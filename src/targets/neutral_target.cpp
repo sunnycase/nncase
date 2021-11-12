@@ -129,6 +129,7 @@ void neutral_target::add_default_transforms(ir::transforms::transform_pass &pass
 
     pass.emplace<fold_conv2d_biasadd_transform>();
     pass.emplace<fold_conv2d_mul_transform>();
+    pass.emplace<fold_two_conv2d_add_transform>();
     pass.emplace<transpose_reduce_motion_transform>();
     pass.emplace<transpose_unary_motion_transform>();
     pass.emplace<simplify_reduce_transform>();
