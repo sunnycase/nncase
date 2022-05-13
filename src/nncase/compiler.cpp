@@ -70,6 +70,8 @@ calibrate_method to_calibrate_method(std::string name)
         return calibrate_method::kld_m2;
     if (name == "cdf")
         return calibrate_method::cdf;
+    if (name == "auto_select")
+        return calibrate_method::auto_select;
     return calibrate_method::no_clip;
 }
 
@@ -289,6 +291,7 @@ public:
                     std::filesystem::create_directories(compile_options_.dump_dir / "layer_output_data");
                 if (has_quant_map)
                 {
+                    std::cout << "TRUE!!!!" << std::endl;
                     for (uint32_t i = 0; i < quant_eval_quantizer->quant_buffers_insert_order().size(); i++)
                     {
                         auto quant_layer_connector = quant_eval_quantizer->quant_buffers_insert_order()[i];
@@ -325,6 +328,7 @@ public:
                 }
                 else
                 {
+                    std::cout << "FALSE!!!!" << std::endl;
                     for (uint32_t i = 0; i < quant_eval_quantizer->quant_buffers_insert_order().size(); i++)
                     {
                         auto quant_layer_connector = quant_eval_quantizer->quant_buffers_insert_order()[i];
@@ -457,8 +461,7 @@ private:
         run_passes("mark_noaction", graph, [&]([[maybe_unused]] const module_type_t &module_type, ir::transforms::pass_manager &pmgr) {
             pmgr.add_pass<make_slice_no_action_pass>();
             pmgr.add_pass<make_concat_no_action_pass>();
-            pmgr.add_pass<make_bitcast_no_action_pass>();
-        });
+            pmgr.add_pass<make_bitcast_no_action_pass>(); });
         graph.merge_module_regions();
 
         std::cout << "7.2. Optimize buffer fusion..." << std::endl;
@@ -491,8 +494,7 @@ private:
             pass.emplace<remove_simple_copy_from_slice_transform>();
             pass.emplace<remove_non_simple_copy_from_slice_transform>();
             pass.emplace<remove_exclusive_copy_to_concat_transform>();
-            pmgr.add_pass(std::move(pass));
-        });
+            pmgr.add_pass(std::move(pass)); });
     }
 
     void optimize_target_dependent_after_buffer_fusion(ir::graph &graph)
@@ -501,8 +503,7 @@ private:
 
         run_passes("target_dependent_after_buffer_fusion", graph, [&](const module_type_t &module_type, ir::transforms::pass_manager &pmgr) {
             target_->register_target_dependent_after_buffer_fusion_passes(module_type, pmgr);
-            pmgr.add_pass<make_bitcast_no_action_pass>();
-        });
+            pmgr.add_pass<make_bitcast_no_action_pass>(); });
     }
 
     void optimize_target_dependent(ir::graph &graph, bool use_ptq)
@@ -567,12 +568,14 @@ private:
 
         if (step != eval_step::after_import)
         {
-            auto calib_method = std::visit([](auto &options) { return to_calibrate_method(options.calibrate_method); }, ptq_options_);
+            auto calib_method = std::visit([](auto &options) { return to_calibrate_method(options.calibrate_method); },
+                ptq_options_);
             evaluator.enable_ptq(*target_, calib_method);
         }
         else
         {
-            auto calib_method = std::visit([](auto &options) { return to_calibrate_method(options.calibrate_method); }, dump_range_options_);
+            auto calib_method = std::visit([](auto &options) { return to_calibrate_method(options.calibrate_method); },
+                dump_range_options_);
             evaluator.enable_ptq(*target_, calib_method);
         }
 
