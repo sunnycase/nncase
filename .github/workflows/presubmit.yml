@@ -23,7 +23,7 @@ jobs:
   #         clangFormatVersion: 11
   check_autopep8_format:
     name: Check autopep8-format
-    runs-on: ubuntu-18.04
+    runs-on: ubuntu-20.04
     steps:
       - name: autopep8
         id: autopep8
