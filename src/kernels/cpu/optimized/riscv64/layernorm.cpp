@@ -26,16 +26,16 @@ using namespace nncase::kernels::cpu;
 using namespace nncase::kernels::cpu::optimized;
 
 #if __riscv_vector
-#RVV_LMUL 8
+#define RVV_LMUL 8
 #define _STR(x) #x
 #define STR(x) _STR(x)
 #define _CONNECT(a, b) a##b
 #define CONNECT(a, b) _CONNECT(a, b)
 #define RVVSETVLI2(evl, avl, elen) "vsetvli " STR(evl) "," STR(avl) "," STR(elen) "," STR(CONNECT(m, RVV_LMUL)) ";"
 
-static float get_mean(float *data, int n)
+static float get_mean(const float *data, int n)
 {
-    register float ret;
+    float ret;
     __asm volatile(
 
         "mv a0, %[avl];"
@@ -58,9 +58,9 @@ static float get_mean(float *data, int n)
     return ret;
 }
 
-static float get_var(float *data, int n, float mean)
+static float get_var(const float *data, int n, float mean)
 {
-    register float ret;
+    float ret;
     __asm volatile(
 
         "mv a0, %[avl];"
@@ -96,7 +96,7 @@ static float get_var(float *data, int n, float mean)
     return ret;
 }
 
-static void layer_norm_update1(float *data, float *out, int len, float mean, float var, float *r1, float e, float *b)
+static void layer_norm_update1(const float *data, float *out, int len, float mean, float var, float *r1, float e, float *b)
 {
     float r_sqrt = 1.0f / sqrtf(var + e);
     __asm volatile(
@@ -128,11 +128,24 @@ static void layer_norm_update1(float *data, float *out, int len, float mean, flo
         : "t0", "t1", "a0", "a1", "a2", "v0", "v16", "a3", "a4", "v8");
 }
 
+
+static __inline __attribute__ ((__always_inline__))
+uint64_t k230_get_cycles()
+{
+    uint64_t x;
+    __asm volatile ("rdcycle %0;":"=r" (x)
+                    ::);
+                    
+                    
+    return x;
+}
+
 result<void> layernorm_impl(const float *input, float *output, float *scale, float *bias, const runtime_shape_t &in_shape, int32_t axis, float epsilon)
 {
+    //uint64_t t1 = k230_get_cycles();
     if (axis < 0)
     {
-        axis = shape_len + axis;
+        axis = (int)in_shape.size() + axis;
     }
     auto outer_size = 1;
     auto inner_size = 1;
@@ -152,18 +165,29 @@ result<void> layernorm_impl(const float *input, float *output, float *scale, flo
 
         layer_norm_update1(src, dest, inner_size, mean, var_data, scale, epsilon, bias);
     }
+    //uint64_t t2 = k230_get_cycles();
+    //printf("layernorm release time: %f\n", (float)(t2 - t1));
     return ok();
 }
 #endif
 
 template result<void> optimized::layernorm<float>(const float *input, float *output, float *scale, float *bias, const runtime_shape_t &in_shape, int32_t axis, float epsilon) noexcept;
 
+
+
+
 template <typename T>
 result<void> optimized::layernorm(const T *input, T *output, T *scale, T *bias, const runtime_shape_t &in_shape, int32_t axis, float epsilon) noexcept
 {
+    //uint64_t t1 = k230_get_cycles();
 #if __riscv_vector
+    //printf("now print in optimized::layernorm ... \n");
     return layernorm_impl(input, output, scale, bias, in_shape, axis, epsilon);
-#else
+#else 
     return cpu::reference::layernorm(input, output, scale, bias, in_shape, axis, epsilon);
 #endif
+    //uint64_t t2 = k230_get_cycles();
+    //printf("layernorm release time: %ld\n", (t2 - t1));
+
+    // return cpu::reference::layernorm(input, output, scale, bias, in_shape, axis, epsilon);
 }
