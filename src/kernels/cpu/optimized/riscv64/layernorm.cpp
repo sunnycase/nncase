@@ -128,15 +128,14 @@ static void layer_norm_update1(const float *data, float *out, int len, float mea
         : "t0", "t1", "a0", "a1", "a2", "v0", "v16", "a3", "a4", "v8");
 }
 
-
-static __inline __attribute__ ((__always_inline__))
-uint64_t k230_get_cycles()
+static __inline __attribute__((__always_inline__))
+uint64_t
+k230_get_cycles()
 {
     uint64_t x;
-    __asm volatile ("rdcycle %0;":"=r" (x)
-                    ::);
-                    
-                    
+    __asm volatile("rdcycle %0;"
+                   : "=r"(x)::);
+
     return x;
 }
 
@@ -173,9 +172,6 @@ result<void> layernorm_impl(const float *input, float *output, float *scale, flo
 
 template result<void> optimized::layernorm<float>(const float *input, float *output, float *scale, float *bias, const runtime_shape_t &in_shape, int32_t axis, float epsilon) noexcept;
 
-
-
-
 template <typename T>
 result<void> optimized::layernorm(const T *input, T *output, T *scale, T *bias, const runtime_shape_t &in_shape, int32_t axis, float epsilon) noexcept
 {
@@ -183,7 +179,7 @@ result<void> optimized::layernorm(const T *input, T *output, T *scale, T *bias, 
 #if __riscv_vector
     //printf("now print in optimized::layernorm ... \n");
     return layernorm_impl(input, output, scale, bias, in_shape, axis, epsilon);
-#else 
+#else
     return cpu::reference::layernorm(input, output, scale, bias, in_shape, axis, epsilon);
 #endif
     //uint64_t t2 = k230_get_cycles();
