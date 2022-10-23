@@ -72,6 +72,9 @@ include(${CMAKE_BINARY_DIR}/conan_paths.cmake)
 include(cmake/dependencies.cmake)
 
 if (BUILDING_RUNTIME)
+    if(ENABLE_RISCV_VECTOR)
+        add_definitions(-D__riscv_vector=1)
+    endif()
     set(NNCASE_MAIN_INCLUDE_DIR ${CMAKE_CURRENT_LIST_DIR}/include)
     set(NNCASE_INCLUDE_DIR ${CMAKE_CURRENT_BINARY_DIR}/include)
     set(THIRD_PARTY ${CMAKE_CURRENT_LIST_DIR}/third_party)
@@ -101,6 +104,8 @@ if (BUILDING_RUNTIME)
     if(BUILD_BENCHMARK)
         add_subdirectory(benchmark)
     endif()
+    
+    set(CMAKE_VERBOSE_MAKEFILEON ON)
 
     # Python binding
     if(BUILD_PYTHON_BINDING)
