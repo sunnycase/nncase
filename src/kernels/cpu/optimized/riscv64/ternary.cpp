@@ -47,7 +47,7 @@ void ternary_vec(const float *input_a, int input_a_len, const float *input_b, in
         "mv a1, %[mask];"
 
         "XXXXXX%=:"
-        "vsetvli t0, a0, e32, m4;" // RVVSETVLI2(t0,a0,e32)
+        "vsetvli t0, a0, e32, m8;" // RVVSETVLI2(t0,a0,e32)
         "vle32.v v8, (a1);"
         "vle32.v v16,(a2);"
         "vmsne.vx v0, v8, x0;" // "vmseq.vx v0, v8, x0;"
@@ -69,7 +69,6 @@ void ternary_vec(const float *input_a, int input_a_len, const float *input_b, in
         "B_IS_VECTOR%=:;"
 
         // "mv a5, %[b];" // "flw ft0, (%[b]);"
-
         "TERNARY_RVV2%=:;"
 
         "mv a0, %[mask_len];"
@@ -77,7 +76,7 @@ void ternary_vec(const float *input_a, int input_a_len, const float *input_b, in
         "mv a5, %[b];" // "flw ft0, (%[b]);"
 
         "XXXXXX2%=:"
-        "vsetvli t0, a0, e32, m4;" // RVVSETVLI2(t0,a0,e32)
+        "vsetvli t0, a0, e32, m8;" // RVVSETVLI2(t0,a0,e32)
         "vle32.v v8, (a1);"
         "vle32.v v16,(a2);"
         "vle32.v v24, (a5);"

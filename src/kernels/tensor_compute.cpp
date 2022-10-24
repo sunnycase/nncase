@@ -444,7 +444,7 @@ result<void> kernels::ternary(const float *input_a, const T *input_b, const T *i
     const runtime_shape_t &in_b_strides, const runtime_shape_t &in_c_shape, const runtime_shape_t &in_c_strides,
     const runtime_shape_t &out_strides) noexcept
 {
-    return cpu::reference::ternary(input_a, input_b, input_c, output, in_a_shape, in_a_strides, in_b_shape, in_b_strides,
+    return cpu::optimized::ternary(input_a, input_b, input_c, output, in_a_shape, in_a_strides, in_b_shape, in_b_strides,
         in_c_shape, in_c_strides, out_strides);
 }
 
