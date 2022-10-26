@@ -47,6 +47,14 @@ jobs:
       run: |
         cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=${{matrix.config.buildType}} ${{matrix.config.cmakeArgs}} -DBUILD_TESTING=ON -DPython3_ROOT_DIR=${pythonLocation}
 
+    - name: Upload Conan Recipes
+      env:
+        CONAN_PASSWORD: ${{secrets.CONAN_SUNNYCASE_PASSWORD}}
+      shell: bash
+      run: |
+        conan user sunnycase -r sunnycase -p $CONAN_PASSWORD
+        conan upload "*" --all -f -r sunnycase -c
+
     - name: Build & Install
       run: |
         cmake --build build --config ${{matrix.config.buildType}}
