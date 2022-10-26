@@ -16,6 +16,7 @@ jobs:
     steps:
     - uses: actions/checkout@v3
     - uses: seanmiddleditch/gha-setup-ninja@master
+    - uses: devbotsxyz/xcode-select@v1
 
     - name: Set up build environment (Windows, Visual Studio)
       uses: ilammy/msvc-dev-cmd@v1
@@ -26,7 +27,6 @@ jobs:
     - name: Set up build environment (Macos)
       run: |
         brew install sunnycase/core/libomp@14.0.6
-        xcode-select --install
       if: runner.os == 'Macos'
 
     - name: Setup Python
