@@ -17,6 +17,8 @@ jobs:
     - uses: actions/checkout@v3
     - uses: seanmiddleditch/gha-setup-ninja@master
     - uses: devbotsxyz/xcode-select@v1
+      with:
+        version: "13"
       if: runner.os == 'Macos'
 
     - name: Set up build environment (Windows, Visual Studio)
