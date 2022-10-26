@@ -65,9 +65,9 @@ else() # in user space
     conan_cmake_install(PATH_OR_REFERENCE ${CMAKE_SOURCE_DIR}
                     BUILD missing
                     PROFILE_BUILD default
-                    PROFILE_HOST default
                     OPTIONS ${CONAN_OPTS}
-                    SETTINGS ${CONAN_SETTINGS})
+                    SETTINGS_BUILD ${CONAN_SETTINGS}
+                    SETTINGS_HOST ${CONAN_SETTINGS})
 endif()
 
 include(${CMAKE_BINARY_DIR}/conan_paths.cmake)
