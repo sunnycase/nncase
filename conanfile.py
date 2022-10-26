@@ -97,8 +97,6 @@ class nncaseConan(ConanFile):
             self.options["libzip"].crypto = False
             if self.settings.os == 'Linux':
                 self.options["opencv"].with_gtk = False
-                self.options["spirv-tools"].link_libcpp = False
-                self.options["shaderc"].link_libcpp = False
 
         if (not self.options.runtime) or self.options.vulkan_runtime:
             if self.settings.os == 'Linux':
