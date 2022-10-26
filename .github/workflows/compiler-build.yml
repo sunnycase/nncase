@@ -53,7 +53,7 @@ jobs:
       shell: bash
       run: |
         conan user sunnycase -r sunnycase -p $CONAN_PASSWORD
-        conan upload "*" --all -f -r sunnycase -c
+        conan upload "*" --all --force -r sunnycase -c
 
     - name: Build & Install
       run: |
