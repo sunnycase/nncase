@@ -61,11 +61,13 @@ if(CONAN_EXPORTED) # in conan local cache
 else() # in user space
     message(STATUS "Auto Cmake Conan Installation")
     include(${CMAKE_SOURCE_DIR}/cmake/conan.cmake)
-    conan_cmake_run(CONANFILE conanfile.py
-                    BASIC_SETUP
+    conan_cmake_autodetect(settings)
+    conan_cmake_install(PATH_OR_REFERENCE ${CMAKE_SOURCE_DIR}
+                    BUILD missing
+                    PROFILE_BUILD default
+                    PROFILE_HOST default
                     OPTIONS ${CONAN_OPTS}
-                    SETTINGS ${CONAN_SETTINGS}
-                    BUILD missing)
+                    SETTINGS ${CONAN_SETTINGS})
 endif()
 
 include(${CMAKE_BINARY_DIR}/conan_paths.cmake)
