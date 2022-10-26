@@ -26,6 +26,7 @@ jobs:
     - name: Set up build environment (Macos)
       run: |
         brew install sunnycase/core/libomp@14.0.6
+        xcode-select --install
       if: runner.os == 'Macos'
 
     - name: Setup Python
