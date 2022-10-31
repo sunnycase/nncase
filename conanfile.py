@@ -90,6 +90,7 @@ class nncaseConan(ConanFile):
             self.options["opencv"].with_quirc = False
             self.options["opencv"].with_ffmpeg = False
             self.options["opencv"].with_tiff = False
+            self.options["opencv"].with_jpeg = 'libjpeg-turbo'
             self.options["opencv"].dnn = False
             self.options["xtensor"].xsimd = False
             self.options["libzip"].with_bzip2 = False
