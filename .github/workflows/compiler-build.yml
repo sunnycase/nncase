@@ -16,10 +16,6 @@ jobs:
     steps:
     - uses: actions/checkout@v3
     - uses: seanmiddleditch/gha-setup-ninja@master
-    - uses: devbotsxyz/xcode-select@v1
-      with:
-        version: "13"
-      if: runner.os == 'Macos'
 
     - name: Set up build environment (Windows, Visual Studio)
       uses: ilammy/msvc-dev-cmd@v1
@@ -43,8 +39,9 @@ jobs:
     - name: Configure Conan (Linux)
       run: |
         conan profile new default --detect
-        conan profile update settings.compiler.version=10 default
         conan profile update settings.compiler.libcxx=libstdc++11 default
+        echo "CC=gcc-10" >> $GITHUB_ENV
+        echo "CXX=g++-10" >> $GITHUB_ENV
       if: runner.os == 'Linux'
       
     - name: Configure CMake
