@@ -9,8 +9,8 @@ jobs:
     strategy:
       matrix:
         config:
-          - {name: x86_64-macos, os: macos-latest, cmakeArgs: -G Ninja, buildType: Release}
-          - {name: x86_64-linux, os: ubuntu-latest, cmakeArgs: -G Ninja, buildType: Release}
+          - {name: x86_64-macos, os: macos-11, cmakeArgs: -G Ninja, buildType: Release}
+          - {name: x86_64-linux, os: ubuntu-20.04, cmakeArgs: -G Ninja, buildType: Release}
           - {name: x86_64-windows, os: windows-latest, arch: x64, cmakeArgs: -G Ninja, buildType: Release}
 
     steps:
@@ -34,7 +34,7 @@ jobs:
         python-version: 3.7
 
     - name: Install Conan
-      run: pip install conan
+      run: pip install conan==1.59.0
 
     - name: Configure Conan (Linux)
       run: |
@@ -101,7 +101,7 @@ jobs:
       if: matrix.config.name == 'riscv64-none-k210'
         
     - name: Install Conan
-      run: pip install conan
+      run: pip install conan==1.59.0
 
     - name: Configure Conan (Linux)
       run: |

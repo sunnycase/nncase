@@ -354,6 +354,11 @@ void register_neutral_evaluators()
                 output.buffer().as_span<int32_t>().data(), input.shape(), to(rnode.axis()), input.strides(), output.strides(), rnode.keep_dims())
                 .unwrap_or_throw();
             break;
+        case dt_int64:
+            kernels::reduce(rnode.reduce_op(), static_cast<int64_t>(rnode.init_value()), input.buffer().as_span<int64_t>().data(),
+                            output.buffer().as_span<int64_t>().data(), input.shape(), to(rnode.axis()), input.strides(), output.strides(), rnode.keep_dims())
+                    .unwrap_or_throw();
+            break;
         default:
             std::cerr << "unsupported dtype for reduce: " + std::string(datatype_names(input_type));
         } });
@@ -843,7 +848,7 @@ void register_neutral_evaluators()
         auto output_h = context.memory_at(rnode.output_h());
         kernels::gru(input.buffer().as_span<float>().data(), W.buffer().as_span<float>().data(), R.buffer().as_span<float>().data(),
             B.buffer().as_span<float>().data(), initial_h.buffer().as_span<float>().data(), output.buffer().as_span<float>().data(), output_h.buffer().as_span<float>().data(),
-            input.shape(), W.shape(), rnode.direction())
+            input.shape(), W.shape(), rnode.direction(), rnode.linear_before_reset())
             .unwrap_or_throw(); });
 
     register_evaluator(op_tflite_detection_postprocess, [](ir::node &node, function_evaluate_context &context) {
