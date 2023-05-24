@@ -12,8 +12,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include "ref_ops.h"
 #include <nncase/kernels/kernel_utils.h>
-#include <nncase/kernels/stackvm/ref_ops.h>
 #include <nncase/runtime/allocator.h>
 #include <nncase/runtime/host_buffer.h>
 #include <nncase/runtime/runtime_op_utility.h>
@@ -85,6 +85,7 @@ result<void> binary_impl(binary_op_t op, const T *lhs, const T *rhs, T *output,
         BINARY_IMPL_OP(pow, [](T a, T b) { return std::pow(a, b); });
         BINARY_IMPL_OP(logical_and,
                        [](T a, T b) { return static_cast<T>(a && b); });
+        BINARY_IMPL_OP(mod, [](T a, T b) { return std::fmod(a, b); });
     default:
         return err(std::errc::not_supported);
     }

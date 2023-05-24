@@ -1,6 +1,5 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <TargetFramework>net6.0</TargetFramework>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
 	<EmitCompilerGeneratedFiles>true</EmitCompilerGeneratedFiles>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
@@ -8,9 +7,6 @@
 
   <ItemGroup>
     <PackageReference Include="OrtKISharp" />
-    <PackageReference Include="MagicalTensorflowLib" />
-    <PackageReference Include="MagicalTensorflowLibOSX-ARM64" />
-    <PackageReference Include="AnyTensorFlow.NET" />
   </ItemGroup>
 
   <ItemGroup>

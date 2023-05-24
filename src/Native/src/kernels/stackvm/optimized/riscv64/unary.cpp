@@ -12,10 +12,10 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include "../../reference/ref_ops.h"
+#include "../opt_ops.h"
 #include <iostream>
 #include <nncase/kernels/kernel_utils.h>
-#include <nncase/kernels/stackvm/opt_ops.h>
-#include <nncase/kernels/stackvm/ref_ops.h>
 #include <nncase/runtime/runtime_op_utility.h>
 #include <nncase/runtime/util.h>
 
@@ -41,7 +41,7 @@ struct unary_op_abs_rvv {
 };
 
 struct unary_op_ceil_rvv {
-    vfloat32m8_t operator()(const vfloat32m8_t &x, const word_type &vl) const {
+    vfloat32m8_t operator()(const vfloat32m8_t &x, const size_t &vl) const {
         vint32m8_t _xi = vfcvt_x_f_v_i32m8(x, vl);
         vbool4_t _mask = vmflt_vv_f32m8_b4(vfcvt_f_x_v_f32m8(_xi, vl), x, vl);
         return vfcvt_f_x_v_f32m8(vadd_vx_i32m8_m(_mask, _xi, _xi, 1, vl), vl);
@@ -55,7 +55,7 @@ struct unary_op_cos_rvv {
 };
 
 struct unary_op_exp_rvv {
-    vfloat32m8_t operator()(const vfloat32m8_t &x, const word_type &vl) const {
+    vfloat32m8_t operator()(const vfloat32m8_t &x, const size_t &vl) const {
         return exp_ps(x, vl);
     }
 };

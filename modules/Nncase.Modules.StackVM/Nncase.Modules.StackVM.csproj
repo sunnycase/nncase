@@ -1,7 +1,6 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <TargetFramework>net6.0</TargetFramework>
     <RootNamespace>Nncase</RootNamespace>
     <ImplicitUsings>enable</ImplicitUsings>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
@@ -10,6 +9,7 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <ProjectReference Include="..\..\src\Nncase.Passes\Nncase.Passes.csproj" />
     <ProjectReference Include="..\..\src\Nncase.CodeGen\Nncase.CodeGen.csproj" />
   </ItemGroup>
 

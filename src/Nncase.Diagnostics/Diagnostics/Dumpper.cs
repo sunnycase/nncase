@@ -34,16 +34,16 @@ internal sealed class Dumpper : IDumpper
         return new Dumpper(subDumpFlags, Path.Join(_dumpDirectory, subDirectory));
     }
 
-    public void DumpIR(Expr expr, string prefix, string? reletivePath = null)
+    public void DumpIR(Expr expr, string prefix, string? reletivePath = null, bool displayCallable = true)
     {
         var path = Path.Join(_dumpDirectory, reletivePath);
-        CompilerServices.DumpIR(expr, prefix, EnsureWritable(path));
+        CompilerServices.DumpIR(expr, prefix, EnsureWritable(path), displayCallable);
     }
 
     public void DumpDotIR(Expr expr, string prefix, string? reletivePath = null)
     {
         var path = Path.Join(_dumpDirectory, reletivePath);
-        CompilerServices.DumpDotIR(expr, prefix, EnsureWritable(path));
+        CompilerServices.DumpDotIR(expr, prefix, EnsureWritable(path), false);
     }
 
     public void DumpCSharpIR(Expr expr, string prefix, string? reletivePath = null)
@@ -56,7 +56,7 @@ internal sealed class Dumpper : IDumpper
     {
         foreach (var func in module.Functions)
         {
-            DumpIR(func, string.Empty, reletivePath);
+            DumpIR(func, string.Empty, reletivePath, false);
         }
     }
 
@@ -71,7 +71,7 @@ internal sealed class Dumpper : IDumpper
         return File.Open(EnsureWritable(path), fileMode);
     }
 
-    public override string ToString() => $"Dumpper({_dumpFlags})";
+    public override string ToString() => $"Dumpper({_dumpFlags}, {_dumpDirectory})";
 
     private static string EnsureWritable(string path)
     {

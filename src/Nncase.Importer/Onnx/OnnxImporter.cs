@@ -134,6 +134,7 @@ public sealed partial class OnnxImporter : BaseImporter
             "MaxPool" => VisitReduceWindow2D(op, ReduceOp.Max, float.MinValue),
             "Max" => VisitBinary(op, BinaryOp.Max),
             "Min" => VisitBinary(op, BinaryOp.Min),
+            "Mod" => VisitBinary(op, BinaryOp.Mod),
             "Mul" => VisitBinary(op, BinaryOp.Mul),
             "Neg" => VisitUnary(op, UnaryOp.Neg),
             "Not" => VisitUnary(op, UnaryOp.LogicalNot),
@@ -167,6 +168,7 @@ public sealed partial class OnnxImporter : BaseImporter
             "Resize" => VisitResize(op),
             "ReverseSequence" => VisitReverseSequence(op),
             "Round" => VisitUnary(op, UnaryOp.Round),
+            "ScatterND" => VisitScatterND(op),
             "Selu" => VisitSelu(op),
             "Shape" => VisitShape(op),
             "Sin" => VisitUnary(op, UnaryOp.Sin),
@@ -194,6 +196,17 @@ public sealed partial class OnnxImporter : BaseImporter
             "Where" => VisitWhere(op),
             _ => UnSupportedOp(op.OpType),
         };
+
+        List<string> outputNames = new();
+
+        var outputsCount = op.Output.Count;
+        for (int i = 0; i < outputsCount; i++)
+        {
+            outputNames.Add(op.Output[i]);
+        }
+
+        output.Metadata.OutputNames = outputNames;
+
         AddToOutputs(_outputTensors!, op.Output.ToArray(), output);
     }
 

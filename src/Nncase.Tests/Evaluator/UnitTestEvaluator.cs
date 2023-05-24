@@ -10,7 +10,9 @@ using NetFabric.Hyperlinq;
 using Nncase.Evaluator;
 using Nncase.IR;
 using Nncase.IR.F;
+using Nncase.IR.Random;
 using Nncase.IR.Tensors;
+using Nncase.TIR;
 using Nncase.Utilities;
 using OrtKISharp;
 using Xunit;
@@ -80,5 +82,50 @@ public class UnitTestEvaluator : TestClassBase
         var image = Imaging.ResizeImage(ImageResizeMode.Bilinear, input, Array.Empty<int>(), new[] { 1, 3, 112, 112 }, isTFResize: true);
         image.InferenceType();
         Assert.Equal(new[] { 1, 3, 112, 112 }, image.Evaluate().AsTensor().Dimensions.ToArray());
+    }
+
+    [Fact]
+    public void TestOnnxResizeImage()
+    {
+        var input = OrtKI.Random(1, 3, 224, 224).ToTensor();
+        var image = Imaging.ResizeImage(ImageResizeMode.Bilinear, input, Array.Empty<float>(), new[] { 1, 3, 112, 112 }, isTFResize: false);
+        image.InferenceType();
+        Assert.Equal(new[] { 1, 3, 112, 112 }, image.Evaluate().AsTensor().Dimensions.ToArray());
+    }
+
+    [Fact]
+    public void TestLoadStore()
+    {
+        var loop_i = new Var(TensorType.Scalar(DataTypes.Int32));
+        var load = T.Load(T.Handle("hd", DataTypes.Float32), loop_i);
+        CompilerServices.InferenceType(load);
+
+        var store = T.Store((Var)load[TIR.Load.Handle], load[TIR.Load.Index], loop_i);
+        CompilerServices.InferenceType(store);
+    }
+
+    [Fact]
+    public void TestNop()
+    {
+        var nop = T.Nop();
+        CompilerServices.InferenceType(nop);
+    }
+
+    [Fact]
+    public void TestRamp()
+    {
+        var ramp = T.Ramp(1, 2, 0);
+        CompilerServices.InferenceType(ramp);
+    }
+
+    [Fact]
+    public void TestEvaluatorUtil()
+    {
+        var pad = OrtKI.Random(1);
+        Assert.Throws<InvalidOperationException>(() => EvaluatorUtil.ToOnnxPadFormat(pad));
+
+        var pads = OrtKI.Random(2, 2);
+        var expect = OrtKI.Transpose(pads.Cast(OrtDataType.Int64), new long[] { 1, 0 }).ToArray<long>();
+        Assert.Equal(expect, EvaluatorUtil.ToOnnxPadFormat(pads));
     }
 }

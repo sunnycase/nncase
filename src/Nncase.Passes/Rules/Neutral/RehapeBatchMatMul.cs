@@ -7,12 +7,12 @@ using System.Collections.Immutable;
 using System.Linq;
 using Nncase.IR;
 using Nncase.PatternMatch;
-using Tensorflow;
 using static Nncase.IR.F.NN;
 using static Nncase.IR.F.Tensors;
 using static Nncase.IR.TypePatternUtility;
 using static Nncase.PatternMatch.F.Math;
 using static Nncase.PatternMatch.Utility;
+using static Nncase.Utilities.MetadataUtility;
 using Shape = Nncase.IR.Shape;
 
 namespace Nncase.Passes.Rules.Neutral;
@@ -46,7 +46,7 @@ public sealed partial class ReshapeBatchMatmul : IRewriteRule
         return Reshape(
             MatMul(
                 Reshape(a, newAShape),
-                Reshape(b, newBShape)),
-            call.CheckedShape);
+                Reshape(b, newBShape)).InheritMetaData(call),
+            call.CheckedShape).InheritMetaData(call);
     }
 }

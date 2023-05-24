@@ -1,5 +1,6 @@
 ﻿// Copyright (c) Canaan Inc. All rights reserved.
 // Licensed under the Apache license. See LICENSE file in the project root for full license information.
+
 using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
@@ -117,5 +118,18 @@ public sealed class UnitTestDataTypes
         Assert.Equal("float", DataTypes.GetBuiltInName(DataTypes.Float32));
         Assert.Equal("double", DataTypes.GetBuiltInName(DataTypes.Float64));
         Assert.Equal("BFloat16", DataTypes.GetBuiltInName(DataTypes.BFloat16));
+    }
+
+    [Fact]
+    public void TestFromShortName()
+    {
+        Assert.Equal(DataTypes.Int8, DataTypes.FromShortName("i8"));
+        Assert.Equal(DataTypes.UInt8, DataTypes.FromShortName("u8"));
+        Assert.Equal(DataTypes.Int16, DataTypes.FromShortName("i16"));
+        Assert.Equal(DataTypes.Int32, DataTypes.FromShortName("i32"));
+        Assert.Equal(DataTypes.Float16, DataTypes.FromShortName("f16"));
+        Assert.Equal(DataTypes.Float32, DataTypes.FromShortName("f32"));
+        Assert.Equal(DataTypes.BFloat16, DataTypes.FromShortName("bf16"));
+        Assert.Throws<ArgumentException>(() => DataTypes.FromShortName("f64"));
     }
 }

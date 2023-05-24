@@ -24,7 +24,7 @@ public static class Tensors
 
     public static Expr NCHWToNHWC(Expr input) => Transpose(input, new[] { 0, 2, 3, 1 });
 
-    public static Expr NHWCToWNCH(Expr input) => Transpose(input, new[] { 3, 0, 1, 2 });
+    public static Expr NHWCToWNCH(Expr input) => Transpose(input, new[] { 2, 0, 3, 1 });
 
     public static Call Broadcast(Expr input, Expr shape) => new Call(new Broadcast(), input, shape);
 
@@ -58,6 +58,9 @@ public static class Tensors
     public static Call GatherND(Expr input, Expr batch_dims, Expr index) =>
         new Call(new GatherND(), input, batch_dims, index);
 
+    public static Call ScatterND(Expr input, Expr indices, Expr updates) =>
+        new Call(new ScatterND(), input, indices, updates);
+
     public static Call MatMul(Expr input, Expr other) => new Call(new MatMul(), input, other);
 
     // todo:remove prod
@@ -78,7 +81,7 @@ public static class Tensors
         Reduce(ReduceOp.Min, input, axis, initValue, keepDims);
 
     public static Call ReduceMax(Expr input, Expr axis, Expr initValue, Expr keepDims) =>
-        Reduce(ReduceOp.Min, input, axis, initValue, keepDims);
+        Reduce(ReduceOp.Max, input, axis, initValue, keepDims);
 
     public static Call ReduceSum(Expr input, Expr axis, Expr initValue, Expr keepDims) =>
         Reduce(ReduceOp.Sum, input, axis, initValue, keepDims);

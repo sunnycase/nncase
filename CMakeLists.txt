@@ -3,7 +3,7 @@
 list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_LIST_DIR}/cmake/Modules)
 
 if(NOT DEFINED NNCASE_VERSION)
-    set(NNCASE_VERSION "1.0.0")
+    set(NNCASE_VERSION "2.0.0")
 endif()
 
 if(DEFINED ENV{NNCASE_VERSION_SUFFIX})
@@ -31,6 +31,7 @@ project(nncase
 
 option(ENABLE_OPENMP "OpenMP support" ON)
 option(ENABLE_HALIDE "halide kernels support" ON)
+option(DOTNET_INIT_FOR_CONFIG "Initialize dotnet from runtimeconfig" OFF)
 option(BUILD_PYTHON_BINDING "Build python binding" ON)
 option(BUILD_CSHARP_BINDING "Build csharp binding" ON)
 option(BUILD_BENCHMARK "Build benchmark programs" ON)
@@ -41,6 +42,10 @@ option(ENABLE_RVV "Some kernel impl by rvv" OFF)
 
 if (ENABLE_OP_PROFILE)
     add_definitions(-DENABLE_OP_PROFILE)
+endif()
+
+if(NOT CMAKE_TOOLCHAIN_FILE)
+   include(toolchains/native.toolchain.cmake)
 endif()
 
 if (BUILDING_RUNTIME)
@@ -84,7 +89,7 @@ if (BUILDING_RUNTIME)
     
     if (MSVC)
         add_definitions(/D_CRT_SECURE_NO_WARNINGS /DNOMINMAX)
-        add_compile_options(/wd4267 /wd4251 /wd4244 /FC /utf-8 /W3 /WX /wd4297)
+        add_compile_options(/wd4267 /wd4251 /wd4244 /FC /utf-8 /W3 /WX /wd4297 -Wno-unused-function -Wno-unused-command-line-argument)
     else()
         add_compile_options(-Wall -Wextra -pedantic -Werror -Wno-multichar -Wno-missing-field-initializers -Wno-unused-function -Wno-type-limits)
         if (APPLE)
@@ -177,7 +182,7 @@ else()
     
     if (MSVC)
         add_definitions(/D_SILENCE_ALL_CXX17_DEPRECATION_WARNINGS /D_CRT_SECURE_NO_WARNINGS /DNOMINMAX)
-        add_compile_options(/wd4267 /wd4251 /wd4244 /FC /utf-8 /W3 /WX)
+        add_compile_options(/wd4267 /wd4251 /wd4244 /FC /utf-8 /W3 /WX -Wno-unused-function -Wno-unused-command-line-argument)
         set(PYBIND11_CPP_STANDARD "/std:c++latest")
     else()
         add_compile_options(-fvisibility=hidden)

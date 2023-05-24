@@ -86,11 +86,6 @@ public enum CalibMethod
     /// kld.
     /// </summary>
     Kld,
-
-    /// <summary>
-    /// use random data only for test.
-    /// </summary>
-    Random,
 }
 
 /// <summary>
@@ -137,6 +132,21 @@ public class QuantizeOptions
     /// Gets or sets model quant mode.
     /// </summary>
     public ModelQuantMode ModelQuantMode { get; set; } = ModelQuantMode.NoQuant;
+
+    /// <summary>
+    /// Gets or sets import quant scheme.
+    /// </summary>
+    public string QuantScheme { get; set; } = string.Empty;
+
+    /// <summary>
+    /// Gets or sets a value indicating whether export quant scheme.
+    /// </summary>
+    public bool ExportQuantScheme { get; set; }
+
+    /// <summary>
+    /// Gets or sets a value indicating whether export weight range by channel.
+    /// </summary>
+    public bool ExportWeightRangeByChannel { get; set; }
 
     /// <summary>
     /// Creates no quantization options.

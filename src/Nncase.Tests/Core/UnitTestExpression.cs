@@ -10,8 +10,11 @@ using System.Linq.Expressions;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Options;
 using NetFabric.Hyperlinq;
+using Nncase.Evaluator.TIR;
 using Nncase.IR;
+using Nncase.TIR;
 using Xunit;
+using Buffer = Nncase.TIR.Buffer;
 
 namespace Nncase.Tests.CoreTest;
 
@@ -56,6 +59,19 @@ public class UnitTestExpression
         Assert.True(sa == sb);
         Assert.Equal(sa, sb);
         Assert.Equal(sa.GetHashCode(), sb.GetHashCode());
+    }
+
+    [Fact]
+    public void TestConstNotEqual()
+    {
+        var a = (Const)(int)1;
+        var b = (Const)(uint)1U;
+        Assert.NotEqual(a, b);
+        Assert.Equal(a.GetHashCode(), b.GetHashCode());
+        var dict = new Dictionary<Expr, int>();
+        dict.TryAdd(a, 0);
+        dict.TryAdd(b, 1);
+        Assert.Equal(2, dict.Keys.Count);
     }
 
     /// <summary>
@@ -262,6 +278,69 @@ public class UnitTestExpression
         var glb_ld_output = new TIR.BufferRegion(new TIR.PhysicalBuffer("glb_ld_output", DataTypes.BFloat16, Schedule.MemoryLocation.Data, new[] { 1, 16, 64, 400 }, TensorUtilities.GetStrides(new[] { 1, 16, 64, 400 }), 0, 0), new(new TIR.Range[] { 0..1, 0..16, 0..31, 0..400 }));
         Assert.False(ddr_ld_input.Buffer.Equals(glb_ld_output.Buffer));
         Assert.False(ddr_ld_input.Equals(glb_ld_output));
+    }
+
+    [Fact]
+    public void TestPaddingEqual()
+    {
+        Assert.Equal(2, new Padding(1, 1).Sum());
+        Assert.Equal(new Padding(0, 0), Padding.Zero());
+    }
+
+    [Fact]
+    public void TestSegmentNDEqual()
+    {
+        var segments = new[]
+        {
+            new Segment1D(default, new Padding(0, 0)),
+            new Segment1D(default, new Padding(0, 0)),
+            new Segment1D(default, new Padding(0, 0)),
+            new Segment1D(default, new Padding(0, 0)),
+        };
+        var segmentND = new SegmentND(segments);
+        Assert.Equal(4, segmentND.Count);
+        Assert.False(segmentND.Equals(new SegmentND()));
+        Assert.Equal(
+            HashCode.Combine(StructuralComparisons.StructuralEqualityComparer.GetHashCode(segments), segmentND.PadH, segmentND.PadW), segmentND.GetHashCode());
+        Assert.Equal(string.Join(",", segments.Select(s => s.ToString())), segmentND.ToString());
+        Assert.Equal(segments.Aggregate(1, (acc, seg) => acc * seg.Length), segmentND.Shape_size);
+        var segAll = new Segment1D(System.Range.All, Padding.Zero());
+        Assert.Throws<InvalidOperationException>(() => segAll.Length);
+        var segAddND = segmentND + segmentND;
+        Assert.Equal(segments, segAddND.Segments);
+        Assert.Equal(4, segAddND.Count);
+        Assert.True(segAddND == segmentND);
+        Assert.False(segAddND != segmentND);
+
+        var seg1 = new Segment1D(2..5, Padding.Zero());
+        Assert.Equal(2, seg1.Start);
+        Assert.Equal(5, seg1.End);
+        Assert.Equal(3, seg1.Length);
+        Assert.Equal(Padding.Zero(), seg1.Padding);
+
+        var seg2 = new Segment1D(4..7, Padding.Zero());
+        var segAdd = seg1 + seg2;
+        Assert.Equal(2, segAdd.Start);
+        Assert.Equal(7, segAdd.End);
+        Assert.Equal(5, segAdd.Length);
+
+        var segDivide = seg1 / 2;
+        Assert.Equal(1, segDivide.Start);
+        Assert.Equal(2, segDivide.End);
+        Assert.Equal(1, segDivide.Length);
+
+        var segMultiply = seg1 * 3;
+        Assert.Equal(6, segMultiply.Start);
+        Assert.Equal(15, segMultiply.End);
+        Assert.Equal(9, segMultiply.Length);
+    }
+
+    [Fact]
+    public void TestSelectedRangeEqual()
+    {
+        var selectedRange = new SelectedRange(0, 0, new Padding(0, 0));
+        Assert.Equal(selectedRange, selectedRange.Slice(new Segment1D(new System.Range(0, 0), new Padding(0, 0))));
+        Assert.Equal(selectedRange with { }, selectedRange.Slice(new Segment1D(System.Range.All, new Padding(0, 0))));
     }
 
     [Fact]

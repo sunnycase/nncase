@@ -151,6 +151,14 @@ gather_nd(datatype_t type, const gsl::byte *input, gsl::byte *output,
           const dims_t &indices_shape, size_t batch_dims,
           kernel_context &context = default_kernel_context()) noexcept;
 
+NNCASE_API
+result<void>
+scatter_nd(datatype_t type, const gsl::byte *input, gsl::byte *output,
+           const dims_t &in_shape, datatype_t indices_type,
+           const gsl::byte *indices, const dims_t &indices_shape,
+           const gsl::byte *updates, const dims_t &updates_shape,
+           kernel_context &context = default_kernel_context()) noexcept;
+
 NNCASE_API result<void>
 get_item(tensor input, tensor index, tensor output = nullptr,
          kernel_context &context = default_kernel_context());
@@ -181,10 +189,6 @@ l2_normalization(tensor input, tensor output = nullptr,
 NNCASE_API result<void>
 leaky_relu(tensor input, tensor alpha, tensor output = nullptr,
            kernel_context &context = default_kernel_context());
-
-NNCASE_API result<void>
-log_softmax(tensor input, tensor axis, tensor output = nullptr,
-            kernel_context &context = default_kernel_context());
 
 NNCASE_API result<void>
 lp_normalization(tensor input, tensor axis, tensor p, tensor output = nullptr,
@@ -362,6 +366,12 @@ NNCASE_API result<void> softmax(const float *input, float *output,
                                 const dims_t &in_strides,
                                 const dims_t &out_strides, int64_t axis,
                                 float beta, bool needLog = false) noexcept;
+
+NNCASE_API result<void> log_softmax(const float *input, float *output,
+                                    const dims_t &in_shape,
+                                    const dims_t &in_strides,
+                                    const dims_t &out_strides,
+                                    int32_t axis) noexcept;
 
 NNCASE_API result<void>
 softplus(tensor input, tensor output = nullptr,

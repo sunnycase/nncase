@@ -13,6 +13,11 @@ namespace Nncase.Importer
         private Expr VisitBinary(NodeProto op, BinaryOp binaryOp)
         {
             var (lhs, rhs) = GetInputExprs(op, 0, 1);
+            if (binaryOp == BinaryOp.Pow && lhs.CheckedDataType != rhs.CheckedDataType)
+            {
+                return F.Math.Binary(binaryOp, lhs, IR.F.Tensors.Cast(rhs, lhs.CheckedDataType));
+            }
+
             return F.Math.Binary(binaryOp, lhs, rhs);
         }
     }

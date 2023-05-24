@@ -7,6 +7,7 @@ import shutil
 import os
 import numpy as np
 from test_runner import *
+from collections import ChainMap
 
 
 class OnnxTestRunner(TestRunner):
@@ -94,7 +95,8 @@ class OnnxTestRunner(TestRunner):
                 for input in self.inputs:
                     input_shapes[input['name']] = input['shape']
 
-                onnx_model, check = onnxsim.simplify(onnx_model, input_shapes=input_shapes)
+                onnx_model, check = onnxsim.simplify(
+                    onnx_model, input_shapes=input_shapes, dynamic_input_shape=self.dynamic)
                 assert check, "Simplified ONNX model could not be validated"
 
             print('[info]: preprocess ONNX model success: ', args)
@@ -113,7 +115,11 @@ class OnnxTestRunner(TestRunner):
         input_tensors = [node for node in onnx_model.graph.input if node.name in input_names]
 
         def to_dim_value(d, default_d):
-            if d.dim_value == 0:
+            """
+            if dim_value is not digit, it should be fixed.
+            dim_value range: [0, inf)
+            """
+            if not str(d.dim_value).isdigit():
                 if len(self.shape_vars):
                     # we should eval dim_param instead of get var value
                     # e.g. dim_param = dec_len - 1
@@ -144,14 +150,25 @@ class OnnxTestRunner(TestRunner):
             self.calibs.append(copy.deepcopy(input_dict))
             self.dump_range_data.append(copy.deepcopy(input_dict))
 
+        def is_dynamic(output):
+            dims = output.type.tensor_type.shape.dim
+            return any(dim.dim_param != '' for dim in dims)
+
+        outputs = onnx_model.graph.output
+        self.dynamic = any(is_dynamic(output) for output in outputs)
+        # make a static model for infer output
+        if self.dynamic:
+            input_shapes = list(map(lambda input: {input['name']: input['shape']}, self.inputs))
+            input_shapes = dict(ChainMap(*input_shapes))
+            (onnx_model, _) = onnxsim.simplify(onnx_model, input_shapes=input_shapes)
+
         # output
         for e in onnx_model.graph.output:
             output_dict = {}
             onnx_type = e.type.tensor_type
             output_dict['name'] = e.name
             output_dict['dtype'] = onnx.mapping.TENSOR_TYPE_TO_NP_TYPE[onnx_type.elem_type]
-            # todo:fix this
-            output_dict['model_shape'] = translate_shape(onnx_type.shape.dim, self.default_shape)
+            output_dict['model_shape'] = [i.dim_value for i in onnx_type.shape.dim]
             self.outputs.append(output_dict)
 
     def cpu_infer(self, case_dir: str, model_file: bytes, type: str):
@@ -186,7 +203,8 @@ class OnnxTestRunner(TestRunner):
             text_file = os.path.join(case_dir, f'cpu_result_{i}.txt')
             self.output_paths.append((bin_file, text_file))
             output.tofile(bin_file)
-            self.totxtfile(text_file, output)
+            if not test_utils.in_ci():
+                self.totxtfile(text_file, output)
             i += 1
 
     def import_model(self, compiler, model_content, import_options):

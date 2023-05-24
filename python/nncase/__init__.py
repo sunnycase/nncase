@@ -34,19 +34,12 @@ import _nncase
 from _nncase import RuntimeTensor, TensorDesc, Simulator
 
 
-def _check_env():
-    env = os.environ
-    errors = []
-    if not "NNCASE_COMPILER" in env:
-        errors.append("NNCASE_COMPILER not found")
-    return errors
-
-
 def _initialize():
-    errors = _check_env()
-    if len(errors) > 0:
-        raise Exception("check failed:\n" + str.join('\n', errors))
-    _nncase.initialize(os.getenv("NNCASE_COMPILER"))
+    compiler_path = os.getenv("NNCASE_COMPILER")
+    if not compiler_path:
+        compiler_path = os.path.join(os.path.dirname(_nncase.__file__),
+                                     "nncase", "Nncase.Compiler.dll")
+    _nncase.initialize(compiler_path)
 
 
 _initialize()
@@ -67,6 +60,9 @@ class PTQTensorOptions:
     w_quant_type: str
     finetune_weights_method: str
     use_mix_quant: bool
+    quant_scheme: str
+    export_quant_scheme: bool
+    export_weight_range_by_channel: bool
     cali_data: List[RuntimeTensor]
 
     def __init__(self) -> None:
@@ -212,14 +208,20 @@ class Compiler:
             raise Exception("Unsupported Weights Quant Type")
 
         self._quantize_options.use_mix_quant = ptq_dataset_options.use_mix_quant
+        self._quantize_options.quant_scheme = ptq_dataset_options.quant_scheme
+        self._quantize_options.export_quant_scheme = ptq_dataset_options.export_quant_scheme
+        self._quantize_options.export_weight_range_by_channel = ptq_dataset_options.export_weight_range_by_channel
 
     def dump_range_options(self) -> DumpRangeTensorOptions:
         raise NotImplementedError("dump_range_options")
 
     def __process_compile_options(self, compile_options: CompileOptions) -> ClCompileOptions:
         self._target = _nncase.Target(compile_options.target)
-        self._compile_options.dump_flags = _nncase.DumpFlags.Nothing if not compile_options.dump_ir else _nncase.DumpFlags(
-            _nncase.DumpFlags.Rewrite | _nncase.DumpFlags.EGraphCost | _nncase.DumpFlags.PassIR)
+        dump_flags = _nncase.DumpFlags.Nothing if not compile_options.dump_ir else _nncase.DumpFlags(
+            _nncase.DumpFlags.PassIR)
+        if (compile_options.dump_asm):
+            dump_flags = _nncase.DumpFlags(dump_flags | _nncase.DumpFlags.CodeGen)
+        self._compile_options.dump_flags = dump_flags
         self._compile_options.dump_dir = compile_options.dump_dir
 
     def _import_module(self, model_content: bytes | io.RawIOBase) -> None:

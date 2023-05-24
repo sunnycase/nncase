@@ -12,9 +12,9 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include "opt_ops.h"
 #include <cstring>
 #include <nncase/kernels/kernel_utils.h>
-#include <nncase/kernels/stackvm/opt_ops.h>
 #include <nncase/runtime/runtime_op_utility.h>
 #include <nncase/runtime/util.h>
 
@@ -49,7 +49,8 @@ result<void> gather_impl(const T *input, T *output, const dims_t &in_shape,
 #endif
         for (int i = 0; i < indices_count; ++i) {
             auto *o_ptr = out_ptr + i * block_size;
-            auto indices_ptr = indices[i];
+            auto indices_ptr =
+                indices[i] >= 0 ? indices[i] : indices[i] + in_shape[axis];
             memcpy(o_ptr, in_ptr + (indices_ptr * block_size),
                    block_size * sizeof(T));
         }
