@@ -63,6 +63,9 @@ class nncaseConan(ConanFile):
             self.requires('magic_enum/0.7.0')
             self.requires('spdlog/1.8.2')
             self.requires('inja/3.2.0')
+            self.requires('eigen/3.4.0')
+            self.requires('stduuid/1.2.2')
+            self.requires('systemc/2.3.3')
             if self.options.tests:
                 self.requires('gtest/1.10.0')
 
