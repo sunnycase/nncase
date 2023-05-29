@@ -68,6 +68,8 @@ class nncaseConan(ConanFile):
             self.requires('systemc/2.3.3')
             if self.options.tests:
                 self.requires('gtest/1.10.0')
+            if self.settings.os == 'Linux':
+                self.requires('libuuid/1.0.3')
 
         if (not self.options.runtime) or self.options.vulkan_runtime:
             self.requires('vulkan-headers/1.2.182')
