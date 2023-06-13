@@ -10,7 +10,6 @@ jobs:
       matrix:
         config:
           - {name: x86_64-macos, os: macos-latest, cmakeArgs: '', buildType: Release}
-          - {name: x86_64-linux, os: ubuntu-latest, cmakeArgs: '', buildType: Release}
           - {name: x86_64-windows, os: windows-latest, arch: x64, cmakeArgs: -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl, buildType: Release}
 
     steps:
@@ -117,3 +116,20 @@ jobs:
      run: |
        conan user sunnycase -r sunnycase -p $CONAN_PASSWORD
        conan upload "*" --all -r sunnycase -c
+
+  build-manylinux-native-runtime:
+    name: build-manylinux-native-runtime-${{matrix.config.name}}
+    runs-on: ${{matrix.config.os}}
+    strategy:
+      matrix:
+        config:
+          - {name: x86_64-linux, os: ubuntu-latest, cmakeArgs: '', buildType: Release}
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Build in docker (Linux)
+        uses: docker://sunnycase/manylinux2014_x86_64
+        with:
+            args: /bin/bash tools/build-runtime.sh ${{secrets.CONAN_SUNNYCASE_PASSWORD}}
+        if: runner.os == 'Linux'
