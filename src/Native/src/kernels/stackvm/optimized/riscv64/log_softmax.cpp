@@ -42,7 +42,7 @@ static float get_max_value(int n, const float *x) {
                    "slli t1, t0, 2;"
                    "sub a0, a0, t0;"
                    "add a1, a1, t1;"
-                   "vredmax.vs v16,v8,v16;"
+                   "vfredmax.vs v16,v8,v16;"
                    /////////////////
                    "bnez a0, loop_rvv_max_index%=;"
                    "vfmv.f.s %[value_index], v16;"
@@ -125,7 +125,7 @@ void log_softmax_step_not1(int32_t len, const float *x, float *dx, int step) {
 }
 
 static void log_softmax_impl(const float *input, float *output,
-                             const dims_t &in_shape, int axis) {
+                             gsl::span<const size_t> in_shape, int axis) {
     size_t ndim = in_shape.size();
     size_t positive_axis = axis < 0 ? ndim + axis : axis;
     size_t axis_dim = in_shape[positive_axis];
@@ -167,16 +167,18 @@ static void log_softmax_impl(const float *input, float *output,
 #endif
 
 template result<void> optimized::log_softmax<float>(
-    const float *input, float *output, const dims_t &in_shape,
-    [[maybe_unused]] const dims_t &in_strides,
-    [[maybe_unused]] const dims_t &out_strides, int32_t axis) noexcept;
+    const float *input, float *output, gsl::span<const size_t> in_shape,
+    [[maybe_unused]] gsl::span<const size_t> in_strides,
+    [[maybe_unused]] gsl::span<const size_t> out_strides,
+    int32_t axis) noexcept;
 
 template <typename T>
-result<void> optimized::log_softmax(const T *input, T *output,
-                                    const dims_t &in_shape,
-                                    [[maybe_unused]] const dims_t &in_strides,
-                                    [[maybe_unused]] const dims_t &out_strides,
-                                    int32_t axis) noexcept {
+result<void>
+optimized::log_softmax(const T *input, T *output,
+                       gsl::span<const size_t> in_shape,
+                       [[maybe_unused]] gsl::span<const size_t> in_strides,
+                       [[maybe_unused]] gsl::span<const size_t> out_strides,
+                       int32_t axis) noexcept {
     result<void> ret_value = ok();
 #if __riscv_vector
     log_softmax_impl(input, output, in_shape, axis);

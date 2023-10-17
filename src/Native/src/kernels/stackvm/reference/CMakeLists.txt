@@ -1,6 +1,7 @@
 ﻿cmake_minimum_required(VERSION 3.13)
 
 set(SRCS ../tensor_ops.cpp
+         ../shape_ops.cpp
          activation.cpp
          batchnorm.cpp
          batch_to_space.cpp
@@ -41,9 +42,11 @@ set(SRCS ../tensor_ops.cpp
          tile.cpp
          topk.cpp
          transpose.cpp
+         trilu.cpp
          unary.cpp
          where.cpp
          uninitialized.cpp
          layer_norm.cpp
-         scatter_nd.cpp)
+         scatter_nd.cpp
+         gather_elements.cpp)
 target_sources(kernels PRIVATE ${SRCS})

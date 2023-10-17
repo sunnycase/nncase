@@ -43,42 +43,22 @@ rhs_shapes = [
 
 @pytest.mark.parametrize('lhs_shape', lhs_shapes)
 @pytest.mark.parametrize('rhs_shape', rhs_shapes)
-def test_letterbox(lhs_shape, rhs_shape, request):
+def test_norm(lhs_shape, rhs_shape, request):
     module = _make_module(rhs_shape)
     overwrite_cfg = """
-case: 
-  preprocess_opt:
-    - name: preprocess
-      values:
-        - true
-    - name: swapRB
-      values:
-        - false
-    - name: input_shape
-      values:
-        - [1,3,224,224]
-    - name: mean
-      values:
-        - [123,114,109]
-    - name: std
-      values:
-        - [2,2,2]
-    - name: input_range
-      values:
-        - [0,255]
-    - name: input_type
-      values:
-        - uint8
-    - name: input_layout
-      values:
-        - NCHW
-    - name: output_layout
-      values:
-        - NCHW
-    - name: letter_value
-      values:
-        - 0.
-"""
+    [compile_opt]
+    preprocess = true
+    swapRB = false
+    input_type = 'uint8'
+    input_shape = [1, 3, 224, 224]
+    input_range = [0, 255]
+    mean = [123, 114, 109]
+    std = [2, 2, 2]
+    input_layout = 'NCHW'
+    output_layout = 'NCHW'
+    model_layout = 'NCHW'
+    letterbox_value = 0
+    """
 
     runner = OnnxTestRunner(request.node.name, overwrite_configs=overwrite_cfg)
     model_file = runner.from_torch(module, lhs_shape)
@@ -86,4 +66,4 @@ case:
 
 
 if __name__ == "__main__":
-    pytest.main(['-vv', 'test_letterbox.py'])
+    pytest.main(['-vv', 'test_norm.py'])

@@ -12,6 +12,7 @@ using System.Text;
 using System.Threading.Tasks;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
+using Newtonsoft.Json;
 using Nncase.Diagnostics;
 using Nncase.Hosting;
 using Nncase.IR;
@@ -48,10 +49,23 @@ public unsafe struct CApiMT
     public delegate* unmanaged<IntPtr, DumpFlags> CompileOptionsGetDumpFlagsPtr;
     public delegate* unmanaged<IntPtr, DumpFlags, void> CompileOptionsSetDumpFlagsPtr;
     public delegate* unmanaged<IntPtr, IntPtr, void> CompileOptionsSetQuantizeOptionsPtr;
+    public delegate* unmanaged<IntPtr, byte, void> CompileOptionsSetPreProcessPtr;
+    public delegate* unmanaged<IntPtr, byte*, nuint, void> CompileOptionsSetInputLayoutPtr;
+    public delegate* unmanaged<IntPtr, byte*, nuint, void> CompileOptionsSetOutputLayoutPtr;
+    public delegate* unmanaged<IntPtr, byte, void> CompileOptionsSetInputTypePtr;
+    public delegate* unmanaged<IntPtr, byte*, nuint, void> CompileOptionsSetInputShapePtr;
+    public delegate* unmanaged<IntPtr, byte*, nuint, void> CompileOptionsSetInputRangePtr;
+    public delegate* unmanaged<IntPtr, byte, void> CompileOptionsSetSwapRBPtr;
+    public delegate* unmanaged<IntPtr, float, void> CompileOptionsSetLetterBoxValuePtr;
+    public delegate* unmanaged<IntPtr, byte*, nuint, void> CompileOptionsSetMeanPtr;
+    public delegate* unmanaged<IntPtr, byte*, nuint, void> CompileOptionsSetStdPtr;
+    public delegate* unmanaged<IntPtr, IntPtr, void> CompileOptionsSetShapeBucketOptionsPtr;
     public delegate* unmanaged<IntPtr, IntPtr, IntPtr> CompileSessionCreatePtr;
     public delegate* unmanaged<IntPtr, IntPtr> CompileSessionGetCompilerPtr;
     public delegate* unmanaged<void> CompilerInitializePtr;
-    public delegate* unmanaged<IntPtr, IntPtr, IntPtr> CompilerImportModulePtr;
+    public delegate* unmanaged<IntPtr, IntPtr, IntPtr> CompilerImportTFLiteModulePtr;
+    public delegate* unmanaged<IntPtr, IntPtr, IntPtr> CompilerImportOnnxModulePtr;
+    public delegate* unmanaged<IntPtr, IntPtr, IntPtr, IntPtr> CompilerImportNcnnModulePtr;
     public delegate* unmanaged<IntPtr, void> CompilerCompilePtr;
     public delegate* unmanaged<IntPtr, IntPtr, void> CompilerGencodePtr;
     public delegate* unmanaged<Runtime.TypeCode, IntPtr> DataTypeFromTypeCodePtr;
@@ -61,6 +75,7 @@ public unsafe struct CApiMT
     public delegate* unmanaged<IntPtr, IntPtr> IRModuleGetEntryPtr;
     public delegate* unmanaged<void> LaunchDebuggerPtr;
     public delegate* unmanaged<IntPtr> QuantizeOptionsCreatePtr;
+    public delegate* unmanaged<IntPtr> ShapeBucketOptionsCreatePtr;
     public delegate* unmanaged<IntPtr, IntPtr, void> QuantizeOptionsSetCalibrationDatasetPtr;
     public delegate* unmanaged<IntPtr, CalibMethod, void> QuantizeOptionsSetCalibrationMethodPtr;
     public delegate* unmanaged<IntPtr, ModelQuantMode, void> QuantizeOptionsSetModelQuantModePtr;
@@ -71,6 +86,12 @@ public unsafe struct CApiMT
     public delegate* unmanaged<IntPtr, byte*, nuint, void> QuantOptionsSetQuantSchemePtr;
     public delegate* unmanaged<IntPtr, byte, void> QuantOptionsSetExportQuantSchemePtr;
     public delegate* unmanaged<IntPtr, byte, void> QuantOptionsSetExportWeightRangeByChannelPtr;
+    public delegate* unmanaged<IntPtr, byte, void> QuantOptionsSetDumpQuantErrorPtr;
+    public delegate* unmanaged<IntPtr, byte, void> QuantOptionsSetDumpQuantErrorSymmetricForSignedPtr;
+    public delegate* unmanaged<IntPtr, byte, void> ShapeBucketOptionsSetEnablePtr;
+    public delegate* unmanaged<IntPtr, byte*, nuint, void> ShapeBucketOptionsSetRangeInfoPtr;
+    public delegate* unmanaged<IntPtr, nuint, void> ShapeBucketOptionsSetSegmentsCountPtr;
+    public delegate* unmanaged<IntPtr, byte*, nuint, void> ShapeBucketOptionsSetFixVarMapPtr;
     public delegate* unmanaged<IntPtr, IntPtr> RTValueFromHandlePtr;
     public delegate* unmanaged<IntPtr, IntPtr> RTValueGetHandlePtr;
     public delegate* unmanaged<CStreamMT*, IntPtr, IntPtr> StreamCreatePtr;
@@ -98,10 +119,23 @@ public static unsafe class CApi
         mt->CompileOptionsSetDumpFlagsPtr = &CompileOptionsSetDumpFlags;
         mt->CompileOptionsGetDumpFlagsPtr = &CompileOptionsGetDumpFlags;
         mt->CompileOptionsSetQuantizeOptionsPtr = &CompileOptionsSetQuantizeOptions;
+        mt->CompileOptionsSetPreProcessPtr = &CompileOptionsSetPreProcess;
+        mt->CompileOptionsSetInputLayoutPtr = &CompileOptionsSetInputLayout;
+        mt->CompileOptionsSetOutputLayoutPtr = &CompileOptionsSetOutputLayout;
+        mt->CompileOptionsSetInputTypePtr = &CompileOptionsSetInputType;
+        mt->CompileOptionsSetInputShapePtr = &CompileOptionsSetInputShape;
+        mt->CompileOptionsSetInputRangePtr = &CompileOptionsSetInputRange;
+        mt->CompileOptionsSetSwapRBPtr = &CompileOptionsSetSwapRB;
+        mt->CompileOptionsSetLetterBoxValuePtr = &CompileOptionsSetLetterBoxValue;
+        mt->CompileOptionsSetMeanPtr = &CompileOptionsSetMean;
+        mt->CompileOptionsSetStdPtr = &CompileOptionsSetStd;
+        mt->CompileOptionsSetShapeBucketOptionsPtr = &CompileOptionsSetShapeBucketOptions;
         mt->CompileSessionCreatePtr = &CompileSessionCreate;
         mt->CompileSessionGetCompilerPtr = &CompileSessionGetCompiler;
         mt->CompilerInitializePtr = &CompilerInitialize;
-        mt->CompilerImportModulePtr = &CompilerImportModule;
+        mt->CompilerImportTFLiteModulePtr = &CompilerImportTFLiteModule;
+        mt->CompilerImportOnnxModulePtr = &CompilerImportOnnxModule;
+        mt->CompilerImportNcnnModulePtr = &CompilerImportNcnnModule;
         mt->CompilerCompilePtr = &CompilerCompile;
         mt->CompilerGencodePtr = &CompilerGencode;
         mt->DataTypeFromTypeCodePtr = &DataTypeFromTypeCode;
@@ -111,6 +145,7 @@ public static unsafe class CApi
         mt->IRModuleGetEntryPtr = &IRModuleGetEntry;
         mt->LaunchDebuggerPtr = &LaunchDebugger;
         mt->QuantizeOptionsCreatePtr = &QuantizeOptionsCreate;
+        mt->ShapeBucketOptionsCreatePtr = &ShapeBucketOptionsCreate;
         mt->QuantizeOptionsSetCalibrationDatasetPtr = &QuantizeOptionsSetCalibrationDataset;
         mt->QuantizeOptionsSetCalibrationMethodPtr = &QuantizeOptionsSetCalibrationMethod;
         mt->QuantizeOptionsSetModelQuantModePtr = &QuantizeOptionsSetModelQuantMode;
@@ -121,6 +156,12 @@ public static unsafe class CApi
         mt->QuantOptionsSetQuantSchemePtr = &QuantizeOptionsSetQuantScheme;
         mt->QuantOptionsSetExportQuantSchemePtr = &QuantizeOptionsSetExportQuantScheme;
         mt->QuantOptionsSetExportWeightRangeByChannelPtr = &QuantizeOptionsSetExportWeightRangeByChannel;
+        mt->QuantOptionsSetDumpQuantErrorPtr = &QuantizeOptionsSetDumpQuantError;
+        mt->QuantOptionsSetDumpQuantErrorSymmetricForSignedPtr = &QuantizeOptionsSetDumpQuantErrorSymmetricForSigned;
+        mt->ShapeBucketOptionsSetEnablePtr = &ShapeBucketOptionsSetEnable;
+        mt->ShapeBucketOptionsSetRangeInfoPtr = &ShapeBucketOptionsSetRangeInfo;
+        mt->ShapeBucketOptionsSetSegmentsCountPtr = &ShapeBucketOptionsSetSegmentsCount;
+        mt->ShapeBucketOptionsSetFixVarMapPtr = &ShapeBucketOptionsSetFixVarMap;
         mt->RTValueFromHandlePtr = &RTValueFromHandle;
         mt->RTValueGetHandlePtr = &RTValueGetHandle;
         mt->StreamCreatePtr = &StreamCreate;
@@ -234,6 +275,106 @@ public static unsafe class CApi
     }
 
     [UnmanagedCallersOnly]
+    private static void CompileOptionsSetPreProcess(IntPtr compileOptionsHandle, byte preProcess)
+    {
+        switch (preProcess)
+        {
+            case 0:
+                Get<CompileOptions>(compileOptionsHandle).PreProcess = false;
+                break;
+            case 1:
+                Get<CompileOptions>(compileOptionsHandle).PreProcess = true;
+                break;
+            default:
+                throw new ArgumentException("Invalid PreProcess Flag");
+        }
+    }
+
+    [UnmanagedCallersOnly]
+    private static void CompileOptionsSetInputLayout(IntPtr compileOptionsHandle, byte* inputLayout, nuint inputLayoutLength)
+    {
+        Get<CompileOptions>(compileOptionsHandle).InputLayout = ToString(inputLayout, inputLayoutLength);
+    }
+
+    [UnmanagedCallersOnly]
+    private static void CompileOptionsSetOutputLayout(IntPtr compileOptionsHandle, byte* outputLayout, nuint outputLayoutLength)
+    {
+        Get<CompileOptions>(compileOptionsHandle).OutputLayout = ToString(outputLayout, outputLayoutLength);
+    }
+
+    [UnmanagedCallersOnly]
+    private static void CompileOptionsSetInputType(IntPtr compileOptionsHandle, byte inputType)
+    {
+        // Get<CompileOptions>(compileOptionsHandle).InputType = inputType;
+        switch (inputType)
+        {
+            case 0:
+                Get<CompileOptions>(compileOptionsHandle).InputType = InputType.Uint8;
+                break;
+            case 1:
+                Get<CompileOptions>(compileOptionsHandle).InputType = InputType.Int8;
+                break;
+            case 2:
+                Get<CompileOptions>(compileOptionsHandle).InputType = InputType.Float32;
+                break;
+            default:
+                throw new ArgumentException("Invalid InputType Flag");
+        }
+    }
+
+    [UnmanagedCallersOnly]
+    private static void CompileOptionsSetInputShape(IntPtr compileOptionsHandle, byte* inputShapeValue, nuint inputShapeValueLength)
+    {
+        Get<CompileOptions>(compileOptionsHandle).InputShape = StringToArrayInt32(ToString(inputShapeValue, inputShapeValueLength));
+    }
+
+    [UnmanagedCallersOnly]
+    private static void CompileOptionsSetInputRange(IntPtr compileOptionsHandle, byte* inputRangeValue, nuint inputRangeValueLength)
+    {
+        Get<CompileOptions>(compileOptionsHandle).InputRange = StringToArrayFloat(ToString(inputRangeValue, inputRangeValueLength));
+    }
+
+    [UnmanagedCallersOnly]
+    private static void CompileOptionsSetSwapRB(IntPtr compileOptionsHandle, byte swapRBValue)
+    {
+        switch (swapRBValue)
+        {
+            case 0:
+                Get<CompileOptions>(compileOptionsHandle).SwapRB = false;
+                break;
+            case 1:
+                Get<CompileOptions>(compileOptionsHandle).SwapRB = true;
+                break;
+            default:
+                throw new ArgumentException("Invalid SwapRB Flag");
+        }
+    }
+
+    [UnmanagedCallersOnly]
+    private static void CompileOptionsSetLetterBoxValue(IntPtr compileOptionsHandle, float letterBoxValue)
+    {
+        Get<CompileOptions>(compileOptionsHandle).LetterBoxValue = letterBoxValue;
+    }
+
+    [UnmanagedCallersOnly]
+    private static void CompileOptionsSetMean(IntPtr compileOptionsHandle, byte* meanValue, nuint meanValueLength)
+    {
+        Get<CompileOptions>(compileOptionsHandle).Mean = StringToArrayFloat(ToString(meanValue, meanValueLength));
+    }
+
+    [UnmanagedCallersOnly]
+    private static void CompileOptionsSetStd(IntPtr compileOptionsHandle, byte* stdValue, nuint stdValueLength)
+    {
+        Get<CompileOptions>(compileOptionsHandle).Std = StringToArrayFloat(ToString(stdValue, stdValueLength));
+    }
+
+    [UnmanagedCallersOnly]
+    private static void CompileOptionsSetShapeBucketOptions(IntPtr compileOptionsHandle, IntPtr shapeBucketOptionsHandle)
+    {
+        Get<CompileOptions>(compileOptionsHandle).ShapeBucketOptions = Get<ShapeBucketOptions>(shapeBucketOptionsHandle);
+    }
+
+    [UnmanagedCallersOnly]
     private static IntPtr CompileSessionCreate(IntPtr targetHandle, IntPtr compileOptionsHandle)
     {
         var target = Get<ITarget>(targetHandle);
@@ -258,11 +399,30 @@ public static unsafe class CApi
     }
 
     [UnmanagedCallersOnly]
-    private static IntPtr CompilerImportModule(IntPtr compilerHandle, IntPtr streamHandle)
+    private static IntPtr CompilerImportTFLiteModule(IntPtr compilerHandle, IntPtr streamHandle)
     {
         var compiler = Get<Compiler>(compilerHandle);
         var stream = Get<CStream>(streamHandle);
-        var module = compiler.ImportModuleAsync(stream).Result;
+        var module = compiler.ImportTFLiteModuleAsync(stream).Result;
+        return GCHandle.ToIntPtr(GCHandle.Alloc(module));
+    }
+
+    [UnmanagedCallersOnly]
+    private static IntPtr CompilerImportOnnxModule(IntPtr compilerHandle, IntPtr streamHandle)
+    {
+        var compiler = Get<Compiler>(compilerHandle);
+        var stream = Get<CStream>(streamHandle);
+        var module = compiler.ImportOnnxModuleAsync(stream).Result;
+        return GCHandle.ToIntPtr(GCHandle.Alloc(module));
+    }
+
+    [UnmanagedCallersOnly]
+    private static IntPtr CompilerImportNcnnModule(IntPtr compilerHandle, IntPtr ncnnParamHandle, IntPtr ncnnBinHandle)
+    {
+        var compiler = Get<Compiler>(compilerHandle);
+        var ncnnParam = Get<CStream>(ncnnParamHandle);
+        var ncnnBin = Get<CStream>(ncnnBinHandle);
+        var module = compiler.ImportNcnnModuleAsync(ncnnParam, ncnnBin).Result;
         return GCHandle.ToIntPtr(GCHandle.Alloc(module));
     }
 
@@ -335,6 +495,12 @@ public static unsafe class CApi
     private static IntPtr QuantizeOptionsCreate()
     {
         return GCHandle.ToIntPtr(GCHandle.Alloc(new QuantizeOptions()));
+    }
+
+    [UnmanagedCallersOnly]
+    private static IntPtr ShapeBucketOptionsCreate()
+    {
+        return GCHandle.ToIntPtr(GCHandle.Alloc(ShapeBucketOptions.Default));
     }
 
     [UnmanagedCallersOnly]
@@ -470,6 +636,86 @@ public static unsafe class CApi
     }
 
     [UnmanagedCallersOnly]
+    private static void QuantizeOptionsSetDumpQuantError(IntPtr quantizeOptionsHandle, byte dumpQuantError)
+    {
+        switch (dumpQuantError)
+        {
+            case 0:
+                Get<QuantizeOptions>(quantizeOptionsHandle).DumpQuantError = false;
+                break;
+            case 1:
+                Get<QuantizeOptions>(quantizeOptionsHandle).DumpQuantError = true;
+                break;
+            default:
+                throw new ArgumentException("Invalid dumpQuantError Flag");
+        }
+    }
+
+    [UnmanagedCallersOnly]
+    private static void QuantizeOptionsSetDumpQuantErrorSymmetricForSigned(IntPtr quantizeOptionsHandle, byte dumpQuantErrorSymmetricForSigned)
+    {
+        switch (dumpQuantErrorSymmetricForSigned)
+        {
+            case 0:
+                Get<QuantizeOptions>(quantizeOptionsHandle).DumpQuantErrorSymmetricForSigned = false;
+                break;
+            case 1:
+                Get<QuantizeOptions>(quantizeOptionsHandle).DumpQuantErrorSymmetricForSigned = true;
+                break;
+            default:
+                throw new ArgumentException("Invalid dumpQuantErrorSymmetricForSigned Flag");
+        }
+    }
+
+    [UnmanagedCallersOnly]
+    private static void ShapeBucketOptionsSetEnable(IntPtr shapeBucketOptionsHandle, byte enable)
+    {
+        switch (enable)
+        {
+            case 0:
+                Get<ShapeBucketOptions>(shapeBucketOptionsHandle).Enable = false;
+                break;
+            case 1:
+                Get<ShapeBucketOptions>(shapeBucketOptionsHandle).Enable = true;
+                break;
+            default:
+                throw new ArgumentException("Invalid enable Flag");
+        }
+    }
+
+    [UnmanagedCallersOnly]
+    private static void ShapeBucketOptionsSetRangeInfo(IntPtr shapeBucketOptionsHandle, byte* rangeInfo, nuint rangeInfoSize)
+    {
+        byte[] rangeInfoByte = new byte[rangeInfoSize];
+        Marshal.Copy(new IntPtr(rangeInfo), rangeInfoByte, 0, (int)rangeInfoSize);
+        string jsonStr = Encoding.UTF8.GetString(rangeInfoByte);
+        Dictionary<string, List<int>> rangeInfoStructTmp = JsonConvert.DeserializeObject<Dictionary<string, List<int>>>(jsonStr)!;
+        Dictionary<string, (int, int)> rangeInfoStruct = new();
+        foreach (var element in rangeInfoStructTmp)
+        {
+            rangeInfoStruct.Add(element.Key, (element.Value[0], element.Value[1]));
+        }
+
+        Get<ShapeBucketOptions>(shapeBucketOptionsHandle).RangeInfo = rangeInfoStruct;
+    }
+
+    [UnmanagedCallersOnly]
+    private static void ShapeBucketOptionsSetSegmentsCount(IntPtr shapeBucketOptionsHandle, nuint segmentCount)
+    {
+        Get<ShapeBucketOptions>(shapeBucketOptionsHandle).SegmentsCount = (int)segmentCount;
+    }
+
+    [UnmanagedCallersOnly]
+    private static void ShapeBucketOptionsSetFixVarMap(IntPtr shapeBucketOptionsHandle, byte* fixVarMap, nuint fixVarMapSize)
+    {
+        byte[] fixVarMapByte = new byte[fixVarMapSize];
+        Marshal.Copy(new IntPtr(fixVarMap), fixVarMapByte, 0, (int)fixVarMapSize);
+        string jsonStr = Encoding.UTF8.GetString(fixVarMapByte);
+        Dictionary<string, int> fixVarMapStruct = JsonConvert.DeserializeObject<Dictionary<string, int>>(jsonStr)!;
+        Get<ShapeBucketOptions>(shapeBucketOptionsHandle).FixVarMap = fixVarMapStruct;
+    }
+
+    [UnmanagedCallersOnly]
     private static IntPtr RTValueFromHandle(IntPtr handle)
     {
         var rtValue = RTValue.FromHandle(handle, true);
@@ -518,6 +764,18 @@ public static unsafe class CApi
 
     private static string ToString(byte* bytes, nuint length) =>
         Encoding.UTF8.GetString(bytes, (int)length);
+
+    private static int[] StringToArrayInt32(string value)
+    {
+        var data = value.Replace(" ", string.Empty, StringComparison.OrdinalIgnoreCase).Split(",");
+        return Array.ConvertAll(data, int.Parse);
+    }
+
+    private static float[] StringToArrayFloat(string value)
+    {
+        var data = value.Replace(" ", string.Empty, StringComparison.OrdinalIgnoreCase).Split(',');
+        return Array.ConvertAll(data, float.Parse);
+    }
 
     private class CCalibrationDatasetProvider : ICalibrationDatasetProvider
     {

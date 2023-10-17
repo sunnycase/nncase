@@ -5,6 +5,7 @@ using System;
 using Nncase.CostModel;
 using Nncase.IR;
 using Nncase.IR.Math;
+using Nncase.Utilities;
 using OrtKISharp;
 
 namespace Nncase.Evaluator.Math;
@@ -12,7 +13,7 @@ namespace Nncase.Evaluator.Math;
 /// <summary>
 /// Evaluator for <see cref="Compare"/>.
 /// </summary>
-public class CompareEvaluator : IEvaluator<Compare>, ITypeInferencer<Compare>, ICostEvaluator<Compare>, IOpPrinter<Compare>
+public class CompareEvaluator : IEvaluator<Compare>, ITypeInferencer<Compare>, ICostEvaluator<Compare>, IOpPrinter<Compare>, IShapeEvaluator<Compare>, IMetricEvaluator<Compare>
 {
     /// <inheritdoc />
     public IValue Visit(IEvaluateContext context, Compare target)
@@ -53,6 +54,16 @@ public class CompareEvaluator : IEvaluator<Compare>, ITypeInferencer<Compare>, I
         };
     }
 
+    public Metric Visit(IMetricEvaluateContext context, Compare target)
+    {
+        var outputType = context.GetReturnType<TensorType>();
+        return new()
+        {
+            [MetricFactorNames.OffChipMemoryTraffic] = CostUtility.GetMemoryAccess(outputType) * 2,
+            [MetricFactorNames.FLOPs] = MetricUtility.GetFLOPs(outputType, 2),
+        };
+    }
+
     /// <inheritdoc/>
     public IRType Visit(ITypeInferenceContext context, Compare target)
     {
@@ -76,6 +87,13 @@ public class CompareEvaluator : IEvaluator<Compare>, ITypeInferencer<Compare>, I
         return $"{context.GetArgument(target, Compare.Lhs)} {op} {context.GetArgument(target, Compare.Rhs)}";
     }
 
+    public Expr Visit(IShapeEvaluateContext context, Compare target)
+    {
+        var lhs = context.GetArgumentShape(target, Compare.Lhs);
+        var rhs = context.GetArgumentShape(target, Compare.Rhs);
+        return ShapeExprUtility.BroadcastShape(lhs, rhs);
+    }
+
     private bool Compute(CompareOp op, int a, int b) => op switch
     {
         CompareOp.Equal => a == b,
@@ -89,6 +107,12 @@ public class CompareEvaluator : IEvaluator<Compare>, ITypeInferencer<Compare>, I
 
     private IRType Visit(TensorType lhs, TensorType rhs)
     {
-        return ((TensorType)TypeInference.BroadcastType(lhs, rhs)) with { DType = DataTypes.Boolean };
+        var broadcastType = TypeInference.BroadcastType(lhs, rhs);
+        if (broadcastType is TensorType tensorType)
+        {
+            return tensorType with { DType = DataTypes.Boolean };
+        }
+
+        return broadcastType;
     }
 }

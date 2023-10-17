@@ -5,6 +5,7 @@ using System;
 using Nncase.CostModel;
 using Nncase.IR;
 using Nncase.IR.Math;
+using Nncase.Utilities;
 using OrtKISharp;
 
 namespace Nncase.Evaluator.Math;
@@ -12,7 +13,7 @@ namespace Nncase.Evaluator.Math;
 /// <summary>
 /// Evaluator for <see cref="Binary"/>.
 /// </summary>
-public partial class BinaryEvaluator : IEvaluator<Binary>, ITypeInferencer<Binary>, ICostEvaluator<Binary>, IOpPrinter<Binary>
+public partial class BinaryEvaluator : IEvaluator<Binary>, ITypeInferencer<Binary>, ICostEvaluator<Binary>, IOpPrinter<Binary>, IShapeEvaluator<Binary>, IMetricEvaluator<Binary>
 {
     /// <inheritdoc />
     public IValue Visit(IEvaluateContext context, Binary binary)
@@ -73,6 +74,20 @@ public partial class BinaryEvaluator : IEvaluator<Binary>, ITypeInferencer<Binar
         };
     }
 
+    public Metric Visit(IMetricEvaluateContext context, Binary target)
+    {
+        var lhsType = context.GetArgumentType<TensorType>(target, Binary.Lhs);
+        var rhsType = context.GetArgumentType<TensorType>(target, Binary.Rhs);
+        var outputType = context.GetReturnType<TensorType>();
+
+        return new()
+        {
+            [MetricFactorNames.OffChipMemoryTraffic] = CostUtility.GetMemoryAccess(lhsType) + CostUtility.GetMemoryAccess(rhsType) + CostUtility.GetMemoryAccess(outputType),
+            [MetricFactorNames.FLOPs] = MetricUtility.GetFLOPs(outputType, (int)MetricUtility.GetBinaryFLOPs(target.BinaryOp)),
+            [MetricFactorNames.Parallel] = 4,
+        };
+    }
+
     /// <inheritdoc/>
     public string Visit(IIRPrinterContext context, Binary target, bool iLmode)
     {
@@ -97,6 +112,13 @@ public partial class BinaryEvaluator : IEvaluator<Binary>, ITypeInferencer<Binar
             BinaryOp.RightShift => $"({lhs} >> {rhs})",
             _ => $"{target.BinaryOp}({lhs}, {rhs})",
         };
+    }
+
+    public Expr Visit(IShapeEvaluateContext context, Binary target)
+    {
+        var lhs = context.GetArgumentShape(target, Binary.Lhs);
+        var rhs = context.GetArgumentShape(target, Binary.Rhs);
+        return ShapeExprUtility.BroadcastShape(lhs, rhs);
     }
 
     private int Compute(BinaryOp op, int a, int b) => op switch

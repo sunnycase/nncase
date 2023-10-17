@@ -13,7 +13,7 @@ namespace Nncase.Evaluator.Math;
 /// <summary>
 /// Evaluator for <see cref="Unary"/>.
 /// </summary>
-public class UnaryEvaluator : IEvaluator<Unary>, ITypeInferencer<Unary>, ICostEvaluator<Unary>, IOpPrinter<Unary>
+public class UnaryEvaluator : IEvaluator<Unary>, ITypeInferencer<Unary>, ICostEvaluator<Unary>, IOpPrinter<Unary>, IShapeEvaluator<Unary>, IMetricEvaluator<Unary>
 {
     /// <inheritdoc/>
     public IValue Visit(IEvaluateContext context, Unary unary)
@@ -43,7 +43,7 @@ public class UnaryEvaluator : IEvaluator<Unary>, ITypeInferencer<Unary>, ICostEv
             UnaryOp.Cos => OrtKI.Cos(input),
             UnaryOp.Cosh => OrtKI.Cosh(input),
             UnaryOp.Exp => OrtKI.Exp(input),
-            UnaryOp.Floor => OrtKI.Floor(input),
+            UnaryOp.Floor => OrtKI.Floor(input.Cast(OrtDataType.Float)).Cast(input.DataType),
             UnaryOp.Log => OrtKI.Log(input),
             UnaryOp.Neg => OrtKI.Neg(input),
             UnaryOp.Round => OrtKI.Round(input),
@@ -82,6 +82,19 @@ public class UnaryEvaluator : IEvaluator<Unary>, ITypeInferencer<Unary>, ICostEv
         };
     }
 
+    public Metric Visit(IMetricEvaluateContext context, Unary target)
+    {
+        var inputType = context.GetArgumentType<TensorType>(target, Unary.Input);
+        var outputType = context.GetReturnType<TensorType>();
+
+        return new()
+        {
+            [MetricFactorNames.OffChipMemoryTraffic] = CostUtility.GetMemoryAccess(inputType) + CostUtility.GetMemoryAccess(outputType),
+            [MetricFactorNames.FLOPs] = MetricUtility.GetFLOPs(outputType),
+            [MetricFactorNames.Parallel] = 4,
+        };
+    }
+
     /// <inheritdoc/>
     public string Visit(IIRPrinterContext context, Unary target, bool iLmode)
     {
@@ -97,6 +110,11 @@ public class UnaryEvaluator : IEvaluator<Unary>, ITypeInferencer<Unary>, ICostEv
         }
 
         throw new NotSupportedException("ILmode = true");
+    }
+
+    public Expr Visit(IShapeEvaluateContext context, Unary target)
+    {
+        return context.GetArgumentShape(target, Unary.Input);
     }
 
     private int Compute_int(int input, UnaryOp op) => op switch

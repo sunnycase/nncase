@@ -12,142 +12,151 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "test_util.h"
+#include "kernel_test.h"
 #include <gtest/gtest.h>
-#include <nncase/kernels/cpu/optimized/tensor_compute.h>
-#include <nncase/kernels/cpu/reference/tensor_compute.h>
+#include <iostream>
+#include <nncase/kernels/stackvm/tensor_ops.h>
+#include <nncase/runtime/datatypes.h>
 #include <nncase/runtime/runtime_tensor.h>
+#include <nncase/runtime/simple_types.h>
+#include <nncase/runtime/stackvm/opcode.h>
+#include <ortki/operators.h>
 
-void slice(runtime_tensor &input, runtime_tensor &output,
-           const runtime_shape_t &begins, const runtime_axis_t &ends,
-           const runtime_axis_t &strides, OpType type) {
-    if (type == OpType::Ref) {
-        NNCASE_UNUSED auto res = cpu::reference::slice(
-            dt_float32,
-            // input.data_as<const gsl::byte>(),
-            get_tensor_cbegin(input), get_tensor_begin(output), input.shape(),
-            input.strides(), output.strides(), begins, ends, strides,
-            default_kernel_context());
-    } else if (type == OpType::Opt) {
-        NNCASE_UNUSED auto res = cpu::optimized::slice(
-            dt_float32, get_tensor_cbegin(input), get_tensor_begin(output),
-            input.shape(), input.strides(), output.strides(), begins, ends,
-            strides, default_kernel_context());
-    } else {
-        assert(false);
-    }
-}
+#define TEST_CASE_NAME "test_slice"
 
-class SliceTest
-    : public ::testing::TestWithParam<std::tuple<
-          runtime_shape_t, runtime_shape_t, // input shape, input strides bias
-          runtime_shape_t, runtime_axis_t,  // begin end
-          runtime_shape_t, runtime_axis_t>> // out strides bias, strides
-{
+using namespace nncase;
+using namespace nncase::runtime;
+using namespace ortki;
+
+class SliceTest : public KernelTest,
+                  public ::testing::TestWithParam<std::tuple<int>> {
   public:
     void SetUp() override {
-        auto &&[data_shape, in_strides_bias, begins, ends, out_strides_bias,
-                strides] = GetParam();
+        READY_SUBCASE()
 
-        input = create_input_tensor(data_shape, in_strides_bias);
+        auto typecode = GetDataType("lhs_type");
+        auto l_shape = GetShapeArray("input_shape");
+        auto value1 = GetShapeArray("value1");
+        auto value2 = GetShapeArray("value2");
+        auto value3 = GetShapeArray("value3");
+        auto value4 = GetShapeArray("value4");
 
-        this->strides = strides;
-        this->begins = begins;
-        this->ends = ends;
+        int32_t input_array[120];
 
-        auto out_shape = shape_sub(begins, ends);
-        for (size_t i = 0; i < out_shape.size(); ++i) {
-            auto out_div = div(out_shape[i], strides[i]);
-            out_shape[i] = (size_t)out_div.quot + (out_div.rem == 0 ? 0 : 1);
+        for (int i = 0; i < 120; ++i) {
+            input_array[i] = i;
         }
-        output_ref = create_tensor(out_shape, out_strides_bias);
-        output_opt = create_tensor(out_shape, out_strides_bias);
+
+        input = hrt::create(typecode, l_shape,
+                            {reinterpret_cast<gsl::byte *>(input_array),
+                             sizeof(input_array)},
+                            true, host_runtime_tensor::pool_cpu_only)
+                    .expect("create tensor failed");
+
+        size_t begin_size = value1.size();
+        int64_t *begin_array = (int64_t *)malloc(begin_size * sizeof(int64_t));
+        std::copy(value1.begin(), value1.end(), begin_array);
+        begin = hrt::create(dt_int64, {begin_size},
+                            {reinterpret_cast<gsl::byte *>(begin_array),
+                             begin_size * sizeof(int64_t)},
+                            true, host_runtime_tensor::pool_cpu_only)
+                    .expect("create1 tensor failed");
+
+        size_t end_size = value2.size();
+        int64_t *end_array = (int64_t *)malloc(end_size * sizeof(int64_t));
+        std::copy(value2.begin(), value2.end(), end_array);
+        end = hrt::create(dt_int64, {begin_size},
+                          {reinterpret_cast<gsl::byte *>(end_array),
+                           end_size * sizeof(int64_t)},
+                          true, host_runtime_tensor::pool_cpu_only)
+                  .expect("create2 tensor failed");
+
+        size_t axes_size = value3.size();
+        int64_t *axes_array = (int64_t *)malloc(axes_size * sizeof(int64_t));
+        std::copy(value3.begin(), value3.end(), axes_array);
+        axes = hrt::create(dt_int64, {begin_size},
+                           {reinterpret_cast<gsl::byte *>(axes_array),
+                            axes_size * sizeof(int64_t)},
+                           true, host_runtime_tensor::pool_cpu_only)
+                   .expect("create3 tensor failed");
+
+        size_t strides_size = value4.size();
+        int64_t *strides_array =
+            (int64_t *)malloc(strides_size * sizeof(int64_t));
+        std::copy(value4.begin(), value4.end(), strides_array);
+        strides = hrt::create(dt_int64, {begin_size},
+                              {reinterpret_cast<gsl::byte *>(strides_array),
+                               strides_size * sizeof(int64_t)},
+                              true, host_runtime_tensor::pool_cpu_only)
+                      .expect("create4 tensor failed");
     }
 
-    runtime_tensor input, output_ref, output_opt;
-    // Tensor<uint32_t> input, output_ref, output_opt;
-    runtime_shape_t begins;
-    runtime_axis_t ends;
-    runtime_axis_t strides;
+    void TearDown() override { CLEAR_SUBCASE() }
+
+  protected:
+    runtime_tensor input;
+    runtime_tensor begin;
+    runtime_tensor end;
+    runtime_tensor axes;
+    runtime_tensor strides;
 };
 
-INSTANTIATE_TEST_SUITE_P(
-    SliceTestDims4, SliceTest,
-    testing::Combine(
-        testing::Values(runtime_shape_t{7, 4, 8, 6}), // input shape
-        testing::Values(runtime_shape_t{0, 0, 0, 0},  // input strides offset
-                        runtime_shape_t{0, 0, 3, 0},
-                        runtime_shape_t{0, 3, 0, 0},
-                        runtime_shape_t{3, 0, 0, 0},
-                        runtime_shape_t{3, 3, 3, 3}),
-        testing::Values(runtime_shape_t{0, 0, 0, 0}, // begin
-                        runtime_shape_t{1, 1, 1, 1},
-                        runtime_shape_t{2, 2, 2, 2}),
-        testing::Values(runtime_axis_t{3, 3, 3, 3}, // end
-                        runtime_axis_t{3, 3, 8, 6}, runtime_axis_t{7, 4, 8, 6}),
-        testing::Values(runtime_shape_t{0, 0, 0, 0}, // output strides offset
-                        runtime_shape_t{3, 3, 3, 3}),
-        testing::Values(runtime_axis_t{1, 1, 1, 1}, // strides
-                        runtime_axis_t{1, 1, 1, 3}, runtime_axis_t{1, 1, 3, 1},
-                        runtime_axis_t{1, 3, 1, 1}, runtime_axis_t{3, 1, 1, 1},
-                        runtime_axis_t{3, 3, 3, 3})));
+INSTANTIATE_TEST_SUITE_P(Slice, SliceTest,
+                         testing::Combine(testing::Range(0, MAX_CASE_NUM)));
 
-INSTANTIATE_TEST_SUITE_P(
-    SliceTestDims3, SliceTest,
-    testing::Combine(
-        testing::Values(runtime_shape_t{7, 8, 6}), // input shape
-        testing::Values(runtime_shape_t{0, 0, 0},  // input strides offset
-                        runtime_shape_t{0, 3, 0}, runtime_shape_t{3, 0, 0},
-                        runtime_shape_t{3, 3, 3}),
-        testing::Values(runtime_shape_t{0, 0, 0}, // begin
-                        runtime_shape_t{1, 1, 1}, runtime_shape_t{2, 2, 2}),
-        testing::Values(runtime_axis_t{3, 3, 3}, // end
-                        runtime_axis_t{3, 7, 4}, runtime_axis_t{7, 8, 6}),
-        testing::Values(runtime_shape_t{0, 0, 0},
-                        runtime_shape_t{3, 3, 3}), // output strides offset
-        testing::Values(runtime_axis_t{1, 1, 1},   // strides
-                        runtime_axis_t{1, 1, 3}, runtime_axis_t{1, 3, 1},
-                        runtime_axis_t{3, 1, 1}, runtime_axis_t{3, 3, 3})));
+TEST_P(SliceTest, Slice) {
 
-INSTANTIATE_TEST_SUITE_P(
-    SliceTestDims2, SliceTest,
-    testing::Combine(
-        testing::Values(runtime_shape_t{8, 6}), // input shape
-        testing::Values(runtime_shape_t{0, 0},  // input strides offset
-                        runtime_shape_t{0, 3}, runtime_shape_t{3, 0},
-                        runtime_shape_t{3, 3}),
-        testing::Values(runtime_shape_t{0, 0}, // begin
-                        runtime_shape_t{1, 1}, runtime_shape_t{2, 2}),
-        testing::Values(runtime_axis_t{3, 3}, // end
-                        runtime_axis_t{7, 4}, runtime_axis_t{8, 6}),
-        testing::Values(runtime_shape_t{0, 0},
-                        runtime_shape_t{3, 3}), // output strides offset
-        testing::Values(runtime_axis_t{1, 1},   // strides
-                        runtime_axis_t{1, 3}, runtime_axis_t{3, 1},
-                        runtime_axis_t{3, 3})));
+    // expected
+    int32_t result[] = {0, 1, 2, 3, 4};
+    auto expected =
+        hrt::create(input.datatype(), {1, 1, 1, 5},
+                    {reinterpret_cast<gsl::byte *>(result), sizeof(result)},
+                    true, host_runtime_tensor::pool_cpu_only)
+            .expect("create tensor failed");
 
-INSTANTIATE_TEST_SUITE_P(
-    SliceTestDims1, SliceTest,
-    testing::Combine(testing::Values(runtime_shape_t{19}), // input shape
-                     testing::Values(runtime_shape_t{0}, // input strides offset
-                                     runtime_shape_t{3}),
-                     testing::Values(runtime_shape_t{1}, // begin
-                                     runtime_shape_t{3}),
-                     testing::Values(runtime_axis_t{5}, // end
-                                     runtime_axis_t{10}, runtime_axis_t{19}),
-                     testing::Values(runtime_shape_t{0},
-                                     runtime_shape_t{
-                                         3}),           // output strides offset
-                     testing::Values(runtime_axis_t{1}, // strides
-                                     runtime_axis_t{2}, runtime_axis_t{3},
-                                     runtime_axis_t{4})));
+    // actual
+    auto output =
+        kernels::stackvm::slice(input.impl(), begin.impl(), end.impl(),
+                                axes.impl(), strides.impl())
+            .expect("slice failed");
+    runtime_tensor actual(output.as<tensor>().expect("as tensor failed"));
 
-TEST_P(SliceTest, normal) {
-    slice(input, output_ref, begins, ends, strides, OpType::Ref);
-    slice(input, output_opt, begins, ends, strides, OpType::Opt);
-    auto is_ok = is_same_tensor(output_ref, output_opt);
-    if (!is_ok) {
-        output_all_data(input, output_ref, output_opt);
-        ASSERT_EQ(output_ref, output_opt);
+    bool result1 = is_same_tensor(expected, actual) ||
+                   cosine_similarity_tensor(expected, actual);
+
+    if (!result1) {
+        std::cout << "actual ";
+        print_runtime_tensor(actual);
+        std::cout << "expected ";
+        print_runtime_tensor(expected);
     }
+
+    // compare
+    EXPECT_TRUE(result);
+}
+
+int main(int argc, char *argv[]) {
+    READY_TEST_CASE_GENERATE()
+    FOR_LOOP(lhs_type, i)
+    FOR_LOOP(input_shape, j)
+    FOR_LOOP(value1, k)
+    FOR_LOOP(value2, l)
+    FOR_LOOP(value3, m)
+    FOR_LOOP(value4, n)
+    SPLIT_ELEMENT(lhs_type, i)
+    SPLIT_ELEMENT(input_shape, j)
+    SPLIT_ELEMENT(value1, k)
+    SPLIT_ELEMENT(value2, l)
+    SPLIT_ELEMENT(value3, m)
+    SPLIT_ELEMENT(value4, n)
+    WRITE_SUB_CASE()
+    FOR_LOOP_END()
+    FOR_LOOP_END()
+    FOR_LOOP_END()
+    FOR_LOOP_END()
+    FOR_LOOP_END()
+    FOR_LOOP_END()
+
+    ::testing::InitGoogleTest(&argc, argv);
+    return RUN_ALL_TESTS();
 }

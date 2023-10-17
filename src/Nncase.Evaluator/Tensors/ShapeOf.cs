@@ -15,7 +15,7 @@ namespace Nncase.Evaluator.Tensors;
 /// <summary>
 /// Evaluator for <see cref="ShapeOf"/>.
 /// </summary>
-public class ShapeOfEvaluator : IEvaluator<ShapeOf>, ITypeInferencer<ShapeOf>, ICostEvaluator<ShapeOf>
+public class ShapeOfEvaluator : IEvaluator<ShapeOf>, ITypeInferencer<ShapeOf>, ICostEvaluator<ShapeOf>, IShapeEvaluator<ShapeOf>, IMetricEvaluator<ShapeOf>
 {
     public IValue Visit(IEvaluateContext context, ShapeOf shape)
     {
@@ -39,6 +39,21 @@ public class ShapeOfEvaluator : IEvaluator<ShapeOf>, ITypeInferencer<ShapeOf>, I
         return new()
         {
             [CostFactorNames.MemoryStore] = CostUtility.GetMemoryAccess(outputType),
+        };
+    }
+
+    public Expr Visit(IShapeEvaluateContext context, ShapeOf target)
+    {
+        return context.GetArgumentShape(target, ShapeOf.Input);
+    }
+
+    public Metric Visit(IMetricEvaluateContext context, ShapeOf target)
+    {
+        var outputType = context.GetReturnType<TensorType>();
+
+        return new()
+        {
+            [MetricFactorNames.OffChipMemoryTraffic] = CostUtility.GetMemoryAccess(outputType),
         };
     }
 

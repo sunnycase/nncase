@@ -21,6 +21,7 @@ set(SRCS concat.cpp
          gather_nd.cpp
          quantize.cpp
          onehot.cpp
+         transpose.cpp
 )
 
 function(_TARGET_ARCH_FILES)
@@ -50,6 +51,7 @@ _TARGET_ARCH_FILES(TARGET kernels
                    unary.cpp
                    where.cpp
                    log_softmax.cpp
+                   reduce.cpp
 )
 
 if(NOT MSVC)

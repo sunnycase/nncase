@@ -132,7 +132,7 @@ public static class TypeInference
                 var inDim = inDimIndex < 0 ? 1 : inShape[inDimIndex].Value!.Value;
                 if (inDim == 0)
                 {
-                    throw new InvalidOperationException("Input dimension should not be 0.");
+                    return new InvalidType("Input dimension should not be 0.");
                 }
 
                 inputDims[i] = inDim;
@@ -177,10 +177,8 @@ public static class TypeInference
             padding is TensorConst paddingValue &&
             dilation is TensorConst dilation_con &&
             groups is TensorConst groups_con &&
-            input.Shape[2].IsFixed &&
-            input.Shape[3].IsFixed &&
-            weights.Shape[2].IsFixed &&
-            weights.Shape[3].IsFixed)
+            input.Shape.IsFixed &&
+            weights.Shape.IsFixed)
         {
             var ts_stride = strideValue.Value.Cast<int>();
             var ts_padding = paddingValue.Value.Cast<int>();
@@ -300,6 +298,11 @@ public static class TypeInference
             return input;
         }
 
+        if (input.Shape.IsScalar)
+        {
+            return new InvalidType("Reduce input shape should not be scalar");
+        }
+
         if (keepDims is TensorConst keepDimsV &&
             axis is TensorConst axisValue)
         {
@@ -315,7 +318,6 @@ public static class TypeInference
                 }
                 else
                 {
-                    // todo: test
                     outShape[ax] = 0;
                 }
             }
@@ -350,6 +352,11 @@ public static class TypeInference
             }
 
             var permt = permValue.Value.ToArray<int>();
+            if (input.Shape.Count != permt.Length)
+            {
+                return new InvalidType("Transpose shoud perm.size == inShape.size");
+            }
+
             var outShape = ApplyPerm(input.Shape, permt);
             return input with { Shape = outShape };
         }
@@ -439,11 +446,6 @@ public static class TypeInference
             if (a.DType != b.DType)
             {
                 return new InvalidType($"Inputs DType of if should be same, then: {a.DType}, else: {b.DType}");
-            }
-
-            if (a.Shape.Rank != b.Shape.Rank)
-            {
-                return new InvalidType($"Inputs Shape of if should be same Rank, then: {a.Shape.Rank}, else: {b.Shape.Rank}");
             }
 
             return new TensorType(a.DType, Shape.Unknown(a.Shape.Rank));

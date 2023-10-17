@@ -14,7 +14,7 @@ namespace Nncase.Evaluator.Tensors;
 /// Evaluator for <see cref="Broadcast"/>.
 /// </summary>
 [TypeInferGenerator]
-public sealed partial class BroadcastEvaluator : IEvaluator<Broadcast>, ITypeInferencer<Broadcast>, ICostEvaluator<Broadcast>
+public sealed partial class BroadcastEvaluator : IEvaluator<Broadcast>, ITypeInferencer<Broadcast>, ICostEvaluator<Broadcast>, IMetricEvaluator<Broadcast>
 {
     /// <inheritdoc/>
     public IValue Visit(IEvaluateContext context, Broadcast b)
@@ -26,7 +26,7 @@ public sealed partial class BroadcastEvaluator : IEvaluator<Broadcast>, ITypeInf
             return input.Cast(OrtDataType.Float).BroadcastTo(shape).Cast(OrtDataType.Bool).ToValue();
         }
 
-        return input.BroadcastTo(shape).ToValue();
+        return OrtKIExtensions.BroadcastTo(input, shape, input.DataType).ToValue();
     }
 
     /// <inheritdoc/>
@@ -35,6 +35,16 @@ public sealed partial class BroadcastEvaluator : IEvaluator<Broadcast>, ITypeInf
         var input = context.GetArgumentType<TensorType>(target, Broadcast.Input);
         var ret = context.GetReturnType<TensorType>();
         return CostUtility.GetBroadcastCost(input, ret);
+    }
+
+    public Metric Visit(IMetricEvaluateContext context, Broadcast target)
+    {
+        var input = context.GetArgumentType<TensorType>(target, Broadcast.Input);
+        var ret = context.GetReturnType<TensorType>();
+        return new()
+        {
+            [MetricFactorNames.OffChipMemoryTraffic] = CostUtility.GetMemoryAccess(input) + CostUtility.GetMemoryAccess(ret),
+        };
     }
 
     private IRType Visit(TensorType input, TensorType shape, ITypeInferenceContext context, Broadcast op)

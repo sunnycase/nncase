@@ -17,7 +17,7 @@ namespace Nncase.Evaluator.Tensors;
 /// <summary>
 /// Evaluator for <see cref="TopK"/>.
 /// </summary>
-public class TopKEvaluator : IEvaluator<TopK>, ITypeInferencer<TopK>, ICostEvaluator<TopK>
+public class TopKEvaluator : IEvaluator<TopK>, ITypeInferencer<TopK>, ICostEvaluator<TopK>, IMetricEvaluator<TopK>
 {
     /// <inheritdoc/>
     public IValue Visit(IEvaluateContext context, TopK topK)
@@ -51,16 +51,21 @@ public class TopKEvaluator : IEvaluator<TopK>, ITypeInferencer<TopK>, ICostEvalu
         };
     }
 
+    public Metric Visit(IMetricEvaluateContext context, TopK target)
+    {
+        var x = context.GetArgumentType<TensorType>(target, TopK.X);
+        var outputType = context.GetReturnType<TupleType>();
+        return new()
+        {
+            [MetricFactorNames.OffChipMemoryTraffic] = CostUtility.GetMemoryAccess(x) + CostUtility.GetMemoryAccess(outputType),
+        };
+    }
+
     private IRType Visit(ITypeInferenceContext context, TopK target, TensorType x, TensorType k)
     {
-        if (x.Shape.IsUnranked)
+        if (x.Shape.IsUnranked || k.Shape.IsUnranked)
         {
-            return x;
-        }
-
-        if (k.Shape.IsUnranked)
-        {
-            return k;
+            return new TupleType(new[] { x, new TensorType(DataTypes.Int64, Shape.Unranked) });
         }
 
         if (k.DType != DataTypes.Int64)

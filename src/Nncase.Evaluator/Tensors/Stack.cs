@@ -9,6 +9,7 @@ using Nncase.CostModel;
 using Nncase.IR;
 using Nncase.IR.Math;
 using Nncase.IR.Tensors;
+using Nncase.Utilities;
 using OrtKISharp;
 
 namespace Nncase.Evaluator.Tensors;
@@ -16,7 +17,7 @@ namespace Nncase.Evaluator.Tensors;
 /// <summary>
 /// Evaluator for <see cref="Stack"/>.
 /// </summary>
-public class StackEvaluator : IEvaluator<Stack>, ITypeInferencer<Stack>, ICostEvaluator<Stack>
+public class StackEvaluator : IEvaluator<Stack>, ITypeInferencer<Stack>, ICostEvaluator<Stack>, IShapeEvaluator<Stack>, IMetricEvaluator<Stack>
 {
     /// <inheritdoc/>
     public IValue Visit(IEvaluateContext context, Stack stack)
@@ -54,8 +55,34 @@ public class StackEvaluator : IEvaluator<Stack>, ITypeInferencer<Stack>, ICostEv
         };
     }
 
+    public Expr Visit(IShapeEvaluateContext context, Stack target)
+    {
+        var inShape = context.GetArgumentShape(target, Stack.Inputs);
+        Expr one = new[] { 1L };
+        if (inShape[0].CheckedShape.IsScalar)
+        {
+            one = 1L;
+        }
+
+        return IR.F.Tensors.Concat(new IR.Tuple(inShape[0], one), 0);
+    }
+
+    public Metric Visit(IMetricEvaluateContext context, Stack target)
+    {
+        var returnType = context.GetReturnType<TensorType>();
+        return new()
+        {
+            [MetricFactorNames.OffChipMemoryTraffic] = CostUtility.GetMemoryAccess(returnType) * 2,
+        };
+    }
+
     private IRType Visit(ITypeInferenceContext context, Stack target, TupleType inputs)
     {
+        if (inputs.Count == 0)
+        {
+            return new InvalidType("Tuple count should not be zero");
+        }
+
         if (context.GetArgument(target, Stack.Axis) is TensorConst axis_con)
         {
             var axis_v = axis_con.Value.ToScalar<int>();
@@ -80,6 +107,11 @@ public class StackEvaluator : IEvaluator<Stack>, ITypeInferencer<Stack>, ICostEv
             if (!ttypes.Skip(1).All(ttype => ttype.Shape == ttypes[0].Shape))
             {
                 return new InvalidType("The Tuple Elements Shape Must All Equal!");
+            }
+
+            if (!ttypes.Skip(1).All(ttype => ttype.DType == ttypes[0].DType))
+            {
+                return new InvalidType("The Tuple Elements DatType Must All Equal!");
             }
 
             if (ttypes[0].Shape.IsScalar)

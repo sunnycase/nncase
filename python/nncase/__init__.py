@@ -23,6 +23,7 @@ import subprocess
 import shutil
 import os
 import sys
+import string
 import numpy as np
 from pathlib import Path
 from shutil import which
@@ -52,21 +53,38 @@ class ImportOptions:
 
 
 class PTQTensorOptions:
-    calibrate_method: str
-    input_mean: float
-    input_std: float
-    samples_count: int
-    quant_type: str
-    w_quant_type: str
-    finetune_weights_method: str
     use_mix_quant: bool
-    quant_scheme: str
+    use_mse_quant_w: bool
     export_quant_scheme: bool
     export_weight_range_by_channel: bool
+    dump_quant_error: bool
+    dump_quant_error_symmetric_for_signed: bool
+    quant_type: str
+    w_quant_type: str
+    calibrate_method: str
+    finetune_weights_method: str
+    input_mean: float
+    input_std: float
+    quant_scheme: str
+    samples_count: int
     cali_data: List[RuntimeTensor]
 
     def __init__(self) -> None:
-        pass
+        self.use_mix_quant: bool = False
+        self.use_mse_quant_w = False
+        self.export_quant_scheme: bool = False
+        self.export_weight_range_by_channel: bool = False
+        self.dump_quant_error: bool = False
+        self.dump_quant_error_symmetric_for_signed: bool = True
+        self.quant_type: str = "uint8"
+        self.w_quant_type: str = "uint8"
+        self.calibrate_method: str = "Kld"
+        self.finetune_weights_method: str = "NoFineTuneWeights"
+        self.input_mean: float = 0.5
+        self.input_std: float = 0.5
+        self.quant_scheme: str = ""
+        self.samples_count: int = 5
+        self.cali_data: List[RuntimeTensor] = []
 
     def set_tensor_data(self, data: List[List[np.ndarray]]) -> None:
         reshape_data = list(map(list, zip(*data)))
@@ -124,6 +142,7 @@ class Compiler:
     _compiler: _nncase.Compiler
     _compile_options: _nncase.CompileOptions
     _quantize_options: _nncase.QuantizeOptions
+    _shape_bucket_options: _nncase.ShapeBucketOptions
     _module: IRModule
 
     def __init__(self, compile_options: CompileOptions) -> None:
@@ -132,6 +151,17 @@ class Compiler:
         self._session = _nncase.CompileSession(self._target, self._compile_options)
         self._compiler = self._session.compiler
         self._quantize_options = None
+        self._shape_bucket_options = _nncase.ShapeBucketOptions()
+        self.init_shape_bucket_options(compile_options)
+
+    def init_shape_bucket_options(self, compile_options: CompileOptions) -> None:
+        self._shape_bucket_options = _nncase.ShapeBucketOptions()
+        self._shape_bucket_options.segments_count = compile_options.shape_bucket_segments_count
+        self._shape_bucket_options.enable = compile_options.shape_bucket_enable
+        self._shape_bucket_options.range_info = compile_options.shape_bucket_range_info
+        self._shape_bucket_options.segments_count = compile_options.shape_bucket_segments_count
+        self._shape_bucket_options.fix_var_map = compile_options.shape_bucket_fix_var_map
+        self._compile_options.shape_bucket_options = self._shape_bucket_options
 
     def compile(self) -> None:
         self._compiler.compile()
@@ -156,21 +186,26 @@ class Compiler:
 
     def import_onnx(self, model_content: bytes, options: ImportOptions) -> None:
         self._compile_options.input_format = "onnx"
-        self._import_module(model_content)
+        self._import_onnx_module(model_content)
 
     def import_tflite(self, model_content: bytes, options: ImportOptions) -> None:
         self._compile_options.input_format = "tflite"
-        self._import_module(model_content)
+        self._import_tflite_module(model_content)
+
+    def import_ncnn(self, model_param: bytes, model_bin : bytes, options: ImportOptions) -> None:
+        self._compile_options.input_format = "ncnn"
+        self._import_ncnn_module(model_param, model_bin)
 
     def use_ptq(self, ptq_dataset_options: PTQTensorOptions) -> None:
         dataset = [_nncase.RTValue.from_runtime_tensor(
             data) for data in ptq_dataset_options.cali_data]
         provider = _nncase.CalibrationDatasetProvider(
-            dataset, ptq_dataset_options.samples_count, self._module.entry.parameters)
+            dataset, ptq_dataset_options.samples_count, self._module.entry.parameters) if len(dataset) != 0 else []
         if not self._quantize_options:
             self._quantize_options = _nncase.QuantizeOptions()
             self._compile_options.quantize_options = self._quantize_options
-        self._quantize_options.calibration_dataset = provider
+        if len(dataset) != 0:
+            self._quantize_options.calibration_dataset = provider
         self._quantize_options.model_quant_mode = _nncase.ModelQuantMode.UsePTQ
 
         if (ptq_dataset_options.calibrate_method == "NoClip"):
@@ -211,12 +246,32 @@ class Compiler:
         self._quantize_options.quant_scheme = ptq_dataset_options.quant_scheme
         self._quantize_options.export_quant_scheme = ptq_dataset_options.export_quant_scheme
         self._quantize_options.export_weight_range_by_channel = ptq_dataset_options.export_weight_range_by_channel
+        self._quantize_options.dump_quant_error = ptq_dataset_options.dump_quant_error
+        self._quantize_options.dump_quant_error_symmetric_for_signed = ptq_dataset_options.dump_quant_error_symmetric_for_signed
 
     def dump_range_options(self) -> DumpRangeTensorOptions:
         raise NotImplementedError("dump_range_options")
 
     def __process_compile_options(self, compile_options: CompileOptions) -> ClCompileOptions:
         self._target = _nncase.Target(compile_options.target)
+        if compile_options.preprocess:
+            self._compile_options.preprocess = compile_options.preprocess
+            self._compile_options.swapRB = compile_options.swapRB
+            if compile_options.input_type == "uint8":
+                self._compile_options.input_type = _nncase.InputType.Uint8
+            elif compile_options.input_type == "int8":
+                self._compile_options.input_type = _nncase.InputType.Int8
+            if compile_options.input_type == "float32":
+                self._compile_options.input_type = _nncase.InputType.Float32
+            self._compile_options.input_shape = str(compile_options.input_shape)[1:-1]
+            self._compile_options.input_range = str(compile_options.input_range)[1:-1]
+            self._compile_options.mean = str(compile_options.mean)[1:-1]
+            self._compile_options.std = str(compile_options.std)[1:-1]
+            self._compile_options.input_layout = compile_options.input_layout
+            self._compile_options.output_layout = compile_options.output_layout
+            self._compile_options.letterbox_value = compile_options.letterbox_value
+
+        self._compile_options.input_file = compile_options.input_file
         dump_flags = _nncase.DumpFlags.Nothing if not compile_options.dump_ir else _nncase.DumpFlags(
             _nncase.DumpFlags.PassIR)
         if (compile_options.dump_asm):
@@ -224,9 +279,18 @@ class Compiler:
         self._compile_options.dump_flags = dump_flags
         self._compile_options.dump_dir = compile_options.dump_dir
 
-    def _import_module(self, model_content: bytes | io.RawIOBase) -> None:
+    def _import_onnx_module(self, model_content: bytes | io.RawIOBase) -> None:
         stream = io.BytesIO(model_content) if isinstance(model_content, bytes) else model_content
-        self._module = IRModule(self._compiler.import_module(stream))
+        self._module = IRModule(self._compiler.import_onnx_module(stream))
+
+    def _import_tflite_module(self, model_content: bytes | io.RawIOBase) -> None:
+        stream = io.BytesIO(model_content) if isinstance(model_content, bytes) else model_content
+        self._module = IRModule(self._compiler.import_tflite_module(stream))
+
+    def _import_ncnn_module(self, model_param: bytes | io.RawIOBase, model_bin: bytes | io.RawIOBase) -> None:
+        param_stream = io.BytesIO(model_param) if isinstance(model_param, bytes) else model_param
+        bin_stream = io.BytesIO(model_bin) if isinstance(model_bin, bytes) else model_bin
+        self._module = IRModule(self._compiler.import_ncnn_module(param_stream, bin_stream))
 
 
 def check_target(target: str):
@@ -278,30 +342,72 @@ class ClCompileOptions():
     OutputFile: str
     ModelQuantMode: int
     QuantizeOptions: ClQuantizeOptions
+    SwapRB: bool
+    InputRange: List[float]
+    InputShape: List[int]
+    InputType: str
+    Mean: List[float]
+    Std: List[float]
+    PreProcess: bool
+    InputLayout: str
+    OutputLayout: str
+    LetterBoxValue: float
 
 
 class CompileOptions:
-    benchmark_only: bool
-    dump_asm: bool
-    dump_dir: str
-    dump_ir: bool
+    target: str
+    preprocess: bool
     swapRB: bool
-    input_range: List[float]
-    input_shape: List[int]
     input_type: str
-    is_fpga: bool
+    input_shape: List[int]
+    input_range: List[float]
+    input_file: str
     mean: List[float]
     std: List[float]
-    output_type: str
-    preprocess: bool
-    quant_type: str
-    target: str
-    w_quant_type: str
-    use_mse_quant_w: bool
     input_layout: str
     output_layout: str
     letterbox_value: float
-    tcu_num: int
+    dump_asm: bool
+    dump_ir: bool
+    dump_dir: str
+    shape_bucket_enable: bool
+    shape_bucket_range_info: dict
+    shape_bucket_segments_count: int
+    shape_bucket_fix_var_map: dict
 
     def __init__(self) -> None:
-        pass
+
+        self.target = "cpu"
+        self.preprocess = False
+        self.swapRB = False
+        self.input_type = "float32"
+        self.input_shape = []
+        self.input_range = []
+        self.input_file = ""
+        self.mean = [0, 0, 0]
+        self.std = [1, 1, 1]
+        self.input_layout = ""
+        self.output_layout = ""
+        self.letterbox_value = 0
+        self.dump_asm = True
+        self.dump_ir = False
+        self.dump_dir = "tmp"
+        self.shape_bucket_enable = False
+        self.shape_bucket_range_info = {}
+        self.shape_bucket_segments_count = 2
+        self.shape_bucket_fix_var_map = {}
+
+
+class ShapeBucketOptions:
+    enable: bool
+    var_map: dict
+    range_info: dict
+    segments_count: int
+    fix_var_map: dict
+
+    def __init__(self) -> None:
+        self.enable = False
+        self.var_map = {}
+        self.range_info = {}
+        self.segments_count = 2
+        self.fix_var_map = {}

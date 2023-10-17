@@ -6,6 +6,8 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Text;
 using System.Threading.Tasks;
+using DryIoc.ImTools;
+using Nncase.Diagnostics;
 using Nncase.IR.Math;
 using Nncase.IR.NN;
 using Nncase.IR.Tensors;
@@ -20,9 +22,43 @@ public static class Tensors
 {
     public static Call Transpose(Expr input, Expr perm) => new Call(new Transpose(), input, perm);
 
-    public static Expr NHWCToNCHW(Expr input) => Transpose(input, new[] { 0, 3, 1, 2 });
+    public static Expr NHWCToNCHW(Expr input)
+    {
+        int[] perm;
+        if (input.CheckedShape.Rank == 4)
+        {
+            perm = new[] { 0, 3, 1, 2 };
+        }
+        else if (input.CheckedShape.Rank == 3)
+        {
+            perm = new[] { 0, 2, 1 };
+        }
+        else
+        {
+            throw new InvalidOperationException();
+        }
 
-    public static Expr NCHWToNHWC(Expr input) => Transpose(input, new[] { 0, 2, 3, 1 });
+        return Transpose(input, perm);
+    }
+
+    public static Expr NCHWToNHWC(Expr input)
+    {
+        int[] perm;
+        if (input.CheckedShape.Rank == 4)
+        {
+            perm = new[] { 0, 2, 3, 1 };
+        }
+        else if (input.CheckedShape.Rank == 3)
+        {
+            perm = new[] { 0, 2, 1 };
+        }
+        else
+        {
+            throw new InvalidOperationException();
+        }
+
+        return Transpose(input, perm);
+    }
 
     public static Expr NHWCToWNCH(Expr input) => Transpose(input, new[] { 2, 0, 3, 1 });
 
@@ -55,6 +91,9 @@ public static class Tensors
 
     public static Call Gather(Expr input, Expr axis, Expr index) => new Call(new Gather(), input, axis, index);
 
+    public static Call GatherElements(Expr input, Expr axis, Expr indices) =>
+        new Call(new GatherElements(), input, axis, indices);
+
     public static Call GatherND(Expr input, Expr batch_dims, Expr index) =>
         new Call(new GatherND(), input, batch_dims, index);
 
@@ -63,8 +102,10 @@ public static class Tensors
 
     public static Call MatMul(Expr input, Expr other) => new Call(new MatMul(), input, other);
 
-    // todo:remove prod
-    public static Call Prod(Expr input) => new Call(new Prod(), input);
+    public static Call Prod(Expr input)
+    {
+        return Reduce(ReduceOp.Prod, input, Enumerable.Range(0, input.CheckedShape.Rank).Select(x => (long)x).ToArray(), IR.F.Tensors.Cast(1, input.CheckedDataType, CastMode.KDefault), false);
+    }
 
     public static Call Range(Expr begin, Expr end, Expr step) => new Call(new Range(), begin, end, step);
 
@@ -142,4 +183,8 @@ public static class Tensors
 
     public static Call TopK(Expr x, Expr k, Expr axis, Expr largest, Expr sorted) =>
         new Call(new TopK(), x, k, axis, largest, sorted);
+
+    public static Call IndexOf(Expr input, Expr value) => new Call(new IndexOf(), input, value);
+
+    public static Call Trilu(Expr input, Expr k, Expr upper) => new Call(new Trilu(), input, k, upper);
 }

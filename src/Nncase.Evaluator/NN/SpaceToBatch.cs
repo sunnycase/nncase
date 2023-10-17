@@ -5,10 +5,13 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using NetFabric.Hyperlinq;
+using Nncase.CostModel;
 using Nncase.IR;
 using Nncase.IR.NN;
 using Nncase.IR.Tensors;
+using Nncase.Utilities;
 using OrtKISharp;
+using static Nncase.IR.F.Tensors;
 using Range = System.Range;
 
 namespace Nncase.Evaluator.NN;
@@ -16,8 +19,28 @@ namespace Nncase.Evaluator.NN;
 /// <summary>
 /// Evaluator for <see cref="SpaceToBatch"/>.
 /// </summary>
-public class SpaceToBatchEvaluator : IEvaluator<SpaceToBatch>, ITypeInferencer<SpaceToBatch>
+public class SpaceToBatchEvaluator : IEvaluator<SpaceToBatch>, ITypeInferencer<SpaceToBatch>, ICostEvaluator<SpaceToBatch>, IMetricEvaluator<SpaceToBatch>, IShapeEvaluator<SpaceToBatch>
 {
+    /// <inheritdoc/>
+    public Cost Visit(ICostEvaluateContext context, SpaceToBatch target)
+    {
+        var ret = context.GetReturnType<TensorType>();
+        return new()
+        {
+            [CostFactorNames.MemoryLoad] = CostUtility.GetMemoryAccess(ret),
+            [CostFactorNames.MemoryStore] = CostUtility.GetMemoryAccess(ret),
+        };
+    }
+
+    public Metric Visit(IMetricEvaluateContext context, SpaceToBatch target)
+    {
+        var ret = context.GetReturnType<TensorType>();
+        return new()
+        {
+            [MetricFactorNames.OffChipMemoryTraffic] = CostUtility.GetMemoryAccess(ret) * 2,
+        };
+    }
+
     /// <inheritdoc/>
     public IValue Visit(IEvaluateContext context, SpaceToBatch s)
     {
@@ -71,6 +94,43 @@ public class SpaceToBatchEvaluator : IEvaluator<SpaceToBatch>, ITypeInferencer<S
         return Visit(context, target, input, blockShape, paddings);
     }
 
+    public Expr Visit(IShapeEvaluateContext context, SpaceToBatch target)
+    {
+        var inShape = context.GetArgumentShape(target, SpaceToBatch.Input);
+        var blockShape = context.GetArgument(target, SpaceToBatch.BlockShape);
+        var padding = Cast(context.GetArgument(target, SpaceToBatch.Paddings), DataTypes.Int64);
+        var input = context.GetArgument(target, SpaceToBatch.Input);
+        if (blockShape is TensorConst blockConst)
+        {
+            var blockShapeValue = blockConst.Value.ToArray<long>();
+            var m = blockShapeValue.Length;
+            var inRank = input.CheckedShape.Rank;
+
+            var paddedShape = new[] { inShape[0] }
+                .Concat(Enumerable.Range(0, inRank)
+                .Select(i =>
+                {
+                    return inShape[i + 1] + padding[2 * i, 0] + padding[2 * i, 1];
+                }))
+                .ToArray();
+            var outFirst = new[] { paddedShape[0] * IR.F.Tensors.Prod(blockShapeValue) };
+
+            // var inRank = Cast(ShapeOf(inShape)[0], DataTypes.Int32);
+            var outMid = Enumerable.Range(0, m).Select(i =>
+            {
+                return paddedShape[i + 1] / blockShapeValue[i];
+            }).ToArray();
+
+            var remainSize = inRank - 1 - m;
+            var remainShape = new If(remainSize > 0, ShapeExprUtility.Slice(inShape, 1 + m, int.MaxValue), Array.Empty<long>());
+            var outLast = remainShape;
+            var outShape = Concat(new IR.Tuple(Stack(new IR.Tuple(outFirst.Concat(outMid).ToArray()), 0), outLast), 0);
+            return outShape;
+        }
+
+        throw new NotImplementedException();
+    }
+
     private T[] RangeExec<T>(long end, Func<int, T> f)
     {
         return EndRange(0, (int)end).Select(f).ToArray();
@@ -108,7 +168,7 @@ public class SpaceToBatchEvaluator : IEvaluator<SpaceToBatch>, ITypeInferencer<S
                                         new InvalidType($"The Padded Shape Must Divides BlockShape!")));
             }
 
-            foreach (var i in Enumerable.Range(m + 1, outshape.Count - (m + 1)))
+            foreach (var i in Enumerable.Range(m + 1, padded_shape.Count - (m + 1)))
             {
                 outshape.Add(padded_shape[i]);
             }
@@ -121,6 +181,6 @@ public class SpaceToBatchEvaluator : IEvaluator<SpaceToBatch>, ITypeInferencer<S
             return input with { Shape = new Shape(outshape) };
         }
 
-        return new InvalidType("Can't Infer Shape With Dynamic Input!");
+        return new TensorType(input.DType, Enumerable.Repeat(Dimension.Unknown, input.Shape.Count).ToArray());
     }
 }

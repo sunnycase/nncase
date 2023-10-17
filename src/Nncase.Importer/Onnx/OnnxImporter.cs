@@ -10,9 +10,11 @@ using System.Linq;
 using Google.Protobuf;
 using Google.Protobuf.Collections;
 using LanguageExt;
+using NetFabric.Hyperlinq;
 using Nncase.IR;
 using Nncase.IR.Tensors;
 using Onnx;
+using Tuple = Nncase.IR.Tuple;
 
 namespace Nncase.Importer;
 
@@ -23,6 +25,8 @@ public sealed partial class OnnxImporter : BaseImporter
     private readonly Dictionary<string, long> _opSetMap;
     private Dictionary<string, Expr>? _outputTensors;
     private Dictionary<string, TensorProto>? _constTensors;
+    private Dictionary<string, Var> _dynVarMap = new();
+    private Dictionary<string, int> _fixVarMap = new();
 
     /// <summary>
     /// Initializes a new instance of the <see cref="OnnxImporter"/> class.
@@ -44,17 +48,28 @@ public sealed partial class OnnxImporter : BaseImporter
     }
 
     /// <inheritdoc/>
-    protected override IEnumerable<Var> CreateInputs()
+    protected override (IEnumerable<Var> Inputs, Dictionary<Var, Expr[]> VarMap) CreateInputs()
     {
+        var bucketOptions = CompileSession.CompileOptions.ShapeBucketOptions;
+        _fixVarMap = bucketOptions.FixVarMap;
+
         _constTensors = _graph.Initializer
             .ToDictionary(tensor => tensor.Name, tensor => tensor);
 
-        var createdInputs = _graph.Input
-            .Where(n => !_constTensors.ContainsKey(n.Name))
-            .Select(n => new Var(n.Name, GetIRType(n))).ToArray();
+        var originInputs = _graph.Input
+            .Where(n => !_constTensors.ContainsKey(n.Name));
+        var createdInputs = originInputs.Select(n => new Var(n.Name, GetIRType(n))).ToArray();
+        _dynVarMap = _graph.Input.SelectMany(input => input.Type.TensorType.Shape.Dim.Where(d => IsDynamicDim(d)))
+            .Select(v => v.DimParam).ToHashSet().Select(v => new Var(v, new TensorType(DataTypes.Int32, Shape.Scalar)))
+            .ToDictionary(v => v.Name, v => v);
+        var varMap = originInputs
+            .Select((v, i) => (createdInputs[i], GetOriginShape(v)))
+            .ToDictionary(tup => tup.Item1, tup => tup.Item2);
 
+        CompileSession.CompileOptions.ShapeBucketOptions =
+            bucketOptions with { VarMap = varMap };
         _outputTensors = createdInputs.ToDictionary(n => n.Name, n => (Expr)n);
-        return createdInputs;
+        return (createdInputs, varMap);
     }
 
     /// <inheritdoc/>
@@ -107,17 +122,22 @@ public sealed partial class OnnxImporter : BaseImporter
             "DequantizeLinear" => VisitDequantizeLinear(op),
             "Div" => VisitBinary(op, BinaryOp.Div),
             "Dropout" => VisitDropout(op),
+            "Einsum" => VisitEinsum(op),
             "Elu" => VisitElu(op),
             "Equal" => VisitCompare(op, CompareOp.Equal),
             "Exp" => VisitUnary(op, UnaryOp.Exp),
+            "Erf" => VisitErf(op),
             "Expand" => VisitExpand(op),
             "Flatten" => VisitFlatten(op),
             "Floor" => VisitUnary(op, UnaryOp.Floor),
             "Gather" => VisitGather(op),
+            "GatherElements" => VisitGatherElements(op),
             "GatherND" => VisitGatherND(op),
             "Gemm" => VisitGemm(op),
             "GlobalAveragePool" => VisitReduceWindow2D(op, ReduceOp.Mean, 0f, true),
             "GlobalMaxPool" => VisitReduceWindow2D(op, ReduceOp.Max, float.MinValue, true),
+            "Greater" => VisitCompare(op, CompareOp.GreaterThan),
+            "GreaterOrEqual" => VisitCompare(op, CompareOp.GreaterOrEqual),
             "Hardmax" => VisitHardmax(op),
             "HardSigmoid" => VisitHardSigmoid(op),
             "HardSwish" => VisitHardSwish(op),
@@ -126,6 +146,7 @@ public sealed partial class OnnxImporter : BaseImporter
             "LpNormalization" => VisitLpNormalization(op),
             "LeakyRelu" => VisitLeakyRelu(op),
             "Less" => VisitCompare(op, CompareOp.LowerThan),
+            "LessOrEqual" => VisitCompare(op, CompareOp.LowerOrEqual),
             "Log" => VisitUnary(op, UnaryOp.Log),
             "LogSoftmax" => VisitLogSoftmax(op),
             "LRN" => VisitLRN(op),
@@ -138,11 +159,11 @@ public sealed partial class OnnxImporter : BaseImporter
             "Mul" => VisitBinary(op, BinaryOp.Mul),
             "Neg" => VisitUnary(op, UnaryOp.Neg),
             "Not" => VisitUnary(op, UnaryOp.LogicalNot),
+            "Or" => VisitBinary(op, BinaryOp.LogicalOr),
             "OneHot" => VisitOneHot(op),
             "Pad" => VisitPad(op),
             "Pow" => VisitBinary(op, BinaryOp.Pow),
             "PRelu" => VisitPRelu(op),
-            "Erf" => VisitErf(op),
 
             "QuantizeLinear" => VisitQuantizeLinear(op),
             "QLinearConv" => VisitQLinearConv(op),
@@ -188,6 +209,7 @@ public sealed partial class OnnxImporter : BaseImporter
             "Sum" => VisitSum(op),
             "Tanh" => VisitUnary(op, UnaryOp.Tanh),
             "Tile" => VisitTile(op),
+            "Trilu" => VisitTrilu(op),
             "TopK" => VisitTopK(op),
             "Transpose" => VisitTranspose(op),
 

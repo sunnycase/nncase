@@ -79,6 +79,11 @@ PYBIND11_MODULE(_nncase, m) {
         .value("Int8", nncase_qt_int8)
         .value("Int16", nncase_qt_int16);
 
+    py::enum_<nncase_input_type_t>(m, "InputType")
+        .value("Uint8", nncase_it_uint8)
+        .value("Int8", nncase_it_int8)
+        .value("Float32", nncase_it_float32);
+
     py::enum_<nncase_finetune_weights_method_t>(m, "FineTuneWeightsMethod")
         .value("NoFineTuneWeights", nncase_no_finetune_weights)
         .value("UseSquant", nncase_finetune_weights_squant)
@@ -99,7 +104,47 @@ PYBIND11_MODULE(_nncase, m) {
         .def_property("quantize_options",
                       py::overload_cast<>(&compile_options::quantize_options),
                       py::overload_cast<const quantize_options &>(
-                          &compile_options::quantize_options));
+                          &compile_options::quantize_options))
+        .def_property("preprocess",
+                      py::overload_cast<>(&compile_options::preprocess),
+                      py::overload_cast<bool>(&compile_options::preprocess))
+        .def_property(
+            "input_layout", py::overload_cast<>(&compile_options::input_layout),
+            py::overload_cast<std::string_view>(&compile_options::input_layout))
+        .def_property("output_layout",
+                      py::overload_cast<>(&compile_options::output_layout),
+                      py::overload_cast<std::string_view>(
+                          &compile_options::output_layout))
+        .def_property(
+            "input_file", py::overload_cast<>(&compile_options::input_file),
+            py::overload_cast<std::string_view>(&compile_options::input_file))
+        .def_property("input_type",
+                      py::overload_cast<>(&compile_options::input_type),
+                      py::overload_cast<nncase_input_type_t>(
+                          &compile_options::input_type))
+        .def_property(
+            "input_shape", py::overload_cast<>(&compile_options::input_shape),
+            py::overload_cast<std::string_view>(&compile_options::input_shape))
+        .def_property(
+            "input_range", py::overload_cast<>(&compile_options::input_range),
+            py::overload_cast<std::string_view>(&compile_options::input_range))
+        .def_property("swapRB", py::overload_cast<>(&compile_options::swapRB),
+                      py::overload_cast<bool>(&compile_options::swapRB))
+        .def_property(
+            "letterbox_value",
+            py::overload_cast<>(&compile_options::letterbox_value),
+            py::overload_cast<float>(&compile_options::letterbox_value))
+        .def_property(
+            "mean", py::overload_cast<>(&compile_options::mean),
+            py::overload_cast<std::string_view>(&compile_options::mean))
+        .def_property(
+            "std", py::overload_cast<>(&compile_options::std),
+            py::overload_cast<std::string_view>(&compile_options::std))
+        .def_property(
+            "shape_bucket_options",
+            py::overload_cast<>(&compile_options::shape_bucket_options),
+            py::overload_cast<const shape_bucket_options &>(
+                &compile_options::shape_bucket_options));
 
     py::class_<target>(m, "Target")
         .def(py::init<std::string_view>())
@@ -148,7 +193,36 @@ PYBIND11_MODULE(_nncase, m) {
                       py::overload_cast<>(
                           &quantize_options::export_weight_range_by_channel),
                       py::overload_cast<bool>(
-                          &quantize_options::export_weight_range_by_channel));
+                          &quantize_options::export_weight_range_by_channel))
+        .def_property(
+            "dump_quant_error",
+            py::overload_cast<>(&quantize_options::dump_quant_error),
+            py::overload_cast<bool>(&quantize_options::dump_quant_error))
+        .def_property(
+            "dump_quant_error_symmetric_for_signed",
+            py::overload_cast<>(
+                &quantize_options::dump_quant_error_symmetric_for_signed),
+            py::overload_cast<bool>(
+                &quantize_options::dump_quant_error_symmetric_for_signed));
+
+    py::class_<shape_bucket_options>(m, "ShapeBucketOptions")
+        .def(py::init())
+        .def_property("enable",
+                      py::overload_cast<>(&shape_bucket_options::enable),
+                      py::overload_cast<bool>(&shape_bucket_options::enable))
+        .def_property(
+            "range_info",
+            py::overload_cast<>(&shape_bucket_options::range_info),
+            py::overload_cast<std::map<std::string, std::tuple<int, int>>>(
+                &shape_bucket_options::range_info))
+        .def_property(
+            "segments_count",
+            py::overload_cast<>(&shape_bucket_options::segments_count),
+            py::overload_cast<int>(&shape_bucket_options::segments_count))
+        .def_property("fix_var_map",
+                      py::overload_cast<>(&shape_bucket_options::fix_var_map),
+                      py::overload_cast<std::map<std::string, int>>(
+                          &shape_bucket_options::fix_var_map));
 
     py::class_<calibration_dataset_provider>(m, "CalibrationDatasetProvider")
         .def(py::init([](py::list dataset, size_t samples_count,
@@ -225,7 +299,9 @@ PYBIND11_MODULE(_nncase, m) {
         .def_property_readonly("entry", &ir_module::entry);
 
     py::class_<compiler>(m, "Compiler")
-        .def("import_module", &compiler::import_module)
+        .def("import_tflite_module", &compiler::import_tflite_module)
+        .def("import_onnx_module", &compiler::import_onnx_module)
+        .def("import_ncnn_module", &compiler::import_ncnn_module)
         .def("compile", &compiler::compile)
         .def("gencode", &compiler::gencode);
 
@@ -243,6 +319,14 @@ PYBIND11_MODULE(_nncase, m) {
         .def_property_readonly("outputs_size", &interpreter::outputs_size)
         .def("get_input_desc", &interpreter::input_desc)
         .def("get_output_desc", &interpreter::output_desc)
+        .def("get_input_shape",
+             [](interpreter &interp, size_t index) {
+                 return to_py_shape(interp.input_shape(index));
+             })
+        .def("get_output_shape",
+             [](interpreter &interp, size_t index) {
+                 return to_py_shape(interp.output_shape(index));
+             })
         .def("get_input_tensor",
              [](interpreter &interp, size_t index) {
                  return interp.input_tensor(index).unwrap_or_throw();

@@ -151,6 +151,16 @@ public sealed record Cost : IComparable<Cost>, IEquatable<Cost>
     {
         return Factors.GetHashCode();
     }
+
+    public override string ToString()
+    {
+        if (Equals(Cost.Zero))
+        {
+            return "Zero";
+        }
+
+        return $"{{ {string.Join(", ", Factors.Select(kv => $"{kv.Key}: {kv.Value}"))}, Score:{Score} }}";
+    }
 }
 
 /// <summary>
@@ -292,6 +302,14 @@ public static class CostUtility
 
     // cost for op similar to reshape, e.g. squeeze
     public static Cost GetReshapeCost()
+    {
+        return new()
+        {
+            [CostFactorNames.CPUCycles] = 1,
+        };
+    }
+
+    public static Cost GetShapeExprCost()
     {
         return new()
         {

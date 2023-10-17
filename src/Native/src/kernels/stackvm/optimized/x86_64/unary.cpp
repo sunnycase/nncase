@@ -104,13 +104,30 @@ struct unary_op_neg {
     }
 };
 
+static float round_onnx(float v) {
+    if (v > 0 && v - (int32_t)v == 0.5) {
+        float result = (int32_t)v + 1.0;
+        if ((int32_t)result % 2 == 0)
+            return result;
+        else
+            return result - 1;
+    } else if (v < 0 && (int32_t)v - v == 0.5) {
+        float result = (int32_t)v + 1.0;
+        if ((int32_t)result % 2 == 0)
+            return result;
+        else
+            return result - 1;
+    } else
+        return roundf(v);
+}
+
 struct unary_op_round {
-    float operator()(float x) const { return roundf(x); }
+    float operator()(float x) const { return round_onnx(x); }
 
     void pack(const float *a, float *b) {
         __m256 vector_a = _mm256_loadu_ps(a);
         __m256 dst_a = _mm256_round_ps(
-            vector_a, (_MM_FROUND_CUR_DIRECTION | _MM_FROUND_NO_EXC));
+            vector_a, (_MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
         _mm256_storeu_ps(b, dst_a);
     }
 };
@@ -187,7 +204,7 @@ struct unary_op_tanh {
 template <typename Top>
 result<void> optimized_unary_impl(const float *CXX_RESTRICT input,
                                   float *CXX_RESTRICT output,
-                                  const dims_t &shape) noexcept {
+                                  gsl::span<const size_t> shape) noexcept {
     Top op;
     size_t n = compute_size(shape);
     size_t n8 = (n >> 3);
@@ -207,9 +224,10 @@ result<void> optimized_unary_impl(const float *CXX_RESTRICT input,
 
 result<void> optimized::unary(typecode_t dtype, runtime::stackvm::unary_op_t op,
                               const gsl::byte *in, gsl::byte *out,
-                              const dims_t &shape, const strides_t &in_strides,
-                              const dims_t &out_shape,
-                              const strides_t &out_strides,
+                              gsl::span<const size_t> shape,
+                              gsl::span<const size_t> in_strides,
+                              gsl::span<const size_t> out_shape,
+                              gsl::span<const size_t> out_strides,
                               kernel_context &context) noexcept {
     auto *input = IN_CAST(float, in);
     auto *output = OUT_CAST(float, out);

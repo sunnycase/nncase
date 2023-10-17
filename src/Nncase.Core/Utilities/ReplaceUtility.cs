@@ -3,6 +3,9 @@
 
 using System.Collections.Immutable;
 using System.Linq;
+using System.Reactive;
+using DryIoc.ImTools;
+using Microsoft.Toolkit.HighPerformance;
 using NetFabric.Hyperlinq;
 using Nncase.IR;
 using Fx = System.Func<Nncase.IR.Expr, Nncase.IR.Expr>;
@@ -94,6 +97,11 @@ public static class ReplaceUtility
         return new Call(target, ReplaceItems(oldParams, pairs));
     }
 
+    public static Call ReplaceCallParams(Call call, params (int, Expr)[] pairs)
+    {
+        return new Call(call.Target, ReplaceItems(call.Arguments.ToArray(), pairs));
+    }
+
     /// <summary>
     /// replace the call params with parameter info.
     /// </summary>
@@ -115,4 +123,35 @@ public static class ReplaceUtility
     /// <returns>new Call.</returns>
     public static Call ReplaceCallFirstParam(Expr target, IReadOnlyList<Expr> oldParams, Expr expr) =>
         ReplaceCallParams(target, oldParams, (oldParams[0], expr));
+
+    public static Expr ReplaceCallFirstParam(Call call, Expr expr)
+    {
+        return ReplaceCallFirstParam(call.Target, call.Arguments.ToArray(), expr);
+    }
+
+    /// <summary>
+    /// Replace target in body with expr.
+    /// </summary>
+    /// <param name="body">Body.</param>
+    /// <param name="target">Target.</param>
+    /// <param name="expr">Expr.</param>
+    /// <returns>New Body.</returns>
+    public static Expr ReplaceExpr(Expr body, Expr target, Expr expr)
+    {
+        var mutator = new Passes.Mutators.Substitutor(e =>
+        {
+            if (ReferenceEquals(e, target))
+            {
+                return expr;
+            }
+
+            return null;
+        });
+        return mutator.Visit(body, Unit.Default);
+    }
+
+    public static void ReplaceAllUsesWith(Expr expr, Expr newOperand)
+    {
+        expr.ReplaceAllUsesWith(newOperand);
+    }
 }

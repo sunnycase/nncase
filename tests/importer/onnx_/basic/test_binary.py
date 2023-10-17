@@ -23,7 +23,7 @@ def _make_module(v_shape):
     class BinaryModule(torch.nn.Module):
         def __init__(self):
             super(BinaryModule, self).__init__()
-            self.v = torch.from_numpy(np.random.rand(*v_shape).astype(np.float32))
+            self.v = torch.from_numpy(np.ones(v_shape).astype(np.float32))
 
         def forward(self, x):
             outs = []
@@ -43,7 +43,7 @@ lhs_shapes = [
     [3],
     [64, 3],
     [3, 64, 3],
-    [8, 3, 64, 3]
+    [8, 3, 64, 3],
 ]
 
 rhs_shapes = [
@@ -58,7 +58,7 @@ rhs_shapes = [
     [8, 3, 64, 3],
     [8, 3, 1, 3],
     [8, 1, 64, 3],
-    [1, 3, 64, 1]
+    [1, 3, 64, 1],
 ]
 
 

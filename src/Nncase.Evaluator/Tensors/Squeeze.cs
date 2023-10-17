@@ -1,6 +1,7 @@
 ﻿// Copyright (c) Canaan Inc. All rights reserved.
 // Licensed under the Apache license. See LICENSE file in the project root for full license information.
 
+using System;
 using System.Linq;
 using NetFabric.Hyperlinq;
 using Nncase.CostModel;
@@ -13,7 +14,7 @@ namespace Nncase.Evaluator.Tensors;
 /// <summary>
 /// Evaluator for <see cref="Squeeze"/>.
 /// </summary>
-public class SqueezeEvaluator : IEvaluator<Squeeze>, ITypeInferencer<Squeeze>, ICostEvaluator<Squeeze>
+public class SqueezeEvaluator : IEvaluator<Squeeze>, ITypeInferencer<Squeeze>, ICostEvaluator<Squeeze>, IShapeEvaluator<Squeeze>, IMetricEvaluator<Squeeze>
 {
     /// <inheritdoc/>
     public IValue Visit(IEvaluateContext context, Squeeze squeeze)
@@ -33,6 +34,18 @@ public class SqueezeEvaluator : IEvaluator<Squeeze>, ITypeInferencer<Squeeze>, I
     public Cost Visit(ICostEvaluateContext context, Squeeze target)
     {
         return CostUtility.GetReshapeCost();
+    }
+
+    public Expr Visit(IShapeEvaluateContext context, Squeeze target)
+    {
+        var input = context.GetArgumentShape(target, Squeeze.Input);
+        var dims = context.GetArgument(target, Squeeze.Dim);
+        return IR.F.ShapeExpr.SqueezeShape(input, dims);
+    }
+
+    public Metric Visit(IMetricEvaluateContext context, Squeeze target)
+    {
+        return Metric.Zero;
     }
 
     private IRType Visit(ITypeInferenceContext context, Squeeze target, TensorType input)

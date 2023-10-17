@@ -15,7 +15,7 @@ namespace Nncase.Evaluator.Math;
 /// <summary>
 /// Evaluator for <see cref="Clamp"/>.
 /// </summary>
-public class ClampEvaluator : IEvaluator<Clamp>, ITypeInferencer<Clamp>, ICostEvaluator<Clamp>
+public class ClampEvaluator : IEvaluator<Clamp>, ITypeInferencer<Clamp>, ICostEvaluator<Clamp>, IShapeEvaluator<Clamp>, IMetricEvaluator<Clamp>
 {
     /// <inheritdoc/>
     public IValue Visit(IEvaluateContext context, Clamp clamp)
@@ -35,7 +35,7 @@ public class ClampEvaluator : IEvaluator<Clamp>, ITypeInferencer<Clamp>, ICostEv
         if (input.DType != min.DType || input.DType != max.DType || min.DType != max.DType)
         {
             return new InvalidType(
-                $"clamp type is not equal, input:{input.DType}, min:${input.DType}, max:${input.DType}");
+                $"clamp type is not equal, input:{input.DType}, min:${min.DType}, max:${max.DType}");
         }
 
         return Visit(input, min, max);
@@ -54,6 +54,18 @@ public class ClampEvaluator : IEvaluator<Clamp>, ITypeInferencer<Clamp>, ICostEv
             [CostFactorNames.MemoryLoad] = CostUtility.GetMemoryAccess(inputType) + CostUtility.GetMemoryAccess(minType) + CostUtility.GetMemoryAccess(maxType),
             [CostFactorNames.MemoryStore] = CostUtility.GetMemoryAccess(outputType),
             [CostFactorNames.CPUCycles] = CostUtility.GetCPUCycles(outputType, 2),
+        };
+    }
+
+    public Expr Visit(IShapeEvaluateContext context, Clamp target) => context.GetArgumentShape(target, Clamp.Input);
+
+    public Metric Visit(IMetricEvaluateContext context, Clamp target)
+    {
+        var outputType = context.GetReturnType<TensorType>();
+        return new()
+        {
+            [MetricFactorNames.OffChipMemoryTraffic] = CostUtility.GetMemoryAccess(outputType) * 2,
+            [MetricFactorNames.FLOPs] = MetricUtility.GetFLOPs(outputType, 2),
         };
     }
 

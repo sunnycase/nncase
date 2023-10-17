@@ -12,196 +12,119 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "test_util.h"
+#include "kernel_test.h"
 #include <gtest/gtest.h>
-#include <nncase/kernels/cpu/optimized/tensor_compute.h>
-#include <nncase/kernels/cpu/reference/tensor_compute.h>
-#include <nncase/kernels/kernel_utils.h>
-#include <nncase/runtime/runtime_op_utility.h>
+#include <iostream>
+#include <nncase/kernels/stackvm/tensor_ops.h>
+#include <nncase/runtime/datatypes.h>
+#include <nncase/runtime/runtime_tensor.h>
+#include <nncase/runtime/simple_types.h>
+#include <nncase/runtime/stackvm/opcode.h>
+#include <ortki/operators.h>
 
-class ConcatTest : public ::testing::TestWithParam<
-                       std::tuple<std::vector<runtime_shape_t>, // input shapes
-                                  runtime_shape_t, // in strides bias
-                                  runtime_shape_t, // out strides bias
-                                  size_t>>         // axis
-{
+#define TEST_CASE_NAME "test_concat"
+
+using namespace nncase;
+using namespace nncase::runtime;
+using namespace ortki;
+
+class ConcatTest : public KernelTest,
+                   public ::testing::TestWithParam<std::tuple<int>> {
   public:
     void SetUp() override {
-        auto &&[data_shapes, in_strides_bias, out_strides_bias, axis] =
-            GetParam();
+        READY_SUBCASE()
 
-        for (size_t i = 0; i < data_shapes.size(); ++i) {
-            concat_dims.push_back(data_shapes[i][axis]);
-        }
+        auto shape = GetShapeArray("lhs_shape");
+        auto value = GetNumber("axis");
+        auto typecode = GetDataType("lhs_type");
 
-        runtime_shape_t out_shape(data_shapes[0]);
-        out_shape[axis] =
-            std::accumulate(concat_dims.begin(), concat_dims.end(), 0);
-        output_ref = create_tensor(out_shape, out_strides_bias);
-        output_opt = create_tensor(out_shape, out_strides_bias);
-        this->axis = axis;
+        lhs = hrt::create(typecode, shape, host_runtime_tensor::pool_cpu_only)
+                  .expect("create tensor failed");
+        init_tensor(lhs);
 
-        inputs.resize(data_shapes.size());
-        for (size_t i = 0; i < data_shapes.size(); ++i) {
-            inputs[i] = create_input_tensor(data_shapes[i], in_strides_bias);
-        }
+        rhs = hrt::create(typecode, shape, host_runtime_tensor::pool_cpu_only)
+                  .expect("create tensor failed");
+        init_tensor(rhs);
+
+        axis_value = value > 0 ? value >= (int64_t)shape.size() ? 0 : value
+                     : -value > (int64_t)shape.size() ? 0
+                                                      : value;
     }
 
-    runtime_shape_t concat_dims;
-    std::vector<runtime_tensor> inputs;
-    runtime_tensor output_ref, output_opt;
-    size_t axis;
+    void TearDown() override { CLEAR_SUBCASE() }
+
+  protected:
+    runtime_tensor lhs;
+    runtime_tensor rhs;
+    int64_t axis_value;
 };
 
-// Test name:ConcatTestDims[Dims axis]
-INSTANTIATE_TEST_SUITE_P(
-    ConcatTestDims43, ConcatTest,
-    testing::Combine(
-        testing::Values(std::vector<runtime_shape_t>{
-            runtime_shape_t{7, 3, 4, 6}, // input shape
-            runtime_shape_t{7, 3, 4, 3}, runtime_shape_t{7, 3, 4, 5}}),
-        testing::Values(runtime_shape_t{0, 0, 0, 0},
-                        runtime_shape_t{3, 3, 3, 3}), // input strides bias
-        testing::Values(runtime_shape_t{0, 0, 0, 0},
-                        runtime_shape_t{3, 3, 3, 3}), // output strides bias
-        testing::Values(3)));
+INSTANTIATE_TEST_SUITE_P(Concat, ConcatTest,
+                         testing::Combine(testing::Range(0, MAX_CASE_NUM)));
 
-INSTANTIATE_TEST_SUITE_P(
-    ConcatTestDims42, ConcatTest,
-    testing::Combine(
-        testing::Values(std::vector<runtime_shape_t>{
-            runtime_shape_t{7, 3, 3, 6}, // input shape
-            runtime_shape_t{7, 3, 4, 6}, runtime_shape_t{7, 3, 5, 6}}),
-        testing::Values(runtime_shape_t{0, 0, 0, 0},
-                        runtime_shape_t{3, 3, 3, 3}), // input strides bias
-        testing::Values(runtime_shape_t{0, 0, 0, 0},
-                        runtime_shape_t{3, 3, 3, 3}), // output strides bias
-        testing::Values(2)));
+TEST_P(ConcatTest, Concat) {
+    auto l_ort = runtime_tensor_2_ort_tensor(lhs);
+    auto r_ort = runtime_tensor_2_ort_tensor(rhs);
+    OrtKITensor *ls_ort[2] = {l_ort, r_ort};
 
-INSTANTIATE_TEST_SUITE_P(
-    ConcatTestDims41, ConcatTest,
-    testing::Combine(
-        testing::Values(std::vector<runtime_shape_t>{
-            runtime_shape_t{7, 3, 11, 6}, // input shape
-            runtime_shape_t{7, 4, 11, 6}, runtime_shape_t{7, 5, 11, 6}}),
-        testing::Values(runtime_shape_t{0, 0, 0, 0},
-                        runtime_shape_t{3, 3, 3, 3}), // input strides bias
-        testing::Values(runtime_shape_t{0, 0, 0, 0},
-                        runtime_shape_t{3, 3, 3, 3}), // output strides bias
-        testing::Values(1)));
+    // expected
+    auto output_ort = ortki_Concat(ls_ort, 2, axis_value);
+    size_t size = 0;
+    void *ptr_ort = tensor_buffer(output_ort, &size);
+    dims_t shape(tensor_rank(output_ort));
+    tensor_shape(output_ort, reinterpret_cast<int64_t *>(shape.data()));
+    auto expected = hrt::create(lhs.datatype(), shape,
+                                {reinterpret_cast<gsl::byte *>(ptr_ort), size},
+                                true, host_runtime_tensor::pool_cpu_only)
+                        .expect("create tensor failed");
 
-INSTANTIATE_TEST_SUITE_P(
-    ConcatTestDims40, ConcatTest,
-    testing::Combine(
-        testing::Values(std::vector<runtime_shape_t>{
-            runtime_shape_t{5, 3, 7, 6}, // input shape
-            runtime_shape_t{8, 3, 7, 6}, runtime_shape_t{3, 3, 7, 6}}),
-        testing::Values(runtime_shape_t{0, 0, 0, 0},
-                        runtime_shape_t{3, 3, 3, 3}), // input strides bias
-        testing::Values(runtime_shape_t{0, 0, 0, 0},
-                        runtime_shape_t{3, 3, 3, 3}), // output strides bias
-        testing::Values(0)));
+    // actual
+    value_t field1 = lhs.impl();
+    value_t field2 = rhs.impl();
+    std::vector<value_t> fields;
+    fields.push_back(field1);
+    fields.push_back(field2);
+    auto output_tuple = tuple(std::in_place, std::move(fields));
 
-INSTANTIATE_TEST_SUITE_P(
-    ConcatTestDims32, ConcatTest,
-    testing::Combine(
-        testing::Values(std::vector<runtime_shape_t>{
-            runtime_shape_t{7, 3, 3}, // input shape
-            runtime_shape_t{7, 3, 4}, runtime_shape_t{7, 3, 5}}),
-        testing::Values(runtime_shape_t{0, 0, 0},
-                        runtime_shape_t{3, 3, 3}), // input strides bias
-        testing::Values(runtime_shape_t{0, 0, 0},
-                        runtime_shape_t{3, 3, 3}), // output strides bias
-        testing::Values(2)));
+    int64_t axis_ptr[] = {axis_value};
+    auto axis =
+        hrt::create(dt_int64, {1},
+                    {reinterpret_cast<gsl::byte *>(axis_ptr), sizeof(axis_ptr)},
+                    true, host_runtime_tensor::pool_cpu_only)
+            .expect("create tensor failed");
 
-INSTANTIATE_TEST_SUITE_P(
-    ConcatTestDims31, ConcatTest,
-    testing::Combine(
-        testing::Values(std::vector<runtime_shape_t>{
-            runtime_shape_t{7, 3, 11}, // input shape
-            runtime_shape_t{7, 4, 11}, runtime_shape_t{7, 5, 11}}),
-        testing::Values(runtime_shape_t{0, 0, 0},
-                        runtime_shape_t{3, 3, 3}), // input strides bias
-        testing::Values(runtime_shape_t{0, 0, 0},
-                        runtime_shape_t{3, 3, 3}), // output strides bias
-        testing::Values(1)));
+    auto output = kernels::stackvm::concat(output_tuple, axis.impl())
+                      .expect("concat failed");
 
-INSTANTIATE_TEST_SUITE_P(
-    ConcatTestDims30, ConcatTest,
-    testing::Combine(
-        testing::Values(std::vector<runtime_shape_t>{
-            runtime_shape_t{5, 3, 7}, // input shape
-            runtime_shape_t{8, 3, 7}, runtime_shape_t{3, 3, 7}}),
-        testing::Values(runtime_shape_t{0, 0, 0},
-                        runtime_shape_t{3, 3, 3}), // input strides bias
-        testing::Values(runtime_shape_t{0, 0, 0},
-                        runtime_shape_t{3, 3, 3}), // output strides bias
-        testing::Values(0)));
+    runtime_tensor actual(output.as<tensor>().expect("as tensor failed"));
 
-INSTANTIATE_TEST_SUITE_P(
-    ConcatTestDims21, ConcatTest,
-    testing::Combine(
-        testing::Values(std::vector<runtime_shape_t>{
-            runtime_shape_t{7, 3}, // input shape
-            runtime_shape_t{7, 4}, runtime_shape_t{7, 5}}),
-        testing::Values(runtime_shape_t{0, 0},
-                        runtime_shape_t{3, 3}), // input strides bias
-        testing::Values(runtime_shape_t{0, 0},
-                        runtime_shape_t{3, 3}), // output strides bias
-        testing::Values(1)));
+    bool result = is_same_tensor(expected, actual) ||
+                  cosine_similarity_tensor(expected, actual);
 
-INSTANTIATE_TEST_SUITE_P(
-    ConcatTestDims20, ConcatTest,
-    testing::Combine(
-        testing::Values(std::vector<runtime_shape_t>{
-            runtime_shape_t{5, 3}, // input shape
-            runtime_shape_t{8, 3}, runtime_shape_t{3, 3}}),
-        testing::Values(runtime_shape_t{0, 0},
-                        runtime_shape_t{3, 3}), // input strides bias
-        testing::Values(runtime_shape_t{0, 0},
-                        runtime_shape_t{3, 3}), // output strides bias
-        testing::Values(0)));
-
-INSTANTIATE_TEST_SUITE_P(
-    ConcatTestDims10, ConcatTest,
-    testing::Combine(testing::Values(std::vector<runtime_shape_t>{
-                         runtime_shape_t{5}, // input shape
-                         runtime_shape_t{8}, runtime_shape_t{3}}),
-                     testing::Values(runtime_shape_t{0},
-                                     runtime_shape_t{3}), // input strides bias
-                     testing::Values(runtime_shape_t{0},
-                                     runtime_shape_t{3}), // output strides bias
-                     testing::Values(0)));
-
-void concat(std::vector<runtime_tensor> &inputs, runtime_tensor &output,
-            runtime_shape_t &concat_dims, size_t axis, OpType type) {
-    std::vector<runtime_shape_t> in_strides(inputs.size());
-    std::vector<const gsl::byte *> inputs_v(inputs.size());
-    for (size_t i = 0; i < inputs.size(); ++i) {
-        in_strides[i] = inputs[i].strides();
-        inputs_v[i] = get_tensor_cbegin(inputs[i]);
+    if (!result) {
+        std::cout << "actual ";
+        print_runtime_tensor(actual);
+        std::cout << "expected ";
+        print_runtime_tensor(expected);
     }
-    if (type == OpType::Ref) {
-        NNCASE_UNUSED auto res1 = cpu::reference::concat(
-            dt_float32, inputs_v, get_tensor_begin(output), output.shape(),
-            in_strides, output.strides(), axis, concat_dims,
-            default_kernel_context());
-    } else if (type == OpType::Opt) {
-        NNCASE_UNUSED auto res2 = cpu::optimized::concat(
-            dt_float32, inputs_v, get_tensor_begin(output), output.shape(),
-            in_strides, output.strides(), axis, concat_dims,
-            default_kernel_context());
-    } else {
-        assert(false);
-    }
+
+    // compare
+    EXPECT_TRUE(result);
 }
 
-TEST_P(ConcatTest, normal) {
-    concat(inputs, output_ref, concat_dims, axis, OpType::Ref);
-    concat(inputs, output_opt, concat_dims, axis, OpType::Opt);
-    auto is_ok = is_same_tensor(output_ref, output_opt);
-    if (!is_ok) {
-        output_all_data(inputs, output_ref, output_opt);
-        ASSERT_EQ(output_ref, output_opt);
-    }
+int main(int argc, char *argv[]) {
+    READY_TEST_CASE_GENERATE()
+    FOR_LOOP(lhs_shape, i)
+    FOR_LOOP(axis, j)
+    FOR_LOOP(lhs_type, k)
+    SPLIT_ELEMENT(lhs_shape, i)
+    SPLIT_ELEMENT(axis, j)
+    SPLIT_ELEMENT(lhs_type, k)
+    WRITE_SUB_CASE()
+    FOR_LOOP_END()
+    FOR_LOOP_END()
+    FOR_LOOP_END()
+
+    ::testing::InitGoogleTest(&argc, argv);
+    return RUN_ALL_TESTS();
 }

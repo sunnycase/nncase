@@ -24,6 +24,7 @@ internal class TensorsModule : IApplicationPart
         registrator.RegisterManyInterface<FlattenEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<GatherEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<GatherNDEvaluator>(reuse: Reuse.Singleton);
+        registrator.RegisterManyInterface<GatherElementsEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<ScatterNDEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<ProdEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<RangeEvaluator>(reuse: Reuse.Singleton);
@@ -37,9 +38,14 @@ internal class TensorsModule : IApplicationPart
         registrator.RegisterManyInterface<StackEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<TileEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<TopKEvaluator>(reuse: Reuse.Singleton);
+        registrator.RegisterManyInterface<TriluEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<TransposeEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<UnsqueezeEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<WhereEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<GetItemEvaluator>(reuse: Reuse.Singleton);
+        registrator.RegisterManyInterface<IndexOfEvaluator>(reuse: Reuse.Singleton);
+        registrator.RegisterManyInterface<FixShapeEvaluator>(reuse: Reuse.Singleton);
+        registrator.RegisterManyInterface<BucketPadEvaluator>(reuse: Reuse.Singleton);
+        registrator.RegisterManyInterface<RankEvaluator>(reuse: Reuse.Singleton);
     }
 }

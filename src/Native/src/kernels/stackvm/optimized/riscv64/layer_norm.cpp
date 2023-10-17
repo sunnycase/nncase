@@ -68,26 +68,16 @@ static float get_var(const float *data, int n, float mean) {
         "mv a1, %[input_ptr1];" RVVSETVLI2(
             t0, a0, e32) "vmv.s.x v0, x0;"
 
-                         "vle32.v v8, (a1);"
-                         "sub a0,a0, t0;"
-                         "slli t1, t0, 2;"
-                         "vfsub.vf v8, v8, %[mean];"
-                         "vfmul.vv v8, v8, v8;"
-                         "add a1, a1, t1;"
-                         "beqz a0, X1_END%=;"
                          "X1_STRAT%=:;" RVVSETVLI2(
                              t0, a0, e32) "vle32.v v16, (a1);"
                                           "sub a0,a0, t0;"
                                           "slli t1, t0, 2;"
                                           "vfsub.vf v16, v16, %[mean];"
-                                          "vfmacc.vv v8, v16, v16;"
+                                          "vfmul.vv v16,v16,v16;"
+                                          "vfredsum.vs v0,v16,v0;"
 
                                           "add a1, a1, t1;"
                                           "bnez a0, X1_STRAT%=;"
-
-                                          "X1_END%=:"
-
-                                          "vfredsum.vs v0,v8,v0;"
 
                                           "vfmv.f.s f0, v0;"
                                           "fcvt.s.w f1, %[avl];"
@@ -137,7 +127,7 @@ static void layer_norm_update1(const float *data, float *out, int len,
 
 result<void> layernorm_impl(const float *input, float *output,
                             const float *scale, const float *bias,
-                            const dims_t &in_shape, int32_t axis,
+                            gsl::span<const size_t> in_shape, int32_t axis,
                             float epsilon) {
     if (axis < 0) {
         axis = (int)in_shape.size() + axis;
@@ -166,7 +156,7 @@ result<void> layernorm_impl(const float *input, float *output,
 
 result<void> nncase::kernels::stackvm::optimized::layer_norm(
     const float *input, float *output, const float *scale, const float *bias,
-    const dims_t &in_shape, int32_t axis, float epsilon) {
+    gsl::span<const size_t> in_shape, int32_t axis, float epsilon) {
 #if __riscv_vector
     return layernorm_impl(input, output, scale, bias, in_shape, axis, epsilon);
 #else

@@ -1,6 +1,7 @@
 ﻿// Copyright (c) Canaan Inc. All rights reserved.
 // Licensed under the Apache license. See LICENSE file in the project root for full license information.
 
+using System;
 using Nncase.CostModel;
 using Nncase.IR;
 using Nncase.IR.NN;
@@ -11,7 +12,8 @@ namespace Nncase.Evaluator.NN;
 /// <summary>
 /// Evaluator for <see cref="LayerNorm"/>.
 /// </summary>
-public class LayerNormEvaluator : IEvaluator<LayerNorm>, ITypeInferencer<LayerNorm>, ICostEvaluator<LayerNorm>
+public class LayerNormEvaluator : IEvaluator<LayerNorm>, ITypeInferencer<LayerNorm>, ICostEvaluator<LayerNorm>,
+    IShapeEvaluator<LayerNorm>, IMetricEvaluator<LayerNorm>
 {
     /// <inheritdoc/>
     public IValue Visit(IEvaluateContext context, LayerNorm layerNorm)
@@ -43,6 +45,26 @@ public class LayerNormEvaluator : IEvaluator<LayerNorm>, ITypeInferencer<LayerNo
         };
     }
 
+    public Metric Visit(IMetricEvaluateContext context, LayerNorm target)
+    {
+        var inputType = context.GetArgumentType<TensorType>(target, LayerNorm.Input);
+        var returnType = context.GetReturnType<TensorType>();
+
+        var r = MetricUtility.GetFLOPs(returnType);
+        var i = MetricUtility.GetFLOPs(inputType);
+        var outter = i / r;
+        var inner = i / outter;
+
+        return new()
+        {
+            [MetricFactorNames.OffChipMemoryTraffic] = CostUtility.GetMemoryAccess(inputType) + CostUtility.GetMemoryAccess(returnType),
+            [MetricFactorNames.FLOPs] = outter * ((inner * 7) + MetricUtility.SqrtFLOPs),
+            [MetricFactorNames.Parallel] = 4,
+        };
+    }
+
+    public Expr Visit(IShapeEvaluateContext context, LayerNorm target) => context.GetArgumentShape(target, LayerNorm.Input);
+
     private IRType Visit(TensorType input)
     {
         return input;
@@ -56,6 +78,11 @@ public class LayerNormEvaluator : IEvaluator<LayerNorm>, ITypeInferencer<LayerNo
         float[] inputArray = input.ToArray<float>();
         float[] outputArray = new float[inputArray.Length];
         int[] inShape = input.Shape.ToValueArray();
+        if (axis < 0)
+        {
+            axis += inShape.Length;
+        }
+
         for (int i = 0; i < axis; i++)
         {
             outputSize *= inShape[i];
@@ -63,14 +90,7 @@ public class LayerNormEvaluator : IEvaluator<LayerNorm>, ITypeInferencer<LayerNo
 
         for (int i = axis; i < inShape.Length; i++)
         {
-            if (i < 0)
-            {
-                innerSize *= inShape[^System.Math.Abs(i)];
-            }
-            else
-            {
-                innerSize *= inShape[i];
-            }
+            innerSize *= inShape[i];
         }
 
         for (int batch = 0; batch < outputSize; batch++)
@@ -110,7 +130,8 @@ public class LayerNormEvaluator : IEvaluator<LayerNorm>, ITypeInferencer<LayerNo
 
             for (int i = 0; i < innerSize; i++)
             {
-                outputArray[(i + (batch * innerSize)) % outputArray.Length] = (div[i] * scale.ToArray<float>()[i % scale.Length]) + bias.ToArray<float>()[i % bias.Length];
+                outputArray[(i + (batch * innerSize)) % outputArray.Length] =
+                    (div[i] * scale.ToArray<float>()[i % scale.Length]) + bias.ToArray<float>()[i % bias.Length];
             }
         }
 

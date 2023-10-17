@@ -141,7 +141,7 @@ struct unary_op_tanh_rvv {
 // float
 template <typename Top>
 result<void> optimized_unary_impl(const float *input, float *output,
-                                  const dims_t &shape) noexcept {
+                                  gsl::span<const size_t> shape) noexcept {
     Top op;
     int32_t n = compute_size(shape);
     while (n > 0) {
@@ -161,66 +161,78 @@ result<void> optimized_unary_impl(const float *input, float *output,
 } // namespace
 
 // result<void> optimized::unary(runtime::stackvm::unary_op_t op, const float
-// *input, float *output, const dims_t &shape,
-//    const dims_t &in_strides, const dims_t &out_strides, kernel_context
-//    &context) noexcept
+// *input, float *output, gsl::span<const size_t> shape,
+//    gsl::span<const size_t> in_strides, gsl::span<const size_t> out_strides,
+//    kernel_context &context) noexcept
 result<void> optimized::unary(typecode_t dtype, runtime::stackvm::unary_op_t op,
                               const gsl::byte *in, gsl::byte *out,
-                              const dims_t &shape, const strides_t &in_strides,
-                              const dims_t &out_shape,
-                              const strides_t &out_strides,
+                              gsl::span<const size_t> shape,
+                              gsl::span<const size_t> in_strides,
+                              gsl::span<const size_t> out_shape,
+                              gsl::span<const size_t> out_strides,
                               kernel_context &context) noexcept {
+    if (dtype == dt_float32) {
 #if __riscv_vector
-    auto *input = IN_CAST(float, in);
-    auto *output = OUT_CAST(float, out);
-    switch (op) {
-    case unary_op_t::abs: {
-        return optimized_unary_impl<unary_op_abs_rvv>(input, output, shape);
-    }
-    case unary_op_t::ceil: {
-        return optimized_unary_impl<unary_op_ceil_rvv>(input, output, shape);
-    }
-    case unary_op_t::cos: {
-        return optimized_unary_impl<unary_op_cos_rvv>(input, output, shape);
-    }
-    case unary_op_t::exp: {
-        return optimized_unary_impl<unary_op_exp_rvv>(input, output, shape);
-    }
-    case unary_op_t::floor: {
-        return optimized_unary_impl<unary_op_floor_rvv>(input, output, shape);
-    }
-    case unary_op_t::log: {
-        return optimized_unary_impl<unary_op_log_rvv>(input, output, shape);
-    }
-    case unary_op_t::neg: {
-        return optimized_unary_impl<unary_op_neg_rvv>(input, output, shape);
-    }
-    case unary_op_t::round: {
-        return optimized_unary_impl<unary_op_round_rvv>(input, output, shape);
-    }
-    case unary_op_t::rsqrt: {
-        return optimized_unary_impl<unary_op_rsqrt_rvv>(input, output, shape);
-    }
-    case unary_op_t::sign: {
-        return optimized_unary_impl<unary_op_sign_rvv>(input, output, shape);
-    }
-    case unary_op_t::sin: {
-        return optimized_unary_impl<unary_op_sin_rvv>(input, output, shape);
-    }
-    case unary_op_t::sqrt: {
-        return optimized_unary_impl<unary_op_sqrt_rvv>(input, output, shape);
-    }
-    case unary_op_t::square: {
-        return optimized_unary_impl<unary_op_square_rvv>(input, output, shape);
-    }
-    case unary_op_t::tanh: {
-        return optimized_unary_impl<unary_op_tanh_rvv>(input, output, shape);
-    }
-    default:;
-        //        std::cout << "Unsupported unary op: " + unary_op_to_string(op)
-        //        + " for optimizing, fallback to reference" << std::endl;
-    }
+        auto *input = IN_CAST(float, in);
+        auto *output = OUT_CAST(float, out);
+        switch (op) {
+        case unary_op_t::abs: {
+            return optimized_unary_impl<unary_op_abs_rvv>(input, output, shape);
+        }
+        case unary_op_t::ceil: {
+            return optimized_unary_impl<unary_op_ceil_rvv>(input, output,
+                                                           shape);
+        }
+        case unary_op_t::cos: {
+            return optimized_unary_impl<unary_op_cos_rvv>(input, output, shape);
+        }
+        case unary_op_t::exp: {
+            return optimized_unary_impl<unary_op_exp_rvv>(input, output, shape);
+        }
+        case unary_op_t::floor: {
+            return optimized_unary_impl<unary_op_floor_rvv>(input, output,
+                                                            shape);
+        }
+        case unary_op_t::log: {
+            return optimized_unary_impl<unary_op_log_rvv>(input, output, shape);
+        }
+        case unary_op_t::neg: {
+            return optimized_unary_impl<unary_op_neg_rvv>(input, output, shape);
+        }
+        case unary_op_t::round: {
+            return optimized_unary_impl<unary_op_round_rvv>(input, output,
+                                                            shape);
+        }
+        case unary_op_t::rsqrt: {
+            return optimized_unary_impl<unary_op_rsqrt_rvv>(input, output,
+                                                            shape);
+        }
+        case unary_op_t::sign: {
+            return optimized_unary_impl<unary_op_sign_rvv>(input, output,
+                                                           shape);
+        }
+        case unary_op_t::sin: {
+            return optimized_unary_impl<unary_op_sin_rvv>(input, output, shape);
+        }
+        case unary_op_t::sqrt: {
+            return optimized_unary_impl<unary_op_sqrt_rvv>(input, output,
+                                                           shape);
+        }
+        case unary_op_t::square: {
+            return optimized_unary_impl<unary_op_square_rvv>(input, output,
+                                                             shape);
+        }
+        case unary_op_t::tanh: {
+            return optimized_unary_impl<unary_op_tanh_rvv>(input, output,
+                                                           shape);
+        }
+        default:;
+            //        std::cout << "Unsupported unary op: " +
+            //        unary_op_to_string(op)
+            //        + " for optimizing, fallback to reference" << std::endl;
+        }
 #endif
+    }
     return stackvm::reference::unary(dtype, op, in, out, shape, in_strides,
                                      out_shape, out_strides, context);
 }

@@ -13,9 +13,16 @@
  * limitations under the License.
  */
 #pragma once
+#include <cstring>
+#include <iostream>
+#include <map>
+#include <nlohmann/json.hpp>
 #include <nncase/compiler_defs.h>
 #include <nncase/runtime/simple_types.h>
 #include <nncase/value.h>
+#include <string>
+#include <unordered_map>
+using nlohmann::json;
 
 extern "C" {
 typedef void *clr_object_handle_t;
@@ -69,6 +76,12 @@ typedef enum {
     nncase_dump_flags_codegen = 1 << 10
 } nncase_dump_flags_t;
 
+typedef enum {
+    nncase_it_uint8 = 0,
+    nncase_it_int8 = 1,
+    nncase_it_float32 = 2
+} nncase_input_type_t;
+
 typedef struct {
     void (*add_ref)(nncase_stream_handle_t handle);
     void (*release)(nncase_stream_handle_t handle);
@@ -114,13 +127,45 @@ typedef struct {
     void (*compile_options_set_quantize_options)(
         clr_object_handle_t compile_options,
         clr_object_handle_t quantize_options);
+    void (*compile_options_set_preprocess)(clr_object_handle_t compile_options,
+                                           bool preprocess);
+    void (*compile_options_set_input_layout)(
+        clr_object_handle_t compile_options, const char *input_layout,
+        size_t input_layout_length);
+    void (*compile_options_set_output_layout)(
+        clr_object_handle_t compile_options, const char *output_layout,
+        size_t output_layout_length);
+    void (*compile_options_set_input_type)(clr_object_handle_t compile_options,
+                                           nncase_input_type_t input_type);
+    void (*compile_options_set_input_shape)(clr_object_handle_t compile_options,
+                                            const char *input_shape,
+                                            size_t input_shape_length);
+    void (*compile_options_set_input_range)(clr_object_handle_t compile_options,
+                                            const char *input_range,
+                                            size_t input_range_length);
+    void (*compile_options_set_swapRB)(clr_object_handle_t compile_options,
+                                       bool swapRB);
+    void (*compile_options_set_letterbox_value)(
+        clr_object_handle_t compile_options, float letterbox_value);
+    void (*compile_options_set_mean)(clr_object_handle_t compile_options,
+                                     const char *mean, size_t mean_length);
+    void (*compile_options_set_std)(clr_object_handle_t compile_options,
+                                    const char *std, size_t std_length);
+    void (*compile_options_set_shape_bucket_options)(
+        clr_object_handle_t compile_options,
+        clr_object_handle_t shape_bucket_options);
     clr_object_handle_t (*compile_session_create)(
         clr_object_handle_t target, clr_object_handle_t compile_options);
     clr_object_handle_t (*compile_session_get_compiler)(
         clr_object_handle_t compile_session);
     void (*compiler_initialize)();
-    clr_object_handle_t (*compiler_import_module)(clr_object_handle_t compiler,
-                                                  clr_object_handle_t stream);
+    clr_object_handle_t (*compiler_import_tflite_module)(
+        clr_object_handle_t compiler, clr_object_handle_t stream);
+    clr_object_handle_t (*compiler_import_onnx_module)(
+        clr_object_handle_t compiler, clr_object_handle_t stream);
+    clr_object_handle_t (*compiler_import_ncnn_module)(
+        clr_object_handle_t compiler, clr_object_handle_t param_stream,
+        clr_object_handle_t bin_stream);
     void (*compiler_compile)(clr_object_handle_t compiler);
     void (*compiler_gencode)(clr_object_handle_t compiler,
                              clr_object_handle_t stream);
@@ -134,6 +179,7 @@ typedef struct {
     clr_object_handle_t (*ir_module_get_entry)(clr_object_handle_t module);
     void (*luanch_debugger)();
     clr_object_handle_t (*quantize_options_create)();
+    clr_object_handle_t (*shape_bucket_options_create)();
     void (*quantize_options_set_calibration_dataset)(
         clr_object_handle_t quantize_options, clr_object_handle_t dataset);
     void (*quantize_options_set_calibration_method)(
@@ -158,6 +204,22 @@ typedef struct {
     void (*quantize_options_set_export_weight_range_by_channel)(
         clr_object_handle_t quantize_options,
         bool export_weight_range_by_channel);
+    void (*quantize_options_set_dump_quant_error)(
+        clr_object_handle_t quantize_options, bool dump_quant_error);
+    void (*quantize_options_set_dump_quant_error_symmetric_for_signed)(
+        clr_object_handle_t quantize_options,
+        bool dump_quant_error_symmetric_for_signed);
+    void (*shape_bucket_options_set_enable)(
+        clr_object_handle_t shape_bucket_options, bool enable);
+    void (*shape_bucket_options_set_range_info)(
+        clr_object_handle_t shape_bucket_options, const char *range_info,
+        size_t range_info_size);
+    void (*shape_bucket_options_set_segments_count)(
+        clr_object_handle_t shape_bucket_options, int segments_count);
+    void (*shape_bucket_options_set_fix_var_map)(
+        clr_object_handle_t shape_bucket_options, const char *fix_var_map,
+        size_t fix_var_map_size);
+
     clr_object_handle_t (*rtvalue_from_handle)(nncase::value_node *value);
     nncase::value_node *(*rtvalue_get_handle)(clr_object_handle_t rtvalue);
     clr_object_handle_t (*stream_create)(const nncase_stream_mt_t *mt,
@@ -350,6 +412,55 @@ class quantize_options : public clr_object_base {
         nncase_clr_api()->quantize_options_set_export_weight_range_by_channel(
             obj_.get(), value);
     }
+
+    bool dump_quant_error() { return false; }
+    void dump_quant_error(bool value) {
+        nncase_clr_api()->quantize_options_set_dump_quant_error(obj_.get(),
+                                                                value);
+    }
+
+    bool dump_quant_error_symmetric_for_signed() { return false; }
+    void dump_quant_error_symmetric_for_signed(bool value) {
+        nncase_clr_api()
+            ->quantize_options_set_dump_quant_error_symmetric_for_signed(
+                obj_.get(), value);
+    }
+};
+
+class shape_bucket_options : public clr_object_base {
+  public:
+    using clr_object_base::clr_object_base;
+
+    shape_bucket_options() {
+        obj_ = nncase_clr_api()->shape_bucket_options_create();
+    }
+
+    bool enable() { return false; }
+    void enable(bool value) {
+        nncase_clr_api()->shape_bucket_options_set_enable(obj_.get(), value);
+    }
+
+    std::map<std::string, std::tuple<int, int>> range_info() { return {}; }
+    void range_info(std::map<std::string, std::tuple<int, int>> value) {
+        json j = value;
+        std::string s = j.dump();
+        nncase_clr_api()->shape_bucket_options_set_range_info(
+            obj_.get(), s.c_str(), s.length());
+    }
+
+    int segments_count() { return 2; }
+    void segments_count(int value) {
+        nncase_clr_api()->shape_bucket_options_set_segments_count(obj_.get(),
+                                                                  value);
+    }
+
+    std::map<std::string, int> fix_var_map() { return {}; }
+    void fix_var_map(std::map<std::string, int> value) {
+        json j = value;
+        std::string s = j.dump();
+        nncase_clr_api()->shape_bucket_options_set_fix_var_map(
+            obj_.get(), s.c_str(), s.length());
+    }
 };
 
 class cstream : public clr_object_base {
@@ -390,6 +501,75 @@ class compile_options : public clr_object_base {
     void quantize_options(const clr::quantize_options &value) {
         nncase_clr_api()->compile_options_set_quantize_options(obj_.get(),
                                                                value.get());
+    }
+
+    bool preprocess() { return true; }
+    void preprocess(bool value) {
+        nncase_clr_api()->compile_options_set_preprocess(obj_.get(), value);
+    }
+
+    std::string input_layout() { return ""; }
+    void input_layout(std::string_view value) {
+        nncase_clr_api()->compile_options_set_input_layout(
+            obj_.get(), value.data(), value.length());
+    }
+
+    std::string output_layout() { return ""; }
+    void output_layout(std::string_view value) {
+        nncase_clr_api()->compile_options_set_output_layout(
+            obj_.get(), value.data(), value.length());
+    }
+
+    std::string input_file() { return ""; }
+    void input_file(std::string_view value) {
+        nncase_clr_api()->compile_options_set_input_file(
+            obj_.get(), value.data(), value.length());
+    }
+
+    nncase_input_type_t input_type() { return nncase_it_float32; }
+    void input_type(nncase_input_type_t value) {
+        nncase_clr_api()->compile_options_set_input_type(obj_.get(), value);
+    }
+
+    std::string input_shape() { return ""; }
+    void input_shape(std::string_view value) {
+        nncase_clr_api()->compile_options_set_input_shape(
+            obj_.get(), value.data(), value.length());
+    }
+
+    std::string input_range() { return ""; }
+    void input_range(std::string_view value) {
+        nncase_clr_api()->compile_options_set_input_range(
+            obj_.get(), value.data(), value.length());
+    }
+
+    bool swapRB() { return false; }
+    void swapRB(bool value) {
+        nncase_clr_api()->compile_options_set_swapRB(obj_.get(), value);
+    }
+
+    float letterbox_value() { return 0.f; }
+    void letterbox_value(float value) {
+        nncase_clr_api()->compile_options_set_letterbox_value(obj_.get(),
+                                                              value);
+    }
+
+    std::string mean() { return ""; }
+    void mean(std::string_view value) {
+        nncase_clr_api()->compile_options_set_mean(obj_.get(), value.data(),
+                                                   value.length());
+    }
+
+    std::string std() { return ""; }
+    void std(std::string_view value) {
+        nncase_clr_api()->compile_options_set_std(obj_.get(), value.data(),
+                                                  value.length());
+    }
+
+    clr::shape_bucket_options shape_bucket_options() { return nullptr; }
+    void shape_bucket_options(const clr::shape_bucket_options &value) {
+        nncase_clr_api()->compile_options_set_shape_bucket_options(obj_.get(),
+                                                                   value.get());
     }
 };
 
@@ -467,9 +647,20 @@ class compiler : public clr_object_base {
   public:
     using clr_object_base::clr_object_base;
 
-    ir_module import_module(cstream &stream) {
+    ir_module import_tflite_module(cstream &stream) {
+        return {std::in_place, nncase_clr_api()->compiler_import_tflite_module(
+                                   get(), stream.get())};
+    }
+
+    ir_module import_onnx_module(cstream &stream) {
+        return {std::in_place, nncase_clr_api()->compiler_import_onnx_module(
+                                   get(), stream.get())};
+    }
+
+    ir_module import_ncnn_module(cstream &param_stream, cstream &bin_stream) {
         return {std::in_place,
-                nncase_clr_api()->compiler_import_module(get(), stream.get())};
+                nncase_clr_api()->compiler_import_ncnn_module(
+                    get(), param_stream.get(), bin_stream.get())};
     }
 
     void compile() { nncase_clr_api()->compiler_compile(obj_.get()); }

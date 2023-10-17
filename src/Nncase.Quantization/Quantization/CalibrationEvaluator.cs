@@ -108,23 +108,14 @@ public class CalibrationEvaluator : IDisposable
             Op op => Visit(enode, op),
             Marker marker => Visit(enode, marker),
             None none => Visit(enode, none),
+            If @if => Visit(enode, @if),
             _ => throw new ArgumentException("Unsupported expression type."),
         };
     }
 
-    private bool ShapeChecker(Shape current, Shape target)
-    {
-        if (current.Count != target.Count)
-        {
-            return false;
-        }
-
-        return current.Zip(target).All(p => p.Second.IsUnknown ? true : p.Second.FixedValue == p.First.FixedValue);
-    }
-
     private bool TypeChecker(IRType cur_type, IRType target_type) => (cur_type, target_type) switch
     {
-        (TensorType a, TensorType b) => a.DType == b.DType && ShapeChecker(a.Shape, b.Shape),
+        (TensorType a, TensorType b) => a.DType == b.DType && b.Shape.IsAssignableFrom(a.Shape),
         (TupleType a, TupleType b) => a.Zip(b).All(p => TypeChecker(p.First, p.Second)),
         (_, _) => true,
     };
@@ -178,6 +169,16 @@ public class CalibrationEvaluator : IDisposable
         return NoneValue.Default;
     }
 
+    private IValue? Visit(ENode enode, If expr)
+    {
+        return Visit(enode, values =>
+        {
+            return values[^3].AsTensor().ToScalar<bool>()
+                ? values[^2]
+                : values[^1];
+        });
+    }
+
     private IValue? Visit(ENode enode, Call call)
     {
         return Visit(enode, costs =>
@@ -204,7 +205,8 @@ public class CalibrationEvaluator : IDisposable
                 else
                 {
                     Trace.Assert(targetEnode.Expr is Function);
-                    value = Visit(targetEnode.Children[0]);
+                    value = CompilerServices.Evaluate(((Function)targetEnode.Expr).Body, _inputs);
+                    return value;
                 }
 
                 if (value != null)
@@ -251,6 +253,32 @@ public class CalibrationEvaluator : IDisposable
             {
                 _values.Add(enode, value);
             }
+        }
+
+        if (enode.Expr is Nncase.IR.Marker && ((Marker)enode.Expr).MixQuantInfo?.QuantParameter != null && ((Marker)enode.Expr).MixQuantInfo!.QuantParameter.Count != 0 && value != null)
+        {
+            var valueArray = value.AsTensor().ToArray<float>();
+            int index = 0;
+
+            int size = 0;
+            if (((Marker)enode.Expr).MixQuantInfo!.QuantParameter.Count != 1)
+            {
+                size = value.AsTensor().Shape[1].FixedValue * value.AsTensor().Shape[2].FixedValue * value.AsTensor().Shape[3].FixedValue;
+            }
+
+            for (int i = 0; i < valueArray.Length; i++)
+            {
+                if (((Marker)enode.Expr).MixQuantInfo!.QuantParameter.Count != 1)
+                {
+                    index = i / size;
+                }
+
+                var valueArrayQuant = Math.Round((valueArray[i] / (double)((Marker)enode.Expr).MixQuantInfo!.QuantParameter[index].Scale) + ((Marker)enode.Expr).MixQuantInfo!.QuantParameter[index].ZeroPoint);
+                var valueArrayDeQuant = ((float)valueArrayQuant - ((Marker)enode.Expr).MixQuantInfo!.QuantParameter[index].ZeroPoint) * (double)((Marker)enode.Expr).MixQuantInfo!.QuantParameter[index].Scale;
+                valueArray[i] = (float)valueArrayDeQuant;
+            }
+
+            value = Value.FromTensor(Tensor.From<float>(valueArray, value.AsTensor().Shape));
         }
 
         return value;

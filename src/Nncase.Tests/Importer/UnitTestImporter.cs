@@ -7,6 +7,7 @@ using System.IO;
 using System.Linq;
 using System.Text;
 using System.Threading.Tasks;
+using Nncase.IO;
 using Nncase.IR;
 using Nncase.Passes.Transforms;
 using Nncase.Tests.TestFixture;
@@ -18,9 +19,19 @@ namespace Nncase.Tests.ImporterTest;
 public class UnitTestImporter : TestClassBase
 {
     [Fact]
-    public async Task TestImport20ClassesYolo()
+    public async Task TestImportOnnx()
     {
-        using var file = File.OpenRead(Path.Join(SolutionDirectory, "examples/20classes_yolo/model/20classes_yolo.tflite"));
+        using var file = File.OpenRead(Path.Join(SolutionDirectory, "examples/user_guide/test.onnx"));
+        var module = Importers.ImportOnnx(file, CompileSession);
+        await InferShapeAsync(module);
+        Assert.NotNull(module.Entry);
+        Assert.True(module.Entry!.InferenceType());
+    }
+
+    [Fact]
+    public async Task TestImportTFLite()
+    {
+        using var file = File.OpenRead(Path.Combine(SolutionDirectory, "examples/user_guide/test.tflite"));
         var module = Importers.ImportTFLite(file, CompileSession);
         await InferShapeAsync(module);
         Assert.NotNull(module.Entry);
@@ -28,10 +39,10 @@ public class UnitTestImporter : TestClassBase
     }
 
     [Fact]
-    public async Task TestImportFacedetectLandmark()
+    public async Task TestImportNcnn()
     {
-        using var file = File.OpenRead(Path.Combine(SolutionDirectory, "examples/facedetect_landmark/model/ulffd_landmark.tflite"));
-        var module = Importers.ImportTFLite(file, CompileSession);
+        using var file = File.OpenRead(Path.Combine(SolutionDirectory, "examples/user_guide/test.param"));
+        var module = Importers.ImportNcnn(file, new ZeroStream(), CompileSession);
         await InferShapeAsync(module);
         Assert.NotNull(module.Entry);
         Assert.True(module.Entry!.InferenceType());

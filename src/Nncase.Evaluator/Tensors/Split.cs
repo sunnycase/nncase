@@ -9,6 +9,7 @@ using Nncase.CostModel;
 using Nncase.IR;
 using Nncase.IR.Math;
 using Nncase.IR.Tensors;
+using Nncase.Utilities;
 using OrtKISharp;
 
 namespace Nncase.Evaluator.Tensors;
@@ -16,7 +17,7 @@ namespace Nncase.Evaluator.Tensors;
 /// <summary>
 /// Evaluator for <see cref="Split"/>.
 /// </summary>
-public class SplitEvaluator : IEvaluator<Split>, ITypeInferencer<Split>, ICostEvaluator<Split>
+public class SplitEvaluator : IEvaluator<Split>, ITypeInferencer<Split>, ICostEvaluator<Split>, IShapeEvaluator<Split>, IMetricEvaluator<Split>
 {
     /// <inheritdoc/>
     public IValue Visit(IEvaluateContext context, Split target)
@@ -38,10 +39,28 @@ public class SplitEvaluator : IEvaluator<Split>, ITypeInferencer<Split>, ICostEv
     /// <inheritdoc/>
     public Cost Visit(ICostEvaluateContext context, Split target)
     {
-        _ = context.GetReturnType<TupleType>();
+        // _ = context.GetReturnType<TupleType>();
         return new()
         {
             [CostFactorNames.CPUCycles] = 1,
+        };
+    }
+
+    public Expr Visit(IShapeEvaluateContext context, Split target)
+    {
+        var inShape = context.GetArgumentShape(target, Split.Input);
+        var axis = ((TensorConst)context.GetArgument(target, Split.Axis)).Value.ToScalar<int>();
+        var sections = ((TensorConst)context.GetArgument(target, Split.Sections)).Value.ToArray<int>();
+        var shapes = sections.Select(section => ShapeExprUtility.Replace(inShape, axis, section)).ToArray();
+        return new IR.Tuple(shapes);
+    }
+
+    public Metric Visit(IMetricEvaluateContext context, Split target)
+    {
+        var inputType = context.GetArgumentType<TensorType>(target, Split.Input);
+        return new()
+        {
+            [MetricFactorNames.OffChipMemoryTraffic] = CostUtility.GetMemoryAccess(inputType) * 2,
         };
     }
 
@@ -88,6 +107,17 @@ public class SplitEvaluator : IEvaluator<Split>, ITypeInferencer<Split>, ICostEv
             }
         }
 
-        return input with { Shape = Shape.Unranked };
+        var splitedShape = input.Shape.ToArray();
+        if (context.GetArgument(target, Split.Axis) is TensorConst axisCon)
+        {
+            var axisV = Util.PositiveIndex(axisCon.Value.ToScalar<int>(), input.Shape.Rank);
+            splitedShape[axisV] = Dimension.Unknown;
+        }
+        else
+        {
+            splitedShape = splitedShape.Select(s => Dimension.Unknown).ToArray();
+        }
+
+        return new TupleType(new IRType[] { input with { Shape = splitedShape } }, true);
     }
 }
