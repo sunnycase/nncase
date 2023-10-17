@@ -4,8 +4,6 @@ export PATH=/opt/python/cp37-cp37m/bin:$PATH
 export BUILD_TYPE=Release
 
 pip install conan==1.58 ninja
-cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=$BUILD_TYPE -BUILD_PYTHON_BINDING=OFF
-cmake --build build --config $BUILD_TYPE
-cmake --install build --prefix install
+conan install . -if build --build=missing -s build_type=$BUILD_TYPE --profile=default -o runtime=False -o python=False -o tests=True
 conan user sunnycase -r sunnycase -p $1
 conan upload "*" --all -r sunnycase -c
