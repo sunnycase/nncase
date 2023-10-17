@@ -67,6 +67,7 @@ class nncaseConan(ConanFile):
             self.requires('eigen/3.4.0')
             self.requires('stduuid/1.2.2')
             self.requires('systemc/2.3.3')
+            self.requires('ms-gsl/4.0.0')
             if self.options.tests:
                 self.requires('gtest/1.10.0')
             if self.settings.os == 'Linux':
