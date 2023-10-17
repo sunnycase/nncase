@@ -44,6 +44,7 @@ jobs:
         shell: bash
         run: |
           pip install conan==1.58
+          conan remote add -i 0 sunnycase https://conan.sunnycase.moe
 
       - name: Configure Conan (Linux)
         run: |
