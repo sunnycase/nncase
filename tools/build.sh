@@ -3,7 +3,7 @@
 export PATH=/opt/python/cp37-cp37m/bin:$PATH
 export BUILD_TYPE=Release
 
-pip install conan==1.58 ninja
+pip install conan==1.64 ninja
 conan remote add -i 0 sunnycase https://conan.sunnycase.moe
 conan profile new default --detect
 conan profile update settings.compiler.libcxx=libstdc++11 default
