@@ -37,12 +37,12 @@ jobs:
           pip install conan==1.64
           conan remote add -i 0 sunnycase https://conan.sunnycase.moe
 
-    - name: Configure Conan (Linux)
-      run: |
-        conan profile new default --detect
-        conan profile update settings.compiler.libcxx=libstdc++11 default
-        conan profile update settings.compiler.version=10 default
-      if: runner.os == 'Linux'
+      - name: Configure Conan (Linux)
+        run: |
+          conan profile new default --detect
+          conan profile update settings.compiler.libcxx=libstdc++11 default
+          conan profile update settings.compiler.version=10 default
+        if: runner.os == 'Linux'
 
       - name: Configure Conan (Macos)
         run: |
@@ -51,25 +51,25 @@ jobs:
           sed -i '' 's/"14.0"]/"14.0", "15"]/g' ~/.conan/settings.yml
         if: runner.os == 'Macos'
 
-    - name: Configure CMake
-      shell: bash
-      run: |
-        conan install . -if build --build=missing -s build_type=${{matrix.config.buildType}} --profile=default -o runtime=True -o python=False -o tests=True -s compiler.cppstd=17
-        
-    - name: Upload Conan Recipes
-      env:
-        CONAN_PASSWORD: ${{secrets.CONAN_SUNNYCASE_PASSWORD}}
-      shell: bash
-      run: |
-        conan user sunnycase -r sunnycase -p $CONAN_PASSWORD
-        conan upload "*" --all -r sunnycase -c
+      - name: Configure CMake
+        shell: bash
+        run: |
+          conan install . -if build --build=missing -s build_type=${{matrix.config.buildType}} --profile=default -o runtime=True -o python=False -o tests=True -s compiler.cppstd=20
+          
+      - name: Upload Conan Recipes
+        env:
+          CONAN_PASSWORD: ${{secrets.CONAN_SUNNYCASE_PASSWORD}}
+        shell: bash
+        run: |
+          conan user sunnycase -r sunnycase -p $CONAN_PASSWORD
+          conan upload "*" --all -r sunnycase -c
 
-    #- name: Upload nncaseruntime Benchmark
-    #  uses: actions/upload-artifact@v3
-    #  with:
-    #    name: nncaseruntime-benchmark-${{matrix.config.name}}
-    #    path: ${{github.workspace}}/benchnncase.log
-    #    if-no-files-found: error
+      #- name: Upload nncaseruntime Benchmark
+      #  uses: actions/upload-artifact@v3
+      #  with:
+      #    name: nncaseruntime-benchmark-${{matrix.config.name}}
+      #    path: ${{github.workspace}}/benchnncase.log
+      #    if-no-files-found: error
 
   build-cross-linux-runtime:
     name: build-runtime-${{matrix.config.name}}
@@ -116,13 +116,13 @@ jobs:
         run: |
           conan install . -if build --build=missing -s build_type=${{matrix.config.buildType}} --profile:host=toolchains/riscv64-unknown-linux.profile.jinja --profile:build=default -o runtime=True -o python=False -o tests=True -s compiler.cppstd=20
 
-   - name: Upload Conan Recipes
-     env:
-       CONAN_PASSWORD: ${{secrets.CONAN_SUNNYCASE_PASSWORD}}
-     shell: bash
-     run: |
-       conan user sunnycase -r sunnycase -p $CONAN_PASSWORD
-       conan upload "*" --all -r sunnycase -c
+      - name: Upload Conan Recipes
+        env:
+          CONAN_PASSWORD: ${{secrets.CONAN_SUNNYCASE_PASSWORD}}
+        shell: bash
+        run: |
+          conan user sunnycase -r sunnycase -p $CONAN_PASSWORD
+          conan upload "*" --all -r sunnycase -c
 
   build-manylinux-native-runtime:
     name: build-manylinux-native-runtime-${{matrix.config.name}}
