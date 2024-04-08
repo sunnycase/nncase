@@ -36,15 +36,13 @@ internal class EGraphRewriteProvider : IEGraphRewriteProvider
 
         var graph = new EGraph(expr);
         ERewrite(graph, rules, options);
-        var post = graph.Extract(graph.Root!, null);
+        var post = graph.Extract(graph.Root!, null, Array.Empty<EGraphExtractConstrains>());
         return post;
     }
 
     public IEGraph ERewrite(IEGraph eGraph, IEnumerable<IRewriteRule> rules, RunPassContext context)
     {
         var last_version = eGraph.Version;
-        int count = 0;
-
         while (true)
         {
             var matches = rules.
@@ -59,10 +57,12 @@ internal class EGraphRewriteProvider : IEGraphRewriteProvider
 
             if (DumpScope.Current.IsEnabled(DumpFlags.Rewrite))
             {
-                foreach (var (rule, results) in matches.Where(p => p.Item2.Count != 0))
+                using var fs = DumpScope.Current.OpenFile(Path.Combine("Matches", $"V{eGraph.Version}.txt"));
+                using var writer = new StreamWriter(fs);
+                writer.WriteLine("rule, results");
+                foreach (var (rule, results) in matches)
                 {
-                    using var fs = DumpScope.Current.OpenFile(Path.Combine("Matches", $"V{eGraph.Version}_{count++}_{rule.GetType().Name}.dot"));
-                    EGraphPrinter.DumpEgraphAsDot(eGraph, results, fs);
+                    writer.WriteLine($"{rule.GetType().Name}, {results.Count}");
                 }
             }
 
@@ -70,9 +70,9 @@ internal class EGraphRewriteProvider : IEGraphRewriteProvider
             {
                 var replacedExprs = (from result in results
                                      let oldExpr = ((ENode)result.Root).Expr
-                                     let newExpr = rule.GetReplace(result, context)?.InheritMetaData(oldExpr)
+                                     from newExpr in rule.GetReplaceCandidates(result, context)
                                      where newExpr != null
-                                     select (oldExpr, eGraph.Find((ENode)result.Root), newExpr)).ToList();
+                                     select (oldExpr, eGraph.Find((ENode)result.Root), newExpr.InheritMetaData(oldExpr))).ToList();
 
                 foreach (var (oldExpr, oldEClass, newExpr) in replacedExprs)
                 {

@@ -81,12 +81,6 @@ class TestRunner(Evaluator, Inference, metaclass=ABCMeta):
                 'shape': 'N/A',
                 'if_quant_type': 'uint8',
                 'w_quant_type': 'uint8',
-                'roofline_fps': 'N/A',
-                'actual_fps': 'N/A',
-                'roofline_mac_usage': 'N/A',
-                'actual_mac_usage': 'N/A',
-                'result': 'Pass',
-                'remark': 'N/A'
             }
 
     def transform_input(self, values: List[np.ndarray], type: str, stage: str) -> List[np.ndarray]:
@@ -247,6 +241,12 @@ class TestRunner(Evaluator, Inference, metaclass=ABCMeta):
     def import_model(self, compiler, model_content, import_options):
         pass
 
+    def config_cmds(self):
+        return []
+
+    def stat_target(self, infer_dir, results):
+        pass
+
     def run(self, model_file: Union[List[str], str]):
         if not self.inputs:
             self.parse_model(model_file)
@@ -277,7 +277,7 @@ class TestRunner(Evaluator, Inference, metaclass=ABCMeta):
                                 actual = self.run_evaluator(compiler, tmp_dir)
                             else:
                                 actual = self.run_inference(
-                                    compiler, k_target, v_mode['enabled'], tmp_dir)
+                                    compiler, k_target, k_mode == "ptq" and v_mode['enabled'], tmp_dir)
                             target_dir = os.path.join(self.case_dir, stage, k_target)
                             os.makedirs(target_dir, exist_ok=True)
                             mode_dir = os.path.join(target_dir, k_mode)
@@ -400,6 +400,12 @@ class TestRunner(Evaluator, Inference, metaclass=ABCMeta):
             file_list.extend([os.path.join(args, p) for p in os.listdir(args)])
         elif method == 'constant_of_shape':
             assert len(args) != 0
+        elif method == 'numpy':
+            assert(os.path.isdir(args))
+            for file in os.listdir(args):
+                if file.endswith('.npy'):
+                    file_list.append(os.path.join(args, file))
+            file_list.sort()
         else:
             assert '{0} : not supported generator method'.format(method)
 
@@ -420,19 +426,19 @@ class TestRunner(Evaluator, Inference, metaclass=ABCMeta):
                 input_shape[0] *= generator_cfg['batch']
 
             for batch_idx in range(batch_number):
+                idx = input_idx * batch_number + batch_idx
                 if method == 'random':
                     data = generator.from_random(input_shape, dtype, args)
                 elif method == 'bin':
-                    idx = input_idx * batch_number + batch_idx
                     assert(idx < len(file_list))
                     data = generator.from_bin(input_shape, dtype, file_list[idx])
                 elif method == 'image':
-                    idx = input_idx * batch_number + batch_idx
                     assert(idx < len(file_list))
                     data = generator.from_image(input_shape, dtype, file_list[idx])
                 elif method == 'constant_of_shape':
                     data = generator.from_constant_of_shape(args, dtype)
-
+                elif method == 'numpy':
+                    data = generator.from_numpy(file_list[idx])
                 if not test_utils.in_ci():
                     dump_bin_file(os.path.join(self.case_dir, name,
                                                f'{name}_{input_idx}_{batch_idx}.bin'), data)

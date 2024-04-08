@@ -37,7 +37,7 @@ class GatherTest : public KernelTest,
         auto shape = GetShapeArray("lhs_shape");
         auto indices_shape = GetShapeArray("indices_shape");
         auto indices_value = GetDataArray("indices_value");
-        auto value = GetNumber("axis");
+        auto axis = GetNumber("axis");
         auto typecode = GetDataType("lhs_type");
 
         input = hrt::create(typecode, shape, host_runtime_tensor::pool_cpu_only)
@@ -56,22 +56,14 @@ class GatherTest : public KernelTest,
             (int64_t *)malloc(indices_value_size * sizeof(int64_t));
         std::copy(indices_value.begin(), indices_value.end(), indices_array);
         indices = hrt::create(dt_int64, indices_shape,
-                              {reinterpret_cast<gsl::byte *>(indices_array),
+                              {reinterpret_cast<std::byte *>(indices_array),
                                indices_value_size * sizeof(int64_t)},
                               true, host_runtime_tensor::pool_cpu_only)
                       .expect("create tensor failed");
 
-        batchDims_value = value >= 0
-                              ? (size_t)value >= shape.size() ? -1 : value
-                          : -(size_t)value > shape.size() ? -1
-                                                          : value;
-
-        int64_t batchDims_array[1] = {batchDims_value};
-        batchDims = hrt::create(dt_int64, dims_t{1},
-                                {reinterpret_cast<gsl::byte *>(batchDims_array),
-                                 sizeof(batchDims_array)},
-                                true, host_runtime_tensor::pool_cpu_only)
-                        .expect("create tensor failed");
+        batchDims_value = axis >= 0 ? (size_t)axis >= shape.size() ? -1 : axis
+                          : -(size_t)axis > shape.size() ? -1
+                                                         : axis;
     }
 
     void TearDown() override { CLEAR_SUBCASE() }
@@ -79,7 +71,6 @@ class GatherTest : public KernelTest,
   protected:
     runtime_tensor input;
     runtime_tensor indices;
-    runtime_tensor batchDims;
     int64_t batchDims_value;
 };
 
@@ -97,13 +88,13 @@ TEST_P(GatherTest, gather) {
     dims_t shape(tensor_rank(output_ort));
     tensor_shape(output_ort, reinterpret_cast<int64_t *>(shape.data()));
     auto expected = hrt::create(input.datatype(), shape,
-                                {reinterpret_cast<gsl::byte *>(ptr_ort), size},
+                                {reinterpret_cast<std::byte *>(ptr_ort), size},
                                 true, host_runtime_tensor::pool_cpu_only)
                         .expect("create tensor failed");
 
     // actual
     auto output =
-        kernels::stackvm::gather(input.impl(), batchDims.impl(), indices.impl())
+        kernels::stackvm::gather(batchDims_value, input.impl(), indices.impl())
             .expect("gather failed");
     runtime_tensor actual(output.as<tensor>().expect("as tensor failed"));
 

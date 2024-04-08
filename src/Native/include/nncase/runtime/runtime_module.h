@@ -36,7 +36,7 @@ class NNCASE_API runtime_module {
     create(const module_kind_t &kind);
 
     using custom_call_type = result<value_t> (*)(
-        gsl::span<const gsl::byte>, const std::vector<value_t> &,
+        std::span<const std::byte>, const std::vector<value_t> &,
         const kernels::kernel_context &);
 
     static result<
@@ -48,7 +48,7 @@ class NNCASE_API runtime_module {
     virtual ~runtime_module() = default;
     runtime_module &operator=(const runtime_module &) = delete;
 
-    result<void> initialize(gsl::span<const gsl::byte> payload,
+    result<void> initialize(std::span<const std::byte> payload,
                             interpreter &interp) noexcept;
     result<void> initialize(stream_reader &reader,
                             interpreter &interp) noexcept;
@@ -58,6 +58,8 @@ class NNCASE_API runtime_module {
 
     result<runtime_function *> find_function_by_id(size_t index) noexcept;
 
+    result<size_t> find_id_by_function(runtime_function *function) noexcept;
+
   protected:
     virtual result<void>
     initialize_before_functions(runtime_module_init_context &context) noexcept;
@@ -66,7 +68,7 @@ class NNCASE_API runtime_module {
     virtual result<std::unique_ptr<runtime_function>>
     create_function() noexcept = 0;
 
-    gsl::span<std::unique_ptr<runtime_function>> functions() noexcept {
+    std::span<std::unique_ptr<runtime_function>> functions() noexcept {
         return functions_;
     }
 

@@ -14,8 +14,10 @@ using Microsoft.Extensions.DependencyInjection;
 using Nncase.CostModel;
 using Nncase.Evaluator;
 using Nncase.IR;
+using Nncase.IR.Affine;
 using Nncase.Passes;
 using Nncase.PatternMatch;
+using Nncase.Schedule;
 using Nncase.Targets;
 
 namespace Nncase;
@@ -72,6 +74,14 @@ public interface ICompilerServicesProvider
     /// <param name="dumpDir">file dump ir.</param>
     /// <param name="randConst">false for save const into bin.</param>
     public void DumpCSharpIR(Expr expr, string prefix, string dumpDir, bool randConst);
+
+    /// <summary>
+    /// dump the expr as csharp code.
+    /// </summary>
+    /// <param name="expr">expression.</param>
+    /// <param name="prefix">file prefix.</param>
+    /// <param name="dumpDir">file dump ir.</param>
+    public void DumpPatternIR(Expr expr, string prefix, string dumpDir);
 
     /// <summary>
     /// print ir type.
@@ -200,6 +210,15 @@ public interface ICompilerServicesProvider
     /// <param name="options">Options.</param>
     /// <returns>Rewrited expression.</returns>
     Expr ERewrite(Expr expr, IEnumerable<IRewriteRule> rules, RunPassContext options);
+
+    /// <summary>
+    /// Using EGraph rewrite expression.
+    /// </summary>
+    /// <param name="expr">Expression.</param>
+    /// <param name="rules">Rewrite rules.</param>
+    /// <param name="options">Options.</param>
+    /// <returns>Rewrited expression.</returns>
+    IEGraph ERewrite(IEGraph expr, IEnumerable<IRewriteRule> rules, RunPassContext options);
 }
 
 internal interface ICompilerServicesProviderInternal
@@ -402,6 +421,18 @@ public static class CompilerServices
     }
 
     /// <summary>
+    /// Using EGraph rewrite expression.
+    /// </summary>
+    /// <param name="graph">Expression.</param>
+    /// <param name="rules">Rewrite rules.</param>
+    /// <param name="options">Options.</param>
+    /// <returns>Rewrited expression.</returns>
+    public static IEGraph ERewrite(IEGraph graph, IEnumerable<IRewriteRule> rules, RunPassContext options)
+    {
+        return Provider.ERewrite(graph, rules, options);
+    }
+
+    /// <summary>
     /// Match enodes as root.
     /// </summary>
     /// <param name="enodes">ENodes.</param>
@@ -467,6 +498,15 @@ public static class CompilerServices
     /// <param name="randConst">randConst = false will save the const into bin.</param>
     public static void DumpCSharpIR(Expr expr, string prefix, string dumpDir, bool randConst = true) =>
       Provider.DumpCSharpIR(expr, prefix, dumpDir, randConst);
+
+    /// <summary>
+    /// dump the expr as csharp code.
+    /// </summary>
+    /// <param name="expr">expression.</param>
+    /// <param name="prefix">file prefix.</param>
+    /// <param name="dumpDir">file dump ir.</param>
+    public static void DumpPatternIR(Expr expr, string prefix, string dumpDir) =>
+      Provider.DumpPatternIR(expr, prefix, dumpDir);
 
     public static string Print(IRType type) => Provider.Print(type);
 
@@ -584,6 +624,10 @@ internal class CompilerServicesProvider : ICompilerServicesProvider, ICompilerSe
     _irprinterProvider.DumpCSharpIR(expr, prefix, dumpDir, randConst);
 
     /// <inheritdoc/>
+    public void DumpPatternIR(Expr expr, string prefix, string dumpDir) =>
+    _irprinterProvider.DumpPatternIR(expr, prefix, dumpDir);
+
+    /// <inheritdoc/>
     public string Print(IRType type) => _irprinterProvider.Print(type);
 
     /// <inheritdoc/>
@@ -655,5 +699,10 @@ internal class CompilerServicesProvider : ICompilerServicesProvider, ICompilerSe
     public Expr ERewrite(Expr expr, IEnumerable<IRewriteRule> rules, RunPassContext options)
     {
         return _eGraphrewriteProvider.ERewrite(expr, rules, options);
+    }
+
+    public IEGraph ERewrite(IEGraph graph, IEnumerable<IRewriteRule> rules, RunPassContext options)
+    {
+        return _eGraphrewriteProvider.ERewrite(graph, rules, options);
     }
 }

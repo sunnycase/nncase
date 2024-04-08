@@ -8,7 +8,7 @@ using System.Diagnostics;
 using System.Linq;
 using System.Text;
 using System.Threading.Tasks;
-using Microsoft.Toolkit.HighPerformance.Helpers;
+using CommunityToolkit.HighPerformance.Helpers;
 using Nncase.Diagnostics;
 
 namespace Nncase.IR;
@@ -84,6 +84,30 @@ public abstract partial class Expr : IDisposable
     }
 
     /// <summary>
+    /// Gets checked tensor type.
+    /// </summary>
+    public TensorType CheckedTensorType
+    {
+        get
+        {
+            switch (CheckedType)
+            {
+                case TensorType type:
+                    return type;
+                case DistributedType type:
+                    return type.TensorType;
+                default:
+                    if (DumpScope.Current.IsEnabled(DumpFlags.Compile))
+                    {
+                        DumpScope.Current.DumpIR(this, "CheckedTensorType");
+                    }
+
+                    throw new InvalidOperationException("Only The Expr Have CheckedType Can Get It's Shape");
+            }
+        }
+    }
+
+    /// <summary>
     /// Gets checked shape.
     /// </summary>
     public Shape CheckedShape
@@ -94,6 +118,8 @@ public abstract partial class Expr : IDisposable
             {
                 case TensorType type:
                     return type.Shape;
+                case DistributedType type:
+                    return type.TensorType.Shape;
                 default:
                     if (DumpScope.Current.IsEnabled(DumpFlags.Compile))
                     {
@@ -116,6 +142,8 @@ public abstract partial class Expr : IDisposable
             {
                 case TensorType type:
                     return type.DType;
+                case DistributedType type:
+                    return type.TensorType.DType;
                 default:
                     if (DumpScope.Current.IsEnabled(DumpFlags.Compile))
                     {
@@ -180,7 +208,10 @@ public abstract partial class Expr : IDisposable
             return true;
         }
 
-        return obj is Expr other && GetHashCode() == other.GetHashCode() && Operands.SequenceEqual(other.Operands);
+        return obj is Expr other
+            && GetType() == other.GetType()
+            && GetHashCode() == other.GetHashCode()
+            && Operands.SequenceEqual(other.Operands);
     }
 
     /// <inheritdoc/>

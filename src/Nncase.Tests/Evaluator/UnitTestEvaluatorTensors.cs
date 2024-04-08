@@ -43,6 +43,16 @@ public class UnitTestEvaluatorTensors : TestClassBase
         Assert.Equal(expect, expr.Evaluate().AsTensor().ToOrtTensor());
     }
 
+    [Fact(Skip = "OnnxBug")]
+    public void TestBinary()
+    {
+        var lhsShape = new long[] { 1, 1, 12, 256, 1, 32, 32, 1 };
+        var rhsShape = new long[] { 64, 1, 256, 4, 1, 32, 32 };
+        var lhs = OrtKI.Random(lhsShape);
+        var rhs = OrtKI.Random(rhsShape);
+        _ = OrtKI.Mul(lhs, rhs);
+    }
+
     [Fact]
     public void TestBroadcast()
     {
@@ -112,7 +122,7 @@ public class UnitTestEvaluatorTensors : TestClassBase
         for (long i = 0; i < shape.Length; i++)
         {
             var expect = OrtKI.Concat(new OrtKISharp.Tensor[] { inputA, inputB }, i);
-            var expr = IR.F.Tensors.Concat(new Tuple(inputA.ToTensor(), inputB.ToTensor()), i);
+            var expr = IR.F.Tensors.Concat(new Tuple(inputA.ToTensor(), inputB.ToTensor()), (int)i);
             CompilerServices.InferenceType(expr);
             Assert.Equal(expect, expr.Evaluate().AsTensor().ToOrtTensor());
         }
@@ -624,7 +634,7 @@ public class UnitTestEvaluatorTensors : TestClassBase
         long batchDims = 0L;
         var expect = OrtKI.Gather(input.ToOrtTensor(), indices.ToOrtTensor(), batchDims);
 
-        var expr = IR.F.Tensors.Gather(input, batchDims, indices);
+        var expr = IR.F.Tensors.Gather(input, (int)batchDims, indices);
         CompilerServices.InferenceType(expr);
         Assert.Equal(expect, expr.Evaluate().AsTensor().ToOrtTensor());
     }

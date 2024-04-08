@@ -9,7 +9,6 @@ using System.Threading.Tasks;
 using DryIoc.FastExpressionCompiler.LightExpression;
 using DryIoc.ImTools;
 using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Toolkit.HighPerformance;
 using NetFabric.Hyperlinq;
 using Nncase.IR;
 using Nncase.IR.Tensors;
@@ -40,20 +39,12 @@ public class MergeBucketFusionPass : FunctionPass
         while (true)
         {
             var preHash = main.GetHashCode();
-            if (_greedy)
-            {
-                CompilerServices.Rewrite(main, new IRewriteRule[] { new MultiUserCallToFusion(false, _greedy), new MergeTupleFusion() }, new());
-                await new MergeSeqBucketFusion().RunAsync(main, context);
-                IRHelpers.DCE(main);
-                await new MergeMultiUsersFusion().RunAsync(main, context);
-                DumpIR(main, $"{i}_before", "FoldNopTuple");
-                await new FoldNopTuple().RunAsync(main, context);
-            }
-            else
-            {
-                await new MergeSeqBucketFusion().RunAsync(main, context);
-                IRHelpers.DCE(main);
-            }
+            CompilerServices.Rewrite(main, new IRewriteRule[] { new MultiUserCallToFusion(!_greedy, _greedy), new MergeTupleFusion() }, new());
+            await new MergeSeqBucketFusion().RunAsync(main, context);
+            IRHelpers.DCE(main);
+            await new MergeMultiUsersFusion().RunAsync(main, context);
+            DumpIR(main, $"{i}_before", "FoldNopTuple");
+            await new FoldNopTuple().RunAsync(main, context);
 
             CheckRepeat(main);
             CheckErrorVar(main, main.Parameters.ToArray());
@@ -298,8 +289,10 @@ public class MergeMultiUsersFusion : FunctionPass
             Op op => op.GetType().Name,
             _ => string.Empty,
         }));
+#if DEBUG
         Console.WriteLine($"Merge {fusion.Name}");
         Console.WriteLine(otherName);
+#endif
         var fusionDict = outerCall.Arguments.ToArray().Zip(fusion.Parameters.ToArray()).ToArray();
 
         // 这个vars用于确定output的args里面哪些要加入，哪些要消除，另外还要包含多个user的那个

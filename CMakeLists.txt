@@ -12,7 +12,6 @@ endif()
 
 if(NOT DEFINED NNCASE_VERSION_SUFFIX)
     find_package (Git)
-
     execute_process(
         COMMAND ${GIT_EXECUTABLE} describe --always --dirty --tag
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
@@ -40,8 +39,6 @@ project(nncase
   VERSION ${NNCASE_VERSION}
   LANGUAGES C CXX ASM)
 
-option(ENABLE_OPENMP "OpenMP support" ON)
-option(ENABLE_HALIDE "halide kernels support" ON)
 option(DOTNET_INIT_FOR_CONFIG "Initialize dotnet from runtimeconfig" OFF)
 option(BUILD_PYTHON_BINDING "Build python binding" ON)
 option(BUILD_CSHARP_BINDING "Build csharp binding" ON)
@@ -107,7 +104,7 @@ if (BUILDING_RUNTIME)
     else()
         add_compile_options(-Wall -Wextra -pedantic -Werror -Wno-multichar -Wno-missing-field-initializers -Wno-unused-function -Wno-type-limits)
         if (APPLE)
-            add_compile_options(-Wno-four-char-constants -Wno-sometimes-uninitialized)
+            add_compile_options(-Wno-four-char-constants -Wno-sometimes-uninitialized -Wno-deprecated-declarations)
         elseif (CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
             add_compile_options(-Wno-uninitialized -Wno-unused-private-field)
         else()
@@ -125,6 +122,9 @@ if (BUILDING_RUNTIME)
     #    add_subdirectory(src/Native/src/kernels)
     #    add_subdirectory(src/Native/src/runtime)
     add_subdirectory(src/Native/src)
+    if(BUILD_TESTING)
+        add_subdirectory(src/Native/test)
+    endif()
 #    add_subdirectory(src/Native/src/functional)
     if(BUILD_BENCHMARK)
 #        add_subdirectory(benchmark)
@@ -215,7 +215,9 @@ else()
 
     add_subdirectory(src/Native/include/nncase)
     add_subdirectory(src/Native/src)
-
+if(BUILD_TESTING)
+    add_subdirectory(src/Native/test)
+endif()
     # Python binding
     if(BUILD_PYTHON_BINDING)
         add_subdirectory(python/nncase/native)
@@ -274,6 +276,5 @@ if(BUILD_TESTING)
 endif()
 
 # Modules
-add_subdirectory(modules/ncnn)
-#add_subdirectory(modules/k210)
+
 #add_subdirectory(modules/vulkan)

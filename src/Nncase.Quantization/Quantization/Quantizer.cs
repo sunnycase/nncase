@@ -167,10 +167,10 @@ internal partial class Quantizer
                 var histograms = await GetHistogramsAsync(_quantizeOptions.CalibrationDataset, ranges, srcBinSize, dstBinSize);
 
                 // 1.2. Select best ranges
-                var optRanges = GetOptRanges(histograms, ranges, srcBinSize, dstBinSize, _quantizeOptions.CalibrationMethod);
+                ranges = GetOptRanges(histograms, ranges, srcBinSize, dstBinSize, _quantizeOptions.CalibrationMethod);
 
                 // 1.3. Assign ranges
-                AssignRanges(optRanges);
+                AssignRanges(ranges);
             }
             else
             { // 2. Assign ranges
@@ -325,25 +325,21 @@ internal partial class Quantizer
         _graph.Rebuild();
     }
 
-    private async Task RunPassAsync(ICalibrationDatasetProvider calibrationDataset, Action<IReadOnlyDictionary<ENode, Tensor>, IReadOnlyDictionary<ENode, Tensor>> func)
+    private async Task RunForHistogramsAsync(ICalibrationDatasetProvider calibrationDataset, Action<IReadOnlyDictionary<ENode, Tensor>> func)
     {
         await foreach (var sample in calibrationDataset.Samples)
         {
-            IReadOnlyDictionary<ENode, Tensor> values, childrenValues;
-            using (var dumpScope = new DumpScope("ep1"))
-            {
-                var evaluator = new CalibrationEvaluator(sample, _rangeOfs);
-                values = evaluator.Evaluate();
-            }
-
+            IReadOnlyDictionary<ENode, Tensor> childrenValues;
             using (var dumpScope2 = new DumpScope("ep2"))
             {
                 var childrenEvaluator = new CalibrationEvaluator(sample, _childrenOfRangeOfs);
-                childrenValues = childrenEvaluator.Evaluate();
+                var tmpChildrenValues = childrenEvaluator.Evaluate().ToList();
+                childrenValues = tmpChildrenValues.Zip(_rangeOfs).ToDictionary(pair => pair.Second, pair => pair.First.Value);
             }
 
             // values are children op range values(only two scalars for each value: Min and Max), childrenValues are children op tensor values.
-            func(values, childrenValues);
+            func(childrenValues);
+            GC.Collect();
         }
     }
 
@@ -355,6 +351,7 @@ internal partial class Quantizer
             var evaluator = new CalibrationEvaluator(sample, _rangeOfs);
             var values = evaluator.Evaluate();
             func(values);
+            GC.Collect();
         }
     }
 
@@ -417,10 +414,12 @@ internal partial class Quantizer
 
         foreach (var rangeOf in _rangeOfs)
         {
+            bool getRange = false;
             for (int i = 0; i < quantScheme!.Outputs!.Length; i++)
             {
                 if (rangeOf.Expr.Metadata.OutputNames?[0] == quantScheme!.Outputs[i].Name)
                 {
+                    getRange = true;
                     if (((RangeOf)((Call)rangeOf.Expr).Target).IsRangeOfWeight == true && quantScheme!.Outputs[i].DataRangeMode == "by_tensor")
                     {
                         var oc = ((Call)rangeOf.Expr).Operands[1].CheckedShape[0].FixedValue;
@@ -457,6 +456,21 @@ internal partial class Quantizer
                     }
                 }
             }
+
+            if (getRange == false && _quantizeOptions.QuantScheme != string.Empty && _quantizeOptions.QuantSchemeStrictMode == true)
+            {
+                if (((RangeOf)((Call)rangeOf.Expr).Target).IsRangeOfWeight == true)
+                {
+                    var oc = ((Call)rangeOf.Expr).Operands[1].CheckedShape[0].FixedValue;
+                    var valueRanges = new ValueRange<float>[oc];
+                    ranges.Add(rangeOf, valueRanges);
+                }
+                else
+                {
+                    var valueRanges = new ValueRange<float>[1];
+                    ranges.Add(rangeOf, valueRanges);
+                }
+            }
         }
 
         return ranges;
@@ -466,8 +480,10 @@ internal partial class Quantizer
     {
         foreach (var marker in _markers)
         {
+            bool getRange = false;
             for (int i = 0; i < quantScheme!.Outputs!.Length; i++)
             {
+                getRange = true;
                 if (marker.Expr.Metadata.OutputNames?[0] == quantScheme.Outputs[i].Name)
                 {
                     var markerExpr = (Marker)marker.Expr;
@@ -480,32 +496,35 @@ internal partial class Quantizer
                     markerExpr.MixQuantInfo!.MarkerQuantType = dataType;
                 }
             }
+
+            if (getRange == false && _quantizeOptions.QuantScheme != string.Empty && _quantizeOptions.QuantSchemeStrictMode == true)
+            {
+                var markerExpr = (Marker)marker.Expr;
+                markerExpr.MixQuantInfo!.MarkerQuantType = DataTypes.Float16;
+            }
         }
     }
 
     private async Task<IDictionary<ENode, QuantizeHistogram<float>>> GetHistogramsAsync(ICalibrationDatasetProvider calibrationDataset, IDictionary<ENode, ValueRange<float>> ranges, int srcBinSize, int dstBinSize)
     {
         var histograms = new Dictionary<ENode, QuantizeHistogram<float>>(ReferenceEqualityComparer.Instance);
-        await RunPassAsync(calibrationDataset, (values, childrenValues) =>
+        foreach (var (key, value) in ranges)
         {
-            var valuesList = values.ToList();
-            var childrenValuesList = childrenValues.ToList();
-            for (int i = 0; i < valuesList.Count; i++)
+            var initSrcBin = new List<float>(new float[srcBinSize]);
+            histograms[key] = new QuantizeHistogram<float>(initSrcBin, initSrcBin);
+        }
+
+        await RunForHistogramsAsync(calibrationDataset, childrenValues =>
+        {
+            foreach (var (key, value) in childrenValues)
             {
-                var r = ranges[valuesList[i].Key].Max - ranges[valuesList[i].Key].Min;
+                var r = ranges[key].Max - ranges[key].Min;
                 var srcBinInterval = r / srcBinSize;
-                if (!histograms.TryGetValue(valuesList[i].Key, out var histogram))
-                {
-                    var initSrcBin = new List<float>(new float[srcBinSize]);
-                    var initDstBin = new List<float>(new float[dstBinSize]);
-                    histogram = new QuantizeHistogram<float>(initSrcBin, initDstBin);
-                    histograms.Add(valuesList[i].Key, histogram);
-                }
 
-                var childrenTensor = childrenValuesList[i].Value.Cast<float>();
+                var childrenTensor = value.Cast<float>();
                 var childrenBuffer = childrenTensor.Buffer.Span;
-                var valueRange = ranges[valuesList[i].Key];
-
+                var valueRange = ranges[key];
+                var histogram = histograms[key];
                 foreach (var buf in childrenBuffer)
                 {
                     var r_index = (buf - valueRange.Min) / srcBinInterval;

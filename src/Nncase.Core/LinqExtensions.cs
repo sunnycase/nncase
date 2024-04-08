@@ -4,6 +4,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Numerics;
 using System.Text;
 using System.Threading.Tasks;
 
@@ -14,6 +15,38 @@ namespace Nncase;
 /// </summary>
 public static class LinqExtensions
 {
+    public static int IndexOf<T>(this T[] source, T value)
+    {
+        if (source != null && source.Length != 0)
+        {
+            for (int i = 0; i < source.Length; i++)
+            {
+                T val = source[i];
+                if (object.Equals(val, value))
+                {
+                    return i;
+                }
+            }
+        }
+
+        return -1;
+    }
+
+    /// <summary>
+    /// Get the ranges from range desc.
+    /// </summary>
+    /// <param name="stride">stride.</param>
+    /// <param name="start">start.</param>
+    /// <param name="stop">stop.</param>
+    /// <returns>Ranges.</returns>
+    public static IEnumerable<Range> Ranges(this int stride, int start, int stop)
+    {
+        for (int i = start; i < stop; i += stride)
+        {
+            yield return new Range(i, Math.Min(stop, i + stride));
+        }
+    }
+
     /// <summary>
     /// Get cartesian product.
     /// </summary>
@@ -29,6 +62,23 @@ public static class LinqExtensions
               from accseq in accumulator
               from item in sequence
               select accseq.Concat(new[] { item }));
+    }
+
+    /// <summary>
+    /// Get the permutation of the source.
+    /// </summary>
+    /// <typeparam name="T">Element type.</typeparam>
+    /// <param name="source">Source sequences.</param>
+    /// <returns>Permutated sequences.</returns>
+    public static IEnumerable<T[]> Permutate<T>(this IEnumerable<T> source)
+    {
+        return Permutation(source, Enumerable.Empty<T>());
+
+        IEnumerable<T[]> Permutation(IEnumerable<T> reminder, IEnumerable<T> prefix) =>
+            !reminder.Any() ? new[] { prefix.ToArray() } :
+            reminder.SelectMany((c, i) => Permutation(
+                reminder.Take(i).Concat(reminder.Skip(i + 1)).ToArray(),
+                prefix.Append(c)));
     }
 
     /// <summary>

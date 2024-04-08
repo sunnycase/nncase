@@ -22,7 +22,6 @@
 #include <nncase/value.h>
 #include <string>
 #include <unordered_map>
-using nlohmann::json;
 
 extern "C" {
 typedef void *clr_object_handle_t;
@@ -109,6 +108,7 @@ typedef struct {
     clr_object_handle_t (*calibration_dataset_provider_create)(
         clr_object_handle_t dataset, size_t samplesCount,
         clr_object_handle_t fn_params);
+    void (*handle_dispose)(clr_object_handle_t handle);
     void (*handle_free)(clr_object_handle_t handle);
     clr_object_handle_t (*compile_options_create)();
     void (*compile_options_set_input_file)(clr_object_handle_t compile_options,
@@ -199,6 +199,8 @@ typedef struct {
     void (*quantize_options_set_quant_scheme)(
         clr_object_handle_t quantize_options, const char *quant_scheme,
         size_t quant_scheme_length);
+    void (*quantize_options_set_quant_scheme_strict_mode)(
+        clr_object_handle_t quantize_options, bool quant_scheme_strict_mode);
     void (*quantize_options_set_export_quant_scheme)(
         clr_object_handle_t quantize_options, bool export_quant_scheme);
     void (*quantize_options_set_export_weight_range_by_channel)(
@@ -401,6 +403,12 @@ class quantize_options : public clr_object_base {
             obj_.get(), value.data(), value.length());
     }
 
+    bool quant_scheme_strict_mode() { return false; }
+    void quant_scheme_strict_mode(bool value) {
+        nncase_clr_api()->quantize_options_set_quant_scheme_strict_mode(
+            obj_.get(), value);
+    }
+
     bool export_quant_scheme() { return false; }
     void export_quant_scheme(bool value) {
         nncase_clr_api()->quantize_options_set_export_quant_scheme(obj_.get(),
@@ -442,7 +450,7 @@ class shape_bucket_options : public clr_object_base {
 
     std::map<std::string, std::tuple<int, int>> range_info() { return {}; }
     void range_info(std::map<std::string, std::tuple<int, int>> value) {
-        json j = value;
+        nlohmann::json j = value;
         std::string s = j.dump();
         nncase_clr_api()->shape_bucket_options_set_range_info(
             obj_.get(), s.c_str(), s.length());
@@ -456,7 +464,7 @@ class shape_bucket_options : public clr_object_base {
 
     std::map<std::string, int> fix_var_map() { return {}; }
     void fix_var_map(std::map<std::string, int> value) {
-        json j = value;
+        nlohmann::json j = value;
         std::string s = j.dump();
         nncase_clr_api()->shape_bucket_options_set_fix_var_map(
             obj_.get(), s.c_str(), s.length());
@@ -470,6 +478,8 @@ class cstream : public clr_object_base {
     cstream(const nncase_stream_mt_t *mt, void *handle) {
         obj_ = nncase_clr_api()->stream_create(mt, handle);
     }
+
+    ~cstream() { nncase_clr_api()->handle_dispose(obj_.get()); }
 };
 
 class compile_options : public clr_object_base {

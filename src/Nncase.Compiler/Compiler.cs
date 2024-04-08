@@ -20,9 +20,12 @@ using Nncase.Passes.Rules.Lower;
 using Nncase.Passes.Rules.Neutral;
 using Nncase.Passes.Rules.ShapeBucket;
 using Nncase.Passes.Rules.ShapeExpr;
+using Nncase.Passes.Rules.WithMarker;
 using Nncase.Passes.Transforms;
 using Nncase.Quantization;
 using static Nncase.Passes.Rules.ShapeBucket.ShapeBucketRegister;
+using CombinePadTranspose = Nncase.Passes.Rules.WithMarker.CombinePadTranspose;
+using CombineReshapePad = Nncase.Passes.Rules.Neutral.CombineReshapePad;
 using FoldConstCall = Nncase.Passes.Rules.Neutral.FoldConstCall;
 
 namespace Nncase.Compiler;
@@ -88,13 +91,15 @@ internal class Compiler : ICompiler
 
     public void TargetIndependentPass(IPassManager passManager)
     {
-        passManager.AddWithName<DataflowPass>("ReshapeMatMul").Configure(p =>
+        passManager.AddWithName<DataflowPass>("NormAxisAndShape").Configure(p =>
         {
             p.Add<Passes.Rules.Neutral.ReshapeMatMul>();
-        });
-
-        passManager.AddWithName<DataflowPass>("SqueezeShape").Configure(p =>
-        {
+            p.Add<Passes.Rules.Neutral.NormAxisGather>();
+            p.Add<Passes.Rules.Neutral.NormAxisConcat>();
+            p.Add<Passes.Rules.Neutral.NormAxisReduce>();
+            p.Add<Passes.Rules.Neutral.NormAxisReshape>();
+            p.Add<Passes.Rules.Neutral.NormAxisReduceArg>();
+            p.Add<Passes.Rules.Neutral.NormAxisSlice>();
             p.Add<Passes.Rules.Neutral.SqueezeTransposeShape>();
             p.Add<Passes.Rules.Neutral.Squeeze5DTranspose>();
             p.Add<Passes.Rules.Neutral.SqueezeBinaryShape>();
@@ -102,6 +107,7 @@ internal class Compiler : ICompiler
             p.Add<Passes.Rules.Neutral.FoldLayerNormPattern2>();
             p.Add<Passes.Rules.Neutral.FoldLayerNormPattern3>();
             p.Add<Passes.Rules.Neutral.FoldLayerNormPattern4>();
+            p.Add<Passes.Rules.Neutral.FoldLayerNormPattern5>();
             p.Add<Passes.Rules.Neutral.FoldGeluWithScale>();
             p.Add<Passes.Rules.Neutral.FoldGeneralGelu>();
             p.Add<Passes.Rules.Neutral.FoldSwishPattern1>();
@@ -114,8 +120,6 @@ internal class Compiler : ICompiler
             p.Add<Passes.Rules.Neutral.FoldTwoSlices>();
             p.Add<Passes.Rules.Neutral.FocusFull>();
             p.Add<Passes.Rules.Neutral.ReshapeMatMul>();
-            p.Add<Passes.Rules.Neutral.SplitSpaceToBatch>();
-            p.Add<Passes.Rules.Neutral.SplitBatchToSpace>();
             p.Add<Passes.Rules.Neutral.FoldConstCall>();
             p.Add<Passes.Rules.Neutral.FoldShapeOf>();
             p.Add<Passes.Rules.Neutral.FoldTwoReshapes>();
@@ -128,6 +132,7 @@ internal class Compiler : ICompiler
             p.Add<Passes.Rules.Neutral.FoldUnsqueezeSqueeze>();
             p.Add<Passes.Rules.Neutral.FoldTwoTransposes>();
             p.Add<Passes.Rules.Neutral.FoldNopClamp>();
+            p.Add<Passes.Rules.ShapeBucket.FoldRepeatMarker>();
             p.Add<Passes.Rules.Neutral.SqueezeToReshape>();
             p.Add<Passes.Rules.Neutral.UnSqueezeToReshape>();
             p.Add<Passes.Rules.ShapeExpr.GatherToGetItem>();
@@ -135,6 +140,8 @@ internal class Compiler : ICompiler
             p.Add<Passes.Rules.Neutral.FoldNopReduce>();
             p.Add<Passes.Rules.Neutral.SliceToGetItem>();
             p.Add<Passes.Rules.Neutral.FoldTwoPads>();
+            p.Add<Passes.Rules.Neutral.SwapBinaryArgs>();
+            p.Add<Passes.Rules.Neutral.FoldDilatedConv2D>();
         });
 
         passManager.AddWithName<EGraphRulesPass>("NeutralOptimizeTranspose").Configure(p =>
@@ -142,8 +149,21 @@ internal class Compiler : ICompiler
             p.Add<Passes.Rules.Neutral.FoldConstCall>();
             p.Add<Passes.Rules.Neutral.FoldNopTranspose>();
             p.Add<Passes.Rules.Neutral.FoldTwoTransposes>();
+            p.Add<FoldRepeatMarker>();
+            p.Add<Passes.Rules.WithMarker.FoldTransposeActTranspose>();
+            p.Add<Passes.Rules.WithMarker.FoldTransposeBinaryActTranspose>();
+            p.Add<Passes.Rules.WithMarker.CombineReshapePad>();
+            p.Add<Passes.Rules.WithMarker.CombinePadTranspose>();
             p.Add<Passes.Rules.Neutral.CombineTransposeUnary>();
-            p.Add<Passes.Rules.Neutral.CombineTransposePad>();
+            if (_compileSession.CompileOptions.ShapeBucketOptions.Enable)
+            {
+                p.Add<Passes.Rules.WithMarker.CombineTransposePad>();
+            }
+            else
+            {
+                p.Add<Passes.Rules.Neutral.CombineTransposePad>();
+            }
+
             p.Add<Passes.Rules.Neutral.CombinePadTranspose>();
             p.Add<Passes.Rules.Neutral.CombineBinaryTranspose>();
             p.Add<Passes.Rules.Neutral.CombineConstBinaryTranspose>();
@@ -157,6 +177,8 @@ internal class Compiler : ICompiler
             p.Add<Passes.Rules.Neutral.CombineUnaryReshape>();
             p.Add<Passes.Rules.Neutral.CombineActivationsReshape>();
             p.Add<Passes.Rules.Neutral.CombineReshapePad>();
+            p.Add<Passes.Rules.Neutral.CombineReshapeTranspose>();
+            p.Add<Passes.Rules.Neutral.CombineTransposeReshape>();
             p.Add<Passes.Rules.Neutral.FoldNopPad>();
             p.Add<Passes.Rules.Neutral.FoldConv2DPads>();
             p.Add<Passes.Rules.Neutral.FuseClampConv2D>();
@@ -168,17 +190,20 @@ internal class Compiler : ICompiler
             p.Add<Passes.Rules.Neutral.ReshapeToTranspose>();
             p.Add<Passes.Rules.Neutral.FoldNopReshape>();
             p.Add<Passes.Rules.Neutral.FoldTwoReshapes>();
+            p.Add<Passes.Rules.Neutral.FoldReshapeBinaryConstReshape>();
             p.Add<Passes.Rules.Neutral.ReluToClamp>();
             p.Add<Passes.Rules.Neutral.Relu6ToClamp>();
             p.Add<Passes.Rules.Neutral.FoldNopSlice>();
             p.Add<Passes.Rules.Neutral.FoldTwoSlices>();
             p.Add<Passes.Rules.Neutral.SpaceToBatchToPad>();
+            p.Add<Passes.Rules.Neutral.FoldConv2DAddMul>();
         });
 
         _compileSession.Target.RegisterTargetInDependentPass(passManager, _compileSession.CompileOptions);
 
         passManager.AddWithName<DataflowPass>("BroadcastMarker").Configure(p =>
         {
+            p.Add<FoldTransposeActTranspose>();
             p.Add<BroadcastInputMarker>();
             p.Add<BroadcastOutputMarker>();
         });
@@ -214,8 +239,8 @@ internal class Compiler : ICompiler
             MergeOp(p, true);
             ClearMarker(p);
             MergeFusion(p, singleVar, true);
-            Bucket(p);
             Rebuild(p, singleVar);
+            Bucket(p);
             Simplify(p);
         }
         else
@@ -238,28 +263,34 @@ internal class Compiler : ICompiler
         });
     }
 
-    public async Task CompileAsync()
+    public async Task CompileAsync(IProgress<int>? progress = null, CancellationToken token = default)
     {
         var target = _compileSession.Target;
-        await RunPassAsync(p => TargetIndependentPass(p), "TargetIndependentPass");
-        await RunPassAsync(p => RegisterTargetIndependQuantPass(p), "TargetIndependentQuantPass");
+        await RunPassAsync(p => TargetIndependentPass(p), "TargetIndependentPass", progress, token);
+        await RunPassAsync(p => RegisterTargetIndependQuantPass(p), "TargetIndependentQuantPass", progress, token);
         if (_compileSession.CompileOptions.ShapeBucketOptions.Enable)
         {
-            await RunPassAsync(p => RegisterShapeBucket(p), "ShapeBucket");
-            await RunPassAsync(p => TargetIndependentPass(p), "TargetIndependentPass");
+            await RunPassAsync(p => RegisterShapeBucket(p), "ShapeBucket", progress, token);
+            await RunPassAsync(p => TargetIndependentPass(p), "TargetIndependentPass", progress, token);
         }
 
         await RunPassAsync(
             p => target.RegisterTargetDependentPass(p, _compileSession.CompileOptions),
-            "TargetDependentPass");
-        await RunPassAsync(p => target.RegisterQuantizePass(p, _compileSession.CompileOptions), "QuantizePass");
+            "TargetDependentPass",
+            progress,
+            token);
+        await RunPassAsync(p => target.RegisterQuantizePass(p, _compileSession.CompileOptions), "QuantizePass", progress, token);
         await RunPassAsync(
             p => target.RegisterTargetDependentAfterQuantPass(p, _compileSession.CompileOptions),
-            "TargetDependentAfterQuantPass");
-        await RunPassAsync(p => ClearFixShape(p), "ClearFixShape");
+            "TargetDependentAfterQuantPass",
+            progress,
+            token);
+        await RunPassAsync(p => ClearFixShape(p), "ClearFixShape", progress, token);
         await RunPassAsync(
             p => target.RegisterTargetDependentBeforeCodeGen(p, _compileSession.CompileOptions),
-            "TargetDependentBeforeCodeGen");
+            "TargetDependentBeforeCodeGen",
+            progress,
+            token);
         if (_dumpper.IsEnabled(DumpFlags.Compile))
         {
             DumpScope.Current.DumpModule(_module!, "ModuleAfterCompile");
@@ -309,7 +340,7 @@ internal class Compiler : ICompiler
         }
     }
 
-    private async Task RunPassAsync(Action<IPassManager> register, string name)
+    private async Task RunPassAsync(Action<IPassManager> register, string name, IProgress<int>? progress = null, CancellationToken token = default)
     {
         var newName = $"{_runPassCount++}_" + name;
         var pmgr = _compileSession.CreatePassManager(newName);
@@ -321,5 +352,8 @@ internal class Compiler : ICompiler
             _dumpper.DumpModule(_module, newName);
             _dumpper.DumpDotIR(_module.Entry!, newName);
         }
+
+        progress?.Report(_runPassCount);
+        token.ThrowIfCancellationRequested();
     }
 }

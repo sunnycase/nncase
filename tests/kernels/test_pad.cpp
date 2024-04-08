@@ -59,13 +59,14 @@ class PadTest : public KernelTest,
         }
     }
 
-    std::vector<int64_t> ToNncaseFormat(std::vector<int64_t> &padding) {
+    std::vector<int64_t> ToNncaseFormat(std::vector<int64_t> &padding_vector) {
         // int64_t before_pad;
         // int64_t after_pad;
         std::vector<int64_t> padding_nncase;
-        for (size_t i = 0; i < padding.size() / 2; ++i) {
-            padding_nncase.push_back(padding[i]);
-            padding_nncase.push_back(padding[i + padding.size() / 2]);
+        for (size_t i = 0; i < padding_vector.size() / 2; ++i) {
+            padding_nncase.push_back(padding_vector[i]);
+            padding_nncase.push_back(
+                padding_vector[i + padding_vector.size() / 2]);
         }
         return padding_nncase;
     }
@@ -94,7 +95,7 @@ TEST_P(PadTest, Pad) {
     size_t size = 0;
     // int64_t pad_ptr[] = {1, 0, 0, 0, 0, 0, 0, 0};
     auto pad = hrt::create(dt_int64, {padding.size()},
-                           {reinterpret_cast<gsl::byte *>(padding.data()),
+                           {reinterpret_cast<std::byte *>(padding.data()),
                             sizeof(padding[0]) * padding.size()},
                            true, host_runtime_tensor::pool_cpu_only)
                    .expect("create tensor failed");
@@ -107,14 +108,14 @@ TEST_P(PadTest, Pad) {
     dims_t shape(tensor_rank(output_ort));
     tensor_shape(output_ort, reinterpret_cast<int64_t *>(shape.data()));
     auto expected = hrt::create(input.datatype(), shape,
-                                {reinterpret_cast<gsl::byte *>(ptr_ort), size},
+                                {reinterpret_cast<std::byte *>(ptr_ort), size},
                                 true, host_runtime_tensor::pool_cpu_only)
                         .expect("create tensor failed");
 
     // actual
     pad = hrt::create(
               dt_int64, {padding_nncaseformat.size()},
-              {reinterpret_cast<gsl::byte *>(padding_nncaseformat.data()),
+              {reinterpret_cast<std::byte *>(padding_nncaseformat.data()),
                sizeof(padding_nncaseformat[0]) * padding_nncaseformat.size()},
               true, host_runtime_tensor::pool_cpu_only)
               .expect("create tensor failed");

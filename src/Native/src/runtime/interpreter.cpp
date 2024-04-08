@@ -28,10 +28,11 @@ using namespace nncase::runtime;
 
 interpreter::interpreter() noexcept : entry_function_(nullptr) {}
 
-result<void> interpreter::load_model(gsl::span<const gsl::byte> buffer,
+result<void> interpreter::load_model(std::span<const std::byte> buffer,
                                      bool copy_buffer) noexcept {
     if (copy_buffer) {
-        char_array_buffer array_buffer(buffer.as_span<const char>());
+        char_array_buffer array_buffer(
+            {reinterpret_cast<const char *>(buffer.data()), buffer.size()});
         std::istream stream(&array_buffer);
         return load_model(stream);
     }
@@ -244,6 +245,17 @@ result<void> interpreter::run() noexcept {
 result<runtime_module *> interpreter::find_module_by_id(size_t index) noexcept {
     CHECK_WITH_ERR(index < modules_.size(), std::errc::result_out_of_range);
     return ok(modules_[index].get());
+}
+
+result<size_t> interpreter::find_id_by_module(runtime_module *module) noexcept {
+    auto it = std::find_if(modules_.begin(), modules_.end(),
+                           [&module](const std::unique_ptr<runtime_module> &p) {
+                               return p.get() == module;
+                           });
+    if (it == modules_.end()) {
+        return err(std::errc::result_out_of_range);
+    }
+    return ok((it - modules_.begin()));
 }
 
 options_dict &interpreter::options() noexcept { return options_; }

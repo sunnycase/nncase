@@ -359,17 +359,17 @@ internal sealed class ILDotPrintVisitor : ExprFunctor<ILDotOption, string>
                     Op op => op.Parameters.Select(info => info.Name),
                     Fusion fusion => fusion.Parameters.AsValueEnumerable().Select(v => v.Name).ToArray(),
                     Function func => func.Parameters.AsValueEnumerable().Select(v => v.Name).ToArray(),
-                    PrimFunctionWrapper wrapper => wrapper.Target.Parameters.AsValueEnumerable().Select(b => b.Name).ToArray(),
+                    PrimFunctionWrapper wrapper => wrapper.Target.Parameters.AsValueEnumerable().Select(b => ((TIR.Buffer)b).Name).ToArray(),
                     _ => throw new NotSupportedException($"Target type {expr.Target.GetType()} is not supported."),
                 }))
                 {
-                    if (child is Const or None)
+                    if (child is None)
                     {
                         continue;
                     }
 
                     var portName = $"P{count++}";
-                    row.AddCell(arg_name, cell => cell.PortName = portName);
+                    row.AddCell(child switch { Const c => c.CheckedType.ToString(), _ => arg_name }, cell => cell.PortName = portName);
                     connect_list.Add((child, portName));
                 }
             });
@@ -385,7 +385,7 @@ internal sealed class ILDotPrintVisitor : ExprFunctor<ILDotOption, string>
             // 4. connect edge.
             foreach (var (child, port_name) in connect_list)
             {
-                if (child is BaseFunction)
+                if (child is BaseFunction or Const)
                 {
                     continue;
                 }

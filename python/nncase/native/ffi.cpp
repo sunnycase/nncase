@@ -186,6 +186,11 @@ PYBIND11_MODULE(_nncase, m) {
                       py::overload_cast<std::string_view>(
                           &quantize_options::quant_scheme))
         .def_property(
+            "quant_scheme_strict_mode",
+            py::overload_cast<>(&quantize_options::quant_scheme_strict_mode),
+            py::overload_cast<bool>(
+                &quantize_options::quant_scheme_strict_mode))
+        .def_property(
             "export_quant_scheme",
             py::overload_cast<>(&quantize_options::export_quant_scheme),
             py::overload_cast<bool>(&quantize_options::export_quant_scheme))
@@ -312,7 +317,7 @@ PYBIND11_MODULE(_nncase, m) {
     py::class_<interpreter>(m, "Simulator")
         .def(py::init())
         .def("load_model",
-             [](interpreter &interp, gsl::span<const gsl::byte> buffer) {
+             [](interpreter &interp, std::span<const std::byte> buffer) {
                  interp.load_model(buffer, true).unwrap_or_throw();
              })
         .def_property_readonly("inputs_size", &interpreter::inputs_size)

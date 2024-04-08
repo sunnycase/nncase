@@ -5,7 +5,6 @@ using System.Collections.Immutable;
 using System.Linq;
 using System.Reactive;
 using DryIoc.ImTools;
-using Microsoft.Toolkit.HighPerformance;
 using NetFabric.Hyperlinq;
 using Nncase.IR;
 using Fx = System.Func<Nncase.IR.Expr, Nncase.IR.Expr>;
@@ -97,11 +96,6 @@ public static class ReplaceUtility
         return new Call(target, ReplaceItems(oldParams, pairs));
     }
 
-    public static Call ReplaceCallParams(Call call, params (int, Expr)[] pairs)
-    {
-        return new Call(call.Target, ReplaceItems(call.Arguments.ToArray(), pairs));
-    }
-
     /// <summary>
     /// replace the call params with parameter info.
     /// </summary>
@@ -122,12 +116,7 @@ public static class ReplaceUtility
     /// <param name="expr">expr.</param>
     /// <returns>new Call.</returns>
     public static Call ReplaceCallFirstParam(Expr target, IReadOnlyList<Expr> oldParams, Expr expr) =>
-        ReplaceCallParams(target, oldParams, (oldParams[0], expr));
-
-    public static Expr ReplaceCallFirstParam(Call call, Expr expr)
-    {
-        return ReplaceCallFirstParam(call.Target, call.Arguments.ToArray(), expr);
-    }
+        ReplaceCallParams(target, oldParams, (0, expr));
 
     /// <summary>
     /// Replace target in body with expr.

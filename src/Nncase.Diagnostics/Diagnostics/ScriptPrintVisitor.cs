@@ -11,6 +11,7 @@ using System.Threading.Tasks;
 using DryIoc;
 using NetFabric.Hyperlinq;
 using Nncase.IR;
+using Nncase.IR.Buffers;
 using Nncase.IR.Math;
 using Nncase.TIR;
 using Nncase.Utilities;
@@ -131,6 +132,8 @@ internal sealed class ScriptPrintVisitor : ExprFunctor<IPrintSymbol, string>
         PrimType ptype => ptype.GetDisplayName() + (type.Shape.IsScalar ? string.Empty : type.Shape.ToString()),
         PointerType { ElemType: PrimType etype } => $"*{etype.GetDisplayName()}",
         ValueType vtype => vtype.GetDisplayName() + (type.Shape.IsScalar ? string.Empty : type.Shape.ToString()),
+        VectorType vtype => $"{vtype.ElemType.GetDisplayName()}<{string.Join(",", vtype.Lanes)}>" + (type.Shape.IsScalar ? string.Empty : type.Shape.ToString()),
+
         _ => throw new NotSupportedException(type.DType.GetType().Name),
     };
 
@@ -216,6 +219,22 @@ internal sealed class ScriptPrintVisitor : ExprFunctor<IPrintSymbol, string>
         return doc;
     }
 
+    protected override IPrintSymbol VisitMemSpan(MemSpan expr)
+    {
+        if (_exprMemo.TryGetValue(expr, out var doc))
+        {
+            return doc;
+        }
+
+        var start = Visit(expr.Start);
+        var size = Visit(expr.Size);
+        _scope.Push();
+        _scope.Append($"MemSpan({start}, {size})@<{expr.Hierarchy}, {expr.Location}>");
+        doc = new(_scope.Pop());
+        _exprMemo.Add(expr, doc);
+        return doc;
+    }
+
     /// <inheritdoc/>
     protected override IPrintSymbol VisitMarker(Marker expr)
     {
@@ -279,18 +298,21 @@ internal sealed class ScriptPrintVisitor : ExprFunctor<IPrintSymbol, string>
         {
             doc = new(new($"{@const}"));
         }
-        else
-            if (@const.Value.ElementType.IsFloat())
+        else if (@const.Value.ElementType.IsFloat())
         {
-            doc = new(new($"{string.Join(",", @const.Value.ToArray<float>())}"));
+            doc = new(new(@const.Value.Length > 8 ? @const.CheckedShape.ToString() : $"{string.Join(",", @const.Value.ToArray<float>())}"));
         }
         else if (@const.Value.ElementType.IsIntegral())
         {
-            doc = new(new($"{string.Join(",", @const.Value.ToArray<int>())}"));
+            doc = new(new(@const.Value.Length > 8 ? @const.CheckedShape.ToString() : $"{string.Join(",", @const.Value.ToArray<int>())}"));
         }
-        else if (@const.Value.ElementType.IsPointer())
+        else if (@const.Value.ElementType is VectorType vtype)
         {
-            doc = new(new($"{string.Join(",", @const.Value.ToArray<int>().Select(i => "0x" + i.ToString("X")))}"));
+            doc = new(new($"{vtype.ElemType.GetDisplayName()}<{string.Join(",", vtype.Lanes)}>" + (@const.Value.Shape.IsScalar ? string.Empty : @const.Value.Shape.ToString())));
+        }
+        else if (@const.Value.ElementType is PointerType p)
+        {
+            doc = new(new($"*{p.ElemType.GetDisplayName()}@{@const.Value.Shape}"));
         }
 
         _exprMemo.Add(@const, doc!);
@@ -482,34 +504,6 @@ internal sealed class ScriptPrintVisitor : ExprFunctor<IPrintSymbol, string>
     }
 
     /// <inheritdoc/>
-    protected override IPrintSymbol VisitBufferLoad(BufferLoad expr)
-    {
-        if (_exprMemo.TryGetValue(expr, out var doc))
-        {
-            return doc;
-        }
-
-        _scope.Push();
-        _scope.Append($"{expr.Buffer.Name}[{string.Join(", ", expr.Indices.ToArray().Select(Visit))}]");
-        doc = new(_scope.Pop());
-        return doc;
-    }
-
-    /// <inheritdoc/>
-    protected override IPrintSymbol VisitBufferStore(BufferStore expr)
-    {
-        if (_exprMemo.TryGetValue(expr, out var doc))
-        {
-            return doc;
-        }
-
-        _scope.Push();
-        _scope.Append($"{expr.Buffer.Name}[{string.Join(", ", expr.Indices.ToArray().Select(Visit))}] = {Visit(expr.Value)}");
-        doc = new(_scope.Pop());
-        return doc;
-    }
-
-    /// <inheritdoc/>
     protected override IPrintSymbol VisitIterVar(IterVar expr)
     {
         if (_exprMemo.TryGetValue(expr, out var doc))
@@ -570,13 +564,22 @@ internal sealed class ScriptPrintVisitor : ExprFunctor<IPrintSymbol, string>
         }
 
         _scope.Push();
-        _scope.Append($"T.Buffer({expr.Name}, {expr.MemLocation}, {VisitType(expr.ElemType)})");
-        if (expr is TIR.PhysicalBuffer phy)
+        var memSpan = Visit(expr.MemSpan);
+        _scope.Append($"T.Buffer({expr.Name}, {VisitType(expr.ElemType)}, {memSpan.Span}, [{string.Join(',', expr.Dimensions.AsValueEnumerable().Select(Visit).Select(e => e.Span.ToString()).ToArray())}], [{string.Join(',', expr.Strides.AsValueEnumerable().Select(Visit).Select(e => e.Span.ToString()).ToArray())}])");
+        doc = new(_scope.Pop(), expr.Name, true);
+        _exprMemo.Add(expr, doc);
+        return doc;
+    }
+
+    protected override IPrintSymbol VisitBufferOf(BufferOf expr)
+    {
+        if (_exprMemo.TryGetValue(expr, out var doc))
         {
-            _scope.Append($"@({phy.Start}, {phy.Size})");
+            return doc;
         }
 
-        doc = new(_scope.Pop(), expr.Name, true);
+        _ = Visit(expr.Input);
+        doc = new ScriptSymobl(new("BufferOf"), "BufferOf", false);
         _exprMemo.Add(expr, doc);
         return doc;
     }

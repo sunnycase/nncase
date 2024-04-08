@@ -154,13 +154,17 @@ public class UnitTestVrp : TestClassBase
         // 3. soft clause
         var solver = new CpSolver();
         solver.StringParameters = "enumerate_all_solutions:true";
+#if DEBUG
         System.Console.WriteLine(model.Validate());
+#endif
         var status = solver.Solve(model, new PrintCallBack(vars, costs));
         if (status is CpSolverStatus.Feasible or CpSolverStatus.Optimal)
         {
             foreach (var v in vars)
             {
+#if DEBUG
                 System.Console.WriteLine(v.Name() + " " + solver.BooleanValue(v));
+#endif
             }
 
             Assert.True(solver.BooleanValue(vars[0]));
@@ -174,8 +178,38 @@ public class UnitTestVrp : TestClassBase
         }
     }
 
+    [Fact]
+    public void TestOverLap()
+    {
+        // note ortools no overlap not support 0 size.
+        var model = new CpModel();
+
+        var x0 = model.NewIntervalVar(model.NewConstant(0), model.NewConstant(2), model.NewConstant(2), "x0");
+        var y0 = model.NewFixedSizeIntervalVar(model.NewIntVar(0, 10, "y0_start"), 7, "y0");
+
+        var x1 = model.NewIntervalVar(model.NewConstant(2), model.NewConstant(0), model.NewConstant(2), "x1");
+        var y1 = model.NewFixedSizeIntervalVar(model.NewIntVar(0, 10, "y1_start"), 7, "y1");
+
+        var x2 = model.NewIntervalVar(model.NewConstant(2), model.NewConstant(1), model.NewConstant(3), "x2");
+        var y2 = model.NewFixedSizeIntervalVar(model.NewIntVar(0, 10, "y2_start"), 7, "y2");
+
+        model.Add(y0.StartExpr() == y1.StartExpr());
+        model.Add(y1.StartExpr() == y2.StartExpr());
+        var nooverlap = model.AddNoOverlap2D();
+        nooverlap.AddRectangle(x0, y0);
+        nooverlap.AddRectangle(x1, y1);
+        nooverlap.AddRectangle(x2, y2);
+        model.Minimize(y0.StartExpr() + y1.StartExpr() + y2.StartExpr());
+
+        var solver = new CpSolver();
+        var status = solver.Solve(model);
+
+        Assert.Equal(CpSolverStatus.Infeasible, status);
+    }
+
     private static void PrintSolution(in IDataModel data, in RoutingModel routing, in RoutingIndexManager manager, in Assignment solution)
     {
+#if DEBUG
         Console.WriteLine($"Objective {solution.ObjectiveValue()}:");
 
         // Inspect solution.
@@ -199,6 +233,7 @@ public class UnitTestVrp : TestClassBase
         }
 
         Console.WriteLine("Maximum distance of the routes: {0}m", maxRouteDistance);
+#endif
     }
 
     private class PrintCallBack : CpSolverSolutionCallback
@@ -216,6 +251,7 @@ public class UnitTestVrp : TestClassBase
 
         public override void OnSolutionCallback()
         {
+#if DEBUG
             System.Console.WriteLine($"Solution {_count++}");
             foreach (var v in _vars)
             {
@@ -224,6 +260,9 @@ public class UnitTestVrp : TestClassBase
 
             System.Console.WriteLine("costs: " + _vars.Zip(_costs).Select(p => BooleanValue(p.First) ? p.Second : 0).Sum());
             System.Console.WriteLine();
+#else
+            _count++;
+#endif
         }
     }
 }

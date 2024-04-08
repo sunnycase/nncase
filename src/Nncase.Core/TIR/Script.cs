@@ -52,7 +52,7 @@ public static class T
     /// </summary>
     /// <param name="handle">The buffer handle variable in the load expression.</param>
     /// <param name="index">The index in the load.</param>
-    public static Call Load(Var handle, Expr index) => new Call(new Load(), handle, index);
+    public static Call Load(Expr handle, Expr index) => new Call(new Load(), handle, index);
 
     /// <summary>
     /// get the nop op.
@@ -76,25 +76,7 @@ public static class T
     /// <param name="handle">The buffer Variable.</param>
     /// <param name="index">The index in the store expression.</param>
     /// <param name="value">The value we want to store.</param>
-    public static Call Store(Var handle, Expr index, Expr value) => new Call(new Store(), handle, index, value);
-
-    /// <summary>
-    /// If the op is BufferLoad, it will return BufferStore
-    /// If the op is Load, it will return Store.
-    /// </summary>
-    /// <param name="op">the op call.</param>
-    /// <param name="value">update value.</param>
-    /// <returns>new store call.</returns>
-    public static Expr Store(Expr op, Expr value) => op switch
-    {
-        Call load => load.Target switch
-        {
-            TIR.Load => T.Store((Var)load[TIR.Load.Handle], load[TIR.Load.Index], value),
-            _ => throw new InvalidOperationException("Only Can build Store Op from Load!"),
-        },
-        TIR.BufferLoad bufload => new BufferStore(bufload.Buffer, bufload.Indices, value),
-        _ => throw new InvalidOperationException("Only Can build Store Op from Load!"),
-    };
+    public static Call Store(Expr handle, Expr index, Expr value) => new Call(new Store(), handle, index, value);
 
     /// <summary>
     /// build for loop.
@@ -152,8 +134,16 @@ public static class T
     {
         string[] names = { "i", "j", "k", "l" };
         var newLoopVars = loopVars = new Var[ranges.Length];
-        return new NestBodyExprBuilder<For>(ranges.Select((rg, i) =>
-             T.ForLoop(out newLoopVars[i], rg, loopMode, names[i % 4] + (i / 4 == 0 ? string.Empty : (i / 4).ToString())).Body()).ToArray());
+        var newLoops = ranges.Select((rg, i) => T.ForLoop(out newLoopVars[i], rg, loopMode, names[i % 4] + (i / 4 == 0 ? string.Empty : (i / 4).ToString())).Body()).ToArray();
+        return new NestBodyExprBuilder<For>(newLoops);
+    }
+
+    public static ISequentialBuilder<For> Grid(out Var[] loopVars, out ISequentialBuilder<For>[] loops, LoopMode loopMode, params TIR.Range[] ranges)
+    {
+        string[] names = { "i", "j", "k", "l" };
+        var newLoopVars = loopVars = new Var[ranges.Length];
+        var newLoops = loops = ranges.Select((rg, i) => T.ForLoop(out newLoopVars[i], rg, loopMode, names[i % 4] + (i / 4 == 0 ? string.Empty : (i / 4).ToString())).Body()).ToArray();
+        return new NestBodyExprBuilder<For>(loops);
     }
 
     /// <summary>
@@ -202,7 +192,7 @@ public static class T
     /// ));
     /// </code>
     /// </summary>
-    public static ISequentialBuilder<PrimFunction> PrimFunc(string name, string module_kind, params PhysicalBuffer[] parameters)
+    public static ISequentialBuilder<PrimFunction> PrimFunc(string name, string module_kind, params Buffer[] parameters)
     {
         return new SequentialBuilder<PrimFunction>(body => new PrimFunction(name, module_kind, body, parameters));
     }
@@ -224,54 +214,116 @@ public static class T
     }
 
     /// <summary>
-    /// create the memRef by tensortype.
+    /// create the buffer by tensortype.
     /// </summary>
-    public static LogicalBuffer Buffer(DataType elem_type, Schedule.MemoryLocation location, ReadOnlySpan<Expr> dimensions, out LogicalBuffer buffer, [CallerArgumentExpression("buffer")] string name = "")
+    public static Buffer CreateBuffer(TensorType tensorType, MemoryLocation location, out Buffer buffer, [CallerArgumentExpression("buffer")] string name = "")
     {
         if (name.StartsWith("var "))
         {
             name = name[4..];
         }
 
-        buffer = new LogicalBuffer(name, elem_type, location, dimensions);
+        var dimensions = tensorType.Shape.ToValueArray();
+        var strides = TensorUtilities.GetStrides(dimensions);
+        var size = (int)TensorUtilities.GetProduct(dimensions.ToArray()) * tensorType.DType.SizeInBytes;
+        var memspan = new MemSpan(size, location);
+        buffer = new Buffer(name, tensorType.DType, memspan, dimensions.Select(i => (Expr)i).ToArray(), strides.Select(i => (Expr)i).ToArray());
         return buffer;
     }
 
     /// <summary>
-    /// ctor for physical buffer.
+    /// create the buffer by expressions.
     /// </summary>
-    public static PhysicalBuffer PhysicalBuffer(DataType elem_type, Schedule.MemoryLocation location, ReadOnlySpan<int> dimensions, out PhysicalBuffer buffer, [CallerArgumentExpression("buffer")] string name = "")
+    public static Buffer CreateBuffer(DataType dataType, Expr[] dimensions, MemoryLocation location, out Buffer buffer, [CallerArgumentExpression("buffer")] string name = "")
     {
         if (name.StartsWith("var "))
         {
             name = name[4..];
         }
 
-        buffer = new PhysicalBuffer(name, elem_type, location, dimensions, 0, (int)TensorUtilities.GetProduct(dimensions.ToArray()) * elem_type.SizeInBytes);
+        var strides = TensorUtilities.GetStrides(dimensions);
+        var size = TensorUtilities.GetProduct(dimensions.ToArray()) * dataType.SizeInBytes;
+        var memspan = new MemSpan(size, location);
+        buffer = new Buffer(name, dataType, memspan, dimensions, strides);
+        return buffer;
+    }
+
+    public static Buffer CreateBuffer(DataType dataType, Expr[] dimensions, Expr[] strides, MemSpan memSpan, out Buffer buffer, [CallerArgumentExpression("buffer")] string name = "")
+    {
+        if (name.StartsWith("var "))
+        {
+            name = name[4..];
+        }
+
+        buffer = new Buffer(name, dataType, memSpan, dimensions, strides);
+        return buffer;
+    }
+
+    public static Buffer AttachBuffer(Expr start, TensorType tensorType, MemoryLocation location, int hierarchy, out Buffer buffer, [CallerArgumentExpression("buffer")] string name = "")
+    {
+        if (name.StartsWith("var "))
+        {
+            name = name[4..];
+        }
+
+        var dimensions = tensorType.Shape.ToValueArray();
+        var strides = TensorUtilities.GetStrides(dimensions);
+        var size = (int)TensorUtilities.GetProduct(dimensions.ToArray()) * tensorType.DType.SizeInBytes;
+        var memspan = new MemSpan(start, size, location, hierarchy);
+        buffer = new Buffer(name, tensorType.DType, memspan, dimensions.Select(i => (Expr)i).ToArray(), strides.Select(i => (Expr)i).ToArray());
         return buffer;
     }
 
     /// <summary>
-    /// create buffer from const.
+    /// create buffer by const.
     /// </summary>
-    public static PhysicalBuffer ConstBuffer(Const expr, out PhysicalBuffer buffer, [CallerArgumentExpression("buffer")] string name = "")
+    public static Buffer AttachBuffer(TensorConst @const, out Buffer buffer, [CallerArgumentExpression("buffer")] string name = "")
     {
         if (name.StartsWith("var "))
         {
             name = name[4..];
         }
 
-        int size;
-        if (expr is TensorConst tc)
+        var dimensions = @const.CheckedShape.ToValueArray();
+        var strides = TensorUtilities.GetStrides(dimensions);
+        var size = (int)TensorUtilities.GetProduct(dimensions.ToArray()) * @const.CheckedDataType.SizeInBytes;
+        var memspan = new MemSpan(IR.F.Buffer.DDrOf(@const), size, MemoryLocation.Rdata);
+        buffer = new Buffer(name, @const.CheckedDataType, memspan, dimensions.Select(i => (Expr)i).ToArray(), strides.Select(i => (Expr)i).ToArray());
+        return buffer;
+    }
+
+    /// <summary>
+    /// attach the buffer.
+    /// </summary>
+    public static Buffer AttachBuffer(Buffer originBuffer, Expr offset, TensorType tensorType, out Buffer buffer, [CallerArgumentExpression("buffer")] string name = "")
+    {
+        if (name.StartsWith("var "))
         {
-            size = tc.Value.BytesBuffer.Length;
-        }
-        else
-        {
-            throw new NotSupportedException();
+            name = name[4..];
         }
 
-        buffer = new PhysicalBuffer(name, Schedule.MemoryLocation.Rdata, (TensorConst)expr, 0, size);
+        var dimensions = tensorType.Shape.ToValueArray();
+        var strides = TensorUtilities.GetStrides(dimensions);
+        var size = (int)TensorUtilities.GetProduct(dimensions.ToArray()) * tensorType.DType.SizeInBytes;
+        buffer = new Buffer(name, tensorType.DType, originBuffer.MemSpan.SubSpan(offset, size), dimensions.Select(i => (Expr)i).ToArray(), strides.Select(i => (Expr)i).ToArray());
+        return buffer;
+    }
+
+    /// <summary>
+    /// attach the buffer.
+    /// </summary>
+    public static Buffer AttachBuffer(TensorType tensorType, MemoryLocation location, int hierarchy, out Var @var, out Buffer buffer, [CallerArgumentExpression("buffer")] string name = "")
+    {
+        if (name.StartsWith("var "))
+        {
+            name = name[4..];
+        }
+
+        @var = new Var(TensorType.Pointer(tensorType.DType));
+        var dimensions = tensorType.Shape.ToValueArray();
+        var strides = TensorUtilities.GetStrides(dimensions);
+        var size = (int)TensorUtilities.GetProduct(dimensions.ToArray()) * tensorType.DType.SizeInBytes;
+        buffer = new Buffer(name, tensorType.DType, new MemSpan(@var, size, location, hierarchy), dimensions.Select(i => (Expr)i).ToArray(), strides.Select(i => (Expr)i).ToArray());
         return buffer;
     }
 
@@ -294,7 +346,7 @@ public static class T
         {
             name = name[4..];
         }
-        buffer = new Buffer(name, Schedule.MemoryLocation.Rdata, (TensorType)expr.ValueType)
+        buffer = new Buffer(name, MemoryLocation.Rdata, (TensorType)expr.ValueType)
         {
             Const = expr,
         };
@@ -331,4 +383,23 @@ public static class T
         value = creator();
         return Nop();
     }
+
+    /// <summary>
+    /// buffer load.
+    /// </summary>
+    /// <param name="buffer"> buffer. </param>
+    /// <param name="indices"> indices. </param>
+    /// <returns> call bufferload. </returns>
+    public static Call BufferLoad(TIR.Buffer buffer, params Expr[] indices) => new Call(new IR.Buffers.BufferLoad(), buffer, new IR.Tuple(indices));
+
+    /// <summary>
+    /// buffer store.
+    /// </summary>
+    /// <param name="buffer">buffer.</param>
+    /// <param name="indices">indices.</param>
+    /// <param name="value">value.</param>
+    /// <returns> call bufferstore.</returns>
+    public static Call BufferStore(TIR.Buffer buffer, Expr[] indices, Expr value) => new Call(new IR.Buffers.BufferStore(), buffer, new IR.Tuple(indices), value);
+
+    public static Call MatchBuffer(TIR.Buffer buffer) => new Call(new IR.Buffers.MatchBuffer(), buffer);
 }

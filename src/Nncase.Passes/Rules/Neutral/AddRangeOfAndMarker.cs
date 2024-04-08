@@ -10,6 +10,7 @@ using Nncase.IR;
 using Nncase.IR.Imaging;
 using Nncase.IR.Math;
 using Nncase.IR.NN;
+using Nncase.IR.RNN;
 using Nncase.IR.Tensors;
 using Nncase.PatternMatch;
 using static Nncase.IR.TypePatternUtility;
@@ -194,7 +195,7 @@ public partial class AddRangeOfAndMarker : RewriteRule<Pattern>
         {
             var outputNames = new List<string>();
             var getItem = IR.F.Tensors.GetItem(call, i);
-            outputNames.Add("LSTMOutput_" + call.Metadata.OutputNames?[i]);
+            outputNames.Add(call.Metadata.OutputNames?[i] ?? "LSTMOutput_" + i.ToString());
             outputs[i].Metadata.OutputNames = outputNames;
         }
 

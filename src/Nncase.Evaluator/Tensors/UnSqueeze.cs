@@ -21,15 +21,24 @@ public class UnsqueezeEvaluator : IEvaluator<Unsqueeze>, ITypeInferencer<Unsquee
     {
         var input = context.GetOrtArgumentValue(unSqueeze, Unsqueeze.Input);
         var axes = context.GetInt64OrtTensorArgumentValue(unSqueeze, Unsqueeze.Dim);
-        return OrtKI.Unsqueeze(input, axes).ToValue();
+        return Value.FromTensor(OrtKI.Unsqueeze(input, axes).ToTensor(context.CurrentCall.CheckedTensorType));
     }
 
     /// <inheritdoc/>
     public IRType Visit(ITypeInferenceContext context, Unsqueeze target)
     {
-        var input = context.CheckArgumentType<TensorType>(target, Unsqueeze.Input);
+        var input = context.CheckArgumentType<IRType>(target, Unsqueeze.Input);
         _ = context.CheckArgumentType<TensorType>(target, Unsqueeze.Dim);
-        return Visit(context, target, input);
+        if (input is TensorType tensorType)
+        {
+            return Visit(context, target, tensorType);
+        }
+        else if (input is DistributedType distributedType)
+        {
+            return Visit(context, target, distributedType);
+        }
+
+        return new InvalidType(input.GetType().Name);
     }
 
     /// <inheritdoc/>
@@ -80,5 +89,27 @@ public class UnsqueezeEvaluator : IEvaluator<Unsqueeze>, ITypeInferencer<Unsquee
         }
 
         return input with { Shape = new Shape(Enumerable.Repeat(Dimension.Unknown, input.Shape.Rank + 1)) };
+    }
+
+    private IRType Visit(ITypeInferenceContext context, Unsqueeze target, DistributedType input)
+    {
+        var tensorType = (TensorType)Visit(context, target, input.TensorType);
+
+        var ndsbp = new SBP[input.NdSBP.Count];
+
+        if (context.GetArgument(target, Unsqueeze.Dim) is TensorConst tdims)
+        {
+            var dimsValue = tdims.Value.Cast<int>();
+            for (int i = 0; i < input.NdSBP.Count; i++)
+            {
+                ndsbp[i] = input.NdSBP[i] switch
+                {
+                    SBPSplit { Axis: int axis } => SBP.S(axis + dimsValue.Select(i => i <= axis).Count(b => b)),
+                    SBP sbp => sbp,
+                };
+            }
+        }
+
+        return new DistributedType(tensorType, ndsbp, input.Placement);
     }
 }

@@ -20,12 +20,18 @@ public sealed class TensorConst : Const, IEquatable<TensorConst?>
         Value = tensor;
     }
 
+    public TensorConst(Tensor tensor, IRArray<SBP> ndsbp, Placement placement)
+        : base(new DistributedType(new TensorType(tensor.ElementType, tensor.Shape), ndsbp, placement))
+    {
+        Value = tensor;
+    }
+
     public Tensor Value { get; }
 
     /// <summary>
     /// Gets value type.
     /// </summary>
-    public new TensorType ValueType => (TensorType)base.ValueType;
+    public new IRType ValueType => base.ValueType;
 
     /// <summary>
     /// Create TensorConstant from a <see cref="byte"/>.
@@ -122,31 +128,49 @@ public sealed class TensorConst : Const, IEquatable<TensorConst?>
     public static bool operator !=(TensorConst? left, TensorConst? right) => !(left == right);
 
     /// <inheritdoc/>
-    public override string ToString() => ValueType switch
+    public override string ToString()
     {
-        var x when x.IsScalar =>
-          x.DType switch
-          {
-              var dtype when DataTypes.IsIntegral(dtype) => Value.ToScalar<long>().ToString(),
-              var dtype when DataTypes.IsFloat(dtype) => Value.ToScalar<float>().ToString(),
-              var dtype when DataTypes.IsPointer(dtype) => Value.ToScalar<ulong>().ToString(),
-              var dtype when dtype == DataTypes.Boolean => Value.ToScalar<bool>().ToString(),
-              _ => $"{x.DType.GetDisplayName()} {x.Shape}",
-          },
-        _ => $"{ValueType.DType.GetDisplayName()} {ValueType.Shape}",
-    };
+        var type = ValueType switch
+        {
+            DistributedType dt => dt.TensorType,
+            TensorType tt => tt,
+            _ => throw new NotSupportedException("Not supported const type: " + ValueType),
+        };
+
+        return type switch
+        {
+            var x when x.IsScalar =>
+                x.DType switch
+                {
+                    var dtype when DataTypes.IsIntegral(dtype) => Value.ToScalar<long>().ToString(),
+                    var dtype when DataTypes.IsFloat(dtype) => Value.ToScalar<float>().ToString(),
+                    var dtype when DataTypes.IsPointer(dtype) => Value.ToScalar<ulong>().ToString(),
+                    var dtype when dtype == DataTypes.Boolean => Value.ToScalar<bool>().ToString(),
+                    _ => $"{x.DType.GetDisplayName()} {x.Shape}",
+                },
+            _ => $"{type.DType.GetDisplayName()} {type.Shape}",
+        };
+    }
 
     /// <inheritdoc/>
     public override TExprResult Accept<TExprResult, TTypeResult, TContext>(ExprFunctor<TExprResult, TTypeResult, TContext> functor, TContext context)
         => functor.VisitTensorConst(this, context);
 
-    public TensorConst With(Tensor? value = null) => new TensorConst(value ?? Value);
+    public TensorConst With(Tensor? value = null)
+    {
+        if (value is null && ValueType is DistributedType dt)
+        {
+            return new TensorConst(Value, dt.NdSBP, dt.Placement);
+        }
+
+        return new TensorConst(value ?? Value);
+    }
 
     /// <inheritdoc/>
     public override bool Equals(object? obj) => Equals(obj as TensorConst);
 
     /// <inheritdoc/>
-    public bool Equals(TensorConst? other) => other is not null && base.Equals(other) && EqualityComparer<Tensor>.Default.Equals(Value, other.Value);
+    public bool Equals(TensorConst? other) => other is not null && (ReferenceEquals(this, other) || GetHashCode() == other.GetHashCode()) && EqualityComparer<Tensor>.Default.Equals(Value, other.Value);
 
     /// <inheritdoc/>
     protected override int GetHashCodeCore() => HashCode.Combine(Value);

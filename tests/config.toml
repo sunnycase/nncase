@@ -40,6 +40,7 @@ finetune_weights_method = 'NoFineTuneWeights'
 input_mean = 0.5
 input_std = 0.5
 quant_scheme = ""
+quant_scheme_strict_mode = false
 
 [infer_report_opt]
 enabled = false
@@ -130,3 +131,16 @@ threshold = 0.999
 [target.k230.mode.ptq]
 enabled = true
 threshold = 0.96
+
+[target.xpu]
+eval = false
+infer = true
+similarity_name = 'cosine'
+
+[target.xpu.mode.noptq]
+enabled = true
+threshold = 0.999
+
+[target.xpu.mode.ptq]
+enabled = false
+threshold = 0.9
