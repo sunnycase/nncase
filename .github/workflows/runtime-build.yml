@@ -14,7 +14,6 @@ jobs:
       matrix:
         config:
           - { name: aarch64-macos, os: macos-14, buildType: Release }
-          - { name: x86_64-linux, os: ubuntu-latest, buildType: Release }
           - { name: x86_64-windows, os: windows-latest, arch: x64, buildType: Release }
 
     steps:
@@ -40,19 +39,15 @@ jobs:
       - name: Configure
         shell: bash
         run: |
-          conan install . --build=missing -s build_type=${{matrix.config.buildType}} -pr:a=toolchains/${{matrix.config.name}}.profile.jinja -o runtime=True -o python=False -o tests=True
-          cmake --preset conan-release
-          
-      - name: Build & Install
-          conan install . -if build --build=missing -s build_type=${{matrix.config.buildType}} --profile=default -o runtime=True -o python=False -o tests=True -s compiler.cppstd=20
+          conan install . --build=missing -s build_type=${{matrix.config.buildType}} -pr:a=toolchains/${{matrix.config.name}}.profile.jinja -o "&:runtime=True" -o "&:python=True" -o "&:tests=True"
           
       - name: Upload Conan Recipes
         env:
           CONAN_PASSWORD: ${{secrets.CONAN_SUNNYCASE_PASSWORD}}
         shell: bash
         run: |
-          conan user sunnycase -r sunnycase -p $CONAN_PASSWORD
-          conan upload "*" --all -r sunnycase -c
+          conan login -p $CONAN_PASSWORD sunnycase sunnycase
+          conan upload "*" -r sunnycase -c
 
       #- name: Upload nncaseruntime Benchmark
       #  uses: actions/upload-artifact@v3
@@ -98,16 +93,15 @@ jobs:
       - name: Configure
         shell: bash
         run: |
-          conan install . --build=missing -s build_type=${{matrix.config.buildType}} -pr:a=toolchains/${{matrix.config.name}}.profile.jinja -o runtime=True -o python=False -o tests=True
-          cmake --preset conan-release
+          conan install . --build=missing -s build_type=${{matrix.config.buildType}} -pr:a=toolchains/${{matrix.config.name}}.profile.jinja -o "&:runtime=False" -o "&:python=True" -o "&:tests=True"
 
       - name: Upload Conan Recipes
         env:
           CONAN_PASSWORD: ${{secrets.CONAN_SUNNYCASE_PASSWORD}}
         shell: bash
         run: |
-          conan user sunnycase -r sunnycase -p $CONAN_PASSWORD
-          conan upload "*" --all -r sunnycase -c
+          conan login -p $CONAN_PASSWORD sunnycase sunnycase
+          conan upload "*" -r sunnycase -c
 
   build-manylinux-native-runtime:
     name: build-manylinux-native-runtime-${{matrix.config.name}}

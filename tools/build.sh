@@ -3,10 +3,8 @@
 export PATH=/opt/python/cp37-cp37m/bin:$PATH
 export BUILD_TYPE=Release
 
-pip install conan==1.64 ninja
-conan remote add -i 0 sunnycase https://conan.sunnycase.moe
-conan profile new default --detect
-conan profile update settings.compiler.libcxx=libstdc++11 default
-conan install . -if build --build=missing -s build_type=$BUILD_TYPE --profile=default -o runtime=False -o python=False -o tests=True -s compiler.cppstd=20
-conan user sunnycase -r sunnycase -p $1
-conan upload "*" --all -r sunnycase -c
+pip install conan==2.6.0
+conan remote add sunnycase https://conan.sunnycase.moe --index 0
+conan install . --build=missing -s build_type=$BUILD_TYPE -pr:a=toolchains/x86_64-linux.profile.jinja -o "&:runtime=False" -o "&:python=True" -o "&:tests=True"
+conan login -p $1 sunnycase sunnycase
+conan upload "*" -r sunnycase -c

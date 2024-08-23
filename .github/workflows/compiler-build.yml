@@ -18,7 +18,6 @@ jobs:
       matrix:
         config:
           - {name: aarch64-macos, os: macos-14, buildType: Release}
-          - {name: x86_64-linux, os: ubuntu-latest, buildType: Release}
           - {name: x86_64-windows, os: windows-latest, arch: x64, buildType: Release}
 
     steps:
@@ -45,16 +44,15 @@ jobs:
       - name: Configure
         shell: bash
         run: |
-          conan install . --build=missing -s build_type=${{matrix.config.buildType}} -pr:a=toolchains/${{matrix.config.name}}.profile.jinja
-          cmake --preset conan-release
+          conan install . --build=missing -s build_type=${{matrix.config.buildType}} -pr:a=toolchains/${{matrix.config.name}}.profile.jinja -o "&:runtime=False" -o "&:python=True" -o "&:tests=True"
 
       - name: Upload Conan Recipes
         env:
           CONAN_PASSWORD: ${{secrets.CONAN_SUNNYCASE_PASSWORD}}
         shell: bash
         run: |
-          conan user sunnycase -r sunnycase -p $CONAN_PASSWORD
-          conan upload "*" --all -r sunnycase -c
+          conan login -p $CONAN_PASSWORD sunnycase sunnycase
+          conan upload "*" -r sunnycase -c
 
   build-manylinux-native:
     name: build-manylinux-native-${{matrix.config.name}}
