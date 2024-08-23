@@ -30,9 +30,8 @@ slice_index(const ranked_shape<InRank> &index, const size_t offset,
 
 template <size_t OutRank, size_t OffSet = 0, template <size_t...> class A,
           size_t... Dims, size_t... Ints>
-inline constexpr auto slice(const A<Dims...> a,
-                            std::index_sequence<Ints...>) noexcept {
-    return A<a.at(Ints + OffSet)...>{};
+inline constexpr auto slice(A<Dims...>, std::index_sequence<Ints...>) noexcept {
+    return A<A<Dims...>::at(Ints + OffSet)...>{};
 }
 
 template <template <size_t...> class T, size_t... ADims, size_t... BDims,
@@ -40,6 +39,30 @@ template <template <size_t...> class T, size_t... ADims, size_t... BDims,
 inline constexpr bool is_same_seq(const T<ADims...> &a, const T<BDims...> &b,
                                   std::index_sequence<I...>) {
     return ((a[I] == b[I]) && ...);
+}
+
+template <class TTensor, class TOutShape>
+static constexpr size_t get_safe_stride(const TTensor &tensor, size_t axis,
+                                        const TOutShape &out_shape) noexcept {
+    auto dim_ext = out_shape.rank() - tensor.rank();
+    if (axis < dim_ext) {
+        return 0;
+    }
+
+    auto actual_axis = axis - dim_ext;
+    return tensor.shape()[actual_axis] == 1 ? 0 // broadcast
+                                            : tensor.strides()[actual_axis];
+}
+
+template <template <size_t...> class A, size_t... Ints>
+inline constexpr auto
+make_index_sequence(std::index_sequence<Ints...>) noexcept {
+    return A<Ints...>{};
+}
+
+template <int32_t Offset, template <size_t...> class A, size_t... Dims>
+inline constexpr auto shift_fixed_dims(A<Dims...>) {
+    return A<(Dims - Offset)...>{};
 }
 } // namespace utility_detail
 
@@ -69,7 +92,7 @@ inline constexpr auto concat_fixed_dims(T<PreDims...>,
 
 template <size_t OutRank, size_t OffSet = 0, template <size_t...> class A,
           size_t... Dims>
-inline constexpr auto slice_fixed_dims(const A<Dims...> &a) noexcept {
+inline constexpr auto slice_fixed_dims(A<Dims...> a) noexcept {
     return utility_detail::slice<OutRank, OffSet>(
         a, std::make_index_sequence<OutRank>{});
 }
@@ -81,14 +104,14 @@ inline constexpr bool is_same_seq(const T<ADims...> &a, const T<BDims...> &b) {
                a, b, std::make_index_sequence<sizeof...(ADims)>{});
 }
 
-template <typename T>
-concept IsFixedTensor = is_fixed_dims_v<typename std::decay_t<T>::shape_type>
-    &&is_fixed_dims_v<typename std::decay_t<T>::strides_type>;
+template <template <size_t...> class A, size_t... Dims>
+inline constexpr auto make_index_sequence(A<Dims...>) {
+    return utility_detail::make_index_sequence<A>(
+        std::make_index_sequence<sizeof...(Dims)>{});
+}
 
-template <typename T>
-concept IsRankedTensor = is_ranked_dims_v<typename std::decay_t<T>::shape_type>
-    &&is_ranked_dims_v<typename std::decay_t<T>::strides_type>;
-
-template <typename T> concept IsFixedDims = is_fixed_dims_v<T>;
-
+template <int32_t Offset, template <size_t...> class A, size_t... Dims>
+inline constexpr auto shift_fixed_dims(A<Dims...> a) {
+    return utility_detail::shift_fixed_dims<Offset>(a);
+}
 } // namespace nncase::ntt

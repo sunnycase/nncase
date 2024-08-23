@@ -15,23 +15,29 @@
 #pragma once
 #include "detail/shape_storage.h"
 #include "detail/tensor_storage.h"
+#include "tensor_traits.h"
 
 namespace nncase::ntt {
 template <class T, class Shape, class Strides, size_t MaxSize, bool IsView>
-class tensor_base;
+class basic_tensor;
 
 template <class T, class Shape, class Strides = default_strides_t<Shape>,
           size_t MaxSize = max_size_v<Shape, Strides>>
-using tensor = tensor_base<T, Shape, Strides, MaxSize, false>;
+using tensor = basic_tensor<T, Shape, Strides, MaxSize, false>;
 
 template <class T, class Shape, class Strides = default_strides_t<Shape>,
           size_t MaxSize = max_size_v<Shape, Strides>>
-using tensor_view = tensor_base<T, Shape, Strides, MaxSize, true>;
+using tensor_view = basic_tensor<T, Shape, Strides, MaxSize, true>;
 
 template <class T, size_t... Lanes>
 using fixed_tensor = tensor<T, fixed_shape<Lanes...>>;
 
-template <class T, size_t... Lanes> using vector = fixed_tensor<T, Lanes...>;
+template <class T, class Shape, class Strides, size_t MaxSize, bool IsView,
+          size_t... Lanes>
+struct fixed_tensor_alike_type<basic_tensor<T, Shape, Strides, MaxSize, IsView>,
+                               Lanes...> {
+    using type = fixed_tensor<T, Lanes...>;
+};
 
 namespace detail {
 template <class T, class Shape, class Strides, size_t MaxSize, bool IsView,
@@ -110,7 +116,7 @@ class tensor_impl<T, Shape, Strides, MaxSize, true, true>
 } // namespace detail
 
 template <class T, class Shape, class Strides, size_t MaxSize, bool IsView>
-class tensor_base
+class basic_tensor
     : public detail::tensor_impl<T, Shape, Strides, MaxSize, IsView> {
     using impl_type = detail::tensor_impl<T, Shape, Strides, MaxSize, IsView>;
     using size_impl_type = detail::tensor_size_impl<Shape, Strides>;
@@ -122,6 +128,7 @@ class tensor_base
     using shape_type = Shape;
     using strides_type = Strides;
 
+    using size_impl_type::rank;
     using size_impl_type::shape;
     using size_impl_type::size;
     using size_impl_type::strides;
@@ -130,10 +137,11 @@ class tensor_base
 
     using impl_type::impl_type;
 
+    static basic_tensor<T, Shape, Strides, MaxSize, IsView>
+    from_scalar(T value) noexcept;
+
     operator const buffer_type &() const noexcept { return buffer(); }
     operator buffer_type &() noexcept { return buffer(); }
-
-    static tensor_base<T, Shape, Strides, MaxSize, IsView> from_scalar(T value);
 
     template <class Index, class UShape>
     constexpr tensor_view<T, UShape, Strides> view(Index index,
@@ -168,7 +176,7 @@ class tensor_base
     template <class... Indices>
     constexpr const T &operator()(Indices &&...index) const noexcept {
         if constexpr (sizeof...(index) == 1 &&
-                      (!std::is_integral_v<Indices> && ...)) {
+                      (!std::is_integral_v<std::decay_t<Indices>> && ...)) {
             return elements()[linear_offset(index..., strides())];
         } else {
             return this->operator()(
@@ -179,7 +187,7 @@ class tensor_base
     template <class... Indices>
     constexpr T &operator()(Indices &&...index) noexcept {
         if constexpr (sizeof...(index) == 1 &&
-                      (!std::is_integral_v<Indices> && ...)) {
+                      (!std::is_integral_v<std::decay_t<Indices>> && ...)) {
             return elements()[linear_offset(index..., strides())];
         } else {
             return this->operator()(

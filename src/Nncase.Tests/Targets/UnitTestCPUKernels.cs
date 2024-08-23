@@ -60,9 +60,42 @@ public sealed class UnitTestCPUKernels : TestClassBase
     public static int Rank => 1;
 
     [Theory]
+    [InlineData(new object[] { new[] { 32, 512, 64, 64 }, 0 })]
+    public async Task TestSwish(int[] shape, int count)
+    {
+        var input = new Var(new TensorType(DataTypes.Float32, shape));
+        var pre = IR.F.NN.Swish(input);
+        var feedDict = new Dictionary<Var, IValue>() {
+            { input, IR.F.Random.Normal(DataTypes.Float32, 0, 1, 1, shape).Evaluate() },
+        };
+
+        var rule = new Passes.Rules.CPU.PackSwish(Rank, Lane);
+        CompilerServices.TryMatch(pre, rule.Pattern, out var result);
+        var posts = new[] { pre }.Concat(rule.GetReplaceCandidates(result!, new Passes.RunPassContext()).Where(e => e is not Call { Target: Slice }));
+        await RunCases(Path.Join(CompileOptions.DumpDir.ToString(), $"Theory{count}"), feedDict, posts);
+    }
+
+    [Theory]
+    [InlineData(new object[] { new[] { 4, 8, 16, 32 }, 0 })]
+    public async Task TestUnary(int[] shape, int count)
+    {
+        var input = new Var(new TensorType(DataTypes.Float32, shape));
+        var pre = IR.F.Math.Unary(UnaryOp.Neg, input);
+        var feedDict = new Dictionary<Var, IValue>() {
+            { input, IR.F.Random.Normal(DataTypes.Float32, 0, 1, 1, shape).Evaluate() },
+        };
+
+        var rule = new Passes.Rules.CPU.PackUnary(Rank, Lane);
+        CompilerServices.TryMatch(pre, rule.Pattern, out var result);
+        var posts = new[] { pre }.Concat(rule.GetReplaceCandidates(result!, new Passes.RunPassContext()).Where(e => e is not Call { Target: Slice }));
+        await RunCases(Path.Join(CompileOptions.DumpDir.ToString(), $"Theory{count}"), feedDict, posts);
+    }
+
+    [Theory]
     [InlineData(new object[] { BinaryOp.Add, new[] { 8, 2 }, new int[] { 8, 2 }, 0 })] // normal
     [InlineData(new object[] { BinaryOp.Mul, new[] { 1, 8, 64, 2 * 8 }, new int[] { 1, 1, 64, 2 * 8 }, 1 })] // broadcast
-    public async void TestPackBinary(BinaryOp op, int[] lhsShape, int[] rhsShape, int count)
+    [InlineData(new object[] { BinaryOp.Add, new[] { 8, 16 }, new int[] { 16 }, 2 })] // normal
+    public async Task TestPackBinary(BinaryOp op, int[] lhsShape, int[] rhsShape, int count)
     {
         var lhs = new Var(new TensorType(DataTypes.Float32, lhsShape));
         var rhs = new Var(new TensorType(DataTypes.Float32, rhsShape));
@@ -73,9 +106,9 @@ public sealed class UnitTestCPUKernels : TestClassBase
             { rhs, IR.F.Random.Normal(DataTypes.Float32, 0, 1, 3, rhsShape).Evaluate() },
         };
 
-        var rule = new Passes.Rules.CPU.PackBinary() { Lane = Lane, Rank = Rank };
+        var rule = new Passes.Rules.CPU.PackBinary(Rank, Lane);
         CompilerServices.TryMatch(pre, rule.Pattern, out var result);
-        var posts = rule.GetReplaceCandidates(result!, new Passes.RunPassContext());
+        var posts = new[] { pre }.Concat(rule.GetReplaceCandidates(result!, new Passes.RunPassContext()));
         await RunCases(Path.Join(CompileOptions.DumpDir.ToString(), $"Theory{count}"), feedDict, posts);
     }
 
@@ -96,7 +129,48 @@ public sealed class UnitTestCPUKernels : TestClassBase
             { bias, IR.F.Random.Normal(DataTypes.Float32, 0, 1, 1, pshape).Evaluate() },
         };
 
-        var rule = new Passes.Rules.CPU.PackLayerNorm() { Lane = Lane, Rank = Rank };
+        var rule = new Passes.Rules.CPU.PackLayerNorm(Rank, Lane);
+        CompilerServices.TryMatch(pre, rule.Pattern, out var result);
+        var posts = new[] { pre }.Concat(rule.GetReplaceCandidates(result!, new Passes.RunPassContext())).Where(e => e is not Call { Target: Slice });
+        await RunCases(Path.Join(CompileOptions.DumpDir.ToString(), $"Theory{count}"), feedDict, posts);
+    }
+
+    [Theory]
+    [InlineData(new object[] { new[] { 1, 2, 16, 32 }, 1e-5, 0 })]
+    [InlineData(new object[] { new[] { 1, 32, 2048 }, 1e-6, 1 })]
+    public async Task TestInstanceNorm(int[] shape, float epsion, int count)
+    {
+        var input = new Var(new TensorType(DataTypes.Float32, shape));
+        var pshape = new[] { shape[1] };
+        var scale = new Var(new TensorType(DataTypes.Float32, pshape));
+        var bias = new Var(new TensorType(DataTypes.Float32, pshape));
+        var pre = IR.F.NN.InstanceNormalization(input, scale, bias, epsion);
+
+        var feedDict = new Dictionary<Var, IValue>() {
+            { input, IR.F.Random.Normal(DataTypes.Float32, 0, 1, 1, shape).Evaluate() },
+            { scale, IR.F.Random.Normal(DataTypes.Float32, 0, 1, 1, pshape).Evaluate() },
+            { bias, IR.F.Random.Normal(DataTypes.Float32, 0, 1, 1, pshape).Evaluate() },
+        };
+
+        var rule = new Passes.Rules.CPU.PackInstanceNorm(Rank, Lane);
+        CompilerServices.TryMatch(pre, rule.Pattern, out var result);
+        var posts = new[] { pre }.Concat(rule.GetReplaceCandidates(result!, new Passes.RunPassContext())).Where(e => e is not Call { Target: Slice });
+        await RunCases(Path.Join(CompileOptions.DumpDir.ToString(), $"Theory{count}"), feedDict, posts);
+    }
+
+    [Theory]
+    [InlineData(new object[] { new[] { 1, 4, 32, 32 }, ImageResizeMode.Bilinear, new[] { 1, 4, 64, 64 }, 0 })]
+    [InlineData(new object[] { new[] { 1, 8, 32, 32 }, ImageResizeMode.NearestNeighbor, new[] { 1, 8, 64, 64 }, 1 })]
+    public async Task TestResizeImage(int[] shape, ImageResizeMode resizeMode, int[] newSize, int count)
+    {
+        var input = new Var(new TensorType(DataTypes.Float32, shape));
+        var pre = IR.F.Imaging.ResizeImage(resizeMode, input, None.Default, newSize);
+
+        var feedDict = new Dictionary<Var, IValue>() {
+            { input, IR.F.Random.Normal(DataTypes.Float32, 0, 1, 1, shape).Evaluate() },
+        };
+
+        var rule = new Passes.Rules.CPU.PackResizeImage(Rank, Lane);
         CompilerServices.TryMatch(pre, rule.Pattern, out var result);
         var posts = new[] { pre }.Concat(rule.GetReplaceCandidates(result!, new Passes.RunPassContext())).Where(e => e is not Call { Target: Slice });
         await RunCases(Path.Join(CompileOptions.DumpDir.ToString(), $"Theory{count}"), feedDict, posts);
@@ -105,6 +179,7 @@ public sealed class UnitTestCPUKernels : TestClassBase
     [Theory]
     [InlineData(new object[] { new[] { 1, 384, 512 }, new[] { 512, 512 }, 0 })]
     [InlineData(new object[] { new[] { 1, 1, 384, 256 }, new[] { 32, 256, 512 }, 1 })]
+    [InlineData(new object[] { new[] { 384, 512 }, new[] { 512, 512 }, 2 })]
     public async Task TestMatMul(int[] lhsShape, int[] rhsShape, int count)
     {
         var lhs = new Var(new TensorType(DataTypes.Float32, lhsShape));
@@ -116,7 +191,7 @@ public sealed class UnitTestCPUKernels : TestClassBase
             { rhs, IR.F.Random.Normal(DataTypes.Float32, 0, 1, 3, rhsShape).Evaluate() },
         };
 
-        var rule = new Passes.Rules.CPU.PackMatMul() { Lane = Lane, Rank = Rank };
+        var rule = new Passes.Rules.CPU.PackMatMul(Rank, Lane);
         CompilerServices.TryMatch(pre, rule.Pattern, out var result);
         var posts = new[] { pre }.Concat(rule.GetReplaceCandidates(result!, new Passes.RunPassContext()));
         await RunCases(Path.Join(CompileOptions.DumpDir.ToString(), $"Theory{count}"), feedDict, posts);
@@ -139,6 +214,32 @@ public sealed class UnitTestCPUKernels : TestClassBase
     }
 
     [Theory]
+    [InlineData(new object[] { new int[] { 1, 1, 4, 4 }, new int[] { 8, 1, 3, 3 }, new int[] { 1, 1, 1, 1 }, new int[] { 1, 1 }, 0 })]
+    [InlineData(new object[] { new int[] { 3, 2, 4, 4 }, new int[] { 8, 2, 3, 3 }, new int[] { 0, 0, 1, 1 }, new int[] { 1, 2 }, 1 })]
+    [InlineData(new object[] { new int[] { 3, 2, 4, 4 }, new int[] { 8, 2, 3, 3 }, new int[] { 1, 0, 1, 1 }, new int[] { 2, 1 }, 2 })]
+    [InlineData(new object[] { new int[] { 1, 512, 64, 64 }, new int[] { 512, 512, 3, 3 }, new int[] { 1, 1, 1, 1 }, new int[] { 1, 1 }, 3 })]
+    public async Task TestConv2DAndIm2col(int[] inputShape, int[] wShape, int[] padding, int[] strides, int count)
+    {
+        var dilation = new[] { 1, 1 };
+        var groups = 1;
+        var input = new Var(new TensorType(DataTypes.Float32, inputShape));
+        var weights = new Var(new TensorType(DataTypes.Float32, wShape));
+        var bias = IR.F.Random.Normal(DataTypes.Float32, new[] { wShape[0] }).Evaluate().AsTensor();
+        var pre = IR.F.NN.Conv2D(input, weights, bias, strides, new[,] { { padding[0], padding[1] }, { padding[2], padding[3] } }, dilation, PadMode.Constant, groups);
+        var outShape = pre.CheckedShape.ToValueArray();
+
+        var feedDict = new Dictionary<Var, IValue>() {
+            { input, IR.F.Random.Normal(DataTypes.Float32, 0, 1, 1, inputShape).Evaluate() },
+            { weights, IR.F.Random.Normal(DataTypes.Float32, 0, 1, 3, wShape).Evaluate() },
+        };
+
+        Expr post = Passes.Rules.CPU.PackConv2D.AddCandidate(input, weights, bias, strides, padding, wShape, outShape);
+        Expr post2 = Passes.Rules.CPU.PackConv2D.AddPackedCandidate(input, weights, bias, strides, padding, wShape, outShape, Lane);
+        var posts = new[] { pre, post, post2 };
+        await RunCases(Path.Join(CompileOptions.DumpDir.ToString(), $"Theory{count}"), feedDict, posts);
+    }
+
+    [Theory]
     [InlineData(new object[] { false, 0 })]
     [InlineData(new object[] { true, 1 })] // enable packing
     public async Task TestDecodeLayer(bool packing, int count)
@@ -149,7 +250,7 @@ public sealed class UnitTestCPUKernels : TestClassBase
             return;
         }
 
-        CompileOptions.TargetCompileOptions = CPUCompileOptions.Default with { Packing = packing };
+        CompileOptions.TargetCompileOptions = new CpuTargetOptions() { Packing = packing };
         var vhidden_in = new Var("vhidden_in", new TensorType(DataTypes.Float32, new[] { 1, 384, 8192 }));
         var vattn_mask = new Var("vattn_mask", new TensorType(DataTypes.Float32, new[] { 1, 1, 384, 384 }));
         var vposition_ids = new Var("vposition_ids", new TensorType(DataTypes.Int64, new[] { 1, 384 }));
@@ -215,15 +316,52 @@ public sealed class UnitTestCPUKernels : TestClassBase
         await RunCases(Path.Join(CompileOptions.DumpDir.ToString(), $"Theory{count}"), feedDict, posts);
     }
 
+    [Theory]
+    [InlineData(new object[] { false, 0 })]
+    [InlineData(new object[] { true, 1 })] // enable packing
+    public async Task TestVAEDecRes(bool packing, int count)
+    {
+        CompileOptions.TargetCompileOptions = new CpuTargetOptions() { Packing = packing };
+        var vlatent_sample = new Var("vlatent_sample", new TensorType(DataTypes.Float32, new[] { 1, 4, 64, 64 }));
+        Expr pre;
+        {
+            var v0 = IR.F.NN.Conv2D(vlatent_sample, IR.F.Random.Normal(DataTypes.Float32, 0, 0.1, 1, new[] { 4, 4, 1, 1 }).Evaluate().AsTensor(), IR.F.Random.Normal(DataTypes.Float32, 0, 0.1, 2, new[] { 4 }).Evaluate().AsTensor(), new[] { 1L, 1L }, new[,] { { 0L, 0L }, { 0L, 0L } }, new[] { 1L, 1L }, PadMode.Constant, 1L, new[] { float.NegativeInfinity, float.PositiveInfinity }); // f32[1,4,64,64]
+            var v1 = IR.F.NN.Conv2D(v0, IR.F.Random.Normal(DataTypes.Float32, 0, 0.1, 3, new[] { 512, 4, 3, 3 }).Evaluate().AsTensor(), IR.F.Random.Normal(DataTypes.Float32, 0, 0.1, 4, new[] { 512 }).Evaluate().AsTensor(), new[] { 1L, 1L }, new[,] { { 1L, 1L }, { 1L, 1L } }, new[] { 1L, 1L }, PadMode.Constant, 1L, new[] { float.NegativeInfinity, float.PositiveInfinity }); // f32[1,512,64,64]
+            var v2 = IR.F.Tensors.Reshape(v1, new[] { 1L, 32L, 65536L }); // f32[1,32,65536]
+            var v3 = IR.F.NN.InstanceNormalization(v2, IR.F.Random.Normal(DataTypes.Float32, 0, 0.1, 5, new[] { 32 }).Evaluate().AsTensor(), IR.F.Random.Normal(DataTypes.Float32, 0, 0.1, 6, new[] { 32 }).Evaluate().AsTensor(), 1E-06f); // f32[1,32,65536]
+            var v4 = IR.F.Tensors.Reshape(v3, new[] { 1L, 512L, 64L, 64L }); // f32[1,512,64,64]
+            var v5 = IR.F.Math.Binary(BinaryOp.Mul, v4, IR.F.Random.Normal(DataTypes.Float32, 0, 0.1, 7, new[] { 512, 1, 1 }).Evaluate().AsTensor()); // f32[1,512,64,64]
+            var v6 = IR.F.Math.Binary(BinaryOp.Add, v5, IR.F.Random.Normal(DataTypes.Float32, 0, 0.1, 8, new[] { 512, 1, 1 }).Evaluate().AsTensor()); // f32[1,512,64,64]
+            var v7 = IR.F.NN.Swish(v6, 1f); // f32[1,512,64,64]
+            var v8 = IR.F.NN.Conv2D(v7, IR.F.Random.Normal(DataTypes.Float32, 0, 0.1, 9, new[] { 512, 512, 3, 3 }).Evaluate().AsTensor(), IR.F.Random.Normal(DataTypes.Float32, 0, 0.1, 10, new[] { 512 }).Evaluate().AsTensor(), new[] { 1L, 1L }, new[,] { { 1L, 1L }, { 1L, 1L } }, new[] { 1L, 1L }, PadMode.Constant, 1L, new[] { float.NegativeInfinity, float.PositiveInfinity }); // f32[1,512,64,64]
+            var v9 = IR.F.Tensors.Reshape(v8, new[] { 1L, 32L, 65536L }); // f32[1,32,65536]
+            var v10 = IR.F.NN.InstanceNormalization(v9, IR.F.Random.Normal(DataTypes.Float32, 0, 0.1, 11, new[] { 32 }).Evaluate().AsTensor(), IR.F.Random.Normal(DataTypes.Float32, 0, 0.1, 12, new[] { 32 }).Evaluate().AsTensor(), 1E-06f); // f32[1,32,65536]
+            var v11 = IR.F.Tensors.Reshape(v10, new[] { 1L, 512L, 64L, 64L }); // f32[1,512,64,64]
+            var v12 = IR.F.Math.Binary(BinaryOp.Mul, v11, IR.F.Random.Normal(DataTypes.Float32, 0, 0.1, 13, new[] { 512, 1, 1 }).Evaluate().AsTensor()); // f32[1,512,64,64]
+            var v13 = IR.F.Math.Binary(BinaryOp.Add, v12, IR.F.Random.Normal(DataTypes.Float32, 0, 0.1, 14, new[] { 512, 1, 1 }).Evaluate().AsTensor()); // f32[1,512,64,64]
+            var v14 = IR.F.NN.Swish(v13, 1f); // f32[1,512,64,64]
+            var v15 = IR.F.NN.Conv2D(v14, IR.F.Random.Normal(DataTypes.Float32, 0, 0.1, 15, new[] { 512, 512, 3, 3 }).Evaluate().AsTensor(), IR.F.Random.Normal(DataTypes.Float32, 0, 0.1, 16, new[] { 512 }).Evaluate().AsTensor(), new[] { 1L, 1L }, new[,] { { 1L, 1L }, { 1L, 1L } }, new[] { 1L, 1L }, PadMode.Constant, 1L, new[] { float.NegativeInfinity, float.PositiveInfinity }); // f32[1,512,64,64]
+            pre = IR.F.Math.Binary(BinaryOp.Add, v1, v15); // f32[1,512,64,64]
+        }
+
+        var feedDict = new Dictionary<Var, IValue>() {
+            { vlatent_sample, IR.F.Random.Normal(DataTypes.Float32, 0, 0.1, 13,  new[] { 1, 4, 64, 64 }).Evaluate() },
+        };
+
+        var posts = new[] { pre };
+        await RunCases(Path.Join(CompileOptions.DumpDir.ToString(), $"Theory{count}"), feedDict, posts);
+    }
+
     internal async Task RunCases(string dumpDir, Dictionary<Var, IValue> feedDict, IEnumerable<Expr> posts)
     {
-        int count = 0;
-        foreach (var post in posts)
+        var postArray = posts.ToArray();
+        using var pinner = new ExprPinner(postArray);
+        for (int i = 0; i < postArray.Length; i++)
         {
 #if DEBUG
-            System.Console.WriteLine(CompilerServices.Print(post));
+            System.Console.WriteLine(CompilerServices.Print(postArray[i]));
 #endif
-            var kernelCase = new CpuKernelCase($"Case{count++}", new Fusion("kernel", CPUTarget.Kind, post, feedDict.Keys.ToArray()), feedDict.Keys.ToArray(), feedDict.Values.Select(v => v.AsTensor()).ToArray());
+            var kernelCase = new CpuKernelCase($"Case{i}", new Fusion("kernel", CPUTarget.Kind, postArray[i], feedDict.Keys.ToArray()), feedDict.Keys.ToArray(), feedDict.Values.Select(v => v.AsTensor()).ToArray());
             await Run(dumpDir, kernelCase);
         }
     }
@@ -240,7 +378,7 @@ public sealed class UnitTestCPUKernels : TestClassBase
             return;
         }
 
-        var main = new Function(new Call(fusion, kernelCase.Vars.ToArray()), kernelCase.Vars.ToArray());
+        var main = new Function(fusion.Body, kernelCase.Vars.ToArray());
 
         var module = new IR.IRModule(main);
         var inputs = kernelCase.Inputs.ToArray();

@@ -30,13 +30,45 @@ public class CPUTarget : ITarget
 
     string ITarget.Kind => Kind;
 
-    public (System.CommandLine.Command Command, Func<InvocationContext, System.CommandLine.Command, ITargetCompileOptions> Parser) RegisterCommandAndParser()
+    public (System.CommandLine.Command Command, Func<InvocationContext, System.CommandLine.Command, ITargetOptions> Parser) RegisterCommandAndParser()
     {
         var cmd = new System.CommandLine.Command(Kind);
-        cmd.AddOption(new Option<bool>(
+        var packingOption = new Option<bool>(
             name: "--packing",
             description: "enable layout optimization.",
-            getDefaultValue: () => false));
+            getDefaultValue: () => false);
+        cmd.AddOption(packingOption);
+        var hierarchyOption = new Option<IEnumerable<int[]>>(
+            name: "--hierarchy",
+            description: "the topology of hardware. eg. `8,4 4,8` for dynamic cluster search or `4` for fixed hardware",
+            parseArgument: result =>
+            {
+                return result.Tokens.Select(tk => tk.Value.Split(",").Select(i => int.Parse(i)).ToArray());
+            })
+        {
+            AllowMultipleArgumentsPerToken = true,
+        };
+        cmd.AddOption(hierarchyOption);
+        var hierarchyNameOption = new Option<string>(
+            name: "--hierarchy-name",
+            description: "the name identify of hierarchy.",
+            getDefaultValue: () => "b");
+        cmd.AddOption(hierarchyNameOption);
+        var schemeOption = new Option<string>(
+            name: "--scheme",
+            description: "the distributed scheme path.",
+            getDefaultValue: () => string.Empty);
+        cmd.AddOption(schemeOption);
+
+        ITargetOptions ParseTargetCompileOptions(InvocationContext context, Command command)
+        {
+            var packing = context.ParseResult.GetValueForOption(packingOption);
+            var hierarchy = context.ParseResult.GetValueForOption(hierarchyOption);
+            var hierarchyName = context.ParseResult.GetValueForOption(hierarchyNameOption);
+            var scheme = context.ParseResult.GetValueForOption(schemeOption);
+            return new CpuTargetOptions() { Packing = packing, Hierarchy = hierarchy?.ToArray() ?? new[] { new[] { 1 } }, HierarchyNames = hierarchyName ?? "b", DistributedScheme = scheme ?? string.Empty };
+        }
+
         return (cmd, ParseTargetCompileOptions);
     }
 
@@ -53,24 +85,6 @@ public class CPUTarget : ITarget
     /// <inheritdoc/>
     public void RegisterTargetDependentPass(IPassManager passManager, CompileOptions options)
     {
-        passManager.AddWithName<DataflowPass>("MakeFusion").Configure(p =>
-        {
-            p.Add<Passes.Rules.CombineMHA>();
-            p.Add<Passes.Rules.Neutral.FoldConstCall>();
-            p.Add<Passes.Rules.FuseMHA2>();
-        });
-
-#if false
-        passManager.AddWithName<DataflowPass>("CPUDeviceFusion").Configure(p =>
-        {
-            p.Add<Passes.Rules.CPU.Affine.LowerUnary>();
-        });
-#endif
-
-        passManager.AddWithName<DataflowPass>("CPUKernelFusion").Configure(p =>
-        {
-            p.Add<Passes.Rules.CPUSingleKernelFusion>();
-        });
     }
 
     /// <inheritdoc/>
@@ -102,37 +116,55 @@ public class CPUTarget : ITarget
             });
         }
 
-        if (options.TargetCompileOptions is CPUCompileOptions { Packing: true })
+        if (options.TargetCompileOptions is CpuTargetOptions { Packing: true })
         {
-            passManager.AddWithName<DataflowPass>("AutoPacking").Configure(p =>
+            passManager.AddWithName<EGraphRulesPass>("AutoPacking").Configure(p =>
             {
-                p.Add<Passes.Rules.AutoPacking>();
+                // todo config it in the target options.
+                var rank = 1;
+                var lane = System.Runtime.Intrinsics.Vector256.IsHardwareAccelerated ? 8 : 4;
+                p.Add<Passes.Rules.CPU.PackSoftmax>(rank, lane);
+                p.Add<Passes.Rules.CPU.PackSwish>(rank, lane);
+                p.Add<Passes.Rules.CPU.PackLayerNorm>(rank, lane);
+                p.Add<Passes.Rules.CPU.PackResizeImage>(rank, lane);
+                p.Add<Passes.Rules.CPU.PackMatMul>(rank, lane);
+                p.Add<Passes.Rules.CPU.PackConv2D>(rank, lane);
+                p.Add<Passes.Rules.CPU.PackUnary>(rank, lane);
+                p.Add<Passes.Rules.CPU.PackBinary>(rank, lane);
+                p.Add<Passes.Rules.CPU.PackTranspose>(rank, lane);
+                p.Add<Passes.Rules.CPU.PackUnsqueeze>(rank, lane);
+                p.Add<Passes.Rules.CPU.PackReshape>(rank, lane);
+                p.Add<Passes.Rules.CPU.PackSlice>(rank, lane);
+                p.Add<Passes.Rules.Neutral.FoldConstCall>();
+                p.Add<Passes.Rules.CPU.FoldPackUnpack>();
+                p.Add<Passes.Rules.CPU.FoldPackConcatUnpack>();
+                p.Add<Passes.Rules.Neutral.FoldTwoReshapes>();
             });
         }
 
-        passManager.AddWithName<DataflowPass>("AutoDistributed").Configure(p =>
-        {
-            p.Add<Passes.Rules.AutoDistributed>();
-        });
+        // need refactor tiling.
+        passManager.Add<Passes.Distributed.AutoDistributedPass>();
+
+        passManager.Add<Nncase.Passes.CPUFunctionPartitionPass>(CPUTarget.Kind);
 
         passManager.Add<CPUFusionToModulePass>();
 
-#if false
-        // FIX ME: Disable macos as macho loader is buggy.
-        if (!RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
+        passManager.AddWithName<DataflowPass>("LowerToAffine").Configure(p =>
         {
-            passManager.AddWithName<DataflowPass>("CPUDeviceFusion").Configure(p =>
-            {
-                p.AddAnalysis<Passes.Analysis.IExprUserAnalysisResult>();
-                p.Add<Passes.Rules.CPUDeviceFusion>();
-            });
-        }
-#endif
+            p.Add<Passes.Rules.CPU.Affine.LowerUnary>();
+            p.Add<Passes.Rules.CPU.Affine.LowerSwish>();
+            p.Add<Passes.Rules.CPU.Affine.LowerBinary>();
+            p.Add<Passes.Rules.CPU.Affine.LowerPackedBinary>();
+            p.Add<Passes.Rules.CPU.Affine.LowerMatmul>();
+        });
 
+        // concat/reshape lower
+        // tile and lower to tir.
         passManager.Add<AutoTilePass>();
 
         passManager.Add<CPUFusionToTirPass>();
 
+        // todo add auto fusion merge pass here.
         passManager.Add<PrimFuncPass>().Configure(p =>
         {
             p.Add<Passes.Mutators.UnFoldBlock>();
@@ -170,10 +202,5 @@ public class CPUTarget : ITarget
         {
             throw new NotSupportedException($"{moduleKind} module is not supported.");
         }
-    }
-
-    private static ITargetCompileOptions ParseTargetCompileOptions(InvocationContext context, Command command)
-    {
-        return new CPUCompileOptions(string.Empty, false, Array.Empty<int>(), new[] { 1 }, "b", new[] { 3 * (int)MathF.Pow(2, 20) });
     }
 }

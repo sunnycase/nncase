@@ -13,12 +13,15 @@
 # limitations under the License.
 # pylint: disable=invalid-name, unused-argument, import-outside-toplevel
 
-from conans import ConanFile, CMake, tools
+from conan import ConanFile
+from conan.errors import ConanInvalidConfiguration
+from conan.tools.build import check_min_cppstd, cross_building
+from conan.tools.cmake import CMake, CMakeDeps, CMakeToolchain, cmake_layout
+from conan.tools.files import apply_conandata_patches, copy, export_conandata_patches, get, rmdir
 
 
 class nncaseConan(ConanFile):
     settings = "os", "compiler", "build_type", "arch"
-    generators = "CMakeToolchain", "cmake_find_package", "cmake_paths"
     options = {
         "shared": [True, False],
         "fPIC": [True, False],
@@ -35,52 +38,56 @@ class nncaseConan(ConanFile):
         "python": True,
         "vulkan_runtime": False
     }
-    
-    def imports(self):
-        if self.settings.os == 'Windows':
-            self.copy("nethost.dll", "bin", "bin")
-            self.copy("ortki.dll", "bin", "bin")
+
+    @property
+    def _min_cppstd(self):
+        return 20
+
+    def layout(self):
+        cmake_layout(self)
 
     def requirements(self):
         if self.options.tests:
             self.requires('gtest/1.10.0')
-            self.requires('ortki/0.0.3')
-            self.requires('rapidjson/1.1.x')
+            self.requires('ortki/0.0.4')
 
         if self.options.python:
             self.requires('pybind11/2.11.1')
 
         if not self.options.runtime:
-            self.requires('nethost/7.0.5')
+            self.requires('nethost/8.0.8')
             self.requires('fmt/7.1.3')
+
+        if not self.options.runtime or self.options.tests:
             self.requires('nlohmann_json/3.9.1')
 
     def build_requirements(self):
         pass
 
     def configure(self):
-        min_cppstd = "20"
-        tools.check_min_cppstd(self, min_cppstd)
-
-        if self.settings.os == 'Windows':
-            self.settings.compiler.toolset = 'ClangCL'
-            
         if not self.options.runtime:
-            if self.settings.os == 'Windows':
+            if self.settings.os == 'Windows' and self.settings.build_type == 'Debug':
                 self.options["nethost"].shared = True
 
         if self.options.tests:
             self.options["ortki"].shared = True
+            self.options["date"].header_only = True
+        
+    def validate(self):
+        if self.settings.compiler.get_safe("cppstd"):
+            check_min_cppstd(self, self._min_cppstd)
 
-    def cmake_configure(self):
-        cmake = CMake(self)
-        cmake.definitions['BUILDING_RUNTIME'] = self.options.runtime
-        cmake.definitions['ENABLE_VULKAN_RUNTIME'] = self.options.vulkan_runtime
-        cmake.definitions['BUILD_PYTHON_BINDING'] = self.options.python
-        cmake.definitions['BUILD_TESTING'] = self.options.tests
-        cmake.configure()
-        return cmake
+    def generate(self):
+        tc = CMakeToolchain(self, generator="Ninja")
+        tc.variables['BUILDING_RUNTIME'] = self.options.runtime
+        tc.variables['ENABLE_VULKAN_RUNTIME'] = self.options.vulkan_runtime
+        tc.variables['BUILD_PYTHON_BINDING'] = self.options.python
+        tc.variables['BUILD_TESTING'] = self.options.tests
+        tc.generate()
+        deps = CMakeDeps(self)
+        deps.generate()
 
     def build(self):
-        cmake = self.cmake_configure()
+        cmake = CMake(self)
+        cmake.configure()
         cmake.build()

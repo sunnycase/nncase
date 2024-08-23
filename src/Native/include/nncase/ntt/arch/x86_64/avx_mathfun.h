@@ -178,8 +178,7 @@ static inline __m256 log256_ps(__m256 x) {
     x = _mm256_max_ps(
         x, *(__m256 *)_ps256_min_norm_pos); /* cut off denormalized stuff */
 
-    // can be done with AVX2
-    imm0 = _mm256_comp_srli_epi32(_mm256_castps_si256(x), 23);
+    imm0 = _mm256_srli_epi32(_mm256_castps_si256(x), 23);
 
     /* keep only the fractional part */
     x = _mm256_and_ps(x, *(__m256 *)_ps256_inv_mant_mask);
@@ -1049,8 +1048,6 @@ static inline __m256 atan2256_ps(__m256 y, __m256 x) {
 static inline __m256 abs256_ps(__m256 x) {
     // Use negative zero as the sign bit mask.
     const __m256 magic_negative_zero = _mm256_set1_ps(-0.0f);
-
-    // return (!magic_negative_zero && x);
     return _mm256_andnot_ps(magic_negative_zero, x);
 }
 

@@ -560,7 +560,14 @@ internal sealed class ILPrintVisitor : ExprFunctor<string, string>
 
     protected override string VisitBufferOf(BufferOf expr)
     {
-        return $"bufferof({Visit(expr.Input)})";
+        if (_names.TryGetValue(expr, out var name))
+        {
+            return name;
+        }
+
+        name = $"bufferof({Visit(expr.Input)})";
+        _names.Add(expr, name);
+        return name;
     }
 
     /// <inheritdoc/>
@@ -578,7 +585,8 @@ internal sealed class ILPrintVisitor : ExprFunctor<string, string>
 
         // 1. For Loop signature
         _scope.Append($"{name} = Grid({string.Join(", ", reads)})");
-        AppendCheckedType(expr.CheckedType, " {");
+        AppendCheckedType(expr.CheckedType);
+        _scope.IndWriteLine(" {");
 
         using (_scope.IndentUp())
         {
@@ -605,9 +613,10 @@ internal sealed class ILPrintVisitor : ExprFunctor<string, string>
             AppendCheckedType(expr.Body.CheckedType, " {", hasNewLine: true);
             using (_scope.IndentUp())
             {
-                foreach (var item in expr.Body.Fields)
+                var ss = CompilerServices.Print(expr.Body, true);
+                foreach (var line in ss.Split('\n'))
                 {
-                    Visit(item);
+                    _scope.IndWriteLine(line);
                 }
             }
 

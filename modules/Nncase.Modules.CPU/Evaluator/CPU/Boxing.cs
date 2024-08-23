@@ -17,9 +17,23 @@ public sealed class BoxingEvaluator : ITypeInferencer<Boxing>, ICostEvaluator<Bo
 
     public IRType Visit(ITypeInferenceContext context, Boxing target)
     {
-        return context.GetArgumentType(target, Boxing.Input) switch
+        var check = (DistributedType inv, DistributedType outv) =>
+            {
+                // TODO: add more invalid cases
+                if (inv.NdSBP.Distinct().Count() == 1 && outv.NdSBP.Distinct().Count() == 1 && inv.NdSBP[0] == outv.NdSBP[0])
+                {
+                    return (IRType)new InvalidType("Same NDSBP");
+                }
+                else
+                {
+                    return outv;
+                }
+            };
+
+        return (context.GetArgumentType(target, Boxing.Input), target.NewType) switch
         {
-            InvalidType inv => inv,
+            (InvalidType inv, _) => inv,
+            (DistributedType inv, DistributedType outv) => check(inv, outv),
             _ => target.NewType,
         };
     }
@@ -32,18 +46,34 @@ public sealed class BoxingEvaluator : ITypeInferencer<Boxing>, ICostEvaluator<Bo
         switch (inType, returnType)
         {
             case (TensorType tensorType, DistributedType distTensorType):
-                cost = new Cost()
+                switch (context.CompileOptions.TargetCompileOptions)
                 {
-                    [CostFactorNames.MemoryLoad] = CostUtility.GetMemoryAccess(tensorType),
-                    [CostFactorNames.MemoryStore] = (UInt128)((float)CostUtility.GetMemoryAccess(distTensorType) / DistributedUtility.GetDividedTensorEfficiency(distTensorType, _burstLength)),
-                };
+                    case Targets.CpuTargetOptions { UnifiedMemoryArchitecture: true }:
+                        break;
+                    default:
+                        cost = new Cost()
+                        {
+                            [CostFactorNames.MemoryLoad] = CostUtility.GetMemoryAccess(tensorType),
+                            [CostFactorNames.MemoryStore] = (UInt128)((float)CostUtility.GetMemoryAccess(distTensorType) / DistributedUtility.GetDividedTensorEfficiency(distTensorType, _burstLength)),
+                        };
+                        break;
+                }
+
                 break;
             case (DistributedType distTensorType, TensorType tensorType):
-                cost = new Cost()
+                switch (context.CompileOptions.TargetCompileOptions)
                 {
-                    [CostFactorNames.MemoryLoad] = (UInt128)((float)CostUtility.GetMemoryAccess(distTensorType) / DistributedUtility.GetDividedTensorEfficiency(distTensorType, _burstLength)),
-                    [CostFactorNames.MemoryStore] = CostUtility.GetMemoryAccess(tensorType),
-                };
+                    case Targets.CpuTargetOptions { UnifiedMemoryArchitecture: true }:
+                        break;
+                    default:
+                        cost = new Cost()
+                        {
+                            [CostFactorNames.MemoryLoad] = (UInt128)((float)CostUtility.GetMemoryAccess(distTensorType) / DistributedUtility.GetDividedTensorEfficiency(distTensorType, _burstLength)),
+                            [CostFactorNames.MemoryStore] = CostUtility.GetMemoryAccess(tensorType),
+                        };
+                        break;
+                }
+
                 break;
 
             case (DistributedType a, DistributedType b) when a.Placement == b.Placement && a.NdSBP != b.NdSBP:
@@ -127,6 +157,13 @@ public sealed class BoxingEvaluator : ITypeInferencer<Boxing>, ICostEvaluator<Bo
 
                 break;
             case (DistributedType a, DistributedType b) when a.TensorType != b.TensorType && a.Placement == b.Placement:
+                cost = new Cost()
+                {
+                    [CostFactorNames.MemoryStore] = (UInt128)((float)CostUtility.GetMemoryAccess(a) / DistributedUtility.GetDividedTensorEfficiency(a, _burstLength)),
+                    [CostFactorNames.MemoryLoad] = (UInt128)((float)CostUtility.GetMemoryAccess(b) / DistributedUtility.GetDividedTensorEfficiency(b, _burstLength)),
+                };
+                break;
+            case (DistributedType a, DistributedType b) when a.Placement != b.Placement:
                 cost = new Cost()
                 {
                     [CostFactorNames.MemoryStore] = (UInt128)((float)CostUtility.GetMemoryAccess(a) / DistributedUtility.GetDividedTensorEfficiency(a, _burstLength)),

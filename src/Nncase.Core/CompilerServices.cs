@@ -118,8 +118,9 @@ public interface ICompilerServicesProvider
     /// Evaluate cost of the expression tree.
     /// </summary>
     /// <param name="expr">Expression.</param>
+    /// <param name="compileOptions">options.</param>
     /// <returns>Evaluate result.</returns>
-    Cost EvaluateCost(Expr expr);
+    Cost EvaluateCost(Expr expr, CompileOptions compileOptions);
 
     /// <summary>
     /// Evaluate metric of the expression tree.
@@ -208,8 +209,9 @@ public interface ICompilerServicesProvider
     /// <param name="expr">Expression.</param>
     /// <param name="rules">Rewrite rules.</param>
     /// <param name="options">Options.</param>
+    /// <param name="compileOptions">compileOptions.</param>
     /// <returns>Rewrited expression.</returns>
-    Expr ERewrite(Expr expr, IEnumerable<IRewriteRule> rules, RunPassContext options);
+    Expr ERewrite(Expr expr, IEnumerable<IRewriteRule> rules, RunPassContext options, CompileOptions compileOptions);
 
     /// <summary>
     /// Using EGraph rewrite expression.
@@ -219,6 +221,8 @@ public interface ICompilerServicesProvider
     /// <param name="options">Options.</param>
     /// <returns>Rewrited expression.</returns>
     IEGraph ERewrite(IEGraph expr, IEnumerable<IRewriteRule> rules, RunPassContext options);
+
+    MicroKernelInfo GetOpMicroKernelInfo(Op op, AffineDim[] domain, AffineMap[] accessMaps, int[][] bufferShapes, ITargetOptions targetOptions);
 }
 
 internal interface ICompilerServicesProviderInternal
@@ -304,10 +308,11 @@ public static class CompilerServices
     /// Evaluate cost of the expression tree.
     /// </summary>
     /// <param name="expr">Expression.</param>
+    /// <param name="compileOptions">compileOptions.</param>
     /// <returns>Evaluate result.</returns>
-    public static Cost EvaluateCost(Expr expr)
+    public static Cost EvaluateCost(Expr expr, CompileOptions compileOptions)
     {
-        return Provider.EvaluateCost(expr);
+        return Provider.EvaluateCost(expr, compileOptions);
     }
 
     /// <summary>
@@ -324,6 +329,8 @@ public static class CompilerServices
     /// <param name="expr">Expression.</param>
     /// <returns>Evaluate result.</returns>
     public static Dictionary<Expr, Metric> EvaluateMetric(Expr expr) => Provider.EvaluateMetric(expr);
+
+    public static MicroKernelInfo GetOpMicroKernelInfo(Op op, AffineDim[] domain, AffineMap[] accessMaps, int[][] bufferShapes, ITargetOptions targetOptions) => Provider.GetOpMicroKernelInfo(op, domain, accessMaps, bufferShapes, targetOptions);
 
     /// <summary>
     /// Evaluate cost of operator.
@@ -414,10 +421,11 @@ public static class CompilerServices
     /// <param name="expr">Expression.</param>
     /// <param name="rules">Rewrite rules.</param>
     /// <param name="options">Options.</param>
+    /// <param name="compileOptions">compileOptions.</param>
     /// <returns>Rewrited expression.</returns>
-    public static Expr ERewrite(Expr expr, IEnumerable<IRewriteRule> rules, RunPassContext options)
+    public static Expr ERewrite(Expr expr, IEnumerable<IRewriteRule> rules, RunPassContext options, CompileOptions compileOptions)
     {
-        return Provider.ERewrite(expr, rules, options);
+        return Provider.ERewrite(expr, rules, options, compileOptions);
     }
 
     /// <summary>
@@ -549,6 +557,7 @@ internal class CompilerServicesProvider : ICompilerServicesProvider, ICompilerSe
     private readonly IEGraphRewriteProvider _eGraphrewriteProvider;
     private readonly ITargetProvider _targetProvider;
     private readonly IShapeEvaluateProvider _shapeEvaluateProvider;
+    private readonly IMicroKernelInfoProvider _microKernelInfoGetter;
 
     public CompilerServicesProvider(
         IEvaluateProvider evaluateProvider,
@@ -562,7 +571,8 @@ internal class CompilerServicesProvider : ICompilerServicesProvider, ICompilerSe
         IEGraphMatchProvider eGraphMatchProvider,
         IEGraphRewriteProvider eGraphrewriteProvider,
         ITargetProvider targetProvider,
-        IShapeEvaluateProvider shapeEvaluateProvider)
+        IShapeEvaluateProvider shapeEvaluateProvider,
+        IMicroKernelInfoProvider microKernelInfoGetter)
     {
         // _compileOptions = compileOptions.Value;
         _evaluateProvider = evaluateProvider;
@@ -577,6 +587,7 @@ internal class CompilerServicesProvider : ICompilerServicesProvider, ICompilerSe
         _eGraphrewriteProvider = eGraphrewriteProvider;
         _targetProvider = targetProvider;
         _shapeEvaluateProvider = shapeEvaluateProvider;
+        _microKernelInfoGetter = microKernelInfoGetter;
     }
 
     public IDataTypeServiceProvider DataTypeService { get; }
@@ -652,9 +663,9 @@ internal class CompilerServicesProvider : ICompilerServicesProvider, ICompilerSe
     }
 
     /// <inheritdoc/>
-    public Cost EvaluateCost(Expr expr)
+    public Cost EvaluateCost(Expr expr, CompileOptions compileOptions)
     {
-        return _costEvaluateProvider.EvaluateCost(expr);
+        return _costEvaluateProvider.EvaluateCost(expr, compileOptions);
     }
 
     /// <inheritdoc/>
@@ -696,13 +707,15 @@ internal class CompilerServicesProvider : ICompilerServicesProvider, ICompilerSe
         return _targetProvider.GetTarget(name);
     }
 
-    public Expr ERewrite(Expr expr, IEnumerable<IRewriteRule> rules, RunPassContext options)
+    public Expr ERewrite(Expr expr, IEnumerable<IRewriteRule> rules, RunPassContext options, CompileOptions compileOptions)
     {
-        return _eGraphrewriteProvider.ERewrite(expr, rules, options);
+        return _eGraphrewriteProvider.ERewrite(expr, rules, options, compileOptions);
     }
 
     public IEGraph ERewrite(IEGraph graph, IEnumerable<IRewriteRule> rules, RunPassContext options)
     {
         return _eGraphrewriteProvider.ERewrite(graph, rules, options);
     }
+
+    public MicroKernelInfo GetOpMicroKernelInfo(Op op, AffineDim[] domain, AffineMap[] accessMaps, int[][] bufferShapes, ITargetOptions targetOptions) => _microKernelInfoGetter.GetInfo(op, domain, accessMaps, bufferShapes, targetOptions);
 }

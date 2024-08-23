@@ -13,6 +13,7 @@
  * limitations under the License.
  */
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <iostream>
 #include <nncase/api.h>
@@ -25,6 +26,10 @@ using namespace nncase;
 using namespace nncase::clr;
 using namespace nncase::runtime;
 using namespace std::string_view_literals;
+
+bool are_floats_equal(float a, float b, float epsilon = 1e-6) {
+    return std::fabs(a - b) < epsilon;
+}
 
 #define TRY(x)                                                                 \
     if (x)                                                                     \
@@ -43,7 +48,6 @@ int main() {
     compiler = nncapi->compile_session_get_compiler(compile_session.get());
 #endif
 
-#if 0
     // fixed
     {
         ntt::tensor<float, ntt::fixed_shape<1, 16>> ta, tb, tc;
@@ -93,8 +97,8 @@ int main() {
 
     // fixed pack
     {
-        ntt::tensor<float, ntt::fixed_shape<16, 64, 32>> ta;
-        ntt::tensor<ntt::vector<float, 4>, ntt::fixed_shape<16, 16, 32>> tb;
+        ntt::tensor<float, ntt::fixed_shape<1, 64, 32>> ta;
+        ntt::tensor<ntt::vector<float, 4>, ntt::fixed_shape<1, 16, 32>> tb;
         std::iota(ta.elements().begin(), ta.elements().end(), 0.f);
         ntt::pack<1>(ta, tb.view());
         ntt::apply(tb.shape(), [&](auto index) {
@@ -122,7 +126,7 @@ int main() {
         assert(tb(0, 0, 0)(0) == ta(0, 0, 0));
         assert(tb(0, 0, 0)(1) == ta(0, 1, 0));
         assert(tb(0, 0, 0)(2) == ta(0, 2, 0));
-        assert(tb(0, 0, 0)(3) == 0.f);
+        assert(are_floats_equal(tb(0, 0, 0)(3), 0.f));
 
         ntt::tensor<float, ntt::fixed_shape<16>> tc;
         ntt::tensor<ntt::vector<float, 4>, ntt::fixed_shape<4>> td;
@@ -141,19 +145,19 @@ int main() {
         ntt::tensor<float, ntt::fixed_shape<1, 3, 4>> ta;
         ntt::tensor<ntt::vector<float, 4>, ntt::fixed_shape<1, 1, 4>> tb;
         std::iota(ta.elements().begin(), ta.elements().end(), 0.f);
-        ntt::pack<1>(ta, tb.view());
+        ntt::pack<1>(ta, tb);
         ntt::tensor<ntt::vector<float, 4>, ntt::fixed_shape<1, 1, 4>> tc;
         ntt::unary<ntt::ops::cos>(tb, tc);
         assert(tc(0, 0, 0)(0) == std::cos(ta(0, 0, 0)));
         assert(tc(0, 0, 0)(1) == std::cos(ta(0, 1, 0)));
         assert(tc(0, 0, 0)(2) == std::cos(ta(0, 2, 0)));
-        assert(tc(0, 0, 0)(3) == std::cos(0.0f));
+        assert(are_floats_equal(tc(0, 0, 0)(3), std::cos(0.0f)));
     }
 
     // pack(fixed_shape + fixed_shape)
     {
-        ntt::tensor<float, ntt::fixed_shape<16, 64, 32>> ta;
-        ntt::tensor<ntt::vector<float, 8>, ntt::fixed_shape<16, 8, 32>> tb;
+        ntt::tensor<float, ntt::fixed_shape<1, 64, 32>> ta;
+        ntt::tensor<ntt::vector<float, 8>, ntt::fixed_shape<1, 8, 32>> tb;
         std::iota(ta.elements().begin(), ta.elements().end(), 0.f);
         ntt::pack<1>(ta, tb.view());
         ntt::apply(tb.shape(), [&](auto index) {
@@ -177,14 +181,15 @@ int main() {
 
     // pack(ranked_shape + ranked_shape)
     {
-        auto a_shape = ntt::make_ranked_shape(16, 64, 32);
-        auto b_shape = ntt::make_ranked_shape(16, 8, 32);
+        auto a_shape = ntt::make_ranked_shape(1, 64, 32);
+        auto b_shape = ntt::make_ranked_shape(1, 8, 32);
         ntt::tensor<float, ntt::ranked_shape<3>> ta(a_shape);
         ntt::tensor<ntt::vector<float, 8>, ntt::ranked_shape<3>> tb(b_shape);
         std::iota(ta.elements().begin(), ta.elements().end(), 0.f);
         ntt::pack<1>(ta, tb.view());
+        constexpr auto rank = tb.shape().rank();
         ntt::apply(tb.shape(), [&](auto index) {
-            ntt::ranked_shape<tb.shape().rank()> inIndex;
+            ntt::ranked_shape<rank> inIndex;
             for (size_t i = 0; i < index.rank(); i++)
                 inIndex[i] = index[i];
             auto b = tb(index);
@@ -202,16 +207,16 @@ int main() {
         });
     }
 
-
     // pack(fixed_shape + ranked_shape)
     {
-        ntt::tensor<float, ntt::fixed_shape<16, 64, 32>> ta;
-        auto shape = ntt::make_ranked_shape(16, 8, 32);
+        ntt::tensor<float, ntt::fixed_shape<1, 64, 32>> ta;
+        auto shape = ntt::make_ranked_shape(1, 8, 32);
         ntt::tensor<ntt::vector<float, 8>, ntt::ranked_shape<3>> tb(shape);
         std::iota(ta.elements().begin(), ta.elements().end(), 0.f);
         ntt::pack<1>(ta, tb.view());
+        constexpr auto rank = tb.shape().rank();
         ntt::apply(tb.shape(), [&](auto index) {
-            ntt::ranked_shape<tb.shape().rank()> inIndex;
+            ntt::ranked_shape<rank> inIndex;
             for (size_t i = 0; i < index.rank(); i++)
                 inIndex[i] = index[i];
             auto b = tb(index);
@@ -231,13 +236,14 @@ int main() {
 
     // pack(ranked_shape + fixed_shape)
     {
-        auto shape = ntt::make_ranked_shape(16, 64, 32);
+        auto shape = ntt::make_ranked_shape(1, 64, 32);
         ntt::tensor<float, ntt::ranked_shape<3>> ta(shape);
-        ntt::tensor<ntt::vector<float, 8>, ntt::fixed_shape<16, 8, 32>> tb;
+        ntt::tensor<ntt::vector<float, 8>, ntt::fixed_shape<1, 8, 32>> tb;
         std::iota(ta.elements().begin(), ta.elements().end(), 0.f);
         ntt::pack<1>(ta, tb.view());
+        constexpr auto rank = tb.shape().rank();
         ntt::apply(tb.shape(), [&](auto index) {
-            ntt::ranked_shape<tb.shape().rank()> inIndex;
+            ntt::ranked_shape<rank> inIndex;
             for (size_t i = 0; i < index.rank(); i++)
                 inIndex[i] = index[i];
             auto b = tb(index);
@@ -255,11 +261,10 @@ int main() {
         });
     }
 
-
     // unpack(fixed_shape + fixed_shape)
     {
-        ntt::tensor<float, ntt::fixed_shape<16, 64, 32>> ta, tc;
-        ntt::tensor<ntt::vector<float, 4>, ntt::fixed_shape<16, 16, 32>> tb;
+        ntt::tensor<float, ntt::fixed_shape<1, 64, 32>> ta, tc;
+        ntt::tensor<ntt::vector<float, 4>, ntt::fixed_shape<1, 16, 32>> tb;
         std::iota(ta.elements().begin(), ta.elements().end(), 0.f);
         ntt::pack<1>(ta, tb.view());
         ntt::unpack<1>(tb, tc.view());
@@ -272,9 +277,9 @@ int main() {
 
     // unpack(fixed_shape + ranked_shape)
     {
-        ntt::tensor<float, ntt::fixed_shape<16, 64, 32>> ta;
-        ntt::tensor<ntt::vector<float, 4>, ntt::fixed_shape<16, 16, 32>> tb;
-        auto shape = ntt::make_ranked_shape(16, 64, 32);
+        ntt::tensor<float, ntt::fixed_shape<1, 64, 32>> ta;
+        ntt::tensor<ntt::vector<float, 4>, ntt::fixed_shape<1, 16, 32>> tb;
+        auto shape = ntt::make_ranked_shape(1, 64, 32);
         ntt::tensor<float, ntt::ranked_shape<3>> tc(shape);
 
         std::iota(ta.elements().begin(), ta.elements().end(), 0.f);
@@ -286,7 +291,6 @@ int main() {
             assert(a == c);
         });
     }
-#endif
 
     // vector unary
     {
@@ -297,8 +301,8 @@ int main() {
 
     // unpack(ranked_shape + fixed_shape)
     {
-        ntt::tensor<float, ntt::fixed_shape<16, 64, 32>> ta, tc;
-        auto shape = ntt::make_ranked_shape(16, 16, 32);
+        ntt::tensor<float, ntt::fixed_shape<1, 64, 32>> ta, tc;
+        auto shape = ntt::make_ranked_shape(1, 16, 32);
         ntt::tensor<ntt::vector<float, 4>, ntt::ranked_shape<3>> tb(shape);
 
         std::iota(ta.elements().begin(), ta.elements().end(), 0.f);
@@ -313,12 +317,12 @@ int main() {
 
     // unpack(ranked_shape + ranked_shape)
     {
-        ntt::tensor<float, ntt::fixed_shape<16, 64, 32>> ta;
+        ntt::tensor<float, ntt::fixed_shape<1, 64, 32>> ta;
 
-        auto shape1 = ntt::make_ranked_shape(16, 16, 32);
+        auto shape1 = ntt::make_ranked_shape(1, 16, 32);
         ntt::tensor<ntt::vector<float, 4>, ntt::ranked_shape<3>> tb(shape1);
 
-        auto shape2 = ntt::make_ranked_shape(16, 64, 32);
+        auto shape2 = ntt::make_ranked_shape(1, 64, 32);
         ntt::tensor<float, ntt::ranked_shape<3>> tc(shape2);
 
         std::iota(ta.elements().begin(), ta.elements().end(), 0.f);
@@ -331,18 +335,52 @@ int main() {
         });
     }
 
-#if 0
-    // fixed unpack with pad
+    // im2col
     {
-        ntt::tensor<float, ntt::fixed_shape<16, 62, 32>> ta;
-        ntt::tensor<ntt::vector<float, 4>, ntt::fixed_shape<16, 16, 32>> tb;
-        ntt::tensor<float, ntt::fixed_shape<16, 62, 32>> tc;
-        std::iota(ta.elements().begin(), ta.elements().end(), 0.f);
-        ntt::pack<1>(ta, tb);
-        ntt::unpack<1>(tb, tc);
-        ntt::apply(tc.shape(), [&](auto index) {
-            NNCASE_UNUSED auto a = ta(index);
-            NNCASE_UNUSED auto c = tc(index);
+        ntt::tensor<float, ntt::fixed_shape<1, 1, 4, 4>> input;
+        std::iota(input.elements().begin(), input.elements().end(), 0.f);
+        ntt::tensor<float, ntt::fixed_shape<9, 16>> output;
+        ntt::im2col(input, ntt::fixed_shape<3, 3>{}, ntt::fixed_shape<1, 1>{},
+                    ntt::fixed_shape<1, 1, 1, 1>{}, ntt::fixed_shape<>{},
+                    ntt::fixed_shape<>{}, output);
+        // clang-format off
+      assert(output(0,0) == 0.f); assert(output(0,1) == 0.f); assert(output(0,2) == 0.f); assert(output(0,3) == 0.f); assert(output(0,4) == 0.f); assert(output(0,5) == 0.f); assert(output(0,6) == 1.f); assert(output(0,7) == 2.f); assert(output(0,8) == 0.f); assert(output(0,9) == 4.f); assert(output(0,10) == 5.f); assert(output(0,11) == 6.f); assert(output(0,12) == 0.f); assert(output(0,13) == 8.f); assert(output(0,14) == 9.f); assert(output(0,15) == 10.f);
+      assert(output(1,0) == 0.f); assert(output(1,1) == 0.f); assert(output(1,2) == 0.f); assert(output(1,3) == 0.f); assert(output(1,4) == 0.f); assert(output(1,5) == 1.f); assert(output(1,6) == 2.f); assert(output(1,7) == 3.f); assert(output(1,8) == 4.f); assert(output(1,9) == 5.f); assert(output(1,10) == 6.f); assert(output(1,11) == 7.f); assert(output(1,12) == 8.f); assert(output(1,13) == 9.f); assert(output(1,14) == 10.f); assert(output(1,15) == 11.f); 
+      assert(output(2,0) == 0.f); assert(output(2,1) == 0.f); assert(output(2,2) == 0.f); assert(output(2,3) == 0.f); assert(output(2,4) == 1.f); assert(output(2,5) == 2.f); assert(output(2,6) == 3.f); assert(output(2,7) == 0.f); assert(output(2,8) == 5.f); assert(output(2,9) == 6.f); assert(output(2,10) == 7.f); assert(output(2,11) == 0.f); assert(output(2,12) == 9.f); assert(output(2,13) == 10.f); assert(output(2,14) == 11.f); assert(output(2,15) == 0.f); 
+      assert(output(3,0) == 0.f); assert(output(3,1) == 0.f); assert(output(3,2) == 1.f); assert(output(3,3) == 2.f); assert(output(3,4) == 0.f); assert(output(3,5) == 4.f); assert(output(3,6) == 5.f); assert(output(3,7) == 6.f); assert(output(3,8) == 0.f); assert(output(3,9) == 8.f); assert(output(3,10) == 9.f); assert(output(3,11) == 10.f); assert(output(3,12) == 0.f); assert(output(3,13) == 12.f); assert(output(3,14) == 13.f); assert(output(3,15) == 14.f); 
+      assert(output(4,0) == 0.f); assert(output(4,1) == 1.f); assert(output(4,2) == 2.f); assert(output(4,3) == 3.f); assert(output(4,4) == 4.f); assert(output(4,5) == 5.f); assert(output(4,6) == 6.f); assert(output(4,7) == 7.f); assert(output(4,8) == 8.f); assert(output(4,9) == 9.f); assert(output(4,10) == 10.f); assert(output(4,11) == 11.f); assert(output(4,12) == 12.f); assert(output(4,13) == 13.f); assert(output(4,14) == 14.f); assert(output(4,15) == 15.f); 
+      assert(output(5,0) == 1.f); assert(output(5,1) == 2.f); assert(output(5,2) == 3.f); assert(output(5,3) == 0.f); assert(output(5,4) == 5.f); assert(output(5,5) == 6.f); assert(output(5,6) == 7.f); assert(output(5,7) == 0.f); assert(output(5,8) == 9.f); assert(output(5,9) == 10.f); assert(output(5,10) == 11.f); assert(output(5,11) == 0.f); assert(output(5,12) == 13.f); assert(output(5,13) == 14.f); assert(output(5,14) == 15.f); assert(output(5,15) == 0.f); 
+      assert(output(6,0) == 0.f); assert(output(6,1) == 4.f); assert(output(6,2) == 5.f); assert(output(6,3) == 6.f); assert(output(6,4) == 0.f); assert(output(6,5) == 8.f); assert(output(6,6) == 9.f); assert(output(6,7) == 10.f); assert(output(6,8) == 0.f); assert(output(6,9) == 12.f); assert(output(6,10) == 13.f); assert(output(6,11) == 14.f); assert(output(6,12) == 0.f); assert(output(6,13) == 0.f); assert(output(6,14) == 0.f); assert(output(6,15) == 0.f); 
+      assert(output(7,0) == 4.f); assert(output(7,1) == 5.f); assert(output(7,2) == 6.f); assert(output(7,3) == 7.f); assert(output(7,4) == 8.f); assert(output(7,5) == 9.f); assert(output(7,6) == 10.f); assert(output(7,7) == 11.f); assert(output(7,8) == 12.f); assert(output(7,9) == 13.f); assert(output(7,10) == 14.f); assert(output(7,11) == 15.f); assert(output(7,12) == 0.f); assert(output(7,13) == 0.f); assert(output(7,14) == 0.f); assert(output(7,15) == 0.f); 
+      assert(output(8,0) == 5.f); assert(output(8,1) == 6.f); assert(output(8,2) == 7.f); assert(output(8,3) == 0.f); assert(output(8,4) == 9.f); assert(output(8,5) == 10.f); assert(output(8,6) == 11.f); assert(output(8,7) == 0.f); assert(output(8,8) == 13.f); assert(output(8,9) == 14.f); assert(output(8,10) == 15.f); assert(output(8,11) == 0.f); assert(output(8,12) == 0.f); assert(output(8,13) == 0.f); assert(output(8,14) == 0.f); assert(output(8,15) == 0.f);
+        // clang-format on
+    }
+
+    // im2col packed on ic
+    {
+        ntt::tensor<float, ntt::fixed_shape<1, 4, 4, 4>> input;
+        std::iota(input.elements().begin(), input.elements().end(), 0.f);
+        ntt::tensor<ntt::vector<float, 4>, ntt::fixed_shape<1, 1, 4, 4>>
+            packed_input;
+        ntt::pack<1>(input, packed_input);
+        ntt::tensor<ntt::vector<float, 4>, ntt::fixed_shape<9, 16>>
+            packed_output;
+        ntt::im2col(packed_input, ntt::fixed_shape<3, 3>{},
+                    ntt::fixed_shape<1, 1>{}, ntt::fixed_shape<1, 1, 1, 1>{},
+                    ntt::fixed_shape<1>{}, ntt::fixed_shape<0>{},
+                    packed_output);
+        ntt::tensor<float, ntt::fixed_shape<36, 16>> unpacked_output;
+        // packed [n,c/4,h,w,4] => [c/4 * h * w, b * oh * ow]
+        // so unpack should after reshape
+        ntt::unpack<0>(packed_output.reshape(ntt::fixed_shape<1, 9, 16>{}),
+                       unpacked_output.reshape(ntt::fixed_shape<4, 9, 16>{}));
+        ntt::tensor<float, ntt::fixed_shape<36, 16>> output;
+        ntt::im2col(input, ntt::fixed_shape<3, 3>{}, ntt::fixed_shape<1, 1>{},
+                    ntt::fixed_shape<1, 1, 1, 1>{}, ntt::fixed_shape<>{},
+                    ntt::fixed_shape<>{}, output);
+        ntt::apply(output.shape(), [&](auto index) {
+            NNCASE_UNUSED auto a = output(index);
+            NNCASE_UNUSED auto c = unpacked_output(index);
             assert(a == c);
         });
     }
@@ -653,7 +691,7 @@ int main() {
         ntt::tensor<ntt::vector<float, 8>, ntt::fixed_shape<2, 2>> pb;
         ntt::pack<1>(ta, pa);
         ntt::pack<0>(tb, pb);
-        ntt::packed_matmul(pa, pb, tc, ntt::fixed_shape<1>{},
+        ntt::matmul<false>(pa, pb, tc, ntt::fixed_shape<1>{},
                            ntt::fixed_shape<0>{}, ntt::fixed_shape<0>{},
                            ntt::fixed_shape<0>{});
         assert(tc(0, 0) == 2480.f);
@@ -662,6 +700,182 @@ int main() {
         assert(tc(1, 1) == 6696.f);
         assert(tc(2, 0) == 10160.f);
         assert(tc(2, 1) == 10792.f);
+    }
+
+    // packed matmul 1d on m
+    {
+        ntt::tensor<float, ntt::fixed_shape<4, 8>> ta;
+        ntt::tensor<float, ntt::fixed_shape<8, 2>> tb;
+        std::iota(ta.elements().begin(), ta.elements().end(), 0.f);
+        std::iota(tb.elements().begin(), tb.elements().end(), 0.f);
+        ntt::tensor<ntt::vector<float, 4>, ntt::fixed_shape<1, 8>> pa;
+        ntt::tensor<ntt::vector<float, 4>, ntt::fixed_shape<1, 2>> pc;
+        ntt::pack<0>(ta, pa);
+        ntt::matmul<false>(pa, tb, pc, ntt::fixed_shape<0>{},
+                           ntt::fixed_shape<0>{}, ntt::fixed_shape<>{},
+                           ntt::fixed_shape<0>{});
+        assert(are_floats_equal(pc(0, 0)(0), 280.f));
+        assert(are_floats_equal(pc(0, 1)(0), 308.f));
+        assert(are_floats_equal(pc(0, 0)(1), 728.f));
+        assert(are_floats_equal(pc(0, 1)(1), 820.f));
+        assert(are_floats_equal(pc(0, 0)(2), 1176.f));
+        assert(are_floats_equal(pc(0, 1)(2), 1332.f));
+        assert(are_floats_equal(pc(0, 0)(3), 1624.f));
+        assert(are_floats_equal(pc(0, 1)(3), 1844.f));
+    }
+
+    // packed matmul 1d on n
+    {
+        ntt::tensor<float, ntt::fixed_shape<3, 8>> ta;
+        ntt::tensor<float, ntt::fixed_shape<8, 4>> tb;
+        std::iota(ta.elements().begin(), ta.elements().end(), 0.f);
+        std::iota(tb.elements().begin(), tb.elements().end(), 0.f);
+        ntt::tensor<ntt::vector<float, 4>, ntt::fixed_shape<8, 1>> pb;
+        ntt::tensor<ntt::vector<float, 4>, ntt::fixed_shape<3, 1>> pc;
+        ntt::pack<1>(tb, pb);
+        ntt::matmul<false>(ta, pb, pc, ntt::fixed_shape<>{},
+                           ntt::fixed_shape<0>{}, ntt::fixed_shape<1>{},
+                           ntt::fixed_shape<0>{});
+        assert(are_floats_equal(pc(0, 0)(0), 560.f));
+        assert(are_floats_equal(pc(0, 0)(1), 588.f));
+        assert(are_floats_equal(pc(0, 0)(2), 616.f));
+        assert(are_floats_equal(pc(0, 0)(3), 644.f));
+        assert(are_floats_equal(pc(1, 0)(0), 1456.f));
+        assert(are_floats_equal(pc(1, 0)(1), 1548.f));
+        assert(are_floats_equal(pc(1, 0)(2), 1640.f));
+        assert(are_floats_equal(pc(1, 0)(3), 1732.f));
+        assert(are_floats_equal(pc(2, 0)(0), 2352.f));
+        assert(are_floats_equal(pc(2, 0)(1), 2508.f));
+        assert(are_floats_equal(pc(2, 0)(2), 2664.f));
+        assert(are_floats_equal(pc(2, 0)(3), 2820.f));
+    }
+
+    // packed matmul 1d on m(A) and n(B)
+    {
+        ntt::tensor<float, ntt::fixed_shape<4, 8>> ta;
+        ntt::tensor<float, ntt::fixed_shape<8, 4>> tb;
+        std::iota(ta.elements().begin(), ta.elements().end(), 0.f);
+        std::iota(tb.elements().begin(), tb.elements().end(), 0.f);
+        ntt::tensor<ntt::vector<float, 4>, ntt::fixed_shape<1, 8>> pa;
+        ntt::tensor<ntt::vector<float, 4>, ntt::fixed_shape<8, 1>> pb;
+        ntt::tensor<ntt::vector<float, 4, 4>, ntt::fixed_shape<1, 1>> pc;
+        ntt::pack<0>(ta, pa);
+        ntt::pack<1>(tb, pb);
+        ntt::matmul<false>(pa, pb, pc, ntt::fixed_shape<0>{},
+                           ntt::fixed_shape<0>{}, ntt::fixed_shape<1>{},
+                           ntt::fixed_shape<0>{});
+        assert(are_floats_equal(pc(0, 0)(0, 0), 560.f));
+        assert(are_floats_equal(pc(0, 0)(0, 1), 588.f));
+        assert(are_floats_equal(pc(0, 0)(0, 2), 616.f));
+        assert(are_floats_equal(pc(0, 0)(0, 3), 644.f));
+        assert(are_floats_equal(pc(0, 0)(1, 0), 1456.f));
+        assert(are_floats_equal(pc(0, 0)(1, 1), 1548.f));
+        assert(are_floats_equal(pc(0, 0)(1, 2), 1640.f));
+        assert(are_floats_equal(pc(0, 0)(1, 3), 1732.f));
+        assert(are_floats_equal(pc(0, 0)(2, 0), 2352.f));
+        assert(are_floats_equal(pc(0, 0)(2, 1), 2508.f));
+        assert(are_floats_equal(pc(0, 0)(2, 2), 2664.f));
+        assert(are_floats_equal(pc(0, 0)(2, 3), 2820.f));
+        assert(are_floats_equal(pc(0, 0)(3, 0), 3248.f));
+        assert(are_floats_equal(pc(0, 0)(3, 1), 3468.f));
+        assert(are_floats_equal(pc(0, 0)(3, 2), 3688.f));
+        assert(are_floats_equal(pc(0, 0)(3, 3), 3908.f));
+    }
+
+    // packed matmul 2d on mk(A) and k(B)
+    {
+        ntt::tensor<float, ntt::fixed_shape<4, 8>> ta;
+        ntt::tensor<float, ntt::fixed_shape<8, 4>> tb;
+        std::iota(ta.elements().begin(), ta.elements().end(), 0.f);
+        std::iota(tb.elements().begin(), tb.elements().end(), 0.f);
+        ntt::tensor<ntt::vector<float, 4, 4>, ntt::fixed_shape<1, 2>> pa;
+        ntt::tensor<ntt::vector<float, 4>, ntt::fixed_shape<2, 4>> pb;
+        ntt::tensor<ntt::vector<float, 4>, ntt::fixed_shape<1, 4>> pc;
+        ntt::pack<0, 1>(ta, pa);
+        ntt::pack<0>(tb, pb);
+        ntt::matmul<false>(pa, pb, pc, ntt::fixed_shape<0, 1>{},
+                           ntt::fixed_shape<0>{}, ntt::fixed_shape<0>{},
+                           ntt::fixed_shape<0>{});
+        assert(are_floats_equal(pc(0, 0)(0), 560.f));
+        assert(are_floats_equal(pc(0, 1)(0), 588.f));
+        assert(are_floats_equal(pc(0, 2)(0), 616.f));
+        assert(are_floats_equal(pc(0, 3)(0), 644.f));
+        assert(are_floats_equal(pc(0, 0)(1), 1456.f));
+        assert(are_floats_equal(pc(0, 1)(1), 1548.f));
+        assert(are_floats_equal(pc(0, 2)(1), 1640.f));
+        assert(are_floats_equal(pc(0, 3)(1), 1732.f));
+        assert(are_floats_equal(pc(0, 0)(2), 2352.f));
+        assert(are_floats_equal(pc(0, 1)(2), 2508.f));
+        assert(are_floats_equal(pc(0, 2)(2), 2664.f));
+        assert(are_floats_equal(pc(0, 3)(2), 2820.f));
+        assert(are_floats_equal(pc(0, 0)(3), 3248.f));
+        assert(are_floats_equal(pc(0, 1)(3), 3468.f));
+        assert(are_floats_equal(pc(0, 2)(3), 3688.f));
+        assert(are_floats_equal(pc(0, 3)(3), 3908.f));
+    }
+
+    // packed matmul 2d on k(A) and kn(B)
+    {
+        ntt::tensor<float, ntt::fixed_shape<4, 8>> ta;
+        ntt::tensor<float, ntt::fixed_shape<8, 4>> tb;
+        std::iota(ta.elements().begin(), ta.elements().end(), 0.f);
+        std::iota(tb.elements().begin(), tb.elements().end(), 0.f);
+        ntt::tensor<ntt::vector<float, 4>, ntt::fixed_shape<4, 2>> pa;
+        ntt::tensor<ntt::vector<float, 4, 4>, ntt::fixed_shape<2, 1>> pb;
+        ntt::tensor<ntt::vector<float, 4>, ntt::fixed_shape<4, 1>> pc;
+        ntt::pack<1>(ta, pa);
+        ntt::pack<0, 1>(tb, pb);
+        ntt::matmul<false>(pa, pb, pc, ntt::fixed_shape<1>{},
+                           ntt::fixed_shape<0>{}, ntt::fixed_shape<0, 1>{},
+                           ntt::fixed_shape<0>{});
+        assert(are_floats_equal(pc(0, 0)(0), 560.f));
+        assert(are_floats_equal(pc(0, 0)(1), 588.f));
+        assert(are_floats_equal(pc(0, 0)(2), 616.f));
+        assert(are_floats_equal(pc(0, 0)(3), 644.f));
+        assert(are_floats_equal(pc(1, 0)(0), 1456.f));
+        assert(are_floats_equal(pc(1, 0)(1), 1548.f));
+        assert(are_floats_equal(pc(1, 0)(2), 1640.f));
+        assert(are_floats_equal(pc(1, 0)(3), 1732.f));
+        assert(are_floats_equal(pc(2, 0)(0), 2352.f));
+        assert(are_floats_equal(pc(2, 0)(1), 2508.f));
+        assert(are_floats_equal(pc(2, 0)(2), 2664.f));
+        assert(are_floats_equal(pc(2, 0)(3), 2820.f));
+        assert(are_floats_equal(pc(3, 0)(0), 3248.f));
+        assert(are_floats_equal(pc(3, 0)(1), 3468.f));
+        assert(are_floats_equal(pc(3, 0)(2), 3688.f));
+        assert(are_floats_equal(pc(3, 0)(3), 3908.f));
+    }
+
+    // packed matmul 2d on mk(A) and kn(B)
+    {
+        ntt::tensor<float, ntt::fixed_shape<4, 8>> ta;
+        ntt::tensor<float, ntt::fixed_shape<8, 4>> tb;
+        std::iota(ta.elements().begin(), ta.elements().end(), 0.f);
+        std::iota(tb.elements().begin(), tb.elements().end(), 0.f);
+        ntt::tensor<ntt::vector<float, 4, 4>, ntt::fixed_shape<1, 2>> pa;
+        ntt::tensor<ntt::vector<float, 4, 4>, ntt::fixed_shape<2, 1>> pb;
+        ntt::tensor<ntt::vector<float, 4, 4>, ntt::fixed_shape<1, 1>> pc;
+        ntt::pack<0, 1>(ta, pa);
+        ntt::pack<0, 1>(tb, pb);
+        ntt::matmul<false>(pa, pb, pc, ntt::fixed_shape<0, 1>{},
+                           ntt::fixed_shape<0>{}, ntt::fixed_shape<0, 1>{},
+                           ntt::fixed_shape<0>{});
+        assert(are_floats_equal(pc(0, 0)(0, 0), 560.f));
+        assert(are_floats_equal(pc(0, 0)(0, 1), 588.f));
+        assert(are_floats_equal(pc(0, 0)(0, 2), 616.f));
+        assert(are_floats_equal(pc(0, 0)(0, 3), 644.f));
+        assert(are_floats_equal(pc(0, 0)(1, 0), 1456.f));
+        assert(are_floats_equal(pc(0, 0)(1, 1), 1548.f));
+        assert(are_floats_equal(pc(0, 0)(1, 2), 1640.f));
+        assert(are_floats_equal(pc(0, 0)(1, 3), 1732.f));
+        assert(are_floats_equal(pc(0, 0)(2, 0), 2352.f));
+        assert(are_floats_equal(pc(0, 0)(2, 1), 2508.f));
+        assert(are_floats_equal(pc(0, 0)(2, 2), 2664.f));
+        assert(are_floats_equal(pc(0, 0)(2, 3), 2820.f));
+        assert(are_floats_equal(pc(0, 0)(3, 0), 3248.f));
+        assert(are_floats_equal(pc(0, 0)(3, 1), 3468.f));
+        assert(are_floats_equal(pc(0, 0)(3, 2), 3688.f));
+        assert(are_floats_equal(pc(0, 0)(3, 3), 3908.f));
     }
 
     // packed matmul 1d on k with broadcast
@@ -675,7 +889,7 @@ int main() {
         ntt::tensor<ntt::vector<float, 8>, ntt::fixed_shape<2, 2, 4>> pb;
         ntt::pack<3>(ta, pa);
         ntt::pack<1>(tb, pb);
-        ntt::packed_matmul(pa, pb, tc, ntt::fixed_shape<3>{},
+        ntt::matmul<false>(pa, pb, tc, ntt::fixed_shape<3>{},
                            ntt::fixed_shape<0>{}, ntt::fixed_shape<1>{},
                            ntt::fixed_shape<0>{});
         assert(tc(0, 0, 0, 0) == 4960.f);
@@ -695,7 +909,7 @@ int main() {
         ntt::tensor<float, ntt::fixed_shape<3, 2>> tc;
         std::iota(ta.elements().begin(), ta.elements().end(), 0.f);
         std::iota(tb.elements().begin(), tb.elements().end(), 0.f);
-        ntt::matmul(ta, tb, tc);
+        ntt::matmul<false>(ta, tb, tc);
         assert(tc(0, 0) == 28.f);
         assert(tc(0, 1) == 34.f);
         assert(tc(1, 0) == 76.f);
@@ -707,7 +921,7 @@ int main() {
         std::iota(te.elements().begin(), te.elements().end(), 0.f);
         std::iota(tf.elements().begin(), tf.elements().end(), 0.f);
         ntt::tensor<float, ntt::fixed_shape<1, 2, 3, 5>> tg;
-        ntt::matmul(te, tf, tg);
+        ntt::matmul<false>(te, tf, tg);
         assert(tg(0, 0, 0, 0) == 70.f);
         assert(tg(0, 0, 1, 0) == 190.f);
         assert(tg(0, 0, 2, 0) == 310.f);
@@ -826,6 +1040,21 @@ int main() {
         ntt::unary<ntt::ops::swish>(pa, pb);
     }
 
+    // swishb
+    {
+        ntt::tensor<float, ntt::fixed_shape<3, 24>> ta;
+        ntt::tensor<float, ntt::fixed_shape<1>> tb;
+        ntt::tensor<float, ntt::fixed_shape<3, 24>> tc;
+        std::iota(ta.elements().begin(), ta.elements().end(), 0.f);
+        std::iota(tb.elements().begin(), tb.elements().end(), 1.f);
+        ntt::binary<ntt::ops::swishb>(ta, tb, tc);
+
+        ntt::tensor<ntt::vector<float, 8>, ntt::fixed_shape<3, 3>> pa;
+        ntt::pack<1>(ta, pa);
+        ntt::tensor<ntt::vector<float, 8>, ntt::fixed_shape<3, 3>> pc;
+        ntt::binary<ntt::ops::swishb>(pa, tb, pc);
+    }
+
     // gather
     {
         ntt::tensor<float, ntt::fixed_shape<6, 3>> ta;
@@ -870,6 +1099,110 @@ int main() {
         assert(te(3, 0, 1) == 1.3f);
     }
 
+    {
+        ntt::tensor<float, ntt::fixed_shape<2, 8>> ta;
+        ntt::tensor<ntt::vector<float, 4>, ntt::fixed_shape<2, 2>> tav;
+        std::fill(ta.elements().begin(), ta.elements().begin() + 8, 1.f);
+        std::fill(ta.elements().begin() + 8, ta.elements().end(), 3.2f);
+        ntt::pack<1>(ta, tav.view());
+
+        ntt::tensor<float, ntt::fixed_shape<2, 1>> tb;
+        ntt::reduce<ntt::ops::add>(tav, tb, ntt::fixed_shape<1>{},
+                                   ntt::fixed_shape<1>{}, ntt::fixed_shape<>{});
+        assert(are_floats_equal(tb(0, 0), 8.f));
+        assert(are_floats_equal(tb(1, 0), 25.6f));
+    }
+
+    {
+        ntt::tensor<float, ntt::fixed_shape<1, 16>> ta;
+        ntt::tensor<int32_t, ntt::fixed_shape<1, 16>> tb;
+        std::iota(ta.elements().begin(), ta.elements().end(), 0.f);
+        ntt::cast(ta, tb.view());
+        assert(tb(0, 0) == 0);
+        assert(tb(0, 2) == 2);
+    }
+
+    {
+        ntt::tensor<float, ntt::fixed_shape<1, 64, 32>> ta;
+        ntt::tensor<ntt::vector<float, 4>, ntt::fixed_shape<1, 16, 32>> tb;
+        std::iota(ta.elements().begin(), ta.elements().end(), 0.f);
+        ntt::pack<1>(ta, tb.view());
+        ntt::tensor<ntt::vector<int32_t, 4>, ntt::fixed_shape<1, 16, 32>> tc;
+        ntt::cast(tb, tc);
+        assert(tc(0, 0, 0)(0) == 0);
+        assert(tc(0, 0, 0)(1) == 32);
+        assert(tc(0, 0, 0)(2) == 64);
+    }
+
+    {
+        ntt::tensor<float, ntt::fixed_shape<1, 2>> ta;
+        ntt::tensor<float, ntt::fixed_shape<2, 2>> tb;
+        std::iota(ta.elements().begin(), ta.elements().end(), 0.f);
+        ntt::expand(ta, tb.view());
+        assert(are_floats_equal(tb(0, 0), 0.f));
+        assert(are_floats_equal(tb(0, 1), 1.f));
+        assert(are_floats_equal(tb(1, 0), 0.f));
+        assert(are_floats_equal(tb(1, 1), 1.f));
+    }
+
+    {
+        ntt::tensor<bool, ntt::fixed_shape<2, 2>> tcond;
+        ntt::tensor<float, ntt::fixed_shape<2, 2>> tx;
+        ntt::tensor<float, ntt::fixed_shape<2, 2>> ty;
+        ntt::tensor<float, ntt::fixed_shape<2, 2>> tout;
+        tcond(0, 0) = true;
+        tcond(0, 1) = false;
+        tcond(1, 0) = false;
+        tcond(1, 1) = true;
+        std::iota(tx.elements().begin(), tx.elements().end(), 0.f);
+        std::iota(ty.elements().begin(), ty.elements().end(), 4.f);
+        ntt::where(tcond, tx, ty, tout.view());
+        assert(are_floats_equal(tout(0, 0), 0.f));
+        assert(are_floats_equal(tout(0, 1), 5.f));
+        assert(are_floats_equal(tout(1, 0), 6.f));
+        assert(are_floats_equal(tout(1, 1), 3.f));
+    }
+
+    {
+        ntt::tensor<float, ntt::fixed_shape<2, 4>> ta;
+        ta(0, 0) = 0.f;
+        ta(0, 1) = 2.f;
+        ta(0, 2) = 4.f;
+        ta(0, 3) = 6.f;
+        ta(1, 0) = 7.f;
+        ta(1, 1) = 5.f;
+        ta(1, 2) = 3.f;
+        ta(1, 3) = 7.f;
+
+        ntt::tensor<int64_t, ntt::fixed_shape<2, 1>> tb;
+        ntt::reduce_arg<ntt::ops::max, 1, false, true>(
+            ta, tb.view(), ntt::fixed_shape<>(), ntt::fixed_shape<>());
+        assert(tb(0, 0) == 3);
+        assert(tb(1, 0) == 0);
+
+        ntt::tensor<int64_t, ntt::fixed_shape<1, 4>> tc;
+        ntt::reduce_arg<ntt::ops::max, 0, false, true>(
+            ta, tc.view(), ntt::fixed_shape<>(), ntt::fixed_shape<>());
+        assert(tc(0, 0) == 1);
+        assert(tc(0, 1) == 1);
+        assert(tc(0, 2) == 0);
+        assert(tc(0, 3) == 1);
+
+        ntt::tensor<int64_t, ntt::fixed_shape<2>> td;
+        ntt::reduce_arg<ntt::ops::max, 1, true, false>(
+            ta, td.view(), ntt::fixed_shape<>(), ntt::fixed_shape<>());
+        assert(td(0) == 3);
+        assert(td(1) == 3);
+    }
+
+    {
+        ntt::tensor<float, ntt::fixed_shape<1, 16>> ta, tb, tc;
+        std::fill(ta.elements().begin(), ta.elements().end(), 1.f);
+        ntt::unary<ntt::ops::erf>(ta, tb.view());
+        assert(are_floats_equal(tb(0, 0), erf(1.f)));
+    }
+
+#if 0
     auto kmodel = read_file(
         R"(/mnt/home-nas/work/repo/nncase/tests_output/UnitTestCPUTarget/TestSimpleUnary/TestSimpleUnary.kmodel)");
 

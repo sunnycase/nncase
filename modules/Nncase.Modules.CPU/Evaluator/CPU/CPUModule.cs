@@ -14,7 +14,6 @@ internal class CPUModule : IApplicationPart
     public void ConfigureServices(IRegistrator registrator)
     {
         registrator.RegisterManyInterface<BoxingEvaluator>(reuse: Reuse.Singleton);
-        registrator.RegisterManyInterface<CPUKernelOpEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<LoadEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<StoreEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<PackEvaluator>(reuse: Reuse.Singleton);
@@ -24,5 +23,8 @@ internal class CPUModule : IApplicationPart
         registrator.RegisterManyInterface<PackedBinaryEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<PackedTransposeEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<UnpackEvaluator>(reuse: Reuse.Singleton);
+        registrator.RegisterManyInterface<Im2colEvaluator>(reuse: Reuse.Singleton);
+        registrator.RegisterManyInterface<InstanceNormEvaluator>(reuse: Reuse.Singleton);
+        registrator.RegisterManyInterface<ResizeImageEvaluator>(reuse: Reuse.Singleton);
     }
 }

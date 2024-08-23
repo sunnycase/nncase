@@ -39,7 +39,14 @@ public sealed class FusionMerger : ExprCloner<Unit>
     {
         if (_multiVarMap.TryGetValue(expr, out var newVar))
         {
-            return newVar;
+            if (expr.CheckedType is DistributedType d)
+            {
+                return IR.F.CPU.Boxing(newVar, d);
+            }
+            else
+            {
+                return newVar;
+            }
         }
 
         return base.VisitCall(expr, context);
@@ -49,21 +56,20 @@ public sealed class FusionMerger : ExprCloner<Unit>
     {
         var target = Clone(expr.Target, context);
         var arguments = CloneArray(expr.Arguments, context);
-        if (target is Binary || target is Where)
-        {
-            arguments = arguments.Select(e => e switch { TensorConst { Value: Tensor { Shape.IsScalar: true } } tc => Const.FromTensor(Tensor.FromBytes(tc.CheckedDataType, tc.Value.BytesBuffer.ToArray(), new[] { 1 })), _ => e }).ToArray();
-        }
 
-        if (target is Conv2D conv)
-        {
-            var bias = (TensorConst)arguments[2];
-            var fusedClamp = ((TensorConst)arguments[7]).Value.ToArray<float>();
-            var newConv = IR.F.NN.Conv2D(arguments[0], arguments[1], Tensor.Zeros<float>(bias.CheckedShape), arguments[3], arguments[4], arguments[5], conv.PadMode, arguments[6], new[] { float.NegativeInfinity, float.PositiveInfinity });
-            var newBias = IR.F.Math.Add(newConv, Tensor.FromBytes(bias.CheckedDataType, bias.Value.BytesBuffer.ToArray(), new[] { bias.CheckedShape[0].FixedValue, 1, 1 }));
-            var newClamp = IR.F.Math.Clamp(newBias, fusedClamp[0], fusedClamp[1]);
-            return newClamp;
-        }
-
+        // if (target is Binary || target is Where)
+        // {
+        //     arguments = arguments.Select(e => e switch { TensorConst { Value: Tensor { Shape.IsScalar: true } } tc => Const.FromTensor(Tensor.FromBytes(tc.CheckedDataType, tc.Value.BytesBuffer.ToArray(), new[] { 1 })), _ => e }).ToArray();
+        // }
+        // if (target is Conv2D conv)
+        // {
+        //     var bias = (TensorConst)arguments[2];
+        //     var fusedClamp = ((TensorConst)arguments[7]).Value.ToArray<float>();
+        //     var newConv = IR.F.NN.Conv2D(arguments[0], arguments[1], Tensor.Zeros<float>(bias.CheckedShape), arguments[3], arguments[4], arguments[5], conv.PadMode, arguments[6], new[] { float.NegativeInfinity, float.PositiveInfinity });
+        //     var newBias = IR.F.Math.Add(newConv, Tensor.FromBytes(bias.CheckedDataType, bias.Value.BytesBuffer.ToArray(), new[] { bias.CheckedShape[0].FixedValue, 1, 1 }));
+        //     var newClamp = IR.F.Math.Clamp(newBias, fusedClamp[0], fusedClamp[1]);
+        //     return newClamp;
+        // }
         return expr.With(target: target, arguments: arguments);
     }
 

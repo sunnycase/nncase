@@ -13,7 +13,6 @@ using Nncase.PatternMatch;
 using Nncase.Targets;
 using static Nncase.IR.F.CPU;
 using static Nncase.IR.TypePatternUtility;
-using static Nncase.PatternMatch.F.Math;
 using static Nncase.PatternMatch.Utility;
 
 namespace Nncase.Passes.Rules.CPU.Affine;
@@ -21,18 +20,33 @@ namespace Nncase.Passes.Rules.CPU.Affine;
 [RuleGenerator]
 public partial class LowerUnary : RewriteRule<Pattern>
 {
+    public LowerUnary(string moduleKind = CPUTarget.Kind)
+    {
+        ModuleKind = moduleKind;
+    }
+
+    public string ModuleKind { get; }
+
     /// <inheritdoc/>
-    public override Pattern Pattern { get; } = IsUnary(
-      target_name: "unary",
+    public override Pattern Pattern { get; } = PatternMatch.F.Math.IsUnary(
+      "unary",
+      "call",
       _ => true,
-      IsWildcard("input") with { TypePattern = HasFixedShape() });
+      IsWildcard("input") with { TypePattern = HasShape(s => s.Rank > 0 && s.IsFixed, "tileable") });
 
     private Expr GetReplace(Unary unary, Expr input)
     {
+        var outBuffer = input.CheckedType switch
+        {
+            TensorType t => IR.F.Buffer.Uninitialized(t.DType, TIR.MemoryLocation.Data, t.Shape.ToValueArray()),
+            DistributedType dt => IR.F.Buffer.Uninitialized(dt.TensorType.DType, TIR.MemoryLocation.Data, dt.TensorType.Shape.ToValueArray(), dt.NdSBP, dt.Placement),
+            _ => throw new ArgumentOutOfRangeException(nameof(input)),
+        };
+
         var rank = input.CheckedShape.Rank;
-        return IR.F.Affine.Grid(CPUTarget.Kind)
+        return IR.F.Affine.Grid(ModuleKind)
             .Read(input, AffineMap.Identity(rank), out var inTile)
-            .Write(TIR.T.CreateBuffer(input.CheckedTensorType, TIR.MemoryLocation.Data, out _), AffineMap.Identity(rank), out var outTile)
+            .Write(outBuffer, AffineMap.Identity(rank), out var outTile)
             .Body(TIR.F.CPU.Unary(unary.UnaryOp, inTile, outTile))
             .Build();
     }

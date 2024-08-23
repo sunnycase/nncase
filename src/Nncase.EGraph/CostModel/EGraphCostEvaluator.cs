@@ -12,19 +12,44 @@ using Nncase.Passes;
 
 namespace Nncase.CostModel;
 
+internal sealed record CostMemoKeyPartial(Op Op, IRType ReTurnType, IRArray<IRType> Types)
+{
+}
+
+internal sealed record CostMemoKey(ENode Node, CostMemoKeyPartial KeyPart)
+{
+    public bool Equals(CostMemoKey? other)
+    {
+        if (other == null)
+        {
+            return false;
+        }
+
+        return ReferenceEquals(Node, other.Node) && KeyPart == other.KeyPart;
+    }
+
+    public override int GetHashCode()
+    {
+        return HashCode.Combine(ReferenceEqualityComparer.Instance.GetHashCode(Node), KeyPart.GetHashCode());
+    }
+}
+
 internal sealed class EGraphCostEvaluator
 {
     private readonly EClass _root;
+    private readonly CompileOptions _compileOptions;
     private readonly Dictionary<ENode, Cost> _costs = new(ReferenceEqualityComparer.Instance);
     private readonly Dictionary<EClass, Cost> _eclassCosts = new();
     private readonly HashSet<EClass> _allEclasses = new();
     private readonly IBaseFuncCostEvaluator? _baseFuncCostEvaluator;
+    private readonly Dictionary<CostMemoKey, Cost> _opCosts = new(ReferenceEqualityComparer.Instance);
     private readonly bool _accumulate;
     private bool _changed;
 
-    public EGraphCostEvaluator(EClass root, IBaseFuncCostEvaluator? basefunc_cost_evaluator, bool accumulate = true)
+    public EGraphCostEvaluator(EClass root, CompileOptions compileOptions, IBaseFuncCostEvaluator? basefunc_cost_evaluator, bool accumulate = true)
     {
         _root = root;
+        _compileOptions = compileOptions;
         _accumulate = accumulate;
         _baseFuncCostEvaluator = basefunc_cost_evaluator;
         PopulateAllEclasses(_root);
@@ -160,11 +185,16 @@ internal sealed class EGraphCostEvaluator
             Cost? cost = null;
             foreach (var targetEnode in enode.Children[0].Nodes)
             {
-                Cost? newCost;
+                Cost? newCost = null;
                 if (targetEnode.Expr is Op op)
                 {
-                    var context = new EGraphOpCostEvaluateContext(returnType, enode.Children.Skip(1).Select(x => x.CheckedType).ToArray(), enode.Children.Skip(1).ToArray());
-                    newCost = CompilerServices.EvaluateOpCost(op, context);
+                    var key = new CostMemoKey(targetEnode, new CostMemoKeyPartial(op, returnType, enode.Children.Skip(1).Select(x => x.CheckedType).ToArray()));
+                    if (!_opCosts.TryGetValue(key, out newCost))
+                    {
+                        var context = new EGraphOpCostEvaluateContext(returnType, enode.Children.Skip(1).Select(x => x.CheckedType).ToArray(), enode.Children.Skip(1).ToArray(), _compileOptions);
+                        newCost = CompilerServices.EvaluateOpCost(op, context);
+                        _opCosts.Add(key, newCost);
+                    }
                 }
                 else
                 {
@@ -285,12 +315,15 @@ internal sealed class EGraphOpCostEvaluateContext : ICostEvaluateContext
     private readonly IRType?[] _argumentTypes;
     private readonly EClass[] _arguments;
 
-    public EGraphOpCostEvaluateContext(IRType? returnType, IRType?[] argumentTypes, EClass[] arguments)
+    public EGraphOpCostEvaluateContext(IRType? returnType, IRType?[] argumentTypes, EClass[] arguments, CompileOptions compileOptions)
     {
         _returnType = returnType;
         _argumentTypes = argumentTypes;
         _arguments = arguments;
+        CompileOptions = compileOptions;
     }
+
+    public CompileOptions CompileOptions { get; }
 
     public T GetArgument<T>(Op op, ParameterInfo parameter)
       where T : BaseFunction
