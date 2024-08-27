@@ -100,7 +100,7 @@ jobs:
           CONAN_PASSWORD: ${{secrets.CONAN_SUNNYCASE_PASSWORD}}
         shell: bash
         run: |
-          conan login -p $CONAN_PASSWORD sunnycase sunnycase
+          conan remote login -p $CONAN_PASSWORD sunnycase sunnycase
           conan upload "*" -r sunnycase -c
 
   build-manylinux-native-runtime:
@@ -115,7 +115,7 @@ jobs:
       - uses: actions/checkout@v3
 
       - name: Build in docker (Linux)
-        uses: docker://sunnycase/manylinux2014_x86_64
+        uses: docker://sunnycase/manylinux_2_28_x86_64:1.0
         with:
             args: /bin/bash tools/build-runtime.sh ${{secrets.CONAN_SUNNYCASE_PASSWORD}}
         if: runner.os == 'Linux'
