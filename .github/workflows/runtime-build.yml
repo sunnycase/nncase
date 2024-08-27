@@ -46,7 +46,7 @@ jobs:
           CONAN_PASSWORD: ${{secrets.CONAN_SUNNYCASE_PASSWORD}}
         shell: bash
         run: |
-          conan login -p $CONAN_PASSWORD sunnycase sunnycase
+          conan remote login -p $CONAN_PASSWORD sunnycase sunnycase
           conan upload "*" -r sunnycase -c
 
       #- name: Upload nncaseruntime Benchmark
@@ -93,7 +93,7 @@ jobs:
       - name: Configure
         shell: bash
         run: |
-          conan install . --build=missing -s build_type=${{matrix.config.buildType}} -pr:a=toolchains/${{matrix.config.name}}.profile.jinja -o "&:runtime=False" -o "&:python=True" -o "&:tests=True"
+          conan install . --build=missing -s build_type=${{matrix.config.buildType}} -pr:a=toolchains/${{matrix.config.name}}.profile.jinja -o "&:runtime=True" -o "&:python=True" -o "&:tests=True"
 
       - name: Upload Conan Recipes
         env:
