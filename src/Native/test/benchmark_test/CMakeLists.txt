@@ -15,3 +15,8 @@ foreach(test_name ${TEST_NAMES})
     add_executable(${tname} ${tname}.cpp)
     target_link_libraries(${tname} PRIVATE nncaseruntime)
 endforeach()
+
+add_executable(gemm_opt gemm_opt.cpp)
+target_link_libraries(gemm_opt PRIVATE nncaseruntime)
+#target_compile_options(gemm_opt PRIVATE -mtune=znver3)
+target_compile_options(gemm_opt PRIVATE -march=rv64gcv_zvl256b_zfh_zicbom_zicbop_zicboz)

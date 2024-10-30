@@ -50,7 +50,7 @@
 #endif
 
 #ifndef CLOCK_SOURCE_FREQUENCY_MHZ
-#define CLOCK_SOURCE_FREQUENCY_MHZ 27
+#define CLOCK_SOURCE_FREQUENCY_MHZ 24
 #endif
 
 #else
@@ -73,9 +73,15 @@ __inline__ uint64_t get_cpu_cycle(void) {
     cycles = __rdtsc();
     __asm__ __volatile__("" : : : "memory");
 #elif defined __riscv
+#if 1
     uint64_t time = 0;
     asm volatile("rdtime %0" : "=r"(time));
     cycles = time * CPU_FREQUENCY_MHZ / CLOCK_SOURCE_FREQUENCY_MHZ;
+#else
+    __asm__ __volatile__("" : : : "memory");
+    asm volatile("rdcycle %0" : "=r"(cycles));
+    __asm__ __volatile__("" : : : "memory");
+#endif
 #endif
     return cycles;
 }
