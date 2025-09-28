@@ -23,25 +23,15 @@ using Nncase.Quantization;
 namespace Nncase.Targets;
 
 /// <summary>
-/// Target for CPU.
+/// Target for CUDA.
 /// </summary>
-public class CPUTarget : NTTTarget
+public class CUDATarget : NTTTarget
 {
-    public const string Kind = "cpu";
+    public const string Kind = "cuda";
 
-    public CPUTarget()
+    public CUDATarget()
     {
     }
 
-    protected override INTTModuleCompiler NTTModuleCompiler { get; } = new CPUModuleCompiler();
-
-    public override void RegisterTIRSelectionPass(IPassManager passManager, CompileOptions optionsÍ)
-    {
-        base.RegisterTIRSelectionPass(passManager, optionsÍ);
-        passManager.AddWithName<PrimFuncPass>("ToBlockLocalData").Configure(p =>
-        {
-            p.Add<Passes.Mutators.RemoveNop>();
-            p.Add<Nncase.Passes.Mutators.ToBlockLocalData>();
-        });
-    }
+    protected override INTTModuleCompiler NTTModuleCompiler { get; } = new CUDAModuleCompiler();
 }
