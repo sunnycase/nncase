@@ -337,9 +337,9 @@ class u_pack2d<true, TIn, TOut, float, vector<float, 8, 8>> {
 
         constexpr auto axes_temp = TAxes{};
         constexpr auto conti_dims_input =
-            contiguous_dims(input.shape(), input.strides());
+            contiguous_dims(TIn::shape(), TIn::strides());
         constexpr auto conti_dims_output =
-            contiguous_dims(output.shape(), output.strides());
+            contiguous_dims(TOut::shape(), TOut::strides());
 
         if constexpr (TAxes::rank() == 2 &&
                       axes_temp[0_dim] + 1 == axes_temp[1_dim] &&
@@ -349,7 +349,6 @@ class u_pack2d<true, TIn, TOut, float, vector<float, 8, 8>> {
             if constexpr (TAxes::rank() > 0 &&
                           (TAxes{}[-1]) == (TIn::rank() - 1)) {
                 using TVec = vector<float, 8, 8>;
-                constexpr auto in_rank = TIn::rank();
                 constexpr auto out_rank = TOut::rank();
                 constexpr auto lanes = TVec::shape();
                 constexpr auto out_shape = TOut::shape();
@@ -371,7 +370,6 @@ class u_pack2d<true, TIn, TOut, float, vector<float, 8, 8>> {
             } else {
                 using TVec = vector<float, 8, 8>;
                 constexpr auto in_rank = TIn::rank();
-                constexpr auto out_rank = TOut::rank();
                 constexpr auto lanes = TVec::shape();
                 const auto out_shape = output.shape();
 
