@@ -23,8 +23,8 @@
 namespace nncase::ntt {
 namespace scatter_nd_detail {
 template <Tensor TIn, Tensor TIndex, Tensor TUpdates, Tensor TOut>
-void scatter_nd_impl(const TIn &input, const TIndex &indices,
-                     const TUpdates &updates, TOut &output) noexcept {
+constexpr void scatter_nd_impl(const TIn &input, const TIndex &indices,
+                               const TUpdates &updates, TOut &output) noexcept {
     using TIElem = typename TIn::element_type;
     [[maybe_unused]] const auto in_shape = input.shape();
     const auto indices_shape = indices.shape();
@@ -65,8 +65,8 @@ void scatter_nd_impl(const TIn &input, const TIndex &indices,
 } // namespace scatter_nd_detail
 
 template <typename TIn, typename TIndex, typename TUpdate, typename TOut>
-void scatter_nd(const TIn &input, TIndex &indices, TUpdate &updates,
-                TOut &&output) noexcept {
+constexpr void scatter_nd(const TIn &input, TIndex &indices, TUpdate &updates,
+                          TOut &&output) noexcept {
     scatter_nd_detail::scatter_nd_impl(input, indices, updates, output);
 }
 } // namespace nncase::ntt

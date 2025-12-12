@@ -45,6 +45,7 @@ typedef struct {
     uint32_t local_data_align;
     uint64_t output_pool_size;
     uint64_t local_data_pool_size;
+    uint64_t warp_local_data_pool_size;
     uint64_t block_local_data_pool_size;
 } kernel_desc_header;
 

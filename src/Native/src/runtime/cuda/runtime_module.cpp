@@ -13,6 +13,7 @@
  * limitations under the License.
  */
 #include "runtime_module.h"
+#include "nncase/runtime/host_buffer.h"
 #include "runtime_function.h"
 #include <nncase/ntt/arch/cuda/runtime.h>
 #include <nncase/runtime/dbg.h>
@@ -28,13 +29,13 @@ using namespace nncase::ntt::runtime;
 
 typedef struct {
     uint32_t tdim;
+    uint32_t wdim;
     uint32_t bdim;
     uint32_t cdim;
-    uint32_t reserved0;
 } module_desc_header;
 
 cuda_runtime_module::cuda_runtime_module() noexcept
-    : tdim_(0), bdim_(0), cdim_(0) {}
+    : tdim_(0), wdim_(0), bdim_(0), cdim_(0) {}
 
 result<void> cuda_runtime_module::initialize_before_functions(
     runtime_module_init_context &context) noexcept {
@@ -42,6 +43,7 @@ result<void> cuda_runtime_module::initialize_before_functions(
         ".desc", [this](auto reader, size_t) -> result<void> {
             auto header = reader.template read<module_desc_header>();
             this->tdim_ = header.tdim;
+            this->wdim_ = header.wdim;
             this->bdim_ = header.bdim;
             this->cdim_ = header.cdim;
             return ok();
@@ -51,6 +53,8 @@ result<void> cuda_runtime_module::initialize_before_functions(
     try_set(rdata_, initialize_section(context, ".rdata"));
     try_set(thread_local_rdata_,
             initialize_section(context, ".thread_local_rdata"));
+    try_set(warp_local_rdata_,
+            initialize_section(context, ".warp_local_rdata"));
     try_set(block_local_rdata_,
             initialize_section(context, ".block_local_rdata"));
     return ok();
@@ -76,7 +80,8 @@ result<void> cuda_runtime_module::initialize_text(
 result<std::span<const std::byte>>
 cuda_runtime_module::initialize_section(runtime_module_init_context &context,
                                         const char *name) noexcept {
-    try_var(host_span, context.get_or_read_section(name, text_storage_, false));
+    host_buffer_t host_storage;
+    try_var(host_span, context.get_or_read_section(name, host_storage, false));
     if (host_span.empty()) {
         return ok(host_span);
     } else {

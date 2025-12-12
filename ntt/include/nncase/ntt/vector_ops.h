@@ -116,9 +116,6 @@ struct tensor_binary_impl<Op, TVector, T2> {
 
         return value;
     }
-
-    //   private:
-    //     Op<element_type1, element_type2> op_;
 };
 
 // T1 scalar, T2 1D vector or 2D vector

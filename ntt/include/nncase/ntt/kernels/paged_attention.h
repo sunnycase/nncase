@@ -180,12 +180,12 @@ constexpr void update_paged_attention_kv_cache(const TSlots &slots_tensor,
 template <FixedDimensions QLayout, ShardedTensor TQ, Tensor TKVCache,
           Tensor TScale, class TOutput, Tensor TExtra>
     requires(Tensor<std::decay_t<TOutput>>)
-void paged_attention(
-    const TQ &q_tensor, TKVCache &kv_cache_tensor,
-    TExtra &extra_tensor, /* [head_q, max_query_len, max_seq_len] + [head_q,
-                            max_query_len, 1] */
-    const TScale &scale, size_t layer_id, TOutput &&output_tensor,
-    const QLayout &q_layout) noexcept {
+constexpr void
+paged_attention(const TQ &q_tensor, TKVCache &kv_cache_tensor,
+                TExtra &extra_tensor, /* [head_q, max_query_len, max_seq_len] +
+                                        [head_q, max_query_len, 1] */
+                const TScale &scale, size_t layer_id, TOutput &&output_tensor,
+                const QLayout &q_layout) noexcept {
     auto &kv_cache = kv_cache_tensor(fixed_shape_v<>);
     using kv_cache_t = typename std::decay_t<decltype(kv_cache)>;
     using config_t = typename kv_cache_t::config_t;
@@ -229,7 +229,11 @@ void paged_attention(
             (s_shape.length() + reduce_s_shape.length()) *
                 (sizeof(kv_prim_type_t))) {
             printf("extra_tensor is not enough.\n");
+#ifdef __CUDA_ARCH__
+            cuda::std::terminate();
+#else
             std::terminate();
+#endif
         }
 
         auto s = make_tensor_view_from_address(
@@ -398,7 +402,7 @@ void paged_attention(
 
 template <class T0, class T1, class T2, class T3, class T4, class T5, class T6,
           class T7, class T8>
-void identity_paged_attention_kv_cache(
+constexpr void identity_paged_attention_kv_cache(
     [[maybe_unused]] T0 input, [[maybe_unused]] T1 num_seqs,
     [[maybe_unused]] T2 num_tokens, [[maybe_unused]] T3 context_lens,
     [[maybe_unused]] T4 seq_lens, [[maybe_unused]] T5 block_table,
@@ -408,8 +412,9 @@ void identity_paged_attention_kv_cache(
 }
 
 template <ShardedTensor T0, class T1, class T2>
-void gather_paged_attention_kv_cache([[maybe_unused]] const T0 &value,
-                                     T1 &&kv_cache_tensor, T2 &&output_tensor) {
+constexpr void gather_paged_attention_kv_cache([[maybe_unused]] const T0 &value,
+                                               T1 &&kv_cache_tensor,
+                                               T2 &&output_tensor) {
     auto &kv_cache = kv_cache_tensor(fixed_shape_v<>);
     using kv_cache_t = typename std::decay_t<decltype(kv_cache)>;
     using config_t = typename kv_cache_t::config_t;
@@ -419,7 +424,7 @@ void gather_paged_attention_kv_cache([[maybe_unused]] const T0 &value,
     const auto kv_cache_index =
         generate_shape<config_t::sharding_axes_t::rank()>([&](auto axis) {
             const auto submesh_axes =
-                std::get<axis>(config_t::axis_policies).axes;
+                ntt::get<axis>(config_t::axis_policies).axes;
             const auto submesh_shape = mesh_type::shape.select(submesh_axes);
             const auto local_program_id =
                 linear_offset(local_index.select(submesh_axes), submesh_shape);

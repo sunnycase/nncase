@@ -80,9 +80,9 @@ using namespace nncase::ntt::distributed::shard_policy;
         return content;
     }
 
-    public static string ModuleTopologyDef(NTTTargetOptions options)
+    public static string ModuleTopologyDef(NTTTargetOptions options, bool isCUDA)
     {
-        var content = RazorTemplateEngine.RenderAsync("~/CodeGen/CPU/Templates/module_topology_def.h.cshtml", options).Result;
+        var content = RazorTemplateEngine.RenderAsync("~/CodeGen/CPU/Templates/module_topology_def.h.cshtml", new { Hierarchies = options.Hierarchies[0], IsCUDA = isCUDA }).Result;
         return content;
     }
 

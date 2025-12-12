@@ -28,9 +28,9 @@ using namespace nncase::ntt::runtime;
 
 typedef struct {
     uint32_t tdim;
+    uint32_t wdim;
     uint32_t bdim;
     uint32_t cdim;
-    uint32_t reserved0;
 } module_desc_header;
 
 cpu_runtime_module::cpu_runtime_module() noexcept

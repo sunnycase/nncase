@@ -14,20 +14,36 @@
  */
 #pragma once
 #include "compiler_defs.h"
-#include <array>
-#include <span>
 
 #ifdef __CUDA_ARCH__
 #include <cuda/std/array>
+#include <cuda/std/barrier>
 #include <cuda/std/span>
+#include <cuda/std/tuple>
+#else
+#include <array>
+#include <barrier>
+#include <span>
+#include <tuple>
+#endif
+
+#ifdef __CUDA_ARCH__
+#define NTT_NS_STD cuda::std
+#else
+#define NTT_NS_STD std
 #endif
 
 namespace nncase::ntt {
-#ifdef __CUDA_ARCH__
-using cuda::std::array;
-using cuda::std::span;
-#else
-using std::array;
-using std::span;
-#endif
+using NTT_NS_STD::array;
+using NTT_NS_STD::barrier;
+using NTT_NS_STD::forward_as_tuple;
+using NTT_NS_STD::get;
+using NTT_NS_STD::make_tuple;
+using NTT_NS_STD::span;
+using NTT_NS_STD::tuple;
+using NTT_NS_STD::tuple_element_t;
+
+template <size_t Count> struct fixed_barrier : barrier<> {
+    constexpr fixed_barrier() : barrier<>(Count) {}
+};
 } // namespace nncase::ntt

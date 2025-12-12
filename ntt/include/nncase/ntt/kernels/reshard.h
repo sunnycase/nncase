@@ -34,7 +34,7 @@ namespace tar {
 #if defined(NNCASE_XPU_MODULE) && defined(SYS_MODE)
 __device__ extern uint8_t collective_pool_ptr[];
 #else
-extern uint8_t collective_pool_ptr[];
+NTT_DEVICE extern uint8_t collective_pool_ptr[];
 #endif
 } // namespace tar
 
@@ -117,12 +117,12 @@ struct reshard_impl<SrcTensor, DestTensor> {
                                       const TShardIndex &shard_index) {
         // 1. Fill split axes.
         auto split_phase1 = src.shape().aggregate(
-            std::make_tuple(fixed_shape_v<>, fixed_shape_v<>, fixed_shape_v<>),
+            ntt::make_tuple(fixed_shape_v<>, fixed_shape_v<>, fixed_shape_v<>),
             [&](auto last_acc, auto global_dim, auto axis) {
                 auto [last_global_offset, last_local_offset, last_shape] =
                     last_acc;
-                auto policy =
-                    std::get<axis>(src.sharding().axis_policies);
+                const auto policy =
+                    ntt::get<axis>(src.sharding().axis_policies);
                 if constexpr (distributed::SplitShardPolicy<
                                   std::decay_t<decltype(policy)>>) {
                     // Split axis, simply calculate the global offset and
@@ -134,12 +134,12 @@ struct reshard_impl<SrcTensor, DestTensor> {
                     const auto local_shape =
                         policy.template shard_dim<mesh_type>(global_dim,
                                                              shard_index);
-                    return std::make_tuple(
+                    return ntt::make_tuple(
                         last_global_offset.append(global_offset),
                         last_local_offset.append(local_offset),
                         last_shape.append(local_shape));
                 } else {
-                    return std::make_tuple(last_global_offset.append(dim_zero),
+                    return ntt::make_tuple(last_global_offset.append(dim_zero),
                                            last_local_offset.append(dim_zero),
                                            last_shape.append(dim_zero));
                 }
@@ -170,7 +170,7 @@ struct reshard_impl<SrcTensor, DestTensor> {
                 const auto global_end =
                     ntt::min(global_offset + local_dim, global_dim);
                 const auto in_bound = global_offset < global_dim;
-                return std::make_tuple(
+                return ntt::make_tuple(
                     last_global_offset.template replace_at<axis>(
                         ntt::where(in_bound, global_offset, dim_zero)),
                     last_local_offset.template replace_at<axis>(
@@ -347,7 +347,7 @@ struct reshard_impl<SrcTensor, DestTensor> {
     }
 
   private:
-    void copy_to_global(const SrcTensor &src) noexcept {
+    constexpr void copy_to_global(const SrcTensor &src) noexcept {
         auto global_buffer_address =
             reinterpret_cast<typename SrcTensor::value_type *>(
                 tar::collective_pool_ptr);
@@ -356,7 +356,7 @@ struct reshard_impl<SrcTensor, DestTensor> {
         reshard(src, global_tensor);
     }
 
-    void copy_from_global(DestTensor &dest) noexcept {
+    constexpr void copy_from_global(DestTensor &dest) noexcept {
         auto global_buffer_address =
             reinterpret_cast<const typename DestTensor::value_type *>(
                 tar::collective_pool_ptr);
@@ -383,7 +383,7 @@ struct reshard_impl<SrcTensor, DestTensor> {
         // 2. get mesh index of src candidates
         // 2.1 generate coords for each split axis
         auto make_coords = [&]<std::size_t... Is>(std::index_sequence<Is...>) {
-            return std::make_tuple(
+            return ntt::make_tuple(
                 std::array<size_t, mesh_type::shape[Is]>{}...);
         };
         auto coords =
@@ -392,7 +392,7 @@ struct reshard_impl<SrcTensor, DestTensor> {
 
         auto get_coord = [&]<size_t tensor_axis>() {
             const auto policy =
-                std::get<tensor_axis>(src.sharding().axis_policies);
+                ntt::get<tensor_axis>(src.sharding().axis_policies);
             if constexpr (distributed::SplitShardPolicy<
                               std::decay_t<decltype(policy)>>) {
                 size_t num_blocks = 1;
@@ -417,7 +417,7 @@ struct reshard_impl<SrcTensor, DestTensor> {
                         size_t c = remainder % dim;
                         remainder /= dim;
 
-                        auto &coord = std::get<mesh_axis>(coords);
+                        auto &coord = ntt::get<mesh_axis>(coords);
                         bool exist = false;
                         for (size_t i = 0; i < counts[mesh_axis]; ++i) {
                             if (coord[i] == c) {
@@ -444,7 +444,7 @@ struct reshard_impl<SrcTensor, DestTensor> {
             [&]<std::size_t... Is>(std::index_sequence<Is...>) {
                 (([&] {
                      if (counts[Is] == 0) {
-                         auto &coord = std::get<Is>(coords);
+                         auto &coord = ntt::get<Is>(coords);
                          coord[counts[Is]++] = local_mesh_index[Is];
                      }
                  }()),
@@ -466,7 +466,7 @@ struct reshard_impl<SrcTensor, DestTensor> {
                 candidates[linear_idx] = true;
                 return;
             } else {
-                const auto &coord = std::get<axis>(coords);
+                const auto &coord = ntt::get<axis>(coords);
                 for (size_t i = 0; i < counts[axis]; ++i) {
                     current_coord[axis] = coord[i];
                     self(self, std::integral_constant<size_t, axis + 1>{});

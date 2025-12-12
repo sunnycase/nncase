@@ -21,14 +21,14 @@
 
 namespace nncase::ntt {
 template <size_t Axis, Tensor... TInputs, class TOut>
-void stack(const std::tuple<TInputs...> &inputs, TOut &&output) {
+void stack(const ntt::tuple<TInputs...> &inputs, TOut &&output) {
     auto domain = output.shape().template replace_at<Axis>(dim_one);
     apply(domain, [&](auto out_index) {
         auto left_shape = slice_dims<Axis>(out_index);
         auto right_shape = slice_dims<output.rank() - Axis - 1>(out_index);
         auto in_index = concat_dims(left_shape, right_shape);
         loop<sizeof...(TInputs)>([&](auto i) {
-            auto input = std::get<i>(inputs);
+            auto input = ntt::get<i>(inputs);
             for (out_index[Axis] = 0; out_index[Axis] < input.size();
                  out_index[Axis]++) {
                 output(out_index) = input(in_index);

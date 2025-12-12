@@ -11,8 +11,10 @@ extern "C" NTT_DEVICE void thread_main(const nncase::ntt::runtime::thread_inout_
   nncase::ntt::runtime::thread_inout_desc *const output_descs,
   const std::byte *rdata,
   const std::byte *thread_local_rdata,
+  const std::byte *warp_local_rdata,
   const std::byte *block_local_rdata,
   std::byte *thread_local_data,
+  std::byte *warp_local_data,
   std::byte *block_local_data,
   std::byte *output) {
   /* prepare inputs */
@@ -72,7 +74,7 @@ extern "C" NTT_DEVICE void thread_main(const nncase::ntt::runtime::thread_inout_
     throw new NotSupportedException($"not support multi form topology!");
   }
   
-  @(Model.PrimFunction.Name)(@(string.Concat(names.Select(x => $"{x}, ")))rdata, thread_local_rdata, block_local_rdata, thread_local_data, block_local_data, output, output_descs);
+  @(Model.PrimFunction.Name)(@(string.Concat(names.Select(x => $"{x}, ")))rdata, thread_local_rdata, warp_local_rdata, block_local_rdata, thread_local_data, warp_local_data, block_local_data, output, output_descs);
 }
 
 #ifdef NNCASE_STANDALONE

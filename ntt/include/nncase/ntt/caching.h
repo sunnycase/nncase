@@ -72,7 +72,7 @@ struct paged_attention_config
     using vectorized_axes_t = VectorizedAxes;
     using lanes_t = Lanes;
     using sharding_axes_t = ShardingAxes;
-    using axis_policies_t = std::tuple<AxisPolicies...>;
+    using axis_policies_t = ntt::tuple<AxisPolicies...>;
 
     static inline constexpr auto cache_layout = cache_layout_t{};
     static inline constexpr auto block_layout = block_layout_t{};
@@ -88,7 +88,7 @@ struct paged_attention_config
         if constexpr (index == -1_dim) {
             return distributed::shard_policy::B;
         } else {
-            return std::get<index>(axis_policies);
+            return ntt::get<index>(axis_policies);
         }
     }
 };
@@ -125,14 +125,16 @@ template <class TConfig> class attention_kv_cache {
           context_lens_(std::move(context_lens)),
           seq_lens_(std::move(seq_lens)) {}
 
-    size_t num_seqs() const noexcept { return num_seqs_; }
-    size_t num_tokens() const noexcept { return num_tokens_; }
+    constexpr size_t num_seqs() const noexcept { return num_seqs_; }
+    constexpr size_t num_tokens() const noexcept { return num_tokens_; }
 
-    int64_t context_len(int64_t request_id) const noexcept {
+    constexpr int64_t context_len(int64_t request_id) const noexcept {
         return context_lens_(request_id);
     }
 
-    int64_t seq_len(int64_t seq_id) const noexcept { return seq_lens_(seq_id); }
+    constexpr int64_t seq_len(int64_t seq_id) const noexcept {
+        return seq_lens_(seq_id);
+    }
 
   protected:
     size_t num_seqs_;
@@ -150,7 +152,7 @@ kv_dim(distributed::shard_policy::split<std::nullptr_t, Axes...> split) noexcept
 }
 
 template <class Mesh, class... AxisPolicies>
-constexpr auto kv_addr_shape(std::tuple<AxisPolicies...>) noexcept {
+constexpr auto kv_addr_shape(ntt::tuple<AxisPolicies...>) noexcept {
     return fixed_shape_v<kv_dim<Mesh>(AxisPolicies{})...>;
 }
 
@@ -177,7 +179,7 @@ constexpr auto origin_kv_cache_one_block_shape() noexcept {
     auto shard_shape = TConfig::sharding_axes.aggregate(
         vectorized_shape, [&](auto last_shape, auto sharding_axis, auto i) {
             using axis_policy_t =
-                std::tuple_element_t<i, typename TConfig::axis_policies_t>;
+                ntt::tuple_element_t<i, typename TConfig::axis_policies_t>;
             if constexpr (sharding_axis ==
                           fixed_dim_v<(
                               dim_t)paged_kvcache_dim_kind::num_blocks>) {
@@ -246,10 +248,12 @@ class paged_attention_kv_cache : public attention_kv_cache<TConfig> {
     using kv_addrs_t = decltype(make_tensor_view_from_address(
         std::declval<kv_storage_type_t **>(), kv_addrs_shape));
 
-    paged_attention_kv_cache(size_t num_seqs, size_t num_tokens,
-                             context_lens_t context_lens, seq_lens_t seq_lens,
-                             block_table_t block_table,
-                             slot_mapping_t slot_mapping, kv_addrs_t kv_addrs)
+    constexpr paged_attention_kv_cache(size_t num_seqs, size_t num_tokens,
+                                       context_lens_t context_lens,
+                                       seq_lens_t seq_lens,
+                                       block_table_t block_table,
+                                       slot_mapping_t slot_mapping,
+                                       kv_addrs_t kv_addrs)
         : attention_kv_cache<TConfig>(num_seqs, num_tokens, context_lens,
                                       seq_lens),
           block_table_(block_table),
@@ -311,7 +315,7 @@ class paged_attention_kv_cache : public attention_kv_cache<TConfig> {
         }
     }
 
-    auto block_table() const noexcept { return block_table_; }
+    constexpr auto block_table() const noexcept { return block_table_; }
 
   private:
     template <class T>
@@ -326,7 +330,7 @@ class paged_attention_kv_cache : public attention_kv_cache<TConfig> {
             generate_shape<block_shard_index.size()>([&](auto axis) {
                 const auto index = block_shard_index(axis);
                 const auto submesh_axes =
-                    std::get<axis>(TConfig::axis_policies).axes;
+                    ntt::get<axis>(TConfig::axis_policies).axes;
                 const auto submesh_shape = Mesh::shape.select(submesh_axes);
                 const auto local_program_id = linear_offset(
                     local_index.select(submesh_axes), submesh_shape);

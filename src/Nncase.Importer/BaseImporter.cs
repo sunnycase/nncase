@@ -184,7 +184,7 @@ public abstract class BaseImporter
 
     private IRModule CreateModule(IVar[] inputs, Dictionary<IVar, Dimension[]> varMap, BaseExpr body)
     {
-        var mainFunc = new Function("main", body, inputs, varMap);
+        var mainFunc = new Function("main", CompileSession.Target.Name, body, inputs, varMap);
         var module = new IRModule(mainFunc);
         return module;
     }

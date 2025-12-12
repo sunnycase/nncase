@@ -41,9 +41,9 @@ struct reduce_source_begin_index_impl {
                               const TOutIndex &out_index) noexcept {
         auto [new_dim, new_shrinked_dims] = [&] {
             if constexpr (ReduceAxes{}.contains(fixed_dim_v<Axis>)) {
-                return std::make_tuple(0, fixed_dim_v<ShrinkedDims + 1>);
+                return ntt::make_tuple(0, fixed_dim_v<ShrinkedDims + 1>);
             } else {
-                return std::make_tuple(
+                return ntt::make_tuple(
                     (dim_t)out_index.template at<Axis - ShrinkedDims>(),
                     fixed_dim_v<ShrinkedDims>);
             }

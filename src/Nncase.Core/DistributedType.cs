@@ -156,6 +156,8 @@ public sealed record Placement(IRArray<int> Hierarchy, string Name, HierarchyKin
     // }
     public int Rank => Hierarchy.Count;
 
+    public bool HasWarp => Name.Contains('w', StringComparison.Ordinal);
+
     public override string ToString() => $"[{string.Join(',', Hierarchy.Zip(Name).Select(t => t.Second.ToString() + ':' + t.First.ToString()))}]";
 }
 

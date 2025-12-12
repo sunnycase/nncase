@@ -20,9 +20,9 @@
 namespace nncase::ntt {
 
 template <class TKVCache, Tensor TOut, class TSharding, Shape TGlobalShape>
-void get_position_ids(TKVCache &&kv_cache_tensor, TOut output,
-                      const TSharding &sharding,
-                      const TGlobalShape &global_shape) {
+constexpr void get_position_ids(TKVCache &&kv_cache_tensor, TOut output,
+                                const TSharding &sharding,
+                                const TGlobalShape &global_shape) {
     using TOutType = typename std::decay_t<TOut>;
     using mesh_type = typename TSharding::mesh_type;
     using TOutElem = typename TOutType::value_type;

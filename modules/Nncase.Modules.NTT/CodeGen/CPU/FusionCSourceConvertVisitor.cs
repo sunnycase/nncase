@@ -60,7 +60,7 @@ public class LambdaCSourceConvertVisitor : CSourceConvertVisitor
             IndentScope.Writer.IndWrite($"template<{string.Join(", ", Enumerable.Range(0, expr.Parameters.Length).Select(x => $"class T{x}"))}> struct {expr.Name} {{\n");
             using (_ = new IndentScope())
             {
-                IndentScope.Writer.IndWrite($"auto operator()({string.Join(", ", expr.Parameters.AsValueEnumerable().Select(Visit).Select((s, i) => $"const T{i} &{s.Name}").ToArray())}) const noexcept {{\n");
+                IndentScope.Writer.IndWrite($"constexpr auto operator()({string.Join(", ", expr.Parameters.AsValueEnumerable().Select(Visit).Select((s, i) => $"const T{i} &{s.Name}").ToArray())}) const noexcept {{\n");
 
                 // 2. Function body
                 using (_ = new IndentScope())

@@ -194,12 +194,14 @@ struct bfloat16 {
 };
 
 #define DEFINE_BF16_BINARY_BF16RET(x)                                          \
-    inline bfloat16 operator x(bfloat16 a, bfloat16 b) noexcept {              \
+    NTT_ALWAYS_INLINE constexpr bfloat16 operator x(bfloat16 a,                \
+                                                    bfloat16 b) noexcept {     \
         return bfloat16::round_to_bfloat16(float(a) x float(b));               \
     }
 
 #define DEFINE_BF16_BINARY_BOOLRET(x)                                          \
-    inline bool operator x(bfloat16 a, bfloat16 b) noexcept {                  \
+    NTT_ALWAYS_INLINE constexpr bool operator x(bfloat16 a,                    \
+                                                bfloat16 b) noexcept {         \
         return float(a) x float(b);                                            \
     }
 
@@ -213,7 +215,8 @@ DEFINE_BF16_BINARY_BOOLRET(>=)
 DEFINE_BF16_BINARY_BOOLRET(>)
 
 #define DEFINE_BF16_BINARY_SELF_MOD(x, op)                                     \
-    inline bfloat16 &operator x(bfloat16 & a, bfloat16 b) noexcept {           \
+    NTT_ALWAYS_INLINE constexpr bfloat16 &operator x(bfloat16 &a,              \
+                                                     bfloat16 b) noexcept {    \
         a = a op b;                                                            \
         return a;                                                              \
     }
@@ -223,15 +226,17 @@ DEFINE_BF16_BINARY_SELF_MOD(-=, -)
 DEFINE_BF16_BINARY_SELF_MOD(*=, *)
 DEFINE_BF16_BINARY_SELF_MOD(/=, /)
 
-inline bfloat16 operator-(bfloat16 a) noexcept {
+NTT_ALWAYS_INLINE constexpr bfloat16 operator-(bfloat16 a) noexcept {
     return bfloat16::round_to_bfloat16(-float(a));
 }
 
-inline bool operator==(const bfloat16 &lhs, const bfloat16 &rhs) noexcept {
+NTT_ALWAYS_INLINE constexpr bool operator==(const bfloat16 &lhs,
+                                            const bfloat16 &rhs) noexcept {
     return lhs.raw() == rhs.raw();
 }
 
-inline bool operator!=(const bfloat16 &lhs, const bfloat16 &rhs) noexcept {
+NTT_ALWAYS_INLINE constexpr bool operator!=(const bfloat16 &lhs,
+                                            const bfloat16 &rhs) noexcept {
     return lhs.raw() != rhs.raw();
 }
 } // namespace nncase
@@ -300,66 +305,76 @@ template <> struct numeric_limits<nncase::bfloat16> {
 };
 
 using nncase::bfloat16;
-inline bool isinf(const bfloat16 &a) { return std::isinf(float(a)); }
-inline bool isnan(const bfloat16 &a) { return std::isnan(float(a)); }
-inline bool isfinite(const bfloat16 &a) { return std::isfinite(float(a)); }
-inline bfloat16 abs(const bfloat16 &a) {
+NTT_ALWAYS_INLINE NTT_HOST_DEVICE bool isinf(const bfloat16 &a) {
+    return std::isinf(float(a));
+}
+NTT_ALWAYS_INLINE NTT_HOST_DEVICE bool isnan(const bfloat16 &a) {
+    return std::isnan(float(a));
+}
+NTT_ALWAYS_INLINE NTT_HOST_DEVICE bool isfinite(const bfloat16 &a) {
+    return std::isfinite(float(a));
+}
+NTT_ALWAYS_INLINE NTT_HOST_DEVICE bfloat16 abs(const bfloat16 &a) {
     return bfloat16::round_to_bfloat16(fabsf(float(a)));
 }
-inline bfloat16 acos(const bfloat16 &a) {
+NTT_ALWAYS_INLINE NTT_HOST_DEVICE bfloat16 acos(const bfloat16 &a) {
     return bfloat16::round_to_bfloat16(std::acos(float(a)));
 }
-inline bfloat16 asin(const bfloat16 &a) {
+NTT_ALWAYS_INLINE NTT_HOST_DEVICE bfloat16 asin(const bfloat16 &a) {
     return bfloat16::round_to_bfloat16(std::asin(float(a)));
 }
-inline bfloat16 erf(const bfloat16 &a) {
+NTT_ALWAYS_INLINE NTT_HOST_DEVICE bfloat16 erf(const bfloat16 &a) {
     return bfloat16::round_to_bfloat16(std::erff(float(a)));
 }
-inline bfloat16 exp(const bfloat16 &a) {
+NTT_ALWAYS_INLINE NTT_HOST_DEVICE bfloat16 exp(const bfloat16 &a) {
     return bfloat16::round_to_bfloat16(expf(float(a)));
 }
-inline bfloat16 log(const bfloat16 &a) {
+NTT_ALWAYS_INLINE NTT_HOST_DEVICE bfloat16 log(const bfloat16 &a) {
     return bfloat16::round_to_bfloat16(logf(float(a)));
 }
-inline bfloat16 log10(const bfloat16 &a) {
+NTT_ALWAYS_INLINE NTT_HOST_DEVICE bfloat16 log10(const bfloat16 &a) {
     return bfloat16::round_to_bfloat16(log10f(float(a)));
 }
-inline bfloat16 sqrt(const bfloat16 &a) {
+NTT_ALWAYS_INLINE NTT_HOST_DEVICE bfloat16 sqrt(const bfloat16 &a) {
     return bfloat16::round_to_bfloat16(sqrtf(float(a)));
 }
-inline bfloat16 pow(const bfloat16 &a, const bfloat16 &b) {
+NTT_ALWAYS_INLINE NTT_HOST_DEVICE bfloat16 pow(const bfloat16 &a,
+                                               const bfloat16 &b) {
     return bfloat16::round_to_bfloat16(powf(float(a), float(b)));
 }
-inline bfloat16 sin(const bfloat16 &a) {
+NTT_ALWAYS_INLINE NTT_HOST_DEVICE bfloat16 sin(const bfloat16 &a) {
     return bfloat16::round_to_bfloat16(sinf(float(a)));
 }
-inline bfloat16 cos(const bfloat16 &a) {
+NTT_ALWAYS_INLINE NTT_HOST_DEVICE bfloat16 cos(const bfloat16 &a) {
     return bfloat16::round_to_bfloat16(cosf(float(a)));
 }
-inline bfloat16 tan(const bfloat16 &a) {
+NTT_ALWAYS_INLINE NTT_HOST_DEVICE bfloat16 tan(const bfloat16 &a) {
     return bfloat16::round_to_bfloat16(tanf(float(a)));
 }
-inline bfloat16 tanh(const bfloat16 &a) {
+NTT_ALWAYS_INLINE NTT_HOST_DEVICE bfloat16 tanh(const bfloat16 &a) {
     return bfloat16::round_to_bfloat16(tanhf(float(a)));
 }
-inline bfloat16 floor(const bfloat16 &a) {
+NTT_ALWAYS_INLINE NTT_HOST_DEVICE bfloat16 floor(const bfloat16 &a) {
     return bfloat16::round_to_bfloat16(floorf(float(a)));
 }
-inline bfloat16 ceil(const bfloat16 &a) {
+NTT_ALWAYS_INLINE NTT_HOST_DEVICE bfloat16 ceil(const bfloat16 &a) {
     return bfloat16::round_to_bfloat16(ceilf(float(a)));
 }
-inline bfloat16 round(const bfloat16 &a) {
+NTT_ALWAYS_INLINE NTT_HOST_DEVICE bfloat16 round(const bfloat16 &a) {
     return bfloat16::round_to_bfloat16(roundf(float(a)));
 }
-inline bfloat16 nearbyint(const bfloat16 &a) {
+NTT_ALWAYS_INLINE NTT_HOST_DEVICE bfloat16 nearbyint(const bfloat16 &a) {
     return bfloat16::round_to_bfloat16(nearbyintf(float(a)));
 }
-inline long lrint(const bfloat16 &a) { return lrintf(float(a)); }
+NTT_ALWAYS_INLINE NTT_HOST_DEVICE long lrint(const bfloat16 &a) {
+    return lrintf(float(a));
+}
 
 template <> struct is_arithmetic<bfloat16> : public true_type {};
 
 } // namespace std
 
-inline nncase::bfloat16 operator""_bf16(long double x) {
+NTT_ALWAYS_INLINE NTT_HOST_DEVICE nncase::bfloat16
+operator""_bf16(long double x) {
     return nncase::bfloat16(float(x));
 }

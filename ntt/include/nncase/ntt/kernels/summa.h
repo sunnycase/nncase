@@ -29,12 +29,12 @@ template <bool AccumulateC = false, bool TransposedA = false,
           class TOut, class TScale, FixedDimensions LhsVectorizedAxes,
           FixedDimensions LhsPadedNums, FixedDimensions RhsVectorizedAxes,
           FixedDimensions RhsPadedNums>
-void summa(
-    const TLhs &lhs, const TRhs &rhs, TOut &&output, const TScale &scale,
-    [[maybe_unused]] LhsVectorizedAxes lhsVectorizedAxes = fixed_shape_v<>,
-    [[maybe_unused]] LhsPadedNums lhsPadedNums = fixed_shape_v<>,
-    [[maybe_unused]] RhsVectorizedAxes rhsVectorizedAxes = fixed_shape_v<>,
-    [[maybe_unused]] RhsPadedNums rhsPadedNums = fixed_shape_v<>) {
+constexpr void
+summa(const TLhs &lhs, const TRhs &rhs, TOut &&output, const TScale &scale,
+      [[maybe_unused]] LhsVectorizedAxes lhsVectorizedAxes = fixed_shape_v<>,
+      [[maybe_unused]] LhsPadedNums lhsPadedNums = fixed_shape_v<>,
+      [[maybe_unused]] RhsVectorizedAxes rhsVectorizedAxes = fixed_shape_v<>,
+      [[maybe_unused]] RhsPadedNums rhsPadedNums = fixed_shape_v<>) {
     static_assert(TransposedA == false && TransposedB == false,
                   "not supported for now");
     using TLhsElem = typename TLhs::element_type;

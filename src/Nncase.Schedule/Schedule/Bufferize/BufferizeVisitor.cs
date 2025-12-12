@@ -18,6 +18,7 @@ public sealed class BufferizeVisitor : ExprRewriter
     private readonly IGrouping<string, PrimFunction> _functions;
     private long _currentRdataStart;
     private long _currentThreadLocalRdataStart;
+    private long _currentWarpLocalRdataStart;
     private long _currentBlockLocalRdataStart;
     private int _dataBufferId;
 
@@ -44,6 +45,7 @@ public sealed class BufferizeVisitor : ExprRewriter
             {
                 MemoryLocation.Rdata => new BufferScheduleOptions(_currentRdataStart),
                 MemoryLocation.ThreadLocalRdata => new BufferScheduleOptions(_currentThreadLocalRdataStart),
+                MemoryLocation.WarpLocalRdata => new BufferScheduleOptions(_currentWarpLocalRdataStart),
                 MemoryLocation.BlockLocalRdata => new BufferScheduleOptions(_currentBlockLocalRdataStart),
                 _ => new BufferScheduleOptions(),
             });
@@ -56,9 +58,11 @@ public sealed class BufferizeVisitor : ExprRewriter
 
             AssignOutputResult(func, scheduleResult);
             AssignDataResult(func, scheduleResult);
+            AssignWarpLocalDataResult(func, scheduleResult);
             AssignBlockLocalDataResult(func, scheduleResult);
             AssignRdataResult(func, scheduleResult);
             AssignThreadLocalRdataResult(func, scheduleResult);
+            AssignWarpLocalRdataResult(func, scheduleResult);
             AssignBlockLocalRdataResult(func, scheduleResult);
 
             var bufferReplaces = scheduleResult.SelectMany(x => x.Value.Buffers).ToDictionary(ReferenceEqualityComparer.Instance);
@@ -81,10 +85,14 @@ public sealed class BufferizeVisitor : ExprRewriter
             T.CreateBuffer(new TensorType(DataTypes.UInt8, [(long)func.SchedResult.DataUsage]), MemoryLocation.Data, out var dataBuffer, $"data_{_dataBufferId++}");
             var dataVar = new Var("data", TensorType.Scalar(new PointerType(DataTypes.UInt8)));
 
+            T.CreateBuffer(new TensorType(DataTypes.UInt8, [(long)func.SchedResult.WarpLocalDataPoolSize]), MemoryLocation.WarpLocalData, out var warpLocalDataBuffer, $"warp_local_data_{_dataBufferId++}");
+            var warpLocalDataVar = new Var("warp_local_data", TensorType.Scalar(new PointerType(DataTypes.UInt8)));
+
             T.CreateBuffer(new TensorType(DataTypes.UInt8, [(long)func.SchedResult.BlockLocalDataPoolSize]), MemoryLocation.BlockLocalData, out var blockLocalDataBuffer, $"block_local_data_{_dataBufferId++}");
             var blockLocalDataVar = new Var("block_local_data", TensorType.Scalar(new PointerType(DataTypes.UInt8)));
-            var funcParams = func.Parameters.ToArray().Append(dataVar).Append(blockLocalDataVar).ToArray();
-            var funcArgs = expr.Arguments.ToArray().Append(dataBuffer).Append(blockLocalDataBuffer).ToArray();
+
+            var funcParams = func.Parameters.ToArray().Append(dataVar).Append(warpLocalDataVar).Append(blockLocalDataVar).ToArray();
+            var funcArgs = expr.Arguments.ToArray().Append(dataBuffer).Append(warpLocalDataBuffer).Append(blockLocalDataBuffer).ToArray();
             var newFunc = func.With(parameters: funcParams);
             return expr.With(target: newFunc, arguments: funcArgs);
         }
@@ -107,6 +115,15 @@ public sealed class BufferizeVisitor : ExprRewriter
         {
             func.SchedResult.DataAlign = Math.Max(8, (ulong)dataResult.Alignment);
             func.SchedResult.DataUsage = MathUtility.AlignUp((ulong)dataResult.MemoryPoolEnd, func.SchedResult.DataAlign);
+        }
+    }
+
+    private void AssignWarpLocalDataResult(PrimFunction func, IReadOnlyDictionary<MemoryLocation, BufferScheduleResult> scheduleResult)
+    {
+        if (scheduleResult.TryGetValue(MemoryLocation.WarpLocalData, out var warpLocalDataResult))
+        {
+            func.SchedResult.DataAlign = Math.Max(8, (ulong)warpLocalDataResult.Alignment);
+            func.SchedResult.WarpLocalDataPoolSize = MathUtility.AlignUp((ulong)warpLocalDataResult.MemoryPoolEnd, func.SchedResult.DataAlign);
         }
     }
 
@@ -136,16 +153,31 @@ public sealed class BufferizeVisitor : ExprRewriter
 
     private void AssignThreadLocalRdataResult(PrimFunction func, IReadOnlyDictionary<MemoryLocation, BufferScheduleResult> scheduleResult)
     {
-        if (scheduleResult.TryGetValue(MemoryLocation.ThreadLocalRdata, out var threadLocalRdataResult))
+        if (scheduleResult.TryGetValue(MemoryLocation.ThreadLocalRdata, out var threadOrWarpLocalRdataResult))
         {
-            foreach ((var buffer, var lifetime) in threadLocalRdataResult.Buffers)
+            foreach ((var buffer, var lifetime) in threadOrWarpLocalRdataResult.Buffers)
             {
                 var constValue = (Const)((Call)buffer.Start)[IR.Buffers.AddressOf.Input];
                 var range = new ValueRange<ulong>((ulong)lifetime.Memory.Start, (ulong)lifetime.Memory.Stop);
                 func.SchedResult.ThreadLocalRdatas.Add(constValue, range);
             }
 
-            _currentThreadLocalRdataStart = threadLocalRdataResult.MemoryPoolEnd;
+            _currentThreadLocalRdataStart = threadOrWarpLocalRdataResult.MemoryPoolEnd;
+        }
+    }
+
+    private void AssignWarpLocalRdataResult(PrimFunction func, IReadOnlyDictionary<MemoryLocation, BufferScheduleResult> scheduleResult)
+    {
+        if (scheduleResult.TryGetValue(MemoryLocation.WarpLocalRdata, out var warpLocalRdataResult))
+        {
+            foreach ((var buffer, var lifetime) in warpLocalRdataResult.Buffers)
+            {
+                var constValue = (Const)((Call)buffer.Start)[IR.Buffers.AddressOf.Input];
+                var range = new ValueRange<ulong>((ulong)lifetime.Memory.Start, (ulong)lifetime.Memory.Stop);
+                func.SchedResult.WarpLocalRdatas.Add(constValue, range);
+            }
+
+            _currentWarpLocalRdataStart = warpLocalRdataResult.MemoryPoolEnd;
         }
     }
 

@@ -108,11 +108,12 @@
 // #include <cuda_fp16.h>
 
 // #include "nncase/nncase.h"
+#include "ntt/compiler_defs.h"
 #include "bfloat16.h"
 #include "half.h"
 #ifndef CUTLASS_HOST_DEVICE
-#define CUTLASS_HOST_DEVICE inline
-#define CUTLASS_DEVICE inline
+#define CUTLASS_HOST_DEVICE NTT_HOST_DEVICE inline
+#define CUTLASS_DEVICE NTT_DEVICE inline
 #endif // !CUTLASS_HOST_DEVICE
 #include "exmy_base.h"
 
