@@ -44,28 +44,30 @@ result<void> cuda_runtime_function::run(std::byte *output_data) noexcept {
             .tdim = module().tdim(),
             .bdim = module().bdim(),
             .cdim = module().cdim(),
-            .bid = 0,
             .cid = cid,
-            .cpu_id_offset = cid * module().bdim() * module().tdim(),
             .enable_profiling = enable_profiling,
             .input_descs = this->input_descs_.data(),
             .output_descs = this->output_descs_.data(),
             .rdata = module().rdata(),
             .output = output_data,
             .thread_local_rdata_header = module().thread_local_rdata_header(
-                cid * module().bdim() * module().tdim()),
+                cid * module().bdim() * module().wdim() * module().tdim()),
             .thread_local_rdata = module().thread_local_rdata_content(),
-            .block_local_rdata = module().block_local_rdata(),
-            .thread_local_data = thread_local_data(cid * module().bdim()),
-            .block_local_data = block_local_data(cid * module().bdim()),
-            .profile_records =
-                enable_profiling
-                    ? thread_local_profile_records(cid * module().bdim())
-                    : std::span<ntt::runtime::profile_record>{},
+            .warp_local_rdata_header = module().warp_local_rdata_header(
+                cid * module().bdim() * module().wdim()),
+            .warp_local_rdata = module().warp_local_rdata_content(),
+            .block_local_rdata_header =
+                module().block_local_rdata_header(cid * module().bdim()),
+            .block_local_rdata = module().block_local_rdata_content(),
+            .thread_local_data = thread_local_data(cid),
+            .warp_local_data = warp_local_data(cid),
+            .block_local_data = block_local_data(cid),
+            .profile_records = enable_profiling
+                                   ? thread_local_profile_records(cid)
+                                   : std::span<ntt::runtime::profile_record>{},
             .profile_record_counts =
                 enable_profiling
-                    ? thread_local_profile_record_counts(cid * module().bdim())
-                          .data()
+                    ? thread_local_profile_record_counts(cid).data()
                     : nullptr,
         };
         memcpy(params, &src_params, sizeof(cuda_block_entry_params_t));
@@ -73,7 +75,7 @@ result<void> cuda_runtime_function::run(std::byte *output_data) noexcept {
         void *args[] = {&params};
         CHECK_CUDA(cudaLaunchKernel(
             (const void *)block_entry_, dim3(module().bdim()),
-            dim3(module().tdim() * WARP_SIZE), args, 0, nullptr));
+            dim3(module().wdim() * module().tdim()), args, 0, nullptr));
     }
 
     for (size_t cid = 0; cid < module().cdim(); cid++) {

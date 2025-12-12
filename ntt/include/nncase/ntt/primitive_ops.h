@@ -41,7 +41,9 @@ namespace ops {
  */
 
 template <prefetch_hint Hint, bool Arch> struct prefetch {
-    void operator()(const void *ptr) const noexcept { __builtin_prefetch(ptr); }
+    constexpr void operator()(const void *ptr) const noexcept {
+        __builtin_prefetch(ptr);
+    }
 };
 
 template <class TDest, class TSource> struct store {

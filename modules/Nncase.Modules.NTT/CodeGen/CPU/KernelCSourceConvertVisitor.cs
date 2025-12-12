@@ -27,7 +27,7 @@ namespace Nncase.CodeGen.NTT;
 /// </summary>
 internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisposable
 {
-    private readonly HashSet<string> _excludedVars = new() { "data", "block_local_data" };
+    private readonly HashSet<string> _excludedVars = new() { "data", "warp_local_data", "block_local_data" };
     private readonly StringBuilder _kernelBuilder;
     private readonly HashSet<TIR.PrimFunction> _refFuncs;
     private readonly HashSet<TIR.Buffer> _declaredBuffers = new(ReferenceEqualityComparer.Instance);
@@ -92,7 +92,7 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
         var paramsExcluded = VisitEntry.Parameters.ToArray().OfType<IVar>().Where(x => !_excludedVars.Contains(x.Name)).ToArray();
         var templateHeader = TensorParams.Length == 0 ? string.Empty : $"template<{string.Join(", ", Enumerable.Range(0, TensorParams.Length).Select(x => $"class T{x}"))}>" + Environment.NewLine;
         var ctype = templateHeader +
-            $"NTT_DEVICE void {VisitEntry.Name}({string.Concat(paramsExcluded.Select(Visit).Select(s => $"{s.Type} {s.Name}, ").ToArray())}const std::byte *rdata, const std::byte *thread_local_rdata, const std::byte *block_local_rdata, std::byte *thread_local_data, std::byte *block_local_data, std::byte *output, nncase::ntt::runtime::thread_inout_desc *const output_descs)";
+            $"NTT_DEVICE void {VisitEntry.Name}({string.Concat(paramsExcluded.Select(Visit).Select(s => $"{s.Type} {s.Name}, ").ToArray())}const std::byte *rdata, const std::byte *thread_local_rdata, const std::byte *warp_local_rdata, const std::byte *block_local_rdata, std::byte *thread_local_data, std::byte *warp_local_data, std::byte *block_local_data, std::byte *output, nncase::ntt::runtime::thread_inout_desc *const output_descs)";
         return new(
             Declare: ctype + ";\n",
             Kernel: CSourceBuiltn.MakeKernel(ctype, _kernelBuilder.ToString()),
@@ -186,16 +186,18 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
         {
             (MemoryLocation.Rdata, 0) => "rdata",
             (MemoryLocation.ThreadLocalRdata, 0) => "thread_local_rdata",
+            (MemoryLocation.WarpLocalRdata, 0) => "warp_local_rdata",
             (MemoryLocation.BlockLocalRdata, 0) => "block_local_rdata",
             (MemoryLocation.Data, 0) => "thread_local_data",
             (MemoryLocation.Data, 1) => "thread_local_data",
+            (MemoryLocation.WarpLocalData, 0) => "warp_local_data",
             (MemoryLocation.BlockLocalData, 0) => "block_local_data",
             (MemoryLocation.Output, 0) => "output",
             _ => throw new NotSupportedException($"{expr.Location}, {expr.Hierarchy}"),
         };
 
         var ptypeName = "std::byte";
-        if (expr.Location is MemoryLocation.Rdata or MemoryLocation.ThreadLocalRdata or MemoryLocation.BlockLocalRdata)
+        if (expr.Location is MemoryLocation.Rdata or MemoryLocation.ThreadLocalRdata or MemoryLocation.WarpLocalRdata or MemoryLocation.BlockLocalRdata)
         {
             // Rdata, ThreadLocalRdata and BlockLocalRdata are const
             ptypeName = $"const {ptypeName}";
@@ -471,7 +473,7 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
                     WriteWithProfiler($"slice({VisitBuffer(args[0], local: true).Name}, {VisitBuffer(args[3], local: true).Name}, {VisitDimOrShape(args[1]).Name}, {VisitDimOrShape(args[2]).Name}, fixed_dims_v<{string.Join(",", slice.Axes)}>, fixed_dims_v<{string.Join(",", slice.Strides)}>);\n");
                     break;
                 case TIR.NTT.Concat concat:
-                    WriteWithProfiler($"concat(std::make_tuple({string.Join(",", args.SkipLast(1).Select(x => VisitBuffer(x, local: true)).Select(s => s.Name))}), {VisitBuffer(args[^1], local: true).Name}, {concat.Axis}_dim);\n");
+                    WriteWithProfiler($"concat(ntt::make_tuple({string.Join(",", args.SkipLast(1).Select(x => VisitBuffer(x, local: true)).Select(s => s.Name))}), {VisitBuffer(args[^1], local: true).Name}, {concat.Axis}_dim);\n");
                     break;
                 case TIR.NTT.Transpose transpose:
                     WriteWithProfiler($"transpose({VisitBuffer(args[0], local: true).Name}, {VisitBuffer(args[1], local: true).Name}, fixed_dims_v<{string.Join(",", transpose.Perm)}>);\n");
@@ -555,7 +557,7 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
                     WriteIndWithProfiler($"get_position_ids({VisitBuffer(args[0], local: true).Name}, {VisitBuffer(args[1], local: true).Name}, {KernelUtility.ShardingToC(getPositionIds.DistributedType)}, {Visit(getPositionIds.DistributedType.TensorType.Shape).Name});\n");
                     break;
                 case TIR.NTT.Stack stack:
-                    IndentScope.Writer.Write($"stack<{stack.Axis}>(std::make_tuple({string.Join(",", args.SkipLast(1).Select(x => VisitBuffer(x, local: true)).Select(s => s.Name))}), {VisitBuffer(args[^1], local: true).Name});\n");
+                    IndentScope.Writer.Write($"stack<{stack.Axis}>(ntt::make_tuple({string.Join(",", args.SkipLast(1).Select(x => VisitBuffer(x, local: true)).Select(s => s.Name))}), {VisitBuffer(args[^1], local: true).Name});\n");
                     break;
                 case TIR.NTT.Reshape reshape:
                     IndentScope.Writer.Write($"reshape({VisitBuffer(args[0], local: true).Name}, {VisitBuffer(args[1], local: true).Name});\n");

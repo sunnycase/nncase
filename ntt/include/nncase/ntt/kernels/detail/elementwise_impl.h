@@ -27,7 +27,7 @@ class elementwise_impl {
     constexpr void operator()(const TInputs &...inputs, TOutput &output,
                               TArgs &&...args) {
         apply_broadcasted(
-            std::make_tuple(inputs.broadcast_to(output.shape())...), output,
+            ntt::make_tuple(inputs.broadcast_to(output.shape())...), output,
             std::make_index_sequence<sizeof...(TInputs)>(),
             std::forward<TArgs>(args)...);
     }
@@ -35,10 +35,10 @@ class elementwise_impl {
   private:
     template <Tensor... TBroadcastedInputs, size_t... I, class... TArgs>
     constexpr void
-    apply_broadcasted(const std::tuple<TBroadcastedInputs...> &inputs,
+    apply_broadcasted(const ntt::tuple<TBroadcastedInputs...> &inputs,
                       TOutput &output, std::index_sequence<I...>,
                       TArgs &&...args) {
-        derived().apply(std::get<I>(inputs)..., output,
+        derived().apply(ntt::get<I>(inputs)..., output,
                         std::forward<TArgs>(args)...);
     }
 

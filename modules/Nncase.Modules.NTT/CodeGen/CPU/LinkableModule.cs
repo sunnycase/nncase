@@ -22,17 +22,19 @@ internal sealed class LinkableModule : ILinkableModule
     private readonly Stream _rdata;
     private readonly IReadOnlyList<Stream> _threadLocalRdatas;
     private readonly IReadOnlyList<Stream> _threadLocalCaches;
+    private readonly IReadOnlyList<Stream> _warpLocalRdatas;
     private readonly IReadOnlyList<Stream> _blockLocalRdatas;
     private readonly IReadOnlyList<ILinkableFunction> _functions;
     private readonly NTTTargetOptions _targetOptions;
 
-    public LinkableModule(string moduleKind, Stream desc, Stream rdata, IReadOnlyList<Stream> threadLocalRdatas, IReadOnlyList<Stream> threadLocalCaches, IReadOnlyList<Stream> blockLocalRdatas, IReadOnlyList<ILinkableFunction> functions, CompileOptions options)
+    public LinkableModule(string moduleKind, Stream desc, Stream rdata, IReadOnlyList<Stream> threadLocalRdatas, IReadOnlyList<Stream> threadLocalCaches, IReadOnlyList<Stream> warpLocalRdatas, IReadOnlyList<Stream> blockLocalRdatas, IReadOnlyList<ILinkableFunction> functions, CompileOptions options)
     {
         _moduleKind = moduleKind;
         _desc = desc;
         _rdata = rdata;
         _threadLocalRdatas = threadLocalRdatas;
         _threadLocalCaches = threadLocalCaches;
+        _warpLocalRdatas = warpLocalRdatas;
         _blockLocalRdatas = blockLocalRdatas;
         _functions = functions;
         PublicFunctions = _functions.OfType<LinkableKernelFunction>().ToArray();
@@ -136,7 +138,7 @@ internal sealed class LinkableModule : ILinkableModule
         {
             using (var writer = new StreamWriter(fs))
             {
-                writer.Write(CSourceBuiltn.ModuleTopologyDef(_targetOptions));
+                writer.Write(CSourceBuiltn.ModuleTopologyDef(_targetOptions, isCUDA: _moduleKind == CUDATarget.Kind));
             }
         }
     }
@@ -202,7 +204,7 @@ internal sealed class LinkableModule : ILinkableModule
         var funcText = File.ReadAllBytes(elfPath);
         textWriter.Write(funcText);
         linkedFunctions.Add(new LinkedFunction(mainFunc.Id, mainFunc.SourceFunction, 0, (uint)funcText.Length, mainFunc.Sections));
-        return new LinkedModule(_moduleKind, linkedFunctions, _desc, manager.GetContent(WellknownSectionNames.Text)!, _rdata, _threadLocalRdatas, _threadLocalCaches, _blockLocalRdatas, rdataAlign);
+        return new LinkedModule(_moduleKind, linkedFunctions, _desc, manager.GetContent(WellknownSectionNames.Text)!, _rdata, _threadLocalRdatas, _threadLocalCaches, _warpLocalRdatas, _blockLocalRdatas, rdataAlign);
     }
 
     private string CompileCSource(string sourcePath)

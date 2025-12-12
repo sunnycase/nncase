@@ -142,12 +142,25 @@ public sealed class TensorConst : Const, IEquatable<TensorConst?>
 
     public MemoryLocation GetMemoryLocation()
     {
-        return ValueType switch
+        if (ValueType is DistributedType dt)
         {
-            DistributedType dt when dt.AxisPolicies.Any(p => p is SBPSplit split && split.Axes.Contains(dt.Placement.Rank - 1)) => MemoryLocation.ThreadLocalRdata,
-            DistributedType => MemoryLocation.BlockLocalRdata,
-            _ => MemoryLocation.Rdata,
-        };
+            if (dt.AxisPolicies.Any(p => p is SBPSplit split && split.Axes.Contains(dt.Placement.Rank - 1)))
+            {
+                return MemoryLocation.ThreadLocalRdata;
+            }
+            else if (dt.Placement.HasWarp && dt.AxisPolicies.Any(p => p is SBPSplit split && split.Axes.Contains(dt.Placement.Rank - 2)))
+            {
+                return MemoryLocation.WarpLocalRdata;
+            }
+            else
+            {
+                return MemoryLocation.BlockLocalRdata;
+            }
+        }
+        else
+        {
+            return MemoryLocation.Rdata;
+        }
     }
 
     /// <inheritdoc/>

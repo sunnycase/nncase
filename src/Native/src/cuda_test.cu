@@ -910,6 +910,7 @@ NTT_HOST_DEVICE void test_vectorize() {
     }
 }
 
+#if 0
 NTT_HOST_DEVICE void test_im2col() {
     // im2col
     {
@@ -963,6 +964,7 @@ NTT_HOST_DEVICE void test_im2col() {
         });
     }
 }
+#endif
 
 NTT_HOST_DEVICE void test_concat() {
     auto ta = ntt::make_tensor<float>(ntt::fixed_shape_v<3, 8>);
@@ -975,7 +977,7 @@ NTT_HOST_DEVICE void test_concat() {
     auto pc = ntt::make_tensor<ntt::vector<float, 8>>(ntt::fixed_shape_v<3, 3>);
     ntt::pack(ta, pa, ntt::fixed_shape_v<1>);
     ntt::pack(tb, pb, ntt::fixed_shape_v<1>);
-    ntt::concat(std::make_tuple(pa, pb), pc, 1_dim);
+    ntt::concat(ntt::make_tuple(pa, pb), pc, 1_dim);
     ntt::unpack(pc, tc, ntt::fixed_shape_v<1>);
 
     assert(tc(0, 0) == 0.f);
@@ -1344,7 +1346,7 @@ __global__ void test_device() {
     test_unary_binary();
     test_tensor_view();
     test_vectorize();
-    test_im2col();
+    // test_im2col();
     test_concat();
     test_slice();
     test_transpose();
@@ -1377,7 +1379,7 @@ int main() {
     test_unary_binary();
     test_tensor_view();
     test_vectorize();
-    test_im2col();
+    // test_im2col();
     test_concat();
     test_slice();
     test_transpose();

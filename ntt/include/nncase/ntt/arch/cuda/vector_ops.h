@@ -13,7 +13,7 @@
  * limitations under the License.
  */
 #pragma once
+#include "../../vector_ops.h"
+#include <type_traits>
 
-namespace nncase::ntt::distributed {
-enum class topology { chip, block, warp, thread, count__ };
-} // namespace nncase::ntt::distributed
+namespace nncase::ntt::ops {} // namespace nncase::ntt::ops

@@ -28,6 +28,10 @@ extern __device__ decltype(nncase::ntt::make_tensor<
     nncase::ntt::distributed::topology_shape)) global_thread_local_rdata_ptr;
 
 extern __device__ decltype(nncase::ntt::make_tensor<
+                           nncase::ntt::vector<uintptr_t, 3>>(
+    nncase::ntt::distributed::topology_shape)) global_thread_local_cache_ptr;
+
+extern __device__ decltype(nncase::ntt::make_tensor<
                            nncase::ntt::vector<uintptr_t, 2>>(
     nncase::ntt::distributed::topology_shape)) global_block_local_rdata_ptr;
 

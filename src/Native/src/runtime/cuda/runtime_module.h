@@ -28,6 +28,7 @@ class cuda_runtime_module : public runtime_module {
     result<uintptr_t> native_handle(uint32_t flags) const noexcept override;
 
     uint64_t tdim() const noexcept { return tdim_; }
+    uint64_t wdim() const noexcept { return wdim_; }
     uint64_t bdim() const noexcept { return bdim_; }
     uint64_t cdim() const noexcept { return cdim_; }
 
@@ -45,8 +46,22 @@ class cuda_runtime_module : public runtime_module {
 
     const std::span<const std::byte>
     thread_local_rdata_content() const noexcept {
-        return thread_local_rdata_.subspan(cdim_ * bdim_ * tdim_ * 2 *
+        return thread_local_rdata_.subspan(cdim_ * bdim_ * wdim_ * tdim_ * 2 *
                                            sizeof(uint64_t));
+    }
+
+    const std::span<const std::byte> warp_local_rdata() const noexcept {
+        return warp_local_rdata_;
+    }
+
+    const uint64_t *warp_local_rdata_header(size_t offset) const noexcept {
+        return reinterpret_cast<const uint64_t *>(warp_local_rdata_.data()) +
+               offset * 2;
+    }
+
+    const std::span<const std::byte> warp_local_rdata_content() const noexcept {
+        return warp_local_rdata_.subspan(cdim_ * bdim_ * wdim_ * 2 *
+                                         sizeof(uint64_t));
     }
 
     const std::span<const std::byte> block_local_rdata() const noexcept {
@@ -83,15 +98,18 @@ class cuda_runtime_module : public runtime_module {
 
   private:
     uint64_t tdim_;
+    uint64_t wdim_;
     uint64_t bdim_;
     uint64_t cdim_;
     std::span<const std::byte> text_;
     std::span<const std::byte> rdata_;
     std::span<const std::byte> thread_local_rdata_;
+    std::span<const std::byte> warp_local_rdata_;
     std::span<const std::byte> block_local_rdata_;
     host_buffer_t text_storage_;
     host_buffer_t rdata_storage_;
     host_buffer_t thread_local_rdata_storage_;
+    host_buffer_t warp_local_rdata_storage_;
     host_buffer_t block_local_rdata_storage_;
 
     cuda_loader loader_;

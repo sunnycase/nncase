@@ -25,6 +25,7 @@
 // Arch specific types & ops
 
 #ifdef __CUDA_ARCH__
+#include "arch/cuda/vector_ops.h"
 #else
 #ifndef NNCASE_XPU_MODULE
 #ifdef __AVX2__

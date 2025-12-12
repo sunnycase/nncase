@@ -54,7 +54,7 @@ constexpr auto translate_slice_params(const TInShape &in_shape,
                                                     auto axis, auto i) {
             return cnt_new_steps.template replace_at<axis>(steps[i]);
         });
-    return std::make_tuple(new_begins, new_steps);
+    return ntt::make_tuple(new_begins, new_steps);
 }
 } // namespace slice_detail
 

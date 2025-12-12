@@ -63,7 +63,7 @@ if (CMAKE_CUDA_COMPILER)
                 -arch=sm_${arch}
                 $<TARGET_OBJECTS:${NNCASE_NTT_MODULE_TARGET_NAME}>
                 -o ${linked_obj}
-            DEPENDS ${NNCASE_NTT_MODULE_TARGET_NAME}
+            DEPENDS ${NNCASE_NTT_MODULE_TARGET_NAME} $<TARGET_OBJECTS:${NNCASE_NTT_MODULE_TARGET_NAME}>
             COMMAND_EXPAND_LISTS
             VERBATIM
             COMMENT "Linking device code for sm_${arch}"

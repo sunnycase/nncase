@@ -58,7 +58,11 @@ public sealed class UnitTestCUDAKernels : TestClassBase
     public UnitTestCUDAKernels()
     {
         DefaultTargetName = CUDATarget.Kind;
-        CompileOptions.TargetOptions = new NTTTargetOptions();
+        CompileOptions.TargetOptions = new NTTTargetOptions
+        {
+            HierarchyNames = "t",
+            Hierarchies = [[32]],
+        };
 #if DEBUG
         CompileOptions.DumpFlags = Diagnostics.DumpFlags.PassIR | Diagnostics.DumpFlags.Compile | Diagnostics.DumpFlags.Schedule | Diagnostics.DumpFlags.Rewrite | Diagnostics.DumpFlags.CodeGen | Diagnostics.DumpFlags.EGraphCost | Diagnostics.DumpFlags.Tiling;
 #endif
@@ -73,7 +77,7 @@ public sealed class UnitTestCUDAKernels : TestClassBase
 
     public static Placement DefaultPlacement => new Placement(new[] { 1 }, "t");
 
-    public static int Lane => Vector256.IsHardwareAccelerated ? 32 : 16;
+    public static int Lane => 16;
 
     public static int Rank => 1;
 
@@ -110,7 +114,7 @@ public sealed class UnitTestCUDAKernels : TestClassBase
     {
         var targetOptions = (NTTTargetOptions)CompileOptions.TargetOptions;
         targetOptions.Hierarchies[0] = hierarchy;
-        targetOptions.HierarchyNames = string.Join(string.Empty, "cbt".TakeLast(hierarchy.Length));
+        targetOptions.HierarchyNames = string.Join(string.Empty, "cbwt".TakeLast(hierarchy.Length));
         targetOptions.HierarchySizes = Enumerable.Repeat((long)MathF.Pow(2, 30), hierarchy.Length).ToArray();
         targetOptions.HierarchyLatencies = Enumerable.Repeat(1, hierarchy.Length).ToArray();
         targetOptions.HierarchyBandWidths = Enumerable.Repeat(1, hierarchy.Length).ToArray();
@@ -177,7 +181,7 @@ public sealed class UnitTestCUDAKernels : TestClassBase
     {
         var targetOptions = (NTTTargetOptions)CompileOptions.TargetOptions;
         targetOptions.Hierarchies[0] = hierarchy;
-        targetOptions.HierarchyNames = string.Join(string.Empty, "cbt".TakeLast(hierarchy.Length));
+        targetOptions.HierarchyNames = string.Join(string.Empty, "cbwt".TakeLast(hierarchy.Length));
         targetOptions.HierarchySizes = Enumerable.Repeat((long)MathF.Pow(2, 30), hierarchy.Length).ToArray();
         targetOptions.HierarchyLatencies = Enumerable.Repeat(1, hierarchy.Length).ToArray();
         targetOptions.HierarchyBandWidths = Enumerable.Repeat(1, hierarchy.Length).ToArray();
@@ -246,7 +250,7 @@ public sealed class UnitTestCUDAKernels : TestClassBase
     {
         var targetOptions = (NTTTargetOptions)CompileOptions.TargetOptions;
         targetOptions.Hierarchies[0] = hierarchy;
-        targetOptions.HierarchyNames = string.Join(string.Empty, "cbt".TakeLast(hierarchy.Length));
+        targetOptions.HierarchyNames = string.Join(string.Empty, "cbwt".TakeLast(hierarchy.Length));
         targetOptions.HierarchySizes = Enumerable.Repeat((long)MathF.Pow(2, 30), hierarchy.Length).ToArray();
         targetOptions.HierarchyLatencies = Enumerable.Repeat(1, hierarchy.Length).ToArray();
         targetOptions.HierarchyBandWidths = Enumerable.Repeat(1, hierarchy.Length).ToArray();
@@ -283,7 +287,7 @@ public sealed class UnitTestCUDAKernels : TestClassBase
     {
         var targetOptions = (NTTTargetOptions)CompileOptions.TargetOptions;
         targetOptions.Hierarchies[0] = hierarchy;
-        targetOptions.HierarchyNames = string.Join(string.Empty, "cbt".TakeLast(hierarchy.Length));
+        targetOptions.HierarchyNames = string.Join(string.Empty, "cbwt".TakeLast(hierarchy.Length));
         targetOptions.HierarchySizes = Enumerable.Repeat((long)MathF.Pow(2, 30), hierarchy.Length).ToArray();
         targetOptions.HierarchyLatencies = Enumerable.Repeat(1, hierarchy.Length).ToArray();
         targetOptions.HierarchyBandWidths = Enumerable.Repeat(1, hierarchy.Length).ToArray();
@@ -316,7 +320,7 @@ public sealed class UnitTestCUDAKernels : TestClassBase
     {
         var targetOptions = (NTTTargetOptions)CompileOptions.TargetOptions;
         targetOptions.Hierarchies[0] = hierarchy;
-        targetOptions.HierarchyNames = string.Join(string.Empty, "cbt".TakeLast(hierarchy.Length));
+        targetOptions.HierarchyNames = string.Join(string.Empty, "cbwt".TakeLast(hierarchy.Length));
         targetOptions.HierarchySizes = Enumerable.Repeat((long)MathF.Pow(2, 30), hierarchy.Length).ToArray();
         targetOptions.HierarchyLatencies = Enumerable.Repeat(1, hierarchy.Length).ToArray();
         targetOptions.HierarchyBandWidths = Enumerable.Repeat(1, hierarchy.Length).ToArray();
@@ -430,7 +434,7 @@ public sealed class UnitTestCUDAKernels : TestClassBase
     {
         var targetOptions = (NTTTargetOptions)CompileOptions.TargetOptions;
         targetOptions.Hierarchies[0] = hierarchy;
-        targetOptions.HierarchyNames = string.Join(string.Empty, "cbt".TakeLast(hierarchy.Length));
+        targetOptions.HierarchyNames = string.Join(string.Empty, "cbwt".TakeLast(hierarchy.Length));
         targetOptions.HierarchySizes = Enumerable.Repeat((long)MathF.Pow(2, 30), hierarchy.Length).ToArray();
         targetOptions.HierarchyLatencies = Enumerable.Repeat(1, hierarchy.Length).ToArray();
         targetOptions.HierarchyBandWidths = Enumerable.Repeat(1, hierarchy.Length).ToArray();
@@ -486,7 +490,7 @@ public sealed class UnitTestCUDAKernels : TestClassBase
     {
         var targetOptions = (NTTTargetOptions)CompileOptions.TargetOptions;
         targetOptions.Hierarchies[0] = hierarchy;
-        targetOptions.HierarchyNames = string.Join(string.Empty, "cbt".TakeLast(hierarchy.Length));
+        targetOptions.HierarchyNames = string.Join(string.Empty, "cbwt".TakeLast(hierarchy.Length));
         targetOptions.HierarchySizes = Enumerable.Repeat((long)MathF.Pow(2, 40), hierarchy.Length).ToArray();
         targetOptions.HierarchyLatencies = Enumerable.Repeat(1, hierarchy.Length).ToArray();
         targetOptions.HierarchyBandWidths = Enumerable.Repeat(1, hierarchy.Length).ToArray();
@@ -522,7 +526,7 @@ public sealed class UnitTestCUDAKernels : TestClassBase
     {
         var targetOptions = (NTTTargetOptions)CompileOptions.TargetOptions;
         targetOptions.Hierarchies[0] = hierarchy;
-        targetOptions.HierarchyNames = string.Join(string.Empty, "cbt".TakeLast(hierarchy.Length));
+        targetOptions.HierarchyNames = string.Join(string.Empty, "cbwt".TakeLast(hierarchy.Length));
         targetOptions.HierarchySizes = Enumerable.Repeat((long)MathF.Pow(2, 40), hierarchy.Length).ToArray();
         targetOptions.HierarchyLatencies = Enumerable.Repeat(1, hierarchy.Length).ToArray();
         targetOptions.HierarchyBandWidths = Enumerable.Repeat(1, hierarchy.Length).ToArray();
@@ -553,7 +557,7 @@ public sealed class UnitTestCUDAKernels : TestClassBase
     {
         var targetOptions = (NTTTargetOptions)CompileOptions.TargetOptions;
         targetOptions.Hierarchies[0] = hierarchy;
-        targetOptions.HierarchyNames = string.Join(string.Empty, "cbt".TakeLast(hierarchy.Length));
+        targetOptions.HierarchyNames = string.Join(string.Empty, "cbwt".TakeLast(hierarchy.Length));
         targetOptions.HierarchySizes = Enumerable.Repeat((long)MathF.Pow(2, 30), hierarchy.Length).ToArray();
         targetOptions.HierarchyLatencies = Enumerable.Repeat(1, hierarchy.Length).ToArray();
         targetOptions.HierarchyBandWidths = Enumerable.Repeat(1, hierarchy.Length).ToArray();
@@ -631,7 +635,7 @@ public sealed class UnitTestCUDAKernels : TestClassBase
     {
         var targetOptions = (NTTTargetOptions)CompileOptions.TargetOptions;
         targetOptions.Hierarchies[0] = hierarchy;
-        targetOptions.HierarchyNames = string.Join(string.Empty, "cbt".TakeLast(hierarchy.Length));
+        targetOptions.HierarchyNames = string.Join(string.Empty, "cbwt".TakeLast(hierarchy.Length));
         targetOptions.HierarchySizes = Enumerable.Repeat((long)MathF.Pow(2, 30), hierarchy.Length).ToArray();
         targetOptions.HierarchyLatencies = Enumerable.Repeat(1, hierarchy.Length).ToArray();
         targetOptions.HierarchyBandWidths = Enumerable.Repeat(1, hierarchy.Length).ToArray();
@@ -673,7 +677,7 @@ public sealed class UnitTestCUDAKernels : TestClassBase
     {
         var targetOptions = (NTTTargetOptions)CompileOptions.TargetOptions;
         targetOptions.Hierarchies[0] = hierarchy;
-        targetOptions.HierarchyNames = string.Join(string.Empty, "cbt".TakeLast(hierarchy.Length));
+        targetOptions.HierarchyNames = string.Join(string.Empty, "cbwt".TakeLast(hierarchy.Length));
         targetOptions.HierarchySizes = Enumerable.Repeat((long)MathF.Pow(2, 30), hierarchy.Length).ToArray();
         targetOptions.HierarchyLatencies = Enumerable.Repeat(1, hierarchy.Length).ToArray();
         targetOptions.HierarchyBandWidths = Enumerable.Repeat(1, hierarchy.Length).ToArray();
@@ -836,7 +840,7 @@ public sealed class UnitTestCUDAKernels : TestClassBase
     {
         var targetOptions = (NTTTargetOptions)CompileOptions.TargetOptions;
         targetOptions.Hierarchies[0] = hierarchy;
-        targetOptions.HierarchyNames = string.Join(string.Empty, "cbt".Skip(3 - hierarchy.Length));
+        targetOptions.HierarchyNames = string.Join(string.Empty, "cbwt".Skip(4 - hierarchy.Length));
         targetOptions.HierarchyLatencies = Enumerable.Repeat(1, hierarchy.Length).ToArray();
         targetOptions.HierarchyBandWidths = Enumerable.Repeat(1, hierarchy.Length).ToArray();
         var lhsTensor = IR.F.Random.Normal(DataTypes.Float32, 0, 1, 1, lhsShape).Evaluate().AsTensor(); // IR.F.Tensors.ConstantOfShape(lhsShape, 1.0f).Evaluate().AsTensor();
@@ -874,7 +878,7 @@ public sealed class UnitTestCUDAKernels : TestClassBase
     {
         var targetOptions = (NTTTargetOptions)CompileOptions.TargetOptions;
         targetOptions.Hierarchies[0] = hierarchy;
-        targetOptions.HierarchyNames = string.Join(string.Empty, "cbt".Skip(3 - hierarchy.Length));
+        targetOptions.HierarchyNames = string.Join(string.Empty, "cbwt".Skip(4 - hierarchy.Length));
         targetOptions.HierarchyLatencies = Enumerable.Repeat(1, hierarchy.Length).ToArray();
         targetOptions.HierarchyBandWidths = Enumerable.Repeat(1, hierarchy.Length).ToArray();
         var lhsTensor = IR.F.Random.Normal(DataTypes.Float32, 0, 1, 1, lhsShape).Evaluate().AsTensor(); // IR.F.Tensors.ConstantOfShape(lhsShape, 1.0f).Evaluate().AsTensor();
@@ -922,7 +926,7 @@ public sealed class UnitTestCUDAKernels : TestClassBase
     {
         var targetOptions = (NTTTargetOptions)CompileOptions.TargetOptions;
         targetOptions.Hierarchies[0] = hierarchy;
-        targetOptions.HierarchyNames = string.Join(string.Empty, "cbt".TakeLast(hierarchy.Length));
+        targetOptions.HierarchyNames = string.Join(string.Empty, "cbwt".TakeLast(hierarchy.Length));
         targetOptions.HierarchySizes = Enumerable.Repeat((long)MathF.Pow(2, 30), hierarchy.Length).ToArray();
         targetOptions.HierarchyLatencies = Enumerable.Repeat(1, hierarchy.Length).ToArray();
         targetOptions.HierarchyBandWidths = Enumerable.Repeat(1, hierarchy.Length).ToArray();
@@ -964,7 +968,7 @@ public sealed class UnitTestCUDAKernels : TestClassBase
     {
         var targetOptions = (NTTTargetOptions)CompileOptions.TargetOptions;
         targetOptions.Hierarchies[0] = hierarchy;
-        targetOptions.HierarchyNames = string.Join(string.Empty, "cbt".TakeLast(hierarchy.Length));
+        targetOptions.HierarchyNames = string.Join(string.Empty, "cbwt".TakeLast(hierarchy.Length));
         targetOptions.HierarchySizes = Enumerable.Repeat((long)MathF.Pow(2, 30), hierarchy.Length).ToArray();
         targetOptions.HierarchyLatencies = Enumerable.Repeat(1, hierarchy.Length).ToArray();
         targetOptions.HierarchyBandWidths = Enumerable.Repeat(1, hierarchy.Length).ToArray();
@@ -1014,7 +1018,7 @@ public sealed class UnitTestCUDAKernels : TestClassBase
     {
         var targetOptions = (NTTTargetOptions)CompileOptions.TargetOptions;
         targetOptions.Hierarchies[0] = hierarchy;
-        targetOptions.HierarchyNames = string.Join(string.Empty, "cbt".TakeLast(hierarchy.Length));
+        targetOptions.HierarchyNames = string.Join(string.Empty, "cbwt".TakeLast(hierarchy.Length));
         targetOptions.HierarchySizes = Enumerable.Repeat((long)MathF.Pow(2, 40), hierarchy.Length).ToArray();
         targetOptions.HierarchyLatencies = Enumerable.Repeat(1, hierarchy.Length).ToArray();
         targetOptions.HierarchyBandWidths = Enumerable.Repeat(1, hierarchy.Length).ToArray();
@@ -1083,7 +1087,7 @@ public sealed class UnitTestCUDAKernels : TestClassBase
     {
         var targetOptions = (NTTTargetOptions)CompileOptions.TargetOptions;
         targetOptions.Hierarchies[0] = hierarchy;
-        targetOptions.HierarchyNames = string.Join(string.Empty, "cbt".Skip(3 - hierarchy.Length));
+        targetOptions.HierarchyNames = string.Join(string.Empty, "cbwt".Skip(4 - hierarchy.Length));
         targetOptions.HierarchyLatencies = Enumerable.Repeat(1, hierarchy.Length).ToArray();
         targetOptions.HierarchyBandWidths = Enumerable.Repeat(1, hierarchy.Length).ToArray();
         var dimVar = new DimVar("seq_len")
@@ -1166,7 +1170,7 @@ public sealed class UnitTestCUDAKernels : TestClassBase
     {
         var targetOptions = (NTTTargetOptions)CompileOptions.TargetOptions;
         targetOptions.Hierarchies[0] = hierarchy;
-        targetOptions.HierarchyNames = string.Join(string.Empty, "cbt".Skip(3 - hierarchy.Length));
+        targetOptions.HierarchyNames = string.Join(string.Empty, "cbwt".Skip(4 - hierarchy.Length));
         targetOptions.HierarchyLatencies = Enumerable.Repeat(1, hierarchy.Length).ToArray();
         targetOptions.HierarchyBandWidths = Enumerable.Repeat(1, hierarchy.Length).ToArray();
         var dimVar = new DimVar("seq_len")
@@ -1256,7 +1260,7 @@ public sealed class UnitTestCUDAKernels : TestClassBase
     {
         var targetOptions = (NTTTargetOptions)CompileOptions.TargetOptions;
         targetOptions.Hierarchies[0] = hierarchy;
-        targetOptions.HierarchyNames = string.Join(string.Empty, "cbt".Skip(3 - hierarchy.Length));
+        targetOptions.HierarchyNames = string.Join(string.Empty, "cbwt".Skip(4 - hierarchy.Length));
         targetOptions.HierarchyLatencies = Enumerable.Repeat(1, hierarchy.Length).ToArray();
         targetOptions.HierarchyBandWidths = Enumerable.Repeat(1, hierarchy.Length).ToArray();
         var lhsTensor = IR.F.Random.Normal(DataTypes.Float32, 0, 1, 1, lhsShape).Evaluate().AsTensor(); // IR.F.Tensors.ConstantOfShape(lhsShape, 1.0f).Evaluate().AsTensor();
@@ -1308,7 +1312,7 @@ public sealed class UnitTestCUDAKernels : TestClassBase
     {
         var targetOptions = (NTTTargetOptions)CompileOptions.TargetOptions;
         targetOptions.Hierarchies[0] = hierarchy;
-        targetOptions.HierarchyNames = string.Join(string.Empty, "cbt".TakeLast(hierarchy.Length));
+        targetOptions.HierarchyNames = string.Join(string.Empty, "cbwt".TakeLast(hierarchy.Length));
         targetOptions.HierarchySizes = Enumerable.Repeat((long)MathF.Pow(2, 30), hierarchy.Length).ToArray();
         targetOptions.HierarchyLatencies = Enumerable.Repeat(1, hierarchy.Length).ToArray();
         targetOptions.HierarchyBandWidths = Enumerable.Repeat(1, hierarchy.Length).ToArray();
@@ -1397,7 +1401,7 @@ public sealed class UnitTestCUDAKernels : TestClassBase
     {
         var targetOptions = (NTTTargetOptions)CompileOptions.TargetOptions;
         targetOptions.Hierarchies[0] = hierarchy;
-        targetOptions.HierarchyNames = string.Join(string.Empty, "cbt".TakeLast(hierarchy.Length));
+        targetOptions.HierarchyNames = string.Join(string.Empty, "cbwt".TakeLast(hierarchy.Length));
         targetOptions.HierarchySizes = Enumerable.Repeat((long)MathF.Pow(2, 30), hierarchy.Length).ToArray();
         targetOptions.HierarchyLatencies = Enumerable.Repeat(1, hierarchy.Length).ToArray();
         targetOptions.HierarchyBandWidths = Enumerable.Repeat(1, hierarchy.Length).ToArray();
@@ -1446,7 +1450,7 @@ public sealed class UnitTestCUDAKernels : TestClassBase
         var targetOptions = (NTTTargetOptions)CompileOptions.TargetOptions;
         targetOptions.Vectorize = true;
         targetOptions.Hierarchies[0] = hierarchy;
-        targetOptions.HierarchyNames = string.Join(string.Empty, "cbt".TakeLast(hierarchy.Length));
+        targetOptions.HierarchyNames = string.Join(string.Empty, "cbwt".TakeLast(hierarchy.Length));
         targetOptions.HierarchySizes = Enumerable.Repeat((long)MathF.Pow(2, 30), hierarchy.Length).ToArray();
         targetOptions.HierarchyLatencies = Enumerable.Repeat(1, hierarchy.Length).ToArray();
         targetOptions.HierarchyBandWidths = Enumerable.Repeat(1, hierarchy.Length).ToArray();
@@ -1508,7 +1512,7 @@ public sealed class UnitTestCUDAKernels : TestClassBase
     {
         var targetOptions = (NTTTargetOptions)CompileOptions.TargetOptions;
         targetOptions.Hierarchies[0] = hierarchy;
-        targetOptions.HierarchyNames = string.Join(string.Empty, "cbt".TakeLast(hierarchy.Length));
+        targetOptions.HierarchyNames = string.Join(string.Empty, "cbwt".TakeLast(hierarchy.Length));
         targetOptions.HierarchySizes = Enumerable.Repeat((long)MathF.Pow(2, 30), hierarchy.Length).ToArray();
         targetOptions.HierarchyLatencies = Enumerable.Repeat(1, hierarchy.Length).ToArray();
         targetOptions.HierarchyBandWidths = Enumerable.Repeat(1, hierarchy.Length).ToArray();
@@ -1537,7 +1541,7 @@ public sealed class UnitTestCUDAKernels : TestClassBase
     {
         var targetOptions = (NTTTargetOptions)CompileOptions.TargetOptions;
         targetOptions.Hierarchies[0] = hierarchy;
-        targetOptions.HierarchyNames = string.Join(string.Empty, "cbt".TakeLast(hierarchy.Length));
+        targetOptions.HierarchyNames = string.Join(string.Empty, "cbwt".TakeLast(hierarchy.Length));
         targetOptions.HierarchySizes = Enumerable.Repeat((long)MathF.Pow(2, 30), hierarchy.Length).ToArray();
         targetOptions.HierarchyLatencies = Enumerable.Repeat(1, hierarchy.Length).ToArray();
         targetOptions.HierarchyBandWidths = Enumerable.Repeat(1, hierarchy.Length).ToArray();
@@ -1581,7 +1585,7 @@ public sealed class UnitTestCUDAKernels : TestClassBase
     {
         var targetOptions = (NTTTargetOptions)CompileOptions.TargetOptions;
         targetOptions.Hierarchies[0] = hierarchy;
-        targetOptions.HierarchyNames = string.Join(string.Empty, "cbt".TakeLast(hierarchy.Length));
+        targetOptions.HierarchyNames = string.Join(string.Empty, "cbwt".TakeLast(hierarchy.Length));
         targetOptions.HierarchySizes = Enumerable.Repeat((long)MathF.Pow(2, 30), hierarchy.Length).ToArray();
         targetOptions.HierarchyLatencies = Enumerable.Repeat(1, hierarchy.Length).ToArray();
         targetOptions.HierarchyBandWidths = Enumerable.Repeat(1, hierarchy.Length).ToArray();
@@ -1614,7 +1618,7 @@ public sealed class UnitTestCUDAKernels : TestClassBase
     {
         var targetOptions = (NTTTargetOptions)CompileOptions.TargetOptions;
         targetOptions.Hierarchies[0] = hierarchy;
-        targetOptions.HierarchyNames = string.Join(string.Empty, "cbt".TakeLast(hierarchy.Length));
+        targetOptions.HierarchyNames = string.Join(string.Empty, "cbwt".TakeLast(hierarchy.Length));
         targetOptions.HierarchySizes = Enumerable.Repeat((long)MathF.Pow(2, 30), hierarchy.Length).ToArray();
         targetOptions.HierarchyLatencies = Enumerable.Repeat(1, hierarchy.Length).ToArray();
         targetOptions.HierarchyBandWidths = Enumerable.Repeat(1, hierarchy.Length).ToArray();
@@ -1650,7 +1654,7 @@ public sealed class UnitTestCUDAKernels : TestClassBase
     {
         var targetOptions = (NTTTargetOptions)CompileOptions.TargetOptions;
         targetOptions.Hierarchies[0] = hierarchy;
-        targetOptions.HierarchyNames = string.Join(string.Empty, "cbt".TakeLast(hierarchy.Length));
+        targetOptions.HierarchyNames = string.Join(string.Empty, "cbwt".TakeLast(hierarchy.Length));
         targetOptions.HierarchySizes = Enumerable.Repeat((long)MathF.Pow(2, 30), hierarchy.Length).ToArray();
         targetOptions.HierarchyLatencies = Enumerable.Repeat(1, hierarchy.Length).ToArray();
         targetOptions.HierarchyBandWidths = Enumerable.Repeat(1, hierarchy.Length).ToArray();
@@ -1685,7 +1689,7 @@ public sealed class UnitTestCUDAKernels : TestClassBase
     {
         var targetOptions = (NTTTargetOptions)CompileOptions.TargetOptions;
         targetOptions.Hierarchies[0] = hierarchy;
-        targetOptions.HierarchyNames = string.Join(string.Empty, "cbt".TakeLast(hierarchy.Length));
+        targetOptions.HierarchyNames = string.Join(string.Empty, "cbwt".TakeLast(hierarchy.Length));
         targetOptions.HierarchySizes = Enumerable.Repeat((long)MathF.Pow(2, 30), hierarchy.Length).ToArray();
         targetOptions.HierarchyLatencies = Enumerable.Repeat(1, hierarchy.Length).ToArray();
         targetOptions.HierarchyBandWidths = Enumerable.Repeat(1, hierarchy.Length).ToArray();
@@ -1724,7 +1728,7 @@ public sealed class UnitTestCUDAKernels : TestClassBase
     {
         var targetOptions = (NTTTargetOptions)CompileOptions.TargetOptions;
         targetOptions.Hierarchies[0] = hierarchy;
-        targetOptions.HierarchyNames = string.Join(string.Empty, "cbt".TakeLast(hierarchy.Length));
+        targetOptions.HierarchyNames = string.Join(string.Empty, "cbwt".TakeLast(hierarchy.Length));
         targetOptions.HierarchySizes = Enumerable.Repeat((long)MathF.Pow(2, 30), hierarchy.Length).ToArray();
         targetOptions.HierarchyLatencies = Enumerable.Repeat(1, hierarchy.Length).ToArray();
         targetOptions.HierarchyBandWidths = Enumerable.Repeat(1, hierarchy.Length).ToArray();
@@ -1759,7 +1763,7 @@ public sealed class UnitTestCUDAKernels : TestClassBase
         ((NTTTargetOptions)CompileOptions.TargetOptions).Vectorize = vectorize;
         var hierarchy = new[] { 2, 4 };
         ((NTTTargetOptions)CompileOptions.TargetOptions).Hierarchies[0] = hierarchy;
-        ((NTTTargetOptions)CompileOptions.TargetOptions).HierarchyNames = string.Join(string.Empty, "cbt".TakeLast(hierarchy.Length));
+        ((NTTTargetOptions)CompileOptions.TargetOptions).HierarchyNames = string.Join(string.Empty, "cbwt".TakeLast(hierarchy.Length));
         ((NTTTargetOptions)CompileOptions.TargetOptions).HierarchySizes = Enumerable.Repeat((long)MathF.Pow(2, 30), hierarchy.Length).ToArray();
         var vhidden_in = new Var("vhidden_in", new TensorType(DataTypes.Float32, new[] { 1, 384, 8192 }));
         var vattn_mask = new Var("vattn_mask", new TensorType(DataTypes.Float32, new[] { 1, 1, 384, 384 }));
@@ -1869,7 +1873,7 @@ public sealed class UnitTestCUDAKernels : TestClassBase
     {
         var targetOptions = (NTTTargetOptions)CompileOptions.TargetOptions;
         targetOptions.Hierarchies[0] = hierarchy;
-        targetOptions.HierarchyNames = string.Join(string.Empty, "cbt".Skip(3 - hierarchy.Length));
+        targetOptions.HierarchyNames = string.Join(string.Empty, "cbwt".Skip(4 - hierarchy.Length));
         targetOptions.HierarchyLatencies = Enumerable.Repeat(1, hierarchy.Length).ToArray();
         targetOptions.HierarchyBandWidths = Enumerable.Repeat(1, hierarchy.Length).ToArray();
         var lhsTensor = IR.F.Random.Normal(DataTypes.Float32, 0, 1, 1, lhsShape).Evaluate().AsTensor(); // IR.F.Tensors.ConstantOfShape(lhsShape, 1.0f).Evaluate().AsTensor();

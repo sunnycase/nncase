@@ -41,29 +41,26 @@ class cuda_runtime_function final : public runtime_function {
     cuda_runtime_module &module() const noexcept;
 
     const std::span<std::byte>
-    thread_local_data(size_t block_id) const noexcept {
-        auto &local_data = thread_local_datas_[block_id];
-        auto mapped_local_data =
-            local_data->map(map_read_write).expect("Failed to map local data");
-        return mapped_local_data.buffer();
+    thread_local_data(size_t chip_id) const noexcept {
+        return thread_local_datas_[chip_id];
     }
 
-    const std::span<std::byte>
-    block_local_data(size_t block_id) const noexcept {
-        auto &local_data = block_local_datas_[block_id];
-        auto mapped_local_data =
-            local_data->map(map_read_write).expect("Failed to map local data");
-        return mapped_local_data.buffer();
+    const std::span<std::byte> warp_local_data(size_t chip_id) const noexcept {
+        return warp_local_datas_[chip_id];
+    }
+
+    const std::span<std::byte> block_local_data(size_t chip_id) const noexcept {
+        return block_local_datas_[chip_id];
     }
 
     const std::span<ntt::runtime::profile_record>
-    thread_local_profile_records(size_t block_id) noexcept {
-        return profile_records_[block_id];
+    thread_local_profile_records(size_t chip_id) noexcept {
+        return profile_records_[chip_id];
     }
 
     const std::span<uint32_t>
-    thread_local_profile_record_counts(size_t block_id) noexcept {
-        return profile_record_counts_[block_id];
+    thread_local_profile_record_counts(size_t chip_id) noexcept {
+        return profile_record_counts_[chip_id];
     }
 
   protected:
@@ -80,8 +77,9 @@ class cuda_runtime_function final : public runtime_function {
 
   private:
     block_entry_t block_entry_;
-    std::span<std::byte> thread_local_datas_;
-    std::span<std::byte> block_local_datas_;
+    std::vector<std::span<std::byte>> thread_local_datas_;
+    std::vector<std::span<std::byte>> warp_local_datas_;
+    std::vector<std::span<std::byte>> block_local_datas_;
     host_buffer_t output_buffer_;
     std::vector<ntt::runtime::thread_inout_desc> input_descs_;
     std::vector<ntt::runtime::thread_inout_desc> output_descs_;

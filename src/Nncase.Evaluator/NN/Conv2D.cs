@@ -131,8 +131,8 @@ public class Conv2DEvaluator : IEvaluator<Conv2D>, ITypeInferencer<Conv2D>, ICos
         var ndsbp = new SBP[input.Placement.Rank];
         for (int i = 0; i < ndsbp.Length; i++)
         {
-            var invalid = new InvalidType($"({input.AxisPolicies[i]}, {weights.AxisPolicies[i]}) not support");
-            switch (input.AxisPolicies[i], weights.AxisPolicies[i])
+            var invalid = new InvalidType($"({ndsbpsIf[i]}, {ndsbpsW[i]}) not support");
+            switch (ndsbpsIf[i], ndsbpsW[i])
             {
                 case (SBPSplit sa, SBPSplit sb):
                     // split on ic

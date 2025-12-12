@@ -50,7 +50,10 @@ im2col_impl(const TIn &input, TOut &output,
     const auto OW = shape_infer::windowed_output_size(
         input_shape[3_dim], kernel[1_dim], strides[1_dim], 1_dim,
         padding[1_dim]);
-    const auto [batch, IC, IH, IW] = input_shape;
+    const auto batch = input_shape[0_dim];
+    const auto IC = input_shape[1_dim];
+    const auto IH = input_shape[2_dim];
+    const auto IW = input_shape[3_dim];
     const auto pad_h = padding[0_dim];
     const auto pad_w = padding[1_dim];
     const auto kernel_h = kernel[0_dim];

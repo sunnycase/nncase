@@ -15,8 +15,7 @@
 
 #pragma once
 #include <nncase/ntt/ntt.h>
-#include <thread>
-#include <barrier>
+#include <nncase/ntt/std_containers.h>
 
 /**
  * @@brief topology aware runtime
@@ -33,22 +32,15 @@ namespace tar {
     foreach (var i in comb) {
       shape[i] = 1;
     }
-    var groupRawName = groupName + "_raw";
 
-@:std::barrier<> @(groupRawName)[@(groups)] {
-    @for (int i = 0; i < groups; i++) 
-    {
-  @:std::barrier(@(groupSize)), 
-    }
-@:};
-@:auto @(groupName) = nncase::ntt::make_tensor_view_from_address<std::barrier<>>(@(groupRawName), nncase::ntt::fixed_shape_v<@(string.Join(",", shape))>);
+@:NTT_DEVICE decltype(nncase::ntt::make_tensor<ntt::fixed_barrier<@(groupSize)>>(nncase::ntt::fixed_shape_v<@(string.Join(",", shape))>)) @(groupName);
 @:
   }
 
 @if (Model.CollectivePoolSize > 0) {
-@:alignas(@Model.Alignment) uint8_t collective_pool_ptr[@Model.CollectivePoolSize];
+@:alignas(@Model.Alignment) NTT_DEVICE uint8_t collective_pool_ptr[@Model.CollectivePoolSize];
 } else {
-@:alignas(@Model.Alignment) uint8_t collective_pool_ptr[1];
+@:alignas(@Model.Alignment) NTT_DEVICE uint8_t collective_pool_ptr[1];
 }
 
 enum reduce_kind {
@@ -57,11 +49,11 @@ enum reduce_kind {
 }
 };
 
-constexpr std::array<size_t, @(hierarchy.Length)> Hierarchy = {@(string.Join(", ", hierarchy))};
-auto src_ptr_tensor = nncase::ntt::make_tensor<void *>(nncase::ntt::fixed_shape_v<@(string.Join(",", hierarchy))>);
-auto dest_ptr_tensor = nncase::ntt::make_tensor<void *>(nncase::ntt::fixed_shape_v<@(string.Join(",", hierarchy))>);
+NTT_DEVICE constexpr ntt::array<size_t, @(hierarchy.Length)> Hierarchy = {@(string.Join(", ", hierarchy))};
+NTT_DEVICE auto src_ptr_tensor = nncase::ntt::make_tensor<void *>(nncase::ntt::fixed_shape_v<@(string.Join(",", hierarchy))>);
+NTT_DEVICE auto dest_ptr_tensor = nncase::ntt::make_tensor<void *>(nncase::ntt::fixed_shape_v<@(string.Join(",", hierarchy))>);
 
-template <size_t Level> static std::byte *get_cache_address() {
+template <size_t Level> NTT_DEVICE static std::byte *get_cache_address() {
     return reinterpret_cast<std::byte *>(
         ntt::distributed::detail::global_thread_local_cache_ptr(program_ids())(
             Level));
@@ -77,7 +69,7 @@ namespace tac {
 using namespace nncase;
 
 template <ntt::Shape GlobalShape, ntt::Shape Index, ntt::Tensor TDst>
-void tensor_boxing_load_sync(const GlobalShape &global_shape, const Index &index, TDst &dest)
+NTT_DEVICE void tensor_boxing_load_sync(const GlobalShape &global_shape, const Index &index, TDst &dest)
 {
     using TOutBase = std::decay_t<TDst>;
     using TElem = typename TOutBase::element_type;
@@ -87,7 +79,7 @@ void tensor_boxing_load_sync(const GlobalShape &global_shape, const Index &index
 }
 
 template <ntt::Shape GlobalShape, ntt::Shape Index, ntt::Tensor TSrc>
-void tensor_boxing_store_sync(const GlobalShape &global_shape, const Index &index, TSrc &src)
+NTT_DEVICE void tensor_boxing_store_sync(const GlobalShape &global_shape, const Index &index, TSrc &src)
 {
     using TSrcBase = std::decay_t<TSrc>;
     using TElem = typename TSrcBase::element_type;
@@ -103,14 +95,14 @@ template <tar::reduce_kind Kind> class group_hierarchy_getter;
 @:template <> class group_hierarchy_getter<tar::reduce_kind::@(GetName(comb, string.Empty))> {
   var shape = Enumerable.Range(0, hierarchy.Length).Select(i => comb.Contains(i) ?  hierarchy[i] : 1).ToArray();
 @:public:
-@:    static constexpr auto group_hierarchy = ntt::fixed_shape_v<@(string.Join(", ", shape))>;
+@:    NTT_DEVICE static constexpr auto group_hierarchy = ntt::fixed_shape_v<@(string.Join(", ", shape))>;
 @:};
 }
 
 template <ntt::reduce_op Op, tar::reduce_kind Kind>
 class tensor_reduce_sync_impl {
   public:
-    void reduce_group_sync() const noexcept {
+    NTT_DEVICE void reduce_group_sync() const noexcept {
         @foreach(var comb in combinations) {
           var reduce_group_index = string.Join(", ", Enumerable.Range(0, hierarchy.Length).Select(i => comb.Contains(i) ? "0" : "ntt::distributed::" + hierarchyNames[i] + "id()"));
         @:if constexpr (Kind == tar::reduce_kind::@(GetName(comb, string.Empty))) {
@@ -124,7 +116,7 @@ class tensor_reduce_sync_impl {
     }
 
     template <ntt::Shape TIndexInGroup, ntt::Shape TIndexInGlobal>
-    constexpr auto index_group2global(const TIndexInGroup &index_in_group, const TIndexInGlobal &index_in_global) const noexcept {
+    NTT_DEVICE constexpr auto index_group2global(const TIndexInGroup &index_in_group, const TIndexInGlobal &index_in_global) const noexcept {
         return ntt::generate_shape<TIndexInGlobal::rank()>([&](auto axis) {
             if constexpr (Kind & (1 << (TIndexInGlobal::rank() - axis))) {
                 return index_in_group[axis];
@@ -135,7 +127,7 @@ class tensor_reduce_sync_impl {
     }
 
     template <ntt::Shape TIndexInGlobal>
-    constexpr auto index_global2group(const TIndexInGlobal &index_in_global) const noexcept {
+    NTT_DEVICE constexpr auto index_global2group(const TIndexInGlobal &index_in_global) const noexcept {
         return ntt::generate_shape<TIndexInGlobal::rank()>([&](auto axis) {
             if constexpr (Kind & (1 << (TIndexInGlobal::rank() - axis))) {
                 return index_in_global[axis];
@@ -145,7 +137,7 @@ class tensor_reduce_sync_impl {
         });
     }
 
-    static constexpr auto get_group_size() {
+    NTT_DEVICE static constexpr auto get_group_size() {
         size_t group_size = 1;
         for (size_t i = 1; i <= tar::Hierarchy.size(); i++) {
             if (Kind & (1 << i)) {
@@ -160,7 +152,7 @@ class tensor_reduce_sync_impl {
     }
 
     template <class TSliceIn, class TSliceOut>
-    void reduce_impl(TSliceIn &local, TSliceIn &remote, TSliceOut &dest) {
+    NTT_DEVICE void reduce_impl(TSliceIn &local, TSliceIn &remote, TSliceOut &dest) {
         if constexpr (Op == ntt::reduce_op::max) {
             ntt::binary<ntt::ops::max>(local, remote, dest);
         } else if constexpr (Op == ntt::reduce_op::sum ||
@@ -173,7 +165,7 @@ class tensor_reduce_sync_impl {
         }
     }
 
-    template <class TIn, class TOut> void operator()(TIn &src, TOut &&dest) {
+    template <class TIn, class TOut> NTT_DEVICE void operator()(TIn &src, TOut &&dest) {
         // collect all tensors pointer for access tensor from other nodes.
         using TElem = typename TIn::element_type;
         using TOutBase = std::decay_t<TOut>;
@@ -289,7 +281,7 @@ class tensor_reduce_sync_impl {
 } // namespace detail
 
 template <ntt::reduce_op Op, tar::reduce_kind Kind, class TIn, class TOut>
-void tensor_reduce_sync(TIn &input, TOut &&output) {
+NTT_DEVICE void tensor_reduce_sync(TIn &input, TOut &&output) {
     detail::tensor_reduce_sync_impl<Op, Kind> impl;
     impl(input, output);
 }

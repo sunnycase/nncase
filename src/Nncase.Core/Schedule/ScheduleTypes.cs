@@ -85,6 +85,7 @@ public sealed class SchedFunctionResult
     {
         Rdatas = new(ReferenceEqualityComparer.Instance);
         ThreadLocalRdatas = new(ReferenceEqualityComparer.Instance);
+        WarpLocalRdatas = new(ReferenceEqualityComparer.Instance);
         BlockLocalRdatas = new(ReferenceEqualityComparer.Instance);
         DataUsage = 0;
         BlockLocalDataPoolSize = 0;
@@ -104,12 +105,22 @@ public sealed class SchedFunctionResult
     /// <summary>
     /// Gets the buffer allocation.
     /// </summary>
+    public Dictionary<IR.Const, ValueRange<ulong>> WarpLocalRdatas { get; }
+
+    /// <summary>
+    /// Gets the buffer allocation.
+    /// </summary>
     public Dictionary<IR.Const, ValueRange<ulong>> BlockLocalRdatas { get; }
 
     /// <summary>
     /// Gets or sets the data section length.
     /// </summary>
     public ulong DataUsage { get; set; }
+
+    /// <summary>
+    /// Gets or sets the warp local data section length.
+    /// </summary>
+    public ulong WarpLocalDataPoolSize { get; set; }
 
     /// <summary>
     /// Gets or sets the block local data section length.

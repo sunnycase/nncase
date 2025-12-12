@@ -128,7 +128,7 @@ result<std::vector<value_t>> to_values(value_t v) {
 //     auto d = (T *)get_output_span(t).unwrap().data();
 //     std::vector<T> dec_result(d, d + t->length());
 //     auto dec_shape = t->shape();
-//     return std::make_tuple(dec_result, dec_shape);
+//     return ntt::make_tuple(dec_result, dec_shape);
 // }
 
 std::vector<std::string> split(const std::string &s, char delim) {
