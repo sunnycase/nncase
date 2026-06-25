@@ -60,7 +60,7 @@ namespace Nncase.Importer
             if (bias == null)
             {
                 int? ocNumber = (int)((TensorConst)weights).CheckedShape[0].FixedValue;
-                var zeroBias = new TensorConst(new int[ocNumber == null ? default(int) : ocNumber.Value]);
+                var zeroBias = new TensorConst(new int[ocNumber == null ? default : ocNumber.Value]);
                 var conv = F.NN.Conv2D(inputDeq, weightsDeq, zeroBias, strideArr, pads, dilationArr, PadMode.Constant, group);
                 return Quantize(conv, new QuantParam(((TensorConst)yZeroPoint).Value.ToScalar<int>(), ((TensorConst)yScale).Value.ToScalar<float>()), ((TensorConst)yZeroPoint).CheckedDataType);
             }
