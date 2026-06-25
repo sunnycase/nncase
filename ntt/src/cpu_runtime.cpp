@@ -236,9 +236,9 @@ extern "C" void block_entry(const cpu_block_entry_params_t &params) {
 
             thread_main(params.input_descs, params.output_descs,
                         params.rdata.data(), thread_local_rdata.data(),
-                        params.block_local_rdata.data(),
-                        thread_local_data.data(), block_local_data.data(),
-                        params.output);
+                        nullptr, params.block_local_rdata.data(),
+                        thread_local_data.data(), nullptr,
+                        block_local_data.data(), params.output);
         });
     }
 
