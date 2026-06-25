@@ -25,7 +25,7 @@ class cuda_loader {
   public:
     cuda_loader() noexcept
         :
-#if 0 
+#if 0
      ofi_(nullptr),
 #endif
           mod_(nullptr),
