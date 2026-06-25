@@ -61,9 +61,9 @@ internal class FunctionBuilder
                 }
 
                 // 2. write the local rdatas
-                var threadLocalRdataPoolSize = SerializeLocalRdata(primFunc.SchedResult.ThreadLocalRdatas, _threadLocalRdataWriters);
-                var warpLocalRdataPoolSize = SerializeLocalRdata(primFunc.SchedResult.WarpLocalRdatas, _warpLocalRdataWriters);
-                var blockLocalRdataPoolSize = SerializeLocalRdata(primFunc.SchedResult.BlockLocalRdatas, _blockLocalRdataWriters);
+                var threadLocalRdataPoolSize = SerializeLocalRdata(primFunc.SchedResult.ThreadLocalRdatas, _threadLocalRdataWriters, "t");
+                var warpLocalRdataPoolSize = SerializeLocalRdata(primFunc.SchedResult.WarpLocalRdatas, _warpLocalRdataWriters, "w");
+                var blockLocalRdataPoolSize = SerializeLocalRdata(primFunc.SchedResult.BlockLocalRdatas, _blockLocalRdataWriters, "b");
 
                 // 3. build function.
                 var visitor = new KernelCSourceConvertVisitor(TargetOptions);
@@ -110,7 +110,7 @@ internal class FunctionBuilder
         throw new NotSupportedException($"the {baseFunc.GetType()} {baseFunc.Name} is notsupport for codegen!");
     }
 
-    private ulong SerializeLocalRdata(IReadOnlyDictionary<Const, ValueRange<ulong>> localRdatas, IReadOnlyList<BinaryWriter> localRdataWriters)
+    private ulong SerializeLocalRdata(IReadOnlyDictionary<Const, ValueRange<ulong>> localRdatas, IReadOnlyList<BinaryWriter> localRdataWriters, string scopeName)
     {
         ulong localRdataPoolSize = ulong.MinValue;
         foreach (var (@const, range) in localRdatas)
@@ -124,7 +124,7 @@ internal class FunctionBuilder
             for (int i = 0; i < localRdataWriters.Count; i++)
             {
                 var localRdataWriter = localRdataWriters[i];
-                var shardIndex = DistributedUtility.GetUnraveledIndex(i, TargetOptions.Hierarchies[0]);
+                var shardIndex = GetScopedShardIndex(i, scopeName);
                 (var localOffset, var localShape) = DistributedUtility.GetLocalOffsetAndShape(distributedType, shardIndex);
                 var linearOffset = TensorUtilities.GetLinearOffset(tensor.Strides, localOffset);
 
@@ -139,5 +139,20 @@ internal class FunctionBuilder
         }
 
         return localRdataPoolSize;
+    }
+
+    private int[] GetScopedShardIndex(int writerIndex, string scopeName)
+    {
+        var hierarchies = TargetOptions.Hierarchies[0];
+        var scopeIndex = TargetOptions.HierarchyNames.IndexOf(scopeName, StringComparison.Ordinal);
+        if (scopeIndex < 0)
+        {
+            return DistributedUtility.GetUnraveledIndex(writerIndex, hierarchies);
+        }
+
+        var scopedHierarchies = hierarchies[..(scopeIndex + 1)];
+        return DistributedUtility.GetUnraveledIndex(writerIndex, scopedHierarchies)
+            .Concat(Enumerable.Repeat(0, hierarchies.Length - scopedHierarchies.Length))
+            .ToArray();
     }
 }
