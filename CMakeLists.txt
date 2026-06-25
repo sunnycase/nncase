@@ -37,7 +37,7 @@ endif()
 
 project(nncase
   VERSION ${NNCASE_VERSION}
-  LANGUAGES C CXX ASM CUDA)
+  LANGUAGES C CXX ASM)
 
 option(DOTNET_INIT_FOR_CONFIG "Initialize dotnet from runtimeconfig" OFF)
 option(BUILD_PYTHON_BINDING "Build python binding" ON)
@@ -47,6 +47,18 @@ option(BUILD_TESTING "Build test programs" OFF)
 option(ENABLE_OP_PROFILE "Profile ops cast time" OFF)
 option(ENABLE_DUMP_MANAGER "Enable dump manager" OFF)
 option(ENABLE_DUMP_MEM "Dump mem usage" OFF)
+option(ENABLE_CUDA_RUNTIME "Enable CUDA runtime" OFF)
+
+if(DEFINED CMAKE_CUDA_COMPILER AND NOT "${CMAKE_CUDA_COMPILER}" STREQUAL "")
+    set(ENABLE_CUDA_RUNTIME ON CACHE BOOL "Enable CUDA runtime" FORCE)
+endif()
+
+if(ENABLE_CUDA_RUNTIME)
+    if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+        set(CMAKE_CUDA_ARCHITECTURES 120)
+    endif()
+    enable_language(CUDA)
+endif()
 
 if (BUILDING_RUNTIME)
     # option(ENABLE_VULKAN_RUNTIME "Enable Vulkan runtime" OFF)

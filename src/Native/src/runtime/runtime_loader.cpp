@@ -21,7 +21,9 @@
 
 #include <cstring>
 #include <nncase/runtime/cpu/runtime_module.h>
+#ifdef NNCASE_ENABLE_CUDA_RUNTIME
 #include <nncase/runtime/cuda/runtime_module.h>
+#endif
 #include <nncase/runtime/runtime_loader.h>
 #include <nncase/runtime/runtime_module.h>
 
@@ -119,10 +121,12 @@ std::pair<module_kind_t, rt_module_activator_t> builtin_activators[] = {
      [](result<std::unique_ptr<runtime_module>> &out) {
          out = cpu::create_cpu_runtime_module();
      }},
+#ifdef NNCASE_ENABLE_CUDA_RUNTIME
     {cuda::cuda_module_kind,
      [](result<std::unique_ptr<runtime_module>> &out) {
          out = cuda::create_cuda_runtime_module();
      }},
+#endif
 };
 
 result<rt_module_activator_t>
