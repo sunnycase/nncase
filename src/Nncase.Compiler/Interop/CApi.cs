@@ -660,9 +660,17 @@ public static unsafe class CApi
     [UnmanagedCallersOnly]
     private static void CompilerGencode(IntPtr compilerHandle, IntPtr streamHandle)
     {
-        var compiler = Get<Compiler>(compilerHandle);
-        var stream = Get<CStream>(streamHandle);
-        compiler.Gencode(stream);
+        try
+        {
+            var compiler = Get<Compiler>(compilerHandle);
+            var stream = Get<CStream>(streamHandle);
+            compiler.Gencode(stream);
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine(ex);
+            Environment.FailFast(ex.ToString());
+        }
     }
 
     [UnmanagedCallersOnly]
