@@ -29,6 +29,7 @@ class nncaseConan(ConanFile):
         "k230_runtime": [True, False],
         "k80_runtime": [True, False],
         "vulkan_runtime": [True, False],
+        "cuda_runtime": [True, False],
         "tests": [True, False],
         "python": [True, False],
         "python_root": ["ANY"]
@@ -40,6 +41,7 @@ class nncaseConan(ConanFile):
         "k230_runtime": False,
         "k80_runtime": False,
         "vulkan_runtime": False,
+        "cuda_runtime": False,
         "tests": False,
         "python": True,
         "python_root": ""
@@ -88,9 +90,11 @@ class nncaseConan(ConanFile):
         tc.variables['ENABLE_K230_RUNTIME'] = self.options.k230_runtime
         tc.variables['ENABLE_K80_RUNTIME'] = self.options.k80_runtime
         tc.variables['ENABLE_VULKAN_RUNTIME'] = self.options.vulkan_runtime
+        tc.variables['ENABLE_CUDA_RUNTIME'] = self.options.cuda_runtime
         tc.variables['BUILD_PYTHON_BINDING'] = self.options.python
         tc.variables['BUILD_TESTING'] = self.options.tests
-        tc.variables['CMAKE_CUDA_ARCHITECTURES'] = "120"
+        if self.options.cuda_runtime:
+            tc.variables['CMAKE_CUDA_ARCHITECTURES'] = "120"
         if self.options.get_safe("python_root", default="") != "":
             tc.variables['Python3_ROOT_DIR'] = self.options.python_root
         if self.options.runtime:

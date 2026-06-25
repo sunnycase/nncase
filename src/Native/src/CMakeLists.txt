@@ -1,5 +1,4 @@
 ﻿cmake_minimum_required (VERSION 3.13)
-find_package(CUDAToolkit REQUIRED)
 
 set(SRCS 
         api.cpp
@@ -30,8 +29,11 @@ add_subdirectory(runtime)
 
 if (NOT BUILDING_RUNTIME)
     add_executable(nncasetest test.cpp)
-    add_executable(nncase_cudatest cuda_test.cu)
     target_link_libraries(nncasetest PRIVATE nncaseruntime)
+    if(ENABLE_CUDA_RUNTIME)
+        add_executable(nncase_cudatest cuda_test.cu)
+        target_link_libraries(nncase_cudatest PRIVATE nncaseruntime CUDA::cudart)
+    endif()
     if(MSVC)
     else()
       if(APPLE)
