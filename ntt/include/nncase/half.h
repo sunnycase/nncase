@@ -33,7 +33,7 @@
 namespace nncase {
 #ifdef __CUDA_ARCH__
 using native_half_t = __half;
-#elif defined(__F16C__)
+#else
 using native_half_t = _Float16;
 #endif
 
