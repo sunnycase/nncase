@@ -40,9 +40,7 @@ if (MSVC)
                                                     "msvcrt$<$<CONFIG:Debug>:d>"
                                                     "ucrt$<$<CONFIG:Debug>:d>"
                                                     "libcpmt$<$<CONFIG:Debug>:d>")
-elseif(APPLE)
-    target_link_options(${NNCASE_NTT_MODULE_TARGET_NAME} PRIVATE -ld_classic -lc)
-else()
+elseif(NOT APPLE)
     target_link_libraries(${NNCASE_NTT_MODULE_TARGET_NAME} PRIVATE pthread)
 endif()
 
