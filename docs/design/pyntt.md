@@ -10,7 +10,8 @@ PyNTT is a Python-first nncase inference backend and megakernel framework. It
 uses nncase front-end import, graph optimization, NTT selection, tiling, and
 bufferization, then emits a runnable Python model directory instead of a native
 kmodel module. The initial backend is Triton, the runtime API uses
-`torch.Tensor`, and the first implementation supports static shapes only.
+`torch.Tensor`, and the generated model runs through the existing nncase
+compiler pipeline.
 
 PyNTT is not a rewrite of NTT. It reuses the existing NTT tensor IR and schedule
 contracts as the compiler-side source of truth, while replacing the kernel
@@ -30,13 +31,13 @@ Target and module kind: `pyntt`.
 - Reuse existing nncase and NTT compiler passes where their semantics match
   PyNTT:
   - module partitioning
-  - auto packing
-  - auto vectorization
   - auto distribution with `b` as the initial block placement axis
   - affine selection
   - auto tiling
   - TIR selection
   - bufferization
+- Skip native NTT auto packing and auto vectorization in the PyNTT pipeline
+  until Triton templates have an explicit representation for those layouts.
 - Support the first op group:
   - elementwise
   - unary
@@ -52,7 +53,6 @@ Target and module kind: `pyntt`.
 
 - Phase 1 does not need to emit a native kmodel payload.
 - Phase 1 does not need to be executable by the C++ nncase runtime.
-- Phase 1 does not support dynamic shapes.
 - Phase 1 does not support multiple Python DSL backends. Triton is the only
   backend.
 - PyNTT must not silently fall back to C++ NTT kernels. Unsupported operators,
@@ -233,7 +233,9 @@ Runtime constraints:
 - CUDA tensors are the primary execution path.
 - CPU tensors may be rejected initially unless a copy-to-CUDA policy is
   explicitly configured.
-- Shapes are static in phase 1 and must match the generated spec exactly.
+- Ranks, layouts, dtypes, and storage plans are fixed by the generated spec.
+- Dynamic dimensions are resolved from input tensor shapes before launch and
+  must satisfy the generated shape binding constraints.
 - Dtypes must match the generated spec exactly unless an explicit cast kernel is
   part of the graph.
 - Output allocation is owned by the PyNTT runtime unless the generated model
@@ -263,7 +265,7 @@ PyNTT follows the same ownership model as the existing NTT CPU codegen path:
 
 The generated Triton top kernel is instantiated from Razor templates. Template
 models carry TIR-derived dtype, shape, stride, offset, op, and launch metadata,
-and the rendered `generated_kernels.py` contains the concrete rank/static-shape
+and the rendered `generated_kernels.py` contains the concrete rank/shape-expr
 Triton code. This keeps kernel implementation logic out of the visitor without
 forcing the Python package to hand-write rank-dispatched device helpers.
 Generated load/compute/store fragments should be emitted as named Triton
@@ -277,10 +279,16 @@ backend. It should not inline large Python snippets directly in C# strings.
 Launch-shape parameters such as `block_size` are not constants owned by the
 source visitor. They are emitted as tuning or auto-tiling parameters in kernel
 metadata. The generated model selects the current parameter value, computes the
-launch grid from that value and static shape metadata, and passes it as a
-Triton constexpr to the top kernel. Later milestones should replace the M3
+launch grid from that value and resolved logical shape metadata, and passes it
+as a Triton constexpr to the top kernel. Later milestones should replace the M3
 deterministic selector with real autotune cache entries or NTT auto-tiling
 results without changing the generated top-kernel/body split.
+
+Dynamic shape dimensions are not Triton constexpr parameters. Codegen emits them
+as regular scalar kernel arguments, because their values are selected by runtime
+input tensors and shape bucket bindings. Only structural template choices such
+as rank, operator kind, dtype, and tuning meta parameters remain compile-time
+constants.
 
 ## Block-Axis Distribution
 
@@ -289,9 +297,9 @@ the first launch grid dimension: `tl.program_id(0)` is the block shard index and
 `tl.num_programs(0)` is the block shard count.
 
 Generated metadata records this as `launch.sharding` with a `local_shard`
-strategy. The generated model still owns launch shape selection and passes only
-static meta parameters to the top kernel. Generated Triton helper subfunctions
-compute the local contiguous shard region:
+strategy. The generated model still owns launch shape selection and passes
+static meta parameters plus runtime dynamic dimension scalars to the top kernel.
+Generated Triton helper subfunctions compute the local contiguous shard region:
 
 ```text
 local_extent = ceil_div(global_extent, block_count)
@@ -343,8 +351,8 @@ Example conceptual schema:
 class TensorSpec:
     name: str
     dtype: DType
-    shape: tuple[int, ...]
-    strides: tuple[int, ...]
+    shape: tuple[int | str, ...]
+    strides: tuple[int | str, ...]
     role: TensorRole
     layout: LayoutSpec
     memory: MemorySpace
@@ -357,6 +365,7 @@ class FunctionSpec:
     parameters: tuple[str, ...]
     inputs: tuple[TensorSpec, ...]
     outputs: tuple[TensorSpec, ...]
+    shape_bindings: tuple[ShapeBinding, ...]
 ```
 
 The C# emitter may serialize this as JSON plus Python builders. JSON is useful
@@ -365,7 +374,10 @@ runtime construction.
 
 Spec invariants:
 
-- All shapes are static in phase 1.
+- Tensor ranks are static, while each dimension may be either an integer or a
+  generated Python dimension expression.
+- Dynamic dimension expressions must be derived from nncase `Dimension`/shape
+  expressions and shape bucket bindings, not from ad hoc generated names.
 - Layout and strides are explicit.
 - Broadcast semantics are explicit, not inferred from shape alone.
 - Memory space is explicit.
@@ -375,6 +387,53 @@ Spec invariants:
 - Every generated kernel launch has explicit static launch metadata in the
   generated Python code and `metadata.json`.
 
+## Dynamic Shape Policy
+
+PyNTT dynamic shape support follows nncase shape expressions instead of adding a
+separate dispatch system.
+
+The compiler-side source of truth is the existing ranked shape and dimension
+expression system:
+
+- `DimConst` is emitted as a literal in Python and Triton.
+- `DimVar` is emitted as a generated Python shape binding and as a non-constexpr
+  Triton scalar argument.
+- Compound expressions such as product, sum, min, max, floor division, ceil
+  division, remainder, clamp, and compare/select are emitted as Python
+  expressions for runtime allocation/launch and as Triton scalar expressions for
+  in-kernel indexing and masking.
+
+The runtime resolves a shape environment before each function call:
+
+```text
+inputs
+  -> FunctionSpec.shape_bindings
+  -> shape_env
+  -> validate input/output tensor specs
+  -> allocate outputs using resolved shapes
+  -> compute numel/grid expressions
+  -> launch top kernel with runtime dim scalar arguments
+```
+
+Workspace and constant storage are not dynamically resized in this path. After
+bufferization, workspace sizes are static upper bounds derived from shape bucket
+ranges. Generated kernels use runtime logical shape expressions for masks, loop
+extents, and view indexing, while runtime allocation keeps the bufferized
+storage plan fixed.
+
+The split between static and dynamic data is:
+
+- Static: rank, dtype, operator specialization, memory space, workspace pool
+  size, local rdata layout, structural schedule choices, and Triton meta
+  parameters such as `block_size`.
+- Dynamic: input-bound dimensions, logical tensor shapes, logical contiguous
+  strides when they depend on dynamic dimensions, `numel`, launch grid size, and
+  masks.
+
+Dynamic dimensions must not be emitted as `tl.constexpr`. Doing so would turn
+runtime tensor shapes into Triton specialization keys and break shape-bucket
+execution semantics.
+
 ## Triton Backend
 
 The first PyNTT backend is Triton.
@@ -382,7 +441,7 @@ The first PyNTT backend is Triton.
 Backend responsibilities:
 
 - Generate Triton top-kernel source into `generated_kernels.py`.
-- Emit direct launch calls and static launch metadata into `model.py`.
+- Emit direct launch calls and launch metadata into `model.py`.
 - Validate shape, dtype, layout, and schedule constraints before codegen or
   before launch through generated runtime helpers.
 - Surface Triton compilation errors with the generated kernel name and original
@@ -392,7 +451,7 @@ M3 emits generated Triton `@triton.jit` top kernels directly. Runtime helpers
 validate `torch.Tensor` inputs and allocate outputs; they do not resolve or
 dispatch kernel descriptors.
 
-Kernel validation should be strict in phase 1. The runtime should reject
+Kernel validation should be strict. The runtime should reject
 missing launch metadata, unsupported placement, non-CUDA tensors, non-contiguous
 tensors, shape mismatches, or unsupported generated kernel patterns.
 
@@ -415,8 +474,8 @@ Initial template groups:
   - where
   - simple fused elementwise expressions where schedule allows
 - matmul
-  - static 2-D dense matmul in M4
-  - batched static matmul in a later coverage pass
+  - 2-D dense matmul in M4
+  - batched matmul in a later coverage pass
   - optional bias/scale/activation epilogue when represented in spec
 - reduce
   - sum
@@ -425,7 +484,7 @@ Initial template groups:
   - single-axis reduction in M4
   - mean if represented as reduce plus scale
 - softmax
-  - static axis softmax
+  - fixed rank/axis softmax
   - numerically stable max-subtract-exp-sum-div pattern
 
 Template design rules:
@@ -449,6 +508,65 @@ runtime utilities may support validation, tuning, and launch preparation, but
 op-specific Triton implementation should be generated from templates so each
 kernel specialization is explicit and inspectable.
 
+### Explicit Vector Layout Ops
+
+PyNTT skips the native NTT auto-pack and auto-vectorize passes in phase 1, but
+it still supports explicit layout-changing TIR ops that are produced by
+front-end or model-specific lowering. Qwen-style paged attention is the first
+case: the importer may emit `TIR.NTT.Pack`/`Unpack` to convert logical head
+dimensions into a vector-lane storage layout required by the KV cache.
+
+This boundary is important:
+
+- Auto pack/vectorize remain disabled in the PyNTT pipeline.
+- Explicit `Pack`/`Unpack` in TIR are real model semantics and must be lowered.
+- Vector element buffers are lowered to scalar physical pointer access in
+  Triton templates. The vector lane count is a static template parameter, while
+  logical dimensions remain runtime scalar arguments when they are dynamic.
+- Tail lanes are masked. Pack writes zero to physical tail lanes; unpack avoids
+  writing logical elements outside the source shape.
+
+Generated code should therefore keep the rendered kernel easy to inspect:
+logical shape expressions, physical lane expansion, offsets, masks, and stores
+are visible in the generated Triton helper instead of hidden in a package-level
+runtime dispatch.
+
+### Paged Attention KV Cache Objects
+
+Paged-attention inputs enter PyNTT as nncase runtime objects, but Triton kernels
+cannot consume Python objects. The generated model is responsible for
+materializing a stable set of tensor arguments before launch:
+
+- `metadata`: flat `int64` tensor containing number of sequences and
+  `(context_len, seq_len)` pairs.
+- `slot_mapping`: `int64` tensor used by update kernels to map logical token
+  positions to physical KV-cache slots.
+- `block_tables`: `int64` tensor used by attention kernels to map sequence
+  blocks to physical cache blocks.
+- `kv_caches`: the backing KV-cache tensor, preferably as a torch tensor view
+  over the runtime object's storage so update kernels mutate persistent state.
+
+The C# source converter should not special-case a Python object at the call
+site. Instead, when a TIR op references an object buffer, it records synthetic
+generated-kernel inputs for the object fields it needs. `model.py` then resolves
+those synthetic inputs from the original function argument through runtime
+helpers. This keeps the top-kernel signature pure Tensor/scalar while preserving
+the existing nncase object input contract at the public function boundary.
+
+Paged-attention templates follow the NTT kernel split:
+
+- `UpdatePagedAttentionKVCache` updates the persistent cache from a local
+  K/V slot tensor and a slot-mapping tensor.
+- `GatherPagedAttentionKVCache` reads cache blocks into a temporary local
+  tensor when TIR asks for a gather stage.
+- `PagedAttention` computes attention from Q, cache storage, metadata, scale,
+  and output buffers.
+
+For the first implementation, the metadata and storage layout are specialized
+from the static `IPagedAttentionKVCache` type information embedded in TIR. The
+runtime sequence lengths and dynamic token counts are passed as non-constexpr
+  Triton scalar arguments.
+
 ## Connecting Specs to PyNTT Kernels
 
 The generated model should directly launch generated Triton top kernels.
@@ -459,13 +577,16 @@ Recommended flow:
 generated model __call__
   -> validate runtime tensors against FunctionSpec/TensorSpec
   -> allocate outputs/temp buffers
-  -> launch generated Triton top kernel with static meta
+  -> resolve dynamic shape environment
+  -> launch generated Triton top kernel with runtime dim scalars and static meta
 ```
 
 Generated kernel metadata should contain:
 
 - generated top kernel name
 - static launch metadata
+- runtime dimension scalar names
+- Python expressions for dynamic launch values such as `numel`
 - optional autotune result
 - debug mapping
 
@@ -519,29 +640,25 @@ Recommended phase 1 options:
 The runtime should load constants to the target device lazily or during model
 initialization, depending on the selected runtime configuration.
 
-## Static Shape Policy
-
-Phase 1 supports static shapes only.
+## Shape Validation Policy
 
 The generated model should validate:
 
 - number of inputs
 - tensor rank
-- tensor shape
+- tensor shape or shape expression
 - dtype
 - device
 - contiguous/layout constraints
 - stride constraints when required
 
-Shape mismatch should be an error. It should not trigger dynamic recompilation
-in phase 1.
+Shape mismatch should be an error. It should not trigger dynamic recompilation.
+If a runtime input violates the shape bucket range used by compilation, the
+runtime should reject it before launching Triton.
 
-Future dynamic shape support should use specialization:
-
-- shape bucket key
-- generated or cached spec variant
-- Triton compilation cache key
-- runtime dispatch by concrete shape
+Future specialization may add multiple generated variants selected by a shape
+bucket key, but the single-variant dynamic path should remain valid for
+dimension values inside the compiled range.
 
 ## Error Handling
 
@@ -610,10 +727,10 @@ Initial test matrix:
 - elementwise unary: `abs`, `exp`, `log`, `sqrt`, `neg`
 - binary: `add`, `sub`, `mul`, `div`, `max`, `min`
 - cast: `float32 <-> float16`, integer casts where supported
-- where: boolean mask with static broadcast rules
-- matmul: 2-D static shapes first; batched static shapes later
-- reduce: sum/max/min over one static axis first; multi-axis later
-- softmax: static axis softmax
+- where: boolean mask with fixed-rank broadcast rules
+- matmul: 2-D shapes first; batched shapes later
+- reduce: sum/max/min over one fixed axis first; multi-axis later
+- softmax: fixed axis softmax
 
 Correctness tolerances should be dtype-specific and documented in tests.
 
@@ -655,6 +772,7 @@ Recommended policy:
   - kernel key
   - dtype
   - shape
+  - dynamic shape bucket key or range summary
   - layout/stride constraints
   - GPU architecture
   - Triton version
@@ -690,7 +808,7 @@ The runtime should reject unsupported spec versions with a clear error.
 - Add a minimal `PyNTTModuleBuilder` that emits a model directory.
 - Add a single generated model smoke test.
 
-### Phase 1: Static Triton Runtime
+### Phase 1: Triton Runtime
 
 - Define `ModuleSpec`, `FunctionSpec`, and `TensorSpec`.
 - Implement pure Python runtime with `torch.Tensor` validation.
@@ -706,6 +824,16 @@ The runtime should reject unsupported spec versions with a clear error.
 - Add dtype-specific correctness tolerances.
 - Add generated metadata and debug source maps.
 - Add benchmark helpers.
+
+### Phase 2.5: Dynamic Shape Bring-Up
+
+- Emit PyNTT shape expressions from nncase `Dimension` values.
+- Serialize `FunctionSpec.shape_bindings` from shape bucket metadata.
+- Resolve dynamic dimensions from `torch.Tensor.shape` in the generated runtime.
+- Pass dynamic dimensions as non-constexpr Triton scalar arguments.
+- Keep bufferized workspace allocation at static upper-bound sizes.
+- Run dynamic-shape importer coverage, starting with Qwen3 decode/prefill
+  coverage.
 
 ### Phase 3: Megakernel Improvements
 
@@ -742,10 +870,13 @@ implementation.
 Phase 1 is complete when:
 
 - `pyntt` is a registered nncase target.
-- nncase can compile small static-shape graphs to a PyNTT Python directory.
+- nncase can compile small graphs to a PyNTT Python directory.
 - The generated directory can be imported and run with `torch.Tensor` inputs.
 - The generated model directly launches generated Triton top kernels from
   `generated_kernels.py`.
+- Dynamic input dimensions are resolved through existing nncase shape
+  expressions and are passed to Triton top kernels as non-constexpr scalar
+  arguments.
 - Unsupported ops fail during compilation with clear diagnostics.
 - pytest covers the initial op group at unit and generated-model levels.
 - Generated metadata is deterministic and includes source mapping.

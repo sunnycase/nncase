@@ -1,44 +1,24 @@
 @using System.Text
+@using Nncase.CodeGen.PyNTT
 @model Nncase.CodeGen.PyNTT.PyNTTConv2DTemplateModel
 @{
-    var inputShape = "(" + string.Join(", ", Model.InputShape) + ")";
-    var weightsShape = "(" + string.Join(", ", Model.WeightsShape) + ")";
-    var outputShape = "(" + string.Join(", ", Model.OutputShape) + ")";
+    var inputShape = PyNTTTemplateUtility.ShapeTuple(Model.InputShape);
+    var weightsShape = PyNTTTemplateUtility.ShapeTuple(Model.WeightsShape);
+    var outputShape = PyNTTTemplateUtility.ShapeTuple(Model.OutputShape);
     var strideH = Model.Stride[0];
     var strideW = Model.Stride[1];
     var padTop = Model.Padding[0];
     var padLeft = Model.Padding[2];
     var dilationH = Model.Dilation[0];
     var dilationW = Model.Dilation[1];
-    var inputChannelsPerGroup = Model.WeightsShape[1];
-    var outputChannelsPerGroup = Model.OutputShape[1] / Model.Groups;
-    var kernelH = Model.WeightsShape[2];
-    var kernelW = Model.WeightsShape[3];
+    var inputChannelsPerGroup = PyNTTTemplateUtility.RequireFixed(Model.WeightsShape[1], "Conv2D input channels per group");
+    var outputChannelsPerGroup = PyNTTTemplateUtility.RequireFixed(Model.OutputShape[1], "Conv2D output channels") / Model.Groups;
+    var kernelH = PyNTTTemplateUtility.RequireFixed(Model.WeightsShape[2], "Conv2D kernel height");
+    var kernelW = PyNTTTemplateUtility.RequireFixed(Model.WeightsShape[3], "Conv2D kernel width");
 
     static string Indent(int level) => new(' ', level * 4);
 
-    static int SelectBlockAxis(long[] shape, long[] strides)
-    {
-        for (var i = shape.Length - 1; i >= 0; i--)
-        {
-            if (shape[i] > 1 && strides[i] == 1)
-            {
-                return i;
-            }
-        }
-
-        for (var i = shape.Length - 1; i >= 0; i--)
-        {
-            if (shape[i] > 1)
-            {
-                return i;
-            }
-        }
-
-        return shape.Length - 1;
-    }
-
-    var blockAxis = SelectBlockAxis(Model.OutputShape, Model.OutputStrides);
+    var blockAxis = PyNTTTemplateUtility.SelectBlockAxis(Model.OutputShape, Model.OutputStrides);
     var blockExtent = Model.OutputShape[blockAxis];
     var loopAxes = Enumerable.Range(0, Model.OutputShape.Length).Where(axis => axis != blockAxis).ToArray();
 
@@ -100,8 +80,8 @@
 # generated from CodeGen/PyNTT/Templates/Triton/Kernels/Conv2D.py.cshtml
 # @Model.Comment; input_dtype=@Model.InputDType, weights_dtype=@Model.WeightsDType, bias_dtype=@Model.BiasDType, output_dtype=@Model.OutputDType, input_shape=@inputShape, weights_shape=@weightsShape, output_shape=@outputShape
 @@triton.jit
-@($"def {Model.FunctionName}(data, rdata, thread_local_rdata, warp_local_rdata, block_local_rdata, block_size: tl.constexpr):")
-    shard_index = tl.program_id(0)
+@($"def {Model.FunctionName}(data, rdata, thread_local_rdata, warp_local_rdata, block_local_rdata{PyNTTTemplateUtility.RuntimeParameterSuffix(Model.RuntimeShapeArgs)}):")
+    shard_index = tl.program_id(0).to(tl.int64)
     input = @Html.Raw(Model.Input.Expression)
     weights = @Html.Raw(Model.Weights.Expression)
     bias = @Html.Raw(Model.Bias.Expression)

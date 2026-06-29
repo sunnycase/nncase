@@ -1,12 +1,13 @@
 """PyNTT Python runtime package."""
 
-from .ir import FunctionSpec, ModuleSpec, TensorSpec
+from .ir import FunctionSpec, ModuleSpec, ShapeBinding, TensorSpec
 from .runtime import PyNTTModule
 
 __all__ = [
     "FunctionSpec",
     "ModuleSpec",
     "PyNTTModule",
+    "ShapeBinding",
     "TensorSpec",
 ]
 

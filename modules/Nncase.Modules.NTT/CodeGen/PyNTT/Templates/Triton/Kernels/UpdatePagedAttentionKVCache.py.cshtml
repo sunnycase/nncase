@@ -1,0 +1,65 @@
+@using System.Text
+@using Nncase.CodeGen.PyNTT
+@model Nncase.CodeGen.PyNTT.PyNTTUpdatePagedAttentionKVCacheTemplateModel
+@{
+    var slotsShape = PyNTTTemplateUtility.ShapeTuple(Model.SlotsShape);
+
+    static string SlotOffset(IReadOnlyList<PyNTTDimExpression> strides, int seqAxis, int headAxis, int dimAxis, int laneCount)
+    {
+        var indices = new string[strides.Count];
+        indices[seqAxis] = "token_id";
+        indices[headAxis] = "head_id";
+        indices[dimAxis] = "dim_block";
+        var terms = new List<string>();
+        for (var axis = 0; axis < strides.Count; axis++)
+        {
+            terms.Add($"{indices[axis]} * {strides[axis]}");
+        }
+
+        return $"(({string.Join(" + ", terms)}) * {laneCount} + lane_id)";
+    }
+
+    var slotOffset = SlotOffset(Model.SlotsStrides, Model.SeqAxis, Model.HeadAxis, Model.DimAxis, Model.Cache.LaneCount);
+    var totalElements = $"({Model.SlotsShape[Model.SeqAxis]}) * ({Model.SlotsShape[Model.HeadAxis]}) * {Model.Cache.HeadDimBlocks} * {Model.Cache.LaneCount}";
+    var cacheOffset = $"((((((block_id * {Model.Cache.NumLayers} + {Model.LayerId}) * 2 + {Model.CacheKind}) * {Model.Cache.NumKVHeads} + head_id) * {Model.Cache.HeadDimBlocks} + dim_block) * {Model.Cache.BlockSize} + block_offset) * {Model.Cache.LaneCount} + lane_id)";
+}
+# generated from CodeGen/PyNTT/Templates/Triton/Kernels/UpdatePagedAttentionKVCache.py.cshtml
+# @Model.Comment; dtype=@Model.SlotsDType, slots_shape=@slotsShape, layer=@Model.LayerId, cache_kind=@Model.CacheKind
+@@triton.jit
+@($"def {Model.FunctionName}(slot_mapping, kv_cache, cache_meta, data, rdata, thread_local_rdata, warp_local_rdata, block_local_rdata{PyNTTTemplateUtility.RuntimeParameterSuffix(Model.RuntimeShapeArgs)}):")
+    shard_index = tl.program_id(0).to(tl.int64)
+    slots = @Html.Raw(Model.Slots.Expression)
+    num_seqs = tl.load(cache_meta + 0).to(tl.int64)
+    num_tokens = tl.full((), 0, tl.int64)
+    seq_id = tl.full((), 0, tl.int64)
+    while seq_id < num_seqs:
+        context_len = tl.load(cache_meta + 1 + seq_id * 2)
+        seq_len = tl.load(cache_meta + 2 + seq_id * 2)
+        num_tokens += seq_len - context_len
+        seq_id += 1
+
+    linear_start = tl.full((), 0, tl.int64)
+    while linear_start < @Html.Raw(totalElements):
+        linear = linear_start + tl.arange(0, block_size)
+        mask = linear < @Html.Raw(totalElements)
+        lane_id = linear % @Model.Cache.LaneCount
+        tmp = linear // @Model.Cache.LaneCount
+        dim_block = tmp % @Model.Cache.HeadDimBlocks
+        tmp = tmp // @Model.Cache.HeadDimBlocks
+        head_id = tmp % @Model.SlotsShape[Model.HeadAxis]
+        token_id = tmp // @Model.SlotsShape[Model.HeadAxis]
+        active = mask & (token_id < num_tokens)
+@if (Model.Cache.IdLength > 1)
+{
+<text>        shard_id = tl.load(slot_mapping + token_id * @Model.Cache.IdLength, mask=active, other=0)
+        active = active & ((shard_id == 0) | (shard_id == -1))
+</text>
+}
+        slot_id = tl.load(slot_mapping + token_id * @Model.Cache.IdLength + @(Model.Cache.IdLength - 1), mask=active, other=0)
+        block_id = slot_id // @Model.Cache.BlockSize
+        block_offset = slot_id % @Model.Cache.BlockSize
+        slot_offsets = @Html.Raw(slotOffset)
+        cache_offsets = @Html.Raw(cacheOffset)
+        value = tl.load(slots + slot_offsets, mask=active, other=0.0)
+        tl.store(kv_cache + cache_offsets, value, mask=active)
+        linear_start += block_size

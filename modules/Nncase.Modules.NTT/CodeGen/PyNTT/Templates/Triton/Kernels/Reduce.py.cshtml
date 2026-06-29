@@ -1,42 +1,17 @@
 @using System.Text
+@using Nncase.CodeGen.PyNTT
 @model Nncase.CodeGen.PyNTT.PyNTTReduceTemplateModel
 @{
-    var inputShape = "(" + string.Join(", ", Model.InputShape) + (Model.InputShape.Length == 1 ? "," : string.Empty) + ")";
-    var outputShape = "(" + string.Join(", ", Model.OutputShape) + (Model.OutputShape.Length == 1 ? "," : string.Empty) + ")";
+    var inputShape = PyNTTTemplateUtility.ShapeTuple(Model.InputShape);
+    var outputShape = PyNTTTemplateUtility.ShapeTuple(Model.OutputShape);
     var axes = "(" + string.Join(", ", Model.Axes) + (Model.Axes.Length == 1 ? "," : string.Empty) + ")";
     var rank = Model.OutputShape.Length;
     var axisSet = Model.Axes.ToHashSet();
 
     static string Indent(int level) => new(' ', level * 4);
 
-    static int SelectBlockAxis(long[] shape, long[] strides)
-    {
-        if (shape.Length == 0)
-        {
-            return 0;
-        }
-
-        for (var i = shape.Length - 1; i >= 0; i--)
-        {
-            if (shape[i] > 1 && strides[i] == 1)
-            {
-                return i;
-            }
-        }
-
-        for (var i = shape.Length - 1; i >= 0; i--)
-        {
-            if (shape[i] > 1)
-            {
-                return i;
-            }
-        }
-
-        return shape.Length - 1;
-    }
-
-    var blockAxis = SelectBlockAxis(Model.OutputShape, Model.OutputStrides);
-    var blockExtent = rank == 0 ? 1 : Model.OutputShape[blockAxis];
+    var blockAxis = PyNTTTemplateUtility.SelectBlockAxis(Model.OutputShape, Model.OutputStrides);
+    var blockExtent = rank == 0 ? PyNTTDimExpression.One : Model.OutputShape[blockAxis];
     var loopAxes = Enumerable.Range(0, rank).Where(axis => axis != blockAxis).ToArray();
 
     string AxisIndex(int axis) => axis == blockAxis ? "lane" : $"out_idx{axis}";
@@ -131,8 +106,8 @@
 # generated from CodeGen/PyNTT/Templates/Triton/Kernels/Reduce.py.cshtml
 # @Model.Comment; op=@Model.ReduceOp, input_dtype=@Model.InputDType, output_dtype=@Model.OutputDType, input_shape=@inputShape, output_shape=@outputShape, axes=@axes
 @@triton.jit
-@($"def {Model.FunctionName}(data, rdata, thread_local_rdata, warp_local_rdata, block_local_rdata, block_size: tl.constexpr):")
-    shard_index = tl.program_id(0)
+@($"def {Model.FunctionName}(data, rdata, thread_local_rdata, warp_local_rdata, block_local_rdata{PyNTTTemplateUtility.RuntimeParameterSuffix(Model.RuntimeShapeArgs)}):")
+    shard_index = tl.program_id(0).to(tl.int64)
     input0 = @Html.Raw(Model.Input.Expression)
     output = @Html.Raw(Model.Output.Expression)
 @Html.Raw(body.ToString().TrimEnd())

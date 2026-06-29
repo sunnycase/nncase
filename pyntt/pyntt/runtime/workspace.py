@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+from pathlib import Path
 from typing import Any
 
 from pyntt.runtime.errors import PyNTTSpecError
@@ -38,7 +39,10 @@ def _decode_payload(payload: str, byte_count: int) -> bytes:
             raise PyNTTSpecError("PyNTT rdata payload is non-empty for a zero-sized section.")
         return b""
 
-    raw = base64.b64decode(payload.encode("ascii"))
+    if payload.startswith("file:"):
+        raw = Path(payload[5:]).read_bytes()
+    else:
+        raw = base64.b64decode(payload.encode("ascii"))
     if len(raw) != int(byte_count):
         raise PyNTTSpecError(
             f"PyNTT rdata payload size mismatch: expected {byte_count} bytes, got {len(raw)}."

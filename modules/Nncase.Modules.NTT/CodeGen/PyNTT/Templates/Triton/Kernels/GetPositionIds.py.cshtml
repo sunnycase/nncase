@@ -1,0 +1,54 @@
+@using System.Text
+@using Nncase.CodeGen.PyNTT
+@model Nncase.CodeGen.PyNTT.PyNTTGetPositionIdsTemplateModel
+@{
+    var localShape = PyNTTTemplateUtility.ShapeTuple(Model.LocalShape);
+    var globalShape = PyNTTTemplateUtility.ShapeTuple(Model.GlobalShape);
+    var localExtent = Model.LocalShape[0];
+
+    static string Indent(int level) => new(' ', level * 4);
+
+    var body = new StringBuilder();
+    var indent = 1;
+    body.AppendLine($"{Indent(indent)}axis_start = 0");
+    body.AppendLine($"{Indent(indent)}while axis_start < {localExtent}:");
+    body.AppendLine($"{Indent(indent + 1)}lane = axis_start + tl.arange(0, block_size)");
+    body.AppendLine($"{Indent(indent + 1)}mask = lane < {localExtent}");
+    body.AppendLine($"{Indent(indent + 1)}global_lane = global_start + lane");
+    body.AppendLine($"{Indent(indent + 1)}result = tl.full((block_size,), 0.0, tl.float32)");
+    body.AppendLine($"{Indent(indent + 1)}active = tl.full((block_size,), False, tl.int1)");
+    body.AppendLine($"{Indent(indent + 1)}num_seqs = tl.load(cache_meta + 0).to(tl.int64)");
+    body.AppendLine($"{Indent(indent + 1)}seq_id = tl.full((), 0, tl.int64)");
+    body.AppendLine($"{Indent(indent + 1)}query_start = tl.full((), 0, tl.int64)");
+    body.AppendLine($"{Indent(indent + 1)}while seq_id < num_seqs:");
+    body.AppendLine($"{Indent(indent + 2)}context_len = tl.load(cache_meta + 1 + seq_id * 2)");
+    body.AppendLine($"{Indent(indent + 2)}seq_len = tl.load(cache_meta + 2 + seq_id * 2)");
+    body.AppendLine($"{Indent(indent + 2)}query_len = seq_len - context_len");
+    body.AppendLine($"{Indent(indent + 2)}query_end = query_start + query_len");
+    body.AppendLine($"{Indent(indent + 2)}in_seq = (global_lane >= query_start) & (global_lane < query_end)");
+    body.AppendLine($"{Indent(indent + 2)}result = tl.where(in_seq, (context_len + global_lane - query_start).to(tl.float32), result)");
+    body.AppendLine($"{Indent(indent + 2)}active = active | in_seq");
+    body.AppendLine($"{Indent(indent + 2)}query_start = query_end");
+    body.AppendLine($"{Indent(indent + 2)}seq_id += 1");
+    body.AppendLine($"{Indent(indent + 1)}tl.store(output + lane * {Model.OutputStrides[0]}, result, mask=mask & active)");
+    body.AppendLine($"{Indent(indent + 1)}axis_start += block_size");
+}
+# generated from CodeGen/PyNTT/Templates/Triton/Kernels/GetPositionIds.py.cshtml
+# @Model.Comment; output_dtype=@Model.OutputDType, local_shape=@localShape, global_shape=@globalShape
+@@triton.jit
+@($"def {Model.FunctionName}(cache_meta, data, rdata, thread_local_rdata, warp_local_rdata, block_local_rdata{PyNTTTemplateUtility.RuntimeParameterSuffix(Model.RuntimeShapeArgs)}):")
+    shard_count = tl.num_programs(0)
+    shard_index = tl.program_id(0).to(tl.int64)
+    output = @Html.Raw(Model.Output.Expression)
+@if (Model.ShardAxis.HasValue)
+{
+<text>    shard_axis_extent = tl.cdiv(@Model.GlobalShape[Model.ShardAxis.Value].TritonExpression, shard_count)
+    global_start = shard_index * shard_axis_extent
+</text>
+}
+else
+{
+<text>    global_start = tl.full((), 0, tl.int64)
+</text>
+}
+@Html.Raw(body.ToString().TrimEnd())

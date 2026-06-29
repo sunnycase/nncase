@@ -1,41 +1,16 @@
 @using System.Text
+@using Nncase.CodeGen.PyNTT
 @model Nncase.CodeGen.PyNTT.PyNTTConcatTemplateModel
 @{
-    var outputShape = "(" + string.Join(", ", Model.OutputShape) + (Model.OutputShape.Length == 1 ? "," : string.Empty) + ")";
+    var outputShape = PyNTTTemplateUtility.ShapeTuple(Model.OutputShape);
     var rank = Model.OutputShape.Length;
     var inputPointerLines = string.Join(Environment.NewLine, Model.Inputs.Select((input, index) => $"    input{index} = {input.Expression}"));
 
     static string Indent(int level) => new(' ', level * 4);
 
-    static int SelectBlockAxis(long[] shape, long[] strides)
-    {
-        if (shape.Length == 0)
-        {
-            return 0;
-        }
-
-        for (var i = shape.Length - 1; i >= 0; i--)
-        {
-            if (shape[i] > 1 && strides[i] == 1)
-            {
-                return i;
-            }
-        }
-
-        for (var i = shape.Length - 1; i >= 0; i--)
-        {
-            if (shape[i] > 1)
-            {
-                return i;
-            }
-        }
-
-        return shape.Length - 1;
-    }
-
     string AxisIndex(int axis, int blockAxis) => axis == blockAxis ? "lane" : $"idx{axis}";
 
-    string InputOffsetExpression(long[] shape, long[] strides, int blockAxis)
+    string InputOffsetExpression(PyNTTDimExpression[] shape, PyNTTDimExpression[] strides, int blockAxis)
     {
         var terms = new List<string>();
         for (var i = 0; i < shape.Length; i++)
@@ -46,13 +21,13 @@
         return terms.Count == 0 ? "lane * 0" : $"lane * 0 + {string.Join(" + ", terms)}";
     }
 
-    string OutputOffsetExpression(int inputIndex, int blockAxis, long axisOffset)
+    string OutputOffsetExpression(int inputIndex, int blockAxis, PyNTTDimExpression axisOffset)
     {
         var terms = new List<string>();
         for (var i = 0; i < rank; i++)
         {
             var index = AxisIndex(i, blockAxis);
-            if (i == Model.Axis && axisOffset != 0)
+            if (i == Model.Axis && axisOffset.FixedValue != 0)
             {
                 index = $"({index} + {axisOffset})";
             }
@@ -68,13 +43,16 @@
     {
         var inputShape = Model.InputShapes[inputIndex];
         var inputStrides = Model.InputStrides[inputIndex];
-        var blockAxis = SelectBlockAxis(inputShape, inputStrides);
-        var blockExtent = inputShape.Length == 0 ? 1 : inputShape[blockAxis];
+        var blockAxis = PyNTTTemplateUtility.SelectBlockAxis(inputShape, inputStrides);
+        var blockExtent = inputShape.Length == 0 ? PyNTTDimExpression.One : inputShape[blockAxis];
         var loopAxes = Enumerable.Range(0, inputShape.Length).Where(axis => axis != blockAxis).ToArray();
-        var axisOffset = 0L;
+        var axisOffset = PyNTTDimExpression.Zero;
         for (var previousInputIndex = 0; previousInputIndex < inputIndex; previousInputIndex++)
         {
-            axisOffset += Model.InputShapes[previousInputIndex][Model.Axis];
+            var previousExtent = Model.InputShapes[previousInputIndex][Model.Axis];
+            axisOffset = axisOffset.FixedValue == 0
+                ? previousExtent
+                : new PyNTTDimExpression($"({axisOffset.PythonExpression} + {previousExtent.PythonExpression})", $"({axisOffset.TritonExpression} + {previousExtent.TritonExpression})");
         }
 
         if (inputIndex > 0)
@@ -111,8 +89,8 @@
 # generated from CodeGen/PyNTT/Templates/Triton/Kernels/Concat.py.cshtml
 # @Model.Comment; dtype=@Model.OutputDType, axis=@Model.Axis, output_shape=@outputShape
 @@triton.jit
-@($"def {Model.FunctionName}(data, rdata, thread_local_rdata, warp_local_rdata, block_local_rdata, block_size: tl.constexpr):")
-    shard_index = tl.program_id(0)
+@($"def {Model.FunctionName}(data, rdata, thread_local_rdata, warp_local_rdata, block_local_rdata{PyNTTTemplateUtility.RuntimeParameterSuffix(Model.RuntimeShapeArgs)}):")
+    shard_index = tl.program_id(0).to(tl.int64)
 @Html.Raw(inputPointerLines)
     output = @Html.Raw(Model.Output.Expression)
 @Html.Raw(body.ToString().TrimEnd())

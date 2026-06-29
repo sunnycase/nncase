@@ -1,19 +1,21 @@
 @using System.Text
 @using Nncase.CodeGen.PyNTT
-@model Nncase.CodeGen.PyNTT.PyNTTElementwiseCastTemplateModel
+@model Nncase.CodeGen.PyNTT.PyNTTRoPETemplateModel
 @{
-    var shape = PyNTTTemplateUtility.ShapeTuple(Model.Shape);
+    var shape = PyNTTTemplateUtility.ShapeTuple(Model.OutputShape);
     var rank = Model.OutputShape.Length;
+    var blockAxis = rank - 1;
+    var blockExtent = Model.OutputShape[blockAxis];
+    var halfDim = blockExtent.FixedValue.HasValue
+        ? (blockExtent.FixedValue.Value / 2).ToString()
+        : $"(({blockExtent.TritonExpression}) // 2)";
+    var loopAxes = Enumerable.Range(0, rank).Where(axis => axis != blockAxis).ToArray();
 
     static string Indent(int level) => new(' ', level * 4);
 
-    var blockAxis = PyNTTTemplateUtility.SelectBlockAxis(Model.OutputShape, Model.OutputStrides);
-    var blockExtent = rank == 0 ? PyNTTDimExpression.One : Model.OutputShape[blockAxis];
-    var loopAxes = Enumerable.Range(0, rank).Where(axis => axis != blockAxis).ToArray();
-
     string AxisIndex(int axis) => axis == blockAxis ? "lane" : $"idx{axis}";
 
-    string OffsetExpression(PyNTTDimExpression[] operandShape, PyNTTDimExpression[] operandStrides)
+    string OffsetExpression(PyNTTDimExpression[] operandShape, PyNTTDimExpression[] operandStrides, string dimIndex)
     {
         var axisOffset = rank - operandShape.Length;
         var terms = new List<string>();
@@ -25,7 +27,8 @@
             }
 
             var outputAxis = axisOffset + i;
-            terms.Add($"{AxisIndex(outputAxis)} * {operandStrides[i]}");
+            var index = outputAxis == blockAxis ? dimIndex : AxisIndex(outputAxis);
+            terms.Add($"{index} * {operandStrides[i]}");
         }
 
         return terms.Count == 0 ? "lane * 0" : $"lane * 0 + {string.Join(" + ", terms)}";
@@ -55,10 +58,18 @@
     body.AppendLine($"{Indent(indent)}while axis_start < {blockExtent}:");
     body.AppendLine($"{Indent(indent + 1)}lane = axis_start + tl.arange(0, block_size)");
     body.AppendLine($"{Indent(indent + 1)}mask = lane < {blockExtent}");
-    body.AppendLine($"{Indent(indent + 1)}input_offsets = {OffsetExpression(Model.InputShape, Model.InputStrides)}");
+    body.AppendLine($"{Indent(indent + 1)}paired_lane = tl.where(lane < {halfDim}, lane + {halfDim}, lane - {halfDim})");
+    body.AppendLine($"{Indent(indent + 1)}input_offsets = {OffsetExpression(Model.InputShape, Model.InputStrides, "lane")}");
+    body.AppendLine($"{Indent(indent + 1)}paired_input_offsets = {OffsetExpression(Model.InputShape, Model.InputStrides, "paired_lane")}");
+    body.AppendLine($"{Indent(indent + 1)}cos_offsets = {OffsetExpression(Model.CosShape, Model.CosStrides, "lane")}");
+    body.AppendLine($"{Indent(indent + 1)}sin_offsets = {OffsetExpression(Model.SinShape, Model.SinStrides, "lane")}");
     body.AppendLine($"{Indent(indent + 1)}output_offsets = {OutputOffsetExpression()}");
     body.AppendLine($"{Indent(indent + 1)}value0 = tl.load(input0 + input_offsets, mask=mask)");
-    body.AppendLine($"{Indent(indent + 1)}result = {Model.CastExpression}");
+    body.AppendLine($"{Indent(indent + 1)}paired_value = tl.load(input0 + paired_input_offsets, mask=mask)");
+    body.AppendLine($"{Indent(indent + 1)}cos_value = tl.load(cos0 + cos_offsets, mask=mask)");
+    body.AppendLine($"{Indent(indent + 1)}sin_value = tl.load(sin0 + sin_offsets, mask=mask)");
+    body.AppendLine($"{Indent(indent + 1)}rotated = tl.where(lane < {halfDim}, -paired_value, paired_value)");
+    body.AppendLine($"{Indent(indent + 1)}result = value0 * cos_value + rotated * sin_value");
     body.AppendLine($"{Indent(indent + 1)}tl.store(output + output_offsets, result, mask=mask)");
     body.AppendLine($"{Indent(indent + 1)}axis_start += block_size");
 
@@ -68,11 +79,13 @@
         indent--;
     }
 }
-# generated from CodeGen/PyNTT/Templates/Triton/Kernels/ElementwiseCast.py.cshtml
-# @Model.Comment; cast_mode=@Model.CastMode, input_dtype=@Model.InputDType, output_dtype=@Model.OutputDType, shape=@shape
+# generated from CodeGen/PyNTT/Templates/Triton/Kernels/RoPE.py.cshtml
+# @Model.Comment; input_dtype=@Model.InputDType, cos_dtype=@Model.CosDType, sin_dtype=@Model.SinDType, output_dtype=@Model.OutputDType, shape=@shape
 @@triton.jit
 @($"def {Model.FunctionName}(data, rdata, thread_local_rdata, warp_local_rdata, block_local_rdata{PyNTTTemplateUtility.RuntimeParameterSuffix(Model.RuntimeShapeArgs)}):")
     shard_index = tl.program_id(0).to(tl.int64)
     input0 = @Html.Raw(Model.Input.Expression)
+    cos0 = @Html.Raw(Model.Cos.Expression)
+    sin0 = @Html.Raw(Model.Sin.Expression)
     output = @Html.Raw(Model.Output.Expression)
 @Html.Raw(body.ToString().TrimEnd())

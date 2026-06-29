@@ -69,6 +69,7 @@ public sealed class PyNTTModuleCompiler : INTTModuleCompiler
                 or IR.NN.Pad { PadMode: PadMode.Constant }
                 or IR.NN.Conv2D { PadMode: PadMode.Constant }
                 or IR.NN.Erf
+                or IR.NN.RoPE
                 or IR.NN.Swish
                 or IR.Math.MatMul
                 or IR.NTT.VectorizedMatMul

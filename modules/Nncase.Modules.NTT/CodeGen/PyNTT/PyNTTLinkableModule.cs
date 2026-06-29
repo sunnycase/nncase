@@ -5,14 +5,19 @@ using System.Globalization;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Text.RegularExpressions;
 using Nncase.IR;
+using Nncase.IR.Shapes;
 using Nncase.Targets;
 using Nncase.TIR;
+using Nncase.Utilities;
 
 namespace Nncase.CodeGen.PyNTT;
 
 internal sealed class PyNTTLinkableModule : ILinkableModule
 {
+    private const int SplitLaunchHelperThreshold = 64;
+
     private readonly string _moduleKind;
     private readonly IReadOnlyList<PyNTTLinkableFunction> _functions;
     private readonly CompileOptions _compileOptions;
@@ -40,7 +45,7 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
 
     private static string[] GetParameterNames(BaseFunction function)
     {
-        return GetParameters(function).Select(parameter => parameter.Name).ToArray();
+        return GetInputParameters(function).Select(parameter => parameter.Name).ToArray();
     }
 
     private static IVar[] GetParameters(BaseFunction function)
@@ -52,6 +57,16 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
             PrimFunction f => f.Parameters.ToArray(),
             _ => Array.Empty<IVar>(),
         };
+    }
+
+    private static IVar[] GetInputParameters(BaseFunction function)
+    {
+        var outputParameters = function is PrimFunction primFunction
+            ? GetTensorStoreOutputParameters(primFunction)
+            : new HashSet<IVar>(ReferenceEqualityComparer.Instance);
+        return GetParameters(function)
+            .Where(parameter => IsTensorType(((Expr)parameter).CheckedType) && !outputParameters.Contains(parameter))
+            .ToArray();
     }
 
     private static TensorSpecMetadata[] GetInputTensorSpecs(BaseFunction function)
@@ -67,7 +82,7 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
     private static TensorSpecMetadata[] GetInputTensorSpecs(BaseFunction function, int generatedKernelCount)
     {
         var device = generatedKernelCount > 0 ? "cuda" : "any";
-        return GetParameters(function)
+        return GetInputParameters(function)
             .Select(parameter => BuildTensorSpec(parameter.Name, parameter.CheckedType, "input", device))
             .ToArray();
     }
@@ -76,12 +91,24 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
     {
         if (function.CheckedType is not CallableType callableType)
         {
-            return Array.Empty<TensorSpecMetadata>();
+            return function is PrimFunction primFunctionWithoutCallable
+                ? GetTensorStoreDestinations(primFunctionWithoutCallable)
+                    .Select((expr, index) => BuildTensorSpec($"output{index}", expr.CheckedType, "output", "like_input"))
+                    .ToArray()
+                : Array.Empty<TensorSpecMetadata>();
         }
 
-        return FlattenReturnTypes(callableType.ReturnType)
+        var outputs = FlattenReturnTypes(callableType.ReturnType)
             .Select((type, index) => BuildTensorSpec($"output{index}", type, "output", "like_input"))
             .ToArray();
+        if (outputs.Length == 0 && function is PrimFunction primFunction)
+        {
+            return GetTensorStoreDestinations(primFunction)
+                .Select((expr, index) => BuildTensorSpec($"output{index}", expr.CheckedType, "output", "like_input"))
+                .ToArray();
+        }
+
+        return outputs;
     }
 
     private static IEnumerable<IRType> FlattenReturnTypes(IRType type)
@@ -97,16 +124,19 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
     private static TensorSpecMetadata BuildTensorSpec(string name, IRType type, string role, string device)
     {
         var tensorType = GetTensorType(type, name);
-        var shape = GetStaticShape(tensorType, name);
+        var shape = GetRankedShape(tensorType, name).Dimensions.ToArray()
+            .Select(dimension => new PyNTTDimExpressionEmitter().Emit(dimension))
+            .ToArray();
+        var isObject = IsObjectDataType(tensorType.DType);
         return new TensorSpecMetadata(
             name,
             GetPyNTTDTypeName(tensorType.DType),
-            shape,
-            GetContiguousStrides(shape),
+            shape.Select(dim => dim.ToPythonLiteral()).ToArray(),
+            GetContiguousStrides(shape).Select(dim => dim.ToPythonLiteral()).ToArray(),
             role,
-            device,
-            "contiguous",
-            "global");
+            isObject ? "cpu" : device,
+            isObject ? "object" : "contiguous",
+            isObject ? "object" : "global");
     }
 
     private static TensorType GetTensorType(IRType type, string name)
@@ -119,31 +149,70 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
         };
     }
 
-    private static long[] GetStaticShape(TensorType tensorType, string name)
+    private static bool IsTensorType(IRType type)
     {
-        if (tensorType.Shape is not RankedShape { IsFixed: true } shape)
-        {
-            throw new NotSupportedException($"PyNTT M2 requires static ranked shape for {name}, got {tensorType.Shape}.");
-        }
-
-        return shape.ToValueArray();
+        return type is TensorType or DistributedType;
     }
 
-    private static long[] GetContiguousStrides(IReadOnlyList<long> shape)
+    private static bool IsObjectDataType(DataType dataType) => dataType is ReferenceType;
+
+    private static HashSet<IVar> GetTensorStoreOutputParameters(PrimFunction function)
     {
-        var strides = new long[shape.Count];
-        var stride = 1L;
-        for (var i = shape.Count - 1; i >= 0; i--)
+        var outputParameters = new HashSet<IVar>(ReferenceEqualityComparer.Instance);
+        foreach (var destination in GetTensorStoreDestinations(function))
         {
-            strides[i] = stride;
-            stride *= shape[i];
+            var unwrapped = UnwrapInputBoxing(destination);
+            if (unwrapped is IVar parameter)
+            {
+                outputParameters.Add(parameter);
+            }
         }
 
-        return strides;
+        return outputParameters;
     }
+
+    private static BaseExpr[] GetTensorStoreDestinations(PrimFunction function)
+    {
+        var destinations = new List<BaseExpr>();
+        CollectTensorStoreDestinations(function.Body, destinations);
+        return destinations
+            .Distinct((IEqualityComparer<BaseExpr>)ReferenceEqualityComparer.Instance)
+            .ToArray();
+    }
+
+    private static void CollectTensorStoreDestinations(BaseExpr expr, List<BaseExpr> destinations)
+    {
+        if (expr is Call call && call.Target is Nncase.TIR.NTT.TensorStore && call.Arguments.ToArray().Length >= 2)
+        {
+            destinations.Add(UnwrapInputBoxing(call.Arguments[1]));
+        }
+
+        foreach (var operand in expr.Operands)
+        {
+            CollectTensorStoreDestinations(operand, destinations);
+        }
+    }
+
+    private static RankedShape GetRankedShape(TensorType tensorType, string name)
+    {
+        if (tensorType.Shape is not RankedShape shape)
+        {
+            throw new NotSupportedException($"PyNTT requires ranked shape for {name}, got {tensorType.Shape}.");
+        }
+
+        return shape;
+    }
+
+    private static PyNTTDimExpression[] GetContiguousStrides(IReadOnlyList<PyNTTDimExpression> shape)
+        => PyNTTTemplateUtility.ContiguousStrides(shape);
 
     private static string GetPyNTTDTypeName(DataType dataType)
     {
+        if (IsObjectDataType(dataType))
+        {
+            return "object";
+        }
+
         return dataType.GetDisplayName() switch
         {
             "bool" => "bool",
@@ -173,19 +242,27 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
         return $"({string.Join(", ", valueArray)}{(valueArray.Length == 1 ? "," : string.Empty)})";
     }
 
-    private static string BuildFunctionSpecPython(PyNTTLinkableFunction function)
+    private string BuildFunctionSpecPython(PyNTTLinkableFunction function)
     {
         var sourceFunction = function.SourceFunction;
         var parameters = PythonTuple(GetParameterNames(sourceFunction).Select(PythonString));
         var inputs = PythonTuple(GetInputTensorSpecs(function).Select(BuildTensorSpecPython));
         var outputs = PythonTuple(GetOutputTensorSpecs(sourceFunction).Select(BuildTensorSpecPython));
+        var shapeBindings = PythonTuple(GetShapeBindings(sourceFunction).Select(BuildShapeBindingPython));
 
-        return $"        FunctionSpec(name={PythonString(sourceFunction.Name)}, module_kind={PythonString(sourceFunction.ModuleKind)}, is_entry={PythonBool(sourceFunction.IsEntry)}, parameters={parameters}, inputs={inputs}, outputs={outputs}),";
+        return $"        FunctionSpec(name={PythonString(sourceFunction.Name)}, module_kind={PythonString(sourceFunction.ModuleKind)}, is_entry={PythonBool(sourceFunction.IsEntry)}, parameters={parameters}, inputs={inputs}, outputs={outputs}, shape_bindings={shapeBindings}),";
     }
 
     private static string BuildTensorSpecPython(TensorSpecMetadata spec)
     {
-        return $"TensorSpec(name={PythonString(spec.Name)}, dtype={PythonString(spec.DType)}, shape={PythonTuple(spec.Shape.Select(value => value.ToString()))}, strides={PythonTuple(spec.Strides.Select(value => value.ToString()))}, role={PythonString(spec.Role)}, device={PythonString(spec.Device)}, layout={PythonString(spec.Layout)}, memory={PythonString(spec.Memory)})";
+        return $"TensorSpec(name={PythonString(spec.Name)}, dtype={PythonString(spec.DType)}, shape={PythonTuple(spec.Shape.Select(PythonValue))}, strides={PythonTuple(spec.Strides.Select(PythonValue))}, role={PythonString(spec.Role)}, device={PythonString(spec.Device)}, layout={PythonString(spec.Layout)}, memory={PythonString(spec.Memory)})";
+    }
+
+    private static string BuildShapeBindingPython(ShapeBindingMetadata binding)
+    {
+        var minValue = binding.MinValue.HasValue ? binding.MinValue.Value.ToString(CultureInfo.InvariantCulture) : "None";
+        var maxValue = binding.MaxValue.HasValue ? binding.MaxValue.Value.ToString(CultureInfo.InvariantCulture) : "None";
+        return $"ShapeBinding(name={PythonString(binding.Name)}, input_index={binding.InputIndex}, axis={binding.Axis}, min_value={minValue}, max_value={maxValue})";
     }
 
     private static string PythonDict(IReadOnlyDictionary<string, object> values)
@@ -204,6 +281,7 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
         {
             string text => PythonString(text),
             bool boolean => PythonBool(boolean),
+            JsonElement jsonElement => jsonElement.ToString() ?? "None",
             int integer => integer.ToString(),
             long integer => integer.ToString(),
             float number => number.ToString("R", CultureInfo.InvariantCulture),
@@ -285,7 +363,7 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
         File.WriteAllText(Path.Join(outputDirectory, "requirements.txt"), requirements, Encoding.UTF8);
         File.WriteAllText(Path.Join(outputDirectory, "README.md"), readme, Encoding.UTF8);
         File.WriteAllText(Path.Join(outputDirectory, "specs.py"), BuildSpecsPython(moduleName, backend), Encoding.UTF8);
-        File.WriteAllText(Path.Join(outputDirectory, "rdata.py"), BuildRDataPython(), Encoding.UTF8);
+        File.WriteAllText(Path.Join(outputDirectory, "rdata.py"), BuildRDataPython(outputDirectory), Encoding.UTF8);
         File.WriteAllText(Path.Join(outputDirectory, "generated_kernels.py"), BuildGeneratedKernelsPython(), Encoding.UTF8);
         File.WriteAllText(Path.Join(outputDirectory, "model.py"), BuildModelPython(), Encoding.UTF8);
     }
@@ -310,7 +388,7 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
             _functions.Select(BuildFunctionSpecPython));
 
         return $$"""
-            from pyntt.ir import FunctionSpec, ModuleSpec, TensorSpec
+            from pyntt.ir import FunctionSpec, ModuleSpec, ShapeBinding, TensorSpec
 
 
             MODULE_SPEC = ModuleSpec(
@@ -329,7 +407,7 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
         var launchStatements = entry is null ? string.Empty : BuildModelLaunchStatements(entry);
 
         return $$"""
-            from pyntt.runtime.tensor import allocate_outputs, validate_inputs
+            from pyntt.runtime.tensor import allocate_outputs, materialize_kv_cache_metadata, materialize_kv_cache_storage, materialize_kv_cache_tensor_field, resolve_shape_env, validate_inputs
             from pyntt.runtime.tuning import select_tuning_parameter
             from pyntt.runtime.workspace import allocate_workspace, materialize_rdata, materialize_rdata_table
             from .rdata import RDATA_BUNDLES
@@ -345,8 +423,9 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
                     if entry is None:
                         raise RuntimeError(f"PyNTT module {self.spec.name} does not declare an entry function.")
 
-                    validate_inputs(entry, inputs)
-                    outputs = list(allocate_outputs(entry, inputs))
+                    shape_env = resolve_shape_env(entry, inputs)
+                    validate_inputs(entry, inputs, shape_env)
+                    outputs = list(allocate_outputs(entry, inputs, shape_env))
             {{launchStatements}}
                     if len(outputs) == 1:
                         return outputs[0]
@@ -363,6 +442,12 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
         var kernels = function.GeneratedKernelSource.Kernels;
         if (kernels.Count == 0)
         {
+            var dispatch = BuildDispatchLaunchStatements(function.SourceFunction, extraIndent: 0);
+            if (!string.IsNullOrWhiteSpace(dispatch))
+            {
+                return dispatch;
+            }
+
             var outputs = GetOutputTensorSpecs(function.SourceFunction);
             if (outputs.Length == 0)
             {
@@ -380,6 +465,177 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
             kernels.Select(kernel => BuildModelKernelLaunchPython(function.SourceFunction.Name, kernel, parameterNames, outputNames)));
     }
 
+    private string BuildDispatchLaunchStatements(BaseExpr expr, int extraIndent)
+    {
+        switch (expr)
+        {
+            case PrimFunction primFunction:
+                return BuildDispatchLaunchStatements(primFunction.Body, extraIndent);
+            case Sequential sequential:
+                return string.Join(
+                    Environment.NewLine,
+                    sequential.Fields.ToArray()
+                        .Select(field => BuildDispatchLaunchStatements(field, extraIndent))
+                        .Where(statement => !string.IsNullOrWhiteSpace(statement)));
+            case IfThenElse ifThenElse:
+                return BuildDispatchIfThenElse(ifThenElse, extraIndent);
+            case Call { Target: PrimFunction callee }:
+                return IndentPythonBlock(BuildModelLaunchStatements(FindLinkableFunction(callee)), extraIndent);
+            case Return ret:
+                return string.Join(
+                    Environment.NewLine,
+                    ret.Values.ToArray()
+                        .Select(value => BuildDispatchLaunchStatements(value, extraIndent))
+                        .Where(statement => !string.IsNullOrWhiteSpace(statement)));
+            case Nncase.TIR.Buffer:
+            case Const:
+            case IVar:
+                return string.Empty;
+            default:
+                return string.Empty;
+        }
+    }
+
+    private string BuildDispatchIfThenElse(IfThenElse expr, int extraIndent)
+    {
+        var indent = new string(' ', 8 + extraIndent);
+        var condition = BuildRuntimePythonScalarExpression(expr.Condition);
+        var thenBody = BuildDispatchLaunchStatements(expr.Then, extraIndent + 4);
+        var elseBody = BuildDispatchLaunchStatements(expr.Else, extraIndent + 4);
+
+        if (string.IsNullOrWhiteSpace(thenBody))
+        {
+            thenBody = new string(' ', 12 + extraIndent) + "pass";
+        }
+
+        if (string.IsNullOrWhiteSpace(elseBody))
+        {
+            return $"{indent}if {condition}:{Environment.NewLine}{thenBody}";
+        }
+
+        return $"{indent}if {condition}:{Environment.NewLine}{thenBody}{Environment.NewLine}{indent}else:{Environment.NewLine}{elseBody}";
+    }
+
+    private PyNTTLinkableFunction FindLinkableFunction(BaseFunction sourceFunction)
+    {
+        return _functions.FirstOrDefault(function => ReferenceEquals(function.SourceFunction, sourceFunction) || function.SourceFunction.Name == sourceFunction.Name)
+            ?? throw new NotSupportedException($"Generated PyNTT dispatch references unknown function {sourceFunction.Name}.");
+    }
+
+    private static string IndentPythonBlock(string text, int extraIndent)
+    {
+        if (extraIndent == 0 || string.IsNullOrWhiteSpace(text))
+        {
+            return text;
+        }
+
+        var indent = new string(' ', extraIndent);
+        return string.Join(
+            Environment.NewLine,
+            text.Split(Environment.NewLine).Select(line => string.IsNullOrWhiteSpace(line) ? line : indent + line));
+    }
+
+    private static string BuildRuntimePythonScalarExpression(BaseExpr expr)
+    {
+        expr = UnwrapInputBoxing(expr);
+        if (expr is Dimension dimension)
+        {
+            var emitter = new PyNTTDimExpressionEmitter(formatRuntimeScalar: name => $"shape_env[{PythonString(name)}]");
+            return emitter.Emit(dimension).PythonExpression;
+        }
+
+        if (expr is TensorConst tensorConst)
+        {
+            return FormatRuntimeScalarConst(tensorConst);
+        }
+
+        if (expr is IVar parameter && parameter is Expr { CheckedType: DimensionType })
+        {
+            return $"shape_env[{PythonString(SanitizePythonIdentifier(parameter.Name))}]";
+        }
+
+        if (expr is Call call)
+        {
+            var args = call.Arguments.ToArray();
+            return call.Target switch
+            {
+                Nncase.IR.Math.Compare compare when args.Length >= 2 =>
+                    $"({BuildRuntimePythonScalarExpression(args[0])} {GetRuntimeCompareOperator(compare.CompareOp)} {BuildRuntimePythonScalarExpression(args[1])})",
+                Nncase.IR.Math.Binary binary when args.Length >= 2 =>
+                    BuildRuntimeScalarBinaryExpression(binary.BinaryOp, BuildRuntimePythonScalarExpression(args[0]), BuildRuntimePythonScalarExpression(args[1])),
+                _ => throw new NotSupportedException($"Unsupported PyNTT dispatch scalar expression call target: {call.Target.GetType().Name}."),
+            };
+        }
+
+        throw new NotSupportedException($"Unsupported PyNTT dispatch scalar expression: {expr.GetType().Name}.");
+    }
+
+    private static BaseExpr UnwrapInputBoxing(BaseExpr expr)
+    {
+        while (expr is Call call && call.Target is Nncase.IR.Distributed.Boxing)
+        {
+            expr = call.Arguments[0];
+        }
+
+        return expr;
+    }
+
+    private static string GetRuntimeCompareOperator(CompareOp op)
+    {
+        return op switch
+        {
+            CompareOp.Equal => "==",
+            CompareOp.NotEqual => "!=",
+            CompareOp.LowerThan => "<",
+            CompareOp.LowerOrEqual => "<=",
+            CompareOp.GreaterThan => ">",
+            CompareOp.GreaterOrEqual => ">=",
+            _ => throw new NotSupportedException($"Unsupported PyNTT dispatch compare op: {op}."),
+        };
+    }
+
+    private static string BuildRuntimeScalarBinaryExpression(BinaryOp op, string lhs, string rhs)
+    {
+        return op switch
+        {
+            BinaryOp.Add => $"({lhs} + {rhs})",
+            BinaryOp.Sub => $"({lhs} - {rhs})",
+            BinaryOp.Mul => $"({lhs} * {rhs})",
+            BinaryOp.Div => $"({lhs} / {rhs})",
+            BinaryOp.Mod => $"({lhs} % {rhs})",
+            BinaryOp.Min => $"min({lhs}, {rhs})",
+            BinaryOp.Max => $"max({lhs}, {rhs})",
+            BinaryOp.Pow => $"(({lhs}) ** ({rhs}))",
+            BinaryOp.BitwiseAnd => $"({lhs} & {rhs})",
+            BinaryOp.BitwiseOr => $"({lhs} | {rhs})",
+            BinaryOp.BitwiseXor => $"({lhs} ^ {rhs})",
+            BinaryOp.LogicalAnd => $"({lhs} and {rhs})",
+            BinaryOp.LogicalOr => $"({lhs} or {rhs})",
+            BinaryOp.LogicalXor => $"(({lhs}) != ({rhs}))",
+            BinaryOp.LeftShift => $"({lhs} << {rhs})",
+            BinaryOp.RightShift => $"({lhs} >> {rhs})",
+            BinaryOp.FloorDiv => $"(({lhs}) // ({rhs}))",
+            BinaryOp.CeilDiv => $"((({lhs}) + ({rhs}) - 1) // ({rhs}))",
+            _ => throw new NotSupportedException($"Unsupported PyNTT dispatch scalar binary op: {op}."),
+        };
+    }
+
+    private static string FormatRuntimeScalarConst(TensorConst tensorConst)
+    {
+        if (!tensorConst.Value.Shape.IsScalar)
+        {
+            throw new NotSupportedException("PyNTT dispatch scalar expression only supports scalar TensorConst values.");
+        }
+
+        var value = tensorConst.Value[Array.Empty<long>()];
+        return value switch
+        {
+            bool boolean => boolean ? "True" : "False",
+            IFormattable formattable => formattable.ToString(null, CultureInfo.InvariantCulture),
+            _ => value?.ToString() ?? "None",
+        };
+    }
+
     private string BuildModelKernelLaunchPython(string functionName, GeneratedKernelMetadata kernel, string[] parameterNames, string[] outputNames)
     {
         var outputAliases = BuildOutputAliasStatements(kernel);
@@ -388,9 +644,11 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
             return outputAliases;
         }
 
-        var inputArgs = kernel.Inputs.Select(name => $"inputs[{FindIndex(parameterNames, name, "input")}]");
         var outputArgs = kernel.Outputs.Select(name => $"outputs[{FindIndex(outputNames, name, "output")}]");
-        var numel = PythonValue(kernel.Launch.Meta["numel"]);
+        var kvCacheFieldInputs = GetKVCacheFieldInputs(kernel).ToDictionary(input => input.Name, StringComparer.Ordinal);
+        var inputArgs = kernel.Inputs.Select(name => BuildKernelInputExpression(name, parameterNames, kvCacheFieldInputs));
+        var runtimeShapeArgNames = GetRuntimeShapeArgs(kernel);
+        var numel = RuntimePythonExpression(kernel.Launch.Meta["numel_expr"], runtimeShapeArgNames);
         var blockSize = kernel.Launch.Tuning.Parameters["block_size"];
         var blockSizeCandidates = PythonTuple(blockSize.Candidates.Select(value => value.ToString()));
         var shardCount = kernel.Launch.Sharding.Hierarchy.Aggregate(1, (product, value) => product * value);
@@ -417,7 +675,8 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
             workspaceArgs = new[] { "data", "rdata", "thread_local_rdata", "warp_local_rdata", "block_local_rdata" };
         }
 
-        var tensorArgs = string.Join(", ", inputArgs.Concat(outputArgs).Concat(workspaceArgs));
+        var runtimeShapeArgs = runtimeShapeArgNames.Select(arg => $"shape_env[{PythonString(arg)}]").ToArray();
+        var tensorArgs = string.Join(", ", inputArgs.Concat(outputArgs).Concat(workspaceArgs).Concat(runtimeShapeArgs));
         var launchKwargs = new List<string>();
         if (kernel.Launch.NumWarps.HasValue)
         {
@@ -430,15 +689,88 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
         }
 
         var kwargs = launchKwargs.Count == 0 ? string.Empty : $", {string.Join(", ", launchKwargs)}";
+        var helperCalls = GetHelperKernelCalls(kernel);
+        var useSplitLaunch = isTir && helperCalls.Length > SplitLaunchHelperThreshold;
+        var importStatement = useSplitLaunch
+            ? "from . import generated_kernels as _generated_kernels"
+            : $"from .generated_kernels import {kernel.Name}";
+        var launchStatement = useSplitLaunch
+            ? BuildSplitHelperLaunchPython(helperCalls, kernel, parameterNames, outputNames, kvCacheFieldInputs, workspaceArgs, runtimeShapeArgs, kwargs)
+            : $"        {kernel.Name}[grid]({tensorArgs}, numel, block_size{kwargs})";
         return $"""
-                    from .generated_kernels import {kernel.Name}
+                    {importStatement}
                     numel = {numel}
                     block_size = select_tuning_parameter({PythonString(kernel.Name)}, "block_size", {blockSizeCandidates}, source={PythonString(blockSize.Source)})
                     grid = {grid}
             {workspaceSetup}
-                    {kernel.Name}[grid]({tensorArgs}, numel, block_size{kwargs})
+            {launchStatement}
             {outputAliases}
             """;
+    }
+
+    private string BuildSplitHelperLaunchPython(
+        IReadOnlyList<HelperKernelCallMetadata> helperCalls,
+        GeneratedKernelMetadata kernel,
+        string[] parameterNames,
+        string[] outputNames,
+        IReadOnlyDictionary<string, PyNTTKVCacheFieldInputMetadata> kvCacheFieldInputs,
+        IReadOnlyList<string> workspaceArgs,
+        IReadOnlyList<string> runtimeShapeArgs,
+        string kwargs)
+    {
+        var inputVariableExpressions = kernel.Inputs
+            .Select((name, index) => (Variable: $"input{index}", Expression: BuildKernelInputExpression(name, parameterNames, kvCacheFieldInputs)))
+            .ToDictionary(pair => pair.Variable, pair => pair.Expression, StringComparer.Ordinal);
+        var outputVariableExpressions = kernel.Outputs
+            .Select((name, index) => (Variable: $"output{index}", Expression: $"outputs[{FindIndex(outputNames, name, "output")}]"))
+            .ToDictionary(pair => pair.Variable, pair => pair.Expression, StringComparer.Ordinal);
+
+        return string.Join(
+            Environment.NewLine,
+            helperCalls.Select(call =>
+            {
+                var leadingArgs = call.Arguments.Select(arg => ResolveHelperArgumentExpression(arg, inputVariableExpressions, outputVariableExpressions));
+                var args = string.Join(", ", leadingArgs.Concat(workspaceArgs).Concat(runtimeShapeArgs).Concat(new[] { "block_size" }));
+                return $"        _generated_kernels.{call.Name}[grid]({args}{kwargs})";
+            }));
+    }
+
+    private static string ResolveHelperArgumentExpression(
+        string argument,
+        IReadOnlyDictionary<string, string> inputVariableExpressions,
+        IReadOnlyDictionary<string, string> outputVariableExpressions)
+    {
+        if (inputVariableExpressions.TryGetValue(argument, out var inputExpression))
+        {
+            return inputExpression;
+        }
+
+        if (outputVariableExpressions.TryGetValue(argument, out var outputExpression))
+        {
+            return outputExpression;
+        }
+
+        throw new NotSupportedException($"Generated PyNTT helper references unknown top-kernel argument {argument}.");
+    }
+
+    private string BuildKernelInputExpression(string name, string[] parameterNames, IReadOnlyDictionary<string, PyNTTKVCacheFieldInputMetadata> kvCacheFieldInputs)
+    {
+        if (!kvCacheFieldInputs.TryGetValue(name, out var kvCacheField))
+        {
+            return $"inputs[{FindIndex(parameterNames, name, "input")}]";
+        }
+
+        var sourceExpression = $"inputs[{FindIndex(parameterNames, kvCacheField.SourceName, "input")}]";
+        return kvCacheField.Field switch
+        {
+            "metadata" => $"materialize_kv_cache_metadata({sourceExpression}, outputs[0].device)",
+            "slot_mapping" or "block_tables" or "context_lens" or "seq_lens" =>
+                $"materialize_kv_cache_tensor_field({sourceExpression}, {PythonString(kvCacheField.Field)}, outputs[0].device)",
+            "kv_caches" when kvCacheField.Storage is { } storage =>
+                $"materialize_kv_cache_storage({sourceExpression}, outputs[0].device, dtype={PythonString(storage.DType)}, topology_shape={PythonTuple(storage.TopologyShape.Select(value => value.ToString(CultureInfo.InvariantCulture)))}, tail_shape={PythonTuple(storage.TailShape.Select(value => value.ToString(CultureInfo.InvariantCulture)))}, block_size={storage.BlockSize.ToString(CultureInfo.InvariantCulture)})",
+            "kv_caches" => throw new NotSupportedException($"Generated PyNTT kernel input {name} is missing KV-cache storage metadata."),
+            _ => throw new NotSupportedException($"Generated PyNTT kernel input {name} references unsupported KV-cache field {kvCacheField.Field}."),
+        };
     }
 
     private string BuildOutputAliasStatements(GeneratedKernelMetadata kernel)
@@ -491,13 +823,17 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
             """;
     }
 
-    private string BuildRDataPython()
+    private string BuildRDataPython(string outputDirectory)
     {
         var entries = string.Join(
             Environment.NewLine,
-            _functions.Select(function => $"    {PythonString(function.SourceFunction.Name)}: {BuildRDataBundlePython(function.RDataBundle)},"));
+            _functions.Select(function => $"    {PythonString(function.SourceFunction.Name)}: {BuildRDataBundlePython(outputDirectory, function)},"));
         return $$"""
             # Serialized PyNTT rdata payloads.
+            from pathlib import Path
+
+
+            _BASE_DIR = Path(__file__).resolve().parent
 
             RDATA_BUNDLES = {
             {{entries}}
@@ -505,23 +841,135 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
             """;
     }
 
-    private string BuildRDataBundlePython(PyNTTRDataBundle bundle)
+    private string BuildRDataBundlePython(string outputDirectory, PyNTTLinkableFunction function)
     {
+        var bundle = function.RDataBundle;
         return "{" +
             string.Join(
                 ", ",
                 new[]
                 {
-                    $"{PythonString("rdata")}: {PythonString(bundle.RData)}",
+                    $"{PythonString("rdata")}: {BuildRDataPayloadPython(outputDirectory, function, "rdata", bundle.RData, null)}",
                     $"{PythonString("rdata_bytes")}: {bundle.RDataBytes.ToString(CultureInfo.InvariantCulture)}",
-                    $"{PythonString("thread_local_rdata")}: {PythonTuple(bundle.ThreadLocalRDatas.Select(PythonString))}",
+                    $"{PythonString("thread_local_rdata")}: {PythonTuple(bundle.ThreadLocalRDatas.Select((payload, index) => BuildRDataPayloadPython(outputDirectory, function, "thread_local_rdata", payload, index)))}",
                     $"{PythonString("thread_local_rdata_bytes")}: {bundle.ThreadLocalRDataBytes.ToString(CultureInfo.InvariantCulture)}",
-                    $"{PythonString("warp_local_rdata")}: {PythonTuple(bundle.WarpLocalRDatas.Select(PythonString))}",
+                    $"{PythonString("warp_local_rdata")}: {PythonTuple(bundle.WarpLocalRDatas.Select((payload, index) => BuildRDataPayloadPython(outputDirectory, function, "warp_local_rdata", payload, index)))}",
                     $"{PythonString("warp_local_rdata_bytes")}: {bundle.WarpLocalRDataBytes.ToString(CultureInfo.InvariantCulture)}",
-                    $"{PythonString("block_local_rdata")}: {PythonTuple(bundle.BlockLocalRDatas.Select(PythonString))}",
+                    $"{PythonString("block_local_rdata")}: {PythonTuple(bundle.BlockLocalRDatas.Select((payload, index) => BuildRDataPayloadPython(outputDirectory, function, "block_local_rdata", payload, index)))}",
                     $"{PythonString("block_local_rdata_bytes")}: {bundle.BlockLocalRDataBytes.ToString(CultureInfo.InvariantCulture)}",
                 }) +
             "}";
+    }
+
+    private string BuildRDataPayloadPython(string outputDirectory, PyNTTLinkableFunction function, string section, string payload, int? index)
+    {
+        const string filePrefix = "file:";
+        if (!payload.StartsWith(filePrefix, StringComparison.Ordinal))
+        {
+            return PythonString(payload);
+        }
+
+        var sourcePath = payload[filePrefix.Length..];
+        var assetDirectory = Path.Join(outputDirectory, "assets");
+        Directory.CreateDirectory(assetDirectory);
+        var suffix = index.HasValue ? $"_{index.Value.ToString(CultureInfo.InvariantCulture)}" : string.Empty;
+        var assetName = $"{SanitizePythonIdentifier(function.SourceFunction.Name)}_{section}{suffix}.bin";
+        var destinationPath = Path.Join(assetDirectory, assetName);
+        File.Copy(sourcePath, destinationPath, overwrite: true);
+        return $"\"file:\" + str(_BASE_DIR / {PythonString(Path.Join("assets", assetName))})";
+    }
+
+    private ShapeBindingMetadata[] GetShapeBindings(BaseFunction function)
+    {
+        var parameterNames = GetParameterNames(function);
+        var bindings = new List<ShapeBindingMetadata>();
+        foreach (var (tensorVar, dimExprs) in _compileOptions.ShapeBucketOptions.VarMap)
+        {
+            var inputIndex = Array.IndexOf(parameterNames, tensorVar.Name);
+            if (inputIndex < 0)
+            {
+                continue;
+            }
+
+            for (var axis = 0; axis < dimExprs.Length; axis++)
+            {
+                if (dimExprs[axis] is not DimVar dimVar)
+                {
+                    continue;
+                }
+
+                var name = SanitizePythonIdentifier(dimVar.Name);
+                var range = dimVar.Metadata.Range;
+                bindings.Add(new(
+                    name,
+                    inputIndex,
+                    axis,
+                    range.HasValue && !double.IsNegativeInfinity(range.Value.Min) ? checked((long)range.Value.Min) : null,
+                    range.HasValue && !double.IsPositiveInfinity(range.Value.Max) ? checked((long)range.Value.Max) : null));
+            }
+        }
+
+        return bindings
+            .GroupBy(binding => (binding.Name, binding.InputIndex, binding.Axis))
+            .Select(group => group.First())
+            .OrderBy(binding => binding.Name, StringComparer.Ordinal)
+            .ThenBy(binding => binding.InputIndex)
+            .ThenBy(binding => binding.Axis)
+            .ToArray();
+    }
+
+    private static string PythonExpression(object value)
+        => value switch
+        {
+            string text => text,
+            int integer => integer.ToString(CultureInfo.InvariantCulture),
+            long integer => integer.ToString(CultureInfo.InvariantCulture),
+            _ => throw new NotSupportedException($"PyNTT launch expression must be a string or integer, got {value.GetType().Name}."),
+        };
+
+    private static string RuntimePythonExpression(object value, IReadOnlyList<string> runtimeShapeArgs)
+    {
+        var expression = PythonExpression(value);
+        foreach (var arg in runtimeShapeArgs.OrderByDescending(arg => arg.Length))
+        {
+            expression = Regex.Replace(
+                expression,
+                $@"(?<![A-Za-z0-9_]){Regex.Escape(arg)}(?![A-Za-z0-9_])",
+                $"shape_env[{PythonString(arg)}]");
+        }
+
+        return expression;
+    }
+
+    private static string[] GetRuntimeShapeArgs(GeneratedKernelMetadata kernel)
+        => kernel.Attrs.TryGetValue("runtime_shape_args", out var value) && value is string[] args
+            ? args
+            : Array.Empty<string>();
+
+    private static string[] GetStringArrayAttr(GeneratedKernelMetadata kernel, string name)
+        => kernel.Attrs.TryGetValue(name, out var value) && value is string[] args
+            ? args
+            : Array.Empty<string>();
+
+    private static PyNTTKVCacheFieldInputMetadata[] GetKVCacheFieldInputs(GeneratedKernelMetadata kernel)
+        => kernel.Attrs.TryGetValue("kv_cache_field_inputs", out var value) && value is PyNTTKVCacheFieldInputMetadata[] args
+            ? args
+            : Array.Empty<PyNTTKVCacheFieldInputMetadata>();
+
+    private static HelperKernelCallMetadata[] GetHelperKernelCalls(GeneratedKernelMetadata kernel)
+        => kernel.Attrs.TryGetValue("helper_calls", out var value) && value is HelperKernelCallMetadata[] args
+            ? args
+            : Array.Empty<HelperKernelCallMetadata>();
+
+    private static string SanitizePythonIdentifier(string value)
+    {
+        var chars = value.Select(ch => char.IsAsciiLetterOrDigit(ch) || ch == '_' ? ch : '_').ToArray();
+        if (chars.Length == 0 || char.IsDigit(chars[0]))
+        {
+            return "_" + new string(chars);
+        }
+
+        return new string(chars);
     }
 
     private sealed record TensorSpecMetadata(
@@ -530,9 +978,9 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
         [property: JsonPropertyName("dtype")]
         string DType,
         [property: JsonPropertyName("shape")]
-        long[] Shape,
+        object[] Shape,
         [property: JsonPropertyName("strides")]
-        long[] Strides,
+        object[] Strides,
         [property: JsonPropertyName("role")]
         string Role,
         [property: JsonPropertyName("device")]
@@ -541,4 +989,6 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
         string Layout,
         [property: JsonPropertyName("memory")]
         string Memory);
+
+    private sealed record ShapeBindingMetadata(string Name, int InputIndex, int Axis, long? MinValue, long? MaxValue);
 }

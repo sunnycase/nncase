@@ -1,53 +1,15 @@
 @using System.Text
+@using Nncase.CodeGen.PyNTT
 @model Nncase.CodeGen.PyNTT.PyNTTTensorStoreTemplateModel
 @{
-    var localShape = "(" + string.Join(", ", Model.LocalShape) + (Model.LocalShape.Length == 1 ? "," : string.Empty) + ")";
-    var globalShape = "(" + string.Join(", ", Model.GlobalShape) + (Model.GlobalShape.Length == 1 ? "," : string.Empty) + ")";
-
-    static long[] Strides(long[] shape)
-    {
-        var strides = new long[shape.Length];
-        long stride = 1;
-        for (var i = shape.Length - 1; i >= 0; i--)
-        {
-            strides[i] = stride;
-            stride *= shape[i];
-        }
-
-        return strides;
-    }
+    var localShape = PyNTTTemplateUtility.ShapeTuple(Model.LocalShape);
+    var globalShape = PyNTTTemplateUtility.ShapeTuple(Model.GlobalShape);
 
     static string Indent(int level) => new(' ', level * 4);
 
-    static int SelectBlockAxis(long[] shape, long[] strides)
-    {
-        if (shape.Length == 0)
-        {
-            return 0;
-        }
-
-        for (var i = shape.Length - 1; i >= 0; i--)
-        {
-            if (shape[i] > 1 && strides[i] == 1)
-            {
-                return i;
-            }
-        }
-
-        for (var i = shape.Length - 1; i >= 0; i--)
-        {
-            if (shape[i] > 1)
-            {
-                return i;
-            }
-        }
-
-        return shape.Length - 1;
-    }
-
-    var globalStrides = Strides(Model.GlobalShape);
-    var blockAxis = SelectBlockAxis(Model.LocalShape, Model.SourceStrides);
-    var blockExtent = Model.LocalShape.Length == 0 ? 1 : Model.LocalShape[blockAxis];
+    var globalStrides = PyNTTTemplateUtility.ContiguousStrides(Model.GlobalShape);
+    var blockAxis = PyNTTTemplateUtility.SelectBlockAxis(Model.LocalShape, Model.SourceStrides);
+    var blockExtent = Model.LocalShape.Length == 0 ? PyNTTDimExpression.One : Model.LocalShape[blockAxis];
     var loopAxes = Enumerable.Range(0, Model.LocalShape.Length).Where(axis => axis != blockAxis).ToArray();
 
     string AxisIndex(int axis) => axis == blockAxis ? "lane" : $"idx{axis}";
@@ -117,13 +79,13 @@
 # generated from CodeGen/PyNTT/Templates/Triton/Kernels/TensorStore.py.cshtml
 # @Model.Comment; dtype=@Model.DType, local_shape=@localShape, global_shape=@globalShape
 @@triton.jit
-@($"def {Model.FunctionName}(destination, data, rdata, thread_local_rdata, warp_local_rdata, block_local_rdata, block_size: tl.constexpr):")
+@($"def {Model.FunctionName}(destination, data, rdata, thread_local_rdata, warp_local_rdata, block_local_rdata{PyNTTTemplateUtility.RuntimeParameterSuffix(Model.RuntimeShapeArgs)}):")
     shard_count = tl.num_programs(0)
-    shard_index = tl.program_id(0)
+    shard_index = tl.program_id(0).to(tl.int64)
     source = @Html.Raw(Model.Source.Expression)
 @if (Model.ShardAxis.HasValue)
 {
-<text>    shard_axis_extent = tl.cdiv(@Model.GlobalShape[Model.ShardAxis.Value], shard_count)
+<text>    shard_axis_extent = tl.cdiv(@Model.GlobalShape[Model.ShardAxis.Value].TritonExpression, shard_count)
     shard_axis_offset = shard_index * shard_axis_extent
 </text>
 }

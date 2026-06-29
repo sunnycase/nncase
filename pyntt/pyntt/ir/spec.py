@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Union
+
+
+DimExpr = Union[int, str]
 
 
 def _as_tuple(value):
@@ -11,12 +15,12 @@ def _as_tuple(value):
 
 @dataclass(frozen=True)
 class TensorSpec:
-    """Static tensor contract for generated PyNTT functions and kernels."""
+    """Tensor contract for generated PyNTT functions and kernels."""
 
     name: str
     dtype: str
-    shape: tuple[int, ...]
-    strides: tuple[int, ...] | None = None
+    shape: tuple[DimExpr, ...]
+    strides: tuple[DimExpr, ...] | None = None
     role: str = "input"
     device: str = "any"
     layout: str = "contiguous"
@@ -29,8 +33,19 @@ class TensorSpec:
 
 
 @dataclass(frozen=True)
+class ShapeBinding:
+    """Bind one dynamic dimension variable to a runtime input shape axis."""
+
+    name: str
+    input_index: int
+    axis: int
+    min_value: int | None = None
+    max_value: int | None = None
+
+
+@dataclass(frozen=True)
 class FunctionSpec:
-    """Generated function metadata and static runtime contract."""
+    """Generated function metadata and runtime contract."""
 
     name: str
     module_kind: str
@@ -38,11 +53,13 @@ class FunctionSpec:
     parameters: tuple[str, ...] = ()
     inputs: tuple[TensorSpec, ...] = ()
     outputs: tuple[TensorSpec, ...] = ()
+    shape_bindings: tuple[ShapeBinding, ...] = ()
 
     def __post_init__(self):
         inputs = _as_tuple(self.inputs)
         object.__setattr__(self, "inputs", inputs)
         object.__setattr__(self, "outputs", _as_tuple(self.outputs))
+        object.__setattr__(self, "shape_bindings", _as_tuple(self.shape_bindings))
 
         parameters = _as_tuple(self.parameters)
         if not parameters and inputs:

@@ -12,11 +12,14 @@ public sealed record PyNTTTensorLoadTemplateModel(
     PyNTTBufferPointerTemplateModel Destination,
     string DType,
     string TritonDType,
-    long[] LocalShape,
-    long[] DestinationStrides,
-    long[] GlobalShape,
+    PyNTTDimExpression[] LocalShape,
+    PyNTTDimExpression[] DestinationStrides,
+    PyNTTDimExpression[] GlobalShape,
     int? ShardAxis,
-    string Comment);
+    string Comment)
+{
+    public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
+}
 
 public sealed record PyNTTTensorStoreTemplateModel(
     string FunctionName,
@@ -25,11 +28,14 @@ public sealed record PyNTTTensorStoreTemplateModel(
     long DestinationOffset,
     string DType,
     string TritonDType,
-    long[] LocalShape,
-    long[] SourceStrides,
-    long[] GlobalShape,
+    PyNTTDimExpression[] LocalShape,
+    PyNTTDimExpression[] SourceStrides,
+    PyNTTDimExpression[] GlobalShape,
     int? ShardAxis,
-    string Comment);
+    string Comment)
+{
+    public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
+}
 
 public sealed record PyNTTElementwiseBinaryTemplateModel(
     string FunctionName,
@@ -42,16 +48,19 @@ public sealed record PyNTTElementwiseBinaryTemplateModel(
     string LhsTritonDType,
     string RhsTritonDType,
     string OutputTritonDType,
-    long[] LhsShape,
-    long[] RhsShape,
-    long[] OutputShape,
-    long[] LhsStrides,
-    long[] RhsStrides,
-    long[] OutputStrides,
-    long[] Shape,
+    PyNTTDimExpression[] LhsShape,
+    PyNTTDimExpression[] RhsShape,
+    PyNTTDimExpression[] OutputShape,
+    PyNTTDimExpression[] LhsStrides,
+    PyNTTDimExpression[] RhsStrides,
+    PyNTTDimExpression[] OutputStrides,
+    PyNTTDimExpression[] Shape,
     string BinaryExpression,
     string Op,
-    string Comment);
+    string Comment)
+{
+    public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
+}
 
 public sealed record PyNTTElementwiseUnaryTemplateModel(
     string FunctionName,
@@ -61,14 +70,17 @@ public sealed record PyNTTElementwiseUnaryTemplateModel(
     string OutputDType,
     string InputTritonDType,
     string OutputTritonDType,
-    long[] InputShape,
-    long[] OutputShape,
-    long[] InputStrides,
-    long[] OutputStrides,
-    long[] Shape,
+    PyNTTDimExpression[] InputShape,
+    PyNTTDimExpression[] OutputShape,
+    PyNTTDimExpression[] InputStrides,
+    PyNTTDimExpression[] OutputStrides,
+    PyNTTDimExpression[] Shape,
     string UnaryExpression,
     string Op,
-    string Comment);
+    string Comment)
+{
+    public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
+}
 
 public sealed record PyNTTElementwiseCastTemplateModel(
     string FunctionName,
@@ -78,14 +90,17 @@ public sealed record PyNTTElementwiseCastTemplateModel(
     string OutputDType,
     string InputTritonDType,
     string OutputTritonDType,
-    long[] InputShape,
-    long[] OutputShape,
-    long[] InputStrides,
-    long[] OutputStrides,
-    long[] Shape,
+    PyNTTDimExpression[] InputShape,
+    PyNTTDimExpression[] OutputShape,
+    PyNTTDimExpression[] InputStrides,
+    PyNTTDimExpression[] OutputStrides,
+    PyNTTDimExpression[] Shape,
     string CastExpression,
     string CastMode,
-    string Comment);
+    string Comment)
+{
+    public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
+}
 
 public sealed record PyNTTElementwiseWhereTemplateModel(
     string FunctionName,
@@ -99,16 +114,41 @@ public sealed record PyNTTElementwiseWhereTemplateModel(
     string CondTritonDType,
     string ValueTritonDType,
     string OutputTritonDType,
-    long[] CondShape,
-    long[] TrueShape,
-    long[] FalseShape,
-    long[] OutputShape,
-    long[] CondStrides,
-    long[] TrueStrides,
-    long[] FalseStrides,
-    long[] OutputStrides,
-    long[] Shape,
-    string Comment);
+    PyNTTDimExpression[] CondShape,
+    PyNTTDimExpression[] TrueShape,
+    PyNTTDimExpression[] FalseShape,
+    PyNTTDimExpression[] OutputShape,
+    PyNTTDimExpression[] CondStrides,
+    PyNTTDimExpression[] TrueStrides,
+    PyNTTDimExpression[] FalseStrides,
+    PyNTTDimExpression[] OutputStrides,
+    PyNTTDimExpression[] Shape,
+    string Comment)
+{
+    public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
+}
+
+public sealed record PyNTTVectorLayoutTemplateModel(
+    string FunctionName,
+    PyNTTBufferPointerTemplateModel Input,
+    PyNTTBufferPointerTemplateModel Output,
+    string InputDType,
+    string OutputDType,
+    string InputTritonDType,
+    string OutputTritonDType,
+    PyNTTDimExpression[] InputShape,
+    PyNTTDimExpression[] OutputShape,
+    PyNTTDimExpression[] InputStrides,
+    PyNTTDimExpression[] OutputStrides,
+    int[] InputLanes,
+    int[] OutputLanes,
+    int[] Axes,
+    int[] Lanes,
+    bool IsPack,
+    string Comment)
+{
+    public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
+}
 
 public sealed record PyNTTConcatTemplateModel(
     string FunctionName,
@@ -116,12 +156,15 @@ public sealed record PyNTTConcatTemplateModel(
     PyNTTBufferPointerTemplateModel Output,
     string OutputDType,
     string OutputTritonDType,
-    long[][] InputShapes,
-    long[][] InputStrides,
-    long[] OutputShape,
-    long[] OutputStrides,
+    PyNTTDimExpression[][] InputShapes,
+    PyNTTDimExpression[][] InputStrides,
+    PyNTTDimExpression[] OutputShape,
+    PyNTTDimExpression[] OutputStrides,
     int Axis,
-    string Comment);
+    string Comment)
+{
+    public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
+}
 
 public sealed record PyNTTGatherTemplateModel(
     string FunctionName,
@@ -134,14 +177,17 @@ public sealed record PyNTTGatherTemplateModel(
     string InputTritonDType,
     string IndexTritonDType,
     string OutputTritonDType,
-    long[] InputShape,
-    long[] IndexShape,
-    long[] OutputShape,
-    long[] InputStrides,
-    long[] IndexStrides,
-    long[] OutputStrides,
+    PyNTTDimExpression[] InputShape,
+    PyNTTDimExpression[] IndexShape,
+    PyNTTDimExpression[] OutputShape,
+    PyNTTDimExpression[] InputStrides,
+    PyNTTDimExpression[] IndexStrides,
+    PyNTTDimExpression[] OutputStrides,
     int Axis,
-    string Comment);
+    string Comment)
+{
+    public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
+}
 
 public sealed record PyNTTPadTemplateModel(
     string FunctionName,
@@ -151,13 +197,16 @@ public sealed record PyNTTPadTemplateModel(
     string OutputDType,
     string InputTritonDType,
     string OutputTritonDType,
-    long[] InputShape,
-    long[] OutputShape,
-    long[] InputStrides,
-    long[] OutputStrides,
+    PyNTTDimExpression[] InputShape,
+    PyNTTDimExpression[] OutputShape,
+    PyNTTDimExpression[] InputStrides,
+    PyNTTDimExpression[] OutputStrides,
     long[][] Pads,
     string PadValue,
-    string Comment);
+    string Comment)
+{
+    public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
+}
 
 public sealed record PyNTTScatterNDTemplateModel(
     string FunctionName,
@@ -173,15 +222,18 @@ public sealed record PyNTTScatterNDTemplateModel(
     string IndicesTritonDType,
     string UpdatesTritonDType,
     string OutputTritonDType,
-    long[] InputShape,
-    long[] IndicesShape,
-    long[] UpdatesShape,
-    long[] OutputShape,
-    long[] InputStrides,
-    long[] IndicesStrides,
-    long[] UpdatesStrides,
-    long[] OutputStrides,
-    string Comment);
+    PyNTTDimExpression[] InputShape,
+    PyNTTDimExpression[] IndicesShape,
+    PyNTTDimExpression[] UpdatesShape,
+    PyNTTDimExpression[] OutputShape,
+    PyNTTDimExpression[] InputStrides,
+    PyNTTDimExpression[] IndicesStrides,
+    PyNTTDimExpression[] UpdatesStrides,
+    PyNTTDimExpression[] OutputStrides,
+    string Comment)
+{
+    public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
+}
 
 public sealed record PyNTTSliceTemplateModel(
     string FunctionName,
@@ -191,13 +243,151 @@ public sealed record PyNTTSliceTemplateModel(
     string OutputDType,
     string InputTritonDType,
     string OutputTritonDType,
-    long[] InputShape,
-    long[] OutputShape,
-    long[] InputStrides,
-    long[] OutputStrides,
+    PyNTTDimExpression[] InputShape,
+    PyNTTDimExpression[] OutputShape,
+    PyNTTDimExpression[] InputStrides,
+    PyNTTDimExpression[] OutputStrides,
     long[] Starts,
     long[] Strides,
-    string Comment);
+    string Comment)
+{
+    public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
+}
+
+public sealed record PyNTTRoPETemplateModel(
+    string FunctionName,
+    PyNTTBufferPointerTemplateModel Input,
+    PyNTTBufferPointerTemplateModel Cos,
+    PyNTTBufferPointerTemplateModel Sin,
+    PyNTTBufferPointerTemplateModel Output,
+    string InputDType,
+    string CosDType,
+    string SinDType,
+    string OutputDType,
+    string InputTritonDType,
+    string CosTritonDType,
+    string SinTritonDType,
+    string OutputTritonDType,
+    PyNTTDimExpression[] InputShape,
+    PyNTTDimExpression[] CosShape,
+    PyNTTDimExpression[] SinShape,
+    PyNTTDimExpression[] OutputShape,
+    PyNTTDimExpression[] InputStrides,
+    PyNTTDimExpression[] CosStrides,
+    PyNTTDimExpression[] SinStrides,
+    PyNTTDimExpression[] OutputStrides,
+    string Comment)
+{
+    public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
+}
+
+public sealed record PyNTTLayerNormTemplateModel(
+    string FunctionName,
+    PyNTTBufferPointerTemplateModel Input,
+    PyNTTBufferPointerTemplateModel Scale,
+    PyNTTBufferPointerTemplateModel Bias,
+    PyNTTBufferPointerTemplateModel Output,
+    string InputDType,
+    string ScaleDType,
+    string BiasDType,
+    string OutputDType,
+    string InputTritonDType,
+    string ScaleTritonDType,
+    string BiasTritonDType,
+    string OutputTritonDType,
+    PyNTTDimExpression[] InputShape,
+    PyNTTDimExpression[] ScaleShape,
+    PyNTTDimExpression[] BiasShape,
+    PyNTTDimExpression[] OutputShape,
+    PyNTTDimExpression[] InputStrides,
+    PyNTTDimExpression[] ScaleStrides,
+    PyNTTDimExpression[] BiasStrides,
+    PyNTTDimExpression[] OutputStrides,
+    int Axis,
+    float Epsilon,
+    bool UseMean,
+    string Comment)
+{
+    public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
+}
+
+public sealed record PyNTTGetPositionIdsTemplateModel(
+    string FunctionName,
+    PyNTTBufferPointerTemplateModel Output,
+    string OutputDType,
+    string OutputTritonDType,
+    PyNTTDimExpression[] LocalShape,
+    PyNTTDimExpression[] GlobalShape,
+    PyNTTDimExpression[] OutputStrides,
+    int? ShardAxis,
+    string Comment)
+{
+    public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
+}
+
+internal sealed record PyNTTKVCacheFieldInputMetadata(
+    string Name,
+    string SourceName,
+    string Field,
+    PyNTTKVCacheStorageMetadata? Storage);
+
+internal sealed record PyNTTKVCacheStorageMetadata(
+    string DType,
+    int[] TopologyShape,
+    int[] TailShape,
+    int BlockSize);
+
+public sealed record PyNTTPagedAttentionCacheTemplateModel(
+    string DType,
+    string TritonDType,
+    int NumLayers,
+    int NumKVHeads,
+    int HeadDim,
+    int BlockSize,
+    int LaneCount,
+    int HeadDimBlocks,
+    int IdLength);
+
+public sealed record PyNTTUpdatePagedAttentionKVCacheTemplateModel(
+    string FunctionName,
+    PyNTTBufferPointerTemplateModel Slots,
+    string SlotsDType,
+    string SlotsTritonDType,
+    PyNTTDimExpression[] SlotsShape,
+    PyNTTDimExpression[] SlotsStrides,
+    int SeqAxis,
+    int HeadAxis,
+    int DimAxis,
+    int LayerId,
+    int CacheKind,
+    PyNTTPagedAttentionCacheTemplateModel Cache,
+    string Comment)
+{
+    public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
+}
+
+public sealed record PyNTTPagedAttentionTemplateModel(
+    string FunctionName,
+    PyNTTBufferPointerTemplateModel Query,
+    PyNTTBufferPointerTemplateModel Scale,
+    PyNTTBufferPointerTemplateModel Output,
+    string QueryDType,
+    string QueryTritonDType,
+    string OutputDType,
+    string OutputTritonDType,
+    PyNTTDimExpression[] QueryShape,
+    PyNTTDimExpression[] OutputShape,
+    PyNTTDimExpression[] QueryStrides,
+    PyNTTDimExpression[] OutputStrides,
+    int SeqAxis,
+    int HeadAxis,
+    int DimAxis,
+    int LayerId,
+    PyNTTPagedAttentionCacheTemplateModel Cache,
+    string Comment)
+{
+    public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
+}
 
 public sealed record PyNTTConv2DTemplateModel(
     string FunctionName,
@@ -213,19 +403,22 @@ public sealed record PyNTTConv2DTemplateModel(
     string WeightsTritonDType,
     string BiasTritonDType,
     string OutputTritonDType,
-    long[] InputShape,
-    long[] WeightsShape,
-    long[] BiasShape,
-    long[] OutputShape,
-    long[] InputStrides,
-    long[] WeightsStrides,
-    long[] BiasStrides,
-    long[] OutputStrides,
+    PyNTTDimExpression[] InputShape,
+    PyNTTDimExpression[] WeightsShape,
+    PyNTTDimExpression[] BiasShape,
+    PyNTTDimExpression[] OutputShape,
+    PyNTTDimExpression[] InputStrides,
+    PyNTTDimExpression[] WeightsStrides,
+    PyNTTDimExpression[] BiasStrides,
+    PyNTTDimExpression[] OutputStrides,
     long[] Stride,
     long[] Padding,
     long[] Dilation,
     long Groups,
-    string Comment);
+    string Comment)
+{
+    public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
+}
 
 public sealed record PyNTTTransposeTemplateModel(
     string FunctionName,
@@ -235,12 +428,15 @@ public sealed record PyNTTTransposeTemplateModel(
     string OutputDType,
     string InputTritonDType,
     string OutputTritonDType,
-    long[] InputShape,
-    long[] OutputShape,
-    long[] InputStrides,
-    long[] OutputStrides,
+    PyNTTDimExpression[] InputShape,
+    PyNTTDimExpression[] OutputShape,
+    PyNTTDimExpression[] InputStrides,
+    PyNTTDimExpression[] OutputStrides,
     int[] Perm,
-    string Comment);
+    string Comment)
+{
+    public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
+}
 
 public sealed record PyNTTMatmulTemplateModel(
     string FunctionName,
@@ -253,16 +449,19 @@ public sealed record PyNTTMatmulTemplateModel(
     string LhsTritonDType,
     string RhsTritonDType,
     string OutputTritonDType,
-    long[] LhsShape,
-    long[] RhsShape,
-    long[] OutputShape,
-    long[] LhsStrides,
-    long[] RhsStrides,
-    long[] OutputStrides,
+    PyNTTDimExpression[] LhsShape,
+    PyNTTDimExpression[] RhsShape,
+    PyNTTDimExpression[] OutputShape,
+    PyNTTDimExpression[] LhsStrides,
+    PyNTTDimExpression[] RhsStrides,
+    PyNTTDimExpression[] OutputStrides,
     bool TransposeA,
     bool TransposeB,
     string Scale,
-    string Comment);
+    string Comment)
+{
+    public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
+}
 
 public sealed record PyNTTReduceTemplateModel(
     string FunctionName,
@@ -272,17 +471,20 @@ public sealed record PyNTTReduceTemplateModel(
     string OutputDType,
     string InputTritonDType,
     string OutputTritonDType,
-    long[] InputShape,
-    long[] OutputShape,
-    long[] InputStrides,
-    long[] OutputStrides,
+    PyNTTDimExpression[] InputShape,
+    PyNTTDimExpression[] OutputShape,
+    PyNTTDimExpression[] InputStrides,
+    PyNTTDimExpression[] OutputStrides,
     int[] Axes,
     bool KeepDims,
     string ReduceOp,
     string InitValue,
     string UpdateExpression,
     string FinalizeExpression,
-    string Comment);
+    string Comment)
+{
+    public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
+}
 
 public sealed record PyNTTSoftmaxTemplateModel(
     string FunctionName,
@@ -292,8 +494,11 @@ public sealed record PyNTTSoftmaxTemplateModel(
     string OutputDType,
     string InputTritonDType,
     string OutputTritonDType,
-    long[] Shape,
-    long[] InputStrides,
-    long[] OutputStrides,
+    PyNTTDimExpression[] Shape,
+    PyNTTDimExpression[] InputStrides,
+    PyNTTDimExpression[] OutputStrides,
     int Axis,
-    string Comment);
+    string Comment)
+{
+    public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
+}

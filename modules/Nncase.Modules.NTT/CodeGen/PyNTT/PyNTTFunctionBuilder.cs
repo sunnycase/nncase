@@ -9,6 +9,8 @@ namespace Nncase.CodeGen.PyNTT;
 
 internal sealed class PyNTTFunctionBuilder
 {
+    private const ulong InlineRDataThreshold = 4UL * 1024UL * 1024UL;
+
     private readonly uint _id;
     private readonly CompileOptions _compileOptions;
 
@@ -58,7 +60,8 @@ internal sealed class PyNTTFunctionBuilder
             return (string.Empty, 0);
         }
 
-        using var stream = new MemoryStream();
+        using var payload = CreatePayloadStream(poolSize, "rdata");
+        var stream = payload.Stream;
         stream.SetLength(checked((long)poolSize));
         foreach (var (@const, range) in rdatas)
         {
@@ -73,7 +76,7 @@ internal sealed class PyNTTFunctionBuilder
             tensor.Serialize(stream);
         }
 
-        return (Convert.ToBase64String(stream.ToArray()), checked((long)poolSize));
+        return (FinalizePayload(payload), checked((long)poolSize));
     }
 
     private (string[] Payloads, long Bytes) SerializeLocalRData(
@@ -91,7 +94,8 @@ internal sealed class PyNTTFunctionBuilder
         var payloads = new string[shardCount];
         for (var shard = 0; shard < shardCount; shard++)
         {
-            using var stream = new MemoryStream();
+            using var payload = CreatePayloadStream(poolSize, $"{scopeName}_{shard}");
+            var stream = payload.Stream;
             stream.SetLength(checked((long)poolSize));
             foreach (var (@const, range) in localRdatas)
             {
@@ -113,10 +117,39 @@ internal sealed class PyNTTFunctionBuilder
                 tensor.Serialize(stream, linearOffset, localShape, localStrides);
             }
 
-            payloads[shard] = Convert.ToBase64String(stream.ToArray());
+            payloads[shard] = FinalizePayload(payload);
         }
 
         return (payloads, checked((long)poolSize));
+    }
+
+    private PayloadStream CreatePayloadStream(ulong poolSize, string label)
+    {
+        if (poolSize <= InlineRDataThreshold)
+        {
+            return new(new MemoryStream(), null);
+        }
+
+        var directory = Path.Join(Path.GetTempPath(), "nncase_pyntt_rdata");
+        Directory.CreateDirectory(directory);
+        var path = Path.Join(directory, $"{_id}_{label}_{Guid.NewGuid():N}.bin");
+        return new(new FileStream(path, FileMode.Create, FileAccess.ReadWrite, FileShare.None), path);
+    }
+
+    private static string FinalizePayload(PayloadStream payload)
+    {
+        payload.Stream.Flush();
+        if (!string.IsNullOrEmpty(payload.Path))
+        {
+            return $"file:{payload.Path}";
+        }
+
+        if (payload.Stream is not MemoryStream memoryStream)
+        {
+            throw new InvalidOperationException("Inline PyNTT rdata payload must use a memory stream.");
+        }
+
+        return Convert.ToBase64String(memoryStream.ToArray());
     }
 
     private ulong GetPoolSize(IReadOnlyDictionary<Const, ValueRange<ulong>> ranges)
@@ -149,5 +182,13 @@ internal sealed class PyNTTFunctionBuilder
         return DistributedUtility.GetUnraveledIndex(writerIndex, scopedHierarchies)
             .Concat(Enumerable.Repeat(0, hierarchies.Length - scopedHierarchies.Length))
             .ToArray();
+    }
+
+    private sealed record PayloadStream(Stream Stream, string? Path) : IDisposable
+    {
+        public void Dispose()
+        {
+            Stream.Dispose();
+        }
     }
 }

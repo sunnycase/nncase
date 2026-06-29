@@ -206,6 +206,35 @@ class HuggingfaceTestRunner(TestRunner):
 
         return results, next_token_id, next_token
 
+    def get_pyntt_result(self, torch_outputs, token_num):
+        results = []
+        next_token_id = None
+        next_token = None
+        if not isinstance(torch_outputs, (tuple, list)):
+            torch_outputs = [torch_outputs]
+
+        for idx, output in enumerate(torch_outputs):
+            res_tensor = output.detach()
+            if res_tensor.dtype in (torch.bfloat16, torch.float16):
+                res_tensor = res_tensor.to(torch.float32)
+            res = res_tensor.cpu().numpy()
+
+            dump_data_to_file(self.tmp_dir, f'nncase_result_{token_num}_{idx}', res)
+            if (self.cfg['huggingface_options']['output_logits']) and idx == 0:
+                results.append(res)
+                next_token_id, next_token = self.decode_token(res[np.newaxis, ...])
+            elif idx == 0:
+                logits_to_keep = 0
+                slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep,
+                                                                           int) else logits_to_keep
+                nncase_logits = self.model.lm_head(torch.tensor(
+                    res[np.newaxis, ...][:, slice_indices, :], dtype=self.hf_config.torch_dtype)).detach().to(torch.float32).numpy()
+                next_token_id, next_token = self.decode_token(nncase_logits)
+            else:
+                results.append(res)
+
+        return results, next_token_id, next_token
+
     def hf_eval(self, model, input_data, token_num):
         for idx, i in enumerate(input_data):
             value = None
@@ -229,6 +258,25 @@ class HuggingfaceTestRunner(TestRunner):
         model.run()
         return self.get_result(model, token_num, "infer")
 
+    def hf_infer_pyntt(self, model, input_data, token_num):
+        import pytest
+        import triton  # noqa: F401
+
+        if not torch.cuda.is_available():
+            pytest.skip("PyNTT inference requires CUDA.")
+
+        torch_inputs = []
+        for value in input_data:
+            if isinstance(value, nncase.PagedAttentionKVCache):
+                torch_inputs.append(value)
+            else:
+                torch_inputs.append(torch.from_numpy(np.ascontiguousarray(value)).cuda())
+
+        with torch.no_grad():
+            torch_outputs = model(*torch_inputs)
+        torch.cuda.synchronize()
+        return self.get_pyntt_result(torch_outputs, token_num)
+
     def pipeline_run(self, model, infer_or_eval):
         input_ids = self.local_inputs[0]['data'][0].input_ids[0].astype(np.int64)
         loop_data = [input_ids, self.local_inputs[1]['data'][0]]
@@ -246,6 +294,9 @@ class HuggingfaceTestRunner(TestRunner):
                 kv_object = self.local_inputs[1]['scheduler'].schedule([0], [current_length])
             if infer_or_eval == "infer":
                 result, next_token_id, next_token = self.hf_infer(
+                    model, [loop_data[0], kv_object], token_num=i)
+            elif infer_or_eval == "pyntt":
+                result, next_token_id, next_token = self.hf_infer_pyntt(
                     model, [loop_data[0], kv_object], token_num=i)
             else:
                 result, next_token_id, next_token = self.hf_eval(
@@ -302,14 +353,24 @@ class HuggingfaceTestRunner(TestRunner):
                             else:
                                 self.local_inputs = [self.inputs[0], self.inputs[2]]
                                 compiler.compile()
-                                kmodel_path = os.path.join(self.tmp_dir, self.cfg['kmodel_name'])
-                                with open(kmodel_path, 'wb') as f:
-                                    compiler.gencode(f)
-                                sim = nncase.Simulator()
-                                with open(kmodel_path, 'rb') as f:
-                                    sim.load_model(f)
+                                if k_target == "pyntt":
+                                    compiler.gencode(io.BytesIO())
+                                    generated_dir = os.path.join(self.tmp_dir, "CodeGen", "pyntt")
+                                    if not os.path.exists(os.path.join(generated_dir, "__init__.py")):
+                                        raise FileNotFoundError(
+                                            f"PyNTT generated model package was not found: {generated_dir}")
+                                    model_package = self.load_pyntt_generated_package(generated_dir)
+                                    pyntt_model = model_package.load_model()
+                                    actual_results, actual_token_ids, actual_tokens = func(pyntt_model, "pyntt")
+                                else:
+                                    kmodel_path = os.path.join(self.tmp_dir, self.cfg['kmodel_name'])
+                                    with open(kmodel_path, 'wb') as f:
+                                        compiler.gencode(f)
+                                    sim = nncase.Simulator()
+                                    with open(kmodel_path, 'rb') as f:
+                                        sim.load_model(f)
 
-                                actual_results, actual_token_ids, actual_tokens = func(sim, "infer")
+                                    actual_results, actual_token_ids, actual_tokens = func(sim, "infer")
 
                             target_dir = os.path.join(self.case_dir, stage, k_target)
                             os.makedirs(target_dir, exist_ok=True)

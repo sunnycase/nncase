@@ -1,0 +1,143 @@
+@using System.Text
+@using Nncase.CodeGen.PyNTT
+@model Nncase.CodeGen.PyNTT.PyNTTPagedAttentionTemplateModel
+@{
+    var queryShape = PyNTTTemplateUtility.ShapeTuple(Model.QueryShape);
+    var outputShape = PyNTTTemplateUtility.ShapeTuple(Model.OutputShape);
+
+    static string TensorOffset(IReadOnlyList<PyNTTDimExpression> strides, int seqAxis, int headAxis, int dimAxis, string head, string dimBlock, string token, string lane, int laneCount)
+    {
+        var indices = new string[strides.Count];
+        indices[seqAxis] = token;
+        indices[headAxis] = head;
+        indices[dimAxis] = dimBlock;
+        var terms = new List<string>();
+        for (var axis = 0; axis < strides.Count; axis++)
+        {
+            terms.Add($"{indices[axis]} * {strides[axis]}");
+        }
+
+        return $"(({string.Join(" + ", terms)}) * {laneCount} + {lane})";
+    }
+
+    var queryOffset = TensorOffset(Model.QueryStrides, Model.SeqAxis, Model.HeadAxis, Model.DimAxis, "q_head", "reduce_dim_block", "global_query_id", "reduce_lane", Model.Cache.LaneCount);
+    var outputOffset = TensorOffset(Model.OutputStrides, Model.SeqAxis, Model.HeadAxis, Model.DimAxis, "q_head", "out_dim_block", "global_query_id", "out_lane", Model.Cache.LaneCount);
+    var qHeads = Model.QueryShape[Model.HeadAxis];
+    var outputElements = $"({Model.OutputShape[Model.SeqAxis]}) * ({Model.OutputShape[Model.HeadAxis]}) * {Model.Cache.HeadDim}";
+    var keyOffset = $"((((((block_id * {Model.Cache.NumLayers} + {Model.LayerId}) * 2 + 0) * {Model.Cache.NumKVHeads} + kv_head) * {Model.Cache.HeadDimBlocks} + reduce_dim_block) * {Model.Cache.BlockSize} + block_offset) * {Model.Cache.LaneCount} + reduce_lane)";
+    var valueOffset = $"((((((block_id * {Model.Cache.NumLayers} + {Model.LayerId}) * 2 + 1) * {Model.Cache.NumKVHeads} + kv_head) * {Model.Cache.HeadDimBlocks} + out_dim_block) * {Model.Cache.BlockSize} + block_offset) * {Model.Cache.LaneCount} + out_lane)";
+}
+# generated from CodeGen/PyNTT/Templates/Triton/Kernels/PagedAttention.py.cshtml
+# @Model.Comment; query_dtype=@Model.QueryDType, output_dtype=@Model.OutputDType, query_shape=@queryShape, output_shape=@outputShape, layer=@Model.LayerId
+@@triton.jit
+@($"def {Model.FunctionName}(block_tables, kv_cache, cache_meta, data, rdata, thread_local_rdata, warp_local_rdata, block_local_rdata{PyNTTTemplateUtility.RuntimeParameterSuffix(Model.RuntimeShapeArgs)}):")
+    shard_index = tl.program_id(0).to(tl.int64)
+    query = @Html.Raw(Model.Query.Expression)
+    scale_ptr = @Html.Raw(Model.Scale.Expression)
+    output = @Html.Raw(Model.Output.Expression)
+    scale_value = tl.load(scale_ptr + 0).to(tl.float32)
+    num_seqs = tl.load(cache_meta + 0).to(tl.int64)
+
+    max_seq_len = tl.full((), 0, tl.int64)
+    num_tokens = tl.full((), 0, tl.int64)
+    seq_scan = tl.full((), 0, tl.int64)
+    while seq_scan < num_seqs:
+        context_len_scan = tl.load(cache_meta + 1 + seq_scan * 2)
+        seq_len_scan = tl.load(cache_meta + 2 + seq_scan * 2)
+        max_seq_len = tl.maximum(max_seq_len, seq_len_scan)
+        num_tokens += seq_len_scan - context_len_scan
+        seq_scan += 1
+    block_table_blocks = tl.cdiv(max_seq_len, @Model.Cache.BlockSize)
+
+    linear_start = tl.full((), 0, tl.int64)
+    while linear_start < @Html.Raw(outputElements):
+        linear = linear_start
+        mask = linear < @Html.Raw(outputElements)
+        out_lane = linear % @Model.Cache.LaneCount
+        tmp = linear // @Model.Cache.LaneCount
+        out_dim_block = tmp % @Model.Cache.HeadDimBlocks
+        tmp = tmp // @Model.Cache.HeadDimBlocks
+        q_head = tmp % @qHeads
+        global_query_id = tmp // @qHeads
+
+        seq_id = tl.full((), 0, tl.int64)
+        query_start = tl.full((), 0, tl.int64)
+        context_len = tl.full((), 0, tl.int64)
+        seq_len = tl.full((), 0, tl.int64)
+        query_id = tl.full((), 0, tl.int64)
+        matched_seq_id = tl.full((), 0, tl.int64)
+        query_active = mask & (global_query_id < num_tokens)
+        found_seq = False
+        while seq_id < num_seqs:
+            current_context_len = tl.load(cache_meta + 1 + seq_id * 2)
+            current_seq_len = tl.load(cache_meta + 2 + seq_id * 2)
+            current_query_len = current_seq_len - current_context_len
+            in_seq = query_active & (global_query_id >= query_start) & (global_query_id < query_start + current_query_len)
+            matched_seq_id = tl.where(in_seq, seq_id, matched_seq_id)
+            context_len = tl.where(in_seq, current_context_len, context_len)
+            seq_len = tl.where(in_seq, current_seq_len, seq_len)
+            query_id = tl.where(in_seq, global_query_id - query_start, query_id)
+            found_seq = found_seq | in_seq
+            query_start += current_query_len
+            seq_id += 1
+
+        head_group = @qHeads // @Model.Cache.NumKVHeads
+        kv_head = q_head // head_group
+        max_score = -float("inf")
+        context_start = tl.full((), 0, tl.int64)
+        while context_start < max_seq_len:
+            context_ids = context_start + tl.arange(0, block_size)
+            context_mask = found_seq & (context_ids < seq_len) & (context_ids <= context_len + query_id)
+            dot = tl.zeros((block_size,), tl.float32)
+            reduce_dim = 0
+            while reduce_dim < @Model.Cache.HeadDim:
+                reduce_dim_block = reduce_dim // @Model.Cache.LaneCount
+                reduce_lane = reduce_dim % @Model.Cache.LaneCount
+                q_offsets = @Html.Raw(queryOffset)
+                q_value = tl.load(query + q_offsets, mask=found_seq, other=0.0).to(tl.float32)
+                context_bid = context_ids // @Model.Cache.BlockSize
+                block_offset = context_ids % @Model.Cache.BlockSize
+                block_id = tl.load(block_tables + matched_seq_id * block_table_blocks * @Model.Cache.IdLength + context_bid * @Model.Cache.IdLength + @(Model.Cache.IdLength - 1), mask=context_mask, other=0)
+                key_offsets = @Html.Raw(keyOffset)
+                key_value = tl.load(kv_cache + key_offsets, mask=context_mask, other=0.0).to(tl.float32)
+                dot += q_value * key_value
+                reduce_dim += 1
+            score = tl.where(context_mask, dot * scale_value, -float("inf"))
+            max_score = tl.maximum(max_score, tl.max(score, axis=0))
+            context_start += block_size
+
+        sum_exp = 0.0
+        acc = 0.0
+        context_start = tl.full((), 0, tl.int64)
+        while context_start < max_seq_len:
+            context_ids = context_start + tl.arange(0, block_size)
+            context_mask = found_seq & (context_ids < seq_len) & (context_ids <= context_len + query_id)
+            dot = tl.zeros((block_size,), tl.float32)
+            reduce_dim = 0
+            while reduce_dim < @Model.Cache.HeadDim:
+                reduce_dim_block = reduce_dim // @Model.Cache.LaneCount
+                reduce_lane = reduce_dim % @Model.Cache.LaneCount
+                q_offsets = @Html.Raw(queryOffset)
+                q_value = tl.load(query + q_offsets, mask=found_seq, other=0.0).to(tl.float32)
+                context_bid = context_ids // @Model.Cache.BlockSize
+                block_offset = context_ids % @Model.Cache.BlockSize
+                block_id = tl.load(block_tables + matched_seq_id * block_table_blocks * @Model.Cache.IdLength + context_bid * @Model.Cache.IdLength + @(Model.Cache.IdLength - 1), mask=context_mask, other=0)
+                key_offsets = @Html.Raw(keyOffset)
+                key_value = tl.load(kv_cache + key_offsets, mask=context_mask, other=0.0).to(tl.float32)
+                dot += q_value * key_value
+                reduce_dim += 1
+            score = tl.where(context_mask, dot * scale_value, -float("inf"))
+            weight = tl.exp(score - max_score)
+            context_bid = context_ids // @Model.Cache.BlockSize
+            block_offset = context_ids % @Model.Cache.BlockSize
+            block_id = tl.load(block_tables + matched_seq_id * block_table_blocks * @Model.Cache.IdLength + context_bid * @Model.Cache.IdLength + @(Model.Cache.IdLength - 1), mask=context_mask, other=0)
+            value_offsets = @Html.Raw(valueOffset)
+            value = tl.load(kv_cache + value_offsets, mask=context_mask, other=0.0).to(tl.float32)
+            sum_exp += tl.sum(tl.where(context_mask, weight, 0.0), axis=0)
+            acc += tl.sum(tl.where(context_mask, weight * value, 0.0), axis=0)
+            context_start += block_size
+
+        result = acc / sum_exp
+        output_offsets = @Html.Raw(outputOffset)
+        tl.store(output + output_offsets, result, mask=found_seq)
+        linear_start += 1
