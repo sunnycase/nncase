@@ -9,8 +9,6 @@ namespace Nncase.CodeGen.PyNTT;
 
 internal sealed class PyNTTFunctionBuilder
 {
-    private const ulong InlineRDataThreshold = 4UL * 1024UL * 1024UL;
-
     private readonly uint _id;
     private readonly CompileOptions _compileOptions;
 
@@ -36,7 +34,7 @@ internal sealed class PyNTTFunctionBuilder
             return PyNTTRDataBundle.Empty;
         }
 
-        var targetOptions = _compileOptions.TargetOptions as NTTTargetOptions ?? new NTTTargetOptions();
+        var targetOptions = PyNTTTargetOptionsUtility.Normalize(_compileOptions);
         var rdata = SerializeRData(primFunction.SchedResult.Rdatas);
         var threadLocalRdatas = SerializeLocalRData(primFunction.SchedResult.ThreadLocalRdatas, targetOptions, "t");
         var warpLocalRdatas = SerializeLocalRData(primFunction.SchedResult.WarpLocalRdatas, targetOptions, "w");
@@ -54,7 +52,7 @@ internal sealed class PyNTTFunctionBuilder
 
     private (string Payload, long Bytes) SerializeRData(IReadOnlyDictionary<Const, ValueRange<ulong>> rdatas)
     {
-        var poolSize = GetPoolSize(rdatas);
+        var poolSize = PyNTTRDataUtility.GetPoolSizeBytes(rdatas);
         if (poolSize == 0)
         {
             return (string.Empty, 0);
@@ -76,7 +74,7 @@ internal sealed class PyNTTFunctionBuilder
             tensor.Serialize(stream);
         }
 
-        return (FinalizePayload(payload), checked((long)poolSize));
+        return (FinalizePayload(payload), poolSize);
     }
 
     private (string[] Payloads, long Bytes) SerializeLocalRData(
@@ -84,16 +82,29 @@ internal sealed class PyNTTFunctionBuilder
         NTTTargetOptions targetOptions,
         string scopeName)
     {
-        var poolSize = GetPoolSize(localRdatas);
+        var poolSize = PyNTTRDataUtility.GetPoolSizeBytes(localRdatas);
         if (poolSize == 0)
         {
             return (Array.Empty<string>(), 0);
         }
 
-        var shardCount = GetScopedShardCount(targetOptions, scopeName);
-        var payloads = new string[shardCount];
+        var shardCount = PyNTTRDataUtility.GetScopedShardCount(targetOptions, scopeName);
+        var tableStride = PyNTTRDataUtility.GetLocalRDataTableStrideBytes(localRdatas, targetOptions, scopeName);
+        var payloads = new string[tableStride == 0 ? 1 : shardCount];
+        var payloadBySignature = new Dictionary<string, string>(StringComparer.Ordinal);
         for (var shard = 0; shard < shardCount; shard++)
         {
+            var signature = PyNTTRDataUtility.GetLocalRDataShardSignature(localRdatas, targetOptions, scopeName, shard);
+            if (payloadBySignature.TryGetValue(signature, out var existingPayload))
+            {
+                if (shard < payloads.Length)
+                {
+                    payloads[shard] = existingPayload;
+                }
+
+                continue;
+            }
+
             using var payload = CreatePayloadStream(poolSize, $"{scopeName}_{shard}");
             var stream = payload.Stream;
             stream.SetLength(checked((long)poolSize));
@@ -104,7 +115,7 @@ internal sealed class PyNTTFunctionBuilder
                 var size = range.Max - range.Min;
                 var dividedDims = DistributedUtility.GetDividedTensorType(distributedType).Shape.ToValueArray();
                 var localStrides = TensorUtilities.GetDefaultStrides(dividedDims);
-                var shardIndex = GetScopedShardIndex(shard, targetOptions, scopeName);
+                var shardIndex = PyNTTRDataUtility.GetScopedShardIndex(shard, targetOptions, scopeName);
                 (var localOffset, var localShape) = DistributedUtility.GetLocalOffsetAndShape(distributedType, shardIndex);
                 var linearOffset = TensorUtilities.GetLinearOffset(tensor.Strides, localOffset);
 
@@ -117,19 +128,24 @@ internal sealed class PyNTTFunctionBuilder
                 tensor.Serialize(stream, linearOffset, localShape, localStrides);
             }
 
-            payloads[shard] = FinalizePayload(payload);
+            var finalizedPayload = FinalizePayload(payload);
+            payloadBySignature[signature] = finalizedPayload;
+            if (shard < payloads.Length)
+            {
+                payloads[shard] = finalizedPayload;
+            }
+
+            if (tableStride == 0)
+            {
+                break;
+            }
         }
 
-        return (payloads, checked((long)poolSize));
+        return (payloads, poolSize);
     }
 
-    private PayloadStream CreatePayloadStream(ulong poolSize, string label)
+    private PayloadStream CreatePayloadStream(long poolSize, string label)
     {
-        if (poolSize <= InlineRDataThreshold)
-        {
-            return new(new MemoryStream(), null);
-        }
-
         var directory = Path.Join(Path.GetTempPath(), "nncase_pyntt_rdata");
         Directory.CreateDirectory(directory);
         var path = Path.Join(directory, $"{_id}_{label}_{Guid.NewGuid():N}.bin");
@@ -144,44 +160,7 @@ internal sealed class PyNTTFunctionBuilder
             return $"file:{payload.Path}";
         }
 
-        if (payload.Stream is not MemoryStream memoryStream)
-        {
-            throw new InvalidOperationException("Inline PyNTT rdata payload must use a memory stream.");
-        }
-
-        return Convert.ToBase64String(memoryStream.ToArray());
-    }
-
-    private ulong GetPoolSize(IReadOnlyDictionary<Const, ValueRange<ulong>> ranges)
-    {
-        return ranges.Count == 0 ? 0UL : ranges.Values.Max(range => range.Max);
-    }
-
-    private int GetScopedShardCount(NTTTargetOptions targetOptions, string scopeName)
-    {
-        var hierarchies = targetOptions.Hierarchies.Length == 0 ? new[] { 1 } : targetOptions.Hierarchies[0];
-        var scopeIndex = targetOptions.HierarchyNames.IndexOf(scopeName, StringComparison.Ordinal);
-        if (scopeIndex < 0)
-        {
-            return checked((int)TensorUtilities.GetProduct(hierarchies));
-        }
-
-        return checked((int)TensorUtilities.GetProduct(hierarchies.Take(scopeIndex + 1).ToArray()));
-    }
-
-    private int[] GetScopedShardIndex(int writerIndex, NTTTargetOptions targetOptions, string scopeName)
-    {
-        var hierarchies = targetOptions.Hierarchies.Length == 0 ? new[] { 1 } : targetOptions.Hierarchies[0];
-        var scopeIndex = targetOptions.HierarchyNames.IndexOf(scopeName, StringComparison.Ordinal);
-        if (scopeIndex < 0)
-        {
-            return DistributedUtility.GetUnraveledIndex(writerIndex, hierarchies);
-        }
-
-        var scopedHierarchies = hierarchies.Take(scopeIndex + 1).ToArray();
-        return DistributedUtility.GetUnraveledIndex(writerIndex, scopedHierarchies)
-            .Concat(Enumerable.Repeat(0, hierarchies.Length - scopedHierarchies.Length))
-            .ToArray();
+        throw new InvalidOperationException("PyNTT rdata payloads must be backed by binary files.");
     }
 
     private sealed record PayloadStream(Stream Stream, string? Path) : IDisposable

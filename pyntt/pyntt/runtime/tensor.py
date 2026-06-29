@@ -292,7 +292,7 @@ def materialize_kv_cache_storage(
     if block_size <= 0:
         raise PyNTTArgumentError(f"KV cache block_size must be positive, got {block_size}.")
 
-    required_blocks = _infer_required_kv_blocks(value, block_size)
+    required_blocks = _infer_required_kv_blocks(value, block_size, topology_shape)
     raw_storage = _extract_kv_cache_field(value, "kv_caches")
     storage_key = _kv_cache_storage_key(raw_storage, dtype, topology_shape, tail_shape)
     existing = _KV_CACHE_STORAGE_CACHE.get(storage_key)
@@ -317,6 +317,18 @@ def materialize_kv_cache_storage(
 
     _KV_CACHE_STORAGE_CACHE[storage_key] = initial
     return initial
+
+
+def materialize_kv_cache_blocks_per_shard(
+    value: Any,
+    topology_shape: tuple[int, ...] = (),
+    block_size: int = 1,
+) -> int:
+    """Return the local block capacity used by PyNTT KV-cache storage."""
+    topology_shape = tuple(int(dim) for dim in topology_shape)
+    if block_size <= 0:
+        raise PyNTTArgumentError(f"KV cache block_size must be positive, got {block_size}.")
+    return _infer_required_kv_blocks(value, block_size, topology_shape)
 
 
 def _extract_kv_cache_field(value: Any, name: str):
@@ -358,14 +370,19 @@ def _to_int64_tensor(torch, value: Any, device):
     return torch.as_tensor(value, dtype=torch.int64, device=device).contiguous()
 
 
-def _infer_required_kv_blocks(value: Any, block_size: int) -> int:
+def _infer_required_kv_blocks(value: Any, block_size: int, topology_shape: tuple[int, ...] = ()) -> int:
     required = 1
+    topology_extent = 1
+    for dim in topology_shape:
+        topology_extent *= max(1, int(dim))
+
     num_blocks = getattr(value, "num_blocks", None)
     if callable(num_blocks):
         num_blocks = num_blocks()
     if num_blocks is not None:
         try:
-            required = max(required, int(num_blocks))
+            total_blocks = int(num_blocks)
+            required = max(required, (total_blocks + topology_extent - 1) // topology_extent)
         except TypeError:
             pass
 

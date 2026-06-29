@@ -55,7 +55,7 @@
             terms.Add($"{prefix}{axis} * {strides[axis]}");
         }
 
-        var tensorOffset = terms.Count == 0 ? "0" : string.Join(" + ", terms);
+        var tensorOffset = terms.Count == 0 ? "lane_flat * 0" : string.Join(" + ", terms);
         return laneCount == 1 ? tensorOffset : $"(({tensorOffset}) * {laneCount} + {laneFlat})";
     }
 
@@ -70,8 +70,7 @@
     }
 
     var body = new StringBuilder();
-    body.AppendLine("    linear_start = 0");
-    body.AppendLine($"    while linear_start < {totalElements}:");
+    body.AppendLine($"    for linear_start in tl.range(0, {totalElements}, block_size):");
     body.AppendLine("        linear = linear_start + tl.arange(0, block_size)");
     body.AppendLine($"        mask = linear < {totalElements}");
     body.AppendLine($"        lane_flat = linear % {domainLaneCount}");

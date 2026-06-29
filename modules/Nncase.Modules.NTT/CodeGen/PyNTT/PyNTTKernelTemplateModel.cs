@@ -15,7 +15,8 @@ public sealed record PyNTTTensorLoadTemplateModel(
     PyNTTDimExpression[] LocalShape,
     PyNTTDimExpression[] DestinationStrides,
     PyNTTDimExpression[] GlobalShape,
-    int? ShardAxis,
+    int[] Hierarchy,
+    int[][] SplitAxes,
     string Comment)
 {
     public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
@@ -31,7 +32,8 @@ public sealed record PyNTTTensorStoreTemplateModel(
     PyNTTDimExpression[] LocalShape,
     PyNTTDimExpression[] SourceStrides,
     PyNTTDimExpression[] GlobalShape,
-    int? ShardAxis,
+    int[] Hierarchy,
+    int[][] SplitAxes,
     string Comment)
 {
     public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
@@ -54,6 +56,9 @@ public sealed record PyNTTElementwiseBinaryTemplateModel(
     PyNTTDimExpression[] LhsStrides,
     PyNTTDimExpression[] RhsStrides,
     PyNTTDimExpression[] OutputStrides,
+    int LhsVectorLaneCount,
+    int RhsVectorLaneCount,
+    int OutputVectorLaneCount,
     PyNTTDimExpression[] Shape,
     string BinaryExpression,
     string Op,
@@ -74,6 +79,8 @@ public sealed record PyNTTElementwiseUnaryTemplateModel(
     PyNTTDimExpression[] OutputShape,
     PyNTTDimExpression[] InputStrides,
     PyNTTDimExpression[] OutputStrides,
+    int InputVectorLaneCount,
+    int OutputVectorLaneCount,
     PyNTTDimExpression[] Shape,
     string UnaryExpression,
     string Op,
@@ -94,6 +101,9 @@ public sealed record PyNTTElementwiseCastTemplateModel(
     PyNTTDimExpression[] OutputShape,
     PyNTTDimExpression[] InputStrides,
     PyNTTDimExpression[] OutputStrides,
+    int InputVectorLaneCount,
+    int OutputVectorLaneCount,
+    int[] VectorizedAxes,
     PyNTTDimExpression[] Shape,
     string CastExpression,
     string CastMode,
@@ -122,6 +132,10 @@ public sealed record PyNTTElementwiseWhereTemplateModel(
     PyNTTDimExpression[] TrueStrides,
     PyNTTDimExpression[] FalseStrides,
     PyNTTDimExpression[] OutputStrides,
+    int CondVectorLaneCount,
+    int TrueVectorLaneCount,
+    int FalseVectorLaneCount,
+    int OutputVectorLaneCount,
     PyNTTDimExpression[] Shape,
     string Comment)
 {
@@ -184,6 +198,34 @@ public sealed record PyNTTGatherTemplateModel(
     PyNTTDimExpression[] IndexStrides,
     PyNTTDimExpression[] OutputStrides,
     int Axis,
+    int ValueVectorLaneCount,
+    string Comment)
+{
+    public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
+}
+
+public sealed record PyNTTReshardTemplateModel(
+    string FunctionName,
+    PyNTTBufferPointerTemplateModel Input,
+    PyNTTBufferPointerTemplateModel Output,
+    string InputBaseName,
+    long InputOffsetBytes,
+    long InputPoolBytes,
+    string OutputBaseName,
+    long OutputOffsetBytes,
+    long OutputPoolBytes,
+    int ScalarElementSizeBytes,
+    string DType,
+    string TritonDType,
+    PyNTTDimExpression[] GlobalShape,
+    PyNTTDimExpression[] InputLocalShape,
+    PyNTTDimExpression[] OutputLocalShape,
+    PyNTTDimExpression[] InputStrides,
+    PyNTTDimExpression[] OutputStrides,
+    int VectorLaneCount,
+    int[] Hierarchy,
+    int[][] InputSplitAxes,
+    int[][] OutputSplitAxes,
     string Comment)
 {
     public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
@@ -276,6 +318,11 @@ public sealed record PyNTTRoPETemplateModel(
     PyNTTDimExpression[] CosStrides,
     PyNTTDimExpression[] SinStrides,
     PyNTTDimExpression[] OutputStrides,
+    int InputVectorLaneCount,
+    int CosVectorLaneCount,
+    int SinVectorLaneCount,
+    int OutputVectorLaneCount,
+    int RotaryAxis,
     string Comment)
 {
     public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
@@ -303,6 +350,10 @@ public sealed record PyNTTLayerNormTemplateModel(
     PyNTTDimExpression[] ScaleStrides,
     PyNTTDimExpression[] BiasStrides,
     PyNTTDimExpression[] OutputStrides,
+    int InputVectorLaneCount,
+    int ScaleVectorLaneCount,
+    int BiasVectorLaneCount,
+    int OutputVectorLaneCount,
     int Axis,
     float Epsilon,
     bool UseMean,
@@ -346,7 +397,9 @@ public sealed record PyNTTPagedAttentionCacheTemplateModel(
     int BlockSize,
     int LaneCount,
     int HeadDimBlocks,
-    int IdLength);
+    int IdLength,
+    int[] TopologyShape,
+    int[] NumBlocksSplitAxes);
 
 public sealed record PyNTTUpdatePagedAttentionKVCacheTemplateModel(
     string FunctionName,
@@ -354,7 +407,14 @@ public sealed record PyNTTUpdatePagedAttentionKVCacheTemplateModel(
     string SlotsDType,
     string SlotsTritonDType,
     PyNTTDimExpression[] SlotsShape,
+    PyNTTDimExpression[] SlotsGlobalShape,
     PyNTTDimExpression[] SlotsStrides,
+    int[][] SlotsSplitAxes,
+    int[] Hierarchy,
+    string SlotsBaseName,
+    long SlotsOffsetBytes,
+    long SlotsPoolBytes,
+    int ScalarElementSizeBytes,
     int SeqAxis,
     int HeadAxis,
     int DimAxis,
@@ -377,11 +437,15 @@ public sealed record PyNTTPagedAttentionTemplateModel(
     string OutputTritonDType,
     PyNTTDimExpression[] QueryShape,
     PyNTTDimExpression[] OutputShape,
+    PyNTTDimExpression[] OutputGlobalShape,
     PyNTTDimExpression[] QueryStrides,
     PyNTTDimExpression[] OutputStrides,
+    int[][] OutputSplitAxes,
+    int[] Hierarchy,
     int SeqAxis,
     int HeadAxis,
     int DimAxis,
+    int GlobalNumQueryHeads,
     int LayerId,
     PyNTTPagedAttentionCacheTemplateModel Cache,
     string Comment)
@@ -432,6 +496,8 @@ public sealed record PyNTTTransposeTemplateModel(
     PyNTTDimExpression[] OutputShape,
     PyNTTDimExpression[] InputStrides,
     PyNTTDimExpression[] OutputStrides,
+    int InputVectorLaneCount,
+    int OutputVectorLaneCount,
     int[] Perm,
     string Comment)
 {
@@ -457,7 +523,25 @@ public sealed record PyNTTMatmulTemplateModel(
     PyNTTDimExpression[] OutputStrides,
     bool TransposeA,
     bool TransposeB,
+    int RhsNVectorLaneCount,
+    int OutputNVectorLaneCount,
     string Scale,
+    string Comment)
+{
+    public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
+}
+
+public sealed record PyNTTShardReduceTemplateModel(
+    string FunctionName,
+    string BaseName,
+    string DType,
+    string TritonDType,
+    PyNTTDimExpression[] LocalShape,
+    PyNTTDimExpression[] Strides,
+    int VectorLaneCount,
+    int[] Hierarchy,
+    int[] ReduceAxes,
+    bool Broadcast,
     string Comment)
 {
     public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();

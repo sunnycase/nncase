@@ -5,62 +5,64 @@
     var inputShape = PyNTTTemplateUtility.ShapeTuple(Model.InputShape);
     var outputShape = PyNTTTemplateUtility.ShapeTuple(Model.OutputShape);
     var perm = "(" + string.Join(", ", Model.Perm) + (Model.Perm.Length == 1 ? "," : string.Empty) + ")";
+    var totalElements = Multiply(ProductExpression(Model.OutputShape), Model.OutputVectorLaneCount.ToString(System.Globalization.CultureInfo.InvariantCulture));
 
     static string Indent(int level) => new(' ', level * 4);
 
-    var blockAxis = PyNTTTemplateUtility.SelectBlockAxis(Model.OutputShape, Model.OutputStrides);
-    var blockExtent = Model.OutputShape.Length == 0 ? PyNTTDimExpression.One : Model.OutputShape[blockAxis];
-    var loopAxes = Enumerable.Range(0, Model.OutputShape.Length).Where(axis => axis != blockAxis).ToArray();
-
-    string AxisIndex(int outputAxis) => outputAxis == blockAxis ? "lane" : $"idx{outputAxis}";
-
-    string OutputOffsetExpression()
+    static string ProductExpression(IReadOnlyList<PyNTTDimExpression> values)
     {
-        var terms = new List<string>();
-        for (var outputAxis = 0; outputAxis < Model.OutputShape.Length; outputAxis++)
+        if (values.Count == 0)
         {
-            terms.Add($"{AxisIndex(outputAxis)} * {Model.OutputStrides[outputAxis]}");
+            return "1";
         }
 
-        return terms.Count == 0 ? "lane * 0" : $"lane * 0 + {string.Join(" + ", terms)}";
+        return string.Join(" * ", values.Select(value => $"({value.TritonExpression})"));
     }
 
-    string InputOffsetExpression()
+    static string Multiply(string lhs, string rhs)
+    {
+        return rhs == "1" ? lhs : $"({lhs}) * {rhs}";
+    }
+
+    static string TensorOffset(string prefix, IReadOnlyList<PyNTTDimExpression> strides, int laneCount, string laneFlat)
     {
         var terms = new List<string>();
-        for (var inputAxis = 0; inputAxis < Model.InputShape.Length; inputAxis++)
+        for (var axis = 0; axis < strides.Count; axis++)
         {
-            var outputAxis = Array.IndexOf(Model.Perm, inputAxis);
-            terms.Add($"{AxisIndex(outputAxis)} * {Model.InputStrides[inputAxis]}");
+            terms.Add($"{prefix}{axis} * {strides[axis]}");
         }
 
-        return terms.Count == 0 ? "lane * 0" : $"lane * 0 + {string.Join(" + ", terms)}";
+        var tensorOffset = terms.Count == 0 ? "lane_flat * 0" : string.Join(" + ", terms);
+        return laneCount == 1 ? tensorOffset : $"(({tensorOffset}) * {laneCount} + {laneFlat})";
+    }
+
+    void AppendTensorIndexDecompose(StringBuilder builder, int indent, string linearName, string prefix, IReadOnlyList<PyNTTDimExpression> shape)
+    {
+        builder.AppendLine($"{Indent(indent)}tmp = {linearName}");
+        for (var axis = shape.Count - 1; axis >= 0; axis--)
+        {
+            builder.AppendLine($"{Indent(indent)}{prefix}{axis} = tmp % {shape[axis]}");
+            builder.AppendLine($"{Indent(indent)}tmp = tmp // {shape[axis]}");
+        }
     }
 
     var body = new StringBuilder();
-    var indent = 1;
-    foreach (var axis in loopAxes)
+    body.AppendLine($"    for linear_start in tl.range(0, {totalElements}, block_size):");
+    body.AppendLine("        linear = linear_start + tl.arange(0, block_size)");
+    body.AppendLine($"        mask = linear < {totalElements}");
+    body.AppendLine($"        lane_flat = linear % {Model.OutputVectorLaneCount}");
+    body.AppendLine($"        output_tensor_linear = linear // {Model.OutputVectorLaneCount}");
+    AppendTensorIndexDecompose(body, 2, "output_tensor_linear", "out_idx", Model.OutputShape);
+    for (var inputAxis = 0; inputAxis < Model.InputShape.Length; inputAxis++)
     {
-        body.AppendLine($"{Indent(indent)}idx{axis} = 0");
-        body.AppendLine($"{Indent(indent)}while idx{axis} < {Model.OutputShape[axis]}:");
-        indent++;
+        var outputAxis = Array.IndexOf(Model.Perm, inputAxis);
+        body.AppendLine($"        in_idx{inputAxis} = out_idx{outputAxis}");
     }
 
-    body.AppendLine($"{Indent(indent)}axis_start = 0");
-    body.AppendLine($"{Indent(indent)}while axis_start < {blockExtent}:");
-    body.AppendLine($"{Indent(indent + 1)}lane = axis_start + tl.arange(0, block_size)");
-    body.AppendLine($"{Indent(indent + 1)}mask = lane < {blockExtent}");
-    body.AppendLine($"{Indent(indent + 1)}input_offsets = {InputOffsetExpression()}");
-    body.AppendLine($"{Indent(indent + 1)}output_offsets = {OutputOffsetExpression()}");
-    body.AppendLine($"{Indent(indent + 1)}value = tl.load(input + input_offsets, mask=mask)");
-    body.AppendLine($"{Indent(indent + 1)}tl.store(output + output_offsets, value, mask=mask)");
-    body.AppendLine($"{Indent(indent + 1)}axis_start += block_size");
-
-    foreach (var axis in loopAxes.Reverse())
-    {
-        body.AppendLine($"{Indent(indent)}idx{axis} += 1");
-        indent--;
-    }
+    body.AppendLine($"        input_offsets = {TensorOffset("in_idx", Model.InputStrides, Model.InputVectorLaneCount, "lane_flat")}");
+    body.AppendLine($"        output_offsets = {TensorOffset("out_idx", Model.OutputStrides, Model.OutputVectorLaneCount, "lane_flat")}");
+    body.AppendLine("        value = tl.load(input + input_offsets, mask=mask)");
+    body.AppendLine("        tl.store(output + output_offsets, value, mask=mask)");
 }
 # generated from CodeGen/PyNTT/Templates/Triton/Kernels/Transpose.py.cshtml
 # @Model.Comment; input_dtype=@Model.InputDType, output_dtype=@Model.OutputDType, input_shape=@inputShape, output_shape=@outputShape, perm=@perm

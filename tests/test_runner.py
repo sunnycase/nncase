@@ -372,12 +372,17 @@ class TestRunner(Evaluator, Inference, metaclass=ABCMeta):
         target_options: object = None
         if target == 'pyntt':
             target_options = nncase.NTTTargetOptions()
-            target_options.Vectorize = False
-            target_options.Hierarchies = [[1]]
-            target_options.HierarchyNames = "b"
+            target_options.Vectorize = True
+            pyntt_hierarchy = self.get_pyntt_block_hierarchy()
+            target_options.Hierarchies = [pyntt_hierarchy]
+            target_options.HierarchyNames = self.get_pyntt_block_hierarchy_names(pyntt_hierarchy)
             for k, v in (values or {}).items():
                 target_option = self.get_pyntt_target_option_name(k)
                 if target_option is None:
+                    continue
+                if target_option == "Hierarchies" and self.is_default_pyntt_hierarchies(v):
+                    continue
+                if target_option == "HierarchyNames" and self.is_default_pyntt_hierarchy_names(v):
                     continue
                 setattr(target_options, target_option, v)
         if target == 'cpu' or target == 'xpu':
@@ -418,6 +423,30 @@ class TestRunner(Evaluator, Inference, metaclass=ABCMeta):
             print(f"WARN: PyNTT Python runner ignores target option {name}; generated output uses dump_dir/CodeGen/pyntt.")
             return None
         return aliases.get(name, name)
+
+    def is_pyntt_target_enabled(self) -> bool:
+        target_cfg = self.cfg.get('target', {}).get('pyntt', {})
+        return bool(target_cfg.get('eval', False) or target_cfg.get('infer', False))
+
+    def get_pyntt_block_hierarchy(self) -> List[int]:
+        try:
+            import torch
+            if torch.cuda.is_available():
+                return [4, 8]
+        except Exception as ex:
+            print(f"WARN: failed to query CUDA availability for PyNTT hierarchy: {ex}")
+        return [1]
+
+    def get_pyntt_block_hierarchy_names(self, hierarchy: List[int]) -> str:
+        if list(hierarchy) == [4, 8]:
+            return "yx"
+        return "b"
+
+    def is_default_pyntt_hierarchies(self, value) -> bool:
+        return value == [[1]]
+
+    def is_default_pyntt_hierarchy_names(self, value) -> bool:
+        return value == "b"
 
     def get_compile_options(self, target, model_file: Union[List[str], str], dump_dir):
         compile_options = nncase.CompileOptions()

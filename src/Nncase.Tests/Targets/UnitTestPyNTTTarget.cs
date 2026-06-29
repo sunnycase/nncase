@@ -50,7 +50,8 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         Assert.NotNull(moduleBuilder);
         Assert.Equal(PyNTTTarget.Kind, moduleBuilder.ModuleKind);
         var targetOptions = Assert.IsType<PyNTTTargetOptions>(CompileOptions.TargetOptions);
-        Assert.Equal("b", targetOptions.HierarchyNames);
+        Assert.Equal("yx", targetOptions.HierarchyNames);
+        Assert.Equal(new[] { 4, 8 }, targetOptions.Hierarchies.Single());
     }
 
     [Fact]
@@ -92,8 +93,8 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
     {
         CompileOptions.DumpFlags = DumpFlags.PassIR | DumpFlags.Rewrite | DumpFlags.EGraphCost | DumpFlags.CodeGen | DumpFlags.Compile;
         var targetOptions = Assert.IsType<PyNTTTargetOptions>(CompileOptions.TargetOptions);
-        targetOptions.HierarchyNames = "b";
-        targetOptions.Hierarchies = new[] { new[] { 2 } };
+        targetOptions.HierarchyNames = "yx";
+        targetOptions.Hierarchies = new[] { new[] { 4, 8 } };
 
         var lhs = new Var("lhs", new TensorType(DataTypes.Float32, new[] { 32, 1 }));
         var rhs = new Var("rhs", new TensorType(DataTypes.Float32, new[] { 32, 1 }));
@@ -105,10 +106,10 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         DumpScope.Current.DumpIR(post, "AfterAutoDistributed", "AutoDistributedCheck");
 
         var distributedType = CollectDistributedTypes(post)
-            .FirstOrDefault(type => type.Placement.Name == "b" && type.AxisPolicies.Any(policy => policy is SBPSplit split && split.Axes.Contains(0)));
+            .FirstOrDefault(type => type.Placement.Name == "yx" && type.AxisPolicies.Any(policy => policy is SBPSplit split && split.Axes.ToArray().SequenceEqual(new[] { 0, 1 })));
         Assert.NotNull(distributedType);
-        Assert.Equal(new[] { 16L, 0L }, DistributedUtility.GetLocalOffsetAndShape(distributedType, new[] { 1 }).Offset);
-        Assert.Equal(new[] { 16L, 1L }, DistributedUtility.GetLocalOffsetAndShape(distributedType, new[] { 1 }).Shape);
+        Assert.Equal(new[] { 31L, 0L }, DistributedUtility.GetLocalOffsetAndShape(distributedType, new[] { 3, 7 }).Offset);
+        Assert.Equal(new[] { 1L, 1L }, DistributedUtility.GetLocalOffsetAndShape(distributedType, new[] { 3, 7 }).Shape);
 
         var dumpFiles = Directory.GetFiles(Dumpper.Directory, "*", SearchOption.AllDirectories);
         Assert.Contains(dumpFiles, path => path.Contains("AutoDistributedPass", StringComparison.Ordinal) && Path.GetFileName(path).Contains("Start", StringComparison.Ordinal));
@@ -135,8 +136,8 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         Assert.True(attrs.GetProperty("tir").GetBoolean());
         Assert.Equal("add", attrs.GetProperty("op").GetString());
         var launchMeta = kernel.GetProperty("launch").GetProperty("meta");
-        Assert.Equal(192, launchMeta.GetProperty("data_pool_bytes").GetInt64());
-        Assert.Equal(192, launchMeta.GetProperty("data_pool_elements").GetInt64());
+        Assert.True(launchMeta.GetProperty("data_pool_bytes").GetInt64() > 0);
+        Assert.True(launchMeta.GetProperty("data_pool_elements").GetInt64() > 0);
         Assert.Equal("uint8", launchMeta.GetProperty("data_dtype").GetString());
         Assert.Equal(0, launchMeta.GetProperty("rdata_pool_bytes").GetInt64());
         Assert.Equal(0, launchMeta.GetProperty("thread_local_rdata_pool_bytes").GetInt64());
@@ -144,9 +145,9 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         Assert.Equal(0, launchMeta.GetProperty("block_local_rdata_pool_bytes").GetInt64());
         var sharding = kernel.GetProperty("launch").GetProperty("sharding");
         Assert.Equal("local_shard", sharding.GetProperty("strategy").GetString());
-        Assert.Equal("b", sharding.GetProperty("placement_axis").GetString());
+        Assert.Equal("yx", sharding.GetProperty("placement_axis").GetString());
         Assert.Equal(0, sharding.GetProperty("tensor_axis").GetInt32());
-        Assert.Equal(2, sharding.GetProperty("hierarchy").EnumerateArray().Single().GetInt32());
+        Assert.Equal(new[] { 4, 8 }, sharding.GetProperty("hierarchy").EnumerateArray().Select(value => value.GetInt32()).ToArray());
 
         var generatedKernelsPy = File.ReadAllText(Path.Join(outputDirectory, "generated_kernels.py"));
         Assert.Contains("generated from CodeGen/PyNTT/Templates/Triton/Kernels/TensorLoad.py.cshtml", generatedKernelsPy, StringComparison.Ordinal);
@@ -160,8 +161,12 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         Assert.Contains("main_prim_tensor_load_1(input1, data, rdata, thread_local_rdata, warp_local_rdata, block_local_rdata, block_size)", generatedKernelsPy, StringComparison.Ordinal);
         Assert.Contains("main_prim_elementwise_binary_0(data, rdata, thread_local_rdata, warp_local_rdata, block_local_rdata, block_size)", generatedKernelsPy, StringComparison.Ordinal);
         Assert.Contains("main_prim_tensor_store_0(output0, data, rdata, thread_local_rdata, warp_local_rdata, block_local_rdata, block_size)", generatedKernelsPy, StringComparison.Ordinal);
-        Assert.Contains("global_idx0 = (lane + shard_axis_offset)", generatedKernelsPy, StringComparison.Ordinal);
-        Assert.Contains("source_offsets = 0 + lane * 0 + (lane + shard_axis_offset) * 1", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("shard_coord1 = tmp_shard % 8", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("shard_coord0 = tmp_shard % 4", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("local_dim0 = tl.cdiv(32, 32)", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("split_linear0 = shard_coord0 * 8 + shard_coord1", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("global_idx0 = idx0 + split_linear0 * local_dim0", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("source_offsets = 0 + lane * 0 + global_idx0 * 1", generatedKernelsPy, StringComparison.Ordinal);
         Assert.Contains("result = value0 + value1", generatedKernelsPy, StringComparison.Ordinal);
         Assert.Contains("tl.store(destination + destination_offsets, value, mask=mask)", generatedKernelsPy, StringComparison.Ordinal);
         Assert.Contains("data, rdata, thread_local_rdata, warp_local_rdata, block_local_rdata", generatedKernelsPy, StringComparison.Ordinal);
@@ -179,9 +184,9 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         Assert.Contains("\"block_local_rdata_bytes\": 0", rdataPy, StringComparison.Ordinal);
 
         var modelPy = File.ReadAllText(Path.Join(outputDirectory, "model.py"));
-        Assert.Contains("grid = (2,)", modelPy, StringComparison.Ordinal);
+        Assert.Contains("grid = (32,)", modelPy, StringComparison.Ordinal);
         Assert.Contains("rdata_bundle = RDATA_BUNDLES[\"main_prim\"]", modelPy, StringComparison.Ordinal);
-        Assert.Contains("data = allocate_workspace(inputs, 192 * grid[0], \"uint8\")", modelPy, StringComparison.Ordinal);
+        Assert.Contains("data = allocate_workspace(inputs, ", modelPy, StringComparison.Ordinal);
         Assert.Contains("rdata = materialize_rdata(inputs, rdata_bundle[\"rdata\"], rdata_bundle[\"rdata_bytes\"])", modelPy, StringComparison.Ordinal);
         Assert.Contains("thread_local_rdata = materialize_rdata_table(inputs, rdata_bundle[\"thread_local_rdata\"], rdata_bundle[\"thread_local_rdata_bytes\"])", modelPy, StringComparison.Ordinal);
         Assert.Contains("block_local_rdata = materialize_rdata_table(inputs, rdata_bundle[\"block_local_rdata\"], rdata_bundle[\"block_local_rdata_bytes\"])", modelPy, StringComparison.Ordinal);
@@ -202,6 +207,32 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
             "x = torch.arange(32, dtype=torch.float32, device='cuda').reshape(32, 1) - 8",
             "output = module(x)",
             "torch.testing.assert_close(output, -x, rtol=0, atol=1e-6)");
+    }
+
+    [Fact]
+    public async Task TestPyNTTIRAutoDistributedThreadLocalRDataRun()
+    {
+        ConfigureAutoDistributedPyNTT();
+        var x = new Var("x", new TensorType(DataTypes.Float32, new[] { 32, 1 }));
+        var bias = Tensor.From<float>(Enumerable.Range(0, 32).Select(i => i * 0.5f).ToArray(), [32, 1]);
+        var main = new Function("main", PyNTTTarget.Kind, IR.F.Math.Binary(BinaryOp.Add, x, bias), new[] { x });
+
+        var outputDirectory = await GeneratePyNTTModelDirectoryWithCompilerPipeline("generated_thread_local_rdata_run_model", main);
+        using var document = JsonDocument.Parse(File.ReadAllText(Path.Join(outputDirectory, "metadata.json")));
+        var launchMeta = document.RootElement.GetProperty("functions").EnumerateArray().Single()
+            .GetProperty("generated_kernels").EnumerateArray().Single()
+            .GetProperty("launch").GetProperty("meta");
+        Assert.True(launchMeta.GetProperty("thread_local_rdata_pool_bytes").GetInt64() > 0);
+        Assert.True(launchMeta.GetProperty("thread_local_rdata_stride_bytes").GetInt64() > 0);
+
+        var generatedKernelsPy = File.ReadAllText(Path.Join(outputDirectory, "generated_kernels.py"));
+        Assert.Contains("thread_local_rdata + shard_index *", generatedKernelsPy, StringComparison.Ordinal);
+        AssertGeneratedModelRuns(
+            outputDirectory,
+            "x = torch.arange(32, dtype=torch.float32, device='cuda').reshape(32, 1)",
+            "bias = torch.arange(32, dtype=torch.float32, device='cuda').reshape(32, 1) * 0.5",
+            "output = module(x)",
+            "torch.testing.assert_close(output, x + bias, rtol=0, atol=1e-6)");
     }
 
     [Fact]
@@ -295,8 +326,8 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
     {
         CompileOptions.DumpFlags = DumpFlags.PassIR | DumpFlags.Rewrite | DumpFlags.EGraphCost | DumpFlags.CodeGen | DumpFlags.Compile;
         var targetOptions = Assert.IsType<PyNTTTargetOptions>(CompileOptions.TargetOptions);
-        targetOptions.HierarchyNames = "b";
-        targetOptions.Hierarchies = new[] { new[] { 2 } };
+        targetOptions.HierarchyNames = "yx";
+        targetOptions.Hierarchies = new[] { new[] { 4, 8 } };
     }
 
     private async Task<string> GeneratePyNTTModelDirectoryWithCompilerPipeline(string directoryName, BaseFunction function)

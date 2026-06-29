@@ -45,36 +45,28 @@
     var indent = 1;
     foreach (var axis in loopAxes)
     {
-        body.AppendLine($"{Indent(indent)}idx{axis} = 0");
-        body.AppendLine($"{Indent(indent)}while idx{axis} < {Model.Shape[axis]}:");
+        body.AppendLine($"{Indent(indent)}for idx{axis} in tl.range(0, {Model.Shape[axis]}):");
         indent++;
     }
 
-    body.AppendLine($"{Indent(indent)}axis_start = 0");
-    body.AppendLine($"{Indent(indent)}while axis_start < {blockExtent}:");
+    body.AppendLine($"{Indent(indent)}for axis_start in tl.range(0, {blockExtent}, block_size):");
     body.AppendLine($"{Indent(indent + 1)}lane = axis_start + tl.arange(0, block_size)");
     body.AppendLine($"{Indent(indent + 1)}mask = lane < {blockExtent}");
     body.AppendLine($"{Indent(indent + 1)}slice_base = {SliceBaseExpression()}");
     body.AppendLine($"{Indent(indent + 1)}max_value = tl.full((block_size,), -float(\"inf\"), tl.float32)");
-    body.AppendLine($"{Indent(indent + 1)}axis_pos = 0");
-    body.AppendLine($"{Indent(indent + 1)}while axis_pos < {axisExtent}:");
+    body.AppendLine($"{Indent(indent + 1)}for axis_pos in tl.range(0, {axisExtent}):");
     body.AppendLine($"{Indent(indent + 2)}values = tl.load(input0 + slice_base + axis_pos * {Model.InputStrides[Model.Axis]}, mask=mask, other=-float(\"inf\"))");
     body.AppendLine($"{Indent(indent + 2)}max_value = tl.maximum(max_value, values)");
-    body.AppendLine($"{Indent(indent + 2)}axis_pos += 1");
     body.AppendLine($"{Indent(indent + 1)}sum_value = tl.full((block_size,), 0.0, tl.float32)");
-    body.AppendLine($"{Indent(indent + 1)}axis_pos = 0");
-    body.AppendLine($"{Indent(indent + 1)}while axis_pos < {axisExtent}:");
+    body.AppendLine($"{Indent(indent + 1)}for axis_pos in tl.range(0, {axisExtent}):");
     body.AppendLine($"{Indent(indent + 2)}values = tl.load(input0 + slice_base + axis_pos * {Model.InputStrides[Model.Axis]}, mask=mask, other=-float(\"inf\"))");
     body.AppendLine($"{Indent(indent + 2)}sum_value += tl.exp(values - max_value)");
-    body.AppendLine($"{Indent(indent + 2)}axis_pos += 1");
     body.AppendLine($"{Indent(indent + 1)}value0 = tl.load(input0 + {OffsetExpression(Model.InputStrides)}, mask=mask, other=-float(\"inf\"))");
     body.AppendLine($"{Indent(indent + 1)}result = tl.exp(value0 - max_value) / sum_value");
     body.AppendLine($"{Indent(indent + 1)}tl.store(output + {OffsetExpression(Model.OutputStrides)}, result, mask=mask)");
-    body.AppendLine($"{Indent(indent + 1)}axis_start += block_size");
 
     foreach (var axis in loopAxes.Reverse())
     {
-        body.AppendLine($"{Indent(indent)}idx{axis} += 1");
         indent--;
     }
 }

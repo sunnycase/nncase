@@ -22,6 +22,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 def test_qwen3(request):
     cfg = """
     [compile_opt]
+    dump_ir = true
     shape_bucket_enable = true
     shape_bucket_range_info = { "batch_size"=[1,4], "sequence_length"=[1, 1024] }
     shape_bucket_segments_count = 2
@@ -29,11 +30,11 @@ def test_qwen3(request):
     
     [huggingface_options]
     output_logits = true
-    output_hidden_states = true
+    output_hidden_states = false
     num_layers = -1
 
     [paged_attention_config]
-    lanes = [8]
+    lanes = [4]
 
     [generator]
     [generator.inputs]

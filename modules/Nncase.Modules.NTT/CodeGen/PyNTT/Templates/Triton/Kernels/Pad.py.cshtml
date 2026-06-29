@@ -41,13 +41,11 @@
     var indent = 1;
     foreach (var axis in loopAxes)
     {
-        body.AppendLine($"{Indent(indent)}idx{axis} = 0");
-        body.AppendLine($"{Indent(indent)}while idx{axis} < {Model.OutputShape[axis]}:");
+        body.AppendLine($"{Indent(indent)}for idx{axis} in tl.range(0, {Model.OutputShape[axis]}):");
         indent++;
     }
 
-    body.AppendLine($"{Indent(indent)}axis_start = 0");
-    body.AppendLine($"{Indent(indent)}while axis_start < {blockExtent}:");
+    body.AppendLine($"{Indent(indent)}for axis_start in tl.range(0, {blockExtent}, block_size):");
     body.AppendLine($"{Indent(indent + 1)}lane = axis_start + tl.arange(0, block_size)");
     body.AppendLine($"{Indent(indent + 1)}mask = lane < {blockExtent}");
     body.AppendLine($"{Indent(indent + 1)}in_bounds = mask");
@@ -64,11 +62,9 @@
     body.AppendLine($"{Indent(indent + 1)}input_value = tl.load(input + input_offsets, mask=in_bounds, other={Model.PadValue})");
     body.AppendLine($"{Indent(indent + 1)}result = tl.where(in_bounds, input_value, {Model.PadValue})");
     body.AppendLine($"{Indent(indent + 1)}tl.store(output + output_offsets, result, mask=mask)");
-    body.AppendLine($"{Indent(indent + 1)}axis_start += block_size");
 
     foreach (var axis in loopAxes.Reverse())
     {
-        body.AppendLine($"{Indent(indent)}idx{axis} += 1");
         indent--;
     }
 }

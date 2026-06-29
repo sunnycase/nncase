@@ -48,4 +48,21 @@ public sealed class UnitTestDistribAutoDistributed : TestClassBase
         var pass = new AutoDistributedPass(false, CPUTarget.Kind, CompileOptions);
         pass.RunAsync(main, new()).Wait();
     }
+
+    [Fact]
+    public void TestNonUniformSplitCandidateIsGenerated()
+    {
+        var tensorType = new TensorType(DataTypes.Float32, [1024]);
+        var placement = new Placement([36], "b");
+        var policies = DistributedUtility.GetLeafCandidatePolicies(tensorType, placement);
+
+        Assert.Contains(policies, policy => policy.Count == 1 && policy[0] is SBPSplit split && split.Axes.SequenceEqual(new[] { 0 }));
+
+        var distributedType = new DistributedType(tensorType, new SBP[] { SBP.S(0) }, placement);
+        Assert.Equal(new[] { 1015L }, DistributedUtility.GetLocalOffsetAndShape(distributedType, new[] { 35 }).Offset);
+        Assert.Equal(new[] { 9L }, DistributedUtility.GetLocalOffsetAndShape(distributedType, new[] { 35 }).Shape);
+
+        var skinnyType = new DistributedType(new TensorType(DataTypes.Float32, new[] { 37L }), new SBP[] { SBP.S(0) }, placement);
+        Assert.Equal(new[] { 0L }, DistributedUtility.GetLocalOffsetAndShape(skinnyType, new[] { 35 }).Shape);
+    }
 }

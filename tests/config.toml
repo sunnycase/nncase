@@ -153,9 +153,9 @@ enabled = false
 threshold = 0.98
 
 [target.pyntt.target_options]
-Vectorize = false
-Hierarchies = [[1]]
-HierarchyNames = "b"
+Vectorize = true
+Hierarchies = [[4, 8]]
+HierarchyNames = "yx"
 
 [target.cuda]
 eval = false

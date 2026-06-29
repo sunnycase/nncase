@@ -81,23 +81,19 @@
     var indent = 1;
     foreach (var axis in copyLoopAxes)
     {
-        body.AppendLine($"{Indent(indent)}copy_idx{axis} = 0");
-        body.AppendLine($"{Indent(indent)}while copy_idx{axis} < {Model.OutputShape[axis]}:");
+        body.AppendLine($"{Indent(indent)}for copy_idx{axis} in tl.range(0, {Model.OutputShape[axis]}):");
         indent++;
     }
 
-    body.AppendLine($"{Indent(indent)}copy_axis_start = 0");
-    body.AppendLine($"{Indent(indent)}while copy_axis_start < {copyBlockExtent}:");
+    body.AppendLine($"{Indent(indent)}for copy_axis_start in tl.range(0, {copyBlockExtent}, block_size):");
     body.AppendLine($"{Indent(indent + 1)}copy_lane = copy_axis_start + tl.arange(0, block_size)");
     body.AppendLine($"{Indent(indent + 1)}copy_mask = copy_lane < {copyBlockExtent}");
     body.AppendLine($"{Indent(indent + 1)}copy_input_offsets = {OffsetExpression("copy", Model.InputShape, Model.InputStrides, copyBlockAxis)}");
     body.AppendLine($"{Indent(indent + 1)}copy_output_offsets = {OffsetExpression("copy", Model.OutputShape, Model.OutputStrides, copyBlockAxis)}");
     body.AppendLine($"{Indent(indent + 1)}copy_value = tl.load(input + copy_input_offsets, mask=copy_mask)");
     body.AppendLine($"{Indent(indent + 1)}tl.store(output + copy_output_offsets, copy_value, mask=copy_mask)");
-    body.AppendLine($"{Indent(indent + 1)}copy_axis_start += block_size");
     foreach (var axis in copyLoopAxes.Reverse())
     {
-        body.AppendLine($"{Indent(indent)}copy_idx{axis} += 1");
         indent--;
     }
 
@@ -106,13 +102,11 @@
     indent = 1;
     foreach (var axis in updatesLoopAxes)
     {
-        body.AppendLine($"{Indent(indent)}upd_idx{axis} = 0");
-        body.AppendLine($"{Indent(indent)}while upd_idx{axis} < {Model.UpdatesShape[axis]}:");
+        body.AppendLine($"{Indent(indent)}for upd_idx{axis} in tl.range(0, {Model.UpdatesShape[axis]}):");
         indent++;
     }
 
-    body.AppendLine($"{Indent(indent)}upd_axis_start = 0");
-    body.AppendLine($"{Indent(indent)}while upd_axis_start < {updatesBlockExtent}:");
+    body.AppendLine($"{Indent(indent)}for upd_axis_start in tl.range(0, {updatesBlockExtent}, block_size):");
     body.AppendLine($"{Indent(indent + 1)}upd_lane = upd_axis_start + tl.arange(0, block_size)");
     body.AppendLine($"{Indent(indent + 1)}upd_mask = upd_lane < {updatesBlockExtent}");
     body.AppendLine($"{Indent(indent + 1)}indices_prefix_offsets = {IndicesPrefixOffsetExpression(updatesBlockAxis)}");
@@ -129,10 +123,8 @@
     body.AppendLine($"{Indent(indent + 1)}scatter_output_offsets = {ScatterOutputOffsetExpression(updatesBlockAxis)}");
     body.AppendLine($"{Indent(indent + 1)}updates_value = tl.load(updates + updates_offsets, mask=upd_mask)");
     body.AppendLine($"{Indent(indent + 1)}tl.store(output + scatter_output_offsets, updates_value, mask=upd_mask)");
-    body.AppendLine($"{Indent(indent + 1)}upd_axis_start += block_size");
     foreach (var axis in updatesLoopAxes.Reverse())
     {
-        body.AppendLine($"{Indent(indent)}upd_idx{axis} += 1");
         indent--;
     }
 }

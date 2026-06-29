@@ -1,0 +1,159 @@
+@using System.Text
+@using Nncase.CodeGen.PyNTT
+@model Nncase.CodeGen.PyNTT.PyNTTReshardTemplateModel
+@{
+    var globalShape = PyNTTTemplateUtility.ShapeTuple(Model.GlobalShape);
+    var inputShape = PyNTTTemplateUtility.ShapeTuple(Model.InputLocalShape);
+    var outputShape = PyNTTTemplateUtility.ShapeTuple(Model.OutputLocalShape);
+
+    static string Indent(int level) => new(' ', level * 4);
+    static string Product(IEnumerable<string> values)
+    {
+        var array = values.ToArray();
+        return array.Length == 0 ? "1" : string.Join(" * ", array.Select(value => $"({value})"));
+    }
+
+    string SplitLinearExpression(IReadOnlyList<int> splitAxes, string coordPrefix)
+    {
+        if (splitAxes.Count == 0)
+        {
+            return "0";
+        }
+
+        var terms = new List<string>();
+        for (var i = 0; i < splitAxes.Count; i++)
+        {
+            var placementAxis = splitAxes[i];
+            var stride = splitAxes.Skip(i + 1).Aggregate(1, (acc, axis) => acc * Model.Hierarchy[axis]);
+            terms.Add(stride == 1 ? $"{coordPrefix}{placementAxis}" : $"{coordPrefix}{placementAxis} * {stride}");
+        }
+
+        return string.Join(" + ", terms);
+    }
+
+    string TensorOffsetExpression(string indexPrefix, IReadOnlyList<PyNTTDimExpression> strides)
+    {
+        var terms = new List<string>();
+        for (var axis = 0; axis < strides.Count; axis++)
+        {
+            terms.Add($"{indexPrefix}{axis} * {strides[axis]}");
+        }
+
+        return terms.Count == 0 ? "lane * 0" : $"lane * 0 + {string.Join(" + ", terms)}";
+    }
+
+    string ScalarOffsetExpression(string elementOffset)
+    {
+        return Model.VectorLaneCount == 1
+            ? elementOffset
+            : $"(({elementOffset}) * {Model.VectorLaneCount} + lane_value)";
+    }
+
+    var body = new StringBuilder();
+    var indent = 1;
+
+    body.AppendLine($"{Indent(indent)}tmp_shard = shard_index");
+    for (var axis = Model.Hierarchy.Length - 1; axis >= 0; axis--)
+    {
+        body.AppendLine($"{Indent(indent)}shard_coord{axis} = tmp_shard % {Model.Hierarchy[axis]}");
+        body.AppendLine($"{Indent(indent)}tmp_shard = tmp_shard // {Model.Hierarchy[axis]}");
+    }
+
+    for (var axis = 0; axis < Model.OutputLocalShape.Length; axis++)
+    {
+        var splitAxes = Model.OutputSplitAxes[axis];
+        if (splitAxes.Length == 0)
+        {
+            body.AppendLine($"{Indent(indent)}iter_dim{axis} = {Model.OutputLocalShape[axis]}");
+            body.AppendLine($"{Indent(indent)}global_base{axis} = 0");
+        }
+        else
+        {
+            var divisor = splitAxes.Aggregate(1, (acc, placementAxis) => acc * Model.Hierarchy[placementAxis]);
+            body.AppendLine($"{Indent(indent)}out_local_dim{axis} = tl.cdiv({Model.GlobalShape[axis]}, {divisor})");
+            body.AppendLine($"{Indent(indent)}out_split_linear{axis} = {SplitLinearExpression(splitAxes, "shard_coord")}");
+            body.AppendLine($"{Indent(indent)}global_base{axis} = out_split_linear{axis} * out_local_dim{axis}");
+            body.AppendLine($"{Indent(indent)}remaining_dim{axis} = {Model.GlobalShape[axis]} - global_base{axis}");
+            body.AppendLine($"{Indent(indent)}iter_dim{axis} = tl.minimum(out_local_dim{axis}, tl.maximum(remaining_dim{axis}, 0))");
+        }
+    }
+
+    var totalElements = Product(Enumerable.Range(0, Model.OutputLocalShape.Length).Select(axis => $"iter_dim{axis}").Concat(new[] { Model.VectorLaneCount.ToString(System.Globalization.CultureInfo.InvariantCulture) }));
+    body.AppendLine($"{Indent(indent)}for linear_start in tl.range(0, {totalElements}, block_size):");
+    indent++;
+    body.AppendLine($"{Indent(indent)}linear = linear_start + tl.arange(0, block_size)");
+    body.AppendLine($"{Indent(indent)}mask = linear < {totalElements}");
+    if (Model.VectorLaneCount == 1)
+    {
+        body.AppendLine($"{Indent(indent)}lane = linear");
+        body.AppendLine($"{Indent(indent)}lane_value = linear * 0");
+    }
+    else
+    {
+        body.AppendLine($"{Indent(indent)}lane = linear // {Model.VectorLaneCount}");
+        body.AppendLine($"{Indent(indent)}lane_value = linear % {Model.VectorLaneCount}");
+    }
+
+    body.AppendLine($"{Indent(indent)}remaining = lane");
+    for (var axis = Model.OutputLocalShape.Length - 1; axis >= 0; axis--)
+    {
+        body.AppendLine($"{Indent(indent)}idx{axis} = remaining % iter_dim{axis}");
+        body.AppendLine($"{Indent(indent)}remaining = remaining // iter_dim{axis}");
+    }
+
+    for (var axis = 0; axis < Model.GlobalShape.Length; axis++)
+    {
+        var splitAxes = Model.OutputSplitAxes[axis];
+        if (splitAxes.Length == 0)
+        {
+            body.AppendLine($"{Indent(indent)}global_idx{axis} = idx{axis}");
+        }
+        else
+        {
+            body.AppendLine($"{Indent(indent)}global_idx{axis} = idx{axis} + global_base{axis}");
+            body.AppendLine($"{Indent(indent)}mask = mask & (global_idx{axis} < {Model.GlobalShape[axis]})");
+        }
+    }
+
+    for (var axis = 0; axis < Model.Hierarchy.Length; axis++)
+    {
+        body.AppendLine($"{Indent(indent)}source_shard_coord{axis} = shard_coord{axis}");
+    }
+
+    for (var axis = 0; axis < Model.GlobalShape.Length; axis++)
+    {
+        var splitAxes = Model.InputSplitAxes[axis];
+        if (splitAxes.Length == 0)
+        {
+            body.AppendLine($"{Indent(indent)}source_idx{axis} = global_idx{axis}");
+        }
+        else
+        {
+            var divisor = splitAxes.Aggregate(1, (acc, placementAxis) => acc * Model.Hierarchy[placementAxis]);
+            body.AppendLine($"{Indent(indent)}in_local_dim{axis} = tl.cdiv({Model.GlobalShape[axis]}, {divisor})");
+            body.AppendLine($"{Indent(indent)}in_split_linear{axis} = global_idx{axis} // in_local_dim{axis}");
+            body.AppendLine($"{Indent(indent)}source_idx{axis} = global_idx{axis} - in_split_linear{axis} * in_local_dim{axis}");
+            body.AppendLine($"{Indent(indent)}tmp_in_split{axis} = in_split_linear{axis}");
+            for (var i = splitAxes.Length - 1; i >= 0; i--)
+            {
+                var placementAxis = splitAxes[i];
+                body.AppendLine($"{Indent(indent)}source_shard_coord{placementAxis} = tmp_in_split{axis} % {Model.Hierarchy[placementAxis]}");
+                body.AppendLine($"{Indent(indent)}tmp_in_split{axis} = tmp_in_split{axis} // {Model.Hierarchy[placementAxis]}");
+            }
+        }
+    }
+
+    body.AppendLine($"{Indent(indent)}source_shard_index = {SplitLinearExpression(Enumerable.Range(0, Model.Hierarchy.Length).ToArray(), "source_shard_coord")}");
+    body.AppendLine($"{Indent(indent)}input_offsets = {ScalarOffsetExpression(TensorOffsetExpression("source_idx", Model.InputStrides))}");
+    body.AppendLine($"{Indent(indent)}output_offsets = {ScalarOffsetExpression(TensorOffsetExpression("idx", Model.OutputStrides))}");
+    body.AppendLine($"{Indent(indent)}input_byte_offsets = source_shard_index * {Model.InputPoolBytes} + {Model.InputOffsetBytes} + input_offsets * {Model.ScalarElementSizeBytes}");
+    body.AppendLine($"{Indent(indent)}output_byte_offsets = shard_index * {Model.OutputPoolBytes} + {Model.OutputOffsetBytes} + output_offsets * {Model.ScalarElementSizeBytes}");
+    body.AppendLine($"{Indent(indent)}value = tl.load(({Model.InputBaseName} + input_byte_offsets).to(tl.pointer_type({Model.TritonDType})), mask=mask)");
+    body.AppendLine($"{Indent(indent)}tl.store(({Model.OutputBaseName} + output_byte_offsets).to(tl.pointer_type({Model.TritonDType})), value, mask=mask)");
+}
+# generated from CodeGen/PyNTT/Templates/Triton/Kernels/Reshard.py.cshtml
+# @Model.Comment; dtype=@Model.DType, global_shape=@globalShape, input_local_shape=@inputShape, output_local_shape=@outputShape, lane=@Model.VectorLaneCount
+@@triton.jit
+@($"def {Model.FunctionName}(data, rdata, thread_local_rdata, warp_local_rdata, block_local_rdata{PyNTTTemplateUtility.RuntimeParameterSuffix(Model.RuntimeShapeArgs)}):")
+    shard_index = tl.program_id(0).to(tl.int64)
+@Html.Raw(body.ToString().TrimEnd())

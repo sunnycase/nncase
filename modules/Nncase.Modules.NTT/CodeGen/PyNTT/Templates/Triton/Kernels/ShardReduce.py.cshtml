@@ -1,0 +1,138 @@
+@using System.Text
+@using Nncase.CodeGen.PyNTT
+@model Nncase.CodeGen.PyNTT.PyNTTShardReduceTemplateModel
+@{
+    var localShape = PyNTTTemplateUtility.ShapeTuple(Model.LocalShape);
+
+    static string Indent(int level) => new(' ', level * 4);
+    static string Product(IEnumerable<string> values)
+    {
+        var array = values.ToArray();
+        return array.Length == 0 ? "1" : string.Join(" * ", array.Select(value => $"({value})"));
+    }
+
+    string SplitLinearExpression(IReadOnlyList<int> splitAxes, string coordPrefix)
+    {
+        if (splitAxes.Count == 0)
+        {
+            return "0";
+        }
+
+        var terms = new List<string>();
+        for (var i = 0; i < splitAxes.Count; i++)
+        {
+            var placementAxis = splitAxes[i];
+            var stride = splitAxes.Skip(i + 1).Aggregate(1, (acc, axis) => acc * Model.Hierarchy[axis]);
+            terms.Add(stride == 1 ? $"{coordPrefix}{placementAxis}" : $"{coordPrefix}{placementAxis} * {stride}");
+        }
+
+        return string.Join(" + ", terms);
+    }
+
+    string TensorOffsetExpression(string indexPrefix)
+    {
+        var terms = new List<string>();
+        for (var axis = 0; axis < Model.Strides.Length; axis++)
+        {
+            terms.Add($"{indexPrefix}{axis} * {Model.Strides[axis]}");
+        }
+
+        return terms.Count == 0 ? "lane * 0" : $"lane * 0 + {string.Join(" + ", terms)}";
+    }
+
+    string ScalarOffsetExpression(string elementOffset)
+    {
+        return Model.VectorLaneCount == 1
+            ? elementOffset
+            : $"(({elementOffset}) * {Model.VectorLaneCount} + lane_value)";
+    }
+
+    var body = new StringBuilder();
+    var indent = 1;
+
+    body.AppendLine($"{Indent(indent)}tmp_shard = shard_index");
+    for (var axis = Model.Hierarchy.Length - 1; axis >= 0; axis--)
+    {
+        body.AppendLine($"{Indent(indent)}shard_coord{axis} = tmp_shard % {Model.Hierarchy[axis]}");
+        body.AppendLine($"{Indent(indent)}tmp_shard = tmp_shard // {Model.Hierarchy[axis]}");
+    }
+
+    if (Model.Broadcast)
+    {
+        for (var axis = 0; axis < Model.Hierarchy.Length; axis++)
+        {
+            var source = Model.ReduceAxes.Contains(axis) ? $"shard_coord{axis} * 0" : $"shard_coord{axis}";
+            body.AppendLine($"{Indent(indent)}source_shard_coord{axis} = {source}");
+        }
+
+        body.AppendLine($"{Indent(indent)}source_shard_index = {SplitLinearExpression(Enumerable.Range(0, Model.Hierarchy.Length).ToArray(), "source_shard_coord")}");
+        body.AppendLine($"{Indent(indent)}source = ({Model.BaseName} + source_shard_index * pool_bytes + source_offset_bytes).to(tl.pointer_type({Model.TritonDType}))");
+    }
+    else
+    {
+        body.AppendLine($"{Indent(indent)}active = True");
+        foreach (var axis in Model.ReduceAxes)
+        {
+            body.AppendLine($"{Indent(indent)}active = active & (shard_coord{axis} == 0)");
+        }
+    }
+
+    var totalElements = Product(Model.LocalShape.Select(axis => axis.TritonExpression).Concat(new[] { Model.VectorLaneCount.ToString(System.Globalization.CultureInfo.InvariantCulture) }));
+    body.AppendLine($"{Indent(indent)}for linear_start in tl.range(0, {totalElements}, block_size):");
+    indent++;
+    body.AppendLine($"{Indent(indent)}linear = linear_start + tl.arange(0, block_size)");
+    body.AppendLine($"{Indent(indent)}mask = linear < {totalElements}");
+    if (Model.VectorLaneCount == 1)
+    {
+        body.AppendLine($"{Indent(indent)}lane = linear");
+        body.AppendLine($"{Indent(indent)}lane_value = linear * 0");
+    }
+    else
+    {
+        body.AppendLine($"{Indent(indent)}lane = linear // {Model.VectorLaneCount}");
+        body.AppendLine($"{Indent(indent)}lane_value = linear % {Model.VectorLaneCount}");
+    }
+
+    body.AppendLine($"{Indent(indent)}remaining = lane");
+    for (var axis = Model.LocalShape.Length - 1; axis >= 0; axis--)
+    {
+        body.AppendLine($"{Indent(indent)}idx{axis} = remaining % {Model.LocalShape[axis]}");
+        body.AppendLine($"{Indent(indent)}remaining = remaining // {Model.LocalShape[axis]}");
+    }
+
+    var offset = ScalarOffsetExpression(TensorOffsetExpression("idx"));
+    if (Model.Broadcast)
+    {
+        body.AppendLine($"{Indent(indent)}value = tl.load(source + {offset}, mask=mask)");
+        body.AppendLine($"{Indent(indent)}tl.store(destination + {offset}, value, mask=mask)");
+    }
+    else
+    {
+        body.AppendLine($"{Indent(indent)}acc = tl.full((block_size,), 0.0, tl.float32)");
+        for (var axis = 0; axis < Model.Hierarchy.Length; axis++)
+        {
+            body.AppendLine($"{Indent(indent)}source_shard_coord{axis} = shard_coord{axis}");
+        }
+
+        var reduceIndent = indent;
+        foreach (var axis in Model.ReduceAxes)
+        {
+            body.AppendLine($"{Indent(reduceIndent)}for reduce_coord{axis} in tl.range(0, {Model.Hierarchy[axis]}):");
+            reduceIndent++;
+            body.AppendLine($"{Indent(reduceIndent)}source_shard_coord{axis} = reduce_coord{axis}.to(tl.int64)");
+        }
+
+        body.AppendLine($"{Indent(reduceIndent)}source_shard_index = {SplitLinearExpression(Enumerable.Range(0, Model.Hierarchy.Length).ToArray(), "source_shard_coord")}");
+        body.AppendLine($"{Indent(reduceIndent)}source = ({Model.BaseName} + source_shard_index * pool_bytes + source_offset_bytes).to(tl.pointer_type({Model.TritonDType}))");
+        body.AppendLine($"{Indent(reduceIndent)}source_value = tl.load(source + {offset}, mask=mask & active, other=0.0).to(tl.float32)");
+        body.AppendLine($"{Indent(reduceIndent)}acc += source_value");
+        body.AppendLine($"{Indent(indent)}tl.store(destination + {offset}, acc, mask=mask & active)");
+    }
+}
+# generated from CodeGen/PyNTT/Templates/Triton/Kernels/ShardReduce.py.cshtml
+# @Model.Comment; dtype=@Model.DType, local_shape=@localShape, vector_lane=@Model.VectorLaneCount, broadcast=@Model.Broadcast
+@@triton.jit
+@($"def {Model.FunctionName}(pool_bytes, source_offset_bytes, destination_offset_bytes, data, rdata, thread_local_rdata, warp_local_rdata, block_local_rdata{PyNTTTemplateUtility.RuntimeParameterSuffix(Model.RuntimeShapeArgs)}):")
+    shard_index = tl.program_id(0).to(tl.int64)
+    destination = (@Model.BaseName + shard_index * pool_bytes + destination_offset_bytes).to(tl.pointer_type(@Model.TritonDType))
+@Html.Raw(body.ToString().TrimEnd())

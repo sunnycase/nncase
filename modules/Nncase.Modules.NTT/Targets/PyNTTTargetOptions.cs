@@ -16,8 +16,8 @@ public sealed class PyNTTTargetOptions : NTTTargetOptions
     /// </summary>
     public PyNTTTargetOptions()
     {
-        HierarchyNames = "b";
-        Hierarchies = new[] { new[] { 1 } };
+        HierarchyNames = "yx";
+        Hierarchies = new[] { new[] { 4, 8 } };
     }
 
     /// <summary>

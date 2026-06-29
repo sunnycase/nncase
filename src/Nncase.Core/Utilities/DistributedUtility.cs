@@ -9,21 +9,6 @@ namespace Nncase.Utilities;
 
 public static class DistributedUtility
 {
-    static DistributedUtility()
-    {
-        var divisibleDist = Environment.GetEnvironmentVariable("DivisibleDist");
-        if (!string.IsNullOrEmpty(divisibleDist) && divisibleDist == "0")
-        {
-            DivideByFunc = IsDivideBy;
-        }
-        else
-        {
-            DivideByFunc = IsDivideExactly;
-        }
-    }
-
-    public delegate bool DivideByDelegate(long input, int divisor, bool isFixed);
-
     [Flags]
     public enum DivideFlags
     {
@@ -31,8 +16,6 @@ public static class DistributedUtility
         MaxShape = 1 << 1,
         FloorDiv = 1 << 2,
     }
-
-    public static DivideByDelegate DivideByFunc { get; }
 
     public static List<List<int>> GetHierarchyCombinations(int rank)
     {
@@ -73,7 +56,7 @@ public static class DistributedUtility
             {
                 var axis = splitsAxes[ti];
                 var divisor = axis.Select(a => placement.Hierarchy[a]).Aggregate(1, (a, b) => a * b);
-                if (axis.All(a => placement.Hierarchy[a] > 1) && divisor > 1 && DivideByFunc(maxShape[di], divisor, tensorType.Shape[di].IsFixed))
+                if (axis.All(a => placement.Hierarchy[a] > 1) && divisor > 1 && IsDivideBy(maxShape[di], divisor, tensorType.Shape[di].IsFixed))
                 {
                     policy.Add(SBP.S(axis.ToArray(), (int)MathUtility.CeilDiv(maxShape[di], divisor)));
                 }
@@ -142,7 +125,7 @@ public static class DistributedUtility
         // 2. All shapes are divisible by the mesh.
         var maxShape = CompilerServices.GetMaxShape(tensorType.Shape);
         var divisors = GetDivisors(new DistributedType(tensorType, polices.ToArray(), placement));
-        return divisors.Select((d, axis) => (d, axis)).All(p => p.d == 0 ? true : DivideByFunc(maxShape[p.axis], p.d, tensorType.Shape[p.axis].IsFixed));
+        return divisors.Select((d, axis) => (d, axis)).All(p => p.d == 0 ? true : IsDivideBy(maxShape[p.axis], p.d, tensorType.Shape[p.axis].IsFixed));
     }
 
     public static bool IsDistributable(ReadOnlySpan<SBP> polices)
@@ -427,7 +410,7 @@ public static class DistributedUtility
                 var linearIndex = TensorUtilities.GetLinearOffset(subHierarchyStrides, subShardIndex);
                 var localDim = ((SBPSplit)policy).Granularity is not null ? (long)((SBPSplit)policy).Granularity!.Metadata.Range!.Value.Max : MathUtility.CeilDiv(globalShape[axis], subHierarchySize);
                 offset[axis] = linearIndex * localDim;
-                shape[axis] = Math.Min(localDim, globalShape[axis] - offset[axis]);
+                shape[axis] = Math.Max(0, Math.Min(localDim, globalShape[axis] - offset[axis]));
             }
             else
             {

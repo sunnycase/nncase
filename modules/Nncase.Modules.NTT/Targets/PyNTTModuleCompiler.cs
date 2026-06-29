@@ -21,7 +21,7 @@ public sealed class PyNTTModuleCompiler : INTTModuleCompiler
     public MaskVectorStyle MaskVectorStyle => MaskVectorStyle.Fat;
 
     /// <inheritdoc/>
-    public int Lane => 1;
+    public int Lane => 16;
 
     /// <inheritdoc/>
     public int Nr => 1;

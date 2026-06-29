@@ -32,7 +32,7 @@ public sealed class PyNTTTarget : NTTTarget
     /// <inheritdoc/>
     public override void RegisterAutoVectorizeRules(IRulesAddable pass, CompileOptions options)
     {
-        // PyNTT emits Triton code from tensor-level TIR and does not use NTT lane-vectorized IR yet.
+        base.RegisterAutoVectorizeRules(pass, options);
     }
 
     /// <inheritdoc/>

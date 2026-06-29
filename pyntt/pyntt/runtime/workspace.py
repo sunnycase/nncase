@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import base64
 from pathlib import Path
 from typing import Any
 
@@ -15,7 +14,7 @@ def allocate_workspace(inputs: tuple[Any, ...], elements: int, dtype: str):
     import torch
 
     device = inputs[0].device if inputs else "cuda"
-    return torch.empty((int(elements),), dtype=_torch_dtype(torch, dtype), device=device)
+    return torch.zeros((int(elements),), dtype=_torch_dtype(torch, dtype), device=device)
 
 
 def materialize_rdata(inputs: tuple[Any, ...], payload: str, byte_count: int):
@@ -42,7 +41,7 @@ def _decode_payload(payload: str, byte_count: int) -> bytes:
     if payload.startswith("file:"):
         raw = Path(payload[5:]).read_bytes()
     else:
-        raw = base64.b64decode(payload.encode("ascii"))
+        raise PyNTTSpecError("PyNTT rdata payloads must be binary files.")
     if len(raw) != int(byte_count):
         raise PyNTTSpecError(
             f"PyNTT rdata payload size mismatch: expected {byte_count} bytes, got {len(raw)}."

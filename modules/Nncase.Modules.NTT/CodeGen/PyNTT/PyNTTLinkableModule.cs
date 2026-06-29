@@ -294,9 +294,10 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
 
     private string ResolveOutputDirectory()
     {
-        if (_compileOptions.TargetOptions is PyNTTTargetOptions { OutputDirectory.Length: > 0 } pynttOptions)
+        var targetOptions = PyNTTTargetOptionsUtility.Normalize(_compileOptions);
+        if (targetOptions.OutputDirectory.Length > 0)
         {
-            return Path.GetFullPath(pynttOptions.OutputDirectory);
+            return Path.GetFullPath(targetOptions.OutputDirectory);
         }
 
         if (!string.IsNullOrWhiteSpace(_compileOptions.DumpDir))
@@ -309,13 +310,13 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
 
     private string BuildMetadataJson()
     {
-        var targetOptions = _compileOptions.TargetOptions as PyNTTTargetOptions;
+        var targetOptions = PyNTTTargetOptionsUtility.Normalize(_compileOptions);
         var metadata = new
         {
             pyntt_spec_version = 0,
             target_kind = _moduleKind,
-            backend = targetOptions?.Backend ?? "triton",
-            strict = targetOptions?.Strict ?? true,
+            backend = targetOptions.Backend,
+            strict = targetOptions.Strict,
             functions = _functions.Select(function => new
             {
                 id = function.Id,
@@ -335,12 +336,12 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
     {
         Directory.CreateDirectory(outputDirectory);
 
-        var targetOptions = _compileOptions.TargetOptions as PyNTTTargetOptions;
-        var backend = targetOptions?.Backend ?? "triton";
+        var targetOptions = PyNTTTargetOptionsUtility.Normalize(_compileOptions);
+        var backend = targetOptions.Backend;
         var moduleName = GetModuleName();
         var runtimeConfig = $"""
             BACKEND = {PythonString(backend)}
-            STRICT = {PythonBool(targetOptions?.Strict ?? true)}
+            STRICT = {PythonBool(targetOptions.Strict)}
             """;
         var requirements = """
             torch
@@ -407,7 +408,7 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
         var launchStatements = entry is null ? string.Empty : BuildModelLaunchStatements(entry);
 
         return $$"""
-            from pyntt.runtime.tensor import allocate_outputs, materialize_kv_cache_metadata, materialize_kv_cache_storage, materialize_kv_cache_tensor_field, resolve_shape_env, validate_inputs
+            from pyntt.runtime.tensor import allocate_outputs, materialize_kv_cache_blocks_per_shard, materialize_kv_cache_metadata, materialize_kv_cache_storage, materialize_kv_cache_tensor_field, resolve_shape_env, validate_inputs
             from pyntt.runtime.tuning import select_tuning_parameter
             from pyntt.runtime.workspace import allocate_workspace, materialize_rdata, materialize_rdata_table
             from .rdata import RDATA_BUNDLES
@@ -690,7 +691,8 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
 
         var kwargs = launchKwargs.Count == 0 ? string.Empty : $", {string.Join(", ", launchKwargs)}";
         var helperCalls = GetHelperKernelCalls(kernel);
-        var useSplitLaunch = isTir && helperCalls.Length > SplitLaunchHelperThreshold;
+        var requiresSplitLaunch = kernel.Attrs.TryGetValue("requires_split_launch", out var splitValue) && splitValue is bool splitBool && splitBool;
+        var useSplitLaunch = isTir && (requiresSplitLaunch || helperCalls.Length > SplitLaunchHelperThreshold);
         var importStatement = useSplitLaunch
             ? "from . import generated_kernels as _generated_kernels"
             : $"from .generated_kernels import {kernel.Name}";
@@ -740,6 +742,11 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
         IReadOnlyDictionary<string, string> inputVariableExpressions,
         IReadOnlyDictionary<string, string> outputVariableExpressions)
     {
+        if (argument.StartsWith("py:", StringComparison.Ordinal))
+        {
+            return argument[3..];
+        }
+
         if (inputVariableExpressions.TryGetValue(argument, out var inputExpression))
         {
             return inputExpression;
@@ -768,7 +775,10 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
                 $"materialize_kv_cache_tensor_field({sourceExpression}, {PythonString(kvCacheField.Field)}, outputs[0].device)",
             "kv_caches" when kvCacheField.Storage is { } storage =>
                 $"materialize_kv_cache_storage({sourceExpression}, outputs[0].device, dtype={PythonString(storage.DType)}, topology_shape={PythonTuple(storage.TopologyShape.Select(value => value.ToString(CultureInfo.InvariantCulture)))}, tail_shape={PythonTuple(storage.TailShape.Select(value => value.ToString(CultureInfo.InvariantCulture)))}, block_size={storage.BlockSize.ToString(CultureInfo.InvariantCulture)})",
+            "kv_caches_blocks" when kvCacheField.Storage is { } storage =>
+                $"materialize_kv_cache_blocks_per_shard({sourceExpression}, topology_shape={PythonTuple(storage.TopologyShape.Select(value => value.ToString(CultureInfo.InvariantCulture)))}, block_size={storage.BlockSize.ToString(CultureInfo.InvariantCulture)})",
             "kv_caches" => throw new NotSupportedException($"Generated PyNTT kernel input {name} is missing KV-cache storage metadata."),
+            "kv_caches_blocks" => throw new NotSupportedException($"Generated PyNTT kernel input {name} is missing KV-cache storage metadata."),
             _ => throw new NotSupportedException($"Generated PyNTT kernel input {name} references unsupported KV-cache field {kvCacheField.Field}."),
         };
     }
@@ -866,7 +876,12 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
         const string filePrefix = "file:";
         if (!payload.StartsWith(filePrefix, StringComparison.Ordinal))
         {
-            return PythonString(payload);
+            if (string.IsNullOrEmpty(payload))
+            {
+                return PythonString(payload);
+            }
+
+            throw new InvalidDataException("PyNTT rdata payloads must be emitted as binary files.");
         }
 
         var sourcePath = payload[filePrefix.Length..];

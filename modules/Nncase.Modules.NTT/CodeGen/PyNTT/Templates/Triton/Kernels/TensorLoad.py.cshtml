@@ -14,6 +14,24 @@
 
     string AxisIndex(int axis) => axis == blockAxis ? "lane" : $"idx{axis}";
 
+    string SplitLinearExpression(IReadOnlyList<int> splitAxes)
+    {
+        if (splitAxes.Count == 0)
+        {
+            return "0";
+        }
+
+        var terms = new List<string>();
+        for (var i = 0; i < splitAxes.Count; i++)
+        {
+            var placementAxis = splitAxes[i];
+            var stride = splitAxes.Skip(i + 1).Aggregate(1, (acc, axis) => acc * Model.Hierarchy[axis]);
+            terms.Add(stride == 1 ? $"shard_coord{placementAxis}" : $"shard_coord{placementAxis} * {stride}");
+        }
+
+        return string.Join(" + ", terms);
+    }
+
     string LocalOffsetExpression()
     {
         var terms = new List<string>();
@@ -25,20 +43,12 @@
         return terms.Count == 0 ? "lane * 0" : $"lane * 0 + {string.Join(" + ", terms)}";
     }
 
-    string GlobalIndex(int axis)
-    {
-        var index = AxisIndex(axis);
-        return Model.ShardAxis is int shardAxis && shardAxis == axis
-            ? $"({index} + shard_axis_offset)"
-            : index;
-    }
-
     string SourceOffsetExpression()
     {
         var terms = new List<string>();
         for (var i = 0; i < Model.GlobalShape.Length; i++)
         {
-            terms.Add($"{GlobalIndex(i)} * {globalStrides[i]}");
+            terms.Add($"global_idx{i} * {globalStrides[i]}");
         }
 
         return terms.Count == 0 ? "lane * 0" : $"lane * 0 + {string.Join(" + ", terms)}";
@@ -46,33 +56,46 @@
 
     var body = new StringBuilder();
     var indent = 1;
+    body.AppendLine($"{Indent(indent)}tmp_shard = shard_index");
+    for (var axis = Model.Hierarchy.Length - 1; axis >= 0; axis--)
+    {
+        body.AppendLine($"{Indent(indent)}shard_coord{axis} = tmp_shard % {Model.Hierarchy[axis]}");
+        body.AppendLine($"{Indent(indent)}tmp_shard = tmp_shard // {Model.Hierarchy[axis]}");
+    }
+
     foreach (var axis in loopAxes)
     {
-        body.AppendLine($"{Indent(indent)}idx{axis} = 0");
-        body.AppendLine($"{Indent(indent)}while idx{axis} < {Model.LocalShape[axis]}:");
+        body.AppendLine($"{Indent(indent)}for idx{axis} in tl.range(0, {Model.LocalShape[axis]}):");
         indent++;
     }
 
-    body.AppendLine($"{Indent(indent)}axis_start = 0");
-    body.AppendLine($"{Indent(indent)}while axis_start < {blockExtent}:");
+    body.AppendLine($"{Indent(indent)}for axis_start in tl.range(0, {blockExtent}, block_size):");
     body.AppendLine($"{Indent(indent + 1)}lane = axis_start + tl.arange(0, block_size)");
     body.AppendLine($"{Indent(indent + 1)}mask = lane < {blockExtent}");
-    if (Model.ShardAxis.HasValue)
+    for (var axis = 0; axis < Model.GlobalShape.Length; axis++)
     {
-        var shardAxisValue = Model.ShardAxis.Value;
-        body.AppendLine($"{Indent(indent + 1)}global_idx{shardAxisValue} = {GlobalIndex(shardAxisValue)}");
-        body.AppendLine($"{Indent(indent + 1)}mask = mask & (global_idx{shardAxisValue} < {Model.GlobalShape[shardAxisValue]})");
+        var splitAxes = Model.SplitAxes[axis];
+        if (splitAxes.Length == 0)
+        {
+            body.AppendLine($"{Indent(indent + 1)}global_idx{axis} = {AxisIndex(axis)}");
+        }
+        else
+        {
+            var divisor = splitAxes.Aggregate(1, (acc, placementAxis) => acc * Model.Hierarchy[placementAxis]);
+            body.AppendLine($"{Indent(indent + 1)}local_dim{axis} = tl.cdiv({Model.GlobalShape[axis]}, {divisor})");
+            body.AppendLine($"{Indent(indent + 1)}split_linear{axis} = {SplitLinearExpression(splitAxes)}");
+            body.AppendLine($"{Indent(indent + 1)}global_idx{axis} = {AxisIndex(axis)} + split_linear{axis} * local_dim{axis}");
+            body.AppendLine($"{Indent(indent + 1)}mask = mask & (global_idx{axis} < {Model.GlobalShape[axis]})");
+        }
     }
 
     body.AppendLine($"{Indent(indent + 1)}source_offsets = {Model.SourceOffset} + {SourceOffsetExpression()}");
     body.AppendLine($"{Indent(indent + 1)}destination_offsets = {LocalOffsetExpression()}");
     body.AppendLine($"{Indent(indent + 1)}value = tl.load(source + source_offsets, mask=mask)");
     body.AppendLine($"{Indent(indent + 1)}tl.store(destination + destination_offsets, value, mask=mask)");
-    body.AppendLine($"{Indent(indent + 1)}axis_start += block_size");
 
     foreach (var axis in loopAxes.Reverse())
     {
-        body.AppendLine($"{Indent(indent)}idx{axis} += 1");
         indent--;
     }
 }
@@ -80,13 +103,6 @@
 # @Model.Comment; dtype=@Model.DType, local_shape=@localShape, global_shape=@globalShape
 @@triton.jit
 @($"def {Model.FunctionName}(source, data, rdata, thread_local_rdata, warp_local_rdata, block_local_rdata{PyNTTTemplateUtility.RuntimeParameterSuffix(Model.RuntimeShapeArgs)}):")
-    shard_count = tl.num_programs(0)
     shard_index = tl.program_id(0).to(tl.int64)
     destination = @Html.Raw(Model.Destination.Expression)
-@if (Model.ShardAxis.HasValue)
-{
-<text>    shard_axis_extent = tl.cdiv(@Model.GlobalShape[Model.ShardAxis.Value].TritonExpression, shard_count)
-    shard_axis_offset = shard_index * shard_axis_extent
-</text>
-}
 @Html.Raw(body.ToString().TrimEnd())

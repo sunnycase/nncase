@@ -4,18 +4,30 @@
 @{
     var shape = PyNTTTemplateUtility.ShapeTuple(Model.OutputShape);
     var rank = Model.OutputShape.Length;
-    var blockAxis = rank - 1;
-    var blockExtent = Model.OutputShape[blockAxis];
-    var halfDim = blockExtent.FixedValue.HasValue
-        ? (blockExtent.FixedValue.Value / 2).ToString()
-        : $"(({blockExtent.TritonExpression}) // 2)";
-    var loopAxes = Enumerable.Range(0, rank).Where(axis => axis != blockAxis).ToArray();
+    var rotaryAxis = Model.RotaryAxis;
+    var outputLaneCount = Model.OutputVectorLaneCount.ToString(System.Globalization.CultureInfo.InvariantCulture);
+    var totalElements = Multiply(ProductExpression(Model.OutputShape), outputLaneCount);
+    var rotaryExtent = Multiply($"({Model.OutputShape[rotaryAxis].TritonExpression})", outputLaneCount);
+    var halfDim = $"(({rotaryExtent}) // 2)";
 
     static string Indent(int level) => new(' ', level * 4);
 
-    string AxisIndex(int axis) => axis == blockAxis ? "lane" : $"idx{axis}";
+    static string ProductExpression(IReadOnlyList<PyNTTDimExpression> values)
+    {
+        if (values.Count == 0)
+        {
+            return "1";
+        }
 
-    string OffsetExpression(PyNTTDimExpression[] operandShape, PyNTTDimExpression[] operandStrides, string dimIndex)
+        return string.Join(" * ", values.Select(value => $"({value.TritonExpression})"));
+    }
+
+    static string Multiply(string lhs, string rhs)
+    {
+        return rhs == "1" ? lhs : $"({lhs}) * {rhs}";
+    }
+
+    string OffsetExpression(PyNTTDimExpression[] operandShape, PyNTTDimExpression[] operandStrides, int operandLaneCount, string rotaryIndex, string laneIndex)
     {
         var axisOffset = rank - operandShape.Length;
         var terms = new List<string>();
@@ -27,11 +39,12 @@
             }
 
             var outputAxis = axisOffset + i;
-            var index = outputAxis == blockAxis ? dimIndex : AxisIndex(outputAxis);
+            var index = outputAxis == rotaryAxis ? rotaryIndex : $"idx{outputAxis}";
             terms.Add($"{index} * {operandStrides[i]}");
         }
 
-        return terms.Count == 0 ? "lane * 0" : $"lane * 0 + {string.Join(" + ", terms)}";
+        var tensorOffset = terms.Count == 0 ? "lane_flat * 0" : string.Join(" + ", terms);
+        return operandLaneCount == 1 ? tensorOffset : $"(({tensorOffset}) * {operandLaneCount} + {laneIndex})";
     }
 
     string OutputOffsetExpression()
@@ -39,48 +52,49 @@
         var terms = new List<string>();
         for (var i = 0; i < Model.OutputShape.Length; i++)
         {
-            terms.Add($"{AxisIndex(i)} * {Model.OutputStrides[i]}");
+            terms.Add($"idx{i} * {Model.OutputStrides[i]}");
         }
 
-        return terms.Count == 0 ? "lane * 0" : $"lane * 0 + {string.Join(" + ", terms)}";
+        var tensorOffset = terms.Count == 0 ? "lane_flat * 0" : string.Join(" + ", terms);
+        return Model.OutputVectorLaneCount == 1 ? tensorOffset : $"(({tensorOffset}) * {Model.OutputVectorLaneCount} + lane_flat)";
+    }
+
+    void AppendTensorIndexDecompose(StringBuilder builder, int indent, string linearName, string prefix, IReadOnlyList<PyNTTDimExpression> tensorShape)
+    {
+        builder.AppendLine($"{Indent(indent)}tmp = {linearName}");
+        for (var axis = tensorShape.Count - 1; axis >= 0; axis--)
+        {
+            builder.AppendLine($"{Indent(indent)}{prefix}{axis} = tmp % {tensorShape[axis]}");
+            builder.AppendLine($"{Indent(indent)}tmp = tmp // {tensorShape[axis]}");
+        }
     }
 
     var body = new StringBuilder();
-    var indent = 1;
-    foreach (var axis in loopAxes)
-    {
-        body.AppendLine($"{Indent(indent)}idx{axis} = 0");
-        body.AppendLine($"{Indent(indent)}while idx{axis} < {Model.OutputShape[axis]}:");
-        indent++;
-    }
-
-    body.AppendLine($"{Indent(indent)}axis_start = 0");
-    body.AppendLine($"{Indent(indent)}while axis_start < {blockExtent}:");
-    body.AppendLine($"{Indent(indent + 1)}lane = axis_start + tl.arange(0, block_size)");
-    body.AppendLine($"{Indent(indent + 1)}mask = lane < {blockExtent}");
-    body.AppendLine($"{Indent(indent + 1)}paired_lane = tl.where(lane < {halfDim}, lane + {halfDim}, lane - {halfDim})");
-    body.AppendLine($"{Indent(indent + 1)}input_offsets = {OffsetExpression(Model.InputShape, Model.InputStrides, "lane")}");
-    body.AppendLine($"{Indent(indent + 1)}paired_input_offsets = {OffsetExpression(Model.InputShape, Model.InputStrides, "paired_lane")}");
-    body.AppendLine($"{Indent(indent + 1)}cos_offsets = {OffsetExpression(Model.CosShape, Model.CosStrides, "lane")}");
-    body.AppendLine($"{Indent(indent + 1)}sin_offsets = {OffsetExpression(Model.SinShape, Model.SinStrides, "lane")}");
-    body.AppendLine($"{Indent(indent + 1)}output_offsets = {OutputOffsetExpression()}");
-    body.AppendLine($"{Indent(indent + 1)}value0 = tl.load(input0 + input_offsets, mask=mask)");
-    body.AppendLine($"{Indent(indent + 1)}paired_value = tl.load(input0 + paired_input_offsets, mask=mask)");
-    body.AppendLine($"{Indent(indent + 1)}cos_value = tl.load(cos0 + cos_offsets, mask=mask)");
-    body.AppendLine($"{Indent(indent + 1)}sin_value = tl.load(sin0 + sin_offsets, mask=mask)");
-    body.AppendLine($"{Indent(indent + 1)}rotated = tl.where(lane < {halfDim}, -paired_value, paired_value)");
-    body.AppendLine($"{Indent(indent + 1)}result = value0 * cos_value + rotated * sin_value");
-    body.AppendLine($"{Indent(indent + 1)}tl.store(output + output_offsets, result, mask=mask)");
-    body.AppendLine($"{Indent(indent + 1)}axis_start += block_size");
-
-    foreach (var axis in loopAxes.Reverse())
-    {
-        body.AppendLine($"{Indent(indent)}idx{axis} += 1");
-        indent--;
-    }
+    body.AppendLine($"    for linear_start in tl.range(0, {totalElements}, block_size):");
+    body.AppendLine("        linear = linear_start + tl.arange(0, block_size)");
+    body.AppendLine($"        mask = linear < {totalElements}");
+    body.AppendLine($"        lane_flat = linear % {Model.OutputVectorLaneCount}");
+    body.AppendLine($"        output_tensor_linear = linear // {Model.OutputVectorLaneCount}");
+    AppendTensorIndexDecompose(body, 2, "output_tensor_linear", "idx", Model.OutputShape);
+    body.AppendLine($"        logical_rotary = idx{rotaryAxis} * {Model.OutputVectorLaneCount} + lane_flat");
+    body.AppendLine($"        paired_logical = tl.where(logical_rotary < {halfDim}, logical_rotary + {halfDim}, logical_rotary - {halfDim})");
+    body.AppendLine($"        paired_idx{rotaryAxis} = paired_logical // {Model.OutputVectorLaneCount}");
+    body.AppendLine($"        paired_lane = paired_logical % {Model.OutputVectorLaneCount}");
+    body.AppendLine($"        input_offsets = {OffsetExpression(Model.InputShape, Model.InputStrides, Model.InputVectorLaneCount, $"idx{rotaryAxis}", "lane_flat")}");
+    body.AppendLine($"        paired_input_offsets = {OffsetExpression(Model.InputShape, Model.InputStrides, Model.InputVectorLaneCount, $"paired_idx{rotaryAxis}", "paired_lane")}");
+    body.AppendLine($"        cos_offsets = {OffsetExpression(Model.CosShape, Model.CosStrides, Model.CosVectorLaneCount, $"idx{rotaryAxis}", "lane_flat")}");
+    body.AppendLine($"        sin_offsets = {OffsetExpression(Model.SinShape, Model.SinStrides, Model.SinVectorLaneCount, $"idx{rotaryAxis}", "lane_flat")}");
+    body.AppendLine($"        output_offsets = {OutputOffsetExpression()}");
+    body.AppendLine("        value0 = tl.load(input0 + input_offsets, mask=mask)");
+    body.AppendLine("        paired_value = tl.load(input0 + paired_input_offsets, mask=mask)");
+    body.AppendLine("        cos_value = tl.load(cos0 + cos_offsets, mask=mask)");
+    body.AppendLine("        sin_value = tl.load(sin0 + sin_offsets, mask=mask)");
+    body.AppendLine($"        rotated = tl.where(logical_rotary < {halfDim}, -paired_value, paired_value)");
+    body.AppendLine("        result = value0 * cos_value + rotated * sin_value");
+    body.AppendLine("        tl.store(output + output_offsets, result, mask=mask)");
 }
 # generated from CodeGen/PyNTT/Templates/Triton/Kernels/RoPE.py.cshtml
-# @Model.Comment; input_dtype=@Model.InputDType, cos_dtype=@Model.CosDType, sin_dtype=@Model.SinDType, output_dtype=@Model.OutputDType, shape=@shape
+# @Model.Comment; input_dtype=@Model.InputDType, cos_dtype=@Model.CosDType, sin_dtype=@Model.SinDType, output_dtype=@Model.OutputDType, shape=@shape, rotary_axis=@Model.RotaryAxis
 @@triton.jit
 @($"def {Model.FunctionName}(data, rdata, thread_local_rdata, warp_local_rdata, block_local_rdata{PyNTTTemplateUtility.RuntimeParameterSuffix(Model.RuntimeShapeArgs)}):")
     shard_index = tl.program_id(0).to(tl.int64)

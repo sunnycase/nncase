@@ -2,6 +2,7 @@ from posixpath import join
 from typing import Sequence
 import shutil
 import os
+import math
 import numpy as np
 from test_runner import *
 import io
@@ -474,6 +475,26 @@ class HuggingfaceTestRunner(TestRunner):
                 all_outputs.append(outputs)
         return all_outputs, tokens_ids, tokens
 
+    def align_pyntt_paged_attention_num_blocks(self, num_blocks):
+        if not self.is_pyntt_target_enabled():
+            return num_blocks
+
+        parallelism = 1
+        for sharding_axis, policy in zip(self.sharding_axes, self.axis_policies):
+            if sharding_axis != nncase.PagedKVCacheDimKind.NumBlocks:
+                continue
+            for axis in policy:
+                if axis >= len(self.hierarchy):
+                    raise ValueError(
+                        f"Paged attention axis policy {policy} is outside hierarchy {self.hierarchy}.")
+                parallelism *= int(self.hierarchy[axis])
+
+        alignment = math.lcm(parallelism, int(self.max_sessions))
+        if alignment <= 1 or num_blocks % alignment == 0:
+            return num_blocks
+
+        return ((num_blocks + alignment - 1) // alignment) * alignment
+
     def parse_model(self, model_path):
         # if self.cfg['huggingface_options']['tensor_type'] == "bfloat16":
         #     raise RuntimeError(
@@ -497,7 +518,6 @@ class HuggingfaceTestRunner(TestRunner):
         self.block_size = paged_attention_config['block_size']
         self.num_blocks = paged_attention_config['num_blocks']
         self.max_sessions = paged_attention_config['max_sessions']
-        self.max_model_len = (self.block_size * self.num_blocks) // self.max_sessions
         self.kv_type = np.dtype(to_np_type(paged_attention_config['kv_type']))
         self.cache_layout = [getattr(nncase.PagedKVCacheDimKind, item)
                              for item in paged_attention_config['cache_layout']]
@@ -509,6 +529,12 @@ class HuggingfaceTestRunner(TestRunner):
                               for item in paged_attention_config['sharding_axes']]
         self.axis_policies = paged_attention_config['axis_policies']
         self.hierarchy = paged_attention_config['hierarchy']
+        if self.is_pyntt_target_enabled() and self.hierarchy == [1]:
+            self.hierarchy = self.get_pyntt_block_hierarchy()
+            if self.axis_policies == [[0]] and len(self.hierarchy) > 1:
+                self.axis_policies = [list(range(len(self.hierarchy)))]
+        self.num_blocks = self.align_pyntt_paged_attention_num_blocks(self.num_blocks)
+        self.max_model_len = (self.block_size * self.num_blocks) // self.max_sessions
 
         self.kv_cache_config = nncase.PagedAttentionConfig(
             self.num_layers,

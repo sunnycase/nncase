@@ -43,37 +43,27 @@
     var indent = 1;
     foreach (var axis in loopAxes)
     {
-        body.AppendLine($"{Indent(indent)}idx{axis} = 0");
-        body.AppendLine($"{Indent(indent)}while idx{axis} < {Model.OutputShape[axis]}:");
+        body.AppendLine($"{Indent(indent)}for idx{axis} in tl.range(0, {Model.OutputShape[axis]}):");
         indent++;
     }
 
-    body.AppendLine($"{Indent(indent)}axis_start = 0");
-    body.AppendLine($"{Indent(indent)}while axis_start < {blockExtent}:");
+    body.AppendLine($"{Indent(indent)}for axis_start in tl.range(0, {blockExtent}, block_size):");
     body.AppendLine($"{Indent(indent + 1)}lane = axis_start + tl.arange(0, block_size)");
     body.AppendLine($"{Indent(indent + 1)}mask = lane < {blockExtent}");
     body.AppendLine($"{Indent(indent + 1)}acc = tl.load(bias + {biasOffset}, mask=mask, other=0.0).to(tl.float32)");
-    body.AppendLine($"{Indent(indent + 1)}ic = 0");
-    body.AppendLine($"{Indent(indent + 1)}while ic < {inputChannelsPerGroup}:");
-    body.AppendLine($"{Indent(indent + 2)}kh = 0");
-    body.AppendLine($"{Indent(indent + 2)}while kh < {kernelH}:");
-    body.AppendLine($"{Indent(indent + 3)}kw = 0");
-    body.AppendLine($"{Indent(indent + 3)}while kw < {kernelW}:");
+    body.AppendLine($"{Indent(indent + 1)}for ic in tl.range(0, {inputChannelsPerGroup}):");
+    body.AppendLine($"{Indent(indent + 2)}for kh in tl.range(0, {kernelH}):");
+    body.AppendLine($"{Indent(indent + 3)}for kw in tl.range(0, {kernelW}):");
     body.AppendLine($"{Indent(indent + 4)}ih = {ih}");
     body.AppendLine($"{Indent(indent + 4)}iw = {iw}");
     body.AppendLine($"{Indent(indent + 4)}input_mask = mask & (ih >= 0) & (ih < {Model.InputShape[2]}) & (iw >= 0) & (iw < {Model.InputShape[3]})");
     body.AppendLine($"{Indent(indent + 4)}input_value = tl.load(input + {inputOffset}, mask=input_mask, other=0.0).to(tl.float32)");
     body.AppendLine($"{Indent(indent + 4)}weight_value = tl.load(weights + {weightsOffset}, mask=mask, other=0.0).to(tl.float32)");
     body.AppendLine($"{Indent(indent + 4)}acc += input_value * weight_value");
-    body.AppendLine($"{Indent(indent + 4)}kw += 1");
-    body.AppendLine($"{Indent(indent + 3)}kh += 1");
-    body.AppendLine($"{Indent(indent + 2)}ic += 1");
     body.AppendLine($"{Indent(indent + 1)}tl.store(output + {outputOffset}, acc.to({Model.OutputTritonDType}), mask=mask)");
-    body.AppendLine($"{Indent(indent + 1)}axis_start += block_size");
 
     foreach (var axis in loopAxes.Reverse())
     {
-        body.AppendLine($"{Indent(indent)}idx{axis} += 1");
         indent--;
     }
 }
