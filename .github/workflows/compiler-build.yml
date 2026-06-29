@@ -246,7 +246,11 @@ jobs:
         run: |
           dotnet tool install --global dotnet-coverage
           dotnet-coverage collect -s tools/dotnet_coverage.settings.xml -f cobertura -o coverage/llm_ffi.xml pytest tests/other/ --doctest-modules --junitxml=test_results/llm_ffi.xml
-          dotnet-coverage collect -s tools/dotnet_coverage.settings.xml -f cobertura -o coverage/llm_huggingface.xml pytest tests/importer/huggingface_/ --doctest-modules --junitxml=test_results/llm_huggingface.xml
+          if [ -n "${HF_HOME:-}" ]; then
+            dotnet-coverage collect -s tools/dotnet_coverage.settings.xml -f cobertura -o coverage/llm_huggingface.xml pytest tests/importer/huggingface_/ --doctest-modules --junitxml=test_results/llm_huggingface.xml
+          else
+            echo "Skipping HuggingFace importer tests because HF_HOME is not configured."
+          fi
 
       - name: Test
         working-directory: ${{github.workspace}}
