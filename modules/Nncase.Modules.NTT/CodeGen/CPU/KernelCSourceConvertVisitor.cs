@@ -159,7 +159,7 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
             return symbol;
         }
 
-        var start = Visit(expr.Start);
+        var start = expr.Start is None ? null : Visit(expr.Start);
         string loc = (expr.Location, expr.Hierarchy) switch
         {
             (MemoryLocation.Rdata, 0) => "rdata",
@@ -173,6 +173,7 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
             (MemoryLocation.Output, 0) => "output",
             _ => throw new NotSupportedException($"{expr.Location}, {expr.Hierarchy}"),
         };
+        var address = start is null ? loc : $"{loc} + {start.Name}UL";
 
         var ptypeName = "std::byte";
         if (expr.Location is MemoryLocation.Rdata or MemoryLocation.ThreadLocalRdata or MemoryLocation.WarpLocalRdata or MemoryLocation.BlockLocalRdata)
@@ -185,15 +186,15 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
         if (expr.Size is DimConst)
         {
             var spanSize = (ulong)expr.Size.FixedValue;
-            name = $"ntt::span<{ptypeName}, {spanSize}>({loc} + {start.Name}UL, {spanSize})";
+            name = $"ntt::span<{ptypeName}, {spanSize}>({address}, {spanSize})";
         }
         else
         {
             var spanSize = Visit(expr.Size).Name;
-            name = $"ntt::span<{ptypeName}>({loc} + {start.Name}UL, {spanSize})";
+            name = $"ntt::span<{ptypeName}>({address}, {spanSize})";
         }
 
-        symbol = new(start.Type, name);
+        symbol = new(start?.Type ?? "dim_t", name);
         _exprMemo.Add(expr, symbol);
         return symbol;
     }
@@ -603,7 +604,9 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
             IndentScope.Writer.IndWrite($"runtime_util->printf(\"call {deviceFunc.Name} bid %d tid %d\\n\", bid, tid);\n");
 #endif
             var argumentNames = new List<string>();
-            string? dataName = null;
+            string? dataBufferName = null;
+            string? warpLocalDataBufferName = null;
+            string? blockLocalDataBufferName = null;
             foreach (var arg in expr.Arguments)
             {
                 if (arg is TIR.Buffer b)
@@ -611,11 +614,15 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
                     var buffer = VisitBuffer(b, local: true);
                     if (b.Name.StartsWith("data_"))
                     {
-                        dataName = $"rdata, thread_local_rdata, block_local_rdata, (std::byte *){buffer.Name}.buffer().data(), <block_local_data>, output, output_descs";
+                        dataBufferName = buffer.Name;
+                    }
+                    else if (b.Name.StartsWith("warp_local_data_"))
+                    {
+                        warpLocalDataBufferName = buffer.Name;
                     }
                     else if (b.Name.StartsWith("block_local_data_"))
                     {
-                        dataName = dataName!.Replace("<block_local_data>", $"(std::byte *){buffer.Name}.buffer().data()", StringComparison.Ordinal);
+                        blockLocalDataBufferName = buffer.Name;
                     }
                     else
                     {
@@ -628,9 +635,16 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
                 }
             }
 
-            if (dataName is not null)
+            if (dataBufferName is not null)
             {
-                argumentNames.Add(dataName);
+                var warpLocalDataName = warpLocalDataBufferName is null
+                    ? "warp_local_data"
+                    : $"(std::byte *){warpLocalDataBufferName}.buffer().data()";
+                var blockLocalDataName = blockLocalDataBufferName is null
+                    ? "block_local_data"
+                    : $"(std::byte *){blockLocalDataBufferName}.buffer().data()";
+                argumentNames.Add(
+                    $"rdata, thread_local_rdata, warp_local_rdata, block_local_rdata, (std::byte *){dataBufferName}.buffer().data(), {warpLocalDataName}, {blockLocalDataName}, output, output_descs");
             }
 
             _refFuncs.Add(deviceFunc);
@@ -858,9 +872,10 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
         if (_declaredBuffers.Add(buffer))
         {
             IndentScope.Writer.IndWrite($"auto {symbol.Name}");
-            if (buffer.MemSpan.Buffer.Start is not None)
+            if (buffer.MemSpan.Buffer.Start is not None ||
+                buffer.MemSpan.Buffer.Location is MemoryLocation.Data or MemoryLocation.WarpLocalData or MemoryLocation.BlockLocalData)
             {
-                // If the buffer has a start, we create a tensor view
+                // Runtime local-data buffers use the function tail pointers as their backing storage.
                 var dtypeStr = buffer.ElemType.ToC();
                 var dimensions = buffer.DistributedType is null ? buffer.Dimensions : ((RankedShape)buffer.DistributedType.TensorType.Shape).Dimensions;
                 var spanStr = $"span_cast<{dtypeStr}>({Visit(buffer.MemSpan).Name})";
