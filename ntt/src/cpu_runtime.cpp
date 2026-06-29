@@ -110,7 +110,15 @@ void record_profile(profile_level level,
     // Other levels are not supported yet.
     if (level == profile_level::kernel) {
         auto &ctx = cpu_thread_context_t::current();
+        if (!ctx.profile_record_counts || ctx.profile_records.empty()) {
+            return;
+        }
+
         auto idx = ctx.profile_record_counts[0]++;
+        if (idx >= ctx.profile_records.size()) {
+            return;
+        }
+
         ctx.profile_records[idx] = record;
     }
 }
@@ -143,6 +151,9 @@ extern "C" void block_entry(const cpu_block_entry_params_t &params) {
                 block_profile_records.size() / params.tdim;
             auto profile_records = block_profile_records.subspan(
                 profile_records_size * tid, profile_records_size);
+            auto profile_record_counts =
+                params.profile_record_counts ? params.profile_record_counts + tid
+                                             : nullptr;
 
 #ifdef __APPLE__
             pthread_setspecific(
@@ -155,7 +166,7 @@ extern "C" void block_entry(const cpu_block_entry_params_t &params) {
                  .cid = params.cid,
                  .enable_profiling = params.enable_profiling,
                  .profile_records = profile_records,
-                 .profile_record_counts = params.profile_record_counts + tid}
+                 .profile_record_counts = profile_record_counts}
 #ifdef __APPLE__
             );
 #else

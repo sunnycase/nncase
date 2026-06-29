@@ -66,7 +66,15 @@ __device__ void record_profile(profile_level level,
     // Other levels are not supported yet.
     if (level == profile_level::kernel) {
         auto &ctx = cuda_thread_context_t::current();
+        if (!ctx.profile_record_counts || ctx.profile_records.empty()) {
+            return;
+        }
+
         auto idx = ctx.profile_record_counts[0]++;
+        if (idx >= ctx.profile_records.size()) {
+            return;
+        }
+
         ctx.profile_records[idx] = record;
     }
 }
@@ -135,12 +143,15 @@ block_entry(const cuda_block_entry_params_t &params) {
         block_profile_records.size() / (bdim() * wdim() * tdim());
     auto profile_records = block_profile_records.subspan(
         profile_records_size * linear_tid, profile_records_size);
+    auto profile_record_counts = params.profile_record_counts
+                                     ? params.profile_record_counts + linear_tid
+                                     : nullptr;
 
     cuda_thread_context_t::current() = {
         .cid = params.cid,
         .enable_profiling = params.enable_profiling,
         .profile_records = profile_records,
-        .profile_record_counts = params.profile_record_counts + linear_tid};
+        .profile_record_counts = profile_record_counts};
 
     const auto program_ids = make_shape(params.cid, bid(), wid(), tid());
 

@@ -50,18 +50,7 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
     public void WriteWithProfiler(string functionName, string tagName = "")
     {
         functionName = functionName.TrimEnd(new char[] { ';', '\n' });
-        if (tagName == string.Empty)
-        {
-            int index = functionName.IndexOf('(', StringComparison.Ordinal); // 找到第一个 '(' 的位置
-            if (index != -1)
-            {
-                tagName = functionName.Substring(0, index); // 截取从头到 '(' 之前的部分
-            }
-        }
-
-        tagName = tagName == string.Empty ? functionName : tagName;
         IndentScope.Writer.IndWrite("{\n");
-        IndentScope.Writer.Write($"constexpr std::string_view function_name = \"{tagName}\";\n");
         IndentScope.Writer.Write($"profile_scope profiler(0, profile_level::kernel);\n");
         IndentScope.Writer.Write($"{functionName};\n");
         IndentScope.Writer.IndWrite("}\n");
@@ -70,18 +59,7 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
     public void WriteIndWithProfiler(string functionName, string tagName = "")
     {
         functionName = functionName.TrimEnd(new char[] { ';', '\n' });
-        if (tagName == string.Empty)
-        {
-            int index = functionName.IndexOf('(', StringComparison.Ordinal); // 找到第一个 '(' 的位置
-            if (index != -1)
-            {
-                tagName = functionName.Substring(0, index); // 截取从头到 '(' 之前的部分
-            }
-        }
-
-        tagName = tagName == string.Empty ? functionName : tagName;
         IndentScope.Writer.IndWrite("{\n");
-        IndentScope.Writer.IndWrite($"constexpr std::string_view function_name = \"{tagName}\";\n");
         IndentScope.Writer.IndWrite($"profile_scope profiler(0, profile_level::kernel);\n");
         IndentScope.Writer.IndWrite($"{functionName};\n");
         IndentScope.Writer.IndWrite("}\n");
