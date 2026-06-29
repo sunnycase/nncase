@@ -200,7 +200,11 @@ public sealed class BufferizeVisitor : ExprRewriter
     {
         foreach (var group in buffers.GroupBy(x => x.MemSpan.Buffer.Location))
         {
-            var schedule = scheduleResult[group.Key];
+            if (!scheduleResult.TryGetValue(group.Key, out var schedule))
+            {
+                continue;
+            }
+
             using var wr = new StreamWriter(DumpScope.Current.OpenFile($"{group.Key}.py"), Encoding.UTF8);
             wr.Write(@"from bokeh.models import ColumnDataSource, HoverTool, SingleIntervalTicker, SaveTool, WheelZoomTool, WheelPanTool, ResetTool
 from bokeh.palettes import Category20_20 as palette

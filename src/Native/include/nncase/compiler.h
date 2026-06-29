@@ -20,6 +20,7 @@
 #include <nncase/llm/paged_attention_config.h>
 #include <nncase/runtime/simple_types.h>
 #include <nncase/value.h>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 
@@ -139,6 +140,8 @@ typedef struct {
         clr_object_handle_t fn_params);
     void (*handle_dispose)(clr_object_handle_t handle);
     void (*handle_free)(clr_object_handle_t handle);
+    const char *(*get_last_error)();
+    void (*string_free)(const char *value);
     clr_object_handle_t (*import_options_create)();
     clr_object_handle_t (*huggingface_options_create)();
     void (*import_options_set_huggingface_options)(
@@ -226,9 +229,9 @@ typedef struct {
     clr_object_handle_t (*compiler_import_huggingface_module)(
         clr_object_handle_t compiler, const char *model_dir,
         size_t model_dir_length, clr_object_handle_t import_options);
-    void (*compiler_compile)(clr_object_handle_t compiler);
-    void (*compiler_gencode)(clr_object_handle_t compiler,
-                             clr_object_handle_t stream);
+    int (*compiler_compile)(clr_object_handle_t compiler);
+    int (*compiler_gencode)(clr_object_handle_t compiler,
+                            clr_object_handle_t stream);
     clr_object_handle_t (*datatype_from_typecode)(nncase::typecode_t typecode);
     clr_object_handle_t (*expr_evaluate)(clr_object_handle_t expr,
                                          clr_object_handle_t parameters,
@@ -411,7 +414,33 @@ class clr_object_ptr {
     clr_object_handle_t handle_;
 };
 
-#define CHECK_CLR(x) x
+inline std::string take_last_error() {
+    auto api = nncase_clr_api();
+    const char *message = api->get_last_error ? api->get_last_error() : nullptr;
+    if (!message)
+        return "Nncase.Compiler C API call failed.";
+
+    std::string result(message);
+    if (api->string_free)
+        api->string_free(message);
+
+    if (result.empty())
+        return "Nncase.Compiler C API call failed.";
+
+    return result;
+}
+
+inline void throw_if_capi_failed(int status) {
+    if (status != 0)
+        throw std::runtime_error(take_last_error());
+}
+
+inline clr_object_handle_t throw_if_capi_null(clr_object_handle_t handle) {
+    if (!handle)
+        throw std::runtime_error(take_last_error());
+
+    return handle;
+}
 
 class clr_object_base {
   public:
@@ -993,32 +1022,43 @@ class compiler : public clr_object_base {
     using clr_object_base::clr_object_base;
 
     ir_module import_tflite_module(cstream &stream) {
-        return {std::in_place, nncase_clr_api()->compiler_import_tflite_module(
-                                   get(), stream.get())};
+        return {std::in_place,
+                throw_if_capi_null(
+                    nncase_clr_api()->compiler_import_tflite_module(
+                        get(), stream.get()))};
     }
 
     ir_module import_onnx_module(cstream &stream) {
-        return {std::in_place, nncase_clr_api()->compiler_import_onnx_module(
-                                   get(), stream.get())};
+        return {
+            std::in_place,
+            throw_if_capi_null(nncase_clr_api()->compiler_import_onnx_module(
+                get(), stream.get()))};
     }
 
     ir_module import_ncnn_module(cstream &param_stream, cstream &bin_stream) {
         return {std::in_place,
-                nncase_clr_api()->compiler_import_ncnn_module(
-                    get(), param_stream.get(), bin_stream.get())};
+                throw_if_capi_null(
+                    nncase_clr_api()->compiler_import_ncnn_module(
+                        get(), param_stream.get(), bin_stream.get()))};
     }
 
     ir_module import_huggingface_module(std::string_view modelDir,
                                         const import_options &import_opts) {
         return {
             std::in_place,
-            nncase_clr_api()->compiler_import_huggingface_module(
-                get(), modelDir.data(), modelDir.length(), import_opts.get())};
+            throw_if_capi_null(
+                nncase_clr_api()->compiler_import_huggingface_module(
+                    get(), modelDir.data(), modelDir.length(),
+                    import_opts.get()))};
     }
 
-    void compile() { nncase_clr_api()->compiler_compile(obj_.get()); }
+    void compile() {
+        throw_if_capi_failed(nncase_clr_api()->compiler_compile(obj_.get()));
+    }
+
     void gencode(cstream &stream) {
-        nncase_clr_api()->compiler_gencode(obj_.get(), stream.get());
+        throw_if_capi_failed(
+            nncase_clr_api()->compiler_gencode(obj_.get(), stream.get()));
     }
 };
 

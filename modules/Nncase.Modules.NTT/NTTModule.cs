@@ -16,5 +16,6 @@ internal class NTTModule : IApplicationPart
     {
         registrator.Register<ITarget, CPUTarget>(reuse: Reuse.Singleton);
         registrator.Register<ITarget, CUDATarget>(reuse: Reuse.Singleton);
+        registrator.Register<ITarget, PyNTTTarget>(reuse: Reuse.Singleton);
     }
 }

@@ -1,0 +1,134 @@
+@using System.Text
+@model Nncase.CodeGen.PyNTT.PyNTTGatherTemplateModel
+@{
+    var inputShape = "(" + string.Join(", ", Model.InputShape) + (Model.InputShape.Length == 1 ? "," : string.Empty) + ")";
+    var indexShape = "(" + string.Join(", ", Model.IndexShape) + (Model.IndexShape.Length == 1 ? "," : string.Empty) + ")";
+    var outputShape = "(" + string.Join(", ", Model.OutputShape) + (Model.OutputShape.Length == 1 ? "," : string.Empty) + ")";
+
+    static string Indent(int level) => new(' ', level * 4);
+
+    static int SelectBlockAxis(long[] shape, long[] strides)
+    {
+        if (shape.Length == 0)
+        {
+            return 0;
+        }
+
+        for (var i = shape.Length - 1; i >= 0; i--)
+        {
+            if (shape[i] > 1 && strides[i] == 1)
+            {
+                return i;
+            }
+        }
+
+        for (var i = shape.Length - 1; i >= 0; i--)
+        {
+            if (shape[i] > 1)
+            {
+                return i;
+            }
+        }
+
+        return shape.Length - 1;
+    }
+
+    var outputRank = Model.OutputShape.Length;
+    var indexRank = Model.IndexShape.Length;
+    var blockAxis = SelectBlockAxis(Model.OutputShape, Model.OutputStrides);
+    var blockExtent = outputRank == 0 ? 1 : Model.OutputShape[blockAxis];
+    var loopAxes = Enumerable.Range(0, outputRank).Where(axis => axis != blockAxis).ToArray();
+    var signedIndex = !Model.IndexDType.StartsWith("uint", StringComparison.Ordinal);
+
+    string AxisIndex(int axis) => axis == blockAxis ? "lane" : $"idx{axis}";
+
+    string OutputOffsetExpression()
+    {
+        var terms = new List<string>();
+        for (var outputAxis = 0; outputAxis < outputRank; outputAxis++)
+        {
+            terms.Add($"{AxisIndex(outputAxis)} * {Model.OutputStrides[outputAxis]}");
+        }
+
+        return terms.Count == 0 ? "lane * 0" : $"lane * 0 + {string.Join(" + ", terms)}";
+    }
+
+    string IndexOffsetExpression()
+    {
+        var terms = new List<string>();
+        for (var indexAxis = 0; indexAxis < indexRank; indexAxis++)
+        {
+            var outputAxis = Model.Axis + indexAxis;
+            terms.Add($"{AxisIndex(outputAxis)} * {Model.IndexStrides[indexAxis]}");
+        }
+
+        return terms.Count == 0 ? "lane * 0" : $"lane * 0 + {string.Join(" + ", terms)}";
+    }
+
+    string InputOffsetExpression()
+    {
+        var terms = new List<string>();
+        for (var inputAxis = 0; inputAxis < Model.InputShape.Length; inputAxis++)
+        {
+            string index;
+            if (inputAxis < Model.Axis)
+            {
+                index = AxisIndex(inputAxis);
+            }
+            else if (inputAxis == Model.Axis)
+            {
+                index = "gather_index";
+            }
+            else
+            {
+                var outputAxis = inputAxis + indexRank - 1;
+                index = AxisIndex(outputAxis);
+            }
+
+            terms.Add($"{index} * {Model.InputStrides[inputAxis]}");
+        }
+
+        return terms.Count == 0 ? "lane * 0" : $"lane * 0 + {string.Join(" + ", terms)}";
+    }
+
+    var body = new StringBuilder();
+    var indent = 1;
+    foreach (var axis in loopAxes)
+    {
+        body.AppendLine($"{Indent(indent)}idx{axis} = 0");
+        body.AppendLine($"{Indent(indent)}while idx{axis} < {Model.OutputShape[axis]}:");
+        indent++;
+    }
+
+    body.AppendLine($"{Indent(indent)}axis_start = 0");
+    body.AppendLine($"{Indent(indent)}while axis_start < {blockExtent}:");
+    body.AppendLine($"{Indent(indent + 1)}lane = axis_start + tl.arange(0, block_size)");
+    body.AppendLine($"{Indent(indent + 1)}mask = lane < {blockExtent}");
+    body.AppendLine($"{Indent(indent + 1)}index_offsets = {IndexOffsetExpression()}");
+    body.AppendLine($"{Indent(indent + 1)}gather_index = tl.load(index + index_offsets, mask=mask, other=0)");
+    if (signedIndex)
+    {
+        body.AppendLine($"{Indent(indent + 1)}gather_index = tl.where(gather_index < 0, gather_index + {Model.InputShape[Model.Axis]}, gather_index)");
+    }
+
+    body.AppendLine($"{Indent(indent + 1)}input_offsets = {InputOffsetExpression()}");
+    body.AppendLine($"{Indent(indent + 1)}output_offsets = {OutputOffsetExpression()}");
+    body.AppendLine($"{Indent(indent + 1)}value = tl.load(input + input_offsets, mask=mask)");
+    body.AppendLine($"{Indent(indent + 1)}tl.store(output + output_offsets, value, mask=mask)");
+    body.AppendLine($"{Indent(indent + 1)}axis_start += block_size");
+
+    foreach (var axis in loopAxes.Reverse())
+    {
+        body.AppendLine($"{Indent(indent)}idx{axis} += 1");
+        indent--;
+    }
+}
+# generated from CodeGen/PyNTT/Templates/Triton/Kernels/Gather.py.cshtml
+# @Model.Comment; input_dtype=@Model.InputDType, index_dtype=@Model.IndexDType, output_dtype=@Model.OutputDType, input_shape=@inputShape, index_shape=@indexShape, output_shape=@outputShape, axis=@Model.Axis
+@@triton.jit
+@($"def {Model.FunctionName}(data, rdata, thread_local_rdata, warp_local_rdata, block_local_rdata, block_size: tl.constexpr):")
+    shard_index = tl.program_id(0)
+    input = @Html.Raw(Model.Input.Expression)
+    index = @Html.Raw(Model.Index.Expression)
+    output = @Html.Raw(Model.Output.Expression)
+@Html.Raw(body.ToString().TrimEnd())

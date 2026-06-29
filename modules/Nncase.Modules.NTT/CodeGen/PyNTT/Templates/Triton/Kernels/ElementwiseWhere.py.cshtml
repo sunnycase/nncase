@@ -1,0 +1,109 @@
+@using System.Text
+@model Nncase.CodeGen.PyNTT.PyNTTElementwiseWhereTemplateModel
+@{
+    var shape = "(" + string.Join(", ", Model.Shape) + (Model.Shape.Length == 1 ? "," : string.Empty) + ")";
+    var rank = Model.OutputShape.Length;
+
+    static string Indent(int level) => new(' ', level * 4);
+
+    static int SelectBlockAxis(long[] shape, long[] strides)
+    {
+        if (shape.Length == 0)
+        {
+            return 0;
+        }
+
+        for (var i = shape.Length - 1; i >= 0; i--)
+        {
+            if (shape[i] > 1 && strides[i] == 1)
+            {
+                return i;
+            }
+        }
+
+        for (var i = shape.Length - 1; i >= 0; i--)
+        {
+            if (shape[i] > 1)
+            {
+                return i;
+            }
+        }
+
+        return shape.Length - 1;
+    }
+
+    var blockAxis = SelectBlockAxis(Model.OutputShape, Model.OutputStrides);
+    var blockExtent = rank == 0 ? 1 : Model.OutputShape[blockAxis];
+    var loopAxes = Enumerable.Range(0, rank).Where(axis => axis != blockAxis).ToArray();
+
+    string AxisIndex(int axis) => axis == blockAxis ? "lane" : $"idx{axis}";
+
+    string OffsetExpression(long[] operandShape, long[] operandStrides)
+    {
+        var axisOffset = rank - operandShape.Length;
+        var terms = new List<string>();
+        for (var i = 0; i < operandShape.Length; i++)
+        {
+            if (operandShape[i] == 1)
+            {
+                continue;
+            }
+
+            var outputAxis = axisOffset + i;
+            terms.Add($"{AxisIndex(outputAxis)} * {operandStrides[i]}");
+        }
+
+        return terms.Count == 0 ? "lane * 0" : $"lane * 0 + {string.Join(" + ", terms)}";
+    }
+
+    string OutputOffsetExpression()
+    {
+        var terms = new List<string>();
+        for (var i = 0; i < Model.OutputShape.Length; i++)
+        {
+            terms.Add($"{AxisIndex(i)} * {Model.OutputStrides[i]}");
+        }
+
+        return terms.Count == 0 ? "lane * 0" : $"lane * 0 + {string.Join(" + ", terms)}";
+    }
+
+    var body = new StringBuilder();
+    var indent = 1;
+    foreach (var axis in loopAxes)
+    {
+        body.AppendLine($"{Indent(indent)}idx{axis} = 0");
+        body.AppendLine($"{Indent(indent)}while idx{axis} < {Model.OutputShape[axis]}:");
+        indent++;
+    }
+
+    body.AppendLine($"{Indent(indent)}axis_start = 0");
+    body.AppendLine($"{Indent(indent)}while axis_start < {blockExtent}:");
+    body.AppendLine($"{Indent(indent + 1)}lane = axis_start + tl.arange(0, block_size)");
+    body.AppendLine($"{Indent(indent + 1)}mask = lane < {blockExtent}");
+    body.AppendLine($"{Indent(indent + 1)}cond_offsets = {OffsetExpression(Model.CondShape, Model.CondStrides)}");
+    body.AppendLine($"{Indent(indent + 1)}true_offsets = {OffsetExpression(Model.TrueShape, Model.TrueStrides)}");
+    body.AppendLine($"{Indent(indent + 1)}false_offsets = {OffsetExpression(Model.FalseShape, Model.FalseStrides)}");
+    body.AppendLine($"{Indent(indent + 1)}output_offsets = {OutputOffsetExpression()}");
+    body.AppendLine($"{Indent(indent + 1)}predicate = tl.load(cond + cond_offsets, mask=mask)");
+    body.AppendLine($"{Indent(indent + 1)}value0 = tl.load(true_value + true_offsets, mask=mask)");
+    body.AppendLine($"{Indent(indent + 1)}value1 = tl.load(false_value + false_offsets, mask=mask)");
+    body.AppendLine($"{Indent(indent + 1)}result = tl.where(predicate, value0, value1)");
+    body.AppendLine($"{Indent(indent + 1)}tl.store(output + output_offsets, result, mask=mask)");
+    body.AppendLine($"{Indent(indent + 1)}axis_start += block_size");
+
+    foreach (var axis in loopAxes.Reverse())
+    {
+        body.AppendLine($"{Indent(indent)}idx{axis} += 1");
+        indent--;
+    }
+}
+# generated from CodeGen/PyNTT/Templates/Triton/Kernels/ElementwiseWhere.py.cshtml
+# @Model.Comment; cond_dtype=@Model.CondDType, value_dtype=@Model.ValueDType, output_dtype=@Model.OutputDType, shape=@shape
+@@triton.jit
+@($"def {Model.FunctionName}(data, rdata, thread_local_rdata, warp_local_rdata, block_local_rdata, block_size: tl.constexpr):")
+    shard_index = tl.program_id(0)
+    cond = @Html.Raw(Model.Cond.Expression)
+    true_value = @Html.Raw(Model.TrueValue.Expression)
+    false_value = @Html.Raw(Model.FalseValue.Expression)
+    output = @Html.Raw(Model.Output.Expression)
+@Html.Raw(body.ToString().TrimEnd())

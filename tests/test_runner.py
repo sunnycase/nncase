@@ -202,6 +202,8 @@ class TestRunner(Evaluator, Inference, metaclass=ABCMeta):
             config['compile_opt']['dump_asm'] = False
             config['compile_opt']['dump_quant_error'] = False
 
+        self.apply_requested_targets(config)
+
         # check target
         for k, v in config['target'].items():
             if not nncase.check_target(k):
@@ -215,6 +217,22 @@ class TestRunner(Evaluator, Inference, metaclass=ABCMeta):
             config['target']['cpu']['infer'] = False
 
         return config
+
+    def apply_requested_targets(self, config):
+        requested = os.getenv('NNCASE_TEST_TARGETS', '')
+        if not requested:
+            return
+
+        requested_targets = {target.strip() for target in requested.split(',') if target.strip()}
+        if not requested_targets:
+            return
+
+        for target, target_cfg in config['target'].items():
+            if target not in requested_targets:
+                target_cfg['eval'] = False
+                target_cfg['infer'] = False
+            elif not target_cfg['eval'] and not target_cfg['infer']:
+                target_cfg['infer'] = True
 
     def update_config(self, config: Dict, override_cfg: Dict) -> Dict:
         if override_cfg:
@@ -348,10 +366,20 @@ class TestRunner(Evaluator, Inference, metaclass=ABCMeta):
                            self.cfg['compile_opt'], self.cfg['generator']['calibs'])
 
     def get_target_options(self, target: str, values: dict) -> object:
-        if values is None:
+        if values is None and target != 'pyntt':
             return None
         e = '"'
         target_options: object = None
+        if target == 'pyntt':
+            target_options = nncase.NTTTargetOptions()
+            target_options.Vectorize = False
+            target_options.Hierarchies = [[1]]
+            target_options.HierarchyNames = "b"
+            for k, v in (values or {}).items():
+                target_option = self.get_pyntt_target_option_name(k)
+                if target_option is None:
+                    continue
+                setattr(target_options, target_option, v)
         if target == 'cpu' or target == 'xpu':
             target_options = nncase.NTTTargetOptions()
             for k, v in values.items():
@@ -364,6 +392,32 @@ class TestRunner(Evaluator, Inference, metaclass=ABCMeta):
                 exec(
                     f"target_options.{k} = { e + v + e if isinstance(v, str) and not is_enum else v}")
         return target_options
+
+    def get_pyntt_target_option_name(self, name: str) -> Union[str, None]:
+        aliases = {
+            "vectorize": "Vectorize",
+            "hierarchies": "Hierarchies",
+            "hierarchy_names": "HierarchyNames",
+            "hierarchy_sizes": "HierarchySizes",
+            "hierarchy_latencies": "HierarchyLatencies",
+            "hierarchy_band_widths": "HierarchyBandWidths",
+            "memory_capacities": "MemoryCapacities",
+            "memory_band_widths": "MemoryBandWidths",
+            "distributed_scheme": "DistributedScheme",
+            "custom_op_scheme": "CustomOpScheme",
+        }
+        unsupported = {
+            "Backend",
+            "backend",
+            "OutputDirectory",
+            "output_directory",
+            "Strict",
+            "strict",
+        }
+        if name in unsupported:
+            print(f"WARN: PyNTT Python runner ignores target option {name}; generated output uses dump_dir/CodeGen/pyntt.")
+            return None
+        return aliases.get(name, name)
 
     def get_compile_options(self, target, model_file: Union[List[str], str], dump_dir):
         compile_options = nncase.CompileOptions()

@@ -1,0 +1,130 @@
+@using System.Text
+@model Nncase.CodeGen.PyNTT.PyNTTTensorLoadTemplateModel
+@{
+    var localShape = "(" + string.Join(", ", Model.LocalShape) + (Model.LocalShape.Length == 1 ? "," : string.Empty) + ")";
+    var globalShape = "(" + string.Join(", ", Model.GlobalShape) + (Model.GlobalShape.Length == 1 ? "," : string.Empty) + ")";
+
+    static long[] Strides(long[] shape)
+    {
+        var strides = new long[shape.Length];
+        long stride = 1;
+        for (var i = shape.Length - 1; i >= 0; i--)
+        {
+            strides[i] = stride;
+            stride *= shape[i];
+        }
+
+        return strides;
+    }
+
+    static string Indent(int level) => new(' ', level * 4);
+
+    static int SelectBlockAxis(long[] shape, long[] strides)
+    {
+        if (shape.Length == 0)
+        {
+            return 0;
+        }
+
+        for (var i = shape.Length - 1; i >= 0; i--)
+        {
+            if (shape[i] > 1 && strides[i] == 1)
+            {
+                return i;
+            }
+        }
+
+        for (var i = shape.Length - 1; i >= 0; i--)
+        {
+            if (shape[i] > 1)
+            {
+                return i;
+            }
+        }
+
+        return shape.Length - 1;
+    }
+
+    var globalStrides = Strides(Model.GlobalShape);
+    var blockAxis = SelectBlockAxis(Model.LocalShape, Model.DestinationStrides);
+    var blockExtent = Model.LocalShape.Length == 0 ? 1 : Model.LocalShape[blockAxis];
+    var loopAxes = Enumerable.Range(0, Model.LocalShape.Length).Where(axis => axis != blockAxis).ToArray();
+
+    string AxisIndex(int axis) => axis == blockAxis ? "lane" : $"idx{axis}";
+
+    string LocalOffsetExpression()
+    {
+        var terms = new List<string>();
+        for (var i = 0; i < Model.LocalShape.Length; i++)
+        {
+            terms.Add($"{AxisIndex(i)} * {Model.DestinationStrides[i]}");
+        }
+
+        return terms.Count == 0 ? "lane * 0" : $"lane * 0 + {string.Join(" + ", terms)}";
+    }
+
+    string GlobalIndex(int axis)
+    {
+        var index = AxisIndex(axis);
+        return Model.ShardAxis is int shardAxis && shardAxis == axis
+            ? $"({index} + shard_axis_offset)"
+            : index;
+    }
+
+    string SourceOffsetExpression()
+    {
+        var terms = new List<string>();
+        for (var i = 0; i < Model.GlobalShape.Length; i++)
+        {
+            terms.Add($"{GlobalIndex(i)} * {globalStrides[i]}");
+        }
+
+        return terms.Count == 0 ? "lane * 0" : $"lane * 0 + {string.Join(" + ", terms)}";
+    }
+
+    var body = new StringBuilder();
+    var indent = 1;
+    foreach (var axis in loopAxes)
+    {
+        body.AppendLine($"{Indent(indent)}idx{axis} = 0");
+        body.AppendLine($"{Indent(indent)}while idx{axis} < {Model.LocalShape[axis]}:");
+        indent++;
+    }
+
+    body.AppendLine($"{Indent(indent)}axis_start = 0");
+    body.AppendLine($"{Indent(indent)}while axis_start < {blockExtent}:");
+    body.AppendLine($"{Indent(indent + 1)}lane = axis_start + tl.arange(0, block_size)");
+    body.AppendLine($"{Indent(indent + 1)}mask = lane < {blockExtent}");
+    if (Model.ShardAxis.HasValue)
+    {
+        var shardAxisValue = Model.ShardAxis.Value;
+        body.AppendLine($"{Indent(indent + 1)}global_idx{shardAxisValue} = {GlobalIndex(shardAxisValue)}");
+        body.AppendLine($"{Indent(indent + 1)}mask = mask & (global_idx{shardAxisValue} < {Model.GlobalShape[shardAxisValue]})");
+    }
+
+    body.AppendLine($"{Indent(indent + 1)}source_offsets = {Model.SourceOffset} + {SourceOffsetExpression()}");
+    body.AppendLine($"{Indent(indent + 1)}destination_offsets = {LocalOffsetExpression()}");
+    body.AppendLine($"{Indent(indent + 1)}value = tl.load(source + source_offsets, mask=mask)");
+    body.AppendLine($"{Indent(indent + 1)}tl.store(destination + destination_offsets, value, mask=mask)");
+    body.AppendLine($"{Indent(indent + 1)}axis_start += block_size");
+
+    foreach (var axis in loopAxes.Reverse())
+    {
+        body.AppendLine($"{Indent(indent)}idx{axis} += 1");
+        indent--;
+    }
+}
+# generated from CodeGen/PyNTT/Templates/Triton/Kernels/TensorLoad.py.cshtml
+# @Model.Comment; dtype=@Model.DType, local_shape=@localShape, global_shape=@globalShape
+@@triton.jit
+@($"def {Model.FunctionName}(source, data, rdata, thread_local_rdata, warp_local_rdata, block_local_rdata, block_size: tl.constexpr):")
+    shard_count = tl.num_programs(0)
+    shard_index = tl.program_id(0)
+    destination = @Html.Raw(Model.Destination.Expression)
+@if (Model.ShardAxis.HasValue)
+{
+<text>    shard_axis_extent = tl.cdiv(@Model.GlobalShape[Model.ShardAxis.Value], shard_count)
+    shard_axis_offset = shard_index * shard_axis_extent
+</text>
+}
+@Html.Raw(body.ToString().TrimEnd())

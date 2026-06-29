@@ -46,6 +46,8 @@ public unsafe struct CApiMT
     public delegate* unmanaged<IntPtr, nuint, IntPtr, IntPtr> CalibrationDatasetProviderCreatePtr;
     public delegate* unmanaged<IntPtr, void> ClrHandleDisposePtr;
     public delegate* unmanaged<IntPtr, void> ClrHandleFreePtr;
+    public delegate* unmanaged<IntPtr> GetLastErrorPtr;
+    public delegate* unmanaged<IntPtr, void> StringFreePtr;
     public delegate* unmanaged<IntPtr> ImportOptionsCreatePtr;
     public delegate* unmanaged<IntPtr> HuggingFaceOptionsCreatePtr;
     public delegate* unmanaged<IntPtr, IntPtr, void> ImportOptionsSetHuggingFaceOptionsPtr;
@@ -84,8 +86,8 @@ public unsafe struct CApiMT
     public delegate* unmanaged<IntPtr, IntPtr, IntPtr> CompilerImportOnnxModulePtr;
     public delegate* unmanaged<IntPtr, IntPtr, IntPtr, IntPtr> CompilerImportNcnnModulePtr;
     public delegate* unmanaged<IntPtr, byte*, nuint, IntPtr, IntPtr> CompilerImportHuggingFaceModulePtr;
-    public delegate* unmanaged<IntPtr, void> CompilerCompilePtr;
-    public delegate* unmanaged<IntPtr, IntPtr, void> CompilerGencodePtr;
+    public delegate* unmanaged<IntPtr, int> CompilerCompilePtr;
+    public delegate* unmanaged<IntPtr, IntPtr, int> CompilerGencodePtr;
     public delegate* unmanaged<Runtime.TypeCode, IntPtr> DataTypeFromTypeCodePtr;
     public delegate* unmanaged<IntPtr, IntPtr, IntPtr, IntPtr> ExprEvaluatePtr;
     public delegate* unmanaged<IntPtr, IntPtr> FunctionGetBodyPtr;
@@ -168,6 +170,12 @@ public unsafe struct CApiMT
 /// </summary>
 public static unsafe class CApi
 {
+    private const int CApiSuccess = 0;
+    private const int CApiFailure = -1;
+
+    [ThreadStatic]
+    private static string? _lastError;
+
     [UnmanagedCallersOnly]
     public static void Initialize(CApiMT* mt)
     {
@@ -177,6 +185,8 @@ public static unsafe class CApi
         mt->CalibrationDatasetProviderCreatePtr = &CalibrationDatasetProviderCreate;
         mt->ClrHandleDisposePtr = &ClrHandleDispose;
         mt->ClrHandleFreePtr = &ClrHandleFree;
+        mt->GetLastErrorPtr = &GetLastError;
+        mt->StringFreePtr = &StringFree;
         mt->ImportOptionsCreatePtr = &ImportOptionsCreate;
         mt->HuggingFaceOptionsCreatePtr = &HuggingFaceOptionsCreate;
         mt->ImportOptionsSetHuggingFaceOptionsPtr = &ImportOptionsSetHuggingFaceOptions;
@@ -361,6 +371,21 @@ public static unsafe class CApi
         if (handle != IntPtr.Zero)
         {
             GCHandle.FromIntPtr(handle).Free();
+        }
+    }
+
+    [UnmanagedCallersOnly]
+    private static IntPtr GetLastError()
+    {
+        return Marshal.StringToCoTaskMemUTF8(_lastError ?? string.Empty);
+    }
+
+    [UnmanagedCallersOnly]
+    private static void StringFree(IntPtr value)
+    {
+        if (value != IntPtr.Zero)
+        {
+            Marshal.FreeCoTaskMem(value);
         }
     }
 
@@ -615,62 +640,72 @@ public static unsafe class CApi
     [UnmanagedCallersOnly]
     private static IntPtr CompilerImportTFLiteModule(IntPtr compilerHandle, IntPtr streamHandle)
     {
-        var compiler = Get<Compiler>(compilerHandle);
-        var stream = Get<CStream>(streamHandle);
-        var module = compiler.ImportTFLiteModuleAsync(stream).Result;
-        return GCHandle.ToIntPtr(GCHandle.Alloc(module));
+        return GuardHandle(() =>
+        {
+            var compiler = Get<Compiler>(compilerHandle);
+            var stream = Get<CStream>(streamHandle);
+            var module = compiler.ImportTFLiteModuleAsync(stream).GetAwaiter().GetResult();
+            return GCHandle.ToIntPtr(GCHandle.Alloc(module));
+        });
     }
 
     [UnmanagedCallersOnly]
     private static IntPtr CompilerImportOnnxModule(IntPtr compilerHandle, IntPtr streamHandle)
     {
-        var compiler = Get<Compiler>(compilerHandle);
-        var stream = Get<CStream>(streamHandle);
-        var module = compiler.ImportOnnxModuleAsync(stream).Result;
-        return GCHandle.ToIntPtr(GCHandle.Alloc(module));
+        return GuardHandle(() =>
+        {
+            var compiler = Get<Compiler>(compilerHandle);
+            var stream = Get<CStream>(streamHandle);
+            var module = compiler.ImportOnnxModuleAsync(stream).GetAwaiter().GetResult();
+            return GCHandle.ToIntPtr(GCHandle.Alloc(module));
+        });
     }
 
     [UnmanagedCallersOnly]
     private static IntPtr CompilerImportNcnnModule(IntPtr compilerHandle, IntPtr ncnnParamHandle, IntPtr ncnnBinHandle)
     {
-        var compiler = Get<Compiler>(compilerHandle);
-        var ncnnParam = Get<CStream>(ncnnParamHandle);
-        var ncnnBin = Get<CStream>(ncnnBinHandle);
-        var module = compiler.ImportNcnnModuleAsync(ncnnParam, ncnnBin).Result;
-        return GCHandle.ToIntPtr(GCHandle.Alloc(module));
+        return GuardHandle(() =>
+        {
+            var compiler = Get<Compiler>(compilerHandle);
+            var ncnnParam = Get<CStream>(ncnnParamHandle);
+            var ncnnBin = Get<CStream>(ncnnBinHandle);
+            var module = compiler.ImportNcnnModuleAsync(ncnnParam, ncnnBin).GetAwaiter().GetResult();
+            return GCHandle.ToIntPtr(GCHandle.Alloc(module));
+        });
     }
 
     [UnmanagedCallersOnly]
     private static IntPtr CompilerImportHuggingFaceModule(IntPtr compilerHandle, byte* modelDir, nuint modelDirLength, IntPtr importOptionsHandle)
     {
-        var compiler = Get<Compiler>(compilerHandle);
-        var modelDirStr = ToString(modelDir, modelDirLength);
-        var importOptions = Get<ImportOptions>(importOptionsHandle);
-        var module = compiler.ImportHuggingFaceModuleAsync(modelDirStr, importOptions).Result;
-        return GCHandle.ToIntPtr(GCHandle.Alloc(module));
+        return GuardHandle(() =>
+        {
+            var compiler = Get<Compiler>(compilerHandle);
+            var modelDirStr = ToString(modelDir, modelDirLength);
+            var importOptions = Get<ImportOptions>(importOptionsHandle);
+            var module = compiler.ImportHuggingFaceModuleAsync(modelDirStr, importOptions).GetAwaiter().GetResult();
+            return GCHandle.ToIntPtr(GCHandle.Alloc(module));
+        });
     }
 
     [UnmanagedCallersOnly]
-    private static void CompilerCompile(IntPtr compilerHandle)
+    private static int CompilerCompile(IntPtr compilerHandle)
     {
-        var compiler = Get<Compiler>(compilerHandle);
-        compiler.CompileAsync().Wait();
+        return Guard(() =>
+        {
+            var compiler = Get<Compiler>(compilerHandle);
+            compiler.CompileAsync().GetAwaiter().GetResult();
+        });
     }
 
     [UnmanagedCallersOnly]
-    private static void CompilerGencode(IntPtr compilerHandle, IntPtr streamHandle)
+    private static int CompilerGencode(IntPtr compilerHandle, IntPtr streamHandle)
     {
-        try
+        return Guard(() =>
         {
             var compiler = Get<Compiler>(compilerHandle);
             var stream = Get<CStream>(streamHandle);
             compiler.Gencode(stream);
-        }
-        catch (Exception ex)
-        {
-            Console.Error.WriteLine(ex);
-            Environment.FailFast(ex.ToString());
-        }
+        });
     }
 
     [UnmanagedCallersOnly]
@@ -1308,6 +1343,35 @@ public static unsafe class CApi
     private static T Get<T>(IntPtr handle)
     {
         return (T)(GCHandle.FromIntPtr(handle).Target ?? throw new ArgumentNullException(nameof(handle)));
+    }
+
+    private static int Guard(Action action)
+    {
+        try
+        {
+            _lastError = null;
+            action();
+            return CApiSuccess;
+        }
+        catch (Exception ex)
+        {
+            _lastError = ex.ToString();
+            return CApiFailure;
+        }
+    }
+
+    private static IntPtr GuardHandle(Func<IntPtr> action)
+    {
+        try
+        {
+            _lastError = null;
+            return action();
+        }
+        catch (Exception ex)
+        {
+            _lastError = ex.ToString();
+            return IntPtr.Zero;
+        }
     }
 
     private static string ToString(byte* bytes, nuint length) =>

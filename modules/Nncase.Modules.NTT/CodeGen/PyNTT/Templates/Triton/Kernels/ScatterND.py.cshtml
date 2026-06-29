@@ -1,0 +1,173 @@
+@using System.Text
+@model Nncase.CodeGen.PyNTT.PyNTTScatterNDTemplateModel
+@{
+    var inputShape = "(" + string.Join(", ", Model.InputShape) + (Model.InputShape.Length == 1 ? "," : string.Empty) + ")";
+    var indicesShape = "(" + string.Join(", ", Model.IndicesShape) + (Model.IndicesShape.Length == 1 ? "," : string.Empty) + ")";
+    var updatesShape = "(" + string.Join(", ", Model.UpdatesShape) + (Model.UpdatesShape.Length == 1 ? "," : string.Empty) + ")";
+    var outputShape = "(" + string.Join(", ", Model.OutputShape) + (Model.OutputShape.Length == 1 ? "," : string.Empty) + ")";
+    var inputRank = Model.InputShape.Length;
+    var updatesRank = Model.UpdatesShape.Length;
+    var indicesRank = Model.IndicesShape.Length;
+    var prefixRank = indicesRank - 1;
+    var indexDepth = (int)Model.IndicesShape[^1];
+    var sliceRank = inputRank - indexDepth;
+    var signedIndices = !Model.IndicesDType.StartsWith("uint", StringComparison.Ordinal);
+
+    static string Indent(int level) => new(' ', level * 4);
+
+    static int SelectBlockAxis(long[] shape, long[] strides)
+    {
+        if (shape.Length == 0)
+        {
+            return 0;
+        }
+
+        for (var i = shape.Length - 1; i >= 0; i--)
+        {
+            if (shape[i] > 1 && strides[i] == 1)
+            {
+                return i;
+            }
+        }
+
+        for (var i = shape.Length - 1; i >= 0; i--)
+        {
+            if (shape[i] > 1)
+            {
+                return i;
+            }
+        }
+
+        return shape.Length - 1;
+    }
+
+    string AxisIndex(string prefix, int axis, int blockAxis) => axis == blockAxis ? $"{prefix}_lane" : $"{prefix}_idx{axis}";
+
+    string OffsetExpression(string prefix, long[] shape, long[] strides, int blockAxis)
+    {
+        var terms = new List<string>();
+        for (var axis = 0; axis < shape.Length; axis++)
+        {
+            terms.Add($"{AxisIndex(prefix, axis, blockAxis)} * {strides[axis]}");
+        }
+
+        return terms.Count == 0 ? $"{prefix}_lane * 0" : $"{prefix}_lane * 0 + {string.Join(" + ", terms)}";
+    }
+
+    string IndicesPrefixOffsetExpression(int updatesBlockAxis)
+    {
+        var terms = new List<string>();
+        for (var axis = 0; axis < prefixRank; axis++)
+        {
+            terms.Add($"{AxisIndex("upd", axis, updatesBlockAxis)} * {Model.IndicesStrides[axis]}");
+        }
+
+        return terms.Count == 0 ? "upd_lane * 0" : $"upd_lane * 0 + {string.Join(" + ", terms)}";
+    }
+
+    string UpdatesOffsetExpression(int updatesBlockAxis)
+    {
+        var terms = new List<string>();
+        for (var axis = 0; axis < updatesRank; axis++)
+        {
+            terms.Add($"{AxisIndex("upd", axis, updatesBlockAxis)} * {Model.UpdatesStrides[axis]}");
+        }
+
+        return terms.Count == 0 ? "upd_lane * 0" : $"upd_lane * 0 + {string.Join(" + ", terms)}";
+    }
+
+    string ScatterOutputOffsetExpression(int updatesBlockAxis)
+    {
+        var terms = new List<string>();
+        for (var axis = 0; axis < indexDepth; axis++)
+        {
+            terms.Add($"scatter_idx{axis} * {Model.OutputStrides[axis]}");
+        }
+
+        for (var axis = 0; axis < sliceRank; axis++)
+        {
+            var updatesAxis = prefixRank + axis;
+            var outputAxis = indexDepth + axis;
+            terms.Add($"{AxisIndex("upd", updatesAxis, updatesBlockAxis)} * {Model.OutputStrides[outputAxis]}");
+        }
+
+        return terms.Count == 0 ? "upd_lane * 0" : $"upd_lane * 0 + {string.Join(" + ", terms)}";
+    }
+
+    var copyBlockAxis = SelectBlockAxis(Model.OutputShape, Model.OutputStrides);
+    var copyBlockExtent = Model.OutputShape.Length == 0 ? 1 : Model.OutputShape[copyBlockAxis];
+    var copyLoopAxes = Enumerable.Range(0, Model.OutputShape.Length).Where(axis => axis != copyBlockAxis).ToArray();
+    var updatesBlockAxis = SelectBlockAxis(Model.UpdatesShape, Model.UpdatesStrides);
+    var updatesBlockExtent = Model.UpdatesShape.Length == 0 ? 1 : Model.UpdatesShape[updatesBlockAxis];
+    var updatesLoopAxes = Enumerable.Range(0, Model.UpdatesShape.Length).Where(axis => axis != updatesBlockAxis).ToArray();
+
+    var body = new StringBuilder();
+    body.AppendLine($"{Indent(1)}# copy input to output");
+    var indent = 1;
+    foreach (var axis in copyLoopAxes)
+    {
+        body.AppendLine($"{Indent(indent)}copy_idx{axis} = 0");
+        body.AppendLine($"{Indent(indent)}while copy_idx{axis} < {Model.OutputShape[axis]}:");
+        indent++;
+    }
+
+    body.AppendLine($"{Indent(indent)}copy_axis_start = 0");
+    body.AppendLine($"{Indent(indent)}while copy_axis_start < {copyBlockExtent}:");
+    body.AppendLine($"{Indent(indent + 1)}copy_lane = copy_axis_start + tl.arange(0, block_size)");
+    body.AppendLine($"{Indent(indent + 1)}copy_mask = copy_lane < {copyBlockExtent}");
+    body.AppendLine($"{Indent(indent + 1)}copy_input_offsets = {OffsetExpression("copy", Model.InputShape, Model.InputStrides, copyBlockAxis)}");
+    body.AppendLine($"{Indent(indent + 1)}copy_output_offsets = {OffsetExpression("copy", Model.OutputShape, Model.OutputStrides, copyBlockAxis)}");
+    body.AppendLine($"{Indent(indent + 1)}copy_value = tl.load(input + copy_input_offsets, mask=copy_mask)");
+    body.AppendLine($"{Indent(indent + 1)}tl.store(output + copy_output_offsets, copy_value, mask=copy_mask)");
+    body.AppendLine($"{Indent(indent + 1)}copy_axis_start += block_size");
+    foreach (var axis in copyLoopAxes.Reverse())
+    {
+        body.AppendLine($"{Indent(indent)}copy_idx{axis} += 1");
+        indent--;
+    }
+
+    body.AppendLine();
+    body.AppendLine($"{Indent(1)}# scatter updates");
+    indent = 1;
+    foreach (var axis in updatesLoopAxes)
+    {
+        body.AppendLine($"{Indent(indent)}upd_idx{axis} = 0");
+        body.AppendLine($"{Indent(indent)}while upd_idx{axis} < {Model.UpdatesShape[axis]}:");
+        indent++;
+    }
+
+    body.AppendLine($"{Indent(indent)}upd_axis_start = 0");
+    body.AppendLine($"{Indent(indent)}while upd_axis_start < {updatesBlockExtent}:");
+    body.AppendLine($"{Indent(indent + 1)}upd_lane = upd_axis_start + tl.arange(0, block_size)");
+    body.AppendLine($"{Indent(indent + 1)}upd_mask = upd_lane < {updatesBlockExtent}");
+    body.AppendLine($"{Indent(indent + 1)}indices_prefix_offsets = {IndicesPrefixOffsetExpression(updatesBlockAxis)}");
+    for (var axis = 0; axis < indexDepth; axis++)
+    {
+        body.AppendLine($"{Indent(indent + 1)}scatter_idx{axis} = tl.load(indices + indices_prefix_offsets + {axis} * {Model.IndicesStrides[^1]}, mask=upd_mask, other=0)");
+        if (signedIndices)
+        {
+            body.AppendLine($"{Indent(indent + 1)}scatter_idx{axis} = tl.where(scatter_idx{axis} < 0, scatter_idx{axis} + {Model.OutputShape[axis]}, scatter_idx{axis})");
+        }
+    }
+
+    body.AppendLine($"{Indent(indent + 1)}updates_offsets = {UpdatesOffsetExpression(updatesBlockAxis)}");
+    body.AppendLine($"{Indent(indent + 1)}scatter_output_offsets = {ScatterOutputOffsetExpression(updatesBlockAxis)}");
+    body.AppendLine($"{Indent(indent + 1)}updates_value = tl.load(updates + updates_offsets, mask=upd_mask)");
+    body.AppendLine($"{Indent(indent + 1)}tl.store(output + scatter_output_offsets, updates_value, mask=upd_mask)");
+    body.AppendLine($"{Indent(indent + 1)}upd_axis_start += block_size");
+    foreach (var axis in updatesLoopAxes.Reverse())
+    {
+        body.AppendLine($"{Indent(indent)}upd_idx{axis} += 1");
+        indent--;
+    }
+}
+# generated from CodeGen/PyNTT/Templates/Triton/Kernels/ScatterND.py.cshtml
+# @Model.Comment; input_dtype=@Model.InputDType, indices_dtype=@Model.IndicesDType, updates_dtype=@Model.UpdatesDType, output_dtype=@Model.OutputDType, input_shape=@inputShape, indices_shape=@indicesShape, updates_shape=@updatesShape, output_shape=@outputShape
+@@triton.jit
+@($"def {Model.FunctionName}(data, rdata, thread_local_rdata, warp_local_rdata, block_local_rdata, block_size: tl.constexpr):")
+    shard_index = tl.program_id(0)
+    input = @Html.Raw(Model.Input.Expression)
+    indices = @Html.Raw(Model.Indices.Expression)
+    updates = @Html.Raw(Model.Updates.Expression)
+    output = @Html.Raw(Model.Output.Expression)
+@Html.Raw(body.ToString().TrimEnd())

@@ -1,0 +1,108 @@
+@using System.Text
+@model Nncase.CodeGen.PyNTT.PyNTTSoftmaxTemplateModel
+@{
+    var shape = "(" + string.Join(", ", Model.Shape) + (Model.Shape.Length == 1 ? "," : string.Empty) + ")";
+    var rank = Model.Shape.Length;
+    var axisExtent = Model.Shape[Model.Axis];
+
+    static string Indent(int level) => new(' ', level * 4);
+
+    static int SelectBlockAxis(long[] shape, long[] strides)
+    {
+        for (var i = shape.Length - 1; i >= 0; i--)
+        {
+            if (shape[i] > 1 && strides[i] == 1)
+            {
+                return i;
+            }
+        }
+
+        for (var i = shape.Length - 1; i >= 0; i--)
+        {
+            if (shape[i] > 1)
+            {
+                return i;
+            }
+        }
+
+        return shape.Length - 1;
+    }
+
+    var blockAxis = SelectBlockAxis(Model.Shape, Model.OutputStrides);
+    var blockExtent = Model.Shape[blockAxis];
+    var loopAxes = Enumerable.Range(0, rank).Where(axis => axis != blockAxis).ToArray();
+
+    string AxisIndex(int axis) => axis == blockAxis ? "lane" : $"idx{axis}";
+
+    string OffsetExpression(long[] strides)
+    {
+        var terms = new List<string>();
+        for (var i = 0; i < Model.Shape.Length; i++)
+        {
+            terms.Add($"{AxisIndex(i)} * {strides[i]}");
+        }
+
+        return terms.Count == 0 ? "lane * 0" : $"lane * 0 + {string.Join(" + ", terms)}";
+    }
+
+    string SliceBaseExpression()
+    {
+        var terms = new List<string>();
+        for (var i = 0; i < Model.Shape.Length; i++)
+        {
+            if (i == Model.Axis)
+            {
+                continue;
+            }
+
+            terms.Add($"{AxisIndex(i)} * {Model.InputStrides[i]}");
+        }
+
+        return terms.Count == 0 ? "lane * 0" : $"lane * 0 + {string.Join(" + ", terms)}";
+    }
+
+    var body = new StringBuilder();
+    var indent = 1;
+    foreach (var axis in loopAxes)
+    {
+        body.AppendLine($"{Indent(indent)}idx{axis} = 0");
+        body.AppendLine($"{Indent(indent)}while idx{axis} < {Model.Shape[axis]}:");
+        indent++;
+    }
+
+    body.AppendLine($"{Indent(indent)}axis_start = 0");
+    body.AppendLine($"{Indent(indent)}while axis_start < {blockExtent}:");
+    body.AppendLine($"{Indent(indent + 1)}lane = axis_start + tl.arange(0, block_size)");
+    body.AppendLine($"{Indent(indent + 1)}mask = lane < {blockExtent}");
+    body.AppendLine($"{Indent(indent + 1)}slice_base = {SliceBaseExpression()}");
+    body.AppendLine($"{Indent(indent + 1)}max_value = tl.full((block_size,), -float(\"inf\"), tl.float32)");
+    body.AppendLine($"{Indent(indent + 1)}axis_pos = 0");
+    body.AppendLine($"{Indent(indent + 1)}while axis_pos < {axisExtent}:");
+    body.AppendLine($"{Indent(indent + 2)}values = tl.load(input0 + slice_base + axis_pos * {Model.InputStrides[Model.Axis]}, mask=mask, other=-float(\"inf\"))");
+    body.AppendLine($"{Indent(indent + 2)}max_value = tl.maximum(max_value, values)");
+    body.AppendLine($"{Indent(indent + 2)}axis_pos += 1");
+    body.AppendLine($"{Indent(indent + 1)}sum_value = tl.full((block_size,), 0.0, tl.float32)");
+    body.AppendLine($"{Indent(indent + 1)}axis_pos = 0");
+    body.AppendLine($"{Indent(indent + 1)}while axis_pos < {axisExtent}:");
+    body.AppendLine($"{Indent(indent + 2)}values = tl.load(input0 + slice_base + axis_pos * {Model.InputStrides[Model.Axis]}, mask=mask, other=-float(\"inf\"))");
+    body.AppendLine($"{Indent(indent + 2)}sum_value += tl.exp(values - max_value)");
+    body.AppendLine($"{Indent(indent + 2)}axis_pos += 1");
+    body.AppendLine($"{Indent(indent + 1)}value0 = tl.load(input0 + {OffsetExpression(Model.InputStrides)}, mask=mask, other=-float(\"inf\"))");
+    body.AppendLine($"{Indent(indent + 1)}result = tl.exp(value0 - max_value) / sum_value");
+    body.AppendLine($"{Indent(indent + 1)}tl.store(output + {OffsetExpression(Model.OutputStrides)}, result, mask=mask)");
+    body.AppendLine($"{Indent(indent + 1)}axis_start += block_size");
+
+    foreach (var axis in loopAxes.Reverse())
+    {
+        body.AppendLine($"{Indent(indent)}idx{axis} += 1");
+        indent--;
+    }
+}
+# generated from CodeGen/PyNTT/Templates/Triton/Kernels/Softmax.py.cshtml
+# @Model.Comment; input_dtype=@Model.InputDType, output_dtype=@Model.OutputDType, shape=@shape, axis=@Model.Axis
+@@triton.jit
+@($"def {Model.FunctionName}(data, rdata, thread_local_rdata, warp_local_rdata, block_local_rdata, block_size: tl.constexpr):")
+    shard_index = tl.program_id(0)
+    input0 = @Html.Raw(Model.Input.Expression)
+    output = @Html.Raw(Model.Output.Expression)
+@Html.Raw(body.ToString().TrimEnd())

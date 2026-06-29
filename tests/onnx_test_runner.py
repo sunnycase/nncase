@@ -77,10 +77,72 @@ class OnnxTestRunner(TestRunner):
         if not self.inputs:
             self.parse_model(model_file)
 
+        if self.dynamic and self.should_staticize_for_pyntt():
+            model_file = self.staticize_model_for_pyntt(model_file)
+
         # if not has_external_data:
         #     model_file = self.do_preprocess(model_file)
 
         super().run(model_file)
+
+    def should_staticize_for_pyntt(self):
+        targets = self.cfg.get('target', {})
+        target_cfg = targets.get('pyntt', None)
+        return target_cfg is not None and (target_cfg.get('eval', False) or target_cfg.get('infer', False))
+
+    def staticize_model_for_pyntt(self, model_file):
+        onnx_model = onnx.load(model_file)
+        input_shapes = {input['name']: input['shape'] for input in self.inputs}
+
+        self.apply_static_shapes(onnx_model, input_shapes)
+        onnx_model = onnx.shape_inference.infer_shapes(onnx_model)
+        self.apply_static_shapes(onnx_model, input_shapes)
+
+        static_model_file = os.path.join(self.case_dir, 'pyntt_static.onnx')
+        onnx.save_model(onnx_model, static_model_file)
+        self.dynamic = False
+        self.reload_outputs(onnx_model)
+        return static_model_file
+
+    def apply_static_shapes(self, onnx_model, input_shapes):
+        dim_values = dict(self.shape_vars)
+
+        for input in onnx_model.graph.input:
+            if input.name not in input_shapes:
+                continue
+
+            dims = input.type.tensor_type.shape.dim
+            for dim, value in zip(dims, input_shapes[input.name]):
+                if dim.dim_param != '':
+                    dim_values[dim.dim_param] = int(value)
+                dim.ClearField('dim_param')
+                dim.dim_value = int(value)
+
+        for value_info in list(onnx_model.graph.input) + list(onnx_model.graph.output) + list(onnx_model.graph.value_info):
+            tensor_type = value_info.type.tensor_type
+            if not tensor_type.HasField('shape'):
+                continue
+
+            for dim in tensor_type.shape.dim:
+                if dim.dim_param == '':
+                    continue
+
+                value = eval(dim.dim_param, {"__builtins__": {}}, dim_values)
+                dim.ClearField('dim_param')
+                dim.dim_value = int(value)
+
+    def reload_outputs(self, onnx_model):
+        self.outputs.clear()
+        for e in onnx_model.graph.output:
+            output_dict = {}
+            onnx_type = e.type.tensor_type
+            output_dict['name'] = e.name
+            if onnx_type.elem_type == 0:
+                output_dict['dtype'] = 'float32'
+            else:
+                output_dict['dtype'] = onnx.helper.tensor_dtype_to_np_dtype(onnx_type.elem_type)
+            output_dict['model_shape'] = [i.dim_value for i in onnx_type.shape.dim]
+            self.outputs.append(output_dict)
 
     def do_preprocess(self, model_file):
         # preprocess model

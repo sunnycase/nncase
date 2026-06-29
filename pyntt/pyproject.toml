@@ -1,0 +1,13 @@
+[project]
+name = "pyntt"
+version = "0.0.0"
+requires-python = ">=3.10"
+description = "Python runtime and kernel library for the nncase PyNTT backend"
+dependencies = []
+
+[project.optional-dependencies]
+triton = ["torch", "triton"]
+
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"

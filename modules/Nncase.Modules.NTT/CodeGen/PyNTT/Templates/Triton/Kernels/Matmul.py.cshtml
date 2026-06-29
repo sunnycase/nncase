@@ -1,0 +1,121 @@
+@using System.Text
+@model Nncase.CodeGen.PyNTT.PyNTTMatmulTemplateModel
+@{
+    var lhsShape = "(" + string.Join(", ", Model.LhsShape) + (Model.LhsShape.Length == 1 ? "," : string.Empty) + ")";
+    var rhsShape = "(" + string.Join(", ", Model.RhsShape) + (Model.RhsShape.Length == 1 ? "," : string.Empty) + ")";
+    var outputShape = "(" + string.Join(", ", Model.OutputShape) + (Model.OutputShape.Length == 1 ? "," : string.Empty) + ")";
+    var m = Model.OutputShape[^2];
+    var n = Model.OutputShape[^1];
+    var k = Model.TransposeA ? Model.LhsShape[^2] : Model.LhsShape[^1];
+    var outputBatchRank = Model.OutputShape.Length - 2;
+
+    static string Indent(int level) => new(' ', level * 4);
+
+    static int SelectBlockAxis(long[] shape, long[] strides)
+    {
+        for (var i = shape.Length - 1; i >= 0; i--)
+        {
+            if (shape[i] > 1 && strides[i] == 1)
+            {
+                return i;
+            }
+        }
+
+        for (var i = shape.Length - 1; i >= 0; i--)
+        {
+            if (shape[i] > 1)
+            {
+                return i;
+            }
+        }
+
+        return shape.Length - 1;
+    }
+
+    var blockAxis = SelectBlockAxis(Model.OutputShape, Model.OutputStrides);
+    var blockExtent = Model.OutputShape[blockAxis];
+    var loopAxes = Enumerable.Range(0, Model.OutputShape.Length).Where(axis => axis != blockAxis).ToArray();
+
+    string AxisIndex(int axis) => axis == blockAxis ? "lane" : $"idx{axis}";
+    var row = AxisIndex(Model.OutputShape.Length - 2);
+    var col = AxisIndex(Model.OutputShape.Length - 1);
+
+    string BatchOffsetExpression(long[] operandShape, long[] operandStrides)
+    {
+        var operandBatchRank = operandShape.Length - 2;
+        var axisOffset = outputBatchRank - operandBatchRank;
+        var terms = new List<string>();
+        for (var operandAxis = 0; operandAxis < operandBatchRank; operandAxis++)
+        {
+            if (operandShape[operandAxis] == 1)
+            {
+                continue;
+            }
+
+            var outputAxis = axisOffset + operandAxis;
+            terms.Add($"{AxisIndex(outputAxis)} * {operandStrides[operandAxis]}");
+        }
+
+        return terms.Count == 0 ? "lane * 0" : $"lane * 0 + {string.Join(" + ", terms)}";
+    }
+
+    string OutputOffsetExpression()
+    {
+        var terms = new List<string>();
+        for (var axis = 0; axis < Model.OutputShape.Length; axis++)
+        {
+            terms.Add($"{AxisIndex(axis)} * {Model.OutputStrides[axis]}");
+        }
+
+        return terms.Count == 0 ? "lane * 0" : $"lane * 0 + {string.Join(" + ", terms)}";
+    }
+
+    var lhsBatchOffset = BatchOffsetExpression(Model.LhsShape, Model.LhsStrides);
+    var rhsBatchOffset = BatchOffsetExpression(Model.RhsShape, Model.RhsStrides);
+    var lhsIndex = Model.TransposeA
+        ? $"{lhsBatchOffset} + k_index * {Model.LhsStrides[^2]} + {row} * {Model.LhsStrides[^1]}"
+        : $"{lhsBatchOffset} + {row} * {Model.LhsStrides[^2]} + k_index * {Model.LhsStrides[^1]}";
+    var rhsIndex = Model.TransposeB
+        ? $"{rhsBatchOffset} + {col} * {Model.RhsStrides[^2]} + k_index * {Model.RhsStrides[^1]}"
+        : $"{rhsBatchOffset} + k_index * {Model.RhsStrides[^2]} + {col} * {Model.RhsStrides[^1]}";
+    var outputIndex = OutputOffsetExpression();
+
+    var body = new StringBuilder();
+    var indent = 1;
+    foreach (var axis in loopAxes)
+    {
+        body.AppendLine($"{Indent(indent)}idx{axis} = 0");
+        body.AppendLine($"{Indent(indent)}while idx{axis} < {Model.OutputShape[axis]}:");
+        indent++;
+    }
+
+    body.AppendLine($"{Indent(indent)}axis_start = 0");
+    body.AppendLine($"{Indent(indent)}while axis_start < {blockExtent}:");
+    body.AppendLine($"{Indent(indent + 1)}lane = axis_start + tl.arange(0, block_size)");
+    body.AppendLine($"{Indent(indent + 1)}mask = lane < {blockExtent}");
+    body.AppendLine($"{Indent(indent + 1)}acc = tl.full((block_size,), 0.0, tl.float32)");
+    body.AppendLine($"{Indent(indent + 1)}k_index = 0");
+    body.AppendLine($"{Indent(indent + 1)}while k_index < {k}:");
+    body.AppendLine($"{Indent(indent + 2)}lhs_value = tl.load(lhs + lane * 0 + {lhsIndex}, mask=mask, other=0.0)");
+    body.AppendLine($"{Indent(indent + 2)}rhs_value = tl.load(rhs + lane * 0 + {rhsIndex}, mask=mask, other=0.0)");
+    body.AppendLine($"{Indent(indent + 2)}acc += lhs_value * rhs_value");
+    body.AppendLine($"{Indent(indent + 2)}k_index += 1");
+    body.AppendLine($"{Indent(indent + 1)}result = acc * {Model.Scale}");
+    body.AppendLine($"{Indent(indent + 1)}tl.store(output + {outputIndex}, result, mask=mask)");
+    body.AppendLine($"{Indent(indent + 1)}axis_start += block_size");
+
+    foreach (var axis in loopAxes.Reverse())
+    {
+        body.AppendLine($"{Indent(indent)}idx{axis} += 1");
+        indent--;
+    }
+}
+# generated from CodeGen/PyNTT/Templates/Triton/Kernels/Matmul.py.cshtml
+# @Model.Comment; lhs_dtype=@Model.LhsDType, rhs_dtype=@Model.RhsDType, output_dtype=@Model.OutputDType, lhs_shape=@lhsShape, rhs_shape=@rhsShape, output_shape=@outputShape
+@@triton.jit
+@($"def {Model.FunctionName}(data, rdata, thread_local_rdata, warp_local_rdata, block_local_rdata, block_size: tl.constexpr):")
+    shard_index = tl.program_id(0)
+    lhs = @Html.Raw(Model.Lhs.Expression)
+    rhs = @Html.Raw(Model.Rhs.Expression)
+    output = @Html.Raw(Model.Output.Expression)
+@Html.Raw(body.ToString().TrimEnd())

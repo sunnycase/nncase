@@ -14,6 +14,9 @@
 # pylint: disable=invalid-name, unused-argument, import-outside-toplevel
 
 from typing import List, Dict, Union, Tuple
+import hashlib
+import importlib.util
+import io
 import os
 import nncase
 import numpy as np
@@ -22,9 +25,11 @@ import preprocess_utils
 import socket
 import struct
 import json
+import sys
 from test_utils import *
 import time
 from html import escape
+from pathlib import Path
 
 from npy2json import convert_npy_to_json
 
@@ -35,6 +40,9 @@ def data_shape_list_string(data):
 
 class Inference:
     def run_inference(self, compiler, target, ptq_enabled, infer_dir):
+        if target == "pyntt":
+            return self.run_pyntt_inference(compiler, ptq_enabled, infer_dir)
+
         in_ci = test_utils.in_ci()
         kpu_targets = test_utils.kpu_targets()
         nuc_ip = test_utils.nuc_ip()
@@ -90,6 +98,82 @@ class Inference:
             outputs = self.dump_infer_output(sim, compile_opt, infer_dir)
         return outputs
 
+    def run_pyntt_inference(self, compiler, ptq_enabled, infer_dir):
+        if ptq_enabled:
+            raise NotImplementedError("PyNTT pytest runner does not support PTQ mode yet.")
+
+        try:
+            import pytest
+            import torch
+            import triton  # noqa: F401
+        except ImportError as ex:
+            import pytest
+            pytest.skip(f"PyNTT inference requires torch and triton: {ex}")
+
+        if not torch.cuda.is_available():
+            pytest.skip("PyNTT inference requires CUDA.")
+
+        os.makedirs(infer_dir, exist_ok=True)
+        compiler.compile()
+        compiler.gencode(io.BytesIO())
+
+        generated_dir = os.path.join(infer_dir, "CodeGen", "pyntt")
+        if not os.path.exists(os.path.join(generated_dir, "__init__.py")):
+            raise FileNotFoundError(f"PyNTT generated model package was not found: {generated_dir}")
+
+        model_package = self.load_pyntt_generated_package(generated_dir)
+        module = model_package.load_model()
+        compile_opt = self.cfg['compile_opt']
+
+        torch_inputs = []
+        for value in self.inputs:
+            data = self.transform_input(value['data'], compile_opt['input_type'], "infer")[0]
+            torch_inputs.append(torch.from_numpy(np.ascontiguousarray(data)).cuda())
+
+        with torch.no_grad():
+            torch_outputs = module(*torch_inputs)
+        torch.cuda.synchronize()
+
+        if not isinstance(torch_outputs, (tuple, list)):
+            torch_outputs = [torch_outputs]
+
+        outputs = []
+        for i, output in enumerate(torch_outputs):
+            output = output.detach().cpu().numpy()
+            output = self.postprocess_infer_output(output, compile_opt)
+            outputs.append(output)
+            if not test_utils.in_ci():
+                dump_bin_file(os.path.join(infer_dir, f'nncase_result_{i}.bin'), output)
+                dump_txt_file(os.path.join(infer_dir, f'nncase_result_{i}.txt'), output)
+                dump_npy_file(os.path.join(infer_dir, f'nncase_result_{i}.npy'), output)
+                convert_npy_to_json(os.path.join(infer_dir, f'nncase_result_{i}.npy'),
+                                    infer_dir)
+        return outputs
+
+    def load_pyntt_generated_package(self, generated_dir):
+        repo_root = Path(__file__).resolve().parents[1]
+        pyntt_package_root = str(repo_root / "pyntt")
+        if pyntt_package_root not in sys.path:
+            sys.path.insert(0, pyntt_package_root)
+
+        package_hash = hashlib.sha1(os.path.abspath(generated_dir).encode()).hexdigest()[:12]
+        package_name = f"_nncase_pyntt_generated_{package_hash}"
+        for module_name in list(sys.modules):
+            if module_name == package_name or module_name.startswith(package_name + "."):
+                del sys.modules[module_name]
+
+        spec = importlib.util.spec_from_file_location(
+            package_name,
+            os.path.join(generated_dir, "__init__.py"),
+            submodule_search_locations=[generated_dir])
+        if spec is None or spec.loader is None:
+            raise ImportError(f"Could not load generated PyNTT package from {generated_dir}")
+
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[package_name] = module
+        spec.loader.exec_module(module)
+        return module
+
     def set_infer_input(self, sim, compile_opt):
         for idx, value in enumerate(self.inputs):
             new_data = None
@@ -122,15 +206,7 @@ class Inference:
         outputs = []
         for i in range(sim.outputs_size):
             output = sim.get_output_tensor(i).to_numpy()
-            if compile_opt['preprocess']:
-                if (compile_opt['output_layout'] == 'NHWC' and self.model_type in ['caffe', 'onnx']):
-                    output = np.transpose(output, [0, 3, 1, 2])
-                elif (compile_opt['output_layout'] == 'NCHW' and self.model_type in ['tflite']):
-                    output = np.transpose(output, [0, 2, 3, 1])
-                elif compile_opt['output_layout'] not in ["NCHW", "NHWC"] and compile_opt['output_layout'] != "":
-                    tmp_perm = [int(idx) for idx in compile_opt['output_layout'].split(",")]
-                    output = np.transpose(
-                        output, preprocess_utils.get_source_transpose_index(tmp_perm))
+            output = self.postprocess_infer_output(output, compile_opt)
             outputs.append(output)
             if not test_utils.in_ci():
                 dump_bin_file(os.path.join(infer_dir, f'nncase_result_{i}.bin'), output)
@@ -139,6 +215,18 @@ class Inference:
                 convert_npy_to_json(os.path.join(infer_dir, f'nncase_result_{i}.npy'),
                                     infer_dir)
         return outputs
+
+    def postprocess_infer_output(self, output, compile_opt):
+        if compile_opt['preprocess']:
+            if (compile_opt['output_layout'] == 'NHWC' and self.model_type in ['caffe', 'onnx']):
+                output = np.transpose(output, [0, 3, 1, 2])
+            elif (compile_opt['output_layout'] == 'NCHW' and self.model_type in ['tflite']):
+                output = np.transpose(output, [0, 2, 3, 1])
+            elif compile_opt['output_layout'] not in ["NCHW", "NHWC"] and compile_opt['output_layout'] != "":
+                tmp_perm = [int(idx) for idx in compile_opt['output_layout'].split(",")]
+                output = np.transpose(
+                    output, preprocess_utils.get_source_transpose_index(tmp_perm))
+        return output
 
     def send_msg(self, sock, msg):
         # Prefix each message with a 4-byte length (network byte order)

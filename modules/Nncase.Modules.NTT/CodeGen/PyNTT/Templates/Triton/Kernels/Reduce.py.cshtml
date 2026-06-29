@@ -1,0 +1,138 @@
+@using System.Text
+@model Nncase.CodeGen.PyNTT.PyNTTReduceTemplateModel
+@{
+    var inputShape = "(" + string.Join(", ", Model.InputShape) + (Model.InputShape.Length == 1 ? "," : string.Empty) + ")";
+    var outputShape = "(" + string.Join(", ", Model.OutputShape) + (Model.OutputShape.Length == 1 ? "," : string.Empty) + ")";
+    var axes = "(" + string.Join(", ", Model.Axes) + (Model.Axes.Length == 1 ? "," : string.Empty) + ")";
+    var rank = Model.OutputShape.Length;
+    var axisSet = Model.Axes.ToHashSet();
+
+    static string Indent(int level) => new(' ', level * 4);
+
+    static int SelectBlockAxis(long[] shape, long[] strides)
+    {
+        if (shape.Length == 0)
+        {
+            return 0;
+        }
+
+        for (var i = shape.Length - 1; i >= 0; i--)
+        {
+            if (shape[i] > 1 && strides[i] == 1)
+            {
+                return i;
+            }
+        }
+
+        for (var i = shape.Length - 1; i >= 0; i--)
+        {
+            if (shape[i] > 1)
+            {
+                return i;
+            }
+        }
+
+        return shape.Length - 1;
+    }
+
+    var blockAxis = SelectBlockAxis(Model.OutputShape, Model.OutputStrides);
+    var blockExtent = rank == 0 ? 1 : Model.OutputShape[blockAxis];
+    var loopAxes = Enumerable.Range(0, rank).Where(axis => axis != blockAxis).ToArray();
+
+    string AxisIndex(int axis) => axis == blockAxis ? "lane" : $"out_idx{axis}";
+
+    string OutputOffsetExpression()
+    {
+        var terms = new List<string>();
+        for (var i = 0; i < Model.OutputShape.Length; i++)
+        {
+            terms.Add($"{AxisIndex(i)} * {Model.OutputStrides[i]}");
+        }
+
+        return terms.Count == 0 ? "lane * 0" : $"lane * 0 + {string.Join(" + ", terms)}";
+    }
+
+    string InputBaseExpression()
+    {
+        var terms = new List<string>();
+        var outputIndex = 0;
+        for (var inputIndex = 0; inputIndex < Model.InputShape.Length; inputIndex++)
+        {
+            if (axisSet.Contains(inputIndex))
+            {
+                if (Model.KeepDims)
+                {
+                    outputIndex++;
+                }
+
+                continue;
+            }
+
+            terms.Add($"{AxisIndex(outputIndex)} * {Model.InputStrides[inputIndex]}");
+            outputIndex++;
+        }
+
+        return terms.Count == 0 ? "lane * 0" : $"lane * 0 + {string.Join(" + ", terms)}";
+    }
+
+    string ReduceOffsetExpression()
+    {
+        var terms = new List<string>();
+        foreach (var axis in Model.Axes)
+        {
+            terms.Add($"reduce_idx{axis} * {Model.InputStrides[axis]}");
+        }
+
+        return terms.Count == 0 ? "lane * 0" : string.Join(" + ", terms);
+    }
+
+    var body = new StringBuilder();
+    var indent = 1;
+    foreach (var axis in loopAxes)
+    {
+        body.AppendLine($"{Indent(indent)}out_idx{axis} = 0");
+        body.AppendLine($"{Indent(indent)}while out_idx{axis} < {Model.OutputShape[axis]}:");
+        indent++;
+    }
+
+    body.AppendLine($"{Indent(indent)}axis_start = 0");
+    body.AppendLine($"{Indent(indent)}while axis_start < {blockExtent}:");
+    body.AppendLine($"{Indent(indent + 1)}lane = axis_start + tl.arange(0, block_size)");
+    body.AppendLine($"{Indent(indent + 1)}mask = lane < {blockExtent}");
+    body.AppendLine($"{Indent(indent + 1)}input_base = {InputBaseExpression()}");
+    body.AppendLine($"{Indent(indent + 1)}output_offsets = {OutputOffsetExpression()}");
+    body.AppendLine($"{Indent(indent + 1)}acc = tl.full((block_size,), {Model.InitValue}, tl.float32)");
+    var reduceIndent = indent + 1;
+    foreach (var axis in Model.Axes)
+    {
+        body.AppendLine($"{Indent(reduceIndent)}reduce_idx{axis} = 0");
+        body.AppendLine($"{Indent(reduceIndent)}while reduce_idx{axis} < {Model.InputShape[axis]}:");
+        reduceIndent++;
+    }
+
+    body.AppendLine($"{Indent(reduceIndent)}value0 = tl.load(input0 + input_base + {ReduceOffsetExpression()}, mask=mask, other={Model.InitValue})");
+    body.AppendLine($"{Indent(reduceIndent)}acc = {Model.UpdateExpression}");
+    foreach (var axis in Model.Axes.Reverse())
+    {
+        body.AppendLine($"{Indent(reduceIndent)}reduce_idx{axis} += 1");
+        reduceIndent--;
+    }
+
+    body.AppendLine($"{Indent(indent + 1)}result = {Model.FinalizeExpression}");
+    body.AppendLine($"{Indent(indent + 1)}tl.store(output + output_offsets, result, mask=mask)");
+    body.AppendLine($"{Indent(indent + 1)}axis_start += block_size");
+
+    foreach (var axis in loopAxes.Reverse())
+    {
+        body.AppendLine($"{Indent(indent)}out_idx{axis} += 1");
+        indent--;
+    }
+}
+# generated from CodeGen/PyNTT/Templates/Triton/Kernels/Reduce.py.cshtml
+# @Model.Comment; op=@Model.ReduceOp, input_dtype=@Model.InputDType, output_dtype=@Model.OutputDType, input_shape=@inputShape, output_shape=@outputShape, axes=@axes
+@@triton.jit
+@($"def {Model.FunctionName}(data, rdata, thread_local_rdata, warp_local_rdata, block_local_rdata, block_size: tl.constexpr):")
+    shard_index = tl.program_id(0)
+    input0 = @Html.Raw(Model.Input.Expression)
+    output = @Html.Raw(Model.Output.Expression)
+@Html.Raw(body.ToString().TrimEnd())

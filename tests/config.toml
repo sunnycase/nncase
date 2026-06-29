@@ -139,6 +139,24 @@ Vectorize = true
 Hierarchies = [[1]]
 HierarchyNames = "t"
 
+[target.pyntt]
+eval = false
+infer = false
+similarity_name = 'cosine'
+
+[target.pyntt.mode.noptq]
+enabled = true
+threshold = 0.999
+
+[target.pyntt.mode.ptq]
+enabled = false
+threshold = 0.98
+
+[target.pyntt.target_options]
+Vectorize = false
+Hierarchies = [[1]]
+HierarchyNames = "b"
+
 [target.cuda]
 eval = false
 infer = true
