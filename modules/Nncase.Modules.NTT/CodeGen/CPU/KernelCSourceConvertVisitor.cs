@@ -635,17 +635,20 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
                 }
             }
 
-            var threadLocalDataName = dataBufferName is null
-                ? "thread_local_data"
-                : $"(std::byte *){dataBufferName}.buffer().data()";
-            var warpLocalDataName = warpLocalDataBufferName is null
-                ? "warp_local_data"
-                : $"(std::byte *){warpLocalDataBufferName}.buffer().data()";
-            var blockLocalDataName = blockLocalDataBufferName is null
-                ? "block_local_data"
-                : $"(std::byte *){blockLocalDataBufferName}.buffer().data()";
-            argumentNames.Add(
-                $"rdata, thread_local_rdata, warp_local_rdata, block_local_rdata, {threadLocalDataName}, {warpLocalDataName}, {blockLocalDataName}, output, output_descs");
+            if (!deviceFunc.Name.StartsWith("device_func"))
+            {
+                var threadLocalDataName = dataBufferName is null
+                    ? "thread_local_data"
+                    : $"(std::byte *){dataBufferName}.buffer().data()";
+                var warpLocalDataName = warpLocalDataBufferName is null
+                    ? "warp_local_data"
+                    : $"(std::byte *){warpLocalDataBufferName}.buffer().data()";
+                var blockLocalDataName = blockLocalDataBufferName is null
+                    ? "block_local_data"
+                    : $"(std::byte *){blockLocalDataBufferName}.buffer().data()";
+                argumentNames.Add(
+                    $"rdata, thread_local_rdata, warp_local_rdata, block_local_rdata, {threadLocalDataName}, {warpLocalDataName}, {blockLocalDataName}, output, output_descs");
+            }
 
             _refFuncs.Add(deviceFunc);
             WriteIndWithProfiler($"{deviceFunc.Name}({string.Join(", ", argumentNames)});\n");
