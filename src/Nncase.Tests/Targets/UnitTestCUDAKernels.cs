@@ -341,7 +341,7 @@ public sealed class UnitTestCUDAKernels : TestClassBase
             var newsbp = ndsbp.ToArray();
             foreach (var axis in comb)
             {
-                newsbp[axis] = SBP.P();
+                newsbp[axis] = SBP.P([axis]);
             }
 
             var partial = IR.F.Distributed.ForceBoxing(broadcast, new DistributedType(inputType, newsbp, placement));
@@ -1028,7 +1028,7 @@ public sealed class UnitTestCUDAKernels : TestClassBase
             Metadata = new() { Range = new(1, MathUtility.AlignUp(queryLens.Sum(), 128)) },
         };
 
-        var fixture = new PagedAttentionKVCacheTestFixture(queryLens, seqLens, 2, 2, 64, 64, (int)MathUtility.CeilDiv(seqLens.Select(seq_len => MathUtility.CeilDiv(seq_len, 64)).Sum(), hierarchy.Max()) * hierarchy.Max(), Runtime.TypeCode.Float32, 1, [PagedKVCacheDimKind.NumBlocks, PagedKVCacheDimKind.NumLayers, PagedKVCacheDimKind.KV, PagedKVCacheDimKind.NumKVHeads, PagedKVCacheDimKind.HeadDim, PagedKVCacheDimKind.BlockSize], [PagedKVCacheDimKind.HeadDim], [PagedKVCacheDimKind.NumBlocks], [SBP.S(0)], [AttentionDimKind.Seq, AttentionDimKind.Dim, AttentionDimKind.Head], [AttentionDimKind.Seq, AttentionDimKind.Dim, AttentionDimKind.Head]);
+        var fixture = new PagedAttentionKVCacheTestFixture(queryLens, seqLens, 2, 2, 64, 64, (int)MathUtility.CeilDiv(seqLens.Select(seq_len => MathUtility.CeilDiv(seq_len, 64)).Sum(), hierarchy.Max()) * hierarchy.Max(), Runtime.TypeCode.Float32, 1, [PagedKVCacheDimKind.NumBlocks, PagedKVCacheDimKind.NumLayers, PagedKVCacheDimKind.KV, PagedKVCacheDimKind.NumKVHeads, PagedKVCacheDimKind.HeadDim, PagedKVCacheDimKind.BlockSize], [PagedKVCacheDimKind.HeadDim], [PagedKVCacheDimKind.NumBlocks], [SBP.S([0])], [AttentionDimKind.Seq, AttentionDimKind.Dim, AttentionDimKind.Head], [AttentionDimKind.Seq, AttentionDimKind.Dim, AttentionDimKind.Head]);
 
         var placement = new Placement(hierarchy, targetOptions.HierarchyNames);
         var dataGeneratorOptions = new PagedAttentionKVCacheTestFixture.DataGeneratorOptions(Random: true, IncreaseBy: [AttentionDimKind.Head], ResetForKV: true);
