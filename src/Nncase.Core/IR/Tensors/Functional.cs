@@ -104,7 +104,7 @@ public static class Tensors
     public static Call Range(Expr begin, Expr end, Expr step) => new Call(new Range(), begin, end, step);
 
     public static Call Reduce(ReduceOp reduceOp, Expr input, Shape axes, Expr initValue, Expr keepDims) =>
-        new Call(new Reduce(reduceOp), input, axes, initValue, keepDims);
+        new Call(new Reduce(reduceOp), input, NormalizeReduceAxes(input, axes), initValue, keepDims);
 
     public static Call ReduceArg(ReduceArgOp reduceArgOp, DataType destType, Expr input, Dimension axis, Expr keepDims, Expr selectLastIndex) =>
         new Call(new ReduceArg(reduceArgOp, destType), input, axis, keepDims, selectLastIndex);
@@ -218,4 +218,23 @@ public static class Tensors
     }
 
     public static Call LocalShardDim(Dimension dim, SBP axisPolicy, Placement placement) => new Call(new LocalShardDim(axisPolicy, placement), dim);
+
+    private static Shape NormalizeReduceAxes(Expr input, Shape axes)
+    {
+        var inputShape = input.RawCheckedType switch
+        {
+            TensorType type => type.Shape,
+            DistributedType type => type.TensorType.Shape,
+            _ => null,
+        };
+
+        if (inputShape is not { IsRanked: true } || !axes.IsFixed)
+        {
+            return axes;
+        }
+
+        var rank = inputShape.Rank;
+        var normalizedAxes = axes.Select(axis => axis.FixedValue < 0 ? axis + rank : axis).ToArray();
+        return normalizedAxes.SequenceEqual(axes) ? axes : new RankedShape(normalizedAxes);
+    }
 }
