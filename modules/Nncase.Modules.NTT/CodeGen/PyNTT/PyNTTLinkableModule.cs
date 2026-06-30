@@ -16,8 +16,6 @@ namespace Nncase.CodeGen.PyNTT;
 
 internal sealed class PyNTTLinkableModule : ILinkableModule
 {
-    private const int SplitLaunchHelperThreshold = 64;
-
     private readonly string _moduleKind;
     private readonly IReadOnlyList<PyNTTLinkableFunction> _functions;
     private readonly CompileOptions _compileOptions;
@@ -690,15 +688,8 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
         }
 
         var kwargs = launchKwargs.Count == 0 ? string.Empty : $", {string.Join(", ", launchKwargs)}";
-        var helperCalls = GetHelperKernelCalls(kernel);
-        var requiresSplitLaunch = kernel.Attrs.TryGetValue("requires_split_launch", out var splitValue) && splitValue is bool splitBool && splitBool;
-        var useSplitLaunch = isTir && (requiresSplitLaunch || helperCalls.Length > SplitLaunchHelperThreshold);
-        var importStatement = useSplitLaunch
-            ? "from . import generated_kernels as _generated_kernels"
-            : $"from .generated_kernels import {kernel.Name}";
-        var launchStatement = useSplitLaunch
-            ? BuildSplitHelperLaunchPython(helperCalls, kernel, parameterNames, outputNames, kvCacheFieldInputs, workspaceArgs, runtimeShapeArgs, kwargs)
-            : $"        {kernel.Name}[grid]({tensorArgs}, numel, block_size{kwargs})";
+        var importStatement = $"from .generated_kernels import {kernel.Name}";
+        var launchStatement = $"        {kernel.Name}[grid]({tensorArgs}, numel, block_size{kwargs})";
         return $"""
                     {importStatement}
                     numel = {numel}
@@ -708,56 +699,6 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
             {launchStatement}
             {outputAliases}
             """;
-    }
-
-    private string BuildSplitHelperLaunchPython(
-        IReadOnlyList<HelperKernelCallMetadata> helperCalls,
-        GeneratedKernelMetadata kernel,
-        string[] parameterNames,
-        string[] outputNames,
-        IReadOnlyDictionary<string, PyNTTKVCacheFieldInputMetadata> kvCacheFieldInputs,
-        IReadOnlyList<string> workspaceArgs,
-        IReadOnlyList<string> runtimeShapeArgs,
-        string kwargs)
-    {
-        var inputVariableExpressions = kernel.Inputs
-            .Select((name, index) => (Variable: $"input{index}", Expression: BuildKernelInputExpression(name, parameterNames, kvCacheFieldInputs)))
-            .ToDictionary(pair => pair.Variable, pair => pair.Expression, StringComparer.Ordinal);
-        var outputVariableExpressions = kernel.Outputs
-            .Select((name, index) => (Variable: $"output{index}", Expression: $"outputs[{FindIndex(outputNames, name, "output")}]"))
-            .ToDictionary(pair => pair.Variable, pair => pair.Expression, StringComparer.Ordinal);
-
-        return string.Join(
-            Environment.NewLine,
-            helperCalls.Select(call =>
-            {
-                var leadingArgs = call.Arguments.Select(arg => ResolveHelperArgumentExpression(arg, inputVariableExpressions, outputVariableExpressions));
-                var args = string.Join(", ", leadingArgs.Concat(workspaceArgs).Concat(runtimeShapeArgs).Concat(new[] { "block_size" }));
-                return $"        _generated_kernels.{call.Name}[grid]({args}{kwargs})";
-            }));
-    }
-
-    private static string ResolveHelperArgumentExpression(
-        string argument,
-        IReadOnlyDictionary<string, string> inputVariableExpressions,
-        IReadOnlyDictionary<string, string> outputVariableExpressions)
-    {
-        if (argument.StartsWith("py:", StringComparison.Ordinal))
-        {
-            return argument[3..];
-        }
-
-        if (inputVariableExpressions.TryGetValue(argument, out var inputExpression))
-        {
-            return inputExpression;
-        }
-
-        if (outputVariableExpressions.TryGetValue(argument, out var outputExpression))
-        {
-            return outputExpression;
-        }
-
-        throw new NotSupportedException($"Generated PyNTT helper references unknown top-kernel argument {argument}.");
     }
 
     private string BuildKernelInputExpression(string name, string[] parameterNames, IReadOnlyDictionary<string, PyNTTKVCacheFieldInputMetadata> kvCacheFieldInputs)
@@ -823,10 +764,20 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
                 """;
         }
 
+        var imports = new List<string>
+        {
+            "import triton",
+            "import triton.language as tl",
+        };
+        if (kernelSources.Any(source => source.Contains("tle.distributed_barrier()", StringComparison.Ordinal)))
+        {
+            imports.Add("import triton.experimental.tle.language as tle");
+        }
+
+        imports.Add("from triton.language.extra import libdevice");
+        var importSource = string.Join(Environment.NewLine, imports);
         return $$"""
-            import triton
-            import triton.language as tl
-            from triton.language.extra import libdevice
+            {{importSource}}
 
 
             {{string.Join(Environment.NewLine + Environment.NewLine, kernelSources)}}
@@ -970,11 +921,6 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
         => kernel.Attrs.TryGetValue("kv_cache_field_inputs", out var value) && value is PyNTTKVCacheFieldInputMetadata[] args
             ? args
             : Array.Empty<PyNTTKVCacheFieldInputMetadata>();
-
-    private static HelperKernelCallMetadata[] GetHelperKernelCalls(GeneratedKernelMetadata kernel)
-        => kernel.Attrs.TryGetValue("helper_calls", out var value) && value is HelperKernelCallMetadata[] args
-            ? args
-            : Array.Empty<HelperKernelCallMetadata>();
 
     private static string SanitizePythonIdentifier(string value)
     {

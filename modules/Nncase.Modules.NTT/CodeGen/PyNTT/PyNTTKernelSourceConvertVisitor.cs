@@ -90,6 +90,12 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
 #pragma warning disable SA1201
     private sealed class PyNTTPrimFunctionSourceVisitor : ExprFunctor<Unit, Unit>
     {
+        private enum HelperBarrierKind
+        {
+            Cta,
+            Grid,
+        }
+
         private static readonly string[] WorkspaceParameterNames = { "data", "rdata", "thread_local_rdata", "warp_local_rdata", "block_local_rdata" };
 
         private readonly PrimFunction _function;
@@ -651,7 +657,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
 
             _attrs["op"] = "reshard";
             _attrs["tir"] = true;
-            _attrs["requires_split_launch"] = true;
+            _attrs["requires_grid_barrier"] = true;
             _attrs["dtype"] = outputScalarDType;
             _attrs["shape"] = globalShape;
             var helperName = GetNextHelperName("reshard");
@@ -682,6 +688,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     GetSplitAxes(gatherReduceScatter.InType),
                     GetSplitAxes(gatherReduceScatter.OutType),
                     $"{input.Name} -> {output.Name}"));
+            WriteBarrier(HelperBarrierKind.Grid);
             WriteLine(BuildHelperCall(helperName));
         }
 
@@ -1660,8 +1667,9 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 }
             }
 
-            WriteShardReduceHelper(output, reduceAxes, outputVectorLaneCount, outputScalarDType, hierarchy, broadcast: false, $"{comment}: reduce");
-            WriteShardReduceHelper(output, reduceAxes, outputVectorLaneCount, outputScalarDType, hierarchy, broadcast: true, $"{comment}: broadcast");
+            WriteBarrier(HelperBarrierKind.Grid);
+            WriteShardReduceHelper(output, reduceAxes, outputVectorLaneCount, outputScalarDType, hierarchy, false, HelperBarrierKind.Grid, $"{comment}: reduce");
+            WriteShardReduceHelper(output, reduceAxes, outputVectorLaneCount, outputScalarDType, hierarchy, true, HelperBarrierKind.Cta, $"{comment}: broadcast");
         }
 
         private void WriteShardReduceHelper(
@@ -1671,6 +1679,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             string scalarDType,
             int[] hierarchy,
             bool broadcast,
+            HelperBarrierKind postBarrier,
             string comment)
         {
             var bufferRef = ResolveBufferRef(buffer);
@@ -1712,11 +1721,13 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                         comment));
             }
 
-            WriteLine(BuildHelperCall(
-                helperName,
-                BuildRawPythonArgument(bufferRef.PoolBytes.ToString(CultureInfo.InvariantCulture)),
-                BuildRawPythonArgument(bufferRef.OffsetBytes.ToString(CultureInfo.InvariantCulture)),
-                BuildRawPythonArgument(bufferRef.OffsetBytes.ToString(CultureInfo.InvariantCulture))));
+            WriteLine(
+                BuildHelperCall(
+                    helperName,
+                    BuildRawPythonArgument(bufferRef.PoolBytes.ToString(CultureInfo.InvariantCulture)),
+                    BuildRawPythonArgument(bufferRef.OffsetBytes.ToString(CultureInfo.InvariantCulture)),
+                    BuildRawPythonArgument(bufferRef.OffsetBytes.ToString(CultureInfo.InvariantCulture))),
+                postBarrier);
         }
 
         private void VisitReduce(Nncase.TIR.NTT.Reduce reduce, IReadOnlyList<BaseExpr> args)
@@ -2686,12 +2697,22 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             _body.AppendLine(line);
         }
 
-        private void WriteLine(string line)
+        private void WriteLine(string line, HelperBarrierKind barrierKind = HelperBarrierKind.Cta)
         {
             _body.Append(new string(' ', _bodyIndent * 4));
             _body.AppendLine(line);
+            WriteBarrier(barrierKind);
+        }
+
+        private void WriteBarrier(HelperBarrierKind barrierKind)
+        {
             _body.Append(new string(' ', _bodyIndent * 4));
-            _body.AppendLine("tl.debug_barrier()");
+            _body.AppendLine(barrierKind switch
+            {
+                HelperBarrierKind.Cta => "tl.debug_barrier()",
+                HelperBarrierKind.Grid => "tle.distributed_barrier()",
+                _ => throw new ArgumentOutOfRangeException(nameof(barrierKind), barrierKind, null),
+            });
         }
 
         private void WriteHelperTemplate(string templatePath, object model)

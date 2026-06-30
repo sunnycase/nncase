@@ -158,6 +158,7 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         Assert.Contains("def main_prim_elementwise_binary_0(data, rdata, thread_local_rdata, warp_local_rdata, block_local_rdata, block_size: tl.constexpr):", generatedKernelsPy, StringComparison.Ordinal);
         Assert.Contains("def main_prim_tensor_store_0(destination, data, rdata, thread_local_rdata, warp_local_rdata, block_local_rdata, block_size: tl.constexpr):", generatedKernelsPy, StringComparison.Ordinal);
         Assert.Contains("main_prim_tensor_load_0(input0, data, rdata, thread_local_rdata, warp_local_rdata, block_local_rdata, block_size)", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("tl.debug_barrier()", generatedKernelsPy, StringComparison.Ordinal);
         Assert.Contains("main_prim_tensor_load_1(input1, data, rdata, thread_local_rdata, warp_local_rdata, block_local_rdata, block_size)", generatedKernelsPy, StringComparison.Ordinal);
         Assert.Contains("main_prim_elementwise_binary_0(data, rdata, thread_local_rdata, warp_local_rdata, block_local_rdata, block_size)", generatedKernelsPy, StringComparison.Ordinal);
         Assert.Contains("main_prim_tensor_store_0(output0, data, rdata, thread_local_rdata, warp_local_rdata, block_local_rdata, block_size)", generatedKernelsPy, StringComparison.Ordinal);
@@ -174,6 +175,7 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         Assert.DoesNotContain("elementwise_binary(input0, input1, output0", generatedKernelsPy, StringComparison.Ordinal);
         Assert.DoesNotContain("make_data_tensor_view", generatedKernelsPy, StringComparison.Ordinal);
         Assert.DoesNotContain("elementwise_binary_tensor", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.DoesNotContain("tle.distributed_barrier()", generatedKernelsPy, StringComparison.Ordinal);
 
         var rdataPy = File.ReadAllText(Path.Join(outputDirectory, "rdata.py"));
         Assert.Contains("RDATA_BUNDLES", rdataPy, StringComparison.Ordinal);
@@ -185,6 +187,10 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
 
         var modelPy = File.ReadAllText(Path.Join(outputDirectory, "model.py"));
         Assert.Contains("grid = (32,)", modelPy, StringComparison.Ordinal);
+        Assert.Contains("from .generated_kernels import main_prim_binary_0", modelPy, StringComparison.Ordinal);
+        Assert.Contains("main_prim_binary_0[grid](", modelPy, StringComparison.Ordinal);
+        Assert.DoesNotContain("from . import generated_kernels as _generated_kernels", modelPy, StringComparison.Ordinal);
+        Assert.DoesNotContain("_generated_kernels.", modelPy, StringComparison.Ordinal);
         Assert.Contains("rdata_bundle = RDATA_BUNDLES[\"main_prim\"]", modelPy, StringComparison.Ordinal);
         Assert.Contains("data = allocate_workspace(inputs, ", modelPy, StringComparison.Ordinal);
         Assert.Contains("rdata = materialize_rdata(inputs, rdata_bundle[\"rdata\"], rdata_bundle[\"rdata_bytes\"])", modelPy, StringComparison.Ordinal);
