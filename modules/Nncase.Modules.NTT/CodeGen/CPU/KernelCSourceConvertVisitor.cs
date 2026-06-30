@@ -14,11 +14,13 @@ using DryIoc.ImTools;
 using NetFabric.Hyperlinq;
 using Nncase.CodeGen.NTT;
 using Nncase.IR;
+using Nncase.Layouts;
 using Nncase.Runtime;
 using Nncase.Targets;
 using Nncase.TIR;
 using Nncase.Utilities;
 using Razor.Templating.Core;
+using Lutil = Nncase.Layouts.LayoutUtilities;
 
 namespace Nncase.CodeGen.NTT;
 
@@ -399,18 +401,12 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
                     break;
                 case TIR.NTT.Matmul matmul:
                     {
-                        var dimInfo = IR.NTT.VectorizedMatMul.GetDimInfo(matmul.TransposeA, matmul.TransposeB, args[0].CheckedShape.Rank, args[1].CheckedShape.Rank);
                         WriteWithProfiler(
                             RazorTemplateEngine.RenderAsync("~/CodeGen/CPU/Templates/Kernels/Matmul.cshtml", new TypedKernelTemplateModel<TIR.NTT.Matmul>(matmul)
                             {
                                 Arguments = args.Select(x => new KernelArgument { Symbol = VisitBuffer(x, local: true) }).ToArray(),
                             }).Result,
                             "matmul");
-                        if (args[0] is TIR.Buffer a && a.DistributedType?.AxisPolicies[dimInfo.Lk] is SBPSplit s)
-                        {
-                            var reduceKind = "tar::reduce_kind::" + string.Join("_", Enumerable.Range(0, TargetOptions.HierarchyNames.Length).Select(i => (s.Axes.Contains(i) ? "r" : string.Empty) + TargetOptions.HierarchyNames[i]));
-                            WriteIndWithProfiler($"tac::tensor_reduce_sync<reduce_op::{ReduceOp.Sum.ToC()}, {reduceKind}>({VisitBuffer(args[2], local: true).Name}, {VisitBuffer(args[2], local: true).Name});\n");
-                        }
                     }
 
                     break;
@@ -426,18 +422,12 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
                     break;
                 case TIR.NTT.PackedMatMul matmul:
                     {
-                        var dimInfo = IR.NTT.VectorizedMatMul.GetDimInfo(false, true, args[0].CheckedShape.Rank, args[1].CheckedShape.Rank);
                         WriteWithProfiler(
                             RazorTemplateEngine.RenderAsync("~/CodeGen/CPU/Templates/Kernels/PackedMatMul.cshtml", new TypedKernelTemplateModel<TIR.NTT.PackedMatMul>(matmul)
                             {
                                 Arguments = args.Select(x => new KernelArgument { Symbol = VisitBuffer(x, local: true) }).ToArray(),
                             }).Result,
                             "packed_matmul");
-                        if (args[0] is TIR.Buffer a && a.DistributedType?.AxisPolicies[dimInfo.Lk] is SBPSplit s)
-                        {
-                            var reduceKind = "tar::reduce_kind::" + string.Join("_", Enumerable.Range(0, TargetOptions.HierarchyNames.Length).Select(i => (s.Axes.Contains(i) ? "r" : string.Empty) + TargetOptions.HierarchyNames[i]));
-                            WriteIndWithProfiler($"tac::tensor_reduce_sync<reduce_op::{ReduceOp.Sum.ToC()}, {reduceKind}>({VisitBuffer(args[2], local: true).Name}, {VisitBuffer(args[2], local: true).Name});\n");
-                        }
                     }
 
                     break;
@@ -447,11 +437,6 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
                 case TIR.NTT.Gather gather:
                     {
                         WriteWithProfiler($"gather({VisitBuffer(args[0], local: false).Name}, {VisitBuffer(args[1], local: true).Name}, {VisitBuffer(args[2], local: true).Name}, {gather.Axis}_dim);\n");
-                        if (args[0] is TIR.Buffer b && b.DistributedType?.AxisPolicies[gather.Axis] is SBPSplit s)
-                        {
-                            var reduceKind = "tar::reduce_kind::" + string.Join("_", Enumerable.Range(0, TargetOptions.HierarchyNames.Length).Select(i => (s.Axes.Contains(i) ? "r" : string.Empty) + TargetOptions.HierarchyNames[i]));
-                            WriteIndWithProfiler($"tac::tensor_reduce_sync<reduce_op::{ReduceOp.Sum.ToC()}, {reduceKind}>({VisitBuffer(args[2], local: true).Name}, {VisitBuffer(args[2], local: true).Name});\n");
-                        }
                     }
 
                     break;
@@ -532,18 +517,87 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
                     break;
                 case TIR.NTT.GatherReduceScatter grs:
                     {
-                        if (grs.InType.AxisPolicies.Any(s => s is SBPPartial))
+                        if (grs.InType.Partial is not null)
                         {
-                            // deprecated
-                            var sbpPartial = (SBPPartial)grs.InType.AxisPolicies.Where(s => s is SBPPartial).Distinct().First();
-                            var reduceKind = "tar::reduce_kind::" + string.Join("_", grs.InType.AxisPolicies.Select((s, i) => (s is SBPPartial ? "r" : string.Empty) + TargetOptions.HierarchyNames[i]));
-                            WriteIndWithProfiler($"tac::tensor_reduce_sync<reduce_op::{sbpPartial.Op.ToC()}, {reduceKind}>({VisitBuffer(args[0], local: true).Name}, {VisitBuffer(args[1], local: true).Name});\n");
+                            var sbpPartial = grs.InType.Partial;
+                            var reduceKind = "tar::reduce_kind::" + string.Join("_", Enumerable.Range(0, TargetOptions.HierarchyNames.Length).Select(i => (sbpPartial.Axes.Contains(i) ? "r" : string.Empty) + TargetOptions.HierarchyNames[i]));
+                            WriteIndWithProfiler($"tac::tensor_reduce_sync<reduce_op::{sbpPartial.Op.ToC()}, {reduceKind}>({VisitBuffer(args[0], local: false).Name}, {VisitBuffer(args[1], local: false).Name});\n");
                         }
                         else
                         {
-                            (var maxSize, _) = TensorUtilities.GetTensorMaxSizeAndStrides(args[0].CheckedTensorType);
-                            CollectivePoolSize = Math.Max(CollectivePoolSize, (ulong)maxSize);
-                            WriteWithProfiler($"reshard({VisitBuffer(args[0], local: false).Name}, {VisitBuffer(args[1], local: false).Name});\n");
+                            if (grs.InType.TensorType.Shape.All(dim => dim.IsFixed) &&
+                                grs.OutType.TensorType.Shape.All(dim => dim.IsFixed) &&
+                                !grs.OutType.AxisPolicies.All(p => p is SBPBroadCast) &&
+                                grs.InType.TensorType.Shape == grs.OutType.TensorType.Shape)
+                            {
+                                IndentScope.Writer.IndWrite("{\n");
+                                IndentScope.Writer.Indent++;
+                                var srcBuffer = VisitBuffer(args[0], local: false);
+                                var destBuffer = VisitBuffer(args[1], local: false);
+                                IndentScope.Writer.IndWrite("using T = decltype(" + srcBuffer.Name + ");\n");
+                                IndentScope.Writer.IndWrite("using mesh_type = typename T::mesh_type;\n");
+                                IndentScope.Writer.IndWrite("auto pids = mesh_type::local_index();\n");
+                                IndentScope.Writer.IndWrite("distributed::topology_synchronize();\n");
+                                int[] GetSplitTopoAxes(IRArray<SBP> axisPolicies)
+                                {
+                                    return axisPolicies.OfType<SBPSplit>().Select(x => x.Axes).SelectMany(x => x).ToArray();
+                                }
+
+                                var srcType = grs.InType;
+                                var destType = grs.OutType;
+                                var srcLayout = Layout.From(srcType);
+                                var destLayout = Layout.From(destType);
+                                var primTile = Lutil.Minimum(srcLayout[1].Shape, destLayout[1].Shape);
+                                var primTileInts = Lutil.Flatten(primTile).Elements.OfType<IntValue>().Select(x => x.Value).ToArray();
+                                var placement = srcType.Placement;
+                                var srcSplitTopoAxes = GetSplitTopoAxes(srcType.AxisPolicies);
+                                var destSplitTopoAxes = GetSplitTopoAxes(destType.AxisPolicies);
+                                foreach (var destSplitPids in destSplitTopoAxes.Select(axis => placement.Hierarchy[axis]).Select(x => LinqUtility.Range<long>(0, x)).CartesianProduct().Select(x => x.ToArray()))
+                                {
+                                    IndentScope.Writer.IndWrite($"if ({string.Join(" and ", destSplitTopoAxes.Select((aixs, i) => $"pids[{aixs}] == {destSplitPids[i]}"))}){{\n");
+
+                                    var destLayoutLocal = new Layout(destLayout[1].Shape);
+                                    var destLayoutLocalTiled = Lutil.ZippedDivide(destLayoutLocal, primTile); // [(minTile), (times)]
+                                    var destPrimTimes = destLayoutLocalTiled[1];
+                                    for (int i = 0; i < (int)destPrimTimes.Size(); i++)
+                                    {
+                                        var destCoordLocalTiled = new CollectValue([RecursiveValue.UnderScore, Lutil.Idx2Crd(i, destPrimTimes.Shape)]);
+                                        var destOffsetLocalTiled = destLayoutLocalTiled.Invoke(destCoordLocalTiled);
+                                        var destCoordLocal = destLayoutLocal.HierCoord(destOffsetLocalTiled);
+
+                                        CollectValue destCoord = [new CollectValue(destSplitPids.Select(x => new IntValue(x))), destCoordLocal];
+                                        var destOffest = destLayout.Invoke(destCoord);
+                                        var srcCoord = Lutil.Idx2Crd(destOffest, srcLayout.Shape, srcLayout.Stride); // src rank with src start
+
+                                        var srcCoordFlattened = Lutil.Flatten(srcCoord).Elements.OfType<IntValue>().Select(x => x.Value).ToArray();
+
+                                        var srcSplitPids = srcCoordFlattened[..srcSplitTopoAxes.Length];
+                                        var srcCoordLocal = srcCoordFlattened[srcSplitTopoAxes.Length..];
+
+                                        var srcShardIndexStr = string.Join(",", Enumerable.Range(0, placement.Rank).Select(i => srcSplitTopoAxes.IndexOf(i) switch { -1 => $"pids[{i}]", var j => $"{srcSplitPids[j]}" }));
+                                        IndentScope.Writer.IndWrite($"auto src_local_{i} = {srcBuffer.Name}.remote(make_shape({srcShardIndexStr}));\n");
+                                        var srcLocalTileStartStr = string.Join(", ", srcCoordLocal);
+                                        var tileShapeStr = string.Join(", ", primTileInts);
+                                        IndentScope.Writer.IndWrite($"auto src_local_tile_{i} = src_local_{i}.view(make_shape({srcLocalTileStartStr}), make_shape({tileShapeStr}));\n");
+                                        var destLocalTileStartStr = string.Join(", ", Lutil.Flatten(destCoordLocal).Elements.OfType<IntValue>().Select(x => x.Value).ToArray());
+                                        IndentScope.Writer.IndWrite($"auto dest_local_tile_{i} = {destBuffer.Name}.local().view(make_shape({destLocalTileStartStr}), make_shape({tileShapeStr}));\n");
+                                        IndentScope.Writer.IndWrite($"tensor_copy_sync(src_local_tile_{i}, dest_local_tile_{i});\n");
+                                    }
+
+                                    IndentScope.Writer.IndWrite("}\n");
+                                }
+
+                                IndentScope.Writer.Indent--;
+                                IndentScope.Writer.IndWrite("distributed::topology_synchronize();\n");
+                                IndentScope.Writer.IndWrite("}\n");
+                            }
+                            else
+                            {
+                                // todo using isl.
+                                (var maxSize, _) = TensorUtilities.GetTensorMaxSizeAndStrides(args[0].CheckedTensorType);
+                                CollectivePoolSize = Math.Max(CollectivePoolSize, (ulong)maxSize);
+                                WriteWithProfiler($"reshard({VisitBuffer(args[0], local: false).Name}, {VisitBuffer(args[1], local: false).Name});\n");
+                            }
                         }
                     }
 
