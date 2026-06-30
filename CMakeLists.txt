@@ -58,6 +58,7 @@ if(ENABLE_CUDA_RUNTIME)
         set(CMAKE_CUDA_ARCHITECTURES 120)
     endif()
     enable_language(CUDA)
+    find_package(CUDAToolkit REQUIRED)
 endif()
 
 if (BUILDING_RUNTIME)
