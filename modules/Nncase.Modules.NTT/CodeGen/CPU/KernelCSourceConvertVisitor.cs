@@ -232,7 +232,7 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
         var dimensionStr = $"shape_t<{StringUtility.Join(", ", dimensionTypes)}>";
         var strideStr = $"strides_t<{StringUtility.Join(", ", strideTypes)}>";
 
-        var type = expr.MemSpan.Buffer.Location is MemoryLocation.Rdata or MemoryLocation.ThreadLocalRdata or MemoryLocation.BlockLocalRdata || expr.MemSpan.Buffer.Start is TensorConst
+        var type = expr.MemSpan.Buffer.Location is MemoryLocation.Rdata or MemoryLocation.ThreadLocalRdata or MemoryLocation.WarpLocalRdata or MemoryLocation.BlockLocalRdata || expr.MemSpan.Buffer.Start is TensorConst
             ? (expr.DistributedType == null
              ? $"tensor_view<{dtypeStr}, {dimensionStr}, {strideStr}> "
              : $"sharded_tensor_view<{dtypeStr}, {dimensionStr}, {KernelUtility.ShardingToC(expr.DistributedType)}, {strideStr}> ")
@@ -635,17 +635,17 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
                 }
             }
 
-            if (dataBufferName is not null)
-            {
-                var warpLocalDataName = warpLocalDataBufferName is null
-                    ? "warp_local_data"
-                    : $"(std::byte *){warpLocalDataBufferName}.buffer().data()";
-                var blockLocalDataName = blockLocalDataBufferName is null
-                    ? "block_local_data"
-                    : $"(std::byte *){blockLocalDataBufferName}.buffer().data()";
-                argumentNames.Add(
-                    $"rdata, thread_local_rdata, warp_local_rdata, block_local_rdata, (std::byte *){dataBufferName}.buffer().data(), {warpLocalDataName}, {blockLocalDataName}, output, output_descs");
-            }
+            var threadLocalDataName = dataBufferName is null
+                ? "thread_local_data"
+                : $"(std::byte *){dataBufferName}.buffer().data()";
+            var warpLocalDataName = warpLocalDataBufferName is null
+                ? "warp_local_data"
+                : $"(std::byte *){warpLocalDataBufferName}.buffer().data()";
+            var blockLocalDataName = blockLocalDataBufferName is null
+                ? "block_local_data"
+                : $"(std::byte *){blockLocalDataBufferName}.buffer().data()";
+            argumentNames.Add(
+                $"rdata, thread_local_rdata, warp_local_rdata, block_local_rdata, {threadLocalDataName}, {warpLocalDataName}, {blockLocalDataName}, output, output_descs");
 
             _refFuncs.Add(deviceFunc);
             WriteIndWithProfiler($"{deviceFunc.Name}({string.Join(", ", argumentNames)});\n");

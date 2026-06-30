@@ -87,19 +87,8 @@ namespace Nncase.Importer
         private RankedShape GetAxesAttribute(NodeProto n, Expr input)
         {
             return GetOptionIntsAttribute(n, "axes")
-                .Map(x => new RankedShape(NormalizeAxes(x, input)))
+                .Map(x => new RankedShape(x))
                 .Or(ComputeDefaultAxes(input));
-        }
-
-        private long[] NormalizeAxes(long[] axes, Expr input)
-        {
-            if (!input.CheckedShape.IsRanked)
-            {
-                return axes;
-            }
-
-            var rank = input.CheckedShape.Rank;
-            return axes.Select(axis => axis < 0 ? axis + rank : axis).ToArray();
         }
 
         private long[] GetIntsAttribute(NodeProto n, string attr)

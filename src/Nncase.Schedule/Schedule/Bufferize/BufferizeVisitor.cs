@@ -82,19 +82,35 @@ public sealed class BufferizeVisitor : ExprRewriter
                 throw new InvalidOperationException($"Function {func.Name} is not scheduled, please run BufferizePass first.");
             }
 
-            T.CreateBuffer(new TensorType(DataTypes.UInt8, [(long)func.SchedResult.DataUsage]), MemoryLocation.Data, out var dataBuffer, $"data_{_dataBufferId++}");
-            var dataVar = new Var("data", TensorType.Scalar(new PointerType(DataTypes.UInt8)));
+            var funcParams = func.Parameters.ToArray().ToList();
+            var funcArgs = expr.Arguments.ToArray().ToList();
 
-            T.CreateBuffer(new TensorType(DataTypes.UInt8, [(long)func.SchedResult.WarpLocalDataPoolSize]), MemoryLocation.WarpLocalData, out var warpLocalDataBuffer, $"warp_local_data_{_dataBufferId++}");
-            var warpLocalDataVar = new Var("warp_local_data", TensorType.Scalar(new PointerType(DataTypes.UInt8)));
+            if (func.SchedResult.DataUsage > 0)
+            {
+                T.CreateBuffer(new TensorType(DataTypes.UInt8, [(long)func.SchedResult.DataUsage]), MemoryLocation.Data, out var dataBuffer, $"data_{_dataBufferId++}");
+                var dataVar = new Var("data", TensorType.Scalar(new PointerType(DataTypes.UInt8)));
+                funcParams.Add(dataVar);
+                funcArgs.Add(dataBuffer);
+            }
 
-            T.CreateBuffer(new TensorType(DataTypes.UInt8, [(long)func.SchedResult.BlockLocalDataPoolSize]), MemoryLocation.BlockLocalData, out var blockLocalDataBuffer, $"block_local_data_{_dataBufferId++}");
-            var blockLocalDataVar = new Var("block_local_data", TensorType.Scalar(new PointerType(DataTypes.UInt8)));
+            if (func.SchedResult.WarpLocalDataPoolSize > 0)
+            {
+                T.CreateBuffer(new TensorType(DataTypes.UInt8, [(long)func.SchedResult.WarpLocalDataPoolSize]), MemoryLocation.WarpLocalData, out var warpLocalDataBuffer, $"warp_local_data_{_dataBufferId++}");
+                var warpLocalDataVar = new Var("warp_local_data", TensorType.Scalar(new PointerType(DataTypes.UInt8)));
+                funcParams.Add(warpLocalDataVar);
+                funcArgs.Add(warpLocalDataBuffer);
+            }
 
-            var funcParams = func.Parameters.ToArray().Append(dataVar).Append(warpLocalDataVar).Append(blockLocalDataVar).ToArray();
-            var funcArgs = expr.Arguments.ToArray().Append(dataBuffer).Append(warpLocalDataBuffer).Append(blockLocalDataBuffer).ToArray();
-            var newFunc = func.With(parameters: funcParams);
-            return expr.With(target: newFunc, arguments: funcArgs);
+            if (func.SchedResult.BlockLocalDataPoolSize > 0)
+            {
+                T.CreateBuffer(new TensorType(DataTypes.UInt8, [(long)func.SchedResult.BlockLocalDataPoolSize]), MemoryLocation.BlockLocalData, out var blockLocalDataBuffer, $"block_local_data_{_dataBufferId++}");
+                var blockLocalDataVar = new Var("block_local_data", TensorType.Scalar(new PointerType(DataTypes.UInt8)));
+                funcParams.Add(blockLocalDataVar);
+                funcArgs.Add(blockLocalDataBuffer);
+            }
+
+            var newFunc = func.With(parameters: funcParams.ToArray());
+            return expr.With(target: newFunc, arguments: funcArgs.ToArray());
         }
 
         return expr;
