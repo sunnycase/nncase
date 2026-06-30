@@ -142,18 +142,18 @@ public sealed class VectorizeReduce : VectorizeRule
     {
         var rets = new List<Expr>();
         var inShape = (RankedShape)input.CheckedShape;
+        axes = axes.Select(x => (int)Util.PositiveIndex(x, inShape.Rank)).ToArray();
         if (vectorizedAxes.Length == 0)
         {
             return rets;
         }
 
-        var vectorizeReduceAxes = axes.Intersect(vectorizedAxes) == vectorizedAxes;
+        var vectorizeReduceAxes = vectorizedAxes.All(axes.Contains);
         if (vectorizeReduceAxes && op.ReduceOp == ReduceOp.Mean)
         {
             return rets;
         }
 
-        axes = axes.Select(x => (int)Util.PositiveIndex(x, inShape.Rank)).ToArray();
         var padValue = vectorizeReduceAxes ? op.ReduceOp switch
         {
             ReduceOp.Mean => 0f,
