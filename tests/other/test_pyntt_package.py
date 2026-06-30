@@ -17,6 +17,7 @@ def test_pyntt_package_imports():
     from pyntt.ir import FunctionSpec, ModuleSpec, TensorSpec
     from pyntt.runtime import (
         LocalShard,
+        PyNTTInterpreter,
         PyNTTModule,
         local_shard_1d,
         select_tuning_parameter,
@@ -37,10 +38,13 @@ def test_pyntt_package_imports():
         ),
     )
     module = PyNTTModule(spec)
+    interpreter = PyNTTInterpreter(spec).load()
 
     assert pyntt.__version__ == "0.0.0"
     assert type(get_backend("triton")).__name__ == "TritonBackend"
     assert module.spec.entry is not None
+    assert interpreter.spec.entry is not None
+    assert interpreter.loaded
     assert module.spec.entry.name == "main"
     assert module.spec.entry.parameters == ("x",)
     assert module.spec.entry.outputs[0].name == "output0"
@@ -55,13 +59,13 @@ def test_pyntt_package_imports():
     assert sharded.local_shape(1, 3) == (4, 3)
 
 
-def test_pyntt_runtime_validates_torch_inputs_and_allocates_outputs():
+def test_pyntt_runtime_validates_torch_inputs_and_allocates_outputs(tmp_path):
     torch = pytest.importorskip("torch")
     _add_pyntt_to_path()
 
     from pyntt.ir import FunctionSpec, ModuleSpec, TensorSpec
-    from pyntt.runtime import PyNTTArgumentError, PyNTTModule
-    from pyntt.runtime import materialize_rdata, materialize_rdata_table
+    from pyntt.runtime import PyNTTArgumentError, PyNTTInterpreter, PyNTTModule
+    from pyntt.runtime import allocate_workspace, materialize_rdata, materialize_rdata_table
 
     spec = ModuleSpec(
         name="runtime",
@@ -85,14 +89,24 @@ def test_pyntt_runtime_validates_torch_inputs_and_allocates_outputs():
         ),
     )
     module = PyNTTModule(spec)
+    interpreter = PyNTTInterpreter(spec).load()
 
     x = torch.ones((2, 3), dtype=torch.float32)
     y = module(x)
+    z = interpreter.run(x)
 
     assert isinstance(y, torch.Tensor)
     assert y.shape == x.shape
     assert y.dtype == x.dtype
     assert y.device == x.device
+    assert isinstance(z, torch.Tensor)
+    assert z.shape == x.shape
+
+    workspace = allocate_workspace((x,), 8, "uint8")
+    workspace.fill_(7)
+    reused_workspace = allocate_workspace((x,), 8, "uint8")
+    assert reused_workspace.data_ptr() == workspace.data_ptr()
+    assert int(reused_workspace[0].item()) == 7
 
     with pytest.raises(PyNTTArgumentError, match="shape"):
         module(torch.ones((3, 2), dtype=torch.float32))
@@ -100,11 +114,25 @@ def test_pyntt_runtime_validates_torch_inputs_and_allocates_outputs():
     with pytest.raises(PyNTTArgumentError, match="dtype"):
         module(torch.ones((2, 3), dtype=torch.float16))
 
-    rdata = materialize_rdata((x,), "AQID", 3)
+    rdata_path = tmp_path / "rdata.bin"
+    rdata_path.write_bytes(bytes([1, 2, 3]))
+    rdata = materialize_rdata((x,), f"file:{rdata_path}", 3)
+    rdata_again = materialize_rdata((x,), f"file:{rdata_path}", 3)
     assert rdata.dtype == torch.uint8
     assert rdata.device == x.device
     assert rdata.tolist() == [1, 2, 3]
+    assert rdata_again.data_ptr() == rdata.data_ptr()
 
-    rdata_table = materialize_rdata_table((x,), ("AQ==", "Ag=="), 1)
+    rdata_table_path0 = tmp_path / "rdata_table_0.bin"
+    rdata_table_path1 = tmp_path / "rdata_table_1.bin"
+    rdata_table_path0.write_bytes(bytes([1]))
+    rdata_table_path1.write_bytes(bytes([2]))
+    rdata_table = materialize_rdata_table(
+        (x,), (f"file:{rdata_table_path0}", f"file:{rdata_table_path1}"), 1
+    )
+    rdata_table_again = materialize_rdata_table(
+        (x,), (f"file:{rdata_table_path0}", f"file:{rdata_table_path1}"), 1
+    )
     assert rdata_table.dtype == torch.uint8
     assert rdata_table.tolist() == [1, 2]
+    assert rdata_table_again.data_ptr() == rdata_table.data_ptr()

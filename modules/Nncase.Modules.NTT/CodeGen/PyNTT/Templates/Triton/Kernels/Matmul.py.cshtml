@@ -31,13 +31,10 @@
 
     static string Indent(int level) => new(' ', level * 4);
 
-    var blockAxis = PyNTTTemplateUtility.SelectBlockAxis(logicalOutputShape, logicalOutputStrides);
-    var blockExtent = logicalOutputShape[blockAxis];
-    var loopAxes = Enumerable.Range(0, logicalOutputShape.Length).Where(axis => axis != blockAxis).ToArray();
-
-    string AxisIndex(int axis) => axis == blockAxis ? "lane" : $"idx{axis}";
-    var row = AxisIndex(logicalOutputShape.Length - 2);
-    var col = AxisIndex(logicalOutputShape.Length - 1);
+    const int BlockM = 16;
+    const int BlockN = 16;
+    const int BlockK = 32;
+    var batchAxes = Enumerable.Range(0, outputBatchRank).ToArray();
 
     string BatchOffsetExpression(PyNTTDimExpression[] operandShape, PyNTTDimExpression[] operandStrides)
     {
@@ -52,72 +49,99 @@
             }
 
             var outputAxis = axisOffset + operandAxis;
-            terms.Add($"{AxisIndex(outputAxis)} * {operandStrides[operandAxis]}");
+            terms.Add($"idx{outputAxis} * {operandStrides[operandAxis]}");
         }
 
-        return terms.Count == 0 ? "lane * 0" : $"lane * 0 + {string.Join(" + ", terms)}";
+        return terms.Count == 0 ? "0" : string.Join(" + ", terms);
     }
 
-    string OutputOffsetExpression()
+    string LogicalNIndex(string expression, int vectorLaneCount)
+        => vectorLaneCount == 1 ? expression : $"(({expression}) // {vectorLaneCount})";
+
+    string LogicalLaneIndex(string expression, int vectorLaneCount)
+        => vectorLaneCount == 1 ? "0" : $"(({expression}) % {vectorLaneCount})";
+
+    string MaybeVectorizedOffset(string physicalOffset, string laneIndex, int vectorLaneCount)
+        => vectorLaneCount == 1 ? physicalOffset : $"(({physicalOffset}) * {vectorLaneCount} + {laneIndex})";
+
+    string OutputOffsetExpression(string outputBatchOffset)
     {
         var terms = new List<string>();
-        for (var axis = 0; axis < Model.OutputShape.Length; axis++)
+        if (outputBatchOffset != "0")
         {
-            var index = axis == Model.OutputShape.Length - 1 && Model.OutputNVectorLaneCount > 1
-                ? $"(({AxisIndex(axis)}) // {Model.OutputNVectorLaneCount})"
-                : AxisIndex(axis);
-            terms.Add($"{index} * {Model.OutputStrides[axis]}");
+            terms.Add(outputBatchOffset);
         }
 
-        var physicalIndex = terms.Count == 0 ? "lane * 0" : $"lane * 0 + {string.Join(" + ", terms)}";
-        if (Model.OutputNVectorLaneCount == 1)
-        {
-            return physicalIndex;
-        }
+        terms.Add($"offs_m[:, None] * {Model.OutputStrides[^2]}");
+        terms.Add($"{LogicalNIndex("offs_n[None, :]", Model.OutputNVectorLaneCount)} * {Model.OutputStrides[^1]}");
 
-        var outputLaneIndex = $"(({col}) % {Model.OutputNVectorLaneCount})";
-        return $"(({physicalIndex}) * {Model.OutputNVectorLaneCount} + {outputLaneIndex})";
+        return MaybeVectorizedOffset($"({string.Join(" + ", terms)})", LogicalLaneIndex("offs_n[None, :]", Model.OutputNVectorLaneCount), Model.OutputNVectorLaneCount);
     }
 
     var lhsBatchOffset = BatchOffsetExpression(Model.LhsShape, Model.LhsStrides);
     var rhsBatchOffset = BatchOffsetExpression(Model.RhsShape, Model.RhsStrides);
-    var lhsIndex = Model.TransposeA
-        ? $"{lhsBatchOffset} + k_index * {Model.LhsStrides[^2]} + {row} * {Model.LhsStrides[^1]}"
-        : $"{lhsBatchOffset} + {row} * {Model.LhsStrides[^2]} + k_index * {Model.LhsStrides[^1]}";
-    var rhsNIndex = Model.RhsNVectorLaneCount == 1
-        ? col
-        : $"(({col}) // {Model.RhsNVectorLaneCount})";
-    var rhsLaneIndex = Model.RhsNVectorLaneCount == 1
-        ? "0"
-        : $"(({col}) % {Model.RhsNVectorLaneCount})";
-    var rhsIndex = Model.TransposeB
-        ? $"{rhsBatchOffset} + {rhsNIndex} * {Model.RhsStrides[^2]} + k_index * {Model.RhsStrides[^1]}"
-        : $"{rhsBatchOffset} + k_index * {Model.RhsStrides[^2]} + {rhsNIndex} * {Model.RhsStrides[^1]}";
-    var rhsScalarIndex = Model.RhsNVectorLaneCount == 1
-        ? rhsIndex
-        : $"(({rhsIndex}) * {Model.RhsNVectorLaneCount} + {rhsLaneIndex})";
-    var outputIndex = OutputOffsetExpression();
+    var outputBatchOffset = BatchOffsetExpression(Model.OutputShape, Model.OutputStrides);
+    var lhsOffsetTerms = new List<string>();
+    if (lhsBatchOffset != "0")
+    {
+        lhsOffsetTerms.Add(lhsBatchOffset);
+    }
+
+    if (Model.TransposeA)
+    {
+        lhsOffsetTerms.Add($"offs_k[None, :] * {Model.LhsStrides[^2]}");
+        lhsOffsetTerms.Add($"offs_m[:, None] * {Model.LhsStrides[^1]}");
+    }
+    else
+    {
+        lhsOffsetTerms.Add($"offs_m[:, None] * {Model.LhsStrides[^2]}");
+        lhsOffsetTerms.Add($"offs_k[None, :] * {Model.LhsStrides[^1]}");
+    }
+
+    var rhsOffsetTerms = new List<string>();
+    if (rhsBatchOffset != "0")
+    {
+        rhsOffsetTerms.Add(rhsBatchOffset);
+    }
+
+    if (Model.TransposeB)
+    {
+        rhsOffsetTerms.Add($"{LogicalNIndex("offs_n[None, :]", Model.RhsNVectorLaneCount)} * {Model.RhsStrides[^2]}");
+        rhsOffsetTerms.Add($"offs_k[:, None] * {Model.RhsStrides[^1]}");
+    }
+    else
+    {
+        rhsOffsetTerms.Add($"offs_k[:, None] * {Model.RhsStrides[^2]}");
+        rhsOffsetTerms.Add($"{LogicalNIndex("offs_n[None, :]", Model.RhsNVectorLaneCount)} * {Model.RhsStrides[^1]}");
+    }
+
+    var lhsOffsets = $"({string.Join(" + ", lhsOffsetTerms)})";
+    var rhsPhysicalOffsets = $"({string.Join(" + ", rhsOffsetTerms)})";
+    var rhsOffsets = MaybeVectorizedOffset(rhsPhysicalOffsets, LogicalLaneIndex("offs_n[None, :]", Model.RhsNVectorLaneCount), Model.RhsNVectorLaneCount);
+    var outputOffsets = OutputOffsetExpression(outputBatchOffset);
 
     var body = new StringBuilder();
     var indent = 1;
-    foreach (var axis in loopAxes)
+    foreach (var axis in batchAxes)
     {
-        body.AppendLine($"{Indent(indent)}for idx{axis} in tl.range(0, {Model.OutputShape[axis]}):");
+        body.AppendLine($"{Indent(indent)}for idx{axis} in tl.range(0, {logicalOutputShape[axis]}):");
         indent++;
     }
 
-    body.AppendLine($"{Indent(indent)}for axis_start in tl.range(0, {blockExtent}, block_size):");
-    body.AppendLine($"{Indent(indent + 1)}lane = axis_start + tl.arange(0, block_size)");
-    body.AppendLine($"{Indent(indent + 1)}mask = lane < {blockExtent}");
-    body.AppendLine($"{Indent(indent + 1)}acc = tl.full((block_size,), 0.0, tl.float32)");
-    body.AppendLine($"{Indent(indent + 1)}for k_index in tl.range(0, {k}):");
-    body.AppendLine($"{Indent(indent + 2)}lhs_value = tl.load(lhs + lane * 0 + {lhsIndex}, mask=mask, other=0.0)");
-    body.AppendLine($"{Indent(indent + 2)}rhs_value = tl.load(rhs + lane * 0 + {rhsScalarIndex}, mask=mask, other=0.0)");
-    body.AppendLine($"{Indent(indent + 2)}acc += lhs_value * rhs_value");
-    body.AppendLine($"{Indent(indent + 1)}result = acc * {Model.Scale}");
-    body.AppendLine($"{Indent(indent + 1)}tl.store(output + {outputIndex}, result, mask=mask)");
+    body.AppendLine($"{Indent(indent)}for m_start in tl.range(0, {m}, {BlockM}):");
+    body.AppendLine($"{Indent(indent + 1)}offs_m = m_start + tl.arange(0, {BlockM})");
+    body.AppendLine($"{Indent(indent + 1)}for n_start in tl.range(0, {n}, {BlockN}):");
+    body.AppendLine($"{Indent(indent + 2)}offs_n = n_start + tl.arange(0, {BlockN})");
+    body.AppendLine($"{Indent(indent + 2)}acc = tl.zeros(({BlockM}, {BlockN}), tl.float32)");
+    body.AppendLine($"{Indent(indent + 2)}for k_start in tl.range(0, {k}, {BlockK}):");
+    body.AppendLine($"{Indent(indent + 3)}offs_k = k_start + tl.arange(0, {BlockK})");
+    body.AppendLine($"{Indent(indent + 3)}lhs_values = tl.load(lhs + {lhsOffsets}, mask=(offs_m[:, None] < {m}) & (offs_k[None, :] < {k}), other=0.0)");
+    body.AppendLine($"{Indent(indent + 3)}rhs_values = tl.load(rhs + {rhsOffsets}, mask=(offs_k[:, None] < {k}) & (offs_n[None, :] < {n}), other=0.0)");
+    body.AppendLine($"{Indent(indent + 3)}acc += tl.dot(lhs_values, rhs_values)");
+    body.AppendLine($"{Indent(indent + 2)}result = acc * {Model.Scale}");
+    body.AppendLine($"{Indent(indent + 2)}tl.store(output + {outputOffsets}, result, mask=(offs_m[:, None] < {m}) & (offs_n[None, :] < {n}))");
 
-    foreach (var axis in loopAxes.Reverse())
+    foreach (var axis in batchAxes.Reverse())
     {
         indent--;
     }

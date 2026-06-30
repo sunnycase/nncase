@@ -337,6 +337,9 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 case Nncase.TIR.NTT.Matmul matmul:
                     VisitMatmul(matmul, args);
                     break;
+                case Nncase.TIR.NTT.SUMMA summa:
+                    VisitSUMMA(summa, args);
+                    break;
                 case Nncase.TIR.NTT.Reduce reduce:
                     VisitReduce(reduce, args);
                     break;
@@ -1529,22 +1532,9 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
 
         private void VisitMatmul(Nncase.TIR.NTT.Matmul matmul, IReadOnlyList<BaseExpr> args)
         {
-            if (args.Count < 5 ||
-                args[0] is not TIR.Buffer lhs ||
-                args[1] is not TIR.Buffer rhs ||
-                args[2] is not TIR.Buffer output)
-            {
-                throw new NotSupportedException("PyNTT Matmul codegen expects lhs, rhs, and output TIR buffers.");
-            }
-
             if (matmul.FusedReduce)
             {
                 throw new NotSupportedException("PyNTT Matmul codegen does not support fused reduce yet.");
-            }
-
-            if (GetScalarBool(args[3], "matmul loadC"))
-            {
-                throw new NotSupportedException("PyNTT Matmul codegen does not support loadC yet.");
             }
 
             if (args.Count > 5 && args[5] is not None)
@@ -1552,29 +1542,66 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 throw new NotSupportedException("PyNTT Matmul codegen does not support extra workload operands yet.");
             }
 
+            VisitMatmulLike(
+                "PyNTT Matmul",
+                matmul.LhsVectorizedAxes,
+                matmul.RhsVectorizedAxes,
+                matmul.TransposeA,
+                matmul.TransposeB,
+                args);
+        }
+
+        private void VisitSUMMA(Nncase.TIR.NTT.SUMMA summa, IReadOnlyList<BaseExpr> args)
+        {
+            if (args.Count < 5 ||
+                args[0] is not TIR.Buffer lhs ||
+                args[1] is not TIR.Buffer rhs ||
+                args[2] is not TIR.Buffer output)
+            {
+                throw new NotSupportedException("PyNTT SUMMA codegen expects lhs, rhs, and output TIR buffers.");
+            }
+
+            if (summa.TransposeA || summa.TransposeB)
+            {
+                throw new NotSupportedException("PyNTT SUMMA codegen does not support transposed inputs yet.");
+            }
+
+            if (GetScalarBool(args[3], "PyNTT SUMMA loadC"))
+            {
+                throw new NotSupportedException("PyNTT SUMMA codegen does not support loadC yet.");
+            }
+
             SetComputeOp("matmul");
             var lhsShape = GetBufferShape(lhs);
             var rhsShape = GetBufferShape(rhs);
             var outputShape = GetBufferShape(output);
-            ValidateMinimumRank("PyNTT Matmul lhs", lhsShape, 2);
-            ValidateMinimumRank("PyNTT Matmul rhs", rhsShape, 2);
-            ValidateMinimumRank("PyNTT Matmul output", outputShape, 2);
-            var dimInfo = Nncase.IR.NTT.VectorizedMatMul.GetDimInfo(matmul.TransposeA, matmul.TransposeB, lhsShape.Length, rhsShape.Length);
+            var lhsGlobalShape = GetBufferGlobalShape(lhs);
+            var rhsGlobalShape = GetBufferGlobalShape(rhs);
+            var outputGlobalShape = GetBufferGlobalShape(output);
+            ValidateMinimumRank("PyNTT SUMMA lhs", lhsShape, 2);
+            ValidateMinimumRank("PyNTT SUMMA rhs", rhsShape, 2);
+            ValidateMinimumRank("PyNTT SUMMA output", outputShape, 2);
+            if (lhsShape.Length != 2 || rhsShape.Length != 2 || outputShape.Length != 2)
+            {
+                throw new NotSupportedException($"PyNTT SUMMA currently supports rank-2 matmul only, got lhs rank {lhsShape.Length}, rhs rank {rhsShape.Length}, output rank {outputShape.Length}.");
+            }
+
+            var dimInfo = Nncase.IR.NTT.VectorizedMatMul.GetDimInfo(false, false, lhsShape.Length, rhsShape.Length);
             var lhsVectorLanes = GetVectorLanes(lhs.ElemType);
             var rhsVectorLanes = GetVectorLanes(rhs.ElemType);
             var outputVectorLanes = GetVectorLanes(output.ElemType);
             var rhsNVectorLaneCount = 1;
             var outputNVectorLaneCount = 1;
-            if (!matmul.LhsVectorizedAxes.IsDefaultOrEmpty)
+            if (!summa.LhsVectorizedAxes.IsDefaultOrEmpty)
             {
-                throw new NotSupportedException($"PyNTT Matmul currently supports only RHS N-axis vectorization, got lhs axes [{string.Join(",", matmul.LhsVectorizedAxes)}].");
+                throw new NotSupportedException($"PyNTT SUMMA currently supports only RHS N-axis vectorization, got lhs axes [{string.Join(",", summa.LhsVectorizedAxes)}].");
             }
 
-            if (!matmul.RhsVectorizedAxes.IsDefaultOrEmpty)
+            if (!summa.RhsVectorizedAxes.IsDefaultOrEmpty)
             {
-                if (matmul.RhsVectorizedAxes.Count != 1 || matmul.RhsVectorizedAxes[0] != dimInfo.Rn || rhsVectorLanes.Length != 1)
+                if (summa.RhsVectorizedAxes.Count != 1 || summa.RhsVectorizedAxes[0] != dimInfo.Rn || rhsVectorLanes.Length != 1)
                 {
-                    throw new NotSupportedException($"PyNTT Matmul currently supports only one RHS N-axis vector lane, got rhs axes [{string.Join(",", matmul.RhsVectorizedAxes)}] and lanes [{string.Join(",", rhsVectorLanes)}].");
+                    throw new NotSupportedException($"PyNTT SUMMA currently supports only one RHS N-axis vector lane, got rhs axes [{string.Join(",", summa.RhsVectorizedAxes)}] and lanes [{string.Join(",", rhsVectorLanes)}].");
                 }
 
                 rhsNVectorLaneCount = rhsVectorLanes[0];
@@ -1582,42 +1609,169 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
 
             if (lhsVectorLanes.Length != 0)
             {
-                throw new NotSupportedException($"PyNTT Matmul currently supports scalar lhs operands only, got lhs lanes [{string.Join(",", lhsVectorLanes)}].");
+                throw new NotSupportedException($"PyNTT SUMMA currently supports scalar lhs operands only, got lhs lanes [{string.Join(",", lhsVectorLanes)}].");
             }
 
             if (outputVectorLanes.Length != 0)
             {
                 if (outputVectorLanes.Length != 1 || outputVectorLanes[0] != rhsNVectorLaneCount || rhsNVectorLaneCount == 1)
                 {
-                    throw new NotSupportedException($"PyNTT Matmul currently supports only RHS N-axis vectorization producing the same output N lane, got output lanes [{string.Join(",", outputVectorLanes)}] and rhs N lane {rhsNVectorLaneCount}.");
+                    throw new NotSupportedException($"PyNTT SUMMA currently supports only RHS N-axis vectorization producing the same output N lane, got output lanes [{string.Join(",", outputVectorLanes)}] and rhs N lane {rhsNVectorLaneCount}.");
                 }
 
                 outputNVectorLaneCount = outputVectorLanes[0];
             }
 
-            var lhsK = matmul.TransposeA ? lhsShape[^2] : lhsShape[^1];
-            var rhsK = matmul.TransposeB ? rhsShape[^1] : rhsShape[^2];
-            var lhsM = matmul.TransposeA ? lhsShape[^1] : lhsShape[^2];
-            var rhsN = matmul.TransposeB ? rhsShape[^2] : rhsShape[^1];
+            var rhsFullGlobalN = MultiplyDim(rhsGlobalShape[^1], rhsNVectorLaneCount);
+            var outputGlobalNCompatible = outputNVectorLaneCount == 1
+                ? rhsNVectorLaneCount == 1 ? SameDim(outputGlobalShape[^1], rhsGlobalShape[^1]) : CanFitPaddedDim(outputGlobalShape[^1], rhsFullGlobalN)
+                : SameDim(outputGlobalShape[^1], rhsGlobalShape[^1]);
+            if (!SameDim(lhsGlobalShape[^1], rhsGlobalShape[^2]) ||
+                !SameDim(outputGlobalShape[^2], lhsGlobalShape[^2]) ||
+                !outputGlobalNCompatible)
+            {
+                throw new NotSupportedException($"PyNTT SUMMA expects compatible global matrix shapes, got lhs=[{ShapeText(lhsGlobalShape)}], rhs=[{ShapeText(rhsGlobalShape)}], output=[{ShapeText(outputGlobalShape)}].");
+            }
+
+            var lhsRef = ResolveBufferRef(lhs);
+            var rhsRef = ResolveBufferRef(rhs);
+            var outputRef = ResolveBufferRef(output);
+            var scale = GetScalarFloat(args[4], "PyNTT SUMMA scale", 1.0f);
+            _attrs["op"] = "matmul";
+            _attrs["tir"] = true;
+            _attrs["summa"] = true;
+            _attrs["requires_grid_barrier"] = true;
+            _attrs["dtype"] = GetPyNTTScalarDTypeName(output.ElemType);
+            _attrs["shape"] = outputShape;
+            _attrs["scale"] = scale;
+            var helperName = GetNextHelperName("summa_compute");
+            WriteHelperTemplate(
+                "~/CodeGen/PyNTT/Templates/Triton/Kernels/Summa.py.cshtml",
+                new PyNTTSummaTemplateModel(
+                    helperName,
+                    lhsRef.BaseName,
+                    lhsRef.OffsetBytes,
+                    lhsRef.PoolBytes,
+                    rhsRef.BaseName,
+                    rhsRef.OffsetBytes,
+                    rhsRef.PoolBytes,
+                    outputRef.BaseName,
+                    outputRef.OffsetBytes,
+                    outputRef.PoolBytes,
+                    GetPyNTTScalarDTypeName(lhs.ElemType),
+                    GetPyNTTScalarDTypeName(rhs.ElemType),
+                    GetPyNTTScalarDTypeName(output.ElemType),
+                    GetScalarTritonDType(lhs.ElemType),
+                    GetScalarTritonDType(rhs.ElemType),
+                    GetScalarTritonDType(output.ElemType),
+                    lhsShape,
+                    rhsShape,
+                    outputShape,
+                    lhsGlobalShape,
+                    rhsGlobalShape,
+                    outputGlobalShape,
+                    GetBufferStrides(lhs),
+                    GetBufferStrides(rhs),
+                    GetBufferStrides(output),
+                    GetBufferSplitAxes(lhs, lhsShape.Length),
+                    GetBufferSplitAxes(rhs, rhsShape.Length),
+                    GetBufferSplitAxes(output, outputShape.Length),
+                    GetHierarchy(output),
+                    rhsNVectorLaneCount,
+                    outputNVectorLaneCount,
+                    scale.ToString("R", CultureInfo.InvariantCulture),
+                    $"{lhs.Name}, {rhs.Name} -> {output.Name}"));
+            WriteBarrier(HelperBarrierKind.Grid);
+            WriteLine(BuildHelperCall(helperName), HelperBarrierKind.Grid);
+        }
+
+        private void VisitMatmulLike(
+            string context,
+            IRArray<int> lhsVectorizedAxes,
+            IRArray<int> rhsVectorizedAxes,
+            bool transposeA,
+            bool transposeB,
+            IReadOnlyList<BaseExpr> args)
+        {
+            if (args.Count < 5 ||
+                args[0] is not TIR.Buffer lhs ||
+                args[1] is not TIR.Buffer rhs ||
+                args[2] is not TIR.Buffer output)
+            {
+                throw new NotSupportedException($"{context} codegen expects lhs, rhs, and output TIR buffers.");
+            }
+
+            if (GetScalarBool(args[3], $"{context} loadC"))
+            {
+                throw new NotSupportedException($"{context} codegen does not support loadC yet.");
+            }
+
+            SetComputeOp("matmul");
+            var lhsShape = GetBufferShape(lhs);
+            var rhsShape = GetBufferShape(rhs);
+            var outputShape = GetBufferShape(output);
+            ValidateMinimumRank($"{context} lhs", lhsShape, 2);
+            ValidateMinimumRank($"{context} rhs", rhsShape, 2);
+            ValidateMinimumRank($"{context} output", outputShape, 2);
+            var dimInfo = Nncase.IR.NTT.VectorizedMatMul.GetDimInfo(transposeA, transposeB, lhsShape.Length, rhsShape.Length);
+            var lhsVectorLanes = GetVectorLanes(lhs.ElemType);
+            var rhsVectorLanes = GetVectorLanes(rhs.ElemType);
+            var outputVectorLanes = GetVectorLanes(output.ElemType);
+            var rhsNVectorLaneCount = 1;
+            var outputNVectorLaneCount = 1;
+            if (!lhsVectorizedAxes.IsDefaultOrEmpty)
+            {
+                throw new NotSupportedException($"{context} currently supports only RHS N-axis vectorization, got lhs axes [{string.Join(",", lhsVectorizedAxes)}].");
+            }
+
+            if (!rhsVectorizedAxes.IsDefaultOrEmpty)
+            {
+                if (rhsVectorizedAxes.Count != 1 || rhsVectorizedAxes[0] != dimInfo.Rn || rhsVectorLanes.Length != 1)
+                {
+                    throw new NotSupportedException($"{context} currently supports only one RHS N-axis vector lane, got rhs axes [{string.Join(",", rhsVectorizedAxes)}] and lanes [{string.Join(",", rhsVectorLanes)}].");
+                }
+
+                rhsNVectorLaneCount = rhsVectorLanes[0];
+            }
+
+            if (lhsVectorLanes.Length != 0)
+            {
+                throw new NotSupportedException($"{context} currently supports scalar lhs operands only, got lhs lanes [{string.Join(",", lhsVectorLanes)}].");
+            }
+
+            if (outputVectorLanes.Length != 0)
+            {
+                if (outputVectorLanes.Length != 1 || outputVectorLanes[0] != rhsNVectorLaneCount || rhsNVectorLaneCount == 1)
+                {
+                    throw new NotSupportedException($"{context} currently supports only RHS N-axis vectorization producing the same output N lane, got output lanes [{string.Join(",", outputVectorLanes)}] and rhs N lane {rhsNVectorLaneCount}.");
+                }
+
+                outputNVectorLaneCount = outputVectorLanes[0];
+            }
+
+            var lhsK = transposeA ? lhsShape[^2] : lhsShape[^1];
+            var rhsK = transposeB ? rhsShape[^1] : rhsShape[^2];
+            var lhsM = transposeA ? lhsShape[^1] : lhsShape[^2];
+            var rhsN = transposeB ? rhsShape[^2] : rhsShape[^1];
             var rhsFullN = MultiplyDim(rhsN, rhsNVectorLaneCount);
             var outputNCompatible = outputNVectorLaneCount == 1
                 ? rhsNVectorLaneCount == 1 ? SameDim(outputShape[^1], rhsN) : CanFitPaddedDim(outputShape[^1], rhsFullN)
                 : SameDim(outputShape[^1], rhsN);
             if (!SameDim(lhsK, rhsK) || !SameDim(outputShape[^2], lhsM) || !outputNCompatible)
             {
-                throw new NotSupportedException($"PyNTT Matmul expects compatible matrix shapes, got lhs=[{ShapeText(lhsShape)}], rhs=[{ShapeText(rhsShape)}], output=[{ShapeText(outputShape)}].");
+                throw new NotSupportedException($"{context} expects compatible matrix shapes, got lhs=[{ShapeText(lhsShape)}], rhs=[{ShapeText(rhsShape)}], output=[{ShapeText(outputShape)}].");
             }
 
-            ValidateBroadcastable("PyNTT Matmul lhs batch", lhsShape[..^2], outputShape[..^2]);
-            ValidateBroadcastable("PyNTT Matmul rhs batch", rhsShape[..^2], outputShape[..^2]);
+            ValidateBroadcastable($"{context} lhs batch", lhsShape[..^2], outputShape[..^2]);
+            ValidateBroadcastable($"{context} rhs batch", rhsShape[..^2], outputShape[..^2]);
             var reduceAxes = GetMatmulReduceAxes(lhs, rhs, output, dimInfo);
-            var scale = GetScalarFloat(args[4], "matmul scale", 1.0f);
+            var scale = GetScalarFloat(args[4], $"{context} scale", 1.0f);
             _attrs["op"] = "matmul";
             _attrs["tir"] = true;
             _attrs["dtype"] = GetPyNTTScalarDTypeName(output.ElemType);
             _attrs["shape"] = outputShape;
-            _attrs["transpose_a"] = matmul.TransposeA;
-            _attrs["transpose_b"] = matmul.TransposeB;
+            _attrs["transpose_a"] = transposeA;
+            _attrs["transpose_b"] = transposeB;
             _attrs["scale"] = scale;
             var helperName = GetNextHelperName("matmul_compute");
             WriteHelperTemplate(
@@ -1639,8 +1793,8 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     GetBufferStrides(lhs),
                     GetBufferStrides(rhs),
                     GetBufferStrides(output),
-                    matmul.TransposeA,
-                    matmul.TransposeB,
+                    transposeA,
+                    transposeB,
                     rhsNVectorLaneCount,
                     outputNVectorLaneCount,
                     scale.ToString("R", CultureInfo.InvariantCulture),
@@ -2065,7 +2219,9 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     update.CacheKind == AttentionCacheKind.Key ? 0 : 1,
                     cache,
                     $"{slots.Name} -> kv-cache"));
-            WriteLine(BuildHelperCall(helperName, $"input{slotMappingInputIndex}", $"input{storageInputIndex}", $"input{storageBlocksInputIndex}", $"input{metaInputIndex}"));
+            _attrs["requires_grid_barrier"] = true;
+            WriteBarrier(HelperBarrierKind.Grid);
+            WriteLine(BuildHelperCall(helperName, $"input{slotMappingInputIndex}", $"input{storageInputIndex}", $"input{storageBlocksInputIndex}", $"input{metaInputIndex}"), HelperBarrierKind.Grid);
         }
 
         private void VisitPagedAttention(Nncase.TIR.NTT.PagedAttention pagedAttention, IReadOnlyList<BaseExpr> args)
@@ -2094,6 +2250,13 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 throw new NotSupportedException("PyNTT PagedAttention layout must contain Seq, Head, and Dim.");
             }
 
+            var querySplitAxes = GetBufferSplitAxes(query, query.Dimensions.Length);
+            var outputSplitAxes = GetBufferSplitAxes(output, output.Dimensions.Length);
+            if (querySplitAxes[dimAxis].Length != 0 || outputSplitAxes[dimAxis].Length != 0)
+            {
+                throw new NotSupportedException("PyNTT PagedAttention codegen requires the attention Dim axis to be unsplit.");
+            }
+
             SetComputeOp("paged_attention");
             _attrs["op"] = "paged_attention";
             _attrs["tir"] = true;
@@ -2116,7 +2279,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     GetBufferGlobalShape(output),
                     GetBufferStrides(query),
                     GetBufferStrides(output),
-                    GetBufferSplitAxes(output, output.Dimensions.Length),
+                    outputSplitAxes,
                     GetHierarchy(output),
                     seqAxis,
                     headAxis,
@@ -2125,6 +2288,8 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     pagedAttention.LayerId,
                     cache,
                     $"{query.Name}, kv-cache -> {output.Name}"));
+            _attrs["requires_grid_barrier"] = true;
+            WriteBarrier(HelperBarrierKind.Grid);
             WriteLine(BuildHelperCall(helperName, $"input{blockTablesInputIndex}", $"input{storageInputIndex}", $"input{storageBlocksInputIndex}", $"input{metaInputIndex}"));
         }
 
@@ -2710,7 +2875,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             _body.AppendLine(barrierKind switch
             {
                 HelperBarrierKind.Cta => "tl.debug_barrier()",
-                HelperBarrierKind.Grid => "tle.distributed_barrier()",
+                HelperBarrierKind.Grid => "tle.distributed_barrier(pyntt_grid_mesh)",
                 _ => throw new ArgumentOutOfRangeException(nameof(barrierKind), barrierKind, null),
             });
         }
@@ -2838,7 +3003,10 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
         var outputs = kernel.Outputs.Select((_, index) => $"output{index}").ToArray();
         var workspaceParameters = new[] { "data", "rdata", "thread_local_rdata", "warp_local_rdata", "block_local_rdata" };
         var runtimeShapeArgs = GetRuntimeShapeArgs(kernel);
-        var parameters = string.Join(", ", inputs.Concat(outputs).Concat(workspaceParameters).Concat(runtimeShapeArgs).Concat(new[] { "numel", "block_size: tl.constexpr" }));
+        var gridBarrierParameters = kernel.Attrs.ContainsKey("requires_grid_barrier")
+            ? new[] { "pyntt_grid_mesh: tl.constexpr" }
+            : Array.Empty<string>();
+        var parameters = string.Join(", ", inputs.Concat(outputs).Concat(workspaceParameters).Concat(runtimeShapeArgs).Concat(gridBarrierParameters).Concat(new[] { "numel", "block_size: tl.constexpr" }));
         var call = IndentGeneratedCall(bodySource);
 
         var topKernelSource = $$"""

@@ -352,8 +352,8 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
 
             Backend: `{backend}`
 
-            M4 output validates `torch.Tensor` inputs, allocates outputs, and
-            directly launches generated Triton top kernels.
+            The generated package uses the PyNTT runtime interpreter to separate
+            model load state from per-run execution.
             """;
 
         File.WriteAllText(Path.Join(outputDirectory, "__init__.py"), "from .model import load_model\n", Encoding.UTF8);
@@ -404,35 +404,37 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
     {
         var entry = _functions.FirstOrDefault(function => function.SourceFunction.IsEntry);
         var launchStatements = entry is null ? string.Empty : BuildModelLaunchStatements(entry);
+        if (string.IsNullOrWhiteSpace(launchStatements))
+        {
+            launchStatements = "        pass";
+        }
+
+        var needsGridBarrier = _functions
+            .SelectMany(function => function.GeneratedKernelSource.Kernels)
+            .Any(kernel => kernel.Attrs.ContainsKey("requires_grid_barrier"));
+        var tritonRuntimeImport = needsGridBarrier
+            ? "from pyntt.runtime.triton import ensure_triton_allocator"
+            : string.Empty;
 
         return $$"""
-            from pyntt.runtime.tensor import allocate_outputs, materialize_kv_cache_blocks_per_shard, materialize_kv_cache_metadata, materialize_kv_cache_storage, materialize_kv_cache_tensor_field, resolve_shape_env, validate_inputs
+            from pyntt.runtime.interpreter import PyNTTInterpreter
+            from pyntt.runtime.tensor import materialize_kv_cache_blocks_per_shard, materialize_kv_cache_metadata, materialize_kv_cache_storage, materialize_kv_cache_tensor_field
             from pyntt.runtime.tuning import select_tuning_parameter
-            from pyntt.runtime.workspace import allocate_workspace, materialize_rdata, materialize_rdata_table
+            {{tritonRuntimeImport}}
             from .rdata import RDATA_BUNDLES
             from .specs import MODULE_SPEC
 
 
-            class PyNTTGeneratedModel:
+            class PyNTTGeneratedModel(PyNTTInterpreter):
                 def __init__(self):
-                    self.spec = MODULE_SPEC
+                    super().__init__(MODULE_SPEC, RDATA_BUNDLES)
 
-                def __call__(self, *inputs):
-                    entry = self.spec.entry
-                    if entry is None:
-                        raise RuntimeError(f"PyNTT module {self.spec.name} does not declare an entry function.")
-
-                    shape_env = resolve_shape_env(entry, inputs)
-                    validate_inputs(entry, inputs, shape_env)
-                    outputs = list(allocate_outputs(entry, inputs, shape_env))
+                def _run_entry(self, inputs, outputs, shape_env):
             {{launchStatements}}
-                    if len(outputs) == 1:
-                        return outputs[0]
-                    return tuple(outputs)
 
 
-            def load_model():
-                return PyNTTGeneratedModel()
+            def load_model(device=None):
+                return PyNTTGeneratedModel().load(device=device)
             """;
     }
 
@@ -664,18 +666,19 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
             var dataBytesPerProgram = PythonValue(kernel.Launch.Meta["data_pool_bytes"]);
             var dataDType = PythonString((string)kernel.Launch.Meta["data_dtype"]);
             workspaceSetup = $"""
-                    rdata_bundle = RDATA_BUNDLES[{PythonString(functionName)}]
-                    data = allocate_workspace(inputs, {dataBytesPerProgram} * grid[0], {dataDType})
-                    rdata = materialize_rdata(inputs, rdata_bundle["rdata"], rdata_bundle["rdata_bytes"])
-                    thread_local_rdata = materialize_rdata_table(inputs, rdata_bundle["thread_local_rdata"], rdata_bundle["thread_local_rdata_bytes"])
-                    warp_local_rdata = materialize_rdata_table(inputs, rdata_bundle["warp_local_rdata"], rdata_bundle["warp_local_rdata_bytes"])
-                    block_local_rdata = materialize_rdata_table(inputs, rdata_bundle["block_local_rdata"], rdata_bundle["block_local_rdata_bytes"])
+                    data = self.allocate_workspace(inputs, {PythonString(kernel.Name + ".data")}, {dataBytesPerProgram} * grid[0], {dataDType})
+                    rdata, thread_local_rdata, warp_local_rdata, block_local_rdata = self.materialize_rdata_bundle(inputs, {PythonString(functionName)})
             """;
             workspaceArgs = new[] { "data", "rdata", "thread_local_rdata", "warp_local_rdata", "block_local_rdata" };
         }
 
         var runtimeShapeArgs = runtimeShapeArgNames.Select(arg => $"shape_env[{PythonString(arg)}]").ToArray();
-        var tensorArgs = string.Join(", ", inputArgs.Concat(outputArgs).Concat(workspaceArgs).Concat(runtimeShapeArgs));
+        var requiresGridBarrier = kernel.Attrs.ContainsKey("requires_grid_barrier");
+        var gridBarrierArgs = requiresGridBarrier ? new[] { "PYNTT_GRID_MESH" } : Array.Empty<string>();
+        var tensorArgs = string.Join(", ", inputArgs.Concat(outputArgs).Concat(workspaceArgs).Concat(runtimeShapeArgs).Concat(gridBarrierArgs));
+        var tritonRuntimeSetup = requiresGridBarrier
+            ? $"{Environment.NewLine}        ensure_triton_allocator(outputs[0].device)"
+            : string.Empty;
         var launchKwargs = new List<string>();
         if (kernel.Launch.NumWarps.HasValue)
         {
@@ -688,7 +691,9 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
         }
 
         var kwargs = launchKwargs.Count == 0 ? string.Empty : $", {string.Join(", ", launchKwargs)}";
-        var importStatement = $"from .generated_kernels import {kernel.Name}";
+        var importStatement = requiresGridBarrier
+            ? $"from .generated_kernels import {kernel.Name}, PYNTT_GRID_MESH"
+            : $"from .generated_kernels import {kernel.Name}";
         var launchStatement = $"        {kernel.Name}[grid]({tensorArgs}, numel, block_size{kwargs})";
         return $"""
                     {importStatement}
@@ -696,6 +701,7 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
                     block_size = select_tuning_parameter({PythonString(kernel.Name)}, "block_size", {blockSizeCandidates}, source={PythonString(blockSize.Source)})
                     grid = {grid}
             {workspaceSetup}
+            {tritonRuntimeSetup}
             {launchStatement}
             {outputAliases}
             """;
@@ -764,24 +770,44 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
                 """;
         }
 
+        var needsGridBarrier = kernelSources.Any(source => source.Contains("tle.distributed_barrier", StringComparison.Ordinal));
         var imports = new List<string>
         {
             "import triton",
             "import triton.language as tl",
         };
-        if (kernelSources.Any(source => source.Contains("tle.distributed_barrier()", StringComparison.Ordinal)))
+        if (needsGridBarrier)
         {
             imports.Add("import triton.experimental.tle.language as tle");
         }
 
         imports.Add("from triton.language.extra import libdevice");
         var importSource = string.Join(Environment.NewLine, imports);
+        var gridMeshSource = needsGridBarrier
+            ? $"{Environment.NewLine}{Environment.NewLine}PYNTT_GRID_MESH = tle.device_mesh({{\"block\": [(\"block_x\", {GetGridBarrierMeshSize()})]}})"
+            : string.Empty;
         return $$"""
-            {{importSource}}
+            {{importSource}}{{gridMeshSource}}
 
 
             {{string.Join(Environment.NewLine + Environment.NewLine, kernelSources)}}
             """;
+    }
+
+    private int GetGridBarrierMeshSize()
+    {
+        var meshSizes = _functions
+            .SelectMany(function => function.GeneratedKernelSource.Kernels)
+            .Where(kernel => kernel.Attrs.ContainsKey("requires_grid_barrier"))
+            .Select(kernel => kernel.Launch.Sharding.Hierarchy.Aggregate(1, (acc, value) => checked(acc * value)))
+            .Distinct()
+            .ToArray();
+        return meshSizes.Length switch
+        {
+            0 => 1,
+            1 => meshSizes[0],
+            _ => throw new NotSupportedException($"PyNTT generated kernels with grid barriers must use one grid mesh size, got {string.Join(", ", meshSizes)}."),
+        };
     }
 
     private string BuildRDataPython(string outputDirectory)

@@ -531,6 +531,44 @@ public sealed record PyNTTMatmulTemplateModel(
     public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
 }
 
+public sealed record PyNTTSummaTemplateModel(
+    string FunctionName,
+    string LhsBaseName,
+    long LhsOffsetBytes,
+    long LhsPoolBytes,
+    string RhsBaseName,
+    long RhsOffsetBytes,
+    long RhsPoolBytes,
+    string OutputBaseName,
+    long OutputOffsetBytes,
+    long OutputPoolBytes,
+    string LhsDType,
+    string RhsDType,
+    string OutputDType,
+    string LhsTritonDType,
+    string RhsTritonDType,
+    string OutputTritonDType,
+    PyNTTDimExpression[] LhsShape,
+    PyNTTDimExpression[] RhsShape,
+    PyNTTDimExpression[] OutputShape,
+    PyNTTDimExpression[] LhsGlobalShape,
+    PyNTTDimExpression[] RhsGlobalShape,
+    PyNTTDimExpression[] OutputGlobalShape,
+    PyNTTDimExpression[] LhsStrides,
+    PyNTTDimExpression[] RhsStrides,
+    PyNTTDimExpression[] OutputStrides,
+    int[][] LhsSplitAxes,
+    int[][] RhsSplitAxes,
+    int[][] OutputSplitAxes,
+    int[] Hierarchy,
+    int RhsNVectorLaneCount,
+    int OutputNVectorLaneCount,
+    string Scale,
+    string Comment)
+{
+    public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
+}
+
 public sealed record PyNTTShardReduceTemplateModel(
     string FunctionName,
     string BaseName,

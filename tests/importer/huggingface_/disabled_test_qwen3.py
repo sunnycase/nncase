@@ -20,18 +20,19 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
 def test_qwen3(request):
-    cfg = """
+    num_layers = int(os.getenv("NNCASE_QWEN3_NUM_LAYERS", "-1"))
+    cfg = f"""
     [compile_opt]
     dump_ir = true
     shape_bucket_enable = true
-    shape_bucket_range_info = { "batch_size"=[1,4], "sequence_length"=[1, 1024] }
+    shape_bucket_range_info = {{ "batch_size"=[1,4], "sequence_length"=[1, 1024] }}
     shape_bucket_segments_count = 2
-    shape_bucket_fix_var_map = {  }
+    shape_bucket_fix_var_map = {{  }}
     
     [huggingface_options]
     output_logits = true
     output_hidden_states = false
-    num_layers = -1
+    num_layers = {num_layers}
 
     [paged_attention_config]
     lanes = [4]

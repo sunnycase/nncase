@@ -4,6 +4,7 @@
 @{
     var queryShape = PyNTTTemplateUtility.ShapeTuple(Model.QueryShape);
     var outputShape = PyNTTTemplateUtility.ShapeTuple(Model.OutputShape);
+    const int AttentionBlockSize = 64;
 
     static string TensorOffset(IReadOnlyList<PyNTTDimExpression> strides, int seqAxis, int headAxis, int dimAxis, string head, string dimBlock, string token, string lane, int laneCount)
     {
@@ -62,20 +63,20 @@
         return $"{localIndex} + ({SplitLinearExpression(splitAxes)}) * tl.cdiv({Model.GlobalNumQueryHeads}, {divisor})";
     }
 
-    var queryOffset = TensorOffset(Model.QueryStrides, Model.SeqAxis, Model.HeadAxis, Model.DimAxis, "q_head", "reduce_dim_block", "local_query_id", "reduce_lane", Model.Cache.LaneCount);
-    var outputOffset = TensorOffset(Model.OutputStrides, Model.SeqAxis, Model.HeadAxis, Model.DimAxis, "q_head", "out_dim_block", "local_query_id", "out_lane", Model.Cache.LaneCount);
+    var queryVectorOffset = TensorOffset(Model.QueryStrides, Model.SeqAxis, Model.HeadAxis, Model.DimAxis, "q_head", "dim_blocks", "local_query_id", "dim_lanes", Model.Cache.LaneCount);
+    var outputVectorOffset = TensorOffset(Model.OutputStrides, Model.SeqAxis, Model.HeadAxis, Model.DimAxis, "q_head", "dim_blocks", "local_query_id", "dim_lanes", Model.Cache.LaneCount);
     var localQHeads = Model.OutputShape[Model.HeadAxis];
     var localQueryTokens = Model.OutputShape[Model.SeqAxis];
     var globalQueryTokens = Model.OutputGlobalShape[Model.SeqAxis];
     var globalQueryId = GlobalIndexExpression(Model.SeqAxis, "local_query_id", globalQueryTokens);
     var globalQHead = GlobalHeadExpression("q_head");
-    var outputElements = $"({Model.OutputShape[Model.SeqAxis]}) * ({Model.OutputShape[Model.HeadAxis]}) * {Model.Cache.HeadDim}";
-    var blockIndex = Model.Cache.IdLength > 1 ? "(topology_id * num_blocks_per_shard + block_id)" : "block_id";
-    var keyOffset = $"(((((({blockIndex} * {Model.Cache.NumLayers} + {Model.LayerId}) * 2 + 0) * {Model.Cache.NumKVHeads} + kv_head) * {Model.Cache.HeadDimBlocks} + reduce_dim_block) * {Model.Cache.BlockSize} + block_offset) * {Model.Cache.LaneCount} + reduce_lane)";
-    var valueOffset = $"(((((({blockIndex} * {Model.Cache.NumLayers} + {Model.LayerId}) * 2 + 1) * {Model.Cache.NumKVHeads} + kv_head) * {Model.Cache.HeadDimBlocks} + out_dim_block) * {Model.Cache.BlockSize} + block_offset) * {Model.Cache.LaneCount} + out_lane)";
+    var blockIndexKeyMatrix = Model.Cache.IdLength > 1 ? "(topology_id[None, :] * num_blocks_per_shard + block_id[None, :])" : "block_id[None, :]";
+    var blockIndexValueMatrix = Model.Cache.IdLength > 1 ? "(topology_id[:, None] * num_blocks_per_shard + block_id[:, None])" : "block_id[:, None]";
+    var keyVectorOffset = $"(((((({blockIndexKeyMatrix} * {Model.Cache.NumLayers} + {Model.LayerId}) * 2 + 0) * {Model.Cache.NumKVHeads} + kv_head) * {Model.Cache.HeadDimBlocks} + dim_blocks[:, None]) * {Model.Cache.BlockSize} + block_offsets[None, :]) * {Model.Cache.LaneCount} + dim_lanes[:, None])";
+    var valueVectorOffset = $"(((((({blockIndexValueMatrix} * {Model.Cache.NumLayers} + {Model.LayerId}) * 2 + 1) * {Model.Cache.NumKVHeads} + kv_head) * {Model.Cache.HeadDimBlocks} + dim_blocks[None, :]) * {Model.Cache.BlockSize} + block_offsets[:, None]) * {Model.Cache.LaneCount} + dim_lanes[None, :])";
 }
 # generated from CodeGen/PyNTT/Templates/Triton/Kernels/PagedAttention.py.cshtml
-# @Model.Comment; query_dtype=@Model.QueryDType, output_dtype=@Model.OutputDType, query_shape=@queryShape, output_shape=@outputShape, layer=@Model.LayerId
+# @Model.Comment; query_dtype=@Model.QueryDType, output_dtype=@Model.OutputDType, query_shape=@queryShape, output_shape=@outputShape, layer=@Model.LayerId, block_n=@AttentionBlockSize
 @@triton.jit
 @($"def {Model.FunctionName}(block_tables, kv_cache, num_blocks_per_shard, cache_meta, data, rdata, thread_local_rdata, warp_local_rdata, block_local_rdata{PyNTTTemplateUtility.RuntimeParameterSuffix(Model.RuntimeShapeArgs)}):")
     shard_index = tl.program_id(0).to(tl.int64)
@@ -101,101 +102,71 @@
         num_tokens += seq_len_scan - context_len_scan
     block_table_blocks = tl.cdiv(max_seq_len, @Model.Cache.BlockSize)
 
-    for linear_start in tl.range(0, @Html.Raw(outputElements)):
-        linear = linear_start
-        mask = linear < @Html.Raw(outputElements)
-        out_lane = linear % @Model.Cache.LaneCount
-        tmp = linear // @Model.Cache.LaneCount
-        out_dim_block = tmp % @Model.Cache.HeadDimBlocks
-        tmp = tmp // @Model.Cache.HeadDimBlocks
-        q_head = tmp % @localQHeads
-        local_query_id = tmp // @localQHeads
+    dim_offsets = tl.arange(0, @Model.Cache.HeadDim)
+    dim_blocks = dim_offsets // @Model.Cache.LaneCount
+    dim_lanes = dim_offsets % @Model.Cache.LaneCount
+
+    for local_query_id in tl.range(0, @localQueryTokens):
         global_query_id = @Html.Raw(globalQueryId)
-        global_q_head = @Html.Raw(globalQHead)
+        for q_head in tl.range(0, @localQHeads):
+            global_q_head = @Html.Raw(globalQHead)
 
-        seq_id = tl.full((), 0, tl.int64)
-        query_start = tl.full((), 0, tl.int64)
-        context_len = tl.full((), 0, tl.int64)
-        seq_len = tl.full((), 0, tl.int64)
-        query_id = tl.full((), 0, tl.int64)
-        matched_seq_id = tl.full((), 0, tl.int64)
-        query_active = mask & (local_query_id < @localQueryTokens) & (global_query_id < @globalQueryTokens) & (global_query_id < num_tokens) & (global_q_head < @Model.GlobalNumQueryHeads)
-        found_seq = False
-        for seq_id in tl.range(0, num_seqs):
-            current_context_len = tl.load(cache_meta + 1 + seq_id * 2)
-            current_seq_len = tl.load(cache_meta + 2 + seq_id * 2)
-            current_query_len = current_seq_len - current_context_len
-            in_seq = query_active & (global_query_id >= query_start) & (global_query_id < query_start + current_query_len)
-            matched_seq_id = tl.where(in_seq, seq_id, matched_seq_id)
-            context_len = tl.where(in_seq, current_context_len, context_len)
-            seq_len = tl.where(in_seq, current_seq_len, seq_len)
-            query_id = tl.where(in_seq, global_query_id - query_start, query_id)
-            found_seq = found_seq | in_seq
-            query_start += current_query_len
+            query_start = tl.full((), 0, tl.int64)
+            context_len = tl.full((), 0, tl.int64)
+            seq_len = tl.full((), 0, tl.int64)
+            query_id = tl.full((), 0, tl.int64)
+            matched_seq_id = tl.full((), 0, tl.int64)
+            query_active = (local_query_id < @localQueryTokens) & (global_query_id < @globalQueryTokens) & (global_query_id < num_tokens) & (global_q_head < @Model.GlobalNumQueryHeads)
+            found_seq = False
+            for seq_id in tl.range(0, num_seqs):
+                current_context_len = tl.load(cache_meta + 1 + seq_id * 2)
+                current_seq_len = tl.load(cache_meta + 2 + seq_id * 2)
+                current_query_len = current_seq_len - current_context_len
+                in_seq = query_active & (global_query_id >= query_start) & (global_query_id < query_start + current_query_len)
+                matched_seq_id = tl.where(in_seq, seq_id, matched_seq_id)
+                context_len = tl.where(in_seq, current_context_len, context_len)
+                seq_len = tl.where(in_seq, current_seq_len, seq_len)
+                query_id = tl.where(in_seq, global_query_id - query_start, query_id)
+                found_seq = found_seq | in_seq
+                query_start += current_query_len
 
-        head_group = @Model.GlobalNumQueryHeads // @Model.Cache.NumKVHeads
-        kv_head = global_q_head // head_group
-        max_score = -float("inf")
-        for context_start in tl.range(0, max_seq_len, block_size):
-            context_ids = context_start + tl.arange(0, block_size)
-            context_mask = found_seq & (context_ids < seq_len) & (context_ids <= context_len + query_id)
-            dot = tl.zeros((block_size,), tl.float32)
-            for reduce_dim in tl.range(0, @Model.Cache.HeadDim):
-                reduce_dim_block = reduce_dim // @Model.Cache.LaneCount
-                reduce_lane = reduce_dim % @Model.Cache.LaneCount
-                q_offsets = @Html.Raw(queryOffset)
-                q_value = tl.load(query + q_offsets, mask=found_seq, other=0.0).to(tl.float32)
+            head_group = @Model.GlobalNumQueryHeads // @Model.Cache.NumKVHeads
+            kv_head = global_q_head // head_group
+            q_offsets = @Html.Raw(queryVectorOffset)
+            q_values = tl.load(query + q_offsets, mask=found_seq, other=0.0)
+            max_score = -float("inf")
+            sum_exp = 0.0
+            acc = tl.zeros((1, @Model.Cache.HeadDim), tl.float32)
+
+            for context_start in tl.range(0, max_seq_len, @AttentionBlockSize):
+                context_ids = context_start + tl.arange(0, @AttentionBlockSize)
+                context_mask = found_seq & (context_ids < seq_len) & (context_ids <= context_len + query_id)
                 context_bid = context_ids // @Model.Cache.BlockSize
-                block_offset = context_ids % @Model.Cache.BlockSize
+                block_offsets = context_ids % @Model.Cache.BlockSize
 @if (Model.Cache.IdLength > 1)
 {
 <text>                topology_id = tl.load(block_tables + matched_seq_id * block_table_blocks * @Model.Cache.IdLength + context_bid * @Model.Cache.IdLength, mask=context_mask, other=0)
 </text>
 }
                 block_id = tl.load(block_tables + matched_seq_id * block_table_blocks * @Model.Cache.IdLength + context_bid * @Model.Cache.IdLength + @(Model.Cache.IdLength - 1), mask=context_mask, other=0)
-                key_offsets = @Html.Raw(keyOffset)
-                key_value = tl.load(kv_cache + key_offsets, mask=context_mask, other=0.0).to(tl.float32)
-                dot += q_value * key_value
-            score = tl.where(context_mask, dot * scale_value, -float("inf"))
-            max_score = tl.maximum(max_score, tl.max(score, axis=0))
+                key_offsets = @Html.Raw(keyVectorOffset)
+                key_values = tl.load(kv_cache + key_offsets, mask=context_mask[None, :], other=0.0)
+                score = tl.reshape(tl.dot(q_values[None, :], key_values), (@AttentionBlockSize,))
+                score = tl.where(context_mask, score * scale_value, -float("inf"))
+                block_max = tl.max(score, axis=0)
+                has_context = block_max != -float("inf")
+                new_max = tl.maximum(max_score, block_max)
+                safe_new_max = tl.where(has_context, new_max, 0.0)
+                safe_prev_max = tl.where(has_context, max_score, 0.0)
+                alpha = tl.exp(safe_prev_max - safe_new_max)
+                prob = tl.exp(tl.where(context_mask, score - safe_new_max, -float("inf")))
+                value_offsets = @Html.Raw(valueVectorOffset)
+                value_values = tl.load(kv_cache + value_offsets, mask=context_mask[:, None], other=0.0)
+                acc = acc * alpha + tl.dot(prob[None, :], value_values)
+                sum_exp = sum_exp * alpha + tl.sum(prob, axis=0)
+                max_score = tl.where(has_context, new_max, max_score)
 
-        sum_exp = 0.0
-        acc = 0.0
-        for context_start in tl.range(0, max_seq_len, block_size):
-            context_ids = context_start + tl.arange(0, block_size)
-            context_mask = found_seq & (context_ids < seq_len) & (context_ids <= context_len + query_id)
-            dot = tl.zeros((block_size,), tl.float32)
-            for reduce_dim in tl.range(0, @Model.Cache.HeadDim):
-                reduce_dim_block = reduce_dim // @Model.Cache.LaneCount
-                reduce_lane = reduce_dim % @Model.Cache.LaneCount
-                q_offsets = @Html.Raw(queryOffset)
-                q_value = tl.load(query + q_offsets, mask=found_seq, other=0.0).to(tl.float32)
-                context_bid = context_ids // @Model.Cache.BlockSize
-                block_offset = context_ids % @Model.Cache.BlockSize
-@if (Model.Cache.IdLength > 1)
-{
-<text>                topology_id = tl.load(block_tables + matched_seq_id * block_table_blocks * @Model.Cache.IdLength + context_bid * @Model.Cache.IdLength, mask=context_mask, other=0)
-</text>
-}
-                block_id = tl.load(block_tables + matched_seq_id * block_table_blocks * @Model.Cache.IdLength + context_bid * @Model.Cache.IdLength + @(Model.Cache.IdLength - 1), mask=context_mask, other=0)
-                key_offsets = @Html.Raw(keyOffset)
-                key_value = tl.load(kv_cache + key_offsets, mask=context_mask, other=0.0).to(tl.float32)
-                dot += q_value * key_value
-            score = tl.where(context_mask, dot * scale_value, -float("inf"))
-            weight = tl.exp(score - max_score)
-            context_bid = context_ids // @Model.Cache.BlockSize
-            block_offset = context_ids % @Model.Cache.BlockSize
-@if (Model.Cache.IdLength > 1)
-{
-<text>            topology_id = tl.load(block_tables + matched_seq_id * block_table_blocks * @Model.Cache.IdLength + context_bid * @Model.Cache.IdLength, mask=context_mask, other=0)
-</text>
-}
-            block_id = tl.load(block_tables + matched_seq_id * block_table_blocks * @Model.Cache.IdLength + context_bid * @Model.Cache.IdLength + @(Model.Cache.IdLength - 1), mask=context_mask, other=0)
-            value_offsets = @Html.Raw(valueOffset)
-            value = tl.load(kv_cache + value_offsets, mask=context_mask, other=0.0).to(tl.float32)
-            sum_exp += tl.sum(tl.where(context_mask, weight, 0.0), axis=0)
-            acc += tl.sum(tl.where(context_mask, weight * value, 0.0), axis=0)
-
-        result = acc / sum_exp
-        output_offsets = @Html.Raw(outputOffset)
-        tl.store(output + output_offsets, result, mask=found_seq)
+            inv_sum = tl.where(sum_exp != 0.0, 1.0 / sum_exp, 0.0)
+            result = tl.reshape(acc * inv_sum, (@Model.Cache.HeadDim,))
+            output_offsets = @Html.Raw(outputVectorOffset)
+            tl.store(output + output_offsets, result, mask=found_seq)
