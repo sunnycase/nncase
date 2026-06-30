@@ -51,16 +51,16 @@ struct half {
     static constexpr uint16_t NAN_VALUE = 0x7e00;
 
   public:
-    constexpr half() noexcept = default;
-    constexpr half(native_half_t v) noexcept : value_(v) {}
+    NTT_HOST_DEVICE constexpr half() noexcept = default;
+    NTT_HOST_DEVICE constexpr half(native_half_t v) noexcept : value_(v) {}
 
     template <class T,
               class = std::enable_if_t<std::is_integral<T>::value ||
                                        std::is_floating_point<T>::value>>
-    constexpr explicit half(const T &v) noexcept
+    NTT_HOST_DEVICE constexpr explicit half(const T &v) noexcept
         : value_(round_to_half(v).value_) {}
 
-    static constexpr half round_to_half(float v) {
+    NTT_HOST_DEVICE static constexpr half round_to_half(float v) {
         if (std::is_constant_evaluated()) {
             return (native_half_t)v;
         } else {
@@ -77,34 +77,34 @@ struct half {
         return (native_half_t)v;
     }
 
-    static constexpr half epsilon() noexcept { return from_raw(0x0800); }
+    NTT_HOST_DEVICE static constexpr half epsilon() noexcept { return from_raw(0x0800); }
 
     // Integer conversion constructors
-    constexpr explicit half(int x) noexcept
+    NTT_HOST_DEVICE constexpr explicit half(int x) noexcept
         : value_(round_to_half(float(x)).value_) {}
 
-    constexpr explicit half(int64_t x) noexcept
+    NTT_HOST_DEVICE constexpr explicit half(int64_t x) noexcept
         : value_(round_to_half(float(x)).value_) {}
 
-    constexpr explicit half(uint32_t x) noexcept
+    NTT_HOST_DEVICE constexpr explicit half(uint32_t x) noexcept
         : value_(round_to_half(float(x)).value_) {}
 
-    constexpr explicit half(uint64_t x) noexcept
+    NTT_HOST_DEVICE constexpr explicit half(uint64_t x) noexcept
         : value_(round_to_half(double(x)).value_) {}
 
     // Floating point conversion constructors
-    constexpr explicit half(double x) noexcept
+    NTT_HOST_DEVICE constexpr explicit half(double x) noexcept
         : value_(round_to_half(float(x)).value_) {}
 
     // bfloat16 conversion constructor
-    constexpr explicit half(bfloat16 x) noexcept
+    NTT_HOST_DEVICE constexpr explicit half(bfloat16 x) noexcept
         : value_(round_to_half(float(x)).value_) {}
 
-    constexpr half(fp16_from_raw_t, uint16_t value) noexcept
+    NTT_HOST_DEVICE constexpr half(fp16_from_raw_t, uint16_t value) noexcept
         : value_(std::bit_cast<native_half_t>(value)) {}
 
-    constexpr operator native_half_t() const noexcept { return value_; }
-    constexpr operator float() const noexcept {
+    NTT_HOST_DEVICE constexpr operator native_half_t() const noexcept { return value_; }
+    NTT_HOST_DEVICE constexpr operator float() const noexcept {
         if (std::is_constant_evaluated()) {
             return (float)value_;
         } else {
@@ -119,68 +119,70 @@ struct half {
         }
     }
 
-    constexpr uint16_t raw() const noexcept {
+    NTT_HOST_DEVICE constexpr uint16_t raw() const noexcept {
         return std::bit_cast<uint16_t>(value_);
     }
 
-    static constexpr half from_raw(uint16_t v) noexcept {
+    NTT_HOST_DEVICE static constexpr half from_raw(uint16_t v) noexcept {
         return half(nncase::fp16_from_raw, v);
     }
 
     // Type conversion operators
-    constexpr explicit operator double() const noexcept {
+    NTT_HOST_DEVICE constexpr explicit operator double() const noexcept {
         return double(float(*this));
     }
 
-    constexpr explicit operator int8_t() const noexcept {
+    NTT_HOST_DEVICE constexpr explicit operator int8_t() const noexcept {
         return int(float(*this));
     }
 
-    constexpr explicit operator uint8_t() const noexcept {
+    NTT_HOST_DEVICE constexpr explicit operator uint8_t() const noexcept {
         return int(float(*this));
     }
 
-    constexpr explicit operator int16_t() const noexcept {
+    NTT_HOST_DEVICE constexpr explicit operator int16_t() const noexcept {
         return int(float(*this));
     }
 
-    constexpr explicit operator uint16_t() const noexcept {
+    NTT_HOST_DEVICE constexpr explicit operator uint16_t() const noexcept {
         return int(float(*this));
     }
 
-    constexpr explicit operator int() const noexcept {
+    NTT_HOST_DEVICE constexpr explicit operator int() const noexcept {
         return int(float(*this));
     }
 
-    constexpr explicit operator int64_t() const noexcept {
+    NTT_HOST_DEVICE constexpr explicit operator int64_t() const noexcept {
         return int64_t(float(*this));
     }
 
-    constexpr explicit operator uint32_t() const noexcept {
+    NTT_HOST_DEVICE constexpr explicit operator uint32_t() const noexcept {
         return uint32_t(float(*this));
     }
 
-    constexpr explicit operator uint64_t() const noexcept {
+    NTT_HOST_DEVICE constexpr explicit operator uint64_t() const noexcept {
         return uint64_t(double(*this));
     }
 
-    constexpr explicit operator bool() const noexcept {
+    NTT_HOST_DEVICE constexpr explicit operator bool() const noexcept {
         return bool(std::bit_cast<uint16_t>(*this));
     }
 
-    static constexpr half highest() noexcept { return from_raw(0x7bff); }
+    NTT_HOST_DEVICE static constexpr half highest() noexcept { return from_raw(0x7bff); }
 
-    static constexpr half min() noexcept { return from_raw(0x0400); }
+    NTT_HOST_DEVICE static constexpr half min() noexcept { return from_raw(0x0400); }
 
-    static constexpr half lowest() noexcept { return from_raw(0xfbff); }
+    NTT_HOST_DEVICE static constexpr half lowest() noexcept { return from_raw(0xfbff); }
 
-    static constexpr half quiet_NaN() noexcept { return from_raw(0x7e00); }
+    NTT_HOST_DEVICE static constexpr half quiet_NaN() noexcept { return from_raw(0x7e00); }
 
-    static constexpr half signaling_NaN() noexcept { return from_raw(0x7d00); }
+    NTT_HOST_DEVICE static constexpr half signaling_NaN() noexcept {
+        return from_raw(0x7d00);
+    }
 
-    static constexpr half infinity() noexcept { return from_raw(0x7c00); }
+    NTT_HOST_DEVICE static constexpr half infinity() noexcept { return from_raw(0x7c00); }
 
-    constexpr bool zero() const noexcept {
+    NTT_HOST_DEVICE constexpr bool zero() const noexcept {
         return (raw() & 0x7FFF) == ZERO_VALUE;
     }
 
@@ -193,22 +195,22 @@ struct half {
 };
 
 #define DEFINE_FP16_BINARY_FP16RET(x)                                          \
-    NTT_ALWAYS_INLINE half operator x(half a, half b) noexcept {               \
+    NTT_ALWAYS_INLINE NTT_HOST_DEVICE half operator x(half a, half b) noexcept { \
         return half::round_to_half(float(a) x float(b));                       \
     }
 
 #define DEFINE_FP16_BINARY_BOOLRET(x)                                          \
-    NTT_ALWAYS_INLINE bool operator x(half a, half b) noexcept {               \
+    NTT_ALWAYS_INLINE NTT_HOST_DEVICE bool operator x(half a, half b) noexcept { \
         return float(a) x float(b);                                            \
     }
 
 #define DEFINE_FP16_BINARY_FP32RET(x)                                          \
-    NTT_ALWAYS_INLINE bool operator x(half a, float b) noexcept {              \
+    NTT_ALWAYS_INLINE NTT_HOST_DEVICE bool operator x(half a, float b) noexcept { \
         return float(a) x b;                                                   \
     }
 
 #define DEFINE_FP16_BINARY_INTRET(x)                                           \
-    NTT_ALWAYS_INLINE half operator x(half a, int b) noexcept {                \
+    NTT_ALWAYS_INLINE NTT_HOST_DEVICE half operator x(half a, int b) noexcept { \
         return half::round_to_half(float(a) x b);                              \
     }
 
@@ -228,7 +230,7 @@ DEFINE_FP16_BINARY_BOOLRET(>=)
 DEFINE_FP16_BINARY_BOOLRET(>)
 
 #define DEFINE_FP16_BINARY_SELF_MOD(x, op)                                     \
-    NTT_ALWAYS_INLINE half &operator x(half &a, half b) noexcept {             \
+    NTT_ALWAYS_INLINE NTT_HOST_DEVICE half &operator x(half &a, half b) noexcept { \
         a = a op b;                                                            \
         return a;                                                              \
     }
@@ -238,15 +240,15 @@ DEFINE_FP16_BINARY_SELF_MOD(-=, -)
 DEFINE_FP16_BINARY_SELF_MOD(*=, *)
 DEFINE_FP16_BINARY_SELF_MOD(/=, /)
 
-NTT_ALWAYS_INLINE half operator-(half a) noexcept {
+NTT_ALWAYS_INLINE NTT_HOST_DEVICE half operator-(half a) noexcept {
     return half::round_to_half(-float(a));
 }
 
-NTT_ALWAYS_INLINE bool operator==(const half &lhs, const half &rhs) noexcept {
+NTT_ALWAYS_INLINE NTT_HOST_DEVICE bool operator==(const half &lhs, const half &rhs) noexcept {
     return lhs.raw() == rhs.raw();
 }
 
-NTT_ALWAYS_INLINE bool operator!=(const half &lhs, const half &rhs) noexcept {
+NTT_ALWAYS_INLINE NTT_HOST_DEVICE bool operator!=(const half &lhs, const half &rhs) noexcept {
     return lhs.raw() != rhs.raw();
 }
 
