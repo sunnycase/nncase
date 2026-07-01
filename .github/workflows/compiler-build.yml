@@ -161,6 +161,111 @@ jobs:
           path: ${{github.workspace}}/src/Nncase.Compiler/bin/${{matrix.config.buildType}}/net${{matrix.dotnet-version}}/${{matrix.config.rid}}/publish
           if-no-files-found: error
 
+  test-cuda-kernels:
+    name: test-x86_64-linux-cuda
+    runs-on: [self-hosted, linux, x64, cuda]
+    timeout-minutes: 120
+
+    env:
+      BUILD_TYPE: Release
+      DOTNET_VERSION: '8.0'
+      NNCASE_CUDA_ARCHITECTURES: '120'
+
+    steps:
+      - uses: actions/checkout@v3
+      - uses: seanmiddleditch/gha-setup-ninja@master
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{env.DOTNET_VERSION}}
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Set up CUDA build environment
+        shell: bash
+        run: |
+          CUDA_ROOT="${CUDA_HOME:-${CUDA_PATH:-}}"
+          if [ -z "$CUDA_ROOT" ]; then
+            if [ -d /usr/local/cuda-12.8 ]; then
+              CUDA_ROOT=/usr/local/cuda-12.8
+            else
+              CUDA_ROOT=/usr/local/cuda
+            fi
+          fi
+          test -x "$CUDA_ROOT/bin/nvcc"
+          nvidia-smi
+          "$CUDA_ROOT/bin/nvcc" --version
+          clang++ --version
+          echo "CUDA_HOME=$CUDA_ROOT" >> $GITHUB_ENV
+          echo "CUDA_PATH=$CUDA_ROOT" >> $GITHUB_ENV
+          echo "CUDAToolkit_ROOT=$CUDA_ROOT" >> $GITHUB_ENV
+          echo "CMAKE_CUDA_COMPILER=clang++" >> $GITHUB_ENV
+          echo "CC=clang" >> $GITHUB_ENV
+          echo "CXX=clang++" >> $GITHUB_ENV
+          echo "$CUDA_ROOT/bin" >> $GITHUB_PATH
+          echo "LD_LIBRARY_PATH=$GITHUB_WORKSPACE/install/lib:$CUDA_ROOT/targets/x86_64-linux/lib:$CUDA_ROOT/lib64:${LD_LIBRARY_PATH:-}" >> $GITHUB_ENV
+
+      - name: Install Conan
+        shell: bash
+        run: |
+          pip install conan==2.6.0
+          pip install cmake==3.30.3
+          conan remote add sunnycase https://conan.sunnycase.moe --index 0 --force
+          conan remote update conancenter --url "https://center2.conan.io"
+
+      - name: Build CUDA native runtime
+        shell: bash
+        run: |
+          conan install . --build=missing -s build_type=$BUILD_TYPE -pr:a=toolchains/x86_64-linux-cuda.profile.jinja -o "&:runtime=False" -o "&:python=True" -o "&:tests=False"
+          cmake --preset conan-release \
+            -DCMAKE_CUDA_COMPILER=clang++ \
+            -DCMAKE_CUDA_ARCHITECTURES=$NNCASE_CUDA_ARCHITECTURES \
+            -DCUDAToolkit_ROOT="$CUDAToolkit_ROOT" \
+            -DENABLE_CUDA_RUNTIME=ON
+          cmake --build build/$BUILD_TYPE --config $BUILD_TYPE --parallel
+          cmake --install build/$BUILD_TYPE --prefix install
+
+      - name: Build .NET tests
+        shell: bash
+        run: |
+          dotnet restore -r linux-x64
+          dotnet build src/Nncase.Tests/Nncase.Tests.csproj -c $BUILD_TYPE --no-restore
+
+      - name: Set up Dotnet Test settings
+        shell: bash
+        run: |
+          cat > test.runsettings <<EOF
+          <?xml version="1.0" encoding="utf-8"?>
+          <RunSettings>
+            <RunConfiguration>
+              <EnvironmentVariables>
+                <LD_LIBRARY_PATH>$GITHUB_WORKSPACE/install/lib:$CUDA_HOME/targets/x86_64-linux/lib:$CUDA_HOME/lib64</LD_LIBRARY_PATH>
+                <NNCASE_TILING_MAX_SOLUTIONS>1</NNCASE_TILING_MAX_SOLUTIONS>
+              </EnvironmentVariables>
+            </RunConfiguration>
+          </RunSettings>
+          EOF
+
+      - name: Dotnet Test CUDA Kernels
+        working-directory: ${{github.workspace}}
+        shell: bash
+        run: |
+          dotnet test src/Nncase.Tests/Nncase.Tests.csproj -c $BUILD_TYPE -s test.runsettings --no-build --verbosity normal --filter "FullyQualifiedName~Nncase.Tests.TargetTest.UnitTestCUDAKernels" --blame --logger "trx;LogFileName=cuda-kernels.trx"
+
+      - name: Upload CUDA Test Results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: nncase-cuda-test-results
+          path: |
+            **/TestResults/*.trx
+            **/TestResults/*_Sequence.xml
+          if-no-files-found: ignore
+
   test-compiler:
     needs: [build-compiler]
     name: test-${{matrix.config.name}}
