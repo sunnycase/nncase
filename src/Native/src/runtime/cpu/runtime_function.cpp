@@ -45,6 +45,7 @@ typedef struct {
     uint32_t local_data_align;
     uint64_t output_pool_size;
     uint64_t local_data_pool_size;
+    uint64_t warp_local_data_pool_size;
     uint64_t block_local_data_pool_size;
 } kernel_desc_header;
 
@@ -59,8 +60,9 @@ cpu_runtime_module &cpu_runtime_function::module() const noexcept {
 
 result<void> cpu_runtime_function::initialize_core(
     runtime_function_init_context &context) noexcept {
+    const auto blocks_count = module().cdim() * module().bdim();
     try_(context.read_section(
-        ".desc", [this](auto reader, size_t) -> result<void> {
+        ".desc", [this, blocks_count](auto reader, size_t) -> result<void> {
             auto header = reader.template read<kernel_desc_header>();
 
             // Allocate output buffer
@@ -74,7 +76,6 @@ result<void> cpu_runtime_function::initialize_core(
 
             // Allocate thread local datas
             options.alignment = header.local_data_align;
-            auto blocks_count = module().cdim() * module().bdim();
             thread_local_datas_.resize(blocks_count);
             for (size_t i = 0; i < blocks_count; i++) {
                 try_var(buffer,
@@ -120,6 +121,21 @@ result<void> cpu_runtime_function::initialize_core(
             .shape = output_shapes_[i].data(),
             .strides = output_strides_[i].data(),
         };
+    }
+
+    // Allocate profiling records
+    if (module()
+            .interp()
+            .options()
+            .get_scalar_opt<uint8_t>("enable_profiling")
+            .or_(false)) {
+        profile_records_.resize(blocks_count);
+        profile_record_counts_.resize(blocks_count);
+        for (size_t i = 0; i < blocks_count; i++) {
+            profile_records_[i].resize(module().tdim() *
+                                       default_profile_record_count);
+            profile_record_counts_[i].resize(module().tdim());
+        }
     }
 
     return ok();

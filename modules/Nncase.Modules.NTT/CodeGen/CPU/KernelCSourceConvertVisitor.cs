@@ -27,7 +27,7 @@ namespace Nncase.CodeGen.NTT;
 /// </summary>
 internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisposable
 {
-    private readonly HashSet<string> _excludedVars = new() { "data", "block_local_data" };
+    private readonly HashSet<string> _excludedVars = new() { "data", "warp_local_data", "block_local_data" };
     private readonly StringBuilder _kernelBuilder;
     private readonly HashSet<TIR.PrimFunction> _refFuncs;
     private readonly HashSet<TIR.Buffer> _declaredBuffers = new(ReferenceEqualityComparer.Instance);
@@ -47,42 +47,20 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
 
     private Var[] TensorParams => _tensorParams ??= VisitEntry.Parameters.ToArray().OfType<Var>().Where(x => !_excludedVars.Contains(x.Name)).ToArray();
 
-    public static void WriteWithProfiler(string functionName, string tagName = "")
+    public void WriteWithProfiler(string functionName, string tagName = "")
     {
         functionName = functionName.TrimEnd(new char[] { ';', '\n' });
-        if (tagName == string.Empty)
-        {
-            int index = functionName.IndexOf('(', StringComparison.Ordinal); // 找到第一个 '(' 的位置
-            if (index != -1)
-            {
-                tagName = functionName.Substring(0, index); // 截取从头到 '(' 之前的部分
-            }
-        }
-
-        tagName = tagName == string.Empty ? functionName : tagName;
         IndentScope.Writer.IndWrite("{\n");
-        IndentScope.Writer.Write($"constexpr std::string_view function_name = \"{tagName}\";\n");
-        IndentScope.Writer.Write($"auto_profiler profiler(function_name, runtime::profiling_level::kernel);\n");
+        IndentScope.Writer.Write($"profile_scope profiler(0, profile_level::kernel);\n");
         IndentScope.Writer.Write($"{functionName};\n");
         IndentScope.Writer.IndWrite("}\n");
     }
 
-    public static void WriteIndWithProfiler(string functionName, string tagName = "")
+    public void WriteIndWithProfiler(string functionName, string tagName = "")
     {
         functionName = functionName.TrimEnd(new char[] { ';', '\n' });
-        if (tagName == string.Empty)
-        {
-            int index = functionName.IndexOf('(', StringComparison.Ordinal); // 找到第一个 '(' 的位置
-            if (index != -1)
-            {
-                tagName = functionName.Substring(0, index); // 截取从头到 '(' 之前的部分
-            }
-        }
-
-        tagName = tagName == string.Empty ? functionName : tagName;
         IndentScope.Writer.IndWrite("{\n");
-        IndentScope.Writer.IndWrite($"constexpr std::string_view function_name = \"{tagName}\";\n");
-        IndentScope.Writer.IndWrite($"auto_profiler profiler(function_name, runtime::profiling_level::kernel);\n");
+        IndentScope.Writer.IndWrite($"profile_scope profiler(0, profile_level::kernel);\n");
         IndentScope.Writer.IndWrite($"{functionName};\n");
         IndentScope.Writer.IndWrite("}\n");
     }
@@ -92,7 +70,7 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
         var paramsExcluded = VisitEntry.Parameters.ToArray().OfType<IVar>().Where(x => !_excludedVars.Contains(x.Name)).ToArray();
         var templateHeader = TensorParams.Length == 0 ? string.Empty : $"template<{string.Join(", ", Enumerable.Range(0, TensorParams.Length).Select(x => $"class T{x}"))}>" + Environment.NewLine;
         var ctype = templateHeader +
-            $"void {VisitEntry.Name}({string.Concat(paramsExcluded.Select(Visit).Select(s => $"{s.Type} {s.Name}, ").ToArray())}const std::byte *rdata, const std::byte *thread_local_rdata, const std::byte *block_local_rdata, std::byte *thread_local_data, std::byte *block_local_data, std::byte *output, nncase::ntt::runtime::thread_inout_desc *const output_descs)";
+            $"NTT_DEVICE void {VisitEntry.Name}({string.Concat(paramsExcluded.Select(Visit).Select(s => $"{s.Type} {s.Name}, ").ToArray())}const std::byte *rdata, const std::byte *thread_local_rdata, const std::byte *warp_local_rdata, const std::byte *block_local_rdata, std::byte *thread_local_data, std::byte *warp_local_data, std::byte *block_local_data, std::byte *output, nncase::ntt::runtime::thread_inout_desc *const output_descs)";
         return new(
             Declare: ctype + ";\n",
             Kernel: CSourceBuiltn.MakeKernel(ctype, _kernelBuilder.ToString()),
@@ -181,21 +159,24 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
             return symbol;
         }
 
-        var start = Visit(expr.Start);
+        var start = expr.Start is None ? null : Visit(expr.Start);
         string loc = (expr.Location, expr.Hierarchy) switch
         {
             (MemoryLocation.Rdata, 0) => "rdata",
             (MemoryLocation.ThreadLocalRdata, 0) => "thread_local_rdata",
+            (MemoryLocation.WarpLocalRdata, 0) => "warp_local_rdata",
             (MemoryLocation.BlockLocalRdata, 0) => "block_local_rdata",
             (MemoryLocation.Data, 0) => "thread_local_data",
             (MemoryLocation.Data, 1) => "thread_local_data",
+            (MemoryLocation.WarpLocalData, 0) => "warp_local_data",
             (MemoryLocation.BlockLocalData, 0) => "block_local_data",
             (MemoryLocation.Output, 0) => "output",
             _ => throw new NotSupportedException($"{expr.Location}, {expr.Hierarchy}"),
         };
+        var address = start is null ? loc : $"{loc} + {start.Name}UL";
 
         var ptypeName = "std::byte";
-        if (expr.Location is MemoryLocation.Rdata or MemoryLocation.ThreadLocalRdata or MemoryLocation.BlockLocalRdata)
+        if (expr.Location is MemoryLocation.Rdata or MemoryLocation.ThreadLocalRdata or MemoryLocation.WarpLocalRdata or MemoryLocation.BlockLocalRdata)
         {
             // Rdata, ThreadLocalRdata and BlockLocalRdata are const
             ptypeName = $"const {ptypeName}";
@@ -205,15 +186,15 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
         if (expr.Size is DimConst)
         {
             var spanSize = (ulong)expr.Size.FixedValue;
-            name = $"std::span<{ptypeName}, {spanSize}>({loc} + {start.Name}UL, {spanSize})";
+            name = $"ntt::span<{ptypeName}, {spanSize}>({address}, {spanSize})";
         }
         else
         {
             var spanSize = Visit(expr.Size).Name;
-            name = $"std::span<{ptypeName}>({loc} + {start.Name}UL, {spanSize})";
+            name = $"ntt::span<{ptypeName}>({address}, {spanSize})";
         }
 
-        symbol = new(start.Type, name);
+        symbol = new(start?.Type ?? "dim_t", name);
         _exprMemo.Add(expr, symbol);
         return symbol;
     }
@@ -251,7 +232,7 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
         var dimensionStr = $"shape_t<{StringUtility.Join(", ", dimensionTypes)}>";
         var strideStr = $"strides_t<{StringUtility.Join(", ", strideTypes)}>";
 
-        var type = expr.MemSpan.Buffer.Location is MemoryLocation.Rdata or MemoryLocation.ThreadLocalRdata or MemoryLocation.BlockLocalRdata || expr.MemSpan.Buffer.Start is TensorConst
+        var type = expr.MemSpan.Buffer.Location is MemoryLocation.Rdata or MemoryLocation.ThreadLocalRdata or MemoryLocation.WarpLocalRdata or MemoryLocation.BlockLocalRdata || expr.MemSpan.Buffer.Start is TensorConst
             ? (expr.DistributedType == null
              ? $"tensor_view<{dtypeStr}, {dimensionStr}, {strideStr}> "
              : $"sharded_tensor_view<{dtypeStr}, {dimensionStr}, {KernelUtility.ShardingToC(expr.DistributedType)}, {strideStr}> ")
@@ -471,7 +452,7 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
                     WriteWithProfiler($"slice({VisitBuffer(args[0], local: true).Name}, {VisitBuffer(args[3], local: true).Name}, {VisitDimOrShape(args[1]).Name}, {VisitDimOrShape(args[2]).Name}, fixed_dims_v<{string.Join(",", slice.Axes)}>, fixed_dims_v<{string.Join(",", slice.Strides)}>);\n");
                     break;
                 case TIR.NTT.Concat concat:
-                    WriteWithProfiler($"concat(std::make_tuple({string.Join(",", args.SkipLast(1).Select(x => VisitBuffer(x, local: true)).Select(s => s.Name))}), {VisitBuffer(args[^1], local: true).Name}, {concat.Axis}_dim);\n");
+                    WriteWithProfiler($"concat(ntt::make_tuple({string.Join(",", args.SkipLast(1).Select(x => VisitBuffer(x, local: true)).Select(s => s.Name))}), {VisitBuffer(args[^1], local: true).Name}, {concat.Axis}_dim);\n");
                     break;
                 case TIR.NTT.Transpose transpose:
                     WriteWithProfiler($"transpose({VisitBuffer(args[0], local: true).Name}, {VisitBuffer(args[1], local: true).Name}, fixed_dims_v<{string.Join(",", transpose.Perm)}>);\n");
@@ -555,7 +536,7 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
                     WriteIndWithProfiler($"get_position_ids({VisitBuffer(args[0], local: true).Name}, {VisitBuffer(args[1], local: true).Name}, {KernelUtility.ShardingToC(getPositionIds.DistributedType)}, {Visit(getPositionIds.DistributedType.TensorType.Shape).Name});\n");
                     break;
                 case TIR.NTT.Stack stack:
-                    IndentScope.Writer.Write($"stack<{stack.Axis}>(std::make_tuple({string.Join(",", args.SkipLast(1).Select(x => VisitBuffer(x, local: true)).Select(s => s.Name))}), {VisitBuffer(args[^1], local: true).Name});\n");
+                    IndentScope.Writer.Write($"stack<{stack.Axis}>(ntt::make_tuple({string.Join(",", args.SkipLast(1).Select(x => VisitBuffer(x, local: true)).Select(s => s.Name))}), {VisitBuffer(args[^1], local: true).Name});\n");
                     break;
                 case TIR.NTT.Reshape reshape:
                     IndentScope.Writer.Write($"reshape({VisitBuffer(args[0], local: true).Name}, {VisitBuffer(args[1], local: true).Name});\n");
@@ -623,7 +604,9 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
             IndentScope.Writer.IndWrite($"runtime_util->printf(\"call {deviceFunc.Name} bid %d tid %d\\n\", bid, tid);\n");
 #endif
             var argumentNames = new List<string>();
-            string? dataName = null;
+            string? dataBufferName = null;
+            string? warpLocalDataBufferName = null;
+            string? blockLocalDataBufferName = null;
             foreach (var arg in expr.Arguments)
             {
                 if (arg is TIR.Buffer b)
@@ -631,11 +614,15 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
                     var buffer = VisitBuffer(b, local: true);
                     if (b.Name.StartsWith("data_"))
                     {
-                        dataName = $"rdata, thread_local_rdata, block_local_rdata, (std::byte *){buffer.Name}.buffer().data(), <block_local_data>, output, output_descs";
+                        dataBufferName = buffer.Name;
+                    }
+                    else if (b.Name.StartsWith("warp_local_data_"))
+                    {
+                        warpLocalDataBufferName = buffer.Name;
                     }
                     else if (b.Name.StartsWith("block_local_data_"))
                     {
-                        dataName = dataName!.Replace("<block_local_data>", $"(std::byte *){buffer.Name}.buffer().data()", StringComparison.Ordinal);
+                        blockLocalDataBufferName = buffer.Name;
                     }
                     else
                     {
@@ -648,9 +635,19 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
                 }
             }
 
-            if (dataName is not null)
+            if (!deviceFunc.Name.StartsWith("device_func"))
             {
-                argumentNames.Add(dataName);
+                var threadLocalDataName = dataBufferName is null
+                    ? "thread_local_data"
+                    : $"(std::byte *){dataBufferName}.buffer().data()";
+                var warpLocalDataName = warpLocalDataBufferName is null
+                    ? "warp_local_data"
+                    : $"(std::byte *){warpLocalDataBufferName}.buffer().data()";
+                var blockLocalDataName = blockLocalDataBufferName is null
+                    ? "block_local_data"
+                    : $"(std::byte *){blockLocalDataBufferName}.buffer().data()";
+                argumentNames.Add(
+                    $"rdata, thread_local_rdata, warp_local_rdata, block_local_rdata, {threadLocalDataName}, {warpLocalDataName}, {blockLocalDataName}, output, output_descs");
             }
 
             _refFuncs.Add(deviceFunc);
@@ -878,9 +875,10 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
         if (_declaredBuffers.Add(buffer))
         {
             IndentScope.Writer.IndWrite($"auto {symbol.Name}");
-            if (buffer.MemSpan.Buffer.Start is not None)
+            if (buffer.MemSpan.Buffer.Start is not None ||
+                buffer.MemSpan.Buffer.Location is MemoryLocation.Data or MemoryLocation.WarpLocalData or MemoryLocation.BlockLocalData)
             {
-                // If the buffer has a start, we create a tensor view
+                // Runtime local-data buffers use the function tail pointers as their backing storage.
                 var dtypeStr = buffer.ElemType.ToC();
                 var dimensions = buffer.DistributedType is null ? buffer.Dimensions : ((RankedShape)buffer.DistributedType.TensorType.Shape).Dimensions;
                 var spanStr = $"span_cast<{dtypeStr}>({Visit(buffer.MemSpan).Name})";

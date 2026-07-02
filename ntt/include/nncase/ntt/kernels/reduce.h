@@ -14,11 +14,10 @@
  */
 #pragma once
 #include "../primitive_ops.h"
+#include "../shape.h"
 #include "../shape_infer/reduce.h"
 #include "../ukernels.h"
 #include "../utility.h"
-#include "nncase/ntt/dimension.h"
-#include "nncase/ntt/tensor_traits.h"
 #include <limits>
 
 namespace nncase::ntt {
@@ -152,11 +151,10 @@ class reduce_impl {
         }
     }
 
-    template <size_t Axis, class TSubIn>
-    constexpr void
-    apply_contiguous_reduce(dynamic_shape_t<TSubIn::rank()> &index,
-                            size_t conti_dims, const TSubIn &input,
-                            TInElem &reduced_in) {
+    template <size_t Axis, class TIndex, class TSubIn>
+    constexpr void apply_contiguous_reduce(TIndex &index, size_t conti_dims,
+                                           const TSubIn &input,
+                                           TInElem &reduced_in) {
         const auto outer_dims = TSubIn::rank() - conti_dims;
         const auto axis_v = fixed_dim_v<Axis>;
         if (Axis >= outer_dims) {
@@ -201,9 +199,11 @@ template <reduce_op Op, bool LoadPrevious = false, Tensor TIn, class TOut,
           FixedDimensions VectorizedAxes = shape_t<>,
           FixedDimensions PadedNums =
               decltype(make_zeros_shape<VectorizedAxes::rank()>())>
-void reduce(const TIn &input, TOut &&output, const TReduceAxes &reduce_axes,
-            const VectorizedAxes &vectorized_axes = {},
-            [[maybe_unused]] const PadedNums &paded_nums = {}) noexcept {
+constexpr void
+reduce(const TIn &input, TOut &&output,
+       [[maybe_unused]] const TReduceAxes &reduce_axes,
+       [[maybe_unused]] const VectorizedAxes &vectorized_axes = {},
+       [[maybe_unused]] const PadedNums &paded_nums = {}) noexcept {
     static_assert(!(LoadPrevious && Op == reduce_op::mean),
                   "not support reduce mean splited on reduce axis");
     detail::reduce_impl<Op, LoadPrevious, TIn, std::decay_t<TOut>, PadedNums>
@@ -217,10 +217,10 @@ void reduce(const TIn &input, TOut &&output, const TReduceAxes &reduce_axes,
               FixedDimensions VectorizedAxes = shape_t<>,                      \
               FixedDimensions PadedNums =                                      \
                   decltype(make_zeros_shape<VectorizedAxes::rank()>())>        \
-    void reduce_##op(const TIn &input, TOut &&output,                          \
-                     const TReduceAxes &reduce_axes,                           \
-                     const VectorizedAxes &vectorized_axes = {},               \
-                     const PadedNums &paded_nums = {}) noexcept {              \
+    constexpr void reduce_##op(const TIn &input, TOut &&output,                \
+                               const TReduceAxes &reduce_axes,                 \
+                               const VectorizedAxes &vectorized_axes = {},     \
+                               const PadedNums &paded_nums = {}) noexcept {    \
         return reduce<reduce_op::op, LoadPrevious>(                            \
             input, std::forward<TOut>(output), reduce_axes, vectorized_axes,   \
             paded_nums);                                                       \

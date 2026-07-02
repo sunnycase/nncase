@@ -24,8 +24,9 @@ class compare_impl : public binary_like_impl<compare_impl<TLhs, TRhs, TOut>,
                                              TLhs, TRhs, TOut> {
   public:
     template <Tensor TBroadcastedLhs, Tensor TBroadcastedRhs, class Op>
-    void invoke_ukernel(const TBroadcastedLhs &lhs, const TBroadcastedRhs &rhs,
-                        TOut &output, const Op &op) {
+    constexpr void invoke_ukernel(const TBroadcastedLhs &lhs,
+                                  const TBroadcastedRhs &rhs, TOut &output,
+                                  const Op &op) {
         ntt::apply(output.shape(), [&](auto index) {
             output(index) = op(lhs(index), rhs(index));
         });
@@ -35,7 +36,7 @@ class compare_impl : public binary_like_impl<compare_impl<TLhs, TRhs, TOut>,
 
 template <template <class T1, class T2> class Op, Tensor TLhs, Tensor TRhs,
           class TOut>
-void compare(
+constexpr void compare(
     const TLhs &lhs, const TRhs &rhs, TOut &&output,
     const Op<typename TLhs::value_type, typename TRhs::value_type> &op = {}) {
     detail::compare_impl<TLhs, TRhs, std::decay_t<TOut>>()(lhs, rhs, output,

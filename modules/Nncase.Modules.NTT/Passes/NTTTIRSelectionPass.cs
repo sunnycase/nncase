@@ -154,7 +154,7 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
             case IR.NN.Erf erf:
                 return TIR.F.NTT.Erf((Expr)arguments[0], output);
             case IR.NTT.VectorizedReduce pr:
-                return TIR.F.NTT.Reduce((Expr)arguments[0], output, false, pr.VectorizedAxes.ToArray(), ((RankedShape)call[IR.NTT.VectorizedReduce.PadedNums]).Dimensions.ToArray(), pr.Axes, pr.KeepDims, pr.ReduceOp);
+                return TIR.F.NTT.Reduce((Expr)arguments[0], output, false, pr.VectorizedAxes.ToArray(), ((RankedShape)call[IR.NTT.VectorizedReduce.PadedNums]).Dimensions.ToArray(), pr.Axes.Select(x => Util.PositiveIndex(x, arguments[0].CheckedTensorType)).OrderBy(a => a).ToArray().ToInts(), pr.KeepDims, pr.ReduceOp);
             case IR.Math.Compare compare:
                 return TIR.F.NTT.Compare(compare.CompareOp, (Expr)arguments[0], (Expr)arguments[1], output);
             case IR.Tensors.GetItem getItem:

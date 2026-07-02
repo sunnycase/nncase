@@ -36,7 +36,7 @@
 */
 #pragma once
 
-#if defined(__GNUC__) && defined(__x86_64__)
+#if defined(__GNUC__) && defined(__x86_64__) && !defined(__clang__)
 #pragma GCC optimize("no-strict-aliasing")
 #endif
 
@@ -81,11 +81,12 @@
 // #include <cuda_fp16.h>
 
 // #include "nncase/nncase.h"
+#include "ntt/compiler_defs.h"
 #include "bfloat16.h"
 #include "half.h"
 #ifndef CUTLASS_HOST_DEVICE
-#define CUTLASS_HOST_DEVICE inline
-#define CUTLASS_DEVICE inline
+#define CUTLASS_HOST_DEVICE NTT_HOST_DEVICE inline
+#define CUTLASS_DEVICE NTT_DEVICE inline
 #endif // !CUTLASS_HOST_DEVICE
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -1384,22 +1385,22 @@ struct numeric_limits<nncase::float_e5m2_t>
 //
 
 CUTLASS_HOST_DEVICE
-nncase::float_e4m3_t operator"" _fe4m3(long double x) {
+nncase::float_e4m3_t operator""_fe4m3(long double x) {
     return nncase::float_e4m3_t(float(x));
 }
 
 CUTLASS_HOST_DEVICE
-nncase::float_e4m3_t operator"" _fe4m3(unsigned long long int x) {
+nncase::float_e4m3_t operator""_fe4m3(unsigned long long int x) {
     return nncase::float_e4m3_t(int(x));
 }
 
 CUTLASS_HOST_DEVICE
-nncase::float_e5m2_t operator"" _fe5m2(long double x) {
+nncase::float_e5m2_t operator""_fe5m2(long double x) {
     return nncase::float_e5m2_t(float(x));
 }
 
 CUTLASS_HOST_DEVICE
-nncase::float_e5m2_t operator"" _fe5m2(unsigned long long int x) {
+nncase::float_e5m2_t operator""_fe5m2(unsigned long long int x) {
     return nncase::float_e5m2_t(int(x));
 }
 

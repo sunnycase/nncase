@@ -20,6 +20,7 @@
 #include <nncase/llm/paged_attention_config.h>
 #include <nncase/runtime/simple_types.h>
 #include <nncase/value.h>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 
@@ -139,6 +140,7 @@ typedef struct {
         clr_object_handle_t fn_params);
     void (*handle_dispose)(clr_object_handle_t handle);
     void (*handle_free)(clr_object_handle_t handle);
+    void (*string_free)(char *value);
     clr_object_handle_t (*import_options_create)();
     clr_object_handle_t (*huggingface_options_create)();
     void (*import_options_set_huggingface_options)(
@@ -227,8 +229,8 @@ typedef struct {
         clr_object_handle_t compiler, const char *model_dir,
         size_t model_dir_length, clr_object_handle_t import_options);
     void (*compiler_compile)(clr_object_handle_t compiler);
-    void (*compiler_gencode)(clr_object_handle_t compiler,
-                             clr_object_handle_t stream);
+    char *(*compiler_gencode)(clr_object_handle_t compiler,
+                              clr_object_handle_t stream);
     clr_object_handle_t (*datatype_from_typecode)(nncase::typecode_t typecode);
     clr_object_handle_t (*expr_evaluate)(clr_object_handle_t expr,
                                          clr_object_handle_t parameters,
@@ -1018,7 +1020,12 @@ class compiler : public clr_object_base {
 
     void compile() { nncase_clr_api()->compiler_compile(obj_.get()); }
     void gencode(cstream &stream) {
-        nncase_clr_api()->compiler_gencode(obj_.get(), stream.get());
+        if (auto error =
+                nncase_clr_api()->compiler_gencode(obj_.get(), stream.get())) {
+            std::string message(error);
+            nncase_clr_api()->string_free(error);
+            throw std::runtime_error(message);
+        }
     }
 };
 

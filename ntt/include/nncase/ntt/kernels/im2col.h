@@ -33,11 +33,12 @@ template <Tensor TIn, Tensor TOut, Dimensions TKernel, Dimensions TStrides,
           Paddings TPadding, FixedShape VectorizedAxes, FixedShape PadedNums>
     requires(VectorizedAxes::rank() == 0 ||
              (VectorizedAxes::rank() == 1 && VectorizedAxes{}.at(0) == 1))
-void im2col_impl(const TIn &input, TOut &output,
-                 [[maybe_unused]] const TKernel &kernel,
-                 const TStrides &strides, const TPadding &padding,
-                 [[maybe_unused]] const VectorizedAxes &vectorizedAxes,
-                 [[maybe_unused]] const PadedNums &padedNums) {
+constexpr void
+im2col_impl(const TIn &input, TOut &output,
+            [[maybe_unused]] const TKernel &kernel, const TStrides &strides,
+            const TPadding &padding,
+            [[maybe_unused]] const VectorizedAxes &vectorizedAxes,
+            [[maybe_unused]] const PadedNums &padedNums) {
     using TElem = typename TIn::element_type;
     const auto input_shape = input.shape();
     const auto input_strides = input.strides();
@@ -49,7 +50,10 @@ void im2col_impl(const TIn &input, TOut &output,
     const auto OW = shape_infer::windowed_output_size(
         input_shape[3_dim], kernel[1_dim], strides[1_dim], 1_dim,
         padding[1_dim]);
-    const auto [batch, IC, IH, IW] = input_shape;
+    const auto batch = input_shape[0_dim];
+    const auto IC = input_shape[1_dim];
+    const auto IH = input_shape[2_dim];
+    const auto IW = input_shape[3_dim];
     const auto pad_h = padding[0_dim];
     const auto pad_w = padding[1_dim];
     const auto kernel_h = kernel[0_dim];
@@ -99,11 +103,12 @@ void im2col_impl(const TIn &input, TOut &output,
  */
 template <Tensor TIn, class TOut, Dimensions TKernel, Dimensions TStrides,
           Paddings TPadding = decltype(make_zeros_paddings<2>()),
-          FixedShape VectorizedAxes = shape_t<>, FixedShape PadedNums = shape_t<>>
-void im2col(const TIn &input, TOut &&output, const TKernel &kernel,
-            const TStrides &strides, const TPadding &padding = {},
-            const VectorizedAxes &vectorizedAxes = {},
-            const PadedNums &padedNums = {}) {
+          FixedShape VectorizedAxes = shape_t<>,
+          FixedShape PadedNums = shape_t<>>
+constexpr void im2col(const TIn &input, TOut &&output, const TKernel &kernel,
+                      const TStrides &strides, const TPadding &padding = {},
+                      const VectorizedAxes &vectorizedAxes = {},
+                      const PadedNums &padedNums = {}) {
     im2col_details::im2col_impl(input, output, kernel, strides, padding,
                                 vectorizedAxes, padedNums);
 }

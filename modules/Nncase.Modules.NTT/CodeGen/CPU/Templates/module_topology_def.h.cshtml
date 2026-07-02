@@ -1,14 +1,14 @@
 @using System.Linq
 @using NetFabric.Hyperlinq
 @using Nncase
-@model Nncase.Targets.NTTTargetOptions
 @{
-  var hierarchy = Model.Hierarchies[0];
+  var hierarchy = (int[])Model.Hierarchies;
+  var topologyLevels = Model.IsCUDA ? 4 : 3;
 }
 
 #pragma once
 #include <nncase/ntt/shape.h>
 
 namespace nncase::ntt::distributed {
-    constexpr auto topology_shape = ntt::fixed_shape_v<@(string.Join(", ", Enumerable.Repeat(1, 3 - hierarchy.Length).Concat(hierarchy)))>;
+    constexpr auto topology_shape = ntt::fixed_shape_v<@(string.Join(", ", Enumerable.Repeat(1, topologyLevels - hierarchy.Length).Concat(hierarchy)))>;
 }

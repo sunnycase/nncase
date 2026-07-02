@@ -30,32 +30,42 @@ public enum MemoryLocation
     /// <summary>
     /// thread local constant data.
     /// </summary>
-    ThreadLocalRdata = 1 << 4,
+    ThreadLocalRdata = 1 << 5,
+
+    /// <summary>
+    /// lane local constant data.
+    /// </summary>
+    WarpLocalRdata = 1 << 4,
 
     /// <summary>
     /// block local constant data.
     /// </summary>
-    BlockLocalRdata = 1 << 5,
+    BlockLocalRdata = 1 << 6,
 
     /// <summary>
     /// compute temp data.
     /// </summary>
-    Data = 1 << 6,
+    Data = 1 << 7,
+
+    /// <summary>
+    /// warp local data.
+    /// </summary>
+    WarpLocalData = 1 << 8,
 
     /// <summary>
     /// block local data.
     /// </summary>
-    BlockLocalData = 1 << 7,
+    BlockLocalData = 1 << 9,
 
     /// <summary>
     /// cache.
     /// </summary>
-    Cache = 1 << 8,
+    Cache = 1 << 10,
 
     /// <summary>
     /// base addr.
     /// </summary>
-    PrivateBase = 1 << 10,
+    PrivateBase = 1 << 11,
 }
 
 public sealed class PhysicalBuffer : BaseExpr

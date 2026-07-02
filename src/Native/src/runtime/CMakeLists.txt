@@ -17,7 +17,7 @@ set(SRCS buffer.cpp
 		 type_serializer.cpp
 		 tensor_serializer.cpp
 		 runtime_tensor.cpp
-         dump_manager.cpp)
+     dump_manager.cpp)
 
 if ((NOT BUILDING_RUNTIME) OR DEFAULT_SHARED_RUNTIME_TENSOR_PLATFORM_IMPL)
     list(APPEND SRCS host_allocator.cpp)
@@ -33,11 +33,14 @@ if (BUILDING_RUNTIME)
     if (ENABLE_DUMP_MANAGER)
       target_compile_definitions(runtime PUBLIC -DNNCASE_DUMP_MANAGER)
     endif()
+    if (ENABLE_CUDA_RUNTIME)
+      target_compile_definitions(runtime PRIVATE -DNNCASE_ENABLE_CUDA_RUNTIME)
+    endif()
     set_property(TARGET runtime PROPERTY POSITION_INDEPENDENT_CODE ON)
     install(TARGETS runtime EXPORT nncaseruntimeTargets)
 
     add_library(nncaseruntime STATIC dummy.cpp)
-    target_link_libraries(nncaseruntime PUBLIC nlohmann_json::nlohmann_json PRIVATE nncasebase runtime runtime_cpu cpu_loaders)
+    target_link_libraries(nncaseruntime PUBLIC nlohmann_json::nlohmann_json PRIVATE nncasebase runtime)
     set_target_properties(nncaseruntime PROPERTIES
                                         OUTPUT_NAME "Nncase.Runtime.Native")
     install(TARGETS nncaseruntime EXPORT nncaseruntimeTargets
@@ -63,10 +66,13 @@ else()
     if (ENABLE_DUMP_MANAGER)
       target_compile_definitions(simulator PUBLIC -DNNCASE_DUMP_MANAGER)
     endif()
+    if (ENABLE_CUDA_RUNTIME)
+      target_compile_definitions(simulator PRIVATE -DNNCASE_ENABLE_CUDA_RUNTIME)
+    endif()
     set_property(TARGET simulator PROPERTY POSITION_INDEPENDENT_CODE ON)
     
     add_library(nncaseruntime SHARED dummy.cpp)
-    target_link_libraries(nncaseruntime PUBLIC nlohmann_json::nlohmann_json PRIVATE nncasebase simulator compiler simulator_cpu cpu_loaders fmt::fmt)
+    target_link_libraries(nncaseruntime PUBLIC nlohmann_json::nlohmann_json PRIVATE nncasebase simulator compiler fmt::fmt)
     target_compile_definitions(nncaseruntime PUBLIC -DNNCASE_SHARED_LIBS)
     if (NOT (WIN32 OR APPLE))
       target_link_libraries(nncaseruntime PRIVATE dl pthread)
@@ -89,3 +95,6 @@ else()
 endif()
 
 add_subdirectory(cpu)
+if (ENABLE_CUDA_RUNTIME)
+    add_subdirectory(cuda)
+endif()

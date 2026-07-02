@@ -116,9 +116,6 @@ struct tensor_binary_impl<Op, TVector, T2> {
 
         return value;
     }
-
-    //   private:
-    //     Op<element_type1, element_type2> op_;
 };
 
 // T1 scalar, T2 1D vector or 2D vector
@@ -823,14 +820,15 @@ struct vmma {
 namespace nncase::ntt {
 template <Scalar T, FixedShape Lanes>
 template <ScalarOrVector U>
-basic_vector<T, Lanes> basic_vector<T, Lanes>::from_scalar(U value) noexcept {
+constexpr basic_vector<T, Lanes>
+basic_vector<T, Lanes>::from_scalar(U value) noexcept {
     return vector_ops::vload_scalar<basic_vector<T, Lanes>>()(value);
 }
 
 template <Scalar T, FixedShape Lanes>
 template <ScalarOrVector U>
-basic_vector<T, Lanes>
-basic_vector<T, Lanes>::unaligned_load_from(const U *ptr) noexcept {
+basic_vector<T, Lanes> constexpr basic_vector<T, Lanes>::unaligned_load_from(
+    const U *ptr) noexcept {
     return vector_ops::vunaligned_load<basic_vector<T, Lanes>, U>()(ptr);
 }
 

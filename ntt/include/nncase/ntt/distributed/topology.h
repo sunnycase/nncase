@@ -13,8 +13,11 @@
  * limitations under the License.
  */
 #pragma once
+#include "nncase/ntt/compiler_defs.h"
 #if defined(NNCASE_XPU_MODULE)
 #include "../arch/xpu/topology_def.h"
+#elif defined(__CUDA_ARCH__)
+#include "../arch/cuda/topology_def.h"
 #else
 #include "../arch/cpu/topology_def.h"
 #endif
@@ -70,17 +73,17 @@ constexpr auto topology_up_size() noexcept {
 }
 
 template <topology Topology> struct program_id_getter {
-    static dim_t id() noexcept;
+    NTT_HOST_DEVICE static dim_t id() noexcept;
 };
 
-template <topology Topology> dim_t program_id() noexcept {
+template <topology Topology> NTT_HOST_DEVICE dim_t program_id() noexcept {
     return program_id_getter<Topology>::id();
 }
 
 bool get_profiler_option() noexcept;
 
 template <topology Scope = (topology)(topology_levels - 1)>
-auto program_ids() noexcept {
+NTT_HOST_DEVICE auto program_ids() noexcept {
     auto f = []<size_t... Is>(std::index_sequence<Is...>) {
         return make_shape(program_id<static_cast<topology>(Is)>()...);
     };
@@ -89,7 +92,8 @@ auto program_ids() noexcept {
 
 template <topology Scope> class topology_synchronizer;
 
-template <topology Scope = (topology)0> void topology_synchronize() noexcept {
+template <topology Scope = (topology)0>
+NTT_HOST_DEVICE void topology_synchronize() noexcept {
     topology_synchronizer<Scope>::synchronize();
 }
 } // namespace nncase::ntt::distributed

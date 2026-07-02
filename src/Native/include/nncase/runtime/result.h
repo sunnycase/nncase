@@ -283,6 +283,13 @@ template <class T> class NNCASE_NODISCARD result {
             return std::move(*this);
     }
 
+    constexpr const T &or_(const T &default_value) noexcept {
+        if (is_ok())
+            return ok_;
+        else
+            return default_value;
+    }
+
   private:
     void destroy() {
         if (is_ok())

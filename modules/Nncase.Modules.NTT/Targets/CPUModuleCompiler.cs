@@ -11,7 +11,7 @@ using Nncase.Passes;
 
 namespace Nncase.Targets;
 
-public class NTTModuleCompiler : IModuleCompiler
+public class CPUModuleCompiler : INTTModuleCompiler
 {
     public string ModuleKind => CPUTarget.Kind;
 
@@ -35,7 +35,7 @@ public class NTTModuleCompiler : IModuleCompiler
         _ => throw new NotSupportedException($"Unsupported architecture: {RuntimeInformation.ProcessArchitecture}"),
     };
 
-    public IModuleBuilder CreateModuleBuilder(CompileOptions options) => new NTTModuleBuilder(options);
+    public IModuleBuilder CreateModuleBuilder(CompileOptions options) => new NTTModuleBuilder(ModuleKind, options);
 
     public bool IsSupportedCall(Call call, CompileOptions options)
     {

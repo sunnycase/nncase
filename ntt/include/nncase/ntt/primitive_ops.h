@@ -41,7 +41,9 @@ namespace ops {
  */
 
 template <prefetch_hint Hint, bool Arch> struct prefetch {
-    void operator()(const void *ptr) const noexcept { __builtin_prefetch(ptr); }
+    constexpr void operator()(const void *ptr) const noexcept {
+        __builtin_prefetch(ptr);
+    }
 };
 
 template <class TDest, class TSource> struct store {
@@ -198,7 +200,7 @@ template <class T1, class T2> struct ceil_div {
  */
 template <class T1, class T2> struct floor_mod {
     constexpr auto operator()(const T1 &v1, const T2 &v2) const noexcept {
-#ifdef __clang__
+#if defined(__clang__) && !defined(__CUDA_ARCH__)
 #pragma float_control(precise, on)
 #endif
         return (T1)(double(v1) - std::floor(static_cast<double>(v1) /
@@ -486,7 +488,7 @@ constexpr T1 clamp(const T1 &v, const T2 &min, const T2 &max) noexcept {
     return ops::clamp<T1, T2>()(v, min, max);
 }
 
-template <ScalarOrVector TCond, ScalarOrVector TX, ScalarOrVector TY>
+template <class TCond, class TX, class TY>
 constexpr auto where(const TCond &cond, const TX &x, const TY &y) noexcept {
     return ops::where<TCond, TX, TY>()(cond, x, y);
 }

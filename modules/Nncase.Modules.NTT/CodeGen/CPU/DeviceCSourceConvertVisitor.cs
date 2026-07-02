@@ -47,7 +47,7 @@ public class DeviceCSourceConvertVisitor : CSourceConvertVisitor
         IndentScope.Writer.IndWrite("{\n");
 #if false // Disable device profiling for now.
         IndentScope.Writer.Write($"constexpr std::string_view function_name = \"{tagName}\";\n");
-        IndentScope.Writer.Write($"auto_profiler profiler(function_name, runtime::profiling_level::device);\n");
+        IndentScope.Writer.Write($"profile_scope profiler(function_name, profile_level::device);\n");
 #endif
         IndentScope.Writer.Write($"{functionName};\n");
         IndentScope.Writer.IndWrite("}\n");
@@ -69,7 +69,7 @@ public class DeviceCSourceConvertVisitor : CSourceConvertVisitor
         IndentScope.Writer.IndWrite("{\n");
 #if false // Disable device profiling for now.
         IndentScope.Writer.IndWrite($"constexpr std::string_view function_name = \"{tagName}\";\n");
-        IndentScope.Writer.IndWrite($"auto_profiler profiler(function_name, runtime::profiling_level::device);\n");
+        IndentScope.Writer.IndWrite($"profile_scope profiler(function_name, profile_level::device);\n");
 #endif
         IndentScope.Writer.IndWrite($"{functionName};\n");
         IndentScope.Writer.IndWrite("}\n");
@@ -94,7 +94,7 @@ public class DeviceCSourceConvertVisitor : CSourceConvertVisitor
         }
 
         var ctype = $"template<{string.Join(", ", Enumerable.Range(0, expr.Parameters.Length).Select(x => $"class T{x}"))}>" + Environment.NewLine +
-            $"void {expr.Name}({string.Join(", ", expr.Parameters.AsValueEnumerable().Select(Visit).Select((s, i) => $"T{i} &&{s.Name}").ToArray())})";
+            $"NTT_DEVICE void {expr.Name}({string.Join(", ", expr.Parameters.AsValueEnumerable().Select(Visit).Select((s, i) => $"T{i} &&{s.Name}").ToArray())})";
 
         using (var scope = new IndentScope(_deviceBuilder))
         {
@@ -192,7 +192,7 @@ public class DeviceCSourceConvertVisitor : CSourceConvertVisitor
             _ => throw new NotSupportedException(expr.Location.ToString()),
         };
 
-        var str = $"std::span<std::byte, {size.Name}>({name} + {start.Name}, {size.Name})";
+        var str = $"ntt::span<std::byte, {size.Name}>({name} + {start.Name}, {size.Name})";
         symbol = new(start.Type, str);
         _exprMemo.Add(expr, symbol);
         return symbol;

@@ -46,6 +46,7 @@ public unsafe struct CApiMT
     public delegate* unmanaged<IntPtr, nuint, IntPtr, IntPtr> CalibrationDatasetProviderCreatePtr;
     public delegate* unmanaged<IntPtr, void> ClrHandleDisposePtr;
     public delegate* unmanaged<IntPtr, void> ClrHandleFreePtr;
+    public delegate* unmanaged<byte*, void> StringFreePtr;
     public delegate* unmanaged<IntPtr> ImportOptionsCreatePtr;
     public delegate* unmanaged<IntPtr> HuggingFaceOptionsCreatePtr;
     public delegate* unmanaged<IntPtr, IntPtr, void> ImportOptionsSetHuggingFaceOptionsPtr;
@@ -85,7 +86,7 @@ public unsafe struct CApiMT
     public delegate* unmanaged<IntPtr, IntPtr, IntPtr, IntPtr> CompilerImportNcnnModulePtr;
     public delegate* unmanaged<IntPtr, byte*, nuint, IntPtr, IntPtr> CompilerImportHuggingFaceModulePtr;
     public delegate* unmanaged<IntPtr, void> CompilerCompilePtr;
-    public delegate* unmanaged<IntPtr, IntPtr, void> CompilerGencodePtr;
+    public delegate* unmanaged<IntPtr, IntPtr, byte*> CompilerGencodePtr;
     public delegate* unmanaged<Runtime.TypeCode, IntPtr> DataTypeFromTypeCodePtr;
     public delegate* unmanaged<IntPtr, IntPtr, IntPtr, IntPtr> ExprEvaluatePtr;
     public delegate* unmanaged<IntPtr, IntPtr> FunctionGetBodyPtr;
@@ -177,6 +178,7 @@ public static unsafe class CApi
         mt->CalibrationDatasetProviderCreatePtr = &CalibrationDatasetProviderCreate;
         mt->ClrHandleDisposePtr = &ClrHandleDispose;
         mt->ClrHandleFreePtr = &ClrHandleFree;
+        mt->StringFreePtr = &StringFree;
         mt->ImportOptionsCreatePtr = &ImportOptionsCreate;
         mt->HuggingFaceOptionsCreatePtr = &HuggingFaceOptionsCreate;
         mt->ImportOptionsSetHuggingFaceOptionsPtr = &ImportOptionsSetHuggingFaceOptions;
@@ -361,6 +363,15 @@ public static unsafe class CApi
         if (handle != IntPtr.Zero)
         {
             GCHandle.FromIntPtr(handle).Free();
+        }
+    }
+
+    [UnmanagedCallersOnly]
+    private static void StringFree(byte* value)
+    {
+        if (value != null)
+        {
+            Marshal.FreeCoTaskMem((IntPtr)value);
         }
     }
 
@@ -658,11 +669,19 @@ public static unsafe class CApi
     }
 
     [UnmanagedCallersOnly]
-    private static void CompilerGencode(IntPtr compilerHandle, IntPtr streamHandle)
+    private static byte* CompilerGencode(IntPtr compilerHandle, IntPtr streamHandle)
     {
-        var compiler = Get<Compiler>(compilerHandle);
-        var stream = Get<CStream>(streamHandle);
-        compiler.Gencode(stream);
+        try
+        {
+            var compiler = Get<Compiler>(compilerHandle);
+            var stream = Get<CStream>(streamHandle);
+            compiler.Gencode(stream);
+            return null;
+        }
+        catch (Exception ex)
+        {
+            return (byte*)Marshal.StringToCoTaskMemUTF8(ex.ToString());
+        }
     }
 
     [UnmanagedCallersOnly]

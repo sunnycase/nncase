@@ -26,10 +26,11 @@ namespace vectorized_layer_norm_detail {
 template <bool UseMean, Tensor TIn, Tensor TScale, Tensor TBias, typename TOut,
           FixedDimensions VectorizedAxes, Dimensions PadedNums,
           FixedDimension TAxis>
-void within_axis_vectorize_impl(const TIn &input, const TScale &scale,
-                                const TBias &bias, TOut &output,
-                                const float &epsilon, const VectorizedAxes &,
-                                const PadedNums &, const TAxis &) {
+constexpr void within_axis_vectorize_impl(const TIn &input, const TScale &scale,
+                                          const TBias &bias, TOut &output,
+                                          const float &epsilon,
+                                          const VectorizedAxes &,
+                                          const PadedNums &, const TAxis &) {
 
     using TElem = typename TIn::element_type;
     using TScaleElem = typename TScale::element_type;
@@ -94,19 +95,22 @@ void within_axis_vectorize_impl(const TIn &input, const TScale &scale,
                 const auto extended_sum_s =
                     reduce_sum(extended_sum) * norm_factor;
                 auto extended_add = extended_sum_s + epsilon;
-                auto rsqrt =
-                    ntt::rsqrt(extended_add);
+                auto rsqrt = ntt::rsqrt(extended_add);
 
                 if constexpr (UseMean) {
                     for (auto i = 0; i < inner_size; i++) {
-                        auto val = (input_p[offset + i] - mean) * ntt::cast_elem<TElemScalar>(rsqrt);
+                        auto val = (input_p[offset + i] - mean) *
+                                   ntt::cast_elem<TElemScalar>(rsqrt);
                         output_p[offset + i] =
                             ntt::mul_add(val, scale_p[i], bias_p[i]);
                     }
                 } else {
                     for (auto i = 0; i < inner_size; i++) {
-                        auto val = ntt::cast_elem<float>(input_p[offset + i]) * rsqrt;
-                        output_p[offset + i] = ntt::cast_elem<TElemScalar>(val * ntt::cast_elem<float>(scale_p[i]) + ntt::cast_elem<float>(bias_p[i]));
+                        auto val =
+                            ntt::cast_elem<float>(input_p[offset + i]) * rsqrt;
+                        output_p[offset + i] = ntt::cast_elem<TElemScalar>(
+                            val * ntt::cast_elem<float>(scale_p[i]) +
+                            ntt::cast_elem<float>(bias_p[i]));
                     }
                 }
             } else {
@@ -135,19 +139,22 @@ void within_axis_vectorize_impl(const TIn &input, const TScale &scale,
 
                 extended_sum *= norm_factor;
                 auto extended_add = extended_sum + epsilon;
-                auto rsqrt =
-                    ntt::rsqrt(extended_add);
+                auto rsqrt = ntt::rsqrt(extended_add);
 
                 if constexpr (UseMean) {
                     for (auto i = 0; i < inner_size; i++) {
-                        auto val = (input_p[offset + i] - mean) * ntt::cast_elem<TElemScalar>(rsqrt);
+                        auto val = (input_p[offset + i] - mean) *
+                                   ntt::cast_elem<TElemScalar>(rsqrt);
                         output_p[offset + i] =
                             ntt::mul_add(val, scale_p[i], bias_p[i]);
                     }
                 } else {
                     for (auto i = 0; i < inner_size; i++) {
-                        auto val = ntt::cast_elem<float>(input_p[offset + i]) * rsqrt;
-                        output_p[offset + i] = ntt::cast_elem<TElemScalar>(val * ntt::cast_elem<float>(scale_p[i]) + ntt::cast_elem<float>(bias_p[i]));
+                        auto val =
+                            ntt::cast_elem<float>(input_p[offset + i]) * rsqrt;
+                        output_p[offset + i] = ntt::cast_elem<TElemScalar>(
+                            val * ntt::cast_elem<float>(scale_p[i]) +
+                            ntt::cast_elem<float>(bias_p[i]));
                     }
                 }
             }
@@ -161,11 +168,12 @@ template <bool UseMean = true, Tensor TIn, Tensor TScale, Tensor TBias,
           typename TOut, FixedDimension TAxis,
           FixedDimensions VectorizedAxes = shape_t<>,
           Dimensions PadedNums = shape_t<>>
-void vectorized_layer_norm(const TIn &input, const TScale &scale,
-                           const TBias &bias, TOut &&output,
-                           const float &epsilon, const TAxis &axis = -1_dim,
-                           const VectorizedAxes &vectorizedAxes = {},
-                           const PadedNums &padedNums = {}) {
+constexpr void vectorized_layer_norm(const TIn &input, const TScale &scale,
+                                     const TBias &bias, TOut &&output,
+                                     const float &epsilon,
+                                     const TAxis &axis = -1_dim,
+                                     const VectorizedAxes &vectorizedAxes = {},
+                                     const PadedNums &padedNums = {}) {
     static_assert(VectorizedAxes::rank() < 2,
                   "currently not support 2d packing.");
 

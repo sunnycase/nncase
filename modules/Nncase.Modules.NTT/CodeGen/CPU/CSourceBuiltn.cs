@@ -80,16 +80,16 @@ using namespace nncase::ntt::distributed::shard_policy;
         return content;
     }
 
-    public static string ModuleTopologyDef(NTTTargetOptions options)
+    public static string ModuleTopologyDef(NTTTargetOptions options, bool isCUDA)
     {
-        var content = RazorTemplateEngine.RenderAsync("~/CodeGen/CPU/Templates/module_topology_def.h.cshtml", options).Result;
+        var content = RazorTemplateEngine.RenderAsync("~/CodeGen/CPU/Templates/module_topology_def.h.cshtml", new { Hierarchies = options.Hierarchies[0], IsCUDA = isCUDA }).Result;
         return content;
     }
 
-    public static string CMakeDef()
+    public static string CMakeDef(bool isCUDA)
     {
         var cmakePath = CMakePath(Path.Combine(Path.GetDirectoryName(typeof(CSourceBuiltn).Assembly.Location)!, "Runtime", "cmake", "ntt_module.cmake"));
-        var content = RazorTemplateEngine.RenderAsync("~/CodeGen/CPU/Templates/CMakeLists.txt.cshtml", new { CMakePath = cmakePath }).Result;
+        var content = RazorTemplateEngine.RenderAsync("~/CodeGen/CPU/Templates/CMakeLists.txt.cshtml", new { CMakePath = cmakePath, IsCUDA = isCUDA }).Result;
         return content;
     }
 

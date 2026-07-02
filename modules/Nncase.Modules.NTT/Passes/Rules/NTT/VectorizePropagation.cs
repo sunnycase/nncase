@@ -129,6 +129,7 @@ public sealed class VectorizeReducePropagation : RewriteRule<Pattern>
 
             var initValue = ((TensorConst)result["initValue"]).Value.ToScalar<float>();
             var keepDims = ((TensorConst)result["keepDims"]).Value.ToScalar<bool>();
+            axes = axes.Select(x => (int)Util.PositiveIndex(x, input.CheckedShape.Rank)).ToArray();
             var remainAxes = Enumerable.Range(0, input.CheckedShape.Rank).Where(i => !axes.Contains(i)).ToArray();
             var vectorizeAxes = keepDims ?
                 vectorize.Axes.ToArray() :

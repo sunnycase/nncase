@@ -54,7 +54,7 @@ constexpr auto translate_slice_params(const TInShape &in_shape,
                                                     auto axis, auto i) {
             return cnt_new_steps.template replace_at<axis>(steps[i]);
         });
-    return std::make_tuple(new_begins, new_steps);
+    return ntt::make_tuple(new_begins, new_steps);
 }
 } // namespace slice_detail
 
@@ -71,9 +71,9 @@ constexpr auto translate_slice_params(const TInShape &in_shape,
 template <Tensor TIn, typename TOut, typename TBegins, typename TEnds,
           FixedDimensions TAxes = decltype(make_index_shape<TBegins::rank()>()),
           FixedDimensions TSteps = decltype(make_ones_shape<TBegins::rank()>())>
-void slice(const TIn &input, TOut &&output, const TBegins &begins,
-           [[maybe_unused]] const TEnds &ends, const TAxes &axes = {},
-           const TSteps &steps = {}) {
+constexpr void slice(const TIn &input, TOut &&output, const TBegins &begins,
+                     [[maybe_unused]] const TEnds &ends, const TAxes &axes = {},
+                     const TSteps &steps = {}) {
     static_assert(TBegins::rank() == TEnds::rank() &&
                       TBegins::rank() == TAxes::rank() &&
                       TBegins::rank() == TSteps::rank(),

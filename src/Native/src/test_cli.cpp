@@ -161,6 +161,7 @@ result<void> write_tensor_buffer(value_t value, std::ofstream &of) {
 result<void> run_core(const std::string &kmodel_path,
                       const std::vector<std::string> &files, size_t loop_count,
                       bool warmup, const std::string &cpu_external_module_path,
+                      const std::string &cuda_external_module_path,
                       const std::string &xpu_external_module_path) {
     std::ifstream kmodel(kmodel_path, std::ios::binary | std::ios::in);
     if (!kmodel.is_open())
@@ -170,6 +171,10 @@ result<void> run_core(const std::string &kmodel_path,
     if (!cpu_external_module_path.empty()) {
         interp.options().set("cpu_external_module_path",
                              cpu_external_module_path);
+    }
+    if (!cuda_external_module_path.empty()) {
+        interp.options().set("cuda_external_module_path",
+                             cuda_external_module_path);
     }
     if (!xpu_external_module_path.empty()) {
         interp.options().set("xpu_external_module_path",
@@ -297,6 +302,7 @@ int main(int argc, char **argv) {
       ("l,loop", "Number of inference iterations", cxxopts::value<size_t>()->default_value("1"))
       ("w,warmup", "Enable warmup before inference", cxxopts::value<bool>()->default_value("false")->implicit_value("true"))
       ("cpu_external_module_path", "Path to external module for CPU backend (optional, for testing purposes)", cxxopts::value<std::string>()->default_value(""))
+      ("cuda_external_module_path", "Path to external module for CUDA backend (optional, for testing purposes)", cxxopts::value<std::string>()->default_value(""))
       ("xpu_external_module_path", "Path to external module for XPU backend (optional, for testing purposes)", cxxopts::value<std::string>()->default_value(""))
       ("h,help", "Print usage");
     // clang-format on
@@ -326,6 +332,7 @@ int main(int argc, char **argv) {
 
     run_core(kmodel_bin, bins, loop_count, warmup,
              result["cpu_external_module_path"].as<std::string>(),
+             result["cuda_external_module_path"].as<std::string>(),
              result["xpu_external_module_path"].as<std::string>())
         .unwrap_or_throw();
     return 0;

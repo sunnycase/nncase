@@ -214,6 +214,10 @@ class TestRunner(Evaluator, Inference, metaclass=ABCMeta):
             config['target']['cpu']['eval'] = False
             config['target']['cpu']['infer'] = False
 
+        if test_utils.in_ci() and not test_utils.test_executable('cuda') and 'cuda' in config['target']:
+            config['target']['cuda']['eval'] = False
+            config['target']['cuda']['infer'] = False
+
         return config
 
     def update_config(self, config: Dict, override_cfg: Dict) -> Dict:
@@ -352,7 +356,7 @@ class TestRunner(Evaluator, Inference, metaclass=ABCMeta):
             return None
         e = '"'
         target_options: object = None
-        if target == 'cpu' or target == 'xpu':
+        if target == 'cpu' or target == 'xpu' or target == 'cuda':
             target_options = nncase.NTTTargetOptions()
             for k, v in values.items():
                 is_enum = False

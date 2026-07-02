@@ -18,6 +18,7 @@
 #include "../distributed/topology.h"
 #include "../primitive_ops.h"
 #include "../shape.h"
+#include "../std_containers.h"
 #include "../tensor_traits.h"
 #include "copy.h"
 #include <cstddef>
@@ -33,7 +34,7 @@ namespace tar {
 #if defined(NNCASE_XPU_MODULE) && defined(SYS_MODE)
 __device__ extern uint8_t collective_pool_ptr[];
 #else
-extern uint8_t collective_pool_ptr[];
+NTT_DEVICE extern uint8_t collective_pool_ptr[];
 #endif
 } // namespace tar
 
@@ -116,12 +117,12 @@ struct reshard_impl<SrcTensor, DestTensor> {
                                       const TShardIndex &shard_index) {
         // 1. Fill split axes.
         auto split_phase1 = src.shape().aggregate(
-            std::make_tuple(fixed_shape_v<>, fixed_shape_v<>, fixed_shape_v<>),
+            ntt::make_tuple(fixed_shape_v<>, fixed_shape_v<>, fixed_shape_v<>),
             [&](auto last_acc, auto global_dim, auto axis) {
                 auto [last_global_offset, last_local_offset, last_shape] =
                     last_acc;
                 const auto policy =
-                    std::get<axis>(src.sharding().axis_policies);
+                    ntt::get<axis>(src.sharding().axis_policies);
                 if constexpr (distributed::SplitShardPolicy<
                                   std::decay_t<decltype(policy)>>) {
                     // Split axis, simply calculate the global offset and
@@ -133,12 +134,12 @@ struct reshard_impl<SrcTensor, DestTensor> {
                     const auto local_shape =
                         policy.template shard_dim<mesh_type>(global_dim,
                                                              shard_index);
-                    return std::make_tuple(
+                    return ntt::make_tuple(
                         last_global_offset.append(global_offset),
                         last_local_offset.append(local_offset),
                         last_shape.append(local_shape));
                 } else {
-                    return std::make_tuple(last_global_offset.append(dim_zero),
+                    return ntt::make_tuple(last_global_offset.append(dim_zero),
                                            last_local_offset.append(dim_zero),
                                            last_shape.append(dim_zero));
                 }
@@ -169,7 +170,7 @@ struct reshard_impl<SrcTensor, DestTensor> {
                 const auto global_end =
                     ntt::min(global_offset + local_dim, global_dim);
                 const auto in_bound = global_offset < global_dim;
-                return std::make_tuple(
+                return ntt::make_tuple(
                     last_global_offset.template replace_at<axis>(
                         ntt::where(in_bound, global_offset, dim_zero)),
                     last_local_offset.template replace_at<axis>(
@@ -228,11 +229,11 @@ struct reshard_impl<SrcTensor, DestTensor> {
         constexpr auto non_split_tensor_axes =
             distributed::detail::tensor_axes_of_non_split_shard_policies<
                 sharding_type>();
-        std::array<dim_t, non_split_tensor_axes.rank()> split_counts{};
+        ntt::array<dim_t, non_split_tensor_axes.rank()> split_counts{};
 
         // 1. Calculate the initial split counts.
         {
-            std::array<float, non_split_tensor_axes.rank()> log_dims;
+            ntt::array<float, non_split_tensor_axes.rank()> log_dims;
             for (size_t i = 0; i < non_split_tensor_axes.rank(); i++) {
                 auto dim = (float)shape.at(non_split_tensor_axes[i]);
                 log_dims[i] = std::log(dim);
@@ -346,7 +347,7 @@ struct reshard_impl<SrcTensor, DestTensor> {
     }
 
   private:
-    void copy_to_global(const SrcTensor &src) noexcept {
+    constexpr void copy_to_global(const SrcTensor &src) noexcept {
         auto global_buffer_address =
             reinterpret_cast<typename SrcTensor::value_type *>(
                 tar::collective_pool_ptr);
@@ -355,7 +356,7 @@ struct reshard_impl<SrcTensor, DestTensor> {
         reshard(src, global_tensor);
     }
 
-    void copy_from_global(DestTensor &dest) noexcept {
+    constexpr void copy_from_global(DestTensor &dest) noexcept {
         auto global_buffer_address =
             reinterpret_cast<const typename DestTensor::value_type *>(
                 tar::collective_pool_ptr);
@@ -382,23 +383,31 @@ struct reshard_impl<SrcTensor, DestTensor> {
         // 2. get mesh index of src candidates
         // 2.1 generate coords for each split axis
         auto make_coords = [&]<std::size_t... Is>(std::index_sequence<Is...>) {
-            return std::make_tuple(std::array<size_t, mesh_type::shape[Is]>{}...);
+            return ntt::make_tuple(
+                std::array<size_t, mesh_type::shape[Is]>{}...);
         };
-        auto coords = make_coords(std::make_index_sequence<mesh_type::rank()>{});
+        auto coords =
+            make_coords(std::make_index_sequence<mesh_type::rank()>{});
         std::array<size_t, mesh_type::rank()> counts{};
 
         auto get_coord = [&]<size_t tensor_axis>() {
-            const auto policy = std::get<tensor_axis>(src.sharding().axis_policies);
-            if constexpr (distributed::SplitShardPolicy<std::decay_t<decltype(policy)>>) {
+            const auto policy =
+                ntt::get<tensor_axis>(src.sharding().axis_policies);
+            if constexpr (distributed::SplitShardPolicy<
+                              std::decay_t<decltype(policy)>>) {
                 size_t num_blocks = 1;
                 constexpr auto policy_rank = policy.axes.rank();
                 for (size_t i = 0; i < policy_rank; ++i) {
                     num_blocks *= mesh_type::shape.at(policy.axes.at(i));
                 }
 
-                size_t block_size = (global_shape[tensor_axis] + num_blocks - 1) / num_blocks;
-                size_t begin_block = dest_start_offset[tensor_axis] / block_size;
-                size_t end_block = (dest_start_offset[tensor_axis] + dest_local_shape[tensor_axis] - 1) / block_size;
+                size_t block_size =
+                    (global_shape[tensor_axis] + num_blocks - 1) / num_blocks;
+                size_t begin_block =
+                    dest_start_offset[tensor_axis] / block_size;
+                size_t end_block = (dest_start_offset[tensor_axis] +
+                                    dest_local_shape[tensor_axis] - 1) /
+                                   block_size;
                 for (size_t block = begin_block; block <= end_block; ++block) {
                     size_t remainder = block;
                     auto axes_reverse = policy.axes.reverse();
@@ -408,7 +417,7 @@ struct reshard_impl<SrcTensor, DestTensor> {
                         size_t c = remainder % dim;
                         remainder /= dim;
 
-                        auto& coord = std::get<mesh_axis>(coords);
+                        auto &coord = ntt::get<mesh_axis>(coords);
                         bool exist = false;
                         for (size_t i = 0; i < counts[mesh_axis]; ++i) {
                             if (coord[i] == c) {
@@ -431,38 +440,41 @@ struct reshard_impl<SrcTensor, DestTensor> {
         get_all_coords(std::make_index_sequence<tensor_rank>{});
 
         // 2.2 update coords for mesh broadcast axis
-        auto update_broadcast_axis = [&]<std::size_t... Is>(std::index_sequence<Is...>) {
-            (([&] {
-                if (counts[Is] == 0) {
-                    auto& coord = std::get<Is>(coords);
-                    coord[counts[Is]++] = local_mesh_index[Is];
-                }
-            }()), ...);
-        };
+        auto update_broadcast_axis =
+            [&]<std::size_t... Is>(std::index_sequence<Is...>) {
+                (([&] {
+                     if (counts[Is] == 0) {
+                         auto &coord = ntt::get<Is>(coords);
+                         coord[counts[Is]++] = local_mesh_index[Is];
+                     }
+                 }()),
+                 ...);
+            };
         update_broadcast_axis(std::make_index_sequence<mesh_type::rank()>{});
 
         // 2.3 compute Cartesian product of coords
         std::array<bool, mesh_type::shape.length()> candidates{};
         std::array<size_t, mesh_type::rank()> current_coord{};
-        auto compute_cartesian_product = [&](auto&& self, auto axis_const) -> void {
+        auto compute_cartesian_product = [&](auto &&self,
+                                             auto axis_const) -> void {
             constexpr size_t axis = decltype(axis_const)::value;
             if constexpr (axis == mesh_type::rank()) {
                 dynamic_shape_t<mesh_type::rank()> coord{};
-                loop<mesh_type::rank()>([&](auto i) {
-                    coord[i] = current_coord[i];
-                });
+                loop<mesh_type::rank()>(
+                    [&](auto i) { coord[i] = current_coord[i]; });
                 size_t linear_idx = linear_offset(coord, mesh_type::shape);
                 candidates[linear_idx] = true;
                 return;
             } else {
-                const auto& coord = std::get<axis>(coords);
+                const auto &coord = ntt::get<axis>(coords);
                 for (size_t i = 0; i < counts[axis]; ++i) {
                     current_coord[axis] = coord[i];
                     self(self, std::integral_constant<size_t, axis + 1>{});
                 }
             }
         };
-        compute_cartesian_product(compute_cartesian_product, std::integral_constant<size_t, 0>{});
+        compute_cartesian_product(compute_cartesian_product,
+                                  std::integral_constant<size_t, 0>{});
 
         // 3. traverse src index
         for (size_t i = 0; i < candidates.size(); ++i) {

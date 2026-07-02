@@ -21,15 +21,15 @@
 
 namespace nncase::ntt {
 template <Tensor... TInputs, class TOut, FixedDimension TAxis>
-void concat(const std::tuple<TInputs...> &inputs, TOut &&output,
-            const TAxis &axis) {
+constexpr void concat(const ntt::tuple<TInputs...> &inputs, TOut &&output,
+                      const TAxis &axis) {
     const auto domain =
         shape_infer::reduced_shape_by_axis<TAxis::value>(output.shape());
     dynamic_shape_t<domain.rank()> in_index{};
     apply(domain, [&](auto index) {
         loop<domain.rank()>([&](auto i) { in_index[i] = index[i]; });
         loop<sizeof...(TInputs)>([&](auto i) {
-            auto input = std::get<i>(inputs);
+            auto input = ntt::get<i>(inputs);
             for (in_index[axis] = 0; in_index[axis] < input.shape()[axis];
                  in_index[axis]++, index[axis]++) {
                 output(index) = input(in_index);

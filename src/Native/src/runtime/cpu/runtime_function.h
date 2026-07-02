@@ -13,6 +13,7 @@
  * limitations under the License.
  */
 #pragma once
+#include "nncase/ntt/profiling.h"
 #include "runtime_module.h"
 #include <nncase/ntt/arch/cpu/runtime.h>
 #include <nncase/runtime/host_buffer.h>
@@ -24,6 +25,8 @@ BEGIN_NS_NNCASE_RT_MODULE(cpu)
 
 class cpu_runtime_function final : public runtime_function {
   public:
+    static constexpr size_t default_profile_record_count = 10000;
+
     cpu_runtime_function(runtime_module &rt_module);
     virtual ~cpu_runtime_function();
 
@@ -43,6 +46,16 @@ class cpu_runtime_function final : public runtime_function {
         auto mapped_local_data =
             local_data->map(map_read_write).expect("Failed to map local data");
         return mapped_local_data.buffer();
+    }
+
+    const std::span<ntt::runtime::profile_record>
+    thread_local_profile_records(size_t block_id) noexcept {
+        return profile_records_[block_id];
+    }
+
+    const std::span<uint32_t>
+    thread_local_profile_record_counts(size_t block_id) noexcept {
+        return profile_record_counts_[block_id];
     }
 
   protected:
@@ -66,6 +79,9 @@ class cpu_runtime_function final : public runtime_function {
     std::vector<ntt::runtime::thread_inout_desc> output_descs_;
     std::vector<dims_t> output_shapes_;
     std::vector<dims_t> output_strides_;
+
+    std::vector<std::vector<ntt::runtime::profile_record>> profile_records_;
+    std::vector<std::vector<uint32_t>> profile_record_counts_;
 };
 
 END_NS_NNCASE_RT_MODULE

@@ -50,13 +50,7 @@ using get_coordinate_func_t = float (*)(float, float, float, float, float,
                                         float);
 using get_nearest_pixel_func_t = int64_t (*)(float);
 
-get_coordinate_func_t get_coordinate_from_resized(
-    image_resize_transformation_mode_t coordinate_transform_mode);
-
-get_nearest_pixel_func_t
-get_nearest_pixel_from_origin(image_resize_nearest_mode_t nearest_mode);
-
-inline get_coordinate_func_t get_coordinate_from_resized(
+inline constexpr get_coordinate_func_t get_coordinate_from_resized(
     image_resize_transformation_mode_t coordinate_transform_mode) {
     switch (coordinate_transform_mode) {
     case image_resize_transformation_mode_t::asymmetric:
@@ -95,7 +89,7 @@ inline get_coordinate_func_t get_coordinate_from_resized(
     }
 }
 
-inline get_nearest_pixel_func_t
+inline constexpr get_nearest_pixel_func_t
 get_nearest_pixel_from_origin(image_resize_nearest_mode_t nearest_mode) {
     switch (nearest_mode) {
     case image_resize_nearest_mode_t::round_prefer_ceil:
@@ -122,21 +116,23 @@ get_nearest_pixel_from_origin(image_resize_nearest_mode_t nearest_mode) {
 }
 
 template <typename TShape>
-inline std::tuple<float, float> get_resize_scales(TShape in_shape,
-                                                  int32_t out_h, int32_t out_w,
-                                                  bool align_corners) noexcept {
+inline constexpr ntt::tuple<float, float>
+get_resize_scales(TShape in_shape, int32_t out_h, int32_t out_w,
+                  bool align_corners) noexcept {
     auto height_scale = (float)in_shape[2] / out_h;
     auto width_scale = (float)in_shape[3] / out_w;
     if (align_corners && out_h > 1)
         height_scale = (float)(in_shape[2] - 1) / (out_h - 1);
     if (align_corners && out_w > 1)
         width_scale = (float)(in_shape[3] - 1) / (out_w - 1);
-    return std::make_tuple(height_scale, width_scale);
+    return ntt::make_tuple(height_scale, width_scale);
 }
 
-inline void set_resize_bilinear(size_t value, float scale,
-                                bool half_pixel_centers, size_t shape_size,
-                                float &scaled_value, int32_t &v0, int32_t &v1) {
+inline constexpr void set_resize_bilinear(size_t value, float scale,
+                                          bool half_pixel_centers,
+                                          size_t shape_size,
+                                          float &scaled_value, int32_t &v0,
+                                          int32_t &v1) {
     if (half_pixel_centers) {
         scaled_value = (value + 0.5f) * scale - 0.5f;
     } else {
@@ -148,20 +144,21 @@ inline void set_resize_bilinear(size_t value, float scale,
                   static_cast<int32_t>(shape_size - 1));
 }
 
-template <typename T> float get_rounding_offset() {
+template <typename T> constexpr float get_rounding_offset() {
     return std::is_integral_v<T> ? .5f : .0f;
 }
 
-template <FixedTensor T> float get_rounding_offset() {
+template <FixedTensor T> constexpr float get_rounding_offset() {
     return std::is_integral_v<typename T::element_type> ? .5f : .0f;
 }
 
 template <typename T, typename TInShape, typename TInStrides,
           typename TOutStrides>
-void resize_bilinear(const T *input, T *output, const TInShape in_shape,
-                     const TInStrides in_strides, const TOutStrides out_strides,
-                     int32_t out_h, int32_t out_w, bool align_corners,
-                     bool half_pixel_centers) noexcept {
+constexpr void
+resize_bilinear(const T *input, T *output, const TInShape in_shape,
+                const TInStrides in_strides, const TOutStrides out_strides,
+                int32_t out_h, int32_t out_w, bool align_corners,
+                bool half_pixel_centers) noexcept {
     auto [height_scale, width_scale] =
         get_resize_scales(in_shape, out_h, out_w, align_corners);
 
@@ -215,13 +212,14 @@ void resize_bilinear(const T *input, T *output, const TInShape in_shape,
 
 template <typename T, typename TInShape, typename TInStrides,
           typename TOutStrides>
-void resize_neareast_neighbor(
-    const T *input, T *output, const TInShape in_shape,
-    const TInStrides in_strides, const TOutStrides out_strides,
-    const int32_t out_h, const int32_t out_w, bool align_corners,
-    [[maybe_unused]] bool half_pixel_centers,
-    get_coordinate_func_t get_coordinate_func,
-    get_nearest_pixel_func_t get_nearset_func) noexcept {
+constexpr void
+resize_neareast_neighbor(const T *input, T *output, const TInShape in_shape,
+                         const TInStrides in_strides,
+                         const TOutStrides out_strides, const int32_t out_h,
+                         const int32_t out_w, bool align_corners,
+                         [[maybe_unused]] bool half_pixel_centers,
+                         get_coordinate_func_t get_coordinate_func,
+                         get_nearest_pixel_func_t get_nearset_func) noexcept {
     auto [height_scale, width_scale] =
         get_resize_scales(in_shape, out_h, out_w, align_corners);
 
@@ -265,12 +263,12 @@ void resize_neareast_neighbor(
 
 template <Tensor TIn, typename TOut, FixedDimensions TVectorizedAxes,
           FixedDimensions TPadedNums, FixedDimensions TNewSize>
-void resize(const TIn &input, TOut &&output,
-            [[maybe_unused]] const TVectorizedAxes &vectorizedAxes,
-            [[maybe_unused]] const TPadedNums &padedNums,
-            const TNewSize &new_size, image_resize_mode_t resize_mode,
-            image_resize_transformation_mode_t transformation_mode,
-            image_resize_nearest_mode_t nearest_mode) {
+constexpr void resize(const TIn &input, TOut &&output,
+                      [[maybe_unused]] const TVectorizedAxes &vectorizedAxes,
+                      [[maybe_unused]] const TPadedNums &padedNums,
+                      const TNewSize &new_size, image_resize_mode_t resize_mode,
+                      image_resize_transformation_mode_t transformation_mode,
+                      image_resize_nearest_mode_t nearest_mode) {
     if (resize_mode == image_resize_mode_t::bilinear) {
         resize_detail::resize_bilinear(
             input.elements().data(), output.elements().data(), input.shape(),

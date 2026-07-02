@@ -17,7 +17,7 @@
 #include "dimension.h"
 #include "loop.h"
 #include "nncase/ntt/tensor_traits.h"
-#include <array>
+#include "std_containers.h"
 #include <cmath>
 #include <cstddef>
 #include <cstring>
@@ -41,9 +41,11 @@ struct dynamic_dims_type_impl;
 
 template <template <class... TDims> class Derived, size_t... I>
 struct dynamic_dims_type_impl<Derived, std::index_sequence<I...>> {
-    template <std::size_t> using elem_type = dim_t;
+    template <std::size_t> struct elem_type {
+        using type = dim_t;
+    };
 
-    using type = Derived<elem_type<I>...>;
+    using type = Derived<typename elem_type<I>::type...>;
 };
 
 template <template <class... TDims> class Derived, size_t Rank>
@@ -134,7 +136,7 @@ template <dims_usage Usage, template <class... TDims> class Derived,
           Dimension... TDims>
 struct dims_base {
     NTT_ALWAYS_INLINE constexpr dims_base(const TDims &...dims) noexcept
-        : dims_(std::make_tuple(dims...)) {}
+        : dims_(ntt::make_tuple(dims...)) {}
 
     static constexpr dims_usage usage() noexcept { return Usage; }
 
@@ -153,7 +155,7 @@ struct dims_base {
     static constexpr bool is_fixed() noexcept { return fixed_rank() == rank(); }
 
     template <size_t Rank = rank(), class = std::enable_if_t<Rank != 0>>
-    constexpr dims_base() noexcept : dims_(std::make_tuple(TDims{}...)) {}
+    constexpr dims_base() noexcept : dims_(ntt::make_tuple(TDims{}...)) {}
 
     template <Dimension TIndex>
     constexpr auto operator[](const TIndex &index) const noexcept {
@@ -198,18 +200,18 @@ struct dims_base {
     template <dim_t Index> constexpr auto at() const noexcept {
         constexpr auto PositiveIndex = positive_index(Index, rank());
         if constexpr (is_fixed()) {
-            return std::tuple_element_t<PositiveIndex, decltype(dims_)>{};
+            return ntt::tuple_element_t<PositiveIndex, decltype(dims_)>{};
         } else {
-            return std::get<PositiveIndex>(dims_);
+            return ntt::get<PositiveIndex>(dims_);
         }
     }
 
     template <dim_t Index> constexpr decltype(auto) at() noexcept {
         constexpr auto PositiveIndex = positive_index(Index, rank());
         if constexpr (is_fixed()) {
-            return std::tuple_element_t<PositiveIndex, decltype(dims_)>{};
+            return ntt::tuple_element_t<PositiveIndex, decltype(dims_)>{};
         } else {
-            return std::get<PositiveIndex>(dims_);
+            return ntt::get<PositiveIndex>(dims_);
         }
     }
 
@@ -337,10 +339,10 @@ struct dims_base {
         return slice_impl(std::make_index_sequence<Rank>());
     }
 
-    constexpr std::array<dim_t, rank()> to_array() const noexcept {
+    constexpr ntt::array<dim_t, rank()> to_array() const noexcept {
         auto at_impl = [this]<size_t... I>(std::index_sequence<I...>) {
             (void)this;
-            return std::array<dim_t, rank()>{at(fixed_dim_v<I>)...};
+            return ntt::array<dim_t, rank()>{at(fixed_dim_v<I>)...};
         };
         return at_impl(std::make_index_sequence<rank()>());
     }
@@ -350,7 +352,7 @@ struct dims_base {
     }
 
   private:
-    NTT_NO_UNIQUE_ADDRESS std::tuple<TDims...> dims_;
+    NTT_NO_UNIQUE_ADDRESS ntt::tuple<TDims...> dims_;
 };
 } // namespace detail
 
@@ -512,6 +514,9 @@ default_strides([[maybe_unused]] const TShape shape) noexcept {
     constexpr auto rank = TShape::rank();
     if constexpr (rank == 0) {
         return strides_t<>();
+    } else if constexpr (FixedDimensions<TShape>) {
+        return detail::default_strides_impl<rank, TShape, Canonical>{}(
+            TShape{}, strides_t<>());
     } else {
         return detail::default_strides_impl<rank, TShape, Canonical>{}(
             shape, strides_t<>());
@@ -549,14 +554,14 @@ template <template <class... TDims> class TDimensions = shape_t,
 NTT_ALWAYS_INLINE constexpr auto unravel_index(const TOffset &offset,
                                                const TShape &shape) noexcept {
     return shape.reverse().aggregate(
-        std::make_tuple(offset, TDimensions<>{}),
+        ntt::make_tuple(offset, TDimensions<>{}),
         [&](auto acc, auto dim, [[maybe_unused]] auto axis) {
             auto [last_remain, index] = acc;
             auto cnt_index = last_remain % dim;
             auto remain = last_remain / dim;
-            return std::make_tuple(remain, index.prepend(cnt_index));
+            return ntt::make_tuple(remain, index.prepend(cnt_index));
         },
-        [](auto acc) { return std::get<1>(acc); });
+        [](auto acc) { return ntt::get<1>(acc); });
 }
 
 namespace detail {
@@ -703,17 +708,17 @@ unsqueeze_dims(const TDims &dims, const TAxes &,
                const TDim &insert_dim) noexcept {
     constexpr auto positive_axes_v = positive_axes(TAxes{}, TDims::rank());
     return make_zeros_shape<TDims::rank() + TAxes::rank()>().aggregate(
-        std::make_tuple(empty_dims_alike_t<TDims>{}, dim_zero),
+        ntt::make_tuple(empty_dims_alike_t<TDims>{}, dim_zero),
         [&](auto acc, auto, auto axis) {
             auto [last_result, offset] = acc;
             if constexpr (positive_axes_v.contains(axis)) {
-                return std::make_tuple(last_result.append(insert_dim), offset);
+                return ntt::make_tuple(last_result.append(insert_dim), offset);
             } else {
-                return std::make_tuple(last_result.append(dims[offset]),
+                return ntt::make_tuple(last_result.append(dims[offset]),
                                        offset + dim_one);
             }
         },
-        [](auto acc) { return std::get<0>(acc); });
+        [](auto acc) { return ntt::get<0>(acc); });
 }
 
 template <Dimensions TDimsA, Dimensions TDimsB>
@@ -759,7 +764,7 @@ template <size_t I, template <class... TDims> class Derived,
           nncase::ntt::Dimension... TDims>
     requires(nncase::ntt::Dimensions<Derived<TDims...>>)
 struct tuple_element<I, Derived<TDims...>> {
-    using type = std::tuple_element_t<I, std::tuple<TDims...>>;
+    using type = nncase::ntt::tuple_element_t<I, nncase::ntt::tuple<TDims...>>;
 };
 
 template <size_t I, nncase::ntt::Dimensions TDims>

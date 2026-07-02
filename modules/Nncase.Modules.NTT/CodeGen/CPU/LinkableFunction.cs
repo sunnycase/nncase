@@ -22,10 +22,13 @@ internal unsafe struct KernelDescHeader
     public ulong LocalDataPoolSize;
 
     [MarshalAs(UnmanagedType.U8)]
+    public ulong WarpLocalDataPoolSize;
+
+    [MarshalAs(UnmanagedType.U8)]
     public ulong BlockLocalDataPoolSize;
 }
 
-internal sealed record KernelMemoryPoolDesc(ulong RdataPoolSize, ulong ThreadLocalRdataPoolSize, ulong BlockLocalRdataPoolSize);
+internal sealed record KernelMemoryPoolDesc(ulong RdataPoolSize, ulong ThreadLocalRdataPoolSize, ulong WarpLocalRdataPoolSize, ulong BlockLocalRdataPoolSize);
 
 internal sealed class LinkableKernelFunction : ILinkableFunction
 {

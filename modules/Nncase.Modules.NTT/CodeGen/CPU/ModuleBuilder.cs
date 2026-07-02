@@ -17,22 +17,36 @@ public sealed class NTTModuleBuilder : IModuleBuilder
     private readonly BinaryWriter _rdataWriter;
     private readonly BinaryWriter[] _threadLocalRdataWriters;
     private readonly BinaryWriter[] _threadLocalCacheWriters;
+    private readonly BinaryWriter[] _warpLocalRdataWriters;
     private readonly BinaryWriter[] _blockLocalRdataWriters;
 
-    public NTTModuleBuilder(CompileOptions options)
+    public NTTModuleBuilder(string moduleKind, CompileOptions options)
     {
+        var targetOptions = (NTTTargetOptions)options.TargetOptions;
+        var hierarchies = targetOptions.Hierarchies[0];
+        ModuleKind = moduleKind;
         _sectionManager = new();
         _rdataWriter = _sectionManager.GetWriter(WellknownSectionNames.Rdata);
-        var shardCount = TensorUtilities.GetProduct(((Targets.NTTTargetOptions)options.TargetOptions).Hierarchies[0]);
+
+        var shardCount = TensorUtilities.GetProduct(hierarchies);
         _threadLocalRdataWriters = new BinaryWriter[shardCount];
         _threadLocalCacheWriters = new BinaryWriter[shardCount];
-        _blockLocalRdataWriters = new BinaryWriter[shardCount / ((Targets.NTTTargetOptions)options.TargetOptions).Hierarchies[0][^1]];
         for (int i = 0; i < shardCount; i++)
         {
             _threadLocalRdataWriters[i] = _sectionManager.GetWriter(WellknownSectionNames.ThreadLocalRdata, i);
             _threadLocalCacheWriters[i] = _sectionManager.GetWriter(WellknownSectionNames.ThreadLocalCache, i);
         }
 
+        var isCUDA = ModuleKind == CUDATarget.Kind;
+        var warpsCount = isCUDA ? shardCount / hierarchies[^1] : 0;
+        _warpLocalRdataWriters = new BinaryWriter[warpsCount];
+        for (int i = 0; i < _warpLocalRdataWriters.Length; i++)
+        {
+            _warpLocalRdataWriters[i] = _sectionManager.GetWriter(WellknownSectionNames.WarpLocalRdata, i);
+        }
+
+        var blocksCount = isCUDA ? (hierarchies.Length > 1 ? warpsCount / hierarchies[^2] : 1) : shardCount / hierarchies[^1];
+        _blockLocalRdataWriters = new BinaryWriter[blocksCount];
         for (int i = 0; i < _blockLocalRdataWriters.Length; i++)
         {
             _blockLocalRdataWriters[i] = _sectionManager.GetWriter(WellknownSectionNames.BlockLocalRdata, i);
@@ -44,7 +58,7 @@ public sealed class NTTModuleBuilder : IModuleBuilder
     public CompileOptions CompileOptions { get; }
 
     /// <inheritdoc/>
-    public string ModuleKind => "cpu";
+    public string ModuleKind { get; }
 
     /// <inheritdoc/>
     public ILinkableModule Build(IReadOnlyList<BaseFunction> functions)
@@ -55,9 +69,21 @@ public sealed class NTTModuleBuilder : IModuleBuilder
         using (var writer = _sectionManager.GetWriter(LinkedModule.ModuleHeaderSectionName))
         {
             var header = default(ModuleDescHeader);
+            var hasWarp = targetOptions.HierarchyNames.Contains('w', StringComparison.Ordinal);
             header.ThreadDim = (uint)targetOptions.Hierarchies[0][^1];
-            header.BlockDim = targetOptions.Hierarchies[0].Length < 2 ? 1 : (uint)targetOptions.Hierarchies[0][^2];
-            header.ChipDim = targetOptions.Hierarchies[0].Length < 3 ? 1 : (uint)targetOptions.Hierarchies[0][^3];
+            if (hasWarp)
+            {
+                header.WarpDim = targetOptions.Hierarchies[0].Length < 2 ? 1 : (uint)targetOptions.Hierarchies[0][^2];
+                header.BlockDim = targetOptions.Hierarchies[0].Length < 3 ? 1 : (uint)targetOptions.Hierarchies[0][^3];
+                header.ChipDim = targetOptions.Hierarchies[0].Length < 4 ? 1 : (uint)targetOptions.Hierarchies[0][^4];
+            }
+            else
+            {
+                header.WarpDim = 1;
+                header.BlockDim = targetOptions.Hierarchies[0].Length < 2 ? 1 : (uint)targetOptions.Hierarchies[0][^2];
+                header.ChipDim = targetOptions.Hierarchies[0].Length < 3 ? 1 : (uint)targetOptions.Hierarchies[0][^3];
+            }
+
             writer.Write(ref header);
 
             // cache offsets.
@@ -76,7 +102,7 @@ public sealed class NTTModuleBuilder : IModuleBuilder
             }
         }
 
-        var linkableFunctions = functions.OfType<BaseFunction>().Select((f, i) => new FunctionBuilder((uint)i, _rdataWriter, _threadLocalRdataWriters, _blockLocalRdataWriters, (Targets.NTTTargetOptions)CompileOptions.TargetOptions).Build(f)).ToArray();
+        var linkableFunctions = functions.OfType<BaseFunction>().Select((f, i) => new FunctionBuilder((uint)i, _rdataWriter, _threadLocalRdataWriters, _warpLocalRdataWriters, _blockLocalRdataWriters, (Targets.NTTTargetOptions)CompileOptions.TargetOptions).Build(f)).ToArray();
         _rdataWriter.Flush();
         var threadLocalRdataContents = Enumerable.Range(0, _threadLocalRdataWriters.Length).Select(i =>
         {
@@ -96,12 +122,18 @@ public sealed class NTTModuleBuilder : IModuleBuilder
             return _sectionManager.GetContent(WellknownSectionNames.ThreadLocalCache, i)!;
         }).ToArray();
 
+        var warpLocalRdataContents = Enumerable.Range(0, _warpLocalRdataWriters.Length).Select(i =>
+        {
+            _warpLocalRdataWriters[i].Flush();
+            return _sectionManager.GetContent(WellknownSectionNames.WarpLocalRdata, i)!;
+        }).ToArray();
+
         var blockLocalRdataContents = Enumerable.Range(0, _blockLocalRdataWriters.Length).Select(i =>
         {
             _blockLocalRdataWriters[i].Flush();
             return _sectionManager.GetContent(WellknownSectionNames.BlockLocalRdata, i)!;
         }).ToArray();
 
-        return new LinkableModule(_sectionManager.GetContent(LinkedModule.ModuleHeaderSectionName)!, _sectionManager.GetContent(WellknownSectionNames.Rdata)!, threadLocalRdataContents, threadLocalCacheContents, blockLocalRdataContents, linkableFunctions, CompileOptions);
+        return new LinkableModule(ModuleKind, _sectionManager.GetContent(LinkedModule.ModuleHeaderSectionName)!, _sectionManager.GetContent(WellknownSectionNames.Rdata)!, threadLocalRdataContents, threadLocalCacheContents, warpLocalRdataContents, blockLocalRdataContents, linkableFunctions, CompileOptions);
     }
 }

@@ -72,12 +72,12 @@ constexpr auto make_paddings(const TPaddings &...paddings) noexcept;
 
 template <Padding... TPaddings> class paddings_t {
   public:
-    using paddings_type = std::tuple<TPaddings...>;
+    using paddings_type = ntt::tuple<TPaddings...>;
 
     constexpr paddings_t() = default;
 
     constexpr paddings_t(const TPaddings &...paddings) noexcept
-        : paddings_(std::make_tuple(paddings...)) {}
+        : paddings_(ntt::make_tuple(paddings...)) {}
 
     static constexpr auto rank() noexcept {
         return fixed_dim_v<sizeof...(TPaddings)>;
@@ -95,7 +95,7 @@ template <Padding... TPaddings> class paddings_t {
 
     template <size_t Rank = rank(), class = std::enable_if_t<Rank != 0>>
     constexpr paddings_t() noexcept
-        : paddings_(std::make_tuple(TPaddings{}...)) {}
+        : paddings_(ntt::make_tuple(TPaddings{}...)) {}
 
     template <Dimension TIndex>
     constexpr auto operator[](const TIndex &index) const noexcept {
@@ -135,23 +135,23 @@ template <Padding... TPaddings> class paddings_t {
     template <Dimension TIndex>
     constexpr auto at(const TIndex &) const noexcept {
         if constexpr (FixedDimension<TIndex>) {
-            return std::get<TIndex::value>(paddings_);
+            return ntt::get<TIndex::value>(paddings_);
         } else {
             return to_array()[TIndex{}];
         }
     }
 
     template <dim_t TIndex> constexpr auto at() const noexcept {
-        return std::get<TIndex>(paddings_);
+        return ntt::get<TIndex>(paddings_);
     }
 
     template <dim_t TIndex> constexpr auto &at() noexcept {
-        return std::get<TIndex>(paddings_);
+        return ntt::get<TIndex>(paddings_);
     }
 
     template <FixedDimension TIndex>
     constexpr auto &at(const TIndex &) noexcept {
-        return std::get<TIndex::value>(paddings_);
+        return ntt::get<TIndex::value>(paddings_);
     }
 
     constexpr std::array<std::array<dim_t, 2>, rank()>
@@ -165,7 +165,7 @@ template <Padding... TPaddings> class paddings_t {
     }
 
   private:
-    NTT_NO_UNIQUE_ADDRESS std::tuple<TPaddings...> paddings_;
+    NTT_NO_UNIQUE_ADDRESS ntt::tuple<TPaddings...> paddings_;
 };
 
 template <class T>
@@ -184,9 +184,11 @@ template <class I> struct dynamic_paddings_type_impl;
 
 template <size_t... I>
 struct dynamic_paddings_type_impl<std::index_sequence<I...>> {
-    template <std::size_t> using elem_type = dim_t;
+    template <std::size_t> struct elem_type {
+        using type = padding_t<dim_t, dim_t>;
+    };
 
-    using type = paddings_t<elem_type<I>...>;
+    using type = paddings_t<typename elem_type<I>::type...>;
 };
 
 template <size_t Rank>
@@ -255,7 +257,8 @@ struct tuple_size<TPaddings>
 
 template <size_t I, nncase::ntt::Padding... TPaddings>
 struct tuple_element<I, nncase::ntt::padding_t<TPaddings...>> {
-    using type = std::tuple_element_t<I, std::tuple<TPaddings...>>;
+    using type =
+        nncase::ntt::tuple_element_t<I, nncase::ntt::tuple<TPaddings...>>;
 };
 
 template <size_t I, nncase::ntt::Paddings TPaddings>

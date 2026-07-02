@@ -29,7 +29,7 @@ template <size_t Axis, class Shape, FixedShape TTile, class Offsets,
 NTT_ALWAYS_INLINE constexpr void
 apply_impl(dynamic_shape_t<Shape::rank()> &index, Offsets offsets,
            const Shape &shape, const TTile &tile, Callable &&callable,
-           const std::tuple<Strides...> &strides) {
+           const ntt::tuple<Strides...> &strides) {
     auto call = [&]<size_t... I>(std::index_sequence<I...>) {
         if constexpr (sizeof...(Strides)) {
             callable(index, offsets[fixed_dim_v<I>]...);
@@ -47,7 +47,7 @@ apply_impl(dynamic_shape_t<Shape::rank()> &index, Offsets offsets,
                                  std::forward<Callable>(callable), strides);
         }
         ntt::loop<sizeof...(Strides)>([&](auto i) {
-            offsets[i] += std::get<i>(strides)[fixed_dim_v<Axis>] *
+            offsets[i] += ntt::get<i>(strides)[fixed_dim_v<Axis>] *
                           tile[fixed_dim_v<Axis>];
         });
     }
@@ -62,7 +62,7 @@ NTT_ALWAYS_INLINE constexpr void apply(const TShape &shape, Callable &&callable,
         detail::apply_impl<0>(index, make_repeat_shape<sizeof...(TStrides)>(0),
                               shape, make_ones_shape<TShape::rank()>(),
                               std::forward<Callable>(callable),
-                              std::forward_as_tuple(strides...));
+                              ntt::forward_as_tuple(strides...));
     } else {
         if constexpr (sizeof...(TStrides)) {
             callable(fixed_shape_v<>, (strides, (dim_t)0)...);
@@ -80,7 +80,7 @@ apply_tiled(const TShape &shape, const TTile &tile, Callable &&callable,
         dynamic_shape_t<TShape::rank()> index{};
         detail::apply_impl<0>(index, make_repeat_shape<sizeof...(TStrides)>(0),
                               shape, tile, std::forward<Callable>(callable),
-                              std::forward_as_tuple(strides...));
+                              ntt::forward_as_tuple(strides...));
     } else {
         if constexpr (sizeof...(TStrides)) {
             callable(fixed_shape_v<>, (strides, (dim_t)0)...);
