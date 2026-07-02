@@ -310,3 +310,11 @@ void nncase::clr::shape_bucket_options::fix_var_map(
     nncase_clr_api()->shape_bucket_options_set_fix_var_map(
         obj_.get(), s.c_str(), s.length());
 }
+
+void nncase::clr::shape_bucket_options::segment_ranges(
+    std::map<std::string, std::vector<int>> value) {
+    nlohmann::json j = value;
+    std::string s = j.dump();
+    nncase_clr_api()->shape_bucket_options_set_segment_ranges(
+        obj_.get(), s.c_str(), s.length());
+}

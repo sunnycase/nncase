@@ -319,6 +319,7 @@ public sealed class VectorizeMatMul : VectorizeRule
             AddCandidate(rcontext, IR.NTT.VectorizedMatMul.VectorizeKind.M | IR.NTT.VectorizedMatMul.VectorizeKind.K, IR.NTT.VectorizedMatMul.VectorizeKind.K | IR.NTT.VectorizedMatMul.VectorizeKind.N/* , transB: rhs is Const */);
             if (TransB)
             {
+                // vectorize A's m,k and B's n,k
                 AddCandidate(rcontext, IR.NTT.VectorizedMatMul.VectorizeKind.M | IR.NTT.VectorizedMatMul.VectorizeKind.K, IR.NTT.VectorizedMatMul.VectorizeKind.K | IR.NTT.VectorizedMatMul.VectorizeKind.N, transB: TransB);
             }
 

@@ -56,26 +56,32 @@ public sealed partial class PackMatMulByN : RewriteRule<Pattern>
         (var lhsVectorizeKind, var rhsVectorizeKind) = matMul.GetVectorizeKind(lhsShape.Rank, rhsShape.Rank);
         if (lhsVectorizeKind == VectorizedMatMul.VectorizeKind.None && rhsVectorizeKind == VectorizedMatMul.VectorizeKind.N
             && !matMul.TransposeA && !matMul.TransposeB
-            && Dimension.TryDivExactly(rhsShape[dimInfo.Rn], _nr, out _))
+            && rhs.CheckedDataType is VectorType rhsVectorType
+            && rhsVectorType.Lanes.Count == 1)
         {
-            // 1. Transpose B
+            var cN = Math.Max(lhsShape.Rank, rhsShape.Rank) - 1;
+            if (!Dimension.TryDivExactly(rhsShape[dimInfo.Rn], _nr, out _))
+            {
+                return null;
+            }
+
+            // 1. Transpose B outer dimensions to [N/lanes, K].
             var newRhsPerm = Enumerable.Range(0, rhsShape.Rank).ToArray();
             (newRhsPerm[^2], newRhsPerm[^1]) = (newRhsPerm[^1], newRhsPerm[^2]);
-            var newRhs = (Expr)IR.F.Tensors.Transpose(rhs, newRhsPerm);
+            Expr newRhs = IR.F.Tensors.Transpose(rhs, newRhsPerm);
 
-            // 2. Pack B
+            // 2. Pack B's N axis to vector<Nr, lanes>.
             var rN = rhsShape.Rank - 2;
             newRhs = IR.F.Tensors.Pack(newRhs, [_nr], [rN]);
+
             var output = IR.F.NTT.PackedMatMul(
                 lhs,
                 newRhs,
                 false,
                 matMul.OutputDataType);
 
-            // 3. Unpack C
-            var cN = output.CheckedShape.Rank - 1;
-            output = IR.F.Tensors.Unpack(output, [_nr], [cN]);
-            return output;
+            // 3. Unpack only the packed-N lane, preserving the original N vector lane.
+            return IR.F.Tensors.Unpack(output, [_nr], [cN]);
         }
 
         return null;

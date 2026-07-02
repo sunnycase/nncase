@@ -39,7 +39,37 @@ public sealed record Cost : IComparable<Cost>, IEquatable<Cost>
     /// <summary>
     /// Gets score.
     /// </summary>
-    public UInt128 Score => Factors.Sum(x => x.Value);
+    public UInt128 Score
+    {
+        get
+        {
+            var cpuCost = GetFactor(CostFactorNames.CPUCycles);
+            var memoryCost = GetFactor(CostFactorNames.MemoryLoad) + GetFactor(CostFactorNames.MemoryStore);
+            var overlappedCost = cpuCost > memoryCost ? cpuCost : memoryCost;
+            return overlappedCost + GetFactor(CostFactorNames.Synchronization) + GetFactor(CostFactorNames.Comm) + OtherCost;
+        }
+    }
+
+    private UInt128 OtherCost
+    {
+        get
+        {
+            UInt128 cost = 0;
+            foreach (var factor in Factors)
+            {
+                if (factor.Key != CostFactorNames.CPUCycles
+                    && factor.Key != CostFactorNames.MemoryLoad
+                    && factor.Key != CostFactorNames.MemoryStore
+                    && factor.Key != CostFactorNames.Synchronization
+                    && factor.Key != CostFactorNames.Comm)
+                {
+                    cost += factor.Value;
+                }
+            }
+
+            return cost;
+        }
+    }
 
     public UInt128 this[string name]
     {
@@ -165,6 +195,8 @@ public sealed record Cost : IComparable<Cost>, IEquatable<Cost>
 
         return $"{{ {string.Join(", ", Factors.Select(kv => $"{kv.Key}: {kv.Value}"))}, Score:{Score} }}";
     }
+
+    private UInt128 GetFactor(string name) => Factors.TryGetValue(name, out var value) ? value : 0;
 }
 
 /// <summary>

@@ -3,6 +3,7 @@
 
 using System;
 using System.ComponentModel;
+using Nncase.CostModel;
 
 namespace Nncase.Targets;
 
@@ -11,6 +12,9 @@ namespace Nncase.Targets;
 /// </summary>
 public sealed class PyNTTTargetOptions : NTTTargetOptions
 {
+    private string _backend = "triton";
+    private TritonTargetCapability _tritonCapability = TritonTargetCapability.Default;
+
     /// <summary>
     /// Initializes a new instance of the <see cref="PyNTTTargetOptions"/> class.
     /// </summary>
@@ -18,6 +22,7 @@ public sealed class PyNTTTargetOptions : NTTTargetOptions
     {
         HierarchyNames = "yx";
         Hierarchies = new[] { new[] { 4, 8 } };
+        RefreshTargetCostModel();
     }
 
     /// <summary>
@@ -26,7 +31,28 @@ public sealed class PyNTTTargetOptions : NTTTargetOptions
     [DisplayName("--pyntt-backend")]
     [Description("PyNTT backend name.")]
     [DefaultValue("triton")]
-    public string Backend { get; set; } = "triton";
+    public string Backend
+    {
+        get => _backend;
+        set
+        {
+            _backend = value;
+            RefreshTargetCostModel();
+        }
+    }
+
+    /// <summary>
+    /// Gets or sets the Triton backend hardware capability.
+    /// </summary>
+    public TritonTargetCapability TritonCapability
+    {
+        get => _tritonCapability;
+        set
+        {
+            _tritonCapability = value;
+            RefreshTargetCostModel();
+        }
+    }
 
     /// <summary>
     /// Gets or sets the generated Python model directory.
@@ -43,4 +69,33 @@ public sealed class PyNTTTargetOptions : NTTTargetOptions
     [Description("Reject unsupported PyNTT constructs instead of falling back.")]
     [DefaultValue(true)]
     public bool Strict { get; set; } = true;
+
+    public static PyNTTTargetOptions FromNTTTargetOptions(NTTTargetOptions nttOptions)
+    {
+        return new PyNTTTargetOptions
+        {
+            ModelName = nttOptions.ModelName,
+            Vectorize = nttOptions.Vectorize,
+            UnifiedMemoryArch = nttOptions.UnifiedMemoryArch,
+            MemoryAccessArch = nttOptions.MemoryAccessArch,
+            NocArch = nttOptions.NocArch,
+            HierarchyKind = nttOptions.HierarchyKind,
+            Hierarchies = nttOptions.Hierarchies,
+            HierarchyNames = nttOptions.HierarchyNames,
+            HierarchySizes = nttOptions.HierarchySizes,
+            HierarchyLatencies = nttOptions.HierarchyLatencies,
+            HierarchyBandWidths = nttOptions.HierarchyBandWidths,
+            MemoryCapacities = nttOptions.MemoryCapacities,
+            MemoryBandWidths = nttOptions.MemoryBandWidths,
+            DistributedScheme = nttOptions.DistributedScheme,
+            CustomOpScheme = nttOptions.CustomOpScheme,
+        };
+    }
+
+    private void RefreshTargetCostModel()
+    {
+        TargetCostModel = string.Equals(_backend, "triton", StringComparison.OrdinalIgnoreCase)
+            ? new TritonTargetOpCostModel(_tritonCapability)
+            : DefaultTargetOpCostModel.Instance;
+    }
 }

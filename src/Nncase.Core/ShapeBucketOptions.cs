@@ -15,6 +15,8 @@ namespace Nncase
 
         public int SegmentsCount { get; set; }
 
+        public Dictionary<string, int[]> SegmentRanges { get; set; } = new();
+
         public Dictionary<string, int> FixVarMap { get; set; } = new();
 
         public static ShapeBucketOptions Default => new();
@@ -34,6 +36,11 @@ namespace Nncase
             }
 
             options.SegmentsCount = from.SegmentsCount;
+            foreach (var (k, v) in from.SegmentRanges)
+            {
+                options.SegmentRanges.Add(k, v.ToArray());
+            }
+
             foreach (var (k, v) in from.FixVarMap)
             {
                 options.FixVarMap.Add(k, v);
@@ -42,7 +49,7 @@ namespace Nncase
             return options;
         }
 
-        public static ShapeBucketOptions Create(bool enable, Dictionary<IVar, Dimension[]> varMap, Dictionary<string, (int Min, int Max)> rangeInfo, int segmentsCount, Dictionary<string, int> fixVarMap)
+        public static ShapeBucketOptions Create(bool enable, Dictionary<IVar, Dimension[]> varMap, Dictionary<string, (int Min, int Max)> rangeInfo, int segmentsCount, Dictionary<string, int> fixVarMap, Dictionary<string, int[]>? segmentRanges = null)
         {
             var options = new ShapeBucketOptions();
             options.Enable = enable;
@@ -50,6 +57,7 @@ namespace Nncase
             options.RangeInfo = rangeInfo;
             options.SegmentsCount = segmentsCount;
             options.FixVarMap = fixVarMap;
+            options.SegmentRanges = segmentRanges ?? new();
             return options;
         }
     }

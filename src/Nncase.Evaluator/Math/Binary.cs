@@ -164,6 +164,13 @@ public partial class BinaryEvaluator : IEvaluator<Binary>, ITypeInferencer<Binar
         var lhsType = context.GetArgumentType<IRType>(target, Binary.Lhs);
         var rhsType = context.GetArgumentType<IRType>(target, Binary.Rhs);
         var outputType = context.GetReturnType<IRType>();
+        if (TargetCostTensor.TryFromType(lhsType, out var lhsTensor)
+            && TargetCostTensor.TryFromType(rhsType, out var rhsTensor)
+            && TargetCostTensor.TryFromType(outputType, out var outputTensor)
+            && context.TargetCostModel.TryGetBinaryCost(new(target.BinaryOp, lhsTensor, rhsTensor, outputTensor), out var targetCost))
+        {
+            return targetCost;
+        }
 
         return new()
         {

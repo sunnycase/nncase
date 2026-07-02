@@ -370,7 +370,7 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
             {
                 using (var stream = Diagnostics.DumpScope.Current.OpenFile("DistributedSearchGraph.dot"))
                 {
-                    Dump(stream, new Dictionary<SearchableNode, bool>() { }, new Dictionary<SearchableNode, CostModel.Cost>() { });
+                    Dump(stream, new Dictionary<SearchableNode, bool>() { }, new Dictionary<SearchableNode, CostModel.Cost>() { }, new Dictionary<SearchableNode, UInt128>() { });
                 }
             }
 
@@ -1144,7 +1144,7 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         return standCluster;
     }
 
-    private void Dump(Stream stream, IReadOnlyDictionary<SearchableNode, bool> pickMemo, IReadOnlyDictionary<SearchableNode, CostModel.Cost> costMemo)
+    private void Dump(Stream stream, IReadOnlyDictionary<SearchableNode, bool> pickMemo, IReadOnlyDictionary<SearchableNode, CostModel.Cost> costMemo, IReadOnlyDictionary<SearchableNode, UInt128> costScoreMemo)
     {
         using var writer = new StreamWriter(stream);
         writer.Write(_rootSearchGraph.ToGraphviz(alg =>
@@ -1197,7 +1197,7 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
                         row1.Cells.Add(new() { Text = $"{k}: {v}" });
                     }
 
-                    row1.Cells.Add(new() { Text = $"Score: {cost.Score}" });
+                    row1.Cells.Add(new() { Text = $"Score: {costScoreMemo[arg.Vertex]}" });
                     col1.Cells.Add(row1);
                 }
 
@@ -1223,6 +1223,7 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         var clusterVarMemo = new Dictionary<DistributedSearchGraph, List<BoolVar>>();
         var costMemo = new Dictionary<SearchableNode, CostModel.Cost>();
         var costScoreMemo = new Dictionary<SearchableNode, UInt128>();
+        var targetCostModel = CostModel.TargetOpCostModelUtility.GetTargetCostModel(CompileOptions);
         foreach (var cluster in _rootSearchGraph.Clusters.OfType<DistributedSearchGraph>())
         {
             clusterVarMemo.Add(cluster, new());
@@ -1263,7 +1264,7 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
                     }
 
                     costMemo.Add(enode, cost);
-                    costScoreMemo.Add(enode, cost.Score);
+                    costScoreMemo.Add(enode, CostModel.TargetOpCostModelUtility.GetCostLatency(targetCostModel, cost));
 
                     var boolVar = cpmodel.NewBoolVar(string.Empty);
                     varMemo.Add(enode, boolVar);
@@ -1359,12 +1360,13 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
 
         solver.StringParameters = $"max_time_in_seconds:{max_time},num_workers:{processorCount}";
 
-        var enableDump = Diagnostics.DumpScope.Current.IsEnabled(Diagnostics.DumpFlags.EGraphCost);
+        var enableDump = Diagnostics.DumpScope.Current.IsEnabled(Diagnostics.DumpFlags.EGraphCost)
+            || string.Equals(Environment.GetEnvironmentVariable("NNCASE_DUMP_AD_COSTS"), "1", StringComparison.Ordinal);
         CpSolverStatus status;
         using (var dumpStream = Diagnostics.DumpScope.Current.OpenFile("Costs/Solve.txt"))
         {
             using var writer = new StreamWriter(dumpStream);
-            var cb = new PrintCostCallBack(varMemo, costMemo, writer, enableDump);
+            var cb = new PrintCostCallBack(varMemo, costMemo, targetCostModel, writer, enableDump);
             status = solver.Solve(cpmodel, cb);
             writer.WriteLine($"Status : {status}");
         }
@@ -1377,7 +1379,7 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         var picks = _rootSearchGraph.Vertices.ToDictionary(e => e, e => solver.BooleanValue(varMemo[e]));
         using (var stream = enableDump ? Diagnostics.DumpScope.Current.OpenFile("Costs/Pick.dot") : Stream.Null)
         {
-            Dump(stream, picks, costMemo);
+            Dump(stream, picks, costMemo, costScoreMemo);
         }
 
         if (_phase == AutoDistributedPhase.SearchConstant)
@@ -1496,6 +1498,7 @@ internal sealed class DistributedCostEvaluateContext : Evaluator.ICostEvaluateCo
         ReturnType = returnType;
         Args = args;
         CompileOptions = compileOptions;
+        TargetCostModel = CostModel.TargetOpCostModelUtility.GetTargetCostModel(compileOptions);
     }
 
     public Op Op { get; }
@@ -1505,6 +1508,8 @@ internal sealed class DistributedCostEvaluateContext : Evaluator.ICostEvaluateCo
     public BaseExpr[] Args { get; }
 
     public CompileOptions CompileOptions { get; }
+
+    public CostModel.ITargetOpCostModel TargetCostModel { get; }
 
     public T GetArgument<T>(Op op, ParameterInfo parameter)
         where T : BaseFunction
@@ -1536,14 +1541,16 @@ internal sealed class PrintCostCallBack : CpSolverSolutionCallback
 {
     private readonly IReadOnlyDictionary<SearchableNode, BoolVar> _vars;
     private readonly Dictionary<SearchableNode, CostModel.Cost> _costModel;
+    private readonly CostModel.ITargetOpCostModel _targetCostModel;
     private readonly StreamWriter _dumpWriter;
     private readonly bool _enableDump;
     private int _count;
 
-    public PrintCostCallBack(IReadOnlyDictionary<SearchableNode, BoolVar> vars, Dictionary<SearchableNode, CostModel.Cost> costModel, StreamWriter writer, bool enableDump)
+    public PrintCostCallBack(IReadOnlyDictionary<SearchableNode, BoolVar> vars, Dictionary<SearchableNode, CostModel.Cost> costModel, CostModel.ITargetOpCostModel targetCostModel, StreamWriter writer, bool enableDump)
     {
         _vars = vars;
         _costModel = costModel;
+        _targetCostModel = targetCostModel;
         _dumpWriter = writer;
         _enableDump = enableDump;
     }
@@ -1563,6 +1570,7 @@ internal sealed class PrintCostCallBack : CpSolverSolutionCallback
 
             _dumpWriter.WriteLine($"Solution {_count++} @ {WallTime()}:");
             _dumpWriter.WriteLine(cost.ToString());
+            _dumpWriter.WriteLine($"Latency: {CostModel.TargetOpCostModelUtility.GetCostLatency(_targetCostModel, cost)}");
             _dumpWriter.Flush();
         }
     }

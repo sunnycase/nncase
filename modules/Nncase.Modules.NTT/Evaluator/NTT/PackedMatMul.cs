@@ -18,17 +18,17 @@ public sealed class PackedMatMulEvaluator : IEvaluator<PackedMatMul>, ITypeInfer
 {
     public IValue Visit(IEvaluateContext context, PackedMatMul target)
     {
-        var lhs = context.GetOrtArgumentValue(target, PackedMatMul.Lhs); // [x, k, m]
-        var rhs = context.GetArgumentValueAsTensor(target, PackedMatMul.Rhs); // [x, n/4/8, k, 4, 8]
+        var lhs = context.GetOrtArgumentValue(target, PackedMatMul.Lhs); // [x, m, k]
+        var rhs = context.GetArgumentValueAsTensor(target, PackedMatMul.Rhs); // [x, n/Nr/lanes, k, Nr, lanes]
         var scale = context.GetArgumentValue(target, PackedMatMul.Scale);
         var rhsOrt = rhs.ToOrtTensor();
 
         var rhsVectorType = (VectorType)rhs.ElementType;
         var nr = rhsVectorType.Lanes[0];
-        var lanes = rhsVectorType.Lanes[1];
+        var nLanes = rhsVectorType.Lanes[1];
         var outRank = context.CurrentCall.CheckedShape.Rank;
 
-        // 1. Unpack B
+        // 1. Unpack B to scalar reference layout.
         var rN = rhs.Rank - 2;
         rhsOrt = rhsOrt.Unpack(rhsVectorType.Lanes.Count, [rN, rN]);
 
@@ -41,8 +41,8 @@ public sealed class PackedMatMulEvaluator : IEvaluator<PackedMatMul>, ITypeInfer
 
         var matmul = Math.MatMulEvaluator.InferValue(lhs.DataType.ToDataType(), lhs.ToTensor(), rhsOrt.ToTensor(), target.OutputDataType, scale).AsTensor().ToOrtTensor();
         var cN = matmul.Rank - 1;
-        matmul = matmul.Pack(0, [nr, lanes], [cN, cN]);
-        return matmul.ToValue(new VectorType(DataTypes.Float32, [nr, lanes]));
+        matmul = matmul.Pack(0, [nr, nLanes], [cN, cN]);
+        return matmul.ToValue(new VectorType(target.OutputDataType, [nr, nLanes]));
     }
 
     public IRType Visit(ITypeInferenceContext context, PackedMatMul target)
@@ -100,6 +100,10 @@ public sealed class PackedMatMulEvaluator : IEvaluator<PackedMatMul>, ITypeInfer
         var rhs = context.GetArgumentType<IRType>(target, PackedMatMul.Rhs);
         var outputType = context.GetReturnType<IRType>();
         bool hasAllReduce = false;
+        if (TryGetTargetCost(context, target, lhs, rhs, outputType, out var targetCost, out hasAllReduce))
+        {
+            return AddAllReduceCost(targetCost, outputType, hasAllReduce);
+        }
 
         uint macPerElement = 1;
         if (lhs is TensorType { Shape: Shape lhsShape })
@@ -122,25 +126,64 @@ public sealed class PackedMatMulEvaluator : IEvaluator<PackedMatMul>, ITypeInfer
             [CostFactorNames.CPUCycles] = CostUtility.GetCPUCycles(outputType, macPerElement),
         };
 
-        if (hasAllReduce)
-        {
-            UInt128 synchronizeCost = 25_000; // 25k cycles on 5GHz CPU is about 5us.
-            cost[CostFactorNames.MemoryLoad] += CostUtility.GetMemoryAccess(outputType) * 2;
-            cost[CostFactorNames.MemoryStore] += CostUtility.GetMemoryAccess(outputType);
-            cost[CostFactorNames.CPUCycles] += CostUtility.GetCPUCycles(outputType, 1);
-            cost[CostFactorNames.Synchronization] = synchronizeCost * 3;
-        }
-
-        return cost;
+        return AddAllReduceCost(cost, outputType, hasAllReduce);
     }
 
     private TensorType UnpackedBType(TensorType tensorType)
     {
         var vectorType = (VectorType)tensorType.DType;
         var nr = vectorType.Lanes[0];
-        var lanes = vectorType.Lanes[1];
+        var nLanes = vectorType.Lanes[1];
         var newShape = tensorType.Shape.ToArray();
         newShape[^2] *= nr;
-        return tensorType with { DType = vectorType with { Lanes = [lanes] }, Shape = newShape };
+        return tensorType with { DType = vectorType with { Lanes = [nLanes] }, Shape = newShape };
+    }
+
+    private bool TryGetTargetCost(ICostEvaluateContext context, PackedMatMul target, IRType lhs, IRType rhs, IRType outputType, out Cost cost, out bool hasAllReduce)
+    {
+        hasAllReduce = lhs is DistributedType distributedType && distributedType.AxisPolicies[^1] is SBPSplit;
+        if (!TargetCostTensor.TryFromType(lhs, out var lhsTensor)
+            || !TargetCostTensor.TryFromType(rhs, out var rhsTensor)
+            || !TargetCostTensor.TryFromType(outputType, out var outputTensor)
+            || !context.TargetCostModel.TryGetMatMulCost(new(lhsTensor, rhsTensor, outputTensor, GetScalarType(target.OutputDataType)), out cost))
+        {
+            cost = Cost.Zero;
+            return false;
+        }
+
+        return true;
+    }
+
+    private DataType GetScalarType(DataType dtype) => dtype switch
+    {
+        VectorType vectorType => GetScalarType(vectorType.ElemType),
+        _ => dtype,
+    };
+
+    private Cost AddAllReduceCost(Cost cost, IRType outputType, bool hasAllReduce)
+    {
+        if (!hasAllReduce)
+        {
+            return cost;
+        }
+
+        UInt128 synchronizeCost = 25_000; // 25k cycles on 5GHz CPU is about 5us.
+        AddCostFactor(cost, CostFactorNames.MemoryLoad, CostUtility.GetMemoryAccess(outputType) * 2);
+        AddCostFactor(cost, CostFactorNames.MemoryStore, CostUtility.GetMemoryAccess(outputType));
+        AddCostFactor(cost, CostFactorNames.CPUCycles, CostUtility.GetCPUCycles(outputType, 1));
+        AddCostFactor(cost, CostFactorNames.Synchronization, synchronizeCost * 3);
+        return cost;
+    }
+
+    private void AddCostFactor(Cost cost, string name, UInt128 value)
+    {
+        if (cost.Factors.TryGetValue(name, out var oldValue))
+        {
+            cost.Factors[name] = oldValue + value;
+        }
+        else
+        {
+            cost.Factors.Add(name, value);
+        }
     }
 }

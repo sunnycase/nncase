@@ -26,7 +26,7 @@ public sealed class PyNTTTarget : NTTTarget
     /// <inheritdoc/>
     public override void RegisterAutoPackingRules(IRulesAddable pass, CompileOptions options)
     {
-        // PyNTT consumes tensor-level TIR directly; NTT auto-pack rewrites are not part of this backend path yet.
+        base.RegisterAutoPackingRules(pass, options);
     }
 
     /// <inheritdoc/>
@@ -51,35 +51,25 @@ public sealed class PyNTTTarget : NTTTarget
             name: "--pyntt-strict",
             description: "Reject unsupported PyNTT constructs instead of falling back.",
             getDefaultValue: () => true);
+        var tritonCapabilityOption = new Option<string>(
+            name: "--pyntt-triton-capability",
+            description: "Triton backend capability. Supports sm80/sm90 or key=value list such as cc=90,num_sms=132,clock_ghz=1.8,mem_bw_gbps=3000.",
+            getDefaultValue: () => TritonTargetCapability.Default.ToString());
 
         cmd.Add(backendOption);
         cmd.Add(outputDirOption);
         cmd.Add(strictOption);
+        cmd.Add(tritonCapabilityOption);
 
         ITargetOptions ParseTargetCompileOptions(InvocationContext context, Command command)
         {
             var nttOptions = new NTTTargetOptionsBinder(cmd).GetBoundValue(context);
-            return new PyNTTTargetOptions
-            {
-                ModelName = nttOptions.ModelName,
-                Vectorize = nttOptions.Vectorize,
-                UnifiedMemoryArch = nttOptions.UnifiedMemoryArch,
-                MemoryAccessArch = nttOptions.MemoryAccessArch,
-                NocArch = nttOptions.NocArch,
-                HierarchyKind = nttOptions.HierarchyKind,
-                Hierarchies = nttOptions.Hierarchies,
-                HierarchyNames = nttOptions.HierarchyNames,
-                HierarchySizes = nttOptions.HierarchySizes,
-                HierarchyLatencies = nttOptions.HierarchyLatencies,
-                HierarchyBandWidths = nttOptions.HierarchyBandWidths,
-                MemoryCapacities = nttOptions.MemoryCapacities,
-                MemoryBandWidths = nttOptions.MemoryBandWidths,
-                DistributedScheme = nttOptions.DistributedScheme,
-                CustomOpScheme = nttOptions.CustomOpScheme,
-                Backend = context.ParseResult.GetValueForOption(backendOption)!,
-                OutputDirectory = context.ParseResult.GetValueForOption(outputDirOption)!,
-                Strict = context.ParseResult.GetValueForOption(strictOption),
-            };
+            var pynttOptions = PyNTTTargetOptions.FromNTTTargetOptions(nttOptions);
+            pynttOptions.Backend = context.ParseResult.GetValueForOption(backendOption)!;
+            pynttOptions.TritonCapability = TritonTargetCapability.Parse(context.ParseResult.GetValueForOption(tritonCapabilityOption)!);
+            pynttOptions.OutputDirectory = context.ParseResult.GetValueForOption(outputDirOption)!;
+            pynttOptions.Strict = context.ParseResult.GetValueForOption(strictOption);
+            return pynttOptions;
         }
 
         return (cmd, ParseTargetCompileOptions);

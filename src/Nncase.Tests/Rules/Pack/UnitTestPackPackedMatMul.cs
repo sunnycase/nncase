@@ -16,6 +16,26 @@ namespace Nncase.Tests.Rules.NeutralTest;
 public class UnitTestVectorizeVectorizedMatMul : TransformTestBase
 {
     [Fact]
+    public void TestPackMatMulByNDoesNotRequireOuterUnpack()
+    {
+        var lhs = new Var("lhs", new TensorType(DataTypes.BFloat16, new RankedShape(8, 32)));
+        var rhs = new Var("rhs", new TensorType(new VectorType(DataTypes.BFloat16, [8]), new RankedShape(32, 8)));
+        var expr = VectorizedMatMul(lhs, rhs, [], new[] { 1 }, outDataType: DataTypes.BFloat16);
+        CompilerServices.InferenceType(expr);
+
+        var context = new Nncase.Passes.RunPassContext();
+        var post = (Expr)CompilerServices.Rewrite(expr, [new PackMatMulByN(4)], context);
+        CompilerServices.InferenceType(post);
+        var printed = CompilerServices.Print(post);
+
+        Assert.False(ReferenceEquals(expr, post));
+        Assert.Equal(expr.CheckedType, post.CheckedType);
+        Assert.Contains("PackedMatMul", printed, System.StringComparison.Ordinal);
+        Assert.Contains("Unpack(Lanes: {4}", printed, System.StringComparison.Ordinal);
+        Assert.DoesNotContain("Unpack(Lanes: {8}", printed, System.StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void TestVectorizedMatMulDevectorizePropagation()
     {
         var lhs = Pack(Testing.Rand<float>(3, 24), [8], [1]).Evaluate().AsTensor();

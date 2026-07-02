@@ -86,8 +86,13 @@ public class VectorizedRoPEEvaluator : IEvaluator<VectorizedRoPE>, ITypeInferenc
         var inputType = context.GetArgumentType<IRType>(target, VectorizedRoPE.Input);
         var cosType = context.GetArgumentType<IRType>(target, VectorizedRoPE.Cos);
         var sinType = context.GetArgumentType<IRType>(target, VectorizedRoPE.Sin);
-        var macPerElement = 4; // 2 for mul, 1 for add, 1 for neg and concat
         var returnType = context.GetReturnType<IRType>();
+        if (TargetOpCostModelUtility.TryGetTargetElementwiseCost(context.TargetCostModel, "vectorized_rope", [inputType, cosType, sinType], returnType, workPerElement: 4.0, out var targetCost))
+        {
+            return targetCost;
+        }
+
+        var macPerElement = 4; // 2 for mul, 1 for add, 1 for neg and concat
         return new()
         {
             [CostFactorNames.MemoryLoad] = CostUtility.GetMemoryAccess(inputType) + CostUtility.GetMemoryAccess(cosType) + CostUtility.GetMemoryAccess(sinType),

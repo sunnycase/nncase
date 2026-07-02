@@ -123,8 +123,9 @@ possible.
 
 When changing compiler targets, codegen, Python bindings, or PyNTT, keep the
 local development flow aligned with `compiler-build.yml`: build and install the
-native Python bridge first, then build/publish the C# compiler, then run Python
-tests from `install/`. Debug builds are fine for this loop.
+native Python bridge first, then build the C# compiler, then run Python tests
+against the installed native bridge and the C# build output. Debug builds are
+fine for this loop.
 
 ```sh
 conda activate nncase
@@ -144,20 +145,19 @@ cmake --install build/Debug --prefix install
 
 dotnet restore -r linux-x64
 dotnet build -c Debug --no-restore
-dotnet publish src/Nncase.Compiler -c Debug --no-restore --sc false -r linux-x64
 
-cp -a src/Nncase.Compiler/bin/Debug/net8.0/linux-x64/publish/. install/
 cp install/lib/*.so install/
 ```
 
-Always point Python tests at the installed native bridge and compiler publish
-artifact. Do not validate a compiler/codegen change with only `dotnet build`;
-that can leave Python using stale `_nncase` or stale managed assemblies.
+Always point Python tests at the installed native bridge and the compiler DLL
+from the `dotnet build` output. Publishing is not needed for the local test
+loop, and using `install/Nncase.Compiler.dll` can leave Python tests on stale
+managed assemblies after a compiler/codegen change.
 
 ```sh
 export PYTHONPATH="$PWD/install/lib:$PWD/install/python:$PWD/tests:${PYTHONPATH}"
 export LD_LIBRARY_PATH="$PWD/install/lib:${LD_LIBRARY_PATH}"
-export NNCASE_COMPILER="$PWD/install/Nncase.Compiler.dll"
+export NNCASE_COMPILER="$PWD/src/Nncase.Compiler/bin/Debug/net8.0/linux-x64/Nncase.Compiler.dll"
 export NNCASE_TILING_MAX_SOLUTIONS=1
 
 python - <<'PY'
@@ -187,10 +187,75 @@ pytest tests/importer/onnx_/basic/test_identity.py::test_identity \
 ```
 
 If `nncase.check_target("pyntt")` is false, first check that
-`install/Nncase.Compiler.dll`, `install/Nncase.Modules.NTT.dll`, and
-`install/lib/_nncase*.so` came from the same build loop. `Nncase.Modules.NTT.dll`
-is a built-in module loaded through `AddNTT()`, and `NNCASE_PLUGIN_PATH` will
-not load it as an external plugin.
+`src/Nncase.Compiler/bin/Debug/net8.0/linux-x64/Nncase.Compiler.dll`, the
+managed assemblies in that same build directory, and `install/lib/_nncase*.so`
+came from the same build loop. `Nncase.Modules.NTT.dll` is a built-in module
+loaded through `AddNTT()`, and `NNCASE_PLUGIN_PATH` will not load it as an
+external plugin.
+
+PyNTT template work has a separate fast loop. The generated
+`kernel_params.json`, `metadata.json`, `model.py`, `rdata.py`, and `assets/*.bin`
+form the compiler-to-PyNTT boundary. If you only change PyNTT templates under
+`pyntt/pyntt/codegen/templates/` or the reader-only renderer in
+`pyntt/pyntt/codegen/render.py`, do not recompile the model as the first
+validation step. Re-render `generated_kernels.py` from the existing manifest and
+rerun the generated package. Recompile the model only when changing the C#
+manifest emitter, TIR/codegen metadata, IR passes, rdata layout, runtime model
+signature, or target options.
+
+```sh
+export PYTHONPATH="$PWD/pyntt:${PYTHONPATH}"
+
+python - <<'PY'
+from pathlib import Path
+from pyntt.codegen.render import render_generated_kernels
+
+generated_dir = Path("tests_output/test_qwen3/infer/pyntt/noptq/CodeGen/pyntt")
+render_generated_kernels(generated_dir)
+print(generated_dir / "generated_kernels.py")
+PY
+```
+
+For a template-only correctness loop, load the same generated package in a fresh
+Python process and feed `torch.Tensor` inputs directly. For simple importer
+cases, load the saved `.npy` inputs from `tests_output/.../input/` and convert
+them to CUDA tensors. For HuggingFace or paged-attention cases, reuse or
+construct the same runtime objects used by the test runner, then call
+`load_model()` from the generated package. Avoid rerunning the full pytest case
+until the template-level issue is narrowed down, because the normal pytest flow
+clears `tests_output/`, recompiles the model, and can hide whether a fix really
+only needed PyNTT-side re-rendering.
+
+```sh
+python - <<'PY'
+import importlib.util
+import sys
+from pathlib import Path
+
+import numpy as np
+import torch
+
+generated_dir = Path("tests_output/some_case/infer/pyntt/noptq/CodeGen/pyntt")
+package_name = "_debug_pyntt_generated"
+spec = importlib.util.spec_from_file_location(
+    package_name,
+    generated_dir / "__init__.py",
+    submodule_search_locations=[str(generated_dir)],
+)
+module = importlib.util.module_from_spec(spec)
+sys.modules[package_name] = module
+spec.loader.exec_module(module)
+
+model = module.load_model()
+inputs = [
+    torch.from_numpy(np.ascontiguousarray(np.load("tests_output/some_case/input/input_0_0.npy"))).cuda(),
+]
+with torch.no_grad():
+    output = model(*inputs)
+torch.cuda.synchronize()
+print(output.shape if hasattr(output, "shape") else [o.shape for o in output])
+PY
+```
 
 ### Build Native Compiler Components
 
@@ -263,7 +328,7 @@ python -m pip install -r requirements.test.txt
 
 export PYTHONPATH="$PWD/install/lib:$PWD/install/python:$PWD/tests:${PYTHONPATH}"
 export LD_LIBRARY_PATH="$PWD/install/lib:${LD_LIBRARY_PATH}"
-export NNCASE_COMPILER="$PWD/install/Nncase.Compiler.dll"
+export NNCASE_COMPILER="$PWD/src/Nncase.Compiler/bin/Debug/net8.0/linux-x64/Nncase.Compiler.dll"
 export NNCASE_TILING_MAX_SOLUTIONS=1
 
 pytest tests/other/ --doctest-modules

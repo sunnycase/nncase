@@ -109,7 +109,7 @@ internal class EGraphExtractor
         }
 
         // 3. add pick weights for all enode.
-        cpmodel.Minimize(LinearExpr.WeightedSum(nodes.Select(n => varMemo[n]), nodes.Select(n => checked((long)_costModel[n].Score))));
+        cpmodel.Minimize(LinearExpr.WeightedSum(nodes.Select(n => varMemo[n]), nodes.Select(n => checked((long)_costModel.GetLatency(n)))));
 
         if (cpmodel.Validate().Any())
         {
@@ -255,6 +255,7 @@ internal sealed class PrintCostCallBack : CpSolverSolutionCallback
 
             _dumpWriter.WriteLine($"Solution {_count++} @ {WallTime()}:");
             _dumpWriter.WriteLine(cost.ToString());
+            _dumpWriter.WriteLine($"Latency: {_costModel.GetLatency(cost)}");
             _dumpWriter.Flush();
         }
     }

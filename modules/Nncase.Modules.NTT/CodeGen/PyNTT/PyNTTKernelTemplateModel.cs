@@ -192,6 +192,7 @@ public sealed record PyNTTGatherTemplateModel(
     string IndexTritonDType,
     string OutputTritonDType,
     PyNTTDimExpression[] InputShape,
+    PyNTTDimExpression[] InputGlobalShape,
     PyNTTDimExpression[] IndexShape,
     PyNTTDimExpression[] OutputShape,
     PyNTTDimExpression[] InputStrides,
@@ -199,6 +200,8 @@ public sealed record PyNTTGatherTemplateModel(
     PyNTTDimExpression[] OutputStrides,
     int Axis,
     int ValueVectorLaneCount,
+    int[] Hierarchy,
+    int[][] InputSplitAxes,
     string Comment)
 {
     public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
@@ -209,10 +212,10 @@ public sealed record PyNTTReshardTemplateModel(
     PyNTTBufferPointerTemplateModel Input,
     PyNTTBufferPointerTemplateModel Output,
     string InputBaseName,
-    long InputOffsetBytes,
+    string InputOffsetBytes,
     long InputPoolBytes,
     string OutputBaseName,
-    long OutputOffsetBytes,
+    string OutputOffsetBytes,
     long OutputPoolBytes,
     int ScalarElementSizeBytes,
     string DType,
@@ -412,7 +415,7 @@ public sealed record PyNTTUpdatePagedAttentionKVCacheTemplateModel(
     int[][] SlotsSplitAxes,
     int[] Hierarchy,
     string SlotsBaseName,
-    long SlotsOffsetBytes,
+    string SlotsOffsetBytes,
     long SlotsPoolBytes,
     int ScalarElementSizeBytes,
     int SeqAxis,
@@ -523,24 +526,29 @@ public sealed record PyNTTMatmulTemplateModel(
     PyNTTDimExpression[] OutputStrides,
     bool TransposeA,
     bool TransposeB,
+    int[] Hierarchy,
     int RhsNVectorLaneCount,
     int OutputNVectorLaneCount,
     string Scale,
     string Comment)
 {
     public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
+
+    public int RhsNPackedLaneCount { get; set; } = 1;
+
+    public int OutputNPackedLaneCount { get; set; } = 1;
 }
 
 public sealed record PyNTTSummaTemplateModel(
     string FunctionName,
     string LhsBaseName,
-    long LhsOffsetBytes,
+    string LhsOffsetBytes,
     long LhsPoolBytes,
     string RhsBaseName,
-    long RhsOffsetBytes,
+    string RhsOffsetBytes,
     long RhsPoolBytes,
     string OutputBaseName,
-    long OutputOffsetBytes,
+    string OutputOffsetBytes,
     long OutputPoolBytes,
     string LhsDType,
     string RhsDType,

@@ -113,6 +113,13 @@ public class UnaryEvaluator : IEvaluator<Unary>, ITypeInferencer<Unary>, ICostEv
     {
         var inputType = context.GetArgumentType<IRType>(target, Unary.Input);
         var outputType = context.GetReturnType<IRType>();
+        if (TargetCostTensor.TryFromType(inputType, out var inputTensor)
+            && TargetCostTensor.TryFromType(outputType, out var outputTensor)
+            && context.TargetCostModel.TryGetUnaryCost(new(target.UnaryOp, inputTensor, outputTensor), out var targetCost))
+        {
+            return targetCost;
+        }
+
         return (inputType, outputType) switch
         {
             (TensorType tensorType, TensorType tensorType1) => Visit(tensorType, tensorType1, target),

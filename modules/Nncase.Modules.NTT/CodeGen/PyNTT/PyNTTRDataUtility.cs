@@ -3,6 +3,7 @@
 
 using System.Text;
 using Nncase.IR;
+using Nncase.IR.Shapes;
 using Nncase.Targets;
 using Nncase.Utilities;
 
@@ -71,7 +72,9 @@ internal static class PyNTTRDataUtility
         {
             var tensor = ((TensorConst)@const).Value;
             var distributedType = (DistributedType)@const.CheckedType;
-            (var localOffset, var localShape) = DistributedUtility.GetLocalOffsetAndShape(distributedType, shardIndex);
+            (var localOffsetExpr, var localShapeExpr) = DistributedUtility.GetLocalOffsetAndShape(distributedType, shardIndex, DistributedUtility.DivideFlags.MaxShape);
+            var localOffset = new RankedShape(localOffsetExpr).ToValueArray();
+            var localShape = new RankedShape(localShapeExpr).ToValueArray();
             var linearOffset = TensorUtilities.GetLinearOffset(tensor.Strides, localOffset);
 
             builder.Append(range.Min);

@@ -45,6 +45,14 @@ class NTTTargetOptions:
     CustomOpScheme: str
 
 
+class PyNTTTargetOptions(NTTTargetOptions):
+    def __init__(self) -> None: ...
+    Backend: str
+    TritonCapability: str
+    OutputDirectory: str
+    Strict: bool
+
+
 """ end the auto generated block by tools/stackvm_gen/CApiGen at 12/20/2024 5:27:07 PM +08:00. """
 
 

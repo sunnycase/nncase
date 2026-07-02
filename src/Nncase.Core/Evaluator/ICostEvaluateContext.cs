@@ -22,6 +22,11 @@ public interface ICostEvaluateContext
     CompileOptions CompileOptions { get; }
 
     /// <summary>
+    /// Gets the target registered op cost model.
+    /// </summary>
+    ITargetOpCostModel TargetCostModel { get; }
+
+    /// <summary>
     /// Get return type.
     /// </summary>
     /// <typeparam name="T">Return type.</typeparam>

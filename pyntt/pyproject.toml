@@ -3,10 +3,13 @@ name = "pyntt"
 version = "0.0.0"
 requires-python = ">=3.10"
 description = "Python runtime and kernel library for the nncase PyNTT backend"
-dependencies = []
+dependencies = ["jinja2"]
 
 [project.optional-dependencies]
 triton = ["torch", "triton"]
+
+[tool.setuptools.package-data]
+pyntt = ["codegen/templates/**/*.jinja"]
 
 [build-system]
 requires = ["setuptools>=42", "wheel"]

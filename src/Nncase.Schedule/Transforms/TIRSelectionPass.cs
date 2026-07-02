@@ -60,7 +60,7 @@ public abstract class TIRSelectionPass : FunctionPass
         return Task.FromResult(input);
     }
 
-    protected abstract Expr SelectCall(Call call, IReadOnlyList<BaseExpr> arguments, ref Expr output);
+    protected abstract Expr SelectCall(Call call, IReadOnlyList<BaseExpr> arguments, ref Expr output, TIRSelectionContext context);
 
     protected IRType GetArgumentType(BaseExpr argument)
     {
@@ -89,6 +89,7 @@ public abstract class TIRSelectionPass : FunctionPass
     {
         private readonly TIRSelectionPass _selectionPass;
         private readonly bool _isEntry;
+        private readonly TIRSelectionContext _selectionContext;
         private readonly List<Expr> _body = new();
         private int _bufferIndex;
 
@@ -96,6 +97,7 @@ public abstract class TIRSelectionPass : FunctionPass
         {
             _selectionPass = selectionPass;
             _isEntry = isEntry;
+            _selectionContext = new TIRSelectionContext(ExprMemo);
         }
 
         public SelectionResult Select(Function function)
@@ -145,6 +147,18 @@ public abstract class TIRSelectionPass : FunctionPass
 
         protected sealed override Expr VisitLeafVar(Var expr, Unit context) => expr;
 
+        protected override BaseExpr DispatchVisit(BaseExpr expr, Unit context)
+        {
+            if (HasVisited(expr, out var result))
+            {
+                return result;
+            }
+
+            result = base.DispatchVisit(expr, context);
+            _selectionContext.RegisterSelectedValue(expr, result);
+            return result;
+        }
+
         protected sealed override BaseExpr VisitLeafCall(Call expr, Unit context)
         {
             var args = expr.Arguments.AsValueEnumerable().Select(x => ExprMemo[x]).ToArray();
@@ -180,7 +194,7 @@ public abstract class TIRSelectionPass : FunctionPass
                         _ => new Call(deviceFunc, arguments.Append(output).ToArray()),
                     },
                     Function fn => new Call(new FunctionWrapper(_selectionPass.ModuleKind, fn), arguments.Append(output).ToArray()),
-                    _ => _selectionPass.SelectCall(call, arguments, ref Unsafe.As<BaseExpr, Expr>(ref output)),
+                    _ => _selectionPass.SelectCall(call, arguments, ref Unsafe.As<BaseExpr, Expr>(ref output), _selectionContext),
                 };
                 _body.Add(newCall);
                 return output;
@@ -226,6 +240,51 @@ public abstract class TIRSelectionPass : FunctionPass
                 _ => throw new ArgumentException($"Unsupported type: {type}"),
             };
             return T.CreateBuffer(tensorType, memoryLocation, out _, $"buffer_{_bufferIndex++}", type as DistributedType);
+        }
+    }
+}
+
+public sealed class TIRSelectionContext
+{
+    private readonly Dictionary<BaseExpr, BaseExpr> _exprMemo;
+    private readonly Dictionary<BaseExpr, HashSet<BaseExpr>> _selectedValueUsers = new(ReferenceEqualityComparer.Instance);
+
+    internal TIRSelectionContext(Dictionary<BaseExpr, BaseExpr> exprMemo)
+    {
+        _exprMemo = exprMemo;
+    }
+
+    public void RegisterSelectedValue(BaseExpr source, BaseExpr selectedValue)
+    {
+        if (!_selectedValueUsers.TryGetValue(selectedValue, out var users))
+        {
+            users = new HashSet<BaseExpr>(ReferenceEqualityComparer.Instance);
+            _selectedValueUsers.Add(selectedValue, users);
+        }
+
+        users.Add(source);
+    }
+
+    public void ReplaceSelectedValue(BaseExpr oldValue, BaseExpr newValue)
+    {
+        if (!_selectedValueUsers.Remove(oldValue, out var users))
+        {
+            return;
+        }
+
+        if (!_selectedValueUsers.TryGetValue(newValue, out var newUsers))
+        {
+            newUsers = new HashSet<BaseExpr>(ReferenceEqualityComparer.Instance);
+            _selectedValueUsers.Add(newValue, newUsers);
+        }
+
+        foreach (var user in users)
+        {
+            if (_exprMemo.TryGetValue(user, out var selectedValue) && ReferenceEquals(selectedValue, oldValue))
+            {
+                _exprMemo[user] = newValue;
+                newUsers.Add(user);
+            }
         }
     }
 }

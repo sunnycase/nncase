@@ -149,6 +149,25 @@ public class CSourceCompiler
         }
     }
 
+    private static string CompilerConfig()
+    {
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        {
+            return "-DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl";
+        }
+
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux) ||
+            RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
+        {
+            var cCompiler = Environment.GetEnvironmentVariable("NNCASE_CPU_C_COMPILER") ?? "gcc";
+            var cxxCompiler = Environment.GetEnvironmentVariable("NNCASE_CPU_CXX_COMPILER") ?? "g++";
+            var extraArgs = Environment.GetEnvironmentVariable("NNCASE_CPU_CMAKE_ARGS") ?? string.Empty;
+            return $"-DCMAKE_C_COMPILER={cCompiler} -DCMAKE_CXX_COMPILER={cxxCompiler} {extraArgs}";
+        }
+
+        return string.Empty;
+    }
+
     /// <summary>
     /// select current pattern's exe.
     /// </summary>
@@ -196,8 +215,7 @@ public class CSourceCompiler
         }
         else
         {
-            archConfig = RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ?
-            "-DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl" : string.Empty;
+            archConfig = CompilerConfig();
         }
 
 #if DEBUG

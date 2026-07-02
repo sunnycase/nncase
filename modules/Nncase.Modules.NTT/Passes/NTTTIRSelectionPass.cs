@@ -34,7 +34,7 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
         _compileOptions = compileOptions;
     }
 
-    protected override Expr SelectCall(Call call, IReadOnlyList<BaseExpr> arguments, ref Expr output)
+    protected override Expr SelectCall(Call call, IReadOnlyList<BaseExpr> arguments, ref Expr output, TIRSelectionContext context)
     {
         var op = call.Target;
         switch (op)
@@ -46,7 +46,7 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
             case IR.Math.Clamp clamp:
                 return GenerateClamp(call, arguments, output);
             case IR.Distributed.Boxing boxing:
-                return GenerateBoxing(call, boxing, arguments, ref output);
+                return GenerateBoxing(call, boxing, arguments, ref output, context);
             case IR.Distributed.ForceBoxing forceBoxing:
                 return T.Memcopy(output, (Expr)arguments[0]);
             case IR.Math.Binary binary:
@@ -218,6 +218,7 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
                 {
                     var newBuffer = userBuffer.With(memSpan: userBuffer.MemSpan.With(buffer: newExtraBuffer));
                     ReplaceUtility.ReplaceAllUsesWith(userBuffer, newBuffer);
+                    context.ReplaceSelectedValue(userBuffer, newBuffer);
                 }
 
                 var extraNew = ((TIR.Buffer)arguments[12]).With(memSpan: ((TIR.Buffer)arguments[12]).MemSpan.With(newExtraBuffer));
@@ -322,7 +323,7 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
         return TIR.F.NTT.Clamp((Expr)arguments[0], output, min, max);
     }
 
-    private Expr GenerateBoxing(Call call, IR.Distributed.Boxing boxing, IReadOnlyList<BaseExpr> arguments, ref Expr output)
+    private Expr GenerateBoxing(Call call, IR.Distributed.Boxing boxing, IReadOnlyList<BaseExpr> arguments, ref Expr output, TIRSelectionContext context)
     {
         switch (call[IR.Distributed.Boxing.Input].CheckedType, boxing.NewType)
         {
@@ -331,21 +332,21 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
             case (DistributedType distTensorType, TensorType):
                 return TIR.F.NTT.TensorStore((Expr)arguments[0], output, distTensorType.AxisPolicies, distTensorType.Placement);
             case (DistributedType inType, DistributedType outType):
-                return GenerateReshard((Expr)arguments[0], ref output, inType, outType);
+                return GenerateReshard((Expr)arguments[0], ref output, inType, outType, context);
             default:
                 throw new NotSupportedException();
         }
     }
 
-    private Expr GenerateReshard(Expr input, ref Expr output, DistributedType inType, DistributedType outType)
+    private Expr GenerateReshard(Expr input, ref Expr output, DistributedType inType, DistributedType outType, TIRSelectionContext context)
     {
         if (input is TIR.Buffer inBuffer)
         {
-            if (TryGenerateGatherThreadsReshard(inBuffer, ref output, inType, outType, out var newCall))
+            if (TryGenerateGatherThreadsReshard(inBuffer, ref output, inType, outType, context, out var newCall))
             {
                 return newCall;
             }
-            else if (TryGenerateSplitThreadsReshard(inBuffer, ref output, inType, outType, out newCall))
+            else if (TryGenerateSplitThreadsReshard(inBuffer, ref output, inType, outType, context, out newCall))
             {
                 return newCall;
             }
@@ -354,7 +355,7 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
         return TIR.F.NTT.GatherReduceScatter(input, output, inType, outType);
     }
 
-    private bool TryGenerateGatherThreadsReshard(TIR.Buffer inBuffer, ref Expr output, DistributedType inType, DistributedType outType, [MaybeNullWhen(false)] out Expr newCall)
+    private bool TryGenerateGatherThreadsReshard(TIR.Buffer inBuffer, ref Expr output, DistributedType inType, DistributedType outType, TIRSelectionContext context, [MaybeNullWhen(false)] out Expr newCall)
     {
         if (inType.Partial is not null || inBuffer.Users.Any(u => u is Call { Target: TIR.PrimFunction }))
         {
@@ -380,16 +381,17 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
                 size: oldOutputBuffer.MemSpan.Size,
                 location: MemoryLocation.BlockLocalData);
 
-            // 1. Replace all uses of old buffer to new buffer.
+            // 1. Replace all views of old buffer to new buffer.
             var userBuffers = (from memSpan in oldPhysicalBuffer.Users.OfType<TIR.MemSpan>()
                                from userBuffer in memSpan.Users.OfType<TIR.Buffer>()
                                select userBuffer).ToArray();
+            var replacements = new List<(TIR.Buffer OldBuffer, TIR.Buffer NewBuffer)>();
 
             foreach (var userBuffer in userBuffers)
             {
-                var userType = userBuffer.DistributedType!;
-                var threadAxisDim = userType.AxisPolicies.ToArray().IndexOf(x => x is SBPSplit split && split.Axes.Contains(threadAxis));
-                if (threadAxisDim >= 0)
+                var userType = userBuffer.DistributedType;
+                var threadAxisDim = userType?.AxisPolicies.ToArray().IndexOf(x => x is SBPSplit split && split.Axes.Contains(threadAxis)) ?? -1;
+                if (userType is not null && threadAxisDim >= 0)
                 {
                     var newStrides = userBuffer.Strides.ToArray();
                     for (int i = 0; i < userType.AxisPolicies.Count; i++)
@@ -418,11 +420,22 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
                                     start: newStart,
                                     size: newSize),
                                 strides: newStrides);
-                            ReplaceUtility.ReplaceAllUsesWith(userBuffer, newBuffer);
+                            replacements.Add((userBuffer, newBuffer));
                             break;
                         }
                     }
                 }
+                else
+                {
+                    var newBuffer = userBuffer.With(memSpan: userBuffer.MemSpan.With(buffer: newPhysicalBuffer));
+                    replacements.Add((userBuffer, newBuffer));
+                }
+            }
+
+            foreach (var (oldBuffer, newBuffer) in replacements)
+            {
+                ReplaceUtility.ReplaceAllUsesWith(oldBuffer, newBuffer);
+                context.ReplaceSelectedValue(oldBuffer, newBuffer);
             }
 
             // 2. Create new output buffer.
@@ -436,7 +449,7 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
         return false;
     }
 
-    private bool TryGenerateSplitThreadsReshard(TIR.Buffer inBuffer, ref Expr output, DistributedType inType, DistributedType outType, [MaybeNullWhen(false)] out Expr newCall)
+    private bool TryGenerateSplitThreadsReshard(TIR.Buffer inBuffer, ref Expr output, DistributedType inType, DistributedType outType, TIRSelectionContext context, [MaybeNullWhen(false)] out Expr newCall)
     {
         // Avoid P -> B -> S
         if (inType.Partial is not null || inBuffer.Users.Any(u => u is Call { Target: TIR.PrimFunction }))
@@ -464,13 +477,16 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
             var newPhysicalBuffer = oldPhysicalBuffer.With(
                 location: MemoryLocation.BlockLocalData);
 
-            // 1. Replace all uses of old mem span to new mem span.
-            var userMemSpans = oldPhysicalBuffer.Users.OfType<TIR.MemSpan>().ToArray();
+            // 1. Replace all views of old buffer to new buffer.
+            var userBuffers = (from memSpan in oldPhysicalBuffer.Users.OfType<TIR.MemSpan>()
+                               from userBuffer in memSpan.Users.OfType<TIR.Buffer>()
+                               select userBuffer).ToArray();
 
-            foreach (var userMemSpan in userMemSpans)
+            foreach (var userBuffer in userBuffers)
             {
-                var newMemSpan = userMemSpan.With(buffer: newPhysicalBuffer);
-                ReplaceUtility.ReplaceAllUsesWith(userMemSpan, newMemSpan);
+                var newBuffer = userBuffer.With(memSpan: userBuffer.MemSpan.With(buffer: newPhysicalBuffer));
+                ReplaceUtility.ReplaceAllUsesWith(userBuffer, newBuffer);
+                context.ReplaceSelectedValue(userBuffer, newBuffer);
             }
 
             // 2. Create new output buffer.

@@ -65,6 +65,13 @@ public sealed class VectorizedLayerNormEvaluator : IEvaluator<VectorizedLayerNor
     {
         var inputType = context.GetArgumentType<IRType>(target, VectorizedLayerNorm.Input);
         var returnType = context.GetReturnType<IRType>();
+        var scale = context.GetArgumentType<IRType>(target, VectorizedLayerNorm.Scale);
+        var bias = context.GetArgumentType<IRType>(target, VectorizedLayerNorm.Bias);
+        if (TargetOpCostModelUtility.TryGetTargetElementwiseCost(context.TargetCostModel, "vectorized_layer_norm", [inputType, scale, bias], returnType, workPerElement: 16.0, out var targetCost))
+        {
+            return targetCost;
+        }
+
         switch (inputType, returnType)
         {
             case (TensorType, TensorType):
@@ -76,14 +83,11 @@ public sealed class VectorizedLayerNormEvaluator : IEvaluator<VectorizedLayerNor
                 };
 
             case (DistributedType, DistributedType):
-                var scaleType = context.GetArgumentType<DistributedType>(target, VectorizedLayerNorm.Scale);
-                var biasType = context.GetArgumentType<DistributedType>(target, VectorizedLayerNorm.Bias);
-
                 // var ring = GetRingReduceCommunicate(scaleType, new[] { 0, 1 }) + GetRingReduceCommunicate(biasType, new[] { 0, 1 });
                 // var reCompute = inputDistributedType.NdSBP.Select((sbp, i) => sbp is SBPSplit ? 1 : inputDistributedType.Placement.Hierarchy[i]).ToArray().Aggregate(1, (acc, rep) => acc * rep);
                 return new()
                 {
-                    [CostFactorNames.MemoryLoad] = CostUtility.GetMemoryAccess(inputType) + CostUtility.GetMemoryAccess(scaleType) + CostUtility.GetMemoryAccess(biasType),
+                    [CostFactorNames.MemoryLoad] = CostUtility.GetMemoryAccess(inputType) + CostUtility.GetMemoryAccess(scale) + CostUtility.GetMemoryAccess(bias),
                     [CostFactorNames.CPUCycles] = CostUtility.GetCPUCycles(inputType, 64),
                     [CostFactorNames.MemoryStore] = CostUtility.GetMemoryAccess(returnType),
                 };

@@ -371,7 +371,7 @@ class TestRunner(Evaluator, Inference, metaclass=ABCMeta):
         e = '"'
         target_options: object = None
         if target == 'pyntt':
-            target_options = nncase.NTTTargetOptions()
+            target_options = nncase.PyNTTTargetOptions()
             target_options.Vectorize = True
             pyntt_hierarchy = self.get_pyntt_block_hierarchy()
             target_options.Hierarchies = [pyntt_hierarchy]
@@ -410,18 +410,11 @@ class TestRunner(Evaluator, Inference, metaclass=ABCMeta):
             "memory_band_widths": "MemoryBandWidths",
             "distributed_scheme": "DistributedScheme",
             "custom_op_scheme": "CustomOpScheme",
+            "backend": "Backend",
+            "triton_capability": "TritonCapability",
+            "output_directory": "OutputDirectory",
+            "strict": "Strict",
         }
-        unsupported = {
-            "Backend",
-            "backend",
-            "OutputDirectory",
-            "output_directory",
-            "Strict",
-            "strict",
-        }
-        if name in unsupported:
-            print(f"WARN: PyNTT Python runner ignores target option {name}; generated output uses dump_dir/CodeGen/pyntt.")
-            return None
         return aliases.get(name, name)
 
     def is_pyntt_target_enabled(self) -> bool:

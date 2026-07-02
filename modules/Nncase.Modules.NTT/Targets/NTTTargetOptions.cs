@@ -7,11 +7,12 @@ using System.ComponentModel;
 using System.Linq;
 using System.Text;
 using System.Threading.Tasks;
+using Nncase.CostModel;
 using Nncase.IR;
 
 namespace Nncase.Targets;
 
-public class NTTTargetOptions : INTTTargetOptions
+public class NTTTargetOptions : INTTTargetOptions, ITargetOpCostModelProvider
 {
     [DisplayName("--model-name")]
     [Description("the input model name.")]
@@ -97,4 +98,6 @@ public class NTTTargetOptions : INTTTargetOptions
     [Description("the custom-op scheme path.")]
     [DefaultValue("")]
     public string CustomOpScheme { get; set; } = string.Empty;
+
+    public ITargetOpCostModel TargetCostModel { get; set; } = DefaultTargetOpCostModel.Instance;
 }

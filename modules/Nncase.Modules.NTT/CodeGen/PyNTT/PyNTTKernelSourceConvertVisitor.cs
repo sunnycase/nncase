@@ -12,7 +12,6 @@ using Nncase.IR.Shapes;
 using Nncase.Targets;
 using Nncase.TIR;
 using Nncase.Utilities;
-using Razor.Templating.Core;
 
 namespace Nncase.CodeGen.PyNTT;
 
@@ -21,18 +20,18 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
     private static readonly long[] ElementwiseBlockSizeSearchSpace = { 128, 256, 512, 1024 };
 
     private readonly List<GeneratedKernelMetadata> _generatedKernels = new();
-    private readonly StringBuilder _sourceBuilder = new();
+    private readonly List<KernelRenderSpec> _renderKernels = new();
     private readonly SharedHelperRegistry _sharedHelperRegistry = new();
     private readonly PyNTTTargetOptions _targetOptions;
 
     public PyNTTKernelSourceConvertVisitor(CompileOptions compileOptions)
     {
-        _targetOptions = PyNTTTargetOptionsUtility.Normalize(compileOptions);
+        _targetOptions = PyNTTTargetOptionsUtility.Get(compileOptions);
     }
 
     public PyNTTGeneratedKernelSource GetKernelSource()
     {
-        return new(_generatedKernels.ToArray(), _sourceBuilder.ToString());
+        return new(_generatedKernels.ToArray(), _renderKernels.ToArray(), string.Empty);
     }
 
     protected override Unit VisitFunction(Function expr) => default;
@@ -61,10 +60,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             .ToDictionary(parameter => parameter, parameter => parameter.Name);
         var lowered = new PyNTTPrimFunctionSourceVisitor(expr, parameterNames, outputs, _targetOptions, _sharedHelperRegistry).Build();
         _generatedKernels.Add(lowered.Metadata);
-        if (!string.IsNullOrWhiteSpace(lowered.BodySource))
-        {
-            AppendKernelSource(BuildGeneratedTopKernelPython(lowered.Metadata, lowered.BodySource, lowered.HelperSource));
-        }
+        _renderKernels.Add(lowered.RenderSpec);
 
         return default;
     }
@@ -96,7 +92,9 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             Grid,
         }
 
-        private static readonly string[] WorkspaceParameterNames = { "data", "rdata", "thread_local_rdata", "warp_local_rdata", "block_local_rdata" };
+        private const string ShardCoordDimPrefix = "__pyntt_shard_coord_";
+
+        private static readonly string[] WorkspaceParameterNames = { "data", "rdata", "thread_local_rdata", "warp_local_rdata", "block_local_rdata", "warp_local_data", "block_local_data" };
 
         private readonly PrimFunction _function;
         private readonly IReadOnlyDictionary<IVar, string> _parameterNames;
@@ -104,7 +102,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
         private readonly DistributedType?[] _outputDistributedTypes;
         private readonly PyNTTTargetOptions _targetOptions;
         private readonly StringBuilder _body = new();
-        private readonly StringBuilder _helperSource = new();
+        private readonly List<HelperTemplateRenderSpec> _helpers = new();
         private readonly List<string> _inputNames = new();
         private readonly List<string> _opKinds = new();
         private readonly List<HelperKernelCallMetadata> _helperCalls = new();
@@ -118,6 +116,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
         private readonly Dictionary<int, int> _outputAliases = new();
         private readonly SharedHelperRegistry _sharedHelperRegistry;
         private readonly PyNTTDimExpressionEmitter _dimEmitter;
+        private readonly PyNTTDimExpressionEmitter _localRegionDimEmitter;
         private int _nextStoreIndex;
         private int _bodyIndent;
 
@@ -134,7 +133,8 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             _outputDistributedTypes = new DistributedType?[outputs.Length];
             _targetOptions = targetOptions;
             _sharedHelperRegistry = sharedHelperRegistry;
-            _dimEmitter = new(RegisterRuntimeScalar);
+            _dimEmitter = new(RegisterRuntimeScalar, threadIdExpression: BuildThreadIdExpression(targetOptions));
+            _localRegionDimEmitter = new(RegisterLocalRegionRuntimeScalar, FormatLocalRegionRuntimeScalar, threadIdExpression: BuildThreadIdExpression(targetOptions));
         }
 
         public GeneratedPrimFunctionKernel Build()
@@ -207,6 +207,10 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                         ["data_pool_bytes"] = checked((long)_function.SchedResult.DataUsage),
                         ["data_pool_elements"] = checked((long)_function.SchedResult.DataUsage),
                         ["data_dtype"] = "uint8",
+                        ["warp_local_data_pool_bytes"] = checked((long)_function.SchedResult.WarpLocalDataPoolSize),
+                        ["block_local_data_pool_bytes"] = checked((long)_function.SchedResult.BlockLocalDataPoolSize),
+                        ["warp_local_data_scope_count"] = GetWarpLocalDataScopeCount(_targetOptions),
+                        ["block_local_data_scope_count"] = GetBlockLocalDataScopeCount(_targetOptions),
                         ["rdata_pool_bytes"] = GetPoolSizeBytes(_function.SchedResult.Rdatas),
                         ["thread_local_rdata_pool_bytes"] = GetPoolSizeBytes(_function.SchedResult.ThreadLocalRdatas),
                         ["warp_local_rdata_pool_bytes"] = GetPoolSizeBytes(_function.SchedResult.WarpLocalRdatas),
@@ -215,7 +219,12 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                         ["warp_local_rdata_stride_bytes"] = PyNTTRDataUtility.GetLocalRDataTableStrideBytes(_function.SchedResult.WarpLocalRdatas, _targetOptions, "w"),
                         ["block_local_rdata_stride_bytes"] = PyNTTRDataUtility.GetLocalRDataTableStrideBytes(_function.SchedResult.BlockLocalRdatas, _targetOptions, "b"),
                     }));
-            return new(metadata, _helperSource.ToString().TrimEnd(), _body.ToString().TrimEnd());
+            var bodySource = _body.ToString().TrimEnd();
+            var renderSpec = new KernelRenderSpec(
+                metadata,
+                _helpers.ToArray(),
+                bodySource);
+            return new(metadata, renderSpec);
         }
 
         protected override Unit VisitTuple(Nncase.IR.Tuple expr)
@@ -337,6 +346,9 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 case Nncase.TIR.NTT.Matmul matmul:
                     VisitMatmul(matmul, args);
                     break;
+                case Nncase.TIR.NTT.PackedMatMul packedMatmul:
+                    VisitPackedMatmul(packedMatmul, args);
+                    break;
                 case Nncase.TIR.NTT.SUMMA summa:
                     VisitSUMMA(summa, args);
                     break;
@@ -357,6 +369,10 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     break;
                 case Nncase.TIR.NTT.VectorizedLayerNorm layerNorm:
                     VisitLayerNorm(layerNorm, args);
+                    break;
+                case Nncase.TIR.NTT.SynchronizeThreads:
+                    _attrs["requires_grid_barrier"] = true;
+                    WriteBarrier(HelperBarrierKind.Grid);
                     break;
                 case Nncase.TIR.NTT.VectorizedSoftmax softmax:
                     VisitSoftmax(softmax.Axis, softmax.VectorizedAxes, args, "softmax");
@@ -390,7 +406,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             var globalShape = GetTensorShape(args[1], $"TensorLoad source input{inputIndex}");
             var helperName = GetNextHelperName("tensor_load");
             WriteHelperTemplate(
-                "~/CodeGen/PyNTT/Templates/Triton/Kernels/TensorLoad.py.cshtml",
+                "triton/kernels/TensorLoad.py.jinja",
                 new PyNTTTensorLoadTemplateModel(
                     helperName,
                     $"input{inputIndex}",
@@ -433,7 +449,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             var helperName = GetHelperName("tensor_store", outputIndex);
             var localShape = GetBufferShape(src);
             WriteHelperTemplate(
-                "~/CodeGen/PyNTT/Templates/Triton/Kernels/TensorStore.py.cshtml",
+                "triton/kernels/TensorStore.py.jinja",
                 new PyNTTTensorStoreTemplateModel(
                     helperName,
                     GetBufferPointer(src),
@@ -481,7 +497,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             _attrs["shape"] = shape;
             var helperName = GetNextHelperName("elementwise_unary");
             WriteHelperTemplate(
-                "~/CodeGen/PyNTT/Templates/Triton/Kernels/ElementwiseUnary.py.cshtml",
+                "triton/kernels/ElementwiseUnary.py.jinja",
                 new PyNTTElementwiseUnaryTemplateModel(
                     helperName,
                     GetBufferScalarPointer(input),
@@ -529,7 +545,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             _attrs["shape"] = shape;
             var helperName = GetNextHelperName("expand_compute");
             WriteHelperTemplate(
-                "~/CodeGen/PyNTT/Templates/Triton/Kernels/ElementwiseUnary.py.cshtml",
+                "triton/kernels/ElementwiseUnary.py.jinja",
                 new PyNTTElementwiseUnaryTemplateModel(
                     helperName,
                     GetBufferScalarPointer(input),
@@ -563,6 +579,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
 
             SetComputeOp("gather");
             var inputShape = GetBufferShape(input);
+            var inputGlobalShape = GetBufferGlobalShape(input);
             var indexShape = GetBufferShape(index);
             var outputShape = GetBufferShape(output);
             var axis = NormalizeAxis(gather.Axis, inputShape.Length, "PyNTT Gather");
@@ -592,7 +609,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             _attrs["shape"] = outputShape;
             var helperName = GetNextHelperName("gather_compute");
             WriteHelperTemplate(
-                "~/CodeGen/PyNTT/Templates/Triton/Kernels/Gather.py.cshtml",
+                "triton/kernels/Gather.py.jinja",
                 new PyNTTGatherTemplateModel(
                     helperName,
                     GetBufferScalarPointer(input),
@@ -605,6 +622,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     GetTritonDType(index.ElemType),
                     GetScalarTritonDType(output.ElemType),
                     inputShape,
+                    inputGlobalShape,
                     indexShape,
                     outputShape,
                     GetBufferStrides(input),
@@ -612,6 +630,8 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     GetBufferStrides(output),
                     axis,
                     valueVectorLaneCount,
+                    GetHierarchy(input),
+                    GetBufferSplitAxes(input, inputGlobalShape.Length),
                     $"{input.Name}, {index.Name} -> {output.Name}"));
             WriteLine(BuildHelperCall(helperName));
         }
@@ -623,11 +643,6 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 args[1] is not TIR.Buffer output)
             {
                 throw new NotSupportedException("PyNTT GatherReduceScatter codegen expects input and output TIR buffers.");
-            }
-
-            if (gatherReduceScatter.InType.AxisPolicies.Any(policy => policy is SBPPartial))
-            {
-                throw new NotSupportedException("PyNTT GatherReduceScatter does not support partial/reduction reshard yet.");
             }
 
             if (!gatherReduceScatter.InType.Placement.Hierarchy.SequenceEqual(gatherReduceScatter.OutType.Placement.Hierarchy))
@@ -644,8 +659,8 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             ValidateSameRank("PyNTT GatherReduceScatter input", inputShape, globalShape);
             ValidateSameRank("PyNTT GatherReduceScatter output", outputShape, globalShape);
             ValidateSameShape("PyNTT GatherReduceScatter global type", globalShape, GetRankedShapeDimensions(gatherReduceScatter.InType.TensorType.Shape, "PyNTT GatherReduceScatter input global shape").Select(GetDimensionExpression).ToArray());
-            var inputVectorLaneCount = GetSingleVectorLaneCount(input.ElemType, "PyNTT GatherReduceScatter input");
-            var outputVectorLaneCount = GetSingleVectorLaneCount(output.ElemType, "PyNTT GatherReduceScatter output");
+            var inputVectorLaneCount = GetVectorLaneElementCount(input.ElemType);
+            var outputVectorLaneCount = GetVectorLaneElementCount(output.ElemType);
             if (inputVectorLaneCount != outputVectorLaneCount)
             {
                 throw new NotSupportedException($"PyNTT GatherReduceScatter expects matching input/output vector lanes, got input={inputVectorLaneCount}, output={outputVectorLaneCount}.");
@@ -658,6 +673,28 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 throw new NotSupportedException($"PyNTT GatherReduceScatter expects matching scalar dtypes, got input={inputScalarDType}, output={outputScalarDType}.");
             }
 
+            var hierarchy = gatherReduceScatter.OutType.Placement.Hierarchy.ToArray();
+            if (gatherReduceScatter.InType.Partial is { } partial)
+            {
+                if (partial.Op != ReduceOp.Sum)
+                {
+                    throw new NotSupportedException($"PyNTT GatherReduceScatter currently supports Sum partial reduction only, got {partial.Op}.");
+                }
+
+                var reduceAxes = partial.Axes.ToArray();
+                foreach (var axis in reduceAxes)
+                {
+                    if (axis < 0 || axis >= hierarchy.Length)
+                    {
+                        throw new NotSupportedException($"PyNTT GatherReduceScatter partial reduce axis {axis} is outside hierarchy rank {hierarchy.Length}.");
+                    }
+                }
+
+                WriteBarrier(HelperBarrierKind.Grid);
+                WriteShardReduceHelper(input, reduceAxes, inputVectorLaneCount, inputScalarDType, hierarchy, false, HelperBarrierKind.Grid, $"{input.Name} partial reduce");
+                WriteShardReduceHelper(input, reduceAxes, inputVectorLaneCount, inputScalarDType, hierarchy, true, HelperBarrierKind.Cta, $"{input.Name} partial broadcast");
+            }
+
             _attrs["op"] = "reshard";
             _attrs["tir"] = true;
             _attrs["requires_grid_barrier"] = true;
@@ -667,7 +704,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             var inputRef = ResolveBufferRef(input);
             var outputRef = ResolveBufferRef(output);
             WriteHelperTemplate(
-                "~/CodeGen/PyNTT/Templates/Triton/Kernels/Reshard.py.cshtml",
+                "triton/kernels/Reshard.py.jinja",
                 new PyNTTReshardTemplateModel(
                     helperName,
                     GetBufferScalarPointer(input, "source_shard_index"),
@@ -687,12 +724,12 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     GetBufferStrides(input),
                     GetBufferStrides(output),
                     inputVectorLaneCount,
-                    gatherReduceScatter.OutType.Placement.Hierarchy.ToArray(),
+                    hierarchy,
                     GetSplitAxes(gatherReduceScatter.InType),
                     GetSplitAxes(gatherReduceScatter.OutType),
                     $"{input.Name} -> {output.Name}"));
             WriteBarrier(HelperBarrierKind.Grid);
-            WriteLine(BuildHelperCall(helperName));
+            WriteLine(BuildHelperCall(helperName), HelperBarrierKind.Grid);
         }
 
         private void VisitPad(Nncase.TIR.NTT.Pad pad, IReadOnlyList<BaseExpr> args)
@@ -718,7 +755,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             _attrs["pad_value"] = pad.PadValue;
             var helperName = GetNextHelperName("pad_compute");
             WriteHelperTemplate(
-                "~/CodeGen/PyNTT/Templates/Triton/Kernels/Pad.py.cshtml",
+                "triton/kernels/Pad.py.jinja",
                 new PyNTTPadTemplateModel(
                     helperName,
                     GetBufferPointer(input),
@@ -760,7 +797,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             _attrs["shape"] = outputShape;
             var helperName = GetNextHelperName("scatter_nd_compute");
             WriteHelperTemplate(
-                "~/CodeGen/PyNTT/Templates/Triton/Kernels/ScatterND.py.cshtml",
+                "triton/kernels/ScatterND.py.jinja",
                 new PyNTTScatterNDTemplateModel(
                     helperName,
                     GetBufferPointer(input),
@@ -812,7 +849,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             _attrs["strides"] = normalizedStrides;
             var helperName = GetNextHelperName("slice_compute");
             WriteHelperTemplate(
-                "~/CodeGen/PyNTT/Templates/Triton/Kernels/Slice.py.cshtml",
+                "triton/kernels/Slice.py.jinja",
                 new PyNTTSliceTemplateModel(
                     helperName,
                     GetBufferPointer(input),
@@ -859,7 +896,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             _attrs["beta"] = swish.Beta;
             var helperName = GetNextHelperName("swish_compute");
             WriteHelperTemplate(
-                "~/CodeGen/PyNTT/Templates/Triton/Kernels/ElementwiseUnary.py.cshtml",
+                "triton/kernels/ElementwiseUnary.py.jinja",
                 new PyNTTElementwiseUnaryTemplateModel(
                     helperName,
                     GetBufferScalarPointer(input),
@@ -916,7 +953,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             _attrs["shape"] = shape;
             var helperName = GetNextHelperName("elementwise_binary");
             WriteHelperTemplate(
-                "~/CodeGen/PyNTT/Templates/Triton/Kernels/ElementwiseBinary.py.cshtml",
+                "triton/kernels/ElementwiseBinary.py.jinja",
                 new PyNTTElementwiseBinaryTemplateModel(
                     helperName,
                     GetBufferScalarPointer(lhs),
@@ -973,7 +1010,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             _attrs["lanes"] = lanes;
             var helperName = GetNextHelperName("pack_compute");
             WriteHelperTemplate(
-                "~/CodeGen/PyNTT/Templates/Triton/Kernels/VectorLayout.py.cshtml",
+                "triton/kernels/VectorLayout.py.jinja",
                 new PyNTTVectorLayoutTemplateModel(
                     helperName,
                     GetBufferScalarPointer(input),
@@ -1024,7 +1061,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             _attrs["lanes"] = lanes;
             var helperName = GetNextHelperName("unpack_compute");
             WriteHelperTemplate(
-                "~/CodeGen/PyNTT/Templates/Triton/Kernels/VectorLayout.py.cshtml",
+                "triton/kernels/VectorLayout.py.jinja",
                 new PyNTTVectorLayoutTemplateModel(
                     helperName,
                     GetBufferScalarPointer(input),
@@ -1092,7 +1129,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             _attrs["shape"] = logicalOutputShape;
             var helperName = GetNextHelperName("elementwise_cast");
             WriteHelperTemplate(
-                "~/CodeGen/PyNTT/Templates/Triton/Kernels/ElementwiseCast.py.cshtml",
+                "triton/kernels/ElementwiseCast.py.jinja",
                 new PyNTTElementwiseCastTemplateModel(
                     helperName,
                     GetBufferScalarPointer(input),
@@ -1154,7 +1191,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             _attrs["shape"] = logicalShape;
             var helperName = GetNextHelperName("elementwise_where");
             WriteHelperTemplate(
-                "~/CodeGen/PyNTT/Templates/Triton/Kernels/ElementwiseWhere.py.cshtml",
+                "triton/kernels/ElementwiseWhere.py.jinja",
                 new PyNTTElementwiseWhereTemplateModel(
                     helperName,
                     GetBufferScalarPointer(cond),
@@ -1212,7 +1249,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             _attrs["max"] = clamp.Max;
             var helperName = GetNextHelperName("elementwise_clamp");
             WriteHelperTemplate(
-                "~/CodeGen/PyNTT/Templates/Triton/Kernels/ElementwiseUnary.py.cshtml",
+                "triton/kernels/ElementwiseUnary.py.jinja",
                 new PyNTTElementwiseUnaryTemplateModel(
                     helperName,
                     GetBufferScalarPointer(input),
@@ -1269,7 +1306,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             _attrs["shape"] = shape;
             var helperName = GetNextHelperName("elementwise_compare");
             WriteHelperTemplate(
-                "~/CodeGen/PyNTT/Templates/Triton/Kernels/ElementwiseBinary.py.cshtml",
+                "triton/kernels/ElementwiseBinary.py.jinja",
                 new PyNTTElementwiseBinaryTemplateModel(
                     helperName,
                     GetBufferScalarPointer(lhs),
@@ -1350,7 +1387,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             _attrs["input_count"] = inputs.Length;
             var helperName = GetNextHelperName("concat_compute");
             WriteHelperTemplate(
-                "~/CodeGen/PyNTT/Templates/Triton/Kernels/Concat.py.cshtml",
+                "triton/kernels/Concat.py.jinja",
                 new PyNTTConcatTemplateModel(
                     helperName,
                     inputs.Select(GetBufferPointer).ToArray(),
@@ -1432,7 +1469,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             _attrs["groups"] = conv2D.Groups;
             var helperName = GetNextHelperName("conv2d_compute");
             WriteHelperTemplate(
-                "~/CodeGen/PyNTT/Templates/Triton/Kernels/Conv2D.py.cshtml",
+                "triton/kernels/Conv2D.py.jinja",
                 new PyNTTConv2DTemplateModel(
                     helperName,
                     GetBufferPointer(input),
@@ -1510,7 +1547,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
 
             var helperName = GetNextHelperName("transpose_compute");
             WriteHelperTemplate(
-                "~/CodeGen/PyNTT/Templates/Triton/Kernels/Transpose.py.cshtml",
+                "triton/kernels/Transpose.py.jinja",
                 new PyNTTTransposeTemplateModel(
                     helperName,
                     GetBufferScalarPointer(input),
@@ -1549,6 +1586,120 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 matmul.TransposeA,
                 matmul.TransposeB,
                 args);
+        }
+
+        private void VisitPackedMatmul(Nncase.TIR.NTT.PackedMatMul matmul, IReadOnlyList<BaseExpr> args)
+        {
+            if (matmul.FusedReduce)
+            {
+                throw new NotSupportedException("PyNTT PackedMatMul codegen does not support fused reduce yet.");
+            }
+
+            if (args.Count < 5 ||
+                args[0] is not TIR.Buffer lhs ||
+                args[1] is not TIR.Buffer rhs ||
+                args[2] is not TIR.Buffer output)
+            {
+                throw new NotSupportedException("PyNTT PackedMatMul codegen expects lhs, rhs, and output TIR buffers.");
+            }
+
+            if (GetScalarBool(args[3], "PyNTT PackedMatMul loadC"))
+            {
+                throw new NotSupportedException("PyNTT PackedMatMul codegen does not support loadC yet.");
+            }
+
+            SetComputeOp("matmul");
+            var lhsShape = GetBufferActiveShape(lhs);
+            var rhsShape = GetBufferActiveShape(rhs);
+            var outputShape = GetBufferActiveShape(output);
+            ValidateMinimumRank("PyNTT PackedMatMul lhs", lhsShape, 2);
+            ValidateMinimumRank("PyNTT PackedMatMul rhs", rhsShape, 2);
+            ValidateMinimumRank("PyNTT PackedMatMul output", outputShape, 2);
+
+            var lhsVectorLanes = GetVectorLanes(lhs.ElemType);
+            var rhsVectorLanes = GetVectorLanes(rhs.ElemType);
+            var outputVectorLanes = GetVectorLanes(output.ElemType);
+            if (lhsVectorLanes.Length != 0)
+            {
+                throw new NotSupportedException($"PyNTT PackedMatMul expects scalar lhs operands, got lhs lanes [{string.Join(",", lhsVectorLanes)}].");
+            }
+
+            if (rhsVectorLanes.Length != 2)
+            {
+                throw new NotSupportedException($"PyNTT PackedMatMul expects RHS vector lanes [Nr,lane], got [{string.Join(",", rhsVectorLanes)}].");
+            }
+
+            if (outputVectorLanes.Length != 2 || outputVectorLanes[0] != rhsVectorLanes[0] || outputVectorLanes[1] != rhsVectorLanes[1])
+            {
+                throw new NotSupportedException($"PyNTT PackedMatMul expects output lanes [{rhsVectorLanes[0]},{rhsVectorLanes[1]}], got [{string.Join(",", outputVectorLanes)}].");
+            }
+
+            var nPackedLaneCount = rhsVectorLanes[0];
+            var nVectorLaneCount = rhsVectorLanes[1];
+            var rhsNScalarLaneCount = checked(nPackedLaneCount * nVectorLaneCount);
+            var lhsK = lhsShape[^1];
+            var rhsK = rhsShape[^1];
+            var lhsM = lhsShape[^2];
+            var rhsNOuter = rhsShape[^2];
+            if (!SameDim(lhsK, rhsK) ||
+                !SameDim(outputShape[^2], lhsM) ||
+                !SameDim(outputShape[^1], rhsNOuter))
+            {
+                throw new NotSupportedException($"PyNTT PackedMatMul expects lhs=[...,M,K], rhs=[...,N,K]<Nr,lane>, output=[...,M,N]<Nr,lane>, got lhs=[{ShapeText(lhsShape)}], rhs=[{ShapeText(rhsShape)}], output=[{ShapeText(outputShape)}].");
+            }
+
+            ValidateBroadcastable("PyNTT PackedMatMul lhs batch", lhsShape[..^2], outputShape[..^2]);
+            ValidateBroadcastable("PyNTT PackedMatMul rhs batch", rhsShape[..^2], outputShape[..^2]);
+            var dimInfo = Nncase.IR.NTT.VectorizedMatMul.GetDimInfo(false, true, lhsShape.Length, rhsShape.Length);
+            var scale = GetScalarFloat(args[4], "PyNTT PackedMatMul scale", 1.0f);
+            _attrs["op"] = "packed_matmul";
+            _attrs["tir"] = true;
+            _attrs["dtype"] = GetPyNTTScalarDTypeName(output.ElemType);
+            _attrs["shape"] = outputShape;
+            _attrs["n_pack_lane"] = nPackedLaneCount;
+            _attrs["n_lane"] = nVectorLaneCount;
+            _attrs["n_scalar_lane"] = rhsNScalarLaneCount;
+            _attrs["scale"] = scale;
+            var useGemv = IsGemvMatmul(outputShape);
+            if (useGemv)
+            {
+                _attrs["gemv"] = true;
+            }
+
+            var helperName = GetNextHelperName(useGemv ? "gemv_compute" : "matmul_compute");
+            var templateModel = new PyNTTMatmulTemplateModel(
+                helperName,
+                GetBufferScalarPointer(lhs),
+                GetBufferScalarPointer(rhs),
+                GetBufferScalarPointer(output),
+                GetPyNTTScalarDTypeName(lhs.ElemType),
+                GetPyNTTScalarDTypeName(rhs.ElemType),
+                GetPyNTTScalarDTypeName(output.ElemType),
+                GetScalarTritonDType(lhs.ElemType),
+                GetScalarTritonDType(rhs.ElemType),
+                GetScalarTritonDType(output.ElemType),
+                lhsShape,
+                rhsShape,
+                outputShape,
+                GetBufferStrides(lhs),
+                GetBufferStrides(rhs),
+                GetBufferStrides(output),
+                false,
+                true,
+                GetHierarchy(output),
+                nVectorLaneCount,
+                outputVectorLanes[1],
+                scale.ToString("R", CultureInfo.InvariantCulture),
+                $"{lhs.Name}, {rhs.Name} -> {output.Name}")
+            {
+                RhsNPackedLaneCount = nPackedLaneCount,
+                OutputNPackedLaneCount = outputVectorLanes[0],
+            };
+
+            WriteHelperTemplate(
+                useGemv ? "triton/kernels/Gemv.py.jinja" : "triton/kernels/Matmul.py.jinja",
+                templateModel);
+            WriteLine(BuildHelperCall(helperName));
         }
 
         private void VisitSUMMA(Nncase.TIR.NTT.SUMMA summa, IReadOnlyList<BaseExpr> args)
@@ -1646,7 +1797,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             _attrs["scale"] = scale;
             var helperName = GetNextHelperName("summa_compute");
             WriteHelperTemplate(
-                "~/CodeGen/PyNTT/Templates/Triton/Kernels/Summa.py.cshtml",
+                "triton/kernels/Summa.py.jinja",
                 new PyNTTSummaTemplateModel(
                     helperName,
                     lhsRef.BaseName,
@@ -1707,9 +1858,9 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             }
 
             SetComputeOp("matmul");
-            var lhsShape = GetBufferShape(lhs);
-            var rhsShape = GetBufferShape(rhs);
-            var outputShape = GetBufferShape(output);
+            var lhsShape = GetBufferActiveShape(lhs);
+            var rhsShape = GetBufferActiveShape(rhs);
+            var outputShape = GetBufferActiveShape(output);
             ValidateMinimumRank($"{context} lhs", lhsShape, 2);
             ValidateMinimumRank($"{context} rhs", rhsShape, 2);
             ValidateMinimumRank($"{context} output", outputShape, 2);
@@ -1764,7 +1915,6 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
 
             ValidateBroadcastable($"{context} lhs batch", lhsShape[..^2], outputShape[..^2]);
             ValidateBroadcastable($"{context} rhs batch", rhsShape[..^2], outputShape[..^2]);
-            var reduceAxes = GetMatmulReduceAxes(lhs, rhs, output, dimInfo);
             var scale = GetScalarFloat(args[4], $"{context} scale", 1.0f);
             _attrs["op"] = "matmul";
             _attrs["tir"] = true;
@@ -1773,9 +1923,15 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             _attrs["transpose_a"] = transposeA;
             _attrs["transpose_b"] = transposeB;
             _attrs["scale"] = scale;
-            var helperName = GetNextHelperName("matmul_compute");
+            var useGemv = IsGemvMatmul(outputShape);
+            if (useGemv)
+            {
+                _attrs["gemv"] = true;
+            }
+
+            var helperName = GetNextHelperName(useGemv ? "gemv_compute" : "matmul_compute");
             WriteHelperTemplate(
-                "~/CodeGen/PyNTT/Templates/Triton/Kernels/Matmul.py.cshtml",
+                useGemv ? "triton/kernels/Gemv.py.jinja" : "triton/kernels/Matmul.py.jinja",
                 new PyNTTMatmulTemplateModel(
                     helperName,
                     GetBufferScalarPointer(lhs),
@@ -1795,36 +1951,16 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     GetBufferStrides(output),
                     transposeA,
                     transposeB,
+                    GetHierarchy(output),
                     rhsNVectorLaneCount,
                     outputNVectorLaneCount,
                     scale.ToString("R", CultureInfo.InvariantCulture),
                     $"{lhs.Name}, {rhs.Name} -> {output.Name}"));
             WriteLine(BuildHelperCall(helperName));
-            WriteMatmulShardReduce(output, reduceAxes, $"{output.Name} K-axis shard reduce");
         }
 
-        private void WriteMatmulShardReduce(TIR.Buffer output, int[] reduceAxes, string comment)
-        {
-            if (reduceAxes.Length == 0)
-            {
-                return;
-            }
-
-            var outputVectorLaneCount = GetSingleVectorLaneCount(output.ElemType, "PyNTT Matmul shard reduce output");
-            var outputScalarDType = GetPyNTTScalarDTypeName(output.ElemType);
-            var hierarchy = GetHierarchy(output);
-            foreach (var axis in reduceAxes)
-            {
-                if (axis < 0 || axis >= hierarchy.Length)
-                {
-                    throw new NotSupportedException($"PyNTT Matmul shard reduce axis {axis} is outside hierarchy rank {hierarchy.Length}.");
-                }
-            }
-
-            WriteBarrier(HelperBarrierKind.Grid);
-            WriteShardReduceHelper(output, reduceAxes, outputVectorLaneCount, outputScalarDType, hierarchy, false, HelperBarrierKind.Grid, $"{comment}: reduce");
-            WriteShardReduceHelper(output, reduceAxes, outputVectorLaneCount, outputScalarDType, hierarchy, true, HelperBarrierKind.Cta, $"{comment}: broadcast");
-        }
+        private static bool IsGemvMatmul(IReadOnlyList<PyNTTDimExpression> outputShape)
+            => outputShape.Count >= 2 && outputShape[^2].MaxValue == 1;
 
         private void WriteShardReduceHelper(
             TIR.Buffer buffer,
@@ -1860,7 +1996,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             {
                 helperName = _sharedHelperRegistry.Add(helperKey, _function.Name, broadcast ? "shard_broadcast" : "shard_reduce");
                 WriteHelperTemplate(
-                    "~/CodeGen/PyNTT/Templates/Triton/Kernels/ShardReduce.py.cshtml",
+                    "triton/kernels/ShardReduce.py.jinja",
                     new PyNTTShardReduceTemplateModel(
                         helperName,
                         bufferRef.BaseName,
@@ -1879,8 +2015,8 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 BuildHelperCall(
                     helperName,
                     BuildRawPythonArgument(bufferRef.PoolBytes.ToString(CultureInfo.InvariantCulture)),
-                    BuildRawPythonArgument(bufferRef.OffsetBytes.ToString(CultureInfo.InvariantCulture)),
-                    BuildRawPythonArgument(bufferRef.OffsetBytes.ToString(CultureInfo.InvariantCulture))),
+                    BuildRawPythonArgument(bufferRef.OffsetBytes),
+                    BuildRawPythonArgument(bufferRef.OffsetBytes)),
                 postBarrier);
         }
 
@@ -1919,7 +2055,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             var reduceOp = (string)_attrs["op"];
             var reduceElementCount = Product(axes.Select(axis => inputShape[axis]));
             WriteHelperTemplate(
-                "~/CodeGen/PyNTT/Templates/Triton/Kernels/Reduce.py.cshtml",
+                "triton/kernels/Reduce.py.jinja",
                 new PyNTTReduceTemplateModel(
                     helperName,
                     GetBufferPointer(input),
@@ -1991,7 +2127,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             _attrs["shape"] = outputShape;
             var helperName = GetNextHelperName("rope_compute");
             WriteHelperTemplate(
-                "~/CodeGen/PyNTT/Templates/Triton/Kernels/RoPE.py.cshtml",
+                "triton/kernels/RoPE.py.jinja",
                 new PyNTTRoPETemplateModel(
                     helperName,
                     GetBufferScalarPointer(input),
@@ -2096,7 +2232,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             _attrs["use_mean"] = layerNorm.UseMean;
             var helperName = GetNextHelperName("layer_norm_compute");
             WriteHelperTemplate(
-                "~/CodeGen/PyNTT/Templates/Triton/Kernels/LayerNorm.py.cshtml",
+                "triton/kernels/LayerNorm.py.jinja",
                 new PyNTTLayerNormTemplateModel(
                     helperName,
                     GetBufferScalarPointer(input),
@@ -2152,7 +2288,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             _attrs["shape"] = outputShape;
             var helperName = GetNextHelperName("get_position_ids_compute");
             WriteHelperTemplate(
-                "~/CodeGen/PyNTT/Templates/Triton/Kernels/GetPositionIds.py.cshtml",
+                "triton/kernels/GetPositionIds.py.jinja",
                 new PyNTTGetPositionIdsTemplateModel(
                     helperName,
                     GetBufferPointer(output),
@@ -2197,7 +2333,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             var helperName = GetNextHelperName("update_paged_attention_kv_cache");
             var slotsRef = ResolveBufferRef(slots);
             WriteHelperTemplate(
-                "~/CodeGen/PyNTT/Templates/Triton/Kernels/UpdatePagedAttentionKVCache.py.cshtml",
+                "triton/kernels/UpdatePagedAttentionKVCache.py.jinja",
                 new PyNTTUpdatePagedAttentionKVCacheTemplateModel(
                     helperName,
                     GetBufferScalarPointer(slots),
@@ -2264,7 +2400,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             _attrs["hidden_size"] = pagedAttention.HiddenSize;
             var helperName = GetNextHelperName("paged_attention");
             WriteHelperTemplate(
-                "~/CodeGen/PyNTT/Templates/Triton/Kernels/PagedAttention.py.cshtml",
+                "triton/kernels/PagedAttention.py.jinja",
                 new PyNTTPagedAttentionTemplateModel(
                     helperName,
                     GetBufferScalarPointer(query),
@@ -2319,7 +2455,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             _attrs["axis"] = normalizedAxis;
             var helperName = GetNextHelperName("softmax_compute");
             WriteHelperTemplate(
-                "~/CodeGen/PyNTT/Templates/Triton/Kernels/Softmax.py.cshtml",
+                "triton/kernels/Softmax.py.jinja",
                 new PyNTTSoftmaxTemplateModel(
                     helperName,
                     GetBufferPointer(input),
@@ -2644,6 +2780,8 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             return buffer.MemSpan.Buffer.Location switch
             {
                 MemoryLocation.Data => new("data", offsetBytes, checked((long)_function.SchedResult.DataUsage), "shard_index"),
+                MemoryLocation.WarpLocalData => new("warp_local_data", offsetBytes, checked((long)_function.SchedResult.WarpLocalDataPoolSize), BuildWarpLocalDataIndexExpression(_targetOptions)),
+                MemoryLocation.BlockLocalData => new("block_local_data", offsetBytes, checked((long)_function.SchedResult.BlockLocalDataPoolSize), BuildBlockLocalDataIndexExpression(_targetOptions)),
                 MemoryLocation.Rdata => new("rdata", offsetBytes, 0, null),
                 MemoryLocation.ThreadLocalRdata => new("thread_local_rdata", offsetBytes, PyNTTRDataUtility.GetLocalRDataTableStrideBytes(_function.SchedResult.ThreadLocalRdatas, _targetOptions, "t"), "shard_index"),
                 MemoryLocation.WarpLocalRdata => new("warp_local_rdata", offsetBytes, PyNTTRDataUtility.GetLocalRDataTableStrideBytes(_function.SchedResult.WarpLocalRdatas, _targetOptions, "w"), "shard_index"),
@@ -2660,9 +2798,9 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 expression += $" + {bufferRef.IndexExpression} * {bufferRef.PoolBytes.ToString(CultureInfo.InvariantCulture)}";
             }
 
-            if (bufferRef.OffsetBytes != 0)
+            if (!IsZeroOffset(bufferRef.OffsetBytes))
             {
-                expression += $" + {bufferRef.OffsetBytes.ToString(CultureInfo.InvariantCulture)}";
+                expression += $" + {bufferRef.OffsetBytes}";
             }
 
             return $"({expression}).to(tl.pointer_type({tritonDType}))";
@@ -2698,6 +2836,24 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 .ToArray();
         }
 
+        private PyNTTDimExpression[] GetBufferActiveShape(TIR.Buffer buffer)
+        {
+            if (buffer.DistributedType is { } distributedType)
+            {
+                var shardIndex = Enumerable.Range(0, distributedType.Placement.Rank)
+                    .Select(axis => (Dimension)new DimVar($"{ShardCoordDimPrefix}{axis}"))
+                    .ToArray();
+                var (_, activeShape) = DistributedUtility.GetLocalOffsetAndShape(distributedType, shardIndex);
+                return activeShape
+                    .Select(GetLocalRegionDimensionExpression)
+                    .ToArray();
+            }
+
+            return buffer.Dimensions.ToArray()
+                .Select(GetDimensionExpression)
+                .ToArray();
+        }
+
         private PyNTTDimExpression[] GetBufferGlobalShape(TIR.Buffer buffer)
         {
             if (buffer.DistributedType is { } distributedType)
@@ -2717,6 +2873,13 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             return buffer.Strides.ToArray()
                 .Select(GetDimensionExpression)
                 .ToArray();
+        }
+
+        private string GetBufferOffsetBytes(TIR.Buffer buffer)
+        {
+            var physicalOffset = GetDimensionExpression(buffer.MemSpan.Buffer.Start, $"{buffer.MemSpan.Buffer.Location} physical buffer offset");
+            var spanOffset = GetDimensionExpression(buffer.MemSpan.Start, $"{buffer.MemSpan.Buffer.Location} memspan offset");
+            return AddOffsetExpressions(physicalOffset.TritonExpression, spanOffset.TritonExpression);
         }
 
         private int[] GetHierarchy(TIR.Buffer buffer)
@@ -2805,6 +2968,98 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
 
         private PyNTTDimExpression GetDimensionExpression(Dimension dimension) => _dimEmitter.Emit(dimension);
 
+        private PyNTTDimExpression GetLocalRegionDimensionExpression(Dimension dimension) => _localRegionDimEmitter.Emit(dimension);
+
+        private PyNTTDimExpression GetDimensionExpression(BaseExpr expr, string name)
+        {
+            expr = UnwrapInputBoxing(expr);
+            return expr switch
+            {
+                None => PyNTTDimExpression.Zero,
+                Dimension dimension => _dimEmitter.Emit(dimension),
+                TensorConst tensorConst when tensorConst.Value.Shape.IsScalar => FormatDimensionConst(tensorConst),
+                _ => throw new NotSupportedException($"PyNTT requires scalar dimension expression for {name}, got {expr.GetType().Name}."),
+            };
+        }
+
+        private static PyNTTDimExpression FormatDimensionConst(TensorConst tensorConst)
+        {
+            var value = tensorConst.Value.ToScalar<long>();
+            var text = value.ToString(CultureInfo.InvariantCulture);
+            return new(text, text, value);
+        }
+
+        private static string AddOffsetExpressions(string lhs, string rhs)
+        {
+            if (IsZeroOffset(lhs))
+            {
+                return rhs;
+            }
+
+            if (IsZeroOffset(rhs))
+            {
+                return lhs;
+            }
+
+            return $"(({lhs}) + ({rhs}))";
+        }
+
+        private static bool IsZeroOffset(string expression)
+            => string.Equals(expression.Trim(), "0", StringComparison.Ordinal);
+
+        private static string BuildThreadIdExpression(PyNTTTargetOptions targetOptions)
+        {
+            var hierarchy = GetBlockHierarchy(targetOptions);
+            var threadDim = hierarchy.Length == 0 ? 1 : hierarchy[^1];
+            return threadDim <= 1 ? "0" : $"(shard_index % {threadDim.ToString(CultureInfo.InvariantCulture)})";
+        }
+
+        private static string BuildWarpLocalDataIndexExpression(PyNTTTargetOptions targetOptions)
+            => BuildScopeIndexExpression(GetThreadScopeSize(targetOptions));
+
+        private static string BuildBlockLocalDataIndexExpression(PyNTTTargetOptions targetOptions)
+            => BuildScopeIndexExpression(GetBlockLocalDataScopeSize(targetOptions));
+
+        private static int GetWarpLocalDataScopeCount(PyNTTTargetOptions targetOptions)
+            => GetScopeCount(targetOptions, GetThreadScopeSize(targetOptions));
+
+        private static int GetBlockLocalDataScopeCount(PyNTTTargetOptions targetOptions)
+            => GetScopeCount(targetOptions, GetBlockLocalDataScopeSize(targetOptions));
+
+        private static string BuildScopeIndexExpression(int scopeSize)
+            => scopeSize <= 1 ? "shard_index" : $"(shard_index // {scopeSize.ToString(CultureInfo.InvariantCulture)})";
+
+        private static int GetScopeCount(PyNTTTargetOptions targetOptions, int scopeSize)
+        {
+            var hierarchy = GetBlockHierarchy(targetOptions);
+            var shardCount = hierarchy.Aggregate(1, (product, value) => checked(product * value));
+            return Math.Max(1, shardCount / Math.Max(1, scopeSize));
+        }
+
+        private static int GetThreadScopeSize(PyNTTTargetOptions targetOptions)
+        {
+            var hierarchy = GetBlockHierarchy(targetOptions);
+            return hierarchy.Length == 0 ? 1 : hierarchy[^1];
+        }
+
+        private static int GetBlockLocalDataScopeSize(PyNTTTargetOptions targetOptions)
+        {
+            var hierarchy = GetBlockHierarchy(targetOptions);
+            if (hierarchy.Length == 0)
+            {
+                return 1;
+            }
+
+            var threadScope = hierarchy[^1];
+            var hasWarp = targetOptions.HierarchyNames.Contains('w', StringComparison.Ordinal);
+            if (hasWarp && hierarchy.Length >= 2)
+            {
+                return checked(threadScope * hierarchy[^2]);
+            }
+
+            return threadScope;
+        }
+
         private static int GetScalarElementSizeBytes(DataType dataType)
         {
             return dataType is VectorType vectorType
@@ -2815,6 +3070,28 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
         private void RegisterRuntimeScalar(string name)
         {
             _runtimeScalarNames.Add(name);
+        }
+
+        private void RegisterLocalRegionRuntimeScalar(string name)
+        {
+            if (!TryGetShardCoordDimAxis(name, out _))
+            {
+                RegisterRuntimeScalar(name);
+            }
+        }
+
+        private static string FormatLocalRegionRuntimeScalar(string name)
+            => TryGetShardCoordDimAxis(name, out var axis) ? $"shard_coord{axis}" : name;
+
+        private static bool TryGetShardCoordDimAxis(string name, out int axis)
+        {
+            axis = default;
+            if (!name.StartsWith(ShardCoordDimPrefix, StringComparison.Ordinal))
+            {
+                return false;
+            }
+
+            return int.TryParse(name[ShardCoordDimPrefix.Length..], NumberStyles.None, CultureInfo.InvariantCulture, out axis);
         }
 
         private string BuildScalarExpression(BaseExpr expr)
@@ -2886,13 +3163,20 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             var runtimeShapeArgsProperty = model.GetType().GetProperty("RuntimeShapeArgs");
             runtimeShapeArgsProperty?.SetValue(model, runtimeShapeArgs);
 
-            if (_helperSource.Length > 0)
+            _helpers.Add(new(GetJinjaTemplateName(templatePath), model));
+        }
+
+        private static string GetJinjaTemplateName(string templatePath)
+        {
+            const string prefix = "triton/kernels/";
+            const string suffix = ".py.jinja";
+            if (!templatePath.StartsWith(prefix, StringComparison.Ordinal) ||
+                !templatePath.EndsWith(suffix, StringComparison.Ordinal))
             {
-                _helperSource.AppendLine();
-                _helperSource.AppendLine();
+                throw new NotSupportedException($"Unsupported PyNTT Jinja template path: {templatePath}.");
             }
 
-            _helperSource.Append(RazorTemplateEngine.RenderAsync(templatePath, model).Result.TrimEnd());
+            return templatePath;
         }
 
         private string GetHelperName(string kind, int index)
@@ -2917,7 +3201,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             return expr;
         }
 
-        private sealed record BufferRef(string BaseName, long OffsetBytes, long PoolBytes, string? IndexExpression);
+        private sealed record BufferRef(string BaseName, string OffsetBytes, long PoolBytes, string? IndexExpression);
     }
 
     private static LaunchMetadata BuildLaunchMetadata(OutputInfo output, PyNTTTargetOptions targetOptions, Dictionary<string, object>? extraMeta = null)
@@ -2944,7 +3228,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     ["block_size"] = new TuningParameterMetadata("search_space", ElementwiseBlockSizeSearchSpace),
                 }),
             BuildShardingMetadata(output, targetOptions),
-            4,
+            8,
             null);
     }
 
@@ -3001,7 +3285,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
     {
         var inputs = kernel.Inputs.Select((_, index) => $"input{index}").ToArray();
         var outputs = kernel.Outputs.Select((_, index) => $"output{index}").ToArray();
-        var workspaceParameters = new[] { "data", "rdata", "thread_local_rdata", "warp_local_rdata", "block_local_rdata" };
+        var workspaceParameters = new[] { "data", "rdata", "thread_local_rdata", "warp_local_rdata", "block_local_rdata", "warp_local_data", "block_local_data" };
         var runtimeShapeArgs = GetRuntimeShapeArgs(kernel);
         var gridBarrierParameters = kernel.Attrs.ContainsKey("requires_grid_barrier")
             ? new[] { "pyntt_grid_mesh: tl.constexpr" }
@@ -3498,6 +3782,12 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             1 => lanes[0],
             _ => throw new NotSupportedException($"{context} expects at most one vector lane dimension, got [{string.Join(",", lanes)}]."),
         };
+    }
+
+    private static int GetVectorLaneElementCount(DataType dataType)
+    {
+        var lanes = GetVectorLanes(dataType);
+        return lanes.Length == 0 ? 1 : lanes.Aggregate(1, (acc, lane) => checked(acc * lane));
     }
 
     private static PyNTTDimExpression[] GetLogicalVectorShape(IReadOnlyList<PyNTTDimExpression> physicalShape, int laneCount)
@@ -4111,17 +4401,6 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
         return new string(chars);
     }
 
-    private void AppendKernelSource(string source)
-    {
-        if (_sourceBuilder.Length > 0)
-        {
-            _sourceBuilder.AppendLine();
-            _sourceBuilder.AppendLine();
-        }
-
-        _sourceBuilder.Append(source);
-    }
-
     private sealed record OutputInfo(string Name, PyNTTDimExpression[] Shape, DistributedType? DistributedType);
 
     private sealed class SharedHelperRegistry
@@ -4144,13 +4423,28 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
 internal sealed record PyNTTGeneratedKernelSource(
     [property: JsonPropertyName("generated_kernels")]
     IReadOnlyList<GeneratedKernelMetadata> Kernels,
+    [property: JsonPropertyName("render_kernels")]
+    IReadOnlyList<KernelRenderSpec> RenderKernels,
     [property: JsonPropertyName("source")]
     string Source);
 
 internal sealed record GeneratedPrimFunctionKernel(
     GeneratedKernelMetadata Metadata,
-    string HelperSource,
+    KernelRenderSpec RenderSpec);
+
+internal sealed record KernelRenderSpec(
+    [property: JsonPropertyName("metadata")]
+    GeneratedKernelMetadata Metadata,
+    [property: JsonPropertyName("helpers")]
+    IReadOnlyList<HelperTemplateRenderSpec> Helpers,
+    [property: JsonPropertyName("body_source")]
     string BodySource);
+
+internal sealed record HelperTemplateRenderSpec(
+    [property: JsonPropertyName("template")]
+    string Template,
+    [property: JsonPropertyName("model")]
+    object Model);
 
 internal sealed record GeneratedKernelMetadata(
     [property: JsonPropertyName("name")]

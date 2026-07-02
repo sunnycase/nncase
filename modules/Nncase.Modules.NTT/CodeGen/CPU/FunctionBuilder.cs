@@ -6,6 +6,7 @@ using System.Threading.Tasks;
 using NetFabric.Hyperlinq;
 using Nncase.CodeGen.NTT;
 using Nncase.IR;
+using Nncase.IR.Shapes;
 using Nncase.Targets;
 using Nncase.Utilities;
 
@@ -119,13 +120,15 @@ internal class FunctionBuilder
             var distributedType = (DistributedType)@const.CheckedType;
             var size = range.Max - range.Min;
             localRdataPoolSize = System.Math.Max(range.Max, localRdataPoolSize);
-            var dividedDims = DistributedUtility.GetDividedTensorType(distributedType).Shape.ToValueArray();
+            var dividedDims = DistributedUtility.GetDividedTensorType(distributedType, DistributedUtility.DivideFlags.MaxShape).Shape.ToValueArray();
             var localStrides = TensorUtilities.GetDefaultStrides(dividedDims);
             for (int i = 0; i < localRdataWriters.Count; i++)
             {
                 var localRdataWriter = localRdataWriters[i];
                 var shardIndex = GetScopedShardIndex(i, scopeName);
-                (var localOffset, var localShape) = DistributedUtility.GetLocalOffsetAndShape(distributedType, shardIndex);
+                (var localOffsetExpr, var localShapeExpr) = DistributedUtility.GetLocalOffsetAndShape(distributedType, shardIndex, DistributedUtility.DivideFlags.MaxShape);
+                var localOffset = new RankedShape(localOffsetExpr).ToValueArray();
+                var localShape = new RankedShape(localShapeExpr).ToValueArray();
                 var linearOffset = TensorUtilities.GetLinearOffset(tensor.Strides, localOffset);
 
                 if ((ulong)TensorUtilities.GetProduct(localShape) * (ulong)tensor.ElementType.SizeInBytes > size)

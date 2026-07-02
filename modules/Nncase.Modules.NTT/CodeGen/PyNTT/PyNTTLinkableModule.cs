@@ -32,8 +32,9 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
     public ILinkedModule Link(ILinkContext linkContext)
     {
         var metadataJson = BuildMetadataJson();
+        var kernelParamsJson = BuildKernelParamsJson();
         var outputDirectory = ResolveOutputDirectory();
-        WriteGeneratedModel(outputDirectory, metadataJson);
+        WriteGeneratedModel(outputDirectory, metadataJson, kernelParamsJson);
 
         var linkedFunctions = _functions.Select(function =>
             new LinkedFunction(function.Id, function.SourceFunction, 0, 0, function.Sections)).ToArray();
@@ -292,7 +293,7 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
 
     private string ResolveOutputDirectory()
     {
-        var targetOptions = PyNTTTargetOptionsUtility.Normalize(_compileOptions);
+        var targetOptions = PyNTTTargetOptionsUtility.Get(_compileOptions);
         if (targetOptions.OutputDirectory.Length > 0)
         {
             return Path.GetFullPath(targetOptions.OutputDirectory);
@@ -308,7 +309,7 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
 
     private string BuildMetadataJson()
     {
-        var targetOptions = PyNTTTargetOptionsUtility.Normalize(_compileOptions);
+        var targetOptions = PyNTTTargetOptionsUtility.Get(_compileOptions);
         var metadata = new
         {
             pyntt_spec_version = 0,
@@ -330,11 +331,31 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
         return JsonSerializer.Serialize(metadata, new JsonSerializerOptions { WriteIndented = true });
     }
 
-    private void WriteGeneratedModel(string outputDirectory, string metadataJson)
+    private string BuildKernelParamsJson()
+    {
+        var targetOptions = PyNTTTargetOptionsUtility.Get(_compileOptions);
+        var manifest = new
+        {
+            pyntt_codegen_manifest_version = 1,
+            target_kind = _moduleKind,
+            backend = targetOptions.Backend,
+            functions = _functions.Select(function => new
+            {
+                id = function.Id,
+                name = function.SourceFunction.Name,
+                module_kind = function.SourceFunction.ModuleKind,
+                is_entry = function.SourceFunction.IsEntry,
+                render_kernels = function.GeneratedKernelSource.RenderKernels,
+            }).ToArray(),
+        };
+        return JsonSerializer.Serialize(manifest, new JsonSerializerOptions { WriteIndented = true });
+    }
+
+    private void WriteGeneratedModel(string outputDirectory, string metadataJson, string kernelParamsJson)
     {
         Directory.CreateDirectory(outputDirectory);
 
-        var targetOptions = PyNTTTargetOptionsUtility.Normalize(_compileOptions);
+        var targetOptions = PyNTTTargetOptionsUtility.Get(_compileOptions);
         var backend = targetOptions.Backend;
         var moduleName = GetModuleName();
         var runtimeConfig = $"""
@@ -344,6 +365,7 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
         var requirements = """
             torch
             triton
+            jinja2
             """;
         var readme = $"""
             # Generated PyNTT Model
@@ -358,6 +380,7 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
 
         File.WriteAllText(Path.Join(outputDirectory, "__init__.py"), "from .model import load_model\n", Encoding.UTF8);
         File.WriteAllText(Path.Join(outputDirectory, "metadata.json"), metadataJson + Environment.NewLine, Encoding.UTF8);
+        File.WriteAllText(Path.Join(outputDirectory, "kernel_params.json"), kernelParamsJson + Environment.NewLine, Encoding.UTF8);
         File.WriteAllText(Path.Join(outputDirectory, "runtime_config.py"), runtimeConfig, Encoding.UTF8);
         File.WriteAllText(Path.Join(outputDirectory, "requirements.txt"), requirements, Encoding.UTF8);
         File.WriteAllText(Path.Join(outputDirectory, "README.md"), readme, Encoding.UTF8);
@@ -417,6 +440,9 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
             : string.Empty;
 
         return $$"""
+            from pathlib import Path
+
+            from pyntt.codegen.render import render_generated_kernels
             from pyntt.runtime.interpreter import PyNTTInterpreter
             from pyntt.runtime.tensor import materialize_kv_cache_blocks_per_shard, materialize_kv_cache_metadata, materialize_kv_cache_storage, materialize_kv_cache_tensor_field
             from pyntt.runtime.tuning import select_tuning_parameter
@@ -425,8 +451,12 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
             from .specs import MODULE_SPEC
 
 
+            _BASE_DIR = Path(__file__).resolve().parent
+
+
             class PyNTTGeneratedModel(PyNTTInterpreter):
                 def __init__(self):
+                    render_generated_kernels(_BASE_DIR, package=__package__)
                     super().__init__(MODULE_SPEC, RDATA_BUNDLES)
 
                 def _run_entry(self, inputs, outputs, shape_env):
@@ -664,12 +694,18 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
         if (isTir)
         {
             var dataBytesPerProgram = PythonValue(kernel.Launch.Meta["data_pool_bytes"]);
+            var warpLocalDataBytesPerScope = PythonValue(kernel.Launch.Meta["warp_local_data_pool_bytes"]);
+            var blockLocalDataBytesPerScope = PythonValue(kernel.Launch.Meta["block_local_data_pool_bytes"]);
+            var warpLocalDataScopeCount = PythonValue(kernel.Launch.Meta["warp_local_data_scope_count"]);
+            var blockLocalDataScopeCount = PythonValue(kernel.Launch.Meta["block_local_data_scope_count"]);
             var dataDType = PythonString((string)kernel.Launch.Meta["data_dtype"]);
             workspaceSetup = $"""
                     data = self.allocate_workspace(inputs, {PythonString(kernel.Name + ".data")}, {dataBytesPerProgram} * grid[0], {dataDType})
+                    warp_local_data = self.allocate_workspace(inputs, {PythonString(kernel.Name + ".warp_local_data")}, {warpLocalDataBytesPerScope} * {warpLocalDataScopeCount}, {dataDType})
+                    block_local_data = self.allocate_workspace(inputs, {PythonString(kernel.Name + ".block_local_data")}, {blockLocalDataBytesPerScope} * {blockLocalDataScopeCount}, {dataDType})
                     rdata, thread_local_rdata, warp_local_rdata, block_local_rdata = self.materialize_rdata_bundle(inputs, {PythonString(functionName)})
             """;
-            workspaceArgs = new[] { "data", "rdata", "thread_local_rdata", "warp_local_rdata", "block_local_rdata" };
+            workspaceArgs = new[] { "data", "rdata", "thread_local_rdata", "warp_local_rdata", "block_local_rdata", "warp_local_data", "block_local_data" };
         }
 
         var runtimeShapeArgs = runtimeShapeArgNames.Select(arg => $"shape_env[{PythonString(arg)}]").ToArray();
@@ -757,40 +793,11 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
 
     private string BuildGeneratedKernelsPython()
     {
-        var kernelSources = _functions
-            .Select(function => function.GeneratedKernelSource.Source)
-            .Where(source => !string.IsNullOrWhiteSpace(source))
-            .ToArray();
-        if (kernelSources.Length == 0)
-        {
-            return """
-                # Generated PyNTT kernels.
-                #
-                # This model has no generated Triton top kernels.
-                """;
-        }
-
-        var needsGridBarrier = kernelSources.Any(source => source.Contains("tle.distributed_barrier", StringComparison.Ordinal));
-        var imports = new List<string>
-        {
-            "import triton",
-            "import triton.language as tl",
-        };
-        if (needsGridBarrier)
-        {
-            imports.Add("import triton.experimental.tle.language as tle");
-        }
-
-        imports.Add("from triton.language.extra import libdevice");
-        var importSource = string.Join(Environment.NewLine, imports);
-        var gridMeshSource = needsGridBarrier
-            ? $"{Environment.NewLine}{Environment.NewLine}PYNTT_GRID_MESH = tle.device_mesh({{\"block\": [(\"block_x\", {GetGridBarrierMeshSize()})]}})"
-            : string.Empty;
-        return $$"""
-            {{importSource}}{{gridMeshSource}}
-
-
-            {{string.Join(Environment.NewLine + Environment.NewLine, kernelSources)}}
+        return """
+            # Generated PyNTT kernels.
+            #
+            # model.py refreshes this file from kernel_params.json through
+            # pyntt.codegen.render before launching Triton kernels.
             """;
     }
 

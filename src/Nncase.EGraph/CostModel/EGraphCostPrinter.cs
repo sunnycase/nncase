@@ -40,7 +40,7 @@ public partial class EGraphPrinter
     /// </summary>
     internal static ENode MinByWithMarker(EClass eClass, CostModel.EGraphCostModel costModel)
     {
-        return eClass.Nodes.OrderBy(e => e.Expr, ENodeTypeComparer.Instance).MinBy(x => x.Expr is Marker ? CostModel.Cost.Zero : costModel[x])!;
+        return eClass.Nodes.OrderBy(e => e.Expr, ENodeTypeComparer.Instance).MinBy(x => x.Expr is Marker ? 0 : costModel.GetLatency(x))!;
     }
 
     /// <summary>
@@ -48,7 +48,7 @@ public partial class EGraphPrinter
     /// </summary>
     internal static ENode MinByWithOutMarker(EClass eClass, CostModel.EGraphCostModel costModel)
     {
-        return eClass.Nodes.Where(e => e.Expr is not Marker).MinBy(x => costModel[x])!;
+        return eClass.Nodes.Where(e => e.Expr is not Marker).MinBy(x => costModel.GetLatency(x))!;
     }
 
     private DotGraph AttachEGraphCost(CostModel.EGraphCostModel costModel, EClass entry)
@@ -69,7 +69,7 @@ public partial class EGraphPrinter
                     row.AddCell($"{k}: {v:F2}");
                 }
 
-                row.AddCell($"Score: {cost.Score:F2}");
+                row.AddCell($"Score: {costModel.GetLatency(enode):F2}");
             });
             dotnode.ToPlainHtmlNode(table);
         }

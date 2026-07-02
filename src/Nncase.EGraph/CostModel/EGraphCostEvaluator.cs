@@ -44,6 +44,7 @@ internal sealed class EGraphCostEvaluator
     private readonly HashSet<EClass> _allEclasses = new();
     private readonly IBaseFuncCostEvaluator? _baseFuncCostEvaluator;
     private readonly Dictionary<CostMemoKey, Cost> _opCosts = new(ReferenceEqualityComparer.Instance);
+    private readonly ITargetOpCostModel _targetCostModel;
     private readonly bool _accumulate;
     private bool _changed;
 
@@ -53,6 +54,7 @@ internal sealed class EGraphCostEvaluator
         _compileOptions = compileOptions;
         _accumulate = accumulate;
         _baseFuncCostEvaluator = basefunc_cost_evaluator;
+        _targetCostModel = TargetOpCostModelUtility.GetTargetCostModel(compileOptions);
         PopulateAllEclasses(_root);
     }
 
@@ -73,7 +75,7 @@ internal sealed class EGraphCostEvaluator
             throw new InvalidOperationException("Cannot evaluate cost for root.");
         }
 
-        return new(_costs);
+        return new(_costs, _targetCostModel);
     }
 
     private void PopulateAllEclasses(EClass eClass)
@@ -106,7 +108,7 @@ internal sealed class EGraphCostEvaluator
         {
             var newCost = Visit(enode, eclass.CheckedType);
             if (newCost != null
-                && (cost == null || newCost < cost))
+                && (cost == null || IsLowerCost(newCost, cost)))
             {
                 cost = newCost;
             }
@@ -171,7 +173,7 @@ internal sealed class EGraphCostEvaluator
             {
                 var newCost = Visit(targetEnode, returnType);
 
-                if (cost == null || (newCost != null && newCost < cost))
+                if (cost == null || (newCost != null && IsLowerCost(newCost, cost)))
                 {
                     cost = newCost;
                 }
@@ -182,7 +184,7 @@ internal sealed class EGraphCostEvaluator
             {
                 var newCost = Visit(targetEnode, returnType);
 
-                if (cost == null || (newCost != null && newCost < cost))
+                if (cost == null || (newCost != null && IsLowerCost(newCost, cost)))
                 {
                     cost = newCost;
                 }
@@ -226,7 +228,7 @@ internal sealed class EGraphCostEvaluator
                     newCost = Visit(targetEnode, returnType);
                 }
 
-                if (cost == null || (newCost != null && newCost < cost))
+                if (cost == null || (newCost != null && IsLowerCost(newCost, cost)))
                 {
                     cost = newCost;
                 }
@@ -331,6 +333,11 @@ internal sealed class EGraphCostEvaluator
         var cost = costGetter(costs);
         return UpdateCost(enode, cost);
     }
+
+    private bool IsLowerCost(Cost lhs, Cost rhs)
+    {
+        return TargetOpCostModelUtility.GetCostLatency(_targetCostModel, lhs) < TargetOpCostModelUtility.GetCostLatency(_targetCostModel, rhs);
+    }
 }
 
 internal sealed class EGraphOpCostEvaluateContext : ICostEvaluateContext
@@ -345,9 +352,12 @@ internal sealed class EGraphOpCostEvaluateContext : ICostEvaluateContext
         _argumentTypes = argumentTypes;
         _arguments = arguments;
         CompileOptions = compileOptions;
+        TargetCostModel = TargetOpCostModelUtility.GetTargetCostModel(compileOptions);
     }
 
     public CompileOptions CompileOptions { get; }
+
+    public ITargetOpCostModel TargetCostModel { get; }
 
     public T GetArgument<T>(Op op, ParameterInfo parameter)
       where T : BaseFunction

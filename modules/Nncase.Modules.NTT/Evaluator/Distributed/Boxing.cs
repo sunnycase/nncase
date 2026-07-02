@@ -125,6 +125,11 @@ public sealed class BoxingEvaluator : ITypeInferencer<Boxing>, ICostEvaluator<Bo
     {
         var inType = context.GetArgumentType<IRType>(target, Boxing.Input);
         var returnType = context.GetReturnType<IRType>();
+        if (TryGetTargetBoxingCost(context.TargetCostModel, inType, returnType, out var targetCost))
+        {
+            return targetCost;
+        }
+
         UInt128 synchronizeCost = inType is DistributedType dt && dt.Placement.HierarchyKind == HierarchyKind.SMT ? 1500U : 25_000; // 25k cycles on 5GHz CPU is about 5us.
         var cost = new Cost() { [CostFactorNames.CPUCycles] = 1, [CostFactorNames.MemoryLoad] = 0, [CostFactorNames.MemoryStore] = 0, [CostFactorNames.Synchronization] = synchronizeCost };
         switch (inType, returnType)
@@ -405,5 +410,95 @@ public sealed class BoxingEvaluator : ITypeInferencer<Boxing>, ICostEvaluator<Bo
             DistributedType d => Value.FromTensor(Tensor.FromBytes(input.ElementType, input.BytesBuffer.ToArray(), (RankedShape)d.TensorType.Shape), d.AxisPolicies, d.Placement),
             _ => Value.FromTensor(input),
         };
+    }
+
+    private static bool TryGetTargetBoxingCost(ITargetOpCostModel targetCostModel, IRType inputType, IRType outputType, out Cost cost)
+    {
+        cost = Cost.Zero;
+        if (ReferenceEquals(targetCostModel, DefaultTargetOpCostModel.Instance))
+        {
+            return false;
+        }
+
+        return (inputType, outputType) switch
+        {
+            (TensorType inputTensor, DistributedType outputDistributed) =>
+                TryGetTargetTensorLoadCost(targetCostModel, inputTensor, outputDistributed, out cost),
+            (DistributedType inputDistributed, TensorType outputTensor) =>
+                TryGetTargetTensorStoreCost(targetCostModel, inputDistributed, outputTensor, out cost),
+            (DistributedType inputDistributed, DistributedType outputDistributed) when IsThreadLocalMetadataReshard(inputDistributed, outputDistributed) =>
+                TryGetThreadLocalMetadataReshardCost(out cost),
+            (DistributedType inputDistributed, DistributedType outputDistributed) =>
+                TryGetTargetDistributedCopyCost(targetCostModel, inputDistributed, outputDistributed, out cost),
+            _ => false,
+        };
+    }
+
+    private static bool TryGetTargetTensorLoadCost(ITargetOpCostModel targetCostModel, TensorType inputTensor, DistributedType outputDistributed, out Cost cost)
+    {
+        var outputLocal = GetMaxDividedTensorType(outputDistributed);
+        var localInputTensor = new TargetCostTensor(inputTensor.DType, outputLocal.Shape);
+        var localOutputTensor = new TargetCostTensor(outputLocal.DType, outputLocal.Shape);
+        return targetCostModel.TryGetElementwiseCost(new("boxing_tensor_load", [localInputTensor], localOutputTensor, WorkPerElement: 0.0), out cost);
+    }
+
+    private static bool TryGetTargetTensorStoreCost(ITargetOpCostModel targetCostModel, DistributedType inputDistributed, TensorType outputTensor, out Cost cost)
+    {
+        var inputLocal = GetMaxDividedTensorType(inputDistributed);
+        var localInputTensor = new TargetCostTensor(inputLocal.DType, inputLocal.Shape);
+        var localOutputTensor = new TargetCostTensor(outputTensor.DType, inputLocal.Shape);
+        return targetCostModel.TryGetElementwiseCost(new("boxing_tensor_store", [localInputTensor], localOutputTensor, WorkPerElement: 0.0), out cost);
+    }
+
+    private static bool TryGetTargetDistributedCopyCost(ITargetOpCostModel targetCostModel, DistributedType inputDistributed, DistributedType outputDistributed, out Cost cost)
+    {
+        var inputLocal = GetMaxDividedTensorType(inputDistributed);
+        var outputLocal = GetMaxDividedTensorType(outputDistributed);
+        var localInputTensor = new TargetCostTensor(inputLocal.DType, inputLocal.Shape);
+        var localOutputTensor = new TargetCostTensor(outputLocal.DType, outputLocal.Shape);
+        return targetCostModel.TryGetElementwiseCost(new("boxing_reshard_copy", [localInputTensor], localOutputTensor, WorkPerElement: 0.0), out cost);
+    }
+
+    private static bool TryGetThreadLocalMetadataReshardCost(out Cost cost)
+    {
+        cost = new Cost { [CostFactorNames.CPUCycles] = 1 };
+        return true;
+    }
+
+    private static TensorType GetMaxDividedTensorType(DistributedType distributedType)
+    {
+        return DistributedUtility.GetDividedTensorType(distributedType, DistributedUtility.DivideFlags.MaxShape);
+    }
+
+    private static bool IsThreadLocalMetadataReshard(DistributedType inputType, DistributedType outputType)
+    {
+        if (inputType.TensorType != outputType.TensorType
+            || inputType.Placement != outputType.Placement
+            || inputType.Partial is not null
+            || outputType.Partial is not null
+            || DistributedUtility.AreSamePolicies(inputType.AxisPolicies, outputType.AxisPolicies, false))
+        {
+            return false;
+        }
+
+        var threadAxis = inputType.Placement.Rank - 1;
+        var reducedInputPolicies = inputType.AxisPolicies.Select(sbp => ReduceThreadAxis(sbp, threadAxis)).ToArray();
+        if (DistributedUtility.AreSamePolicies(reducedInputPolicies, outputType.AxisPolicies.ToArray(), false))
+        {
+            return true;
+        }
+
+        var reducedOutputPolicies = outputType.AxisPolicies.Select(sbp => ReduceThreadAxis(sbp, threadAxis)).ToArray();
+        return DistributedUtility.AreSamePolicies(reducedOutputPolicies, inputType.AxisPolicies.ToArray(), false);
+    }
+
+    private static SBP ReduceThreadAxis(SBP sbp, int threadAxis)
+    {
+        if (sbp is not SBPSplit split || !split.Axes.Contains(threadAxis))
+        {
+            return sbp;
+        }
+
+        return split.Axes.Count == 1 ? SBP.B : SBP.S(split.Axes.Except([threadAxis]).ToArray());
     }
 }

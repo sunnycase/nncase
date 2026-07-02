@@ -798,56 +798,17 @@ struct u_matmul_policy<matmul_vectorize_kind::vectorize_mkn,
     static constexpr size_t m0_subtile = 4;
 };
 
-// template <bool AccumulateC, Vector TBPack, Vector TCPack>
-// struct u_packed_gemv<AccumulateC, bfloat16, TBPack, TCPack, true> {
-//     static constexpr auto N0Tile = TCPack::shape()[0_dim];
-
-//     template <Dimension TLdb, Dimension TK, Dimension TN>
-//     constexpr void operator()(const bfloat16 *NTT_RESTRICT a,
-//                               const TBPack *NTT_RESTRICT b,
-//                               TCPack *NTT_RESTRICT c, const TLdb &ldb,
-//                               const TK &K, const TN &N) noexcept {
-//         NTT_ASSUME(K > 0);
-//         if constexpr (!AccumulateC) {
-//             for (size_t n1 = 0; n1 < N; n1++) {
-//                 c[n1] = {};
-//             }
-//         }
-
-//         for (size_t n1 = 0; n1 < N; n1++) {
-//             const auto b1 = b + n1 * ldb;
-//             auto c0 = ntt::cast_elem<float>(c[n1]);
-
-//             for (size_t k1 = 0; k1 < K; k1++) {
-//                 const float a0 = (float)a[k1];
-//                 const auto b0 = ntt::cast_elem<float>(b1[k1]);
-//                 ntt::loop<N0Tile>([&](auto n) {
-//                     ntt::loop<2>([&](auto i) {
-//                         c0(n, i) = ntt::mul_add(a0, b0(n, i), c0(n, i));
-//                     });
-//                 });
-
-//                 ntt::prefetch<prefetch_hint::l2>(&b1[k1 + 8]);
-//             }
-
-//             ntt::apply(fixed_shape_v<N0Tile>, [&](auto index) {
-//                 c[n1](index[0_dim]) =
-//                     ntt::cast_elem<bfloat16>(c0(index[0_dim]));
-//             });
-//         }
-//     }
-// };
-
-template <bool AccumulateC, class TScale>
-struct u_packed_gemv<AccumulateC, half, ntt::vector<half, 4, 16>,
-                     ntt::vector<half, 4, 16>, TScale, true> {
+template <bool AccumulateC, class T, class TScale>
+    requires(std::is_same_v<T, half> || std::is_same_v<T, bfloat16>)
+struct u_packed_gemv<AccumulateC, T, ntt::vector<T, 4, 16>,
+                     ntt::vector<T, 4, 16>, TScale, true> {
     static constexpr auto N0Tile = 4;
 
     template <Dimension TLdb, Dimension TK, Dimension TN>
     NTT_ALWAYS_INLINE constexpr void
-    operator()(const half *NTT_RESTRICT a,
-               const ntt::vector<half, 4, 16> *NTT_RESTRICT b,
-               ntt::vector<half, 4, 16> *NTT_RESTRICT c, const TScale &scale,
+    operator()(const T *NTT_RESTRICT a,
+               const ntt::vector<T, 4, 16> *NTT_RESTRICT b,
+               ntt::vector<T, 4, 16> *NTT_RESTRICT c, const TScale &scale,
                const TLdb &ldb, const TK &K, const TN &N) noexcept {
         using TAccPack = ntt::vector<float, 4, 2, 8>;
 
@@ -855,71 +816,62 @@ struct u_packed_gemv<AccumulateC, half, ntt::vector<half, 4, 16>,
             const auto b1 = b + n1 * ldb;
             auto c0 = ntt::where(std::integral_constant<bool, AccumulateC>{},
                                  ntt::cast_elem<float>(c[n1]), TAccPack{});
-            for (size_t k1 = 0; k1 < K; k1 += 8) {
-                __m256 a0_v = _mm256_cvtph_ps(*(const __m128i *)(a + k1));
-                ntt::loop<8>([&](auto k2) {
-                    __m128 a0_lane = _mm256_extractf128_ps(a0_v, k2 >> 2);
-                    __m128 a0_elem = _mm_shuffle_ps(
-                        a0_lane, a0_lane,
-                        _MM_SHUFFLE(k2 & 3, k2 & 3, k2 & 3, k2 & 3));
-                    const auto a0 =
-                        ntt::vector<float, 8>(_mm256_broadcastss_ps(a0_elem));
-                    const auto a0_scaled = ntt::mul(a0, scale);
-                    ntt::loop<N0Tile>([&](auto tn) {
-                        c0(tn) =
-                            ntt::mul_add(a0_scaled, b1[k1 + k2](tn), c0(tn));
-                    });
+
+            for (size_t k1 = 0; k1 < K; k1++) {
+                const auto b0 = b1[k1];
+                const auto a0 = ntt::mul(a[k1], scale);
+                ntt::loop<N0Tile>([&](auto tn) {
+                    c0(tn) = ntt::mul_add(a0, b0(tn), c0(tn));
                 });
             }
 
             ntt::apply(fixed_shape_v<N0Tile>, [&](auto index) {
-                c[n1](index[0_dim]) = ntt::cast_elem<half>(c0(index[0_dim]));
+                c[n1](index[0_dim]) = ntt::cast_elem<T>(c0(index[0_dim]));
             });
         }
     }
 };
 
-template <bool AccumulateC, class TScale>
-struct u_packed_gemv<AccumulateC, bfloat16, ntt::vector<bfloat16, 4, 16>,
-                     ntt::vector<bfloat16, 4, 16>, TScale, true> {
+template <bool AccumulateC, dim_t M0Tile, class T, class TScale>
+    requires(std::is_same_v<T, half> || std::is_same_v<T, bfloat16>)
+struct u_packed_matmul<AccumulateC, M0Tile, T, ntt::vector<T, 4, 16>,
+                       ntt::vector<T, 4, 16>,
+                       TScale, true> {
     static constexpr auto N0Tile = 4;
 
-    template <Dimension TLdb, Dimension TK, Dimension TN>
+    template <Dimension TLda, Dimension TLdc, Dimension TK>
     NTT_ALWAYS_INLINE constexpr void
-    operator()(const bfloat16 *NTT_RESTRICT a,
-               const ntt::vector<bfloat16, 4, 16> *NTT_RESTRICT b,
-               ntt::vector<bfloat16, 4, 16> *NTT_RESTRICT c,
-               const TScale &scale, const TLdb &ldb, const TK &K,
-               const TN &N) noexcept {
+    operator()(const T *NTT_RESTRICT a,
+               const ntt::vector<T, 4, 16> *NTT_RESTRICT b,
+               ntt::vector<T, 4, 16> *NTT_RESTRICT c, const TScale &scale,
+               const TLda &lda, const TLdc &ldc, const TK &K) noexcept {
         using TAccPack = ntt::vector<float, 4, 2, 8>;
+        TAccPack c0[M0Tile];
 
-        for (size_t n1 = 0; n1 < N; n1++) {
-            const auto b1 = b + n1 * ldb;
-            auto c0 = ntt::where(std::integral_constant<bool, AccumulateC>{},
-                                 ntt::cast_elem<float>(c[n1]), TAccPack{});
-            for (size_t k1 = 0; k1 < K; k1 += 8) {
-                __m256 a0_v = _mm256_castsi256_ps(_mm256_slli_epi32(
-                    _mm256_cvtepu16_epi32(*(const __m128i *)(a + k1)), 16));
-                ntt::loop<8>([&](auto k2) {
-                    __m128 a0_lane = _mm256_extractf128_ps(a0_v, k2 >> 2);
-                    __m128 a0_elem = _mm_shuffle_ps(
-                        a0_lane, a0_lane,
-                        _MM_SHUFFLE(k2 & 3, k2 & 3, k2 & 3, k2 & 3));
-                    const auto a0 =
-                        ntt::vector<float, 8>(_mm256_broadcastss_ps(a0_elem));
-                    const auto a0_scaled = ntt::mul(a0, scale);
-                    ntt::loop<N0Tile>([&](auto tn) {
-                        c0(tn) =
-                            ntt::mul_add(a0_scaled, b1[k1 + k2](tn), c0(tn));
-                    });
+        ntt::loop<M0Tile>([&](auto m) {
+            c0[m] = ntt::where(std::integral_constant<bool, AccumulateC>{},
+                               ntt::cast_elem<float>(c[m * ldc]),
+                               TAccPack{});
+        });
+
+        for (size_t k1 = 0; k1 < K; k1++) {
+            const auto b0 = b[k1];
+            ntt::loop<M0Tile>([&](auto m) {
+                const auto a0 = ntt::mul(a[m * lda + k1], scale);
+                ntt::loop<N0Tile>([&](auto tn) {
+                    c0[m](tn) = ntt::mul_add(a0, b0(tn), c0[m](tn));
                 });
-            }
-
-            ntt::apply(fixed_shape_v<N0Tile>, [&](auto index) {
-                c[n1](index[0_dim]) =
-                    ntt::cast_elem<bfloat16>(c0(index[0_dim]));
             });
+
+            ntt::prefetch<prefetch_hint::l1>(&b[k1 + 8]);
         }
+
+        ntt::loop<M0Tile>([&](auto m) {
+            ntt::apply(fixed_shape_v<N0Tile>, [&](auto index) {
+                c[m * ldc](index[0_dim]) =
+                    ntt::cast_elem<T>(c0[m](index[0_dim]));
+            });
+        });
     }
 };
 

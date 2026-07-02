@@ -162,7 +162,7 @@ internal sealed class ILPrintVisitor : ExprFunctor<string, string>
                 }
                 else
                 {
-                    shape[r] = split.Granularity.FixedValue;
+                    shape[r] = CompilerServices.GetMaxShape(new RankedShape(new[] { split.Granularity }))[0];
                 }
             }
         }

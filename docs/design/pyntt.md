@@ -2,7 +2,7 @@
 
 ## Status
 
-Draft design.
+Active implementation design.
 
 ## Summary
 
@@ -36,8 +36,10 @@ Target and module kind: `pyntt`.
   - auto tiling
   - TIR selection
   - bufferization
-- Skip native NTT auto packing and auto vectorization in the PyNTT pipeline
-  until Triton templates have an explicit representation for those layouts.
+- Preserve native NTT vector layout decisions only when PyNTT codegen has an
+  explicit Triton template representation for the resulting layout. Layout
+  changes must be visible in TIR and generated source; they must not be hidden
+  behind native NTT kernels or runtime fallbacks.
 - Support the first op group:
   - elementwise
   - unary
@@ -96,7 +98,7 @@ contract.
 
 ## Repository Layout
 
-Recommended first layout:
+Current layout:
 
 ```text
 pyntt/
@@ -111,22 +113,32 @@ pyntt/
       layout.py
     runtime/
       __init__.py
+      interpreter.py
       module.py
       tensor.py
-      executor.py
       errors.py
+      sharding.py
+      tuning.py
+      workspace.py
     backends/
       __init__.py
       triton/
         __init__.py
         backend.py
-        lowering.py
-        autotune.py
+    codegen/
+      __init__.py
+      render.py
+      templates/
+        triton/
+          module.py.jinja
+          top_kernel.py.jinja
+          kernels/
+            TensorLoad.py.jinja
+            TensorStore.py.jinja
+            ElementwiseBinary.py.jinja
+            ...
     testing/
       __init__.py
-      reference.py
-      compare.py
-      benchmark.py
 
 modules/Nncase.Modules.NTT/
   Targets/
@@ -140,19 +152,12 @@ modules/Nncase.Modules.NTT/
       PyNTTLinkableFunction.cs
       PyNTTLinkableModule.cs
       PyNTTLinkedModule.cs
-      Templates/
-        Triton/
-          Kernels/
-            TensorLoad.py.cshtml
-            TensorStore.py.cshtml
-            ElementwiseBinary.py.cshtml
-            ...
 ```
 
-The `pyntt/` root contains Python runtime helpers, spec definitions, and
-optional Triton kernel utilities. The C# codegen layer translates nncase NTT
-metadata into stable PyNTT specs, generated Python entry files, and generated
-Triton top kernels.
+The `pyntt/` root contains Python runtime helpers, spec definitions, the Jinja
+renderer, and Triton template assets. The C# codegen layer translates nncase NTT
+metadata into stable PyNTT specs, generated Python entry files, launch metadata,
+and a render manifest. It does not own Python/Triton template source.
 
 ## Target Integration
 
@@ -191,8 +196,12 @@ Suggested output:
 <output-dir>/
   model.py
   metadata.json
+  kernel_params.json
   specs.py
   generated_kernels.py
+  rdata.py
+  assets/
+    <function>_<section>.bin
   runtime_config.py
   requirements.txt
   README.md
@@ -200,16 +209,27 @@ Suggested output:
 
 Responsibilities:
 
-- `model.py`: public entrypoint, runtime validation, output allocation, and
-  direct launch of generated Triton top kernels.
+- `model.py`: public entrypoint, runtime validation, output allocation,
+  `generated_kernels.py` refresh on model load, and direct launch of generated
+  Triton top kernels.
 - `metadata.json`: model metadata, version, static shapes, dtype, kernel list,
   schedule IDs, and debug mapping.
+- `kernel_params.json`: codegen manifest consumed by PyNTT's Jinja renderer.
+  It contains top-kernel metadata, helper template names, helper model objects,
+  and the generated top-kernel call sequence. It is the stable boundary that
+  lets PyNTT template edits regenerate kernels without recompiling nncase or
+  recompiling the model.
 - `specs.py`: Python representation of `ModuleSpec`, `FunctionSpec`, and
   `TensorSpec` instances.
-- `generated_kernels.py`: generated Triton top kernels.
+- `generated_kernels.py`: generated Triton helper functions and launchable top
+  kernels. The file is initially a placeholder and is refreshed from
+  `kernel_params.json` by `model.py` through `pyntt.codegen.render`.
+- `rdata.py`: generated bundle table for read-only data sections.
+- `assets/*.bin`: binary rdata payloads. Non-empty rdata sections must be
+  emitted as binary files, not base64 strings embedded in Python source.
 - `runtime_config.py`: backend choice, cache settings, debug flags, and
   optional autotune controls.
-- `requirements.txt`: first stage should include `torch` and `triton`.
+- `requirements.txt`: first stage includes `torch`, `triton`, and `jinja2`.
 
 The generated code should be deterministic for the same input model, compiler
 options, and PyNTT version. Deterministic output is required for review,
@@ -263,18 +283,25 @@ PyNTT follows the same ownership model as the existing NTT CPU codegen path:
 - `PyNTTLinkableModule` only writes generated files, metadata, and model launch
   glue. It must not contain op-level Triton lowering.
 
-The generated Triton top kernel is instantiated from Razor templates. Template
-models carry TIR-derived dtype, shape, stride, offset, op, and launch metadata,
-and the rendered `generated_kernels.py` contains the concrete rank/shape-expr
-Triton code. This keeps kernel implementation logic out of the visitor without
-forcing the Python package to hand-write rank-dispatched device helpers.
-Generated load/compute/store fragments should be emitted as named Triton
-subfunctions in `generated_kernels.py`; the launchable top kernel should remain
-a readable call sequence over those helpers.
+The generated Triton top kernel is instantiated from PyNTT-owned Jinja
+templates. C# emits a render manifest instead of final kernel source. Template
+models carry TIR-derived dtype, shape, stride, offset, op, and launch metadata;
+`pyntt.codegen.render` reads the manifest and produces concrete rank/shape-expr
+Triton code in `generated_kernels.py`.
 
-`PyNTTKernelSourceConvertVisitor` should select a template and build a strongly
-typed template model, mirroring `KernelCSourceConvertVisitor` in the native NTT
-backend. It should not inline large Python snippets directly in C# strings.
+Generated load/compute/store fragments are emitted as named Triton
+subfunctions in `generated_kernels.py`; the launchable top kernel remains a
+readable call sequence over those helpers. This mirrors the native NTT style:
+a generated top kernel calls generated device/helper functions, while the
+runtime owns launch, workspace allocation, rdata materialization, and input
+validation.
+
+`PyNTTKernelSourceConvertVisitor` selects a Jinja template name and builds a
+strongly typed template model, mirroring `KernelCSourceConvertVisitor` in the
+native NTT backend. It should not inline large Python snippets directly in C#
+strings, and it should not call a C# template engine. The only generated source
+body stored in C# is the top-kernel helper call sequence derived by visiting TIR
+expressions.
 
 Launch-shape parameters such as `block_size` are not constants owned by the
 source visitor. They are emitted as tuning or auto-tiling parameters in kernel
@@ -447,9 +474,11 @@ Backend responsibilities:
 - Surface Triton compilation errors with the generated kernel name and original
   nncase op mapping.
 
-M3 emits generated Triton `@triton.jit` top kernels directly. Runtime helpers
-validate `torch.Tensor` inputs and allocate outputs; they do not resolve or
-dispatch kernel descriptors.
+PyNTT emits generated Triton `@triton.jit` top kernels through the manifest
+renderer. Runtime helpers validate `torch.Tensor` inputs, allocate/reuse
+outputs and workspaces, materialize rdata, resolve dynamic shapes, and launch
+the generated top kernel. They do not resolve or dispatch op-level kernel
+descriptors.
 
 Kernel validation should be strict. The runtime should reject
 missing launch metadata, unsupported placement, non-CUDA tensors, non-contiguous
@@ -457,13 +486,17 @@ tensors, shape mismatches, or unsupported generated kernel patterns.
 
 ## Kernel Templates
 
-PyNTT kernel implementation lives in Razor templates under
-`modules/Nncase.Modules.NTT/CodeGen/PyNTT/Templates/Triton`. Codegen
-instantiates those templates with concrete TIR dtype, rank, shape, stride,
-offset, op, and launch metadata. The rendered output is copied into each
-generated model's `generated_kernels.py` as Triton `@triton.jit` helper
-subfunctions plus one launchable top kernel. Generated models do not require a
-kernel spec dispatch layer or package-level handwritten Triton kernels.
+PyNTT kernel implementation lives in Jinja templates under
+`pyntt/pyntt/codegen/templates/triton`. The nncase C# backend emits a
+reader-only manifest, and PyNTT renders that manifest into each generated
+model's `generated_kernels.py` as Triton `@triton.jit` helper subfunctions plus
+one launchable top kernel. Generated models do not require a kernel spec
+dispatch layer or package-level handwritten Triton kernels.
+
+The design intentionally keeps templates in the PyNTT Python package rather
+than in `modules/Nncase.Modules.NTT`: changing a template or renderer can
+regenerate `generated_kernels.py` from an existing model directory without
+recompiling nncase and without rerunning the compiler.
 
 Initial template groups:
 
@@ -489,8 +522,9 @@ Initial template groups:
 
 Template design rules:
 
-- Razor templates should be mostly Python/Triton, with C# logic kept in the
-  template model.
+- Jinja templates should be reader-only entry points owned by PyNTT. They may
+  call Python renderer functions for complex code generation, but the rendered
+  source must remain deterministic for a fixed manifest and PyNTT version.
 - Rendered kernels should include comments naming the source template and TIR
   specialization metadata.
 - Generated kernels should compute the PyNTT local shard for the `b` axis and
@@ -504,21 +538,22 @@ Template design rules:
   key where possible.
 
 Generated Triton top kernels are the primary execution path. Reusable Python
-runtime utilities may support validation, tuning, and launch preparation, but
-op-specific Triton implementation should be generated from templates so each
-kernel specialization is explicit and inspectable.
+runtime utilities may support validation, tuning, launch preparation, and
+manifest rendering, but op-specific Triton implementation should be generated
+from templates so each kernel specialization is explicit and inspectable.
 
 ### Explicit Vector Layout Ops
 
-PyNTT skips the native NTT auto-pack and auto-vectorize passes in phase 1, but
-it still supports explicit layout-changing TIR ops that are produced by
-front-end or model-specific lowering. Qwen-style paged attention is the first
-case: the importer may emit `TIR.NTT.Pack`/`Unpack` to convert logical head
-dimensions into a vector-lane storage layout required by the KV cache.
+PyNTT supports explicit vector layout TIR ops and packed matmul layouts when
+the corresponding templates are available. Qwen-style paged attention and
+packed matmul are the first cases: lowering may emit `TIR.NTT.Pack`/`Unpack`
+or vectorized/packed matmul buffers to convert logical head or N dimensions
+into vector-lane storage layouts required by Triton kernels.
 
 This boundary is important:
 
-- Auto pack/vectorize remain disabled in the PyNTT pipeline.
+- Pack/vectorize passes may only be enabled when the resulting TIR ops and
+  vector element layouts are represented explicitly in PyNTT templates.
 - Explicit `Pack`/`Unpack` in TIR are real model semantics and must be lowered.
 - Vector element buffers are lowered to scalar physical pointer access in
   Triton templates. The vector lane count is a static template parameter, while
@@ -565,7 +600,7 @@ Paged-attention templates follow the NTT kernel split:
 For the first implementation, the metadata and storage layout are specialized
 from the static `IPagedAttentionKVCache` type information embedded in TIR. The
 runtime sequence lengths and dynamic token counts are passed as non-constexpr
-  Triton scalar arguments.
+Triton scalar arguments.
 
 ## Connecting Specs to PyNTT Kernels
 
@@ -581,7 +616,7 @@ generated model __call__
   -> launch generated Triton top kernel with runtime dim scalars and static meta
 ```
 
-Generated kernel metadata should contain:
+Generated kernel metadata and `kernel_params.json` should contain:
 
 - generated top kernel name
 - static launch metadata
@@ -594,8 +629,9 @@ This keeps PyNTT extensible:
 
 - Generated Triton top kernels can specialize schedule shape, indexing,
   placement, and composition.
-- Hand-written PyNTT Triton kernels can still be used as reusable helpers or
-  fallback implementation patterns when that is intentional.
+- PyNTT package code can provide shared render utilities and runtime helpers.
+  Device code for an op specialization should still be rendered into the
+  generated model so the final Triton source is inspectable.
 - TileLang or CuteDSL can be added later behind the same spec contract.
 
 ## Buffer and Memory Model
@@ -629,13 +665,16 @@ as schedule or kernel metadata, not as Python tensor allocations.
 
 Constants should be handled in a way that supports review and deployment.
 
-Recommended phase 1 options:
+Current policy:
 
-- Small constants may be embedded directly in generated Python.
-- Larger constants should be stored as `.pt`, `.npy`, or `.safetensors` files
-  under the generated model directory.
-- The generated `metadata.json` should include constant names, shapes, dtypes,
-  file paths, and checksums.
+- Rdata sections are emitted as binary assets under `assets/*.bin`.
+- `rdata.py` records the bundle table and `file:` URI for each non-empty
+  payload.
+- Empty rdata sections are represented as empty strings in the bundle table.
+- Base64-embedded rdata is not allowed; C# rejects non-empty inline rdata
+  payloads during generated-model writing.
+- The generated `metadata.json` and `rdata.py` should include enough byte,
+  section, and file-path information to debug runtime materialization.
 
 The runtime should load constants to the target device lazily or during model
 initialization, depending on the selected runtime configuration.
@@ -737,9 +776,9 @@ Correctness tolerances should be dtype-specific and documented in tests.
 ## Performance Policy
 
 Phase 1 prioritizes functionality and correctness. Performance ownership sits
-in generated Triton top kernels for M3. Future work should preserve enough
-schedule and launch metadata to improve those generated kernels without adding
-a runtime kernel dispatch layer.
+in generated Triton top kernels and PyNTT templates. Future work should
+preserve enough schedule, layout, cost, and launch metadata to improve those
+generated kernels without adding a runtime op dispatch layer.
 
 Required performance guardrails:
 
@@ -824,6 +863,18 @@ The runtime should reject unsupported spec versions with a clear error.
 - Add dtype-specific correctness tolerances.
 - Add generated metadata and debug source maps.
 - Add benchmark helpers.
+
+### Phase 2.1: Manifest and Reader-Only Templates
+
+- Emit `kernel_params.json` as the stable C# to PyNTT renderer boundary.
+- Move PyNTT kernel templates out of the C# codegen tree into
+  `pyntt/pyntt/codegen/templates/triton`.
+- Render `generated_kernels.py` from `kernel_params.json` at model load via
+  `pyntt.codegen.render`.
+- Keep generated top kernels as explicit call sequences over generated Triton
+  helper functions.
+- Allow template-only changes to refresh kernels without recompiling nncase or
+  rerunning model compilation.
 
 ### Phase 2.5: Dynamic Shape Bring-Up
 

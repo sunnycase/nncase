@@ -46,13 +46,12 @@ public class GatherEvaluator : IEvaluator<Gather>, ITypeInferencer<Gather>, ICos
     /// <inheritdoc/>
     public Cost Visit(ICostEvaluateContext context, Gather target)
     {
-        var inputType = context.GetArgumentType<IRType>(target, Gather.Input);
         var indexType = context.GetArgumentType<IRType>(target, Gather.Index);
         var retType = context.GetReturnType<IRType>();
 
         return new()
         {
-            [CostFactorNames.MemoryLoad] = CostUtility.GetMemoryAccess(inputType) + CostUtility.GetMemoryAccess(indexType),
+            [CostFactorNames.MemoryLoad] = CostUtility.GetMemoryAccess(retType) + CostUtility.GetMemoryAccess(indexType),
             [CostFactorNames.MemoryStore] = CostUtility.GetMemoryAccess(retType),
         };
     }

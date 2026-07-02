@@ -355,6 +355,10 @@ def _to_torch_tensor(torch, value: Any, device, dtype=None):
     elif hasattr(value, "numpy"):
         value = value.numpy()
 
+    if _is_numpy_bfloat16(value):
+        tensor = _numpy_bfloat16_to_torch(torch, value, device)
+        return tensor.to(dtype=dtype) if dtype is not None and dtype != torch.bfloat16 else tensor
+
     return torch.as_tensor(value, dtype=dtype, device=device)
 
 
@@ -439,7 +443,12 @@ def _try_materialize_initial_kv_storage(
     raw_tensor = raw_storage[0] if isinstance(raw_storage, (list, tuple)) and len(raw_storage) == 1 else raw_storage
     raw_numpy = _runtime_value_to_numpy(raw_tensor)
     if raw_numpy is not None and raw_numpy.dtype.kind not in ("i", "u"):
-        raw_torch = torch.as_tensor(raw_numpy, dtype=torch_dtype, device=device).contiguous()
+        if _is_numpy_bfloat16(raw_numpy):
+            raw_torch = _numpy_bfloat16_to_torch(torch, raw_numpy, device)
+            if raw_torch.dtype != torch_dtype:
+                raw_torch = raw_torch.to(dtype=torch_dtype)
+        else:
+            raw_torch = torch.as_tensor(raw_numpy, dtype=torch_dtype, device=device).contiguous()
         if len(raw_torch.shape) >= len(topology_shape) + 1 and tuple(raw_torch.shape[:len(topology_shape)]) == topology_shape:
             return raw_torch
 
@@ -454,6 +463,19 @@ def _grow_kv_storage(torch, old_storage: Any, new_storage: Any):
     slices = tuple(slice(0, min(int(old_storage.shape[i]), int(new_storage.shape[i]))) for i in range(len(new_storage.shape)))
     new_storage[slices].copy_(old_storage[slices].to(device=new_storage.device, dtype=new_storage.dtype))
     return new_storage.contiguous()
+
+
+def _is_numpy_bfloat16(value: Any) -> bool:
+    dtype = getattr(value, "dtype", None)
+    return getattr(dtype, "name", None) == "bfloat16"
+
+
+def _numpy_bfloat16_to_torch(torch, value: Any, device):
+    import numpy as np
+
+    raw = np.ascontiguousarray(value.view(np.uint16))
+    tensor = torch.from_numpy(raw).view(torch.bfloat16)
+    return tensor.to(device=device) if device is not None else tensor
 
 
 def _resolve_shape(shape, shape_env: Mapping[str, int]) -> tuple[int, ...]:

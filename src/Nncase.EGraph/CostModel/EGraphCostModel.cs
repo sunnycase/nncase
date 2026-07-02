@@ -14,13 +14,25 @@ namespace Nncase.CostModel;
 internal class EGraphCostModel
 {
     private readonly IReadOnlyDictionary<ENode, Cost> _costs;
+    private readonly ITargetOpCostModel _targetCostModel;
 
-    public EGraphCostModel(IReadOnlyDictionary<ENode, Cost> costs)
+    public EGraphCostModel(IReadOnlyDictionary<ENode, Cost> costs, ITargetOpCostModel targetCostModel)
     {
         _costs = costs;
+        _targetCostModel = targetCostModel;
     }
 
     public Cost this[ENode enode] => _costs[enode];
+
+    public UInt128 GetLatency(ENode enode)
+    {
+        return GetLatency(_costs[enode]);
+    }
+
+    public UInt128 GetLatency(Cost cost)
+    {
+        return TargetOpCostModelUtility.GetCostLatency(_targetCostModel, cost);
+    }
 
     public bool TryGet(ENode node, [MaybeNullWhen(false)] out Cost cost)
     {

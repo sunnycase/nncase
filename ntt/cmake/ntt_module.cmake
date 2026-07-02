@@ -2,6 +2,8 @@ cmake_minimum_required(VERSION 3.16)
 
 include(${CMAKE_CURRENT_LIST_DIR}/compile_flags.cmake)
 
+option(NNCASE_NTT_ENABLE_IPO "Enable interprocedural optimization for generated NTT modules" ON)
+
 if (CMAKE_CUDA_COMPILER)
     set(NNCASE_NTT_MODULE_TARGET_NAME nncase_ntt_module_bundle)
 
@@ -25,7 +27,9 @@ target_compile_features(${NNCASE_NTT_MODULE_TARGET_NAME} PUBLIC cxx_std_20)
 target_include_directories(${NNCASE_NTT_MODULE_TARGET_NAME} PUBLIC ${CMAKE_CURRENT_LIST_DIR}/../include)
 set_target_properties(${NNCASE_NTT_MODULE_TARGET_NAME} PROPERTIES PREFIX "" SUFFIX "")
 set_target_properties(${NNCASE_NTT_MODULE_TARGET_NAME} PROPERTIES POSITION_INDEPENDENT_CODE ON)
-set_property(TARGET ${NNCASE_NTT_MODULE_TARGET_NAME} PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
+if (NNCASE_NTT_ENABLE_IPO)
+    set_property(TARGET ${NNCASE_NTT_MODULE_TARGET_NAME} PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
+endif()
 
 if (BUILD_STANDALONE)
     target_compile_definitions(${NNCASE_NTT_MODULE_TARGET_NAME} PUBLIC -DNNCASE_STANDALONE=1)

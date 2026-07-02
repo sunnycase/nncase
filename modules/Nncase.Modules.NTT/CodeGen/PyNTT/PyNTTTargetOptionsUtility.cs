@@ -1,41 +1,20 @@
 // Copyright (c) Canaan Inc. All rights reserved.
 // Licensed under the Apache license. See LICENSE file in the project root for full license information.
 
+using System;
 using Nncase.Targets;
 
 namespace Nncase.CodeGen.PyNTT;
 
 internal static class PyNTTTargetOptionsUtility
 {
-    public static PyNTTTargetOptions Normalize(CompileOptions compileOptions)
+    public static PyNTTTargetOptions Get(CompileOptions compileOptions)
     {
-        return compileOptions.TargetOptions switch
+        if (compileOptions.TargetOptions is PyNTTTargetOptions pynttOptions)
         {
-            PyNTTTargetOptions pynttOptions => pynttOptions,
-            NTTTargetOptions nttOptions => FromNTTTargetOptions(nttOptions),
-            _ => new PyNTTTargetOptions(),
-        };
-    }
+            return pynttOptions;
+        }
 
-    private static PyNTTTargetOptions FromNTTTargetOptions(NTTTargetOptions nttOptions)
-    {
-        return new PyNTTTargetOptions
-        {
-            ModelName = nttOptions.ModelName,
-            Vectorize = nttOptions.Vectorize,
-            UnifiedMemoryArch = nttOptions.UnifiedMemoryArch,
-            MemoryAccessArch = nttOptions.MemoryAccessArch,
-            NocArch = nttOptions.NocArch,
-            HierarchyKind = nttOptions.HierarchyKind,
-            Hierarchies = nttOptions.Hierarchies,
-            HierarchyNames = nttOptions.HierarchyNames,
-            HierarchySizes = nttOptions.HierarchySizes,
-            HierarchyLatencies = nttOptions.HierarchyLatencies,
-            HierarchyBandWidths = nttOptions.HierarchyBandWidths,
-            MemoryCapacities = nttOptions.MemoryCapacities,
-            MemoryBandWidths = nttOptions.MemoryBandWidths,
-            DistributedScheme = nttOptions.DistributedScheme,
-            CustomOpScheme = nttOptions.CustomOpScheme,
-        };
+        throw new InvalidOperationException("PyNTT codegen requires PyNTTTargetOptions.");
     }
 }

@@ -48,7 +48,7 @@ public partial class EGraphPrinter
                             row.AddCell($"{k}: {v:F2}");
                         }
 
-                        row.AddCell($"Score: {cost.Score:F2}");
+                        row.AddCell($"Score: {costModel.GetLatency(enode):F2}");
                     });
                 }
             }

@@ -395,6 +395,13 @@ public class MatMulEvaluator : IEvaluator<MatMul>, ITypeInferencer<MatMul>, ICos
         var lhs = context.GetArgumentType<IRType>(target, MatMul.Lhs);
         var rhs = context.GetArgumentType<IRType>(target, MatMul.Rhs);
         var outputType = context.GetReturnType<IRType>();
+        if (TargetCostTensor.TryFromType(lhs, out var lhsTensor)
+            && TargetCostTensor.TryFromType(rhs, out var rhsTensor)
+            && TargetCostTensor.TryFromType(outputType, out var outputTensor)
+            && context.TargetCostModel.TryGetMatMulCost(new(lhsTensor, rhsTensor, outputTensor, target.OutputDataType), out var targetCost))
+        {
+            return targetCost;
+        }
 
         uint macPerElement = 1;
         if (lhs is TensorType { Shape: RankedShape lhsShape })

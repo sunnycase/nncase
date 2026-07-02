@@ -81,6 +81,11 @@ public class VectorizedCastEvaluator : IEvaluator<VectorizedCast>, ITypeInferenc
     {
         var input = context.GetArgumentType<IRType>(target, VectorizedCast.Input);
         var output = context.GetReturnType<IRType>();
+        if (TargetOpCostModelUtility.TryGetTargetElementwiseCost(context.TargetCostModel, "vectorized_cast", [input], output, workPerElement: 1.0, out var targetCost))
+        {
+            return targetCost;
+        }
+
         var macPerElement = 4;
         return new()
         {

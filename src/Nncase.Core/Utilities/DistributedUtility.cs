@@ -56,9 +56,10 @@ public static class DistributedUtility
             {
                 var axis = splitsAxes[ti];
                 var divisor = axis.Select(a => placement.Hierarchy[a]).Aggregate(1, (a, b) => a * b);
-                if (axis.All(a => placement.Hierarchy[a] > 1) && divisor > 1 && IsDivideBy(maxShape[di], divisor, tensorType.Shape[di].IsFixed))
+                var dim = tensorType.Shape[di];
+                if (axis.All(a => placement.Hierarchy[a] > 1) && divisor > 1 && IsDivideBy(maxShape[di], divisor, dim.IsFixed))
                 {
-                    policy.Add(SBP.S(axis.ToArray(), (int)MathUtility.CeilDiv(maxShape[di], divisor)));
+                    policy.Add(SBP.S(axis.ToArray(), GetSplitGranularity(dim, maxShape[di], divisor)));
                 }
             }
 
@@ -390,36 +391,78 @@ public static class DistributedUtility
         return unraveledIndex;
     }
 
-    public static (long[] Offset, long[] Shape) GetLocalOffsetAndShape(DistributedType distributedType, int[] shardIndex)
+    public static (Dimension[] Offset, Dimension[] Shape) GetLocalOffsetAndShape(DistributedType distributedType, int[] shardIndex, DivideFlags divideFlags = DivideFlags.None)
+        => GetLocalOffsetAndShape(distributedType, shardIndex.Select(index => (Dimension)index).ToArray(), divideFlags);
+
+    public static (Dimension[] Offset, Dimension[] Shape) GetLocalOffsetAndShape(DistributedType distributedType, Dimension[] shardIndex, DivideFlags divideFlags = DivideFlags.None)
     {
-        var globalShape = CompilerServices.GetMaxShape(distributedType.TensorType.Shape);
-        var offset = new long[distributedType.TensorType.Shape.Rank];
-        var shape = new long[distributedType.TensorType.Shape.Rank];
+        var globalShape = divideFlags.HasFlag(DivideFlags.MaxShape)
+            ? CompilerServices.GetMaxShape(distributedType.TensorType.Shape).Select(dim => (Dimension)dim).ToArray()
+            : distributedType.TensorType.Shape.ToArray();
+        var offset = new Dimension[distributedType.TensorType.Shape.Rank];
+        var shape = new Dimension[distributedType.TensorType.Shape.Rank];
         for (int axis = 0; axis < offset.Length; axis++)
         {
             var policy = distributedType.AxisPolicies[axis];
             var splits = policy is SBPSplit s
-            ? s.Axes.Select(td => (Placement: td, DeviceIndex: shardIndex[td], DeviceDim: distributedType.Placement.Hierarchy[td])).ToArray()
-            : Array.Empty<(int Placement, int DeviceIndex, int DeviceDim)>();
+                ? s.Axes.Select(td => (Placement: td, DeviceIndex: shardIndex[td], DeviceDim: distributedType.Placement.Hierarchy[td])).ToArray()
+                : Array.Empty<(int Placement, Dimension DeviceIndex, int DeviceDim)>();
             if (splits.Any())
             {
                 var subHierarchies = splits.Select(x => x.DeviceDim).ToArray();
-                var subHierarchyStrides = TensorUtilities.GetDefaultStrides(subHierarchies);
-                var subHierarchySize = (int)TensorUtilities.GetProduct(subHierarchies);
+                var subHierarchyStrides = TensorUtilities.GetDefaultStrides(subHierarchies).Select(stride => (Dimension)stride).ToArray();
+                var subHierarchySize = TensorUtilities.GetProduct(subHierarchies);
                 var subShardIndex = splits.Select(x => x.DeviceIndex).ToArray();
                 var linearIndex = TensorUtilities.GetLinearOffset(subHierarchyStrides, subShardIndex);
-                var localDim = ((SBPSplit)policy).Granularity is not null ? (long)((SBPSplit)policy).Granularity!.Metadata.Range!.Value.Max : MathUtility.CeilDiv(globalShape[axis], subHierarchySize);
+                var localDim = ((SBPSplit)policy).Granularity is { } granularity
+                    ? divideFlags.HasFlag(DivideFlags.MaxShape) ? GetMaxDimension(granularity) : granularity
+                    : divideFlags.HasFlag(DivideFlags.FloorDiv) ? globalShape[axis] / subHierarchySize : Dimension.CeilDiv(globalShape[axis], subHierarchySize);
                 offset[axis] = linearIndex * localDim;
-                shape[axis] = Math.Max(0, Math.Min(localDim, globalShape[axis] - offset[axis]));
+                shape[axis] = CanUseFullLocalDim(globalShape[axis], localDim, subHierarchySize)
+                    ? localDim
+                    : Dimension.Max(0, Dimension.Min(localDim, globalShape[axis] - offset[axis]));
             }
             else
             {
-                offset[axis] = 0;
+                offset[axis] = 0L;
                 shape[axis] = globalShape[axis];
             }
         }
 
         return (offset, shape);
+    }
+
+    private static Dimension GetMaxDimension(Dimension dimension)
+    {
+        if (dimension.IsFixed)
+        {
+            return dimension;
+        }
+
+        if (dimension.Metadata.Range is { } range &&
+            double.IsFinite(range.Max) &&
+            range.Max >= long.MinValue &&
+            range.Max <= long.MaxValue)
+        {
+            return checked((long)Math.Ceiling(range.Max));
+        }
+
+        return dimension;
+    }
+
+    private static Dimension GetSplitGranularity(Dimension dim, long maxDim, int divisor)
+        => dim.IsFixed ? (Dimension)(int)MathUtility.CeilDiv(maxDim, divisor) : Dimension.CeilDiv(dim, divisor);
+
+    private static bool CanUseFullLocalDim(Dimension globalDim, Dimension localDim, int shardCount)
+    {
+        if (!globalDim.IsFixed || !localDim.IsFixed)
+        {
+            return false;
+        }
+
+        var globalValue = globalDim.FixedValue;
+        var localValue = localDim.FixedValue;
+        return localValue > 0 && globalValue >= localValue * shardCount && globalValue % localValue == 0;
     }
 
     private static (RankedShape Tile, RankedShape Shape) GetDividedTile(DistributedType distributedType, DivideFlags divideFlags = DivideFlags.None)
@@ -432,7 +475,7 @@ public static class DistributedUtility
             {
                 if (split.Granularity is not null)
                 {
-                    tiles[d] = split.Granularity;
+                    tiles[d] = divideFlags.HasFlag(DivideFlags.MaxShape) ? GetMaxDimension(split.Granularity) : split.Granularity;
                 }
                 else
                 {

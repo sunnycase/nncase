@@ -909,7 +909,7 @@ public sealed class UnitTestCUDAKernels : TestClassBase
         var posts = new List<Expr>();
         foreach (var post in vectorizedPosts)
         {
-            var context = new Passes.RunPassContext();
+            var context = new Passes.RunPassContext { Driver = new DataflowPass() };
             var newPost = CompilerServices.Rewrite(post, [packRule], context);
             if (context.IsMutated)
             {
@@ -1240,7 +1240,7 @@ public sealed class UnitTestCUDAKernels : TestClassBase
         var posts = new List<Expr>();
         foreach (var post in vectorizedPosts)
         {
-            var context = new Passes.RunPassContext();
+            var context = new Passes.RunPassContext { Driver = new DataflowPass() };
             var newPost = CompilerServices.Rewrite(post, [packRule], context);
             if (context.IsMutated)
             {

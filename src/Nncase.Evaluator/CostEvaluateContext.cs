@@ -21,6 +21,7 @@ internal sealed class CostEvaluateContext : ICostEvaluateContext
     {
         _exprMemo = exprMemo;
         CompileOptions = compileOptions;
+        TargetCostModel = TargetOpCostModelUtility.GetTargetCostModel(compileOptions);
     }
 
     public Call CurrentCall
@@ -30,6 +31,8 @@ internal sealed class CostEvaluateContext : ICostEvaluateContext
     }
 
     public CompileOptions CompileOptions { get; }
+
+    public ITargetOpCostModel TargetCostModel { get; }
 
     public T GetArgument<T>(Op op, ParameterInfo parameter)
       where T : BaseFunction

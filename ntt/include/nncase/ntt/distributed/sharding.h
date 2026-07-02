@@ -58,13 +58,13 @@ template <class TGranularity, size_t... Axes> struct split {
     TGranularity granularity;
     static constexpr auto axes = fixed_shape_v<Axes...>;
 
-    template <class Mesh> constexpr auto divider() {
+    template <class Mesh> constexpr auto divider() const noexcept {
         return Mesh::shape.select(axes).length();
     }
 
     template <class Mesh, Dimension TDim, ShardIndex<Mesh> TShardIndex>
     constexpr auto global_offset(const TDim &global_dim,
-                                 const TShardIndex &shard_index) noexcept {
+                                 const TShardIndex &shard_index) const noexcept {
         constexpr auto submesh_shape =
             fixed_shape_v<Mesh::shape[fixed_dim_v<Axes>]...>;
         auto subshard_index = make_shape(shard_index[fixed_dim_v<Axes>]...);
@@ -77,7 +77,7 @@ template <class TGranularity, size_t... Axes> struct split {
 
     template <class Mesh, Dimension TDim>
     constexpr auto
-    try_shard_dim_without_shard_index(const TDim &global_dim) noexcept {
+    try_shard_dim_without_shard_index(const TDim &global_dim) const noexcept {
         if constexpr (std::is_same_v<TGranularity, std::nullptr_t>) {
             const auto remainder = global_dim % divider<Mesh>();
             return ntt::where(remainder == dim_zero,
@@ -90,7 +90,7 @@ template <class TGranularity, size_t... Axes> struct split {
 
     template <class Mesh, Dimension TDim, ShardIndex<Mesh> TShardIndex>
     constexpr auto shard_dim(const TDim &global_dim,
-                             const TShardIndex &shard_index) noexcept {
+                             const TShardIndex &shard_index) const noexcept {
         const auto shard_dim_v =
             try_shard_dim_without_shard_index<Mesh>(global_dim);
         return ntt::where(shard_dim_v != -1_dim, shard_dim_v, [&] {
@@ -101,7 +101,7 @@ template <class TGranularity, size_t... Axes> struct split {
     }
 
     template <class Mesh, Dimension TDim>
-    constexpr auto max_shard_dim(const TDim &global_dim) noexcept {
+    constexpr auto max_shard_dim(const TDim &global_dim) const noexcept {
         if constexpr (std::is_same_v<TGranularity, std::nullptr_t>) {
             return ntt::ceil_div(global_dim, divider<Mesh>());
         } else {
@@ -150,9 +150,9 @@ template <class Mesh, class... AxisPolicies> struct sharding {
     global_offset(const GlobalShape &global_shape,
                   const TShardIndex &shard_index) const noexcept {
         auto get_dim = [&, this]<size_t Axis> {
-            return ntt::get<Axis>(axis_policies)
-                .template global_offset<Mesh>(global_shape[fixed_dim_v<Axis>],
-                                              shard_index);
+            auto policy = ntt::get<Axis>(axis_policies);
+            return policy.template global_offset<Mesh>(
+                global_shape[fixed_dim_v<Axis>], shard_index);
         };
         auto get_all_dims = [&]<size_t... Is>(std::index_sequence<Is...>) {
             return make_shape(get_dim.template operator()<Is>()...);
@@ -164,9 +164,9 @@ template <class Mesh, class... AxisPolicies> struct sharding {
     constexpr auto shard_shape(const GlobalShape &global_shape,
                                const TShardIndex &shard_index) const noexcept {
         auto get_dim = [&, this]<size_t Axis> {
-            return ntt::get<Axis>(axis_policies)
-                .template shard_dim<Mesh>(global_shape[fixed_dim_v<Axis>],
-                                          shard_index);
+            auto policy = ntt::get<Axis>(axis_policies);
+            return policy.template shard_dim<Mesh>(
+                global_shape[fixed_dim_v<Axis>], shard_index);
         };
         auto get_all_dims = [&]<size_t... Is>(std::index_sequence<Is...>) {
             return make_shape(get_dim.template operator()<Is>()...);
@@ -256,8 +256,9 @@ constexpr auto local_shard_dim(const TSharding &sharding,
 
     using mesh_type = typename TSharding::mesh_type;
     const auto local_index = mesh_type::local_index();
-    return ntt::get<Axis>(sharding.axis_policies)
-        .template shard_dim<typename TSharding::mesh_type>(global_shape[fixed_dim_v<Axis>], local_index);
+    auto policy = ntt::get<Axis>(sharding.axis_policies);
+    return policy.template shard_dim<typename TSharding::mesh_type>(
+        global_shape[fixed_dim_v<Axis>], local_index);
 }
 
 template <class Sharding, Shape GlobalShape>

@@ -2,6 +2,7 @@
 // Licensed under the Apache license. See LICENSE file in the project root for full license information.
 
 using Nncase.IR;
+using Nncase.IR.Shapes;
 using Nncase.Targets;
 using Nncase.Utilities;
 
@@ -34,7 +35,7 @@ internal sealed class PyNTTFunctionBuilder
             return PyNTTRDataBundle.Empty;
         }
 
-        var targetOptions = PyNTTTargetOptionsUtility.Normalize(_compileOptions);
+        var targetOptions = PyNTTTargetOptionsUtility.Get(_compileOptions);
         var rdata = SerializeRData(primFunction.SchedResult.Rdatas);
         var threadLocalRdatas = SerializeLocalRData(primFunction.SchedResult.ThreadLocalRdatas, targetOptions, "t");
         var warpLocalRdatas = SerializeLocalRData(primFunction.SchedResult.WarpLocalRdatas, targetOptions, "w");
@@ -113,19 +114,13 @@ internal sealed class PyNTTFunctionBuilder
                 var tensor = ((TensorConst)@const).Value;
                 var distributedType = (DistributedType)@const.CheckedType;
                 var size = range.Max - range.Min;
-                var dividedDims = DistributedUtility.GetDividedTensorType(distributedType).Shape.ToValueArray();
+                var dividedDims = DistributedUtility.GetDividedTensorType(distributedType, DistributedUtility.DivideFlags.MaxShape).Shape.ToValueArray();
                 var localStrides = TensorUtilities.GetDefaultStrides(dividedDims);
                 var shardIndex = PyNTTRDataUtility.GetScopedShardIndex(shard, targetOptions, scopeName);
-                (var localOffset, var localShape) = DistributedUtility.GetLocalOffsetAndShape(distributedType, shardIndex);
-                var linearOffset = TensorUtilities.GetLinearOffset(tensor.Strides, localOffset);
-
-                if ((ulong)TensorUtilities.GetProduct(localShape) * (ulong)tensor.ElementType.SizeInBytes > size)
-                {
-                    throw new InvalidDataException("The PyNTT local rdata buffer size does not match the scheduled range.");
-                }
-
-                stream.Position = checked((long)range.Min);
-                tensor.Serialize(stream, linearOffset, localShape, localStrides);
+                (var localOffsetExpr, var localShapeExpr) = DistributedUtility.GetLocalOffsetAndShape(distributedType, shardIndex, DistributedUtility.DivideFlags.MaxShape);
+                var localOffset = new RankedShape(localOffsetExpr).ToValueArray();
+                var localShape = new RankedShape(localShapeExpr).ToValueArray();
+                SerializeLocalTensorShard(stream, tensor, range, localOffset, localShape, localStrides);
             }
 
             var finalizedPayload = FinalizePayload(payload);
@@ -142,6 +137,53 @@ internal sealed class PyNTTFunctionBuilder
         }
 
         return (payloads, poolSize);
+    }
+
+    private void SerializeLocalTensorShard(
+        Stream stream,
+        Tensor tensor,
+        ValueRange<ulong> range,
+        long[] localOffset,
+        long[] localShape,
+        long[] localStrides)
+    {
+        var size = checked((long)(range.Max - range.Min));
+        var elementSize = tensor.ElementType.SizeInBytes;
+        var payload = new byte[checked((int)size)];
+        var localElementCount = TensorUtilities.GetProduct(localShape);
+        var localIndex = new long[localShape.Length];
+        var sourceIndex = new long[localShape.Length];
+        var sourceBytes = tensor.BytesBuffer;
+
+        for (long linear = 0; linear < localElementCount; linear++)
+        {
+            TensorUtilities.UnravelIndex(linear, localShape, localIndex);
+            for (int axis = 0; axis < localIndex.Length; axis++)
+            {
+                sourceIndex[axis] = localOffset[axis] + localIndex[axis];
+            }
+
+            var sourceElementOffset = TensorUtilities.GetLinearOffset(tensor.Strides, sourceIndex);
+            var destinationElementOffset = TensorUtilities.GetLinearOffset(localStrides, localIndex);
+            var sourceByteOffset = checked((int)(sourceElementOffset * elementSize));
+            var destinationByteOffset = checked((int)(destinationElementOffset * elementSize));
+
+            if (sourceByteOffset < 0 || sourceByteOffset + elementSize > sourceBytes.Length)
+            {
+                throw new InvalidDataException($"The PyNTT local rdata source slice is out of range: source={sourceByteOffset}, element_size={elementSize}, tensor_bytes={sourceBytes.Length}.");
+            }
+
+            if (destinationByteOffset < 0 || destinationByteOffset + elementSize > payload.Length)
+            {
+                throw new InvalidDataException($"The PyNTT local rdata destination slice is out of range: destination={destinationByteOffset}, element_size={elementSize}, payload_bytes={payload.Length}.");
+            }
+
+            sourceBytes.Slice(sourceByteOffset, elementSize)
+                .CopyTo(payload.AsSpan(destinationByteOffset, elementSize));
+        }
+
+        stream.Position = checked((long)range.Min);
+        stream.Write(payload);
     }
 
     private PayloadStream CreatePayloadStream(long poolSize, string label)

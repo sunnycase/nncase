@@ -33,7 +33,7 @@ import warnings
 
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
 import _nncase
-from _nncase import RuntimeTensor, RTValue, TensorDesc, Simulator, NTTTargetOptions, NocArchitecture, HierarchyKind, HuggingFaceOptions, MemoryAccessArchitecture, PagedKVCacheDimKind, AttentionConfig, PagedAttentionConfig, PagedAttentionKVCache, PagedAttentionScheduler
+from _nncase import RuntimeTensor, RTValue, TensorDesc, Simulator, NTTTargetOptions, PyNTTTargetOptions, NocArchitecture, HierarchyKind, HuggingFaceOptions, MemoryAccessArchitecture, PagedKVCacheDimKind, AttentionConfig, PagedAttentionConfig, PagedAttentionKVCache, PagedAttentionScheduler
 
 
 def _initialize():
@@ -158,12 +158,12 @@ class Compiler:
     def __init__(self, compile_options: CompileOptions) -> None:
         self._compile_options = _nncase.CompileOptions()
         self.__process_compile_options(compile_options)
-        self._session = _nncase.CompileSession(self._target, self._compile_options)
-        self._compiler = self._session.compiler
         self._quantize_options = None
         self._shape_bucket_options = _nncase.ShapeBucketOptions()
         self.init_shape_bucket_options(compile_options)
         self.init_target_options(compile_options)
+        self._session = _nncase.CompileSession(self._target, self._compile_options)
+        self._compiler = self._session.compiler
 
     def init_shape_bucket_options(self, compile_options: CompileOptions) -> None:
         self._shape_bucket_options = _nncase.ShapeBucketOptions()
@@ -171,12 +171,13 @@ class Compiler:
         self._shape_bucket_options.enable = compile_options.shape_bucket_enable
         self._shape_bucket_options.range_info = compile_options.shape_bucket_range_info
         self._shape_bucket_options.segments_count = compile_options.shape_bucket_segments_count
+        self._shape_bucket_options.segment_ranges = compile_options.shape_bucket_segments
         self._shape_bucket_options.fix_var_map = compile_options.shape_bucket_fix_var_map
         self._compile_options.shape_bucket_options = self._shape_bucket_options
 
     def init_target_options(self, compile_options: CompileOptions) -> None:
         if hasattr(compile_options, "target_options") and compile_options.target_options is not None:
-            self._compile_options.set_cpu_target_options(compile_options.target_options)
+            self._compile_options.set_target_options(compile_options.target_options)
 
     def compile(self) -> None:
         self._compiler.compile()
@@ -399,6 +400,7 @@ class CompileOptions:
     shape_bucket_enable: bool
     shape_bucket_range_info: dict
     shape_bucket_segments_count: int
+    shape_bucket_segments: dict
     shape_bucket_fix_var_map: dict
     target_options: object
 
@@ -422,6 +424,7 @@ class CompileOptions:
         self.shape_bucket_enable = False
         self.shape_bucket_range_info = {}
         self.shape_bucket_segments_count = 2
+        self.shape_bucket_segments = {}
         self.shape_bucket_fix_var_map = {}
         self.target_options = None
 
@@ -431,6 +434,7 @@ class ShapeBucketOptions:
     var_map: dict
     range_info: dict
     segments_count: int
+    segment_ranges: dict
     fix_var_map: dict
 
     def __init__(self) -> None:
@@ -438,6 +442,7 @@ class ShapeBucketOptions:
         self.var_map = {}
         self.range_info = {}
         self.segments_count = 2
+        self.segment_ranges = {}
         self.fix_var_map = {}
 
 

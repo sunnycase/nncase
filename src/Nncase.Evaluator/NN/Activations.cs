@@ -549,7 +549,14 @@ public class SwishEvaluator : IEvaluator<Swish>, ITypeInferencer<Swish>, ICostEv
     /// <inheritdoc/>
     public Cost Visit(ICostEvaluateContext context, Swish target)
     {
+        var inputType = context.GetArgumentType<IRType>(target, Swish.Input);
+        var betaType = context.GetArgumentType<IRType>(target, Swish.Beta);
         var outputType = context.GetReturnType<IRType>();
+        if (TargetOpCostModelUtility.TryGetTargetElementwiseCost(context.TargetCostModel, "swish", [inputType, betaType], outputType, workPerElement: 8.0, out var targetCost))
+        {
+            return targetCost;
+        }
+
         var macPerElement = 256;
         return new()
         {

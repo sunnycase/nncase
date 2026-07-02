@@ -4,11 +4,12 @@
 using System.Globalization;
 using System.Reactive;
 using Nncase.IR;
+using Nncase.IR.Distributed;
 using Nncase.IR.Shapes;
 
 namespace Nncase.CodeGen.PyNTT;
 
-public sealed record PyNTTDimExpression(string PythonExpression, string TritonExpression, long? FixedValue = null)
+public sealed record PyNTTDimExpression(string PythonExpression, string TritonExpression, long? FixedValue = null, long? RangeMin = null, long? RangeMax = null)
 {
     public static PyNTTDimExpression Zero { get; } = new("0", "0", 0);
 
@@ -20,6 +21,10 @@ public sealed record PyNTTDimExpression(string PythonExpression, string TritonEx
 
     public bool IsFixedNonOne => FixedValue.HasValue && FixedValue.Value != 1;
 
+    public long? MinValue => FixedValue ?? RangeMin;
+
+    public long? MaxValue => FixedValue ?? RangeMax;
+
     public object ToPythonLiteral() => FixedValue.HasValue ? FixedValue.Value : PythonExpression;
 
     public override string ToString() => TritonExpression;
@@ -29,14 +34,39 @@ internal sealed class PyNTTDimExpressionEmitter : ExprFunctor<PyNTTDimExpression
 {
     private readonly Action<string>? _registerRuntimeScalar;
     private readonly Func<string, string> _formatRuntimeScalar;
+    private readonly string _threadIdExpression;
 
-    public PyNTTDimExpressionEmitter(Action<string>? registerRuntimeScalar = null, Func<string, string>? formatRuntimeScalar = null)
+    public PyNTTDimExpressionEmitter(Action<string>? registerRuntimeScalar = null, Func<string, string>? formatRuntimeScalar = null, string? threadIdExpression = null)
     {
         _registerRuntimeScalar = registerRuntimeScalar;
         _formatRuntimeScalar = formatRuntimeScalar ?? (name => name);
+        _threadIdExpression = threadIdExpression ?? "pyntt_thread_id";
     }
 
-    public PyNTTDimExpression Emit(Dimension dimension) => Visit(dimension);
+    public PyNTTDimExpression Emit(Dimension dimension)
+    {
+        var expression = Visit(dimension);
+        if (expression.FixedValue.HasValue || dimension.Metadata.Range is not { } range)
+        {
+            return expression;
+        }
+
+        if (!double.IsFinite(range.Min) ||
+            !double.IsFinite(range.Max) ||
+            range.Min < long.MinValue ||
+            range.Min > long.MaxValue ||
+            range.Max < long.MinValue ||
+            range.Max > long.MaxValue)
+        {
+            return expression;
+        }
+
+        return expression with
+        {
+            RangeMin = checked((long)Math.Floor(range.Min)),
+            RangeMax = checked((long)Math.Ceiling(range.Max)),
+        };
+    }
 
     protected override PyNTTDimExpression VisitDimAbs(DimAbs expr)
     {
@@ -183,6 +213,9 @@ internal sealed class PyNTTDimExpressionEmitter : ExprFunctor<PyNTTDimExpression
         var formattedName = _formatRuntimeScalar(name);
         return new(formattedName, formattedName);
     }
+
+    protected override PyNTTDimExpression VisitThreadIdDim(ThreadIdDim expr)
+        => new(_threadIdExpression, _threadIdExpression);
 
     private static PyNTTDimExpression BuildBinaryChain(IReadOnlyList<PyNTTDimExpression> parts, string op, long identity)
     {

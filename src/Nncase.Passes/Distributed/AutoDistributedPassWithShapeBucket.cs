@@ -54,7 +54,8 @@ public sealed partial class AutoDistributedWithShapeBucketPass : FunctionPass
     {
         var shapeBucketOptions = _compileOptions.ShapeBucketOptions;
         var dimVars = IRHelpers.GetDynamicDimVars();
-        if (shapeBucketOptions.SegmentsCount == 0 || dimVars.Count == 0)
+        var segmentsCount = GetShapeBucketSegmentsCount();
+        if (segmentsCount == 0 || dimVars.Count == 0)
         {
             // If no segments or no dynamic dim vars, we can skip the shape bucket pass
             var rewriter = new AutoDistributedRewriter(_compileOptions, targetOptions, AutoDistributedPhase.Final, _moduleKind, _bidirectional);
@@ -75,10 +76,11 @@ public sealed partial class AutoDistributedWithShapeBucketPass : FunctionPass
             }
 
             var segmentFunctions = new List<(Function SegmentFunction, Dictionary<DimVar, DimVar> DimVars)>();
-            for (int segmentIndex = 0; segmentIndex < shapeBucketOptions.SegmentsCount; segmentIndex++)
+            ValidateManualSegmentRanges(segmentsCount);
+            for (int segmentIndex = 0; segmentIndex < segmentsCount; segmentIndex++)
             {
                 var newDimVars = (from dimVar in dimVars
-                                  let newRange = ShapeUtility.GetDimSegmentRange(dimVar.Metadata.Range!.Value, segmentIndex, shapeBucketOptions.SegmentsCount)
+                                  let newRange = GetDimSegmentRange(dimVar, segmentIndex, segmentsCount)
                                   select new KeyValuePair<DimVar, DimVar>(
                                       dimVar,
                                       dimVar.With(range: newRange))).ToDictionary(kvp => kvp.Key, kvp => kvp.Value, (IEqualityComparer<DimVar>)ReferenceEqualityComparer.Instance);
@@ -89,6 +91,78 @@ public sealed partial class AutoDistributedWithShapeBucketPass : FunctionPass
             }
 
             return BuildMainFunction(function, segmentFunctions);
+        }
+
+        int GetShapeBucketSegmentsCount()
+        {
+            if (shapeBucketOptions.SegmentRanges.Count == 0)
+            {
+                return shapeBucketOptions.SegmentsCount;
+            }
+
+            var segmentCounts = shapeBucketOptions.SegmentRanges
+                .Select(pair => pair.Value.Length)
+                .Distinct()
+                .ToArray();
+            if (segmentCounts.Length != 1)
+            {
+                throw new InvalidOperationException($"Shape bucket manual segment ranges must have the same number of bounds, got [{string.Join(", ", segmentCounts)}].");
+            }
+
+            return segmentCounts[0];
+        }
+
+        void ValidateManualSegmentRanges(int expectedSegmentsCount)
+        {
+            foreach (var dimVar in dimVars)
+            {
+                if (!shapeBucketOptions.SegmentRanges.TryGetValue(dimVar.Name, out var upperBounds))
+                {
+                    continue;
+                }
+
+                if (upperBounds.Length != expectedSegmentsCount)
+                {
+                    throw new InvalidOperationException($"Shape bucket manual segment range for {dimVar.Name} has {upperBounds.Length} bounds, expected {expectedSegmentsCount}.");
+                }
+
+                var fullRange = dimVar.Metadata.Range!.Value;
+                var min = (int)fullRange.Min;
+                var max = (int)fullRange.Max;
+                var previous = min - 1;
+                foreach (var upperBound in upperBounds)
+                {
+                    if (upperBound <= previous)
+                    {
+                        throw new InvalidOperationException($"Shape bucket manual segment range for {dimVar.Name} must be strictly increasing, got [{string.Join(", ", upperBounds)}].");
+                    }
+
+                    if (upperBound < min || upperBound > max)
+                    {
+                        throw new InvalidOperationException($"Shape bucket manual segment range for {dimVar.Name} must stay within [{min}, {max}], got [{string.Join(", ", upperBounds)}].");
+                    }
+
+                    previous = upperBound;
+                }
+
+                if (upperBounds[^1] != max)
+                {
+                    throw new InvalidOperationException($"Shape bucket manual segment range for {dimVar.Name} must end at range max {max}, got {upperBounds[^1]}.");
+                }
+            }
+        }
+
+        ValueRange<double> GetDimSegmentRange(DimVar dimVar, int segmentIndex, int expectedSegmentsCount)
+        {
+            var fullRange = dimVar.Metadata.Range!.Value;
+            if (!shapeBucketOptions.SegmentRanges.TryGetValue(dimVar.Name, out var upperBounds))
+            {
+                return ShapeUtility.GetDimSegmentRange(fullRange, segmentIndex, expectedSegmentsCount);
+            }
+
+            var segmentStart = segmentIndex == 0 ? fullRange.Min : upperBounds[segmentIndex - 1] + 1;
+            var segmentEnd = upperBounds[segmentIndex];
+            return new(segmentStart, segmentEnd);
         }
     }
 

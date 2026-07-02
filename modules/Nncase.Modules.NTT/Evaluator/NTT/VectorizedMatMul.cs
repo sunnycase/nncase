@@ -98,6 +98,10 @@ public sealed class VectorizedMatMulEvaluator : IEvaluator<VectorizedMatMul>, IT
         var lhs = context.GetArgumentType<IRType>(target, VectorizedMatMul.Lhs);
         var rhs = context.GetArgumentType<IRType>(target, VectorizedMatMul.Rhs);
         var outputType = context.GetReturnType<IRType>();
+        if (TryGetTargetCost(context, target, lhs, rhs, outputType, out var targetCost))
+        {
+            return targetCost;
+        }
 
         uint macPerElement = 1;
         if (lhs is TensorType { Shape: Shape lhsShape })
@@ -118,5 +122,20 @@ public sealed class VectorizedMatMulEvaluator : IEvaluator<VectorizedMatMul>, IT
             [CostFactorNames.MemoryStore] = CostUtility.GetMemoryAccess(outputType),
             [CostFactorNames.CPUCycles] = CostUtility.GetCPUCycles(outputType, macPerElement),
         };
+    }
+
+    private bool TryGetTargetCost(ICostEvaluateContext context, VectorizedMatMul target, IRType lhs, IRType rhs, IRType outputType, out Cost cost)
+    {
+        if (target.TransposeA
+            || !TargetCostTensor.TryFromType(lhs, out var lhsTensor)
+            || !TargetCostTensor.TryFromType(rhs, out var rhsTensor)
+            || !TargetCostTensor.TryFromType(outputType, out var outputTensor)
+            || !context.TargetCostModel.TryGetMatMulCost(new(lhsTensor, rhsTensor, outputTensor, target.OutputDataType), out cost))
+        {
+            cost = Cost.Zero;
+            return false;
+        }
+
+        return true;
     }
 }

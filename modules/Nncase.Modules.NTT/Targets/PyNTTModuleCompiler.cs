@@ -24,7 +24,7 @@ public sealed class PyNTTModuleCompiler : INTTModuleCompiler
     public int Lane => 16;
 
     /// <inheritdoc/>
-    public int Nr => 1;
+    public int Nr => 4;
 
     /// <inheritdoc/>
     public IModuleBuilder CreateModuleBuilder(CompileOptions options) => new PyNTTModuleBuilder(ModuleKind, options);
@@ -73,6 +73,7 @@ public sealed class PyNTTModuleCompiler : INTTModuleCompiler
                 or IR.NN.Swish
                 or IR.Math.MatMul
                 or IR.NTT.VectorizedMatMul
+                or IR.NTT.PackedMatMul
                 or IR.Math.Reduce { ReduceOp: ReduceOp.Sum or ReduceOp.Mean or ReduceOp.Max or ReduceOp.Min }
                 or IR.NTT.VectorizedReduce { ReduceOp: ReduceOp.Sum or ReduceOp.Mean or ReduceOp.Max or ReduceOp.Min }
                 or IR.NN.Softmax

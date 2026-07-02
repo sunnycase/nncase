@@ -152,7 +152,7 @@ internal sealed class ScriptPrintVisitor : ExprFunctor<IPrintSymbol, string>
                 }
                 else
                 {
-                    shape[r] = split.Granularity.FixedValue;
+                    shape[r] = CompilerServices.GetMaxShape(new RankedShape(new[] { split.Granularity }))[0];
                 }
             }
         }

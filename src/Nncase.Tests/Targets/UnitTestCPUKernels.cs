@@ -1047,9 +1047,9 @@ public sealed class UnitTestCPUKernels : TestClassBase
     }
 
     [Theory]
-    [InlineData(new object[] { new long[] { 1, 3, 2 }, new long[] { 2, 64 }, false, false, new[] { 1 }, 0 })]
-    [InlineData(new object[] { new long[] { 1, 3, 2 }, new long[] { 2, 64 }, false, true, new[] { 1 }, 1 })]
-    [InlineData(new object[] { new long[] { 1, 2 }, new long[] { 2, 64 }, false, true, new[] { 1 }, 2 })]
+    [InlineData(new object[] { new long[] { 1, 3, 4 }, new long[] { 4, 128 }, false, false, new[] { 1 }, 0 })]
+    [InlineData(new object[] { new long[] { 1, 3, 4 }, new long[] { 4, 128 }, false, true, new[] { 1 }, 1 })]
+    [InlineData(new object[] { new long[] { 1, 4 }, new long[] { 4, 128 }, false, true, new[] { 1 }, 2 })]
     public async Task TestPackedMatMul(long[] lhsShape, long[] rhsShape, bool constA, bool constB, int[] hierarchy, int count)
     {
         var targetOptions = (NTTTargetOptions)CompileOptions.TargetOptions;
@@ -1085,7 +1085,7 @@ public sealed class UnitTestCPUKernels : TestClassBase
         var posts = new List<Expr>();
         foreach (var post in vectorizedPosts)
         {
-            var context = new Passes.RunPassContext();
+            var context = new Passes.RunPassContext { Driver = new DataflowPass() };
             var newPost = CompilerServices.Rewrite(post, [packRule], context);
             if (context.IsMutated)
             {
@@ -1093,6 +1093,60 @@ public sealed class UnitTestCPUKernels : TestClassBase
             }
         }
 
+        Assert.NotEmpty(posts);
+        await RunCases($"Theory{count}", feedDict, posts);
+    }
+
+    [Theory]
+    [InlineData(new object[] { new long[] { 1, 64 }, new long[] { 64, 128 }, false, true, new[] { 1 }, Runtime.TypeCode.Float16, Runtime.TypeCode.Float16, 0 })]
+    [InlineData(new object[] { new long[] { 2, 64 }, new long[] { 64, 128 }, false, true, new[] { 1 }, Runtime.TypeCode.Float16, Runtime.TypeCode.Float16, 1 })]
+    [InlineData(new object[] { new long[] { 1, 1024 }, new long[] { 1024, 128 }, false, true, new[] { 1 }, Runtime.TypeCode.Float16, Runtime.TypeCode.Float16, 2 })]
+    [InlineData(new object[] { new long[] { 1, 1024 }, new long[] { 1024, 4096 }, false, true, new[] { 1 }, Runtime.TypeCode.Float16, Runtime.TypeCode.Float16, 3 })]
+    [InlineData(new object[] { new long[] { 1, 1024 }, new long[] { 1024, 19072 }, false, true, new[] { 1 }, Runtime.TypeCode.Float16, Runtime.TypeCode.Float16, 4 })]
+    [InlineData(new object[] { new long[] { 1, 64 }, new long[] { 64, 128 }, false, true, new[] { 1 }, Runtime.TypeCode.BFloat16, Runtime.TypeCode.BFloat16, 5 })]
+    [InlineData(new object[] { new long[] { 2, 64 }, new long[] { 64, 128 }, false, true, new[] { 1 }, Runtime.TypeCode.BFloat16, Runtime.TypeCode.BFloat16, 6 })]
+    public async Task TestQwenPackedMatMul(long[] lhsShape, long[] rhsShape, bool constA, bool constB, int[] hierarchy, Runtime.TypeCode inType, Runtime.TypeCode outType, int count)
+    {
+        var targetOptions = (NTTTargetOptions)CompileOptions.TargetOptions;
+        targetOptions.Hierarchies[0] = hierarchy;
+        targetOptions.HierarchyNames = string.Join(string.Empty, "cbt".Skip(3 - hierarchy.Length));
+        targetOptions.HierarchyLatencies = Enumerable.Repeat(1, hierarchy.Length).ToArray();
+        targetOptions.HierarchyBandWidths = Enumerable.Repeat(1, hierarchy.Length).ToArray();
+        var dataType = DataType.FromTypeCode(inType);
+        var lhsTensor = IR.F.Random.Normal(dataType, 0, 1, 1, lhsShape).Evaluate().AsTensor();
+        var rhsTensor = IR.F.Random.Normal(dataType, 0, 1, 3, rhsShape).Evaluate().AsTensor();
+        Expr lhs = constA ? lhsTensor : new Var(new TensorType(dataType, lhsShape));
+        Expr rhs = constB ? rhsTensor : new Var(new TensorType(dataType, rhsShape));
+        var pre = IR.F.Tensors.MatMul(lhs, rhs, DataType.FromTypeCode(outType));
+
+        var feedDict = new Dictionary<IVar, IValue>();
+        if (!constA)
+        {
+            feedDict.Add((Var)lhs, Value.FromTensor(lhsTensor));
+        }
+
+        if (!constB)
+        {
+            feedDict.Add((Var)rhs, Value.FromTensor(rhsTensor));
+        }
+
+        var rule = new Passes.Rules.NTT.VectorizeMatMul(2, Lane, transB: true);
+        CompilerServices.TryMatch(pre, rule.Pattern, out var result);
+        var vectorizedPosts = rule.GetReplaceCandidates(result!, new Passes.RunPassContext());
+
+        var packRule = new Passes.Rules.NTT.PackMatMulByN(4);
+        var posts = new List<Expr>();
+        foreach (var post in vectorizedPosts)
+        {
+            var context = new Passes.RunPassContext { Driver = new DataflowPass() };
+            var newPost = CompilerServices.Rewrite(post, [packRule], context);
+            if (context.IsMutated)
+            {
+                posts.Add((Expr)newPost);
+            }
+        }
+
+        Assert.NotEmpty(posts);
         await RunCases($"Theory{count}", feedDict, posts);
     }
 
@@ -1416,7 +1470,7 @@ public sealed class UnitTestCPUKernels : TestClassBase
         var posts = new List<Expr>();
         foreach (var post in vectorizedPosts)
         {
-            var context = new Passes.RunPassContext();
+            var context = new Passes.RunPassContext { Driver = new DataflowPass() };
             var newPost = CompilerServices.Rewrite(post, [packRule], context);
             if (context.IsMutated)
             {
@@ -1424,6 +1478,7 @@ public sealed class UnitTestCPUKernels : TestClassBase
             }
         }
 
+        Assert.NotEmpty(posts);
         await RunCases($"Theory{count}", feedDict, posts);
     }
 

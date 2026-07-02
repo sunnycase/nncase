@@ -47,11 +47,17 @@ public class CastEvaluator : IEvaluator<Cast>, ITypeInferencer<Cast>, IOpPrinter
     public Cost Visit(ICostEvaluateContext context, Cast target)
     {
         var input = context.GetArgumentType<IRType>(target, Cast.Input);
+        var output = context.GetReturnType<IRType>();
+        if (TargetOpCostModelUtility.TryGetTargetElementwiseCost(context.TargetCostModel, "cast", [input], output, workPerElement: 1.0, out var targetCost))
+        {
+            return targetCost;
+        }
+
         return new()
         {
             [CostFactorNames.MemoryLoad] = CostUtility.GetMemoryAccess(input),
-            [CostFactorNames.MemoryStore] = CostUtility.GetMemoryAccess(target.NewType),
-            [CostFactorNames.CPUCycles] = CostUtility.GetCPUCycles(target.NewType, 1),
+            [CostFactorNames.MemoryStore] = CostUtility.GetMemoryAccess(output),
+            [CostFactorNames.CPUCycles] = CostUtility.GetCPUCycles(output, 1),
         };
     }
 
