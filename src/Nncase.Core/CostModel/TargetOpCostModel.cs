@@ -9,6 +9,22 @@ using Nncase.Utilities;
 namespace Nncase.CostModel;
 
 /// <summary>
+/// Target matmul implementation kind.
+/// </summary>
+public enum MatMulOpCostKind
+{
+    /// <summary>
+    /// Target decides the implementation from tensor types and shapes.
+    /// </summary>
+    Auto,
+
+    /// <summary>
+    /// SIMT implementation, without tensor-core dot instructions.
+    /// </summary>
+    Simt,
+}
+
+/// <summary>
 /// Target-provided op cost model. Evaluators build these generic queries and do
 /// not depend on concrete hardware details.
 /// </summary>
@@ -114,7 +130,7 @@ public sealed record ElementwiseOpCostQuery(string Op, IReadOnlyList<TargetCostT
 /// <summary>
 /// Target cost query for matmul operators.
 /// </summary>
-public sealed record MatMulOpCostQuery(TargetCostTensor Lhs, TargetCostTensor Rhs, TargetCostTensor Output, DataType OutputDataType);
+public sealed record MatMulOpCostQuery(TargetCostTensor Lhs, TargetCostTensor Rhs, TargetCostTensor Output, DataType OutputDataType, MatMulOpCostKind Kind = MatMulOpCostKind.Auto);
 
 /// <summary>
 /// Default target cost model used when a target does not provide one.
@@ -129,7 +145,13 @@ public sealed class DefaultTargetOpCostModel : ITargetOpCostModel
 
     public UInt128 GetLatency(Cost cost)
     {
-        return cost.Score;
+        var cpuCycles = GetFactor(cost, CostFactorNames.CPUCycles);
+        var memoryCycles = GetFactor(cost, CostFactorNames.MemoryLoad) + GetFactor(cost, CostFactorNames.MemoryStore);
+        var overlappedCycles = cpuCycles > memoryCycles ? cpuCycles : memoryCycles;
+        return overlappedCycles
+            + (GetFactor(cost, CostFactorNames.Synchronization) * (UInt128)25_000)
+            + GetFactor(cost, CostFactorNames.Comm)
+            + GetOtherCost(cost);
     }
 
     public bool TryGetUnaryCost(UnaryOpCostQuery query, out Cost cost)
@@ -154,5 +176,28 @@ public sealed class DefaultTargetOpCostModel : ITargetOpCostModel
     {
         cost = Cost.Zero;
         return false;
+    }
+
+    private static UInt128 GetFactor(Cost cost, string name)
+    {
+        return cost.Factors.TryGetValue(name, out var value) ? value : 0;
+    }
+
+    private static UInt128 GetOtherCost(Cost cost)
+    {
+        UInt128 otherCost = 0;
+        foreach (var (name, value) in cost.Factors)
+        {
+            if (name != CostFactorNames.CPUCycles
+                && name != CostFactorNames.MemoryLoad
+                && name != CostFactorNames.MemoryStore
+                && name != CostFactorNames.Synchronization
+                && name != CostFactorNames.Comm)
+            {
+                otherCost += value;
+            }
+        }
+
+        return otherCost;
     }
 }

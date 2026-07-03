@@ -191,46 +191,52 @@ public sealed class UnitTestTritonTargetCostModel : TestClassBase
 
         Assert.True(cost[CostFactorNames.MemoryLoad] > 0);
         Assert.True(cost[CostFactorNames.MemoryStore] > 0);
-        Assert.Equal((UInt128)25_000, cost[CostFactorNames.Synchronization]);
+        Assert.Equal((UInt128)1, cost[CostFactorNames.Synchronization]);
     }
 
     [Fact]
-    public void TestPackedMatMulCostPenalizesLocalMSplit()
+    public void TestPackedMatMulCostUsesLocalSimtModel()
     {
         var capability = TritonTargetCapability.ForComputeCapability(8, 0) with
         {
             ClockRateGHz = 1.0,
             GlobalMemoryBandwidthGBps = 1_000_000_000.0,
+            GlobalMemoryElementsPerCyclePerCta = 1_000_000.0,
+            SimtFmaPerCyclePerCta = 64.0,
             Mma = new TritonDotInstructionCapability("mma", 16, 8, 16, 1.0),
             Wgmma = new TritonDotInstructionCapability("wgmma", 64, 8, 16, 1.0, isSupported: false),
         };
         CompileOptions.TargetOptions = new PyNTTTargetOptions { TritonCapability = capability };
 
         var packedBf16 = new VectorType(DataTypes.BFloat16, [4, 8]);
-        var mSplit = IR.F.NTT.PackedMatMul(
-            new Var("lhs_m_split", new TensorType(DataTypes.BFloat16, new RankedShape(1, 1024))),
-            new Var("rhs_m_split", new TensorType(packedBf16, new RankedShape(64, 1024))),
+        var broadcastN = IR.F.NTT.PackedMatMul(
+            new Var("lhs_broadcast_n", new TensorType(DataTypes.BFloat16, new RankedShape(1, 1024))),
+            new Var("rhs_broadcast_n", new TensorType(packedBf16, new RankedShape(96, 1024))),
             outDataType: DataTypes.BFloat16);
-        CompilerServices.InferenceType(mSplit);
-        var mSplitCost = CompilerServices.EvaluateCost(mSplit, CompileOptions);
+        CompilerServices.InferenceType(broadcastN);
+        var broadcastNCost = CompilerServices.EvaluateCost(broadcastN, CompileOptions);
 
-        var nSplit = IR.F.NTT.PackedMatMul(
-            new Var("lhs_n_split", new TensorType(DataTypes.BFloat16, new RankedShape(32, 1024))),
-            new Var("rhs_n_split", new TensorType(packedBf16, new RankedShape(2, 1024))),
+        var splitN = IR.F.NTT.PackedMatMul(
+            new Var("lhs_n_split", new TensorType(DataTypes.BFloat16, new RankedShape(1, 1024))),
+            new Var("rhs_n_split", new TensorType(packedBf16, new RankedShape(12, 1024))),
             outDataType: DataTypes.BFloat16);
-        CompilerServices.InferenceType(nSplit);
-        var nSplitCost = CompilerServices.EvaluateCost(nSplit, CompileOptions);
+        CompilerServices.InferenceType(splitN);
+        var splitNCost = CompilerServices.EvaluateCost(splitN, CompileOptions);
 
-        Assert.True(mSplitCost[CostFactorNames.CPUCycles] > nSplitCost[CostFactorNames.CPUCycles]);
+        Assert.Equal((UInt128)49_152, broadcastNCost[CostFactorNames.CPUCycles]);
+        Assert.Equal((UInt128)6_144, splitNCost[CostFactorNames.CPUCycles]);
+        Assert.True(broadcastNCost[CostFactorNames.CPUCycles] > splitNCost[CostFactorNames.CPUCycles]);
     }
 
     [Fact]
-    public void TestDistributedPackedMatMulCostPenalizesLocalMSplit()
+    public void TestDistributedPackedMatMulCostUsesLocalShardShape()
     {
         var capability = TritonTargetCapability.ForComputeCapability(8, 0) with
         {
             ClockRateGHz = 1.0,
             GlobalMemoryBandwidthGBps = 1_000_000_000.0,
+            GlobalMemoryElementsPerCyclePerCta = 1_000_000.0,
+            SimtFmaPerCyclePerCta = 64.0,
             Mma = new TritonDotInstructionCapability("mma", 16, 8, 16, 1.0),
             Wgmma = new TritonDotInstructionCapability("wgmma", 64, 8, 16, 1.0, isSupported: false),
         };
@@ -238,21 +244,21 @@ public sealed class UnitTestTritonTargetCostModel : TestClassBase
 
         var placement = new Placement([4, 8], "y,x", "bb");
         var packedBf16 = new VectorType(DataTypes.BFloat16, [4, 8]);
-        var mSplit = IR.F.NTT.PackedMatMul(
-            new Var("lhs_m_split", new DistributedType(new TensorType(DataTypes.BFloat16, new RankedShape(32, 1024)), [SBP.S([0, 1]), SBP.B], placement)),
-            new Var("rhs_m_split", new DistributedType(new TensorType(packedBf16, new RankedShape(64, 1024)), [SBP.B, SBP.B], placement)),
+        var broadcastN = IR.F.NTT.PackedMatMul(
+            new Var("lhs_broadcast_n", new DistributedType(new TensorType(DataTypes.BFloat16, new RankedShape(1, 1024)), [SBP.B, SBP.B], placement)),
+            new Var("rhs_broadcast_n", new DistributedType(new TensorType(packedBf16, new RankedShape(96, 1024)), [SBP.B, SBP.B], placement)),
             outDataType: DataTypes.BFloat16);
-        CompilerServices.InferenceType(mSplit);
-        var mSplitCost = CompilerServices.EvaluateCost(mSplit, CompileOptions);
+        CompilerServices.InferenceType(broadcastN);
+        var broadcastNCost = CompilerServices.EvaluateCost(broadcastN, CompileOptions);
 
-        var nSplit = IR.F.NTT.PackedMatMul(
-            new Var("lhs_n_split", new DistributedType(new TensorType(DataTypes.BFloat16, new RankedShape(32, 1024)), [SBP.B, SBP.B], placement)),
-            new Var("rhs_n_split", new DistributedType(new TensorType(packedBf16, new RankedShape(64, 1024)), [SBP.S([0, 1]), SBP.B], placement)),
+        var splitN = IR.F.NTT.PackedMatMul(
+            new Var("lhs_n_split", new DistributedType(new TensorType(DataTypes.BFloat16, new RankedShape(1, 1024)), [SBP.B, SBP.B], placement)),
+            new Var("rhs_n_split", new DistributedType(new TensorType(packedBf16, new RankedShape(96, 1024)), [SBP.S([0, 1]), SBP.B], placement)),
             outDataType: DataTypes.BFloat16);
-        CompilerServices.InferenceType(nSplit);
-        var nSplitCost = CompilerServices.EvaluateCost(nSplit, CompileOptions);
+        CompilerServices.InferenceType(splitN);
+        var splitNCost = CompilerServices.EvaluateCost(splitN, CompileOptions);
 
-        Assert.True(mSplitCost[CostFactorNames.CPUCycles] > nSplitCost[CostFactorNames.CPUCycles]);
+        Assert.True(broadcastNCost[CostFactorNames.CPUCycles] > splitNCost[CostFactorNames.CPUCycles]);
     }
 
     [Fact]
@@ -262,12 +268,13 @@ public sealed class UnitTestTritonTargetCostModel : TestClassBase
 
         var costModel = Assert.IsType<TritonTargetOpCostModel>(options.TargetCostModel);
         Assert.Equal(TritonTargetCapability.Default, costModel.Capability);
+        Assert.Equal(2200.0, costModel.Capability.SynchronizationCyclesPerEvent);
     }
 
     [Fact]
     public void TestParseTritonCapability()
     {
-        var capability = TritonTargetCapability.Parse("cc=90,num_sms=120,clock_ghz=2.0,mem_bw_gbps=2500,memory_epc=256,mma=16x8x16,mma_ipc=2,wgmma=64x16x16,wgmma_ipc=8");
+        var capability = TritonTargetCapability.Parse("cc=90,num_sms=120,clock_ghz=2.0,mem_bw_gbps=2500,memory_epc=256,sync_us=2,mma=16x8x16,mma_ipc=2,wgmma=64x16x16,wgmma_ipc=8");
 
         Assert.Equal(9, capability.ComputeCapabilityMajor);
         Assert.Equal(0, capability.ComputeCapabilityMinor);
@@ -275,6 +282,8 @@ public sealed class UnitTestTritonTargetCostModel : TestClassBase
         Assert.Equal(2.0, capability.ClockRateGHz);
         Assert.Equal(2500.0, capability.GlobalMemoryBandwidthGBps);
         Assert.Equal(256.0, capability.GlobalMemoryElementsPerCyclePerCta);
+        Assert.Equal(4000.0, capability.SynchronizationCyclesPerEvent);
+        Assert.Equal(2.0, capability.SynchronizationLatencyUs);
         Assert.Equal(16, capability.Mma.M);
         Assert.Equal(8, capability.Mma.N);
         Assert.Equal(16, capability.Mma.K);
@@ -289,7 +298,7 @@ public sealed class UnitTestTritonTargetCostModel : TestClassBase
     [Fact]
     public void TestLatencyCanDeriveMemoryElementsPerCycle()
     {
-        var capability = TritonTargetCapability.Parse("cc=80,clock_ghz=2.0,mem_bw_gbps=1000,memory_element_bytes=4,memory_efficiency=0.5");
+        var capability = TritonTargetCapability.Parse("cc=80,clock_ghz=2.0,mem_bw_gbps=1000,memory_epc=0,memory_element_bytes=4,memory_efficiency=0.5");
         var costModel = new TritonTargetOpCostModel(capability);
         var cost = new Cost
         {
@@ -303,5 +312,22 @@ public sealed class UnitTestTritonTargetCostModel : TestClassBase
         Assert.Equal(0.0, capability.GlobalMemoryElementsPerCyclePerCta);
         Assert.Equal(62.5, capability.EffectiveGlobalMemoryElementsPerCyclePerCta, precision: 1);
         Assert.Equal((UInt128)2, costModel.GetLatency(cost));
+    }
+
+    [Fact]
+    public void TestLatencyConvertsSynchronizationEventsWithTritonCapability()
+    {
+        var capability = TritonTargetCapability.Parse("cc=80,clock_ghz=1.0,memory_epc=1024,sync_us=1.5");
+        var costModel = new TritonTargetOpCostModel(capability);
+        var cost = new Cost
+        {
+            Factors =
+            {
+                [CostFactorNames.CPUCycles] = (UInt128)10,
+                [CostFactorNames.Synchronization] = (UInt128)2,
+            },
+        };
+
+        Assert.Equal((UInt128)3010, costModel.GetLatency(cost));
     }
 }

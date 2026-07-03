@@ -44,10 +44,12 @@ public class RoPEEvaluator : IEvaluator<RoPE>, ITypeInferencer<RoPE>, ICostEvalu
         var sinTensor = context.GetArgumentValueAsTensor(target, RoPE.Sin);
 
         var originDtype = inputTensor.ElementType;
-        var legalOriginDtype = originDtype.Legalize([(DataTypes.Float16, DataTypes.Float32)]);
-        inputTensor = inputTensor.CastElementTo(legalOriginDtype);
-        cosTensor = cosTensor.CastElementTo(legalOriginDtype);
-        sinTensor = sinTensor.CastElementTo(legalOriginDtype);
+        var computeDtype = originDtype.IsFloat() && originDtype != DataTypes.Float32
+            ? DataTypes.Float32
+            : originDtype;
+        inputTensor = inputTensor.CastElementTo(computeDtype);
+        cosTensor = cosTensor.CastElementTo(DataTypes.Float32);
+        sinTensor = sinTensor.CastElementTo(DataTypes.Float32);
 
         var input = inputTensor.ToOrtTensor();
         var cos = cosTensor.ToOrtTensor();
@@ -59,7 +61,7 @@ public class RoPEEvaluator : IEvaluator<RoPE>, ITypeInferencer<RoPE>, ICostEvalu
 
         // rotate half
         var rotated = OrtKI.Concat([OrtKI.Neg(parts[1]), parts[0]], sliceAxis);
-        var output = OrtKI.Add(OrtKI.Mul(input, cos), OrtKI.Mul(rotated, sin)).ToTensor(legalOriginDtype);
+        var output = OrtKI.Add(OrtKI.Mul(input, cos), OrtKI.Mul(rotated, sin)).ToTensor(computeDtype);
         return Value.FromTensor(output.CastElementTo(originDtype));
     }
 

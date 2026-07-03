@@ -481,12 +481,9 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             var shape = GetBufferShape(output);
             var inputShape = GetBufferShape(input);
             ValidateSameShape(context, inputShape, shape);
-            var inputVectorLaneCount = GetSingleVectorLaneCount(input.ElemType, $"{context} input");
-            var outputVectorLaneCount = GetSingleVectorLaneCount(output.ElemType, $"{context} output");
-            if (inputVectorLaneCount != outputVectorLaneCount)
-            {
-                throw new NotSupportedException($"{context} expects matching input/output vector lanes, got input={inputVectorLaneCount}, output={outputVectorLaneCount}.");
-            }
+            ValidateMatchingVectorLanes($"{context} input/output", input.ElemType, output.ElemType);
+            var inputVectorLaneCount = GetVectorLaneElementCount(input.ElemType);
+            var outputVectorLaneCount = GetVectorLaneElementCount(output.ElemType);
 
             _attrs["op"] = GetOpName(unaryOp);
             _attrs["tir"] = true;
@@ -888,12 +885,9 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             var shape = GetBufferShape(output);
             var inputShape = GetBufferShape(input);
             ValidateSameShape("PyNTT Swish", inputShape, shape);
-            var inputVectorLaneCount = GetSingleVectorLaneCount(input.ElemType, "PyNTT Swish input");
-            var outputVectorLaneCount = GetSingleVectorLaneCount(output.ElemType, "PyNTT Swish output");
-            if (inputVectorLaneCount != outputVectorLaneCount)
-            {
-                throw new NotSupportedException($"PyNTT Swish expects matching input/output vector lanes, got input={inputVectorLaneCount}, output={outputVectorLaneCount}.");
-            }
+            ValidateMatchingVectorLanes("PyNTT Swish input/output", input.ElemType, output.ElemType);
+            var inputVectorLaneCount = GetVectorLaneElementCount(input.ElemType);
+            var outputVectorLaneCount = GetVectorLaneElementCount(output.ElemType);
 
             var beta = swish.Beta.ToString("R", CultureInfo.InvariantCulture);
             _attrs["op"] = "swish";
@@ -941,18 +935,11 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             var rhsShape = GetBufferShape(rhs);
             ValidateBroadcastable("PyNTT VectorizedBinary lhs", lhsShape, shape);
             ValidateBroadcastable("PyNTT VectorizedBinary rhs", rhsShape, shape);
-            var lhsVectorLaneCount = GetSingleVectorLaneCount(lhs.ElemType, "PyNTT VectorizedBinary lhs");
-            var rhsVectorLaneCount = GetSingleVectorLaneCount(rhs.ElemType, "PyNTT VectorizedBinary rhs");
-            var outputVectorLaneCount = GetSingleVectorLaneCount(output.ElemType, "PyNTT VectorizedBinary output");
-            if (lhsVectorLaneCount != 1 && lhsVectorLaneCount != outputVectorLaneCount)
-            {
-                throw new NotSupportedException($"PyNTT VectorizedBinary expects lhs vector lanes to be scalar or match output lanes, got lhs={lhsVectorLaneCount}, output={outputVectorLaneCount}.");
-            }
-
-            if (rhsVectorLaneCount != 1 && rhsVectorLaneCount != outputVectorLaneCount)
-            {
-                throw new NotSupportedException($"PyNTT VectorizedBinary expects rhs vector lanes to be scalar or match output lanes, got rhs={rhsVectorLaneCount}, output={outputVectorLaneCount}.");
-            }
+            ValidateScalarOrMatchingVectorLanes("PyNTT VectorizedBinary lhs", lhs.ElemType, output.ElemType);
+            ValidateScalarOrMatchingVectorLanes("PyNTT VectorizedBinary rhs", rhs.ElemType, output.ElemType);
+            var lhsVectorLaneCount = GetVectorLaneElementCount(lhs.ElemType);
+            var rhsVectorLaneCount = GetVectorLaneElementCount(rhs.ElemType);
+            var outputVectorLaneCount = GetVectorLaneElementCount(output.ElemType);
 
             _attrs["op"] = GetOpName(binary.BinaryOp);
             _attrs["tir"] = true;
@@ -1241,12 +1228,9 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             var shape = GetBufferShape(output);
             var inputShape = GetBufferShape(input);
             ValidateSameShape("PyNTT Clamp", inputShape, shape);
-            var inputVectorLaneCount = GetSingleVectorLaneCount(input.ElemType, "PyNTT Clamp input");
-            var outputVectorLaneCount = GetSingleVectorLaneCount(output.ElemType, "PyNTT Clamp output");
-            if (inputVectorLaneCount != outputVectorLaneCount)
-            {
-                throw new NotSupportedException($"PyNTT Clamp expects matching input/output vector lanes, got input={inputVectorLaneCount}, output={outputVectorLaneCount}.");
-            }
+            ValidateMatchingVectorLanes("PyNTT Clamp input/output", input.ElemType, output.ElemType);
+            var inputVectorLaneCount = GetVectorLaneElementCount(input.ElemType);
+            var outputVectorLaneCount = GetVectorLaneElementCount(output.ElemType);
 
             _attrs["op"] = "clamp";
             _attrs["tir"] = true;
@@ -1294,18 +1278,11 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             var rhsShape = GetBufferShape(rhs);
             ValidateBroadcastable("PyNTT Compare lhs", lhsShape, shape);
             ValidateBroadcastable("PyNTT Compare rhs", rhsShape, shape);
-            var lhsVectorLaneCount = GetSingleVectorLaneCount(lhs.ElemType, "PyNTT Compare lhs");
-            var rhsVectorLaneCount = GetSingleVectorLaneCount(rhs.ElemType, "PyNTT Compare rhs");
-            var outputVectorLaneCount = GetSingleVectorLaneCount(output.ElemType, "PyNTT Compare output");
-            if (lhsVectorLaneCount != 1 && lhsVectorLaneCount != outputVectorLaneCount)
-            {
-                throw new NotSupportedException($"PyNTT Compare expects lhs vector lanes to be scalar or match output lanes, got lhs={lhsVectorLaneCount}, output={outputVectorLaneCount}.");
-            }
-
-            if (rhsVectorLaneCount != 1 && rhsVectorLaneCount != outputVectorLaneCount)
-            {
-                throw new NotSupportedException($"PyNTT Compare expects rhs vector lanes to be scalar or match output lanes, got rhs={rhsVectorLaneCount}, output={outputVectorLaneCount}.");
-            }
+            ValidateScalarOrMatchingVectorLanes("PyNTT Compare lhs", lhs.ElemType, output.ElemType);
+            ValidateScalarOrMatchingVectorLanes("PyNTT Compare rhs", rhs.ElemType, output.ElemType);
+            var lhsVectorLaneCount = GetVectorLaneElementCount(lhs.ElemType);
+            var rhsVectorLaneCount = GetVectorLaneElementCount(rhs.ElemType);
+            var outputVectorLaneCount = GetVectorLaneElementCount(output.ElemType);
 
             _attrs["op"] = GetCompareOpName(compare.CompareOp);
             _attrs["tir"] = true;
@@ -2101,18 +2078,15 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             var cosShape = GetBufferShape(cos);
             var sinShape = GetBufferShape(sin);
             var outputShape = GetBufferShape(output);
-            var inputVectorLaneCount = GetSingleVectorLaneCount(input.ElemType, "PyNTT RoPE input");
-            var cosVectorLaneCount = GetSingleVectorLaneCount(cos.ElemType, "PyNTT RoPE cos");
-            var sinVectorLaneCount = GetSingleVectorLaneCount(sin.ElemType, "PyNTT RoPE sin");
-            var outputVectorLaneCount = GetSingleVectorLaneCount(output.ElemType, "PyNTT RoPE output");
-            var valueLaneCounts = new[] { inputVectorLaneCount, cosVectorLaneCount, sinVectorLaneCount, outputVectorLaneCount }
-                .Where(lane => lane > 1)
-                .Distinct()
-                .ToArray();
-            if (valueLaneCounts.Length > 1)
-            {
-                throw new NotSupportedException($"PyNTT RoPE expects matching input/cos/sin/output vector lanes, got input={inputVectorLaneCount}, cos={cosVectorLaneCount}, sin={sinVectorLaneCount}, output={outputVectorLaneCount}.");
-            }
+            var inputVectorLanes = GetVectorLanes(input.ElemType);
+            var cosVectorLanes = GetVectorLanes(cos.ElemType);
+            var sinVectorLanes = GetVectorLanes(sin.ElemType);
+            var outputVectorLanes = GetVectorLanes(output.ElemType);
+            var inputVectorLaneCount = GetVectorLaneElementCount(input.ElemType);
+            var cosVectorLaneCount = GetVectorLaneElementCount(cos.ElemType);
+            var sinVectorLaneCount = GetVectorLaneElementCount(sin.ElemType);
+            var outputVectorLaneCount = GetVectorLaneElementCount(output.ElemType);
+            var sinCosVectorPackFactor = GetRoPESinCosVectorPackFactor(inputVectorLanes, cosVectorLanes, sinVectorLanes, outputVectorLanes);
 
             var rotaryAxis = outputShape.Length - 1;
             if (rotaryAxis < 0)
@@ -2120,7 +2094,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 throw new NotSupportedException($"PyNTT RoPE requires a non-scalar output, got [{ShapeText(outputShape)}].");
             }
 
-            ValidateRoPEShape("PyNTT RoPE", inputShape, cosShape, sinShape, outputShape, rotaryAxis, outputVectorLaneCount);
+            ValidateRoPEShape("PyNTT RoPE", inputShape, cosShape, sinShape, outputShape, rotaryAxis, outputVectorLaneCount, sinCosVectorPackFactor);
             if (GetShardAxis(output) == rotaryAxis || GetShardAxis(input) == rotaryAxis)
             {
                 throw new NotSupportedException("PyNTT RoPE codegen does not support sharding along the rotary dimension yet.");
@@ -2159,6 +2133,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     cosVectorLaneCount,
                     sinVectorLaneCount,
                     outputVectorLaneCount,
+                    sinCosVectorPackFactor,
                     rotaryAxis,
                     $"{input.Name} -> {output.Name}"));
             WriteLine(BuildHelperCall(helperName));
@@ -3808,6 +3783,26 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
         return lanes.Length == 0 ? 1 : lanes.Aggregate(1, (acc, lane) => checked(acc * lane));
     }
 
+    private static void ValidateMatchingVectorLanes(string context, DataType lhs, DataType rhs)
+    {
+        var lhsLanes = GetVectorLanes(lhs);
+        var rhsLanes = GetVectorLanes(rhs);
+        if (!lhsLanes.SequenceEqual(rhsLanes))
+        {
+            throw new NotSupportedException($"{context} expects matching vector lanes, got lhs=[{string.Join(",", lhsLanes)}], rhs=[{string.Join(",", rhsLanes)}].");
+        }
+    }
+
+    private static void ValidateScalarOrMatchingVectorLanes(string context, DataType operand, DataType output)
+    {
+        var operandLanes = GetVectorLanes(operand);
+        var outputLanes = GetVectorLanes(output);
+        if (operandLanes.Length != 0 && !operandLanes.SequenceEqual(outputLanes))
+        {
+            throw new NotSupportedException($"{context} expects scalar lanes or lanes matching output, got operand=[{string.Join(",", operandLanes)}], output=[{string.Join(",", outputLanes)}].");
+        }
+    }
+
     private static PyNTTDimExpression[] GetLogicalVectorShape(IReadOnlyList<PyNTTDimExpression> physicalShape, int laneCount)
     {
         if (laneCount == 1)
@@ -3942,11 +3937,17 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
         }
     }
 
-    private static void ValidateRoPEShape(string context, IReadOnlyList<PyNTTDimExpression> inputShape, IReadOnlyList<PyNTTDimExpression> cosShape, IReadOnlyList<PyNTTDimExpression> sinShape, IReadOnlyList<PyNTTDimExpression> outputShape, int rotaryAxis, int laneCount)
+    private static void ValidateRoPEShape(string context, IReadOnlyList<PyNTTDimExpression> inputShape, IReadOnlyList<PyNTTDimExpression> cosShape, IReadOnlyList<PyNTTDimExpression> sinShape, IReadOnlyList<PyNTTDimExpression> outputShape, int rotaryAxis, int laneCount, int sinCosVectorPackFactor)
     {
         ValidateSameShape(context, inputShape, outputShape);
-        ValidateBroadcastable($"{context} cos", cosShape, outputShape);
-        ValidateBroadcastable($"{context} sin", sinShape, outputShape);
+        var sinCosOutputShape = outputShape.ToArray();
+        if (sinCosVectorPackFactor > 1)
+        {
+            sinCosOutputShape[rotaryAxis] = CeilDivDim(sinCosOutputShape[rotaryAxis], sinCosVectorPackFactor);
+        }
+
+        ValidateBroadcastable($"{context} cos", cosShape, sinCosOutputShape);
+        ValidateBroadcastable($"{context} sin", sinShape, sinCosOutputShape);
         if (outputShape.Count == 0)
         {
             throw new NotSupportedException($"{context} requires a non-scalar output, got [{ShapeText(outputShape)}].");
@@ -3957,6 +3958,36 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
         {
             throw new NotSupportedException($"{context} requires an even rotary dimension, got axis {rotaryAxis} with shape [{ShapeText(outputShape)}] and lanes {laneCount}.");
         }
+    }
+
+    private static int GetRoPESinCosVectorPackFactor(IReadOnlyList<int> inputLanes, IReadOnlyList<int> cosLanes, IReadOnlyList<int> sinLanes, IReadOnlyList<int> outputLanes)
+    {
+        if (!inputLanes.SequenceEqual(outputLanes))
+        {
+            throw new NotSupportedException($"PyNTT RoPE expects matching input/output vector lanes, got input=[{string.Join(",", inputLanes)}], output=[{string.Join(",", outputLanes)}].");
+        }
+
+        if (!cosLanes.SequenceEqual(sinLanes))
+        {
+            throw new NotSupportedException($"PyNTT RoPE expects matching cos/sin vector lanes, got cos=[{string.Join(",", cosLanes)}], sin=[{string.Join(",", sinLanes)}].");
+        }
+
+        if (cosLanes.Count == 0 && outputLanes.Count == 0)
+        {
+            return 1;
+        }
+
+        if (cosLanes.SequenceEqual(outputLanes))
+        {
+            return 1;
+        }
+
+        if (outputLanes.Count == 1 && cosLanes.Count == 2 && cosLanes[0] == 2 && cosLanes[1] == outputLanes[0])
+        {
+            return 2;
+        }
+
+        throw new NotSupportedException($"PyNTT RoPE expects sin/cos lanes to be scalar, [{string.Join(",", outputLanes)}], or [2,{string.Join(",", outputLanes)}], got [{string.Join(",", cosLanes)}].");
     }
 
     private static void ValidateLayerNormShape(string context, IReadOnlyList<PyNTTDimExpression> parameterShape, IReadOnlyList<PyNTTDimExpression> outputShape, int axis)

@@ -16,7 +16,7 @@ namespace Nncase.Evaluator.IR.Distributed;
 
 public sealed class BoxingEvaluator : ITypeInferencer<Boxing>, ICostEvaluator<Boxing>, IEvaluator<Boxing>
 {
-    private static readonly UInt128 SynchronizationCost = 25_000; // 25k cycles on 5GHz CPU is about 5us.
+    private static readonly UInt128 SynchronizationEventCount = 1;
 
     public static IRType VisitType(IRType inType, IRType outType, bool isReshape = false)
     {
@@ -132,7 +132,7 @@ public sealed class BoxingEvaluator : ITypeInferencer<Boxing>, ICostEvaluator<Bo
             return targetCost;
         }
 
-        var cost = new Cost() { [CostFactorNames.CPUCycles] = 1, [CostFactorNames.MemoryLoad] = 0, [CostFactorNames.MemoryStore] = 0, [CostFactorNames.Synchronization] = SynchronizationCost };
+        var cost = new Cost() { [CostFactorNames.CPUCycles] = 1, [CostFactorNames.MemoryLoad] = 0, [CostFactorNames.MemoryStore] = 0, [CostFactorNames.Synchronization] = SynchronizationEventCount };
         switch (inType, returnType)
         {
             case (TensorType _, DistributedType distributedType):
@@ -169,7 +169,7 @@ public sealed class BoxingEvaluator : ITypeInferencer<Boxing>, ICostEvaluator<Bo
                     {
                         [CostFactorNames.MemoryStore] = CostUtility.GetMemoryAccess(a),
                         [CostFactorNames.MemoryLoad] = CostUtility.GetMemoryAccess(b),
-                        [CostFactorNames.Synchronization] = SynchronizationCost,
+                        [CostFactorNames.Synchronization] = SynchronizationEventCount,
                     };
 
                     float scatterPart = 1;
@@ -273,7 +273,7 @@ public sealed class BoxingEvaluator : ITypeInferencer<Boxing>, ICostEvaluator<Bo
                     {
                         [CostFactorNames.MemoryStore] = CostUtility.GetMemoryAccess(a) * (UInt128)a.TensorType.DType.SizeInBytes,
                         [CostFactorNames.MemoryLoad] = CostUtility.GetMemoryAccess(b) * (UInt128)b.TensorType.DType.SizeInBytes,
-                        [CostFactorNames.Synchronization] = SynchronizationCost,
+                        [CostFactorNames.Synchronization] = SynchronizationEventCount,
                     };
 
                     float gatherPart = 1;
@@ -368,7 +368,7 @@ public sealed class BoxingEvaluator : ITypeInferencer<Boxing>, ICostEvaluator<Bo
                 {
                     [CostFactorNames.MemoryStore] = CostUtility.GetMemoryAccess(a),
                     [CostFactorNames.MemoryLoad] = CostUtility.GetMemoryAccess(b),
-                    [CostFactorNames.Synchronization] = SynchronizationCost,
+                    [CostFactorNames.Synchronization] = SynchronizationEventCount,
                 };
                 break;
             case (DistributedType a, DistributedType b) when a.Placement != b.Placement:
@@ -376,7 +376,7 @@ public sealed class BoxingEvaluator : ITypeInferencer<Boxing>, ICostEvaluator<Bo
                 {
                     [CostFactorNames.MemoryStore] = CostUtility.GetMemoryAccess(a),
                     [CostFactorNames.MemoryLoad] = CostUtility.GetMemoryAccess(b),
-                    [CostFactorNames.Synchronization] = SynchronizationCost,
+                    [CostFactorNames.Synchronization] = SynchronizationEventCount,
                 };
                 break;
             case (DistributedType a, DistributedType b) when a.Partial != b.Partial:
@@ -384,7 +384,7 @@ public sealed class BoxingEvaluator : ITypeInferencer<Boxing>, ICostEvaluator<Bo
                 {
                     [CostFactorNames.MemoryStore] = CostUtility.GetMemoryAccess(a),
                     [CostFactorNames.MemoryLoad] = CostUtility.GetMemoryAccess(b),
-                    [CostFactorNames.Synchronization] = SynchronizationCost,
+                    [CostFactorNames.Synchronization] = SynchronizationEventCount,
                 };
                 break;
             case (DistributedType a, DistributedType b) when a == b:
@@ -459,7 +459,7 @@ public sealed class BoxingEvaluator : ITypeInferencer<Boxing>, ICostEvaluator<Bo
             return false;
         }
 
-        cost += new Cost { [CostFactorNames.Synchronization] = SynchronizationCost };
+        cost += new Cost { [CostFactorNames.Synchronization] = SynchronizationEventCount };
         return true;
     }
 

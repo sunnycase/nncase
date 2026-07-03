@@ -1381,6 +1381,7 @@ def _emit_layer_norm(model: dict[str, Any]) -> str:
 def _emit_rope(model: dict[str, Any]) -> str:
     rank = len(model["OutputShape"])
     rotary_axis = model["RotaryAxis"]
+    sincos_pack_factor = int(model.get("SinCosVectorPackFactor", 1))
     total = _multiply_expr(_product(model["OutputShape"]), model["OutputVectorLaneCount"])
     rotary_extent = _multiply_expr(f"({_dim(model['OutputShape'][rotary_axis])})", model["OutputVectorLaneCount"])
     half_dim = f"(({rotary_extent}) // 2)"
@@ -1418,15 +1419,23 @@ def _emit_rope(model: dict[str, Any]) -> str:
     _line(lines, 2, f"paired_logical = tl.where(logical_rotary < {half_dim}, logical_rotary + {half_dim}, logical_rotary - {half_dim})")
     _line(lines, 2, f"paired_idx{rotary_axis} = paired_logical // {model['OutputVectorLaneCount']}")
     _line(lines, 2, f"paired_lane = paired_logical % {model['OutputVectorLaneCount']}")
+    if sincos_pack_factor == 1:
+        cos_rotary_index = f"idx{rotary_axis}"
+        cos_lane_index = "lane_flat"
+    else:
+        _line(lines, 2, f"sincos_rotary = logical_rotary // ({sincos_pack_factor} * {model['OutputVectorLaneCount']})")
+        _line(lines, 2, f"sincos_lane = ((logical_rotary // {model['OutputVectorLaneCount']}) % {sincos_pack_factor}) * {model['OutputVectorLaneCount']} + lane_flat")
+        cos_rotary_index = "sincos_rotary"
+        cos_lane_index = "sincos_lane"
     _line(lines, 2, f"input_offsets = {offset(model['InputShape'], model['InputStrides'], model['InputVectorLaneCount'], f'idx{rotary_axis}', 'lane_flat')}")
     _line(lines, 2, f"paired_input_offsets = {offset(model['InputShape'], model['InputStrides'], model['InputVectorLaneCount'], f'paired_idx{rotary_axis}', 'paired_lane')}")
-    _line(lines, 2, f"cos_offsets = {offset(model['CosShape'], model['CosStrides'], model['CosVectorLaneCount'], f'idx{rotary_axis}', 'lane_flat')}")
-    _line(lines, 2, f"sin_offsets = {offset(model['SinShape'], model['SinStrides'], model['SinVectorLaneCount'], f'idx{rotary_axis}', 'lane_flat')}")
+    _line(lines, 2, f"cos_offsets = {offset(model['CosShape'], model['CosStrides'], model['CosVectorLaneCount'], cos_rotary_index, cos_lane_index)}")
+    _line(lines, 2, f"sin_offsets = {offset(model['SinShape'], model['SinStrides'], model['SinVectorLaneCount'], cos_rotary_index, cos_lane_index)}")
     _line(lines, 2, f"output_offsets = {output_offset()}")
-    _line(lines, 2, "value0 = tl.load(input0 + input_offsets, mask=mask)")
-    _line(lines, 2, "paired_value = tl.load(input0 + paired_input_offsets, mask=mask)")
-    _line(lines, 2, "cos_value = tl.load(cos0 + cos_offsets, mask=mask)")
-    _line(lines, 2, "sin_value = tl.load(sin0 + sin_offsets, mask=mask)")
+    _line(lines, 2, "value0 = tl.load(input0 + input_offsets, mask=mask).to(tl.float32)")
+    _line(lines, 2, "paired_value = tl.load(input0 + paired_input_offsets, mask=mask).to(tl.float32)")
+    _line(lines, 2, "cos_value = tl.load(cos0 + cos_offsets, mask=mask).to(tl.float32)")
+    _line(lines, 2, "sin_value = tl.load(sin0 + sin_offsets, mask=mask).to(tl.float32)")
     _line(lines, 2, f"rotated = tl.where(logical_rotary < {half_dim}, -paired_value, paired_value)")
     _line(lines, 2, "result = value0 * cos_value + rotated * sin_value")
     _line(lines, 2, "tl.store(output + output_offsets, result, mask=mask)")

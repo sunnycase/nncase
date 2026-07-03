@@ -328,6 +328,7 @@ public sealed record PyNTTRoPETemplateModel(
     int CosVectorLaneCount,
     int SinVectorLaneCount,
     int OutputVectorLaneCount,
+    int SinCosVectorPackFactor,
     int RotaryAxis,
     string Comment)
 {

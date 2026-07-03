@@ -109,6 +109,7 @@ public abstract class NTTTarget : Target
         pass.Add<Passes.Rules.Neutral.FoldConstCall>();
         pass.Add<Passes.Rules.NTT.FoldVectorizeDevectorize>();
         pass.Add<Passes.Rules.NTT.FoldVectorizeConcatDevectorize>();
+        pass.Add<Passes.Rules.NTT.FoldNopVectorizedCast>();
         pass.Add<Passes.Rules.NTT.TransposeVectorizeMatMulInputs>();
         pass.Add<Passes.Rules.Neutral.FoldTwoReshapes>();
         pass.Add<Passes.Rules.Neutral.FoldTwoTransposes>();

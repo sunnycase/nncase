@@ -59,7 +59,7 @@ public sealed record TritonTargetCapability
 
     public double GlobalMemoryBandwidthGBps { get; init; } = 1555.0;
 
-    public double GlobalMemoryElementsPerCyclePerCta { get; init; }
+    public double GlobalMemoryElementsPerCyclePerCta { get; init; } = 32.0;
 
     public double GlobalMemoryElementSizeBytes { get; init; } = 4.0;
 
@@ -70,6 +70,8 @@ public sealed record TritonTargetCapability
     public double SimtFmaPerCyclePerCta { get; init; } = 64.0;
 
     public double FixedOverheadCycles { get; init; }
+
+    public double SynchronizationCyclesPerEvent { get; init; } = 2200.0;
 
     public bool UseTensorCoresForFloat32 { get; init; } = true;
 
@@ -82,6 +84,10 @@ public sealed record TritonTargetCapability
     public double EffectiveGlobalMemoryElementsPerCyclePerCta => GlobalMemoryElementsPerCyclePerCta > 0
         ? GlobalMemoryElementsPerCyclePerCta
         : (GlobalMemoryBandwidthGBps / Math.Max(1.0e-6, ClockRateGHz) / Math.Max(1.0e-6, GlobalMemoryElementSizeBytes)) * GlobalMemoryEfficiency;
+
+    public double SynchronizationLatencyUs => SynchronizationCyclesPerEvent / Math.Max(1.0e-6, ClockRateGHz) / 1000.0;
+
+    public double SynchronizationCycles => Math.Max(0.0, SynchronizationCyclesPerEvent);
 
     public static TritonTargetCapability ForComputeCapability(int major, int minor)
     {
@@ -137,7 +143,7 @@ public sealed record TritonTargetCapability
 
         if (values.TryGetValue("memory_epc", out var memoryEpc) || values.TryGetValue("mem_epc", out memoryEpc))
         {
-            capability = capability with { GlobalMemoryElementsPerCyclePerCta = ParseDouble(memoryEpc, nameof(GlobalMemoryElementsPerCyclePerCta)) };
+            capability = capability with { GlobalMemoryElementsPerCyclePerCta = ParseDouble(memoryEpc, nameof(GlobalMemoryElementsPerCyclePerCta), allowZero: true) };
         }
 
         if (values.TryGetValue("memory_element_bytes", out var memoryElementBytes) || values.TryGetValue("mem_element_bytes", out memoryElementBytes))
@@ -162,7 +168,18 @@ public sealed record TritonTargetCapability
 
         if (values.TryGetValue("overhead_cycles", out var overheadCycles) || values.TryGetValue("fixed_overhead_cycles", out overheadCycles))
         {
-            capability = capability with { FixedOverheadCycles = ParseDouble(overheadCycles, nameof(FixedOverheadCycles)) };
+            capability = capability with { FixedOverheadCycles = ParseDouble(overheadCycles, nameof(FixedOverheadCycles), allowZero: true) };
+        }
+
+        if (values.TryGetValue("sync_cycles", out var syncCycles) || values.TryGetValue("synchronization_cycles", out syncCycles))
+        {
+            capability = capability with { SynchronizationCyclesPerEvent = ParseDouble(syncCycles, nameof(SynchronizationCyclesPerEvent), allowZero: true) };
+        }
+
+        if (values.TryGetValue("sync_us", out var syncUs) || values.TryGetValue("sync_latency_us", out syncUs) || values.TryGetValue("synchronization_us", out syncUs))
+        {
+            var cycles = ParseDouble(syncUs, nameof(SynchronizationLatencyUs), allowZero: true) * Math.Max(1.0e-6, capability.ClockRateGHz) * 1000.0;
+            capability = capability with { SynchronizationCyclesPerEvent = cycles };
         }
 
         if (values.TryGetValue("tf32", out var tf32))
@@ -201,7 +218,7 @@ public sealed record TritonTargetCapability
     public override string ToString()
     {
         return FormattableString.Invariant(
-            $"cc={ComputeCapability},num_sms={MultiprocessorCount},clock_ghz={ClockRateGHz},mem_bw_gbps={GlobalMemoryBandwidthGBps},memory_epc={EffectiveGlobalMemoryElementsPerCyclePerCta},memory_element_bytes={GlobalMemoryElementSizeBytes},memory_efficiency={GlobalMemoryEfficiency},mma={Mma.M}x{Mma.N}x{Mma.K},mma_ipc={Mma.InstructionsPerCyclePerCta},wgmma={Wgmma.M}x{Wgmma.N}x{Wgmma.K},wgmma_ipc={Wgmma.InstructionsPerCyclePerCta},wgmma_supported={Wgmma.IsSupported}");
+            $"cc={ComputeCapability},num_sms={MultiprocessorCount},clock_ghz={ClockRateGHz},mem_bw_gbps={GlobalMemoryBandwidthGBps},memory_epc={EffectiveGlobalMemoryElementsPerCyclePerCta},memory_element_bytes={GlobalMemoryElementSizeBytes},memory_efficiency={GlobalMemoryEfficiency},sync_cycles={SynchronizationCyclesPerEvent},sync_us={SynchronizationLatencyUs},mma={Mma.M}x{Mma.N}x{Mma.K},mma_ipc={Mma.InstructionsPerCyclePerCta},wgmma={Wgmma.M}x{Wgmma.N}x{Wgmma.K},wgmma_ipc={Wgmma.InstructionsPerCyclePerCta},wgmma_supported={Wgmma.IsSupported}");
     }
 
     private static Dictionary<string, string> ParseKeyValues(string text)
@@ -282,9 +299,11 @@ public sealed record TritonTargetCapability
         throw new FormatException($"Invalid Triton capability integer '{name}={value}'.");
     }
 
-    private static double ParseDouble(string value, string name)
+    private static double ParseDouble(string value, string name, bool allowZero = false)
     {
-        if (double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out var result) && double.IsFinite(result) && result > 0)
+        if (double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out var result)
+            && double.IsFinite(result)
+            && (allowZero ? result >= 0 : result > 0))
         {
             return result;
         }

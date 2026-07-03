@@ -44,24 +44,20 @@ public class VectorizedRoPEEvaluator : IEvaluator<VectorizedRoPE>, ITypeInferenc
         var sinTensor = context.GetArgumentValueAsTensor(target, VectorizedRoPE.Sin);
 
         var originDtype = inputTensor.ElementType;
-        if (originDtype.IsFloat() && originDtype is PrimType && originDtype != DataTypes.Float32)
-        {
-            inputTensor = inputTensor.Cast<float>();
-            cosTensor = cosTensor.Cast<float>();
-            sinTensor = sinTensor.Cast<float>();
-        }
+        var rotaryAxis = inputTensor.Dimensions.Length - 1;
+        var input = OrtKI.Cast(ToLogicalTensor(inputTensor, rotaryAxis), (long)OrtDataType.Float);
+        var cos = OrtKI.Cast(ToLogicalTensor(cosTensor, rotaryAxis), (long)OrtDataType.Float);
+        var sin = OrtKI.Cast(ToLogicalTensor(sinTensor, rotaryAxis), (long)OrtDataType.Float);
 
-        var input = inputTensor.ToOrtTensor();
-        var cos = cosTensor.ToOrtTensor();
-        var sin = sinTensor.ToOrtTensor();
-
-        var sliceAxis = inputTensor.Dimensions.Length - 1;
-        var sliceDim = inputTensor.Dimensions[sliceAxis] / 2;
+        var sliceAxis = input.Rank - 1;
+        var sliceDim = input.Shape[sliceAxis] / 2;
         var parts = OrtKI.Split(input, new[] { sliceDim, sliceDim }, sliceAxis);
 
         // rotate half
         var rotated = OrtKI.Concat([OrtKI.Neg(parts[1]), parts[0]], sliceAxis);
         var output = OrtKI.Add(OrtKI.Mul(input, cos), OrtKI.Mul(rotated, sin));
+        output = OrtKI.Cast(output, (long)GetScalarDataType(originDtype).ToOrtType());
+        output = FromLogicalTensor(output, originDtype, rotaryAxis);
         return output.ToValue(originDtype);
     }
 
@@ -138,5 +134,42 @@ public class VectorizedRoPEEvaluator : IEvaluator<VectorizedRoPE>, ITypeInferenc
         }
 
         return input;
+    }
+
+    private static OrtKISharp.Tensor ToLogicalTensor(Tensor tensor, int vectorizedAxis)
+    {
+        var ort = tensor.ToOrtTensor();
+        var lanes = GetVectorLanes(tensor.ElementType);
+        return lanes.Length == 0
+            ? ort
+            : ort.Unpack(lanes.Length, Enumerable.Repeat(vectorizedAxis, lanes.Length).ToArray());
+    }
+
+    private static OrtKISharp.Tensor FromLogicalTensor(OrtKISharp.Tensor tensor, DataType dataType, int vectorizedAxis)
+    {
+        var lanes = GetVectorLanes(dataType);
+        return lanes.Length == 0
+            ? tensor
+            : tensor.Pack(0, lanes, Enumerable.Repeat(vectorizedAxis, lanes.Length).ToArray());
+    }
+
+    private static DataType GetScalarDataType(DataType dataType)
+    {
+        return dataType switch
+        {
+            VectorType vectorType => vectorType.ElemType,
+            MaskVectorType => DataTypes.Boolean,
+            _ => dataType,
+        };
+    }
+
+    private static int[] GetVectorLanes(DataType dataType)
+    {
+        return dataType switch
+        {
+            VectorType vectorType => vectorType.Lanes.ToArray(),
+            MaskVectorType maskVectorType => [maskVectorType.Lanes],
+            _ => [],
+        };
     }
 }

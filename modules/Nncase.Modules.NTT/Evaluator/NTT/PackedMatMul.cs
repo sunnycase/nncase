@@ -145,7 +145,7 @@ public sealed class PackedMatMulEvaluator : IEvaluator<PackedMatMul>, ITypeInfer
         if (!TargetCostTensor.TryFromType(lhs, out var lhsTensor)
             || !TargetCostTensor.TryFromType(rhs, out var rhsTensor)
             || !TargetCostTensor.TryFromType(outputType, out var outputTensor)
-            || !context.TargetCostModel.TryGetMatMulCost(new(lhsTensor, rhsTensor, outputTensor, GetScalarType(target.OutputDataType)), out cost))
+            || !context.TargetCostModel.TryGetMatMulCost(new(lhsTensor, rhsTensor, outputTensor, GetScalarType(target.OutputDataType), MatMulOpCostKind.Simt), out cost))
         {
             cost = Cost.Zero;
             return false;
@@ -167,11 +167,10 @@ public sealed class PackedMatMulEvaluator : IEvaluator<PackedMatMul>, ITypeInfer
             return cost;
         }
 
-        UInt128 synchronizeCost = 25_000; // 25k cycles on 5GHz CPU is about 5us.
         AddCostFactor(cost, CostFactorNames.MemoryLoad, CostUtility.GetMemoryAccess(outputType) * 2);
         AddCostFactor(cost, CostFactorNames.MemoryStore, CostUtility.GetMemoryAccess(outputType));
         AddCostFactor(cost, CostFactorNames.CPUCycles, CostUtility.GetCPUCycles(outputType, 1));
-        AddCostFactor(cost, CostFactorNames.Synchronization, synchronizeCost * 3);
+        AddCostFactor(cost, CostFactorNames.Synchronization, (UInt128)3);
         return cost;
     }
 

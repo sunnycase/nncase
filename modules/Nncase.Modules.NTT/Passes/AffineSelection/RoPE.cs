@@ -29,6 +29,16 @@ public partial class NTTAffineSelectionPass
         // [seq, head, dim], with sin/cos broadcast over head.
         var sinCosResults = inOutResults.ToArray();
         sinCosResults[1] = new AffineRange(0, 1);
+        var sinCosPackFactor = GetRoPESinCosVectorPackFactor(input, cos, sin);
+        if (sinCosPackFactor > 1)
+        {
+            var rotaryAxis = rank - 1;
+            var range = sinCosResults[rotaryAxis];
+            var offset = new AffineDivBinary(AffineDivBinaryOp.FloorDiv, range.Offset, (long)sinCosPackFactor);
+            var end = new AffineDivBinary(AffineDivBinaryOp.CeilDiv, range.Offset + range.Extent, (long)sinCosPackFactor);
+            sinCosResults[rotaryAxis] = new AffineRange(offset, end - offset);
+        }
+
         var sinCosMap = new AffineMap(domains, default, sinCosResults);
 
         return IR.F.Affine.Grid()
@@ -39,5 +49,33 @@ public partial class NTTAffineSelectionPass
             .Write(output, inOutMap, out var outTile)
             .Body(TIR.F.NTT.RoPE(inTile, cosTile, sinTile, outTile))
             .Build();
+    }
+
+    private static int GetRoPESinCosVectorPackFactor(Expr input, Expr cos, Expr sin)
+    {
+        var inputLanes = GetVectorLanes(input.CheckedDataType);
+        var cosLanes = GetVectorLanes(cos.CheckedDataType);
+        var sinLanes = GetVectorLanes(sin.CheckedDataType);
+        if (!cosLanes.SequenceEqual(sinLanes))
+        {
+            throw new NotSupportedException($"VectorizedRoPE requires matching sin/cos vector lanes, got cos=[{string.Join(",", cosLanes)}], sin=[{string.Join(",", sinLanes)}].");
+        }
+
+        if (inputLanes.Length == 1 && cosLanes.Length == 2 && cosLanes[0] == 2 && cosLanes[1] == inputLanes[0])
+        {
+            return 2;
+        }
+
+        return 1;
+    }
+
+    private static int[] GetVectorLanes(DataType dataType)
+    {
+        return dataType switch
+        {
+            VectorType vectorType => vectorType.Lanes.ToArray(),
+            MaskVectorType maskVectorType => [maskVectorType.Lanes],
+            _ => [],
+        };
     }
 }

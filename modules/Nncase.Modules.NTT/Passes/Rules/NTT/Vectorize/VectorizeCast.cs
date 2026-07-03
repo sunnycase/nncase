@@ -10,12 +10,14 @@ using DryIoc.ImTools;
 using NetFabric.Hyperlinq;
 using Nncase.IR;
 using Nncase.IR.NN;
+using Nncase.IR.NTT;
 using Nncase.IR.Shapes;
 using Nncase.IR.Tensors;
 using Nncase.PatternMatch;
 using Nncase.Utilities;
 
 using static Nncase.IR.TypePatternUtility;
+using static Nncase.PatternMatch.F.NTT;
 using static Nncase.PatternMatch.F.Tensors;
 using static Nncase.PatternMatch.Utility;
 
@@ -48,6 +50,24 @@ public sealed partial class VectorizeCastPropagation : RewriteRule<Pattern>
         var postOps = None.Default;
         var ret = IR.F.NTT.VectorizedCast(IR.F.Tensors.Pack(input, vectorizeLanes, vectorize.Axes.ToArray()), newType, CastMode.KDefault, vectorize.Axes.ToArray(), postOps);
         return ret;
+    }
+}
+
+[RuleGenerator]
+public sealed partial class FoldNopVectorizedCast : IRewriteRule
+{
+    public IPattern Pattern { get; } = IsVectorizedCast(
+        "cast",
+        "caller",
+        _ => true,
+        IsWildcard("input"),
+        IsNone());
+
+    private Expr? GetReplace(Call caller, IR.NTT.VectorizedCast cast, Expr input)
+    {
+        return input.CheckedDataType == cast.NewType
+            ? input.InheritMetaData(caller)
+            : null;
     }
 }
 

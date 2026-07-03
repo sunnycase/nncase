@@ -61,23 +61,46 @@ public sealed partial class VectorizeRoPEPropagation : RewriteRule<Pattern>
             }
         }
 
-        var sinCosVectorizedAxes = new List<int>();
-        var sinCosLanes = new List<int>();
-
-        for (int i = 0; i < vectorize.Axes.Count; i++)
+        if (vectorize.Axes.Count != 1 || vectorize.Lanes.Count != 1)
         {
-            var axis = vectorize.Axes[i];
-            var lanes = vectorize.Lanes[i];
+            return null;
+        }
 
-            if (!VectorizeUtility.TryPropagateArgument(outputRank, cos.CheckedShape, axis, lanes, sinCosVectorizedAxes, sinCosLanes))
-            {
-                return null; // Cannot vectorize sincos.
-            }
+        var lane = vectorize.Lanes[0];
+        var rotaryAxis = outputRank - 1;
+        var cosAxis = GetArgumentAxis(outputRank, cos.CheckedShape, rotaryAxis);
+        var sinAxis = GetArgumentAxis(outputRank, sin.CheckedShape, rotaryAxis);
+        if (!CanPackRoPESinCos(cos.CheckedShape, cosAxis, checked(2 * lane))
+            || !CanPackRoPESinCos(sin.CheckedShape, sinAxis, checked(2 * lane)))
+        {
+            return null;
         }
 
         var inputT = caller.WithArguments([(Pack.Input, input)]);
-        var cosT = IR.F.Tensors.Pack(cos, sinCosLanes.ToArray(), sinCosVectorizedAxes.ToArray());
-        var sinT = IR.F.Tensors.Pack(sin, sinCosLanes.ToArray(), sinCosVectorizedAxes.ToArray());
+        var cosT = IR.F.Tensors.Pack(CastToFloat32IfNeeded(cos), [2, lane], [cosAxis, cosAxis]);
+        var sinT = IR.F.Tensors.Pack(CastToFloat32IfNeeded(sin), [2, lane], [sinAxis, sinAxis]);
         return IR.F.NTT.VectorizedRoPE(inputT, cosT, sinT);
+    }
+
+    private static Expr CastToFloat32IfNeeded(Expr expr)
+    {
+        return expr.CheckedDataType == DataTypes.Float32
+            ? expr
+            : IR.F.Tensors.Cast(expr, DataTypes.Float32);
+    }
+
+    private static int GetArgumentAxis(int outputRank, Shape argumentShape, int outputAxis)
+    {
+        return argumentShape is RankedShape rankedShape ? outputAxis - (outputRank - rankedShape.Rank) : -1;
+    }
+
+    private static bool CanPackRoPESinCos(Shape shape, int axis, int laneProduct)
+    {
+        if (shape is not RankedShape rankedShape || axis < 0 || axis >= rankedShape.Rank)
+        {
+            return false;
+        }
+
+        return rankedShape[axis] is DimConst dim && dim.Value % laneProduct == 0;
     }
 }

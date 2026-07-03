@@ -23,6 +23,24 @@ public sealed class UnitTestEvaluatorNTT : TestClassBase
         { new[] { new long[] { 1, 64, 384, 64 }, new long[] { 1, 64, 384, 64 } }, new[] { new[] { 2, 3 }, new[] { 2, 3 } }, 1 },
     };
 
+    [Fact]
+    public void TestVectorizedRoPEMixedSinCosDType()
+    {
+        var input = Testing.Rand<float>(2, 3, 16).CastElementTo(DataTypes.Float16);
+        var cos = Testing.Rand<float>(2, 1, 16);
+        var sin = Testing.Rand<float>(2, 1, 16);
+        var expected = IR.F.NN.RoPE(input, cos, sin);
+        var actual = IR.F.Tensors.Unpack(
+            IR.F.NTT.VectorizedRoPE(
+                IR.F.Tensors.Pack(input, [4], [2]),
+                IR.F.Tensors.Pack(cos, [2, 4], [2, 2]),
+                IR.F.Tensors.Pack(sin, [2, 4], [2, 2])),
+            [4],
+            [2]);
+
+        Comparator.Compare(expected.Evaluate(), actual.Evaluate(), 0.999f);
+    }
+
     [Theory]
     [InlineData(new object[] { false, new long[] { 1, 1, 4, 4 }, new long[] { 8, 1, 3, 3 }, new int[] { 1, 1, 1, 1 }, new int[] { 1, 1 } })]
     [InlineData(new object[] { false, new long[] { 3, 2, 4, 4 }, new long[] { 8, 2, 3, 3 }, new int[] { 0, 0, 1, 1 }, new int[] { 1, 2 } })]

@@ -29,7 +29,7 @@ public sealed class TritonTargetOpCostModel : ITargetOpCostModel
         var memoryCycles = memoryElements / Math.Max(1.0, _capability.EffectiveGlobalMemoryElementsPerCyclePerCta);
         var overlappedCycles = Math.Max(cpuCycles, memoryCycles);
         var latency = overlappedCycles
-            + ToDouble(GetFactor(cost, CostFactorNames.Synchronization))
+            + (ToDouble(GetFactor(cost, CostFactorNames.Synchronization)) * _capability.SynchronizationCycles)
             + ToDouble(GetFactor(cost, CostFactorNames.Comm))
             + ToDouble(GetOtherCost(cost));
         return ToCostFactor(latency);
@@ -106,7 +106,11 @@ public sealed class TritonTargetOpCostModel : ITargetOpCostModel
             || HasVectorDType(query.Rhs.DType)
             || HasVectorDType(query.Output.DType)
             || HasVectorDType(outputDType);
-        var computeCycles = EstimateMatMulComputeCycles(m, n, k, batch, query.Lhs.DType, query.Rhs.DType, outputDType, useDotInstructions);
+        var computeCycles = query.Kind switch
+        {
+            MatMulOpCostKind.Simt => EstimateSimtMatMulComputeCycles(m, n, k, batch),
+            _ => EstimateMatMulComputeCycles(m, n, k, batch, query.Lhs.DType, query.Rhs.DType, outputDType, useDotInstructions),
+        };
 
         cost = ElementwiseCost(
             computeCycles + _capability.FixedOverheadCycles,
@@ -154,6 +158,28 @@ public sealed class TritonTargetOpCostModel : ITargetOpCostModel
         }
 
         return Math.Max(0, m) * Math.Max(0, n) * Math.Max(0, k) * batch;
+    }
+
+    private double EstimateSimtMatMulComputeCycles(long m, long n, long k, double batch)
+    {
+        double paddedM;
+        double paddedN;
+        double paddedK;
+        if (m <= 1)
+        {
+            paddedM = Math.Max(0, m);
+            paddedN = CeilDiv(Math.Max(0, n), 32) * 32;
+            paddedK = CeilDiv(Math.Max(0, k), 256) * 256;
+        }
+        else
+        {
+            paddedM = CeilDiv(Math.Max(0, m), 16) * 16;
+            paddedN = CeilDiv(Math.Max(0, n), 64) * 64;
+            paddedK = CeilDiv(Math.Max(0, k), 64) * 64;
+        }
+
+        var workItems = paddedM * paddedN * paddedK * batch;
+        return workItems / Math.Max(1.0, _capability.SimtFmaPerCyclePerCta);
     }
 
     private long EstimateReductionLaneCount(long lhsLanes, long rhsLanes, long outputLanes)
