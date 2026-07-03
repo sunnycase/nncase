@@ -36,17 +36,30 @@ struct u_rope<vector<half, NTT_VLEN / 16>, NumHeads, HalfDim, true, UseF32> {
                const TCosStrides &cos_strides, const TSinStrides &sin_strides,
                const TOutputStrides &output_strides) noexcept {
         using rope_layout = ukernels::rope_layout;
+        const auto input_apply_strides =
+            ntt::make_strides(input_strides[rope_layout::seq_axis],
+                              input_strides[rope_layout::dim_axis]);
+        const auto cos_apply_strides =
+            ntt::make_strides(cos_strides[rope_layout::sincos_seq_axis],
+                              cos_strides[rope_layout::sincos_dim_axis]);
+        const auto sin_apply_strides =
+            ntt::make_strides(sin_strides[rope_layout::sincos_seq_axis],
+                              sin_strides[rope_layout::sincos_dim_axis]);
+        const auto output_apply_strides =
+            ntt::make_strides(output_strides[rope_layout::seq_axis],
+                              output_strides[rope_layout::dim_axis]);
 
         constexpr auto unroll = 2_dim;
         ntt::apply_tiled(
-            ntt::make_shape(fixed_dim_v<HalfDim>, seq_len),
+            ntt::make_shape(seq_len, fixed_dim_v<HalfDim>),
             ntt::make_shape(1_dim, unroll),
             [&](auto index, auto in_offset, auto cos_offset, auto sin_offset,
                 auto out_offset) {
-                const auto seq_tile = ntt::min(unroll, seq_len - index[1_dim]);
+                const auto dim_tile =
+                    ntt::min(unroll, fixed_dim_v<HalfDim> - index[1_dim]);
 
                 size_t vl =
-                    __riscv_vsetvl_e16m2((size_t)(seq_tile * T::size()));
+                    __riscv_vsetvl_e16m2((size_t)(dim_tile * T::size()));
                 size_t half_vl = vl / 2;
 
                 const T *NTT_RESTRICT cos_0p = cos + cos_offset;
@@ -59,7 +72,7 @@ struct u_rope<vector<half, NTT_VLEN / 16>, NumHeads, HalfDim, true, UseF32> {
                     HalfDim * sin_strides[rope_layout::sincos_dim_axis];
 
                 if constexpr (UseF32) {
-                    if (unroll == seq_tile) {
+                    if (unroll == dim_tile) {
                         vfloat16m2_t v0 =
                             __riscv_vle16_v_f16m2((_Float16 *)(cos_0p),
                                                   vl); // cos_0
@@ -321,8 +334,8 @@ struct u_rope<vector<half, NTT_VLEN / 16>, NumHeads, HalfDim, true, UseF32> {
                     }
                 }
             },
-            input_strides.template slice<1>(), cos_strides, sin_strides,
-            output_strides.template slice<1>());
+            input_apply_strides, cos_apply_strides, sin_apply_strides,
+            output_apply_strides);
     }
 };
 
@@ -340,17 +353,30 @@ struct u_rope<vector<float, NTT_VLEN / 32>, NumHeads, HalfDim, true, UseF32> {
                const TCosStrides &cos_strides, const TSinStrides &sin_strides,
                const TOutputStrides &output_strides) noexcept {
         using rope_layout = ukernels::rope_layout;
+        const auto input_apply_strides =
+            ntt::make_strides(input_strides[rope_layout::seq_axis],
+                              input_strides[rope_layout::dim_axis]);
+        const auto cos_apply_strides =
+            ntt::make_strides(cos_strides[rope_layout::sincos_seq_axis],
+                              cos_strides[rope_layout::sincos_dim_axis]);
+        const auto sin_apply_strides =
+            ntt::make_strides(sin_strides[rope_layout::sincos_seq_axis],
+                              sin_strides[rope_layout::sincos_dim_axis]);
+        const auto output_apply_strides =
+            ntt::make_strides(output_strides[rope_layout::seq_axis],
+                              output_strides[rope_layout::dim_axis]);
 
         constexpr auto unroll = 2_dim;
         ntt::apply_tiled(
-            ntt::make_shape(fixed_dim_v<HalfDim>, seq_len),
+            ntt::make_shape(seq_len, fixed_dim_v<HalfDim>),
             ntt::make_shape(1_dim, unroll),
             [&](auto index, auto in_offset, auto cos_offset, auto sin_offset,
                 auto out_offset) {
-                const auto seq_tile = ntt::min(unroll, seq_len - index[1_dim]);
+                const auto dim_tile =
+                    ntt::min(unroll, fixed_dim_v<HalfDim> - index[1_dim]);
 
                 size_t vl =
-                    __riscv_vsetvl_e32m2((size_t)(seq_tile * T::size()));
+                    __riscv_vsetvl_e32m2((size_t)(dim_tile * T::size()));
 
                 const T *NTT_RESTRICT cos_0p = cos + cos_offset;
                 const T *NTT_RESTRICT sin_0p = sin + sin_offset;
@@ -411,8 +437,8 @@ struct u_rope<vector<float, NTT_VLEN / 32>, NumHeads, HalfDim, true, UseF32> {
                     }
                 }
             },
-            input_strides.template slice<1>(), cos_strides, sin_strides,
-            output_strides.template slice<1>());
+            input_apply_strides, cos_apply_strides, sin_apply_strides,
+            output_apply_strides);
     }
 };
 } // namespace nncase::ntt::ukernels

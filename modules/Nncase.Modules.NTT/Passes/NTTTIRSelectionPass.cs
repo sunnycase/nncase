@@ -47,6 +47,8 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
                 return GenerateClamp(call, arguments, output);
             case IR.Distributed.Boxing boxing:
                 return GenerateBoxing(call, boxing, arguments, ref output, context);
+            case IR.Distributed.ShardedView shardedView:
+                return GenerateShardedView(call, shardedView, arguments, ref output);
             case IR.Distributed.ForceBoxing forceBoxing:
                 return T.Memcopy(output, (Expr)arguments[0]);
             case IR.Math.Binary binary:
@@ -325,6 +327,17 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
             default:
                 throw new NotSupportedException();
         }
+    }
+
+    private Expr GenerateShardedView(Call call, IR.Distributed.ShardedView shardedView, IReadOnlyList<BaseExpr> arguments, ref Expr output)
+    {
+        if (call[IR.Distributed.ShardedView.Input] is not TensorConst tensorConst)
+        {
+            throw new NotSupportedException("ShardedView only supports TensorConst inputs in TIR selection.");
+        }
+
+        output = T.AttachShardedConstView(tensorConst, shardedView.NewType, out _, $"const_sharded_view_{tensorConst.GetHashCode():x}");
+        return T.Nop();
     }
 
     private Expr GenerateReshard(Expr input, ref Expr output, DistributedType inType, DistributedType outType, TIRSelectionContext context)

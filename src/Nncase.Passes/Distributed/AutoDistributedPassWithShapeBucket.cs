@@ -63,16 +63,20 @@ public sealed partial class AutoDistributedWithShapeBucketPass : FunctionPass
         }
         else
         {
-            var rewriter = new AutoDistributedRewriter(_compileOptions, targetOptions, AutoDistributedPhase.SearchConstant, _moduleKind, _bidirectional);
-            rewriter.Rewrite(function);
-
-            var distributedConsts = rewriter.DistributedConsts;
-            var functionWithDistributedConsts = new DistributeConstCloner(distributedConsts).Clone(function, Unit.Default);
-
-            var dumpper = DumpScope.Current;
-            if (dumpper.IsEnabled(DumpFlags.PassIR))
+            var functionForSegments = function;
+            if (!AutoDistributedRewriter.SupportsConstShardedView(targetOptions))
             {
-                dumpper.DumpIR(functionWithDistributedConsts, "FunctionWithDistributedConsts");
+                var rewriter = new AutoDistributedRewriter(_compileOptions, targetOptions, AutoDistributedPhase.SearchConstant, _moduleKind, _bidirectional);
+                rewriter.Rewrite(function);
+
+                var distributedConsts = rewriter.DistributedConsts;
+                functionForSegments = (Function)new DistributeConstCloner(distributedConsts).Clone(function, Unit.Default);
+
+                var dumpper = DumpScope.Current;
+                if (dumpper.IsEnabled(DumpFlags.PassIR))
+                {
+                    dumpper.DumpIR(functionForSegments, "FunctionWithDistributedConsts");
+                }
             }
 
             var segmentFunctions = new List<(Function SegmentFunction, Dictionary<DimVar, DimVar> DimVars)>();
@@ -84,9 +88,9 @@ public sealed partial class AutoDistributedWithShapeBucketPass : FunctionPass
                                   select new KeyValuePair<DimVar, DimVar>(
                                       dimVar,
                                       dimVar.With(range: newRange))).ToDictionary(kvp => kvp.Key, kvp => kvp.Value, (IEqualityComparer<DimVar>)ReferenceEqualityComparer.Instance);
-                var segmentFunction = new SegmentFunctionCloner(newDimVars).Clone(functionWithDistributedConsts, Unit.Default)
+                var segmentFunction = new SegmentFunctionCloner(newDimVars).Clone(functionForSegments, Unit.Default)
                     .With(name: $"{function.Name}_segment_{segmentIndex}");
-                rewriter = new AutoDistributedRewriter(_compileOptions, targetOptions, AutoDistributedPhase.Final, _moduleKind, _bidirectional);
+                var rewriter = new AutoDistributedRewriter(_compileOptions, targetOptions, AutoDistributedPhase.Final, _moduleKind, _bidirectional);
                 segmentFunctions.Add((rewriter.Rewrite(segmentFunction), newDimVars));
             }
 

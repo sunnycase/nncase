@@ -21,13 +21,15 @@
 namespace nncase::ntt {
 namespace ukernels {
 struct rope_layout {
-    // [head, dim, seq]
-    static constexpr auto head_axis = 0_dim;
-    static constexpr auto dim_axis = 1_dim;
-    static constexpr auto seq_axis = 2_dim;
+    // [seq, head, dim]
+    static constexpr auto seq_axis = 0_dim;
+    static constexpr auto head_axis = 1_dim;
+    static constexpr auto dim_axis = 2_dim;
 
-    static constexpr auto sincos_dim_axis = 0_dim;
-    static constexpr auto sincos_seq_axis = 1_dim;
+    // [seq, 1, dim]
+    static constexpr auto sincos_seq_axis = 0_dim;
+    static constexpr auto sincos_head_axis = 1_dim;
+    static constexpr auto sincos_dim_axis = 2_dim;
 };
 
 template <ScalarOrVector T, size_t NumHeads, size_t HalfDim, bool Arch,
@@ -44,9 +46,21 @@ struct u_rope {
                const TOutputStrides &output_strides) noexcept {
         using rope_layout = ukernels::rope_layout;
         using ElemType = typename ntt::element_or_scalar_t<T>;
+        const auto input_apply_strides =
+            ntt::make_strides(input_strides[rope_layout::seq_axis],
+                              input_strides[rope_layout::dim_axis]);
+        const auto cos_apply_strides =
+            ntt::make_strides(cos_strides[rope_layout::sincos_seq_axis],
+                              cos_strides[rope_layout::sincos_dim_axis]);
+        const auto sin_apply_strides =
+            ntt::make_strides(sin_strides[rope_layout::sincos_seq_axis],
+                              sin_strides[rope_layout::sincos_dim_axis]);
+        const auto output_apply_strides =
+            ntt::make_strides(output_strides[rope_layout::seq_axis],
+                              output_strides[rope_layout::dim_axis]);
 
         ntt::apply(
-            ntt::make_shape(fixed_dim_v<HalfDim>, seq_len),
+            ntt::make_shape(seq_len, fixed_dim_v<HalfDim>),
             [&](auto, auto in_offset, auto cos_offset, auto sin_offset,
                 auto out_offset) {
                 const auto cos_0 = cos[cos_offset];
@@ -101,8 +115,8 @@ struct u_rope {
                     }
                 }
             },
-            input_strides.template slice<1>(), cos_strides, sin_strides,
-            output_strides.template slice<1>());
+            input_apply_strides, cos_apply_strides, sin_apply_strides,
+            output_apply_strides);
     }
 };
 } // namespace ukernels

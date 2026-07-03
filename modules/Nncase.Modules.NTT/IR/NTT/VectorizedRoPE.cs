@@ -26,10 +26,10 @@ public sealed partial class VectorizedRoPE : Op
     /// <summary>
     /// Gets cos.
     /// </summary>
-    public static readonly ParameterInfo Cos = new(typeof(VectorizedRoPE), 1, "cos", HasRank(2), ParameterKind.Input);
+    public static readonly ParameterInfo Cos = new(typeof(VectorizedRoPE), 1, "cos", HasRank(3), ParameterKind.Input);
 
     /// <summary>
     /// Gets sin.
     /// </summary>
-    public static readonly ParameterInfo Sin = new(typeof(VectorizedRoPE), 2, "sin", HasRank(2), ParameterKind.Input);
+    public static readonly ParameterInfo Sin = new(typeof(VectorizedRoPE), 2, "sin", HasRank(3), ParameterKind.Input);
 }

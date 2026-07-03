@@ -55,7 +55,7 @@ public class VectorizedRoPEEvaluator : IEvaluator<VectorizedRoPE>, ITypeInferenc
         var cos = cosTensor.ToOrtTensor();
         var sin = sinTensor.ToOrtTensor();
 
-        var sliceAxis = 1;
+        var sliceAxis = inputTensor.Dimensions.Length - 1;
         var sliceDim = inputTensor.Dimensions[sliceAxis] / 2;
         var parts = OrtKI.Split(input, new[] { sliceDim, sliceDim }, sliceAxis);
 
@@ -125,9 +125,11 @@ public class VectorizedRoPEEvaluator : IEvaluator<VectorizedRoPE>, ITypeInferenc
     {
         // only unsupported print without to-string
         if (input.Placement != cos.Placement || cos.Placement != sin.Placement
-            || !AxisEqual(input.AxisPolicies, cos.AxisPolicies, startA: 1, startB: 0)
+            || !Equals(input.AxisPolicies[0], cos.AxisPolicies[0])
+            || cos.AxisPolicies[1] is not SBPBroadCast
+            || !Equals(input.AxisPolicies[2], cos.AxisPolicies[2])
             || !AxisEqual(cos.AxisPolicies, sin.AxisPolicies, startA: 0, startB: 0)
-            || input.AxisPolicies[1] is not SBPBroadCast)
+            || input.AxisPolicies[^1] is not SBPBroadCast)
         {
             return new InvalidType("RoPE: distributed types mismatch (placement/axis/SBP)");
 

@@ -703,9 +703,9 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
             workspaceSetup = $"""
                     data = self.allocate_workspace(inputs, {PythonString(kernel.Name + ".data")}, {dataBytesPerProgram} * grid[0] + {collectiveDataBytes}, {dataDType})
                     block_local_data = self.allocate_workspace(inputs, {PythonString(kernel.Name + ".block_local_data")}, {blockLocalDataBytesPerScope} * {blockLocalDataScopeCount}, {dataDType})
-                    rdata, block_local_rdata = self.materialize_rdata_bundle(inputs, {PythonString(functionName)})
+                    rdata, chip_local_rdata, block_local_rdata = self.materialize_rdata_bundle(inputs, {PythonString(functionName)})
             """;
-            workspaceArgs = new[] { "data", "rdata", "block_local_rdata", "block_local_data" };
+            workspaceArgs = new[] { "data", "rdata", "chip_local_rdata", "block_local_rdata", "block_local_data" };
         }
 
         var runtimeShapeArgs = runtimeShapeArgNames.Select(arg => $"shape_env[{PythonString(arg)}]").ToArray();
@@ -819,9 +819,13 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
 
     private string BuildRDataPython(string outputDirectory)
     {
+        var moduleRData = SerializeModuleRData(primFunction => primFunction.SchedResult.Rdatas, "module_rdata");
+        var moduleChipLocalRData = SerializeModuleRData(primFunction => primFunction.SchedResult.ChipLocalRdatas, "module_chip_local_rdata");
+        var moduleRDataPython = BuildRDataPayloadPython(outputDirectory, "module_rdata.bin", moduleRData.Payload);
+        var moduleChipLocalRDataPython = BuildRDataPayloadPython(outputDirectory, "module_chip_local_rdata.bin", moduleChipLocalRData.Payload);
         var entries = string.Join(
             Environment.NewLine,
-            _functions.Select(function => $"    {PythonString(function.SourceFunction.Name)}: {BuildRDataBundlePython(outputDirectory, function)},"));
+            _functions.Select(function => $"    {PythonString(function.SourceFunction.Name)}: {BuildRDataBundlePython(outputDirectory, function, moduleRData, moduleRDataPython, moduleChipLocalRData, moduleChipLocalRDataPython)},"));
         return $$"""
             # Serialized PyNTT rdata payloads.
             from pathlib import Path
@@ -835,16 +839,37 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
             """;
     }
 
-    private string BuildRDataBundlePython(string outputDirectory, PyNTTLinkableFunction function)
+    private string BuildRDataBundlePython(
+        string outputDirectory,
+        PyNTTLinkableFunction function,
+        SerializedRData moduleRData,
+        string moduleRDataPython,
+        SerializedRData moduleChipLocalRData,
+        string moduleChipLocalRDataPython)
     {
         var bundle = function.RDataBundle;
+        var primFunction = function.SourceFunction as PrimFunction;
+        var usesRData = primFunction?.SchedResult.Rdatas.Count > 0;
+        var usesChipLocalRData = primFunction?.SchedResult.ChipLocalRdatas.Count > 0;
+        if (usesRData && moduleRData.Bytes == 0)
+        {
+            throw new InvalidDataException($"Function {function.SourceFunction.Name} uses PyNTT rdata, but module rdata is empty.");
+        }
+
+        if (usesChipLocalRData && moduleChipLocalRData.Bytes == 0)
+        {
+            throw new InvalidDataException($"Function {function.SourceFunction.Name} uses PyNTT chip local rdata, but module chip local rdata is empty.");
+        }
+
         return "{" +
             string.Join(
                 ", ",
                 new[]
                 {
-                    $"{PythonString("rdata")}: {BuildRDataPayloadPython(outputDirectory, function, "rdata", bundle.RData, null)}",
-                    $"{PythonString("rdata_bytes")}: {bundle.RDataBytes.ToString(CultureInfo.InvariantCulture)}",
+                    $"{PythonString("rdata")}: {(usesRData ? moduleRDataPython : PythonString(string.Empty))}",
+                    $"{PythonString("rdata_bytes")}: {(usesRData ? moduleRData.Bytes : 0).ToString(CultureInfo.InvariantCulture)}",
+                    $"{PythonString("chip_local_rdata")}: {(usesChipLocalRData ? moduleChipLocalRDataPython : PythonString(string.Empty))}",
+                    $"{PythonString("chip_local_rdata_bytes")}: {(usesChipLocalRData ? moduleChipLocalRData.Bytes : 0).ToString(CultureInfo.InvariantCulture)}",
                     $"{PythonString("block_local_rdata")}: {PythonTuple(bundle.BlockLocalRDatas.Select((payload, index) => BuildRDataPayloadPython(outputDirectory, function, "block_local_rdata", payload, index)))}",
                     $"{PythonString("block_local_rdata_bytes")}: {bundle.BlockLocalRDataBytes.ToString(CultureInfo.InvariantCulture)}",
                 }) +
@@ -852,6 +877,13 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
     }
 
     private string BuildRDataPayloadPython(string outputDirectory, PyNTTLinkableFunction function, string section, string payload, int? index)
+    {
+        var suffix = index.HasValue ? $"_{index.Value.ToString(CultureInfo.InvariantCulture)}" : string.Empty;
+        var assetName = $"{SanitizePythonIdentifier(function.SourceFunction.Name)}_{section}{suffix}.bin";
+        return BuildRDataPayloadPython(outputDirectory, assetName, payload);
+    }
+
+    private string BuildRDataPayloadPython(string outputDirectory, string assetName, string payload)
     {
         const string filePrefix = "file:";
         if (!payload.StartsWith(filePrefix, StringComparison.Ordinal))
@@ -867,11 +899,106 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
         var sourcePath = payload[filePrefix.Length..];
         var assetDirectory = Path.Join(outputDirectory, "assets");
         Directory.CreateDirectory(assetDirectory);
-        var suffix = index.HasValue ? $"_{index.Value.ToString(CultureInfo.InvariantCulture)}" : string.Empty;
-        var assetName = $"{SanitizePythonIdentifier(function.SourceFunction.Name)}_{section}{suffix}.bin";
         var destinationPath = Path.Join(assetDirectory, assetName);
         File.Copy(sourcePath, destinationPath, overwrite: true);
         return $"\"file:\" + str(_BASE_DIR / {PythonString(Path.Join("assets", assetName))})";
+    }
+
+    private SerializedRData SerializeModuleRData(
+        Func<PrimFunction, IReadOnlyDictionary<Const, ValueRange<ulong>>> selector,
+        string label)
+    {
+        var allocations = CollectModuleRData(selector);
+        if (allocations.Count == 0)
+        {
+            return new(string.Empty, 0);
+        }
+
+        var poolSize = checked((long)allocations.Max(allocation => allocation.Range.Max));
+        using var payload = CreatePayloadStream(label);
+        var stream = payload.Stream;
+        stream.SetLength(poolSize);
+        foreach (var allocation in allocations)
+        {
+            var tensor = allocation.Const.Value;
+            var size = allocation.Range.Max - allocation.Range.Min;
+            if ((ulong)tensor.BytesBuffer.Length != size)
+            {
+                throw new InvalidDataException("The PyNTT module rdata buffer size does not match the scheduled range.");
+            }
+
+            stream.Position = checked((long)allocation.Range.Min);
+            tensor.Serialize(stream);
+        }
+
+        return new(FinalizePayload(payload), poolSize);
+    }
+
+    private IReadOnlyList<RDataAllocation> CollectModuleRData(
+        Func<PrimFunction, IReadOnlyDictionary<Const, ValueRange<ulong>>> selector)
+    {
+        var allocations = new List<RDataAllocation>();
+        var seenRanges = new Dictionary<RDataRangeKey, TensorConst>();
+        foreach (var function in _functions)
+        {
+            if (function.SourceFunction is not PrimFunction primFunction)
+            {
+                continue;
+            }
+
+            foreach ((var @const, var range) in selector(primFunction))
+            {
+                if (@const is not TensorConst tensorConst)
+                {
+                    throw new NotSupportedException($"PyNTT module rdata only supports TensorConst, got {@const.GetType().Name}.");
+                }
+
+                var key = new RDataRangeKey(range.Min, range.Max);
+                if (seenRanges.TryGetValue(key, out var existing))
+                {
+                    EnsureSameReadOnlyData(existing, tensorConst, key);
+                    continue;
+                }
+
+                seenRanges.Add(key, tensorConst);
+                allocations.Add(new(tensorConst, range));
+            }
+        }
+
+        return allocations.OrderBy(allocation => allocation.Range.Min).ToArray();
+    }
+
+    private void EnsureSameReadOnlyData(TensorConst lhs, TensorConst rhs, RDataRangeKey range)
+    {
+        var lhsTensor = lhs.Value;
+        var rhsTensor = rhs.Value;
+        if (lhsTensor.ElementType != rhsTensor.ElementType ||
+            !lhsTensor.Dimensions.ToArray().SequenceEqual(rhsTensor.Dimensions.ToArray()) ||
+            !lhsTensor.Strides.ToArray().SequenceEqual(rhsTensor.Strides.ToArray()) ||
+            lhsTensor.BytesBuffer.Length != rhsTensor.BytesBuffer.Length ||
+            !lhsTensor.BytesBuffer.SequenceEqual(rhsTensor.BytesBuffer))
+        {
+            throw new InvalidDataException($"PyNTT module rdata range [{range.Min}, {range.Max}) is assigned to different constants.");
+        }
+    }
+
+    private PayloadStream CreatePayloadStream(string label)
+    {
+        var directory = Path.Join(Path.GetTempPath(), "nncase_pyntt_rdata");
+        Directory.CreateDirectory(directory);
+        var path = Path.Join(directory, $"module_{label}_{Guid.NewGuid():N}.bin");
+        return new(new FileStream(path, FileMode.Create, FileAccess.ReadWrite, FileShare.None), path);
+    }
+
+    private string FinalizePayload(PayloadStream payload)
+    {
+        payload.Stream.Flush();
+        if (!string.IsNullOrEmpty(payload.Path))
+        {
+            return $"file:{payload.Path}";
+        }
+
+        throw new InvalidOperationException("PyNTT rdata payloads must be backed by binary files.");
     }
 
     private ShapeBindingMetadata[] GetShapeBindings(BaseFunction function)
@@ -981,4 +1108,18 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
         string Memory);
 
     private sealed record ShapeBindingMetadata(string Name, int InputIndex, int Axis, long? MinValue, long? MaxValue);
+
+    private sealed record SerializedRData(string Payload, long Bytes);
+
+    private sealed record RDataAllocation(TensorConst Const, ValueRange<ulong> Range);
+
+    private sealed record RDataRangeKey(ulong Min, ulong Max);
+
+    private sealed record PayloadStream(Stream Stream, string? Path) : IDisposable
+    {
+        public void Dispose()
+        {
+            Stream.Dispose();
+        }
+    }
 }

@@ -41,7 +41,7 @@ public abstract class BufferScheduler
                 }
             }
         }
-        else if (memoryLocation is MemoryLocation.Output or MemoryLocation.Rdata or MemoryLocation.BlockLocalRdata)
+        else if (memoryLocation is MemoryLocation.Output or MemoryLocation.Rdata or MemoryLocation.ChipLocalRdata or MemoryLocation.BlockLocalRdata)
         {
             var scheduler = new LinearBufferScheduler(memoryLocation);
             if (scheduler.TrySchedule(lifetimes, options, out var result))
@@ -58,7 +58,7 @@ public abstract class BufferScheduler
         var result = new Dictionary<MemoryLocation, BufferScheduleResult>();
         foreach (var group in lifetimes.GroupBy(x => x.Value.Buffer.Location))
         {
-            if (group.Key is MemoryLocation.Output or MemoryLocation.Data or MemoryLocation.BlockLocalData or MemoryLocation.Rdata or MemoryLocation.BlockLocalRdata)
+            if (group.Key is MemoryLocation.Output or MemoryLocation.Data or MemoryLocation.BlockLocalData or MemoryLocation.Rdata or MemoryLocation.ChipLocalRdata or MemoryLocation.BlockLocalRdata)
             {
                 var lifetimeDict = group.ToDictionary(x => x.Key, x => x.Value, (IEqualityComparer<TIR.PhysicalBuffer>)ReferenceEqualityComparer.Instance);
                 result.Add(group.Key, Schedule(group.Key, lifetimeDict, options(group.Key)));

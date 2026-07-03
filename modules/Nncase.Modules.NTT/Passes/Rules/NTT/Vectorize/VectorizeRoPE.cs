@@ -45,6 +45,11 @@ public sealed partial class VectorizeRoPEPropagation : RewriteRule<Pattern>
     {
         var outputShape = (RankedShape)caller.CheckedShape;
         var outputRank = outputShape.Rank;
+        if (vectorize.Axes.Any(axis => axis != outputRank - 1))
+        {
+            return null;
+        }
+
         if (vectorize.Axes.Contains(outputRank - 1))
         {
             var lastDim = outputShape[^1];
@@ -70,11 +75,9 @@ public sealed partial class VectorizeRoPEPropagation : RewriteRule<Pattern>
             }
         }
 
-        // [head, seq, dim] -> [head, dim, seq]
-        var inputT = IR.F.Tensors.Transpose(caller.WithArguments([(Pack.Input, input)]), [0, 2, 1]);
-        var cosT = IR.F.Tensors.Transpose(IR.F.Tensors.Pack(cos, sinCosLanes.ToArray(), sinCosVectorizedAxes.ToArray()), [1, 0]);
-        var sinT = IR.F.Tensors.Transpose(IR.F.Tensors.Pack(sin, sinCosLanes.ToArray(), sinCosVectorizedAxes.ToArray()), [1, 0]);
-        var outputT = IR.F.NTT.VectorizedRoPE(inputT, cosT, sinT);
-        return IR.F.Tensors.Transpose(outputT, [0, 2, 1]);
+        var inputT = caller.WithArguments([(Pack.Input, input)]);
+        var cosT = IR.F.Tensors.Pack(cos, sinCosLanes.ToArray(), sinCosVectorizedAxes.ToArray());
+        var sinT = IR.F.Tensors.Pack(sin, sinCosLanes.ToArray(), sinCosVectorizedAxes.ToArray());
+        return IR.F.NTT.VectorizedRoPE(inputT, cosT, sinT);
     }
 }

@@ -32,9 +32,6 @@ namespace Nncase.Importer
 
         public override System.Tuple<Call, Call> ApplyRotaryPosEmb(Expr q, Expr k, Expr cos, Expr sin, long unSqueezeDim = 1)
         {
-            cos = IR.F.Tensors.Unsqueeze(cos, Tensor.From<long>(new long[] { 0 }));
-            sin = IR.F.Tensors.Unsqueeze(sin, Tensor.From<long>(new long[] { 0 }));
-
             var cosShape = IR.F.Tensors.ShapeOf(cos).AsShape();
             var sinShape = IR.F.Tensors.ShapeOf(sin).AsShape();
 

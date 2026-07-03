@@ -83,6 +83,7 @@ class RDataCache:
 
     def prepare_bundle(self, bundle: dict[str, Any]) -> None:
         self.prepare_payload(bundle["rdata"], bundle["rdata_bytes"])
+        self.prepare_payload(bundle.get("chip_local_rdata", ""), bundle.get("chip_local_rdata_bytes", 0))
         self.prepare_table(bundle["block_local_rdata"], bundle["block_local_rdata_bytes"])
 
     def materialize_bundle(
@@ -93,6 +94,7 @@ class RDataCache:
     ):
         return (
             self.materialize_payload(inputs, bundle["rdata"], bundle["rdata_bytes"], device),
+            self.materialize_payload(inputs, bundle.get("chip_local_rdata", ""), bundle.get("chip_local_rdata_bytes", 0), device),
             self.materialize_table(inputs, bundle["block_local_rdata"], bundle["block_local_rdata_bytes"], device),
         )
 

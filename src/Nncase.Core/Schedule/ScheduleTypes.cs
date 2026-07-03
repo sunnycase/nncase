@@ -84,6 +84,7 @@ public sealed class SchedFunctionResult
     public SchedFunctionResult()
     {
         Rdatas = new(ReferenceEqualityComparer.Instance);
+        ChipLocalRdatas = new(ReferenceEqualityComparer.Instance);
         BlockLocalRdatas = new(ReferenceEqualityComparer.Instance);
         DataUsage = 0;
         BlockLocalDataPoolSize = 0;
@@ -94,6 +95,11 @@ public sealed class SchedFunctionResult
     /// Gets the buffer allocation.
     /// </summary>
     public Dictionary<IR.Const, ValueRange<ulong>> Rdatas { get; }
+
+    /// <summary>
+    /// Gets the chip local readonly buffer allocation.
+    /// </summary>
+    public Dictionary<IR.Const, ValueRange<ulong>> ChipLocalRdatas { get; }
 
     /// <summary>
     /// Gets the buffer allocation.
@@ -137,17 +143,15 @@ public sealed class SchedFunctionResult
             return false;
         }
 
-        if (Rdatas.Count != result.Rdatas.Count)
+        if (Rdatas.Count != result.Rdatas.Count ||
+            ChipLocalRdatas.Count != result.ChipLocalRdatas.Count ||
+            BlockLocalRdatas.Count != result.BlockLocalRdatas.Count)
         {
             return false;
         }
 
-        if (Rdatas.Count == 0)
-        {
-            return true;
-        }
-
         return EqualityComparer<Dictionary<IR.Const, ValueRange<ulong>>>.Default.Equals(Rdatas, result.Rdatas) &&
+                EqualityComparer<Dictionary<IR.Const, ValueRange<ulong>>>.Default.Equals(ChipLocalRdatas, result.ChipLocalRdatas) &&
                 EqualityComparer<Dictionary<IR.Const, ValueRange<ulong>>>.Default.Equals(BlockLocalRdatas, result.BlockLocalRdatas) &&
                 EqualityComparer<ulong>.Default.Equals(DataUsage, result.DataUsage) &&
                 EqualityComparer<ulong>.Default.Equals(DataAlign, result.DataAlign);

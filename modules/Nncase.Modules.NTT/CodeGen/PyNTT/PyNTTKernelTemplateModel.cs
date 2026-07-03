@@ -3,7 +3,7 @@
 
 namespace Nncase.CodeGen.PyNTT;
 
-public sealed record PyNTTBufferPointerTemplateModel(string Expression);
+public sealed record PyNTTBufferPointerTemplateModel(string Expression, int[]? ShardCoordHierarchy = null);
 
 public sealed record PyNTTTensorLoadTemplateModel(
     string FunctionName,

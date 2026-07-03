@@ -271,9 +271,7 @@ public static class FunctionSamples
             // %20 = VectorizedCast(f16<64>, ... , %19, None)
             var v20 = IR.F.Tensors.Cast(v19, DataTypes.Float16);
 
-            // %21 = Transpose(%20, [1,0]) -> [2,sequence_length]
-            // var v21 = IR.F.Tensors.Transpose(v20, [1, 0]);
-            var v21 = v20; // [sequence_length, dim]
+            var v21 = IR.F.Tensors.Unsqueeze(v20, [1]); // [sequence_length, 1, dim]
 
             // %22 = Sin(%18)
             var v22 = IR.F.Math.Unary(UnaryOp.Sin, v18);
@@ -281,9 +279,7 @@ public static class FunctionSamples
             // %23 = VectorizedCast(f16<64>, ... , %22, None)
             var v23 = IR.F.Tensors.Cast(v22, DataTypes.Float16);
 
-            // %24 = Transpose(%23, [1,0]) -> [2,sequence_length]
-            // var v24 = IR.F.Tensors.Transpose(v23, [1, 0]);
-            var v24 = v23; // [sequence_length, dim]
+            var v24 = IR.F.Tensors.Unsqueeze(v23, [1]); // [sequence_length, 1, dim]
 
             // %25 = VectorizedRoPE(%15, %21, %24)
             var v25 = IR.F.NN.RoPE(v15, v21, v24);

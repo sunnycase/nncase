@@ -5,6 +5,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Reactive;
+using System.Security.Cryptography;
 using System.Text;
 using Nncase.Diagnostics;
 using Nncase.IR;
@@ -16,7 +17,10 @@ namespace Nncase.Schedule.Bufferize;
 public sealed class BufferizeVisitor : ExprRewriter
 {
     private readonly IGrouping<string, PrimFunction> _functions;
+    private readonly Dictionary<ReadOnlyDataKey, ValueRange<ulong>> _rdataRanges = new();
+    private readonly Dictionary<ReadOnlyDataKey, ValueRange<ulong>> _chipLocalRdataRanges = new();
     private long _currentRdataStart;
+    private long _currentChipLocalRdataStart;
     private long _currentBlockLocalRdataStart;
     private int _dataBufferId;
 
@@ -42,9 +46,12 @@ public sealed class BufferizeVisitor : ExprRewriter
             var scheduleResult = BufferScheduler.Schedule(lifetimes, x => x switch
             {
                 MemoryLocation.Rdata => new BufferScheduleOptions(_currentRdataStart),
+                MemoryLocation.ChipLocalRdata => new BufferScheduleOptions(_currentChipLocalRdataStart),
                 MemoryLocation.BlockLocalRdata => new BufferScheduleOptions(_currentBlockLocalRdataStart),
                 _ => new BufferScheduleOptions(),
             });
+            ReuseReadOnlyRDataResult(scheduleResult, MemoryLocation.Rdata, _rdataRanges);
+            ReuseReadOnlyRDataResult(scheduleResult, MemoryLocation.ChipLocalRdata, _chipLocalRdataRanges);
 
             if (DumpScope.Current.IsEnabled(DumpFlags.Schedule))
             {
@@ -56,6 +63,7 @@ public sealed class BufferizeVisitor : ExprRewriter
             AssignDataResult(func, scheduleResult);
             AssignBlockLocalDataResult(func, scheduleResult);
             AssignRdataResult(func, scheduleResult);
+            AssignChipLocalRdataResult(func, scheduleResult);
             AssignBlockLocalRdataResult(func, scheduleResult);
 
             var bufferReplaces = scheduleResult.SelectMany(x => x.Value.Buffers).ToDictionary(ReferenceEqualityComparer.Instance);
@@ -128,7 +136,22 @@ public sealed class BufferizeVisitor : ExprRewriter
                 func.SchedResult.Rdatas.Add(constValue, range);
             }
 
-            _currentRdataStart = rdataResult.MemoryPoolEnd;
+            _currentRdataStart = GetReadOnlyRDataEnd(_rdataRanges);
+        }
+    }
+
+    private void AssignChipLocalRdataResult(PrimFunction func, IReadOnlyDictionary<MemoryLocation, BufferScheduleResult> scheduleResult)
+    {
+        if (scheduleResult.TryGetValue(MemoryLocation.ChipLocalRdata, out var chipLocalRdataResult))
+        {
+            foreach ((var buffer, var lifetime) in chipLocalRdataResult.Buffers)
+            {
+                var constValue = (Const)((Call)buffer.Start)[IR.Buffers.AddressOf.Input];
+                var range = new ValueRange<ulong>((ulong)lifetime.Memory.Start, (ulong)lifetime.Memory.Stop);
+                func.SchedResult.ChipLocalRdatas.Add(constValue, range);
+            }
+
+            _currentChipLocalRdataStart = GetReadOnlyRDataEnd(_chipLocalRdataRanges);
         }
     }
 
@@ -145,6 +168,59 @@ public sealed class BufferizeVisitor : ExprRewriter
 
             _currentBlockLocalRdataStart = blockLocalRdataResult.MemoryPoolEnd;
         }
+    }
+
+    private void ReuseReadOnlyRDataResult(
+        IReadOnlyDictionary<MemoryLocation, BufferScheduleResult> scheduleResult,
+        MemoryLocation memoryLocation,
+        Dictionary<ReadOnlyDataKey, ValueRange<ulong>> ranges)
+    {
+        if (!scheduleResult.TryGetValue(memoryLocation, out var result))
+        {
+            return;
+        }
+
+        foreach ((var buffer, var lifetime) in result.Buffers)
+        {
+            var constValue = GetAddressOfConst(buffer.Start);
+            var key = GetReadOnlyDataKey(constValue);
+            if (ranges.TryGetValue(key, out var existingRange))
+            {
+                lifetime.Memory = new Interval(checked((long)existingRange.Min), checked((long)existingRange.Max));
+                continue;
+            }
+
+            ranges.Add(key, new ValueRange<ulong>((ulong)lifetime.Memory.Start, (ulong)lifetime.Memory.Stop));
+        }
+    }
+
+    private long GetReadOnlyRDataEnd(Dictionary<ReadOnlyDataKey, ValueRange<ulong>> ranges)
+        => ranges.Count == 0 ? 0L : checked((long)ranges.Values.Max(range => range.Max));
+
+    private Const GetAddressOfConst(Expr start)
+    {
+        if (start is Call call && call.Target is IR.Buffers.AddressOf && call[IR.Buffers.AddressOf.Input] is Const constValue)
+        {
+            return constValue;
+        }
+
+        throw new InvalidOperationException($"Bufferized readonly data expects AddressOf(Const), got {start}.");
+    }
+
+    private ReadOnlyDataKey GetReadOnlyDataKey(Const constValue)
+    {
+        if (constValue is not TensorConst tensorConst)
+        {
+            throw new NotSupportedException($"Bufferized readonly data only supports TensorConst, got {constValue.GetType().Name}.");
+        }
+
+        var tensor = tensorConst.Value;
+        return new(
+            tensor.ElementType.GetDisplayName(),
+            string.Join(",", tensor.Dimensions.ToArray()),
+            string.Join(",", tensor.Strides.ToArray()),
+            tensor.BytesBuffer.Length,
+            Convert.ToHexString(SHA256.HashData(tensor.BytesBuffer)));
     }
 
     private void DumpSchedule(TIR.Buffer[] buffers, IReadOnlyDictionary<MemoryLocation, BufferScheduleResult> scheduleResult)
@@ -280,4 +356,6 @@ show(p)");
             return expr;
         }
     }
+
+    private sealed record ReadOnlyDataKey(string ElementType, string Dimensions, string Strides, int ByteLength, string Hash);
 }

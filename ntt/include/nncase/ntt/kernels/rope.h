@@ -22,7 +22,7 @@ template <bool UseF32 = false, Tensor TInput, Tensor TCos, Tensor TSin,
 void rope(const TInput &input, const TCos &cos, const TSin &sin,
           TOut &&output) {
     using rope_layout = ukernels::rope_layout;
-    // [head, dim, seq]
+    // [seq, head, dim]
     const auto half_dim = input.shape()[rope_layout::dim_axis] / 2_dim;
     const auto num_heads = input.shape()[rope_layout::head_axis];
     const auto seq_len = input.shape()[rope_layout::seq_axis];

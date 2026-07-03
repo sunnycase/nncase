@@ -92,9 +92,9 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             Grid,
         }
 
-        private const string ShardCoordDimPrefix = "__pyntt_shard_coord_";
+        private const string ShardCoordDimPrefix = "__shard_coord_";
 
-        private static readonly string[] WorkspaceParameterNames = { "data", "rdata", "block_local_rdata", "block_local_data" };
+        private static readonly string[] WorkspaceParameterNames = { "data", "rdata", "chip_local_rdata", "block_local_rdata", "block_local_data" };
 
         private readonly PrimFunction _function;
         private readonly IReadOnlyDictionary<IVar, string> _parameterNames;
@@ -212,6 +212,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                         ["block_local_data_pool_bytes"] = checked((long)_function.SchedResult.BlockLocalDataPoolSize),
                         ["block_local_data_scope_count"] = GetBlockLocalDataScopeCount(_targetOptions),
                         ["rdata_pool_bytes"] = GetPoolSizeBytes(_function.SchedResult.Rdatas),
+                        ["chip_local_rdata_pool_bytes"] = GetPoolSizeBytes(_function.SchedResult.ChipLocalRdatas),
                         ["block_local_rdata_pool_bytes"] = GetPoolSizeBytes(_function.SchedResult.BlockLocalRdatas),
                         ["block_local_rdata_stride_bytes"] = PyNTTRDataUtility.GetLocalRDataTableStrideBytes(_function.SchedResult.BlockLocalRdatas, _targetOptions, "b"),
                     }));
@@ -2113,9 +2114,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 throw new NotSupportedException($"PyNTT RoPE expects matching input/cos/sin/output vector lanes, got input={inputVectorLaneCount}, cos={cosVectorLaneCount}, sin={sinVectorLaneCount}, output={outputVectorLaneCount}.");
             }
 
-            var rotaryAxis = outputVectorLaneCount > 1
-                ? outputShape.Length - 2
-                : outputShape.Length - 1;
+            var rotaryAxis = outputShape.Length - 1;
             if (rotaryAxis < 0)
             {
                 throw new NotSupportedException($"PyNTT RoPE requires a non-scalar output, got [{ShapeText(outputShape)}].");
@@ -2759,19 +2758,19 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
         private PyNTTBufferPointerTemplateModel GetBufferPointer(TIR.Buffer buffer)
         {
             var bufferRef = ResolveBufferRef(buffer);
-            return new(BuildPointerExpression(bufferRef, GetTritonDType(buffer.ElemType)));
+            return new(BuildPointerExpression(bufferRef, GetTritonDType(buffer.ElemType)), bufferRef.ShardCoordHierarchy);
         }
 
         private PyNTTBufferPointerTemplateModel GetBufferScalarPointer(TIR.Buffer buffer)
         {
             var bufferRef = ResolveBufferRef(buffer);
-            return new(BuildPointerExpression(bufferRef, GetScalarTritonDType(buffer.ElemType)));
+            return new(BuildPointerExpression(bufferRef, GetScalarTritonDType(buffer.ElemType)), bufferRef.ShardCoordHierarchy);
         }
 
         private PyNTTBufferPointerTemplateModel GetBufferScalarPointer(TIR.Buffer buffer, string indexExpression)
         {
             var bufferRef = ResolveBufferRef(buffer) with { IndexExpression = indexExpression };
-            return new(BuildPointerExpression(bufferRef, GetScalarTritonDType(buffer.ElemType)));
+            return new(BuildPointerExpression(bufferRef, GetScalarTritonDType(buffer.ElemType)), bufferRef.ShardCoordHierarchy);
         }
 
         private PyNTTDimExpression[] GetTensorShape(BaseExpr expr, string name)
@@ -2785,12 +2784,16 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
         private BufferRef ResolveBufferRef(TIR.Buffer buffer)
         {
             var offsetBytes = GetBufferOffsetBytes(buffer);
+            var shardCoordHierarchy = RequiresShardCoords(offsetBytes)
+                ? GetShardCoordHierarchy(buffer)
+                : null;
             return buffer.MemSpan.Buffer.Location switch
             {
-                MemoryLocation.Data => new("data", offsetBytes, checked((long)_function.SchedResult.DataUsage), "shard_index"),
-                MemoryLocation.BlockLocalData => new("block_local_data", offsetBytes, checked((long)_function.SchedResult.BlockLocalDataPoolSize), BuildBlockLocalDataIndexExpression(_targetOptions)),
-                MemoryLocation.Rdata => new("rdata", offsetBytes, 0, null),
-                MemoryLocation.BlockLocalRdata => new("block_local_rdata", offsetBytes, PyNTTRDataUtility.GetLocalRDataTableStrideBytes(_function.SchedResult.BlockLocalRdatas, _targetOptions, "b"), "shard_index"),
+                MemoryLocation.Data => new("data", offsetBytes, checked((long)_function.SchedResult.DataUsage), "shard_index", shardCoordHierarchy),
+                MemoryLocation.BlockLocalData => new("block_local_data", offsetBytes, checked((long)_function.SchedResult.BlockLocalDataPoolSize), BuildBlockLocalDataIndexExpression(_targetOptions), shardCoordHierarchy),
+                MemoryLocation.Rdata => new("rdata", offsetBytes, 0, null, shardCoordHierarchy),
+                MemoryLocation.ChipLocalRdata => new("chip_local_rdata", offsetBytes, 0, null, shardCoordHierarchy),
+                MemoryLocation.BlockLocalRdata => new("block_local_rdata", offsetBytes, PyNTTRDataUtility.GetLocalRDataTableStrideBytes(_function.SchedResult.BlockLocalRdatas, _targetOptions, "b"), "shard_index", shardCoordHierarchy),
                 var location => throw new NotSupportedException($"PyNTT does not support buffer memory location {location} for Triton template operands yet."),
             };
         }
@@ -2883,7 +2886,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
         private string GetBufferOffsetBytes(TIR.Buffer buffer)
         {
             var physicalOffset = GetDimensionExpression(buffer.MemSpan.Buffer.Start, $"{buffer.MemSpan.Buffer.Location} physical buffer offset");
-            var spanOffset = GetDimensionExpression(buffer.MemSpan.Start, $"{buffer.MemSpan.Buffer.Location} memspan offset");
+            var spanOffset = GetLocalRegionDimensionExpression(buffer.MemSpan.Start);
             return AddOffsetExpressions(physicalOffset.TritonExpression, spanOffset.TritonExpression);
         }
 
@@ -3011,6 +3014,14 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
 
         private static bool IsZeroOffset(string expression)
             => string.Equals(expression.Trim(), "0", StringComparison.Ordinal);
+
+        private static bool RequiresShardCoords(string expression)
+            => expression.Contains("shard_coord", StringComparison.Ordinal);
+
+        private int[] GetShardCoordHierarchy(TIR.Buffer buffer)
+            => buffer.DistributedType is { } distributedType
+                ? distributedType.Placement.Hierarchy.ToArray()
+                : GetBlockHierarchy(_targetOptions);
 
         private static string BuildThreadIdExpression(PyNTTTargetOptions targetOptions)
             => "0";
@@ -3175,7 +3186,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             return expr;
         }
 
-        private sealed record BufferRef(string BaseName, string OffsetBytes, long PoolBytes, string? IndexExpression);
+        private sealed record BufferRef(string BaseName, string OffsetBytes, long PoolBytes, string? IndexExpression, int[]? ShardCoordHierarchy);
     }
 
     private static LaunchMetadata BuildLaunchMetadata(OutputInfo output, PyNTTTargetOptions targetOptions, Dictionary<string, object>? extraMeta = null)
@@ -3276,7 +3287,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
     {
         var inputs = kernel.Inputs.Select((_, index) => $"input{index}").ToArray();
         var outputs = kernel.Outputs.Select((_, index) => $"output{index}").ToArray();
-        var workspaceParameters = new[] { "data", "rdata", "block_local_rdata", "block_local_data" };
+        var workspaceParameters = new[] { "data", "rdata", "chip_local_rdata", "block_local_rdata", "block_local_data" };
         var runtimeShapeArgs = GetRuntimeShapeArgs(kernel);
         var gridBarrierParameters = kernel.Attrs.ContainsKey("requires_grid_barrier")
             ? new[] { "pyntt_grid_mesh: tl.constexpr" }

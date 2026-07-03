@@ -496,9 +496,6 @@ public abstract class HuggingFaceModel
         var queryStates = Linear(hiddenStates, qProjW, qProjB, ifScaleQ, wScaleQ, $"model.layers.{count}.self_attn.q_proj");
         queryStates = IR.F.Tensors.Reshape(queryStates, hidden_shape);
 
-        // batch_size, num_heads, seq_len, head_dim
-        queryStates = IR.F.Tensors.Transpose(queryStates, new long[] { 1, 0, 2 });
-
         var kProjW = GetWeight($"model.layers.{count}.self_attn.k_proj.weight")!;
         var kProjB = GetWeight($"model.layers.{count}.self_attn.k_proj.bias");
 
@@ -506,7 +503,6 @@ public abstract class HuggingFaceModel
         var wScaleK = GetWeight($"model.layers.{count}.self_attn.k_proj.weight_scale");
         var keyStates = Linear(hiddenStates, kProjW, kProjB, ifScaleK, wScaleK, $"model.layers.{count}.self_attn.k_proj");
         keyStates = IR.F.Tensors.Reshape(keyStates, hidden_shape);
-        keyStates = IR.F.Tensors.Transpose(keyStates, new long[] { 1, 0, 2 });
 
         var vProjW = GetWeight($"model.layers.{count}.self_attn.v_proj.weight")!;
         var vProjB = GetWeight($"model.layers.{count}.self_attn.v_proj.bias");
@@ -515,7 +511,6 @@ public abstract class HuggingFaceModel
         var wScaleV = GetWeight($"model.layers.{count}.self_attn.v_proj.weight_scale");
         var valueStates = Linear(hiddenStates, vProjW, vProjB, ifScaleV, wScaleV, $"model.layers.{count}.self_attn.v_proj");
         valueStates = IR.F.Tensors.Reshape(valueStates, hidden_shape);
-        valueStates = IR.F.Tensors.Transpose(valueStates, new long[] { 1, 0, 2 });
         return System.Tuple.Create(queryStates, keyStates, valueStates);
     }
 
@@ -563,6 +558,8 @@ public abstract class HuggingFaceModel
 
         cos = IR.F.Tensors.Cast(cos, x.CheckedDataType);
         sin = IR.F.Tensors.Cast(sin, x.CheckedDataType);
+        cos = IR.F.Tensors.Unsqueeze(cos, [1]);
+        sin = IR.F.Tensors.Unsqueeze(sin, [1]);
 
         return System.Tuple.Create(cos, sin);
     }
@@ -835,8 +832,8 @@ public abstract class HuggingFaceModel
         // // apply_rotary_pos_emb
         (queryStates, keyStates) = ApplyRotaryPosEmb(queryStates, keyStates, cos, sin);
         var qType = ((Expr)queryStates).CheckedDataType;
-        AttentionDimKind[] qSrcLayout = [AttentionDimKind.Head, AttentionDimKind.Seq, AttentionDimKind.Dim];
-        AttentionDimKind[] kvSrcLayout = [AttentionDimKind.Head, AttentionDimKind.Seq, AttentionDimKind.Dim];
+        AttentionDimKind[] qSrcLayout = [AttentionDimKind.Seq, AttentionDimKind.Head, AttentionDimKind.Dim];
+        AttentionDimKind[] kvSrcLayout = [AttentionDimKind.Seq, AttentionDimKind.Head, AttentionDimKind.Dim];
         {
             AttentionDimKind[] kvDestLayout = { AttentionDimKind.Head, AttentionDimKind.Dim, AttentionDimKind.Seq };
             var kvPerms = ModelUtils.GetLayoutPerm(kvSrcLayout, kvDestLayout);
@@ -897,8 +894,6 @@ public abstract class HuggingFaceModel
         // {
         //     output = seq_len is DimVar ? IR.F.Tensors.Slice(output, new[] { 0 }, new Dimension[] { seq_len }, new[] { 1 }, new[] { 1 }) : output;
         // }
-        output = IR.F.Tensors.Transpose(output, new[] { 1, 0, 2 });
-
         output = IR.F.Tensors.Reshape(output, new RankedShape(seq_len, -1L));
         var oProjW = GetWeight($"model.layers.{count}.self_attn.o_proj.weight")!;
 

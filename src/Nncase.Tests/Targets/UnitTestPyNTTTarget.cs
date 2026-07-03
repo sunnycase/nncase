@@ -144,6 +144,7 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         Assert.True(launchMeta.GetProperty("data_pool_elements").GetInt64() > 0);
         Assert.Equal("uint8", launchMeta.GetProperty("data_dtype").GetString());
         Assert.Equal(0, launchMeta.GetProperty("rdata_pool_bytes").GetInt64());
+        Assert.Equal(0, launchMeta.GetProperty("chip_local_rdata_pool_bytes").GetInt64());
         Assert.Equal(0, launchMeta.GetProperty("block_local_rdata_pool_bytes").GetInt64());
         Assert.False(launchMeta.TryGetProperty(RemovedLocalMeta("thread", "rdata", "pool_bytes"), out _));
         Assert.False(launchMeta.TryGetProperty(RemovedLocalMeta("warp", "rdata", "pool_bytes"), out _));
@@ -162,15 +163,15 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         Assert.Contains("generated from PyNTT Jinja TensorLoad.py.jinja", generatedKernelsPy, StringComparison.Ordinal);
         Assert.Contains("generated from PyNTT Jinja ElementwiseBinary.py.jinja", generatedKernelsPy, StringComparison.Ordinal);
         Assert.Contains("generated from PyNTT Jinja TensorStore.py.jinja", generatedKernelsPy, StringComparison.Ordinal);
-        Assert.Contains("def main_prim_tensor_load_0(source, data, rdata, block_local_rdata, block_local_data, block_size: tl.constexpr):", generatedKernelsPy, StringComparison.Ordinal);
-        Assert.Contains("def main_prim_tensor_load_1(source, data, rdata, block_local_rdata, block_local_data, block_size: tl.constexpr):", generatedKernelsPy, StringComparison.Ordinal);
-        Assert.Contains("def main_prim_elementwise_binary_0(data, rdata, block_local_rdata, block_local_data, block_size: tl.constexpr):", generatedKernelsPy, StringComparison.Ordinal);
-        Assert.Contains("def main_prim_tensor_store_0(destination, data, rdata, block_local_rdata, block_local_data, block_size: tl.constexpr):", generatedKernelsPy, StringComparison.Ordinal);
-        Assert.Contains("main_prim_tensor_load_0(input0, data, rdata, block_local_rdata, block_local_data, block_size)", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("def main_prim_tensor_load_0(source, data, rdata, chip_local_rdata, block_local_rdata, block_local_data, block_size: tl.constexpr):", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("def main_prim_tensor_load_1(source, data, rdata, chip_local_rdata, block_local_rdata, block_local_data, block_size: tl.constexpr):", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("def main_prim_elementwise_binary_0(data, rdata, chip_local_rdata, block_local_rdata, block_local_data, block_size: tl.constexpr):", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("def main_prim_tensor_store_0(destination, data, rdata, chip_local_rdata, block_local_rdata, block_local_data, block_size: tl.constexpr):", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("main_prim_tensor_load_0(input0, data, rdata, chip_local_rdata, block_local_rdata, block_local_data, block_size)", generatedKernelsPy, StringComparison.Ordinal);
         Assert.Contains("tl.debug_barrier()", generatedKernelsPy, StringComparison.Ordinal);
-        Assert.Contains("main_prim_tensor_load_1(input1, data, rdata, block_local_rdata, block_local_data, block_size)", generatedKernelsPy, StringComparison.Ordinal);
-        Assert.Contains("main_prim_elementwise_binary_0(data, rdata, block_local_rdata, block_local_data, block_size)", generatedKernelsPy, StringComparison.Ordinal);
-        Assert.Contains("main_prim_tensor_store_0(output0, data, rdata, block_local_rdata, block_local_data, block_size)", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("main_prim_tensor_load_1(input1, data, rdata, chip_local_rdata, block_local_rdata, block_local_data, block_size)", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("main_prim_elementwise_binary_0(data, rdata, chip_local_rdata, block_local_rdata, block_local_data, block_size)", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("main_prim_tensor_store_0(output0, data, rdata, chip_local_rdata, block_local_rdata, block_local_data, block_size)", generatedKernelsPy, StringComparison.Ordinal);
         Assert.Contains("shard_coord1 = tmp_shard % 8", generatedKernelsPy, StringComparison.Ordinal);
         Assert.Contains("shard_coord0 = tmp_shard % 4", generatedKernelsPy, StringComparison.Ordinal);
         Assert.Contains("local_dim0 = 4", generatedKernelsPy, StringComparison.Ordinal);
@@ -179,7 +180,7 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         Assert.Contains("source_offsets = 0 + lane * 0 + global_idx0 * (1 * 1) + global_idx1 * 1", generatedKernelsPy, StringComparison.Ordinal);
         Assert.Contains("result = value0 + value1", generatedKernelsPy, StringComparison.Ordinal);
         Assert.Contains("tl.store(destination + destination_offsets, value, mask=mask)", generatedKernelsPy, StringComparison.Ordinal);
-        Assert.Contains("data, rdata, block_local_rdata, block_local_data", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("data, rdata, chip_local_rdata, block_local_rdata, block_local_data", generatedKernelsPy, StringComparison.Ordinal);
         Assert.DoesNotContain(RemovedLocalName("thread", "rdata"), generatedKernelsPy, StringComparison.Ordinal);
         Assert.DoesNotContain(RemovedLocalName("warp", "rdata"), generatedKernelsPy, StringComparison.Ordinal);
         Assert.DoesNotContain(RemovedLocalName("warp", "data"), generatedKernelsPy, StringComparison.Ordinal);
@@ -193,6 +194,7 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         Assert.Contains("RDATA_BUNDLES", rdataPy, StringComparison.Ordinal);
         Assert.Contains("\"main_prim\"", rdataPy, StringComparison.Ordinal);
         Assert.Contains("\"rdata_bytes\": 0", rdataPy, StringComparison.Ordinal);
+        Assert.Contains("\"chip_local_rdata_bytes\": 0", rdataPy, StringComparison.Ordinal);
         Assert.Contains("\"block_local_rdata_bytes\": 0", rdataPy, StringComparison.Ordinal);
         Assert.DoesNotContain(RemovedLocalName("thread", "rdata"), rdataPy, StringComparison.Ordinal);
         Assert.DoesNotContain(RemovedLocalName("warp", "rdata"), rdataPy, StringComparison.Ordinal);
@@ -205,7 +207,7 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         Assert.DoesNotContain("_generated_kernels.", modelPy, StringComparison.Ordinal);
         Assert.Contains("data = self.allocate_workspace(inputs, ", modelPy, StringComparison.Ordinal);
         Assert.Contains("block_local_data = self.allocate_workspace(inputs, ", modelPy, StringComparison.Ordinal);
-        Assert.Contains("rdata, block_local_rdata = self.materialize_rdata_bundle(inputs, \"main_prim\")", modelPy, StringComparison.Ordinal);
+        Assert.Contains("rdata, chip_local_rdata, block_local_rdata = self.materialize_rdata_bundle(inputs, \"main_prim\")", modelPy, StringComparison.Ordinal);
         Assert.DoesNotContain(RemovedLocalName("thread", "rdata"), modelPy, StringComparison.Ordinal);
         Assert.DoesNotContain(RemovedLocalName("warp", "rdata"), modelPy, StringComparison.Ordinal);
         Assert.DoesNotContain(RemovedLocalName("warp", "data"), modelPy, StringComparison.Ordinal);
@@ -245,11 +247,32 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         Assert.False(launchMeta.TryGetProperty(RemovedLocalMeta("warp", "rdata", "pool_bytes"), out _));
         Assert.False(launchMeta.TryGetProperty(RemovedLocalMeta("thread", "rdata", "stride_bytes"), out _));
         Assert.False(launchMeta.TryGetProperty(RemovedLocalMeta("warp", "rdata", "stride_bytes"), out _));
+        Assert.Equal(0, launchMeta.GetProperty("rdata_pool_bytes").GetInt64());
+        Assert.True(launchMeta.GetProperty("chip_local_rdata_pool_bytes").GetInt64() > 0);
+        Assert.Equal(0, launchMeta.GetProperty("block_local_rdata_pool_bytes").GetInt64());
+
+        var graphDumps = string.Join(
+            Environment.NewLine,
+            Directory.GetFiles(Dumpper.Directory, "*.il", SearchOption.AllDirectories).Select(File.ReadAllText));
+        var tirDumps = string.Join(
+            Environment.NewLine,
+            Directory.GetFiles(Dumpper.Directory, "*.script", SearchOption.AllDirectories).Select(File.ReadAllText));
+        Assert.Contains("ShardedView", graphDumps, StringComparison.Ordinal);
+        Assert.Contains("ChipLocalRdata", tirDumps, StringComparison.Ordinal);
+        Assert.DoesNotContain("ShardedView", tirDumps, StringComparison.Ordinal);
 
         RenderGeneratedKernels(outputDirectory);
         var generatedKernelsPy = File.ReadAllText(Path.Join(outputDirectory, "generated_kernels.py"));
         Assert.DoesNotContain(RemovedLocalName("thread", "rdata"), generatedKernelsPy, StringComparison.Ordinal);
         Assert.DoesNotContain(RemovedLocalName("warp", "rdata"), generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("chip_local_rdata", generatedKernelsPy, StringComparison.Ordinal);
+
+        var rdataPy = File.ReadAllText(Path.Join(outputDirectory, "rdata.py"));
+        Assert.Contains("\"rdata_bytes\": 0", rdataPy, StringComparison.Ordinal);
+        Assert.Contains("\"chip_local_rdata_bytes\":", rdataPy, StringComparison.Ordinal);
+        Assert.DoesNotContain("\"chip_local_rdata_bytes\": 0", rdataPy, StringComparison.Ordinal);
+        Assert.Contains("\"block_local_rdata_bytes\": 0", rdataPy, StringComparison.Ordinal);
+
         AssertGeneratedModelRuns(
             outputDirectory,
             "x = torch.arange(32, dtype=torch.float32, device='cuda').reshape(32, 1)",

@@ -15,6 +15,7 @@ from jinja2 import Environment, PackageLoader, StrictUndefined
 WORKSPACE_PARAMETERS = (
     "data",
     "rdata",
+    "chip_local_rdata",
     "block_local_rdata",
     "block_local_data",
 )
@@ -295,6 +296,31 @@ def _ptr(model: dict[str, Any], name: str) -> str:
     return str(value)
 
 
+def _pointer_shard_coord_hierarchy(pointer: Any) -> tuple[int, ...] | None:
+    if not isinstance(pointer, dict):
+        return None
+    value = pointer.get("ShardCoordHierarchy", pointer.get("shard_coord_hierarchy"))
+    if not value:
+        return None
+    return tuple(int(axis) for axis in value)
+
+
+def _append_pointer_shard_coords(lines: list[str], level: int, pointers: list[Any]) -> None:
+    hierarchies = {
+        hierarchy
+        for hierarchy in (_pointer_shard_coord_hierarchy(pointer) for pointer in pointers)
+        if hierarchy is not None
+    }
+    if not hierarchies:
+        return
+    if len(hierarchies) != 1:
+        raise RuntimeError(
+            "PyNTT generated helper has pointer offsets from multiple shard "
+            f"hierarchies: {sorted(hierarchies)}."
+        )
+    _append_shard_coords(lines, level, list(next(iter(hierarchies))))
+
+
 def _select_block_axis(shape: list[Any], strides: list[Any]) -> int:
     if not shape:
         return 0
@@ -467,6 +493,7 @@ def _helper_header(
 def _standard_header(model: dict[str, Any], comment: str, pointers: list[tuple[str, str]]) -> list[str]:
     lines = _helper_header(model, comment=comment)
     _line(lines, 1, "shard_index = tl.program_id(0).to(tl.int64)")
+    _append_pointer_shard_coords(lines, 1, [model[model_name] for _, model_name in pointers])
     for local_name, model_name in pointers:
         _line(lines, 1, f"{local_name} = {_ptr(model, model_name)}")
     return lines
@@ -638,6 +665,7 @@ def _emit_tensor_copy(model: dict[str, Any], *, is_load: bool) -> str:
             comment=f"# generated from PyNTT Jinja TensorLoad.py.jinja\n# {model['Comment']}; dtype={model['DType']}, local_shape={_shape_tuple(local_shape)}, global_shape={_shape_tuple(global_shape)}",
         )
         _line(lines, 1, "shard_index = tl.program_id(0).to(tl.int64)")
+        _append_pointer_shard_coords(lines, 1, [model["Destination"]])
         _line(lines, 1, f"destination = {_ptr(model, 'Destination')}")
     else:
         lines = _helper_header(
@@ -646,6 +674,7 @@ def _emit_tensor_copy(model: dict[str, Any], *, is_load: bool) -> str:
             comment=f"# generated from PyNTT Jinja TensorStore.py.jinja\n# {model['Comment']}; dtype={model['DType']}, local_shape={_shape_tuple(local_shape)}, global_shape={_shape_tuple(global_shape)}",
         )
         _line(lines, 1, "shard_index = tl.program_id(0).to(tl.int64)")
+        _append_pointer_shard_coords(lines, 1, [model["Source"]])
         _line(lines, 1, f"source = {_ptr(model, 'Source')}")
 
     _line(lines, 1, "tmp_shard = shard_index")
@@ -1522,6 +1551,7 @@ def _emit_concat(model: dict[str, Any]) -> str:
         f"# generated from PyNTT Jinja Concat.py.jinja\n# {model['Comment']}; dtype={model['OutputDType']}, axis={model['Axis']}, output_shape={_shape_tuple(model['OutputShape'])}",
         [],
     )
+    _append_pointer_shard_coords(lines, 1, list(model["Inputs"]) + [model["Output"]])
     for input_index, input_ptr in enumerate(model["Inputs"]):
         _line(lines, 1, f"input{input_index} = {input_ptr['Expression']}")
     _line(lines, 1, f"output = {_ptr(model, 'Output')}")
@@ -1698,6 +1728,7 @@ def _emit_get_position_ids(model: dict[str, Any]) -> str:
     )
     _line(lines, 1, "shard_count = tl.num_programs(0)")
     _line(lines, 1, "shard_index = tl.program_id(0).to(tl.int64)")
+    _append_pointer_shard_coords(lines, 1, [model["Output"]])
     _line(lines, 1, f"output = {_ptr(model, 'Output')}")
     shard_axis = model.get("ShardAxis")
     if shard_axis is not None:
@@ -2159,6 +2190,7 @@ def _emit_paged_attention(model: dict[str, Any]) -> str:
         comment=f"# generated from PyNTT Jinja PagedAttention.py.jinja\n# {model['Comment']}; query_dtype={model['QueryDType']}, output_dtype={model['OutputDType']}, query_shape={_shape_tuple(model['QueryShape'])}, output_shape={_shape_tuple(model['OutputShape'])}, layer={model['LayerId']}, block_n={attention_block_size}",
     )
     _line(lines, 1, "shard_index = tl.program_id(0).to(tl.int64)")
+    _append_pointer_shard_coords(lines, 1, [model["Query"], model["Scale"], model["Output"]])
     _line(lines, 1, f"query = {_ptr(model, 'Query')}")
     _line(lines, 1, f"scale_ptr = {_ptr(model, 'Scale')}")
     _line(lines, 1, f"output = {_ptr(model, 'Output')}")

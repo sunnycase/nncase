@@ -279,16 +279,8 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         return true;
     }
 
-    private static long GetSingleBlockMemorySize(DistributedType distributedType, INTTTargetOptions targetOptions)
-    {
-        if (targetOptions.HierarchySizes.Length < 2)
-        {
-            return long.MaxValue;
-        }
-
-        var blockCount = Math.Max(1, distributedType.Placement.GetPhysicalLevelSize('b'));
-        return targetOptions.HierarchySizes[^2] / blockCount;
-    }
+    public static bool SupportsConstShardedView(INTTTargetOptions targetOptions)
+        => targetOptions.ConstShardedView && targetOptions.UnifiedMemoryArch && targetOptions.MemoryAccessArch == MemoryAccessArchitecture.UMA;
 
     public static IReadOnlyList<DistributedType> GetLeafCandidateDistTypes(TensorType tensorType, IEnumerable<Placement> placements, string moduleKind, INTTTargetOptions targetOptions)
     {
@@ -391,6 +383,24 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         UserRebuilder.Rebuild(post);
 
         return function.With(body: post);
+    }
+
+    private static UInt128 GetLocalTensorBytes(DistributedType distributedType)
+    {
+        var type = DistributedUtility.GetDividedTensorType(distributedType, DistributedUtility.DivideFlags.MaxShape);
+        var maxShape = CompilerServices.GetMaxShape(type.Shape);
+        return (UInt128)(TensorUtilities.GetProduct(maxShape) * type.DType.SizeInBytes);
+    }
+
+    private static long GetSingleBlockMemorySize(DistributedType distributedType, INTTTargetOptions targetOptions)
+    {
+        if (targetOptions.HierarchySizes.Length < 2)
+        {
+            return long.MaxValue;
+        }
+
+        var blockCount = Math.Max(1, distributedType.Placement.GetPhysicalLevelSize('b'));
+        return targetOptions.HierarchySizes[^2] / blockCount;
     }
 
     protected override Unit DefaultVisitLeaf(BaseExpr expr)
@@ -860,6 +870,7 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
             if (tc2.ValueType is TensorType tensorType)
             {
                 var distCluster = _rootSearchGraph.CreateCluster<DistributedSearchGraph>(SearchGraphKind.DistributedCluster);
+                DistributedSearchGraph? shardedViewInputBucket = null;
                 foreach (var dType in GetLeafCandidateDistTypes(tensorType, Placements, _moduleKind, TargetOptions))
                 {
                     var bucket = distCluster.CreateCluster<DistributedSearchGraph>(SearchGraphKind.Bucket);
@@ -871,6 +882,15 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
 
                     var dnode = new SearchableNode(distConst, dType);
                     bucket.AddVertex(dnode);
+
+                    if (SupportsConstShardedView(TargetOptions))
+                    {
+                        var shardedViewBucket = distCluster.CreateCluster<DistributedSearchGraph>(SearchGraphKind.Bucket);
+                        var shardedViewNode = new SearchableNode(new IR.Distributed.ShardedView(dType), dType);
+                        shardedViewBucket.AddVertex(shardedViewNode);
+                        shardedViewInputBucket ??= CreateShardedViewInputBucket(tc2);
+                        _rootSearchGraph.AddEdge(new(shardedViewNode, shardedViewInputBucket.Vertices.First(), 0, shardedViewInputBucket));
+                    }
                 }
 
                 return distCluster;
@@ -914,6 +934,14 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
                 return distCluster;
             }
         }
+    }
+
+    private DistributedSearchGraph CreateShardedViewInputBucket(TensorConst source)
+    {
+        var sourceCluster = _rootSearchGraph.CreateCluster<DistributedSearchGraph>(SearchGraphKind.StandaloneCluster);
+        var sourceBucket = sourceCluster.CreateCluster<DistributedSearchGraph>(SearchGraphKind.Bucket);
+        sourceBucket.AddVertex(new SearchableNode(source, source.CheckedType));
+        return sourceBucket;
     }
 
     private DistributedSearchGraph TryAddOriginator(BaseExpr expr)
@@ -1212,6 +1240,12 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
                     CostModel.Cost cost;
                     switch (enode.Expr)
                     {
+                        case TensorConst { ValueType: DistributedType distributedType }:
+                            cost = new CostModel.Cost()
+                            {
+                                [CostModel.CostFactorNames.MemoryStore] = GetLocalTensorBytes(distributedType),
+                            };
+                            break;
                         case Const or Var or If or IR.Tuple or BaseFunction or Shape or Padding or Paddings or Dimension or None or Call:
                             cost = new CostModel.Cost() { [CostModel.CostFactorNames.CPUCycles] = 1 };
                             break;

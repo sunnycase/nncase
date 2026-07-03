@@ -23,6 +23,7 @@ public sealed class PyNTTTargetOptions : NTTTargetOptions
         HierarchyNames = "yx";
         HierarchyLevels = "bb";
         Hierarchies = new[] { new[] { 4, 8 } };
+        ConstShardedView = true;
         RefreshTargetCostModel();
     }
 
@@ -78,6 +79,7 @@ public sealed class PyNTTTargetOptions : NTTTargetOptions
             ModelName = nttOptions.ModelName,
             Vectorize = nttOptions.Vectorize,
             UnifiedMemoryArch = nttOptions.UnifiedMemoryArch,
+            ConstShardedView = nttOptions.ConstShardedView,
             MemoryAccessArch = nttOptions.MemoryAccessArch,
             NocArch = nttOptions.NocArch,
             Hierarchies = nttOptions.Hierarchies,

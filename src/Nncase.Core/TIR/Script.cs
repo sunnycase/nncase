@@ -289,6 +289,44 @@ public static class T
         return buffer;
     }
 
+    public static Buffer AttachShardedConstView(TensorConst @const, DistributedType distributedType, out Buffer buffer, [CallerArgumentExpression("buffer")] string name = "")
+    {
+        if (name.StartsWith("var "))
+        {
+            name = name[4..];
+        }
+
+        var tensorType = distributedType.TensorType;
+        if (@const.CheckedTensorType != tensorType)
+        {
+            throw new InvalidOperationException($"Sharded const view type {tensorType} does not match source const type {@const.CheckedTensorType}.");
+        }
+
+        var shardIndex = Enumerable.Range(0, distributedType.Placement.Rank)
+            .Select(axis => (Dimension)new DimVar($"__shard_coord_{axis}"))
+            .ToArray();
+        (var localOffset, var localShape) = DistributedUtility.GetLocalOffsetAndShape(distributedType, shardIndex);
+        var globalStrides = TensorUtilities.GetDefaultStrides(@const.Value.Dimensions.ToArray());
+        var localElementOffset = (Dimension)0;
+        for (var axis = 0; axis < localOffset.Length; axis++)
+        {
+            localElementOffset += localOffset[axis] * globalStrides[axis];
+        }
+
+        var spanStart = localElementOffset * @const.Value.ElementType.SizeInBytes;
+        var size = (Dimension)(@const.Value.Length * @const.Value.ElementType.SizeInBytes);
+        var alignment = @const.Value.ElementType.SizeInBytes;
+        var physicalBuffer = new PhysicalBuffer(alignment, IR.F.Buffer.AddressOf(@const), size, MemoryLocation.ChipLocalRdata);
+        buffer = new Buffer(
+            name,
+            @const.CheckedDataType,
+            new MemSpan(physicalBuffer, spanStart, size),
+            localShape,
+            globalStrides.Select(stride => (Dimension)stride).ToArray(),
+            distributedType);
+        return buffer;
+    }
+
     public static ISequentialBuilder<For> ForSegment(out (Dimension B, Dimension E) seg, Dimension low, Dimension chunck, Dimension high)
     {
         var count = Dimension.CeilDiv(high - low, chunck);

@@ -33,6 +33,11 @@ public enum MemoryLocation
     BlockLocalRdata = 1 << 6,
 
     /// <summary>
+    /// chip local constant data.
+    /// </summary>
+    ChipLocalRdata = 1 << 12,
+
+    /// <summary>
     /// compute temp data.
     /// </summary>
     Data = 1 << 7,

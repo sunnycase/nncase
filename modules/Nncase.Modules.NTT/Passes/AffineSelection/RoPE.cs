@@ -26,8 +26,9 @@ public partial class NTTAffineSelectionPass
         var inOutResults = domains.Select(x => new AffineRange(x.Offset, x.Extent)).ToArray();
         var inOutMap = new AffineMap(domains, default, inOutResults);
 
-        // [head, dim, seq]
-        var sinCosResults = inOutResults[1..];
+        // [seq, head, dim], with sin/cos broadcast over head.
+        var sinCosResults = inOutResults.ToArray();
+        sinCosResults[1] = new AffineRange(0, 1);
         var sinCosMap = new AffineMap(domains, default, sinCosResults);
 
         return IR.F.Affine.Grid()

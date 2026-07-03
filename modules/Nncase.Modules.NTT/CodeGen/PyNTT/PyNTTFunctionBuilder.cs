@@ -36,40 +36,14 @@ internal sealed class PyNTTFunctionBuilder
         }
 
         var targetOptions = PyNTTTargetOptionsUtility.Get(_compileOptions);
-        var rdata = SerializeRData(primFunction.SchedResult.Rdatas);
         var blockLocalRdatas = SerializeLocalRData(primFunction.SchedResult.BlockLocalRdatas, targetOptions, "b");
         return new(
-            rdata.Payload,
-            rdata.Bytes,
+            string.Empty,
+            0,
+            string.Empty,
+            0,
             blockLocalRdatas.Payloads,
             blockLocalRdatas.Bytes);
-    }
-
-    private (string Payload, long Bytes) SerializeRData(IReadOnlyDictionary<Const, ValueRange<ulong>> rdatas)
-    {
-        var poolSize = PyNTTRDataUtility.GetPoolSizeBytes(rdatas);
-        if (poolSize == 0)
-        {
-            return (string.Empty, 0);
-        }
-
-        using var payload = CreatePayloadStream(poolSize, "rdata");
-        var stream = payload.Stream;
-        stream.SetLength(checked((long)poolSize));
-        foreach (var (@const, range) in rdatas)
-        {
-            var tensor = ((TensorConst)@const).Value;
-            var size = range.Max - range.Min;
-            if ((ulong)tensor.Length * (ulong)tensor.ElementType.SizeInBytes != size)
-            {
-                throw new InvalidDataException("The PyNTT rdata buffer size does not match the scheduled range.");
-            }
-
-            stream.Position = checked((long)range.Min);
-            tensor.Serialize(stream);
-        }
-
-        return (FinalizePayload(payload), poolSize);
     }
 
     private (string[] Payloads, long Bytes) SerializeLocalRData(

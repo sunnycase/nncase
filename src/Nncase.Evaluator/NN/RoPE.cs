@@ -118,7 +118,9 @@ public class RoPEEvaluator : IEvaluator<RoPE>, ITypeInferencer<RoPE>, ICostEvalu
     {
         // only unsupported print without to-string
         if (input.Placement != scale.Placement || scale.Placement != bias.Placement
-            || !AxisEqual(input.AxisPolicies, scale.AxisPolicies, startA: 1, startB: 0)
+            || !Equals(input.AxisPolicies[0], scale.AxisPolicies[0])
+            || scale.AxisPolicies[1] is not SBPBroadCast
+            || !Equals(input.AxisPolicies[2], scale.AxisPolicies[2])
             || !AxisEqual(scale.AxisPolicies, bias.AxisPolicies, startA: 0, startB: 0)
             || input.AxisPolicies[^1] is not SBPBroadCast)
         {
