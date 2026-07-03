@@ -694,18 +694,18 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
         if (isTir)
         {
             var dataBytesPerProgram = PythonValue(kernel.Launch.Meta["data_pool_bytes"]);
-            var warpLocalDataBytesPerScope = PythonValue(kernel.Launch.Meta["warp_local_data_pool_bytes"]);
+            var collectiveDataBytes = kernel.Launch.Meta.TryGetValue("collective_data_pool_bytes", out var collectiveDataValue)
+                ? PythonValue(collectiveDataValue)
+                : "0";
             var blockLocalDataBytesPerScope = PythonValue(kernel.Launch.Meta["block_local_data_pool_bytes"]);
-            var warpLocalDataScopeCount = PythonValue(kernel.Launch.Meta["warp_local_data_scope_count"]);
             var blockLocalDataScopeCount = PythonValue(kernel.Launch.Meta["block_local_data_scope_count"]);
             var dataDType = PythonString((string)kernel.Launch.Meta["data_dtype"]);
             workspaceSetup = $"""
-                    data = self.allocate_workspace(inputs, {PythonString(kernel.Name + ".data")}, {dataBytesPerProgram} * grid[0], {dataDType})
-                    warp_local_data = self.allocate_workspace(inputs, {PythonString(kernel.Name + ".warp_local_data")}, {warpLocalDataBytesPerScope} * {warpLocalDataScopeCount}, {dataDType})
+                    data = self.allocate_workspace(inputs, {PythonString(kernel.Name + ".data")}, {dataBytesPerProgram} * grid[0] + {collectiveDataBytes}, {dataDType})
                     block_local_data = self.allocate_workspace(inputs, {PythonString(kernel.Name + ".block_local_data")}, {blockLocalDataBytesPerScope} * {blockLocalDataScopeCount}, {dataDType})
-                    rdata, thread_local_rdata, warp_local_rdata, block_local_rdata = self.materialize_rdata_bundle(inputs, {PythonString(functionName)})
+                    rdata, block_local_rdata = self.materialize_rdata_bundle(inputs, {PythonString(functionName)})
             """;
-            workspaceArgs = new[] { "data", "rdata", "thread_local_rdata", "warp_local_rdata", "block_local_rdata", "warp_local_data", "block_local_data" };
+            workspaceArgs = new[] { "data", "rdata", "block_local_rdata", "block_local_data" };
         }
 
         var runtimeShapeArgs = runtimeShapeArgNames.Select(arg => $"shape_env[{PythonString(arg)}]").ToArray();
@@ -845,10 +845,6 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
                 {
                     $"{PythonString("rdata")}: {BuildRDataPayloadPython(outputDirectory, function, "rdata", bundle.RData, null)}",
                     $"{PythonString("rdata_bytes")}: {bundle.RDataBytes.ToString(CultureInfo.InvariantCulture)}",
-                    $"{PythonString("thread_local_rdata")}: {PythonTuple(bundle.ThreadLocalRDatas.Select((payload, index) => BuildRDataPayloadPython(outputDirectory, function, "thread_local_rdata", payload, index)))}",
-                    $"{PythonString("thread_local_rdata_bytes")}: {bundle.ThreadLocalRDataBytes.ToString(CultureInfo.InvariantCulture)}",
-                    $"{PythonString("warp_local_rdata")}: {PythonTuple(bundle.WarpLocalRDatas.Select((payload, index) => BuildRDataPayloadPython(outputDirectory, function, "warp_local_rdata", payload, index)))}",
-                    $"{PythonString("warp_local_rdata_bytes")}: {bundle.WarpLocalRDataBytes.ToString(CultureInfo.InvariantCulture)}",
                     $"{PythonString("block_local_rdata")}: {PythonTuple(bundle.BlockLocalRDatas.Select((payload, index) => BuildRDataPayloadPython(outputDirectory, function, "block_local_rdata", payload, index)))}",
                     $"{PythonString("block_local_rdata_bytes")}: {bundle.BlockLocalRDataBytes.ToString(CultureInfo.InvariantCulture)}",
                 }) +

@@ -47,11 +47,11 @@ public interface INTTTargetOptions : ITargetOptions
 
     NocArchitecture NocArch { get; set; }
 
-    HierarchyKind HierarchyKind { get; set; }
-
     int[][] Hierarchies { get; set; }
 
     string HierarchyNames { get; set; }
+
+    string HierarchyLevels { get; set; }
 
     long[] HierarchySizes { get; set; }
 

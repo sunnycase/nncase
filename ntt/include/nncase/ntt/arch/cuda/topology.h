@@ -19,23 +19,6 @@
 #include <cuda/ptx>
 
 namespace nncase::ntt::distributed {
-template <> struct program_id_getter<topology::thread> {
-    __device__ static size_t id() noexcept {
-        if constexpr (program_dim<topology::thread>() == warpSize) {
-            return cuda::ptx::get_sreg_laneid();
-
-        } else {
-            return threadIdx.x % program_dim<topology::thread>();
-        }
-    }
-};
-
-template <> struct program_id_getter<topology::warp> {
-    __device__ static size_t id() noexcept {
-        return threadIdx.x / program_dim<topology::thread>();
-    }
-};
-
 template <> struct program_id_getter<topology::block> {
     __device__ static size_t id() noexcept { return blockIdx.x; }
 };
@@ -46,34 +29,14 @@ template <> struct program_id_getter<topology::chip> {
     }
 };
 
-inline __device__ size_t tid() noexcept {
-    return program_id<topology::thread>();
-}
-
-inline __device__ size_t wid() noexcept { return program_id<topology::warp>(); }
-
 inline __device__ size_t bid() noexcept {
     return program_id<topology::block>();
 }
 
 inline __device__ size_t cid() noexcept { return program_id<topology::chip>(); }
 
-inline constexpr auto tdim() noexcept {
-    return program_dim<topology::thread>();
-}
-inline constexpr auto wdim() noexcept { return program_dim<topology::warp>(); }
 inline constexpr auto bdim() noexcept { return program_dim<topology::block>(); }
 inline constexpr auto cdim() noexcept { return program_dim<topology::chip>(); }
-
-template <> class topology_synchronizer<topology::thread> {
-  public:
-    __device__ static void synchronize() noexcept { __syncwarp(); }
-};
-
-template <> class topology_synchronizer<topology::warp> {
-  public:
-    __device__ static void synchronize() noexcept { __syncthreads(); }
-};
 
 template <> class topology_synchronizer<topology::block> {
   public:

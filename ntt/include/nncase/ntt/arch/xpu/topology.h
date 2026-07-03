@@ -24,13 +24,6 @@
 #endif
 
 namespace nncase::ntt::distributed {
-template <> struct program_id_getter<topology::thread> {
-    static size_t id() noexcept {
-
-        return runtime::xpu_thread_context_t::current().tid;
-    }
-};
-
 template <> struct program_id_getter<topology::block> {
     static size_t id() noexcept {
 
@@ -52,23 +45,15 @@ template <> struct program_id_getter<topology::chip> {
     }
 };
 
-inline size_t tid() noexcept { return program_id<topology::thread>(); }
 inline size_t bid() noexcept { return program_id<topology::block>(); }
 inline size_t did() noexcept { return program_id<topology::die>(); }
 inline size_t cid() noexcept { return program_id<topology::chip>(); }
 
-inline constexpr auto tdim() noexcept {
-    return program_dim<topology::thread>();
-}
 inline constexpr auto bdim() noexcept { return program_dim<topology::block>(); }
 inline constexpr auto ddim() noexcept { return program_dim<topology::die>(); }
 inline constexpr auto cdim() noexcept { return program_dim<topology::chip>(); }
 
 namespace detail {
-struct thread_barrier {
-    std::atomic<int32_t> barrier[2] = {0, 0};
-};
-
 struct block_barrier {
     std::atomic<int32_t> barrier[2] = {0, 0};
 };
@@ -100,24 +85,6 @@ void arrive_and_wait(std::atomic<int32_t> vars[2], int32_t value = 0) {
 }
 } // namespace detail
 
-DEVICE_SEC static ntt::distributed::detail::thread_barrier
-    thread_barriers[cdim()][ddim()][bdim()];
-template <> class topology_synchronizer<topology::thread> {
-  private:
-  public:
-    static void synchronize() noexcept {
-#ifndef SYS_MODE
-        detail::arrive_and_wait(thread_barriers[cid()][did()][bid()].barrier,
-                                tdim());
-#else
-        sync_c_d_y_x_rt();
-#endif
-    }
-
-  private:
-    inline static detail::thread_barrier barriers_[cdim()][ddim()][bdim()];
-};
-
 DEVICE_SEC static ntt::distributed::detail::block_barrier
     block_barriers[cdim()][ddim()];
 template <> class topology_synchronizer<topology::block> {
@@ -125,8 +92,7 @@ template <> class topology_synchronizer<topology::block> {
   public:
     static void synchronize() noexcept {
 #ifndef SYS_MODE
-        detail::arrive_and_wait(block_barriers[cid()][did()].barrier,
-                                bdim() * tdim());
+        detail::arrive_and_wait(block_barriers[cid()][did()].barrier, bdim());
 #else
         sync_c_d_ry_rx_rt();
 #endif
@@ -142,8 +108,7 @@ template <> class topology_synchronizer<topology::die> {
   public:
     static void synchronize() noexcept {
 #ifndef SYS_MODE
-        detail::arrive_and_wait(die_barriers[cid()].barrier,
-                                ddim() * bdim() * tdim());
+        detail::arrive_and_wait(die_barriers[cid()].barrier, ddim() * bdim());
 #else
         sync_c_rd_ry_rx_rt();
 #endif
@@ -160,7 +125,7 @@ template <> class topology_synchronizer<topology::chip> {
     static void synchronize() noexcept {
 #ifndef SYS_MODE
         detail::arrive_and_wait(chip_barrier.barrier,
-                                cdim() * ddim() * bdim() * tdim());
+                                cdim() * ddim() * bdim());
 #else
         sync_c_rd_ry_rx_rt();
 #endif

@@ -13,7 +13,7 @@ public record BufferRenderInfo(string Name, string ElemType, int ElemSize, int R
 {
 }
 
-public record KernelMainModel(TIR.PrimFunction PrimFunction, NTTTargetOptions Options, ulong Alignment, ulong DataSize, ulong BlockLocalDataPoolSize, ulong RDataSize, ulong ThreadLocalRdataPoolSize, ulong BlockLocalRdataPoolSize)
+public record KernelMainModel(TIR.PrimFunction PrimFunction, NTTTargetOptions Options, ulong Alignment, ulong DataSize, ulong BlockLocalDataPoolSize, ulong RDataSize, ulong BlockLocalRdataPoolSize)
 {
     public BufferRenderInfo GetInfo(TIR.Buffer buffer)
     {
@@ -82,7 +82,7 @@ using namespace nncase::ntt::distributed::shard_policy;
 
     public static string ModuleTopologyDef(NTTTargetOptions options, bool isCUDA)
     {
-        var content = RazorTemplateEngine.RenderAsync("~/CodeGen/CPU/Templates/module_topology_def.h.cshtml", new { Hierarchies = options.Hierarchies[0], IsCUDA = isCUDA }).Result;
+        var content = RazorTemplateEngine.RenderAsync("~/CodeGen/CPU/Templates/module_topology_def.h.cshtml", new { Options = options, IsCUDA = isCUDA }).Result;
         return content;
     }
 
@@ -93,9 +93,9 @@ using namespace nncase::ntt::distributed::shard_policy;
         return content;
     }
 
-    public static string MakeMain(TIR.PrimFunction primFunction, ulong dataAlign, ulong dataUsage, ulong blockLocalDataPoolSize, ulong rdataPoolSize, ulong threadLocalRdataPoolSize, ulong blockLocalRdataPoolSize, NTTTargetOptions options)
+    public static string MakeMain(TIR.PrimFunction primFunction, ulong dataAlign, ulong dataUsage, ulong blockLocalDataPoolSize, ulong rdataPoolSize, ulong blockLocalRdataPoolSize, NTTTargetOptions options)
     {
-        var content = RazorTemplateEngine.RenderAsync("~/CodeGen/CPU/Templates/thread_main.cpp.cshtml", new KernelMainModel(primFunction, options, dataAlign, dataUsage, blockLocalDataPoolSize, rdataPoolSize, threadLocalRdataPoolSize, blockLocalRdataPoolSize)).Result;
+        var content = RazorTemplateEngine.RenderAsync("~/CodeGen/CPU/Templates/thread_main.cpp.cshtml", new KernelMainModel(primFunction, options, dataAlign, dataUsage, blockLocalDataPoolSize, rdataPoolSize, blockLocalRdataPoolSize)).Result;
         return content;
     }
 

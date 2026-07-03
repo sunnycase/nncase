@@ -216,7 +216,7 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
 
     public AutoDistributedRewriter(CompileOptions compileOptions, INTTTargetOptions targetOptions, AutoDistributedPhase phase, string moduleKind = "cpu", bool bidirectional = false)
     {
-        Placements = targetOptions.Hierarchies.Select(h => new Placement(h, targetOptions.HierarchyNames, targetOptions.HierarchyKind)).ToArray();
+        Placements = targetOptions.Hierarchies.Select(h => new Placement(h, targetOptions.HierarchyNames, targetOptions.HierarchyLevels)).ToArray();
         Bidirectional = bidirectional;
         CompileOptions = compileOptions;
         TargetOptions = targetOptions;
@@ -224,7 +224,7 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         _phase = phase;
         if (Path.Exists(TargetOptions.DistributedScheme) && System.Text.Json.JsonSerializer.Deserialize<DistributedSchema>(File.ReadAllText(TargetOptions.DistributedScheme)) is DistributedSchema scheme)
         {
-            Scheme = scheme.Outputs.ToDictionary(n => n.Name, n => (new IRArray<SBP>(n.NdSBP), new Placement(n.Hierarchy, n.HierarchyName, targetOptions.HierarchyKind)));
+            Scheme = scheme.Outputs.ToDictionary(n => n.Name, n => (new IRArray<SBP>(n.NdSBP), new Placement(n.Hierarchy, n.HierarchyName, n.HierarchyLevels)));
         }
         else
         {
@@ -273,10 +273,21 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
             var maxShape = CompilerServices.GetMaxShape(type.Shape);
             var size = TensorUtilities.GetProduct(maxShape) * type.DType.SizeInBytes;
 
-            return size < targetOptions.HierarchySizes[^2] / targetOptions.Hierarchies[0][^1];
+            return size < GetSingleBlockMemorySize(distributedType, targetOptions);
         }
 
         return true;
+    }
+
+    private static long GetSingleBlockMemorySize(DistributedType distributedType, INTTTargetOptions targetOptions)
+    {
+        if (targetOptions.HierarchySizes.Length < 2)
+        {
+            return long.MaxValue;
+        }
+
+        var blockCount = Math.Max(1, distributedType.Placement.GetPhysicalLevelSize('b'));
+        return targetOptions.HierarchySizes[^2] / blockCount;
     }
 
     public static IReadOnlyList<DistributedType> GetLeafCandidateDistTypes(TensorType tensorType, IEnumerable<Placement> placements, string moduleKind, INTTTargetOptions targetOptions)
@@ -312,7 +323,7 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
                     }
                 }
 
-                model.Add(vars[k] * size < TargetOptions.HierarchySizes[^2] / TargetOptions.Hierarchies[0][^1]);
+                model.Add(vars[k] * size < GetSingleBlockMemorySize((DistributedType)k.Expr.CheckedType, TargetOptions));
             }
         }
     }
@@ -580,28 +591,6 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
             var newExprs = BuildEquivalentCalls(expr.Target, tempArgs);
             foreach (var (newExpr, used) in newExprs)
             {
-                // input of CustomOp must split on threads if input is not CustomOp.
-                if (!combBuckets.First().Vertices.First().Expr.GetType().FullName!.Contains("CustomNTT", StringComparison.Ordinal)
-                    && TargetOptions.HierarchyKind == HierarchyKind.SMT
-                    && (expr.Target.GetType().FullName!.Contains("CustomNTT.MatMul", StringComparison.Ordinal) || expr.Target is PagedAttention))
-                {
-                    if (combBuckets.First().Vertices.First().Expr is not Boxing)
-                    {
-                        continue;
-                    }
-                    else
-                    {
-                        if (_rootSearchGraph.TryGetOutEdges(combBuckets.First().Vertices.First(), out var edges))
-                        {
-                            if (edges.All(e => e.Target.IRType is DistributedType dt &&
-                                    !dt.AxisPolicies.Any(sbp => sbp is SBPSplit s && s.Axes.Contains(dt.Placement.Rank - 1))))
-                            {
-                                continue;
-                            }
-                        }
-                    }
-                }
-
                 if (expr.Target is not Boxing && ((Call)newExpr).Arguments.AsValueEnumerable().Any(a => a.CheckedType is DistributedType dt && dt.Partial is not null))
                 {
                     continue;
@@ -610,17 +599,6 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
                 if (!newExpr.InferenceType(_inferencer_cache) || newExpr.CheckedType is InvalidType)
                 {
                     continue;
-                }
-
-                if (!expr.Target.GetType().FullName!.Contains("CustomNTT", StringComparison.Ordinal)
-                    && TargetOptions.HierarchyKind == HierarchyKind.SMT
-                    && expr.Users.Any(u => u is Call call && (call.Target.GetType().FullName!.Contains("CustomNTT.MatMul", StringComparison.Ordinal) || call.Target is PagedAttention)))
-                {
-                    if (newExpr.CheckedType is DistributedType dt1
-                        && !dt1.AxisPolicies.Any(sbp => sbp is SBPSplit s && s.Axes.Contains(dt1.Placement.Rank - 1)))
-                    {
-                        continue;
-                    }
                 }
 
                 var checkType = newExpr.CheckedType;
@@ -695,11 +673,11 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         foreach (var nType in GetLeafCandidateDistTypes(expr.CheckedTensorType, Placements, _moduleKind, TargetOptions))
         {
             if (!bucketMemo.TryGetValue(nType, out var bucket)
-                || expr.Users.Any(u => u is Call call && (call.Target.GetType().FullName!.Contains("CustomNTT", StringComparison.Ordinal) || (TargetOptions.HierarchyKind == HierarchyKind.SMT && expr.Target is PagedAttention)))
+                || expr.Users.Any(u => u is Call call && call.Target.GetType().FullName!.Contains("CustomNTT", StringComparison.Ordinal))
                 || expr.Target.GetType().FullName!.Contains("CustomNTT", StringComparison.Ordinal)
                 || expr.Target.GetType().FullName!.Contains("VectorizedRoPE", StringComparison.Ordinal)
                 || expr.Target.GetType().FullName!.Contains("Matmul", StringComparison.InvariantCultureIgnoreCase)
-                || (TargetOptions.HierarchyKind == HierarchyKind.SMT && expr.Target is PagedAttention)
+                || expr.Target is PagedAttention
                 || expr.Target is Gather)
             {
                 bucket = callCluster.CreateCluster<DistributedSearchGraph>(SearchGraphKind.Bucket);

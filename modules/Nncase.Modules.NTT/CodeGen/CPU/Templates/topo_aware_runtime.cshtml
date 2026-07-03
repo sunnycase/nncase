@@ -54,9 +54,7 @@ NTT_DEVICE auto src_ptr_tensor = nncase::ntt::make_tensor<void *>(nncase::ntt::f
 NTT_DEVICE auto dest_ptr_tensor = nncase::ntt::make_tensor<void *>(nncase::ntt::fixed_shape_v<@(string.Join(",", hierarchy))>);
 
 template <size_t Level> NTT_DEVICE static std::byte *get_cache_address() {
-    return reinterpret_cast<std::byte *>(
-        ntt::distributed::detail::global_thread_local_cache_ptr(program_ids())(
-            Level));
+    return nullptr;
 }
 }
 

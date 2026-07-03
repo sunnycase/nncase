@@ -58,8 +58,5 @@ void thread_free(void *ptr);
 extern "C" NTT_DEVICE void
 thread_main(const nncase::ntt::runtime::thread_inout_desc *input_descs,
             nncase::ntt::runtime::thread_inout_desc *const output_descs,
-            const std::byte *rdata, const std::byte *thread_local_rdata,
-            const std::byte *warp_local_rdata,
-            const std::byte *block_local_rdata, std::byte *thread_local_data,
-            std::byte *warp_local_data, std::byte *block_local_data,
-            std::byte *output);
+            const std::byte *rdata, const std::byte *block_local_rdata,
+            std::byte *data, std::byte *block_local_data, std::byte *output);

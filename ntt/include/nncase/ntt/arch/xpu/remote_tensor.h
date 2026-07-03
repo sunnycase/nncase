@@ -25,21 +25,13 @@ namespace nncase::ntt::distributed {
 namespace detail {
 #if not defined(SYS_MODE)
 extern decltype(nncase::ntt::make_tensor<nncase::ntt::vector<uintptr_t, 2>>(
-    nncase::ntt::distributed::topology_shape)) global_thread_local_data_ptr;
+    nncase::ntt::distributed::topology_shape)) global_local_data_ptr;
 
 extern decltype(nncase::ntt::make_tensor<nncase::ntt::vector<uintptr_t, 2>>(
     nncase::ntt::distributed::topology_shape)) global_block_local_data_ptr;
 
 extern decltype(nncase::ntt::make_tensor<nncase::ntt::vector<uintptr_t, 2>>(
-    nncase::ntt::distributed::topology_shape)) global_thread_local_rdata_ptr;
-
-extern decltype(nncase::ntt::make_tensor<nncase::ntt::vector<uintptr_t, 2>>(
     nncase::ntt::distributed::topology_shape)) global_block_local_rdata_ptr;
-#else
-extern uintptr_t global_thread_local_data_pool_start;
-extern size_t global_thread_local_data_pool_size;
-extern uintptr_t global_thread_local_rdata_pool_start;
-extern size_t global_thread_local_rdata_pool_size;
 #endif
 
 template <class T, topology RemoteScope, topology TensorScope,
@@ -49,26 +41,19 @@ static auto get_remote_address(const TLocalProgramIds &local_program_ids,
                                const TRemoteProgramIds &remote_program_ids,
                                T *local_address) {
 #if not defined(SYS_MODE)
-    auto start = global_thread_local_data_ptr(local_program_ids)(0_dim);
-    auto end = global_thread_local_data_ptr(local_program_ids)(1_dim);
-    auto remote_address = global_thread_local_data_ptr(remote_program_ids)(0_dim);
+    auto start = global_local_data_ptr(local_program_ids)(0_dim);
+    auto end = global_local_data_ptr(local_program_ids)(1_dim);
+    auto remote_address = global_local_data_ptr(remote_program_ids)(0_dim);
     if ((uintptr_t)local_address < start || (uintptr_t)local_address >= end) {
-        start = global_thread_local_rdata_ptr(local_program_ids)(0_dim);
-        end = global_thread_local_rdata_ptr(local_program_ids)(1_dim);
+        start = global_block_local_rdata_ptr(local_program_ids)(0_dim);
+        end = global_block_local_rdata_ptr(local_program_ids)(1_dim);
         remote_address =
-            global_thread_local_rdata_ptr(remote_program_ids)(0_dim);
+            global_block_local_rdata_ptr(remote_program_ids)(0_dim);
         if ((uintptr_t)local_address < start ||
             (uintptr_t)local_address >= end) {
-            start = global_block_local_rdata_ptr(local_program_ids)(0_dim);
-            end = global_block_local_rdata_ptr(local_program_ids)(1_dim);
+            start = global_block_local_data_ptr(local_program_ids)(0_dim);
             remote_address =
-                global_block_local_rdata_ptr(remote_program_ids)(0_dim);
-            if ((uintptr_t)local_address < start ||
-                (uintptr_t)local_address >= end) {
-                start = global_block_local_data_ptr(local_program_ids)(0_dim);
-                remote_address =
-                    global_block_local_data_ptr(remote_program_ids)(0_dim);
-            }
+                global_block_local_data_ptr(remote_program_ids)(0_dim);
         }
     }
 
@@ -79,28 +64,7 @@ static auto get_remote_address(const TLocalProgramIds &local_program_ids,
         topology_shape.template slice<0, (size_t)topology::count__ - 1>());
     auto remote_block_addr = (uintptr_t)uniform_ptr_global_to_global(
         (void *)local_address, remote_block_id);
-    if ((uintptr_t)local_address >= global_thread_local_data_pool_start &&
-        (uintptr_t)local_address <
-            global_thread_local_data_pool_start +
-                global_thread_local_data_pool_size *
-                    topology_shape[(size_t)topology::thread]) {
-        return (T *)(remote_block_addr +
-                     (remote_program_ids[(size_t)topology::thread] -
-                      local_program_ids[(size_t)topology::thread]) *
-                         global_thread_local_data_pool_size);
-    } else if ((uintptr_t)local_address >=
-                   global_thread_local_rdata_pool_start &&
-               (uintptr_t)local_address <
-                   global_thread_local_rdata_pool_start +
-                       global_thread_local_rdata_pool_size *
-                           topology_shape[(size_t)topology::thread]) {
-        return (T *)(remote_block_addr +
-                     (remote_program_ids[(size_t)topology::thread] -
-                      local_program_ids[(size_t)topology::thread]) *
-                         global_thread_local_rdata_pool_size);
-    } else {
-        return (T *)remote_block_addr;
-    }
+    return (T *)remote_block_addr;
 #endif
 }
 } // namespace detail

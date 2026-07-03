@@ -13,9 +13,16 @@
  * limitations under the License.
  */
 #pragma once
+#include <condition_variable>
+#include <cstddef>
 #include <cstdint>
+#include <memory>
+#include <mutex>
 #include <nncase/ntt/arch/cpu/runtime.h>
 #include <nncase/runtime/cpu/runtime_module.h>
+#include <thread>
+#include <type_traits>
+#include <vector>
 
 #ifdef __APPLE__
 #include <pthread.h>
@@ -31,6 +38,41 @@
 
 BEGIN_NS_NNCASE_RT_MODULE(cpu)
 
+class cpu_core_thread_pool {
+  public:
+    explicit cpu_core_thread_pool(size_t worker_count);
+    ~cpu_core_thread_pool();
+
+    template <class F> void run(size_t task_count, F &&task) noexcept {
+        using task_t = std::remove_reference_t<F>;
+        run_core(
+            task_count, &task,
+            [](void *context, size_t worker_id) noexcept {
+                (*static_cast<task_t *>(context))(worker_id);
+            });
+    }
+
+  private:
+    using task_invoker_t = void (*)(void *, size_t) noexcept;
+
+    void run_core(size_t task_count, void *task_context,
+                  task_invoker_t task_invoker) noexcept;
+    void worker_loop(size_t worker_id) noexcept;
+    static void bind_worker(size_t worker_id) noexcept;
+
+  private:
+    std::vector<std::thread> workers_;
+    std::mutex mutex_;
+    std::condition_variable task_cv_;
+    std::condition_variable done_cv_;
+    void *task_context_ = nullptr;
+    task_invoker_t task_invoker_ = nullptr;
+    size_t task_count_ = 0;
+    size_t generation_ = 0;
+    size_t remaining_ = 0;
+    bool stopping_ = false;
+};
+
 class cpu_runtime_module : public runtime_module {
   public:
     cpu_runtime_module() noexcept;
@@ -38,42 +80,12 @@ class cpu_runtime_module : public runtime_module {
 
     result<uintptr_t> native_handle(uint32_t flags) const noexcept override;
 
-    uint64_t tdim() const noexcept { return tdim_; }
     uint64_t bdim() const noexcept { return bdim_; }
     uint64_t cdim() const noexcept { return cdim_; }
+    cpu_core_thread_pool &thread_pool() noexcept { return *thread_pool_; }
 
     result<block_entry_t> block_entry() const noexcept;
     std::span<const std::byte> rdata() const noexcept { return rdata_; }
-
-    const std::span<const std::byte> thread_local_rdata() const noexcept {
-        return thread_local_rdata_;
-    }
-
-    const uint64_t *thread_local_rdata_header(size_t offset) const noexcept {
-        return reinterpret_cast<const uint64_t *>(thread_local_rdata_.data()) +
-               offset * 2;
-    }
-
-    const uint64_t *thread_local_cache_header(size_t offset) const noexcept {
-        return reinterpret_cast<const uint64_t *>(thread_local_cache_.data()) +
-               offset * 2;
-    }
-
-    const std::span<const std::byte>
-    thread_local_rdata_content() const noexcept {
-        return thread_local_rdata_.subspan(cdim_ * bdim_ * tdim_ * 2 *
-                                           sizeof(uint64_t));
-    }
-
-    const std::span<const std::byte>
-    thread_local_cache_content() const noexcept {
-        return thread_local_cache_.subspan(cdim_ * bdim_ * tdim_ * 2 *
-                                           sizeof(uint64_t));
-    }
-
-    const std::array<int32_t, 3> thread_local_cache_starts() const noexcept {
-        return thread_local_cache_starts_;
-    }
 
     const std::span<const std::byte> block_local_rdata() const noexcept {
         return block_local_rdata_;
@@ -105,19 +117,14 @@ class cpu_runtime_module : public runtime_module {
     result<void> initialize_text(runtime_module_init_context &context) noexcept;
 
   private:
-    uint64_t tdim_;
     uint64_t bdim_;
     uint64_t cdim_;
+    std::unique_ptr<cpu_core_thread_pool> thread_pool_;
     std::span<const std::byte> text_;
     std::span<const std::byte> rdata_;
-    std::span<const std::byte> thread_local_rdata_;
-    std::span<const std::byte> thread_local_cache_;
-    std::array<int32_t, 3> thread_local_cache_starts_;
     std::span<const std::byte> block_local_rdata_;
     host_buffer_t text_storage_;
     host_buffer_t rdata_storage_;
-    host_buffer_t thread_local_rdata_storage_;
-    host_buffer_t thread_local_cache_storage_;
     host_buffer_t block_local_rdata_storage_;
 
 #ifdef __APPLE__

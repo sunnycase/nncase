@@ -5,16 +5,14 @@
 @model Nncase.CodeGen.NTT.KernelMainModel
 @{
   var inputCount = Model.PrimFunction.Parameters.Length;
+  var shardCount = TensorUtilities.GetProduct(Model.Options.Hierarchies[0]);
 }
 
 extern "C" NTT_DEVICE void thread_main(const nncase::ntt::runtime::thread_inout_desc *input_descs,
   nncase::ntt::runtime::thread_inout_desc *const output_descs,
   const std::byte *rdata,
-  const std::byte *thread_local_rdata,
-  const std::byte *warp_local_rdata,
   const std::byte *block_local_rdata,
-  std::byte *thread_local_data,
-  std::byte *warp_local_data,
+  std::byte *data,
   std::byte *block_local_data,
   std::byte *output) {
   /* prepare inputs */
@@ -46,7 +44,7 @@ extern "C" NTT_DEVICE void thread_main(const nncase::ntt::runtime::thread_inout_
           if (kv_tensor_size > 128) {
             throw new NotSupportedException("KVCache tensor size is too large!");
           }
-          var placement = new Placement(Model.Options.Hierarchies[0], Model.Options.HierarchyNames, Model.Options.HierarchyKind);
+          var placement = new Placement(Model.Options.Hierarchies[0], Model.Options.HierarchyNames, Model.Options.HierarchyLevels);
 
   @:std::span<runtime::thread_paged_attention_kv_cache_desc> p@(name)_descs((runtime::thread_paged_attention_kv_cache_desc*)input_descs[@i].data, input_descs[@i].size / sizeof(runtime::thread_paged_attention_kv_cache_desc));
   @:using paged_attention_kv_cache_mesh_t = @Html.Raw(KernelUtility.PlacementToC(placement));
@@ -74,7 +72,7 @@ extern "C" NTT_DEVICE void thread_main(const nncase::ntt::runtime::thread_inout_
     throw new NotSupportedException($"not support multi form topology!");
   }
   
-  @(Model.PrimFunction.Name)(@(string.Concat(names.Select(x => $"{x}, ")))rdata, thread_local_rdata, warp_local_rdata, block_local_rdata, thread_local_data, warp_local_data, block_local_data, output, output_descs);
+  @(Model.PrimFunction.Name)(@(string.Concat(names.Select(x => $"{x}, ")))rdata, block_local_rdata, data, block_local_data, output, output_descs);
 }
 
 #ifdef NNCASE_STANDALONE
@@ -87,11 +85,6 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv) {
   }
 
   std::byte* rdata = (std::byte *)nncase::ntt::runtime::thread_alloc(@Model.RDataSize, align);
-  std::byte* thread_local_rdata = (std::byte *)nncase::ntt::runtime::thread_alloc(@Model.ThreadLocalRdataPoolSize, align);
-  uint64_t thread_local_rdata_header[@Model.Options.Hierarchies[0][^1] * 2];
-  for (size_t tid = 0; tid < tdim(); tid++) {
-    thread_local_rdata_header[tid * 2] = tid * ( @Model.ThreadLocalRdataPoolSize / tdim());
-  }
   std::byte* block_local_rdata = (std::byte *)nncase::ntt::runtime::thread_alloc(@Model.BlockLocalRdataPoolSize, align);
 
 #ifdef __APPLE__
@@ -102,23 +95,19 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv) {
   std::vector<std::thread> blocks;
   for (size_t cid = 0; cid < cdim(); cid++) {
     for (size_t bid = 0; bid < bdim(); bid++) {
-      blocks.emplace_back([cid, bid, inputs, rdata, thread_local_rdata_header, thread_local_rdata, block_local_rdata
+      blocks.emplace_back([cid, bid, inputs, rdata, block_local_rdata
 #ifdef __APPLE__
       , &cpu_thread_context_key_
 #endif
       ] {
         nncase::ntt::runtime::cpu_block_entry_params_t block_entry_params{
-            .tdim = tdim(),
             .bdim = bdim(),
             .cdim = cdim(),
             .bid = bid,
             .cid = cid,
-            .cpu_id_offset = (cid * bdim() + bid) * tdim(),
             .input_descs = nullptr,
             .output_descs = nullptr,
             .rdata = rdata,
-            .thread_local_rdata_header = thread_local_rdata_header,
-            .thread_local_rdata = thread_local_rdata,
             .block_local_rdata = block_local_rdata,
 #ifdef __APPLE__
             .cpu_thread_context_key = cpu_thread_context_key_,

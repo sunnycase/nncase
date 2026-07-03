@@ -13,7 +13,6 @@ using System.Text;
 using System.Threading.Tasks;
 using Nncase;
 using Nncase.CommandLine;
-using Nncase.IR;
 
 namespace Nncase.Targets;
 
@@ -47,11 +46,6 @@ public sealed class NTTTargetOptionsCommand : Command
             description: "Noc Architecture.",
             getDefaultValue: () => NocArchitecture.Mesh);
         Add(NocArchOption);
-        HierarchyKindOption = new Option<HierarchyKind>(
-            name: "--hierarchy-kind",
-            description: "Hierarchy Kind.",
-            getDefaultValue: () => HierarchyKind.Parallel);
-        Add(HierarchyKindOption);
         HierarchiesOption = new Option<IEnumerable<int[]>>(
             name: "--hierarchies",
             description: "the distributed hierarchies of hardware. eg. `8,4 4,8` for dynamic cluster search or `4` for fixed hardware.",
@@ -65,6 +59,11 @@ public sealed class NTTTargetOptionsCommand : Command
             description: "the name identify of hierarchies.",
             getDefaultValue: () => "b");
         Add(HierarchyNamesOption);
+        HierarchyLevelsOption = new Option<string>(
+            name: "--hierarchy-levels",
+            description: "the physical level mapping of logical hierarchy axes. Supported levels are c(chip), d(die), b(block).",
+            getDefaultValue: () => "b");
+        Add(HierarchyLevelsOption);
         HierarchySizesOption = new Option<IEnumerable<long>>(
             name: "--hierarchy-sizes",
             description: "the memory capacity of hierarchies.",
@@ -127,11 +126,11 @@ public sealed class NTTTargetOptionsCommand : Command
 
     public Option<NocArchitecture> NocArchOption { get; }
 
-    public Option<HierarchyKind> HierarchyKindOption { get; }
-
     public Option<IEnumerable<int[]>> HierarchiesOption { get; }
 
     public Option<string> HierarchyNamesOption { get; }
+
+    public Option<string> HierarchyLevelsOption { get; }
 
     public Option<IEnumerable<long>> HierarchySizesOption { get; }
 
@@ -166,9 +165,9 @@ public sealed class NTTTargetOptionsBinder
             UnifiedMemoryArch = context.ParseResult.GetValueForOption(_cmd.UnifiedMemoryArchOption)!,
             MemoryAccessArch = context.ParseResult.GetValueForOption(_cmd.MemoryAccessArchOption)!,
             NocArch = context.ParseResult.GetValueForOption(_cmd.NocArchOption)!,
-            HierarchyKind = context.ParseResult.GetValueForOption(_cmd.HierarchyKindOption)!,
             Hierarchies = context.ParseResult.GetValueForOption(_cmd.HierarchiesOption)!.ToArray(),
             HierarchyNames = context.ParseResult.GetValueForOption(_cmd.HierarchyNamesOption)!,
+            HierarchyLevels = context.ParseResult.GetValueForOption(_cmd.HierarchyLevelsOption)!,
             HierarchySizes = context.ParseResult.GetValueForOption(_cmd.HierarchySizesOption)!.ToArray(),
             HierarchyLatencies = context.ParseResult.GetValueForOption(_cmd.HierarchyLatenciesOption)!.ToArray(),
             HierarchyBandWidths = context.ParseResult.GetValueForOption(_cmd.HierarchyBandWidthsOption)!.ToArray(),

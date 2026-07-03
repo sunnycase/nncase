@@ -416,14 +416,27 @@ def _kv_cache_storage_key(raw_storage: Any, dtype: str, topology_shape: tuple[in
 
 
 def _runtime_value_to_numpy(value: Any):
+    torch = None
+    try:
+        torch = _import_torch()
+    except PyNTTBackendError:
+        pass
+
     if isinstance(value, (list, tuple)) and len(value) == 1:
         value = value[0]
+    if torch is not None and isinstance(value, torch.Tensor):
+        if value.device.type != "cpu":
+            return None
+        return value.numpy()
     if hasattr(value, "to_runtime_tensor"):
         value = value.to_runtime_tensor()
     if hasattr(value, "to_numpy"):
         return value.to_numpy()
     if hasattr(value, "numpy"):
-        return value.numpy()
+        try:
+            return value.numpy()
+        except TypeError:
+            return None
     return None
 
 
@@ -441,6 +454,12 @@ def _try_materialize_initial_kv_storage(
     required_blocks: int,
 ):
     raw_tensor = raw_storage[0] if isinstance(raw_storage, (list, tuple)) and len(raw_storage) == 1 else raw_storage
+    if isinstance(raw_tensor, torch.Tensor):
+        raw_torch = raw_tensor.to(device=device, dtype=torch_dtype) if device is not None or raw_tensor.dtype != torch_dtype else raw_tensor
+        raw_torch = raw_torch.contiguous()
+        if len(raw_torch.shape) >= len(topology_shape) + 1 and tuple(raw_torch.shape[:len(topology_shape)]) == topology_shape:
+            return raw_torch
+
     raw_numpy = _runtime_value_to_numpy(raw_tensor)
     if raw_numpy is not None and raw_numpy.dtype.kind not in ("i", "u"):
         if _is_numpy_bfloat16(raw_numpy):

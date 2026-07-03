@@ -439,7 +439,7 @@ class HuggingfaceTestRunner(TestRunner):
                     count += 1
                 else:
                     hidden_states = recursive_stack(result.hidden_states).detach().to(
-                        torch.float32).numpy()[-1]
+                        torch.float32).cpu().numpy()[-1]
                     dump_data_to_file(self.case_dir, f'cpu_result_{i}_{count}', hidden_states[0])
                     outputs.append(hidden_states[0])
                     count += 1
@@ -449,7 +449,7 @@ class HuggingfaceTestRunner(TestRunner):
                     slice_indices = slice(-logits_to_keep,
                                           None) if isinstance(logits_to_keep, int) else logits_to_keep
                     logits = self.model.lm_head(hidden_states)[
-                        :, slice_indices, :].detach().to(torch.float32).numpy()
+                        :, slice_indices, :].detach().to(torch.float32).cpu().numpy()
                 next_token_id, decoded_token = self.decode_token(logits)
                 tokens_ids.append(next_token_id)
                 tokens.append(decoded_token)

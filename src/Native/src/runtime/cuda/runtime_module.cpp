@@ -28,22 +28,18 @@ using namespace nncase::runtime::cuda;
 using namespace nncase::ntt::runtime;
 
 typedef struct {
-    uint32_t tdim;
-    uint32_t wdim;
     uint32_t bdim;
     uint32_t cdim;
 } module_desc_header;
 
 cuda_runtime_module::cuda_runtime_module() noexcept
-    : tdim_(0), wdim_(0), bdim_(0), cdim_(0) {}
+    : bdim_(0), cdim_(0) {}
 
 result<void> cuda_runtime_module::initialize_before_functions(
     runtime_module_init_context &context) noexcept {
     try_(context.read_section(
         ".desc", [this](auto reader, size_t) -> result<void> {
             auto header = reader.template read<module_desc_header>();
-            this->tdim_ = header.tdim;
-            this->wdim_ = header.wdim;
             this->bdim_ = header.bdim;
             this->cdim_ = header.cdim;
             return ok();
@@ -51,10 +47,6 @@ result<void> cuda_runtime_module::initialize_before_functions(
 
     try_(initialize_text(context));
     try_set(rdata_, initialize_section(context, ".rdata"));
-    try_set(thread_local_rdata_,
-            initialize_section(context, ".thread_local_rdata"));
-    try_set(warp_local_rdata_,
-            initialize_section(context, ".warp_local_rdata"));
     try_set(block_local_rdata_,
             initialize_section(context, ".block_local_rdata"));
     return ok();

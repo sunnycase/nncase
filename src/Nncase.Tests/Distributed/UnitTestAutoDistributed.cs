@@ -54,7 +54,7 @@ public sealed class UnitTestDistribAutoDistributed : TestClassBase
     public void TestNonUniformSplitCandidateIsGenerated()
     {
         var tensorType = new TensorType(DataTypes.Float32, [1024]);
-        var placement = new Placement([36], "b");
+        var placement = new Placement([36], "b", "b");
         var policies = DistributedUtility.GetLeafCandidatePolicies(tensorType, placement);
 
         Assert.Contains(policies, policy => policy.Count == 1 && policy[0] is SBPSplit split && split.Axes.SequenceEqual(new[] { 0 }));
@@ -72,7 +72,7 @@ public sealed class UnitTestDistribAutoDistributed : TestClassBase
     {
         var sequenceLength = new DimVar("sequence_length") { Metadata = { Range = (1, 1024) } };
         var tensorType = new TensorType(DataTypes.Float32, [sequenceLength]);
-        var placement = new Placement([4], "y");
+        var placement = new Placement([4], "y", "b");
         var policies = DistributedUtility.GetLeafCandidatePolicies(tensorType, placement);
 
         var split = policies

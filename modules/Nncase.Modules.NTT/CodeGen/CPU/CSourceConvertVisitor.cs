@@ -346,7 +346,7 @@ public class CSourceConvertVisitor : ExprFunctor<CSymbol, Unit>
             return symbol;
         }
 
-        symbol = new("dim_t", "ntt::distributed::program_id<topology::thread>()");
+        symbol = new("dim_t", "0");
         _exprMemo.Add(expr, symbol);
         return symbol;
     }

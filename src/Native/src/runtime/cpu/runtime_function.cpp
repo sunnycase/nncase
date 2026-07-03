@@ -45,7 +45,6 @@ typedef struct {
     uint32_t local_data_align;
     uint64_t output_pool_size;
     uint64_t local_data_pool_size;
-    uint64_t warp_local_data_pool_size;
     uint64_t block_local_data_pool_size;
 } kernel_desc_header;
 
@@ -74,15 +73,14 @@ result<void> cpu_runtime_function::initialize_core(
             try_set(this->output_buffer_,
                     output_buffer.template as<host_buffer_t>());
 
-            // Allocate thread local datas
+            // Allocate per-block data workspaces
             options.alignment = header.local_data_align;
-            thread_local_datas_.resize(blocks_count);
+            datas_.resize(blocks_count);
             for (size_t i = 0; i < blocks_count; i++) {
                 try_var(buffer,
                         buffer_allocator::host().allocate(
-                            header.local_data_pool_size * module().tdim(),
-                            options));
-                try_set(thread_local_datas_[i],
+                            header.local_data_pool_size, options));
+                try_set(datas_[i],
                         buffer.template as<host_buffer_t>());
             }
 
@@ -132,9 +130,8 @@ result<void> cpu_runtime_function::initialize_core(
         profile_records_.resize(blocks_count);
         profile_record_counts_.resize(blocks_count);
         for (size_t i = 0; i < blocks_count; i++) {
-            profile_records_[i].resize(module().tdim() *
-                                       default_profile_record_count);
-            profile_record_counts_[i].resize(module().tdim());
+            profile_records_[i].resize(default_profile_record_count);
+            profile_record_counts_[i].resize(1);
         }
     }
 

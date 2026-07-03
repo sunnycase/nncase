@@ -33,7 +33,7 @@ import warnings
 
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
 import _nncase
-from _nncase import RuntimeTensor, RTValue, TensorDesc, Simulator, NTTTargetOptions, PyNTTTargetOptions, NocArchitecture, HierarchyKind, HuggingFaceOptions, MemoryAccessArchitecture, PagedKVCacheDimKind, AttentionConfig, PagedAttentionConfig, PagedAttentionKVCache, PagedAttentionScheduler
+from _nncase import RuntimeTensor, RTValue, TensorDesc, Simulator, NTTTargetOptions, PyNTTTargetOptions, NocArchitecture, HuggingFaceOptions, MemoryAccessArchitecture, PagedKVCacheDimKind, AttentionConfig, PagedAttentionConfig, PagedAttentionKVCache, PagedAttentionScheduler
 
 
 def _initialize():

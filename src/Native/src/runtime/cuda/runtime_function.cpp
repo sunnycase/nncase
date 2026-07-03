@@ -33,8 +33,7 @@ typedef struct {
     uint32_t output_align;
     uint32_t local_data_align;
     uint64_t output_pool_size;
-    uint64_t thread_local_data_pool_size;
-    uint64_t warp_local_data_pool_size;
+    uint64_t local_data_pool_size;
     uint64_t block_local_data_pool_size;
 } kernel_desc_header;
 
@@ -62,30 +61,17 @@ result<void> cuda_runtime_function::initialize_core(
             try_set(this->output_buffer_,
                     output_buffer.template as<host_buffer_t>());
 
-            const size_t thread_local_data_size =
-                header.thread_local_data_pool_size * module().tdim() *
-                module().wdim() * module().bdim();
-            const size_t warp_local_data_size =
-                header.warp_local_data_pool_size * module().wdim() *
-                module().bdim();
+            const size_t data_size =
+                header.local_data_pool_size * module().bdim();
             const size_t block_local_data_size =
                 header.block_local_data_pool_size * module().bdim();
             for (size_t cid = 0; cid < module().cdim(); cid++) {
                 CHECK_CUDA(cudaSetDevice(cid));
 
-                // Allocate thread local datas
-                std::byte *thread_local_data_dev_ptr;
-                CHECK_CUDA(cudaMalloc((void **)&thread_local_data_dev_ptr,
-                                      thread_local_data_size));
-                thread_local_datas_.emplace_back(thread_local_data_dev_ptr,
-                                                 thread_local_data_size);
-
-                // Allocate warp local datas
-                std::byte *warp_local_data_dev_ptr;
-                CHECK_CUDA(cudaMalloc((void **)&warp_local_data_dev_ptr,
-                                      warp_local_data_size));
-                warp_local_datas_.emplace_back(warp_local_data_dev_ptr,
-                                               warp_local_data_size);
+                // Allocate per-block data workspaces
+                std::byte *data_dev_ptr;
+                CHECK_CUDA(cudaMalloc((void **)&data_dev_ptr, data_size));
+                datas_.emplace_back(data_dev_ptr, data_size);
 
                 // Allocate block local datas
                 std::byte *block_local_data_dev_ptr;
@@ -131,9 +117,8 @@ result<void> cuda_runtime_function::initialize_core(
         // profile_records_.resize(blocks_count);
         // profile_record_counts_.resize(blocks_count);
         // for (size_t i = 0; i < blocks_count; i++) {
-        //     profile_records_[i].resize(module().tdim() *
-        //                                default_profile_record_count);
-        //     profile_record_counts_[i].resize(module().tdim());
+        //     profile_records_[i].resize(default_profile_record_count);
+        //     profile_record_counts_[i].resize(1);
         // }
     }
 

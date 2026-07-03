@@ -21,6 +21,7 @@ public sealed class PyNTTTargetOptions : NTTTargetOptions
     public PyNTTTargetOptions()
     {
         HierarchyNames = "yx";
+        HierarchyLevels = "bb";
         Hierarchies = new[] { new[] { 4, 8 } };
         RefreshTargetCostModel();
     }
@@ -79,9 +80,9 @@ public sealed class PyNTTTargetOptions : NTTTargetOptions
             UnifiedMemoryArch = nttOptions.UnifiedMemoryArch,
             MemoryAccessArch = nttOptions.MemoryAccessArch,
             NocArch = nttOptions.NocArch,
-            HierarchyKind = nttOptions.HierarchyKind,
             Hierarchies = nttOptions.Hierarchies,
             HierarchyNames = nttOptions.HierarchyNames,
+            HierarchyLevels = nttOptions.HierarchyLevels,
             HierarchySizes = nttOptions.HierarchySizes,
             HierarchyLatencies = nttOptions.HierarchyLatencies,
             HierarchyBandWidths = nttOptions.HierarchyBandWidths,

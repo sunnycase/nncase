@@ -8,7 +8,6 @@ using System.Linq;
 using System.Text;
 using System.Threading.Tasks;
 using Nncase.CostModel;
-using Nncase.IR;
 
 namespace Nncase.Targets;
 
@@ -41,12 +40,6 @@ public class NTTTargetOptions : INTTTargetOptions, ITargetOpCostModelProvider
     [CommandLine.FromAmong(NocArchitecture.Mesh, NocArchitecture.CrossBar)]
     public NocArchitecture NocArch { get; set; } = NocArchitecture.Mesh;
 
-    [DisplayName("--hierarchy-kind")]
-    [Description("Hierarchy Kind.")]
-    [DefaultValue(HierarchyKind.Parallel)]
-    [CommandLine.FromAmong(HierarchyKind.Parallel, HierarchyKind.SMT)]
-    public HierarchyKind HierarchyKind { get; set; } = HierarchyKind.Parallel;
-
     [DisplayName("--hierarchies")]
     [Description("the distributed hierarchies of hardware. eg. `8,4 4,8` for dynamic cluster search or `4` for fixed hardware.")]
     [DefaultValue("() => new int[][] { new int[] { 1 } }")]
@@ -56,8 +49,13 @@ public class NTTTargetOptions : INTTTargetOptions, ITargetOpCostModelProvider
 
     [DisplayName("--hierarchy-names")]
     [Description("the name identify of hierarchies.")]
-    [DefaultValue("t")]
-    public string HierarchyNames { get; set; } = "t";
+    [DefaultValue("b")]
+    public string HierarchyNames { get; set; } = "b";
+
+    [DisplayName("--hierarchy-levels")]
+    [Description("the physical level mapping of logical hierarchy axes. Supported levels are c(chip), d(die), b(block).")]
+    [DefaultValue("b")]
+    public string HierarchyLevels { get; set; } = "b";
 
     [DisplayName("--hierarchy-sizes")]
     [Description("the memory capacity of hierarchies.")]

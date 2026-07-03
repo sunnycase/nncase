@@ -24,20 +24,17 @@
 
 namespace nncase::ntt::runtime {
 struct xpu_block_entry_params_t {
-    size_t tdim;
     size_t bdim;
     size_t ddim;
     size_t cdim;
     size_t bid;
     size_t did;
     size_t cid;
-    size_t xpu_id_offset;
     std::byte *const *input_descs;
     const std::byte *rdata;
 };
 
 struct xpu_thread_context_t {
-    size_t tid;
     size_t bid;
     size_t did;
     size_t cid;
@@ -45,9 +42,7 @@ struct xpu_thread_context_t {
     static xpu_thread_context_t &current() noexcept;
 };
 
-extern size_t tdim;
 extern size_t bdim;
 extern size_t ddim;
 extern size_t cdim;
 } // namespace nncase::ntt::runtime
-

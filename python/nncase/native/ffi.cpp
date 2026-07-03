@@ -296,11 +296,6 @@ PYBIND11_MODULE(_nncase, m) {
       .value("Mesh", noc_architecture_mesh)
       .value("CrossBar", noc_architecture_cross_bar);
 
-    py::enum_<hierarchy_kind_t>(m, "HierarchyKind")
-      .value("Parallel", hierarchy_kind_parallel)
-      .value("SMT", hierarchy_kind_smt);
-
-
     py::class_<cpu_target_options>(m, "NTTTargetOptions")
       .def(py::init())
       .def_property(
@@ -324,10 +319,6 @@ PYBIND11_MODULE(_nncase, m) {
         py::overload_cast<>(&cpu_target_options::noc_arch),
         py::overload_cast<noc_architecture_t>(&cpu_target_options::noc_arch))
       .def_property(
-        "HierarchyKind",
-        py::overload_cast<>(&cpu_target_options::hierarchy_kind),
-        py::overload_cast<hierarchy_kind_t>(&cpu_target_options::hierarchy_kind))
-      .def_property(
         "Hierarchies",
         []() {},
         py::overload_cast<std::vector<std::vector<int>>>(&cpu_target_options::hierarchies))
@@ -335,6 +326,10 @@ PYBIND11_MODULE(_nncase, m) {
         "HierarchyNames",
         []() {},
         py::overload_cast<std::string_view>(&cpu_target_options::hierarchy_names))
+      .def_property(
+        "HierarchyLevels",
+        []() {},
+        py::overload_cast<std::string_view>(&cpu_target_options::hierarchy_levels))
       .def_property(
         "HierarchySizes",
         []() {},

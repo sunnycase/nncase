@@ -105,10 +105,6 @@ enum noc_architecture_t : uint8_t {
   noc_architecture_mesh = 0,
   noc_architecture_cross_bar = 1,
 };
-enum hierarchy_kind_t : uint8_t {
-  hierarchy_kind_parallel = 0,
-  hierarchy_kind_smt = 1,
-};
 /* end the auto generated block by tools/stackvm_gen/CApiGen at 12/20/2024 3:41:05 PM +08:00. */
 // clang-format on
 
@@ -299,10 +295,9 @@ typedef struct {
     void (*cpu_target_options_set_memory_access_arch)(clr_object_handle_t handle, uint8_t value);
     uint8_t (*cpu_target_options_get_noc_arch)(clr_object_handle_t handle);
     void (*cpu_target_options_set_noc_arch)(clr_object_handle_t handle, uint8_t value);
-    uint8_t (*cpu_target_options_get_hierarchy_kind)(clr_object_handle_t handle);
-    void (*cpu_target_options_set_hierarchy_kind)(clr_object_handle_t handle, uint8_t value);
     void (*cpu_target_options_set_hierarchies)(clr_object_handle_t handle, int32_t* value, size_t shape0, size_t* shape1);
     void (*cpu_target_options_set_hierarchy_names)(clr_object_handle_t handle, const char* value, size_t length);
+    void (*cpu_target_options_set_hierarchy_levels)(clr_object_handle_t handle, const char* value, size_t length);
     void (*cpu_target_options_set_hierarchy_sizes)(clr_object_handle_t handle, int64_t* value, size_t shape0);
     void (*cpu_target_options_set_hierarchy_latencies)(clr_object_handle_t handle, int32_t* value, size_t shape0);
     void (*cpu_target_options_set_hierarchy_band_widths)(clr_object_handle_t handle, int32_t* value, size_t shape0);
@@ -721,14 +716,6 @@ class cpu_target_options : public clr_object_base {
         nncase_clr_api()->cpu_target_options_set_noc_arch(obj_.get(), value);
     }
 
-    hierarchy_kind_t hierarchy_kind() {
-        return (hierarchy_kind_t)nncase_clr_api()->cpu_target_options_get_hierarchy_kind(obj_.get());
-    }
-
-    void hierarchy_kind(hierarchy_kind_t value) {
-        nncase_clr_api()->cpu_target_options_set_hierarchy_kind(obj_.get(), value);
-    }
-
     void hierarchies(std::vector<std::vector<int>> value) {
         std::vector<int> values;
         size_t shape0;
@@ -746,6 +733,10 @@ class cpu_target_options : public clr_object_base {
 
     void hierarchy_names(std::string_view value) {
         nncase_clr_api()->cpu_target_options_set_hierarchy_names(obj_.get(), value.data(), value.length());
+    }
+
+    void hierarchy_levels(std::string_view value) {
+        nncase_clr_api()->cpu_target_options_set_hierarchy_levels(obj_.get(), value.data(), value.length());
     }
 
     void hierarchy_sizes(std::vector<int64_t> value) {

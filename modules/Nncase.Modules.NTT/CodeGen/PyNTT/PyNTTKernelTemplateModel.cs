@@ -229,6 +229,9 @@ public sealed record PyNTTReshardTemplateModel(
     int[] Hierarchy,
     int[][] InputSplitAxes,
     int[][] OutputSplitAxes,
+    long CollectiveOffsetBytes,
+    long CollectivePoolBytes,
+    string Stage,
     string Comment)
 {
     public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
@@ -373,6 +376,8 @@ public sealed record PyNTTGetPositionIdsTemplateModel(
     PyNTTDimExpression[] LocalShape,
     PyNTTDimExpression[] GlobalShape,
     PyNTTDimExpression[] OutputStrides,
+    int[] Hierarchy,
+    int[][] SplitAxes,
     int? ShardAxis,
     string Comment)
 {

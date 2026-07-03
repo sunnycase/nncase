@@ -15,12 +15,6 @@ using DryIoc.ImTools;
 
 namespace Nncase.IR;
 
-public enum HierarchyKind : byte
-{
-    Parallel = 0,
-    SMT = 1,
-}
-
 [JsonConverter(typeof(SBPConverter))]
 public abstract record SBP
 {
@@ -147,8 +141,7 @@ public class SBPConverter : JsonConverter<SBP>
     }
 }
 
-// public sealed record Placement(Placement.DeviceKind Kind, IRArray<int> Hierarchy, string Name, HierarchyKind HierarchyKind)
-public sealed record Placement(IRArray<int> Hierarchy, string Name, HierarchyKind HierarchyKind = HierarchyKind.Parallel)
+public sealed record Placement(IRArray<int> Hierarchy, string Name, string HierarchyLevels)
 {
     // public enum DeviceKind : uint
     // {
@@ -156,9 +149,77 @@ public sealed record Placement(IRArray<int> Hierarchy, string Name, HierarchyKin
     // }
     public int Rank => Hierarchy.Count;
 
-    public bool HasWarp => Name.Contains('w', StringComparison.Ordinal);
+    public string NormalizedHierarchyNames => NormalizeAxisString(Name);
+
+    public string NormalizedHierarchyLevels => NormalizeHierarchyLevels(HierarchyLevels, Name, Rank);
+
+    public bool IsPhysicalBlockAxis(int axis) => NormalizedHierarchyLevels[axis] == 'b';
+
+    public int GetPhysicalLevelSize(char level)
+    {
+        var normalizedLevel = char.ToLowerInvariant(level);
+        var levels = NormalizedHierarchyLevels;
+        var size = 1;
+        for (var i = 0; i < levels.Length; i++)
+        {
+            if (levels[i] == normalizedLevel)
+            {
+                size = checked(size * Hierarchy[i]);
+            }
+        }
+
+        return size;
+    }
+
+    public int GetFirstPhysicalLevelAxis(char level)
+    {
+        var normalizedLevel = char.ToLowerInvariant(level);
+        var levels = NormalizedHierarchyLevels;
+        for (var i = 0; i < levels.Length; i++)
+        {
+            if (levels[i] == normalizedLevel)
+            {
+                return i;
+            }
+        }
+
+        return -1;
+    }
 
     public override string ToString() => $"[{string.Join(',', Hierarchy.Zip(Name).Select(t => t.Second.ToString() + ':' + t.First.ToString()))}]";
+
+    public static string NormalizeAxisString(string? value)
+        => string.Concat((value ?? string.Empty).Where(ch => char.IsLetterOrDigit(ch)));
+
+    public static string NormalizeHierarchyLevels(string? levels, string names, int rank)
+    {
+        var normalizedLevels = NormalizeAxisString(levels);
+        if (string.IsNullOrWhiteSpace(normalizedLevels))
+        {
+            if (rank == 0)
+            {
+                return string.Empty;
+            }
+
+            throw new InvalidOperationException("HierarchyLevels must be explicitly provided for non-empty placements.");
+        }
+
+        normalizedLevels = string.Concat(normalizedLevels.Select(char.ToLowerInvariant));
+        if (normalizedLevels.Length != rank)
+        {
+            throw new InvalidOperationException($"HierarchyLevels '{levels}' must have {rank} axis entries.");
+        }
+
+        foreach (var level in normalizedLevels)
+        {
+            if (level is not ('c' or 'd' or 'b'))
+            {
+                throw new InvalidOperationException($"Unsupported hierarchy physical level '{level}'. Only 'c', 'd' and 'b' are supported.");
+            }
+        }
+
+        return normalizedLevels;
+    }
 }
 
 public sealed record DistributedType(TensorType TensorType, IRArray<SBP> AxisPolicies, Placement Placement, SBPPartial? Partial = null) : IRType

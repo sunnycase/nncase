@@ -34,19 +34,11 @@ internal sealed class PyNTTLinkableFunction : ILinkableFunction
 internal sealed record PyNTTRDataBundle(
     string RData,
     long RDataBytes,
-    string[] ThreadLocalRDatas,
-    long ThreadLocalRDataBytes,
-    string[] WarpLocalRDatas,
-    long WarpLocalRDataBytes,
     string[] BlockLocalRDatas,
     long BlockLocalRDataBytes)
 {
     public static PyNTTRDataBundle Empty { get; } = new(
         string.Empty,
-        0,
-        Array.Empty<string>(),
-        0,
-        Array.Empty<string>(),
         0,
         Array.Empty<string>(),
         0);

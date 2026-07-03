@@ -21,18 +21,14 @@ internal class FunctionBuilder
     private readonly SectionManager _sectionManager;
     private readonly BinaryWriter _textWriter;
     private readonly BinaryWriter _rdataWriter;
-    private readonly IReadOnlyList<BinaryWriter> _threadLocalRdataWriters;
-    private readonly IReadOnlyList<BinaryWriter> _warpLocalRdataWriters;
     private readonly IReadOnlyList<BinaryWriter> _blockLocalRdataWriters;
 
-    public FunctionBuilder(uint id, BinaryWriter rdataWriter, IReadOnlyList<BinaryWriter> threadLocalRdataWriters, IReadOnlyList<BinaryWriter> warpLocalRdataWriters, IReadOnlyList<BinaryWriter> blockLocalRdataWriters, Targets.NTTTargetOptions targetOptions)
+    public FunctionBuilder(uint id, BinaryWriter rdataWriter, IReadOnlyList<BinaryWriter> blockLocalRdataWriters, Targets.NTTTargetOptions targetOptions)
     {
         _id = id;
         _sectionManager = new();
         _textWriter = _sectionManager.GetWriter(WellknownSectionNames.Text);
         _rdataWriter = rdataWriter;
-        _threadLocalRdataWriters = threadLocalRdataWriters;
-        _warpLocalRdataWriters = warpLocalRdataWriters;
         _blockLocalRdataWriters = blockLocalRdataWriters;
         TargetOptions = targetOptions;
     }
@@ -62,8 +58,6 @@ internal class FunctionBuilder
                 }
 
                 // 2. write the local rdatas
-                var threadLocalRdataPoolSize = SerializeLocalRdata(primFunc.SchedResult.ThreadLocalRdatas, _threadLocalRdataWriters, "t");
-                var warpLocalRdataPoolSize = SerializeLocalRdata(primFunc.SchedResult.WarpLocalRdatas, _warpLocalRdataWriters, "w");
                 var blockLocalRdataPoolSize = SerializeLocalRdata(primFunc.SchedResult.BlockLocalRdatas, _blockLocalRdataWriters, "b");
 
                 // 3. build function.
@@ -79,15 +73,12 @@ internal class FunctionBuilder
                     header.LocalDataAlign = (uint)primFunc.SchedResult.DataAlign;
                     header.OutputPoolSize = primFunc.SchedResult.OutputUsage;
                     header.LocalDataPoolSize = primFunc.SchedResult.DataUsage;
-                    header.WarpLocalDataPoolSize = primFunc.SchedResult.WarpLocalDataPoolSize;
                     header.BlockLocalDataPoolSize = primFunc.SchedResult.BlockLocalDataPoolSize;
                     writer.Write(ref header);
                 }
 
                 var memoryPoolDesc = new KernelMemoryPoolDesc(
                     rdataPoolSize,
-                    threadLocalRdataPoolSize,
-                    warpLocalRdataPoolSize,
                     blockLocalRdataPoolSize);
                 var kernelDescSection = new LinkedSection(_sectionManager.GetContent(LinkableKernelFunction.KernelHeaderSectionName)!, ".desc", 0, 8, (uint)sizeof(KernelDescHeader));
                 return new LinkableKernelFunction(_id, primFunc, functionCSource, memoryPoolDesc, _sectionManager.GetContent(WellknownSectionNames.Text)!, kernelDescSection);
@@ -147,7 +138,7 @@ internal class FunctionBuilder
     private int[] GetScopedShardIndex(int writerIndex, string scopeName)
     {
         var hierarchies = TargetOptions.Hierarchies[0];
-        var scopeIndex = TargetOptions.HierarchyNames.IndexOf(scopeName, StringComparison.Ordinal);
+        var scopeIndex = GetScopeIndex(scopeName, hierarchies.Length);
         if (scopeIndex < 0)
         {
             return DistributedUtility.GetUnraveledIndex(writerIndex, hierarchies);
@@ -157,5 +148,16 @@ internal class FunctionBuilder
         return DistributedUtility.GetUnraveledIndex(writerIndex, scopedHierarchies)
             .Concat(Enumerable.Repeat(0, hierarchies.Length - scopedHierarchies.Length))
             .ToArray();
+    }
+
+    private int GetScopeIndex(string scopeName, int rank)
+    {
+        if (scopeName.Length == 1 && scopeName[0] is 'c' or 'd' or 'b')
+        {
+            var levels = Placement.NormalizeHierarchyLevels(TargetOptions.HierarchyLevels, TargetOptions.HierarchyNames, rank);
+            return levels.LastIndexOf(scopeName[0]);
+        }
+
+        return -1;
     }
 }

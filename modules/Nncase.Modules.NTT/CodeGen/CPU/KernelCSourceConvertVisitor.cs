@@ -29,7 +29,7 @@ namespace Nncase.CodeGen.NTT;
 /// </summary>
 internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisposable
 {
-    private readonly HashSet<string> _excludedVars = new() { "data", "warp_local_data", "block_local_data" };
+    private readonly HashSet<string> _excludedVars = new() { "data", "block_local_data" };
     private readonly StringBuilder _kernelBuilder;
     private readonly HashSet<TIR.PrimFunction> _refFuncs;
     private readonly HashSet<TIR.Buffer> _declaredBuffers = new(ReferenceEqualityComparer.Instance);
@@ -94,7 +94,7 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
         var paramsExcluded = VisitEntry.Parameters.ToArray().OfType<IVar>().Where(x => !_excludedVars.Contains(x.Name)).ToArray();
         var templateHeader = TensorParams.Length == 0 ? string.Empty : $"template<{string.Join(", ", Enumerable.Range(0, TensorParams.Length).Select(x => $"class T{x}"))}>" + Environment.NewLine;
         var ctype = templateHeader +
-            $"NTT_DEVICE void {VisitEntry.Name}({string.Concat(paramsExcluded.Select(Visit).Select(s => $"{s.Type} {s.Name}, ").ToArray())}const std::byte *rdata, const std::byte *thread_local_rdata, const std::byte *warp_local_rdata, const std::byte *block_local_rdata, std::byte *thread_local_data, std::byte *warp_local_data, std::byte *block_local_data, std::byte *output, nncase::ntt::runtime::thread_inout_desc *const output_descs)";
+            $"NTT_DEVICE void {VisitEntry.Name}({string.Concat(paramsExcluded.Select(Visit).Select(s => $"{s.Type} {s.Name}, ").ToArray())}const std::byte *rdata, const std::byte *block_local_rdata, std::byte *data, std::byte *block_local_data, std::byte *output, nncase::ntt::runtime::thread_inout_desc *const output_descs)";
         return new(
             Declare: ctype + ";\n",
             Kernel: CSourceBuiltn.MakeKernel(ctype, _kernelBuilder.ToString()),
@@ -187,21 +187,18 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
         string loc = (expr.Location, expr.Hierarchy) switch
         {
             (MemoryLocation.Rdata, 0) => "rdata",
-            (MemoryLocation.ThreadLocalRdata, 0) => "thread_local_rdata",
-            (MemoryLocation.WarpLocalRdata, 0) => "warp_local_rdata",
             (MemoryLocation.BlockLocalRdata, 0) => "block_local_rdata",
-            (MemoryLocation.Data, 0) => "thread_local_data",
-            (MemoryLocation.Data, 1) => "thread_local_data",
-            (MemoryLocation.WarpLocalData, 0) => "warp_local_data",
+            (MemoryLocation.Data, 0) => "data",
+            (MemoryLocation.Data, 1) => "data",
             (MemoryLocation.BlockLocalData, 0) => "block_local_data",
             (MemoryLocation.Output, 0) => "output",
             _ => throw new NotSupportedException($"{expr.Location}, {expr.Hierarchy}"),
         };
 
         var ptypeName = "std::byte";
-        if (expr.Location is MemoryLocation.Rdata or MemoryLocation.ThreadLocalRdata or MemoryLocation.WarpLocalRdata or MemoryLocation.BlockLocalRdata)
+        if (expr.Location is MemoryLocation.Rdata or MemoryLocation.BlockLocalRdata)
         {
-            // Rdata, ThreadLocalRdata and BlockLocalRdata are const
+            // Rdata and BlockLocalRdata are const.
             ptypeName = $"const {ptypeName}";
         }
 
@@ -255,7 +252,7 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
         var dimensionStr = $"shape_t<{StringUtility.Join(", ", dimensionTypes)}>";
         var strideStr = $"strides_t<{StringUtility.Join(", ", strideTypes)}>";
 
-        var type = expr.MemSpan.Buffer.Location is MemoryLocation.Rdata or MemoryLocation.ThreadLocalRdata or MemoryLocation.BlockLocalRdata || expr.MemSpan.Buffer.Start is TensorConst
+        var type = expr.MemSpan.Buffer.Location is MemoryLocation.Rdata or MemoryLocation.BlockLocalRdata || expr.MemSpan.Buffer.Start is TensorConst
             ? (expr.DistributedType == null
              ? $"tensor_view<{dtypeStr}, {dimensionStr}, {strideStr}> "
              : $"sharded_tensor_view<{dtypeStr}, {dimensionStr}, {KernelUtility.ShardingToC(expr.DistributedType)}, {strideStr}> ")
@@ -296,7 +293,7 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
             if (args.Any(x => x is TIR.Buffer { MemSpan: { Buffer: { Location: MemoryLocation.BlockLocalData } } }))
             {
                 // Ensure all threads reach this point before a kernel using BlockLocalData
-                WriteIndWithProfiler($"ntt::distributed::topology_synchronize<ntt::distributed::topology::thread>();\n");
+                WriteIndWithProfiler($"ntt::distributed::topology_synchronize<ntt::distributed::topology::block>();\n");
             }
 
             switch (kop)
@@ -638,7 +635,7 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
                     WriteIndWithProfiler($"paged_attention({VisitBuffer(args[0], local: false).Name}, {VisitBuffer(args[1], local: true).Name}, {VisitBuffer(args[2], local: true).Name}, {VisitBuffer(args[3], local: true).Name}, {pagedAttention.LayerId}, {VisitBuffer(args[4], local: true).Name}, {pagedAttention.Layout.ToC()});\n");
                     break;
                 case TIR.NTT.SynchronizeThreads:
-                    WriteIndWithProfiler($"ntt::distributed::topology_synchronize<ntt::distributed::topology::thread>();\n");
+                    WriteIndWithProfiler($"ntt::distributed::topology_synchronize<ntt::distributed::topology::block>();\n");
                     break;
                 case TIR.NTT.Qwen3MoE qwen3MoE:
                     IndentScope.Writer.IndWrite($"qwen3_moe({VisitBuffer(args[0], local: true).Name}, {VisitBuffer(args[1], local: true).Name}, {VisitBuffer(args[2], local: true).Name}, {VisitBuffer(args[3], local: true).Name}, {VisitBuffer(args[4], local: true).Name}, {VisitBuffer(args[5], local: true).Name}, {VisitBuffer(args[6], local: true).Name}, {VisitBuffer(args[7], local: true).Name}, {VisitBuffer(args[8], local: true).Name},{VisitBuffer(args[9], local: true).Name},{VisitBuffer(args[10], local: true).Name},{VisitBuffer(args[11], local: true).Name}, {qwen3MoE.LayerId}, {qwen3MoE.HiddenSize}, {qwen3MoE.IntermediateSize}, {qwen3MoE.MoEIntermediateSize}, {qwen3MoE.NumExpert}, {qwen3MoE.NumTopK}, {qwen3MoE.IsNormTopkProb});\n");
@@ -687,7 +684,7 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
                     var buffer = VisitBuffer(b, local: true);
                     if (b.Name.StartsWith("data_"))
                     {
-                        dataName = $"rdata, thread_local_rdata, block_local_rdata, (std::byte *){buffer.Name}.buffer().data(), <block_local_data>, output, output_descs";
+                        dataName = $"rdata, block_local_rdata, (std::byte *){buffer.Name}.buffer().data(), <block_local_data>, output, output_descs";
                     }
                     else if (b.Name.StartsWith("block_local_data_"))
                     {

@@ -14,12 +14,6 @@ namespace Nncase.CodeGen.NTT;
 internal unsafe struct ModuleDescHeader
 {
     [MarshalAs(UnmanagedType.U4)]
-    public uint ThreadDim;
-
-    [MarshalAs(UnmanagedType.U4)]
-    public uint WarpDim;
-
-    [MarshalAs(UnmanagedType.U4)]
     public uint BlockDim;
 
     [MarshalAs(UnmanagedType.U4)]
@@ -30,7 +24,7 @@ internal sealed class LinkedModule : ILinkedModule
 {
     public const string ModuleHeaderSectionName = ".desc";
 
-    public unsafe LinkedModule(string moduleKind, IReadOnlyList<ILinkedFunction> functions, Stream desc, Stream text, Stream rdata, IReadOnlyList<Stream> threadLocalRdatas, IReadOnlyList<Stream> threadLocalCaches, IReadOnlyList<Stream> warpLocalRdatas, IReadOnlyList<Stream> blockLocalRdatas, ulong rdataAlign)
+    public unsafe LinkedModule(string moduleKind, IReadOnlyList<ILinkedFunction> functions, Stream desc, Stream text, Stream rdata, IReadOnlyList<Stream> blockLocalRdatas, ulong rdataAlign)
     {
         ModuleKind = moduleKind;
         Functions = functions;
@@ -39,9 +33,6 @@ internal sealed class LinkedModule : ILinkedModule
             new LinkedSection(desc, ModuleHeaderSectionName, 0, 8, (ulong)desc.Length),
             new LinkedSection(text, WellknownSectionNames.Text, 0, 8, (ulong)text.Length),
             new LinkedSection(rdata, WellknownSectionNames.Rdata, 0, (uint)rdataAlign, (ulong)rdata.Length),
-            new LinkedMultipleContentsSection(threadLocalRdatas, WellknownSectionNames.ThreadLocalRdata, 0, (uint)rdataAlign),
-            new LinkedMultipleContentsSection(threadLocalCaches, WellknownSectionNames.ThreadLocalCache, 0, (uint)rdataAlign),
-            new LinkedMultipleContentsSection(warpLocalRdatas, WellknownSectionNames.WarpLocalRdata, 0, (uint)rdataAlign),
             new LinkedMultipleContentsSection(blockLocalRdatas, WellknownSectionNames.BlockLocalRdata, 0, (uint)rdataAlign),
         ];
     }

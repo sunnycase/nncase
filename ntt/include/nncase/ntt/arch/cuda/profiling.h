@@ -26,7 +26,7 @@ using namespace nncase::ntt::distributed;
 namespace nncase::ntt {
 
 // static nncase::ntt::runtime::timer_record
-//     timer_records[CHIP_COUNTER][BLOCK_COUNTER][THREAD_COUNTER];
+//     timer_records[CHIP_COUNTER][BLOCK_COUNTER];
 
 // profile_scope, start timing and end timing
 class profile_scope {
@@ -39,8 +39,7 @@ class profile_scope {
 
     __device__ profile_scope(std::string_view function_name)
         : cid_(program_id<topology::chip>()),
-          bid_(program_id<topology::block>()),
-          tid_(program_id<topology::thread>()) {
+          bid_(program_id<topology::block>()) {
 
         enable_profiling_ = get_profiler_option();
         if (enable_profiling_) {
@@ -60,7 +59,7 @@ class profile_scope {
 
     __device__ ~profile_scope() {
         if (enable_profiling_) {
-            timer_storage_->set_id({cid_, bid_, tid_});
+            timer_storage_->set_id({cid_, bid_});
             end_time_ = get_current_time();
             timer_storage_->set_time(function_name_, start_time_, end_time_);
             timer_storage_->set_level(function_name_, level_);
@@ -73,7 +72,6 @@ class profile_scope {
     uint64_t end_time_;
     int cid_;
     int bid_;
-    int tid_;
     nncase::ntt::profile_level level_;
     nncase::ntt::runtime::timer_record *timer_storage_;
     bool enable_profiling_;

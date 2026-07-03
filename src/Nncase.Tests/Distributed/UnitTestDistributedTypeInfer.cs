@@ -21,79 +21,79 @@ public sealed class UnitTestDistributedTypeInfer : TestClassBase
     {
         {
             // split on not related axis.
-            new DistributedType(new(DataTypes.Float32, new long[] { 1, 48, 1024 }), new SBP[] { SBP.B, SBP.S(new[] { 0 }), SBP.B }, new(new[] { 8 }, "t")),
+            new DistributedType(new(DataTypes.Float32, new long[] { 1, 48, 1024 }), new SBP[] { SBP.B, SBP.S(new[] { 0 }), SBP.B }, new(new[] { 8 }, "b", "b")),
             new long[] { 1, 48, 64, 16 },
-            new DistributedType(new(DataTypes.Float32, new long[] { 1, 48, 64, 16 }), new SBP[] { SBP.B, SBP.S(new[] { 0 }), SBP.B, SBP.B }, new(new[] { 8 }, "t"))
+            new DistributedType(new(DataTypes.Float32, new long[] { 1, 48, 64, 16 }), new SBP[] { SBP.B, SBP.S(new[] { 0 }), SBP.B, SBP.B }, new(new[] { 8 }, "b", "b"))
         },
         {
             // split on splited-by-reshape axis.
-            new DistributedType(new(DataTypes.Float32, new long[] { 1, 48, 1024 }), new SBP[] { SBP.B, SBP.B, SBP.S(new[] { 0 }) }, new(new[] { 8 }, "t")),
+            new DistributedType(new(DataTypes.Float32, new long[] { 1, 48, 1024 }), new SBP[] { SBP.B, SBP.B, SBP.S(new[] { 0 }) }, new(new[] { 8 }, "b", "b")),
             new long[] { 1, 48, 64, 16 },
-            new DistributedType(new(DataTypes.Float32, new long[] { 1, 48, 64, 16 }), new SBP[] { SBP.B, SBP.B, SBP.S(new[] { 0 }), SBP.B }, new(new[] { 8 }, "t"))
+            new DistributedType(new(DataTypes.Float32, new long[] { 1, 48, 64, 16 }), new SBP[] { SBP.B, SBP.B, SBP.S(new[] { 0 }), SBP.B }, new(new[] { 8 }, "b", "b"))
         },
         {
             // split on splited-by-reshape axis, but less than split factor.
-            new DistributedType(new(DataTypes.Float32, new long[] { 1, 48, 1024 }), new SBP[] { SBP.B, SBP.B, SBP.S(new[] { 0 }) }, new(new[] { 128 }, "t")),
+            new DistributedType(new(DataTypes.Float32, new long[] { 1, 48, 1024 }), new SBP[] { SBP.B, SBP.B, SBP.S(new[] { 0 }) }, new(new[] { 128 }, "b", "b")),
             new long[] { 1, 48, 64, 16 },
             new InvalidType("not support")
         },
         {
             // split on sequeezed axis.
-            new DistributedType(new(DataTypes.Float32, new long[] { 1, 1, 48, 1024 }), new SBP[] { SBP.B, SBP.B, SBP.S(new[] { 0 }), SBP.B }, new(new[] { 8 }, "t")),
+            new DistributedType(new(DataTypes.Float32, new long[] { 1, 1, 48, 1024 }), new SBP[] { SBP.B, SBP.B, SBP.S(new[] { 0 }), SBP.B }, new(new[] { 8 }, "b", "b")),
             new long[] { 1, 48, 64, 16 },
-            new DistributedType(new(DataTypes.Float32, new long[] { 1, 48, 64, 16 }), new SBP[] { SBP.B, SBP.S(new[] { 0 }), SBP.B, SBP.B }, new(new[] { 8 }, "t"))
+            new DistributedType(new(DataTypes.Float32, new long[] { 1, 48, 64, 16 }), new SBP[] { SBP.B, SBP.S(new[] { 0 }), SBP.B, SBP.B }, new(new[] { 8 }, "b", "b"))
         },
         {
             // split on right unsequeeze axis.
-            new DistributedType(new(DataTypes.Float32, new long[] { 1, 48, 1024 }), new SBP[] { SBP.B, SBP.S(new[] { 0 }), SBP.B }, new(new[] { 8 }, "t")),
+            new DistributedType(new(DataTypes.Float32, new long[] { 1, 48, 1024 }), new SBP[] { SBP.B, SBP.S(new[] { 0 }), SBP.B }, new(new[] { 8 }, "b", "b")),
             new long[] { 1, 48, 1, 64, 16 },
-            new DistributedType(new(DataTypes.Float32, new long[] { 1, 48, 1, 64, 16 }), new SBP[] { SBP.B, SBP.S(new[] { 0 }), SBP.B, SBP.B, SBP.B }, new(new[] { 8 }, "t"))
+            new DistributedType(new(DataTypes.Float32, new long[] { 1, 48, 1, 64, 16 }), new SBP[] { SBP.B, SBP.S(new[] { 0 }), SBP.B, SBP.B, SBP.B }, new(new[] { 8 }, "b", "b"))
         },
         {
             // split on left unsequeeze axis.
-            new DistributedType(new(DataTypes.Float32, new long[] { 1, 384, 128 }), new SBP[] { SBP.B, SBP.S(new[] { 0 }), SBP.B }, new(new[] { 8 }, "t")),
+            new DistributedType(new(DataTypes.Float32, new long[] { 1, 384, 128 }), new SBP[] { SBP.B, SBP.S(new[] { 0 }), SBP.B }, new(new[] { 8 }, "b", "b")),
             new long[] { 1, 1, 384, 128 },
-            new DistributedType(new(DataTypes.Float32, new long[] { 1, 1, 384, 128 }), new SBP[] { SBP.B, SBP.B, SBP.S(new[] { 0 }), SBP.B }, new(new[] { 8 }, "t"))
+            new DistributedType(new(DataTypes.Float32, new long[] { 1, 1, 384, 128 }), new SBP[] { SBP.B, SBP.B, SBP.S(new[] { 0 }), SBP.B }, new(new[] { 8 }, "b", "b"))
         },
         {
             // split on merged-by-reshape axis.
-            new DistributedType(new(DataTypes.Float32, new long[] { 1, 48, 64, 16 }), new SBP[] { SBP.B, SBP.B, SBP.S(new[] { 0 }), SBP.B }, new(new[] { 8 }, "t")),
+            new DistributedType(new(DataTypes.Float32, new long[] { 1, 48, 64, 16 }), new SBP[] { SBP.B, SBP.B, SBP.S(new[] { 0 }), SBP.B }, new(new[] { 8 }, "b", "b")),
             new long[] { 1, 48, 1024 },
-            new DistributedType(new(DataTypes.Float32, new long[] { 1, 48, 1024 }), new SBP[] { SBP.B, SBP.B, SBP.S(new[] { 0 }) }, new(new[] { 8 }, "t"))
+            new DistributedType(new(DataTypes.Float32, new long[] { 1, 48, 1024 }), new SBP[] { SBP.B, SBP.B, SBP.S(new[] { 0 }) }, new(new[] { 8 }, "b", "b"))
         },
         {
             // split on merged-by-reshape axis, but not support.
-            new DistributedType(new(DataTypes.Float32, new long[] { 1, 48, 64, 16 }), new SBP[] { SBP.B, SBP.B, SBP.B, SBP.S(new[] { 0 }) }, new(new[] { 8 }, "t")),
+            new DistributedType(new(DataTypes.Float32, new long[] { 1, 48, 64, 16 }), new SBP[] { SBP.B, SBP.B, SBP.B, SBP.S(new[] { 0 }) }, new(new[] { 8 }, "b", "b")),
             new long[] { 1, 48, 1024 },
             new InvalidType("not support")
         },
         {
             // mesh dim 0 split on first merged-by-reshape axis.
-            new DistributedType(new(DataTypes.Float32, new long[] { 1, 48, 64, 16 }), new SBP[] { SBP.B, SBP.S(new[] { 0 }), SBP.S(new[] { 1 }), SBP.B }, new(new[] { 4, 8 }, "bt")),
+            new DistributedType(new(DataTypes.Float32, new long[] { 1, 48, 64, 16 }), new SBP[] { SBP.B, SBP.S(new[] { 0 }), SBP.S(new[] { 1 }), SBP.B }, new(new[] { 4, 8 }, "yx", "bb")),
             new long[] { 1, 48, 1024 },
-            new DistributedType(new(DataTypes.Float32, new long[] { 1, 48, 1024 }), new SBP[] { SBP.B, SBP.S(new[] { 0 }), SBP.S(new[] { 1 }) }, new(new[] { 4, 8 }, "bt"))
+            new DistributedType(new(DataTypes.Float32, new long[] { 1, 48, 1024 }), new SBP[] { SBP.B, SBP.S(new[] { 0 }), SBP.S(new[] { 1 }) }, new(new[] { 4, 8 }, "yx", "bb"))
         },
         {
             // mesh dim 1 split on first merged-by-reshape axis.
-            new DistributedType(new(DataTypes.Float32, new long[] { 1, 48, 64, 16 }), new SBP[] { SBP.B, SBP.S(new[] { 1 }), SBP.S(new[] { 0 }), SBP.B }, new(new[] { 4, 8 }, "bt")),
+            new DistributedType(new(DataTypes.Float32, new long[] { 1, 48, 64, 16 }), new SBP[] { SBP.B, SBP.S(new[] { 1 }), SBP.S(new[] { 0 }), SBP.B }, new(new[] { 4, 8 }, "yx", "bb")),
             new long[] { 1, 48, 1024 },
-            new DistributedType(new(DataTypes.Float32, new long[] { 1, 48, 1024 }), new SBP[] { SBP.B, SBP.S(new[] { 1 }), SBP.S(new[] { 0 }) }, new(new[] { 4, 8 }, "bt"))
+            new DistributedType(new(DataTypes.Float32, new long[] { 1, 48, 1024 }), new SBP[] { SBP.B, SBP.S(new[] { 1 }), SBP.S(new[] { 0 }) }, new(new[] { 4, 8 }, "yx", "bb"))
         },
         {
             // split on second merged-by-reshape axis.
-            new DistributedType(new(DataTypes.Float32, new long[] { 1, 48, 64, 16 }), new SBP[] { SBP.B, SBP.S(new[] { 0 }), SBP.B, SBP.S(new[] { 1 }) }, new(new[] { 4, 8 }, "bt")),
+            new DistributedType(new(DataTypes.Float32, new long[] { 1, 48, 64, 16 }), new SBP[] { SBP.B, SBP.S(new[] { 0 }), SBP.B, SBP.S(new[] { 1 }) }, new(new[] { 4, 8 }, "yx", "bb")),
             new long[] { 1, 48, 1024 },
             new InvalidType("not support")
         },
         {
             // split and merge axis.
-            new DistributedType(new(DataTypes.Float32, new long[] { 16, 48, 1024 }), new SBP[] { SBP.S(new[] { 0 }), SBP.B, SBP.B }, new(new[] { 8 }, "t")),
+            new DistributedType(new(DataTypes.Float32, new long[] { 16, 48, 1024 }), new SBP[] { SBP.S(new[] { 0 }), SBP.B, SBP.B }, new(new[] { 8 }, "b", "b")),
             new long[] { 8, 2, 64, 768 },
-            new DistributedType(new(DataTypes.Float32, new long[] { 8, 2, 64, 768 }), new SBP[] { SBP.S(new[] { 0 }), SBP.B, SBP.B, SBP.B }, new(new[] { 8 }, "t"))
+            new DistributedType(new(DataTypes.Float32, new long[] { 8, 2, 64, 768 }), new SBP[] { SBP.S(new[] { 0 }), SBP.B, SBP.B, SBP.B }, new(new[] { 8 }, "b", "b"))
         },
         {
             // unmapable reshape
-            new DistributedType(new(DataTypes.Float32, new long[] { 2, 30 }), new SBP[] { SBP.S(new[] { 0 }), SBP.B }, new(new[] { 6 }, "t")),
+            new DistributedType(new(DataTypes.Float32, new long[] { 2, 30 }), new SBP[] { SBP.S(new[] { 0 }), SBP.B }, new(new[] { 6 }, "b", "b")),
             new long[] { 3, 20 },
             new InvalidType("unmapable")
         },

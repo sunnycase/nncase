@@ -35,7 +35,7 @@ __device__ cuda_thread_context_t &cuda_thread_context_t::current() noexcept {
 }
 #else
 cpu_thread_context_t &cpu_thread_context_t::current() noexcept {
-    static cpu_thread_context_t ctx{.tid = 0, .bid = 0, .cid = 0};
+    static cpu_thread_context_t ctx{.bid = 0, .cid = 0};
     return ctx;
 }
 #endif
@@ -148,20 +148,20 @@ NTT_HOST_DEVICE void test_sharding() {
     {
         using namespace ntt::distributed;
         using mesh_type =
-            ntt::distributed::mesh<ntt::distributed::topology::thread, 1>;
+            ntt::distributed::mesh<ntt::distributed::topology::block, 1>;
 
         static_assert(ntt::distributed::program_dim<
-                          ntt::distributed::topology::thread>() == 1);
+                          ntt::distributed::topology::block>() == 1);
         static_assert(
             ntt::distributed::detail::get_submesh_end<mesh_type,
-                                                      topology::thread>() == 1);
+                                                      topology::block>() == 1);
         static_assert(ntt::distributed::detail::get_submesh_rank<
-                          mesh_type, topology::thread>() == 1);
+                          mesh_type, topology::block>() == 1);
         static_assert(
             ntt::distributed::detail::get_submesh_rank<mesh_type,
                                                        topology::chip>() == 0);
         static_assert(ntt::distributed::detail::get_submesh_start<
-                          mesh_type, topology::thread>() == 0);
+                          mesh_type, topology::block>() == 0);
         auto program_ids = ntt::distributed::program_ids<>();
         auto local_index = mesh_type::index_from_program_ids(program_ids);
         static_assert(local_index.rank() == 1);
@@ -188,19 +188,19 @@ NTT_HOST_DEVICE void test_sharding() {
     // Sharding
     {
         using mesh_type =
-            ntt::distributed::mesh<ntt::distributed::topology::thread, 1, 1, 1>;
+            ntt::distributed::mesh<ntt::distributed::topology::block, 1, 1>;
 
         auto sharding = ntt::distributed::make_sharding<mesh_type>(
             ntt::distributed::shard_policy::B,
-            ntt::distributed::shard_policy::S<2>(),
+            ntt::distributed::shard_policy::S<1>(),
             ntt::distributed::shard_policy::B);
         using sharding_type = std::remove_cv_t<decltype(sharding)>;
         static_assert(
             ntt::distributed::detail::mesh_axes_mask_of_split_shard_policies<
-                sharding_type>() == ntt::fixed_shape_v<0, 0, 1>);
+                sharding_type>() == ntt::fixed_shape_v<0, 1>);
         static_assert(
             ntt::distributed::detail::mesh_axes_of_non_split_shard_policies<
-                sharding_type>() == ntt::fixed_shape_v<0, 1>);
+                sharding_type>() == ntt::fixed_shape_v<0>);
     }
 }
 

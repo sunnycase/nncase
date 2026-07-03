@@ -123,10 +123,9 @@ public unsafe struct CApiMT
     public delegate* unmanaged<IntPtr, MemoryAccessArchitecture, void> NTTTargetOptionsSetMemoryAccessArchPtr;
     public delegate* unmanaged<IntPtr, NocArchitecture> NTTTargetOptionsGetNocArchPtr;
     public delegate* unmanaged<IntPtr, NocArchitecture, void> NTTTargetOptionsSetNocArchPtr;
-    public delegate* unmanaged<IntPtr, HierarchyKind> NTTTargetOptionsGetHierarchyKindPtr;
-    public delegate* unmanaged<IntPtr, HierarchyKind, void> NTTTargetOptionsSetHierarchyKindPtr;
     public delegate* unmanaged<IntPtr, int*, nuint, nuint*, void> NTTTargetOptionsSetHierarchiesPtr;
     public delegate* unmanaged<IntPtr, byte*, nuint, void> NTTTargetOptionsSetHierarchyNamesPtr;
+    public delegate* unmanaged<IntPtr, byte*, nuint, void> NTTTargetOptionsSetHierarchyLevelsPtr;
     public delegate* unmanaged<IntPtr, long*, nuint, void> NTTTargetOptionsSetHierarchySizesPtr;
     public delegate* unmanaged<IntPtr, int*, nuint, void> NTTTargetOptionsSetHierarchyLatenciesPtr;
     public delegate* unmanaged<IntPtr, int*, nuint, void> NTTTargetOptionsSetHierarchyBandWidthsPtr;
@@ -268,10 +267,9 @@ public static unsafe class CApi
         mt->NTTTargetOptionsSetMemoryAccessArchPtr = &NTTTargetOptionsSetMemoryAccessArch;
         mt->NTTTargetOptionsGetNocArchPtr = &NTTTargetOptionsGetNocArch;
         mt->NTTTargetOptionsSetNocArchPtr = &NTTTargetOptionsSetNocArch;
-        mt->NTTTargetOptionsGetHierarchyKindPtr = &NTTTargetOptionsGetHierarchyKind;
-        mt->NTTTargetOptionsSetHierarchyKindPtr = &NTTTargetOptionsSetHierarchyKind;
         mt->NTTTargetOptionsSetHierarchiesPtr = &NTTTargetOptionsSetHierarchies;
         mt->NTTTargetOptionsSetHierarchyNamesPtr = &NTTTargetOptionsSetHierarchyNames;
+        mt->NTTTargetOptionsSetHierarchyLevelsPtr = &NTTTargetOptionsSetHierarchyLevels;
         mt->NTTTargetOptionsSetHierarchySizesPtr = &NTTTargetOptionsSetHierarchySizes;
         mt->NTTTargetOptionsSetHierarchyLatenciesPtr = &NTTTargetOptionsSetHierarchyLatencies;
         mt->NTTTargetOptionsSetHierarchyBandWidthsPtr = &NTTTargetOptionsSetHierarchyBandWidths;
@@ -1075,18 +1073,6 @@ public static unsafe class CApi
     }
 
     [UnmanagedCallersOnly]
-    private static HierarchyKind NTTTargetOptionsGetHierarchyKind(IntPtr handle)
-    {
-        return Get<NTTTargetOptions>(handle).HierarchyKind;
-    }
-
-    [UnmanagedCallersOnly]
-    private static void NTTTargetOptionsSetHierarchyKind(IntPtr handle, HierarchyKind value)
-    {
-        Get<NTTTargetOptions>(handle).HierarchyKind = value;
-    }
-
-    [UnmanagedCallersOnly]
     private static void NTTTargetOptionsSetHierarchies(IntPtr handle, int* value, nuint shape0, nuint* shape1)
     {
         Get<NTTTargetOptions>(handle).Hierarchies = To2DArray(value, shape0, shape1);
@@ -1096,6 +1082,12 @@ public static unsafe class CApi
     private static void NTTTargetOptionsSetHierarchyNames(IntPtr handle, byte* value, nuint length)
     {
         Get<NTTTargetOptions>(handle).HierarchyNames = ToString(value, length);
+    }
+
+    [UnmanagedCallersOnly]
+    private static void NTTTargetOptionsSetHierarchyLevels(IntPtr handle, byte* value, nuint length)
+    {
+        Get<NTTTargetOptions>(handle).HierarchyLevels = ToString(value, length);
     }
 
     [UnmanagedCallersOnly]

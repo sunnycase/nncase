@@ -14,7 +14,7 @@ internal static class PyNTTRDataUtility
     public static int GetScopedShardCount(NTTTargetOptions targetOptions, string scopeName)
     {
         var hierarchies = targetOptions.Hierarchies.Length == 0 ? new[] { 1 } : targetOptions.Hierarchies[0];
-        var scopeIndex = targetOptions.HierarchyNames.IndexOf(scopeName, StringComparison.Ordinal);
+        var scopeIndex = GetScopeIndex(targetOptions, scopeName, hierarchies.Length);
         if (scopeIndex < 0)
         {
             return checked((int)TensorUtilities.GetProduct(hierarchies));
@@ -26,7 +26,7 @@ internal static class PyNTTRDataUtility
     public static int[] GetScopedShardIndex(int writerIndex, NTTTargetOptions targetOptions, string scopeName)
     {
         var hierarchies = targetOptions.Hierarchies.Length == 0 ? new[] { 1 } : targetOptions.Hierarchies[0];
-        var scopeIndex = targetOptions.HierarchyNames.IndexOf(scopeName, StringComparison.Ordinal);
+        var scopeIndex = GetScopeIndex(targetOptions, scopeName, hierarchies.Length);
         if (scopeIndex < 0)
         {
             return DistributedUtility.GetUnraveledIndex(writerIndex, hierarchies);
@@ -92,4 +92,15 @@ internal static class PyNTTRDataUtility
 
     public static long GetPoolSizeBytes(IReadOnlyDictionary<Const, ValueRange<ulong>> ranges)
         => ranges.Count == 0 ? 0L : checked((long)ranges.Values.Max(range => range.Max));
+
+    private static int GetScopeIndex(NTTTargetOptions targetOptions, string scopeName, int rank)
+    {
+        if (scopeName.Length == 1 && scopeName[0] is 'c' or 'd' or 'b')
+        {
+            var levels = Placement.NormalizeHierarchyLevels(targetOptions.HierarchyLevels, targetOptions.HierarchyNames, rank);
+            return levels.LastIndexOf(scopeName[0]);
+        }
+
+        return -1;
+    }
 }

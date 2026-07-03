@@ -28,7 +28,7 @@ public static class KernelUtility
 
     public static string PlacementToC(this Placement placement)
     {
-        return $"mesh<topology::thread, {string.Join(',', placement.Hierarchy)}>";
+        return $"mesh<topology::block, {string.Join(',', placement.Hierarchy)}>";
     }
 
     public static string SBPToC(this SBP value)
@@ -48,7 +48,7 @@ public static class KernelUtility
         var placement = distributedType.Placement;
         var ndSBP = distributedType.AxisPolicies;
 
-        var sb = new StringBuilder("make_sharding<mesh<topology::thread, ");
+        var sb = new StringBuilder("make_sharding<mesh<topology::block, ");
         for (int i = 0; i < placement.Rank; i++)
         {
             var value = placement.Hierarchy[i];

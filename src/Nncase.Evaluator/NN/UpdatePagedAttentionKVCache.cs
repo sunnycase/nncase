@@ -100,7 +100,7 @@ public sealed class UpdatePagedAttentionKVCacheEvaluator : ITypeInferencer<Updat
     private IRType Visit(ITypeInferenceContext context, UpdatePagedAttentionKVCache target, DistributedType slots, IRType kvCache)
     {
         // for xpu.
-        if (slots.Placement.Name == "cdyxt")
+        if (slots.Placement.Name == "cdyxb")
         {
             // seq split at x, head split at die and y
             var seqAxis = target.Layout.IndexOf(AttentionDimKind.Seq);

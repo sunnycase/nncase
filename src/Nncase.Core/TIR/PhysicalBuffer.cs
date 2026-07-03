@@ -28,16 +28,6 @@ public enum MemoryLocation
     Rdata = 1 << 3,
 
     /// <summary>
-    /// thread local constant data.
-    /// </summary>
-    ThreadLocalRdata = 1 << 5,
-
-    /// <summary>
-    /// lane local constant data.
-    /// </summary>
-    WarpLocalRdata = 1 << 4,
-
-    /// <summary>
     /// block local constant data.
     /// </summary>
     BlockLocalRdata = 1 << 6,
@@ -46,11 +36,6 @@ public enum MemoryLocation
     /// compute temp data.
     /// </summary>
     Data = 1 << 7,
-
-    /// <summary>
-    /// warp local data.
-    /// </summary>
-    WarpLocalData = 1 << 8,
 
     /// <summary>
     /// block local data.

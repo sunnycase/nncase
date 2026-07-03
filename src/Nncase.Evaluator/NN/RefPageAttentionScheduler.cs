@@ -36,7 +36,7 @@ public sealed class RefPagedAttentionScheduler
             throw new ArgumentException("Max model length must be a multiple of block size.");
         }
 
-        _placement = new Placement(hierarchy, string.Empty);
+        _placement = new Placement(hierarchy, string.Empty, new string('b', hierarchy.Length));
         var tensorType = _config.GetLogicalShardTensorType(numBlocks, _placement);
         _kvCaches = Tensor.Zeros(tensorType.DType, tensorType.Shape.ToValueArray());
     }

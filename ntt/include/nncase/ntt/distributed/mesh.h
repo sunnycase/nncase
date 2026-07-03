@@ -27,7 +27,8 @@ constexpr size_t get_submesh_rank() noexcept;
 
 template <class Mesh, topology Scope>
 constexpr size_t get_submesh_end() noexcept {
-    if constexpr (static_cast<size_t>(Scope) == topology_levels - 1) {
+    if constexpr (static_cast<size_t>(Scope) >=
+                  static_cast<size_t>(Mesh::scope)) {
         return Mesh::rank();
     } else {
         constexpr auto next_topology =
@@ -39,6 +40,11 @@ constexpr size_t get_submesh_end() noexcept {
 
 template <class Mesh, topology Scope>
 constexpr size_t get_submesh_rank() noexcept {
+    if constexpr (static_cast<size_t>(Scope) >
+                  static_cast<size_t>(Mesh::scope)) {
+        return 0;
+    }
+
     auto end = get_submesh_end<Mesh, Scope>();
     if (end) {
         auto index = end;
@@ -135,14 +141,16 @@ template <topology Scope, size_t... Dims> struct mesh {
     static constexpr auto
     program_ids_from_index(const TShardIndex &shard_index) noexcept {
         return detail::program_ids_from_shard_index<mesh<Scope, Dims...>>(
-            shard_index, std::make_index_sequence<topology_levels>{});
+            shard_index,
+            std::make_index_sequence<static_cast<size_t>(scope) + 1>{});
     }
 
     template <ScopedProgramIds<scope> TProgramIds>
     static constexpr auto
     index_from_program_ids(const TProgramIds &program_ids) noexcept {
         return detail::shard_index_from_program_ids<mesh<Scope, Dims...>>(
-            program_ids, std::make_index_sequence<topology_levels>{});
+            program_ids,
+            std::make_index_sequence<static_cast<size_t>(scope) + 1>{});
     }
 
     static constexpr auto local_index() noexcept {

@@ -41,12 +41,8 @@ class cuda_runtime_function final : public runtime_function {
     cuda_runtime_module &module() const noexcept;
 
     const std::span<std::byte>
-    thread_local_data(size_t chip_id) const noexcept {
-        return thread_local_datas_[chip_id];
-    }
-
-    const std::span<std::byte> warp_local_data(size_t chip_id) const noexcept {
-        return warp_local_datas_[chip_id];
+    data(size_t chip_id) const noexcept {
+        return datas_[chip_id];
     }
 
     const std::span<std::byte> block_local_data(size_t chip_id) const noexcept {
@@ -54,12 +50,12 @@ class cuda_runtime_function final : public runtime_function {
     }
 
     const std::span<ntt::runtime::profile_record>
-    thread_local_profile_records(size_t chip_id) noexcept {
+    profile_records(size_t chip_id) noexcept {
         return profile_records_[chip_id];
     }
 
     const std::span<uint32_t>
-    thread_local_profile_record_counts(size_t chip_id) noexcept {
+    profile_record_counts(size_t chip_id) noexcept {
         return profile_record_counts_[chip_id];
     }
 
@@ -77,8 +73,7 @@ class cuda_runtime_function final : public runtime_function {
 
   private:
     block_entry_t block_entry_;
-    std::vector<std::span<std::byte>> thread_local_datas_;
-    std::vector<std::span<std::byte>> warp_local_datas_;
+    std::vector<std::span<std::byte>> datas_;
     std::vector<std::span<std::byte>> block_local_datas_;
     host_buffer_t output_buffer_;
     std::vector<ntt::runtime::thread_inout_desc> input_descs_;

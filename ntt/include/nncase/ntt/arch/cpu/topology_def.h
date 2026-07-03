@@ -15,5 +15,5 @@
 #pragma once
 
 namespace nncase::ntt::distributed {
-enum class topology { chip, block, thread, count__ };
+enum class topology { chip, block, count__ };
 } // namespace nncase::ntt::distributed

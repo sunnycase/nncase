@@ -17,7 +17,7 @@ public class UnitTestDistributeSchema : TestClassBase
     [Fact]
     public void TestExportScheme()
     {
-        var scheme = new DistributedSchema("1", "llama", new DistributedSchema.Node[] { new("hidden_in", new SBP[] { SBP.B, SBP.S(new[] { 0 }), SBP.S(new[] { 1 }), SBP.B }, new[] { 8, 4, 4 }, "cbt") });
+        var scheme = new DistributedSchema("1", "llama", new DistributedSchema.Node[] { new("hidden_in", new SBP[] { SBP.B, SBP.S(new[] { 0 }), SBP.S(new[] { 1 }), SBP.B }, new[] { 8, 4, 4 }, "cby", "cbb") });
         var except = @"{
   ""Version"": ""1"",
   ""Model"": ""llama"",
@@ -49,7 +49,8 @@ public class UnitTestDistributeSchema : TestClassBase
         4,
         4
       ],
-      ""HierarchyName"": ""cbt""
+      ""HierarchyName"": ""cby"",
+      ""HierarchyLevels"": ""cbb""
     }
   ]
 }";
@@ -73,7 +74,8 @@ public class UnitTestDistributeSchema : TestClassBase
         var options = new Nncase.Targets.NTTTargetOptions()
         {
             Hierarchies = new[] { new[] { 8, 8, 4 } },
-            HierarchyNames = "cbt",
+            HierarchyNames = "cby",
+            HierarchyLevels = "cbb",
             DistributedScheme = path,
         };
 
@@ -94,6 +96,6 @@ public class UnitTestDistributeSchema : TestClassBase
 
         Dumpper.DumpIR(result, "result");
 
-        Assert.True(result is Function { Body: Call { Target: IR.Distributed.Boxing } boxing } && boxing.Arguments[0] is Call { Target: IR.Math.Unary { UnaryOp: UnaryOp.Cos } } unary && unary.CheckedType is DistributedType dt && dt == new DistributedType(new(DataTypes.Float32, new[] { 1, 512, 8192 }), new[] { (SBP)SBP.B, SBP.S([0], 64), SBP.S([1, 2], 256) }, new(new[] { 8, 8, 4 }, "cbt")));
+        Assert.True(result is Function { Body: Call { Target: IR.Distributed.Boxing } boxing } && boxing.Arguments[0] is Call { Target: IR.Math.Unary { UnaryOp: UnaryOp.Cos } } unary && unary.CheckedType is DistributedType dt && dt == new DistributedType(new(DataTypes.Float32, new[] { 1, 512, 8192 }), new[] { (SBP)SBP.B, SBP.S([0], 64), SBP.S([1, 2], 256) }, new(new[] { 8, 8, 4 }, "cby", "cbb")));
     }
 }

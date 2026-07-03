@@ -137,7 +137,8 @@ threshold = 0.98
 [target.cpu.target_options]
 Vectorize = true
 Hierarchies = [[1]]
-HierarchyNames = "t"
+HierarchyNames = "b"
+HierarchyLevels = "b"
 
 [target.pyntt]
 eval = false
@@ -156,6 +157,7 @@ threshold = 0.98
 Vectorize = true
 Hierarchies = [[4, 8]]
 HierarchyNames = "yx"
+HierarchyLevels = "bb"
 
 [target.cuda]
 eval = false
@@ -172,13 +174,13 @@ threshold = 0.98
 
 [target.cuda.target_options]
 Hierarchies = [[1]]
-HierarchyNames = "t"
+HierarchyNames = "b"
+HierarchyLevels = "b"
 HierarchySizes = [603979776, 1048576]
 MemoryCapacities = [262144, 150994944]
 MemoryBandWidths = [64, 32]
 UnifiedMemoryArch = false
 Vectorize = true
-HierarchyKind = "nncase.HierarchyKind.SMT"
 
 [target.k510]
 eval = true
@@ -221,10 +223,10 @@ threshold = 0.9
 
 [target.xpu.target_options]
 Hierarchies = [[1, 2, 8, 4, 4]]
-HierarchyNames = "cdyxt"
+HierarchyNames = "cdyxb"
+HierarchyLevels = "cdbbb"
 HierarchySizes = [603979776, 1048576]
 MemoryCapacities = [262144, 150994944]
 MemoryBandWidths = [64, 32]
 UnifiedMemoryArch = false
 Vectorize = true
-HierarchyKind = "nncase.HierarchyKind.SMT"

@@ -25,14 +25,6 @@ extern __device__ decltype(nncase::ntt::make_tensor<
 
 extern __device__ decltype(nncase::ntt::make_tensor<
                            nncase::ntt::vector<uintptr_t, 2>>(
-    nncase::ntt::distributed::topology_shape)) global_thread_local_rdata_ptr;
-
-extern __device__ decltype(nncase::ntt::make_tensor<
-                           nncase::ntt::vector<uintptr_t, 3>>(
-    nncase::ntt::distributed::topology_shape)) global_thread_local_cache_ptr;
-
-extern __device__ decltype(nncase::ntt::make_tensor<
-                           nncase::ntt::vector<uintptr_t, 2>>(
     nncase::ntt::distributed::topology_shape)) global_block_local_rdata_ptr;
 
 template <class T, topology RemoteScope, topology TensorScope,
@@ -46,14 +38,13 @@ __device__ auto get_remote_address(const TLocalProgramIds &local_program_ids,
     auto remote_address =
         (size_t)global_local_data_ptr(remote_program_ids)(0_dim);
     if ((uintptr_t)local_address < start || (uintptr_t)local_address >= end) {
-        start = (size_t)global_thread_local_rdata_ptr(local_program_ids)(0_dim);
-        end = (size_t)global_thread_local_rdata_ptr(local_program_ids)(1_dim);
+        start =
+            (size_t)global_block_local_rdata_ptr(local_program_ids)(0_dim);
+        end = (size_t)global_block_local_rdata_ptr(local_program_ids)(1_dim);
         remote_address =
-            (size_t)global_thread_local_rdata_ptr(remote_program_ids)(0_dim);
+            (size_t)global_block_local_rdata_ptr(remote_program_ids)(0_dim);
         if ((uintptr_t)local_address < start ||
             (uintptr_t)local_address >= end) {
-            start =
-                (size_t)global_block_local_rdata_ptr(local_program_ids)(0_dim);
             remote_address =
                 (size_t)global_block_local_rdata_ptr(remote_program_ids)(0_dim);
         }

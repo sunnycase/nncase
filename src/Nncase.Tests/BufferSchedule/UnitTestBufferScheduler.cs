@@ -37,13 +37,13 @@ public sealed class UnitTestBufferScheduler : TestClassBase
     public static Function SampleSwish()
     {
         var ttype = new TensorType(DataTypes.Float32, new[] { 100 });
-        var dtype = new DistributedType(ttype, new[] { SBP.B }, new(new[] { 1 }, "b"));
+        var dtype = new DistributedType(ttype, new[] { SBP.B }, new(new[] { 1 }, "b", "b"));
         var a = new Var("a", ttype);
         var b = new Var("b", ttype);
         var boxa = IR.F.Distributed.Boxing(a, dtype);
         var boxb = IR.F.Distributed.Boxing(b, dtype);
         var tp = new IR.Tuple([boxa, boxb]);
-        var tc = new TensorConst(Tensor.FromScalar(1.0f, [100]), new[] { SBP.B }, new(new[] { 1 }, "b"));
+        var tc = new TensorConst(Tensor.FromScalar(1.0f, [100]), new[] { SBP.B }, new(new[] { 1 }, "b", "b"));
         var c = IR.F.Math.Sin(tc);
         var d = IR.F.Math.Cos(c);
         var e = IR.F.Math.Neg(d);

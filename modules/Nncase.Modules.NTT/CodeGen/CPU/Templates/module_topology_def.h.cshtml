@@ -1,9 +1,14 @@
 @using System.Linq
 @using NetFabric.Hyperlinq
 @using Nncase
+@using Nncase.IR
 @{
-  var hierarchy = (int[])Model.Hierarchies;
-  var topologyLevels = Model.IsCUDA ? 4 : 3;
+  var options = (Nncase.Targets.NTTTargetOptions)Model.Options;
+  var placement = new Placement(options.Hierarchies[0], options.HierarchyNames, options.HierarchyLevels);
+  var chipDim = Math.Max(1, placement.GetPhysicalLevelSize('c') * placement.GetPhysicalLevelSize('d'));
+  var blockDim = Math.Max(1, placement.GetPhysicalLevelSize('b'));
+  var topologyLevels = 2;
+  var hierarchy = new[] { chipDim, blockDim };
 }
 
 #pragma once

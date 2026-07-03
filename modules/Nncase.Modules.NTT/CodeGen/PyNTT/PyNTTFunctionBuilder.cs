@@ -37,16 +37,10 @@ internal sealed class PyNTTFunctionBuilder
 
         var targetOptions = PyNTTTargetOptionsUtility.Get(_compileOptions);
         var rdata = SerializeRData(primFunction.SchedResult.Rdatas);
-        var threadLocalRdatas = SerializeLocalRData(primFunction.SchedResult.ThreadLocalRdatas, targetOptions, "t");
-        var warpLocalRdatas = SerializeLocalRData(primFunction.SchedResult.WarpLocalRdatas, targetOptions, "w");
         var blockLocalRdatas = SerializeLocalRData(primFunction.SchedResult.BlockLocalRdatas, targetOptions, "b");
         return new(
             rdata.Payload,
             rdata.Bytes,
-            threadLocalRdatas.Payloads,
-            threadLocalRdatas.Bytes,
-            warpLocalRdatas.Payloads,
-            warpLocalRdatas.Bytes,
             blockLocalRdatas.Payloads,
             blockLocalRdatas.Bytes);
     }

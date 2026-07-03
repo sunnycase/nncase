@@ -33,8 +33,8 @@ class cpu_runtime_function final : public runtime_function {
     cpu_runtime_module &module() const noexcept;
 
     const std::span<std::byte>
-    thread_local_data(size_t block_id) const noexcept {
-        auto &local_data = thread_local_datas_[block_id];
+    data(size_t block_id) const noexcept {
+        auto &local_data = datas_[block_id];
         auto mapped_local_data =
             local_data->map(map_read_write).expect("Failed to map local data");
         return mapped_local_data.buffer();
@@ -49,12 +49,12 @@ class cpu_runtime_function final : public runtime_function {
     }
 
     const std::span<ntt::runtime::profile_record>
-    thread_local_profile_records(size_t block_id) noexcept {
+    profile_records(size_t block_id) noexcept {
         return profile_records_[block_id];
     }
 
     const std::span<uint32_t>
-    thread_local_profile_record_counts(size_t block_id) noexcept {
+    profile_record_counts(size_t block_id) noexcept {
         return profile_record_counts_[block_id];
     }
 
@@ -72,7 +72,7 @@ class cpu_runtime_function final : public runtime_function {
 
   private:
     block_entry_t block_entry_;
-    std::vector<host_buffer_t> thread_local_datas_;
+    std::vector<host_buffer_t> datas_;
     std::vector<host_buffer_t> block_local_datas_;
     host_buffer_t output_buffer_;
     std::vector<ntt::runtime::thread_inout_desc> input_descs_;

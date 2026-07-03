@@ -94,7 +94,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
 
         private const string ShardCoordDimPrefix = "__pyntt_shard_coord_";
 
-        private static readonly string[] WorkspaceParameterNames = { "data", "rdata", "thread_local_rdata", "warp_local_rdata", "block_local_rdata", "warp_local_data", "block_local_data" };
+        private static readonly string[] WorkspaceParameterNames = { "data", "rdata", "block_local_rdata", "block_local_data" };
 
         private readonly PrimFunction _function;
         private readonly IReadOnlyDictionary<IVar, string> _parameterNames;
@@ -117,6 +117,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
         private readonly SharedHelperRegistry _sharedHelperRegistry;
         private readonly PyNTTDimExpressionEmitter _dimEmitter;
         private readonly PyNTTDimExpressionEmitter _localRegionDimEmitter;
+        private long _collectiveDataPoolBytes;
         private int _nextStoreIndex;
         private int _bodyIndent;
 
@@ -207,16 +208,11 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                         ["data_pool_bytes"] = checked((long)_function.SchedResult.DataUsage),
                         ["data_pool_elements"] = checked((long)_function.SchedResult.DataUsage),
                         ["data_dtype"] = "uint8",
-                        ["warp_local_data_pool_bytes"] = checked((long)_function.SchedResult.WarpLocalDataPoolSize),
+                        ["collective_data_pool_bytes"] = _collectiveDataPoolBytes,
                         ["block_local_data_pool_bytes"] = checked((long)_function.SchedResult.BlockLocalDataPoolSize),
-                        ["warp_local_data_scope_count"] = GetWarpLocalDataScopeCount(_targetOptions),
                         ["block_local_data_scope_count"] = GetBlockLocalDataScopeCount(_targetOptions),
                         ["rdata_pool_bytes"] = GetPoolSizeBytes(_function.SchedResult.Rdatas),
-                        ["thread_local_rdata_pool_bytes"] = GetPoolSizeBytes(_function.SchedResult.ThreadLocalRdatas),
-                        ["warp_local_rdata_pool_bytes"] = GetPoolSizeBytes(_function.SchedResult.WarpLocalRdatas),
                         ["block_local_rdata_pool_bytes"] = GetPoolSizeBytes(_function.SchedResult.BlockLocalRdatas),
-                        ["thread_local_rdata_stride_bytes"] = PyNTTRDataUtility.GetLocalRDataTableStrideBytes(_function.SchedResult.ThreadLocalRdatas, _targetOptions, "t"),
-                        ["warp_local_rdata_stride_bytes"] = PyNTTRDataUtility.GetLocalRDataTableStrideBytes(_function.SchedResult.WarpLocalRdatas, _targetOptions, "w"),
                         ["block_local_rdata_stride_bytes"] = PyNTTRDataUtility.GetLocalRDataTableStrideBytes(_function.SchedResult.BlockLocalRdatas, _targetOptions, "b"),
                     }));
             var bodySource = _body.ToString().TrimEnd();
@@ -700,36 +696,46 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             _attrs["requires_grid_barrier"] = true;
             _attrs["dtype"] = outputScalarDType;
             _attrs["shape"] = globalShape;
-            var helperName = GetNextHelperName("reshard");
             var inputRef = ResolveBufferRef(input);
             var outputRef = ResolveBufferRef(output);
-            WriteHelperTemplate(
-                "triton/kernels/Reshard.py.jinja",
-                new PyNTTReshardTemplateModel(
-                    helperName,
-                    GetBufferScalarPointer(input, "source_shard_index"),
-                    GetBufferScalarPointer(output),
-                    inputRef.BaseName,
-                    inputRef.OffsetBytes,
-                    inputRef.PoolBytes,
-                    outputRef.BaseName,
-                    outputRef.OffsetBytes,
-                    outputRef.PoolBytes,
-                    GetScalarElementSizeBytes(output.ElemType),
-                    outputScalarDType,
-                    GetScalarTritonDType(output.ElemType),
-                    globalShape,
-                    inputShape,
-                    outputShape,
-                    GetBufferStrides(input),
-                    GetBufferStrides(output),
-                    inputVectorLaneCount,
-                    hierarchy,
-                    GetSplitAxes(gatherReduceScatter.InType),
-                    GetSplitAxes(gatherReduceScatter.OutType),
-                    $"{input.Name} -> {output.Name}"));
+            var collectiveOffsetBytes = checked((long)_function.SchedResult.DataUsage * hierarchy.Aggregate(1L, (acc, value) => checked(acc * value)));
+            var collectivePoolBytes = GetTensorMaxSizeBytes(globalShape, inputVectorLaneCount, GetScalarElementSizeBytes(output.ElemType), "PyNTT GatherReduceScatter collective pool");
+            _collectiveDataPoolBytes = Math.Max(_collectiveDataPoolBytes, collectivePoolBytes);
+
+            PyNTTReshardTemplateModel MakeModel(string helperName, string stage) => new(
+                helperName,
+                GetBufferScalarPointer(input, "source_shard_index"),
+                GetBufferScalarPointer(output),
+                inputRef.BaseName,
+                inputRef.OffsetBytes,
+                inputRef.PoolBytes,
+                outputRef.BaseName,
+                outputRef.OffsetBytes,
+                outputRef.PoolBytes,
+                GetScalarElementSizeBytes(output.ElemType),
+                outputScalarDType,
+                GetScalarTritonDType(output.ElemType),
+                globalShape,
+                inputShape,
+                outputShape,
+                GetBufferStrides(input),
+                GetBufferStrides(output),
+                inputVectorLaneCount,
+                hierarchy,
+                GetSplitAxes(gatherReduceScatter.InType),
+                GetSplitAxes(gatherReduceScatter.OutType),
+                collectiveOffsetBytes,
+                collectivePoolBytes,
+                stage,
+                $"{input.Name} -> {output.Name}");
+
+            var toCollectiveHelperName = GetNextHelperName("reshard_to_collective");
+            WriteHelperTemplate("triton/kernels/Reshard.py.jinja", MakeModel(toCollectiveHelperName, "to_collective"));
+            var fromCollectiveHelperName = GetNextHelperName("reshard_from_collective");
+            WriteHelperTemplate("triton/kernels/Reshard.py.jinja", MakeModel(fromCollectiveHelperName, "from_collective"));
             WriteBarrier(HelperBarrierKind.Grid);
-            WriteLine(BuildHelperCall(helperName), HelperBarrierKind.Grid);
+            WriteLine(BuildHelperCall(toCollectiveHelperName), HelperBarrierKind.Grid);
+            WriteLine(BuildHelperCall(fromCollectiveHelperName), HelperBarrierKind.Grid);
         }
 
         private void VisitPad(Nncase.TIR.NTT.Pad pad, IReadOnlyList<BaseExpr> args)
@@ -2297,6 +2303,8 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     outputShape,
                     globalShape,
                     GetBufferStrides(output),
+                    GetHierarchy(output),
+                    GetBufferSplitAxes(output, outputShape.Length),
                     GetShardAxis(output),
                     $"kv-cache -> {output.Name}"));
             WriteLine(BuildHelperCall(helperName, $"input{cacheMetaInputIndex}"));
@@ -2780,11 +2788,8 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             return buffer.MemSpan.Buffer.Location switch
             {
                 MemoryLocation.Data => new("data", offsetBytes, checked((long)_function.SchedResult.DataUsage), "shard_index"),
-                MemoryLocation.WarpLocalData => new("warp_local_data", offsetBytes, checked((long)_function.SchedResult.WarpLocalDataPoolSize), BuildWarpLocalDataIndexExpression(_targetOptions)),
                 MemoryLocation.BlockLocalData => new("block_local_data", offsetBytes, checked((long)_function.SchedResult.BlockLocalDataPoolSize), BuildBlockLocalDataIndexExpression(_targetOptions)),
                 MemoryLocation.Rdata => new("rdata", offsetBytes, 0, null),
-                MemoryLocation.ThreadLocalRdata => new("thread_local_rdata", offsetBytes, PyNTTRDataUtility.GetLocalRDataTableStrideBytes(_function.SchedResult.ThreadLocalRdatas, _targetOptions, "t"), "shard_index"),
-                MemoryLocation.WarpLocalRdata => new("warp_local_rdata", offsetBytes, PyNTTRDataUtility.GetLocalRDataTableStrideBytes(_function.SchedResult.WarpLocalRdatas, _targetOptions, "w"), "shard_index"),
                 MemoryLocation.BlockLocalRdata => new("block_local_rdata", offsetBytes, PyNTTRDataUtility.GetLocalRDataTableStrideBytes(_function.SchedResult.BlockLocalRdatas, _targetOptions, "b"), "shard_index"),
                 var location => throw new NotSupportedException($"PyNTT does not support buffer memory location {location} for Triton template operands yet."),
             };
@@ -3008,20 +3013,10 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             => string.Equals(expression.Trim(), "0", StringComparison.Ordinal);
 
         private static string BuildThreadIdExpression(PyNTTTargetOptions targetOptions)
-        {
-            var hierarchy = GetBlockHierarchy(targetOptions);
-            var threadDim = hierarchy.Length == 0 ? 1 : hierarchy[^1];
-            return threadDim <= 1 ? "0" : $"(shard_index % {threadDim.ToString(CultureInfo.InvariantCulture)})";
-        }
-
-        private static string BuildWarpLocalDataIndexExpression(PyNTTTargetOptions targetOptions)
-            => BuildScopeIndexExpression(GetThreadScopeSize(targetOptions));
+            => "0";
 
         private static string BuildBlockLocalDataIndexExpression(PyNTTTargetOptions targetOptions)
             => BuildScopeIndexExpression(GetBlockLocalDataScopeSize(targetOptions));
-
-        private static int GetWarpLocalDataScopeCount(PyNTTTargetOptions targetOptions)
-            => GetScopeCount(targetOptions, GetThreadScopeSize(targetOptions));
 
         private static int GetBlockLocalDataScopeCount(PyNTTTargetOptions targetOptions)
             => GetScopeCount(targetOptions, GetBlockLocalDataScopeSize(targetOptions));
@@ -3036,29 +3031,8 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             return Math.Max(1, shardCount / Math.Max(1, scopeSize));
         }
 
-        private static int GetThreadScopeSize(PyNTTTargetOptions targetOptions)
-        {
-            var hierarchy = GetBlockHierarchy(targetOptions);
-            return hierarchy.Length == 0 ? 1 : hierarchy[^1];
-        }
-
         private static int GetBlockLocalDataScopeSize(PyNTTTargetOptions targetOptions)
-        {
-            var hierarchy = GetBlockHierarchy(targetOptions);
-            if (hierarchy.Length == 0)
-            {
-                return 1;
-            }
-
-            var threadScope = hierarchy[^1];
-            var hasWarp = targetOptions.HierarchyNames.Contains('w', StringComparison.Ordinal);
-            if (hasWarp && hierarchy.Length >= 2)
-            {
-                return checked(threadScope * hierarchy[^2]);
-            }
-
-            return threadScope;
-        }
+            => 1;
 
         private static int GetScalarElementSizeBytes(DataType dataType)
         {
@@ -3238,10 +3212,11 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
         {
             return new ShardMetadata(
                 "local_shard",
-                string.IsNullOrWhiteSpace(distributedType.Placement.Name) ? "b" : distributedType.Placement.Name,
+                string.IsNullOrWhiteSpace(distributedType.Placement.NormalizedHierarchyNames) ? "b" : distributedType.Placement.NormalizedHierarchyNames,
                 GetTensorAxis(distributedType),
                 "grid[0]",
                 distributedType.Placement.Hierarchy.ToArray(),
+                distributedType.Placement.NormalizedHierarchyLevels,
                 ToPythonExpressions(output.Shape));
         }
 
@@ -3251,6 +3226,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             0,
             "grid[0]",
             GetBlockHierarchy(targetOptions),
+            GetBlockHierarchyLevels(targetOptions),
             ToPythonExpressions(output.Shape));
     }
 
@@ -3269,10 +3245,19 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
 
     private static string GetBlockPlacementAxis(PyNTTTargetOptions targetOptions)
     {
-        var hierarchyNames = string.IsNullOrWhiteSpace(targetOptions.HierarchyNames)
+        var hierarchy = GetBlockHierarchy(targetOptions);
+        var hierarchyNames = Placement.NormalizeAxisString(string.IsNullOrWhiteSpace(targetOptions.HierarchyNames)
             ? "b"
-            : targetOptions.HierarchyNames;
-        return hierarchyNames.Contains("b", StringComparison.Ordinal) ? "b" : hierarchyNames[0].ToString();
+            : targetOptions.HierarchyNames);
+        var hierarchyLevels = GetBlockHierarchyLevels(targetOptions);
+        if (hierarchyNames.Length != hierarchy.Length)
+        {
+            hierarchyNames = new string('b', hierarchy.Length);
+        }
+
+        var blockAxes = hierarchyNames.Zip(hierarchyLevels).Where(pair => pair.Second == 'b').Select(pair => pair.First);
+        var placementAxis = string.Concat(blockAxes);
+        return string.IsNullOrEmpty(placementAxis) ? "b" : placementAxis;
     }
 
     private static int[] GetBlockHierarchy(PyNTTTargetOptions targetOptions)
@@ -3281,11 +3266,17 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
         return hierarchies.Length == 0 ? new[] { 1 } : hierarchies[0];
     }
 
+    private static string GetBlockHierarchyLevels(PyNTTTargetOptions targetOptions)
+    {
+        var hierarchy = GetBlockHierarchy(targetOptions);
+        return Placement.NormalizeHierarchyLevels(targetOptions.HierarchyLevels, targetOptions.HierarchyNames, hierarchy.Length);
+    }
+
     private static string BuildGeneratedTopKernelPython(GeneratedKernelMetadata kernel, string bodySource, string helperSource)
     {
         var inputs = kernel.Inputs.Select((_, index) => $"input{index}").ToArray();
         var outputs = kernel.Outputs.Select((_, index) => $"output{index}").ToArray();
-        var workspaceParameters = new[] { "data", "rdata", "thread_local_rdata", "warp_local_rdata", "block_local_rdata", "warp_local_data", "block_local_data" };
+        var workspaceParameters = new[] { "data", "rdata", "block_local_rdata", "block_local_data" };
         var runtimeShapeArgs = GetRuntimeShapeArgs(kernel);
         var gridBarrierParameters = kernel.Attrs.ContainsKey("requires_grid_barrier")
             ? new[] { "pyntt_grid_mesh: tl.constexpr" }
@@ -3368,6 +3359,22 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
     private static long GetPoolSizeBytes(IReadOnlyDictionary<Const, ValueRange<ulong>> ranges)
     {
         return ranges.Count == 0 ? 0L : checked((long)ranges.Values.Max(range => range.Max));
+    }
+
+    private static long GetTensorMaxSizeBytes(IReadOnlyList<PyNTTDimExpression> shape, int vectorLaneCount, int scalarElementSizeBytes, string context)
+    {
+        var elements = 1L;
+        foreach (var dimension in shape)
+        {
+            if (dimension.MaxValue is not { } maxValue)
+            {
+                throw new NotSupportedException($"{context} requires bounded dimension for collective staging, got {dimension}.");
+            }
+
+            elements = checked(elements * maxValue);
+        }
+
+        return checked(elements * vectorLaneCount * scalarElementSizeBytes);
     }
 
     private static long GetFixedDimension(BaseExpr expr, string name)
@@ -4489,6 +4496,8 @@ internal sealed record ShardMetadata(
     string Extent,
     [property: JsonPropertyName("hierarchy")]
     int[] Hierarchy,
+    [property: JsonPropertyName("hierarchy_levels")]
+    string HierarchyLevels,
     [property: JsonPropertyName("global_shape")]
     string[] GlobalShape);
 

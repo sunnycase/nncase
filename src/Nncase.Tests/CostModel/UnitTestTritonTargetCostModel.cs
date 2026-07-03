@@ -128,7 +128,7 @@ public sealed class UnitTestTritonTargetCostModel : TestClassBase
     }
 
     [Fact]
-    public void TestBoxingTensorStoreUsesLocalTargetCopyCost()
+    public void TestBoxingTensorStoreUsesLocalTargetCopyCostWithoutSynchronization()
     {
         var capability = TritonTargetCapability.ForComputeCapability(8, 0) with
         {
@@ -139,7 +139,7 @@ public sealed class UnitTestTritonTargetCostModel : TestClassBase
         CompileOptions.TargetOptions = new PyNTTTargetOptions { TritonCapability = capability };
         var costModel = new TritonTargetOpCostModel(capability);
 
-        var placement = new Placement([4, 8], "y,x");
+        var placement = new Placement([4, 8], "y,x", "bb");
         var tensorType = new TensorType(DataTypes.Float32, new RankedShape(128, 151936));
         var distributedType = new DistributedType(tensorType, [SBP.S([0]), SBP.S([1])], placement);
         var input = new Var("input", distributedType);
@@ -151,16 +151,35 @@ public sealed class UnitTestTritonTargetCostModel : TestClassBase
         Assert.False(cost.Factors.ContainsKey(CostFactorNames.CPUCycles));
         Assert.Equal((UInt128)607744, cost[CostFactorNames.MemoryLoad]);
         Assert.Equal((UInt128)607744, cost[CostFactorNames.MemoryStore]);
+        Assert.False(cost.Factors.ContainsKey(CostFactorNames.Synchronization));
         Assert.Equal((UInt128)4862, costModel.GetLatency(cost));
+    }
+
+    [Fact]
+    public void TestBoxingTensorLoadUsesLocalTargetCopyCostWithoutSynchronization()
+    {
+        CompileOptions.TargetOptions = new PyNTTTargetOptions();
+
+        var placement = new Placement([4, 8], "y,x", "bb");
+        var tensorType = new TensorType(DataTypes.BFloat16, new RankedShape(16, 128));
+        var distributedType = new DistributedType(tensorType, [SBP.B, SBP.S([1])], placement);
+        var input = new Var("input", tensorType);
+        var boxing = IR.F.Distributed.Boxing(input, distributedType);
+        CompilerServices.InferenceType(boxing);
+
+        var cost = CompilerServices.EvaluateCost(boxing, CompileOptions);
+
+        Assert.True(cost[CostFactorNames.MemoryLoad] > 0);
+        Assert.True(cost[CostFactorNames.MemoryStore] > 0);
         Assert.False(cost.Factors.ContainsKey(CostFactorNames.Synchronization));
     }
 
     [Fact]
-    public void TestThreadLocalMetadataReshardHasLowTargetCost()
+    public void TestSmallReshardTargetCostIncludesSynchronization()
     {
         CompileOptions.TargetOptions = new PyNTTTargetOptions();
 
-        var placement = new Placement([4, 8], "y,x");
+        var placement = new Placement([4, 8], "y,x", "bb");
         var tensorType = new TensorType(DataTypes.BFloat16, new RankedShape(16, 128));
         var inputType = new DistributedType(tensorType, [SBP.B, SBP.S([1])], placement);
         var outputType = new DistributedType(tensorType, [SBP.B, SBP.B], placement);
@@ -170,8 +189,9 @@ public sealed class UnitTestTritonTargetCostModel : TestClassBase
 
         var cost = CompilerServices.EvaluateCost(boxing, CompileOptions);
 
-        Assert.Equal((UInt128)1, cost[CostFactorNames.CPUCycles]);
-        Assert.False(cost.Factors.ContainsKey(CostFactorNames.Synchronization));
+        Assert.True(cost[CostFactorNames.MemoryLoad] > 0);
+        Assert.True(cost[CostFactorNames.MemoryStore] > 0);
+        Assert.Equal((UInt128)25_000, cost[CostFactorNames.Synchronization]);
     }
 
     [Fact]
@@ -216,7 +236,7 @@ public sealed class UnitTestTritonTargetCostModel : TestClassBase
         };
         CompileOptions.TargetOptions = new PyNTTTargetOptions { TritonCapability = capability };
 
-        var placement = new Placement([4, 8], "y,x");
+        var placement = new Placement([4, 8], "y,x", "bb");
         var packedBf16 = new VectorType(DataTypes.BFloat16, [4, 8]);
         var mSplit = IR.F.NTT.PackedMatMul(
             new Var("lhs_m_split", new DistributedType(new TensorType(DataTypes.BFloat16, new RankedShape(32, 1024)), [SBP.S([0, 1]), SBP.B], placement)),

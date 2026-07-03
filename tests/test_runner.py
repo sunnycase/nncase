@@ -376,6 +376,7 @@ class TestRunner(Evaluator, Inference, metaclass=ABCMeta):
             pyntt_hierarchy = self.get_pyntt_block_hierarchy()
             target_options.Hierarchies = [pyntt_hierarchy]
             target_options.HierarchyNames = self.get_pyntt_block_hierarchy_names(pyntt_hierarchy)
+            target_options.HierarchyLevels = self.get_pyntt_block_hierarchy_levels(pyntt_hierarchy)
             for k, v in (values or {}).items():
                 target_option = self.get_pyntt_target_option_name(k)
                 if target_option is None:
@@ -383,6 +384,8 @@ class TestRunner(Evaluator, Inference, metaclass=ABCMeta):
                 if target_option == "Hierarchies" and self.is_default_pyntt_hierarchies(v):
                     continue
                 if target_option == "HierarchyNames" and self.is_default_pyntt_hierarchy_names(v):
+                    continue
+                if target_option == "HierarchyLevels" and self.is_default_pyntt_hierarchy_levels(v):
                     continue
                 setattr(target_options, target_option, v)
         if target == 'cpu' or target == 'xpu':
@@ -403,6 +406,7 @@ class TestRunner(Evaluator, Inference, metaclass=ABCMeta):
             "vectorize": "Vectorize",
             "hierarchies": "Hierarchies",
             "hierarchy_names": "HierarchyNames",
+            "hierarchy_levels": "HierarchyLevels",
             "hierarchy_sizes": "HierarchySizes",
             "hierarchy_latencies": "HierarchyLatencies",
             "hierarchy_band_widths": "HierarchyBandWidths",
@@ -435,10 +439,16 @@ class TestRunner(Evaluator, Inference, metaclass=ABCMeta):
             return "yx"
         return "b"
 
+    def get_pyntt_block_hierarchy_levels(self, hierarchy: List[int]) -> str:
+        return "b" * len(hierarchy)
+
     def is_default_pyntt_hierarchies(self, value) -> bool:
         return value == [[1]]
 
     def is_default_pyntt_hierarchy_names(self, value) -> bool:
+        return value == "b"
+
+    def is_default_pyntt_hierarchy_levels(self, value) -> bool:
         return value == "b"
 
     def get_compile_options(self, target, model_file: Union[List[str], str], dump_dir):

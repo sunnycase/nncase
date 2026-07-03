@@ -48,7 +48,7 @@ public class MatMulEvaluator : IEvaluator<MatMul>, ITypeInferencer<MatMul>, ICos
         SBPPartial? partial = null;
 
         // TODO: keep summa only
-        if (!a.TensorType.Shape.IsFixed || !b.TensorType.Shape.IsFixed || transB || (a.Placement.HierarchyKind == HierarchyKind.SMT && a.TensorType.DType is VectorType vt && vt.ElemType == DataTypes.Float8E4M3))
+        if (!a.TensorType.Shape.IsFixed || !b.TensorType.Shape.IsFixed || transB)
         {
             var ndsbp = new SBP[oRank];
             for (int i = 0; i < ndsbp.Length - 2; i++)

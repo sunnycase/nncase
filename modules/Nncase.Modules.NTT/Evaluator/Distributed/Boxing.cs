@@ -16,6 +16,8 @@ namespace Nncase.Evaluator.IR.Distributed;
 
 public sealed class BoxingEvaluator : ITypeInferencer<Boxing>, ICostEvaluator<Boxing>, IEvaluator<Boxing>
 {
+    private static readonly UInt128 SynchronizationCost = 25_000; // 25k cycles on 5GHz CPU is about 5us.
+
     public static IRType VisitType(IRType inType, IRType outType, bool isReshape = false)
     {
         IRType VisitD2D(DistributedType inv, DistributedType outv)
@@ -130,8 +132,7 @@ public sealed class BoxingEvaluator : ITypeInferencer<Boxing>, ICostEvaluator<Bo
             return targetCost;
         }
 
-        UInt128 synchronizeCost = inType is DistributedType dt && dt.Placement.HierarchyKind == HierarchyKind.SMT ? 1500U : 25_000; // 25k cycles on 5GHz CPU is about 5us.
-        var cost = new Cost() { [CostFactorNames.CPUCycles] = 1, [CostFactorNames.MemoryLoad] = 0, [CostFactorNames.MemoryStore] = 0, [CostFactorNames.Synchronization] = synchronizeCost };
+        var cost = new Cost() { [CostFactorNames.CPUCycles] = 1, [CostFactorNames.MemoryLoad] = 0, [CostFactorNames.MemoryStore] = 0, [CostFactorNames.Synchronization] = SynchronizationCost };
         switch (inType, returnType)
         {
             case (TensorType _, DistributedType distributedType):
@@ -155,7 +156,6 @@ public sealed class BoxingEvaluator : ITypeInferencer<Boxing>, ICostEvaluator<Bo
                         {
                             [CostFactorNames.MemoryLoad] = CostUtility.GetMemoryAccess(distributedType),
                             [CostFactorNames.MemoryStore] = CostUtility.GetMemoryAccess(distributedType),
-                            [CostFactorNames.Synchronization] = synchronizeCost,
                         };
                         break;
                 }
@@ -169,7 +169,7 @@ public sealed class BoxingEvaluator : ITypeInferencer<Boxing>, ICostEvaluator<Bo
                     {
                         [CostFactorNames.MemoryStore] = CostUtility.GetMemoryAccess(a),
                         [CostFactorNames.MemoryLoad] = CostUtility.GetMemoryAccess(b),
-                        [CostFactorNames.Synchronization] = synchronizeCost,
+                        [CostFactorNames.Synchronization] = SynchronizationCost,
                     };
 
                     float scatterPart = 1;
@@ -249,11 +249,6 @@ public sealed class BoxingEvaluator : ITypeInferencer<Boxing>, ICostEvaluator<Bo
                         {
                             [CostFactorNames.MemoryStore] = (UInt128)((gatherPart - 1) * (float)CostUtility.GetMemoryAccess(DistributedUtility.GetDividedTensorType(a)) / gatherPart),
                         };
-
-                        if (a.Placement.HierarchyKind == HierarchyKind.SMT && (ndsbpsA[1] is SBPPartial))
-                        {
-                            cost[CostFactorNames.MemoryStore] *= 8;
-                        }
                     }
 
                     if (reducePart > 1f)
@@ -278,7 +273,7 @@ public sealed class BoxingEvaluator : ITypeInferencer<Boxing>, ICostEvaluator<Bo
                     {
                         [CostFactorNames.MemoryStore] = CostUtility.GetMemoryAccess(a) * (UInt128)a.TensorType.DType.SizeInBytes,
                         [CostFactorNames.MemoryLoad] = CostUtility.GetMemoryAccess(b) * (UInt128)b.TensorType.DType.SizeInBytes,
-                        [CostFactorNames.Synchronization] = synchronizeCost,
+                        [CostFactorNames.Synchronization] = SynchronizationCost,
                     };
 
                     float gatherPart = 1;
@@ -373,7 +368,7 @@ public sealed class BoxingEvaluator : ITypeInferencer<Boxing>, ICostEvaluator<Bo
                 {
                     [CostFactorNames.MemoryStore] = CostUtility.GetMemoryAccess(a),
                     [CostFactorNames.MemoryLoad] = CostUtility.GetMemoryAccess(b),
-                    [CostFactorNames.Synchronization] = synchronizeCost,
+                    [CostFactorNames.Synchronization] = SynchronizationCost,
                 };
                 break;
             case (DistributedType a, DistributedType b) when a.Placement != b.Placement:
@@ -381,7 +376,7 @@ public sealed class BoxingEvaluator : ITypeInferencer<Boxing>, ICostEvaluator<Bo
                 {
                     [CostFactorNames.MemoryStore] = CostUtility.GetMemoryAccess(a),
                     [CostFactorNames.MemoryLoad] = CostUtility.GetMemoryAccess(b),
-                    [CostFactorNames.Synchronization] = synchronizeCost,
+                    [CostFactorNames.Synchronization] = SynchronizationCost,
                 };
                 break;
             case (DistributedType a, DistributedType b) when a.Partial != b.Partial:
@@ -389,7 +384,7 @@ public sealed class BoxingEvaluator : ITypeInferencer<Boxing>, ICostEvaluator<Bo
                 {
                     [CostFactorNames.MemoryStore] = CostUtility.GetMemoryAccess(a),
                     [CostFactorNames.MemoryLoad] = CostUtility.GetMemoryAccess(b),
-                    [CostFactorNames.Synchronization] = synchronizeCost,
+                    [CostFactorNames.Synchronization] = SynchronizationCost,
                 };
                 break;
             case (DistributedType a, DistributedType b) when a == b:
@@ -426,8 +421,6 @@ public sealed class BoxingEvaluator : ITypeInferencer<Boxing>, ICostEvaluator<Bo
                 TryGetTargetTensorLoadCost(targetCostModel, inputTensor, outputDistributed, out cost),
             (DistributedType inputDistributed, TensorType outputTensor) =>
                 TryGetTargetTensorStoreCost(targetCostModel, inputDistributed, outputTensor, out cost),
-            (DistributedType inputDistributed, DistributedType outputDistributed) when IsThreadLocalMetadataReshard(inputDistributed, outputDistributed) =>
-                TryGetThreadLocalMetadataReshardCost(out cost),
             (DistributedType inputDistributed, DistributedType outputDistributed) =>
                 TryGetTargetDistributedCopyCost(targetCostModel, inputDistributed, outputDistributed, out cost),
             _ => false,
@@ -456,49 +449,22 @@ public sealed class BoxingEvaluator : ITypeInferencer<Boxing>, ICostEvaluator<Bo
         var outputLocal = GetMaxDividedTensorType(outputDistributed);
         var localInputTensor = new TargetCostTensor(inputLocal.DType, inputLocal.Shape);
         var localOutputTensor = new TargetCostTensor(outputLocal.DType, outputLocal.Shape);
-        return targetCostModel.TryGetElementwiseCost(new("boxing_reshard_copy", [localInputTensor], localOutputTensor, WorkPerElement: 0.0), out cost);
+        return TryGetSynchronizedTargetElementwiseCost(targetCostModel, new("boxing_reshard_copy", [localInputTensor], localOutputTensor, WorkPerElement: 0.0), out cost);
     }
 
-    private static bool TryGetThreadLocalMetadataReshardCost(out Cost cost)
+    private static bool TryGetSynchronizedTargetElementwiseCost(ITargetOpCostModel targetCostModel, ElementwiseOpCostQuery query, out Cost cost)
     {
-        cost = new Cost { [CostFactorNames.CPUCycles] = 1 };
+        if (!targetCostModel.TryGetElementwiseCost(query, out cost))
+        {
+            return false;
+        }
+
+        cost += new Cost { [CostFactorNames.Synchronization] = SynchronizationCost };
         return true;
     }
 
     private static TensorType GetMaxDividedTensorType(DistributedType distributedType)
     {
         return DistributedUtility.GetDividedTensorType(distributedType, DistributedUtility.DivideFlags.MaxShape);
-    }
-
-    private static bool IsThreadLocalMetadataReshard(DistributedType inputType, DistributedType outputType)
-    {
-        if (inputType.TensorType != outputType.TensorType
-            || inputType.Placement != outputType.Placement
-            || inputType.Partial is not null
-            || outputType.Partial is not null
-            || DistributedUtility.AreSamePolicies(inputType.AxisPolicies, outputType.AxisPolicies, false))
-        {
-            return false;
-        }
-
-        var threadAxis = inputType.Placement.Rank - 1;
-        var reducedInputPolicies = inputType.AxisPolicies.Select(sbp => ReduceThreadAxis(sbp, threadAxis)).ToArray();
-        if (DistributedUtility.AreSamePolicies(reducedInputPolicies, outputType.AxisPolicies.ToArray(), false))
-        {
-            return true;
-        }
-
-        var reducedOutputPolicies = outputType.AxisPolicies.Select(sbp => ReduceThreadAxis(sbp, threadAxis)).ToArray();
-        return DistributedUtility.AreSamePolicies(reducedOutputPolicies, inputType.AxisPolicies.ToArray(), false);
-    }
-
-    private static SBP ReduceThreadAxis(SBP sbp, int threadAxis)
-    {
-        if (sbp is not SBPSplit split || !split.Axes.Contains(threadAxis))
-        {
-            return sbp;
-        }
-
-        return split.Axes.Count == 1 ? SBP.B : SBP.S(split.Axes.Except([threadAxis]).ToArray());
     }
 }

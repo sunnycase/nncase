@@ -15,7 +15,7 @@
 #include <nncase/ntt/shape.h>
 #define NNCASE_NTT_TOPOLOGY_DEFINED 1
 namespace nncase::ntt::distributed {
-constexpr auto topology_shape = ntt::fixed_shape_v<2, 32, 4>;
+constexpr auto topology_shape = ntt::fixed_shape_v<2, 32>;
 } // namespace nncase::ntt::distributed
 
 #include "ntt_test.h"
@@ -51,13 +51,13 @@ using namespace ortki;
 
 decltype(nncase::ntt::make_tensor<nncase::ntt::vector<uintptr_t, 2>>(
     nncase::ntt::distributed::topology_shape))
-    nncase::ntt::distributed::detail::global_thread_local_data_ptr =
+    nncase::ntt::distributed::detail::global_local_data_ptr =
         nncase::ntt::make_tensor<nncase::ntt::vector<uintptr_t, 2>>(
             nncase::ntt::distributed::topology_shape);
 
 decltype(nncase::ntt::make_tensor<nncase::ntt::vector<uintptr_t, 2>>(
     nncase::ntt::distributed::topology_shape))
-    nncase::ntt::distributed::detail::global_thread_local_rdata_ptr =
+    nncase::ntt::distributed::detail::global_block_local_data_ptr =
         nncase::ntt::make_tensor<nncase::ntt::vector<uintptr_t, 2>>(
             nncase::ntt::distributed::topology_shape);
 
@@ -68,7 +68,6 @@ decltype(nncase::ntt::make_tensor<nncase::ntt::vector<uintptr_t, 2>>(
             nncase::ntt::distributed::topology_shape);
 
 namespace nncase::ntt::runtime {
-size_t tdim;
 size_t bdim;
 size_t cdim;
 
@@ -141,26 +140,24 @@ TEST(CpuTest, reshard_2D_same_sharding_spec_broadcast) {
 
     constexpr size_t cdims = ntt::distributed::cdim();
     constexpr size_t bdims = ntt::distributed::bdim();
-    constexpr size_t tdims = ntt::distributed::tdim();
-    constexpr size_t num = cdims * bdims * tdims;
+    constexpr size_t num = cdims * bdims;
 
     ntt::apply(
-        ntt::distributed::detail::global_thread_local_data_ptr.shape(),
+        ntt::distributed::detail::global_local_data_ptr.shape(),
         [&](auto index) {
-            ntt::distributed::detail::global_thread_local_data_ptr(index)(0_dim) =
+            ntt::distributed::detail::global_local_data_ptr(index)(0_dim) =
                 (uintptr_t)(ntt::runtime::thread_alloc(M * N * sizeof(float),
                                                        8));
-            ntt::distributed::detail::global_thread_local_data_ptr(index)(1_dim) =
-                ntt::distributed::detail::global_thread_local_data_ptr(index)(0_dim) +
+            ntt::distributed::detail::global_local_data_ptr(index)(1_dim) =
+                ntt::distributed::detail::global_local_data_ptr(index)(0_dim) +
                 M * N * sizeof(float);
         });
 
     std::vector<std::thread> threads;
     for (size_t id = 0; id < num; id++) {
         threads.emplace_back([id, p_in] {
-            size_t cid = id / (bdims * tdims);
-            size_t bid = id % (bdims * tdims) / tdims;
-            size_t tid = id % (bdims * tdims) % tdims;
+            size_t cid = id / bdims;
+            size_t bid = id % bdims;
 #ifdef __APPLE__
             pthread_setspecific(cpu_thread_context_key,
                                 new cpu_thread_context_t
@@ -168,7 +165,6 @@ TEST(CpuTest, reshard_2D_same_sharding_spec_broadcast) {
             cpu_thread_context_t::current() =
 #endif
                                 {
-                                    .tid = tid,
                                     .bid = bid,
                                     .cid = cid,
                                 }
@@ -197,17 +193,16 @@ TEST(CpuTest, reshard_2D_same_sharding_spec_broadcast) {
             auto tv = ntt::make_tensor_view_from_address(
                 p_in, ntt::fixed_shape_v<M, N>);
 
-            const auto program_ids = make_shape(cid, bid, tid);
+            const auto program_ids = make_shape(cid, bid);
             float *local_data_src = reinterpret_cast<float *>(
-                ((size_t)ntt::distributed::detail::global_thread_local_data_ptr(program_ids)(
+                ((size_t)ntt::distributed::detail::global_local_data_ptr(program_ids)(
                     0_dim)));
             auto local_data_dst = reinterpret_cast<float *>(
                 nncase::ntt::runtime::thread_alloc(M * N * sizeof(float), 8));
 
             // shard(broadcast)
             using mesh_type =
-                ntt::distributed::mesh<ntt::distributed::topology::thread,
-                                       cdims, bdims, tdims>;
+                ntt::distributed::mesh<ntt::distributed::topology::block, cdims, bdims>;
             auto sharding_spec = ntt::distributed::make_sharding<mesh_type>(
                 ntt::distributed::shard_policy::B,
                 ntt::distributed::shard_policy::B);
@@ -238,10 +233,10 @@ TEST(CpuTest, reshard_2D_same_sharding_spec_broadcast) {
         t.join();
 
 
-    ntt::apply(ntt::distributed::detail::global_thread_local_data_ptr.shape(),
+    ntt::apply(ntt::distributed::detail::global_local_data_ptr.shape(),
                [&](auto index) {
                    thread_free(
-                       (void *)(size_t)ntt::distributed::detail::global_thread_local_data_ptr(
+                       (void *)(size_t)ntt::distributed::detail::global_local_data_ptr(
                            index)(0_dim));
                });
 }
@@ -264,26 +259,24 @@ TEST(CpuTest, reshard_2D_same_sharding_sepc_split) {
 
     constexpr size_t cdims = ntt::distributed::cdim();
     constexpr size_t bdims = ntt::distributed::bdim();
-    constexpr size_t tdims = ntt::distributed::tdim();
-    constexpr size_t num = cdims * bdims * tdims;
+    constexpr size_t num = cdims * bdims;
 
     ntt::apply(
-        ntt::distributed::detail::global_thread_local_data_ptr.shape(),
+        ntt::distributed::detail::global_local_data_ptr.shape(),
         [&](auto index) {
-            ntt::distributed::detail::global_thread_local_data_ptr(index)(0_dim) =
+            ntt::distributed::detail::global_local_data_ptr(index)(0_dim) =
                 (uintptr_t)(ntt::runtime::thread_alloc(M * N * sizeof(float),
                                                        8));
-            ntt::distributed::detail::global_thread_local_data_ptr(index)(1_dim) =
-                ntt::distributed::detail::global_thread_local_data_ptr(index)(0_dim) +
+            ntt::distributed::detail::global_local_data_ptr(index)(1_dim) =
+                ntt::distributed::detail::global_local_data_ptr(index)(0_dim) +
                 M * N * sizeof(float);
     });
 
     std::vector<std::thread> threads;
     for (size_t id = 0; id < num; id++) {
         threads.emplace_back([id, p_in] {
-            size_t cid = id / (bdims * tdims);
-            size_t bid = id % (bdims * tdims) / tdims;
-            size_t tid = id % (bdims * tdims) % tdims;
+            size_t cid = id / bdims;
+            size_t bid = id % bdims;
 #ifdef __APPLE__
             pthread_setspecific(cpu_thread_context_key,
                                 new cpu_thread_context_t
@@ -291,7 +284,6 @@ TEST(CpuTest, reshard_2D_same_sharding_sepc_split) {
             cpu_thread_context_t::current() =
 #endif
                                 {
-                                    .tid = tid,
                                     .bid = bid,
                                     .cid = cid,
                                 }
@@ -317,20 +309,19 @@ TEST(CpuTest, reshard_2D_same_sharding_sepc_split) {
 #endif
 
             // shard(slice)
-            constexpr size_t split_num = bdims * tdims;
+            constexpr size_t split_num = bdims;
             auto tv = ntt::make_tensor_view_from_address(
                 p_in, ntt::fixed_shape_v<M, N>);
 
-            const auto program_ids = make_shape(cid, bid, tid);
+            const auto program_ids = make_shape(cid, bid);
             float *local_data_src = reinterpret_cast<float *>(
-                ((size_t)ntt::distributed::detail::global_thread_local_data_ptr(program_ids)(
+                ((size_t)ntt::distributed::detail::global_local_data_ptr(program_ids)(
                     0_dim)));
             auto local_data_dst = reinterpret_cast<float *>(
                 nncase::ntt::runtime::thread_alloc(M * N * sizeof(float), 8));
 
             using mesh_type =
-                ntt::distributed::mesh<ntt::distributed::topology::thread,
-                                       cdims, bdims, tdims>;
+                ntt::distributed::mesh<ntt::distributed::topology::block, cdims, bdims>;
             auto sharding_spec = ntt::distributed::make_sharding<mesh_type>(
                 ntt::distributed::shard_policy::B,
                 ntt::distributed::shard_policy::S<1, 2>());
@@ -359,10 +350,10 @@ TEST(CpuTest, reshard_2D_same_sharding_sepc_split) {
     for (auto &t : threads)
         t.join();
 
-    ntt::apply(ntt::distributed::detail::global_thread_local_data_ptr.shape(),
+    ntt::apply(ntt::distributed::detail::global_local_data_ptr.shape(),
                [&](auto index) {
                    thread_free(
-                       (void *)(size_t)ntt::distributed::detail::global_thread_local_data_ptr(
+                       (void *)(size_t)ntt::distributed::detail::global_local_data_ptr(
                            index)(0_dim));
     });
 }
@@ -390,26 +381,24 @@ TEST(CpuTest, reshard_2D_different_sharding_spec_broadcast_split) {
 
     constexpr size_t cdims = ntt::distributed::cdim();
     constexpr size_t bdims = ntt::distributed::bdim();
-    constexpr size_t tdims = ntt::distributed::tdim();
-    constexpr size_t num = cdims * bdims * tdims;
+    constexpr size_t num = cdims * bdims;
 
     ntt::apply(
-        ntt::distributed::detail::global_thread_local_data_ptr.shape(),
+        ntt::distributed::detail::global_local_data_ptr.shape(),
         [&](auto index) {
-            ntt::distributed::detail::global_thread_local_data_ptr(index)(0_dim) =
+            ntt::distributed::detail::global_local_data_ptr(index)(0_dim) =
                 (uintptr_t)(ntt::runtime::thread_alloc(M * N * sizeof(float),
                                                        8));
-            ntt::distributed::detail::global_thread_local_data_ptr(index)(1_dim) =
-                ntt::distributed::detail::global_thread_local_data_ptr(index)(0_dim) +
+            ntt::distributed::detail::global_local_data_ptr(index)(1_dim) =
+                ntt::distributed::detail::global_local_data_ptr(index)(0_dim) +
                 M * N * sizeof(float);
     });
 
     std::vector<std::thread> threads;
     for (size_t id = 0; id < num; id++) {
         threads.emplace_back([id, p_in, p_out] {
-            size_t cid = id / (bdims * tdims);
-            size_t bid = id % (bdims * tdims) / tdims;
-            size_t tid = id % (bdims * tdims) % tdims;
+            size_t cid = id / bdims;
+            size_t bid = id % bdims;
 #ifdef __APPLE__
             pthread_setspecific(cpu_thread_context_key,
                                 new cpu_thread_context_t
@@ -417,7 +406,6 @@ TEST(CpuTest, reshard_2D_different_sharding_spec_broadcast_split) {
             cpu_thread_context_t::current() =
 #endif
                                 {
-                                    .tid = tid,
                                     .bid = bid,
                                     .cid = cid,
                                 }
@@ -442,22 +430,21 @@ TEST(CpuTest, reshard_2D_different_sharding_spec_broadcast_split) {
             pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
 #endif
             // shard(slice)
-            constexpr size_t split_num = cdims * bdims * tdims;
+            constexpr size_t split_num = cdims * bdims;
             auto tv_in = ntt::make_tensor_view_from_address(
                 p_in, ntt::fixed_shape_v<M, N>);
             auto tv_out = ntt::make_tensor_view_from_address(
                 p_out, ntt::fixed_shape_v<M, N>);
 
-            const auto program_ids = make_shape(cid, bid, tid);
+            const auto program_ids = make_shape(cid, bid);
             float *local_data_src = reinterpret_cast<float *>(
-                ((size_t)ntt::distributed::detail::global_thread_local_data_ptr(program_ids)(
+                ((size_t)ntt::distributed::detail::global_local_data_ptr(program_ids)(
                     0_dim)));
             auto local_data_dst = reinterpret_cast<float *>(
                 nncase::ntt::runtime::thread_alloc(M * N * sizeof(float), 8));
 
             using mesh_type =
-                ntt::distributed::mesh<ntt::distributed::topology::thread,
-                                       cdims, bdims, tdims>;
+                ntt::distributed::mesh<ntt::distributed::topology::block, cdims, bdims>;
             auto sharding_src = ntt::distributed::make_sharding<mesh_type>(
                 ntt::distributed::shard_policy::B,
                 ntt::distributed::shard_policy::B);
@@ -492,10 +479,10 @@ TEST(CpuTest, reshard_2D_different_sharding_spec_broadcast_split) {
     for (auto &t : threads)
         t.join();
 
-    ntt::apply(ntt::distributed::detail::global_thread_local_data_ptr.shape(),
+    ntt::apply(ntt::distributed::detail::global_local_data_ptr.shape(),
                [&](auto index) {
                    thread_free(
-                       (void *)(size_t)ntt::distributed::detail::global_thread_local_data_ptr(
+                       (void *)(size_t)ntt::distributed::detail::global_local_data_ptr(
                            index)(0_dim));
     });
 }
@@ -520,26 +507,24 @@ TEST(CpuTest, reshard_2D_different_sharding_spec_split_broadcast) {
 
     constexpr size_t cdims = ntt::distributed::cdim();
     constexpr size_t bdims = ntt::distributed::bdim();
-    constexpr size_t tdims = ntt::distributed::tdim();
-    constexpr size_t num = cdims * bdims * tdims;
+    constexpr size_t num = cdims * bdims;
 
     ntt::apply(
-        ntt::distributed::detail::global_thread_local_data_ptr.shape(),
+        ntt::distributed::detail::global_local_data_ptr.shape(),
         [&](auto index) {
-            ntt::distributed::detail::global_thread_local_data_ptr(index)(0_dim) =
+            ntt::distributed::detail::global_local_data_ptr(index)(0_dim) =
                 (uintptr_t)(ntt::runtime::thread_alloc(M * N * sizeof(float),
                                                        8));
-            ntt::distributed::detail::global_thread_local_data_ptr(index)(1_dim) =
-                ntt::distributed::detail::global_thread_local_data_ptr(index)(0_dim) +
+            ntt::distributed::detail::global_local_data_ptr(index)(1_dim) =
+                ntt::distributed::detail::global_local_data_ptr(index)(0_dim) +
                 M * N * sizeof(float);
     });
 
     std::vector<std::thread> threads;
     for (size_t id = 0; id < num; id++) {
         threads.emplace_back([id, p_in] {
-            size_t cid = id / (bdims * tdims);
-            size_t bid = id % (bdims * tdims) / tdims;
-            size_t tid = id % (bdims * tdims) % tdims;
+            size_t cid = id / bdims;
+            size_t bid = id % bdims;
 #ifdef __APPLE__
             pthread_setspecific(cpu_thread_context_key,
                                 new cpu_thread_context_t
@@ -547,7 +532,6 @@ TEST(CpuTest, reshard_2D_different_sharding_spec_split_broadcast) {
             cpu_thread_context_t::current() =
 #endif
                                 {
-                                    .tid = tid,
                                     .bid = bid,
                                     .cid = cid,
                                 }
@@ -572,20 +556,19 @@ TEST(CpuTest, reshard_2D_different_sharding_spec_split_broadcast) {
             pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
 #endif
             // shard(slice)
-            constexpr size_t split_num = cdims * bdims * tdims;
+            constexpr size_t split_num = cdims * bdims;
             auto tv = ntt::make_tensor_view_from_address(
                 p_in, ntt::fixed_shape_v<M, N>);
 
-            const auto program_ids = make_shape(cid, bid, tid);
+            const auto program_ids = make_shape(cid, bid);
             float *local_data_src = reinterpret_cast<float *>(
-                ((size_t)ntt::distributed::detail::global_thread_local_data_ptr(program_ids)(
+                ((size_t)ntt::distributed::detail::global_local_data_ptr(program_ids)(
                     0_dim)));
             auto local_data_dst = reinterpret_cast<float *>(
                 nncase::ntt::runtime::thread_alloc(M * N * sizeof(float), 8));
 
             using mesh_type =
-                ntt::distributed::mesh<ntt::distributed::topology::thread,
-                                       cdims, bdims, tdims>;
+                ntt::distributed::mesh<ntt::distributed::topology::block, cdims, bdims>;
             auto sharding_src = ntt::distributed::make_sharding<mesh_type>(
                 ntt::distributed::shard_policy::B,
                 ntt::distributed::shard_policy::S<0, 1, 2>());
@@ -617,10 +600,10 @@ TEST(CpuTest, reshard_2D_different_sharding_spec_split_broadcast) {
     for (auto &t : threads)
         t.join();
 
-    ntt::apply(ntt::distributed::detail::global_thread_local_data_ptr.shape(),
+    ntt::apply(ntt::distributed::detail::global_local_data_ptr.shape(),
                [&](auto index) {
                    thread_free(
-                       (void *)(size_t)ntt::distributed::detail::global_thread_local_data_ptr(
+                       (void *)(size_t)ntt::distributed::detail::global_local_data_ptr(
                            index)(0_dim));
     });
 }
@@ -655,26 +638,24 @@ TEST(CpuTest, reshard_2D_different_sharding_spec_different_split_axis) {
 
     constexpr size_t cdims = ntt::distributed::cdim();
     constexpr size_t bdims = ntt::distributed::bdim();
-    constexpr size_t tdims = ntt::distributed::tdim();
-    constexpr size_t num = cdims * bdims * tdims;
+    constexpr size_t num = cdims * bdims;
 
     ntt::apply(
-        ntt::distributed::detail::global_thread_local_data_ptr.shape(),
+        ntt::distributed::detail::global_local_data_ptr.shape(),
         [&](auto index) {
-            ntt::distributed::detail::global_thread_local_data_ptr(index)(0_dim) =
+            ntt::distributed::detail::global_local_data_ptr(index)(0_dim) =
                 (uintptr_t)(ntt::runtime::thread_alloc(M * N * sizeof(float),
                                                        8));
-            ntt::distributed::detail::global_thread_local_data_ptr(index)(1_dim) =
-                ntt::distributed::detail::global_thread_local_data_ptr(index)(0_dim) +
+            ntt::distributed::detail::global_local_data_ptr(index)(1_dim) =
+                ntt::distributed::detail::global_local_data_ptr(index)(0_dim) +
                 M * N * sizeof(float);
         });
 
     std::vector<std::thread> threads;
     for (size_t id = 0; id < num; id++) {
         threads.emplace_back([id, p_in, p_out] {
-            size_t cid = id / (bdims * tdims);
-            size_t bid = id % (bdims * tdims) / tdims;
-            size_t tid = id % (bdims * tdims) % tdims;
+            size_t cid = id / bdims;
+            size_t bid = id % bdims;
 #ifdef __APPLE__
             pthread_setspecific(cpu_thread_context_key,
                                 new cpu_thread_context_t
@@ -682,7 +663,6 @@ TEST(CpuTest, reshard_2D_different_sharding_spec_different_split_axis) {
             cpu_thread_context_t::current() =
 #endif
                                 {
-                                    .tid = tid,
                                     .bid = bid,
                                     .cid = cid,
                                 }
@@ -708,22 +688,21 @@ TEST(CpuTest, reshard_2D_different_sharding_spec_different_split_axis) {
 #endif
 
             // shard(slice)
-            constexpr size_t split_num = bdims * tdims;
+            constexpr size_t split_num = bdims;
             auto tv_in = ntt::make_tensor_view_from_address(
                 p_in, ntt::fixed_shape_v<M, N>);
             auto tv_out = ntt::make_tensor_view_from_address(
                 p_out, ntt::fixed_shape_v<M, N>);
 
-            const auto program_ids = make_shape(cid, bid, tid);
+            const auto program_ids = make_shape(cid, bid);
             float *local_data_src = reinterpret_cast<float *>(
-                (size_t)(ntt::distributed::detail::global_thread_local_data_ptr(program_ids)(
+                (size_t)(ntt::distributed::detail::global_local_data_ptr(program_ids)(
                     0_dim)));
             auto local_data_dst = reinterpret_cast<float *>(
                 nncase::ntt::runtime::thread_alloc(M * N * sizeof(float), 8));
 
             using mesh_type =
-                ntt::distributed::mesh<ntt::distributed::topology::thread,
-                                       cdims, bdims, tdims>;
+                ntt::distributed::mesh<ntt::distributed::topology::block, cdims, bdims>;
             auto sharding_src = ntt::distributed::make_sharding<mesh_type>(
                 ntt::distributed::shard_policy::S<1, 2>(),
                 ntt::distributed::shard_policy::B);
@@ -759,10 +738,10 @@ TEST(CpuTest, reshard_2D_different_sharding_spec_different_split_axis) {
 
     EXPECT_TRUE(NttTest::compare_tensor(ntt_input, ntt_output));
 
-    ntt::apply(ntt::distributed::detail::global_thread_local_data_ptr.shape(),
+    ntt::apply(ntt::distributed::detail::global_local_data_ptr.shape(),
                [&](auto index) {
                    thread_free(
-                       (void *)(size_t)ntt::distributed::detail::global_thread_local_data_ptr(
+                       (void *)(size_t)ntt::distributed::detail::global_local_data_ptr(
                            index)(0_dim));
                });
 }
@@ -788,26 +767,24 @@ TEST(CpuTest, reshard_2D_different_sharding_spec_non_divisible_SB2BS) {
 
     constexpr size_t cdims = ntt::distributed::cdim();
     constexpr size_t bdims = ntt::distributed::bdim();
-    constexpr size_t tdims = ntt::distributed::tdim();
-    constexpr size_t num = cdims * bdims * tdims;
+    constexpr size_t num = cdims * bdims;
 
     ntt::apply(
-        ntt::distributed::detail::global_thread_local_data_ptr.shape(),
+        ntt::distributed::detail::global_local_data_ptr.shape(),
         [&](auto index) {
-            ntt::distributed::detail::global_thread_local_data_ptr(index)(0_dim) =
+            ntt::distributed::detail::global_local_data_ptr(index)(0_dim) =
                 (uintptr_t)(ntt::runtime::thread_alloc(M * N * sizeof(float),
                                                        8));
-            ntt::distributed::detail::global_thread_local_data_ptr(index)(1_dim) =
-                ntt::distributed::detail::global_thread_local_data_ptr(index)(0_dim) +
+            ntt::distributed::detail::global_local_data_ptr(index)(1_dim) =
+                ntt::distributed::detail::global_local_data_ptr(index)(0_dim) +
                 M * N * sizeof(float);
         });
 
     std::vector<std::thread> threads;
     for (size_t id = 0; id < num; id++) {
         threads.emplace_back([id, p_in, p_out] {
-            size_t cid = id / (bdims * tdims);
-            size_t bid = id % (bdims * tdims) / tdims;
-            size_t tid = id % (bdims * tdims) % tdims;
+            size_t cid = id / bdims;
+            size_t bid = id % bdims;
 #ifdef __APPLE__
             pthread_setspecific(cpu_thread_context_key,
                                 new cpu_thread_context_t
@@ -815,7 +792,6 @@ TEST(CpuTest, reshard_2D_different_sharding_spec_non_divisible_SB2BS) {
             cpu_thread_context_t::current() =
 #endif
                                 {
-                                    .tid = tid,
                                     .bid = bid,
                                     .cid = cid,
                                 }
@@ -841,22 +817,21 @@ TEST(CpuTest, reshard_2D_different_sharding_spec_non_divisible_SB2BS) {
 #endif
 
             // shard(slice)
-            constexpr size_t split_num = cdims * tdims;
+            constexpr size_t split_num = cdims;
             auto tv_in = ntt::make_tensor_view_from_address(
                 p_in, ntt::fixed_shape_v<M, N>);
             auto tv_out = ntt::make_tensor_view_from_address(
                 p_out, ntt::fixed_shape_v<M, N>);
 
-            const auto program_ids = make_shape(cid, bid, tid);
+            const auto program_ids = make_shape(cid, bid);
             float *local_data_src = reinterpret_cast<float *>(
-                (size_t)(ntt::distributed::detail::global_thread_local_data_ptr(program_ids)(
+                (size_t)(ntt::distributed::detail::global_local_data_ptr(program_ids)(
                     0_dim)));
             auto local_data_dst = reinterpret_cast<float *>(
                 nncase::ntt::runtime::thread_alloc(M * N * sizeof(float), 8));
 
             using mesh_type =
-                ntt::distributed::mesh<ntt::distributed::topology::thread,
-                                       cdims, bdims, tdims>;
+                ntt::distributed::mesh<ntt::distributed::topology::block, cdims, bdims>;
             auto sharding_src = ntt::distributed::make_sharding<mesh_type>(
                 ntt::distributed::shard_policy::S<0, 2>(),
                 ntt::distributed::shard_policy::B);
@@ -892,10 +867,10 @@ TEST(CpuTest, reshard_2D_different_sharding_spec_non_divisible_SB2BS) {
 
     EXPECT_TRUE(NttTest::compare_tensor(ntt_input, ntt_output));
 
-    ntt::apply(ntt::distributed::detail::global_thread_local_data_ptr.shape(),
+    ntt::apply(ntt::distributed::detail::global_local_data_ptr.shape(),
                [&](auto index) {
                    thread_free(
-                       (void *)(size_t)ntt::distributed::detail::global_thread_local_data_ptr(
+                       (void *)(size_t)ntt::distributed::detail::global_local_data_ptr(
                            index)(0_dim));
                });
 }
@@ -922,26 +897,24 @@ TEST(CpuTest, reshard_2D_different_sharding_spec_non_divisible_BS2SB) {
 
     constexpr size_t cdims = ntt::distributed::cdim();
     constexpr size_t bdims = ntt::distributed::bdim();
-    constexpr size_t tdims = ntt::distributed::tdim();
-    constexpr size_t num = cdims * bdims * tdims;
+    constexpr size_t num = cdims * bdims;
 
     ntt::apply(
-        ntt::distributed::detail::global_thread_local_data_ptr.shape(),
+        ntt::distributed::detail::global_local_data_ptr.shape(),
         [&](auto index) {
-            ntt::distributed::detail::global_thread_local_data_ptr(index)(0_dim) =
+            ntt::distributed::detail::global_local_data_ptr(index)(0_dim) =
                 (uintptr_t)(ntt::runtime::thread_alloc(M * N * sizeof(float),
                                                        8));
-            ntt::distributed::detail::global_thread_local_data_ptr(index)(1_dim) =
-                ntt::distributed::detail::global_thread_local_data_ptr(index)(0_dim) +
+            ntt::distributed::detail::global_local_data_ptr(index)(1_dim) =
+                ntt::distributed::detail::global_local_data_ptr(index)(0_dim) +
                 M * N * sizeof(float);
         });
 
     std::vector<std::thread> threads;
     for (size_t id = 0; id < num; id++) {
         threads.emplace_back([id, p_in, p_out] {
-            size_t cid = id / (bdims * tdims);
-            size_t bid = id % (bdims * tdims) / tdims;
-            size_t tid = id % (bdims * tdims) % tdims;
+            size_t cid = id / bdims;
+            size_t bid = id % bdims;
 #ifdef __APPLE__
             pthread_setspecific(cpu_thread_context_key,
                                 new cpu_thread_context_t
@@ -949,7 +922,6 @@ TEST(CpuTest, reshard_2D_different_sharding_spec_non_divisible_BS2SB) {
             cpu_thread_context_t::current() =
 #endif
                                 {
-                                    .tid = tid,
                                     .bid = bid,
                                     .cid = cid,
                                 }
@@ -975,22 +947,21 @@ TEST(CpuTest, reshard_2D_different_sharding_spec_non_divisible_BS2SB) {
 #endif
 
             // shard(slice)
-            constexpr size_t split_num = cdims * tdims;
+            constexpr size_t split_num = cdims;
             auto tv_in = ntt::make_tensor_view_from_address(
                 p_in, ntt::fixed_shape_v<M, N>);
             auto tv_out = ntt::make_tensor_view_from_address(
                 p_out, ntt::fixed_shape_v<M, N>);
 
-            const auto program_ids = make_shape(cid, bid, tid);
+            const auto program_ids = make_shape(cid, bid);
             float *local_data_src = reinterpret_cast<float *>(
-                (size_t)(ntt::distributed::detail::global_thread_local_data_ptr(program_ids)(
+                (size_t)(ntt::distributed::detail::global_local_data_ptr(program_ids)(
                     0_dim)));
             auto local_data_dst = reinterpret_cast<float *>(
                 nncase::ntt::runtime::thread_alloc(M * N * sizeof(float), 8));
 
             using mesh_type =
-                ntt::distributed::mesh<ntt::distributed::topology::thread,
-                                       cdims, bdims, tdims>;
+                ntt::distributed::mesh<ntt::distributed::topology::block, cdims, bdims>;
             auto sharding_src = ntt::distributed::make_sharding<mesh_type>(
                 ntt::distributed::shard_policy::B,
                 ntt::distributed::shard_policy::S<0, 2>());
@@ -1026,10 +997,10 @@ TEST(CpuTest, reshard_2D_different_sharding_spec_non_divisible_BS2SB) {
 
     EXPECT_TRUE(NttTest::compare_tensor(ntt_input, ntt_output));
 
-    ntt::apply(ntt::distributed::detail::global_thread_local_data_ptr.shape(),
+    ntt::apply(ntt::distributed::detail::global_local_data_ptr.shape(),
                [&](auto index) {
                    thread_free(
-                       (void *)(size_t)ntt::distributed::detail::global_thread_local_data_ptr(
+                       (void *)(size_t)ntt::distributed::detail::global_local_data_ptr(
                            index)(0_dim));
                });
 }
@@ -1055,26 +1026,24 @@ TEST(CpuTest, reshard_2D_split_multilple_axes) {
 
     constexpr size_t cdims = ntt::distributed::cdim();
     constexpr size_t bdims = ntt::distributed::bdim();
-    constexpr size_t tdims = ntt::distributed::tdim();
-    constexpr size_t num = cdims * bdims * tdims;
+    constexpr size_t num = cdims * bdims;
 
     ntt::apply(
-        ntt::distributed::detail::global_thread_local_data_ptr.shape(),
+        ntt::distributed::detail::global_local_data_ptr.shape(),
         [&](auto index) {
-            ntt::distributed::detail::global_thread_local_data_ptr(index)(0_dim) =
+            ntt::distributed::detail::global_local_data_ptr(index)(0_dim) =
                 (uintptr_t)(ntt::runtime::thread_alloc(M * N * sizeof(float),
                                                        8));
-            ntt::distributed::detail::global_thread_local_data_ptr(index)(1_dim) =
-                ntt::distributed::detail::global_thread_local_data_ptr(index)(0_dim) +
+            ntt::distributed::detail::global_local_data_ptr(index)(1_dim) =
+                ntt::distributed::detail::global_local_data_ptr(index)(0_dim) +
                 M * N * sizeof(float);
         });
 
     std::vector<std::thread> threads;
     for (size_t id = 0; id < num; id++) {
         threads.emplace_back([id, p_in, p_out] {
-            size_t cid = id / (bdims * tdims);
-            size_t bid = id % (bdims * tdims) / tdims;
-            size_t tid = id % (bdims * tdims) % tdims;
+            size_t cid = id / bdims;
+            size_t bid = id % bdims;
 #ifdef __APPLE__
             pthread_setspecific(cpu_thread_context_key,
                                 new cpu_thread_context_t
@@ -1082,7 +1051,6 @@ TEST(CpuTest, reshard_2D_split_multilple_axes) {
             cpu_thread_context_t::current() =
 #endif
                                 {
-                                    .tid = tid,
                                     .bid = bid,
                                     .cid = cid,
                                 }
@@ -1113,16 +1081,15 @@ TEST(CpuTest, reshard_2D_split_multilple_axes) {
             auto tv_out = ntt::make_tensor_view_from_address(
                 p_out, ntt::fixed_shape_v<M, N>);
 
-            const auto program_ids = make_shape(cid, bid, tid);
+            const auto program_ids = make_shape(cid, bid);
             float *local_data_src = reinterpret_cast<float *>(
-                (size_t)(ntt::distributed::detail::global_thread_local_data_ptr(program_ids)(
+                (size_t)(ntt::distributed::detail::global_local_data_ptr(program_ids)(
                     0_dim)));
             auto local_data_dst = reinterpret_cast<float *>(
                 nncase::ntt::runtime::thread_alloc(M * N * sizeof(float), 8));
 
             using mesh_type =
-                ntt::distributed::mesh<ntt::distributed::topology::thread,
-                                       cdims, bdims, tdims>;
+                ntt::distributed::mesh<ntt::distributed::topology::block, cdims, bdims>;
             auto sharding_src = ntt::distributed::make_sharding<mesh_type>(
                 ntt::distributed::shard_policy::S<1>(),
                 ntt::distributed::shard_policy::S<0, 2>());
@@ -1158,10 +1125,10 @@ TEST(CpuTest, reshard_2D_split_multilple_axes) {
 
     EXPECT_TRUE(NttTest::compare_tensor(ntt_input, ntt_output));
 
-    ntt::apply(ntt::distributed::detail::global_thread_local_data_ptr.shape(),
+    ntt::apply(ntt::distributed::detail::global_local_data_ptr.shape(),
                [&](auto index) {
                    thread_free(
-                       (void *)(size_t)ntt::distributed::detail::global_thread_local_data_ptr(
+                       (void *)(size_t)ntt::distributed::detail::global_local_data_ptr(
                            index)(0_dim));
                });
 }
@@ -1188,26 +1155,24 @@ TEST(CpuTest, reshard_3D_different_sharding_spec_different_split_axis) {
 
     constexpr size_t cdims = ntt::distributed::cdim();
     constexpr size_t bdims = ntt::distributed::bdim();
-    constexpr size_t tdims = ntt::distributed::tdim();
-    constexpr size_t num = cdims * bdims * tdims;
+    constexpr size_t num = cdims * bdims;
 
     ntt::apply(
-        ntt::distributed::detail::global_thread_local_data_ptr.shape(),
+        ntt::distributed::detail::global_local_data_ptr.shape(),
         [&](auto index) {
-            ntt::distributed::detail::global_thread_local_data_ptr(index)(0_dim) =
+            ntt::distributed::detail::global_local_data_ptr(index)(0_dim) =
                 (uintptr_t)(ntt::runtime::thread_alloc(M * N * K * sizeof(float),
                                                        8));
-            ntt::distributed::detail::global_thread_local_data_ptr(index)(1_dim) =
-                ntt::distributed::detail::global_thread_local_data_ptr(index)(0_dim) +
+            ntt::distributed::detail::global_local_data_ptr(index)(1_dim) =
+                ntt::distributed::detail::global_local_data_ptr(index)(0_dim) +
                 M * N * K *sizeof(float);
         });
 
     std::vector<std::thread> threads;
     for (size_t id = 0; id < num; id++) {
         threads.emplace_back([id, p_in, p_out] {
-            size_t cid = id / (bdims * tdims);
-            size_t bid = id % (bdims * tdims) / tdims;
-            size_t tid = id % (bdims * tdims) % tdims;
+            size_t cid = id / bdims;
+            size_t bid = id % bdims;
 #ifdef __APPLE__
             pthread_setspecific(cpu_thread_context_key,
                                 new cpu_thread_context_t
@@ -1215,7 +1180,6 @@ TEST(CpuTest, reshard_3D_different_sharding_spec_different_split_axis) {
             cpu_thread_context_t::current() =
 #endif
                                 {
-                                    .tid = tid,
                                     .bid = bid,
                                     .cid = cid,
                                 }
@@ -1241,7 +1205,7 @@ TEST(CpuTest, reshard_3D_different_sharding_spec_different_split_axis) {
 #endif
 
             // shard(slice)
-            constexpr size_t src_split_num = cdims * tdims;
+            constexpr size_t src_split_num = cdims;
             constexpr size_t dst_split_num = cdims * bdims;
 
             auto tv_in = ntt::make_tensor_view_from_address(
@@ -1249,16 +1213,15 @@ TEST(CpuTest, reshard_3D_different_sharding_spec_different_split_axis) {
             auto tv_out = ntt::make_tensor_view_from_address(
                 p_out, ntt::fixed_shape_v<M, N, K>);
 
-            const auto program_ids = make_shape(cid, bid, tid);
+            const auto program_ids = make_shape(cid, bid);
             float *local_data_src = reinterpret_cast<float *>(
-                (size_t)(ntt::distributed::detail::global_thread_local_data_ptr(program_ids)(
+                (size_t)(ntt::distributed::detail::global_local_data_ptr(program_ids)(
                     0_dim)));
             auto local_data_dst = reinterpret_cast<float *>(
                 nncase::ntt::runtime::thread_alloc(M * N * K * sizeof(float), 8));
 
             using mesh_type =
-                ntt::distributed::mesh<ntt::distributed::topology::thread,
-                                       cdims, bdims, tdims>;
+                ntt::distributed::mesh<ntt::distributed::topology::block, cdims, bdims>;
             auto sharding_src = ntt::distributed::make_sharding<mesh_type>(
                 ntt::distributed::shard_policy::B,
                 ntt::distributed::shard_policy::B,
@@ -1297,10 +1260,10 @@ TEST(CpuTest, reshard_3D_different_sharding_spec_different_split_axis) {
 
     EXPECT_TRUE(NttTest::compare_tensor(ntt_input, ntt_output));
 
-    ntt::apply(ntt::distributed::detail::global_thread_local_data_ptr.shape(),
+    ntt::apply(ntt::distributed::detail::global_local_data_ptr.shape(),
                [&](auto index) {
                    thread_free(
-                       (void *)(size_t)ntt::distributed::detail::global_thread_local_data_ptr(
+                       (void *)(size_t)ntt::distributed::detail::global_local_data_ptr(
                            index)(0_dim));
                });
 }
@@ -1331,14 +1294,12 @@ TEST(CpuTest, reshard_reshape) {
 
     constexpr size_t cdims = ntt::distributed::cdim();
     constexpr size_t bdims = ntt::distributed::bdim();
-    constexpr size_t tdims = ntt::distributed::tdim();
-    constexpr size_t num = cdims * bdims * tdims;
+    constexpr size_t num = cdims * bdims;
     std::vector<std::thread> threads;
     for (size_t id = 0; id < num; id++) {
         threads.emplace_back([id, p_in, p_out] {
-            size_t cid = id / (bdims * tdims);
-            size_t bid = id % (bdims * tdims) / tdims;
-            size_t tid = id % (bdims * tdims) % tdims;
+            size_t cid = id / bdims;
+            size_t bid = id % bdims;
 #ifdef __APPLE__
             pthread_setspecific(cpu_thread_context_key,
                                 new cpu_thread_context_t
@@ -1346,7 +1307,6 @@ TEST(CpuTest, reshard_reshape) {
             cpu_thread_context_t::current() =
 #endif
                                 {
-                                    .tid = tid,
                                     .bid = bid,
                                     .cid = cid,
                                 }
@@ -1370,7 +1330,7 @@ TEST(CpuTest, reshard_reshape) {
             CPU_SET(cpu_id, &cpuset);
             pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
 #endif
-            constexpr size_t split_num = bdims * tdims;
+            constexpr size_t split_num = bdims;
             auto local_data = reinterpret_cast<float *>(nncase::ntt::runtime::thread_alloc(2 * M_LHS * N_LHS * sizeof(float), 8));
             auto shape_src = fixed_shape_v<M_LHS, N_LHS>;
             auto shape_dst = fixed_shape_v<M_RHS, N_RHS, K_RHS>;
@@ -1380,8 +1340,7 @@ TEST(CpuTest, reshard_reshape) {
 
             // shard(slice)
             using mesh_type =
-                ntt::distributed::mesh<ntt::distributed::topology::thread,
-                                       cdims, bdims, tdims>;
+                ntt::distributed::mesh<ntt::distributed::topology::block, cdims, bdims>;
             auto sharding_src = ntt::distributed::make_sharding<mesh_type>(
                 ntt::distributed::shard_policy::S<1, 2>(),
                 ntt::distributed::shard_policy::B);

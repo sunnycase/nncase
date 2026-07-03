@@ -41,7 +41,6 @@ result<void> cuda_runtime_function::run(std::byte *output_data) noexcept {
                                   sizeof(cuda_block_entry_params_t)));
 
         cuda_block_entry_params_t src_params{
-            .tdim = module().tdim(),
             .bdim = module().bdim(),
             .cdim = module().cdim(),
             .cid = cid,
@@ -50,32 +49,25 @@ result<void> cuda_runtime_function::run(std::byte *output_data) noexcept {
             .output_descs = this->output_descs_.data(),
             .rdata = module().rdata(),
             .output = output_data,
-            .thread_local_rdata_header = module().thread_local_rdata_header(
-                cid * module().bdim() * module().wdim() * module().tdim()),
-            .thread_local_rdata = module().thread_local_rdata_content(),
-            .warp_local_rdata_header = module().warp_local_rdata_header(
-                cid * module().bdim() * module().wdim()),
-            .warp_local_rdata = module().warp_local_rdata_content(),
             .block_local_rdata_header =
                 module().block_local_rdata_header(cid * module().bdim()),
             .block_local_rdata = module().block_local_rdata_content(),
-            .thread_local_data = thread_local_data(cid),
-            .warp_local_data = warp_local_data(cid),
+            .data = data(cid),
             .block_local_data = block_local_data(cid),
             .profile_records = enable_profiling
-                                   ? thread_local_profile_records(cid)
+                                   ? profile_records(cid)
                                    : std::span<ntt::runtime::profile_record>{},
             .profile_record_counts =
                 enable_profiling
-                    ? thread_local_profile_record_counts(cid).data()
+                    ? profile_record_counts(cid).data()
                     : nullptr,
         };
         memcpy(params, &src_params, sizeof(cuda_block_entry_params_t));
 
         void *args[] = {&params};
         CHECK_CUDA(cudaLaunchKernel(
-            (const void *)block_entry_, dim3(module().bdim()),
-            dim3(module().wdim() * module().tdim()), args, 0, nullptr));
+            (const void *)block_entry_, dim3(module().bdim()), dim3(1), args, 0,
+            nullptr));
     }
 
     for (size_t cid = 0; cid < module().cdim(); cid++) {

@@ -84,8 +84,6 @@ public sealed class SchedFunctionResult
     public SchedFunctionResult()
     {
         Rdatas = new(ReferenceEqualityComparer.Instance);
-        ThreadLocalRdatas = new(ReferenceEqualityComparer.Instance);
-        WarpLocalRdatas = new(ReferenceEqualityComparer.Instance);
         BlockLocalRdatas = new(ReferenceEqualityComparer.Instance);
         DataUsage = 0;
         BlockLocalDataPoolSize = 0;
@@ -100,27 +98,12 @@ public sealed class SchedFunctionResult
     /// <summary>
     /// Gets the buffer allocation.
     /// </summary>
-    public Dictionary<IR.Const, ValueRange<ulong>> ThreadLocalRdatas { get; }
-
-    /// <summary>
-    /// Gets the buffer allocation.
-    /// </summary>
-    public Dictionary<IR.Const, ValueRange<ulong>> WarpLocalRdatas { get; }
-
-    /// <summary>
-    /// Gets the buffer allocation.
-    /// </summary>
     public Dictionary<IR.Const, ValueRange<ulong>> BlockLocalRdatas { get; }
 
     /// <summary>
     /// Gets or sets the data section length.
     /// </summary>
     public ulong DataUsage { get; set; }
-
-    /// <summary>
-    /// Gets or sets the warp local data section length.
-    /// </summary>
-    public ulong WarpLocalDataPoolSize { get; set; }
 
     /// <summary>
     /// Gets or sets the block local data section length.
@@ -165,7 +148,6 @@ public sealed class SchedFunctionResult
         }
 
         return EqualityComparer<Dictionary<IR.Const, ValueRange<ulong>>>.Default.Equals(Rdatas, result.Rdatas) &&
-                EqualityComparer<Dictionary<IR.Const, ValueRange<ulong>>>.Default.Equals(ThreadLocalRdatas, result.ThreadLocalRdatas) &&
                 EqualityComparer<Dictionary<IR.Const, ValueRange<ulong>>>.Default.Equals(BlockLocalRdatas, result.BlockLocalRdatas) &&
                 EqualityComparer<ulong>.Default.Equals(DataUsage, result.DataUsage) &&
                 EqualityComparer<ulong>.Default.Equals(DataAlign, result.DataAlign);
