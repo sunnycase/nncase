@@ -39,12 +39,12 @@ public class GatherNDEvaluator : IEvaluator<GatherND>, ITypeInferencer<GatherND>
 
         return new()
         {
-            [CostFactorNames.MemoryLoad] = returnType switch
+            [CostFactorNames.BlockLocalMemoryLoadBytes] = returnType switch
             {
                 TensorType t => CostUtility.GetMemoryAccess(t),
                 _ => 1,
             },
-            [CostFactorNames.MemoryStore] = returnType switch
+            [CostFactorNames.BlockLocalMemoryStoreBytes] = returnType switch
             {
                 TensorType t => CostUtility.GetMemoryAccess(t),
                 _ => 1,

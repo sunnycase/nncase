@@ -130,9 +130,9 @@ public class LayerNormEvaluator : IEvaluator<LayerNorm>, ITypeInferencer<LayerNo
             case (TensorType, TensorType):
                 return new()
                 {
-                    [CostFactorNames.MemoryLoad] = CostUtility.GetMemoryAccess(inputType),
+                    [CostFactorNames.BlockLocalMemoryLoadBytes] = CostUtility.GetMemoryAccess(inputType),
                     [CostFactorNames.CPUCycles] = CostUtility.GetCPUCycles(inputType, 1),
-                    [CostFactorNames.MemoryStore] = CostUtility.GetMemoryAccess(returnType),
+                    [CostFactorNames.BlockLocalMemoryStoreBytes] = CostUtility.GetMemoryAccess(returnType),
                 };
 
             case (DistributedType inputDistributedType, DistributedType):
@@ -143,9 +143,9 @@ public class LayerNormEvaluator : IEvaluator<LayerNorm>, ITypeInferencer<LayerNo
                 var reCompute = broadcastAxes.Select(a => inputDistributedType.Placement.Hierarchy[a]).ToArray().Aggregate(1, (acc, rep) => acc * rep);
                 return new()
                 {
-                    [CostFactorNames.MemoryLoad] = CostUtility.GetMemoryAccess(inputType) + ring,
+                    [CostFactorNames.BlockLocalMemoryLoadBytes] = CostUtility.GetMemoryAccess(inputType) + ring,
                     [CostFactorNames.CPUCycles] = CostUtility.GetCPUCycles(inputType, 1) * (UInt128)reCompute,
-                    [CostFactorNames.MemoryStore] = CostUtility.GetMemoryAccess(returnType) + ring,
+                    [CostFactorNames.BlockLocalMemoryStoreBytes] = CostUtility.GetMemoryAccess(returnType) + ring,
                 };
             default:
                 throw new NotSupportedException();

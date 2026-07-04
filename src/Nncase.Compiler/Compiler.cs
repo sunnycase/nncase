@@ -297,8 +297,9 @@ public class Compiler : ICompiler
             p.Add<Passes.Rules.Neutral.FoldConstCall>();
             p.Add<Passes.Rules.Neutral.UnpackToBitcast>();
             p.Add<Passes.Rules.Neutral.FoldGetItemTuple>();
+            p.Add<Passes.Rules.Neutral.FoldPackTranspose>();
+            p.Add<Passes.Rules.Neutral.FoldPackReshape>();
             p.Add<Passes.Rules.Neutral.FoldPackBitcast>();
-            p.Add<Passes.Rules.Neutral.FoldPackReshapeBitcast>();
         });
     }
 

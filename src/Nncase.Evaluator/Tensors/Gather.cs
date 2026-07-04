@@ -51,8 +51,8 @@ public class GatherEvaluator : IEvaluator<Gather>, ITypeInferencer<Gather>, ICos
 
         return new()
         {
-            [CostFactorNames.MemoryLoad] = CostUtility.GetMemoryAccess(retType) + CostUtility.GetMemoryAccess(indexType),
-            [CostFactorNames.MemoryStore] = CostUtility.GetMemoryAccess(retType),
+            [CostFactorNames.BlockLocalMemoryLoadBytes] = CostUtility.GetMemoryAccess(retType) + CostUtility.GetMemoryAccess(indexType),
+            [CostFactorNames.BlockLocalMemoryStoreBytes] = CostUtility.GetMemoryAccess(retType),
         };
     }
 

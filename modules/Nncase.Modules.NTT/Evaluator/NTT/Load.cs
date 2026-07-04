@@ -21,7 +21,7 @@ public sealed class LoadEvaluator : ITypeInferencer<Load>, ICostEvaluator<Load>
 
     public Cost Visit(ICostEvaluateContext context, Load target) => new Cost()
     {
-        [CostFactorNames.MemoryLoad] = CostUtility.GetMemoryAccess(context.GetArgumentType<IRType>(target, Load.Input)),
-        [CostFactorNames.MemoryStore] = CostUtility.GetMemoryAccess(context.GetArgumentType<IRType>(target, Load.Input)),
+        [CostFactorNames.BlockLocalMemoryLoadBytes] = CostUtility.GetMemoryAccess(context.GetArgumentType<IRType>(target, Load.Input)),
+        [CostFactorNames.BlockLocalMemoryStoreBytes] = CostUtility.GetMemoryAccess(context.GetArgumentType<IRType>(target, Load.Input)),
     };
 }

@@ -62,8 +62,8 @@ public class LSTMEvaluator : IEvaluator<LSTM>, ITypeInferencer<LSTM>, ICostEvalu
         var returnType = context.GetReturnType<TupleType>();
         return new()
         {
-            [CostFactorNames.MemoryLoad] = CostUtility.GetMemoryAccess(xType) + CostUtility.GetMemoryAccess(wType) + CostUtility.GetMemoryAccess(rType) + CostUtility.GetMemoryAccess(bType),
-            [CostFactorNames.MemoryStore] = returnType.Select(t => t switch
+            [CostFactorNames.BlockLocalMemoryLoadBytes] = CostUtility.GetMemoryAccess(xType) + CostUtility.GetMemoryAccess(wType) + CostUtility.GetMemoryAccess(rType) + CostUtility.GetMemoryAccess(bType),
+            [CostFactorNames.BlockLocalMemoryStoreBytes] = returnType.Select(t => t switch
             {
                 TensorType tensorType => CostUtility.GetMemoryAccess(tensorType),
                 _ => UInt128.One,

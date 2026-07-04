@@ -42,7 +42,7 @@ public class AsTensorEvaluator : IEvaluator<AsTensor>, ITypeInferencer<AsTensor>
 
         return new()
         {
-            [CostFactorNames.MemoryStore] = CostUtility.GetMemoryAccess(outputType),
+            [CostFactorNames.BlockLocalMemoryStoreBytes] = CostUtility.GetMemoryAccess(outputType),
         };
     }
 

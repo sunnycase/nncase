@@ -49,7 +49,7 @@ public sealed class CreatePagedAttentionKVCacheEvaluator : ITypeInferencer<Creat
 
         return new()
         {
-            [CostFactorNames.MemoryLoad] = CostUtility.GetMemoryAccess(num_seqs) + CostUtility.GetMemoryAccess(num_tokens) + CostUtility.GetMemoryAccess(context_lens) + CostUtility.GetMemoryAccess(seq_lens) + CostUtility.GetMemoryAccess(block_table) + CostUtility.GetMemoryAccess(slot_mapping) + CostUtility.GetMemoryAccess(num_blocks) + CostUtility.GetMemoryAccess(kv_caches),
+            [CostFactorNames.BlockLocalMemoryLoadBytes] = CostUtility.GetMemoryAccess(num_seqs) + CostUtility.GetMemoryAccess(num_tokens) + CostUtility.GetMemoryAccess(context_lens) + CostUtility.GetMemoryAccess(seq_lens) + CostUtility.GetMemoryAccess(block_table) + CostUtility.GetMemoryAccess(slot_mapping) + CostUtility.GetMemoryAccess(num_blocks) + CostUtility.GetMemoryAccess(kv_caches),
         };
     }
 

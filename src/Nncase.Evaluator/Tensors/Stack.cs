@@ -49,8 +49,8 @@ public class StackEvaluator : IEvaluator<Stack>, ITypeInferencer<Stack>, ICostEv
         var ret = context.GetReturnType<IRType>();
         return new()
         {
-            [CostFactorNames.MemoryLoad] = CostUtility.GetMemoryAccess(input),
-            [CostFactorNames.MemoryStore] = CostUtility.GetMemoryAccess(ret),
+            [CostFactorNames.BlockLocalMemoryLoadBytes] = CostUtility.GetMemoryAccess(input),
+            [CostFactorNames.BlockLocalMemoryStoreBytes] = CostUtility.GetMemoryAccess(ret),
             [CostFactorNames.CPUCycles] = CostUtility.GetCPUCycles(ret, 1),
         };
     }

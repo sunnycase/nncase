@@ -4,6 +4,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics.CodeAnalysis;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Numerics;
@@ -688,7 +689,8 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
                 || expr.Target.GetType().FullName!.Contains("VectorizedRoPE", StringComparison.Ordinal)
                 || expr.Target.GetType().FullName!.Contains("Matmul", StringComparison.InvariantCultureIgnoreCase)
                 || expr.Target is PagedAttention
-                || expr.Target is Gather)
+                || expr.Target is Gather
+                || ShouldLinkAllSupplementalBoxingSources(addedBuckets))
             {
                 bucket = callCluster.CreateCluster<DistributedSearchGraph>(SearchGraphKind.Bucket);
                 var linked = false;
@@ -744,6 +746,9 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         FilterByScheme(expr, callCluster);
         return default;
     }
+
+    private bool ShouldLinkAllSupplementalBoxingSources(IReadOnlyList<DistributedSearchGraph> inferredBuckets)
+        => inferredBuckets.Any(bucket => bucket.Vertices.Any(node => ContainsPartial(node.IRType)));
 
     /// <summary>
     /// some times we didn't use all args.
@@ -1221,6 +1226,345 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         }));
     }
 
+    private void DumpCostSummary(Stream stream, DistributedSearchGraph rootCluster, IReadOnlyDictionary<SearchableNode, bool> pickMemo, IReadOnlyDictionary<SearchableNode, CostModel.Cost> costMemo, IReadOnlyDictionary<SearchableNode, UInt128> costScoreMemo)
+    {
+        using var writer = new StreamWriter(stream);
+        var dump = BuildCostDumpContext(rootCluster, pickMemo, costMemo, costScoreMemo);
+        var topK = GetCostDumpTopK();
+        var focusTerms = GetCostDumpFocusTerms();
+
+        writer.WriteLine("# AutoDistributed Cost Pick Summary");
+        writer.WriteLine($"top_k: {topK}");
+        writer.WriteLine($"focus_terms: {string.Join(", ", focusTerms)}");
+        writer.WriteLine($"selected_score_sum: {pickMemo.Where(kv => kv.Value).Aggregate((UInt128)0, (sum, kv) => sum + GetScore(costScoreMemo, kv.Key))}");
+        var selectedAggregateCost = pickMemo.Where(kv => kv.Value).Aggregate(CostModel.Cost.Zero, (sum, kv) => sum + (costMemo.TryGetValue(kv.Key, out var cost) ? cost : CostModel.Cost.Zero));
+        writer.WriteLine($"selected_aggregate_cost: {FormatCost(selectedAggregateCost)}");
+        writer.WriteLine($"selected_aggregate_latency: {FormatLatencyBreakdown(dump.TargetCostModel, selectedAggregateCost, null)}");
+        writer.WriteLine($"root_cluster: {dump.GetGraphName(rootCluster)}");
+        writer.WriteLine();
+
+        foreach (var cluster in dump.Clusters)
+        {
+            var selectedNodes = cluster.Clusters.OfType<DistributedSearchGraph>()
+                .SelectMany(bucket => bucket.Vertices)
+                .Where(dump.IsPicked)
+                .ToArray();
+
+            writer.WriteLine($"## {dump.GetGraphName(cluster)} {cluster.Kind}");
+            if (selectedNodes.Length > 0)
+            {
+                writer.WriteLine($"selected: {string.Join(", ", selectedNodes.Select(dump.GetNodeName))}");
+            }
+
+            foreach (var bucket in cluster.Clusters.OfType<DistributedSearchGraph>())
+            {
+                DumpBucketSummary(writer, bucket, dump, topK, focusTerms);
+            }
+
+            writer.WriteLine();
+        }
+    }
+
+    private void DumpSelectedTree(Stream stream, DistributedSearchGraph rootCluster, IReadOnlyDictionary<SearchableNode, bool> pickMemo, IReadOnlyDictionary<SearchableNode, CostModel.Cost> costMemo, IReadOnlyDictionary<SearchableNode, UInt128> costScoreMemo)
+    {
+        using var writer = new StreamWriter(stream);
+        var dump = BuildCostDumpContext(rootCluster, pickMemo, costMemo, costScoreMemo);
+        var rootNode = rootCluster.Vertices.FirstOrDefault(dump.IsPicked);
+        writer.WriteLine("# AutoDistributed Selected Tree");
+        writer.WriteLine($"root_cluster: {dump.GetGraphName(rootCluster)}");
+        if (rootNode is null)
+        {
+            writer.WriteLine("root_selected: <none>");
+            return;
+        }
+
+        var active = new HashSet<SearchableNode>();
+        DumpSelectedNode(writer, rootNode, dump, active, 0);
+    }
+
+    private void DumpBucketSummary(StreamWriter writer, DistributedSearchGraph bucket, CostDumpContext dump, int topK, IReadOnlyList<string> focusTerms)
+    {
+        var bucketName = dump.GetGraphName(bucket);
+        var selected = bucket.Vertices.Where(dump.IsPicked).ToArray();
+        writer.WriteLine($"### {bucketName} {bucket.Kind}");
+        writer.WriteLine($"type: {GetOneLine(bucket.Vertices.FirstOrDefault()?.IRType.ToString() ?? string.Empty)}");
+        writer.WriteLine($"root_reachable: {dump.IsRootReachable(bucket)} selected_tree: {dump.IsSelectedDependency(bucket)}");
+        if (selected.Length > 0)
+        {
+            writer.WriteLine($"picked: {string.Join(", ", selected.Select(dump.GetNodeName))}");
+        }
+
+        var ranked = bucket.Vertices
+            .OrderBy(node => GetScore(dump.CostScoreMemo, node))
+            .ThenBy(dump.GetNodeName)
+            .ToArray();
+        var printed = new HashSet<SearchableNode>();
+        for (int i = 0; i < ranked.Length; i++)
+        {
+            var node = ranked[i];
+            if (i < topK || dump.IsPicked(node) || MatchesFocus(node, focusTerms) || ContainsPartial(node.IRType))
+            {
+                printed.Add(node);
+                DumpCandidate(writer, node, dump, indent: "  ", rank: i);
+            }
+        }
+
+        if (ranked.Length > printed.Count)
+        {
+            writer.WriteLine($"  ... {ranked.Length - printed.Count} candidates omitted");
+        }
+
+        if (dump.ConsumerEdgesByInputGraph.TryGetValue(bucket, out var consumers))
+        {
+            writer.WriteLine("  consumers:");
+            foreach (var edge in consumers
+                .OrderBy(e => dump.GetNodeName(e.Root))
+                .ThenBy(e => e.InputIndex))
+            {
+                writer.WriteLine($"    <- P{edge.InputIndex} {dump.GetNodeName(edge.Root)} {GetNodeLabel(edge.Root)} picked={dump.IsPicked(edge.Root)} score={GetScore(dump.CostScoreMemo, edge.Root)} bucket={dump.GetGraphName(dump.GetBucket(edge.Root))}");
+            }
+        }
+    }
+
+    private void DumpCandidate(StreamWriter writer, SearchableNode node, CostDumpContext dump, string indent, int rank)
+    {
+        writer.WriteLine($"{indent}[{rank}] {dump.GetNodeName(node)} picked={dump.IsPicked(node)} score={GetScore(dump.CostScoreMemo, node)} expr={GetNodeLabel(node)}");
+        writer.WriteLine($"{indent}    type: {GetOneLine(node.IRType.ToString() ?? string.Empty)}");
+        var cost = dump.CostMemo.TryGetValue(node, out var nodeCost) ? nodeCost : CostModel.Cost.Zero;
+        writer.WriteLine($"{indent}    cost: {FormatCost(cost)}");
+        writer.WriteLine($"{indent}    latency: {FormatLatencyBreakdown(dump.TargetCostModel, cost, node.IRType)}");
+        DumpCandidateInputs(writer, node, dump, indent + "    ");
+    }
+
+    private void DumpCandidateInputs(StreamWriter writer, SearchableNode node, CostDumpContext dump, string indent)
+    {
+        if (!_rootSearchGraph.TryGetOutEdges(node, out var edges))
+        {
+            return;
+        }
+
+        var orderedEdges = edges.OrderBy(e => e.InputIndex).ToArray();
+        if (orderedEdges.Length == 0)
+        {
+            return;
+        }
+
+        writer.WriteLine($"{indent}inputs:");
+        foreach (var edge in orderedEdges)
+        {
+            var selected = edge.InputGraph.Vertices.FirstOrDefault(dump.IsPicked);
+            var selectedText = selected is null
+                ? "<none>"
+                : $"{dump.GetNodeName(selected)} {GetNodeLabel(selected)} score={GetScore(dump.CostScoreMemo, selected)}";
+            var best = dump.GetBestNode(edge.InputGraph);
+            var bestText = best is null
+                ? "<none>"
+                : $"{dump.GetNodeName(best)} {GetNodeLabel(best)} score={GetScore(dump.CostScoreMemo, best)}";
+            writer.WriteLine($"{indent}  P{edge.InputIndex} -> {dump.GetGraphName(edge.InputGraph)} root_reachable={dump.IsRootReachable(edge.InputGraph)} selected_tree={dump.IsSelectedDependency(edge.InputGraph)} selected={selectedText} best={bestText}");
+        }
+    }
+
+    private void DumpSelectedNode(StreamWriter writer, SearchableNode node, CostDumpContext dump, HashSet<SearchableNode> active, int depth)
+    {
+        var indent = new string(' ', depth * 2);
+        writer.WriteLine($"{indent}{dump.GetNodeName(node)} bucket={dump.GetGraphName(dump.GetBucket(node))} score={GetScore(dump.CostScoreMemo, node)} expr={GetNodeLabel(node)}");
+        writer.WriteLine($"{indent}  type: {GetOneLine(node.IRType.ToString() ?? string.Empty)}");
+        var cost = dump.CostMemo.TryGetValue(node, out var nodeCost) ? nodeCost : CostModel.Cost.Zero;
+        writer.WriteLine($"{indent}  cost: {FormatCost(cost)}");
+        writer.WriteLine($"{indent}  latency: {FormatLatencyBreakdown(dump.TargetCostModel, cost, node.IRType)}");
+        if (!active.Add(node))
+        {
+            writer.WriteLine($"{indent}  <cycle>");
+            return;
+        }
+
+        if (_rootSearchGraph.TryGetOutEdges(node, out var edges))
+        {
+            foreach (var edge in edges.OrderBy(e => e.InputIndex))
+            {
+                var selected = edge.InputGraph.Vertices.FirstOrDefault(dump.IsPicked);
+                writer.WriteLine($"{indent}  P{edge.InputIndex} -> {dump.GetGraphName(edge.InputGraph)}");
+                if (selected is null)
+                {
+                    writer.WriteLine($"{indent}    <none>");
+                }
+                else
+                {
+                    DumpSelectedNode(writer, selected, dump, active, depth + 2);
+                }
+            }
+        }
+
+        active.Remove(node);
+    }
+
+    private CostDumpContext BuildCostDumpContext(DistributedSearchGraph rootCluster, IReadOnlyDictionary<SearchableNode, bool> pickMemo, IReadOnlyDictionary<SearchableNode, CostModel.Cost> costMemo, IReadOnlyDictionary<SearchableNode, UInt128> costScoreMemo)
+    {
+        var clusters = _rootSearchGraph.Clusters.OfType<DistributedSearchGraph>().ToArray();
+        var graphNames = new Dictionary<DistributedSearchGraph, string>();
+        var bucketByNode = new Dictionary<SearchableNode, DistributedSearchGraph>();
+        var nodeNames = _rootSearchGraph.Vertices
+            .Select((node, index) => (node, name: $"N{index}"))
+            .ToDictionary(pair => pair.node, pair => pair.name);
+
+        for (int clusterIndex = 0; clusterIndex < clusters.Length; clusterIndex++)
+        {
+            var cluster = clusters[clusterIndex];
+            var clusterName = $"C{clusterIndex}";
+            graphNames[cluster] = clusterName;
+            var buckets = cluster.Clusters.OfType<DistributedSearchGraph>().ToArray();
+            for (int bucketIndex = 0; bucketIndex < buckets.Length; bucketIndex++)
+            {
+                var bucket = buckets[bucketIndex];
+                graphNames[bucket] = $"{clusterName}.B{bucketIndex}";
+                foreach (var node in bucket.Vertices)
+                {
+                    bucketByNode[node] = bucket;
+                }
+            }
+        }
+
+        var consumerEdgesByInputGraph = _rootSearchGraph.Edges
+            .GroupBy(edge => edge.InputGraph)
+            .ToDictionary(group => group.Key, group => group.ToArray());
+        var bestNodeByBucket = graphNames.Keys
+            .Where(graph => graph.Kind is SearchGraphKind.Bucket)
+            .ToDictionary(
+                graph => graph,
+                graph => graph.Vertices
+                    .OrderBy(node => GetScore(costScoreMemo, node))
+                    .ThenBy(node => nodeNames.TryGetValue(node, out var name) ? name : string.Empty)
+                    .FirstOrDefault());
+        var rootReachableBuckets = GetDependencyBuckets(rootCluster, pickMemo: null);
+        var selectedDependencyBuckets = GetDependencyBuckets(rootCluster, pickMemo);
+        var targetCostModel = CostModel.TargetOpCostModelUtility.GetTargetCostModel(CompileOptions);
+
+        return new CostDumpContext(clusters, graphNames, nodeNames, bucketByNode, consumerEdgesByInputGraph, bestNodeByBucket, rootReachableBuckets, selectedDependencyBuckets, pickMemo, costMemo, costScoreMemo, targetCostModel);
+    }
+
+    private HashSet<DistributedSearchGraph> GetDependencyBuckets(DistributedSearchGraph rootCluster, IReadOnlyDictionary<SearchableNode, bool>? pickMemo)
+    {
+        bool IsAllowedNode(SearchableNode node) => pickMemo is null || (pickMemo.TryGetValue(node, out var picked) && picked);
+
+        var visited = new HashSet<DistributedSearchGraph>();
+        var queue = new Queue<DistributedSearchGraph>();
+        foreach (var rootBucket in rootCluster.Clusters.OfType<DistributedSearchGraph>())
+        {
+            visited.Add(rootBucket);
+            queue.Enqueue(rootBucket);
+        }
+
+        while (queue.Count > 0)
+        {
+            var bucket = queue.Dequeue();
+            foreach (var node in bucket.Vertices.Where(IsAllowedNode))
+            {
+                if (!_rootSearchGraph.TryGetOutEdges(node, out var edges))
+                {
+                    continue;
+                }
+
+                foreach (var edge in edges)
+                {
+                    if (pickMemo is not null && !edge.InputGraph.Vertices.Any(IsAllowedNode))
+                    {
+                        continue;
+                    }
+
+                    if (visited.Add(edge.InputGraph))
+                    {
+                        queue.Enqueue(edge.InputGraph);
+                    }
+                }
+            }
+        }
+
+        return visited;
+    }
+
+    private int GetCostDumpTopK()
+    {
+        if (int.TryParse(Environment.GetEnvironmentVariable("NNCASE_DUMP_AD_COST_TOPK"), out var topK))
+        {
+            return Math.Max(1, topK);
+        }
+
+        return 6;
+    }
+
+    private IReadOnlyList<string> GetCostDumpFocusTerms()
+    {
+        var text = Environment.GetEnvironmentVariable("NNCASE_DUMP_AD_COST_FILTER");
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return Array.Empty<string>();
+        }
+
+        return text.Split([';', ',', '|'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+    }
+
+    private bool MatchesFocus(SearchableNode node, IReadOnlyList<string> focusTerms)
+    {
+        if (focusTerms.Count == 0)
+        {
+            return false;
+        }
+
+        var label = $"{GetNodeLabel(node)} {node.IRType}";
+        return focusTerms.Any(term => label.Contains(term, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private bool ContainsPartial(IRType type)
+    {
+        var text = type.ToString();
+        return text?.Contains("Partial: P", StringComparison.OrdinalIgnoreCase) == true
+            || text?.Contains("SBPPartial", StringComparison.OrdinalIgnoreCase) == true;
+    }
+
+    private UInt128 GetScore(IReadOnlyDictionary<SearchableNode, UInt128> costScoreMemo, SearchableNode node)
+        => costScoreMemo.TryGetValue(node, out var score) ? score : 0;
+
+    private string FormatCost(CostModel.Cost cost)
+        => cost.Factors.Count == 0
+            ? "{}"
+            : "{ " + string.Join(", ", cost.Factors.Select(kv => $"{kv.Key}={kv.Value}")) + " }";
+
+    private string FormatLatencyBreakdown(CostModel.ITargetOpCostModel targetCostModel, CostModel.Cost cost, IRType? resultType)
+    {
+        var breakdown = CostModel.TargetOpCostModelUtility.GetCostLatencyBreakdown(targetCostModel, cost, resultType);
+        return "{" +
+            $" active_blocks={breakdown.ActiveBlockCount}," +
+            $" cpu={FormatDouble(breakdown.CPUCycles)}," +
+            $" blocklocal={FormatDouble(breakdown.BlockLocalMemoryCycles)}," +
+            $" chipglobal={FormatDouble(breakdown.ChipGlobalMemoryCycles)}," +
+            $" overlap={FormatDouble(breakdown.OverlappedCycles)}," +
+            $" block_sync={FormatDouble(breakdown.BlockSynchronizationCycles)}," +
+            $" grid_sync={FormatDouble(breakdown.GridSynchronizationCycles)}," +
+            $" comm={FormatDouble(breakdown.CommCycles)}," +
+            $" other={FormatDouble(breakdown.OtherCycles)}," +
+            $" latency={breakdown.Latency}" +
+            " }";
+    }
+
+    private string FormatDouble(double value)
+        => value.ToString("0.###", CultureInfo.InvariantCulture);
+
+    private string GetNodeLabel(SearchableNode node)
+    {
+        if (node.Expr is Op op)
+        {
+            var property = op.DisplayProperty();
+            return string.IsNullOrWhiteSpace(property)
+                ? op.GetType().FullName ?? op.GetType().Name
+                : $"{op.GetType().FullName}({property})";
+        }
+
+        return node.Expr.GetType().FullName ?? node.Expr.GetType().Name;
+    }
+
+    private string GetOneLine(string text)
+        => text.Replace("\r", " ", StringComparison.Ordinal).Replace("\n", " ", StringComparison.Ordinal);
+
     private BaseExpr SolveAndExtract(DistributedSearchGraph rootCluster)
     {
         // 0. create bool var for all node.
@@ -1243,7 +1587,7 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
                         case TensorConst { ValueType: DistributedType distributedType }:
                             cost = new CostModel.Cost()
                             {
-                                [CostModel.CostFactorNames.MemoryStore] = GetLocalTensorBytes(distributedType),
+                                [CostModel.CostFactorNames.BlockLocalMemoryStoreBytes] = GetLocalTensorBytes(distributedType),
                             };
                             break;
                         case Const or Var or If or IR.Tuple or BaseFunction or Shape or Padding or Paddings or Dimension or None or Call:
@@ -1276,7 +1620,7 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
                     }
 
                     costMemo.Add(enode, cost);
-                    costScoreMemo.Add(enode, CostModel.TargetOpCostModelUtility.GetCostLatency(targetCostModel, cost));
+                    costScoreMemo.Add(enode, CostModel.TargetOpCostModelUtility.GetCostLatency(targetCostModel, cost, enode.IRType));
 
                     var boolVar = cpmodel.NewBoolVar(string.Empty);
                     varMemo.Add(enode, boolVar);
@@ -1394,6 +1738,19 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
             Dump(stream, picks, costMemo, costScoreMemo);
         }
 
+        if (enableDump)
+        {
+            using (var stream = Diagnostics.DumpScope.Current.OpenFile("Costs/Pick.txt"))
+            {
+                DumpCostSummary(stream, rootCluster, picks, costMemo, costScoreMemo);
+            }
+
+            using (var stream = Diagnostics.DumpScope.Current.OpenFile("Costs/SelectedTree.txt"))
+            {
+                DumpSelectedTree(stream, rootCluster, picks, costMemo, costScoreMemo);
+            }
+        }
+
         if (_phase == AutoDistributedPhase.SearchConstant)
         {
             foreach (var pick in picks)
@@ -1442,6 +1799,35 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         }
 
         return hgraph;
+    }
+
+    private sealed record CostDumpContext(
+        IReadOnlyList<DistributedSearchGraph> Clusters,
+        IReadOnlyDictionary<DistributedSearchGraph, string> GraphNames,
+        IReadOnlyDictionary<SearchableNode, string> NodeNames,
+        IReadOnlyDictionary<SearchableNode, DistributedSearchGraph> BucketByNode,
+        IReadOnlyDictionary<DistributedSearchGraph, CrossEdge[]> ConsumerEdgesByInputGraph,
+        IReadOnlyDictionary<DistributedSearchGraph, SearchableNode?> BestNodeByBucket,
+        IReadOnlySet<DistributedSearchGraph> RootReachableBuckets,
+        IReadOnlySet<DistributedSearchGraph> SelectedDependencyBuckets,
+        IReadOnlyDictionary<SearchableNode, bool> PickMemo,
+        IReadOnlyDictionary<SearchableNode, CostModel.Cost> CostMemo,
+        IReadOnlyDictionary<SearchableNode, UInt128> CostScoreMemo,
+        CostModel.ITargetOpCostModel TargetCostModel)
+    {
+        public bool IsPicked(SearchableNode node) => PickMemo.TryGetValue(node, out var picked) && picked;
+
+        public string GetGraphName(DistributedSearchGraph graph) => GraphNames.TryGetValue(graph, out var name) ? name : "<unknown>";
+
+        public string GetNodeName(SearchableNode node) => NodeNames.TryGetValue(node, out var name) ? name : "<unknown>";
+
+        public DistributedSearchGraph GetBucket(SearchableNode node) => BucketByNode.TryGetValue(node, out var bucket) ? bucket : null!;
+
+        public SearchableNode? GetBestNode(DistributedSearchGraph bucket) => BestNodeByBucket.TryGetValue(bucket, out var node) ? node : null;
+
+        public bool IsRootReachable(DistributedSearchGraph bucket) => RootReachableBuckets.Contains(bucket);
+
+        public bool IsSelectedDependency(DistributedSearchGraph bucket) => SelectedDependencyBuckets.Contains(bucket);
     }
 }
 
@@ -1582,8 +1968,29 @@ internal sealed class PrintCostCallBack : CpSolverSolutionCallback
 
             _dumpWriter.WriteLine($"Solution {_count++} @ {WallTime()}:");
             _dumpWriter.WriteLine(cost.ToString());
-            _dumpWriter.WriteLine($"Latency: {CostModel.TargetOpCostModelUtility.GetCostLatency(_targetCostModel, cost)}");
+            var breakdown = CostModel.TargetOpCostModelUtility.GetCostLatencyBreakdown(_targetCostModel, cost, null);
+            _dumpWriter.WriteLine($"Latency: {breakdown.Latency}");
+            _dumpWriter.WriteLine($"LatencyBreakdown: {FormatLatencyBreakdown(breakdown)}");
             _dumpWriter.Flush();
         }
     }
+
+    private static string FormatLatencyBreakdown(CostModel.TargetCostLatencyBreakdown breakdown)
+    {
+        return "{" +
+            $" active_blocks={breakdown.ActiveBlockCount}," +
+            $" cpu={FormatDouble(breakdown.CPUCycles)}," +
+            $" blocklocal={FormatDouble(breakdown.BlockLocalMemoryCycles)}," +
+            $" chipglobal={FormatDouble(breakdown.ChipGlobalMemoryCycles)}," +
+            $" overlap={FormatDouble(breakdown.OverlappedCycles)}," +
+            $" block_sync={FormatDouble(breakdown.BlockSynchronizationCycles)}," +
+            $" grid_sync={FormatDouble(breakdown.GridSynchronizationCycles)}," +
+            $" comm={FormatDouble(breakdown.CommCycles)}," +
+            $" other={FormatDouble(breakdown.OtherCycles)}," +
+            $" latency={breakdown.Latency}" +
+            " }";
+    }
+
+    private static string FormatDouble(double value)
+        => value.ToString("0.###", CultureInfo.InvariantCulture);
 }

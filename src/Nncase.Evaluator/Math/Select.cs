@@ -49,8 +49,8 @@ public partial class SelectEvaluator : IEvaluator<Select>, ITypeInferencer<Selec
 
         return new()
         {
-            [CostFactorNames.MemoryLoad] = CostUtility.GetMemoryAccess(condition, true_value, false_value),
-            [CostFactorNames.MemoryStore] = CostUtility.GetMemoryAccess(ret),
+            [CostFactorNames.BlockLocalMemoryLoadBytes] = CostUtility.GetMemoryAccess(condition, true_value, false_value),
+            [CostFactorNames.BlockLocalMemoryStoreBytes] = CostUtility.GetMemoryAccess(ret),
             [CostFactorNames.CPUCycles] = CostUtility.GetCPUCycles(condition, CostUtility.GetCPUCyclesOfCompare()),
         };
     }

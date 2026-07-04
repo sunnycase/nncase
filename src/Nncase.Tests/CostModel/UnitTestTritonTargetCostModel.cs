@@ -20,7 +20,7 @@ public sealed class UnitTestTritonTargetCostModel : TestClassBase
         {
             MultiprocessorCount = 128,
             ClockRateGHz = 1.0,
-            GlobalMemoryBandwidthGBps = 1_000_000_000.0,
+            ChipGlobalMemoryBandwidthGBps = 1_000_000_000.0,
             Mma = new TritonDotInstructionCapability("mma", 16, 8, 16, 1.0),
             Wgmma = new TritonDotInstructionCapability("wgmma", 64, 8, 16, 1.0, isSupported: false),
         };
@@ -44,7 +44,7 @@ public sealed class UnitTestTritonTargetCostModel : TestClassBase
         {
             MultiprocessorCount = 128,
             ClockRateGHz = 1.0,
-            GlobalMemoryBandwidthGBps = 1_000_000_000.0,
+            ChipGlobalMemoryBandwidthGBps = 1_000_000_000.0,
             Mma = new TritonDotInstructionCapability("mma", 16, 8, 16, 1.0),
             Wgmma = new TritonDotInstructionCapability("wgmma", 64, 8, 16, 4.0),
         };
@@ -66,7 +66,7 @@ public sealed class UnitTestTritonTargetCostModel : TestClassBase
         {
             MultiprocessorCount = 128,
             ClockRateGHz = 1.0,
-            GlobalMemoryBandwidthGBps = 1_000_000_000.0,
+            ChipGlobalMemoryBandwidthGBps = 1_000_000_000.0,
             Mma = new TritonDotInstructionCapability("mma", 16, 8, 16, 1.0),
             Wgmma = new TritonDotInstructionCapability("wgmma", 64, 8, 16, 4.0),
         };
@@ -89,7 +89,7 @@ public sealed class UnitTestTritonTargetCostModel : TestClassBase
         {
             MultiprocessorCount = 128,
             ClockRateGHz = 1.0,
-            GlobalMemoryBandwidthGBps = 1_000_000_000.0,
+            ChipGlobalMemoryBandwidthGBps = 1_000_000_000.0,
             Mma = new TritonDotInstructionCapability("mma", 16, 8, 16, 1.0),
             Wgmma = new TritonDotInstructionCapability("wgmma", 64, 8, 16, 4.0),
         };
@@ -111,9 +111,9 @@ public sealed class UnitTestTritonTargetCostModel : TestClassBase
         var capability = TritonTargetCapability.ForComputeCapability(8, 0) with
         {
             ClockRateGHz = 1.0,
-            GlobalMemoryBandwidthGBps = 1_000_000_000.0,
-            GlobalMemoryElementsPerCyclePerCta = 128.0,
-            ElementwiseElementsPerCyclePerCta = 128.0,
+            ChipGlobalMemoryBandwidthGBps = 1_000_000_000.0,
+            ChipGlobalMemoryBytesPerCycle = 128.0,
+            ElementwiseElementsPerCyclePerBlock = 128.0,
         };
         var costModel = new TritonTargetOpCostModel(capability);
         var dtype = new VectorType(DataTypes.BFloat16, [8]);
@@ -122,9 +122,9 @@ public sealed class UnitTestTritonTargetCostModel : TestClassBase
 
         Assert.True(costModel.TryGetElementwiseCost(query, out var cost));
         Assert.Equal((UInt128)8, cost[CostFactorNames.CPUCycles]);
-        Assert.Equal((UInt128)1024, cost[CostFactorNames.MemoryLoad]);
-        Assert.Equal((UInt128)1024, cost[CostFactorNames.MemoryStore]);
-        Assert.Equal((UInt128)16, costModel.GetLatency(cost));
+        Assert.Equal((UInt128)2048, cost[CostFactorNames.BlockLocalMemoryLoadBytes]);
+        Assert.Equal((UInt128)2048, cost[CostFactorNames.BlockLocalMemoryStoreBytes]);
+        Assert.Equal((UInt128)32, costModel.GetLatency(cost));
     }
 
     [Fact]
@@ -133,8 +133,8 @@ public sealed class UnitTestTritonTargetCostModel : TestClassBase
         var capability = TritonTargetCapability.ForComputeCapability(8, 0) with
         {
             ClockRateGHz = 1.0,
-            GlobalMemoryBandwidthGBps = 1000.0,
-            GlobalMemoryElementsPerCyclePerCta = 250.0,
+            ChipGlobalMemoryBandwidthGBps = 1000.0,
+            ChipGlobalMemoryBytesPerCycle = 250.0,
         };
         CompileOptions.TargetOptions = new PyNTTTargetOptions { TritonCapability = capability };
         var costModel = new TritonTargetOpCostModel(capability);
@@ -149,10 +149,10 @@ public sealed class UnitTestTritonTargetCostModel : TestClassBase
         var cost = CompilerServices.EvaluateCost(boxing, CompileOptions);
 
         Assert.False(cost.Factors.ContainsKey(CostFactorNames.CPUCycles));
-        Assert.Equal((UInt128)607744, cost[CostFactorNames.MemoryLoad]);
-        Assert.Equal((UInt128)607744, cost[CostFactorNames.MemoryStore]);
-        Assert.False(cost.Factors.ContainsKey(CostFactorNames.Synchronization));
-        Assert.Equal((UInt128)4862, costModel.GetLatency(cost));
+        Assert.Equal((UInt128)2_430_976, cost[CostFactorNames.BlockLocalMemoryLoadBytes]);
+        Assert.Equal((UInt128)2_430_976, cost[CostFactorNames.BlockLocalMemoryStoreBytes]);
+        Assert.False(cost.Factors.ContainsKey(CostFactorNames.GridSynchronization));
+        Assert.Equal((UInt128)19_448, costModel.GetLatency(cost));
     }
 
     [Fact]
@@ -169,9 +169,9 @@ public sealed class UnitTestTritonTargetCostModel : TestClassBase
 
         var cost = CompilerServices.EvaluateCost(boxing, CompileOptions);
 
-        Assert.True(cost[CostFactorNames.MemoryLoad] > 0);
-        Assert.True(cost[CostFactorNames.MemoryStore] > 0);
-        Assert.False(cost.Factors.ContainsKey(CostFactorNames.Synchronization));
+        Assert.True(cost[CostFactorNames.BlockLocalMemoryLoadBytes] > 0);
+        Assert.True(cost[CostFactorNames.BlockLocalMemoryStoreBytes] > 0);
+        Assert.False(cost.Factors.ContainsKey(CostFactorNames.GridSynchronization));
     }
 
     [Fact]
@@ -189,9 +189,9 @@ public sealed class UnitTestTritonTargetCostModel : TestClassBase
 
         var cost = CompilerServices.EvaluateCost(boxing, CompileOptions);
 
-        Assert.True(cost[CostFactorNames.MemoryLoad] > 0);
-        Assert.True(cost[CostFactorNames.MemoryStore] > 0);
-        Assert.Equal((UInt128)1, cost[CostFactorNames.Synchronization]);
+        Assert.True(cost[CostFactorNames.BlockLocalMemoryLoadBytes] > 0);
+        Assert.True(cost[CostFactorNames.BlockLocalMemoryStoreBytes] > 0);
+        Assert.Equal((UInt128)1, cost[CostFactorNames.GridSynchronization]);
     }
 
     [Fact]
@@ -200,9 +200,9 @@ public sealed class UnitTestTritonTargetCostModel : TestClassBase
         var capability = TritonTargetCapability.ForComputeCapability(8, 0) with
         {
             ClockRateGHz = 1.0,
-            GlobalMemoryBandwidthGBps = 1_000_000_000.0,
-            GlobalMemoryElementsPerCyclePerCta = 1_000_000.0,
-            SimtFmaPerCyclePerCta = 64.0,
+            ChipGlobalMemoryBandwidthGBps = 1_000_000_000.0,
+            ChipGlobalMemoryBytesPerCycle = 1_000_000.0,
+            SimtFmaPerCyclePerBlock = 64.0,
             Mma = new TritonDotInstructionCapability("mma", 16, 8, 16, 1.0),
             Wgmma = new TritonDotInstructionCapability("wgmma", 64, 8, 16, 1.0, isSupported: false),
         };
@@ -234,9 +234,9 @@ public sealed class UnitTestTritonTargetCostModel : TestClassBase
         var capability = TritonTargetCapability.ForComputeCapability(8, 0) with
         {
             ClockRateGHz = 1.0,
-            GlobalMemoryBandwidthGBps = 1_000_000_000.0,
-            GlobalMemoryElementsPerCyclePerCta = 1_000_000.0,
-            SimtFmaPerCyclePerCta = 64.0,
+            ChipGlobalMemoryBandwidthGBps = 1_000_000_000.0,
+            ChipGlobalMemoryBytesPerCycle = 1_000_000.0,
+            SimtFmaPerCyclePerBlock = 64.0,
             Mma = new TritonDotInstructionCapability("mma", 16, 8, 16, 1.0),
             Wgmma = new TritonDotInstructionCapability("wgmma", 64, 8, 16, 1.0, isSupported: false),
         };
@@ -268,63 +268,84 @@ public sealed class UnitTestTritonTargetCostModel : TestClassBase
 
         var costModel = Assert.IsType<TritonTargetOpCostModel>(options.TargetCostModel);
         Assert.Equal(TritonTargetCapability.Default, costModel.Capability);
-        Assert.Equal(2200.0, costModel.Capability.SynchronizationCyclesPerEvent);
+        Assert.Equal(2200.0, costModel.Capability.GridSynchronizationCyclesPerEvent);
     }
 
     [Fact]
     public void TestParseTritonCapability()
     {
-        var capability = TritonTargetCapability.Parse("cc=90,num_sms=120,clock_ghz=2.0,mem_bw_gbps=2500,memory_epc=256,sync_us=2,mma=16x8x16,mma_ipc=2,wgmma=64x16x16,wgmma_ipc=8");
+        var capability = TritonTargetCapability.Parse("cc=90,num_sms=120,clock_ghz=2.0,mem_bw_gbps=2500,memory_bpc=256,block_memory_bpc=512,block_sync_cycles=32,sync_us=2,mma=16x8x16,mma_ipc=2,wgmma=64x16x16,wgmma_ipc=8");
 
         Assert.Equal(9, capability.ComputeCapabilityMajor);
         Assert.Equal(0, capability.ComputeCapabilityMinor);
         Assert.Equal(120, capability.MultiprocessorCount);
         Assert.Equal(2.0, capability.ClockRateGHz);
-        Assert.Equal(2500.0, capability.GlobalMemoryBandwidthGBps);
-        Assert.Equal(256.0, capability.GlobalMemoryElementsPerCyclePerCta);
-        Assert.Equal(4000.0, capability.SynchronizationCyclesPerEvent);
-        Assert.Equal(2.0, capability.SynchronizationLatencyUs);
+        Assert.Equal(2500.0, capability.ChipGlobalMemoryBandwidthGBps);
+        Assert.Equal(256.0, capability.ChipGlobalMemoryBytesPerCycle);
+        Assert.Equal(512.0, capability.BlockLocalMemoryBytesPerCyclePerBlock);
+        Assert.Equal(32.0, capability.BlockSynchronizationCyclesPerEvent);
+        Assert.Equal(4000.0, capability.GridSynchronizationCyclesPerEvent);
+        Assert.Equal(2.0, capability.GridSynchronizationLatencyUs);
         Assert.Equal(16, capability.Mma.M);
         Assert.Equal(8, capability.Mma.N);
         Assert.Equal(16, capability.Mma.K);
-        Assert.Equal(2.0, capability.Mma.InstructionsPerCyclePerCta);
+        Assert.Equal(2.0, capability.Mma.InstructionsPerCyclePerBlock);
         Assert.Equal(64, capability.Wgmma.M);
         Assert.Equal(16, capability.Wgmma.N);
         Assert.Equal(16, capability.Wgmma.K);
-        Assert.Equal(8.0, capability.Wgmma.InstructionsPerCyclePerCta);
+        Assert.Equal(8.0, capability.Wgmma.InstructionsPerCyclePerBlock);
         Assert.True(capability.Wgmma.IsSupported);
     }
 
     [Fact]
-    public void TestLatencyCanDeriveMemoryElementsPerCycle()
+    public void TestLatencyCanDeriveChipGlobalMemoryBytesPerCycle()
     {
-        var capability = TritonTargetCapability.Parse("cc=80,clock_ghz=2.0,mem_bw_gbps=1000,memory_epc=0,memory_element_bytes=4,memory_efficiency=0.5");
+        var capability = TritonTargetCapability.Parse("cc=80,clock_ghz=2.0,mem_bw_gbps=1000,memory_bpc=0,memory_efficiency=0.5");
         var costModel = new TritonTargetOpCostModel(capability);
         var cost = new Cost
         {
             Factors =
             {
                 [CostFactorNames.CPUCycles] = (UInt128)1,
-                [CostFactorNames.MemoryLoad] = (UInt128)125,
+                [CostFactorNames.ChipGlobalMemoryLoadBytes] = (UInt128)500,
             },
         };
 
-        Assert.Equal(0.0, capability.GlobalMemoryElementsPerCyclePerCta);
-        Assert.Equal(62.5, capability.EffectiveGlobalMemoryElementsPerCyclePerCta, precision: 1);
+        Assert.Equal(0.0, capability.ChipGlobalMemoryBytesPerCycle);
+        Assert.Equal(250.0, capability.EffectiveChipGlobalMemoryBytesPerCycle, precision: 1);
         Assert.Equal((UInt128)2, costModel.GetLatency(cost));
+    }
+
+    [Fact]
+    public void TestHierarchyLatencyAggregatesChipGlobalBytesAcrossActiveBlocks()
+    {
+        var capability = TritonTargetCapability.Parse("cc=80,clock_ghz=1.0,memory_bpc=100");
+        var costModel = new TritonTargetOpCostModel(capability);
+        var cost = new Cost
+        {
+            Factors =
+            {
+                [CostFactorNames.BlockLocalMemoryLoadBytes] = (UInt128)100,
+            },
+        };
+        var placement = new Placement([4, 8], "y,x", "bb");
+        var distributedType = new DistributedType(new TensorType(DataTypes.Float32, new RankedShape(1)), [SBP.B], placement);
+
+        Assert.Equal((UInt128)1, costModel.GetLatency(cost));
+        Assert.Equal((UInt128)32, TargetOpCostModelUtility.GetCostLatency(costModel, cost, distributedType));
     }
 
     [Fact]
     public void TestLatencyConvertsSynchronizationEventsWithTritonCapability()
     {
-        var capability = TritonTargetCapability.Parse("cc=80,clock_ghz=1.0,memory_epc=1024,sync_us=1.5");
+        var capability = TritonTargetCapability.Parse("cc=80,clock_ghz=1.0,memory_bpc=1024,sync_us=1.5");
         var costModel = new TritonTargetOpCostModel(capability);
         var cost = new Cost
         {
             Factors =
             {
                 [CostFactorNames.CPUCycles] = (UInt128)10,
-                [CostFactorNames.Synchronization] = (UInt128)2,
+                [CostFactorNames.GridSynchronization] = (UInt128)2,
             },
         };
 

@@ -39,10 +39,10 @@ public sealed class PagedAttentionEvaluator : ITypeInferencer<PagedAttention>, I
         return new()
         {
             // todo kv cache
-            [CostFactorNames.MemoryLoad] = CostUtility.GetMemoryAccess(qType),
+            [CostFactorNames.BlockLocalMemoryLoadBytes] = CostUtility.GetMemoryAccess(qType),
 
             // todo [CostFactorNames.CPUCycles].
-            [CostFactorNames.MemoryStore] = CostUtility.GetMemoryAccess(returnType),
+            [CostFactorNames.BlockLocalMemoryStoreBytes] = CostUtility.GetMemoryAccess(returnType),
         };
     }
 

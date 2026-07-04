@@ -32,8 +32,8 @@ public sealed class UpdatePagedAttentionKVCacheEvaluator : ITypeInferencer<Updat
         var slotsType = context.GetArgumentType<IRType>(target, UpdatePagedAttentionKVCache.Slots);
         return new()
         {
-            [CostFactorNames.MemoryLoad] = CostUtility.GetMemoryAccess(slotsType),
-            [CostFactorNames.MemoryStore] = CostUtility.GetMemoryAccess(slotsType),
+            [CostFactorNames.BlockLocalMemoryLoadBytes] = CostUtility.GetMemoryAccess(slotsType),
+            [CostFactorNames.BlockLocalMemoryStoreBytes] = CostUtility.GetMemoryAccess(slotsType),
         };
     }
 

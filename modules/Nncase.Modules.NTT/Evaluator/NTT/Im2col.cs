@@ -27,8 +27,8 @@ public sealed class Im2colEvaluator : ITypeInferencer<Im2col>, ICostEvaluator<Im
 
     public Cost Visit(ICostEvaluateContext context, Im2col target) => new Cost()
     {
-        [CostFactorNames.MemoryLoad] = CostUtility.GetMemoryAccess(context.GetArgumentType<IRType>(target, Im2col.Input)),
-        [CostFactorNames.MemoryStore] = CostUtility.GetMemoryAccess(context.GetArgumentType<IRType>(target, Im2col.Input)),
+        [CostFactorNames.BlockLocalMemoryLoadBytes] = CostUtility.GetMemoryAccess(context.GetArgumentType<IRType>(target, Im2col.Input)),
+        [CostFactorNames.BlockLocalMemoryStoreBytes] = CostUtility.GetMemoryAccess(context.GetArgumentType<IRType>(target, Im2col.Input)),
     };
 
     public IValue Visit(IEvaluateContext context, Im2col target)

@@ -91,9 +91,9 @@ public class VectorizedRoPEEvaluator : IEvaluator<VectorizedRoPE>, ITypeInferenc
         var macPerElement = 4; // 2 for mul, 1 for add, 1 for neg and concat
         return new()
         {
-            [CostFactorNames.MemoryLoad] = CostUtility.GetMemoryAccess(inputType) + CostUtility.GetMemoryAccess(cosType) + CostUtility.GetMemoryAccess(sinType),
+            [CostFactorNames.BlockLocalMemoryLoadBytes] = CostUtility.GetMemoryAccess(inputType) + CostUtility.GetMemoryAccess(cosType) + CostUtility.GetMemoryAccess(sinType),
             [CostFactorNames.CPUCycles] = CostUtility.GetCPUCycles(inputType, macPerElement),
-            [CostFactorNames.MemoryStore] = CostUtility.GetMemoryAccess(returnType),
+            [CostFactorNames.BlockLocalMemoryStoreBytes] = CostUtility.GetMemoryAccess(returnType),
         };
     }
 

@@ -22,9 +22,9 @@ public partial class CeluEvaluator : IEvaluator<Celu>, ITypeInferencer<Celu>, IC
         var outputType = context.GetReturnType<TensorType>();
         return new()
         {
-            [CostFactorNames.MemoryLoad] = CostUtility.GetMemoryAccess(outputType),
+            [CostFactorNames.BlockLocalMemoryLoadBytes] = CostUtility.GetMemoryAccess(outputType),
             [CostFactorNames.CPUCycles] = CostUtility.GetCPUCycles(outputType),
-            [CostFactorNames.MemoryStore] = CostUtility.GetMemoryAccess(outputType),
+            [CostFactorNames.BlockLocalMemoryStoreBytes] = CostUtility.GetMemoryAccess(outputType),
         };
     }
 
@@ -70,9 +70,9 @@ public partial class EluEvaluator : IEvaluator<Elu>, ITypeInferencer<Elu>, ICost
         var outputType = context.GetReturnType<TensorType>();
         return new()
         {
-            [CostFactorNames.MemoryLoad] = CostUtility.GetMemoryAccess(outputType),
+            [CostFactorNames.BlockLocalMemoryLoadBytes] = CostUtility.GetMemoryAccess(outputType),
             [CostFactorNames.CPUCycles] = CostUtility.GetCPUCycles(outputType),
-            [CostFactorNames.MemoryStore] = CostUtility.GetMemoryAccess(outputType),
+            [CostFactorNames.BlockLocalMemoryStoreBytes] = CostUtility.GetMemoryAccess(outputType),
         };
     }
 
@@ -123,9 +123,9 @@ public class HardSwishEvaluator : IEvaluator<HardSwish>, ITypeInferencer<HardSwi
         var outputType = context.GetReturnType<TensorType>();
         return new()
         {
-            [CostFactorNames.MemoryLoad] = CostUtility.GetMemoryAccess(outputType),
+            [CostFactorNames.BlockLocalMemoryLoadBytes] = CostUtility.GetMemoryAccess(outputType),
             [CostFactorNames.CPUCycles] = CostUtility.GetCPUCycles(outputType),
-            [CostFactorNames.MemoryStore] = CostUtility.GetMemoryAccess(outputType),
+            [CostFactorNames.BlockLocalMemoryStoreBytes] = CostUtility.GetMemoryAccess(outputType),
         };
     }
 
@@ -170,9 +170,9 @@ public class LeakyReluEvaluator : IEvaluator<LeakyRelu>, ITypeInferencer<LeakyRe
         var outputType = context.GetReturnType<TensorType>();
         return new()
         {
-            [CostFactorNames.MemoryLoad] = CostUtility.GetMemoryAccess(outputType),
+            [CostFactorNames.BlockLocalMemoryLoadBytes] = CostUtility.GetMemoryAccess(outputType),
             [CostFactorNames.CPUCycles] = CostUtility.GetCPUCycles(outputType),
-            [CostFactorNames.MemoryStore] = CostUtility.GetMemoryAccess(outputType),
+            [CostFactorNames.BlockLocalMemoryStoreBytes] = CostUtility.GetMemoryAccess(outputType),
         };
     }
 
@@ -301,9 +301,9 @@ public class SeluEvaluator : IEvaluator<Selu>, ITypeInferencer<Selu>, ICostEvalu
         var outputType = context.GetReturnType<TensorType>();
         return new()
         {
-            [CostFactorNames.MemoryLoad] = CostUtility.GetMemoryAccess(outputType),
+            [CostFactorNames.BlockLocalMemoryLoadBytes] = CostUtility.GetMemoryAccess(outputType),
             [CostFactorNames.CPUCycles] = CostUtility.GetCPUCycles(outputType),
-            [CostFactorNames.MemoryStore] = CostUtility.GetMemoryAccess(outputType),
+            [CostFactorNames.BlockLocalMemoryStoreBytes] = CostUtility.GetMemoryAccess(outputType),
         };
     }
 
@@ -401,9 +401,9 @@ public class HardSigmoidEvaluator : IEvaluator<HardSigmoid>, ITypeInferencer<Har
         var outputType = context.GetReturnType<TensorType>();
         return new()
         {
-            [CostFactorNames.MemoryLoad] = CostUtility.GetMemoryAccess(outputType),
+            [CostFactorNames.BlockLocalMemoryLoadBytes] = CostUtility.GetMemoryAccess(outputType),
             [CostFactorNames.CPUCycles] = CostUtility.GetCPUCycles(outputType),
-            [CostFactorNames.MemoryStore] = CostUtility.GetMemoryAccess(outputType),
+            [CostFactorNames.BlockLocalMemoryStoreBytes] = CostUtility.GetMemoryAccess(outputType),
         };
     }
 
@@ -449,9 +449,9 @@ public class PReluEvaluator : IEvaluator<PRelu>, ITypeInferencer<PRelu>, ICostEv
         var outputType = context.GetReturnType<TensorType>();
         return new()
         {
-            [CostFactorNames.MemoryLoad] = CostUtility.GetMemoryAccess(outputType),
+            [CostFactorNames.BlockLocalMemoryLoadBytes] = CostUtility.GetMemoryAccess(outputType),
             [CostFactorNames.CPUCycles] = CostUtility.GetCPUCycles(outputType),
-            [CostFactorNames.MemoryStore] = CostUtility.GetMemoryAccess(outputType),
+            [CostFactorNames.BlockLocalMemoryStoreBytes] = CostUtility.GetMemoryAccess(outputType),
         };
     }
 
@@ -496,9 +496,9 @@ public class ErfEvaluator : IEvaluator<Erf>, ITypeInferencer<Erf>, ICostEvaluato
         var outputType = context.GetReturnType<IRType>();
         return new()
         {
-            [CostFactorNames.MemoryLoad] = CostUtility.GetMemoryAccess(outputType),
+            [CostFactorNames.BlockLocalMemoryLoadBytes] = CostUtility.GetMemoryAccess(outputType),
             [CostFactorNames.CPUCycles] = CostUtility.GetCPUCycles(outputType),
-            [CostFactorNames.MemoryStore] = CostUtility.GetMemoryAccess(outputType),
+            [CostFactorNames.BlockLocalMemoryStoreBytes] = CostUtility.GetMemoryAccess(outputType),
         };
     }
 
@@ -560,9 +560,9 @@ public class SwishEvaluator : IEvaluator<Swish>, ITypeInferencer<Swish>, ICostEv
         var macPerElement = 256;
         return new()
         {
-            [CostFactorNames.MemoryLoad] = CostUtility.GetMemoryAccess(outputType),
+            [CostFactorNames.BlockLocalMemoryLoadBytes] = CostUtility.GetMemoryAccess(outputType),
             [CostFactorNames.CPUCycles] = CostUtility.GetCPUCycles(outputType, macPerElement),
-            [CostFactorNames.MemoryStore] = CostUtility.GetMemoryAccess(outputType),
+            [CostFactorNames.BlockLocalMemoryStoreBytes] = CostUtility.GetMemoryAccess(outputType),
         };
     }
 
@@ -615,9 +615,9 @@ public class GeluEvaluator : IEvaluator<Gelu>, ITypeInferencer<Gelu>, ICostEvalu
         var outputType = context.GetReturnType<IRType>();
         return new()
         {
-            [CostFactorNames.MemoryLoad] = CostUtility.GetMemoryAccess(outputType),
+            [CostFactorNames.BlockLocalMemoryLoadBytes] = CostUtility.GetMemoryAccess(outputType),
             [CostFactorNames.CPUCycles] = CostUtility.GetCPUCycles(outputType, (CostUtility.GetCPUCyclesOfBinary(BinaryOp.Mul) * 3) + (CostUtility.GetCPUCyclesOfBinary(BinaryOp.Div) * 2) + CostUtility.GetCPUCyclesOfBinary(BinaryOp.Add)),
-            [CostFactorNames.MemoryStore] = CostUtility.GetMemoryAccess(outputType),
+            [CostFactorNames.BlockLocalMemoryStoreBytes] = CostUtility.GetMemoryAccess(outputType),
         };
     }
 

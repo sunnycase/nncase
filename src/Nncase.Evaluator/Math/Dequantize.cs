@@ -39,8 +39,8 @@ public class DequantizeEvaluator : IEvaluator<Dequantize>, ITypeInferencer<Dequa
 
         return new()
         {
-            [CostFactorNames.MemoryLoad] = CostUtility.GetMemoryAccess(inputType),
-            [CostFactorNames.MemoryStore] = CostUtility.GetMemoryAccess(outputType),
+            [CostFactorNames.BlockLocalMemoryLoadBytes] = CostUtility.GetMemoryAccess(inputType),
+            [CostFactorNames.BlockLocalMemoryStoreBytes] = CostUtility.GetMemoryAccess(outputType),
             [CostFactorNames.CPUCycles] = CostUtility.GetCPUCycles(outputType, 2),
         };
     }

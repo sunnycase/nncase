@@ -51,8 +51,8 @@ public class ClampEvaluator : IEvaluator<Clamp>, ITypeInferencer<Clamp>, ICostEv
 
         return new()
         {
-            [CostFactorNames.MemoryLoad] = CostUtility.GetMemoryAccess(inputType) + CostUtility.GetMemoryAccess(minType) + CostUtility.GetMemoryAccess(maxType),
-            [CostFactorNames.MemoryStore] = CostUtility.GetMemoryAccess(outputType),
+            [CostFactorNames.BlockLocalMemoryLoadBytes] = CostUtility.GetMemoryAccess(inputType) + CostUtility.GetMemoryAccess(minType) + CostUtility.GetMemoryAccess(maxType),
+            [CostFactorNames.BlockLocalMemoryStoreBytes] = CostUtility.GetMemoryAccess(outputType),
             [CostFactorNames.CPUCycles] = CostUtility.GetCPUCycles(outputType, 2),
         };
     }

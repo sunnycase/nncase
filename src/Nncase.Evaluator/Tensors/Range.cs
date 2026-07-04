@@ -73,8 +73,8 @@ public class RangeEvaluator : IEvaluator<Range>, ITypeInferencer<Range>, ICostEv
         var ret = context.GetReturnType<TensorType>();
         return new()
         {
-            [CostFactorNames.MemoryLoad] = 0,
-            [CostFactorNames.MemoryStore] = CostUtility.GetMemoryAccess(ret),
+            [CostFactorNames.BlockLocalMemoryLoadBytes] = 0,
+            [CostFactorNames.BlockLocalMemoryStoreBytes] = CostUtility.GetMemoryAccess(ret),
             [CostFactorNames.CPUCycles] = CostUtility.GetCPUCycles(ret),
         };
     }

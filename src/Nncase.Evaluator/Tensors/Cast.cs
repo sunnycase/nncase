@@ -55,8 +55,8 @@ public class CastEvaluator : IEvaluator<Cast>, ITypeInferencer<Cast>, IOpPrinter
 
         return new()
         {
-            [CostFactorNames.MemoryLoad] = CostUtility.GetMemoryAccess(input),
-            [CostFactorNames.MemoryStore] = CostUtility.GetMemoryAccess(output),
+            [CostFactorNames.BlockLocalMemoryLoadBytes] = CostUtility.GetMemoryAccess(input),
+            [CostFactorNames.BlockLocalMemoryStoreBytes] = CostUtility.GetMemoryAccess(output),
             [CostFactorNames.CPUCycles] = CostUtility.GetCPUCycles(output, 1),
         };
     }

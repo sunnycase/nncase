@@ -77,9 +77,9 @@ public sealed class VectorizedLayerNormEvaluator : IEvaluator<VectorizedLayerNor
             case (TensorType, TensorType):
                 return new()
                 {
-                    [CostFactorNames.MemoryLoad] = CostUtility.GetMemoryAccess(inputType),
+                    [CostFactorNames.BlockLocalMemoryLoadBytes] = CostUtility.GetMemoryAccess(inputType),
                     [CostFactorNames.CPUCycles] = CostUtility.GetCPUCycles(inputType, 1),
-                    [CostFactorNames.MemoryStore] = CostUtility.GetMemoryAccess(returnType),
+                    [CostFactorNames.BlockLocalMemoryStoreBytes] = CostUtility.GetMemoryAccess(returnType),
                 };
 
             case (DistributedType, DistributedType):
@@ -87,9 +87,9 @@ public sealed class VectorizedLayerNormEvaluator : IEvaluator<VectorizedLayerNor
                 // var reCompute = inputDistributedType.NdSBP.Select((sbp, i) => sbp is SBPSplit ? 1 : inputDistributedType.Placement.Hierarchy[i]).ToArray().Aggregate(1, (acc, rep) => acc * rep);
                 return new()
                 {
-                    [CostFactorNames.MemoryLoad] = CostUtility.GetMemoryAccess(inputType) + CostUtility.GetMemoryAccess(scale) + CostUtility.GetMemoryAccess(bias),
+                    [CostFactorNames.BlockLocalMemoryLoadBytes] = CostUtility.GetMemoryAccess(inputType) + CostUtility.GetMemoryAccess(scale) + CostUtility.GetMemoryAccess(bias),
                     [CostFactorNames.CPUCycles] = CostUtility.GetCPUCycles(inputType, 64),
-                    [CostFactorNames.MemoryStore] = CostUtility.GetMemoryAccess(returnType),
+                    [CostFactorNames.BlockLocalMemoryStoreBytes] = CostUtility.GetMemoryAccess(returnType),
                 };
             default:
                 throw new NotSupportedException();

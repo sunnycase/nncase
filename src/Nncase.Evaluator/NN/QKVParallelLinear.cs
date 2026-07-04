@@ -89,12 +89,12 @@ public sealed class QKVParallelLinearEvaluator : IEvaluator<QKVParallelLinear>, 
         var macPerElement = GetK(input);
         return new()
         {
-            [CostFactorNames.MemoryLoad] = CostUtility.GetMemoryAccess(input)
+            [CostFactorNames.BlockLocalMemoryLoadBytes] = CostUtility.GetMemoryAccess(input)
                 + CostUtility.GetMemoryAccess(qWeight) + CostUtility.GetMemoryAccess(kWeight) + CostUtility.GetMemoryAccess(vWeight)
                 + CostUtility.GetMemoryAccess(qBias) + CostUtility.GetMemoryAccess(kBias) + CostUtility.GetMemoryAccess(vBias)
                 + CostUtility.GetMemoryAccess(qInputScale) + CostUtility.GetMemoryAccess(kInputScale) + CostUtility.GetMemoryAccess(vInputScale)
                 + CostUtility.GetMemoryAccess(qWeightScale) + CostUtility.GetMemoryAccess(kWeightScale) + CostUtility.GetMemoryAccess(vWeightScale),
-            [CostFactorNames.MemoryStore] = output.Fields.Aggregate((UInt128)0, (sum, type) => sum + CostUtility.GetMemoryAccess(type)),
+            [CostFactorNames.BlockLocalMemoryStoreBytes] = output.Fields.Aggregate((UInt128)0, (sum, type) => sum + CostUtility.GetMemoryAccess(type)),
             [CostFactorNames.CPUCycles] = output.Fields.Aggregate((UInt128)0, (sum, type) => sum + CostUtility.GetCPUCycles(type, macPerElement)),
         };
     }

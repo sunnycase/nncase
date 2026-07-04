@@ -121,8 +121,8 @@ public sealed class PackedMatMulEvaluator : IEvaluator<PackedMatMul>, ITypeInfer
 
         var cost = new Cost()
         {
-            [CostFactorNames.MemoryLoad] = CostUtility.GetMemoryAccess(lhs) + CostUtility.GetMemoryAccess(rhs),
-            [CostFactorNames.MemoryStore] = CostUtility.GetMemoryAccess(outputType),
+            [CostFactorNames.BlockLocalMemoryLoadBytes] = CostUtility.GetMemoryAccess(lhs) + CostUtility.GetMemoryAccess(rhs),
+            [CostFactorNames.BlockLocalMemoryStoreBytes] = CostUtility.GetMemoryAccess(outputType),
             [CostFactorNames.CPUCycles] = CostUtility.GetCPUCycles(outputType, macPerElement),
         };
 
@@ -167,10 +167,10 @@ public sealed class PackedMatMulEvaluator : IEvaluator<PackedMatMul>, ITypeInfer
             return cost;
         }
 
-        AddCostFactor(cost, CostFactorNames.MemoryLoad, CostUtility.GetMemoryAccess(outputType) * 2);
-        AddCostFactor(cost, CostFactorNames.MemoryStore, CostUtility.GetMemoryAccess(outputType));
+        AddCostFactor(cost, CostFactorNames.ChipGlobalMemoryLoadBytes, CostUtility.GetMemoryAccess(outputType) * 2);
+        AddCostFactor(cost, CostFactorNames.ChipGlobalMemoryStoreBytes, CostUtility.GetMemoryAccess(outputType));
         AddCostFactor(cost, CostFactorNames.CPUCycles, CostUtility.GetCPUCycles(outputType, 1));
-        AddCostFactor(cost, CostFactorNames.Synchronization, (UInt128)3);
+        AddCostFactor(cost, CostFactorNames.GridSynchronization, (UInt128)3);
         return cost;
     }
 

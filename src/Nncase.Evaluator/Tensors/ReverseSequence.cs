@@ -37,8 +37,8 @@ public class ReverseSequenceEvaluator : IEvaluator<ReverseSequence>, ITypeInfere
         var returnType = context.GetReturnType<TensorType>();
         return new()
         {
-            [CostFactorNames.MemoryLoad] = CostUtility.GetMemoryAccess(inputType),
-            [CostFactorNames.MemoryStore] = CostUtility.GetMemoryAccess(returnType),
+            [CostFactorNames.BlockLocalMemoryLoadBytes] = CostUtility.GetMemoryAccess(inputType),
+            [CostFactorNames.BlockLocalMemoryStoreBytes] = CostUtility.GetMemoryAccess(returnType),
         };
     }
 

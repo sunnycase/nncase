@@ -54,8 +54,8 @@ public class L2NormalizationEvaluator : IEvaluator<L2Normalization>, ITypeInfere
         var returnType = context.GetReturnType<TensorType>();
         return new()
         {
-            [CostFactorNames.MemoryLoad] = CostUtility.GetMemoryAccess(inputType),
-            [CostFactorNames.MemoryStore] = CostUtility.GetMemoryAccess(returnType),
+            [CostFactorNames.BlockLocalMemoryLoadBytes] = CostUtility.GetMemoryAccess(inputType),
+            [CostFactorNames.BlockLocalMemoryStoreBytes] = CostUtility.GetMemoryAccess(returnType),
         };
     }
 
@@ -113,8 +113,8 @@ public class BatchNormalizationEvaluator : IEvaluator<BatchNormalization>, IType
         var returnType = context.GetReturnType<TensorType>();
         return new()
         {
-            [CostFactorNames.MemoryLoad] = CostUtility.GetMemoryAccess(inputType),
-            [CostFactorNames.MemoryStore] = CostUtility.GetMemoryAccess(returnType),
+            [CostFactorNames.BlockLocalMemoryLoadBytes] = CostUtility.GetMemoryAccess(inputType),
+            [CostFactorNames.BlockLocalMemoryStoreBytes] = CostUtility.GetMemoryAccess(returnType),
         };
     }
 
@@ -171,8 +171,8 @@ public class InstanceNormalizationEvaluator : IEvaluator<InstanceNormalization>,
         var returnType = context.GetReturnType<IRType>();
         return new()
         {
-            [CostFactorNames.MemoryLoad] = CostUtility.GetMemoryAccess(inputType),
-            [CostFactorNames.MemoryStore] = CostUtility.GetMemoryAccess(returnType),
+            [CostFactorNames.BlockLocalMemoryLoadBytes] = CostUtility.GetMemoryAccess(inputType),
+            [CostFactorNames.BlockLocalMemoryStoreBytes] = CostUtility.GetMemoryAccess(returnType),
         };
     }
 
@@ -256,8 +256,8 @@ public class LpNormalizationEvaluator : IEvaluator<LpNormalization>, ITypeInfere
         var returnType = context.GetReturnType<TensorType>();
         return new()
         {
-            [CostFactorNames.MemoryLoad] = CostUtility.GetMemoryAccess(inputType),
-            [CostFactorNames.MemoryStore] = CostUtility.GetMemoryAccess(returnType),
+            [CostFactorNames.BlockLocalMemoryLoadBytes] = CostUtility.GetMemoryAccess(inputType),
+            [CostFactorNames.BlockLocalMemoryStoreBytes] = CostUtility.GetMemoryAccess(returnType),
         };
     }
 
@@ -307,8 +307,8 @@ public class LRNEvaluator : IEvaluator<LRN>, ITypeInferencer<LRN>, ICostEvaluato
         var returnType = context.GetReturnType<TensorType>();
         return new()
         {
-            [CostFactorNames.MemoryLoad] = CostUtility.GetMemoryAccess(inputType),
-            [CostFactorNames.MemoryStore] = CostUtility.GetMemoryAccess(returnType),
+            [CostFactorNames.BlockLocalMemoryLoadBytes] = CostUtility.GetMemoryAccess(inputType),
+            [CostFactorNames.BlockLocalMemoryStoreBytes] = CostUtility.GetMemoryAccess(returnType),
         };
     }
 

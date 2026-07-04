@@ -105,12 +105,12 @@ public sealed class MatMulGluEvaluator : IEvaluator<MatMulGlu>, ITypeInferencer<
         var macPerElement = GetK(input);
         return new()
         {
-            [CostFactorNames.MemoryLoad] = CostUtility.GetMemoryAccess(input)
+            [CostFactorNames.BlockLocalMemoryLoadBytes] = CostUtility.GetMemoryAccess(input)
                 + CostUtility.GetMemoryAccess(gateWeight) + CostUtility.GetMemoryAccess(upWeight)
                 + CostUtility.GetMemoryAccess(gateBias) + CostUtility.GetMemoryAccess(upBias)
                 + CostUtility.GetMemoryAccess(gateInputScale) + CostUtility.GetMemoryAccess(upInputScale)
                 + CostUtility.GetMemoryAccess(gateWeightScale) + CostUtility.GetMemoryAccess(upWeightScale),
-            [CostFactorNames.MemoryStore] = CostUtility.GetMemoryAccess(output),
+            [CostFactorNames.BlockLocalMemoryStoreBytes] = CostUtility.GetMemoryAccess(output),
             [CostFactorNames.CPUCycles] = CostUtility.GetCPUCycles(output, checked(macPerElement * 2U + 9U)),
         };
     }
@@ -213,13 +213,13 @@ public sealed class MatMulGluEvaluator : IEvaluator<MatMulGlu>, ITypeInferencer<
         else
         {
             AddCostFactor(cost, CostFactorNames.CPUCycles, CostUtility.GetCPUCycles(output, 9));
-            AddCostFactor(cost, CostFactorNames.MemoryLoad, CostUtility.GetMemoryAccess(output));
-            AddCostFactor(cost, CostFactorNames.MemoryStore, CostUtility.GetMemoryAccess(output));
+            AddCostFactor(cost, CostFactorNames.BlockLocalMemoryLoadBytes, CostUtility.GetMemoryAccess(output));
+            AddCostFactor(cost, CostFactorNames.BlockLocalMemoryStoreBytes, CostUtility.GetMemoryAccess(output));
         }
 
-        if (TryGetScalarElementCount(input, out var inputElements))
+        if (TryGetMemoryBytes(input, out var inputBytes))
         {
-            SubtractCostFactor(cost, CostFactorNames.MemoryLoad, inputElements);
+            SubtractCostFactor(cost, CostFactorNames.BlockLocalMemoryLoadBytes, inputBytes);
         }
 
         return true;
@@ -234,7 +234,7 @@ public sealed class MatMulGluEvaluator : IEvaluator<MatMulGlu>, ITypeInferencer<
                 continue;
             }
 
-            AddCostFactor(cost, CostFactorNames.MemoryLoad, CostUtility.GetMemoryAccess(bias));
+            AddCostFactor(cost, CostFactorNames.BlockLocalMemoryLoadBytes, CostUtility.GetMemoryAccess(bias));
             AddCostFactor(cost, CostFactorNames.CPUCycles, CostUtility.GetCPUCycles(outputType, 1));
         }
     }
@@ -266,30 +266,11 @@ public sealed class MatMulGluEvaluator : IEvaluator<MatMulGlu>, ITypeInferencer<
         cost.Factors[name] = oldValue > value ? oldValue - value : 0;
     }
 
-    private static bool TryGetScalarElementCount(IRType type, out UInt128 count)
+    private static bool TryGetMemoryBytes(IRType type, out UInt128 count)
     {
-        if (!TargetCostTensor.TryFromType(type, out var tensor)
-            || !CompilerServices.TryGetMaxShape(tensor.Shape, out var shape))
-        {
-            count = 0;
-            return false;
-        }
-
-        count = 1;
-        foreach (var dim in shape)
-        {
-            count *= (UInt128)System.Math.Max(0, dim);
-        }
-
-        count *= (UInt128)GetVectorLaneCount(tensor.DType);
-        return true;
+        count = CostUtility.GetMemoryAccess(type);
+        return count > 0;
     }
-
-    private static long GetVectorLaneCount(DataType dtype) => dtype switch
-    {
-        VectorType vectorType => vectorType.Lanes.Aggregate(1L, static (acc, lane) => acc * lane) * GetVectorLaneCount(vectorType.ElemType),
-        _ => 1,
-    };
 
     private static InvalidType? CheckBiasType(string name, IRType output, IRType bias)
     {

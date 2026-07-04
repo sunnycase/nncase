@@ -50,8 +50,8 @@ public sealed class IdentityPagedAttentionKVCacheEvaluator : ITypeInferencer<Ide
         var input = context.GetArgumentType<IRType>(target, IdentityPagedAttentionKVCache.Input);
         return new()
         {
-            [CostFactorNames.MemoryLoad] = CostUtility.GetMemoryAccess(input),
-            [CostFactorNames.MemoryStore] = CostUtility.GetMemoryAccess(input),
+            [CostFactorNames.BlockLocalMemoryLoadBytes] = CostUtility.GetMemoryAccess(input),
+            [CostFactorNames.BlockLocalMemoryStoreBytes] = CostUtility.GetMemoryAccess(input),
         };
     }
 

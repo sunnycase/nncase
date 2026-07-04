@@ -46,8 +46,8 @@ public class GetPositionIdsEvaluator : IEvaluator<GetPositionIds>, ITypeInferenc
         var returnType = context.GetReturnType<IRType>();
         return new()
         {
-            [CostFactorNames.MemoryLoad] = CostUtility.GetMemoryAccess(returnType),
-            [CostFactorNames.MemoryStore] = CostUtility.GetMemoryAccess(returnType),
+            [CostFactorNames.BlockLocalMemoryLoadBytes] = CostUtility.GetMemoryAccess(returnType),
+            [CostFactorNames.BlockLocalMemoryStoreBytes] = CostUtility.GetMemoryAccess(returnType),
             [CostFactorNames.CPUCycles] = CostUtility.GetCPUCycles(returnType, 8),
         };
     }

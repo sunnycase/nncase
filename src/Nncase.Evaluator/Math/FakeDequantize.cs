@@ -38,8 +38,8 @@ public class FakeDequantizeEvaluator : IEvaluator<FakeDequantize>, ITypeInferenc
         // TODO: bits
         return new()
         {
-            [CostFactorNames.MemoryLoad] = CostUtility.GetFakeMemoryAccess(inputType, 8),
-            [CostFactorNames.MemoryStore] = CostUtility.GetMemoryAccess(outputType),
+            [CostFactorNames.BlockLocalMemoryLoadBytes] = CostUtility.GetFakeMemoryAccess(inputType, 8),
+            [CostFactorNames.BlockLocalMemoryStoreBytes] = CostUtility.GetMemoryAccess(outputType),
             [CostFactorNames.CPUCycles] = 2,
         };
     }

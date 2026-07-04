@@ -53,8 +53,8 @@ public class TopKEvaluator : IEvaluator<TopK>, ITypeInferencer<TopK>, ICostEvalu
         var outputType = context.GetReturnType<TupleType>();
         return new()
         {
-            [CostFactorNames.MemoryLoad] = CostUtility.GetMemoryAccess(x) + CostUtility.GetMemoryAccess(k),
-            [CostFactorNames.MemoryStore] = CostUtility.GetMemoryAccess(outputType),
+            [CostFactorNames.BlockLocalMemoryLoadBytes] = CostUtility.GetMemoryAccess(x) + CostUtility.GetMemoryAccess(k),
+            [CostFactorNames.BlockLocalMemoryStoreBytes] = CostUtility.GetMemoryAccess(outputType),
             [CostFactorNames.CPUCycles] = CostUtility.GetCPUCycles(outputType),
         };
     }

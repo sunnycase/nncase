@@ -89,8 +89,8 @@ public class VectorizedCastEvaluator : IEvaluator<VectorizedCast>, ITypeInferenc
         var macPerElement = 4;
         return new()
         {
-            [CostFactorNames.MemoryLoad] = CostUtility.GetMemoryAccess(input),
-            [CostFactorNames.MemoryStore] = CostUtility.GetMemoryAccess(output),
+            [CostFactorNames.BlockLocalMemoryLoadBytes] = CostUtility.GetMemoryAccess(input),
+            [CostFactorNames.BlockLocalMemoryStoreBytes] = CostUtility.GetMemoryAccess(output),
             [CostFactorNames.CPUCycles] = CostUtility.GetCPUCycles(input, macPerElement),
         };
     }

@@ -73,8 +73,8 @@ public sealed class UnitTestTargetOpCostModel : TestClassBase
 
         var cost = CompilerServices.EvaluateCost(gather, CompileOptions);
 
-        Assert.Equal((UInt128)66, cost[CostFactorNames.MemoryLoad]);
-        Assert.Equal((UInt128)64, cost[CostFactorNames.MemoryStore]);
+        Assert.Equal((UInt128)272, cost[CostFactorNames.BlockLocalMemoryLoadBytes]);
+        Assert.Equal((UInt128)256, cost[CostFactorNames.BlockLocalMemoryStoreBytes]);
     }
 
     private sealed record TestTargetOptions(ITargetOpCostModel TargetCostModel) : ITargetOptions, ITargetOpCostModelProvider;

@@ -161,8 +161,8 @@ public class ResizeImageEvaluator : IEvaluator<ResizeImage>, ITypeInferencer<Res
         var returnType = context.GetReturnType<IRType>();
         return new()
         {
-            [CostFactorNames.MemoryLoad] = CostUtility.GetMemoryAccess(inputType),
-            [CostFactorNames.MemoryStore] = CostUtility.GetMemoryAccess(returnType),
+            [CostFactorNames.BlockLocalMemoryLoadBytes] = CostUtility.GetMemoryAccess(inputType),
+            [CostFactorNames.BlockLocalMemoryStoreBytes] = CostUtility.GetMemoryAccess(returnType),
             [CostFactorNames.CPUCycles] = CostUtility.GetCPUCycles(returnType, 4),
         };
     }

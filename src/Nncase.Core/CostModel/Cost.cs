@@ -10,13 +10,19 @@ namespace Nncase.CostModel;
 
 public static class CostFactorNames
 {
-    public static readonly string MemoryLoad = "MemoryLoad";
+    public static readonly string BlockLocalMemoryLoadBytes = "BlockLocalMemoryLoadBytes";
 
-    public static readonly string MemoryStore = "MemoryStore";
+    public static readonly string BlockLocalMemoryStoreBytes = "BlockLocalMemoryStoreBytes";
+
+    public static readonly string ChipGlobalMemoryLoadBytes = "ChipGlobalMemoryLoadBytes";
+
+    public static readonly string ChipGlobalMemoryStoreBytes = "ChipGlobalMemoryStoreBytes";
 
     public static readonly string CPUCycles = "CPUCycles";
 
-    public static readonly string Synchronization = "Synchronization";
+    public static readonly string BlockSynchronization = "BlockSynchronization";
+
+    public static readonly string GridSynchronization = "GridSynchronization";
 
     public static readonly string Comm = "Comm";
 }
@@ -44,9 +50,15 @@ public sealed record Cost : IComparable<Cost>, IEquatable<Cost>
         get
         {
             var cpuCost = GetFactor(CostFactorNames.CPUCycles);
-            var memoryCost = GetFactor(CostFactorNames.MemoryLoad) + GetFactor(CostFactorNames.MemoryStore);
-            var overlappedCost = cpuCost > memoryCost ? cpuCost : memoryCost;
-            return overlappedCost + GetFactor(CostFactorNames.Synchronization) + GetFactor(CostFactorNames.Comm) + OtherCost;
+            var blockLocalMemoryCost = GetFactor(CostFactorNames.BlockLocalMemoryLoadBytes) + GetFactor(CostFactorNames.BlockLocalMemoryStoreBytes);
+            var explicitChipGlobalMemoryCost = GetFactor(CostFactorNames.ChipGlobalMemoryLoadBytes) + GetFactor(CostFactorNames.ChipGlobalMemoryStoreBytes);
+            var chipGlobalMemoryCost = blockLocalMemoryCost + explicitChipGlobalMemoryCost;
+            var overlappedCost = new[] { cpuCost, blockLocalMemoryCost, chipGlobalMemoryCost }.Max();
+            return overlappedCost
+                + GetFactor(CostFactorNames.BlockSynchronization)
+                + GetFactor(CostFactorNames.GridSynchronization)
+                + GetFactor(CostFactorNames.Comm)
+                + OtherCost;
         }
     }
 
@@ -58,9 +70,12 @@ public sealed record Cost : IComparable<Cost>, IEquatable<Cost>
             foreach (var factor in Factors)
             {
                 if (factor.Key != CostFactorNames.CPUCycles
-                    && factor.Key != CostFactorNames.MemoryLoad
-                    && factor.Key != CostFactorNames.MemoryStore
-                    && factor.Key != CostFactorNames.Synchronization
+                    && factor.Key != CostFactorNames.BlockLocalMemoryLoadBytes
+                    && factor.Key != CostFactorNames.BlockLocalMemoryStoreBytes
+                    && factor.Key != CostFactorNames.ChipGlobalMemoryLoadBytes
+                    && factor.Key != CostFactorNames.ChipGlobalMemoryStoreBytes
+                    && factor.Key != CostFactorNames.BlockSynchronization
+                    && factor.Key != CostFactorNames.GridSynchronization
                     && factor.Key != CostFactorNames.Comm)
                 {
                     cost += factor.Value;
@@ -238,7 +253,7 @@ public static class CostUtility
     {
         return type switch
         {
-            TensorType t => (UInt128)t.Shape.ProdWithDynamicAsMaxValue(),
+            TensorType t => (UInt128)(t.Shape.ProdWithDynamicAsMaxValue() * t.DType.SizeInBytes),
             TupleType t => t.Fields.Sum(GetMemoryAccess),
             DistributedType t => GetMemoryAccess(Utilities.DistributedUtility.GetDividedTensorType(t)),
             _ => 0,
@@ -359,8 +374,8 @@ public static class CostUtility
     {
         return new()
         {
-            [CostFactorNames.MemoryLoad] = CostUtility.GetMemoryAccess(ret),
-            [CostFactorNames.MemoryStore] = CostUtility.GetMemoryAccess(ret),
+            [CostFactorNames.BlockLocalMemoryLoadBytes] = CostUtility.GetMemoryAccess(ret),
+            [CostFactorNames.BlockLocalMemoryStoreBytes] = CostUtility.GetMemoryAccess(ret),
             [CostFactorNames.CPUCycles] = CostUtility.GetCPUCycles(ret, macPerElement),
         };
     }
@@ -370,8 +385,8 @@ public static class CostUtility
     {
         return new()
         {
-            [CostFactorNames.MemoryLoad] = CostUtility.GetMemoryAccess(input),
-            [CostFactorNames.MemoryStore] = CostUtility.GetMemoryAccess(ret),
+            [CostFactorNames.BlockLocalMemoryLoadBytes] = CostUtility.GetMemoryAccess(input),
+            [CostFactorNames.BlockLocalMemoryStoreBytes] = CostUtility.GetMemoryAccess(ret),
             [CostFactorNames.CPUCycles] = CostUtility.GetCPUCycles(ret, 1),
         };
     }

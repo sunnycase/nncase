@@ -102,8 +102,8 @@ public sealed class InstanceNormEvaluator : IEvaluator<InstacneNorm>, ITypeInfer
             case (TensorType, TensorType):
                 return new()
                 {
-                    [CostFactorNames.MemoryLoad] = CostUtility.GetMemoryAccess(inputType),
-                    [CostFactorNames.MemoryStore] = CostUtility.GetMemoryAccess(returnType),
+                    [CostFactorNames.BlockLocalMemoryLoadBytes] = CostUtility.GetMemoryAccess(inputType),
+                    [CostFactorNames.BlockLocalMemoryStoreBytes] = CostUtility.GetMemoryAccess(returnType),
                 };
 
 #if false
@@ -114,9 +114,9 @@ public sealed class InstanceNormEvaluator : IEvaluator<InstacneNorm>, ITypeInfer
                 var reCompute = inputDistributedType.NdSBP.Select((sbp, i) => sbp is SBPSplit ? 1 : inputDistributedType.Placement.Hierarchy[i]).ToArray().Aggregate(1, (acc, rep) => acc * rep);
                 return new()
                 {
-                    [CostFactorNames.MemoryLoad] = CostUtility.GetMemoryAccess(inputType) + ring,
+                    [CostFactorNames.BlockLocalMemoryLoadBytes] = CostUtility.GetMemoryAccess(inputType) + ring,
                     [CostFactorNames.CPUCycles] = CostUtility.GetCPUCycles(inputType, 1) * (UInt128)reCompute,
-                    [CostFactorNames.MemoryStore] = CostUtility.GetMemoryAccess(returnType) + ring,
+                    [CostFactorNames.BlockLocalMemoryStoreBytes] = CostUtility.GetMemoryAccess(returnType) + ring,
                 };
 #endif
             default:

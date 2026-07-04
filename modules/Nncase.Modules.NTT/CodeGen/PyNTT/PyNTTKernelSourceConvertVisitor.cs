@@ -88,7 +88,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
     {
         private enum HelperBarrierKind
         {
-            Cta,
+            Block,
             Grid,
         }
 
@@ -698,7 +698,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
 
                 WriteBarrier(HelperBarrierKind.Grid);
                 WriteShardReduceHelper(input, reduceAxes, inputVectorLaneCount, inputScalarDType, hierarchy, false, HelperBarrierKind.Grid, $"{input.Name} partial reduce");
-                WriteShardReduceHelper(input, reduceAxes, inputVectorLaneCount, inputScalarDType, hierarchy, true, HelperBarrierKind.Cta, $"{input.Name} partial broadcast");
+                WriteShardReduceHelper(input, reduceAxes, inputVectorLaneCount, inputScalarDType, hierarchy, true, HelperBarrierKind.Block, $"{input.Name} partial broadcast");
             }
 
             _attrs["op"] = "reshard";
@@ -3947,7 +3947,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             _body.AppendLine(line);
         }
 
-        private void WriteLine(string line, HelperBarrierKind barrierKind = HelperBarrierKind.Cta)
+        private void WriteLine(string line, HelperBarrierKind barrierKind = HelperBarrierKind.Block)
         {
             _body.Append(new string(' ', _bodyIndent * 4));
             _body.AppendLine(line);
@@ -3959,7 +3959,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             _body.Append(new string(' ', _bodyIndent * 4));
             _body.AppendLine(barrierKind switch
             {
-                HelperBarrierKind.Cta => "tl.debug_barrier()",
+                HelperBarrierKind.Block => "tl.debug_barrier()",
                 HelperBarrierKind.Grid => "tle.distributed_barrier(pyntt_grid_mesh)",
                 _ => throw new ArgumentOutOfRangeException(nameof(barrierKind), barrierKind, null),
             });

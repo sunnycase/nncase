@@ -35,8 +35,8 @@ public class HardmaxEvaluator : IEvaluator<Hardmax>, ITypeInferencer<Hardmax>, I
         var inputType = context.GetArgumentType<TensorType>(target, Hardmax.Input);
         return new()
         {
-            [CostFactorNames.MemoryLoad] = CostUtility.GetMemoryAccess(inputType),
-            [CostFactorNames.MemoryStore] = (UInt128)inputType.Shape.Rank,
+            [CostFactorNames.BlockLocalMemoryLoadBytes] = CostUtility.GetMemoryAccess(inputType),
+            [CostFactorNames.BlockLocalMemoryStoreBytes] = (UInt128)inputType.Shape.Rank,
         };
     }
 

@@ -15,9 +15,9 @@ public sealed class UnitTestCost
         var cost = new Cost
         {
             [CostFactorNames.CPUCycles] = 100,
-            [CostFactorNames.MemoryLoad] = 40,
-            [CostFactorNames.MemoryStore] = 70,
-            [CostFactorNames.Synchronization] = 5,
+            [CostFactorNames.ChipGlobalMemoryLoadBytes] = 40,
+            [CostFactorNames.ChipGlobalMemoryStoreBytes] = 70,
+            [CostFactorNames.GridSynchronization] = 5,
             [CostFactorNames.Comm] = 7,
         };
 
@@ -30,8 +30,8 @@ public sealed class UnitTestCost
         var cost = new Cost
         {
             [CostFactorNames.CPUCycles] = 100,
-            [CostFactorNames.MemoryLoad] = 10,
-            [CostFactorNames.MemoryStore] = 20,
+            [CostFactorNames.ChipGlobalMemoryLoadBytes] = 10,
+            [CostFactorNames.ChipGlobalMemoryStoreBytes] = 20,
             ["Custom"] = 3,
         };
 

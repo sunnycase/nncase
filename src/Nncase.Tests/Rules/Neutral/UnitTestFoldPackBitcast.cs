@@ -55,11 +55,33 @@ public class UnitTestFoldPackBitcast : TransformTestBase
         var repacked = Pack(reshaped, [8], [2]);
         CompilerServices.InferenceType(repacked);
 
-        var post = (Expr)CompilerServices.Rewrite(repacked, [new FoldPackReshapeBitcast()], new());
+        var post = (Expr)CompilerServices.Rewrite(repacked, [new FoldPackReshape(), new FoldPackBitcast()], new());
         CompilerServices.InferenceType(post);
 
         Assert.Equal(repacked.CheckedType, post.CheckedType);
         Assert.IsType<IR.Tensors.Reshape>(((Call)post).Target);
         Assert.True(ReferenceEquals(input, ((Call)post).Arguments[IR.Tensors.Reshape.Input.Index]));
+    }
+
+    [Fact]
+    public void TestFoldPackAfterTransposeReshapeBitcastToScalar()
+    {
+        var input = new Var("input", new TensorType(new VectorType(DataTypes.BFloat16, [4, 8]), new RankedShape(2, 32)));
+        var vectorView = Bitcast(input, new VectorType(DataTypes.BFloat16, [8]));
+        var scalarView = Bitcast(vectorView, DataTypes.BFloat16);
+        var reshaped = Reshape(scalarView, new RankedShape(2, 8, 128));
+        var transposed = Transpose(reshaped, [1, 2, 0]);
+        var repacked = Pack(transposed, [8], [1]);
+        CompilerServices.InferenceType(repacked);
+
+        var post = (Expr)CompilerServices.Rewrite(repacked, [new FoldPackTranspose(), new FoldPackReshape(), new FoldPackBitcast()], new());
+        CompilerServices.InferenceType(post);
+
+        Assert.Equal(repacked.CheckedType, post.CheckedType);
+        var postTranspose = Assert.IsType<Call>(post);
+        Assert.IsType<IR.Tensors.Transpose>(postTranspose.Target);
+        var postReshape = Assert.IsType<Call>(postTranspose.Arguments[IR.Tensors.Transpose.Input.Index]);
+        Assert.IsType<IR.Tensors.Reshape>(postReshape.Target);
+        Assert.True(ReferenceEquals(vectorView, postReshape.Arguments[IR.Tensors.Reshape.Input.Index]));
     }
 }

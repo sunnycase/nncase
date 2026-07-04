@@ -81,7 +81,7 @@ public sealed class ForceBoxingEvaluator : ITypeInferencer<ForceBoxing>, ICostEv
     {
         var inType = context.GetArgumentType<IRType>(target, ForceBoxing.Input);
         var returnType = context.GetReturnType<IRType>();
-        var cost = new Cost() { [CostFactorNames.MemoryLoad] = CostUtility.GetMemoryAccess(inType), [CostFactorNames.MemoryStore] = CostUtility.GetMemoryAccess(returnType) };
+        var cost = new Cost() { [CostFactorNames.ChipGlobalMemoryLoadBytes] = CostUtility.GetMemoryAccess(inType), [CostFactorNames.ChipGlobalMemoryStoreBytes] = CostUtility.GetMemoryAccess(returnType) };
         return cost;
     }
 

@@ -40,12 +40,12 @@ public class GatherElementsEvaluator : IEvaluator<GatherElements>, ITypeInferenc
 
         return new()
         {
-            [CostFactorNames.MemoryLoad] = returnType switch
+            [CostFactorNames.BlockLocalMemoryLoadBytes] = returnType switch
             {
                 TensorType t => CostUtility.GetMemoryAccess(t),
                 _ => 1,
             },
-            [CostFactorNames.MemoryStore] = returnType switch
+            [CostFactorNames.BlockLocalMemoryStoreBytes] = returnType switch
             {
                 TensorType t => CostUtility.GetMemoryAccess(t),
                 _ => 1,

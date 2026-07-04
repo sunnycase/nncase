@@ -33,8 +33,8 @@ public sealed class GatherPagedAttentionKVCacheEvaluator : ITypeInferencer<Gathe
         var returnType = context.GetReturnType<IRType>();
         return new()
         {
-            [CostFactorNames.MemoryLoad] = CostUtility.GetMemoryAccess(slotsType) + CostUtility.GetMemoryAccess(returnType),
-            [CostFactorNames.MemoryStore] = CostUtility.GetMemoryAccess(slotsType) + CostUtility.GetMemoryAccess(returnType),
+            [CostFactorNames.BlockLocalMemoryLoadBytes] = CostUtility.GetMemoryAccess(slotsType) + CostUtility.GetMemoryAccess(returnType),
+            [CostFactorNames.BlockLocalMemoryStoreBytes] = CostUtility.GetMemoryAccess(slotsType) + CostUtility.GetMemoryAccess(returnType),
         };
     }
 

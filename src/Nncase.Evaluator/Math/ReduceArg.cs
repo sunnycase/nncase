@@ -58,7 +58,7 @@ public class ReduceArgEvaluator : IEvaluator<ReduceArg>, ITypeInferencer<ReduceA
         uint input_elem = inShape.Aggregate(1U, (acc, d) => acc * (d.IsFixed ? (uint)d.FixedValue : 1U));
         uint ret_elem = rShape.Aggregate(1U, (acc, d) => acc * (d.IsFixed ? (uint)d.FixedValue : 1U));
         uint macPerElement = input_elem / ret_elem;
-        return new() { [CostFactorNames.MemoryLoad] = CostUtility.GetMemoryAccess(input), [CostFactorNames.MemoryStore] = CostUtility.GetMemoryAccess(ret), [CostFactorNames.CPUCycles] = CostUtility.GetCPUCycles(ret, macPerElement), };
+        return new() { [CostFactorNames.BlockLocalMemoryLoadBytes] = CostUtility.GetMemoryAccess(input), [CostFactorNames.BlockLocalMemoryStoreBytes] = CostUtility.GetMemoryAccess(ret), [CostFactorNames.CPUCycles] = CostUtility.GetCPUCycles(ret, macPerElement), };
     }
 
     public Metric Visit(IMetricEvaluateContext context, ReduceArg target)

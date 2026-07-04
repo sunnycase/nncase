@@ -26,22 +26,22 @@ public sealed class UnitTestEGraphCostModel
         {
           { a,
             new() {
-              [CostFactorNames.MemoryLoad] = 76380,
-              [CostFactorNames.MemoryLoad] = 42336,
+              [CostFactorNames.ChipGlobalMemoryLoadBytes] = 76380,
+              [CostFactorNames.ChipGlobalMemoryLoadBytes] = 42336,
               [CostFactorNames.CPUCycles] = 532529182956,
             }
           },
           { b, Cost.Zero },
           { c,
             new() {
-              [CostFactorNames.MemoryLoad] = 37940,
-              [CostFactorNames.MemoryLoad] = 20840,
+              [CostFactorNames.ChipGlobalMemoryLoadBytes] = 37940,
+              [CostFactorNames.ChipGlobalMemoryLoadBytes] = 20840,
               [CostFactorNames.CPUCycles] = 266073472105,
             }
           },
           { d, new() {
-              [CostFactorNames.MemoryLoad] = 38080,
-              [CostFactorNames.MemoryLoad] = 20980,
+              [CostFactorNames.ChipGlobalMemoryLoadBytes] = 38080,
+              [CostFactorNames.ChipGlobalMemoryLoadBytes] = 20980,
               [CostFactorNames.CPUCycles] = 266073472105,
             }
           },

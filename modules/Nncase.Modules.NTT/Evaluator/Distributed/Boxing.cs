@@ -132,7 +132,7 @@ public sealed class BoxingEvaluator : ITypeInferencer<Boxing>, ICostEvaluator<Bo
             return targetCost;
         }
 
-        var cost = new Cost() { [CostFactorNames.CPUCycles] = 1, [CostFactorNames.MemoryLoad] = 0, [CostFactorNames.MemoryStore] = 0, [CostFactorNames.Synchronization] = SynchronizationEventCount };
+        var cost = new Cost() { [CostFactorNames.CPUCycles] = 1, [CostFactorNames.ChipGlobalMemoryLoadBytes] = 0, [CostFactorNames.ChipGlobalMemoryStoreBytes] = 0, [CostFactorNames.GridSynchronization] = SynchronizationEventCount };
         switch (inType, returnType)
         {
             case (TensorType _, DistributedType distributedType):
@@ -141,8 +141,8 @@ public sealed class BoxingEvaluator : ITypeInferencer<Boxing>, ICostEvaluator<Bo
                     default:
                         cost = new Cost()
                         {
-                            [CostFactorNames.MemoryLoad] = CostUtility.GetMemoryAccess(distributedType),
-                            [CostFactorNames.MemoryStore] = CostUtility.GetMemoryAccess(distributedType),
+                            [CostFactorNames.ChipGlobalMemoryLoadBytes] = CostUtility.GetMemoryAccess(distributedType),
+                            [CostFactorNames.ChipGlobalMemoryStoreBytes] = CostUtility.GetMemoryAccess(distributedType),
                         };
                         break;
                 }
@@ -154,8 +154,8 @@ public sealed class BoxingEvaluator : ITypeInferencer<Boxing>, ICostEvaluator<Bo
                     default:
                         cost = new Cost()
                         {
-                            [CostFactorNames.MemoryLoad] = CostUtility.GetMemoryAccess(distributedType),
-                            [CostFactorNames.MemoryStore] = CostUtility.GetMemoryAccess(distributedType),
+                            [CostFactorNames.ChipGlobalMemoryLoadBytes] = CostUtility.GetMemoryAccess(distributedType),
+                            [CostFactorNames.ChipGlobalMemoryStoreBytes] = CostUtility.GetMemoryAccess(distributedType),
                         };
                         break;
                 }
@@ -167,9 +167,9 @@ public sealed class BoxingEvaluator : ITypeInferencer<Boxing>, ICostEvaluator<Bo
                 {
                     var fullLoadStore = new Cost()
                     {
-                        [CostFactorNames.MemoryStore] = CostUtility.GetMemoryAccess(a),
-                        [CostFactorNames.MemoryLoad] = CostUtility.GetMemoryAccess(b),
-                        [CostFactorNames.Synchronization] = SynchronizationEventCount,
+                        [CostFactorNames.ChipGlobalMemoryStoreBytes] = CostUtility.GetMemoryAccess(a),
+                        [CostFactorNames.ChipGlobalMemoryLoadBytes] = CostUtility.GetMemoryAccess(b),
+                        [CostFactorNames.GridSynchronization] = SynchronizationEventCount,
                     };
 
                     float scatterPart = 1;
@@ -247,7 +247,7 @@ public sealed class BoxingEvaluator : ITypeInferencer<Boxing>, ICostEvaluator<Bo
                     {
                         cost += new Cost()
                         {
-                            [CostFactorNames.MemoryStore] = (UInt128)((gatherPart - 1) * (float)CostUtility.GetMemoryAccess(DistributedUtility.GetDividedTensorType(a)) / gatherPart),
+                            [CostFactorNames.ChipGlobalMemoryStoreBytes] = (UInt128)((gatherPart - 1) * (float)CostUtility.GetMemoryAccess(DistributedUtility.GetDividedTensorType(a)) / gatherPart),
                         };
                     }
 
@@ -263,7 +263,7 @@ public sealed class BoxingEvaluator : ITypeInferencer<Boxing>, ICostEvaluator<Bo
                     {
                         cost += new Cost()
                         {
-                            [CostFactorNames.MemoryLoad] = (UInt128)((scatterPart - 1) * (float)CostUtility.GetMemoryAccess(DistributedUtility.GetDividedTensorType(b)) / scatterPart),
+                            [CostFactorNames.ChipGlobalMemoryLoadBytes] = (UInt128)((scatterPart - 1) * (float)CostUtility.GetMemoryAccess(DistributedUtility.GetDividedTensorType(b)) / scatterPart),
                         };
                     }
                 }
@@ -271,9 +271,9 @@ public sealed class BoxingEvaluator : ITypeInferencer<Boxing>, ICostEvaluator<Bo
                 {
                     var fullLoadStore = new Cost()
                     {
-                        [CostFactorNames.MemoryStore] = CostUtility.GetMemoryAccess(a) * (UInt128)a.TensorType.DType.SizeInBytes,
-                        [CostFactorNames.MemoryLoad] = CostUtility.GetMemoryAccess(b) * (UInt128)b.TensorType.DType.SizeInBytes,
-                        [CostFactorNames.Synchronization] = SynchronizationEventCount,
+                        [CostFactorNames.ChipGlobalMemoryStoreBytes] = CostUtility.GetMemoryAccess(a),
+                        [CostFactorNames.ChipGlobalMemoryLoadBytes] = CostUtility.GetMemoryAccess(b),
+                        [CostFactorNames.GridSynchronization] = SynchronizationEventCount,
                     };
 
                     float gatherPart = 1;
@@ -357,7 +357,7 @@ public sealed class BoxingEvaluator : ITypeInferencer<Boxing>, ICostEvaluator<Bo
                     {
                         cost += new Cost()
                         {
-                            [CostFactorNames.MemoryStore] = (UInt128)((gatherPart - 1) / scatterPart * (float)CostUtility.GetMemoryAccess(DistributedUtility.GetDividedTensorType(a))) * (UInt128)a.TensorType.DType.SizeInBytes,
+                            [CostFactorNames.ChipGlobalMemoryStoreBytes] = (UInt128)((gatherPart - 1) / scatterPart * (float)CostUtility.GetMemoryAccess(DistributedUtility.GetDividedTensorType(a))),
                         };
                     }
                 }
@@ -366,25 +366,25 @@ public sealed class BoxingEvaluator : ITypeInferencer<Boxing>, ICostEvaluator<Bo
             case (DistributedType a, DistributedType b) when a.TensorType != b.TensorType && a.Placement == b.Placement:
                 cost = new Cost()
                 {
-                    [CostFactorNames.MemoryStore] = CostUtility.GetMemoryAccess(a),
-                    [CostFactorNames.MemoryLoad] = CostUtility.GetMemoryAccess(b),
-                    [CostFactorNames.Synchronization] = SynchronizationEventCount,
+                    [CostFactorNames.ChipGlobalMemoryStoreBytes] = CostUtility.GetMemoryAccess(a),
+                    [CostFactorNames.ChipGlobalMemoryLoadBytes] = CostUtility.GetMemoryAccess(b),
+                    [CostFactorNames.GridSynchronization] = SynchronizationEventCount,
                 };
                 break;
             case (DistributedType a, DistributedType b) when a.Placement != b.Placement:
                 cost = new Cost()
                 {
-                    [CostFactorNames.MemoryStore] = CostUtility.GetMemoryAccess(a),
-                    [CostFactorNames.MemoryLoad] = CostUtility.GetMemoryAccess(b),
-                    [CostFactorNames.Synchronization] = SynchronizationEventCount,
+                    [CostFactorNames.ChipGlobalMemoryStoreBytes] = CostUtility.GetMemoryAccess(a),
+                    [CostFactorNames.ChipGlobalMemoryLoadBytes] = CostUtility.GetMemoryAccess(b),
+                    [CostFactorNames.GridSynchronization] = SynchronizationEventCount,
                 };
                 break;
             case (DistributedType a, DistributedType b) when a.Partial != b.Partial:
                 cost = new Cost()
                 {
-                    [CostFactorNames.MemoryStore] = CostUtility.GetMemoryAccess(a),
-                    [CostFactorNames.MemoryLoad] = CostUtility.GetMemoryAccess(b),
-                    [CostFactorNames.Synchronization] = SynchronizationEventCount,
+                    [CostFactorNames.ChipGlobalMemoryStoreBytes] = CostUtility.GetMemoryAccess(a),
+                    [CostFactorNames.ChipGlobalMemoryLoadBytes] = CostUtility.GetMemoryAccess(b),
+                    [CostFactorNames.GridSynchronization] = SynchronizationEventCount,
                 };
                 break;
             case (DistributedType a, DistributedType b) when a == b:
@@ -459,7 +459,7 @@ public sealed class BoxingEvaluator : ITypeInferencer<Boxing>, ICostEvaluator<Bo
             return false;
         }
 
-        cost += new Cost { [CostFactorNames.Synchronization] = SynchronizationEventCount };
+        cost += new Cost { [CostFactorNames.GridSynchronization] = SynchronizationEventCount };
         return true;
     }
 

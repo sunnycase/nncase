@@ -47,10 +47,10 @@ public sealed class Qwen3MoEEvaluator : ITypeInferencer<Qwen3MoE>, ICostEvaluato
         return new()
         {
             // todo kv cache
-            [CostFactorNames.MemoryLoad] = CostUtility.GetMemoryAccess(qType),
+            [CostFactorNames.BlockLocalMemoryLoadBytes] = CostUtility.GetMemoryAccess(qType),
 
             // todo [CostFactorNames.CPUCycles].
-            [CostFactorNames.MemoryStore] = CostUtility.GetMemoryAccess(returnType),
+            [CostFactorNames.BlockLocalMemoryStoreBytes] = CostUtility.GetMemoryAccess(returnType),
         };
     }
 

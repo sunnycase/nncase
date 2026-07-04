@@ -35,7 +35,7 @@ public class OneHotEvaluator : IEvaluator<OneHot>, ITypeInferencer<OneHot>, ICos
         var returnType = context.GetReturnType<TensorType>();
         return new()
         {
-            [CostFactorNames.MemoryStore] = CostUtility.GetMemoryAccess(returnType),
+            [CostFactorNames.BlockLocalMemoryStoreBytes] = CostUtility.GetMemoryAccess(returnType),
         };
     }
 

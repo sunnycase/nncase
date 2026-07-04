@@ -100,10 +100,10 @@ public sealed class PackedQKVParallelLinearEvaluator : IEvaluator<PackedQKVParal
         var macPerElement = GetK(input);
         var cost = new Cost()
         {
-            [CostFactorNames.MemoryLoad] = CostUtility.GetMemoryAccess(input)
+            [CostFactorNames.BlockLocalMemoryLoadBytes] = CostUtility.GetMemoryAccess(input)
                 + CostUtility.GetMemoryAccess(qWeight) + CostUtility.GetMemoryAccess(kWeight) + CostUtility.GetMemoryAccess(vWeight)
                 + CostUtility.GetMemoryAccess(qBias) + CostUtility.GetMemoryAccess(kBias) + CostUtility.GetMemoryAccess(vBias),
-            [CostFactorNames.MemoryStore] = output.Fields.Aggregate((UInt128)0, (sum, type) => sum + CostUtility.GetMemoryAccess(type)),
+            [CostFactorNames.BlockLocalMemoryStoreBytes] = output.Fields.Aggregate((UInt128)0, (sum, type) => sum + CostUtility.GetMemoryAccess(type)),
             [CostFactorNames.CPUCycles] = output.Fields.Aggregate((UInt128)0, (sum, type) => sum + CostUtility.GetCPUCycles(type, macPerElement)),
         };
 
@@ -195,9 +195,9 @@ public sealed class PackedQKVParallelLinearEvaluator : IEvaluator<PackedQKVParal
             cost += projectionCost;
         }
 
-        if (TryGetScalarElementCount(input, out var inputElements))
+        if (TryGetMemoryBytes(input, out var inputBytes))
         {
-            SubtractCostFactor(cost, CostFactorNames.MemoryLoad, inputElements * 2);
+            SubtractCostFactor(cost, CostFactorNames.BlockLocalMemoryLoadBytes, inputBytes * 2);
         }
 
         return true;
@@ -213,7 +213,7 @@ public sealed class PackedQKVParallelLinearEvaluator : IEvaluator<PackedQKVParal
                 continue;
             }
 
-            AddCostFactor(cost, CostFactorNames.MemoryLoad, CostUtility.GetMemoryAccess(biases[i]));
+            AddCostFactor(cost, CostFactorNames.BlockLocalMemoryLoadBytes, CostUtility.GetMemoryAccess(biases[i]));
             AddCostFactor(cost, CostFactorNames.CPUCycles, CostUtility.GetCPUCycles(outputType.Fields[i], 1));
         }
     }
@@ -245,30 +245,11 @@ public sealed class PackedQKVParallelLinearEvaluator : IEvaluator<PackedQKVParal
         cost.Factors[name] = oldValue > value ? oldValue - value : 0;
     }
 
-    private static bool TryGetScalarElementCount(IRType type, out UInt128 count)
+    private static bool TryGetMemoryBytes(IRType type, out UInt128 count)
     {
-        if (!TargetCostTensor.TryFromType(type, out var tensor)
-            || !CompilerServices.TryGetMaxShape(tensor.Shape, out var shape))
-        {
-            count = 0;
-            return false;
-        }
-
-        count = 1;
-        foreach (var dim in shape)
-        {
-            count *= (UInt128)System.Math.Max(0, dim);
-        }
-
-        count *= (UInt128)GetVectorLaneCount(tensor.DType);
-        return true;
+        count = CostUtility.GetMemoryAccess(type);
+        return count > 0;
     }
-
-    private static long GetVectorLaneCount(DataType dtype) => dtype switch
-    {
-        VectorType vectorType => vectorType.Lanes.Aggregate(1L, static (acc, lane) => acc * lane) * GetVectorLaneCount(vectorType.ElemType),
-        _ => 1,
-    };
 
     private static DataType GetScalarType(DataType dtype) => dtype switch
     {

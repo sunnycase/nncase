@@ -50,9 +50,9 @@ public class QuantizeEvaluator : IEvaluator<Quantize>, ITypeInferencer<Quantize>
         uint macParallel = 1;
         return new()
         {
-            [CostFactorNames.MemoryLoad] = CostUtility.GetMemoryAccess(input) +
+            [CostFactorNames.BlockLocalMemoryLoadBytes] = CostUtility.GetMemoryAccess(input) +
                                            CostUtility.GetMemoryAccess(quant_param),
-            [CostFactorNames.MemoryStore] = CostUtility.GetMemoryAccess(output),
+            [CostFactorNames.BlockLocalMemoryStoreBytes] = CostUtility.GetMemoryAccess(output),
             [CostFactorNames.CPUCycles] = CostUtility.GetCPUCycles(output, macPerElement) / macParallel,
         };
     }
