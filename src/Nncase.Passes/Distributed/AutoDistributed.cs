@@ -681,74 +681,69 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
             return default;
         }
 
-        foreach (var nType in GetLeafCandidateDistTypes(expr.CheckedTensorType, Placements, _moduleKind, TargetOptions))
-        {
-            if (!bucketMemo.TryGetValue(nType, out var bucket)
-                || expr.Users.Any(u => u is Call call && call.Target.GetType().FullName!.Contains("CustomNTT", StringComparison.Ordinal))
-                || expr.Target.GetType().FullName!.Contains("CustomNTT", StringComparison.Ordinal)
-                || expr.Target.GetType().FullName!.Contains("VectorizedRoPE", StringComparison.Ordinal)
-                || expr.Target.GetType().FullName!.Contains("Matmul", StringComparison.InvariantCultureIgnoreCase)
-                || expr.Target is PagedAttention
-                || expr.Target is Gather
-                || ShouldLinkAllSupplementalBoxingSources(addedBuckets))
-            {
-                bucket = callCluster.CreateCluster<DistributedSearchGraph>(SearchGraphKind.Bucket);
-                var linked = false;
-                foreach (var addedBucket in addedBuckets)
-                {
-                    var addedNode = addedBucket.Vertices.First();
-                    if (CheckBoxingType(addedNode.IRType, nType) is not InvalidType)
-                    {
-                        var node = new SearchableNode(new Boxing(nType), nType);
-                        bucket.AddVertex(node);
-                        callCluster.AddEdge(new(node, addedNode, 0, addedBucket));
-                        linked |= true;
-                    }
-                }
-
-                if (!linked)
-                {
-                    callCluster.RemoveCluster(bucket);
-                }
-                else
-                {
-                    bucketMemo.TryAdd(nType, bucket);
-                }
-            }
-            else
-            {
-                bucket = callCluster.CreateCluster<DistributedSearchGraph>(SearchGraphKind.Bucket);
-                var linked = false;
-                var addedBucket = addedBuckets[0];
-                {
-                    var addedNode = addedBucket.Vertices.First();
-                    if (CheckBoxingType(addedNode.IRType, nType) is not InvalidType)
-                    {
-                        var node = new SearchableNode(new Boxing(nType), nType);
-                        bucket.AddVertex(node);
-                        callCluster.AddEdge(new(node, addedNode, 0, addedBucket));
-                        linked |= true;
-                    }
-                }
-
-                if (!linked)
-                {
-                    callCluster.RemoveCluster(bucket);
-                }
-                else
-                {
-                    bucketMemo.TryAdd(nType, bucket);
-                }
-            }
-        }
+        AddSupplementalReshardCandidates(expr, callCluster, addedBuckets);
 
         // 5. filter
         FilterByScheme(expr, callCluster);
         return default;
     }
 
-    private bool ShouldLinkAllSupplementalBoxingSources(IReadOnlyList<DistributedSearchGraph> inferredBuckets)
-        => inferredBuckets.Any(bucket => bucket.Vertices.Any(node => ContainsPartial(node.IRType)));
+    private void AddSupplementalReshardCandidates(
+        Call expr,
+        DistributedSearchGraph callCluster,
+        IReadOnlyList<DistributedSearchGraph> inferredBuckets)
+    {
+        var sourceBuckets = ShouldLinkAllSupplementalReshardSources(expr, inferredBuckets)
+            ? inferredBuckets
+            : inferredBuckets.Take(1).ToArray();
+
+        foreach (var targetType in GetLeafCandidateDistTypes(expr.CheckedTensorType, Placements, _moduleKind, TargetOptions))
+        {
+            foreach (var sourceBucket in sourceBuckets)
+            {
+                var sourceNode = sourceBucket.Vertices.FirstOrDefault();
+                if (sourceNode is null)
+                {
+                    continue;
+                }
+
+                foreach (var plan in DistributedReshardPlanner.Plan(sourceNode.IRType, targetType, CanBoxingType))
+                {
+                    AddSupplementalReshardPath(callCluster, sourceBucket, sourceNode, plan.StepTypes);
+                }
+            }
+        }
+    }
+
+    private void AddSupplementalReshardPath(
+        DistributedSearchGraph callCluster,
+        DistributedSearchGraph sourceBucket,
+        SearchableNode sourceNode,
+        IReadOnlyList<IRType> stepTypes)
+    {
+        var inputBucket = sourceBucket;
+        var inputNode = sourceNode;
+        foreach (var stepType in stepTypes)
+        {
+            var bucket = callCluster.CreateCluster<DistributedSearchGraph>(SearchGraphKind.Bucket);
+            var node = new SearchableNode(new Boxing(stepType), stepType);
+            bucket.AddVertex(node);
+            callCluster.AddEdge(new(node, inputNode, 0, inputBucket));
+            inputBucket = bucket;
+            inputNode = node;
+        }
+    }
+
+    private bool ShouldLinkAllSupplementalReshardSources(Call expr, IReadOnlyList<DistributedSearchGraph> inferredBuckets)
+        => inferredBuckets.Any(bucket => bucket.Vertices.Any(node => ContainsPartial(node.IRType)))
+            || expr.Users.Any(u => u is Call call && call.Target.GetType().FullName!.Contains("CustomNTT", StringComparison.Ordinal))
+            || expr.Target.GetType().FullName!.Contains("CustomNTT", StringComparison.Ordinal)
+            || expr.Target.GetType().FullName!.Contains("VectorizedRoPE", StringComparison.Ordinal)
+            || expr.Target.GetType().FullName!.Contains("Matmul", StringComparison.InvariantCultureIgnoreCase)
+            || expr.Target is PagedAttention
+            || expr.Target is Gather;
+
+    private bool CanBoxingType(IRType inputType, IRType outputType) => CheckBoxingType(inputType, outputType) is not InvalidType;
 
     /// <summary>
     /// some times we didn't use all args.

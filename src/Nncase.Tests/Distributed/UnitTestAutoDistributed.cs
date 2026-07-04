@@ -92,4 +92,43 @@ public sealed class UnitTestDistribAutoDistributed : TestClassBase
         Assert.Equal(new[] { 768L }, new RankedShape(DistributedUtility.GetLocalOffsetAndShape(distributedType, new[] { 3 }, DistributedUtility.DivideFlags.MaxShape).Offset).ToValueArray());
         Assert.Equal(new[] { 256L }, new RankedShape(DistributedUtility.GetLocalOffsetAndShape(distributedType, new[] { 3 }, DistributedUtility.DivideFlags.MaxShape).Shape).ToValueArray());
     }
+
+    [Fact]
+    public void TestReshardPlannerDecomposesPartialToBroadcastThenSplit()
+    {
+        var tensorType = new TensorType(DataTypes.Float32, [32, 64]);
+        var placement = new Placement([4, 8], "yx", "bb");
+        var source = new DistributedType(tensorType, new SBP[] { SBP.B, SBP.S([1]) }, placement, SBP.P([1]));
+        var noPartial = new DistributedType(tensorType, source.AxisPolicies, placement);
+        var broadcast = new DistributedType(tensorType, new SBP[] { SBP.B, SBP.B }, placement);
+        var target = new DistributedType(tensorType, new SBP[] { SBP.S([0]), SBP.B }, placement);
+
+        var plans = DistributedReshardPlanner.Plan(source, target, CanBox);
+
+        Assert.Single(plans);
+        Assert.True(plans[0].StepTypes.SequenceEqual(new IRType[] { noPartial, broadcast, target }));
+
+        bool CanBox(IRType input, IRType output)
+            => (input, output) switch
+            {
+                (DistributedType i, DistributedType o) when i == source && o == noPartial => true,
+                (DistributedType i, DistributedType o) when i == noPartial && o == broadcast => true,
+                (DistributedType i, DistributedType o) when i == broadcast && o == target => true,
+                _ => false,
+            };
+    }
+
+    [Fact]
+    public void TestReshardPlannerKeepsDirectPathCompact()
+    {
+        var tensorType = new TensorType(DataTypes.Float32, [32, 64]);
+        var placement = new Placement([4, 8], "yx", "bb");
+        var source = new DistributedType(tensorType, new SBP[] { SBP.B, SBP.S([1]) }, placement);
+        var target = new DistributedType(tensorType, new SBP[] { SBP.S([0]), SBP.B }, placement);
+
+        var plans = DistributedReshardPlanner.Plan(source, target, (_, _) => true);
+
+        Assert.Single(plans);
+        Assert.True(plans[0].StepTypes.SequenceEqual(new IRType[] { target }));
+    }
 }
