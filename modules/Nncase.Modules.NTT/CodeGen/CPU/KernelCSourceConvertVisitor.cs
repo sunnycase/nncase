@@ -430,6 +430,30 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
                     }
 
                     break;
+                case TIR.NTT.QKVParallelLinear qkvParallelLinear:
+                    {
+                        ValidateQKVParallelLinearScales(args);
+                        WriteWithProfiler(
+                            RazorTemplateEngine.RenderAsync("~/CodeGen/CPU/Templates/Kernels/QKVParallelLinear.cshtml", new TypedKernelTemplateModel<TIR.NTT.QKVParallelLinear>(qkvParallelLinear)
+                            {
+                                Arguments = args.Select(x => new KernelArgument { Symbol = VisitBuffer(x, local: true) }).ToArray(),
+                            }).Result,
+                            "qkv_parallel_linear");
+                    }
+
+                    break;
+                case TIR.NTT.PackedQKVParallelLinear packedQKVParallelLinear:
+                    {
+                        ValidateQKVParallelLinearScales(args);
+                        WriteWithProfiler(
+                            RazorTemplateEngine.RenderAsync("~/CodeGen/CPU/Templates/Kernels/PackedQKVParallelLinear.cshtml", new TypedKernelTemplateModel<TIR.NTT.PackedQKVParallelLinear>(packedQKVParallelLinear)
+                            {
+                                Arguments = args.Select(x => new KernelArgument { Symbol = VisitBuffer(x, local: true) }).ToArray(),
+                            }).Result,
+                            "packed_qkv_parallel_linear");
+                    }
+
+                    break;
                 case TIR.Memcopy copy:
                     WriteWithProfiler($"tensor_copy_sync({VisitBuffer(args[1], local: true).Name}, {VisitBuffer(args[0], local: true).Name});\n");
                     break;
@@ -924,6 +948,14 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
         }
 
         return symbol;
+    }
+
+    private static void ValidateQKVParallelLinearScales(IReadOnlyList<BaseExpr> args)
+    {
+        if (args.Count < 16 || args.Skip(7).Take(6).Any(arg => arg is not None))
+        {
+            throw new NotSupportedException("NTT QKVParallelLinear codegen currently supports only None input/weight scales.");
+        }
     }
 
     private void DeclBuffer(TIR.Buffer buffer, CSymbol symbol)

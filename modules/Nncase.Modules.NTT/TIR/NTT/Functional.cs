@@ -57,6 +57,86 @@ public partial class NTT
         return new Call(new PackedMatMul(fusedReduce), lhs, rhs, output, loadC, scale);
     }
 
+    public static Call QKVParallelLinear(
+        Expr input,
+        Expr qWeight,
+        Expr kWeight,
+        Expr vWeight,
+        Expr qBias,
+        Expr kBias,
+        Expr vBias,
+        Expr qInputScale,
+        Expr kInputScale,
+        Expr vInputScale,
+        Expr qWeightScale,
+        Expr kWeightScale,
+        Expr vWeightScale,
+        Expr qOutput,
+        Expr kOutput,
+        Expr vOutput,
+        long numHeads,
+        long numKvHeads)
+    {
+        return new Call(
+            new QKVParallelLinear(numHeads, numKvHeads),
+            input,
+            qWeight,
+            kWeight,
+            vWeight,
+            qBias,
+            kBias,
+            vBias,
+            qInputScale,
+            kInputScale,
+            vInputScale,
+            qWeightScale,
+            kWeightScale,
+            vWeightScale,
+            qOutput,
+            kOutput,
+            vOutput);
+    }
+
+    public static Call PackedQKVParallelLinear(
+        Expr input,
+        Expr qWeight,
+        Expr kWeight,
+        Expr vWeight,
+        Expr qBias,
+        Expr kBias,
+        Expr vBias,
+        Expr qInputScale,
+        Expr kInputScale,
+        Expr vInputScale,
+        Expr qWeightScale,
+        Expr kWeightScale,
+        Expr vWeightScale,
+        Expr qOutput,
+        Expr kOutput,
+        Expr vOutput,
+        long numHeads,
+        long numKvHeads)
+    {
+        return new Call(
+            new PackedQKVParallelLinear(numHeads, numKvHeads),
+            input,
+            qWeight,
+            kWeight,
+            vWeight,
+            qBias,
+            kBias,
+            vBias,
+            qInputScale,
+            kInputScale,
+            vInputScale,
+            qWeightScale,
+            kWeightScale,
+            vWeightScale,
+            qOutput,
+            kOutput,
+            vOutput);
+    }
+
     public static Call SUMMA(Expr lhs, Expr rhs, Expr output, Expr loadC, Expr scale, IRArray<int> lhsVectorizedAxes, IRArray<int> rhsVectorizedAxes, bool transA = false, bool transB = false)
     {
         return new Call(new SUMMA(lhsVectorizedAxes, rhsVectorizedAxes, transA, transB), lhs, rhs, output, loadC, scale);

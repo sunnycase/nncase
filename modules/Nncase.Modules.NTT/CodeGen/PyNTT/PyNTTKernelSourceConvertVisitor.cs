@@ -346,6 +346,12 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 case Nncase.TIR.NTT.PackedMatMul packedMatmul:
                     VisitPackedMatmul(packedMatmul, args);
                     break;
+                case Nncase.TIR.NTT.QKVParallelLinear qkvParallelLinear:
+                    VisitQKVParallelLinear(qkvParallelLinear, args);
+                    break;
+                case Nncase.TIR.NTT.PackedQKVParallelLinear packedQKVParallelLinear:
+                    VisitPackedQKVParallelLinear(packedQKVParallelLinear, args);
+                    break;
                 case Nncase.TIR.NTT.SUMMA summa:
                     VisitSUMMA(summa, args);
                     break;
@@ -1684,6 +1690,412 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 useGemv ? "triton/kernels/Gemv.py.jinja" : "triton/kernels/Matmul.py.jinja",
                 templateModel);
             WriteLine(BuildHelperCall(helperName));
+        }
+
+        private void VisitQKVParallelLinear(Nncase.TIR.NTT.QKVParallelLinear qkv, IReadOnlyList<BaseExpr> args)
+        {
+            if (args.Count < 16 ||
+                args[0] is not TIR.Buffer input ||
+                args[1] is not TIR.Buffer qWeight ||
+                args[2] is not TIR.Buffer kWeight ||
+                args[3] is not TIR.Buffer vWeight ||
+                args[13] is not TIR.Buffer qOutput ||
+                args[14] is not TIR.Buffer kOutput ||
+                args[15] is not TIR.Buffer vOutput)
+            {
+                throw new NotSupportedException("PyNTT QKVParallelLinear codegen expects input, q/k/v weights, optional q/k/v bias and scale values, and q/k/v output TIR buffers.");
+            }
+
+            TIR.Buffer? GetOptionalBuffer(int index, string name) => args[index] switch
+            {
+                TIR.Buffer buffer => buffer,
+                None => null,
+                _ => throw new NotSupportedException($"PyNTT QKVParallelLinear expects {name} to be a TIR buffer or None, got {args[index].GetType().Name}."),
+            };
+
+            if (args.Skip(7).Take(6).Any(arg => arg is not None))
+            {
+                throw new NotSupportedException("PyNTT QKVParallelLinear codegen currently supports only None input/weight scales.");
+            }
+
+            var qBias = GetOptionalBuffer(4, "q bias");
+            var kBias = GetOptionalBuffer(5, "k bias");
+            var vBias = GetOptionalBuffer(6, "v bias");
+            SetComputeOp("qkv_parallel_linear");
+            var inputShape = GetBufferActiveShape(input);
+            var qWeightShape = GetBufferActiveShape(qWeight);
+            var kWeightShape = GetBufferActiveShape(kWeight);
+            var vWeightShape = GetBufferActiveShape(vWeight);
+            var qBiasShape = qBias is null ? Array.Empty<PyNTTDimExpression>() : GetBufferActiveShape(qBias);
+            var kBiasShape = kBias is null ? Array.Empty<PyNTTDimExpression>() : GetBufferActiveShape(kBias);
+            var vBiasShape = vBias is null ? Array.Empty<PyNTTDimExpression>() : GetBufferActiveShape(vBias);
+            var qOutputShape = GetBufferActiveShape(qOutput);
+            var kOutputShape = GetBufferActiveShape(kOutput);
+            var vOutputShape = GetBufferActiveShape(vOutput);
+            ValidateMinimumRank("PyNTT QKVParallelLinear input", inputShape, 2);
+            ValidateMinimumRank("PyNTT QKVParallelLinear q weight", qWeightShape, 2);
+            ValidateMinimumRank("PyNTT QKVParallelLinear k weight", kWeightShape, 2);
+            ValidateMinimumRank("PyNTT QKVParallelLinear v weight", vWeightShape, 2);
+            ValidateMinimumRank("PyNTT QKVParallelLinear q output", qOutputShape, 2);
+            ValidateMinimumRank("PyNTT QKVParallelLinear k output", kOutputShape, 2);
+            ValidateMinimumRank("PyNTT QKVParallelLinear v output", vOutputShape, 2);
+
+            foreach (var (name, buffer) in new[]
+            {
+                ("input", input),
+                ("q weight", qWeight),
+                ("k weight", kWeight),
+                ("v weight", vWeight),
+                ("q output", qOutput),
+                ("k output", kOutput),
+                ("v output", vOutput),
+            })
+            {
+                var lanes = GetVectorLanes(buffer.ElemType);
+                if (lanes.Length != 0)
+                {
+                    throw new NotSupportedException($"PyNTT QKVParallelLinear currently expects scalar {name} operands, got lanes [{string.Join(",", lanes)}].");
+                }
+            }
+
+            ValidateProjectionShape("q", inputShape, qWeightShape, qOutputShape);
+            ValidateProjectionShape("k", inputShape, kWeightShape, kOutputShape);
+            ValidateProjectionShape("v", inputShape, vWeightShape, vOutputShape);
+            ValidateBiasShape("q", qBiasShape, qOutputShape);
+            ValidateBiasShape("k", kBiasShape, kOutputShape);
+            ValidateBiasShape("v", vBiasShape, vOutputShape);
+            ValidateBroadcastable("PyNTT QKVParallelLinear input/q output batch", inputShape[..^2], qOutputShape[..^2]);
+            ValidateBroadcastable("PyNTT QKVParallelLinear input/k output batch", inputShape[..^2], kOutputShape[..^2]);
+            ValidateBroadcastable("PyNTT QKVParallelLinear input/v output batch", inputShape[..^2], vOutputShape[..^2]);
+            ValidateBroadcastable("PyNTT QKVParallelLinear q weight/q output batch", qWeightShape[..^2], qOutputShape[..^2]);
+            ValidateBroadcastable("PyNTT QKVParallelLinear k weight/k output batch", kWeightShape[..^2], kOutputShape[..^2]);
+            ValidateBroadcastable("PyNTT QKVParallelLinear v weight/v output batch", vWeightShape[..^2], vOutputShape[..^2]);
+
+            if (input.ElemType != qWeight.ElemType || qWeight.ElemType != kWeight.ElemType || kWeight.ElemType != vWeight.ElemType)
+            {
+                throw new NotSupportedException($"PyNTT QKVParallelLinear expects input and q/k/v weights to have the same dtype, got input={input.ElemType}, q={qWeight.ElemType}, k={kWeight.ElemType}, v={vWeight.ElemType}.");
+            }
+
+            if (qOutput.ElemType != kOutput.ElemType || kOutput.ElemType != vOutput.ElemType)
+            {
+                throw new NotSupportedException($"PyNTT QKVParallelLinear expects q/k/v outputs to have the same dtype, got q={qOutput.ElemType}, k={kOutput.ElemType}, v={vOutput.ElemType}.");
+            }
+
+            var biasDType = qBias?.ElemType ?? kBias?.ElemType ?? vBias?.ElemType ?? qOutput.ElemType;
+            _attrs["op"] = "qkv_parallel_linear";
+            _attrs["tir"] = true;
+            _attrs["dtype"] = GetPyNTTScalarDTypeName(qOutput.ElemType);
+            _attrs["has_bias"] = qBias is not null || kBias is not null || vBias is not null;
+            _attrs["q_shape"] = qOutputShape;
+            _attrs["k_shape"] = kOutputShape;
+            _attrs["v_shape"] = vOutputShape;
+            _attrs["num_heads"] = qkv.NumHeads;
+            _attrs["num_kv_heads"] = qkv.NumKvHeads;
+            var useGemv = IsGemvMatmul(qOutputShape);
+            if (useGemv)
+            {
+                _attrs["gemv"] = true;
+            }
+
+            var helperName = GetNextHelperName(useGemv ? "qkv_gemv_compute" : "qkv_matmul_compute");
+            var templateModel = new PyNTTQKVParallelLinearTemplateModel(
+                helperName,
+                GetBufferScalarPointer(input),
+                GetBufferScalarPointer(qWeight),
+                GetBufferScalarPointer(kWeight),
+                GetBufferScalarPointer(vWeight),
+                qBias is null ? new PyNTTBufferPointerTemplateModel("None") : GetBufferScalarPointer(qBias),
+                kBias is null ? new PyNTTBufferPointerTemplateModel("None") : GetBufferScalarPointer(kBias),
+                vBias is null ? new PyNTTBufferPointerTemplateModel("None") : GetBufferScalarPointer(vBias),
+                GetBufferScalarPointer(qOutput),
+                GetBufferScalarPointer(kOutput),
+                GetBufferScalarPointer(vOutput),
+                qBias is not null,
+                kBias is not null,
+                vBias is not null,
+                GetPyNTTScalarDTypeName(input.ElemType),
+                GetPyNTTScalarDTypeName(qWeight.ElemType),
+                GetPyNTTScalarDTypeName(biasDType),
+                GetPyNTTScalarDTypeName(qOutput.ElemType),
+                GetScalarTritonDType(input.ElemType),
+                GetScalarTritonDType(qWeight.ElemType),
+                GetScalarTritonDType(biasDType),
+                GetScalarTritonDType(qOutput.ElemType),
+                inputShape,
+                qWeightShape,
+                kWeightShape,
+                vWeightShape,
+                qBiasShape,
+                kBiasShape,
+                vBiasShape,
+                qOutputShape,
+                kOutputShape,
+                vOutputShape,
+                GetBufferStrides(input),
+                GetBufferStrides(qWeight),
+                GetBufferStrides(kWeight),
+                GetBufferStrides(vWeight),
+                qBias is null ? Array.Empty<PyNTTDimExpression>() : GetBufferStrides(qBias),
+                kBias is null ? Array.Empty<PyNTTDimExpression>() : GetBufferStrides(kBias),
+                vBias is null ? Array.Empty<PyNTTDimExpression>() : GetBufferStrides(vBias),
+                GetBufferStrides(qOutput),
+                GetBufferStrides(kOutput),
+                GetBufferStrides(vOutput),
+                GetHierarchy(qOutput),
+                $"{input.Name}, ({qWeight.Name}, {kWeight.Name}, {vWeight.Name}) -> ({qOutput.Name}, {kOutput.Name}, {vOutput.Name})");
+
+            WriteHelperTemplate("triton/kernels/QKVParallelLinear.py.jinja", templateModel);
+            WriteLine(BuildHelperCall(helperName));
+        }
+
+        private void VisitPackedQKVParallelLinear(Nncase.TIR.NTT.PackedQKVParallelLinear qkv, IReadOnlyList<BaseExpr> args)
+        {
+            if (args.Count < 16 ||
+                args[0] is not TIR.Buffer input ||
+                args[1] is not TIR.Buffer qWeight ||
+                args[2] is not TIR.Buffer kWeight ||
+                args[3] is not TIR.Buffer vWeight ||
+                args[13] is not TIR.Buffer qOutput ||
+                args[14] is not TIR.Buffer kOutput ||
+                args[15] is not TIR.Buffer vOutput)
+            {
+                throw new NotSupportedException("PyNTT PackedQKVParallelLinear codegen expects input, packed q/k/v weights, optional packed q/k/v bias and scale values, and packed q/k/v output TIR buffers.");
+            }
+
+            TIR.Buffer? GetOptionalBuffer(int index, string name) => args[index] switch
+            {
+                TIR.Buffer buffer => buffer,
+                None => null,
+                _ => throw new NotSupportedException($"PyNTT PackedQKVParallelLinear expects {name} to be a TIR buffer or None, got {args[index].GetType().Name}."),
+            };
+
+            if (args.Skip(7).Take(6).Any(arg => arg is not None))
+            {
+                throw new NotSupportedException("PyNTT PackedQKVParallelLinear codegen currently supports only None input/weight scales.");
+            }
+
+            var qBias = GetOptionalBuffer(4, "q bias");
+            var kBias = GetOptionalBuffer(5, "k bias");
+            var vBias = GetOptionalBuffer(6, "v bias");
+            SetComputeOp("packed_qkv_parallel_linear");
+            var inputShape = GetBufferActiveShape(input);
+            var qWeightShape = GetBufferActiveShape(qWeight);
+            var kWeightShape = GetBufferActiveShape(kWeight);
+            var vWeightShape = GetBufferActiveShape(vWeight);
+            var qBiasShape = qBias is null ? Array.Empty<PyNTTDimExpression>() : GetBufferActiveShape(qBias);
+            var kBiasShape = kBias is null ? Array.Empty<PyNTTDimExpression>() : GetBufferActiveShape(kBias);
+            var vBiasShape = vBias is null ? Array.Empty<PyNTTDimExpression>() : GetBufferActiveShape(vBias);
+            var qOutputShape = GetBufferActiveShape(qOutput);
+            var kOutputShape = GetBufferActiveShape(kOutput);
+            var vOutputShape = GetBufferActiveShape(vOutput);
+            ValidateMinimumRank("PyNTT PackedQKVParallelLinear input", inputShape, 2);
+            ValidateMinimumRank("PyNTT PackedQKVParallelLinear q weight", qWeightShape, 2);
+            ValidateMinimumRank("PyNTT PackedQKVParallelLinear k weight", kWeightShape, 2);
+            ValidateMinimumRank("PyNTT PackedQKVParallelLinear v weight", vWeightShape, 2);
+            ValidateMinimumRank("PyNTT PackedQKVParallelLinear q output", qOutputShape, 2);
+            ValidateMinimumRank("PyNTT PackedQKVParallelLinear k output", kOutputShape, 2);
+            ValidateMinimumRank("PyNTT PackedQKVParallelLinear v output", vOutputShape, 2);
+
+            var inputVectorLanes = GetVectorLanes(input.ElemType);
+            if (inputVectorLanes.Length != 0)
+            {
+                throw new NotSupportedException($"PyNTT PackedQKVParallelLinear expects scalar input operands, got lanes [{string.Join(",", inputVectorLanes)}].");
+            }
+
+            var qWeightLanes = GetVectorLanes(qWeight.ElemType);
+            var kWeightLanes = GetVectorLanes(kWeight.ElemType);
+            var vWeightLanes = GetVectorLanes(vWeight.ElemType);
+            var qOutputLanes = GetVectorLanes(qOutput.ElemType);
+            var kOutputLanes = GetVectorLanes(kOutput.ElemType);
+            var vOutputLanes = GetVectorLanes(vOutput.ElemType);
+            ValidatePackedQKVLanes("q", qWeightLanes, qOutputLanes);
+            ValidatePackedQKVLanes("k", kWeightLanes, kOutputLanes);
+            ValidatePackedQKVLanes("v", vWeightLanes, vOutputLanes);
+            if (!qWeightLanes.SequenceEqual(kWeightLanes) || !qWeightLanes.SequenceEqual(vWeightLanes))
+            {
+                throw new NotSupportedException($"PyNTT PackedQKVParallelLinear expects q/k/v packed lanes to match, got q=[{string.Join(",", qWeightLanes)}], k=[{string.Join(",", kWeightLanes)}], v=[{string.Join(",", vWeightLanes)}].");
+            }
+
+            foreach (var (name, bias) in new[] { ("q", qBias), ("k", kBias), ("v", vBias) })
+            {
+                if (bias is not null && !GetVectorLanes(bias.ElemType).SequenceEqual(qWeightLanes))
+                {
+                    throw new NotSupportedException($"PyNTT PackedQKVParallelLinear expects {name} bias lanes [{string.Join(",", qWeightLanes)}], got [{string.Join(",", GetVectorLanes(bias.ElemType))}].");
+                }
+            }
+
+            ValidatePackedProjectionShape("q", inputShape, qWeightShape, qOutputShape);
+            ValidatePackedProjectionShape("k", inputShape, kWeightShape, kOutputShape);
+            ValidatePackedProjectionShape("v", inputShape, vWeightShape, vOutputShape);
+            ValidatePackedBiasShape("q", qBiasShape, qOutputShape);
+            ValidatePackedBiasShape("k", kBiasShape, kOutputShape);
+            ValidatePackedBiasShape("v", vBiasShape, vOutputShape);
+            ValidateBroadcastable("PyNTT PackedQKVParallelLinear input/q output batch", inputShape[..^2], qOutputShape[..^2]);
+            ValidateBroadcastable("PyNTT PackedQKVParallelLinear input/k output batch", inputShape[..^2], kOutputShape[..^2]);
+            ValidateBroadcastable("PyNTT PackedQKVParallelLinear input/v output batch", inputShape[..^2], vOutputShape[..^2]);
+            ValidateBroadcastable("PyNTT PackedQKVParallelLinear q weight/q output batch", qWeightShape[..^2], qOutputShape[..^2]);
+            ValidateBroadcastable("PyNTT PackedQKVParallelLinear k weight/k output batch", kWeightShape[..^2], kOutputShape[..^2]);
+            ValidateBroadcastable("PyNTT PackedQKVParallelLinear v weight/v output batch", vWeightShape[..^2], vOutputShape[..^2]);
+
+            if (input.ElemType != GetScalarDataType(qWeight.ElemType) ||
+                GetScalarDataType(qWeight.ElemType) != GetScalarDataType(kWeight.ElemType) ||
+                GetScalarDataType(kWeight.ElemType) != GetScalarDataType(vWeight.ElemType))
+            {
+                throw new NotSupportedException($"PyNTT PackedQKVParallelLinear expects input and packed q/k/v weights to have the same scalar dtype, got input={input.ElemType}, q={qWeight.ElemType}, k={kWeight.ElemType}, v={vWeight.ElemType}.");
+            }
+
+            if (GetScalarDataType(qOutput.ElemType) != GetScalarDataType(kOutput.ElemType) ||
+                GetScalarDataType(kOutput.ElemType) != GetScalarDataType(vOutput.ElemType))
+            {
+                throw new NotSupportedException($"PyNTT PackedQKVParallelLinear expects q/k/v outputs to have the same scalar dtype, got q={qOutput.ElemType}, k={kOutput.ElemType}, v={vOutput.ElemType}.");
+            }
+
+            var biasDType = qBias?.ElemType ?? kBias?.ElemType ?? vBias?.ElemType ?? qOutput.ElemType;
+            var nPackedLaneCount = qWeightLanes[0];
+            var nVectorLaneCount = qWeightLanes[1];
+            _attrs["op"] = "packed_qkv_parallel_linear";
+            _attrs["tir"] = true;
+            _attrs["dtype"] = GetPyNTTScalarDTypeName(qOutput.ElemType);
+            _attrs["has_bias"] = qBias is not null || kBias is not null || vBias is not null;
+            _attrs["q_shape"] = qOutputShape;
+            _attrs["k_shape"] = kOutputShape;
+            _attrs["v_shape"] = vOutputShape;
+            _attrs["n_pack_lane"] = nPackedLaneCount;
+            _attrs["n_lane"] = nVectorLaneCount;
+            _attrs["n_scalar_lane"] = checked(nPackedLaneCount * nVectorLaneCount);
+            _attrs["num_heads"] = qkv.NumHeads;
+            _attrs["num_kv_heads"] = qkv.NumKvHeads;
+            var qLogicalOutputShape = qOutputShape.ToArray();
+            qLogicalOutputShape[^1] = MultiplyDim(qLogicalOutputShape[^1], checked(nPackedLaneCount * nVectorLaneCount));
+            var useGemv = IsGemvMatmul(qLogicalOutputShape);
+            if (useGemv)
+            {
+                _attrs["gemv"] = true;
+            }
+
+            var helperName = GetNextHelperName(useGemv ? "packed_qkv_gemv_compute" : "packed_qkv_matmul_compute");
+            var templateModel = new PyNTTQKVParallelLinearTemplateModel(
+                helperName,
+                GetBufferScalarPointer(input),
+                GetBufferScalarPointer(qWeight),
+                GetBufferScalarPointer(kWeight),
+                GetBufferScalarPointer(vWeight),
+                qBias is null ? new PyNTTBufferPointerTemplateModel("None") : GetBufferScalarPointer(qBias),
+                kBias is null ? new PyNTTBufferPointerTemplateModel("None") : GetBufferScalarPointer(kBias),
+                vBias is null ? new PyNTTBufferPointerTemplateModel("None") : GetBufferScalarPointer(vBias),
+                GetBufferScalarPointer(qOutput),
+                GetBufferScalarPointer(kOutput),
+                GetBufferScalarPointer(vOutput),
+                qBias is not null,
+                kBias is not null,
+                vBias is not null,
+                GetPyNTTScalarDTypeName(input.ElemType),
+                GetPyNTTScalarDTypeName(qWeight.ElemType),
+                GetPyNTTScalarDTypeName(biasDType),
+                GetPyNTTScalarDTypeName(qOutput.ElemType),
+                GetScalarTritonDType(input.ElemType),
+                GetScalarTritonDType(qWeight.ElemType),
+                GetScalarTritonDType(biasDType),
+                GetScalarTritonDType(qOutput.ElemType),
+                inputShape,
+                qWeightShape,
+                kWeightShape,
+                vWeightShape,
+                qBiasShape,
+                kBiasShape,
+                vBiasShape,
+                qOutputShape,
+                kOutputShape,
+                vOutputShape,
+                GetBufferStrides(input),
+                GetBufferStrides(qWeight),
+                GetBufferStrides(kWeight),
+                GetBufferStrides(vWeight),
+                qBias is null ? Array.Empty<PyNTTDimExpression>() : GetBufferStrides(qBias),
+                kBias is null ? Array.Empty<PyNTTDimExpression>() : GetBufferStrides(kBias),
+                vBias is null ? Array.Empty<PyNTTDimExpression>() : GetBufferStrides(vBias),
+                GetBufferStrides(qOutput),
+                GetBufferStrides(kOutput),
+                GetBufferStrides(vOutput),
+                GetHierarchy(qOutput),
+                $"{input.Name}, packed({qWeight.Name}, {kWeight.Name}, {vWeight.Name}) -> packed({qOutput.Name}, {kOutput.Name}, {vOutput.Name})")
+            {
+                PackedN = true,
+                NPackedLaneCount = nPackedLaneCount,
+                NVectorLaneCount = nVectorLaneCount,
+            };
+
+            WriteHelperTemplate("triton/kernels/PackedQKVParallelLinear.py.jinja", templateModel);
+            WriteLine(BuildHelperCall(helperName));
+        }
+
+        private static void ValidateBiasShape(string name, PyNTTDimExpression[] biasShape, PyNTTDimExpression[] outputShape)
+        {
+            if (biasShape.Length == 0)
+            {
+                return;
+            }
+
+            ValidateRank($"PyNTT QKVParallelLinear {name} bias", biasShape, 1);
+            if (!SameDim(biasShape[^1], outputShape[^1]))
+            {
+                throw new NotSupportedException($"PyNTT QKVParallelLinear {name} bias last dimension should match output N, got bias=[{ShapeText(biasShape)}], output=[{ShapeText(outputShape)}].");
+            }
+        }
+
+        private static void ValidateProjectionShape(string name, PyNTTDimExpression[] inputShape, PyNTTDimExpression[] weightShape, PyNTTDimExpression[] outputShape)
+        {
+            var inputK = inputShape[^1];
+            var inputM = inputShape[^2];
+            var weightK = weightShape[^2];
+            var weightN = weightShape[^1];
+            if (!SameDim(inputK, weightK) ||
+                !SameDim(outputShape[^2], inputM) ||
+                !SameDim(outputShape[^1], weightN))
+            {
+                throw new NotSupportedException($"PyNTT QKVParallelLinear {name} projection expects input=[...,M,K], weight=[...,K,N], output=[...,M,N], got input=[{ShapeText(inputShape)}], weight=[{ShapeText(weightShape)}], output=[{ShapeText(outputShape)}].");
+            }
+        }
+
+        private static void ValidatePackedQKVLanes(string name, IReadOnlyList<int> weightLanes, IReadOnlyList<int> outputLanes)
+        {
+            if (weightLanes.Count != 2)
+            {
+                throw new NotSupportedException($"PyNTT PackedQKVParallelLinear expects {name} weight lanes [Nr,lane], got [{string.Join(",", weightLanes)}].");
+            }
+
+            if (!weightLanes.SequenceEqual(outputLanes))
+            {
+                throw new NotSupportedException($"PyNTT PackedQKVParallelLinear expects {name} output lanes [{string.Join(",", weightLanes)}], got [{string.Join(",", outputLanes)}].");
+            }
+        }
+
+        private static void ValidatePackedBiasShape(string name, PyNTTDimExpression[] biasShape, PyNTTDimExpression[] outputShape)
+        {
+            if (biasShape.Length == 0)
+            {
+                return;
+            }
+
+            ValidateRank($"PyNTT PackedQKVParallelLinear {name} bias", biasShape, 1);
+            if (!SameDim(biasShape[^1], outputShape[^1]))
+            {
+                throw new NotSupportedException($"PyNTT PackedQKVParallelLinear {name} bias last dimension should match packed output N, got bias=[{ShapeText(biasShape)}], output=[{ShapeText(outputShape)}].");
+            }
+        }
+
+        private static void ValidatePackedProjectionShape(string name, PyNTTDimExpression[] inputShape, PyNTTDimExpression[] weightShape, PyNTTDimExpression[] outputShape)
+        {
+            var inputK = inputShape[^1];
+            var inputM = inputShape[^2];
+            var weightN = weightShape[^2];
+            var weightK = weightShape[^1];
+            if (!SameDim(inputK, weightK) ||
+                !SameDim(outputShape[^2], inputM) ||
+                !SameDim(outputShape[^1], weightN))
+            {
+                throw new NotSupportedException($"PyNTT PackedQKVParallelLinear {name} projection expects input=[...,M,K], weight=[...,N,K]<Nr,lane>, output=[...,M,N]<Nr,lane>, got input=[{ShapeText(inputShape)}], weight=[{ShapeText(weightShape)}], output=[{ShapeText(outputShape)}].");
+            }
         }
 
         private void VisitSUMMA(Nncase.TIR.NTT.SUMMA summa, IReadOnlyList<BaseExpr> args)

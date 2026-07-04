@@ -10,6 +10,7 @@ using System.Text;
 using System.Threading.Tasks;
 using Microsoft.Extensions.DependencyInjection;
 using Nncase.CodeGen;
+using Nncase.CodeGen.NTT;
 using Nncase.Diagnostics;
 using Nncase.IR;
 using Nncase.IR.F;
@@ -99,6 +100,113 @@ public class UnitTestCPUTarget : TestClassBase
         var y = x + 1.0f + x;
         var z = y * 2.0f;
         TestCodeGen(new IR.Tuple(y, z), new[] { x });
+    }
+
+    [Fact]
+    public void TestQKVParallelLinearNTTCodeGen()
+    {
+        var input = CreateBuffer("input", DataTypes.Float32, TIR.MemoryLocation.Data, 0, [2, 3], [3, 1]);
+        var qWeight = CreateBuffer("q_weight", DataTypes.Float32, TIR.MemoryLocation.Data, 24, [3, 4], [4, 1]);
+        var kWeight = CreateBuffer("k_weight", DataTypes.Float32, TIR.MemoryLocation.Data, 72, [3, 2], [2, 1]);
+        var vWeight = CreateBuffer("v_weight", DataTypes.Float32, TIR.MemoryLocation.Data, 96, [3, 2], [2, 1]);
+        var qBias = CreateBuffer("q_bias", DataTypes.Float32, TIR.MemoryLocation.Data, 120, [4], [1]);
+        var qOutput = CreateBuffer("q_output", DataTypes.Float32, TIR.MemoryLocation.Output, 0, [2, 4], [4, 1]);
+        var kOutput = CreateBuffer("k_output", DataTypes.Float32, TIR.MemoryLocation.Output, 32, [2, 2], [2, 1]);
+        var vOutput = CreateBuffer("v_output", DataTypes.Float32, TIR.MemoryLocation.Output, 48, [2, 2], [2, 1]);
+        var body = new TIR.Sequential(
+            TIR.F.NTT.QKVParallelLinear(
+                input,
+                qWeight,
+                kWeight,
+                vWeight,
+                qBias,
+                None.Default,
+                None.Default,
+                None.Default,
+                None.Default,
+                None.Default,
+                None.Default,
+                None.Default,
+                None.Default,
+                qOutput,
+                kOutput,
+                vOutput,
+                2,
+                1),
+            TIR.T.Return(qOutput, kOutput, vOutput));
+        var main = new TIR.PrimFunction("main_prim", CPUTarget.Kind, body, Array.Empty<IVar>())
+        {
+            SchedResult =
+            {
+                IsScheduled = true,
+                DataUsage = 136,
+                OutputUsage = 64,
+                DataAlign = 8,
+                OutputAlign = 8,
+            },
+        };
+
+        Assert.True(main.InferenceType());
+        using var visitor = new KernelCSourceConvertVisitor((NTTTargetOptions)CompileOptions.TargetOptions);
+        visitor.Visit(main);
+        var kernelSource = visitor.GetCSource().Kernel;
+        Assert.Contains("qkv_parallel_linear", kernelSource, StringComparison.Ordinal);
+        Assert.Equal(3, CountOccurrences(kernelSource, "matmul<false, false, false>"));
+        Assert.Contains("binary<ops::add>", kernelSource, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void TestPackedQKVParallelLinearNTTCodeGen()
+    {
+        var packedType = new VectorType(DataTypes.Float32, [2, 2]);
+        var input = CreateBuffer("input", DataTypes.Float32, TIR.MemoryLocation.Data, 0, [2, 3], [3, 1]);
+        var qWeight = CreateBuffer("q_weight", packedType, TIR.MemoryLocation.Data, 24, [1, 3], [3, 1]);
+        var kWeight = CreateBuffer("k_weight", packedType, TIR.MemoryLocation.Data, 72, [1, 3], [3, 1]);
+        var vWeight = CreateBuffer("v_weight", packedType, TIR.MemoryLocation.Data, 120, [1, 3], [3, 1]);
+        var qBias = CreateBuffer("q_bias", packedType, TIR.MemoryLocation.Data, 168, [1], [1]);
+        var qOutput = CreateBuffer("q_output", packedType, TIR.MemoryLocation.Output, 0, [2, 1], [1, 1]);
+        var kOutput = CreateBuffer("k_output", packedType, TIR.MemoryLocation.Output, 32, [2, 1], [1, 1]);
+        var vOutput = CreateBuffer("v_output", packedType, TIR.MemoryLocation.Output, 64, [2, 1], [1, 1]);
+        var body = new TIR.Sequential(
+            TIR.F.NTT.PackedQKVParallelLinear(
+                input,
+                qWeight,
+                kWeight,
+                vWeight,
+                qBias,
+                None.Default,
+                None.Default,
+                None.Default,
+                None.Default,
+                None.Default,
+                None.Default,
+                None.Default,
+                None.Default,
+                qOutput,
+                kOutput,
+                vOutput,
+                2,
+                1),
+            TIR.T.Return(qOutput, kOutput, vOutput));
+        var main = new TIR.PrimFunction("main_prim", CPUTarget.Kind, body, Array.Empty<IVar>())
+        {
+            SchedResult =
+            {
+                IsScheduled = true,
+                DataUsage = 184,
+                OutputUsage = 96,
+                DataAlign = 8,
+                OutputAlign = 8,
+            },
+        };
+
+        Assert.True(main.InferenceType());
+        using var visitor = new KernelCSourceConvertVisitor((NTTTargetOptions)CompileOptions.TargetOptions);
+        visitor.Visit(main);
+        var kernelSource = visitor.GetCSource().Kernel;
+        Assert.Contains("packed_qkv_parallel_linear", kernelSource, StringComparison.Ordinal);
+        Assert.Equal(3, CountOccurrences(kernelSource, "packed_matmul<false>"));
+        Assert.Contains("binary<ops::add>", kernelSource, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -310,5 +418,31 @@ public class UnitTestCPUTarget : TestClassBase
     private void GenerateKModelAndRunFromFn(Function fn, Tensor input, Tensor[] expectedOutput, [CallerMemberName] string? name = null)
     {
         GenerateKModelAndRun(new IRModule(fn), input, expectedOutput, name);
+    }
+
+    private TIR.Buffer CreateBuffer(string name, DataType elemType, TIR.MemoryLocation location, long startBytes, long[] dimensions, long[] strides)
+    {
+        var physicalElementCount = dimensions.Aggregate(1L, (acc, dim) => checked(acc * dim));
+        var sizeBytes = checked(physicalElementCount * elemType.SizeInBytes);
+        return new TIR.Buffer(
+            name,
+            elemType,
+            new TIR.MemSpan(new TIR.PhysicalBuffer(elemType.SizeInBytes, startBytes, sizeBytes, location)),
+            dimensions.Select(dim => (Dimension)dim).ToArray(),
+            strides.Select(stride => (Dimension)stride).ToArray(),
+            null);
+    }
+
+    private int CountOccurrences(string text, string value)
+    {
+        var count = 0;
+        var index = 0;
+        while ((index = text.IndexOf(value, index, StringComparison.Ordinal)) >= 0)
+        {
+            count++;
+            index += value.Length;
+        }
+
+        return count;
     }
 }

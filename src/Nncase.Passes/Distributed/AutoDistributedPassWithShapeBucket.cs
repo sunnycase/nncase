@@ -91,6 +91,7 @@ public sealed partial class AutoDistributedWithShapeBucketPass : FunctionPass
                 var segmentFunction = new SegmentFunctionCloner(newDimVars).Clone(functionForSegments, Unit.Default)
                     .With(name: $"{function.Name}_segment_{segmentIndex}");
                 var rewriter = new AutoDistributedRewriter(_compileOptions, targetOptions, AutoDistributedPhase.Final, _moduleKind, _bidirectional);
+                using var segmentDumpScope = new DumpScope(segmentFunction.Name);
                 segmentFunctions.Add((rewriter.Rewrite(segmentFunction), newDimVars));
             }
 

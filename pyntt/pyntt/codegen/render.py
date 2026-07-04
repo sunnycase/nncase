@@ -1006,6 +1006,362 @@ def _emit_gemv(model: dict[str, Any]) -> str:
     return _emit_matmul_like(model, gemv=True)
 
 
+def _emit_qkv_parallel_linear(model: dict[str, Any]) -> str:
+    m = model["QOutputShape"][-2]
+    k = model["InputShape"][-1]
+    output_batch_rank = len(model["QOutputShape"]) - 2
+    batch_axes = list(range(output_batch_rank))
+    input_batch_offset = _batch_offset_expression(model["InputShape"], model["InputStrides"], output_batch_rank)
+
+    lines = _standard_header(
+        model,
+        f"# generated from PyNTT Jinja QKVParallelLinear.py.jinja\n# {model['Comment']}; input_dtype={model['InputDType']}, weight_dtype={model['WeightDType']}, output_dtype={model['OutputDType']}, input_shape={_shape_tuple(model['InputShape'])}, q_weight_shape={_shape_tuple(model['QWeightShape'])}, k_weight_shape={_shape_tuple(model['KWeightShape'])}, v_weight_shape={_shape_tuple(model['VWeightShape'])}, q_output_shape={_shape_tuple(model['QOutputShape'])}, k_output_shape={_shape_tuple(model['KOutputShape'])}, v_output_shape={_shape_tuple(model['VOutputShape'])}",
+        [
+            ("input0", "Input"),
+            ("q_weight", "QWeight"),
+            ("k_weight", "KWeight"),
+            ("v_weight", "VWeight"),
+            ("q_bias", "QBias"),
+            ("k_bias", "KBias"),
+            ("v_bias", "VBias"),
+            ("q_output", "QOutput"),
+            ("k_output", "KOutput"),
+            ("v_output", "VOutput"),
+        ],
+    )
+    _line(lines, 1, "tmp_shard = shard_index")
+    for axis in range(len(model["Hierarchy"]) - 1, -1, -1):
+        _line(lines, 1, f"shard_coord{axis} = tmp_shard % {model['Hierarchy'][axis]}")
+        _line(lines, 1, f"tmp_shard = tmp_shard // {model['Hierarchy'][axis]}")
+
+    indent = 1
+    for axis in batch_axes:
+        _line(lines, indent, f"for idx{axis} in tl.range(0, {_dim(model['QOutputShape'][axis])}):")
+        indent += 1
+
+    use_gemv = (_max_value(m) == 1) or (_fixed(m) == 1)
+    if use_gemv:
+        block_k = 256
+        k_max = _max_value(k)
+        n_max = max(_max_value(model[name][-1]) or 0 for name in ("QOutputShape", "KOutputShape", "VOutputShape"))
+        use_large_n = k_max is not None and k_max <= block_k and n_max >= 4096
+        block_n = 128 if use_large_n else 32
+        n_stages = 2 if use_large_n else 1
+        _line(lines, indent, f"for m_idx in tl.range(0, {_dim(m)}):")
+        indent += 1
+        for prefix in ("Q", "K", "V"):
+            _emit_qkv_gemv_projection(lines, indent, model, prefix, input_batch_offset, block_n, block_k, n_stages)
+    else:
+        block_m = 16
+        block_n = 64
+        block_k = 64
+        _line(lines, indent, f"for m_start in tl.range(0, {_dim(m)}, {block_m}):")
+        _line(lines, indent + 1, f"offs_m = m_start + tl.arange(0, {block_m})")
+        for prefix in ("Q", "K", "V"):
+            _emit_qkv_matmul_projection(lines, indent + 1, model, prefix, input_batch_offset, block_m, block_n, block_k)
+    return _finish(lines)
+
+
+def _emit_packed_qkv_parallel_linear(model: dict[str, Any]) -> str:
+    q_logical_output_shape = _packed_qkv_logical_output_shape(model, "Q")
+    m = q_logical_output_shape[-2]
+    k = model["InputShape"][-1]
+    output_batch_rank = len(model["QOutputShape"]) - 2
+    batch_axes = list(range(output_batch_rank))
+    input_batch_offset = _batch_offset_expression(model["InputShape"], model["InputStrides"], output_batch_rank)
+    lane_comment = (
+        f", n_packed_lane={model['NPackedLaneCount']}, n_lane={model['NVectorLaneCount']}, "
+        f"n_scalar_lane={model['NPackedLaneCount'] * model['NVectorLaneCount']}"
+    )
+
+    lines = _standard_header(
+        model,
+        f"# generated from PyNTT Jinja PackedQKVParallelLinear.py.jinja\n# {model['Comment']}; input_dtype={model['InputDType']}, weight_dtype={model['WeightDType']}, output_dtype={model['OutputDType']}, input_shape={_shape_tuple(model['InputShape'])}, q_weight_shape={_shape_tuple(model['QWeightShape'])}, k_weight_shape={_shape_tuple(model['KWeightShape'])}, v_weight_shape={_shape_tuple(model['VWeightShape'])}, q_output_shape={_shape_tuple(model['QOutputShape'])}, k_output_shape={_shape_tuple(model['KOutputShape'])}, v_output_shape={_shape_tuple(model['VOutputShape'])}{lane_comment}",
+        [
+            ("input0", "Input"),
+            ("q_weight", "QWeight"),
+            ("k_weight", "KWeight"),
+            ("v_weight", "VWeight"),
+            ("q_bias", "QBias"),
+            ("k_bias", "KBias"),
+            ("v_bias", "VBias"),
+            ("q_output", "QOutput"),
+            ("k_output", "KOutput"),
+            ("v_output", "VOutput"),
+        ],
+    )
+    _line(lines, 1, "tmp_shard = shard_index")
+    for axis in range(len(model["Hierarchy"]) - 1, -1, -1):
+        _line(lines, 1, f"shard_coord{axis} = tmp_shard % {model['Hierarchy'][axis]}")
+        _line(lines, 1, f"tmp_shard = tmp_shard // {model['Hierarchy'][axis]}")
+
+    indent = 1
+    for axis in batch_axes:
+        _line(lines, indent, f"for idx{axis} in tl.range(0, {_dim(q_logical_output_shape[axis])}):")
+        indent += 1
+
+    use_gemv = (_max_value(m) == 1) or (_fixed(m) == 1)
+    if use_gemv:
+        block_k = 256
+        k_max = _max_value(k)
+        n_max = max(_max_value(_packed_qkv_logical_output_shape(model, name)[-1]) or 0 for name in ("Q", "K", "V"))
+        use_large_n = k_max is not None and k_max <= block_k and n_max >= 4096
+        block_n = 128 if use_large_n else 32
+        n_stages = 2 if use_large_n else 1
+        _line(lines, indent, f"for m_idx in tl.range(0, {_dim(m)}):")
+        indent += 1
+        for prefix in ("Q", "K", "V"):
+            _emit_packed_qkv_gemv_projection(lines, indent, model, prefix, input_batch_offset, block_n, block_k, n_stages)
+    else:
+        block_m = 16
+        block_n = 64
+        block_k = 64
+        _line(lines, indent, f"for m_start in tl.range(0, {_dim(m)}, {block_m}):")
+        _line(lines, indent + 1, f"offs_m = m_start + tl.arange(0, {block_m})")
+        for prefix in ("Q", "K", "V"):
+            _emit_packed_qkv_matmul_projection(lines, indent + 1, model, prefix, input_batch_offset, block_m, block_n, block_k)
+    return _finish(lines)
+
+
+def _packed_qkv_logical_output_shape(model: dict[str, Any], prefix: str) -> list[Any]:
+    scalar_lane_count = model["NPackedLaneCount"] * model["NVectorLaneCount"]
+    shape = [dict(dim) if isinstance(dim, dict) else dim for dim in model[f"{prefix}OutputShape"]]
+    shape[-1] = _multiply_dim(shape[-1], scalar_lane_count)
+    return shape
+
+
+def _packed_qkv_weight_offsets(model: dict[str, Any], prefix: str, weight_batch_offset: str, n_expr: str, k_expr: str) -> str:
+    weight_strides = model[f"{prefix}WeightStrides"]
+    terms = [] if weight_batch_offset == "0" else [weight_batch_offset]
+    terms += [
+        f"{_logical_n_index(n_expr, model['NPackedLaneCount'], model['NVectorLaneCount'])} * {_dim(weight_strides[-2])}",
+        f"{k_expr} * {_dim(weight_strides[-1])}",
+    ]
+    return _maybe_vectorized_offset(
+        f"({' + '.join(terms)})",
+        _logical_packed_lane_index(n_expr, model["NPackedLaneCount"], model["NVectorLaneCount"]),
+        _logical_vector_lane_index(n_expr, model["NVectorLaneCount"]),
+        model["NPackedLaneCount"],
+        model["NVectorLaneCount"],
+    )
+
+
+def _packed_qkv_output_offsets(model: dict[str, Any], prefix: str, output_batch_offset: str, n_expr: str, m_expr: str) -> str:
+    output_strides = model[f"{prefix}OutputStrides"]
+    terms = [] if output_batch_offset == "0" else [output_batch_offset]
+    terms += [
+        f"{m_expr} * {_dim(output_strides[-2])}",
+        f"{_logical_n_index(n_expr, model['NPackedLaneCount'], model['NVectorLaneCount'])} * {_dim(output_strides[-1])}",
+    ]
+    return _maybe_vectorized_offset(
+        f"({' + '.join(terms)})",
+        _logical_packed_lane_index(n_expr, model["NPackedLaneCount"], model["NVectorLaneCount"]),
+        _logical_vector_lane_index(n_expr, model["NVectorLaneCount"]),
+        model["NPackedLaneCount"],
+        model["NVectorLaneCount"],
+    )
+
+
+def _packed_qkv_bias_offsets(model: dict[str, Any], prefix: str, n_expr: str) -> str:
+    bias_strides = model[f"{prefix}BiasStrides"]
+    physical = f"({_logical_n_index(n_expr, model['NPackedLaneCount'], model['NVectorLaneCount'])} * {_dim(bias_strides[-1])})"
+    return _maybe_vectorized_offset(
+        physical,
+        _logical_packed_lane_index(n_expr, model["NPackedLaneCount"], model["NVectorLaneCount"]),
+        _logical_vector_lane_index(n_expr, model["NVectorLaneCount"]),
+        model["NPackedLaneCount"],
+        model["NVectorLaneCount"],
+    )
+
+
+def _emit_packed_qkv_gemv_projection(
+    lines: list[str],
+    indent: int,
+    model: dict[str, Any],
+    prefix: str,
+    input_batch_offset: str,
+    block_n: int,
+    block_k: int,
+    n_stages: int,
+) -> None:
+    weight_shape = model[f"{prefix}WeightShape"]
+    output_shape = model[f"{prefix}OutputShape"]
+    weight_strides = model[f"{prefix}WeightStrides"]
+    output_strides = model[f"{prefix}OutputStrides"]
+    output_logical_shape = _packed_qkv_logical_output_shape(model, prefix)
+    weight_batch_offset = _batch_offset_expression(weight_shape, weight_strides, len(output_shape) - 2)
+    output_batch_offset = _batch_offset_expression(output_shape, output_strides, len(output_shape) - 2)
+    n = output_logical_shape[-1]
+    k = model["InputShape"][-1]
+    ptr_weight = f"{prefix.lower()}_weight"
+    ptr_bias = f"{prefix.lower()}_bias"
+    ptr_output = f"{prefix.lower()}_output"
+
+    input_terms = [] if input_batch_offset == "0" else [input_batch_offset]
+    input_terms += [f"m_idx * {_dim(model['InputStrides'][-2])}", f"offs_k * {_dim(model['InputStrides'][-1])}"]
+    input_offsets = f"({' + '.join(input_terms)})"
+    weight_offsets = _packed_qkv_weight_offsets(model, prefix, weight_batch_offset, "offs_n[:, None]", "offs_k[None, :]")
+    output_offsets = _packed_qkv_output_offsets(model, prefix, output_batch_offset, "offs_n", "m_idx")
+
+    _line(lines, indent, f"for {prefix.lower()}_n_start in tl.range(0, {_dim(n)}, {block_n}, num_stages={n_stages}):")
+    _line(lines, indent + 1, f"offs_n = {prefix.lower()}_n_start + tl.arange(0, {block_n})")
+    _line(lines, indent + 1, f"acc = tl.zeros(({block_n},), tl.float32)")
+    _line(lines, indent + 1, f"for k_start in tl.range(0, {_dim(k)}, {block_k}):")
+    _line(lines, indent + 2, f"offs_k = k_start + tl.arange(0, {block_k})")
+    _line(lines, indent + 2, f"weight_values = tl.load({ptr_weight} + {weight_offsets}, mask=(offs_n[:, None] < {_dim(n)}) & (offs_k[None, :] < {_dim(k)}), other=0.0, eviction_policy=\"evict_first\").to(tl.float32)")
+    _line(lines, indent + 2, f"input_values = tl.load(input0 + {input_offsets}, mask=offs_k < {_dim(k)}, other=0.0).to(tl.float32)")
+    _line(lines, indent + 2, "acc += tl.sum(weight_values * input_values[None, :], axis=1)")
+    if model[f"Has{prefix}Bias"]:
+        bias_offsets = _packed_qkv_bias_offsets(model, prefix, "offs_n")
+        _line(lines, indent + 1, f"bias_values = tl.load({ptr_bias} + {bias_offsets}, mask=offs_n < {_dim(n)}, other=0.0).to(tl.float32)")
+        _line(lines, indent + 1, "acc += bias_values")
+    _line(lines, indent + 1, f"tl.store({ptr_output} + {output_offsets}, acc, mask=offs_n < {_dim(n)})")
+
+
+def _emit_packed_qkv_matmul_projection(
+    lines: list[str],
+    indent: int,
+    model: dict[str, Any],
+    prefix: str,
+    input_batch_offset: str,
+    block_m: int,
+    block_n: int,
+    block_k: int,
+) -> None:
+    weight_shape = model[f"{prefix}WeightShape"]
+    output_shape = model[f"{prefix}OutputShape"]
+    weight_strides = model[f"{prefix}WeightStrides"]
+    output_strides = model[f"{prefix}OutputStrides"]
+    output_logical_shape = _packed_qkv_logical_output_shape(model, prefix)
+    weight_batch_offset = _batch_offset_expression(weight_shape, weight_strides, len(output_shape) - 2)
+    output_batch_offset = _batch_offset_expression(output_shape, output_strides, len(output_shape) - 2)
+    n = output_logical_shape[-1]
+    k = model["InputShape"][-1]
+    ptr_weight = f"{prefix.lower()}_weight"
+    ptr_bias = f"{prefix.lower()}_bias"
+    ptr_output = f"{prefix.lower()}_output"
+
+    input_terms = [] if input_batch_offset == "0" else [input_batch_offset]
+    input_terms += [f"offs_m[:, None] * {_dim(model['InputStrides'][-2])}", f"offs_k[None, :] * {_dim(model['InputStrides'][-1])}"]
+    input_offsets = f"({' + '.join(input_terms)})"
+    weight_offsets = _packed_qkv_weight_offsets(model, prefix, weight_batch_offset, "offs_n[None, :]", "offs_k[:, None]")
+    output_offsets = _packed_qkv_output_offsets(model, prefix, output_batch_offset, "offs_n[None, :]", "offs_m[:, None]")
+
+    _line(lines, indent, f"for {prefix.lower()}_n_start in tl.range(0, {_dim(n)}, {block_n}):")
+    _line(lines, indent + 1, f"offs_n = {prefix.lower()}_n_start + tl.arange(0, {block_n})")
+    _line(lines, indent + 1, f"acc = tl.zeros(({block_m}, {block_n}), tl.float32)")
+    _line(lines, indent + 1, f"for k_start in tl.range(0, {_dim(k)}, {block_k}, num_stages=5):")
+    _line(lines, indent + 2, f"offs_k = k_start + tl.arange(0, {block_k})")
+    _line(lines, indent + 2, f"weight_values = tl.load({ptr_weight} + {weight_offsets}, mask=(offs_k[:, None] < {_dim(k)}) & (offs_n[None, :] < {_dim(n)}), other=0.0)")
+    _line(lines, indent + 2, f"input_values = tl.load(input0 + {input_offsets}, mask=(offs_m[:, None] < {_dim(output_logical_shape[-2])}) & (offs_k[None, :] < {_dim(k)}), other=0.0)")
+    dot_precision = ', input_precision="ieee"' if model["InputDType"] == "float32" and model["WeightDType"] == "float32" else ""
+    _line(lines, indent + 2, f"acc += tl.dot(input_values, weight_values{dot_precision})")
+    if model[f"Has{prefix}Bias"]:
+        bias_offsets = _packed_qkv_bias_offsets(model, prefix, "offs_n")
+        _line(lines, indent + 1, f"bias_values = tl.load({ptr_bias} + {bias_offsets}, mask=offs_n < {_dim(n)}, other=0.0).to(tl.float32)")
+        _line(lines, indent + 1, "acc += bias_values[None, :]")
+    _line(lines, indent + 1, f"tl.store({ptr_output} + {output_offsets}, acc, mask=(offs_m[:, None] < {_dim(output_logical_shape[-2])}) & (offs_n[None, :] < {_dim(n)}))")
+
+
+def _emit_qkv_gemv_projection(
+    lines: list[str],
+    indent: int,
+    model: dict[str, Any],
+    prefix: str,
+    input_batch_offset: str,
+    block_n: int,
+    block_k: int,
+    n_stages: int,
+) -> None:
+    weight_shape = model[f"{prefix}WeightShape"]
+    output_shape = model[f"{prefix}OutputShape"]
+    weight_strides = model[f"{prefix}WeightStrides"]
+    bias_strides = model[f"{prefix}BiasStrides"]
+    output_strides = model[f"{prefix}OutputStrides"]
+    weight_batch_offset = _batch_offset_expression(weight_shape, weight_strides, len(output_shape) - 2)
+    output_batch_offset = _batch_offset_expression(output_shape, output_strides, len(output_shape) - 2)
+    n = output_shape[-1]
+    k = model["InputShape"][-1]
+    ptr_weight = f"{prefix.lower()}_weight"
+    ptr_bias = f"{prefix.lower()}_bias"
+    ptr_output = f"{prefix.lower()}_output"
+
+    input_terms = [] if input_batch_offset == "0" else [input_batch_offset]
+    input_terms += [f"m_idx * {_dim(model['InputStrides'][-2])}", f"offs_k * {_dim(model['InputStrides'][-1])}"]
+    input_offsets = f"({' + '.join(input_terms)})"
+
+    weight_terms = [] if weight_batch_offset == "0" else [weight_batch_offset]
+    weight_terms += [f"offs_k[None, :] * {_dim(weight_strides[-2])}", f"offs_n[:, None] * {_dim(weight_strides[-1])}"]
+    weight_offsets = f"({' + '.join(weight_terms)})"
+
+    output_terms = [] if output_batch_offset == "0" else [output_batch_offset]
+    output_terms += [f"m_idx * {_dim(output_strides[-2])}", f"offs_n * {_dim(output_strides[-1])}"]
+    output_offsets = f"({' + '.join(output_terms)})"
+
+    _line(lines, indent, f"for {prefix.lower()}_n_start in tl.range(0, {_dim(n)}, {block_n}, num_stages={n_stages}):")
+    _line(lines, indent + 1, f"offs_n = {prefix.lower()}_n_start + tl.arange(0, {block_n})")
+    _line(lines, indent + 1, f"acc = tl.zeros(({block_n},), tl.float32)")
+    _line(lines, indent + 1, f"for k_start in tl.range(0, {_dim(k)}, {block_k}):")
+    _line(lines, indent + 2, f"offs_k = k_start + tl.arange(0, {block_k})")
+    _line(lines, indent + 2, f"weight_values = tl.load({ptr_weight} + {weight_offsets}, mask=(offs_n[:, None] < {_dim(n)}) & (offs_k[None, :] < {_dim(k)}), other=0.0, eviction_policy=\"evict_first\").to(tl.float32)")
+    _line(lines, indent + 2, f"input_values = tl.load(input0 + {input_offsets}, mask=offs_k < {_dim(k)}, other=0.0).to(tl.float32)")
+    _line(lines, indent + 2, "acc += tl.sum(weight_values * input_values[None, :], axis=1)")
+    if model[f"Has{prefix}Bias"]:
+        _line(lines, indent + 1, f"bias_values = tl.load({ptr_bias} + offs_n * {_dim(bias_strides[-1])}, mask=offs_n < {_dim(n)}, other=0.0).to(tl.float32)")
+        _line(lines, indent + 1, "acc += bias_values")
+    _line(lines, indent + 1, f"tl.store({ptr_output} + {output_offsets}, acc, mask=offs_n < {_dim(n)})")
+
+
+def _emit_qkv_matmul_projection(
+    lines: list[str],
+    indent: int,
+    model: dict[str, Any],
+    prefix: str,
+    input_batch_offset: str,
+    block_m: int,
+    block_n: int,
+    block_k: int,
+) -> None:
+    weight_shape = model[f"{prefix}WeightShape"]
+    output_shape = model[f"{prefix}OutputShape"]
+    weight_strides = model[f"{prefix}WeightStrides"]
+    bias_strides = model[f"{prefix}BiasStrides"]
+    output_strides = model[f"{prefix}OutputStrides"]
+    weight_batch_offset = _batch_offset_expression(weight_shape, weight_strides, len(output_shape) - 2)
+    output_batch_offset = _batch_offset_expression(output_shape, output_strides, len(output_shape) - 2)
+    n = output_shape[-1]
+    k = model["InputShape"][-1]
+    ptr_weight = f"{prefix.lower()}_weight"
+    ptr_bias = f"{prefix.lower()}_bias"
+    ptr_output = f"{prefix.lower()}_output"
+
+    input_terms = [] if input_batch_offset == "0" else [input_batch_offset]
+    input_terms += [f"offs_m[:, None] * {_dim(model['InputStrides'][-2])}", f"offs_k[None, :] * {_dim(model['InputStrides'][-1])}"]
+    input_offsets = f"({' + '.join(input_terms)})"
+
+    weight_terms = [] if weight_batch_offset == "0" else [weight_batch_offset]
+    weight_terms += [f"offs_k[:, None] * {_dim(weight_strides[-2])}", f"offs_n[None, :] * {_dim(weight_strides[-1])}"]
+    weight_offsets = f"({' + '.join(weight_terms)})"
+
+    output_terms = [] if output_batch_offset == "0" else [output_batch_offset]
+    output_terms += [f"offs_m[:, None] * {_dim(output_strides[-2])}", f"offs_n[None, :] * {_dim(output_strides[-1])}"]
+    output_offsets = f"({' + '.join(output_terms)})"
+
+    _line(lines, indent, f"for {prefix.lower()}_n_start in tl.range(0, {_dim(n)}, {block_n}):")
+    _line(lines, indent + 1, f"offs_n = {prefix.lower()}_n_start + tl.arange(0, {block_n})")
+    _line(lines, indent + 1, f"acc = tl.zeros(({block_m}, {block_n}), tl.float32)")
+    _line(lines, indent + 1, f"for k_start in tl.range(0, {_dim(k)}, {block_k}, num_stages=5):")
+    _line(lines, indent + 2, f"offs_k = k_start + tl.arange(0, {block_k})")
+    _line(lines, indent + 2, f"weight_values = tl.load({ptr_weight} + {weight_offsets}, mask=(offs_k[:, None] < {_dim(k)}) & (offs_n[None, :] < {_dim(n)}), other=0.0)")
+    _line(lines, indent + 2, f"input_values = tl.load(input0 + {input_offsets}, mask=(offs_m[:, None] < {_dim(model['QOutputShape'][-2])}) & (offs_k[None, :] < {_dim(k)}), other=0.0)")
+    dot_precision = ', input_precision="ieee"' if model["InputDType"] == "float32" and model["WeightDType"] == "float32" else ""
+    _line(lines, indent + 2, f"acc += tl.dot(input_values, weight_values{dot_precision})")
+    if model[f"Has{prefix}Bias"]:
+        _line(lines, indent + 1, f"bias_values = tl.load({ptr_bias} + offs_n * {_dim(bias_strides[-1])}, mask=offs_n < {_dim(n)}, other=0.0).to(tl.float32)")
+        _line(lines, indent + 1, "acc += bias_values[None, :]")
+    _line(lines, indent + 1, f"tl.store({ptr_output} + {output_offsets}, acc, mask=(offs_m[:, None] < {_dim(output_shape[-2])}) & (offs_n[None, :] < {_dim(n)}))")
+
+
 def _emit_matmul_like(model: dict[str, Any], *, gemv: bool) -> str:
     output_n_scalar_lane_count = model.get("OutputNPackedLaneCount", 1) * model["OutputNVectorLaneCount"]
     logical_output_shape = [dict(dim) if isinstance(dim, dict) else dim for dim in model["OutputShape"]]
@@ -1056,7 +1412,7 @@ def _emit_matmul_like(model: dict[str, Any], *, gemv: bool) -> str:
         _line(lines, indent, f"acc = tl.zeros(({block_n},), tl.float32)")
         _line(lines, indent, f"for k_start in tl.range(0, {_dim(k)}, {block_k}):")
         _line(lines, indent + 1, f"offs_k = k_start + tl.arange(0, {block_k})")
-        _line(lines, indent + 1, f"rhs_values = tl.load(rhs + {rhs_offsets}, mask=(offs_n[:, None] < {_dim(n)}) & (offs_k[None, :] < {_dim(k)}), other=0.0).to(tl.float32)")
+        _line(lines, indent + 1, f"rhs_values = tl.load(rhs + {rhs_offsets}, mask=(offs_n[:, None] < {_dim(n)}) & (offs_k[None, :] < {_dim(k)}), other=0.0, eviction_policy=\"evict_first\").to(tl.float32)")
         _line(lines, indent + 1, f"lhs_values = tl.load(lhs + {lhs_offsets}, mask=offs_k < {_dim(k)}, other=0.0).to(tl.float32)")
         _line(lines, indent + 1, "acc += tl.sum(rhs_values * lhs_values[None, :], axis=1)")
         _line(lines, indent, f"result = acc * {model['Scale']}")
@@ -2390,6 +2746,8 @@ _EMITTERS = {
     "Matmul": _emit_matmul,
     "Pad": _emit_pad,
     "PagedAttention": _emit_paged_attention,
+    "PackedQKVParallelLinear": _emit_packed_qkv_parallel_linear,
+    "QKVParallelLinear": _emit_qkv_parallel_linear,
     "Reduce": _emit_reduce,
     "Reshard": _emit_reshard,
     "RoPE": _emit_rope,

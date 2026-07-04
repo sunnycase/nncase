@@ -482,31 +482,7 @@ public abstract class HuggingFaceModel
     public virtual Tuple<Call, Call, Call> QKVCompute(int count, Expr hiddenStates, Dimension seqLen, Dimension headDim)
     {
         var hidden_shape = new RankedShape(seqLen, -1L, headDim);
-
-        var qProjW = GetWeight($"model.layers.{count}.self_attn.q_proj.weight")!;
-        var qProjB = GetWeight($"model.layers.{count}.self_attn.q_proj.bias");
-
-        var ifScaleQ = GetWeight($"model.layers.{count}.self_attn.q_proj.input_scale");
-        var wScaleQ = GetWeight($"model.layers.{count}.self_attn.q_proj.weight_scale");
-        var queryStates = Linear(hiddenStates, qProjW, qProjB, ifScaleQ, wScaleQ, $"model.layers.{count}.self_attn.q_proj");
-        queryStates = IR.F.Tensors.Reshape(queryStates, hidden_shape);
-
-        var kProjW = GetWeight($"model.layers.{count}.self_attn.k_proj.weight")!;
-        var kProjB = GetWeight($"model.layers.{count}.self_attn.k_proj.bias");
-
-        var ifScaleK = GetWeight($"model.layers.{count}.self_attn.k_proj.input_scale");
-        var wScaleK = GetWeight($"model.layers.{count}.self_attn.k_proj.weight_scale");
-        var keyStates = Linear(hiddenStates, kProjW, kProjB, ifScaleK, wScaleK, $"model.layers.{count}.self_attn.k_proj");
-        keyStates = IR.F.Tensors.Reshape(keyStates, hidden_shape);
-
-        var vProjW = GetWeight($"model.layers.{count}.self_attn.v_proj.weight")!;
-        var vProjB = GetWeight($"model.layers.{count}.self_attn.v_proj.bias");
-
-        var ifScaleV = GetWeight($"model.layers.{count}.self_attn.v_proj.input_scale");
-        var wScaleV = GetWeight($"model.layers.{count}.self_attn.v_proj.weight_scale");
-        var valueStates = Linear(hiddenStates, vProjW, vProjB, ifScaleV, wScaleV, $"model.layers.{count}.self_attn.v_proj");
-        valueStates = IR.F.Tensors.Reshape(valueStates, hidden_shape);
-        return System.Tuple.Create(queryStates, keyStates, valueStates);
+        return BuildQKVParallelLinear(count, hiddenStates, hidden_shape);
     }
 
     public virtual Tuple<Expr, Expr> EagerAttentionForward(Expr query, Expr key, Expr value, Expr? attentionMask, float scaling)
@@ -1022,6 +998,62 @@ public abstract class HuggingFaceModel
             // FIXIT: this is work around for bfloat16
             Context.Outputs!["hiddenStates"] = IR.F.Tensors.Cast(allHiddenStates!, DataTypes.Float32);
         }
+    }
+
+    protected virtual Tuple<Call, Call, Call> BuildQKVParallelLinear(int count, Expr hiddenStates, RankedShape hiddenShape)
+    {
+        var qProjW = GetWeight($"model.layers.{count}.self_attn.q_proj.weight")!;
+        var qProjB = GetWeight($"model.layers.{count}.self_attn.q_proj.bias");
+
+        var ifScaleQ = GetWeight($"model.layers.{count}.self_attn.q_proj.input_scale");
+        var wScaleQ = GetWeight($"model.layers.{count}.self_attn.q_proj.weight_scale");
+        var kProjW = GetWeight($"model.layers.{count}.self_attn.k_proj.weight")!;
+        var kProjB = GetWeight($"model.layers.{count}.self_attn.k_proj.bias");
+
+        var ifScaleK = GetWeight($"model.layers.{count}.self_attn.k_proj.input_scale");
+        var wScaleK = GetWeight($"model.layers.{count}.self_attn.k_proj.weight_scale");
+        var vProjW = GetWeight($"model.layers.{count}.self_attn.v_proj.weight")!;
+        var vProjB = GetWeight($"model.layers.{count}.self_attn.v_proj.bias");
+
+        var ifScaleV = GetWeight($"model.layers.{count}.self_attn.v_proj.input_scale");
+        var wScaleV = GetWeight($"model.layers.{count}.self_attn.v_proj.weight_scale");
+        Expr PrepareWeight(Tensor weight, Tensor? inputScale, Tensor? weightScale)
+        {
+            _ = inputScale;
+            var transposedWeight = IR.F.Tensors.Transpose(weight, new long[] { 1, 0 });
+            return weightScale is null
+                ? IR.F.Tensors.Cast(transposedWeight, hiddenStates.CheckedDataType)
+                : IR.F.Tensors.Cast(transposedWeight, DataTypes.Float8E4M3);
+        }
+
+        Expr PrepareBias(Tensor? bias) => bias is null ? None.Default : IR.F.Tensors.Cast(bias, hiddenStates.CheckedDataType);
+
+        Expr PrepareScale(Tensor? scale) => scale is null ? None.Default : scale;
+
+        var numHeads = (long)Config["num_attention_heads"];
+        var numKvHeads = (long)Config["num_key_value_heads"];
+        var qkvStates = IR.F.NN.QKVParallelLinear(
+            hiddenStates,
+            PrepareWeight(qProjW, ifScaleQ, wScaleQ),
+            PrepareWeight(kProjW, ifScaleK, wScaleK),
+            PrepareWeight(vProjW, ifScaleV, wScaleV),
+            PrepareBias(qProjB),
+            PrepareBias(kProjB),
+            PrepareBias(vProjB),
+            PrepareScale(ifScaleQ),
+            PrepareScale(ifScaleK),
+            PrepareScale(ifScaleV),
+            PrepareScale(wScaleQ),
+            PrepareScale(wScaleK),
+            PrepareScale(wScaleV),
+            numHeads,
+            numKvHeads,
+            hiddenStates.CheckedDataType)
+            .With(metadata: new IRMetadata() { OutputNames = new[] { $"model.layers.{count}.self_attn.qkv_proj" } });
+        var queryStates = IR.F.Tensors.Reshape(IR.F.Tensors.GetItem(qkvStates, 0), hiddenShape);
+        var keyStates = IR.F.Tensors.Reshape(IR.F.Tensors.GetItem(qkvStates, 1), hiddenShape);
+        var valueStates = IR.F.Tensors.Reshape(IR.F.Tensors.GetItem(qkvStates, 2), hiddenShape);
+        return System.Tuple.Create(queryStates, keyStates, valueStates);
     }
 
     /*

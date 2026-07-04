@@ -68,6 +68,39 @@ public static class NN
 
     public static Call RoPE(Expr input, Expr cos, Expr sin) => new Call(new RoPE(), input, cos, sin);
 
+    public static Call QKVParallelLinear(
+        Expr input,
+        Expr qWeight,
+        Expr kWeight,
+        Expr vWeight,
+        Expr qBias,
+        Expr kBias,
+        Expr vBias,
+        Expr qInputScale,
+        Expr kInputScale,
+        Expr vInputScale,
+        Expr qWeightScale,
+        Expr kWeightScale,
+        Expr vWeightScale,
+        long numHeads,
+        long numKvHeads,
+        DataType outputDataType) =>
+        new Call(
+            new QKVParallelLinear(numHeads, numKvHeads, outputDataType),
+            input,
+            qWeight,
+            kWeight,
+            vWeight,
+            qBias,
+            kBias,
+            vBias,
+            qInputScale,
+            kInputScale,
+            vInputScale,
+            qWeightScale,
+            kWeightScale,
+            vWeightScale);
+
     public static Call PRelu(Expr input, Expr slope) => new Call(new PRelu(), input, slope);
 
     public static Call Selu(Expr input, Expr alpha, Expr gamma) => new Call(new Selu(), input, alpha, gamma);

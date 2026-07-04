@@ -545,6 +545,61 @@ public sealed record PyNTTMatmulTemplateModel(
     public int OutputNPackedLaneCount { get; set; } = 1;
 }
 
+public sealed record PyNTTQKVParallelLinearTemplateModel(
+    string FunctionName,
+    PyNTTBufferPointerTemplateModel Input,
+    PyNTTBufferPointerTemplateModel QWeight,
+    PyNTTBufferPointerTemplateModel KWeight,
+    PyNTTBufferPointerTemplateModel VWeight,
+    PyNTTBufferPointerTemplateModel QBias,
+    PyNTTBufferPointerTemplateModel KBias,
+    PyNTTBufferPointerTemplateModel VBias,
+    PyNTTBufferPointerTemplateModel QOutput,
+    PyNTTBufferPointerTemplateModel KOutput,
+    PyNTTBufferPointerTemplateModel VOutput,
+    bool HasQBias,
+    bool HasKBias,
+    bool HasVBias,
+    string InputDType,
+    string WeightDType,
+    string BiasDType,
+    string OutputDType,
+    string InputTritonDType,
+    string WeightTritonDType,
+    string BiasTritonDType,
+    string OutputTritonDType,
+    PyNTTDimExpression[] InputShape,
+    PyNTTDimExpression[] QWeightShape,
+    PyNTTDimExpression[] KWeightShape,
+    PyNTTDimExpression[] VWeightShape,
+    PyNTTDimExpression[] QBiasShape,
+    PyNTTDimExpression[] KBiasShape,
+    PyNTTDimExpression[] VBiasShape,
+    PyNTTDimExpression[] QOutputShape,
+    PyNTTDimExpression[] KOutputShape,
+    PyNTTDimExpression[] VOutputShape,
+    PyNTTDimExpression[] InputStrides,
+    PyNTTDimExpression[] QWeightStrides,
+    PyNTTDimExpression[] KWeightStrides,
+    PyNTTDimExpression[] VWeightStrides,
+    PyNTTDimExpression[] QBiasStrides,
+    PyNTTDimExpression[] KBiasStrides,
+    PyNTTDimExpression[] VBiasStrides,
+    PyNTTDimExpression[] QOutputStrides,
+    PyNTTDimExpression[] KOutputStrides,
+    PyNTTDimExpression[] VOutputStrides,
+    int[] Hierarchy,
+    string Comment)
+{
+    public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
+
+    public bool PackedN { get; set; }
+
+    public int NPackedLaneCount { get; set; } = 1;
+
+    public int NVectorLaneCount { get; set; } = 1;
+}
+
 public sealed record PyNTTSummaTemplateModel(
     string FunctionName,
     string LhsBaseName,

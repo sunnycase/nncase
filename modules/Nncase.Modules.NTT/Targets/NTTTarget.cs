@@ -59,8 +59,10 @@ public abstract class NTTTarget : Target
     public override void RegisterAutoPackingRules(IRulesAddable pass, CompileOptions options)
     {
         var nr = NTTModuleCompiler.Nr;
+        var lane = NTTModuleCompiler.Lane;
 
         pass.Add<Passes.Rules.NTT.PackMatMulByN>(nr);
+        pass.Add<Passes.Rules.NTT.PackQKVParallelLinearByN>(nr, lane);
     }
 
     public override void RegisterAutoVectorizeRules(IRulesAddable pass, CompileOptions options)

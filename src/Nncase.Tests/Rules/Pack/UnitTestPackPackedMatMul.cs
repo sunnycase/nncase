@@ -7,6 +7,7 @@ using Nncase.Passes.Rules.Neutral;
 using Nncase.Passes.Rules.NTT;
 using Nncase.Tests.TestFixture;
 using Xunit;
+using static Nncase.IR.F.NN;
 using static Nncase.IR.F.NTT;
 using static Nncase.IR.F.Tensors;
 
@@ -33,6 +34,43 @@ public class UnitTestVectorizeVectorizedMatMul : TransformTestBase
         Assert.Contains("PackedMatMul", printed, System.StringComparison.Ordinal);
         Assert.Contains("Unpack(Lanes: {4}", printed, System.StringComparison.Ordinal);
         Assert.DoesNotContain("Unpack(Lanes: {8}", printed, System.StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void TestPackQKVParallelLinearByNUsesSinglePackedQKVOp()
+    {
+        var input = new Var("input", new TensorType(DataTypes.BFloat16, new RankedShape(1, 64)));
+        var qWeight = new Var("q_weight", new TensorType(DataTypes.BFloat16, new RankedShape(64, 64)));
+        var kWeight = new Var("k_weight", new TensorType(DataTypes.BFloat16, new RankedShape(64, 32)));
+        var vWeight = new Var("v_weight", new TensorType(DataTypes.BFloat16, new RankedShape(64, 32)));
+        var expr = QKVParallelLinear(
+            input,
+            qWeight,
+            kWeight,
+            vWeight,
+            None.Default,
+            None.Default,
+            None.Default,
+            None.Default,
+            None.Default,
+            None.Default,
+            None.Default,
+            None.Default,
+            None.Default,
+            4,
+            2,
+            DataTypes.BFloat16);
+        CompilerServices.InferenceType(expr);
+
+        var context = new Nncase.Passes.RunPassContext();
+        var post = CompilerServices.Rewrite(expr, [new PackQKVParallelLinearByN(4, 16)], context);
+        CompilerServices.InferenceType(post);
+        var printed = CompilerServices.Print(post);
+
+        Assert.False(ReferenceEquals(expr, post));
+        Assert.Equal(expr.CheckedType, post.CheckedType);
+        Assert.Contains("PackedQKVParallelLinear", printed, System.StringComparison.Ordinal);
+        Assert.DoesNotContain("PackedMatMul", printed, System.StringComparison.Ordinal);
     }
 
     [Fact]

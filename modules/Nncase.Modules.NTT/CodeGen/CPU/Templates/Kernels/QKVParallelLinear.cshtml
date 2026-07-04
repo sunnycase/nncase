@@ -1,0 +1,27 @@
+@model Nncase.CodeGen.NTT.TypedKernelTemplateModel<Nncase.TIR.NTT.QKVParallelLinear>
+@{
+  string input = Model.Arguments[0].Symbol.Name;
+  string qWeight = Model.Arguments[1].Symbol.Name;
+  string kWeight = Model.Arguments[2].Symbol.Name;
+  string vWeight = Model.Arguments[3].Symbol.Name;
+  string qBias = Model.Arguments[4].Symbol.Name;
+  string kBias = Model.Arguments[5].Symbol.Name;
+  string vBias = Model.Arguments[6].Symbol.Name;
+  string qOutput = Model.Arguments[13].Symbol.Name;
+  string kOutput = Model.Arguments[14].Symbol.Name;
+  string vOutput = Model.Arguments[15].Symbol.Name;
+
+  string MatmulLine(string lhs, string rhs, string output) =>
+      $"{Model.Indent}  matmul<false, false, false>({lhs}, {rhs}, {output}, nullptr, fixed_shape_v<>, fixed_shape_v<>, fixed_shape_v<>, fixed_shape_v<>);\n";
+
+  string BiasLine(string bias, string output) =>
+      bias == "nullptr" ? string.Empty : $"{Model.Indent}  binary<ops::add>({output}, {bias}, {output});\n";
+}
+@Html.Raw($"{Model.Indent}{{\n")
+@Html.Raw(MatmulLine(input, qWeight, qOutput))
+@Html.Raw(BiasLine(qBias, qOutput))
+@Html.Raw(MatmulLine(input, kWeight, kOutput))
+@Html.Raw(BiasLine(kBias, kOutput))
+@Html.Raw(MatmulLine(input, vWeight, vOutput))
+@Html.Raw(BiasLine(vBias, vOutput))
+@Html.Raw($"{Model.Indent}}}\n")

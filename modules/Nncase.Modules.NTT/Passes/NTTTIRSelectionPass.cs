@@ -6,6 +6,7 @@ using System.Collections.Generic;
 using System.Diagnostics.CodeAnalysis;
 using System.Linq;
 using System.Reactive;
+using System.Runtime.CompilerServices;
 using System.Text;
 using System.Threading.Tasks;
 using DryIoc.ImTools;
@@ -94,6 +95,64 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
                 return TIR.F.NTT.Matmul((Expr)arguments[0], (Expr)arguments[1], output, None.Default, (Expr)call[IR.CustomNTT.MatMul.Scale], (Expr)arguments[3], matmul.LhsVectorizedAxes, matmul.RhsVectorizedAxes, matmul.TransposeA, matmul.TransposeB, false, matmul.CSourcePath, matmul.FuncName);
             case IR.NTT.PackedMatMul matmul:
                 return TIR.F.NTT.PackedMatMul((Expr)arguments[0], (Expr)arguments[1], output, None.Default, (Expr)call[IR.NTT.PackedMatMul.Scale], matmul.FusedReduce);
+            case IR.NTT.PackedQKVParallelLinear qkv:
+                {
+                    var outputBase = Unsafe.As<Expr, BaseExpr>(ref output);
+                    if (outputBase is not IR.Tuple outputs || outputs.Count != 3)
+                    {
+                        throw new NotSupportedException("PackedQKVParallelLinear TIR selection expects a tuple of 3 outputs.");
+                    }
+
+                    return TIR.F.NTT.PackedQKVParallelLinear(
+                        (Expr)arguments[0],
+                        (Expr)arguments[1],
+                        (Expr)arguments[2],
+                        (Expr)arguments[3],
+                        (Expr)arguments[4],
+                        (Expr)arguments[5],
+                        (Expr)arguments[6],
+                        (Expr)arguments[7],
+                        (Expr)arguments[8],
+                        (Expr)arguments[9],
+                        (Expr)arguments[10],
+                        (Expr)arguments[11],
+                        (Expr)arguments[12],
+                        (Expr)outputs[0],
+                        (Expr)outputs[1],
+                        (Expr)outputs[2],
+                        qkv.NumHeads,
+                        qkv.NumKvHeads);
+                }
+
+            case IR.NN.QKVParallelLinear qkv:
+                {
+                    var outputBase = Unsafe.As<Expr, BaseExpr>(ref output);
+                    if (outputBase is not IR.Tuple outputs || outputs.Count != 3)
+                    {
+                        throw new NotSupportedException("QKVParallelLinear TIR selection expects a tuple of 3 outputs.");
+                    }
+
+                    return TIR.F.NTT.QKVParallelLinear(
+                        (Expr)arguments[0],
+                        (Expr)arguments[1],
+                        (Expr)arguments[2],
+                        (Expr)arguments[3],
+                        (Expr)arguments[4],
+                        (Expr)arguments[5],
+                        (Expr)arguments[6],
+                        (Expr)arguments[7],
+                        (Expr)arguments[8],
+                        (Expr)arguments[9],
+                        (Expr)arguments[10],
+                        (Expr)arguments[11],
+                        (Expr)arguments[12],
+                        (Expr)outputs[0],
+                        (Expr)outputs[1],
+                        (Expr)outputs[2],
+                        qkv.NumHeads,
+                        qkv.NumKvHeads);
+                }
+
             case IR.NN.Conv2D conv:
                 {
                     var input = call[IR.NN.Conv2D.Input];

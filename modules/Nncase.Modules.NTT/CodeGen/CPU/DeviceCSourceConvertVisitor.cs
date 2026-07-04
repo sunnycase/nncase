@@ -382,6 +382,24 @@ public class DeviceCSourceConvertVisitor : CSourceConvertVisitor
                 }).Result);
 
                 break;
+            case TIR.NTT.QKVParallelLinear qkvParallelLinear:
+                ValidateQKVParallelLinearScales(expr.Arguments.ToArray());
+                IndentScope.Writer.Write(RazorTemplateEngine.RenderAsync("~/CodeGen/CPU/Templates/Kernels/QKVParallelLinear.cshtml", new TypedKernelTemplateModel<TIR.NTT.QKVParallelLinear>(qkvParallelLinear)
+                {
+                    Arguments = arguments.Select(x => new KernelArgument { Symbol = x }).ToArray(),
+                    Indent = new string(' ', IndentScope.Writer.Indent),
+                }).Result);
+
+                break;
+            case TIR.NTT.PackedQKVParallelLinear packedQKVParallelLinear:
+                ValidateQKVParallelLinearScales(expr.Arguments.ToArray());
+                IndentScope.Writer.Write(RazorTemplateEngine.RenderAsync("~/CodeGen/CPU/Templates/Kernels/PackedQKVParallelLinear.cshtml", new TypedKernelTemplateModel<TIR.NTT.PackedQKVParallelLinear>(packedQKVParallelLinear)
+                {
+                    Arguments = arguments.Select(x => new KernelArgument { Symbol = x }).ToArray(),
+                    Indent = new string(' ', IndentScope.Writer.Indent),
+                }).Result);
+
+                break;
             case TIR.NTT.Pack vectorize:
                 WriteWithProfiler(RazorTemplateEngine.RenderAsync("~/CodeGen/CPU/Templates/Kernels/Pack.cshtml", new TypedKernelTemplateModel<TIR.NTT.Pack>(vectorize)
                 {
@@ -592,6 +610,14 @@ public class DeviceCSourceConvertVisitor : CSourceConvertVisitor
         symbol = new(string.Empty, string.Empty);
         _exprMemo.Add(expr, symbol);
         return symbol;
+    }
+
+    private static void ValidateQKVParallelLinearScales(IReadOnlyList<BaseExpr> args)
+    {
+        if (args.Count < 16 || args.Skip(7).Take(6).Any(arg => arg is not None))
+        {
+            throw new NotSupportedException("NTT QKVParallelLinear codegen currently supports only None input/weight scales.");
+        }
     }
 
     protected override CSymbol VisitVar(Var expr)

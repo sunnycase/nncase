@@ -787,6 +787,9 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         DistributedSearchGraph argCluster;
         switch (parameterKind, expr)
         {
+            case (_, None e):
+                argCluster = TryInstertTerminator(e);
+                break;
             case (ParameterKind.Input, BaseExpr e):
                 if (isSupported)
                 {
@@ -812,9 +815,6 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
                 break;
             case (_, Paddings e):
                 argCluster = TryInstertTerminator(e);
-                break;
-            case (_, None e):
-                argCluster = TryInstertTerminator(e.With());
                 break;
             default:
                 throw new InvalidOperationException();

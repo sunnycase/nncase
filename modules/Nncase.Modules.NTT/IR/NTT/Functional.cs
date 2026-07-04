@@ -53,6 +53,41 @@ public partial class NTT
         return new Call(new PackedMatMul(outDataType ?? DataTypes.Float32, fusedReduce), lhs, rhs, scale ?? None.Default);
     }
 
+    public static Expr PackedQKVParallelLinear(
+        Expr input,
+        Expr qWeight,
+        Expr kWeight,
+        Expr vWeight,
+        Expr qBias,
+        Expr kBias,
+        Expr vBias,
+        Expr qInputScale,
+        Expr kInputScale,
+        Expr vInputScale,
+        Expr qWeightScale,
+        Expr kWeightScale,
+        Expr vWeightScale,
+        long numHeads,
+        long numKvHeads,
+        DataType? outDataType = null)
+    {
+        return new Call(
+            new PackedQKVParallelLinear(numHeads, numKvHeads, outDataType ?? DataTypes.Float32),
+            input,
+            qWeight,
+            kWeight,
+            vWeight,
+            qBias,
+            kBias,
+            vBias,
+            qInputScale,
+            kInputScale,
+            vInputScale,
+            qWeightScale,
+            kWeightScale,
+            vWeightScale);
+    }
+
     public static Expr VectorizedMatMul(Expr lhs, Expr rhs, IRArray<int> lhsVectorizedAxes, IRArray<int> rhsVectorizedAxes, bool transA = false, bool transB = false, bool fusedReduce = false, DataType? outDataType = null, Expr? scale = null)
     {
         return new Call(new VectorizedMatMul(outDataType ?? DataTypes.Float32, lhsVectorizedAxes, rhsVectorizedAxes, transA, transB, fusedReduce), lhs, rhs, scale ?? None.Default);
