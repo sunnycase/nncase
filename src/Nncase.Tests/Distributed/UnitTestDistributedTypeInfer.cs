@@ -106,6 +106,58 @@ public sealed class UnitTestDistributedTypeInfer : TestClassBase
         Assert.Equal(3, LinqUtility.Combination(2).Count());
     }
 
+    [Fact]
+    public void TestMatMulGluRejectsPartialProjectionSharding()
+    {
+        var sequenceLength = new DimVar("sequence_length") { Metadata = { Range = (1, 128) } };
+        var placement = new Placement(new[] { 4 }, "b", "b");
+        var input = new Var("input", new DistributedType(new TensorType(DataTypes.BFloat16, new Dimension[] { sequenceLength, 64 }), new SBP[] { SBP.B, SBP.S([0]) }, placement));
+        var gateWeight = new Var("gate_weight", new DistributedType(new TensorType(DataTypes.BFloat16, new long[] { 64, 128 }), new SBP[] { SBP.S([0]), SBP.B }, placement));
+        var upWeight = new Var("up_weight", gateWeight.CheckedType);
+
+        var expr = IR.F.NN.MatMulGlu(
+            input,
+            gateWeight,
+            upWeight,
+            None.Default,
+            None.Default,
+            None.Default,
+            None.Default,
+            None.Default,
+            None.Default,
+            IR.NN.GluType.SwiGLU,
+            DataTypes.BFloat16);
+
+        var invalid = Assert.IsType<InvalidType>(expr.CheckedType);
+        Assert.Contains("nonlinear", invalid.Reason, System.StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void TestPackedMatMulGluRejectsPartialProjectionSharding()
+    {
+        var placement = new Placement(new[] { 4 }, "b", "b");
+        var packedBFloat16 = new VectorType(DataTypes.BFloat16, [4, 8]);
+        var input = new Var("input", new DistributedType(new TensorType(DataTypes.BFloat16, new long[] { 1, 64 }), new SBP[] { SBP.B, SBP.S([0]) }, placement));
+        var gateWeight = new Var("gate_weight", new DistributedType(new TensorType(packedBFloat16, new long[] { 4, 64 }), new SBP[] { SBP.B, SBP.S([0]) }, placement));
+        var upWeight = new Var("up_weight", gateWeight.CheckedType);
+
+        var expr = IR.F.NTT.PackedMatMulGlu(
+            input,
+            gateWeight,
+            upWeight,
+            None.Default,
+            None.Default,
+            None.Default,
+            None.Default,
+            None.Default,
+            None.Default,
+            IR.NN.GluType.SwiGLU,
+            DataTypes.BFloat16);
+
+        var invalid = Assert.IsType<InvalidType>(expr.CheckedType);
+        Assert.Contains("nonlinear", invalid.Reason, System.StringComparison.Ordinal);
+    }
+
     [Theory]
     [MemberData(nameof(ReshapeTypeInferData))]
     public void TestReshapeTypeInfer(DistributedType inType, long[] newShape, IRType except)

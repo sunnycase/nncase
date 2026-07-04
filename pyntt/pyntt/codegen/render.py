@@ -1362,6 +1362,442 @@ def _emit_qkv_matmul_projection(
     _line(lines, indent + 1, f"tl.store({ptr_output} + {output_offsets}, acc, mask=(offs_m[:, None] < {_dim(output_shape[-2])}) & (offs_n[None, :] < {_dim(n)}))")
 
 
+def _emit_matmul_glu(model: dict[str, Any]) -> str:
+    return _emit_matmul_glu_like(model, packed=False)
+
+
+def _emit_packed_matmul_glu(model: dict[str, Any]) -> str:
+    return _emit_matmul_glu_like(model, packed=True)
+
+
+def _emit_matmul_glu_like(model: dict[str, Any], *, packed: bool) -> str:
+    logical_output_shape = _matmul_glu_logical_output_shape(model)
+    m = logical_output_shape[-2]
+    k = model["InputShape"][-1]
+    output_batch_rank = len(model["OutputShape"]) - 2
+    batch_axes = list(range(output_batch_rank))
+    input_batch_offset = _batch_offset_expression(model["InputShape"], model["InputStrides"], output_batch_rank)
+    lane_comment = (
+        f", n_packed_lane={model['NPackedLaneCount']}, n_lane={model['NVectorLaneCount']}, "
+        f"n_scalar_lane={model['NPackedLaneCount'] * model['NVectorLaneCount']}"
+        if packed
+        else ""
+    )
+    template_name = "PackedMatMulGlu" if packed else "MatMulGlu"
+
+    lines = _standard_header(
+        model,
+        f"# generated from PyNTT Jinja {template_name}.py.jinja\n# {model['Comment']}; glu={model['GluType']}, input_dtype={model['InputDType']}, weight_dtype={model['WeightDType']}, output_dtype={model['OutputDType']}, input_shape={_shape_tuple(model['InputShape'])}, gate_weight_shape={_shape_tuple(model['GateWeightShape'])}, up_weight_shape={_shape_tuple(model['UpWeightShape'])}, output_shape={_shape_tuple(model['OutputShape'])}{lane_comment}",
+        [
+            ("input0", "Input"),
+            ("gate_weight", "GateWeight"),
+            ("up_weight", "UpWeight"),
+            ("gate_bias", "GateBias"),
+            ("up_bias", "UpBias"),
+            ("output", "Output"),
+        ],
+    )
+    _line(lines, 1, "tmp_shard = shard_index")
+    for axis in range(len(model["Hierarchy"]) - 1, -1, -1):
+        _line(lines, 1, f"shard_coord{axis} = tmp_shard % {model['Hierarchy'][axis]}")
+        _line(lines, 1, f"tmp_shard = tmp_shard // {model['Hierarchy'][axis]}")
+
+    indent = 1
+    for axis in batch_axes:
+        _line(lines, indent, f"for idx{axis} in tl.range(0, {_dim(logical_output_shape[axis])}):")
+        indent += 1
+
+    use_gemv = (_max_value(m) == 1) or (_fixed(m) == 1)
+    if use_gemv:
+        block_k = 256
+        k_max = _max_value(k)
+        n_max = _max_value(logical_output_shape[-1]) or 0
+        use_large_n = k_max is not None and k_max <= block_k and n_max >= 4096
+        block_n = 128 if use_large_n else 32
+        n_stages = 2 if use_large_n else 1
+        _line(lines, indent, f"for m_idx in tl.range(0, {_dim(m)}):")
+        _emit_matmul_glu_gemv(lines, indent + 1, model, input_batch_offset, block_n, block_k, n_stages, packed=packed)
+    else:
+        block_m = 16
+        block_n = 64
+        block_k = 64
+        _line(lines, indent, f"for m_start in tl.range(0, {_dim(m)}, {block_m}):")
+        _line(lines, indent + 1, f"offs_m = m_start + tl.arange(0, {block_m})")
+        _emit_matmul_glu_matmul(lines, indent + 1, model, input_batch_offset, block_m, block_n, block_k, packed=packed)
+    return _finish(lines)
+
+
+def _matmul_glu_logical_output_shape(model: dict[str, Any]) -> list[Any]:
+    shape = [dict(dim) if isinstance(dim, dict) else dim for dim in model["OutputShape"]]
+    if model.get("PackedN"):
+        shape[-1] = _multiply_dim(shape[-1], model["NPackedLaneCount"] * model["NVectorLaneCount"])
+    return shape
+
+
+def _matmul_glu_shape(model: dict[str, Any], name: str, fallback: str) -> list[Any]:
+    return model.get(name) or model[fallback]
+
+
+def _matmul_glu_split_axes(model: dict[str, Any], name: str, rank: int) -> list[list[int]]:
+    axes = model.get(name)
+    if axes is None:
+        return [[] for _ in range(rank)]
+    return axes
+
+
+def _matmul_glu_global_axis_index(
+    model: dict[str, Any],
+    local_expr: str,
+    global_shape: list[Any],
+    axis: int,
+    split_axes: list[int],
+    *,
+    lane_scale: int = 1,
+) -> str:
+    if not split_axes:
+        return local_expr
+    divisor = _split_divisor(split_axes, model["Hierarchy"])
+    base = f"({_split_linear_expression(split_axes, model['Hierarchy'])}) * tl.cdiv({_dim(global_shape[axis])}, {divisor})"
+    if lane_scale != 1:
+        base = f"({base}) * {lane_scale}"
+    return f"(({local_expr}) + ({base}))"
+
+
+def _matmul_glu_split_axes_equal(lhs: list[int], rhs: list[int]) -> bool:
+    return len(lhs) == len(rhs) and all(l == r for l, r in zip(lhs, rhs))
+
+
+def _matmul_glu_split_axes_is_prefix(prefix: list[int], values: list[int]) -> bool:
+    return len(prefix) <= len(values) and all(prefix[index] == values[index] for index in range(len(prefix)))
+
+
+def _matmul_glu_axis_shard_base(
+    model: dict[str, Any],
+    global_shape: list[Any],
+    axis: int,
+    split_axes: list[int],
+    *,
+    lane_scale: int = 1,
+) -> str:
+    if not split_axes:
+        return "0"
+    divisor = _split_divisor(split_axes, model["Hierarchy"])
+    base = f"({_split_linear_expression(split_axes, model['Hierarchy'])}) * tl.cdiv({_dim(global_shape[axis])}, {divisor})"
+    if lane_scale != 1:
+        base = f"({base}) * {lane_scale}"
+    return base
+
+
+def _matmul_glu_tensor_axis_index(
+    model: dict[str, Any],
+    local_expr: str,
+    tensor_shape: list[Any],
+    tensor_global_shape: list[Any],
+    tensor_axis: int,
+    tensor_split_axes: list[int],
+    canonical_global_shape: list[Any],
+    canonical_axis: int,
+    canonical_split_axes: list[int],
+    *,
+    lane_scale: int = 1,
+) -> tuple[str, Any]:
+    tensor_local_limit = _multiply_dim(tensor_shape[tensor_axis], lane_scale)
+    if _matmul_glu_split_axes_equal(tensor_split_axes, canonical_split_axes):
+        return local_expr, tensor_local_limit
+
+    canonical_base = _matmul_glu_axis_shard_base(
+        model,
+        canonical_global_shape,
+        canonical_axis,
+        canonical_split_axes,
+        lane_scale=lane_scale,
+    )
+    global_index = f"(({local_expr}) + ({canonical_base}))"
+    if not tensor_split_axes:
+        return global_index, _multiply_dim(tensor_global_shape[tensor_axis], lane_scale)
+
+    if _matmul_glu_split_axes_is_prefix(tensor_split_axes, canonical_split_axes):
+        tensor_base = _matmul_glu_axis_shard_base(
+            model,
+            tensor_global_shape,
+            tensor_axis,
+            tensor_split_axes,
+            lane_scale=lane_scale,
+        )
+        return f"(({global_index}) - ({tensor_base}))", tensor_local_limit
+
+    return local_expr, tensor_local_limit
+
+
+def _matmul_glu_input_m_index(model: dict[str, Any], m_expr: str) -> tuple[str, Any]:
+    input_shape = model["InputShape"]
+    input_global_shape = _matmul_glu_shape(model, "InputGlobalShape", "InputShape")
+    output_global_shape = _matmul_glu_shape(model, "OutputGlobalShape", "OutputShape")
+    input_split_axes = _matmul_glu_split_axes(model, "InputSplitAxes", len(input_global_shape))
+    output_split_axes = _matmul_glu_split_axes(model, "OutputSplitAxes", len(output_global_shape))
+    return _matmul_glu_tensor_axis_index(
+        model,
+        m_expr,
+        input_shape,
+        input_global_shape,
+        -2,
+        input_split_axes[-2],
+        output_global_shape,
+        -2,
+        output_split_axes[-2],
+    )
+
+
+def _matmul_glu_weight_k_index(model: dict[str, Any], prefix: str, k_expr: str, *, packed: bool) -> tuple[str, Any]:
+    weight_shape = model[f"{prefix}WeightShape"]
+    weight_global_shape = _matmul_glu_shape(model, f"{prefix}WeightGlobalShape", f"{prefix}WeightShape")
+    input_global_shape = _matmul_glu_shape(model, "InputGlobalShape", "InputShape")
+    weight_split_axes = _matmul_glu_split_axes(model, f"{prefix}WeightSplitAxes", len(weight_global_shape))
+    input_split_axes = _matmul_glu_split_axes(model, "InputSplitAxes", len(input_global_shape))
+    weight_axis = -1 if packed else -2
+    return _matmul_glu_tensor_axis_index(
+        model,
+        k_expr,
+        weight_shape,
+        weight_global_shape,
+        weight_axis,
+        weight_split_axes[weight_axis],
+        input_global_shape,
+        -1,
+        input_split_axes[-1],
+    )
+
+
+def _matmul_glu_weight_n_index(
+    model: dict[str, Any],
+    prefix: str,
+    n_expr: str,
+    *,
+    packed: bool,
+) -> tuple[str, Any]:
+    weight_shape = model[f"{prefix}WeightShape"]
+    weight_global_shape = _matmul_glu_shape(model, f"{prefix}WeightGlobalShape", f"{prefix}WeightShape")
+    output_global_shape = _matmul_glu_shape(model, "OutputGlobalShape", "OutputShape")
+    weight_split_axes = _matmul_glu_split_axes(model, f"{prefix}WeightSplitAxes", len(weight_global_shape))
+    output_split_axes = _matmul_glu_split_axes(model, "OutputSplitAxes", len(output_global_shape))
+    weight_axis = -2 if packed else -1
+    lane_scale = model["NPackedLaneCount"] * model["NVectorLaneCount"] if packed else 1
+    return _matmul_glu_tensor_axis_index(
+        model,
+        n_expr,
+        weight_shape,
+        weight_global_shape,
+        weight_axis,
+        weight_split_axes[weight_axis],
+        output_global_shape,
+        -1,
+        output_split_axes[-1],
+        lane_scale=lane_scale,
+    )
+
+
+def _matmul_glu_bias_n_index(
+    model: dict[str, Any],
+    prefix: str,
+    n_expr: str,
+    *,
+    packed: bool,
+) -> tuple[str, Any]:
+    bias_shape = model[f"{prefix}BiasShape"]
+    bias_global_shape = _matmul_glu_shape(model, f"{prefix}BiasGlobalShape", f"{prefix}BiasShape")
+    output_global_shape = _matmul_glu_shape(model, "OutputGlobalShape", "OutputShape")
+    bias_split_axes = _matmul_glu_split_axes(model, f"{prefix}BiasSplitAxes", len(bias_global_shape))
+    output_split_axes = _matmul_glu_split_axes(model, "OutputSplitAxes", len(output_global_shape))
+    lane_scale = model["NPackedLaneCount"] * model["NVectorLaneCount"] if packed else 1
+    return _matmul_glu_tensor_axis_index(
+        model,
+        n_expr,
+        bias_shape,
+        bias_global_shape,
+        -1,
+        bias_split_axes[-1],
+        output_global_shape,
+        -1,
+        output_split_axes[-1],
+        lane_scale=lane_scale,
+    )
+
+
+def _matmul_glu_expr(model: dict[str, Any], gate: str, up: str) -> str:
+    glu_type = str(model.get("GluType", "swiglu")).lower()
+    if glu_type == "swiglu":
+        return f"(({gate}) / (1.0 + tl.exp(-({gate}))) * ({up}))"
+    raise NotImplementedError(f"Unsupported MatMulGlu type: {model.get('GluType')}.")
+
+
+def _matmul_glu_weight_offsets(
+    model: dict[str, Any],
+    prefix: str,
+    weight_batch_offset: str,
+    n_expr: str,
+    k_expr: str,
+    *,
+    packed: bool,
+) -> tuple[str, str, str]:
+    weight_strides = model[f"{prefix}WeightStrides"]
+    weight_n, weight_n_limit = _matmul_glu_weight_n_index(model, prefix, n_expr, packed=packed)
+    weight_k, weight_k_limit = _matmul_glu_weight_k_index(model, prefix, k_expr, packed=packed)
+    terms = [] if weight_batch_offset == "0" else [weight_batch_offset]
+    if not packed:
+        terms += [
+            f"{weight_k} * {_dim(weight_strides[-2])}",
+            f"{weight_n} * {_dim(weight_strides[-1])}",
+        ]
+        return f"({' + '.join(terms)})", weight_n_limit, weight_k_limit
+
+    terms += [
+        f"{_logical_n_index(weight_n, model['NPackedLaneCount'], model['NVectorLaneCount'])} * {_dim(weight_strides[-2])}",
+        f"{weight_k} * {_dim(weight_strides[-1])}",
+    ]
+    return _maybe_vectorized_offset(
+        f"({' + '.join(terms)})",
+        _logical_packed_lane_index(weight_n, model["NPackedLaneCount"], model["NVectorLaneCount"]),
+        _logical_vector_lane_index(weight_n, model["NVectorLaneCount"]),
+        model["NPackedLaneCount"],
+        model["NVectorLaneCount"],
+    ), weight_n_limit, weight_k_limit
+
+
+def _matmul_glu_output_offsets(model: dict[str, Any], output_batch_offset: str, n_expr: str, m_expr: str, *, packed: bool) -> str:
+    output_strides = model["OutputStrides"]
+    terms = [] if output_batch_offset == "0" else [output_batch_offset]
+    n_index = _logical_n_index(n_expr, model["NPackedLaneCount"], model["NVectorLaneCount"]) if packed else n_expr
+    terms += [
+        f"{m_expr} * {_dim(output_strides[-2])}",
+        f"{n_index} * {_dim(output_strides[-1])}",
+    ]
+    physical = f"({' + '.join(terms)})"
+    if not packed:
+        return physical
+    return _maybe_vectorized_offset(
+        physical,
+        _logical_packed_lane_index(n_expr, model["NPackedLaneCount"], model["NVectorLaneCount"]),
+        _logical_vector_lane_index(n_expr, model["NVectorLaneCount"]),
+        model["NPackedLaneCount"],
+        model["NVectorLaneCount"],
+    )
+
+
+def _matmul_glu_bias_offsets(model: dict[str, Any], prefix: str, n_expr: str, *, packed: bool) -> str:
+    bias_strides = model[f"{prefix}BiasStrides"]
+    bias_n, _ = _matmul_glu_bias_n_index(model, prefix, n_expr, packed=packed)
+    if not packed:
+        return f"{bias_n} * {_dim(bias_strides[-1])}"
+    physical = f"({_logical_n_index(bias_n, model['NPackedLaneCount'], model['NVectorLaneCount'])} * {_dim(bias_strides[-1])})"
+    return _maybe_vectorized_offset(
+        physical,
+        _logical_packed_lane_index(bias_n, model["NPackedLaneCount"], model["NVectorLaneCount"]),
+        _logical_vector_lane_index(bias_n, model["NVectorLaneCount"]),
+        model["NPackedLaneCount"],
+        model["NVectorLaneCount"],
+    )
+
+
+def _emit_matmul_glu_gemv(
+    lines: list[str],
+    indent: int,
+    model: dict[str, Any],
+    input_batch_offset: str,
+    block_n: int,
+    block_k: int,
+    n_stages: int,
+    *,
+    packed: bool,
+) -> None:
+    output_shape = _matmul_glu_logical_output_shape(model)
+    output_batch_offset = _batch_offset_expression(model["OutputShape"], model["OutputStrides"], len(model["OutputShape"]) - 2)
+    n = output_shape[-1]
+    k = model["InputShape"][-1]
+
+    input_m, input_m_limit = _matmul_glu_input_m_index(model, "m_idx")
+    input_terms = [] if input_batch_offset == "0" else [input_batch_offset]
+    input_terms += [f"{input_m} * {_dim(model['InputStrides'][-2])}", f"offs_k * {_dim(model['InputStrides'][-1])}"]
+    input_offsets = f"({' + '.join(input_terms)})"
+    output_offsets = _matmul_glu_output_offsets(model, output_batch_offset, "offs_n", "m_idx", packed=packed)
+
+    _line(lines, indent, f"for n_start in tl.range(0, {_dim(n)}, {block_n}, num_stages={n_stages}):")
+    _line(lines, indent + 1, f"offs_n = n_start + tl.arange(0, {block_n})")
+    _line(lines, indent + 1, f"gate_acc = tl.zeros(({block_n},), tl.float32)")
+    _line(lines, indent + 1, f"up_acc = tl.zeros(({block_n},), tl.float32)")
+    _line(lines, indent + 1, f"for k_start in tl.range(0, {_dim(k)}, {block_k}):")
+    _line(lines, indent + 2, f"offs_k = k_start + tl.arange(0, {block_k})")
+    _line(lines, indent + 2, f"input_values = tl.load(input0 + {input_offsets}, mask=(m_idx < {_dim(input_m_limit)}) & (offs_k < {_dim(k)}), other=0.0).to(tl.float32)")
+    for prefix, acc_name in (("Gate", "gate_acc"), ("Up", "up_acc")):
+        weight_shape = model[f"{prefix}WeightShape"]
+        weight_strides = model[f"{prefix}WeightStrides"]
+        weight_batch_offset = _batch_offset_expression(weight_shape, weight_strides, len(model["OutputShape"]) - 2)
+        weight_offsets, weight_n_limit, weight_k_limit = _matmul_glu_weight_offsets(model, prefix, weight_batch_offset, "offs_n[:, None]", "offs_k[None, :]", packed=packed)
+        ptr_weight = f"{prefix.lower()}_weight"
+        _line(lines, indent + 2, f"{prefix.lower()}_weight_values = tl.load({ptr_weight} + {weight_offsets}, mask=(offs_n[:, None] < {_dim(n)}) & (offs_n[:, None] < {_dim(weight_n_limit)}) & (offs_k[None, :] < {_dim(weight_k_limit)}), other=0.0, eviction_policy=\"evict_first\").to(tl.float32)")
+        _line(lines, indent + 2, f"{acc_name} += tl.sum({prefix.lower()}_weight_values * input_values[None, :], axis=1)")
+    if model["HasGateBias"]:
+        gate_bias_offsets = _matmul_glu_bias_offsets(model, "Gate", "offs_n", packed=packed)
+        _, gate_bias_n_limit = _matmul_glu_bias_n_index(model, "Gate", "offs_n", packed=packed)
+        _line(lines, indent + 1, f"gate_acc += tl.load(gate_bias + {gate_bias_offsets}, mask=(offs_n < {_dim(n)}) & (offs_n < {_dim(gate_bias_n_limit)}), other=0.0).to(tl.float32)")
+    if model["HasUpBias"]:
+        up_bias_offsets = _matmul_glu_bias_offsets(model, "Up", "offs_n", packed=packed)
+        _, up_bias_n_limit = _matmul_glu_bias_n_index(model, "Up", "offs_n", packed=packed)
+        _line(lines, indent + 1, f"up_acc += tl.load(up_bias + {up_bias_offsets}, mask=(offs_n < {_dim(n)}) & (offs_n < {_dim(up_bias_n_limit)}), other=0.0).to(tl.float32)")
+    _line(lines, indent + 1, f"result = {_matmul_glu_expr(model, 'gate_acc', 'up_acc')}")
+    _line(lines, indent + 1, f"tl.store(output + {output_offsets}, result, mask=offs_n < {_dim(n)})")
+
+
+def _emit_matmul_glu_matmul(
+    lines: list[str],
+    indent: int,
+    model: dict[str, Any],
+    input_batch_offset: str,
+    block_m: int,
+    block_n: int,
+    block_k: int,
+    *,
+    packed: bool,
+) -> None:
+    output_shape = _matmul_glu_logical_output_shape(model)
+    output_batch_offset = _batch_offset_expression(model["OutputShape"], model["OutputStrides"], len(model["OutputShape"]) - 2)
+    n = output_shape[-1]
+    m = output_shape[-2]
+    k = model["InputShape"][-1]
+    output_offsets = _matmul_glu_output_offsets(model, output_batch_offset, "offs_n[None, :]", "offs_m[:, None]", packed=packed)
+
+    input_m, input_m_limit = _matmul_glu_input_m_index(model, "offs_m[:, None]")
+    input_terms = [] if input_batch_offset == "0" else [input_batch_offset]
+    input_terms += [f"{input_m} * {_dim(model['InputStrides'][-2])}", f"offs_k[None, :] * {_dim(model['InputStrides'][-1])}"]
+    input_offsets = f"({' + '.join(input_terms)})"
+
+    _line(lines, indent, f"for n_start in tl.range(0, {_dim(n)}, {block_n}):")
+    _line(lines, indent + 1, f"offs_n = n_start + tl.arange(0, {block_n})")
+    _line(lines, indent + 1, f"gate_acc = tl.zeros(({block_m}, {block_n}), tl.float32)")
+    _line(lines, indent + 1, f"up_acc = tl.zeros(({block_m}, {block_n}), tl.float32)")
+    _line(lines, indent + 1, f"for k_start in tl.range(0, {_dim(k)}, {block_k}, num_stages=5):")
+    _line(lines, indent + 2, f"offs_k = k_start + tl.arange(0, {block_k})")
+    _line(lines, indent + 2, f"input_values = tl.load(input0 + {input_offsets}, mask=(offs_m[:, None] < {_dim(m)}) & ({input_m} < {_dim(input_m_limit)}) & (offs_k[None, :] < {_dim(k)}), other=0.0)")
+    dot_precision = ', input_precision="ieee"' if model["InputDType"] == "float32" and model["WeightDType"] == "float32" else ""
+    for prefix, acc_name in (("Gate", "gate_acc"), ("Up", "up_acc")):
+        weight_shape = model[f"{prefix}WeightShape"]
+        weight_strides = model[f"{prefix}WeightStrides"]
+        weight_batch_offset = _batch_offset_expression(weight_shape, weight_strides, len(model["OutputShape"]) - 2)
+        weight_offsets, weight_n_limit, weight_k_limit = _matmul_glu_weight_offsets(model, prefix, weight_batch_offset, "offs_n[None, :]", "offs_k[:, None]", packed=packed)
+        ptr_weight = f"{prefix.lower()}_weight"
+        _line(lines, indent + 2, f"{prefix.lower()}_weight_values = tl.load({ptr_weight} + {weight_offsets}, mask=(offs_k[:, None] < {_dim(weight_k_limit)}) & (offs_n[None, :] < {_dim(n)}) & (offs_n[None, :] < {_dim(weight_n_limit)}), other=0.0)")
+        _line(lines, indent + 2, f"{acc_name} += tl.dot(input_values, {prefix.lower()}_weight_values{dot_precision})")
+    if model["HasGateBias"]:
+        gate_bias_offsets = _matmul_glu_bias_offsets(model, "Gate", "offs_n", packed=packed)
+        _, gate_bias_n_limit = _matmul_glu_bias_n_index(model, "Gate", "offs_n", packed=packed)
+        _line(lines, indent + 1, f"gate_acc += tl.load(gate_bias + {gate_bias_offsets}, mask=(offs_n < {_dim(n)}) & (offs_n < {_dim(gate_bias_n_limit)}), other=0.0).to(tl.float32)[None, :]")
+    if model["HasUpBias"]:
+        up_bias_offsets = _matmul_glu_bias_offsets(model, "Up", "offs_n", packed=packed)
+        _, up_bias_n_limit = _matmul_glu_bias_n_index(model, "Up", "offs_n", packed=packed)
+        _line(lines, indent + 1, f"up_acc += tl.load(up_bias + {up_bias_offsets}, mask=(offs_n < {_dim(n)}) & (offs_n < {_dim(up_bias_n_limit)}), other=0.0).to(tl.float32)[None, :]")
+    _line(lines, indent + 1, f"result = {_matmul_glu_expr(model, 'gate_acc', 'up_acc')}")
+    _line(lines, indent + 1, f"tl.store(output + {output_offsets}, result, mask=(offs_m[:, None] < {_dim(m)}) & (offs_n[None, :] < {_dim(n)}))")
+
+
 def _emit_matmul_like(model: dict[str, Any], *, gemv: bool) -> str:
     output_n_scalar_lane_count = model.get("OutputNPackedLaneCount", 1) * model["OutputNVectorLaneCount"]
     logical_output_shape = [dict(dim) if isinstance(dim, dict) else dim for dim in model["OutputShape"]]
@@ -2743,9 +3179,11 @@ _EMITTERS = {
     "Gemv": _emit_gemv,
     "GetPositionIds": _emit_get_position_ids,
     "LayerNorm": _emit_layer_norm,
+    "MatMulGlu": _emit_matmul_glu,
     "Matmul": _emit_matmul,
     "Pad": _emit_pad,
     "PagedAttention": _emit_paged_attention,
+    "PackedMatMulGlu": _emit_packed_matmul_glu,
     "PackedQKVParallelLinear": _emit_packed_qkv_parallel_linear,
     "QKVParallelLinear": _emit_qkv_parallel_linear,
     "Reduce": _emit_reduce,

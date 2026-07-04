@@ -454,6 +454,30 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
                     }
 
                     break;
+                case TIR.NTT.MatMulGlu matMulGlu:
+                    {
+                        ValidateMatMulGluScales(args);
+                        WriteWithProfiler(
+                            RazorTemplateEngine.RenderAsync("~/CodeGen/CPU/Templates/Kernels/MatMulGlu.cshtml", new TypedKernelTemplateModel<TIR.NTT.MatMulGlu>(matMulGlu)
+                            {
+                                Arguments = args.Select(x => new KernelArgument { Symbol = VisitBuffer(x, local: true) }).ToArray(),
+                            }).Result,
+                            "matmul_glu");
+                    }
+
+                    break;
+                case TIR.NTT.PackedMatMulGlu packedMatMulGlu:
+                    {
+                        ValidateMatMulGluScales(args);
+                        WriteWithProfiler(
+                            RazorTemplateEngine.RenderAsync("~/CodeGen/CPU/Templates/Kernels/PackedMatMulGlu.cshtml", new TypedKernelTemplateModel<TIR.NTT.PackedMatMulGlu>(packedMatMulGlu)
+                            {
+                                Arguments = args.Select(x => new KernelArgument { Symbol = VisitBuffer(x, local: true) }).ToArray(),
+                            }).Result,
+                            "packed_matmul_glu");
+                    }
+
+                    break;
                 case TIR.Memcopy copy:
                     WriteWithProfiler($"tensor_copy_sync({VisitBuffer(args[1], local: true).Name}, {VisitBuffer(args[0], local: true).Name});\n");
                     break;
@@ -955,6 +979,14 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
         if (args.Count < 16 || args.Skip(7).Take(6).Any(arg => arg is not None))
         {
             throw new NotSupportedException("NTT QKVParallelLinear codegen currently supports only None input/weight scales.");
+        }
+    }
+
+    private static void ValidateMatMulGluScales(IReadOnlyList<BaseExpr> args)
+    {
+        if (args.Count < 10 || args.Skip(5).Take(4).Any(arg => arg is not None))
+        {
+            throw new NotSupportedException("NTT MatMulGlu codegen currently supports only None input/weight scales.");
         }
     }
 

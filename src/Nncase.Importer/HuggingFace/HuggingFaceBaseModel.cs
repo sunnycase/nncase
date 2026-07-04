@@ -458,25 +458,11 @@ public abstract class HuggingFaceModel
 
     public virtual Call LLMMlp(int count, Expr hiddenStates)
     {
-        var gateProjW = GetWeight($"model.layers.{count}.mlp.gate_proj.weight")!;
-        var upProjW = GetWeight($"model.layers.{count}.mlp.up_proj.weight")!;
         var downProjW = GetWeight($"model.layers.{count}.mlp.down_proj.weight")!;
-        var ifScaleGate = GetWeight($"model.layers.{count}.mlp.gate_proj.input_scale");
-        var wScaleGate = GetWeight($"model.layers.{count}.mlp.gate_proj.weight_scale");
-        var ifScaleUp = GetWeight($"model.layers.{count}.mlp.up_proj.input_scale");
-        var wScaleUp = GetWeight($"model.layers.{count}.mlp.up_proj.weight_scale");
         var ifScaleDown = GetWeight($"model.layers.{count}.mlp.down_proj.input_scale");
         var wScaleDown = GetWeight($"model.layers.{count}.mlp.down_proj.weight_scale");
 
-        var tmp = Linear(hiddenStates, gateProjW, null, ifScaleGate, wScaleGate, $"model.layers.{count}.mlp.gate_proj");
-
-        if (Config.ContainsKey("hidden_act"))
-        {
-            var actType = Config.GetNestedValue<string>("hidden_act");
-            tmp = ModelUtils.ActFunc(tmp, actType);
-        }
-
-        return Linear(tmp * Linear(hiddenStates, upProjW, null, ifScaleUp, wScaleUp, $"model.layers.{count}.mlp.up_proj"), downProjW, null, ifScaleDown, wScaleDown, $"model.layers.{count}.mlp.down_proj");
+        return Linear(BuildMatMulGlu(count, hiddenStates), downProjW, null, ifScaleDown, wScaleDown, $"model.layers.{count}.mlp.down_proj");
     }
 
     public virtual Tuple<Call, Call, Call> QKVCompute(int count, Expr hiddenStates, Dimension seqLen, Dimension headDim)
@@ -1054,6 +1040,55 @@ public abstract class HuggingFaceModel
         var keyStates = IR.F.Tensors.Reshape(IR.F.Tensors.GetItem(qkvStates, 1), hiddenShape);
         var valueStates = IR.F.Tensors.Reshape(IR.F.Tensors.GetItem(qkvStates, 2), hiddenShape);
         return System.Tuple.Create(queryStates, keyStates, valueStates);
+    }
+
+    protected virtual Call BuildMatMulGlu(int count, Expr hiddenStates)
+    {
+        var gateProjW = GetWeight($"model.layers.{count}.mlp.gate_proj.weight")!;
+        var gateProjB = GetWeight($"model.layers.{count}.mlp.gate_proj.bias");
+        var upProjW = GetWeight($"model.layers.{count}.mlp.up_proj.weight")!;
+        var upProjB = GetWeight($"model.layers.{count}.mlp.up_proj.bias");
+        var ifScaleGate = GetWeight($"model.layers.{count}.mlp.gate_proj.input_scale");
+        var wScaleGate = GetWeight($"model.layers.{count}.mlp.gate_proj.weight_scale");
+        var ifScaleUp = GetWeight($"model.layers.{count}.mlp.up_proj.input_scale");
+        var wScaleUp = GetWeight($"model.layers.{count}.mlp.up_proj.weight_scale");
+
+        Expr PrepareWeight(Tensor weight, Tensor? inputScale, Tensor? weightScale)
+        {
+            _ = inputScale;
+            var transposedWeight = IR.F.Tensors.Transpose(weight, new long[] { 1, 0 });
+            return weightScale is null
+                ? IR.F.Tensors.Cast(transposedWeight, hiddenStates.CheckedDataType)
+                : IR.F.Tensors.Cast(transposedWeight, DataTypes.Float8E4M3);
+        }
+
+        Expr PrepareBias(Tensor? bias) => bias is null ? None.Default : IR.F.Tensors.Cast(bias, hiddenStates.CheckedDataType);
+
+        Expr PrepareScale(Tensor? scale) => scale is null ? None.Default : scale;
+
+        return IR.F.NN.MatMulGlu(
+            hiddenStates,
+            PrepareWeight(gateProjW, ifScaleGate, wScaleGate),
+            PrepareWeight(upProjW, ifScaleUp, wScaleUp),
+            PrepareBias(gateProjB),
+            PrepareBias(upProjB),
+            PrepareScale(ifScaleGate),
+            PrepareScale(ifScaleUp),
+            PrepareScale(wScaleGate),
+            PrepareScale(wScaleUp),
+            GetMlpGluType(),
+            hiddenStates.CheckedDataType)
+            .With(metadata: new IRMetadata() { OutputNames = new[] { $"model.layers.{count}.mlp.gate_up_proj" } });
+    }
+
+    protected virtual GluType GetMlpGluType()
+    {
+        var actType = Config.ContainsKey("hidden_act") ? Config.GetNestedValue<string>("hidden_act") : "silu";
+        return actType.ToUpperInvariant() switch
+        {
+            "SILU" or "SWISH" => GluType.SwiGLU,
+            _ => throw new NotSupportedException($"MatMulGlu currently supports only SwiGLU, got hidden_act={actType}."),
+        };
     }
 
     /*

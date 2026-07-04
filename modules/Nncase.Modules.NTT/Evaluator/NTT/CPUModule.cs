@@ -30,5 +30,6 @@ internal class NTTModule : IApplicationPart
 
         registrator.RegisterManyInterface<PackedMatMulEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<PackedQKVParallelLinearEvaluator>(reuse: Reuse.Singleton);
+        registrator.RegisterManyInterface<PackedMatMulGluEvaluator>(reuse: Reuse.Singleton);
     }
 }

@@ -210,6 +210,95 @@ public class UnitTestCPUTarget : TestClassBase
     }
 
     [Fact]
+    public void TestMatMulGluNTTCodeGen()
+    {
+        var input = CreateBuffer("input", DataTypes.Float32, TIR.MemoryLocation.Data, 0, [2, 3], [3, 1]);
+        var gateWeight = CreateBuffer("gate_weight", DataTypes.Float32, TIR.MemoryLocation.Data, 24, [3, 4], [4, 1]);
+        var upWeight = CreateBuffer("up_weight", DataTypes.Float32, TIR.MemoryLocation.Data, 72, [3, 4], [4, 1]);
+        var gateBias = CreateBuffer("gate_bias", DataTypes.Float32, TIR.MemoryLocation.Data, 120, [4], [1]);
+        var output = CreateBuffer("output", DataTypes.Float32, TIR.MemoryLocation.Output, 0, [2, 4], [4, 1]);
+        var body = new TIR.Sequential(
+            TIR.F.NTT.MatMulGlu(
+                input,
+                gateWeight,
+                upWeight,
+                gateBias,
+                None.Default,
+                None.Default,
+                None.Default,
+                None.Default,
+                None.Default,
+                output,
+                IR.NN.GluType.SwiGLU),
+            TIR.T.Return(output));
+        var main = new TIR.PrimFunction("main_prim", CPUTarget.Kind, body, Array.Empty<IVar>())
+        {
+            SchedResult =
+            {
+                IsScheduled = true,
+                DataUsage = 136,
+                OutputUsage = 32,
+                DataAlign = 8,
+                OutputAlign = 8,
+            },
+        };
+
+        Assert.True(main.InferenceType());
+        using var visitor = new KernelCSourceConvertVisitor((NTTTargetOptions)CompileOptions.TargetOptions);
+        visitor.Visit(main);
+        var kernelSource = visitor.GetCSource().Kernel;
+        Assert.Contains("matmul_glu", kernelSource, StringComparison.Ordinal);
+        Assert.Equal(2, CountOccurrences(kernelSource, "matmul<false, false, false>"));
+        Assert.Contains("unary<ops::swish>", kernelSource, StringComparison.Ordinal);
+        Assert.Contains("binary<ops::mul>", kernelSource, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void TestPackedMatMulGluNTTCodeGen()
+    {
+        var packedType = new VectorType(DataTypes.Float32, [2, 2]);
+        var input = CreateBuffer("input", DataTypes.Float32, TIR.MemoryLocation.Data, 0, [2, 3], [3, 1]);
+        var gateWeight = CreateBuffer("gate_weight", packedType, TIR.MemoryLocation.Data, 24, [1, 3], [3, 1]);
+        var upWeight = CreateBuffer("up_weight", packedType, TIR.MemoryLocation.Data, 72, [1, 3], [3, 1]);
+        var gateBias = CreateBuffer("gate_bias", packedType, TIR.MemoryLocation.Data, 120, [1], [1]);
+        var output = CreateBuffer("output", packedType, TIR.MemoryLocation.Output, 0, [2, 1], [1, 1]);
+        var body = new TIR.Sequential(
+            TIR.F.NTT.PackedMatMulGlu(
+                input,
+                gateWeight,
+                upWeight,
+                gateBias,
+                None.Default,
+                None.Default,
+                None.Default,
+                None.Default,
+                None.Default,
+                output,
+                IR.NN.GluType.SwiGLU),
+            TIR.T.Return(output));
+        var main = new TIR.PrimFunction("main_prim", CPUTarget.Kind, body, Array.Empty<IVar>())
+        {
+            SchedResult =
+            {
+                IsScheduled = true,
+                DataUsage = 136,
+                OutputUsage = 32,
+                DataAlign = 8,
+                OutputAlign = 8,
+            },
+        };
+
+        Assert.True(main.InferenceType());
+        using var visitor = new KernelCSourceConvertVisitor((NTTTargetOptions)CompileOptions.TargetOptions);
+        visitor.Visit(main);
+        var kernelSource = visitor.GetCSource().Kernel;
+        Assert.Contains("packed_matmul_glu", kernelSource, StringComparison.Ordinal);
+        Assert.Equal(2, CountOccurrences(kernelSource, "packed_matmul<false>"));
+        Assert.Contains("unary<ops::swish>", kernelSource, StringComparison.Ordinal);
+        Assert.Contains("binary<ops::mul>", kernelSource, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void TestCodeGenVisitLeafVar()
     {
         Assert.Throws<InvalidOperationException>(() => TestCodeGen(Var.Scalar("x", DataTypes.Float32), Array.Empty<Var>()));

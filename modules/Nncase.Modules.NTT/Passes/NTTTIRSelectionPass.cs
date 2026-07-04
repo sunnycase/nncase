@@ -95,6 +95,19 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
                 return TIR.F.NTT.Matmul((Expr)arguments[0], (Expr)arguments[1], output, None.Default, (Expr)call[IR.CustomNTT.MatMul.Scale], (Expr)arguments[3], matmul.LhsVectorizedAxes, matmul.RhsVectorizedAxes, matmul.TransposeA, matmul.TransposeB, false, matmul.CSourcePath, matmul.FuncName);
             case IR.NTT.PackedMatMul matmul:
                 return TIR.F.NTT.PackedMatMul((Expr)arguments[0], (Expr)arguments[1], output, None.Default, (Expr)call[IR.NTT.PackedMatMul.Scale], matmul.FusedReduce);
+            case IR.NTT.PackedMatMulGlu matmulGlu:
+                return TIR.F.NTT.PackedMatMulGlu(
+                    (Expr)arguments[0],
+                    (Expr)arguments[1],
+                    (Expr)arguments[2],
+                    (Expr)arguments[3],
+                    (Expr)arguments[4],
+                    (Expr)arguments[5],
+                    (Expr)arguments[6],
+                    (Expr)arguments[7],
+                    (Expr)arguments[8],
+                    output,
+                    matmulGlu.GluType);
             case IR.NTT.PackedQKVParallelLinear qkv:
                 {
                     var outputBase = Unsafe.As<Expr, BaseExpr>(ref output);
@@ -152,6 +165,20 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
                         qkv.NumHeads,
                         qkv.NumKvHeads);
                 }
+
+            case IR.NN.MatMulGlu matmulGlu:
+                return TIR.F.NTT.MatMulGlu(
+                    (Expr)arguments[0],
+                    (Expr)arguments[1],
+                    (Expr)arguments[2],
+                    (Expr)arguments[3],
+                    (Expr)arguments[4],
+                    (Expr)arguments[5],
+                    (Expr)arguments[6],
+                    (Expr)arguments[7],
+                    (Expr)arguments[8],
+                    output,
+                    matmulGlu.GluType);
 
             case IR.NN.Conv2D conv:
                 {

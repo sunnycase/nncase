@@ -88,6 +88,32 @@ public partial class NTT
             vWeightScale);
     }
 
+    public static Expr PackedMatMulGlu(
+        Expr input,
+        Expr gateWeight,
+        Expr upWeight,
+        Expr gateBias,
+        Expr upBias,
+        Expr gateInputScale,
+        Expr upInputScale,
+        Expr gateWeightScale,
+        Expr upWeightScale,
+        IR.NN.GluType gluType,
+        DataType? outDataType = null)
+    {
+        return new Call(
+            new PackedMatMulGlu(gluType, outDataType ?? DataTypes.Float32),
+            input,
+            gateWeight,
+            upWeight,
+            gateBias,
+            upBias,
+            gateInputScale,
+            upInputScale,
+            gateWeightScale,
+            upWeightScale);
+    }
+
     public static Expr VectorizedMatMul(Expr lhs, Expr rhs, IRArray<int> lhsVectorizedAxes, IRArray<int> rhsVectorizedAxes, bool transA = false, bool transB = false, bool fusedReduce = false, DataType? outDataType = null, Expr? scale = null)
     {
         return new Call(new VectorizedMatMul(outDataType ?? DataTypes.Float32, lhsVectorizedAxes, rhsVectorizedAxes, transA, transB, fusedReduce), lhs, rhs, scale ?? None.Default);

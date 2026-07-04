@@ -23,6 +23,7 @@ internal class NNModule : IApplicationPart
         registrator.RegisterManyInterface<ReluEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<Relu6Evaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<QKVParallelLinearEvaluator>(reuse: Reuse.Singleton);
+        registrator.RegisterManyInterface<MatMulGluEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<RoPEEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<SeluEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<SigmoidEvaluator>(reuse: Reuse.Singleton);

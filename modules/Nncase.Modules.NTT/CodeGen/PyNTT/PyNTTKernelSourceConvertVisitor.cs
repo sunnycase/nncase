@@ -352,6 +352,12 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 case Nncase.TIR.NTT.PackedQKVParallelLinear packedQKVParallelLinear:
                     VisitPackedQKVParallelLinear(packedQKVParallelLinear, args);
                     break;
+                case Nncase.TIR.NTT.MatMulGlu matMulGlu:
+                    VisitMatMulGlu(matMulGlu, args);
+                    break;
+                case Nncase.TIR.NTT.PackedMatMulGlu packedMatMulGlu:
+                    VisitPackedMatMulGlu(packedMatMulGlu, args);
+                    break;
                 case Nncase.TIR.NTT.SUMMA summa:
                     VisitSUMMA(summa, args);
                     break;
@@ -2027,6 +2033,436 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
 
             WriteHelperTemplate("triton/kernels/PackedQKVParallelLinear.py.jinja", templateModel);
             WriteLine(BuildHelperCall(helperName));
+        }
+
+        private void VisitMatMulGlu(Nncase.TIR.NTT.MatMulGlu matMulGlu, IReadOnlyList<BaseExpr> args)
+        {
+            if (args.Count < 10 ||
+                args[0] is not TIR.Buffer input ||
+                args[1] is not TIR.Buffer gateWeight ||
+                args[2] is not TIR.Buffer upWeight ||
+                args[9] is not TIR.Buffer output)
+            {
+                throw new NotSupportedException("PyNTT MatMulGlu codegen expects input, gate/up weights, optional gate/up bias and scale values, and output TIR buffers.");
+            }
+
+            TIR.Buffer? GetOptionalBuffer(int index, string name) => args[index] switch
+            {
+                TIR.Buffer buffer => buffer,
+                None => null,
+                _ => throw new NotSupportedException($"PyNTT MatMulGlu expects {name} to be a TIR buffer or None, got {args[index].GetType().Name}."),
+            };
+
+            if (args.Skip(5).Take(4).Any(arg => arg is not None))
+            {
+                throw new NotSupportedException("PyNTT MatMulGlu codegen currently supports only None input/weight scales.");
+            }
+
+            var gateBias = GetOptionalBuffer(3, "gate bias");
+            var upBias = GetOptionalBuffer(4, "up bias");
+            SetComputeOp("matmul_glu");
+            var inputShape = GetBufferActiveShape(input);
+            var gateWeightShape = GetBufferActiveShape(gateWeight);
+            var upWeightShape = GetBufferActiveShape(upWeight);
+            var gateBiasShape = gateBias is null ? Array.Empty<PyNTTDimExpression>() : GetBufferActiveShape(gateBias);
+            var upBiasShape = upBias is null ? Array.Empty<PyNTTDimExpression>() : GetBufferActiveShape(upBias);
+            var outputShape = GetBufferActiveShape(output);
+            var inputGlobalShape = GetBufferGlobalShape(input);
+            var gateWeightGlobalShape = GetBufferGlobalShape(gateWeight);
+            var upWeightGlobalShape = GetBufferGlobalShape(upWeight);
+            var gateBiasGlobalShape = gateBias is null ? Array.Empty<PyNTTDimExpression>() : GetBufferGlobalShape(gateBias);
+            var upBiasGlobalShape = upBias is null ? Array.Empty<PyNTTDimExpression>() : GetBufferGlobalShape(upBias);
+            var outputGlobalShape = GetBufferGlobalShape(output);
+            var inputSplitAxes = GetBufferSplitAxes(input, inputGlobalShape.Length);
+            var gateWeightSplitAxes = GetBufferSplitAxes(gateWeight, gateWeightGlobalShape.Length);
+            var upWeightSplitAxes = GetBufferSplitAxes(upWeight, upWeightGlobalShape.Length);
+            var gateBiasSplitAxes = gateBias is null ? Array.Empty<int[]>() : GetBufferSplitAxes(gateBias, gateBiasGlobalShape.Length);
+            var upBiasSplitAxes = upBias is null ? Array.Empty<int[]>() : GetBufferSplitAxes(upBias, upBiasGlobalShape.Length);
+            var outputSplitAxes = GetBufferSplitAxes(output, outputGlobalShape.Length);
+            ValidateMinimumRank("PyNTT MatMulGlu input", inputShape, 2);
+            ValidateMinimumRank("PyNTT MatMulGlu gate weight", gateWeightShape, 2);
+            ValidateMinimumRank("PyNTT MatMulGlu up weight", upWeightShape, 2);
+            ValidateMinimumRank("PyNTT MatMulGlu output", outputShape, 2);
+
+            foreach (var (name, buffer) in new[]
+            {
+                ("input", input),
+                ("gate weight", gateWeight),
+                ("up weight", upWeight),
+                ("output", output),
+            })
+            {
+                var lanes = GetVectorLanes(buffer.ElemType);
+                if (lanes.Length != 0)
+                {
+                    throw new NotSupportedException($"PyNTT MatMulGlu currently expects scalar {name} operands, got lanes [{string.Join(",", lanes)}].");
+                }
+            }
+
+            ValidateMatMulGluProjectionShape("gate", inputShape, gateWeightShape, outputShape, inputGlobalShape, gateWeightGlobalShape, outputGlobalShape, inputSplitAxes, gateWeightSplitAxes, outputSplitAxes, packed: false);
+            ValidateMatMulGluProjectionShape("up", inputShape, upWeightShape, outputShape, inputGlobalShape, upWeightGlobalShape, outputGlobalShape, inputSplitAxes, upWeightSplitAxes, outputSplitAxes, packed: false);
+            ValidateMatMulGluBiasShape("gate", gateBiasShape, outputShape, gateBiasGlobalShape, outputGlobalShape, gateBiasSplitAxes, outputSplitAxes, packed: false);
+            ValidateMatMulGluBiasShape("up", upBiasShape, outputShape, upBiasGlobalShape, outputGlobalShape, upBiasSplitAxes, outputSplitAxes, packed: false);
+            ValidateBroadcastable("PyNTT MatMulGlu input/output batch", inputShape[..^2], outputShape[..^2]);
+            ValidateBroadcastable("PyNTT MatMulGlu gate weight/output batch", gateWeightShape[..^2], outputShape[..^2]);
+            ValidateBroadcastable("PyNTT MatMulGlu up weight/output batch", upWeightShape[..^2], outputShape[..^2]);
+
+            if (input.ElemType != gateWeight.ElemType || gateWeight.ElemType != upWeight.ElemType)
+            {
+                throw new NotSupportedException($"PyNTT MatMulGlu expects input and gate/up weights to have the same dtype, got input={input.ElemType}, gate={gateWeight.ElemType}, up={upWeight.ElemType}.");
+            }
+
+            var biasDType = gateBias?.ElemType ?? upBias?.ElemType ?? output.ElemType;
+            _attrs["op"] = "matmul_glu";
+            _attrs["tir"] = true;
+            _attrs["dtype"] = GetPyNTTScalarDTypeName(output.ElemType);
+            _attrs["has_bias"] = gateBias is not null || upBias is not null;
+            _attrs["shape"] = outputShape;
+            _attrs["glu_type"] = GetGluTypeName(matMulGlu.GluType);
+            var useGemv = IsGemvMatmul(outputShape);
+            if (useGemv)
+            {
+                _attrs["gemv"] = true;
+            }
+
+            var helperName = GetNextHelperName(useGemv ? "matmul_glu_gemv_compute" : "matmul_glu_matmul_compute");
+            var templateModel = new PyNTTMatMulGluTemplateModel(
+                helperName,
+                GetBufferScalarPointer(input),
+                GetBufferScalarPointer(gateWeight),
+                GetBufferScalarPointer(upWeight),
+                gateBias is null ? new PyNTTBufferPointerTemplateModel("None") : GetBufferScalarPointer(gateBias),
+                upBias is null ? new PyNTTBufferPointerTemplateModel("None") : GetBufferScalarPointer(upBias),
+                GetBufferScalarPointer(output),
+                gateBias is not null,
+                upBias is not null,
+                GetGluTypeName(matMulGlu.GluType),
+                GetPyNTTScalarDTypeName(input.ElemType),
+                GetPyNTTScalarDTypeName(gateWeight.ElemType),
+                GetPyNTTScalarDTypeName(biasDType),
+                GetPyNTTScalarDTypeName(output.ElemType),
+                GetScalarTritonDType(input.ElemType),
+                GetScalarTritonDType(gateWeight.ElemType),
+                GetScalarTritonDType(biasDType),
+                GetScalarTritonDType(output.ElemType),
+                inputShape,
+                gateWeightShape,
+                upWeightShape,
+                gateBiasShape,
+                upBiasShape,
+                outputShape,
+                GetBufferStrides(input),
+                GetBufferStrides(gateWeight),
+                GetBufferStrides(upWeight),
+                gateBias is null ? Array.Empty<PyNTTDimExpression>() : GetBufferStrides(gateBias),
+                upBias is null ? Array.Empty<PyNTTDimExpression>() : GetBufferStrides(upBias),
+                GetBufferStrides(output),
+                GetHierarchy(output),
+                $"{input.Name}, ({gateWeight.Name}, {upWeight.Name}) -> {output.Name}")
+            {
+                InputGlobalShape = inputGlobalShape,
+                GateWeightGlobalShape = gateWeightGlobalShape,
+                UpWeightGlobalShape = upWeightGlobalShape,
+                GateBiasGlobalShape = gateBiasGlobalShape,
+                UpBiasGlobalShape = upBiasGlobalShape,
+                OutputGlobalShape = outputGlobalShape,
+                InputSplitAxes = inputSplitAxes,
+                GateWeightSplitAxes = gateWeightSplitAxes,
+                UpWeightSplitAxes = upWeightSplitAxes,
+                GateBiasSplitAxes = gateBiasSplitAxes,
+                UpBiasSplitAxes = upBiasSplitAxes,
+                OutputSplitAxes = outputSplitAxes,
+            };
+
+            WriteHelperTemplate("triton/kernels/MatMulGlu.py.jinja", templateModel);
+            WriteLine(BuildHelperCall(helperName));
+        }
+
+        private void VisitPackedMatMulGlu(Nncase.TIR.NTT.PackedMatMulGlu matMulGlu, IReadOnlyList<BaseExpr> args)
+        {
+            if (args.Count < 10 ||
+                args[0] is not TIR.Buffer input ||
+                args[1] is not TIR.Buffer gateWeight ||
+                args[2] is not TIR.Buffer upWeight ||
+                args[9] is not TIR.Buffer output)
+            {
+                throw new NotSupportedException("PyNTT PackedMatMulGlu codegen expects input, packed gate/up weights, optional packed gate/up bias and scale values, and packed output TIR buffers.");
+            }
+
+            TIR.Buffer? GetOptionalBuffer(int index, string name) => args[index] switch
+            {
+                TIR.Buffer buffer => buffer,
+                None => null,
+                _ => throw new NotSupportedException($"PyNTT PackedMatMulGlu expects {name} to be a TIR buffer or None, got {args[index].GetType().Name}."),
+            };
+
+            if (args.Skip(5).Take(4).Any(arg => arg is not None))
+            {
+                throw new NotSupportedException("PyNTT PackedMatMulGlu codegen currently supports only None input/weight scales.");
+            }
+
+            var gateBias = GetOptionalBuffer(3, "gate bias");
+            var upBias = GetOptionalBuffer(4, "up bias");
+            SetComputeOp("packed_matmul_glu");
+            var inputShape = GetBufferActiveShape(input);
+            var gateWeightShape = GetBufferActiveShape(gateWeight);
+            var upWeightShape = GetBufferActiveShape(upWeight);
+            var gateBiasShape = gateBias is null ? Array.Empty<PyNTTDimExpression>() : GetBufferActiveShape(gateBias);
+            var upBiasShape = upBias is null ? Array.Empty<PyNTTDimExpression>() : GetBufferActiveShape(upBias);
+            var outputShape = GetBufferActiveShape(output);
+            var inputGlobalShape = GetBufferGlobalShape(input);
+            var gateWeightGlobalShape = GetBufferGlobalShape(gateWeight);
+            var upWeightGlobalShape = GetBufferGlobalShape(upWeight);
+            var gateBiasGlobalShape = gateBias is null ? Array.Empty<PyNTTDimExpression>() : GetBufferGlobalShape(gateBias);
+            var upBiasGlobalShape = upBias is null ? Array.Empty<PyNTTDimExpression>() : GetBufferGlobalShape(upBias);
+            var outputGlobalShape = GetBufferGlobalShape(output);
+            var inputSplitAxes = GetBufferSplitAxes(input, inputGlobalShape.Length);
+            var gateWeightSplitAxes = GetBufferSplitAxes(gateWeight, gateWeightGlobalShape.Length);
+            var upWeightSplitAxes = GetBufferSplitAxes(upWeight, upWeightGlobalShape.Length);
+            var gateBiasSplitAxes = gateBias is null ? Array.Empty<int[]>() : GetBufferSplitAxes(gateBias, gateBiasGlobalShape.Length);
+            var upBiasSplitAxes = upBias is null ? Array.Empty<int[]>() : GetBufferSplitAxes(upBias, upBiasGlobalShape.Length);
+            var outputSplitAxes = GetBufferSplitAxes(output, outputGlobalShape.Length);
+            ValidateMinimumRank("PyNTT PackedMatMulGlu input", inputShape, 2);
+            ValidateMinimumRank("PyNTT PackedMatMulGlu gate weight", gateWeightShape, 2);
+            ValidateMinimumRank("PyNTT PackedMatMulGlu up weight", upWeightShape, 2);
+            ValidateMinimumRank("PyNTT PackedMatMulGlu output", outputShape, 2);
+
+            var inputVectorLanes = GetVectorLanes(input.ElemType);
+            if (inputVectorLanes.Length != 0)
+            {
+                throw new NotSupportedException($"PyNTT PackedMatMulGlu expects scalar input operands, got lanes [{string.Join(",", inputVectorLanes)}].");
+            }
+
+            var gateWeightLanes = GetVectorLanes(gateWeight.ElemType);
+            var upWeightLanes = GetVectorLanes(upWeight.ElemType);
+            var outputLanes = GetVectorLanes(output.ElemType);
+            ValidatePackedQKVLanes("gate", gateWeightLanes, outputLanes);
+            ValidatePackedQKVLanes("up", upWeightLanes, outputLanes);
+            if (!gateWeightLanes.SequenceEqual(upWeightLanes))
+            {
+                throw new NotSupportedException($"PyNTT PackedMatMulGlu expects gate/up packed lanes to match, got gate=[{string.Join(",", gateWeightLanes)}], up=[{string.Join(",", upWeightLanes)}].");
+            }
+
+            foreach (var (name, bias) in new[] { ("gate", gateBias), ("up", upBias) })
+            {
+                if (bias is not null && !GetVectorLanes(bias.ElemType).SequenceEqual(gateWeightLanes))
+                {
+                    throw new NotSupportedException($"PyNTT PackedMatMulGlu expects {name} bias lanes [{string.Join(",", gateWeightLanes)}], got [{string.Join(",", GetVectorLanes(bias.ElemType))}].");
+                }
+            }
+
+            ValidateMatMulGluProjectionShape("gate", inputShape, gateWeightShape, outputShape, inputGlobalShape, gateWeightGlobalShape, outputGlobalShape, inputSplitAxes, gateWeightSplitAxes, outputSplitAxes, packed: true);
+            ValidateMatMulGluProjectionShape("up", inputShape, upWeightShape, outputShape, inputGlobalShape, upWeightGlobalShape, outputGlobalShape, inputSplitAxes, upWeightSplitAxes, outputSplitAxes, packed: true);
+            ValidateMatMulGluBiasShape("gate", gateBiasShape, outputShape, gateBiasGlobalShape, outputGlobalShape, gateBiasSplitAxes, outputSplitAxes, packed: true);
+            ValidateMatMulGluBiasShape("up", upBiasShape, outputShape, upBiasGlobalShape, outputGlobalShape, upBiasSplitAxes, outputSplitAxes, packed: true);
+            ValidateBroadcastable("PyNTT PackedMatMulGlu input/output batch", inputShape[..^2], outputShape[..^2]);
+            ValidateBroadcastable("PyNTT PackedMatMulGlu gate weight/output batch", gateWeightShape[..^2], outputShape[..^2]);
+            ValidateBroadcastable("PyNTT PackedMatMulGlu up weight/output batch", upWeightShape[..^2], outputShape[..^2]);
+
+            if (input.ElemType != GetScalarDataType(gateWeight.ElemType) ||
+                GetScalarDataType(gateWeight.ElemType) != GetScalarDataType(upWeight.ElemType))
+            {
+                throw new NotSupportedException($"PyNTT PackedMatMulGlu expects input and packed gate/up weights to have the same scalar dtype, got input={input.ElemType}, gate={gateWeight.ElemType}, up={upWeight.ElemType}.");
+            }
+
+            var biasDType = gateBias?.ElemType ?? upBias?.ElemType ?? output.ElemType;
+            var nPackedLaneCount = gateWeightLanes[0];
+            var nVectorLaneCount = gateWeightLanes[1];
+            _attrs["op"] = "packed_matmul_glu";
+            _attrs["tir"] = true;
+            _attrs["dtype"] = GetPyNTTScalarDTypeName(output.ElemType);
+            _attrs["has_bias"] = gateBias is not null || upBias is not null;
+            _attrs["shape"] = outputShape;
+            _attrs["n_pack_lane"] = nPackedLaneCount;
+            _attrs["n_lane"] = nVectorLaneCount;
+            _attrs["n_scalar_lane"] = checked(nPackedLaneCount * nVectorLaneCount);
+            _attrs["glu_type"] = GetGluTypeName(matMulGlu.GluType);
+            var logicalOutputShape = outputShape.ToArray();
+            logicalOutputShape[^1] = MultiplyDim(logicalOutputShape[^1], checked(nPackedLaneCount * nVectorLaneCount));
+            var useGemv = IsGemvMatmul(logicalOutputShape);
+            if (useGemv)
+            {
+                _attrs["gemv"] = true;
+            }
+
+            var helperName = GetNextHelperName(useGemv ? "packed_matmul_glu_gemv_compute" : "packed_matmul_glu_matmul_compute");
+            var templateModel = new PyNTTMatMulGluTemplateModel(
+                helperName,
+                GetBufferScalarPointer(input),
+                GetBufferScalarPointer(gateWeight),
+                GetBufferScalarPointer(upWeight),
+                gateBias is null ? new PyNTTBufferPointerTemplateModel("None") : GetBufferScalarPointer(gateBias),
+                upBias is null ? new PyNTTBufferPointerTemplateModel("None") : GetBufferScalarPointer(upBias),
+                GetBufferScalarPointer(output),
+                gateBias is not null,
+                upBias is not null,
+                GetGluTypeName(matMulGlu.GluType),
+                GetPyNTTScalarDTypeName(input.ElemType),
+                GetPyNTTScalarDTypeName(gateWeight.ElemType),
+                GetPyNTTScalarDTypeName(biasDType),
+                GetPyNTTScalarDTypeName(output.ElemType),
+                GetScalarTritonDType(input.ElemType),
+                GetScalarTritonDType(gateWeight.ElemType),
+                GetScalarTritonDType(biasDType),
+                GetScalarTritonDType(output.ElemType),
+                inputShape,
+                gateWeightShape,
+                upWeightShape,
+                gateBiasShape,
+                upBiasShape,
+                outputShape,
+                GetBufferStrides(input),
+                GetBufferStrides(gateWeight),
+                GetBufferStrides(upWeight),
+                gateBias is null ? Array.Empty<PyNTTDimExpression>() : GetBufferStrides(gateBias),
+                upBias is null ? Array.Empty<PyNTTDimExpression>() : GetBufferStrides(upBias),
+                GetBufferStrides(output),
+                GetHierarchy(output),
+                $"{input.Name}, packed({gateWeight.Name}, {upWeight.Name}) -> packed({output.Name})")
+            {
+                PackedN = true,
+                NPackedLaneCount = nPackedLaneCount,
+                NVectorLaneCount = nVectorLaneCount,
+                InputGlobalShape = inputGlobalShape,
+                GateWeightGlobalShape = gateWeightGlobalShape,
+                UpWeightGlobalShape = upWeightGlobalShape,
+                GateBiasGlobalShape = gateBiasGlobalShape,
+                UpBiasGlobalShape = upBiasGlobalShape,
+                OutputGlobalShape = outputGlobalShape,
+                InputSplitAxes = inputSplitAxes,
+                GateWeightSplitAxes = gateWeightSplitAxes,
+                UpWeightSplitAxes = upWeightSplitAxes,
+                GateBiasSplitAxes = gateBiasSplitAxes,
+                UpBiasSplitAxes = upBiasSplitAxes,
+                OutputSplitAxes = outputSplitAxes,
+            };
+
+            WriteHelperTemplate("triton/kernels/PackedMatMulGlu.py.jinja", templateModel);
+            WriteLine(BuildHelperCall(helperName));
+        }
+
+        private static void ValidateMatMulGluProjectionShape(
+            string name,
+            PyNTTDimExpression[] inputShape,
+            PyNTTDimExpression[] weightShape,
+            PyNTTDimExpression[] outputShape,
+            PyNTTDimExpression[] inputGlobalShape,
+            PyNTTDimExpression[] weightGlobalShape,
+            PyNTTDimExpression[] outputGlobalShape,
+            int[][] inputSplitAxes,
+            int[][] weightSplitAxes,
+            int[][] outputSplitAxes,
+            bool packed)
+        {
+            var inputGlobalK = inputGlobalShape[^1];
+            var inputGlobalM = inputGlobalShape[^2];
+            var weightGlobalK = packed ? weightGlobalShape[^1] : weightGlobalShape[^2];
+            var weightGlobalN = packed ? weightGlobalShape[^2] : weightGlobalShape[^1];
+            var outputGlobalM = outputGlobalShape[^2];
+            var outputGlobalN = outputGlobalShape[^1];
+            if (!SameDim(inputGlobalK, weightGlobalK) ||
+                !SameDim(outputGlobalM, inputGlobalM) ||
+                !SameDim(outputGlobalN, weightGlobalN))
+            {
+                var weightLayout = packed ? "weight=[...,N,K]<Nr,lane>" : "weight=[...,K,N]";
+                var outputLayout = packed ? "output=[...,M,N]<Nr,lane>" : "output=[...,M,N]";
+                throw new NotSupportedException($"PyNTT MatMulGlu {name} projection expects compatible global shapes input=[...,M,K], {weightLayout}, {outputLayout}, got input=[{ShapeText(inputGlobalShape)}], weight=[{ShapeText(weightGlobalShape)}], output=[{ShapeText(outputGlobalShape)}].");
+            }
+
+            ValidateMatMulGluShardAxis(
+                $"PyNTT MatMulGlu {name} input M",
+                inputShape[^2],
+                inputSplitAxes[^2],
+                outputShape[^2],
+                outputSplitAxes[^2]);
+            ValidateMatMulGluShardAxis(
+                $"PyNTT MatMulGlu {name} weight K",
+                packed ? weightShape[^1] : weightShape[^2],
+                packed ? weightSplitAxes[^1] : weightSplitAxes[^2],
+                inputShape[^1],
+                inputSplitAxes[^1]);
+            ValidateMatMulGluShardAxis(
+                $"PyNTT MatMulGlu {name} weight N",
+                packed ? weightShape[^2] : weightShape[^1],
+                packed ? weightSplitAxes[^2] : weightSplitAxes[^1],
+                outputShape[^1],
+                outputSplitAxes[^1]);
+        }
+
+        private static void ValidateMatMulGluBiasShape(
+            string name,
+            PyNTTDimExpression[] biasShape,
+            PyNTTDimExpression[] outputShape,
+            PyNTTDimExpression[] biasGlobalShape,
+            PyNTTDimExpression[] outputGlobalShape,
+            int[][] biasSplitAxes,
+            int[][] outputSplitAxes,
+            bool packed)
+        {
+            if (biasShape.Length == 0)
+            {
+                return;
+            }
+
+            ValidateRank($"PyNTT MatMulGlu {name} bias", biasShape, 1);
+            if (!SameDim(biasGlobalShape[^1], outputGlobalShape[^1]))
+            {
+                var outputLayout = packed ? "packed output N" : "output N";
+                throw new NotSupportedException($"PyNTT MatMulGlu {name} bias last dimension should match global {outputLayout}, got bias=[{ShapeText(biasGlobalShape)}], output=[{ShapeText(outputGlobalShape)}].");
+            }
+
+            ValidateMatMulGluShardAxis(
+                $"PyNTT MatMulGlu {name} bias N",
+                biasShape[^1],
+                biasSplitAxes[^1],
+                outputShape[^1],
+                outputSplitAxes[^1]);
+        }
+
+        private static void ValidateMatMulGluShardAxis(
+            string context,
+            PyNTTDimExpression tensorLocal,
+            int[] tensorSplitAxes,
+            PyNTTDimExpression canonicalLocal,
+            int[] canonicalSplitAxes)
+        {
+            if (tensorSplitAxes.Length == 0)
+            {
+                return;
+            }
+
+            if (!tensorSplitAxes.SequenceEqual(canonicalSplitAxes))
+            {
+                if (IsPrefix(tensorSplitAxes, canonicalSplitAxes))
+                {
+                    return;
+                }
+
+                throw new NotSupportedException($"{context} split axes [{string.Join(",", tensorSplitAxes)}] must either match canonical split axes [{string.Join(",", canonicalSplitAxes)}], be a prefix of them, or be broadcast.");
+            }
+
+            if (!SameDim(tensorLocal, canonicalLocal))
+            {
+                throw new NotSupportedException($"{context} local extent should match canonical local extent when split axes match, got local={tensorLocal.PythonExpression}, canonical={canonicalLocal.PythonExpression}.");
+            }
+        }
+
+        private static bool IsPrefix(int[] prefix, int[] values)
+        {
+            if (prefix.Length > values.Length)
+            {
+                return false;
+            }
+
+            for (int i = 0; i < prefix.Length; i++)
+            {
+                if (prefix[i] != values[i])
+                {
+                    return false;
+                }
+            }
+
+            return true;
         }
 
         private static void ValidateBiasShape(string name, PyNTTDimExpression[] biasShape, PyNTTDimExpression[] outputShape)
@@ -3858,6 +4294,15 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             UnaryOp.LogicalNot => "value0 == 0",
             UnaryOp.Sign => "tl.where(value0 > 0, 1.0, tl.where(value0 < 0, -1.0, 0.0))",
             _ => throw new NotSupportedException($"Unsupported PyNTT unary template op: {op}."),
+        };
+    }
+
+    private static string GetGluTypeName(GluType gluType)
+    {
+        return gluType switch
+        {
+            GluType.SwiGLU => "swiglu",
+            _ => throw new NotSupportedException($"Unsupported PyNTT MatMulGlu type: {gluType}."),
         };
     }
 

@@ -400,6 +400,24 @@ public class DeviceCSourceConvertVisitor : CSourceConvertVisitor
                 }).Result);
 
                 break;
+            case TIR.NTT.MatMulGlu matMulGlu:
+                ValidateMatMulGluScales(expr.Arguments.ToArray());
+                IndentScope.Writer.Write(RazorTemplateEngine.RenderAsync("~/CodeGen/CPU/Templates/Kernels/MatMulGlu.cshtml", new TypedKernelTemplateModel<TIR.NTT.MatMulGlu>(matMulGlu)
+                {
+                    Arguments = arguments.Select(x => new KernelArgument { Symbol = x }).ToArray(),
+                    Indent = new string(' ', IndentScope.Writer.Indent),
+                }).Result);
+
+                break;
+            case TIR.NTT.PackedMatMulGlu packedMatMulGlu:
+                ValidateMatMulGluScales(expr.Arguments.ToArray());
+                IndentScope.Writer.Write(RazorTemplateEngine.RenderAsync("~/CodeGen/CPU/Templates/Kernels/PackedMatMulGlu.cshtml", new TypedKernelTemplateModel<TIR.NTT.PackedMatMulGlu>(packedMatMulGlu)
+                {
+                    Arguments = arguments.Select(x => new KernelArgument { Symbol = x }).ToArray(),
+                    Indent = new string(' ', IndentScope.Writer.Indent),
+                }).Result);
+
+                break;
             case TIR.NTT.Pack vectorize:
                 WriteWithProfiler(RazorTemplateEngine.RenderAsync("~/CodeGen/CPU/Templates/Kernels/Pack.cshtml", new TypedKernelTemplateModel<TIR.NTT.Pack>(vectorize)
                 {
@@ -617,6 +635,14 @@ public class DeviceCSourceConvertVisitor : CSourceConvertVisitor
         if (args.Count < 16 || args.Skip(7).Take(6).Any(arg => arg is not None))
         {
             throw new NotSupportedException("NTT QKVParallelLinear codegen currently supports only None input/weight scales.");
+        }
+    }
+
+    private static void ValidateMatMulGluScales(IReadOnlyList<BaseExpr> args)
+    {
+        if (args.Count < 10 || args.Skip(5).Take(4).Any(arg => arg is not None))
+        {
+            throw new NotSupportedException("NTT MatMulGlu codegen currently supports only None input/weight scales.");
         }
     }
 

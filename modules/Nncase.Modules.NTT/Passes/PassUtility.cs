@@ -44,6 +44,7 @@ public static class PassUtility
             or IR.NN.PagedAttention
             or IR.NN.Qwen3MoE
             or IR.NN.QKVParallelLinear
+            or IR.NN.MatMulGlu
             or IR.Tensors.Cast
             or IR.Tensors.Concat
             or IR.Tensors.ConstantOfShape

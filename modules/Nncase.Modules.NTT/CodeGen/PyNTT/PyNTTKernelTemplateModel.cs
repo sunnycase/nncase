@@ -600,6 +600,73 @@ public sealed record PyNTTQKVParallelLinearTemplateModel(
     public int NVectorLaneCount { get; set; } = 1;
 }
 
+public sealed record PyNTTMatMulGluTemplateModel(
+    string FunctionName,
+    PyNTTBufferPointerTemplateModel Input,
+    PyNTTBufferPointerTemplateModel GateWeight,
+    PyNTTBufferPointerTemplateModel UpWeight,
+    PyNTTBufferPointerTemplateModel GateBias,
+    PyNTTBufferPointerTemplateModel UpBias,
+    PyNTTBufferPointerTemplateModel Output,
+    bool HasGateBias,
+    bool HasUpBias,
+    string GluType,
+    string InputDType,
+    string WeightDType,
+    string BiasDType,
+    string OutputDType,
+    string InputTritonDType,
+    string WeightTritonDType,
+    string BiasTritonDType,
+    string OutputTritonDType,
+    PyNTTDimExpression[] InputShape,
+    PyNTTDimExpression[] GateWeightShape,
+    PyNTTDimExpression[] UpWeightShape,
+    PyNTTDimExpression[] GateBiasShape,
+    PyNTTDimExpression[] UpBiasShape,
+    PyNTTDimExpression[] OutputShape,
+    PyNTTDimExpression[] InputStrides,
+    PyNTTDimExpression[] GateWeightStrides,
+    PyNTTDimExpression[] UpWeightStrides,
+    PyNTTDimExpression[] GateBiasStrides,
+    PyNTTDimExpression[] UpBiasStrides,
+    PyNTTDimExpression[] OutputStrides,
+    int[] Hierarchy,
+    string Comment)
+{
+    public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
+
+    public bool PackedN { get; set; }
+
+    public int NPackedLaneCount { get; set; } = 1;
+
+    public int NVectorLaneCount { get; set; } = 1;
+
+    public PyNTTDimExpression[] InputGlobalShape { get; set; } = Array.Empty<PyNTTDimExpression>();
+
+    public PyNTTDimExpression[] GateWeightGlobalShape { get; set; } = Array.Empty<PyNTTDimExpression>();
+
+    public PyNTTDimExpression[] UpWeightGlobalShape { get; set; } = Array.Empty<PyNTTDimExpression>();
+
+    public PyNTTDimExpression[] GateBiasGlobalShape { get; set; } = Array.Empty<PyNTTDimExpression>();
+
+    public PyNTTDimExpression[] UpBiasGlobalShape { get; set; } = Array.Empty<PyNTTDimExpression>();
+
+    public PyNTTDimExpression[] OutputGlobalShape { get; set; } = Array.Empty<PyNTTDimExpression>();
+
+    public int[][] InputSplitAxes { get; set; } = Array.Empty<int[]>();
+
+    public int[][] GateWeightSplitAxes { get; set; } = Array.Empty<int[]>();
+
+    public int[][] UpWeightSplitAxes { get; set; } = Array.Empty<int[]>();
+
+    public int[][] GateBiasSplitAxes { get; set; } = Array.Empty<int[]>();
+
+    public int[][] UpBiasSplitAxes { get; set; } = Array.Empty<int[]>();
+
+    public int[][] OutputSplitAxes { get; set; } = Array.Empty<int[]>();
+}
+
 public sealed record PyNTTSummaTemplateModel(
     string FunctionName,
     string LhsBaseName,

@@ -74,6 +74,37 @@ public class UnitTestVectorizeVectorizedMatMul : TransformTestBase
     }
 
     [Fact]
+    public void TestPackMatMulGluByNUsesSinglePackedMatMulGluOp()
+    {
+        var input = new Var("input", new TensorType(DataTypes.BFloat16, new RankedShape(1, 64)));
+        var gateWeight = new Var("gate_weight", new TensorType(DataTypes.BFloat16, new RankedShape(64, 128)));
+        var upWeight = new Var("up_weight", new TensorType(DataTypes.BFloat16, new RankedShape(64, 128)));
+        var expr = MatMulGlu(
+            input,
+            gateWeight,
+            upWeight,
+            None.Default,
+            None.Default,
+            None.Default,
+            None.Default,
+            None.Default,
+            None.Default,
+            IR.NN.GluType.SwiGLU,
+            DataTypes.BFloat16);
+        CompilerServices.InferenceType(expr);
+
+        var context = new Nncase.Passes.RunPassContext();
+        var post = CompilerServices.Rewrite(expr, [new PackMatMulGluByN(4, 16)], context);
+        CompilerServices.InferenceType(post);
+        var printed = CompilerServices.Print(post);
+
+        Assert.False(ReferenceEquals(expr, post));
+        Assert.Equal(expr.CheckedType, post.CheckedType);
+        Assert.Contains("PackedMatMulGlu", printed, System.StringComparison.Ordinal);
+        Assert.DoesNotContain("PackedMatMul(", printed, System.StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void TestVectorizedMatMulDevectorizePropagation()
     {
         var lhs = Pack(Testing.Rand<float>(3, 24), [8], [1]).Evaluate().AsTensor();

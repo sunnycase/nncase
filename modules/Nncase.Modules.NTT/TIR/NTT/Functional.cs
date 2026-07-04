@@ -137,6 +137,60 @@ public partial class NTT
             vOutput);
     }
 
+    public static Call MatMulGlu(
+        Expr input,
+        Expr gateWeight,
+        Expr upWeight,
+        Expr gateBias,
+        Expr upBias,
+        Expr gateInputScale,
+        Expr upInputScale,
+        Expr gateWeightScale,
+        Expr upWeightScale,
+        Expr output,
+        IR.NN.GluType gluType)
+    {
+        return new Call(
+            new MatMulGlu(gluType),
+            input,
+            gateWeight,
+            upWeight,
+            gateBias,
+            upBias,
+            gateInputScale,
+            upInputScale,
+            gateWeightScale,
+            upWeightScale,
+            output);
+    }
+
+    public static Call PackedMatMulGlu(
+        Expr input,
+        Expr gateWeight,
+        Expr upWeight,
+        Expr gateBias,
+        Expr upBias,
+        Expr gateInputScale,
+        Expr upInputScale,
+        Expr gateWeightScale,
+        Expr upWeightScale,
+        Expr output,
+        IR.NN.GluType gluType)
+    {
+        return new Call(
+            new PackedMatMulGlu(gluType),
+            input,
+            gateWeight,
+            upWeight,
+            gateBias,
+            upBias,
+            gateInputScale,
+            upInputScale,
+            gateWeightScale,
+            upWeightScale,
+            output);
+    }
+
     public static Call SUMMA(Expr lhs, Expr rhs, Expr output, Expr loadC, Expr scale, IRArray<int> lhsVectorizedAxes, IRArray<int> rhsVectorizedAxes, bool transA = false, bool transB = false)
     {
         return new Call(new SUMMA(lhsVectorizedAxes, rhsVectorizedAxes, transA, transB), lhs, rhs, output, loadC, scale);

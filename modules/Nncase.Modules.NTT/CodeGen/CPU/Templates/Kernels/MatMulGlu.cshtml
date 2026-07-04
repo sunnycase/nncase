@@ -1,0 +1,29 @@
+@model Nncase.CodeGen.NTT.TypedKernelTemplateModel<Nncase.TIR.NTT.MatMulGlu>
+@{
+  string input = Model.Arguments[0].Symbol.Name;
+  string gateWeight = Model.Arguments[1].Symbol.Name;
+  string upWeight = Model.Arguments[2].Symbol.Name;
+  string gateBias = Model.Arguments[3].Symbol.Name;
+  string upBias = Model.Arguments[4].Symbol.Name;
+  string output = Model.Arguments[9].Symbol.Name;
+
+  if (Model.Target.GluType != Nncase.IR.NN.GluType.SwiGLU)
+  {
+      throw new NotSupportedException($"Unsupported MatMulGlu type: {Model.Target.GluType}.");
+  }
+
+  string MatmulLine(string rhs, string dest) =>
+      $"{Model.Indent}  matmul<false, false, false>({input}, {rhs}, {dest}, nullptr, fixed_shape_v<>, fixed_shape_v<>, fixed_shape_v<>, fixed_shape_v<>);\n";
+
+  string BiasLine(string bias, string dest) =>
+      bias == "nullptr" ? string.Empty : $"{Model.Indent}  binary<ops::add>({dest}, {bias}, {dest});\n";
+}
+@Html.Raw($"{Model.Indent}{{\n")
+@Html.Raw($"{Model.Indent}  auto up_output = make_tensor<typename std::decay_t<decltype({output})>::element_type>({output}.shape());\n")
+@Html.Raw(MatmulLine(gateWeight, output))
+@Html.Raw(BiasLine(gateBias, output))
+@Html.Raw(MatmulLine(upWeight, "up_output"))
+@Html.Raw(BiasLine(upBias, "up_output"))
+@Html.Raw($"{Model.Indent}  unary<ops::swish>({output}, {output});\n")
+@Html.Raw($"{Model.Indent}  binary<ops::mul>({output}, up_output, {output});\n")
+@Html.Raw($"{Model.Indent}}}\n")

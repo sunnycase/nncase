@@ -101,6 +101,30 @@ public static class NN
             kWeightScale,
             vWeightScale);
 
+    public static Call MatMulGlu(
+        Expr input,
+        Expr gateWeight,
+        Expr upWeight,
+        Expr gateBias,
+        Expr upBias,
+        Expr gateInputScale,
+        Expr upInputScale,
+        Expr gateWeightScale,
+        Expr upWeightScale,
+        GluType gluType,
+        DataType outputDataType) =>
+        new Call(
+            new MatMulGlu(gluType, outputDataType),
+            input,
+            gateWeight,
+            upWeight,
+            gateBias,
+            upBias,
+            gateInputScale,
+            upInputScale,
+            gateWeightScale,
+            upWeightScale);
+
     public static Call PRelu(Expr input, Expr slope) => new Call(new PRelu(), input, slope);
 
     public static Call Selu(Expr input, Expr alpha, Expr gamma) => new Call(new Selu(), input, alpha, gamma);

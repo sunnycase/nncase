@@ -63,6 +63,7 @@ public abstract class NTTTarget : Target
 
         pass.Add<Passes.Rules.NTT.PackMatMulByN>(nr);
         pass.Add<Passes.Rules.NTT.PackQKVParallelLinearByN>(nr, lane);
+        pass.Add<Passes.Rules.NTT.PackMatMulGluByN>(nr, lane);
     }
 
     public override void RegisterAutoVectorizeRules(IRulesAddable pass, CompileOptions options)
