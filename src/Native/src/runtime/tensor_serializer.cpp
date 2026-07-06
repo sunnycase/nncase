@@ -52,13 +52,18 @@ result<llm::paged_attention_config> runtime::deserialize_paged_attention_config(
     auto block_size = json["BlockSize"].get<int>();
     auto kv_type_code = static_cast<typecode_t>(json["KVPrimType"].get<int>());
 
-    auto cache_layout =
-        json["CacheLayout"].get<std::array<llm::paged_kvcache_dim_kind, 6>>();
-
-    auto vectorized_axes =
-        json["VectorizedAxes"].get<std::vector<llm::paged_kvcache_dim_kind>>();
-
-    auto lanes = json["Lanes"].get<dims_t>();
+    auto key_cache_layout =
+        json["KeyCacheLayout"].get<std::array<llm::paged_kvcache_dim_kind, 6>>();
+    auto value_cache_layout = json["ValueCacheLayout"]
+                                  .get<std::array<llm::paged_kvcache_dim_kind, 6>>();
+    auto key_vectorized_axes =
+        json["KeyVectorizedAxes"]
+            .get<std::vector<llm::paged_kvcache_dim_kind>>();
+    auto value_vectorized_axes =
+        json["ValueVectorizedAxes"]
+            .get<std::vector<llm::paged_kvcache_dim_kind>>();
+    auto key_lanes = json["KeyLanes"].get<dims_t>();
+    auto value_lanes = json["ValueLanes"].get<dims_t>();
 
     auto sharding_axes =
         json["ShardingAxes"].get<std::vector<llm::paged_kvcache_dim_kind>>();
@@ -71,7 +76,8 @@ result<llm::paged_attention_config> runtime::deserialize_paged_attention_config(
 
     auto config = llm::paged_attention_config(
         std::in_place, num_layers, num_kv_heads, head_dim, kv_type_code,
-        block_size, cache_layout, vectorized_axes, lanes, sharding_axes,
+        block_size, key_cache_layout, value_cache_layout, key_vectorized_axes,
+        value_vectorized_axes, key_lanes, value_lanes, sharding_axes,
         axis_policies);
 
     return ok(config);

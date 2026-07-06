@@ -38,17 +38,12 @@ internal sealed class PagedAttentionConfigConverter : JsonConverter<IPagedAttent
         var blockSize = root.GetProperty(nameof(IPagedAttentionConfig.BlockSize)).GetInt32();
         var kvType = DataType.FromTypeCode((Runtime.TypeCode)root.GetProperty(nameof(IPagedAttentionConfig.KVPrimType)).GetInt32());
 
-        var cacheLayout = JsonSerializer.Deserialize<PagedKVCacheDimKind[]>(
-            root.GetProperty(nameof(IPagedAttentionConfig.CacheLayout)).GetRawText(),
-            options)!;
-
-        var vectorizedAxes = JsonSerializer.Deserialize<PagedKVCacheDimKind[]>(
-            root.GetProperty(nameof(IPagedAttentionConfig.VectorizedAxes)).GetRawText(),
-            options)!;
-
-        var lanes = JsonSerializer.Deserialize<int[]>(
-            root.GetProperty(nameof(IPagedAttentionConfig.Lanes)).GetRawText(),
-            options)!;
+        var keyCacheLayout = ReadArray<PagedKVCacheDimKind>(root, nameof(IPagedAttentionConfig.KeyCacheLayout), options);
+        var valueCacheLayout = ReadArray<PagedKVCacheDimKind>(root, nameof(IPagedAttentionConfig.ValueCacheLayout), options);
+        var keyVectorizedAxes = ReadArray<PagedKVCacheDimKind>(root, nameof(IPagedAttentionConfig.KeyVectorizedAxes), options);
+        var valueVectorizedAxes = ReadArray<PagedKVCacheDimKind>(root, nameof(IPagedAttentionConfig.ValueVectorizedAxes), options);
+        var keyLanes = ReadArray<int>(root, nameof(IPagedAttentionConfig.KeyLanes), options);
+        var valueLanes = ReadArray<int>(root, nameof(IPagedAttentionConfig.ValueLanes), options);
 
         var shardingAxes = JsonSerializer.Deserialize<PagedKVCacheDimKind[]>(
             root.GetProperty(nameof(IPagedAttentionConfig.ShardingAxes)).GetRawText(),
@@ -64,9 +59,12 @@ internal sealed class PagedAttentionConfigConverter : JsonConverter<IPagedAttent
             headDim,
             kvType,
             blockSize,
-            cacheLayout,
-            vectorizedAxes,
-            lanes,
+            keyCacheLayout,
+            valueCacheLayout,
+            keyVectorizedAxes,
+            valueVectorizedAxes,
+            keyLanes,
+            valueLanes,
             shardingAxes,
             axisPolicies.OfType<IR.SBPSplit>().ToArray());
     }
@@ -83,14 +81,23 @@ internal sealed class PagedAttentionConfigConverter : JsonConverter<IPagedAttent
         writer.WritePropertyName(nameof(value.KVPrimType));
         JsonSerializer.Serialize(writer, value.KVPrimType.TypeCode, options);
 
-        writer.WritePropertyName(nameof(IPagedAttentionConfig.CacheLayout));
-        JsonSerializer.Serialize(writer, value.CacheLayout, options);
+        writer.WritePropertyName(nameof(IPagedAttentionConfig.KeyCacheLayout));
+        JsonSerializer.Serialize(writer, value.KeyCacheLayout, options);
 
-        writer.WritePropertyName(nameof(IPagedAttentionConfig.VectorizedAxes));
-        JsonSerializer.Serialize(writer, value.VectorizedAxes, options);
+        writer.WritePropertyName(nameof(IPagedAttentionConfig.ValueCacheLayout));
+        JsonSerializer.Serialize(writer, value.ValueCacheLayout, options);
 
-        writer.WritePropertyName(nameof(IPagedAttentionConfig.Lanes));
-        JsonSerializer.Serialize(writer, value.Lanes, options);
+        writer.WritePropertyName(nameof(IPagedAttentionConfig.KeyVectorizedAxes));
+        JsonSerializer.Serialize(writer, value.KeyVectorizedAxes, options);
+
+        writer.WritePropertyName(nameof(IPagedAttentionConfig.ValueVectorizedAxes));
+        JsonSerializer.Serialize(writer, value.ValueVectorizedAxes, options);
+
+        writer.WritePropertyName(nameof(IPagedAttentionConfig.KeyLanes));
+        JsonSerializer.Serialize(writer, value.KeyLanes, options);
+
+        writer.WritePropertyName(nameof(IPagedAttentionConfig.ValueLanes));
+        JsonSerializer.Serialize(writer, value.ValueLanes, options);
 
         writer.WritePropertyName(nameof(IPagedAttentionConfig.ShardingAxes));
         JsonSerializer.Serialize(writer, value.ShardingAxes, options);
@@ -99,5 +106,17 @@ internal sealed class PagedAttentionConfigConverter : JsonConverter<IPagedAttent
         JsonSerializer.Serialize(writer, value.AxisPolicies.OfType<IR.SBP>().ToArray(), options);
 
         writer.WriteEndObject();
+    }
+
+    private static T[] ReadArray<T>(JsonElement root, string propertyName, JsonSerializerOptions options)
+    {
+        if (!root.TryGetProperty(propertyName, out var property))
+        {
+            throw new JsonException($"Expected {propertyName}");
+        }
+
+        return JsonSerializer.Deserialize<T[]>(
+            property.GetRawText(),
+            options)!;
     }
 }

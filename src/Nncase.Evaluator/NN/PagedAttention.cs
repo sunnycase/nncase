@@ -33,17 +33,22 @@ public sealed class PagedAttentionEvaluator : ITypeInferencer<PagedAttention>, I
     public Cost Visit(ICostEvaluateContext context, PagedAttention target)
     {
         var qType = context.GetArgumentType<IRType>(target, PagedAttention.Q);
+        var extraType = context.GetArgumentType<IRType>(target, PagedAttention.Extra);
+        var kvCachesType = context.GetArgumentType<TensorType>(target, PagedAttention.KVCaches);
         var returnType = context.GetReturnType<IRType>();
 
-        // cycles = softmax((q @ k^t) + mask) @ v.
-        return new()
+        var cost = new Cost()
         {
-            // todo kv cache
             [CostFactorNames.BlockLocalMemoryLoadBytes] = CostUtility.GetMemoryAccess(qType),
-
-            // todo [CostFactorNames.CPUCycles].
             [CostFactorNames.BlockLocalMemoryStoreBytes] = CostUtility.GetMemoryAccess(returnType),
         };
+        if (TryEstimatePagedAttentionCost(qType, extraType, kvCachesType, target, out var kvReadBytes, out var cpuCycles))
+        {
+            AddCostFactor(cost, CostFactorNames.BlockLocalMemoryLoadBytes, kvReadBytes);
+            AddCostFactor(cost, CostFactorNames.CPUCycles, cpuCycles);
+        }
+
+        return cost;
     }
 
     public IValue Visit(IEvaluateContext context, PagedAttention target)
@@ -65,12 +70,12 @@ public sealed class PagedAttentionEvaluator : ITypeInferencer<PagedAttention>, I
         var cache = kvCaches.Single().Value;
 
         // devectorize for q
-        if (cache.Config.VectorizedAxes.Contains(PagedKVCacheDimKind.HeadDim))
+        if (cache.Config.KeyVectorizedAxes.Contains(PagedKVCacheDimKind.HeadDim))
         {
             query = query.Unpack(1, qlayout.IndexOf(AttentionDimKind.Dim));
         }
 
-        if (cache.Config.VectorizedAxes.Contains(PagedKVCacheDimKind.NumKVHeads))
+        if (cache.Config.KeyVectorizedAxes.Contains(PagedKVCacheDimKind.NumKVHeads))
         {
             query = query.Unpack(1, qlayout.IndexOf(AttentionDimKind.Head));
         }
@@ -143,14 +148,14 @@ public sealed class PagedAttentionEvaluator : ITypeInferencer<PagedAttention>, I
         }
 
         // revectorize for output
-        if (cache.Config.VectorizedAxes.Contains(PagedKVCacheDimKind.NumKVHeads))
+        if (cache.Config.KeyVectorizedAxes.Contains(PagedKVCacheDimKind.NumKVHeads))
         {
-            concat_output = concat_output.Pack(0, cache.Config.Lanes[cache.Config.VectorizedAxes.IndexOf(PagedKVCacheDimKind.NumKVHeads)], qlayout.IndexOf(AttentionDimKind.Head));
+            concat_output = concat_output.Pack(0, cache.Config.KeyLanes[cache.Config.KeyVectorizedAxes.IndexOf(PagedKVCacheDimKind.NumKVHeads)], qlayout.IndexOf(AttentionDimKind.Head));
         }
 
-        if (cache.Config.VectorizedAxes.Contains(PagedKVCacheDimKind.HeadDim))
+        if (cache.Config.KeyVectorizedAxes.Contains(PagedKVCacheDimKind.HeadDim))
         {
-            concat_output = concat_output.Pack(0, cache.Config.Lanes[cache.Config.VectorizedAxes.IndexOf(PagedKVCacheDimKind.HeadDim)], qlayout.IndexOf(AttentionDimKind.Dim));
+            concat_output = concat_output.Pack(0, cache.Config.KeyLanes[cache.Config.KeyVectorizedAxes.IndexOf(PagedKVCacheDimKind.HeadDim)], qlayout.IndexOf(AttentionDimKind.Dim));
         }
 
         return concat_output;
@@ -206,7 +211,7 @@ public sealed class PagedAttentionEvaluator : ITypeInferencer<PagedAttention>, I
         var numBlocksForSeq = MathUtility.CeilDiv(cache.SeqLen(seqId), cache.Config.BlockSize);
 
         // block layout is construct from `head dim, block_size`. but we don't know the concrete shape.
-        var blockLayout = cache.Config.BlockLayout;
+        var blockLayout = cache.Config.GetBlockLayout(cacheKind);
         var blockSizeAxis = blockLayout.IndexOf(PagedKVCacheDimKind.BlockSize);
         if (blockSizeAxis < 0)
         {
@@ -227,7 +232,8 @@ public sealed class PagedAttentionEvaluator : ITypeInferencer<PagedAttention>, I
         var concatCache = OrtKI.Concat(caches.ToArray(), blockSizeAxis);
 
         // devectorize head dim
-        if (cache.Config.VectorizedAxes.Contains(PagedKVCacheDimKind.HeadDim))
+        var vectorizedAxes = cache.Config.GetVectorizedAxes(cacheKind);
+        if (vectorizedAxes.Contains(PagedKVCacheDimKind.HeadDim))
         {
             concatCache = concatCache.Unpack(1, headDimAxis);
         }
@@ -294,17 +300,20 @@ public sealed class PagedAttentionEvaluator : ITypeInferencer<PagedAttention>, I
                 return new InvalidType("kv cache has not config!");
             }
 
-            if (!config.CacheLayout.SequenceEqual([PagedKVCacheDimKind.NumBlocks, PagedKVCacheDimKind.NumLayers, PagedKVCacheDimKind.NumKVHeads, PagedKVCacheDimKind.KV, PagedKVCacheDimKind.HeadDim, PagedKVCacheDimKind.BlockSize]))
+            if (!config.KeyCacheLayout.SequenceEqual([PagedKVCacheDimKind.NumBlocks, PagedKVCacheDimKind.NumLayers, PagedKVCacheDimKind.NumKVHeads, PagedKVCacheDimKind.KV, PagedKVCacheDimKind.HeadDim, PagedKVCacheDimKind.BlockSize]) ||
+                !config.ValueCacheLayout.SequenceEqual([PagedKVCacheDimKind.NumBlocks, PagedKVCacheDimKind.NumLayers, PagedKVCacheDimKind.NumKVHeads, PagedKVCacheDimKind.KV, PagedKVCacheDimKind.HeadDim, PagedKVCacheDimKind.BlockSize]))
             {
                 return new InvalidType("kv cache block layout not support!");
             }
 
-            if (!config.VectorizedAxes.SequenceEqual([PagedKVCacheDimKind.HeadDim]))
+            if (!config.KeyVectorizedAxes.SequenceEqual([PagedKVCacheDimKind.HeadDim]) ||
+                !config.ValueVectorizedAxes.SequenceEqual([PagedKVCacheDimKind.HeadDim]))
             {
                 return new InvalidType("kv cache vectorize axes not support!");
             }
 
-            if ((config.Lanes[0] * config.KVPrimType.SizeInBytes) != 128)
+            if ((config.KeyLanes[0] * config.KVPrimType.SizeInBytes) != 128 ||
+                (config.ValueLanes[0] * config.KVPrimType.SizeInBytes) != 128)
             {
                 return new InvalidType("kv cache vectorized lanes not support!");
             }
@@ -345,5 +354,126 @@ public sealed class PagedAttentionEvaluator : ITypeInferencer<PagedAttention>, I
         }
 
         return new InvalidType("not support distributed type");
+    }
+
+    private bool TryEstimatePagedAttentionCost(IRType qType, IRType extraType, TensorType kvCachesType, PagedAttention target, out UInt128 kvReadBytes, out UInt128 cpuCycles)
+    {
+        kvReadBytes = 0;
+        cpuCycles = 0;
+        if (!TryGetTensorMaxShape(qType, out var qShape)
+            || qShape.Length != target.Layout.Count
+            || kvCachesType.DType is not ReferenceType { ElemType: PagedAttentionKVCacheType { Config: IPagedAttentionConfig config } })
+        {
+            return false;
+        }
+
+        var seqAxis = target.Layout.IndexOf(AttentionDimKind.Seq);
+        var headAxis = target.Layout.IndexOf(AttentionDimKind.Head);
+        var dimAxis = target.Layout.IndexOf(AttentionDimKind.Dim);
+        if (seqAxis < 0 || headAxis < 0 || dimAxis < 0)
+        {
+            return false;
+        }
+
+        var qSeq = System.Math.Max(1.0, qShape[seqAxis]);
+        var qHeads = System.Math.Max(1.0, qShape[headAxis]);
+        var headDim = System.Math.Max(1.0, qShape[dimAxis] * GetVectorLaneCount(GetDType(qType)));
+        var contextLen = System.Math.Max(qSeq, EstimateContextLength(extraType, config, target, qSeq));
+
+        var kvScalarElements = 2.0 * qSeq * qHeads * contextLen * headDim;
+        kvReadBytes = ToCostFactor(kvScalarElements * config.KVPrimType.SizeInBytes);
+
+        // qk and pv each cost roughly headDim FMA per attention element. Softmax/mask
+        // adds a smaller per score term but matters for small headDim cases.
+        var attentionScores = qSeq * qHeads * contextLen;
+        var work = attentionScores * ((2.0 * headDim) + 8.0);
+        cpuCycles = ToCostFactor(work);
+        return true;
+    }
+
+    private bool TryGetTensorMaxShape(IRType type, out long[] shape)
+    {
+        var tensorType = type switch
+        {
+            TensorType tensor => tensor,
+            DistributedType distributed => DistributedUtility.GetDividedTensorType(distributed, DistributedUtility.DivideFlags.MaxShape),
+            _ => null,
+        };
+        if (tensorType is not null && CompilerServices.TryGetMaxShape(tensorType.Shape, out var maxShape))
+        {
+            shape = maxShape;
+            return true;
+        }
+
+        shape = Array.Empty<long>();
+        return false;
+    }
+
+    private double EstimateContextLength(IRType extraType, IPagedAttentionConfig config, PagedAttention target, double fallback)
+    {
+        if (!TryGetTensorMaxShape(extraType, out var extraShape) || extraShape.Length == 0)
+        {
+            return fallback;
+        }
+
+        var extraElements = extraShape.Aggregate(1.0, static (acc, dim) => acc * System.Math.Max(1, dim));
+        var numHeads = System.Math.Max(1.0, target.HiddenSize / (double)System.Math.Max(1, config.HeadDim));
+        var denom = System.Math.Max(1.0, numHeads * System.Math.Max(1, config.KVPrimType.SizeInBytes));
+        var quadratic = extraElements / denom;
+        if (!double.IsFinite(quadratic) || quadratic <= 0)
+        {
+            return fallback;
+        }
+
+        // extra workspace is generated as dtype_bytes * num_heads * L * (L + 1)
+        // for the HuggingFace paged-attention importer path.
+        var estimated = (System.Math.Sqrt((4.0 * quadratic) + 1.0) - 1.0) / 2.0;
+        return double.IsFinite(estimated) && estimated > 0 ? estimated : fallback;
+    }
+
+    private DataType GetDType(IRType type)
+    {
+        return type switch
+        {
+            TensorType tensor => tensor.DType,
+            DistributedType distributed => distributed.TensorType.DType,
+            _ => DataTypes.Float32,
+        };
+    }
+
+    private int GetVectorLaneCount(DataType dtype)
+    {
+        return dtype switch
+        {
+            VectorType vectorType => vectorType.Lanes.Aggregate(1, static (acc, lane) => acc * lane) * GetVectorLaneCount(vectorType.ElemType),
+            _ => 1,
+        };
+    }
+
+    private UInt128 ToCostFactor(double value)
+    {
+        if (!double.IsFinite(value) || value <= 0)
+        {
+            return 0;
+        }
+
+        return (UInt128)(ulong)System.Math.Ceiling(System.Math.Min(value, ulong.MaxValue));
+    }
+
+    private void AddCostFactor(Cost cost, string name, UInt128 value)
+    {
+        if (value == 0)
+        {
+            return;
+        }
+
+        if (cost.Factors.TryGetValue(name, out var oldValue))
+        {
+            cost.Factors[name] = oldValue + value;
+        }
+        else
+        {
+            cost.Factors.Add(name, value);
+        }
     }
 }

@@ -171,9 +171,9 @@ public sealed class CreatePagedAttentionKVCacheEvaluator : ITypeInferencer<Creat
             return new InvalidType("slot_mapping rank != 2");
         }
 
-        if (kv_caches.Shape.Rank < target.Config.CacheLayout.Count)
+        if (kv_caches.Shape.Rank < target.Config.KeyCacheLayout.Count)
         {
-            return new InvalidType("kv_caches shape < CacheLayout.Count");
+            return new InvalidType("kv_caches shape < KeyCacheLayout.Count");
         }
 
         return new ReferenceType(new PagedAttentionKVCacheType()

@@ -452,8 +452,20 @@ public sealed class UnitTestTensor
                     IR.NN.PagedKVCacheDimKind.HeadDim,
                 },
                 new[] {
+                    IR.NN.PagedKVCacheDimKind.NumBlocks,
+                    IR.NN.PagedKVCacheDimKind.NumLayers,
+                    IR.NN.PagedKVCacheDimKind.KV,
+                    IR.NN.PagedKVCacheDimKind.BlockSize,
+                    IR.NN.PagedKVCacheDimKind.NumKVHeads,
                     IR.NN.PagedKVCacheDimKind.HeadDim,
                 },
+                new[] {
+                    IR.NN.PagedKVCacheDimKind.HeadDim,
+                },
+                new[] {
+                    IR.NN.PagedKVCacheDimKind.HeadDim,
+                },
+                new[] { 32 },
                 new[] { 32 },
                 new[] { IR.NN.PagedKVCacheDimKind.NumBlocks },
                 new[] { SBP.S([0]) });

@@ -69,9 +69,12 @@ def test_qwen3_30B_A3B_static(request):
     num_blocks = 32
     max_sessions = 1
     kv_type = "float16"
-    cache_layout = ["NumBlocks","NumLayers","NumKVHeads","KV","HeadDim","BlockSize"]
-    vectorized_axes = ["HeadDim"]
-    lanes = [64]
+    key_cache_layout = ["NumBlocks","NumLayers","KV","NumKVHeads","HeadDim","BlockSize"]
+    value_cache_layout = ["NumBlocks","NumLayers","KV","NumKVHeads","BlockSize","HeadDim"]
+    key_vectorized_axes = ["HeadDim"]
+    value_vectorized_axes = ["BlockSize"]
+    key_lanes = [64]
+    value_lanes = [64]
     sharding_axes = ["NumKVHeads","NumBlocks"]
     axis_policies = [[1],[2,3]]
     hierarchy = [1, 2, 8, 4, 4]

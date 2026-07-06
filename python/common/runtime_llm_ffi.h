@@ -84,10 +84,15 @@ void register_runtime_llm_ffi(py::module &m) {
                  [](size_t num_layers, size_t num_kv_heads, size_t head_dim,
                     py::dtype kv_prim_type, size_t block_size,
                     const std::array<llm::paged_kvcache_dim_kind, 6>
-                        cache_layout = {},
+                        key_cache_layout = {},
+                    const std::array<llm::paged_kvcache_dim_kind, 6>
+                        value_cache_layout = {},
                     const std::vector<llm::paged_kvcache_dim_kind>
-                        vectorized_axes = {},
-                    const std::vector<size_t> lanes = {},
+                        key_vectorized_axes = {},
+                    const std::vector<llm::paged_kvcache_dim_kind>
+                        value_vectorized_axes = {},
+                    const std::vector<size_t> key_lanes = {},
+                    const std::vector<size_t> value_lanes = {},
                     const std::vector<llm::paged_kvcache_dim_kind>
                         sharding_axes = {},
                     const std::vector<std::vector<size_t>> axis_policies = {}) {
@@ -95,21 +100,54 @@ void register_runtime_llm_ffi(py::module &m) {
                      for (auto &&item : axis_policies) {
                          policies.emplace_back(item.begin(), item.end());
                      }
+                     const std::array<llm::paged_kvcache_dim_kind, 6>
+                         empty_layout = {};
+                     const std::array<llm::paged_kvcache_dim_kind, 6>
+                         default_layout = {
+                             llm::paged_kvcache_dim_kind::num_blocks,
+                             llm::paged_kvcache_dim_kind::num_layers,
+                             llm::paged_kvcache_dim_kind::kv,
+                             llm::paged_kvcache_dim_kind::num_kv_heads,
+                             llm::paged_kvcache_dim_kind::head_dim,
+                             llm::paged_kvcache_dim_kind::block_size};
+                     auto actual_key_cache_layout =
+                         key_cache_layout == empty_layout ? default_layout
+                                                            : key_cache_layout;
+                     auto actual_value_cache_layout =
+                         value_cache_layout == empty_layout
+                             ? actual_key_cache_layout
+                             : value_cache_layout;
+                     auto actual_value_vectorized_axes =
+                         value_vectorized_axes.empty()
+                             ? key_vectorized_axes
+                             : value_vectorized_axes;
+                     auto actual_key_lanes =
+                         dims_t{key_lanes.begin(), key_lanes.end()};
+                     auto actual_value_lanes =
+                         value_lanes.empty()
+                             ? actual_key_lanes
+                             : dims_t{value_lanes.begin(), value_lanes.end()};
                      return llm::paged_attention_config(
                                 std::in_place, num_layers, num_kv_heads,
                                 head_dim, nncase::from_dtype(kv_prim_type),
-                                block_size, cache_layout, vectorized_axes,
-                                dims_t{lanes.begin(), lanes.end()},
-                                sharding_axes, policies)
+                                block_size, actual_key_cache_layout,
+                                actual_value_cache_layout, key_vectorized_axes,
+                                actual_value_vectorized_axes, actual_key_lanes,
+                                actual_value_lanes, sharding_axes, policies)
                          .detach();
                  }),
              py::arg("num_layers"), py::arg("num_kv_heads"),
              py::arg("head_dim"), py::arg("kv_type"), py::arg("block_size"),
-             py::arg("cache_layout") =
+             py::arg("key_cache_layout") =
                  std::array<llm::paged_kvcache_dim_kind, 6>{},
-             py::arg("vectorized_axes") =
+             py::arg("value_cache_layout") =
+                 std::array<llm::paged_kvcache_dim_kind, 6>{},
+             py::arg("key_vectorized_axes") =
                  std::vector<llm::paged_kvcache_dim_kind>{},
-             py::arg("lanes") = std::vector<size_t>{},
+             py::arg("value_vectorized_axes") =
+                 std::vector<llm::paged_kvcache_dim_kind>{},
+             py::arg("key_lanes") = std::vector<size_t>{},
+             py::arg("value_lanes") = std::vector<size_t>{},
              py::arg("sharding_axes") =
                  std::vector<llm::paged_kvcache_dim_kind>{},
              py::arg("axis_policies") = std::vector<std::vector<size_t>>{})
@@ -120,34 +158,71 @@ void register_runtime_llm_ffi(py::module &m) {
             py::overload_cast<size_t>(
                 &llm::paged_attention_config_node::block_size))
         .def_property(
-            "cache_layout",
-            py::overload_cast<>(&llm::paged_attention_config_node::cache_layout,
-                                py::const_),
+            "key_cache_layout",
+            py::overload_cast<>(
+                &llm::paged_attention_config_node::key_cache_layout,
+                py::const_),
             py::overload_cast<
                 const std::array<llm::paged_kvcache_dim_kind, 6> &>(
-                &llm::paged_attention_config_node::cache_layout))
-        .def_property_readonly(
-            "block_layout",
-            py::overload_cast<>(&llm::paged_attention_config_node::block_layout,
-                                py::const_))
+                &llm::paged_attention_config_node::key_cache_layout))
         .def_property(
-            "vectorized_axes",
+            "value_cache_layout",
+            py::overload_cast<>(
+                &llm::paged_attention_config_node::value_cache_layout,
+                py::const_),
+            py::overload_cast<
+                const std::array<llm::paged_kvcache_dim_kind, 6> &>(
+                &llm::paged_attention_config_node::value_cache_layout))
+        .def_property_readonly(
+            "key_block_layout",
+            py::overload_cast<>(
+                &llm::paged_attention_config_node::key_block_layout,
+                py::const_))
+        .def_property_readonly(
+            "value_block_layout",
+            py::overload_cast<>(
+                &llm::paged_attention_config_node::value_block_layout,
+                py::const_))
+        .def_property(
+            "key_vectorized_axes",
             [](const llm::paged_attention_config_node &self) {
-                auto axes = self.vectorized_axes();
+                auto axes = self.key_vectorized_axes();
                 return std::vector<llm::paged_kvcache_dim_kind>(axes.begin(),
                                                                 axes.end());
             },
             [](llm::paged_attention_config_node &self,
                const std::vector<llm::paged_kvcache_dim_kind>
-                   &vectorized_axes) { self.vectorized_axes(vectorized_axes); })
+                   &vectorized_axes) {
+                self.key_vectorized_axes(vectorized_axes);
+            })
         .def_property(
-            "lanes",
+            "value_vectorized_axes",
             [](const llm::paged_attention_config_node &self) {
-                auto lanes = self.lanes();
+                auto axes = self.value_vectorized_axes();
+                return std::vector<llm::paged_kvcache_dim_kind>(axes.begin(),
+                                                                axes.end());
+            },
+            [](llm::paged_attention_config_node &self,
+               const std::vector<llm::paged_kvcache_dim_kind>
+                   &vectorized_axes) {
+                self.value_vectorized_axes(vectorized_axes);
+            })
+        .def_property(
+            "key_lanes",
+            [](const llm::paged_attention_config_node &self) {
+                auto lanes = self.key_lanes();
                 return std::vector<int>(lanes.begin(), lanes.end());
             },
             [](llm::paged_attention_config_node &self,
-               const std::vector<int> &lanes) { self.lanes(lanes); })
+               const std::vector<int> &lanes) { self.key_lanes(lanes); })
+        .def_property(
+            "value_lanes",
+            [](const llm::paged_attention_config_node &self) {
+                auto lanes = self.value_lanes();
+                return std::vector<int>(lanes.begin(), lanes.end());
+            },
+            [](llm::paged_attention_config_node &self,
+               const std::vector<int> &lanes) { self.value_lanes(lanes); })
         .def_property(
             "sharding_axes",
             [](const llm::paged_attention_config_node &self) {

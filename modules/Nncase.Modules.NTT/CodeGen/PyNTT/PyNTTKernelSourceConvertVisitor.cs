@@ -3183,6 +3183,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     dimAxis,
                     update.LayerId,
                     update.CacheKind == AttentionCacheKind.Key ? 0 : 1,
+                    GetVectorLaneElementCount(slots.ElemType),
                     cache,
                     $"{slots.Name} -> kv-cache"));
             _attrs["requires_grid_barrier"] = true;
@@ -3401,19 +3402,40 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             var config = GetPagedAttentionConfig(expr, context);
             ValidatePagedAttentionConfig(config, context);
 
-            var laneCount = config.Lanes.Count == 0 ? 1 : checked((int)config.Lanes[0]);
-            var headDimBlocks = checked(config.HeadDim / laneCount);
+            var key = GetPagedAttentionCacheKindLayout(config, AttentionCacheKind.Key, context);
+            var value = GetPagedAttentionCacheKindLayout(config, AttentionCacheKind.Value, context);
             var topologyShape = GetPagedAttentionTopologyShape(config);
             var numBlocksSplitAxes = GetPagedAttentionNumBlocksSplitAxes(config);
+            var valueSectionOffset = key.SectionElements;
+            var blockElements = checked(key.SectionElements + value.SectionElements);
             return new(
-                GetPyNTTScalarDTypeName(config.KVType),
-                GetScalarTritonDType(config.KVType),
+                GetPyNTTScalarDTypeName(config.KVPrimType),
+                GetScalarTritonDType(config.KVPrimType),
                 config.NumLayers,
                 config.NumKVHeads,
                 config.HeadDim,
                 config.BlockSize,
-                laneCount,
-                headDimBlocks,
+                key.LaneCount,
+                value.LaneCount,
+                (int)key.VectorizedDim,
+                (int)value.VectorizedDim,
+                key.HeadDimBlocks,
+                value.HeadDimBlocks,
+                0,
+                valueSectionOffset,
+                key.SectionElements,
+                value.SectionElements,
+                blockElements,
+                key.LayerStride,
+                key.HeadStride,
+                key.DimBlockStride,
+                key.BlockOffsetStride,
+                value.LayerStride,
+                value.HeadStride,
+                value.DimBlockStride,
+                value.BlockOffsetStride,
+                key.TailShape,
+                value.TailShape,
                 config.ShardingAxes.Count + 1,
                 topologyShape,
                 numBlocksSplitAxes);
@@ -3441,11 +3463,138 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             throw new NotSupportedException($"{context} expects Reference<PagedAttentionKVCacheType>, got {dataType}.");
         }
 
+        private sealed record PagedAttentionCacheKindLayout(
+            int LaneCount,
+            PagedKVCacheDimKind VectorizedDim,
+            int HeadDimBlocks,
+            int[] TailShape,
+            int SectionElements,
+            int LayerStride,
+            int HeadStride,
+            int DimBlockStride,
+            int BlockOffsetStride);
+
+        private static PagedAttentionCacheKindLayout GetPagedAttentionCacheKindLayout(IPagedAttentionConfig config, AttentionCacheKind kind, string context)
+        {
+            var vectorizedAxes = config.GetVectorizedAxes(kind).ToArray();
+            var lanes = config.GetLanes(kind).ToArray();
+            int laneCount;
+            PagedKVCacheDimKind vectorizedDim;
+            if (vectorizedAxes.Length == 0 && lanes.Length == 0)
+            {
+                laneCount = 1;
+                vectorizedDim = (PagedKVCacheDimKind)(-1);
+            }
+            else if (vectorizedAxes.Length == 1 && lanes.Length == 1 &&
+                vectorizedAxes[0] is PagedKVCacheDimKind.HeadDim or PagedKVCacheDimKind.BlockSize)
+            {
+                laneCount = checked((int)lanes[0]);
+                vectorizedDim = vectorizedAxes[0];
+            }
+            else
+            {
+                throw new NotSupportedException($"{context} currently supports only {kind} HeadDim or BlockSize vectorization with zero or one lane value.");
+            }
+
+            if (laneCount <= 0)
+            {
+                throw new NotSupportedException($"{context} requires {kind} lane to be positive, got {laneCount}.");
+            }
+
+            if (vectorizedDim == PagedKVCacheDimKind.HeadDim && config.HeadDim % laneCount != 0)
+            {
+                throw new NotSupportedException($"{context} requires {kind} head_dim divisible by lane, got head_dim={config.HeadDim}, lane={laneCount}.");
+            }
+
+            if (vectorizedDim == PagedKVCacheDimKind.BlockSize && config.BlockSize % laneCount != 0)
+            {
+                throw new NotSupportedException($"{context} requires {kind} block_size divisible by lane, got block_size={config.BlockSize}, lane={laneCount}.");
+            }
+
+            var headDimBlocks = vectorizedDim == PagedKVCacheDimKind.HeadDim
+                ? checked(config.HeadDim / laneCount)
+                : config.HeadDim;
+            var tailDims = new List<int>();
+            var tailDimKinds = new List<PagedKVCacheDimKind>();
+            foreach (var dimKind in config.GetCacheLayout(kind))
+            {
+                if (dimKind is PagedKVCacheDimKind.NumBlocks or PagedKVCacheDimKind.KV)
+                {
+                    continue;
+                }
+
+                tailDimKinds.Add(dimKind);
+                var dimExtent = dimKind switch
+                {
+                    PagedKVCacheDimKind.NumLayers => checked((int)config.NumLayers),
+                    PagedKVCacheDimKind.BlockSize => checked((int)config.BlockSize),
+                    PagedKVCacheDimKind.NumKVHeads => checked((int)config.NumKVHeads),
+                    PagedKVCacheDimKind.HeadDim => checked((int)config.HeadDim),
+                    _ => throw new NotSupportedException($"{context} does not support {kind} cache dimension {dimKind}."),
+                };
+                if (dimKind == vectorizedDim)
+                {
+                    dimExtent = checked(dimExtent / laneCount);
+                }
+
+                tailDims.Add(dimExtent);
+            }
+
+            if (tailDims.Count != 4)
+            {
+                throw new NotSupportedException($"{context} expects {kind} cache layout to contain exactly NumLayers, NumKVHeads, HeadDim, and BlockSize after removing NumBlocks/KV.");
+            }
+
+            var strides = ComputeContiguousStrides(tailDims);
+            int GetStride(PagedKVCacheDimKind dimKind)
+            {
+                var index = tailDimKinds.IndexOf(dimKind);
+                if (index < 0)
+                {
+                    throw new NotSupportedException($"{context} {kind} cache layout is missing {dimKind}.");
+                }
+
+                return strides[index];
+            }
+
+            var sectionVectorElements = checked(tailDims.Aggregate(1, static (acc, dim) => checked(acc * dim)));
+            var sectionElements = checked(sectionVectorElements * laneCount);
+            return new(
+                laneCount,
+                vectorizedDim,
+                headDimBlocks,
+                tailDims.ToArray(),
+                sectionElements,
+                GetStride(PagedKVCacheDimKind.NumLayers),
+                GetStride(PagedKVCacheDimKind.NumKVHeads),
+                GetStride(PagedKVCacheDimKind.HeadDim),
+                GetStride(PagedKVCacheDimKind.BlockSize));
+        }
+
+        private static int[] ComputeContiguousStrides(IReadOnlyList<int> shape)
+        {
+            var strides = new int[shape.Count];
+            var stride = 1;
+            for (int i = shape.Count - 1; i >= 0; i--)
+            {
+                strides[i] = stride;
+                stride = checked(stride * shape[i]);
+            }
+
+            return strides;
+        }
+
         private PyNTTKVCacheStorageMetadata GetKVCacheStorageMetadata(PyNTTPagedAttentionCacheTemplateModel cache)
         {
-            // [topology, num_blocks, num_layers, kv, num_kv_heads, head_dim_blocks, block_size, lane].
-            var tailShape = new[] { cache.NumLayers, 2, cache.NumKVHeads, cache.HeadDimBlocks, cache.BlockSize, cache.LaneCount };
-            return new(cache.DType, cache.TopologyShape, tailShape, cache.BlockSize);
+            return new(
+                cache.DType,
+                cache.TopologyShape,
+                cache.KeyTailShape,
+                cache.ValueTailShape,
+                cache.KeySectionElements,
+                cache.ValueSectionElements,
+                cache.BlockElements,
+                cache.BlockSize);
         }
 
         private static int GetGlobalNumQueryHeads(Nncase.TIR.NTT.PagedAttention pagedAttention, PyNTTPagedAttentionCacheTemplateModel cache)
@@ -3466,29 +3615,10 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
 
         private void ValidatePagedAttentionConfig(IPagedAttentionConfig config, string context)
         {
-            var expectedLayout = new[]
-            {
-                PagedKVCacheDimKind.NumBlocks,
-                PagedKVCacheDimKind.NumLayers,
-                PagedKVCacheDimKind.KV,
-                PagedKVCacheDimKind.NumKVHeads,
-                PagedKVCacheDimKind.HeadDim,
-                PagedKVCacheDimKind.BlockSize,
-            };
-            if (!config.CacheLayout.ToArray().SequenceEqual(expectedLayout))
-            {
-                throw new NotSupportedException($"{context} currently supports cache layout [NumBlocks, NumLayers, KV, NumKVHeads, HeadDim, BlockSize], got [{string.Join(", ", config.CacheLayout)}].");
-            }
-
-            if (config.VectorizedAxes.Count != 1 || config.VectorizedAxes[0] != PagedKVCacheDimKind.HeadDim || config.Lanes.Count != 1)
-            {
-                throw new NotSupportedException($"{context} currently supports only HeadDim vectorization with one lane value.");
-            }
-
-            if (config.HeadDim % config.Lanes[0] != 0)
-            {
-                throw new NotSupportedException($"{context} requires head_dim divisible by lane, got head_dim={config.HeadDim}, lane={config.Lanes[0]}.");
-            }
+            ValidatePagedAttentionLayout(config.KeyCacheLayout, AttentionCacheKind.Key, context);
+            ValidatePagedAttentionLayout(config.ValueCacheLayout, AttentionCacheKind.Value, context);
+            _ = GetPagedAttentionCacheKindLayout(config, AttentionCacheKind.Key, context);
+            _ = GetPagedAttentionCacheKindLayout(config, AttentionCacheKind.Value, context);
 
             if (config.ShardingAxes.Count > 1 ||
                 (config.ShardingAxes.Count == 1 && config.ShardingAxes[0] != PagedKVCacheDimKind.NumBlocks))
@@ -3512,6 +3642,21 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                         throw new NotSupportedException($"{context} NumBlocks sharding axis {axis} is outside PyNTT hierarchy rank {hierarchy.Length}.");
                     }
                 }
+            }
+        }
+
+        private static void ValidatePagedAttentionLayout(IRArray<PagedKVCacheDimKind> layout, AttentionCacheKind kind, string context)
+        {
+            if (layout.Count != 6)
+            {
+                throw new NotSupportedException($"{context} {kind} cache layout must have 6 dimensions, got {layout.Count}.");
+            }
+
+            var expected = Enum.GetValues<PagedKVCacheDimKind>().OrderBy(x => (int)x).ToArray();
+            var actual = layout.ToArray().OrderBy(x => (int)x).ToArray();
+            if (!actual.SequenceEqual(expected))
+            {
+                throw new NotSupportedException($"{context} {kind} cache layout must be a permutation of [{string.Join(", ", expected)}], got [{string.Join(", ", layout)}].");
             }
         }
 

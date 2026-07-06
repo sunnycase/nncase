@@ -38,7 +38,8 @@ def test_qwen3(request):
 
     [paged_attention_config]
     kv_type = "bfloat16"
-    lanes = [8]
+    key_lanes = [8]
+    value_lanes = [8]
 
     [generator]
     [generator.inputs]

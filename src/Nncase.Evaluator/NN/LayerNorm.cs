@@ -135,16 +135,14 @@ public class LayerNormEvaluator : IEvaluator<LayerNorm>, ITypeInferencer<LayerNo
                     [CostFactorNames.BlockLocalMemoryStoreBytes] = CostUtility.GetMemoryAccess(returnType),
                 };
 
-            case (DistributedType inputDistributedType, DistributedType):
+            case (DistributedType, DistributedType):
                 var scaleType = context.GetArgumentType<DistributedType>(target, LayerNorm.Scale);
                 var biasType = context.GetArgumentType<DistributedType>(target, LayerNorm.Bias);
                 var ring = GetRingReduceCommunicate(scaleType, new[] { 0, 1 }) + GetRingReduceCommunicate(biasType, new[] { 0, 1 });
-                var broadcastAxes = Enumerable.Range(0, inputDistributedType.Placement.Rank).Except(inputDistributedType.AxisPolicies.OfType<SBPSplit>().Select(s => s.Axes).SelectMany(x => x)).ToArray();
-                var reCompute = broadcastAxes.Select(a => inputDistributedType.Placement.Hierarchy[a]).ToArray().Aggregate(1, (acc, rep) => acc * rep);
                 return new()
                 {
                     [CostFactorNames.BlockLocalMemoryLoadBytes] = CostUtility.GetMemoryAccess(inputType) + ring,
-                    [CostFactorNames.CPUCycles] = CostUtility.GetCPUCycles(inputType, 1) * (UInt128)reCompute,
+                    [CostFactorNames.CPUCycles] = CostUtility.GetCPUCycles(inputType, 1),
                     [CostFactorNames.BlockLocalMemoryStoreBytes] = CostUtility.GetMemoryAccess(returnType) + ring,
                 };
             default:

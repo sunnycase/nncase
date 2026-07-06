@@ -240,7 +240,8 @@ public class UnitTestInterop
         Assert.Equal(2, r_a.NumKVHeads);
         Assert.Equal(1, r_a.HeadDim);
         {
-            var b = new IR.NN.PagedAttentionConfig(1, 2, 3, DataTypes.Float16, 4, new[] { IR.NN.PagedKVCacheDimKind.BlockSize, IR.NN.PagedKVCacheDimKind.HeadDim, IR.NN.PagedKVCacheDimKind.KV, IR.NN.PagedKVCacheDimKind.NumBlocks, IR.NN.PagedKVCacheDimKind.NumKVHeads, IR.NN.PagedKVCacheDimKind.NumLayers }, [], [], [], []);
+            var layout = new[] { IR.NN.PagedKVCacheDimKind.BlockSize, IR.NN.PagedKVCacheDimKind.HeadDim, IR.NN.PagedKVCacheDimKind.KV, IR.NN.PagedKVCacheDimKind.NumBlocks, IR.NN.PagedKVCacheDimKind.NumKVHeads, IR.NN.PagedKVCacheDimKind.NumLayers };
+            var b = new IR.NN.PagedAttentionConfig(1, 2, 3, DataTypes.Float16, 4, layout, layout, [], [], [], [], [], []);
             var r_ = RTAttentionConfig.FromConfig(b);
             Assert.IsType<RTPagedAttentionConfig>(r_);
             var r_b = (RTPagedAttentionConfig)r_;
@@ -257,24 +258,55 @@ public class UnitTestInterop
             Assert.Equal(1, r_b.HeadDim);
             Assert.Equal(0, r_b.BlockSize);
 
-            Assert.Empty(r_b.VectorizedAxes);
-            Assert.Empty(r_b.Lanes);
-            r_b.VectorizedAxes = new[] { IR.NN.PagedKVCacheDimKind.HeadDim };
-            r_b.Lanes = new[] { 64 };
-            Assert.True(r_b.VectorizedAxes.SequenceEqual(new[] { IR.NN.PagedKVCacheDimKind.HeadDim }));
-            Assert.True(r_b.Lanes.SequenceEqual(new[] { 64 }));
+            Assert.Empty(r_b.KeyVectorizedAxes);
+            Assert.Empty(r_b.KeyLanes);
+            r_b.KeyVectorizedAxes = new[] { IR.NN.PagedKVCacheDimKind.HeadDim };
+            r_b.KeyLanes = new[] { 64 };
+            r_b.ValueVectorizedAxes = new[] { IR.NN.PagedKVCacheDimKind.HeadDim };
+            r_b.ValueLanes = new[] { 64 };
+            Assert.True(r_b.KeyVectorizedAxes.SequenceEqual(new[] { IR.NN.PagedKVCacheDimKind.HeadDim }));
+            Assert.True(r_b.KeyLanes.SequenceEqual(new[] { 64 }));
+            Assert.True(r_b.ValueVectorizedAxes.SequenceEqual(new[] { IR.NN.PagedKVCacheDimKind.HeadDim }));
+            Assert.True(r_b.ValueLanes.SequenceEqual(new[] { 64 }));
+            r_b.ValueVectorizedAxes = new[] { IR.NN.PagedKVCacheDimKind.NumKVHeads };
+            r_b.ValueLanes = new[] { 2 };
+            Assert.True(r_b.KeyVectorizedAxes.SequenceEqual(new[] { IR.NN.PagedKVCacheDimKind.HeadDim }));
+            Assert.True(r_b.KeyLanes.SequenceEqual(new[] { 64 }));
+            Assert.True(r_b.ValueVectorizedAxes.SequenceEqual(new[] { IR.NN.PagedKVCacheDimKind.NumKVHeads }));
+            Assert.True(r_b.ValueLanes.SequenceEqual(new[] { 2 }));
 
             Assert.Throws<InvalidOperationException>(() =>
             {
-                r_b.Lanes = new[] { 1, 2, 3, 4, 5, 6, 7, 8, 9 };
+                r_b.KeyLanes = new[] { 1, 2, 3, 4, 5, 6, 7, 8, 9 };
             });
         }
 
         {
-            var config = new IR.NN.PagedAttentionConfig(1, 2, 3, DataTypes.Float16, 4, new[] { IR.NN.PagedKVCacheDimKind.BlockSize, IR.NN.PagedKVCacheDimKind.HeadDim, IR.NN.PagedKVCacheDimKind.KV, IR.NN.PagedKVCacheDimKind.NumBlocks, IR.NN.PagedKVCacheDimKind.NumKVHeads, IR.NN.PagedKVCacheDimKind.NumLayers }, new[] { IR.NN.PagedKVCacheDimKind.HeadDim }, new[] { 32 }, new[] { IR.NN.PagedKVCacheDimKind.NumBlocks }, new[] { SBP.S([1, 2]) });
+            var keyLayout = new[] { IR.NN.PagedKVCacheDimKind.BlockSize, IR.NN.PagedKVCacheDimKind.HeadDim, IR.NN.PagedKVCacheDimKind.KV, IR.NN.PagedKVCacheDimKind.NumBlocks, IR.NN.PagedKVCacheDimKind.NumKVHeads, IR.NN.PagedKVCacheDimKind.NumLayers };
+            var valueLayout = new[] { IR.NN.PagedKVCacheDimKind.HeadDim, IR.NN.PagedKVCacheDimKind.BlockSize, IR.NN.PagedKVCacheDimKind.KV, IR.NN.PagedKVCacheDimKind.NumBlocks, IR.NN.PagedKVCacheDimKind.NumKVHeads, IR.NN.PagedKVCacheDimKind.NumLayers };
+            var config = new IR.NN.PagedAttentionConfig(
+                1,
+                2,
+                3,
+                DataTypes.Float16,
+                4,
+                keyLayout,
+                valueLayout,
+                new[] { IR.NN.PagedKVCacheDimKind.HeadDim },
+                new[] { IR.NN.PagedKVCacheDimKind.NumKVHeads },
+                new[] { 32 },
+                new[] { 2 },
+                new[] { IR.NN.PagedKVCacheDimKind.NumBlocks },
+                new[] { SBP.S([1, 2]) });
             var rtConfig = RTAttentionConfig.FromConfig(config);
             Assert.IsType<RTPagedAttentionConfig>(rtConfig);
             var rtPagedConfig = (RTPagedAttentionConfig)rtConfig;
+            Assert.True(rtPagedConfig.KeyCacheLayout.SequenceEqual(keyLayout));
+            Assert.True(rtPagedConfig.ValueCacheLayout.SequenceEqual(valueLayout));
+            Assert.True(rtPagedConfig.KeyVectorizedAxes.SequenceEqual([IR.NN.PagedKVCacheDimKind.HeadDim]));
+            Assert.True(rtPagedConfig.ValueVectorizedAxes.SequenceEqual([IR.NN.PagedKVCacheDimKind.NumKVHeads]));
+            Assert.True(rtPagedConfig.KeyLanes.SequenceEqual([32]));
+            Assert.True(rtPagedConfig.ValueLanes.SequenceEqual([2]));
             Assert.True(rtPagedConfig.AxisPolicies.SequenceEqual([SBP.S([1, 2])]));
         }
     }
@@ -303,7 +335,8 @@ public class UnitTestInterop
     [Fact]
     public void TestRTPagedAttentionScheduler()
     {
-        var cfg = new IR.NN.PagedAttentionConfig(1, 2, 3, 4, [IR.NN.PagedKVCacheDimKind.BlockSize, IR.NN.PagedKVCacheDimKind.HeadDim, IR.NN.PagedKVCacheDimKind.KV, IR.NN.PagedKVCacheDimKind.NumBlocks, IR.NN.PagedKVCacheDimKind.NumKVHeads, IR.NN.PagedKVCacheDimKind.NumLayers], [], [], DataTypes.Float32);
+        var layout = new[] { IR.NN.PagedKVCacheDimKind.BlockSize, IR.NN.PagedKVCacheDimKind.HeadDim, IR.NN.PagedKVCacheDimKind.KV, IR.NN.PagedKVCacheDimKind.NumBlocks, IR.NN.PagedKVCacheDimKind.NumKVHeads, IR.NN.PagedKVCacheDimKind.NumLayers };
+        var cfg = new IR.NN.PagedAttentionConfig(1, 2, 3, DataTypes.Float32, 4, layout, layout, [], [], [], [], [], []);
         var s = RTPagedAttentionScheduler.Create(cfg, 128, 1238);
 
         var sessionIds = Tensor.From([1L]);

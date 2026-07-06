@@ -45,7 +45,10 @@ public sealed class PagedAttentionKVCacheTestFixture
             kvPrimType,
             blockSize,
             cacheLayout,
+            cacheLayout,
             vectorizedAxes,
+            vectorizedAxes,
+            lanes,
             lanes,
             shardingAxes,
             axisPolicies);
@@ -205,21 +208,23 @@ public sealed class PagedAttentionKVCacheTestFixture
             queryLens.Length);
     }
 
-    public static TensorType GetQKVTensorType(ReadOnlySpan<long> defaultDims, IPagedAttentionConfig config)
+    public static TensorType GetQKVTensorType(ReadOnlySpan<long> defaultDims, IPagedAttentionConfig config, AttentionCacheKind cacheKind = AttentionCacheKind.Key)
     {
         var dims = defaultDims.ToArray();
         var lanes = new List<int>();
-        for (int i = 0; i < config.VectorizedAxes.Count; i++)
+        var vectorizedAxes = config.GetVectorizedAxes(cacheKind);
+        var cacheLanes = config.GetLanes(cacheKind);
+        for (int i = 0; i < vectorizedAxes.Count; i++)
         {
-            if (config.VectorizedAxes[i] is PagedKVCacheDimKind.HeadDim or PagedKVCacheDimKind.NumKVHeads)
+            if (vectorizedAxes[i] is PagedKVCacheDimKind.HeadDim or PagedKVCacheDimKind.NumKVHeads)
             {
-                dims[config.VectorizedAxes[i] switch
+                dims[vectorizedAxes[i] switch
                 {
                     PagedKVCacheDimKind.NumKVHeads => 1,
                     PagedKVCacheDimKind.HeadDim => 2,
                     _ => throw new ArgumentOutOfRangeException(nameof(config)),
-                }] /= config.Lanes[i];
-                lanes.Add(config.Lanes[i]);
+                }] /= cacheLanes[i];
+                lanes.Add(cacheLanes[i]);
             }
         }
 
@@ -233,7 +238,7 @@ public sealed class PagedAttentionKVCacheTestFixture
         var contextLensTensor = Tensor.From(contextLens);
 
         // 1. create logical kv cache tensor.
-        var logicalKVTensorType = config.GetLogicalShardTensorType(numBlocks, placement);
+        var logicalKVTensorType = config.GetLogicalShardTensorType(numBlocks, placement, AttentionCacheKind.Key);
         var logicalKVCacheTensor = Tensor.Zeros(logicalKVTensorType.DType, logicalKVTensorType.Shape.ToValueArray());
 
         // 2. create temporary slotmapping for update hist key and value tensors.
@@ -267,18 +272,20 @@ public sealed class PagedAttentionKVCacheTestFixture
                 layerKVInputs[(int)kind] = curOrtTensors;
 
                 // vectorize tensors.
-                for (int i = 0; i < config.VectorizedAxes.Count; i++)
+                var vectorizedAxes = config.GetVectorizedAxes(kind);
+                var cacheLanes = config.GetLanes(kind);
+                for (int i = 0; i < vectorizedAxes.Count; i++)
                 {
-                    if (config.VectorizedAxes[i] is PagedKVCacheDimKind.HeadDim or PagedKVCacheDimKind.NumKVHeads)
+                    if (vectorizedAxes[i] is PagedKVCacheDimKind.HeadDim or PagedKVCacheDimKind.NumKVHeads)
                     {
                         histOrtTensors = histOrtTensors.Pack(
                             0,
-                            config.Lanes[i],
-                            config.VectorizedAxes[i] switch { PagedKVCacheDimKind.NumKVHeads => 1, PagedKVCacheDimKind.HeadDim => 2, _ => throw new ArgumentOutOfRangeException(nameof(config)) });
+                            cacheLanes[i],
+                            vectorizedAxes[i] switch { PagedKVCacheDimKind.NumKVHeads => 1, PagedKVCacheDimKind.HeadDim => 2, _ => throw new ArgumentOutOfRangeException(nameof(config)) });
                     }
                 }
 
-                var histTensor = Tensor.FromBytes(new TensorType(config.KVType, histOrtTensors.Shape.SkipLast(config.VectorizedAxes.Count).ToArray()), histOrtTensors.BytesBuffer.ToArray());
+                var histTensor = Tensor.FromBytes(new TensorType(config.GetKVType(kind), histOrtTensors.Shape.SkipLast(vectorizedAxes.Count).ToArray()), histOrtTensors.BytesBuffer.ToArray());
 
                 // assign slot id.
                 var contextTokens = contextLens.Sum();

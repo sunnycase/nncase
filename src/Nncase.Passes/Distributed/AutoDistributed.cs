@@ -192,6 +192,14 @@ internal sealed class DistributedSearchGraph : TieredAdjacencyGraph<SearchableNo
     public SearchGraphKind Kind { get; }
 }
 
+internal sealed record CandidateDiagnosticKey(
+    string Target,
+    string Stage,
+    string Status,
+    string ResultType,
+    string Reason,
+    string Arguments);
+
 internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
 {
     private readonly Dictionary<BaseExpr, DistributedSearchGraph> _reshardMemo;
@@ -210,10 +218,14 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
 
     private readonly Dictionary<Type, ITypeInferencer> _inferencer_cache = new Dictionary<Type, ITypeInferencer>();
 
+    private readonly Dictionary<CandidateDiagnosticKey, int> _candidateDiagnostics = new();
+
     /// <summary>
     /// The original tensor consts that are distributed.
     /// </summary>
     private readonly Dictionary<TensorConst, TensorConst> _distributedConstSources = new(ReferenceEqualityComparer.Instance);
+
+    private int _candidateDiagnosticTotal;
 
     public AutoDistributedRewriter(CompileOptions compileOptions, INTTTargetOptions targetOptions, AutoDistributedPhase phase, string moduleKind = "cpu", bool bidirectional = false)
     {
@@ -604,15 +616,24 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
             {
                 if (expr.Target is not Boxing && ((Call)newExpr).Arguments.AsValueEnumerable().Any(a => a.CheckedType is DistributedType dt && dt.Partial is not null))
                 {
+                    RecordCandidateDiagnostic(expr, bucketArray, "infer", "rejected", null, "partial argument is not allowed before boxing");
                     continue;
                 }
 
-                if (!newExpr.InferenceType(_inferencer_cache) || newExpr.CheckedType is InvalidType)
+                if (!newExpr.InferenceType(_inferencer_cache))
                 {
+                    RecordCandidateDiagnostic(expr, bucketArray, "infer", "rejected", newExpr.CheckedType, "type inference returned false");
+                    continue;
+                }
+
+                if (newExpr.CheckedType is InvalidType invalidType)
+                {
+                    RecordCandidateDiagnostic(expr, bucketArray, "infer", "rejected", invalidType, invalidType.Reason);
                     continue;
                 }
 
                 var checkType = newExpr.CheckedType;
+                RecordCandidateDiagnostic(expr, bucketArray, "infer", "accepted", checkType, string.Empty);
                 if (!bucketMemo.TryGetValue(checkType, out var dbucket))
                 {
                     dbucket = callCluster.CreateCluster<DistributedSearchGraph>(SearchGraphKind.Bucket);
@@ -686,6 +707,30 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         // 5. filter
         FilterByScheme(expr, callCluster);
         return default;
+    }
+
+    private void RecordCandidateDiagnostic(
+        Call sourceCall,
+        IReadOnlyList<DistributedSearchGraph> argBuckets,
+        string stage,
+        string status,
+        IRType? resultType,
+        string reason)
+    {
+        _candidateDiagnosticTotal++;
+        var arguments = string.Join(" | ", argBuckets.Select((bucket, index) =>
+        {
+            var type = bucket.Vertices.FirstOrDefault()?.IRType;
+            return $"P{index}:{FormatType(type)}";
+        }));
+        var key = new CandidateDiagnosticKey(
+            GetExprLabel(sourceCall.Target),
+            stage,
+            status,
+            FormatType(resultType),
+            string.IsNullOrWhiteSpace(reason) ? "-" : GetOneLine(reason),
+            arguments);
+        _candidateDiagnostics[key] = _candidateDiagnostics.TryGetValue(key, out var count) ? count + 1 : 1;
     }
 
     private void AddSupplementalReshardCandidates(
@@ -1277,6 +1322,35 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         DumpSelectedNode(writer, rootNode, dump, active, 0);
     }
 
+    private void DumpCandidateDiagnostics(Stream stream)
+    {
+        using var writer = new StreamWriter(stream);
+        var focusTerms = GetCostDumpFocusTerms();
+        writer.WriteLine("# AutoDistributed Candidate Diagnostics");
+        writer.WriteLine($"total_records: {_candidateDiagnosticTotal}");
+        writer.WriteLine($"distinct_records: {_candidateDiagnostics.Count}");
+        writer.WriteLine($"focus_terms: {string.Join(", ", focusTerms)}");
+        writer.WriteLine();
+
+        foreach (var entry in _candidateDiagnostics
+            .Where(entry => focusTerms.Count == 0 || MatchesFocusText(entry.Key.ToString(), focusTerms))
+            .OrderBy(entry => entry.Key.Target)
+            .ThenBy(entry => entry.Key.Status)
+            .ThenByDescending(entry => entry.Value)
+            .ThenBy(entry => entry.Key.Reason)
+            .ThenBy(entry => entry.Key.ResultType))
+        {
+            writer.WriteLine($"## {entry.Key.Target}");
+            writer.WriteLine($"count: {entry.Value}");
+            writer.WriteLine($"stage: {entry.Key.Stage}");
+            writer.WriteLine($"status: {entry.Key.Status}");
+            writer.WriteLine($"reason: {entry.Key.Reason}");
+            writer.WriteLine($"result: {entry.Key.ResultType}");
+            writer.WriteLine($"args: {entry.Key.Arguments}");
+            writer.WriteLine();
+        }
+    }
+
     private void DumpBucketSummary(StreamWriter writer, DistributedSearchGraph bucket, CostDumpContext dump, int topK, IReadOnlyList<string> focusTerms)
     {
         var bucketName = dump.GetGraphName(bucket);
@@ -1506,7 +1580,12 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         }
 
         var label = $"{GetNodeLabel(node)} {node.IRType}";
-        return focusTerms.Any(term => label.Contains(term, StringComparison.OrdinalIgnoreCase));
+        return MatchesFocusText(label, focusTerms);
+    }
+
+    private bool MatchesFocusText(string text, IReadOnlyList<string> focusTerms)
+    {
+        return focusTerms.Any(term => text.Contains(term, StringComparison.OrdinalIgnoreCase));
     }
 
     private bool ContainsPartial(IRType type)
@@ -1527,8 +1606,14 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
     private string FormatLatencyBreakdown(CostModel.ITargetOpCostModel targetCostModel, CostModel.Cost cost, IRType? resultType)
     {
         var breakdown = CostModel.TargetOpCostModelUtility.GetCostLatencyBreakdown(targetCostModel, cost, resultType);
+        var blockLocalBytes = GetCostFactor(cost, CostModel.CostFactorNames.BlockLocalMemoryLoadBytes) + GetCostFactor(cost, CostModel.CostFactorNames.BlockLocalMemoryStoreBytes);
+        var explicitChipGlobalBytes = GetCostFactor(cost, CostModel.CostFactorNames.ChipGlobalMemoryLoadBytes) + GetCostFactor(cost, CostModel.CostFactorNames.ChipGlobalMemoryStoreBytes);
+        var effectiveChipGlobalBytes = ToDouble(blockLocalBytes + explicitChipGlobalBytes) * Math.Max(1L, breakdown.ActiveBlockCount);
         return "{" +
             $" active_blocks={breakdown.ActiveBlockCount}," +
+            $" local_bytes={blockLocalBytes}," +
+            $" explicit_chipglobal_bytes={explicitChipGlobalBytes}," +
+            $" effective_chipglobal_bytes={FormatDouble(effectiveChipGlobalBytes)}," +
             $" cpu={FormatDouble(breakdown.CPUCycles)}," +
             $" blocklocal={FormatDouble(breakdown.BlockLocalMemoryCycles)}," +
             $" chipglobal={FormatDouble(breakdown.ChipGlobalMemoryCycles)}," +
@@ -1544,9 +1629,18 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
     private string FormatDouble(double value)
         => value.ToString("0.###", CultureInfo.InvariantCulture);
 
+    private UInt128 GetCostFactor(CostModel.Cost cost, string name)
+        => cost.Factors.TryGetValue(name, out var value) ? value : 0;
+
+    private double ToDouble(UInt128 value)
+        => value > ulong.MaxValue ? ulong.MaxValue : (ulong)value;
+
     private string GetNodeLabel(SearchableNode node)
+        => GetExprLabel(node.Expr);
+
+    private string GetExprLabel(BaseExpr expr)
     {
-        if (node.Expr is Op op)
+        if (expr is Op op)
         {
             var property = op.DisplayProperty();
             return string.IsNullOrWhiteSpace(property)
@@ -1554,7 +1648,12 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
                 : $"{op.GetType().FullName}({property})";
         }
 
-        return node.Expr.GetType().FullName ?? node.Expr.GetType().Name;
+        return expr.GetType().FullName ?? expr.GetType().Name;
+    }
+
+    private string FormatType(IRType? type)
+    {
+        return GetOneLine(type?.ToString() ?? "<none>");
     }
 
     private string GetOneLine(string text)
@@ -1711,7 +1810,8 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
 
         solver.StringParameters = $"max_time_in_seconds:{max_time},num_workers:{processorCount}";
 
-        var enableDump = Diagnostics.DumpScope.Current.IsEnabled(Diagnostics.DumpFlags.EGraphCost)
+        var enableDump = Diagnostics.DumpScope.Current.IsEnabled(Diagnostics.DumpFlags.Compile)
+            || Diagnostics.DumpScope.Current.IsEnabled(Diagnostics.DumpFlags.EGraphCost)
             || string.Equals(Environment.GetEnvironmentVariable("NNCASE_DUMP_AD_COSTS"), "1", StringComparison.Ordinal);
         CpSolverStatus status;
         using (var dumpStream = Diagnostics.DumpScope.Current.OpenFile("Costs/Solve.txt"))
@@ -1743,6 +1843,11 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
             using (var stream = Diagnostics.DumpScope.Current.OpenFile("Costs/SelectedTree.txt"))
             {
                 DumpSelectedTree(stream, rootCluster, picks, costMemo, costScoreMemo);
+            }
+
+            using (var stream = Diagnostics.DumpScope.Current.OpenFile("Costs/CandidateDiagnostics.txt"))
+            {
+                DumpCandidateDiagnostics(stream);
             }
         }
 

@@ -790,24 +790,25 @@ public abstract class HuggingFaceModel
         AttentionDimKind[] qSrcLayout = [AttentionDimKind.Seq, AttentionDimKind.Head, AttentionDimKind.Dim];
         AttentionDimKind[] kvSrcLayout = [AttentionDimKind.Seq, AttentionDimKind.Head, AttentionDimKind.Dim];
         {
-            AttentionDimKind[] kvDestLayout = { AttentionDimKind.Head, AttentionDimKind.Dim, AttentionDimKind.Seq };
+            var kvDestLayout = GetPagedAttentionTensorLayout(pagedAttentionConfig, kvSrcLayout);
             var kvPerms = ModelUtils.GetLayoutPerm(kvSrcLayout, kvDestLayout);
-            var (kvLanes, kvVectorizedAxis) = ModelUtils.GetQKVVectorizeParams(pagedAttentionConfig, kvDestLayout);
-            var transK = IR.F.Tensors.Transpose(keyStates, kvPerms);
+            var (keyLanes, keyVectorizedAxis) = ModelUtils.GetQKVVectorizeParams(pagedAttentionConfig, kvDestLayout, AttentionCacheKind.Key);
+            var (valueLanes, valueVectorizedAxis) = ModelUtils.GetQKVVectorizeParams(pagedAttentionConfig, kvDestLayout, AttentionCacheKind.Value);
+            var transK = TransposeIfNeeded(keyStates, kvPerms);
             var castK = pagedAttentionConfig.KVPrimType != qType ? IR.F.Tensors.Cast(transK, pagedAttentionConfig.KVPrimType) : transK;
-            var vectorizedK = kvLanes.Length > 0 ? IR.F.Tensors.Pack(castK, kvLanes, kvVectorizedAxis) : castK;
+            var vectorizedK = keyLanes.Length > 0 ? IR.F.Tensors.Pack(castK, keyLanes, keyVectorizedAxis) : castK;
             paskKeyValues = IR.F.NN.UpdatePagedAttentionKVCache(vectorizedK, paskKeyValues, AttentionCacheKind.Key, count, kvDestLayout);
 
-            var transV = IR.F.Tensors.Transpose(valueStates, kvPerms);
+            var transV = TransposeIfNeeded(valueStates, kvPerms);
             var castV = pagedAttentionConfig.KVPrimType != qType ? IR.F.Tensors.Cast(transV, pagedAttentionConfig.KVPrimType) : transV;
-            var vectorizedV = kvLanes.Length > 0 ? IR.F.Tensors.Pack(castV, kvLanes, kvVectorizedAxis) : castV;
+            var vectorizedV = valueLanes.Length > 0 ? IR.F.Tensors.Pack(castV, valueLanes, valueVectorizedAxis) : castV;
             paskKeyValues = IR.F.NN.UpdatePagedAttentionKVCache(vectorizedV, paskKeyValues, AttentionCacheKind.Value, count, kvDestLayout);
         }
 
         var scaling = Tensor.FromScalar((float)(1.0f / System.Math.Sqrt((double)head_dim)));
 
         // var mergedKeyValue = MergeKV(keyStates, valueStates);
-        AttentionDimKind[] qDestLayout = { AttentionDimKind.Head, AttentionDimKind.Dim, AttentionDimKind.Seq };
+        var qDestLayout = GetPagedAttentionTensorLayout(pagedAttentionConfig, qSrcLayout);
         var qPerm = ModelUtils.GetLayoutPerm(qSrcLayout, qDestLayout);
         var (qLanes, qVectorizedAxis) = ModelUtils.GetQKVVectorizeParams(pagedAttentionConfig, qDestLayout);
         bool isXpu = Context.CompileSession!.Target.Name == "xpu";
@@ -817,7 +818,7 @@ public abstract class HuggingFaceModel
         //     var padding_m = Dimension.AlignUp(seq_len, 8) - seq_len;
         //     queryStates = seq_len is DimVar ? IR.F.NN.Pad(queryStates, new(new(0, 0), new(0, padding_m), new(0, 0)), PadMode.Constant, Tensor.Zero(queryStates.CheckedDataType)) : queryStates;
         // }
-        var transQ = IR.F.Tensors.Transpose(queryStates, qPerm);
+        var transQ = TransposeIfNeeded(queryStates, qPerm);
         var castQ = pagedAttentionConfig.KVPrimType != qType ? IR.F.Tensors.Cast(transQ, pagedAttentionConfig.KVPrimType) : transQ;
         var vectorizedQ = qLanes.Length > 0 ? IR.F.Tensors.Pack(castQ, qLanes, qVectorizedAxis) : castQ;
 
@@ -843,7 +844,7 @@ public abstract class HuggingFaceModel
         output = qLanes.Length > 0 ? IR.F.Tensors.Unpack(output, qLanes, qVectorizedAxis) : output;
 
         output = pagedAttentionConfig.KVPrimType != qType ? IR.F.Tensors.Cast(output, qType) : output;
-        output = IR.F.Tensors.Transpose(output, ModelUtils.GetLayoutPerm(qDestLayout, qSrcLayout));
+        output = TransposeIfNeeded(output, ModelUtils.GetLayoutPerm(qDestLayout, qSrcLayout));
 
         // if (isXpu)
         // {
@@ -1162,4 +1163,24 @@ public abstract class HuggingFaceModel
     //         { "routerLogits", routerLogits },
     //     };
     // }
+    private AttentionDimKind[] GetPagedAttentionTensorLayout(IPagedAttentionConfig config, AttentionDimKind[] sourceLayout)
+    {
+        if (UsesSourcePagedAttentionTensorLayout(config))
+        {
+            return sourceLayout;
+        }
+
+        return [AttentionDimKind.Head, AttentionDimKind.Dim, AttentionDimKind.Seq];
+    }
+
+    private bool UsesSourcePagedAttentionTensorLayout(IPagedAttentionConfig config)
+    {
+        return !config.KeyCacheLayout.SequenceEqual(config.ValueCacheLayout) ||
+            config.GetVectorizedAxes(AttentionCacheKind.Value).Contains(PagedKVCacheDimKind.BlockSize);
+    }
+
+    private Expr TransposeIfNeeded(Expr input, IReadOnlyList<int> perm)
+    {
+        return perm.Select((axis, index) => axis == index).All(x => x) ? input : IR.F.Tensors.Transpose(input, perm.ToArray());
+    }
 }

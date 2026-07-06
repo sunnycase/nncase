@@ -50,19 +50,19 @@ public sealed class GatherPagedAttentionKVCacheEvaluator : ITypeInferencer<Gathe
         var kvcahe = (RefPagedAttentionKVCache)refernece.Value;
         var ortKVCacheTensor = kvcahe.KVCaches.ToOrtTensor();
         var config = (IPagedAttentionConfig)kvcahe.Config;
-        var lanesShape = ortKVCacheTensor.Shape.Skip(config.ShardingAxes.Count + config.CacheLayout.Count).ToArray();
+        var lanesShape = ortKVCacheTensor.Shape.Skip(config.ShardingAxes.Count + config.KeyCacheLayout.Count).ToArray();
 
         var perms = Enumerable.Range(0, ortKVCacheTensor.Shape.Length).Select(i => new List<long> { i }).ToList();
         for (int i = 0; i < config.ShardingAxes.Count; i++)
         {
-            var axis = config.CacheLayout.IndexOf(config.ShardingAxes[i]);
+            var axis = config.KeyCacheLayout.IndexOf(config.ShardingAxes[i]);
             perms[config.ShardingAxes.Count + axis].Insert(0, perms[i][0]);
             perms[i].RemoveAt(0);
         }
 
         var perm = perms.SelectMany(x => x).ToArray();
         var transKVCacheTensor = OrtKI.Transpose(ortKVCacheTensor, perm);
-        var logicalTensorType = config.GetLogicalTensorType(kvcahe.NumBlocks);
+        var logicalTensorType = config.GetLogicalTensorType(kvcahe.NumBlocks, AttentionCacheKind.Key);
         var logicalShape = logicalTensorType.Shape.ToValueArray();
         var shape = logicalShape.Concat(lanesShape).ToArray();
         var reshaped = OrtKI.Reshape(transKVCacheTensor, shape, 0);
@@ -82,7 +82,7 @@ public sealed class GatherPagedAttentionKVCacheEvaluator : ITypeInferencer<Gathe
             return new InvalidType("only support PagedAttentionKVCache!");
         }
 
-        return pagedAttentionKVCacheType.Config.GetLogicalTensorType(target.NumBlocks);
+        return pagedAttentionKVCacheType.Config.GetLogicalTensorType(target.NumBlocks, AttentionCacheKind.Key);
     }
 
     private IRType Visit(ITypeInferenceContext context, GatherPagedAttentionKVCache target, DistributedType shardId, IRType kvCache)
@@ -102,12 +102,12 @@ public sealed class GatherPagedAttentionKVCacheEvaluator : ITypeInferencer<Gathe
             return new InvalidType("only support PagedAttentionKVCache!");
         }
 
-        var tensorType = pagedAttentionKVCacheType.Config.GetLogicalTensorType(target.NumBlocks);
+        var tensorType = pagedAttentionKVCacheType.Config.GetLogicalTensorType(target.NumBlocks, AttentionCacheKind.Key);
         var axisPolices = Enumerable.Repeat<SBP>(SBP.B, tensorType.Shape.Rank).ToArray();
         for (int i = 0; i < pagedAttentionKVCacheType.Config.ShardingAxes.Count; i++)
         {
             var dimName = pagedAttentionKVCacheType.Config.ShardingAxes[i];
-            axisPolices[pagedAttentionKVCacheType.Config.CacheLayout.IndexOf(dimName)] = pagedAttentionKVCacheType.Config.AxisPolicies[i];
+            axisPolices[pagedAttentionKVCacheType.Config.KeyCacheLayout.IndexOf(dimName)] = pagedAttentionKVCacheType.Config.AxisPolicies[i];
         }
 
         return new DistributedType(tensorType, axisPolices.ToArray(), shardId.Placement);

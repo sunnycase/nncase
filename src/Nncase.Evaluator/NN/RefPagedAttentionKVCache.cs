@@ -176,7 +176,7 @@ public sealed record RefPagedAttentionKVCache(
     {
         var headIdCopy = headId;
         var slotIdCopy = slotId.AsContiguous(true);
-        var cacheDimensions = config.GetLogicalShardTensorType(numBlocks, placement).Shape.ToValueArray();
+        var cacheDimensions = config.GetLogicalShardTensorType(numBlocks, placement, AttentionCacheKind.Key).Shape.ToValueArray();
         for (int shardId = 0; shardId < config.ShardingAxes.Count; shardId++)
         {
             switch (config.ShardingAxes[shardId])
@@ -218,8 +218,9 @@ public sealed record RefPagedAttentionKVCache(
         }
 
         // Build computation graph
-        var (q_lanes, q_vectorized_axes) = GetQKVVectorizeParams(config, qLayout);
-        var (kv_lanes, kv_vectorized_axes) = GetQKVVectorizeParams(config, kvLayout);
+        var (q_lanes, q_vectorized_axes) = GetQKVVectorizeParams(config, qLayout, AttentionCacheKind.Key);
+        var (key_lanes, key_vectorized_axes) = GetQKVVectorizeParams(config, kvLayout, AttentionCacheKind.Key);
+        var (value_lanes, value_vectorized_axes) = GetQKVVectorizeParams(config, kvLayout, AttentionCacheKind.Value);
         var padedQuery = (options.DynamicShape && options.DynamicPadding) ? IR.F.NN.Pad(queryVar, new IR.Shapes.Paddings(new(0, options.DynamicMaxTokens - numTokensVar), new(0, 0), new(0, 0)), PadMode.Constant, Tensor.Zeros(config.KVPrimType, [])) : (Expr)queryVar;
         var transedQuery = IR.F.Tensors.Transpose(padedQuery, qLayout.Select(x => (int)x).ToArray());
         var vectorizedQuery = q_lanes.Length > 0 ? IR.F.Tensors.Pack(transedQuery, q_lanes, q_vectorized_axes) : transedQuery;
@@ -230,7 +231,7 @@ public sealed record RefPagedAttentionKVCache(
 
             var padedKey = (options.DynamicShape && options.DynamicPadding) ? IR.F.NN.Pad(keyVar, new IR.Shapes.Paddings(new(0, options.DynamicMaxTokens - numTokensVar), new(0, 0), new(0, 0)), PadMode.Constant, Tensor.Zeros(config.KVPrimType, [])) : (Expr)keyVar;
             var transedKey = IR.F.Tensors.Transpose(padedKey, kvLayout.Select(x => (int)x).ToArray());
-            var vectorizedKey = kv_lanes.Length > 0 ? IR.F.Tensors.Pack(transedKey, kv_lanes, kv_vectorized_axes) : transedKey;
+            var vectorizedKey = key_lanes.Length > 0 ? IR.F.Tensors.Pack(transedKey, key_lanes, key_vectorized_axes) : transedKey;
             updatedKVCache = IR.F.NN.UpdatePagedAttentionKVCache(
                 vectorizedKey,
                 kvCacheObjVar,
@@ -240,7 +241,7 @@ public sealed record RefPagedAttentionKVCache(
 
             var padedValue = (options.DynamicShape && options.DynamicPadding) ? IR.F.NN.Pad(valueVar, new IR.Shapes.Paddings(new(0, options.DynamicMaxTokens - numTokensVar), new(0, 0), new(0, 0)), PadMode.Constant, Tensor.Zeros(config.KVPrimType, [])) : (Expr)valueVar;
             var transValue = IR.F.Tensors.Transpose(padedValue, kvLayout.Select(x => (int)x).ToArray());
-            var vectorizedValue = kv_lanes.Length > 0 ? IR.F.Tensors.Pack(transValue, kv_lanes, kv_vectorized_axes) : transValue;
+            var vectorizedValue = value_lanes.Length > 0 ? IR.F.Tensors.Pack(transValue, value_lanes, value_vectorized_axes) : transValue;
             updatedKVCache = IR.F.NN.UpdatePagedAttentionKVCache(
                 vectorizedValue,
                 updatedKVCache,
@@ -277,21 +278,23 @@ public sealed record RefPagedAttentionKVCache(
         return (root, queryVar, kvVars, kvCacheObjVar);
     }
 
-    public static (int[] Lanes, int[] Axes) GetQKVVectorizeParams(IPagedAttentionConfig config, AttentionDimKind[] qLayout)
+    public static (int[] Lanes, int[] Axes) GetQKVVectorizeParams(IPagedAttentionConfig config, AttentionDimKind[] qLayout, AttentionCacheKind cacheKind = AttentionCacheKind.Key)
     {
         var lanes = new List<int>();
         var axes = new List<int>();
-        for (int i = 0; i < config.VectorizedAxes.Count; i++)
+        var vectorizedAxes = config.GetVectorizedAxes(cacheKind);
+        var cacheLanes = config.GetLanes(cacheKind);
+        for (int i = 0; i < vectorizedAxes.Count; i++)
         {
-            if (config.VectorizedAxes[i] is PagedKVCacheDimKind.HeadDim or PagedKVCacheDimKind.NumKVHeads)
+            if (vectorizedAxes[i] is PagedKVCacheDimKind.HeadDim or PagedKVCacheDimKind.NumKVHeads)
             {
-                axes.Add(config.VectorizedAxes[i] switch
+                axes.Add(vectorizedAxes[i] switch
                 {
                     PagedKVCacheDimKind.NumKVHeads => qLayout.IndexOf(AttentionDimKind.Head),
                     PagedKVCacheDimKind.HeadDim => qLayout.IndexOf(AttentionDimKind.Dim),
                     _ => throw new ArgumentOutOfRangeException(nameof(config)),
                 });
-                lanes.Add(config.Lanes[i]);
+                lanes.Add(cacheLanes[i]);
             }
         }
 
@@ -311,15 +314,17 @@ public sealed record RefPagedAttentionKVCache(
 
         var blockView = GetBlockViewFromStorage(kind, layerId, headId, blockId);
         var blockShape = blockView.Dimensions;
-        var blockLayout = PagedAttentionConfig.BlockLayout;
+        var blockLayout = PagedAttentionConfig.GetBlockLayout(kind);
 
         // PagedKVCacheDimKind[] defaultLayout = [PagedKVCacheDimKind.BlockSize, PagedKVCacheDimKind.HeadDim];
         int[] defaultLayout = [-1, -1, -1, 0, -1, 1];
         long[] defaultStarts = [blockOffset, 0];
         long[] defaultShape = [1, PagedAttentionConfig.HeadDim];
-        if (PagedAttentionConfig.VectorizedAxes.IndexOf(PagedKVCacheDimKind.HeadDim) is int i && i != -1)
+        var vectorizedAxes = PagedAttentionConfig.GetVectorizedAxes(kind);
+        var lanes = PagedAttentionConfig.GetLanes(kind);
+        if (vectorizedAxes.IndexOf(PagedKVCacheDimKind.HeadDim) is int i && i != -1)
         {
-            defaultShape[1] /= PagedAttentionConfig.Lanes[i];
+            defaultShape[1] /= lanes[i];
         }
 
         var starts = blockLayout.Select(i => defaultStarts[defaultLayout[(int)i]]).ToArray();
@@ -334,14 +339,17 @@ public sealed record RefPagedAttentionKVCache(
         PagedKVCacheDimKind[] defaultLayout = [PagedKVCacheDimKind.NumBlocks, PagedKVCacheDimKind.NumLayers, PagedKVCacheDimKind.KV, PagedKVCacheDimKind.BlockSize, PagedKVCacheDimKind.NumKVHeads, PagedKVCacheDimKind.HeadDim];
         long[] defaultStarts = [blockIdValue, layerId, (long)kind, 0, (long)headId, 0];
         long[] defaultShape = [1, 1, 1, PagedAttentionConfig.BlockSize, 1, PagedAttentionConfig.HeadDim];
-        if (PagedAttentionConfig.VectorizedAxes.IndexOf(PagedKVCacheDimKind.HeadDim) is int i && i != -1)
+        var vectorizedAxes = PagedAttentionConfig.GetVectorizedAxes(kind);
+        var lanes = PagedAttentionConfig.GetLanes(kind);
+        if (vectorizedAxes.IndexOf(PagedKVCacheDimKind.HeadDim) is int i && i != -1)
         {
-            defaultShape[^1] /= PagedAttentionConfig.Lanes[i];
+            defaultShape[^1] /= lanes[i];
         }
 
-        var starts = PagedAttentionConfig.CacheLayout.Select(i => defaultStarts[(int)i]).ToArray();
-        var shape = PagedAttentionConfig.CacheLayout.Select(i => defaultShape[(int)i]).ToArray();
-        var squeeze_axes = Enumerable.Range(0, PagedAttentionConfig.CacheLayout.Count).Where(i => PagedAttentionConfig.CacheLayout[i] is not (PagedKVCacheDimKind.BlockSize or PagedKVCacheDimKind.HeadDim)).Select(i => (long)i + PagedAttentionConfig.ShardingAxes.Count).ToArray();
+        var cacheLayout = PagedAttentionConfig.GetCacheLayout(kind);
+        var starts = cacheLayout.Select(i => defaultStarts[(int)i]).ToArray();
+        var shape = cacheLayout.Select(i => defaultShape[(int)i]).ToArray();
+        var squeeze_axes = Enumerable.Range(0, cacheLayout.Count).Where(i => cacheLayout[i] is not (PagedKVCacheDimKind.BlockSize or PagedKVCacheDimKind.HeadDim)).Select(i => (long)i + PagedAttentionConfig.ShardingAxes.Count).ToArray();
 
         // process the topology.
         var topo_starts = Enumerable.Range(0, PagedAttentionConfig.ShardingAxes.Count).Select(i => (long)blockId[i]).ToArray();

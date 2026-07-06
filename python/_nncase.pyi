@@ -262,14 +262,19 @@ class AttentionConfig(Object):
 class PagedAttentionConfig(AttentionConfig):
     axis_policies: list[list[int]]
     block_size: int
-    cache_layout: list[PagedKVCacheDimKind]
-    lanes: list[int]
-    vectorized_axes: list[PagedKVCacheDimKind]
+    key_cache_layout: list[PagedKVCacheDimKind]
+    value_cache_layout: list[PagedKVCacheDimKind]
+    key_lanes: list[int]
+    value_lanes: list[int]
+    key_vectorized_axes: list[PagedKVCacheDimKind]
+    value_vectorized_axes: list[PagedKVCacheDimKind]
     sharding_axes: list[PagedKVCacheDimKind]
-    def __init__(self, num_layers: int, num_kv_heads: int, head_dim: int, kv_type: numpy.dtype, block_size: int, cache_layout=..., vectorized_axes: list[PagedKVCacheDimKind] = ..., lanes: list[int] = ..., sharding_axes: list[PagedKVCacheDimKind] = ..., axis_policies: list[list[int]] = ...) -> None: ...
+    def __init__(self, num_layers: int, num_kv_heads: int, head_dim: int, kv_type: numpy.dtype, block_size: int, key_cache_layout=..., value_cache_layout=..., key_vectorized_axes: list[PagedKVCacheDimKind] = ..., value_vectorized_axes: list[PagedKVCacheDimKind] = ..., key_lanes: list[int] = ..., value_lanes: list[int] = ..., sharding_axes: list[PagedKVCacheDimKind] = ..., axis_policies: list[list[int]] = ...) -> None: ...
     def set_axis_policy(self, arg0: int, arg1: list[int]) -> None: ...
     @property
-    def block_layout(self): ...
+    def key_block_layout(self): ...
+    @property
+    def value_block_layout(self): ...
 
 class PagedAttentionKVCache(Object):
     block_table: RuntimeTensor

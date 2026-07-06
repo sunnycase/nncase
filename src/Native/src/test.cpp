@@ -643,10 +643,23 @@ void test_caching() {
                 (size_t)caching::paged_kvcache_dim_kind::head_dim,
                 (size_t)caching::paged_kvcache_dim_kind::block_size>,
             ntt::fixed_shape_v<
+                (size_t)caching::paged_kvcache_dim_kind::num_blocks,
+                (size_t)caching::paged_kvcache_dim_kind::num_layers,
+                (size_t)caching::paged_kvcache_dim_kind::num_kv_heads,
+                (size_t)caching::paged_kvcache_dim_kind::kv,
+                (size_t)caching::paged_kvcache_dim_kind::head_dim,
+                (size_t)caching::paged_kvcache_dim_kind::block_size>,
+            ntt::fixed_shape_v<
+                (size_t)caching::paged_kvcache_dim_kind::head_dim,
+                (size_t)caching::paged_kvcache_dim_kind::block_size>,
+            ntt::fixed_shape_v<
                 (size_t)caching::paged_kvcache_dim_kind::head_dim,
                 (size_t)caching::paged_kvcache_dim_kind::block_size>,
             ntt::fixed_shape_v<(
                 size_t)caching::paged_kvcache_dim_kind::head_dim>,
+            ntt::fixed_shape_v<(
+                size_t)caching::paged_kvcache_dim_kind::head_dim>,
+            ntt::fixed_shape_v<64>,
             ntt::fixed_shape_v<64>,
             ntt::fixed_shape_v<
                 (size_t)caching::paged_kvcache_dim_kind::num_kv_heads,

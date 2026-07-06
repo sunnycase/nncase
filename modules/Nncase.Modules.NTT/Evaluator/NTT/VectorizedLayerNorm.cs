@@ -84,7 +84,6 @@ public sealed class VectorizedLayerNormEvaluator : IEvaluator<VectorizedLayerNor
 
             case (DistributedType, DistributedType):
                 // var ring = GetRingReduceCommunicate(scaleType, new[] { 0, 1 }) + GetRingReduceCommunicate(biasType, new[] { 0, 1 });
-                // var reCompute = inputDistributedType.NdSBP.Select((sbp, i) => sbp is SBPSplit ? 1 : inputDistributedType.Placement.Hierarchy[i]).ToArray().Aggregate(1, (acc, rep) => acc * rep);
                 return new()
                 {
                     [CostFactorNames.BlockLocalMemoryLoadBytes] = CostUtility.GetMemoryAccess(inputType) + CostUtility.GetMemoryAccess(scale) + CostUtility.GetMemoryAccess(bias),
@@ -156,6 +155,7 @@ public sealed class VectorizedLayerNormEvaluator : IEvaluator<VectorizedLayerNor
 
         return new DistributedType(input.TensorType, ndsbp, input.Placement);
     }
+
 #if false
     private UInt128 GetRingReduceCommunicate(DistributedType distributedType, int[] axes)
     {

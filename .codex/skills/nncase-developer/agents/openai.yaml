@@ -1,0 +1,4 @@
+interface:
+  display_name: "nncase Developer"
+  short_description: "Guidance for nncase compiler, AutoDistributed, cost model, and PyNTT work."
+  default_prompt: "Use nncase developer guidance to modify nncase compiler internals safely."

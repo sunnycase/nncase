@@ -33,7 +33,8 @@ def test_qwen3_0_6B_fp8_dynamic(request):
     num_layers = 3
 
     [paged_attention_config]
-    lanes = [8]
+    key_lanes = [8]
+    value_lanes = [8]
 
     [generator]
     [generator.inputs]

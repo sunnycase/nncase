@@ -37,7 +37,7 @@ public sealed class RefPagedAttentionScheduler
         }
 
         _placement = new Placement(hierarchy, string.Empty, new string('b', hierarchy.Length));
-        var tensorType = _config.GetLogicalShardTensorType(numBlocks, _placement);
+        var tensorType = _config.GetLogicalShardTensorType(numBlocks, _placement, AttentionCacheKind.Key);
         _kvCaches = Tensor.Zeros(tensorType.DType, tensorType.Shape.ToValueArray());
     }
 

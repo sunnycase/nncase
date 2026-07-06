@@ -176,7 +176,8 @@ public sealed class PagedAttentionSchedulerTestData : TheoryData<PagedAttentionC
                         foreach (var (shardingAxes, axisPolicies, hierarchy) in ShardingConfigs)
                         {
                             var kvType = PrimType.FromTypeCode(typeCode);
-                            var config = new PagedAttentionConfig(numLayer, numKVHeads, headDim, kvType, blockSize, cacheLayout, vectorizedAxes, new[] { 128 / kvType.SizeInBytes }, shardingAxes, axisPolicies);
+                            var lanes = new[] { 128 / kvType.SizeInBytes };
+                            var config = new PagedAttentionConfig(numLayer, numKVHeads, headDim, kvType, blockSize, cacheLayout, cacheLayout, vectorizedAxes, vectorizedAxes, lanes, lanes, shardingAxes, axisPolicies);
                             Add(config, hierarchy);
                         }
                     }

@@ -78,9 +78,8 @@ def test_paged_attention_config():
     assert config.head_dim == head_dim
     assert config.block_size == block_size
 
-    # Test cache_layout property
-    # Define cache layout
-    cache_layout = [
+    # Test independent key/value cache layouts.
+    key_cache_layout = [
         nncase.PagedKVCacheDimKind.NumLayers,
         nncase.PagedKVCacheDimKind.KV,
         nncase.PagedKVCacheDimKind.NumKVHeads,
@@ -88,33 +87,46 @@ def test_paged_attention_config():
         nncase.PagedKVCacheDimKind.HeadDim,
         nncase.PagedKVCacheDimKind.NumBlocks
     ]
-    config.cache_layout = cache_layout
+    config.key_cache_layout = key_cache_layout
+    for i, dim in enumerate(key_cache_layout):
+        assert config.key_cache_layout[i] == dim
 
-    # Verify cache_layout was set correctly
-    retrieved_layout = config.cache_layout
-    for i, dim in enumerate(cache_layout):
-        assert retrieved_layout[i] == dim
+    value_cache_layout = [
+        nncase.PagedKVCacheDimKind.NumLayers,
+        nncase.PagedKVCacheDimKind.KV,
+        nncase.PagedKVCacheDimKind.NumKVHeads,
+        nncase.PagedKVCacheDimKind.HeadDim,
+        nncase.PagedKVCacheDimKind.BlockSize,
+        nncase.PagedKVCacheDimKind.NumBlocks
+    ]
+    config.value_cache_layout = value_cache_layout
+    for i, dim in enumerate(value_cache_layout):
+        assert config.value_cache_layout[i] == dim
 
-    # Test block_layout (read-only property derived from cache_layout)
-    block_layout = config.block_layout
-    assert len(block_layout) == 2  # Should have 2 dimensions
+    # Test block layouts (read-only properties derived per cache kind).
+    assert len(config.key_block_layout) == 2
+    assert len(config.value_block_layout) == 2
 
-    # Test vectorized_axes property
-    vectorized_axes = [
+    # Test independent key/value vectorized axes.
+    key_vectorized_axes = [
         nncase.PagedKVCacheDimKind.NumKVHeads,
         nncase.PagedKVCacheDimKind.HeadDim
     ]
-    config.vectorized_axes = vectorized_axes
-    assert len(config.vectorized_axes) == len(vectorized_axes)
-    for i, dim in enumerate(vectorized_axes):
-        assert config.vectorized_axes[i] == dim
+    config.key_vectorized_axes = key_vectorized_axes
+    for i, dim in enumerate(key_vectorized_axes):
+        assert config.key_vectorized_axes[i] == dim
 
-    # Test lanes property
-    lanes = [2, 4, 8]
-    config.lanes = lanes
-    assert len(config.lanes) == len(lanes)
-    for i, lane in enumerate(lanes):
-        assert config.lanes[i] == lane
+    config.value_vectorized_axes = [nncase.PagedKVCacheDimKind.HeadDim]
+    assert config.value_vectorized_axes == [nncase.PagedKVCacheDimKind.HeadDim]
+
+    # Test independent key/value lanes.
+    key_lanes = [2, 4, 8]
+    config.key_lanes = key_lanes
+    for i, lane in enumerate(key_lanes):
+        assert config.key_lanes[i] == lane
+
+    config.value_lanes = [16]
+    assert config.value_lanes == [16]
 
     # Test sharding_axes property
     sharding_axes = [
@@ -188,7 +200,7 @@ def test_paged_attention_scheduler():
         block_size
     )
 
-    # Set cache layout
+    # Set cache layouts
     cache_layout = [
         nncase.PagedKVCacheDimKind.NumBlocks,
         nncase.PagedKVCacheDimKind.NumLayers,
@@ -197,7 +209,8 @@ def test_paged_attention_scheduler():
         nncase.PagedKVCacheDimKind.NumKVHeads,
         nncase.PagedKVCacheDimKind.HeadDim
     ]
-    config.cache_layout = cache_layout
+    config.key_cache_layout = cache_layout
+    config.value_cache_layout = cache_layout
 
     hierarchy = []  # Example: single node, no distribution
     session_ids = [1, 2, 3]  # Three different sessions
@@ -317,16 +330,24 @@ class config_wrapper:
             head_dim,
             kv_type,
             block_size,
-            [nncase.PagedKVCacheDimKind.NumBlocks,
-             nncase.PagedKVCacheDimKind.NumLayers,
-             nncase.PagedKVCacheDimKind.NumKVHeads,
-             nncase.PagedKVCacheDimKind.KV,
-             nncase.PagedKVCacheDimKind.BlockSize,
-             nncase.PagedKVCacheDimKind.HeadDim],
-            [nncase.PagedKVCacheDimKind.HeadDim],
-            [128 // 2],
-            [nncase.PagedKVCacheDimKind.NumKVHeads, nncase.PagedKVCacheDimKind.NumBlocks],
-            [[1], [2, 3]])
+            key_cache_layout=[nncase.PagedKVCacheDimKind.NumBlocks,
+                              nncase.PagedKVCacheDimKind.NumLayers,
+                              nncase.PagedKVCacheDimKind.NumKVHeads,
+                              nncase.PagedKVCacheDimKind.KV,
+                              nncase.PagedKVCacheDimKind.BlockSize,
+                              nncase.PagedKVCacheDimKind.HeadDim],
+            value_cache_layout=[nncase.PagedKVCacheDimKind.NumBlocks,
+                                nncase.PagedKVCacheDimKind.NumLayers,
+                                nncase.PagedKVCacheDimKind.NumKVHeads,
+                                nncase.PagedKVCacheDimKind.KV,
+                                nncase.PagedKVCacheDimKind.BlockSize,
+                                nncase.PagedKVCacheDimKind.HeadDim],
+            key_vectorized_axes=[nncase.PagedKVCacheDimKind.HeadDim],
+            value_vectorized_axes=[nncase.PagedKVCacheDimKind.HeadDim],
+            key_lanes=[128 // 2],
+            value_lanes=[128 // 2],
+            sharding_axes=[nncase.PagedKVCacheDimKind.NumKVHeads, nncase.PagedKVCacheDimKind.NumBlocks],
+            axis_policies=[[1], [2, 3]])
         self.config_v = config
         self.kv_cache = nncase.PagedAttentionKVCache()
 
@@ -359,19 +380,28 @@ def test_paged_attention_scheduler_distributed():
         head_dim,
         kv_type,
         block_size,
-        [nncase.PagedKVCacheDimKind.NumBlocks,
-         nncase.PagedKVCacheDimKind.NumLayers,
-         nncase.PagedKVCacheDimKind.NumKVHeads,
-         nncase.PagedKVCacheDimKind.KV,
-         nncase.PagedKVCacheDimKind.BlockSize,
-         nncase.PagedKVCacheDimKind.HeadDim],
-        [nncase.PagedKVCacheDimKind.HeadDim],
-        [128 // 2],
-        [nncase.PagedKVCacheDimKind.NumKVHeads, nncase.PagedKVCacheDimKind.NumBlocks],
-        [[1], [2, 3]]
+        key_cache_layout=[nncase.PagedKVCacheDimKind.NumBlocks,
+                          nncase.PagedKVCacheDimKind.NumLayers,
+                          nncase.PagedKVCacheDimKind.NumKVHeads,
+                          nncase.PagedKVCacheDimKind.KV,
+                          nncase.PagedKVCacheDimKind.BlockSize,
+                          nncase.PagedKVCacheDimKind.HeadDim],
+        value_cache_layout=[nncase.PagedKVCacheDimKind.NumBlocks,
+                            nncase.PagedKVCacheDimKind.NumLayers,
+                            nncase.PagedKVCacheDimKind.NumKVHeads,
+                            nncase.PagedKVCacheDimKind.KV,
+                            nncase.PagedKVCacheDimKind.BlockSize,
+                            nncase.PagedKVCacheDimKind.HeadDim],
+        key_vectorized_axes=[nncase.PagedKVCacheDimKind.HeadDim],
+        value_vectorized_axes=[nncase.PagedKVCacheDimKind.HeadDim],
+        key_lanes=[128 // 2],
+        value_lanes=[128 // 2],
+        sharding_axes=[nncase.PagedKVCacheDimKind.NumKVHeads, nncase.PagedKVCacheDimKind.NumBlocks],
+        axis_policies=[[1], [2, 3]]
     )
 
-    assert config.lanes == [64]
+    assert config.key_lanes == [64]
+    assert config.value_lanes == [64]
     assert len(config.sharding_axes) == 2
     assert config.axis_policies[0] == [1]
     assert config.axis_policies[1] == [2, 3]
@@ -520,11 +550,14 @@ def test_paged_attention_with_sdpa(head_config, block_config, kv_type: np.dtype,
         head_dim,
         kv_type,
         block_size,
-        cache_layout,
-        vectorized_axes,
-        lanes,
-        sharding_axes,
-        axis_policies)
+        key_cache_layout=cache_layout,
+        value_cache_layout=cache_layout,
+        key_vectorized_axes=vectorized_axes,
+        value_vectorized_axes=vectorized_axes,
+        key_lanes=lanes,
+        value_lanes=lanes,
+        sharding_axes=sharding_axes,
+        axis_policies=axis_policies)
 
     scheduler = nncase._nncase.RefPagedAttentionScheduler(
         config, num_blocks, max_model_len, hierarchy)

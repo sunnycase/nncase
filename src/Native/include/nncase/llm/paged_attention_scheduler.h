@@ -144,8 +144,8 @@ class paged_attention_scheduler_node : public object_node {
                 "Max model length must be a multiple of block size.");
         }
 
-        auto kv_shard_shape =
-            config_->get_logical_shard_dimensions(num_blocks_, hierarchy_);
+        auto kv_shard_shape = config_->get_logical_shard_dimensions(
+            num_blocks_, hierarchy_, attention_cache_kind::key);
         dims_t kv_topo_shape = {kv_shard_shape.begin(),
                                 kv_shard_shape.begin() +
                                     config_->sharding_axes().size()};
@@ -163,7 +163,7 @@ class paged_attention_scheduler_node : public object_node {
         for (size_t i = 0; i < runtime::compute_size(kv_topo_shape); i++) {
             auto storage =
                 runtime::hrt::create(
-                    config_->kv_type(),
+                    config_->key_type(),
                     {kv_shard_shape.begin() + config_->sharding_axes().size(),
                      kv_shard_shape.end()})
                     .unwrap_or_throw();

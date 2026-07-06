@@ -150,11 +150,16 @@ internal static class Native
         int head_dim,
         TypeCode kv_type,
         int block_size,
-        [In] IR.NN.PagedKVCacheDimKind[] cache_layout,
-        [In] IR.NN.PagedKVCacheDimKind[] vectorized_axes,
-        int vectorized_axes_len,
-        [In] int[] lanes,
-        int lanes_len,
+        [In] IR.NN.PagedKVCacheDimKind[] key_cache_layout,
+        [In] IR.NN.PagedKVCacheDimKind[] value_cache_layout,
+        [In] IR.NN.PagedKVCacheDimKind[] key_vectorized_axes,
+        int key_vectorized_axes_len,
+        [In] IR.NN.PagedKVCacheDimKind[] value_vectorized_axes,
+        int value_vectorized_axes_len,
+        [In] int[] key_lanes,
+        int key_lanes_len,
+        [In] int[] value_lanes,
+        int value_lanes_len,
         [In] IR.NN.PagedKVCacheDimKind[] sharding_axes,
         int sharding_axes_len,
         [In] int[] axis_policies,
@@ -167,23 +172,41 @@ internal static class Native
     [DllImport(LibraryName, EntryPoint = "nncase_paged_attention_config_set_block_size")]
     public static extern ErrorCode PagedAttentionConfigSetBlockSize(RTPagedAttentionConfig config, int block_size);
 
-    [DllImport(LibraryName, EntryPoint = "nncase_paged_attention_config_get_cache_layout")]
-    public static extern ErrorCode PagedAttentionConfigGetCacheLayout(RTPagedAttentionConfig config, [Out] IR.NN.PagedKVCacheDimKind[] layout, int layout_len);
+    [DllImport(LibraryName, EntryPoint = "nncase_paged_attention_config_get_key_cache_layout")]
+    public static extern ErrorCode PagedAttentionConfigGetKeyCacheLayout(RTPagedAttentionConfig config, [Out] IR.NN.PagedKVCacheDimKind[] layout, int layout_len);
 
-    [DllImport(LibraryName, EntryPoint = "nncase_paged_attention_config_set_cache_layout")]
-    public static extern ErrorCode PagedAttentionConfigSetCacheLayout(RTPagedAttentionConfig config, [In] IR.NN.PagedKVCacheDimKind[] layout, int layout_len);
+    [DllImport(LibraryName, EntryPoint = "nncase_paged_attention_config_set_key_cache_layout")]
+    public static extern ErrorCode PagedAttentionConfigSetKeyCacheLayout(RTPagedAttentionConfig config, [In] IR.NN.PagedKVCacheDimKind[] layout, int layout_len);
 
-    [DllImport(LibraryName, EntryPoint = "nncase_paged_attention_config_get_vectorized_axes")]
-    public static extern ErrorCode PagedAttentionConfigGetVectorizedAxes(RTPagedAttentionConfig config, [Out] IR.NN.PagedKVCacheDimKind[] vectorized_axes, int vectorized_axes_len);
+    [DllImport(LibraryName, EntryPoint = "nncase_paged_attention_config_get_value_cache_layout")]
+    public static extern ErrorCode PagedAttentionConfigGetValueCacheLayout(RTPagedAttentionConfig config, [Out] IR.NN.PagedKVCacheDimKind[] layout, int layout_len);
 
-    [DllImport(LibraryName, EntryPoint = "nncase_paged_attention_config_set_vectorized_axes")]
-    public static extern ErrorCode PagedAttentionConfigSetVectorizedAxes(RTPagedAttentionConfig config, [In] IR.NN.PagedKVCacheDimKind[] vectorized_axes, int vectorized_axes_len);
+    [DllImport(LibraryName, EntryPoint = "nncase_paged_attention_config_set_value_cache_layout")]
+    public static extern ErrorCode PagedAttentionConfigSetValueCacheLayout(RTPagedAttentionConfig config, [In] IR.NN.PagedKVCacheDimKind[] layout, int layout_len);
 
-    [DllImport(LibraryName, EntryPoint = "nncase_paged_attention_config_get_lanes")]
-    public static extern ErrorCode PagedAttentionConfigGetLanes(RTPagedAttentionConfig config, [Out] int[] lanes, int lanes_len);
+    [DllImport(LibraryName, EntryPoint = "nncase_paged_attention_config_get_key_vectorized_axes")]
+    public static extern ErrorCode PagedAttentionConfigGetKeyVectorizedAxes(RTPagedAttentionConfig config, [Out] IR.NN.PagedKVCacheDimKind[] vectorized_axes, int vectorized_axes_len);
 
-    [DllImport(LibraryName, EntryPoint = "nncase_paged_attention_config_set_lanes")]
-    public static extern ErrorCode PagedAttentionConfigSetLanes(RTPagedAttentionConfig config, [In] int[] lanes, int lanes_len);
+    [DllImport(LibraryName, EntryPoint = "nncase_paged_attention_config_set_key_vectorized_axes")]
+    public static extern ErrorCode PagedAttentionConfigSetKeyVectorizedAxes(RTPagedAttentionConfig config, [In] IR.NN.PagedKVCacheDimKind[] vectorized_axes, int vectorized_axes_len);
+
+    [DllImport(LibraryName, EntryPoint = "nncase_paged_attention_config_get_value_vectorized_axes")]
+    public static extern ErrorCode PagedAttentionConfigGetValueVectorizedAxes(RTPagedAttentionConfig config, [Out] IR.NN.PagedKVCacheDimKind[] vectorized_axes, int vectorized_axes_len);
+
+    [DllImport(LibraryName, EntryPoint = "nncase_paged_attention_config_set_value_vectorized_axes")]
+    public static extern ErrorCode PagedAttentionConfigSetValueVectorizedAxes(RTPagedAttentionConfig config, [In] IR.NN.PagedKVCacheDimKind[] vectorized_axes, int vectorized_axes_len);
+
+    [DllImport(LibraryName, EntryPoint = "nncase_paged_attention_config_get_key_lanes")]
+    public static extern ErrorCode PagedAttentionConfigGetKeyLanes(RTPagedAttentionConfig config, [Out] int[] lanes, int lanes_len);
+
+    [DllImport(LibraryName, EntryPoint = "nncase_paged_attention_config_set_key_lanes")]
+    public static extern ErrorCode PagedAttentionConfigSetKeyLanes(RTPagedAttentionConfig config, [In] int[] lanes, int lanes_len);
+
+    [DllImport(LibraryName, EntryPoint = "nncase_paged_attention_config_get_value_lanes")]
+    public static extern ErrorCode PagedAttentionConfigGetValueLanes(RTPagedAttentionConfig config, [Out] int[] lanes, int lanes_len);
+
+    [DllImport(LibraryName, EntryPoint = "nncase_paged_attention_config_set_value_lanes")]
+    public static extern ErrorCode PagedAttentionConfigSetValueLanes(RTPagedAttentionConfig config, [In] int[] lanes, int lanes_len);
 
     [DllImport(LibraryName, EntryPoint = "nncase_paged_attention_config_get_sharding_axes")]
     public static extern ErrorCode PagedAttentionConfigGetShardingAxes(

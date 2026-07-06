@@ -147,12 +147,12 @@ public sealed class RTPagedAttentionConfig : RTAttentionConfig, IPagedAttentionC
         }
     }
 
-    public IRArray<PagedKVCacheDimKind> CacheLayout
+    public IRArray<PagedKVCacheDimKind> KeyCacheLayout
     {
         get
         {
             var layout = new PagedKVCacheDimKind[6];
-            Native.PagedAttentionConfigGetCacheLayout(this, layout, layout.Length).ThrowIfFailed();
+            Native.PagedAttentionConfigGetKeyCacheLayout(this, layout, layout.Length).ThrowIfFailed();
             return layout;
         }
 
@@ -160,45 +160,100 @@ public sealed class RTPagedAttentionConfig : RTAttentionConfig, IPagedAttentionC
         {
             if (value.Count != 6)
             {
-                throw new ArgumentException("Cache layout must have 6 dimensions");
+                throw new ArgumentException("Key cache layout must have 6 dimensions");
             }
 
             var arr = value.ToArray();
-            Native.PagedAttentionConfigSetCacheLayout(this, arr, arr.Length).ThrowIfFailed();
+            Native.PagedAttentionConfigSetKeyCacheLayout(this, arr, arr.Length).ThrowIfFailed();
         }
     }
 
-    public IRArray<PagedKVCacheDimKind> VectorizedAxes
+    public IRArray<PagedKVCacheDimKind> ValueCacheLayout
+    {
+        get
+        {
+            var layout = new PagedKVCacheDimKind[6];
+            Native.PagedAttentionConfigGetValueCacheLayout(this, layout, layout.Length).ThrowIfFailed();
+            return layout;
+        }
+
+        set
+        {
+            if (value.Count != 6)
+            {
+                throw new ArgumentException("Value cache layout must have 6 dimensions");
+            }
+
+            var arr = value.ToArray();
+            Native.PagedAttentionConfigSetValueCacheLayout(this, arr, arr.Length).ThrowIfFailed();
+        }
+    }
+
+    public IRArray<PagedKVCacheDimKind> KeyVectorizedAxes
     {
         get
         {
             var vectorizedAxes = new PagedKVCacheDimKind[8]; // Using max size from small_vector
             int length = vectorizedAxes.Length;
-            Native.PagedAttentionConfigGetVectorizedAxes(this, vectorizedAxes, length).ThrowIfFailed();
+            Native.PagedAttentionConfigGetKeyVectorizedAxes(this, vectorizedAxes, length).ThrowIfFailed();
             return vectorizedAxes.Where(x => Enum.IsDefined(x)).ToArray();
         }
 
         set
         {
             var arr = value.ToArray();
-            Native.PagedAttentionConfigSetVectorizedAxes(this, arr, arr.Length).ThrowIfFailed();
+            Native.PagedAttentionConfigSetKeyVectorizedAxes(this, arr, arr.Length).ThrowIfFailed();
         }
     }
 
-    public IRArray<int> Lanes
+    public IRArray<PagedKVCacheDimKind> ValueVectorizedAxes
+    {
+        get
+        {
+            var vectorizedAxes = new PagedKVCacheDimKind[8]; // Using max size from small_vector
+            int length = vectorizedAxes.Length;
+            Native.PagedAttentionConfigGetValueVectorizedAxes(this, vectorizedAxes, length).ThrowIfFailed();
+            return vectorizedAxes.Where(x => Enum.IsDefined(x)).ToArray();
+        }
+
+        set
+        {
+            var arr = value.ToArray();
+            Native.PagedAttentionConfigSetValueVectorizedAxes(this, arr, arr.Length).ThrowIfFailed();
+        }
+    }
+
+    public IRArray<int> KeyLanes
     {
         get
         {
             var lanes = new int[8]; // Using a reasonable initial size
             int length = lanes.Length;
-            Native.PagedAttentionConfigGetLanes(this, lanes, length).ThrowIfFailed();
+            Native.PagedAttentionConfigGetKeyLanes(this, lanes, length).ThrowIfFailed();
             return lanes.Where(x => x != -1).ToArray();
         }
 
         set
         {
             var arr = value.ToArray();
-            Native.PagedAttentionConfigSetLanes(this, arr, arr.Length).ThrowIfFailed();
+            Native.PagedAttentionConfigSetKeyLanes(this, arr, arr.Length).ThrowIfFailed();
+        }
+    }
+
+    public IRArray<int> ValueLanes
+    {
+        get
+        {
+            var lanes = new int[8]; // Using a reasonable initial size
+            int length = lanes.Length;
+            Native.PagedAttentionConfigGetValueLanes(this, lanes, length).ThrowIfFailed();
+            return lanes.Where(x => x != -1).ToArray();
+        }
+
+        set
+        {
+            var arr = value.ToArray();
+            Native.PagedAttentionConfigSetValueLanes(this, arr, arr.Length).ThrowIfFailed();
         }
     }
 
@@ -270,11 +325,16 @@ public sealed class RTPagedAttentionConfig : RTAttentionConfig, IPagedAttentionC
             cfg.HeadDim,
             cfg.KVPrimType.TypeCode,
             cfg.BlockSize,
-            cfg.CacheLayout.ToArray(),
-            cfg.VectorizedAxes.ToArray(),
-            cfg.VectorizedAxes.Count,
-            cfg.Lanes.ToArray(),
-            cfg.Lanes.Count,
+            cfg.KeyCacheLayout.ToArray(),
+            cfg.ValueCacheLayout.ToArray(),
+            cfg.KeyVectorizedAxes.ToArray(),
+            cfg.KeyVectorizedAxes.Count,
+            cfg.ValueVectorizedAxes.ToArray(),
+            cfg.ValueVectorizedAxes.Count,
+            cfg.KeyLanes.ToArray(),
+            cfg.KeyLanes.Count,
+            cfg.ValueLanes.ToArray(),
+            cfg.ValueLanes.Count,
             cfg.ShardingAxes.ToArray(),
             cfg.ShardingAxes.Count,
             flattenedPolicies.ToArray(),

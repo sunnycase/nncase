@@ -196,9 +196,14 @@ nncase_attention_config_set_kv_type(nncase::llm::attention_config_node *config,
 NNCASE_API int nncase_paged_attention_config_create(
     int32_t num_layers, int32_t num_kv_heads, int32_t head_dim,
     nncase::typecode_t kv_type, int32_t block_size,
-    const nncase::llm::paged_kvcache_dim_kind *cache_layout,
-    const nncase::llm::paged_kvcache_dim_kind *vectorized_axes,
-    int32_t vectorized_axes_len, const int32_t *lanes, int32_t lanes_len,
+    const nncase::llm::paged_kvcache_dim_kind *key_cache_layout,
+    const nncase::llm::paged_kvcache_dim_kind *value_cache_layout,
+    const nncase::llm::paged_kvcache_dim_kind *key_vectorized_axes,
+    int32_t key_vectorized_axes_len,
+    const nncase::llm::paged_kvcache_dim_kind *value_vectorized_axes,
+    int32_t value_vectorized_axes_len, const int32_t *key_lanes,
+    int32_t key_lanes_len, const int32_t *value_lanes,
+    int32_t value_lanes_len,
     const nncase::llm::paged_kvcache_dim_kind *sharding_axes,
     int32_t sharding_axes_len, const int32_t *axis_policies,
     const int32_t *axis_policies_lens,
@@ -210,29 +215,55 @@ NNCASE_API int nncase_paged_attention_config_get_block_size(
 NNCASE_API int nncase_paged_attention_config_set_block_size(
     nncase::llm::paged_attention_config_node *config, int32_t block_size);
 
-NNCASE_API int nncase_paged_attention_config_get_cache_layout(
+NNCASE_API int nncase_paged_attention_config_get_key_cache_layout(
     nncase::llm::paged_attention_config_node *config,
     nncase::llm::paged_kvcache_dim_kind *layout, int32_t layout_len);
 
-NNCASE_API int nncase_paged_attention_config_set_cache_layout(
+NNCASE_API int nncase_paged_attention_config_set_key_cache_layout(
     nncase::llm::paged_attention_config_node *config,
     const nncase::llm::paged_kvcache_dim_kind *layout, int32_t layout_len);
 
-NNCASE_API int nncase_paged_attention_config_get_vectorized_axes(
+NNCASE_API int nncase_paged_attention_config_get_value_cache_layout(
+    nncase::llm::paged_attention_config_node *config,
+    nncase::llm::paged_kvcache_dim_kind *layout, int32_t layout_len);
+
+NNCASE_API int nncase_paged_attention_config_set_value_cache_layout(
+    nncase::llm::paged_attention_config_node *config,
+    const nncase::llm::paged_kvcache_dim_kind *layout, int32_t layout_len);
+
+NNCASE_API int nncase_paged_attention_config_get_key_vectorized_axes(
     nncase::llm::paged_attention_config_node *config,
     nncase::llm::paged_kvcache_dim_kind *vectorized_axes,
     int32_t vectorized_axes_len);
 
-NNCASE_API int nncase_paged_attention_config_set_vectorized_axes(
+NNCASE_API int nncase_paged_attention_config_set_key_vectorized_axes(
     nncase::llm::paged_attention_config_node *config,
     const nncase::llm::paged_kvcache_dim_kind *vectorized_axes,
     int32_t vectorized_axes_len);
 
-NNCASE_API int nncase_paged_attention_config_get_lanes(
+NNCASE_API int nncase_paged_attention_config_get_value_vectorized_axes(
+    nncase::llm::paged_attention_config_node *config,
+    nncase::llm::paged_kvcache_dim_kind *vectorized_axes,
+    int32_t vectorized_axes_len);
+
+NNCASE_API int nncase_paged_attention_config_set_value_vectorized_axes(
+    nncase::llm::paged_attention_config_node *config,
+    const nncase::llm::paged_kvcache_dim_kind *vectorized_axes,
+    int32_t vectorized_axes_len);
+
+NNCASE_API int nncase_paged_attention_config_get_key_lanes(
     nncase::llm::paged_attention_config_node *config, int32_t *lanes,
     int32_t lanes_len);
 
-NNCASE_API int nncase_paged_attention_config_set_lanes(
+NNCASE_API int nncase_paged_attention_config_set_key_lanes(
+    nncase::llm::paged_attention_config_node *config, const int32_t *lanes,
+    int32_t lanes_len);
+
+NNCASE_API int nncase_paged_attention_config_get_value_lanes(
+    nncase::llm::paged_attention_config_node *config, int32_t *lanes,
+    int32_t lanes_len);
+
+NNCASE_API int nncase_paged_attention_config_set_value_lanes(
     nncase::llm::paged_attention_config_node *config, const int32_t *lanes,
     int32_t lanes_len);
 

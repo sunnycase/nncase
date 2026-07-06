@@ -394,7 +394,11 @@ internal sealed record PyNTTKVCacheFieldInputMetadata(
 internal sealed record PyNTTKVCacheStorageMetadata(
     string DType,
     int[] TopologyShape,
-    int[] TailShape,
+    int[] KeyTailShape,
+    int[] ValueTailShape,
+    int KeySectionElements,
+    int ValueSectionElements,
+    int BlockElements,
     int BlockSize);
 
 public sealed record PyNTTPagedAttentionCacheTemplateModel(
@@ -404,8 +408,27 @@ public sealed record PyNTTPagedAttentionCacheTemplateModel(
     int NumKVHeads,
     int HeadDim,
     int BlockSize,
-    int LaneCount,
-    int HeadDimBlocks,
+    int KeyLaneCount,
+    int ValueLaneCount,
+    int KeyVectorizedDim,
+    int ValueVectorizedDim,
+    int KeyHeadDimBlocks,
+    int ValueHeadDimBlocks,
+    int KeySectionOffset,
+    int ValueSectionOffset,
+    int KeySectionElements,
+    int ValueSectionElements,
+    int BlockElements,
+    int KeyLayerStride,
+    int KeyHeadStride,
+    int KeyDimBlockStride,
+    int KeyBlockOffsetStride,
+    int ValueLayerStride,
+    int ValueHeadStride,
+    int ValueDimBlockStride,
+    int ValueBlockOffsetStride,
+    int[] KeyTailShape,
+    int[] ValueTailShape,
     int IdLength,
     int[] TopologyShape,
     int[] NumBlocksSplitAxes);
@@ -429,6 +452,7 @@ public sealed record PyNTTUpdatePagedAttentionKVCacheTemplateModel(
     int DimAxis,
     int LayerId,
     int CacheKind,
+    int SlotsVectorLaneCount,
     PyNTTPagedAttentionCacheTemplateModel Cache,
     string Comment)
 {

@@ -2973,8 +2973,28 @@ def _emit_paged_attention(model: dict[str, Any]) -> str:
         divisor = _split_divisor(split_axes, model["Hierarchy"])
         return f"{local_index} + ({_split_linear_expression(split_axes, model['Hierarchy'])}) * tl.cdiv({_dim(global_extent)}, {divisor})"
 
-    query_vector_offset = tensor_offset(model["QueryStrides"], model["SeqAxis"], model["HeadAxis"], model["DimAxis"], "q_head", "dim_blocks", "local_query_id", "dim_lanes", cache["LaneCount"])
-    output_vector_offset = tensor_offset(model["OutputStrides"], model["SeqAxis"], model["HeadAxis"], model["DimAxis"], "q_head", "dim_blocks", "local_query_id", "dim_lanes", cache["LaneCount"])
+    def cache_dim_index(prefix: str, dim_name: str, block_name: str) -> str:
+        if cache[f"{prefix}VectorizedDim"] == 5:  # HeadDim
+            return f"{dim_name} // {cache[f'{prefix}LaneCount']}"
+        return dim_name
+
+    def cache_block_index(prefix: str, block_name: str) -> str:
+        if cache[f"{prefix}VectorizedDim"] == 3:  # BlockSize
+            return f"{block_name} // {cache[f'{prefix}LaneCount']}"
+        return block_name
+
+    def cache_lane(prefix: str, dim_name: str, block_name: str) -> str:
+        if cache[f"{prefix}VectorizedDim"] == 5:  # HeadDim
+            return f"{dim_name} % {cache[f'{prefix}LaneCount']}"
+        if cache[f"{prefix}VectorizedDim"] == 3:  # BlockSize
+            return f"{block_name} % {cache[f'{prefix}LaneCount']}"
+        return "0"
+
+    if cache["KeyVectorizedDim"] != 5:
+        raise ValueError("PyNTT PagedAttention currently requires key cache to be HeadDim-vectorized.")
+
+    query_vector_offset = tensor_offset(model["QueryStrides"], model["SeqAxis"], model["HeadAxis"], model["DimAxis"], "q_head", "query_dim_blocks", "local_query_id", "query_dim_lanes", cache["KeyLaneCount"])
+    output_vector_offset = tensor_offset(model["OutputStrides"], model["SeqAxis"], model["HeadAxis"], model["DimAxis"], "q_head", "query_dim_blocks", "local_query_id", "query_dim_lanes", cache["KeyLaneCount"])
     local_q_heads = model["OutputShape"][model["HeadAxis"]]
     local_query_tokens = model["OutputShape"][model["SeqAxis"]]
     global_query_tokens = model["OutputGlobalShape"][model["SeqAxis"]]
@@ -2982,8 +3002,10 @@ def _emit_paged_attention(model: dict[str, Any]) -> str:
     global_q_head = global_index_expression(model["HeadAxis"], "q_head", model["GlobalNumQueryHeads"])
     block_index_key_matrix = "(topology_id[None, :] * num_blocks_per_shard + block_id[None, :])" if cache["IdLength"] > 1 else "block_id[None, :]"
     block_index_value_matrix = "(topology_id[:, None] * num_blocks_per_shard + block_id[:, None])" if cache["IdLength"] > 1 else "block_id[:, None]"
-    key_vector_offset = f"(((((({block_index_key_matrix} * {cache['NumLayers']} + {model['LayerId']}) * 2 + 0) * {cache['NumKVHeads']} + kv_head) * {cache['HeadDimBlocks']} + dim_blocks[:, None]) * {cache['BlockSize']} + block_offsets[None, :]) * {cache['LaneCount']} + dim_lanes[:, None])"
-    value_vector_offset = f"(((((({block_index_value_matrix} * {cache['NumLayers']} + {model['LayerId']}) * 2 + 1) * {cache['NumKVHeads']} + kv_head) * {cache['HeadDimBlocks']} + dim_blocks[None, :]) * {cache['BlockSize']} + block_offsets[:, None]) * {cache['LaneCount']} + dim_lanes[None, :])"
+    key_lane_broadcast = "key_lane[:, None]" if cache["KeyVectorizedDim"] == 5 else "key_lane[None, :]" if cache["KeyVectorizedDim"] == 3 else "0"
+    value_lane_broadcast = "value_lane[None, :]" if cache["ValueVectorizedDim"] == 5 else "value_lane[:, None]" if cache["ValueVectorizedDim"] == 3 else "0"
+    key_vector_offset = f"({block_index_key_matrix} * {cache['BlockElements']} + {cache['KeySectionOffset']} + (({model['LayerId']}) * {cache['KeyLayerStride']} + kv_head * {cache['KeyHeadStride']} + key_dim_index[:, None] * {cache['KeyDimBlockStride']} + key_block_index[None, :] * {cache['KeyBlockOffsetStride']}) * {cache['KeyLaneCount']} + {key_lane_broadcast})"
+    value_vector_offset = f"({block_index_value_matrix} * {cache['BlockElements']} + {cache['ValueSectionOffset']} + (({model['LayerId']}) * {cache['ValueLayerStride']} + kv_head * {cache['ValueHeadStride']} + value_dim_index[None, :] * {cache['ValueDimBlockStride']} + value_block_index[:, None] * {cache['ValueBlockOffsetStride']}) * {cache['ValueLaneCount']} + {value_lane_broadcast})"
 
     lines = _helper_header(
         model,
@@ -3007,8 +3029,13 @@ def _emit_paged_attention(model: dict[str, Any]) -> str:
     _line(lines, 2, "num_tokens += seq_len_scan - context_len_scan")
     _line(lines, 1, f"block_table_blocks = tl.cdiv(max_seq_len, {cache['BlockSize']})")
     _line(lines, 1, f"dim_offsets = tl.arange(0, {cache['HeadDim']})")
-    _line(lines, 1, f"dim_blocks = dim_offsets // {cache['LaneCount']}")
-    _line(lines, 1, f"dim_lanes = dim_offsets % {cache['LaneCount']}")
+    _line(lines, 1, f"query_dim_blocks = dim_offsets // {cache['KeyLaneCount']}")
+    _line(lines, 1, f"query_dim_lanes = dim_offsets % {cache['KeyLaneCount']}")
+    _line(lines, 1, f"key_dim_index = {cache_dim_index('Key', 'dim_offsets', 'block_offsets')}")
+    _line(lines, 1, f"key_lane = {cache_lane('Key', 'dim_offsets', 'block_offsets')}")
+    _line(lines, 1, f"value_dim_index = {cache_dim_index('Value', 'dim_offsets', 'block_offsets')}")
+    if cache["ValueVectorizedDim"] != 3:
+        _line(lines, 1, f"value_lane = {cache_lane('Value', 'dim_offsets', 'block_offsets')}")
     _line(lines, 1, f"for local_query_id in tl.range(0, {_dim(local_query_tokens)}):")
     _line(lines, 2, f"global_query_id = {global_query_id}")
     _line(lines, 2, f"for q_head in tl.range(0, {_dim(local_q_heads)}):")
@@ -3043,6 +3070,10 @@ def _emit_paged_attention(model: dict[str, Any]) -> str:
     _line(lines, 4, "context_mask = found_seq & (context_ids < seq_len) & (context_ids <= context_len + query_id)")
     _line(lines, 4, f"context_bid = context_ids // {cache['BlockSize']}")
     _line(lines, 4, f"block_offsets = context_ids % {cache['BlockSize']}")
+    _line(lines, 4, f"key_block_index = {cache_block_index('Key', 'block_offsets')}")
+    _line(lines, 4, f"value_block_index = {cache_block_index('Value', 'block_offsets')}")
+    if cache["ValueVectorizedDim"] == 3:
+        _line(lines, 4, f"value_lane = {cache_lane('Value', 'dim_offsets', 'block_offsets')}")
     if cache["IdLength"] > 1:
         _line(lines, 4, f"topology_id = tl.load(block_tables + matched_seq_id * block_table_blocks * {cache['IdLength']} + context_bid * {cache['IdLength']}, mask=context_mask, other=0)")
     _line(lines, 4, f"block_id = tl.load(block_tables + matched_seq_id * block_table_blocks * {cache['IdLength']} + context_bid * {cache['IdLength']} + {cache['IdLength'] - 1}, mask=context_mask, other=0)")
@@ -3071,11 +3102,20 @@ def _emit_paged_attention(model: dict[str, Any]) -> str:
 
 def _emit_update_paged_attention_kv_cache(model: dict[str, Any]) -> str:
     cache = model["Cache"]
+    kind_prefix = "Key" if model["CacheKind"] == 0 else "Value"
+    lane_count = cache[f"{kind_prefix}LaneCount"]
+    section_offset = cache[f"{kind_prefix}SectionOffset"]
+    layer_stride = cache[f"{kind_prefix}LayerStride"]
+    head_stride = cache[f"{kind_prefix}HeadStride"]
+    dim_block_stride = cache[f"{kind_prefix}DimBlockStride"]
+    block_offset_stride = cache[f"{kind_prefix}BlockOffsetStride"]
+    vectorized_dim = cache[f"{kind_prefix}VectorizedDim"]
+    slots_lane_count = model["SlotsVectorLaneCount"]
     head_split_axes = model["SlotsSplitAxes"][model["HeadAxis"]]
     topology_match_axes = [axis for axis in cache["NumBlocksSplitAxes"] if axis not in head_split_axes]
     full_source_shard_index = _split_linear_expression(list(range(len(model["Hierarchy"]))), model["Hierarchy"], "source_shard_coord")
     block_index = "(topology_id * num_blocks_per_shard + block_id)" if cache["IdLength"] > 1 else "block_id"
-    cache_offset = f"(((((({block_index} * {cache['NumLayers']} + {model['LayerId']}) * 2 + {model['CacheKind']}) * {cache['NumKVHeads']} + cache_head_id) * {cache['HeadDimBlocks']} + dim_block) * {cache['BlockSize']} + block_offset) * {cache['LaneCount']} + lane_id)"
+    cache_offset = f"({block_index} * {cache['BlockElements']} + {section_offset} + (({model['LayerId']}) * {layer_stride} + cache_head_id * {head_stride} + cache_dim_block * {dim_block_stride} + cache_block_offset * {block_offset_stride}) * {lane_count} + cache_lane_id)"
 
     def product(values: list[str]) -> str:
         return "1" if not values else " * ".join(f"({value})" for value in values)
@@ -3083,7 +3123,7 @@ def _emit_update_paged_attention_kv_cache(model: dict[str, Any]) -> str:
     def slot_offset() -> str:
         terms = [f"source_idx{axis} * {_dim(model['SlotsStrides'][axis])}" for axis in range(len(model["SlotsStrides"]))]
         element_offset = "linear * 0" if not terms else " + ".join(terms)
-        return element_offset if cache["LaneCount"] == 1 else f"(({element_offset}) * {cache['LaneCount']} + lane_id)"
+        return element_offset if slots_lane_count == 1 else f"(({element_offset}) * {slots_lane_count} + source_lane_id)"
 
     def global_index_name(axis: int) -> str:
         if axis == model["SeqAxis"]:
@@ -3091,14 +3131,14 @@ def _emit_update_paged_attention_kv_cache(model: dict[str, Any]) -> str:
         if axis == model["HeadAxis"]:
             return "head_id"
         if axis == model["DimAxis"]:
-            return "dim_block"
+            return "source_dim_block"
         return f"global_idx{axis}"
 
     total_elements = product([
         "num_tokens",
         _dim(model["SlotsGlobalShape"][model["HeadAxis"]]),
         _dim(model["SlotsGlobalShape"][model["DimAxis"]]),
-        str(cache["LaneCount"]),
+        str(slots_lane_count),
     ])
     lines = _helper_header(
         model,
@@ -3117,14 +3157,18 @@ def _emit_update_paged_attention_kv_cache(model: dict[str, Any]) -> str:
     _line(lines, 1, f"for linear_start in tl.range(0, {total_elements}, block_size):")
     _line(lines, 2, "linear = linear_start + tl.arange(0, block_size)")
     _line(lines, 2, f"mask = linear < {total_elements}")
-    _line(lines, 2, f"lane_id = linear % {cache['LaneCount']}")
-    _line(lines, 2, f"tmp = linear // {cache['LaneCount']}")
-    _line(lines, 2, f"dim_block = tmp % {_dim(model['SlotsGlobalShape'][model['DimAxis']])}")
+    _line(lines, 2, f"source_lane_id = linear % {slots_lane_count}")
+    _line(lines, 2, f"tmp = linear // {slots_lane_count}")
+    _line(lines, 2, f"source_dim_block = tmp % {_dim(model['SlotsGlobalShape'][model['DimAxis']])}")
     _line(lines, 2, f"tmp = tmp // {_dim(model['SlotsGlobalShape'][model['DimAxis']])}")
     _line(lines, 2, f"head_id = tmp % {_dim(model['SlotsGlobalShape'][model['HeadAxis']])}")
     _line(lines, 2, f"token_id = tmp // {_dim(model['SlotsGlobalShape'][model['HeadAxis']])}")
+    if slots_lane_count == 1:
+        _line(lines, 2, "logical_dim = source_dim_block")
+    else:
+        _line(lines, 2, f"logical_dim = source_dim_block * {slots_lane_count} + source_lane_id")
     _line(lines, 2, "cache_head_id = head_id")
-    _line(lines, 2, f"active = mask & (token_id < num_tokens) & (cache_head_id < {cache['NumKVHeads']})")
+    _line(lines, 2, f"active = mask & (token_id < num_tokens) & (cache_head_id < {cache['NumKVHeads']}) & (logical_dim < {cache['HeadDim']})")
     for axis in range(len(model["SlotsGlobalShape"])):
         global_index = global_index_name(axis)
         _line(lines, 2, f"active = active & ({global_index} < {_dim(model['SlotsGlobalShape'][axis])})")
@@ -3159,6 +3203,18 @@ def _emit_update_paged_attention_kv_cache(model: dict[str, Any]) -> str:
     _line(lines, 2, f"slot_id = tl.load(slot_mapping + token_id * {cache['IdLength']} + {cache['IdLength'] - 1}, mask=active, other=0)")
     _line(lines, 2, f"block_id = slot_id // {cache['BlockSize']}")
     _line(lines, 2, f"block_offset = slot_id % {cache['BlockSize']}")
+    if vectorized_dim == 5:  # HeadDim
+        _line(lines, 2, f"cache_dim_block = logical_dim // {lane_count}")
+        _line(lines, 2, "cache_block_offset = block_offset")
+        _line(lines, 2, f"cache_lane_id = logical_dim % {lane_count}")
+    elif vectorized_dim == 3:  # BlockSize
+        _line(lines, 2, "cache_dim_block = logical_dim")
+        _line(lines, 2, f"cache_block_offset = block_offset // {lane_count}")
+        _line(lines, 2, f"cache_lane_id = block_offset % {lane_count}")
+    else:
+        _line(lines, 2, "cache_dim_block = logical_dim")
+        _line(lines, 2, "cache_block_offset = block_offset")
+        _line(lines, 2, "cache_lane_id = 0")
     _line(lines, 2, f"source_shard_index = {full_source_shard_index}")
     _line(lines, 2, f"slot_offsets = {slot_offset()}")
     _line(lines, 2, f"source_byte_offsets = source_shard_index * {model['SlotsPoolBytes']} + {model['SlotsOffsetBytes']} + slot_offsets * {model['ScalarElementSizeBytes']}")

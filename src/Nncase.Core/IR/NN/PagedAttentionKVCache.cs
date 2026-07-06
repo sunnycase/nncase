@@ -26,35 +26,86 @@ public interface IPagedAttentionConfig : IAttentionConfig
 {
     int BlockSize { get; }
 
-    IRArray<PagedKVCacheDimKind> CacheLayout { get; }
+    IRArray<PagedKVCacheDimKind> KeyCacheLayout { get; }
 
-    IRArray<PagedKVCacheDimKind> BlockLayout => CacheLayout.Where(x => x is PagedKVCacheDimKind.BlockSize or PagedKVCacheDimKind.HeadDim).ToArray();
+    IRArray<PagedKVCacheDimKind> ValueCacheLayout { get; }
 
-    IRArray<PagedKVCacheDimKind> VectorizedAxes { get; }
+    IRArray<PagedKVCacheDimKind> KeyBlockLayout => GetBlockLayout(AttentionCacheKind.Key);
 
-    IRArray<int> Lanes { get; }
+    IRArray<PagedKVCacheDimKind> ValueBlockLayout => GetBlockLayout(AttentionCacheKind.Value);
+
+    IRArray<PagedKVCacheDimKind> KeyVectorizedAxes { get; }
+
+    IRArray<PagedKVCacheDimKind> ValueVectorizedAxes { get; }
+
+    IRArray<int> KeyLanes { get; }
+
+    IRArray<int> ValueLanes { get; }
 
     IRArray<PagedKVCacheDimKind> ShardingAxes { get; }
 
     IRArray<SBPSplit> AxisPolicies { get; }
 
-    DataType KVType => Lanes.Count == 0 ? KVPrimType : new VectorType(KVPrimType, Lanes);
+    DataType KeyType => GetKVType(AttentionCacheKind.Key);
+
+    DataType ValueType => GetKVType(AttentionCacheKind.Value);
+
+    IRArray<PagedKVCacheDimKind> GetCacheLayout(AttentionCacheKind kind)
+    {
+        return kind switch
+        {
+            AttentionCacheKind.Key => KeyCacheLayout,
+            AttentionCacheKind.Value => ValueCacheLayout,
+            _ => throw new ArgumentOutOfRangeException(nameof(kind)),
+        };
+    }
+
+    IRArray<PagedKVCacheDimKind> GetBlockLayout(AttentionCacheKind kind)
+    {
+        return GetCacheLayout(kind).Where(x => x is PagedKVCacheDimKind.BlockSize or PagedKVCacheDimKind.HeadDim).ToArray();
+    }
+
+    IRArray<PagedKVCacheDimKind> GetVectorizedAxes(AttentionCacheKind kind)
+    {
+        return kind switch
+        {
+            AttentionCacheKind.Key => KeyVectorizedAxes,
+            AttentionCacheKind.Value => ValueVectorizedAxes,
+            _ => throw new ArgumentOutOfRangeException(nameof(kind)),
+        };
+    }
+
+    IRArray<int> GetLanes(AttentionCacheKind kind)
+    {
+        return kind switch
+        {
+            AttentionCacheKind.Key => KeyLanes,
+            AttentionCacheKind.Value => ValueLanes,
+            _ => throw new ArgumentOutOfRangeException(nameof(kind)),
+        };
+    }
+
+    DataType GetKVType(AttentionCacheKind kind)
+    {
+        var lanes = GetLanes(kind);
+        return lanes.Count == 0 ? KVPrimType : new VectorType(KVPrimType, lanes);
+    }
 
     long[] GetDefaultDimensions(int numBlocks)
     {
         return new long[] { numBlocks, NumLayers, 2, BlockSize, NumKVHeads, HeadDim };
     }
 
-    long[] GetDimensions(int numBlocks)
+    long[] GetDimensions(int numBlocks, AttentionCacheKind kind)
     {
         var defaultDims = GetDefaultDimensions(numBlocks);
-        var dims = CacheLayout.Select(i => defaultDims[(int)i]).ToArray();
+        var dims = GetCacheLayout(kind).Select(i => defaultDims[(int)i]).ToArray();
         return dims;
     }
 
-    TensorType GetRawTensorType(int numBlocks)
+    TensorType GetRawTensorType(int numBlocks, AttentionCacheKind kind)
     {
-        var shape = GetDimensions(numBlocks);
+        var shape = GetDimensions(numBlocks, kind);
         return new TensorType(KVPrimType, shape);
     }
 
@@ -68,28 +119,28 @@ public interface IPagedAttentionConfig : IAttentionConfig
         return new TensorType(DataTypes.Int64, new[] { numTokens, ShardingAxes.Count + 1 });
     }
 
-    TensorType GetLogicalTensorType(int numBlocks)
+    TensorType GetLogicalTensorType(int numBlocks, AttentionCacheKind kind)
     {
         var dims = GetDefaultDimensions(numBlocks);
 
         // 1. process vectorized axes
-        foreach (var (axis, lane) in VectorizedAxes.Zip(Lanes))
+        foreach (var (axis, lane) in GetVectorizedAxes(kind).Zip(GetLanes(kind)))
         {
             dims[(int)axis] /= lane;
         }
 
         // 3. reorder dims
-        var cacheDims = CacheLayout.Select(i => dims[(int)i]).ToArray();
+        var cacheDims = GetCacheLayout(kind).Select(i => dims[(int)i]).ToArray();
 
-        return new TensorType(KVType, cacheDims);
+        return new TensorType(GetKVType(kind), cacheDims);
     }
 
-    TensorType GetLogicalShardTensorType(int numBlocks, Placement placement)
+    TensorType GetLogicalShardTensorType(int numBlocks, Placement placement, AttentionCacheKind kind)
     {
         var dims = GetDefaultDimensions(numBlocks);
 
         // 1. process vectorized axes
-        foreach (var (axis, lane) in VectorizedAxes.Zip(Lanes))
+        foreach (var (axis, lane) in GetVectorizedAxes(kind).Zip(GetLanes(kind)))
         {
             dims[(int)axis] /= lane;
         }
@@ -108,9 +159,9 @@ public interface IPagedAttentionConfig : IAttentionConfig
         }
 
         // 3. reorder dims
-        var cacheDims = CacheLayout.Select(i => dims[(int)i]).ToArray();
+        var cacheDims = GetCacheLayout(kind).Select(i => dims[(int)i]).ToArray();
 
-        return new TensorType(KVType, shardingDims.Concat(cacheDims).ToArray());
+        return new TensorType(GetKVType(kind), shardingDims.Concat(cacheDims).ToArray());
     }
 }
 
@@ -207,12 +258,16 @@ public interface IPagedAttentionKVCache : IAttentionKVCache
     long[] LogicalCacheDimensions();
 }
 
-public sealed record PagedAttentionConfig(int NumLayers, int NumKVHeads, int HeadDim, PrimType KVType, int BlockSize, IRArray<PagedKVCacheDimKind> CacheLayout, IRArray<PagedKVCacheDimKind> VectorizedAxes, IRArray<int> Lanes, IRArray<PagedKVCacheDimKind> ShardingAxes, IRArray<SBPSplit> AxisPolicies)
-    : AttentionConfig(NumLayers, NumKVHeads, HeadDim, KVType), IPagedAttentionConfig
+public sealed record PagedAttentionConfig(int NumLayers, int NumKVHeads, int HeadDim, PrimType KVPrimType, int BlockSize, IRArray<PagedKVCacheDimKind> KeyCacheLayout, IRArray<PagedKVCacheDimKind> ValueCacheLayout, IRArray<PagedKVCacheDimKind> KeyVectorizedAxes, IRArray<PagedKVCacheDimKind> ValueVectorizedAxes, IRArray<int> KeyLanes, IRArray<int> ValueLanes, IRArray<PagedKVCacheDimKind> ShardingAxes, IRArray<SBPSplit> AxisPolicies)
+    : AttentionConfig(NumLayers, NumKVHeads, HeadDim, KVPrimType), IPagedAttentionConfig
 {
+    public DataType KeyType => ((IPagedAttentionConfig)this).KeyType;
+
+    public DataType ValueType => ((IPagedAttentionConfig)this).ValueType;
+
     public override string ToString()
     {
-        return $"PagedAttentionConfig(NumLayers={NumLayers}, NumKVHeads={NumKVHeads}, HeadDim={HeadDim}, KVType={KVType}, BlockSize={BlockSize}, CacheLayout=[{string.Join(", ", CacheLayout)}], VectorizedAxes=[{string.Join(", ", VectorizedAxes)}], Lanes=[{string.Join(", ", Lanes)}], ShardingAxes=[{string.Join(", ", ShardingAxes)}], AxisPolicies=[{string.Join(", ", AxisPolicies)}])";
+        return $"PagedAttentionConfig(NumLayers={NumLayers}, NumKVHeads={NumKVHeads}, HeadDim={HeadDim}, KVType={KVPrimType}, BlockSize={BlockSize}, KeyCacheLayout=[{string.Join(", ", KeyCacheLayout)}], ValueCacheLayout=[{string.Join(", ", ValueCacheLayout)}], KeyVectorizedAxes=[{string.Join(", ", KeyVectorizedAxes)}], ValueVectorizedAxes=[{string.Join(", ", ValueVectorizedAxes)}], KeyLanes=[{string.Join(", ", KeyLanes)}], ValueLanes=[{string.Join(", ", ValueLanes)}], ShardingAxes=[{string.Join(", ", ShardingAxes)}], AxisPolicies=[{string.Join(", ", AxisPolicies)}])";
     }
 }
 

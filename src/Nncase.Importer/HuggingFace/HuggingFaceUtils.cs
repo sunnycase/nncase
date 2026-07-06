@@ -552,21 +552,23 @@ internal static class ModelUtils
         return data;
     }
 
-    public static (int[] Lanes, int[] Axes) GetQKVVectorizeParams(IPagedAttentionConfig config, AttentionDimKind[] qLayout)
+    public static (int[] Lanes, int[] Axes) GetQKVVectorizeParams(IPagedAttentionConfig config, AttentionDimKind[] qLayout, AttentionCacheKind cacheKind = AttentionCacheKind.Key)
     {
         var lanes = new List<int>();
         var axes = new List<int>();
-        for (int i = 0; i < config.VectorizedAxes.Count; i++)
+        var vectorizedAxes = config.GetVectorizedAxes(cacheKind);
+        var cacheLanes = config.GetLanes(cacheKind);
+        for (int i = 0; i < vectorizedAxes.Count; i++)
         {
-            if (config.VectorizedAxes[i] is PagedKVCacheDimKind.HeadDim or PagedKVCacheDimKind.NumKVHeads)
+            if (vectorizedAxes[i] is PagedKVCacheDimKind.HeadDim or PagedKVCacheDimKind.NumKVHeads)
             {
-                axes.Add(config.VectorizedAxes[i] switch
+                axes.Add(vectorizedAxes[i] switch
                 {
                     PagedKVCacheDimKind.NumKVHeads => qLayout.IndexOf(AttentionDimKind.Head),
                     PagedKVCacheDimKind.HeadDim => qLayout.IndexOf(AttentionDimKind.Dim),
                     _ => throw new ArgumentOutOfRangeException(nameof(config)),
                 });
-                lanes.Add(config.Lanes[i]);
+                lanes.Add(cacheLanes[i]);
             }
         }
 

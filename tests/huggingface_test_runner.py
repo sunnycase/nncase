@@ -519,12 +519,22 @@ class HuggingfaceTestRunner(TestRunner):
         self.num_blocks = paged_attention_config['num_blocks']
         self.max_sessions = paged_attention_config['max_sessions']
         self.kv_type = np.dtype(to_np_type(paged_attention_config['kv_type']))
-        self.cache_layout = [getattr(nncase.PagedKVCacheDimKind, item)
-                             for item in paged_attention_config['cache_layout']]
-        # [ nncase.PagedKVCacheDimKind.it for it in paged_attention_config['cache_layout'] ]
-        self.vectorized_axes = [getattr(nncase.PagedKVCacheDimKind, item)
-                                for item in paged_attention_config['vectorized_axes']]
-        self.lanes = paged_attention_config['lanes']
+        key_cache_layout = paged_attention_config['key_cache_layout']
+        value_cache_layout = paged_attention_config['value_cache_layout']
+        key_vectorized_axes = paged_attention_config['key_vectorized_axes']
+        value_vectorized_axes = paged_attention_config['value_vectorized_axes']
+        key_lanes = paged_attention_config['key_lanes']
+        value_lanes = paged_attention_config['value_lanes']
+        self.key_cache_layout = [getattr(nncase.PagedKVCacheDimKind, item)
+                                 for item in key_cache_layout]
+        self.value_cache_layout = [getattr(nncase.PagedKVCacheDimKind, item)
+                                   for item in value_cache_layout]
+        self.key_vectorized_axes = [getattr(nncase.PagedKVCacheDimKind, item)
+                                    for item in key_vectorized_axes]
+        self.value_vectorized_axes = [getattr(nncase.PagedKVCacheDimKind, item)
+                                      for item in value_vectorized_axes]
+        self.key_lanes = key_lanes
+        self.value_lanes = value_lanes
         self.sharding_axes = [getattr(nncase.PagedKVCacheDimKind, item)
                               for item in paged_attention_config['sharding_axes']]
         self.axis_policies = paged_attention_config['axis_policies']
@@ -542,11 +552,14 @@ class HuggingfaceTestRunner(TestRunner):
             self.head_dim,
             self.kv_type,
             self.block_size,
-            self.cache_layout,
-            self.vectorized_axes,
-            self.lanes,
-            self.sharding_axes,
-            self.axis_policies
+            key_cache_layout=self.key_cache_layout,
+            value_cache_layout=self.value_cache_layout,
+            key_vectorized_axes=self.key_vectorized_axes,
+            value_vectorized_axes=self.value_vectorized_axes,
+            key_lanes=self.key_lanes,
+            value_lanes=self.value_lanes,
+            sharding_axes=self.sharding_axes,
+            axis_policies=self.axis_policies,
         )
 
         self.cfg['huggingface_options']['config'] = self.kv_cache_config

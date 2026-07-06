@@ -272,7 +272,11 @@ def materialize_kv_cache_storage(
     device=None,
     dtype: str = "float16",
     topology_shape: tuple[int, ...] = (1,),
-    tail_shape: tuple[int, ...] = (),
+    key_tail_shape: tuple[int, ...] = (),
+    value_tail_shape: tuple[int, ...] = (),
+    key_section_elements: int = 0,
+    value_section_elements: int = 0,
+    block_elements: int = 0,
     block_size: int = 1,
 ):
     """Return persistent torch storage for PyNTT paged-attention kernels.
@@ -286,15 +290,32 @@ def materialize_kv_cache_storage(
     torch = _import_torch()
     torch_dtype = _torch_dtype(torch, dtype)
     topology_shape = tuple(int(dim) for dim in topology_shape)
-    tail_shape = tuple(int(dim) for dim in tail_shape)
-    if not tail_shape:
-        raise PyNTTArgumentError("KV cache storage tail_shape must not be empty.")
+    key_tail_shape = tuple(int(dim) for dim in key_tail_shape)
+    value_tail_shape = tuple(int(dim) for dim in value_tail_shape)
+    if not key_tail_shape or not value_tail_shape:
+        raise PyNTTArgumentError("KV cache storage key_tail_shape and value_tail_shape must not be empty.")
+    key_section_elements = int(key_section_elements) if key_section_elements else _product(key_tail_shape)
+    value_section_elements = int(value_section_elements) if value_section_elements else _product(value_tail_shape)
+    block_elements = int(block_elements) if block_elements else key_section_elements + value_section_elements
+    if key_section_elements <= 0 or value_section_elements <= 0 or block_elements < key_section_elements + value_section_elements:
+        raise PyNTTArgumentError(
+            "KV cache storage section sizes must be positive and fit inside block_elements."
+        )
     if block_size <= 0:
         raise PyNTTArgumentError(f"KV cache block_size must be positive, got {block_size}.")
 
     required_blocks = _infer_required_kv_blocks(value, block_size, topology_shape)
     raw_storage = _extract_kv_cache_field(value, "kv_caches")
-    storage_key = _kv_cache_storage_key(raw_storage, dtype, topology_shape, tail_shape)
+    storage_key = _kv_cache_storage_key(
+        raw_storage,
+        dtype,
+        topology_shape,
+        key_tail_shape,
+        value_tail_shape,
+        key_section_elements,
+        value_section_elements,
+        block_elements,
+    )
     existing = _KV_CACHE_STORAGE_CACHE.get(storage_key)
 
     if existing is not None and _storage_has_enough_blocks(existing, len(topology_shape), required_blocks):
@@ -309,7 +330,7 @@ def materialize_kv_cache_storage(
         device,
         torch_dtype,
         topology_shape,
-        tail_shape,
+        block_elements,
         required_blocks,
     )
     if existing is not None:
@@ -407,12 +428,30 @@ def _infer_required_kv_blocks(value: Any, block_size: int, topology_shape: tuple
     return required
 
 
-def _kv_cache_storage_key(raw_storage: Any, dtype: str, topology_shape: tuple[int, ...], tail_shape: tuple[int, ...]):
+def _kv_cache_storage_key(
+    raw_storage: Any,
+    dtype: str,
+    topology_shape: tuple[int, ...],
+    key_tail_shape: tuple[int, ...],
+    value_tail_shape: tuple[int, ...],
+    key_section_elements: int,
+    value_section_elements: int,
+    block_elements: int,
+):
     raw_value = raw_storage[0] if isinstance(raw_storage, (list, tuple)) and len(raw_storage) == 1 else raw_storage
     raw_numpy = _runtime_value_to_numpy(raw_value)
+    layout_key = (
+        dtype,
+        topology_shape,
+        key_tail_shape,
+        value_tail_shape,
+        int(key_section_elements),
+        int(value_section_elements),
+        int(block_elements),
+    )
     if raw_numpy is not None and raw_numpy.dtype.kind in ("i", "u") and raw_numpy.size <= 4096:
-        return ("kv_addr_table", tuple(int(v) for v in raw_numpy.reshape(-1).tolist()), dtype, topology_shape, tail_shape)
-    return ("kv_object", id(raw_value), dtype, topology_shape, tail_shape)
+        return ("kv_addr_table", tuple(int(v) for v in raw_numpy.reshape(-1).tolist()), layout_key)
+    return ("kv_object", id(raw_value), layout_key)
 
 
 def _runtime_value_to_numpy(value: Any):
@@ -450,14 +489,14 @@ def _try_materialize_initial_kv_storage(
     device,
     torch_dtype,
     topology_shape: tuple[int, ...],
-    tail_shape: tuple[int, ...],
+    block_elements: int,
     required_blocks: int,
 ):
     raw_tensor = raw_storage[0] if isinstance(raw_storage, (list, tuple)) and len(raw_storage) == 1 else raw_storage
     if isinstance(raw_tensor, torch.Tensor):
         raw_torch = raw_tensor.to(device=device, dtype=torch_dtype) if device is not None or raw_tensor.dtype != torch_dtype else raw_tensor
         raw_torch = raw_torch.contiguous()
-        if len(raw_torch.shape) >= len(topology_shape) + 1 and tuple(raw_torch.shape[:len(topology_shape)]) == topology_shape:
+        if _matches_flat_kv_storage(raw_torch, topology_shape, block_elements):
             return raw_torch
 
     raw_numpy = _runtime_value_to_numpy(raw_tensor)
@@ -468,10 +507,10 @@ def _try_materialize_initial_kv_storage(
                 raw_torch = raw_torch.to(dtype=torch_dtype)
         else:
             raw_torch = torch.as_tensor(raw_numpy, dtype=torch_dtype, device=device).contiguous()
-        if len(raw_torch.shape) >= len(topology_shape) + 1 and tuple(raw_torch.shape[:len(topology_shape)]) == topology_shape:
+        if _matches_flat_kv_storage(raw_torch, topology_shape, block_elements):
             return raw_torch
 
-    shape = topology_shape + (required_blocks,) + tail_shape
+    shape = topology_shape + (required_blocks, block_elements)
     return torch.zeros(shape, dtype=torch_dtype, device=device)
 
 
@@ -482,6 +521,21 @@ def _grow_kv_storage(torch, old_storage: Any, new_storage: Any):
     slices = tuple(slice(0, min(int(old_storage.shape[i]), int(new_storage.shape[i]))) for i in range(len(new_storage.shape)))
     new_storage[slices].copy_(old_storage[slices].to(device=new_storage.device, dtype=new_storage.dtype))
     return new_storage.contiguous()
+
+
+def _matches_flat_kv_storage(tensor: Any, topology_shape: tuple[int, ...], block_elements: int) -> bool:
+    return (
+        len(tensor.shape) == len(topology_shape) + 2
+        and tuple(int(dim) for dim in tensor.shape[:len(topology_shape)]) == topology_shape
+        and int(tensor.shape[-1]) == int(block_elements)
+    )
+
+
+def _product(shape: tuple[int, ...]) -> int:
+    result = 1
+    for dim in shape:
+        result *= int(dim)
+    return result
 
 
 def _is_numpy_bfloat16(value: Any) -> bool:

@@ -60,24 +60,36 @@ struct attention_config {
 };
 
 template <size_t NumLayer, size_t NumKVHead, size_t HeadDim,
-          typename KVPrimType, size_t BlockSize, FixedDimensions CacheLayout,
-          FixedDimensions BlockLayout, FixedDimensions VectorizedAxes,
-          FixedDimensions Lanes, FixedDimensions ShardingAxes,
+          typename KVPrimType, size_t BlockSize,
+          FixedDimensions KeyCacheLayout, FixedDimensions ValueCacheLayout,
+          FixedDimensions KeyBlockLayout, FixedDimensions ValueBlockLayout,
+          FixedDimensions KeyVectorizedAxes,
+          FixedDimensions ValueVectorizedAxes, FixedDimensions KeyLanes,
+          FixedDimensions ValueLanes, FixedDimensions ShardingAxes,
           class... AxisPolicies>
 struct paged_attention_config
     : public attention_config<NumLayer, NumKVHead, HeadDim, KVPrimType> {
     static inline constexpr auto block_size = fixed_dim_v<BlockSize>;
-    using cache_layout_t = CacheLayout;
-    using block_layout_t = BlockLayout;
-    using vectorized_axes_t = VectorizedAxes;
-    using lanes_t = Lanes;
+    using key_cache_layout_t = KeyCacheLayout;
+    using value_cache_layout_t = ValueCacheLayout;
+    using key_block_layout_t = KeyBlockLayout;
+    using value_block_layout_t = ValueBlockLayout;
+    using key_vectorized_axes_t = KeyVectorizedAxes;
+    using value_vectorized_axes_t = ValueVectorizedAxes;
+    using key_lanes_t = KeyLanes;
+    using value_lanes_t = ValueLanes;
     using sharding_axes_t = ShardingAxes;
     using axis_policies_t = ntt::tuple<AxisPolicies...>;
 
-    static inline constexpr auto cache_layout = cache_layout_t{};
-    static inline constexpr auto block_layout = block_layout_t{};
-    static inline constexpr auto vectorized_axes = vectorized_axes_t{};
-    static inline constexpr auto lanes = lanes_t{};
+    static inline constexpr auto key_cache_layout = key_cache_layout_t{};
+    static inline constexpr auto value_cache_layout = value_cache_layout_t{};
+    static inline constexpr auto key_block_layout = key_block_layout_t{};
+    static inline constexpr auto value_block_layout = value_block_layout_t{};
+    static inline constexpr auto key_vectorized_axes = key_vectorized_axes_t{};
+    static inline constexpr auto value_vectorized_axes =
+        value_vectorized_axes_t{};
+    static inline constexpr auto key_lanes = key_lanes_t{};
+    static inline constexpr auto value_lanes = value_lanes_t{};
     static inline constexpr auto sharding_axes = sharding_axes_t{};
     static inline constexpr auto axis_policies = axis_policies_t{};
 
@@ -94,18 +106,23 @@ struct paged_attention_config
 };
 
 template <size_t NumLayer, size_t NumKVHead, size_t HeadDim,
-          typename KVPrimType, size_t BlockSize, FixedDimensions CacheLayout,
-          FixedDimensions BlockLayout, FixedDimensions VectorizedAxes,
-          FixedDimensions Lanes, FixedDimensions ShardingAxes,
+          typename KVPrimType, size_t BlockSize,
+          FixedDimensions KeyCacheLayout, FixedDimensions ValueCacheLayout,
+          FixedDimensions KeyBlockLayout, FixedDimensions ValueBlockLayout,
+          FixedDimensions KeyVectorizedAxes,
+          FixedDimensions ValueVectorizedAxes, FixedDimensions KeyLanes,
+          FixedDimensions ValueLanes, FixedDimensions ShardingAxes,
           class... AxisPolicies>
-constexpr auto make_paged_attention_config(const CacheLayout &,
-                                           const BlockLayout &,
-                                           const VectorizedAxes &,
-                                           const Lanes &, const ShardingAxes &,
-                                           const AxisPolicies &...) noexcept {
+constexpr auto make_paged_attention_config(
+    const KeyCacheLayout &, const ValueCacheLayout &, const KeyBlockLayout &,
+    const ValueBlockLayout &, const KeyVectorizedAxes &,
+    const ValueVectorizedAxes &, const KeyLanes &, const ValueLanes &,
+    const ShardingAxes &, const AxisPolicies &...) noexcept {
     return paged_attention_config<
-        NumLayer, NumKVHead, HeadDim, KVPrimType, BlockSize, CacheLayout,
-        BlockLayout, VectorizedAxes, Lanes, ShardingAxes, AxisPolicies...>{};
+        NumLayer, NumKVHead, HeadDim, KVPrimType, BlockSize, KeyCacheLayout,
+        ValueCacheLayout, KeyBlockLayout, ValueBlockLayout, KeyVectorizedAxes,
+        ValueVectorizedAxes, KeyLanes, ValueLanes, ShardingAxes,
+        AxisPolicies...>{};
 }
 
 template <class TConfig> class attention_kv_cache {
@@ -163,17 +180,55 @@ concept HasValidShape =
 template <dim_t N, typename T>
 concept ValidIdTensor = Tensor<T> && HasValidShape<T, N>;
 
-template <class Mesh, class TConfig>
+template <attention_cache_kind Kind, class TConfig>
+constexpr auto cache_layout() noexcept {
+    if constexpr (Kind == attention_cache_kind::key) {
+        return TConfig::key_cache_layout;
+    } else {
+        return TConfig::value_cache_layout;
+    }
+}
+
+template <attention_cache_kind Kind, class TConfig>
+constexpr auto block_layout() noexcept {
+    if constexpr (Kind == attention_cache_kind::key) {
+        return TConfig::key_block_layout;
+    } else {
+        return TConfig::value_block_layout;
+    }
+}
+
+template <attention_cache_kind Kind, class TConfig>
+constexpr auto vectorized_axes() noexcept {
+    if constexpr (Kind == attention_cache_kind::key) {
+        return TConfig::key_vectorized_axes;
+    } else {
+        return TConfig::value_vectorized_axes;
+    }
+}
+
+template <attention_cache_kind Kind, class TConfig>
+constexpr auto lanes() noexcept {
+    if constexpr (Kind == attention_cache_kind::key) {
+        return TConfig::key_lanes;
+    } else {
+        return TConfig::value_lanes;
+    }
+}
+
+template <attention_cache_kind Kind, class Mesh, class TConfig>
 constexpr auto origin_kv_cache_one_block_shape() noexcept {
     constexpr auto devectorized_shape =
         fixed_shape_v<1 /* one block */, TConfig::num_layers, 2,
                       TConfig::block_size, TConfig::num_kv_heads,
                       TConfig::head_dim>;
 
-    auto vectorized_shape = TConfig::vectorized_axes.aggregate(
+    constexpr auto kind_vectorized_axes = vectorized_axes<Kind, TConfig>();
+    constexpr auto kind_lanes = lanes<Kind, TConfig>();
+    auto vectorized_shape = kind_vectorized_axes.aggregate(
         devectorized_shape, [&](auto last_shape, auto vectorized_axis, auto i) {
             return last_shape.template replace_at<vectorized_axis>(
-                last_shape[vectorized_axis] / TConfig::lanes[i]);
+                last_shape[vectorized_axis] / kind_lanes[i]);
         });
 
     auto shard_shape = TConfig::sharding_axes.aggregate(
@@ -197,18 +252,20 @@ constexpr auto origin_kv_cache_one_block_shape() noexcept {
     return shard_shape;
 }
 
-template <class TConfig, Dimensions TDims>
+template <attention_cache_kind Kind, class TConfig, Dimensions TDims>
 constexpr auto transform_kv_cache_dims(const TDims &dims) noexcept {
-    constexpr auto cache_layout = TConfig::cache_layout;
-    return dims.select(cache_layout);
+    constexpr auto kind_cache_layout = cache_layout<Kind, TConfig>();
+    return dims.select(kind_cache_layout);
 }
 
-template <class TConfig, Dimensions TDims>
+template <attention_cache_kind Kind, class TConfig, Dimensions TDims>
 constexpr auto transform_block_dims(const TDims &dims) noexcept {
     constexpr auto default_layout = fixed_shape_v<-1, -1, -1, 0, -1, 1>;
-    constexpr auto block_layout = TConfig::block_layout;
+    constexpr auto kind_block_layout = block_layout<Kind, TConfig>();
     return generate_shape<TDims::rank()>(
-        [&](auto axis) { return dims[default_layout[block_layout[axis]]]; });
+        [&](auto axis) {
+            return dims[default_layout[kind_block_layout[axis]]];
+        });
 }
 } // namespace detail
 
@@ -232,13 +289,14 @@ class paged_attention_kv_cache : public attention_kv_cache<TConfig> {
     using slot_mapping_t = decltype(make_tensor_view_from_address(
         std::declval<const int64_t *>(), std::declval<slot_mapping_shape_t>()));
 
-    using kv_storage_type_t =
-        basic_vector<typename TConfig::kv_prim_type, typename TConfig::lanes_t>;
+    using kv_storage_type_t = basic_vector<typename TConfig::kv_prim_type,
+                                          typename TConfig::key_lanes_t>;
 
     static constexpr auto origin_kv_cache_one_block_shape =
-        detail::origin_kv_cache_one_block_shape<Mesh, TConfig>();
+        detail::origin_kv_cache_one_block_shape<attention_cache_kind::key, Mesh,
+                                                TConfig>();
     static constexpr auto kv_cache_one_block_shape =
-        detail::transform_kv_cache_dims<TConfig>(
+        detail::transform_kv_cache_dims<attention_cache_kind::key, TConfig>(
             origin_kv_cache_one_block_shape);
     static constexpr auto kv_cache_block_length =
         kv_cache_one_block_shape.length();
@@ -318,7 +376,7 @@ class paged_attention_kv_cache : public attention_kv_cache<TConfig> {
     constexpr auto block_table() const noexcept { return block_table_; }
 
   private:
-    template <class T>
+    template <attention_cache_kind Kind, class T>
     constexpr auto get_kv_cache_one_block_view(const T &block_id) noexcept
         requires detail::ValidIdTensor<id_length, T>
     {
@@ -336,9 +394,14 @@ class paged_attention_kv_cache : public attention_kv_cache<TConfig> {
                     local_index.select(submesh_axes), submesh_shape);
                 return ntt::where(index == -1_dim, local_program_id, index);
             });
-        auto address = kv_cache_address(kv_cache_index) +
-                       block_offset * kv_cache_block_length;
-        return make_tensor_view_from_address(address, kv_cache_one_block_shape);
+        constexpr auto kind_origin_shape =
+            detail::origin_kv_cache_one_block_shape<Kind, Mesh, TConfig>();
+        constexpr auto kind_shape =
+            detail::transform_kv_cache_dims<Kind, TConfig>(kind_origin_shape);
+        constexpr auto kind_block_length = kind_shape.length();
+        auto address =
+            kv_cache_address(kv_cache_index) + block_offset * kind_block_length;
+        return make_tensor_view_from_address(address, kind_shape);
     }
 
     template <attention_cache_kind Kind, class T>
@@ -346,12 +409,12 @@ class paged_attention_kv_cache : public attention_kv_cache<TConfig> {
                                   const T &block_id) noexcept
         requires detail::ValidIdTensor<id_length, T>
     {
-        auto cache_layout = config().cache_layout;
+        constexpr auto cache_layout = detail::cache_layout<Kind, TConfig>();
         const auto origin_starts =
             ntt::make_shape(dim_zero, layer_id, fixed_dim_v<(dim_t)Kind>,
                             dim_zero, head_id, dim_zero);
         const auto origin_shape =
-            origin_kv_cache_one_block_shape
+            detail::origin_kv_cache_one_block_shape<Kind, Mesh, TConfig>()
                 .template replace_at<(
                     size_t)paged_kvcache_dim_kind::num_layers>(1_dim)
                 .template replace_at<(size_t)paged_kvcache_dim_kind::kv>(1_dim)
@@ -359,9 +422,9 @@ class paged_attention_kv_cache : public attention_kv_cache<TConfig> {
                     size_t)paged_kvcache_dim_kind::num_kv_heads>(1_dim);
 
         const auto starts =
-            detail::transform_kv_cache_dims<TConfig>(origin_starts);
+            detail::transform_kv_cache_dims<Kind, TConfig>(origin_starts);
         const auto shape =
-            detail::transform_kv_cache_dims<TConfig>(origin_shape);
+            detail::transform_kv_cache_dims<Kind, TConfig>(origin_shape);
         const auto squeeze_axes = cache_layout.aggregate(
             fixed_shape_v<>, [&](auto last_axes, auto kv_cache_dim, auto i) {
                 if constexpr (kv_cache_dim !=
@@ -373,7 +436,7 @@ class paged_attention_kv_cache : public attention_kv_cache<TConfig> {
                     return last_axes;
                 }
             });
-        auto block_view = get_kv_cache_one_block_view(block_id);
+        auto block_view = get_kv_cache_one_block_view<Kind>(block_id);
         // printf("[nncase_log] default_shape [%ld, %ld, %ld, %ld, %ld,
         // %ld]\n",
         //        default_shape[0], default_shape[1], default_shape[2],
@@ -407,12 +470,16 @@ class paged_attention_kv_cache : public attention_kv_cache<TConfig> {
         auto block_view = get_block_view<Kind>(layer_id, head_id, block_id);
         const auto origin_starts = make_shape(local_slot_offset, dim_zero);
         const auto origin_shape =
-            make_shape(dim_one, origin_kv_cache_one_block_shape[fixed_dim_v<(
-                                    dim_t)paged_kvcache_dim_kind::head_dim>]);
+            make_shape(dim_one,
+                       detail::origin_kv_cache_one_block_shape<
+                           Kind, Mesh, TConfig>()[fixed_dim_v<(
+                           dim_t)paged_kvcache_dim_kind::head_dim>]);
         const auto starts =
-            detail::transform_block_dims<TConfig>(origin_starts);
-        const auto shape = detail::transform_block_dims<TConfig>(origin_shape);
-        const auto squeeze_axes = fixed_shape_v<TConfig::block_layout.index_of(
+            detail::transform_block_dims<Kind, TConfig>(origin_starts);
+        const auto shape =
+            detail::transform_block_dims<Kind, TConfig>(origin_shape);
+        constexpr auto kind_block_layout = detail::block_layout<Kind, TConfig>();
+        const auto squeeze_axes = fixed_shape_v<kind_block_layout.index_of(
             fixed_dim_v<(dim_t)paged_kvcache_dim_kind::block_size>)>;
         return block_view.view(starts, shape).squeeze(squeeze_axes);
     }
