@@ -379,6 +379,12 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 case Nncase.TIR.NTT.VectorizedLayerNorm layerNorm:
                     VisitLayerNorm(layerNorm, args);
                     break;
+                case Nncase.TIR.NTT.NormStats normStats:
+                    VisitNormStats(normStats, args);
+                    break;
+                case Nncase.TIR.NTT.NormApply normApply:
+                    VisitNormApply(normApply, args);
+                    break;
                 case Nncase.TIR.NTT.SynchronizeThreads:
                     _attrs["requires_grid_barrier"] = true;
                     WriteBarrier(HelperBarrierKind.Grid);
@@ -3094,6 +3100,152 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             WriteLine(BuildHelperCall(helperName));
         }
 
+        private void VisitNormStats(Nncase.TIR.NTT.NormStats normStats, IReadOnlyList<BaseExpr> args)
+        {
+            if (args.Count < 2 ||
+                args[0] is not TIR.Buffer input ||
+                args[1] is not TIR.Buffer output)
+            {
+                throw new NotSupportedException("PyNTT NormStats codegen expects input and output TIR buffers.");
+            }
+
+            SetComputeOp(normStats.UseMean ? "norm_stats" : "rms_norm_stats");
+            var inputShape = GetBufferShape(input);
+            var outputShape = GetBufferShape(output);
+            var normalizedAxis = NormalizeAxis(normStats.Axis, inputShape.Length, "PyNTT NormStats");
+            var inputVectorLaneCount = GetSingleVectorLaneCount(input.ElemType, "PyNTT NormStats input");
+            var outputVectorLaneCount = GetSingleVectorLaneCount(output.ElemType, "PyNTT NormStats output");
+            if (inputVectorLaneCount != 1 || outputVectorLaneCount != 1)
+            {
+                throw new NotSupportedException("PyNTT NormStats codegen currently expects scalar buffer dtypes.");
+            }
+
+            ValidateNormStatsShape("PyNTT NormStats", inputShape, outputShape, normalizedAxis, normStats.UseMean);
+
+            _attrs["op"] = normStats.UseMean ? "norm_stats" : "rms_norm_stats";
+            _attrs["tir"] = true;
+            _attrs["dtype"] = GetPyNTTScalarDTypeName(output.ElemType);
+            _attrs["shape"] = outputShape;
+            _attrs["axis"] = normalizedAxis;
+            _attrs["use_mean"] = normStats.UseMean;
+            var helperName = GetNextHelperName("norm_stats_compute");
+            WriteHelperTemplate(
+                "triton/kernels/NormStats.py.jinja",
+                new PyNTTNormStatsTemplateModel(
+                    helperName,
+                    GetBufferScalarPointer(input),
+                    GetBufferScalarPointer(output),
+                    GetPyNTTScalarDTypeName(input.ElemType),
+                    GetPyNTTScalarDTypeName(output.ElemType),
+                    GetScalarTritonDType(input.ElemType),
+                    GetScalarTritonDType(output.ElemType),
+                    inputShape,
+                    outputShape,
+                    GetBufferStrides(input),
+                    GetBufferStrides(output),
+                    inputVectorLaneCount,
+                    outputVectorLaneCount,
+                    normalizedAxis,
+                    normStats.UseMean,
+                    $"{input.Name} -> {output.Name}"));
+            WriteLine(BuildHelperCall(helperName));
+        }
+
+        private void VisitNormApply(Nncase.TIR.NTT.NormApply normApply, IReadOnlyList<BaseExpr> args)
+        {
+            if (args.Count < 5 ||
+                args[0] is not TIR.Buffer input ||
+                args[1] is not TIR.Buffer stats ||
+                args[2] is not TIR.Buffer scale ||
+                args[3] is not TIR.Buffer bias ||
+                args[4] is not TIR.Buffer output)
+            {
+                throw new NotSupportedException("PyNTT NormApply codegen expects input, stats, scale, bias, and output TIR buffers.");
+            }
+
+            SetComputeOp(normApply.UseMean ? "norm_apply" : "rms_norm_apply");
+            var inputShape = GetBufferShape(input);
+            var inputGlobalShape = GetBufferGlobalShape(input);
+            var statsShape = GetBufferShape(stats);
+            var scaleShape = GetBufferShape(scale);
+            var biasShape = GetBufferShape(bias);
+            var outputShape = GetBufferShape(output);
+            var normalizedAxis = NormalizeAxis(normApply.Axis, outputShape.Length, "PyNTT NormApply");
+            ValidateSameShape("PyNTT NormApply", inputShape, outputShape);
+            ValidateNormStatsShape("PyNTT NormApply stats", outputShape, statsShape, normalizedAxis, normApply.UseMean);
+            ValidateLayerNormShape("PyNTT NormApply scale", scaleShape, outputShape, normalizedAxis);
+            ValidateLayerNormShape("PyNTT NormApply bias", biasShape, outputShape, normalizedAxis);
+
+            var inputVectorLaneCount = GetSingleVectorLaneCount(input.ElemType, "PyNTT NormApply input");
+            var statsVectorLaneCount = GetSingleVectorLaneCount(stats.ElemType, "PyNTT NormApply stats");
+            var scaleVectorLaneCount = GetSingleVectorLaneCount(scale.ElemType, "PyNTT NormApply scale");
+            var biasVectorLaneCount = GetSingleVectorLaneCount(bias.ElemType, "PyNTT NormApply bias");
+            var outputVectorLaneCount = GetSingleVectorLaneCount(output.ElemType, "PyNTT NormApply output");
+            if (statsVectorLaneCount != 1)
+            {
+                throw new NotSupportedException("PyNTT NormApply expects scalar stats buffer dtype.");
+            }
+
+            if (new[] { inputVectorLaneCount, scaleVectorLaneCount, biasVectorLaneCount, outputVectorLaneCount }.Distinct().Count() != 1)
+            {
+                throw new NotSupportedException($"PyNTT NormApply expects matching input/scale/bias/output vector lanes, got input={inputVectorLaneCount}, scale={scaleVectorLaneCount}, bias={biasVectorLaneCount}, output={outputVectorLaneCount}.");
+            }
+
+            if (inputVectorLaneCount != 1 && normalizedAxis > outputShape.Length - 1)
+            {
+                throw new NotSupportedException("PyNTT NormApply vectorized axis must be inside the normalized dimensions.");
+            }
+
+            _attrs["op"] = normApply.UseMean ? "norm_apply" : "rms_norm_apply";
+            _attrs["tir"] = true;
+            _attrs["dtype"] = GetPyNTTScalarDTypeName(output.ElemType);
+            _attrs["shape"] = outputShape;
+            _attrs["axis"] = normalizedAxis;
+            _attrs["epsilon"] = normApply.Epsilon;
+            _attrs["use_mean"] = normApply.UseMean;
+            var helperName = GetNextHelperName("norm_apply_compute");
+            WriteHelperTemplate(
+                "triton/kernels/NormApply.py.jinja",
+                new PyNTTNormApplyTemplateModel(
+                    helperName,
+                    GetBufferScalarPointer(input),
+                    GetBufferScalarPointer(stats),
+                    GetBufferScalarPointer(scale),
+                    GetBufferScalarPointer(bias),
+                    GetBufferScalarPointer(output),
+                    GetPyNTTScalarDTypeName(input.ElemType),
+                    GetPyNTTScalarDTypeName(stats.ElemType),
+                    GetPyNTTScalarDTypeName(scale.ElemType),
+                    GetPyNTTScalarDTypeName(bias.ElemType),
+                    GetPyNTTScalarDTypeName(output.ElemType),
+                    GetScalarTritonDType(input.ElemType),
+                    GetScalarTritonDType(stats.ElemType),
+                    GetScalarTritonDType(scale.ElemType),
+                    GetScalarTritonDType(bias.ElemType),
+                    GetScalarTritonDType(output.ElemType),
+                    inputShape,
+                    inputGlobalShape,
+                    statsShape,
+                    scaleShape,
+                    biasShape,
+                    outputShape,
+                    GetBufferStrides(input),
+                    GetBufferStrides(stats),
+                    GetBufferStrides(scale),
+                    GetBufferStrides(bias),
+                    GetBufferStrides(output),
+                    inputVectorLaneCount,
+                    statsVectorLaneCount,
+                    scaleVectorLaneCount,
+                    biasVectorLaneCount,
+                    outputVectorLaneCount,
+                    normalizedAxis,
+                    normApply.Epsilon,
+                    normApply.UseMean,
+                    $"{input.Name}, {stats.Name}, {scale.Name}, {bias.Name} -> {output.Name}"));
+            WriteLine(BuildHelperCall(helperName));
+        }
+
         private void VisitGetPositionIds(Nncase.TIR.NTT.GetPositionIds getPositionIds, IReadOnlyList<BaseExpr> args)
         {
             if (args.Count < 2 ||
@@ -4998,6 +5150,36 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
         if (parameterShape.Count != expectedShape.Length || parameterShape.Zip(expectedShape).Any(pair => !SameDim(pair.First, pair.Second)))
         {
             throw new NotSupportedException($"{context} requires shape [{ShapeText(expectedShape)}], got [{ShapeText(parameterShape)}].");
+        }
+    }
+
+    private static void ValidateNormStatsShape(string context, IReadOnlyList<PyNTTDimExpression> inputShape, IReadOnlyList<PyNTTDimExpression> statsShape, int axis, bool useMean)
+    {
+        var expectedRank = inputShape.Count + 1;
+        if (statsShape.Count != expectedRank)
+        {
+            throw new NotSupportedException($"{context} stats rank must be {expectedRank}, got [{ShapeText(statsShape)}].");
+        }
+
+        var expectedComponents = useMean ? 2 : 1;
+        if (statsShape[0].FixedValue != expectedComponents)
+        {
+            throw new NotSupportedException($"{context} stats component dimension must be {expectedComponents}, got [{ShapeText(statsShape)}].");
+        }
+
+        for (var i = 0; i < inputShape.Count; i++)
+        {
+            if (i < axis)
+            {
+                if (!SameDim(inputShape[i], statsShape[i + 1]))
+                {
+                    throw new NotSupportedException($"{context} stats outer axis {i} must match input shape [{ShapeText(inputShape)}], got [{ShapeText(statsShape)}].");
+                }
+            }
+            else if (!statsShape[i + 1].IsFixedOne)
+            {
+                throw new NotSupportedException($"{context} stats normalized axis {i} must have extent 1, got [{ShapeText(statsShape)}].");
+            }
         }
     }
 

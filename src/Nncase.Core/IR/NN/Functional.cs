@@ -38,6 +38,10 @@ public static class NN
 
     public static Call LayerNorm(int axis, float epsilon, Expr input, Expr scale, Expr bias, bool hasMean = true, bool channelFirst = false) => new Call(new LayerNorm(axis, epsilon, hasMean, channelFirst), input, scale, bias);
 
+    public static Call NormStats(int axis, Expr input, bool useMean) => new Call(new NormStats(axis, useMean), input);
+
+    public static Call NormApply(int axis, float epsilon, Expr input, Expr stats, Expr scale, Expr bias, bool useMean) => new Call(new NormApply(axis, epsilon, useMean), input, stats, scale, bias);
+
     public static Call BatchToSpace(Expr input, Shape blockShape, Paddings crops) => new Call(new BatchToSpace(), input, blockShape, crops);
 
     public static Call InstanceNormalization(Expr input, Expr scale, Expr bias, Expr eps) => new Call(new InstanceNormalization(), input, scale, bias, eps);

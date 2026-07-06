@@ -144,7 +144,7 @@ cmake --build build/Debug --config Debug
 cmake --install build/Debug --prefix install
 
 dotnet restore -r linux-x64
-dotnet build -c Debug --no-restore
+dotnet build src/Nncase.Compiler/Nncase.Compiler.csproj -c Debug -r linux-x64 --no-restore
 
 cp install/lib/*.so install/
 ```
@@ -152,7 +152,10 @@ cp install/lib/*.so install/
 Always point Python tests at the installed native bridge and the compiler DLL
 from the `dotnet build` output. Publishing is not needed for the local test
 loop, and using `install/Nncase.Compiler.dll` can leave Python tests on stale
-managed assemblies after a compiler/codegen change.
+managed assemblies after a compiler/codegen change. When `NNCASE_COMPILER`
+points at the `net8.0/linux-x64` RID output below, compiler changes must be
+built with `-r linux-x64`; a plain `dotnet build -c Debug` updates only the
+non-RID `net8.0` output and can leave pytest using an old compiler DLL.
 
 ```sh
 export PYTHONPATH="$PWD/install/lib:$PWD/install/python:$PWD/tests:${PYTHONPATH}"

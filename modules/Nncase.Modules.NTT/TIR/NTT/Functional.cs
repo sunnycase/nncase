@@ -228,6 +228,16 @@ public partial class NTT
         return new Call(new VectorizedLayerNorm(axis, epsilon, usemean, vectorizedAxes, padedNums, null!, cSourcePath, funcName), input, scale, bias, postScale, output);
     }
 
+    public static Expr NormStats(Expr input, Expr output, int axis, bool useMean)
+    {
+        return new Call(new NormStats(axis, useMean), input, output);
+    }
+
+    public static Expr NormApply(Expr input, Expr stats, Expr scale, Expr bias, Expr output, int axis, float epsilon, bool useMean)
+    {
+        return new Call(new NormApply(axis, epsilon, useMean), input, stats, scale, bias, output);
+    }
+
     public static Expr InstanceNorm(Expr input, Expr scale, Expr bias, Expr output, float epsilon, IRArray<int> vectorizedAxes, IRArray<Dimension> padedNums, DistributedType distributedType)
     {
         return new Call(new InstanceNorm(epsilon, vectorizedAxes, padedNums, distributedType), input, scale, bias, output);

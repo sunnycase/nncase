@@ -1110,16 +1110,14 @@ def _emit_packed_qkv_parallel_linear(model: dict[str, Any]) -> str:
         n_stages = 2 if use_large_n else 1
         _line(lines, indent, f"for m_idx in tl.range(0, {_dim(m)}):")
         indent += 1
-        for prefix in ("Q", "K", "V"):
-            _emit_packed_qkv_gemv_projection(lines, indent, model, prefix, input_batch_offset, block_n, block_k, n_stages)
+        _emit_packed_qkv_gemv_concat_n(lines, indent, model, input_batch_offset, block_n, block_k, n_stages)
     else:
         block_m = 16
         block_n = 64
         block_k = 64
         _line(lines, indent, f"for m_start in tl.range(0, {_dim(m)}, {block_m}):")
         _line(lines, indent + 1, f"offs_m = m_start + tl.arange(0, {block_m})")
-        for prefix in ("Q", "K", "V"):
-            _emit_packed_qkv_matmul_projection(lines, indent + 1, model, prefix, input_batch_offset, block_m, block_n, block_k)
+        _emit_packed_qkv_matmul_concat_n(lines, indent + 1, model, input_batch_offset, block_m, block_n, block_k)
     return _finish(lines)
 
 
@@ -1172,6 +1170,138 @@ def _packed_qkv_bias_offsets(model: dict[str, Any], prefix: str, n_expr: str) ->
         model["NPackedLaneCount"],
         model["NVectorLaneCount"],
     )
+
+
+def _packed_qkv_logical_n(model: dict[str, Any], prefix: str) -> Any:
+    return _packed_qkv_logical_output_shape(model, prefix)[-1]
+
+
+def _packed_qkv_total_logical_n(model: dict[str, Any]) -> Any:
+    return _add_dims(_add_dims(_packed_qkv_logical_n(model, "Q"), _packed_qkv_logical_n(model, "K")), _packed_qkv_logical_n(model, "V"))
+
+
+def _packed_qkv_qk_logical_n(model: dict[str, Any]) -> Any:
+    return _add_dims(_packed_qkv_logical_n(model, "Q"), _packed_qkv_logical_n(model, "K"))
+
+
+def _append_packed_qkv_concat_n_indices(lines: list[str], indent: int, model: dict[str, Any]) -> None:
+    q_n = _packed_qkv_logical_n(model, "Q")
+    qk_n = _packed_qkv_qk_logical_n(model)
+    total_n = _packed_qkv_total_logical_n(model)
+    _line(lines, indent, f"q_active = offs_n < {_dim(q_n)}")
+    _line(lines, indent, f"k_active = (offs_n >= {_dim(q_n)}) & (offs_n < {_dim(qk_n)})")
+    _line(lines, indent, f"v_active = (offs_n >= {_dim(qk_n)}) & (offs_n < {_dim(total_n)})")
+    _line(lines, indent, "q_local_n = offs_n")
+    _line(lines, indent, f"k_local_n = offs_n - {_dim(q_n)}")
+    _line(lines, indent, f"v_local_n = offs_n - {_dim(qk_n)}")
+
+
+def _emit_packed_qkv_gemv_concat_n(
+    lines: list[str],
+    indent: int,
+    model: dict[str, Any],
+    input_batch_offset: str,
+    block_n: int,
+    block_k: int,
+    n_stages: int,
+) -> None:
+    total_n = _packed_qkv_total_logical_n(model)
+    k = model["InputShape"][-1]
+    input_terms = [] if input_batch_offset == "0" else [input_batch_offset]
+    input_terms += [f"m_idx * {_dim(model['InputStrides'][-2])}", f"offs_k * {_dim(model['InputStrides'][-1])}"]
+    input_offsets = f"({' + '.join(input_terms)})"
+
+    _line(lines, indent, f"for n_start in tl.range(0, {_dim(total_n)}, {block_n}, num_stages={n_stages}):")
+    _line(lines, indent + 1, f"offs_n = n_start + tl.arange(0, {block_n})")
+    _append_packed_qkv_concat_n_indices(lines, indent + 1, model)
+    _line(lines, indent + 1, f"acc = tl.zeros(({block_n},), tl.float32)")
+    _line(lines, indent + 1, f"for k_start in tl.range(0, {_dim(k)}, {block_k}):")
+    _line(lines, indent + 2, f"offs_k = k_start + tl.arange(0, {block_k})")
+
+    for prefix in ("Q", "K", "V"):
+        weight_shape = model[f"{prefix}WeightShape"]
+        output_shape = model[f"{prefix}OutputShape"]
+        weight_strides = model[f"{prefix}WeightStrides"]
+        weight_batch_offset = _batch_offset_expression(weight_shape, weight_strides, len(output_shape) - 2)
+        local_n = f"{prefix.lower()}_local_n"
+        weight_offsets = _packed_qkv_weight_offsets(model, prefix, weight_batch_offset, f"{local_n}[:, None]", "offs_k[None, :]")
+        _line(lines, indent + 2, f"{prefix.lower()}_weight_ptrs = {prefix.lower()}_weight + {weight_offsets}")
+
+    _line(lines, indent + 2, "weight_ptrs = tl.where(q_active[:, None], q_weight_ptrs, tl.where(k_active[:, None], k_weight_ptrs, v_weight_ptrs))")
+    _line(lines, indent + 2, f"weight_values = tl.load(weight_ptrs, mask=(offs_n[:, None] < {_dim(total_n)}) & (offs_k[None, :] < {_dim(k)}), other=0.0, eviction_policy=\"evict_first\").to(tl.float32)")
+    _line(lines, indent + 2, f"input_values = tl.load(input0 + {input_offsets}, mask=offs_k < {_dim(k)}, other=0.0).to(tl.float32)")
+    _line(lines, indent + 2, "acc += tl.sum(weight_values * input_values[None, :], axis=1)")
+
+    for prefix, active in (("Q", "q_active"), ("K", "k_active"), ("V", "v_active")):
+        if model[f"Has{prefix}Bias"]:
+            bias_offsets = _packed_qkv_bias_offsets(model, prefix, f"{prefix.lower()}_local_n")
+            _line(lines, indent + 1, f"acc += tl.load({prefix.lower()}_bias + {bias_offsets}, mask={active} & (offs_n < {_dim(total_n)}), other=0.0).to(tl.float32)")
+
+    for prefix in ("Q", "K", "V"):
+        output_shape = model[f"{prefix}OutputShape"]
+        output_strides = model[f"{prefix}OutputStrides"]
+        output_batch_offset = _batch_offset_expression(output_shape, output_strides, len(output_shape) - 2)
+        output_offsets = _packed_qkv_output_offsets(model, prefix, output_batch_offset, f"{prefix.lower()}_local_n", "m_idx")
+        _line(lines, indent + 1, f"{prefix.lower()}_output_ptrs = {prefix.lower()}_output + {output_offsets}")
+
+    _line(lines, indent + 1, "output_ptrs = tl.where(q_active, q_output_ptrs, tl.where(k_active, k_output_ptrs, v_output_ptrs))")
+    _line(lines, indent + 1, f"tl.store(output_ptrs, acc, mask=offs_n < {_dim(total_n)})")
+
+
+def _emit_packed_qkv_matmul_concat_n(
+    lines: list[str],
+    indent: int,
+    model: dict[str, Any],
+    input_batch_offset: str,
+    block_m: int,
+    block_n: int,
+    block_k: int,
+) -> None:
+    q_output_logical_shape = _packed_qkv_logical_output_shape(model, "Q")
+    total_n = _packed_qkv_total_logical_n(model)
+    m = q_output_logical_shape[-2]
+    k = model["InputShape"][-1]
+
+    input_terms = [] if input_batch_offset == "0" else [input_batch_offset]
+    input_terms += [f"offs_m[:, None] * {_dim(model['InputStrides'][-2])}", f"offs_k[None, :] * {_dim(model['InputStrides'][-1])}"]
+    input_offsets = f"({' + '.join(input_terms)})"
+
+    _line(lines, indent, f"for n_start in tl.range(0, {_dim(total_n)}, {block_n}):")
+    _line(lines, indent + 1, f"offs_n = n_start + tl.arange(0, {block_n})")
+    _append_packed_qkv_concat_n_indices(lines, indent + 1, model)
+    _line(lines, indent + 1, f"acc = tl.zeros(({block_m}, {block_n}), tl.float32)")
+    _line(lines, indent + 1, f"for k_start in tl.range(0, {_dim(k)}, {block_k}, num_stages=5):")
+    _line(lines, indent + 2, f"offs_k = k_start + tl.arange(0, {block_k})")
+
+    for prefix in ("Q", "K", "V"):
+        weight_shape = model[f"{prefix}WeightShape"]
+        output_shape = model[f"{prefix}OutputShape"]
+        weight_strides = model[f"{prefix}WeightStrides"]
+        weight_batch_offset = _batch_offset_expression(weight_shape, weight_strides, len(output_shape) - 2)
+        local_n = f"{prefix.lower()}_local_n"
+        weight_offsets = _packed_qkv_weight_offsets(model, prefix, weight_batch_offset, f"{local_n}[None, :]", "offs_k[:, None]")
+        _line(lines, indent + 2, f"{prefix.lower()}_weight_ptrs = {prefix.lower()}_weight + {weight_offsets}")
+
+    _line(lines, indent + 2, "weight_ptrs = tl.where(q_active[None, :], q_weight_ptrs, tl.where(k_active[None, :], k_weight_ptrs, v_weight_ptrs))")
+    _line(lines, indent + 2, f"weight_values = tl.load(weight_ptrs, mask=(offs_k[:, None] < {_dim(k)}) & (offs_n[None, :] < {_dim(total_n)}), other=0.0)")
+    _line(lines, indent + 2, f"input_values = tl.load(input0 + {input_offsets}, mask=(offs_m[:, None] < {_dim(m)}) & (offs_k[None, :] < {_dim(k)}), other=0.0)")
+    dot_precision = ', input_precision="ieee"' if model["InputDType"] == "float32" and model["WeightDType"] == "float32" else ""
+    _line(lines, indent + 2, f"acc += tl.dot(input_values, weight_values{dot_precision})")
+
+    for prefix, active in (("Q", "q_active"), ("K", "k_active"), ("V", "v_active")):
+        if model[f"Has{prefix}Bias"]:
+            bias_offsets = _packed_qkv_bias_offsets(model, prefix, f"{prefix.lower()}_local_n")
+            _line(lines, indent + 1, f"acc += tl.load({prefix.lower()}_bias + {bias_offsets}, mask={active} & (offs_n < {_dim(total_n)}), other=0.0).to(tl.float32)[None, :]")
+
+    for prefix in ("Q", "K", "V"):
+        output_shape = model[f"{prefix}OutputShape"]
+        output_strides = model[f"{prefix}OutputStrides"]
+        output_batch_offset = _batch_offset_expression(output_shape, output_strides, len(output_shape) - 2)
+        output_offsets = _packed_qkv_output_offsets(model, prefix, output_batch_offset, f"{prefix.lower()}_local_n[None, :]", "offs_m[:, None]")
+        _line(lines, indent + 1, f"{prefix.lower()}_output_ptrs = {prefix.lower()}_output + {output_offsets}")
+
+    _line(lines, indent + 1, "output_ptrs = tl.where(q_active[None, :], q_output_ptrs, tl.where(k_active[None, :], k_output_ptrs, v_output_ptrs))")
+    _line(lines, indent + 1, f"tl.store(output_ptrs, acc, mask=(offs_m[:, None] < {_dim(m)}) & (offs_n[None, :] < {_dim(total_n)}))")
 
 
 def _emit_packed_qkv_gemv_projection(
@@ -2154,6 +2284,174 @@ def _emit_layer_norm(model: dict[str, Any]) -> str:
     _line(lines, indent + 1, "centered = value0 - mean_value")
     _line(lines, indent + 1, "variance_sum += tl.sum(centered * centered, axis=0)")
     _line(lines, indent, f"inv_std = tl.rsqrt((variance_sum / inner_count) + {model['Epsilon']!r})")
+    _line(lines, indent, "for inner_start in tl.range(0, inner_size, block_size):")
+    _line(lines, indent + 1, "inner_lane = inner_start + tl.arange(0, block_size)")
+    _line(lines, indent + 1, "mask = inner_lane < inner_size")
+    append_inner_decode(lines, indent + 1)
+    _line(lines, indent + 1, f"input_offsets = {input_offset}")
+    _line(lines, indent + 1, f"scale_offsets = {scale_offset}")
+    _line(lines, indent + 1, f"bias_offsets = {bias_offset}")
+    _line(lines, indent + 1, f"output_offsets = {output_offset}")
+    _line(lines, indent + 1, "value0 = tl.load(input0 + input_offsets, mask=mask, other=0.0).to(tl.float32)")
+    _line(lines, indent + 1, "scale_value = tl.load(scale0 + scale_offsets, mask=mask, other=0.0).to(tl.float32)")
+    _line(lines, indent + 1, "bias_value = tl.load(bias0 + bias_offsets, mask=mask, other=0.0).to(tl.float32)")
+    _line(lines, indent + 1, "result = ((value0 - mean_value) * inv_std * scale_value) + bias_value")
+    _line(lines, indent + 1, "tl.store(output + output_offsets, result, mask=mask)")
+    return _finish(lines)
+
+
+def _emit_norm_stats(model: dict[str, Any]) -> str:
+    logical_input_shape = _logical_shape(model["InputShape"], model["InputVectorLaneCount"])
+    rank = len(logical_input_shape)
+    inner_axes = list(range(model["Axis"], rank))
+    outer_axes = list(range(0, model["Axis"]))
+
+    def axis_index(axis: int) -> str:
+        return f"outer_idx{axis}" if axis < model["Axis"] else f"inner_idx{axis}"
+
+    def input_offset() -> str:
+        terms = []
+        for axis in range(rank):
+            if _is_fixed_one(logical_input_shape[axis]):
+                continue
+            terms.append(f"{axis_index(axis)} * {_dim(model['InputStrides'][axis])}")
+        return "inner_lane * 0" if not terms else "inner_lane * 0 + " + " + ".join(terms)
+
+    def stats_offset(component: int) -> str:
+        terms = []
+        if component != 0:
+            terms.append(f"{component} * {_dim(model['OutputStrides'][0])}")
+        for axis in outer_axes:
+            if _is_fixed_one(logical_input_shape[axis]):
+                continue
+            terms.append(f"outer_idx{axis} * {_dim(model['OutputStrides'][axis + 1])}")
+        return "0" if not terms else " + ".join(terms)
+
+    def append_inner_decode(lines: list[str], indent: int) -> None:
+        _line(lines, indent, "inner_remaining = inner_lane")
+        for axis in reversed(inner_axes):
+            _line(lines, indent, f"inner_idx{axis} = inner_remaining % {_dim(logical_input_shape[axis])}")
+            _line(lines, indent, f"inner_remaining = inner_remaining // {_dim(logical_input_shape[axis])}")
+
+    inner_size = _product(logical_input_shape[model["Axis"] :])
+    lines = _standard_header(
+        model,
+        f"# generated from PyNTT Jinja NormStats.py.jinja\n# {model['Comment']}; input_dtype={model['InputDType']}, output_dtype={model['OutputDType']}, input_shape={_shape_tuple(model['InputShape'])}, output_shape={_shape_tuple(model['OutputShape'])}, axis={model['Axis']}",
+        [("input0", "Input"), ("output", "Output")],
+    )
+    indent = 1
+    for axis in outer_axes:
+        _line(lines, indent, f"for outer_idx{axis} in tl.range(0, {_dim(logical_input_shape[axis])}):")
+        indent += 1
+    if model["UseMean"]:
+        _line(lines, indent, "mean_sum = tl.full((), 0.0, tl.float32)")
+    _line(lines, indent, "square_sum = tl.full((), 0.0, tl.float32)")
+    _line(lines, indent, f"inner_size = {inner_size}")
+    _line(lines, indent, "for inner_start in tl.range(0, inner_size, block_size):")
+    _line(lines, indent + 1, "inner_lane = inner_start + tl.arange(0, block_size)")
+    _line(lines, indent + 1, "mask = inner_lane < inner_size")
+    append_inner_decode(lines, indent + 1)
+    _line(lines, indent + 1, f"input_offsets = {input_offset()}")
+    _line(lines, indent + 1, "value0 = tl.load(input0 + input_offsets, mask=mask, other=0.0).to(tl.float32)")
+    if model["UseMean"]:
+        _line(lines, indent + 1, "mean_sum += tl.sum(value0, axis=0)")
+    _line(lines, indent + 1, "square_sum += tl.sum(value0 * value0, axis=0)")
+    if model["UseMean"]:
+        _line(lines, indent, f"tl.store(output + {stats_offset(0)}, mean_sum)")
+        _line(lines, indent, f"tl.store(output + {stats_offset(1)}, square_sum)")
+    else:
+        _line(lines, indent, f"tl.store(output + {stats_offset(0)}, square_sum)")
+    return _finish(lines)
+
+
+def _emit_norm_apply(model: dict[str, Any]) -> str:
+    logical_input_shape = _logical_shape(model["InputShape"], model["InputVectorLaneCount"])
+    logical_input_global_shape = _logical_shape(model["InputGlobalShape"], model["InputVectorLaneCount"])
+    logical_scale_shape = _logical_shape(model["ScaleShape"], model["ScaleVectorLaneCount"])
+    logical_bias_shape = _logical_shape(model["BiasShape"], model["BiasVectorLaneCount"])
+    logical_output_shape = _logical_shape(model["OutputShape"], model["OutputVectorLaneCount"])
+    rank = len(logical_output_shape)
+    inner_axes = list(range(model["Axis"], rank))
+    outer_axes = list(range(0, model["Axis"]))
+
+    def axis_index(axis: int) -> str:
+        return f"outer_idx{axis}" if axis < model["Axis"] else f"inner_idx{axis}"
+
+    def tensor_offset(physical_shape: list[Any], logical_shape: list[Any], strides: list[Any], lane_count: int) -> str:
+        terms = []
+        for axis in range(rank):
+            if _is_fixed_one(logical_shape[axis]):
+                continue
+            index = axis_index(axis)
+            if lane_count > 1 and axis == len(physical_shape) - 1:
+                index = f"(({index}) // {lane_count})"
+            terms.append(f"{index} * {_dim(strides[axis])}")
+        physical_index = "inner_lane * 0" if not terms else "inner_lane * 0 + " + " + ".join(terms)
+        if lane_count == 1:
+            return physical_index
+        lane_index = f"(({axis_index(len(physical_shape) - 1)}) % {lane_count})"
+        return f"(({physical_index}) * {lane_count} + {lane_index})"
+
+    def param_offset(physical_shape: list[Any], logical_shape: list[Any], strides: list[Any], lane_count: int) -> str:
+        terms = []
+        for axis in range(len(logical_shape)):
+            if _is_fixed_one(logical_shape[axis]):
+                continue
+            output_axis = model["Axis"] + axis
+            index = axis_index(output_axis)
+            if lane_count > 1 and axis == len(physical_shape) - 1:
+                index = f"(({index}) // {lane_count})"
+            terms.append(f"{index} * {_dim(strides[axis])}")
+        physical_index = "inner_lane * 0" if not terms else "inner_lane * 0 + " + " + ".join(terms)
+        if lane_count == 1:
+            return physical_index
+        lane_index = f"(({axis_index(model['Axis'] + len(physical_shape) - 1)}) % {lane_count})"
+        return f"(({physical_index}) * {lane_count} + {lane_index})"
+
+    def stats_offset(component: int) -> str:
+        terms = []
+        if component != 0:
+            terms.append(f"{component} * {_dim(model['StatsStrides'][0])}")
+        for axis in outer_axes:
+            if _is_fixed_one(logical_output_shape[axis]):
+                continue
+            terms.append(f"outer_idx{axis} * {_dim(model['StatsStrides'][axis + 1])}")
+        return "0" if not terms else " + ".join(terms)
+
+    def append_inner_decode(lines: list[str], indent: int) -> None:
+        _line(lines, indent, "inner_remaining = inner_lane")
+        for axis in reversed(inner_axes):
+            _line(lines, indent, f"inner_idx{axis} = inner_remaining % {_dim(logical_output_shape[axis])}")
+            _line(lines, indent, f"inner_remaining = inner_remaining // {_dim(logical_output_shape[axis])}")
+
+    inner_size = _product(logical_output_shape[model["Axis"] :])
+    normalization_size = _product(logical_input_global_shape[model["Axis"] :])
+    input_offset = tensor_offset(model["InputShape"], logical_input_shape, model["InputStrides"], model["InputVectorLaneCount"])
+    output_offset = tensor_offset(model["OutputShape"], logical_output_shape, model["OutputStrides"], model["OutputVectorLaneCount"])
+    scale_offset = param_offset(model["ScaleShape"], logical_scale_shape, model["ScaleStrides"], model["ScaleVectorLaneCount"])
+    bias_offset = param_offset(model["BiasShape"], logical_bias_shape, model["BiasStrides"], model["BiasVectorLaneCount"])
+    lines = _standard_header(
+        model,
+        f"# generated from PyNTT Jinja NormApply.py.jinja\n# {model['Comment']}; input_dtype={model['InputDType']}, stats_dtype={model['StatsDType']}, scale_dtype={model['ScaleDType']}, bias_dtype={model['BiasDType']}, output_dtype={model['OutputDType']}, output_shape={_shape_tuple(model['OutputShape'])}, axis={model['Axis']}",
+        [("input0", "Input"), ("stats0", "Stats"), ("scale0", "Scale"), ("bias0", "Bias"), ("output", "Output")],
+    )
+    indent = 1
+    for axis in outer_axes:
+        _line(lines, indent, f"for outer_idx{axis} in tl.range(0, {_dim(logical_output_shape[axis])}):")
+        indent += 1
+    _line(lines, indent, f"inner_size = {inner_size}")
+    _line(lines, indent, f"inner_count = ({normalization_size}) + 0.0")
+    if model["UseMean"]:
+        _line(lines, indent, f"mean_sum = tl.load(stats0 + {stats_offset(0)}).to(tl.float32)")
+        _line(lines, indent, f"square_sum = tl.load(stats0 + {stats_offset(1)}).to(tl.float32)")
+        _line(lines, indent, "mean_value = mean_sum / inner_count")
+        _line(lines, indent, "variance = (square_sum / inner_count) - (mean_value * mean_value)")
+    else:
+        _line(lines, indent, f"square_sum = tl.load(stats0 + {stats_offset(0)}).to(tl.float32)")
+        _line(lines, indent, "mean_value = 0.0")
+        _line(lines, indent, "variance = square_sum / inner_count")
+    _line(lines, indent, "variance = tl.maximum(variance, 0.0)")
+    _line(lines, indent, f"inv_std = tl.rsqrt(variance + {model['Epsilon']!r})")
     _line(lines, indent, "for inner_start in tl.range(0, inner_size, block_size):")
     _line(lines, indent + 1, "inner_lane = inner_start + tl.arange(0, block_size)")
     _line(lines, indent + 1, "mask = inner_lane < inner_size")
@@ -3237,6 +3535,8 @@ _EMITTERS = {
     "LayerNorm": _emit_layer_norm,
     "MatMulGlu": _emit_matmul_glu,
     "Matmul": _emit_matmul,
+    "NormApply": _emit_norm_apply,
+    "NormStats": _emit_norm_stats,
     "Pad": _emit_pad,
     "PagedAttention": _emit_paged_attention,
     "PackedMatMulGlu": _emit_packed_matmul_glu,

@@ -1,6 +1,6 @@
 ---
 name: nncase-developer
-description: nncase compiler development guidance for IR, importers, passes, AutoDistributed, cost model, NTT/PyNTT codegen/runtime, and tests. Use when modifying nncase compiler internals, target backends, sharding/search/cost logic, PyNTT templates, or debugging model integration and performance regressions.
+description: nncase compiler development guidance for IR, importers, passes, AutoDistributed, vectorize/packing, cost model, NTT/PyNTT codegen/runtime, and tests. Use when modifying nncase compiler internals, target backends, sharding/search/cost logic, vectorized or packed ops, PyNTT templates, or debugging model integration and performance regressions.
 ---
 
 # nncase Developer
@@ -27,3 +27,13 @@ Read [references/auto-dist-cost-model.md](references/auto-dist-cost-model.md) be
 - boxing, sharding, placement, hierarchy, or reshard search behavior
 
 The most important boundary is: op cost evaluators report local shard cost only; target/hierarchy cost models aggregate that local cost over the selected placement and hardware model.
+
+## Vectorize And Packing
+
+Read [references/vectorize-packing.md](references/vectorize-packing.md) before changing:
+
+- `Pack`, `Unpack`, `VectorType`, `MaskVectorType`, or vector lane type inference
+- NTT/PyNTT vectorized ops, propagation rules, or AutoPacking rules
+- packed matmul/QKV/GLU layouts, vectorized reduce/norm/rope behavior, or vectorized cost/codegen
+
+The most important boundary is: tensor shape carries semantic dimensions, while vector dtype lanes carry physical packed lanes only. Do not encode semantic fields such as stats components or tuple outputs in vector lanes.

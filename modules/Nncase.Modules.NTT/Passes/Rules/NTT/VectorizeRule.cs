@@ -1704,6 +1704,96 @@ public sealed class VectorizeLayerNorm : VectorizeRule
     }
 }
 
+public sealed class VectorizeNormApply : VectorizeRule
+{
+    public VectorizeNormApply(int rank, int lane)
+        : base(rank, lane)
+    {
+    }
+
+    public override Pattern Pattern { get; } = IsNormApply(
+      "target",
+      _ => true,
+      IsWildcard("input") with { TypePattern = IsFloat() & !IsVector() },
+      IsWildcard("stats") with { TypePattern = IsFloat() & !IsVector() },
+      IsWildcard("scale") with { TypePattern = IsFloat() & !IsVector() },
+      IsWildcard("bias") with { TypePattern = IsFloat() & !IsVector() });
+
+    public static List<Expr> AddCandidate(NormApply op, Expr input, Expr stats, Expr scale, Expr bias, int[] vectorizedAxes, int[] lanes)
+    {
+        var rets = new List<Expr>();
+        var inShape = input.CheckedShape;
+        if (inShape.IsUnranked || inShape.Rank == 0 || vectorizedAxes.Length != 1)
+        {
+            return rets;
+        }
+
+        var normalizedAxis = op.Axis < 0 ? op.Axis + inShape.Rank : op.Axis;
+        if (normalizedAxis < 0 || normalizedAxis >= inShape.Rank)
+        {
+            return rets;
+        }
+
+        var vectorizedAxis = vectorizedAxes[0];
+        if (vectorizedAxis != inShape.Rank - 1 || vectorizedAxis < normalizedAxis)
+        {
+            return rets;
+        }
+
+        var packedInput = IR.F.Tensors.Pack(VectorizeUtility.PadForVectorize(input, inShape, vectorizedAxes, lanes, 0f, out var padedNums), lanes, vectorizedAxes);
+        if (Enumerable.Range(0, vectorizedAxes.Length).Any(i => vectorizedAxes[i] >= normalizedAxis && padedNums[i] != new DimConst(0)))
+        {
+            return rets;
+        }
+
+        var pAxes = vectorizedAxes.Where(i => i >= normalizedAxis).Select(i => i - normalizedAxis).ToArray();
+        var pLanes = Enumerable.Repeat(lanes[0], pAxes.Length).ToArray();
+        var scaleShape = scale.CheckedShape;
+        var vectorizedScale = VectorizeUtility.PadForVectorize(scale, scaleShape, pAxes, pLanes, 0f, out _);
+        if (pAxes.Length > 0)
+        {
+            vectorizedScale = IR.F.Tensors.Pack(vectorizedScale, pLanes, pAxes);
+        }
+
+        var biasShape = bias.CheckedShape;
+        var vectorizedBias = VectorizeUtility.PadForVectorize(bias, biasShape, pAxes, pLanes, 0f, out _);
+        if (pAxes.Length > 0)
+        {
+            vectorizedBias = IR.F.Tensors.Pack(vectorizedBias, pLanes, pAxes);
+        }
+
+        var normApply = IR.F.NN.NormApply(normalizedAxis, op.Epsilon, packedInput, stats, vectorizedScale, vectorizedBias, op.UseMean);
+        if (normApply.CheckedType is not InvalidType)
+        {
+            var post = VectorizeUtility.SliceForVectorize(IR.F.Tensors.Unpack(normApply, lanes, vectorizedAxes), inShape, padedNums);
+            if (post.CheckedType is not InvalidType)
+            {
+                rets.Add(post);
+            }
+        }
+
+        return rets;
+    }
+
+    public override List<Expr> GetReplaceCandidates(IMatchResult result, RunPassContext context)
+    {
+        var rets = new List<Expr>();
+        var op = (IR.NN.NormApply)result["target"];
+        var input = (Expr)result["input"];
+        var stats = (Expr)result["stats"];
+        var scale = (Expr)result["scale"];
+        var bias = (Expr)result["bias"];
+        var laneSize = Lane / input.CheckedDataType.SizeInBytes;
+        if (laneSize <= 1 || input.CheckedShape.IsUnranked || input.CheckedShape.Rank == 0)
+        {
+            return rets;
+        }
+
+        rets.AddRange(AddCandidate(op, input, stats, scale, bias, new[] { input.CheckedShape.Rank - 1 }, new[] { laneSize }));
+        return rets;
+    }
+}
+
 [RuleGenerator]
 public sealed partial class FoldVectorizeDevectorize : RewriteRule<Pattern>
 {

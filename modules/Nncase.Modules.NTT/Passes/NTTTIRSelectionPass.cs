@@ -280,6 +280,10 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
                 return call;
             case IR.NN.GetPositionIds getPositionIds:
                 return TIR.F.NTT.GetPositionIds((Expr)arguments[1], output, (DistributedType)call.CheckedType);
+            case IR.NN.NormStats normStats:
+                return TIR.F.NTT.NormStats((Expr)arguments[0], output, normStats.Axis, normStats.UseMean);
+            case IR.NN.NormApply normApply:
+                return TIR.F.NTT.NormApply((Expr)arguments[0], (Expr)arguments[1], (Expr)arguments[2], (Expr)arguments[3], output, normApply.Axis, normApply.Epsilon, normApply.UseMean);
             case IR.NN.LayerNorm ln:
                 return TIR.F.NTT.VectorizedLayerNorm((Expr)arguments[0], (Expr)arguments[1], (Expr)arguments[2], output, ln.Axis, ln.Epsilon, ln.UseMean, Array.Empty<int>(), Array.Empty<Dimension>());
             case IR.NTT.VectorizedLayerNorm ln:

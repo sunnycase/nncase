@@ -369,6 +369,68 @@ public sealed record PyNTTLayerNormTemplateModel(
     public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
 }
 
+public sealed record PyNTTNormStatsTemplateModel(
+    string FunctionName,
+    PyNTTBufferPointerTemplateModel Input,
+    PyNTTBufferPointerTemplateModel Output,
+    string InputDType,
+    string OutputDType,
+    string InputTritonDType,
+    string OutputTritonDType,
+    PyNTTDimExpression[] InputShape,
+    PyNTTDimExpression[] OutputShape,
+    PyNTTDimExpression[] InputStrides,
+    PyNTTDimExpression[] OutputStrides,
+    int InputVectorLaneCount,
+    int OutputVectorLaneCount,
+    int Axis,
+    bool UseMean,
+    string Comment)
+{
+    public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
+}
+
+public sealed record PyNTTNormApplyTemplateModel(
+    string FunctionName,
+    PyNTTBufferPointerTemplateModel Input,
+    PyNTTBufferPointerTemplateModel Stats,
+    PyNTTBufferPointerTemplateModel Scale,
+    PyNTTBufferPointerTemplateModel Bias,
+    PyNTTBufferPointerTemplateModel Output,
+    string InputDType,
+    string StatsDType,
+    string ScaleDType,
+    string BiasDType,
+    string OutputDType,
+    string InputTritonDType,
+    string StatsTritonDType,
+    string ScaleTritonDType,
+    string BiasTritonDType,
+    string OutputTritonDType,
+    PyNTTDimExpression[] InputShape,
+    PyNTTDimExpression[] InputGlobalShape,
+    PyNTTDimExpression[] StatsShape,
+    PyNTTDimExpression[] ScaleShape,
+    PyNTTDimExpression[] BiasShape,
+    PyNTTDimExpression[] OutputShape,
+    PyNTTDimExpression[] InputStrides,
+    PyNTTDimExpression[] StatsStrides,
+    PyNTTDimExpression[] ScaleStrides,
+    PyNTTDimExpression[] BiasStrides,
+    PyNTTDimExpression[] OutputStrides,
+    int InputVectorLaneCount,
+    int StatsVectorLaneCount,
+    int ScaleVectorLaneCount,
+    int BiasVectorLaneCount,
+    int OutputVectorLaneCount,
+    int Axis,
+    float Epsilon,
+    bool UseMean,
+    string Comment)
+{
+    public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
+}
+
 public sealed record PyNTTGetPositionIdsTemplateModel(
     string FunctionName,
     PyNTTBufferPointerTemplateModel Output,

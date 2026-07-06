@@ -960,6 +960,29 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
             "torch.testing.assert_close(output, torch.softmax(x, dim=1), rtol=1e-5, atol=1e-5)");
     }
 
+    [Fact]
+    public async Task TestPyNTTIRAutoDistributedRmsNormRun()
+    {
+        ConfigureAutoDistributedPyNTT();
+        var x = new Var("x", new TensorType(DataTypes.Float32, new[] { 4, 8 }));
+        var scale = Tensor.From<float>(Enumerable.Range(0, 8).Select(i => 1.0f + (i * 0.01f)).ToArray(), [8]);
+        var bias = Tensor.Zeros<float>([8]);
+        var main = new Function("main", PyNTTTarget.Kind, IR.F.NN.LayerNorm(1, 1e-5f, x, scale, bias, hasMean: false), new[] { x });
+
+        var outputDirectory = await GeneratePyNTTModelDirectoryWithCompilerPipeline("generated_rms_norm_run_model", main);
+        RenderGeneratedKernels(outputDirectory);
+        var generatedKernelsPy = File.ReadAllText(Path.Join(outputDirectory, "generated_kernels.py"));
+        Assert.Contains("generated from PyNTT Jinja NormStats.py.jinja", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("generated from PyNTT Jinja NormApply.py.jinja", generatedKernelsPy, StringComparison.Ordinal);
+        AssertGeneratedModelRuns(
+            outputDirectory,
+            "x = (torch.arange(32, dtype=torch.float32, device='cuda').reshape(4, 8) - 7) * 0.125",
+            "scale = (1.0 + torch.arange(8, dtype=torch.float32, device='cuda') * 0.01)",
+            "expect = x * torch.rsqrt(torch.mean(x * x, dim=1, keepdim=True) + 1e-5) * scale",
+            "output = module(x)",
+            "torch.testing.assert_close(output, expect, rtol=1e-5, atol=1e-5)");
+    }
+
     private void ConfigureAutoDistributedPyNTT()
     {
         CompileOptions.DumpFlags = DumpFlags.PassIR | DumpFlags.Rewrite | DumpFlags.EGraphCost | DumpFlags.CodeGen | DumpFlags.Compile;

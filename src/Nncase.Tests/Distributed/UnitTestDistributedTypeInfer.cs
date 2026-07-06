@@ -158,6 +158,36 @@ public sealed class UnitTestDistributedTypeInfer : TestClassBase
         Assert.Contains("nonlinear", invalid.Reason, System.StringComparison.Ordinal);
     }
 
+    [Fact]
+    public void TestNormStatsProducesPartialAndNormApplyRequiresBroadcastStats()
+    {
+        var placement = new Placement(new[] { 4 }, "b", "b");
+        var inputType = new DistributedType(
+            new TensorType(DataTypes.Float32, new long[] { 2, 8 }),
+            new SBP[] { SBP.B, SBP.S([0]) },
+            placement);
+        var input = new Var("input", inputType);
+        var stats = IR.F.NN.NormStats(1, input, useMean: true);
+
+        var statsType = Assert.IsType<DistributedType>(stats.CheckedType);
+        Assert.Equal(new TensorType(DataTypes.Float32, new long[] { 2, 2, 1 }), statsType.TensorType);
+        Assert.Equal(new SBP[] { SBP.B, SBP.B, SBP.B }, statsType.AxisPolicies.ToArray());
+        Assert.Equal(SBP.P([0], ReduceOp.Sum), statsType.Partial);
+
+        var scale = new Var(
+            "scale",
+            new DistributedType(new TensorType(DataTypes.Float32, new long[] { 8 }), new SBP[] { SBP.S([0]) }, placement));
+        var bias = new Var("bias", scale.CheckedType);
+        var invalidApply = IR.F.NN.NormApply(1, 1e-5f, input, new Var("partial_stats", statsType), scale, bias, useMean: true);
+        Assert.IsType<InvalidType>(invalidApply.CheckedType);
+
+        var broadcastStats = new Var(
+            "broadcast_stats",
+            new DistributedType(statsType.TensorType, statsType.AxisPolicies, statsType.Placement));
+        var apply = IR.F.NN.NormApply(1, 1e-5f, input, broadcastStats, scale, bias, useMean: true);
+        Assert.Equal(inputType, apply.CheckedType);
+    }
+
     [Theory]
     [MemberData(nameof(ReshapeTypeInferData))]
     public void TestReshapeTypeInfer(DistributedType inType, long[] newShape, IRType except)
