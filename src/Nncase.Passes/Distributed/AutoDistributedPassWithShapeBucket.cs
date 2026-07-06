@@ -79,7 +79,7 @@ public sealed partial class AutoDistributedWithShapeBucketPass : FunctionPass
                 }
             }
 
-            var segmentFunctions = new List<(Function SegmentFunction, Dictionary<DimVar, DimVar> DimVars)>();
+            var segmentStates = new SegmentAutoDistributedState[segmentsCount];
             ValidateManualSegmentRanges(segmentsCount);
             for (int segmentIndex = 0; segmentIndex < segmentsCount; segmentIndex++)
             {
@@ -90,9 +90,20 @@ public sealed partial class AutoDistributedWithShapeBucketPass : FunctionPass
                                       dimVar.With(range: newRange))).ToDictionary(kvp => kvp.Key, kvp => kvp.Value, (IEqualityComparer<DimVar>)ReferenceEqualityComparer.Instance);
                 var segmentFunction = new SegmentFunctionCloner(newDimVars).Clone(functionForSegments, Unit.Default)
                     .With(name: $"{function.Name}_segment_{segmentIndex}");
-                var rewriter = new AutoDistributedRewriter(_compileOptions, targetOptions, AutoDistributedPhase.Final, _moduleKind, _bidirectional);
-                using var segmentDumpScope = new DumpScope(segmentFunction.Name);
-                segmentFunctions.Add((rewriter.Rewrite(segmentFunction), newDimVars));
+                segmentStates[segmentIndex] = new SegmentAutoDistributedState(
+                    segmentFunction,
+                    newDimVars,
+                    new AutoDistributedRewriter(_compileOptions, targetOptions, AutoDistributedPhase.Final, _moduleKind, _bidirectional));
+            }
+
+            BuildSegmentSearchGraphs(segmentStates);
+
+            var segmentFunctions = new List<(Function SegmentFunction, Dictionary<DimVar, DimVar> DimVars)>(segmentStates.Length);
+            foreach (var segmentState in segmentStates)
+            {
+                using var segmentDumpScope = new DumpScope(segmentState.SegmentFunction.Name);
+                var rewritten = segmentState.Rewriter.SolveAndExtract(segmentState.SegmentFunction, segmentState.Root);
+                segmentFunctions.Add((rewritten, segmentState.DimVars));
             }
 
             return BuildMainFunction(function, segmentFunctions);
@@ -171,6 +182,50 @@ public sealed partial class AutoDistributedWithShapeBucketPass : FunctionPass
         }
     }
 
+    private void BuildSegmentSearchGraphs(IReadOnlyList<SegmentAutoDistributedState> segmentStates)
+    {
+        var parallelism = GetSegmentGraphBuildParallelism(segmentStates.Count);
+        if (parallelism <= 1)
+        {
+            for (int i = 0; i < segmentStates.Count; i++)
+            {
+                BuildSegmentSearchGraph(segmentStates[i]);
+            }
+
+            return;
+        }
+
+        Parallel.For(
+            0,
+            segmentStates.Count,
+            new ParallelOptions { MaxDegreeOfParallelism = parallelism },
+            index => BuildSegmentSearchGraph(segmentStates[index]));
+    }
+
+    private void BuildSegmentSearchGraph(SegmentAutoDistributedState segmentState)
+    {
+        using var segmentDumpScope = new DumpScope(segmentState.SegmentFunction.Name);
+        segmentState.Root = segmentState.Rewriter.BuildSearchGraph(segmentState.SegmentFunction);
+    }
+
+    private int GetSegmentGraphBuildParallelism(int segmentsCount)
+    {
+        if (segmentsCount <= 1)
+        {
+            return 1;
+        }
+
+        var parallelism = Math.Min(segmentsCount, Math.Max(1, Environment.ProcessorCount / 2));
+        if (Environment.GetEnvironmentVariable("NNCASE_AUTO_DIST_SEGMENT_GRAPH_BUILD_PARALLELISM") is { } value
+            && int.TryParse(value, out var configured)
+            && configured > 0)
+        {
+            parallelism = Math.Min(segmentsCount, configured);
+        }
+
+        return parallelism;
+    }
+
     private PrimFunction BuildMainFunction(Function inputFunction, List<(Function SegmentFunction, Dictionary<DimVar, DimVar> DimVars)> segmentFunctions)
     {
         var outputBuffers = CreateOutputBuffers(inputFunction.Body);
@@ -228,6 +283,27 @@ public sealed partial class AutoDistributedWithShapeBucketPass : FunctionPass
             _ => throw new ArgumentException($"Unsupported type: {type}"),
         };
         return T.CreateBuffer(tensorType, memoryLocation, out _, $"buffer_{_bufferIndex++}", type as DistributedType);
+    }
+
+    private sealed class SegmentAutoDistributedState
+    {
+        public SegmentAutoDistributedState(
+            Function segmentFunction,
+            Dictionary<DimVar, DimVar> dimVars,
+            AutoDistributedRewriter rewriter)
+        {
+            SegmentFunction = segmentFunction;
+            DimVars = dimVars;
+            Rewriter = rewriter;
+        }
+
+        public Function SegmentFunction { get; }
+
+        public Dictionary<DimVar, DimVar> DimVars { get; }
+
+        public AutoDistributedRewriter Rewriter { get; }
+
+        public DistributedSearchGraph Root { get; set; } = null!;
     }
 
     private sealed class DistributeConstCloner : ExprCloner<Unit>

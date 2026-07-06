@@ -77,16 +77,12 @@ internal sealed class InferRangeVisitor : ExprVisitor<ValueRange<double>, Unit>
 
     protected override ValueRange<double> VisitLeafTensorConst(TensorConst expr)
     {
-        // QuantParam
-        if (expr.Value.ElementType is PrimType)
+        if (expr.Value.ElementType is PrimType && TensorRangeUtility.TryGetValueRange(expr.Value, out var range))
         {
-            var value = expr.Value.ToArray<double>();
-            return value.Length == 0 ? new ValueRange<double>(0, 0) : new ValueRange<double>(value.Min(), value.Max());
+            return range;
         }
-        else
-        {
-            return ValueRange<double>.Full;
-        }
+
+        return ValueRange<double>.Full;
     }
 
     protected override ValueRange<double> VisitLeafUnrankedShape(UnrankedShape expr)

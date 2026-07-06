@@ -56,9 +56,9 @@ public sealed class MatMulGluEvaluator : IEvaluator<MatMulGlu>, ITypeInferencer<
             return up;
         }
 
-        if (!SameTensorShape(gate, up))
+        if (!SameProjectionType(gate, up))
         {
-            return new InvalidType($"MatMulGlu gate/up projections must have the same shape, got gate={gate}, up={up}.");
+            return new InvalidType($"MatMulGlu gate/up projections must have the same distributed type, got gate={gate}, up={up}.");
         }
 
         if (RejectPartialProjection("gate", gate) is { } partialCheck)
@@ -294,12 +294,12 @@ public sealed class MatMulGluEvaluator : IEvaluator<MatMulGlu>, ITypeInferencer<
         return null;
     }
 
-    private static bool SameTensorShape(IRType lhs, IRType rhs)
+    private static bool SameProjectionType(IRType lhs, IRType rhs) => (lhs, rhs) switch
     {
-        var lhsTensor = GetTensorType(lhs);
-        var rhsTensor = GetTensorType(rhs);
-        return lhsTensor is not null && rhsTensor is not null && lhsTensor.Shape.Equals(rhsTensor.Shape);
-    }
+        (DistributedType lhsDistributed, DistributedType rhsDistributed) => lhsDistributed.Equals(rhsDistributed),
+        (TensorType lhsTensor, TensorType rhsTensor) => lhsTensor.Equals(rhsTensor),
+        _ => false,
+    };
 
     private static TensorType? GetTensorType(IRType type) => type switch
     {

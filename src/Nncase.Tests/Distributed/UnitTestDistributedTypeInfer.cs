@@ -133,6 +133,46 @@ public sealed class UnitTestDistributedTypeInfer : TestClassBase
     }
 
     [Fact]
+    public void TestMatMulGluRejectsMismatchedProjectionSharding()
+    {
+        var placement = new Placement(new[] { 4, 8 }, "yx", "bb");
+        var input = new Var(
+            "input",
+            new DistributedType(
+                new TensorType(DataTypes.BFloat16, new long[] { 32, 1024 }),
+                new SBP[] { SBP.B, SBP.B },
+                placement));
+        var gateWeight = new Var(
+            "gate_weight",
+            new DistributedType(
+                new TensorType(DataTypes.BFloat16, new long[] { 1024, 3072 }),
+                new SBP[] { SBP.B, SBP.S([0, 1], 96) },
+                placement));
+        var upWeight = new Var(
+            "up_weight",
+            new DistributedType(
+                new TensorType(DataTypes.BFloat16, new long[] { 1024, 3072 }),
+                new SBP[] { SBP.B, SBP.S([1], 384) },
+                placement));
+
+        var expr = IR.F.NN.MatMulGlu(
+            input,
+            gateWeight,
+            upWeight,
+            None.Default,
+            None.Default,
+            None.Default,
+            None.Default,
+            None.Default,
+            None.Default,
+            IR.NN.GluType.SwiGLU,
+            DataTypes.BFloat16);
+
+        var invalid = Assert.IsType<InvalidType>(expr.CheckedType);
+        Assert.Contains("same distributed type", invalid.Reason, System.StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void TestPackedMatMulGluRejectsPartialProjectionSharding()
     {
         var placement = new Placement(new[] { 4 }, "b", "b");
@@ -156,6 +196,47 @@ public sealed class UnitTestDistributedTypeInfer : TestClassBase
 
         var invalid = Assert.IsType<InvalidType>(expr.CheckedType);
         Assert.Contains("nonlinear", invalid.Reason, System.StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void TestPackedMatMulGluRejectsMismatchedProjectionSharding()
+    {
+        var placement = new Placement(new[] { 4, 8 }, "yx", "bb");
+        var packedBFloat16 = new VectorType(DataTypes.BFloat16, [4, 8]);
+        var input = new Var(
+            "input",
+            new DistributedType(
+                new TensorType(DataTypes.BFloat16, new long[] { 32, 1024 }),
+                new SBP[] { SBP.B, SBP.B },
+                placement));
+        var gateWeight = new Var(
+            "gate_weight",
+            new DistributedType(
+                new TensorType(packedBFloat16, new long[] { 96, 1024 }),
+                new SBP[] { SBP.S([0, 1], 3), SBP.B },
+                placement));
+        var upWeight = new Var(
+            "up_weight",
+            new DistributedType(
+                new TensorType(packedBFloat16, new long[] { 96, 1024 }),
+                new SBP[] { SBP.S([1], 12), SBP.B },
+                placement));
+
+        var expr = IR.F.NTT.PackedMatMulGlu(
+            input,
+            gateWeight,
+            upWeight,
+            None.Default,
+            None.Default,
+            None.Default,
+            None.Default,
+            None.Default,
+            None.Default,
+            IR.NN.GluType.SwiGLU,
+            DataTypes.BFloat16);
+
+        var invalid = Assert.IsType<InvalidType>(expr.CheckedType);
+        Assert.Contains("same distributed type", invalid.Reason, System.StringComparison.Ordinal);
     }
 
     [Fact]

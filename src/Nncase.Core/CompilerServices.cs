@@ -237,6 +237,28 @@ public static class CompilerServices
     private static ICompilerServicesProvider Provider => _provider ?? throw new InvalidOperationException("Compiler services provider must be set.");
 
     /// <summary>
+    /// Gets an optional compiler service.
+    /// </summary>
+    /// <typeparam name="T">Service type.</typeparam>
+    /// <returns>Service instance or null.</returns>
+    public static T? GetService<T>()
+        where T : class
+    {
+        return ServiceProvider.GetService<T>();
+    }
+
+    /// <summary>
+    /// Gets a required compiler service.
+    /// </summary>
+    /// <typeparam name="T">Service type.</typeparam>
+    /// <returns>Service instance.</returns>
+    public static T GetRequiredService<T>()
+        where T : notnull
+    {
+        return ServiceProvider.GetRequiredService<T>();
+    }
+
+    /// <summary>
     /// Configure compiler services.
     /// </summary>
     /// <param name="serviceProvider">Root service provider.</param>

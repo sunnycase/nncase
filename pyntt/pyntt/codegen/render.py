@@ -3418,10 +3418,14 @@ def _emit_update_paged_attention_kv_cache(model: dict[str, Any]) -> str:
     def product(values: list[str]) -> str:
         return "1" if not values else " * ".join(f"({value})" for value in values)
 
-    def slot_offset() -> str:
+    def slot_offset(lane_expr: str | None = "source_lane_id") -> str:
         terms = [f"source_idx{axis} * {_dim(model['SlotsStrides'][axis])}" for axis in range(len(model["SlotsStrides"]))]
         element_offset = "linear * 0" if not terms else " + ".join(terms)
-        return element_offset if slots_lane_count == 1 else f"(({element_offset}) * {slots_lane_count} + source_lane_id)"
+        if slots_lane_count == 1:
+            return element_offset
+        if lane_expr is None:
+            return f"(({element_offset}) * {slots_lane_count})"
+        return f"(({element_offset}) * {slots_lane_count} + {lane_expr})"
 
     def global_index_name(axis: int) -> str:
         if axis == model["SeqAxis"]:
@@ -3432,12 +3436,21 @@ def _emit_update_paged_attention_kv_cache(model: dict[str, Any]) -> str:
             return "source_dim_block"
         return f"global_idx{axis}"
 
+    vector_bytes = slots_lane_count * model["ScalarElementSizeBytes"]
+    use_key_vector_copy = (
+        model["CacheKind"] == 0
+        and vectorized_dim == 5
+        and slots_lane_count == lane_count
+        and slots_lane_count > 1
+        and vector_bytes % 8 == 0
+        and cache["HeadDim"] % lane_count == 0
+        and cache.get("TritonDType") == model["SlotsTritonDType"]
+    )
     total_elements = product([
         "num_tokens",
         _dim(model["SlotsGlobalShape"][model["HeadAxis"]]),
         _dim(model["SlotsGlobalShape"][model["DimAxis"]]),
-        str(slots_lane_count),
-    ])
+    ] + ([] if use_key_vector_copy else [str(slots_lane_count)]))
     lines = _helper_header(
         model,
         ("slot_mapping", "kv_cache", "num_blocks_per_shard", "cache_meta"),
@@ -3455,13 +3468,18 @@ def _emit_update_paged_attention_kv_cache(model: dict[str, Any]) -> str:
     _line(lines, 1, f"for linear_start in tl.range(0, {total_elements}, block_size):")
     _line(lines, 2, "linear = linear_start + tl.arange(0, block_size)")
     _line(lines, 2, f"mask = linear < {total_elements}")
-    _line(lines, 2, f"source_lane_id = linear % {slots_lane_count}")
-    _line(lines, 2, f"tmp = linear // {slots_lane_count}")
+    if not use_key_vector_copy:
+        _line(lines, 2, f"source_lane_id = linear % {slots_lane_count}")
+        _line(lines, 2, f"tmp = linear // {slots_lane_count}")
+    else:
+        _line(lines, 2, "tmp = linear")
     _line(lines, 2, f"source_dim_block = tmp % {_dim(model['SlotsGlobalShape'][model['DimAxis']])}")
     _line(lines, 2, f"tmp = tmp // {_dim(model['SlotsGlobalShape'][model['DimAxis']])}")
     _line(lines, 2, f"head_id = tmp % {_dim(model['SlotsGlobalShape'][model['HeadAxis']])}")
     _line(lines, 2, f"token_id = tmp // {_dim(model['SlotsGlobalShape'][model['HeadAxis']])}")
-    if slots_lane_count == 1:
+    if use_key_vector_copy:
+        _line(lines, 2, f"logical_dim = source_dim_block * {slots_lane_count}")
+    elif slots_lane_count == 1:
         _line(lines, 2, "logical_dim = source_dim_block")
     else:
         _line(lines, 2, f"logical_dim = source_dim_block * {slots_lane_count} + source_lane_id")
@@ -3502,9 +3520,15 @@ def _emit_update_paged_attention_kv_cache(model: dict[str, Any]) -> str:
     _line(lines, 2, f"block_id = slot_id // {cache['BlockSize']}")
     _line(lines, 2, f"block_offset = slot_id % {cache['BlockSize']}")
     if vectorized_dim == 5:  # HeadDim
-        _line(lines, 2, f"cache_dim_block = logical_dim // {lane_count}")
+        if use_key_vector_copy:
+            _line(lines, 2, "cache_dim_block = source_dim_block")
+        else:
+            _line(lines, 2, f"cache_dim_block = logical_dim // {lane_count}")
         _line(lines, 2, "cache_block_offset = block_offset")
-        _line(lines, 2, f"cache_lane_id = logical_dim % {lane_count}")
+        if use_key_vector_copy:
+            _line(lines, 2, "cache_lane_id = 0")
+        else:
+            _line(lines, 2, f"cache_lane_id = logical_dim % {lane_count}")
     elif vectorized_dim == 3:  # BlockSize
         _line(lines, 2, "cache_dim_block = logical_dim")
         _line(lines, 2, f"cache_block_offset = block_offset // {lane_count}")
@@ -3514,11 +3538,20 @@ def _emit_update_paged_attention_kv_cache(model: dict[str, Any]) -> str:
         _line(lines, 2, "cache_block_offset = block_offset")
         _line(lines, 2, "cache_lane_id = 0")
     _line(lines, 2, f"source_shard_index = {full_source_shard_index}")
-    _line(lines, 2, f"slot_offsets = {slot_offset()}")
+    _line(lines, 2, f"slot_offsets = {slot_offset(None) if use_key_vector_copy else slot_offset()}")
     _line(lines, 2, f"source_byte_offsets = source_shard_index * {model['SlotsPoolBytes']} + {model['SlotsOffsetBytes']} + slot_offsets * {model['ScalarElementSizeBytes']}")
     _line(lines, 2, f"cache_offsets = {cache_offset}")
-    _line(lines, 2, f"value = tl.load(({model['SlotsBaseName']} + source_byte_offsets).to(tl.pointer_type({model['SlotsTritonDType']})), mask=active, other=0.0)")
-    _line(lines, 2, "tl.store(kv_cache + cache_offsets, value, mask=active)")
+    if use_key_vector_copy:
+        word_count = vector_bytes // 8
+        _line(lines, 2, f"source_words = ({model['SlotsBaseName']} + source_byte_offsets).to(tl.pointer_type(tl.uint64))")
+        _line(lines, 2, "cache_words = (kv_cache + cache_offsets).to(tl.pointer_type(tl.uint64))")
+        for word_index in range(word_count):
+            suffix = "" if word_index == 0 else f" + {word_index}"
+            _line(lines, 2, f"word{word_index} = tl.load(source_words{suffix}, mask=active, other=0)")
+            _line(lines, 2, f"tl.store(cache_words{suffix}, word{word_index}, mask=active)")
+    else:
+        _line(lines, 2, f"value = tl.load(({model['SlotsBaseName']} + source_byte_offsets).to(tl.pointer_type({model['SlotsTritonDType']})), mask=active, other=0.0)")
+        _line(lines, 2, "tl.store(kv_cache + cache_offsets, value, mask=active)")
     return _finish(lines)
 
 

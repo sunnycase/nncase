@@ -339,8 +339,7 @@ public abstract class HuggingFaceModel
             };
 
             qInput = Nncase.IR.F.Tensors.Cast(qInput, DataTypes.Float8E4M3);
-            var transposed_weight = IR.F.Tensors.Transpose(weight, new long[] { 1, 0 }).Evaluate().AsTensor();
-            var qWeights = IR.F.Tensors.Cast(transposed_weight, DataTypes.Float8E4M3);
+            var qWeights = PrepareLinearWeightTensor(weight, DataTypes.Float8E4M3);
             var result = Nncase.IR.F.Math.MatMul(qInput, qWeights, expr.CheckedDataType, deqScaleA * deqScaleB).With(metadata: new IRMetadata() { OutputNames = new[] { layerName } });
 
             // var result = Nncase.IR.F.Math.Binary(Nncase.BinaryOp.Mul, qMatmul, deqScaleA * deqScaleB);
@@ -376,8 +375,7 @@ public abstract class HuggingFaceModel
 
             var qInput = Nncase.IR.F.Math.Binary(Nncase.BinaryOp.Mul, expr, qScaleA);
             qInput = Nncase.IR.F.Tensors.Cast(qInput, DataTypes.Float8E4M3);
-            var transposed_weight = IR.F.Tensors.Transpose(weight, new long[] { 1, 0 }).Evaluate().AsTensor();
-            var qWeights = IR.F.Tensors.Cast(transposed_weight, DataTypes.Float8E4M3);
+            var qWeights = PrepareLinearWeightTensor(weight, DataTypes.Float8E4M3);
             var qMatmul = Nncase.IR.F.Math.MatMul(qInput, qWeights, DataTypes.Float32).With(metadata: new IRMetadata() { OutputNames = new[] { layerName } });
 
             if (deqScaleA.CheckedDataType != qMatmul.CheckedDataType)
@@ -409,8 +407,7 @@ public abstract class HuggingFaceModel
         }
         else
         {
-            var transposed_weight = IR.F.Tensors.Transpose(weight, new long[] { 1, 0 });
-            transposed_weight = IR.F.Tensors.Cast(transposed_weight, expr.CheckedDataType);
+            var transposed_weight = PrepareLinearWeightTensor(weight, expr.CheckedDataType);
             var result = IR.F.Math.MatMul(expr, transposed_weight, expr.CheckedDataType).With(metadata: new IRMetadata() { OutputNames = new[] { layerName } });
             if (bias != null)
             {
@@ -870,10 +867,11 @@ public abstract class HuggingFaceModel
          * self.vocab_size = config.vocab_size
          * self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
          */
-        Expr embedTokensWeight = GetWeight("model.embed_tokens.weight")!;
-        if (ImportOptions.HuggingFaceOptions.TensorType != "default")
+        var embedTokensWeight = GetWeight("model.embed_tokens.weight")!;
+        var requestedTensorType = GetRequestedTensorType();
+        if (requestedTensorType is not null)
         {
-            embedTokensWeight = IR.F.Tensors.Cast(embedTokensWeight, HuggingFaceUtils.Str2Dtype(ImportOptions.HuggingFaceOptions.TensorType)).With(metadata: new IRMetadata() { OutputNames = new[] { "embd cast" } });
+            embedTokensWeight = embedTokensWeight.CastTo(requestedTensorType);
         }
 
         Expr? inputEmbeds;
@@ -890,11 +888,10 @@ public abstract class HuggingFaceModel
                 padding_idx = (long)Config["pad_token_id"];
             }
 
-            inputEmbeds = Embedding(inputIds, embedTokensWeight.Evaluate().AsTensor(), padding_idx);
+            inputEmbeds = Embedding(inputIds, embedTokensWeight, padding_idx);
         }
 
-        // Notice: The type of inputEmbeds is same as safetensors' dtype.
-        // Here, we will cast it to the type defined by `HuggingFaceOptions.TensorType`.
+        // The embedding output dtype follows the prepared embedding weight dtype.
         Expr hiddenStates = inputEmbeds;
 
         var (invFreq, attentionScaling) = ModelUtils.RoPEInit(Context!.Config!);
@@ -987,6 +984,19 @@ public abstract class HuggingFaceModel
         }
     }
 
+    protected static Tensor PrepareLinearWeightTensor(Tensor weight, DataType targetType)
+    {
+        return weight.Transpose([1, 0]).CastTo(targetType);
+    }
+
+    protected DataType? GetRequestedTensorType()
+    {
+        var tensorType = ImportOptions.HuggingFaceOptions.TensorType;
+        return string.IsNullOrWhiteSpace(tensorType) || tensorType == "default"
+            ? null
+            : HuggingFaceUtils.Str2Dtype(tensorType);
+    }
+
     protected virtual Tuple<Call, Call, Call> BuildQKVParallelLinear(int count, Expr hiddenStates, RankedShape hiddenShape)
     {
         var qProjW = GetWeight($"model.layers.{count}.self_attn.q_proj.weight")!;
@@ -1007,13 +1017,10 @@ public abstract class HuggingFaceModel
         Expr PrepareWeight(Tensor weight, Tensor? inputScale, Tensor? weightScale)
         {
             _ = inputScale;
-            var transposedWeight = IR.F.Tensors.Transpose(weight, new long[] { 1, 0 });
-            return weightScale is null
-                ? IR.F.Tensors.Cast(transposedWeight, hiddenStates.CheckedDataType)
-                : IR.F.Tensors.Cast(transposedWeight, DataTypes.Float8E4M3);
+            return PrepareLinearWeightTensor(weight, weightScale is null ? hiddenStates.CheckedDataType : DataTypes.Float8E4M3);
         }
 
-        Expr PrepareBias(Tensor? bias) => bias is null ? None.Default : IR.F.Tensors.Cast(bias, hiddenStates.CheckedDataType);
+        Expr PrepareBias(Tensor? bias) => bias is null ? None.Default : bias.CastTo(hiddenStates.CheckedDataType);
 
         Expr PrepareScale(Tensor? scale) => scale is null ? None.Default : scale;
 
@@ -1057,13 +1064,10 @@ public abstract class HuggingFaceModel
         Expr PrepareWeight(Tensor weight, Tensor? inputScale, Tensor? weightScale)
         {
             _ = inputScale;
-            var transposedWeight = IR.F.Tensors.Transpose(weight, new long[] { 1, 0 });
-            return weightScale is null
-                ? IR.F.Tensors.Cast(transposedWeight, hiddenStates.CheckedDataType)
-                : IR.F.Tensors.Cast(transposedWeight, DataTypes.Float8E4M3);
+            return PrepareLinearWeightTensor(weight, weightScale is null ? hiddenStates.CheckedDataType : DataTypes.Float8E4M3);
         }
 
-        Expr PrepareBias(Tensor? bias) => bias is null ? None.Default : IR.F.Tensors.Cast(bias, hiddenStates.CheckedDataType);
+        Expr PrepareBias(Tensor? bias) => bias is null ? None.Default : bias.CastTo(hiddenStates.CheckedDataType);
 
         Expr PrepareScale(Tensor? scale) => scale is null ? None.Default : scale;
 
