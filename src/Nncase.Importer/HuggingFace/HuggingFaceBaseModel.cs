@@ -27,6 +27,7 @@ public abstract class HuggingFaceModel
     public Dictionary<string, string> WeightToFileMap = new();
     public Dictionary<string, Tensor> LoadedWeights = new();
     public HashSet<string> LoadedFiles = new();
+    private LayerFunctionBuildContext? _layerFunctionBuildContext;
 
     protected ModelInitContext? Context { get; private set; }
 
@@ -37,6 +38,42 @@ public abstract class HuggingFaceModel
     protected ImportOptions ImportOptions => Context?.ImportOptions ?? throw new InvalidOperationException("Model not initialized - ImportOptions is null");
 
     protected CompileSession CompileSession => Context?.CompileSession ?? throw new InvalidOperationException("Model not initialized - CompileSession is null");
+
+    protected virtual bool SupportsDecoderLayerFunctionReuse => true;
+
+    private sealed class LayerFunctionBuildContext
+    {
+        private readonly Dictionary<string, Expr> _parametersByWeight = new();
+
+        public List<IVar> Parameters { get; } = new();
+
+        public List<LayerParameterSpec> ParameterSpecs { get; } = new();
+
+        public Expr GetOrAddParameter(string weightName, Expr templateValue, Func<int, Expr> argumentFactory)
+        {
+            if (_parametersByWeight.TryGetValue(weightName, out var parameter))
+            {
+                return parameter;
+            }
+
+            var varName = $"layer_{SanitizeParameterName(GetLayerWeightSuffix(weightName))}";
+            var var = new Var(varName, templateValue.CheckedType);
+            Parameters.Add(var);
+            ParameterSpecs.Add(new LayerParameterSpec(var, argumentFactory));
+            _parametersByWeight.Add(weightName, var);
+            return var;
+        }
+
+        private static string SanitizeParameterName(string name)
+        {
+            var chars = name.Select(ch => char.IsAsciiLetterOrDigit(ch) ? ch : '_').ToArray();
+            return new string(chars).Trim('_');
+        }
+    }
+
+    private sealed record LayerParameterSpec(IVar Parameter, Func<int, Expr> ArgumentFactory);
+
+    private sealed record DecoderLayerFunction(Function Function, IReadOnlyList<LayerParameterSpec> ParameterSpecs);
 
     public void Initialize(ModelInitContext context, string dir)
     {
@@ -84,6 +121,80 @@ public abstract class HuggingFaceModel
 
         Console.WriteLine($"Weight {weightName} not found after loading {fileName}!");
         throw new InvalidOperationException($"Weight {weightName} could not be loaded from {fileName}");
+    }
+
+    private static string GetLayerWeightName(string templateWeightName, int layerIndex)
+    {
+        const string prefix = "model.layers.";
+        if (!templateWeightName.StartsWith(prefix, StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException($"Layer function parameter must be a per-layer weight, but got {templateWeightName}.");
+        }
+
+        var suffixStart = templateWeightName.IndexOf('.', prefix.Length);
+        if (suffixStart < 0)
+        {
+            throw new InvalidOperationException($"Invalid per-layer weight name: {templateWeightName}.");
+        }
+
+        return $"{prefix}{layerIndex}{templateWeightName[suffixStart..]}";
+    }
+
+    private static string GetLayerWeightSuffix(string weightName)
+    {
+        const string prefix = "model.layers.";
+        if (!weightName.StartsWith(prefix, StringComparison.Ordinal))
+        {
+            return weightName;
+        }
+
+        var suffixStart = weightName.IndexOf('.', prefix.Length);
+        return suffixStart < 0 ? weightName : weightName[(suffixStart + 1)..];
+    }
+
+    private Expr GetLayerWeightExpr(string weightName, Func<Tensor, Expr> prepare)
+    {
+        var tensor = GetWeight(weightName) ?? throw new InvalidOperationException($"Required weight {weightName} is missing.");
+        var templateValue = prepare(tensor);
+        if (_layerFunctionBuildContext is null)
+        {
+            return templateValue;
+        }
+
+        return _layerFunctionBuildContext.GetOrAddParameter(
+            weightName,
+            templateValue,
+            layerIndex =>
+            {
+                var layerWeightName = GetLayerWeightName(weightName, layerIndex);
+                var layerTensor = GetWeight(layerWeightName) ?? throw new InvalidOperationException($"Required weight {layerWeightName} is missing.");
+                return prepare(layerTensor);
+            });
+    }
+
+    private Expr GetOptionalLayerWeightExpr(string weightName, Func<Tensor, Expr> prepare)
+    {
+        var tensor = GetWeight(weightName);
+        if (tensor is null)
+        {
+            return None.Default;
+        }
+
+        var templateValue = prepare(tensor);
+        if (_layerFunctionBuildContext is null)
+        {
+            return templateValue;
+        }
+
+        return _layerFunctionBuildContext.GetOrAddParameter(
+            weightName,
+            templateValue,
+            layerIndex =>
+            {
+                var layerWeightName = GetLayerWeightName(weightName, layerIndex);
+                var layerTensor = GetWeight(layerWeightName);
+                return layerTensor is null ? None.Default : prepare(layerTensor);
+            });
     }
 
     public virtual (IEnumerable<IVar> Inputs, Dictionary<IVar, Dimension[]> VarMap) CreateInputs()
@@ -303,8 +414,9 @@ public abstract class HuggingFaceModel
     public virtual Call LLMLayerNorm(Expr hiddenStates, string layerName)
     {
         var originDtype = hiddenStates.CheckedDataType;
-        var weight = GetWeight($"{layerName}")!.CastTo(originDtype);
-        var bias = Tensor.Zeros(originDtype, weight.Dimensions);
+        var weightTensor = GetWeight($"{layerName}")!;
+        var weight = GetLayerWeightExpr(layerName, tensor => tensor.CastTo(originDtype));
+        var bias = Tensor.Zeros(originDtype, weightTensor.Dimensions);
         int axis = -1;
 
         float eps = 1e-6F;
@@ -418,6 +530,127 @@ public abstract class HuggingFaceModel
         }
     }
 
+    protected virtual Call LinearByName(
+        Expr expr,
+        string weightName,
+        string? biasName = null,
+        string? inputScaleName = null,
+        string? weightScaleName = null,
+        string layerName = "")
+    {
+        var inputScaleTensor = inputScaleName is null ? null : GetWeight(inputScaleName);
+        var weightScaleTensor = weightScaleName is null ? null : GetWeight(weightScaleName);
+        var hasInputScale = inputScaleTensor is not null;
+        var hasWeightScale = weightScaleTensor is not null;
+        var preparedWeightType = hasWeightScale ? DataTypes.Float8E4M3 : expr.CheckedDataType;
+        var weight = GetLayerWeightExpr(weightName, tensor => PrepareLinearWeightTensor(tensor, preparedWeightType));
+        var bias = biasName is null
+            ? None.Default
+            : GetOptionalLayerWeightExpr(biasName, tensor => tensor.CastTo(expr.CheckedDataType));
+        var inputScale = hasInputScale
+            ? GetLayerWeightExpr(inputScaleName!, tensor => tensor)
+            : (Expr)None.Default;
+        var weightScale = hasWeightScale
+            ? GetLayerWeightExpr(weightScaleName!, tensor => tensor)
+            : (Expr)None.Default;
+        return BuildLinear(expr, weight, bias, inputScale, weightScale, hasInputScale, hasWeightScale, layerName);
+    }
+
+    private static Call BuildLinear(
+        Expr expr,
+        Expr weight,
+        Expr bias,
+        Expr inputScale,
+        Expr weightScale,
+        bool hasInputScale,
+        bool hasWeightScale,
+        string layerName)
+    {
+        if (hasInputScale && hasWeightScale)
+        {
+            var qScaleA = Nncase.IR.F.Math.Div(1.0f, inputScale);
+            if (qScaleA.CheckedDataType != expr.CheckedDataType)
+            {
+                qScaleA = Nncase.IR.F.Tensors.Cast(qScaleA, expr.CheckedDataType);
+            }
+
+            var qInput = Nncase.IR.F.Math.Binary(Nncase.BinaryOp.Mul, expr, qScaleA);
+            qInput = Nncase.IR.F.Tensors.Cast(qInput, DataTypes.Float8E4M3);
+            var deqScale = Nncase.IR.F.Math.Binary(Nncase.BinaryOp.Mul, inputScale, weightScale);
+            var result = Nncase.IR.F.Math.MatMul(qInput, weight, expr.CheckedDataType, deqScale).With(metadata: new IRMetadata() { OutputNames = new[] { layerName } });
+
+            if (bias is not None)
+            {
+                result = IR.F.Math.Add(result, bias);
+            }
+
+            return result;
+        }
+        else if (!hasInputScale && hasWeightScale)
+        {
+            var exprType = expr.CheckedDataType;
+            long[] axes = new long[] { expr.CheckedShape.Rank - 1 };
+            var max = Nncase.IR.F.Tensors.ReduceMax(expr, axes, float.MinValue, true);
+            var min = Nncase.IR.F.Tensors.ReduceMin(expr, axes, float.MaxValue, true);
+            var limit = Nncase.IR.F.Math.Max(Nncase.IR.F.Math.Abs(max), Nncase.IR.F.Math.Abs(min));
+            if (limit.CheckedDataType != DataTypes.Float32)
+            {
+                limit = Nncase.IR.F.Tensors.Cast(limit, DataTypes.Float32);
+            }
+
+            var qScaleA = Nncase.IR.F.Math.Div((float)Float8E4M3.MaxNormal, limit);
+            var deqScaleA = Nncase.IR.F.Math.Div(1.0f, qScaleA);
+            var deqScaleB = weightScale;
+
+            if (qScaleA.CheckedDataType != expr.CheckedDataType)
+            {
+                qScaleA = Nncase.IR.F.Tensors.Cast(qScaleA, expr.CheckedDataType);
+            }
+
+            var qInput = Nncase.IR.F.Math.Binary(Nncase.BinaryOp.Mul, expr, qScaleA);
+            qInput = Nncase.IR.F.Tensors.Cast(qInput, DataTypes.Float8E4M3);
+            var qMatmul = Nncase.IR.F.Math.MatMul(qInput, weight, DataTypes.Float32).With(metadata: new IRMetadata() { OutputNames = new[] { layerName } });
+
+            if (deqScaleA.CheckedDataType != qMatmul.CheckedDataType)
+            {
+                deqScaleA = Nncase.IR.F.Tensors.Cast(deqScaleA, qMatmul.CheckedDataType);
+            }
+
+            var result = Nncase.IR.F.Math.Binary(Nncase.BinaryOp.Mul, qMatmul, deqScaleA);
+
+            if (deqScaleB.CheckedShape.Rank == 2)
+            {
+                var dims = Enumerable.Range(0, qMatmul.CheckedShape.Rank).Select(_ => (Dimension)1L).ToArray();
+                dims[^1] = deqScaleB.CheckedShape[0];
+                deqScaleB = IR.F.Tensors.Reshape(deqScaleB, new RankedShape(dims));
+            }
+
+            if (deqScaleB.CheckedDataType != qMatmul.CheckedDataType)
+            {
+                deqScaleB = IR.F.Tensors.Cast(deqScaleB, qMatmul.CheckedDataType);
+            }
+
+            result = Nncase.IR.F.Math.Binary(Nncase.BinaryOp.Mul, result, deqScaleB);
+            result = Nncase.IR.F.Tensors.Cast(result, exprType);
+            if (bias is not None)
+            {
+                result = IR.F.Math.Add(result, bias);
+            }
+
+            return result;
+        }
+        else
+        {
+            var result = IR.F.Math.MatMul(expr, weight, expr.CheckedDataType).With(metadata: new IRMetadata() { OutputNames = new[] { layerName } });
+            if (bias is not None)
+            {
+                result = IR.F.Math.Add(result, bias);
+            }
+
+            return result;
+        }
+    }
+
     public virtual Tuple<Expr, Expr> DecodeLayer(
             int count,
             Expr hiddenStates,
@@ -455,11 +688,12 @@ public abstract class HuggingFaceModel
 
     public virtual Call LLMMlp(int count, Expr hiddenStates)
     {
-        var downProjW = GetWeight($"model.layers.{count}.mlp.down_proj.weight")!;
-        var ifScaleDown = GetWeight($"model.layers.{count}.mlp.down_proj.input_scale");
-        var wScaleDown = GetWeight($"model.layers.{count}.mlp.down_proj.weight_scale");
-
-        return Linear(BuildMatMulGlu(count, hiddenStates), downProjW, null, ifScaleDown, wScaleDown, $"model.layers.{count}.mlp.down_proj");
+        return LinearByName(
+            BuildMatMulGlu(count, hiddenStates),
+            $"model.layers.{count}.mlp.down_proj.weight",
+            inputScaleName: $"model.layers.{count}.mlp.down_proj.input_scale",
+            weightScaleName: $"model.layers.{count}.mlp.down_proj.weight_scale",
+            layerName: $"model.layers.{count}.mlp.down_proj");
     }
 
     public virtual Tuple<Call, Call, Call> QKVCompute(int count, Expr hiddenStates, Dimension seqLen, Dimension headDim)
@@ -848,13 +1082,66 @@ public abstract class HuggingFaceModel
         //     output = seq_len is DimVar ? IR.F.Tensors.Slice(output, new[] { 0 }, new Dimension[] { seq_len }, new[] { 1 }, new[] { 1 }) : output;
         // }
         output = IR.F.Tensors.Reshape(output, new RankedShape(seq_len, -1L));
-        var oProjW = GetWeight($"model.layers.{count}.self_attn.o_proj.weight")!;
-
-        var ifScaleO = GetWeight($"model.layers.{count}.self_attn.o_proj.input_scale");
-        var wScaleO = GetWeight($"model.layers.{count}.self_attn.o_proj.weight_scale");
-
-        output = Linear(output, oProjW, null, ifScaleO, wScaleO, $"model.layers.{count}.self_attn.o_proj");
+        output = LinearByName(
+            output,
+            $"model.layers.{count}.self_attn.o_proj.weight",
+            inputScaleName: $"model.layers.{count}.self_attn.o_proj.input_scale",
+            weightScaleName: $"model.layers.{count}.self_attn.o_proj.weight_scale",
+            layerName: $"model.layers.{count}.self_attn.o_proj");
         return System.Tuple.Create(output, paskKeyValues);
+    }
+
+    private DecoderLayerFunction BuildDecoderLayerFunction(
+        Expr hiddenStates,
+        Expr pastKeyValues,
+        Tuple<Expr, Expr> positionEmbeddings)
+    {
+        var hiddenStatesParam = new Var("hidden_states", hiddenStates.CheckedType);
+        var pastKeyValuesParam = new Var("kv_cache", pastKeyValues.CheckedType);
+        var cosParam = new Var("cos", positionEmbeddings.Item1.CheckedType);
+        var sinParam = new Var("sin", positionEmbeddings.Item2.CheckedType);
+        var context = new LayerFunctionBuildContext();
+        if (_layerFunctionBuildContext is not null)
+        {
+            throw new InvalidOperationException("Nested HuggingFace decoder layer function construction is not supported.");
+        }
+
+        _layerFunctionBuildContext = context;
+        try
+        {
+            var (layerOutput, updatedKvCache) = DecodeLayer(
+                0,
+                hiddenStatesParam,
+                pastKeyValuesParam,
+                System.Tuple.Create<Expr, Expr>(cosParam, sinParam));
+            var body = new IR.Tuple(layerOutput, updatedKvCache);
+            var parameters = new List<IVar> { hiddenStatesParam, pastKeyValuesParam, cosParam, sinParam };
+            parameters.AddRange(context.Parameters);
+            var function = new Function("hf_decoder_layer", CompileSession.Target.Name, body, parameters.ToArray());
+            return new DecoderLayerFunction(function, context.ParameterSpecs.ToArray());
+        }
+        finally
+        {
+            _layerFunctionBuildContext = null;
+        }
+    }
+
+    private static Call CallDecoderLayerFunction(
+        DecoderLayerFunction layerFunction,
+        int layerIndex,
+        Expr hiddenStates,
+        Expr pastKeyValues,
+        Tuple<Expr, Expr> positionEmbeddings)
+    {
+        var arguments = new List<BaseExpr>
+        {
+            hiddenStates,
+            pastKeyValues,
+            positionEmbeddings.Item1,
+            positionEmbeddings.Item2,
+        };
+        arguments.AddRange(layerFunction.ParameterSpecs.Select(spec => (BaseExpr)spec.ArgumentFactory(layerIndex)));
+        return new Call(layerFunction.Function, arguments.ToArray());
     }
 
     public virtual Tuple<Expr, Expr?> LLMModel(
@@ -898,6 +1185,9 @@ public abstract class HuggingFaceModel
         var positionEmbeddings = RotaryEmbedding(hiddenStates, pastKeyValues, invFreq, attentionScaling);
 
         Expr? allHiddenStates = null;
+        var layerFunction = SupportsDecoderLayerFunctionReuse
+            ? BuildDecoderLayerFunction(hiddenStates, pastKeyValues, positionEmbeddings)
+            : null;
 
         for (int i = 0; i < (int)(long)Context!.Config!["num_hidden_layers"]; i++)
         {
@@ -917,13 +1207,27 @@ public abstract class HuggingFaceModel
             // var (hiddenStatesTmp, selfAttenWeights) = DecodeLayer(i, hiddenStates, casualMask, positionIds,
             //     pastKeyValues, outputAttentions,
             //     useCache, cachePosition, positionEmbeddings);
-            var (hiddenStatesTmp, pastKeyValuesTmp) = DecodeLayer(
-                i,
-                hiddenStates,
-                pastKeyValues,
-                positionEmbeddings);
-            pastKeyValues = pastKeyValuesTmp;
-            hiddenStates = hiddenStatesTmp;
+            if (layerFunction is not null)
+            {
+                var layerResult = CallDecoderLayerFunction(
+                    layerFunction,
+                    i,
+                    hiddenStates,
+                    pastKeyValues,
+                    positionEmbeddings);
+                hiddenStates = IR.F.Tensors.GetItem(layerResult, 0);
+                pastKeyValues = IR.F.Tensors.GetItem(layerResult, 1);
+            }
+            else
+            {
+                var (hiddenStatesTmp, pastKeyValuesTmp) = DecodeLayer(
+                    i,
+                    hiddenStates,
+                    pastKeyValues,
+                    positionEmbeddings);
+                pastKeyValues = pastKeyValuesTmp;
+                hiddenStates = hiddenStatesTmp;
+            }
         }
 
         // the last one
@@ -999,47 +1303,45 @@ public abstract class HuggingFaceModel
 
     protected virtual Tuple<Call, Call, Call> BuildQKVParallelLinear(int count, Expr hiddenStates, RankedShape hiddenShape)
     {
-        var qProjW = GetWeight($"model.layers.{count}.self_attn.q_proj.weight")!;
-        var qProjB = GetWeight($"model.layers.{count}.self_attn.q_proj.bias");
+        string qWeightName = $"model.layers.{count}.self_attn.q_proj.weight";
+        string kWeightName = $"model.layers.{count}.self_attn.k_proj.weight";
+        string vWeightName = $"model.layers.{count}.self_attn.v_proj.weight";
+        string qBiasName = $"model.layers.{count}.self_attn.q_proj.bias";
+        string kBiasName = $"model.layers.{count}.self_attn.k_proj.bias";
+        string vBiasName = $"model.layers.{count}.self_attn.v_proj.bias";
+        string qInputScaleName = $"model.layers.{count}.self_attn.q_proj.input_scale";
+        string kInputScaleName = $"model.layers.{count}.self_attn.k_proj.input_scale";
+        string vInputScaleName = $"model.layers.{count}.self_attn.v_proj.input_scale";
+        string qWeightScaleName = $"model.layers.{count}.self_attn.q_proj.weight_scale";
+        string kWeightScaleName = $"model.layers.{count}.self_attn.k_proj.weight_scale";
+        string vWeightScaleName = $"model.layers.{count}.self_attn.v_proj.weight_scale";
 
-        var ifScaleQ = GetWeight($"model.layers.{count}.self_attn.q_proj.input_scale");
-        var wScaleQ = GetWeight($"model.layers.{count}.self_attn.q_proj.weight_scale");
-        var kProjW = GetWeight($"model.layers.{count}.self_attn.k_proj.weight")!;
-        var kProjB = GetWeight($"model.layers.{count}.self_attn.k_proj.bias");
-
-        var ifScaleK = GetWeight($"model.layers.{count}.self_attn.k_proj.input_scale");
-        var wScaleK = GetWeight($"model.layers.{count}.self_attn.k_proj.weight_scale");
-        var vProjW = GetWeight($"model.layers.{count}.self_attn.v_proj.weight")!;
-        var vProjB = GetWeight($"model.layers.{count}.self_attn.v_proj.bias");
-
-        var ifScaleV = GetWeight($"model.layers.{count}.self_attn.v_proj.input_scale");
-        var wScaleV = GetWeight($"model.layers.{count}.self_attn.v_proj.weight_scale");
-        Expr PrepareWeight(Tensor weight, Tensor? inputScale, Tensor? weightScale)
+        Expr PrepareWeight(string weightName, string weightScaleName)
         {
-            _ = inputScale;
-            return PrepareLinearWeightTensor(weight, weightScale is null ? hiddenStates.CheckedDataType : DataTypes.Float8E4M3);
+            var weightScale = GetWeight(weightScaleName);
+            return GetLayerWeightExpr(weightName, weight => PrepareLinearWeightTensor(weight, weightScale is null ? hiddenStates.CheckedDataType : DataTypes.Float8E4M3));
         }
 
-        Expr PrepareBias(Tensor? bias) => bias is null ? None.Default : bias.CastTo(hiddenStates.CheckedDataType);
+        Expr PrepareBias(string biasName) => GetOptionalLayerWeightExpr(biasName, bias => bias.CastTo(hiddenStates.CheckedDataType));
 
-        Expr PrepareScale(Tensor? scale) => scale is null ? None.Default : scale;
+        Expr PrepareScale(string scaleName) => GetOptionalLayerWeightExpr(scaleName, scale => scale);
 
         var numHeads = (long)Config["num_attention_heads"];
         var numKvHeads = (long)Config["num_key_value_heads"];
         var qkvStates = IR.F.NN.QKVParallelLinear(
             hiddenStates,
-            PrepareWeight(qProjW, ifScaleQ, wScaleQ),
-            PrepareWeight(kProjW, ifScaleK, wScaleK),
-            PrepareWeight(vProjW, ifScaleV, wScaleV),
-            PrepareBias(qProjB),
-            PrepareBias(kProjB),
-            PrepareBias(vProjB),
-            PrepareScale(ifScaleQ),
-            PrepareScale(ifScaleK),
-            PrepareScale(ifScaleV),
-            PrepareScale(wScaleQ),
-            PrepareScale(wScaleK),
-            PrepareScale(wScaleV),
+            PrepareWeight(qWeightName, qWeightScaleName),
+            PrepareWeight(kWeightName, kWeightScaleName),
+            PrepareWeight(vWeightName, vWeightScaleName),
+            PrepareBias(qBiasName),
+            PrepareBias(kBiasName),
+            PrepareBias(vBiasName),
+            PrepareScale(qInputScaleName),
+            PrepareScale(kInputScaleName),
+            PrepareScale(vInputScaleName),
+            PrepareScale(qWeightScaleName),
+            PrepareScale(kWeightScaleName),
+            PrepareScale(vWeightScaleName),
             numHeads,
             numKvHeads,
             hiddenStates.CheckedDataType)
@@ -1052,35 +1354,35 @@ public abstract class HuggingFaceModel
 
     protected virtual Call BuildMatMulGlu(int count, Expr hiddenStates)
     {
-        var gateProjW = GetWeight($"model.layers.{count}.mlp.gate_proj.weight")!;
-        var gateProjB = GetWeight($"model.layers.{count}.mlp.gate_proj.bias");
-        var upProjW = GetWeight($"model.layers.{count}.mlp.up_proj.weight")!;
-        var upProjB = GetWeight($"model.layers.{count}.mlp.up_proj.bias");
-        var ifScaleGate = GetWeight($"model.layers.{count}.mlp.gate_proj.input_scale");
-        var wScaleGate = GetWeight($"model.layers.{count}.mlp.gate_proj.weight_scale");
-        var ifScaleUp = GetWeight($"model.layers.{count}.mlp.up_proj.input_scale");
-        var wScaleUp = GetWeight($"model.layers.{count}.mlp.up_proj.weight_scale");
+        string gateWeightName = $"model.layers.{count}.mlp.gate_proj.weight";
+        string upWeightName = $"model.layers.{count}.mlp.up_proj.weight";
+        string gateBiasName = $"model.layers.{count}.mlp.gate_proj.bias";
+        string upBiasName = $"model.layers.{count}.mlp.up_proj.bias";
+        string gateInputScaleName = $"model.layers.{count}.mlp.gate_proj.input_scale";
+        string upInputScaleName = $"model.layers.{count}.mlp.up_proj.input_scale";
+        string gateWeightScaleName = $"model.layers.{count}.mlp.gate_proj.weight_scale";
+        string upWeightScaleName = $"model.layers.{count}.mlp.up_proj.weight_scale";
 
-        Expr PrepareWeight(Tensor weight, Tensor? inputScale, Tensor? weightScale)
+        Expr PrepareWeight(string weightName, string weightScaleName)
         {
-            _ = inputScale;
-            return PrepareLinearWeightTensor(weight, weightScale is null ? hiddenStates.CheckedDataType : DataTypes.Float8E4M3);
+            var weightScale = GetWeight(weightScaleName);
+            return GetLayerWeightExpr(weightName, weight => PrepareLinearWeightTensor(weight, weightScale is null ? hiddenStates.CheckedDataType : DataTypes.Float8E4M3));
         }
 
-        Expr PrepareBias(Tensor? bias) => bias is null ? None.Default : bias.CastTo(hiddenStates.CheckedDataType);
+        Expr PrepareBias(string biasName) => GetOptionalLayerWeightExpr(biasName, bias => bias.CastTo(hiddenStates.CheckedDataType));
 
-        Expr PrepareScale(Tensor? scale) => scale is null ? None.Default : scale;
+        Expr PrepareScale(string scaleName) => GetOptionalLayerWeightExpr(scaleName, scale => scale);
 
         return IR.F.NN.MatMulGlu(
             hiddenStates,
-            PrepareWeight(gateProjW, ifScaleGate, wScaleGate),
-            PrepareWeight(upProjW, ifScaleUp, wScaleUp),
-            PrepareBias(gateProjB),
-            PrepareBias(upProjB),
-            PrepareScale(ifScaleGate),
-            PrepareScale(ifScaleUp),
-            PrepareScale(wScaleGate),
-            PrepareScale(wScaleUp),
+            PrepareWeight(gateWeightName, gateWeightScaleName),
+            PrepareWeight(upWeightName, upWeightScaleName),
+            PrepareBias(gateBiasName),
+            PrepareBias(upBiasName),
+            PrepareScale(gateInputScaleName),
+            PrepareScale(upInputScaleName),
+            PrepareScale(gateWeightScaleName),
+            PrepareScale(upWeightScaleName),
             GetMlpGluType(),
             hiddenStates.CheckedDataType)
             .With(metadata: new IRMetadata() { OutputNames = new[] { $"model.layers.{count}.mlp.gate_up_proj" } });

@@ -245,9 +245,17 @@ internal sealed partial class TypeInferenceVisitor : ExprVisitor<IRType, Unit>
         var returnType = ((CallableType)expr.Target.CheckedType).ReturnType;
         var type = expr.ReturnOutput
             ? new CallableType(returnType, new(expr.ParameterTypes.ToImmutableArray()))
-            : new CallableType(TupleType.Void, new(expr.ParameterTypes.Append(returnType).ToImmutableArray()));
+            : new CallableType(TupleType.Void, new(expr.ParameterTypes.Concat(FlattenOutputParameterTypes(returnType)).ToImmutableArray()));
         return type;
     }
+
+    private static IEnumerable<IRType> FlattenOutputParameterTypes(IRType type)
+        => type switch
+        {
+            TupleType tupleType when tupleType == TupleType.Void => Array.Empty<IRType>(),
+            TupleType tupleType => tupleType.ToArray(),
+            _ => new[] { type },
+        };
 
     protected override IRType VisitLeafGrid(Grid expr)
     {
@@ -336,6 +344,13 @@ internal sealed partial class TypeInferenceVisitor : ExprVisitor<IRType, Unit>
 
     /// <inheritdoc/>
     protected override IRType VisitLeafVar(Var expr)
+    {
+        var type = expr.TypeAnnotation;
+        return type;
+    }
+
+    /// <inheritdoc/>
+    protected override IRType VisitLeafBufferVar(BufferVar expr)
     {
         var type = expr.TypeAnnotation;
         return type;

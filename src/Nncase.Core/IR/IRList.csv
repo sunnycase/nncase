@@ -15,6 +15,7 @@ TupleConst,true,false,Const,,
 PhysicalBuffer,true,false,Default,TIR.,Start;Size;
 MemSpan,true,false,Default,TIR.,Buffer,Start;Size;
 Var,true,false,Default,,
+BufferVar,true,false,Default,TIR.,
 Block,true,false,Default,TIR.,Body;InitBody;@IterVars;@Reads;@Writes;@AllocBuffers;Predicate
 Buffer,true,false,Default,TIR.,MemSpan;@Dimensions;@Strides;!DistributedType
 BufferRegion,true,false,Default,TIR.,Buffer;@Region

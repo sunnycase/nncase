@@ -135,7 +135,7 @@ public sealed partial class NormAxisLayernorm : RewriteRule<CallPattern>
         IsWildcard("scale") with { TypePattern = HasRankedShape() },
         IsWildcard("bias") with { TypePattern = HasRankedShape() });
 
-    private Expr? GetReplace(Expr input, Call call, LayerNorm ln, TensorConst scale, TensorConst bias)
+    private Expr? GetReplace(Expr input, Call call, LayerNorm ln, Expr scale, Expr bias)
     {
         if (ln.Axis < 0)
         {

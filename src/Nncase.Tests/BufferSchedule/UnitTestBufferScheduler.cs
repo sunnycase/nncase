@@ -104,11 +104,11 @@ public sealed class UnitTestBufferScheduler : TestClassBase
         var passManager = CompileSession.CreatePassManager("pmgr");
         passManager.Add<NTTTIRSelectionPass>();
         passManager.Add<AddFunctionToModule>();
+        passManager.Add<RemoveFunctionWrapperPass>();
 
         // todo add auto fusion merge pass here.
         passManager.Add<PrimFuncPass>().Configure(p =>
         {
-            p.Add<Passes.Mutators.RemoveFunctionWrapper>();
             p.Add<Passes.Mutators.UnFoldBlock>();
             p.Add<Passes.Mutators.FlattenSequential>();
             p.Add<Passes.Mutators.TailLoopStripping>();

@@ -4,7 +4,10 @@
 using System.Globalization;
 using System.Reactive;
 using System.Text;
+using System.Text.Json;
+using System.Text.Json.Nodes;
 using System.Text.Json.Serialization;
+using System.Text.RegularExpressions;
 using Nncase.IR;
 using Nncase.IR.Distributed;
 using Nncase.IR.NN;
@@ -18,6 +21,7 @@ namespace Nncase.CodeGen.PyNTT;
 internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
 {
     private static readonly long[] ElementwiseBlockSizeSearchSpace = { 128, 256, 512, 1024 };
+    private static readonly Regex InputReferenceRegex = new(@"\binput(?<index>\d+)\b", RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
     private readonly List<GeneratedKernelMetadata> _generatedKernels = new();
     private readonly List<KernelRenderSpec> _renderKernels = new();
@@ -34,47 +38,175 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
         return new(_generatedKernels.ToArray(), _renderKernels.ToArray(), string.Empty);
     }
 
-    protected override Unit VisitFunction(Function expr) => default;
+    protected override Unit VisitFunction(Function expr)
+        => throw new NotSupportedException($"PyNTT kernel codegen expects lowered PrimFunction inputs, got Function {expr.Name}.");
 
-    protected override Unit VisitFusion(Fusion expr) => default;
+    protected override Unit VisitFusion(Fusion expr)
+        => throw new NotSupportedException($"PyNTT kernel codegen expects lowered PrimFunction inputs, got Fusion {expr.Name}.");
+
+    protected override Unit VisitPrimFunctionWrapper(PrimFunctionWrapper expr)
+        => throw new NotSupportedException($"PyNTT kernel codegen expects direct PrimFunction inputs, got PrimFunctionWrapper {expr.Name}.");
+
+    protected override Unit VisitFunctionWrapper(FunctionWrapper expr)
+        => throw new NotSupportedException($"PyNTT kernel codegen expects direct PrimFunction inputs, got FunctionWrapper {expr.Name}.");
 
     protected override Unit VisitPrimFunction(PrimFunction expr)
     {
-        if (ContainsPrimFunctionCall(expr.Body))
-        {
-            return default;
-        }
-
         var outputs = GetOutputInfos(expr);
-        if (outputs.Length == 0)
-        {
-            outputs = GetTensorStoreOutputInfos(expr);
-        }
-
         if (outputs.Length == 0)
         {
             throw new NotSupportedException($"PyNTT PrimFunction {expr.Name} does not have tensor outputs.");
         }
 
-        var parameterNames = expr.Parameters.ToArray()
-            .ToDictionary(parameter => parameter, parameter => parameter.Name);
-        var lowered = new PyNTTPrimFunctionSourceVisitor(expr, parameterNames, outputs, _targetOptions, _sharedHelperRegistry).Build();
-        _generatedKernels.Add(lowered.Metadata);
-        _renderKernels.Add(lowered.RenderSpec);
+        if (ContainsFunctionCall(expr.Body))
+        {
+            VisitSegmentedPrimFunction(expr, outputs);
+            return default;
+        }
 
+        AddPrimFunctionKernel(expr, expr.Body, outputs, dispatchSegmentIndex: null, allowPartialOutputs: false);
         return default;
     }
 
-    private static bool ContainsPrimFunctionCall(BaseExpr expr)
+    private void VisitSegmentedPrimFunction(PrimFunction function, OutputInfo[] outputs)
     {
-        if (expr is Call { Target: PrimFunction })
+        if (function.Body is not Sequential sequential)
+        {
+            if (ContainsKernelWork(function.Body))
+            {
+                throw new NotSupportedException($"PyNTT PrimFunction {function.Name} contains nested function calls in a non-sequential body. Split it before PyNTT codegen.");
+            }
+
+            return;
+        }
+
+        var segmentIndex = 0;
+        var segment = new List<BaseExpr>();
+        foreach (var field in sequential.Fields)
+        {
+            if (field is Function or Fusion or FunctionWrapper or PrimFunctionWrapper)
+            {
+                throw new NotSupportedException($"PyNTT PrimFunction {function.Name} body contains {field.GetType().Name}. TIR selection and RemoveFunctionWrapperPass must run before PyNTT codegen.");
+            }
+
+            if (field is BaseFunction)
+            {
+                continue;
+            }
+
+            if (field is IfThenElse)
+            {
+                AddDispatchSegmentKernel(function, segment, outputs, segmentIndex);
+                segment.Clear();
+                if (ContainsKernelWork(field))
+                {
+                    throw new NotSupportedException($"PyNTT PrimFunction {function.Name} contains non-function work inside dispatch control flow. Split the branch work before PyNTT codegen.");
+                }
+
+                segmentIndex++;
+                continue;
+            }
+
+            if (IsFunctionCall(field))
+            {
+                AddDispatchSegmentKernel(function, segment, outputs, segmentIndex);
+                segment.Clear();
+                segmentIndex++;
+                continue;
+            }
+
+            segment.Add(field);
+        }
+
+        AddDispatchSegmentKernel(function, segment, outputs, segmentIndex);
+    }
+
+    private void AddDispatchSegmentKernel(PrimFunction function, IReadOnlyList<BaseExpr> fields, OutputInfo[] outputs, int segmentIndex)
+    {
+        if (fields.Count == 0)
+        {
+            return;
+        }
+
+        if (!fields.Any(ContainsKernelWork))
+        {
+            return;
+        }
+
+        var bodyFields = fields.Select((field, index) => field as Expr ??
+            throw new NotSupportedException($"PyNTT dispatch segment {function.Name}[{segmentIndex}] field {index} must be an Expr, got {field.GetType().Name}.")).ToArray();
+        var body = new Sequential(bodyFields);
+        var generated = BuildPrimFunctionKernel(function, body, outputs, $"dispatch_{segmentIndex}", allowPartialOutputs: true, new Dictionary<string, object>
+        {
+            ["dispatch_segment_index"] = segmentIndex,
+            ["workspace_scope"] = function.Name,
+        });
+        if (string.IsNullOrWhiteSpace(generated.RenderSpec.BodySource)
+            && generated.RenderSpec.Helpers.Count == 0
+            && !generated.Metadata.Attrs.ContainsKey("output_aliases")
+            && !generated.Metadata.Attrs.ContainsKey("runtime_output_aliases"))
+        {
+            return;
+        }
+
+        AddPrimFunctionKernel(generated);
+    }
+
+    private void AddPrimFunctionKernel(PrimFunction function, BaseExpr body, OutputInfo[] outputs, int? dispatchSegmentIndex, bool allowPartialOutputs)
+    {
+        Dictionary<string, object>? extraAttrs = null;
+        string? namePart = null;
+        if (dispatchSegmentIndex.HasValue)
+        {
+            namePart = $"dispatch_{dispatchSegmentIndex.Value}";
+            extraAttrs = new()
+            {
+                ["dispatch_segment_index"] = dispatchSegmentIndex.Value,
+                ["workspace_scope"] = function.Name,
+            };
+        }
+
+        AddPrimFunctionKernel(BuildPrimFunctionKernel(function, body, outputs, namePart, allowPartialOutputs, extraAttrs));
+    }
+
+    private GeneratedPrimFunctionKernel BuildPrimFunctionKernel(PrimFunction function, BaseExpr body, OutputInfo[] outputs, string? namePart, bool allowPartialOutputs, Dictionary<string, object>? extraAttrs)
+    {
+        var parameterNames = function.Parameters.ToArray()
+            .ToDictionary(parameter => parameter, parameter => parameter.Name);
+        return new PyNTTPrimFunctionSourceVisitor(function, body, parameterNames, outputs, _targetOptions, _sharedHelperRegistry, namePart, allowPartialOutputs, extraAttrs).Build();
+    }
+
+    private void AddPrimFunctionKernel(GeneratedPrimFunctionKernel kernel)
+    {
+        _generatedKernels.Add(kernel.Metadata);
+        _renderKernels.Add(kernel.RenderSpec);
+    }
+
+    private static bool ContainsFunctionCall(BaseExpr expr)
+    {
+        if (IsFunctionCall(expr))
         {
             return true;
         }
 
+        if (expr is PrimFunction primFunction)
+        {
+            return ContainsFunctionCall(primFunction.Body);
+        }
+
+        if (expr is Function or Fusion or FunctionWrapper or PrimFunctionWrapper)
+        {
+            throw new NotSupportedException($"PyNTT kernel codegen expects lowered PrimFunction bodies only, but found {expr.GetType().Name}. TIR selection and RemoveFunctionWrapperPass must run before PyNTT codegen.");
+        }
+
+        if (expr is BaseFunction)
+        {
+            return false;
+        }
+
         foreach (var operand in expr.Operands)
         {
-            if (ContainsPrimFunctionCall(operand))
+            if (ContainsFunctionCall(operand))
             {
                 return true;
             }
@@ -82,6 +214,46 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
 
         return false;
     }
+
+    private static bool ContainsKernelWork(BaseExpr expr)
+    {
+        if (expr is Call call)
+        {
+            return call.Target is not BaseFunction;
+        }
+
+        if (expr is PrimFunction primFunction)
+        {
+            return ContainsKernelWork(primFunction.Body);
+        }
+
+        if (expr is Function or Fusion or FunctionWrapper or PrimFunctionWrapper)
+        {
+            throw new NotSupportedException($"PyNTT kernel codegen expects lowered PrimFunction bodies only, but found {expr.GetType().Name}. TIR selection and RemoveFunctionWrapperPass must run before PyNTT codegen.");
+        }
+
+        if (expr is BaseFunction or Nop or TIR.Buffer or Const or IVar or Dimension or Shape or Padding or Paddings or None)
+        {
+            return false;
+        }
+
+        if (expr is IfThenElse ifThenElse)
+        {
+            return ContainsKernelWork(ifThenElse.Then) || ContainsKernelWork(ifThenElse.Else);
+        }
+
+        foreach (var operand in expr.Operands)
+        {
+            if (ContainsKernelWork(operand))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static bool IsFunctionCall(BaseExpr expr) => expr is Call { Target: BaseFunction };
 
 #pragma warning disable SA1201
     private sealed class PyNTTPrimFunctionSourceVisitor : ExprFunctor<Unit, Unit>
@@ -94,13 +266,26 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
 
         private const string ShardCoordDimPrefix = "__shard_coord_";
 
-        private static readonly string[] WorkspaceParameterNames = { "data", "rdata", "chip_local_rdata", "block_local_rdata", "block_local_data" };
+        private static readonly string[] WorkspaceParameterNames =
+        {
+            "data",
+            "rdata",
+            "chip_local_rdata",
+            "block_local_rdata",
+            "block_local_data",
+            "data_pool_stride_bytes",
+            "block_local_data_pool_stride_bytes",
+        };
 
         private readonly PrimFunction _function;
+        private readonly BaseExpr _bodyExpr;
         private readonly IReadOnlyDictionary<IVar, string> _parameterNames;
         private readonly OutputInfo[] _outputs;
         private readonly DistributedType?[] _outputDistributedTypes;
         private readonly PyNTTTargetOptions _targetOptions;
+        private readonly string? _namePart;
+        private readonly bool _allowPartialOutputs;
+        private readonly Dictionary<string, object>? _extraAttrs;
         private readonly StringBuilder _body = new();
         private readonly List<HelperTemplateRenderSpec> _helpers = new();
         private readonly List<string> _inputNames = new();
@@ -110,7 +295,6 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
         private readonly SortedSet<string> _runtimeScalarNames = new(StringComparer.Ordinal);
         private readonly Dictionary<string, int> _helperCounters = new();
         private readonly Dictionary<string, object> _attrs = new();
-        private readonly Dictionary<TIR.Buffer, int> _returnOutputBufferIndices = new(ReferenceEqualityComparer.Instance);
         private readonly Dictionary<TIR.Buffer, int> _bufferInputIndices = new(ReferenceEqualityComparer.Instance);
         private readonly HashSet<int> _storedOutputIndices = new();
         private readonly Dictionary<int, int> _outputAliases = new();
@@ -118,21 +302,28 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
         private readonly PyNTTDimExpressionEmitter _dimEmitter;
         private readonly PyNTTDimExpressionEmitter _localRegionDimEmitter;
         private long _collectiveDataPoolBytes;
-        private int _nextStoreIndex;
         private int _bodyIndent;
 
         public PyNTTPrimFunctionSourceVisitor(
             PrimFunction function,
+            BaseExpr bodyExpr,
             IReadOnlyDictionary<IVar, string> parameterNames,
             OutputInfo[] outputs,
             PyNTTTargetOptions targetOptions,
-            SharedHelperRegistry sharedHelperRegistry)
+            SharedHelperRegistry sharedHelperRegistry,
+            string? namePart,
+            bool allowPartialOutputs,
+            Dictionary<string, object>? extraAttrs)
         {
             _function = function;
+            _bodyExpr = bodyExpr;
             _parameterNames = parameterNames;
             _outputs = outputs;
             _outputDistributedTypes = new DistributedType?[outputs.Length];
             _targetOptions = targetOptions;
+            _namePart = namePart;
+            _allowPartialOutputs = allowPartialOutputs;
+            _extraAttrs = extraAttrs;
             _sharedHelperRegistry = sharedHelperRegistry;
             _dimEmitter = new(RegisterRuntimeScalar, threadIdExpression: BuildThreadIdExpression(targetOptions));
             _localRegionDimEmitter = new(RegisterLocalRegionRuntimeScalar, FormatLocalRegionRuntimeScalar, threadIdExpression: BuildThreadIdExpression(targetOptions));
@@ -140,10 +331,11 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
 
         public GeneratedPrimFunctionKernel Build()
         {
-            AnalyzeReturnValues(_function.Body);
-            Visit(_function.Body);
+            Visit(_bodyExpr);
+            var bodySource = _body.ToString().TrimEnd();
+            var inputLayout = BuildKernelInputLayout(bodySource);
             var materializedOutputIndices = _storedOutputIndices.Concat(_outputAliases.Keys).ToHashSet();
-            if (materializedOutputIndices.Count != _outputs.Length)
+            if (!_allowPartialOutputs && materializedOutputIndices.Count != _outputs.Length)
             {
                 var missingOutputs = _outputs
                     .Select((output, index) => (output.Name, Index: index))
@@ -169,9 +361,47 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 _attrs["ops"] = _opKinds.ToArray();
             }
 
-            if (_outputAliases.Count > 0)
+            if (_extraAttrs is not null)
             {
-                _attrs["output_aliases"] = new Dictionary<int, int>(_outputAliases);
+                foreach (var pair in _extraAttrs)
+                {
+                    _attrs[pair.Key] = pair.Value;
+                }
+            }
+
+            var kernelOutputIndexes = outputs
+                .Select((output, index) => (output, index))
+                .Where(item => materializedOutputIndices.Contains(item.index) && !IsObjectDataType(item.output.DType))
+                .ToArray();
+            var kernelOutputs = kernelOutputIndexes.Select(item => item.output).ToArray();
+            var kernelOutputIndexByFunctionIndex = kernelOutputIndexes
+                .Select((item, kernelIndex) => (item.index, kernelIndex))
+                .ToDictionary(item => item.index, item => item.kernelIndex);
+            var kernelOutputAliases = new Dictionary<int, int>();
+            var runtimeOutputAliases = new Dictionary<string, string>(StringComparer.Ordinal);
+            foreach (var pair in _outputAliases)
+            {
+                var sourceInputName = GetInputName(pair.Value, $"PyNTT output alias {outputs[pair.Key].Name}");
+                runtimeOutputAliases[outputs[pair.Key].Name] = sourceInputName;
+                if (kernelOutputIndexByFunctionIndex.TryGetValue(pair.Key, out var kernelOutputIndex))
+                {
+                    if (!inputLayout.IndexMap.TryGetValue(pair.Value, out var kernelInputIndex))
+                    {
+                        throw new NotSupportedException($"PyNTT output {outputs[pair.Key].Name} aliases object input {sourceInputName}, which cannot be passed to a Triton kernel.");
+                    }
+
+                    kernelOutputAliases[kernelOutputIndex] = kernelInputIndex;
+                }
+            }
+
+            if (kernelOutputAliases.Count > 0)
+            {
+                _attrs["output_aliases"] = kernelOutputAliases;
+            }
+
+            if (runtimeOutputAliases.Count > 0)
+            {
+                _attrs["runtime_output_aliases"] = runtimeOutputAliases;
             }
 
             if (_runtimeScalarNames.Count > 0)
@@ -194,14 +424,15 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 _attrs["pure_alias"] = true;
             }
 
+            var kernelBaseName = _namePart is null ? _function.Name : $"{_function.Name}_{_namePart}";
             var metadata = new GeneratedKernelMetadata(
-                SanitizePythonIdentifier($"{_function.Name}_{opKind}_0"),
+                SanitizePythonIdentifier($"{kernelBaseName}_{opKind}_0"),
                 opKind,
-                _inputNames.ToArray(),
-                outputs.Select(output => output.Name).ToArray(),
+                inputLayout.Names,
+                kernelOutputs.Select(output => output.Name).ToArray(),
                 _attrs,
                 BuildLaunchMetadata(
-                    outputs[0],
+                    kernelOutputs.Length > 0 ? kernelOutputs[0] : outputs[0],
                     _targetOptions,
                     new()
                     {
@@ -216,11 +447,10 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                         ["block_local_rdata_pool_bytes"] = GetPoolSizeBytes(_function.SchedResult.BlockLocalRdatas),
                         ["block_local_rdata_stride_bytes"] = PyNTTRDataUtility.GetLocalRDataTableStrideBytes(_function.SchedResult.BlockLocalRdatas, _targetOptions, "b"),
                     }));
-            var bodySource = _body.ToString().TrimEnd();
             var renderSpec = new KernelRenderSpec(
                 metadata,
-                _helpers.ToArray(),
-                bodySource);
+                inputLayout.Helpers,
+                inputLayout.BodySource);
             return new(metadata, renderSpec);
         }
 
@@ -238,6 +468,16 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
         {
             foreach (var field in expr.Fields)
             {
+                if (field is Function or Fusion or FunctionWrapper or PrimFunctionWrapper)
+                {
+                    throw new NotSupportedException($"PyNTT kernel codegen expects lowered PrimFunction bodies only, but found {field.GetType().Name}. TIR selection and RemoveFunctionWrapperPass must run before PyNTT codegen.");
+                }
+
+                if (field is BaseFunction)
+                {
+                    continue;
+                }
+
                 Visit(field);
             }
 
@@ -282,6 +522,9 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     break;
                 case Nncase.TIR.NTT.TensorStore:
                     VisitTensorStore(args);
+                    break;
+                case Nncase.TIR.Memcopy:
+                    VisitMemcopy(args);
                     break;
                 case Nncase.TIR.NTT.Unary unary:
                     VisitUnary(unary, args);
@@ -395,6 +638,8 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 case Nncase.TIR.NTT.Softmax softmax:
                     VisitSoftmax(softmax.Axis, default, args, "softmax");
                     break;
+                case BaseFunction callee:
+                    throw new NotSupportedException($"PyNTT kernel segment unexpectedly contains function call target {callee.GetType().Name} {callee.Name}. Caller dispatch must split nested PrimFunction calls before kernel codegen.");
                 default:
                     throw new NotSupportedException($"Unsupported PyNTT PrimFunction call target: {expr.Target.GetType().Name}.");
             }
@@ -407,6 +652,12 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             if (args.Count != 2 || args[0] is not TIR.Buffer dest)
             {
                 throw new NotSupportedException("PyNTT TensorLoad codegen expects (dest_buffer, source_tensor).");
+            }
+
+            if (args[1] is TIR.Buffer srcBuffer)
+            {
+                VisitInternalTensorLoad(dest, srcBuffer);
+                return;
             }
 
             var inputIndex = GetInputIndex(args[1]);
@@ -435,7 +686,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     GetHierarchy(dest),
                     GetBufferSplitAxes(dest, globalShape.Length),
                     $"TensorLoad -> {dest.Name}"));
-            WriteLine(BuildHelperCall(helperName, $"input{inputIndex}"));
+            WriteLine(BuildHelperCall(helperName, $"input{inputIndex}", $"input{inputIndex}_pool_stride_elements"));
         }
 
         private void VisitTensorStore(IReadOnlyList<BaseExpr> args)
@@ -445,10 +696,100 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 throw new NotSupportedException("PyNTT TensorStore codegen expects (source_buffer, dest_tensor).");
             }
 
+            if (args[1] is TIR.Buffer destBuffer)
+            {
+                if (destBuffer.MemSpan.Buffer.Location == MemoryLocation.Output)
+                {
+                    throw new NotSupportedException($"PyNTT PrimFunction {_function.Name} must store to output BufferVar ABI parameters, but TensorStore destination {destBuffer.Name} is a TIR Buffer in Output memory.");
+                }
+
+                VisitInternalTensorStore(src, destBuffer);
+                return;
+            }
+
             var localShape = GetBufferShape(src);
             var globalShape = GetTensorShape(args[1], "TensorStore destination");
             var outputIndex = GetOutputIndex(args[1]);
             WriteTensorStore(src, outputIndex, globalShape, $"{src.Name} -> TensorStore");
+        }
+
+        private void VisitInternalTensorLoad(TIR.Buffer dest, TIR.Buffer src)
+        {
+            if (IsObjectDataType(dest.ElemType) || IsObjectDataType(src.ElemType))
+            {
+                return;
+            }
+
+            ValidateMatchingBufferDType("PyNTT TensorLoad buffer source/destination", src, dest);
+            var sourcePointer = GetBufferScalarPointer(src);
+            _attrs["tir"] = true;
+            var localShape = GetBufferShape(dest);
+            var globalShape = GetBufferShape(src);
+            var helperName = GetNextHelperName("tensor_load");
+            WriteHelperTemplate(
+                "triton/kernels/TensorLoad.py.jinja",
+                new PyNTTTensorLoadTemplateModel(
+                    helperName,
+                    src.Name,
+                    0,
+                    GetBufferPointer(dest),
+                    GetPyNTTDTypeName(dest.ElemType),
+                    GetTritonDType(dest.ElemType),
+                    localShape,
+                    GetBufferStrides(dest),
+                    globalShape,
+                    GetHierarchy(dest),
+                    GetBufferSplitAxes(dest, globalShape.Length),
+                    $"{src.Name} -> {dest.Name}")
+                {
+                    Source = sourcePointer,
+                });
+            WriteLine(BuildHelperCall(helperName));
+        }
+
+        private void VisitInternalTensorStore(TIR.Buffer src, TIR.Buffer dest)
+        {
+            if (IsObjectDataType(src.ElemType) || IsObjectDataType(dest.ElemType))
+            {
+                return;
+            }
+
+            ValidateMatchingBufferDType("PyNTT TensorStore buffer source/destination", src, dest);
+            var destinationPointer = GetBufferScalarPointer(dest);
+            _attrs["tir"] = true;
+            var localShape = GetBufferShape(src);
+            var globalShape = GetBufferShape(dest);
+            var helperName = GetNextHelperName("tensor_store");
+            WriteHelperTemplate(
+                "triton/kernels/TensorStore.py.jinja",
+                new PyNTTTensorStoreTemplateModel(
+                    helperName,
+                    GetBufferPointer(src),
+                    dest.Name,
+                    0,
+                    GetPyNTTDTypeName(src.ElemType),
+                    GetTritonDType(src.ElemType),
+                    localShape,
+                    GetBufferStrides(src),
+                    globalShape,
+                    GetHierarchy(src),
+                    GetBufferSplitAxes(src, globalShape.Length),
+                    $"{src.Name} -> {dest.Name}")
+                {
+                    Destination = destinationPointer,
+                });
+            WriteLine(BuildHelperCall(helperName));
+        }
+
+        private static void ValidateMatchingBufferDType(string context, TIR.Buffer src, TIR.Buffer dest)
+        {
+            ValidateMatchingVectorLanes(context, src.ElemType, dest.ElemType);
+            var srcScalarDType = GetPyNTTScalarDTypeName(src.ElemType);
+            var destScalarDType = GetPyNTTScalarDTypeName(dest.ElemType);
+            if (srcScalarDType != destScalarDType)
+            {
+                throw new NotSupportedException($"{context} expects matching scalar dtypes, got source {srcScalarDType} and destination {destScalarDType}.");
+            }
         }
 
         private void WriteTensorStore(TIR.Buffer src, int outputIndex, PyNTTDimExpression[] globalShape, string comment)
@@ -478,7 +819,110 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     GetHierarchy(src),
                     GetBufferSplitAxes(src, globalShape.Length),
                     comment));
-            WriteLine(BuildHelperCall(helperName, outputName));
+            WriteLine(BuildHelperCall(helperName, outputName, $"{outputName}_pool_stride_elements"));
+        }
+
+        private void VisitMemcopy(IReadOnlyList<BaseExpr> args)
+        {
+            if (args.Count != 2)
+            {
+                throw new NotSupportedException("PyNTT Memcopy codegen expects (destination, source).");
+            }
+
+            var dest = UnwrapInputBoxing(args[0]);
+            var src = UnwrapInputBoxing(args[1]);
+            if (IsObjectExpression(dest) || IsObjectExpression(src))
+            {
+                VisitObjectMemcopy(dest, src);
+                return;
+            }
+
+            if (dest is IVar && src is IVar)
+            {
+                VisitTensorOutputAliasMemcopy(dest, src);
+                return;
+            }
+
+            if (dest is not TIR.Buffer destBuffer || src is not TIR.Buffer srcBuffer)
+            {
+                throw new NotSupportedException($"PyNTT Memcopy expects object aliases or TIR buffers, got destination {dest.GetType().Name} and source {src.GetType().Name}.");
+            }
+
+            ValidateSameShape("PyNTT Memcopy", GetBufferShape(srcBuffer), GetBufferShape(destBuffer));
+            ValidateMatchingVectorLanes("PyNTT Memcopy source/destination", srcBuffer.ElemType, destBuffer.ElemType);
+            var srcScalarDType = GetPyNTTScalarDTypeName(srcBuffer.ElemType);
+            var destScalarDType = GetPyNTTScalarDTypeName(destBuffer.ElemType);
+            if (srcScalarDType != destScalarDType)
+            {
+                throw new NotSupportedException($"PyNTT Memcopy expects matching scalar dtypes, got source {srcScalarDType} and destination {destScalarDType}.");
+            }
+
+            SetComputeOp("memcopy");
+            _attrs["tir"] = true;
+            _attrs["op"] = "memcopy";
+            _attrs["dtype"] = GetPyNTTDTypeName(destBuffer.ElemType);
+            _attrs["shape"] = GetBufferShape(destBuffer);
+            var helperName = GetNextHelperName("memcopy");
+            WriteHelperTemplate(
+                "triton/kernels/Memcopy.py.jinja",
+                new PyNTTMemcopyTemplateModel(
+                    helperName,
+                    GetBufferScalarPointer(srcBuffer),
+                    GetBufferScalarPointer(destBuffer),
+                    destScalarDType,
+                    GetScalarTritonDType(destBuffer.ElemType),
+                    GetBufferShape(destBuffer),
+                    GetBufferStrides(srcBuffer),
+                    GetBufferStrides(destBuffer),
+                    GetVectorLaneElementCount(destBuffer.ElemType),
+                    $"{srcBuffer.Name} -> {destBuffer.Name}"));
+            WriteLine(BuildHelperCall(helperName));
+        }
+
+        private void VisitTensorOutputAliasMemcopy(BaseExpr dest, BaseExpr src)
+        {
+            var outputIndex = GetOutputIndex(dest);
+            if (_storedOutputIndices.Contains(outputIndex))
+            {
+                throw new NotSupportedException($"PyNTT PrimFunction {_function.Name} materializes output {_outputs[outputIndex].Name} both by TensorStore and tensor Memcopy.");
+            }
+
+            var inputIndex = GetInputIndex(src);
+            var destType = GetTensorType(dest.CheckedType, $"PyNTT tensor Memcopy destination {_outputs[outputIndex].Name}");
+            var srcType = GetTensorType(src.CheckedType, $"PyNTT tensor Memcopy source input{inputIndex}");
+            if (destType.DType != srcType.DType || destType.Shape.Rank != srcType.Shape.Rank)
+            {
+                throw new NotSupportedException($"PyNTT tensor Memcopy alias expects matching dtype/rank, got destination {destType} and source {srcType}.");
+            }
+
+            if (_outputAliases.TryGetValue(outputIndex, out var existingInputIndex) && existingInputIndex != inputIndex)
+            {
+                throw new NotSupportedException($"PyNTT PrimFunction {_function.Name} assigns output {_outputs[outputIndex].Name} to multiple input aliases.");
+            }
+
+            _outputAliases[outputIndex] = inputIndex;
+        }
+
+        private void VisitObjectMemcopy(BaseExpr dest, BaseExpr src)
+        {
+            if (!IsObjectExpression(dest) || !IsObjectExpression(src))
+            {
+                throw new NotSupportedException($"PyNTT object Memcopy expects both operands to be object tensors, got destination {dest.CheckedDataType} and source {src.CheckedDataType}.");
+            }
+
+            var outputIndex = GetOutputIndex(dest);
+            if (_storedOutputIndices.Contains(outputIndex))
+            {
+                throw new NotSupportedException($"PyNTT PrimFunction {_function.Name} materializes output {_outputs[outputIndex].Name} both by TensorStore and object Memcopy.");
+            }
+
+            var inputIndex = GetInputIndex(src);
+            if (_outputAliases.TryGetValue(outputIndex, out var existingInputIndex) && existingInputIndex != inputIndex)
+            {
+                throw new NotSupportedException($"PyNTT PrimFunction {_function.Name} assigns output {_outputs[outputIndex].Name} to multiple input aliases.");
+            }
+
+            _outputAliases[outputIndex] = inputIndex;
         }
 
         private void VisitUnary(Nncase.TIR.NTT.Unary unary, IReadOnlyList<BaseExpr> args)
@@ -724,10 +1168,10 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 GetBufferScalarPointer(output),
                 inputRef.BaseName,
                 inputRef.OffsetBytes,
-                inputRef.PoolBytes,
+                inputRef.PoolStrideBytes,
                 outputRef.BaseName,
                 outputRef.OffsetBytes,
-                outputRef.PoolBytes,
+                outputRef.PoolStrideBytes,
                 GetScalarElementSizeBytes(output.ElemType),
                 outputScalarDType,
                 GetScalarTritonDType(output.ElemType),
@@ -1540,12 +1984,9 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             _attrs["dtype"] = GetPyNTTScalarDTypeName(output.ElemType);
             _attrs["shape"] = outputShape;
             _attrs["perm"] = perm;
-            var inputVectorLaneCount = GetSingleVectorLaneCount(input.ElemType, "PyNTT Transpose input");
-            var outputVectorLaneCount = GetSingleVectorLaneCount(output.ElemType, "PyNTT Transpose output");
-            if (inputVectorLaneCount != outputVectorLaneCount)
-            {
-                throw new NotSupportedException($"PyNTT Transpose expects matching input/output vector lanes, got input={inputVectorLaneCount}, output={outputVectorLaneCount}.");
-            }
+            ValidateMatchingVectorLanes("PyNTT Transpose input/output", input.ElemType, output.ElemType);
+            var inputVectorLaneCount = GetVectorLaneElementCount(input.ElemType);
+            var outputVectorLaneCount = GetVectorLaneElementCount(output.ElemType);
 
             var helperName = GetNextHelperName("transpose_compute");
             WriteHelperTemplate(
@@ -2640,13 +3081,13 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     helperName,
                     lhsRef.BaseName,
                     lhsRef.OffsetBytes,
-                    lhsRef.PoolBytes,
+                    lhsRef.PoolStrideBytes,
                     rhsRef.BaseName,
                     rhsRef.OffsetBytes,
-                    rhsRef.PoolBytes,
+                    rhsRef.PoolStrideBytes,
                     outputRef.BaseName,
                     outputRef.OffsetBytes,
-                    outputRef.PoolBytes,
+                    outputRef.PoolStrideBytes,
                     GetPyNTTScalarDTypeName(lhs.ElemType),
                     GetPyNTTScalarDTypeName(rhs.ElemType),
                     GetPyNTTScalarDTypeName(output.ElemType),
@@ -2852,7 +3293,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             WriteLine(
                 BuildHelperCall(
                     helperName,
-                    BuildRawPythonArgument(bufferRef.PoolBytes.ToString(CultureInfo.InvariantCulture)),
+                    BuildRawPythonArgument(bufferRef.PoolStrideBytes),
                     BuildRawPythonArgument(bufferRef.OffsetBytes),
                     BuildRawPythonArgument(bufferRef.OffsetBytes)),
                 postBarrier);
@@ -3328,7 +3769,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     GetHierarchy(slots),
                     slotsRef.BaseName,
                     slotsRef.OffsetBytes,
-                    slotsRef.PoolBytes,
+                    slotsRef.PoolStrideBytes,
                     GetScalarElementSizeBytes(slots.ElemType),
                     seqAxis,
                     headAxis,
@@ -3470,43 +3911,29 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             return inputIndex;
         }
 
+        private string GetInputName(int inputIndex, string context)
+        {
+            if (inputIndex < 0 || inputIndex >= _inputNames.Count)
+            {
+                throw new NotSupportedException($"{context} references input index {inputIndex}, but PyNTT PrimFunction {_function.Name} only has {_inputNames.Count} inputs.");
+            }
+
+            return _inputNames[inputIndex];
+        }
+
         private int GetOutputIndex(BaseExpr expr)
         {
             expr = UnwrapInputBoxing(expr);
-            if (expr is TIR.Buffer buffer && _returnOutputBufferIndices.TryGetValue(buffer, out var returnOutputIndex))
+            var outputName = GetTensorName(expr, _parameterNames);
+            for (var i = 0; i < _outputs.Length; i++)
             {
-                return returnOutputIndex;
-            }
-
-            try
-            {
-                var outputName = GetTensorName(expr, _parameterNames);
-                for (var i = 0; i < _outputs.Length; i++)
+                if (_outputs[i].Name == outputName || _outputs[i].AbiName == outputName)
                 {
-                    if (_outputs[i].Name == outputName)
-                    {
-                        return i;
-                    }
+                    return i;
                 }
             }
-            catch (NotSupportedException)
-            {
-                // Some TIR forms do not preserve the destination tensor as a named
-                // parameter. In that case the TensorStore order matches the flattened
-                // function return order produced by TIR lowering.
-            }
 
-            while (_nextStoreIndex < _outputs.Length && _storedOutputIndices.Contains(_nextStoreIndex))
-            {
-                _nextStoreIndex++;
-            }
-
-            if (_nextStoreIndex >= _outputs.Length)
-            {
-                throw new NotSupportedException($"PyNTT PrimFunction {_function.Name} has more TensorStore calls than flattened outputs.");
-            }
-
-            return _nextStoreIndex++;
+            throw new NotSupportedException($"PyNTT PrimFunction {_function.Name} references unknown output parameter {outputName}.");
         }
 
         private int GetBufferInputIndex(TIR.Buffer buffer, string context)
@@ -3547,6 +3974,111 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             }
 
             return GetTensorName(expr, _parameterNames);
+        }
+
+        private KernelInputLayout BuildKernelInputLayout(string bodySource)
+        {
+            var names = new List<string>(_inputNames.Count);
+            var indexMap = new Dictionary<int, int>();
+            var removedIndexes = new HashSet<int>();
+
+            for (var i = 0; i < _inputNames.Count; i++)
+            {
+                var name = _inputNames[i];
+                if (IsObjectKernelInput(name))
+                {
+                    removedIndexes.Add(i);
+                    continue;
+                }
+
+                indexMap[i] = names.Count;
+                names.Add(name);
+            }
+
+            var remappedBodySource = RemapInputReferences(bodySource, indexMap, removedIndexes, $"PyNTT PrimFunction {_function.Name} body");
+            var helpers = _helpers
+                .Select((helper, index) => RemapHelperInputReferences(helper, indexMap, removedIndexes, $"PyNTT PrimFunction {_function.Name} helper {index}"))
+                .ToArray();
+            return new(names.ToArray(), indexMap, removedIndexes, remappedBodySource, helpers);
+        }
+
+        private bool IsObjectKernelInput(string name)
+        {
+            foreach (var pair in _parameterNames)
+            {
+                if (pair.Value == name && pair.Key is Expr expr)
+                {
+                    return IsObjectExpression(expr);
+                }
+            }
+
+            return false;
+        }
+
+        private static HelperTemplateRenderSpec RemapHelperInputReferences(
+            HelperTemplateRenderSpec helper,
+            IReadOnlyDictionary<int, int> indexMap,
+            IReadOnlySet<int> removedIndexes,
+            string context)
+        {
+            var model = JsonSerializer.SerializeToNode(helper.Model);
+            var remappedModel = RemapJsonInputReferences(model, indexMap, removedIndexes, context);
+            return helper with { Model = remappedModel ?? new JsonObject() };
+        }
+
+        private static JsonNode? RemapJsonInputReferences(
+            JsonNode? node,
+            IReadOnlyDictionary<int, int> indexMap,
+            IReadOnlySet<int> removedIndexes,
+            string context)
+        {
+            switch (node)
+            {
+                case null:
+                    return null;
+                case JsonValue value when value.TryGetValue<string>(out var text):
+                    return JsonValue.Create(RemapInputReferences(text, indexMap, removedIndexes, context));
+                case JsonValue value:
+                    return value.DeepClone();
+                case JsonArray array:
+                    var remappedArray = new JsonArray();
+                    foreach (var item in array)
+                    {
+                        remappedArray.Add(RemapJsonInputReferences(item, indexMap, removedIndexes, context));
+                    }
+
+                    return remappedArray;
+                case JsonObject obj:
+                    var remappedObject = new JsonObject();
+                    foreach (var pair in obj)
+                    {
+                        remappedObject[pair.Key] = RemapJsonInputReferences(pair.Value, indexMap, removedIndexes, context);
+                    }
+
+                    return remappedObject;
+                default:
+                    return node.DeepClone();
+            }
+        }
+
+        private static string RemapInputReferences(
+            string source,
+            IReadOnlyDictionary<int, int> indexMap,
+            IReadOnlySet<int> removedIndexes,
+            string context)
+        {
+            return InputReferenceRegex.Replace(source, match =>
+            {
+                var inputIndex = int.Parse(match.Groups["index"].Value, CultureInfo.InvariantCulture);
+                if (removedIndexes.Contains(inputIndex))
+                {
+                    throw new NotSupportedException($"{context} references object input{inputIndex}, which cannot be passed to a Triton kernel.");
+                }
+
+                return indexMap.TryGetValue(inputIndex, out var remappedInputIndex)
+                    ? $"input{remappedInputIndex.ToString(CultureInfo.InvariantCulture)}"
+                    : match.Value;
+            });
         }
 
         private PyNTTPagedAttentionCacheTemplateModel GetPagedAttentionCacheTemplateModel(BaseExpr expr, string context)
@@ -3835,46 +4367,6 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             return config.AxisPolicies[0].Axes.ToArray();
         }
 
-        private void AnalyzeReturnValues(BaseExpr expr)
-        {
-            switch (expr)
-            {
-                case Return ret:
-                    AnalyzeReturn(ret);
-                    break;
-                case Sequential sequential:
-                    foreach (var field in sequential.Fields)
-                    {
-                        AnalyzeReturnValues(field);
-                    }
-
-                    break;
-            }
-        }
-
-        private void AnalyzeReturn(Return expr)
-        {
-            var values = expr.Values.ToArray();
-            for (var i = 0; i < values.Length && i < _outputs.Length; i++)
-            {
-                var value = UnwrapInputBoxing(values[i]);
-                if (value is TIR.Buffer buffer)
-                {
-                    _returnOutputBufferIndices[buffer] = i;
-                    continue;
-                }
-
-                try
-                {
-                    _outputAliases[i] = GetInputIndex(value);
-                }
-                catch (NotSupportedException)
-                {
-                    throw new NotSupportedException($"PyNTT PrimFunction {_function.Name} cannot materialize return output {_outputs[i].Name} from {value.GetType().Name}.");
-                }
-            }
-        }
-
         private PyNTTBufferPointerTemplateModel GetBufferPointer(TIR.Buffer buffer)
         {
             var bufferRef = ResolveBufferRef(buffer);
@@ -3909,11 +4401,12 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 : null;
             return buffer.MemSpan.Buffer.Location switch
             {
-                MemoryLocation.Data => new("data", offsetBytes, checked((long)_function.SchedResult.DataUsage), "shard_index", shardCoordHierarchy),
-                MemoryLocation.BlockLocalData => new("block_local_data", offsetBytes, checked((long)_function.SchedResult.BlockLocalDataPoolSize), BuildBlockLocalDataIndexExpression(_targetOptions), shardCoordHierarchy),
-                MemoryLocation.Rdata => new("rdata", offsetBytes, 0, null, shardCoordHierarchy),
-                MemoryLocation.ChipLocalRdata => new("chip_local_rdata", offsetBytes, 0, null, shardCoordHierarchy),
-                MemoryLocation.BlockLocalRdata => new("block_local_rdata", offsetBytes, PyNTTRDataUtility.GetLocalRDataTableStrideBytes(_function.SchedResult.BlockLocalRdatas, _targetOptions, "b"), "shard_index", shardCoordHierarchy),
+                MemoryLocation.Data when buffer.DistributedType is null => new("data", offsetBytes, "0", null, shardCoordHierarchy),
+                MemoryLocation.Data => new("data", offsetBytes, "data_pool_stride_bytes", "shard_index", shardCoordHierarchy),
+                MemoryLocation.BlockLocalData => new("block_local_data", offsetBytes, "block_local_data_pool_stride_bytes", BuildBlockLocalDataIndexExpression(_targetOptions), shardCoordHierarchy),
+                MemoryLocation.Rdata => new("rdata", offsetBytes, "0", null, shardCoordHierarchy),
+                MemoryLocation.ChipLocalRdata => new("chip_local_rdata", offsetBytes, "0", null, shardCoordHierarchy),
+                MemoryLocation.BlockLocalRdata => new("block_local_rdata", offsetBytes, PyNTTRDataUtility.GetLocalRDataTableStrideBytes(_function.SchedResult.BlockLocalRdatas, _targetOptions, "b").ToString(CultureInfo.InvariantCulture), "shard_index", shardCoordHierarchy),
                 var location => throw new NotSupportedException($"PyNTT does not support buffer memory location {location} for Triton template operands yet."),
             };
         }
@@ -3921,9 +4414,9 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
         private string BuildPointerExpression(BufferRef bufferRef, string tritonDType)
         {
             var expression = bufferRef.BaseName;
-            if (!string.IsNullOrWhiteSpace(bufferRef.IndexExpression) && bufferRef.PoolBytes != 0)
+            if (!string.IsNullOrWhiteSpace(bufferRef.IndexExpression) && bufferRef.PoolStrideBytes != "0")
             {
-                expression += $" + {bufferRef.IndexExpression} * {bufferRef.PoolBytes.ToString(CultureInfo.InvariantCulture)}";
+                expression += $" + {bufferRef.IndexExpression} * {bufferRef.PoolStrideBytes}";
             }
 
             if (!IsZeroOffset(bufferRef.OffsetBytes))
@@ -4286,7 +4779,8 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
 
         private string GetHelperName(string kind, int index)
         {
-            return SanitizePythonIdentifier($"{_function.Name}_{kind}_{index}");
+            var helperBaseName = _namePart is null ? _function.Name : $"{_function.Name}_{_namePart}";
+            return SanitizePythonIdentifier($"{helperBaseName}_{kind}_{index}");
         }
 
         private string GetNextHelperName(string kind)
@@ -4306,7 +4800,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             return expr;
         }
 
-        private sealed record BufferRef(string BaseName, string OffsetBytes, long PoolBytes, string? IndexExpression, int[]? ShardCoordHierarchy);
+        private sealed record BufferRef(string BaseName, string OffsetBytes, string PoolStrideBytes, string? IndexExpression, int[]? ShardCoordHierarchy);
     }
 
     private static LaunchMetadata BuildLaunchMetadata(OutputInfo output, PyNTTTargetOptions targetOptions, Dictionary<string, object>? extraMeta = null)
@@ -5025,8 +5519,8 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
         ValidateSameRank(context, inputShape, outputShape);
         for (var axis = 0; axis < inputShape.Count; axis++)
         {
-            var packedAxis = axes.IndexOf(axis);
-            var expected = packedAxis >= 0 ? CeilDivDim(inputShape[axis], lanes[packedAxis]) : inputShape[axis];
+            var laneProduct = GetLayoutAxisLaneProduct(axes, lanes, axis);
+            var expected = laneProduct > 1 ? CeilDivDim(inputShape[axis], laneProduct) : inputShape[axis];
             if (!SameDim(outputShape[axis], expected))
             {
                 throw new NotSupportedException($"{context} output shape mismatch at axis {axis}, expected {expected}, got {outputShape[axis]}.");
@@ -5039,8 +5533,8 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
         ValidateSameRank(context, inputShape, outputShape);
         for (var axis = 0; axis < outputShape.Count; axis++)
         {
-            var unpackedAxis = axes.IndexOf(axis);
-            var expected = unpackedAxis >= 0 ? MultiplyDim(inputShape[axis], lanes[unpackedAxis]) : inputShape[axis];
+            var laneProduct = GetLayoutAxisLaneProduct(axes, lanes, axis);
+            var expected = laneProduct > 1 ? MultiplyDim(inputShape[axis], laneProduct) : inputShape[axis];
             if (!SameDim(outputShape[axis], expected))
             {
                 throw new NotSupportedException($"{context} output shape mismatch at axis {axis}, expected {expected}, got {outputShape[axis]}.");
@@ -5053,18 +5547,22 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
         var normalizedAxes = axes.IsDefaultOrEmpty
             ? Array.Empty<int>()
             : axes.ToArray().Select(axis => NormalizeAxis(axis, rank, context)).ToArray();
-        for (var i = 0; i < normalizedAxes.Length; i++)
+
+        return normalizedAxes;
+    }
+
+    private static int GetLayoutAxisLaneProduct(IReadOnlyList<int> axes, IReadOnlyList<int> lanes, int axis)
+    {
+        var product = 1;
+        for (var i = 0; i < axes.Count; i++)
         {
-            for (var j = i + 1; j < normalizedAxes.Length; j++)
+            if (axes[i] == axis)
             {
-                if (normalizedAxes[i] == normalizedAxes[j])
-                {
-                    throw new NotSupportedException($"{context} contains duplicated axis {normalizedAxes[i]}.");
-                }
+                product = checked(product * lanes[i]);
             }
         }
 
-        return normalizedAxes;
+        return product;
     }
 
     private static int[] GetLayoutLanes(IRArray<int> lanes, int axesCount, string context)
@@ -5466,65 +5964,32 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             .ToArray();
     }
 
+    private static bool IsObjectExpression(BaseExpr expr) => IsObjectDataType(expr.CheckedDataType);
+
     private static bool IsObjectDataType(DataType dataType) => dataType is ReferenceType;
 
     private static OutputInfo[] GetOutputInfos(BaseFunction function)
     {
-        if (function.CheckedType is not CallableType callableType)
-        {
-            return Array.Empty<OutputInfo>();
-        }
+        return BuildOutputInfos(PyNTTFunctionOutputs.GetOutputs(function));
+    }
 
-        return FlattenReturnTypes(callableType.ReturnType)
-            .Select((type, index) =>
+    private static OutputInfo[] BuildOutputInfos(IEnumerable<BufferVar> outputs)
+    {
+        return outputs
+            .Select((output, index) =>
             {
+                var type = output.CheckedType;
                 var tensorType = GetTensorType(type, $"output{index}");
                 return new OutputInfo(
                     $"output{index}",
+                    output.Name,
                     GetRankedShape(tensorType, $"output{index}").Dimensions.ToArray()
                         .Select(dimension => new PyNTTDimExpressionEmitter().Emit(dimension))
                         .ToArray(),
+                    tensorType.DType,
                     type as DistributedType);
             })
             .ToArray();
-    }
-
-    private static OutputInfo[] GetTensorStoreOutputInfos(PrimFunction function)
-    {
-        return GetTensorStoreDestinations(function)
-            .Select((expr, index) =>
-            {
-                var tensorType = GetTensorType(expr.CheckedType, $"output{index}");
-                return new OutputInfo(
-                    $"output{index}",
-                    GetRankedShape(tensorType, $"output{index}").Dimensions.ToArray()
-                        .Select(dimension => new PyNTTDimExpressionEmitter().Emit(dimension))
-                        .ToArray(),
-                    expr.CheckedType as DistributedType);
-            })
-            .ToArray();
-    }
-
-    private static BaseExpr[] GetTensorStoreDestinations(PrimFunction function)
-    {
-        var destinations = new List<BaseExpr>();
-        CollectTensorStoreDestinations(function.Body, destinations);
-        return destinations
-            .Distinct((IEqualityComparer<BaseExpr>)ReferenceEqualityComparer.Instance)
-            .ToArray();
-    }
-
-    private static void CollectTensorStoreDestinations(BaseExpr expr, List<BaseExpr> destinations)
-    {
-        if (expr is Call call && call.Target is Nncase.TIR.NTT.TensorStore && call.Arguments.ToArray().Length >= 2)
-        {
-            destinations.Add(UnwrapInputBoxing(call.Arguments[1]));
-        }
-
-        foreach (var operand in expr.Operands)
-        {
-            CollectTensorStoreDestinations(operand, destinations);
-        }
     }
 
     private static BaseExpr UnwrapInputBoxing(BaseExpr expr)
@@ -5535,16 +6000,6 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
         }
 
         return expr;
-    }
-
-    private static IEnumerable<IRType> FlattenReturnTypes(IRType type)
-    {
-        return type switch
-        {
-            TupleType tupleType when tupleType == TupleType.Void => Array.Empty<IRType>(),
-            TupleType tupleType => tupleType.ToArray(),
-            _ => new[] { type },
-        };
     }
 
     private static TensorType GetTensorType(IRType type, string name)
@@ -5634,7 +6089,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
         return new string(chars);
     }
 
-    private sealed record OutputInfo(string Name, PyNTTDimExpression[] Shape, DistributedType? DistributedType);
+    private sealed record OutputInfo(string Name, string AbiName, PyNTTDimExpression[] Shape, DataType DType, DistributedType? DistributedType);
 
     private sealed class SharedHelperRegistry
     {
@@ -5672,6 +6127,13 @@ internal sealed record KernelRenderSpec(
     IReadOnlyList<HelperTemplateRenderSpec> Helpers,
     [property: JsonPropertyName("body_source")]
     string BodySource);
+
+internal sealed record KernelInputLayout(
+    string[] Names,
+    IReadOnlyDictionary<int, int> IndexMap,
+    IReadOnlySet<int> RemovedIndexes,
+    string BodySource,
+    HelperTemplateRenderSpec[] Helpers);
 
 internal sealed record HelperTemplateRenderSpec(
     [property: JsonPropertyName("template")]

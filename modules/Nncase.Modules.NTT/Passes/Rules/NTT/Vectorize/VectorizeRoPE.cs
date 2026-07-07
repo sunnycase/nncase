@@ -41,7 +41,7 @@ public sealed partial class VectorizeRoPEPropagation : RewriteRule<Pattern>
                 IsWildcard("cos"),
                 IsWildcard("sin")));
 
-    private Expr? GetReplace(Call caller, Pack vectorize, Call cos, Call sin, Call callee, Expr input)
+    private Expr? GetReplace(Call caller, Pack vectorize, Expr cos, Expr sin, Call callee, Expr input)
     {
         var outputShape = (RankedShape)caller.CheckedShape;
         var outputRank = outputShape.Rank;

@@ -8,6 +8,7 @@ using System.Reactive;
 using NetFabric.Hyperlinq;
 using Nncase.CostModel;
 using Nncase.IR;
+using Nncase.TIR;
 
 namespace Nncase.Evaluator;
 
@@ -58,4 +59,7 @@ internal sealed class CostEvaluateVisitor : ExprVisitor<Cost, Unit>
 
     /// <inheritdoc/>
     protected override Cost VisitLeafVar(Var expr) => Cost.Zero;
+
+    /// <inheritdoc/>
+    protected override Cost VisitLeafBufferVar(BufferVar expr) => Cost.Zero;
 }

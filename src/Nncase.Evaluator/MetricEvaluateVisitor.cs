@@ -7,6 +7,7 @@ using System.Linq;
 using System.Reactive;
 using NetFabric.Hyperlinq;
 using Nncase.IR;
+using Nncase.TIR;
 
 namespace Nncase.Evaluator;
 
@@ -56,4 +57,7 @@ internal sealed class MetricEvaluateVisitor : ExprVisitor<Metric, Unit>
 
     /// <inheritdoc/>
     protected override Metric VisitLeafVar(Var expr) => Metric.Zero;
+
+    /// <inheritdoc/>
+    protected override Metric VisitLeafBufferVar(BufferVar expr) => Metric.Zero;
 }

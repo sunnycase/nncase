@@ -9,6 +9,8 @@ namespace Nncase.Importer
 {
     public class Qwen3A3B : Qwen3
     {
+        protected override bool SupportsDecoderLayerFunctionReuse => false;
+
         public override Call LLMMlp(int count, Expr hiddenStates)
         {
             var expertNum = Config.GetNestedValue<long>("num_experts");

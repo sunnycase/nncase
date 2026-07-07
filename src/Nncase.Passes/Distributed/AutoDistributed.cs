@@ -1496,9 +1496,20 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
             }
             else
             {
+                if (expr.CheckedType is TupleType)
+                {
+                    return CreateTuplePassThroughOriginatorCluster(expr);
+                }
+
                 var distCluster = _rootSearchGraph.CreateCluster<DistributedSearchGraph>(SearchGraphKind.DistributedCluster);
                 var inferCluster = _inferedMemo[expr];
-                foreach (var dType in GetLeafCandidateDistTypes((TensorType)inferCluster.Vertices.First().IRType))
+                var sourceType = inferCluster.Vertices.First().IRType;
+                if (sourceType is not TensorType tensorType)
+                {
+                    throw new InvalidOperationException($"AutoDistributed can only create tensor originator candidates from TensorType, but got {sourceType} for {expr.GetType().Name}.");
+                }
+
+                foreach (var dType in GetLeafCandidateDistTypes(tensorType))
                 {
                     var bucket = distCluster.CreateCluster<DistributedSearchGraph>(SearchGraphKind.Bucket);
                     var dnode = new SearchableNode(new Boxing(dType), dType);
@@ -1509,6 +1520,38 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
                 return distCluster;
             }
         }
+    }
+
+    private DistributedSearchGraph CreateTuplePassThroughOriginatorCluster(BaseExpr expr)
+    {
+        if (!_inferedMemo.TryGetValue(expr, out var inferCluster))
+        {
+            throw new InvalidOperationException($"Tuple originator {expr.GetType().Name} must be inferred before resharding.");
+        }
+
+        var sourceBuckets = inferCluster.Clusters.OfType<DistributedSearchGraph>().ToArray();
+        if (sourceBuckets.Length == 0)
+        {
+            throw new InvalidOperationException($"Tuple originator {expr.GetType().Name} has no inferred candidate buckets.");
+        }
+
+        var distCluster = _rootSearchGraph.CreateCluster<DistributedSearchGraph>(SearchGraphKind.DistributedCluster);
+        foreach (var sourceBucket in sourceBuckets)
+        {
+            var sourceNode = sourceBucket.Vertices.FirstOrDefault()
+                ?? throw new InvalidOperationException($"Tuple originator {expr.GetType().Name} has an empty inferred bucket.");
+            if (sourceNode.IRType is not TupleType)
+            {
+                throw new InvalidOperationException($"Tuple originator {expr.GetType().Name} expected TupleType source, but got {sourceNode.IRType}.");
+            }
+
+            var bucket = distCluster.CreateCluster<DistributedSearchGraph>(SearchGraphKind.Bucket);
+            var node = new SearchableNode(expr, sourceNode.IRType);
+            bucket.AddVertex(node);
+            _rootSearchGraph.AddEdge(new(node, sourceNode, 0, sourceBucket));
+        }
+
+        return distCluster;
     }
 
     private DistributedSearchGraph CreateShardedViewInputBucket(TensorConst source)
@@ -1565,6 +1608,32 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
             for (int i = 0; i < tp.Fields.Length; i++)
             {
                 _rootSearchGraph.AddEdge(new(tpnode, buckets[i].Vertices.First(), i, buckets[i]));
+            }
+        }
+        else if (expr.CheckedType is TupleType tupleType)
+        {
+            if (init)
+            {
+                var bucket = standCluster.CreateCluster<DistributedSearchGraph>(SearchGraphKind.Bucket);
+                var node = new SearchableNode(expr, expr.CheckedType);
+                bucket.AddVertex(node);
+            }
+            else
+            {
+                var buckets = new DistributedSearchGraph[tupleType.Fields.Count];
+                for (int i = 0; i < tupleType.Fields.Count; i++)
+                {
+                    var field = IR.F.Tensors.GetItem(expr, i);
+                    buckets[i] = TryInstertTerminator(field).Clusters.OfType<DistributedSearchGraph>().First();
+                }
+
+                var tpnode = new SearchableNode(new IR.Tuple(), new TupleType(buckets.Select(g => g.Vertices.First().IRType).ToArray()));
+                var bucket = standCluster.CreateCluster<DistributedSearchGraph>(SearchGraphKind.Bucket);
+                bucket.AddVertex(tpnode);
+                for (int i = 0; i < tupleType.Fields.Count; i++)
+                {
+                    _rootSearchGraph.AddEdge(new(tpnode, buckets[i].Vertices.First(), i, buckets[i]));
+                }
             }
         }
         else if (expr is TensorConst tc && tc.ValueType is TensorType tensorType)
@@ -1684,10 +1753,38 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
             return outv;
         }
 
+        IRType VisitTuple(TupleType inv, TupleType outv)
+        {
+            if (inv.Count != outv.Count)
+            {
+                return new InvalidType($"Tuple boxing field count mismatch: {inv.Count} -> {outv.Count}");
+            }
+
+            var changed = false;
+            for (int i = 0; i < inv.Count; i++)
+            {
+                if (EqualityComparer<IRType>.Default.Equals(inv[i], outv[i]))
+                {
+                    continue;
+                }
+
+                var fieldResult = CheckBoxingTypeCached(inv[i], outv[i], isReshape);
+                if (fieldResult is InvalidType invalidType)
+                {
+                    return new InvalidType($"Tuple boxing field {i} is invalid: {invalidType.Reason}");
+                }
+
+                changed = true;
+            }
+
+            return changed ? outv : new InvalidType("Same TupleType");
+        }
+
         return (inType, outType) switch
         {
             (InvalidType inv, _) => inv,
             (_, InvalidType inv) => inv,
+            (TupleType inv, TupleType outv) => VisitTuple(inv, outv),
             (DistributedType d, DistributedType d1) => VisitD2D(d, d1),
             (TensorType t, DistributedType d) => VisitT2D(t, d),
             (DistributedType d, TensorType t) => VisitD2T(d, t),
@@ -1840,8 +1937,12 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         using var writer = new StreamWriter(stream);
         var dump = BuildCostDumpContext(rootCluster, pickMemo, costMemo, costScoreMemo);
         var rootNode = rootCluster.Vertices.FirstOrDefault(dump.IsPicked);
+        var maxDepth = GetSelectedTreeMaxDepth();
+        var maxNodes = GetSelectedTreeMaxNodes();
         writer.WriteLine("# AutoDistributed Selected Tree");
         writer.WriteLine($"root_cluster: {dump.GetGraphName(rootCluster)}");
+        writer.WriteLine($"max_depth: {maxDepth}");
+        writer.WriteLine($"max_nodes: {maxNodes}");
         if (rootNode is null)
         {
             writer.WriteLine("root_selected: <none>");
@@ -1849,7 +1950,14 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         }
 
         var active = new HashSet<SearchableNode>();
-        DumpSelectedNode(writer, rootNode, dump, active, 0);
+        var emitted = new HashSet<SearchableNode>();
+        var references = 0;
+        var truncated = false;
+        DumpSelectedNode(writer, rootNode, dump, active, emitted, ref references, ref truncated, 0, maxDepth, maxNodes);
+        writer.WriteLine();
+        writer.WriteLine($"emitted_nodes: {emitted.Count}");
+        writer.WriteLine($"references: {references}");
+        writer.WriteLine($"truncated: {truncated}");
     }
 
     private void DumpCandidateDiagnostics(Stream stream)
@@ -1970,20 +2078,54 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         }
     }
 
-    private void DumpSelectedNode(StreamWriter writer, SearchableNode node, CostDumpContext dump, HashSet<SearchableNode> active, int depth)
+    private void DumpSelectedNode(
+        StreamWriter writer,
+        SearchableNode node,
+        CostDumpContext dump,
+        HashSet<SearchableNode> active,
+        HashSet<SearchableNode> emitted,
+        ref int references,
+        ref bool truncated,
+        int depth,
+        int maxDepth,
+        int maxNodes)
     {
         var indent = new string(' ', depth * 2);
+        if (depth > maxDepth)
+        {
+            writer.WriteLine($"{indent}<max-depth node={dump.GetNodeName(node)} bucket={dump.GetGraphName(dump.GetBucket(node))}>");
+            truncated = true;
+            return;
+        }
+
+        if (active.Contains(node))
+        {
+            writer.WriteLine($"{indent}{dump.GetNodeName(node)} <cycle> bucket={dump.GetGraphName(dump.GetBucket(node))} score={GetScore(dump.CostScoreMemo, node)} expr={GetNodeLabel(node)}");
+            truncated = true;
+            return;
+        }
+
+        if (!emitted.Add(node))
+        {
+            references++;
+            writer.WriteLine($"{indent}{dump.GetNodeName(node)} <ref> bucket={dump.GetGraphName(dump.GetBucket(node))} score={GetScore(dump.CostScoreMemo, node)} expr={GetNodeLabel(node)}");
+            return;
+        }
+
+        if (emitted.Count > maxNodes)
+        {
+            writer.WriteLine($"{indent}<max-nodes node={dump.GetNodeName(node)} bucket={dump.GetGraphName(dump.GetBucket(node))}>");
+            truncated = true;
+            return;
+        }
+
         writer.WriteLine($"{indent}{dump.GetNodeName(node)} bucket={dump.GetGraphName(dump.GetBucket(node))} score={GetScore(dump.CostScoreMemo, node)} expr={GetNodeLabel(node)}");
         writer.WriteLine($"{indent}  type: {GetOneLine(node.IRType.ToString() ?? string.Empty)}");
         var cost = dump.CostMemo.TryGetValue(node, out var nodeCost) ? nodeCost : CostModel.Cost.Zero;
         writer.WriteLine($"{indent}  cost: {FormatCost(cost)}");
         writer.WriteLine($"{indent}  latency: {FormatLatencyBreakdown(dump.TargetCostModel, cost, node.IRType)}");
-        if (!active.Add(node))
-        {
-            writer.WriteLine($"{indent}  <cycle>");
-            return;
-        }
 
+        active.Add(node);
         if (_rootSearchGraph.TryGetOutEdges(node, out var edges))
         {
             foreach (var edge in edges.OrderBy(e => e.InputIndex))
@@ -1996,7 +2138,7 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
                 }
                 else
                 {
-                    DumpSelectedNode(writer, selected, dump, active, depth + 2);
+                    DumpSelectedNode(writer, selected, dump, active, emitted, ref references, ref truncated, depth + 2, maxDepth, maxNodes);
                 }
             }
         }
@@ -2107,6 +2249,29 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         }
 
         return text.Split([';', ',', '|'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+    }
+
+    private bool ShouldDumpSelectedTree()
+        => string.Equals(Environment.GetEnvironmentVariable("NNCASE_DUMP_AD_SELECTED_TREE"), "1", StringComparison.OrdinalIgnoreCase);
+
+    private int GetSelectedTreeMaxDepth()
+    {
+        if (int.TryParse(Environment.GetEnvironmentVariable("NNCASE_DUMP_AD_SELECTED_TREE_MAX_DEPTH"), out var maxDepth))
+        {
+            return Math.Max(1, maxDepth);
+        }
+
+        return 2048;
+    }
+
+    private int GetSelectedTreeMaxNodes()
+    {
+        if (int.TryParse(Environment.GetEnvironmentVariable("NNCASE_DUMP_AD_SELECTED_TREE_MAX_NODES"), out var maxNodes))
+        {
+            return Math.Max(1, maxNodes);
+        }
+
+        return 200000;
     }
 
     private bool MatchesFocus(SearchableNode node, IReadOnlyList<string> focusTerms)
@@ -2470,11 +2635,14 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
                 DumpCostSummary(stream, rootCluster, picks, costMemo, costScoreMemo);
             });
 
-            _profiler.Time("dump_selected_tree", () =>
+            if (ShouldDumpSelectedTree())
             {
-                using var stream = Diagnostics.DumpScope.Current.OpenFile("Costs/SelectedTree.txt");
-                DumpSelectedTree(stream, rootCluster, picks, costMemo, costScoreMemo);
-            });
+                _profiler.Time("dump_selected_tree", () =>
+                {
+                    using var stream = Diagnostics.DumpScope.Current.OpenFile("Costs/SelectedTree.txt");
+                    DumpSelectedTree(stream, rootCluster, picks, costMemo, costScoreMemo);
+                });
+            }
 
             _profiler.Time("dump_candidate_diagnostics", () =>
             {
@@ -2591,8 +2759,23 @@ internal sealed class ExprBuildVisitor
             var children = edges.GroupBy(e => e.InputIndex).Select(g => Visit(g.Select(e => e.InputGraph))).ToArray();
             switch (root.Expr)
             {
-                case Var or TensorConst or TupleConst or None or Shape or Padding or Paddings or Dimension or Call:
+                case Var or TensorConst or TupleConst or None or Shape or Padding or Paddings or Dimension:
                     expr = root.Expr;
+                    break;
+                case Call call:
+                    if (children.Length == call.Arguments.Length)
+                    {
+                        expr = call.With(arguments: children);
+                    }
+                    else if (children.Length == 1 && EqualityComparer<IRType>.Default.Equals(children[0].CheckedType, root.IRType))
+                    {
+                        expr = children[0];
+                    }
+                    else
+                    {
+                        throw new InvalidOperationException($"Cannot rebuild call {call.Target.GetType().Name}: expected {call.Arguments.Length} arguments, got {children.Length}.");
+                    }
+
                     break;
                 case Fusion fusion:
                     expr = fusion;

@@ -51,7 +51,70 @@ public sealed class AddFunctionToModule : ModulePass
             }
         }
 
+        ModuleGraphValidator.ValidateAcyclic(input);
         return Task.FromResult(input);
+    }
+
+    private sealed class ModuleGraphValidator
+    {
+        public static void ValidateAcyclic(IRModule module)
+        {
+            var visited = new HashSet<BaseExpr>(ReferenceEqualityComparer.Instance);
+            var active = new HashSet<BaseExpr>(ReferenceEqualityComparer.Instance);
+            var path = new List<BaseExpr>();
+            foreach (var function in module.Functions)
+            {
+                Visit(function, visited, active, path);
+            }
+        }
+
+        private static void Visit(BaseExpr expr, HashSet<BaseExpr> visited, HashSet<BaseExpr> active, List<BaseExpr> path)
+        {
+            if (active.Contains(expr))
+            {
+                var cycleStart = path.FindIndex(item => ReferenceEquals(item, expr));
+                var cycle = path.Skip(cycleStart).Append(expr).Select(Describe);
+                throw new InvalidOperationException($"IR module contains an operand cycle: {string.Join(" -> ", cycle)}.");
+            }
+
+            if (!visited.Add(expr))
+            {
+                return;
+            }
+
+            active.Add(expr);
+            path.Add(expr);
+            var operands = expr.Operands;
+            for (int i = 0; i < operands.Length; i++)
+            {
+                Visit(operands[i], visited, active, path);
+            }
+
+            path.RemoveAt(path.Count - 1);
+            active.Remove(expr);
+        }
+
+        private static string Describe(BaseExpr expr)
+        {
+            return expr switch
+            {
+                BaseFunction function => $"{expr.GetType().Name}({function.Name})",
+                Call call => $"Call({DescribeCallTarget(call.Target)})",
+                Op op => $"Op({op.GetType().Name})",
+                Var var => $"Var({var.Name})",
+                _ => expr.GetType().Name,
+            };
+        }
+
+        private static string DescribeCallTarget(Expr target)
+        {
+            return target switch
+            {
+                BaseFunction function => function.Name,
+                Op op => op.GetType().Name,
+                _ => target.GetType().Name,
+            };
+        }
     }
 
     private class FuncCollector : ExprWalker

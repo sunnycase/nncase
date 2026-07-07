@@ -61,7 +61,8 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
     public void TestGeneratePyNTTModelDirectory()
     {
         var x = new Var("x", new TensorType(DataTypes.Float32, new[] { 1 }));
-        var main = new Function("main", PyNTTTarget.Kind, x, new[] { x });
+        var output = CreateOutputVar("output", new TensorType(DataTypes.Float32, new[] { 1 }));
+        var main = new TIR.PrimFunction("main", PyNTTTarget.Kind, new TIR.Sequential(TIR.T.Memcopy(output, x)), new IVar[] { x, output });
         var outputDirectory = GeneratePyNTTModelDirectory("generated_model", main);
 
         Assert.True(File.Exists(Path.Join(outputDirectory, "__init__.py")));
@@ -174,9 +175,9 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         Assert.Contains("main_prim_tensor_store_0(output0, data, rdata, chip_local_rdata, block_local_rdata, block_local_data, block_size)", generatedKernelsPy, StringComparison.Ordinal);
         Assert.Contains("shard_coord1 = tmp_shard % 8", generatedKernelsPy, StringComparison.Ordinal);
         Assert.Contains("shard_coord0 = tmp_shard % 4", generatedKernelsPy, StringComparison.Ordinal);
-        Assert.Contains("local_dim0 = 4", generatedKernelsPy, StringComparison.Ordinal);
-        Assert.Contains("split_linear0 = shard_coord1", generatedKernelsPy, StringComparison.Ordinal);
-        Assert.Contains("global_idx0 = lane + split_linear0 * local_dim0", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("local_dim0 = 1", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("split_linear0 = shard_coord0 * 8 + shard_coord1", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("global_idx0 = idx0 + split_linear0 * local_dim0", generatedKernelsPy, StringComparison.Ordinal);
         Assert.Contains("source_offsets = 0 + lane * 0 + global_idx0 * (1 * 1) + global_idx1 * 1", generatedKernelsPy, StringComparison.Ordinal);
         Assert.Contains("result = value0 + value1", generatedKernelsPy, StringComparison.Ordinal);
         Assert.Contains("tl.store(destination + destination_offsets, value, mask=mask)", generatedKernelsPy, StringComparison.Ordinal);
@@ -212,6 +213,37 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         Assert.DoesNotContain(RemovedLocalName("warp", "rdata"), modelPy, StringComparison.Ordinal);
         Assert.DoesNotContain(RemovedLocalName("warp", "data"), modelPy, StringComparison.Ordinal);
         AssertGeneratedModelRunsBinaryAdd(outputDirectory);
+    }
+
+    [Fact]
+    public async Task TestPyNTTShapeBucketMainUsesOutputBufferAbi()
+    {
+        ConfigureAutoDistributedPyNTT();
+        CompileOptions.DumpFlags = DumpFlags.PassIR | DumpFlags.CodeGen;
+        CompileOptions.ShapeBucketOptions.Enable = true;
+        CompileOptions.ShapeBucketOptions.SegmentsCount = 2;
+
+        var dimN = new DimVar("n") { Metadata = { Range = new(1, 8) } };
+        var shape = new RankedShape(new Dimension[] { dimN, 1 });
+        var lhs = new Var("lhs", new TensorType(DataTypes.Float32, shape));
+        var rhs = new Var("rhs", new TensorType(DataTypes.Float32, shape));
+        CompileOptions.ShapeBucketOptions.VarMap.Add(lhs, shape.ToArray());
+        CompileOptions.ShapeBucketOptions.VarMap.Add(rhs, shape.ToArray());
+        var main = new Function("main", PyNTTTarget.Kind, IR.F.Math.Binary(BinaryOp.Add, lhs, rhs), new[] { lhs, rhs });
+
+        var outputDirectory = await GeneratePyNTTModelDirectoryWithCompilerPipeline("generated_shape_bucket_abi_model", main);
+        using var document = JsonDocument.Parse(File.ReadAllText(Path.Join(outputDirectory, "metadata.json")));
+        var function = document.RootElement.GetProperty("functions").EnumerateArray()
+            .Single(item => item.GetProperty("is_entry").GetBoolean());
+        Assert.Equal("main_prim", function.GetProperty("name").GetString());
+        Assert.Equal("output0", function.GetProperty("outputs").EnumerateArray().Single().GetProperty("name").GetString());
+
+        var finalMainTir = Directory.GetFiles(Dumpper.Directory, "main_prim.script", SearchOption.AllDirectories)
+            .Select(File.ReadAllText)
+            .Last(text => text.Contains("T.PrimFunc(\"main_prim\"", StringComparison.Ordinal) && text.Contains("-> ()", StringComparison.Ordinal));
+        Assert.Contains("%out_", finalMainTir, StringComparison.Ordinal);
+        Assert.Contains("main_segment_", finalMainTir, StringComparison.Ordinal);
+        Assert.DoesNotContain("Return(", finalMainTir, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -330,12 +362,12 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         var splitByTokenType = new DistributedType(inputType, new SBP[] { SBP.S([0], 1), SBP.B }, placement);
         var featureShard = CreateBuffer("feature_shard", DataTypes.BFloat16, TIR.MemoryLocation.Data, 0, [3, 128], [4, 1], splitByFeatureType);
         var tokenShard = CreateBuffer("token_shard", DataTypes.BFloat16, TIR.MemoryLocation.Data, 1024, [3, 128], [128, 1], splitByTokenType);
-        var output = new Var("output", inputType);
+        var output = CreateOutputVar("output", inputType);
         var body = new TIR.Sequential(
             TIR.F.NTT.TensorLoad(featureShard, input, splitByFeatureType.AxisPolicies, placement),
             TIR.F.NTT.GatherReduceScatter(featureShard, tokenShard, splitByFeatureType, splitByTokenType),
             TIR.F.NTT.TensorStore(tokenShard, output, splitByTokenType.AxisPolicies, placement));
-        var main = new TIR.PrimFunction("main_prim", PyNTTTarget.Kind, body, new[] { input })
+        var main = new TIR.PrimFunction("main_prim", PyNTTTarget.Kind, body, new IVar[] { input, output })
         {
             SchedResult =
             {
@@ -358,6 +390,55 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
     }
 
     [Fact]
+    public void TestPyNTTMultiLaneVectorTransposeRun()
+    {
+        ConfigureAutoDistributedPyNTT();
+
+        var inputType = new TensorType(DataTypes.BFloat16, new[] { 2, 3, 32 });
+        var outputType = new TensorType(DataTypes.BFloat16, new[] { 3, 2, 32 });
+        var vector32Type = new VectorType(DataTypes.BFloat16, 4, 8);
+        var vector32InputType = new TensorType(vector32Type, new[] { 2, 3, 1 });
+        var vector32OutputType = new TensorType(vector32Type, new[] { 3, 2, 1 });
+        var placement = new Placement(new[] { 4, 8 }, "yx", "bb");
+        var inputDistributedType = new DistributedType(inputType, new SBP[] { SBP.B, SBP.B, SBP.B }, placement);
+        var vector32InputDistributedType = new DistributedType(vector32InputType, new SBP[] { SBP.B, SBP.B, SBP.B }, placement);
+        var vector32OutputDistributedType = new DistributedType(vector32OutputType, new SBP[] { SBP.B, SBP.B, SBP.B }, placement);
+        var outputDistributedType = new DistributedType(outputType, new SBP[] { SBP.B, SBP.B, SBP.B }, placement);
+        var scalarInput = CreateBuffer("scalar_input", DataTypes.BFloat16, TIR.MemoryLocation.Data, 0, [2, 3, 32], [96, 32, 1], inputDistributedType);
+        var vector32Input = CreateBuffer("vector32_input", vector32Type, TIR.MemoryLocation.Data, 384, [2, 3, 1], [3, 1, 1], vector32InputDistributedType);
+        var vector32Output = CreateBuffer("vector32_output", vector32Type, TIR.MemoryLocation.Data, 768, [3, 2, 1], [2, 1, 1], vector32OutputDistributedType);
+        var scalarOutput = CreateBuffer("scalar_output", DataTypes.BFloat16, TIR.MemoryLocation.Data, 1152, [3, 2, 32], [64, 32, 1], outputDistributedType);
+        var input = new Var("x", inputType);
+        var output = CreateOutputVar("output", outputType);
+        var body = new TIR.Sequential(
+            TIR.F.NTT.TensorLoad(scalarInput, input, inputDistributedType.AxisPolicies, placement),
+            TIR.F.NTT.Pack(scalarInput, vector32Input, new[] { 4, 8 }, new[] { 2, 2 }),
+            TIR.F.NTT.Transpose(vector32Input, vector32Output, new[] { 1, 0, 2 }),
+            TIR.F.NTT.Unpack(vector32Output, scalarOutput, new[] { 4, 8 }, new[] { 2, 2 }),
+            TIR.F.NTT.TensorStore(scalarOutput, output, outputDistributedType.AxisPolicies, placement));
+        var main = new TIR.PrimFunction("main_prim", PyNTTTarget.Kind, body, new IVar[] { input, output })
+        {
+            SchedResult =
+            {
+                DataUsage = 1536,
+            },
+        };
+
+        var outputDirectory = GeneratePyNTTModelDirectory("generated_multi_lane_vector_transpose_run_model", main);
+        RenderGeneratedKernels(outputDirectory);
+        var generatedKernelsPy = File.ReadAllText(Path.Join(outputDirectory, "generated_kernels.py"));
+        Assert.Contains("generated from PyNTT Jinja Transpose.py.jinja", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("lane_flat = linear % 32", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("in_idx2 = out_idx2 * 32 + lane0 * 8 + lane1", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("out_idx2 = in_idx2 * 32 + lane0 * 8 + lane1", generatedKernelsPy, StringComparison.Ordinal);
+        AssertGeneratedModelRuns(
+            outputDirectory,
+            "x = ((torch.arange(2 * 3 * 32, dtype=torch.float32, device='cuda').reshape(2, 3, 32) - 37) * 0.015625).to(torch.bfloat16)",
+            "output = module(x)",
+            "torch.testing.assert_close(output, x.permute(1, 0, 2).contiguous(), rtol=0, atol=0)");
+    }
+
+    [Fact]
     public void TestPyNTTDistributedBoxingBroadcastAxisPartitionRun()
     {
         ConfigureAutoDistributedPyNTT();
@@ -369,12 +450,12 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         var broadcastType = new DistributedType(inputType, new SBP[] { SBP.B, SBP.B }, placement);
         var tokenShard = CreateBuffer("token_shard", DataTypes.BFloat16, TIR.MemoryLocation.Data, 0, [1, 128], [128, 1], splitByTokenType);
         var broadcastShard = CreateBuffer("broadcast_shard", DataTypes.BFloat16, TIR.MemoryLocation.Data, 1024, [3, 128], [128, 1], broadcastType);
-        var output = new Var("output", inputType);
+        var output = CreateOutputVar("output", inputType);
         var body = new TIR.Sequential(
             TIR.F.NTT.TensorLoad(tokenShard, input, splitByTokenType.AxisPolicies, placement),
             TIR.F.NTT.GatherReduceScatter(tokenShard, broadcastShard, splitByTokenType, broadcastType),
             TIR.F.NTT.TensorStore(broadcastShard, output, broadcastType.AxisPolicies, placement));
-        var main = new TIR.PrimFunction("main_prim", PyNTTTarget.Kind, body, new[] { input })
+        var main = new TIR.PrimFunction("main_prim", PyNTTTarget.Kind, body, new IVar[] { input, output })
         {
             SchedResult =
             {
@@ -416,14 +497,14 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         var vectorShard = CreateBuffer("vector_shard", vectorElemType, TIR.MemoryLocation.Data, 2048, [3, 2, 16], [32, 16, 1], vectorSplitType);
         var broadcastVectorShard = CreateBuffer("broadcast_vector_shard", vectorElemType, TIR.MemoryLocation.Data, 4096, [3, 16, 16], [256, 16, 1], vectorBroadcastType);
         var broadcastScalarShard = CreateBuffer("broadcast_scalar_shard", DataTypes.BFloat16, TIR.MemoryLocation.Data, 18432, [3, 16, 128], [2048, 128, 1], scalarBroadcastType);
-        var output = new Var("output", scalarInputType);
+        var output = CreateOutputVar("output", scalarInputType);
         var body = new TIR.Sequential(
             TIR.F.NTT.TensorLoad(scalarShard, input, scalarSplitType.AxisPolicies, placement),
             TIR.F.NTT.Pack(scalarShard, vectorShard, new[] { 8 }, new[] { 2 }),
             TIR.F.NTT.GatherReduceScatter(vectorShard, broadcastVectorShard, vectorSplitType, vectorBroadcastType),
             TIR.F.NTT.Unpack(broadcastVectorShard, broadcastScalarShard, new[] { 8 }, new[] { 2 }),
             TIR.F.NTT.TensorStore(broadcastScalarShard, output, scalarBroadcastType.AxisPolicies, placement));
-        var main = new TIR.PrimFunction("main_prim", PyNTTTarget.Kind, body, new[] { input })
+        var main = new TIR.PrimFunction("main_prim", PyNTTTarget.Kind, body, new IVar[] { input, output })
         {
             SchedResult =
             {
@@ -464,14 +545,14 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         var vectorFeatureShard = CreateBuffer("vector_feature_shard", vectorElemType, TIR.MemoryLocation.Data, 256, [3, 4], [4, 1], vectorFeatureSplitType);
         var vectorTokenShard = CreateBuffer("vector_token_shard", vectorElemType, TIR.MemoryLocation.Data, 512, [1, 128], [128, 1], vectorTokenSplitType);
         var scalarTokenShard = CreateBuffer("scalar_token_shard", DataTypes.BFloat16, TIR.MemoryLocation.Data, 2560, [1, 1024], [1024, 1], scalarTokenSplitType);
-        var output = new Var("output", scalarInputType);
+        var output = CreateOutputVar("output", scalarInputType);
         var body = new TIR.Sequential(
             TIR.F.NTT.TensorLoad(scalarFeatureShard, input, scalarFeatureSplitType.AxisPolicies, placement),
             TIR.F.NTT.Pack(scalarFeatureShard, vectorFeatureShard, new[] { 8 }, new[] { 1 }),
             TIR.F.NTT.GatherReduceScatter(vectorFeatureShard, vectorTokenShard, vectorFeatureSplitType, vectorTokenSplitType),
             TIR.F.NTT.Unpack(vectorTokenShard, scalarTokenShard, new[] { 8 }, new[] { 1 }),
             TIR.F.NTT.TensorStore(scalarTokenShard, output, scalarTokenSplitType.AxisPolicies, placement));
-        var main = new TIR.PrimFunction("main_prim", PyNTTTarget.Kind, body, new[] { input })
+        var main = new TIR.PrimFunction("main_prim", PyNTTTarget.Kind, body, new IVar[] { input, output })
         {
             SchedResult =
             {
@@ -510,14 +591,14 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         var vectorShard = CreateBuffer("vector_shard", vectorElemType, TIR.MemoryLocation.Data, 4096, [2, 16, 5], [80, 5, 1], vectorSplitType);
         var broadcastVectorShard = CreateBuffer("broadcast_vector_shard", vectorElemType, TIR.MemoryLocation.Data, 8192, [16, 16, 20], [320, 20, 1], vectorBroadcastType);
         var broadcastScalarShard = CreateBuffer("broadcast_scalar_shard", DataTypes.BFloat16, TIR.MemoryLocation.Data, 98304, [16, 16, 160], [2560, 160, 1], scalarBroadcastType);
-        var output = new Var("output", scalarInputType);
+        var output = CreateOutputVar("output", scalarInputType);
         var body = new TIR.Sequential(
             TIR.F.NTT.TensorLoad(scalarShard, input, scalarSplitType.AxisPolicies, placement),
             TIR.F.NTT.Pack(scalarShard, vectorShard, new[] { 8 }, new[] { 2 }),
             TIR.F.NTT.GatherReduceScatter(vectorShard, broadcastVectorShard, vectorSplitType, vectorBroadcastType),
             TIR.F.NTT.Unpack(broadcastVectorShard, broadcastScalarShard, new[] { 8 }, new[] { 2 }),
             TIR.F.NTT.TensorStore(broadcastScalarShard, output, scalarBroadcastType.AxisPolicies, placement));
-        var main = new TIR.PrimFunction("main_prim", PyNTTTarget.Kind, body, new[] { input })
+        var main = new TIR.PrimFunction("main_prim", PyNTTTarget.Kind, body, new IVar[] { input, output })
         {
             SchedResult =
             {
@@ -551,12 +632,12 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         var broadcastFeatureType = new DistributedType(inputType, new SBP[] { SBP.S([0], 5), SBP.B }, placement);
         var featureShard = CreateBuffer("feature_shard", DataTypes.BFloat16, TIR.MemoryLocation.Data, 0, [5, 384], [384, 1], splitFeatureType);
         var broadcastShard = CreateBuffer("broadcast_shard", DataTypes.BFloat16, TIR.MemoryLocation.Data, 4096, [5, 3072], [3072, 1], broadcastFeatureType);
-        var output = new Var("output", inputType);
+        var output = CreateOutputVar("output", inputType);
         var body = new TIR.Sequential(
             TIR.F.NTT.TensorLoad(featureShard, input, splitFeatureType.AxisPolicies, placement),
             TIR.F.NTT.GatherReduceScatter(featureShard, broadcastShard, splitFeatureType, broadcastFeatureType),
             TIR.F.NTT.TensorStore(broadcastShard, output, broadcastFeatureType.AxisPolicies, placement));
-        var main = new TIR.PrimFunction("main_prim", PyNTTTarget.Kind, body, new[] { input })
+        var main = new TIR.PrimFunction("main_prim", PyNTTTarget.Kind, body, new IVar[] { input, output })
         {
             SchedResult =
             {
@@ -675,6 +756,18 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         var generatedKernelsPy = File.ReadAllText(Path.Join(outputDirectory, "generated_kernels.py"));
         Assert.Contains("generated from PyNTT Jinja UpdatePagedAttentionKVCache.py.jinja", generatedKernelsPy, StringComparison.Ordinal);
         Assert.Contains("generated from PyNTT Jinja PagedAttention.py.jinja", generatedKernelsPy, StringComparison.Ordinal);
+        using (var kernelParams = JsonDocument.Parse(File.ReadAllText(Path.Join(outputDirectory, "kernel_params.json"))))
+        {
+            var kernelInputs = kernelParams.RootElement.GetProperty("functions")
+                .EnumerateArray()
+                .SelectMany(function => function.GetProperty("render_kernels").EnumerateArray())
+                .SelectMany(kernel => kernel.GetProperty("metadata").GetProperty("inputs").EnumerateArray())
+                .Select(input => input.GetString())
+                .ToArray();
+            Assert.DoesNotContain(kvCacheObjVar.Name, kernelInputs);
+            Assert.Contains($"{kvCacheObjVar.Name}.__metadata", kernelInputs);
+        }
+
         AssertGeneratedModelRuns(
             outputDirectory,
             "torch.manual_seed(0)",
@@ -703,6 +796,130 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
             "        probs = torch.softmax(scores, dim=0)",
             "        ref[token, q_head, :] = torch.matmul(probs, value[:token + 1, kv_head, :].to(torch.float32))",
             "torch.testing.assert_close(output.to(torch.float32), ref.to(torch.bfloat16).to(torch.float32), rtol=3e-2, atol=3e-2)");
+    }
+
+    [Fact]
+    public async Task TestPyNTTPackedQKVParallelLinearQwenLikeRun()
+    {
+        ConfigureAutoDistributedPyNTT();
+        var targetOptions = Assert.IsType<PyNTTTargetOptions>(CompileOptions.TargetOptions);
+        targetOptions.Vectorize = true;
+
+        var seq = 20;
+        var k = 256;
+        var qn = 512;
+        var kvn = 256;
+        var input = new Var("input", new TensorType(DataTypes.BFloat16, new[] { seq, k }));
+        var qWeight = new Var("q_weight", new TensorType(DataTypes.BFloat16, new[] { k, qn }));
+        var kWeight = new Var("k_weight", new TensorType(DataTypes.BFloat16, new[] { k, kvn }));
+        var vWeight = new Var("v_weight", new TensorType(DataTypes.BFloat16, new[] { k, kvn }));
+        var qkv = IR.F.NN.QKVParallelLinear(
+            input,
+            qWeight,
+            kWeight,
+            vWeight,
+            None.Default,
+            None.Default,
+            None.Default,
+            None.Default,
+            None.Default,
+            None.Default,
+            None.Default,
+            None.Default,
+            None.Default,
+            numHeads: 16,
+            numKvHeads: 8,
+            outputDataType: DataTypes.BFloat16);
+        var main = new Function("main", PyNTTTarget.Kind, qkv, new[] { input, qWeight, kWeight, vWeight });
+
+        var outputDirectory = await GeneratePyNTTModelDirectoryWithCompilerPipeline("generated_qwen_like_qkv_run_model", main);
+        RenderGeneratedKernels(outputDirectory);
+        var generatedKernelsPy = File.ReadAllText(Path.Join(outputDirectory, "generated_kernels.py"));
+        Assert.Contains("generated from PyNTT Jinja PackedQKVParallelLinear.py.jinja", generatedKernelsPy, StringComparison.Ordinal);
+        AssertGeneratedModelRuns(
+            outputDirectory,
+            "torch.manual_seed(0)",
+            $"input = (torch.randn({seq}, {k}, dtype=torch.float32, device='cuda') * 0.05).to(torch.bfloat16)",
+            $"q_weight = (torch.randn({k}, {qn}, dtype=torch.float32, device='cuda') * 0.03).to(torch.bfloat16)",
+            $"k_weight = (torch.randn({k}, {kvn}, dtype=torch.float32, device='cuda') * 0.03).to(torch.bfloat16)",
+            $"v_weight = (torch.randn({k}, {kvn}, dtype=torch.float32, device='cuda') * 0.03).to(torch.bfloat16)",
+            "q, k_out, v_out = module(input, q_weight, k_weight, v_weight)",
+            "torch.testing.assert_close(q.to(torch.float32), (input @ q_weight).to(torch.bfloat16).to(torch.float32), rtol=2e-2, atol=2e-2)",
+            "torch.testing.assert_close(k_out.to(torch.float32), (input @ k_weight).to(torch.bfloat16).to(torch.float32), rtol=2e-2, atol=2e-2)",
+            "torch.testing.assert_close(v_out.to(torch.float32), (input @ v_weight).to(torch.bfloat16).to(torch.float32), rtol=2e-2, atol=2e-2)");
+    }
+
+    [Fact]
+    public async Task TestPyNTTPackedMatMulGluQwenLikeRun()
+    {
+        ConfigureAutoDistributedPyNTT();
+        var targetOptions = Assert.IsType<PyNTTTargetOptions>(CompileOptions.TargetOptions);
+        targetOptions.Vectorize = true;
+
+        var seq = 20;
+        var k = 512;
+        var n = 768;
+        var input = new Var("input", new TensorType(DataTypes.BFloat16, new[] { seq, k }));
+        var gateWeight = new Var("gate_weight", new TensorType(DataTypes.BFloat16, new[] { k, n }));
+        var upWeight = new Var("up_weight", new TensorType(DataTypes.BFloat16, new[] { k, n }));
+        var glu = IR.F.NN.MatMulGlu(
+            input,
+            gateWeight,
+            upWeight,
+            None.Default,
+            None.Default,
+            None.Default,
+            None.Default,
+            None.Default,
+            None.Default,
+            IR.NN.GluType.SwiGLU,
+            DataTypes.BFloat16);
+        var main = new Function("main", PyNTTTarget.Kind, glu, new[] { input, gateWeight, upWeight });
+
+        var outputDirectory = await GeneratePyNTTModelDirectoryWithCompilerPipeline("generated_qwen_like_glu_run_model", main);
+        RenderGeneratedKernels(outputDirectory);
+        var generatedKernelsPy = File.ReadAllText(Path.Join(outputDirectory, "generated_kernels.py"));
+        Assert.Contains("generated from PyNTT Jinja PackedMatMulGlu.py.jinja", generatedKernelsPy, StringComparison.Ordinal);
+        AssertGeneratedModelRuns(
+            outputDirectory,
+            "torch.manual_seed(1)",
+            $"input = (torch.randn({seq}, {k}, dtype=torch.float32, device='cuda') * 0.05).to(torch.bfloat16)",
+            $"gate_weight = (torch.randn({k}, {n}, dtype=torch.float32, device='cuda') * 0.03).to(torch.bfloat16)",
+            $"up_weight = (torch.randn({k}, {n}, dtype=torch.float32, device='cuda') * 0.03).to(torch.bfloat16)",
+            "output = module(input, gate_weight, up_weight)",
+            "gate = input @ gate_weight",
+            "up = input @ up_weight",
+            "expect = (gate.to(torch.float32) * torch.sigmoid(gate.to(torch.float32)) * up.to(torch.float32)).to(torch.bfloat16).to(torch.float32)",
+            "torch.testing.assert_close(output.to(torch.float32), expect, rtol=2e-2, atol=2e-2)");
+    }
+
+    [Fact]
+    public async Task TestPyNTTRmsNormQwenLikeRun()
+    {
+        ConfigureAutoDistributedPyNTT();
+        var targetOptions = Assert.IsType<PyNTTTargetOptions>(CompileOptions.TargetOptions);
+        targetOptions.Vectorize = true;
+
+        var seq = 20;
+        var hidden = 1024;
+        var input = new Var("input", new TensorType(DataTypes.BFloat16, new[] { seq, hidden }));
+        var scale = new Var("scale", new TensorType(DataTypes.BFloat16, new[] { hidden }));
+        var bias = Tensor.Zeros<BFloat16>([hidden]);
+        var main = new Function("main", PyNTTTarget.Kind, IR.F.NN.LayerNorm(1, 1e-6f, input, scale, bias, hasMean: false), new[] { input, scale });
+
+        var outputDirectory = await GeneratePyNTTModelDirectoryWithCompilerPipeline("generated_qwen_like_rms_norm_run_model", main);
+        RenderGeneratedKernels(outputDirectory);
+        var generatedKernelsPy = File.ReadAllText(Path.Join(outputDirectory, "generated_kernels.py"));
+        Assert.Contains("generated from PyNTT Jinja NormStats.py.jinja", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("generated from PyNTT Jinja NormApply.py.jinja", generatedKernelsPy, StringComparison.Ordinal);
+        AssertGeneratedModelRuns(
+            outputDirectory,
+            "torch.manual_seed(2)",
+            $"input = (torch.randn({seq}, {hidden}, dtype=torch.float32, device='cuda') * 0.05).to(torch.bfloat16)",
+            $"scale = (1.0 + torch.randn({hidden}, dtype=torch.float32, device='cuda') * 0.01).to(torch.bfloat16)",
+            "output = module(input, scale)",
+            "expect = input.to(torch.float32) * torch.rsqrt(torch.mean(input.to(torch.float32) * input.to(torch.float32), dim=1, keepdim=True) + 1e-6) * scale.to(torch.float32)",
+            "torch.testing.assert_close(output.to(torch.float32), expect.to(torch.bfloat16).to(torch.float32), rtol=2e-2, atol=2e-2)");
     }
 
     [Fact]
@@ -742,12 +959,12 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         var outputType = new TensorType(DataTypes.Float32, new[] { 20 });
         var outputDistributedType = new DistributedType(outputType, new SBP[] { SBP.S([0], 5) }, placement);
         var kvCacheObjVar = new Var("kvCache", TensorType.Scalar(new ReferenceType(new PagedAttentionKVCacheType { Config = config })));
-        var output = new Var("output", outputType);
+        var output = CreateOutputVar("output", outputType);
         var outputBuffer = CreateBuffer("position_ids", DataTypes.Float32, TIR.MemoryLocation.Data, 0, [5], [1], outputDistributedType);
         var body = new TIR.Sequential(
             TIR.F.NTT.GetPositionIds(kvCacheObjVar, outputBuffer, outputDistributedType),
             TIR.F.NTT.TensorStore(outputBuffer, output, outputDistributedType.AxisPolicies, placement));
-        var main = new TIR.PrimFunction("main_prim", PyNTTTarget.Kind, body, new[] { kvCacheObjVar })
+        var main = new TIR.PrimFunction("main_prim", PyNTTTarget.Kind, body, new IVar[] { kvCacheObjVar, output })
         {
             SchedResult =
             {
@@ -773,17 +990,81 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
     }
 
     [Fact]
+    public void TestPyNTTObjectMemcopyMaterializesOutputAlias()
+    {
+        var objectType = TensorType.Scalar(new ReferenceType(DataTypes.Int32));
+        var input = new Var("cache", objectType);
+        var output = CreateOutputVar("output", objectType);
+        var body = new TIR.Sequential(TIR.T.Memcopy(output, input));
+        var main = new TIR.PrimFunction("main_prim", PyNTTTarget.Kind, body, new IVar[] { input, output });
+
+        var outputDirectory = GeneratePyNTTModelDirectory("generated_object_memcopy_alias_model", main);
+        RenderGeneratedKernels(outputDirectory);
+        using var document = JsonDocument.Parse(File.ReadAllText(Path.Join(outputDirectory, "metadata.json")));
+        var function = document.RootElement.GetProperty("functions").EnumerateArray().Single();
+        Assert.Equal("cache", function.GetProperty("inputs").EnumerateArray().Single().GetProperty("name").GetString());
+        Assert.Equal("object", function.GetProperty("outputs").EnumerateArray().Single().GetProperty("dtype").GetString());
+        var kernel = function.GetProperty("generated_kernels").EnumerateArray().Single();
+        Assert.Equal("alias", kernel.GetProperty("op_kind").GetString());
+        Assert.True(kernel.GetProperty("attrs").GetProperty("pure_alias").GetBoolean());
+        Assert.Equal("cache", kernel.GetProperty("attrs").GetProperty("runtime_output_aliases").GetProperty("output0").GetString());
+        Assert.False(kernel.GetProperty("attrs").TryGetProperty("output_aliases", out _));
+
+        var modelPy = File.ReadAllText(Path.Join(outputDirectory, "model.py"));
+        Assert.Contains("outputs[0] = inputs[0]", modelPy, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void TestPyNTTEntryOutputSpecDoesNotCollectNestedFunctionOutputs()
+    {
+        var input = new Var("x", new TensorType(DataTypes.Float32, new[] { 4 }));
+        var placement = new Placement(new[] { 1 }, "b", "b");
+        var sourceBuffer = CreateBuffer("source", DataTypes.Float32, TIR.MemoryLocation.Data, 0, [4], [1]);
+        var publicOutputBuffer = CreateOutputVar("public_output", new TensorType(DataTypes.Float32, new[] { 4 }));
+        var nestedOutputBuffer = CreateOutputVar("nested_output", new TensorType(DataTypes.Float32, new[] { 2 }));
+        var nested = new TIR.PrimFunction(
+            "nested_prim",
+            PyNTTTarget.Kind,
+            new TIR.Sequential(),
+            new IVar[] { nestedOutputBuffer });
+        var body = new TIR.Sequential(
+            nested,
+            TIR.F.NTT.TensorStore(sourceBuffer, publicOutputBuffer, new[] { SBP.B }, placement));
+        var main = new TIR.PrimFunction("main_prim", PyNTTTarget.Kind, body, new IVar[] { input, publicOutputBuffer })
+        {
+            SchedResult =
+            {
+                DataUsage = 16,
+            },
+        };
+
+        var outputDirectory = GeneratePyNTTModelDirectory("generated_nested_output_scope_model", main);
+        using var document = JsonDocument.Parse(File.ReadAllText(Path.Join(outputDirectory, "metadata.json")));
+        var function = document.RootElement.GetProperty("functions").EnumerateArray().Single();
+        var outputs = function.GetProperty("outputs").EnumerateArray().ToArray();
+        var output = Assert.Single(outputs);
+        Assert.Equal("output0", output.GetProperty("name").GetString());
+        Assert.Equal("float32", output.GetProperty("dtype").GetString());
+        Assert.Equal(new[] { 4L }, output.GetProperty("shape").EnumerateArray().Select(value => value.GetInt64()).ToArray());
+    }
+
+    [Fact]
     public void TestPyNTTPackedMatmulUsesTwoDimensionalNLanes()
     {
         var lhsBuffer = CreateDataBuffer("lhs", DataTypes.Float32, 0, [1, 64], [64, 1]);
         var packedElemType = new VectorType(DataTypes.Float32, 4, 8);
         var rhsBuffer = CreateDataBuffer("rhs", packedElemType, 256, [4, 64], [64, 1]);
-        var outputBuffer = CreateDataBuffer("output", packedElemType, 33024, [1, 4], [4, 1]);
-        var outputAlias = new Var("output_alias", new TensorType(DataTypes.Float32, new[] { 1 }));
+        var packedOutputBuffer = CreateDataBuffer("packed_output", packedElemType, 33024, [1, 4], [4, 1]);
+        var vectorOutputBuffer = CreateDataBuffer("vector_output", new VectorType(DataTypes.Float32, 8), 33536, [1, 16], [16, 1]);
+        var outputBuffer = CreateDataBuffer("output", DataTypes.Float32, 34048, [1, 128], [128, 1]);
+        var output = CreateOutputVar("output", new TensorType(DataTypes.Float32, new[] { 1, 128 }));
+        var placement = new Placement(new[] { 1 }, "b", "b");
         var body = new TIR.Sequential(
-            TIR.F.NTT.PackedMatMul(lhsBuffer, rhsBuffer, outputBuffer, None.Default, 1.0f),
-            TIR.T.Return(outputAlias));
-        var main = new TIR.PrimFunction("main_prim", PyNTTTarget.Kind, body, new[] { outputAlias })
+            TIR.F.NTT.PackedMatMul(lhsBuffer, rhsBuffer, packedOutputBuffer, None.Default, 1.0f),
+            TIR.F.NTT.Unpack(packedOutputBuffer, vectorOutputBuffer, new[] { 4 }, new[] { 1 }),
+            TIR.F.NTT.Unpack(vectorOutputBuffer, outputBuffer, new[] { 8 }, new[] { 1 }),
+            TIR.F.NTT.TensorStore(outputBuffer, output, new[] { SBP.B, SBP.B }, placement));
+        var main = new TIR.PrimFunction("main_prim", PyNTTTarget.Kind, body, new IVar[] { output })
         {
             SchedResult =
             {
@@ -807,7 +1088,7 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
     public void TestPyNTTPackedMatmulRunUsesPackedNLanes()
     {
         var lhs = new Var("lhs", new TensorType(DataTypes.Float32, new[] { 1, 64 }));
-        var output = new Var("output", new TensorType(DataTypes.Float32, new[] { 1, 128 }));
+        var output = CreateOutputVar("output", new TensorType(DataTypes.Float32, new[] { 1, 128 }));
         var packedElemType = new VectorType(DataTypes.Float32, 4, 8);
         var rhs = CreatePackedMatmulRhsConst();
         var rhsSizeBytes = checked((ulong)rhs.Value.Length * (ulong)rhs.Value.ElementType.SizeInBytes);
@@ -823,7 +1104,7 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
             TIR.F.NTT.Unpack(packedOutputBuffer, vectorOutputBuffer, new[] { 4 }, new[] { 1 }),
             TIR.F.NTT.Unpack(vectorOutputBuffer, outputBuffer, new[] { 8 }, new[] { 1 }),
             TIR.F.NTT.TensorStore(outputBuffer, output, new[] { SBP.B, SBP.B }, placement));
-        var main = new TIR.PrimFunction("main_prim", PyNTTTarget.Kind, body, new[] { lhs })
+        var main = new TIR.PrimFunction("main_prim", PyNTTTarget.Kind, body, new IVar[] { lhs, output })
         {
             SchedResult =
             {
@@ -866,7 +1147,7 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         const int localN = n / x;
 
         var lhs = new Var("lhs", new TensorType(DataTypes.BFloat16, new[] { m, k }));
-        var output = new Var("output", new TensorType(DataTypes.BFloat16, new[] { m, n }));
+        var output = CreateOutputVar("output", new TensorType(DataTypes.BFloat16, new[] { m, n }));
         var placement = new Placement(new[] { y, x }, "yx", "bb");
         var lhsDistributedType = new DistributedType(
             new TensorType(DataTypes.BFloat16, new[] { m, k }),
@@ -906,7 +1187,7 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
             TIR.F.NTT.Unpack(packedOutputBuffer, vectorOutputBuffer, new[] { nPackedLane }, new[] { 1 }),
             TIR.F.NTT.Unpack(vectorOutputBuffer, outputBuffer, new[] { nLane }, new[] { 1 }),
             TIR.F.NTT.TensorStore(outputBuffer, output, outputDistributedType.AxisPolicies.ToArray(), placement));
-        var main = new TIR.PrimFunction("main_prim", PyNTTTarget.Kind, body, new[] { lhs })
+        var main = new TIR.PrimFunction("main_prim", PyNTTTarget.Kind, body, new IVar[] { lhs, output })
         {
             SchedResult =
             {
@@ -1072,6 +1353,9 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
 
     private TIR.Buffer CreateDataBuffer(string name, DataType elemType, long startBytes, long[] dimensions, long[] strides)
         => CreateBuffer(name, elemType, TIR.MemoryLocation.Data, startBytes, dimensions, strides);
+
+    private TIR.BufferVar CreateOutputVar(string name, IRType type)
+        => new(name, type, TIR.BufferVarRole.Output, TIR.MemoryLocation.Output);
 
     private TIR.Buffer CreateBuffer(string name, DataType elemType, TIR.MemoryLocation location, long startBytes, long[] dimensions, long[] strides, DistributedType? distributedType = null)
     {

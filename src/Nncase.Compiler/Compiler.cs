@@ -105,6 +105,7 @@ public class Compiler : ICompiler
         passManager.Add<OptimizeByRangePass>();
         passManager.Add<ShapeInferPass>();
         RegisterPreAndPostProcess(passManager);
+        passManager.Add<AddFunctionToModule>();
     }
 
     public void TargetIndependentPass(IPassManager passManager)
@@ -358,10 +359,7 @@ public class Compiler : ICompiler
         target.RegisterTIRSelectionPass(passManager, _compileSession.CompileOptions);
         passManager.Add<AddFunctionToModule>();
 
-        passManager.AddWithName<PrimFuncPass>("RemoveFunctionWrapper").Configure(p =>
-        {
-            p.Add<Passes.Mutators.RemoveFunctionWrapper>();
-        });
+        passManager.AddWithName<RemoveFunctionWrapperPass>("RemoveFunctionWrapper");
 
         passManager.Add<RemoveUnusedFunctions>();
         passManager.Add<InferRangePass>();

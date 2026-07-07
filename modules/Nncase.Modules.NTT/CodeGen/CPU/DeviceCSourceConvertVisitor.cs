@@ -675,6 +675,35 @@ public class DeviceCSourceConvertVisitor : CSourceConvertVisitor
         return symbol;
     }
 
+    protected override CSymbol VisitBufferVar(BufferVar expr)
+    {
+        if (_exprMemo.TryGetValue(expr, out var symbol))
+        {
+            return symbol;
+        }
+
+        var name = IRHelpers.GetIdentityName(expr.Name);
+        var index = VisitEntry.Parameters.IndexOf(expr);
+        if (index != -1)
+        {
+            symbol = new CSymbol($"T{index}", name);
+        }
+        else
+        {
+            symbol = new(
+                expr.CheckedType switch
+                {
+                    TensorType tensorType => tensorType.DType.ToC(),
+                    DistributedType distributedType => distributedType.TensorType.DType.ToC(),
+                    _ => throw new NotSupportedException($"Unsupported buffer var type: {expr.CheckedType}"),
+                },
+                name);
+        }
+
+        _exprMemo.Add(expr, symbol);
+        return symbol;
+    }
+
     protected override CSymbol VisitAsDim(AsDim expr)
     {
         if (_exprMemo.TryGetValue(expr, out var symbol))

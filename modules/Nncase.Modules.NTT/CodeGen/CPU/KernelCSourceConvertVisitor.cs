@@ -33,7 +33,7 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
     private readonly StringBuilder _kernelBuilder;
     private readonly HashSet<TIR.PrimFunction> _refFuncs;
     private readonly HashSet<TIR.Buffer> _declaredBuffers = new(ReferenceEqualityComparer.Instance);
-    private Var[]? _tensorParams;
+    private IVar[]? _tensorParams;
 
     public KernelCSourceConvertVisitor(NTTTargetOptions targetOptions)
     {
@@ -47,7 +47,7 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
 
     public ulong CollectivePoolSize { get; private set; }
 
-    private Var[] TensorParams => _tensorParams ??= VisitEntry.Parameters.ToArray().OfType<Var>().Where(x => !_excludedVars.Contains(x.Name)).ToArray();
+    private IVar[] TensorParams => _tensorParams ??= VisitEntry.Parameters.ToArray().Where(x => !_excludedVars.Contains(x.Name)).ToArray();
 
     public void WriteWithProfiler(string functionName, string tagName = "")
     {
@@ -114,7 +114,29 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
         }
 
         var name = IRHelpers.GetIdentityName(expr.Name);
-        var index = TensorParams.IndexOf(expr);
+        var index = Array.IndexOf(TensorParams, expr);
+        if (index != -1)
+        {
+            symbol = new CSymbol($"T{index}", name);
+        }
+        else
+        {
+            symbol = new(expr.CheckedDataType.ToC(), name);
+        }
+
+        _exprMemo.Add(expr, symbol);
+        return symbol;
+    }
+
+    protected override CSymbol VisitBufferVar(BufferVar expr)
+    {
+        if (_exprMemo.TryGetValue(expr, out var symbol))
+        {
+            return symbol;
+        }
+
+        var name = IRHelpers.GetIdentityName(expr.Name);
+        var index = Array.IndexOf(TensorParams, expr);
         if (index != -1)
         {
             symbol = new CSymbol($"T{index}", name);

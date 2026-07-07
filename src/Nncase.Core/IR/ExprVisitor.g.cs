@@ -210,6 +210,18 @@ public partial class ExprVisitor<TExprResult, TTypeResult, TContext>
     }
 
     /// <inheritdoc />
+    protected internal override TExprResult VisitBufferVar(TIR.BufferVar expr, TContext context)
+    {
+        VisitOperands(expr, context);
+        if (CanVisitAttributes(expr))
+        {
+            VisitAttributes(expr, context);
+        }
+
+        return VisitLeafBufferVar(expr, context);
+    }
+
+    /// <inheritdoc />
     protected internal override TExprResult VisitBlock(TIR.Block expr, TContext context)
     {
         VisitOperands(expr, context);
@@ -899,6 +911,11 @@ public partial class ExprVisitor<TExprResult, TTypeResult, TContext>
     protected virtual TExprResult VisitLeafVar(Var expr, TContext context) => DefaultVisitLeaf(expr, context);
 
     /// <summary>
+    /// Visit leaf <see cref="TIR.BufferVar"/>.
+    /// </summary>
+    protected virtual TExprResult VisitLeafBufferVar(TIR.BufferVar expr, TContext context) => DefaultVisitLeaf(expr, context);
+
+    /// <summary>
     /// Visit leaf <see cref="TIR.Block"/>.
     /// </summary>
     protected virtual TExprResult VisitLeafBlock(TIR.Block expr, TContext context) => DefaultVisitLeaf(expr, context);
@@ -1171,462 +1188,471 @@ public partial class ExprVisitor<TExprResult, TTypeResult>
     /// Visit <see cref="Call"/>.
     /// </summary>
     internal protected virtual TExprResult VisitCall(Call expr) => base.VisitCall(expr, default);
-    
+
     /// <inheritdoc/>
     internal protected sealed override TExprResult VisitCall(Call expr, Unit context) => VisitCall(expr);
     /// <summary>
     /// Visit <see cref="Function"/>.
     /// </summary>
     internal protected virtual TExprResult VisitFunction(Function expr) => base.VisitFunction(expr, default);
-    
+
     /// <inheritdoc/>
     internal protected sealed override TExprResult VisitFunction(Function expr, Unit context) => VisitFunction(expr);
     /// <summary>
     /// Visit <see cref="Fusion"/>.
     /// </summary>
     internal protected virtual TExprResult VisitFusion(Fusion expr) => base.VisitFusion(expr, default);
-    
+
     /// <inheritdoc/>
     internal protected sealed override TExprResult VisitFusion(Fusion expr, Unit context) => VisitFusion(expr);
     /// <summary>
     /// Visit <see cref="If"/>.
     /// </summary>
     internal protected virtual TExprResult VisitIf(If expr) => base.VisitIf(expr, default);
-    
+
     /// <inheritdoc/>
     internal protected sealed override TExprResult VisitIf(If expr, Unit context) => VisitIf(expr);
     /// <summary>
     /// Visit <see cref="Marker"/>.
     /// </summary>
     internal protected virtual TExprResult VisitMarker(Marker expr) => base.VisitMarker(expr, default);
-    
+
     /// <inheritdoc/>
     internal protected sealed override TExprResult VisitMarker(Marker expr, Unit context) => VisitMarker(expr);
     /// <summary>
     /// Visit <see cref="None"/>.
     /// </summary>
     internal protected virtual TExprResult VisitNone(None expr) => base.VisitNone(expr, default);
-    
+
     /// <inheritdoc/>
     internal protected sealed override TExprResult VisitNone(None expr, Unit context) => VisitNone(expr);
     /// <summary>
     /// Visit <see cref="Op"/>.
     /// </summary>
     internal protected virtual TExprResult VisitOp(Op expr) => base.VisitOp(expr, default);
-    
+
     /// <inheritdoc/>
     internal protected sealed override TExprResult VisitOp(Op expr, Unit context) => VisitOp(expr);
     /// <summary>
     /// Visit <see cref="PrimFunctionWrapper"/>.
     /// </summary>
     internal protected virtual TExprResult VisitPrimFunctionWrapper(PrimFunctionWrapper expr) => base.VisitPrimFunctionWrapper(expr, default);
-    
+
     /// <inheritdoc/>
     internal protected sealed override TExprResult VisitPrimFunctionWrapper(PrimFunctionWrapper expr, Unit context) => VisitPrimFunctionWrapper(expr);
     /// <summary>
     /// Visit <see cref="FunctionWrapper"/>.
     /// </summary>
     internal protected virtual TExprResult VisitFunctionWrapper(FunctionWrapper expr) => base.VisitFunctionWrapper(expr, default);
-    
+
     /// <inheritdoc/>
     internal protected sealed override TExprResult VisitFunctionWrapper(FunctionWrapper expr, Unit context) => VisitFunctionWrapper(expr);
     /// <summary>
     /// Visit <see cref="TensorConst"/>.
     /// </summary>
     internal protected virtual TExprResult VisitTensorConst(TensorConst expr) => base.VisitTensorConst(expr, default);
-    
+
     /// <inheritdoc/>
     internal protected sealed override TExprResult VisitTensorConst(TensorConst expr, Unit context) => VisitTensorConst(expr);
     /// <summary>
     /// Visit <see cref="IR.Tuple"/>.
     /// </summary>
     internal protected virtual TExprResult VisitTuple(IR.Tuple expr) => base.VisitTuple(expr, default);
-    
+
     /// <inheritdoc/>
     internal protected sealed override TExprResult VisitTuple(IR.Tuple expr, Unit context) => VisitTuple(expr);
     /// <summary>
     /// Visit <see cref="TupleConst"/>.
     /// </summary>
     internal protected virtual TExprResult VisitTupleConst(TupleConst expr) => base.VisitTupleConst(expr, default);
-    
+
     /// <inheritdoc/>
     internal protected sealed override TExprResult VisitTupleConst(TupleConst expr, Unit context) => VisitTupleConst(expr);
     /// <summary>
     /// Visit <see cref="TIR.PhysicalBuffer"/>.
     /// </summary>
     internal protected virtual TExprResult VisitPhysicalBuffer(TIR.PhysicalBuffer expr) => base.VisitPhysicalBuffer(expr, default);
-    
+
     /// <inheritdoc/>
     internal protected sealed override TExprResult VisitPhysicalBuffer(TIR.PhysicalBuffer expr, Unit context) => VisitPhysicalBuffer(expr);
     /// <summary>
     /// Visit <see cref="TIR.MemSpan"/>.
     /// </summary>
     internal protected virtual TExprResult VisitMemSpan(TIR.MemSpan expr) => base.VisitMemSpan(expr, default);
-    
+
     /// <inheritdoc/>
     internal protected sealed override TExprResult VisitMemSpan(TIR.MemSpan expr, Unit context) => VisitMemSpan(expr);
     /// <summary>
     /// Visit <see cref="Var"/>.
     /// </summary>
     internal protected virtual TExprResult VisitVar(Var expr) => base.VisitVar(expr, default);
-    
+
     /// <inheritdoc/>
     internal protected sealed override TExprResult VisitVar(Var expr, Unit context) => VisitVar(expr);
+
+    /// <summary>
+    /// Visit <see cref="TIR.BufferVar"/>.
+    /// </summary>
+    internal protected virtual TExprResult VisitBufferVar(TIR.BufferVar expr) => base.VisitBufferVar(expr, default);
+
+    /// <inheritdoc/>
+    internal protected sealed override TExprResult VisitBufferVar(TIR.BufferVar expr, Unit context) => VisitBufferVar(expr);
+
     /// <summary>
     /// Visit <see cref="TIR.Block"/>.
     /// </summary>
     internal protected virtual TExprResult VisitBlock(TIR.Block expr) => base.VisitBlock(expr, default);
-    
+
     /// <inheritdoc/>
     internal protected sealed override TExprResult VisitBlock(TIR.Block expr, Unit context) => VisitBlock(expr);
     /// <summary>
     /// Visit <see cref="TIR.Buffer"/>.
     /// </summary>
     internal protected virtual TExprResult VisitBuffer(TIR.Buffer expr) => base.VisitBuffer(expr, default);
-    
+
     /// <inheritdoc/>
     internal protected sealed override TExprResult VisitBuffer(TIR.Buffer expr, Unit context) => VisitBuffer(expr);
     /// <summary>
     /// Visit <see cref="TIR.BufferRegion"/>.
     /// </summary>
     internal protected virtual TExprResult VisitBufferRegion(TIR.BufferRegion expr) => base.VisitBufferRegion(expr, default);
-    
+
     /// <inheritdoc/>
     internal protected sealed override TExprResult VisitBufferRegion(TIR.BufferRegion expr, Unit context) => VisitBufferRegion(expr);
     /// <summary>
     /// Visit <see cref="TIR.For"/>.
     /// </summary>
     internal protected virtual TExprResult VisitFor(TIR.For expr) => base.VisitFor(expr, default);
-    
+
     /// <inheritdoc/>
     internal protected sealed override TExprResult VisitFor(TIR.For expr, Unit context) => VisitFor(expr);
     /// <summary>
     /// Visit <see cref="TIR.IfThenElse"/>.
     /// </summary>
     internal protected virtual TExprResult VisitIfThenElse(TIR.IfThenElse expr) => base.VisitIfThenElse(expr, default);
-    
+
     /// <inheritdoc/>
     internal protected sealed override TExprResult VisitIfThenElse(TIR.IfThenElse expr, Unit context) => VisitIfThenElse(expr);
     /// <summary>
     /// Visit <see cref="TIR.Let"/>.
     /// </summary>
     internal protected virtual TExprResult VisitLet(TIR.Let expr) => base.VisitLet(expr, default);
-    
+
     /// <inheritdoc/>
     internal protected sealed override TExprResult VisitLet(TIR.Let expr, Unit context) => VisitLet(expr);
     /// <summary>
     /// Visit <see cref="TIR.PrimFunction"/>.
     /// </summary>
     internal protected virtual TExprResult VisitPrimFunction(TIR.PrimFunction expr) => base.VisitPrimFunction(expr, default);
-    
+
     /// <inheritdoc/>
     internal protected sealed override TExprResult VisitPrimFunction(TIR.PrimFunction expr, Unit context) => VisitPrimFunction(expr);
     /// <summary>
     /// Visit <see cref="TIR.Sequential"/>.
     /// </summary>
     internal protected virtual TExprResult VisitSequential(TIR.Sequential expr) => base.VisitSequential(expr, default);
-    
+
     /// <inheritdoc/>
     internal protected sealed override TExprResult VisitSequential(TIR.Sequential expr, Unit context) => VisitSequential(expr);
     /// <summary>
     /// Visit <see cref="TIR.Range"/>.
     /// </summary>
     internal protected virtual TExprResult VisitRange(TIR.Range expr) => base.VisitRange(expr, default);
-    
+
     /// <inheritdoc/>
     internal protected sealed override TExprResult VisitRange(TIR.Range expr, Unit context) => VisitRange(expr);
     /// <summary>
     /// Visit <see cref="TIR.IterVar"/>.
     /// </summary>
     internal protected virtual TExprResult VisitIterVar(TIR.IterVar expr) => base.VisitIterVar(expr, default);
-    
+
     /// <inheritdoc/>
     internal protected sealed override TExprResult VisitIterVar(TIR.IterVar expr, Unit context) => VisitIterVar(expr);
     /// <summary>
     /// Visit <see cref="TIR.Return"/>.
     /// </summary>
     internal protected virtual TExprResult VisitReturn(TIR.Return expr) => base.VisitReturn(expr, default);
-    
+
     /// <inheritdoc/>
     internal protected sealed override TExprResult VisitReturn(TIR.Return expr, Unit context) => VisitReturn(expr);
     /// <summary>
     /// Visit <see cref="Affine.AffineDim"/>.
     /// </summary>
     internal protected virtual TExprResult VisitAffineDim(Affine.AffineDim expr) => base.VisitAffineDim(expr, default);
-    
+
     /// <inheritdoc/>
     internal protected sealed override TExprResult VisitAffineDim(Affine.AffineDim expr, Unit context) => VisitAffineDim(expr);
     /// <summary>
     /// Visit <see cref="Affine.AffineExtent"/>.
     /// </summary>
     internal protected virtual TExprResult VisitAffineExtent(Affine.AffineExtent expr) => base.VisitAffineExtent(expr, default);
-    
+
     /// <inheritdoc/>
     internal protected sealed override TExprResult VisitAffineExtent(Affine.AffineExtent expr, Unit context) => VisitAffineExtent(expr);
     /// <summary>
     /// Visit <see cref="Affine.AffineSymbol"/>.
     /// </summary>
     internal protected virtual TExprResult VisitAffineSymbol(Affine.AffineSymbol expr) => base.VisitAffineSymbol(expr, default);
-    
+
     /// <inheritdoc/>
     internal protected sealed override TExprResult VisitAffineSymbol(Affine.AffineSymbol expr, Unit context) => VisitAffineSymbol(expr);
     /// <summary>
     /// Visit <see cref="Affine.AffineConstant"/>.
     /// </summary>
     internal protected virtual TExprResult VisitAffineConstant(Affine.AffineConstant expr) => base.VisitAffineConstant(expr, default);
-    
+
     /// <inheritdoc/>
     internal protected sealed override TExprResult VisitAffineConstant(Affine.AffineConstant expr, Unit context) => VisitAffineConstant(expr);
     /// <summary>
     /// Visit <see cref="Affine.AffineAddBinary"/>.
     /// </summary>
     internal protected virtual TExprResult VisitAffineAddBinary(Affine.AffineAddBinary expr) => base.VisitAffineAddBinary(expr, default);
-    
+
     /// <inheritdoc/>
     internal protected sealed override TExprResult VisitAffineAddBinary(Affine.AffineAddBinary expr, Unit context) => VisitAffineAddBinary(expr);
     /// <summary>
     /// Visit <see cref="Affine.AffineMulBinary"/>.
     /// </summary>
     internal protected virtual TExprResult VisitAffineMulBinary(Affine.AffineMulBinary expr) => base.VisitAffineMulBinary(expr, default);
-    
+
     /// <inheritdoc/>
     internal protected sealed override TExprResult VisitAffineMulBinary(Affine.AffineMulBinary expr, Unit context) => VisitAffineMulBinary(expr);
     /// <summary>
     /// Visit <see cref="Affine.AffineDivBinary"/>.
     /// </summary>
     internal protected virtual TExprResult VisitAffineDivBinary(Affine.AffineDivBinary expr) => base.VisitAffineDivBinary(expr, default);
-    
+
     /// <inheritdoc/>
     internal protected sealed override TExprResult VisitAffineDivBinary(Affine.AffineDivBinary expr, Unit context) => VisitAffineDivBinary(expr);
     /// <summary>
     /// Visit <see cref="Affine.AffineDomain"/>.
     /// </summary>
     internal protected virtual TExprResult VisitAffineDomain(Affine.AffineDomain expr) => base.VisitAffineDomain(expr, default);
-    
+
     /// <inheritdoc/>
     internal protected sealed override TExprResult VisitAffineDomain(Affine.AffineDomain expr, Unit context) => VisitAffineDomain(expr);
     /// <summary>
     /// Visit <see cref="Affine.AffineRange"/>.
     /// </summary>
     internal protected virtual TExprResult VisitAffineRange(Affine.AffineRange expr) => base.VisitAffineRange(expr, default);
-    
+
     /// <inheritdoc/>
     internal protected sealed override TExprResult VisitAffineRange(Affine.AffineRange expr, Unit context) => VisitAffineRange(expr);
     /// <summary>
     /// Visit <see cref="Affine.AffineMap"/>.
     /// </summary>
     internal protected virtual TExprResult VisitAffineMap(Affine.AffineMap expr) => base.VisitAffineMap(expr, default);
-    
+
     /// <inheritdoc/>
     internal protected sealed override TExprResult VisitAffineMap(Affine.AffineMap expr, Unit context) => VisitAffineMap(expr);
     /// <summary>
     /// Visit <see cref="Affine.AffineRelation"/>.
     /// </summary>
     internal protected virtual TExprResult VisitAffineRelation(Affine.AffineRelation expr) => base.VisitAffineRelation(expr, default);
-    
+
     /// <inheritdoc/>
     internal protected sealed override TExprResult VisitAffineRelation(Affine.AffineRelation expr, Unit context) => VisitAffineRelation(expr);
     /// <summary>
     /// Visit <see cref="Affine.Grid"/>.
     /// </summary>
     internal protected virtual TExprResult VisitGrid(Affine.Grid expr) => base.VisitGrid(expr, default);
-    
+
     /// <inheritdoc/>
     internal protected sealed override TExprResult VisitGrid(Affine.Grid expr, Unit context) => VisitGrid(expr);
     /// <summary>
     /// Visit <see cref="Affine.Load"/>.
     /// </summary>
     internal protected virtual TExprResult VisitLoad(Affine.Load expr) => base.VisitLoad(expr, default);
-    
+
     /// <inheritdoc/>
     internal protected sealed override TExprResult VisitLoad(Affine.Load expr, Unit context) => VisitLoad(expr);
     /// <summary>
     /// Visit <see cref="Affine.For"/>.
     /// </summary>
     internal protected virtual TExprResult VisitFor(Affine.For expr) => base.VisitFor(expr, default);
-    
+
     /// <inheritdoc/>
     internal protected sealed override TExprResult VisitFor(Affine.For expr, Unit context) => VisitFor(expr);
     /// <summary>
     /// Visit <see cref="Buffers.BufferOf"/>.
     /// </summary>
     internal protected virtual TExprResult VisitBufferOf(Buffers.BufferOf expr) => base.VisitBufferOf(expr, default);
-    
+
     /// <inheritdoc/>
     internal protected sealed override TExprResult VisitBufferOf(Buffers.BufferOf expr, Unit context) => VisitBufferOf(expr);
     /// <summary>
     /// Visit <see cref="Distributed.ThreadIdDim"/>.
     /// </summary>
     internal protected virtual TExprResult VisitThreadIdDim(Distributed.ThreadIdDim expr) => base.VisitThreadIdDim(expr, default);
-    
+
     /// <inheritdoc/>
     internal protected sealed override TExprResult VisitThreadIdDim(Distributed.ThreadIdDim expr, Unit context) => VisitThreadIdDim(expr);
     /// <summary>
     /// Visit <see cref="AsDim"/>.
     /// </summary>
     internal protected virtual TExprResult VisitAsDim(AsDim expr) => base.VisitAsDim(expr, default);
-    
+
     /// <inheritdoc/>
     internal protected sealed override TExprResult VisitAsDim(AsDim expr, Unit context) => VisitAsDim(expr);
     /// <summary>
     /// Visit <see cref="UnknownDim"/>.
     /// </summary>
     internal protected virtual TExprResult VisitUnknownDim(UnknownDim expr) => base.VisitUnknownDim(expr, default);
-    
+
     /// <inheritdoc/>
     internal protected sealed override TExprResult VisitUnknownDim(UnknownDim expr, Unit context) => VisitUnknownDim(expr);
     /// <summary>
     /// Visit <see cref="DimVar"/>.
     /// </summary>
     internal protected virtual TExprResult VisitDimVar(DimVar expr) => base.VisitDimVar(expr, default);
-    
+
     /// <inheritdoc/>
     internal protected sealed override TExprResult VisitDimVar(DimVar expr, Unit context) => VisitDimVar(expr);
     /// <summary>
     /// Visit <see cref="DimConst"/>.
     /// </summary>
     internal protected virtual TExprResult VisitDimConst(DimConst expr) => base.VisitDimConst(expr, default);
-    
+
     /// <inheritdoc/>
     internal protected sealed override TExprResult VisitDimConst(DimConst expr, Unit context) => VisitDimConst(expr);
     /// <summary>
     /// Visit <see cref="DimPower"/>.
     /// </summary>
     internal protected virtual TExprResult VisitDimPower(DimPower expr) => base.VisitDimPower(expr, default);
-    
+
     /// <inheritdoc/>
     internal protected sealed override TExprResult VisitDimPower(DimPower expr, Unit context) => VisitDimPower(expr);
     /// <summary>
     /// Visit <see cref="DimFraction"/>.
     /// </summary>
     internal protected virtual TExprResult VisitDimFraction(DimFraction expr) => base.VisitDimFraction(expr, default);
-    
+
     /// <inheritdoc/>
     internal protected sealed override TExprResult VisitDimFraction(DimFraction expr, Unit context) => VisitDimFraction(expr);
     /// <summary>
     /// Visit <see cref="DimRemainder"/>.
     /// </summary>
     internal protected virtual TExprResult VisitDimRemainder(DimRemainder expr) => base.VisitDimRemainder(expr, default);
-    
+
     /// <inheritdoc/>
     internal protected sealed override TExprResult VisitDimRemainder(DimRemainder expr, Unit context) => VisitDimRemainder(expr);
     /// <summary>
     /// Visit <see cref="DimProduct"/>.
     /// </summary>
     internal protected virtual TExprResult VisitDimProduct(DimProduct expr) => base.VisitDimProduct(expr, default);
-    
+
     /// <inheritdoc/>
     internal protected sealed override TExprResult VisitDimProduct(DimProduct expr, Unit context) => VisitDimProduct(expr);
     /// <summary>
     /// Visit <see cref="DimSum"/>.
     /// </summary>
     internal protected virtual TExprResult VisitDimSum(DimSum expr) => base.VisitDimSum(expr, default);
-    
+
     /// <inheritdoc/>
     internal protected sealed override TExprResult VisitDimSum(DimSum expr, Unit context) => VisitDimSum(expr);
     /// <summary>
     /// Visit <see cref="DimAbs"/>.
     /// </summary>
     internal protected virtual TExprResult VisitDimAbs(DimAbs expr) => base.VisitDimAbs(expr, default);
-    
+
     /// <inheritdoc/>
     internal protected sealed override TExprResult VisitDimAbs(DimAbs expr, Unit context) => VisitDimAbs(expr);
     /// <summary>
     /// Visit <see cref="DimClamp"/>.
     /// </summary>
     internal protected virtual TExprResult VisitDimClamp(DimClamp expr) => base.VisitDimClamp(expr, default);
-    
+
     /// <inheritdoc/>
     internal protected sealed override TExprResult VisitDimClamp(DimClamp expr, Unit context) => VisitDimClamp(expr);
     /// <summary>
     /// Visit <see cref="DimCompareAndSelect"/>.
     /// </summary>
     internal protected virtual TExprResult VisitDimCompareAndSelect(DimCompareAndSelect expr) => base.VisitDimCompareAndSelect(expr, default);
-    
+
     /// <inheritdoc/>
     internal protected sealed override TExprResult VisitDimCompareAndSelect(DimCompareAndSelect expr, Unit context) => VisitDimCompareAndSelect(expr);
     /// <summary>
     /// Visit <see cref="DimMin"/>.
     /// </summary>
     internal protected virtual TExprResult VisitDimMin(DimMin expr) => base.VisitDimMin(expr, default);
-    
+
     /// <inheritdoc/>
     internal protected sealed override TExprResult VisitDimMin(DimMin expr, Unit context) => VisitDimMin(expr);
     /// <summary>
     /// Visit <see cref="DimMax"/>.
     /// </summary>
     internal protected virtual TExprResult VisitDimMax(DimMax expr) => base.VisitDimMax(expr, default);
-    
+
     /// <inheritdoc/>
     internal protected sealed override TExprResult VisitDimMax(DimMax expr, Unit context) => VisitDimMax(expr);
     /// <summary>
     /// Visit <see cref="DimPositive"/>.
     /// </summary>
     internal protected virtual TExprResult VisitDimPositive(DimPositive expr) => base.VisitDimPositive(expr, default);
-    
+
     /// <inheritdoc/>
     internal protected sealed override TExprResult VisitDimPositive(DimPositive expr, Unit context) => VisitDimPositive(expr);
     /// <summary>
     /// Visit <see cref="DimAt"/>.
     /// </summary>
     internal protected virtual TExprResult VisitDimAt(DimAt expr) => base.VisitDimAt(expr, default);
-    
+
     /// <inheritdoc/>
     internal protected sealed override TExprResult VisitDimAt(DimAt expr, Unit context) => VisitDimAt(expr);
     /// <summary>
     /// Visit <see cref="IR.Shapes.Padding"/>.
     /// </summary>
     internal protected virtual TExprResult VisitPadding(IR.Shapes.Padding expr) => base.VisitPadding(expr, default);
-    
+
     /// <inheritdoc/>
     internal protected sealed override TExprResult VisitPadding(IR.Shapes.Padding expr, Unit context) => VisitPadding(expr);
     /// <summary>
     /// Visit <see cref="IR.Shapes.Paddings"/>.
     /// </summary>
     internal protected virtual TExprResult VisitPaddings(IR.Shapes.Paddings expr) => base.VisitPaddings(expr, default);
-    
+
     /// <inheritdoc/>
     internal protected sealed override TExprResult VisitPaddings(IR.Shapes.Paddings expr, Unit context) => VisitPaddings(expr);
     /// <summary>
     /// Visit <see cref="RankedShape"/>.
     /// </summary>
     internal protected virtual TExprResult VisitRankedShape(RankedShape expr) => base.VisitRankedShape(expr, default);
-    
+
     /// <inheritdoc/>
     internal protected sealed override TExprResult VisitRankedShape(RankedShape expr, Unit context) => VisitRankedShape(expr);
     /// <summary>
     /// Visit <see cref="UnrankedShape"/>.
     /// </summary>
     internal protected virtual TExprResult VisitUnrankedShape(UnrankedShape expr) => base.VisitUnrankedShape(expr, default);
-    
+
     /// <inheritdoc/>
     internal protected sealed override TExprResult VisitUnrankedShape(UnrankedShape expr, Unit context) => VisitUnrankedShape(expr);
     /// <summary>
     /// Visit <see cref="InvalidShape"/>.
     /// </summary>
     internal protected virtual TExprResult VisitInvalidShape(InvalidShape expr) => base.VisitInvalidShape(expr, default);
-    
+
     /// <inheritdoc/>
     internal protected sealed override TExprResult VisitInvalidShape(InvalidShape expr, Unit context) => VisitInvalidShape(expr);
     /// <summary>
     /// Visit <see cref="ShapeVar"/>.
     /// </summary>
     internal protected virtual TExprResult VisitShapeVar(ShapeVar expr) => base.VisitShapeVar(expr, default);
-    
+
     /// <inheritdoc/>
     internal protected sealed override TExprResult VisitShapeVar(ShapeVar expr, Unit context) => VisitShapeVar(expr);
     /// <summary>
     /// Visit <see cref="IR.Shapes.ShapeOf"/>.
     /// </summary>
     internal protected virtual TExprResult VisitShapeOf(IR.Shapes.ShapeOf expr) => base.VisitShapeOf(expr, default);
-    
+
     /// <inheritdoc/>
     internal protected sealed override TExprResult VisitShapeOf(IR.Shapes.ShapeOf expr, Unit context) => VisitShapeOf(expr);
     /// <summary>
     /// Visit leaf <see cref="BaseFunction"/>.
     /// </summary>
     protected virtual TExprResult VisitLeafBaseFunction(BaseFunction expr) => base.VisitLeafBaseFunction(expr, default);
-    
+
     /// <inheritdoc/>
     protected sealed override TExprResult VisitLeafBaseFunction(BaseFunction expr, Unit context) => VisitLeafBaseFunction(expr);
 
@@ -1634,7 +1660,7 @@ public partial class ExprVisitor<TExprResult, TTypeResult>
     /// Visit leaf <see cref="Call"/>.
     /// </summary>
     protected virtual TExprResult VisitLeafCall(Call expr) => base.VisitLeafCall(expr, default);
-    
+
     /// <inheritdoc/>
     protected sealed override TExprResult VisitLeafCall(Call expr, Unit context) => VisitLeafCall(expr);
 
@@ -1642,7 +1668,7 @@ public partial class ExprVisitor<TExprResult, TTypeResult>
     /// Visit leaf <see cref="Const"/>.
     /// </summary>
     protected virtual TExprResult VisitLeafConst(Const expr) => base.VisitLeafConst(expr, default);
-    
+
     /// <inheritdoc/>
     protected sealed override TExprResult VisitLeafConst(Const expr, Unit context) => VisitLeafConst(expr);
 
@@ -1650,7 +1676,7 @@ public partial class ExprVisitor<TExprResult, TTypeResult>
     /// Visit leaf <see cref="Function"/>.
     /// </summary>
     protected virtual TExprResult VisitLeafFunction(Function expr) => base.VisitLeafFunction(expr, default);
-    
+
     /// <inheritdoc/>
     protected sealed override TExprResult VisitLeafFunction(Function expr, Unit context) => VisitLeafFunction(expr);
 
@@ -1658,7 +1684,7 @@ public partial class ExprVisitor<TExprResult, TTypeResult>
     /// Visit leaf <see cref="Fusion"/>.
     /// </summary>
     protected virtual TExprResult VisitLeafFusion(Fusion expr) => base.VisitLeafFusion(expr, default);
-    
+
     /// <inheritdoc/>
     protected sealed override TExprResult VisitLeafFusion(Fusion expr, Unit context) => VisitLeafFusion(expr);
 
@@ -1666,7 +1692,7 @@ public partial class ExprVisitor<TExprResult, TTypeResult>
     /// Visit leaf <see cref="If"/>.
     /// </summary>
     protected virtual TExprResult VisitLeafIf(If expr) => base.VisitLeafIf(expr, default);
-    
+
     /// <inheritdoc/>
     protected sealed override TExprResult VisitLeafIf(If expr, Unit context) => VisitLeafIf(expr);
 
@@ -1674,7 +1700,7 @@ public partial class ExprVisitor<TExprResult, TTypeResult>
     /// Visit leaf <see cref="Marker"/>.
     /// </summary>
     protected virtual TExprResult VisitLeafMarker(Marker expr) => base.VisitLeafMarker(expr, default);
-    
+
     /// <inheritdoc/>
     protected sealed override TExprResult VisitLeafMarker(Marker expr, Unit context) => VisitLeafMarker(expr);
 
@@ -1682,7 +1708,7 @@ public partial class ExprVisitor<TExprResult, TTypeResult>
     /// Visit leaf <see cref="None"/>.
     /// </summary>
     protected virtual TExprResult VisitLeafNone(None expr) => base.VisitLeafNone(expr, default);
-    
+
     /// <inheritdoc/>
     protected sealed override TExprResult VisitLeafNone(None expr, Unit context) => VisitLeafNone(expr);
 
@@ -1690,7 +1716,7 @@ public partial class ExprVisitor<TExprResult, TTypeResult>
     /// Visit leaf <see cref="Op"/>.
     /// </summary>
     protected virtual TExprResult VisitLeafOp(Op expr) => base.VisitLeafOp(expr, default);
-    
+
     /// <inheritdoc/>
     protected sealed override TExprResult VisitLeafOp(Op expr, Unit context) => VisitLeafOp(expr);
 
@@ -1698,7 +1724,7 @@ public partial class ExprVisitor<TExprResult, TTypeResult>
     /// Visit leaf <see cref="PrimFunctionWrapper"/>.
     /// </summary>
     protected virtual TExprResult VisitLeafPrimFunctionWrapper(PrimFunctionWrapper expr) => base.VisitLeafPrimFunctionWrapper(expr, default);
-    
+
     /// <inheritdoc/>
     protected sealed override TExprResult VisitLeafPrimFunctionWrapper(PrimFunctionWrapper expr, Unit context) => VisitLeafPrimFunctionWrapper(expr);
 
@@ -1706,7 +1732,7 @@ public partial class ExprVisitor<TExprResult, TTypeResult>
     /// Visit leaf <see cref="FunctionWrapper"/>.
     /// </summary>
     protected virtual TExprResult VisitLeafFunctionWrapper(FunctionWrapper expr) => base.VisitLeafFunctionWrapper(expr, default);
-    
+
     /// <inheritdoc/>
     protected sealed override TExprResult VisitLeafFunctionWrapper(FunctionWrapper expr, Unit context) => VisitLeafFunctionWrapper(expr);
 
@@ -1714,7 +1740,7 @@ public partial class ExprVisitor<TExprResult, TTypeResult>
     /// Visit leaf <see cref="TensorConst"/>.
     /// </summary>
     protected virtual TExprResult VisitLeafTensorConst(TensorConst expr) => base.VisitLeafTensorConst(expr, default);
-    
+
     /// <inheritdoc/>
     protected sealed override TExprResult VisitLeafTensorConst(TensorConst expr, Unit context) => VisitLeafTensorConst(expr);
 
@@ -1722,7 +1748,7 @@ public partial class ExprVisitor<TExprResult, TTypeResult>
     /// Visit leaf <see cref="IR.Tuple"/>.
     /// </summary>
     protected virtual TExprResult VisitLeafTuple(IR.Tuple expr) => base.VisitLeafTuple(expr, default);
-    
+
     /// <inheritdoc/>
     protected sealed override TExprResult VisitLeafTuple(IR.Tuple expr, Unit context) => VisitLeafTuple(expr);
 
@@ -1730,7 +1756,7 @@ public partial class ExprVisitor<TExprResult, TTypeResult>
     /// Visit leaf <see cref="TupleConst"/>.
     /// </summary>
     protected virtual TExprResult VisitLeafTupleConst(TupleConst expr) => base.VisitLeafTupleConst(expr, default);
-    
+
     /// <inheritdoc/>
     protected sealed override TExprResult VisitLeafTupleConst(TupleConst expr, Unit context) => VisitLeafTupleConst(expr);
 
@@ -1738,7 +1764,7 @@ public partial class ExprVisitor<TExprResult, TTypeResult>
     /// Visit leaf <see cref="TIR.PhysicalBuffer"/>.
     /// </summary>
     protected virtual TExprResult VisitLeafPhysicalBuffer(TIR.PhysicalBuffer expr) => base.VisitLeafPhysicalBuffer(expr, default);
-    
+
     /// <inheritdoc/>
     protected sealed override TExprResult VisitLeafPhysicalBuffer(TIR.PhysicalBuffer expr, Unit context) => VisitLeafPhysicalBuffer(expr);
 
@@ -1746,7 +1772,7 @@ public partial class ExprVisitor<TExprResult, TTypeResult>
     /// Visit leaf <see cref="TIR.MemSpan"/>.
     /// </summary>
     protected virtual TExprResult VisitLeafMemSpan(TIR.MemSpan expr) => base.VisitLeafMemSpan(expr, default);
-    
+
     /// <inheritdoc/>
     protected sealed override TExprResult VisitLeafMemSpan(TIR.MemSpan expr, Unit context) => VisitLeafMemSpan(expr);
 
@@ -1754,15 +1780,23 @@ public partial class ExprVisitor<TExprResult, TTypeResult>
     /// Visit leaf <see cref="Var"/>.
     /// </summary>
     protected virtual TExprResult VisitLeafVar(Var expr) => base.VisitLeafVar(expr, default);
-    
+
     /// <inheritdoc/>
     protected sealed override TExprResult VisitLeafVar(Var expr, Unit context) => VisitLeafVar(expr);
+
+    /// <summary>
+    /// Visit leaf <see cref="TIR.BufferVar"/>.
+    /// </summary>
+    protected virtual TExprResult VisitLeafBufferVar(TIR.BufferVar expr) => base.VisitLeafBufferVar(expr, default);
+
+    /// <inheritdoc/>
+    protected sealed override TExprResult VisitLeafBufferVar(TIR.BufferVar expr, Unit context) => VisitLeafBufferVar(expr);
 
     /// <summary>
     /// Visit leaf <see cref="TIR.Block"/>.
     /// </summary>
     protected virtual TExprResult VisitLeafBlock(TIR.Block expr) => base.VisitLeafBlock(expr, default);
-    
+
     /// <inheritdoc/>
     protected sealed override TExprResult VisitLeafBlock(TIR.Block expr, Unit context) => VisitLeafBlock(expr);
 
@@ -1770,7 +1804,7 @@ public partial class ExprVisitor<TExprResult, TTypeResult>
     /// Visit leaf <see cref="TIR.Buffer"/>.
     /// </summary>
     protected virtual TExprResult VisitLeafBuffer(TIR.Buffer expr) => base.VisitLeafBuffer(expr, default);
-    
+
     /// <inheritdoc/>
     protected sealed override TExprResult VisitLeafBuffer(TIR.Buffer expr, Unit context) => VisitLeafBuffer(expr);
 
@@ -1778,7 +1812,7 @@ public partial class ExprVisitor<TExprResult, TTypeResult>
     /// Visit leaf <see cref="TIR.BufferRegion"/>.
     /// </summary>
     protected virtual TExprResult VisitLeafBufferRegion(TIR.BufferRegion expr) => base.VisitLeafBufferRegion(expr, default);
-    
+
     /// <inheritdoc/>
     protected sealed override TExprResult VisitLeafBufferRegion(TIR.BufferRegion expr, Unit context) => VisitLeafBufferRegion(expr);
 
@@ -1786,7 +1820,7 @@ public partial class ExprVisitor<TExprResult, TTypeResult>
     /// Visit leaf <see cref="TIR.For"/>.
     /// </summary>
     protected virtual TExprResult VisitLeafFor(TIR.For expr) => base.VisitLeafFor(expr, default);
-    
+
     /// <inheritdoc/>
     protected sealed override TExprResult VisitLeafFor(TIR.For expr, Unit context) => VisitLeafFor(expr);
 
@@ -1794,7 +1828,7 @@ public partial class ExprVisitor<TExprResult, TTypeResult>
     /// Visit leaf <see cref="TIR.IfThenElse"/>.
     /// </summary>
     protected virtual TExprResult VisitLeafIfThenElse(TIR.IfThenElse expr) => base.VisitLeafIfThenElse(expr, default);
-    
+
     /// <inheritdoc/>
     protected sealed override TExprResult VisitLeafIfThenElse(TIR.IfThenElse expr, Unit context) => VisitLeafIfThenElse(expr);
 
@@ -1802,7 +1836,7 @@ public partial class ExprVisitor<TExprResult, TTypeResult>
     /// Visit leaf <see cref="TIR.Let"/>.
     /// </summary>
     protected virtual TExprResult VisitLeafLet(TIR.Let expr) => base.VisitLeafLet(expr, default);
-    
+
     /// <inheritdoc/>
     protected sealed override TExprResult VisitLeafLet(TIR.Let expr, Unit context) => VisitLeafLet(expr);
 
@@ -1810,7 +1844,7 @@ public partial class ExprVisitor<TExprResult, TTypeResult>
     /// Visit leaf <see cref="TIR.PrimFunction"/>.
     /// </summary>
     protected virtual TExprResult VisitLeafPrimFunction(TIR.PrimFunction expr) => base.VisitLeafPrimFunction(expr, default);
-    
+
     /// <inheritdoc/>
     protected sealed override TExprResult VisitLeafPrimFunction(TIR.PrimFunction expr, Unit context) => VisitLeafPrimFunction(expr);
 
@@ -1818,7 +1852,7 @@ public partial class ExprVisitor<TExprResult, TTypeResult>
     /// Visit leaf <see cref="TIR.Sequential"/>.
     /// </summary>
     protected virtual TExprResult VisitLeafSequential(TIR.Sequential expr) => base.VisitLeafSequential(expr, default);
-    
+
     /// <inheritdoc/>
     protected sealed override TExprResult VisitLeafSequential(TIR.Sequential expr, Unit context) => VisitLeafSequential(expr);
 
@@ -1826,7 +1860,7 @@ public partial class ExprVisitor<TExprResult, TTypeResult>
     /// Visit leaf <see cref="TIR.Range"/>.
     /// </summary>
     protected virtual TExprResult VisitLeafRange(TIR.Range expr) => base.VisitLeafRange(expr, default);
-    
+
     /// <inheritdoc/>
     protected sealed override TExprResult VisitLeafRange(TIR.Range expr, Unit context) => VisitLeafRange(expr);
 
@@ -1834,7 +1868,7 @@ public partial class ExprVisitor<TExprResult, TTypeResult>
     /// Visit leaf <see cref="TIR.IterVar"/>.
     /// </summary>
     protected virtual TExprResult VisitLeafIterVar(TIR.IterVar expr) => base.VisitLeafIterVar(expr, default);
-    
+
     /// <inheritdoc/>
     protected sealed override TExprResult VisitLeafIterVar(TIR.IterVar expr, Unit context) => VisitLeafIterVar(expr);
 
@@ -1842,7 +1876,7 @@ public partial class ExprVisitor<TExprResult, TTypeResult>
     /// Visit leaf <see cref="TIR.Return"/>.
     /// </summary>
     protected virtual TExprResult VisitLeafReturn(TIR.Return expr) => base.VisitLeafReturn(expr, default);
-    
+
     /// <inheritdoc/>
     protected sealed override TExprResult VisitLeafReturn(TIR.Return expr, Unit context) => VisitLeafReturn(expr);
 
@@ -1850,7 +1884,7 @@ public partial class ExprVisitor<TExprResult, TTypeResult>
     /// Visit leaf <see cref="Affine.AffineExpr"/>.
     /// </summary>
     protected virtual TExprResult VisitLeafAffineExpr(Affine.AffineExpr expr) => base.VisitLeafAffineExpr(expr, default);
-    
+
     /// <inheritdoc/>
     protected sealed override TExprResult VisitLeafAffineExpr(Affine.AffineExpr expr, Unit context) => VisitLeafAffineExpr(expr);
 
@@ -1858,7 +1892,7 @@ public partial class ExprVisitor<TExprResult, TTypeResult>
     /// Visit leaf <see cref="Affine.AffineDim"/>.
     /// </summary>
     protected virtual TExprResult VisitLeafAffineDim(Affine.AffineDim expr) => base.VisitLeafAffineDim(expr, default);
-    
+
     /// <inheritdoc/>
     protected sealed override TExprResult VisitLeafAffineDim(Affine.AffineDim expr, Unit context) => VisitLeafAffineDim(expr);
 
@@ -1866,7 +1900,7 @@ public partial class ExprVisitor<TExprResult, TTypeResult>
     /// Visit leaf <see cref="Affine.AffineExtent"/>.
     /// </summary>
     protected virtual TExprResult VisitLeafAffineExtent(Affine.AffineExtent expr) => base.VisitLeafAffineExtent(expr, default);
-    
+
     /// <inheritdoc/>
     protected sealed override TExprResult VisitLeafAffineExtent(Affine.AffineExtent expr, Unit context) => VisitLeafAffineExtent(expr);
 
@@ -1874,7 +1908,7 @@ public partial class ExprVisitor<TExprResult, TTypeResult>
     /// Visit leaf <see cref="Affine.AffineSymbol"/>.
     /// </summary>
     protected virtual TExprResult VisitLeafAffineSymbol(Affine.AffineSymbol expr) => base.VisitLeafAffineSymbol(expr, default);
-    
+
     /// <inheritdoc/>
     protected sealed override TExprResult VisitLeafAffineSymbol(Affine.AffineSymbol expr, Unit context) => VisitLeafAffineSymbol(expr);
 
@@ -1882,7 +1916,7 @@ public partial class ExprVisitor<TExprResult, TTypeResult>
     /// Visit leaf <see cref="Affine.AffineConstant"/>.
     /// </summary>
     protected virtual TExprResult VisitLeafAffineConstant(Affine.AffineConstant expr) => base.VisitLeafAffineConstant(expr, default);
-    
+
     /// <inheritdoc/>
     protected sealed override TExprResult VisitLeafAffineConstant(Affine.AffineConstant expr, Unit context) => VisitLeafAffineConstant(expr);
 
@@ -1890,7 +1924,7 @@ public partial class ExprVisitor<TExprResult, TTypeResult>
     /// Visit leaf <see cref="Affine.AffineAddBinary"/>.
     /// </summary>
     protected virtual TExprResult VisitLeafAffineAddBinary(Affine.AffineAddBinary expr) => base.VisitLeafAffineAddBinary(expr, default);
-    
+
     /// <inheritdoc/>
     protected sealed override TExprResult VisitLeafAffineAddBinary(Affine.AffineAddBinary expr, Unit context) => VisitLeafAffineAddBinary(expr);
 
@@ -1898,7 +1932,7 @@ public partial class ExprVisitor<TExprResult, TTypeResult>
     /// Visit leaf <see cref="Affine.AffineMulBinary"/>.
     /// </summary>
     protected virtual TExprResult VisitLeafAffineMulBinary(Affine.AffineMulBinary expr) => base.VisitLeafAffineMulBinary(expr, default);
-    
+
     /// <inheritdoc/>
     protected sealed override TExprResult VisitLeafAffineMulBinary(Affine.AffineMulBinary expr, Unit context) => VisitLeafAffineMulBinary(expr);
 
@@ -1906,7 +1940,7 @@ public partial class ExprVisitor<TExprResult, TTypeResult>
     /// Visit leaf <see cref="Affine.AffineDivBinary"/>.
     /// </summary>
     protected virtual TExprResult VisitLeafAffineDivBinary(Affine.AffineDivBinary expr) => base.VisitLeafAffineDivBinary(expr, default);
-    
+
     /// <inheritdoc/>
     protected sealed override TExprResult VisitLeafAffineDivBinary(Affine.AffineDivBinary expr, Unit context) => VisitLeafAffineDivBinary(expr);
 
@@ -1914,7 +1948,7 @@ public partial class ExprVisitor<TExprResult, TTypeResult>
     /// Visit leaf <see cref="Affine.AffineDomain"/>.
     /// </summary>
     protected virtual TExprResult VisitLeafAffineDomain(Affine.AffineDomain expr) => base.VisitLeafAffineDomain(expr, default);
-    
+
     /// <inheritdoc/>
     protected sealed override TExprResult VisitLeafAffineDomain(Affine.AffineDomain expr, Unit context) => VisitLeafAffineDomain(expr);
 
@@ -1922,7 +1956,7 @@ public partial class ExprVisitor<TExprResult, TTypeResult>
     /// Visit leaf <see cref="Affine.AffineRange"/>.
     /// </summary>
     protected virtual TExprResult VisitLeafAffineRange(Affine.AffineRange expr) => base.VisitLeafAffineRange(expr, default);
-    
+
     /// <inheritdoc/>
     protected sealed override TExprResult VisitLeafAffineRange(Affine.AffineRange expr, Unit context) => VisitLeafAffineRange(expr);
 
@@ -1930,7 +1964,7 @@ public partial class ExprVisitor<TExprResult, TTypeResult>
     /// Visit leaf <see cref="Affine.AffineMap"/>.
     /// </summary>
     protected virtual TExprResult VisitLeafAffineMap(Affine.AffineMap expr) => base.VisitLeafAffineMap(expr, default);
-    
+
     /// <inheritdoc/>
     protected sealed override TExprResult VisitLeafAffineMap(Affine.AffineMap expr, Unit context) => VisitLeafAffineMap(expr);
 
@@ -1938,7 +1972,7 @@ public partial class ExprVisitor<TExprResult, TTypeResult>
     /// Visit leaf <see cref="Affine.AffineRelation"/>.
     /// </summary>
     protected virtual TExprResult VisitLeafAffineRelation(Affine.AffineRelation expr) => base.VisitLeafAffineRelation(expr, default);
-    
+
     /// <inheritdoc/>
     protected sealed override TExprResult VisitLeafAffineRelation(Affine.AffineRelation expr, Unit context) => VisitLeafAffineRelation(expr);
 
@@ -1946,7 +1980,7 @@ public partial class ExprVisitor<TExprResult, TTypeResult>
     /// Visit leaf <see cref="Affine.Grid"/>.
     /// </summary>
     protected virtual TExprResult VisitLeafGrid(Affine.Grid expr) => base.VisitLeafGrid(expr, default);
-    
+
     /// <inheritdoc/>
     protected sealed override TExprResult VisitLeafGrid(Affine.Grid expr, Unit context) => VisitLeafGrid(expr);
 
@@ -1954,7 +1988,7 @@ public partial class ExprVisitor<TExprResult, TTypeResult>
     /// Visit leaf <see cref="Affine.Load"/>.
     /// </summary>
     protected virtual TExprResult VisitLeafLoad(Affine.Load expr) => base.VisitLeafLoad(expr, default);
-    
+
     /// <inheritdoc/>
     protected sealed override TExprResult VisitLeafLoad(Affine.Load expr, Unit context) => VisitLeafLoad(expr);
 
@@ -1962,7 +1996,7 @@ public partial class ExprVisitor<TExprResult, TTypeResult>
     /// Visit leaf <see cref="Affine.For"/>.
     /// </summary>
     protected virtual TExprResult VisitLeafFor(Affine.For expr) => base.VisitLeafFor(expr, default);
-    
+
     /// <inheritdoc/>
     protected sealed override TExprResult VisitLeafFor(Affine.For expr, Unit context) => VisitLeafFor(expr);
 
@@ -1970,7 +2004,7 @@ public partial class ExprVisitor<TExprResult, TTypeResult>
     /// Visit leaf <see cref="Buffers.BufferOf"/>.
     /// </summary>
     protected virtual TExprResult VisitLeafBufferOf(Buffers.BufferOf expr) => base.VisitLeafBufferOf(expr, default);
-    
+
     /// <inheritdoc/>
     protected sealed override TExprResult VisitLeafBufferOf(Buffers.BufferOf expr, Unit context) => VisitLeafBufferOf(expr);
 
@@ -1978,7 +2012,7 @@ public partial class ExprVisitor<TExprResult, TTypeResult>
     /// Visit leaf <see cref="Distributed.ThreadIdDim"/>.
     /// </summary>
     protected virtual TExprResult VisitLeafThreadIdDim(Distributed.ThreadIdDim expr) => base.VisitLeafThreadIdDim(expr, default);
-    
+
     /// <inheritdoc/>
     protected sealed override TExprResult VisitLeafThreadIdDim(Distributed.ThreadIdDim expr, Unit context) => VisitLeafThreadIdDim(expr);
 
@@ -1986,7 +2020,7 @@ public partial class ExprVisitor<TExprResult, TTypeResult>
     /// Visit leaf <see cref="Dimension"/>.
     /// </summary>
     protected virtual TExprResult VisitLeafDimension(Dimension expr) => base.VisitLeafDimension(expr, default);
-    
+
     /// <inheritdoc/>
     protected sealed override TExprResult VisitLeafDimension(Dimension expr, Unit context) => VisitLeafDimension(expr);
 
@@ -1994,7 +2028,7 @@ public partial class ExprVisitor<TExprResult, TTypeResult>
     /// Visit leaf <see cref="AsDim"/>.
     /// </summary>
     protected virtual TExprResult VisitLeafAsDim(AsDim expr) => base.VisitLeafAsDim(expr, default);
-    
+
     /// <inheritdoc/>
     protected sealed override TExprResult VisitLeafAsDim(AsDim expr, Unit context) => VisitLeafAsDim(expr);
 
@@ -2002,7 +2036,7 @@ public partial class ExprVisitor<TExprResult, TTypeResult>
     /// Visit leaf <see cref="UnknownDim"/>.
     /// </summary>
     protected virtual TExprResult VisitLeafUnknownDim(UnknownDim expr) => base.VisitLeafUnknownDim(expr, default);
-    
+
     /// <inheritdoc/>
     protected sealed override TExprResult VisitLeafUnknownDim(UnknownDim expr, Unit context) => VisitLeafUnknownDim(expr);
 
@@ -2010,7 +2044,7 @@ public partial class ExprVisitor<TExprResult, TTypeResult>
     /// Visit leaf <see cref="DimVar"/>.
     /// </summary>
     protected virtual TExprResult VisitLeafDimVar(DimVar expr) => base.VisitLeafDimVar(expr, default);
-    
+
     /// <inheritdoc/>
     protected sealed override TExprResult VisitLeafDimVar(DimVar expr, Unit context) => VisitLeafDimVar(expr);
 
@@ -2018,7 +2052,7 @@ public partial class ExprVisitor<TExprResult, TTypeResult>
     /// Visit leaf <see cref="DimConst"/>.
     /// </summary>
     protected virtual TExprResult VisitLeafDimConst(DimConst expr) => base.VisitLeafDimConst(expr, default);
-    
+
     /// <inheritdoc/>
     protected sealed override TExprResult VisitLeafDimConst(DimConst expr, Unit context) => VisitLeafDimConst(expr);
 
@@ -2026,7 +2060,7 @@ public partial class ExprVisitor<TExprResult, TTypeResult>
     /// Visit leaf <see cref="DimPower"/>.
     /// </summary>
     protected virtual TExprResult VisitLeafDimPower(DimPower expr) => base.VisitLeafDimPower(expr, default);
-    
+
     /// <inheritdoc/>
     protected sealed override TExprResult VisitLeafDimPower(DimPower expr, Unit context) => VisitLeafDimPower(expr);
 
@@ -2034,7 +2068,7 @@ public partial class ExprVisitor<TExprResult, TTypeResult>
     /// Visit leaf <see cref="DimFraction"/>.
     /// </summary>
     protected virtual TExprResult VisitLeafDimFraction(DimFraction expr) => base.VisitLeafDimFraction(expr, default);
-    
+
     /// <inheritdoc/>
     protected sealed override TExprResult VisitLeafDimFraction(DimFraction expr, Unit context) => VisitLeafDimFraction(expr);
 
@@ -2042,7 +2076,7 @@ public partial class ExprVisitor<TExprResult, TTypeResult>
     /// Visit leaf <see cref="DimRemainder"/>.
     /// </summary>
     protected virtual TExprResult VisitLeafDimRemainder(DimRemainder expr) => base.VisitLeafDimRemainder(expr, default);
-    
+
     /// <inheritdoc/>
     protected sealed override TExprResult VisitLeafDimRemainder(DimRemainder expr, Unit context) => VisitLeafDimRemainder(expr);
 
@@ -2050,7 +2084,7 @@ public partial class ExprVisitor<TExprResult, TTypeResult>
     /// Visit leaf <see cref="DimProduct"/>.
     /// </summary>
     protected virtual TExprResult VisitLeafDimProduct(DimProduct expr) => base.VisitLeafDimProduct(expr, default);
-    
+
     /// <inheritdoc/>
     protected sealed override TExprResult VisitLeafDimProduct(DimProduct expr, Unit context) => VisitLeafDimProduct(expr);
 
@@ -2058,7 +2092,7 @@ public partial class ExprVisitor<TExprResult, TTypeResult>
     /// Visit leaf <see cref="DimSum"/>.
     /// </summary>
     protected virtual TExprResult VisitLeafDimSum(DimSum expr) => base.VisitLeafDimSum(expr, default);
-    
+
     /// <inheritdoc/>
     protected sealed override TExprResult VisitLeafDimSum(DimSum expr, Unit context) => VisitLeafDimSum(expr);
 
@@ -2066,7 +2100,7 @@ public partial class ExprVisitor<TExprResult, TTypeResult>
     /// Visit leaf <see cref="DimAbs"/>.
     /// </summary>
     protected virtual TExprResult VisitLeafDimAbs(DimAbs expr) => base.VisitLeafDimAbs(expr, default);
-    
+
     /// <inheritdoc/>
     protected sealed override TExprResult VisitLeafDimAbs(DimAbs expr, Unit context) => VisitLeafDimAbs(expr);
 
@@ -2074,7 +2108,7 @@ public partial class ExprVisitor<TExprResult, TTypeResult>
     /// Visit leaf <see cref="DimClamp"/>.
     /// </summary>
     protected virtual TExprResult VisitLeafDimClamp(DimClamp expr) => base.VisitLeafDimClamp(expr, default);
-    
+
     /// <inheritdoc/>
     protected sealed override TExprResult VisitLeafDimClamp(DimClamp expr, Unit context) => VisitLeafDimClamp(expr);
 
@@ -2082,7 +2116,7 @@ public partial class ExprVisitor<TExprResult, TTypeResult>
     /// Visit leaf <see cref="DimCompareAndSelect"/>.
     /// </summary>
     protected virtual TExprResult VisitLeafDimCompareAndSelect(DimCompareAndSelect expr) => base.VisitLeafDimCompareAndSelect(expr, default);
-    
+
     /// <inheritdoc/>
     protected sealed override TExprResult VisitLeafDimCompareAndSelect(DimCompareAndSelect expr, Unit context) => VisitLeafDimCompareAndSelect(expr);
 
@@ -2090,7 +2124,7 @@ public partial class ExprVisitor<TExprResult, TTypeResult>
     /// Visit leaf <see cref="DimMin"/>.
     /// </summary>
     protected virtual TExprResult VisitLeafDimMin(DimMin expr) => base.VisitLeafDimMin(expr, default);
-    
+
     /// <inheritdoc/>
     protected sealed override TExprResult VisitLeafDimMin(DimMin expr, Unit context) => VisitLeafDimMin(expr);
 
@@ -2098,7 +2132,7 @@ public partial class ExprVisitor<TExprResult, TTypeResult>
     /// Visit leaf <see cref="DimMax"/>.
     /// </summary>
     protected virtual TExprResult VisitLeafDimMax(DimMax expr) => base.VisitLeafDimMax(expr, default);
-    
+
     /// <inheritdoc/>
     protected sealed override TExprResult VisitLeafDimMax(DimMax expr, Unit context) => VisitLeafDimMax(expr);
 
@@ -2106,7 +2140,7 @@ public partial class ExprVisitor<TExprResult, TTypeResult>
     /// Visit leaf <see cref="DimPositive"/>.
     /// </summary>
     protected virtual TExprResult VisitLeafDimPositive(DimPositive expr) => base.VisitLeafDimPositive(expr, default);
-    
+
     /// <inheritdoc/>
     protected sealed override TExprResult VisitLeafDimPositive(DimPositive expr, Unit context) => VisitLeafDimPositive(expr);
 
@@ -2114,7 +2148,7 @@ public partial class ExprVisitor<TExprResult, TTypeResult>
     /// Visit leaf <see cref="DimAt"/>.
     /// </summary>
     protected virtual TExprResult VisitLeafDimAt(DimAt expr) => base.VisitLeafDimAt(expr, default);
-    
+
     /// <inheritdoc/>
     protected sealed override TExprResult VisitLeafDimAt(DimAt expr, Unit context) => VisitLeafDimAt(expr);
 
@@ -2122,7 +2156,7 @@ public partial class ExprVisitor<TExprResult, TTypeResult>
     /// Visit leaf <see cref="IR.Shapes.Padding"/>.
     /// </summary>
     protected virtual TExprResult VisitLeafPadding(IR.Shapes.Padding expr) => base.VisitLeafPadding(expr, default);
-    
+
     /// <inheritdoc/>
     protected sealed override TExprResult VisitLeafPadding(IR.Shapes.Padding expr, Unit context) => VisitLeafPadding(expr);
 
@@ -2130,7 +2164,7 @@ public partial class ExprVisitor<TExprResult, TTypeResult>
     /// Visit leaf <see cref="IR.Shapes.Paddings"/>.
     /// </summary>
     protected virtual TExprResult VisitLeafPaddings(IR.Shapes.Paddings expr) => base.VisitLeafPaddings(expr, default);
-    
+
     /// <inheritdoc/>
     protected sealed override TExprResult VisitLeafPaddings(IR.Shapes.Paddings expr, Unit context) => VisitLeafPaddings(expr);
 
@@ -2138,7 +2172,7 @@ public partial class ExprVisitor<TExprResult, TTypeResult>
     /// Visit leaf <see cref="Shape"/>.
     /// </summary>
     protected virtual TExprResult VisitLeafShape(Shape expr) => base.VisitLeafShape(expr, default);
-    
+
     /// <inheritdoc/>
     protected sealed override TExprResult VisitLeafShape(Shape expr, Unit context) => VisitLeafShape(expr);
 
@@ -2146,7 +2180,7 @@ public partial class ExprVisitor<TExprResult, TTypeResult>
     /// Visit leaf <see cref="RankedShape"/>.
     /// </summary>
     protected virtual TExprResult VisitLeafRankedShape(RankedShape expr) => base.VisitLeafRankedShape(expr, default);
-    
+
     /// <inheritdoc/>
     protected sealed override TExprResult VisitLeafRankedShape(RankedShape expr, Unit context) => VisitLeafRankedShape(expr);
 
@@ -2154,7 +2188,7 @@ public partial class ExprVisitor<TExprResult, TTypeResult>
     /// Visit leaf <see cref="UnrankedShape"/>.
     /// </summary>
     protected virtual TExprResult VisitLeafUnrankedShape(UnrankedShape expr) => base.VisitLeafUnrankedShape(expr, default);
-    
+
     /// <inheritdoc/>
     protected sealed override TExprResult VisitLeafUnrankedShape(UnrankedShape expr, Unit context) => VisitLeafUnrankedShape(expr);
 
@@ -2162,7 +2196,7 @@ public partial class ExprVisitor<TExprResult, TTypeResult>
     /// Visit leaf <see cref="InvalidShape"/>.
     /// </summary>
     protected virtual TExprResult VisitLeafInvalidShape(InvalidShape expr) => base.VisitLeafInvalidShape(expr, default);
-    
+
     /// <inheritdoc/>
     protected sealed override TExprResult VisitLeafInvalidShape(InvalidShape expr, Unit context) => VisitLeafInvalidShape(expr);
 
@@ -2170,7 +2204,7 @@ public partial class ExprVisitor<TExprResult, TTypeResult>
     /// Visit leaf <see cref="ShapeVar"/>.
     /// </summary>
     protected virtual TExprResult VisitLeafShapeVar(ShapeVar expr) => base.VisitLeafShapeVar(expr, default);
-    
+
     /// <inheritdoc/>
     protected sealed override TExprResult VisitLeafShapeVar(ShapeVar expr, Unit context) => VisitLeafShapeVar(expr);
 
@@ -2178,7 +2212,7 @@ public partial class ExprVisitor<TExprResult, TTypeResult>
     /// Visit leaf <see cref="IR.Shapes.ShapeOf"/>.
     /// </summary>
     protected virtual TExprResult VisitLeafShapeOf(IR.Shapes.ShapeOf expr) => base.VisitLeafShapeOf(expr, default);
-    
+
     /// <inheritdoc/>
     protected sealed override TExprResult VisitLeafShapeOf(IR.Shapes.ShapeOf expr, Unit context) => VisitLeafShapeOf(expr);
 

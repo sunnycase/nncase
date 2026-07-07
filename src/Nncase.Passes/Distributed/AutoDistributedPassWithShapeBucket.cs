@@ -50,6 +50,27 @@ public sealed partial class AutoDistributedWithShapeBucketPass : FunctionPass
         return Task.FromResult(input);
     }
 
+    private static void ValidateSegmentFunction(Function inputFunction, Function sourceSegmentFunction, Function segmentFunction, IReadOnlySet<BaseFunction> forbiddenFunctions)
+    {
+        var directReferences = FunctionReferenceValidator.GetDirectFunctionReferences(segmentFunction);
+        foreach (var referencedFunction in directReferences)
+        {
+            if (ReferenceEquals(referencedFunction, inputFunction)
+                || ReferenceEquals(referencedFunction, sourceSegmentFunction)
+                || forbiddenFunctions.Contains(referencedFunction))
+            {
+                throw new InvalidOperationException($"Shape bucket segment {segmentFunction.Name} illegally references source function {referencedFunction.Name}.");
+            }
+        }
+
+        FunctionReferenceValidator.ValidateAcyclic(segmentFunction);
+    }
+
+    private static void ValidateShapeBucketFunctionGraph(BaseFunction function)
+    {
+        FunctionReferenceValidator.ValidateAcyclic(function);
+    }
+
     private BaseFunction Distribute(Function function, INTTTargetOptions targetOptions)
     {
         var shapeBucketOptions = _compileOptions.ShapeBucketOptions;
@@ -99,14 +120,17 @@ public sealed partial class AutoDistributedWithShapeBucketPass : FunctionPass
             BuildSegmentSearchGraphs(segmentStates);
 
             var segmentFunctions = new List<(Function SegmentFunction, Dictionary<DimVar, DimVar> DimVars)>(segmentStates.Length);
+            var sourceSegmentFunctions = segmentStates.Select(state => (BaseFunction)state.SegmentFunction).ToHashSet((IEqualityComparer<BaseFunction>)ReferenceEqualityComparer.Instance);
             foreach (var segmentState in segmentStates)
             {
                 using var segmentDumpScope = new DumpScope(segmentState.SegmentFunction.Name);
                 var rewritten = segmentState.Rewriter.SolveAndExtract(segmentState.SegmentFunction, segmentState.Root);
+                ValidateSegmentFunction(function, segmentState.SegmentFunction, rewritten, sourceSegmentFunctions);
                 segmentFunctions.Add((rewritten, segmentState.DimVars));
             }
 
-            return BuildMainFunction(function, segmentFunctions);
+            var primFunction = BuildMainFunction(function, segmentFunctions);
+            return WrapShapeBucketFunction(function, primFunction);
         }
 
         int GetShapeBucketSegmentsCount()
@@ -182,6 +206,17 @@ public sealed partial class AutoDistributedWithShapeBucketPass : FunctionPass
         }
     }
 
+    private BaseFunction WrapShapeBucketFunction(Function inputFunction, PrimFunction primFunction)
+    {
+        var callers = inputFunction.Users.Where(x => x is Call or FunctionWrapper).ToArray();
+        if (callers.Length == 0)
+        {
+            return primFunction;
+        }
+
+        return new PrimFunctionWrapper(inputFunction.Name, primFunction, inputFunction.Parameters.Length);
+    }
+
     private void BuildSegmentSearchGraphs(IReadOnlyList<SegmentAutoDistributedState> segmentStates)
     {
         var parallelism = GetSegmentGraphBuildParallelism(segmentStates.Count);
@@ -228,7 +263,7 @@ public sealed partial class AutoDistributedWithShapeBucketPass : FunctionPass
 
     private PrimFunction BuildMainFunction(Function inputFunction, List<(Function SegmentFunction, Dictionary<DimVar, DimVar> DimVars)> segmentFunctions)
     {
-        var outputBuffers = CreateOutputBuffers(inputFunction.Body);
+        var outputBuffers = CreateOutputBufferVars(inputFunction.Body);
         var inputParams = inputFunction.Parameters.AsValueEnumerable().Select(x => (Expr)x).ToArray().Concat(outputBuffers).ToArray();
         TIR.Sequential MakeSegementCall(Function segmentFunction)
         {
@@ -252,38 +287,27 @@ public sealed partial class AutoDistributedWithShapeBucketPass : FunctionPass
         }
 
         var mainBody = T.Sequential()
-            .Body(outputBuffers)
-            .Body(
-                lastSegmentCall,
-                T.Return(outputBuffers))
+            .Body(lastSegmentCall)
             .Build();
-        return new PrimFunction($"{inputFunction.Name}_prim", inputFunction.ModuleKind, mainBody, inputFunction.Parameters) { Metadata = inputFunction.Metadata };
+        var mainFunction = new PrimFunction($"{inputFunction.Name}_prim", inputFunction.ModuleKind, mainBody, inputFunction.Parameters.ToArray().Concat<IVar>(outputBuffers).ToArray()) { Metadata = inputFunction.Metadata };
+        ValidateShapeBucketFunctionGraph(mainFunction);
+        return mainFunction;
     }
 
-    private TIR.Buffer[] CreateOutputBuffers(BaseExpr expr)
+    private BufferVar[] CreateOutputBufferVars(BaseExpr expr)
     {
-        var memoryLocation = MemoryLocation.Output;
         if (expr.CheckedType is TupleType tt)
         {
-            var fields = tt.Fields.AsValueEnumerable().Select(x => CreateBuffer(x, memoryLocation)).ToArray();
-            return fields;
+            return tt.Fields.AsValueEnumerable().Select(CreateOutputBufferVar).ToArray();
         }
         else
         {
-            return [CreateBuffer(expr.CheckedType, memoryLocation)];
+            return [CreateOutputBufferVar(expr.CheckedType)];
         }
     }
 
-    private TIR.Buffer CreateBuffer(IRType type, MemoryLocation memoryLocation)
-    {
-        var tensorType = type switch
-        {
-            DistributedType dt => dt.TensorType,
-            TensorType tt => tt,
-            _ => throw new ArgumentException($"Unsupported type: {type}"),
-        };
-        return T.CreateBuffer(tensorType, memoryLocation, out _, $"buffer_{_bufferIndex++}", type as DistributedType);
-    }
+    private BufferVar CreateOutputBufferVar(IRType type)
+        => new($"out_{_bufferIndex++}", type, BufferVarRole.Output, MemoryLocation.Output);
 
     private sealed class SegmentAutoDistributedState
     {
@@ -358,6 +382,91 @@ public sealed partial class AutoDistributedWithShapeBucketPass : FunctionPass
         protected override BaseExpr VisitLeafDimVar(DimVar expr, Unit context)
         {
             return _newDimVars.GetValueOrDefault(expr, expr);
+        }
+    }
+
+    private sealed class FunctionReferenceValidator
+    {
+        public static IReadOnlyList<BaseFunction> GetDirectFunctionReferences(BaseFunction function)
+        {
+            return function switch
+            {
+                Function f => GetDirectFunctionReferences(f.Body),
+                Fusion f => GetDirectFunctionReferences(f.Body),
+                FunctionWrapper wrapper => [wrapper.Target],
+                PrimFunctionWrapper wrapper => [wrapper.Target],
+                PrimFunction f => GetDirectFunctionReferences(f.Body),
+                _ => throw new NotSupportedException($"Unsupported function type {function.GetType().Name}."),
+            };
+        }
+
+        public static void ValidateAcyclic(BaseFunction root)
+        {
+            var visited = new HashSet<BaseFunction>(ReferenceEqualityComparer.Instance);
+            var active = new HashSet<BaseFunction>(ReferenceEqualityComparer.Instance);
+            var path = new List<BaseFunction>();
+            Visit(root, visited, active, path);
+        }
+
+        private static IReadOnlyList<BaseFunction> GetDirectFunctionReferences(BaseExpr root)
+        {
+            var refs = new List<BaseFunction>();
+            var seenRefs = new HashSet<BaseFunction>(ReferenceEqualityComparer.Instance);
+            var visited = new HashSet<BaseExpr>(ReferenceEqualityComparer.Instance);
+            var stack = new Stack<BaseExpr>();
+            stack.Push(root);
+
+            while (stack.Count != 0)
+            {
+                var expr = stack.Pop();
+                if (!visited.Add(expr))
+                {
+                    continue;
+                }
+
+                if (expr is BaseFunction function)
+                {
+                    if (seenRefs.Add(function))
+                    {
+                        refs.Add(function);
+                    }
+
+                    continue;
+                }
+
+                var operands = expr.Operands;
+                for (int i = operands.Length - 1; i >= 0; i--)
+                {
+                    stack.Push(operands[i]);
+                }
+            }
+
+            return refs;
+        }
+
+        private static void Visit(BaseFunction function, HashSet<BaseFunction> visited, HashSet<BaseFunction> active, List<BaseFunction> path)
+        {
+            if (active.Contains(function))
+            {
+                var cycleStart = path.FindIndex(f => ReferenceEquals(f, function));
+                var cycle = path.Skip(cycleStart).Append(function).Select(f => f.Name);
+                throw new InvalidOperationException($"Function reference graph contains a cycle: {string.Join(" -> ", cycle)}.");
+            }
+
+            if (!visited.Add(function))
+            {
+                return;
+            }
+
+            active.Add(function);
+            path.Add(function);
+            foreach (var referencedFunction in GetDirectFunctionReferences(function))
+            {
+                Visit(referencedFunction, visited, active, path);
+            }
+
+            path.RemoveAt(path.Count - 1);
+            active.Remove(function);
         }
     }
 }

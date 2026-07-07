@@ -2,6 +2,7 @@
 // Licensed under the Apache license. See LICENSE file in the project root for full license information.
 
 using Nncase.IR;
+using Nncase.TIR;
 
 namespace Nncase.CodeGen.PyNTT;
 
@@ -32,9 +33,20 @@ public sealed class PyNTTModuleBuilder : IModuleBuilder
     /// <inheritdoc/>
     public ILinkableModule Build(IReadOnlyList<BaseFunction> functions)
     {
-        var linkableFunctions = functions
+        var primFunctions = functions.Select(RequirePrimFunction).ToArray();
+        var linkableFunctions = primFunctions
             .Select((function, index) => new PyNTTFunctionBuilder((uint)index, CompileOptions).Build(function))
             .ToArray();
         return new PyNTTLinkableModule(ModuleKind, linkableFunctions, CompileOptions);
+    }
+
+    private static PrimFunction RequirePrimFunction(BaseFunction function)
+    {
+        if (function is PrimFunction primFunction)
+        {
+            return primFunction;
+        }
+
+        throw new NotSupportedException($"PyNTT module builder expects lowered PrimFunction inputs, got {function.GetType().Name} {function.Name}. Run TIR selection and RemoveFunctionWrapperPass before PyNTT codegen.");
     }
 }

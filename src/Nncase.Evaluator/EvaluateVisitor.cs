@@ -146,6 +146,22 @@ internal sealed partial class EvaluateVisitor : ExprVisitor<IValue, Unit>, IDisp
     }
 
     /// <inheritdoc/>
+    protected override IValue VisitLeafBufferVar(BufferVar expr) => VisitVarLike(expr);
+
+    private IValue VisitVarLike(IVar expr)
+    {
+        if (!_varsValues.TryGetValue(expr, out var value))
+        {
+            if (!_dimVarsValues.TryGetValue(expr, out value))
+            {
+                throw new ArgumentException($"Must Set Input For Var {expr.Name}!");
+            }
+        }
+
+        return value;
+    }
+
+    /// <inheritdoc/>
     protected override IValue VisitCall(Call expr)
     {
         if (HasVisited(expr, out var result))

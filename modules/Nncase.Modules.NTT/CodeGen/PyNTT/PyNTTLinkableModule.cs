@@ -60,11 +60,14 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
 
     private static IVar[] GetInputParameters(BaseFunction function)
     {
-        var outputParameters = function is PrimFunction primFunction
-            ? GetTensorStoreOutputParameters(primFunction)
-            : new HashSet<IVar>(ReferenceEqualityComparer.Instance);
+        if (function is PrimFunction primFunction)
+        {
+            var abi = primFunction.GetAbiView();
+            return abi.Inputs.Concat<IVar>(abi.Workspaces).ToArray();
+        }
+
         return GetParameters(function)
-            .Where(parameter => IsTensorType(((Expr)parameter).CheckedType) && !outputParameters.Contains(parameter))
+            .Where(parameter => IsTensorType(((Expr)parameter).CheckedType))
             .ToArray();
     }
 
@@ -88,36 +91,9 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
 
     private static TensorSpecMetadata[] GetOutputTensorSpecs(BaseFunction function)
     {
-        if (function.CheckedType is not CallableType callableType)
-        {
-            return function is PrimFunction primFunctionWithoutCallable
-                ? GetTensorStoreDestinations(primFunctionWithoutCallable)
-                    .Select((expr, index) => BuildTensorSpec($"output{index}", expr.CheckedType, "output", "like_input"))
-                    .ToArray()
-                : Array.Empty<TensorSpecMetadata>();
-        }
-
-        var outputs = FlattenReturnTypes(callableType.ReturnType)
-            .Select((type, index) => BuildTensorSpec($"output{index}", type, "output", "like_input"))
+        return PyNTTFunctionOutputs.GetOutputs(function)
+            .Select((output, index) => BuildTensorSpec($"output{index}", output.CheckedType, "output", "like_input"))
             .ToArray();
-        if (outputs.Length == 0 && function is PrimFunction primFunction)
-        {
-            return GetTensorStoreDestinations(primFunction)
-                .Select((expr, index) => BuildTensorSpec($"output{index}", expr.CheckedType, "output", "like_input"))
-                .ToArray();
-        }
-
-        return outputs;
-    }
-
-    private static IEnumerable<IRType> FlattenReturnTypes(IRType type)
-    {
-        return type switch
-        {
-            TupleType tupleType when tupleType == TupleType.Void => Array.Empty<IRType>(),
-            TupleType tupleType => tupleType.ToArray(),
-            _ => new[] { type },
-        };
     }
 
     private static TensorSpecMetadata BuildTensorSpec(string name, IRType type, string role, string device)
@@ -154,43 +130,6 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
     }
 
     private static bool IsObjectDataType(DataType dataType) => dataType is ReferenceType;
-
-    private static HashSet<IVar> GetTensorStoreOutputParameters(PrimFunction function)
-    {
-        var outputParameters = new HashSet<IVar>(ReferenceEqualityComparer.Instance);
-        foreach (var destination in GetTensorStoreDestinations(function))
-        {
-            var unwrapped = UnwrapInputBoxing(destination);
-            if (unwrapped is IVar parameter)
-            {
-                outputParameters.Add(parameter);
-            }
-        }
-
-        return outputParameters;
-    }
-
-    private static BaseExpr[] GetTensorStoreDestinations(PrimFunction function)
-    {
-        var destinations = new List<BaseExpr>();
-        CollectTensorStoreDestinations(function.Body, destinations);
-        return destinations
-            .Distinct((IEqualityComparer<BaseExpr>)ReferenceEqualityComparer.Instance)
-            .ToArray();
-    }
-
-    private static void CollectTensorStoreDestinations(BaseExpr expr, List<BaseExpr> destinations)
-    {
-        if (expr is Call call && call.Target is Nncase.TIR.NTT.TensorStore && call.Arguments.ToArray().Length >= 2)
-        {
-            destinations.Add(UnwrapInputBoxing(call.Arguments[1]));
-        }
-
-        foreach (var operand in expr.Operands)
-        {
-            CollectTensorStoreDestinations(operand, destinations);
-        }
-    }
 
     private static RankedShape GetRankedShape(TensorType tensorType, string name)
     {
@@ -230,6 +169,94 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
             var name => name,
         };
     }
+
+    private static string GetPyNTTScalarDTypeName(DataType dataType)
+    {
+        return dataType switch
+        {
+            VectorType vectorType => GetPyNTTDTypeName(vectorType.ElemType),
+            MaskVectorType maskVectorType => maskVectorType.ElementBits switch
+            {
+                1 => "bool",
+                8 => "uint8",
+                16 => "uint16",
+                32 => "uint32",
+                64 => "uint64",
+                _ => throw new NotSupportedException($"PyNTT does not support mask vector element width {maskVectorType.ElementBits}."),
+            },
+            _ => GetPyNTTDTypeName(dataType),
+        };
+    }
+
+    private static long GetBufferOffsetBytes(TIR.Buffer buffer)
+    {
+        return checked(GetFixedDimension(buffer.MemSpan.Buffer.Start, $"{buffer.Name} physical buffer offset") +
+            GetFixedDimension(buffer.MemSpan.Start, $"{buffer.Name} memspan offset"));
+    }
+
+    private static long GetFixedDimension(BaseExpr expr, string context)
+    {
+        return expr switch
+        {
+            Dimension dimension => GetFixedDimension(dimension, context),
+            TensorConst tensorConst when tensorConst.Value.Shape.IsScalar => tensorConst.Value.ToScalar<long>(),
+            _ => expr.Evaluate().AsTensor().ToScalar<long>(),
+        };
+    }
+
+    private static long GetFixedDimension(Dimension dimension, string context)
+    {
+        if (!dimension.IsFixed)
+        {
+            throw new NotSupportedException($"PyNTT requires fixed {context}, got {dimension}.");
+        }
+
+        return dimension.FixedValue;
+    }
+
+    private static int GetShardCount(GeneratedKernelMetadata kernel)
+        => kernel.Launch.Sharding.Hierarchy.Aggregate(1, (product, value) => checked(product * value));
+
+    private static bool IsTirKernel(GeneratedKernelMetadata kernel)
+        => kernel.Attrs.TryGetValue("tir", out var value) && value switch
+        {
+            bool boolValue => boolValue,
+            JsonElement { ValueKind: JsonValueKind.True } => true,
+            JsonElement { ValueKind: JsonValueKind.False } => false,
+            _ => false,
+        };
+
+    private static long GetMaxCollectiveDataBytes(IReadOnlyList<GeneratedKernelMetadata> kernels)
+        => kernels
+            .Select(GetCollectiveDataBytes)
+            .DefaultIfEmpty(0)
+            .Max();
+
+    private static long GetCollectiveDataBytes(GeneratedKernelMetadata kernel)
+    {
+        if (!kernel.Launch.Meta.TryGetValue("collective_data_pool_bytes", out var value))
+        {
+            return 0;
+        }
+
+        return value switch
+        {
+            int intValue => intValue,
+            long longValue => longValue,
+            JsonElement { ValueKind: JsonValueKind.Number } jsonElement => jsonElement.GetInt64(),
+            _ => throw new NotSupportedException($"PyNTT collective_data_pool_bytes must be an integer, got {value}."),
+        };
+    }
+
+    private int GetTargetShardCount()
+    {
+        var targetOptions = PyNTTTargetOptionsUtility.Get(_compileOptions);
+        var hierarchy = targetOptions.Hierarchies.Length == 0 ? new[] { 1 } : targetOptions.Hierarchies[0];
+        return hierarchy.Aggregate(1, (product, value) => checked(product * value));
+    }
+
+    private int GetBlockLocalDataScopeCount()
+        => GetTargetShardCount();
 
     private static string PythonString(string value) => JsonSerializer.Serialize(value);
 
@@ -403,6 +430,97 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
         return _functions.Count > 0 ? _functions[0].SourceFunction.Name : "model";
     }
 
+    private sealed record RuntimeBinding(
+        string Expression,
+        string? AssignmentTarget = null,
+        string? PoolStrideBytes = null,
+        string? PoolStrideElements = null,
+        string? WorkspacePoolStrideBytes = null);
+
+    private sealed record FunctionCallArgumentLayout(
+        BaseExpr[] InputArguments,
+        BaseExpr[] OutputArguments,
+        BaseExpr[] WorkspaceArguments);
+
+    private sealed record ObjectBufferKey(
+        string Scope,
+        string Name,
+        string ElemType,
+        int Rank);
+
+    private sealed record WorkspaceUsage(bool IsReferenced, long LocalBytes);
+
+    private sealed record PreparedWorkspaceRequirements(
+        bool UsesData,
+        long DataLocalBytes,
+        long CollectiveDataBytes,
+        int MaxShardCount,
+        bool UsesBlockLocalData,
+        long BlockLocalDataBytes);
+
+    private sealed class RuntimeDispatchState
+    {
+        private int _nextTempIndex;
+
+        public string NewTemp(string prefix)
+        {
+            var index = _nextTempIndex++;
+            return $"__pyntt_{prefix}_{index.ToString(CultureInfo.InvariantCulture)}";
+        }
+    }
+
+    private sealed class RuntimeDispatchContext
+    {
+        public RuntimeDispatchContext(
+            RuntimeDispatchState state,
+            Dictionary<string, RuntimeBinding> parameters,
+            Dictionary<string, RuntimeBinding> outputs,
+            Dictionary<ObjectBufferKey, RuntimeBinding> objectBuffers,
+            string scope,
+            string deviceExpression,
+            string rootInputsExpression)
+        {
+            State = state;
+            Parameters = parameters;
+            Outputs = outputs;
+            ObjectBuffers = objectBuffers;
+            Scope = scope;
+            DeviceExpression = deviceExpression;
+            RootInputsExpression = rootInputsExpression;
+        }
+
+        public RuntimeDispatchState State { get; }
+
+        public Dictionary<string, RuntimeBinding> Parameters { get; }
+
+        public Dictionary<string, RuntimeBinding> Outputs { get; }
+
+        public Dictionary<ObjectBufferKey, RuntimeBinding> ObjectBuffers { get; }
+
+        public string Scope { get; }
+
+        public string DeviceExpression { get; }
+
+        public string RootInputsExpression { get; }
+
+        public string? Data { get; set; }
+
+        public string? DataPoolStrideBytes { get; set; }
+
+        public string? RData { get; set; }
+
+        public string? ChipLocalRData { get; set; }
+
+        public string? BlockLocalRData { get; set; }
+
+        public string? BlockLocalData { get; set; }
+
+        public string? BlockLocalDataPoolStrideBytes { get; set; }
+
+        public RuntimeDispatchContext CreateCallee(string scope, Dictionary<string, RuntimeBinding> parameters, Dictionary<string, RuntimeBinding> outputs)
+            => new(State, parameters, outputs, ObjectBuffers, scope, DeviceExpression, RootInputsExpression);
+    }
+
     private string BuildSpecsPython(string moduleName, string backend)
     {
         var functionSpecs = string.Join(
@@ -444,7 +562,7 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
 
             from pyntt.codegen.render import render_generated_kernels
             from pyntt.runtime.interpreter import PyNTTInterpreter
-            from pyntt.runtime.tensor import materialize_kv_cache_blocks_per_shard, materialize_kv_cache_metadata, materialize_kv_cache_storage, materialize_kv_cache_tensor_field
+            from pyntt.runtime.tensor import materialize_kv_cache_blocks_per_shard, materialize_kv_cache_metadata, materialize_kv_cache_storage, materialize_kv_cache_tensor_field, view_typed_buffer
             from pyntt.runtime.tuning import select_tuning_parameter
             {{tritonRuntimeImport}}
             from .rdata import RDATA_BUNDLES
@@ -470,10 +588,16 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
 
     private string BuildModelLaunchStatements(PyNTTLinkableFunction function)
     {
+        var context = CreateEntryDispatchContext(function.SourceFunction);
+        if (RequiresDispatch(function))
+        {
+            return BuildFunctionDispatch(function, context, extraIndent: 0);
+        }
+
         var kernels = function.GeneratedKernelSource.Kernels;
         if (kernels.Count == 0)
         {
-            var dispatch = BuildDispatchLaunchStatements(function.SourceFunction, extraIndent: 0);
+            var dispatch = BuildDispatchLaunchStatements(function.SourceFunction, function, context, extraIndent: 0);
             if (!string.IsNullOrWhiteSpace(dispatch))
             {
                 return dispatch;
@@ -493,30 +617,291 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
         var outputNames = GetOutputTensorSpecs(function.SourceFunction).Select(output => output.Name).ToArray();
         return string.Join(
             Environment.NewLine,
-            kernels.Select(kernel => BuildModelKernelLaunchPython(function.SourceFunction.Name, kernel, parameterNames, outputNames)));
+            kernels.Select(kernel => BuildModelKernelLaunchPython(function.SourceFunction.Name, kernel, parameterNames, outputNames, context, usePreparedWorkspace: false)));
     }
 
-    private string BuildDispatchLaunchStatements(BaseExpr expr, int extraIndent)
+    private static bool RequiresDispatch(PyNTTLinkableFunction function)
+        => ContainsFunctionCall(function.SourceFunction) ||
+            function.GeneratedKernelSource.Kernels.Any(IsDispatchSegmentKernel);
+
+    private static bool ContainsFunctionCall(BaseExpr expr)
+    {
+        if (expr is Call { Target: BaseFunction })
+        {
+            return true;
+        }
+
+        if (expr is PrimFunction primFunction)
+        {
+            return ContainsFunctionCall(primFunction.Body);
+        }
+
+        if (expr is Function or Fusion or FunctionWrapper or PrimFunctionWrapper)
+        {
+            throw new NotSupportedException($"PyNTT dispatch expects lowered PrimFunction bodies only, but found {expr.GetType().Name}. TIR selection and RemoveFunctionWrapperPass must run before PyNTT codegen.");
+        }
+
+        if (expr is BaseFunction)
+        {
+            return false;
+        }
+
+        foreach (var operand in expr.Operands)
+        {
+            if (ContainsFunctionCall(operand))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static bool IsDispatchSegmentKernel(GeneratedKernelMetadata kernel)
+        => kernel.Attrs.ContainsKey("dispatch_segment_index");
+
+    private RuntimeDispatchContext CreateEntryDispatchContext(BaseFunction function)
+    {
+        var state = new RuntimeDispatchState();
+        var parameters = GetParameterNames(function)
+            .Select((name, index) => (name, index))
+            .ToDictionary(item => item.name, item => new RuntimeBinding($"inputs[{item.index.ToString(CultureInfo.InvariantCulture)}]"), StringComparer.Ordinal);
+        var outputs = CreateRuntimeOutputBindings(function, index => new RuntimeBinding(
+            $"outputs[{index.ToString(CultureInfo.InvariantCulture)}]",
+            $"outputs[{index.ToString(CultureInfo.InvariantCulture)}]"));
+        return new RuntimeDispatchContext(state, parameters, outputs, new Dictionary<ObjectBufferKey, RuntimeBinding>(), function.Name, "outputs[0].device", "inputs");
+    }
+
+    private static Dictionary<string, RuntimeBinding> CreateRuntimeOutputBindings(BaseFunction function, Func<int, RuntimeBinding> createBinding)
+    {
+        var outputParameters = PyNTTFunctionOutputs.GetOutputs(function);
+        var bindings = new Dictionary<string, RuntimeBinding>(StringComparer.Ordinal);
+        for (var i = 0; i < outputParameters.Length; i++)
+        {
+            var outputName = $"output{i.ToString(CultureInfo.InvariantCulture)}";
+            var binding = createBinding(i);
+            bindings[outputName] = binding;
+            bindings[outputParameters[i].Name] = binding;
+        }
+
+        return bindings;
+    }
+
+    private static WorkspaceUsage GetWorkspaceUsage(BaseFunction function, MemoryLocation location)
+    {
+        var buffers = new List<TIR.Buffer>();
+        switch (function)
+        {
+            case Function f:
+                CollectWorkspaceBuffers(f.Body, location, buffers);
+                break;
+            case Fusion f:
+                CollectWorkspaceBuffers(f.Body, location, buffers);
+                break;
+            case PrimFunction f:
+                CollectWorkspaceBuffers(f.Body, location, buffers);
+                break;
+        }
+
+        if (buffers.Count == 0)
+        {
+            return new WorkspaceUsage(false, 0);
+        }
+
+        var localBytes = buffers
+            .Distinct((IEqualityComparer<TIR.Buffer>)ReferenceEqualityComparer.Instance)
+            .Select(buffer => checked(GetBufferOffsetBytes(buffer) + GetFixedDimension(buffer.MemSpan.Size, $"{buffer.Name} memspan size")))
+            .DefaultIfEmpty(0)
+            .Max();
+        return new WorkspaceUsage(true, localBytes);
+    }
+
+    private PreparedWorkspaceRequirements GetPreparedWorkspaceRequirements(PyNTTLinkableFunction function)
+        => GetPreparedWorkspaceRequirements(function, new HashSet<PyNTTLinkableFunction>());
+
+    private PreparedWorkspaceRequirements GetPreparedWorkspaceRequirements(PyNTTLinkableFunction function, HashSet<PyNTTLinkableFunction> active)
+    {
+        if (!active.Add(function))
+        {
+            throw new NotSupportedException($"PyNTT dispatch call graph contains a recursive call involving {function.SourceFunction.Name}.");
+        }
+
+        try
+        {
+            var kernels = function.GeneratedKernelSource.Kernels.ToArray();
+            var tirKernels = kernels.Where(IsTirKernel).ToArray();
+            var maxShardCount = kernels
+                .Select(GetShardCount)
+                .DefaultIfEmpty(GetTargetShardCount())
+                .Max();
+            var collectiveDataBytes = GetMaxCollectiveDataBytes(kernels);
+            var usesData = false;
+            var dataLocalBytes = 0L;
+            var usesBlockLocalData = false;
+            var blockLocalDataBytes = 0L;
+
+            if (function.SourceFunction is PrimFunction primFunction)
+            {
+                var dataUsage = GetWorkspaceUsage(function.SourceFunction, MemoryLocation.Data);
+                dataLocalBytes = Math.Max((long)primFunction.SchedResult.DataUsage, dataUsage.LocalBytes);
+                usesData = tirKernels.Length > 0 || primFunction.SchedResult.DataUsage > 0 || dataUsage.IsReferenced;
+
+                var blockLocalDataUsage = GetWorkspaceUsage(function.SourceFunction, MemoryLocation.BlockLocalData);
+                blockLocalDataBytes = Math.Max((long)primFunction.SchedResult.BlockLocalDataPoolSize, blockLocalDataUsage.LocalBytes);
+                usesBlockLocalData = tirKernels.Length > 0 || primFunction.SchedResult.BlockLocalDataPoolSize > 0 || blockLocalDataUsage.IsReferenced;
+            }
+
+            var callees = new List<PrimFunction>();
+            CollectDirectPrimFunctionCallees(function.SourceFunction, callees);
+            foreach (var directCallee in callees)
+            {
+                var calleeRequirements = GetPreparedWorkspaceRequirements(FindLinkableFunction(directCallee), active);
+                usesData |= calleeRequirements.UsesData;
+                dataLocalBytes = Math.Max(dataLocalBytes, calleeRequirements.DataLocalBytes);
+                collectiveDataBytes = Math.Max(collectiveDataBytes, calleeRequirements.CollectiveDataBytes);
+                maxShardCount = Math.Max(maxShardCount, calleeRequirements.MaxShardCount);
+                usesBlockLocalData |= calleeRequirements.UsesBlockLocalData;
+                blockLocalDataBytes = Math.Max(blockLocalDataBytes, calleeRequirements.BlockLocalDataBytes);
+            }
+
+            return new PreparedWorkspaceRequirements(
+                usesData,
+                dataLocalBytes,
+                collectiveDataBytes,
+                maxShardCount,
+                usesBlockLocalData,
+                blockLocalDataBytes);
+        }
+        finally
+        {
+            active.Remove(function);
+        }
+    }
+
+    private static void CollectDirectPrimFunctionCallees(BaseExpr expr, List<PrimFunction> callees)
+    {
+        if (expr is PrimFunction primFunction)
+        {
+            CollectDirectPrimFunctionCallees(primFunction.Body, callees);
+            return;
+        }
+
+        if (expr is BaseFunction)
+        {
+            return;
+        }
+
+        if (expr is Call { Target: PrimFunction callee })
+        {
+            callees.Add(callee);
+        }
+
+        foreach (var operand in expr.Operands)
+        {
+            CollectDirectPrimFunctionCallees(operand, callees);
+        }
+    }
+
+    private static void CollectWorkspaceBuffers(BaseExpr expr, MemoryLocation location, List<TIR.Buffer> buffers)
+    {
+        if (expr is BaseFunction)
+        {
+            return;
+        }
+
+        if (expr is TIR.Buffer buffer && buffer.MemSpan.Buffer.Location == location)
+        {
+            buffers.Add(buffer);
+        }
+
+        foreach (var operand in expr.Operands)
+        {
+            CollectWorkspaceBuffers(operand, location, buffers);
+        }
+    }
+
+    private string BuildFunctionDispatch(PyNTTLinkableFunction function, RuntimeDispatchContext context, int extraIndent)
+    {
+        var pieces = new List<string>();
+        pieces.Add(BuildPreparedWorkspaceSetup(function, context, extraIndent));
+
+        var body = BuildDispatchLaunchStatements(function.SourceFunction, function, context, extraIndent);
+        if (!string.IsNullOrWhiteSpace(body))
+        {
+            pieces.Add(body);
+        }
+
+        return string.Join(Environment.NewLine, pieces.Where(piece => !string.IsNullOrWhiteSpace(piece)));
+    }
+
+    private string BuildPreparedWorkspaceSetup(PyNTTLinkableFunction function, RuntimeDispatchContext context, int extraIndent)
+    {
+        var statements = new List<string>();
+        var indent = new string(' ', 8 + extraIndent);
+        var kernels = function.GeneratedKernelSource.Kernels.ToArray();
+        var tirKernels = kernels.Where(IsTirKernel).ToArray();
+        var primFunction = function.SourceFunction as PrimFunction;
+        if (primFunction is not null)
+        {
+            var requirements = GetPreparedWorkspaceRequirements(function);
+            var dataDType = PythonString("uint8");
+            context.DataPoolStrideBytes ??= requirements.DataLocalBytes.ToString(CultureInfo.InvariantCulture);
+            if (string.IsNullOrWhiteSpace(context.Data) && requirements.UsesData)
+            {
+                var dataName = context.State.NewTemp("data");
+                context.Data = dataName;
+                statements.Add(
+                    $"{indent}{dataName} = self.allocate_workspace({context.RootInputsExpression}, {PythonString(function.SourceFunction.Name + ".data")}, {requirements.DataLocalBytes.ToString(CultureInfo.InvariantCulture)} * {requirements.MaxShardCount.ToString(CultureInfo.InvariantCulture)} + {requirements.CollectiveDataBytes.ToString(CultureInfo.InvariantCulture)}, {dataDType})");
+            }
+
+            context.BlockLocalDataPoolStrideBytes ??= requirements.BlockLocalDataBytes.ToString(CultureInfo.InvariantCulture);
+            if (string.IsNullOrWhiteSpace(context.BlockLocalData) && requirements.UsesBlockLocalData)
+            {
+                var blockLocalDataName = context.State.NewTemp("block_local_data");
+                context.BlockLocalData = blockLocalDataName;
+                var blockLocalDataScopeCount = GetBlockLocalDataScopeCount();
+                statements.Add(
+                    $"{indent}{blockLocalDataName} = self.allocate_workspace({context.RootInputsExpression}, {PythonString(function.SourceFunction.Name + ".block_local_data")}, {requirements.BlockLocalDataBytes.ToString(CultureInfo.InvariantCulture)} * {blockLocalDataScopeCount.ToString(CultureInfo.InvariantCulture)}, {dataDType})");
+            }
+        }
+
+        if (tirKernels.Length > 0
+            && (string.IsNullOrWhiteSpace(context.RData)
+                || string.IsNullOrWhiteSpace(context.ChipLocalRData)
+                || string.IsNullOrWhiteSpace(context.BlockLocalRData)))
+        {
+            var rdataName = context.State.NewTemp("rdata");
+            var chipLocalRDataName = context.State.NewTemp("chip_local_rdata");
+            var blockLocalRDataName = context.State.NewTemp("block_local_rdata");
+            context.RData = rdataName;
+            context.ChipLocalRData = chipLocalRDataName;
+            context.BlockLocalRData = blockLocalRDataName;
+            statements.Add(
+                $"{indent}{rdataName}, {chipLocalRDataName}, {blockLocalRDataName} = self.materialize_rdata_bundle({context.RootInputsExpression}, {PythonString(function.SourceFunction.Name)})");
+        }
+
+        return string.Join(Environment.NewLine, statements);
+    }
+
+    private string BuildDispatchLaunchStatements(BaseExpr expr, PyNTTLinkableFunction? currentFunction, RuntimeDispatchContext context, int extraIndent)
     {
         switch (expr)
         {
             case PrimFunction primFunction:
-                return BuildDispatchLaunchStatements(primFunction.Body, extraIndent);
+                return BuildDispatchLaunchStatements(primFunction.Body, currentFunction, context, extraIndent);
             case Sequential sequential:
-                return string.Join(
-                    Environment.NewLine,
-                    sequential.Fields.ToArray()
-                        .Select(field => BuildDispatchLaunchStatements(field, extraIndent))
-                        .Where(statement => !string.IsNullOrWhiteSpace(statement)));
+                return BuildDispatchSequential(sequential, currentFunction, context, extraIndent);
             case IfThenElse ifThenElse:
-                return BuildDispatchIfThenElse(ifThenElse, extraIndent);
-            case Call { Target: PrimFunction callee }:
-                return IndentPythonBlock(BuildModelLaunchStatements(FindLinkableFunction(callee)), extraIndent);
+                return BuildDispatchIfThenElse(ifThenElse, currentFunction, context, extraIndent);
+            case Call { Target: PrimFunction callee } call:
+                return BuildFunctionCallDispatch(call, FindLinkableFunction(callee), context, extraIndent);
+            case Call { Target: BaseFunction callee }:
+                throw new NotSupportedException($"PyNTT dispatch expects direct PrimFunction call targets, got {callee.GetType().Name} {callee.Name}.");
             case Return ret:
                 return string.Join(
                     Environment.NewLine,
                     ret.Values.ToArray()
-                        .Select(value => BuildDispatchLaunchStatements(value, extraIndent))
+                        .Select(value => BuildDispatchLaunchStatements(value, currentFunction, context, extraIndent))
                         .Where(statement => !string.IsNullOrWhiteSpace(statement)));
             case Nncase.TIR.Buffer:
             case Const:
@@ -527,12 +912,121 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
         }
     }
 
-    private string BuildDispatchIfThenElse(IfThenElse expr, int extraIndent)
+    private string BuildDispatchSequential(Sequential sequential, PyNTTLinkableFunction? currentFunction, RuntimeDispatchContext context, int extraIndent)
+    {
+        var pieces = new List<string>();
+        var segment = new List<BaseExpr>();
+        var segmentIndex = 0;
+        foreach (var field in sequential.Fields)
+        {
+            if (field is Function or Fusion or FunctionWrapper or PrimFunctionWrapper)
+            {
+                throw new NotSupportedException($"PyNTT dispatch expects lowered PrimFunction bodies only, but found {field.GetType().Name}. TIR selection and RemoveFunctionWrapperPass must run before PyNTT codegen.");
+            }
+
+            if (field is BaseFunction)
+            {
+                continue;
+            }
+
+            if (field is IfThenElse)
+            {
+                pieces.Add(BuildDispatchSegmentLaunch(currentFunction, segmentIndex, context, extraIndent));
+                pieces.Add(BuildRuntimeObjectStatements(segment, context, extraIndent));
+                pieces.Add(BuildDispatchLaunchStatements(field, currentFunction, context, extraIndent));
+                segment.Clear();
+                segmentIndex++;
+                continue;
+            }
+
+            if (field is Call { Target: PrimFunction callee } call)
+            {
+                pieces.Add(BuildDispatchSegmentLaunch(currentFunction, segmentIndex, context, extraIndent));
+                pieces.Add(BuildRuntimeObjectStatements(segment, context, extraIndent));
+                pieces.Add(BuildFunctionCallDispatch(call, FindLinkableFunction(callee), context, extraIndent));
+                segment.Clear();
+                segmentIndex++;
+                continue;
+            }
+
+            if (field is Call { Target: BaseFunction calleeFunction })
+            {
+                throw new NotSupportedException($"PyNTT dispatch expects direct PrimFunction call targets, got {calleeFunction.GetType().Name} {calleeFunction.Name}.");
+            }
+
+            segment.Add(field);
+        }
+
+        pieces.Add(BuildDispatchSegmentLaunch(currentFunction, segmentIndex, context, extraIndent));
+        pieces.Add(BuildRuntimeObjectStatements(segment, context, extraIndent));
+        return string.Join(Environment.NewLine, pieces.Where(piece => !string.IsNullOrWhiteSpace(piece)));
+    }
+
+    private string BuildDispatchSegmentLaunch(PyNTTLinkableFunction? currentFunction, int segmentIndex, RuntimeDispatchContext context, int extraIndent)
+    {
+        if (currentFunction is null)
+        {
+            return string.Empty;
+        }
+
+        var parameterNames = GetParameterNames(currentFunction.SourceFunction);
+        var outputNames = GetOutputTensorSpecs(currentFunction.SourceFunction).Select(output => output.Name).ToArray();
+        var kernels = currentFunction.GeneratedKernelSource.Kernels
+            .Where(kernel => TryGetDispatchSegmentIndex(kernel, out var index) && index == segmentIndex)
+            .ToArray();
+        return string.Join(
+            Environment.NewLine,
+            kernels.Select(kernel => IndentPythonBlock(BuildModelKernelLaunchPython(currentFunction.SourceFunction.Name, kernel, parameterNames, outputNames, context, usePreparedWorkspace: true), extraIndent)));
+    }
+
+    private string BuildFunctionCallDispatch(Call call, PyNTTLinkableFunction callee, RuntimeDispatchContext callerContext, int extraIndent)
+    {
+        var calleeContext = CreateCalleeDispatchContext(call, callee, callerContext);
+        if (RequiresDispatch(callee))
+        {
+            return BuildFunctionDispatch(callee, calleeContext, extraIndent);
+        }
+
+        var workspaceSetup = BuildPreparedWorkspaceSetup(callee, calleeContext, extraIndent);
+        var kernels = callee.GeneratedKernelSource.Kernels;
+        if (kernels.Count == 0)
+        {
+            var dispatch = BuildDispatchLaunchStatements(callee.SourceFunction, callee, calleeContext, extraIndent);
+            return string.Join(Environment.NewLine, new[] { workspaceSetup, dispatch }.Where(piece => !string.IsNullOrWhiteSpace(piece)));
+        }
+
+        var parameterNames = GetParameterNames(callee.SourceFunction);
+        var outputNames = GetOutputTensorSpecs(callee.SourceFunction).Select(output => output.Name).ToArray();
+        var launches = string.Join(
+            Environment.NewLine,
+            kernels.Select(kernel => IndentPythonBlock(BuildModelKernelLaunchPython(callee.SourceFunction.Name, kernel, parameterNames, outputNames, calleeContext, usePreparedWorkspace: HasPreparedKernelWorkspace(calleeContext)), extraIndent)));
+        return string.Join(Environment.NewLine, new[] { workspaceSetup, launches }.Where(piece => !string.IsNullOrWhiteSpace(piece)));
+    }
+
+    private static bool TryGetDispatchSegmentIndex(GeneratedKernelMetadata kernel, out int index)
+    {
+        if (kernel.Attrs.TryGetValue("dispatch_segment_index", out var value))
+        {
+            index = value switch
+            {
+                int intValue => intValue,
+                long longValue => checked((int)longValue),
+                JsonElement jsonElement when jsonElement.ValueKind == JsonValueKind.Number => jsonElement.GetInt32(),
+                _ => throw new NotSupportedException($"PyNTT dispatch_segment_index must be an integer, got {value}."),
+            };
+            return true;
+        }
+
+        index = -1;
+        return false;
+    }
+
+    private string BuildDispatchIfThenElse(IfThenElse expr, PyNTTLinkableFunction? currentFunction, RuntimeDispatchContext context, int extraIndent)
     {
         var indent = new string(' ', 8 + extraIndent);
         var condition = BuildRuntimePythonScalarExpression(expr.Condition);
-        var thenBody = BuildDispatchLaunchStatements(expr.Then, extraIndent + 4);
-        var elseBody = BuildDispatchLaunchStatements(expr.Else, extraIndent + 4);
+        var thenBody = BuildDispatchLaunchStatements(expr.Then, currentFunction, context, extraIndent + 4);
+        var elseBody = BuildDispatchLaunchStatements(expr.Else, currentFunction, context, extraIndent + 4);
 
         if (string.IsNullOrWhiteSpace(thenBody))
         {
@@ -547,9 +1041,499 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
         return $"{indent}if {condition}:{Environment.NewLine}{thenBody}{Environment.NewLine}{indent}else:{Environment.NewLine}{elseBody}";
     }
 
-    private PyNTTLinkableFunction FindLinkableFunction(BaseFunction sourceFunction)
+    private static bool HasPreparedKernelWorkspace(RuntimeDispatchContext context)
+        => !string.IsNullOrWhiteSpace(context.Data)
+            && !string.IsNullOrWhiteSpace(context.DataPoolStrideBytes)
+            && !string.IsNullOrWhiteSpace(context.RData)
+            && !string.IsNullOrWhiteSpace(context.ChipLocalRData)
+            && !string.IsNullOrWhiteSpace(context.BlockLocalRData)
+            && !string.IsNullOrWhiteSpace(context.BlockLocalData)
+            && !string.IsNullOrWhiteSpace(context.BlockLocalDataPoolStrideBytes);
+
+    private RuntimeDispatchContext CreateCalleeDispatchContext(Call call, PyNTTLinkableFunction calleeFunction, RuntimeDispatchContext callerContext)
     {
-        return _functions.FirstOrDefault(function => ReferenceEquals(function.SourceFunction, sourceFunction) || function.SourceFunction.Name == sourceFunction.Name)
+        var callee = calleeFunction.SourceFunction;
+        var inputParameters = GetInputParameters(callee);
+        var outputTypes = GetOutputTypes(callee);
+        var layout = ResolveFunctionCallArgumentLayout(call, callee, inputParameters, outputTypes);
+        var workspaceParameters = inputParameters.Skip(layout.InputArguments.Length).ToArray();
+
+        if (workspaceParameters.Length != layout.WorkspaceArguments.Length
+            || workspaceParameters.Any(parameter => !IsRuntimeWorkspaceParameter(parameter)))
+        {
+            throw new NotSupportedException($"PyNTT dispatch call to {callee.Name} expects caller-provided trailing runtime workspace inputs.");
+        }
+
+        if (layout.OutputArguments.Length != outputTypes.Length)
+        {
+            throw new NotSupportedException($"PyNTT dispatch call to {callee.Name} expects {outputTypes.Length} outputs, got {layout.OutputArguments.Length}.");
+        }
+
+        var parameters = new Dictionary<string, RuntimeBinding>(StringComparer.Ordinal);
+        for (var i = 0; i < layout.InputArguments.Length; i++)
+        {
+            parameters[inputParameters[i].Name] = ResolveCallArgumentBinding(layout.InputArguments[i], callerContext, $"call {callee.Name} input {inputParameters[i].Name}");
+        }
+
+        var outputs = CreateRuntimeOutputBindings(
+            callee,
+            index => ResolveCallOutputBinding(layout.OutputArguments[index], callerContext, $"call {callee.Name} output {index}"));
+        var calleeContext = callerContext.CreateCallee(callee.Name, parameters, outputs);
+        for (var i = 0; i < workspaceParameters.Length; i++)
+        {
+            var parameter = workspaceParameters[i];
+            var binding = ResolveCallArgumentBinding(layout.WorkspaceArguments[i], callerContext, $"call {callee.Name} workspace {parameter.Name}");
+            parameters[parameter.Name] = binding;
+            switch (parameter.Name)
+            {
+                case "data":
+                    calleeContext.Data = binding.Expression;
+                    calleeContext.DataPoolStrideBytes = RequireWorkspaceName(binding.WorkspacePoolStrideBytes, callee.Name, "data_pool_stride_bytes");
+                    break;
+                case "block_local_data":
+                    calleeContext.BlockLocalData = binding.Expression;
+                    calleeContext.BlockLocalDataPoolStrideBytes = RequireWorkspaceName(binding.WorkspacePoolStrideBytes, callee.Name, "block_local_data_pool_stride_bytes");
+                    break;
+                default:
+                    throw new NotSupportedException($"PyNTT dispatch call to {callee.Name} does not support runtime workspace parameter {parameter.Name}.");
+            }
+        }
+
+        return calleeContext;
+    }
+
+    private static IRType[] GetOutputTypes(BaseFunction function)
+        => PyNTTFunctionOutputs.GetOutputTypes(function);
+
+    private static FunctionCallArgumentLayout ResolveFunctionCallArgumentLayout(
+        Call call,
+        BaseFunction callee,
+        IReadOnlyList<IVar> inputParameters,
+        IReadOnlyList<IRType> outputTypes)
+    {
+        var arguments = call.Arguments.ToArray();
+        var trailingWorkspaceCount = CountTrailingRuntimeWorkspaceParameters(inputParameters);
+        var regularInputCount = inputParameters.Count - trailingWorkspaceCount;
+        if (trailingWorkspaceCount == 0)
+        {
+            var expectedCount = regularInputCount + outputTypes.Count;
+            if (arguments.Length == expectedCount)
+            {
+                var outputArguments = arguments
+                    .Skip(regularInputCount)
+                    .Take(outputTypes.Count)
+                    .ToArray();
+                if (AreCompatibleOutputArguments(outputArguments, outputTypes))
+                {
+                    return new FunctionCallArgumentLayout(arguments.Take(regularInputCount).ToArray(), outputArguments, Array.Empty<BaseExpr>());
+                }
+            }
+
+            throw new NotSupportedException(
+                $"PyNTT dispatch call to {callee.Name} expects flattened outputs with regular-inputs + outputs, got {arguments.Length} arguments.");
+        }
+
+        var expectedWithWorkspaceCount = inputParameters.Count + outputTypes.Count;
+        if (arguments.Length == expectedWithWorkspaceCount)
+        {
+            var outputArguments = arguments
+                .Skip(regularInputCount)
+                .Take(outputTypes.Count)
+                .ToArray();
+            var workspaceArguments = arguments
+                .Skip(regularInputCount + outputTypes.Count)
+                .ToArray();
+            if (AreCompatibleOutputArguments(outputArguments, outputTypes)
+                && AreCompatibleRuntimeWorkspaceArguments(
+                    inputParameters.Skip(regularInputCount).ToArray(),
+                    workspaceArguments))
+            {
+                return new FunctionCallArgumentLayout(arguments.Take(regularInputCount).ToArray(), outputArguments, workspaceArguments);
+            }
+        }
+
+        throw new NotSupportedException(
+            $"PyNTT dispatch call to {callee.Name} expects flattened outputs with " +
+            $"regular-inputs + outputs + caller-provided runtime-workspace, got {arguments.Length} arguments.");
+    }
+
+    private static int CountTrailingRuntimeWorkspaceParameters(IReadOnlyList<IVar> inputParameters)
+    {
+        var count = 0;
+        for (var i = inputParameters.Count - 1; i >= 0 && IsRuntimeWorkspaceParameter(inputParameters[i]); i--)
+        {
+            count++;
+        }
+
+        return count;
+    }
+
+    private static bool IsRuntimeWorkspaceParameter(IVar parameter)
+        => parameter is BufferVar { Role: BufferVarRole.Workspace };
+
+    private static bool AreCompatibleRuntimeWorkspaceArguments(IReadOnlyList<IVar> parameters, IReadOnlyList<BaseExpr> arguments)
+    {
+        if (parameters.Count != arguments.Count)
+        {
+            return false;
+        }
+
+        for (var i = 0; i < parameters.Count; i++)
+        {
+            if (!IsCompatibleRuntimeWorkspaceArgument(parameters[i], arguments[i]))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static bool IsCompatibleRuntimeWorkspaceArgument(IVar parameter, BaseExpr argument)
+    {
+        if (parameter is not BufferVar { Role: BufferVarRole.Workspace } workspace
+            || UnwrapInputBoxing(argument) is not TIR.Buffer buffer
+            || buffer.ElemType != DataTypes.UInt8)
+        {
+            return false;
+        }
+
+        return buffer.MemSpan.Buffer.Location == workspace.Location;
+    }
+
+    private static bool AreCompatibleOutputArguments(IReadOnlyList<BaseExpr> arguments, IReadOnlyList<IRType> outputTypes)
+    {
+        if (arguments.Count != outputTypes.Count)
+        {
+            return false;
+        }
+
+        for (var i = 0; i < arguments.Count; i++)
+        {
+            if (!IsCompatibleOutputArgument(arguments[i], outputTypes[i]))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static bool IsCompatibleOutputArgument(BaseExpr argument, IRType outputType)
+    {
+        if (!TryGetTensorType(outputType, out var expectedTensorType))
+        {
+            return false;
+        }
+
+        argument = UnwrapInputBoxing(argument);
+        var actualTensorType = argument switch
+        {
+            TIR.Buffer buffer => new TensorType(buffer.ElemType, new RankedShape(buffer.Dimensions.ToArray())),
+            Expr typed when TryGetTensorType(typed.CheckedType, out var tensorType) => tensorType,
+            _ => null,
+        };
+        return actualTensorType is not null
+            && actualTensorType.DType == expectedTensorType.DType
+            && actualTensorType.Shape.Rank == expectedTensorType.Shape.Rank;
+    }
+
+    private static bool TryGetTensorType(IRType type, out TensorType tensorType)
+    {
+        switch (type)
+        {
+            case TensorType tt:
+                tensorType = tt;
+                return true;
+            case DistributedType dt:
+                tensorType = dt.TensorType;
+                return true;
+            default:
+                tensorType = null!;
+                return false;
+        }
+    }
+
+    private RuntimeBinding ResolveCallArgumentBinding(BaseExpr expr, RuntimeDispatchContext context, string contextName)
+    {
+        expr = UnwrapInputBoxing(expr);
+        if (expr is TIR.Buffer buffer)
+        {
+            var tensorPoolStrideBytes = GetBufferRuntimePoolStrideBytes(buffer, context);
+            var workspacePoolStrideBytes = GetWorkspacePoolStrideBytes(buffer.MemSpan.Buffer.Location, context);
+            return IsObjectDataType(buffer.ElemType)
+                ? ResolveObjectBinding(buffer, context, contextName)
+                : new RuntimeBinding(
+                    BuildTensorBufferViewExpression(buffer, context, contextName),
+                    PoolStrideBytes: tensorPoolStrideBytes,
+                    PoolStrideElements: BuildPoolStrideElementsExpression(tensorPoolStrideBytes, buffer.ElemType),
+                    WorkspacePoolStrideBytes: workspacePoolStrideBytes);
+        }
+
+        if (expr is IVar parameter)
+        {
+            if (context.Parameters.TryGetValue(parameter.Name, out var parameterBinding))
+            {
+                return parameterBinding;
+            }
+        }
+
+        throw new NotSupportedException($"PyNTT dispatch cannot bind {contextName} from {expr.GetType().Name}.");
+    }
+
+    private static string? GetWorkspacePoolStrideBytes(MemoryLocation location, RuntimeDispatchContext context)
+        => location switch
+        {
+            MemoryLocation.Data => context.DataPoolStrideBytes,
+            MemoryLocation.BlockLocalData => context.BlockLocalDataPoolStrideBytes,
+            _ => null,
+        };
+
+    private static string? GetBufferRuntimePoolStrideBytes(TIR.Buffer buffer, RuntimeDispatchContext context)
+    {
+        if (buffer.MemSpan.Buffer.Location == MemoryLocation.Data && buffer.DistributedType is null)
+        {
+            return "0";
+        }
+
+        return GetWorkspacePoolStrideBytes(buffer.MemSpan.Buffer.Location, context);
+    }
+
+    private static string? BuildPoolStrideElementsExpression(string? poolStrideBytes, DataType elementType)
+    {
+        if (string.IsNullOrWhiteSpace(poolStrideBytes))
+        {
+            return null;
+        }
+
+        var scalarElementSizeBytes = GetScalarElementSizeBytes(elementType);
+        if (poolStrideBytes == "0")
+        {
+            return "0";
+        }
+
+        if (long.TryParse(poolStrideBytes, NumberStyles.Integer, CultureInfo.InvariantCulture, out var fixedStrideBytes))
+        {
+            if (fixedStrideBytes % scalarElementSizeBytes != 0)
+            {
+                throw new NotSupportedException($"PyNTT workspace pool stride {fixedStrideBytes} is not aligned to scalar element size {scalarElementSizeBytes}.");
+            }
+
+            return (fixedStrideBytes / scalarElementSizeBytes).ToString(CultureInfo.InvariantCulture);
+        }
+
+        return scalarElementSizeBytes == 1
+            ? poolStrideBytes
+            : $"(({poolStrideBytes}) // {scalarElementSizeBytes.ToString(CultureInfo.InvariantCulture)})";
+    }
+
+    private static int GetScalarElementSizeBytes(DataType dataType)
+    {
+        return dataType is VectorType vectorType
+            ? vectorType.ElemType.SizeInBytes
+            : dataType.SizeInBytes;
+    }
+
+    private RuntimeBinding ResolveCallOutputBinding(BaseExpr expr, RuntimeDispatchContext context, string contextName)
+    {
+        expr = UnwrapInputBoxing(expr);
+        if (expr is TIR.Buffer buffer)
+        {
+            var tensorPoolStrideBytes = GetBufferRuntimePoolStrideBytes(buffer, context);
+            var workspacePoolStrideBytes = GetWorkspacePoolStrideBytes(buffer.MemSpan.Buffer.Location, context);
+            return IsObjectDataType(buffer.ElemType)
+                ? EnsureObjectBufferBinding(buffer, context)
+                : new RuntimeBinding(
+                    BuildTensorBufferViewExpression(buffer, context, contextName),
+                    PoolStrideBytes: tensorPoolStrideBytes,
+                    PoolStrideElements: BuildPoolStrideElementsExpression(tensorPoolStrideBytes, buffer.ElemType),
+                    WorkspacePoolStrideBytes: workspacePoolStrideBytes);
+        }
+
+        if (expr is IVar parameter && context.Outputs.TryGetValue(parameter.Name, out var parameterOutputBinding))
+        {
+            return parameterOutputBinding;
+        }
+
+        throw new NotSupportedException($"PyNTT dispatch cannot bind {contextName} from {expr.GetType().Name}.");
+    }
+
+    private string BuildRuntimeObjectStatements(IReadOnlyList<BaseExpr> fields, RuntimeDispatchContext context, int extraIndent)
+    {
+        var statements = new List<string>();
+        foreach (var field in fields)
+        {
+            CollectRuntimeObjectStatements(field, context, statements, extraIndent);
+        }
+
+        return string.Join(Environment.NewLine, statements);
+    }
+
+    private void CollectRuntimeObjectStatements(BaseExpr expr, RuntimeDispatchContext context, List<string> statements, int extraIndent)
+    {
+        if (expr is BaseFunction)
+        {
+            return;
+        }
+
+        if (expr is Call call)
+        {
+            var args = call.Arguments.ToArray();
+            if (call.Target is Nncase.TIR.NTT.TensorLoad && args.Length >= 2)
+            {
+                TryAppendObjectAssignment(UnwrapInputBoxing(args[0]), UnwrapInputBoxing(args[1]), context, statements, extraIndent, "TensorLoad");
+                return;
+            }
+
+            if (call.Target is Nncase.TIR.NTT.TensorStore && args.Length >= 2)
+            {
+                TryAppendObjectAssignment(UnwrapInputBoxing(args[1]), UnwrapInputBoxing(args[0]), context, statements, extraIndent, "TensorStore");
+                return;
+            }
+
+            if (call.Target is Nncase.TIR.Memcopy && args.Length >= 2)
+            {
+                TryAppendObjectAssignment(UnwrapInputBoxing(args[0]), UnwrapInputBoxing(args[1]), context, statements, extraIndent, "Memcopy");
+                return;
+            }
+        }
+
+        foreach (var operand in expr.Operands)
+        {
+            CollectRuntimeObjectStatements(operand, context, statements, extraIndent);
+        }
+    }
+
+    private void TryAppendObjectAssignment(BaseExpr destination, BaseExpr source, RuntimeDispatchContext context, List<string> statements, int extraIndent, string opName)
+    {
+        if (!IsObjectExpression(destination) && !IsObjectExpression(source))
+        {
+            return;
+        }
+
+        if (!IsObjectExpression(destination) || !IsObjectExpression(source))
+        {
+            throw new NotSupportedException($"PyNTT dispatch {opName} object assignment expects both operands to be object tensors.");
+        }
+
+        var destinationBinding = ResolveAssignableObjectBinding(destination, context, $"PyNTT dispatch {opName} destination");
+        var sourceBinding = ResolveObjectExpressionBinding(source, context, $"PyNTT dispatch {opName} source");
+        statements.Add($"{new string(' ', 8 + extraIndent)}{destinationBinding.AssignmentTarget} = {sourceBinding.Expression}");
+    }
+
+    private RuntimeBinding ResolveAssignableObjectBinding(BaseExpr expr, RuntimeDispatchContext context, string contextName)
+    {
+        expr = UnwrapInputBoxing(expr);
+        if (expr is TIR.Buffer buffer)
+        {
+            return EnsureObjectBufferBinding(buffer, context);
+        }
+
+        if (expr is IVar parameter && context.Outputs.TryGetValue(parameter.Name, out var outputBinding) && !string.IsNullOrWhiteSpace(outputBinding.AssignmentTarget))
+        {
+            return outputBinding;
+        }
+
+        throw new NotSupportedException($"{contextName} is not an assignable object binding.");
+    }
+
+    private RuntimeBinding ResolveObjectExpressionBinding(BaseExpr expr, RuntimeDispatchContext context, string contextName)
+    {
+        expr = UnwrapInputBoxing(expr);
+        if (expr is TIR.Buffer buffer)
+        {
+            return ResolveObjectBinding(buffer, context, contextName);
+        }
+
+        if (expr is IVar parameter && context.Parameters.TryGetValue(parameter.Name, out var parameterBinding))
+        {
+            return parameterBinding;
+        }
+
+        throw new NotSupportedException($"{contextName} is not a known object binding.");
+    }
+
+    private static RuntimeBinding EnsureObjectBufferBinding(TIR.Buffer buffer, RuntimeDispatchContext context)
+    {
+        if (!IsObjectDataType(buffer.ElemType))
+        {
+            throw new NotSupportedException($"PyNTT expected object buffer, got {buffer.ElemType}.");
+        }
+
+        var key = CreateObjectBufferKey(buffer, context);
+        if (!context.ObjectBuffers.TryGetValue(key, out var binding))
+        {
+            var variableName = context.State.NewTemp("object");
+            binding = new RuntimeBinding(variableName, variableName);
+            context.ObjectBuffers[key] = binding;
+        }
+
+        return binding;
+    }
+
+    private static RuntimeBinding ResolveObjectBinding(TIR.Buffer buffer, RuntimeDispatchContext context, string contextName)
+    {
+        if (!IsObjectDataType(buffer.ElemType))
+        {
+            throw new NotSupportedException($"{contextName} expected object buffer, got {buffer.ElemType}.");
+        }
+
+        var key = CreateObjectBufferKey(buffer, context);
+        if (context.ObjectBuffers.TryGetValue(key, out var binding))
+        {
+            return binding;
+        }
+
+        throw new NotSupportedException($"{contextName} references object buffer {buffer.Name} in scope {context.Scope} before it is assigned.");
+    }
+
+    private static ObjectBufferKey CreateObjectBufferKey(TIR.Buffer buffer, RuntimeDispatchContext context)
+    {
+        if (string.IsNullOrWhiteSpace(buffer.Name))
+        {
+            throw new NotSupportedException($"PyNTT object buffer in scope {context.Scope} must have a stable name.");
+        }
+
+        return new ObjectBufferKey(
+            context.Scope,
+            buffer.Name,
+            buffer.ElemType.ToString(),
+            buffer.Rank);
+    }
+
+    private string BuildTensorBufferViewExpression(TIR.Buffer buffer, RuntimeDispatchContext context, string contextName)
+    {
+        var baseName = buffer.MemSpan.Buffer.Location switch
+        {
+            MemoryLocation.Data => RequireWorkspaceName(context.Data, contextName, "data"),
+            MemoryLocation.BlockLocalData => RequireWorkspaceName(context.BlockLocalData, contextName, "block_local_data"),
+            MemoryLocation.Rdata => RequireWorkspaceName(context.RData, contextName, "rdata"),
+            MemoryLocation.ChipLocalRdata => RequireWorkspaceName(context.ChipLocalRData, contextName, "chip_local_rdata"),
+            MemoryLocation.BlockLocalRdata => RequireWorkspaceName(context.BlockLocalRData, contextName, "block_local_rdata"),
+            var location => throw new NotSupportedException($"{contextName} cannot pass buffer {buffer.Name} from memory location {location} as a PyNTT runtime tensor view."),
+        };
+        var offsetBytes = GetBufferOffsetBytes(buffer);
+        var sizeBytes = GetFixedDimension(buffer.MemSpan.Size, $"{contextName} buffer {buffer.Name} size");
+        var dtype = GetPyNTTScalarDTypeName(buffer.ElemType);
+        return $"view_typed_buffer({baseName}, {offsetBytes.ToString(CultureInfo.InvariantCulture)}, {sizeBytes.ToString(CultureInfo.InvariantCulture)}, {PythonString(dtype)})";
+    }
+
+    private static bool IsObjectExpression(BaseExpr expr)
+    {
+        expr = UnwrapInputBoxing(expr);
+        return expr switch
+        {
+            TIR.Buffer buffer => IsObjectDataType(buffer.ElemType),
+            Expr typedExpr when typedExpr.CheckedType is TensorType tensorType => IsObjectDataType(tensorType.DType),
+            Expr typedExpr when typedExpr.CheckedType is DistributedType distributedType => IsObjectDataType(distributedType.TensorType.DType),
+            _ => false,
+        };
+    }
+
+    private PyNTTLinkableFunction FindLinkableFunction(PrimFunction sourceFunction)
+    {
+        return _functions.FirstOrDefault(function =>
+                ReferenceEquals(function.SourceFunction, sourceFunction))
             ?? throw new NotSupportedException($"Generated PyNTT dispatch references unknown function {sourceFunction.Name}.");
     }
 
@@ -667,17 +1651,37 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
         };
     }
 
-    private string BuildModelKernelLaunchPython(string functionName, GeneratedKernelMetadata kernel, string[] parameterNames, string[] outputNames)
+    private string BuildModelKernelLaunchPython(string functionName, GeneratedKernelMetadata kernel, string[] parameterNames, string[] outputNames, RuntimeDispatchContext context, bool usePreparedWorkspace)
     {
-        var outputAliases = BuildOutputAliasStatements(kernel);
+        var kvCacheFieldInputs = GetKVCacheFieldInputs(kernel).ToDictionary(input => input.Name, StringComparer.Ordinal);
+        var inputBindings = kernel.Inputs.Select(name => BuildKernelInputBinding(name, parameterNames, context, kvCacheFieldInputs)).ToArray();
+        var inputArgs = inputBindings.Select(binding => binding.Expression).ToArray();
+        var outputAliasMap = GetKernelOutputAliases(kernel);
+        var outputBindings = kernel.Outputs.Select((name, index) =>
+        {
+            if (!outputAliasMap.TryGetValue(index, out var inputIndex))
+            {
+                return ResolveOutputBinding(context, name);
+            }
+
+            if (inputIndex < 0 || inputIndex >= inputBindings.Length)
+            {
+                throw new NotSupportedException($"Generated PyNTT kernel {kernel.Name} aliases input index {inputIndex}, but it only has {inputBindings.Length} inputs.");
+            }
+
+            return inputBindings[inputIndex];
+        }).ToArray();
+        var outputArgs = outputBindings.Select(binding => binding.Expression).ToArray();
+        var tensorStrideArgs = inputBindings
+            .Concat(outputBindings)
+            .Select(binding => string.IsNullOrWhiteSpace(binding.PoolStrideElements) ? "0" : binding.PoolStrideElements!)
+            .ToArray();
+        var outputAliases = BuildRuntimeOutputAliasStatements(kernel, context, parameterNames, inputArgs);
         if (kernel.Attrs.TryGetValue("pure_alias", out var pureAliasValue) && pureAliasValue is bool pureAlias && pureAlias)
         {
             return outputAliases;
         }
 
-        var outputArgs = kernel.Outputs.Select(name => $"outputs[{FindIndex(outputNames, name, "output")}]");
-        var kvCacheFieldInputs = GetKVCacheFieldInputs(kernel).ToDictionary(input => input.Name, StringComparer.Ordinal);
-        var inputArgs = kernel.Inputs.Select(name => BuildKernelInputExpression(name, parameterNames, kvCacheFieldInputs));
         var runtimeShapeArgNames = GetRuntimeShapeArgs(kernel);
         var numel = RuntimePythonExpression(kernel.Launch.Meta["numel_expr"], runtimeShapeArgNames);
         var blockSize = kernel.Launch.Tuning.Parameters["block_size"];
@@ -691,29 +1695,50 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
             : "((numel + block_size - 1) // block_size,)";
         var workspaceSetup = string.Empty;
         var workspaceArgs = Array.Empty<string>();
+        var workspaceStrideArgs = Array.Empty<string>();
         if (isTir)
         {
-            var dataBytesPerProgram = PythonValue(kernel.Launch.Meta["data_pool_bytes"]);
-            var collectiveDataBytes = kernel.Launch.Meta.TryGetValue("collective_data_pool_bytes", out var collectiveDataValue)
-                ? PythonValue(collectiveDataValue)
-                : "0";
-            var blockLocalDataBytesPerScope = PythonValue(kernel.Launch.Meta["block_local_data_pool_bytes"]);
-            var blockLocalDataScopeCount = PythonValue(kernel.Launch.Meta["block_local_data_scope_count"]);
-            var dataDType = PythonString((string)kernel.Launch.Meta["data_dtype"]);
-            workspaceSetup = $"""
-                    data = self.allocate_workspace(inputs, {PythonString(kernel.Name + ".data")}, {dataBytesPerProgram} * grid[0] + {collectiveDataBytes}, {dataDType})
-                    block_local_data = self.allocate_workspace(inputs, {PythonString(kernel.Name + ".block_local_data")}, {blockLocalDataBytesPerScope} * {blockLocalDataScopeCount}, {dataDType})
-                    rdata, chip_local_rdata, block_local_rdata = self.materialize_rdata_bundle(inputs, {PythonString(functionName)})
-            """;
-            workspaceArgs = new[] { "data", "rdata", "chip_local_rdata", "block_local_rdata", "block_local_data" };
+            if (usePreparedWorkspace)
+            {
+                workspaceArgs = new[]
+                {
+                    RequireWorkspaceName(context.Data, functionName, "data"),
+                    RequireWorkspaceName(context.RData, functionName, "rdata"),
+                    RequireWorkspaceName(context.ChipLocalRData, functionName, "chip_local_rdata"),
+                    RequireWorkspaceName(context.BlockLocalRData, functionName, "block_local_rdata"),
+                    RequireWorkspaceName(context.BlockLocalData, functionName, "block_local_data"),
+                };
+                workspaceStrideArgs = new[]
+                {
+                    RequireWorkspaceName(context.DataPoolStrideBytes, functionName, "data_pool_stride_bytes"),
+                    RequireWorkspaceName(context.BlockLocalDataPoolStrideBytes, functionName, "block_local_data_pool_stride_bytes"),
+                };
+            }
+            else
+            {
+                var dataBytesPerProgram = PythonValue(kernel.Launch.Meta["data_pool_bytes"]);
+                var collectiveDataBytes = kernel.Launch.Meta.TryGetValue("collective_data_pool_bytes", out var collectiveDataValue)
+                    ? PythonValue(collectiveDataValue)
+                    : "0";
+                var blockLocalDataBytesPerScope = PythonValue(kernel.Launch.Meta["block_local_data_pool_bytes"]);
+                var blockLocalDataScopeCount = PythonValue(kernel.Launch.Meta["block_local_data_scope_count"]);
+                var dataDType = PythonString((string)kernel.Launch.Meta["data_dtype"]);
+                workspaceSetup = $"""
+                        data = self.allocate_workspace({context.RootInputsExpression}, {PythonString(kernel.Name + ".data")}, {dataBytesPerProgram} * grid[0] + {collectiveDataBytes}, {dataDType})
+                        block_local_data = self.allocate_workspace({context.RootInputsExpression}, {PythonString(kernel.Name + ".block_local_data")}, {blockLocalDataBytesPerScope} * {blockLocalDataScopeCount}, {dataDType})
+                        rdata, chip_local_rdata, block_local_rdata = self.materialize_rdata_bundle({context.RootInputsExpression}, {PythonString(functionName)})
+                """;
+                workspaceArgs = new[] { "data", "rdata", "chip_local_rdata", "block_local_rdata", "block_local_data" };
+                workspaceStrideArgs = new[] { dataBytesPerProgram, blockLocalDataBytesPerScope };
+            }
         }
 
         var runtimeShapeArgs = runtimeShapeArgNames.Select(arg => $"shape_env[{PythonString(arg)}]").ToArray();
         var requiresGridBarrier = kernel.Attrs.ContainsKey("requires_grid_barrier");
         var gridBarrierArgs = requiresGridBarrier ? new[] { "PYNTT_GRID_MESH" } : Array.Empty<string>();
-        var tensorArgs = string.Join(", ", inputArgs.Concat(outputArgs).Concat(workspaceArgs).Concat(runtimeShapeArgs).Concat(gridBarrierArgs));
+        var tensorArgs = string.Join(", ", inputArgs.Concat(outputArgs).Concat(tensorStrideArgs).Concat(workspaceArgs).Concat(workspaceStrideArgs).Concat(runtimeShapeArgs).Concat(gridBarrierArgs));
         var tritonRuntimeSetup = requiresGridBarrier
-            ? $"{Environment.NewLine}        ensure_triton_allocator(outputs[0].device)"
+            ? $"{Environment.NewLine}        ensure_triton_allocator({context.DeviceExpression})"
             : string.Empty;
         var launchKwargs = new List<string>();
         if (kernel.Launch.NumWarps.HasValue)
@@ -743,39 +1768,106 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
             """;
     }
 
-    private string BuildKernelInputExpression(string name, string[] parameterNames, IReadOnlyDictionary<string, PyNTTKVCacheFieldInputMetadata> kvCacheFieldInputs)
+    private static string RequireWorkspaceName(string? name, string functionName, string workspaceName)
+        => string.IsNullOrWhiteSpace(name)
+            ? throw new NotSupportedException($"PyNTT dispatch for {functionName} requires prepared {workspaceName} workspace.")
+            : name;
+
+    private RuntimeBinding BuildKernelInputBinding(string name, string[] parameterNames, RuntimeDispatchContext context, IReadOnlyDictionary<string, PyNTTKVCacheFieldInputMetadata> kvCacheFieldInputs)
     {
         if (!kvCacheFieldInputs.TryGetValue(name, out var kvCacheField))
         {
-            return $"inputs[{FindIndex(parameterNames, name, "input")}]";
+            return ResolveParameterBinding(context, name, parameterNames);
         }
 
-        var sourceExpression = $"inputs[{FindIndex(parameterNames, kvCacheField.SourceName, "input")}]";
-        return kvCacheField.Field switch
+        var sourceExpression = ResolveParameterBinding(context, kvCacheField.SourceName, parameterNames).Expression;
+        var expression = kvCacheField.Field switch
         {
-            "metadata" => $"materialize_kv_cache_metadata({sourceExpression}, outputs[0].device)",
+            "metadata" => $"materialize_kv_cache_metadata({sourceExpression}, {context.DeviceExpression})",
             "slot_mapping" or "block_tables" or "context_lens" or "seq_lens" =>
-                $"materialize_kv_cache_tensor_field({sourceExpression}, {PythonString(kvCacheField.Field)}, outputs[0].device)",
+                $"materialize_kv_cache_tensor_field({sourceExpression}, {PythonString(kvCacheField.Field)}, {context.DeviceExpression})",
             "kv_caches" when kvCacheField.Storage is { } storage =>
-                $"materialize_kv_cache_storage({sourceExpression}, outputs[0].device, dtype={PythonString(storage.DType)}, topology_shape={PythonTuple(storage.TopologyShape.Select(value => value.ToString(CultureInfo.InvariantCulture)))}, key_tail_shape={PythonTuple(storage.KeyTailShape.Select(value => value.ToString(CultureInfo.InvariantCulture)))}, value_tail_shape={PythonTuple(storage.ValueTailShape.Select(value => value.ToString(CultureInfo.InvariantCulture)))}, key_section_elements={storage.KeySectionElements.ToString(CultureInfo.InvariantCulture)}, value_section_elements={storage.ValueSectionElements.ToString(CultureInfo.InvariantCulture)}, block_elements={storage.BlockElements.ToString(CultureInfo.InvariantCulture)}, block_size={storage.BlockSize.ToString(CultureInfo.InvariantCulture)})",
+                $"materialize_kv_cache_storage({sourceExpression}, {context.DeviceExpression}, dtype={PythonString(storage.DType)}, topology_shape={PythonTuple(storage.TopologyShape.Select(value => value.ToString(CultureInfo.InvariantCulture)))}, key_tail_shape={PythonTuple(storage.KeyTailShape.Select(value => value.ToString(CultureInfo.InvariantCulture)))}, value_tail_shape={PythonTuple(storage.ValueTailShape.Select(value => value.ToString(CultureInfo.InvariantCulture)))}, key_section_elements={storage.KeySectionElements.ToString(CultureInfo.InvariantCulture)}, value_section_elements={storage.ValueSectionElements.ToString(CultureInfo.InvariantCulture)}, block_elements={storage.BlockElements.ToString(CultureInfo.InvariantCulture)}, block_size={storage.BlockSize.ToString(CultureInfo.InvariantCulture)})",
             "kv_caches_blocks" when kvCacheField.Storage is { } storage =>
                 $"materialize_kv_cache_blocks_per_shard({sourceExpression}, topology_shape={PythonTuple(storage.TopologyShape.Select(value => value.ToString(CultureInfo.InvariantCulture)))}, block_size={storage.BlockSize.ToString(CultureInfo.InvariantCulture)})",
             "kv_caches" => throw new NotSupportedException($"Generated PyNTT kernel input {name} is missing KV-cache storage metadata."),
             "kv_caches_blocks" => throw new NotSupportedException($"Generated PyNTT kernel input {name} is missing KV-cache storage metadata."),
             _ => throw new NotSupportedException($"Generated PyNTT kernel input {name} references unsupported KV-cache field {kvCacheField.Field}."),
         };
+        return new RuntimeBinding(expression);
     }
 
-    private string BuildOutputAliasStatements(GeneratedKernelMetadata kernel)
+    private RuntimeBinding ResolveParameterBinding(RuntimeDispatchContext context, string name, IReadOnlyList<string> parameterNames)
     {
-        if (!kernel.Attrs.TryGetValue("output_aliases", out var value) || value is not IReadOnlyDictionary<int, int> aliases || aliases.Count == 0)
+        if (context.Parameters.TryGetValue(name, out var binding))
+        {
+            return binding;
+        }
+
+        var index = FindIndex(parameterNames, name, "input");
+        return new RuntimeBinding($"inputs[{index.ToString(CultureInfo.InvariantCulture)}]");
+    }
+
+    private static RuntimeBinding ResolveOutputBinding(RuntimeDispatchContext context, string name)
+    {
+        if (context.Outputs.TryGetValue(name, out var binding))
+        {
+            return binding;
+        }
+
+        throw new NotSupportedException($"Generated PyNTT kernel references unknown output: {name}.");
+    }
+
+    private static IReadOnlyDictionary<int, int> GetKernelOutputAliases(GeneratedKernelMetadata kernel)
+    {
+        if (kernel.Attrs.TryGetValue("output_aliases", out var value) && value is IReadOnlyDictionary<int, int> aliases)
+        {
+            return aliases;
+        }
+
+        return new Dictionary<int, int>();
+    }
+
+    private string BuildRuntimeOutputAliasStatements(GeneratedKernelMetadata kernel, RuntimeDispatchContext context, IReadOnlyList<string> parameterNames, IReadOnlyList<string> inputArgs)
+    {
+        if (!kernel.Attrs.TryGetValue("runtime_output_aliases", out var value))
         {
             return string.Empty;
         }
 
-        return string.Join(
-            Environment.NewLine,
-            aliases.OrderBy(pair => pair.Key).Select(pair => $"        outputs[{pair.Key}] = inputs[{pair.Value}]"));
+        if (value is IReadOnlyDictionary<string, string> aliasesByName)
+        {
+            return string.Join(
+                Environment.NewLine,
+                aliasesByName.OrderBy(pair => pair.Key, StringComparer.Ordinal).Select(pair =>
+                {
+                    var output = ResolveOutputBinding(context, pair.Key);
+                    var source = ResolveParameterBinding(context, pair.Value, parameterNames);
+                    return string.IsNullOrWhiteSpace(output.AssignmentTarget)
+                        ? $"        {output.Expression}.copy_({source.Expression})"
+                        : $"        {output.AssignmentTarget} = {source.Expression}";
+                }));
+        }
+
+        if (value is IReadOnlyDictionary<string, int> aliasesByIndex)
+        {
+            return string.Join(
+                Environment.NewLine,
+                aliasesByIndex.OrderBy(pair => pair.Key, StringComparer.Ordinal).Select(pair =>
+                {
+                    if (pair.Value < 0 || pair.Value >= inputArgs.Count)
+                    {
+                        throw new NotSupportedException($"Generated PyNTT kernel {kernel.Name} aliases input index {pair.Value}, but it only has {inputArgs.Count} inputs.");
+                    }
+
+                    var output = ResolveOutputBinding(context, pair.Key);
+                    return string.IsNullOrWhiteSpace(output.AssignmentTarget)
+                        ? $"        {output.Expression}.copy_({inputArgs[pair.Value]})"
+                        : $"        {output.AssignmentTarget} = {inputArgs[pair.Value]}";
+                }));
+        }
+
+        throw new NotSupportedException($"Generated PyNTT kernel {kernel.Name} has unsupported runtime_output_aliases metadata type {value.GetType()}.");
     }
 
     private int FindIndex(IReadOnlyList<string> names, string name, string role)

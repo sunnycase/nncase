@@ -133,6 +133,10 @@ def allocate_outputs(
     shape_env = shape_env or resolve_shape_env(function, inputs)
     outputs = []
     for spec in function.outputs:
+        if is_object_spec(spec):
+            outputs.append(None)
+            continue
+
         outputs.append(
             torch.empty(
                 _resolve_shape(spec.shape, shape_env),
@@ -141,6 +145,42 @@ def allocate_outputs(
             )
         )
     return tuple(outputs)
+
+
+def view_typed_buffer(storage: Any, offset_bytes: int, size_bytes: int, dtype: str):
+    """Return a typed flat view into a byte-addressed PyNTT workspace tensor."""
+    torch = _import_torch()
+    if not isinstance(storage, torch.Tensor):
+        raise PyNTTArgumentError(
+            f"PyNTT typed buffer view expects torch.Tensor storage, got {type(storage).__name__}."
+        )
+    if storage.dtype != torch.uint8:
+        raise PyNTTArgumentError(
+            f"PyNTT typed buffer view expects uint8 storage, got {storage.dtype}."
+        )
+
+    offset_bytes = int(offset_bytes)
+    size_bytes = int(size_bytes)
+    if offset_bytes < 0 or size_bytes < 0:
+        raise PyNTTArgumentError(
+            f"PyNTT typed buffer view expects non-negative offset/size, got {offset_bytes}/{size_bytes}."
+        )
+    end = offset_bytes + size_bytes
+    if end > storage.numel():
+        raise PyNTTArgumentError(
+            f"PyNTT typed buffer view [{offset_bytes}, {end}) exceeds storage size {storage.numel()}."
+        )
+
+    torch_dtype = _torch_dtype(torch, dtype)
+    element_size = torch.empty((), dtype=torch_dtype, device=storage.device).element_size()
+    if offset_bytes % element_size != 0 or size_bytes % element_size != 0:
+        raise PyNTTArgumentError(
+            f"PyNTT typed buffer view offset/size {offset_bytes}/{size_bytes} are not aligned "
+            f"to dtype {dtype} element size {element_size}."
+        )
+
+    byte_view = storage.narrow(0, offset_bytes, size_bytes)
+    return byte_view.view(torch_dtype)
 
 
 def _validate_tensor(

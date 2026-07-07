@@ -395,6 +395,40 @@ internal sealed class ILPrintVisitor : ExprFunctor<string, string>
     }
 
     /// <inheritdoc/>
+    protected override string VisitPrimFunction(PrimFunction expr)
+    {
+        if (Flags.HasFlag(PrinterFlags.Inline))
+        {
+            return expr.Name;
+        }
+
+        using var subScope = NestedScope();
+        var name = $"%{expr.Name}";
+
+        _writer.WInd().Write($"{name} = prim_fn<{expr.ModuleKind}>({StringUtility.Join(", ", expr.Parameters.AsValueEnumerable().Select(Visit))})");
+        AppendCheckedType(expr.CheckedType, expr.Metadata.Range, " {");
+
+        if (ShouldEnterScope())
+        {
+            using (IndentScope())
+            {
+                using var body = new StringReader(CompilerServices.Print(expr, Flags | PrinterFlags.Script));
+                while (body.ReadLine() is string line)
+                {
+                    _writer.WInd().WriteLine(line);
+                }
+            }
+        }
+        else
+        {
+            _writer.WInd().WriteLine("...");
+        }
+
+        _writer.WInd().WriteLine("}");
+        return name;
+    }
+
+    /// <inheritdoc/>
     protected override string VisitFunctionWrapper(FunctionWrapper expr)
     {
         if (Flags.HasFlag(PrinterFlags.Inline))
@@ -461,6 +495,19 @@ internal sealed class ILPrintVisitor : ExprFunctor<string, string>
         }
 
         name += $": {VisitType(expr.TypeAnnotation)}";
+        return name;
+    }
+
+    /// <inheritdoc/>
+    protected override string VisitBufferVar(BufferVar expr)
+    {
+        var name = $"%{expr.Name}#{expr.GlobalVarIndex}";
+        if (Flags.HasFlag(PrinterFlags.Inline))
+        {
+            return name;
+        }
+
+        name += $": {VisitType(expr.TypeAnnotation)} [{expr.Role}, {expr.Location}]";
         return name;
     }
 

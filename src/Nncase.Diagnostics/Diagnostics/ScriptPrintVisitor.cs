@@ -519,6 +519,19 @@ internal sealed class ScriptPrintVisitor : ExprFunctor<IPrintSymbol, string>
     }
 
     /// <inheritdoc/>
+    protected override IPrintSymbol VisitBufferVar(BufferVar expr)
+    {
+        if (_exprMemo.TryGetValue(expr, out var doc))
+        {
+            return doc;
+        }
+
+        doc = (ScriptSymobl)_scope.GetUniqueVarSymbol(expr, "%");
+        _exprMemo.Add(expr, doc);
+        return doc;
+    }
+
+    /// <inheritdoc/>
     protected override IPrintSymbol VisitFor(For expr)
     {
         if (_exprMemo.TryGetValue(expr, out var doc))

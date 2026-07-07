@@ -51,6 +51,23 @@ public sealed class UnitTestDistribAutoDistributed : TestClassBase
     }
 
     [Fact]
+    public void TestFunctionTupleCallGetItemCanBeDistributed()
+    {
+        var inputType = new TensorType(DataTypes.Float32, [16, 32]);
+        var input = new Var("input", inputType);
+        var layerInput = new Var("layer_input", inputType);
+        var layer = new Function("layer", new IR.Tuple(layerInput, layerInput), [layerInput]);
+        var layerCall = new Call(layer, input);
+        var output = IR.F.Tensors.GetItem(layerCall, 0) + input;
+        var main = new Function("main", output, [input]);
+        var pass = new AutoDistributedPass(false, CPUTarget.Kind, CompileOptions);
+
+        var post = pass.RunAsync(main, new()).Result;
+
+        Assert.NotNull(post);
+    }
+
+    [Fact]
     public void TestNonUniformSplitCandidateIsGenerated()
     {
         var tensorType = new TensorType(DataTypes.Float32, [1024]);

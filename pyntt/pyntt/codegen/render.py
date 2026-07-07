@@ -20,6 +20,11 @@ WORKSPACE_PARAMETERS = (
     "block_local_data",
 )
 
+WORKSPACE_STRIDE_PARAMETERS = (
+    "data_pool_stride_bytes: tl.constexpr",
+    "block_local_data_pool_stride_bytes: tl.constexpr",
+)
+
 
 def render_generated_kernels(
     model_dir: str | Path,
@@ -86,7 +91,10 @@ def _render_kernel(kernel: dict[str, Any]) -> str:
     parameters = (
         tuple(f"input{index}" for index, _ in enumerate(metadata.get("inputs", ())))
         + tuple(f"output{index}" for index, _ in enumerate(metadata.get("outputs", ())))
+        + tuple(f"input{index}_pool_stride_elements: tl.constexpr" for index, _ in enumerate(metadata.get("inputs", ())))
+        + tuple(f"output{index}_pool_stride_elements: tl.constexpr" for index, _ in enumerate(metadata.get("outputs", ())))
         + WORKSPACE_PARAMETERS
+        + WORKSPACE_STRIDE_PARAMETERS
         + tuple(runtime_shape_args)
         + grid_barrier_parameters
         + ("numel", "block_size: tl.constexpr")
@@ -481,7 +489,12 @@ def _helper_header(
     comment: str | None = None,
 ) -> list[str]:
     runtime = _runtime_suffix(model)
-    parameters = ", ".join(args + WORKSPACE_PARAMETERS + tuple(model.get("RuntimeShapeArgs", ()) or ()) + ("block_size: tl.constexpr",))
+    parameters = ", ".join(
+        args
+        + WORKSPACE_PARAMETERS
+        + WORKSPACE_STRIDE_PARAMETERS
+        + tuple(model.get("RuntimeShapeArgs", ()) or ())
+        + ("block_size: tl.constexpr",))
     lines = []
     if comment:
         lines.append(comment)
@@ -632,6 +645,33 @@ def _emit_tensor_store(model: dict[str, Any]) -> str:
     return _emit_tensor_copy(model, is_load=False)
 
 
+def _emit_memcopy(model: dict[str, Any]) -> str:
+    total = _multiply_expr(_product(model["Shape"]), model["VectorLaneCount"])
+
+    def tensor_offset(prefix: str, strides: list[Any], lane_flat: str) -> str:
+        terms = [f"{prefix}{axis} * {_dim(stride)}" for axis, stride in enumerate(strides)]
+        tensor = "lane_flat * 0" if not terms else " + ".join(terms)
+        lane_count = model["VectorLaneCount"]
+        return tensor if lane_count == 1 else f"(({tensor}) * {lane_count} + {lane_flat})"
+
+    lines = _standard_header(
+        model,
+        f"# generated from PyNTT Jinja Memcopy.py.jinja\n# {model['Comment']}; dtype={model['DType']}, shape={_shape_tuple(model['Shape'])}",
+        [("source", "Source"), ("destination", "Destination")],
+    )
+    _line(lines, 1, f"for linear_start in tl.range(0, {total}, block_size):")
+    _line(lines, 2, "linear = linear_start + tl.arange(0, block_size)")
+    _line(lines, 2, f"mask = linear < {total}")
+    _line(lines, 2, f"lane_flat = linear % {model['VectorLaneCount']}")
+    _line(lines, 2, f"tensor_linear = linear // {model['VectorLaneCount']}")
+    _append_tensor_index_decompose(lines, 2, "tensor_linear", "idx", model["Shape"])
+    _line(lines, 2, f"source_offsets = {tensor_offset('idx', model['SourceStrides'], 'lane_flat')}")
+    _line(lines, 2, f"destination_offsets = {tensor_offset('idx', model['DestinationStrides'], 'lane_flat')}")
+    _line(lines, 2, "value = tl.load(source + source_offsets, mask=mask)")
+    _line(lines, 2, "tl.store(destination + destination_offsets, value, mask=mask)")
+    return _finish(lines)
+
+
 def _emit_tensor_copy(model: dict[str, Any], *, is_load: bool) -> str:
     local_shape = model["LocalShape"]
     global_shape = model["GlobalShape"]
@@ -659,23 +699,37 @@ def _emit_tensor_copy(model: dict[str, Any], *, is_load: bool) -> str:
         return "lane * 0" if not terms else "lane * 0 + " + " + ".join(terms)
 
     if is_load:
+        internal_source = model.get("Source")
+        source_args = () if internal_source is not None else ("source", "source_pool_stride_elements: tl.constexpr")
         lines = _helper_header(
             model,
-            ("source",),
+            source_args,
             comment=f"# generated from PyNTT Jinja TensorLoad.py.jinja\n# {model['Comment']}; dtype={model['DType']}, local_shape={_shape_tuple(local_shape)}, global_shape={_shape_tuple(global_shape)}",
         )
         _line(lines, 1, "shard_index = tl.program_id(0).to(tl.int64)")
-        _append_pointer_shard_coords(lines, 1, [model["Destination"]])
+        pointer_models = [model["Destination"]]
+        if internal_source is not None:
+            pointer_models.append(internal_source)
+        _append_pointer_shard_coords(lines, 1, pointer_models)
+        if internal_source is not None:
+            _line(lines, 1, f"source = {_ptr(model, 'Source')}")
         _line(lines, 1, f"destination = {_ptr(model, 'Destination')}")
     else:
+        internal_destination = model.get("Destination")
+        destination_args = () if internal_destination is not None else ("destination", "destination_pool_stride_elements: tl.constexpr")
         lines = _helper_header(
             model,
-            ("destination",),
+            destination_args,
             comment=f"# generated from PyNTT Jinja TensorStore.py.jinja\n# {model['Comment']}; dtype={model['DType']}, local_shape={_shape_tuple(local_shape)}, global_shape={_shape_tuple(global_shape)}",
         )
         _line(lines, 1, "shard_index = tl.program_id(0).to(tl.int64)")
-        _append_pointer_shard_coords(lines, 1, [model["Source"]])
+        pointer_models = [model["Source"]]
+        if internal_destination is not None:
+            pointer_models.append(internal_destination)
+        _append_pointer_shard_coords(lines, 1, pointer_models)
         _line(lines, 1, f"source = {_ptr(model, 'Source')}")
+        if internal_destination is not None:
+            _line(lines, 1, f"destination = {_ptr(model, 'Destination')}")
 
     _line(lines, 1, "tmp_shard = shard_index")
     for axis in range(len(model["Hierarchy"]) - 1, -1, -1):
@@ -698,13 +752,15 @@ def _emit_tensor_copy(model: dict[str, Any], *, is_load: bool) -> str:
             _line(lines, indent + 1, f"global_idx{axis} = {axis_index(axis)} + split_linear{axis} * local_dim{axis}")
             _line(lines, indent + 1, f"mask = mask & (global_idx{axis} < {_dim(global_shape[axis])})")
     if is_load:
-        _line(lines, indent + 1, f"source_offsets = {model['SourceOffset']} + {global_offset()}")
+        source_pool_offset = "0" if internal_source is not None else "source_pool_stride_elements * shard_index"
+        _line(lines, indent + 1, f"source_offsets = {source_pool_offset} + {model['SourceOffset']} + {global_offset()}")
         _line(lines, indent + 1, f"destination_offsets = {local_offset(local_strides)}")
         _line(lines, indent + 1, "value = tl.load(source + source_offsets, mask=mask)")
         _line(lines, indent + 1, "tl.store(destination + destination_offsets, value, mask=mask)")
     else:
         _line(lines, indent + 1, f"source_offsets = {local_offset(local_strides)}")
-        _line(lines, indent + 1, f"destination_offsets = {model['DestinationOffset']} + {global_offset()}")
+        destination_pool_offset = "0" if internal_destination is not None else "destination_pool_stride_elements * shard_index"
+        _line(lines, indent + 1, f"destination_offsets = {destination_pool_offset} + {model['DestinationOffset']} + {global_offset()}")
         _line(lines, indent + 1, "value = tl.load(source + source_offsets, mask=mask)")
         _line(lines, indent + 1, "tl.store(destination + destination_offsets, value, mask=mask)")
     return _finish(lines)
@@ -910,6 +966,25 @@ def _emit_vector_layout(model: dict[str, Any]) -> str:
         stride = _product_int(lanes[index + 1 :])
         return f"({lane_group}) % {lanes[index]}" if stride == 1 else f"(({lane_group}) // {stride}) % {lanes[index]}"
 
+    def axis_lane_indices(axis: int) -> list[int]:
+        return [
+            lane_index
+            for lane_index, packed_axis in enumerate(model["Axes"])
+            if packed_axis == axis
+        ]
+
+    def axis_lane_product(indices: list[int]) -> int:
+        return _product_int([model["Lanes"][lane_index] for lane_index in indices])
+
+    def axis_lane_offset(lines: list[str], level: int, lane_group: str, indices: list[int]) -> str:
+        terms = []
+        for index, lane_index in enumerate(indices):
+            lane_name = f"lane{lane_index}"
+            _line(lines, level, f"{lane_name} = {lane_at(lane_group, model['Lanes'], lane_index)}")
+            lane_stride = axis_lane_product(indices[index + 1 :])
+            terms.append(lane_name if lane_stride == 1 else f"{lane_name} * {lane_stride}")
+        return "0" if not terms else " + ".join(terms)
+
     def tensor_offset(prefix: str, strides: list[Any], lane_count: int, lane_flat: str) -> str:
         terms = [f"{prefix}{axis} * {_dim(stride)}" for axis, stride in enumerate(strides)]
         tensor = "lane_flat * 0" if not terms else " + ".join(terms)
@@ -933,11 +1008,11 @@ def _emit_vector_layout(model: dict[str, Any]) -> str:
         _line(lines, 2, f"new_lane_group = {pack_lane_group}")
         _line(lines, 2, "valid = mask")
         for axis in range(len(model["InputShape"])):
-            packed_axis = model["Axes"].index(axis) if axis in model["Axes"] else -1
-            if packed_axis >= 0:
-                lane_value = lane_at("new_lane_group", model["Lanes"], packed_axis)
-                _line(lines, 2, f"lane{packed_axis} = {lane_value}")
-                _line(lines, 2, f"in_idx{axis} = out_idx{axis} * {model['Lanes'][packed_axis]} + lane{packed_axis}")
+            packed_axes = axis_lane_indices(axis)
+            if packed_axes:
+                lane_product = axis_lane_product(packed_axes)
+                lane_offset = axis_lane_offset(lines, 2, "new_lane_group", packed_axes)
+                _line(lines, 2, f"in_idx{axis} = out_idx{axis} * {lane_product} + {lane_offset}")
                 _line(lines, 2, f"valid = valid & (in_idx{axis} < {_dim(model['InputShape'][axis])})")
             else:
                 _line(lines, 2, f"in_idx{axis} = out_idx{axis}")
@@ -953,11 +1028,11 @@ def _emit_vector_layout(model: dict[str, Any]) -> str:
         _line(lines, 2, f"new_lane_group = {unpack_lane_group}")
         _line(lines, 2, "valid = mask")
         for axis in range(len(model["OutputShape"])):
-            unpacked_axis = model["Axes"].index(axis) if axis in model["Axes"] else -1
-            if unpacked_axis >= 0:
-                lane_value = lane_at("new_lane_group", model["Lanes"], unpacked_axis)
-                _line(lines, 2, f"lane{unpacked_axis} = {lane_value}")
-                _line(lines, 2, f"out_idx{axis} = in_idx{axis} * {model['Lanes'][unpacked_axis]} + lane{unpacked_axis}")
+            unpacked_axes = axis_lane_indices(axis)
+            if unpacked_axes:
+                lane_product = axis_lane_product(unpacked_axes)
+                lane_offset = axis_lane_offset(lines, 2, "new_lane_group", unpacked_axes)
+                _line(lines, 2, f"out_idx{axis} = in_idx{axis} * {lane_product} + {lane_offset}")
                 _line(lines, 2, f"valid = valid & (out_idx{axis} < {_dim(model['OutputShape'][axis])})")
             else:
                 _line(lines, 2, f"out_idx{axis} = in_idx{axis}")
@@ -2945,9 +3020,15 @@ def _emit_reshard_staged(model: dict[str, Any]) -> str:
     global_strides = _contiguous_strides(model["GlobalShape"])
     stage = model.get("Stage")
 
+    def is_zero_expression(value: Any) -> bool:
+        try:
+            return int(value) == 0
+        except (TypeError, ValueError):
+            return str(value).strip() in ("", "0")
+
     def buffer_base(base_name: str, offset_bytes: str, pool_bytes: int | str) -> str:
         expression = base_name
-        if int(pool_bytes) != 0:
+        if not is_zero_expression(pool_bytes):
             expression += f" + shard_index * {pool_bytes}"
         expression += f" + {offset_bytes}"
         return expression
@@ -3568,6 +3649,7 @@ _EMITTERS = {
     "LayerNorm": _emit_layer_norm,
     "MatMulGlu": _emit_matmul_glu,
     "Matmul": _emit_matmul,
+    "Memcopy": _emit_memcopy,
     "NormApply": _emit_norm_apply,
     "NormStats": _emit_norm_stats,
     "Pad": _emit_pad,

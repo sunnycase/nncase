@@ -37,3 +37,14 @@ Read [references/vectorize-packing.md](references/vectorize-packing.md) before c
 - packed matmul/QKV/GLU layouts, vectorized reduce/norm/rope behavior, or vectorized cost/codegen
 
 The most important boundary is: tensor shape carries semantic dimensions, while vector dtype lanes carry physical packed lanes only. Do not encode semantic fields such as stats components or tuple outputs in vector lanes.
+
+## PyNTT Codegen And Runtime ABI
+
+Read [references/pyntt-codegen-runtime.md](references/pyntt-codegen-runtime.md) before changing:
+
+- `modules/Nncase.Modules.NTT/CodeGen/PyNTT/`
+- `pyntt/pyntt/codegen/`
+- `pyntt/pyntt/runtime/`
+- PyNTT TIR function calls, generated model dispatch, workspace allocation, rdata layout, or kernel manifests
+
+The most important boundary is: TIR/bufferize owns buffer regions and function ABI; generated PyNTT model code owns runtime dispatch, workspace allocation, and rdata materialization; PyNTT templates consume manifest metadata and must not rediscover or reinterpret backing storage layout.

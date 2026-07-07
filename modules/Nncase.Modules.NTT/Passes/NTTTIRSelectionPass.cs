@@ -28,6 +28,7 @@ namespace Nncase.Passes;
 public sealed class NTTTIRSelectionPass : TIRSelectionPass
 {
     private readonly CompileOptions _compileOptions;
+    private int _bufferIndex;
 
     public NTTTIRSelectionPass(CompileOptions compileOptions, string moduleKind = CPUTarget.Kind)
         : base(moduleKind)
@@ -327,22 +328,27 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
             throw new NotSupportedException("Reshape only support buffer input");
         }
 
-        var outBuffer = (TIR.Buffer)output;
-
-        var bitcast = outBuffer.DistributedType is DistributedType ? false : true;
-        if (!bitcast)
+        if (output is BufferVar { Role: BufferVarRole.Output })
         {
-            if (DistributedUtility.AreSamePolicies(inBuffer.DistributedType!.AxisPolicies.Where(sbp => sbp is not SBPBroadCast).ToArray(), outBuffer.DistributedType!.AxisPolicies.Where(sbp => sbp is not SBPBroadCast).ToArray(), false))
+            var outputBuffer = CreateMetadataBuffer(output, MemoryLocation.Output, "reshape_output");
+            if (CanUseView(inBuffer, outputBuffer, sequeeze))
             {
-                bitcast = true;
+                var view = CreateView(inBuffer, outputBuffer);
+                return GenerateTensorStore(view, output);
             }
+
+            var temp = CreateDataBuffer(outputBuffer);
+            return T.Sequential(
+                TIR.F.NTT.Reshape(input, temp),
+                GenerateTensorStore(temp, output));
         }
 
+        var outBuffer = (TIR.Buffer)output;
+
         // If the size is not same, we cannot bitcast.
-        if ((inBuffer.MemSpan.Size == outBuffer.MemSpan.Size) && (bitcast || sequeeze))
+        if (CanUseView(inBuffer, outBuffer, sequeeze))
         {
-            var newStrides = outBuffer.Strides.ToArray();
-            output = inBuffer.With(name: outBuffer.Name, elemType: outBuffer.ElemType, dimensions: outBuffer.Dimensions.ToArray(), strides: newStrides, distributedType: outBuffer.DistributedType);
+            output = CreateView(inBuffer, outBuffer);
             return T.Nop();
         }
         else
@@ -384,11 +390,77 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
             }
         }
 
-        var distributedType = ((TIR.Buffer)output).DistributedType is DistributedType dt
-            ? dt with { TensorType = new TensorType(newType, newDimensions) }
+        if (output is BufferVar { Role: BufferVarRole.Output } outputVar)
+        {
+            var distributedType = inBuffer.DistributedType is DistributedType dt
+                ? dt with { TensorType = new TensorType(newType, newDimensions) }
+                : null;
+            var view = inBuffer.With(name: $"{outputVar.Name}_view", elemType: newType, dimensions: newDimensions, strides: newStrides, distributedType: distributedType);
+            return GenerateTensorStore(view, output);
+        }
+
+        if (output is not TIR.Buffer outBuffer)
+        {
+            throw new NotSupportedException($"Bitcast output must be a buffer or caller output BufferVar, got {output.GetType().Name}.");
+        }
+
+        var outputDistributedType = outBuffer.DistributedType is DistributedType outDt
+            ? outDt with { TensorType = new TensorType(newType, newDimensions) }
             : null;
-        output = inBuffer.With(name: ((TIR.Buffer)output).Name, elemType: newType, dimensions: newDimensions, strides: newStrides, distributedType: distributedType);
+        output = inBuffer.With(name: outBuffer.Name, elemType: newType, dimensions: newDimensions, strides: newStrides, distributedType: outputDistributedType);
         return T.Nop();
+    }
+
+    private TIR.Buffer CreateMetadataBuffer(Expr expr, MemoryLocation location, string namePrefix)
+    {
+        var (tensorType, distributedType) = GetTensorTypeAndDistributedType(expr.CheckedType, namePrefix);
+        T.CreateBuffer(tensorType, location, out var buffer, $"{namePrefix}_{_bufferIndex++}", distributedType);
+        return buffer;
+    }
+
+    private TIR.Buffer CreateDataBuffer(TIR.Buffer metadataBuffer)
+    {
+        var tensorType = new TensorType(metadataBuffer.ElemType, metadataBuffer.Dimensions.ToArray());
+        T.CreateBuffer(tensorType, MemoryLocation.Data, out var buffer, $"reshape_tmp_{_bufferIndex++}", metadataBuffer.DistributedType);
+        return buffer;
+    }
+
+    private (TensorType TensorType, DistributedType? DistributedType) GetTensorTypeAndDistributedType(IRType type, string context)
+        => type switch
+        {
+            DistributedType distributedType => (distributedType.TensorType, distributedType),
+            TensorType tensorType => (tensorType, null),
+            _ => throw new NotSupportedException($"{context} expects a tensor type, got {type}."),
+        };
+
+    private bool CanUseView(TIR.Buffer input, TIR.Buffer output, bool sequeeze)
+    {
+        var outputDistributedType = output.DistributedType;
+        var bitcast = outputDistributedType is not DistributedType;
+        if (!bitcast)
+        {
+            if (input.DistributedType is not { } inputDistributedType)
+            {
+                return false;
+            }
+
+            bitcast = DistributedUtility.AreSamePolicies(inputDistributedType.AxisPolicies.Where(sbp => sbp is not SBPBroadCast).ToArray(), outputDistributedType!.AxisPolicies.Where(sbp => sbp is not SBPBroadCast).ToArray(), false);
+        }
+
+        return input.MemSpan.Size == output.MemSpan.Size && (bitcast || sequeeze);
+    }
+
+    private TIR.Buffer CreateView(TIR.Buffer input, TIR.Buffer output)
+        => input.With(name: output.Name, elemType: output.ElemType, dimensions: output.Dimensions.ToArray(), strides: output.Strides.ToArray(), distributedType: output.DistributedType);
+
+    private Expr GenerateTensorStore(TIR.Buffer source, Expr destination)
+    {
+        var distributedType = source.DistributedType;
+        return TIR.F.NTT.TensorStore(
+            source,
+            destination,
+            distributedType?.AxisPolicies ?? new IRArray<SBP>(),
+            distributedType?.Placement ?? new Placement(new IRArray<int>(), string.Empty, string.Empty));
     }
 
     private Expr GenerateUnary(UnaryOp unaryOp, IReadOnlyList<BaseExpr> arguments, Expr output)

@@ -116,6 +116,12 @@ public partial class ExprRewriter<TContext>
     }
 
     /// <inheritdoc/>
+    protected sealed override BaseExpr VisitLeafBufferVar(TIR.BufferVar expr, TContext context)
+    {
+        return RewriteLeafBufferVar(expr, context);
+    }
+
+    /// <inheritdoc/>
     protected sealed override BaseExpr VisitLeafBlock(TIR.Block expr, TContext context)
     {
         return RewriteLeafBlock(expr, context);
@@ -517,6 +523,11 @@ public partial class ExprRewriter<TContext>
     /// Rewrite leaf <see cref="Var"/>.
     /// </summary>
     protected virtual BaseExpr RewriteLeafVar(Var expr, TContext context) => DefaultRewriteLeaf(expr, context);
+
+    /// <summary>
+    /// Rewrite leaf <see cref="TIR.BufferVar"/>.
+    /// </summary>
+    protected virtual BaseExpr RewriteLeafBufferVar(TIR.BufferVar expr, TContext context) => DefaultRewriteLeaf(expr, context);
 
     /// <summary>
     /// Rewrite leaf <see cref="TIR.Block"/>.
@@ -922,6 +933,14 @@ public partial class ExprRewriter
 
     /// <inheritdoc />
     protected sealed override BaseExpr RewriteLeafVar(Var expr, Unit context) => RewriteLeafVar(expr);
+
+    /// <summary>
+    /// Rewrite leaf <see cref="TIR.BufferVar"/>.
+    /// </summary>
+    protected virtual BaseExpr RewriteLeafBufferVar(TIR.BufferVar expr) => DefaultRewriteLeaf(expr);
+
+    /// <inheritdoc />
+    protected sealed override BaseExpr RewriteLeafBufferVar(TIR.BufferVar expr, Unit context) => RewriteLeafBufferVar(expr);
 
     /// <summary>
     /// Rewrite leaf <see cref="TIR.Block"/>.
