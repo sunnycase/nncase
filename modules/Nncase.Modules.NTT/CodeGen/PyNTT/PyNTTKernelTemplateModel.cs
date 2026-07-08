@@ -17,6 +17,7 @@ public sealed record PyNTTTensorLoadTemplateModel(
     PyNTTDimExpression[] GlobalShape,
     int[] Hierarchy,
     int[][] SplitAxes,
+    int VectorLaneCount,
     string Comment)
 {
     public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
@@ -36,6 +37,7 @@ public sealed record PyNTTTensorStoreTemplateModel(
     PyNTTDimExpression[] GlobalShape,
     int[] Hierarchy,
     int[][] SplitAxes,
+    int VectorLaneCount,
     string Comment)
 {
     public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
@@ -531,7 +533,7 @@ public sealed record PyNTTUpdatePagedAttentionKVCacheTemplateModel(
     int SeqAxis,
     int HeadAxis,
     int DimAxis,
-    int LayerId,
+    string LayerIdExpression,
     int CacheKind,
     int SlotsVectorLaneCount,
     PyNTTPagedAttentionCacheTemplateModel Cache,
@@ -560,7 +562,7 @@ public sealed record PyNTTPagedAttentionTemplateModel(
     int HeadAxis,
     int DimAxis,
     int GlobalNumQueryHeads,
-    int LayerId,
+    string LayerIdExpression,
     PyNTTPagedAttentionCacheTemplateModel Cache,
     string Comment)
 {

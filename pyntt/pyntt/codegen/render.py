@@ -77,8 +77,12 @@ def _render_kernel(kernel: dict[str, Any]) -> str:
     env = _make_env()
     helper_sources = []
     for helper in kernel.get("helpers", ()):
+        model = dict(helper["model"])
+        arguments = tuple(helper.get("arguments", ()) or ())
+        if arguments:
+            model["Arguments"] = arguments
         helper_sources.append(
-            env.get_template(helper["template"]).render(model=helper["model"]).strip()
+            env.get_template(helper["template"]).render(model=model).strip()
         )
 
     metadata = kernel["metadata"]
@@ -93,6 +97,7 @@ def _render_kernel(kernel: dict[str, Any]) -> str:
         + tuple(f"output{index}" for index, _ in enumerate(metadata.get("outputs", ())))
         + tuple(f"input{index}_pool_stride_elements: tl.constexpr" for index, _ in enumerate(metadata.get("inputs", ())))
         + tuple(f"output{index}_pool_stride_elements: tl.constexpr" for index, _ in enumerate(metadata.get("outputs", ())))
+        + _abi_view_stride_args(metadata)
         + WORKSPACE_PARAMETERS
         + WORKSPACE_STRIDE_PARAMETERS
         + tuple(runtime_shape_args)
@@ -163,6 +168,11 @@ def _attrs(metadata: dict[str, Any]) -> dict[str, Any]:
 
 def _runtime_shape_args(metadata: dict[str, Any]) -> tuple[str, ...]:
     value = _attrs(metadata).get("runtime_shape_args", ())
+    return tuple(value or ())
+
+
+def _abi_view_stride_args(metadata: dict[str, Any]) -> tuple[str, ...]:
+    value = _attrs(metadata).get("abi_view_stride_args", ())
     return tuple(value or ())
 
 
@@ -489,8 +499,10 @@ def _helper_header(
     comment: str | None = None,
 ) -> list[str]:
     runtime = _runtime_suffix(model)
+    abi_args = tuple(model.get("Arguments", ()) or ())
     parameters = ", ".join(
         args
+        + abi_args
         + WORKSPACE_PARAMETERS
         + WORKSPACE_STRIDE_PARAMETERS
         + tuple(model.get("RuntimeShapeArgs", ()) or ())
@@ -698,6 +710,13 @@ def _emit_tensor_copy(model: dict[str, Any], *, is_load: bool) -> str:
         ]
         return "lane * 0" if not terms else "lane * 0 + " + " + ".join(terms)
 
+    vector_lane_count = int(model.get("VectorLaneCount", 1))
+
+    def scalar_offset(tensor_offset: str) -> str:
+        if vector_lane_count == 1:
+            return tensor_offset
+        return f"(({tensor_offset}) * {vector_lane_count} + vector_lane)"
+
     if is_load:
         internal_source = model.get("Source")
         source_args = () if internal_source is not None else ("source", "source_pool_stride_elements: tl.constexpr")
@@ -751,18 +770,22 @@ def _emit_tensor_copy(model: dict[str, Any], *, is_load: bool) -> str:
             _line(lines, indent + 1, f"split_linear{axis} = {split_linear(split_axes)}")
             _line(lines, indent + 1, f"global_idx{axis} = {axis_index(axis)} + split_linear{axis} * local_dim{axis}")
             _line(lines, indent + 1, f"mask = mask & (global_idx{axis} < {_dim(global_shape[axis])})")
+    copy_indent = indent + 1
+    if vector_lane_count != 1:
+        _line(lines, copy_indent, f"for vector_lane in tl.range(0, {vector_lane_count}):")
+        copy_indent += 1
     if is_load:
         source_pool_offset = "0" if internal_source is not None else "source_pool_stride_elements * shard_index"
-        _line(lines, indent + 1, f"source_offsets = {source_pool_offset} + {model['SourceOffset']} + {global_offset()}")
-        _line(lines, indent + 1, f"destination_offsets = {local_offset(local_strides)}")
-        _line(lines, indent + 1, "value = tl.load(source + source_offsets, mask=mask)")
-        _line(lines, indent + 1, "tl.store(destination + destination_offsets, value, mask=mask)")
+        _line(lines, copy_indent, f"source_offsets = {source_pool_offset} + {model['SourceOffset']} + {scalar_offset(global_offset())}")
+        _line(lines, copy_indent, f"destination_offsets = {scalar_offset(local_offset(local_strides))}")
+        _line(lines, copy_indent, "value = tl.load(source + source_offsets, mask=mask)")
+        _line(lines, copy_indent, "tl.store(destination + destination_offsets, value, mask=mask)")
     else:
-        _line(lines, indent + 1, f"source_offsets = {local_offset(local_strides)}")
+        _line(lines, copy_indent, f"source_offsets = {scalar_offset(local_offset(local_strides))}")
         destination_pool_offset = "0" if internal_destination is not None else "destination_pool_stride_elements * shard_index"
-        _line(lines, indent + 1, f"destination_offsets = {destination_pool_offset} + {model['DestinationOffset']} + {global_offset()}")
-        _line(lines, indent + 1, "value = tl.load(source + source_offsets, mask=mask)")
-        _line(lines, indent + 1, "tl.store(destination + destination_offsets, value, mask=mask)")
+        _line(lines, copy_indent, f"destination_offsets = {destination_pool_offset} + {model['DestinationOffset']} + {scalar_offset(global_offset())}")
+        _line(lines, copy_indent, "value = tl.load(source + source_offsets, mask=mask)")
+        _line(lines, copy_indent, "tl.store(destination + destination_offsets, value, mask=mask)")
     return _finish(lines)
 
 
@@ -1185,14 +1208,16 @@ def _emit_packed_qkv_parallel_linear(model: dict[str, Any]) -> str:
         n_stages = 2 if use_large_n else 1
         _line(lines, indent, f"for m_idx in tl.range(0, {_dim(m)}):")
         indent += 1
-        _emit_packed_qkv_gemv_concat_n(lines, indent, model, input_batch_offset, block_n, block_k, n_stages)
+        for prefix in ("Q", "K", "V"):
+            _emit_packed_qkv_gemv_projection(lines, indent, model, prefix, input_batch_offset, block_n, block_k, n_stages)
     else:
         block_m = 16
-        block_n = 64
+        block_n = model["NPackedLaneCount"] * model["NVectorLaneCount"]
         block_k = 64
         _line(lines, indent, f"for m_start in tl.range(0, {_dim(m)}, {block_m}):")
         _line(lines, indent + 1, f"offs_m = m_start + tl.arange(0, {block_m})")
-        _emit_packed_qkv_matmul_concat_n(lines, indent + 1, model, input_batch_offset, block_m, block_n, block_k)
+        for prefix in ("Q", "K", "V"):
+            _emit_packed_qkv_matmul_projection(lines, indent + 1, model, prefix, input_batch_offset, block_m, block_n, block_k)
     return _finish(lines)
 
 
@@ -3383,15 +3408,17 @@ def _emit_paged_attention(model: dict[str, Any]) -> str:
     block_index_value_matrix = "(topology_id[:, None] * num_blocks_per_shard + block_id[:, None])" if cache["IdLength"] > 1 else "block_id[:, None]"
     key_lane_broadcast = "key_lane[:, None]" if cache["KeyVectorizedDim"] == 5 else "key_lane[None, :]" if cache["KeyVectorizedDim"] == 3 else "0"
     value_lane_broadcast = "value_lane[None, :]" if cache["ValueVectorizedDim"] == 5 else "value_lane[:, None]" if cache["ValueVectorizedDim"] == 3 else "0"
-    key_vector_offset = f"({block_index_key_matrix} * {cache['BlockElements']} + {cache['KeySectionOffset']} + (({model['LayerId']}) * {cache['KeyLayerStride']} + kv_head * {cache['KeyHeadStride']} + key_dim_index[:, None] * {cache['KeyDimBlockStride']} + key_block_index[None, :] * {cache['KeyBlockOffsetStride']}) * {cache['KeyLaneCount']} + {key_lane_broadcast})"
-    value_vector_offset = f"({block_index_value_matrix} * {cache['BlockElements']} + {cache['ValueSectionOffset']} + (({model['LayerId']}) * {cache['ValueLayerStride']} + kv_head * {cache['ValueHeadStride']} + value_dim_index[None, :] * {cache['ValueDimBlockStride']} + value_block_index[:, None] * {cache['ValueBlockOffsetStride']}) * {cache['ValueLaneCount']} + {value_lane_broadcast})"
+    layer_id = "layer_id_value"
+    key_vector_offset = f"({block_index_key_matrix} * {cache['BlockElements']} + {cache['KeySectionOffset']} + (({layer_id}) * {cache['KeyLayerStride']} + kv_head * {cache['KeyHeadStride']} + key_dim_index[:, None] * {cache['KeyDimBlockStride']} + key_block_index[None, :] * {cache['KeyBlockOffsetStride']}) * {cache['KeyLaneCount']} + {key_lane_broadcast})"
+    value_vector_offset = f"({block_index_value_matrix} * {cache['BlockElements']} + {cache['ValueSectionOffset']} + (({layer_id}) * {cache['ValueLayerStride']} + kv_head * {cache['ValueHeadStride']} + value_dim_index[None, :] * {cache['ValueDimBlockStride']} + value_block_index[:, None] * {cache['ValueBlockOffsetStride']}) * {cache['ValueLaneCount']} + {value_lane_broadcast})"
 
     lines = _helper_header(
         model,
         ("block_tables", "kv_cache", "num_blocks_per_shard", "cache_meta"),
-        comment=f"# generated from PyNTT Jinja PagedAttention.py.jinja\n# {model['Comment']}; query_dtype={model['QueryDType']}, output_dtype={model['OutputDType']}, query_shape={_shape_tuple(model['QueryShape'])}, output_shape={_shape_tuple(model['OutputShape'])}, layer={model['LayerId']}, block_n={attention_block_size}",
+        comment=f"# generated from PyNTT Jinja PagedAttention.py.jinja\n# {model['Comment']}; query_dtype={model['QueryDType']}, output_dtype={model['OutputDType']}, query_shape={_shape_tuple(model['QueryShape'])}, output_shape={_shape_tuple(model['OutputShape'])}, layer={model['LayerIdExpression']}, block_n={attention_block_size}",
     )
     _line(lines, 1, "shard_index = tl.program_id(0).to(tl.int64)")
+    _line(lines, 1, f"layer_id_value = (tl.full((), 0, tl.int64) + ({model['LayerIdExpression']})).to(tl.int64)")
     _append_pointer_shard_coords(lines, 1, [model["Query"], model["Scale"], model["Output"]])
     _line(lines, 1, f"query = {_ptr(model, 'Query')}")
     _line(lines, 1, f"scale_ptr = {_ptr(model, 'Scale')}")
@@ -3494,7 +3521,7 @@ def _emit_update_paged_attention_kv_cache(model: dict[str, Any]) -> str:
     topology_match_axes = [axis for axis in cache["NumBlocksSplitAxes"] if axis not in head_split_axes]
     full_source_shard_index = _split_linear_expression(list(range(len(model["Hierarchy"]))), model["Hierarchy"], "source_shard_coord")
     block_index = "(topology_id * num_blocks_per_shard + block_id)" if cache["IdLength"] > 1 else "block_id"
-    cache_offset = f"({block_index} * {cache['BlockElements']} + {section_offset} + (({model['LayerId']}) * {layer_stride} + cache_head_id * {head_stride} + cache_dim_block * {dim_block_stride} + cache_block_offset * {block_offset_stride}) * {lane_count} + cache_lane_id)"
+    cache_offset = f"({block_index} * {cache['BlockElements']} + {section_offset} + (layer_id_value * {layer_stride} + cache_head_id * {head_stride} + cache_dim_block * {dim_block_stride} + cache_block_offset * {block_offset_stride}) * {lane_count} + cache_lane_id)"
 
     def product(values: list[str]) -> str:
         return "1" if not values else " * ".join(f"({value})" for value in values)
@@ -3535,9 +3562,10 @@ def _emit_update_paged_attention_kv_cache(model: dict[str, Any]) -> str:
     lines = _helper_header(
         model,
         ("slot_mapping", "kv_cache", "num_blocks_per_shard", "cache_meta"),
-        comment=f"# generated from PyNTT Jinja UpdatePagedAttentionKVCache.py.jinja\n# {model['Comment']}; dtype={model['SlotsDType']}, slots_shape={_shape_tuple(model['SlotsShape'])}, slots_global_shape={_shape_tuple(model['SlotsGlobalShape'])}, layer={model['LayerId']}, cache_kind={model['CacheKind']}",
+        comment=f"# generated from PyNTT Jinja UpdatePagedAttentionKVCache.py.jinja\n# {model['Comment']}; dtype={model['SlotsDType']}, slots_shape={_shape_tuple(model['SlotsShape'])}, slots_global_shape={_shape_tuple(model['SlotsGlobalShape'])}, layer={model['LayerIdExpression']}, cache_kind={model['CacheKind']}",
     )
     _line(lines, 1, "shard_index = tl.program_id(0).to(tl.int64)")
+    _line(lines, 1, f"layer_id_value = (tl.full((), 0, tl.int64) + ({model['LayerIdExpression']})).to(tl.int64)")
     _append_shard_coords(lines, 1, model["Hierarchy"])
     _line(lines, 1, "num_seqs = tl.load(cache_meta + 0).to(tl.int64)")
     _line(lines, 1, "num_tokens = tl.full((), 0, tl.int64)")

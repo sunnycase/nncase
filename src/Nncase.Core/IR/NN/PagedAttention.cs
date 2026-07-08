@@ -8,6 +8,7 @@ using System.Text;
 using System.Threading.Tasks;
 using Nncase.IR.Math;
 using Nncase.PatternMatch;
+using static Nncase.IR.TypePatternUtility;
 
 namespace Nncase.IR.NN;
 
@@ -29,11 +30,11 @@ public sealed partial class PagedAttention : Op
 
     public static readonly ParameterInfo Scale = new(typeof(PagedAttention), 3, "scale", ParameterKind.Attribute);
 
-    public int LayerId { get; }
+    public static readonly ParameterInfo LayerId = new(typeof(PagedAttention), 4, "layerId", IsDimensionType(), ParameterKind.Attribute);
 
     public IRArray<AttentionDimKind> Layout { get; }
 
     public int HiddenSize { get; }
 
-    public override string DisplayProperty() => $"LayerId: {LayerId}, Layout [{string.Join(',', Layout)}], HiddenSize {HiddenSize}";
+    public override string DisplayProperty() => $"Layout [{string.Join(',', Layout)}], HiddenSize {HiddenSize}";
 }

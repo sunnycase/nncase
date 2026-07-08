@@ -8,6 +8,7 @@ using System.Text;
 using System.Threading.Tasks;
 using Nncase.IR.Math;
 using Nncase.PatternMatch;
+using static Nncase.IR.TypePatternUtility;
 
 namespace Nncase.IR.NN;
 
@@ -18,11 +19,11 @@ public sealed partial class UpdatePagedAttentionKVCache : Op
 
     public static readonly ParameterInfo KVCaches = new(typeof(UpdatePagedAttentionKVCache), 1, "kvCaches", ParameterKind.Attribute);
 
-    public AttentionCacheKind CacheKind { get; }
+    public static readonly ParameterInfo LayerId = new(typeof(UpdatePagedAttentionKVCache), 2, "layerId", IsDimensionType(), ParameterKind.Attribute);
 
-    public int LayerId { get; }
+    public AttentionCacheKind CacheKind { get; }
 
     public IRArray<AttentionDimKind> Layout { get; }
 
-    public override string DisplayProperty() => $"CacheKind: {CacheKind}, LayerId: {LayerId}, Layout [{string.Join(',', Layout)}]";
+    public override string DisplayProperty() => $"CacheKind: {CacheKind}, Layout [{string.Join(',', Layout)}]";
 }

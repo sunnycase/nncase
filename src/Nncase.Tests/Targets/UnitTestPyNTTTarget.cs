@@ -439,6 +439,47 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
     }
 
     [Fact]
+    public void TestPyNTTPackUnpackWithDifferentShardCapacityRun()
+    {
+        ConfigureAutoDistributedPyNTT();
+
+        var scalarType = new TensorType(DataTypes.Float32, new[] { 1, 128 });
+        var vectorType = new VectorType(DataTypes.Float32, 2, 8);
+        var packedType = new TensorType(vectorType, new[] { 1, 8 });
+        var placement = new Placement(new[] { 4, 8 }, "yx", "bb");
+        var scalarDistributedType = new DistributedType(scalarType, new SBP[] { SBP.B, SBP.S([0, 1], 4) }, placement);
+        var packedDistributedType = new DistributedType(packedType, new SBP[] { SBP.B, SBP.S([0, 1], 2) }, placement);
+        var scalarShard = CreateBuffer("scalar_shard", DataTypes.Float32, TIR.MemoryLocation.Data, 0, [1, 128], [4, 1], scalarDistributedType);
+        var packedShard = CreateBuffer("packed_shard", vectorType, TIR.MemoryLocation.Data, 1024, [1, 8], [2, 1], packedDistributedType);
+        var scalarOutputShard = CreateBuffer("scalar_output_shard", DataTypes.Float32, TIR.MemoryLocation.Data, 2048, [1, 128], [4, 1], scalarDistributedType);
+        var input = new Var("x", scalarType);
+        var output = CreateOutputVar("output", scalarType);
+        var body = new TIR.Sequential(
+            TIR.F.NTT.TensorLoad(scalarShard, input, scalarDistributedType.AxisPolicies, placement),
+            TIR.F.NTT.Pack(scalarShard, packedShard, new[] { 2, 8 }, new[] { 1, 1 }),
+            TIR.F.NTT.Unpack(packedShard, scalarOutputShard, new[] { 2, 8 }, new[] { 1, 1 }),
+            TIR.F.NTT.TensorStore(scalarOutputShard, output, scalarDistributedType.AxisPolicies, placement));
+        var main = new TIR.PrimFunction("main_prim", PyNTTTarget.Kind, body, new IVar[] { input, output })
+        {
+            SchedResult =
+            {
+                DataUsage = 4096,
+            },
+        };
+
+        var outputDirectory = GeneratePyNTTModelDirectory("generated_pack_unpack_different_shard_capacity_run_model", main);
+        RenderGeneratedKernels(outputDirectory);
+        var generatedKernelsPy = File.ReadAllText(Path.Join(outputDirectory, "generated_kernels.py"));
+        Assert.Contains("op=pack", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("op=unpack", generatedKernelsPy, StringComparison.Ordinal);
+        AssertGeneratedModelRuns(
+            outputDirectory,
+            "x = torch.arange(128, dtype=torch.float32, device='cuda').reshape(1, 128)",
+            "output = module(x)",
+            "torch.testing.assert_close(output, x, rtol=0, atol=0)");
+    }
+
+    [Fact]
     public void TestPyNTTDistributedBoxingBroadcastAxisPartitionRun()
     {
         ConfigureAutoDistributedPyNTT();
@@ -795,6 +836,199 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
             "        scores = torch.matmul(key[:token + 1, kv_head, :].to(torch.float32), query[token, q_head, :].to(torch.float32))",
             "        probs = torch.softmax(scores, dim=0)",
             "        ref[token, q_head, :] = torch.matmul(probs, value[:token + 1, kv_head, :].to(torch.float32))",
+            "torch.testing.assert_close(output.to(torch.float32), ref.to(torch.bfloat16).to(torch.float32), rtol=3e-2, atol=3e-2)");
+    }
+
+    [Fact]
+    public async Task TestPyNTTPagedAttentionQwenLikeTwoLayersRun()
+    {
+        ConfigureAutoDistributedPyNTT();
+        var targetOptions = Assert.IsType<PyNTTTargetOptions>(CompileOptions.TargetOptions);
+        targetOptions.HierarchyNames = "yx";
+        targetOptions.HierarchyLevels = "bb";
+        targetOptions.Hierarchies = new[] { new[] { 4, 8 } };
+        targetOptions.Vectorize = true;
+
+        var config = new PagedAttentionConfig(
+            2,
+            8,
+            128,
+            DataTypes.BFloat16,
+            256,
+            [
+                PagedKVCacheDimKind.NumBlocks,
+                PagedKVCacheDimKind.NumLayers,
+                PagedKVCacheDimKind.KV,
+                PagedKVCacheDimKind.NumKVHeads,
+                PagedKVCacheDimKind.HeadDim,
+                PagedKVCacheDimKind.BlockSize,
+            ],
+            [
+                PagedKVCacheDimKind.NumBlocks,
+                PagedKVCacheDimKind.NumLayers,
+                PagedKVCacheDimKind.KV,
+                PagedKVCacheDimKind.NumKVHeads,
+                PagedKVCacheDimKind.BlockSize,
+                PagedKVCacheDimKind.HeadDim,
+            ],
+            [PagedKVCacheDimKind.HeadDim],
+            [PagedKVCacheDimKind.BlockSize],
+            [8],
+            [8],
+            [PagedKVCacheDimKind.NumBlocks],
+            [SBP.S([0, 1])]);
+        var (root, queryVar, kvVars, kvCacheObjVar) = Nncase.Evaluator.NN.RefPagedAttentionKVCache.BuildPagedAttentionKernel(
+            [20],
+            [20],
+            16,
+            32,
+            [AttentionDimKind.Head, AttentionDimKind.Dim, AttentionDimKind.Seq],
+            [AttentionDimKind.Head, AttentionDimKind.Dim, AttentionDimKind.Seq],
+            config,
+            new());
+        var parameters = new List<IVar> { queryVar };
+        parameters.AddRange(kvVars.SelectMany(x => x));
+        parameters.Add(kvCacheObjVar);
+        var main = new Function("main", PyNTTTarget.Kind, root, parameters.ToArray());
+
+        var outputDirectory = await GeneratePyNTTModelDirectoryWithCompilerPipeline("generated_paged_attention_qwen_like_two_layers_run_model", main);
+        RenderGeneratedKernels(outputDirectory);
+        var generatedKernelsPy = File.ReadAllText(Path.Join(outputDirectory, "generated_kernels.py"));
+        Assert.Contains("layer_id_value = tl.load(layer_id + 0).to(tl.int64)", generatedKernelsPy, StringComparison.Ordinal);
+        AssertGeneratedModelRuns(
+            outputDirectory,
+            "torch.manual_seed(0)",
+            "seq_len = 20",
+            "num_q_heads = 16",
+            "num_kv_heads = 8",
+            "head_dim = 128",
+            "query = (torch.randn(seq_len, num_q_heads, head_dim, device='cuda', dtype=torch.float32) * 0.05).to(torch.bfloat16)",
+            "key0 = (torch.randn(seq_len, num_kv_heads, head_dim, device='cuda', dtype=torch.float32) * 0.05).to(torch.bfloat16)",
+            "value0 = (torch.randn(seq_len, num_kv_heads, head_dim, device='cuda', dtype=torch.float32) * 0.05).to(torch.bfloat16)",
+            "key1 = (torch.randn(seq_len, num_kv_heads, head_dim, device='cuda', dtype=torch.float32) * 0.05).to(torch.bfloat16)",
+            "value1 = (torch.randn(seq_len, num_kv_heads, head_dim, device='cuda', dtype=torch.float32) * 0.05).to(torch.bfloat16)",
+            "class MockKVCache:",
+            "    pass",
+            "cache = MockKVCache()",
+            "cache.context_lens = torch.tensor([0], dtype=torch.int64)",
+            "cache.seq_lens = torch.tensor([seq_len], dtype=torch.int64)",
+            "cache.block_tables = torch.tensor([[[0, 0]]], dtype=torch.int64)",
+            "cache.slot_mapping = torch.stack([torch.zeros(seq_len, dtype=torch.int64), torch.arange(seq_len, dtype=torch.int64)], dim=1)",
+            "cache.num_blocks = 32",
+            "cache.kv_caches = torch.zeros((4, 8, 1, 2 * num_kv_heads * (head_dim // 8) * 256 * 8), dtype=torch.bfloat16, device='cuda')",
+            "output = module(query, key0, value0, key1, value1, cache)",
+            "ref = query",
+            "for key, value in [(key0, value0), (key1, value1)]:",
+            "    next_ref = torch.empty((seq_len, num_q_heads, head_dim), dtype=torch.float32, device='cuda')",
+            "    for token in range(seq_len):",
+            "        for q_head in range(num_q_heads):",
+            "            kv_head = q_head // (num_q_heads // num_kv_heads)",
+            "            scores = torch.matmul(key[:token + 1, kv_head, :].to(torch.float32), ref[token, q_head, :].to(torch.float32))",
+            "            probs = torch.softmax(scores, dim=0)",
+            "            next_ref[token, q_head, :] = torch.matmul(probs, value[:token + 1, kv_head, :].to(torch.float32))",
+            "    ref = next_ref.to(torch.bfloat16)",
+            "torch.testing.assert_close(output.to(torch.float32), ref.to(torch.float32), rtol=3e-2, atol=3e-2)");
+    }
+
+    [Fact]
+    public async Task TestPyNTTPagedAttentionQwenLikeDecodeRun()
+    {
+        ConfigureAutoDistributedPyNTT();
+        CompileOptions.ShapeBucketOptions.Enable = true;
+        CompileOptions.ShapeBucketOptions.SegmentsCount = 2;
+        CompileOptions.ShapeBucketOptions.SegmentRanges["num_tokens"] = [1, 32];
+        var targetOptions = Assert.IsType<PyNTTTargetOptions>(CompileOptions.TargetOptions);
+        targetOptions.HierarchyNames = "yx";
+        targetOptions.HierarchyLevels = "bb";
+        targetOptions.Hierarchies = new[] { new[] { 4, 8 } };
+        targetOptions.Vectorize = true;
+
+        var config = new PagedAttentionConfig(
+            1,
+            8,
+            128,
+            DataTypes.BFloat16,
+            256,
+            [
+                PagedKVCacheDimKind.NumBlocks,
+                PagedKVCacheDimKind.NumLayers,
+                PagedKVCacheDimKind.KV,
+                PagedKVCacheDimKind.NumKVHeads,
+                PagedKVCacheDimKind.HeadDim,
+                PagedKVCacheDimKind.BlockSize,
+            ],
+            [
+                PagedKVCacheDimKind.NumBlocks,
+                PagedKVCacheDimKind.NumLayers,
+                PagedKVCacheDimKind.KV,
+                PagedKVCacheDimKind.NumKVHeads,
+                PagedKVCacheDimKind.BlockSize,
+                PagedKVCacheDimKind.HeadDim,
+            ],
+            [PagedKVCacheDimKind.HeadDim],
+            [PagedKVCacheDimKind.BlockSize],
+            [8],
+            [8],
+            [PagedKVCacheDimKind.NumBlocks],
+            [SBP.S([0, 1])]);
+        var (root, queryVar, kvVars, kvCacheObjVar) = Nncase.Evaluator.NN.RefPagedAttentionKVCache.BuildPagedAttentionKernel(
+            [20],
+            [20],
+            16,
+            32,
+            [AttentionDimKind.Head, AttentionDimKind.Dim, AttentionDimKind.Seq],
+            [AttentionDimKind.Head, AttentionDimKind.Dim, AttentionDimKind.Seq],
+            config,
+            new(DynamicShape: true, DynamicMaxTokens: 32));
+        CompileOptions.ShapeBucketOptions.VarMap.Add(queryVar, queryVar.CheckedShape.ToArray());
+        foreach (var kvVar in kvVars.SelectMany(vars => vars))
+        {
+            CompileOptions.ShapeBucketOptions.VarMap.Add(kvVar, kvVar.CheckedShape.ToArray());
+        }
+
+        var main = new Function("main", PyNTTTarget.Kind, root, [queryVar, kvVars[0][0], kvVars[0][1], kvCacheObjVar]);
+        var outputDirectory = await GeneratePyNTTModelDirectoryWithCompilerPipeline("generated_paged_attention_qwen_like_decode_run_model", main);
+        RenderGeneratedKernels(outputDirectory);
+        AssertGeneratedModelRuns(
+            outputDirectory,
+            "torch.manual_seed(0)",
+            "prefill_len = 20",
+            "num_q_heads = 16",
+            "num_kv_heads = 8",
+            "head_dim = 128",
+            "prefill_query = (torch.randn(prefill_len, num_q_heads, head_dim, device='cuda', dtype=torch.float32) * 0.05).to(torch.bfloat16)",
+            "prefill_key = (torch.randn(prefill_len, num_kv_heads, head_dim, device='cuda', dtype=torch.float32) * 0.05).to(torch.bfloat16)",
+            "prefill_value = (torch.randn(prefill_len, num_kv_heads, head_dim, device='cuda', dtype=torch.float32) * 0.05).to(torch.bfloat16)",
+            "decode_query = (torch.randn(1, num_q_heads, head_dim, device='cuda', dtype=torch.float32) * 0.05).to(torch.bfloat16)",
+            "decode_key = (torch.randn(1, num_kv_heads, head_dim, device='cuda', dtype=torch.float32) * 0.05).to(torch.bfloat16)",
+            "decode_value = (torch.randn(1, num_kv_heads, head_dim, device='cuda', dtype=torch.float32) * 0.05).to(torch.bfloat16)",
+            "class MockKVCache:",
+            "    pass",
+            "storage = torch.zeros((4, 8, 1, 2 * num_kv_heads * (head_dim // 8) * 256 * 8), dtype=torch.bfloat16, device='cuda')",
+            "prefill_cache = MockKVCache()",
+            "prefill_cache.context_lens = torch.tensor([0], dtype=torch.int64)",
+            "prefill_cache.seq_lens = torch.tensor([prefill_len], dtype=torch.int64)",
+            "prefill_cache.block_tables = torch.tensor([[[0, 0]]], dtype=torch.int64)",
+            "prefill_cache.slot_mapping = torch.stack([torch.zeros(prefill_len, dtype=torch.int64), torch.arange(prefill_len, dtype=torch.int64)], dim=1)",
+            "prefill_cache.num_blocks = 32",
+            "prefill_cache.kv_caches = storage",
+            "_ = module(prefill_query, prefill_key, prefill_value, prefill_cache)",
+            "decode_cache = MockKVCache()",
+            "decode_cache.context_lens = torch.tensor([prefill_len], dtype=torch.int64)",
+            "decode_cache.seq_lens = torch.tensor([prefill_len + 1], dtype=torch.int64)",
+            "decode_cache.block_tables = torch.tensor([[[0, 0]]], dtype=torch.int64)",
+            "decode_cache.slot_mapping = torch.tensor([[0, prefill_len]], dtype=torch.int64)",
+            "decode_cache.num_blocks = 32",
+            "decode_cache.kv_caches = storage",
+            "output = module(decode_query, decode_key, decode_value, decode_cache)",
+            "all_key = torch.cat([prefill_key, decode_key], dim=0)",
+            "all_value = torch.cat([prefill_value, decode_value], dim=0)",
+            "ref = torch.empty((1, num_q_heads, head_dim), dtype=torch.float32, device='cuda')",
+            "for q_head in range(num_q_heads):",
+            "    kv_head = q_head // (num_q_heads // num_kv_heads)",
+            "    scores = torch.matmul(all_key[:, kv_head, :].to(torch.float32), decode_query[0, q_head, :].to(torch.float32))",
+            "    probs = torch.softmax(scores, dim=0)",
+            "    ref[0, q_head, :] = torch.matmul(probs, all_value[:, kv_head, :].to(torch.float32))",
             "torch.testing.assert_close(output.to(torch.float32), ref.to(torch.bfloat16).to(torch.float32), rtol=3e-2, atol=3e-2)");
     }
 

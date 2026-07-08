@@ -148,15 +148,11 @@ def allocate_outputs(
 
 
 def view_typed_buffer(storage: Any, offset_bytes: int, size_bytes: int, dtype: str):
-    """Return a typed flat view into a byte-addressed PyNTT workspace tensor."""
+    """Return a typed flat view into byte storage or an already typed tensor."""
     torch = _import_torch()
     if not isinstance(storage, torch.Tensor):
         raise PyNTTArgumentError(
             f"PyNTT typed buffer view expects torch.Tensor storage, got {type(storage).__name__}."
-        )
-    if storage.dtype != torch.uint8:
-        raise PyNTTArgumentError(
-            f"PyNTT typed buffer view expects uint8 storage, got {storage.dtype}."
         )
 
     offset_bytes = int(offset_bytes)
@@ -165,12 +161,6 @@ def view_typed_buffer(storage: Any, offset_bytes: int, size_bytes: int, dtype: s
         raise PyNTTArgumentError(
             f"PyNTT typed buffer view expects non-negative offset/size, got {offset_bytes}/{size_bytes}."
         )
-    end = offset_bytes + size_bytes
-    if end > storage.numel():
-        raise PyNTTArgumentError(
-            f"PyNTT typed buffer view [{offset_bytes}, {end}) exceeds storage size {storage.numel()}."
-        )
-
     torch_dtype = _torch_dtype(torch, dtype)
     element_size = torch.empty((), dtype=torch_dtype, device=storage.device).element_size()
     if offset_bytes % element_size != 0 or size_bytes % element_size != 0:
@@ -179,8 +169,31 @@ def view_typed_buffer(storage: Any, offset_bytes: int, size_bytes: int, dtype: s
             f"to dtype {dtype} element size {element_size}."
         )
 
-    byte_view = storage.narrow(0, offset_bytes, size_bytes)
-    return byte_view.view(torch_dtype)
+    end = offset_bytes + size_bytes
+    if storage.dtype == torch.uint8:
+        if end > storage.numel():
+            raise PyNTTArgumentError(
+                f"PyNTT typed buffer view [{offset_bytes}, {end}) exceeds storage size {storage.numel()}."
+            )
+
+        byte_view = storage.narrow(0, offset_bytes, size_bytes)
+        return byte_view.view(torch_dtype)
+
+    if storage.dtype != torch_dtype:
+        raise PyNTTArgumentError(
+            f"PyNTT typed buffer view expects uint8 storage or dtype {torch_dtype}, got {storage.dtype}."
+        )
+    if not storage.is_contiguous():
+        raise PyNTTArgumentError("PyNTT typed tensor view expects contiguous storage.")
+    if end > storage.numel() * element_size:
+        raise PyNTTArgumentError(
+            f"PyNTT typed buffer view [{offset_bytes}, {end}) exceeds storage size "
+            f"{storage.numel() * element_size} bytes."
+        )
+
+    start = offset_bytes // element_size
+    length = size_bytes // element_size
+    return storage.reshape(-1).narrow(0, start, length)
 
 
 def _validate_tensor(

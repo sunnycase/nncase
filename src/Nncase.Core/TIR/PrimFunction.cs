@@ -60,7 +60,7 @@ public sealed class PrimFunction : BaseFunction
 
     public ReadOnlySpan<IVar> Parameters => SpanUtility.UnsafeCast<BaseExpr, IVar>(Operands.Slice(1));
 
-    public override IEnumerable<IRType> ParameterTypes => Parameters.AsValueEnumerable().Select(x => ((Expr)x).CheckedType).ToArray();
+    public override IEnumerable<IRType> ParameterTypes => Parameters.AsValueEnumerable().Select(x => ((BaseExpr)x).CheckedType).ToArray();
 
     /// <inheritdoc/>
     public override TExprResult Accept<TExprResult, TTypeResult, TContext>(ExprFunctor<TExprResult, TTypeResult, TContext> functor, TContext context)

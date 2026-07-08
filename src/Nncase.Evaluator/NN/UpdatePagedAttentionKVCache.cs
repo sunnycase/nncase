@@ -19,6 +19,7 @@ public sealed class UpdatePagedAttentionKVCacheEvaluator : ITypeInferencer<Updat
     {
         var slots = context.CheckArgumentType<IRType>(target, UpdatePagedAttentionKVCache.Slots);
         var kvCache = context.CheckArgumentType<IRType>(target, UpdatePagedAttentionKVCache.KVCaches);
+        _ = context.CheckArgumentType<DimensionType>(target, UpdatePagedAttentionKVCache.LayerId);
         return slots switch
         {
             DistributedType dslots => Visit(context, target, dslots, kvCache),
@@ -41,7 +42,8 @@ public sealed class UpdatePagedAttentionKVCacheEvaluator : ITypeInferencer<Updat
     {
         var slots = context.GetArgumentValueAsTensor(target, UpdatePagedAttentionKVCache.Slots);
         var kvCaches = context.GetArgumentValue(target, UpdatePagedAttentionKVCache.KVCaches);
-        UpdateCache(slots, kvCaches.AsTensor().Cast<Reference<IPagedAttentionKVCache>>(), target.CacheKind, target.LayerId, target.Layout);
+        var layerId = checked((int)context.GetArgumentValue(target, UpdatePagedAttentionKVCache.LayerId).AsTensor().ToScalar<long>());
+        UpdateCache(slots, kvCaches.AsTensor().Cast<Reference<IPagedAttentionKVCache>>(), target.CacheKind, layerId, target.Layout);
         return kvCaches;
     }
 

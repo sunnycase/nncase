@@ -71,6 +71,10 @@ public abstract class Target : ITarget
     {
     }
 
+    public virtual void RegisterPackPropagationRules(IRulesAddable pass, CompileOptions options)
+    {
+    }
+
     public virtual void RegisterPostAutoVectorizePass(IPassManager passManager, CompileOptions options)
     {
     }

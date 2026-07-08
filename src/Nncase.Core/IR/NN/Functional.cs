@@ -179,7 +179,9 @@ public static class NN
 
     public static Call GetPositionIds(Dimension sequenceLength, Expr kvCache, IRArray<SBP> ndsbp, Placement placement) => new Call(new GetPositionIds(ndsbp, placement), sequenceLength, kvCache);
 
-    public static Expr UpdatePagedAttentionKVCache(Expr slots, Expr kvCaches, AttentionCacheKind cacheKind, int layerId, AttentionDimKind[] layout) => new Call(new UpdatePagedAttentionKVCache(cacheKind, layerId, layout), slots, kvCaches);
+    public static Expr UpdatePagedAttentionKVCache(Expr slots, Expr kvCaches, AttentionCacheKind cacheKind, int layerId, AttentionDimKind[] layout) => UpdatePagedAttentionKVCache(slots, kvCaches, new DimConst(layerId), cacheKind, layout);
+
+    public static Expr UpdatePagedAttentionKVCache(Expr slots, Expr kvCaches, Dimension layerId, AttentionCacheKind cacheKind, AttentionDimKind[] layout) => new Call(new UpdatePagedAttentionKVCache(cacheKind, layout), slots, kvCaches, layerId);
 
     public static Expr GatherPagedAttentionKVCache(Expr shardId, Expr kvCaches, int numBlocks) => new Call(new GatherPagedAttentionKVCache(numBlocks), shardId, kvCaches);
 
@@ -187,7 +189,9 @@ public static class NN
 
     public static Expr IdentityPagedAttentionKVCache(Expr input, Expr numSeqs, Expr numTokens, Expr contextLens, Expr seqLens, Expr blockTable, Expr slotMapping, Expr numBlocks, Expr kvCaches) => new Call(new IdentityPagedAttentionKVCache(), input, numSeqs, numTokens, contextLens, seqLens, blockTable, slotMapping, numBlocks, kvCaches);
 
-    public static Expr PagedAttention(Expr q, Expr kvCaches, Expr extra, Expr scale, int layerId, AttentionDimKind[] qlayout, int hiddenSize) => new Call(new PagedAttention(layerId, new IRArray<AttentionDimKind>(qlayout), hiddenSize), q, kvCaches, extra, scale);
+    public static Expr PagedAttention(Expr q, Expr kvCaches, Expr extra, Expr scale, int layerId, AttentionDimKind[] qlayout, int hiddenSize) => PagedAttention(q, kvCaches, extra, scale, new DimConst(layerId), qlayout, hiddenSize);
+
+    public static Expr PagedAttention(Expr q, Expr kvCaches, Expr extra, Expr scale, Dimension layerId, AttentionDimKind[] qlayout, int hiddenSize) => new Call(new PagedAttention(new IRArray<AttentionDimKind>(qlayout), hiddenSize), q, kvCaches, extra, scale, layerId);
 
     public static Expr Qwen3MoE(Expr q, Expr moeGateW, Expr moeExpertGateInputScale, Expr moeExpertGateProjW, Expr moeExpertGateProjScale, Expr moeExpertDownInputScale, Expr moeExpertDownProjW, Expr moeExpertDownProjScale, Expr moeExpertUpInputScale, Expr moeExpertUpProjW, Expr moeExpertUpProjScale, long layerId, long hiddenSize, long intermediateSize, long moeIntermediateSize, long numExpert, long numTopK, long isNormTopkProb) => new Call(new Qwen3MoE(layerId, hiddenSize, intermediateSize, moeIntermediateSize, numExpert, numTopK, isNormTopkProb), q, moeGateW, moeExpertGateInputScale, moeExpertGateProjW, moeExpertGateProjScale, moeExpertDownInputScale, moeExpertDownProjW, moeExpertDownProjScale, moeExpertUpInputScale, moeExpertUpProjW, moeExpertUpProjScale);
 

@@ -59,14 +59,14 @@ public sealed class TritonTargetOpCostModel : ITargetOpCostModel, IHierarchicalT
 
     public bool TryGetUnaryCost(UnaryOpCostQuery query, out Cost cost)
     {
-        if (!TryGetMaxScalarElementCount(query.Output, out var elements))
+        if (!TryGetMaxVectorElementCount(query.Output, out var elements))
         {
             cost = Cost.Zero;
             return false;
         }
 
         cost = ElementwiseCost(
-            EstimateElementwiseComputeCycles(elements, workPerElement: 1.0),
+            EstimateElementwiseComputeCycles(elements, CostUtility.GetCPUCyclesOfUnary(query.Op)),
             GetTensorByteCount(query.Input),
             GetTensorByteCount(query.Output));
         return true;
@@ -74,14 +74,14 @@ public sealed class TritonTargetOpCostModel : ITargetOpCostModel, IHierarchicalT
 
     public bool TryGetBinaryCost(BinaryOpCostQuery query, out Cost cost)
     {
-        if (!TryGetMaxScalarElementCount(query.Output, out var elements))
+        if (!TryGetMaxVectorElementCount(query.Output, out var elements))
         {
             cost = Cost.Zero;
             return false;
         }
 
         cost = ElementwiseCost(
-            EstimateElementwiseComputeCycles(elements, workPerElement: 1.0),
+            EstimateElementwiseComputeCycles(elements, CostUtility.GetCPUCyclesOfBinary(query.Op)),
             GetTensorByteCount(query.Lhs) + GetTensorByteCount(query.Rhs),
             GetTensorByteCount(query.Output));
         return true;
@@ -89,7 +89,7 @@ public sealed class TritonTargetOpCostModel : ITargetOpCostModel, IHierarchicalT
 
     public bool TryGetElementwiseCost(ElementwiseOpCostQuery query, out Cost cost)
     {
-        if (!TryGetMaxScalarElementCount(query.Output, out var elements))
+        if (!TryGetMaxVectorElementCount(query.Output, out var elements))
         {
             cost = Cost.Zero;
             return false;
@@ -312,6 +312,18 @@ public sealed class TritonTargetOpCostModel : ITargetOpCostModel, IHierarchicalT
         }
 
         shape = Array.Empty<long>();
+        return false;
+    }
+
+    private bool TryGetMaxVectorElementCount(TargetCostTensor tensor, out double elements)
+    {
+        if (TryGetMaxShape(tensor, out var shape))
+        {
+            elements = Product(shape);
+            return true;
+        }
+
+        elements = 0;
         return false;
     }
 

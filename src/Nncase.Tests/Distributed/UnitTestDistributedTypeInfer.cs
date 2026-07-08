@@ -240,6 +240,42 @@ public sealed class UnitTestDistributedTypeInfer : TestClassBase
     }
 
     [Fact]
+    public void TestPackRejectsSplitThatCutsRepeatedAxisVectorGroup()
+    {
+        var placement = new Placement(new[] { 4 }, "b", "b");
+        var input = new Var(
+            "input",
+            new DistributedType(
+                new TensorType(DataTypes.Float32, new long[] { 1, 128 }),
+                new SBP[] { SBP.B, SBP.S([0], 4) },
+                placement));
+
+        var packed = IR.F.Tensors.Pack(input, [2, 8], [1, 1]);
+
+        var invalid = Assert.IsType<InvalidType>(packed.CheckedType);
+        Assert.Contains("cuts vector lane group 16", invalid.Reason, System.StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void TestPackAndUnpackScaleRepeatedAxisSplitGranularityByLaneProduct()
+    {
+        var placement = new Placement(new[] { 4 }, "b", "b");
+        var inputType = new DistributedType(
+            new TensorType(DataTypes.Float32, new long[] { 1, 128 }),
+            new SBP[] { SBP.B, SBP.S([0], 32) },
+            placement);
+        var input = new Var("input", inputType);
+
+        var packed = IR.F.Tensors.Pack(input, [2, 8], [1, 1]);
+        var packedType = Assert.IsType<DistributedType>(packed.CheckedType);
+        Assert.Equal(new TensorType(new VectorType(DataTypes.Float32, [2, 8]), new long[] { 1, 8 }), packedType.TensorType);
+        Assert.Equal(new SBP[] { SBP.B, SBP.S([0], 2) }, packedType.AxisPolicies.ToArray());
+
+        var unpacked = IR.F.Tensors.Unpack(packed, [2, 8], [1, 1]);
+        Assert.Equal(inputType, unpacked.CheckedType);
+    }
+
+    [Fact]
     public void TestNormStatsProducesPartialAndNormApplyRequiresBroadcastStats()
     {
         var placement = new Placement(new[] { 4 }, "b", "b");

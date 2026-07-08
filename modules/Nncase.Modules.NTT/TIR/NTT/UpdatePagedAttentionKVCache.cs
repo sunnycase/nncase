@@ -10,6 +10,7 @@ using Nncase.IR;
 using Nncase.IR.Math;
 using Nncase.IR.NN;
 using Nncase.PatternMatch;
+using static Nncase.IR.TypePatternUtility;
 
 namespace Nncase.TIR.NTT;
 
@@ -19,9 +20,9 @@ public sealed partial class UpdatePagedAttentionKVCache : NTTKernelOp
 
     public static readonly ParameterInfo KVCaches = new(typeof(UpdatePagedAttentionKVCache), 1, "kvCaches");
 
-    public AttentionCacheKind CacheKind { get; }
+    public static readonly ParameterInfo LayerId = new(typeof(UpdatePagedAttentionKVCache), 2, "layerId", IsDimensionType());
 
-    public int LayerId { get; }
+    public AttentionCacheKind CacheKind { get; }
 
     public IRArray<AttentionDimKind> Layout { get; }
 }

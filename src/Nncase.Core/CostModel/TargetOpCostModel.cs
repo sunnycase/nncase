@@ -279,20 +279,47 @@ public sealed class DefaultTargetOpCostModel : ITargetOpCostModel, ITargetOpCost
 
     public bool TryGetUnaryCost(UnaryOpCostQuery query, out Cost cost)
     {
-        cost = Cost.Zero;
-        return false;
+        if (!TryGetMaxVectorElementCount(query.Output, out var elements))
+        {
+            cost = Cost.Zero;
+            return false;
+        }
+
+        cost = ElementwiseCost(
+            elements * CostUtility.GetCPUCyclesOfUnary(query.Op),
+            GetTensorByteCount(query.Input),
+            GetTensorByteCount(query.Output));
+        return true;
     }
 
     public bool TryGetBinaryCost(BinaryOpCostQuery query, out Cost cost)
     {
-        cost = Cost.Zero;
-        return false;
+        if (!TryGetMaxVectorElementCount(query.Output, out var elements))
+        {
+            cost = Cost.Zero;
+            return false;
+        }
+
+        cost = ElementwiseCost(
+            elements * CostUtility.GetCPUCyclesOfBinary(query.Op),
+            GetTensorByteCount(query.Lhs) + GetTensorByteCount(query.Rhs),
+            GetTensorByteCount(query.Output));
+        return true;
     }
 
     public bool TryGetElementwiseCost(ElementwiseOpCostQuery query, out Cost cost)
     {
-        cost = Cost.Zero;
-        return false;
+        if (!TryGetMaxVectorElementCount(query.Output, out var elements))
+        {
+            cost = Cost.Zero;
+            return false;
+        }
+
+        cost = ElementwiseCost(
+            elements * Math.Max(0.0, query.WorkPerElement),
+            query.Inputs.Sum(GetTensorByteCount),
+            GetTensorByteCount(query.Output));
+        return true;
     }
 
     public bool TryGetMatMulCost(MatMulOpCostQuery query, out Cost cost)
@@ -304,6 +331,74 @@ public sealed class DefaultTargetOpCostModel : ITargetOpCostModel, ITargetOpCost
     private static UInt128 GetFactor(Cost cost, string name)
     {
         return cost.Factors.TryGetValue(name, out var value) ? value : 0;
+    }
+
+    private static Cost ElementwiseCost(double cpuCycles, double blockLocalMemoryLoadBytes, double blockLocalMemoryStoreBytes)
+    {
+        var cost = new Cost();
+        AddCostFactor(cost, CostFactorNames.CPUCycles, cpuCycles);
+        AddCostFactor(cost, CostFactorNames.BlockLocalMemoryLoadBytes, blockLocalMemoryLoadBytes);
+        AddCostFactor(cost, CostFactorNames.BlockLocalMemoryStoreBytes, blockLocalMemoryStoreBytes);
+        return cost;
+    }
+
+    private static void AddCostFactor(Cost cost, string name, double value)
+    {
+        var factor = ToCostFactor(value);
+        if (factor > 0)
+        {
+            cost[name] = factor;
+        }
+    }
+
+    private static bool TryGetMaxVectorElementCount(TargetCostTensor tensor, out double elements)
+    {
+        if (TryGetMaxShape(tensor, out var shape))
+        {
+            elements = Product(shape);
+            return true;
+        }
+
+        elements = 0;
+        return false;
+    }
+
+    private static bool TryGetMaxShape(TargetCostTensor tensor, out long[] shape)
+    {
+        if (tensor.Shape is RankedShape && CompilerServices.TryGetMaxShape(tensor.Shape, out var maxShape))
+        {
+            shape = maxShape;
+            return true;
+        }
+
+        shape = Array.Empty<long>();
+        return false;
+    }
+
+    private static double GetTensorByteCount(TargetCostTensor tensor)
+    {
+        return TryGetMaxShape(tensor, out var shape) ? Product(shape) * tensor.DType.SizeInBytes : 0;
+    }
+
+    private static double Product(ReadOnlySpan<long> values)
+    {
+        var product = 1.0;
+        foreach (var value in values)
+        {
+            product *= Math.Max(0, value);
+        }
+
+        return product;
+    }
+
+    private static UInt128 ToCostFactor(double value)
+    {
+        if (!double.IsFinite(value) || value <= 0)
+        {
+            return 0;
+        }
+
+        return (UInt128)(ulong)Math.Ceiling(Math.Min(value, ulong.MaxValue));
     }
 
     private static UInt128 GetOtherCost(Cost cost)

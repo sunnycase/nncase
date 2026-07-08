@@ -10,6 +10,7 @@ using Nncase.IR;
 using Nncase.IR.Math;
 using Nncase.IR.NN;
 using Nncase.PatternMatch;
+using static Nncase.IR.TypePatternUtility;
 
 namespace Nncase.TIR.NTT;
 
@@ -23,9 +24,9 @@ public sealed partial class PagedAttention : NTTKernelOp
 
     public static readonly ParameterInfo Scale = new(typeof(PagedAttention), 3, "scale");
 
-    public static readonly ParameterInfo Output = new(typeof(PagedAttention), 4, "Output");
+    public static readonly ParameterInfo LayerId = new(typeof(PagedAttention), 4, "layerId", IsDimensionType());
 
-    public int LayerId { get; }
+    public static readonly ParameterInfo Output = new(typeof(PagedAttention), 5, "Output");
 
     public IRArray<AttentionDimKind> Layout { get; }
 

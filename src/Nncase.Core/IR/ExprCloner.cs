@@ -49,7 +49,7 @@ public partial class ExprCloner<TContext> : ExprVisitor<BaseExpr, IRType, TConte
         => (T)Visit(expr, context);
 
     public IVar Clone(IVar expr, TContext context)
-        => (IVar)Visit((Expr)expr, context);
+        => (IVar)Visit((BaseExpr)expr, context);
 
     public T CloneType<T>([MaybeNull] T type, TContext context)
         where T : IRType

@@ -143,8 +143,8 @@ cmake --preset conan-debug
 cmake --build build/Debug --config Debug
 cmake --install build/Debug --prefix install
 
-dotnet restore -r linux-x64
-dotnet build src/Nncase.Compiler/Nncase.Compiler.csproj -c Debug -r linux-x64 --no-restore
+dotnet restore
+dotnet build src/Nncase.Compiler/Nncase.Compiler.csproj -c Debug --no-restore
 
 cp install/lib/*.so install/
 ```
@@ -152,15 +152,14 @@ cp install/lib/*.so install/
 Always point Python tests at the installed native bridge and the compiler DLL
 from the `dotnet build` output. Publishing is not needed for the local test
 loop, and using `install/Nncase.Compiler.dll` can leave Python tests on stale
-managed assemblies after a compiler/codegen change. When `NNCASE_COMPILER`
-points at the `net8.0/linux-x64` RID output below, compiler changes must be
-built with `-r linux-x64`; a plain `dotnet build -c Debug` updates only the
-non-RID `net8.0` output and can leave pytest using an old compiler DLL.
+managed assemblies after a compiler/codegen change. Do not pass `-r` in the
+local restore/build/test loop; RID-specific restore rewrites many
+`packages.lock.json` files with local runtime sections.
 
 ```sh
 export PYTHONPATH="$PWD/install/lib:$PWD/install/python:$PWD/tests:${PYTHONPATH}"
 export LD_LIBRARY_PATH="$PWD/install/lib:${LD_LIBRARY_PATH}"
-export NNCASE_COMPILER="$PWD/src/Nncase.Compiler/bin/Debug/net8.0/linux-x64/Nncase.Compiler.dll"
+export NNCASE_COMPILER="$PWD/src/Nncase.Compiler/bin/Debug/net8.0/Nncase.Compiler.dll"
 export NNCASE_TILING_MAX_SOLUTIONS=1
 
 python - <<'PY'
@@ -190,7 +189,7 @@ pytest tests/importer/onnx_/basic/test_identity.py::test_identity \
 ```
 
 If `nncase.check_target("pyntt")` is false, first check that
-`src/Nncase.Compiler/bin/Debug/net8.0/linux-x64/Nncase.Compiler.dll`, the
+`src/Nncase.Compiler/bin/Debug/net8.0/Nncase.Compiler.dll`, the
 managed assemblies in that same build directory, and `install/lib/_nncase*.so`
 came from the same build loop. `Nncase.Modules.NTT.dll` is a built-in module
 loaded through `AddNTT()`, and `NNCASE_PLUGIN_PATH` will not load it as an
@@ -290,13 +289,13 @@ or target runtime builds, check the matching workflow and
 Install the native components to `install/` first, then run:
 
 ```sh
-dotnet restore -r linux-x64
+dotnet restore
 dotnet build -c Release --no-restore
-dotnet publish src/Nncase.Compiler -c Release --no-restore --sc false -r linux-x64
-dotnet publish src/Nncase.Studio -c Release --no-restore --sc false -r linux-x64
+dotnet publish src/Nncase.Compiler -c Release --no-restore --sc false
+dotnet publish src/Nncase.Studio -c Release --no-restore --sc false
 ```
 
-Use `osx-arm64` as the RID for macOS arm64 and `win-x64` for Windows x64.
+Use the CI workflow directly for RID-specific release packaging.
 
 ### Build Runtime and Run NTT Tests
 
@@ -331,7 +330,7 @@ python -m pip install -r requirements.test.txt
 
 export PYTHONPATH="$PWD/install/lib:$PWD/install/python:$PWD/tests:${PYTHONPATH}"
 export LD_LIBRARY_PATH="$PWD/install/lib:${LD_LIBRARY_PATH}"
-export NNCASE_COMPILER="$PWD/src/Nncase.Compiler/bin/Debug/net8.0/linux-x64/Nncase.Compiler.dll"
+export NNCASE_COMPILER="$PWD/src/Nncase.Compiler/bin/Debug/net8.0/Nncase.Compiler.dll"
 export NNCASE_TILING_MAX_SOLUTIONS=1
 
 pytest tests/other/ --doctest-modules

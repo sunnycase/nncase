@@ -696,13 +696,13 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
                     IndentScope.Writer.Write($"constant_of_shape({VisitBuffer(args[0], local: true).Name}, {VisitBuffer(args[1], local: true).Name}, {VisitBuffer(args[2], local: true).Name});\n");
                     break;
                 case TIR.NTT.UpdatePagedAttentionKVCache updatePagedAttentionKVCache:
-                    WriteIndWithProfiler($"update_paged_attention_kv_cache<caching::attention_cache_kind::{updatePagedAttentionKVCache.CacheKind.ToString().ToLower(System.Globalization.CultureInfo.CurrentCulture)}>({VisitBuffer(args[0], local: false).Name}, {VisitBuffer(args[1], local: true).Name}, {updatePagedAttentionKVCache.LayerId}, {updatePagedAttentionKVCache.Layout.ToC()});\n");
+                    WriteIndWithProfiler($"update_paged_attention_kv_cache<caching::attention_cache_kind::{updatePagedAttentionKVCache.CacheKind.ToString().ToLower(System.Globalization.CultureInfo.CurrentCulture)}>({VisitBuffer(args[0], local: false).Name}, {VisitBuffer(args[1], local: true).Name}, {Visit(args[2]).Name}, {updatePagedAttentionKVCache.Layout.ToC()});\n");
                     break;
                 case TIR.NTT.GatherPagedAttentionKVCache gakv:
                     IndentScope.Writer.IndWrite($"gather_paged_attention_kv_cache({VisitBuffer(args[0], local: false).Name}, {VisitBuffer(args[1], local: true).Name}, {VisitBuffer(args[2], local: true).Name});\n");
                     break;
                 case TIR.NTT.PagedAttention pagedAttention:
-                    WriteIndWithProfiler($"paged_attention({VisitBuffer(args[0], local: false).Name}, {VisitBuffer(args[1], local: true).Name}, {VisitBuffer(args[2], local: true).Name}, {VisitBuffer(args[3], local: true).Name}, {pagedAttention.LayerId}, {VisitBuffer(args[4], local: true).Name}, {pagedAttention.Layout.ToC()});\n");
+                    WriteIndWithProfiler($"paged_attention({VisitBuffer(args[0], local: false).Name}, {VisitBuffer(args[1], local: true).Name}, {VisitBuffer(args[2], local: true).Name}, {VisitBuffer(args[3], local: true).Name}, {Visit(args[4]).Name}, {VisitBuffer(args[5], local: true).Name}, {pagedAttention.Layout.ToC()});\n");
                     break;
                 case TIR.NTT.SynchronizeThreads:
                     WriteIndWithProfiler($"ntt::distributed::topology_synchronize<ntt::distributed::topology::block>();\n");
@@ -994,6 +994,23 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
         }
 
         return symbol;
+    }
+
+    private string VisitScalarTensor(BaseExpr expr)
+    {
+        var tensorType = expr.CheckedType switch
+        {
+            TensorType tt => tt,
+            DistributedType dt => dt.TensorType,
+            _ => throw new NotSupportedException($"NTT codegen expects scalar tensor argument, got {expr.CheckedType}."),
+        };
+
+        if (!tensorType.Shape.IsScalar)
+        {
+            throw new NotSupportedException($"NTT codegen expects scalar tensor argument, got shape {tensorType.Shape}.");
+        }
+
+        return $"{VisitBuffer(expr, local: true).Name}()";
     }
 
     private static void ValidateQKVParallelLinearScales(IReadOnlyList<BaseExpr> args)

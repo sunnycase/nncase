@@ -15,7 +15,7 @@ using Nncase.Utilities;
 
 namespace Nncase.Passes.Distributed;
 
-public sealed partial class AutoDistributedWithShapeBucketPass : FunctionPass
+public sealed partial class AutoDistributedWithShapeBucketPass : ModulePass
 {
     private const int LargeTensorSizeThreshold = 1000; // Threshold for large tensors in bytes
 
@@ -34,9 +34,9 @@ public sealed partial class AutoDistributedWithShapeBucketPass : FunctionPass
         _moduleKind = moduleKind;
     }
 
-    protected override Task<BaseFunction> RunCoreAsync(BaseFunction input, RunPassContext context)
+    protected override Task<IRModule> RunCoreAsync(IRModule input, RunPassContext context)
     {
-        if (input is not Function function || input.Metadata is AutoDistributedMetaData { Skip: true })
+        if (input.Entry is not Function function || function.Metadata is AutoDistributedMetaData { Skip: true })
         {
             return Task.FromResult(input);
         }
@@ -44,10 +44,23 @@ public sealed partial class AutoDistributedWithShapeBucketPass : FunctionPass
         if (_compileOptions.TargetOptions is INTTTargetOptions targetOptions)
         {
             var newFunction = Distribute(function, targetOptions);
-            return Task.FromResult((BaseFunction)newFunction);
+            input.Replace(GetFunctionIndex(input, function), newFunction);
         }
 
         return Task.FromResult(input);
+    }
+
+    private static int GetFunctionIndex(IRModule module, BaseFunction function)
+    {
+        for (int i = 0; i < module.Functions.Count; i++)
+        {
+            if (ReferenceEquals(module.Functions[i], function))
+            {
+                return i;
+            }
+        }
+
+        throw new InvalidOperationException($"Function {function.Name} is not in the current module.");
     }
 
     private static void ValidateSegmentFunction(Function inputFunction, Function sourceSegmentFunction, Function segmentFunction, IReadOnlySet<BaseFunction> forbiddenFunctions)
@@ -78,19 +91,17 @@ public sealed partial class AutoDistributedWithShapeBucketPass : FunctionPass
         var segmentsCount = GetShapeBucketSegmentsCount();
         if (segmentsCount == 0 || dimVars.Count == 0)
         {
-            // If no segments or no dynamic dim vars, we can skip the shape bucket pass
-            var rewriter = new AutoDistributedRewriter(_compileOptions, targetOptions, AutoDistributedPhase.Final, _moduleKind, _bidirectional);
-            return rewriter.Rewrite(function);
+            // If no segments or no dynamic dim vars, distribute the entry-reachable
+            // function graph as a single segment instead of running per-function
+            // independently through the pass manager.
+            return DistributeFunctionGraph(function, targetOptions, AutoDistributedPhase.Final);
         }
         else
         {
             var functionForSegments = function;
             if (!AutoDistributedRewriter.SupportsConstShardedView(targetOptions))
             {
-                var rewriter = new AutoDistributedRewriter(_compileOptions, targetOptions, AutoDistributedPhase.SearchConstant, _moduleKind, _bidirectional);
-                rewriter.Rewrite(function);
-
-                var distributedConsts = rewriter.DistributedConsts;
+                var distributedConsts = SearchDistributedConstants(function, targetOptions);
                 functionForSegments = (Function)new DistributeConstCloner(distributedConsts).Clone(function, Unit.Default);
 
                 var dumpper = DumpScope.Current;
@@ -109,23 +120,21 @@ public sealed partial class AutoDistributedWithShapeBucketPass : FunctionPass
                                   select new KeyValuePair<DimVar, DimVar>(
                                       dimVar,
                                       dimVar.With(range: newRange))).ToDictionary(kvp => kvp.Key, kvp => kvp.Value, (IEqualityComparer<DimVar>)ReferenceEqualityComparer.Instance);
-                var segmentFunction = new SegmentFunctionCloner(newDimVars).Clone(functionForSegments, Unit.Default)
-                    .With(name: $"{function.Name}_segment_{segmentIndex}");
+                var segmentFunction = (Function)new SegmentFunctionCloner(newDimVars, $"_segment_{segmentIndex}").Clone(functionForSegments, Unit.Default);
                 segmentStates[segmentIndex] = new SegmentAutoDistributedState(
                     segmentFunction,
-                    newDimVars,
-                    new AutoDistributedRewriter(_compileOptions, targetOptions, AutoDistributedPhase.Final, _moduleKind, _bidirectional));
+                    newDimVars);
             }
 
-            BuildSegmentSearchGraphs(segmentStates);
-
             var segmentFunctions = new List<(Function SegmentFunction, Dictionary<DimVar, DimVar> DimVars)>(segmentStates.Length);
-            var sourceSegmentFunctions = segmentStates.Select(state => (BaseFunction)state.SegmentFunction).ToHashSet((IEqualityComparer<BaseFunction>)ReferenceEqualityComparer.Instance);
+            var forbiddenFunctions = GetReachableBaseFunctions(functionForSegments)
+                .Concat(segmentStates.SelectMany(state => GetReachableBaseFunctions(state.SegmentFunction)))
+                .ToHashSet((IEqualityComparer<BaseFunction>)ReferenceEqualityComparer.Instance);
             foreach (var segmentState in segmentStates)
             {
                 using var segmentDumpScope = new DumpScope(segmentState.SegmentFunction.Name);
-                var rewritten = segmentState.Rewriter.SolveAndExtract(segmentState.SegmentFunction, segmentState.Root);
-                ValidateSegmentFunction(function, segmentState.SegmentFunction, rewritten, sourceSegmentFunctions);
+                var rewritten = DistributeFunctionGraph(segmentState.SegmentFunction, targetOptions, AutoDistributedPhase.Final);
+                ValidateSegmentFunction(function, segmentState.SegmentFunction, rewritten, forbiddenFunctions);
                 segmentFunctions.Add((rewritten, segmentState.DimVars));
             }
 
@@ -206,6 +215,115 @@ public sealed partial class AutoDistributedWithShapeBucketPass : FunctionPass
         }
     }
 
+    private Dictionary<TensorConst, TensorConst> SearchDistributedConstants(Function function, INTTTargetOptions targetOptions)
+    {
+        var distributedConsts = new Dictionary<TensorConst, TensorConst>(ReferenceEqualityComparer.Instance);
+        foreach (var reachableFunction in GetReachableFunctionsInCalleeFirstOrder(function))
+        {
+            var rewriter = new AutoDistributedRewriter(_compileOptions, targetOptions, AutoDistributedPhase.SearchConstant, _moduleKind, _bidirectional);
+            using var functionDumpScope = new DumpScope(reachableFunction.Name);
+            _ = rewriter.Rewrite(reachableFunction);
+            foreach (var (source, distributed) in rewriter.DistributedConsts)
+            {
+                distributedConsts[source] = distributed;
+            }
+        }
+
+        return distributedConsts;
+    }
+
+    private Function DistributeFunctionGraph(Function rootFunction, INTTTargetOptions targetOptions, AutoDistributedPhase phase)
+    {
+        var root = rootFunction;
+        foreach (var function in GetReachableFunctionsInCalleeFirstOrder(rootFunction))
+        {
+            var rewriter = new AutoDistributedRewriter(_compileOptions, targetOptions, phase, _moduleKind, _bidirectional);
+            using var functionDumpScope = new DumpScope(function.Name);
+            var rewritten = rewriter.Rewrite(function);
+            if (!CompilerServices.InferenceType(rewritten) || rewritten.CheckedType is InvalidType)
+            {
+                var dumpScope = DumpScope.Current;
+                if (dumpScope.IsEnabled(DumpFlags.PassIR))
+                {
+                    dumpScope.DumpIR(rewritten, "InvalidDistributedFunction");
+                }
+
+                throw new InvalidOperationException($"AutoDistributed function {rewritten.Name} produced invalid type: {rewritten.CheckedType}.");
+            }
+
+            function.ReplaceAllUsesWith(rewritten);
+            if (ReferenceEquals(function, root))
+            {
+                root = rewritten;
+            }
+        }
+
+        ValidateShapeBucketFunctionGraph(root);
+        return root;
+    }
+
+    private IReadOnlyList<Function> GetReachableFunctionsInCalleeFirstOrder(BaseFunction root)
+    {
+        var result = new List<Function>();
+        var visited = new HashSet<BaseFunction>(ReferenceEqualityComparer.Instance);
+        var active = new HashSet<BaseFunction>(ReferenceEqualityComparer.Instance);
+        var path = new List<BaseFunction>();
+
+        void Visit(BaseFunction function)
+        {
+            if (active.Contains(function))
+            {
+                var cycleStart = path.FindIndex(item => ReferenceEquals(item, function));
+                var cycle = path.Skip(cycleStart).Append(function).Select(item => item.Name);
+                throw new InvalidOperationException($"Function reference graph contains a cycle: {string.Join(" -> ", cycle)}.");
+            }
+
+            if (!visited.Add(function))
+            {
+                return;
+            }
+
+            active.Add(function);
+            path.Add(function);
+            foreach (var referencedFunction in FunctionReferenceValidator.GetDirectFunctionReferences(function))
+            {
+                Visit(referencedFunction);
+            }
+
+            path.RemoveAt(path.Count - 1);
+            active.Remove(function);
+
+            if (function is Function highLevelFunction)
+            {
+                result.Add(highLevelFunction);
+            }
+        }
+
+        Visit(root);
+        return result;
+    }
+
+    private IReadOnlySet<BaseFunction> GetReachableBaseFunctions(BaseFunction root)
+    {
+        var result = new HashSet<BaseFunction>(ReferenceEqualityComparer.Instance);
+
+        void Visit(BaseFunction function)
+        {
+            if (!result.Add(function))
+            {
+                return;
+            }
+
+            foreach (var referencedFunction in FunctionReferenceValidator.GetDirectFunctionReferences(function))
+            {
+                Visit(referencedFunction);
+            }
+        }
+
+        Visit(root);
+        return result;
+    }
+
     private BaseFunction WrapShapeBucketFunction(Function inputFunction, PrimFunction primFunction)
     {
         var callers = inputFunction.Users.Where(x => x is Call or FunctionWrapper).ToArray();
@@ -217,54 +335,10 @@ public sealed partial class AutoDistributedWithShapeBucketPass : FunctionPass
         return new PrimFunctionWrapper(inputFunction.Name, primFunction, inputFunction.Parameters.Length);
     }
 
-    private void BuildSegmentSearchGraphs(IReadOnlyList<SegmentAutoDistributedState> segmentStates)
-    {
-        var parallelism = GetSegmentGraphBuildParallelism(segmentStates.Count);
-        if (parallelism <= 1)
-        {
-            for (int i = 0; i < segmentStates.Count; i++)
-            {
-                BuildSegmentSearchGraph(segmentStates[i]);
-            }
-
-            return;
-        }
-
-        Parallel.For(
-            0,
-            segmentStates.Count,
-            new ParallelOptions { MaxDegreeOfParallelism = parallelism },
-            index => BuildSegmentSearchGraph(segmentStates[index]));
-    }
-
-    private void BuildSegmentSearchGraph(SegmentAutoDistributedState segmentState)
-    {
-        using var segmentDumpScope = new DumpScope(segmentState.SegmentFunction.Name);
-        segmentState.Root = segmentState.Rewriter.BuildSearchGraph(segmentState.SegmentFunction);
-    }
-
-    private int GetSegmentGraphBuildParallelism(int segmentsCount)
-    {
-        if (segmentsCount <= 1)
-        {
-            return 1;
-        }
-
-        var parallelism = Math.Min(segmentsCount, Math.Max(1, Environment.ProcessorCount / 2));
-        if (Environment.GetEnvironmentVariable("NNCASE_AUTO_DIST_SEGMENT_GRAPH_BUILD_PARALLELISM") is { } value
-            && int.TryParse(value, out var configured)
-            && configured > 0)
-        {
-            parallelism = Math.Min(segmentsCount, configured);
-        }
-
-        return parallelism;
-    }
-
     private PrimFunction BuildMainFunction(Function inputFunction, List<(Function SegmentFunction, Dictionary<DimVar, DimVar> DimVars)> segmentFunctions)
     {
         var outputBuffers = CreateOutputBufferVars(inputFunction.Body);
-        var inputParams = inputFunction.Parameters.AsValueEnumerable().Select(x => (Expr)x).ToArray().Concat(outputBuffers).ToArray();
+        var inputParams = inputFunction.Parameters.AsValueEnumerable().Select(x => (BaseExpr)x).ToArray().Concat<BaseExpr>(outputBuffers).ToArray();
         TIR.Sequential MakeSegementCall(Function segmentFunction)
         {
             return T.Sequential()
@@ -313,21 +387,15 @@ public sealed partial class AutoDistributedWithShapeBucketPass : FunctionPass
     {
         public SegmentAutoDistributedState(
             Function segmentFunction,
-            Dictionary<DimVar, DimVar> dimVars,
-            AutoDistributedRewriter rewriter)
+            Dictionary<DimVar, DimVar> dimVars)
         {
             SegmentFunction = segmentFunction;
             DimVars = dimVars;
-            Rewriter = rewriter;
         }
 
         public Function SegmentFunction { get; }
 
         public Dictionary<DimVar, DimVar> DimVars { get; }
-
-        public AutoDistributedRewriter Rewriter { get; }
-
-        public DistributedSearchGraph Root { get; set; } = null!;
     }
 
     private sealed class DistributeConstCloner : ExprCloner<Unit>
@@ -335,9 +403,9 @@ public sealed partial class AutoDistributedWithShapeBucketPass : FunctionPass
         private readonly IReadOnlyDictionary<TensorConst, TensorConst> _distributedConsts;
 
         public DistributeConstCloner(IReadOnlyDictionary<TensorConst, TensorConst> distributedConsts)
+            : base(cloneOtherFunctions: true)
         {
             _distributedConsts = distributedConsts;
-            CloneUnmutated = false;
         }
 
         protected override BaseExpr VisitLeafTensorConst(TensorConst expr, Unit context)
@@ -356,11 +424,19 @@ public sealed partial class AutoDistributedWithShapeBucketPass : FunctionPass
     private sealed class SegmentFunctionCloner : ExprCloner<Unit>
     {
         private readonly IReadOnlyDictionary<DimVar, DimVar> _newDimVars;
+        private readonly string _nameSuffix;
 
-        public SegmentFunctionCloner(IReadOnlyDictionary<DimVar, DimVar> newDimVars)
+        public SegmentFunctionCloner(IReadOnlyDictionary<DimVar, DimVar> newDimVars, string nameSuffix)
+            : base(cloneOtherFunctions: true)
         {
             _newDimVars = newDimVars;
-            CloneUnmutated = false;
+            _nameSuffix = nameSuffix;
+        }
+
+        protected override BaseExpr VisitLeafFunction(Function expr, Unit context)
+        {
+            var cloned = (Function)base.VisitLeafFunction(expr, context);
+            return cloned.With(name: $"{expr.Name}{_nameSuffix}");
         }
 
         protected override BaseExpr VisitLeafVar(Var expr, Unit context)

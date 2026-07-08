@@ -81,7 +81,7 @@ public sealed class Function : BaseFunction
     /// <summary>
     /// Gets get all parameter checked types.
     /// </summary>
-    public override IEnumerable<IRType> ParameterTypes => Parameters.AsValueEnumerable().Select(x => ((Expr)x).CheckedType).ToArray();
+    public override IEnumerable<IRType> ParameterTypes => Parameters.AsValueEnumerable().Select(x => ((BaseExpr)x).CheckedType).ToArray();
 
     /// <inheritdoc/>
     public override TExprResult Accept<TExprResult, TTypeResult, TContext>(ExprFunctor<TExprResult, TTypeResult, TContext> functor, TContext context)

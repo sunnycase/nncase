@@ -19,6 +19,43 @@ namespace Nncase.Evaluator.Tensors;
 
 public sealed class PackEvaluator : ITypeInferencer<Pack>, ICostEvaluator<Pack>, IEvaluator<Pack>
 {
+    private static Dictionary<int, int> GetAxisLaneProducts(IRArray<int> lanes, IRArray<int> axes)
+    {
+        var products = new Dictionary<int, int>();
+        for (int i = 0; i < axes.Count; i++)
+        {
+            products[axes[i]] = products.TryGetValue(axes[i], out var product)
+                ? checked(product * lanes[i])
+                : lanes[i];
+        }
+
+        return products;
+    }
+
+    private static bool TryDivideSplitGranularity(Dimension dim, SBPSplit split, Placement placement, int laneProduct, out Dimension? dividedGranularity)
+    {
+        dividedGranularity = null;
+        if (split.Granularity is { } granularity)
+        {
+            if (!Dimension.TryDivExactly(granularity, laneProduct, out var divided))
+            {
+                return false;
+            }
+
+            dividedGranularity = divided;
+            return true;
+        }
+
+        var divisor = split.Axes.Select(axis => placement.Hierarchy[axis]).Aggregate(1, (a, b) => a * b);
+        if (!dim.IsFixed)
+        {
+            return false;
+        }
+
+        var localDim = (Dimension)MathUtility.CeilDiv(dim.FixedValue, divisor);
+        return Dimension.TryDivExactly(localDim, laneProduct, out _);
+    }
+
     /// <inheritdoc/>
     public IValue Visit(IEvaluateContext context, Pack target)
     {
@@ -87,6 +124,16 @@ public sealed class PackEvaluator : ITypeInferencer<Pack>, ICostEvaluator<Pack>,
 
     private IRType Visit(ITypeInferenceContext context, Pack target, TensorType input)
     {
+        if (target.Lanes.Count != target.Axes.Count)
+        {
+            return new InvalidType("pack lanes and axes must have the same length");
+        }
+
+        if (target.Lanes.Any(lane => lane <= 0))
+        {
+            return new InvalidType("pack lane <= 0");
+        }
+
         return TypeInference.PackType(input, target.Lanes, target.Axes);
     }
 
@@ -97,28 +144,19 @@ public sealed class PackEvaluator : ITypeInferencer<Pack>, ICostEvaluator<Pack>,
             throw new InvalidOperationException();
         }
 
-        var divisor = Enumerable.Repeat(1, input.TensorType.Shape.Rank).ToList();
-        for (int i = 0; i < divisor.Count; i++)
-        {
-            if (input.AxisPolicies[i] is SBPSplit split)
-            {
-                divisor[i] *= split.Axes.Select(s => input.Placement.Hierarchy[s]).Aggregate(1, (a, b) => a * b);
-            }
-        }
-
+        var axisLaneProducts = GetAxisLaneProducts(target.Lanes, target.Axes);
         var ndsbp = new SBP[input.TensorType.Shape.Rank];
         for (int i = 0; i < input.TensorType.Shape.Rank; i++)
         {
-            if (input.AxisPolicies[i] is SBPSplit split && target.Axes.Contains(i))
+            if (input.AxisPolicies[i] is SBPSplit split && axisLaneProducts.TryGetValue(i, out var laneProduct))
             {
-                var lane = target.Lanes[target.Axes.IndexOf(i)];
-                if (input.TensorType.Shape[i] is { IsFixed: true, FixedValue: long s } && s / lane % divisor[i] == 0)
+                if (TryDivideSplitGranularity(input.TensorType.Shape[i], split, input.Placement, laneProduct, out var granularity))
                 {
-                    ndsbp[i] = SBP.S(split.Axes, split.Granularity is not null ? split.Granularity / lane : null);
+                    ndsbp[i] = SBP.S(split.Axes, granularity);
                 }
                 else
                 {
-                    return new InvalidType($"{input}, not support");
+                    return new InvalidType($"{input}, pack axis {i} split cuts vector lane group {laneProduct}");
                 }
             }
             else

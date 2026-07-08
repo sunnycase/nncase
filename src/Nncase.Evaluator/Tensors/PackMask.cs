@@ -19,6 +19,30 @@ namespace Nncase.Evaluator.Tensors;
 
 public sealed class VectorizeMaskEvaluator : ITypeInferencer<VectorizeMask>, ICostEvaluator<VectorizeMask>, IEvaluator<VectorizeMask>
 {
+    private static bool TryDivideSplitGranularity(Dimension dim, SBPSplit split, Placement placement, int laneProduct, out Dimension? dividedGranularity)
+    {
+        dividedGranularity = null;
+        if (split.Granularity is { } granularity)
+        {
+            if (!Dimension.TryDivExactly(granularity, laneProduct, out var divided))
+            {
+                return false;
+            }
+
+            dividedGranularity = divided;
+            return true;
+        }
+
+        var divisor = split.Axes.Select(axis => placement.Hierarchy[axis]).Aggregate(1, (a, b) => a * b);
+        if (!dim.IsFixed)
+        {
+            return false;
+        }
+
+        var localDim = (Dimension)MathUtility.CeilDiv(dim.FixedValue, divisor);
+        return Dimension.TryDivExactly(localDim, laneProduct, out _);
+    }
+
     /// <inheritdoc/>
     public IValue Visit(IEvaluateContext context, VectorizeMask target)
     {
@@ -65,6 +89,11 @@ public sealed class VectorizeMaskEvaluator : ITypeInferencer<VectorizeMask>, ICo
 
     private IRType Visit(ITypeInferenceContext context, VectorizeMask target, TensorType input)
     {
+        if (target.Lanes <= 0)
+        {
+            return new InvalidType("vectorize mask lane <= 0");
+        }
+
         return TypeInference.VectorizeMaskType(input, target.Style, target.ElementBits, target.Lanes, target.Axis);
     }
 
@@ -75,28 +104,18 @@ public sealed class VectorizeMaskEvaluator : ITypeInferencer<VectorizeMask>, ICo
             throw new InvalidOperationException();
         }
 
-        var divisor = Enumerable.Repeat(1, input.TensorType.Shape.Rank).ToList();
-        for (int i = 0; i < divisor.Count; i++)
-        {
-            if (input.AxisPolicies[i] is SBPSplit split)
-            {
-                divisor[i] *= split.Axes.Select(s => input.Placement.Hierarchy[s]).Aggregate(1, (a, b) => a * b);
-            }
-        }
-
         var ndsbp = new SBP[input.TensorType.Shape.Rank];
         for (int i = 0; i < input.TensorType.Shape.Rank; i++)
         {
-            if (input.AxisPolicies[i] is SBPSplit && target.Axis == i)
+            if (input.AxisPolicies[i] is SBPSplit split && target.Axis == i)
             {
-                var lane = target.Lanes;
-                if (input.TensorType.Shape[i] is { IsFixed: true, FixedValue: long s } && s / lane % divisor[i] == 0)
+                if (TryDivideSplitGranularity(input.TensorType.Shape[i], split, input.Placement, target.Lanes, out var granularity))
                 {
-                    ndsbp[i] = input.AxisPolicies[i];
+                    ndsbp[i] = SBP.S(split.Axes, granularity);
                 }
                 else
                 {
-                    return new InvalidType($"{input}, not support");
+                    return new InvalidType($"{input}, vectorize mask axis {i} split cuts vector lane group {target.Lanes}");
                 }
             }
             else

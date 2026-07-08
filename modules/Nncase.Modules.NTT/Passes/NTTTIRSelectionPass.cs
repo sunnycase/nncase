@@ -260,7 +260,7 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
                 return GenerateReshape((Expr)arguments[0], ref output);
             case IR.NN.UpdatePagedAttentionKVCache upkv:
                 output = (Expr)arguments[1];
-                return TIR.F.NTT.UpdatePagedAttentionKVCache((Expr)arguments[0], (Expr)arguments[1], upkv.CacheKind, upkv.LayerId, upkv.Layout);
+                return TIR.F.NTT.UpdatePagedAttentionKVCache((Expr)arguments[0], (Expr)arguments[1], (Dimension)arguments[2], upkv.CacheKind, upkv.Layout);
             case IR.NN.GatherPagedAttentionKVCache gakv:
                 return TIR.F.NTT.GatherPagedAttentionKVCache((Expr)arguments[0], (Expr)arguments[1], output);
             case IR.NN.CreatePagedAttentionKVCache ctkv:
@@ -269,7 +269,7 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
                 output = (Expr)arguments[0];
                 return TIR.F.NTT.IdentityPagedAttentionKVCache((Expr)arguments[0], (Expr)arguments[1], (Expr)arguments[2], (Expr)arguments[3], (Expr)arguments[4], (Expr)arguments[5], (Expr)arguments[6], (Expr)arguments[7], (Expr)arguments[8]);
             case IR.NN.PagedAttention pgat:
-                return TIR.F.NTT.PagedAttention((Expr)arguments[0], (Expr)arguments[1], (Expr)arguments[2], (Expr)arguments[3], pgat.LayerId, output, pgat.Layout, pgat.HiddenSize);
+                return TIR.F.NTT.PagedAttention((Expr)arguments[0], (Expr)arguments[1], (Expr)arguments[2], (Expr)arguments[3], (Dimension)arguments[4], output, pgat.Layout, pgat.HiddenSize);
             case IR.Tensors.ConstantOfShape constantOfShape:
                 return TIR.F.NTT.ConstantOfShape((Shape)arguments[0], (Expr)arguments[1], output);
             case IR.Tensors.Range range:

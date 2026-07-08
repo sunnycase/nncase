@@ -16,6 +16,8 @@ namespace Nncase.CodeGen.PyNTT;
 
 internal sealed class PyNTTLinkableModule : ILinkableModule
 {
+    private static readonly Regex AbiViewStrideArgRegex = new(@"^(?<kind>input|output)(?<index>\d+)_(?<scalar>scalar_)?stride(?<axis>\d+)$", RegexOptions.Compiled | RegexOptions.CultureInvariant);
+
     private readonly string _moduleKind;
     private readonly IReadOnlyList<PyNTTLinkableFunction> _functions;
     private readonly CompileOptions _compileOptions;
@@ -36,8 +38,9 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
         var outputDirectory = ResolveOutputDirectory();
         WriteGeneratedModel(outputDirectory, metadataJson, kernelParamsJson);
 
-        var linkedFunctions = _functions.Select(function =>
-            new LinkedFunction(function.Id, function.SourceFunction, 0, 0, function.Sections)).ToArray();
+        var linkedFunctions = _functions
+            .Select(function => (ILinkedFunction)new PyNTTLinkedFunctionSignature(function))
+            .ToArray();
         var metadataSection = new LinkedSection(ToStream(metadataJson), ".pyntt", 0, 8, (ulong)Encoding.UTF8.GetByteCount(metadataJson));
         return new PyNTTLinkedModule(_moduleKind, linkedFunctions, new[] { metadataSection });
     }
@@ -67,7 +70,14 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
         }
 
         return GetParameters(function)
-            .Where(parameter => IsTensorType(((Expr)parameter).CheckedType))
+            .Where(parameter => IsTensorType(((BaseExpr)parameter).CheckedType))
+            .ToArray();
+    }
+
+    private static IVar[] GetInputTensorParameters(BaseFunction function)
+    {
+        return GetInputParameters(function)
+            .Where(parameter => IsTensorType(((BaseExpr)parameter).CheckedType))
             .ToArray();
     }
 
@@ -84,8 +94,8 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
     private static TensorSpecMetadata[] GetInputTensorSpecs(BaseFunction function, int generatedKernelCount)
     {
         var device = generatedKernelCount > 0 ? "cuda" : "any";
-        return GetInputParameters(function)
-            .Select(parameter => BuildTensorSpec(parameter.Name, parameter.CheckedType, "input", device))
+        return GetInputTensorParameters(function)
+            .Select(parameter => BuildTensorSpec(parameter.Name, ((BaseExpr)parameter).CheckedType, "input", device))
             .ToArray();
     }
 
@@ -190,7 +200,10 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
 
     private static long GetBufferOffsetBytes(TIR.Buffer buffer)
     {
-        return checked(GetFixedDimension(buffer.MemSpan.Buffer.Start, $"{buffer.Name} physical buffer offset") +
+        var physicalOffset = buffer.MemSpan.Buffer.Location is MemoryLocation.Input or MemoryLocation.Output
+            ? 0L
+            : GetFixedDimension(buffer.MemSpan.Buffer.Start, $"{buffer.Name} physical buffer offset");
+        return checked(physicalOffset +
             GetFixedDimension(buffer.MemSpan.Start, $"{buffer.Name} memspan offset"));
     }
 
@@ -318,6 +331,42 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
 
     private static MemoryStream ToStream(string content) => new(Encoding.UTF8.GetBytes(content));
 
+    private static IRType ToSerializedType(IRType type)
+    {
+        return type switch
+        {
+            DistributedType distributedType => ToSerializedType(distributedType.TensorType),
+            TupleType tupleType => new TupleType(tupleType.Fields.Select(ToSerializedType).ToArray()),
+            _ => type,
+        };
+    }
+
+    private sealed class PyNTTLinkedFunctionSignature : ILinkedFunction
+    {
+        public PyNTTLinkedFunctionSignature(PyNTTLinkableFunction function)
+        {
+            Id = function.Id;
+            var callableType = (CallableType)function.SourceFunction.CheckedType;
+            ParameterTypes = callableType.Parameters.Select(ToSerializedType).ToArray();
+            ReturnType = ToSerializedType(callableType.ReturnType);
+            TextBegin = 0;
+            TextLength = 0;
+            Sections = function.Sections;
+        }
+
+        public uint Id { get; }
+
+        public IReadOnlyList<IRType> ParameterTypes { get; }
+
+        public IRType ReturnType { get; }
+
+        public ulong TextBegin { get; }
+
+        public ulong TextLength { get; }
+
+        public IReadOnlyList<ILinkedSection> Sections { get; }
+    }
+
     private string ResolveOutputDirectory()
     {
         var targetOptions = PyNTTTargetOptionsUtility.Get(_compileOptions);
@@ -435,7 +484,9 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
         string? AssignmentTarget = null,
         string? PoolStrideBytes = null,
         string? PoolStrideElements = null,
-        string? WorkspacePoolStrideBytes = null);
+        string? WorkspacePoolStrideBytes = null,
+        string[]? StrideElements = null,
+        string[]? ScalarStrideElements = null);
 
     private sealed record FunctionCallArgumentLayout(
         BaseExpr[] InputArguments,
@@ -663,12 +714,21 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
     private RuntimeDispatchContext CreateEntryDispatchContext(BaseFunction function)
     {
         var state = new RuntimeDispatchState();
-        var parameters = GetParameterNames(function)
-            .Select((name, index) => (name, index))
-            .ToDictionary(item => item.name, item => new RuntimeBinding($"inputs[{item.index.ToString(CultureInfo.InvariantCulture)}]"), StringComparer.Ordinal);
+        var parameters = GetInputTensorParameters(function)
+            .Select((parameter, index) =>
+            {
+                var expression = $"inputs[{index.ToString(CultureInfo.InvariantCulture)}]";
+                return (parameter.Name, Binding: new RuntimeBinding(
+                    expression,
+                    StrideElements: BuildTorchTensorStrideExpressions(expression, ((BaseExpr)parameter).CheckedType),
+                    ScalarStrideElements: BuildTorchTensorScalarStrideExpressions(expression, ((BaseExpr)parameter).CheckedType)));
+            })
+            .ToDictionary(item => item.Name, item => item.Binding, StringComparer.Ordinal);
         var outputs = CreateRuntimeOutputBindings(function, index => new RuntimeBinding(
             $"outputs[{index.ToString(CultureInfo.InvariantCulture)}]",
-            $"outputs[{index.ToString(CultureInfo.InvariantCulture)}]"));
+            $"outputs[{index.ToString(CultureInfo.InvariantCulture)}]",
+            StrideElements: BuildTorchTensorStrideExpressions($"outputs[{index.ToString(CultureInfo.InvariantCulture)}]", PyNTTFunctionOutputs.GetOutputTypes(function)[index]),
+            ScalarStrideElements: BuildTorchTensorScalarStrideExpressions($"outputs[{index.ToString(CultureInfo.InvariantCulture)}]", PyNTTFunctionOutputs.GetOutputTypes(function)[index])));
         return new RuntimeDispatchContext(state, parameters, outputs, new Dictionary<ObjectBufferKey, RuntimeBinding>(), function.Name, "outputs[0].device", "inputs");
     }
 
@@ -1267,7 +1327,9 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
                     BuildTensorBufferViewExpression(buffer, context, contextName),
                     PoolStrideBytes: tensorPoolStrideBytes,
                     PoolStrideElements: BuildPoolStrideElementsExpression(tensorPoolStrideBytes, buffer.ElemType),
-                    WorkspacePoolStrideBytes: workspacePoolStrideBytes);
+                    WorkspacePoolStrideBytes: workspacePoolStrideBytes,
+                    StrideElements: BuildBufferStrideElementExpressions(buffer, contextName),
+                    ScalarStrideElements: BuildBufferScalarStrideElementExpressions(buffer, contextName));
         }
 
         if (expr is IVar parameter)
@@ -1276,6 +1338,11 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
             {
                 return parameterBinding;
             }
+        }
+
+        if (expr is Dimension)
+        {
+            return new RuntimeBinding(BuildRuntimePythonScalarExpression(expr));
         }
 
         throw new NotSupportedException($"PyNTT dispatch cannot bind {contextName} from {expr.GetType().Name}.");
@@ -1327,6 +1394,104 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
             : $"(({poolStrideBytes}) // {scalarElementSizeBytes.ToString(CultureInfo.InvariantCulture)})";
     }
 
+    private static string[] BuildBufferStrideElementExpressions(TIR.Buffer buffer, string contextName)
+        => buffer.Strides.ToArray()
+            .Select((stride, axis) => BuildRuntimeDimensionExpression(stride, $"{contextName} buffer {buffer.Name} stride {axis.ToString(CultureInfo.InvariantCulture)}"))
+            .ToArray();
+
+    private static string[] BuildBufferScalarStrideElementExpressions(TIR.Buffer buffer, string contextName)
+        => BuildScalarStrideElementExpressions(
+            BuildBufferStrideElementExpressions(buffer, contextName),
+            buffer.ElemType,
+            buffer.Rank,
+            $"{contextName} buffer {buffer.Name}");
+
+    private static string[] BuildTorchTensorStrideExpressions(string expression, IRType type)
+    {
+        if (!TryGetTensorType(type, out var tensorType))
+        {
+            return Array.Empty<string>();
+        }
+
+        var shape = GetRankedShape(tensorType, expression);
+        return Enumerable.Range(0, shape.Rank)
+            .Select(axis => $"{expression}.stride({axis.ToString(CultureInfo.InvariantCulture)})")
+            .ToArray();
+    }
+
+    private static string[] BuildTorchTensorScalarStrideExpressions(string expression, IRType type)
+    {
+        if (!TryGetTensorType(type, out var tensorType))
+        {
+            return Array.Empty<string>();
+        }
+
+        var shape = GetRankedShape(tensorType, expression);
+        return BuildScalarStrideElementExpressions(
+            BuildTorchTensorStrideExpressions(expression, type),
+            tensorType.DType,
+            shape.Rank,
+            $"runtime tensor {expression}");
+    }
+
+    private static string[] BuildScalarStrideElementExpressions(string[] viewStrides, DataType dataType, int rank, string context)
+    {
+        if (viewStrides.Length != rank)
+        {
+            throw new NotSupportedException($"{context} has rank {rank} but {viewStrides.Length} runtime stride expressions.");
+        }
+
+        var lanes = GetVectorLanes(dataType);
+        if (lanes.Length == 0)
+        {
+            return viewStrides;
+        }
+
+        if (lanes.Length > rank)
+        {
+            throw new NotSupportedException($"{context} has vector lanes [{string.Join(",", lanes)}] but only rank {rank}.");
+        }
+
+        var laneProduct = lanes.Aggregate(1, static (product, lane) => checked(product * lane));
+        var vectorAxisStart = rank - lanes.Length;
+        return viewStrides
+            .Select((stride, axis) =>
+            {
+                if (axis < vectorAxisStart)
+                {
+                    return MultiplyRuntimeExpression(stride, laneProduct);
+                }
+
+                var laneAxis = axis - vectorAxisStart;
+                var innerLaneStride = lanes.Skip(laneAxis + 1).Aggregate(1, static (product, lane) => checked(product * lane));
+                return innerLaneStride.ToString(CultureInfo.InvariantCulture);
+            })
+            .ToArray();
+    }
+
+    private static string MultiplyRuntimeExpression(string expression, int factor)
+    {
+        if (factor == 1)
+        {
+            return expression;
+        }
+
+        if (long.TryParse(expression.Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var value))
+        {
+            return checked(value * factor).ToString(CultureInfo.InvariantCulture);
+        }
+
+        return $"(({expression}) * {factor.ToString(CultureInfo.InvariantCulture)})";
+    }
+
+    private static int[] GetVectorLanes(DataType dataType)
+        => dataType switch
+        {
+            VectorType vectorType => vectorType.Lanes.ToArray(),
+            MaskVectorType maskVectorType => new[] { maskVectorType.Lanes },
+            _ => Array.Empty<int>(),
+        };
+
     private static int GetScalarElementSizeBytes(DataType dataType)
     {
         return dataType is VectorType vectorType
@@ -1347,7 +1512,9 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
                     BuildTensorBufferViewExpression(buffer, context, contextName),
                     PoolStrideBytes: tensorPoolStrideBytes,
                     PoolStrideElements: BuildPoolStrideElementsExpression(tensorPoolStrideBytes, buffer.ElemType),
-                    WorkspacePoolStrideBytes: workspacePoolStrideBytes);
+                    WorkspacePoolStrideBytes: workspacePoolStrideBytes,
+                    StrideElements: BuildBufferStrideElementExpressions(buffer, contextName),
+                    ScalarStrideElements: BuildBufferScalarStrideElementExpressions(buffer, contextName));
         }
 
         if (expr is IVar parameter && context.Outputs.TryGetValue(parameter.Name, out var parameterOutputBinding))
@@ -1460,6 +1627,11 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
             throw new NotSupportedException($"PyNTT expected object buffer, got {buffer.ElemType}.");
         }
 
+        if (TryResolveAbiBufferBinding(buffer, context, out var abiBinding))
+        {
+            return abiBinding;
+        }
+
         var key = CreateObjectBufferKey(buffer, context);
         if (!context.ObjectBuffers.TryGetValue(key, out var binding))
         {
@@ -1476,6 +1648,11 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
         if (!IsObjectDataType(buffer.ElemType))
         {
             throw new NotSupportedException($"{contextName} expected object buffer, got {buffer.ElemType}.");
+        }
+
+        if (TryResolveAbiBufferBinding(buffer, context, out var abiBinding))
+        {
+            return abiBinding;
         }
 
         var key = CreateObjectBufferKey(buffer, context);
@@ -1505,6 +1682,7 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
     {
         var baseName = buffer.MemSpan.Buffer.Location switch
         {
+            MemoryLocation.Input or MemoryLocation.Output when TryResolveAbiBufferBinding(buffer, context, out var abiBinding) => abiBinding.Expression,
             MemoryLocation.Data => RequireWorkspaceName(context.Data, contextName, "data"),
             MemoryLocation.BlockLocalData => RequireWorkspaceName(context.BlockLocalData, contextName, "block_local_data"),
             MemoryLocation.Rdata => RequireWorkspaceName(context.RData, contextName, "rdata"),
@@ -1512,11 +1690,96 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
             MemoryLocation.BlockLocalRdata => RequireWorkspaceName(context.BlockLocalRData, contextName, "block_local_rdata"),
             var location => throw new NotSupportedException($"{contextName} cannot pass buffer {buffer.Name} from memory location {location} as a PyNTT runtime tensor view."),
         };
-        var offsetBytes = GetBufferOffsetBytes(buffer);
-        var sizeBytes = GetFixedDimension(buffer.MemSpan.Size, $"{contextName} buffer {buffer.Name} size");
+        var offsetBytes = BuildRuntimeBufferOffsetExpression(buffer, contextName);
+        var sizeBytes = BuildRuntimeDimensionExpression(buffer.MemSpan.Size, $"{contextName} buffer {buffer.Name} size");
         var dtype = GetPyNTTScalarDTypeName(buffer.ElemType);
-        return $"view_typed_buffer({baseName}, {offsetBytes.ToString(CultureInfo.InvariantCulture)}, {sizeBytes.ToString(CultureInfo.InvariantCulture)}, {PythonString(dtype)})";
+        return $"view_typed_buffer({baseName}, {offsetBytes}, {sizeBytes}, {PythonString(dtype)})";
     }
+
+    private static bool TryResolveAbiBufferBinding(TIR.Buffer buffer, RuntimeDispatchContext context, out RuntimeBinding binding)
+    {
+        binding = null!;
+        if (buffer.MemSpan.Buffer.Location is not (MemoryLocation.Input or MemoryLocation.Output)
+            || buffer.MemSpan.Buffer.Start is not IVar parameter)
+        {
+            return false;
+        }
+
+        var bindings = buffer.MemSpan.Buffer.Location == MemoryLocation.Input
+            ? context.Parameters
+            : context.Outputs;
+        if (!bindings.TryGetValue(parameter.Name, out var resolved))
+        {
+            return false;
+        }
+
+        binding = resolved;
+        return true;
+    }
+
+    private static string BuildRuntimeBufferOffsetExpression(TIR.Buffer buffer, string context)
+    {
+        var physicalOffset = buffer.MemSpan.Buffer.Location is MemoryLocation.Input or MemoryLocation.Output
+            ? "0"
+            : BuildRuntimeDimensionExpression(buffer.MemSpan.Buffer.Start, $"{context} physical buffer offset");
+        if (ContainsShardCoord(buffer.MemSpan.Buffer.Start))
+        {
+            throw new NotSupportedException($"{context} physical buffer offset for {buffer.Name} depends on shard coordinates, which cannot be evaluated by PyNTT host dispatch.");
+        }
+
+        var spanOffset = ContainsShardCoord(buffer.MemSpan.Start)
+            ? "0"
+            : BuildRuntimeDimensionExpression(buffer.MemSpan.Start, $"{context} memspan offset");
+        return AddRuntimeOffsetExpressions(physicalOffset, spanOffset);
+    }
+
+    private static bool ContainsShardCoord(BaseExpr expr)
+    {
+        expr = UnwrapInputBoxing(expr);
+        if (expr is DimVar dimVar && dimVar.Name.StartsWith("__shard_coord_", StringComparison.Ordinal))
+        {
+            return true;
+        }
+
+        foreach (var operand in expr.Operands)
+        {
+            if (ContainsShardCoord(operand))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static string BuildRuntimeDimensionExpression(BaseExpr expr, string context)
+    {
+        expr = UnwrapInputBoxing(expr);
+        return expr switch
+        {
+            None => "0",
+            Dimension or TensorConst or Call => BuildRuntimePythonScalarExpression(expr),
+            _ => GetFixedDimension(expr, context).ToString(CultureInfo.InvariantCulture),
+        };
+    }
+
+    private static string AddRuntimeOffsetExpressions(string lhs, string rhs)
+    {
+        if (IsZeroExpression(lhs))
+        {
+            return rhs;
+        }
+
+        if (IsZeroExpression(rhs))
+        {
+            return lhs;
+        }
+
+        return $"(({lhs}) + ({rhs}))";
+    }
+
+    private static bool IsZeroExpression(string expression)
+        => string.Equals(expression.Trim(), "0", StringComparison.Ordinal);
 
     private static bool IsObjectExpression(BaseExpr expr)
     {
@@ -1676,6 +1939,9 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
             .Concat(outputBindings)
             .Select(binding => string.IsNullOrWhiteSpace(binding.PoolStrideElements) ? "0" : binding.PoolStrideElements!)
             .ToArray();
+        var abiViewStrideArgs = GetAbiViewStrideArgs(kernel)
+            .Select(argument => ResolveAbiViewStrideArgument(argument, inputBindings, outputBindings, kernel.Name))
+            .ToArray();
         var outputAliases = BuildRuntimeOutputAliasStatements(kernel, context, parameterNames, inputArgs);
         if (kernel.Attrs.TryGetValue("pure_alias", out var pureAliasValue) && pureAliasValue is bool pureAlias && pureAlias)
         {
@@ -1733,10 +1999,10 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
             }
         }
 
-        var runtimeShapeArgs = runtimeShapeArgNames.Select(arg => $"shape_env[{PythonString(arg)}]").ToArray();
+        var runtimeShapeArgs = runtimeShapeArgNames.Select(arg => ResolveRuntimeScalarArgument(arg, context)).ToArray();
         var requiresGridBarrier = kernel.Attrs.ContainsKey("requires_grid_barrier");
         var gridBarrierArgs = requiresGridBarrier ? new[] { "PYNTT_GRID_MESH" } : Array.Empty<string>();
-        var tensorArgs = string.Join(", ", inputArgs.Concat(outputArgs).Concat(tensorStrideArgs).Concat(workspaceArgs).Concat(workspaceStrideArgs).Concat(runtimeShapeArgs).Concat(gridBarrierArgs));
+        var tensorArgs = string.Join(", ", inputArgs.Concat(outputArgs).Concat(tensorStrideArgs).Concat(abiViewStrideArgs).Concat(workspaceArgs).Concat(workspaceStrideArgs).Concat(runtimeShapeArgs).Concat(gridBarrierArgs));
         var tritonRuntimeSetup = requiresGridBarrier
             ? $"{Environment.NewLine}        ensure_triton_allocator({context.DeviceExpression})"
             : string.Empty;
@@ -1766,6 +2032,50 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
             {launchStatement}
             {outputAliases}
             """;
+    }
+
+    private static string[] GetAbiViewStrideArgs(GeneratedKernelMetadata kernel)
+    {
+        if (!kernel.Attrs.TryGetValue("abi_view_stride_args", out var value))
+        {
+            return Array.Empty<string>();
+        }
+
+        return value switch
+        {
+            string[] array => array,
+            IEnumerable<string> enumerable => enumerable.ToArray(),
+            JsonElement jsonElement when jsonElement.ValueKind == JsonValueKind.Array =>
+                jsonElement.EnumerateArray().Select(item => item.GetString() ?? throw new NotSupportedException($"Generated PyNTT kernel {kernel.Name} has a non-string ABI view stride arg.")).ToArray(),
+            _ => throw new NotSupportedException($"Generated PyNTT kernel {kernel.Name} has unsupported abi_view_stride_args metadata type {value.GetType().Name}."),
+        };
+    }
+
+    private static string ResolveAbiViewStrideArgument(string argument, RuntimeBinding[] inputBindings, RuntimeBinding[] outputBindings, string kernelName)
+    {
+        var match = AbiViewStrideArgRegex.Match(argument);
+        if (!match.Success)
+        {
+            throw new NotSupportedException($"Generated PyNTT kernel {kernelName} has invalid ABI view stride argument {argument}.");
+        }
+
+        var bindings = match.Groups["kind"].Value == "input" ? inputBindings : outputBindings;
+        var index = int.Parse(match.Groups["index"].Value, CultureInfo.InvariantCulture);
+        var axis = int.Parse(match.Groups["axis"].Value, CultureInfo.InvariantCulture);
+        var useScalarStride = match.Groups["scalar"].Success;
+        if (index < 0 || index >= bindings.Length)
+        {
+            throw new NotSupportedException($"Generated PyNTT kernel {kernelName} references {argument}, but only has {bindings.Length} {match.Groups["kind"].Value} bindings.");
+        }
+
+        var binding = bindings[index];
+        var strideElements = useScalarStride ? binding.ScalarStrideElements : binding.StrideElements;
+        if (strideElements is { } strides && axis < strides.Length)
+        {
+            return strides[axis];
+        }
+
+        return $"{binding.Expression}.stride({axis.ToString(CultureInfo.InvariantCulture)})";
     }
 
     private static string RequireWorkspaceName(string? name, string functionName, string workspaceName)
@@ -2159,6 +2469,11 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
         => kernel.Attrs.TryGetValue("runtime_shape_args", out var value) && value is string[] args
             ? args
             : Array.Empty<string>();
+
+    private static string ResolveRuntimeScalarArgument(string name, RuntimeDispatchContext context)
+        => context.Parameters.TryGetValue(name, out var binding)
+            ? binding.Expression
+            : $"shape_env[{PythonString(name)}]";
 
     private static string[] GetStringArrayAttr(GeneratedKernelMetadata kernel, string name)
         => kernel.Attrs.TryGetValue(name, out var value) && value is string[] args

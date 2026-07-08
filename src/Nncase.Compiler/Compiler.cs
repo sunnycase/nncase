@@ -297,12 +297,32 @@ public class Compiler : ICompiler
             target.RegisterAutoPackingRules(p, _compileSession.CompileOptions);
 
             p.Add<Passes.Rules.Neutral.FoldConstCall>();
+            p.Add<Passes.Rules.Neutral.FoldGetItemTuple>();
+            p.Add<Passes.Rules.Neutral.FoldPackTranspose>();
+            p.Add<Passes.Rules.Neutral.FoldPackReshape>();
+            p.Add<Passes.Rules.Neutral.FoldPackBitcast>();
+            p.Add<Passes.Rules.Neutral.FoldBitcastBitcast>();
+        });
+
+        passManager.AddWithName<FunctionBoundaryLayoutPropagationPass>("FunctionBoundaryLayoutPropagation");
+        passManager.AddWithName<EGraphRulesPass>("PostFunctionBoundaryPackPropagation").Configure(p =>
+        {
+            target.RegisterPackPropagationRules(p, _compileSession.CompileOptions);
+        });
+
+        passManager.AddWithName<DataflowPass>("OptimizeAfterFunctionBoundaryLayoutPropagation").Configure(p =>
+        {
+            p.Add<Passes.Rules.Neutral.FoldConstCall>();
             p.Add<Passes.Rules.Neutral.UnpackToBitcast>();
             p.Add<Passes.Rules.Neutral.FoldGetItemTuple>();
             p.Add<Passes.Rules.Neutral.FoldPackTranspose>();
             p.Add<Passes.Rules.Neutral.FoldPackReshape>();
             p.Add<Passes.Rules.Neutral.FoldPackBitcast>();
+            p.Add<Passes.Rules.Neutral.FoldBitcastBitcast>();
         });
+        passManager.Add<RemoveUnusedFunctions>();
+        passManager.Add<InferRangePass>();
+        passManager.Add<OptimizeByRangePass>();
     }
 
     public void AutoVectorizePass(IPassManager passManager)
@@ -328,12 +348,16 @@ public class Compiler : ICompiler
 
         passManager.Add<AddFunctionToModule>();
         passManager.Add<RemoveUnusedFunctions>();
+        passManager.AddWithName<FunctionBoundaryLayoutPropagationPass>("DistributedFunctionBoundaryLayoutPropagation");
         passManager.AddWithName<DataflowPass>("OptimizeAfterAutoDistributed").Configure(p =>
         {
             p.Add<Passes.Rules.Neutral.FoldConstCall>();
+            p.Add<Passes.Rules.Neutral.FoldGetItemTuple>();
+            p.Add<FoldBoxingBoxing>();
             p.Add<FoldBoxingUninitialized>();
         });
 
+        passManager.Add<RemoveUnusedFunctions>();
         passManager.Add<InferRangePass>();
         passManager.Add<OptimizeByRangePass>();
     }

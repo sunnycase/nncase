@@ -71,12 +71,18 @@ public abstract class NTTTarget : Target
         // todo config it in the target options.
         var rank = 1;
         var lane = NTTModuleCompiler.Lane;
-        var maskVectorStyle = NTTModuleCompiler.MaskVectorStyle;
 
         pass.Add<Passes.Rules.NTT.VectorizeConv2D>(rank, lane);
         pass.Add<Passes.Rules.NTT.VectorizeMatMul>(rank, lane);
         pass.Add<Passes.Rules.NTT.VectorizeLayerNorm>(rank, lane);
         pass.Add<Passes.Rules.NTT.VectorizeNormApply>(rank, lane);
+
+        RegisterPackPropagationRules(pass, options);
+    }
+
+    public override void RegisterPackPropagationRules(IRulesAddable pass, CompileOptions options)
+    {
+        var maskVectorStyle = NTTModuleCompiler.MaskVectorStyle;
 
         pass.Add<Passes.Rules.NTT.VectorizeBinaryPropagation>();
         pass.Add<Passes.Rules.NTT.VectorizeCastPropagation>();

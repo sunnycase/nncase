@@ -655,7 +655,8 @@ public abstract class HuggingFaceModel
             int count,
             Expr hiddenStates,
             Expr pastKeyValues,
-            Tuple<Expr, Expr> positionEmbeddings)
+            Tuple<Expr, Expr> positionEmbeddings,
+            Dimension layerId)
     {
         var residual = hiddenStates;
         hiddenStates = LLMLayerNorm(
@@ -668,7 +669,8 @@ public abstract class HuggingFaceModel
             count,
             hiddenStates,
             pastKeyValues,
-            positionEmbeddings);
+            positionEmbeddings,
+            layerId);
         hiddenStates = residual + hiddenStates;
 
         // fully Connected
@@ -999,7 +1001,8 @@ public abstract class HuggingFaceModel
                 int count,
                 Expr hiddenStates,
                 Expr paskKeyValues,
-                Tuple<Expr, Expr> positionEmbeddings)
+                Tuple<Expr, Expr> positionEmbeddings,
+                Dimension layerId)
     {
         var head_dim = (long)Context!.Config!["hidden_size"] / (long)Context.Config["num_attention_heads"];
         if (Context.Config!.Keys.Contains("head_dim"))
@@ -1028,12 +1031,12 @@ public abstract class HuggingFaceModel
             var transK = TransposeIfNeeded(keyStates, kvPerms);
             var castK = pagedAttentionConfig.KVPrimType != qType ? IR.F.Tensors.Cast(transK, pagedAttentionConfig.KVPrimType) : transK;
             var vectorizedK = keyLanes.Length > 0 ? IR.F.Tensors.Pack(castK, keyLanes, keyVectorizedAxis) : castK;
-            paskKeyValues = IR.F.NN.UpdatePagedAttentionKVCache(vectorizedK, paskKeyValues, AttentionCacheKind.Key, count, kvDestLayout);
+            paskKeyValues = IR.F.NN.UpdatePagedAttentionKVCache(vectorizedK, paskKeyValues, layerId, AttentionCacheKind.Key, kvDestLayout);
 
             var transV = TransposeIfNeeded(valueStates, kvPerms);
             var castV = pagedAttentionConfig.KVPrimType != qType ? IR.F.Tensors.Cast(transV, pagedAttentionConfig.KVPrimType) : transV;
             var vectorizedV = valueLanes.Length > 0 ? IR.F.Tensors.Pack(castV, valueLanes, valueVectorizedAxis) : castV;
-            paskKeyValues = IR.F.NN.UpdatePagedAttentionKVCache(vectorizedV, paskKeyValues, AttentionCacheKind.Value, count, kvDestLayout);
+            paskKeyValues = IR.F.NN.UpdatePagedAttentionKVCache(vectorizedV, paskKeyValues, layerId, AttentionCacheKind.Value, kvDestLayout);
         }
 
         var scaling = Tensor.FromScalar((float)(1.0f / System.Math.Sqrt((double)head_dim)));
@@ -1068,7 +1071,7 @@ public abstract class HuggingFaceModel
             paskKeyValues,
             IR.F.Buffer.Uninitialized(DataTypes.UInt8, TIR.MemoryLocation.Data, [extra_size]),
             scaling.CastTo(pagedAttentionConfig.KVPrimType, CastMode.KDefault),
-            count,
+            layerId,
             qDestLayout,
             hidden_size);
 
@@ -1098,6 +1101,7 @@ public abstract class HuggingFaceModel
     {
         var hiddenStatesParam = new Var("hidden_states", hiddenStates.CheckedType);
         var pastKeyValuesParam = new Var("kv_cache", pastKeyValues.CheckedType);
+        var layerIdParam = new DimVar("layer_id");
         var cosParam = new Var("cos", positionEmbeddings.Item1.CheckedType);
         var sinParam = new Var("sin", positionEmbeddings.Item2.CheckedType);
         var context = new LayerFunctionBuildContext();
@@ -1113,9 +1117,10 @@ public abstract class HuggingFaceModel
                 0,
                 hiddenStatesParam,
                 pastKeyValuesParam,
-                System.Tuple.Create<Expr, Expr>(cosParam, sinParam));
+                System.Tuple.Create<Expr, Expr>(cosParam, sinParam),
+                layerIdParam);
             var body = new IR.Tuple(layerOutput, updatedKvCache);
-            var parameters = new List<IVar> { hiddenStatesParam, pastKeyValuesParam, cosParam, sinParam };
+            var parameters = new List<IVar> { hiddenStatesParam, pastKeyValuesParam, layerIdParam, cosParam, sinParam };
             parameters.AddRange(context.Parameters);
             var function = new Function("hf_decoder_layer", CompileSession.Target.Name, body, parameters.ToArray());
             return new DecoderLayerFunction(function, context.ParameterSpecs.ToArray());
@@ -1137,6 +1142,7 @@ public abstract class HuggingFaceModel
         {
             hiddenStates,
             pastKeyValues,
+            new DimConst(layerIndex),
             positionEmbeddings.Item1,
             positionEmbeddings.Item2,
         };
@@ -1224,7 +1230,8 @@ public abstract class HuggingFaceModel
                     i,
                     hiddenStates,
                     pastKeyValues,
-                    positionEmbeddings);
+                    positionEmbeddings,
+                    new DimConst(i));
                 pastKeyValues = pastKeyValuesTmp;
                 hiddenStates = hiddenStatesTmp;
             }

@@ -163,6 +163,8 @@ public interface ITarget
 
     void RegisterAutoVectorizeRules(IRulesAddable pass, CompileOptions options);
 
+    void RegisterPackPropagationRules(IRulesAddable pass, CompileOptions options);
+
     void RegisterPostAutoVectorizePass(IPassManager passManager, CompileOptions options);
 
     void RegisterTIRSelectionPass(IPassManager passManager, CompileOptions options);

@@ -30,8 +30,7 @@ public abstract class TIRSelectionPass : FunctionPass
             var callers = func.Users.Where(x => x is Call or FunctionWrapper).ToArray();
             var isEntry = callers.Length == 0;
             var visitor = new TIRSelectionVisitor(this);
-            (var newBody, var outBuffers) = visitor.Select(func);
-            var inBuffers = func.Parameters.ToArray();
+            (var newBody, var inBuffers, var outBuffers) = visitor.Select(func);
 
             if (isEntry)
             {
@@ -50,7 +49,7 @@ public abstract class TIRSelectionPass : FunctionPass
                     ModuleKind,
                     newBody,
                     inBuffers.Concat(outBuffers).ToArray());
-                var primWrapper = new PrimFunctionWrapper(input.Name, primFunc, inBuffers.Length);
+                var primWrapper = new PrimFunctionWrapper(input.Name, primFunc, inBuffers.Count);
                 AddOutputBufferAllocsToCallers(func, outBuffers, callers.OfType<Call>());
                 return Task.FromResult((BaseFunction)primWrapper);
             }
@@ -82,7 +81,7 @@ public abstract class TIRSelectionPass : FunctionPass
         }
     }
 
-    private sealed record SelectionResult(Sequential Body, IReadOnlyList<BufferVar> OutputBuffers);
+    private sealed record SelectionResult(Sequential Body, IReadOnlyList<IVar> InputBuffers, IReadOnlyList<BufferVar> OutputBuffers);
 
     private sealed class TIRSelectionVisitor : ExprCloner<Unit>
     {
@@ -99,6 +98,7 @@ public abstract class TIRSelectionPass : FunctionPass
 
         public SelectionResult Select(Function function)
         {
+            var inBuffers = LowerInputParameters(function.Parameters);
             Visit(function.Body, Unit.Default);
 
             var outBuffers = function.Body switch
@@ -126,7 +126,7 @@ public abstract class TIRSelectionPass : FunctionPass
                 }
             }
 
-            return new(new Sequential(_body.ToArray()), outBuffers.Cast<BufferVar>().ToArray());
+            return new(new Sequential(_body.ToArray()), inBuffers, outBuffers.Cast<BufferVar>().ToArray());
         }
 
         protected sealed override Expr VisitLeafTensorConst(TensorConst expr, Unit context)
@@ -164,9 +164,6 @@ public abstract class TIRSelectionPass : FunctionPass
             return SelectCall(expr, args);
         }
 
-        private static BaseExpr[] FlattenOutputArguments(BaseExpr output)
-            => output is IR.Tuple tuple ? tuple.Fields.ToArray() : new[] { output };
-
         protected override BaseExpr VisitLeafIf(If expr, Unit context)
         {
             var output = CreateOutputBuffer(expr);
@@ -179,11 +176,107 @@ public abstract class TIRSelectionPass : FunctionPass
                 .Build();
         }
 
+        private static BaseExpr[] FlattenOutputArguments(BaseExpr output)
+            => output is IR.Tuple tuple ? tuple.Fields.ToArray() : new[] { output };
+
+        private static bool TryGetTensorType(IRType type, out TensorType tensorType, out DistributedType? distributedType)
+        {
+            switch (type)
+            {
+                case DistributedType dt:
+                    tensorType = dt.TensorType;
+                    distributedType = dt;
+                    return true;
+                case TensorType tt when tt.DType is not PointerType:
+                    tensorType = tt;
+                    distributedType = null;
+                    return true;
+                default:
+                    tensorType = null!;
+                    distributedType = null;
+                    return false;
+            }
+        }
+
+        private static bool TrySelectCallerAllocatedPrimCall(Expr target, IReadOnlyList<BaseExpr> arguments, out Call selectedCall, out BaseExpr output)
+        {
+            selectedCall = null!;
+            output = null!;
+            if (!TryGetPrimFunctionTarget(target, out var primFunction, out var inputCount))
+            {
+                return false;
+            }
+
+            var outputCount = primFunction.GetAbiView().Outputs.Count;
+            if (outputCount == 0 || arguments.Count < inputCount + outputCount)
+            {
+                return false;
+            }
+
+            var outputArguments = arguments.Skip(inputCount).Take(outputCount).ToArray();
+            output = outputArguments.Length == 1 ? outputArguments[0] : new IR.Tuple(outputArguments);
+            selectedCall = new Call(primFunction, arguments.ToArray());
+            return true;
+        }
+
+        private static bool TryGetPrimFunctionTarget(Expr target, out TIR.PrimFunction primFunction, out int inputCount)
+        {
+            switch (target)
+            {
+                case TIR.PrimFunction direct:
+                    primFunction = direct;
+                    inputCount = direct.GetAbiView().Inputs.Count;
+                    return true;
+                case PrimFunctionWrapper wrapper:
+                    primFunction = wrapper.Target;
+                    inputCount = wrapper.ParametersCount;
+                    return true;
+                case FunctionWrapper { Target: PrimFunctionWrapper wrapper }:
+                    primFunction = wrapper.Target;
+                    inputCount = wrapper.ParametersCount;
+                    return true;
+                default:
+                    primFunction = null!;
+                    inputCount = 0;
+                    return false;
+            }
+        }
+
+        private IReadOnlyList<IVar> LowerInputParameters(ReadOnlySpan<IVar> parameters)
+        {
+            var lowered = new IVar[parameters.Length];
+            for (var i = 0; i < parameters.Length; i++)
+            {
+                var parameter = parameters[i];
+                if (TryGetTensorType(parameter.CheckedType, out var tensorType, out var distributedType))
+                {
+                    var bufferVar = parameter is BufferVar { Role: BufferVarRole.Input or BufferVarRole.InOut } inputBufferVar
+                        ? inputBufferVar
+                        : new BufferVar(parameter.Name, parameter.CheckedType, BufferVarRole.Input, MemoryLocation.Input);
+                    var buffer = T.AttachBuffer(bufferVar, tensorType, MemoryLocation.Input, 0, out _, $"{parameter.Name}_input", distributedType);
+                    ExprMemo[(BaseExpr)parameter] = buffer;
+                    _selectionContext.RegisterSelectedValue((BaseExpr)parameter, buffer);
+                    lowered[i] = bufferVar;
+                }
+                else
+                {
+                    lowered[i] = parameter;
+                }
+            }
+
+            return lowered;
+        }
+
         private BaseExpr SelectCall(Call call, IReadOnlyList<BaseExpr> arguments)
         {
             if (call.Target is IR.Tensors.GetItem && arguments[IR.Tensors.GetItem.Input.Index] is IR.Tuple tuple && call[IR.Tensors.GetItem.Index] is DimConst index)
             {
                 return tuple[index.Value];
+            }
+            else if (TrySelectCallerAllocatedPrimCall(call.Target, arguments, out var callerAllocatedCall, out var callerAllocatedOutput))
+            {
+                _body.Add(callerAllocatedCall);
+                return callerAllocatedOutput;
             }
             else
             {

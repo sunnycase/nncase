@@ -8,8 +8,10 @@ using System.Text.Json;
 using System.Threading.Tasks;
 using Nncase.Diagnostics;
 using Nncase.IR;
+using Nncase.IR.Math;
 using Nncase.IR.Shapes;
 using Nncase.Passes.Distributed;
+using Nncase.Passes.Rules.ShapeBucket;
 using Nncase.Targets;
 using Nncase.Tests.TestFixture;
 using Nncase.Utilities;
@@ -65,6 +67,38 @@ public sealed class UnitTestDistribAutoDistributed : TestClassBase
         var post = pass.RunAsync(main, new()).Result;
 
         Assert.NotNull(post);
+    }
+
+    [Fact]
+    public async Task TestShapeBucketSegmentsFromEntryAndClonesInternalFunctions()
+    {
+        var n = new DimVar("n") { Metadata = { Range = (1, 32) } };
+        var tensorType = new TensorType(DataTypes.Float32, [n, 16]);
+        var layerInput = new Var("layer_input", tensorType);
+        var layer = new Function("layer", IR.F.Math.Unary(UnaryOp.Abs, layerInput), [layerInput]);
+        Assert.True(layer.InferenceType());
+
+        var input = new Var("input", tensorType);
+        var main = new Function("main", new Call(layer, input), [input]);
+        Assert.True(main.InferenceType());
+
+        CompileOptions.ShapeBucketOptions.Enable = true;
+        CompileOptions.ShapeBucketOptions.SegmentsCount = 2;
+        CompileOptions.ShapeBucketOptions.VarMap.Add(input, input.CheckedShape.ToArray());
+
+        var module = new IRModule(main);
+        module.Add(layer);
+        module = await new AutoDistributedWithShapeBucketPass(false, CPUTarget.Kind, CompileOptions).RunAsync(module, new());
+        module = await new AddFunctionToModule(CompileOptions).RunAsync(module, new());
+        module = await new RemoveUnusedFunctions(CompileOptions).RunAsync(module, new());
+
+        var names = module.Functions.Select(function => function.Name).ToArray();
+        Assert.Contains("main_prim", names);
+        Assert.Equal(2, names.Count(name => name.StartsWith("main_segment_", System.StringComparison.Ordinal)));
+        Assert.Equal(2, names.Count(name => name.StartsWith("layer_segment_", System.StringComparison.Ordinal)));
+        Assert.DoesNotContain("main", names);
+        Assert.DoesNotContain("layer", names);
+        Assert.DoesNotContain("layer_prim", names);
     }
 
     [Fact]
