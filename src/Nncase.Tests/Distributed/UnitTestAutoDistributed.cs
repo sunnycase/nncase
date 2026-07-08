@@ -4,6 +4,7 @@
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Reflection;
 using System.Text.Json;
 using System.Threading.Tasks;
 using Nncase.Diagnostics;
@@ -116,6 +117,42 @@ public sealed class UnitTestDistribAutoDistributed : TestClassBase
 
         var skinnyType = new DistributedType(new TensorType(DataTypes.Float32, new[] { 37L }), new SBP[] { SBP.S([0]) }, placement);
         Assert.Equal(new[] { 0L }, new RankedShape(DistributedUtility.GetLocalOffsetAndShape(skinnyType, new[] { 35 }).Shape).ToValueArray());
+    }
+
+    [Fact]
+    public void TestD2DBoxingRejectsDifferentTensorType()
+    {
+        var placement = new Placement([4, 8], "yx", "bb");
+        var source = new DistributedType(new TensorType(DataTypes.Float32, [16, 32]), new SBP[] { SBP.S([0]), SBP.S([1]) }, placement);
+        var target = new DistributedType(new TensorType(DataTypes.Float32, [16, 8, 4]), new SBP[] { SBP.S([0]), SBP.S([1]), SBP.B }, placement);
+        var rewriter = new AutoDistributedRewriter(CompileOptions, (INTTTargetOptions)CompileOptions.TargetOptions, AutoDistributedPhase.Final, CPUTarget.Kind);
+
+        var method = typeof(AutoDistributedRewriter).GetMethod("CheckBoxingType", BindingFlags.Instance | BindingFlags.NonPublic);
+        Assert.NotNull(method);
+        var result = method!.Invoke(rewriter, new object[] { source, target, false });
+
+        Assert.IsType<InvalidType>(Assert.IsAssignableFrom<IRType>(result));
+    }
+
+    [Fact]
+    public void TestTupleGetItemTypeInferenceCacheKeepsAttributeIndex()
+    {
+        var sequenceLength = new DimVar("sequence_length") { Metadata = { Range = (1, 128) } };
+        var q = new Var("q", new TensorType(new VectorType(DataTypes.BFloat16, [4, 8]), new Dimension[] { sequenceLength, 64 }));
+        var k = new Var("k", new TensorType(new VectorType(DataTypes.BFloat16, [4, 8]), new Dimension[] { sequenceLength, 32 }));
+        var v = new Var("v", new TensorType(new VectorType(DataTypes.BFloat16, [4, 8]), new Dimension[] { sequenceLength, 32 }));
+        var tuple = new IR.Tuple(q, k, v);
+        var qItem = IR.F.Tensors.GetItem(tuple, 0);
+        var qVector = IR.F.Tensors.Bitcast(qItem, new VectorType(DataTypes.BFloat16, [8]));
+        var qReshape = IR.F.Tensors.Reshape(qVector, new Dimension[] { sequenceLength, 16, 16 });
+        var vItem = IR.F.Tensors.GetItem(tuple, 2);
+        var vReshape = IR.F.Tensors.Reshape(vItem, new Dimension[] { sequenceLength, 8, 4 });
+        var main = new Function("main", new IR.Tuple(qReshape, vReshape), [q, k, v]);
+        var pass = new AutoDistributedPass(false, CPUTarget.Kind, CompileOptions);
+
+        var post = pass.RunAsync(main, new()).Result;
+
+        Assert.NotNull(post);
     }
 
     [Fact]

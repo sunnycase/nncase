@@ -1794,6 +1794,70 @@ public sealed class VectorizeNormApply : VectorizeRule
     }
 }
 
+public sealed class VectorizeNormStats : VectorizeRule
+{
+    public VectorizeNormStats(int rank, int lane)
+        : base(rank, lane)
+    {
+    }
+
+    public override Pattern Pattern { get; } = IsNormStats(
+      "target",
+      _ => true,
+      IsWildcard("input") with { TypePattern = IsFloat() & !IsVector() });
+
+    public static List<Expr> AddCandidate(NormStats op, Expr input, int[] vectorizedAxes, int[] lanes)
+    {
+        var rets = new List<Expr>();
+        var inShape = input.CheckedShape;
+        if (inShape.IsUnranked || inShape.Rank == 0 || vectorizedAxes.Length != 1)
+        {
+            return rets;
+        }
+
+        var normalizedAxis = op.Axis < 0 ? op.Axis + inShape.Rank : op.Axis;
+        if (normalizedAxis < 0 || normalizedAxis >= inShape.Rank)
+        {
+            return rets;
+        }
+
+        var vectorizedAxis = vectorizedAxes[0];
+        if (vectorizedAxis != inShape.Rank - 1 || vectorizedAxis < normalizedAxis)
+        {
+            return rets;
+        }
+
+        var paddedInput = VectorizeUtility.PadForVectorize(input, inShape, vectorizedAxes, lanes, 0f, out var padedNums);
+        if (Enumerable.Range(0, vectorizedAxes.Length).Any(i => vectorizedAxes[i] >= normalizedAxis && padedNums[i] != new DimConst(0)))
+        {
+            return rets;
+        }
+
+        var stats = IR.F.NN.NormStats(normalizedAxis, IR.F.Tensors.Pack(paddedInput, lanes, vectorizedAxes), op.UseMean);
+        if (stats.CheckedType is not InvalidType)
+        {
+            rets.Add(stats);
+        }
+
+        return rets;
+    }
+
+    public override List<Expr> GetReplaceCandidates(IMatchResult result, RunPassContext context)
+    {
+        var rets = new List<Expr>();
+        var op = (IR.NN.NormStats)result["target"];
+        var input = (Expr)result["input"];
+        var laneSize = Lane / input.CheckedDataType.SizeInBytes;
+        if (laneSize <= 1 || input.CheckedShape.IsUnranked || input.CheckedShape.Rank == 0)
+        {
+            return rets;
+        }
+
+        rets.AddRange(AddCandidate(op, input, new[] { input.CheckedShape.Rank - 1 }, new[] { laneSize }));
+        return rets;
+    }
+}
+
 [RuleGenerator]
 public sealed partial class FoldVectorizeDevectorize : RewriteRule<Pattern>
 {

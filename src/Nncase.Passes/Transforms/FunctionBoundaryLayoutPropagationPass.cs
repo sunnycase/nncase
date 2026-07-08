@@ -6,6 +6,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Reactive;
 using System.Threading.Tasks;
+using Google.OrTools.Sat;
 using Nncase.IR;
 using Nncase.IR.Distributed;
 using Nncase.IR.Tensors;
@@ -17,7 +18,15 @@ namespace Nncase.Passes.Transforms;
 /// </summary>
 public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
 {
-    private const int MaxIterations = 16;
+    private const int MaxPlanningIterations = 8;
+    private const int IdentityVariantPenalty = 1000;
+    private const int LocalTransformCostScale = 10;
+    private readonly bool _enableCallerOutputDemandLayouts;
+
+    public FunctionBoundaryLayoutPropagationPass(bool enableCallerOutputDemandLayouts = true)
+    {
+        _enableCallerOutputDemandLayouts = enableCallerOutputDemandLayouts;
+    }
 
     private enum BoundaryTransformKind
     {
@@ -33,11 +42,12 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
     {
         var useConstShardedView = CompileSession.CompileOptions.TargetOptions is INTTTargetOptions targetOptions
             && Nncase.Passes.Distributed.AutoDistributedRewriter.SupportsConstShardedView(targetOptions);
-        var specializer = new FunctionLayoutSpecializer(input, useConstShardedView);
-        for (int iteration = 0; iteration < MaxIterations; iteration++)
+        for (int iteration = 0; iteration < MaxPlanningIterations; iteration++)
         {
-            var layouts = CollectLayouts(input);
-            if (layouts.Count == 0)
+            var specializer = new FunctionLayoutSpecializer(input, useConstShardedView);
+            var enableCallerOutputDemandLayouts = _enableCallerOutputDemandLayouts && iteration == 0;
+            var selectedLayouts = ModuleLayoutPlanner.Plan(input, specializer, useConstShardedView, enableCallerOutputDemandLayouts);
+            if (selectedLayouts.Count == 0)
             {
                 return Task.FromResult(input);
             }
@@ -46,52 +56,59 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
             var functions = input.Functions.OfType<Function>().ToArray();
             foreach (var function in functions)
             {
-                var rewriter = new CallBoundaryLayoutRewriter(layouts, specializer, useConstShardedView);
-                rewriter.Rewrite(function);
+                var rewriteTarget = selectedLayouts.TryGetValue(function, out var selectedLayout)
+                    ? specializer.GetOrCreate(function, selectedLayout)
+                    : function;
+                var rewriter = new CallBoundaryLayoutRewriter(selectedLayouts, specializer, useConstShardedView);
+                rewriter.Rewrite(rewriteTarget);
                 if (rewriter.IsMutated)
                 {
                     anyMutated = true;
-                    if (!CompilerServices.InferenceType(function))
+                    if (!CompilerServices.InferenceType(rewriteTarget))
                     {
-                        throw new InvalidOperationException($"Type inference failed after propagating function boundary layouts in {function.Name}.");
+                        throw new InvalidOperationException($"Type inference failed after propagating function boundary layouts in {rewriteTarget.Name}.");
+                    }
+                }
+
+                var cleanup = new BoundaryTransformCleanupRewriter();
+                cleanup.Rewrite(rewriteTarget);
+                if (cleanup.IsMutated)
+                {
+                    anyMutated = true;
+                    if (!CompilerServices.InferenceType(rewriteTarget))
+                    {
+                        throw new InvalidOperationException($"Type inference failed after cleaning function boundary layouts in {rewriteTarget.Name}.");
                     }
                 }
             }
 
+            anyMutated |= specializer.HasReplacements;
+            specializer.CommitReplacements();
             if (!anyMutated)
             {
                 return Task.FromResult(input);
             }
         }
 
-        var remainingLayoutMap = CollectLayouts(input);
+        var remainingLayoutMap = ModuleLayoutPlanner.CollectCandidateLayouts(input, _enableCallerOutputDemandLayouts);
         var remainingLayoutFunctions = remainingLayoutMap.Keys.ToArray();
-        var remainingLayouts = string.Join(", ", remainingLayoutMap.Select(kv => $"{kv.Key.Name}: {kv.Value}"));
+        var remainingLayouts = string.Join(", ", remainingLayoutMap.Select(kv => $"{kv.Key.Name}: {string.Join(" | ", kv.Value.Select(value => value.ToString()))}"));
         var lastSignature = remainingLayoutFunctions.LastOrDefault() is { } last
             ? string.Join(", ", last.Parameters.ToArray().Select(parameter => $"{parameter.Name}: {((BaseExpr)parameter).CheckedType}"))
             : string.Empty;
         var lastBody = remainingLayoutFunctions.LastOrDefault() is { } lastBodyFunction ? CompilerServices.Print(lastBodyFunction.Body) : string.Empty;
-        throw new InvalidOperationException($"Function boundary layout propagation did not converge within {MaxIterations} iterations. Remaining layout functions: {remainingLayouts}. Last signature: {lastSignature}. Last body: {lastBody}");
+        throw new InvalidOperationException($"Function boundary layout planning did not converge within {MaxPlanningIterations} iterations. Remaining layout functions: {remainingLayouts}. Last signature: {lastSignature}. Last body: {lastBody}");
     }
 
-    private static Dictionary<Function, FunctionBoundaryLayout> CollectLayouts(IRModule module)
+    private static Dictionary<Function, FunctionBoundaryLayout> CollectCanonicalLayouts(IRModule module)
     {
         var layouts = new Dictionary<Function, FunctionBoundaryLayout>(ReferenceEqualityComparer.Instance);
-        foreach (var function in module.Functions.OfType<Function>())
+        foreach (var (function, candidates) in ModuleLayoutPlanner.CollectCandidateLayouts(module))
         {
-            if (ReferenceEquals(function, module.Entry) || function.IsEntry)
+            var nonIdentity = candidates.Where(candidate => !candidate.IsIdentity).ToArray();
+            if (nonIdentity.Length != 0)
             {
-                continue;
-            }
-
-            if (!HasFunctionCallUser(function))
-            {
-                continue;
-            }
-
-            if (FunctionBoundaryLayout.TryCreate(function) is { } layout)
-            {
-                layouts.Add(function, layout);
+                layouts.Add(function, nonIdentity[0]);
             }
         }
 
@@ -114,6 +131,25 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
         }
 
         return false;
+    }
+
+    private static bool TryGetTargetFunction(Expr target, out Function function, out FunctionWrapper? wrapper)
+    {
+        switch (target)
+        {
+            case Function fn:
+                function = fn;
+                wrapper = null;
+                return true;
+            case FunctionWrapper { ReturnOutput: true, Target: Function fn } fw:
+                function = fn;
+                wrapper = fw;
+                return true;
+            default:
+                function = null!;
+                wrapper = null;
+                return false;
+        }
     }
 
     private static bool TryStripInverseFromArgument(BaseExpr expr, BoundaryTransform transform, out BaseExpr transformed)
@@ -171,6 +207,238 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
         if (!CompilerServices.InferenceType(expr))
         {
             throw new InvalidOperationException($"Type inference failed for {context}.");
+        }
+    }
+
+    private static bool TryFoldPackUnpack(Call expr, out BaseExpr folded)
+    {
+        if (expr.Target is Pack pack
+            && BoundaryTransform.Pack(pack).TryStripInverse(expr.Arguments[Pack.Input.Index], out folded))
+        {
+            return true;
+        }
+
+        if (expr.Target is Unpack unpack
+            && BoundaryTransform.Unpack(unpack).TryStripInverse(expr.Arguments[Unpack.Input.Index], out folded))
+        {
+            return true;
+        }
+
+        folded = null!;
+        return false;
+    }
+
+    private sealed class ModuleLayoutPlanner
+    {
+        public static IReadOnlyDictionary<Function, FunctionBoundaryLayout> Plan(
+            IRModule module,
+            FunctionLayoutSpecializer specializer,
+            bool useConstShardedView,
+            bool enableCallerOutputDemandLayouts)
+        {
+            var candidates = CollectCandidateLayouts(module, enableCallerOutputDemandLayouts);
+            if (candidates.Count == 0)
+            {
+                return new Dictionary<Function, FunctionBoundaryLayout>(ReferenceEqualityComparer.Instance);
+            }
+
+            var model = new CpModel();
+            var variables = new Dictionary<FunctionLayoutVariant, BoolVar>();
+            foreach (var perFunction in candidates)
+            {
+                var choiceVars = new List<BoolVar>();
+                foreach (var layout in perFunction.Value)
+                {
+                    var variant = new FunctionLayoutVariant(perFunction.Key, layout);
+                    var variable = model.NewBoolVar($"{SanitizeName(perFunction.Key.Name)}_{choiceVars.Count}");
+                    variables.Add(variant, variable);
+                    choiceVars.Add(variable);
+                }
+
+                model.Add(LinearExpr.Sum(choiceVars) == 1);
+            }
+
+            var weightedVars = new List<BoolVar>();
+            var weights = new List<long>();
+            foreach (var (variant, variable) in variables)
+            {
+                weightedVars.Add(variable);
+                weights.Add(EstimateVariantCost(variant.Function, variant.Layout, specializer));
+            }
+
+            model.Minimize(LinearExpr.WeightedSum(weightedVars, weights));
+            var validation = model.Validate();
+            if (!string.IsNullOrEmpty(validation))
+            {
+                throw new InvalidOperationException($"Function boundary layout CP-SAT model is invalid: {validation}");
+            }
+
+            var solver = new CpSolver
+            {
+                StringParameters = $"max_time_in_seconds:{GetSolveMaxTimeSeconds()},num_workers:{Math.Max(Environment.ProcessorCount / 2, 1)}",
+            };
+            var status = solver.Solve(model);
+            if (status is not (CpSolverStatus.Optimal or CpSolverStatus.Feasible))
+            {
+                throw new InvalidOperationException($"Function boundary layout CP-SAT solve failed: {status}.");
+            }
+
+            var selected = new Dictionary<Function, FunctionBoundaryLayout>(ReferenceEqualityComparer.Instance);
+            foreach (var (variant, variable) in variables)
+            {
+                if (solver.BooleanValue(variable) && !variant.Layout.IsIdentity)
+                {
+                    selected.Add(variant.Function, variant.Layout);
+                }
+            }
+
+            return selected;
+        }
+
+        public static Dictionary<Function, FunctionBoundaryLayout[]> CollectCandidateLayouts(IRModule module, bool enableCallerOutputDemandLayouts = true)
+        {
+            var layouts = new Dictionary<Function, FunctionBoundaryLayout[]>(ReferenceEqualityComparer.Instance);
+            foreach (var function in module.Functions.OfType<Function>())
+            {
+                if (ReferenceEquals(function, module.Entry) || function.IsEntry || !HasFunctionCallUser(function))
+                {
+                    continue;
+                }
+
+                var candidates = new List<FunctionBoundaryLayout> { FunctionBoundaryLayout.Identity(function) };
+                var internalLayout = FunctionBoundaryLayout.TryCreate(function);
+                if (internalLayout is not null)
+                {
+                    candidates.Add(internalLayout);
+                }
+
+                if (enableCallerOutputDemandLayouts)
+                {
+                    foreach (var demandLayout in CollectCallDemandLayouts(function, internalLayout))
+                    {
+                        candidates.Add(demandLayout);
+                    }
+                }
+
+                var distinct = candidates
+                    .Distinct()
+                    .OrderBy(candidate => candidate.IsIdentity ? 0 : 1)
+                    .ThenBy(candidate => candidate.ToString(), StringComparer.Ordinal)
+                    .ToArray();
+                if (distinct.Length > 1)
+                {
+                    layouts.Add(function, distinct);
+                }
+            }
+
+            return layouts;
+        }
+
+        private static IEnumerable<FunctionBoundaryLayout> CollectCallDemandLayouts(Function function, FunctionBoundaryLayout? internalLayout)
+        {
+            var calls = function.Users.OfType<Call>()
+                .Where(call => TryGetTargetFunction(call.Target, out var target, out _) && ReferenceEquals(target, function))
+                .ToArray();
+            foreach (var call in calls)
+            {
+                var outputs = FunctionBoundaryLayout.CreateEmptyOutputs(call.CheckedType);
+                if (call.CheckedType is TupleType tupleType)
+                {
+                    foreach (var user in call.Users.OfType<Call>())
+                    {
+                        if (user.Target is GetItem
+                            && ReferenceEquals(user.Arguments[GetItem.Input.Index], call)
+                            && TryGetItemIndex(user.Arguments[GetItem.Index.Index], out var outputIndex)
+                            && outputIndex >= 0
+                            && outputIndex < tupleType.Count)
+                        {
+                            TryCollectOutputDemand(user, outputIndex, outputs);
+                        }
+                    }
+                }
+                else
+                {
+                    TryCollectOutputDemand(call, 0, outputs);
+                }
+
+                if (outputs.Any(output => output is not null))
+                {
+                    yield return FunctionBoundaryLayout.Merge(function, internalLayout, outputs);
+                }
+            }
+        }
+
+        private static void TryCollectOutputDemand(BaseExpr value, int outputIndex, PortLayout?[] outputs)
+        {
+            foreach (var user in value.Users.OfType<Call>())
+            {
+                if (BoundaryTransform.TryCreate(user, out var consumerTransform, out var input)
+                    && ReferenceEquals(input, value)
+                    && consumerTransform.TryCreateRestoreTransform(value.CheckedType, out var restoreTransform))
+                {
+                    outputs[outputIndex] = new PortLayout(restoreTransform, user.CheckedType, consumerTransform);
+                    return;
+                }
+            }
+        }
+
+        private static long EstimateVariantCost(Function function, FunctionBoundaryLayout layout, FunctionLayoutSpecializer specializer)
+        {
+            var callCount = Math.Max(function.Users.OfType<Call>().Count(call => TryGetTargetFunction(call.Target, out var target, out _) && ReferenceEquals(target, function)), 1);
+            if (layout.IsIdentity)
+            {
+                return checked((IdentityVariantPenalty + (CountBoundaryTransforms(function.Body) * LocalTransformCostScale)) * callCount);
+            }
+
+            var specialized = specializer.CreateDetached(function, layout);
+            var localCost = CountBoundaryTransforms(specialized.Body) * LocalTransformCostScale;
+            var adapterCost = layout.AdapterTransformCount;
+            return checked((localCost + adapterCost) * callCount);
+        }
+
+        private static int CountBoundaryTransforms(BaseExpr expr)
+        {
+            return ExprCollector.Collect(expr)
+                .OfType<Call>()
+                .Count(call => BoundaryTransform.TryCreate(call, out _, out _));
+        }
+
+        private static int GetSolveMaxTimeSeconds()
+        {
+            if (Environment.GetEnvironmentVariable("NNCASE_LAYOUT_SOLVE_MAX_TIME") is { } value
+                && int.TryParse(value, out var seconds)
+                && seconds > 0)
+            {
+                return seconds;
+            }
+
+            return 10;
+        }
+
+        private static string SanitizeName(string name)
+        {
+            return new string(name.Select(ch => char.IsLetterOrDigit(ch) ? ch : '_').ToArray());
+        }
+
+        private sealed record FunctionLayoutVariant(Function Function, FunctionBoundaryLayout Layout);
+    }
+
+    private sealed class BoundaryTransformCleanupRewriter : ExprRewriter
+    {
+        public BoundaryTransformCleanupRewriter()
+            : base(visitOtherFunctions: false)
+        {
+        }
+
+        protected override BaseExpr RewriteLeafCall(Call expr)
+        {
+            if (FunctionBoundaryLayoutPropagationPass.TryFoldPackUnpack(expr, out var folded))
+            {
+                SetMutated();
+                return folded;
+            }
+
+            return expr;
         }
     }
 
@@ -258,20 +526,7 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
 
         private static bool TryFoldPackUnpack(Call expr, out BaseExpr folded)
         {
-            if (expr.Target is Pack pack
-                && BoundaryTransform.Pack(pack).TryStripInverse(expr.Arguments[Pack.Input.Index], out folded))
-            {
-                return true;
-            }
-
-            if (expr.Target is Unpack unpack
-                && BoundaryTransform.Unpack(unpack).TryStripInverse(expr.Arguments[Unpack.Input.Index], out folded))
-            {
-                return true;
-            }
-
-            folded = null!;
-            return false;
+            return FunctionBoundaryLayoutPropagationPass.TryFoldPackUnpack(expr, out folded);
         }
 
         private BaseExpr WrapOutputs(Call rawCall, FunctionBoundaryLayout layout)
@@ -316,13 +571,14 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
         private readonly IRModule _module;
         private readonly bool _useConstShardedView;
         private readonly Dictionary<Function, Dictionary<FunctionBoundaryLayout, Function>> _cache = new(ReferenceEqualityComparer.Instance);
-        private int _nextId;
 
         public FunctionLayoutSpecializer(IRModule module, bool useConstShardedView)
         {
             _module = module;
             _useConstShardedView = useConstShardedView;
         }
+
+        public bool HasReplacements => _cache.Count != 0;
 
         public Function GetOrCreate(Function function, FunctionBoundaryLayout layout)
         {
@@ -339,8 +595,29 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
 
             var specialized = Create(function, layout);
             perFunction.Add(layout, specialized);
-            _module.Add(specialized);
             return specialized;
+        }
+
+        public Function CreateDetached(Function function, FunctionBoundaryLayout layout) => Create(function, layout);
+
+        public void CommitReplacements()
+        {
+            foreach (var (function, perFunction) in _cache)
+            {
+                if (perFunction.Count != 1)
+                {
+                    throw new InvalidOperationException($"Function {function.Name} has {perFunction.Count} layout replacements in one planning iteration.");
+                }
+
+                var replacement = perFunction.Values.Single();
+                var index = _module.Functions.ToList().FindIndex(candidate => ReferenceEquals(candidate, function));
+                if (index < 0)
+                {
+                    throw new InvalidOperationException($"Function {function.Name} is not in the module during layout replacement.");
+                }
+
+                _module.Replace(index, replacement);
+            }
         }
 
         private Function Create(Function function, FunctionBoundaryLayout layout)
@@ -379,7 +656,7 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
             var cloner = new SpecializedBodyCloner(mappedParameters, packedInputs, _useConstShardedView);
             var body = CloneBodyWithPackedOutputs(function.Body, layout, cloner);
             var varMap = RewriteVarMap(function.VarMap, mappedParameters);
-            var specialized = new Function($"{function.Name}__layout_{_nextId++}", function.ModuleKind, body, specializedParameters, varMap);
+            var specialized = new Function(function.Name, function.ModuleKind, body, specializedParameters, varMap);
             if (!CompilerServices.InferenceType(specialized))
             {
                 throw new InvalidOperationException($"Type inference failed for specialized function {specialized.Name} generated from {function.Name}.");
@@ -400,10 +677,30 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
             for (int i = 0; i < fields.Length; i++)
             {
                 var source = fields[i];
-                if (layout.Outputs[i] is { } outputLayout
-                    && outputLayout.Transform.TryStrip(source, out var transformedOutput))
+                if (layout.Outputs[i] is { SourceTransform: { } sourceTransform } outputLayout)
                 {
-                    source = transformedOutput;
+                    if (source is not Expr sourceExpr)
+                    {
+                        throw new InvalidOperationException($"Cannot apply output source transform {sourceTransform} to non-expression output.");
+                    }
+
+                    source = sourceTransform.Apply(sourceExpr, _useConstShardedView);
+                    Infer(source, $"output source transform {sourceTransform}");
+                    if (!Equals(source.CheckedType, outputLayout.TransformedType))
+                    {
+                        throw new InvalidOperationException($"Output source transform {sourceTransform} produced {source.CheckedType}, expected {outputLayout.TransformedType}.");
+                    }
+                }
+                else if (layout.Outputs[i] is { } strippedOutputLayout)
+                {
+                    if (strippedOutputLayout.Transform.TryStrip(source, out var transformedOutput))
+                    {
+                        source = transformedOutput;
+                    }
+                    else if (!Equals(source.CheckedType, strippedOutputLayout.TransformedType))
+                    {
+                        throw new InvalidOperationException($"Cannot strip output transform {strippedOutputLayout.Transform} from {source.CheckedType}; expected specialized output type {strippedOutputLayout.TransformedType}.");
+                    }
                 }
 
                 clonedFields[i] = cloner.Clone(source, default);
@@ -499,17 +796,27 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
 
     private sealed class FunctionBoundaryLayout : IEquatable<FunctionBoundaryLayout>
     {
-        public FunctionBoundaryLayout(PortLayout?[] inputs, PortLayout?[] outputs)
+        public FunctionBoundaryLayout(PortLayout?[] inputs, PortLayout?[] outputs, bool isIdentity = false)
         {
             Inputs = inputs;
             Outputs = outputs;
+            IsIdentity = isIdentity;
         }
 
         public PortLayout?[] Inputs { get; }
 
         public PortLayout?[] Outputs { get; }
 
+        public bool IsIdentity { get; }
+
         public bool HasOutputLayout => Outputs.Any(x => x is not null);
+
+        public int AdapterTransformCount => Inputs.Count(input => input is not null) + Outputs.Count(output => output is not null);
+
+        public static FunctionBoundaryLayout Identity(Function function)
+        {
+            return new FunctionBoundaryLayout(new PortLayout?[function.Parameters.Length], CreateEmptyOutputs(function.Body.CheckedType), true);
+        }
 
         public static FunctionBoundaryLayout? TryCreate(Function function)
         {
@@ -523,11 +830,44 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
             return new FunctionBoundaryLayout(inputs, outputs);
         }
 
+        public static FunctionBoundaryLayout Merge(Function function, FunctionBoundaryLayout? baseLayout, IReadOnlyList<PortLayout?> demandedOutputs)
+        {
+            var inputs = new PortLayout?[function.Parameters.Length];
+            if (baseLayout is not null)
+            {
+                Array.Copy(baseLayout.Inputs, inputs, inputs.Length);
+            }
+
+            var outputs = CreateEmptyOutputs(function.Body.CheckedType);
+            if (baseLayout is not null)
+            {
+                Array.Copy(baseLayout.Outputs, outputs, outputs.Length);
+            }
+
+            if (demandedOutputs.Count != outputs.Length)
+            {
+                throw new InvalidOperationException($"Output demand layout rank mismatch for function {function.Name}: expected {outputs.Length}, got {demandedOutputs.Count}.");
+            }
+
+            for (int i = 0; i < outputs.Length; i++)
+            {
+                outputs[i] ??= demandedOutputs[i];
+            }
+
+            return new FunctionBoundaryLayout(inputs, outputs);
+        }
+
+        public static PortLayout?[] CreateEmptyOutputs(IRType returnType)
+        {
+            return returnType is TupleType tupleType ? new PortLayout?[tupleType.Count] : new PortLayout?[1];
+        }
+
         public static BaseExpr[] FlattenReturn(BaseExpr body) => body is IR.Tuple tuple ? tuple.Fields.ToArray() : [body];
 
         public bool Equals(FunctionBoundaryLayout? other)
         {
             return other is not null
+                && IsIdentity == other.IsIdentity
                 && LayoutArraysEqual(Inputs, other.Inputs)
                 && LayoutArraysEqual(Outputs, other.Outputs);
         }
@@ -537,6 +877,7 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
         public override int GetHashCode()
         {
             var hash = default(HashCode);
+            hash.Add(IsIdentity);
             AddLayoutArrayHash(ref hash, Inputs);
             AddLayoutArrayHash(ref hash, Outputs);
             return hash.ToHashCode();
@@ -544,7 +885,9 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
 
         public override string ToString()
         {
-            return $"inputs=[{string.Join(", ", Inputs.Select(x => x?.ToString() ?? "-"))}], outputs=[{string.Join(", ", Outputs.Select(x => x?.ToString() ?? "-"))}]";
+            return IsIdentity
+                ? "identity"
+                : $"inputs=[{string.Join(", ", Inputs.Select(x => x?.ToString() ?? "-"))}], outputs=[{string.Join(", ", Outputs.Select(x => x?.ToString() ?? "-"))}]";
         }
 
         private static PortLayout?[] AnalyzeInputs(Function function)
@@ -636,8 +979,8 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
 
             for (int i = 0; i < lhs.Count; i++)
             {
-                var lhsLayout = lhs[i]?.Transform;
-                var rhsLayout = rhs[i]?.Transform;
+                var lhsLayout = lhs[i];
+                var rhsLayout = rhs[i];
                 if (lhsLayout is null || rhsLayout is null)
                 {
                     if (lhsLayout is not null || rhsLayout is not null)
@@ -661,24 +1004,44 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
         {
             foreach (var value in values)
             {
-                hash.Add(value?.Transform);
+                hash.Add(value);
             }
         }
     }
 
-    private sealed class PortLayout
+    private sealed class PortLayout : IEquatable<PortLayout>
     {
-        public PortLayout(BoundaryTransform transform, IRType transformedType)
+        public PortLayout(BoundaryTransform transform, IRType transformedType, BoundaryTransform? sourceTransform = null)
         {
             Transform = transform;
             TransformedType = transformedType;
+            SourceTransform = sourceTransform;
         }
 
         public BoundaryTransform Transform { get; }
 
         public IRType TransformedType { get; }
 
-        public override string ToString() => $"{Transform}->{TransformedType}";
+        public BoundaryTransform? SourceTransform { get; }
+
+        public bool Equals(PortLayout? other)
+        {
+            return other is not null
+                && Transform.Equals(other.Transform)
+                && Equals(TransformedType, other.TransformedType)
+                && Equals(SourceTransform, other.SourceTransform);
+        }
+
+        public override bool Equals(object? obj) => Equals(obj as PortLayout);
+
+        public override int GetHashCode() => HashCode.Combine(Transform, TransformedType, SourceTransform);
+
+        public override string ToString()
+        {
+            return SourceTransform is null
+                ? $"{Transform}->{TransformedType}"
+                : $"{SourceTransform}=>{TransformedType}; restore {Transform}";
+        }
     }
 
     private sealed class BoundaryTransform : IEquatable<BoundaryTransform>
@@ -860,6 +1223,21 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
             return false;
         }
 
+        public bool TryCreateRestoreTransform(IRType originalType, out BoundaryTransform restoreTransform)
+        {
+            restoreTransform = Kind switch
+            {
+                BoundaryTransformKind.Pack => new BoundaryTransform(BoundaryTransformKind.Unpack, lanes: Lanes, axes: Axes),
+                BoundaryTransformKind.Unpack => new BoundaryTransform(BoundaryTransformKind.Pack, lanes: Lanes, axes: Axes),
+                BoundaryTransformKind.Transpose => Transpose(InvertPerm(Perm)),
+                BoundaryTransformKind.Bitcast => BitcastToType(originalType),
+                BoundaryTransformKind.Boxing => BoxingToType(originalType),
+                _ => null!,
+            };
+
+            return restoreTransform is not null;
+        }
+
         public bool Equals(BoundaryTransform? other)
         {
             return other is not null
@@ -943,6 +1321,16 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
                 DistributedType distributed => distributed.TensorType.DType,
                 _ => throw new InvalidOperationException($"Cannot get tensor dtype for {context} from {type}."),
             };
+        }
+
+        private static BoundaryTransform BitcastToType(IRType type)
+        {
+            return new BoundaryTransform(BoundaryTransformKind.Bitcast, newType: GetDType(type, "bitcast restore transform"));
+        }
+
+        private static BoundaryTransform BoxingToType(IRType type)
+        {
+            return new BoundaryTransform(BoundaryTransformKind.Boxing, newIRType: type);
         }
     }
 }

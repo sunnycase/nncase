@@ -22,21 +22,19 @@ public sealed class BoxingEvaluator : ITypeInferencer<Boxing>, ICostEvaluator<Bo
     {
         IRType VisitD2D(DistributedType inv, DistributedType outv)
         {
+            if (inv.TensorType != outv.TensorType)
+            {
+                return new InvalidType($"D2D boxing requires the same tensor type, but got {inv.TensorType} -> {outv.TensorType}");
+            }
+
+            if (inv.Placement != outv.Placement)
+            {
+                return new InvalidType($"D2D boxing requires the same placement, but got {inv.Placement} -> {outv.Placement}");
+            }
+
             if (inv == outv)
             {
                 return new InvalidType("Same DistributedType");
-            }
-
-            if (inv.TensorType != outv.TensorType)
-            {
-                if (!inv.AxisPolicies.Any(sbp => sbp is SBPPartial) && inv.Partial is null)
-                {
-                    return outv;
-                }
-                else
-                {
-                    return new InvalidType("Not Support Partial when shape changes.");
-                }
             }
 
             if (inv.AxisPolicies.Any(sbp => sbp is SBPPartial) || outv.AxisPolicies.Any(sbp => sbp is SBPPartial))

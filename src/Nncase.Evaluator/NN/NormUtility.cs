@@ -28,7 +28,7 @@ internal static class NormUtility
             return TensorType.Invalid(DataTypes.Float32);
         }
 
-        var statsDType = GetStatsDataType(input.DType);
+        var statsDType = DataTypes.Float32;
         if (input.Shape.IsUnranked)
         {
             return TensorType.Unranked(statsDType);
@@ -67,7 +67,9 @@ internal static class NormUtility
             size = checked(size * shape[i].FixedValue);
         }
 
-        return size;
+        return input.DType is VectorType vectorType
+            ? checked(size * vectorType.Lanes.Aggregate(1L, static (acc, lane) => acc * lane))
+            : size;
     }
 
     public static bool HasPartial(DistributedType distributedType)
@@ -78,21 +80,4 @@ internal static class NormUtility
 
     public static bool IsParameterPolicyCompatible(SBP inputPolicy, SBP parameterPolicy)
         => IsSamePolicy(inputPolicy, parameterPolicy);
-
-    private static DataType GetStatsDataType(DataType inputDType)
-    {
-        if (inputDType is not VectorType vectorType)
-        {
-            return DataTypes.Float32;
-        }
-
-        var lanes = vectorType.Lanes.ToArray();
-        if (vectorType.ElemType.SizeInBytes < DataTypes.Float32.SizeInBytes)
-        {
-            var scale = DataTypes.Float32.SizeInBytes / vectorType.ElemType.SizeInBytes;
-            lanes = new[] { scale }.Concat(lanes).ToArray();
-        }
-
-        return new VectorType(DataTypes.Float32, lanes);
-    }
 }

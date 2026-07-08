@@ -36,14 +36,14 @@ public sealed class UnitTestFunctionBoundaryLayoutPropagation : TestClassBase
         module.Add(layer);
         await new FunctionBoundaryLayoutPropagationPass().RunAsync(module, new());
 
-        var specialized = module.Functions.OfType<Function>().Where(x => x.Name.StartsWith("layer__layout_", StringComparison.Ordinal)).ToArray();
-        Assert.Single(specialized);
+        AssertNoLayoutFunctions(module);
+        var specialized = GetFunction(module, "layer");
 
         var mainBody = CompilerServices.Print(main.Body);
         Assert.Equal(1, Count(mainBody, "Pack("));
         Assert.Equal(1, Count(mainBody, "Unpack("));
 
-        var specializedBody = CompilerServices.Print(specialized[0].Body);
+        var specializedBody = CompilerServices.Print(specialized.Body);
         Assert.DoesNotContain("Pack(", specializedBody, StringComparison.Ordinal);
         Assert.DoesNotContain("Unpack(", specializedBody, StringComparison.Ordinal);
     }
@@ -82,6 +82,33 @@ public sealed class UnitTestFunctionBoundaryLayoutPropagation : TestClassBase
     }
 
     [Fact]
+    public async Task TestCallerOutputPackDemandSpecializesCalleeOutput()
+    {
+        var layerInput = new Var("layer_input", new TensorType(DataTypes.Float32, new RankedShape(4, 16)));
+        var layer = new Function("layer", IR.F.Math.Unary(UnaryOp.Abs, layerInput), layerInput);
+        Assert.True(layer.InferenceType());
+
+        var input = new Var("input", new TensorType(DataTypes.Float32, new RankedShape(4, 16)));
+        var main = new Function("main", Pack(new Call(layer, input), [4], [1]), input);
+        Assert.True(main.InferenceType());
+
+        var module = new IRModule(main);
+        module.Add(layer);
+        await new FunctionBoundaryLayoutPropagationPass().RunAsync(module, new());
+
+        AssertNoLayoutFunctions(module);
+        var specialized = GetFunction(module, "layer");
+        var specializedBody = CompilerServices.Print(specialized.Body);
+        Assert.Contains("Pack(", specializedBody, StringComparison.Ordinal);
+
+        var mainCall = Assert.IsType<Call>(main.Body);
+        var target = Assert.IsType<Function>(mainCall.Target);
+        Assert.Equal("layer", target.Name);
+        var mainType = Assert.IsType<TensorType>(mainCall.CheckedType);
+        Assert.IsType<VectorType>(mainType.DType);
+    }
+
+    [Fact]
     public async Task TestDynamicDimensionIdentityIsPreservedInSpecializedBody()
     {
         var n = new DimVar("n");
@@ -101,7 +128,8 @@ public sealed class UnitTestFunctionBoundaryLayoutPropagation : TestClassBase
         module.Add(layer);
         await new FunctionBoundaryLayoutPropagationPass().RunAsync(module, new());
 
-        var specialized = Assert.Single(module.Functions.OfType<Function>().Where(x => x.Name.StartsWith("layer__layout_", StringComparison.Ordinal)));
+        AssertNoLayoutFunctions(module);
+        var specialized = GetFunction(module, "layer");
         var outputType = Assert.IsType<TensorType>(specialized.Body.CheckedType);
         var outputShape = Assert.IsType<RankedShape>(outputType.Shape);
         Assert.Equal(n, outputShape[0]);
@@ -126,7 +154,8 @@ public sealed class UnitTestFunctionBoundaryLayoutPropagation : TestClassBase
         module.Add(layer);
         await new FunctionBoundaryLayoutPropagationPass().RunAsync(module, new());
 
-        var specialized = Assert.Single(module.Functions.OfType<Function>().Where(x => x.Name.StartsWith("layer__layout_", StringComparison.Ordinal)));
+        AssertNoLayoutFunctions(module);
+        var specialized = GetFunction(module, "layer");
         var parameter = Assert.IsType<Var>(Assert.Single(specialized.Parameters.ToArray()));
         var parameterType = Assert.IsType<TensorType>(parameter.CheckedType);
         Assert.IsType<VectorType>(parameterType.DType);
@@ -160,8 +189,7 @@ public sealed class UnitTestFunctionBoundaryLayoutPropagation : TestClassBase
         module.Add(layer);
         await new FunctionBoundaryLayoutPropagationPass().RunAsync(module, new());
 
-        var specialized = module.Functions.OfType<Function>().Where(x => x.Name.StartsWith("layer__layout_", StringComparison.Ordinal)).ToArray();
-        Assert.Equal(2, specialized.Length);
+        AssertNoLayoutFunctions(module);
 
         var outputUnpack4 = Assert.IsType<Call>(main.Body);
         Assert.IsType<Nncase.IR.Tensors.Unpack>(outputUnpack4.Target);
@@ -174,6 +202,7 @@ public sealed class UnitTestFunctionBoundaryLayoutPropagation : TestClassBase
         Assert.IsType<Nncase.IR.Tensors.Pack>(boundaryPack4.Target);
 
         var finalSpecialized = Assert.IsType<Function>(specializedCall.Target);
+        Assert.Equal("layer", finalSpecialized.Name);
         var specializedBody = CompilerServices.Print(finalSpecialized.Body);
         Assert.DoesNotContain("Pack(", specializedBody, StringComparison.Ordinal);
         Assert.DoesNotContain("Unpack(", specializedBody, StringComparison.Ordinal);
@@ -196,7 +225,8 @@ public sealed class UnitTestFunctionBoundaryLayoutPropagation : TestClassBase
         module.Add(layer);
         await new FunctionBoundaryLayoutPropagationPass().RunAsync(module, new());
 
-        var specialized = Assert.Single(module.Functions.OfType<Function>().Where(x => x.Name.StartsWith("layer__layout_", StringComparison.Ordinal)));
+        AssertNoLayoutFunctions(module);
+        var specialized = GetFunction(module, "layer");
         Assert.Equal(2, specialized.Parameters.Length);
         Assert.IsType<Var>(specialized.Parameters[0]);
         Assert.Same(layerId, specialized.Parameters[1]);
@@ -227,7 +257,8 @@ public sealed class UnitTestFunctionBoundaryLayoutPropagation : TestClassBase
 
         await passManager.RunAsync(module);
 
-        var specialized = Assert.Single(module.Functions.OfType<Function>().Where(x => x.Name.StartsWith("layer__layout_", StringComparison.Ordinal)));
+        AssertNoLayoutFunctions(module);
+        var specialized = GetFunction(module, "layer");
         var parameter = Assert.IsType<Var>(Assert.Single(specialized.Parameters.ToArray()));
         Assert.Equal(distributedType, parameter.CheckedType);
         Assert.Equal(distributedType, specialized.Body.CheckedType);
@@ -267,7 +298,8 @@ public sealed class UnitTestFunctionBoundaryLayoutPropagation : TestClassBase
 
         await passManager.RunAsync(module);
 
-        var specialized = Assert.Single(module.Functions.OfType<Function>().Where(x => x.Name.StartsWith("layer__layout_", StringComparison.Ordinal)));
+        AssertNoLayoutFunctions(module);
+        var specialized = GetFunction(module, "layer");
         var parameter = Assert.IsType<Var>(Assert.Single(specialized.Parameters.ToArray()));
         Assert.IsType<DistributedType>(parameter.CheckedType);
         var specializedBody = CompilerServices.Print(specialized.Body);
@@ -354,7 +386,8 @@ public sealed class UnitTestFunctionBoundaryLayoutPropagation : TestClassBase
         passManager.Add<FunctionBoundaryLayoutPropagationPass>();
         await passManager.RunAsync(module);
 
-        var specialized = Assert.Single(module.Functions.OfType<Function>().Where(x => x.Name.StartsWith("layer__layout_", StringComparison.Ordinal)));
+        AssertNoLayoutFunctions(module);
+        var specialized = GetFunction(module, "layer");
         Assert.DoesNotContain("Boxing(", CompilerServices.Print(specialized.Body), StringComparison.Ordinal);
         var mainCalls = ExprCollector.Collect(main.Body).OfType<Call>().ToArray();
         Assert.Contains(mainCalls, call => call.Target is IR.Distributed.ShardedView && call.Arguments[IR.Distributed.ShardedView.Input.Index] is TensorConst);
@@ -460,7 +493,8 @@ public sealed class UnitTestFunctionBoundaryLayoutPropagation : TestClassBase
 
         await passManager.RunAsync(module);
 
-        var specialized = Assert.Single(module.Functions.OfType<Function>().Where(x => x.Name.StartsWith("layer__layout_", StringComparison.Ordinal)));
+        AssertNoLayoutFunctions(module);
+        var specialized = GetFunction(module, "layer");
         Assert.DoesNotContain("Transpose(", CompilerServices.Print(specialized.Body), StringComparison.Ordinal);
         Assert.DoesNotContain("Transpose(", CompilerServices.Print(main.Body), StringComparison.Ordinal);
         Assert.Contains("f32[3,2]", CompilerServices.Print(main.Body), StringComparison.Ordinal);
@@ -490,7 +524,8 @@ public sealed class UnitTestFunctionBoundaryLayoutPropagation : TestClassBase
 
         await passManager.RunAsync(module);
 
-        var specialized = Assert.Single(module.Functions.OfType<Function>().Where(x => x.Name.StartsWith("layer__layout_", StringComparison.Ordinal)));
+        AssertNoLayoutFunctions(module);
+        var specialized = GetFunction(module, "layer");
         Assert.DoesNotContain("Bitcast(", CompilerServices.Print(specialized.Body), StringComparison.Ordinal);
         var mainBody = CompilerServices.Print(main.Body);
         Assert.DoesNotContain("Pack(", mainBody, StringComparison.Ordinal);
@@ -542,6 +577,16 @@ public sealed class UnitTestFunctionBoundaryLayoutPropagation : TestClassBase
         var packed = Pack(input, [4], [1]);
         var output = Unpack(packed, [4], [1]);
         return new Function(name, output, new IVar[] { input }.Concat(extraParameters).ToArray());
+    }
+
+    private static Function GetFunction(IRModule module, string name)
+    {
+        return Assert.Single(module.Functions.OfType<Function>().Where(x => x.Name == name));
+    }
+
+    private static void AssertNoLayoutFunctions(IRModule module)
+    {
+        Assert.DoesNotContain(module.Functions.OfType<Function>(), x => x.Name.Contains("__layout_", StringComparison.Ordinal));
     }
 
     private static int Count(string text, string value)

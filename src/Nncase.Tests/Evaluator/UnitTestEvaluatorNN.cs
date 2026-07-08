@@ -509,6 +509,18 @@ public class UnitTestEvaluatorNN : TestClassBase
     }
 
     [Fact]
+    public void TestNormStatsVectorizedReduceAxis()
+    {
+        var input = Testing.Rand<float>(2, 16);
+        var expected = IR.F.NN.NormStats(1, input, useMean: true).Evaluate();
+        var packed = IR.F.Tensors.Pack(input, [4], [1]);
+        var actualExpr = IR.F.NN.NormStats(1, packed, useMean: true);
+
+        Assert.Equal(new TensorType(DataTypes.Float32, new long[] { 2, 2, 1 }), actualExpr.CheckedType);
+        Comparator.Compare(expected, actualExpr.Evaluate(), 0.999f);
+    }
+
+    [Fact]
     public void TestL2Normalization()
     {
         var a = new float[] { 0F, 2F, 3F, 2F, 2F, 2F };

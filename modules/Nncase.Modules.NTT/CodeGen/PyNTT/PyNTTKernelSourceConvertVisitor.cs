@@ -307,7 +307,6 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
         private readonly Dictionary<int, int> _outputAliases = new();
         private readonly SharedHelperRegistry _sharedHelperRegistry;
         private readonly PyNTTDimExpressionEmitter _dimEmitter;
-        private readonly PyNTTDimExpressionEmitter _localRegionDimEmitter;
         private long _collectiveDataPoolBytes;
         private int _bodyIndent;
 
@@ -333,7 +332,6 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             _extraAttrs = extraAttrs;
             _sharedHelperRegistry = sharedHelperRegistry;
             _dimEmitter = new(RegisterRuntimeScalar, threadIdExpression: BuildThreadIdExpression(targetOptions));
-            _localRegionDimEmitter = new(RegisterLocalRegionRuntimeScalar, FormatLocalRegionRuntimeScalar, threadIdExpression: BuildThreadIdExpression(targetOptions));
         }
 
         public GeneratedPrimFunctionKernel Build()
@@ -1571,13 +1569,13 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
 
         private void VisitCast(Nncase.TIR.NTT.Cast cast, IReadOnlyList<BaseExpr> args)
         {
-            if (args.Count < 2 ||
-                args[0] is not TIR.Buffer input ||
-                args[1] is not TIR.Buffer output)
+            if (args.Count < 2)
             {
                 throw new NotSupportedException("PyNTT Cast codegen expects TIR buffer operands.");
             }
 
+            var input = GetBufferOperand(args[0], "PyNTT Cast input");
+            var output = GetBufferOperand(args[1], "PyNTT Cast output");
             if (args.Count > 2 && args[2] is not None)
             {
                 throw new NotSupportedException("PyNTT Cast codegen does not support post ops yet.");
@@ -1636,6 +1634,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     (string)_attrs["cast_mode"],
                     $"{input.Name} -> {output.Name}"));
             WriteLine(BuildHelperCall(helperName));
+            MarkStoredOutput(output, "PyNTT Cast");
         }
 
         private void VisitWhere(IReadOnlyList<BaseExpr> args)
@@ -3586,9 +3585,9 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             var normalizedAxis = NormalizeAxis(normStats.Axis, inputShape.Length, "PyNTT NormStats");
             var inputVectorLaneCount = GetSingleVectorLaneCount(input.ElemType, "PyNTT NormStats input");
             var outputVectorLaneCount = GetSingleVectorLaneCount(output.ElemType, "PyNTT NormStats output");
-            if (inputVectorLaneCount != 1 || outputVectorLaneCount != 1)
+            if (outputVectorLaneCount != 1)
             {
-                throw new NotSupportedException("PyNTT NormStats codegen currently expects scalar buffer dtypes.");
+                throw new NotSupportedException("PyNTT NormStats expects scalar stats output buffer dtype.");
             }
 
             ValidateNormStatsShape("PyNTT NormStats", inputShape, outputShape, normalizedAxis, normStats.UseMean);
@@ -3624,29 +3623,24 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
 
         private void VisitNormApply(Nncase.TIR.NTT.NormApply normApply, IReadOnlyList<BaseExpr> args)
         {
-            if (args.Count < 5 ||
-                args[0] is not TIR.Buffer input ||
-                args[1] is not TIR.Buffer stats ||
-                args[2] is not TIR.Buffer scale ||
-                args[3] is not TIR.Buffer bias ||
-                args[4] is not TIR.Buffer output)
+            if (args.Count < 5)
             {
                 throw new NotSupportedException("PyNTT NormApply codegen expects input, stats, scale, bias, and output TIR buffers.");
             }
 
+            var input = GetBufferOperand(args[0], "PyNTT NormApply input");
+            var stats = GetBufferOperand(args[1], "PyNTT NormApply stats");
+            var scale = GetBufferOperand(args[2], "PyNTT NormApply scale");
+            var bias = GetBufferOperand(args[3], "PyNTT NormApply bias");
+            var output = GetBufferOperand(args[4], "PyNTT NormApply output");
             SetComputeOp(normApply.UseMean ? "norm_apply" : "rms_norm_apply");
-            var inputShape = GetBufferShape(input);
+            var inputShape = GetBufferActiveShape(input);
             var inputGlobalShape = GetBufferGlobalShape(input);
-            var statsShape = GetBufferShape(stats);
-            var scaleShape = GetBufferShape(scale);
-            var biasShape = GetBufferShape(bias);
-            var outputShape = GetBufferShape(output);
+            var statsShape = GetBufferActiveShape(stats);
+            var scaleShape = GetBufferActiveShape(scale);
+            var biasShape = GetBufferActiveShape(bias);
+            var outputShape = GetBufferActiveShape(output);
             var normalizedAxis = NormalizeAxis(normApply.Axis, outputShape.Length, "PyNTT NormApply");
-            ValidateSameShape("PyNTT NormApply", inputShape, outputShape);
-            ValidateNormStatsShape("PyNTT NormApply stats", outputShape, statsShape, normalizedAxis, normApply.UseMean);
-            ValidateLayerNormShape("PyNTT NormApply scale", scaleShape, outputShape, normalizedAxis);
-            ValidateLayerNormShape("PyNTT NormApply bias", biasShape, outputShape, normalizedAxis);
-
             var inputVectorLaneCount = GetSingleVectorLaneCount(input.ElemType, "PyNTT NormApply input");
             var statsVectorLaneCount = GetSingleVectorLaneCount(stats.ElemType, "PyNTT NormApply stats");
             var scaleVectorLaneCount = GetSingleVectorLaneCount(scale.ElemType, "PyNTT NormApply scale");
@@ -3667,10 +3661,20 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 throw new NotSupportedException("PyNTT NormApply vectorized axis must be inside the normalized dimensions.");
             }
 
+            var logicalInputShape = GetLogicalVectorShape(inputShape, inputVectorLaneCount);
+            var logicalStatsShape = GetLogicalVectorShape(statsShape, statsVectorLaneCount);
+            var logicalScaleShape = GetLogicalVectorShape(scaleShape, scaleVectorLaneCount);
+            var logicalBiasShape = GetLogicalVectorShape(biasShape, biasVectorLaneCount);
+            var logicalOutputShape = GetLogicalVectorShape(outputShape, outputVectorLaneCount);
+            ValidateSameShape("PyNTT NormApply", logicalInputShape, logicalOutputShape);
+            ValidateNormStatsShape("PyNTT NormApply stats", logicalOutputShape, logicalStatsShape, normalizedAxis, normApply.UseMean);
+            ValidateLayerNormShape("PyNTT NormApply scale", logicalScaleShape, logicalOutputShape, normalizedAxis);
+            ValidateLayerNormShape("PyNTT NormApply bias", logicalBiasShape, logicalOutputShape, normalizedAxis);
+
             _attrs["op"] = normApply.UseMean ? "norm_apply" : "rms_norm_apply";
             _attrs["tir"] = true;
             _attrs["dtype"] = GetPyNTTScalarDTypeName(output.ElemType);
-            _attrs["shape"] = outputShape;
+            _attrs["shape"] = logicalOutputShape;
             _attrs["axis"] = normalizedAxis;
             _attrs["epsilon"] = normApply.Epsilon;
             _attrs["use_mean"] = normApply.UseMean;
@@ -3715,6 +3719,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     normApply.UseMean,
                     $"{input.Name}, {stats.Name}, {scale.Name}, {bias.Name} -> {output.Name}"));
             WriteLine(BuildHelperCall(helperName));
+            MarkStoredOutput(output, "PyNTT NormApply");
         }
 
         private void VisitGetPositionIds(Nncase.TIR.NTT.GetPositionIds getPositionIds, IReadOnlyList<BaseExpr> args)
@@ -4583,8 +4588,9 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     .Select(axis => (Dimension)new DimVar($"{ShardCoordDimPrefix}{axis}"))
                     .ToArray();
                 var (_, activeShape) = DistributedUtility.GetLocalOffsetAndShape(distributedType, shardIndex);
+                var hierarchy = distributedType.Placement.Hierarchy.ToArray();
                 return activeShape
-                    .Select(GetLocalRegionDimensionExpression)
+                    .Select(dimension => GetLocalRegionDimensionExpression(dimension, hierarchy))
                     .ToArray();
             }
 
@@ -4645,13 +4651,13 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
         private string GetBufferOffsetBytes(TIR.Buffer buffer)
         {
             var physicalOffset = GetDimensionExpression(buffer.MemSpan.Buffer.Start, $"{buffer.MemSpan.Buffer.Location} physical buffer offset");
-            var spanOffset = GetLocalRegionDimensionExpression(buffer.MemSpan.Start);
+            var spanOffset = GetLocalRegionDimensionExpression(buffer.MemSpan.Start, GetShardCoordHierarchy(buffer));
             return AddOffsetExpressions(physicalOffset.TritonExpression, spanOffset.TritonExpression);
         }
 
         private string GetBufferSpanOffsetBytes(TIR.Buffer buffer)
         {
-            var spanOffset = GetLocalRegionDimensionExpression(buffer.MemSpan.Start);
+            var spanOffset = GetLocalRegionDimensionExpression(buffer.MemSpan.Start, GetShardCoordHierarchy(buffer));
             return spanOffset.TritonExpression;
         }
 
@@ -4675,7 +4681,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             var globalShape = GetRankedShapeDimensions(distributedType.TensorType.Shape, $"{buffer.Name} distributed global shape").ToArray();
             var globalStrides = TensorUtilities.GetDefaultStrides(globalShape);
             var offsetElements = TensorUtilities.GetLinearOffset(globalStrides, localOffset) * GetVectorLaneElementCount(buffer.ElemType);
-            return GetLocalRegionDimensionExpression(offsetElements).TritonExpression;
+            return GetLocalRegionDimensionExpression(offsetElements, distributedType.Placement.Hierarchy.ToArray()).TritonExpression;
         }
 
         private int[] GetHierarchy(TIR.Buffer buffer)
@@ -4764,7 +4770,14 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
 
         private PyNTTDimExpression GetDimensionExpression(Dimension dimension) => _dimEmitter.Emit(dimension);
 
-        private PyNTTDimExpression GetLocalRegionDimensionExpression(Dimension dimension) => _localRegionDimEmitter.Emit(dimension);
+        private PyNTTDimExpression GetLocalRegionDimensionExpression(Dimension dimension, IReadOnlyList<int> hierarchy)
+        {
+            var emitter = new PyNTTDimExpressionEmitter(
+                RegisterLocalRegionRuntimeScalar,
+                name => FormatLocalRegionRuntimeScalar(name, hierarchy),
+                BuildThreadIdExpression(_targetOptions));
+            return emitter.Emit(dimension);
+        }
 
         private PyNTTDimExpression GetDimensionExpression(BaseExpr expr, string name)
         {
@@ -4878,8 +4891,30 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             }
         }
 
-        private static string FormatLocalRegionRuntimeScalar(string name)
-            => TryGetShardCoordDimAxis(name, out var axis) ? $"shard_coord{axis}" : name;
+        private static string FormatLocalRegionRuntimeScalar(string name, IReadOnlyList<int> hierarchy)
+            => TryGetShardCoordDimAxis(name, out var axis) ? BuildShardCoordExpression(axis, hierarchy) : name;
+
+        private static string BuildShardCoordExpression(int axis, IReadOnlyList<int> hierarchy)
+        {
+            if (axis < 0 || axis >= hierarchy.Count)
+            {
+                throw new NotSupportedException($"PyNTT local shard coordinate axis {axis} is outside hierarchy rank {hierarchy.Count}.");
+            }
+
+            var divisor = 1;
+            for (var i = axis + 1; i < hierarchy.Count; i++)
+            {
+                divisor = checked(divisor * hierarchy[i]);
+            }
+
+            var dividend = divisor == 1
+                ? "shard_index"
+                : $"(shard_index // {divisor.ToString(CultureInfo.InvariantCulture)})";
+            var extent = hierarchy[axis];
+            return extent == 1
+                ? "0"
+                : $"(({dividend}) % {extent.ToString(CultureInfo.InvariantCulture)})";
+        }
 
         private static bool TryGetShardCoordDimAxis(string name, out int axis)
         {

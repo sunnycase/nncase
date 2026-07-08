@@ -71,14 +71,22 @@ public abstract class TIRSelectionPass : FunctionPass
 
     private void AddOutputBufferAllocsToCallers(Function function, IEnumerable<BufferVar> outputBuffers, IEnumerable<Call> callers)
     {
-        var outputBufferShapes = outputBuffers.Select(x => (ElemType: x.CheckedDataType, Shape: x.CheckedShape)).ToArray();
+        var outputBufferTypes = outputBuffers.Select(x => x.CheckedType).ToArray();
         foreach (var caller in callers)
         {
-            var outputAllocs = outputBufferShapes.Select(x => IR.F.Buffer.Uninitialized(x.ElemType, TIR.MemoryLocation.Data, x.Shape));
+            var outputAllocs = outputBufferTypes.Select(CreateDataUninitialized);
             var newArgs = caller.Arguments.ToArray().Concat(outputAllocs).ToArray();
             var newCaller = caller.With(arguments: newArgs);
             ReplaceUtility.ReplaceAllUsesWith(caller, newCaller);
         }
+
+        static Expr CreateDataUninitialized(IRType type)
+            => type switch
+            {
+                DistributedType dt => IR.F.Buffer.Uninitialized(dt.TensorType.DType, TIR.MemoryLocation.Data, dt.TensorType.Shape, dt.AxisPolicies, dt.Placement),
+                TensorType tt => IR.F.Buffer.Uninitialized(tt.DType, TIR.MemoryLocation.Data, tt.Shape),
+                _ => throw new InvalidOperationException($"TIR selection caller-allocated output expects tensor type, got {type.GetType().Name}."),
+            };
     }
 
     private sealed record SelectionResult(Sequential Body, IReadOnlyList<IVar> InputBuffers, IReadOnlyList<BufferVar> OutputBuffers);

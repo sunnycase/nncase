@@ -149,7 +149,7 @@ internal sealed class NormApplyCandidateProvider : DistributedCandidateProvider<
             return TensorType.Invalid(DataTypes.Float32);
         }
 
-        var statsDType = GetStatsDataType(input.DType);
+        var statsDType = DataTypes.Float32;
         if (input.Shape.IsUnranked)
         {
             return TensorType.Unranked(statsDType);
@@ -173,40 +173,7 @@ internal sealed class NormApplyCandidateProvider : DistributedCandidateProvider<
 
     private static IReadOnlyList<TensorType> GetCompatibleStatsTensorTypes(TensorType input, int axis, bool useMean)
     {
-        var result = new List<TensorType>(2);
-        var vectorStats = GetStatsTensorType(input, axis, useMean);
-        if (!vectorStats.Shape.IsInvalid)
-        {
-            result.Add(vectorStats);
-        }
-
-        if (input.DType is VectorType vectorType)
-        {
-            var scalarInput = new TensorType(vectorType.ElemType, input.Shape);
-            var scalarStats = GetStatsTensorType(scalarInput, axis, useMean);
-            if (!scalarStats.Shape.IsInvalid && result.All(existing => existing != scalarStats))
-            {
-                result.Add(scalarStats);
-            }
-        }
-
-        return result;
-    }
-
-    private static DataType GetStatsDataType(DataType inputDType)
-    {
-        if (inputDType is not VectorType vectorType)
-        {
-            return DataTypes.Float32;
-        }
-
-        var lanes = vectorType.Lanes.ToArray();
-        if (vectorType.ElemType.SizeInBytes < DataTypes.Float32.SizeInBytes)
-        {
-            var scale = DataTypes.Float32.SizeInBytes / vectorType.ElemType.SizeInBytes;
-            lanes = new[] { scale }.Concat(lanes).ToArray();
-        }
-
-        return new VectorType(DataTypes.Float32, lanes);
+        var stats = GetStatsTensorType(input, axis, useMean);
+        return stats.Shape.IsInvalid ? Array.Empty<TensorType>() : [stats];
     }
 }

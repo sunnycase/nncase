@@ -75,6 +75,7 @@ public abstract class NTTTarget : Target
         pass.Add<Passes.Rules.NTT.VectorizeConv2D>(rank, lane);
         pass.Add<Passes.Rules.NTT.VectorizeMatMul>(rank, lane);
         pass.Add<Passes.Rules.NTT.VectorizeLayerNorm>(rank, lane);
+        pass.Add<Passes.Rules.NTT.VectorizeNormStats>(rank, lane);
         pass.Add<Passes.Rules.NTT.VectorizeNormApply>(rank, lane);
 
         RegisterPackPropagationRules(pass, options);

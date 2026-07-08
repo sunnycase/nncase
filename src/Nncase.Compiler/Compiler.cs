@@ -308,10 +308,6 @@ public class Compiler : ICompiler
         passManager.AddWithName<EGraphRulesPass>("PostFunctionBoundaryPackPropagation").Configure(p =>
         {
             target.RegisterPackPropagationRules(p, _compileSession.CompileOptions);
-        });
-
-        passManager.AddWithName<DataflowPass>("OptimizeAfterFunctionBoundaryLayoutPropagation").Configure(p =>
-        {
             p.Add<Passes.Rules.Neutral.FoldConstCall>();
             p.Add<Passes.Rules.Neutral.UnpackToBitcast>();
             p.Add<Passes.Rules.Neutral.FoldGetItemTuple>();
@@ -320,6 +316,7 @@ public class Compiler : ICompiler
             p.Add<Passes.Rules.Neutral.FoldPackBitcast>();
             p.Add<Passes.Rules.Neutral.FoldBitcastBitcast>();
         });
+
         passManager.Add<RemoveUnusedFunctions>();
         passManager.Add<InferRangePass>();
         passManager.Add<OptimizeByRangePass>();
@@ -348,7 +345,7 @@ public class Compiler : ICompiler
 
         passManager.Add<AddFunctionToModule>();
         passManager.Add<RemoveUnusedFunctions>();
-        passManager.AddWithName<FunctionBoundaryLayoutPropagationPass>("DistributedFunctionBoundaryLayoutPropagation");
+        passManager.AddWithName<FunctionBoundaryLayoutPropagationPass>("DistributedFunctionBoundaryLayoutPropagation", false);
         passManager.AddWithName<DataflowPass>("OptimizeAfterAutoDistributed").Configure(p =>
         {
             p.Add<Passes.Rules.Neutral.FoldConstCall>();

@@ -18,12 +18,7 @@ public sealed class NormStatsEvaluator : IEvaluator<NormStats>, ITypeInferencer<
 {
     public IValue Visit(IEvaluateContext context, NormStats target)
     {
-        var inputRaw = context.GetArgumentValueAsTensor(target, NormStats.Input);
-        if (inputRaw.ElementType is VectorType)
-        {
-            throw new NotSupportedException("NormStats evaluator does not support vector tensor values.");
-        }
-
+        var inputRaw = UnpackVectorInput(context.GetArgumentValueAsTensor(target, NormStats.Input));
         var input = inputRaw.CastElementTo(DataTypes.Float32).Cast<float>();
         var shape = input.Shape.ToValueArray();
         var rank = shape.Length;
@@ -168,5 +163,21 @@ public sealed class NormStatsEvaluator : IEvaluator<NormStats>, ITypeInferencer<
 
         var partial = partialAxes.Count == 0 ? null : SBP.P(partialAxes.OrderBy(axis => axis).ToArray(), ReduceOp.Sum);
         return new DistributedType(statsType, policies, input.Placement, partial);
+    }
+
+    private static Tensor UnpackVectorInput(Tensor input)
+    {
+        if (input.ElementType is not VectorType vectorType)
+        {
+            return input;
+        }
+
+        if (input.Shape.Count == 0)
+        {
+            throw new NotSupportedException("NormStats evaluator does not support vector scalar tensor values.");
+        }
+
+        var axes = Enumerable.Repeat(input.Shape.Count - 1, vectorType.Lanes.Count).ToArray();
+        return Tensors.UnpackEvaluator.UnpackImpl(input, axes);
     }
 }

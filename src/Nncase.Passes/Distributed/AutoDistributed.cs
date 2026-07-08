@@ -11,6 +11,7 @@ using System.Linq;
 using System.Numerics;
 using System.Reactive;
 using System.Runtime.CompilerServices;
+using System.Text;
 using System.Text.Json;
 using System.Threading.Tasks;
 using DryIoc.ImTools;
@@ -358,18 +359,23 @@ internal sealed class TypeInferenceCacheKey : IEquatable<TypeInferenceCacheKey>
 {
     private readonly BaseExpr _target;
     private readonly IRType[] _argumentTypes;
+    private readonly BaseExpr?[] _attributeArguments;
     private readonly int _hashCode;
 
     public TypeInferenceCacheKey(Call call)
     {
         _target = call.Target;
         _argumentTypes = call.Arguments.AsValueEnumerable().Select(arg => arg.CheckedType).ToArray();
+        _attributeArguments = call.Arguments.AsValueEnumerable()
+            .Select((arg, index) => IsAttributeArgument(call, index) ? arg : null)
+            .ToArray();
 
         HashCode hash = default;
         hash.Add(RuntimeHelpers.GetHashCode(_target));
-        foreach (var type in _argumentTypes)
+        for (int i = 0; i < _argumentTypes.Length; i++)
         {
-            hash.Add(type);
+            hash.Add(_argumentTypes[i]);
+            hash.Add(_attributeArguments[i] is { } attr ? RuntimeHelpers.GetHashCode(attr) : 0);
         }
 
         _hashCode = hash.ToHashCode();
@@ -384,7 +390,8 @@ internal sealed class TypeInferenceCacheKey : IEquatable<TypeInferenceCacheKey>
 
         for (int i = 0; i < _argumentTypes.Length; i++)
         {
-            if (!EqualityComparer<IRType>.Default.Equals(_argumentTypes[i], other._argumentTypes[i]))
+            if (!EqualityComparer<IRType>.Default.Equals(_argumentTypes[i], other._argumentTypes[i])
+                || !ReferenceEquals(_attributeArguments[i], other._attributeArguments[i]))
             {
                 return false;
             }
@@ -396,6 +403,10 @@ internal sealed class TypeInferenceCacheKey : IEquatable<TypeInferenceCacheKey>
     public override bool Equals(object? obj) => Equals(obj as TypeInferenceCacheKey);
 
     public override int GetHashCode() => _hashCode;
+
+    private static bool IsAttributeArgument(Call call, int index)
+        => call.Target is Op op
+            && op.Parameters.AsValueEnumerable().Any(parameter => parameter.Index == index && parameter.ParameterKind == ParameterKind.Attribute);
 }
 
 internal sealed class CandidateDominanceKey : IEquatable<CandidateDominanceKey>
@@ -950,8 +961,9 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
                 }
             }
 
-            System.Console.WriteLine($"[AutoDistributed] Type infer failed for {expr.Target.GetType().FullName}");
-            throw new InvalidOperationException("Please Check expr's TypeInfer.");
+            var failureMessage = BuildCandidateFailureMessage(expr, argClusters);
+            System.Console.WriteLine(failureMessage);
+            throw new InvalidOperationException(failureMessage);
         }
 
         _inferedMemo.Add(expr, callCluster);
@@ -1326,14 +1338,7 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
     private IEnumerable<(Expr Call, bool[] Used)> BuildEquivalentCalls(Expr target, BaseExpr[] tempArgs)
     {
         IEnumerable<(Expr Call, bool[] Used)> calls = [(new Call(target, tempArgs), Enumerable.Repeat(true, tempArgs.Length).ToArray())];
-        if (target is IR.Tensors.Reshape && tempArgs[0].CheckedType is DistributedType distType && tempArgs[1] is Shape { IsFixed: true } constNewShape)
-        {
-            var newTensorType = new TensorType(distType.TensorType.DType, constNewShape);
-            calls = calls.Concat(DistributedUtility.GetLeafCandidatePolicies(newTensorType, distType.Placement)
-                .Where(p => SingleNodeMemoryCheck(new(newTensorType, p, distType.Placement), _moduleKind, TargetOptions))
-                .Select(ndsbp => ((Expr)new Call(new Boxing(new DistributedType(newTensorType, ndsbp, distType.Placement)), tempArgs[0]), new[] { true, false })));
-        }
-        else if (target is Boxing { NewType: TensorType } && tempArgs[0] is TensorConst tc && tc.ValueType is DistributedType distributedType)
+        if (target is Boxing { NewType: TensorType } && tempArgs[0] is TensorConst tc && tc.ValueType is DistributedType distributedType)
         {
             calls = [((Expr)tc, new[] { true })];
         }
@@ -1680,6 +1685,16 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
     {
         IRType VisitD2D(DistributedType inv, DistributedType outv)
         {
+            if (inv.TensorType != outv.TensorType)
+            {
+                return new InvalidType($"D2D boxing requires the same tensor type, but got {inv.TensorType} -> {outv.TensorType}");
+            }
+
+            if (inv.Placement != outv.Placement)
+            {
+                return new InvalidType($"D2D boxing requires the same placement, but got {inv.Placement} -> {outv.Placement}");
+            }
+
             if (inv.Partial == outv.Partial && DistributedUtility.AreSamePolicies(inv.AxisPolicies, outv.AxisPolicies))
             {
                 return new InvalidType("Same DistributedType");
@@ -2360,6 +2375,38 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
 
     private string GetOneLine(string text)
         => text.Replace("\r", " ", StringComparison.Ordinal).Replace("\n", " ", StringComparison.Ordinal);
+
+    private string BuildCandidateFailureMessage(Call expr, IReadOnlyList<DistributedSearchGraph> argClusters)
+    {
+        const int maxBucketsPerArg = 16;
+
+        var builder = new StringBuilder();
+        builder.AppendLine($"[AutoDistributed] Type infer failed for {GetExprLabel(expr.Target)}.");
+        builder.AppendLine($"Source: {GetOneLine(expr.ToString())}");
+        builder.AppendLine($"Source checked type: {FormatType(expr.CheckedType)}");
+        for (var i = 0; i < expr.Arguments.Length; i++)
+        {
+            builder.AppendLine($"Source arg {i}: {GetExprLabel(expr.Arguments[i])}, checked type: {FormatType(expr.Arguments[i].CheckedType)}");
+        }
+
+        for (var i = 0; i < argClusters.Count; i++)
+        {
+            var buckets = argClusters[i].Clusters.OfType<DistributedSearchGraph>().ToArray();
+            builder.AppendLine($"Arg {i}: buckets={buckets.Length}");
+            foreach (var (bucket, bucketIndex) in buckets.Take(maxBucketsPerArg).Select((bucket, index) => (bucket, index)))
+            {
+                var vertex = bucket.Vertices.FirstOrDefault();
+                builder.AppendLine($"  [{bucketIndex}] {FormatType(vertex?.IRType)}");
+            }
+
+            if (buckets.Length > maxBucketsPerArg)
+            {
+                builder.AppendLine($"  ... {buckets.Length - maxBucketsPerArg} more bucket(s)");
+            }
+        }
+
+        return builder.ToString();
+    }
 
     private void PruneDominatedCandidates(Dictionary<SearchableNode, UInt128> costScoreMemo, Dictionary<SearchableNode, CostModel.Cost> costMemo)
     {

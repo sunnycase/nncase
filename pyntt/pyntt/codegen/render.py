@@ -2414,8 +2414,15 @@ def _emit_norm_stats(model: dict[str, Any]) -> str:
         for axis in range(rank):
             if _is_fixed_one(logical_input_shape[axis]):
                 continue
-            terms.append(f"{axis_index(axis)} * {_dim(model['InputStrides'][axis])}")
-        return "inner_lane * 0" if not terms else "inner_lane * 0 + " + " + ".join(terms)
+            index = axis_index(axis)
+            if model["InputVectorLaneCount"] > 1 and axis == len(model["InputShape"]) - 1:
+                index = f"(({index}) // {model['InputVectorLaneCount']})"
+            terms.append(f"{index} * {_dim(model['InputStrides'][axis])}")
+        physical_index = "inner_lane * 0" if not terms else "inner_lane * 0 + " + " + ".join(terms)
+        if model["InputVectorLaneCount"] == 1:
+            return physical_index
+        lane_index = f"(({axis_index(len(model['InputShape']) - 1)}) % {model['InputVectorLaneCount']})"
+        return f"(({physical_index}) * {model['InputVectorLaneCount']} + {lane_index})"
 
     def stats_offset(component: int) -> str:
         terms = []

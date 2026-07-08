@@ -100,6 +100,19 @@ public sealed class UnitTestDistributedTypeInfer : TestClassBase
     };
 
     [Fact]
+    public void TestD2DBoxingRejectsDifferentTensorType()
+    {
+        var placement = new Placement([4, 8], "yx", "bb");
+        var sourceType = new DistributedType(new TensorType(DataTypes.Float32, [16, 32]), new SBP[] { SBP.S([0]), SBP.S([1]) }, placement);
+        var targetType = new DistributedType(new TensorType(DataTypes.Float32, [16, 8, 4]), new SBP[] { SBP.S([0]), SBP.S([1]), SBP.B }, placement);
+        var input = new Var("input", sourceType);
+
+        var boxing = IR.F.Distributed.Boxing(input, targetType);
+
+        Assert.IsType<InvalidType>(boxing.CheckedType);
+    }
+
+    [Fact]
     public void TestGenerateReduceGroups()
     {
         Assert.Single(LinqUtility.Combination(1));
@@ -303,6 +316,23 @@ public sealed class UnitTestDistributedTypeInfer : TestClassBase
             new DistributedType(statsType.TensorType, statsType.AxisPolicies, statsType.Placement));
         var apply = IR.F.NN.NormApply(1, 1e-5f, input, broadcastStats, scale, bias, useMean: true);
         Assert.Equal(inputType, apply.CheckedType);
+    }
+
+    [Fact]
+    public void TestVectorizedNormStatsProducesScalarFp32Stats()
+    {
+        var placement = new Placement(new[] { 4 }, "b", "b");
+        var inputType = new DistributedType(
+            new TensorType(new VectorType(DataTypes.BFloat16, [8]), new long[] { 2, 16 }),
+            new SBP[] { SBP.B, SBP.S([0]) },
+            placement);
+        var input = new Var("input", inputType);
+        var stats = IR.F.NN.NormStats(1, input, useMean: false);
+
+        var statsType = Assert.IsType<DistributedType>(stats.CheckedType);
+        Assert.Equal(new TensorType(DataTypes.Float32, new long[] { 1, 2, 1 }), statsType.TensorType);
+        Assert.Equal(new SBP[] { SBP.B, SBP.B, SBP.B }, statsType.AxisPolicies.ToArray());
+        Assert.Equal(SBP.P([0], ReduceOp.Sum), statsType.Partial);
     }
 
     [Theory]
