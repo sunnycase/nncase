@@ -64,6 +64,8 @@ internal sealed class SimplifyTarget : ITarget
     public void RegisterTargetInDependentPass(IPassManager passManager, CompileOptions options) => throw new NotImplementedException();
 
     public void RegisterTIRSelectionPass(IPassManager passManager, CompileOptions optionsÍ) => throw new NotImplementedException();
+
+    public void RegisterTIRPreBufferizePass(IPassManager passManager, CompileOptions options) => throw new NotImplementedException();
 }
 
 internal sealed class SimplifyProvider : ISimplifyProvider

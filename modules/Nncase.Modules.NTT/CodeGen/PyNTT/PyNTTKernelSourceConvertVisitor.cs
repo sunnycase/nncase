@@ -125,6 +125,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
     {
         private enum HelperBarrierKind
         {
+            None,
             Block,
             Grid,
         }
@@ -137,6 +138,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             "data",
             "rdata",
             "chip_local_rdata",
+            "chip_local_data",
             "block_local_rdata",
             "block_local_data",
             "data_pool_stride_bytes",
@@ -166,9 +168,11 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
         private readonly Dictionary<TIR.Buffer, int> _bufferInputIndices;
         private readonly Dictionary<BufferVar, TIR.Buffer> _abiBufferMemo;
         private readonly Dictionary<TIR.Buffer, string> _dataBaseNameByBuffer;
+        private readonly Dictionary<TIR.Buffer, string> _chipLocalDataBaseNameByBuffer;
         private readonly Dictionary<TIR.Buffer, string> _blockLocalDataBaseNameByBuffer;
         private readonly SortedSet<string> _extraWorkspaceBaseNames;
         private readonly string _dataBaseName;
+        private readonly string _chipLocalDataBaseName;
         private readonly string _blockLocalDataBaseName;
         private readonly HashSet<int> _storedOutputIndices;
         private readonly DistributedType?[] _outputDistributedTypes;
@@ -192,9 +196,11 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             bool validateOutputs = true,
             PrimFunction? currentFunction = null,
             Dictionary<TIR.Buffer, string>? dataBaseNameByBuffer = null,
+            Dictionary<TIR.Buffer, string>? chipLocalDataBaseNameByBuffer = null,
             Dictionary<TIR.Buffer, string>? blockLocalDataBaseNameByBuffer = null,
             IEnumerable<string>? extraWorkspaceBaseNames = null,
             string dataBaseName = "data",
+            string chipLocalDataBaseName = "chip_local_data",
             string blockLocalDataBaseName = "block_local_data")
         {
             _function = function;
@@ -214,9 +220,11 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             _bufferInputIndices = abiState.BufferInputIndices;
             _abiBufferMemo = abiState.AbiBufferMemo;
             _dataBaseNameByBuffer = dataBaseNameByBuffer ?? new Dictionary<TIR.Buffer, string>(ReferenceEqualityComparer.Instance);
+            _chipLocalDataBaseNameByBuffer = chipLocalDataBaseNameByBuffer ?? new Dictionary<TIR.Buffer, string>(ReferenceEqualityComparer.Instance);
             _blockLocalDataBaseNameByBuffer = blockLocalDataBaseNameByBuffer ?? new Dictionary<TIR.Buffer, string>(ReferenceEqualityComparer.Instance);
             _extraWorkspaceBaseNames = extraWorkspaceBaseNames is null ? new SortedSet<string>(StringComparer.Ordinal) : new SortedSet<string>(extraWorkspaceBaseNames, StringComparer.Ordinal);
             _dataBaseName = dataBaseName;
+            _chipLocalDataBaseName = chipLocalDataBaseName;
             _blockLocalDataBaseName = blockLocalDataBaseName;
             _storedOutputIndices = abiState.StoredOutputIndices;
             _outputDistributedTypes = abiState.OutputDistributedTypes;
@@ -338,6 +346,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                         ["data_pool_elements"] = checked((long)_currentFunction.SchedResult.DataUsage),
                         ["data_dtype"] = "uint8",
                         ["collective_data_pool_bytes"] = _collectiveDataPoolBytes,
+                        ["chip_local_data_pool_bytes"] = checked((long)_currentFunction.SchedResult.ChipLocalDataPoolSize),
                         ["block_local_data_pool_bytes"] = checked((long)_currentFunction.SchedResult.BlockLocalDataPoolSize),
                         ["block_local_data_scope_count"] = GetBlockLocalDataScopeCount(_targetOptions),
                         ["rdata_pool_bytes"] = GetPoolSizeBytes(_function.SchedResult.Rdatas),
@@ -552,6 +561,9 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     _attrs["requires_grid_barrier"] = true;
                     WriteBarrier(HelperBarrierKind.Grid);
                     break;
+                case Nncase.TIR.NTT.Barrier barrier:
+                    WriteExplicitBarrier(barrier.Scope);
+                    break;
                 case Nncase.TIR.NTT.VectorizedSoftmax softmax:
                     VisitSoftmax(softmax.Axis, softmax.VectorizedAxes, args, "softmax");
                     break;
@@ -617,9 +629,11 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     validateOutputs: false,
                     currentFunction: callee,
                     dataBaseNameByBuffer: workspaceBinding.DataBaseNameByBuffer,
+                    chipLocalDataBaseNameByBuffer: workspaceBinding.ChipLocalDataBaseNameByBuffer,
                     blockLocalDataBaseNameByBuffer: workspaceBinding.BlockLocalDataBaseNameByBuffer,
                     extraWorkspaceBaseNames: workspaceBinding.ExtraParameters,
                     dataBaseName: workspaceBinding.DataBaseName,
+                    chipLocalDataBaseName: workspaceBinding.ChipLocalDataBaseName,
                     blockLocalDataBaseName: workspaceBinding.BlockLocalDataBaseName)
                     .BuildDeviceFunction(deviceFunctionName, workspaceBinding.ParameterOverrides, workspaceBinding.ExtraParameterArguments);
 
@@ -652,18 +666,23 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
         {
             var parameters = callee.Parameters.ToArray();
             var dataBaseName = $"{deviceFunctionName}_data";
+            var chipLocalDataBaseName = $"{deviceFunctionName}_chip_local_data";
             var blockLocalDataBaseName = $"{deviceFunctionName}_block_local_data";
             var parentDataBaseName = $"{deviceFunctionName}_parent_data";
+            var parentChipLocalDataBaseName = $"{deviceFunctionName}_parent_chip_local_data";
             var parentBlockLocalDataBaseName = $"{deviceFunctionName}_parent_block_local_data";
             var dataBaseNameByBuffer = new Dictionary<TIR.Buffer, string>(_dataBaseNameByBuffer, ReferenceEqualityComparer.Instance);
+            var chipLocalDataBaseNameByBuffer = new Dictionary<TIR.Buffer, string>(_chipLocalDataBaseNameByBuffer, ReferenceEqualityComparer.Instance);
             var blockLocalDataBaseNameByBuffer = new Dictionary<TIR.Buffer, string>(_blockLocalDataBaseNameByBuffer, ReferenceEqualityComparer.Instance);
             var extraParameters = new SortedSet<string>(_extraWorkspaceBaseNames, StringComparer.Ordinal);
             var extraParameterArguments = _extraWorkspaceBaseNames.ToDictionary(name => name, name => name, StringComparer.Ordinal);
             var parameterOverrides = new Dictionary<string, string>(StringComparer.Ordinal);
 
             AddExtraWorkspaceBase(parentDataBaseName, _dataBaseName);
+            AddExtraWorkspaceBase(parentChipLocalDataBaseName, _chipLocalDataBaseName);
             AddExtraWorkspaceBase(parentBlockLocalDataBaseName, _blockLocalDataBaseName);
             AddExtraWorkspaceBase(dataBaseName, string.Empty);
+            AddExtraWorkspaceBase(chipLocalDataBaseName, string.Empty);
             AddExtraWorkspaceBase(blockLocalDataBaseName, string.Empty);
 
             for (var i = 0; i < parameters.Length; i++)
@@ -674,6 +693,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     extraParameterArguments[workspace.Location switch
                     {
                         MemoryLocation.Data => dataBaseName,
+                        MemoryLocation.ChipLocalData => chipLocalDataBaseName,
                         MemoryLocation.BlockLocalData => blockLocalDataBaseName,
                         var location => throw new NotSupportedException($"PyNTT call to {callee.Name} workspace parameter {workspace.Name} cannot use memory location {location}."),
                     }] = BuildWorkspaceBasePointerExpression(callee, workspace, argument);
@@ -687,6 +707,9 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                         case MemoryLocation.Data:
                             dataBaseNameByBuffer[buffer] = CaptureCallerWorkspaceBase(GetDataBaseName(buffer), parentDataBaseName);
                             break;
+                        case MemoryLocation.ChipLocalData:
+                            chipLocalDataBaseNameByBuffer[buffer] = CaptureCallerWorkspaceBase(GetChipLocalDataBaseName(buffer), parentChipLocalDataBaseName);
+                            break;
                         case MemoryLocation.BlockLocalData:
                             blockLocalDataBaseNameByBuffer[buffer] = CaptureCallerWorkspaceBase(GetBlockLocalDataBaseName(buffer), parentBlockLocalDataBaseName);
                             break;
@@ -696,8 +719,10 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
 
             return new(
                 dataBaseName,
+                chipLocalDataBaseName,
                 blockLocalDataBaseName,
                 dataBaseNameByBuffer,
+                chipLocalDataBaseNameByBuffer,
                 blockLocalDataBaseNameByBuffer,
                 extraParameters,
                 parameterOverrides,
@@ -714,7 +739,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
 
             string CaptureCallerWorkspaceBase(string baseName, string fallbackCaptureName)
             {
-                if (baseName is "data" or "block_local_data")
+                if (baseName is "data" or "chip_local_data" or "block_local_data")
                 {
                     return fallbackCaptureName;
                 }
@@ -750,6 +775,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             var baseName = buffer.MemSpan.Buffer.Location switch
             {
                 MemoryLocation.Data => GetDataBaseName(buffer),
+                MemoryLocation.ChipLocalData => GetChipLocalDataBaseName(buffer),
                 MemoryLocation.BlockLocalData => GetBlockLocalDataBaseName(buffer),
                 var location => throw new NotSupportedException($"PyNTT workspace buffer {buffer.Name} cannot use memory location {location}."),
             };
@@ -4782,6 +4808,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             {
                 MemoryLocation.Data when buffer.DistributedType is null => new(GetDataBaseName(buffer), offsetBytes, "0", null, shardCoordHierarchy),
                 MemoryLocation.Data => new(GetDataBaseName(buffer), offsetBytes, "data_pool_stride_bytes", "shard_index", shardCoordHierarchy),
+                MemoryLocation.ChipLocalData => new(GetChipLocalDataBaseName(buffer), offsetBytes, "0", null, shardCoordHierarchy),
                 MemoryLocation.BlockLocalData => new(GetBlockLocalDataBaseName(buffer), offsetBytes, "block_local_data_pool_stride_bytes", BuildBlockLocalDataIndexExpression(_targetOptions), shardCoordHierarchy),
                 MemoryLocation.Rdata => new("rdata", offsetBytes, "0", null, shardCoordHierarchy),
                 MemoryLocation.ChipLocalRdata => new("chip_local_rdata", offsetBytes, "0", null, shardCoordHierarchy),
@@ -4792,6 +4819,9 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
 
         private string GetDataBaseName(TIR.Buffer buffer)
             => _dataBaseNameByBuffer.TryGetValue(buffer, out var baseName) ? baseName : _dataBaseName;
+
+        private string GetChipLocalDataBaseName(TIR.Buffer buffer)
+            => _chipLocalDataBaseNameByBuffer.TryGetValue(buffer, out var baseName) ? baseName : _chipLocalDataBaseName;
 
         private string GetBlockLocalDataBaseName(TIR.Buffer buffer)
             => _blockLocalDataBaseNameByBuffer.TryGetValue(buffer, out var baseName) ? baseName : _blockLocalDataBaseName;
@@ -4867,6 +4897,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 _dataBaseName,
                 "rdata",
                 "chip_local_rdata",
+                _chipLocalDataBaseName,
                 "block_local_rdata",
                 _blockLocalDataBaseName,
                 "data_pool_stride_bytes",
@@ -5311,8 +5342,25 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             WriteBarrier(barrierKind);
         }
 
+        private void WriteExplicitBarrier(TIR.NTT.BarrierScope scope)
+        {
+            if (scope == TIR.NTT.BarrierScope.Chip)
+            {
+                _attrs["requires_grid_barrier"] = true;
+                WriteBarrier(HelperBarrierKind.Grid);
+                return;
+            }
+
+            WriteBarrier(HelperBarrierKind.Block);
+        }
+
         private void WriteBarrier(HelperBarrierKind barrierKind)
         {
+            if (barrierKind == HelperBarrierKind.None)
+            {
+                return;
+            }
+
             _body.Append(new string(' ', _bodyIndent * 4));
             _body.AppendLine(barrierKind switch
             {
@@ -5633,8 +5681,10 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
 
         private sealed record DeviceFunctionWorkspaceBinding(
             string DataBaseName,
+            string ChipLocalDataBaseName,
             string BlockLocalDataBaseName,
             Dictionary<TIR.Buffer, string> DataBaseNameByBuffer,
+            Dictionary<TIR.Buffer, string> ChipLocalDataBaseNameByBuffer,
             Dictionary<TIR.Buffer, string> BlockLocalDataBaseNameByBuffer,
             IReadOnlySet<string> ExtraParameters,
             IReadOnlyDictionary<string, string> ParameterOverrides,
@@ -5739,7 +5789,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
     {
         var inputs = kernel.Inputs.Select((_, index) => $"input{index}").ToArray();
         var outputs = kernel.Outputs.Select((_, index) => $"output{index}").ToArray();
-        var workspaceParameters = new[] { "data", "rdata", "chip_local_rdata", "block_local_rdata", "block_local_data" };
+        var workspaceParameters = new[] { "data", "rdata", "chip_local_rdata", "chip_local_data", "block_local_rdata", "block_local_data" };
         var runtimeShapeArgs = GetRuntimeShapeArgs(kernel);
         var gridBarrierParameters = kernel.Attrs.ContainsKey("requires_grid_barrier")
             ? new[] { "pyntt_grid_mesh: tl.constexpr" }

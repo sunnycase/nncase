@@ -5,6 +5,7 @@ using System;
 using System.CommandLine;
 using System.CommandLine.Invocation;
 using Nncase.Passes;
+using Nncase.Passes.Transforms;
 
 namespace Nncase.Targets;
 
@@ -33,6 +34,12 @@ public sealed class PyNTTTarget : NTTTarget
     public override void RegisterAutoVectorizeRules(IRulesAddable pass, CompileOptions options)
     {
         base.RegisterAutoVectorizeRules(pass, options);
+    }
+
+    /// <inheritdoc/>
+    public override void RegisterTIRPreBufferizePass(IPassManager passManager, CompileOptions options)
+    {
+        passManager.AddWithName<LowerReshardToChipLocalDataPass>("LowerReshardToChipLocalData", Kind);
     }
 
     /// <inheritdoc/>

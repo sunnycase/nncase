@@ -168,6 +168,12 @@ public interface ITarget
     void RegisterPostAutoVectorizePass(IPassManager passManager, CompileOptions options);
 
     void RegisterTIRSelectionPass(IPassManager passManager, CompileOptions options);
+
+    /// <summary>
+    /// Register target-specific TIR passes that must run after TIR functions are
+    /// materialized in the module and before bufferization assigns storage.
+    /// </summary>
+    void RegisterTIRPreBufferizePass(IPassManager passManager, CompileOptions options);
 }
 
 public sealed class DefaultTargetCompileOptions : ITargetOptions

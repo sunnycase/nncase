@@ -48,6 +48,11 @@ public enum MemoryLocation
     BlockLocalData = 1 << 9,
 
     /// <summary>
+    /// chip local mutable data.
+    /// </summary>
+    ChipLocalData = 1 << 13,
+
+    /// <summary>
     /// cache.
     /// </summary>
     Cache = 1 << 10,

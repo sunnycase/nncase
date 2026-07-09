@@ -61,6 +61,7 @@ public sealed class BufferizeVisitor : ExprRewriter
 
             AssignOutputResult(func, scheduleResult);
             AssignDataResult(func, scheduleResult);
+            AssignChipLocalDataResult(func, scheduleResult);
             AssignBlockLocalDataResult(func, scheduleResult);
             AssignRdataResult(func, scheduleResult);
             AssignChipLocalRdataResult(func, scheduleResult);
@@ -86,11 +87,14 @@ public sealed class BufferizeVisitor : ExprRewriter
             T.CreateBuffer(new TensorType(DataTypes.UInt8, [(long)func.SchedResult.DataUsage]), MemoryLocation.Data, out var dataBuffer, $"data_{_dataBufferId++}");
             var dataVar = new BufferVar("data", TensorType.Scalar(new PointerType(DataTypes.UInt8)), BufferVarRole.Workspace, MemoryLocation.Data);
 
+            T.CreateBuffer(new TensorType(DataTypes.UInt8, [(long)func.SchedResult.ChipLocalDataPoolSize]), MemoryLocation.ChipLocalData, out var chipLocalDataBuffer, $"chip_local_data_{_dataBufferId++}");
+            var chipLocalDataVar = new BufferVar("chip_local_data", TensorType.Scalar(new PointerType(DataTypes.UInt8)), BufferVarRole.Workspace, MemoryLocation.ChipLocalData);
+
             T.CreateBuffer(new TensorType(DataTypes.UInt8, [(long)func.SchedResult.BlockLocalDataPoolSize]), MemoryLocation.BlockLocalData, out var blockLocalDataBuffer, $"block_local_data_{_dataBufferId++}");
             var blockLocalDataVar = new BufferVar("block_local_data", TensorType.Scalar(new PointerType(DataTypes.UInt8)), BufferVarRole.Workspace, MemoryLocation.BlockLocalData);
 
-            var funcParams = func.Parameters.ToArray().Append(dataVar).Append(blockLocalDataVar).ToArray();
-            var funcArgs = expr.Arguments.ToArray().Append(dataBuffer).Append(blockLocalDataBuffer).ToArray();
+            var funcParams = func.Parameters.ToArray().Append(dataVar).Append(chipLocalDataVar).Append(blockLocalDataVar).ToArray();
+            var funcArgs = expr.Arguments.ToArray().Append(dataBuffer).Append(chipLocalDataBuffer).Append(blockLocalDataBuffer).ToArray();
             var newFunc = func.With(parameters: funcParams);
             return expr.With(target: newFunc, arguments: funcArgs);
         }
@@ -113,6 +117,15 @@ public sealed class BufferizeVisitor : ExprRewriter
         {
             func.SchedResult.DataAlign = Math.Max(8, (ulong)dataResult.Alignment);
             func.SchedResult.DataUsage = MathUtility.AlignUp((ulong)dataResult.MemoryPoolEnd, func.SchedResult.DataAlign);
+        }
+    }
+
+    private void AssignChipLocalDataResult(PrimFunction func, IReadOnlyDictionary<MemoryLocation, BufferScheduleResult> scheduleResult)
+    {
+        if (scheduleResult.TryGetValue(MemoryLocation.ChipLocalData, out var chipLocalDataResult))
+        {
+            func.SchedResult.DataAlign = Math.Max(8, (ulong)chipLocalDataResult.Alignment);
+            func.SchedResult.ChipLocalDataPoolSize = MathUtility.AlignUp((ulong)chipLocalDataResult.MemoryPoolEnd, func.SchedResult.DataAlign);
         }
     }
 

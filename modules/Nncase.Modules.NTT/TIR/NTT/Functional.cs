@@ -358,6 +358,11 @@ public partial class NTT
         return new Call(new TIR.NTT.SynchronizeThreads());
     }
 
+    public static Call Barrier(BarrierScope scope)
+    {
+        return new Call(new TIR.NTT.Barrier(scope));
+    }
+
     public static Call Where(Expr cond, Expr x, Expr y, Expr output)
     {
         return new Call(new TIR.NTT.Where(), cond, x, y, output);

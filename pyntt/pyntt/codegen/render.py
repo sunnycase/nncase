@@ -17,6 +17,7 @@ WORKSPACE_PARAMETERS = (
     "data",
     "rdata",
     "chip_local_rdata",
+    "chip_local_data",
     "block_local_rdata",
     "block_local_data",
 )

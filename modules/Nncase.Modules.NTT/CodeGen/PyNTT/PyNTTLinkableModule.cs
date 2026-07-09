@@ -596,6 +596,8 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
         long DataLocalBytes,
         long CollectiveDataBytes,
         int MaxShardCount,
+        bool UsesChipLocalData,
+        long ChipLocalDataBytes,
         bool UsesBlockLocalData,
         long BlockLocalDataBytes);
 
@@ -651,6 +653,8 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
         public string? RData { get; set; }
 
         public string? ChipLocalRData { get; set; }
+
+        public string? ChipLocalData { get; set; }
 
         public string? BlockLocalRData { get; set; }
 
@@ -824,6 +828,25 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
         return new WorkspaceUsage(true, localBytes);
     }
 
+    private static bool HasWorkspaceReference(BaseFunction function, MemoryLocation location)
+    {
+        var buffers = new List<TIR.Buffer>();
+        switch (function)
+        {
+            case Function f:
+                CollectWorkspaceBuffers(f.Body, location, buffers);
+                break;
+            case Fusion f:
+                CollectWorkspaceBuffers(f.Body, location, buffers);
+                break;
+            case PrimFunction f:
+                CollectWorkspaceBuffers(f.Body, location, buffers);
+                break;
+        }
+
+        return buffers.Count != 0;
+    }
+
     private PreparedWorkspaceRequirements GetPreparedWorkspaceRequirements(PyNTTLinkableFunction function)
         => GetPreparedWorkspaceRequirements(function, new HashSet<PyNTTLinkableFunction>());
 
@@ -846,6 +869,9 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
             var usesData = false;
             var dataLocalBytes = 0L;
             var nestedDataLocalBytes = 0L;
+            var usesChipLocalData = false;
+            var chipLocalDataBytes = 0L;
+            var nestedChipLocalDataBytes = 0L;
             var usesBlockLocalData = false;
             var blockLocalDataBytes = 0L;
             var nestedBlockLocalDataBytes = 0L;
@@ -855,6 +881,10 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
                 var dataUsage = GetWorkspaceUsage(function.SourceFunction, MemoryLocation.Data);
                 dataLocalBytes = Math.Max((long)primFunction.SchedResult.DataUsage, dataUsage.LocalBytes);
                 usesData = tirKernels.Length > 0 || primFunction.SchedResult.DataUsage > 0 || dataUsage.IsReferenced;
+
+                var chipLocalDataUsage = HasWorkspaceReference(function.SourceFunction, MemoryLocation.ChipLocalData);
+                chipLocalDataBytes = (long)primFunction.SchedResult.ChipLocalDataPoolSize;
+                usesChipLocalData = primFunction.SchedResult.ChipLocalDataPoolSize > 0 || chipLocalDataUsage;
 
                 var blockLocalDataUsage = GetWorkspaceUsage(function.SourceFunction, MemoryLocation.BlockLocalData);
                 blockLocalDataBytes = Math.Max((long)primFunction.SchedResult.BlockLocalDataPoolSize, blockLocalDataUsage.LocalBytes);
@@ -870,6 +900,8 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
                 nestedDataLocalBytes = Math.Max(nestedDataLocalBytes, calleeRequirements.DataLocalBytes);
                 collectiveDataBytes = Math.Max(collectiveDataBytes, calleeRequirements.CollectiveDataBytes);
                 maxShardCount = Math.Max(maxShardCount, calleeRequirements.MaxShardCount);
+                usesChipLocalData |= calleeRequirements.UsesChipLocalData;
+                nestedChipLocalDataBytes = Math.Max(nestedChipLocalDataBytes, calleeRequirements.ChipLocalDataBytes);
                 usesBlockLocalData |= calleeRequirements.UsesBlockLocalData;
                 nestedBlockLocalDataBytes = Math.Max(nestedBlockLocalDataBytes, calleeRequirements.BlockLocalDataBytes);
             }
@@ -879,6 +911,8 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
                 checked(dataLocalBytes + nestedDataLocalBytes),
                 collectiveDataBytes,
                 maxShardCount,
+                usesChipLocalData,
+                checked(chipLocalDataBytes + nestedChipLocalDataBytes),
                 usesBlockLocalData,
                 checked(blockLocalDataBytes + nestedBlockLocalDataBytes));
         }
@@ -962,6 +996,14 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
                 context.Data = dataName;
                 statements.Add(
                     $"{indent}{dataName} = self.allocate_workspace({context.RootInputsExpression}, {PythonString(function.SourceFunction.Name + ".data")}, {requirements.DataLocalBytes.ToString(CultureInfo.InvariantCulture)} * {requirements.MaxShardCount.ToString(CultureInfo.InvariantCulture)} + {requirements.CollectiveDataBytes.ToString(CultureInfo.InvariantCulture)}, {dataDType})");
+            }
+
+            if (string.IsNullOrWhiteSpace(context.ChipLocalData) && requirements.UsesChipLocalData)
+            {
+                var chipLocalDataName = context.State.NewTemp("chip_local_data");
+                context.ChipLocalData = chipLocalDataName;
+                statements.Add(
+                    $"{indent}{chipLocalDataName} = self.allocate_workspace({context.RootInputsExpression}, {PythonString(function.SourceFunction.Name + ".chip_local_data")}, {requirements.ChipLocalDataBytes.ToString(CultureInfo.InvariantCulture)}, {dataDType})");
             }
 
             context.BlockLocalDataPoolStrideBytes ??= requirements.BlockLocalDataBytes.ToString(CultureInfo.InvariantCulture);
@@ -1200,6 +1242,7 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
             && !string.IsNullOrWhiteSpace(context.DataPoolStrideBytes)
             && !string.IsNullOrWhiteSpace(context.RData)
             && !string.IsNullOrWhiteSpace(context.ChipLocalRData)
+            && !string.IsNullOrWhiteSpace(context.ChipLocalData)
             && !string.IsNullOrWhiteSpace(context.BlockLocalRData)
             && !string.IsNullOrWhiteSpace(context.BlockLocalData)
             && !string.IsNullOrWhiteSpace(context.BlockLocalDataPoolStrideBytes);
@@ -1243,6 +1286,9 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
                 case "data":
                     calleeContext.Data = binding.Expression;
                     calleeContext.DataPoolStrideBytes = RequireWorkspaceName(binding.WorkspacePoolStrideBytes, callee.Name, "data_pool_stride_bytes");
+                    break;
+                case "chip_local_data":
+                    calleeContext.ChipLocalData = binding.Expression;
                     break;
                 case "block_local_data":
                     calleeContext.BlockLocalData = binding.Expression;
@@ -1446,6 +1492,7 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
         => location switch
         {
             MemoryLocation.Data => context.DataPoolStrideBytes,
+            MemoryLocation.ChipLocalData => "0",
             MemoryLocation.BlockLocalData => context.BlockLocalDataPoolStrideBytes,
             _ => null,
         };
@@ -1778,6 +1825,7 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
         {
             MemoryLocation.Input or MemoryLocation.Output when TryResolveAbiBufferBinding(buffer, context, out var abiBinding) => abiBinding.Expression,
             MemoryLocation.Data => RequireWorkspaceName(context.Data, contextName, "data"),
+            MemoryLocation.ChipLocalData => RequireWorkspaceName(context.ChipLocalData, contextName, "chip_local_data"),
             MemoryLocation.BlockLocalData => RequireWorkspaceName(context.BlockLocalData, contextName, "block_local_data"),
             MemoryLocation.Rdata => RequireWorkspaceName(context.RData, contextName, "rdata"),
             MemoryLocation.ChipLocalRdata => RequireWorkspaceName(context.ChipLocalRData, contextName, "chip_local_rdata"),
@@ -2065,6 +2113,7 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
                     RequireWorkspaceName(context.Data, functionName, "data"),
                     RequireWorkspaceName(context.RData, functionName, "rdata"),
                     RequireWorkspaceName(context.ChipLocalRData, functionName, "chip_local_rdata"),
+                    RequireWorkspaceName(context.ChipLocalData, functionName, "chip_local_data"),
                     RequireWorkspaceName(context.BlockLocalRData, functionName, "block_local_rdata"),
                     RequireWorkspaceName(context.BlockLocalData, functionName, "block_local_data"),
                 };
@@ -2082,13 +2131,15 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
                     : "0";
                 var blockLocalDataBytesPerScope = PythonValue(kernel.Launch.Meta["block_local_data_pool_bytes"]);
                 var blockLocalDataScopeCount = PythonValue(kernel.Launch.Meta["block_local_data_scope_count"]);
+                var chipLocalDataBytes = PythonValue(kernel.Launch.Meta["chip_local_data_pool_bytes"]);
                 var dataDType = PythonString((string)kernel.Launch.Meta["data_dtype"]);
                 workspaceSetup = $"""
                         data = self.allocate_workspace({context.RootInputsExpression}, {PythonString(kernel.Name + ".data")}, {dataBytesPerProgram} * grid[0] + {collectiveDataBytes}, {dataDType})
+                        chip_local_data = self.allocate_workspace({context.RootInputsExpression}, {PythonString(kernel.Name + ".chip_local_data")}, {chipLocalDataBytes}, {dataDType})
                         block_local_data = self.allocate_workspace({context.RootInputsExpression}, {PythonString(kernel.Name + ".block_local_data")}, {blockLocalDataBytesPerScope} * {blockLocalDataScopeCount}, {dataDType})
                         rdata, chip_local_rdata, block_local_rdata = self.materialize_rdata_bundle({context.RootInputsExpression}, {PythonString(functionName)})
                 """;
-                workspaceArgs = new[] { "data", "rdata", "chip_local_rdata", "block_local_rdata", "block_local_data" };
+                workspaceArgs = new[] { "data", "rdata", "chip_local_rdata", "chip_local_data", "block_local_rdata", "block_local_data" };
                 workspaceStrideArgs = new[] { dataBytesPerProgram, blockLocalDataBytesPerScope };
             }
         }

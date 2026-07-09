@@ -87,6 +87,7 @@ public sealed class SchedFunctionResult
         ChipLocalRdatas = new(ReferenceEqualityComparer.Instance);
         BlockLocalRdatas = new(ReferenceEqualityComparer.Instance);
         DataUsage = 0;
+        ChipLocalDataPoolSize = 0;
         BlockLocalDataPoolSize = 0;
         IsScheduled = false;
     }
@@ -110,6 +111,11 @@ public sealed class SchedFunctionResult
     /// Gets or sets the data section length.
     /// </summary>
     public ulong DataUsage { get; set; }
+
+    /// <summary>
+    /// Gets or sets the chip local data section length.
+    /// </summary>
+    public ulong ChipLocalDataPoolSize { get; set; }
 
     /// <summary>
     /// Gets or sets the block local data section length.
@@ -154,6 +160,8 @@ public sealed class SchedFunctionResult
                 EqualityComparer<Dictionary<IR.Const, ValueRange<ulong>>>.Default.Equals(ChipLocalRdatas, result.ChipLocalRdatas) &&
                 EqualityComparer<Dictionary<IR.Const, ValueRange<ulong>>>.Default.Equals(BlockLocalRdatas, result.BlockLocalRdatas) &&
                 EqualityComparer<ulong>.Default.Equals(DataUsage, result.DataUsage) &&
+                EqualityComparer<ulong>.Default.Equals(ChipLocalDataPoolSize, result.ChipLocalDataPoolSize) &&
+                EqualityComparer<ulong>.Default.Equals(BlockLocalDataPoolSize, result.BlockLocalDataPoolSize) &&
                 EqualityComparer<ulong>.Default.Equals(DataAlign, result.DataAlign);
     }
 

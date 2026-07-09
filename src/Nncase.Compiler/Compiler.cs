@@ -384,6 +384,7 @@ public class Compiler : ICompiler
         passManager.Add<RemoveUnusedFunctions>();
         passManager.Add<InferRangePass>();
         passManager.Add<OptimizeByRangePass>();
+        target.RegisterTIRPreBufferizePass(passManager, _compileSession.CompileOptions);
         passManager.Add<BufferizePass>();
 
         passManager.AddWithName<PrimFuncPass>("Optimize").Configure(p =>

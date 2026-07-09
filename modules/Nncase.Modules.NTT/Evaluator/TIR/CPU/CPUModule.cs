@@ -54,6 +54,7 @@ internal class NTTModule : IApplicationPart
         registrator.RegisterManyInterface<Conv2DEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<ReduceEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<ReduceArgEvaluator>(reuse: Reuse.Singleton);
+        registrator.RegisterManyInterface<BarrierEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<SynchronizeThreadsEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<GatherReduceScatterEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<ClampEvaluator>(reuse: Reuse.Singleton);
