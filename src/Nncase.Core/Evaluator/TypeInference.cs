@@ -562,6 +562,23 @@ public static class TypeInference
     /// <returns>IRType.</returns>
     public static IRType CommonType(IRType thenType, IRType elseType)
     {
+        Dimension CommonDimension(Dimension thenDim, Dimension elseDim)
+        {
+            if (thenDim.Equals(elseDim))
+            {
+                return thenDim;
+            }
+
+            if (thenDim is DimVar thenVar && elseDim is DimVar elseVar && thenVar.Name == elseVar.Name)
+            {
+                var thenRange = thenVar.Metadata.Range ?? ValueRange<double>.Full;
+                var elseRange = elseVar.Metadata.Range ?? ValueRange<double>.Full;
+                return thenVar.With(range: thenRange.Union(elseRange));
+            }
+
+            return Dimension.Unknown;
+        }
+
         IRType CommonTypeImpl(TensorType a, TensorType b)
         {
             if (a == b)
@@ -579,7 +596,8 @@ public static class TypeInference
                 return new TensorType(a.DType, Shape.Unranked);
             }
 
-            return new TensorType(a.DType, Shape.Unknown(a.Shape.Rank));
+            var shape = new RankedShape(Enumerable.Range(0, a.Shape.Rank).Select(i => CommonDimension(a.Shape[i], b.Shape[i])));
+            return new TensorType(a.DType, shape);
         }
 
         IRType DistributedCommonTypeImpl(DistributedType a, DistributedType b)

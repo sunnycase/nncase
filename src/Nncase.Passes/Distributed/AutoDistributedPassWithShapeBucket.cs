@@ -25,8 +25,6 @@ public sealed partial class AutoDistributedWithShapeBucketPass : ModulePass
 
     private readonly string _moduleKind;
 
-    private int _bufferIndex;
-
     public AutoDistributedWithShapeBucketPass(bool bidirectional, string moduleKind, CompileOptions compileOptions)
     {
         _compileOptions = compileOptions;
@@ -138,8 +136,7 @@ public sealed partial class AutoDistributedWithShapeBucketPass : ModulePass
                 segmentFunctions.Add((rewritten, segmentState.DimVars));
             }
 
-            var primFunction = BuildMainFunction(function, segmentFunctions);
-            return WrapShapeBucketFunction(function, primFunction);
+            return BuildMainFunction(function, segmentFunctions);
         }
 
         int GetShapeBucketSegmentsCount()
@@ -218,15 +215,12 @@ public sealed partial class AutoDistributedWithShapeBucketPass : ModulePass
     private Dictionary<TensorConst, TensorConst> SearchDistributedConstants(Function function, INTTTargetOptions targetOptions)
     {
         var distributedConsts = new Dictionary<TensorConst, TensorConst>(ReferenceEqualityComparer.Instance);
-        foreach (var reachableFunction in GetReachableFunctionsInCalleeFirstOrder(function))
+        var reachableFunctions = GetReachableFunctionsInCalleeFirstOrder(function);
+        var rewriter = new AutoDistributedRewriter(_compileOptions, targetOptions, AutoDistributedPhase.SearchConstant, _moduleKind, _bidirectional);
+        _ = rewriter.RewriteProgram(function, reachableFunctions);
+        foreach (var (source, distributed) in rewriter.DistributedConsts)
         {
-            var rewriter = new AutoDistributedRewriter(_compileOptions, targetOptions, AutoDistributedPhase.SearchConstant, _moduleKind, _bidirectional);
-            using var functionDumpScope = new DumpScope(reachableFunction.Name);
-            _ = rewriter.Rewrite(reachableFunction);
-            foreach (var (source, distributed) in rewriter.DistributedConsts)
-            {
-                distributedConsts[source] = distributed;
-            }
+            distributedConsts[source] = distributed;
         }
 
         return distributedConsts;
@@ -234,28 +228,17 @@ public sealed partial class AutoDistributedWithShapeBucketPass : ModulePass
 
     private Function DistributeFunctionGraph(Function rootFunction, INTTTargetOptions targetOptions, AutoDistributedPhase phase)
     {
-        var root = rootFunction;
-        foreach (var function in GetReachableFunctionsInCalleeFirstOrder(rootFunction))
+        var reachableFunctions = GetReachableFunctionsInCalleeFirstOrder(rootFunction);
+        var rewriter = new AutoDistributedRewriter(_compileOptions, targetOptions, phase, _moduleKind, _bidirectional);
+        var root = rewriter.RewriteProgram(rootFunction, reachableFunctions);
+        foreach (var function in reachableFunctions)
         {
-            var rewriter = new AutoDistributedRewriter(_compileOptions, targetOptions, phase, _moduleKind, _bidirectional);
-            using var functionDumpScope = new DumpScope(function.Name);
-            var rewritten = rewriter.Rewrite(function);
-            if (!CompilerServices.InferenceType(rewritten) || rewritten.CheckedType is InvalidType)
+            if (!ReferenceEquals(function, rootFunction))
             {
-                var dumpScope = DumpScope.Current;
-                if (dumpScope.IsEnabled(DumpFlags.PassIR))
-                {
-                    dumpScope.DumpIR(rewritten, "InvalidDistributedFunction");
-                }
-
-                throw new InvalidOperationException($"AutoDistributed function {rewritten.Name} produced invalid type: {rewritten.CheckedType}.");
+                continue;
             }
 
-            function.ReplaceAllUsesWith(rewritten);
-            if (ReferenceEquals(function, root))
-            {
-                root = rewritten;
-            }
+            function.ReplaceAllUsesWith(root);
         }
 
         ValidateShapeBucketFunctionGraph(root);
@@ -324,64 +307,99 @@ public sealed partial class AutoDistributedWithShapeBucketPass : ModulePass
         return result;
     }
 
-    private BaseFunction WrapShapeBucketFunction(Function inputFunction, PrimFunction primFunction)
+    private Function BuildMainFunction(Function inputFunction, List<(Function SegmentFunction, Dictionary<DimVar, DimVar> DimVars)> segmentFunctions)
     {
-        var callers = inputFunction.Users.Where(x => x is Call or FunctionWrapper).ToArray();
-        if (callers.Length == 0)
+        if (segmentFunctions.Count == 0)
         {
-            return primFunction;
+            throw new InvalidOperationException("Shape bucket dispatcher requires at least one segment function.");
         }
 
-        return new PrimFunctionWrapper(inputFunction.Name, primFunction, inputFunction.Parameters.Length);
-    }
-
-    private PrimFunction BuildMainFunction(Function inputFunction, List<(Function SegmentFunction, Dictionary<DimVar, DimVar> DimVars)> segmentFunctions)
-    {
-        var outputBuffers = CreateOutputBufferVars(inputFunction.Body);
-        var inputParams = inputFunction.Parameters.AsValueEnumerable().Select(x => (BaseExpr)x).ToArray().Concat<BaseExpr>(outputBuffers).ToArray();
-        TIR.Sequential MakeSegementCall(Function segmentFunction)
+        BaseFunction elseFunction = segmentFunctions[^1].SegmentFunction;
+        for (int i = segmentFunctions.Count - 2; i >= 1; i--)
         {
-            return T.Sequential()
-                .Body(new Call(new FunctionWrapper(segmentFunction.ModuleKind, segmentFunction), inputParams))
-                .Build();
+            elseFunction = CreateShapeBucketSelectorFunction(
+                $"{inputFunction.Name}_shape_bucket_selector_{i}",
+                inputFunction,
+                segmentFunctions[i].SegmentFunction,
+                elseFunction,
+                segmentFunctions[i].DimVars,
+                CloneParameters(inputFunction.Parameters.ToArray()));
         }
 
-        Expr lastSegmentCall = MakeSegementCall(segmentFunctions[^1].SegmentFunction);
-        for (int i = segmentFunctions.Count - 2; i >= 0; i--)
+        var parameters = inputFunction.Parameters.ToArray();
+        var mainBody = segmentFunctions.Count == 1
+            ? new Call(segmentFunctions[0].SegmentFunction, parameters.AsValueEnumerable().Select(x => (BaseExpr)x).ToArray())
+            : CreateShapeBucketIf(segmentFunctions[0].SegmentFunction, elseFunction, segmentFunctions[0].DimVars, parameters);
+        var mainFunction = new Function(inputFunction.Name, inputFunction.ModuleKind, mainBody, parameters, inputFunction.VarMap) { Metadata = inputFunction.Metadata };
+        if (!CompilerServices.InferenceType(mainFunction))
         {
-            var dimVars = segmentFunctions[i].DimVars;
-            var segmentCall = MakeSegementCall(segmentFunctions[i].SegmentFunction);
-            var condition = dimVars
-                .Select(dimVarPair => dimVarPair.Key <= (long)dimVarPair.Value.Metadata.Range!.Value.Max)
-                .Aggregate(IR.F.Math.LogicalAnd);
-            lastSegmentCall = T.If(condition)
-                .Then(segmentCall)
-                .Else(lastSegmentCall)
-                .Build();
+            throw new InvalidOperationException($"Type inference failed for shape bucket dispatcher {mainFunction.Name}.");
         }
 
-        var mainBody = T.Sequential()
-            .Body(lastSegmentCall)
-            .Build();
-        var mainFunction = new PrimFunction($"{inputFunction.Name}_prim", inputFunction.ModuleKind, mainBody, inputFunction.Parameters.ToArray().Concat<IVar>(outputBuffers).ToArray()) { Metadata = inputFunction.Metadata };
         ValidateShapeBucketFunctionGraph(mainFunction);
         return mainFunction;
     }
 
-    private BufferVar[] CreateOutputBufferVars(BaseExpr expr)
+    private Function CreateShapeBucketSelectorFunction(
+        string name,
+        Function inputFunction,
+        BaseFunction thenFunction,
+        BaseFunction elseFunction,
+        IReadOnlyDictionary<DimVar, DimVar> dimVars,
+        IVar[] parameters)
     {
-        if (expr.CheckedType is TupleType tt)
+        var body = CreateShapeBucketIf(thenFunction, elseFunction, dimVars, parameters);
+        var selector = new Function(
+            name,
+            inputFunction.ModuleKind,
+            body,
+            parameters,
+            RemapVarMap(inputFunction.VarMap, inputFunction.Parameters.ToArray(), parameters))
         {
-            return tt.Fields.AsValueEnumerable().Select(CreateOutputBufferVar).ToArray();
-        }
-        else
+            Metadata = inputFunction.Metadata,
+        };
+        if (!CompilerServices.InferenceType(selector))
         {
-            return [CreateOutputBufferVar(expr.CheckedType)];
+            throw new InvalidOperationException($"Type inference failed for shape bucket selector {selector.Name}.");
         }
+
+        return selector;
     }
 
-    private BufferVar CreateOutputBufferVar(IRType type)
-        => new($"out_{_bufferIndex++}", type, BufferVarRole.Output, MemoryLocation.Output);
+    private BaseExpr CreateShapeBucketIf(
+        BaseFunction thenFunction,
+        BaseFunction elseFunction,
+        IReadOnlyDictionary<DimVar, DimVar> dimVars,
+        IReadOnlyList<IVar> parameters)
+    {
+        var condition = dimVars
+            .Select(dimVarPair => dimVarPair.Key <= (long)dimVarPair.Value.Metadata.Range!.Value.Max)
+            .Aggregate(IR.F.Math.LogicalAnd);
+        var arguments = parameters.Select(x => (BaseExpr)x).ToArray();
+        return new If(condition, thenFunction, elseFunction, arguments);
+    }
+
+    private IVar[] CloneParameters(IReadOnlyList<IVar> parameters)
+        => parameters.Select(parameter => parameter.With(parameter.Name)).ToArray();
+
+    private Dictionary<IVar, Dimension[]>? RemapVarMap(
+        Dictionary<IVar, Dimension[]>? source,
+        IReadOnlyList<IVar> sourceParameters,
+        IReadOnlyList<IVar> targetParameters)
+    {
+        if (source is null)
+        {
+            return null;
+        }
+
+        var parameterMap = sourceParameters
+            .Zip(targetParameters)
+            .ToDictionary(pair => pair.First, pair => pair.Second, (IEqualityComparer<IVar>)ReferenceEqualityComparer.Instance);
+        return source.ToDictionary(
+            kvp => parameterMap.TryGetValue(kvp.Key, out var mapped) ? mapped : kvp.Key,
+            kvp => kvp.Value,
+            (IEqualityComparer<IVar>)ReferenceEqualityComparer.Instance);
+    }
 
     private sealed class SegmentAutoDistributedState
     {

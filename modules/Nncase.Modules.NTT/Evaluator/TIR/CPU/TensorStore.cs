@@ -10,8 +10,18 @@ public sealed class TensorStoreEvaluator : ITypeInferencer<TensorStore>
 {
     public IRType Visit(ITypeInferenceContext context, TensorStore target)
     {
-        _ = context.CheckArgumentType<TensorType>(target, TensorStore.Src);
+        _ = CheckTensorOrDistributedBuffer(context, target, TensorStore.Src);
         _ = context.CheckArgumentType<IRType>(target, TensorStore.Dest);
         return TupleType.Void;
     }
+
+    private static IRType CheckTensorOrDistributedBuffer(ITypeInferenceContext context, TensorStore target, ParameterInfo parameter)
+        => context.GetArgumentType(target, parameter) switch
+        {
+            TensorType type => type,
+            DistributedType type => type,
+            AnyType type => throw new TypeInferenceInterruptException(type),
+            InvalidType type => throw new TypeInferenceInterruptException(type),
+            var type => throw new TypeInferenceInterruptException(new InvalidType($"{target.GetType().Name}.{parameter.Name} Must Be TensorType or DistributedType But Give {type.GetType().Name}.")),
+        };
 }

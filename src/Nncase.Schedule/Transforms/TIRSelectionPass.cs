@@ -27,7 +27,7 @@ public abstract class TIRSelectionPass : FunctionPass
     {
         if (input is Function func)
         {
-            var callers = func.Users.Where(x => x is Call or FunctionWrapper).ToArray();
+            var callers = func.Users.Where(x => x is Call or If or FunctionWrapper).ToArray();
             var isEntry = callers.Length == 0;
             var visitor = new TIRSelectionVisitor(this);
             (var newBody, var inBuffers, var outBuffers) = visitor.Select(func);
@@ -172,17 +172,50 @@ public abstract class TIRSelectionPass : FunctionPass
             return SelectCall(expr, args);
         }
 
+        protected override BaseExpr VisitIf(If expr, Unit context)
+        {
+            if (ConditionUsesTensorValue(expr.Condition))
+            {
+                Visit(expr.Condition, context);
+            }
+
+            foreach (var argument in expr.Arguments)
+            {
+                Visit(argument, context);
+            }
+
+            return VisitLeafIf(expr, context);
+        }
+
         protected override BaseExpr VisitLeafIf(If expr, Unit context)
         {
             var output = CreateOutputBuffer(expr);
-            var condition = (Expr)Visit(expr.Condition, context);
-            return T.Let(out var outputVar, (Expr)output).Body(
-                T.Assign(out var arguments, expr.Arguments.AsValueEnumerable().Select(x => ExprMemo[x]).ToArray().Concat(output is IR.Tuple tupleOutput ? tupleOutput.Fields.ToArray() : new[] { outputVar }).ToArray()),
-                T.If(condition)
-                    .Then(new Call(new FunctionWrapper(_selectionPass.ModuleKind, expr.Then), arguments))
-                    .Else(new Call(new FunctionWrapper(_selectionPass.ModuleKind, expr.Else), arguments)))
-                .Build();
+            var condition = ConditionUsesTensorValue(expr.Condition)
+                ? (Expr)Visit(expr.Condition, context)
+                : expr.Condition;
+            var arguments = expr.Arguments.AsValueEnumerable().Select(x => ExprMemo[x]).ToArray().Concat(FlattenOutputArguments(output)).ToArray();
+            _body.Add(T.If(condition)
+                .Then(new Call(WrapIfBranch(expr.Then), arguments))
+                .Else(new Call(WrapIfBranch(expr.Else), arguments))
+                .Build());
+            return output;
         }
+
+        private BaseFunction WrapIfBranch(BaseFunction branch)
+            => branch switch
+            {
+                FunctionWrapper { Target: PrimFunctionWrapper primFunctionWrapper } => primFunctionWrapper.Target,
+                FunctionWrapper wrapper => wrapper,
+                TIR.PrimFunction primFunction => primFunction,
+                PrimFunctionWrapper primFunctionWrapper => primFunctionWrapper.Target,
+                Function => new FunctionWrapper(_selectionPass.ModuleKind, branch),
+                _ => throw new InvalidOperationException($"TIR selection if branch expects Function, FunctionWrapper, PrimFunctionWrapper or PrimFunction, got {branch.GetType().Name}."),
+            };
+
+        private static bool ConditionUsesTensorValue(Expr condition)
+            => ExprCollector.Collect(condition).Any(expr =>
+                (expr is Var or TensorConst or TIR.Buffer)
+                && expr.CheckedType is TensorType or DistributedType);
 
         private static BaseExpr[] FlattenOutputArguments(BaseExpr output)
             => output is IR.Tuple tuple ? tuple.Fields.ToArray() : new[] { output };

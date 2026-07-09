@@ -16,6 +16,7 @@ using Nncase.Passes.Rules.ShapeBucket;
 using Nncase.Targets;
 using Nncase.Tests.TestFixture;
 using Nncase.Utilities;
+using QuikGraph;
 using Xunit;
 
 namespace Nncase.Tests.DistributedTest;
@@ -71,6 +72,112 @@ public sealed class UnitTestDistribAutoDistributed : TestClassBase
     }
 
     [Fact]
+    public void TestFunctionCallUsesDistributedParameterSignature()
+    {
+        var inputType = new TensorType(DataTypes.Float32, [16, 32]);
+        var input = new Var("input", inputType);
+        var layerInput = new Var("layer_input", inputType);
+        var layer = new Function("layer", IR.F.Math.Unary(UnaryOp.Abs, layerInput), [layerInput]);
+        Assert.True(layer.InferenceType());
+
+        var main = new Function("main", new Call(layer, input), [input]);
+        Assert.True(main.InferenceType());
+        var pass = new AutoDistributedPass(false, CPUTarget.Kind, CompileOptions);
+
+        var post = Assert.IsType<Function>(pass.RunAsync(main, new()).Result);
+
+        var layerCall = Assert.Single(ExprCollector.Collect(post.Body).OfType<Call>().Where(call => call.Target is Function { Name: "layer" }));
+        var rewrittenLayer = Assert.IsType<Function>(layerCall.Target);
+        var parameter = Assert.IsType<Var>(Assert.Single(rewrittenLayer.Parameters.ToArray()));
+        Assert.IsType<DistributedType>(parameter.CheckedType);
+        var argument = Assert.Single(layerCall.Arguments.ToArray());
+        Assert.True(
+            EqualityComparer<IRType>.Default.Equals(argument.CheckedType, parameter.CheckedType),
+            $"Function call ABI mismatch: argument is {argument.CheckedType}, parameter is {parameter.CheckedType}.");
+        Assert.DoesNotContain("Boxing(", CompilerServices.Print(rewrittenLayer.Body), System.StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void TestFunctionBoundaryKeepsReferenceTensorStandalone()
+    {
+        var inputType = new TensorType(DataTypes.Float32, [16, 32]);
+        var objectType = TensorType.Scalar(new ReferenceType(DataTypes.Int32));
+        var input = new Var("input", inputType);
+        var cache = new Var("cache", objectType);
+        var layerInput = new Var("layer_input", inputType);
+        var layerCache = new Var("layer_cache", objectType);
+        var layer = new Function(
+            "hf_decoder_layer",
+            new IR.Tuple(IR.F.Math.Unary(UnaryOp.Abs, layerInput), layerCache),
+            [layerInput, layerCache]);
+        Assert.True(layer.InferenceType());
+
+        var layerCall0 = new Call(layer, input, cache);
+        var hidden0 = IR.F.Tensors.GetItem(layerCall0, 0);
+        var cache0 = IR.F.Tensors.GetItem(layerCall0, 1);
+        var layerCall1 = new Call(layer, hidden0, cache0);
+        var main = new Function("main", IR.F.Tensors.GetItem(layerCall1, 0), [input, cache]);
+        Assert.True(main.InferenceType());
+        var pass = new AutoDistributedPass(false, CPUTarget.Kind, CompileOptions);
+
+        var post = Assert.IsType<Function>(pass.RunAsync(main, new()).Result);
+
+        var layerCalls = ExprCollector.Collect(post.Body).OfType<Call>().Where(call => call.Target is Function { Name: "hf_decoder_layer" }).ToArray();
+        Assert.Equal(2, layerCalls.Length);
+        var rewrittenLayer = Assert.IsType<Function>(layerCalls[0].Target);
+        var parameters = rewrittenLayer.Parameters.ToArray();
+        Assert.IsType<DistributedType>(parameters[0].CheckedType);
+        Assert.Equal(objectType, parameters[1].CheckedType);
+        foreach (var layerCall in layerCalls)
+        {
+            Assert.Equal(objectType, layerCall.Arguments[1].CheckedType);
+            Assert.DoesNotContain(
+                ExprCollector.Collect(layerCall.Arguments[1]).OfType<Call>(),
+                call => call.Target is IR.Distributed.Boxing boxing && EqualityComparer<IRType>.Default.Equals(boxing.NewType, objectType));
+        }
+    }
+
+    [Fact]
+    public void TestAutoDistributedMaterializerReusesSameSourceAndTargetBoxing()
+    {
+        var inputType = new TensorType(DataTypes.Float32, [16]);
+        var input = new Var("input", inputType);
+        var distributedType0 = new DistributedType(inputType, new SBP[] { SBP.B }, new Placement([4], "b", "b"));
+        var distributedType1 = new DistributedType(inputType, new SBP[] { SBP.B }, new Placement([4], "b", "b"));
+
+        var graph = new DistributedSearchGraph(new AdjacencyGraph<SearchableNode, CrossEdge>(true), SearchGraphKind.Root);
+        var rootBucket = graph.CreateCluster<DistributedSearchGraph>(SearchGraphKind.Bucket);
+        var inputBucket = graph.CreateCluster<DistributedSearchGraph>(SearchGraphKind.Bucket);
+        var boxedBucket0 = graph.CreateCluster<DistributedSearchGraph>(SearchGraphKind.Bucket);
+        var boxedBucket1 = graph.CreateCluster<DistributedSearchGraph>(SearchGraphKind.Bucket);
+
+        var tupleNode = new SearchableNode(new IR.Tuple(), new TupleType([distributedType0, distributedType1]));
+        var inputNode = new SearchableNode(input, inputType);
+        var boxedNode0 = new SearchableNode(new IR.Distributed.Boxing(distributedType0), distributedType0);
+        var boxedNode1 = new SearchableNode(new IR.Distributed.Boxing(distributedType1), distributedType1);
+        rootBucket.AddVertex(tupleNode);
+        inputBucket.AddVertex(inputNode);
+        boxedBucket0.AddVertex(boxedNode0);
+        boxedBucket1.AddVertex(boxedNode1);
+        graph.AddEdge(new(tupleNode, boxedNode0, 0, boxedBucket0));
+        graph.AddEdge(new(tupleNode, boxedNode1, 1, boxedBucket1));
+        graph.AddEdge(new(boxedNode0, inputNode, 0, inputBucket));
+        graph.AddEdge(new(boxedNode1, inputNode, 0, inputBucket));
+
+        var picks = new Dictionary<SearchableNode, bool>
+        {
+            [tupleNode] = true,
+            [inputNode] = true,
+            [boxedNode0] = true,
+            [boxedNode1] = true,
+        };
+
+        var tuple = Assert.IsType<IR.Tuple>(new ExprBuildVisitor(graph, picks).Visit([rootBucket]));
+        Assert.Same(tuple.Fields[0], tuple.Fields[1]);
+        Assert.Single(ExprCollector.Collect(tuple).OfType<Call>().Where(call => call.Target is IR.Distributed.Boxing));
+    }
+
+    [Fact]
     public async Task TestShapeBucketSegmentsFromEntryAndClonesInternalFunctions()
     {
         var n = new DimVar("n") { Metadata = { Range = (1, 32) } };
@@ -94,10 +201,10 @@ public sealed class UnitTestDistribAutoDistributed : TestClassBase
         module = await new RemoveUnusedFunctions(CompileOptions).RunAsync(module, new());
 
         var names = module.Functions.Select(function => function.Name).ToArray();
-        Assert.Contains("main_prim", names);
+        Assert.Contains("main", names);
+        Assert.DoesNotContain("main_prim", names);
         Assert.Equal(2, names.Count(name => name.StartsWith("main_segment_", System.StringComparison.Ordinal)));
         Assert.Equal(2, names.Count(name => name.StartsWith("layer_segment_", System.StringComparison.Ordinal)));
-        Assert.DoesNotContain("main", names);
         Assert.DoesNotContain("layer", names);
         Assert.DoesNotContain("layer_prim", names);
     }

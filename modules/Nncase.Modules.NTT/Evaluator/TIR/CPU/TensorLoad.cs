@@ -10,8 +10,18 @@ public class TensorLoadEvaluator : ITypeInferencer<TensorLoad>
 {
     public IRType Visit(ITypeInferenceContext context, TensorLoad target)
     {
-        _ = context.CheckArgumentType<TensorType>(target, TensorLoad.Dest);
+        _ = CheckTensorOrDistributedBuffer(context, target, TensorLoad.Dest);
         _ = context.CheckArgumentType<IRType>(target, TensorLoad.Src);
         return TupleType.Void;
     }
+
+    private static IRType CheckTensorOrDistributedBuffer(ITypeInferenceContext context, TensorLoad target, ParameterInfo parameter)
+        => context.GetArgumentType(target, parameter) switch
+        {
+            TensorType type => type,
+            DistributedType type => type,
+            AnyType type => throw new TypeInferenceInterruptException(type),
+            InvalidType type => throw new TypeInferenceInterruptException(type),
+            var type => throw new TypeInferenceInterruptException(new InvalidType($"{target.GetType().Name}.{parameter.Name} Must Be TensorType or DistributedType But Give {type.GetType().Name}.")),
+        };
 }

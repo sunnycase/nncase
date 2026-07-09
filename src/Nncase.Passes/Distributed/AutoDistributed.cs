@@ -17,6 +17,7 @@ using System.Threading.Tasks;
 using DryIoc.ImTools;
 using Google.OrTools.Sat;
 using NetFabric.Hyperlinq;
+using Nncase.Diagnostics;
 using Nncase.Evaluator;
 using Nncase.Graphs;
 using Nncase.IR;
@@ -47,9 +48,91 @@ internal enum SearchGraphKind : int
     Bucket,
 }
 
+internal enum SearchableNodeKind : int
+{
+    Normal,
+    FunctionParameter,
+    FunctionCall,
+    FunctionBoundaryAdapter,
+    TypeAdapter,
+}
+
 public sealed class AutoDistributedMetaData : IRMetadata
 {
     public bool Skip { get; set; }
+}
+
+internal static class DistributedFunctionGraphUtility
+{
+    public static IReadOnlyList<Function> GetReachableFunctionsInCalleeFirstOrder(BaseFunction root)
+    {
+        var result = new List<Function>();
+        var visited = new HashSet<BaseFunction>(ReferenceEqualityComparer.Instance);
+        var active = new HashSet<BaseFunction>(ReferenceEqualityComparer.Instance);
+        var path = new List<BaseFunction>();
+
+        void Visit(BaseFunction function)
+        {
+            if (active.Contains(function))
+            {
+                var cycleStart = path.FindIndex(x => ReferenceEquals(x, function));
+                var cycle = path.Skip(Math.Max(cycleStart, 0)).Append(function).Select(x => x.Name);
+                throw new InvalidOperationException($"Function reference graph contains a cycle: {string.Join(" -> ", cycle)}.");
+            }
+
+            if (!visited.Add(function))
+            {
+                return;
+            }
+
+            active.Add(function);
+            path.Add(function);
+            foreach (var referencedFunction in GetDirectFunctionReferences(function))
+            {
+                Visit(referencedFunction);
+            }
+
+            path.RemoveAt(path.Count - 1);
+            active.Remove(function);
+            if (function is Function highLevelFunction)
+            {
+                result.Add(highLevelFunction);
+            }
+        }
+
+        Visit(root);
+        return result;
+    }
+
+    public static IReadOnlyList<BaseFunction> GetDirectFunctionReferences(BaseExpr root)
+    {
+        var refs = new List<BaseFunction>();
+        var seenRefs = new HashSet<BaseFunction>(ReferenceEqualityComparer.Instance);
+        var seenExprs = new HashSet<BaseExpr>(ReferenceEqualityComparer.Instance);
+        var stack = new Stack<BaseExpr>();
+        stack.Push(root);
+        while (stack.Count != 0)
+        {
+            var expr = stack.Pop();
+            if (!seenExprs.Add(expr))
+            {
+                continue;
+            }
+
+            if (expr is BaseFunction function && !ReferenceEquals(function, root) && seenRefs.Add(function))
+            {
+                refs.Add(function);
+                continue;
+            }
+
+            foreach (var operand in expr.Operands)
+            {
+                stack.Push(operand);
+            }
+        }
+
+        return refs;
+    }
 }
 
 /// <summary>
@@ -140,11 +223,12 @@ internal static class UserRebuilder
 
 internal sealed class SearchableNode
 {
-    public SearchableNode(BaseExpr expr, IRType type, bool isBidirect = false)
+    public SearchableNode(BaseExpr expr, IRType type, bool isBidirect = false, SearchableNodeKind kind = SearchableNodeKind.Normal)
     {
         Expr = expr;
         IRType = type;
         IsBidirect = isBidirect;
+        Kind = kind;
     }
 
     public BaseExpr Expr { get; }
@@ -152,6 +236,8 @@ internal sealed class SearchableNode
     public IRType IRType { get; }
 
     public bool IsBidirect { get; }
+
+    public SearchableNodeKind Kind { get; }
 }
 
 internal sealed record CrossEdge : IEdge<SearchableNode>
@@ -207,6 +293,17 @@ internal sealed record BoxingTypeKey(IRType InputType, IRType OutputType, bool I
 internal sealed record LeafCandidateKey(TensorType TensorType);
 
 internal sealed record ReshardPlanKey(IRType SourceType, IRType TargetType, int MaxHops);
+
+internal sealed record BoxingCandidateKey(
+    DistributedSearchGraph OwnerCluster,
+    DistributedSearchGraph? OutputBucket,
+    DistributedSearchGraph InputBucket,
+    SearchableNode InputNode,
+    IRType TargetType,
+    SearchableNodeKind Kind,
+    bool IsBidirect,
+    DistributedSearchGraph? DependencyBucket,
+    SearchableNode? DependencyNode);
 
 internal sealed class AutoDistributedProfiler
 {
@@ -459,6 +556,7 @@ internal sealed class CandidateDominanceKey : IEquatable<CandidateDominanceKey>
 internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
 {
     private const int MaxProviderReturnCandidateTypes = 4096;
+    private const int HiddenFunctionDependencyIndex = -1;
 
     private readonly Dictionary<BaseExpr, DistributedSearchGraph> _reshardMemo;
 
@@ -490,7 +588,23 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
 
     private readonly Dictionary<BoxingTypeKey, IRType> _boxingTypeMemo = new();
 
+    private readonly Dictionary<BoxingCandidateKey, (DistributedSearchGraph Bucket, SearchableNode Node)> _boxingCandidateMemo = new();
+
     private readonly Dictionary<TypeInferenceCacheKey, (bool Success, IRType CheckedType)> _typeInferenceMemo = new();
+
+    private readonly Dictionary<Function, DistributedSearchGraph> _functionReturnClusters = new(ReferenceEqualityComparer.Instance);
+
+    private readonly Dictionary<Function, DistributedSearchGraph> _functionRootClusters = new(ReferenceEqualityComparer.Instance);
+
+    private readonly Dictionary<Function, Dictionary<IVar, DistributedSearchGraph>> _functionParameterClusters = new(ReferenceEqualityComparer.Instance);
+
+    private readonly HashSet<DistributedSearchGraph> _singleChoiceClusters = new(ReferenceEqualityComparer.Instance);
+
+    private Function? _currentFunction;
+
+    private bool _currentFunctionIsEntry;
+
+    private Dictionary<SearchableNode, bool>? _lastPicks;
 
     /// <summary>
     /// The original tensor consts that are distributed.
@@ -575,8 +689,24 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
     public static bool SupportsConstShardedView(INTTTargetOptions targetOptions)
         => targetOptions.ConstShardedView && targetOptions.UnifiedMemoryArch && targetOptions.MemoryAccessArch == MemoryAccessArchitecture.UMA;
 
+    private static bool IsDistributableTensorType(TensorType tensorType)
+        => tensorType.DType is not ReferenceType;
+
+    private static bool ContainsDistributableTensorType(IRType type) => type switch
+    {
+        DistributedType => true,
+        TensorType tensorType => IsDistributableTensorType(tensorType),
+        TupleType tupleType => tupleType.Fields.Any(ContainsDistributableTensorType),
+        _ => false,
+    };
+
     public static IReadOnlyList<DistributedType> GetLeafCandidateDistTypes(TensorType tensorType, IEnumerable<Placement> placements, string moduleKind, INTTTargetOptions targetOptions)
     {
+        if (!IsDistributableTensorType(tensorType))
+        {
+            return Array.Empty<DistributedType>();
+        }
+
         return placements.Select(
             placement =>
             DistributedUtility.GetLeafCandidatePolicies(tensorType, placement)
@@ -656,9 +786,70 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
     }
 
     public Function Rewrite(Function function)
+        => RewriteProgram(function, DistributedFunctionGraphUtility.GetReachableFunctionsInCalleeFirstOrder(function));
+
+    public Function RewriteProgram(Function rootFunction, IReadOnlyList<Function> reachableFunctions)
     {
-        var root = BuildSearchGraph(function);
-        return SolveAndExtract(function, root);
+        if (!reachableFunctions.Contains(rootFunction, ReferenceEqualityComparer.Instance))
+        {
+            throw new InvalidOperationException($"AutoDistributed reachable function list does not contain root function {rootFunction.Name}.");
+        }
+
+        _profiler.SetFunction(rootFunction.Name);
+        DistributedSearchGraph root = null!;
+        using (Nncase.IR.UserTrackingScope.Suppress())
+        {
+            _profiler.Time("build_search_graph", () =>
+            {
+                foreach (var function in reachableFunctions)
+                {
+                    using var functionDumpScope = new DumpScope(function.Name);
+                    var isEntry = ReferenceEquals(function, rootFunction);
+                    var functionRoot = BuildFunctionSearchGraph(function, isEntry);
+                    if (isEntry)
+                    {
+                        root = functionRoot;
+                    }
+                }
+            });
+
+            if (Diagnostics.DumpScope.Current.IsEnabled(Diagnostics.DumpFlags.EGraphCost))
+            {
+                _profiler.Time("dump_search_graph_dot", () =>
+                {
+                    using var stream = Diagnostics.DumpScope.Current.OpenFile("DistributedSearchGraph.dot");
+                    Dump(stream, new Dictionary<SearchableNode, bool>() { }, new Dictionary<SearchableNode, CostModel.Cost>() { }, new Dictionary<SearchableNode, UInt128>() { });
+                });
+            }
+        }
+
+        if (root is null)
+        {
+            throw new InvalidOperationException($"AutoDistributed failed to build root search graph for {rootFunction.Name}.");
+        }
+
+        _profiler.TimeActive(() =>
+        {
+            using (Nncase.IR.UserTrackingScope.Suppress())
+            {
+                _ = _profiler.Time("solve_total", () => Solve(root));
+            }
+        });
+
+        if (_lastPicks is null)
+        {
+            throw new InvalidOperationException("AutoDistributed solver finished without selected picks.");
+        }
+
+        var materializer = new DistributedProgramMaterializer(_rootSearchGraph, _lastPicks);
+        var rewritten = materializer.Materialize(rootFunction, reachableFunctions, _functionRootClusters, _functionParameterClusters);
+        foreach (var function in rewritten.Values)
+        {
+            _profiler.Time("rebuild_users", () => UserRebuilder.Rebuild(function));
+        }
+
+        _profiler.Write(_rootSearchGraph, _candidateDiagnosticTotal);
+        return rewritten[rootFunction];
     }
 
     public DistributedSearchGraph BuildSearchGraph(Function function)
@@ -689,6 +880,30 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         });
     }
 
+    private DistributedSearchGraph BuildFunctionSearchGraph(Function function, bool isEntry)
+    {
+        _currentFunction = function;
+        _currentFunctionIsEntry = isEntry;
+        try
+        {
+            Visit(function.Body);
+            var root = isEntry ? TryInstertTerminator(function.Body) : TryAddOriginator(function.Body);
+            _functionRootClusters[function] = root;
+            if (!isEntry)
+            {
+                _functionReturnClusters[function] = root;
+                _singleChoiceClusters.Add(root);
+            }
+
+            return root;
+        }
+        finally
+        {
+            _currentFunction = null;
+            _currentFunctionIsEntry = false;
+        }
+    }
+
     public Function SolveAndExtract(Function function, DistributedSearchGraph root)
     {
         var post = _profiler.TimeActive(() =>
@@ -696,7 +911,11 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
             BaseExpr result;
             using (Nncase.IR.UserTrackingScope.Suppress())
             {
-                result = _profiler.Time("solve_and_extract_total", () => SolveAndExtract(root));
+                result = _profiler.Time("solve_and_extract_total", () =>
+                {
+                    var picks = Solve(root);
+                    return ExtractSelectedExpression(root, picks);
+                });
             }
 
             _profiler.Time("rebuild_users", () => UserRebuilder.Rebuild(result));
@@ -715,6 +934,11 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
     protected override Unit VisitLeafCall(Call expr)
     {
         _profiler.Count("calls");
+
+        if (expr.Target is Function callee && _functionReturnClusters.ContainsKey(callee))
+        {
+            return VisitLeafFunctionCall(expr, callee);
+        }
 
         string DescribeType(IRType type) => type switch
         {
@@ -982,9 +1206,14 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
                 {
                     if (CheckBoxingTypeCached(lType, rType) is not InvalidType)
                     {
-                        var rnode = new SearchableNode(new Boxing(rType), rType, true);
-                        rBucket.AddVertex(rnode);
-                        callCluster.AddEdge(new(rnode, lBucket.Vertices.First(), 0, lBucket));
+                        GetOrCreateBoxingCandidate(
+                            callCluster,
+                            lBucket,
+                            lBucket.Vertices.First(),
+                            rType,
+                            isBidirect: true,
+                            outputBucket: rBucket,
+                            addDataEdgeToOwnerCluster: true);
                     }
                 }
             }
@@ -993,7 +1222,7 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         // 4. add not infered type in search space.
         var addedBuckets = bucketMemo.Values.ToArray();
 
-        if (expr.CheckedType is not TensorType)
+        if (expr.CheckedType is not TensorType tensorType || !IsDistributableTensorType(tensorType))
         {
             return default;
         }
@@ -1207,7 +1436,8 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         return type switch
         {
             DistributedType distributedType => [distributedType],
-            TensorType tensorType => GetLeafCandidateDistTypes(tensorType).Cast<IRType>().ToArray(),
+            TensorType tensorType when IsDistributableTensorType(tensorType) => GetLeafCandidateDistTypes(tensorType).Cast<IRType>().ToArray(),
+            TensorType tensorType => [tensorType],
             TupleType tupleType => GetProviderTupleReturnCandidateTypes(tupleType),
             _ => Array.Empty<IRType>(),
         };
@@ -1312,10 +1542,12 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         var inputNode = sourceNode;
         foreach (var stepType in stepTypes)
         {
-            var bucket = callCluster.CreateCluster<DistributedSearchGraph>(SearchGraphKind.Bucket);
-            var node = new SearchableNode(new Boxing(stepType), stepType);
-            bucket.AddVertex(node);
-            callCluster.AddEdge(new(node, inputNode, 0, inputBucket));
+            var (bucket, node) = GetOrCreateBoxingCandidate(
+                callCluster,
+                inputBucket,
+                inputNode,
+                stepType,
+                addDataEdgeToOwnerCluster: true);
             inputBucket = bucket;
             inputNode = node;
         }
@@ -1331,6 +1563,186 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
             || expr.Target is Gather;
 
     private bool CanBoxingType(IRType inputType, IRType outputType) => CheckBoxingTypeCached(inputType, outputType) is not InvalidType;
+
+    private (DistributedSearchGraph Bucket, SearchableNode Node) GetOrCreateBoxingCandidate(
+        DistributedSearchGraph ownerCluster,
+        DistributedSearchGraph inputBucket,
+        SearchableNode inputNode,
+        IRType targetType,
+        SearchableNodeKind kind = SearchableNodeKind.Normal,
+        bool isBidirect = false,
+        DistributedSearchGraph? outputBucket = null,
+        DistributedSearchGraph? dependencyBucket = null,
+        SearchableNode? dependencyNode = null,
+        bool addDataEdgeToOwnerCluster = false)
+    {
+        if ((dependencyBucket is null) != (dependencyNode is null))
+        {
+            throw new InvalidOperationException("A boxing candidate dependency must provide both bucket and node.");
+        }
+
+        var key = new BoxingCandidateKey(
+            ownerCluster,
+            outputBucket,
+            inputBucket,
+            inputNode,
+            targetType,
+            kind,
+            isBidirect,
+            dependencyBucket,
+            dependencyNode);
+        if (_boxingCandidateMemo.TryGetValue(key, out var existing))
+        {
+            return existing;
+        }
+
+        var bucket = outputBucket ?? ownerCluster.CreateCluster<DistributedSearchGraph>(SearchGraphKind.Bucket);
+        var node = new SearchableNode(new Boxing(targetType), targetType, isBidirect, kind);
+        bucket.AddVertex(node);
+        var dataEdge = new CrossEdge(node, inputNode, 0, inputBucket);
+        if (addDataEdgeToOwnerCluster)
+        {
+            ownerCluster.AddEdge(dataEdge);
+        }
+        else
+        {
+            _rootSearchGraph.AddEdge(dataEdge);
+        }
+
+        if (dependencyBucket is not null && dependencyNode is not null)
+        {
+            _rootSearchGraph.AddEdge(new(node, dependencyNode, HiddenFunctionDependencyIndex, dependencyBucket));
+        }
+
+        var created = (bucket, node);
+        _boxingCandidateMemo.Add(key, created);
+        _profiler.Count("boxing_candidate_created");
+        return created;
+    }
+
+    private Unit VisitLeafFunctionCall(Call expr, Function callee)
+    {
+        _profiler.Count("function_calls");
+        var calleeReturnCluster = _functionReturnClusters[callee];
+        var actualClusters = new DistributedSearchGraph[expr.Arguments.Length];
+        var formalClusters = GetFunctionParameterClusters(callee);
+        var boundaryClusters = new DistributedSearchGraph[expr.Arguments.Length];
+        var calleeParameters = callee.Parameters.ToArray();
+        if (calleeParameters.Length != expr.Arguments.Length)
+        {
+            throw new InvalidOperationException($"Function call argument count mismatch for {callee.Name}: expected {calleeParameters.Length}, got {expr.Arguments.Length}.");
+        }
+
+        for (int i = 0; i < expr.Arguments.Length; i++)
+        {
+            var parameter = calleeParameters[i];
+            var actual = expr.Arguments[i];
+            if (formalClusters.TryGetValue(parameter, out var formalCluster))
+            {
+                actualClusters[i] = VisitLeafArgument(ParameterKind.Input, actual, isSupported: true);
+                boundaryClusters[i] = CreateFunctionBoundaryArgumentCluster(expr, i, actualClusters[i], formalCluster);
+            }
+            else
+            {
+                actualClusters[i] = VisitLeafArgument(ParameterKind.Input, actual, isSupported: false);
+                boundaryClusters[i] = actualClusters[i];
+            }
+        }
+
+        var callCluster = _rootSearchGraph.CreateCluster<DistributedSearchGraph>(SearchGraphKind.DistributedCluster);
+        foreach (var returnBucket in calleeReturnCluster.Clusters.OfType<DistributedSearchGraph>())
+        {
+            var returnNode = returnBucket.Vertices.FirstOrDefault()
+                ?? throw new InvalidOperationException($"Function {callee.Name} has an empty return candidate bucket.");
+            var bucket = callCluster.CreateCluster<DistributedSearchGraph>(SearchGraphKind.Bucket);
+            var callNode = new SearchableNode(callee, returnNode.IRType, kind: SearchableNodeKind.FunctionCall);
+            bucket.AddVertex(callNode);
+            _rootSearchGraph.AddEdge(new(callNode, returnNode, HiddenFunctionDependencyIndex, returnBucket));
+            for (int i = 0; i < boundaryClusters.Length; i++)
+            {
+                foreach (var boundaryBucket in boundaryClusters[i].Clusters.OfType<DistributedSearchGraph>())
+                {
+                    var boundaryNode = boundaryBucket.Vertices.FirstOrDefault()
+                        ?? throw new InvalidOperationException($"Function {callee.Name} call boundary argument {i} has an empty candidate bucket.");
+                    _rootSearchGraph.AddEdge(new(callNode, boundaryNode, i, boundaryBucket));
+                }
+            }
+        }
+
+        _inferedMemo.Add(expr, callCluster);
+        FilterByScheme(expr, callCluster);
+        return default;
+    }
+
+    private DistributedSearchGraph CreateFunctionBoundaryArgumentCluster(Call call, int argumentIndex, DistributedSearchGraph actualCluster, DistributedSearchGraph formalCluster)
+    {
+        var callTargetName = call.Target is Callable callable ? callable.Name : call.Target.GetType().Name;
+        var boundaryCluster = _rootSearchGraph.CreateCluster<DistributedSearchGraph>(SearchGraphKind.DistributedCluster);
+        var formalBuckets = formalCluster.Clusters.OfType<DistributedSearchGraph>().ToArray();
+        var actualBuckets = actualCluster.Clusters.OfType<DistributedSearchGraph>().ToArray();
+        foreach (var formalBucket in formalBuckets)
+        {
+            var formalNode = formalBucket.Vertices.FirstOrDefault()
+                ?? throw new InvalidOperationException($"Function call {callTargetName} formal argument {argumentIndex} has an empty candidate bucket.");
+            foreach (var actualBucket in actualBuckets)
+            {
+                var actualNode = actualBucket.Vertices.FirstOrDefault()
+                    ?? throw new InvalidOperationException($"Function call {callTargetName} actual argument {argumentIndex} has an empty candidate bucket.");
+                foreach (var plan in GetFunctionBoundaryReshardPlans(actualNode.IRType, formalNode.IRType))
+                {
+                    var finalBucket = AddFunctionBoundaryReshardPath(boundaryCluster, actualBucket, actualNode, plan.StepTypes);
+                    var finalNode = finalBucket.Vertices.First();
+                    GetOrCreateBoxingCandidate(
+                        boundaryCluster,
+                        finalBucket,
+                        finalNode,
+                        formalNode.IRType,
+                        kind: SearchableNodeKind.FunctionBoundaryAdapter,
+                        dependencyBucket: formalBucket,
+                        dependencyNode: formalNode);
+                }
+            }
+        }
+
+        if (boundaryCluster.VertexCount == 0)
+        {
+            throw new InvalidOperationException($"Function call {callTargetName} argument {argumentIndex} has no legal actual/formal distributed boundary plan.");
+        }
+
+        return boundaryCluster;
+    }
+
+    private IEnumerable<DistributedReshardPlan> GetFunctionBoundaryReshardPlans(IRType sourceType, IRType targetType)
+    {
+        if (EqualityComparer<IRType>.Default.Equals(sourceType, targetType))
+        {
+            return new[] { new DistributedReshardPlan(Array.Empty<IRType>()) };
+        }
+
+        return GetReshardPlans(sourceType, targetType);
+    }
+
+    private DistributedSearchGraph AddFunctionBoundaryReshardPath(
+        DistributedSearchGraph boundaryCluster,
+        DistributedSearchGraph sourceBucket,
+        SearchableNode sourceNode,
+        IReadOnlyList<IRType> stepTypes)
+    {
+        var inputBucket = sourceBucket;
+        var inputNode = sourceNode;
+        foreach (var stepType in stepTypes)
+        {
+            var (bucket, node) = GetOrCreateBoxingCandidate(
+                boundaryCluster,
+                inputBucket,
+                inputNode,
+                stepType);
+            inputBucket = bucket;
+            inputNode = node;
+        }
+
+        return inputBucket;
+    }
 
     /// <summary>
     /// some times we didn't use all args.
@@ -1411,6 +1823,64 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         _ => false,
     };
 
+    private Dictionary<IVar, DistributedSearchGraph> GetFunctionParameterClusters(Function function)
+    {
+        if (!_functionParameterClusters.TryGetValue(function, out var clusters))
+        {
+            clusters = new Dictionary<IVar, DistributedSearchGraph>(ReferenceEqualityComparer.Instance);
+            _functionParameterClusters.Add(function, clusters);
+        }
+
+        return clusters;
+    }
+
+    private bool TryGetCurrentInternalTensorParameter(Var var, [NotNullWhen(true)] out Function? function)
+    {
+        function = null;
+        if (_currentFunction is null || _currentFunctionIsEntry || var.CheckedType is not TensorType tensorType || !IsDistributableTensorType(tensorType))
+        {
+            return false;
+        }
+
+        foreach (var parameter in _currentFunction.Parameters)
+        {
+            if (ReferenceEquals(parameter, var))
+            {
+                function = _currentFunction;
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private DistributedSearchGraph CreateFunctionParameterCluster(Function function, Var parameter)
+    {
+        var clusters = GetFunctionParameterClusters(function);
+        if (clusters.TryGetValue(parameter, out var existing))
+        {
+            return existing;
+        }
+
+        if (parameter.CheckedType is not TensorType tensorType || !IsDistributableTensorType(tensorType))
+        {
+            throw new InvalidOperationException($"AutoDistributed function parameter signature only supports distributable tensor parameters, got {parameter.CheckedType}.");
+        }
+
+        var distCluster = _rootSearchGraph.CreateCluster<DistributedSearchGraph>(SearchGraphKind.DistributedCluster);
+        var tensorBucket = distCluster.CreateCluster<DistributedSearchGraph>(SearchGraphKind.Bucket);
+        tensorBucket.AddVertex(new SearchableNode(parameter, tensorType, kind: SearchableNodeKind.FunctionParameter));
+        foreach (var dType in GetLeafCandidateDistTypes(tensorType))
+        {
+            var bucket = distCluster.CreateCluster<DistributedSearchGraph>(SearchGraphKind.Bucket);
+            bucket.AddVertex(new SearchableNode(parameter, dType, kind: SearchableNodeKind.FunctionParameter));
+        }
+
+        clusters.Add(parameter, distCluster);
+        _singleChoiceClusters.Add(distCluster);
+        return distCluster;
+    }
+
     private DistributedSearchGraph CreateOriginatorCluster(BaseExpr expr, bool init)
     {
         if (expr is IR.Tuple tp)
@@ -1447,7 +1917,7 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         }
         else if (expr is TensorConst tc2)
         {
-            if (tc2.ValueType is TensorType tensorType)
+            if (tc2.ValueType is TensorType tensorType && IsDistributableTensorType(tensorType))
             {
                 var distCluster = _rootSearchGraph.CreateCluster<DistributedSearchGraph>(SearchGraphKind.DistributedCluster);
                 DistributedSearchGraph? shardedViewInputBucket = null;
@@ -1475,6 +1945,13 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
 
                 return distCluster;
             }
+            else if (tc2.ValueType is TensorType)
+            {
+                var standCluster = _rootSearchGraph.CreateCluster<DistributedSearchGraph>(SearchGraphKind.StandaloneCluster);
+                var bucket = standCluster.CreateCluster<DistributedSearchGraph>(SearchGraphKind.Bucket);
+                bucket.AddVertex(new SearchableNode(tc2, tc2.CheckedType));
+                return standCluster;
+            }
             else if (tc2.ValueType is DistributedType distributedType2)
             {
                 var distCluster = _rootSearchGraph.CreateCluster<DistributedSearchGraph>(SearchGraphKind.DistributedCluster);
@@ -1491,6 +1968,11 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         }
         else
         {
+            if (init && expr is Var var && TryGetCurrentInternalTensorParameter(var, out var function))
+            {
+                return CreateFunctionParameterCluster(function, var);
+            }
+
             if (init)
             {
                 var standCluster = _rootSearchGraph.CreateCluster<DistributedSearchGraph>(SearchGraphKind.StandaloneCluster);
@@ -1509,6 +1991,11 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
                 var distCluster = _rootSearchGraph.CreateCluster<DistributedSearchGraph>(SearchGraphKind.DistributedCluster);
                 var inferCluster = _inferedMemo[expr];
                 var sourceType = inferCluster.Vertices.First().IRType;
+                if (sourceType is TensorType sourceTensorType && !IsDistributableTensorType(sourceTensorType))
+                {
+                    return inferCluster;
+                }
+
                 if (sourceType is not TensorType tensorType)
                 {
                     throw new InvalidOperationException($"AutoDistributed can only create tensor originator candidates from TensorType, but got {sourceType} for {expr.GetType().Name}.");
@@ -1516,10 +2003,13 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
 
                 foreach (var dType in GetLeafCandidateDistTypes(tensorType))
                 {
-                    var bucket = distCluster.CreateCluster<DistributedSearchGraph>(SearchGraphKind.Bucket);
-                    var dnode = new SearchableNode(new Boxing(dType), dType);
-                    bucket.AddVertex(dnode);
-                    _rootSearchGraph.AddEdge(new(dnode, inferCluster.Vertices.First(), 0, inferCluster.Clusters.OfType<DistributedSearchGraph>().First()));
+                    var inputBucket = inferCluster.Clusters.OfType<DistributedSearchGraph>().First();
+                    var inputNode = inputBucket.Vertices.First();
+                    GetOrCreateBoxingCandidate(
+                        distCluster,
+                        inputBucket,
+                        inputNode,
+                        dType);
                 }
 
                 return distCluster;
@@ -1576,6 +2066,11 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         }
 
         if (inferCluster.Kind is SearchGraphKind.DistributedCluster)
+        {
+            return inferCluster;
+        }
+
+        if (!ContainsDistributableTensorType(expr.CheckedType))
         {
             return inferCluster;
         }
@@ -1663,6 +2158,29 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
             }
             else
             {
+                if (!ContainsDistributableTensorType(expr.CheckedType))
+                {
+                    var passthroughInputBuckets = _inferedMemo[expr].Clusters.OfType<DistributedSearchGraph>().ToArray();
+                    var passthroughBucket = standCluster.CreateCluster<DistributedSearchGraph>(SearchGraphKind.Bucket);
+                    var passthroughNode = new SearchableNode(expr, expr.CheckedType, kind: SearchableNodeKind.TypeAdapter);
+                    passthroughBucket.AddVertex(passthroughNode);
+                    foreach (var inputBucket in passthroughInputBuckets)
+                    {
+                        var inputNode = inputBucket.Vertices.FirstOrDefault();
+                        if (inputNode is not null && EqualityComparer<IRType>.Default.Equals(inputNode.IRType, passthroughNode.IRType))
+                        {
+                            _rootSearchGraph.AddEdge(new(passthroughNode, inputNode, 0, inputBucket));
+                        }
+                    }
+
+                    if (!_rootSearchGraph.TryGetOutEdges(passthroughNode, out var edges) || !edges.Any())
+                    {
+                        throw new InvalidOperationException($"AutoDistributed cannot create standalone passthrough for non-distributable tensor {expr.CheckedType}.");
+                    }
+
+                    return standCluster;
+                }
+
                 var onode = new SearchableNode(new Boxing(expr.CheckedType), expr.CheckedType);
                 var inputBuckets = _inferedMemo[expr].Clusters.OfType<DistributedSearchGraph>().ToArray();
 
@@ -2477,7 +2995,7 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         }
     }
 
-    private BaseExpr SolveAndExtract(DistributedSearchGraph rootCluster)
+    private Dictionary<SearchableNode, bool> Solve(DistributedSearchGraph rootCluster)
     {
         // 0. create bool var for all node.
         var cpmodel = new CpModel();
@@ -2495,6 +3013,12 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
                     foreach (var enode in bucket.Vertices)
                     {
                         CostModel.Cost cost;
+                        if (enode.Kind is SearchableNodeKind.FunctionBoundaryAdapter or SearchableNodeKind.TypeAdapter)
+                        {
+                            cost = new CostModel.Cost() { [CostModel.CostFactorNames.CPUCycles] = 0 };
+                        }
+                        else
+                        {
                         switch (enode.Expr)
                         {
                             case TensorConst { ValueType: DistributedType distributedType }:
@@ -2515,7 +3039,7 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
                                         throw new NotSupportedException("graph doesn't contain the vertex.");
                                     }
 
-                                    var tempArgs = edges.OrderBy(e => e.InputIndex).Select<CrossEdge, BaseExpr>(e => e.Target switch
+                                    var tempArgs = edges.Where(e => e.InputIndex >= 0).OrderBy(e => e.InputIndex).Select<CrossEdge, BaseExpr>(e => e.Target switch
                                     {
                                         SearchableNode { Expr: Dimension attr } => attr,
                                         SearchableNode { Expr: Shape attr } => attr,
@@ -2532,6 +3056,7 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
                                 break;
                             default:
                                 throw new NotSupportedException($"extract not support {enode.Expr.GetType()}");
+                        }
                         }
 
                         costMemo.Add(enode, cost);
@@ -2551,7 +3076,8 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
                     {
                         var boolVar = cpmodel.NewBoolVar(string.Empty);
                         varMemo.Add(enode, boolVar);
-                        if (enode.Expr is Op o && o is not Boxing)
+                        if (_singleChoiceClusters.Contains(cluster)
+                            || enode.Expr is Op o && o is not Boxing)
                         {
                             clusterVarMemo[cluster].Add(boolVar);
                         }
@@ -2667,6 +3193,7 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         }
 
         var picks = _profiler.Time("sat_read_picks", () => _rootSearchGraph.Vertices.ToDictionary(e => e, e => solver.BooleanValue(varMemo[e])));
+        _lastPicks = picks;
         _profiler.Count("sat_picked_nodes", picks.Count(kv => kv.Value));
         _profiler.Time("dump_pick_dot", () =>
         {
@@ -2710,8 +3237,11 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
             }
         }
 
-        return _profiler.Time("extract_expr", () => new ExprBuildVisitor(_rootSearchGraph, picks).Visit(rootCluster.Clusters.OfType<DistributedSearchGraph>()));
+        return picks;
     }
+
+    private BaseExpr ExtractSelectedExpression(DistributedSearchGraph rootCluster, Dictionary<SearchableNode, bool> picks)
+        => _profiler.Time("extract_expr", () => new ExprBuildVisitor(_rootSearchGraph, picks).Visit(rootCluster.Clusters.OfType<DistributedSearchGraph>()));
 
     private HyperGraph<DistributedSearchGraph, SearchableNode> ToHyperGraph(DistributedSearchGraph root, DistributedSearchGraph rootCluster)
     {
@@ -2778,17 +3308,126 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
     }
 }
 
+internal sealed class DistributedProgramMaterializer
+{
+    private readonly DistributedSearchGraph _rootSearchGraph;
+    private readonly Dictionary<SearchableNode, bool> _picks;
+
+    public DistributedProgramMaterializer(DistributedSearchGraph rootSearchGraph, Dictionary<SearchableNode, bool> picks)
+    {
+        _rootSearchGraph = rootSearchGraph;
+        _picks = picks;
+    }
+
+    public IReadOnlyDictionary<Function, Function> Materialize(
+        Function rootFunction,
+        IReadOnlyList<Function> reachableFunctions,
+        IReadOnlyDictionary<Function, DistributedSearchGraph> functionRootClusters,
+        IReadOnlyDictionary<Function, Dictionary<IVar, DistributedSearchGraph>> functionParameterClusters)
+    {
+        var rewritten = new Dictionary<Function, Function>(ReferenceEqualityComparer.Instance);
+        foreach (var function in reachableFunctions)
+        {
+            var isEntry = ReferenceEquals(function, rootFunction);
+            var parameterMap = BuildParameterMap(function, isEntry, functionParameterClusters);
+            var rootCluster = functionRootClusters.TryGetValue(function, out var cluster)
+                ? cluster
+                : throw new InvalidOperationException($"AutoDistributed has no root cluster for function {function.Name}.");
+            var body = new ExprBuildVisitor(_rootSearchGraph, _picks, parameterMap, rewritten).Visit(rootCluster.Clusters.OfType<DistributedSearchGraph>());
+            var parameters = function.Parameters.ToArray()
+                .Select(parameter => parameterMap.TryGetValue(parameter, out var mapped) ? mapped : parameter)
+                .ToArray();
+            var newVarMap = RemapVarMap(function, parameterMap);
+            var newFunction = new Function(function.Name, function.ModuleKind, body, parameters, newVarMap) { Metadata = function.Metadata };
+            if (!CompilerServices.InferenceType(newFunction) || newFunction.CheckedType is InvalidType)
+            {
+                throw new InvalidOperationException($"AutoDistributed materialized function {function.Name} produced invalid type: {newFunction.CheckedType}.");
+            }
+
+            rewritten.Add(function, newFunction);
+        }
+
+        return rewritten;
+    }
+
+    private Dictionary<IVar, IVar> BuildParameterMap(
+        Function function,
+        bool isEntry,
+        IReadOnlyDictionary<Function, Dictionary<IVar, DistributedSearchGraph>> functionParameterClusters)
+    {
+        var result = new Dictionary<IVar, IVar>(ReferenceEqualityComparer.Instance);
+        if (isEntry || !functionParameterClusters.TryGetValue(function, out var parameterClusters))
+        {
+            return result;
+        }
+
+        foreach (var parameter in function.Parameters)
+        {
+            if (!parameterClusters.TryGetValue(parameter, out var cluster))
+            {
+                continue;
+            }
+
+            var selected = GetSelectedNode(cluster);
+            result.Add(parameter, parameter switch
+            {
+                Var var => var.With(typeAnnotation: selected.IRType),
+                _ => throw new InvalidOperationException($"AutoDistributed can only materialize tensor function parameter signatures for Var, got {parameter.GetType().Name}."),
+            });
+        }
+
+        return result;
+    }
+
+    private Dictionary<IVar, Dimension[]>? RemapVarMap(Function function, IReadOnlyDictionary<IVar, IVar> parameterMap)
+    {
+        if (function.VarMap is null)
+        {
+            return null;
+        }
+
+        return function.VarMap.ToDictionary(
+            kvp => parameterMap.TryGetValue(kvp.Key, out var mapped) ? mapped : kvp.Key,
+            kvp => kvp.Value,
+            (IEqualityComparer<IVar>)ReferenceEqualityComparer.Instance);
+    }
+
+    private SearchableNode GetSelectedNode(DistributedSearchGraph cluster)
+    {
+        var selected = cluster.Clusters.OfType<DistributedSearchGraph>()
+            .SelectMany(bucket => bucket.Vertices)
+            .Where(node => _picks.TryGetValue(node, out var picked) && picked)
+            .ToArray();
+        if (selected.Length != 1)
+        {
+            throw new InvalidOperationException($"AutoDistributed expected one selected signature node in cluster, got {selected.Length}.");
+        }
+
+        return selected[0];
+    }
+}
+
 internal sealed class ExprBuildVisitor
 {
     private readonly Dictionary<SearchableNode, bool> _picks;
     private readonly DistributedSearchGraph _rootSearchGraph;
     private readonly Dictionary<SearchableNode, BaseExpr> _memo;
+    private readonly Dictionary<BaseExpr, Dictionary<IRType, BaseExpr>> _materializedBoxings;
+    private readonly IReadOnlyDictionary<IVar, IVar> _parameterMap;
+    private readonly IReadOnlyDictionary<Function, Function> _functionMap;
 
-    public ExprBuildVisitor(DistributedSearchGraph rootSearchGraph, Dictionary<SearchableNode, bool> picks)
+    public ExprBuildVisitor(
+        DistributedSearchGraph rootSearchGraph,
+        Dictionary<SearchableNode, bool> picks,
+        IReadOnlyDictionary<IVar, IVar>? parameterMap = null,
+        IReadOnlyDictionary<Function, Function>? functionMap = null)
     {
         _rootSearchGraph = rootSearchGraph;
         _picks = picks;
         _memo = new();
+        _materializedBoxings = new(ReferenceEqualityComparer.Instance);
+        _parameterMap = parameterMap ?? new Dictionary<IVar, IVar>(ReferenceEqualityComparer.Instance);
+        _functionMap = functionMap ?? new Dictionary<Function, Function>(ReferenceEqualityComparer.Instance);
     }
 
     public BaseExpr Visit(IEnumerable<DistributedSearchGraph> rootBuckets)
@@ -2803,13 +3442,37 @@ internal sealed class ExprBuildVisitor
         if (!_memo.TryGetValue(root, out var expr))
         {
             _rootSearchGraph.TryGetOutEdges(root, out var edges);
-            var children = edges.GroupBy(e => e.InputIndex).Select(g => Visit(g.Select(e => e.InputGraph))).ToArray();
-            switch (root.Expr)
+            var children = edges
+                .Where(e => e.InputIndex >= 0)
+                .GroupBy(e => e.InputIndex)
+                .OrderBy(g => g.Key)
+                .Select(g => Visit(g.Select(e => e.InputGraph)))
+                .ToArray();
+            switch (root.Kind, root.Expr)
             {
-                case Var or TensorConst or TupleConst or None or Shape or Padding or Paddings or Dimension:
+                case (SearchableNodeKind.FunctionBoundaryAdapter or SearchableNodeKind.TypeAdapter, _):
+                    if (children.Length != 1)
+                    {
+                        throw new InvalidOperationException($"{root.Kind} expects one data input, got {children.Length}.");
+                    }
+
+                    expr = MaterializeBoxing(children[0], root.IRType, $"{root.Kind} node");
+                    break;
+                case (_, Var var):
+                    expr = _parameterMap.TryGetValue(var, out var mapped) ? (BaseExpr)mapped : var;
+                    break;
+                case (_, TensorConst or TupleConst or None or Shape or Padding or Paddings or Dimension):
                     expr = root.Expr;
                     break;
-                case Call call:
+                case (_, Call { Target: Boxing boxing } call):
+                    if (children.Length != 1)
+                    {
+                        throw new InvalidOperationException($"Cannot rebuild boxing call: expected one argument, got {children.Length}.");
+                    }
+
+                    expr = MaterializeBoxing(children[0], boxing.NewType, "selected boxing call");
+                    break;
+                case (_, Call call):
                     if (children.Length == call.Arguments.Length)
                     {
                         expr = call.With(arguments: children);
@@ -2824,30 +3487,187 @@ internal sealed class ExprBuildVisitor
                     }
 
                     break;
-                case Fusion fusion:
+                case (_, Fusion fusion):
                     expr = fusion;
                     break;
-                case BaseFunction func:
+                case (SearchableNodeKind.FunctionCall, Function func):
+                    {
+                        var target = _functionMap.TryGetValue(func, out var rewritten) ? rewritten : func;
+                        expr = new Call(target: target, arguments: BuildFunctionCallArguments(target, children));
+                    }
+
+                    break;
+                case (_, BaseFunction func):
                     expr = new Call(target: func, arguments: children);
                     break;
-                case Op op:
+                case (_, Boxing boxing):
+                    if (children.Length != 1)
+                    {
+                        throw new InvalidOperationException($"Cannot rebuild boxing op: expected one argument, got {children.Length}.");
+                    }
+
+                    expr = MaterializeBoxing(children[0], boxing.NewType, "selected boxing op");
+                    break;
+                case (_, Op op):
                     expr = new Call(target: op, arguments: children);
                     break;
-                case IR.Tuple tp:
+                case (_, IR.Tuple tp):
                     expr = (BaseExpr)tp.With(fields: children);
                     break;
-                case IR.If @if:
+                case (_, IR.If @if):
                     expr = @if.With(condition: (Expr)children[^3], then: (BaseFunction)children[^2], @else: (BaseFunction)children[^1], arguments: children[..^3].ToArray());
                     break;
                 default:
                     throw new NotSupportedException(root.Expr.GetType().Name);
             }
 
+            _ = EnsureMaterializedType(expr, $"selected {root.Expr.GetType().Name}");
             _memo.Add(root, expr);
         }
 
         return expr;
     }
+
+    private BaseExpr[] BuildFunctionCallArguments(Function target, BaseExpr[] children)
+    {
+        var parameters = target.Parameters.ToArray();
+        if (parameters.Length != children.Length)
+        {
+            throw new InvalidOperationException($"Cannot rebuild function call {target.Name}: expected {parameters.Length} arguments, got {children.Length}.");
+        }
+
+        var arguments = new BaseExpr[children.Length];
+        for (int i = 0; i < children.Length; i++)
+        {
+            var parameterType = parameters[i].CheckedType;
+            arguments[i] = RequiresExactFunctionArgumentType(parameterType)
+                ? EnsureType(children[i], parameterType, $"function {target.Name} argument {i}")
+                : children[i];
+        }
+
+        return arguments;
+    }
+
+    private bool RequiresExactFunctionArgumentType(IRType targetType) => targetType switch
+    {
+        TensorType or DistributedType => true,
+        TupleType tupleType => tupleType.Fields.Any(RequiresExactFunctionArgumentType),
+        _ => false,
+    };
+
+    private BaseExpr EnsureType(BaseExpr value, IRType targetType, string context)
+    {
+        return MaterializeBoxing(value, targetType, context);
+    }
+
+    private BaseExpr MaterializeBoxing(BaseExpr value, IRType targetType, string context)
+    {
+        var valueType = EnsureMaterializedType(value, context);
+        if (EqualityComparer<IRType>.Default.Equals(valueType, targetType))
+        {
+            return value;
+        }
+
+        if (!_materializedBoxings.TryGetValue(value, out var byTargetType))
+        {
+            byTargetType = new Dictionary<IRType, BaseExpr>();
+            _materializedBoxings.Add(value, byTargetType);
+        }
+
+        if (byTargetType.TryGetValue(targetType, out var existing))
+        {
+            return existing;
+        }
+
+        var boxed = new Call(new Boxing(targetType), value);
+        if (!CompilerServices.InferenceType(boxed) || boxed.CheckedType is InvalidType)
+        {
+            throw new InvalidOperationException($"AutoDistributed cannot materialize {context}: cannot convert {value.CheckedType} to {targetType}.");
+        }
+
+        byTargetType.Add(targetType, boxed);
+        return boxed;
+    }
+
+    private IRType EnsureMaterializedType(BaseExpr value, string context)
+    {
+        var rawType = IRHelpers.GetRawCheckedType(value);
+        if (rawType is not null and not InvalidType)
+        {
+            return rawType;
+        }
+
+        if (rawType is InvalidType)
+        {
+            ClearDerivedCheckedTypes(value, new HashSet<BaseExpr>(ReferenceEqualityComparer.Instance));
+        }
+
+        if (!CompilerServices.InferenceType(value) || value.CheckedType is InvalidType)
+        {
+            throw new InvalidOperationException($"AutoDistributed cannot infer materialized {context}: {DescribeMaterializedExpr(value)}.");
+        }
+
+        return value.CheckedType;
+    }
+
+    private void ClearDerivedCheckedTypes(BaseExpr value, HashSet<BaseExpr> visited)
+    {
+        if (!visited.Add(value))
+        {
+            return;
+        }
+
+        if (value is Call or IR.Tuple or IR.If)
+        {
+            IRHelpers.SetRawCheckedType(value, null);
+        }
+
+        var operands = value is Call call ? call.Arguments.ToArray() : value.Operands;
+        foreach (var operand in operands)
+        {
+            ClearDerivedCheckedTypes(operand, visited);
+        }
+    }
+
+    private string DescribeMaterializedExpr(BaseExpr value)
+    {
+        var builder = new StringBuilder();
+        builder.Append($"{GetExprLabel(value)} checked_type={FormatType(IRHelpers.GetRawCheckedType(value))}");
+        if (value.CheckedType is InvalidType invalidType)
+        {
+            builder.Append($" reason={FormatOneLine(invalidType.Reason ?? string.Empty)}");
+        }
+
+        if (value is Call call)
+        {
+            builder.Append($" target={GetExprLabel(call.Target)} target_type={FormatType(IRHelpers.GetRawCheckedType(call.Target))}");
+            for (var i = 0; i < call.Arguments.Length; i++)
+            {
+                builder.Append($" arg{i}={GetExprLabel(call.Arguments[i])}:{FormatType(IRHelpers.GetRawCheckedType(call.Arguments[i]))}");
+            }
+        }
+
+        return builder.ToString();
+    }
+
+    private string GetExprLabel(BaseExpr expr)
+    {
+        if (expr is Op op)
+        {
+            var property = op.DisplayProperty();
+            return string.IsNullOrWhiteSpace(property)
+                ? op.GetType().FullName ?? op.GetType().Name
+                : $"{op.GetType().FullName}({property})";
+        }
+
+        return expr.GetType().FullName ?? expr.GetType().Name;
+    }
+
+    private string FormatType(IRType? type)
+        => FormatOneLine(type?.ToString() ?? "<none>");
+
+    private string FormatOneLine(string text)
+        => text.Replace("\r", " ", StringComparison.Ordinal).Replace("\n", " ", StringComparison.Ordinal);
 }
 
 internal sealed class DistributedCostEvaluateContext : Evaluator.ICostEvaluateContext

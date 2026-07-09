@@ -250,7 +250,7 @@ public sealed record PyNTTReshardTemplateModel(
     int[] Hierarchy,
     int[][] InputSplitAxes,
     int[][] OutputSplitAxes,
-    long CollectiveOffsetBytes,
+    string CollectiveOffsetBytes,
     long CollectivePoolBytes,
     string Stage,
     string Comment)

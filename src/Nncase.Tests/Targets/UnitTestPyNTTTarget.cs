@@ -1249,6 +1249,31 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
     }
 
     [Fact]
+    public void TestPyNTTObjectTensorLoadMaterializesOutputAlias()
+    {
+        var objectType = TensorType.Scalar(new ReferenceType(DataTypes.Int32));
+        var input = new Var("cache", objectType);
+        var inputBuffer = TIR.T.AttachBuffer(input, objectType, TIR.MemoryLocation.Input, 0, out _, "cache_input");
+        var output = CreateOutputVar("output", objectType);
+        var placement = new Placement(new[] { 1 }, "b", "b");
+        var body = new TIR.Sequential(TIR.F.NTT.TensorLoad(output, inputBuffer, Array.Empty<SBP>(), placement));
+        var main = new TIR.PrimFunction("main_prim", PyNTTTarget.Kind, body, new IVar[] { input, output });
+
+        var outputDirectory = GeneratePyNTTModelDirectory("generated_object_tensor_load_alias_model", main);
+        RenderGeneratedKernels(outputDirectory);
+        using var document = JsonDocument.Parse(File.ReadAllText(Path.Join(outputDirectory, "metadata.json")));
+        var function = document.RootElement.GetProperty("functions").EnumerateArray().Single();
+        var kernel = function.GetProperty("generated_kernels").EnumerateArray().Single();
+        Assert.Equal("alias", kernel.GetProperty("op_kind").GetString());
+        Assert.True(kernel.GetProperty("attrs").GetProperty("pure_alias").GetBoolean());
+        Assert.Equal("cache", kernel.GetProperty("attrs").GetProperty("runtime_output_aliases").GetProperty("output0").GetString());
+        Assert.False(kernel.GetProperty("attrs").TryGetProperty("output_aliases", out _));
+
+        var modelPy = File.ReadAllText(Path.Join(outputDirectory, "model.py"));
+        Assert.Contains("outputs[0] = inputs[0]", modelPy, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void TestPyNTTEntryOutputSpecDoesNotCollectNestedFunctionOutputs()
     {
         var input = new Var("x", new TensorType(DataTypes.Float32, new[] { 4 }));
@@ -1280,6 +1305,64 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         Assert.Equal("output0", output.GetProperty("name").GetString());
         Assert.Equal("float32", output.GetProperty("dtype").GetString());
         Assert.Equal(new[] { 4L }, output.GetProperty("shape").EnumerateArray().Select(value => value.GetInt64()).ToArray());
+    }
+
+    [Fact]
+    public void TestPyNTTNestedPrimFunctionUsesCallerWorkspacePointers()
+    {
+        var tensorType = new TensorType(DataTypes.Float32, new[] { 4 });
+        var input = new Var("x", tensorType);
+        var publicOutputBuffer = CreateOutputVar("public_output", tensorType);
+        var nestedInputBufferVar = new TIR.BufferVar("nested_input", tensorType, TIR.BufferVarRole.Input, TIR.MemoryLocation.Input);
+        var nestedOutputBufferVar = CreateOutputVar("nested_output", tensorType);
+        var nestedDataVar = new TIR.BufferVar("data", TensorType.Scalar(new PointerType(DataTypes.UInt8)), TIR.BufferVarRole.Workspace, TIR.MemoryLocation.Data);
+        var nestedBlockLocalDataVar = new TIR.BufferVar("block_local_data", TensorType.Scalar(new PointerType(DataTypes.UInt8)), TIR.BufferVarRole.Workspace, TIR.MemoryLocation.BlockLocalData);
+        var nestedInputBuffer = TIR.T.AttachBuffer(nestedInputBufferVar, tensorType, TIR.MemoryLocation.Input, 0, out _, "nested_input_buffer");
+        var nestedTempBuffer = CreateBuffer("nested_temp", DataTypes.Float32, TIR.MemoryLocation.Data, 0, [4], [1]);
+        var placement = new Placement(new[] { 1 }, "b", "b");
+        var nested = new TIR.PrimFunction(
+            "nested_prim",
+            PyNTTTarget.Kind,
+            new TIR.Sequential(
+                TIR.F.NTT.TensorLoad(nestedTempBuffer, nestedInputBuffer, new[] { SBP.B }, placement),
+                TIR.F.NTT.TensorStore(nestedTempBuffer, nestedOutputBufferVar, new[] { SBP.B }, placement)),
+            new IVar[] { nestedInputBufferVar, nestedOutputBufferVar, nestedDataVar, nestedBlockLocalDataVar })
+        {
+            SchedResult =
+            {
+                DataUsage = 128,
+            },
+        };
+
+        var callerInputBuffer = CreateBuffer("caller_input", DataTypes.Float32, TIR.MemoryLocation.Data, 0, [4], [1]);
+        var callerOutputBuffer = CreateBuffer("caller_output", DataTypes.Float32, TIR.MemoryLocation.Data, 16, [4], [1]);
+        var calleeDataBuffer = CreateBuffer("data_0", DataTypes.UInt8, TIR.MemoryLocation.Data, 64, [128], [1]);
+        var calleeBlockLocalDataBuffer = CreateBuffer("block_local_data_0", DataTypes.UInt8, TIR.MemoryLocation.BlockLocalData, 0, [0], [1]);
+        var body = new TIR.Sequential(
+            nested,
+            TIR.F.NTT.TensorLoad(callerInputBuffer, input, new[] { SBP.B }, placement),
+            new Call(nested, callerInputBuffer, callerOutputBuffer, calleeDataBuffer, calleeBlockLocalDataBuffer),
+            TIR.F.NTT.TensorStore(callerOutputBuffer, publicOutputBuffer, new[] { SBP.B }, placement));
+        var main = new TIR.PrimFunction("main_prim", PyNTTTarget.Kind, body, new IVar[] { input, publicOutputBuffer })
+        {
+            SchedResult =
+            {
+                DataUsage = 192,
+            },
+        };
+
+        var module = new IRModule(main);
+        module.Add(nested);
+        var outputDirectory = GeneratePyNTTModelDirectory("generated_nested_call_workspace_model", module);
+        RenderGeneratedKernels(outputDirectory);
+        var generatedKernelsPy = File.ReadAllText(Path.Join(outputDirectory, "generated_kernels.py"));
+        Assert.Contains("def main_prim_nested_prim_0_device", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("(data + 64).to(tl.pointer_type(tl.uint8))", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("source = (main_prim_nested_prim_0_device_parent_data).to(tl.pointer_type(tl.float32))", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("destination = (main_prim_nested_prim_0_device_data).to(tl.pointer_type(tl.float32))", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("source = (main_prim_nested_prim_0_device_data).to(tl.pointer_type(tl.float32))", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("destination = (main_prim_nested_prim_0_device_parent_data + 16).to(tl.pointer_type(tl.float32))", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.DoesNotContain("data + 192", generatedKernelsPy, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -1568,6 +1651,12 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
 
     private string GeneratePyNTTModelDirectory(string directoryName, BaseFunction function)
     {
+        var module = new IRModule(function);
+        return GeneratePyNTTModelDirectory(directoryName, module);
+    }
+
+    private string GeneratePyNTTModelDirectory(string directoryName, IRModule module)
+    {
         var outputDirectory = Path.Join(CompileOptions.DumpDir, directoryName);
         if (Directory.Exists(outputDirectory))
         {
@@ -1576,7 +1665,6 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
 
         ((PyNTTTargetOptions)CompileOptions.TargetOptions).OutputDirectory = outputDirectory;
 
-        var module = new IRModule(function);
         var linkedModel = new ModelBuilder(CompileSession.Target, CompileOptions).Build(module);
 
         using var stream = new MemoryStream();

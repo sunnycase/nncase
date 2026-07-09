@@ -386,6 +386,7 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
     private string BuildMetadataJson()
     {
         var targetOptions = PyNTTTargetOptionsUtility.Get(_compileOptions);
+        var topKernelFunctions = GetRuntimeTopKernelFunctions();
         var metadata = new
         {
             pyntt_spec_version = 0,
@@ -401,7 +402,9 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
                 parameters = GetParameterNames(function.SourceFunction),
                 inputs = GetInputTensorSpecs(function),
                 outputs = GetOutputTensorSpecs(function.SourceFunction),
-                generated_kernels = function.GeneratedKernelSource.Kernels,
+                generated_kernels = topKernelFunctions.Contains(function)
+                    ? function.GeneratedKernelSource.Kernels
+                    : Array.Empty<GeneratedKernelMetadata>(),
             }).ToArray(),
         };
         return JsonSerializer.Serialize(metadata, new JsonSerializerOptions { WriteIndented = true });
@@ -410,6 +413,7 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
     private string BuildKernelParamsJson()
     {
         var targetOptions = PyNTTTargetOptionsUtility.Get(_compileOptions);
+        var topKernelFunctions = GetRuntimeTopKernelFunctions();
         var manifest = new
         {
             pyntt_codegen_manifest_version = 1,
@@ -421,10 +425,96 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
                 name = function.SourceFunction.Name,
                 module_kind = function.SourceFunction.ModuleKind,
                 is_entry = function.SourceFunction.IsEntry,
-                render_kernels = function.GeneratedKernelSource.RenderKernels,
+                render_kernels = topKernelFunctions.Contains(function)
+                    ? function.GeneratedKernelSource.RenderKernels
+                    : Array.Empty<KernelRenderSpec>(),
             }).ToArray(),
         };
         return JsonSerializer.Serialize(manifest, new JsonSerializerOptions { WriteIndented = true });
+    }
+
+    private HashSet<PyNTTLinkableFunction> GetRuntimeTopKernelFunctions()
+    {
+        var result = new HashSet<PyNTTLinkableFunction>();
+        var entry = _functions.FirstOrDefault(function => function.SourceFunction.IsEntry);
+        if (entry is null)
+        {
+            return result;
+        }
+
+        CollectRuntimeTopKernelFunctions(entry, result, new HashSet<PyNTTLinkableFunction>());
+        return result;
+    }
+
+    private void CollectRuntimeTopKernelFunctions(
+        PyNTTLinkableFunction function,
+        HashSet<PyNTTLinkableFunction> result,
+        HashSet<PyNTTLinkableFunction> active)
+    {
+        if (!active.Add(function))
+        {
+            throw new NotSupportedException($"PyNTT runtime dispatch call graph contains a recursive call involving {function.SourceFunction.Name}.");
+        }
+
+        try
+        {
+            if (function.GeneratedKernelSource.Kernels.Count > 0)
+            {
+                result.Add(function);
+                return;
+            }
+
+            var callees = new List<PrimFunction>();
+            CollectRuntimeDispatchCallees(function.SourceFunction, callees);
+            foreach (var callee in callees)
+            {
+                CollectRuntimeTopKernelFunctions(FindLinkableFunction(callee), result, active);
+            }
+        }
+        finally
+        {
+            active.Remove(function);
+        }
+    }
+
+    private static void CollectRuntimeDispatchCallees(BaseFunction function, List<PrimFunction> callees)
+    {
+        switch (function)
+        {
+            case Function f:
+                CollectRuntimeDispatchCallees(f.Body, callees);
+                break;
+            case Fusion f:
+                CollectRuntimeDispatchCallees(f.Body, callees);
+                break;
+            case PrimFunction f:
+                CollectRuntimeDispatchCallees(f.Body, callees);
+                break;
+        }
+    }
+
+    private static void CollectRuntimeDispatchCallees(BaseExpr expr, List<PrimFunction> callees)
+    {
+        if (expr is BaseFunction)
+        {
+            return;
+        }
+
+        if (expr is Call { Target: PrimFunction callee })
+        {
+            callees.Add(callee);
+            return;
+        }
+
+        if (expr is Call { Target: BaseFunction calleeFunction })
+        {
+            throw new NotSupportedException($"PyNTT runtime dispatch expects direct PrimFunction call targets, got {calleeFunction.GetType().Name} {calleeFunction.Name}.");
+        }
+
+        foreach (var operand in expr.Operands)
+        {
+            CollectRuntimeDispatchCallees(operand, callees);
+        }
     }
 
     private void WriteGeneratedModel(string outputDirectory, string metadataJson, string kernelParamsJson)
@@ -601,7 +691,8 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
             launchStatements = "        pass";
         }
 
-        var needsGridBarrier = _functions
+        var topKernelFunctions = GetRuntimeTopKernelFunctions();
+        var needsGridBarrier = topKernelFunctions
             .SelectMany(function => function.GeneratedKernelSource.Kernels)
             .Any(kernel => kernel.Attrs.ContainsKey("requires_grid_barrier"));
         var tritonRuntimeImport = needsGridBarrier
@@ -640,15 +731,12 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
     private string BuildModelLaunchStatements(PyNTTLinkableFunction function)
     {
         var context = CreateEntryDispatchContext(function.SourceFunction);
-        if (RequiresDispatch(function))
-        {
-            return BuildFunctionDispatch(function, context, extraIndent: 0);
-        }
-
         var kernels = function.GeneratedKernelSource.Kernels;
+        ValidateSingleKernelFunction(function);
         if (kernels.Count == 0)
         {
-            var dispatch = BuildDispatchLaunchStatements(function.SourceFunction, function, context, extraIndent: 0);
+            ValidateSingleRuntimeLaunchPath(function);
+            var dispatch = BuildFunctionDispatch(function, context, extraIndent: 0);
             if (!string.IsNullOrWhiteSpace(dispatch))
             {
                 return dispatch;
@@ -670,46 +758,6 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
             Environment.NewLine,
             kernels.Select(kernel => BuildModelKernelLaunchPython(function.SourceFunction.Name, kernel, parameterNames, outputNames, context, usePreparedWorkspace: false)));
     }
-
-    private static bool RequiresDispatch(PyNTTLinkableFunction function)
-        => ContainsFunctionCall(function.SourceFunction) ||
-            function.GeneratedKernelSource.Kernels.Any(IsDispatchSegmentKernel);
-
-    private static bool ContainsFunctionCall(BaseExpr expr)
-    {
-        if (expr is Call { Target: BaseFunction })
-        {
-            return true;
-        }
-
-        if (expr is PrimFunction primFunction)
-        {
-            return ContainsFunctionCall(primFunction.Body);
-        }
-
-        if (expr is Function or Fusion or FunctionWrapper or PrimFunctionWrapper)
-        {
-            throw new NotSupportedException($"PyNTT dispatch expects lowered PrimFunction bodies only, but found {expr.GetType().Name}. TIR selection and RemoveFunctionWrapperPass must run before PyNTT codegen.");
-        }
-
-        if (expr is BaseFunction)
-        {
-            return false;
-        }
-
-        foreach (var operand in expr.Operands)
-        {
-            if (ContainsFunctionCall(operand))
-            {
-                return true;
-            }
-        }
-
-        return false;
-    }
-
-    private static bool IsDispatchSegmentKernel(GeneratedKernelMetadata kernel)
-        => kernel.Attrs.ContainsKey("dispatch_segment_index");
 
     private RuntimeDispatchContext CreateEntryDispatchContext(BaseFunction function)
     {
@@ -797,8 +845,10 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
             var collectiveDataBytes = GetMaxCollectiveDataBytes(kernels);
             var usesData = false;
             var dataLocalBytes = 0L;
+            var nestedDataLocalBytes = 0L;
             var usesBlockLocalData = false;
             var blockLocalDataBytes = 0L;
+            var nestedBlockLocalDataBytes = 0L;
 
             if (function.SourceFunction is PrimFunction primFunction)
             {
@@ -817,20 +867,20 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
             {
                 var calleeRequirements = GetPreparedWorkspaceRequirements(FindLinkableFunction(directCallee), active);
                 usesData |= calleeRequirements.UsesData;
-                dataLocalBytes = Math.Max(dataLocalBytes, calleeRequirements.DataLocalBytes);
+                nestedDataLocalBytes = Math.Max(nestedDataLocalBytes, calleeRequirements.DataLocalBytes);
                 collectiveDataBytes = Math.Max(collectiveDataBytes, calleeRequirements.CollectiveDataBytes);
                 maxShardCount = Math.Max(maxShardCount, calleeRequirements.MaxShardCount);
                 usesBlockLocalData |= calleeRequirements.UsesBlockLocalData;
-                blockLocalDataBytes = Math.Max(blockLocalDataBytes, calleeRequirements.BlockLocalDataBytes);
+                nestedBlockLocalDataBytes = Math.Max(nestedBlockLocalDataBytes, calleeRequirements.BlockLocalDataBytes);
             }
 
             return new PreparedWorkspaceRequirements(
                 usesData,
-                dataLocalBytes,
+                checked(dataLocalBytes + nestedDataLocalBytes),
                 collectiveDataBytes,
                 maxShardCount,
                 usesBlockLocalData,
-                blockLocalDataBytes);
+                checked(blockLocalDataBytes + nestedBlockLocalDataBytes));
         }
         finally
         {
@@ -975,8 +1025,6 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
     private string BuildDispatchSequential(Sequential sequential, PyNTTLinkableFunction? currentFunction, RuntimeDispatchContext context, int extraIndent)
     {
         var pieces = new List<string>();
-        var segment = new List<BaseExpr>();
-        var segmentIndex = 0;
         foreach (var field in sequential.Fields)
         {
             if (field is Function or Fusion or FunctionWrapper or PrimFunctionWrapper)
@@ -991,21 +1039,13 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
 
             if (field is IfThenElse)
             {
-                pieces.Add(BuildDispatchSegmentLaunch(currentFunction, segmentIndex, context, extraIndent));
-                pieces.Add(BuildRuntimeObjectStatements(segment, context, extraIndent));
                 pieces.Add(BuildDispatchLaunchStatements(field, currentFunction, context, extraIndent));
-                segment.Clear();
-                segmentIndex++;
                 continue;
             }
 
             if (field is Call { Target: PrimFunction callee } call)
             {
-                pieces.Add(BuildDispatchSegmentLaunch(currentFunction, segmentIndex, context, extraIndent));
-                pieces.Add(BuildRuntimeObjectStatements(segment, context, extraIndent));
                 pieces.Add(BuildFunctionCallDispatch(call, FindLinkableFunction(callee), context, extraIndent));
-                segment.Clear();
-                segmentIndex++;
                 continue;
             }
 
@@ -1014,41 +1054,18 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
                 throw new NotSupportedException($"PyNTT dispatch expects direct PrimFunction call targets, got {calleeFunction.GetType().Name} {calleeFunction.Name}.");
             }
 
-            segment.Add(field);
+            pieces.Add(BuildRuntimeObjectStatements(new[] { field }, context, extraIndent));
         }
 
-        pieces.Add(BuildDispatchSegmentLaunch(currentFunction, segmentIndex, context, extraIndent));
-        pieces.Add(BuildRuntimeObjectStatements(segment, context, extraIndent));
         return string.Join(Environment.NewLine, pieces.Where(piece => !string.IsNullOrWhiteSpace(piece)));
-    }
-
-    private string BuildDispatchSegmentLaunch(PyNTTLinkableFunction? currentFunction, int segmentIndex, RuntimeDispatchContext context, int extraIndent)
-    {
-        if (currentFunction is null)
-        {
-            return string.Empty;
-        }
-
-        var parameterNames = GetParameterNames(currentFunction.SourceFunction);
-        var outputNames = GetOutputTensorSpecs(currentFunction.SourceFunction).Select(output => output.Name).ToArray();
-        var kernels = currentFunction.GeneratedKernelSource.Kernels
-            .Where(kernel => TryGetDispatchSegmentIndex(kernel, out var index) && index == segmentIndex)
-            .ToArray();
-        return string.Join(
-            Environment.NewLine,
-            kernels.Select(kernel => IndentPythonBlock(BuildModelKernelLaunchPython(currentFunction.SourceFunction.Name, kernel, parameterNames, outputNames, context, usePreparedWorkspace: true), extraIndent)));
     }
 
     private string BuildFunctionCallDispatch(Call call, PyNTTLinkableFunction callee, RuntimeDispatchContext callerContext, int extraIndent)
     {
         var calleeContext = CreateCalleeDispatchContext(call, callee, callerContext);
-        if (RequiresDispatch(callee))
-        {
-            return BuildFunctionDispatch(callee, calleeContext, extraIndent);
-        }
-
         var workspaceSetup = BuildPreparedWorkspaceSetup(callee, calleeContext, extraIndent);
         var kernels = callee.GeneratedKernelSource.Kernels;
+        ValidateSingleKernelFunction(callee);
         if (kernels.Count == 0)
         {
             var dispatch = BuildDispatchLaunchStatements(callee.SourceFunction, callee, calleeContext, extraIndent);
@@ -1063,22 +1080,99 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
         return string.Join(Environment.NewLine, new[] { workspaceSetup, launches }.Where(piece => !string.IsNullOrWhiteSpace(piece)));
     }
 
-    private static bool TryGetDispatchSegmentIndex(GeneratedKernelMetadata kernel, out int index)
+    private static void ValidateSingleKernelFunction(PyNTTLinkableFunction function)
     {
-        if (kernel.Attrs.TryGetValue("dispatch_segment_index", out var value))
+        var count = function.GeneratedKernelSource.Kernels.Count;
+        if (count > 1)
         {
-            index = value switch
-            {
-                int intValue => intValue,
-                long longValue => checked((int)longValue),
-                JsonElement jsonElement when jsonElement.ValueKind == JsonValueKind.Number => jsonElement.GetInt32(),
-                _ => throw new NotSupportedException($"PyNTT dispatch_segment_index must be an integer, got {value}."),
-            };
-            return true;
+            throw new NotSupportedException($"PyNTT function {function.SourceFunction.Name} generated {count} top kernels. PyNTT requires each runtime-dispatched function to lower to at most one top kernel; nested PrimFunctions must be inlined into that kernel.");
+        }
+    }
+
+    private void ValidateSingleRuntimeLaunchPath(PyNTTLinkableFunction function)
+    {
+        var count = CountRuntimeLaunches(function.SourceFunction, new HashSet<PyNTTLinkableFunction>());
+        if (count > 1)
+        {
+            throw new NotSupportedException($"PyNTT entry dispatch for {function.SourceFunction.Name} can launch {count} top kernels on one runtime path. PyNTT requires one selected top kernel per model invocation; fuse the work into one PrimFunction and inline nested PrimFunctions as device-level code.");
+        }
+    }
+
+    private int CountRuntimeLaunches(BaseExpr expr, HashSet<PyNTTLinkableFunction> active)
+    {
+        switch (expr)
+        {
+            case Function function:
+                return CountRuntimeLaunches(function.Body, active);
+            case Fusion fusion:
+                return CountRuntimeLaunches(fusion.Body, active);
+            case PrimFunction primFunction:
+                return CountRuntimeLaunches(FindLinkableFunction(primFunction), active);
+            case Call { Target: PrimFunction callee }:
+                return CountRuntimeLaunches(FindLinkableFunction(callee), active);
+            case Call { Target: BaseFunction callee }:
+                throw new NotSupportedException($"PyNTT runtime dispatch expects direct PrimFunction call targets, got {callee.GetType().Name} {callee.Name}.");
+            case IfThenElse ifThenElse:
+                return Math.Max(
+                    CountRuntimeLaunches(ifThenElse.Then, active),
+                    CountRuntimeLaunches(ifThenElse.Else, active));
+            case Sequential sequential:
+                var sequentialCount = 0;
+                foreach (var field in sequential.Fields)
+                {
+                    sequentialCount = checked(sequentialCount + CountRuntimeLaunches(field, active));
+                }
+
+                return sequentialCount;
+            case Return ret:
+                var returnCount = 0;
+                foreach (var value in ret.Values)
+                {
+                    returnCount = checked(returnCount + CountRuntimeLaunches(value, active));
+                }
+
+                return returnCount;
+            case BaseFunction:
+                return 0;
+            default:
+                var operandCount = 0;
+                foreach (var operand in expr.Operands)
+                {
+                    operandCount = checked(operandCount + CountRuntimeLaunches(operand, active));
+                }
+
+                return operandCount;
+        }
+    }
+
+    private int CountRuntimeLaunches(PyNTTLinkableFunction function, HashSet<PyNTTLinkableFunction> active)
+    {
+        ValidateSingleKernelFunction(function);
+        var kernels = function.GeneratedKernelSource.Kernels.Count;
+        if (kernels > 0)
+        {
+            return kernels;
         }
 
-        index = -1;
-        return false;
+        if (!active.Add(function))
+        {
+            throw new NotSupportedException($"PyNTT runtime dispatch call graph contains a recursive call involving {function.SourceFunction.Name}.");
+        }
+
+        try
+        {
+            return function.SourceFunction switch
+            {
+                Function f => CountRuntimeLaunches(f.Body, active),
+                Fusion f => CountRuntimeLaunches(f.Body, active),
+                PrimFunction f => CountRuntimeLaunches(f.Body, active),
+                _ => 0,
+            };
+        }
+        finally
+        {
+            active.Remove(function);
+        }
     }
 
     private string BuildDispatchIfThenElse(IfThenElse expr, PyNTTLinkableFunction? currentFunction, RuntimeDispatchContext context, int extraIndent)
@@ -2205,7 +2299,7 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
 
     private int GetGridBarrierMeshSize()
     {
-        var meshSizes = _functions
+        var meshSizes = GetRuntimeTopKernelFunctions()
             .SelectMany(function => function.GeneratedKernelSource.Kernels)
             .Where(kernel => kernel.Attrs.ContainsKey("requires_grid_barrier"))
             .Select(kernel => kernel.Launch.Sharding.Hierarchy.Aggregate(1, (acc, value) => checked(acc * value)))
@@ -2250,9 +2344,8 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
         string moduleChipLocalRDataPython)
     {
         var bundle = function.RDataBundle;
-        var primFunction = function.SourceFunction as PrimFunction;
-        var usesRData = primFunction?.SchedResult.Rdatas.Count > 0;
-        var usesChipLocalRData = primFunction?.SchedResult.ChipLocalRdatas.Count > 0;
+        var usesRData = UsesTransitiveModuleRData(function, static primFunction => primFunction.SchedResult.Rdatas);
+        var usesChipLocalRData = UsesTransitiveModuleRData(function, static primFunction => primFunction.SchedResult.ChipLocalRdatas);
         if (usesRData && moduleRData.Bytes == 0)
         {
             throw new InvalidDataException($"Function {function.SourceFunction.Name} uses PyNTT rdata, but module rdata is empty.");
@@ -2276,6 +2369,38 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
                     $"{PythonString("block_local_rdata_bytes")}: {bundle.BlockLocalRDataBytes.ToString(CultureInfo.InvariantCulture)}",
                 }) +
             "}";
+    }
+
+    private bool UsesTransitiveModuleRData(
+        PyNTTLinkableFunction function,
+        Func<PrimFunction, IReadOnlyDictionary<Const, ValueRange<ulong>>> selector)
+        => UsesTransitiveModuleRData(function, selector, new HashSet<PyNTTLinkableFunction>());
+
+    private bool UsesTransitiveModuleRData(
+        PyNTTLinkableFunction function,
+        Func<PrimFunction, IReadOnlyDictionary<Const, ValueRange<ulong>>> selector,
+        HashSet<PyNTTLinkableFunction> active)
+    {
+        if (!active.Add(function))
+        {
+            throw new NotSupportedException($"PyNTT rdata call graph contains a recursive call involving {function.SourceFunction.Name}.");
+        }
+
+        try
+        {
+            if (function.SourceFunction is PrimFunction primFunction && selector(primFunction).Count > 0)
+            {
+                return true;
+            }
+
+            var callees = new List<PrimFunction>();
+            CollectDirectPrimFunctionCallees(function.SourceFunction, callees);
+            return callees.Any(callee => UsesTransitiveModuleRData(FindLinkableFunction(callee), selector, active));
+        }
+        finally
+        {
+            active.Remove(function);
+        }
     }
 
     private string BuildRDataPayloadPython(string outputDirectory, PyNTTLinkableFunction function, string section, string payload, int? index)

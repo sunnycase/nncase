@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib
 import json
 import math
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -23,6 +24,10 @@ WORKSPACE_PARAMETERS = (
 WORKSPACE_STRIDE_PARAMETERS = (
     "data_pool_stride_bytes: tl.constexpr",
     "block_local_data_pool_stride_bytes: tl.constexpr",
+)
+
+DEVICE_CALL_RE = re.compile(
+    r"(?m)^(?P<indent>[ \t]*)__pyntt_device_call__(?P<name>[A-Za-z_]\w*)\(\)$"
 )
 
 
@@ -75,16 +80,6 @@ def render_manifest(manifest: dict[str, Any]) -> str:
 
 def _render_kernel(kernel: dict[str, Any]) -> str:
     env = _make_env()
-    helper_sources = []
-    for helper in kernel.get("helpers", ()):
-        model = dict(helper["model"])
-        arguments = tuple(helper.get("arguments", ()) or ())
-        if arguments:
-            model["Arguments"] = arguments
-        helper_sources.append(
-            env.get_template(helper["template"]).render(model=model).strip()
-        )
-
     metadata = kernel["metadata"]
     runtime_shape_args = _runtime_shape_args(metadata)
     grid_barrier_parameters = (
@@ -104,14 +99,116 @@ def _render_kernel(kernel: dict[str, Any]) -> str:
         + grid_barrier_parameters
         + ("numel", "block_size: tl.constexpr")
     )
+    call_arguments = _parameter_call_arguments(parameters)
+    device_functions = tuple(
+        _prepare_device_function(device_function, call_arguments)
+        for device_function in kernel.get("device_functions", ()) or ()
+    )
+    device_function_calls = {
+        device_function["name"]: device_function["call_source"]
+        for device_function in device_functions
+    }
+    helper_sources = _render_helper_sources(env, kernel.get("helpers", ()))
+    device_function_sources = [
+        _render_device_function(env, device_function, parameters, device_function_calls)
+        for device_function in device_functions
+    ]
+    body_source = _replace_device_function_calls(
+        kernel.get("body_source", ""),
+        device_function_calls,
+    )
     top_kernel = env.get_template("triton/top_kernel.py.jinja").render(
         name=metadata["name"],
         parameters=", ".join(parameters),
-        body_source=_indent_block(kernel.get("body_source", ""), 4),
+        body_source=_indent_block(body_source, 4),
     ).strip()
     parts = [source for source in helper_sources if source]
+    parts.extend(source for source in device_function_sources if source)
     parts.append(top_kernel)
     return "\n\n".join(parts)
+
+
+def _render_device_function(
+    env: Environment,
+    device_function: dict[str, Any],
+    parameters: tuple[str, ...],
+    device_function_calls: dict[str, str],
+) -> str:
+    helper_sources = _render_helper_sources(env, device_function.get("helpers", ()))
+    parts = [source for source in helper_sources if source]
+    device_parameters = parameters + tuple(device_function.get("extra_parameters", ()) or ())
+    for stage in device_function["stages"]:
+        body_source = _replace_device_function_calls(
+            stage["body_source"],
+            device_function_calls,
+        )
+        parts.append(
+            env.get_template("triton/top_kernel.py.jinja").render(
+                name=stage["name"],
+                parameters=", ".join(device_parameters),
+                body_source=_indent_block(body_source, 4),
+            ).strip()
+        )
+    return "\n\n".join(parts)
+
+
+def _prepare_device_function(
+    device_function: dict[str, Any],
+    call_arguments: tuple[str, ...],
+) -> dict[str, Any]:
+    prepared = dict(device_function)
+    parameter_overrides = dict(device_function.get("parameter_overrides", {}) or {})
+    extra_parameters = tuple(device_function.get("extra_parameters", ()) or ())
+    extra_parameter_arguments = dict(device_function.get("extra_parameter_arguments", {}) or {})
+    prepared_call_arguments = tuple(
+        parameter_overrides.get(argument, argument)
+        for argument in call_arguments
+    ) + tuple(
+        extra_parameter_arguments.get(argument, argument)
+        for argument in extra_parameters
+    )
+    prepared["stages"] = (
+        {
+            "name": device_function["name"],
+            "body_source": device_function.get("body_source", "").rstrip() or "pass",
+        },
+    )
+    prepared["call_source"] = f"{device_function['name']}({', '.join(prepared_call_arguments)})"
+    return prepared
+
+
+def _render_helper_sources(env: Environment, helpers: Any) -> list[str]:
+    helper_sources = []
+    for helper in helpers:
+        model = dict(helper["model"])
+        arguments = tuple(helper.get("arguments", ()) or ())
+        if arguments:
+            model["Arguments"] = arguments
+        helper_sources.append(
+            env.get_template(helper["template"]).render(model=model).strip()
+        )
+    return helper_sources
+
+
+def _parameter_call_arguments(parameters: tuple[str, ...]) -> tuple[str, ...]:
+    return tuple(parameter.split(":", 1)[0].strip() for parameter in parameters)
+
+
+def _replace_device_function_calls(
+    source: str,
+    device_function_calls: dict[str, str],
+) -> str:
+    def replace(match: re.Match[str]) -> str:
+        name = match.group("name")
+        if name not in device_function_calls:
+            raise RuntimeError(f"PyNTT kernel references unknown device function {name}.")
+        indent = match.group("indent")
+        return "\n".join(
+            f"{indent}{line}" if line else line
+            for line in device_function_calls[name].splitlines()
+        )
+
+    return DEVICE_CALL_RE.sub(replace, source)
 
 
 def emit(template_name: str, model: dict[str, Any]) -> str:

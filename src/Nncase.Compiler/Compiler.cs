@@ -345,7 +345,6 @@ public class Compiler : ICompiler
 
         passManager.Add<AddFunctionToModule>();
         passManager.Add<RemoveUnusedFunctions>();
-        passManager.AddWithName<FunctionBoundaryLayoutPropagationPass>("DistributedFunctionBoundaryLayoutPropagation", false);
         passManager.AddWithName<DataflowPass>("OptimizeAfterAutoDistributed").Configure(p =>
         {
             p.Add<Passes.Rules.Neutral.FoldConstCall>();
