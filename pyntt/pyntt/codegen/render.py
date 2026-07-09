@@ -28,7 +28,7 @@ WORKSPACE_STRIDE_PARAMETERS = (
 )
 
 DEVICE_CALL_RE = re.compile(
-    r"(?m)^(?P<indent>[ \t]*)__pyntt_device_call__(?P<name>[A-Za-z_]\w*)\(\)$"
+    r"(?m)^(?P<indent>[ \t]*)__pyntt_device_call__(?P<name>[A-Za-z_]\w*)\((?P<args>.*)\)$"
 )
 
 
@@ -117,7 +117,9 @@ def _render_kernel(kernel: dict[str, Any]) -> str:
     body_source = _replace_device_function_calls(
         kernel.get("body_source", ""),
         device_function_calls,
+        call_arguments,
     )
+    body_source = _with_shard_index_prelude(body_source)
     top_kernel = env.get_template("triton/top_kernel.py.jinja").render(
         name=metadata["name"],
         parameters=", ".join(parameters),
@@ -138,11 +140,14 @@ def _render_device_function(
     helper_sources = _render_helper_sources(env, device_function.get("helpers", ()))
     parts = [source for source in helper_sources if source]
     device_parameters = parameters + tuple(device_function.get("extra_parameters", ()) or ())
+    device_call_arguments = _parameter_call_arguments(device_parameters)
     for stage in device_function["stages"]:
         body_source = _replace_device_function_calls(
             stage["body_source"],
             device_function_calls,
+            device_call_arguments,
         )
+        body_source = _with_shard_index_prelude(body_source)
         parts.append(
             env.get_template("triton/top_kernel.py.jinja").render(
                 name=stage["name"],
@@ -198,18 +203,34 @@ def _parameter_call_arguments(parameters: tuple[str, ...]) -> tuple[str, ...]:
 def _replace_device_function_calls(
     source: str,
     device_function_calls: dict[str, str],
+    call_arguments: tuple[str, ...] = (),
 ) -> str:
     def replace(match: re.Match[str]) -> str:
         name = match.group("name")
         if name not in device_function_calls:
             raise RuntimeError(f"PyNTT kernel references unknown device function {name}.")
         indent = match.group("indent")
+        extra_arguments = match.group("args").strip()
+        if extra_arguments:
+            arguments = ", ".join(call_arguments + (extra_arguments,))
+            call_source = f"{name}({arguments})"
+        else:
+            call_source = device_function_calls[name]
+
         return "\n".join(
             f"{indent}{line}" if line else line
-            for line in device_function_calls[name].splitlines()
+            for line in call_source.splitlines()
         )
 
     return DEVICE_CALL_RE.sub(replace, source)
+
+
+def _with_shard_index_prelude(source: str) -> str:
+    source = source.rstrip()
+    prelude = "shard_index = tl.program_id(0).to(tl.int64)"
+    if not source:
+        return prelude
+    return f"{prelude}\n{source}"
 
 
 def emit(template_name: str, model: dict[str, Any]) -> str:

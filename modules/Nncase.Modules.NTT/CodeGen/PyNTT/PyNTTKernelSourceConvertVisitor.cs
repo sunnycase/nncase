@@ -160,6 +160,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
         private readonly List<HelperKernelCallMetadata> _helperCalls = new();
         private readonly Dictionary<string, string[]> _helperArguments = new(StringComparer.Ordinal);
         private readonly List<PyNTTKVCacheFieldInputMetadata> _kvCacheFieldInputs;
+        private readonly Dictionary<string, PyNTTKVCacheStorageMetadata?> _formalObjectFieldStorages = new(StringComparer.Ordinal);
         private readonly SortedSet<string> _runtimeScalarNames;
         private readonly SortedSet<string> _abiViewStrideArgNames;
         private readonly Dictionary<string, int> _helperCounters = new();
@@ -170,6 +171,12 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
         private readonly Dictionary<TIR.Buffer, string> _dataBaseNameByBuffer;
         private readonly Dictionary<TIR.Buffer, string> _chipLocalDataBaseNameByBuffer;
         private readonly Dictionary<TIR.Buffer, string> _blockLocalDataBaseNameByBuffer;
+        private readonly IReadOnlyDictionary<IVar, string> _formalTensorParameterBaseNames;
+        private readonly IReadOnlyDictionary<string, string> _formalDimParameterNames;
+        private readonly IReadOnlyDictionary<IVar, string> _formalObjectParameterBaseNames;
+        private readonly Dictionary<TIR.Buffer, string> _formalObjectBaseNameByBuffer = new(ReferenceEqualityComparer.Instance);
+        private readonly Dictionary<int, string> _formalObjectOutputAliases = new();
+        private readonly HashSet<IVar> _formalWorkspaceParameters;
         private readonly SortedSet<string> _extraWorkspaceBaseNames;
         private readonly string _dataBaseName;
         private readonly string _chipLocalDataBaseName;
@@ -180,6 +187,9 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
         private readonly SharedHelperRegistry _sharedHelperRegistry;
         private readonly PyNTTDimExpressionEmitter _dimEmitter;
         private readonly HashSet<PrimFunction> _activePrimFunctionCalls;
+        private readonly HashSet<string> _activeDeviceFunctionNames;
+        private readonly Dictionary<PrimFunction, DeviceFunctionDefinition> _deviceFunctionDefinitions;
+        private readonly Dictionary<string, DeviceFunctionDefinition> _deviceFunctionDefinitionsByName;
         private long _collectiveDataPoolBytes;
         private PrimFunction _currentFunction;
         private int _bodyIndent;
@@ -198,6 +208,10 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             Dictionary<TIR.Buffer, string>? dataBaseNameByBuffer = null,
             Dictionary<TIR.Buffer, string>? chipLocalDataBaseNameByBuffer = null,
             Dictionary<TIR.Buffer, string>? blockLocalDataBaseNameByBuffer = null,
+            IReadOnlyDictionary<IVar, string>? formalTensorParameterBaseNames = null,
+            IReadOnlyDictionary<string, string>? formalDimParameterNames = null,
+            IReadOnlyDictionary<IVar, string>? formalObjectParameterBaseNames = null,
+            IEnumerable<IVar>? formalWorkspaceParameters = null,
             IEnumerable<string>? extraWorkspaceBaseNames = null,
             string dataBaseName = "data",
             string chipLocalDataBaseName = "chip_local_data",
@@ -222,6 +236,10 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             _dataBaseNameByBuffer = dataBaseNameByBuffer ?? new Dictionary<TIR.Buffer, string>(ReferenceEqualityComparer.Instance);
             _chipLocalDataBaseNameByBuffer = chipLocalDataBaseNameByBuffer ?? new Dictionary<TIR.Buffer, string>(ReferenceEqualityComparer.Instance);
             _blockLocalDataBaseNameByBuffer = blockLocalDataBaseNameByBuffer ?? new Dictionary<TIR.Buffer, string>(ReferenceEqualityComparer.Instance);
+            _formalTensorParameterBaseNames = formalTensorParameterBaseNames ?? new Dictionary<IVar, string>(ReferenceEqualityComparer.Instance);
+            _formalDimParameterNames = formalDimParameterNames ?? new Dictionary<string, string>(StringComparer.Ordinal);
+            _formalObjectParameterBaseNames = formalObjectParameterBaseNames ?? new Dictionary<IVar, string>(ReferenceEqualityComparer.Instance);
+            _formalWorkspaceParameters = formalWorkspaceParameters is null ? new HashSet<IVar>(ReferenceEqualityComparer.Instance) : new HashSet<IVar>(formalWorkspaceParameters, ReferenceEqualityComparer.Instance);
             _extraWorkspaceBaseNames = extraWorkspaceBaseNames is null ? new SortedSet<string>(StringComparer.Ordinal) : new SortedSet<string>(extraWorkspaceBaseNames, StringComparer.Ordinal);
             _dataBaseName = dataBaseName;
             _chipLocalDataBaseName = chipLocalDataBaseName;
@@ -230,7 +248,10 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             _outputDistributedTypes = abiState.OutputDistributedTypes;
             _outputAliases = abiState.OutputAliases;
             _activePrimFunctionCalls = abiState.ActivePrimFunctionCalls;
-            _dimEmitter = new(RegisterRuntimeScalar, threadIdExpression: BuildThreadIdExpression(targetOptions));
+            _activeDeviceFunctionNames = abiState.ActiveDeviceFunctionNames;
+            _deviceFunctionDefinitions = abiState.DeviceFunctionDefinitions;
+            _deviceFunctionDefinitionsByName = abiState.DeviceFunctionDefinitionsByName;
+            _dimEmitter = new(RegisterRuntimeScalar, FormatRuntimeScalar, BuildThreadIdExpression(targetOptions));
         }
 
         public GeneratedPrimFunctionKernel Build()
@@ -380,7 +401,9 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 _helperCalls.ToArray(),
                 _opKinds.ToArray(),
                 _attrs.TryGetValue("requires_grid_barrier", out var requiresGridBarrier) && requiresGridBarrier is true,
-                _collectiveDataPoolBytes);
+                _collectiveDataPoolBytes,
+                new Dictionary<string, PyNTTKVCacheStorageMetadata?>(_formalObjectFieldStorages, StringComparer.Ordinal),
+                new Dictionary<int, string>(_formalObjectOutputAliases));
         }
 
         protected override Unit VisitTuple(Nncase.IR.Tuple expr)
@@ -584,170 +607,393 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
 
         private void VisitPrimFunctionCall(PrimFunction callee, IReadOnlyList<BaseExpr> args)
         {
-            if (!_activePrimFunctionCalls.Add(callee))
+            var parameters = callee.Parameters.ToArray();
+            if (parameters.Length != args.Count)
             {
+                throw new NotSupportedException($"PyNTT call to {callee.Name} expects {parameters.Length} arguments, got {args.Count}.");
+            }
+
+            var traceLabel = GetPrimFunctionCallTraceLabel(callee.Name);
+            var definition = GetOrBuildDeviceFunctionDefinition(callee);
+            if (definition.WasAdded)
+            {
+                _deviceFunctions.AddRange(definition.BuildResult.NestedDeviceFunctions);
+                _deviceFunctions.Add(definition.BuildResult.Function);
+                _helperCalls.AddRange(definition.BuildResult.HelperCalls);
+                foreach (var opKind in definition.BuildResult.OpKinds)
+                {
+                    _opKinds.Add(opKind);
+                }
+
+                if (definition.BuildResult.RequiresGridBarrier)
+                {
+                    _attrs["requires_grid_barrier"] = true;
+                }
+
+                _collectiveDataPoolBytes = Math.Max(_collectiveDataPoolBytes, definition.BuildResult.CollectiveDataPoolBytes);
+            }
+
+            var callArguments = BuildDeviceFunctionInvocationArguments(callee, args, definition.Definition);
+            SetComputeOp("function_call");
+            WriteTraceMarker($"begin_function:{traceLabel}");
+            WriteControlLine(BuildDeviceFunctionCallPlaceholder(definition.Definition.Name, callArguments));
+            WriteTraceMarker($"end_function:{traceLabel}");
+            TrackPrimFunctionCallObjectAliases(callee, args, definition.Definition);
+        }
+
+        private (DeviceFunctionDefinition Definition, DeviceFunctionBuildResult BuildResult, bool WasAdded) GetOrBuildDeviceFunctionDefinition(PrimFunction callee)
+        {
+            var deviceFunctionName = SanitizePythonIdentifier($"{_ownerName}_{callee.Name}_device");
+            if (_deviceFunctionDefinitions.TryGetValue(callee, out var existing))
+            {
+                return (existing, existing.BuildResult, false);
+            }
+
+            if (_deviceFunctionDefinitionsByName.TryGetValue(deviceFunctionName, out var existingByName))
+            {
+                ValidateCompatibleDeviceFunctionDefinition(callee, existingByName);
+                _deviceFunctionDefinitions.Add(callee, existingByName);
+                return (existingByName, existingByName.BuildResult, false);
+            }
+
+            var addedActiveFunction = _activePrimFunctionCalls.Add(callee);
+            var addedActiveName = _activeDeviceFunctionNames.Add(deviceFunctionName);
+            if (!addedActiveFunction || !addedActiveName)
+            {
+                if (addedActiveFunction)
+                {
+                    _activePrimFunctionCalls.Remove(callee);
+                }
+
+                if (addedActiveName)
+                {
+                    _activeDeviceFunctionNames.Remove(deviceFunctionName);
+                }
+
                 throw new NotSupportedException($"PyNTT PrimFunction call graph contains a recursive call involving {callee.Name}.");
             }
 
             try
             {
-                var parameters = callee.Parameters.ToArray();
-                if (parameters.Length != args.Count)
-                {
-                    throw new NotSupportedException($"PyNTT call to {callee.Name} expects {parameters.Length} arguments, got {args.Count}.");
-                }
-
-                var aliases = new Dictionary<IVar, BaseExpr>();
-                for (var i = 0; i < parameters.Length; i++)
-                {
-                    aliases.Add(parameters[i], NormalizeParameterAlias(parameters[i], UnwrapInputBoxing(args[i])));
-                }
-
-                var traceLabel = GetPrimFunctionCallTraceLabel(callee.Name);
-                var deviceFunctionName = SanitizePythonIdentifier($"{_ownerName}_{traceLabel.Replace('#', '_')}_device");
-                var workspaceBinding = BuildDeviceFunctionWorkspaceBinding(callee, args, deviceFunctionName);
-                var instantiatedBody = new PrimFunctionCallBodyCloner(aliases).Clone(callee.Body, default);
+                var formalPlan = BuildDeviceFunctionFormalPlan(callee, deviceFunctionName);
+                var calleeOutputs = GetOutputInfos(callee);
+                var deviceAbiState = new KernelAbiState(
+                    _inputNames,
+                    _kvCacheFieldInputs,
+                    _runtimeScalarNames,
+                    _abiViewStrideArgNames,
+                    _bufferInputIndices,
+                    _abiBufferMemo,
+                    new HashSet<int>(),
+                    new DistributedType?[calleeOutputs.Length],
+                    new Dictionary<int, int>(),
+                    _activePrimFunctionCalls,
+                    _activeDeviceFunctionNames,
+                    _deviceFunctionDefinitions,
+                    _deviceFunctionDefinitionsByName);
                 var deviceFunction = new PyNTTPrimFunctionSourceVisitor(
                     _function,
-                    instantiatedBody,
-                    _parameterNames,
-                    _outputs,
+                    callee.Body,
+                    formalPlan.ParameterNames,
+                    calleeOutputs,
                     _targetOptions,
                     _sharedHelperRegistry,
-                    new KernelAbiState(
-                        _inputNames,
-                        _kvCacheFieldInputs,
-                        _runtimeScalarNames,
-                        _abiViewStrideArgNames,
-                        _bufferInputIndices,
-                        _abiBufferMemo,
-                        _storedOutputIndices,
-                        _outputDistributedTypes,
-                        _outputAliases,
-                        _activePrimFunctionCalls),
+                    deviceAbiState,
                     deviceFunctionName,
                     validateOutputs: false,
                     currentFunction: callee,
-                    dataBaseNameByBuffer: workspaceBinding.DataBaseNameByBuffer,
-                    chipLocalDataBaseNameByBuffer: workspaceBinding.ChipLocalDataBaseNameByBuffer,
-                    blockLocalDataBaseNameByBuffer: workspaceBinding.BlockLocalDataBaseNameByBuffer,
-                    extraWorkspaceBaseNames: workspaceBinding.ExtraParameters,
-                    dataBaseName: workspaceBinding.DataBaseName,
-                    chipLocalDataBaseName: workspaceBinding.ChipLocalDataBaseName,
-                    blockLocalDataBaseName: workspaceBinding.BlockLocalDataBaseName)
-                    .BuildDeviceFunction(deviceFunctionName, workspaceBinding.ParameterOverrides, workspaceBinding.ExtraParameterArguments);
+                    formalTensorParameterBaseNames: formalPlan.TensorBaseNames,
+                    formalDimParameterNames: formalPlan.DimParameterNames,
+                    formalObjectParameterBaseNames: formalPlan.ObjectBaseNames,
+                    formalWorkspaceParameters: formalPlan.WorkspaceParameters,
+                    extraWorkspaceBaseNames: formalPlan.ExtraParameters,
+                    dataBaseName: formalPlan.DataBaseName,
+                    chipLocalDataBaseName: formalPlan.ChipLocalDataBaseName,
+                    blockLocalDataBaseName: formalPlan.BlockLocalDataBaseName)
+                    .BuildDeviceFunction(deviceFunctionName, new Dictionary<string, string>(StringComparer.Ordinal), new Dictionary<string, string>(StringComparer.Ordinal));
 
-                _deviceFunctions.AddRange(deviceFunction.NestedDeviceFunctions);
-                _deviceFunctions.Add(deviceFunction.Function);
-                _helperCalls.AddRange(deviceFunction.HelperCalls);
-                foreach (var opKind in deviceFunction.OpKinds)
-                {
-                    _opKinds.Add(opKind);
-                }
-
-                if (deviceFunction.RequiresGridBarrier)
-                {
-                    _attrs["requires_grid_barrier"] = true;
-                }
-
-                _collectiveDataPoolBytes = Math.Max(_collectiveDataPoolBytes, deviceFunction.CollectiveDataPoolBytes);
-                SetComputeOp("function_call");
-                WriteTraceMarker($"begin_function:{traceLabel}");
-                WriteControlLine(BuildDeviceFunctionCallPlaceholder(deviceFunctionName));
-                WriteTraceMarker($"end_function:{traceLabel}");
+                var definition = new DeviceFunctionDefinition(deviceFunctionName, deviceFunction, formalPlan.Parameters);
+                _deviceFunctionDefinitions.Add(callee, definition);
+                _deviceFunctionDefinitionsByName.Add(deviceFunctionName, definition);
+                return (definition, deviceFunction, true);
             }
             finally
             {
-                _activePrimFunctionCalls.Remove(callee);
+                if (addedActiveFunction)
+                {
+                    _activePrimFunctionCalls.Remove(callee);
+                }
+
+                if (addedActiveName)
+                {
+                    _activeDeviceFunctionNames.Remove(deviceFunctionName);
+                }
             }
         }
 
-        private DeviceFunctionWorkspaceBinding BuildDeviceFunctionWorkspaceBinding(PrimFunction callee, IReadOnlyList<BaseExpr> args, string deviceFunctionName)
+        private static void ValidateCompatibleDeviceFunctionDefinition(PrimFunction callee, DeviceFunctionDefinition existing)
         {
             var parameters = callee.Parameters.ToArray();
-            var dataBaseName = $"{deviceFunctionName}_data";
-            var chipLocalDataBaseName = $"{deviceFunctionName}_chip_local_data";
-            var blockLocalDataBaseName = $"{deviceFunctionName}_block_local_data";
-            var parentDataBaseName = $"{deviceFunctionName}_parent_data";
-            var parentChipLocalDataBaseName = $"{deviceFunctionName}_parent_chip_local_data";
-            var parentBlockLocalDataBaseName = $"{deviceFunctionName}_parent_block_local_data";
-            var dataBaseNameByBuffer = new Dictionary<TIR.Buffer, string>(_dataBaseNameByBuffer, ReferenceEqualityComparer.Instance);
-            var chipLocalDataBaseNameByBuffer = new Dictionary<TIR.Buffer, string>(_chipLocalDataBaseNameByBuffer, ReferenceEqualityComparer.Instance);
-            var blockLocalDataBaseNameByBuffer = new Dictionary<TIR.Buffer, string>(_blockLocalDataBaseNameByBuffer, ReferenceEqualityComparer.Instance);
-            var extraParameters = new SortedSet<string>(_extraWorkspaceBaseNames, StringComparer.Ordinal);
-            var extraParameterArguments = _extraWorkspaceBaseNames.ToDictionary(name => name, name => name, StringComparer.Ordinal);
-            var parameterOverrides = new Dictionary<string, string>(StringComparer.Ordinal);
-
-            AddExtraWorkspaceBase(parentDataBaseName, _dataBaseName);
-            AddExtraWorkspaceBase(parentChipLocalDataBaseName, _chipLocalDataBaseName);
-            AddExtraWorkspaceBase(parentBlockLocalDataBaseName, _blockLocalDataBaseName);
-            AddExtraWorkspaceBase(dataBaseName, string.Empty);
-            AddExtraWorkspaceBase(chipLocalDataBaseName, string.Empty);
-            AddExtraWorkspaceBase(blockLocalDataBaseName, string.Empty);
+            if (parameters.Length != existing.Parameters.Count)
+            {
+                throw new NotSupportedException($"PyNTT device function name collision for {existing.Name}: existing ABI has {existing.Parameters.Count} parameters, but PrimFunction {callee.Name} has {parameters.Length}.");
+            }
 
             for (var i = 0; i < parameters.Length; i++)
             {
-                var argument = UnwrapInputBoxing(args[i]);
-                if (parameters[i] is BufferVar { Role: BufferVarRole.Workspace } workspace)
+                var parameter = parameters[i];
+                var existingParameter = existing.Parameters[i];
+                var kind = GetDeviceFunctionFormalParameterKind(parameter);
+                if (kind != existingParameter.Kind)
                 {
-                    extraParameterArguments[workspace.Location switch
-                    {
-                        MemoryLocation.Data => dataBaseName,
-                        MemoryLocation.ChipLocalData => chipLocalDataBaseName,
-                        MemoryLocation.BlockLocalData => blockLocalDataBaseName,
-                        var location => throw new NotSupportedException($"PyNTT call to {callee.Name} workspace parameter {workspace.Name} cannot use memory location {location}."),
-                    }] = BuildWorkspaceBasePointerExpression(callee, workspace, argument);
+                    throw new NotSupportedException($"PyNTT device function name collision for {existing.Name}: parameter {i} has kind {kind}, but existing ABI has {existingParameter.Kind}.");
+                }
+
+                if (!string.Equals(parameter.Name, existingParameter.Parameter.Name, StringComparison.Ordinal))
+                {
+                    throw new NotSupportedException($"PyNTT device function name collision for {existing.Name}: parameter {i} is named {parameter.Name}, but existing ABI uses {existingParameter.Parameter.Name}.");
+                }
+
+                var parameterType = CompilerServices.Print(parameter.CheckedType);
+                var existingType = CompilerServices.Print(existingParameter.Parameter.CheckedType);
+                if (!string.Equals(parameterType, existingType, StringComparison.Ordinal))
+                {
+                    throw new NotSupportedException($"PyNTT device function name collision for {existing.Name}: parameter {parameter.Name} has type {parameterType}, but existing ABI uses {existingType}.");
+                }
+
+                if (parameter is BufferVar { Role: BufferVarRole.Workspace } workspace &&
+                    existingParameter.WorkspaceLocation != workspace.Location)
+                {
+                    throw new NotSupportedException($"PyNTT device function name collision for {existing.Name}: workspace parameter {parameter.Name} uses {workspace.Location}, but existing ABI uses {existingParameter.WorkspaceLocation}.");
+                }
+            }
+        }
+
+        private static DeviceFunctionFormalParameterKind GetDeviceFunctionFormalParameterKind(IVar parameter)
+        {
+            if (parameter is DimVar)
+            {
+                return DeviceFunctionFormalParameterKind.Scalar;
+            }
+
+            if (parameter is BufferVar { Role: BufferVarRole.Workspace })
+            {
+                return DeviceFunctionFormalParameterKind.Workspace;
+            }
+
+            if (IsObjectDataType(parameter.CheckedDataType))
+            {
+                return DeviceFunctionFormalParameterKind.Object;
+            }
+
+            if (parameter is BufferVar)
+            {
+                return DeviceFunctionFormalParameterKind.Tensor;
+            }
+
+            throw new NotSupportedException($"PyNTT device function parameter {parameter.Name} has unsupported kind {parameter.GetType().Name} and type {parameter.CheckedType}.");
+        }
+
+        private DeviceFunctionFormalPlan BuildDeviceFunctionFormalPlan(PrimFunction callee, string deviceFunctionName)
+        {
+            var parameterNames = new Dictionary<IVar, string>(ReferenceEqualityComparer.Instance);
+            var tensorBaseNames = new Dictionary<IVar, string>(ReferenceEqualityComparer.Instance);
+            var objectBaseNames = new Dictionary<IVar, string>(ReferenceEqualityComparer.Instance);
+            var dimParameterNames = new Dictionary<string, string>(StringComparer.Ordinal);
+            var workspaceParameters = new HashSet<IVar>(ReferenceEqualityComparer.Instance);
+            var extraParameters = new SortedSet<string>(StringComparer.Ordinal);
+            var parameters = new List<DeviceFunctionFormalParameter>();
+            var dataBaseName = $"{deviceFunctionName}_data";
+            var chipLocalDataBaseName = $"{deviceFunctionName}_chip_local_data";
+            var blockLocalDataBaseName = $"{deviceFunctionName}_block_local_data";
+            extraParameters.Add(dataBaseName);
+            extraParameters.Add(chipLocalDataBaseName);
+            extraParameters.Add(blockLocalDataBaseName);
+
+            var calleeParameters = callee.Parameters.ToArray();
+            for (var i = 0; i < calleeParameters.Length; i++)
+            {
+                var parameter = calleeParameters[i];
+                var baseName = SanitizePythonIdentifier($"{deviceFunctionName}_arg{i.ToString(CultureInfo.InvariantCulture)}_{parameter.Name}");
+                parameterNames.Add(parameter, baseName);
+
+                if (parameter is DimVar dimVar)
+                {
+                    var scalarName = baseName;
+                    dimParameterNames[SanitizePythonIdentifier(dimVar.Name)] = scalarName;
+                    extraParameters.Add(scalarName);
+                    parameters.Add(new DeviceFunctionFormalParameter(i, parameter, DeviceFunctionFormalParameterKind.Scalar, null, null, Array.Empty<string>(), scalarName, null));
                     continue;
                 }
 
-                if (argument is TIR.Buffer buffer)
+                if (parameter is BufferVar { Role: BufferVarRole.Workspace } workspace)
                 {
-                    switch (buffer.MemSpan.Buffer.Location)
-                    {
-                        case MemoryLocation.Data:
-                            dataBaseNameByBuffer[buffer] = CaptureCallerWorkspaceBase(GetDataBaseName(buffer), parentDataBaseName);
-                            break;
-                        case MemoryLocation.ChipLocalData:
-                            chipLocalDataBaseNameByBuffer[buffer] = CaptureCallerWorkspaceBase(GetChipLocalDataBaseName(buffer), parentChipLocalDataBaseName);
-                            break;
-                        case MemoryLocation.BlockLocalData:
-                            blockLocalDataBaseNameByBuffer[buffer] = CaptureCallerWorkspaceBase(GetBlockLocalDataBaseName(buffer), parentBlockLocalDataBaseName);
-                            break;
-                    }
+                    workspaceParameters.Add(workspace);
+                    parameters.Add(new DeviceFunctionFormalParameter(i, parameter, DeviceFunctionFormalParameterKind.Workspace, null, null, Array.Empty<string>(), null, workspace.Location));
+                    continue;
                 }
+
+                if (IsObjectDataType(parameter.CheckedDataType))
+                {
+                    objectBaseNames.Add(parameter, baseName);
+                    parameters.Add(new DeviceFunctionFormalParameter(i, parameter, DeviceFunctionFormalParameterKind.Object, null, null, Array.Empty<string>(), baseName, null));
+                    continue;
+                }
+
+                if (parameter is BufferVar bufferVar)
+                {
+                    var tensorType = GetTensorType(bufferVar.CheckedType, $"PyNTT device function {callee.Name} parameter {bufferVar.Name}");
+                    var poolStrideName = $"{baseName}{PoolStrideElementsSuffix}";
+                    var stridePrefix = GetVectorLaneElementCount(tensorType.DType) == 1
+                        ? $"{baseName}_scalar_stride"
+                        : $"{baseName}_stride";
+                    var strideNames = Enumerable.Range(0, tensorType.Shape.Rank)
+                        .Select(axis => $"{stridePrefix}{axis.ToString(CultureInfo.InvariantCulture)}")
+                        .ToArray();
+                    tensorBaseNames.Add(bufferVar, baseName);
+                    extraParameters.Add(baseName);
+                    extraParameters.Add(poolStrideName);
+                    foreach (var strideName in strideNames)
+                    {
+                        extraParameters.Add(strideName);
+                    }
+
+                    parameters.Add(new DeviceFunctionFormalParameter(i, parameter, DeviceFunctionFormalParameterKind.Tensor, baseName, poolStrideName, strideNames, null, null));
+                    continue;
+                }
+
+                throw new NotSupportedException($"PyNTT device function {callee.Name} parameter {parameter.Name} has unsupported kind {parameter.GetType().Name} and type {parameter.CheckedType}.");
             }
 
             return new(
+                parameterNames,
+                tensorBaseNames,
+                dimParameterNames,
+                objectBaseNames,
+                workspaceParameters,
+                extraParameters,
                 dataBaseName,
                 chipLocalDataBaseName,
                 blockLocalDataBaseName,
-                dataBaseNameByBuffer,
-                chipLocalDataBaseNameByBuffer,
-                blockLocalDataBaseNameByBuffer,
-                extraParameters,
-                parameterOverrides,
-                extraParameterArguments);
+                parameters);
+        }
 
-            void AddExtraWorkspaceBase(string name, string argument)
+        private void TrackPrimFunctionCallObjectAliases(PrimFunction callee, IReadOnlyList<BaseExpr> args, DeviceFunctionDefinition definition)
+        {
+            if (definition.BuildResult.FormalObjectOutputAliases.Count == 0)
             {
-                extraParameters.Add(name);
-                if (!string.IsNullOrWhiteSpace(argument))
-                {
-                    extraParameterArguments[name] = argument;
-                }
+                return;
             }
 
-            string CaptureCallerWorkspaceBase(string baseName, string fallbackCaptureName)
+            var parameters = callee.Parameters.ToArray();
+            var outputs = PyNTTFunctionOutputs.GetOutputs(callee);
+            foreach (var pair in definition.BuildResult.FormalObjectOutputAliases)
             {
-                if (baseName is "data" or "chip_local_data" or "block_local_data")
+                if ((uint)pair.Key >= (uint)outputs.Length)
                 {
-                    return fallbackCaptureName;
+                    throw new NotSupportedException($"PyNTT device function {definition.Name} reports object output alias index {pair.Key}, but {callee.Name} only has {outputs.Length} outputs.");
                 }
 
-                AddExtraWorkspaceBase(baseName, baseName);
-                return baseName;
+                var outputParameter = outputs[pair.Key];
+                var outputParameterIndex = Array.FindIndex(parameters, parameter => ReferenceEquals(parameter, outputParameter));
+                if (outputParameterIndex < 0)
+                {
+                    throw new NotSupportedException($"PyNTT cannot find output parameter {outputParameter.Name} in PrimFunction {callee.Name}.");
+                }
+
+                var sourceParameter = definition.Parameters.SingleOrDefault(parameter =>
+                    parameter.Kind == DeviceFunctionFormalParameterKind.Object &&
+                    string.Equals(parameter.ObjectBaseName, pair.Value, StringComparison.Ordinal));
+                if (sourceParameter is null)
+                {
+                    throw new NotSupportedException($"PyNTT device function {definition.Name} reports object output {outputParameter.Name} aliases unknown formal object {pair.Value}.");
+                }
+
+                VisitObjectAssignment(
+                    args[outputParameterIndex],
+                    args[sourceParameter.Index],
+                    $"PrimFunction {callee.Name} object output {outputParameter.Name}");
             }
         }
+
+        private string[] BuildDeviceFunctionInvocationArguments(PrimFunction callee, IReadOnlyList<BaseExpr> args, DeviceFunctionDefinition definition)
+        {
+            var values = new Dictionary<string, string>(StringComparer.Ordinal);
+            foreach (var parameter in definition.Parameters)
+            {
+                var argument = NormalizeParameterAlias(parameter.Parameter, UnwrapInputBoxing(args[parameter.Index]));
+                switch (parameter.Kind)
+                {
+                    case DeviceFunctionFormalParameterKind.Workspace:
+                        if (parameter.WorkspaceLocation is not { } workspaceLocation)
+                        {
+                            throw new NotSupportedException($"PyNTT device function {definition.Name} workspace parameter {parameter.Parameter.Name} is missing its memory location.");
+                        }
+
+                        values[workspaceLocation switch
+                        {
+                            MemoryLocation.Data => $"{definition.Name}_data",
+                            MemoryLocation.ChipLocalData => $"{definition.Name}_chip_local_data",
+                            MemoryLocation.BlockLocalData => $"{definition.Name}_block_local_data",
+                            var location => throw new NotSupportedException($"PyNTT call to {callee.Name} workspace parameter {parameter.Parameter.Name} cannot use memory location {location}."),
+                        }] = BuildWorkspaceBasePointerExpression(callee, (BufferVar)parameter.Parameter, argument);
+                        break;
+                    case DeviceFunctionFormalParameterKind.Tensor:
+                        var buffer = GetBufferOperand(argument, $"PyNTT call to {callee.Name} tensor parameter {parameter.Parameter.Name}");
+                        values[RequireParameterName(parameter.BaseName, definition.Name, parameter.Parameter.Name)] = BuildFormalTensorBasePointerArgument(buffer);
+                        values[RequireParameterName(parameter.PoolStrideName, definition.Name, parameter.Parameter.Name)] = BuildFormalTensorPoolStrideElementsArgument(buffer);
+                        var strides = GetBufferStrides(buffer);
+                        if (strides.Length != parameter.StrideNames.Length)
+                        {
+                            throw new NotSupportedException($"PyNTT call to {callee.Name} tensor parameter {parameter.Parameter.Name} expects {parameter.StrideNames.Length} strides, got {strides.Length}.");
+                        }
+
+                        for (var i = 0; i < strides.Length; i++)
+                        {
+                            values[parameter.StrideNames[i]] = strides[i].TritonExpression;
+                        }
+
+                        break;
+                    case DeviceFunctionFormalParameterKind.Scalar:
+                        values[RequireParameterName(parameter.ScalarName, definition.Name, parameter.Parameter.Name)] = BuildScalarExpression(argument);
+                        break;
+                    case DeviceFunctionFormalParameterKind.Object:
+                        var objectBaseName = RequireParameterName(parameter.ObjectBaseName, definition.Name, parameter.Parameter.Name);
+                        var prefix = objectBaseName + "_";
+                        foreach (var pair in definition.BuildResult.FormalObjectFieldStorages)
+                        {
+                            if (!pair.Key.StartsWith(prefix, StringComparison.Ordinal))
+                            {
+                                continue;
+                            }
+
+                            var field = pair.Key[prefix.Length..];
+                            values[pair.Key] = GetKVCacheFieldArgument(argument, field, pair.Value);
+                        }
+
+                        break;
+                    default:
+                        throw new NotSupportedException($"PyNTT call to {callee.Name} has unsupported formal parameter kind {parameter.Kind}.");
+                }
+            }
+
+            return definition.BuildResult.Function.ExtraParameters
+                .Select(parameter =>
+                {
+                    if (!values.TryGetValue(parameter, out var value))
+                    {
+                        throw new NotSupportedException($"PyNTT call to {callee.Name} did not bind device function parameter {parameter}.");
+                    }
+
+                    return value;
+                })
+                .ToArray();
+        }
+
+        private static string RequireParameterName(string? name, string deviceFunctionName, string sourceParameterName)
+            => string.IsNullOrWhiteSpace(name)
+                ? throw new NotSupportedException($"PyNTT device function {deviceFunctionName} has incomplete formal binding for parameter {sourceParameterName}.")
+                : name;
 
         private string BuildWorkspaceBasePointerExpression(PrimFunction callee, BufferVar workspace, BaseExpr argument)
         {
@@ -824,6 +1070,12 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 return;
             }
 
+            if (TryGetFormalTensorBuffer(srcExpr, "PyNTT TensorLoad formal source", out var formalSrc))
+            {
+                VisitInternalTensorLoad(dest, formalSrc);
+                return;
+            }
+
             var inputIndex = GetInputIndex(srcExpr);
             _bufferInputIndices[dest] = inputIndex;
             if (IsObjectDataType(dest.ElemType))
@@ -863,12 +1115,18 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
 
             if (args[1] is TIR.Buffer destBuffer)
             {
-                if (destBuffer.MemSpan.Buffer.Location == MemoryLocation.Output)
+                if (destBuffer.MemSpan.Buffer.Location == MemoryLocation.Output && !IsFormalAbiBuffer(destBuffer))
                 {
                     throw new NotSupportedException($"PyNTT PrimFunction {_function.Name} must store to output BufferVar ABI parameters, but TensorStore destination {destBuffer.Name} is a TIR Buffer in Output memory.");
                 }
 
                 VisitInternalTensorStore(src, destBuffer);
+                return;
+            }
+
+            if (TryGetFormalTensorBuffer(args[1], "PyNTT TensorStore formal destination", out var formalDest))
+            {
+                VisitInternalTensorStore(src, formalDest);
                 return;
             }
 
@@ -1084,24 +1342,19 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 return;
             }
 
-            if (TryGetDirectInputName(src, out _))
+            if (TryGetFormalObjectBaseName(src, out var formalObjectBaseName))
             {
-                if (_storedOutputIndices.Contains(outputIndex))
-                {
-                    throw new NotSupportedException($"PyNTT PrimFunction {_function.Name} materializes output {_outputs[outputIndex].Name} both by TensorStore and object {context}.");
-                }
-
-                var inputIndex = GetInputIndex(src);
-                if (_outputAliases.TryGetValue(outputIndex, out var existingInputIndex) && existingInputIndex != inputIndex)
-                {
-                    throw new NotSupportedException($"PyNTT PrimFunction {_function.Name} assigns output {_outputs[outputIndex].Name} to multiple input aliases.");
-                }
-
-                _outputAliases[outputIndex] = inputIndex;
+                RecordFormalObjectOutputAlias(outputIndex, formalObjectBaseName, context);
                 return;
             }
 
-            if (_outputAliases.ContainsKey(outputIndex))
+            if (TryResolveObjectInputIndex(src, out var inputIndex))
+            {
+                RecordRuntimeObjectOutputAlias(outputIndex, inputIndex, context);
+                return;
+            }
+
+            if (_outputAliases.ContainsKey(outputIndex) || _formalObjectOutputAliases.ContainsKey(outputIndex))
             {
                 throw new NotSupportedException($"PyNTT PrimFunction {_function.Name} materializes output {_outputs[outputIndex].Name} both by input alias and object {context}.");
             }
@@ -1112,11 +1365,58 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             }
         }
 
+        private void RecordRuntimeObjectOutputAlias(int outputIndex, int inputIndex, string context)
+        {
+            if (_storedOutputIndices.Contains(outputIndex))
+            {
+                throw new NotSupportedException($"PyNTT PrimFunction {_function.Name} materializes output {_outputs[outputIndex].Name} both by TensorStore and object {context}.");
+            }
+
+            if (_formalObjectOutputAliases.ContainsKey(outputIndex))
+            {
+                throw new NotSupportedException($"PyNTT PrimFunction {_function.Name} assigns output {_outputs[outputIndex].Name} to both runtime and formal object aliases.");
+            }
+
+            if (_outputAliases.TryGetValue(outputIndex, out var existingInputIndex) && existingInputIndex != inputIndex)
+            {
+                throw new NotSupportedException($"PyNTT PrimFunction {_function.Name} assigns output {_outputs[outputIndex].Name} to multiple input aliases.");
+            }
+
+            _outputAliases[outputIndex] = inputIndex;
+        }
+
+        private void RecordFormalObjectOutputAlias(int outputIndex, string formalObjectBaseName, string context)
+        {
+            if (_storedOutputIndices.Contains(outputIndex))
+            {
+                throw new NotSupportedException($"PyNTT PrimFunction {_function.Name} materializes output {_outputs[outputIndex].Name} both by TensorStore and object {context}.");
+            }
+
+            if (_outputAliases.ContainsKey(outputIndex))
+            {
+                throw new NotSupportedException($"PyNTT PrimFunction {_function.Name} assigns output {_outputs[outputIndex].Name} to both runtime and formal object aliases.");
+            }
+
+            if (_formalObjectOutputAliases.TryGetValue(outputIndex, out var existingFormalObjectBaseName) &&
+                !string.Equals(existingFormalObjectBaseName, formalObjectBaseName, StringComparison.Ordinal))
+            {
+                throw new NotSupportedException($"PyNTT PrimFunction {_function.Name} assigns output {_outputs[outputIndex].Name} to multiple formal object aliases.");
+            }
+
+            _formalObjectOutputAliases[outputIndex] = formalObjectBaseName;
+        }
+
         private void TrackObjectBufferAlias(BaseExpr dest, BaseExpr src, string context)
         {
             dest = UnwrapInputBoxing(dest);
             if (dest is not TIR.Buffer destBuffer || !IsObjectDataType(destBuffer.ElemType))
             {
+                return;
+            }
+
+            if (TryGetFormalObjectBaseName(src, out var formalObjectBaseName))
+            {
+                _formalObjectBaseNameByBuffer[destBuffer] = formalObjectBaseName;
                 return;
             }
 
@@ -1132,6 +1432,12 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
         private bool TryResolveObjectInputIndex(BaseExpr expr, out int inputIndex)
         {
             expr = UnwrapInputBoxing(expr);
+            if (TryGetFormalObjectBaseName(expr, out _))
+            {
+                inputIndex = -1;
+                return false;
+            }
+
             if (TryGetDirectInputName(expr, out _))
             {
                 inputIndex = GetInputIndex(expr);
@@ -3507,11 +3813,11 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 hierarchy,
                 reduceAxes,
                 broadcast);
-            var hasSharedHelper = _sharedHelperRegistry.TryGetName(helperKey, out var helperName);
+            var hasSharedHelper = _sharedHelperRegistry.TryGet(helperKey, out var helperName, out var sharedHelperArguments);
             if (!hasSharedHelper)
             {
                 helperName = _sharedHelperRegistry.Add(helperKey, _function.Name, broadcast ? "shard_broadcast" : "shard_reduce");
-                WriteHelperTemplate(
+                var helperArguments = WriteHelperTemplate(
                     "triton/kernels/ShardReduce.py.jinja",
                     new PyNTTShardReduceTemplateModel(
                         helperName,
@@ -3525,6 +3831,11 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                         reduceAxes,
                         broadcast,
                         comment));
+                _sharedHelperRegistry.SetArguments(helperKey, helperArguments);
+            }
+            else
+            {
+                _helperArguments[helperName] = sharedHelperArguments;
             }
 
             WriteLine(
@@ -3944,7 +4255,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 .Select(GetDimensionExpression)
                 .ToArray();
             ValidateRank("PyNTT GetPositionIds global output", globalShape, 1);
-            var cacheMetaInputIndex = RegisterKVCacheFieldInput(args[0], "metadata");
+            var cacheMetaArgument = GetKVCacheFieldArgument(args[0], "metadata");
             SetComputeOp("get_position_ids");
             _attrs["op"] = "get_position_ids";
             _attrs["tir"] = true;
@@ -3965,7 +4276,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     GetBufferSplitAxes(output, outputShape.Length),
                     GetShardAxis(output),
                     $"kv-cache -> {output.Name}"));
-            WriteLine(BuildHelperCall(helperName, $"input{cacheMetaInputIndex}"));
+            WriteLine(BuildHelperCall(helperName, cacheMetaArgument));
         }
 
         private void VisitUpdatePagedAttentionKVCache(Nncase.TIR.NTT.UpdatePagedAttentionKVCache update, IReadOnlyList<BaseExpr> args)
@@ -3979,10 +4290,10 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             var cache = GetPagedAttentionCacheTemplateModel(args[1], "PyNTT UpdatePagedAttentionKVCache");
             var layerIdExpression = GetDimensionExpression(args[2], "PyNTT UpdatePagedAttentionKVCache layer id").TritonExpression;
             var storage = GetKVCacheStorageMetadata(cache);
-            var metaInputIndex = RegisterKVCacheFieldInput(args[1], "metadata");
-            var slotMappingInputIndex = RegisterKVCacheFieldInput(args[1], "slot_mapping");
-            var storageInputIndex = RegisterKVCacheFieldInput(args[1], "kv_caches", storage);
-            var storageBlocksInputIndex = RegisterKVCacheFieldInput(args[1], "kv_caches_blocks", storage);
+            var metaArgument = GetKVCacheFieldArgument(args[1], "metadata");
+            var slotMappingArgument = GetKVCacheFieldArgument(args[1], "slot_mapping");
+            var storageArgument = GetKVCacheFieldArgument(args[1], "kv_caches", storage);
+            var storageBlocksArgument = GetKVCacheFieldArgument(args[1], "kv_caches_blocks", storage);
             var layout = update.Layout.ToArray();
             var seqAxis = Array.IndexOf(layout, AttentionDimKind.Seq);
             var headAxis = Array.IndexOf(layout, AttentionDimKind.Head);
@@ -4025,7 +4336,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     $"{slots.Name} -> kv-cache"));
             _attrs["requires_grid_barrier"] = true;
             WriteBarrier(HelperBarrierKind.Grid);
-            WriteLine(BuildHelperCall(helperName, $"input{slotMappingInputIndex}", $"input{storageInputIndex}", $"input{storageBlocksInputIndex}", $"input{metaInputIndex}"), HelperBarrierKind.Grid);
+            WriteLine(BuildHelperCall(helperName, slotMappingArgument, storageArgument, storageBlocksArgument, metaArgument), HelperBarrierKind.Grid);
         }
 
         private void VisitPagedAttention(Nncase.TIR.NTT.PagedAttention pagedAttention, IReadOnlyList<BaseExpr> args)
@@ -4042,10 +4353,10 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             var cache = GetPagedAttentionCacheTemplateModel(args[1], "PyNTT PagedAttention");
             var layerIdExpression = GetDimensionExpression(args[4], "PyNTT PagedAttention layer id").TritonExpression;
             var storage = GetKVCacheStorageMetadata(cache);
-            var metaInputIndex = RegisterKVCacheFieldInput(args[1], "metadata");
-            var blockTablesInputIndex = RegisterKVCacheFieldInput(args[1], "block_tables");
-            var storageInputIndex = RegisterKVCacheFieldInput(args[1], "kv_caches", storage);
-            var storageBlocksInputIndex = RegisterKVCacheFieldInput(args[1], "kv_caches_blocks", storage);
+            var metaArgument = GetKVCacheFieldArgument(args[1], "metadata");
+            var blockTablesArgument = GetKVCacheFieldArgument(args[1], "block_tables");
+            var storageArgument = GetKVCacheFieldArgument(args[1], "kv_caches", storage);
+            var storageBlocksArgument = GetKVCacheFieldArgument(args[1], "kv_caches_blocks", storage);
             var layout = pagedAttention.Layout.ToArray();
             var seqAxis = Array.IndexOf(layout, AttentionDimKind.Seq);
             var headAxis = Array.IndexOf(layout, AttentionDimKind.Head);
@@ -4095,7 +4406,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     $"{query.Name}, kv-cache -> {output.Name}"));
             _attrs["requires_grid_barrier"] = true;
             WriteBarrier(HelperBarrierKind.Grid);
-            WriteLine(BuildHelperCall(helperName, $"input{blockTablesInputIndex}", $"input{storageInputIndex}", $"input{storageBlocksInputIndex}", $"input{metaInputIndex}"));
+            WriteLine(BuildHelperCall(helperName, blockTablesArgument, storageArgument, storageBlocksArgument, metaArgument));
         }
 
         private void VisitSoftmax(int axis, IRArray<int> vectorizedAxes, IReadOnlyList<BaseExpr> args, string opKind)
@@ -4144,6 +4455,10 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
         private int GetInputIndex(BaseExpr expr)
         {
             expr = UnwrapInputBoxing(expr);
+            if (TryGetFormalObjectBaseName(expr, out var formalObjectBaseName))
+            {
+                throw new NotSupportedException($"PyNTT formal object parameter {formalObjectBaseName} cannot be registered as a kernel tensor input. Use a concrete object field argument instead.");
+            }
 
             var inputName = GetTensorName(expr, _parameterNames);
             var inputIndex = _inputNames.IndexOf(inputName);
@@ -4167,6 +4482,25 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             };
         }
 
+        private bool TryGetFormalTensorBuffer(BaseExpr expr, string context, out TIR.Buffer buffer)
+        {
+            expr = UnwrapInputBoxing(expr);
+            if (expr is BufferVar bufferVar && _formalTensorParameterBaseNames.ContainsKey(bufferVar))
+            {
+                buffer = GetAbiBuffer(bufferVar, context);
+                return true;
+            }
+
+            if (expr is TIR.Buffer candidate && IsFormalAbiBuffer(candidate))
+            {
+                buffer = candidate;
+                return true;
+            }
+
+            buffer = null!;
+            return false;
+        }
+
         private TIR.Buffer GetAbiBuffer(BufferVar bufferVar, string context)
         {
             if (_abiBufferMemo.TryGetValue(bufferVar, out var buffer))
@@ -4183,7 +4517,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
 
         private void MarkStoredOutput(TIR.Buffer buffer, string context)
         {
-            if (buffer.MemSpan.Buffer.Location != MemoryLocation.Output)
+            if (buffer.MemSpan.Buffer.Location != MemoryLocation.Output || IsFormalAbiBuffer(buffer))
             {
                 return;
             }
@@ -4210,13 +4544,15 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
         private int GetOutputIndex(BaseExpr expr)
         {
             expr = UnwrapInputBoxing(expr);
-            var outputName = GetTensorName(expr, _parameterNames);
-            for (var i = 0; i < _outputs.Length; i++)
+            if (TryGetDirectOutputName(expr, out var directOutputName) && TryFindOutputIndex(directOutputName, out var directOutputIndex))
             {
-                if (_outputs[i].Name == outputName || _outputs[i].AbiName == outputName)
-                {
-                    return i;
-                }
+                return directOutputIndex;
+            }
+
+            var outputName = GetTensorName(expr, _parameterNames);
+            if (TryFindOutputIndex(outputName, out var outputIndex))
+            {
+                return outputIndex;
             }
 
             throw new NotSupportedException($"PyNTT PrimFunction {_function.Name} references unknown output parameter {outputName}.");
@@ -4225,11 +4561,43 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
         private bool TryGetOutputIndex(BaseExpr expr, out int outputIndex)
         {
             outputIndex = -1;
+            if (TryGetDirectOutputName(expr, out var directOutputName))
+            {
+                return TryFindOutputIndex(directOutputName, out outputIndex);
+            }
+
             if (!TryGetAbiTensorName(expr, requireLocation: MemoryLocation.Output, out var outputName))
             {
                 return false;
             }
 
+            return TryFindOutputIndex(outputName, out outputIndex);
+        }
+
+        private bool TryGetDirectOutputName(BaseExpr expr, out string outputName)
+        {
+            expr = UnwrapInputBoxing(expr);
+            outputName = string.Empty;
+            if (expr is BufferVar { Role: BufferVarRole.Output } outputVar)
+            {
+                outputName = outputVar.Name;
+                return true;
+            }
+
+            if (expr is TIR.Buffer buffer &&
+                IsAbiBuffer(buffer) &&
+                buffer.MemSpan.Buffer.Location == MemoryLocation.Output &&
+                buffer.MemSpan.Buffer.Start is BufferVar { Role: BufferVarRole.Output } outputBufferVar)
+            {
+                outputName = outputBufferVar.Name;
+                return true;
+            }
+
+            return false;
+        }
+
+        private bool TryFindOutputIndex(string outputName, out int outputIndex)
+        {
             for (var i = 0; i < _outputs.Length; i++)
             {
                 if (_outputs[i].Name == outputName || _outputs[i].AbiName == outputName)
@@ -4239,11 +4607,18 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 }
             }
 
+            outputIndex = -1;
             return false;
         }
 
         private bool TryGetDirectInputName(BaseExpr expr, out string inputName)
         {
+            if (TryGetFormalObjectBaseName(expr, out _))
+            {
+                inputName = string.Empty;
+                return false;
+            }
+
             if (TryGetAbiTensorName(expr, requireLocation: MemoryLocation.Input, out inputName))
             {
                 return true;
@@ -4304,6 +4679,20 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             throw new NotSupportedException($"{context} must be loaded from a function input before use.");
         }
 
+        private string GetKVCacheFieldArgument(BaseExpr expr, string field, PyNTTKVCacheStorageMetadata? storage = null)
+        {
+            expr = UnwrapInputBoxing(expr);
+            if (TryGetFormalObjectBaseName(expr, out var objectBaseName))
+            {
+                var argumentName = SanitizePythonIdentifier($"{objectBaseName}_{field}");
+                _extraWorkspaceBaseNames.Add(argumentName);
+                _formalObjectFieldStorages[argumentName] = storage;
+                return argumentName;
+            }
+
+            return $"input{RegisterKVCacheFieldInput(expr, field, storage).ToString(CultureInfo.InvariantCulture)}";
+        }
+
         private int RegisterKVCacheFieldInput(BaseExpr expr, string field, PyNTTKVCacheStorageMetadata? storage = null)
         {
             var sourceName = GetKVCacheSourceInputName(expr, $"PyNTT KV-cache field {field}");
@@ -4321,6 +4710,33 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             }
 
             return inputIndex;
+        }
+
+        private bool TryGetFormalObjectBaseName(BaseExpr expr, out string baseName)
+        {
+            expr = UnwrapInputBoxing(expr);
+            baseName = string.Empty;
+            if (expr is IVar parameter && _formalObjectParameterBaseNames.TryGetValue(parameter, out baseName))
+            {
+                return true;
+            }
+
+            if (expr is TIR.Buffer buffer)
+            {
+                if (_formalObjectBaseNameByBuffer.TryGetValue(buffer, out baseName))
+                {
+                    return true;
+                }
+
+                if (IsAbiBuffer(buffer) &&
+                    buffer.MemSpan.Buffer.Start is IVar bufferParameter &&
+                    _formalObjectParameterBaseNames.TryGetValue(bufferParameter, out baseName))
+                {
+                    return true;
+                }
+            }
+
+            return false;
         }
 
         private string GetKVCacheSourceInputName(BaseExpr expr, string context)
@@ -4780,6 +5196,12 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             return new(BuildPointerExpression(bufferRef, GetScalarTritonDType(buffer.ElemType)), bufferRef.ShardCoordHierarchy);
         }
 
+        private string BuildFormalTensorBasePointerArgument(TIR.Buffer buffer)
+            => GetBufferScalarPointer(buffer).Expression;
+
+        private string BuildFormalTensorPoolStrideElementsArgument(TIR.Buffer buffer)
+            => "0";
+
         private PyNTTDimExpression[] GetTensorShape(BaseExpr expr, string name)
         {
             var tensorType = GetTensorType(expr.CheckedType, name);
@@ -4790,6 +5212,11 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
 
         private BufferRef ResolveBufferRef(TIR.Buffer buffer)
         {
+            if (TryGetFormalTensorBaseName(buffer, out var formalBaseName))
+            {
+                return ResolveFormalAbiBufferRef(buffer, formalBaseName);
+            }
+
             if (buffer.MemSpan.Buffer.Location == MemoryLocation.Input)
             {
                 return ResolveAbiBufferRef(buffer, $"input{GetInputIndex(buffer).ToString(CultureInfo.InvariantCulture)}");
@@ -4817,6 +5244,20 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             };
         }
 
+        private BufferRef ResolveFormalAbiBufferRef(TIR.Buffer buffer, string baseName)
+            => new(baseName, GetBufferSpanOffsetElements(buffer), "0", null, null);
+
+        private bool TryGetFormalTensorBaseName(TIR.Buffer buffer, out string baseName)
+        {
+            baseName = string.Empty;
+            return IsAbiBuffer(buffer) &&
+                buffer.MemSpan.Buffer.Start is IVar parameter &&
+                _formalTensorParameterBaseNames.TryGetValue(parameter, out baseName);
+        }
+
+        private bool IsFormalAbiBuffer(TIR.Buffer buffer)
+            => TryGetFormalTensorBaseName(buffer, out _);
+
         private string GetDataBaseName(TIR.Buffer buffer)
             => _dataBaseNameByBuffer.TryGetValue(buffer, out var baseName) ? baseName : _dataBaseName;
 
@@ -4837,7 +5278,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             return IsZeroOffset(expression) ? offset : $"(({offset}) + ({expression}))";
         }
 
-        private BufferRef ResolveAbiBufferRef(TIR.Buffer buffer, string baseName)
+        private BufferRef ResolveAbiBufferRef(TIR.Buffer buffer, string baseName, bool registerAbiViewStrideArgs = true)
         {
             var spanOffsetElements = GetBufferSpanOffsetElements(buffer);
             if (buffer.DistributedType is not { })
@@ -4846,6 +5287,11 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             }
 
             var poolStrideElements = $"{baseName}{PoolStrideElementsSuffix}";
+            if (!registerAbiViewStrideArgs)
+            {
+                _extraWorkspaceBaseNames.Add(poolStrideElements);
+            }
+
             var localOffsetElements = GetDistributedCompactLocalOffsetElements(buffer);
             var offsetElements = spanOffsetElements;
             if (!IsZeroOffset(localOffsetElements))
@@ -4904,8 +5350,8 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 "block_local_data_pool_stride_bytes",
             ];
 
-        private static string BuildDeviceFunctionCallPlaceholder(string functionName)
-            => $"{DeviceFunctionCallPrefix}{functionName}()";
+        private static string BuildDeviceFunctionCallPlaceholder(string functionName, IReadOnlyList<string>? extraArguments = null)
+            => $"{DeviceFunctionCallPrefix}{functionName}({string.Join(", ", extraArguments ?? Array.Empty<string>())})";
 
         private static string BuildRawPythonArgument(string expression) => $"py:{expression}";
 
@@ -4961,6 +5407,11 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
 
         private PyNTTDimExpression[] GetBufferStrides(TIR.Buffer buffer)
         {
+            if (TryGetFormalTensorBaseName(buffer, out var formalBaseName))
+            {
+                return GetAbiBufferStrideExpressions(formalBaseName, buffer, registerAbiViewStrideArgs: false);
+            }
+
             if (buffer.MemSpan.Buffer.Location == MemoryLocation.Input)
             {
                 var inputIndex = GetInputIndex(buffer).ToString(CultureInfo.InvariantCulture);
@@ -4978,7 +5429,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 .ToArray();
         }
 
-        private PyNTTDimExpression[] GetAbiBufferStrideExpressions(string prefix, TIR.Buffer buffer)
+        private PyNTTDimExpression[] GetAbiBufferStrideExpressions(string prefix, TIR.Buffer buffer, bool registerAbiViewStrideArgs = true)
         {
             var stridePrefix = GetVectorLaneElementCount(buffer.ElemType) == 1
                 ? $"{prefix}_scalar_stride"
@@ -4987,7 +5438,15 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             for (var axis = 0; axis < buffer.Rank; axis++)
             {
                 var name = $"{stridePrefix}{axis.ToString(CultureInfo.InvariantCulture)}";
-                _abiViewStrideArgNames.Add(name);
+                if (registerAbiViewStrideArgs)
+                {
+                    _abiViewStrideArgNames.Add(name);
+                }
+                else
+                {
+                    _extraWorkspaceBaseNames.Add(name);
+                }
+
                 strides[axis] = new PyNTTDimExpression(name, name);
             }
 
@@ -4996,9 +5455,20 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
 
         private string GetBufferOffsetBytes(TIR.Buffer buffer)
         {
-            var physicalOffset = GetDimensionExpression(buffer.MemSpan.Buffer.Start, $"{buffer.MemSpan.Buffer.Location} physical buffer offset");
+            var physicalOffset = GetPhysicalBufferStartOffset(buffer.MemSpan.Buffer.Start, $"{buffer.MemSpan.Buffer.Location} physical buffer offset");
             var spanOffset = GetLocalRegionDimensionExpression(buffer.MemSpan.Start, GetShardCoordHierarchy(buffer));
             return AddOffsetExpressions(physicalOffset.TritonExpression, spanOffset.TritonExpression);
+        }
+
+        private PyNTTDimExpression GetPhysicalBufferStartOffset(BaseExpr expr, string name)
+        {
+            expr = UnwrapInputBoxing(expr);
+            if (expr is BufferVar bufferVar && _formalWorkspaceParameters.Contains(bufferVar))
+            {
+                return PyNTTDimExpression.Zero;
+            }
+
+            return GetDimensionExpression(expr, name);
         }
 
         private string GetBufferSpanOffsetBytes(TIR.Buffer buffer)
@@ -5226,8 +5696,16 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
 
         private void RegisterRuntimeScalar(string name)
         {
+            if (_formalDimParameterNames.ContainsKey(name))
+            {
+                return;
+            }
+
             _runtimeScalarNames.Add(name);
         }
+
+        private string FormatRuntimeScalar(string name)
+            => _formalDimParameterNames.TryGetValue(name, out var formalName) ? formalName : name;
 
         private void RegisterLocalRegionRuntimeScalar(string name)
         {
@@ -5237,8 +5715,8 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             }
         }
 
-        private static string FormatLocalRegionRuntimeScalar(string name, IReadOnlyList<int> hierarchy)
-            => TryGetShardCoordDimAxis(name, out var axis) ? BuildShardCoordExpression(axis, hierarchy) : name;
+        private string FormatLocalRegionRuntimeScalar(string name, IReadOnlyList<int> hierarchy)
+            => TryGetShardCoordDimAxis(name, out var axis) ? BuildShardCoordExpression(axis, hierarchy) : FormatRuntimeScalar(name);
 
         private static string BuildShardCoordExpression(int axis, IReadOnlyList<int> hierarchy)
         {
@@ -5370,7 +5848,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             });
         }
 
-        private void WriteHelperTemplate(string templatePath, object model)
+        private string[] WriteHelperTemplate(string templatePath, object model)
         {
             var runtimeShapeArgs = _runtimeScalarNames.ToArray();
             var runtimeShapeArgsProperty = model.GetType().GetProperty("RuntimeShapeArgs");
@@ -5383,6 +5861,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             var functionName = GetHelperFunctionName(model);
             _helperArguments[functionName] = arguments;
             _helpers.Add(new(GetJinjaTemplateName(templatePath), model, arguments));
+            return arguments;
         }
 
         private static string GetHelperFunctionName(object model)
@@ -5510,7 +5989,10 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     new HashSet<int>(),
                     new DistributedType?[outputCount],
                     new Dictionary<int, int>(),
-                    new HashSet<PrimFunction>(ReferenceEqualityComparer.Instance))
+                    new HashSet<PrimFunction>(ReferenceEqualityComparer.Instance),
+                    new HashSet<string>(StringComparer.Ordinal),
+                    new Dictionary<PrimFunction, DeviceFunctionDefinition>(ReferenceEqualityComparer.Instance),
+                    new Dictionary<string, DeviceFunctionDefinition>(StringComparer.Ordinal))
             {
             }
 
@@ -5524,7 +6006,10 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 HashSet<int> storedOutputIndices,
                 DistributedType?[] outputDistributedTypes,
                 Dictionary<int, int> outputAliases,
-                HashSet<PrimFunction> activePrimFunctionCalls)
+                HashSet<PrimFunction> activePrimFunctionCalls,
+                HashSet<string> activeDeviceFunctionNames,
+                Dictionary<PrimFunction, DeviceFunctionDefinition>? deviceFunctionDefinitions = null,
+                Dictionary<string, DeviceFunctionDefinition>? deviceFunctionDefinitionsByName = null)
             {
                 InputNames = inputNames;
                 KVCacheFieldInputs = kvCacheFieldInputs;
@@ -5536,6 +6021,9 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 OutputDistributedTypes = outputDistributedTypes;
                 OutputAliases = outputAliases;
                 ActivePrimFunctionCalls = activePrimFunctionCalls;
+                ActiveDeviceFunctionNames = activeDeviceFunctionNames;
+                DeviceFunctionDefinitions = deviceFunctionDefinitions ?? new Dictionary<PrimFunction, DeviceFunctionDefinition>(ReferenceEqualityComparer.Instance);
+                DeviceFunctionDefinitionsByName = deviceFunctionDefinitionsByName ?? new Dictionary<string, DeviceFunctionDefinition>(StringComparer.Ordinal);
             }
 
             public List<string> InputNames { get; }
@@ -5557,138 +6045,53 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             public Dictionary<int, int> OutputAliases { get; }
 
             public HashSet<PrimFunction> ActivePrimFunctionCalls { get; }
-        }
 
-        private sealed class PrimFunctionCallBodyCloner : ExprCloner<Unit>
-        {
-            private readonly IReadOnlyDictionary<IVar, BaseExpr> _aliases;
-            private readonly Dictionary<string, BaseExpr> _dimAliasesByName = new(StringComparer.Ordinal);
-            private readonly Dictionary<IVar, TIR.Buffer> _attachedBuffers = new();
+            public HashSet<string> ActiveDeviceFunctionNames { get; }
 
-            public PrimFunctionCallBodyCloner(IReadOnlyDictionary<IVar, BaseExpr> aliases)
-                : base(cloneOtherFunctions: false)
-            {
-                _aliases = aliases;
-                foreach (var pair in aliases)
-                {
-                    if (pair.Key is not DimVar)
-                    {
-                        continue;
-                    }
+            public Dictionary<PrimFunction, DeviceFunctionDefinition> DeviceFunctionDefinitions { get; }
 
-                    if (_dimAliasesByName.TryGetValue(pair.Key.Name, out var existing) && !Equals(existing, pair.Value))
-                    {
-                        throw new NotSupportedException($"PyNTT found duplicate dimension parameter alias for {pair.Key.Name}.");
-                    }
-
-                    _dimAliasesByName[pair.Key.Name] = pair.Value;
-                }
-            }
-
-            protected override BaseExpr DispatchVisit(BaseExpr expr, Unit context)
-            {
-                if (expr is IVar parameter && _aliases.TryGetValue(parameter, out var alias))
-                {
-                    return alias;
-                }
-
-                return base.DispatchVisit(expr, context);
-            }
-
-            protected override BaseExpr VisitLeafVar(Var expr, Unit context)
-                => _aliases.TryGetValue(expr, out var alias) ? alias : base.VisitLeafVar(expr, context);
-
-            protected override BaseExpr VisitLeafBufferVar(BufferVar expr, Unit context)
-                => _aliases.TryGetValue(expr, out var alias) ? alias : base.VisitLeafBufferVar(expr, context);
-
-            protected override BaseExpr VisitLeafDimVar(DimVar expr, Unit context)
-            {
-                if (_aliases.TryGetValue(expr, out var alias))
-                {
-                    return alias;
-                }
-
-                if (_dimAliasesByName.TryGetValue(expr.Name, out alias))
-                {
-                    return alias;
-                }
-
-                return base.VisitLeafDimVar(expr, context);
-            }
-
-            protected override BaseExpr VisitLeafBuffer(TIR.Buffer expr, Unit context)
-            {
-                if (TryResolveAbiBufferAlias(expr, out var alias))
-                {
-                    return alias;
-                }
-
-                return base.VisitLeafBuffer(expr, context);
-            }
-
-            private bool TryResolveAbiBufferAlias(TIR.Buffer buffer, out BaseExpr alias)
-            {
-                alias = null!;
-                if (!IsAbiBuffer(buffer) ||
-                    buffer.MemSpan.Buffer.Start is not IVar parameter ||
-                    !_aliases.TryGetValue(parameter, out var parameterAlias))
-                {
-                    return false;
-                }
-
-                parameterAlias = UnwrapAliasBoxing(parameterAlias);
-                switch (parameterAlias)
-                {
-                    case TIR.Buffer aliasBuffer:
-                        alias = aliasBuffer;
-                        return true;
-                    case BufferVar bufferVar:
-                        alias = GetAttachedBuffer(bufferVar);
-                        return true;
-                    case Var var when IsObjectDataType(var.CheckedDataType):
-                        alias = var;
-                        return true;
-                    default:
-                        throw new NotSupportedException($"PyNTT cannot bind callee ABI buffer {buffer.Name} to call argument {parameterAlias.GetType().Name}.");
-                }
-            }
-
-            private TIR.Buffer GetAttachedBuffer(BufferVar bufferVar)
-            {
-                if (_attachedBuffers.TryGetValue(bufferVar, out var buffer))
-                {
-                    return buffer;
-                }
-
-                var tensorType = GetTensorType(bufferVar.CheckedType, bufferVar.Name);
-                buffer = T.AttachBuffer(bufferVar, tensorType, bufferVar.Location, 0, out _, $"{bufferVar.Name}_abi", bufferVar.CheckedType as DistributedType);
-                _attachedBuffers.Add(bufferVar, buffer);
-                return buffer;
-            }
-
-            private static BaseExpr UnwrapAliasBoxing(BaseExpr expr)
-            {
-                while (expr is Call call && call.Target is Boxing)
-                {
-                    expr = call.Arguments[0];
-                }
-
-                return expr;
-            }
+            public Dictionary<string, DeviceFunctionDefinition> DeviceFunctionDefinitionsByName { get; }
         }
 
         private sealed record BufferRef(string BaseName, string OffsetBytes, string PoolStrideBytes, string? IndexExpression, int[]? ShardCoordHierarchy);
 
-        private sealed record DeviceFunctionWorkspaceBinding(
+        public enum DeviceFunctionFormalParameterKind
+        {
+            Tensor,
+            Workspace,
+            Scalar,
+            Object,
+        }
+
+        public sealed record DeviceFunctionFormalParameter(
+            int Index,
+            IVar Parameter,
+            DeviceFunctionFormalParameterKind Kind,
+            string? BaseName,
+            string? PoolStrideName,
+            string[] StrideNames,
+            string? ScalarName,
+            MemoryLocation? WorkspaceLocation)
+        {
+            public string? ObjectBaseName => ScalarName;
+        }
+
+        public sealed record DeviceFunctionFormalPlan(
+            IReadOnlyDictionary<IVar, string> ParameterNames,
+            IReadOnlyDictionary<IVar, string> TensorBaseNames,
+            IReadOnlyDictionary<string, string> DimParameterNames,
+            IReadOnlyDictionary<IVar, string> ObjectBaseNames,
+            IReadOnlySet<IVar> WorkspaceParameters,
+            IReadOnlySet<string> ExtraParameters,
             string DataBaseName,
             string ChipLocalDataBaseName,
             string BlockLocalDataBaseName,
-            Dictionary<TIR.Buffer, string> DataBaseNameByBuffer,
-            Dictionary<TIR.Buffer, string> ChipLocalDataBaseNameByBuffer,
-            Dictionary<TIR.Buffer, string> BlockLocalDataBaseNameByBuffer,
-            IReadOnlySet<string> ExtraParameters,
-            IReadOnlyDictionary<string, string> ParameterOverrides,
-            IReadOnlyDictionary<string, string> ExtraParameterArguments);
+            IReadOnlyList<DeviceFunctionFormalParameter> Parameters);
+
+        public sealed record DeviceFunctionDefinition(
+            string Name,
+            DeviceFunctionBuildResult BuildResult,
+            IReadOnlyList<DeviceFunctionFormalParameter> Parameters);
     }
 
     private static LaunchMetadata BuildLaunchMetadata(OutputInfo output, PyNTTTargetOptions targetOptions, Dictionary<string, object>? extraMeta = null)
@@ -7003,17 +7406,41 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
 
     private sealed class SharedHelperRegistry
     {
-        private readonly Dictionary<string, string> _names = new(StringComparer.Ordinal);
+        private readonly Dictionary<string, SharedHelperDefinition> _definitions = new(StringComparer.Ordinal);
         private int _nextIndex;
 
-        public bool TryGetName(string key, out string name) => _names.TryGetValue(key, out name!);
+        public bool TryGet(string key, out string name, out string[] arguments)
+        {
+            if (_definitions.TryGetValue(key, out var definition))
+            {
+                name = definition.Name;
+                arguments = definition.Arguments;
+                return true;
+            }
+
+            name = string.Empty;
+            arguments = Array.Empty<string>();
+            return false;
+        }
 
         public string Add(string key, string ownerName, string kind)
         {
             var name = SanitizePythonIdentifier($"{ownerName}_shared_{kind}_{_nextIndex++}");
-            _names.Add(key, name);
+            _definitions.Add(key, new(name, Array.Empty<string>()));
             return name;
         }
+
+        public void SetArguments(string key, string[] arguments)
+        {
+            if (!_definitions.TryGetValue(key, out var definition))
+            {
+                throw new NotSupportedException($"PyNTT shared helper registry does not contain key {key}.");
+            }
+
+            _definitions[key] = definition with { Arguments = arguments };
+        }
+
+        private sealed record SharedHelperDefinition(string Name, string[] Arguments);
     }
 }
 #pragma warning restore SA1201
@@ -7054,7 +7481,9 @@ internal sealed record DeviceFunctionBuildResult(
     IReadOnlyList<HelperKernelCallMetadata> HelperCalls,
     IReadOnlyList<string> OpKinds,
     bool RequiresGridBarrier,
-    long CollectiveDataPoolBytes);
+    long CollectiveDataPoolBytes,
+    IReadOnlyDictionary<string, PyNTTKVCacheStorageMetadata?> FormalObjectFieldStorages,
+    IReadOnlyDictionary<int, string> FormalObjectOutputAliases);
 
 internal sealed record DeviceFunctionRenderSpec(
     [property: JsonPropertyName("name")]
