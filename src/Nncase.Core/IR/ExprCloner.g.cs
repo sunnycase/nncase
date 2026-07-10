@@ -662,6 +662,11 @@ public partial class ExprCloner<TContext>
                 return true;
             }
 
+            if (IsMutated(expr.Results, context))
+            {
+                return true;
+            }
+
             return false;
         }
 
@@ -674,7 +679,8 @@ public partial class ExprCloner<TContext>
         {
             return expr.With(
                 parameters: CloneArray(expr.Parameters, context),
-                body: Clone(expr.Body, context)
+                body: Clone(expr.Body, context),
+                results: Clone(expr.Results, context)
             );
         }
 

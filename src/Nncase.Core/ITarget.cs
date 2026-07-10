@@ -43,8 +43,6 @@ public interface INTTTargetOptions : ITargetOptions
 
     bool UnifiedMemoryArch { get; set; }
 
-    bool ConstShardedView { get; set; }
-
     MemoryAccessArchitecture MemoryAccessArch { get; set; }
 
     NocArchitecture NocArch { get; set; }

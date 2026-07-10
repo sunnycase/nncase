@@ -101,9 +101,41 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
 
     private static TensorSpecMetadata[] GetOutputTensorSpecs(BaseFunction function)
     {
-        return PyNTTFunctionOutputs.GetOutputs(function)
+        return PyNTTFunctionOutputs.GetOutputParameters(function)
             .Select((output, index) => BuildTensorSpec($"output{index}", output.CheckedType, "output", "like_input"))
             .ToArray();
+    }
+
+    private static TensorResultSpecMetadata[] GetResultTensorSpecs(BaseFunction function)
+    {
+        if (function is not PrimFunction primFunction)
+        {
+            throw new NotSupportedException($"PyNTT requires PrimFunction result ABI, got {function.GetType().Name} {function.Name}.");
+        }
+
+        var abi = primFunction.GetAbiView();
+        var inputParameters = GetInputTensorParameters(function);
+        var outputParameters = abi.OutputParameters.ToArray();
+        return abi.Results.Select((result, index) =>
+        {
+            var inputIndex = Array.FindIndex(inputParameters, parameter => ReferenceEquals(parameter, result.Storage));
+            var outputIndex = Array.FindIndex(outputParameters, parameter => ReferenceEquals(parameter, result.Storage));
+            var (source, sourceIndex) = (inputIndex, outputIndex) switch
+            {
+                (>= 0, < 0) => ("input", inputIndex),
+                (< 0, >= 0) => ("output", outputIndex),
+                _ => throw new InvalidOperationException(
+                    $"PyNTT PrimFunction {primFunction.Name} result {index} storage {result.Storage.Name} must bind exactly one input or output parameter."),
+            };
+            var offset = result.Value is TIR.Buffer buffer
+                ? new PyNTTDimExpressionEmitter().Emit(buffer.MemSpan.Start).ToPythonLiteral()
+                : 0L;
+            return new TensorResultSpecMetadata(
+                BuildTensorSpec($"result{index}", result.Type, "result", "like_input"),
+                source,
+                sourceIndex,
+                offset);
+        }).ToArray();
     }
 
     private static TensorSpecMetadata BuildTensorSpec(string name, IRType type, string role, string device)
@@ -346,15 +378,19 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
         var parameters = PythonTuple(GetParameterNames(sourceFunction).Select(PythonString));
         var inputs = PythonTuple(GetInputTensorSpecs(function).Select(BuildTensorSpecPython));
         var outputs = PythonTuple(GetOutputTensorSpecs(sourceFunction).Select(BuildTensorSpecPython));
+        var results = PythonTuple(GetResultTensorSpecs(sourceFunction).Select(BuildTensorResultSpecPython));
         var shapeBindings = PythonTuple(GetShapeBindings(sourceFunction).Select(BuildShapeBindingPython));
 
-        return $"        FunctionSpec(name={PythonString(sourceFunction.Name)}, module_kind={PythonString(sourceFunction.ModuleKind)}, is_entry={PythonBool(sourceFunction.IsEntry)}, parameters={parameters}, inputs={inputs}, outputs={outputs}, shape_bindings={shapeBindings}),";
+        return $"        FunctionSpec(name={PythonString(sourceFunction.Name)}, module_kind={PythonString(sourceFunction.ModuleKind)}, is_entry={PythonBool(sourceFunction.IsEntry)}, parameters={parameters}, inputs={inputs}, outputs={outputs}, results={results}, shape_bindings={shapeBindings}),";
     }
 
     private static string BuildTensorSpecPython(TensorSpecMetadata spec)
     {
         return $"TensorSpec(name={PythonString(spec.Name)}, dtype={PythonString(spec.DType)}, shape={PythonTuple(spec.Shape.Select(PythonValue))}, strides={PythonTuple(spec.Strides.Select(PythonValue))}, role={PythonString(spec.Role)}, device={PythonString(spec.Device)}, layout={PythonString(spec.Layout)}, memory={PythonString(spec.Memory)})";
     }
+
+    private static string BuildTensorResultSpecPython(TensorResultSpecMetadata spec)
+        => $"TensorResultSpec(tensor={BuildTensorSpecPython(spec.Tensor)}, source={PythonString(spec.Source)}, source_index={spec.SourceIndex.ToString(CultureInfo.InvariantCulture)}, offset_bytes={PythonValue(spec.OffsetBytes)})";
 
     private static string BuildShapeBindingPython(ShapeBindingMetadata binding)
     {
@@ -461,6 +497,7 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
                 parameters = GetParameterNames(function.SourceFunction),
                 inputs = GetInputTensorSpecs(function),
                 outputs = GetOutputTensorSpecs(function.SourceFunction),
+                results = GetResultTensorSpecs(function.SourceFunction),
                 generated_kernels = topKernelFunctions.Contains(function)
                     ? function.GeneratedKernelSource.Kernels
                     : Array.Empty<GeneratedKernelMetadata>(),
@@ -732,7 +769,7 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
             _functions.Select(BuildFunctionSpecPython));
 
         return $$"""
-            from pyntt.ir import FunctionSpec, ModuleSpec, ShapeBinding, TensorSpec
+            from pyntt.ir import FunctionSpec, ModuleSpec, ShapeBinding, TensorResultSpec, TensorSpec
 
 
             MODULE_SPEC = ModuleSpec(
@@ -767,7 +804,7 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
 
             from pyntt.codegen.render import render_generated_kernels
             from pyntt.runtime.interpreter import PyNTTInterpreter
-            from pyntt.runtime.tensor import materialize_kv_cache_blocks_per_shard, materialize_kv_cache_metadata, materialize_kv_cache_storage, materialize_kv_cache_tensor_field, view_typed_buffer
+            from pyntt.runtime.tensor import materialize_kv_cache_blocks_per_shard, materialize_kv_cache_metadata, materialize_kv_cache_storage, materialize_kv_cache_tensor_field, resolve_execution_device, view_typed_buffer
             from pyntt.runtime.tuning import select_tuning_parameter
             {{tritonRuntimeImport}}
             from .rdata import RDATA_BUNDLES
@@ -838,14 +875,14 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
         var outputs = CreateRuntimeOutputBindings(function, index => new RuntimeBinding(
             $"outputs[{index.ToString(CultureInfo.InvariantCulture)}]",
             $"outputs[{index.ToString(CultureInfo.InvariantCulture)}]",
-            StrideElements: BuildTorchTensorStrideExpressions($"outputs[{index.ToString(CultureInfo.InvariantCulture)}]", PyNTTFunctionOutputs.GetOutputTypes(function)[index]),
-            ScalarStrideElements: BuildTorchTensorScalarStrideExpressions($"outputs[{index.ToString(CultureInfo.InvariantCulture)}]", PyNTTFunctionOutputs.GetOutputTypes(function)[index])));
-        return new RuntimeDispatchContext(state, parameters, outputs, new Dictionary<ObjectBufferKey, RuntimeBinding>(), function.Name, "outputs[0].device", "inputs");
+            StrideElements: BuildTorchTensorStrideExpressions($"outputs[{index.ToString(CultureInfo.InvariantCulture)}]", PyNTTFunctionOutputs.GetOutputParameterTypes(function)[index]),
+            ScalarStrideElements: BuildTorchTensorScalarStrideExpressions($"outputs[{index.ToString(CultureInfo.InvariantCulture)}]", PyNTTFunctionOutputs.GetOutputParameterTypes(function)[index])));
+        return new RuntimeDispatchContext(state, parameters, outputs, new Dictionary<ObjectBufferKey, RuntimeBinding>(), function.Name, "resolve_execution_device(inputs, outputs)", "inputs");
     }
 
     private static Dictionary<string, RuntimeBinding> CreateRuntimeOutputBindings(BaseFunction function, Func<int, RuntimeBinding> createBinding)
     {
-        var outputParameters = PyNTTFunctionOutputs.GetOutputs(function);
+        var outputParameters = PyNTTFunctionOutputs.GetOutputParameters(function);
         var bindings = new Dictionary<string, RuntimeBinding>(StringComparer.Ordinal);
         for (var i = 0; i < outputParameters.Length; i++)
         {
@@ -1375,7 +1412,7 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
     }
 
     private static IRType[] GetOutputTypes(BaseFunction function)
-        => PyNTTFunctionOutputs.GetOutputTypes(function);
+        => PyNTTFunctionOutputs.GetOutputParameterTypes(function);
 
     private static FunctionCallArgumentLayout ResolveFunctionCallArgumentLayout(
         Call call,
@@ -2841,6 +2878,16 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
         string Layout,
         [property: JsonPropertyName("memory")]
         string Memory);
+
+    private sealed record TensorResultSpecMetadata(
+        [property: JsonPropertyName("tensor")]
+        TensorSpecMetadata Tensor,
+        [property: JsonPropertyName("source")]
+        string Source,
+        [property: JsonPropertyName("source_index")]
+        int SourceIndex,
+        [property: JsonPropertyName("offset_bytes")]
+        object OffsetBytes);
 
     private sealed record ShapeBindingMetadata(string Name, int InputIndex, int Axis, long? MinValue, long? MaxValue);
 

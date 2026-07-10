@@ -97,7 +97,7 @@ public sealed partial class AutoDistributedWithShapeBucketPass : ModulePass
         else
         {
             var functionForSegments = function;
-            if (!AutoDistributedRewriter.SupportsConstShardedView(targetOptions))
+            if (!AutoDistributedRewriter.SupportsConstAffineView(targetOptions))
             {
                 var distributedConsts = SearchDistributedConstants(function, targetOptions);
                 functionForSegments = (Function)new DistributeConstCloner(distributedConsts).Clone(function, Unit.Default);

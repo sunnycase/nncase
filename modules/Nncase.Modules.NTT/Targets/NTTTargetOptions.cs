@@ -28,11 +28,6 @@ public class NTTTargetOptions : INTTTargetOptions, ITargetOpCostModelProvider
     [DefaultValue(true)]
     public bool UnifiedMemoryArch { get; set; } = true;
 
-    [DisplayName("--const-sharded-view")]
-    [Description("enable zero-copy distributed views for readonly constants on UMA targets.")]
-    [DefaultValue(false)]
-    public bool ConstShardedView { get; set; }
-
     [DisplayName("--memory-access-arch")]
     [Description("Memory Access Architecture.")]
     [DefaultValue(MemoryAccessArchitecture.UMA)]

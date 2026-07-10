@@ -14,6 +14,7 @@ using Microsoft.Extensions.DependencyInjection;
 using NetFabric.Hyperlinq;
 using Nncase.Diagnostics;
 using Nncase.IR;
+using Nncase.IR.Affine;
 using Nncase.IR.Shapes;
 using Nncase.IR.Tensors;
 using Nncase.Passes.Analysis;
@@ -49,14 +50,12 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
                 return GenerateClamp(call, arguments, output);
             case IR.Distributed.Boxing boxing:
                 return GenerateBoxing(call, boxing, arguments, ref output, context);
-            case IR.Distributed.ShardedView shardedView:
-                return GenerateShardedView(call, shardedView, arguments, ref output);
+            case AffineView affineView:
+                return GenerateAffineView(call, affineView, arguments, ref output);
             case IR.Distributed.ForceBoxing forceBoxing:
                 return T.Memcopy(output, (Expr)arguments[0]);
             case IR.Math.Binary binary:
                 return TIR.F.NTT.VectorizedBinary((Expr)arguments[0], (Expr)arguments[1], output, None.Default, binary.BinaryOp, Array.Empty<int>(), Array.Empty<Dimension>(), Array.Empty<int>(), Array.Empty<Dimension>());
-            case IR.Tensors.Bitcast bitcast:
-                return GenerateBitcast((Expr)arguments[0], ref output, bitcast.NewType);
             case IR.Tensors.Pack pack:
                 return TIR.F.NTT.Pack((Expr)arguments[0], output, pack.Lanes, pack.Axes);
             case IR.Tensors.VectorizeMask pack:
@@ -250,14 +249,10 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
                 return TIR.F.NTT.Compare(compare.CompareOp, (Expr)arguments[0], (Expr)arguments[1], output);
             case IR.Tensors.GetItem getItem:
                 return TIR.F.NTT.GetItem((Expr)arguments[0], arguments[1], output);
-            case IR.Tensors.Reshape:
-                return GenerateReshape((Expr)arguments[0], ref output);
             case IR.Tensors.ScatterND scatterND:
                 return TIR.F.NTT.ScatterND((Expr)arguments[0], (Expr)arguments[1], (Expr)arguments[2], output);
             case IR.Tensors.Stack stack:
                 return TIR.F.NTT.Stack(((IR.Tuple)arguments[0]).Fields.AsValueEnumerable().Select(x => (Expr)x).ToArray(), output, ((TensorConst)call[IR.Tensors.Stack.Axis]).Value.ToScalar<int>());
-            case IR.Tensors.Unsqueeze:
-                return GenerateReshape((Expr)arguments[0], ref output);
             case IR.NN.UpdatePagedAttentionKVCache upkv:
                 output = (Expr)arguments[1];
                 return TIR.F.NTT.UpdatePagedAttentionKVCache((Expr)arguments[0], (Expr)arguments[1], (Dimension)arguments[2], upkv.CacheKind, upkv.Layout);
@@ -321,146 +316,85 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
         }
     }
 
-    private Expr GenerateReshape(Expr input, ref Expr output, bool sequeeze = false)
+    private Expr GenerateAffineView(Call call, AffineView affineView, IReadOnlyList<BaseExpr> arguments, ref Expr output)
     {
-        if (input is not TIR.Buffer inBuffer)
+        if (arguments[AffineView.Input.Index] is not TIR.Buffer inputBuffer)
         {
-            throw new NotSupportedException("Reshape only support buffer input");
+            throw new NotSupportedException($"AffineView input must lower to TIR.Buffer, got {arguments[AffineView.Input.Index].GetType().Name}.");
         }
 
-        if (output is BufferVar { Role: BufferVarRole.Output })
+        if (call[AffineView.Input] is TensorConst tensorConst && affineView.NewType is DistributedType shardedType)
         {
-            var outputBuffer = CreateMetadataBuffer(output, MemoryLocation.Output, "reshape_output");
-            if (CanUseView(inBuffer, outputBuffer, sequeeze))
-            {
-                var view = CreateView(inBuffer, outputBuffer);
-                return GenerateTensorStore(view, output);
-            }
-
-            var temp = CreateDataBuffer(outputBuffer);
-            return T.Sequential(
-                TIR.F.NTT.Reshape(input, temp),
-                GenerateTensorStore(temp, output));
-        }
-
-        var outBuffer = (TIR.Buffer)output;
-
-        // If the size is not same, we cannot bitcast.
-        if (CanUseView(inBuffer, outBuffer, sequeeze))
-        {
-            output = CreateView(inBuffer, outBuffer);
+            output = T.AttachShardedConstView(tensorConst, shardedType, out _, $"affine_const_view_{_bufferIndex++}");
             return T.Nop();
         }
-        else
-        {
-            return TIR.F.NTT.Reshape(input, output);
-        }
-    }
 
-    private Expr GenerateBitcast(Expr input, ref Expr output, DataType newType)
-    {
-        if (input is not TIR.Buffer inBuffer)
+        var resultTensorType = affineView.NewType switch
         {
-            throw new NotSupportedException("Bitcast only support buffer input");
-        }
-
-        var srcSize = inBuffer.ElemType.SizeInBytes;
-        var destSize = newType.SizeInBytes;
-        var newDimensions = inBuffer.Dimensions.ToArray();
-        var newStrides = inBuffer.Strides.ToArray();
-
-        if (srcSize != destSize)
+            DistributedType distributedType => distributedType.TensorType,
+            TensorType tensorType => tensorType,
+            _ => throw new NotSupportedException($"AffineView result must be a tensor type, got {affineView.NewType}."),
+        };
+        if (resultTensorType.Shape is not RankedShape resultShape)
         {
-            if (newDimensions.Rank == 0)
-            {
-                newDimensions = [srcSize / destSize];
-                newStrides = [1];
-            }
-            else
-            {
-                newDimensions[^1] = newDimensions[^1] * srcSize / destSize;
-                if (newStrides.Length > 1)
-                {
-                    newStrides[^1] = 1;
-                    for (var i = 0; i < newStrides.Length - 1; i++)
-                    {
-                        newStrides[i] = newStrides[i] * srcSize / destSize;
-                    }
-                }
-            }
+            throw new NotSupportedException("AffineView TIR lowering requires a ranked result shape.");
         }
 
-        if (output is BufferVar { Role: BufferVarRole.Output } outputVar)
+        var resultDimensions = resultShape.Dimensions.ToArray();
+        var resultStrides = CreateAffineViewStrides(inputBuffer, resultTensorType, affineView.Transform);
+        var name = output switch
         {
-            var distributedType = inBuffer.DistributedType is DistributedType dt
-                ? dt with { TensorType = new TensorType(newType, newDimensions) }
-                : null;
-            var view = inBuffer.With(name: $"{outputVar.Name}_view", elemType: newType, dimensions: newDimensions, strides: newStrides, distributedType: distributedType);
-            return GenerateTensorStore(view, output);
-        }
-
-        if (output is not TIR.Buffer outBuffer)
-        {
-            throw new NotSupportedException($"Bitcast output must be a buffer or caller output BufferVar, got {output.GetType().Name}.");
-        }
-
-        var outputDistributedType = outBuffer.DistributedType is DistributedType outDt
-            ? outDt with { TensorType = new TensorType(newType, newDimensions) }
-            : null;
-        output = inBuffer.With(name: outBuffer.Name, elemType: newType, dimensions: newDimensions, strides: newStrides, distributedType: outputDistributedType);
+            BufferVar outputVar => $"{outputVar.Name}_view",
+            TIR.Buffer outputBuffer => outputBuffer.Name,
+            _ => $"affine_view_{_bufferIndex++}",
+        };
+        output = T.CreateBufferView(
+            inputBuffer,
+            resultTensorType.DType,
+            resultDimensions,
+            resultStrides,
+            0,
+            inputBuffer.MemSpan.Size,
+            affineView.NewType as DistributedType,
+            name);
         return T.Nop();
     }
 
-    private TIR.Buffer CreateMetadataBuffer(Expr expr, MemoryLocation location, string namePrefix)
+    private static Dimension[] CreateAffineViewStrides(TIR.Buffer source, TensorType resultType, AffineViewTransform transform)
     {
-        var (tensorType, distributedType) = GetTensorTypeAndDistributedType(expr.CheckedType, namePrefix);
-        T.CreateBuffer(tensorType, location, out var buffer, $"{namePrefix}_{_bufferIndex++}", distributedType);
-        return buffer;
-    }
-
-    private TIR.Buffer CreateDataBuffer(TIR.Buffer metadataBuffer)
-    {
-        var tensorType = new TensorType(metadataBuffer.ElemType, metadataBuffer.Dimensions.ToArray());
-        T.CreateBuffer(tensorType, MemoryLocation.Data, out var buffer, $"reshape_tmp_{_bufferIndex++}", metadataBuffer.DistributedType);
-        return buffer;
-    }
-
-    private (TensorType TensorType, DistributedType? DistributedType) GetTensorTypeAndDistributedType(IRType type, string context)
-        => type switch
+        var sourceDefaultStrides = TensorUtilities.GetDefaultStrides(source.Dimensions);
+        var prefixRank = 0;
+        var comparableRank = System.Math.Min(transform.SourceMap.Results.Length, transform.ResultMap.Results.Length);
+        while (prefixRank < comparableRank && transform.SourceMap.Results[prefixRank].Equals(transform.ResultMap.Results[prefixRank]))
         {
-            DistributedType distributedType => (distributedType.TensorType, distributedType),
-            TensorType tensorType => (tensorType, null),
-            _ => throw new NotSupportedException($"{context} expects a tensor type, got {type}."),
-        };
-
-    private bool CanUseView(TIR.Buffer input, TIR.Buffer output, bool sequeeze)
-    {
-        var outputDistributedType = output.DistributedType;
-        var bitcast = outputDistributedType is not DistributedType;
-        if (!bitcast)
-        {
-            if (input.DistributedType is not { } inputDistributedType)
-            {
-                return false;
-            }
-
-            bitcast = DistributedUtility.AreSamePolicies(inputDistributedType.AxisPolicies.Where(sbp => sbp is not SBPBroadCast).ToArray(), outputDistributedType!.AxisPolicies.Where(sbp => sbp is not SBPBroadCast).ToArray(), false);
+            prefixRank++;
         }
 
-        return input.MemSpan.Size == output.MemSpan.Size && (bitcast || sequeeze);
-    }
+        for (var axis = prefixRank; axis < source.Rank; axis++)
+        {
+            if (!source.Strides[axis].Equals(sourceDefaultStrides[axis]))
+            {
+                throw new NotSupportedException(
+                    $"AffineView cannot reshape non-contiguous source suffix at axis {axis}: stride={source.Strides[axis]}, expected={sourceDefaultStrides[axis]}.");
+            }
+        }
 
-    private TIR.Buffer CreateView(TIR.Buffer input, TIR.Buffer output)
-        => input.With(name: output.Name, elemType: output.ElemType, dimensions: output.Dimensions.ToArray(), strides: output.Strides.ToArray(), distributedType: output.DistributedType);
+        var resultDimensions = ((RankedShape)resultType.Shape).Dimensions.ToArray();
+        var resultStrides = TensorUtilities.GetDefaultStrides(resultDimensions);
+        var sharedPrefixRank = System.Math.Min(prefixRank, System.Math.Min(source.Rank, resultDimensions.Length));
+        for (var axis = 0; axis < sharedPrefixRank; axis++)
+        {
+            var sourceByteStride = source.Strides[axis] * source.ElemType.SizeInBytes;
+            if (sourceByteStride is DimConst byteStride && byteStride.Value % resultType.DType.SizeInBytes != 0)
+            {
+                throw new NotSupportedException(
+                    $"AffineView byte stride {byteStride.Value} at axis {axis} is not aligned to result element size {resultType.DType.SizeInBytes}.");
+            }
 
-    private Expr GenerateTensorStore(TIR.Buffer source, Expr destination)
-    {
-        var distributedType = source.DistributedType;
-        return TIR.F.NTT.TensorStore(
-            source,
-            destination,
-            distributedType?.AxisPolicies ?? new IRArray<SBP>(),
-            distributedType?.Placement ?? new Placement(new IRArray<int>(), string.Empty, string.Empty));
+            resultStrides[axis] = (sourceByteStride / resultType.DType.SizeInBytes).Simplify();
+        }
+
+        return resultStrides;
     }
 
     private Expr GenerateUnary(UnaryOp unaryOp, IReadOnlyList<BaseExpr> arguments, Expr output)
@@ -489,17 +423,6 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
             default:
                 throw new NotSupportedException();
         }
-    }
-
-    private Expr GenerateShardedView(Call call, IR.Distributed.ShardedView shardedView, IReadOnlyList<BaseExpr> arguments, ref Expr output)
-    {
-        if (call[IR.Distributed.ShardedView.Input] is not TensorConst tensorConst)
-        {
-            throw new NotSupportedException("ShardedView only supports TensorConst inputs in TIR selection.");
-        }
-
-        output = T.AttachShardedConstView(tensorConst, shardedView.NewType, out _, $"const_sharded_view_{tensorConst.GetHashCode():x}");
-        return T.Nop();
     }
 
     private Expr GenerateReshard(Expr input, ref Expr output, DistributedType inType, DistributedType outType, TIRSelectionContext context)

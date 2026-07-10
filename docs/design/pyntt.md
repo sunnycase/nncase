@@ -40,6 +40,8 @@ Target and module kind: `pyntt`.
   explicit Triton template representation for the resulting layout. Layout
   changes must be visible in TIR and generated source; they must not be hidden
   behind native NTT kernels or runtime fallbacks.
+- Represent storage-preserving reshape and bitcast operations as first-class
+  affine views. They must not allocate storage or generate Triton/C++ kernels.
 - Support the first op group:
   - elementwise
   - unary
@@ -219,8 +221,10 @@ Responsibilities:
   and the generated top-kernel call sequence. It is the stable boundary that
   lets PyNTT template edits regenerate kernels without recompiling nncase or
   recompiling the model.
-- `specs.py`: Python representation of `ModuleSpec`, `FunctionSpec`, and
-  `TensorSpec` instances.
+- `specs.py`: Python representation of `ModuleSpec`, `FunctionSpec`,
+  `TensorSpec`, and `TensorResultSpec` instances. `FunctionSpec.outputs`
+  describes caller-allocated storage, while `FunctionSpec.results` describes
+  ordered logical results backed by input or output storage.
 - `generated_kernels.py`: generated Triton helper functions and launchable top
   kernels. The file is initially a placeholder and is refreshed from
   `kernel_params.json` by `model.py` through `pyntt.codegen.render`.
@@ -249,7 +253,8 @@ outputs = model(*inputs)
 
 Runtime constraints:
 
-- Inputs and outputs are `torch.Tensor`.
+- Tensor inputs, caller-allocated outputs, and tensor results are
+  `torch.Tensor`. Object ABI values remain objects.
 - CUDA tensors are the primary execution path.
 - CPU tensors may be rejected initially unless a copy-to-CUDA policy is
   explicitly configured.
@@ -265,7 +270,9 @@ Core runtime objects:
 
 - `ModuleSpec`: whole generated model metadata.
 - `FunctionSpec`: callable graph or megakernel-level function.
-- `TensorSpec`: dtype, shape, strides, memory role, layout, and aliasing.
+- `TensorSpec`: dtype, shape, strides, memory role, and layout.
+- `TensorResultSpec`: logical tensor metadata plus its input/output storage
+  source and byte offset.
 
 Kernel launch metadata is emitted directly into `model.py` and
 `metadata.json`. There is no runtime kernel dispatch layer in M3.
@@ -385,6 +392,13 @@ class TensorSpec:
     memory: MemorySpace
 
 @dataclass(frozen=True)
+class TensorResultSpec:
+    tensor: TensorSpec
+    source: Literal["input", "output"]
+    source_index: int
+    offset_bytes: int | str
+
+@dataclass(frozen=True)
 class FunctionSpec:
     name: str
     module_kind: str
@@ -392,6 +406,7 @@ class FunctionSpec:
     parameters: tuple[str, ...]
     inputs: tuple[TensorSpec, ...]
     outputs: tuple[TensorSpec, ...]
+    results: tuple[TensorResultSpec, ...]
     shape_bindings: tuple[ShapeBinding, ...]
 ```
 
@@ -409,6 +424,8 @@ Spec invariants:
 - Broadcast semantics are explicit, not inferred from shape alone.
 - Memory space is explicit.
 - Aliasing and in-place behavior are explicit.
+- Caller-allocated storage outputs and ordered logical results are distinct;
+  every result names exactly one input/output storage owner.
 - Every generated kernel has a stable debug name and source mapping back to
   nncase function/op information.
 - Every generated kernel launch has explicit static launch metadata in the
@@ -460,6 +477,72 @@ The split between static and dynamic data is:
 Dynamic dimensions must not be emitted as `tl.constexpr`. Doing so would turn
 runtime tensor shapes into Triton specialization keys and break shape-bucket
 execution semantics.
+
+## Affine Views and Function ABI
+
+Storage-preserving `Reshape` and `Bitcast` are view operations, not compute
+operators. Their lowering is target-independent until the final TIR buffer
+alias is created:
+
+```text
+Reshape / Bitcast
+  -> AffineView(source type, result type, common-domain transform)
+  -> compose into compatible Grid reads when exact
+  -> explicit TIR.Buffer alias when composition is not exact
+  -> bufferize/codegen with no view kernel and no copy
+```
+
+`AffineViewTransform` contains a source map and a result map over one common
+affine domain. Construction and verification enforce:
+
+- ranked tensor or distributed tensor source/result types;
+- equal physical byte size;
+- no partial distributed values;
+- compatible placement;
+- for distributed-to-distributed views, every physical shard maps to the same
+  symbolic common-domain region on both sides, including non-uniform tail
+  shards and vector lane width changes;
+- explicit singleton-axis projection for dimension insertion/removal;
+- byte-aligned dtype reinterpretation and a contiguous reshaped suffix.
+
+The composition pass is deliberately exact. A view is folded into a Grid read
+only when dtype, rank, distribution, and affine domain permit direct access-map
+composition. Rank-changing or full-suffix reshapes remain explicit aliases.
+TIR selection lowers those aliases to `TIR.Buffer` values sharing the original
+`PhysicalBuffer` and `MemSpan`; no `TIR.NTT.Reshape`, `TIR.NTT.Bitcast`,
+memcopy, or backend template is permitted. `AffineView` must not remain after
+TIR selection.
+
+`PrimFunction` has two distinct result concepts:
+
+- output parameters are physical storage allocated by the caller;
+- `PrimFunction.Results` is the ordered list of logical result buffers/views
+  and the input/output ABI storage that owns their bytes.
+
+A direct TIR `PrimFunction` call remains an imperative `Unit` expression. Its
+logical results are exposed only through `PrimFunctionWrapper` before wrapper
+removal and through the explicit result bindings after lowering. This keeps
+TIR control-flow bodies statement-typed while preserving tuple and alias
+results without copies.
+
+TIR selection promotes full-span internal result storage to caller-allocated
+output storage. A partial internal view is rejected unless an owning pass has
+inserted an explicit materialization. Input-backed and in-place results require
+no output allocation. At a callee call site, the caller reconstructs each
+logical result view from the callee descriptor and the bound storage argument.
+
+PyNTT serializes this ABI directly:
+
+- `FunctionSpec.inputs`: input storage parameters;
+- `FunctionSpec.outputs`: caller-allocated output storage parameters;
+- `FunctionSpec.results`: ordered logical results with `source`,
+  `source_index`, dtype, shape, strides, and `offset_bytes`.
+
+The runtime allocates only `outputs`. After execution it materializes `results`
+as zero-copy `torch.Tensor` views over their input/output storage using the
+generated dtype, shape, strides, and byte offset. This distinction is required
+for root reshape/bitcast results, in-place object results such as KV cache, and
+tuple-returning internal functions.
 
 ## Triton Backend
 

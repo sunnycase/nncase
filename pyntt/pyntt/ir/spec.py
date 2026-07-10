@@ -33,6 +33,26 @@ class TensorSpec:
 
 
 @dataclass(frozen=True)
+class TensorResultSpec:
+    """Logical tensor result backed by an input or caller-allocated output."""
+
+    tensor: TensorSpec
+    source: str
+    source_index: int
+    offset_bytes: DimExpr = 0
+
+    def __post_init__(self):
+        if self.source not in ("input", "output"):
+            raise ValueError(
+                f"Tensor result source must be 'input' or 'output', got {self.source!r}."
+            )
+        if self.source_index < 0:
+            raise ValueError(
+                f"Tensor result source_index must be non-negative, got {self.source_index}."
+            )
+
+
+@dataclass(frozen=True)
 class ShapeBinding:
     """Bind one dynamic dimension variable to a runtime input shape axis."""
 
@@ -50,15 +70,17 @@ class FunctionSpec:
     name: str
     module_kind: str
     is_entry: bool
+    inputs: tuple[TensorSpec, ...]
+    outputs: tuple[TensorSpec, ...]
+    results: tuple[TensorResultSpec, ...]
     parameters: tuple[str, ...] = ()
-    inputs: tuple[TensorSpec, ...] = ()
-    outputs: tuple[TensorSpec, ...] = ()
     shape_bindings: tuple[ShapeBinding, ...] = ()
 
     def __post_init__(self):
         inputs = _as_tuple(self.inputs)
         object.__setattr__(self, "inputs", inputs)
         object.__setattr__(self, "outputs", _as_tuple(self.outputs))
+        object.__setattr__(self, "results", _as_tuple(self.results))
         object.__setattr__(self, "shape_bindings", _as_tuple(self.shape_bindings))
 
         parameters = _as_tuple(self.parameters)

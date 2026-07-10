@@ -449,8 +449,9 @@ internal sealed class ScriptPrintVisitor : ExprFunctor<IPrintSymbol, string>
         // 1. Function signature
         _scope.IndWrite($"T.PrimFunc(\"{expr.Name}\", {string.Join(", ", expr.Parameters.ToArray().Select(Visit))}).Body");
 
-        // 2. Function body
-        _scope.AppendLine(VisitTypeSequential(expr.Body, VisitType(expr.CheckedType)).ToString());
+        // 2. Function body and explicit logical result bindings.
+        var printableBody = new Sequential(expr.Body.Fields.ToArray().Append<Expr>(expr.Results).ToArray());
+        _scope.AppendLine(VisitTypeSequential(printableBody, VisitType(expr.CheckedType)).ToString());
 
         doc = new(_scope.Pop().ToString(), expr.Name, true);
         _exprMemo.Add(expr, doc);

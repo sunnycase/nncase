@@ -15,6 +15,5 @@ internal class DistributedModule : IApplicationPart
     {
         registrator.RegisterManyInterface<BoxingEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<ForceBoxingEvaluator>(reuse: Reuse.Singleton);
-        registrator.RegisterManyInterface<ShardedViewEvaluator>(reuse: Reuse.Singleton);
     }
 }

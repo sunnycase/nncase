@@ -57,15 +57,15 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
 
     protected override Unit VisitPrimFunction(PrimFunction expr)
     {
-        var outputs = GetOutputInfos(expr);
-        if (outputs.Length == 0)
-        {
-            throw new NotSupportedException($"PyNTT PrimFunction {expr.Name} does not have tensor outputs.");
-        }
-
         if (!ContainsOwnKernelWork(expr.Body))
         {
             return default;
+        }
+
+        var outputs = GetOutputInfos(expr);
+        if (outputs.Length == 0)
+        {
+            throw new NotSupportedException($"PyNTT PrimFunction {expr.Name} contains kernel work but does not have caller-allocated tensor output storage.");
         }
 
         AddPrimFunctionKernel(expr, expr.Body, outputs);
@@ -432,7 +432,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
 
         private void RegisterInOutObjectOutputAliases()
         {
-            var outputs = _currentFunction.GetAbiView().Outputs;
+            var outputs = _currentFunction.GetAbiView().OutputParameters;
             for (var outputIndex = 0; outputIndex < outputs.Count; outputIndex++)
             {
                 var output = outputs[outputIndex];
@@ -668,12 +668,6 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 case Nncase.TIR.NTT.Transpose transpose:
                     VisitTranspose(transpose, args);
                     break;
-                case Nncase.TIR.NTT.Bitcast bitcast:
-                    VisitBitcast(bitcast, args);
-                    break;
-                case Nncase.TIR.NTT.Reshape reshape:
-                    VisitReshape(reshape, args);
-                    break;
                 case Nncase.TIR.NTT.Matmul matmul:
                     VisitMatmul(matmul, args);
                     break;
@@ -775,7 +769,6 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             }
 
             var callArguments = BuildDeviceFunctionInvocationArguments(callee, args, definition.Definition);
-            SetComputeOp("function_call");
             WriteTraceMarker($"begin_function:{traceLabel}");
             WriteControlLine(BuildDeviceFunctionCallPlaceholder(definition.Definition.Name, callArguments));
             WriteTraceMarker($"end_function:{traceLabel}");
@@ -1167,7 +1160,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             }
 
             var parameters = callee.Parameters.ToArray();
-            var outputs = PyNTTFunctionOutputs.GetOutputs(callee);
+            var outputs = PyNTTFunctionOutputs.GetOutputParameters(callee);
             foreach (var pair in definition.BuildResult.FormalObjectOutputAliases)
             {
                 if ((uint)pair.Key >= (uint)outputs.Length)
@@ -1200,7 +1193,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
         private void TrackPrimFunctionCallTensorOutputs(PrimFunction callee, IReadOnlyList<BaseExpr> args)
         {
             var parameters = callee.Parameters.ToArray();
-            foreach (var outputParameter in PyNTTFunctionOutputs.GetOutputs(callee))
+            foreach (var outputParameter in PyNTTFunctionOutputs.GetOutputParameters(callee))
             {
                 if (IsObjectDataType(outputParameter.CheckedDataType))
                 {
@@ -2979,107 +2972,6 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             var sourceShape = GetBufferActiveShape(viewSource.Source);
             return sourceShape.Length == viewSource.Shape.Length &&
                 sourceShape.Zip(viewSource.Shape).All(pair => SameDim(pair.First, pair.Second));
-        }
-
-        private void VisitReshape(Nncase.TIR.NTT.Reshape reshape, IReadOnlyList<BaseExpr> args)
-        {
-            if (args.Count < 2 ||
-                args[0] is not TIR.Buffer input ||
-                args[1] is not TIR.Buffer output)
-            {
-                throw new NotSupportedException("PyNTT Reshape codegen expects input and output TIR buffers.");
-            }
-
-            SetComputeOp("reshape");
-            var inputShape = GetBufferActiveShape(input);
-            var outputShape = GetBufferActiveShape(output);
-            var inputVectorLaneCount = GetVectorLaneElementCount(input.ElemType);
-            var outputVectorLaneCount = GetVectorLaneElementCount(output.ElemType);
-            if (input.ElemType != output.ElemType)
-            {
-                throw new NotSupportedException($"PyNTT Reshape must preserve dtype and lanes, got input={input.ElemType}, output={output.ElemType}.");
-            }
-
-            ValidateMatchingFixedScalarElementCount(
-                "PyNTT Reshape local buffers",
-                inputShape,
-                inputVectorLaneCount,
-                outputShape,
-                outputVectorLaneCount);
-
-            _attrs["op"] = "reshape";
-            _attrs["tir"] = true;
-            _attrs["input_dtype"] = GetPyNTTScalarDTypeName(input.ElemType);
-            _attrs["output_dtype"] = GetPyNTTScalarDTypeName(output.ElemType);
-            _attrs["shape"] = outputShape;
-
-            var helperName = GetNextHelperName("reshape_compute");
-            WriteHelperTemplate(
-                "triton/kernels/Reshape.py.jinja",
-                new PyNTTReshapeTemplateModel(
-                    helperName,
-                    GetBufferScalarPointer(input),
-                    GetBufferScalarPointer(output),
-                    GetPyNTTScalarDTypeName(input.ElemType),
-                    GetPyNTTScalarDTypeName(output.ElemType),
-                    GetScalarTritonDType(input.ElemType),
-                    GetScalarTritonDType(output.ElemType),
-                    inputShape,
-                    outputShape,
-                    GetBufferStrides(input),
-                    GetBufferStrides(output),
-                    inputVectorLaneCount,
-                    outputVectorLaneCount,
-                    $"{input.Name} -> {output.Name}"));
-            WriteLine(BuildHelperCall(helperName));
-        }
-
-        private void VisitBitcast(Nncase.TIR.NTT.Bitcast bitcast, IReadOnlyList<BaseExpr> args)
-        {
-            if (args.Count < 2 ||
-                args[0] is not TIR.Buffer input ||
-                args[1] is not TIR.Buffer output)
-            {
-                throw new NotSupportedException("PyNTT Bitcast codegen expects input and output TIR buffers.");
-            }
-
-            SetComputeOp("bitcast");
-            var inputShape = GetBufferActiveShape(input);
-            var outputShape = GetBufferActiveShape(output);
-            var inputVectorLaneCount = GetVectorLaneElementCount(input.ElemType);
-            var outputVectorLaneCount = GetVectorLaneElementCount(output.ElemType);
-            if (GetScalarDataType(input.ElemType) != GetScalarDataType(output.ElemType))
-            {
-                throw new NotSupportedException($"PyNTT Bitcast only supports lane reinterpretation of one scalar dtype, got input={input.ElemType}, output={output.ElemType}.");
-            }
-
-            ValidateSameShape("PyNTT Bitcast local output", outputShape, GetBitcastShape(inputShape, input.ElemType, output.ElemType));
-
-            _attrs["op"] = "bitcast";
-            _attrs["tir"] = true;
-            _attrs["input_dtype"] = GetPyNTTScalarDTypeName(input.ElemType);
-            _attrs["output_dtype"] = GetPyNTTScalarDTypeName(output.ElemType);
-            _attrs["shape"] = outputShape;
-
-            var helperName = GetNextHelperName("bitcast_compute");
-            WriteHelperTemplate(
-                "triton/kernels/Bitcast.py.jinja",
-                new PyNTTBitcastTemplateModel(
-                    helperName,
-                    GetBufferScalarPointer(input),
-                    GetBufferScalarPointer(output),
-                    GetPyNTTScalarDTypeName(input.ElemType),
-                    GetPyNTTScalarDTypeName(output.ElemType),
-                    GetScalarTritonDType(input.ElemType),
-                    GetScalarTritonDType(output.ElemType),
-                    inputShape,
-                    outputShape,
-                    GetBufferStrides(input),
-                    GetBufferStrides(output),
-                    inputVectorLaneCount,
-                    outputVectorLaneCount,
-                    $"{input.Name} -> {output.Name}"));
-            WriteLine(BuildHelperCall(helperName));
         }
 
         private void VisitMatmul(Nncase.TIR.NTT.Matmul matmul, IReadOnlyList<BaseExpr> args)
@@ -8017,55 +7909,6 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             })
             .ToArray();
 
-    private static PyNTTDimExpression[] GetBitcastShape(IReadOnlyList<PyNTTDimExpression> inputShape, DataType inputType, DataType outputType)
-    {
-        var inputBytes = inputType.SizeInBytes;
-        var outputBytes = outputType.SizeInBytes;
-        if (inputBytes <= 0 || outputBytes <= 0)
-        {
-            throw new NotSupportedException($"PyNTT Bitcast requires byte-addressable input/output dtypes, got input={inputType}, output={outputType}.");
-        }
-
-        if (inputBytes == outputBytes)
-        {
-            return inputShape.ToArray();
-        }
-
-        if (inputShape.Count == 0)
-        {
-            if (inputBytes < outputBytes || inputBytes % outputBytes != 0)
-            {
-                throw new NotSupportedException($"PyNTT Bitcast cannot reinterpret scalar {inputType} as {outputType}.");
-            }
-
-            var extent = inputBytes / outputBytes;
-            var text = extent.ToString(CultureInfo.InvariantCulture);
-            return new[] { new PyNTTDimExpression(text, text, extent) };
-        }
-
-        var outputShape = inputShape.ToArray();
-        if (inputBytes > outputBytes)
-        {
-            if (inputBytes % outputBytes != 0)
-            {
-                throw new NotSupportedException($"PyNTT Bitcast input element size {inputBytes} is not divisible by output element size {outputBytes}.");
-            }
-
-            outputShape[^1] = MultiplyDim(outputShape[^1], inputBytes / outputBytes);
-        }
-        else
-        {
-            if (outputBytes % inputBytes != 0)
-            {
-                throw new NotSupportedException($"PyNTT Bitcast output element size {outputBytes} is not divisible by input element size {inputBytes}.");
-            }
-
-            outputShape[^1] = FloorDivDim(outputShape[^1], outputBytes / inputBytes);
-        }
-
-        return outputShape;
-    }
-
     private static int[] NormalizeLayoutAxes(IRArray<int> axes, int rank, string context)
     {
         var normalizedAxes = axes.IsDefaultOrEmpty
@@ -8502,7 +8345,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
 
     private static OutputInfo[] GetOutputInfos(BaseFunction function)
     {
-        return BuildOutputInfos(PyNTTFunctionOutputs.GetOutputs(function));
+        return BuildOutputInfos(PyNTTFunctionOutputs.GetOutputParameters(function));
     }
 
     private static OutputInfo[] BuildOutputInfos(IEnumerable<BufferVar> outputs)

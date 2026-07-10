@@ -13,6 +13,8 @@ namespace Nncase.IR.F;
 
 public static class Affine
 {
+    public static Call View(Expr input, IRType newType, AffineViewTransform transform) => new(new AffineView(newType, transform), input);
+
     public static AffineDim Dim(int position) => new AffineDim(position);
 
     public static AffineDim[] Dims(int count) => Enumerable.Range(0, count).Select(Dim).ToArray();

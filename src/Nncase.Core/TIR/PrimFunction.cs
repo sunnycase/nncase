@@ -28,8 +28,17 @@ public sealed class PrimFunction : BaseFunction
     /// <param name="moduleKind">module kind.</param>
     /// <param name="parameters">Arguments.</param>
     /// <param name="body">Body.</param>
+    /// <param name="results">Ordered logical results.</param>
+    public PrimFunction(string name, string moduleKind, Sequential body, Return results, ReadOnlySpan<IVar> parameters)
+        : base(name, moduleKind, new BaseExpr[] { body, results }.Concat(SpanUtility.UnsafeCast<IVar, BaseExpr>(parameters).ToArray()).ToArray())
+    {
+    }
+
+    /// <summary>
+    /// Initializes a new instance of the <see cref="PrimFunction"/> class with no logical results.
+    /// </summary>
     public PrimFunction(string name, string moduleKind, Sequential body, ReadOnlySpan<IVar> parameters)
-        : base(name, moduleKind, ArrayUtility.Concat(body, SpanUtility.UnsafeCast<IVar, BaseExpr>(parameters)))
+        : this(name, moduleKind, body, new Return(Array.Empty<Expr>()), parameters)
     {
     }
 
@@ -39,17 +48,33 @@ public sealed class PrimFunction : BaseFunction
     /// <param name="moduleKind">module kind.</param>
     /// <param name="parameters">Arguments.</param>
     /// <param name="body">Body.</param>
+    /// <param name="results">Ordered logical results.</param>
+    public PrimFunction(string moduleKind, Sequential body, Return results, ReadOnlySpan<IVar> parameters)
+        : this($"primfunc_{_globalFuncIndex++}", moduleKind, body, results, parameters)
+    {
+    }
+
+    /// <summary>
+    /// Initializes a new instance of the <see cref="PrimFunction"/> class with no logical results.
+    /// </summary>
     public PrimFunction(string moduleKind, Sequential body, ReadOnlySpan<IVar> parameters)
-        : this($"primfunc_{_globalFuncIndex++}", moduleKind, body, parameters)
+        : this(moduleKind, body, new Return(Array.Empty<Expr>()), parameters)
     {
     }
 
     /// <summary>
     /// Initializes a new instance of the <see cref="PrimFunction"/> class.
-    /// build function.
+    /// </summary>
+    public PrimFunction(string moduleKind, Sequential body, Return results, params IVar[] parameters)
+        : this($"primfunc_{_globalFuncIndex++}", moduleKind, body, results, new(parameters))
+    {
+    }
+
+    /// <summary>
+    /// Initializes a new instance of the <see cref="PrimFunction"/> class with no logical results.
     /// </summary>
     public PrimFunction(string moduleKind, Sequential body, params IVar[] parameters)
-        : this($"primfunc_{_globalFuncIndex++}", moduleKind, body, new(parameters))
+        : this(moduleKind, body, new Return(Array.Empty<Expr>()), parameters)
     {
     }
 
@@ -58,7 +83,12 @@ public sealed class PrimFunction : BaseFunction
     /// </summary>
     public Sequential Body => (Sequential)Operands[0];
 
-    public ReadOnlySpan<IVar> Parameters => SpanUtility.UnsafeCast<BaseExpr, IVar>(Operands.Slice(1));
+    /// <summary>
+    /// Gets the ordered logical results.
+    /// </summary>
+    public Return Results => (Return)Operands[1];
+
+    public ReadOnlySpan<IVar> Parameters => SpanUtility.UnsafeCast<BaseExpr, IVar>(Operands.Slice(2));
 
     public override IEnumerable<IRType> ParameterTypes => Parameters.AsValueEnumerable().Select(x => ((BaseExpr)x).CheckedType).ToArray();
 
@@ -68,11 +98,11 @@ public sealed class PrimFunction : BaseFunction
 
     public override BaseFunction With(string? name = null, string? moduleKind = null)
     {
-        return new PrimFunction(name ?? Name, moduleKind ?? ModuleKind, Body, Parameters);
+        return new PrimFunction(name ?? Name, moduleKind ?? ModuleKind, Body, Results, Parameters);
     }
 
-    public PrimFunction With(string? name = null, string? moduleKind = null, Sequential? body = null, IVar[]? parameters = null, Schedule.SchedFunctionResult? sched = null)
-        => new PrimFunction(name ?? Name, moduleKind ?? ModuleKind, body ?? Body, parameters ?? Parameters)
+    public PrimFunction With(string? name = null, string? moduleKind = null, Sequential? body = null, Return? results = null, IVar[]? parameters = null, Schedule.SchedFunctionResult? sched = null)
+        => new PrimFunction(name ?? Name, moduleKind ?? ModuleKind, body ?? Body, results ?? Results, parameters ?? Parameters)
         {
             // note maybe add SchedResult into ctor.
             SchedResult = sched ?? SchedResult,

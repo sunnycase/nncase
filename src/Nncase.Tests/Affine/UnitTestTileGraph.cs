@@ -11,6 +11,7 @@ using Nncase.IR;
 using Nncase.Passes;
 using Nncase.Passes.Transforms;
 using Nncase.Schedule.TileGraph;
+using Nncase.TIR;
 using QuikGraph;
 using QuikGraph.Graphviz;
 using Xunit;
@@ -88,28 +89,158 @@ public sealed class UnitTestTileGraph : TestClassBase
         var function = new Function("main", Targets.CPUTarget.Kind, reshape, [input]);
 
         var post = Assert.IsType<Function>(new NTTAffineSelectionPass(CompileOptions).RunAsync(function, new()).Result);
-        var grid = Assert.IsType<IR.Affine.Grid>(post.Body);
-        Assert.Equal(1, grid.Body.Fields.Length);
-        var bodyCall = Assert.IsType<Call>(grid.Body.Fields[0]);
-        var reshapeKernel = Assert.IsType<TIR.NTT.Reshape>(bodyCall.Target);
-        Assert.Equal(vectorType, bodyCall.Arguments[0].CheckedDataType);
-        Assert.Equal(vectorType, bodyCall.Arguments[1].CheckedDataType);
+        var viewCall = Assert.IsType<Call>(post.Body);
+        var view = Assert.IsType<IR.Affine.AffineView>(viewCall.Target);
+        Assert.Same(input, viewCall.Arguments[IR.Affine.AffineView.Input.Index]);
+        Assert.Equal(vectorType, viewCall.CheckedDataType);
+        Assert.Equal(input.CheckedShape.Rank, view.Transform.SourceMap.Results.Length);
+        Assert.Equal(viewCall.CheckedShape.Rank, view.Transform.ResultMap.Results.Length);
     }
 
     [Fact]
-    public void TestBitcastAffineSelectionUsesDedicatedLaneReinterpretationKernel()
+    public void TestBitcastAffineSelectionUsesZeroCopyAffineView()
     {
         var input = new Var("input", new TensorType(new VectorType(DataTypes.BFloat16, [8]), new[] { 20, 128 }));
         var bitcast = IR.F.Tensors.Bitcast(input, DataTypes.BFloat16);
         var function = new Function("main", Targets.CPUTarget.Kind, bitcast, [input]);
 
         var post = Assert.IsType<Function>(new NTTAffineSelectionPass(CompileOptions).RunAsync(function, new()).Result);
-        var grid = Assert.IsType<IR.Affine.Grid>(post.Body);
-        Assert.Equal(1, grid.Body.Fields.Length);
-        var bodyCall = Assert.IsType<Call>(grid.Body.Fields[0]);
-        var bitcastKernel = Assert.IsType<TIR.NTT.Bitcast>(bodyCall.Target);
-        Assert.Equal(new VectorType(DataTypes.BFloat16, [8]), bodyCall.Arguments[0].CheckedDataType);
-        Assert.Equal(DataTypes.BFloat16, bodyCall.Arguments[1].CheckedDataType);
+        var viewCall = Assert.IsType<Call>(post.Body);
+        var view = Assert.IsType<IR.Affine.AffineView>(viewCall.Target);
+        Assert.Same(input, viewCall.Arguments[IR.Affine.AffineView.Input.Index]);
+        Assert.Equal(new VectorType(DataTypes.BFloat16, [8]), input.CheckedDataType);
+        Assert.Equal(DataTypes.BFloat16, viewCall.CheckedDataType);
+        Assert.Equal(input.CheckedShape.Rank, view.Transform.SourceMap.Results.Length);
+        Assert.Equal(viewCall.CheckedShape.Rank, view.Transform.ResultMap.Results.Length);
+    }
+
+    [Fact]
+    public void TestSingletonReshapePreservesDistributedShardRegions()
+    {
+        var placement = new Placement([4, 8], "yx", "bb");
+        var dataType = new VectorType(DataTypes.Float32, [2, 8]);
+        var source = new DistributedType(
+            new TensorType(dataType, new[] { 20, 8 }),
+            new SBP[] { SBP.B, SBP.S([1], 1) },
+            placement);
+        var result = new DistributedType(
+            new TensorType(dataType, new[] { 20, 1, 8 }),
+            new SBP[] { SBP.B, SBP.B, SBP.S([1], 1) },
+            placement);
+
+        Assert.True(IR.Affine.AffineViewUtility.TryCreate(source, result, out var transform));
+        Assert.Null(IR.Affine.AffineViewUtility.Verify(source, result, transform));
+        Assert.Equal(2, transform.SourceMap.Domains.Length);
+        Assert.Equal(2, transform.SourceMap.Results.Length);
+        Assert.Equal(3, transform.ResultMap.Results.Length);
+        Assert.Equal(0, Assert.IsType<IR.Affine.AffineConstant>(transform.ResultMap.Results[1].Offset).Value);
+        Assert.Equal(1, Assert.IsType<IR.Affine.AffineConstant>(transform.ResultMap.Results[1].Extent).Value);
+    }
+
+    [Fact]
+    public void TestVectorBitcastRejectsByteIncompatibleShardGranularity()
+    {
+        var placement = new Placement([8], "b", "b");
+        var source = new DistributedType(
+            new TensorType(new VectorType(DataTypes.BFloat16, [8]), new[] { 4, 8 }),
+            new SBP[] { SBP.B, SBP.S([0], 1) },
+            placement);
+        var incompatibleResult = new DistributedType(
+            new TensorType(DataTypes.BFloat16, new[] { 4, 64 }),
+            new SBP[] { SBP.B, SBP.S([0], 1) },
+            placement);
+        var compatibleResult = new DistributedType(
+            new TensorType(DataTypes.BFloat16, new[] { 4, 64 }),
+            new SBP[] { SBP.B, SBP.S([0], 8) },
+            placement);
+
+        Assert.False(IR.Affine.AffineViewUtility.TryCreate(source, incompatibleResult, out _));
+        Assert.True(IR.Affine.AffineViewUtility.TryCreate(source, compatibleResult, out var transform));
+        Assert.Null(IR.Affine.AffineViewUtility.Verify(source, compatibleResult, transform));
+    }
+
+    [Fact]
+    public async Task TestPointwiseAffineViewComposesIntoGridRead()
+    {
+        var input = new Var("input", new TensorType(DataTypes.Float32, new[] { 4, 4 }));
+        var view = IR.F.Affine.View(input, input.CheckedType, IR.Affine.AffineViewTransform.Identity(input.CheckedShape));
+        var unary = IR.F.Math.Unary(UnaryOp.Neg, view);
+        var function = new Function("main", Targets.CPUTarget.Kind, unary, [input]);
+
+        var selected = Assert.IsType<Function>(await new NTTAffineSelectionPass(CompileOptions).RunAsync(function, new()));
+        var selectedGrid = Assert.IsType<IR.Affine.Grid>(selected.Body);
+        Assert.IsType<IR.Affine.AffineView>(Assert.IsType<Call>(selectedGrid.Reads[0]).Target);
+
+        var composed = Assert.IsType<Function>(await new AffineViewCompositionPass(Targets.CPUTarget.Kind).RunAsync(selected, new()));
+        var composedGrid = Assert.IsType<IR.Affine.Grid>(composed.Body);
+        Assert.Same(input, composedGrid.Reads[0]);
+        Assert.DoesNotContain(ExprCollector.Collect(composed.Body).OfType<Call>(), call => call.Target is IR.Affine.AffineView);
+    }
+
+    [Fact]
+    public async Task TestRankChangingAffineViewRemainsExplicitAliasBoundary()
+    {
+        var input = new Var("input", new TensorType(DataTypes.Float32, new[] { 16 }));
+        var reshape = IR.F.Tensors.Reshape(input, new Dimension[] { 4, 4 });
+        var unary = IR.F.Math.Unary(UnaryOp.Neg, reshape);
+        var function = new Function("main", Targets.CPUTarget.Kind, unary, [input]);
+
+        var selected = Assert.IsType<Function>(await new NTTAffineSelectionPass(CompileOptions).RunAsync(function, new()));
+        var composed = Assert.IsType<Function>(await new AffineViewCompositionPass(Targets.CPUTarget.Kind).RunAsync(selected, new()));
+        var grid = Assert.IsType<IR.Affine.Grid>(composed.Body);
+        Assert.IsType<IR.Affine.AffineView>(Assert.IsType<Call>(grid.Reads[0]).Target);
+    }
+
+    [Fact]
+    public async Task TestFullSuffixReshapeRemainsExplicitAliasBoundary()
+    {
+        var input = new Var("input", new TensorType(DataTypes.Float32, new[] { 4, 4 }));
+        var reshape = IR.F.Tensors.Reshape(input, new Dimension[] { 2, 8 });
+        var unary = IR.F.Math.Unary(UnaryOp.Neg, reshape);
+        var function = new Function("main", Targets.CPUTarget.Kind, unary, [input]);
+
+        var selected = Assert.IsType<Function>(await new NTTAffineSelectionPass(CompileOptions).RunAsync(function, new()));
+        var composed = Assert.IsType<Function>(await new AffineViewCompositionPass(Targets.CPUTarget.Kind).RunAsync(selected, new()));
+        var grid = Assert.IsType<IR.Affine.Grid>(composed.Body);
+        Assert.IsType<IR.Affine.AffineView>(Assert.IsType<Call>(grid.Reads[0]).Target);
+    }
+
+    [Fact]
+    public async Task TestRootAffineViewLowersToInputBackedPrimFunctionResult()
+    {
+        var input = new Var("input", new TensorType(DataTypes.Float32, new[] { 4, 4 }));
+        var reshape = IR.F.Tensors.Reshape(input, new Dimension[] { 2, 8 });
+        var function = new Function("main", Targets.CPUTarget.Kind, reshape, [input]);
+        var selected = Assert.IsType<Function>(await new NTTAffineSelectionPass(CompileOptions).RunAsync(function, new()));
+
+        var lowered = Assert.IsType<TIR.PrimFunction>(await new NTTTIRSelectionPass(CompileOptions).RunAsync(selected, new()));
+        var abi = lowered.GetAbiView();
+        Assert.Empty(abi.OutputParameters);
+        var result = Assert.Single(abi.Results);
+        Assert.Same(Assert.Single(abi.Inputs), result.Storage);
+        Assert.DoesNotContain(ExprCollector.Collect(lowered.Body).OfType<Call>(), call => call.Target is TIR.Memcopy);
+    }
+
+    [Fact]
+    public async Task TestAffineViewEliminatesUnobservedDistributedRoundTrip()
+    {
+        var sourceType = new TensorType(DataTypes.Float32, new[] { 4, 4 });
+        var resultType = new TensorType(DataTypes.Float32, new[] { 2, 8 });
+        var placement = new Placement(new[] { 2 }, "b", "b");
+        var distributedSourceType = new DistributedType(sourceType, new SBP[] { SBP.B, SBP.B }, placement);
+        var distributedResultType = new DistributedType(resultType, new SBP[] { SBP.B, SBP.B }, placement);
+        var input = new Var("input", sourceType);
+        var distributedInput = IR.F.Distributed.Boxing(input, distributedSourceType);
+        Assert.True(IR.Affine.AffineViewUtility.TryCreate(distributedSourceType, distributedResultType, out var transform));
+        var distributedView = IR.F.Affine.View(distributedInput, distributedResultType, transform);
+        var output = IR.F.Distributed.Boxing(distributedView, resultType);
+        var function = new Function("main", Targets.CPUTarget.Kind, output, [input]);
+
+        var rewritten = Assert.IsType<Function>(await new AffineViewCompositionPass(Targets.CPUTarget.Kind).RunAsync(function, new()));
+        var viewCall = Assert.IsType<Call>(rewritten.Body);
+        Assert.IsType<IR.Affine.AffineView>(viewCall.Target);
+        Assert.Same(input, viewCall.Arguments[IR.Affine.AffineView.Input.Index]);
+        Assert.DoesNotContain(ExprCollector.Collect(rewritten.Body).OfType<Call>(), call => call.Target is IR.Distributed.Boxing);
     }
 
     [Fact]

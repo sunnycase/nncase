@@ -50,7 +50,6 @@
 #endif
 
 #include "kernels/binary.h"
-#include "kernels/bitcast.h"
 #include "kernels/cast.h"
 #include "kernels/clamp.h"
 #include "kernels/compare.h"
@@ -72,7 +71,6 @@
 #include "kernels/range.h"
 #include "kernels/reduce.h"
 #include "kernels/reduce_arg.h"
-#include "kernels/reshape.h"
 #include "kernels/resize_image.h"
 #include "kernels/rms_norm.h"
 #include "kernels/rope.h"

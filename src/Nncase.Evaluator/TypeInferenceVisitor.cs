@@ -226,9 +226,10 @@ internal sealed partial class TypeInferenceVisitor : ExprVisitor<IRType, Unit>
         }
 
         VerifySubField(expr, expr.Body);
+        VerifySubField(expr, expr.Results);
 
         var paramTypes = expr.Parameters.AsValueEnumerable().Select(x => x.CheckedType).ToArray();
-        var type = new CallableType(expr.Body.CheckedType, ImmutableArray.Create(paramTypes));
+        var type = new CallableType(TupleType.Void, ImmutableArray.Create(paramTypes));
         return type;
     }
 

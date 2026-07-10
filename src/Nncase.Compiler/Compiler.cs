@@ -365,6 +365,7 @@ public class Compiler : ICompiler
 
         foreach (var moduleCompiler in _compileSession.Target.ModuleCompilers)
         {
+            passManager.AddWithName<AffineViewCompositionPass>($"AffineViewComposition_{moduleCompiler.ModuleKind}", moduleCompiler.ModuleKind);
             passManager.AddWithName<AutoTilePass>($"AutoTiling_{moduleCompiler.ModuleKind}", moduleCompiler.ModuleKind);
         }
 

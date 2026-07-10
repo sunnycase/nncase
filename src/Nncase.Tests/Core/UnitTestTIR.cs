@@ -151,18 +151,30 @@ public sealed class UnitTestTIR
     }
 
     [Fact]
-    public void TestPrimFunctionInOutAbiIsBothInputAndOutput()
+    public void TestPrimFunctionInOutAbiUsesExplicitResult()
     {
         var objectType = TensorType.Scalar(new ReferenceType(DataTypes.Int32));
         var inOut = new BufferVar("state", objectType, BufferVarRole.InOut, MemoryLocation.Input);
-        var primFunction = new PrimFunction("inout", "cpu", new Sequential(), new IVar[] { inOut });
+        var primFunction = new PrimFunction("inout", "cpu", new Sequential(), new Return(new Expr[] { inOut }), new IVar[] { inOut });
         var abi = primFunction.GetAbiView();
 
         Assert.Same(inOut, Assert.Single(abi.Inputs));
-        Assert.Same(inOut, Assert.Single(abi.Outputs));
+        Assert.Empty(abi.OutputParameters);
+        var result = Assert.Single(abi.Results);
+        Assert.Same(inOut, result.Value);
+        Assert.Same(inOut, result.Storage);
         var wrapper = new PrimFunctionWrapper(primFunction, 1, objectType);
         Assert.Equal(objectType, wrapper.ReturnType);
         Assert.Equal(objectType, Assert.Single(wrapper.ParameterTypes));
+
+        Assert.True(CompilerServices.InferenceType(primFunction));
+        Assert.Equal(TupleType.Void, Assert.IsType<CallableType>(primFunction.CheckedType).ReturnType);
+        var directCall = new Call(primFunction, inOut);
+        Assert.True(CompilerServices.InferenceType(directCall));
+        Assert.Equal(TupleType.Void, directCall.CheckedType);
+        var wrapperCall = new Call(wrapper, inOut);
+        Assert.True(CompilerServices.InferenceType(wrapperCall));
+        Assert.Equal(objectType, wrapperCall.CheckedType);
     }
 
     [Fact]

@@ -9,6 +9,7 @@ using System.Text;
 using System.Threading.Tasks;
 using DryIoc;
 using Nncase.Evaluator;
+using Nncase.Evaluator.Affine;
 using Nncase.Evaluator.Buffers;
 using Nncase.Evaluator.Distributed;
 using Nncase.Evaluator.Imaging;
@@ -35,6 +36,7 @@ public static class EvaluatorApplicationPart
     public static IRegistrator AddEvaluator(this IRegistrator registrator)
     {
         return registrator.RegisterModule<EvaluatorModule>()
+            .RegisterModule<AffineModule>()
             .RegisterModule<BufferModule>()
             .RegisterModule<DistributedModule>()
             .RegisterModule<ImagingModule>()

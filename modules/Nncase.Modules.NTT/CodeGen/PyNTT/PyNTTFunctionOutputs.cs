@@ -8,22 +8,26 @@ namespace Nncase.CodeGen.PyNTT;
 
 internal static class PyNTTFunctionOutputs
 {
-    public static BufferVar[] GetOutputs(BaseFunction function)
+    public static BufferVar[] GetOutputParameters(BaseFunction function)
     {
         if (function is not PrimFunction primFunction)
         {
             throw new NotSupportedException($"PyNTT requires PrimFunction output ABI, got {function.GetType().Name} {function.Name}.");
         }
 
-        var outputs = primFunction.GetAbiView().Outputs.ToArray();
-        if (outputs.Length == 0)
-        {
-            throw new NotSupportedException($"PyNTT PrimFunction {primFunction.Name} does not declare caller-allocated output BufferVar parameters.");
-        }
-
-        return outputs;
+        return primFunction.GetAbiView().OutputParameters.ToArray();
     }
 
-    public static IRType[] GetOutputTypes(BaseFunction function)
-        => GetOutputs(function).Select(output => output.CheckedType).ToArray();
+    public static IRType[] GetOutputParameterTypes(BaseFunction function)
+        => GetOutputParameters(function).Select(output => output.CheckedType).ToArray();
+
+    public static PrimFunctionResultBinding[] GetResults(BaseFunction function)
+    {
+        if (function is not PrimFunction primFunction)
+        {
+            throw new NotSupportedException($"PyNTT requires PrimFunction result ABI, got {function.GetType().Name} {function.Name}.");
+        }
+
+        return primFunction.GetAbiView().Results.ToArray();
+    }
 }

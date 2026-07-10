@@ -22,7 +22,7 @@ BufferRegion,true,false,Default,TIR.,Buffer;@Region
 For,true,false,Default,TIR.,LoopVar;Domain;Body
 IfThenElse,true,false,Default,TIR.,Condition;Then;Else
 Let,true,false,Default,TIR.,Var;Expression;Body
-PrimFunction,true,true,BaseFunction,TIR.,@Parameters;Body
+PrimFunction,true,true,BaseFunction,TIR.,@Parameters;Body;Results
 Sequential,true,false,Default,TIR.,@Fields
 Range,true,false,Default,TIR.,Start;Stop;Step
 IterVar,true,false,Default,TIR.,Value;Dom

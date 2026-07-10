@@ -521,8 +521,12 @@ public sealed class GraphTiler
                 var parameters = inputBidsOrdered.Select(k => result.InputOutputVars[k]).Concat(
                     dynamicDimVars.Select(v => (IVar)v.With())).Concat(
                     callerAllocatedOutputBids.Select(k => result.InputOutputVars[k])).ToArray();
-                var funcBuilder = T.PrimFunc(funcName, moduleKind, parameters).Body(bodyBuilder);
-                var primFunc = funcBuilder.Build();
+                var primFunc = new PrimFunction(
+                    funcName,
+                    moduleKind,
+                    bodyBuilder.Build(),
+                    new Return(outputBidsOrdered.Select(bid => (Expr)result.InputOutputVars[bid]).ToArray()),
+                    parameters);
                 {
                     // note noneed to rewrite shapeof, because we don't use shapeof new.
                     // var gridBufferToVarMap = inputBids.Concat(outputBids).Select(bid => bid.Node.Grid.GetArgument(bid.Index)).Zip(parameters.Where(p => p is not DimVar)).ToDictionary(p => p.First, p => (Expr)p.Second, (IEqualityComparer<Expr>)ReferenceEqualityComparer.Instance);

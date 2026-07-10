@@ -623,44 +623,6 @@ public sealed record PyNTTTransposeTemplateModel(
     public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
 }
 
-public sealed record PyNTTReshapeTemplateModel(
-    string FunctionName,
-    PyNTTBufferPointerTemplateModel Input,
-    PyNTTBufferPointerTemplateModel Output,
-    string InputDType,
-    string OutputDType,
-    string InputTritonDType,
-    string OutputTritonDType,
-    PyNTTDimExpression[] InputShape,
-    PyNTTDimExpression[] OutputShape,
-    PyNTTDimExpression[] InputStrides,
-    PyNTTDimExpression[] OutputStrides,
-    int InputVectorLaneCount,
-    int OutputVectorLaneCount,
-    string Comment)
-{
-    public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
-}
-
-public sealed record PyNTTBitcastTemplateModel(
-    string FunctionName,
-    PyNTTBufferPointerTemplateModel Input,
-    PyNTTBufferPointerTemplateModel Output,
-    string InputDType,
-    string OutputDType,
-    string InputTritonDType,
-    string OutputTritonDType,
-    PyNTTDimExpression[] InputShape,
-    PyNTTDimExpression[] OutputShape,
-    PyNTTDimExpression[] InputStrides,
-    PyNTTDimExpression[] OutputStrides,
-    int InputVectorLaneCount,
-    int OutputVectorLaneCount,
-    string Comment)
-{
-    public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
-}
-
 public sealed record PyNTTMatmulTemplateModel(
     string FunctionName,
     PyNTTBufferPointerTemplateModel Lhs,

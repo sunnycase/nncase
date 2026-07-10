@@ -272,6 +272,45 @@ public static class T
     }
 
     /// <summary>
+    /// Creates a typed tensor view over an existing buffer's physical storage.
+    /// Offsets and sizes are expressed in bytes; strides are expressed in elements
+    /// of <paramref name="elemType"/>.
+    /// </summary>
+    public static Buffer CreateBufferView(
+        Buffer source,
+        DataType elemType,
+        ReadOnlySpan<Dimension> dimensions,
+        ReadOnlySpan<Dimension> strides,
+        Dimension byteOffset,
+        Dimension byteSize,
+        DistributedType? distributedType = null,
+        [CallerArgumentExpression("source")] string name = "")
+    {
+        if (dimensions.Length != strides.Length)
+        {
+            throw new ArgumentException(
+                $"Buffer view rank mismatch: dimensions={dimensions.Length}, strides={strides.Length}.");
+        }
+
+        if (name.StartsWith("var "))
+        {
+            name = name[4..];
+        }
+
+        var memSpan = new MemSpan(
+            source.MemSpan.Buffer,
+            (source.MemSpan.Start + byteOffset).Simplify(),
+            byteSize);
+        return new Buffer(
+            name,
+            elemType,
+            memSpan,
+            dimensions.ToArray(),
+            strides.ToArray(),
+            distributedType);
+    }
+
+    /// <summary>
     /// create buffer by const.
     /// </summary>
     public static Buffer AttachBuffer(TensorConst @const, out Buffer buffer, [CallerArgumentExpression("buffer")] string name = "")

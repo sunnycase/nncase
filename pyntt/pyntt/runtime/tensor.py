@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
-from pyntt.ir import FunctionSpec, TensorSpec
+from pyntt.ir import FunctionSpec, TensorResultSpec, TensorSpec
 from pyntt.runtime.errors import PyNTTArgumentError, PyNTTBackendError
 
 
@@ -147,8 +147,31 @@ def allocate_outputs(
     return tuple(outputs)
 
 
+def materialize_results(
+    function: FunctionSpec,
+    inputs: tuple[Any, ...],
+    outputs: tuple[Any, ...] | list[Any],
+    shape_env: Mapping[str, int] | None = None,
+) -> tuple[Any, ...]:
+    """Create ordered logical result views over ABI input/output storage."""
+    shape_env = shape_env or resolve_shape_env(function, inputs)
+    return tuple(
+        _materialize_result(result, inputs, outputs, shape_env)
+        for result in function.results
+    )
+
+
+def resolve_execution_device(inputs: tuple[Any, ...], outputs: tuple[Any, ...] | list[Any]):
+    """Return the device carried by the first tensor ABI storage value."""
+    for value in (*outputs, *inputs):
+        device = getattr(value, "device", None)
+        if device is not None:
+            return device
+    return "cpu"
+
+
 def view_typed_buffer(storage: Any, offset_bytes: int, size_bytes: int, dtype: str):
-    """Return a typed flat view into byte storage or an already typed tensor."""
+    """Return a zero-copy typed flat view into contiguous tensor storage."""
     torch = _import_torch()
     if not isinstance(storage, torch.Tensor):
         raise PyNTTArgumentError(
@@ -169,31 +192,67 @@ def view_typed_buffer(storage: Any, offset_bytes: int, size_bytes: int, dtype: s
             f"to dtype {dtype} element size {element_size}."
         )
 
-    end = offset_bytes + size_bytes
-    if storage.dtype == torch.uint8:
-        if end > storage.numel():
-            raise PyNTTArgumentError(
-                f"PyNTT typed buffer view [{offset_bytes}, {end}) exceeds storage size {storage.numel()}."
-            )
-
-        byte_view = storage.narrow(0, offset_bytes, size_bytes)
-        return byte_view.view(torch_dtype)
-
-    if storage.dtype != torch_dtype:
-        raise PyNTTArgumentError(
-            f"PyNTT typed buffer view expects uint8 storage or dtype {torch_dtype}, got {storage.dtype}."
-        )
     if not storage.is_contiguous():
         raise PyNTTArgumentError("PyNTT typed tensor view expects contiguous storage.")
-    if end > storage.numel() * element_size:
+
+    byte_storage = storage.reshape(-1).view(torch.uint8).reshape(-1)
+    end = offset_bytes + size_bytes
+    if end > byte_storage.numel():
         raise PyNTTArgumentError(
             f"PyNTT typed buffer view [{offset_bytes}, {end}) exceeds storage size "
-            f"{storage.numel() * element_size} bytes."
+            f"{byte_storage.numel()} bytes."
         )
 
-    start = offset_bytes // element_size
-    length = size_bytes // element_size
-    return storage.reshape(-1).narrow(0, start, length)
+    return byte_storage.narrow(0, offset_bytes, size_bytes).view(torch_dtype)
+
+
+def _materialize_result(
+    result: TensorResultSpec,
+    inputs: tuple[Any, ...],
+    outputs: tuple[Any, ...] | list[Any],
+    shape_env: Mapping[str, int],
+):
+    sources = inputs if result.source == "input" else outputs
+    if result.source_index >= len(sources):
+        raise PyNTTArgumentError(
+            f"Logical result {result.tensor.name} references missing {result.source} "
+            f"storage {result.source_index}."
+        )
+
+    storage = sources[result.source_index]
+    if is_object_spec(result.tensor):
+        return storage
+
+    torch = _import_torch()
+    if not isinstance(storage, torch.Tensor):
+        raise PyNTTArgumentError(
+            f"Logical result {result.tensor.name} expects torch.Tensor storage, "
+            f"got {type(storage).__name__}."
+        )
+
+    shape = _resolve_shape(result.tensor.shape, shape_env)
+    strides = (
+        _contiguous_strides(shape)
+        if result.tensor.strides is None
+        else _resolve_shape(result.tensor.strides, shape_env)
+    )
+    offset_bytes = _resolve_dim(result.offset_bytes, shape_env)
+    torch_dtype = _torch_dtype(torch, result.tensor.dtype)
+    element_size = torch.empty((), dtype=torch_dtype, device=storage.device).element_size()
+    if offset_bytes % element_size != 0:
+        raise PyNTTArgumentError(
+            f"Logical result {result.tensor.name} offset {offset_bytes} is not aligned "
+            f"to dtype {result.tensor.dtype} element size {element_size}."
+        )
+
+    span_elements = _required_span_elements(shape, strides)
+    flat = view_typed_buffer(
+        storage,
+        offset_bytes,
+        span_elements * element_size,
+        result.tensor.dtype,
+    )
+    return torch.as_strided(flat, size=shape, stride=strides)
 
 
 def _validate_tensor(
@@ -582,6 +641,27 @@ def _matches_flat_kv_storage(tensor: Any, topology_shape: tuple[int, ...], block
         and tuple(int(dim) for dim in tensor.shape[:len(topology_shape)]) == topology_shape
         and int(tensor.shape[-1]) == int(block_elements)
     )
+
+
+def _contiguous_strides(shape: tuple[int, ...]) -> tuple[int, ...]:
+    strides = [1] * len(shape)
+    for axis in range(len(shape) - 2, -1, -1):
+        strides[axis] = strides[axis + 1] * shape[axis + 1]
+    return tuple(strides)
+
+
+def _required_span_elements(shape: tuple[int, ...], strides: tuple[int, ...]) -> int:
+    if len(shape) != len(strides):
+        raise PyNTTArgumentError(
+            f"Tensor result shape rank {len(shape)} does not match stride rank {len(strides)}."
+        )
+    if any(dim < 0 for dim in shape) or any(stride < 0 for stride in strides):
+        raise PyNTTArgumentError(
+            f"Tensor result shape and strides must be non-negative, got {shape}/{strides}."
+        )
+    if any(dim == 0 for dim in shape):
+        return 0
+    return 1 + sum((dim - 1) * stride for dim, stride in zip(shape, strides))
 
 
 def _product(shape: tuple[int, ...]) -> int:

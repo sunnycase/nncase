@@ -14,7 +14,7 @@ def test_pyntt_package_imports():
 
     import pyntt
     from pyntt.backends import get_backend
-    from pyntt.ir import FunctionSpec, ModuleSpec, TensorSpec
+    from pyntt.ir import FunctionSpec, ModuleSpec, TensorResultSpec, TensorSpec
     from pyntt.runtime import (
         LocalShard,
         PyNTTInterpreter,
@@ -34,6 +34,13 @@ def test_pyntt_package_imports():
                 True,
                 inputs=(TensorSpec("x", "float32", (1,)),),
                 outputs=(TensorSpec("output0", "float32", (1,), role="output"),),
+                results=(
+                    TensorResultSpec(
+                        TensorSpec("result0", "float32", (1,), role="result"),
+                        "output",
+                        0,
+                    ),
+                ),
             ),
         ),
     )
@@ -63,7 +70,7 @@ def test_pyntt_runtime_validates_torch_inputs_and_allocates_outputs(tmp_path):
     torch = pytest.importorskip("torch")
     _add_pyntt_to_path()
 
-    from pyntt.ir import FunctionSpec, ModuleSpec, TensorSpec
+    from pyntt.ir import FunctionSpec, ModuleSpec, TensorResultSpec, TensorSpec
     from pyntt.runtime import PyNTTArgumentError, PyNTTInterpreter, PyNTTModule
     from pyntt.runtime import allocate_workspace, materialize_rdata, materialize_rdata_table
 
@@ -83,6 +90,13 @@ def test_pyntt_runtime_validates_torch_inputs_and_allocates_outputs(tmp_path):
                         (2, 3),
                         role="output",
                         device="like_input",
+                    ),
+                ),
+                results=(
+                    TensorResultSpec(
+                        TensorSpec("result0", "float32", (2, 3), role="result"),
+                        "output",
+                        0,
                     ),
                 ),
             ),
@@ -136,3 +150,45 @@ def test_pyntt_runtime_validates_torch_inputs_and_allocates_outputs(tmp_path):
     assert rdata_table.dtype == torch.uint8
     assert rdata_table.tolist() == [1, 2]
     assert rdata_table_again.data_ptr() == rdata_table.data_ptr()
+
+
+def test_pyntt_runtime_materializes_zero_copy_input_result_views():
+    torch = pytest.importorskip("torch")
+    _add_pyntt_to_path()
+
+    from pyntt.ir import FunctionSpec, ModuleSpec, TensorResultSpec, TensorSpec
+    from pyntt.runtime import PyNTTModule
+
+    spec = ModuleSpec(
+        name="views",
+        backend="triton",
+        functions=(
+            FunctionSpec(
+                "main",
+                "pyntt",
+                True,
+                inputs=(TensorSpec("x", "float32", (2, 2)),),
+                outputs=(),
+                results=(
+                    TensorResultSpec(
+                        TensorSpec("reshaped", "float32", (4,), role="result"),
+                        "input",
+                        0,
+                    ),
+                    TensorResultSpec(
+                        TensorSpec("bytes", "uint8", (16,), role="result"),
+                        "input",
+                        0,
+                    ),
+                ),
+            ),
+        ),
+    )
+
+    x = torch.arange(4, dtype=torch.float32).reshape(2, 2)
+    reshaped, bytes_view = PyNTTModule(spec)(x)
+    assert reshaped.shape == (4,)
+    assert bytes_view.shape == (16,)
+    assert bytes_view.dtype == torch.uint8
+    assert reshaped.data_ptr() == x.data_ptr()
+    assert bytes_view.data_ptr() == x.data_ptr()

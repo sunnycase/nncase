@@ -30,21 +30,18 @@ public abstract class TIRSelectionPass : FunctionPass
             var callers = func.Users.Where(x => x is Call or If or FunctionWrapper).ToArray();
             var isEntry = callers.Length == 0;
             var visitor = new TIRSelectionVisitor(this);
-            (var newBody, var inBuffers, var outBuffers) = visitor.Select(func);
-            var callerAllocatedOutBuffers = outBuffers
-                .Where(buffer => buffer.Role == BufferVarRole.Output)
-                .Distinct()
-                .ToArray();
-            var parameters = inBuffers.Concat(callerAllocatedOutBuffers).ToArray();
+            var selection = visitor.Select(func);
+            var parameters = selection.InputBuffers.Concat(selection.OutputParameters).ToArray();
 
             if (isEntry)
             {
                 var primFunc = new PrimFunction(
                     $"{input.Name}_prim",
                     ModuleKind,
-                    newBody,
+                    selection.Body,
+                    new Return(selection.Results.ToArray()),
                     parameters);
-                EnsureEntryOutputOrder(primFunc, outBuffers);
+                _ = primFunc.GetAbiView();
                 return Task.FromResult((BaseFunction)primFunc);
             }
             else
@@ -53,10 +50,11 @@ public abstract class TIRSelectionPass : FunctionPass
                 var primFunc = new PrimFunction(
                     $"{input.Name}_prim",
                     ModuleKind,
-                    newBody,
+                    selection.Body,
+                    new Return(selection.Results.ToArray()),
                     parameters);
-                var primWrapper = new PrimFunctionWrapper(input.Name, primFunc, inBuffers.Count);
-                RewriteCallersForPrimFunction(primFunc, outBuffers, callerAllocatedOutBuffers, callers.OfType<Call>());
+                var primWrapper = new PrimFunctionWrapper(input.Name, primFunc, selection.InputBuffers.Count);
+                RewriteCallersForPrimFunction(primFunc, callers.OfType<Call>());
                 return Task.FromResult((BaseFunction)primWrapper);
             }
         }
@@ -75,64 +73,17 @@ public abstract class TIRSelectionPass : FunctionPass
         };
     }
 
-    private static void EnsureEntryOutputOrder(PrimFunction primFunction, IReadOnlyList<BufferVar> logicalOutputs)
-    {
-        var abiOutputs = primFunction.GetAbiView().Outputs;
-        if (abiOutputs.Count != logicalOutputs.Count
-            || !abiOutputs.Zip(logicalOutputs).All(pair => ReferenceEquals(pair.First, pair.Second)))
-        {
-            throw new InvalidOperationException(
-                $"Entry PrimFunction {primFunction.Name} cannot represent its logical output order with the derived buffer ABI.");
-        }
-    }
-
     private void RewriteCallersForPrimFunction(
         PrimFunction primFunction,
-        IReadOnlyList<BufferVar> logicalOutputs,
-        IReadOnlyList<BufferVar> callerAllocatedOutputs,
         IEnumerable<Call> callers)
     {
-        var outputBufferTypes = callerAllocatedOutputs.Select(x => x.CheckedType).ToArray();
-        var abiOutputs = primFunction.GetAbiView().Outputs;
+        var outputBufferTypes = primFunction.GetAbiView().OutputParameters.Select(x => x.CheckedType).ToArray();
         foreach (var caller in callers)
         {
             var outputAllocs = outputBufferTypes.Select(CreateDataUninitialized).ToArray();
             var newArgs = caller.Arguments.ToArray().Concat(outputAllocs).ToArray();
             var newCaller = caller.With(arguments: newArgs);
-            var logicalResult = BuildLogicalResult(newCaller, logicalOutputs, abiOutputs);
-            ReplaceUtility.ReplaceAllUsesWith(caller, logicalResult);
-        }
-
-        BaseExpr BuildLogicalResult(Call caller, IReadOnlyList<BufferVar> logicalOutputs, IReadOnlyList<BufferVar> abiOutputs)
-        {
-            if (logicalOutputs.Count == 0)
-            {
-                return caller;
-            }
-
-            var fields = logicalOutputs.Select(logicalOutput =>
-            {
-                var abiIndex = -1;
-                for (var index = 0; index < abiOutputs.Count; index++)
-                {
-                    if (ReferenceEquals(abiOutputs[index], logicalOutput))
-                    {
-                        abiIndex = index;
-                        break;
-                    }
-                }
-
-                if (abiIndex < 0)
-                {
-                    throw new InvalidOperationException(
-                        $"PrimFunction {primFunction.Name} logical output {logicalOutput.Name} is not present in its derived ABI outputs.");
-                }
-
-                return abiOutputs.Count == 1
-                    ? (BaseExpr)caller
-                    : IR.F.Tensors.GetItem(caller, abiIndex);
-            }).ToArray();
-            return fields.Length == 1 ? fields[0] : new IR.Tuple(fields);
+            ReplaceUtility.ReplaceAllUsesWith(caller, newCaller);
         }
 
         static Expr CreateDataUninitialized(IRType type)
@@ -144,7 +95,11 @@ public abstract class TIRSelectionPass : FunctionPass
             };
     }
 
-    private sealed record SelectionResult(Sequential Body, IReadOnlyList<IVar> InputBuffers, IReadOnlyList<BufferVar> OutputBuffers);
+    private sealed record SelectionResult(
+        Sequential Body,
+        IReadOnlyList<IVar> InputBuffers,
+        IReadOnlyList<BufferVar> OutputParameters,
+        IReadOnlyList<Expr> Results);
 
     private sealed class TIRSelectionVisitor : ExprCloner<Unit>
     {
@@ -164,7 +119,7 @@ public abstract class TIRSelectionPass : FunctionPass
             var inBuffers = LowerInputParameters(function.Parameters).ToArray();
             Visit(function.Body, Unit.Default);
 
-            var outBuffers = function.Body switch
+            var results = function.Body switch
             {
                 IR.Tuple tuple => tuple.Fields.AsValueEnumerable().Select(x => (Expr)ExprMemo[x]).ToArray(),
                 var body => ExprMemo[function.Body] switch
@@ -174,53 +129,70 @@ public abstract class TIRSelectionPass : FunctionPass
                 },
             };
 
-            var inputValues = new Dictionary<BaseExpr, int>(ReferenceEqualityComparer.Instance);
-            for (var inputIndex = 0; inputIndex < function.Parameters.Length; inputIndex++)
+            var outputParameters = new List<BufferVar>();
+            var promotedStorages = new Dictionary<PhysicalBuffer, BufferVar>(ReferenceEqualityComparer.Instance);
+            for (var resultIndex = 0; resultIndex < results.Length; resultIndex++)
             {
-                var parameter = (BaseExpr)function.Parameters[inputIndex];
-                if (inBuffers[inputIndex] is BufferVar && ExprMemo.TryGetValue(parameter, out var inputValue))
+                switch (results[resultIndex])
                 {
-                    if (!inputValues.TryAdd(inputValue, inputIndex))
-                    {
+                    case BufferVar { Role: BufferVarRole.Output } outputParameter:
+                        AddOutputParameter(outputParameter);
+                        break;
+                    case BufferVar { Role: BufferVarRole.Input or BufferVarRole.InOut }:
+                        break;
+                    case TIR.Buffer buffer:
+                        PromoteResultStorage(buffer, resultIndex);
+                        break;
+                    default:
                         throw new InvalidOperationException(
-                            $"Function {function.Name} has multiple buffer parameters lowered to the same selected value.");
-                    }
+                            $"Function {function.Name} result {resultIndex} must lower to BufferVar or TIR.Buffer, got {results[resultIndex].GetType().Name}.");
                 }
             }
 
-            // Add necessary copy calls
-            for (int i = 0; i < outBuffers.Length; i++)
-            {
-                var previousBuffers = outBuffers.AsReadOnlySpan(0, i);
-                var currentBuffer = outBuffers[i];
-                if (inputValues.TryGetValue(currentBuffer, out var inputIndex))
-                {
-                    var inputBuffer = (BufferVar)inBuffers[inputIndex];
-                    if (inputBuffer.Role == BufferVarRole.Input)
-                    {
-                        var inOutBuffer = inputBuffer.With(role: BufferVarRole.InOut);
-                        ReplaceUtility.ReplaceAllUsesWith(inputBuffer, inOutBuffer);
-                        inBuffers[inputIndex] = inOutBuffer;
-                        inputBuffer = inOutBuffer;
-                    }
-                    else if (inputBuffer.Role != BufferVarRole.InOut)
-                    {
-                        throw new InvalidOperationException(
-                            $"Function {function.Name} output aliases input buffer {inputBuffer.Name} with invalid role {inputBuffer.Role}.");
-                    }
+            return new(new Sequential(_body.ToArray()), inBuffers, outputParameters, results);
 
-                    outBuffers[i] = inputBuffer;
-                }
-                else if (currentBuffer is not BufferVar { Role: BufferVarRole.Output }
-                         || previousBuffers.ReferenceContains(currentBuffer))
+            void AddOutputParameter(BufferVar outputParameter)
+            {
+                if (!outputParameters.Contains(outputParameter, ReferenceEqualityComparer.Instance))
                 {
-                    var newBuffer = CreateOutputBufferVar(_selectionPass.GetArgumentType(currentBuffer));
-                    _body.Add(T.Memcopy(newBuffer, currentBuffer));
-                    outBuffers[i] = newBuffer;
+                    outputParameters.Add(outputParameter);
                 }
             }
 
-            return new(new Sequential(_body.ToArray()), inBuffers, outBuffers.Cast<BufferVar>().ToArray());
+            void PromoteResultStorage(TIR.Buffer buffer, int resultIndex)
+            {
+                var physicalBuffer = buffer.MemSpan.Buffer;
+                switch (physicalBuffer.Start)
+                {
+                    case BufferVar { Role: BufferVarRole.Output } outputParameter:
+                        AddOutputParameter(outputParameter);
+                        return;
+                    case BufferVar { Role: BufferVarRole.Input or BufferVarRole.InOut }:
+                        return;
+                    case None when physicalBuffer.Location is MemoryLocation.Data or MemoryLocation.Cache:
+                        if (!buffer.MemSpan.Start.Simplify().Equals(Dimension.Zero) ||
+                            !buffer.MemSpan.Size.Simplify().Equals(physicalBuffer.Size.Simplify()))
+                        {
+                            throw new InvalidOperationException(
+                                $"Function {function.Name} result {resultIndex} is a partial view of internal storage. " +
+                                "Insert an explicit materialization before promoting it to caller-allocated output storage.");
+                        }
+
+                        if (!promotedStorages.TryGetValue(physicalBuffer, out var promotedOutput))
+                        {
+                            promotedOutput = CreateOutputBufferVar(_selectionPass.GetArgumentType(buffer));
+                            promotedStorages.Add(physicalBuffer, promotedOutput);
+                            AddOutputParameter(promotedOutput);
+                            var outputStorage = physicalBuffer.With(start: promotedOutput, location: MemoryLocation.Output);
+                            ReplaceUtility.ReplaceAllUsesWith(physicalBuffer, outputStorage);
+                        }
+
+                        return;
+                    default:
+                        throw new InvalidOperationException(
+                            $"Function {function.Name} result {resultIndex} is backed by non-ABI storage {physicalBuffer.Location}/{physicalBuffer.Start.GetType().Name}. Insert an explicit materialization before TIR selection.");
+                }
+            }
         }
 
         protected sealed override Expr VisitLeafTensorConst(TensorConst expr, Unit context)
@@ -329,65 +301,89 @@ public abstract class TIRSelectionPass : FunctionPass
         {
             selectedCall = null!;
             output = null!;
-            if (!TryGetPrimFunctionTarget(target, out var primFunction, out var inputCount))
+            if (!TryGetPrimFunctionTarget(target, out var primFunction))
             {
                 return false;
             }
 
-            var outputs = primFunction.GetAbiView().Outputs;
-            if (outputs.Count == 0)
+            var abi = primFunction.GetAbiView();
+            if (abi.Results.Count == 0)
             {
                 return false;
             }
 
             var parameters = primFunction.Parameters.ToArray();
-            var outputArguments = new BaseExpr[outputs.Count];
-            for (var outputIndex = 0; outputIndex < outputs.Count; outputIndex++)
+            foreach (var outputParameter in abi.OutputParameters)
             {
-                var outputParameter = outputs[outputIndex];
                 var parameterIndex = Array.FindIndex(parameters, parameter => ReferenceEquals(parameter, outputParameter));
                 if (parameterIndex < 0)
                 {
                     throw new InvalidOperationException($"PrimFunction {primFunction.Name} ABI output {outputParameter.Name} is not in its parameter list.");
                 }
 
-                if (outputParameter.Role == BufferVarRole.InOut && parameterIndex >= inputCount)
-                {
-                    throw new InvalidOperationException($"PrimFunction {primFunction.Name} InOut parameter {outputParameter.Name} is not part of the input ABI.");
-                }
-
                 if (parameterIndex >= arguments.Count)
                 {
                     return false;
                 }
-
-                outputArguments[outputIndex] = arguments[parameterIndex];
             }
 
-            output = outputArguments.Length == 1 ? outputArguments[0] : new IR.Tuple(outputArguments);
+            var resultValues = abi.Results.Select((result, resultIndex) =>
+            {
+                var storageIndex = Array.FindIndex(parameters, parameter => ReferenceEquals(parameter, result.Storage));
+                if (storageIndex < 0 || storageIndex >= arguments.Count)
+                {
+                    throw new InvalidOperationException(
+                        $"PrimFunction {primFunction.Name} result {resultIndex} storage {result.Storage.Name} is not bound by the call arguments.");
+                }
+
+                var storage = arguments[storageIndex];
+                return result.Value switch
+                {
+                    BufferVar => storage,
+                    TIR.Buffer resultView => CreateResultView(resultView, storage, primFunction.Name, resultIndex),
+                    _ => throw new InvalidOperationException(
+                        $"PrimFunction {primFunction.Name} result {resultIndex} has unsupported binding {result.Value.GetType().Name}."),
+                };
+            }).ToArray();
+            output = resultValues.Length == 1 ? (Expr)resultValues[0] : new IR.Tuple(resultValues.Cast<Expr>().ToArray());
             selectedCall = new Call(primFunction, arguments.ToArray());
             return true;
+
+            static BaseExpr CreateResultView(TIR.Buffer descriptor, BaseExpr storage, string functionName, int resultIndex)
+            {
+                if (storage is not TIR.Buffer storageBuffer)
+                {
+                    throw new InvalidOperationException(
+                        $"PrimFunction {functionName} result {resultIndex} view storage must lower to TIR.Buffer, got {storage.GetType().Name}.");
+                }
+
+                return T.CreateBufferView(
+                    storageBuffer,
+                    descriptor.ElemType,
+                    descriptor.Dimensions.ToArray(),
+                    descriptor.Strides.ToArray(),
+                    descriptor.MemSpan.Start,
+                    descriptor.MemSpan.Size,
+                    descriptor.DistributedType,
+                    $"{functionName}_result_{resultIndex}");
+            }
         }
 
-        private static bool TryGetPrimFunctionTarget(Expr target, out TIR.PrimFunction primFunction, out int inputCount)
+        private static bool TryGetPrimFunctionTarget(Expr target, out TIR.PrimFunction primFunction)
         {
             switch (target)
             {
                 case TIR.PrimFunction direct:
                     primFunction = direct;
-                    inputCount = direct.GetAbiView().Inputs.Count;
                     return true;
                 case PrimFunctionWrapper wrapper:
                     primFunction = wrapper.Target;
-                    inputCount = wrapper.ParametersCount;
                     return true;
                 case FunctionWrapper { Target: PrimFunctionWrapper wrapper }:
                     primFunction = wrapper.Target;
-                    inputCount = wrapper.ParametersCount;
                     return true;
                 default:
                     primFunction = null!;
-                    inputCount = 0;
                     return false;
             }
         }

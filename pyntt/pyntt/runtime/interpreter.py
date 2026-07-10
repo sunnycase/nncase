@@ -6,7 +6,12 @@ from typing import Any, Mapping
 
 from pyntt.ir import ModuleSpec
 from pyntt.runtime.errors import PyNTTSpecError
-from pyntt.runtime.tensor import allocate_outputs, resolve_shape_env, validate_inputs
+from pyntt.runtime.tensor import (
+    allocate_outputs,
+    materialize_results,
+    resolve_shape_env,
+    validate_inputs,
+)
 from pyntt.runtime.workspace import RDataCache, WorkspacePool
 
 
@@ -49,10 +54,11 @@ class PyNTTInterpreter:
         validate_inputs(entry, inputs, shape_env)
         outputs = list(allocate_outputs(entry, inputs, shape_env))
         self._run_entry(inputs, outputs, shape_env)
+        results = materialize_results(entry, inputs, outputs, shape_env)
 
-        if len(outputs) == 1:
-            return outputs[0]
-        return tuple(outputs)
+        if len(results) == 1:
+            return results[0]
+        return results
 
     def __call__(self, *inputs):
         return self.run(*inputs)

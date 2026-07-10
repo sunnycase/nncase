@@ -361,11 +361,10 @@ public sealed class UnitTestFunctionBoundaryLayoutPropagation : TestClassBase
     }
 
     [Fact]
-    public async Task TestConstWeightDistributedBoundaryUsesShardedView()
+    public async Task TestConstWeightDistributedBoundaryUsesAffineView()
     {
         CompileOptions.TargetOptions = new Nncase.Targets.NTTTargetOptions
         {
-            ConstShardedView = true,
             MemoryAccessArch = MemoryAccessArchitecture.UMA,
             UnifiedMemoryArch = true,
         };
@@ -382,7 +381,7 @@ public sealed class UnitTestFunctionBoundaryLayoutPropagation : TestClassBase
 
         var module = new IRModule(main);
         module.Add(layer);
-        var passManager = CompileSession.CreatePassManager("BoundaryConstShardedView");
+        var passManager = CompileSession.CreatePassManager("BoundaryConstAffineView");
         passManager.Add<FunctionBoundaryLayoutPropagationPass>();
         await passManager.RunAsync(module);
 
@@ -390,7 +389,7 @@ public sealed class UnitTestFunctionBoundaryLayoutPropagation : TestClassBase
         var specialized = GetFunction(module, "layer");
         Assert.DoesNotContain("Boxing(", CompilerServices.Print(specialized.Body), StringComparison.Ordinal);
         var mainCalls = ExprCollector.Collect(main.Body).OfType<Call>().ToArray();
-        Assert.Contains(mainCalls, call => call.Target is IR.Distributed.ShardedView && call.Arguments[IR.Distributed.ShardedView.Input.Index] is TensorConst);
+        Assert.Contains(mainCalls, call => call.Target is IR.Affine.AffineView && call.Arguments[IR.Affine.AffineView.Input.Index] is TensorConst);
         Assert.DoesNotContain(mainCalls, call => call.Target is IR.Distributed.Boxing { NewType: DistributedType } && call.Arguments[IR.Distributed.Boxing.Input.Index] is TensorConst);
     }
 
@@ -431,7 +430,7 @@ public sealed class UnitTestFunctionBoundaryLayoutPropagation : TestClassBase
             .ToArray();
         var selectedCall = Assert.Single(calleeCalls);
         var abi = calleeWrapper.Target.GetAbiView();
-        Assert.Equal(abi.Inputs.Count + abi.Outputs.Count, selectedCall.Arguments.Length);
+        Assert.Equal(abi.Inputs.Count + abi.OutputParameters.Count, selectedCall.Arguments.Length);
     }
 
     [Fact]
@@ -465,10 +464,11 @@ public sealed class UnitTestFunctionBoundaryLayoutPropagation : TestClassBase
 
         var calleeWrapper = Assert.Single(module.Functions.OfType<PrimFunctionWrapper>());
         var calleeAbi = calleeWrapper.Target.GetAbiView();
-        var inOut = Assert.IsType<BufferVar>(Assert.Single(calleeAbi.Inputs));
-        Assert.Equal(BufferVarRole.InOut, inOut.Role);
-        Assert.Equal(2, calleeAbi.Outputs.Count);
-        Assert.Same(inOut, calleeAbi.Outputs[0]);
+        var inputParameter = Assert.IsType<BufferVar>(Assert.Single(calleeAbi.Inputs));
+        Assert.Equal(BufferVarRole.Input, inputParameter.Role);
+        Assert.Single(calleeAbi.OutputParameters);
+        Assert.Equal(2, calleeAbi.Results.Count);
+        Assert.Same(inputParameter, calleeAbi.Results[1].Storage);
         Assert.DoesNotContain(
             ExprCollector.Collect(calleeWrapper.Target.Body).OfType<Call>(),
             call => call.Target is Memcopy);
@@ -482,8 +482,12 @@ public sealed class UnitTestFunctionBoundaryLayoutPropagation : TestClassBase
         var add = Assert.Single(ExprCollector.Collect(mainPrim.Body)
             .OfType<Call>()
             .Where(call => call.Target is TIR.NTT.VectorizedBinary binary && binary.BinaryOp == BinaryOp.Add));
-        Assert.Same(selectedCall.Arguments[1], add.Arguments[0]);
-        Assert.Same(selectedCall.Arguments[0], add.Arguments[1]);
+        Assert.Same(
+            Assert.IsType<TIR.Buffer>(selectedCall.Arguments[1]).MemSpan.Buffer,
+            Assert.IsType<TIR.Buffer>(add.Arguments[0]).MemSpan.Buffer);
+        Assert.Same(
+            Assert.IsType<TIR.Buffer>(selectedCall.Arguments[0]).MemSpan.Buffer,
+            Assert.IsType<TIR.Buffer>(add.Arguments[1]).MemSpan.Buffer);
     }
 
     [Fact]

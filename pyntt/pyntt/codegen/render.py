@@ -1038,43 +1038,6 @@ def _emit_transpose(model: dict[str, Any]) -> str:
     return _finish(lines)
 
 
-def _emit_linear_view_copy(model: dict[str, Any], op_name: str) -> str:
-    total = _multiply_expr(_product(model["OutputShape"]), model["OutputVectorLaneCount"])
-
-    def tensor_offset(prefix: str, strides: list[Any], lane_count: int, lane_flat: str) -> str:
-        terms = [f"{prefix}{axis} * {_dim(stride)}" for axis, stride in enumerate(strides)]
-        tensor = "lane_flat * 0" if not terms else " + ".join(terms)
-        return tensor if lane_count == 1 else f"(({tensor}) * {lane_count} + {lane_flat})"
-
-    lines = _standard_header(
-        model,
-        f"# generated from PyNTT Jinja {op_name}.py.jinja\n# {model['Comment']}; input_dtype={model['InputDType']}, output_dtype={model['OutputDType']}, input_shape={_shape_tuple(model['InputShape'])}, output_shape={_shape_tuple(model['OutputShape'])}",
-        [("input", "Input"), ("output", "Output")],
-    )
-    _line(lines, 1, f"for linear_start in tl.range(0, {total}, block_size):")
-    _line(lines, 2, "linear = linear_start + tl.arange(0, block_size)")
-    _line(lines, 2, f"mask = linear < {total}")
-    _line(lines, 2, f"input_lane = linear % {model['InputVectorLaneCount']}")
-    _line(lines, 2, f"input_tensor_linear = linear // {model['InputVectorLaneCount']}")
-    _line(lines, 2, f"output_lane = linear % {model['OutputVectorLaneCount']}")
-    _line(lines, 2, f"output_tensor_linear = linear // {model['OutputVectorLaneCount']}")
-    _append_tensor_index_decompose(lines, 2, "input_tensor_linear", "in_idx", model["InputShape"])
-    _append_tensor_index_decompose(lines, 2, "output_tensor_linear", "out_idx", model["OutputShape"])
-    _line(lines, 2, f"input_offsets = {tensor_offset('in_idx', model['InputStrides'], model['InputVectorLaneCount'], 'input_lane')}")
-    _line(lines, 2, f"output_offsets = {tensor_offset('out_idx', model['OutputStrides'], model['OutputVectorLaneCount'], 'output_lane')}")
-    _line(lines, 2, "value = tl.load(input + input_offsets, mask=mask)")
-    _line(lines, 2, "tl.store(output + output_offsets, value, mask=mask)")
-    return _finish(lines)
-
-
-def _emit_reshape(model: dict[str, Any]) -> str:
-    return _emit_linear_view_copy(model, "Reshape")
-
-
-def _emit_bitcast(model: dict[str, Any]) -> str:
-    return _emit_linear_view_copy(model, "Bitcast")
-
-
 def _emit_elementwise_where(model: dict[str, Any]) -> str:
     logical_cond_shape = _logical_shape(model["CondShape"], model["CondVectorLaneCount"])
     logical_true_shape = _logical_shape(model["TrueShape"], model["TrueVectorLaneCount"])
@@ -3724,8 +3687,6 @@ _EMITTERS = {
     "PackedQKVParallelLinear": _emit_packed_qkv_parallel_linear,
     "QKVParallelLinear": _emit_qkv_parallel_linear,
     "Reduce": _emit_reduce,
-    "Reshape": _emit_reshape,
-    "Bitcast": _emit_bitcast,
     "Reshard": _emit_reshard,
     "RoPE": _emit_rope,
     "ScatterND": _emit_scatter_nd,

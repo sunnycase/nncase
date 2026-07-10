@@ -290,9 +290,9 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         var tirDumps = string.Join(
             Environment.NewLine,
             Directory.GetFiles(Dumpper.Directory, "*.script", SearchOption.AllDirectories).Select(File.ReadAllText));
-        Assert.Contains("ShardedView", graphDumps, StringComparison.Ordinal);
+        Assert.Contains("AffineView", graphDumps, StringComparison.Ordinal);
         Assert.Contains("ChipLocalRdata", tirDumps, StringComparison.Ordinal);
-        Assert.DoesNotContain("ShardedView", tirDumps, StringComparison.Ordinal);
+        Assert.DoesNotContain("AffineView", tirDumps, StringComparison.Ordinal);
 
         RenderGeneratedKernels(outputDirectory);
         var generatedKernelsPy = File.ReadAllText(Path.Join(outputDirectory, "generated_kernels.py"));
@@ -1385,7 +1385,8 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
             "nested_prim",
             PyNTTTarget.Kind,
             new TIR.Sequential(
-                TIR.F.NTT.Reshape(
+                TIR.F.NTT.Unary(
+                    UnaryOp.Abs,
                     IR.F.Buffer.BufferSubview(nestedInput, new RankedShape(2, 0), new RankedShape(2, 16)),
                     IR.F.Buffer.BufferSubview(nestedOutput, new RankedShape(3, 0), new RankedShape(2, 16))),
                 TIR.F.NTT.TensorStore(nestedOutput, nestedOutputVar, new[] { SBP.B, SBP.B }, placement)),
@@ -1814,7 +1815,7 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
     }
 
     [Fact]
-    public async Task TestPyNTTAffineBitcastUsesDedicatedTemplate()
+    public async Task TestPyNTTAffineBitcastUsesInputBackedResultView()
     {
         ConfigureAutoDistributedPyNTT();
         var inputType = new TensorType(new VectorType(DataTypes.BFloat16, [8]), new[] { 4, 8 });
@@ -1823,9 +1824,17 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         var main = new Function("main", PyNTTTarget.Kind, bitcast, [input]);
 
         var outputDirectory = await GeneratePyNTTModelDirectoryWithCompilerPipeline("generated_affine_bitcast_model", main);
+        using var metadata = JsonDocument.Parse(File.ReadAllText(Path.Join(outputDirectory, "metadata.json")));
+        var function = metadata.RootElement.GetProperty("functions").EnumerateArray().Single();
+        Assert.Empty(function.GetProperty("outputs").EnumerateArray());
+        Assert.Empty(function.GetProperty("generated_kernels").EnumerateArray());
+        var result = function.GetProperty("results").EnumerateArray().Single();
+        Assert.Equal("input", result.GetProperty("source").GetString());
+        Assert.Equal(0, result.GetProperty("source_index").GetInt32());
+
         RenderGeneratedKernels(outputDirectory);
         var generatedKernelsPy = File.ReadAllText(Path.Join(outputDirectory, "generated_kernels.py"));
-        Assert.Contains("generated from PyNTT Jinja Bitcast.py.jinja", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.DoesNotContain("generated from PyNTT Jinja Bitcast.py.jinja", generatedKernelsPy, StringComparison.Ordinal);
         Assert.DoesNotContain("generated from PyNTT Jinja Reshape.py.jinja", generatedKernelsPy, StringComparison.Ordinal);
     }
 
@@ -1856,8 +1865,7 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
             .SelectMany(function => ExprCollector.Collect(function).OfType<TIR.Buffer>())
             .Where(buffer => buffer.MemSpan.Buffer.Location == TIR.MemoryLocation.Cache)
             .ToArray();
-        Assert.NotEmpty(cacheBuffers);
-        Assert.All(cacheBuffers, buffer => Assert.NotNull(buffer.DistributedType));
+        Assert.Empty(cacheBuffers);
 
         RenderGeneratedKernels(outputDirectory);
         var generatedKernelsPy = File.ReadAllText(Path.Join(outputDirectory, "generated_kernels.py"));
