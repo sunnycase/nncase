@@ -44,6 +44,8 @@ public static class ISLUtility
             else
             {
                 var range = dim.Metadata!.Range!;
+                var min = GetIntegerDimensionBound(range.Value.Min, dim);
+                var max = GetIntegerDimensionBound(range.Value.Max, dim);
                 parameters.Add($"D{i}");
                 var dimVar = new DimVar($"D{i}")
                 {
@@ -53,7 +55,7 @@ public static class ISLUtility
                     },
                 };
                 paramMap.Add(dimVar, shape[i]);
-                constraints.Add($"{range.Value.Min} <= D{i} <= {range.Value.Max}");
+                constraints.Add($"{min} <= D{i} <= {max}");
                 constraints.Add($"0 <= d{i} < D{i}");
             }
         }
@@ -122,6 +124,16 @@ public static class ISLUtility
 
         return dimensions;
     }
+
+    private static long GetIntegerDimensionBound(double value, Dimension dimension)
+    {
+        if (!double.IsFinite(value) || value != System.Math.Truncate(value) || value < long.MinValue || value > long.MaxValue)
+        {
+            throw new InvalidOperationException($"Affine domain dimension {dimension} has a non-finite or non-integral range bound {value}.");
+        }
+
+        return checked((long)value);
+    }
 }
 
 internal sealed class AstExprToExprConverter
@@ -145,6 +157,7 @@ internal sealed class AstExprToExprConverter
                 Isl.ast_expr_op_type.sub => Visit(astExpr.op_arg(0)) - Visit(astExpr.op_arg(1)),
                 Isl.ast_expr_op_type.mul => Visit(astExpr.op_arg(0)) * Visit(astExpr.op_arg(1)),
                 Isl.ast_expr_op_type.div => Visit(astExpr.op_arg(0)) / Visit(astExpr.op_arg(1)),
+                Isl.ast_expr_op_type.pdiv_q => Visit(astExpr.op_arg(0)) / Visit(astExpr.op_arg(1)),
                 Isl.ast_expr_op_type.select => VisitSelect(astExpr),
                 Isl.ast_expr_op_type.min => Dimension.Min(Visit(astExpr.op_arg(0)), Visit(astExpr.op_arg(1))),
                 Isl.ast_expr_op_type.minus => -Visit(astExpr.op_arg(0)),

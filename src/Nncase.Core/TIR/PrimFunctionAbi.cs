@@ -51,13 +51,21 @@ public static class PrimFunctionAbi
             switch (bufferVar.Role)
             {
                 case BufferVarRole.Input:
-                case BufferVarRole.InOut:
                     if (phase != AbiParameterPhase.Inputs)
                     {
                         throw new InvalidOperationException($"PrimFunction {function.Name} has input parameter {bufferVar.Name} after output/workspace parameters.");
                     }
 
                     inputs.Add(bufferVar);
+                    break;
+                case BufferVarRole.InOut:
+                    if (phase != AbiParameterPhase.Inputs)
+                    {
+                        throw new InvalidOperationException($"PrimFunction {function.Name} has input/output parameter {bufferVar.Name} after output/workspace parameters.");
+                    }
+
+                    inputs.Add(bufferVar);
+                    outputs.Add(bufferVar);
                     break;
                 case BufferVarRole.Output:
                     if (phase == AbiParameterPhase.Workspaces)

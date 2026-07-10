@@ -17,8 +17,11 @@ public partial class NTTAffineSelectionPass
 {
     public static Expr SelectCompare(Compare op, Call call, Expr output)
     {
-        var lhs = (Expr)call[Compare.Lhs];
-        var rhs = (Expr)call[Compare.Rhs];
+        if (call[Compare.Lhs] is not Expr lhs || call[Compare.Rhs] is not Expr rhs)
+        {
+            return call;
+        }
+
         if (lhs.CheckedShape is not { Rank: > 0 } || rhs.CheckedShape is not { Rank: > 0 })
         {
             return call;

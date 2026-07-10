@@ -43,9 +43,9 @@ public static class Buffer
     /// <summary>
     /// create the uninitialized buffer.
     /// </summary>
-    public static Call Uninitialized(DataType dataType, TIR.MemoryLocation memoryLocation, Shape shape) => new Call(new Uninitialized(dataType, memoryLocation, new IRArray<SBP>(), new Placement(new IRArray<int>(), string.Empty, string.Empty)), shape);
+    public static Call Uninitialized(DataType dataType, TIR.MemoryLocation memoryLocation, Shape shape) => new Call(new Uninitialized(dataType, memoryLocation, new IRArray<SBP>(), new Placement(new IRArray<int>(), string.Empty, string.Empty), null), shape);
 
-    public static Call Uninitialized(DataType dataType, TIR.MemoryLocation memoryLocation, Shape shape, IRArray<SBP> ndsbp, Placement placement) => new Call(new Uninitialized(dataType, memoryLocation, ndsbp, placement), shape);
+    public static Call Uninitialized(DataType dataType, TIR.MemoryLocation memoryLocation, Shape shape, IRArray<SBP> ndsbp, Placement placement, SBPPartial? partial = null) => new Call(new Uninitialized(dataType, memoryLocation, ndsbp, placement, partial), shape);
 
     public static Call Allocate(Expr size, DataType dataType, TIR.MemoryLocation location, bool malloc = true) => new Call(new Allocate(dataType, location, malloc), size);
 

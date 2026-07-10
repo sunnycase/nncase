@@ -53,7 +53,7 @@ public abstract class NTTTarget : Target
 
     public override void RegisterAffineSelectionPass(IPassManager passManager, CompileOptions options)
     {
-        passManager.Add<NTTAffineSelectionPass>();
+        passManager.Add<NTTAffineSelectionPass>(NTTModuleCompiler.ModuleKind);
     }
 
     public override void RegisterAutoPackingRules(IRulesAddable pass, CompileOptions options)

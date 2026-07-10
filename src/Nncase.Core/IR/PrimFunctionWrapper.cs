@@ -58,10 +58,13 @@ public sealed class PrimFunctionWrapper : BaseFunction
     {
         get
         {
-            var outputParams = Target.Parameters.AsValueEnumerable().Skip(ParametersCount).ToArray();
+            var abiOutputs = Target.GetAbiView().Outputs;
+            var outputParams = abiOutputs.Count > 0
+                ? abiOutputs.Cast<IVar>().ToArray()
+                : Target.Parameters.AsValueEnumerable().Skip(ParametersCount).ToArray();
             return outputParams.Length == 1
-                ? (TypeHints.Count <= ParametersCount ? ((BaseExpr)outputParams[0]).CheckedType : TypeHints[ParametersCount])
-                : new TupleType(outputParams.Select((x, i) => TypeHints.Count <= ParametersCount ? ((BaseExpr)x).CheckedType! : TypeHints[ParametersCount + i]));
+                ? GetParameterType(outputParams[0])
+                : new TupleType(outputParams.Select(GetParameterType));
         }
     }
 
@@ -79,4 +82,15 @@ public sealed class PrimFunctionWrapper : BaseFunction
 
     public PrimFunctionWrapper With(string? name = null, PrimFunction? target = null, int? parametersCount = null, IRType[]? hints = null)
         => new PrimFunctionWrapper(name ?? Name, target ?? Target, parametersCount ?? ParametersCount, hints ?? TypeHints.ToArray());
+
+    private IRType GetParameterType(IVar parameter)
+    {
+        var parameterIndex = Array.FindIndex(Target.Parameters.ToArray(), candidate => ReferenceEquals(candidate, parameter));
+        if (parameterIndex < 0)
+        {
+            throw new InvalidOperationException($"PrimFunctionWrapper {Name} cannot find ABI parameter {parameter.Name} in target {Target.Name}.");
+        }
+
+        return TypeHints.Count > parameterIndex ? TypeHints[parameterIndex] : ((BaseExpr)parameter).CheckedType;
+    }
 }

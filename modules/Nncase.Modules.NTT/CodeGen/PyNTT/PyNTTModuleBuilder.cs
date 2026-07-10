@@ -33,7 +33,10 @@ public sealed class PyNTTModuleBuilder : IModuleBuilder
     /// <inheritdoc/>
     public ILinkableModule Build(IReadOnlyList<BaseFunction> functions)
     {
-        var primFunctions = functions.Select(RequirePrimFunction).ToArray();
+        var primFunctions = functions
+            .Select(RequirePrimFunction)
+            .Where(function => !PyNTTPrimFunctionRoles.IsAutoTilingDeviceFunction(function))
+            .ToArray();
         var linkableFunctions = primFunctions
             .Select((function, index) => new PyNTTFunctionBuilder((uint)index, CompileOptions).Build(function))
             .ToArray();

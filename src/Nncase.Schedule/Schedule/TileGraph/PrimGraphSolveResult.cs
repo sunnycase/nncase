@@ -20,7 +20,11 @@ namespace Nncase.Schedule.TileGraph;
 /// </summary>
 public record class NodeWithBuffer(TileNode Node, BufferIdentity Id)
 {
-    public long MaxSize => TensorUtilities.GetProduct(Id.Node.BufferShapes[Id.Index].ToArray()) * Id.Node.GetBufferElemSize(Id.Index);
+    public long MaxSize => IsObjectBuffer(Id.Node.Grid.Buffers[Id.Index])
+        ? 0
+        : TensorUtilities.GetProduct(Id.Node.BufferShapes[Id.Index].ToArray()) * Id.Node.GetBufferElemSize(Id.Index);
+
+    private static bool IsObjectBuffer(Expr expr) => expr.CheckedDataType is ReferenceType;
 }
 
 public record NodeWithBufferInfo(long Size, Tuple<int, int> Liveness, long[] Shape, long[] Strides)
@@ -33,12 +37,12 @@ public record NodeWithBufferInfo(long Size, Tuple<int, int> Liveness, long[] Sha
 /// </summary>
 /// <param name="Parent">The parent view information.</param>
 /// <param name="View">The view expression.</param>
-/// <param name="ViewVar">The variable for the view expression.</param>
+/// <param name="ViewVar">The variable for the view expression. Object buffers are passed through by reference and do not need a view variable.</param>
 /// <param name="Buffer">The buffer expression.</param>
 /// <param name="GlobalOffsets">The global offsets for the buffer.</param>
 /// <param name="LocalOffsets">The local offsets of parent for the buffer.</param>
 /// <param name="Shape">The shape of the view.</param>
-internal sealed record ViewInfo(ViewInfo? Parent, Expr View, Var ViewVar, Expr Buffer, RankedShape GlobalOffsets, RankedShape LocalOffsets, RankedShape Shape)
+internal sealed record ViewInfo(ViewInfo? Parent, Expr View, Var? ViewVar, Expr Buffer, RankedShape GlobalOffsets, RankedShape LocalOffsets, RankedShape Shape)
 {
 }
 
@@ -51,16 +55,34 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
     {
         PrimBufferGraph = primBufferGraph;
         (Inputs, Outputs) = primBufferGraph.GetInputsOutputs(primBufferGraph.Parent as BufferGraph);
+        ObjectOutputAliases = ResolveObjectOutputAliases();
         InputOutputVars = new();
-        foreach (var bid in Inputs.Concat(Outputs))
+        var inOutInputs = ObjectOutputAliases.Values.ToHashSet();
+        foreach (var bid in Inputs)
         {
             var expr = bid.Node.Grid.Buffers[bid.Index];
-            var tensorType = GetBufferTensorType(expr);
-            if (!InputOutputVars.TryGetValue(bid, out _))
+            var bufferType = GetBufferType(expr);
+            var isInOut = inOutInputs.Contains(bid);
+            InputOutputVars.Add(
+                bid,
+                new BufferVar(
+                    $"{bid}",
+                    bufferType,
+                    isInOut ? BufferVarRole.InOut : BufferVarRole.Input,
+                    MemoryLocation.Input));
+        }
+
+        foreach (var bid in Outputs)
+        {
+            if (ObjectOutputAliases.TryGetValue(bid, out var inputBid))
             {
-                var ivar = new Var($"{bid}", tensorType);
-                InputOutputVars.Add(bid, ivar);
+                InputOutputVars.Add(bid, InputOutputVars[inputBid]);
+                continue;
             }
+
+            var expr = bid.Node.Grid.Buffers[bid.Index];
+            var bufferType = GetBufferType(expr);
+            InputOutputVars.Add(bid, new BufferVar($"{bid}", bufferType, BufferVarRole.Output, MemoryLocation.Output));
         }
 
         ObjectiveValue = objectiveValue;
@@ -75,7 +97,9 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
 
     public HashSet<BufferIdentity> Outputs { get; }
 
-    public Dictionary<BufferIdentity, Var> InputOutputVars { get; }
+    public IReadOnlyDictionary<BufferIdentity, BufferIdentity> ObjectOutputAliases { get; }
+
+    public Dictionary<BufferIdentity, IVar> InputOutputVars { get; }
 
     public long ObjectiveValue { get; }
 
@@ -215,7 +239,11 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
                     };
                 }
 
-                forwardExtents[i] = forwardExtent;
+                // ISL describes the affine-domain span, while the serial loop defines
+                // the concrete tile geometry. Keep both constraints: a tile cannot
+                // extend beyond its stride or the remaining loop domain.
+                var remainingExtent = Dimension.Max(0L, stop - loopVar);
+                forwardExtents[i] = Dimension.Min(forwardExtent, stride, remainingExtent);
             }
         }
 
@@ -242,11 +270,10 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
 
         for (int ci = 0; ci < loopVars.Length + 1; ci++)
         {
-            foreach (var (bid, bufferInfo) in nodeMemo.BufferInfoMap)
+            foreach (var (bid, bufferInfo) in OrderBufferInfosForViewCreation(nodeMemo.BufferInfoMap))
             {
                 var place = bufferInfo.Places[ci];
                 var expr = bid.Node.Grid.Buffers[bid.Index];
-                var distributedType = GetBufferDistributedType(expr);
                 for (int sl = 0; sl < place.Length; sl++)
                 {
                     if (place[sl] != 1)
@@ -258,23 +285,26 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
                     var partialShape = PartialShapeFromDomain(parentDomain, value.DomainRelation, tiledChildDomain, bufferInfo.Map, (uint)ci, paramDimMap);
 
                     var viewInfo = GetViewInfo(sl, value, bid, bufferInfo.Map, forwardOffsets[ci], partialShape);
-                    var letBuilder = T.Let(viewInfo.ViewVar, viewInfo.View);
-                    cntBuilder.Body(letBuilder);
-                    cntBuilder = letBuilder;
+                    if (viewInfo.ViewVar is { } viewVar)
+                    {
+                        var letBuilder = T.Let(viewVar, viewInfo.View);
+                        cntBuilder.Body(letBuilder);
+                        cntBuilder = letBuilder;
+                    }
 
                     // note when create loop is inner loop, the buffer load store should be instert by children's order.
                     {
                         var localBuilder = ci < loopVars.Length ? cntBuilder : childBuilders[FetchBidOwnerIndex(value, bid)];
-                        if (!TargetOptions.UnifiedMemoryArch && viewInfo.Parent is ViewInfo parentViewInfo)
+                        if (!IsObjectBuffer(expr) && !TargetOptions.UnifiedMemoryArch && viewInfo.Parent is ViewInfo parentViewInfo)
                         {
                             if (kernelInfo.BufferInfos[bid.Index].State.HasFlag(MicroKernelBufferInfo.BufferState.Read))
                             {
-                                localBuilder.Body(T.Memcopy(viewInfo.ViewVar, IR.F.Buffer.BufferSubview(parentViewInfo.ViewVar ?? parentViewInfo.Buffer, viewInfo.LocalOffsets, viewInfo.Shape)));
+                                localBuilder.Body(T.Memcopy(viewInfo.ViewVar!, IR.F.Buffer.BufferSubview(parentViewInfo.ViewVar ?? parentViewInfo.Buffer, viewInfo.LocalOffsets, viewInfo.Shape)));
                             }
 
                             if (kernelInfo.BufferInfos[bid.Index].State.HasFlag(MicroKernelBufferInfo.BufferState.Write))
                             {
-                                localBuilder.Tail(T.Memcopy(IR.F.Buffer.BufferSubview(parentViewInfo.ViewVar ?? parentViewInfo.Buffer, viewInfo.LocalOffsets, viewInfo.Shape), viewInfo.ViewVar));
+                                localBuilder.Tail(T.Memcopy(IR.F.Buffer.BufferSubview(parentViewInfo.ViewVar ?? parentViewInfo.Buffer, viewInfo.LocalOffsets, viewInfo.Shape), viewInfo.ViewVar!));
                             }
                         }
                     }
@@ -342,7 +372,9 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
 
             offsets = ISLUtility.RoundTrip(offsets);
             bufferParentViewInfos[i] = parentViewInfo;
-            bufferViews[i] = IR.F.Buffer.BufferSubview(parentViewInfo.ViewVar, offsets, shape);
+            bufferViews[i] = IsObjectBuffer(value.Grid.Buffers[i])
+                ? parentViewInfo.ViewVar ?? parentViewInfo.Buffer
+                : IR.F.Buffer.BufferSubview(parentViewInfo.ViewVar!, offsets, shape);
         }
 
         var bodyVarReplaces = new Dictionary<BaseExpr, BaseExpr>();
@@ -417,26 +449,17 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
         {
             IR.Buffers.BufferOf bufof => GetTensorType(bufof.Input.CheckedType),
             Call { Target: IR.Buffers.Uninitialized } c => GetTensorType(c.CheckedType),
-            _ => throw new NotSupportedException(),
+            _ => GetTensorType(expr.CheckedType),
         };
     }
 
-    private DistributedType GetBufferDistributedType(Expr expr)
-    {
-        DistributedType GetTensorType(IRType type) => type switch
+    private static IRType GetBufferType(Expr expr)
+        => expr switch
         {
-            TensorType => null!,
-            DistributedType dt => dt,
-            _ => throw new NotSupportedException(),
+            IR.Buffers.BufferOf bufof => bufof.Input.CheckedType,
+            Call { Target: IR.Buffers.Uninitialized } call => call.CheckedType,
+            _ => expr.CheckedType,
         };
-
-        return expr switch
-        {
-            IR.Buffers.BufferOf bufof => GetTensorType(bufof.Input.CheckedType),
-            Call { Target: IR.Buffers.Uninitialized } c => GetTensorType(c.CheckedType),
-            _ => throw new NotSupportedException(),
-        };
-    }
 
     private bool TryGetParentViewInfo(ITreeNode node, BufferIdentity bid, [MaybeNullWhen(false)] out ViewInfo parentViewInfo)
     {
@@ -461,16 +484,22 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
 
     private ViewInfo GetViewInfo(int storeLevel, TileNode node, BufferIdentity bid, AffineMap map, Dimension[] forwardOffsets, RankedShape shape)
     {
+        if (IsObjectBuffer(bid.Node.Grid.Buffers[bid.Index]))
+        {
+            return GetObjectViewInfo(node, bid, map, forwardOffsets, shape);
+        }
+
         TIR.Buffer AllocateBuffer(TileNode tileNode, BufferIdentity bid)
         {
             var expr = bid.Node.Grid.Buffers[bid.Index];
+            var distributedType = GetBufferType(expr) as DistributedType;
             var tensorType = GetBufferTensorType(expr);
             tensorType = new TensorType(tensorType.DType, shape); // according to subtensor shape.
             var info = LevelNodeBufferInfos[storeLevel][new NodeWithBuffer(tileNode, bid)];
             var alignment = tensorType.DType.SizeInBytes;
             var strides = info.Strides.Select(i => (Dimension)i).ToArray(); // using fixed strides.
             var physicalBuffer = new PhysicalBuffer(alignment, Tensor.FromPointer(info.Offset, tensorType.DType), info.Size, MemoryLocation.Cache, storeLevel);
-            return new TIR.Buffer($"{bid}", tensorType.DType, new MemSpan(physicalBuffer), shape.Dimensions.ToArray(), strides, null);
+            return new TIR.Buffer($"{bid}", tensorType.DType, new MemSpan(physicalBuffer), shape.Dimensions.ToArray(), strides, distributedType);
         }
 
         Expr GetViewExpr(ViewInfo? parentInfo, Expr buffer, RankedShape forwardOffsets, RankedShape relatedOffsets, RankedShape shape)
@@ -480,7 +509,7 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
                 null => buffer switch
                 {
                     TIR.Buffer buf => IR.F.Buffer.AllocateBufferView(buf),
-                    Var ivar => TargetOptions.UnifiedMemoryArch switch
+                    Expr ivar when ivar is IVar => TargetOptions.UnifiedMemoryArch switch
                     {
                         true => IR.F.Buffer.BufferSubview(ivar, relatedOffsets, shape),
                         false => ivar,
@@ -489,7 +518,7 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
                 },
                 ViewInfo info => TargetOptions.UnifiedMemoryArch switch
                 {
-                    true => IR.F.Buffer.BufferSubview(info.ViewVar, relatedOffsets, shape),
+                    true => IR.F.Buffer.BufferSubview(info.ViewVar!, relatedOffsets, shape),
                     false => buffer switch
                     {
                         TIR.Buffer buf => IR.F.Buffer.AllocateBufferView(buf),
@@ -533,7 +562,7 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
 
             if (TargetOptions.UnifiedMemoryArch && fromExternal)
             {
-                buffer = InputOutputVars[bid];
+                buffer = (Expr)InputOutputVars[bid];
             }
             else
             {
@@ -542,7 +571,7 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
 
             if (!TargetOptions.UnifiedMemoryArch && fromExternal)
             {
-                parentViewInfo = new ViewInfo(null, null!, null!, InputOutputVars[bid], new RankedShape(bufferOffsets.Select(i => 0).ToArray()), new RankedShape(bufferOffsets.Select(i => 0).ToArray()), shape);
+                parentViewInfo = new ViewInfo(null, null!, null!, (Expr)InputOutputVars[bid], new RankedShape(bufferOffsets.Select(i => 0).ToArray()), new RankedShape(bufferOffsets.Select(i => 0).ToArray()), shape);
             }
 
             var view = GetViewExpr(null, buffer, bufferOffsets, offsets, shape);
@@ -550,6 +579,193 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
             return new ViewInfo(parentViewInfo, view, viewVar, buffer, bufferOffsets, fromExternal ? bufferOffsets : new RankedShape(bufferOffsets.Select(i => 0).ToArray()), shape);
         }
     }
+
+    private ViewInfo GetObjectViewInfo(TileNode node, BufferIdentity bid, AffineMap map, Dimension[] forwardOffsets, RankedShape shape)
+    {
+        if (map.Results.Length != 0 || shape.Rank != 0)
+        {
+            throw new InvalidOperationException($"Object buffer {bid} must be passed by reference without subview. Access rank: {map.Results.Length}, shape rank: {shape.Rank}.");
+        }
+
+        var bufferOffsets = map.Apply(forwardOffsets, Enumerable.Repeat<Dimension>(0L, forwardOffsets.Length).ToArray()).Select(i => i.Start).ToArray();
+        var offsets = new RankedShape(bufferOffsets.Select(_ => (Dimension)0L).ToArray());
+        var fromExternal = Inputs.Contains(bid) || Outputs.Contains(bid);
+        ViewInfo? parentViewInfo = null;
+        Expr buffer;
+
+        if (fromExternal)
+        {
+            buffer = (Expr)InputOutputVars[bid];
+        }
+        else if (TryGetObjectAliasSource(node, bid, out var aliasSource))
+        {
+            buffer = aliasSource;
+        }
+        else if (TryGetParentViewInfo(node, bid, out parentViewInfo))
+        {
+            buffer = parentViewInfo.ViewVar ?? parentViewInfo.Buffer;
+        }
+        else
+        {
+            throw new InvalidOperationException($"can't find object alias source for {bid} at TileNode {node}.");
+        }
+
+        return new ViewInfo(parentViewInfo, buffer, null, buffer, bufferOffsets, offsets, shape);
+    }
+
+    private bool TryGetObjectAliasSource(TileNode node, BufferIdentity bid, [MaybeNullWhen(false)] out Expr source)
+    {
+        source = null;
+        if (!bid.IsOutput)
+        {
+            return false;
+        }
+
+        var argument = bid.Node.Grid.GetArgument(bid.Index);
+        for (int i = 0; i < bid.Node.Grid.Reads.Length; i++)
+        {
+            if (!ReferenceEquals(bid.Node.Grid.Reads[i], argument))
+            {
+                continue;
+            }
+
+            var readBid = new BufferIdentity(bid.Node, i);
+            if (TryGetCurrentOrParentViewInfo(node, readBid, out var readViewInfo))
+            {
+                source = readViewInfo.ViewVar ?? readViewInfo.Buffer;
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private Dictionary<BufferIdentity, BufferIdentity> ResolveObjectOutputAliases()
+    {
+        var aliases = new Dictionary<BufferIdentity, BufferIdentity>();
+        var producerByRead = new Dictionary<BufferIdentity, BufferIdentity>();
+        foreach (var edge in PrimBufferGraph.Edges.Where(edge => edge.Tag == BufferEdgeKind.Inter))
+        {
+            if (!IsObjectBuffer(edge.Target.Node.Grid.Buffers[edge.Target.Index]))
+            {
+                continue;
+            }
+
+            if (!producerByRead.TryAdd(edge.Target, edge.Source))
+            {
+                throw new InvalidOperationException($"Object SSA read {edge.Target} has multiple producers.");
+            }
+        }
+
+        foreach (var output in Outputs)
+        {
+            if (!IsObjectBuffer(output.Node.Grid.Buffers[output.Index]))
+            {
+                continue;
+            }
+
+            if (TryResolveObjectAliasInput(output, producerByRead, new HashSet<BufferIdentity>(), out var input))
+            {
+                aliases.Add(output, input);
+            }
+        }
+
+        return aliases;
+    }
+
+    private bool TryResolveObjectAliasInput(
+        BufferIdentity bid,
+        IReadOnlyDictionary<BufferIdentity, BufferIdentity> producerByRead,
+        HashSet<BufferIdentity> visited,
+        [MaybeNullWhen(false)] out BufferIdentity input)
+    {
+        input = null;
+        if (!visited.Add(bid))
+        {
+            throw new InvalidOperationException($"Object alias cycle detected at {bid}.");
+        }
+
+        if (Inputs.Contains(bid))
+        {
+            input = bid;
+            return true;
+        }
+
+        if (!bid.IsOutput || !IsObjectBuffer(bid.Node.Grid.Buffers[bid.Index]))
+        {
+            return false;
+        }
+
+        var outputArgument = bid.Node.Grid.GetArgument(bid.Index);
+        var aliasReads = Enumerable.Range(0, bid.Node.Grid.Reads.Length)
+            .Where(index => ReferenceEquals(bid.Node.Grid.Reads[index], outputArgument))
+            .Select(index => new BufferIdentity(bid.Node, index))
+            .ToArray();
+        if (aliasReads.Length == 0)
+        {
+            return false;
+        }
+
+        BufferIdentity? resolvedInput = null;
+        foreach (var read in aliasReads)
+        {
+            if (!TryResolveObjectReadInput(read, producerByRead, new HashSet<BufferIdentity>(visited), out var candidate))
+            {
+                return false;
+            }
+
+            if (resolvedInput is not null && resolvedInput != candidate)
+            {
+                throw new InvalidOperationException($"Object output {bid} aliases multiple function inputs: {resolvedInput} and {candidate}.");
+            }
+
+            resolvedInput = candidate;
+        }
+
+        input = resolvedInput;
+        return input is not null;
+    }
+
+    private bool TryResolveObjectReadInput(
+        BufferIdentity read,
+        IReadOnlyDictionary<BufferIdentity, BufferIdentity> producerByRead,
+        HashSet<BufferIdentity> visited,
+        [MaybeNullWhen(false)] out BufferIdentity input)
+    {
+        if (Inputs.Contains(read))
+        {
+            input = read;
+            return true;
+        }
+
+        if (!producerByRead.TryGetValue(read, out var producer))
+        {
+            input = null;
+            return false;
+        }
+
+        return TryResolveObjectAliasInput(producer, producerByRead, visited, out input);
+    }
+
+    private bool TryGetCurrentOrParentViewInfo(TileNode node, BufferIdentity bid, [MaybeNullWhen(false)] out ViewInfo viewInfo)
+    {
+        if (_viewInfoMemo.TryGetValue(node, out var viewMap) && viewMap.TryGetValue(bid, out viewInfo))
+        {
+            return true;
+        }
+
+        return TryGetParentViewInfo(node, bid, out viewInfo);
+    }
+
+    private static IEnumerable<KeyValuePair<BufferIdentity, TileNodeBufferInfo<long>>> OrderBufferInfosForViewCreation(Dictionary<BufferIdentity, TileNodeBufferInfo<long>> bufferInfoMap)
+    {
+        return bufferInfoMap
+            .OrderBy(pair => pair.Key.IsOutput ? 1 : 0)
+            .ThenBy(pair => pair.Key.Node.OpId)
+            .ThenBy(pair => pair.Key.Index);
+    }
+
+    private static bool IsObjectBuffer(Expr expr) => expr.CheckedDataType is ReferenceType;
 
     private int FetchBidOwnerIndex(TileNode node, BufferIdentity bid)
     {

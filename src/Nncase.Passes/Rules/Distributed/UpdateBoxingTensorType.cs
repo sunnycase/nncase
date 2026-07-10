@@ -32,6 +32,11 @@ public partial class UpdateBoxingTensorType : RewriteRule<Pattern>
         {
             var ttype = dt.TensorType;
             var dtype = dt with { TensorType = ttype with { Shape = ttype.Shape.Select(d => d.Simplify()).ToArray() } };
+            if (Equals(dtype, input.CheckedType))
+            {
+                return input;
+            }
+
             var newBoxing = new Call(new IR.Distributed.Boxing(dtype), input);
             context.MatchOptions.SuppressPattern(newBoxing, Pattern);
             return newBoxing;

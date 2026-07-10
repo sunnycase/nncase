@@ -286,6 +286,21 @@ public class UnitTestAffine
             });
             Assert.IsType<DimMin>(expr);
         }
+
+        {
+            var n = new DimVar("n")
+            {
+                Metadata = new()
+                {
+                    Range = new(0, 128),
+                },
+            };
+            var quotient = ISLUtility.RoundTrip(new Dimension[] { n / 16 })[0];
+            var fraction = Assert.IsType<DimFraction>(quotient);
+            Assert.Equal(DimDivideMode.FloorDiv, fraction.DivMode);
+            Assert.Equal(n, fraction.Numerator);
+            Assert.Equal(16, fraction.Denominator);
+        }
     }
 
     [Fact]

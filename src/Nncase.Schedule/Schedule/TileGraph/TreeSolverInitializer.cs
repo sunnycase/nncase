@@ -208,11 +208,8 @@ public sealed class TreeSolverInitializer : TreeSolverBase<IntExpr>, ITreeNodeVi
         }
 
         // perpare return infos.
-        var bufferResults = new BufferResult[value.ReadAccesses.Length + 1];
-        BufferIdentity obid = new(value.Wrapped, value.ReadAccesses.Length);
-        bufferResults[value.ReadAccesses.Length] = new(obid, new(TimeStamp, TimeStamp + 1), value.DomainRelation.Map * accessMaps[^1], elemSizes[value.ReadAccesses.Length]);
-
-        for (int i = 0; i < value.ReadAccesses.Length; i++)
+        var bufferResults = new BufferResult[value.Grid.AccessMaps.Length];
+        for (int i = 0; i < value.Grid.AccessMaps.Length; i++)
         {
             BufferIdentity bid = new(value.Wrapped, i);
             bufferResults[i] = new(bid, new(TimeStamp, TimeStamp + 1), value.DomainRelation.Map * accessMaps[i], elemSizes[i]);

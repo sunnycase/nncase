@@ -6,6 +6,7 @@ using System.Reactive;
 using Nncase.IR;
 using Nncase.IR.Distributed;
 using Nncase.IR.Shapes;
+using Nncase.IR.Tensors;
 
 namespace Nncase.CodeGen.PyNTT;
 
@@ -46,26 +47,7 @@ internal sealed class PyNTTDimExpressionEmitter : ExprFunctor<PyNTTDimExpression
     public PyNTTDimExpression Emit(Dimension dimension)
     {
         var expression = Visit(dimension);
-        if (expression.FixedValue.HasValue || dimension.Metadata.Range is not { } range)
-        {
-            return expression;
-        }
-
-        if (!double.IsFinite(range.Min) ||
-            !double.IsFinite(range.Max) ||
-            range.Min < long.MinValue ||
-            range.Min > long.MaxValue ||
-            range.Max < long.MinValue ||
-            range.Max > long.MaxValue)
-        {
-            return expression;
-        }
-
-        return expression with
-        {
-            RangeMin = checked((long)Math.Floor(range.Min)),
-            RangeMax = checked((long)Math.Ceiling(range.Max)),
-        };
+        return WithRangeFromMetadata(expression, dimension);
     }
 
     protected override PyNTTDimExpression VisitDimAbs(DimAbs expr)
@@ -79,9 +61,7 @@ internal sealed class PyNTTDimExpressionEmitter : ExprFunctor<PyNTTDimExpression
         var operand = Visit(expr.Operand);
         var min = Visit(expr.MinValue);
         var max = Visit(expr.MaxValue);
-        return new(
-            $"min(max({operand.PythonExpression}, {min.PythonExpression}), {max.PythonExpression})",
-            $"tl.minimum(tl.maximum({operand.TritonExpression}, {min.TritonExpression}), {max.TritonExpression})");
+        return WithRangeFromMetadata(Minimum(Maximum(operand, min), max), expr);
     }
 
     protected override PyNTTDimExpression VisitDimCompareAndSelect(DimCompareAndSelect expr)
@@ -110,14 +90,16 @@ internal sealed class PyNTTDimExpressionEmitter : ExprFunctor<PyNTTDimExpression
         var denominator = Visit(expr.Denominator);
         if (expr.DivMode == DimDivideMode.FloorDiv)
         {
-            return new(
+            var expression = new PyNTTDimExpression(
                 $"(({numerator.PythonExpression}) // ({denominator.PythonExpression}))",
                 $"(({numerator.TritonExpression}) // ({denominator.TritonExpression}))");
+            return WithRangeFromMetadata(expression, expr);
         }
 
-        return new(
+        var ceilExpression = new PyNTTDimExpression(
             $"(({numerator.PythonExpression} + {denominator.PythonExpression} - 1) // ({denominator.PythonExpression}))",
             $"(({numerator.TritonExpression} + {denominator.TritonExpression} - 1) // ({denominator.TritonExpression}))");
+        return WithRangeFromMetadata(ceilExpression, expr);
     }
 
     protected override PyNTTDimExpression VisitDimMax(DimMax expr)
@@ -128,11 +110,7 @@ internal sealed class PyNTTDimExpressionEmitter : ExprFunctor<PyNTTDimExpression
             return operands[0];
         }
 
-        var python = $"max({string.Join(", ", operands.Select(operand => operand.PythonExpression))})";
-        var triton = operands.Skip(1).Aggregate(
-            operands[0].TritonExpression,
-            (current, operand) => $"tl.maximum({current}, {operand.TritonExpression})");
-        return new(python, triton);
+        return WithRangeFromMetadata(operands.Skip(1).Aggregate(operands[0], Maximum), expr);
     }
 
     protected override PyNTTDimExpression VisitDimMin(DimMin expr)
@@ -143,11 +121,7 @@ internal sealed class PyNTTDimExpressionEmitter : ExprFunctor<PyNTTDimExpression
             return operands[0];
         }
 
-        var python = $"min({string.Join(", ", operands.Select(operand => operand.PythonExpression))})";
-        var triton = operands.Skip(1).Aggregate(
-            operands[0].TritonExpression,
-            (current, operand) => $"tl.minimum({current}, {operand.TritonExpression})");
-        return new(python, triton);
+        return WithRangeFromMetadata(operands.Skip(1).Aggregate(operands[0], Minimum), expr);
     }
 
     protected override PyNTTDimExpression VisitDimPositive(DimPositive expr)
@@ -179,16 +153,17 @@ internal sealed class PyNTTDimExpressionEmitter : ExprFunctor<PyNTTDimExpression
         }
 
         parts.AddRange(expr.Operands.ToArray().Select(Visit));
-        return BuildBinaryChain(parts, "*", 1);
+        return WithRangeFromMetadata(BuildBinaryChain(parts, "*", 1), expr);
     }
 
     protected override PyNTTDimExpression VisitDimRemainder(DimRemainder expr)
     {
         var numerator = Visit(expr.Numerator);
         var denominator = Visit(expr.Denominator);
-        return new(
+        var expression = new PyNTTDimExpression(
             $"(({numerator.PythonExpression}) % ({denominator.PythonExpression}))",
             $"(({numerator.TritonExpression}) % ({denominator.TritonExpression}))");
+        return WithRangeFromMetadata(expression, expr);
     }
 
     protected override PyNTTDimExpression VisitDimSum(DimSum expr)
@@ -203,7 +178,7 @@ internal sealed class PyNTTDimExpressionEmitter : ExprFunctor<PyNTTDimExpression
         }
 
         parts.AddRange(expr.Operands.ToArray().Select(Visit));
-        return BuildBinaryChain(parts, "+", 0);
+        return WithRangeFromMetadata(BuildBinaryChain(parts, "+", 0), expr);
     }
 
     protected override PyNTTDimExpression VisitDimVar(DimVar expr)
@@ -211,11 +186,123 @@ internal sealed class PyNTTDimExpressionEmitter : ExprFunctor<PyNTTDimExpression
         var name = SanitizePythonIdentifier(expr.Name);
         _registerRuntimeScalar?.Invoke(name);
         var formattedName = _formatRuntimeScalar(name);
-        return new(formattedName, formattedName);
+        return WithRangeFromMetadata(new(formattedName, formattedName), expr);
     }
+
+    protected override PyNTTDimExpression VisitAsDim(AsDim expr)
+        => EmitScalarExpression(expr.Dim);
 
     protected override PyNTTDimExpression VisitThreadIdDim(ThreadIdDim expr)
         => new(_threadIdExpression, _threadIdExpression);
+
+    private PyNTTDimExpression EmitScalarExpression(BaseExpr expr)
+    {
+        return expr switch
+        {
+            Dimension dimension => Visit(dimension),
+            TensorConst tensorConst when tensorConst.Value.Shape.IsScalar => FormatScalarConst(tensorConst.Value.ToScalar<long>()),
+            Call call => EmitScalarCall(call),
+            _ => throw new NotSupportedException($"Unsupported PyNTT dimension scalar expression: {expr.GetType().Name}."),
+        };
+    }
+
+    private PyNTTDimExpression EmitScalarCall(Call call)
+    {
+        var args = call.Arguments.ToArray();
+        return call.Target switch
+        {
+            AsTensor when args.Length == 1 => EmitScalarExpression(args[0]),
+            LocalShardDim localShardDim when args.Length == 1 => EmitLocalShardDim(localShardDim, args[0]),
+            _ => throw new NotSupportedException($"Unsupported PyNTT dimension scalar call target: {call.Target.GetType().Name}."),
+        };
+    }
+
+    private PyNTTDimExpression EmitLocalShardDim(LocalShardDim op, BaseExpr dimExpr)
+    {
+        var globalDim = EmitScalarExpression(dimExpr);
+        if (op.AxisPolicy is not SBPSplit split || split.Axes.Count == 0)
+        {
+            return globalDim;
+        }
+
+        var axes = split.Axes.ToArray();
+        var hierarchy = op.Placement.Hierarchy.ToArray();
+        foreach (var axis in axes)
+        {
+            if (axis < 0 || axis >= hierarchy.Length)
+            {
+                throw new NotSupportedException($"PyNTT LocalShardDim split axis {axis} is outside placement rank {hierarchy.Length}.");
+            }
+        }
+
+        var shardCount = axes.Select(axis => hierarchy[axis]).Aggregate(1, checked((lhs, rhs) => lhs * rhs));
+        if (shardCount == 1)
+        {
+            return globalDim;
+        }
+
+        var localDim = split.Granularity is { } granularity
+            ? Visit(granularity)
+            : CeilDiv(globalDim, Const(shardCount));
+        var shardOffset = Multiply(BuildSubShardLinearIndex(axes, hierarchy), localDim);
+        if (CanUseFullLocalDim(globalDim, localDim, shardCount))
+        {
+            return localDim;
+        }
+
+        return Maximum(PyNTTDimExpression.Zero, Minimum(localDim, Subtract(globalDim, shardOffset)));
+    }
+
+    private static PyNTTDimExpression BuildSubShardLinearIndex(IReadOnlyList<int> axes, IReadOnlyList<int> hierarchy)
+    {
+        var parts = new List<PyNTTDimExpression>();
+        for (var i = 0; i < axes.Count; i++)
+        {
+            var stride = 1;
+            for (var j = i + 1; j < axes.Count; j++)
+            {
+                stride = checked(stride * hierarchy[axes[j]]);
+            }
+
+            var coord = BuildShardCoordExpression(axes[i], hierarchy);
+            parts.Add(stride == 1 ? coord : Multiply(Const(stride), coord));
+        }
+
+        return BuildBinaryChain(parts, "+", 0);
+    }
+
+    private static PyNTTDimExpression BuildShardCoordExpression(int axis, IReadOnlyList<int> hierarchy)
+    {
+        var divisor = 1;
+        for (var i = axis + 1; i < hierarchy.Count; i++)
+        {
+            divisor = checked(divisor * hierarchy[i]);
+        }
+
+        var dividend = divisor == 1
+            ? "shard_index"
+            : $"(shard_index // {divisor.ToString(CultureInfo.InvariantCulture)})";
+        var extent = hierarchy[axis];
+        if (extent == 1)
+        {
+            return PyNTTDimExpression.Zero;
+        }
+
+        var expression = $"(({dividend}) % {extent.ToString(CultureInfo.InvariantCulture)})";
+        return new(expression, expression);
+    }
+
+    private static bool CanUseFullLocalDim(PyNTTDimExpression globalDim, PyNTTDimExpression localDim, int shardCount)
+    {
+        if (!globalDim.FixedValue.HasValue || !localDim.FixedValue.HasValue)
+        {
+            return false;
+        }
+
+        var globalValue = globalDim.FixedValue.Value;
+        var localValue = localDim.FixedValue.Value;
+        return localValue > 0 && globalValue >= localValue * shardCount && globalValue % localValue == 0;
+    }
 
     private static PyNTTDimExpression BuildBinaryChain(IReadOnlyList<PyNTTDimExpression> parts, string op, long identity)
     {
@@ -238,10 +325,153 @@ internal sealed class PyNTTDimExpressionEmitter : ExprFunctor<PyNTTDimExpression
                 : parts.Aggregate(0L, (value, part) => checked(value + part.FixedValue!.Value));
         }
 
+        long? rangeMin = null;
+        long? rangeMax = null;
+        if (op == "+")
+        {
+            rangeMin = parts.All(part => part.MinValue.HasValue)
+                ? parts.Aggregate(0L, (value, part) => checked(value + part.MinValue!.Value))
+                : null;
+            rangeMax = parts.All(part => part.MaxValue.HasValue)
+                ? parts.Aggregate(0L, (value, part) => checked(value + part.MaxValue!.Value))
+                : null;
+        }
+        else if (op == "*" && parts.All(part => part.MinValue.HasValue && part.MaxValue.HasValue && part.MinValue.Value >= 0))
+        {
+            rangeMin = parts.Aggregate(1L, (value, part) => checked(value * part.MinValue!.Value));
+            rangeMax = parts.Aggregate(1L, (value, part) => checked(value * part.MaxValue!.Value));
+        }
+
         return new(
             $"({string.Join($" {op} ", parts.Select(part => part.PythonExpression))})",
             $"({string.Join($" {op} ", parts.Select(part => part.TritonExpression))})",
-            fixedValue);
+            fixedValue,
+            rangeMin,
+            rangeMax);
+    }
+
+    private static PyNTTDimExpression Const(long value)
+    {
+        var text = value.ToString(CultureInfo.InvariantCulture);
+        return new(text, text, value);
+    }
+
+    private static PyNTTDimExpression FormatScalarConst(long value) => Const(value);
+
+    private static PyNTTDimExpression WithRangeFromMetadata(PyNTTDimExpression expression, BaseExpr source)
+    {
+        if (expression.FixedValue.HasValue || source.Metadata.Range is not { } range)
+        {
+            return expression;
+        }
+
+        if (!double.IsFinite(range.Min) ||
+            !double.IsFinite(range.Max) ||
+            range.Min < long.MinValue ||
+            range.Min > long.MaxValue ||
+            range.Max < long.MinValue ||
+            range.Max > long.MaxValue)
+        {
+            return expression;
+        }
+
+        return expression with
+        {
+            RangeMin = checked((long)Math.Floor(range.Min)),
+            RangeMax = checked((long)Math.Ceiling(range.Max)),
+        };
+    }
+
+    private static PyNTTDimExpression Add(PyNTTDimExpression lhs, PyNTTDimExpression rhs)
+        => BuildBinaryChain([lhs, rhs], "+", 0);
+
+    private static PyNTTDimExpression Subtract(PyNTTDimExpression lhs, PyNTTDimExpression rhs)
+    {
+        if (rhs.FixedValue == 0)
+        {
+            return lhs;
+        }
+
+        if (lhs.FixedValue.HasValue && rhs.FixedValue.HasValue)
+        {
+            return Const(checked(lhs.FixedValue.Value - rhs.FixedValue.Value));
+        }
+
+        long? rangeMin = lhs.MinValue.HasValue && rhs.MaxValue.HasValue
+            ? checked(lhs.MinValue.Value - rhs.MaxValue.Value)
+            : null;
+        long? rangeMax = lhs.MaxValue.HasValue && rhs.MinValue.HasValue
+            ? checked(lhs.MaxValue.Value - rhs.MinValue.Value)
+            : null;
+        return new(
+            $"(({lhs.PythonExpression}) - ({rhs.PythonExpression}))",
+            $"(({lhs.TritonExpression}) - ({rhs.TritonExpression}))",
+            null,
+            rangeMin,
+            rangeMax);
+    }
+
+    private static PyNTTDimExpression Multiply(PyNTTDimExpression lhs, PyNTTDimExpression rhs)
+        => BuildBinaryChain([lhs, rhs], "*", 1);
+
+    private static PyNTTDimExpression CeilDiv(PyNTTDimExpression numerator, PyNTTDimExpression denominator)
+    {
+        if (numerator.FixedValue.HasValue && denominator.FixedValue.HasValue)
+        {
+            var denominatorValue = denominator.FixedValue.Value;
+            return Const(checked((numerator.FixedValue.Value + denominatorValue - 1) / denominatorValue));
+        }
+
+        long? rangeMin = numerator.MinValue.HasValue && denominator.FixedValue is > 0
+            ? checked((numerator.MinValue.Value + denominator.FixedValue.Value - 1) / denominator.FixedValue.Value)
+            : null;
+        long? rangeMax = numerator.MaxValue.HasValue && denominator.FixedValue is > 0
+            ? checked((numerator.MaxValue.Value + denominator.FixedValue.Value - 1) / denominator.FixedValue.Value)
+            : null;
+        return new(
+            $"(({numerator.PythonExpression} + {denominator.PythonExpression} - 1) // ({denominator.PythonExpression}))",
+            $"(({numerator.TritonExpression} + {denominator.TritonExpression} - 1) // ({denominator.TritonExpression}))",
+            null,
+            rangeMin,
+            rangeMax);
+    }
+
+    private static PyNTTDimExpression Minimum(PyNTTDimExpression lhs, PyNTTDimExpression rhs)
+    {
+        if (lhs.FixedValue.HasValue && rhs.FixedValue.HasValue)
+        {
+            return Const(Math.Min(lhs.FixedValue.Value, rhs.FixedValue.Value));
+        }
+
+        var minValues = new[] { lhs.MinValue, rhs.MinValue }.OfType<long>().ToArray();
+        var maxValues = new[] { lhs.MaxValue, rhs.MaxValue }.OfType<long>().ToArray();
+        long? rangeMin = minValues.Length == 2 ? minValues.Min() : null;
+        long? rangeMax = maxValues.Length > 0 ? maxValues.Min() : null;
+        return new(
+            $"min({lhs.PythonExpression}, {rhs.PythonExpression})",
+            $"tl.minimum({lhs.TritonExpression}, {rhs.TritonExpression})",
+            null,
+            rangeMin,
+            rangeMax);
+    }
+
+    private static PyNTTDimExpression Maximum(PyNTTDimExpression lhs, PyNTTDimExpression rhs)
+    {
+        if (lhs.FixedValue.HasValue && rhs.FixedValue.HasValue)
+        {
+            return Const(Math.Max(lhs.FixedValue.Value, rhs.FixedValue.Value));
+        }
+
+        var minValues = new[] { lhs.MinValue, rhs.MinValue }.OfType<long>().ToArray();
+        var maxValues = new[] { lhs.MaxValue, rhs.MaxValue }.OfType<long>().ToArray();
+        long? rangeMin = minValues.Length > 0 ? minValues.Max() : null;
+        long? rangeMax = maxValues.Length == 2 ? maxValues.Max() : null;
+        return new(
+            $"max({lhs.PythonExpression}, {rhs.PythonExpression})",
+            $"tl.maximum({lhs.TritonExpression}, {rhs.TritonExpression})",
+            null,
+            rangeMin,
+            rangeMax);
     }
 
     private static string CompareOpToPython(CompareOp compareOp) => compareOp switch

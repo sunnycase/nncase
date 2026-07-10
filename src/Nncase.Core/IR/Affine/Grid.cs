@@ -15,6 +15,7 @@ public sealed class Grid : Expr
 {
     private readonly int _bodyParametersCount;
     private readonly int _accessMapsCount;
+    private readonly int _readsCount;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="Grid"/> class.
@@ -30,6 +31,7 @@ public sealed class Grid : Expr
     {
         _bodyParametersCount = bodyParameters.Length;
         _accessMapsCount = accessMaps.Length;
+        _readsCount = reads.Length;
 
         if (buffers.Length != _accessMapsCount
             || buffers.Length != bodyParameters.Length)
@@ -37,7 +39,7 @@ public sealed class Grid : Expr
             throw new ArgumentException("Invalid buffers count.");
         }
 
-        if (reads.Length != _accessMapsCount - 1)
+        if (reads.Length >= _accessMapsCount)
         {
             throw new ArgumentException("Invalid reads count.");
         }
@@ -51,9 +53,13 @@ public sealed class Grid : Expr
 
     public ReadOnlySpan<Expr> Buffers => SpanUtility.UnsafeCast<BaseExpr, Expr>(Operands.Slice(1 + _bodyParametersCount + _accessMapsCount, _accessMapsCount));
 
-    public ReadOnlySpan<Expr> Reads => SpanUtility.UnsafeCast<BaseExpr, Expr>(Operands.Slice(1 + _bodyParametersCount + (_accessMapsCount * 2), _accessMapsCount - 1));
+    public ReadOnlySpan<Expr> Reads => SpanUtility.UnsafeCast<BaseExpr, Expr>(Operands.Slice(1 + _bodyParametersCount + (_accessMapsCount * 2), _readsCount));
 
-    public Sequential Body => (Sequential)Operands[1 + _bodyParametersCount + (_accessMapsCount * 3) - 1];
+    public ReadOnlySpan<Expr> Writes => Buffers[_readsCount..];
+
+    public ReadOnlySpan<AffineMap> WriteAccessMaps => AccessMaps[_readsCount..];
+
+    public Sequential Body => (Sequential)Operands[1 + _bodyParametersCount + (_accessMapsCount * 2) + _readsCount];
 
     /// <inheritdoc/>
     public override TExprResult Accept<TExprResult, TTypeResult, TContext>(ExprFunctor<TExprResult, TTypeResult, TContext> functor, TContext context)

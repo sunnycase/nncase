@@ -4,6 +4,9 @@
 using System.Diagnostics;
 using System.Text.RegularExpressions;
 using Google.OrTools.ConstraintSolver;
+using Nncase.IR;
+using Nncase.IR.Affine;
+using Nncase.IR.Tensors;
 using Nncase.Graphs;
 using QuikGraph;
 using QuikGraph.Graphviz;
@@ -50,7 +53,10 @@ public static class GraphExtensions
                         domainCell.Cells.Add(new() { Text = $"read: {item}", Port = $"R{i}" });
                     }
 
-                    domainCell.Cells.Add(new() { Text = $"write: {arg.Vertex.WriteAccess}", Port = $"W" });
+                    for (int i = 0; i < arg.Vertex.WriteAccesses.Length; i++)
+                    {
+                        domainCell.Cells.Add(new() { Text = $"write{i}: {arg.Vertex.WriteAccesses[i]}", Port = $"W{i}" });
+                    }
 
                     for (int i = 0; i < arg.Vertex.DomainBounds.Length; i++)
                     {
@@ -65,7 +71,7 @@ public static class GraphExtensions
 
                 alg.FormatEdge += (_, arg) =>
                 {
-                    arg.EdgeFormat.TailPort = $"W:e";
+                    arg.EdgeFormat.TailPort = $"W{GetProducerOutputIndex(arg.Edge.Target.Grid.Reads[arg.Edge.Tag], arg.Edge.Source)}:e";
                     arg.EdgeFormat.HeadPort = $"R{arg.Edge.Tag}:e";
                 };
             });
@@ -263,7 +269,51 @@ public static class GraphExtensions
     public static IR.Expr GetArgument(this IR.Affine.Grid grid, int index)
     {
         // note why we use bufferof wrapper the reads?
-        return index >= grid.Reads.Length ? grid.Buffers[^1] : grid.Reads[index];
+        return index >= grid.Reads.Length ? grid.Buffers[index] : grid.Reads[index];
+    }
+
+    public static bool TryGetProducerGrid(Expr expr, out Grid producer, out int outputIndex)
+    {
+        if (expr is Grid grid)
+        {
+            producer = grid;
+            outputIndex = 0;
+            return true;
+        }
+
+        if (expr is Call { Target: GetItem } getItem &&
+            getItem[GetItem.Input] is Grid inputGrid &&
+            getItem[GetItem.Index] is DimConst index)
+        {
+            producer = inputGrid;
+            outputIndex = checked((int)index.Value);
+            return true;
+        }
+
+        producer = null!;
+        outputIndex = -1;
+        return false;
+    }
+
+    public static int GetOutputBufferIndex(this Grid grid, int outputIndex)
+    {
+        if (outputIndex < 0 || outputIndex >= grid.Writes.Length)
+        {
+            throw new ArgumentOutOfRangeException(nameof(outputIndex), $"Grid has {grid.Writes.Length} outputs, got {outputIndex}.");
+        }
+
+        return grid.Reads.Length + outputIndex;
+    }
+
+    public static int GetProducerOutputIndex(Expr consumerRead, TileGrid producer)
+    {
+        if (!TryGetProducerGrid(consumerRead, out var producerGrid, out var outputIndex) ||
+            !ReferenceEquals(producerGrid, producer.Grid))
+        {
+            throw new InvalidOperationException($"Read expression does not reference producer Op{producer.OpId}.");
+        }
+
+        return outputIndex;
     }
 
     public static (HashSet<BufferIdentity> Inputs, HashSet<BufferIdentity> Outputs) GetInputsOutputs(this BufferGraph g, BufferGraph? parent)

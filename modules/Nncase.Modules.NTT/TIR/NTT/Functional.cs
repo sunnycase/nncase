@@ -268,6 +268,11 @@ public partial class NTT
         return new Call(new Reshape(), input, ret);
     }
 
+    public static Expr Bitcast(Expr input, Expr ret)
+    {
+        return new Call(new Bitcast(), input, ret);
+    }
+
     public static Expr PagedAttention(Expr q, Expr kvcache, Expr extra, Expr scale, Dimension layerId, Expr ret, IRArray<IR.NN.AttentionDimKind> layout, int hiddenSize)
     {
         return new Call(new PagedAttention(layout, hiddenSize), q, kvcache, extra, scale, layerId, ret);

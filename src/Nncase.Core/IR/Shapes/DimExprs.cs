@@ -644,7 +644,7 @@ public sealed class DimMin : OpaqueDim, IEquatable<DimMin?>
     private ValueRange<double> InferRange()
     {
         var min = double.MaxValue;
-        var max = double.MinValue;
+        var max = double.MaxValue;
         foreach (var operand in Operands)
         {
             var range = operand.Metadata.Range!.Value;
@@ -706,7 +706,7 @@ public sealed class DimMax : OpaqueDim, IEquatable<DimMax?>
 
     private ValueRange<double> InferRange()
     {
-        var min = double.MaxValue;
+        var min = double.MinValue;
         var max = double.MinValue;
         foreach (var operand in Operands)
         {

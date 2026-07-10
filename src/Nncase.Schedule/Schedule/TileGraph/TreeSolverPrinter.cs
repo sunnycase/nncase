@@ -122,8 +122,11 @@ public sealed class TreeSolverPrinter : TreeSolverBase<IntExpr>, ITreeNodeVisito
             writer.WriteLine(value.ReadAccesses[i]);
         }
 
-        writer.Write("- write: ");
-        writer.WriteLine(value.WriteAccess);
+        for (int i = 0; i < value.WriteAccesses.Length; i++)
+        {
+            writer.Write($"- write_{i}: ");
+            writer.WriteLine(value.WriteAccesses[i]);
+        }
         writer.Indent--;
         writer.Indent--;
 

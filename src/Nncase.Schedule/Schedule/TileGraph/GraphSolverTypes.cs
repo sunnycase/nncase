@@ -11,11 +11,15 @@ namespace Nncase.Schedule.TileGraph;
 
 public sealed record BufferIdentity(TileGrid Node, int Index)
 {
-    public bool IsOutput => Index == Node.ReadAccesses.Length;
+    public bool IsOutput => Index >= Node.ReadAccesses.Length;
+
+    public int OutputIndex => IsOutput ? Index - Node.ReadAccesses.Length : -1;
 
     public bool IsOutputLiveOut => IsOutput && Node.Attribute.HasFlag(TileGridAttribute.LiveOut);
 
-    public override string ToString() => IsOutput ? $"Op{Node.OpId}_Out" : $"Op{Node.OpId}_in{Index}";
+    public override string ToString() => IsOutput
+        ? (Node.WriteAccesses.Length == 1 ? $"Op{Node.OpId}_Out" : $"Op{Node.OpId}_Out{OutputIndex}")
+        : $"Op{Node.OpId}_in{Index}";
 }
 
 /// <summary>

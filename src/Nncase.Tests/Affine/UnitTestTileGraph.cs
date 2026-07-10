@@ -5,9 +5,11 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Threading.Tasks;
 using Nncase.Graphs;
 using Nncase.IR;
 using Nncase.Passes;
+using Nncase.Passes.Transforms;
 using Nncase.Schedule.TileGraph;
 using QuikGraph;
 using QuikGraph.Graphviz;
@@ -75,6 +77,199 @@ public sealed class UnitTestTileGraph : TestClassBase
 #if DEBUG
         CompileOptions.DumpFlags = Diagnostics.DumpFlags.Tiling;
 #endif
+    }
+
+    [Fact]
+    public void TestReshapeAffineSelectionPreservesVectorLanes()
+    {
+        var vectorType = new VectorType(DataTypes.BFloat16, [8]);
+        var input = new Var("input", new TensorType(vectorType, new[] { 20, 128 }));
+        var reshape = IR.F.Tensors.Reshape(input, new Dimension[] { 20, 16, 8 });
+        var function = new Function("main", Targets.CPUTarget.Kind, reshape, [input]);
+
+        var post = Assert.IsType<Function>(new NTTAffineSelectionPass(CompileOptions).RunAsync(function, new()).Result);
+        var grid = Assert.IsType<IR.Affine.Grid>(post.Body);
+        Assert.Equal(1, grid.Body.Fields.Length);
+        var bodyCall = Assert.IsType<Call>(grid.Body.Fields[0]);
+        var reshapeKernel = Assert.IsType<TIR.NTT.Reshape>(bodyCall.Target);
+        Assert.Equal(vectorType, bodyCall.Arguments[0].CheckedDataType);
+        Assert.Equal(vectorType, bodyCall.Arguments[1].CheckedDataType);
+    }
+
+    [Fact]
+    public void TestBitcastAffineSelectionUsesDedicatedLaneReinterpretationKernel()
+    {
+        var input = new Var("input", new TensorType(new VectorType(DataTypes.BFloat16, [8]), new[] { 20, 128 }));
+        var bitcast = IR.F.Tensors.Bitcast(input, DataTypes.BFloat16);
+        var function = new Function("main", Targets.CPUTarget.Kind, bitcast, [input]);
+
+        var post = Assert.IsType<Function>(new NTTAffineSelectionPass(CompileOptions).RunAsync(function, new()).Result);
+        var grid = Assert.IsType<IR.Affine.Grid>(post.Body);
+        Assert.Equal(1, grid.Body.Fields.Length);
+        var bodyCall = Assert.IsType<Call>(grid.Body.Fields[0]);
+        var bitcastKernel = Assert.IsType<TIR.NTT.Bitcast>(bodyCall.Target);
+        Assert.Equal(new VectorType(DataTypes.BFloat16, [8]), bodyCall.Arguments[0].CheckedDataType);
+        Assert.Equal(DataTypes.BFloat16, bodyCall.Arguments[1].CheckedDataType);
+    }
+
+    [Fact]
+    public void TestPackedMatMulGluAffineSelection()
+    {
+        var input = new Var("input", new TensorType(DataTypes.BFloat16, new[] { 20, 512 }));
+        var packedWeightType = new TensorType(new VectorType(DataTypes.BFloat16, [4, 8]), new[] { 24, 512 });
+        var gateWeight = new Var("gate_weight", packedWeightType);
+        var upWeight = new Var("up_weight", packedWeightType);
+        var glu = IR.F.NTT.PackedMatMulGlu(
+            input,
+            gateWeight,
+            upWeight,
+            None.Default,
+            None.Default,
+            None.Default,
+            None.Default,
+            None.Default,
+            None.Default,
+            IR.NN.GluType.SwiGLU,
+            DataTypes.BFloat16);
+        var function = new Function("main", Targets.CPUTarget.Kind, glu, [input, gateWeight, upWeight]);
+
+        var post = Assert.IsType<Function>(new NTTAffineSelectionPass(CompileOptions).RunAsync(function, new()).Result);
+        var grid = Assert.IsType<IR.Affine.Grid>(post.Body);
+        Assert.Equal(3, grid.Reads.Length);
+        Assert.Equal(1, grid.Writes.Length);
+        Assert.Equal(2, grid.AccessMaps[0].Domains.Length);
+        var kRange = grid.AccessMaps[0].Results[^1];
+        Assert.Equal(0, Assert.IsType<IR.Affine.AffineConstant>(kRange.Offset).Value);
+        Assert.Equal(512, Assert.IsType<IR.Affine.AffineConstant>(kRange.Extent).Value);
+        Assert.Equal(1, grid.Body.Fields.Length);
+        var bodyCall = Assert.IsType<Call>(grid.Body.Fields[0]);
+        Assert.IsType<TIR.NTT.PackedMatMulGlu>(bodyCall.Target);
+    }
+
+    [Fact]
+    public void TestPackedQKVParallelLinearAffineSelectionUsesSharedProjectionDomain()
+    {
+        var input = new Var("input", new TensorType(DataTypes.BFloat16, new[] { 20, 512 }));
+        var packedDataType = new VectorType(DataTypes.BFloat16, [4, 8]);
+        var qWeight = new Var("q_weight", new TensorType(packedDataType, new[] { 16, 512 }));
+        var kWeight = new Var("k_weight", new TensorType(packedDataType, new[] { 8, 512 }));
+        var vWeight = new Var("v_weight", new TensorType(packedDataType, new[] { 8, 512 }));
+        var qkv = IR.F.NTT.PackedQKVParallelLinear(
+            input,
+            qWeight,
+            kWeight,
+            vWeight,
+            None.Default,
+            None.Default,
+            None.Default,
+            None.Default,
+            None.Default,
+            None.Default,
+            None.Default,
+            None.Default,
+            None.Default,
+            numHeads: 16,
+            numKvHeads: 8,
+            outDataType: DataTypes.BFloat16);
+        var function = new Function("main", Targets.CPUTarget.Kind, qkv, [input, qWeight, kWeight, vWeight]);
+
+        var post = Assert.IsType<Function>(new NTTAffineSelectionPass(CompileOptions).RunAsync(function, new()).Result);
+        var grid = Assert.IsType<IR.Affine.Grid>(post.Body);
+        Assert.Equal(4, grid.Reads.Length);
+        Assert.Equal(3, grid.Writes.Length);
+        Assert.All(grid.AccessMaps.ToArray(), map => Assert.Equal(2, map.Domains.Length));
+
+        var domainOffsets = new long[] { 3, 5 };
+        var domainExtents = new long[] { 7, 11 };
+        var qWeightRange = grid.AccessMaps[1].Results[0].Apply(domainOffsets, domainExtents);
+        var kWeightRange = grid.AccessMaps[2].Results[0].Apply(domainOffsets, domainExtents);
+        var vWeightRange = grid.AccessMaps[3].Results[0].Apply(domainOffsets, domainExtents);
+        Assert.Equal(new ValueRange<long>(10, 22), qWeightRange);
+        Assert.Equal(new ValueRange<long>(5, 11), kWeightRange);
+        Assert.Equal(new ValueRange<long>(5, 11), vWeightRange);
+
+        Assert.Equal(1, grid.Body.Fields.Length);
+        var bodyCall = Assert.IsType<Call>(grid.Body.Fields[0]);
+        Assert.IsType<TIR.NTT.PackedQKVParallelLinear>(bodyCall.Target);
+    }
+
+    [Fact]
+    public void TestUpdatePagedAttentionKVCacheAffineSelectionUsesObjectAsSsaOutput()
+    {
+        var slots = new Var("slots", new TensorType(DataTypes.BFloat16, new[] { 1, 1, 8 }));
+        var objectType = TensorType.Scalar(new ReferenceType(DataTypes.Int32));
+        var kvCache = new Var("kv_cache", objectType);
+        var update = IR.F.NN.UpdatePagedAttentionKVCache(
+            slots,
+            kvCache,
+            IR.NN.AttentionCacheKind.Key,
+            0,
+            [IR.NN.AttentionDimKind.Seq, IR.NN.AttentionDimKind.Head, IR.NN.AttentionDimKind.Dim]);
+        var function = new Function("main", Targets.CPUTarget.Kind, update, [slots, kvCache]);
+
+        var post = Assert.IsType<Function>(new NTTAffineSelectionPass(CompileOptions).RunAsync(function, new()).Result);
+        var grid = Assert.IsType<IR.Affine.Grid>(post.Body);
+        Assert.Equal(2, grid.Reads.Length);
+        Assert.Equal(1, grid.Writes.Length);
+        Assert.Same(kvCache, grid.Reads[1]);
+        Assert.Same(kvCache, grid.Writes[0]);
+        Assert.Equal(1, grid.Body.Fields.Length);
+        var bodyCall = Assert.IsType<Call>(grid.Body.Fields[0]);
+        Assert.IsType<TIR.NTT.UpdatePagedAttentionKVCache>(bodyCall.Target);
+    }
+
+    [Fact]
+    public async Task TestAutoTilePreservesPassthroughObjectAtClusterBoundary()
+    {
+        var slots = new Var("slots", new TensorType(DataTypes.BFloat16, new[] { 1, 1, 8 }));
+        var objectType = TensorType.Scalar(new ReferenceType(DataTypes.Int32));
+        var kvCache = new Var("kv_cache", objectType);
+        var passthrough = new Var("passthrough", objectType);
+        var update = IR.F.NN.UpdatePagedAttentionKVCache(
+            slots,
+            kvCache,
+            IR.NN.AttentionCacheKind.Key,
+            0,
+            [IR.NN.AttentionDimKind.Seq, IR.NN.AttentionDimKind.Head, IR.NN.AttentionDimKind.Dim]);
+        var selectionInput = new Function("selection_input", Targets.CPUTarget.Kind, update, [slots, kvCache]);
+        var selected = Assert.IsType<Function>(await new NTTAffineSelectionPass(CompileOptions).RunAsync(selectionInput, new()));
+        var grid = Assert.IsType<IR.Affine.Grid>(selected.Body);
+        var function = new Function("main", Targets.CPUTarget.Kind, new IR.Tuple(grid, passthrough), [slots, kvCache, passthrough]);
+
+        var tiled = Assert.IsType<Function>(await new AutoTilePass(Targets.CPUTarget.Kind, CompileOptions).RunAsync(function, new()));
+
+        var outputs = Assert.IsType<IR.Tuple>(tiled.Body);
+        Assert.Same(passthrough, outputs.Fields[1]);
+    }
+
+    [Fact]
+    public async Task TestAutoTilePreservesPartialResultBeforeBoxing()
+    {
+        var placement = new Placement(new[] { 4, 8 }, "yx", "bb");
+        var inputType = new DistributedType(
+            new TensorType(new VectorType(DataTypes.BFloat16, [8]), new long[] { 20, 128 }),
+            new SBP[] { SBP.S([0], 5), SBP.S([1], 16) },
+            placement);
+        var input = new Var("input", inputType);
+        var stats = IR.F.NN.NormStats(1, input, useMean: false);
+        var partialStatsType = Assert.IsType<DistributedType>(stats.CheckedType);
+        var broadcastStatsType = partialStatsType with { Partial = null };
+        var boxed = IR.F.Distributed.Boxing(stats, broadcastStatsType);
+        var selectionInput = new Function("selection_input", Targets.CPUTarget.Kind, boxed, [input]);
+        var selected = Assert.IsType<Function>(await new NTTAffineSelectionPass(CompileOptions).RunAsync(selectionInput, new()));
+        var selectedBoxing = Assert.IsType<Call>(selected.Body);
+        Assert.IsType<IR.Distributed.Boxing>(selectedBoxing.Target);
+        var selectedGrid = Assert.IsType<IR.Affine.Grid>(selectedBoxing.Arguments[0]);
+        Assert.Equal(partialStatsType.Partial, Assert.IsType<DistributedType>(selectedGrid.CheckedType).Partial);
+
+        var tiled = Assert.IsType<Function>(await new AutoTilePass(Targets.CPUTarget.Kind, CompileOptions).RunAsync(selected, new()));
+
+        var boxingCall = Assert.IsType<Call>(tiled.Body);
+        Assert.True(
+            boxingCall.Target is IR.Distributed.Boxing,
+            $"AutoTile changed partial stats into {boxingCall.CheckedType} through {boxingCall.Target.GetType().Name}.\n{CompilerServices.Print(tiled)}");
+        var tiledStatsType = Assert.IsType<DistributedType>(boxingCall.Arguments[0].CheckedType);
+        Assert.Equal(partialStatsType.Partial, tiledStatsType.Partial);
     }
 
     [Fact]

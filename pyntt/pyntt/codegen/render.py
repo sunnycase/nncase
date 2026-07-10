@@ -140,12 +140,12 @@ def _render_device_function(
     helper_sources = _render_helper_sources(env, device_function.get("helpers", ()))
     parts = [source for source in helper_sources if source]
     device_parameters = parameters + tuple(device_function.get("extra_parameters", ()) or ())
-    device_call_arguments = _parameter_call_arguments(device_parameters)
+    base_call_arguments = _parameter_call_arguments(parameters)
     for stage in device_function["stages"]:
         body_source = _replace_device_function_calls(
             stage["body_source"],
             device_function_calls,
-            device_call_arguments,
+            base_call_arguments,
         )
         body_source = _with_shard_index_prelude(body_source)
         parts.append(
@@ -647,6 +647,18 @@ def _finish(lines: list[str]) -> str:
     return "\n".join(lines).rstrip()
 
 
+def _is_bool_dtype(dtype: Any) -> bool:
+    return str(dtype) == "bool"
+
+
+def _as_predicate(expression: str, dtype: Any) -> str:
+    return f"({expression} != 0)" if _is_bool_dtype(dtype) else expression
+
+
+def _store_value(expression: str, dtype: Any) -> str:
+    return f"({expression}).to(tl.uint8)" if _is_bool_dtype(dtype) else expression
+
+
 def _emit_elementwise_unary(model: dict[str, Any]) -> str:
     shape = model["Shape"]
     total = _multiply_expr(_product(model["OutputShape"]), model["OutputVectorLaneCount"])
@@ -687,7 +699,7 @@ def _emit_elementwise_unary(model: dict[str, Any]) -> str:
     _line(lines, 2, "value0 = tl.load(input0 + input_offsets, mask=mask)")
     _line(lines, 2, "value0_f32 = value0.to(tl.float32)")
     _line(lines, 2, f"result = {model['UnaryExpression']}")
-    _line(lines, 2, "tl.store(output + output_offsets, result, mask=mask)")
+    _line(lines, 2, f"tl.store(output + output_offsets, {_store_value('result', model['OutputDType'])}, mask=mask)")
     return _finish(lines)
 
 
@@ -731,7 +743,7 @@ def _emit_elementwise_binary(model: dict[str, Any]) -> str:
     _line(lines, 2, "value0 = tl.load(lhs + lhs_offsets, mask=mask)")
     _line(lines, 2, "value1 = tl.load(rhs + rhs_offsets, mask=mask)")
     _line(lines, 2, f"result = {model['BinaryExpression']}")
-    _line(lines, 2, "tl.store(output + output_offsets, result, mask=mask)")
+    _line(lines, 2, f"tl.store(output + output_offsets, {_store_value('result', model['OutputDType'])}, mask=mask)")
     return _finish(lines)
 
 
@@ -764,7 +776,7 @@ def _emit_elementwise_cast(model: dict[str, Any]) -> str:
     _line(lines, 2, f"output_offsets = {tensor_offset('idx', model['OutputStrides'], model['OutputVectorLaneCount'])}")
     _line(lines, 2, "value0 = tl.load(input0 + input_offsets, mask=mask)")
     _line(lines, 2, f"result = {model['CastExpression']}")
-    _line(lines, 2, "tl.store(output + output_offsets, result, mask=mask)")
+    _line(lines, 2, f"tl.store(output + output_offsets, {_store_value('result', model['OutputDType'])}, mask=mask)")
     return _finish(lines)
 
 
@@ -1026,6 +1038,43 @@ def _emit_transpose(model: dict[str, Any]) -> str:
     return _finish(lines)
 
 
+def _emit_linear_view_copy(model: dict[str, Any], op_name: str) -> str:
+    total = _multiply_expr(_product(model["OutputShape"]), model["OutputVectorLaneCount"])
+
+    def tensor_offset(prefix: str, strides: list[Any], lane_count: int, lane_flat: str) -> str:
+        terms = [f"{prefix}{axis} * {_dim(stride)}" for axis, stride in enumerate(strides)]
+        tensor = "lane_flat * 0" if not terms else " + ".join(terms)
+        return tensor if lane_count == 1 else f"(({tensor}) * {lane_count} + {lane_flat})"
+
+    lines = _standard_header(
+        model,
+        f"# generated from PyNTT Jinja {op_name}.py.jinja\n# {model['Comment']}; input_dtype={model['InputDType']}, output_dtype={model['OutputDType']}, input_shape={_shape_tuple(model['InputShape'])}, output_shape={_shape_tuple(model['OutputShape'])}",
+        [("input", "Input"), ("output", "Output")],
+    )
+    _line(lines, 1, f"for linear_start in tl.range(0, {total}, block_size):")
+    _line(lines, 2, "linear = linear_start + tl.arange(0, block_size)")
+    _line(lines, 2, f"mask = linear < {total}")
+    _line(lines, 2, f"input_lane = linear % {model['InputVectorLaneCount']}")
+    _line(lines, 2, f"input_tensor_linear = linear // {model['InputVectorLaneCount']}")
+    _line(lines, 2, f"output_lane = linear % {model['OutputVectorLaneCount']}")
+    _line(lines, 2, f"output_tensor_linear = linear // {model['OutputVectorLaneCount']}")
+    _append_tensor_index_decompose(lines, 2, "input_tensor_linear", "in_idx", model["InputShape"])
+    _append_tensor_index_decompose(lines, 2, "output_tensor_linear", "out_idx", model["OutputShape"])
+    _line(lines, 2, f"input_offsets = {tensor_offset('in_idx', model['InputStrides'], model['InputVectorLaneCount'], 'input_lane')}")
+    _line(lines, 2, f"output_offsets = {tensor_offset('out_idx', model['OutputStrides'], model['OutputVectorLaneCount'], 'output_lane')}")
+    _line(lines, 2, "value = tl.load(input + input_offsets, mask=mask)")
+    _line(lines, 2, "tl.store(output + output_offsets, value, mask=mask)")
+    return _finish(lines)
+
+
+def _emit_reshape(model: dict[str, Any]) -> str:
+    return _emit_linear_view_copy(model, "Reshape")
+
+
+def _emit_bitcast(model: dict[str, Any]) -> str:
+    return _emit_linear_view_copy(model, "Bitcast")
+
+
 def _emit_elementwise_where(model: dict[str, Any]) -> str:
     logical_cond_shape = _logical_shape(model["CondShape"], model["CondVectorLaneCount"])
     logical_true_shape = _logical_shape(model["TrueShape"], model["TrueVectorLaneCount"])
@@ -1074,11 +1123,12 @@ def _emit_elementwise_where(model: dict[str, Any]) -> str:
     _line(lines, indent + 1, f"true_offsets = {offset(model['TrueShape'], logical_true_shape, model['TrueStrides'], model['TrueVectorLaneCount'])}")
     _line(lines, indent + 1, f"false_offsets = {offset(model['FalseShape'], logical_false_shape, model['FalseStrides'], model['FalseVectorLaneCount'])}")
     _line(lines, indent + 1, f"output_offsets = {offset(model['OutputShape'], logical_output_shape, model['OutputStrides'], model['OutputVectorLaneCount'])}")
-    _line(lines, indent + 1, "predicate = tl.load(cond + cond_offsets, mask=mask)")
+    _line(lines, indent + 1, "predicate_value = tl.load(cond + cond_offsets, mask=mask, other=0)")
+    _line(lines, indent + 1, f"predicate = {_as_predicate('predicate_value', model['CondDType'])}")
     _line(lines, indent + 1, "value0 = tl.load(true_value + true_offsets, mask=mask)")
     _line(lines, indent + 1, "value1 = tl.load(false_value + false_offsets, mask=mask)")
     _line(lines, indent + 1, "result = tl.where(predicate, value0, value1)")
-    _line(lines, indent + 1, "tl.store(output + output_offsets, result, mask=mask)")
+    _line(lines, indent + 1, f"tl.store(output + output_offsets, {_store_value('result', model['OutputDType'])}, mask=mask)")
     return _finish(lines)
 
 
@@ -1246,11 +1296,6 @@ def _emit_qkv_parallel_linear(model: dict[str, Any]) -> str:
             ("v_output", "VOutput"),
         ],
     )
-    _line(lines, 1, "tmp_shard = shard_index")
-    for axis in range(len(model["Hierarchy"]) - 1, -1, -1):
-        _line(lines, 1, f"shard_coord{axis} = tmp_shard % {model['Hierarchy'][axis]}")
-        _line(lines, 1, f"tmp_shard = tmp_shard // {model['Hierarchy'][axis]}")
-
     indent = 1
     for axis in batch_axes:
         _line(lines, indent, f"for idx{axis} in tl.range(0, {_dim(model['QOutputShape'][axis])}):")
@@ -1746,11 +1791,6 @@ def _emit_matmul_glu_like(model: dict[str, Any], *, packed: bool) -> str:
             ("output", "Output"),
         ],
     )
-    _line(lines, 1, "tmp_shard = shard_index")
-    for axis in range(len(model["Hierarchy"]) - 1, -1, -1):
-        _line(lines, 1, f"shard_coord{axis} = tmp_shard % {model['Hierarchy'][axis]}")
-        _line(lines, 1, f"tmp_shard = tmp_shard // {model['Hierarchy'][axis]}")
-
     indent = 1
     for axis in batch_axes:
         _line(lines, indent, f"for idx{axis} in tl.range(0, {_dim(logical_output_shape[axis])}):")
@@ -1783,138 +1823,14 @@ def _matmul_glu_logical_output_shape(model: dict[str, Any]) -> list[Any]:
     return shape
 
 
-def _matmul_glu_shape(model: dict[str, Any], name: str, fallback: str) -> list[Any]:
-    return model.get(name) or model[fallback]
-
-
-def _matmul_glu_split_axes(model: dict[str, Any], name: str, rank: int) -> list[list[int]]:
-    axes = model.get(name)
-    if axes is None:
-        return [[] for _ in range(rank)]
-    return axes
-
-
-def _matmul_glu_global_axis_index(
-    model: dict[str, Any],
-    local_expr: str,
-    global_shape: list[Any],
-    axis: int,
-    split_axes: list[int],
-    *,
-    lane_scale: int = 1,
-) -> str:
-    if not split_axes:
-        return local_expr
-    divisor = _split_divisor(split_axes, model["Hierarchy"])
-    base = f"({_split_linear_expression(split_axes, model['Hierarchy'])}) * tl.cdiv({_dim(global_shape[axis])}, {divisor})"
-    if lane_scale != 1:
-        base = f"({base}) * {lane_scale}"
-    return f"(({local_expr}) + ({base}))"
-
-
-def _matmul_glu_split_axes_equal(lhs: list[int], rhs: list[int]) -> bool:
-    return len(lhs) == len(rhs) and all(l == r for l, r in zip(lhs, rhs))
-
-
-def _matmul_glu_split_axes_is_prefix(prefix: list[int], values: list[int]) -> bool:
-    return len(prefix) <= len(values) and all(prefix[index] == values[index] for index in range(len(prefix)))
-
-
-def _matmul_glu_axis_shard_base(
-    model: dict[str, Any],
-    global_shape: list[Any],
-    axis: int,
-    split_axes: list[int],
-    *,
-    lane_scale: int = 1,
-) -> str:
-    if not split_axes:
-        return "0"
-    divisor = _split_divisor(split_axes, model["Hierarchy"])
-    base = f"({_split_linear_expression(split_axes, model['Hierarchy'])}) * tl.cdiv({_dim(global_shape[axis])}, {divisor})"
-    if lane_scale != 1:
-        base = f"({base}) * {lane_scale}"
-    return base
-
-
-def _matmul_glu_tensor_axis_index(
-    model: dict[str, Any],
-    local_expr: str,
-    tensor_shape: list[Any],
-    tensor_global_shape: list[Any],
-    tensor_axis: int,
-    tensor_split_axes: list[int],
-    canonical_global_shape: list[Any],
-    canonical_axis: int,
-    canonical_split_axes: list[int],
-    *,
-    lane_scale: int = 1,
-) -> tuple[str, Any]:
-    tensor_local_limit = _multiply_dim(tensor_shape[tensor_axis], lane_scale)
-    if _matmul_glu_split_axes_equal(tensor_split_axes, canonical_split_axes):
-        return local_expr, tensor_local_limit
-
-    canonical_base = _matmul_glu_axis_shard_base(
-        model,
-        canonical_global_shape,
-        canonical_axis,
-        canonical_split_axes,
-        lane_scale=lane_scale,
-    )
-    global_index = f"(({local_expr}) + ({canonical_base}))"
-    if not tensor_split_axes:
-        return global_index, _multiply_dim(tensor_global_shape[tensor_axis], lane_scale)
-
-    if _matmul_glu_split_axes_is_prefix(tensor_split_axes, canonical_split_axes):
-        tensor_base = _matmul_glu_axis_shard_base(
-            model,
-            tensor_global_shape,
-            tensor_axis,
-            tensor_split_axes,
-            lane_scale=lane_scale,
-        )
-        return f"(({global_index}) - ({tensor_base}))", tensor_local_limit
-
-    return local_expr, tensor_local_limit
-
-
 def _matmul_glu_input_m_index(model: dict[str, Any], m_expr: str) -> tuple[str, Any]:
-    input_shape = model["InputShape"]
-    input_global_shape = _matmul_glu_shape(model, "InputGlobalShape", "InputShape")
-    output_global_shape = _matmul_glu_shape(model, "OutputGlobalShape", "OutputShape")
-    input_split_axes = _matmul_glu_split_axes(model, "InputSplitAxes", len(input_global_shape))
-    output_split_axes = _matmul_glu_split_axes(model, "OutputSplitAxes", len(output_global_shape))
-    return _matmul_glu_tensor_axis_index(
-        model,
-        m_expr,
-        input_shape,
-        input_global_shape,
-        -2,
-        input_split_axes[-2],
-        output_global_shape,
-        -2,
-        output_split_axes[-2],
-    )
+    return m_expr, model["InputShape"][-2]
 
 
 def _matmul_glu_weight_k_index(model: dict[str, Any], prefix: str, k_expr: str, *, packed: bool) -> tuple[str, Any]:
     weight_shape = model[f"{prefix}WeightShape"]
-    weight_global_shape = _matmul_glu_shape(model, f"{prefix}WeightGlobalShape", f"{prefix}WeightShape")
-    input_global_shape = _matmul_glu_shape(model, "InputGlobalShape", "InputShape")
-    weight_split_axes = _matmul_glu_split_axes(model, f"{prefix}WeightSplitAxes", len(weight_global_shape))
-    input_split_axes = _matmul_glu_split_axes(model, "InputSplitAxes", len(input_global_shape))
     weight_axis = -1 if packed else -2
-    return _matmul_glu_tensor_axis_index(
-        model,
-        k_expr,
-        weight_shape,
-        weight_global_shape,
-        weight_axis,
-        weight_split_axes[weight_axis],
-        input_global_shape,
-        -1,
-        input_split_axes[-1],
-    )
+    return k_expr, weight_shape[weight_axis]
 
 
 def _matmul_glu_weight_n_index(
@@ -1925,24 +1841,9 @@ def _matmul_glu_weight_n_index(
     packed: bool,
 ) -> tuple[str, Any]:
     weight_shape = model[f"{prefix}WeightShape"]
-    weight_global_shape = _matmul_glu_shape(model, f"{prefix}WeightGlobalShape", f"{prefix}WeightShape")
-    output_global_shape = _matmul_glu_shape(model, "OutputGlobalShape", "OutputShape")
-    weight_split_axes = _matmul_glu_split_axes(model, f"{prefix}WeightSplitAxes", len(weight_global_shape))
-    output_split_axes = _matmul_glu_split_axes(model, "OutputSplitAxes", len(output_global_shape))
     weight_axis = -2 if packed else -1
     lane_scale = model["NPackedLaneCount"] * model["NVectorLaneCount"] if packed else 1
-    return _matmul_glu_tensor_axis_index(
-        model,
-        n_expr,
-        weight_shape,
-        weight_global_shape,
-        weight_axis,
-        weight_split_axes[weight_axis],
-        output_global_shape,
-        -1,
-        output_split_axes[-1],
-        lane_scale=lane_scale,
-    )
+    return n_expr, _multiply_dim(weight_shape[weight_axis], lane_scale)
 
 
 def _matmul_glu_bias_n_index(
@@ -1953,23 +1854,8 @@ def _matmul_glu_bias_n_index(
     packed: bool,
 ) -> tuple[str, Any]:
     bias_shape = model[f"{prefix}BiasShape"]
-    bias_global_shape = _matmul_glu_shape(model, f"{prefix}BiasGlobalShape", f"{prefix}BiasShape")
-    output_global_shape = _matmul_glu_shape(model, "OutputGlobalShape", "OutputShape")
-    bias_split_axes = _matmul_glu_split_axes(model, f"{prefix}BiasSplitAxes", len(bias_global_shape))
-    output_split_axes = _matmul_glu_split_axes(model, "OutputSplitAxes", len(output_global_shape))
     lane_scale = model["NPackedLaneCount"] * model["NVectorLaneCount"] if packed else 1
-    return _matmul_glu_tensor_axis_index(
-        model,
-        n_expr,
-        bias_shape,
-        bias_global_shape,
-        -1,
-        bias_split_axes[-1],
-        output_global_shape,
-        -1,
-        output_split_axes[-1],
-        lane_scale=lane_scale,
-    )
+    return n_expr, _multiply_dim(bias_shape[-1], lane_scale)
 
 
 def _matmul_glu_expr(model: dict[str, Any], gate: str, up: str) -> str:
@@ -2149,11 +2035,18 @@ def _emit_matmul_glu_matmul(
 
 def _emit_matmul_like(model: dict[str, Any], *, gemv: bool) -> str:
     output_n_scalar_lane_count = model.get("OutputNPackedLaneCount", 1) * model["OutputNVectorLaneCount"]
+    rhs_n_scalar_lane_count = model.get("RhsNPackedLaneCount", 1) * model["RhsNVectorLaneCount"]
     logical_output_shape = [dict(dim) if isinstance(dim, dict) else dim for dim in model["OutputShape"]]
     logical_output_shape[-1] = _multiply_dim(logical_output_shape[-1], output_n_scalar_lane_count)
     m = logical_output_shape[-2]
     n = logical_output_shape[-1]
+    lhs_m = model["LhsShape"][-1] if model["TransposeA"] else model["LhsShape"][-2]
     k = model["LhsShape"][-2] if model["TransposeA"] else model["LhsShape"][-1]
+    rhs_k = model["RhsShape"][-1] if model["TransposeB"] else model["RhsShape"][-2]
+    rhs_n = _multiply_dim(
+        model["RhsShape"][-2] if model["TransposeB"] else model["RhsShape"][-1],
+        rhs_n_scalar_lane_count,
+    )
     output_batch_rank = len(logical_output_shape) - 2
     batch_axes = list(range(output_batch_rank))
     lhs_batch_offset = _batch_offset_expression(model["LhsShape"], model["LhsStrides"], output_batch_rank)
@@ -2163,10 +2056,22 @@ def _emit_matmul_like(model: dict[str, Any], *, gemv: bool) -> str:
         f", rhs_n_packed_lane={model.get('RhsNPackedLaneCount', 1)}, rhs_n_lane={model['RhsNVectorLaneCount']}, "
         f"output_n_packed_lane={model.get('OutputNPackedLaneCount', 1)}, output_n_lane={model['OutputNVectorLaneCount']}"
     )
+    load_c_expression = str(model.get("LoadCExpression", "False")).strip() or "False"
+
+    def append_load_c(lines: list[str], indent: int, output_offsets: str, output_mask: str) -> None:
+        if load_c_expression in ("False", "false", "0"):
+            return
+
+        predicate = "True" if load_c_expression in ("True", "true", "1") else f"({load_c_expression})"
+        _line(lines, indent, f"previous = tl.load(output + {output_offsets}, mask=({output_mask}) & ({predicate}), other=0.0).to(tl.float32)")
+        if predicate == "True":
+            _line(lines, indent, "result = previous + result")
+        else:
+            _line(lines, indent, f"result = tl.where({predicate}, previous + result, result)")
 
     lines = _standard_header(
         model,
-        f"# generated from PyNTT Jinja {'Gemv' if gemv else 'Matmul'}.py.jinja\n# {model['Comment']}; lhs_dtype={model['LhsDType']}, rhs_dtype={model['RhsDType']}, output_dtype={model['OutputDType']}, lhs_shape={_shape_tuple(model['LhsShape'])}, rhs_shape={_shape_tuple(model['RhsShape'])}, output_shape={_shape_tuple(model['OutputShape'])}{lane_comment}",
+        f"# generated from PyNTT Jinja {'Gemv' if gemv else 'Matmul'}.py.jinja\n# {model['Comment']}; lhs_dtype={model['LhsDType']}, rhs_dtype={model['RhsDType']}, output_dtype={model['OutputDType']}, lhs_shape={_shape_tuple(model['LhsShape'])}, rhs_shape={_shape_tuple(model['RhsShape'])}, output_shape={_shape_tuple(model['OutputShape'])}{lane_comment}, load_c={load_c_expression}",
         [("lhs", "Lhs"), ("rhs", "Rhs"), ("output", "Output")],
     )
     _line(lines, 1, "tmp_shard = shard_index")
@@ -2197,11 +2102,15 @@ def _emit_matmul_like(model: dict[str, Any], *, gemv: bool) -> str:
         _line(lines, indent, f"acc = tl.zeros(({block_n},), tl.float32)")
         _line(lines, indent, f"for k_start in tl.range(0, {_dim(k)}, {block_k}):")
         _line(lines, indent + 1, f"offs_k = k_start + tl.arange(0, {block_k})")
-        _line(lines, indent + 1, f"rhs_values = tl.load(rhs + {rhs_offsets}, mask=(offs_n[:, None] < {_dim(n)}) & (offs_k[None, :] < {_dim(k)}), other=0.0, eviction_policy=\"evict_first\").to(tl.float32)")
-        _line(lines, indent + 1, f"lhs_values = tl.load(lhs + {lhs_offsets}, mask=offs_k < {_dim(k)}, other=0.0).to(tl.float32)")
+        rhs_mask = f"(offs_n[:, None] < {_dim(n)}) & (offs_n[:, None] < {_dim(rhs_n)}) & (offs_k[None, :] < {_dim(k)}) & (offs_k[None, :] < {_dim(rhs_k)})"
+        lhs_mask = f"(m_idx < {_dim(lhs_m)}) & (offs_k < {_dim(k)})"
+        _line(lines, indent + 1, f"rhs_values = tl.load(rhs + {rhs_offsets}, mask={rhs_mask}, other=0.0, eviction_policy=\"evict_first\").to(tl.float32)")
+        _line(lines, indent + 1, f"lhs_values = tl.load(lhs + {lhs_offsets}, mask={lhs_mask}, other=0.0).to(tl.float32)")
         _line(lines, indent + 1, "acc += tl.sum(rhs_values * lhs_values[None, :], axis=1)")
         _line(lines, indent, f"result = acc * {model['Scale']}")
-        _line(lines, indent, f"tl.store(output + {output_offsets}, result, mask=offs_n < {_dim(n)})")
+        output_mask = f"offs_n < {_dim(n)}"
+        append_load_c(lines, indent, output_offsets, output_mask)
+        _line(lines, indent, f"tl.store(output + {output_offsets}, result, mask={output_mask})")
     else:
         block_m = 16
         block_n = 64
@@ -2214,12 +2123,16 @@ def _emit_matmul_like(model: dict[str, Any], *, gemv: bool) -> str:
         _line(lines, indent + 2, f"acc = tl.zeros(({block_m}, {block_n}), tl.float32)")
         _line(lines, indent + 2, f"for k_start in tl.range(0, {_dim(k)}, {block_k}, num_stages=5):")
         _line(lines, indent + 3, f"offs_k = k_start + tl.arange(0, {block_k})")
-        _line(lines, indent + 3, f"rhs_values = tl.load(rhs + {rhs_offsets}, mask=(offs_k[:, None] < {_dim(k)}) & (offs_n[None, :] < {_dim(n)}), other=0.0)")
-        _line(lines, indent + 3, f"lhs_values = tl.load(lhs + {lhs_offsets}, mask=(offs_m[:, None] < {_dim(m)}) & (offs_k[None, :] < {_dim(k)}), other=0.0)")
+        rhs_mask = f"(offs_k[:, None] < {_dim(k)}) & (offs_k[:, None] < {_dim(rhs_k)}) & (offs_n[None, :] < {_dim(n)}) & (offs_n[None, :] < {_dim(rhs_n)})"
+        lhs_mask = f"(offs_m[:, None] < {_dim(m)}) & (offs_m[:, None] < {_dim(lhs_m)}) & (offs_k[None, :] < {_dim(k)})"
+        _line(lines, indent + 3, f"rhs_values = tl.load(rhs + {rhs_offsets}, mask={rhs_mask}, other=0.0)")
+        _line(lines, indent + 3, f"lhs_values = tl.load(lhs + {lhs_offsets}, mask={lhs_mask}, other=0.0)")
         dot_precision = ', input_precision="ieee"' if model["LhsDType"] == "float32" and model["RhsDType"] == "float32" else ""
         _line(lines, indent + 3, f"acc += tl.dot(lhs_values, rhs_values{dot_precision})")
         _line(lines, indent + 2, f"result = acc * {model['Scale']}")
-        _line(lines, indent + 2, f"tl.store(output + {output_offsets}, result, mask=(offs_m[:, None] < {_dim(m)}) & (offs_n[None, :] < {_dim(n)}))")
+        output_mask = f"(offs_m[:, None] < {_dim(m)}) & (offs_n[None, :] < {_dim(n)})"
+        append_load_c(lines, indent + 2, output_offsets, output_mask)
+        _line(lines, indent + 2, f"tl.store(output + {output_offsets}, result, mask={output_mask})")
     return _finish(lines)
 
 
@@ -3643,8 +3556,8 @@ def _emit_update_paged_attention_kv_cache(model: dict[str, Any]) -> str:
     block_offset_stride = cache[f"{kind_prefix}BlockOffsetStride"]
     vectorized_dim = cache[f"{kind_prefix}VectorizedDim"]
     slots_lane_count = model["SlotsVectorLaneCount"]
-    head_split_axes = model["SlotsSplitAxes"][model["HeadAxis"]]
-    topology_match_axes = [axis for axis in cache["NumBlocksSplitAxes"] if axis not in head_split_axes]
+    source_split_axes = sorted({axis for split_axes in model["SlotsSourceSplitAxes"] for axis in split_axes})
+    topology_match_axes = [axis for axis in cache["NumBlocksSplitAxes"] if axis not in source_split_axes]
     full_source_shard_index = _split_linear_expression(list(range(len(model["Hierarchy"]))), model["Hierarchy"], "source_shard_coord")
     block_index = "(topology_id * num_blocks_per_shard + block_id)" if cache["IdLength"] > 1 else "block_id"
     cache_offset = f"({block_index} * {cache['BlockElements']} + {section_offset} + (layer_id_value * {layer_stride} + cache_head_id * {head_stride} + cache_dim_block * {dim_block_stride} + cache_block_offset * {block_offset_stride}) * {lane_count} + cache_lane_id)"
@@ -3661,14 +3574,14 @@ def _emit_update_paged_attention_kv_cache(model: dict[str, Any]) -> str:
             return f"(({element_offset}) * {slots_lane_count})"
         return f"(({element_offset}) * {slots_lane_count} + {lane_expr})"
 
-    def global_index_name(axis: int) -> str:
+    def local_index_name(axis: int) -> str:
         if axis == model["SeqAxis"]:
             return "token_id"
         if axis == model["HeadAxis"]:
             return "head_id"
         if axis == model["DimAxis"]:
             return "source_dim_block"
-        return f"global_idx{axis}"
+        return f"local_idx{axis}"
 
     vector_bytes = slots_lane_count * model["ScalarElementSizeBytes"]
     use_key_vector_copy = (
@@ -3681,9 +3594,9 @@ def _emit_update_paged_attention_kv_cache(model: dict[str, Any]) -> str:
         and cache.get("TritonDType") == model["SlotsTritonDType"]
     )
     total_elements = product([
-        "num_tokens",
-        _dim(model["SlotsGlobalShape"][model["HeadAxis"]]),
-        _dim(model["SlotsGlobalShape"][model["DimAxis"]]),
+        _dim(model["SlotsShape"][model["SeqAxis"]]),
+        _dim(model["SlotsShape"][model["HeadAxis"]]),
+        _dim(model["SlotsShape"][model["DimAxis"]]),
     ] + ([] if use_key_vector_copy else [str(slots_lane_count)]))
     lines = _helper_header(
         model,
@@ -3708,42 +3621,35 @@ def _emit_update_paged_attention_kv_cache(model: dict[str, Any]) -> str:
         _line(lines, 2, f"tmp = linear // {slots_lane_count}")
     else:
         _line(lines, 2, "tmp = linear")
-    _line(lines, 2, f"source_dim_block = tmp % {_dim(model['SlotsGlobalShape'][model['DimAxis']])}")
-    _line(lines, 2, f"tmp = tmp // {_dim(model['SlotsGlobalShape'][model['DimAxis']])}")
-    _line(lines, 2, f"head_id = tmp % {_dim(model['SlotsGlobalShape'][model['HeadAxis']])}")
-    _line(lines, 2, f"token_id = tmp // {_dim(model['SlotsGlobalShape'][model['HeadAxis']])}")
-    if use_key_vector_copy:
-        _line(lines, 2, f"logical_dim = source_dim_block * {slots_lane_count}")
-    elif slots_lane_count == 1:
-        _line(lines, 2, "logical_dim = source_dim_block")
-    else:
-        _line(lines, 2, f"logical_dim = source_dim_block * {slots_lane_count} + source_lane_id")
-    _line(lines, 2, "cache_head_id = head_id")
-    _line(lines, 2, f"active = mask & (token_id < num_tokens) & (cache_head_id < {cache['NumKVHeads']}) & (logical_dim < {cache['HeadDim']})")
+    _line(lines, 2, f"source_dim_block = tmp % {_dim(model['SlotsShape'][model['DimAxis']])}")
+    _line(lines, 2, f"tmp = tmp // {_dim(model['SlotsShape'][model['DimAxis']])}")
+    _line(lines, 2, f"head_id = tmp % {_dim(model['SlotsShape'][model['HeadAxis']])}")
+    _line(lines, 2, f"token_id = tmp // {_dim(model['SlotsShape'][model['HeadAxis']])}")
     for axis in range(len(model["SlotsGlobalShape"])):
-        global_index = global_index_name(axis)
-        _line(lines, 2, f"active = active & ({global_index} < {_dim(model['SlotsGlobalShape'][axis])})")
+        if axis in (model["SeqAxis"], model["HeadAxis"], model["DimAxis"]):
+            continue
+        _line(lines, 2, f"local_idx{axis} = 0")
+        _line(lines, 2, f"global_idx{axis} = local_idx{axis} + {_dim(model['SlotsGlobalOffsets'][axis])}")
+    _line(lines, 2, f"global_token_id = token_id + {_dim(model['SlotsGlobalOffsets'][model['SeqAxis']])}")
+    _line(lines, 2, f"global_head_id = head_id + {_dim(model['SlotsGlobalOffsets'][model['HeadAxis']])}")
+    _line(lines, 2, f"global_source_dim_block = source_dim_block + {_dim(model['SlotsGlobalOffsets'][model['DimAxis']])}")
+    if use_key_vector_copy:
+        _line(lines, 2, f"logical_dim = global_source_dim_block * {slots_lane_count}")
+    elif slots_lane_count == 1:
+        _line(lines, 2, "logical_dim = global_source_dim_block")
+    else:
+        _line(lines, 2, f"logical_dim = global_source_dim_block * {slots_lane_count} + source_lane_id")
+    _line(lines, 2, "cache_head_id = global_head_id")
+    _line(lines, 2, f"active = mask & (global_token_id < num_tokens) & (cache_head_id < {cache['NumKVHeads']}) & (logical_dim < {cache['HeadDim']})")
+    for axis in range(len(model["SlotsShape"])):
+        local_index = local_index_name(axis)
+        _line(lines, 2, f"active = active & ({local_index} < {_dim(model['SlotsShape'][axis])})")
     for axis in range(len(model["Hierarchy"])):
         _line(lines, 2, f"source_shard_coord{axis} = shard_coord{axis}")
-    for axis in range(len(model["SlotsGlobalShape"])):
-        split_axes = model["SlotsSplitAxes"][axis]
-        global_index = global_index_name(axis)
-        if not split_axes:
-            _line(lines, 2, f"source_idx{axis} = {global_index}")
-        else:
-            divisor = _split_divisor(split_axes, model["Hierarchy"])
-            _line(lines, 2, f"source_local_dim{axis} = tl.cdiv({_dim(model['SlotsGlobalShape'][axis])}, {divisor})")
-            _line(lines, 2, f"source_split_linear{axis} = {global_index} // source_local_dim{axis}")
-            _line(lines, 2, f"source_idx{axis} = {global_index} - source_split_linear{axis} * source_local_dim{axis}")
-            _line(lines, 2, f"tmp_source_split{axis} = source_split_linear{axis}")
-            for index in range(len(split_axes) - 1, -1, -1):
-                placement_axis = split_axes[index]
-                _line(lines, 2, f"source_shard_coord{placement_axis} = tmp_source_split{axis} % {model['Hierarchy'][placement_axis]}")
-                _line(lines, 2, f"tmp_source_split{axis} = tmp_source_split{axis} // {model['Hierarchy'][placement_axis]}")
-    for axis in head_split_axes:
-        _line(lines, 2, f"active = active & (source_shard_coord{axis} == shard_coord{axis})")
+    for axis in range(len(model["SlotsShape"])):
+        _line(lines, 2, f"source_idx{axis} = {local_index_name(axis)}")
     if cache["IdLength"] > 1:
-        _line(lines, 2, f"topology_id = tl.load(slot_mapping + token_id * {cache['IdLength']}, mask=active, other=0)")
+        _line(lines, 2, f"topology_id = tl.load(slot_mapping + global_token_id * {cache['IdLength']}, mask=active, other=0)")
         _line(lines, 2, "tmp_topology = topology_id")
         for index in range(len(cache["NumBlocksSplitAxes"]) - 1, -1, -1):
             axis = cache["NumBlocksSplitAxes"][index]
@@ -3751,7 +3657,7 @@ def _emit_update_paged_attention_kv_cache(model: dict[str, Any]) -> str:
             _line(lines, 2, f"tmp_topology = tmp_topology // {model['Hierarchy'][axis]}")
         for axis in topology_match_axes:
             _line(lines, 2, f"active = active & (topology_coord{axis} == shard_coord{axis})")
-    _line(lines, 2, f"slot_id = tl.load(slot_mapping + token_id * {cache['IdLength']} + {cache['IdLength'] - 1}, mask=active, other=0)")
+    _line(lines, 2, f"slot_id = tl.load(slot_mapping + global_token_id * {cache['IdLength']} + {cache['IdLength'] - 1}, mask=active, other=0)")
     _line(lines, 2, f"block_id = slot_id // {cache['BlockSize']}")
     _line(lines, 2, f"block_offset = slot_id % {cache['BlockSize']}")
     if vectorized_dim == 5:  # HeadDim
@@ -3774,18 +3680,24 @@ def _emit_update_paged_attention_kv_cache(model: dict[str, Any]) -> str:
         _line(lines, 2, "cache_lane_id = 0")
     _line(lines, 2, f"source_shard_index = {full_source_shard_index}")
     _line(lines, 2, f"slot_offsets = {slot_offset(None) if use_key_vector_copy else slot_offset()}")
-    _line(lines, 2, f"source_byte_offsets = source_shard_index * {model['SlotsPoolBytes']} + {model['SlotsOffsetBytes']} + slot_offsets * {model['ScalarElementSizeBytes']}")
+    source_offsets_name = "source_byte_offsets" if model["SlotsAddressIsByteOffset"] else "source_element_offsets"
+    source_slot_offsets = (
+        f"slot_offsets * {model['ScalarElementSizeBytes']}"
+        if model["SlotsAddressIsByteOffset"]
+        else "slot_offsets"
+    )
+    _line(lines, 2, f"{source_offsets_name} = source_shard_index * {model['SlotsPoolBytes']} + {model['SlotsOffsetBytes']} + {source_slot_offsets}")
     _line(lines, 2, f"cache_offsets = {cache_offset}")
     if use_key_vector_copy:
         word_count = vector_bytes // 8
-        _line(lines, 2, f"source_words = ({model['SlotsBaseName']} + source_byte_offsets).to(tl.pointer_type(tl.uint64))")
+        _line(lines, 2, f"source_words = ({model['SlotsBaseName']} + {source_offsets_name}).to(tl.pointer_type(tl.uint64))")
         _line(lines, 2, "cache_words = (kv_cache + cache_offsets).to(tl.pointer_type(tl.uint64))")
         for word_index in range(word_count):
             suffix = "" if word_index == 0 else f" + {word_index}"
             _line(lines, 2, f"word{word_index} = tl.load(source_words{suffix}, mask=active, other=0)")
             _line(lines, 2, f"tl.store(cache_words{suffix}, word{word_index}, mask=active)")
     else:
-        _line(lines, 2, f"value = tl.load(({model['SlotsBaseName']} + source_byte_offsets).to(tl.pointer_type({model['SlotsTritonDType']})), mask=active, other=0.0)")
+        _line(lines, 2, f"value = tl.load(({model['SlotsBaseName']} + {source_offsets_name}).to(tl.pointer_type({model['SlotsTritonDType']})), mask=active, other=0.0)")
         _line(lines, 2, "tl.store(kv_cache + cache_offsets, value, mask=active)")
     return _finish(lines)
 
@@ -3812,6 +3724,8 @@ _EMITTERS = {
     "PackedQKVParallelLinear": _emit_packed_qkv_parallel_linear,
     "QKVParallelLinear": _emit_qkv_parallel_linear,
     "Reduce": _emit_reduce,
+    "Reshape": _emit_reshape,
+    "Bitcast": _emit_bitcast,
     "Reshard": _emit_reshard,
     "RoPE": _emit_rope,
     "ScatterND": _emit_scatter_nd,

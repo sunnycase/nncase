@@ -28,7 +28,7 @@ public class UninitializedEvaluator : IEvaluator<Uninitialized>, ITypeInferencer
             tensorType = new TensorType(target.DType, shape);
         }
 
-        return target.Placement.Rank == 0 ? tensorType : new DistributedType(tensorType, target.NdSBP, target.Placement);
+        return target.Placement.Rank == 0 ? tensorType : new DistributedType(tensorType, target.NdSBP, target.Placement, target.Partial);
     }
 
     /// <inheritdoc/>

@@ -130,11 +130,17 @@ public sealed class TileGrid : ITileable
 
     public ImmutableArray<ImmutableArray<long>> BufferShapes { get; }
 
-    public ReadOnlySpan<AffineMap> ReadAccesses => Grid.AccessMaps[..^1];
+    public ReadOnlySpan<AffineMap> ReadAccesses => Grid.AccessMaps[..Grid.Reads.Length];
 
-    public AffineMap WriteAccess => Grid.AccessMaps[^1];
+    public ReadOnlySpan<AffineMap> WriteAccesses => Grid.WriteAccessMaps;
 
-    public long GetBufferElemSize(int i) => Grid.Buffers[i].CheckedDataType.SizeInBytes;
+    public AffineMap WriteAccess => WriteAccesses.Length == 1
+        ? WriteAccesses[0]
+        : throw new InvalidOperationException($"Op{OpId} has {WriteAccesses.Length} write accesses.");
+
+    public long GetBufferElemSize(int i) => Grid.Buffers[i].CheckedDataType is ReferenceType
+        ? 0
+        : Grid.Buffers[i].CheckedDataType.SizeInBytes;
 
     public MicroKernelInfo GetKernelInfo(ITargetOptions targetOptions) => CompilerServices.GetOpMicroKernelInfo(Op, new(Op, Grid.AccessMaps.ToImmutableArray(), BufferShapes, targetOptions));
 

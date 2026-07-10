@@ -435,6 +435,58 @@ public sealed class UnitTestFunctionBoundaryLayoutPropagation : TestClassBase
     }
 
     [Fact]
+    public async Task TestTIRSelectionPreservesInputAliasInTupleOutput()
+    {
+        var tensorType = new TensorType(DataTypes.Float32, new RankedShape(4, 16));
+        var calleeInput = new Var("callee_input", tensorType);
+        var callee = new Function(
+            "callee",
+            new IR.Tuple(
+                IR.F.Math.Unary(UnaryOp.Abs, calleeInput),
+                calleeInput),
+            calleeInput);
+        Assert.True(callee.InferenceType());
+
+        var input = new Var("input", tensorType);
+        var calleeCall = new Call(callee, input);
+        var main = new Function(
+            "main",
+            IR.F.Math.Add(GetItem(calleeCall, 0), GetItem(calleeCall, 1)),
+            input);
+        Assert.True(main.InferenceType());
+
+        var module = new IRModule(callee);
+        module.Add(main);
+        module.Entry = main;
+
+        var passManager = CompileSession.CreatePassManager("TIRSelectionInputAliasTupleOutput");
+        passManager.Add<NTTTIRSelectionPass>();
+        await passManager.RunAsync(module);
+
+        var calleeWrapper = Assert.Single(module.Functions.OfType<PrimFunctionWrapper>());
+        var calleeAbi = calleeWrapper.Target.GetAbiView();
+        var inOut = Assert.IsType<BufferVar>(Assert.Single(calleeAbi.Inputs));
+        Assert.Equal(BufferVarRole.InOut, inOut.Role);
+        Assert.Equal(2, calleeAbi.Outputs.Count);
+        Assert.Same(inOut, calleeAbi.Outputs[0]);
+        Assert.DoesNotContain(
+            ExprCollector.Collect(calleeWrapper.Target.Body).OfType<Call>(),
+            call => call.Target is Memcopy);
+
+        var mainPrim = Assert.IsType<PrimFunction>(module.Entry);
+        var selectedCall = Assert.Single(ExprCollector.Collect(mainPrim.Body)
+            .OfType<Call>()
+            .Where(call => ReferenceEquals(call.Target, calleeWrapper.Target)));
+        Assert.Equal(calleeWrapper.Target.Parameters.Length, selectedCall.Arguments.Length);
+
+        var add = Assert.Single(ExprCollector.Collect(mainPrim.Body)
+            .OfType<Call>()
+            .Where(call => call.Target is TIR.NTT.VectorizedBinary binary && binary.BinaryOp == BinaryOp.Add));
+        Assert.Same(selectedCall.Arguments[1], add.Arguments[0]);
+        Assert.Same(selectedCall.Arguments[0], add.Arguments[1]);
+    }
+
+    [Fact]
     public async Task TestPostBoundaryPackPropagationPushesCallerPackThroughUnary()
     {
         var layerInput = new Var("layer_input", new TensorType(DataTypes.Float32, new RankedShape(4, 16)));

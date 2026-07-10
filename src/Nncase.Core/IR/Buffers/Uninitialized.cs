@@ -28,9 +28,12 @@ public sealed partial class Uninitialized : Op
     [Browsable(false)]
     public Placement Placement { get; }
 
+    [Browsable(false)]
+    public SBPPartial? Partial { get; }
+
     /// <inheritdoc/>
     public override bool CanFoldConstCall => false;
 
     /// <inheritdoc/>
-    public override string DisplayProperty() => $"{DType.GetCSharpName()}, MemoryLocation.{MemoryLocation}, {NdSBP}, {Placement}";
+    public override string DisplayProperty() => $"{DType.GetCSharpName()}, MemoryLocation.{MemoryLocation}, {NdSBP}, {Placement}, Partial: {Partial}";
 }

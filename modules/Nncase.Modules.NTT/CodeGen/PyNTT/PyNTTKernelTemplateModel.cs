@@ -523,12 +523,15 @@ public sealed record PyNTTUpdatePagedAttentionKVCacheTemplateModel(
     string SlotsTritonDType,
     PyNTTDimExpression[] SlotsShape,
     PyNTTDimExpression[] SlotsGlobalShape,
+    PyNTTDimExpression[] SlotsGlobalOffsets,
     PyNTTDimExpression[] SlotsStrides,
     int[][] SlotsSplitAxes,
+    int[][] SlotsSourceSplitAxes,
     int[] Hierarchy,
     string SlotsBaseName,
     string SlotsOffsetBytes,
     string SlotsPoolBytes,
+    bool SlotsAddressIsByteOffset,
     int ScalarElementSizeBytes,
     int SeqAxis,
     int HeadAxis,
@@ -620,6 +623,44 @@ public sealed record PyNTTTransposeTemplateModel(
     public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
 }
 
+public sealed record PyNTTReshapeTemplateModel(
+    string FunctionName,
+    PyNTTBufferPointerTemplateModel Input,
+    PyNTTBufferPointerTemplateModel Output,
+    string InputDType,
+    string OutputDType,
+    string InputTritonDType,
+    string OutputTritonDType,
+    PyNTTDimExpression[] InputShape,
+    PyNTTDimExpression[] OutputShape,
+    PyNTTDimExpression[] InputStrides,
+    PyNTTDimExpression[] OutputStrides,
+    int InputVectorLaneCount,
+    int OutputVectorLaneCount,
+    string Comment)
+{
+    public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
+}
+
+public sealed record PyNTTBitcastTemplateModel(
+    string FunctionName,
+    PyNTTBufferPointerTemplateModel Input,
+    PyNTTBufferPointerTemplateModel Output,
+    string InputDType,
+    string OutputDType,
+    string InputTritonDType,
+    string OutputTritonDType,
+    PyNTTDimExpression[] InputShape,
+    PyNTTDimExpression[] OutputShape,
+    PyNTTDimExpression[] InputStrides,
+    PyNTTDimExpression[] OutputStrides,
+    int InputVectorLaneCount,
+    int OutputVectorLaneCount,
+    string Comment)
+{
+    public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
+}
+
 public sealed record PyNTTMatmulTemplateModel(
     string FunctionName,
     PyNTTBufferPointerTemplateModel Lhs,
@@ -650,6 +691,8 @@ public sealed record PyNTTMatmulTemplateModel(
     public int RhsNPackedLaneCount { get; set; } = 1;
 
     public int OutputNPackedLaneCount { get; set; } = 1;
+
+    public string LoadCExpression { get; set; } = "False";
 }
 
 public sealed record PyNTTQKVParallelLinearTemplateModel(
@@ -738,7 +781,6 @@ public sealed record PyNTTMatMulGluTemplateModel(
     PyNTTDimExpression[] GateBiasStrides,
     PyNTTDimExpression[] UpBiasStrides,
     PyNTTDimExpression[] OutputStrides,
-    int[] Hierarchy,
     string Comment)
 {
     public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
@@ -748,30 +790,6 @@ public sealed record PyNTTMatMulGluTemplateModel(
     public int NPackedLaneCount { get; set; } = 1;
 
     public int NVectorLaneCount { get; set; } = 1;
-
-    public PyNTTDimExpression[] InputGlobalShape { get; set; } = Array.Empty<PyNTTDimExpression>();
-
-    public PyNTTDimExpression[] GateWeightGlobalShape { get; set; } = Array.Empty<PyNTTDimExpression>();
-
-    public PyNTTDimExpression[] UpWeightGlobalShape { get; set; } = Array.Empty<PyNTTDimExpression>();
-
-    public PyNTTDimExpression[] GateBiasGlobalShape { get; set; } = Array.Empty<PyNTTDimExpression>();
-
-    public PyNTTDimExpression[] UpBiasGlobalShape { get; set; } = Array.Empty<PyNTTDimExpression>();
-
-    public PyNTTDimExpression[] OutputGlobalShape { get; set; } = Array.Empty<PyNTTDimExpression>();
-
-    public int[][] InputSplitAxes { get; set; } = Array.Empty<int[]>();
-
-    public int[][] GateWeightSplitAxes { get; set; } = Array.Empty<int[]>();
-
-    public int[][] UpWeightSplitAxes { get; set; } = Array.Empty<int[]>();
-
-    public int[][] GateBiasSplitAxes { get; set; } = Array.Empty<int[]>();
-
-    public int[][] UpBiasSplitAxes { get; set; } = Array.Empty<int[]>();
-
-    public int[][] OutputSplitAxes { get; set; } = Array.Empty<int[]>();
 }
 
 public sealed record PyNTTSummaTemplateModel(

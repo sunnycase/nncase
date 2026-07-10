@@ -108,8 +108,12 @@ public sealed class GraphTiler
                     endTime = Math.Max(endTime, bufferInfo.Liveness[ci].Item2);
 
                     extents.Add(solver.MakeProd(bufferInfo.Places[ci][sl], bufferInfo.Sizes[ci]));
-                    var cons = solver.MakeGreater(bufferInfo.Sizes[ci], 0);
-                    solver.Add(cons);
+                    if (!IsObjectBuffer(nodeBuffer.Id))
+                    {
+                        var cons = solver.MakeGreater(bufferInfo.Sizes[ci], 0);
+                        solver.Add(cons);
+                    }
+
                     nodeBufferSizes[nodeBuffer] = solver.MakeSum(extents);
                     nodeBufferShapes[nodeBuffer] = bufferInfo.Shapes[ci];
                     nodeBufferLiveness[nodeBuffer] = bufferInfo.Liveness[ci];
@@ -504,14 +508,19 @@ public sealed class GraphTiler
             {
                 var result = SolvePrimGraph(primTree, bufferGraphMemo, targetOptions, moduleKind);
                 (inputBids, outputBids) = (result.Inputs, result.Outputs);
+                var inputBidsOrdered = OrderBufferIdentities(inputBids);
+                var outputBidsOrdered = OrderBufferIdentities(outputBids);
+                var callerAllocatedOutputBids = outputBidsOrdered
+                    .Where(bid => !result.ObjectOutputAliases.ContainsKey(bid))
+                    .ToArray();
                 var maxAlign = result.ScheduleBuffers();
                 var bodyBuilder = T.Sequential();
                 var initOffsets = Enumerable.Repeat(new DimConst(0), primTree.DomainBoundExprs.Length).ToArray();
                 var initBounds = primTree.DomainBoundExprs.ToArray();
                 result.Visit(primTree, new(bodyBuilder, initOffsets, initBounds));
-                var parameters = inputBids.Select(k => result.InputOutputVars[k]).Concat(
+                var parameters = inputBidsOrdered.Select(k => result.InputOutputVars[k]).Concat(
                     dynamicDimVars.Select(v => (IVar)v.With())).Concat(
-                    outputBids.Select(k => result.InputOutputVars[k])).ToArray();
+                    callerAllocatedOutputBids.Select(k => result.InputOutputVars[k])).ToArray();
                 var funcBuilder = T.PrimFunc(funcName, moduleKind, parameters).Body(bodyBuilder);
                 var primFunc = funcBuilder.Build();
                 {
@@ -523,7 +532,7 @@ public sealed class GraphTiler
 
                 primFunc.SchedResult.IsScheduled = true; // avoid buffersize pass schedule it again.
                 primFunc.SchedResult.DataAlign = (ulong)maxAlign;
-                tiled = new(new PrimFunctionWrapper(primFunc, inputBids.Count + dynamicDimVars.Length, inputBids.Select(bid => bid.Node.Grid.GetArgument(bid.Index).CheckedType).Concat(dynamicDimVars.Select(v => new DimensionType(DimensionKind.Dynamic))).Concat(outputBids.Select(bid => bid.Node.Grid.GetArgument(bid.Index).CheckedType)).ToArray()), result.ObjectiveValue);
+                tiled = new(new PrimFunctionWrapper(primFunc, inputBidsOrdered.Length + dynamicDimVars.Length, inputBidsOrdered.Select(bid => bid.Node.Grid.GetArgument(bid.Index).CheckedType).Concat(dynamicDimVars.Select(v => new DimensionType(DimensionKind.Dynamic))).Concat(callerAllocatedOutputBids.Select(bid => bid.Node.Grid.GetArgument(bid.Index).CheckedType)).ToArray()), result.ObjectiveValue);
                 SolveMemo.Add(primTree, tiled);
             }
             else
@@ -531,18 +540,20 @@ public sealed class GraphTiler
                 (inputBids, outputBids) = bufferGraphMemo[primGraph].GetInputsOutputs(bufferGraphMemo[rootGraph]);
             }
 
+            var orderedInputBids = OrderBufferIdentities(inputBids);
+            var orderedOutputBids = OrderBufferIdentities(outputBids);
             objectValue += tiled.ObjectValue;
-            var finalCall = new Call(tiled.Func, inputBids.Select(bid => argumentMemo[bid]).Concat(dynamicDimVars.OfType<BaseExpr>()).ToArray());
+            var finalCall = new Call(tiled.Func, orderedInputBids.Select(bid => argumentMemo[bid]).Concat(dynamicDimVars.OfType<BaseExpr>()).ToArray());
 
             // save the output.
-            foreach (var (outputBid, outputIndex) in outputBids.Select((b, i) => (b, i)))
+            foreach (var (outputBid, outputIndex) in orderedOutputBids.Select((b, i) => (b, i)))
             {
                 if (!argumentMemo.TryGetValue(outputBid, out var _))
                 {
                     var outputExpr = finalCall;
 
                     // process the tuple output.
-                    if (outputBids.Count > 1)
+                    if (orderedOutputBids.Length > 1)
                     {
                         outputExpr = IR.F.Tensors.GetItem(outputExpr, outputIndex);
                     }
@@ -565,6 +576,12 @@ public sealed class GraphTiler
 
         return (argumentMemo, objectValue);
     }
+
+    private static BufferIdentity[] OrderBufferIdentities(IEnumerable<BufferIdentity> identities)
+        => identities
+            .OrderBy(identity => identity.Node.OpId)
+            .ThenBy(identity => identity.Index)
+            .ToArray();
 
     public BaseExpr Tile(BaseExpr preExpr, string moduleKind, INTTTargetOptions targetOptions, DimVar[] dynamicDimVars)
     {
@@ -602,19 +619,58 @@ public sealed class GraphTiler
         }
 
         var bestState = (MCTState)searcher.BestMCTNode!.State;
-        var replaces = new Dictionary<BaseExpr, BaseExpr>();
+        if (bestState.ObjectValue == long.MaxValue)
+        {
+            throw new SolveFailedException("auto tiling failed to find a feasible schedule.");
+        }
+
+        var replaces = new Dictionary<BaseExpr, BaseExpr>(ReferenceEqualityComparer.Instance);
+        var multiOutputReplaces = new Dictionary<Grid, Dictionary<int, BaseExpr>>(ReferenceEqualityComparer.Instance);
 
         foreach (var (bid, value) in bestState.ArgumentMemo)
         {
             // use bid to find the old expr.
-            var oldExpr = bid.IsOutput ? bid.Node.Grid : bid.Node.Grid.GetArgument(bid.Index);
-            if (!replaces.ContainsKey(oldExpr))
+            if (bid.IsOutput)
             {
-                replaces.Add(oldExpr, value);
+                var grid = bid.Node.Grid;
+                var outputIndex = bid.OutputIndex;
+                if (grid.Writes.Length == 1)
+                {
+                    replaces.TryAdd(grid, value);
+                }
+                else
+                {
+                    if (!multiOutputReplaces.TryGetValue(grid, out var outputMap))
+                    {
+                        outputMap = new Dictionary<int, BaseExpr>();
+                        multiOutputReplaces.Add(grid, outputMap);
+                    }
+
+                    outputMap.TryAdd(outputIndex, value);
+                }
+            }
+            else
+            {
+                var oldExpr = bid.Node.Grid.GetArgument(bid.Index);
+                replaces.TryAdd(oldExpr, value);
             }
         }
 
-        var cloner = new ReplacingExprCloner(replaces);
+        foreach (var (grid, outputMap) in multiOutputReplaces)
+        {
+            var fields = Enumerable.Range(0, grid.Writes.Length).Select(i =>
+            {
+                if (!outputMap.TryGetValue(i, out var output))
+                {
+                    throw new InvalidOperationException($"Missing tiled output {i} for Op{exprMemo[grid].OpId}.");
+                }
+
+                return output;
+            }).ToArray();
+            replaces.TryAdd(grid, new IR.Tuple(fields));
+        }
+
+        var cloner = new TiledOutputReplacingExprCloner(replaces, multiOutputReplaces);
         return cloner.Clone(preExpr, default);
 #endif
     }
@@ -642,8 +698,44 @@ public sealed class GraphTiler
         }
     }
 
+    private static bool IsObjectBuffer(BufferIdentity bid) => bid.Node.Grid.Buffers[bid.Index].CheckedDataType is ReferenceType;
+
     public sealed record TiledFunc(PrimFunctionWrapper Func, long ObjectValue)
     {
+    }
+
+    private sealed class TiledOutputReplacingExprCloner : ExprCloner<Unit>
+    {
+        private readonly IReadOnlyDictionary<BaseExpr, BaseExpr> _replaces;
+        private readonly IReadOnlyDictionary<Grid, Dictionary<int, BaseExpr>> _multiOutputReplaces;
+
+        public TiledOutputReplacingExprCloner(
+            IReadOnlyDictionary<BaseExpr, BaseExpr> replaces,
+            IReadOnlyDictionary<Grid, Dictionary<int, BaseExpr>> multiOutputReplaces)
+        {
+            _replaces = replaces;
+            _multiOutputReplaces = multiOutputReplaces;
+            CloneUnmutated = false;
+        }
+
+        protected override BaseExpr DispatchVisit(BaseExpr expr, Unit context)
+        {
+            if (expr is Call { Target: IR.Tensors.GetItem } getItem &&
+                getItem[IR.Tensors.GetItem.Input] is Grid grid &&
+                getItem[IR.Tensors.GetItem.Index] is DimConst index &&
+                _multiOutputReplaces.TryGetValue(grid, out var outputs) &&
+                outputs.TryGetValue(checked((int)index.Value), out var output))
+            {
+                return output;
+            }
+
+            if (_replaces.TryGetValue(expr, out var replacement))
+            {
+                return replacement;
+            }
+
+            return base.DispatchVisit(expr, context);
+        }
     }
 
     private sealed class AtShapeOfRewriter : ExprRewriter

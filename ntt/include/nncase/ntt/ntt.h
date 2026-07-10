@@ -50,6 +50,7 @@
 #endif
 
 #include "kernels/binary.h"
+#include "kernels/bitcast.h"
 #include "kernels/cast.h"
 #include "kernels/clamp.h"
 #include "kernels/compare.h"

@@ -34,7 +34,7 @@ public abstract class AffineSelectionPass : FunctionPass
         return Task.FromResult(input);
     }
 
-    protected abstract Expr SelectCall(Call call, Expr output);
+    protected abstract Expr SelectCall(Call call, BaseExpr output);
 
     protected Expr SelectUnaryLike(Expr input, Op tirOp, Call call, Expr output)
     {
@@ -68,26 +68,43 @@ public abstract class AffineSelectionPass : FunctionPass
 
         protected override Expr RewriteLeafCall(Call expr)
         {
-            if (expr.CheckedType is not (TensorType or DistributedType))
-            {
-                return expr;
-            }
-
-            Expr outBuffer = expr.CheckedType switch
-            {
-                TensorType t => (Expr)IR.F.Buffer.Uninitialized(t.DType, TIR.MemoryLocation.Data, t.Shape),
-                DistributedType dt => (Expr)IR.F.Buffer.Uninitialized(dt.TensorType.DType, TIR.MemoryLocation.Data, dt.TensorType.Shape, dt.AxisPolicies, dt.Placement),
-
-                // TupleType tt => tt.Fields.Select(f => RewriteLeafCall(()f)),
-                _ => expr,
-            };
-
-            if (outBuffer == expr)
+            if (!TryCreateOutputBuffer(expr.CheckedType, out var outBuffer))
             {
                 return expr;
             }
 
             return _selectionPass.SelectCall(expr, outBuffer);
+        }
+
+        private static bool TryCreateOutputBuffer(IRType type, out BaseExpr output)
+        {
+            switch (type)
+            {
+                case TensorType t:
+                    output = IR.F.Buffer.Uninitialized(t.DType, TIR.MemoryLocation.Data, t.Shape);
+                    return true;
+                case DistributedType dt:
+                    output = IR.F.Buffer.Uninitialized(dt.TensorType.DType, TIR.MemoryLocation.Data, dt.TensorType.Shape, dt.AxisPolicies, dt.Placement, dt.Partial);
+                    return true;
+                case TupleType tupleType when tupleType.Count > 0:
+                    var fields = new Expr[tupleType.Count];
+                    for (int i = 0; i < tupleType.Count; i++)
+                    {
+                        if (!TryCreateOutputBuffer(tupleType[i], out var field) || field is not Expr fieldExpr)
+                        {
+                            output = null!;
+                            return false;
+                        }
+
+                        fields[i] = fieldExpr;
+                    }
+
+                    output = new IR.Tuple(fields);
+                    return true;
+                default:
+                    output = null!;
+                    return false;
+            }
         }
     }
 }

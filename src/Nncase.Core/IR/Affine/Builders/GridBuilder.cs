@@ -38,10 +38,10 @@ internal class GridBuilder : IGridBuilder
     private readonly List<Expr> _reads = new();
     private readonly List<Expr> _readBuffers = new();
     private readonly List<AffineMap> _readMaps = new();
+    private readonly List<Expr> _writeBuffers = new();
+    private readonly List<AffineMap> _writeMaps = new();
     private int? _domainDims;
     private Var? _domainParameter;
-    private Expr? _writeBuffer;
-    private AffineMap? _writeMap;
 
     public GridBuilder()
     {
@@ -58,8 +58,8 @@ internal class GridBuilder : IGridBuilder
         return new Grid(
             _domainParameter ?? throw new InvalidOperationException("domain dims is not set."),
             CollectionsMarshal.AsSpan(_bodyParameters),
-            _readMaps.Append(_writeMap ?? throw new InvalidOperationException("Write map is not set.")).ToArray(),
-            _readBuffers.Append(_writeBuffer ?? throw new InvalidOperationException("Write buffer is not set.")).ToArray(),
+            _readMaps.Concat(_writeMaps).ToArray(),
+            _readBuffers.Concat(_writeBuffers).ToArray(),
             CollectionsMarshal.AsSpan(_reads),
             Sequential.Flatten(CollectionsMarshal.AsSpan(_body)));
     }
@@ -74,7 +74,7 @@ internal class GridBuilder : IGridBuilder
 
     public IGridBuilder Read(Expr argument, AffineMap accessMap, out Var parameter)
     {
-        parameter = new Var(new TensorType(argument.CheckedDataType, Shape.Unknown(argument.CheckedShape.Rank)));
+        parameter = new Var(GetTileParameterType(argument.CheckedType));
         _bodyParameters.Add(parameter);
         _reads.Add(argument);
         _readBuffers.Add(F.Buffer.BufferOf(argument));
@@ -84,10 +84,22 @@ internal class GridBuilder : IGridBuilder
 
     public IGridBuilder Write(Expr buffer, AffineMap accessMap, out Var parameter)
     {
-        parameter = new Var(new TensorType(buffer.CheckedDataType, Shape.Unknown(buffer.CheckedShape.Rank)));
+        parameter = new Var(GetTileParameterType(buffer.CheckedType));
         _bodyParameters.Add(parameter);
-        _writeBuffer = buffer;
-        _writeMap = accessMap;
+        _writeBuffers.Add(buffer);
+        _writeMaps.Add(accessMap);
         return this;
+    }
+
+    private static IRType GetTileParameterType(IRType type)
+    {
+        return type switch
+        {
+            TensorType { DType: ReferenceType } tensorType => tensorType,
+            TensorType tensorType => new TensorType(tensorType.DType, Shape.Unknown(tensorType.Shape.Rank)),
+            DistributedType { TensorType.DType: ReferenceType } distributedType => distributedType.TensorType,
+            DistributedType distributedType => new TensorType(distributedType.TensorType.DType, Shape.Unknown(distributedType.TensorType.Shape.Rank)),
+            _ => type,
+        };
     }
 }

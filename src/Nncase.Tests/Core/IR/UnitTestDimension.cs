@@ -175,4 +175,36 @@ public sealed class UnitTestDimension
         sum = dv + sum;
         Assert.Equal(sum, mul);
     }
+
+    [Fact]
+    public void TestDimensionMinMaxInferRange()
+    {
+        var lhs = new DimVar("lhs")
+        {
+            Metadata = new()
+            {
+                Range = new(1, 128),
+            },
+        };
+        var rhs = new DimVar("rhs")
+        {
+            Metadata = new()
+            {
+                Range = new(4, 64),
+            },
+        };
+
+        Assert.Equal(new ValueRange<double>(1, 64), Dimension.Min(lhs, rhs).Metadata.Range);
+        Assert.Equal(new ValueRange<double>(4, 128), Dimension.Max(lhs, rhs).Metadata.Range);
+
+        var offset = new DimVar("offset")
+        {
+            Metadata = new()
+            {
+                Range = new(0, 1),
+            },
+        };
+        var boundedTile = Dimension.Min(1L, 1L, Dimension.Max(0L, 1L - offset));
+        Assert.Equal(new ValueRange<double>(0, 1), boundedTile.Metadata.Range);
+    }
 }

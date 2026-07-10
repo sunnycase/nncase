@@ -31,51 +31,71 @@ public partial class NTTAffineSelectionPass : AffineSelectionPass
         _compileOptions = compileOptions;
     }
 
-    protected override Expr SelectCall(Call call, Expr output)
+    protected override Expr SelectCall(Call call, BaseExpr output)
     {
         switch (call.Target)
         {
-            case IR.NTT.PackedMatMul op:
-                return SelectMatMul(op, call, output);
-            case IR.NTT.VectorizedBinary op:
-                return SelectVectorizedBinary(op, call, output);
-            case IR.NTT.VectorizedMatMul:
-                return SelectMatMul((Op)call.Target, call, output);
-            case IR.Tensors.Pack op:
-                return SelectVectorize(op, call, output);
-            case IR.NTT.VectorizedReduce op:
-                return SelectReduce(op, call, output);
-            case IR.NTT.VectorizedRoPE op:
-                return SelectRoPE(op, call, output);
-            case IR.Tensors.Unpack op:
-                return SelectDevectorize(op, call, output);
-            case IR.Math.Binary op:
-                return SelectBinary(op, call, output);
-            case IR.Math.MatMul:
-                return SelectMatMul((Op)call.Target, call, output);
-            case IR.Math.Unary op:
-                return SelectUnaryLike((Expr)call[IR.Math.Unary.Input], new TIR.NTT.Unary(op.UnaryOp), call, output);
-            case IR.NN.Swish op:
-                return SelectSwish(op, call, output);
-            case IR.NTT.VectorizedLayerNorm op:
-                return SelectLayerNorm(op, call, output);
-            case IR.NN.LayerNorm op:
-                return SelectLayerNorm(op, call, output);
-            case IR.Tensors.Cast op:
-                return SelectCast(op, call, output);
-            case IR.NTT.VectorizedCast op:
-                return SelectVectorizedCast(op, call, output);
-            case IR.Tensors.Transpose op:
-                return SelectTranspose(op, call, output);
-            case IR.Tensors.Where op:
-                return SelectWhere(op, call, output);
-            case IR.Math.Compare op:
-                return SelectCompare(op, call, output);
-            case IR.NN.GetPositionIds op:
-                return SelectGetPositionIds(op, call, output);
+            case IR.NTT.PackedQKVParallelLinear op:
+                return SelectPackedQKVParallelLinear(op, call, output);
+        }
 
-            // case IR.NN.Pad op:
-            //     return SelectPad(op, call, output);
+        if (output is not Expr exprOutput)
+        {
+            return call;
+        }
+
+        switch (call.Target)
+        {
+            case IR.NTT.PackedMatMul op:
+                return SelectMatMul(op, call, exprOutput);
+            case IR.NTT.PackedMatMulGlu op:
+                return SelectPackedMatMulGlu(op, call, exprOutput);
+            case IR.NTT.VectorizedBinary op:
+                return SelectVectorizedBinary(op, call, exprOutput);
+            case IR.NTT.VectorizedMatMul:
+                return SelectMatMul((Op)call.Target, call, exprOutput);
+            case IR.Tensors.Pack op:
+                return SelectVectorize(op, call, exprOutput);
+            case IR.NTT.VectorizedReduce op:
+                return SelectReduce(op, call, exprOutput);
+            case IR.NTT.VectorizedRoPE op:
+                return SelectRoPE(op, call, exprOutput);
+            case IR.Tensors.Unpack op:
+                return SelectDevectorize(op, call, exprOutput);
+            case IR.Math.Binary op:
+                return SelectBinary(op, call, exprOutput);
+            case IR.Math.MatMul:
+                return SelectMatMul((Op)call.Target, call, exprOutput);
+            case IR.Math.Unary op:
+                return SelectUnaryLike((Expr)call[IR.Math.Unary.Input], new TIR.NTT.Unary(op.UnaryOp), call, exprOutput);
+            case IR.NN.Swish op:
+                return SelectSwish(op, call, exprOutput);
+            case IR.NTT.VectorizedLayerNorm op:
+                return SelectLayerNorm(op, call, exprOutput);
+            case IR.NN.LayerNorm op:
+                return SelectLayerNorm(op, call, exprOutput);
+            case IR.NN.NormStats op:
+                return SelectNormStats(op, call, exprOutput);
+            case IR.NN.NormApply op:
+                return SelectNormApply(op, call, exprOutput);
+            case IR.Tensors.Cast op:
+                return SelectCast(op, call, exprOutput);
+            case IR.NTT.VectorizedCast op:
+                return SelectVectorizedCast(op, call, exprOutput);
+            case IR.Tensors.Bitcast:
+                return SelectBitcast(call, exprOutput);
+            case IR.Tensors.Reshape:
+                return SelectReshape(call, exprOutput);
+            case IR.Tensors.Transpose op:
+                return SelectTranspose(op, call, exprOutput);
+            case IR.Tensors.Where op:
+                return SelectWhere(op, call, exprOutput);
+            case IR.Math.Compare op:
+                return SelectCompare(op, call, exprOutput);
+            case IR.NN.GetPositionIds op:
+                return SelectGetPositionIds(op, call, exprOutput);
+            case IR.NN.UpdatePagedAttentionKVCache op:
+                return SelectUpdatePagedAttentionKVCache(op, call);
             default:
                 return call;
         }

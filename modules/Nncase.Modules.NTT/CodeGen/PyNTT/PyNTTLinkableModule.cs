@@ -212,7 +212,7 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
         return expr switch
         {
             Dimension dimension => GetFixedDimension(dimension, context),
-            TensorConst tensorConst when tensorConst.Value.Shape.IsScalar => tensorConst.Value.ToScalar<long>(),
+            TensorConst tensorConst when tensorConst.Value.Shape.IsScalar => ReadScalarInt64(tensorConst.Value, $"PyNTT fixed {context}"),
             _ => expr.Evaluate().AsTensor().ToScalar<long>(),
         };
     }
@@ -225,6 +225,53 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
         }
 
         return dimension.FixedValue;
+    }
+
+    private static long ReadScalarInt64(Tensor tensor, string context)
+    {
+        if (!tensor.Shape.IsScalar)
+        {
+            throw new NotSupportedException($"{context} expects a scalar tensor, got shape {tensor.Shape}.");
+        }
+
+        return tensor[Array.Empty<long>()] switch
+        {
+            sbyte value => value,
+            byte value => value,
+            short value => value,
+            ushort value => value,
+            int value => value,
+            uint value => value,
+            long value => value,
+            ulong value => checked((long)value),
+            bool value => value ? 1L : 0L,
+            var value when TryReadPointerValue(value, out var pointerValue) => checked((long)pointerValue),
+            var value => throw new NotSupportedException($"{context} expects an integral scalar tensor, got {value?.GetType().Name ?? "null"}."),
+        };
+    }
+
+    private static bool TryReadPointerValue(object? value, out ulong pointerValue)
+    {
+        pointerValue = 0UL;
+        if (value is null)
+        {
+            return false;
+        }
+
+        var type = value.GetType();
+        if (!type.IsGenericType || type.GetGenericTypeDefinition() != typeof(Pointer<>))
+        {
+            return false;
+        }
+
+        var property = type.GetProperty(nameof(Pointer<byte>.Value));
+        if (property?.GetValue(value) is not ulong rawValue)
+        {
+            return false;
+        }
+
+        pointerValue = rawValue;
+        return true;
     }
 
     private static int GetShardCount(GeneratedKernelMetadata kernel)
@@ -246,8 +293,20 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
             .Max();
 
     private static long GetCollectiveDataBytes(GeneratedKernelMetadata kernel)
+        => GetInt64LaunchMeta(kernel, "collective_data_pool_bytes");
+
+    private static long GetMaxBlockLocalDataBytes(IReadOnlyList<GeneratedKernelMetadata> kernels)
+        => kernels
+            .Select(GetBlockLocalDataBytes)
+            .DefaultIfEmpty(0)
+            .Max();
+
+    private static long GetBlockLocalDataBytes(GeneratedKernelMetadata kernel)
+        => GetInt64LaunchMeta(kernel, "block_local_data_pool_bytes");
+
+    private static long GetInt64LaunchMeta(GeneratedKernelMetadata kernel, string key)
     {
-        if (!kernel.Launch.Meta.TryGetValue("collective_data_pool_bytes", out var value))
+        if (!kernel.Launch.Meta.TryGetValue(key, out var value))
         {
             return 0;
         }
@@ -257,7 +316,7 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
             int intValue => intValue,
             long longValue => longValue,
             JsonElement { ValueKind: JsonValueKind.Number } jsonElement => jsonElement.GetInt64(),
-            _ => throw new NotSupportedException($"PyNTT collective_data_pool_bytes must be an integer, got {value}."),
+            _ => throw new NotSupportedException($"PyNTT {key} must be an integer, got {value}."),
         };
     }
 
@@ -866,6 +925,7 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
                 .DefaultIfEmpty(GetTargetShardCount())
                 .Max();
             var collectiveDataBytes = GetMaxCollectiveDataBytes(kernels);
+            var kernelBlockLocalDataBytes = GetMaxBlockLocalDataBytes(tirKernels);
             var usesData = false;
             var dataLocalBytes = 0L;
             var nestedDataLocalBytes = 0L;
@@ -887,14 +947,26 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
                 usesChipLocalData = primFunction.SchedResult.ChipLocalDataPoolSize > 0 || chipLocalDataUsage;
 
                 var blockLocalDataUsage = GetWorkspaceUsage(function.SourceFunction, MemoryLocation.BlockLocalData);
-                blockLocalDataBytes = Math.Max((long)primFunction.SchedResult.BlockLocalDataPoolSize, blockLocalDataUsage.LocalBytes);
-                usesBlockLocalData = tirKernels.Length > 0 || primFunction.SchedResult.BlockLocalDataPoolSize > 0 || blockLocalDataUsage.IsReferenced;
+                var cacheUsage = GetWorkspaceUsage(function.SourceFunction, MemoryLocation.Cache);
+                blockLocalDataBytes = new[]
+                {
+                    (long)primFunction.SchedResult.BlockLocalDataPoolSize,
+                    blockLocalDataUsage.LocalBytes,
+                    cacheUsage.LocalBytes,
+                    kernelBlockLocalDataBytes,
+                }.Max();
+                usesBlockLocalData = tirKernels.Length > 0 || primFunction.SchedResult.BlockLocalDataPoolSize > 0 || blockLocalDataUsage.IsReferenced || cacheUsage.IsReferenced || kernelBlockLocalDataBytes > 0;
             }
 
             var callees = new List<PrimFunction>();
             CollectDirectPrimFunctionCallees(function.SourceFunction, callees);
             foreach (var directCallee in callees)
             {
+                if (PyNTTPrimFunctionRoles.IsAutoTilingDeviceFunction(directCallee))
+                {
+                    continue;
+                }
+
                 var calleeRequirements = GetPreparedWorkspaceRequirements(FindLinkableFunction(directCallee), active);
                 usesData |= calleeRequirements.UsesData;
                 nestedDataLocalBytes = Math.Max(nestedDataLocalBytes, calleeRequirements.DataLocalBytes);
@@ -1494,6 +1566,7 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
             MemoryLocation.Data => context.DataPoolStrideBytes,
             MemoryLocation.ChipLocalData => "0",
             MemoryLocation.BlockLocalData => context.BlockLocalDataPoolStrideBytes,
+            MemoryLocation.Cache => context.BlockLocalDataPoolStrideBytes,
             _ => null,
         };
 
@@ -1827,15 +1900,29 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
             MemoryLocation.Data => RequireWorkspaceName(context.Data, contextName, "data"),
             MemoryLocation.ChipLocalData => RequireWorkspaceName(context.ChipLocalData, contextName, "chip_local_data"),
             MemoryLocation.BlockLocalData => RequireWorkspaceName(context.BlockLocalData, contextName, "block_local_data"),
+            MemoryLocation.Cache => RequireWorkspaceName(context.BlockLocalData, contextName, "block_local_data"),
             MemoryLocation.Rdata => RequireWorkspaceName(context.RData, contextName, "rdata"),
             MemoryLocation.ChipLocalRdata => RequireWorkspaceName(context.ChipLocalRData, contextName, "chip_local_rdata"),
             MemoryLocation.BlockLocalRdata => RequireWorkspaceName(context.BlockLocalRData, contextName, "block_local_rdata"),
             var location => throw new NotSupportedException($"{contextName} cannot pass buffer {buffer.Name} from memory location {location} as a PyNTT runtime tensor view."),
         };
         var offsetBytes = BuildRuntimeBufferOffsetExpression(buffer, contextName);
-        var sizeBytes = BuildRuntimeDimensionExpression(buffer.MemSpan.Size, $"{contextName} buffer {buffer.Name} size");
+        var sizeBytes = BuildRuntimeBufferViewSizeExpression(buffer, context, contextName);
         var dtype = GetPyNTTScalarDTypeName(buffer.ElemType);
         return $"view_typed_buffer({baseName}, {offsetBytes}, {sizeBytes}, {PythonString(dtype)})";
+    }
+
+    private string BuildRuntimeBufferViewSizeExpression(TIR.Buffer buffer, RuntimeDispatchContext context, string contextName)
+        => buffer.MemSpan.Buffer.Location switch
+        {
+            MemoryLocation.BlockLocalData or MemoryLocation.Cache => BuildBlockLocalDataBackingSizeExpression(context, contextName),
+            _ => BuildRuntimeDimensionExpression(buffer.MemSpan.Size, $"{contextName} buffer {buffer.Name} size"),
+        };
+
+    private string BuildBlockLocalDataBackingSizeExpression(RuntimeDispatchContext context, string contextName)
+    {
+        var strideBytes = RequireWorkspaceName(context.BlockLocalDataPoolStrideBytes, contextName, "block_local_data_pool_stride_bytes");
+        return MultiplyRuntimeExpression(strideBytes, GetBlockLocalDataScopeCount());
     }
 
     private static bool TryResolveAbiBufferBinding(TIR.Buffer buffer, RuntimeDispatchContext context, out RuntimeBinding binding)
@@ -2446,7 +2533,37 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
 
             var callees = new List<PrimFunction>();
             CollectDirectPrimFunctionCallees(function.SourceFunction, callees);
-            return callees.Any(callee => UsesTransitiveModuleRData(FindLinkableFunction(callee), selector, active));
+            return callees.Any(callee =>
+                PyNTTPrimFunctionRoles.IsAutoTilingDeviceFunction(callee)
+                    ? UsesTransitiveModuleRData(callee, selector, new HashSet<PrimFunction>(ReferenceEqualityComparer.Instance))
+                    : UsesTransitiveModuleRData(FindLinkableFunction(callee), selector, active));
+        }
+        finally
+        {
+            active.Remove(function);
+        }
+    }
+
+    private bool UsesTransitiveModuleRData(
+        PrimFunction function,
+        Func<PrimFunction, IReadOnlyDictionary<Const, ValueRange<ulong>>> selector,
+        HashSet<PrimFunction> active)
+    {
+        if (!active.Add(function))
+        {
+            throw new NotSupportedException($"PyNTT rdata device call graph contains a recursive call involving {function.Name}.");
+        }
+
+        try
+        {
+            if (selector(function).Count > 0)
+            {
+                return true;
+            }
+
+            var callees = new List<PrimFunction>();
+            CollectDirectPrimFunctionCallees(function, callees);
+            return callees.Any(callee => UsesTransitiveModuleRData(callee, selector, active));
         }
         finally
         {
@@ -2519,31 +2636,66 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
         var seenRanges = new Dictionary<RDataRangeKey, TensorConst>();
         foreach (var function in _functions)
         {
-            if (function.SourceFunction is not PrimFunction primFunction)
+            foreach (var primFunction in EnumerateTransitivePrimFunctions(function.SourceFunction))
             {
-                continue;
-            }
-
-            foreach ((var @const, var range) in selector(primFunction))
-            {
-                if (@const is not TensorConst tensorConst)
+                foreach ((var @const, var range) in selector(primFunction))
                 {
-                    throw new NotSupportedException($"PyNTT module rdata only supports TensorConst, got {@const.GetType().Name}.");
-                }
+                    if (@const is not TensorConst tensorConst)
+                    {
+                        throw new NotSupportedException($"PyNTT module rdata only supports TensorConst, got {@const.GetType().Name}.");
+                    }
 
-                var key = new RDataRangeKey(range.Min, range.Max);
-                if (seenRanges.TryGetValue(key, out var existing))
-                {
-                    EnsureSameReadOnlyData(existing, tensorConst, key);
-                    continue;
-                }
+                    var key = new RDataRangeKey(range.Min, range.Max);
+                    if (seenRanges.TryGetValue(key, out var existing))
+                    {
+                        EnsureSameReadOnlyData(existing, tensorConst, key);
+                        continue;
+                    }
 
-                seenRanges.Add(key, tensorConst);
-                allocations.Add(new(tensorConst, range));
+                    seenRanges.Add(key, tensorConst);
+                    allocations.Add(new(tensorConst, range));
+                }
             }
         }
 
         return allocations.OrderBy(allocation => allocation.Range.Min).ToArray();
+    }
+
+    private static IReadOnlyList<PrimFunction> EnumerateTransitivePrimFunctions(BaseExpr expr)
+    {
+        var functions = new List<PrimFunction>();
+        CollectTransitivePrimFunctions(expr, functions, new HashSet<PrimFunction>(ReferenceEqualityComparer.Instance));
+        return functions;
+    }
+
+    private static void CollectTransitivePrimFunctions(BaseExpr expr, List<PrimFunction> functions, HashSet<PrimFunction> seen)
+    {
+        if (expr is PrimFunction primFunction)
+        {
+            if (!seen.Add(primFunction))
+            {
+                return;
+            }
+
+            functions.Add(primFunction);
+            CollectTransitivePrimFunctions(primFunction.Body, functions, seen);
+            return;
+        }
+
+        if (expr is BaseFunction)
+        {
+            return;
+        }
+
+        if (expr is Call { Target: PrimFunction callee })
+        {
+            CollectTransitivePrimFunctions(callee, functions, seen);
+        }
+
+        foreach (var operand in expr.Operands)
+        {
+            CollectTransitivePrimFunctions(operand, functions, seen);
+        }
     }
 
     private void EnsureSameReadOnlyData(TensorConst lhs, TensorConst rhs, RDataRangeKey range)

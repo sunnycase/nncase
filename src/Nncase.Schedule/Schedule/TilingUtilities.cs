@@ -54,8 +54,9 @@ public static class TilingUtilities
         };
     }
 
-    public static (Isl.set DomainSet, bool[] DomainDynamic, long[] DomainBoundValues, Dimension[] DomainBoundExprs) InferDomainBounds(Shape[] bufferRuntimeShapes, Isl.set[] shapeDomains, Isl.map[] accessMaps, HashSet<DimVar> dimVars)
+    public static (Isl.set DomainSet, bool[] DomainDynamic, long[] DomainBoundValues, Dimension[] DomainBoundExprs) InferDomainBounds(Shape[] bufferRuntimeShapes, Isl.set[] shapeDomains, AffineMap[] affineMaps, HashSet<DimVar> dimVars)
     {
+        var accessMaps = affineMaps.Select(AffineUtility.AsMap).ToArray();
         var reversedAccessMaps = accessMaps.Zip(shapeDomains).Select(pair =>
         {
             var reverse = pair.First.reverse();
@@ -106,7 +107,96 @@ public static class TilingUtilities
             }
         }
 
-        return (domainSet, domainDynamic, domainBoundValues, domainBoundExprs);
+        if (affineMaps.Length == 0 || domainBoundValues.Length == affineMaps[0].Domains.Length)
+        {
+            return (domainSet, domainDynamic, domainBoundValues, domainBoundExprs);
+        }
+
+        if (TryInferProjectedPermutationDomainBounds(bufferRuntimeShapes, affineMaps, out var directDomainSet, out var directDomainDynamic, out var directDomainBoundValues, out var directDomainBoundExprs))
+        {
+            return (directDomainSet, directDomainDynamic, directDomainBoundValues, directDomainBoundExprs);
+        }
+
+        throw new InvalidOperationException($"Unable to infer complete affine domain bounds. Expected {affineMaps[0].Domains.Length} domains, got {domainBoundValues.Length}.");
+    }
+
+    private static bool TryInferProjectedPermutationDomainBounds(
+        Shape[] bufferRuntimeShapes,
+        AffineMap[] accessMaps,
+        out Isl.set domainSet,
+        out bool[] domainDynamic,
+        out long[] domainBoundValues,
+        out Dimension[] domainBoundExprs)
+    {
+        domainSet = null!;
+        domainDynamic = Array.Empty<bool>();
+        domainBoundValues = Array.Empty<long>();
+        domainBoundExprs = Array.Empty<Dimension>();
+
+        if (accessMaps.Length == 0)
+        {
+            return false;
+        }
+
+        var domainRank = accessMaps[0].Domains.Length;
+        if (accessMaps.Any(map => map.Domains.Length != domainRank))
+        {
+            throw new InvalidOperationException("All affine access maps in a grid must use the same domain rank.");
+        }
+
+        var found = new bool[domainRank];
+        var exprs = new Dimension[domainRank];
+        var values = new long[domainRank];
+        for (int bufferIndex = 0; bufferIndex < accessMaps.Length; bufferIndex++)
+        {
+            var accessMap = accessMaps[bufferIndex];
+            var shape = bufferRuntimeShapes[bufferIndex];
+            if (accessMap.Results.Length > shape.Rank)
+            {
+                return false;
+            }
+
+            for (int resultIndex = 0; resultIndex < accessMap.Results.Length; resultIndex++)
+            {
+                var range = accessMap.Results[resultIndex];
+                if (range.Offset is not AffineDim dim || range.Extent is not AffineExtent extent || dim.Position != extent.Position)
+                {
+                    continue;
+                }
+
+                var candidate = shape[resultIndex];
+                if (!CompilerServices.TryGetMaxShape(new RankedShape(new[] { candidate }), out var maxShape))
+                {
+                    return false;
+                }
+
+                var position = dim.Position;
+                if (position < 0 || position >= domainRank)
+                {
+                    throw new InvalidOperationException($"Affine domain position {position} is outside domain rank {domainRank}.");
+                }
+
+                if (found[position] && values[position] != maxShape[0])
+                {
+                    return false;
+                }
+
+                found[position] = true;
+                exprs[position] = candidate;
+                values[position] = maxShape[0];
+            }
+        }
+
+        if (found.Any(x => !x))
+        {
+            return false;
+        }
+
+        domainBoundExprs = exprs;
+        domainBoundValues = values;
+        domainDynamic = exprs.Select(expr => expr is not DimConst).ToArray();
+        domainSet = ISLUtility.ToDomain(new RankedShape(domainBoundExprs), out _);
+        return true;
     }
 
     /// <summary>

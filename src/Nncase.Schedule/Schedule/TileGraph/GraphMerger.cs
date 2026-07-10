@@ -83,7 +83,9 @@ public sealed class GraphMerger
 
         // 1.3 build the domain relation betwwen relay op -> producer op.
         var readAccess = relayOp.ReadAccesses[dependencePath.First().Tag];
-        var relation = readAccess * AffineUtility.Inverse(ProducerOp.WriteAccess, ProducerOp.DomainBounds.Select(Convert.ToInt64).ToArray());
+        var producerOutputIndex = GraphExtensions.GetProducerOutputIndex(relayOp.Grid.Reads[dependencePath.First().Tag], ProducerOp);
+        var producerWriteAccess = ProducerOp.WriteAccesses[producerOutputIndex];
+        var relation = readAccess * AffineUtility.Inverse(producerWriteAccess, ProducerOp.DomainBounds.Select(Convert.ToInt64).ToArray());
         if (!relation.IsProjectedPermutation(true))
         {
             return false;

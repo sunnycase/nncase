@@ -68,7 +68,8 @@ public sealed class BufferizationAlgorithm : AlgorithmBase<TieredTileGraph>
             Visit(rootGraph, rootBufferGraph, rootGraph);
             foreach (var edge in rootGraph.Edges)
             {
-                var source = new BufferIdentity(edge.Source, edge.Source.ReadAccesses.Length);
+                var sourceOutputIndex = GraphExtensions.GetProducerOutputIndex(edge.Target.Grid.Reads[edge.Tag], edge.Source);
+                var source = new BufferIdentity(edge.Source, edge.Source.Grid.GetOutputBufferIndex(sourceOutputIndex));
                 var target = new BufferIdentity(edge.Target, edge.Tag);
                 rootBufferGraph.AddEdge(new(source, target, BufferEdgeKind.Inter));
             }
@@ -85,10 +86,15 @@ public sealed class BufferizationAlgorithm : AlgorithmBase<TieredTileGraph>
             foreach (var item in graph.Vertices)
             {
                 opnodes.Add(item);
-                var outBid = new BufferIdentity(item, item.ReadAccesses.Length);
+                var outputBids = Enumerable.Range(0, item.WriteAccesses.Length)
+                    .Select(outputIndex => new BufferIdentity(item, item.Grid.GetOutputBufferIndex(outputIndex)))
+                    .ToArray();
                 for (int i = 0; i < item.ReadAccesses.Length; i++)
                 {
-                    bufferGraph.AddVerticesAndEdge(new(new(item, i), outBid, BufferEdgeKind.Intra));
+                    foreach (var outBid in outputBids)
+                    {
+                        bufferGraph.AddVerticesAndEdge(new(new(item, i), outBid, BufferEdgeKind.Intra));
+                    }
                 }
             }
         }
@@ -109,7 +115,8 @@ public sealed class BufferizationAlgorithm : AlgorithmBase<TieredTileGraph>
         {
             if (opnodes.Contains(edge.Source) && opnodes.Contains(edge.Target))
             {
-                var source = new BufferIdentity(edge.Source, edge.Source.ReadAccesses.Length);
+                var sourceOutputIndex = GraphExtensions.GetProducerOutputIndex(edge.Target.Grid.Reads[edge.Tag], edge.Source);
+                var source = new BufferIdentity(edge.Source, edge.Source.Grid.GetOutputBufferIndex(sourceOutputIndex));
                 var target = new BufferIdentity(edge.Target, edge.Tag);
                 bufferGraph.AddEdge(new(source, target, BufferEdgeKind.Inter));
             }

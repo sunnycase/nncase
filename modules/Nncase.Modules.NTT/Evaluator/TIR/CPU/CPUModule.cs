@@ -47,6 +47,7 @@ internal class NTTModule : IApplicationPart
         registrator.RegisterManyInterface<TransposeEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<GatherEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<ReshapeEvaluator>(reuse: Reuse.Singleton);
+        registrator.RegisterManyInterface<BitcastEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<PadEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<Im2colEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<InstanceNormEvaluator>(reuse: Reuse.Singleton);

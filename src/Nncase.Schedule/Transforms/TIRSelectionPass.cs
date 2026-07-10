@@ -31,6 +31,11 @@ public abstract class TIRSelectionPass : FunctionPass
             var isEntry = callers.Length == 0;
             var visitor = new TIRSelectionVisitor(this);
             (var newBody, var inBuffers, var outBuffers) = visitor.Select(func);
+            var callerAllocatedOutBuffers = outBuffers
+                .Where(buffer => buffer.Role == BufferVarRole.Output)
+                .Distinct()
+                .ToArray();
+            var parameters = inBuffers.Concat(callerAllocatedOutBuffers).ToArray();
 
             if (isEntry)
             {
@@ -38,7 +43,8 @@ public abstract class TIRSelectionPass : FunctionPass
                     $"{input.Name}_prim",
                     ModuleKind,
                     newBody,
-                    inBuffers.Concat(outBuffers).ToArray());
+                    parameters);
+                EnsureEntryOutputOrder(primFunc, outBuffers);
                 return Task.FromResult((BaseFunction)primFunc);
             }
             else
@@ -48,9 +54,9 @@ public abstract class TIRSelectionPass : FunctionPass
                     $"{input.Name}_prim",
                     ModuleKind,
                     newBody,
-                    inBuffers.Concat(outBuffers).ToArray());
+                    parameters);
                 var primWrapper = new PrimFunctionWrapper(input.Name, primFunc, inBuffers.Count);
-                AddOutputBufferAllocsToCallers(func, outBuffers, callers.OfType<Call>());
+                RewriteCallersForPrimFunction(primFunc, outBuffers, callerAllocatedOutBuffers, callers.OfType<Call>());
                 return Task.FromResult((BaseFunction)primWrapper);
             }
         }
@@ -69,21 +75,70 @@ public abstract class TIRSelectionPass : FunctionPass
         };
     }
 
-    private void AddOutputBufferAllocsToCallers(Function function, IEnumerable<BufferVar> outputBuffers, IEnumerable<Call> callers)
+    private static void EnsureEntryOutputOrder(PrimFunction primFunction, IReadOnlyList<BufferVar> logicalOutputs)
     {
-        var outputBufferTypes = outputBuffers.Select(x => x.CheckedType).ToArray();
+        var abiOutputs = primFunction.GetAbiView().Outputs;
+        if (abiOutputs.Count != logicalOutputs.Count
+            || !abiOutputs.Zip(logicalOutputs).All(pair => ReferenceEquals(pair.First, pair.Second)))
+        {
+            throw new InvalidOperationException(
+                $"Entry PrimFunction {primFunction.Name} cannot represent its logical output order with the derived buffer ABI.");
+        }
+    }
+
+    private void RewriteCallersForPrimFunction(
+        PrimFunction primFunction,
+        IReadOnlyList<BufferVar> logicalOutputs,
+        IReadOnlyList<BufferVar> callerAllocatedOutputs,
+        IEnumerable<Call> callers)
+    {
+        var outputBufferTypes = callerAllocatedOutputs.Select(x => x.CheckedType).ToArray();
+        var abiOutputs = primFunction.GetAbiView().Outputs;
         foreach (var caller in callers)
         {
-            var outputAllocs = outputBufferTypes.Select(CreateDataUninitialized);
+            var outputAllocs = outputBufferTypes.Select(CreateDataUninitialized).ToArray();
             var newArgs = caller.Arguments.ToArray().Concat(outputAllocs).ToArray();
             var newCaller = caller.With(arguments: newArgs);
-            ReplaceUtility.ReplaceAllUsesWith(caller, newCaller);
+            var logicalResult = BuildLogicalResult(newCaller, logicalOutputs, abiOutputs);
+            ReplaceUtility.ReplaceAllUsesWith(caller, logicalResult);
+        }
+
+        BaseExpr BuildLogicalResult(Call caller, IReadOnlyList<BufferVar> logicalOutputs, IReadOnlyList<BufferVar> abiOutputs)
+        {
+            if (logicalOutputs.Count == 0)
+            {
+                return caller;
+            }
+
+            var fields = logicalOutputs.Select(logicalOutput =>
+            {
+                var abiIndex = -1;
+                for (var index = 0; index < abiOutputs.Count; index++)
+                {
+                    if (ReferenceEquals(abiOutputs[index], logicalOutput))
+                    {
+                        abiIndex = index;
+                        break;
+                    }
+                }
+
+                if (abiIndex < 0)
+                {
+                    throw new InvalidOperationException(
+                        $"PrimFunction {primFunction.Name} logical output {logicalOutput.Name} is not present in its derived ABI outputs.");
+                }
+
+                return abiOutputs.Count == 1
+                    ? (BaseExpr)caller
+                    : IR.F.Tensors.GetItem(caller, abiIndex);
+            }).ToArray();
+            return fields.Length == 1 ? fields[0] : new IR.Tuple(fields);
         }
 
         static Expr CreateDataUninitialized(IRType type)
             => type switch
             {
-                DistributedType dt => IR.F.Buffer.Uninitialized(dt.TensorType.DType, TIR.MemoryLocation.Data, dt.TensorType.Shape, dt.AxisPolicies, dt.Placement),
+                DistributedType dt => IR.F.Buffer.Uninitialized(dt.TensorType.DType, TIR.MemoryLocation.Data, dt.TensorType.Shape, dt.AxisPolicies, dt.Placement, dt.Partial),
                 TensorType tt => IR.F.Buffer.Uninitialized(tt.DType, TIR.MemoryLocation.Data, tt.Shape),
                 _ => throw new InvalidOperationException($"TIR selection caller-allocated output expects tensor type, got {type.GetType().Name}."),
             };
@@ -106,7 +161,7 @@ public abstract class TIRSelectionPass : FunctionPass
 
         public SelectionResult Select(Function function)
         {
-            var inBuffers = LowerInputParameters(function.Parameters);
+            var inBuffers = LowerInputParameters(function.Parameters).ToArray();
             Visit(function.Body, Unit.Default);
 
             var outBuffers = function.Body switch
@@ -119,14 +174,45 @@ public abstract class TIRSelectionPass : FunctionPass
                 },
             };
 
+            var inputValues = new Dictionary<BaseExpr, int>(ReferenceEqualityComparer.Instance);
+            for (var inputIndex = 0; inputIndex < function.Parameters.Length; inputIndex++)
+            {
+                var parameter = (BaseExpr)function.Parameters[inputIndex];
+                if (inBuffers[inputIndex] is BufferVar && ExprMemo.TryGetValue(parameter, out var inputValue))
+                {
+                    if (!inputValues.TryAdd(inputValue, inputIndex))
+                    {
+                        throw new InvalidOperationException(
+                            $"Function {function.Name} has multiple buffer parameters lowered to the same selected value.");
+                    }
+                }
+            }
+
             // Add necessary copy calls
             for (int i = 0; i < outBuffers.Length; i++)
             {
                 var previousBuffers = outBuffers.AsReadOnlySpan(0, i);
                 var currentBuffer = outBuffers[i];
-                if (currentBuffer is not BufferVar { Role: BufferVarRole.Output }
-                    || previousBuffers.ReferenceContains(currentBuffer)
-                    || (currentBuffer is IVar currentVar && function.Parameters.ReferenceContains(currentVar)))
+                if (inputValues.TryGetValue(currentBuffer, out var inputIndex))
+                {
+                    var inputBuffer = (BufferVar)inBuffers[inputIndex];
+                    if (inputBuffer.Role == BufferVarRole.Input)
+                    {
+                        var inOutBuffer = inputBuffer.With(role: BufferVarRole.InOut);
+                        ReplaceUtility.ReplaceAllUsesWith(inputBuffer, inOutBuffer);
+                        inBuffers[inputIndex] = inOutBuffer;
+                        inputBuffer = inOutBuffer;
+                    }
+                    else if (inputBuffer.Role != BufferVarRole.InOut)
+                    {
+                        throw new InvalidOperationException(
+                            $"Function {function.Name} output aliases input buffer {inputBuffer.Name} with invalid role {inputBuffer.Role}.");
+                    }
+
+                    outBuffers[i] = inputBuffer;
+                }
+                else if (currentBuffer is not BufferVar { Role: BufferVarRole.Output }
+                         || previousBuffers.ReferenceContains(currentBuffer))
                 {
                     var newBuffer = CreateOutputBufferVar(_selectionPass.GetArgumentType(currentBuffer));
                     _body.Add(T.Memcopy(newBuffer, currentBuffer));
@@ -248,13 +334,36 @@ public abstract class TIRSelectionPass : FunctionPass
                 return false;
             }
 
-            var outputCount = primFunction.GetAbiView().Outputs.Count;
-            if (outputCount == 0 || arguments.Count < inputCount + outputCount)
+            var outputs = primFunction.GetAbiView().Outputs;
+            if (outputs.Count == 0)
             {
                 return false;
             }
 
-            var outputArguments = arguments.Skip(inputCount).Take(outputCount).ToArray();
+            var parameters = primFunction.Parameters.ToArray();
+            var outputArguments = new BaseExpr[outputs.Count];
+            for (var outputIndex = 0; outputIndex < outputs.Count; outputIndex++)
+            {
+                var outputParameter = outputs[outputIndex];
+                var parameterIndex = Array.FindIndex(parameters, parameter => ReferenceEquals(parameter, outputParameter));
+                if (parameterIndex < 0)
+                {
+                    throw new InvalidOperationException($"PrimFunction {primFunction.Name} ABI output {outputParameter.Name} is not in its parameter list.");
+                }
+
+                if (outputParameter.Role == BufferVarRole.InOut && parameterIndex >= inputCount)
+                {
+                    throw new InvalidOperationException($"PrimFunction {primFunction.Name} InOut parameter {outputParameter.Name} is not part of the input ABI.");
+                }
+
+                if (parameterIndex >= arguments.Count)
+                {
+                    return false;
+                }
+
+                outputArguments[outputIndex] = arguments[parameterIndex];
+            }
+
             output = outputArguments.Length == 1 ? outputArguments[0] : new IR.Tuple(outputArguments);
             selectedCall = new Call(primFunction, arguments.ToArray());
             return true;

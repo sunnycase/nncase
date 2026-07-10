@@ -94,7 +94,7 @@ public class OpGenerator : IIncrementalGenerator
                             select Parameter(
                                 attributeLists: default,
                                 modifiers: default,
-                                type: NullableType(ParseTypeName(p.Type.ToDisplayString())).WithTrailingTrivia(ElasticSpace),
+                                type: MakeOptionalParameterType(p).WithTrailingTrivia(ElasticSpace),
                                 identifier: Identifier(p.Name.Camelize()),
                                 @default: EqualsValueClause(LiteralExpression(SyntaxKind.NullLiteralExpression))))),
                         constraintClauses: default,
@@ -289,22 +289,47 @@ public class OpGenerator : IIncrementalGenerator
             var inner = BinaryExpression(
                 SyntaxKind.LogicalAndExpression,
                 left.WithTrailingTrivia(ElasticSpace),
-                InvocationExpression(
-                    MemberAccessExpression(
-                        SyntaxKind.SimpleMemberAccessExpression,
-                        IdentifierName(prop.Name),
-                        IdentifierName("Equals")),
-                    ArgumentList(SeparatedList(new[] {
-                        Argument(
-                            MemberAccessExpression(
-                            SyntaxKind.SimpleMemberAccessExpression,
-                            IdentifierName("other"),
-                            IdentifierName(prop.Name))),
-                    }))));
+                MakePropertyEqualsExpression(prop));
             return ChainLogicalAnd(inner, properties.Skip(1));
         }
 
         return left;
+    }
+
+    private static TypeSyntax MakeOptionalParameterType(IPropertySymbol property)
+    {
+        var type = ParseTypeName(property.Type.ToDisplayString());
+        return property.NullableAnnotation == NullableAnnotation.Annotated
+            ? type
+            : NullableType(type);
+    }
+
+    private static ExpressionSyntax MakePropertyEqualsExpression(IPropertySymbol property)
+    {
+        var otherProperty = MemberAccessExpression(
+            SyntaxKind.SimpleMemberAccessExpression,
+            IdentifierName("other"),
+            IdentifierName(property.Name));
+        if (property.NullableAnnotation == NullableAnnotation.Annotated)
+        {
+            return InvocationExpression(
+                MemberAccessExpression(
+                    SyntaxKind.SimpleMemberAccessExpression,
+                    PredefinedType(Token(SyntaxKind.ObjectKeyword)),
+                    IdentifierName("Equals")),
+                ArgumentList(SeparatedList(new[]
+                {
+                    Argument(IdentifierName(property.Name)),
+                    Argument(otherProperty),
+                })));
+        }
+
+        return InvocationExpression(
+            MemberAccessExpression(
+                SyntaxKind.SimpleMemberAccessExpression,
+                IdentifierName(property.Name),
+                IdentifierName("Equals")),
+            ArgumentList(SeparatedList(new[] { Argument(otherProperty) })));
     }
 
     private GenerateCandidate? GetSemanticTargetForGeneration(GeneratorSyntaxContext context)

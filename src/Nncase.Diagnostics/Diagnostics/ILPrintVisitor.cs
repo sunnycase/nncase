@@ -580,7 +580,7 @@ internal sealed class ILPrintVisitor : ExprFunctor<string, string>
             _writer.WInd().WriteLine($"Reads:");
             using (IndentScope())
             {
-                for (int i = 0; i < buffers.Length - 1; i++)
+                for (int i = 0; i < expr.Reads.Length; i++)
                 {
                     _writer.WInd().WriteLine($"{buffers[i]}: {expr.AccessMaps[i]}");
                 }
@@ -590,7 +590,10 @@ internal sealed class ILPrintVisitor : ExprFunctor<string, string>
             _writer.WInd().WriteLine($"Write:");
             using (IndentScope())
             {
-                _writer.WInd().WriteLine($"{buffers[^1]}: {expr.AccessMaps[^1]}");
+                for (int i = 0; i < expr.Writes.Length; i++)
+                {
+                    _writer.WInd().WriteLine($"{buffers[expr.Reads.Length + i]}: {expr.WriteAccessMaps[i]}");
+                }
             }
 
             // 4. For Body

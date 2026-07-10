@@ -39,15 +39,7 @@ public sealed class TieredTileGraphBuilder : ExprVisitor<Unit, Unit>
     public static TieredTileGraph Build(BaseExpr expr, int levelCount, out Dictionary<Grid, TieredTileGraph> exprMemo)
     {
         HashSet<Grid> outputGrids = new();
-        if (expr is IR.Tuple tp)
-        {
-            var outputs = tp.Fields.ToArray().OfType<Grid>().ToHashSet();
-            outputGrids.UnionWith(outputs);
-        }
-        else if (expr is Grid grid)
-        {
-            outputGrids.UnionWith(new[] { grid });
-        }
+        CollectOutputGrids(expr, outputGrids);
 
         var builder = new TieredTileGraphBuilder(levelCount, outputGrids);
         builder.Visit(expr);
@@ -79,8 +71,7 @@ public sealed class TieredTileGraphBuilder : ExprVisitor<Unit, Unit>
             dimVars.UnionWith(tps.Select(t => t.paramMap).SelectMany(i => i).ToArray());
         }
 
-        var accessMaps = current.AccessMaps.AsValueEnumerable().Select(AffineUtility.AsMap).ToArray();
-        var (domain, domainDynamic, domainBoundValues, domainBoundExprs) = TilingUtilities.InferDomainBounds(bufferRuntimeShapes, bufferDomains, accessMaps, dimVars);
+        var (domain, domainDynamic, domainBoundValues, domainBoundExprs) = TilingUtilities.InferDomainBounds(bufferRuntimeShapes, bufferDomains, current.AccessMaps.ToArray(), dimVars);
 
         var copId = _opId++;
         var domainDims = current.AccessMaps[0].Domains.Length;
@@ -109,7 +100,7 @@ public sealed class TieredTileGraphBuilder : ExprVisitor<Unit, Unit>
 
         for (int i = 0; i < current.Reads.Length; i++)
         {
-            if (current.Reads[i] is Grid producer)
+            if (GraphExtensions.TryGetProducerGrid(current.Reads[i], out var producer, out _))
             {
                 var producerNode = _memo[producer];
                 RootGraph.AddEdge(new(producerNode, opNode, i));
@@ -120,5 +111,32 @@ public sealed class TieredTileGraphBuilder : ExprVisitor<Unit, Unit>
         _exprMemo.Add(current, tileNodeRoot);
 
         return default;
+    }
+
+    private static void CollectOutputGrids(BaseExpr expr, HashSet<Grid> outputGrids)
+    {
+        switch (expr)
+        {
+            case Grid grid:
+                outputGrids.Add(grid);
+                break;
+            case IR.Tuple tuple:
+                foreach (var field in tuple.Fields)
+                {
+                    CollectOutputGrids(field, outputGrids);
+                }
+
+                break;
+            case Expr tensorExpr when GraphExtensions.TryGetProducerGrid(tensorExpr, out var producer, out _):
+                outputGrids.Add(producer);
+                break;
+            default:
+                foreach (var operand in expr.Operands)
+                {
+                    CollectOutputGrids(operand, outputGrids);
+                }
+
+                break;
+        }
     }
 }

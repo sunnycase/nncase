@@ -27,6 +27,11 @@ public static class AffineUtility
 
     public static AffineMap Inverse(AffineMap map, params long[] bounds)
     {
+        if (bounds.Length != map.Domains.Length)
+        {
+            throw new ArgumentException($"Affine inverse expects {map.Domains.Length} domain bounds, got {bounds.Length}.", nameof(bounds));
+        }
+
         var domains = new AffineDomain[map.Results.Length];
         var ranges = new AffineRange[map.Domains.Length];
         var syms = new List<AffineSymbol>();
@@ -41,7 +46,6 @@ public static class AffineUtility
                     ranges[dim.Position] = new(offset, extent);
                     break;
                 case (null, null) when offset is AffineConstant && extent is AffineConstant:
-                    ranges[i] = new(0, bounds[i]);
                     break;
                 default:
                     throw new System.Diagnostics.UnreachableException();

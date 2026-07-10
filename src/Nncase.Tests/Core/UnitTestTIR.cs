@@ -151,6 +151,21 @@ public sealed class UnitTestTIR
     }
 
     [Fact]
+    public void TestPrimFunctionInOutAbiIsBothInputAndOutput()
+    {
+        var objectType = TensorType.Scalar(new ReferenceType(DataTypes.Int32));
+        var inOut = new BufferVar("state", objectType, BufferVarRole.InOut, MemoryLocation.Input);
+        var primFunction = new PrimFunction("inout", "cpu", new Sequential(), new IVar[] { inOut });
+        var abi = primFunction.GetAbiView();
+
+        Assert.Same(inOut, Assert.Single(abi.Inputs));
+        Assert.Same(inOut, Assert.Single(abi.Outputs));
+        var wrapper = new PrimFunctionWrapper(primFunction, 1, objectType);
+        Assert.Equal(objectType, wrapper.ReturnType);
+        Assert.Equal(objectType, Assert.Single(wrapper.ParameterTypes));
+    }
+
+    [Fact]
     public void TestTIRExtensions()
     {
         var list = new List<Expr>();
