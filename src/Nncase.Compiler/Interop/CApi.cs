@@ -129,13 +129,11 @@ public unsafe struct CApiMT
     public delegate* unmanaged<IntPtr, long*, nuint, void> CPUTargetOptionsSetHierarchySizesPtr;
     public delegate* unmanaged<IntPtr, int*, nuint, void> CPUTargetOptionsSetHierarchyLatenciesPtr;
     public delegate* unmanaged<IntPtr, int*, nuint, void> CPUTargetOptionsSetHierarchyBandWidthsPtr;
-    public delegate* unmanaged<IntPtr, int*, nuint, void> CPUTargetOptionsSetMemoryCapacitiesPtr;
-    public delegate* unmanaged<IntPtr, int*, nuint, void> CPUTargetOptionsSetMemoryBandWidthsPtr;
+    public delegate* unmanaged<IntPtr, byte*, nuint, void> CPUTargetOptionsSetTargetMachinePtr;
     public delegate* unmanaged<IntPtr, byte*, nuint, void> CPUTargetOptionsSetDistributedSchemePtr;
     public delegate* unmanaged<IntPtr, byte*, nuint, void> CPUTargetOptionsSetCustomOpSchemePtr;
     public delegate* unmanaged<IntPtr> PyNTTTargetOptionsCreatePtr;
     public delegate* unmanaged<IntPtr, byte*, nuint, void> PyNTTTargetOptionsSetBackendPtr;
-    public delegate* unmanaged<IntPtr, byte*, nuint, void> PyNTTTargetOptionsSetTritonCapabilityPtr;
     public delegate* unmanaged<IntPtr, byte*, nuint, void> PyNTTTargetOptionsSetOutputDirectoryPtr;
     public delegate* unmanaged<IntPtr, byte, void> PyNTTTargetOptionsSetStrictPtr;
     /* end the auto generated block by tools/stackvm_gen/CApiGen at 12/20/2024 5:31:31 PM +08:00. */
@@ -273,13 +271,11 @@ public static unsafe class CApi
         mt->CPUTargetOptionsSetHierarchySizesPtr = &NTTTargetOptionsSetHierarchySizes;
         mt->CPUTargetOptionsSetHierarchyLatenciesPtr = &NTTTargetOptionsSetHierarchyLatencies;
         mt->CPUTargetOptionsSetHierarchyBandWidthsPtr = &NTTTargetOptionsSetHierarchyBandWidths;
-        mt->CPUTargetOptionsSetMemoryCapacitiesPtr = &NTTTargetOptionsSetMemoryCapacities;
-        mt->CPUTargetOptionsSetMemoryBandWidthsPtr = &NTTTargetOptionsSetMemoryBandWidths;
+        mt->CPUTargetOptionsSetTargetMachinePtr = &NTTTargetOptionsSetTargetMachine;
         mt->CPUTargetOptionsSetDistributedSchemePtr = &NTTTargetOptionsSetDistributedScheme;
         mt->CPUTargetOptionsSetCustomOpSchemePtr = &NTTTargetOptionsSetCustomOpScheme;
         mt->PyNTTTargetOptionsCreatePtr = &PyNTTTargetOptionsCreate;
         mt->PyNTTTargetOptionsSetBackendPtr = &PyNTTTargetOptionsSetBackend;
-        mt->PyNTTTargetOptionsSetTritonCapabilityPtr = &PyNTTTargetOptionsSetTritonCapability;
         mt->PyNTTTargetOptionsSetOutputDirectoryPtr = &PyNTTTargetOptionsSetOutputDirectory;
         mt->PyNTTTargetOptionsSetStrictPtr = &PyNTTTargetOptionsSetStrict;
         /* end the auto generated block by tools/stackvm_gen/CApiGen at 12/20/2024 3:41:05 PM +08:00. */
@@ -1109,15 +1105,9 @@ public static unsafe class CApi
     }
 
     [UnmanagedCallersOnly]
-    private static void NTTTargetOptionsSetMemoryCapacities(IntPtr handle, int* value, nuint shape0)
+    private static void NTTTargetOptionsSetTargetMachine(IntPtr handle, byte* value, nuint length)
     {
-        Get<NTTTargetOptions>(handle).MemoryCapacities = To1DArray(value, shape0);
-    }
-
-    [UnmanagedCallersOnly]
-    private static void NTTTargetOptionsSetMemoryBandWidths(IntPtr handle, int* value, nuint shape0)
-    {
-        Get<NTTTargetOptions>(handle).MemoryBandWidths = To1DArray(value, shape0);
+        Get<NTTTargetOptions>(handle).TargetMachine = ToString(value, length);
     }
 
     [UnmanagedCallersOnly]
@@ -1142,12 +1132,6 @@ public static unsafe class CApi
     private static void PyNTTTargetOptionsSetBackend(IntPtr handle, byte* value, nuint length)
     {
         Get<PyNTTTargetOptions>(handle).Backend = ToString(value, length);
-    }
-
-    [UnmanagedCallersOnly]
-    private static void PyNTTTargetOptionsSetTritonCapability(IntPtr handle, byte* value, nuint length)
-    {
-        Get<PyNTTTargetOptions>(handle).TritonCapability = TritonTargetCapability.Parse(ToString(value, length));
     }
 
     [UnmanagedCallersOnly]

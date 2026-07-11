@@ -7,9 +7,9 @@ using Nncase.TIR.NTT;
 
 namespace Nncase.Evaluator.TIR.NTT;
 
-public class TensorLoadEvaluator : ITypeInferencer<TensorLoad>, IKernelInfoEvaluator<TensorLoad>
+public class TensorLoadEvaluator : ITypeInferencer<TensorLoad>, ITileWorkloadEvaluator<TensorLoad>
 {
-    public MicroKernelInfo Visit(TensorLoad target, MicroKernelContext context) => TransferKernelInfo.Create(context);
+    public TileWorkload Visit(TensorLoad target, TileWorkloadContext context) => TransferTileWorkload.Create(context);
 
     public IRType Visit(ITypeInferenceContext context, TensorLoad target)
     {

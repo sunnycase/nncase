@@ -21,10 +21,10 @@ public sealed class PyNTTModuleCompiler : INTTModuleCompiler
     public MaskVectorStyle MaskVectorStyle => MaskVectorStyle.Fat;
 
     /// <inheritdoc/>
-    public int Lane => 16;
+    public int GetLane(CompileOptions options) => GetMachine(options).Execution.VectorWidthBits / 8;
 
     /// <inheritdoc/>
-    public int Nr => 4;
+    public int GetNr(CompileOptions options) => GetMachine(options).Execution.MatMulNr;
 
     /// <inheritdoc/>
     public IModuleBuilder CreateModuleBuilder(CompileOptions options) => new PyNTTModuleBuilder(ModuleKind, options);
@@ -48,6 +48,11 @@ public sealed class PyNTTModuleCompiler : INTTModuleCompiler
             _ => true,
         };
     }
+
+    private static TargetMachineModel GetMachine(CompileOptions options)
+        => options.TargetOptions is ITargetMachineModelProvider provider
+            ? provider.TargetMachineModel
+            : throw new InvalidOperationException("PyNTT compilation requires a resolved target machine model.");
 
     private static bool IsSupportedOp(Op op)
     {

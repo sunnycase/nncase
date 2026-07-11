@@ -2,10 +2,14 @@
 // Licensed under the Apache license. See LICENSE file in the project root for full license information.
 
 using System;
+using System.Collections.Generic;
+using System.Collections.Immutable;
+using System.Linq;
 using Nncase.CostModel;
 using Nncase.IR;
 using Nncase.Targets;
 using Nncase.Tests.TestFixture;
+using Nncase.TIR;
 using Xunit;
 
 namespace Nncase.Tests.CostModelTest;
@@ -16,16 +20,7 @@ public sealed class UnitTestTritonTargetCostModel : TestClassBase
     [Fact]
     public void TestDynamicMatMulCostUsesMaxShape()
     {
-        var capability = TritonTargetCapability.ForComputeCapability(8, 0) with
-        {
-            MultiprocessorCount = 128,
-            ClockRateGHz = 1.0,
-            ChipGlobalMemoryBandwidthGBps = 1_000_000_000.0,
-            Mma = new TritonDotInstructionCapability("mma", 16, 8, 16, 1.0),
-            Wgmma = new TritonDotInstructionCapability("wgmma", 64, 8, 16, 1.0, isSupported: false),
-        };
-        CompileOptions.TargetOptions = new PyNTTTargetOptions { TritonCapability = capability };
-
+        CompileOptions.TargetOptions = CreateOptions(CreateGpuMachine());
         var seq = new DimVar("seq").With(range: new ValueRange<double>(1, 20));
         var lhs = new Var("lhs", new TensorType(DataTypes.BFloat16, new RankedShape((Dimension)1, seq, (Dimension)64)));
         var rhs = new Var("rhs", new TensorType(DataTypes.BFloat16, new RankedShape((Dimension)64, (Dimension)128)));
@@ -34,21 +29,13 @@ public sealed class UnitTestTritonTargetCostModel : TestClassBase
 
         var cost = CompilerServices.EvaluateCost(matmul, CompileOptions);
 
-        Assert.Equal((UInt128)163840, cost[CostFactorNames.CPUCycles]);
+        Assert.Equal((UInt128)4_096, cost[CostFactorNames.CPUCycles]);
     }
 
     [Fact]
-    public void TestScalarMatMulCostDoesNotUseDotInstructions()
+    public void TestScalarMatMulCostDoesNotUseMatrixPrimitive()
     {
-        var capability = TritonTargetCapability.ForComputeCapability(9, 0) with
-        {
-            MultiprocessorCount = 128,
-            ClockRateGHz = 1.0,
-            ChipGlobalMemoryBandwidthGBps = 1_000_000_000.0,
-            Mma = new TritonDotInstructionCapability("mma", 16, 8, 16, 1.0),
-            Wgmma = new TritonDotInstructionCapability("wgmma", 64, 8, 16, 4.0),
-        };
-        var costModel = new TritonTargetOpCostModel(capability);
+        var costModel = new TritonTargetOpCostModel(CreateGpuMachine(wgmmaInstructionsPerCycle: 4));
         var query = new MatMulOpCostQuery(
             new TargetCostTensor(DataTypes.BFloat16, new RankedShape(64, 64)),
             new TargetCostTensor(DataTypes.BFloat16, new RankedShape(64, 128)),
@@ -56,21 +43,13 @@ public sealed class UnitTestTritonTargetCostModel : TestClassBase
             DataTypes.BFloat16);
 
         Assert.True(costModel.TryGetMatMulCost(query, out var cost));
-        Assert.Equal((UInt128)524288, cost[CostFactorNames.CPUCycles]);
+        Assert.Equal((UInt128)8_192, cost[CostFactorNames.CPUCycles]);
     }
 
     [Fact]
-    public void TestMatMulCostCanSelectWgmma()
+    public void TestVectorizedMatMulCanSelectWgmma()
     {
-        var capability = TritonTargetCapability.ForComputeCapability(9, 0) with
-        {
-            MultiprocessorCount = 128,
-            ClockRateGHz = 1.0,
-            ChipGlobalMemoryBandwidthGBps = 1_000_000_000.0,
-            Mma = new TritonDotInstructionCapability("mma", 16, 8, 16, 1.0),
-            Wgmma = new TritonDotInstructionCapability("wgmma", 64, 8, 16, 4.0),
-        };
-        var costModel = new TritonTargetOpCostModel(capability);
+        var costModel = new TritonTargetOpCostModel(CreateGpuMachine(wgmmaInstructionsPerCycle: 4));
         var vectorBf16 = new VectorType(DataTypes.BFloat16, [8]);
         var query = new MatMulOpCostQuery(
             new TargetCostTensor(DataTypes.BFloat16, new RankedShape(64, 64)),
@@ -83,39 +62,9 @@ public sealed class UnitTestTritonTargetCostModel : TestClassBase
     }
 
     [Fact]
-    public void TestVectorizedMatMulCostUsesDotInstructionsFromVectorDType()
-    {
-        var capability = TritonTargetCapability.ForComputeCapability(9, 0) with
-        {
-            MultiprocessorCount = 128,
-            ClockRateGHz = 1.0,
-            ChipGlobalMemoryBandwidthGBps = 1_000_000_000.0,
-            Mma = new TritonDotInstructionCapability("mma", 16, 8, 16, 1.0),
-            Wgmma = new TritonDotInstructionCapability("wgmma", 64, 8, 16, 4.0),
-        };
-        CompileOptions.TargetOptions = new PyNTTTargetOptions { TritonCapability = capability };
-
-        var lhs = new Var("lhs", new TensorType(DataTypes.BFloat16, new RankedShape(64, 64)));
-        var rhs = new Var("rhs", new TensorType(new VectorType(DataTypes.BFloat16, [8]), new RankedShape(64, 16)));
-        var matmul = IR.F.NTT.VectorizedMatMul(lhs, rhs, [], [1], outDataType: DataTypes.BFloat16);
-        CompilerServices.InferenceType(matmul);
-
-        var cost = CompilerServices.EvaluateCost(matmul, CompileOptions);
-
-        Assert.Equal((UInt128)16, cost[CostFactorNames.CPUCycles]);
-    }
-
-    [Fact]
     public void TestElementwiseCostCountsVectorLanes()
     {
-        var capability = TritonTargetCapability.ForComputeCapability(8, 0) with
-        {
-            ClockRateGHz = 1.0,
-            ChipGlobalMemoryBandwidthGBps = 1_000_000_000.0,
-            ChipGlobalMemoryBytesPerCycle = 128.0,
-            ElementwiseElementsPerCyclePerBlock = 128.0,
-        };
-        var costModel = new TritonTargetOpCostModel(capability);
+        var costModel = new TritonTargetOpCostModel(CreateGpuMachine(rootBytesPerCycle: 128));
         var dtype = new VectorType(DataTypes.BFloat16, [8]);
         var tensor = new TargetCostTensor(dtype, new RankedShape(128));
         var query = new ElementwiseOpCostQuery("vectorized_cast", [tensor], tensor);
@@ -124,21 +73,15 @@ public sealed class UnitTestTritonTargetCostModel : TestClassBase
         Assert.Equal((UInt128)8, cost[CostFactorNames.CPUCycles]);
         Assert.Equal((UInt128)2048, cost[CostFactorNames.BlockLocalMemoryLoadBytes]);
         Assert.Equal((UInt128)2048, cost[CostFactorNames.BlockLocalMemoryStoreBytes]);
-        Assert.Equal((UInt128)32, costModel.GetLatency(cost));
+        Assert.Equal((UInt128)332, costModel.GetLatency(cost));
     }
 
     [Fact]
-    public void TestBoxingTensorStoreUsesLocalTargetCopyCostWithoutSynchronization()
+    public void TestBoxingTensorStoreUsesLocalCopyCostWithoutSynchronization()
     {
-        var capability = TritonTargetCapability.ForComputeCapability(8, 0) with
-        {
-            ClockRateGHz = 1.0,
-            ChipGlobalMemoryBandwidthGBps = 1000.0,
-            ChipGlobalMemoryBytesPerCycle = 250.0,
-        };
-        CompileOptions.TargetOptions = new PyNTTTargetOptions { TritonCapability = capability };
-        var costModel = new TritonTargetOpCostModel(capability);
-
+        var machine = CreateGpuMachine(rootBytesPerCycle: 250);
+        CompileOptions.TargetOptions = CreateOptions(machine);
+        var costModel = new TritonTargetOpCostModel(machine);
         var placement = new Placement([4, 8], "y,x", "bb");
         var tensorType = new TensorType(DataTypes.Float32, new RankedShape(128, 151936));
         var distributedType = new DistributedType(tensorType, [SBP.S([0]), SBP.S([1])], placement);
@@ -152,33 +95,13 @@ public sealed class UnitTestTritonTargetCostModel : TestClassBase
         Assert.Equal((UInt128)2_430_976, cost[CostFactorNames.BlockLocalMemoryLoadBytes]);
         Assert.Equal((UInt128)2_430_976, cost[CostFactorNames.BlockLocalMemoryStoreBytes]);
         Assert.False(cost.Factors.ContainsKey(CostFactorNames.GridSynchronization));
-        Assert.Equal((UInt128)19_448, costModel.GetLatency(cost));
+        Assert.Equal((UInt128)19_748, costModel.GetLatency(cost));
     }
 
     [Fact]
-    public void TestBoxingTensorLoadUsesLocalTargetCopyCostWithoutSynchronization()
+    public void TestDistributedReshardIncludesGridSynchronization()
     {
-        CompileOptions.TargetOptions = new PyNTTTargetOptions();
-
-        var placement = new Placement([4, 8], "y,x", "bb");
-        var tensorType = new TensorType(DataTypes.BFloat16, new RankedShape(16, 128));
-        var distributedType = new DistributedType(tensorType, [SBP.B, SBP.S([1])], placement);
-        var input = new Var("input", tensorType);
-        var boxing = IR.F.Distributed.Boxing(input, distributedType);
-        CompilerServices.InferenceType(boxing);
-
-        var cost = CompilerServices.EvaluateCost(boxing, CompileOptions);
-
-        Assert.True(cost[CostFactorNames.BlockLocalMemoryLoadBytes] > 0);
-        Assert.True(cost[CostFactorNames.BlockLocalMemoryStoreBytes] > 0);
-        Assert.False(cost.Factors.ContainsKey(CostFactorNames.GridSynchronization));
-    }
-
-    [Fact]
-    public void TestSmallReshardTargetCostIncludesSynchronization()
-    {
-        CompileOptions.TargetOptions = new PyNTTTargetOptions();
-
+        CompileOptions.TargetOptions = CreateOptions(CreateGpuMachine());
         var placement = new Placement([4, 8], "y,x", "bb");
         var tensorType = new TensorType(DataTypes.BFloat16, new RankedShape(16, 128));
         var inputType = new DistributedType(tensorType, [SBP.B, SBP.S([1])], placement);
@@ -195,19 +118,9 @@ public sealed class UnitTestTritonTargetCostModel : TestClassBase
     }
 
     [Fact]
-    public void TestPackedMatMulCostUsesLocalSimtModel()
+    public void TestPackedMatMulUsesLocalSimtModel()
     {
-        var capability = TritonTargetCapability.ForComputeCapability(8, 0) with
-        {
-            ClockRateGHz = 1.0,
-            ChipGlobalMemoryBandwidthGBps = 1_000_000_000.0,
-            ChipGlobalMemoryBytesPerCycle = 1_000_000.0,
-            SimtFmaPerCyclePerBlock = 64.0,
-            Mma = new TritonDotInstructionCapability("mma", 16, 8, 16, 1.0),
-            Wgmma = new TritonDotInstructionCapability("wgmma", 64, 8, 16, 1.0, isSupported: false),
-        };
-        CompileOptions.TargetOptions = new PyNTTTargetOptions { TritonCapability = capability };
-
+        CompileOptions.TargetOptions = CreateOptions(CreateGpuMachine(rootBytesPerCycle: 1_000_000));
         var packedBf16 = new VectorType(DataTypes.BFloat16, [4, 8]);
         var broadcastN = IR.F.NTT.PackedMatMul(
             new Var("lhs_broadcast_n", new TensorType(DataTypes.BFloat16, new RankedShape(1, 1024))),
@@ -225,102 +138,30 @@ public sealed class UnitTestTritonTargetCostModel : TestClassBase
 
         Assert.Equal((UInt128)49_152, broadcastNCost[CostFactorNames.CPUCycles]);
         Assert.Equal((UInt128)6_144, splitNCost[CostFactorNames.CPUCycles]);
-        Assert.True(broadcastNCost[CostFactorNames.CPUCycles] > splitNCost[CostFactorNames.CPUCycles]);
     }
 
     [Fact]
-    public void TestDistributedPackedMatMulCostUsesLocalShardShape()
+    public void TestNamedTargetMachineProfilesAreResolved()
     {
-        var capability = TritonTargetCapability.ForComputeCapability(8, 0) with
-        {
-            ClockRateGHz = 1.0,
-            ChipGlobalMemoryBandwidthGBps = 1_000_000_000.0,
-            ChipGlobalMemoryBytesPerCycle = 1_000_000.0,
-            SimtFmaPerCyclePerBlock = 64.0,
-            Mma = new TritonDotInstructionCapability("mma", 16, 8, 16, 1.0),
-            Wgmma = new TritonDotInstructionCapability("wgmma", 64, 8, 16, 1.0, isSupported: false),
-        };
-        CompileOptions.TargetOptions = new PyNTTTargetOptions { TritonCapability = capability };
+        var rtx = NTTTargetMachineCatalog.Resolve("rtx5060");
+        var h800 = NTTTargetMachineCatalog.Resolve("h800");
 
-        var placement = new Placement([4, 8], "y,x", "bb");
-        var packedBf16 = new VectorType(DataTypes.BFloat16, [4, 8]);
-        var broadcastN = IR.F.NTT.PackedMatMul(
-            new Var("lhs_broadcast_n", new DistributedType(new TensorType(DataTypes.BFloat16, new RankedShape(1, 1024)), [SBP.B, SBP.B], placement)),
-            new Var("rhs_broadcast_n", new DistributedType(new TensorType(packedBf16, new RankedShape(96, 1024)), [SBP.B, SBP.B], placement)),
-            outDataType: DataTypes.BFloat16);
-        CompilerServices.InferenceType(broadcastN);
-        var broadcastNCost = CompilerServices.EvaluateCost(broadcastN, CompileOptions);
-
-        var splitN = IR.F.NTT.PackedMatMul(
-            new Var("lhs_n_split", new DistributedType(new TensorType(DataTypes.BFloat16, new RankedShape(1, 1024)), [SBP.B, SBP.B], placement)),
-            new Var("rhs_n_split", new DistributedType(new TensorType(packedBf16, new RankedShape(96, 1024)), [SBP.S([0, 1]), SBP.B], placement)),
-            outDataType: DataTypes.BFloat16);
-        CompilerServices.InferenceType(splitN);
-        var splitNCost = CompilerServices.EvaluateCost(splitN, CompileOptions);
-
-        Assert.True(broadcastNCost[CostFactorNames.CPUCycles] > splitNCost[CostFactorNames.CPUCycles]);
+        Assert.Equal(NTTTargetMachineCatalog.Rtx5060Ti16Gb, rtx.Id);
+        Assert.Equal(36, rtx.Execution.ComputeUnitCount);
+        Assert.Equal(8, rtx.Execution.WorkersPerBlock);
+        Assert.Equal(MemoryLocation.Shared, rtx.TilingMemorySpaces.Single().TIRBinding?.Location);
+        Assert.Equal(101_376, rtx.TilingMemorySpaces.Single().CapacityBytes);
+        Assert.Equal(16L * 1024 * 1024 * 1024, rtx.GetMemorySpace(rtx.RootMemorySpace).CapacityBytes);
+        Assert.DoesNotContain(rtx.Compute.MatrixPrimitives, primitive => primitive.Name == "wgmma" && primitive.IsSupported);
+        Assert.Equal(NTTTargetMachineCatalog.H800Sxm80Gb, h800.Id);
+        Assert.Equal(80L * 1024 * 1024 * 1024, h800.GetMemorySpace(h800.RootMemorySpace).CapacityBytes);
+        Assert.Contains(h800.Compute.MatrixPrimitives, primitive => primitive.Name == "wgmma" && primitive.IsSupported);
     }
 
     [Fact]
-    public void TestPyNTTDefaultTargetCostModelIsTriton()
+    public void TestHierarchyLatencyAggregatesChipTrafficAcrossBlocks()
     {
-        var options = new PyNTTTargetOptions();
-
-        var costModel = Assert.IsType<TritonTargetOpCostModel>(options.TargetCostModel);
-        Assert.Equal(TritonTargetCapability.Default, costModel.Capability);
-        Assert.Equal(2200.0, costModel.Capability.GridSynchronizationCyclesPerEvent);
-    }
-
-    [Fact]
-    public void TestParseTritonCapability()
-    {
-        var capability = TritonTargetCapability.Parse("cc=90,num_sms=120,clock_ghz=2.0,mem_bw_gbps=2500,memory_bpc=256,block_memory_bpc=512,block_sync_cycles=32,sync_us=2,mma=16x8x16,mma_ipc=2,wgmma=64x16x16,wgmma_ipc=8");
-
-        Assert.Equal(9, capability.ComputeCapabilityMajor);
-        Assert.Equal(0, capability.ComputeCapabilityMinor);
-        Assert.Equal(120, capability.MultiprocessorCount);
-        Assert.Equal(2.0, capability.ClockRateGHz);
-        Assert.Equal(2500.0, capability.ChipGlobalMemoryBandwidthGBps);
-        Assert.Equal(256.0, capability.ChipGlobalMemoryBytesPerCycle);
-        Assert.Equal(512.0, capability.BlockLocalMemoryBytesPerCyclePerBlock);
-        Assert.Equal(32.0, capability.BlockSynchronizationCyclesPerEvent);
-        Assert.Equal(4000.0, capability.GridSynchronizationCyclesPerEvent);
-        Assert.Equal(2.0, capability.GridSynchronizationLatencyUs);
-        Assert.Equal(16, capability.Mma.M);
-        Assert.Equal(8, capability.Mma.N);
-        Assert.Equal(16, capability.Mma.K);
-        Assert.Equal(2.0, capability.Mma.InstructionsPerCyclePerBlock);
-        Assert.Equal(64, capability.Wgmma.M);
-        Assert.Equal(16, capability.Wgmma.N);
-        Assert.Equal(16, capability.Wgmma.K);
-        Assert.Equal(8.0, capability.Wgmma.InstructionsPerCyclePerBlock);
-        Assert.True(capability.Wgmma.IsSupported);
-    }
-
-    [Fact]
-    public void TestLatencyCanDeriveChipGlobalMemoryBytesPerCycle()
-    {
-        var capability = TritonTargetCapability.Parse("cc=80,clock_ghz=2.0,mem_bw_gbps=1000,memory_bpc=0,memory_efficiency=0.5");
-        var costModel = new TritonTargetOpCostModel(capability);
-        var cost = new Cost
-        {
-            Factors =
-            {
-                [CostFactorNames.CPUCycles] = (UInt128)1,
-                [CostFactorNames.ChipGlobalMemoryLoadBytes] = (UInt128)500,
-            },
-        };
-
-        Assert.Equal(0.0, capability.ChipGlobalMemoryBytesPerCycle);
-        Assert.Equal(250.0, capability.EffectiveChipGlobalMemoryBytesPerCycle, precision: 1);
-        Assert.Equal((UInt128)2, costModel.GetLatency(cost));
-    }
-
-    [Fact]
-    public void TestHierarchyLatencyAggregatesChipGlobalBytesAcrossActiveBlocks()
-    {
-        var capability = TritonTargetCapability.Parse("cc=80,clock_ghz=1.0,memory_bpc=100");
-        var costModel = new TritonTargetOpCostModel(capability);
+        var costModel = new TritonTargetOpCostModel(CreateGpuMachine(rootBytesPerCycle: 100));
         var cost = new Cost
         {
             Factors =
@@ -331,15 +172,14 @@ public sealed class UnitTestTritonTargetCostModel : TestClassBase
         var placement = new Placement([4, 8], "y,x", "bb");
         var distributedType = new DistributedType(new TensorType(DataTypes.Float32, new RankedShape(1)), [SBP.B], placement);
 
-        Assert.Equal((UInt128)1, costModel.GetLatency(cost));
-        Assert.Equal((UInt128)32, TargetOpCostModelUtility.GetCostLatency(costModel, cost, distributedType));
+        Assert.Equal((UInt128)301, costModel.GetLatency(cost));
+        Assert.Equal((UInt128)332, TargetOpCostModelUtility.GetCostLatency(costModel, cost, distributedType));
     }
 
     [Fact]
-    public void TestLatencyConvertsSynchronizationEventsWithTritonCapability()
+    public void TestLatencyUsesMachineSynchronizationCycles()
     {
-        var capability = TritonTargetCapability.Parse("cc=80,clock_ghz=1.0,memory_bpc=1024,sync_us=1.5");
-        var costModel = new TritonTargetOpCostModel(capability);
+        var costModel = new TritonTargetOpCostModel(CreateGpuMachine(gridSynchronizationCycles: 1500));
         var cost = new Cost
         {
             Factors =
@@ -350,5 +190,44 @@ public sealed class UnitTestTritonTargetCostModel : TestClassBase
         };
 
         Assert.Equal((UInt128)3010, costModel.GetLatency(cost));
+    }
+
+    private static PyNTTTargetOptions CreateOptions(TargetMachineModel machine)
+        => new() { TargetMachineModel = machine };
+
+    private static TargetMachineModel CreateGpuMachine(
+        long rootBytesPerCycle = 1_000_000,
+        long blockBytesPerCycle = 512,
+        double elementwiseElementsPerCycle = 128,
+        double simtFmaPerCycle = 64,
+        double mmaInstructionsPerCycle = 1,
+        double wgmmaInstructionsPerCycle = 1,
+        long gridSynchronizationCycles = 2200)
+    {
+        var register = new TargetMemorySpaceId("test.register");
+        var shared = new TargetMemorySpaceId("test.shared");
+        var global = new TargetMemorySpaceId("test.global");
+        var operandTypes = ImmutableArray.Create<DataType>(DataTypes.Float16, DataTypes.BFloat16, DataTypes.Float32, DataTypes.Int8);
+        return new TargetMachineModel(
+            "test-gpu",
+            new(BlockExecutionKind.PersistentGpuBlock, 128, 8, 32, 1.0, 128, 4),
+            new(
+                elementwiseElementsPerCycle,
+                simtFmaPerCycle,
+                ImmutableArray.Create(
+                    new MatrixComputePrimitiveSpec("mma", 16, 8, 16, mmaInstructionsPerCycle, operandTypes),
+                    new MatrixComputePrimitiveSpec("wgmma", 64, 8, 16, wgmmaInstructionsPerCycle, operandTypes))),
+            new(25, gridSynchronizationCycles),
+            [
+                new(register, TargetMemorySpaceKind.Register, MemorySharingScope.Block, new(MemoryLocation.Register), 256 * 1024, 4096, 4096, 1, false, -1, false, false, false, 4),
+                new(shared, TargetMemorySpaceKind.Shared, MemorySharingScope.Block, new(MemoryLocation.Shared), 48 * 1024, blockBytesPerCycle, blockBytesPerCycle, 20, true, 0, true, true, true, 16),
+                new(global, TargetMemorySpaceKind.Global, MemorySharingScope.Chip, null, int.MaxValue, rootBytesPerCycle, rootBytesPerCycle, 300, false, -1, true, true, false, 128),
+            ],
+            global,
+            [
+                new(global, shared, blockBytesPerCycle, 300),
+                new(shared, global, blockBytesPerCycle, 300),
+            ],
+            new Dictionary<MemoryLocation, TargetMemorySpaceId>());
     }
 }

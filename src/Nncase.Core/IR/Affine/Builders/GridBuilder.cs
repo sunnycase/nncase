@@ -36,6 +36,8 @@ public interface IGridBuilder : IExprBuilder<Grid>
     IGridBuilder ReadWriteRoot(Expr argument, BaseExpr region, out Var parameter);
 
     IGridBuilder Domain(int dims, out Var parameter);
+
+    IGridBuilder Domain(ReadOnlySpan<GridTileAxisPolicy> tileAxisPolicies, out Var parameter);
 }
 
 internal class GridBuilder : IGridBuilder
@@ -43,6 +45,7 @@ internal class GridBuilder : IGridBuilder
     private readonly List<GridAccess> _accesses = new();
     private readonly List<object> _body = new();
     private Var? _domainParameter;
+    private GridTileAxisPolicy[]? _tileAxisPolicies;
 
     public GridBuilder()
     {
@@ -59,13 +62,23 @@ internal class GridBuilder : IGridBuilder
         return new Grid(
             _domainParameter ?? throw new InvalidOperationException("domain dims is not set."),
             CollectionsMarshal.AsSpan(_accesses),
-            Sequential.Flatten(CollectionsMarshal.AsSpan(_body)));
+            Sequential.Flatten(CollectionsMarshal.AsSpan(_body)),
+            _tileAxisPolicies ?? throw new InvalidOperationException("domain tile-axis policies are not set."));
     }
 
     public IGridBuilder Domain(int dims, out Var parameter)
+        => Domain(Enumerable.Repeat(GridTileAxisPolicy.Search(), dims).ToArray(), out parameter);
+
+    public IGridBuilder Domain(ReadOnlySpan<GridTileAxisPolicy> tileAxisPolicies, out Var parameter)
     {
-        parameter = new Var(new IR.TupleType(Enumerable.Repeat(new IR.TupleType(new IRType[] { TensorType.Scalar(DataTypes.Int64), TensorType.Scalar(DataTypes.Int64) }), dims)));
+        if (tileAxisPolicies.IsEmpty)
+        {
+            throw new ArgumentException("Grid domain must have at least one axis.", nameof(tileAxisPolicies));
+        }
+
+        parameter = new Var(new IR.TupleType(Enumerable.Repeat(new IR.TupleType(new IRType[] { TensorType.Scalar(DataTypes.Int64), TensorType.Scalar(DataTypes.Int64) }), tileAxisPolicies.Length)));
         _domainParameter = parameter;
+        _tileAxisPolicies = tileAxisPolicies.ToArray();
         return this;
     }
 

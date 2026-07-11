@@ -17,6 +17,19 @@ def select_tuning_parameter(
     source: str,
 ) -> int:
     """Select a tunable parameter value for a generated kernel launch."""
+    return tuning_parameter_candidates(
+        kernel_name, parameter_name, candidates, source=source
+    )[0]
+
+
+def tuning_parameter_candidates(
+    kernel_name: str,
+    parameter_name: str,
+    candidates: Sequence[int],
+    *,
+    source: str,
+) -> tuple[int, ...]:
+    """Return candidates in runtime evaluation order."""
     if not candidates:
         raise PyNTTSpecError(
             f"PyNTT tuning parameter {kernel_name}.{parameter_name} has no candidates."
@@ -40,14 +53,14 @@ def select_tuning_parameter(
                 f"{normalized_candidates} for {kernel_name}.{parameter_name}."
             )
 
-        return value
+        return (value,)
 
     if source not in ("search_space", "autotune", "auto_tiling"):
         raise PyNTTSpecError(
             f"Unsupported PyNTT tuning source for {kernel_name}.{parameter_name}: {source}."
         )
 
-    return normalized_candidates[-1]
+    return tuple(reversed(normalized_candidates))
 
 
 def _override_env_name(kernel_name: str, parameter_name: str) -> str:

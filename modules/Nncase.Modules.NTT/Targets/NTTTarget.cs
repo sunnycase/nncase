@@ -38,9 +38,11 @@ public abstract class NTTTarget : Target
 
     protected abstract INTTModuleCompiler NTTModuleCompiler { get; }
 
+    protected virtual string DefaultTargetMachine => NTTTargetMachineCatalog.CpuGeneric;
+
     public override (System.CommandLine.Command Command, Func<InvocationContext, System.CommandLine.Command, ITargetOptions> Parser) RegisterCommandAndParser()
     {
-        var cmd = new NTTTargetOptionsCommand(Name);
+        var cmd = new NTTTargetOptionsCommand(Name, DefaultTargetMachine);
 
         ITargetOptions ParseTargetCompileOptions(InvocationContext context, Command command)
         {
@@ -58,8 +60,8 @@ public abstract class NTTTarget : Target
 
     public override void RegisterAutoPackingRules(IRulesAddable pass, CompileOptions options)
     {
-        var nr = NTTModuleCompiler.Nr;
-        var lane = NTTModuleCompiler.Lane;
+        var nr = NTTModuleCompiler.GetNr(options);
+        var lane = NTTModuleCompiler.GetLane(options);
 
         pass.Add<Passes.Rules.NTT.PackMatMulByN>(nr);
         pass.Add<Passes.Rules.NTT.PackQKVParallelLinearByN>(nr, lane);
@@ -70,7 +72,7 @@ public abstract class NTTTarget : Target
     {
         // todo config it in the target options.
         var rank = 1;
-        var lane = NTTModuleCompiler.Lane;
+        var lane = NTTModuleCompiler.GetLane(options);
 
         pass.Add<Passes.Rules.NTT.VectorizeConv2D>(rank, lane);
         pass.Add<Passes.Rules.NTT.VectorizeMatMul>(rank, lane);

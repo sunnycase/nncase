@@ -410,12 +410,10 @@ class TestRunner(Evaluator, Inference, metaclass=ABCMeta):
             "hierarchy_sizes": "HierarchySizes",
             "hierarchy_latencies": "HierarchyLatencies",
             "hierarchy_band_widths": "HierarchyBandWidths",
-            "memory_capacities": "MemoryCapacities",
-            "memory_band_widths": "MemoryBandWidths",
+            "target_machine": "TargetMachine",
             "distributed_scheme": "DistributedScheme",
             "custom_op_scheme": "CustomOpScheme",
             "backend": "Backend",
-            "triton_capability": "TritonCapability",
             "output_directory": "OutputDirectory",
             "strict": "Strict",
         }

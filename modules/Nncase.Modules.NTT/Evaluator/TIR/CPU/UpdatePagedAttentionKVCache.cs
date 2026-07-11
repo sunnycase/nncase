@@ -9,27 +9,13 @@ using Nncase.TIR.NTT;
 
 namespace Nncase.Evaluator.TIR.NTT;
 
-public sealed class UpdatePagedAttentionKVCacheEvaluator : ITypeInferencer<UpdatePagedAttentionKVCache>, IKernelInfoEvaluator<UpdatePagedAttentionKVCache>
+public sealed class UpdatePagedAttentionKVCacheEvaluator : ITypeInferencer<UpdatePagedAttentionKVCache>, ITileWorkloadEvaluator<UpdatePagedAttentionKVCache>
 {
     public IRType Visit(ITypeInferenceContext context, UpdatePagedAttentionKVCache target) => TupleType.Void;
 
-    public MicroKernelInfo Visit(UpdatePagedAttentionKVCache op, MicroKernelContext context)
-    {
-        var domain = context.AccessMaps[0].Domains;
-        var tileBounds = Enumerable.Repeat(new ValueRange<long>(1, int.MaxValue), domain.Length).ToArray();
-        var bufferInfos = new MicroKernelBufferInfo[context.BufferShapes.Length];
-        var opt = (INTTTargetOptions)context.TargetOptions;
-        if (bufferInfos.Length != 2)
-        {
-            throw new InvalidOperationException($"UpdatePagedAttentionKVCache expects slots and one read-write kv-cache resource, got {bufferInfos.Length}.");
-        }
+    public TileWorkload Visit(UpdatePagedAttentionKVCache op, TileWorkloadContext context) => new ElementwiseTileWorkload(GetComputeWork);
 
-        bufferInfos[0] = new(opt.MemoryBandWidths[1], opt.MemoryBandWidths[1], MicroKernelBufferInfo.BufferState.Read);
-        bufferInfos[1] = new(opt.MemoryBandWidths[1], opt.MemoryBandWidths[1], MicroKernelBufferInfo.BufferState.Read | MicroKernelBufferInfo.BufferState.Write);
-        return new MicroKernelInfo(tileBounds, bufferInfos, GetComputeCycle);
-    }
-
-    private static IntExpr GetComputeCycle(IntExpr[][] bufferShapes, Solver solver, MicroKernelContext context)
+    private static IntExpr GetComputeWork(IntExpr[][] bufferShapes, Solver solver, TileWorkloadContext context)
     {
         return bufferShapes[0].Aggregate((IntExpr)solver.MakeIntConst(1), (acc, dim) => solver.MakeProd(acc, dim));
     }

@@ -7,9 +7,9 @@ using Nncase.TIR.NTT;
 
 namespace Nncase.Evaluator.TIR.NTT;
 
-public sealed class TensorStoreEvaluator : ITypeInferencer<TensorStore>, IKernelInfoEvaluator<TensorStore>
+public sealed class TensorStoreEvaluator : ITypeInferencer<TensorStore>, ITileWorkloadEvaluator<TensorStore>
 {
-    public MicroKernelInfo Visit(TensorStore target, MicroKernelContext context) => TransferKernelInfo.Create(context);
+    public TileWorkload Visit(TensorStore target, TileWorkloadContext context) => TransferTileWorkload.Create(context);
 
     public IRType Visit(ITypeInferenceContext context, TensorStore target)
     {

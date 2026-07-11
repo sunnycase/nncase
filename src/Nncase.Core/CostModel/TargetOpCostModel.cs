@@ -239,9 +239,16 @@ public sealed record MatMulOpCostQuery(TargetCostTensor Lhs, TargetCostTensor Rh
 /// <summary>
 /// Default target cost model used when a target does not provide one.
 /// </summary>
-public sealed class DefaultTargetOpCostModel : ITargetOpCostModel, ITargetOpCostBreakdownModel
+public sealed class DefaultTargetOpCostModel : ITargetOpCostModel, IHierarchicalTargetOpCostModel, ITargetOpCostBreakdownModel
 {
     public static readonly DefaultTargetOpCostModel Instance = new();
+
+    private readonly TargetMachineModel? _machine;
+
+    public DefaultTargetOpCostModel(TargetMachineModel machine)
+    {
+        _machine = machine ?? throw new ArgumentNullException(nameof(machine));
+    }
 
     private DefaultTargetOpCostModel()
     {
@@ -252,29 +259,43 @@ public sealed class DefaultTargetOpCostModel : ITargetOpCostModel, ITargetOpCost
         return GetLatencyBreakdown(cost, TargetCostAggregationContext.Local).Latency;
     }
 
+    public UInt128 GetLatency(Cost cost, TargetCostAggregationContext context)
+    {
+        return GetLatencyBreakdown(cost, context).Latency;
+    }
+
     public TargetCostLatencyBreakdown GetLatencyBreakdown(Cost cost, TargetCostAggregationContext context)
     {
-        var cpuCycles = GetFactor(cost, CostFactorNames.CPUCycles);
-        var blockLocalMemoryCycles = GetFactor(cost, CostFactorNames.BlockLocalMemoryLoadBytes) + GetFactor(cost, CostFactorNames.BlockLocalMemoryStoreBytes);
-        var explicitChipGlobalMemoryCycles = GetFactor(cost, CostFactorNames.ChipGlobalMemoryLoadBytes) + GetFactor(cost, CostFactorNames.ChipGlobalMemoryStoreBytes);
-        var chipGlobalMemoryCycles = blockLocalMemoryCycles + explicitChipGlobalMemoryCycles;
-        var overlappedCycles = new[] { cpuCycles, blockLocalMemoryCycles, chipGlobalMemoryCycles }.Max();
-        var blockSynchronizationCycles = GetFactor(cost, CostFactorNames.BlockSynchronization) * (UInt128)25;
-        var gridSynchronizationCycles = GetFactor(cost, CostFactorNames.GridSynchronization) * (UInt128)25_000;
-        var commCycles = GetFactor(cost, CostFactorNames.Comm);
-        var otherCycles = GetOtherCost(cost);
+        var cpuCycles = ToDouble(GetFactor(cost, CostFactorNames.CPUCycles));
+        var blockLocalLoadBytes = ToDouble(GetFactor(cost, CostFactorNames.BlockLocalMemoryLoadBytes));
+        var blockLocalStoreBytes = ToDouble(GetFactor(cost, CostFactorNames.BlockLocalMemoryStoreBytes));
+        var chipGlobalLoadBytes = ToDouble(GetFactor(cost, CostFactorNames.ChipGlobalMemoryLoadBytes));
+        var chipGlobalStoreBytes = ToDouble(GetFactor(cost, CostFactorNames.ChipGlobalMemoryStoreBytes));
+        var activeBlocks = Math.Max(1L, context.ActiveBlockCount);
+        var blockMemory = _machine?.TilingMemorySpaces[^1];
+        var chipMemory = _machine?.GetMemorySpace(_machine.RootMemorySpace);
+        var blockLocalMemoryCycles = GetMemoryCycles(blockLocalLoadBytes, blockLocalStoreBytes, blockMemory);
+        var chipGlobalMemoryCycles = GetMemoryCycles(
+            (blockLocalLoadBytes + chipGlobalLoadBytes) * activeBlocks,
+            (blockLocalStoreBytes + chipGlobalStoreBytes) * activeBlocks,
+            chipMemory);
+        var overlappedCycles = Math.Max(cpuCycles, Math.Max(blockLocalMemoryCycles, chipGlobalMemoryCycles));
+        var blockSynchronizationCycles = ToDouble(GetFactor(cost, CostFactorNames.BlockSynchronization)) * (_machine?.Synchronization.BlockCycles ?? 25);
+        var gridSynchronizationCycles = ToDouble(GetFactor(cost, CostFactorNames.GridSynchronization)) * (_machine?.Synchronization.GridCycles ?? 25_000);
+        var commCycles = ToDouble(GetFactor(cost, CostFactorNames.Comm));
+        var otherCycles = ToDouble(GetOtherCost(cost));
         var latency = overlappedCycles + blockSynchronizationCycles + gridSynchronizationCycles + commCycles + otherCycles;
         return new TargetCostLatencyBreakdown(
-            1,
-            ToDouble(cpuCycles),
-            ToDouble(blockLocalMemoryCycles),
-            ToDouble(chipGlobalMemoryCycles),
-            ToDouble(overlappedCycles),
-            ToDouble(blockSynchronizationCycles),
-            ToDouble(gridSynchronizationCycles),
-            ToDouble(commCycles),
-            ToDouble(otherCycles),
-            latency);
+            activeBlocks,
+            cpuCycles,
+            blockLocalMemoryCycles,
+            chipGlobalMemoryCycles,
+            overlappedCycles,
+            blockSynchronizationCycles,
+            gridSynchronizationCycles,
+            commCycles,
+            otherCycles,
+            ToCostFactor(latency));
     }
 
     public bool TryGetUnaryCost(UnaryOpCostQuery query, out Cost cost)
@@ -286,7 +307,7 @@ public sealed class DefaultTargetOpCostModel : ITargetOpCostModel, ITargetOpCost
         }
 
         cost = ElementwiseCost(
-            elements * CostUtility.GetCPUCyclesOfUnary(query.Op),
+            EstimateElementwiseCycles(elements * CostUtility.GetCPUCyclesOfUnary(query.Op)),
             GetTensorByteCount(query.Input),
             GetTensorByteCount(query.Output));
         return true;
@@ -301,7 +322,7 @@ public sealed class DefaultTargetOpCostModel : ITargetOpCostModel, ITargetOpCost
         }
 
         cost = ElementwiseCost(
-            elements * CostUtility.GetCPUCyclesOfBinary(query.Op),
+            EstimateElementwiseCycles(elements * CostUtility.GetCPUCyclesOfBinary(query.Op)),
             GetTensorByteCount(query.Lhs) + GetTensorByteCount(query.Rhs),
             GetTensorByteCount(query.Output));
         return true;
@@ -316,7 +337,7 @@ public sealed class DefaultTargetOpCostModel : ITargetOpCostModel, ITargetOpCost
         }
 
         cost = ElementwiseCost(
-            elements * Math.Max(0.0, query.WorkPerElement),
+            EstimateElementwiseCycles(elements * Math.Max(0.0, query.WorkPerElement)),
             query.Inputs.Sum(GetTensorByteCount),
             GetTensorByteCount(query.Output));
         return true;
@@ -324,13 +345,48 @@ public sealed class DefaultTargetOpCostModel : ITargetOpCostModel, ITargetOpCost
 
     public bool TryGetMatMulCost(MatMulOpCostQuery query, out Cost cost)
     {
-        cost = Cost.Zero;
-        return false;
+        if (!TryGetMaxShape(query.Lhs, out var lhsShape)
+            || !TryGetMaxShape(query.Output, out var outputShape)
+            || lhsShape.Length < 2
+            || outputShape.Length < 2)
+        {
+            cost = Cost.Zero;
+            return false;
+        }
+
+        var m = outputShape[^2];
+        var n = checked(outputShape[^1] * GetVectorLaneCount(query.Output.DType));
+        var k = checked(lhsShape[^1] * GetVectorLaneCount(query.Lhs.DType));
+        var batch = Product(outputShape.AsSpan(0, outputShape.Length - 2));
+        var work = (double)m * n * k * batch;
+        var computeCycles = work / Math.Max(1.0, _machine?.Compute.SimtFmaPerCycle ?? 1.0);
+        cost = ElementwiseCost(
+            computeCycles,
+            GetTensorByteCount(query.Lhs) + GetTensorByteCount(query.Rhs),
+            GetTensorByteCount(query.Output));
+        return true;
     }
+
+    private static int GetVectorLaneCount(DataType dataType)
+        => dataType is VectorType vectorType
+            ? vectorType.Lanes.Aggregate(1, static (product, lane) => checked(product * lane)) * GetVectorLaneCount(vectorType.ElemType)
+            : 1;
 
     private static UInt128 GetFactor(Cost cost, string name)
     {
         return cost.Factors.TryGetValue(name, out var value) ? value : 0;
+    }
+
+    private static double GetMemoryCycles(double loadBytes, double storeBytes, TargetMemorySpaceSpec? memorySpace)
+    {
+        if (memorySpace is null)
+        {
+            return loadBytes + storeBytes;
+        }
+
+        return (loadBytes / memorySpace.ReadBytesPerCycle)
+            + (storeBytes / memorySpace.WriteBytesPerCycle)
+            + ((loadBytes + storeBytes) > 0 ? memorySpace.LatencyCycles : 0);
     }
 
     private static Cost ElementwiseCost(double cpuCycles, double blockLocalMemoryLoadBytes, double blockLocalMemoryStoreBytes)
@@ -355,7 +411,7 @@ public sealed class DefaultTargetOpCostModel : ITargetOpCostModel, ITargetOpCost
     {
         if (TryGetMaxShape(tensor, out var shape))
         {
-            elements = Product(shape);
+            elements = Product(shape) * GetVectorLaneCount(tensor.DType);
             return true;
         }
 
@@ -426,4 +482,7 @@ public sealed class DefaultTargetOpCostModel : ITargetOpCostModel, ITargetOpCost
     {
         return value > ulong.MaxValue ? ulong.MaxValue : (ulong)value;
     }
+
+    private double EstimateElementwiseCycles(double work)
+        => work / Math.Max(1.0, _machine?.Compute.ElementwiseElementsPerCycle ?? 1.0);
 }

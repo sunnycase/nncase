@@ -59,9 +59,7 @@ public interface INTTTargetOptions : ITargetOptions
 
     int[] HierarchyBandWidths { get; set; }
 
-    int[] MemoryCapacities { get; set; }
-
-    int[] MemoryBandWidths { get; set; }
+    TargetMachineModel TargetMachineModel { get; }
 
     string DistributedScheme { get; set; }
 
@@ -187,8 +185,4 @@ public sealed class DefaultTargetCompileOptions : ITargetOptions
     private DefaultTargetCompileOptions()
     {
     }
-
-    public int[] MemoryCapacities => Array.Empty<int>();
-
-    public int[] MemoryBandWidths => Array.Empty<int>();
 }

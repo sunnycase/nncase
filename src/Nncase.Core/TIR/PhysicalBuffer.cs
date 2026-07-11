@@ -58,6 +58,16 @@ public enum MemoryLocation
     Cache = 1 << 10,
 
     /// <summary>
+    /// explicitly managed register-backed tile storage.
+    /// </summary>
+    Register = 1 << 14,
+
+    /// <summary>
+    /// explicitly managed block shared-memory tile storage.
+    /// </summary>
+    Shared = 1 << 15,
+
+    /// <summary>
     /// base addr.
     /// </summary>
     PrivateBase = 1 << 11,

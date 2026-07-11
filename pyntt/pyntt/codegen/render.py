@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import importlib
 import json
 import math
@@ -26,6 +27,9 @@ WORKSPACE_STRIDE_PARAMETERS = (
     "data_pool_stride_bytes: tl.constexpr",
     "block_local_data_pool_stride_bytes: tl.constexpr",
 )
+
+POINTER_CALL_FRAME_ALIGNMENT = 8
+POINTER_CALL_FRAME_ADDRESS_SPACE = 3
 
 DEVICE_CALL_RE = re.compile(
     r"(?m)^(?P<indent>[ \t]*)__pyntt_device_call__(?P<name>[A-Za-z_]\w*)\((?P<args>.*)\)$"
@@ -71,9 +75,16 @@ def render_manifest(manifest: dict[str, Any]) -> str:
         for function in manifest.get("functions", ())
         for kernel in function.get("render_kernels", ())
     )
+    needs_shared_memory = any(
+        int(_attrs(kernel.get("metadata", {})).get("shared_memory_bytes", 0)) > 0
+        or _pointer_call_frame_bytes(kernel) > 0
+        for function in manifest.get("functions", ())
+        for kernel in function.get("render_kernels", ())
+    )
     env = _make_env()
     return env.get_template("triton/module.py.jinja").render(
         kernels=kernels,
+        needs_tle=needs_grid_barrier or needs_shared_memory,
         needs_grid_barrier=needs_grid_barrier,
         grid_mesh_size=_grid_mesh_size(manifest),
     )
@@ -82,6 +93,19 @@ def render_manifest(manifest: dict[str, Any]) -> str:
 def _render_kernel(kernel: dict[str, Any]) -> str:
     env = _make_env()
     metadata = kernel["metadata"]
+    shared_memory_bytes = int(_attrs(metadata).get("shared_memory_bytes", 0))
+    if shared_memory_bytes < 0:
+        raise ValueError(
+            f"PyNTT kernel {metadata['name']} has invalid shared_memory_bytes={shared_memory_bytes}."
+        )
+    raw_device_functions = tuple(kernel["device_functions"])
+    call_frame_offsets, call_frame_allocation_bytes = _assign_pointer_call_frames(
+        raw_device_functions, shared_memory_bytes
+    )
+    shared_allocation_bytes = shared_memory_bytes + call_frame_allocation_bytes
+    hidden_device_parameters = (
+        ("pyntt_shared_base",) if shared_allocation_bytes > 0 else ()
+    )
     runtime_shape_args = _runtime_shape_args(metadata)
     grid_barrier_parameters = (
         ("pyntt_grid_mesh: tl.constexpr",)
@@ -102,28 +126,39 @@ def _render_kernel(kernel: dict[str, Any]) -> str:
     )
     call_arguments = _parameter_call_arguments(parameters)
     device_functions = tuple(
-        _prepare_device_function(device_function, call_arguments)
-        for device_function in kernel.get("device_functions", ()) or ()
+        _prepare_device_function(
+            device_function,
+            call_frame_offsets[device_function["name"]],
+        )
+        for device_function in raw_device_functions
     )
-    device_function_calls = {
-        device_function["name"]: device_function["call_source"]
+    device_functions_by_name = {
+        device_function["name"]: device_function
         for device_function in device_functions
     }
     helper_sources = _render_helper_sources(env, kernel.get("helpers", ()))
     device_function_sources = [
-        _render_device_function(env, device_function, parameters, device_function_calls)
+        _render_device_function(
+            env,
+            device_function,
+            parameters,
+            hidden_device_parameters,
+            device_functions_by_name,
+        )
         for device_function in device_functions
     ]
     body_source = _replace_device_function_calls(
         kernel.get("body_source", ""),
-        device_function_calls,
-        call_arguments,
+        device_functions_by_name,
+        call_arguments + hidden_device_parameters,
     )
     body_source = _with_shard_index_prelude(body_source)
+    body_source = _with_shared_memory_prelude(body_source, shared_allocation_bytes)
     top_kernel = env.get_template("triton/top_kernel.py.jinja").render(
         name=metadata["name"],
         parameters=", ".join(parameters),
         body_source=_indent_block(body_source, 4),
+        decorator="@triton.jit",
     ).strip()
     parts = [source for source in helper_sources if source]
     parts.extend(source for source in device_function_sources if source)
@@ -135,17 +170,29 @@ def _render_device_function(
     env: Environment,
     device_function: dict[str, Any],
     parameters: tuple[str, ...],
-    device_function_calls: dict[str, str],
+    hidden_parameters: tuple[str, ...],
+    device_functions_by_name: dict[str, dict[str, Any]],
 ) -> str:
-    helper_sources = _render_helper_sources(env, device_function.get("helpers", ()))
+    helper_sources = _render_helper_sources(
+        env,
+        device_function.get("helpers", ()),
+        noinline=bool(device_function["preserve_helper_call_boundaries"]),
+    )
     parts = [source for source in helper_sources if source]
-    device_parameters = parameters + tuple(device_function.get("extra_parameters", ()) or ())
-    base_call_arguments = _parameter_call_arguments(parameters)
+    device_parameters = (
+        parameters
+        + hidden_parameters
+        + tuple(device_function["direct_extra_parameters"])
+    )
+    base_call_arguments = _parameter_call_arguments(parameters + hidden_parameters)
     for stage in device_function["stages"]:
         body_source = _replace_device_function_calls(
             stage["body_source"],
-            device_function_calls,
+            device_functions_by_name,
             base_call_arguments,
+        )
+        body_source = _replace_pointer_call_frame_references(
+            body_source, device_function
         )
         body_source = _with_shard_index_prelude(body_source)
         parts.append(
@@ -153,6 +200,11 @@ def _render_device_function(
                 name=stage["name"],
                 parameters=", ".join(device_parameters),
                 body_source=_indent_block(body_source, 4),
+                decorator=(
+                    "@triton.jit(noinline=True)"
+                    if device_function["noinline"]
+                    else "@triton.jit"
+                ),
             ).strip()
         )
     return "\n\n".join(parts)
@@ -160,18 +212,27 @@ def _render_device_function(
 
 def _prepare_device_function(
     device_function: dict[str, Any],
-    call_arguments: tuple[str, ...],
+    call_frame_offset: int,
 ) -> dict[str, Any]:
     prepared = dict(device_function)
-    parameter_overrides = dict(device_function.get("parameter_overrides", {}) or {})
-    extra_parameters = tuple(device_function.get("extra_parameters", ()) or ())
-    extra_parameter_arguments = dict(device_function.get("extra_parameter_arguments", {}) or {})
-    prepared_call_arguments = tuple(
-        parameter_overrides.get(argument, argument)
-        for argument in call_arguments
-    ) + tuple(
-        extra_parameter_arguments.get(argument, argument)
-        for argument in extra_parameters
+    extra_parameters = tuple(device_function["extra_parameters"])
+    pointer_call_frame = tuple(device_function["pointer_call_frame"])
+    framed_names = {parameter["name"] for parameter in pointer_call_frame}
+    unknown_names = framed_names.difference(extra_parameters)
+    if unknown_names:
+        raise RuntimeError(
+            f"PyNTT device function {device_function['name']} frames unknown parameters "
+            f"{sorted(unknown_names)}."
+        )
+    prepared["direct_extra_parameters"] = tuple(
+        parameter for parameter in extra_parameters if parameter not in framed_names
+    )
+    prepared["pointer_call_frame"] = tuple(
+        {
+            **parameter,
+            "offset": call_frame_offset + index * POINTER_CALL_FRAME_ALIGNMENT,
+        }
+        for index, parameter in enumerate(pointer_call_frame)
     )
     prepared["stages"] = (
         {
@@ -179,14 +240,16 @@ def _prepare_device_function(
             "body_source": device_function.get("body_source", "").rstrip() or "pass",
         },
     )
-    prepared["call_source"] = f"{device_function['name']}({', '.join(prepared_call_arguments)})"
     return prepared
 
 
-def _render_helper_sources(env: Environment, helpers: Any) -> list[str]:
+def _render_helper_sources(
+    env: Environment, helpers: Any, *, noinline: bool = False
+) -> list[str]:
     helper_sources = []
     for helper in helpers:
         model = dict(helper["model"])
+        model["NoInline"] = noinline
         arguments = tuple(helper.get("arguments", ()) or ())
         if arguments:
             model["Arguments"] = arguments
@@ -200,22 +263,118 @@ def _parameter_call_arguments(parameters: tuple[str, ...]) -> tuple[str, ...]:
     return tuple(parameter.split(":", 1)[0].strip() for parameter in parameters)
 
 
+def _pointer_call_frame_bytes(kernel: dict[str, Any]) -> int:
+    return sum(
+        len(device_function["pointer_call_frame"]) * POINTER_CALL_FRAME_ALIGNMENT
+        for device_function in kernel["device_functions"]
+    )
+
+
+def _assign_pointer_call_frames(
+    device_functions: tuple[dict[str, Any], ...], shared_memory_bytes: int
+) -> tuple[dict[str, int], int]:
+    frame_start = (
+        (shared_memory_bytes + POINTER_CALL_FRAME_ALIGNMENT - 1)
+        // POINTER_CALL_FRAME_ALIGNMENT
+        * POINTER_CALL_FRAME_ALIGNMENT
+    )
+    next_offset = frame_start
+    offsets: dict[str, int] = {}
+    for device_function in device_functions:
+        name = device_function["name"]
+        if name in offsets:
+            raise RuntimeError(f"Duplicate PyNTT device function {name}.")
+        offsets[name] = next_offset
+        next_offset += (
+            len(device_function["pointer_call_frame"])
+            * POINTER_CALL_FRAME_ALIGNMENT
+        )
+    return offsets, next_offset - shared_memory_bytes
+
+
+def _split_expression_arguments(source: str) -> tuple[str, ...]:
+    if not source.strip():
+        return ()
+    wrapped = f"_pyntt_call({source})"
+    try:
+        expression = ast.parse(wrapped, mode="eval").body
+    except SyntaxError as ex:
+        raise RuntimeError(
+            f"Invalid PyNTT device-function arguments: {source}"
+        ) from ex
+    if not isinstance(expression, ast.Call):
+        raise RuntimeError(f"Invalid PyNTT device-function arguments: {source}")
+    return tuple(
+        ast.get_source_segment(wrapped, argument) or ast.unparse(argument)
+        for argument in expression.args
+    )
+
+
+def _build_device_function_call(
+    device_function: dict[str, Any],
+    call_arguments: tuple[str, ...],
+    explicit_extra_arguments: tuple[str, ...],
+) -> str:
+    extra_parameters = tuple(device_function["extra_parameters"])
+    if explicit_extra_arguments:
+        if len(explicit_extra_arguments) != len(extra_parameters):
+            raise RuntimeError(
+                f"PyNTT call to {device_function['name']} passes "
+                f"{len(explicit_extra_arguments)} extra arguments, expected "
+                f"{len(extra_parameters)}."
+            )
+        extra_arguments = dict(zip(extra_parameters, explicit_extra_arguments))
+    else:
+        defaults = dict(device_function["extra_parameter_arguments"])
+        missing = [parameter for parameter in extra_parameters if parameter not in defaults]
+        if missing:
+            raise RuntimeError(
+                f"PyNTT call to {device_function['name']} is missing extra arguments "
+                f"{missing}."
+            )
+        extra_arguments = defaults
+
+    parameter_overrides = dict(device_function["parameter_overrides"])
+    direct_call_arguments = tuple(
+        parameter_overrides.get(argument, argument) for argument in call_arguments
+    ) + tuple(
+        extra_arguments[parameter]
+        for parameter in device_function["direct_extra_parameters"]
+    )
+    lines = []
+    for parameter in device_function["pointer_call_frame"]:
+        value = extra_arguments[parameter["name"]]
+        address = (
+            f"(pyntt_shared_base + {parameter['offset']}).to("
+            f"tl.pointer_type(tl.uint64, {POINTER_CALL_FRAME_ADDRESS_SPACE}))"
+        )
+        lines.append(f"tl.store({address}, ({value}).to(tl.uint64))")
+    if device_function["pointer_call_frame"]:
+        if "pyntt_shared_base" not in call_arguments:
+            raise RuntimeError(
+                f"PyNTT call to {device_function['name']} requires a shared call frame."
+            )
+        lines.append("tl.debug_barrier()")
+    lines.append(
+        f"{device_function['name']}({', '.join(direct_call_arguments)})"
+    )
+    return "\n".join(lines)
+
+
 def _replace_device_function_calls(
     source: str,
-    device_function_calls: dict[str, str],
+    device_functions: dict[str, dict[str, Any]],
     call_arguments: tuple[str, ...] = (),
 ) -> str:
     def replace(match: re.Match[str]) -> str:
         name = match.group("name")
-        if name not in device_function_calls:
+        if name not in device_functions:
             raise RuntimeError(f"PyNTT kernel references unknown device function {name}.")
         indent = match.group("indent")
-        extra_arguments = match.group("args").strip()
-        if extra_arguments:
-            arguments = ", ".join(call_arguments + (extra_arguments,))
-            call_source = f"{name}({arguments})"
-        else:
-            call_source = device_function_calls[name]
+        extra_arguments = _split_expression_arguments(match.group("args"))
+        call_source = _build_device_function_call(
+            device_functions[name], call_arguments, extra_arguments
+        )
 
         return "\n".join(
             f"{indent}{line}" if line else line
@@ -225,12 +384,45 @@ def _replace_device_function_calls(
     return DEVICE_CALL_RE.sub(replace, source)
 
 
+def _replace_pointer_call_frame_references(
+    source: str, device_function: dict[str, Any]
+) -> str:
+    for parameter in sorted(
+        device_function["pointer_call_frame"],
+        key=lambda item: len(item["name"]),
+        reverse=True,
+    ):
+        address = (
+            f"(pyntt_shared_base + {parameter['offset']}).to("
+            f"tl.pointer_type(tl.uint64, {POINTER_CALL_FRAME_ADDRESS_SPACE}))"
+        )
+        value = (
+            f"tl.load({address}).to(tl.pointer_type("
+            f"{parameter['triton_dtype']}))"
+        )
+        source = re.sub(rf"\b{re.escape(parameter['name'])}\b", value, source)
+    return source
+
+
 def _with_shard_index_prelude(source: str) -> str:
     source = source.rstrip()
     prelude = "shard_index = tl.program_id(0).to(tl.int64)"
     if not source:
         return prelude
     return f"{prelude}\n{source}"
+
+
+def _with_shared_memory_prelude(source: str, size_bytes: int) -> str:
+    if size_bytes == 0:
+        return source
+    allocation_bytes = 1 << (size_bytes - 1).bit_length()
+    prelude = (
+        f"pyntt_shared_storage = tle.gpu.alloc([{allocation_bytes}], dtype=tl.uint8, "
+        "layout=None, scope=tle.gpu.smem, nv_mma_shared_layout=False)\n"
+        "pyntt_shared_base = tle.gpu.local_ptr(pyntt_shared_storage, (0,))"
+    )
+    source = source.rstrip()
+    return prelude if not source else f"{prelude}\n{source}"
 
 
 def emit(template_name: str, model: dict[str, Any]) -> str:
@@ -314,6 +506,17 @@ def _dim(value: Any) -> str:
     if isinstance(value, dict):
         return str(value.get("TritonExpression", value.get("triton_expression", "0")))
     return str(value)
+
+
+def _pointer_type(dtype: str, address_space: Any) -> str:
+    address_space = int(address_space)
+    if address_space <= 0:
+        raise ValueError(f"Pointer address space must be positive, got {address_space}")
+    return (
+        f"tl.pointer_type({dtype})"
+        if address_space == 1
+        else f"tl.pointer_type({dtype}, {address_space})"
+    )
 
 
 def _py_dim(value: Any) -> str:
@@ -629,7 +832,9 @@ def _helper_header(
     lines = []
     if comment:
         lines.append(comment)
-    lines.append("@triton.jit")
+    lines.append(
+        "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit"
+    )
     lines.append(f"def {model['FunctionName']}({parameters}):")
     return lines
 
@@ -3150,11 +3355,13 @@ def _emit_reshard_direct(model: dict[str, Any]) -> str:
         _line(lines, reduce_indent, f"source_shard_index = {source_shard_index}")
         _line(lines, reduce_indent, f"source_pool_index = {source_pool_index}")
         _line(lines, reduce_indent, f"source_byte_offset = source_pool_index * {model['InputPoolBytes']} + {model['InputOffsetBytes']}")
-        _line(lines, reduce_indent, f"source = ({model['InputBaseName']} + source_byte_offset).to(tl.pointer_type({model['TritonDType']}))")
+        input_pointer_type = _pointer_type(model["TritonDType"], model["Input"]["AddressSpace"])
+        _line(lines, reduce_indent, f"source = ({model['InputBaseName']} + source_byte_offset).to({input_pointer_type})")
         _line(lines, reduce_indent, f"source_value = tl.load(source + input_offsets, mask=mask, other={zero}).to({accumulator_dtype})")
         _line(lines, reduce_indent, "acc += source_value")
         _line(lines, indent + 1, "value = acc")
-    _line(lines, indent + 1, f"tl.store(({model['OutputBaseName']} + output_byte_offsets).to(tl.pointer_type({model['TritonDType']})), value, mask=mask)")
+    output_pointer_type = _pointer_type(model["TritonDType"], model["Output"]["AddressSpace"])
+    _line(lines, indent + 1, f"tl.store(({model['OutputBaseName']} + output_byte_offsets).to({output_pointer_type}), value, mask=mask)")
     return _finish(lines)
 
 
@@ -3255,7 +3462,8 @@ def _emit_summa(model: dict[str, Any]) -> str:
     lhs_k = local_index_expression(lines, 4, "lhs_k", "global_k[None, :]", model["LhsGlobalShape"][1], model["LhsSplitAxes"][1])
     _line(lines, 4, f"lhs_shard_index = {full_source_shard_index}")
     _line(lines, 4, f"lhs_offsets = {lhs_m} * {_dim(model['LhsStrides'][0])} + {lhs_k} * {_dim(model['LhsStrides'][1])}")
-    _line(lines, 4, f"lhs_ptrs = ({model['LhsBaseName']} + lhs_shard_index * {model['LhsPoolBytes']} + {model['LhsOffsetBytes']}).to(tl.pointer_type({model['LhsTritonDType']}))")
+    lhs_pointer_type = _pointer_type(model["LhsTritonDType"], model["LhsAddressSpace"])
+    _line(lines, 4, f"lhs_ptrs = ({model['LhsBaseName']} + lhs_shard_index * {model['LhsPoolBytes']} + {model['LhsOffsetBytes']}).to({lhs_pointer_type})")
     _line(lines, 4, f"lhs_mask = (offs_m[:, None] < out_m_iter_dim) & (global_m[:, None] < {_dim(model['OutputGlobalShape'][0])}) & (global_k[None, :] < {_dim(model['LhsGlobalShape'][1])})")
     _line(lines, 4, "lhs_values = tl.load(lhs_ptrs + lhs_offsets, mask=lhs_mask, other=0.0)")
     append_source_shard_coords(lines, 4)
@@ -3268,7 +3476,8 @@ def _emit_summa(model: dict[str, Any]) -> str:
     _line(lines, 4, f"rhs_shard_index = {full_source_shard_index}")
     _line(lines, 4, f"rhs_physical_offsets = {rhs_k} * {_dim(model['RhsStrides'][0])} + {rhs_n} * {_dim(model['RhsStrides'][1])}")
     _line(lines, 4, f"rhs_offsets = {maybe_vectorized_offset('rhs_physical_offsets', 'rhs_lane[None, :]', model['RhsNVectorLaneCount'])}")
-    _line(lines, 4, f"rhs_ptrs = ({model['RhsBaseName']} + rhs_shard_index * {model['RhsPoolBytes']} + {model['RhsOffsetBytes']}).to(tl.pointer_type({model['RhsTritonDType']}))")
+    rhs_pointer_type = _pointer_type(model["RhsTritonDType"], model["RhsAddressSpace"])
+    _line(lines, 4, f"rhs_ptrs = ({model['RhsBaseName']} + rhs_shard_index * {model['RhsPoolBytes']} + {model['RhsOffsetBytes']}).to({rhs_pointer_type})")
     _line(lines, 4, f"rhs_mask = (global_k[:, None] < {_dim(model['LhsGlobalShape'][1])}) & (offs_n[None, :] < out_n_logical_iter_dim) & (global_n[None, :] < {_dim(rhs_global_logical_n)})")
     _line(lines, 4, "rhs_values = tl.load(rhs_ptrs + rhs_offsets, mask=rhs_mask, other=0.0)")
     _line(lines, 4, f"acc += tl.dot(lhs_values, rhs_values{dot_precision})")
@@ -3278,7 +3487,8 @@ def _emit_summa(model: dict[str, Any]) -> str:
         _line(lines, 3, f"out_lane = offs_n % {model['OutputNVectorLaneCount']}")
     _line(lines, 3, f"output_physical_offsets = offs_m[:, None] * {_dim(model['OutputStrides'][0])} + out_n_physical[None, :] * {_dim(model['OutputStrides'][1])}")
     _line(lines, 3, f"output_offsets = {maybe_vectorized_offset('output_physical_offsets', 'out_lane[None, :]', model['OutputNVectorLaneCount'])}")
-    _line(lines, 3, f"output_ptr = ({model['OutputBaseName']} + shard_index * {model['OutputPoolBytes']} + {model['OutputOffsetBytes']}).to(tl.pointer_type({model['OutputTritonDType']}))")
+    output_pointer_type = _pointer_type(model["OutputTritonDType"], model["OutputAddressSpace"])
+    _line(lines, 3, f"output_ptr = ({model['OutputBaseName']} + shard_index * {model['OutputPoolBytes']} + {model['OutputOffsetBytes']}).to({output_pointer_type})")
     _line(lines, 3, f"result = acc * {model['Scale']}")
     _line(lines, 3, f"output_mask = (offs_m[:, None] < out_m_iter_dim) & (offs_n[None, :] < out_n_logical_iter_dim) & (global_n[None, :] < {_dim(output_global_logical_n)})")
     _line(lines, 3, "tl.store(output_ptr + output_offsets, result, mask=output_mask)")
@@ -3578,14 +3788,16 @@ def _emit_update_paged_attention_kv_cache(model: dict[str, Any]) -> str:
     _line(lines, 2, f"cache_offsets = {cache_offset}")
     if use_key_vector_copy:
         word_count = vector_bytes // 8
-        _line(lines, 2, f"source_words = ({model['SlotsBaseName']} + {source_offsets_name}).to(tl.pointer_type(tl.uint64))")
+        source_word_pointer_type = _pointer_type("tl.uint64", model["Slots"]["AddressSpace"])
+        _line(lines, 2, f"source_words = ({model['SlotsBaseName']} + {source_offsets_name}).to({source_word_pointer_type})")
         _line(lines, 2, "cache_words = (kv_cache + cache_offsets).to(tl.pointer_type(tl.uint64))")
         for word_index in range(word_count):
             suffix = "" if word_index == 0 else f" + {word_index}"
             _line(lines, 2, f"word{word_index} = tl.load(source_words{suffix}, mask=active, other=0)")
             _line(lines, 2, f"tl.store(cache_words{suffix}, word{word_index}, mask=active)")
     else:
-        _line(lines, 2, f"value = tl.load(({model['SlotsBaseName']} + {source_offsets_name}).to(tl.pointer_type({model['SlotsTritonDType']})), mask=active, other=0.0)")
+        source_pointer_type = _pointer_type(model["SlotsTritonDType"], model["Slots"]["AddressSpace"])
+        _line(lines, 2, f"value = tl.load(({model['SlotsBaseName']} + {source_offsets_name}).to({source_pointer_type}), mask=active, other=0.0)")
         _line(lines, 2, "tl.store(kv_cache + cache_offsets, value, mask=active)")
     return _finish(lines)
 

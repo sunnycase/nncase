@@ -7,10 +7,10 @@ using Nncase.TIR.NTT;
 
 namespace Nncase.Evaluator.TIR.NTT;
 
-public class GatherReduceScatterEvaluator : ITypeInferencer<GatherReduceScatter>, IKernelInfoEvaluator<GatherReduceScatter>
+public class GatherReduceScatterEvaluator : ITypeInferencer<GatherReduceScatter>, ITileWorkloadEvaluator<GatherReduceScatter>
 {
-    public MicroKernelInfo Visit(GatherReduceScatter target, MicroKernelContext context)
-        => TransferKernelInfo.Create(context);
+    public TileWorkload Visit(GatherReduceScatter target, TileWorkloadContext context)
+        => TransferTileWorkload.Create(context);
 
     public IRType Visit(ITypeInferenceContext context, GatherReduceScatter target)
     {

@@ -1405,8 +1405,12 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         var generatedKernelsPy = File.ReadAllText(Path.Join(outputDirectory, "generated_kernels.py"));
         Assert.Contains("def main_prim_nested_prim_device", generatedKernelsPy, StringComparison.Ordinal);
         Assert.Contains("(data + 64).to(tl.pointer_type(tl.uint8))", generatedKernelsPy, StringComparison.Ordinal);
-        Assert.Contains("source = (main_prim_nested_prim_device_arg0_nested_input).to(tl.pointer_type(tl.float32))", generatedKernelsPy, StringComparison.Ordinal);
-        Assert.Contains("destination = (main_prim_nested_prim_device_arg1_nested_output).to(tl.pointer_type(tl.float32))", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("tl.store((pyntt_shared_base + 0).to(tl.pointer_type(tl.uint64, 3)), ((data).to(tl.pointer_type(tl.float32))).to(tl.uint64))", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("tl.store((pyntt_shared_base + 8).to(tl.pointer_type(tl.uint64, 3)), ((data + 16).to(tl.pointer_type(tl.float32))).to(tl.uint64))", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("tl.store((pyntt_shared_base + 32).to(tl.pointer_type(tl.uint64, 3)), ((data + 64).to(tl.pointer_type(tl.uint8))).to(tl.uint64))", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("tl.load((pyntt_shared_base + 0).to(tl.pointer_type(tl.uint64, 3))).to(tl.pointer_type(tl.float32))", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("tl.load((pyntt_shared_base + 8).to(tl.pointer_type(tl.uint64, 3))).to(tl.pointer_type(tl.float32))", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("tl.load((pyntt_shared_base + 32).to(tl.pointer_type(tl.uint64, 3))).to(tl.pointer_type(tl.uint8))", generatedKernelsPy, StringComparison.Ordinal);
         Assert.DoesNotContain("data + 192", generatedKernelsPy, StringComparison.Ordinal);
     }
 
@@ -1492,7 +1496,7 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         var outputBuffer = CreateBuffer(
             "tile_output",
             DataTypes.Float32,
-            TIR.MemoryLocation.Cache,
+            TIR.MemoryLocation.Shared,
             0,
             [4, 8],
             [8, 1]);
@@ -1513,6 +1517,8 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         var outputDirectory = GeneratePyNTTModelDirectory("generated_distributed_subview_shape_model", main);
         RenderGeneratedKernels(outputDirectory);
         var generatedKernelsPy = File.ReadAllText(Path.Join(outputDirectory, "generated_kernels.py"));
+        Assert.Contains("import triton.experimental.tle.language as tle", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("pyntt_shared_storage = tle.gpu.alloc([128]", generatedKernelsPy, StringComparison.Ordinal);
         Assert.Contains("shape=(4, 8)", generatedKernelsPy, StringComparison.Ordinal);
         Assert.Contains("for linear_start in tl.range(0, (4) * (8), block_size):", generatedKernelsPy, StringComparison.Ordinal);
         Assert.DoesNotContain("shape=(20, 8)", generatedKernelsPy, StringComparison.Ordinal);
@@ -1528,7 +1534,7 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         var nestedData = new TIR.BufferVar("data", TensorType.Scalar(new PointerType(DataTypes.UInt8)), TIR.BufferVarRole.Workspace, TIR.MemoryLocation.Data);
         var nestedChipLocalData = new TIR.BufferVar("chip_local_data", TensorType.Scalar(new PointerType(DataTypes.UInt8)), TIR.BufferVarRole.Workspace, TIR.MemoryLocation.ChipLocalData);
         var nestedBlockLocalData = new TIR.BufferVar("block_local_data", TensorType.Scalar(new PointerType(DataTypes.UInt8)), TIR.BufferVarRole.Workspace, TIR.MemoryLocation.BlockLocalData);
-        var tileBuffer = CreateBuffer("tile", DataTypes.Float32, TIR.MemoryLocation.Cache, 0, [2, 8], [8, 1], distributedType);
+        var tileBuffer = CreateBuffer("tile", DataTypes.Float32, TIR.MemoryLocation.Shared, 0, [2, 8], [8, 1], distributedType);
         var nestedBody = TIR.T.Let(
             out var tile,
             IR.F.Buffer.AllocateBufferView(tileBuffer, new RankedShape(2, 0)),
@@ -1566,6 +1572,8 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         var outputDirectory = GeneratePyNTTModelDirectory("generated_allocated_tile_logical_origin_model", module);
         RenderGeneratedKernels(outputDirectory);
         var generatedKernelsPy = File.ReadAllText(Path.Join(outputDirectory, "generated_kernels.py"));
+        Assert.Equal(1, generatedKernelsPy.Split("pyntt_shared_storage = tle.gpu.alloc", StringSplitOptions.None).Length - 1);
+        Assert.Contains("pyntt_shared_base", generatedKernelsPy, StringComparison.Ordinal);
         Assert.Contains("generated from PyNTT Jinja TensorRegionCopy.py.jinja", generatedKernelsPy, StringComparison.Ordinal);
         Assert.Contains("copy_start0 = tl.maximum(2, main_prim_nested_prim_device_arg0_nested_output_global_offset0)", generatedKernelsPy, StringComparison.Ordinal);
         Assert.Contains("source_base0 = copy_start0 - 2", generatedKernelsPy, StringComparison.Ordinal);
@@ -1586,7 +1594,7 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         var nestedData = new TIR.BufferVar("data", TensorType.Scalar(new PointerType(DataTypes.UInt8)), TIR.BufferVarRole.Workspace, TIR.MemoryLocation.Data);
         var nestedChipLocalData = new TIR.BufferVar("chip_local_data", TensorType.Scalar(new PointerType(DataTypes.UInt8)), TIR.BufferVarRole.Workspace, TIR.MemoryLocation.ChipLocalData);
         var nestedBlockLocalData = new TIR.BufferVar("block_local_data", TensorType.Scalar(new PointerType(DataTypes.UInt8)), TIR.BufferVarRole.Workspace, TIR.MemoryLocation.BlockLocalData);
-        var tileBuffer = CreateBuffer("tile", DataTypes.Float32, TIR.MemoryLocation.Cache, 0, [1, 8], [8, 1], distributedType);
+        var tileBuffer = CreateBuffer("tile", DataTypes.Float32, TIR.MemoryLocation.Shared, 0, [1, 8], [8, 1], distributedType);
         var nestedBody = TIR.T.Let(
             out var tile,
             IR.F.Buffer.AllocateBufferView(tileBuffer, new RankedShape(1, 0)),
@@ -2496,9 +2504,12 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         process.StartInfo.RedirectStandardOutput = true;
         process.StartInfo.RedirectStandardError = true;
         process.Start();
+        var stdout = process.StandardOutput.ReadToEndAsync();
+        var stderr = process.StandardError.ReadToEndAsync();
         process.WaitForExit();
+        Task.WaitAll(stdout, stderr);
 
-        return (process.ExitCode, process.StandardOutput.ReadToEnd(), process.StandardError.ReadToEnd());
+        return (process.ExitCode, stdout.Result, stderr.Result);
     }
 
     private string PythonString(string value) => JsonSerializer.Serialize(value, PythonStringLiteralOptions);

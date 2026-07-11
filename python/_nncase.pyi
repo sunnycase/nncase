@@ -34,8 +34,7 @@ class NTTTargetOptions:
     HierarchySizes: List[int]
     HierarchyLatencies: List[int]
     HierarchyBandWidths: List[int]
-    MemoryCapacities: List[int]
-    MemoryBandWidths: List[int]
+    TargetMachine: str
     DistributedScheme: str
     CustomOpScheme: str
 
@@ -43,7 +42,6 @@ class NTTTargetOptions:
 class PyNTTTargetOptions(NTTTargetOptions):
     def __init__(self) -> None: ...
     Backend: str
-    TritonCapability: str
     OutputDirectory: str
     Strict: bool
 

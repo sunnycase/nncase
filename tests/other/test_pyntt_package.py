@@ -192,3 +192,209 @@ def test_pyntt_runtime_materializes_zero_copy_input_result_views():
     assert bytes_view.dtype == torch.uint8
     assert reshaped.data_ptr() == x.data_ptr()
     assert bytes_view.data_ptr() == x.data_ptr()
+
+
+def test_pyntt_renderer_threads_one_shared_pool_through_device_functions():
+    _add_pyntt_to_path()
+
+    from pyntt.codegen.render import render_manifest
+
+    source = render_manifest(
+        {
+            "functions": [
+                {
+                    "render_kernels": [
+                        {
+                            "metadata": {
+                                "name": "top",
+                                "inputs": [],
+                                "outputs": [],
+                                "attrs": {"shared_memory_bytes": 128},
+                            },
+                            "body_source": "__pyntt_device_call__child(data)",
+                            "device_functions": [
+                                {
+                                    "name": "child",
+                                    "noinline": True,
+                                    "preserve_helper_call_boundaries": False,
+                                    "pointer_call_frame": [
+                                        {
+                                            "name": "child_data",
+                                            "triton_dtype": "tl.uint8",
+                                        }
+                                    ],
+                                    "helpers": [],
+                                    "body_source": "tl.load(child_data)",
+                                    "parameter_overrides": {},
+                                    "extra_parameters": ["child_data"],
+                                    "extra_parameter_arguments": {},
+                                }
+                            ],
+                        }
+                    ]
+                }
+            ]
+        }
+    )
+
+    assert "import triton.experimental.tle.language as tle" in source
+    assert source.count("pyntt_shared_storage = tle.gpu.alloc([256]") == 1
+    assert "@triton.jit(noinline=True)\ndef child(" in source
+    assert "child_data" not in source.split("def child(", 1)[1].split("):", 1)[0]
+    assert "tl.pointer_type(tl.uint64, 3)" in source
+    assert "tl.store(" in source
+    assert "tl.load(" in source
+    assert "pyntt_shared_base" in source
+    assert "child(" in source
+
+
+class _FakeCompiledKernel:
+    def __init__(
+        self,
+        *,
+        num_warps=8,
+        shared=0,
+        registers=32,
+        spill_stores=0,
+        spill_loads=0,
+        stack=0,
+        local=0,
+    ):
+        self.hash = object()
+        self.name = "fake_kernel"
+        self.metadata = type(
+            "Metadata", (), {"num_warps": num_warps, "shared": shared}
+        )()
+        self.n_regs = registers
+        self.n_spill_stores = spill_stores
+        self.n_spill_loads = spill_loads
+        self.n_stack_bytes = stack
+        self.n_local_bytes = local
+
+    def _init_handles(self):
+        pass
+
+
+class _FakeJitKernel:
+    def __init__(self, compiled):
+        self.compiled = compiled
+
+    def warmup(self, *args, **kwargs):
+        return self.compiled
+
+
+class _FakeTunableJitKernel:
+    def __init__(self, compiled_by_candidate):
+        self.compiled_by_candidate = compiled_by_candidate
+        self.attempts = []
+
+    def warmup(self, *args, **kwargs):
+        candidate = int(args[-1])
+        self.attempts.append(candidate)
+        result = self.compiled_by_candidate[candidate]
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
+
+def test_pyntt_runtime_accepts_kernel_within_fixed_resource_budget():
+    _add_pyntt_to_path()
+
+    from pyntt.runtime.triton import validate_triton_kernel_resources
+
+    validate_triton_kernel_resources(
+        _FakeJitKernel(
+            _FakeCompiledKernel(
+                shared=4096, registers=64, stack=32, local=8
+            )
+        ),
+        grid=(36,),
+        expected_num_warps=8,
+        worker_width=32,
+        register_capacity_bytes=256 * 1024,
+        shared_memory_capacity_bytes=101_376,
+        forbid_spills=True,
+    )
+
+
+@pytest.mark.parametrize(
+    ("compiled", "message"),
+    [
+        (_FakeCompiledKernel(num_warps=4), "requires 8"),
+        (_FakeCompiledKernel(shared=1024), "shared-memory bytes"),
+        (_FakeCompiledKernel(registers=257), "register bytes"),
+        (_FakeCompiledKernel(spill_stores=4), "forbids register spilling"),
+    ],
+)
+def test_pyntt_runtime_rejects_kernel_outside_fixed_resource_budget(
+    compiled, message
+):
+    _add_pyntt_to_path()
+
+    from pyntt.runtime.triton import validate_triton_kernel_resources
+
+    shared_capacity = 512 if compiled.metadata.shared else 101_376
+    with pytest.raises(RuntimeError, match=message):
+        validate_triton_kernel_resources(
+            _FakeJitKernel(compiled),
+            grid=(36,),
+            expected_num_warps=8,
+            worker_width=32,
+            register_capacity_bytes=256 * 1024,
+            shared_memory_capacity_bytes=shared_capacity,
+            forbid_spills=True,
+        )
+
+
+def test_pyntt_runtime_selects_first_resource_feasible_tuning_candidate():
+    _add_pyntt_to_path()
+
+    from pyntt.runtime.triton import (
+        select_and_validate_triton_tuning_parameter,
+    )
+    from triton.runtime.errors import OutOfResources
+
+    kernel = _FakeTunableJitKernel(
+        {
+            128: _FakeCompiledKernel(registers=64),
+            256: _FakeCompiledKernel(spill_stores=4),
+            512: OutOfResources(128 * 1024, 96 * 1024, "shared memory"),
+        }
+    )
+    selected = select_and_validate_triton_tuning_parameter(
+        "test_kernel",
+        "block_size",
+        (128, 256, 512),
+        source="search_space",
+        kernel=kernel,
+        kernel_args=(),
+        grid_for_candidate=lambda _: (1,),
+        expected_num_warps=8,
+        worker_width=32,
+        register_capacity_bytes=256 * 1024,
+        shared_memory_capacity_bytes=101_376,
+        forbid_spills=True,
+        num_warps=8,
+    )
+
+    assert selected == 128
+    assert kernel.attempts == [512, 256, 128]
+
+    selected_again = select_and_validate_triton_tuning_parameter(
+        "test_kernel",
+        "block_size",
+        (128, 256, 512),
+        source="search_space",
+        kernel=kernel,
+        kernel_args=(),
+        grid_for_candidate=lambda _: (1,),
+        expected_num_warps=8,
+        worker_width=32,
+        register_capacity_bytes=256 * 1024,
+        shared_memory_capacity_bytes=101_376,
+        forbid_spills=True,
+        num_warps=8,
+    )
+
+    assert selected_again == 128
+    assert kernel.attempts == [512, 256, 128]

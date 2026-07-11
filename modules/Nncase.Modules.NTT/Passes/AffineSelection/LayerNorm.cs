@@ -46,9 +46,12 @@ public partial class NTTAffineSelectionPass
         var inputAccess = AffineMap.Identity(rank);
         var scaleAccess = new AffineMap(domains, default, Enumerable.Range(axis, rank - axis).Select(i => new AffineRange(domains[i].Offset, domains[i].Extent)).ToArray());
         var biasAccess = new AffineMap(domains, default, Enumerable.Range(axis, rank - axis).Select(i => new AffineRange(domains[i].Offset, domains[i].Extent)).ToArray());
+        var tileAxisPolicies = Enumerable.Range(0, rank)
+            .Select(i => i < axis ? GridTileAxisPolicy.Search() : GridTileAxisPolicy.FullExtent)
+            .ToArray();
 
         return IR.F.Affine.Grid()
-            .Domain(rank, out var _)
+            .Domain(tileAxisPolicies, out var _)
             .Read(input, inputAccess, out var inTile)
             .Read(scale, scaleAccess, out var scaleTile)
             .Read(bias, biasAccess, out var biasTile)

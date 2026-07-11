@@ -717,32 +717,94 @@ This keeps PyNTT extensible:
   generated model so the final Triton source is inspectable.
 - TileLang or CuteDSL can be added later behind the same spec contract.
 
+## Target Machine and AutoTiling Model
+
+NTT-family targets resolve one immutable `TargetMachineModel` from the target
+option `--target-machine`. A named model is the single source of truth shared by
+the op cost model, AutoTiling, TIR buffer placement, codegen metadata, and
+runtime resource validation. Ad-hoc memory capacity/bandwidth arrays and the
+old Triton capability string are not part of the contract.
+
+The model stops at the physical block boundary:
+
+- A CPU block is one core-bound worker.
+- A PyNTT block is one persistent GPU CTA.
+- PyNTT uses eight compute warps with the target warp width. The block count is
+  determined by the configured block hierarchy and must not exceed the target
+  compute-unit count.
+- Occupancy is not an AutoTiling variable. Register and shared-memory budgets
+  are fixed per block.
+- Warp/thread decomposition and tensor layouts remain the responsibility of
+  Triton.
+
+Each physical memory is a `TargetMemorySpaceSpec` with a stable identity,
+sharing scope, capacity, directional bandwidth, latency, allocation
+granularity, and optional `MemoryLocation` binding. Directed
+`TargetMemoryTransferSpec` edges describe adjacent parent/local transfer
+channels. Chip-scoped traffic is aggregated across active blocks; block-local
+traffic remains per block.
+
+All storage resources use the existing TIR buffer vocabulary. Addressable
+AutoTiling placements become buffers with the target-provided
+`MemoryLocation`/hierarchy binding. GPU shared tiles therefore lower to one
+planned TLE shared-memory pool. Registers are also represented in the target
+model and by `MemoryLocation.Register`, but Triton register values are
+non-addressable SSA tensors. PyNTT does not synthesize a pointer-backed register
+array or a warp/thread layout. Instead, operator templates own register tiles,
+while nncase constrains the total CTA register budget and rejects every compiled
+specialization that spills. `BlockLocalData` remains owned by AutoDistributed
+and TIR selection and is not an AutoTiling storage candidate.
+
+AutoTiling minimizes block latency using:
+
+```text
+max(compute cycles,
+    per-memory read/write cycles,
+    directed transfer cycles)
++ explicit synchronization cycles
+```
+
+Elementwise and SIMT throughput are per block. Matrix candidates use the local
+shard/tile shape, model MMA/WGMMA primitive dimensions, and charge padding when
+M/N/K do not fit the primitive. Kernel tile extents use power-of-two candidate
+sets. Hierarchy decomposition factors remain exact affine factors and are not
+kernel tile sizes.
+
+AutoTiling metadata follows three separate ownership rules:
+
+- `ParameterInfo.MemoryEffect` is the only operand read/write/scope contract.
+  Grid memory-effect analysis resolves body calls and aliases back to each
+  `GridAccess`; operators do not publish a second buffer-state table.
+- `GridTileAxisPolicy` records tiling legality on the affine domain. Searchable
+  axes use power-of-two candidates, while full and fixed axes are exact and may
+  have non-power-of-two extents.
+- `TileWorkload` describes only target-independent local compute work. It is an
+  elementwise work expression or a matrix M/N/K/multiplicity expression; the
+  target machine converts that workload into cycles.
+
+There is deliberately no `MicroKernelInfo` contract. Block-internal
+microkernel implementation remains a backend responsibility.
+
+PyNTT currently provides canonical profiles for RTX 5060 Ti 16 GB and H800 SXM
+80 GB, plus generic CPU/CUDA/XPU profiles. The generated manifest records the
+resolved profile and resource contract. At first launch, PyNTT tries tuning
+candidates in priority order and accepts only a specialization whose compiled
+warp count, shared memory, register bytes, and ptxas spill-store/spill-load
+counts satisfy that contract. Successful specialization decisions are cached;
+Triton `OutOfResources` rejects only that candidate, while other compilation
+errors fail immediately.
+
 ## Buffer and Memory Model
 
-Phase 1 should use a simple Python memory model:
-
 - Inputs are user-provided `torch.Tensor` objects.
-- Outputs are allocated by the runtime with `torch.empty_like`,
-  `torch.empty`, or spec-derived allocation.
-- Temporary buffers are allocated by the runtime and reused within one model
-  invocation when lifetime data is available.
-- Constants are emitted as PyTorch tensors or serialized files loaded by
-  `model.py`.
-
-NTT bufferization metadata should be preserved in the spec even if phase 1 does
-not fully exploit it. That metadata is required for future megakernel fusion and
-workspace reuse.
-
-Memory spaces:
-
-- `input`
-- `output`
-- `constant`
-- `temp`
-- `local`
-
-Triton-specific memory hierarchy such as SRAM/shared memory should be encoded
-as schedule or kernel metadata, not as Python tensor allocations.
+- Main and internal PrimFuncs use caller-allocated outputs and workspace.
+- Constants use binary rdata assets and are materialized once by the runtime.
+- `BufferizePass` remains authoritative for buffer shape, strides, size,
+  location, workspace offset, and lifetime.
+- Shared-memory pointer call frames preserve ordinary internal PrimFunc call
+  boundaries without expanding all formal pointers into the top-kernel ABI.
+- Triton top kernels consume the generated TIR buffer plan directly; Python
+  runtime code must not recompute workspace placement.
 
 ## Constants
 

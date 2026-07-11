@@ -13,7 +13,6 @@ namespace Nncase.Targets;
 public sealed class PyNTTTargetOptions : NTTTargetOptions
 {
     private string _backend = "triton";
-    private TritonTargetCapability _tritonCapability = TritonTargetCapability.Default;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="PyNTTTargetOptions"/> class.
@@ -23,7 +22,7 @@ public sealed class PyNTTTargetOptions : NTTTargetOptions
         HierarchyNames = "yx";
         HierarchyLevels = "bb";
         Hierarchies = new[] { new[] { 4, 8 } };
-        RefreshTargetCostModel();
+        TargetMachine = NTTTargetMachineCatalog.Rtx5060Ti16Gb;
     }
 
     /// <summary>
@@ -38,19 +37,6 @@ public sealed class PyNTTTargetOptions : NTTTargetOptions
         set
         {
             _backend = value;
-            RefreshTargetCostModel();
-        }
-    }
-
-    /// <summary>
-    /// Gets or sets the Triton backend hardware capability.
-    /// </summary>
-    public TritonTargetCapability TritonCapability
-    {
-        get => _tritonCapability;
-        set
-        {
-            _tritonCapability = value;
             RefreshTargetCostModel();
         }
     }
@@ -86,17 +72,18 @@ public sealed class PyNTTTargetOptions : NTTTargetOptions
             HierarchySizes = nttOptions.HierarchySizes,
             HierarchyLatencies = nttOptions.HierarchyLatencies,
             HierarchyBandWidths = nttOptions.HierarchyBandWidths,
-            MemoryCapacities = nttOptions.MemoryCapacities,
-            MemoryBandWidths = nttOptions.MemoryBandWidths,
+            TargetMachine = nttOptions.TargetMachine,
             DistributedScheme = nttOptions.DistributedScheme,
             CustomOpScheme = nttOptions.CustomOpScheme,
         };
     }
 
-    private void RefreshTargetCostModel()
+    protected override void OnTargetMachineChanged()
     {
         TargetCostModel = string.Equals(_backend, "triton", StringComparison.OrdinalIgnoreCase)
-            ? new TritonTargetOpCostModel(_tritonCapability)
-            : DefaultTargetOpCostModel.Instance;
+            ? new TritonTargetOpCostModel(TargetMachineModel)
+            : new DefaultTargetOpCostModel(TargetMachineModel);
     }
+
+    private void RefreshTargetCostModel() => OnTargetMachineChanged();
 }

@@ -34,4 +34,6 @@ public class CUDATarget : NTTTarget
     }
 
     protected override INTTModuleCompiler NTTModuleCompiler { get; } = new CUDAModuleCompiler();
+
+    protected override string DefaultTargetMachine => NTTTargetMachineCatalog.CudaGeneric;
 }

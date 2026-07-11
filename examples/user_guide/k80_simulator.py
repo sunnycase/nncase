@@ -112,8 +112,7 @@ def compile_kmodel(model_path, dump_path, config, is_eval: bool):
     target_options.Hierarchies = [[1]]
     target_options.HierarchyNames = 't'
     target_options.HierarchySizes = [603979776]
-    target_options.MemoryCapacities = [262144]
-    target_options.MemoryBandWidths = [64]
+    target_options.TargetMachine = "xpu-generic"
     target_options.UnifiedMemoryArch = True
 
     compile_options.shape_bucket_enable = True

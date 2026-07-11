@@ -38,3 +38,63 @@ public readonly record struct MemoryEffect(MemoryAccessMode Mode, MemoryAccessSc
 
     public static MemoryEffect ChipReadWrite { get; } = new(MemoryAccessMode.ReadWrite, MemoryAccessScope.Chip);
 }
+
+/// <summary>
+/// Shared utilities for interpreting operand memory-effect contracts.
+/// </summary>
+public static class MemoryEffectUtility
+{
+    /// <summary>
+    /// Visits every expression operand with a non-empty memory effect. Tuple and
+    /// variadic operands are expanded according to the call's parameter contract.
+    /// </summary>
+    public static void VisitCallEffects(Call call, Action<Expr, ParameterInfo, MemoryEffect> visitor)
+    {
+        if (call.Target is not Op)
+        {
+            throw new ArgumentException("Operand memory effects can only be read from an Op call.", nameof(call));
+        }
+
+        call.ParametersForeach((argument, parameter) =>
+        {
+            if (parameter.MemoryEffect is not { Mode: not MemoryAccessMode.None } effect)
+            {
+                return;
+            }
+
+            VisitArgument(argument, parameter, effect);
+        });
+
+        void VisitArgument(BaseExpr argument, ParameterInfo parameter, MemoryEffect effect)
+        {
+            switch (argument)
+            {
+                case None:
+                    return;
+                case IR.Tuple tuple:
+                    foreach (var field in tuple.Fields)
+                    {
+                        VisitArgument(field, parameter, effect);
+                    }
+
+                    return;
+                case Expr expression:
+                    visitor(expression, parameter, effect);
+                    return;
+                default:
+                    throw new InvalidOperationException(
+                        $"Memory-effect operand {call.Target.GetType().Name}.{parameter.Name} must be an expression, got {argument.GetType().Name}.");
+            }
+        }
+    }
+
+    public static MemoryEffect Merge(MemoryEffect lhs, MemoryEffect rhs)
+        => new(lhs.Mode | rhs.Mode, MergeScope(lhs.Scope, rhs.Scope));
+
+    public static MemoryAccessScope MergeScope(MemoryAccessScope lhs, MemoryAccessScope rhs)
+        => lhs == MemoryAccessScope.Chip || rhs == MemoryAccessScope.Chip
+            ? MemoryAccessScope.Chip
+            : lhs == MemoryAccessScope.Block || rhs == MemoryAccessScope.Block
+                ? MemoryAccessScope.Block
+                : MemoryAccessScope.Inferred;
+}

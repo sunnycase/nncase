@@ -117,39 +117,11 @@ internal sealed class MemoryEffectAnalyzer
     private static EffectSet GetCallEffects(Call call, ResourceBindingScope bindings)
     {
         var effects = new EffectSet();
-        call.ParametersForeach((argument, parameter) =>
-        {
-            if (parameter.MemoryEffect is not { Mode: not MemoryAccessMode.None } effect)
-            {
-                return;
-            }
-
-            AddArgumentEffects(argument, effect, parameter.Name);
-        });
+        MemoryEffectUtility.VisitCallEffects(
+            call,
+            (argument, _, effect) => effects.Add(ResolveResource(argument, effect.Scope, bindings), effect.Mode));
 
         return effects;
-
-        void AddArgumentEffects(BaseExpr argument, IR.MemoryEffect effect, string parameterName)
-        {
-            switch (argument)
-            {
-                case None:
-                    return;
-                case IR.Tuple tuple:
-                    foreach (var field in tuple.Fields)
-                    {
-                        AddArgumentEffects(field, effect, parameterName);
-                    }
-
-                    return;
-                case Expr expression:
-                    effects.Add(ResolveResource(expression, effect.Scope, bindings), effect.Mode);
-                    return;
-                default:
-                    throw new InvalidOperationException(
-                        $"Memory-effect operand {call.Target.GetType().Name}.{parameterName} must be an expression, got {argument.GetType().Name}.");
-            }
-        }
     }
 
     private static EffectSet Instantiate(

@@ -18,7 +18,7 @@ namespace Nncase.Targets;
 
 public sealed class NTTTargetOptionsCommand : Command
 {
-    public NTTTargetOptionsCommand(string name)
+    public NTTTargetOptionsCommand(string name, string defaultTargetMachine = NTTTargetMachineCatalog.CpuGeneric)
         : base(name)
     {
         ModelNameOption = new Option<string>(
@@ -88,22 +88,11 @@ public sealed class NTTTargetOptionsCommand : Command
             AllowMultipleArgumentsPerToken = true,
         };
         Add(HierarchyBandWidthsOption);
-        MemoryCapacitiesOption = new Option<IEnumerable<int>>(
-            name: "--memory-capacities",
-            description: "the memory capacity of single core. eg. `32 64` for sram,main",
-            getDefaultValue: () => new int[] { 524288, 2147483647 })
-        {
-            AllowMultipleArgumentsPerToken = true,
-        };
-        Add(MemoryCapacitiesOption);
-        MemoryBandWidthsOption = new Option<IEnumerable<int>>(
-            name: "--memory-bandwidths",
-            description: "the memory bandwidth of single core. eg. `64 8` for sram,main",
-            getDefaultValue: () => new int[] { 64, 8 })
-        {
-            AllowMultipleArgumentsPerToken = true,
-        };
-        Add(MemoryBandWidthsOption);
+        TargetMachineOption = new Option<string>(
+            name: "--target-machine",
+            description: "the canonical target machine model used by cost evaluation and AutoTiling.",
+            getDefaultValue: () => defaultTargetMachine);
+        Add(TargetMachineOption);
         DistributedSchemeOption = new Option<string>(
             name: "--distributed--scheme",
             description: "the distributed scheme path.",
@@ -138,9 +127,7 @@ public sealed class NTTTargetOptionsCommand : Command
 
     public Option<IEnumerable<int>> HierarchyBandWidthsOption { get; }
 
-    public Option<IEnumerable<int>> MemoryCapacitiesOption { get; }
-
-    public Option<IEnumerable<int>> MemoryBandWidthsOption { get; }
+    public Option<string> TargetMachineOption { get; }
 
     public Option<string> DistributedSchemeOption { get; }
 
@@ -171,8 +158,7 @@ public sealed class NTTTargetOptionsBinder
             HierarchySizes = context.ParseResult.GetValueForOption(_cmd.HierarchySizesOption)!.ToArray(),
             HierarchyLatencies = context.ParseResult.GetValueForOption(_cmd.HierarchyLatenciesOption)!.ToArray(),
             HierarchyBandWidths = context.ParseResult.GetValueForOption(_cmd.HierarchyBandWidthsOption)!.ToArray(),
-            MemoryCapacities = context.ParseResult.GetValueForOption(_cmd.MemoryCapacitiesOption)!.ToArray(),
-            MemoryBandWidths = context.ParseResult.GetValueForOption(_cmd.MemoryBandWidthsOption)!.ToArray(),
+            TargetMachine = context.ParseResult.GetValueForOption(_cmd.TargetMachineOption)!,
             DistributedScheme = context.ParseResult.GetValueForOption(_cmd.DistributedSchemeOption)!,
             CustomOpScheme = context.ParseResult.GetValueForOption(_cmd.CustomOpSchemeOption)!,
         };

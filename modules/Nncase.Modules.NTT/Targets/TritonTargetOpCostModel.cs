@@ -13,14 +13,21 @@ namespace Nncase.Targets;
 /// </summary>
 public sealed class TritonTargetOpCostModel : ITargetOpCostModel, IHierarchicalTargetOpCostModel, ITargetOpCostBreakdownModel
 {
-    private readonly TritonTargetCapability _capability;
+    private readonly TargetMachineModel _machine;
+    private readonly TargetMemorySpaceSpec _blockMemory;
+    private readonly TargetMemorySpaceSpec _rootMemory;
 
-    public TritonTargetOpCostModel(TritonTargetCapability capability)
+    public TritonTargetOpCostModel(TargetMachineModel machine)
     {
-        _capability = capability;
-    }
+        _machine = machine ?? throw new ArgumentNullException(nameof(machine));
+        if (machine.Execution.Kind != BlockExecutionKind.PersistentGpuBlock)
+        {
+            throw new ArgumentException($"Triton cost model requires a persistent GPU target machine, got {machine.Id} ({machine.Execution.Kind}).", nameof(machine));
+        }
 
-    public TritonTargetCapability Capability => _capability;
+        _blockMemory = machine.TilingMemorySpaces[^1];
+        _rootMemory = machine.GetMemorySpace(machine.RootMemorySpace);
+    }
 
     public UInt128 GetLatency(Cost cost) => GetLatency(cost, TargetCostAggregationContext.Local);
 
@@ -29,14 +36,20 @@ public sealed class TritonTargetOpCostModel : ITargetOpCostModel, IHierarchicalT
     public TargetCostLatencyBreakdown GetLatencyBreakdown(Cost cost, TargetCostAggregationContext context)
     {
         var cpuCycles = ToDouble(GetFactor(cost, CostFactorNames.CPUCycles));
-        var blockLocalMemoryBytes = ToDouble(GetFactor(cost, CostFactorNames.BlockLocalMemoryLoadBytes) + GetFactor(cost, CostFactorNames.BlockLocalMemoryStoreBytes));
-        var explicitChipGlobalMemoryBytes = ToDouble(GetFactor(cost, CostFactorNames.ChipGlobalMemoryLoadBytes) + GetFactor(cost, CostFactorNames.ChipGlobalMemoryStoreBytes));
+        var blockLocalLoadBytes = ToDouble(GetFactor(cost, CostFactorNames.BlockLocalMemoryLoadBytes));
+        var blockLocalStoreBytes = ToDouble(GetFactor(cost, CostFactorNames.BlockLocalMemoryStoreBytes));
+        var chipGlobalLoadBytes = ToDouble(GetFactor(cost, CostFactorNames.ChipGlobalMemoryLoadBytes));
+        var chipGlobalStoreBytes = ToDouble(GetFactor(cost, CostFactorNames.ChipGlobalMemoryStoreBytes));
         var activeBlocks = Math.Max(1.0, context.ActiveBlockCount);
-        var blockLocalMemoryCycles = blockLocalMemoryBytes / Math.Max(1.0, _capability.EffectiveBlockLocalMemoryBytesPerCyclePerBlock);
-        var chipGlobalMemoryCycles = ((blockLocalMemoryBytes + explicitChipGlobalMemoryBytes) * activeBlocks) / Math.Max(1.0, _capability.EffectiveChipGlobalMemoryBytesPerCycle);
+        var blockLocalMemoryCycles = (blockLocalLoadBytes / _blockMemory.ReadBytesPerCycle)
+            + (blockLocalStoreBytes / _blockMemory.WriteBytesPerCycle)
+            + GetMemoryLatency(blockLocalLoadBytes + blockLocalStoreBytes, _blockMemory);
+        var chipGlobalMemoryCycles = (((blockLocalLoadBytes + chipGlobalLoadBytes) * activeBlocks) / _rootMemory.ReadBytesPerCycle)
+            + (((blockLocalStoreBytes + chipGlobalStoreBytes) * activeBlocks) / _rootMemory.WriteBytesPerCycle)
+            + GetMemoryLatency(blockLocalLoadBytes + blockLocalStoreBytes + chipGlobalLoadBytes + chipGlobalStoreBytes, _rootMemory);
         var overlappedCycles = Math.Max(cpuCycles, Math.Max(blockLocalMemoryCycles, chipGlobalMemoryCycles));
-        var blockSynchronizationCycles = ToDouble(GetFactor(cost, CostFactorNames.BlockSynchronization)) * _capability.BlockSynchronizationCycles;
-        var gridSynchronizationCycles = ToDouble(GetFactor(cost, CostFactorNames.GridSynchronization)) * _capability.GridSynchronizationCycles;
+        var blockSynchronizationCycles = ToDouble(GetFactor(cost, CostFactorNames.BlockSynchronization)) * _machine.Synchronization.BlockCycles;
+        var gridSynchronizationCycles = ToDouble(GetFactor(cost, CostFactorNames.GridSynchronization)) * _machine.Synchronization.GridCycles;
         var commCycles = ToDouble(GetFactor(cost, CostFactorNames.Comm));
         var otherCycles = ToDouble(GetOtherCost(cost));
         var latency = overlappedCycles
@@ -135,7 +148,7 @@ public sealed class TritonTargetOpCostModel : ITargetOpCostModel, IHierarchicalT
         };
 
         cost = ElementwiseCost(
-            computeCycles + _capability.FixedOverheadCycles,
+            computeCycles,
             GetTensorByteCount(query.Lhs) + GetTensorByteCount(query.Rhs),
             GetTensorByteCount(query.Output));
         return true;
@@ -143,7 +156,7 @@ public sealed class TritonTargetOpCostModel : ITargetOpCostModel, IHierarchicalT
 
     private double EstimateElementwiseComputeCycles(double elements, double workPerElement)
     {
-        return ((elements * workPerElement) / Math.Max(1.0, _capability.ElementwiseElementsPerCyclePerBlock)) + _capability.FixedOverheadCycles;
+        return (elements * workPerElement) / Math.Max(1.0, _machine.Compute.ElementwiseElementsPerCycle);
     }
 
     private (long M, long N, long K) GetMatMulLogicalShape(MatMulOpCostQuery query, long[] lhsShape, long[] outputShape)
@@ -166,20 +179,21 @@ public sealed class TritonTargetOpCostModel : ITargetOpCostModel, IHierarchicalT
 
     private double EstimateMatMulComputeCycles(long m, long n, long k, double batch, DataType lhsDType, DataType rhsDType, DataType outputDType, bool useDotInstructions)
     {
-        if (useDotInstructions && CanUseDotInstruction(lhsDType, rhsDType, outputDType))
+        var simtCycles = EstimateSimtMatMulComputeCycles(m, n, k, batch);
+        if (useDotInstructions)
         {
-            var candidates = new[] { _capability.Mma, _capability.Wgmma }
-                .Where(instruction => instruction.IsSupported)
+            var candidates = _machine.Compute.MatrixPrimitives
+                .Where(instruction => instruction.Supports(lhsDType, rhsDType))
                 .Select(instruction => EstimateDotInstructionCycles(instruction, m, n, k, batch))
                 .Where(double.IsFinite)
                 .ToArray();
             if (candidates.Length > 0)
             {
-                return candidates.Min();
+                return Math.Min(simtCycles, candidates.Min());
             }
         }
 
-        return Math.Max(0, m) * Math.Max(0, n) * Math.Max(0, k) * batch;
+        return simtCycles;
     }
 
     private double EstimateSimtMatMulComputeCycles(long m, long n, long k, double batch)
@@ -201,7 +215,7 @@ public sealed class TritonTargetOpCostModel : ITargetOpCostModel, IHierarchicalT
         }
 
         var workItems = paddedM * paddedN * paddedK * batch;
-        return workItems / Math.Max(1.0, _capability.SimtFmaPerCyclePerBlock);
+        return workItems / Math.Max(1.0, _machine.Compute.SimtFmaPerCycle);
     }
 
     private long EstimateReductionLaneCount(long lhsLanes, long rhsLanes, long outputLanes)
@@ -236,7 +250,7 @@ public sealed class TritonTargetOpCostModel : ITargetOpCostModel, IHierarchicalT
         return dimension > (long.MaxValue / lanes) ? long.MaxValue : dimension * lanes;
     }
 
-    private double EstimateDotInstructionCycles(TritonDotInstructionCapability instruction, long m, long n, long k, double batch)
+    private double EstimateDotInstructionCycles(MatrixComputePrimitiveSpec instruction, long m, long n, long k, double batch)
     {
         if (instruction.M <= 0 || instruction.N <= 0 || instruction.K <= 0 || instruction.InstructionsPerCyclePerBlock <= 0)
         {
@@ -250,24 +264,8 @@ public sealed class TritonTargetOpCostModel : ITargetOpCostModel, IHierarchicalT
         return blockTiles * kTiles / instruction.InstructionsPerCyclePerBlock;
     }
 
-    private bool CanUseDotInstruction(DataType lhsDType, DataType rhsDType, DataType outputDType)
-    {
-        lhsDType = GetScalarDType(lhsDType);
-        rhsDType = GetScalarDType(rhsDType);
-        outputDType = GetScalarDType(outputDType);
-
-        if (lhsDType != rhsDType)
-        {
-            return false;
-        }
-
-        return lhsDType == DataTypes.Float16
-            || lhsDType == DataTypes.BFloat16
-            || lhsDType == DataTypes.Float8E4M3
-            || lhsDType == DataTypes.Float8E5M2
-            || lhsDType == DataTypes.Int8
-            || (lhsDType == DataTypes.Float32 && outputDType == DataTypes.Float32 && _capability.UseTensorCoresForFloat32);
-    }
+    private static double GetMemoryLatency(double bytes, TargetMemorySpaceSpec memorySpace)
+        => bytes > 0 ? memorySpace.LatencyCycles : 0;
 
     private DataType GetScalarDType(DataType dtype) => dtype switch
     {
@@ -319,7 +317,7 @@ public sealed class TritonTargetOpCostModel : ITargetOpCostModel, IHierarchicalT
     {
         if (TryGetMaxShape(tensor, out var shape))
         {
-            elements = Product(shape);
+            elements = Product(shape) * GetVectorLaneCount(tensor.DType);
             return true;
         }
 

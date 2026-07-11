@@ -17,9 +17,9 @@ public class CUDAModuleCompiler : INTTModuleCompiler
 
     public MaskVectorStyle MaskVectorStyle => MaskVectorStyle.Fat;
 
-    public int Lane => 16;
+    public int GetLane(CompileOptions options) => GetMachine(options).Execution.VectorWidthBits / 8;
 
-    public int Nr => 4;
+    public int GetNr(CompileOptions options) => GetMachine(options).Execution.MatMulNr;
 
     public IModuleBuilder CreateModuleBuilder(CompileOptions options) => new NTTModuleBuilder(ModuleKind, options);
 
@@ -31,4 +31,9 @@ public class CUDAModuleCompiler : INTTModuleCompiler
             _ => false,
         };
     }
+
+    private static TargetMachineModel GetMachine(CompileOptions options)
+        => options.TargetOptions is ITargetMachineModelProvider provider
+            ? provider.TargetMachineModel
+            : throw new InvalidOperationException("CUDA compilation requires a resolved target machine model.");
 }

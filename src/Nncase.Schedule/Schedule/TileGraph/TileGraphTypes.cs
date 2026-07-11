@@ -108,10 +108,13 @@ public sealed class TileGrid : ITileable
         DomainBounds = ImmutableArray.CreateRange(domainBounds);
         DomainBoundExprs = ImmutableArray.CreateRange(domainBoundsExpr);
         BufferShapes = ImmutableArray.CreateRange(bufferShapes.Select(x => ImmutableArray.CreateRange(x)));
+        BufferDataTypes = ImmutableArray.CreateRange(grid.Accesses.ToArray().Select(access => access.Buffer.CheckedDataType));
         var domainRank = grid.Accesses.ToArray().First(access => access.IsAffine).AffineMap.Domains.Length;
         AccessMaps = ImmutableArray.CreateRange(grid.Accesses.ToArray().Select(access => access.IsAffine
             ? access.AffineMap
             : AffineMap.FromCallable((_, _) => Array.Empty<AffineRange>(), domainRank, 0)));
+        TileAxisPolicies = ImmutableArray.CreateRange(grid.TileAxisPolicies);
+        LocalAccessEffects = new GridMemoryEffectAnalysis().Analyze(grid);
         ReadAccessIndices = ImmutableArray.CreateRange(Enumerable.Range(0, grid.Accesses.Length).Where(index => grid.Accesses[index].IsRead));
         WriteAccessIndices = ImmutableArray.CreateRange(Enumerable.Range(0, grid.Accesses.Length).Where(index => grid.Accesses[index].IsWrite));
     }
@@ -136,7 +139,13 @@ public sealed class TileGrid : ITileable
 
     public ImmutableArray<ImmutableArray<long>> BufferShapes { get; }
 
+    public ImmutableArray<DataType> BufferDataTypes { get; }
+
     public ImmutableArray<AffineMap> AccessMaps { get; }
+
+    public ImmutableArray<GridTileAxisPolicy> TileAxisPolicies { get; }
+
+    public ImmutableArray<MemoryEffect> LocalAccessEffects { get; }
 
     public ImmutableArray<int> ReadAccessIndices { get; }
 
@@ -152,7 +161,7 @@ public sealed class TileGrid : ITileable
         ? 0
         : Grid.Accesses[i].Buffer.CheckedDataType.SizeInBytes;
 
-    public MicroKernelInfo GetKernelInfo(ITargetOptions targetOptions) => CompilerServices.GetOpMicroKernelInfo(Op, new(Op, AccessMaps, BufferShapes, targetOptions));
+    public TileWorkload GetTileWorkload() => CompilerServices.GetTileWorkload(Op, new(Op, BufferShapes, BufferDataTypes));
 
     public override string ToString()
     {

@@ -1,6 +1,6 @@
 import triton
 import triton.language as tl
-{% if needs_grid_barrier %}
+{% if needs_tle %}
 import triton.experimental.tle.language as tle
 {% endif %}
 from triton.language.extra import libdevice

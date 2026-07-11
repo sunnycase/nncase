@@ -9,27 +9,16 @@ using Nncase.TIR.NTT;
 
 namespace Nncase.Evaluator.TIR.NTT;
 
-public sealed class CompareEvaluator : ITypeInferencer<Compare>, IKernelInfoEvaluator<Compare>
+public sealed class CompareEvaluator : ITypeInferencer<Compare>, ITileWorkloadEvaluator<Compare>
 {
     public IRType Visit(ITypeInferenceContext context, Compare target)
     {
         return TupleType.Void;
     }
 
-    public MicroKernelInfo Visit(Compare op, MicroKernelContext context)
-    {
-        var domain = context.AccessMaps[0].Domains;
-        var primitives = Enumerable.Repeat(1, domain.Length).ToArray();
-        var tilebounds = Enumerable.Repeat(new ValueRange<long>(1, int.MaxValue), domain.Length).ToArray();
-        var bufferInfos = new MicroKernelBufferInfo[context.BufferShapes.Length];
-        var opt = (INTTTargetOptions)context.TargetOptions;
-        bufferInfos[0] = new(opt.MemoryBandWidths[1], opt.MemoryBandWidths[1], MicroKernelBufferInfo.BufferState.Read);
-        bufferInfos[1] = new(opt.MemoryBandWidths[1], opt.MemoryBandWidths[1], MicroKernelBufferInfo.BufferState.Read);
-        bufferInfos[2] = new(opt.MemoryBandWidths[1], opt.MemoryBandWidths[1], MicroKernelBufferInfo.BufferState.Write);
-        return new MicroKernelInfo(tilebounds, bufferInfos, GetComputeCycle);
-    }
+    public TileWorkload Visit(Compare op, TileWorkloadContext context) => new ElementwiseTileWorkload(GetComputeWork);
 
-    private static IntExpr GetComputeCycle(IntExpr[][] bufferShapes, Solver solver, MicroKernelContext context)
+    private static IntExpr GetComputeWork(IntExpr[][] bufferShapes, Solver solver, TileWorkloadContext context)
     {
         var factor = System.Math.Min(context.BufferShapes[0][^1], 32);
         return factor * (1 + solver.MakeIsLessVar(bufferShapes[0][^1], solver.MakeIntConst(factor)));

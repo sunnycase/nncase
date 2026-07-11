@@ -25,9 +25,10 @@ public partial class NTTAffineSelectionPass
         var kvcacheShape = kvcache.CheckedShape;
         var outputShape = output.CheckedShape;
         var rank = outputShape.Rank;
+        var tileAxisPolicies = Enumerable.Repeat(GridTileAxisPolicy.FullExtent, rank).ToArray();
 
         return IR.F.Affine.Grid()
-            .Domain(rank, out var _)
+            .Domain(tileAxisPolicies, out var _)
             .Read(kvcache, AffineMap.FromCallable((dims, syms) => [], rank, 0), out var inTile)
             .Write(output, AffineMap.Identity(rank), out var outTile)
             .Body(TIR.F.NTT.GetPositionIds(inTile, outTile, (DistributedType)output.CheckedType))

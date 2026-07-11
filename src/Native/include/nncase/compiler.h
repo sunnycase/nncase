@@ -301,13 +301,11 @@ typedef struct {
     void (*cpu_target_options_set_hierarchy_sizes)(clr_object_handle_t handle, int64_t* value, size_t shape0);
     void (*cpu_target_options_set_hierarchy_latencies)(clr_object_handle_t handle, int32_t* value, size_t shape0);
     void (*cpu_target_options_set_hierarchy_band_widths)(clr_object_handle_t handle, int32_t* value, size_t shape0);
-    void (*cpu_target_options_set_memory_capacities)(clr_object_handle_t handle, int32_t* value, size_t shape0);
-    void (*cpu_target_options_set_memory_band_widths)(clr_object_handle_t handle, int32_t* value, size_t shape0);
+    void (*cpu_target_options_set_target_machine)(clr_object_handle_t handle, const char* value, size_t length);
     void (*cpu_target_options_set_distributed_scheme)(clr_object_handle_t handle, const char* value, size_t length);
     void (*cpu_target_options_set_custom_op_scheme)(clr_object_handle_t handle, const char* value, size_t length);
     clr_object_handle_t (*pyntt_target_options_create)();
     void (*pyntt_target_options_set_backend)(clr_object_handle_t handle, const char* value, size_t length);
-    void (*pyntt_target_options_set_triton_capability)(clr_object_handle_t handle, const char* value, size_t length);
     void (*pyntt_target_options_set_output_directory)(clr_object_handle_t handle, const char* value, size_t length);
     void (*pyntt_target_options_set_strict)(clr_object_handle_t handle, uint8_t value);
     /* end the auto generated block by tools/stackvm_gen/CApiGen at 12/20/2024 3:41:05 PM +08:00. */
@@ -772,26 +770,8 @@ class cpu_target_options : public clr_object_base {
         nncase_clr_api()->cpu_target_options_set_hierarchy_band_widths(obj_.get(), values.data(), shape0);
     }
 
-    void memory_capacities(std::vector<int> value) {
-        std::vector<int> values;
-        size_t shape0;
-        shape0 = value.size();
-        for (size_t i0 = 0; i0 < shape0; i0++) {
-          values.push_back(value[i0]);
-        }
-
-        nncase_clr_api()->cpu_target_options_set_memory_capacities(obj_.get(), values.data(), shape0);
-    }
-
-    void memory_band_widths(std::vector<int> value) {
-        std::vector<int> values;
-        size_t shape0;
-        shape0 = value.size();
-        for (size_t i0 = 0; i0 < shape0; i0++) {
-          values.push_back(value[i0]);
-        }
-
-        nncase_clr_api()->cpu_target_options_set_memory_band_widths(obj_.get(), values.data(), shape0);
+    void target_machine(std::string_view value) {
+        nncase_clr_api()->cpu_target_options_set_target_machine(obj_.get(), value.data(), value.length());
     }
 
     void distributed_scheme(std::string_view value) {
@@ -813,10 +793,6 @@ class pyntt_target_options : public cpu_target_options {
 
     void backend(std::string_view value) {
         nncase_clr_api()->pyntt_target_options_set_backend(obj_.get(), value.data(), value.length());
-    }
-
-    void triton_capability(std::string_view value) {
-        nncase_clr_api()->pyntt_target_options_set_triton_capability(obj_.get(), value.data(), value.length());
     }
 
     void output_directory(std::string_view value) {

@@ -63,7 +63,13 @@ public sealed class OpNode : ITreeNode
 
     public ImmutableArray<ImmutableArray<long>> BufferShapes => _wrapped.BufferShapes;
 
+    public ImmutableArray<DataType> BufferDataTypes => _wrapped.BufferDataTypes;
+
     public ImmutableArray<AffineMap> AccessMaps => _wrapped.AccessMaps;
+
+    public ImmutableArray<GridTileAxisPolicy> TileAxisPolicies => _wrapped.TileAxisPolicies;
+
+    public ImmutableArray<MemoryEffect> LocalAccessEffects => _wrapped.LocalAccessEffects;
 
     public ImmutableArray<int> ReadAccessIndices => _wrapped.ReadAccessIndices;
 
@@ -77,9 +83,9 @@ public sealed class OpNode : ITreeNode
 
     public long GetBufferElemSize(int i) => _wrapped.GetBufferElemSize(i);
 
-    public MicroKernelContext GetMicroKernelContext(ITargetOptions targetOptions) => new(Op, AccessMaps, BufferShapes, targetOptions);
+    public TileWorkloadContext GetTileWorkloadContext() => new(Op, BufferShapes, BufferDataTypes);
 
-    public MicroKernelInfo GetKernelInfo(ITargetOptions targetOptions) => CompilerServices.GetOpMicroKernelInfo(Op, GetMicroKernelContext(targetOptions));
+    public TileWorkload GetTileWorkload() => CompilerServices.GetTileWorkload(Op, GetTileWorkloadContext());
 
     public TReturn Accept<TArg1, TReturn>(ITreeNodeVisitor<TArg1, TReturn> visitor, TArg1 arg1) => visitor.Visit(this, arg1);
 

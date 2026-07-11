@@ -33,8 +33,11 @@ public partial class NTTAffineSelectionPass
         }
 
         var affinemap = new AffineMap(domains, default, results);
+        var tileAxisPolicies = Enumerable.Range(0, rank)
+            .Select(axis => actualPadAxes.Contains(axis) ? GridTileAxisPolicy.Search() : GridTileAxisPolicy.FullExtent)
+            .ToArray();
         return IR.F.Affine.Grid()
-            .Domain(rank, out var _)
+            .Domain(tileAxisPolicies, out var _)
             .Read(input, affinemap, out var intile)
             .Write(output, AffineMap.Identity(rank), out var outTile)
             .Body(TIR.F.NTT.Pad(intile, outTile, (Paddings)call[Pad.Pads], ((TensorConst)call[Pad.Value]).Value.ToScalar<float>(), actualPadAxes))

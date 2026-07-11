@@ -4,10 +4,10 @@
 using System.Diagnostics;
 using System.Text.RegularExpressions;
 using Google.OrTools.ConstraintSolver;
+using Nncase.Graphs;
 using Nncase.IR;
 using Nncase.IR.Affine;
 using Nncase.IR.Tensors;
-using Nncase.Graphs;
 using QuikGraph;
 using QuikGraph.Graphviz;
 
@@ -144,7 +144,7 @@ public static class GraphExtensions
     internal static bool IsFusionLegal(TileGrid producer, TileGrid consumer, int consumerAccessIndex)
     {
         var consumerRead = consumer.Grid.Accesses[consumerAccessIndex];
-        if (HasChipMemoryEffect(consumer.Grid, consumerRead.Parameter, MemoryAccessMode.Read))
+        if (HasChipMemoryEffect(consumer, consumerAccessIndex, MemoryAccessMode.Read))
         {
             return false;
         }
@@ -152,40 +152,10 @@ public static class GraphExtensions
         var producerOutputIndex = GetProducerOutputIndex(consumerRead.Value, producer);
         var producerWrite = producer.Grid.Accesses[producer.GetWriteAccessIndex(producerOutputIndex)];
         return producerWrite.BindingMode != GridBindingMode.Root ||
-            !HasChipMemoryEffect(producer.Grid, producerWrite.Parameter, MemoryAccessMode.Write);
-    }
+            !HasChipMemoryEffect(producer, producer.GetWriteAccessIndex(producerOutputIndex), MemoryAccessMode.Write);
 
-    private static bool HasChipMemoryEffect(Grid grid, Var parameter, MemoryAccessMode mode)
-    {
-        foreach (var call in ExprCollector.Collect(grid.Body).OfType<Call>())
-        {
-            if (call.Target is not Op)
-            {
-                continue;
-            }
-
-            var hasEffect = false;
-            call.ParametersForeach((argument, parameterInfo) =>
-            {
-                if (!hasEffect &&
-                    parameterInfo.MemoryEffect is { Scope: MemoryAccessScope.Chip } effect &&
-                    effect.Mode.HasFlag(mode) &&
-                    References(argument, parameter))
-                {
-                    hasEffect = true;
-                }
-            });
-            if (hasEffect)
-            {
-                return true;
-            }
-        }
-
-        return false;
-
-        static bool References(BaseExpr expression, BaseExpr target)
-            => ReferenceEquals(expression, target) ||
-                ExprCollector.Collect(expression).Any(item => ReferenceEquals(item, target));
+        static bool HasChipMemoryEffect(TileGrid grid, int accessIndex, MemoryAccessMode mode)
+            => grid.LocalAccessEffects[accessIndex] is { Scope: MemoryAccessScope.Chip } effect && effect.Mode.HasFlag(mode);
     }
 
     public static List<MergePoint> GetMergePoints(this TieredTileGraph graph)

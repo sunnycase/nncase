@@ -408,11 +408,6 @@ public sealed class BoxingEvaluator : ITypeInferencer<Boxing>, ICostEvaluator<Bo
     private static bool TryGetTargetBoxingCost(ITargetOpCostModel targetCostModel, IRType inputType, IRType outputType, out Cost cost)
     {
         cost = Cost.Zero;
-        if (ReferenceEquals(targetCostModel, DefaultTargetOpCostModel.Instance))
-        {
-            return false;
-        }
-
         return (inputType, outputType) switch
         {
             (TensorType inputTensor, DistributedType outputDistributed) =>

@@ -576,6 +576,7 @@ internal sealed class ILPrintVisitor : ExprFunctor<string, string>
 
         using (IndentScope())
         {
+            _writer.WInd().WriteLine($"TileAxes: [{string.Join(", ", expr.TileAxisPolicies)}]");
             _writer.WInd().WriteLine("Accesses:");
             using (IndentScope())
             {

@@ -11,8 +11,16 @@ using Nncase.CostModel;
 
 namespace Nncase.Targets;
 
-public class NTTTargetOptions : INTTTargetOptions, ITargetOpCostModelProvider
+public class NTTTargetOptions : INTTTargetOptions, ITargetOpCostModelProvider, ITargetMachineModelProvider
 {
+    private string _targetMachine = NTTTargetMachineCatalog.CpuGeneric;
+    private TargetMachineModel _targetMachineModel = NTTTargetMachineCatalog.Resolve(NTTTargetMachineCatalog.CpuGeneric);
+
+    public NTTTargetOptions()
+    {
+        TargetCostModel = new DefaultTargetOpCostModel(_targetMachineModel);
+    }
+
     [DisplayName("--model-name")]
     [Description("the input model name.")]
     [DefaultValue("")]
@@ -75,17 +83,29 @@ public class NTTTargetOptions : INTTTargetOptions, ITargetOpCostModelProvider
     [CommandLine.AllowMultiplePerToken]
     public int[] HierarchyBandWidths { get; set; } = new[] { 1 };
 
-    [DisplayName("--memory-capacities")]
-    [Description("the memory capacity of single core. eg. `32 64` for sram,main")]
-    [DefaultValue("() => new int[] { 524288, 2147483647 }")]
-    [CommandLine.AllowMultiplePerToken]
-    public int[] MemoryCapacities { get; set; } = new[] { 524288, int.MaxValue };
+    [DisplayName("--target-machine")]
+    [Description("the canonical target machine model used by cost evaluation and AutoTiling.")]
+    [DefaultValue(NTTTargetMachineCatalog.CpuGeneric)]
+    public string TargetMachine
+    {
+        get => _targetMachine;
+        set
+        {
+            var model = NTTTargetMachineCatalog.Resolve(value);
+            TargetMachineModel = model;
+        }
+    }
 
-    [DisplayName("--memory-bandwidths")]
-    [Description("the memory bandwidth of single core. eg. `64 8` for sram,main")]
-    [DefaultValue("() => new int[] { 64, 8 }")]
-    [CommandLine.AllowMultiplePerToken]
-    public int[] MemoryBandWidths { get; set; } = new[] { 64, 8 };
+    public TargetMachineModel TargetMachineModel
+    {
+        get => _targetMachineModel;
+        set
+        {
+            _targetMachineModel = value ?? throw new ArgumentNullException(nameof(value));
+            _targetMachine = value.Id;
+            OnTargetMachineChanged();
+        }
+    }
 
     [DisplayName("--distributed--scheme")]
     [Description("the distributed scheme path.")]
@@ -97,5 +117,10 @@ public class NTTTargetOptions : INTTTargetOptions, ITargetOpCostModelProvider
     [DefaultValue("")]
     public string CustomOpScheme { get; set; } = string.Empty;
 
-    public ITargetOpCostModel TargetCostModel { get; set; } = DefaultTargetOpCostModel.Instance;
+    public ITargetOpCostModel TargetCostModel { get; set; }
+
+    protected virtual void OnTargetMachineChanged()
+    {
+        TargetCostModel = new DefaultTargetOpCostModel(TargetMachineModel);
+    }
 }

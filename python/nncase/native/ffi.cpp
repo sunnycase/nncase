@@ -343,13 +343,9 @@ PYBIND11_MODULE(_nncase, m) {
         []() {},
         py::overload_cast<std::vector<int>>(&cpu_target_options::hierarchy_band_widths))
       .def_property(
-        "MemoryCapacities",
+        "TargetMachine",
         []() {},
-        py::overload_cast<std::vector<int>>(&cpu_target_options::memory_capacities))
-      .def_property(
-        "MemoryBandWidths",
-        []() {},
-        py::overload_cast<std::vector<int>>(&cpu_target_options::memory_band_widths))
+        py::overload_cast<std::string_view>(&cpu_target_options::target_machine))
       .def_property(
         "DistributedScheme",
         []() {},
@@ -365,10 +361,6 @@ PYBIND11_MODULE(_nncase, m) {
         "Backend",
         []() {},
         py::overload_cast<std::string_view>(&pyntt_target_options::backend))
-      .def_property(
-        "TritonCapability",
-        []() {},
-        py::overload_cast<std::string_view>(&pyntt_target_options::triton_capability))
       .def_property(
         "OutputDirectory",
         []() {},

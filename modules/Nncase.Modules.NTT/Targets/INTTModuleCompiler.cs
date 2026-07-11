@@ -13,7 +13,7 @@ namespace Nncase.Targets;
 
 public interface INTTModuleCompiler : IModuleCompiler
 {
-    int Lane { get; }
+    int GetLane(CompileOptions options);
 
-    int Nr { get; }
+    int GetNr(CompileOptions options);
 }

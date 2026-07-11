@@ -40,9 +40,11 @@ public partial class NTTAffineSelectionPass
         }
 
         var sinCosMap = new AffineMap(domains, default, sinCosResults);
+        var tileAxisPolicies = Enumerable.Repeat(GridTileAxisPolicy.Search(), rank).ToArray();
+        tileAxisPolicies[^2] = GridTileAxisPolicy.FullExtent;
 
         return IR.F.Affine.Grid()
-            .Domain(rank, out var _)
+            .Domain(tileAxisPolicies, out var _)
             .Read(input, inOutMap, out var inTile)
             .Read(sin, sinCosMap, out var sinTile)
             .Read(cos, sinCosMap, out var cosTile)

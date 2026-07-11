@@ -278,7 +278,6 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
                         continue;
                     }
 
-                    var kernelInfo = bid.Node.GetKernelInfo(TargetOptions);
                     var partialShape = PartialShapeFromDomain(parentDomain, value.DomainRelation, tiledChildDomain, bufferInfo.Map, (uint)ci, paramDimMap);
 
                     var viewInfo = GetViewInfo(sl, value, bid, bufferInfo.Map, forwardOffsets[ci], partialShape);
@@ -294,12 +293,13 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
                         var localBuilder = ci < loopVars.Length ? cntBuilder : childBuilders[FetchBidOwnerIndex(value, bid)];
                         if (bid.Access.BindingMode == GridBindingMode.Subview && !TargetOptions.UnifiedMemoryArch && viewInfo.Parent is ViewInfo parentViewInfo)
                         {
-                            if (!bid.IsOutput && kernelInfo.BufferInfos[bid.Index].State.HasFlag(MicroKernelBufferInfo.BufferState.Read))
+                            var localEffect = bid.Node.LocalAccessEffects[bid.Index];
+                            if (!bid.IsOutput && localEffect.Mode.HasFlag(MemoryAccessMode.Read))
                             {
                                 localBuilder.Body(T.Memcopy(viewInfo.ViewVar!, IR.F.Buffer.BufferSubview(parentViewInfo.ViewVar ?? parentViewInfo.Buffer, viewInfo.LocalOffsets, viewInfo.Shape)));
                             }
 
-                            if (bid.IsOutput && kernelInfo.BufferInfos[bid.Index].State.HasFlag(MicroKernelBufferInfo.BufferState.Write))
+                            if (bid.IsOutput && localEffect.Mode.HasFlag(MemoryAccessMode.Write))
                             {
                                 localBuilder.Tail(T.Memcopy(IR.F.Buffer.BufferSubview(parentViewInfo.ViewVar ?? parentViewInfo.Buffer, viewInfo.LocalOffsets, viewInfo.Shape), viewInfo.ViewVar!));
                             }
@@ -399,7 +399,8 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
                 if (info.Size > 0)
                 {
                     var x = model.NewFixedSizeIntervalVar(info.Liveness.Item1, info.Liveness.Item2 - info.Liveness.Item1, $"x{count}");
-                    var ystart = model.NewIntVar(0, TargetOptions.MemoryCapacities[level] - info.Size, $"ystart{count}");
+                    var memorySpace = TargetOptions.TargetMachineModel.TilingMemorySpaces[level];
+                    var ystart = model.NewIntVar(0, memorySpace.CapacityBytes - info.Size, $"ystart{count}");
                     var align = key.Id.Node.GetBufferElemSize(key.Id.Index);
                     if (ModuleKind == "xpu")
                     {
@@ -493,7 +494,9 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
             var info = LevelNodeBufferInfos[storeLevel][new NodeWithBuffer(tileNode, bid)];
             var alignment = tensorType.DType.SizeInBytes;
             var strides = info.Strides.Select(i => (Dimension)i).ToArray(); // using fixed strides.
-            var physicalBuffer = new PhysicalBuffer(alignment, Tensor.FromPointer(info.Offset, tensorType.DType), info.Size, MemoryLocation.Cache, storeLevel);
+            var binding = TargetOptions.TargetMachineModel.TilingMemorySpaces[storeLevel].TIRBinding
+                ?? throw new InvalidOperationException($"Target tiling memory level {storeLevel} has no TIR binding.");
+            var physicalBuffer = new PhysicalBuffer(alignment, Tensor.FromPointer(info.Offset, tensorType.DType), info.Size, binding.Location, binding.Hierarchy);
             return new TIR.Buffer($"{bid}", tensorType.DType, new MemSpan(physicalBuffer), shape.Dimensions.ToArray(), strides, distributedType);
         }
 
@@ -591,7 +594,9 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
             var info = LevelNodeBufferInfos[storeLevel][new NodeWithBuffer(node, bid)];
             var alignment = tensorType.DType.SizeInBytes;
             var strides = info.Strides.Select(i => (Dimension)i).ToArray();
-            var physicalBuffer = new PhysicalBuffer(alignment, Tensor.FromPointer(info.Offset, tensorType.DType), info.Size, MemoryLocation.Cache, storeLevel);
+            var binding = TargetOptions.TargetMachineModel.TilingMemorySpaces[storeLevel].TIRBinding
+                ?? throw new InvalidOperationException($"Target tiling memory level {storeLevel} has no TIR binding.");
+            var physicalBuffer = new PhysicalBuffer(alignment, Tensor.FromPointer(info.Offset, tensorType.DType), info.Size, binding.Location, binding.Hierarchy);
             return new TIR.Buffer($"{bid}", tensorType.DType, new MemSpan(physicalBuffer), shape.Dimensions.ToArray(), strides, distributedType);
         }
 

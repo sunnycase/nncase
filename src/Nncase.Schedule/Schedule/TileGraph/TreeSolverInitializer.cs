@@ -3,6 +3,7 @@
 
 using Google.OrTools.ConstraintSolver;
 using NetFabric.Hyperlinq;
+using Nncase.IR;
 using Nncase.IR.Affine;
 using QuikGraph;
 using QuikGraph.Graphviz;
@@ -44,7 +45,18 @@ public sealed class TreeSolverInitializer : TreeSolverBase<IntExpr>, ITreeNodeVi
             dimsMap.Clear();
         }
 
-        var tileVars = Enumerable.Range(0, value.DomainRelation.Map.Results.Length).Select(n => Solver.MakeIntVar(1, int.MaxValue, $"op{value.OpId}_d{n}_L{value.Level}")).ToArray();
+        var domainBounds = GetDomainBounds(value);
+        if (domainBounds.Length != value.DomainRelation.Map.Results.Length)
+        {
+            throw new InvalidOperationException(
+                $"Tile node Op{value.OpId}@{value.Level} has {value.DomainRelation.Map.Results.Length} domain results, but {domainBounds.Length} domain bounds.");
+        }
+
+        // TileNode variables are exact hierarchy decomposition factors. Hardware
+        // kernel tile extents belong to OpNode and use power-of-two domains below.
+        var tileVars = domainBounds
+            .Select((bound, n) => Solver.MakeIntVar(1, bound, $"op{value.OpId}_d{n}_L{value.Level}"))
+            .ToArray();
         var forwardExtents = tileVars.Cast<IntExpr>().ToArray();
         if (!TileableNodeMemo.TryGetValue(value, out var dimInfo))
         {
@@ -53,10 +65,16 @@ public sealed class TreeSolverInitializer : TreeSolverBase<IntExpr>, ITreeNodeVi
                 forwardExtents[k] *= pvars[v];
             }
 
+            for (int i = 0; i < forwardExtents.Length; i++)
+            {
+                forwardExtents[i].SetRange(1, domainBounds[i]);
+            }
+
             TileableNodeMemo.Add(value, new(tileVars, forwardExtents, dimsMap));
         }
 
         var tripCounts = new IntExpr[tileVars.Length + 1];
+        var domainVolume = GetDomainVolume(domainBounds, value);
         if (pvars.Any())
         {
             tripCounts[0] = ptrips;
@@ -69,6 +87,7 @@ public sealed class TreeSolverInitializer : TreeSolverBase<IntExpr>, ITreeNodeVi
         for (int i = 0; i < tileVars.Length; i++)
         {
             tripCounts[1 + i] = tripCounts[i] * tileVars[i];
+            tripCounts[1 + i].SetRange(1, domainVolume);
         }
 
         InitResult childResult;
@@ -94,7 +113,7 @@ public sealed class TreeSolverInitializer : TreeSolverBase<IntExpr>, ITreeNodeVi
             childResult = new(results.ToArray(), childDefUseMap, names.ToArray(), extents.ToArray());
         }
 
-        var backWardExtents = GetBackWardExtents(tileVars, childResult.DimsMaps, childResult.BackWardExtents);
+        var backWardExtents = GetBackWardExtents(tileVars, childResult.DimsMaps, childResult.BackWardExtents, domainBounds);
 
         // {def bid : use bid}
         var defUseMap = BufferGraphMemo[value.Wrapped].Edges.Where(e => e.Tag == BufferEdgeKind.Inter).ToBiDictionary(e => e.Source, e => e.Target);
@@ -153,13 +172,47 @@ public sealed class TreeSolverInitializer : TreeSolverBase<IntExpr>, ITreeNodeVi
     {
         var (pid, pvars, ptrips) = context;
         var dimsMap = GetDimsMap(value);
-        var tileVars = Enumerable.Range(0, value.DomainBounds.Length).Select(n => Solver.MakeIntVar(1, long.MaxValue, $"op{value.OpId}_d{n}")).ToArray();
+        if (value.TileAxisPolicies.Length != value.DomainBounds.Length)
+        {
+            throw new InvalidOperationException(
+                $"Grid for {value.Op.GetType().Name} exposes {value.TileAxisPolicies.Length} tile-axis policies for a rank-{value.DomainBounds.Length} domain.");
+        }
 
-        var kernelInfo = value.GetKernelInfo(TargetOptions);
-
+        var tileVars = new IntVar[value.DomainBounds.Length];
         for (int i = 0; i < tileVars.Length; i++)
         {
-            tileVars[i].SetRange(kernelInfo.TileBounds[i].Min, kernelInfo.TileBounds[i].Max);
+            var domainBound = value.DomainBounds[i];
+            var policy = value.TileAxisPolicies[i];
+            switch (policy.ExtentKind)
+            {
+                case GridTileExtentKind.Search:
+                    var powerOfTwoExtents = GetPowerOfTwoExtents(1, domainBound)
+                        .Where(extent => extent % policy.Alignment == 0)
+                        .ToArray();
+                    if (powerOfTwoExtents.Length == 0)
+                    {
+                        throw new InvalidOperationException(
+                            $"Grid Op{value.OpId} axis {i} has no power-of-two tile extent up to {domainBound} aligned to {policy.Alignment}.");
+                    }
+
+                    tileVars[i] = Solver.MakeIntVar(powerOfTwoExtents[0], powerOfTwoExtents[^1], $"op{value.OpId}_d{i}");
+                    Solver.Add(Solver.MakeMemberCt(tileVars[i], powerOfTwoExtents));
+                    break;
+                case GridTileExtentKind.FullExtent:
+                    tileVars[i] = Solver.MakeIntConst(domainBound).Var();
+                    break;
+                case GridTileExtentKind.Fixed:
+                    if (policy.Extent > domainBound)
+                    {
+                        throw new InvalidOperationException(
+                            $"Grid Op{value.OpId} axis {i} fixes tile extent {policy.Extent}, larger than domain bound {domainBound}.");
+                    }
+
+                    tileVars[i] = Solver.MakeIntConst(policy.Extent).Var();
+                    break;
+                default:
+                    throw new ArgumentOutOfRangeException(nameof(value), policy, "Unsupported grid tile-axis policy.");
+            }
         }
 
         // cache the primitive buffer shape and sizes.
@@ -231,13 +284,73 @@ public sealed class TreeSolverInitializer : TreeSolverBase<IntExpr>, ITreeNodeVi
         return new(bufferResults.ToArray(), new(), new[] { dimsMap }, new IntExpr[][] { tileVars.Cast<IntExpr>().ToArray() });
     }
 
+    private static long[] GetPowerOfTwoExtents(long min, long max)
+    {
+        if (min <= 0 || max < min)
+        {
+            throw new InvalidOperationException($"Invalid tile extent range [{min}, {max}].");
+        }
+
+        var values = new List<long>();
+        var value = 1L;
+        while (value <= max)
+        {
+            if (value >= min)
+            {
+                values.Add(value);
+            }
+
+            if (value > long.MaxValue / 2)
+            {
+                break;
+            }
+
+            value *= 2;
+        }
+
+        if (values.Count == 0)
+        {
+            throw new InvalidOperationException($"Tile extent range [{min}, {max}] contains no power-of-two candidate.");
+        }
+
+        return values.ToArray();
+    }
+
+    private static long[] GetDomainBounds(TileNode tileNode)
+    {
+        var bounds = CompilerServices.GetMaxShape(new RankedShape(tileNode.DomainBoundExprs.ToArray()))
+            .Select(Convert.ToInt64)
+            .ToArray();
+        if (bounds.Any(bound => bound <= 0))
+        {
+            throw new InvalidOperationException(
+                $"Tile node Op{tileNode.OpId}@{tileNode.Level} has a non-positive domain bound [{string.Join(", ", bounds)}].");
+        }
+
+        return bounds;
+    }
+
+    private static long GetDomainVolume(IReadOnlyList<long> bounds, TileNode tileNode)
+    {
+        try
+        {
+            return bounds.Aggregate(1L, checked((volume, bound) => volume * bound));
+        }
+        catch (OverflowException ex)
+        {
+            throw new InvalidOperationException(
+                $"Tile node Op{tileNode.OpId}@{tileNode.Level} domain volume exceeds the 64-bit solver limit.",
+                ex);
+        }
+    }
+
     /// <summary>
     /// Get the backward accumulated domain extents.
     /// backWardExtents[i] contains a extents[domain rank], note the extents[0:i] is not accumulated, extents[i:] is accumulated.
     /// for example. backWardExtents[2] contains extents[3], this extents[0],extents[1] is not accumulated, extents[2] is accumulated.
     /// so backWardExtents[0] means extents[0:domain rank] is accumulated.
     /// </summary>
-    private IntExpr[][] GetBackWardExtents(IntVar[] tileVars, Dictionary<int, int>[] childDimsMaps, IntExpr[][] childBackWardExtents)
+    private IntExpr[][] GetBackWardExtents(IntVar[] tileVars, Dictionary<int, int>[] childDimsMaps, IntExpr[][] childBackWardExtents, IReadOnlyList<long> domainBounds)
     {
         var backWardExtents = new IntExpr[tileVars.Length + 1][];
         bool ProductExtent(IntExpr[] extents, int i)
@@ -275,6 +388,11 @@ public sealed class TreeSolverInitializer : TreeSolverBase<IntExpr>, ITreeNodeVi
             {
                 extents[j] = tileVars[j];
                 ProductExtent(extents, j);
+            }
+
+            for (int j = 0; j < extents.Length; j++)
+            {
+                extents[j].SetRange(1, domainBounds[j]);
             }
         }
 

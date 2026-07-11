@@ -786,8 +786,8 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
             .SelectMany(function => function.GeneratedKernelSource.Kernels)
             .Any(kernel => kernel.Attrs.ContainsKey("requires_grid_barrier"));
         var tritonRuntimeImport = needsGridBarrier
-            ? "from pyntt.runtime.triton import ensure_triton_allocator"
-            : string.Empty;
+            ? "from pyntt.runtime.triton import ensure_triton_allocator, select_and_validate_triton_tuning_parameter"
+            : "from pyntt.runtime.triton import select_and_validate_triton_tuning_parameter";
 
         return $$"""
             from pathlib import Path
@@ -795,7 +795,6 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
             from pyntt.codegen.render import render_generated_kernels
             from pyntt.runtime.interpreter import PyNTTInterpreter
             from pyntt.runtime.tensor import materialize_kv_cache_blocks_per_shard, materialize_kv_cache_metadata, materialize_kv_cache_storage, materialize_kv_cache_tensor_field, resolve_execution_device, view_typed_buffer
-            from pyntt.runtime.tuning import select_tuning_parameter
             {{tritonRuntimeImport}}
             from .rdata import RDATA_BUNDLES
             from .specs import MODULE_SPEC
@@ -973,15 +972,13 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
                 usesChipLocalData = primFunction.SchedResult.ChipLocalDataPoolSize > 0 || chipLocalDataUsage;
 
                 var blockLocalDataUsage = GetWorkspaceUsage(function.SourceFunction, MemoryLocation.BlockLocalData);
-                var cacheUsage = GetWorkspaceUsage(function.SourceFunction, MemoryLocation.Cache);
                 blockLocalDataBytes = new[]
                 {
                     (long)primFunction.SchedResult.BlockLocalDataPoolSize,
                     blockLocalDataUsage.LocalBytes,
-                    cacheUsage.LocalBytes,
                     kernelBlockLocalDataBytes,
                 }.Max();
-                usesBlockLocalData = tirKernels.Length > 0 || primFunction.SchedResult.BlockLocalDataPoolSize > 0 || blockLocalDataUsage.IsReferenced || cacheUsage.IsReferenced || kernelBlockLocalDataBytes > 0;
+                usesBlockLocalData = tirKernels.Length > 0 || primFunction.SchedResult.BlockLocalDataPoolSize > 0 || blockLocalDataUsage.IsReferenced || kernelBlockLocalDataBytes > 0;
             }
 
             var callees = new List<PrimFunction>();
@@ -1590,7 +1587,6 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
             MemoryLocation.Data => context.DataPoolStrideBytes,
             MemoryLocation.ChipLocalData => "0",
             MemoryLocation.BlockLocalData => context.BlockLocalDataPoolStrideBytes,
-            MemoryLocation.Cache => context.BlockLocalDataPoolStrideBytes,
             _ => null,
         };
 
@@ -1924,7 +1920,6 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
             MemoryLocation.Data => RequireWorkspaceName(context.Data, contextName, "data"),
             MemoryLocation.ChipLocalData => RequireWorkspaceName(context.ChipLocalData, contextName, "chip_local_data"),
             MemoryLocation.BlockLocalData => RequireWorkspaceName(context.BlockLocalData, contextName, "block_local_data"),
-            MemoryLocation.Cache => RequireWorkspaceName(context.BlockLocalData, contextName, "block_local_data"),
             MemoryLocation.Rdata => RequireWorkspaceName(context.RData, contextName, "rdata"),
             MemoryLocation.ChipLocalRdata => RequireWorkspaceName(context.ChipLocalRData, contextName, "chip_local_rdata"),
             MemoryLocation.BlockLocalRdata => RequireWorkspaceName(context.BlockLocalRData, contextName, "block_local_rdata"),
@@ -1939,7 +1934,7 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
     private string BuildRuntimeBufferViewSizeExpression(TIR.Buffer buffer, RuntimeDispatchContext context, string contextName)
         => buffer.MemSpan.Buffer.Location switch
         {
-            MemoryLocation.BlockLocalData or MemoryLocation.Cache => BuildBlockLocalDataBackingSizeExpression(context, contextName),
+            MemoryLocation.BlockLocalData => BuildBlockLocalDataBackingSizeExpression(context, contextName),
             _ => BuildRuntimeDimensionExpression(buffer.MemSpan.Size, $"{contextName} buffer {buffer.Name} size"),
         };
 
@@ -2206,12 +2201,19 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
         var blockSize = kernel.Launch.Tuning.Parameters["block_size"];
         var blockSizeCandidates = PythonTuple(blockSize.Candidates.Select(value => value.ToString()));
         var shardCount = kernel.Launch.Sharding.Hierarchy.Aggregate(1, (product, value) => product * value);
-        var isTir = kernel.Attrs.TryGetValue("tir", out var tirValue) && tirValue is bool tirBool && tirBool;
+        var isTir = IsTirKernel(kernel);
         var grid = isTir
             ? $"({Math.Max(shardCount, 1)},)"
             : shardCount > 1
             ? $"({shardCount},)"
             : "((numel + block_size - 1) // block_size,)";
+        var gridBeforeTuning = isTir ? $"        grid = {grid}" : string.Empty;
+        var gridForCandidate = isTir
+            ? "lambda _: grid"
+            : shardCount > 1
+            ? $"lambda _: ({shardCount},)"
+            : "lambda candidate: ((numel + candidate - 1) // candidate,)";
+        var gridAfterTuning = isTir ? string.Empty : $"        grid = {grid}";
         var workspaceSetup = string.Empty;
         var workspaceArgs = Array.Empty<string>();
         var workspaceStrideArgs = Array.Empty<string>();
@@ -2275,13 +2277,16 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
             ? $"from .generated_kernels import {kernel.Name}, PYNTT_GRID_MESH"
             : $"from .generated_kernels import {kernel.Name}";
         var launchStatement = $"        {kernel.Name}[grid]({tensorArgs}, numel, block_size{kwargs})";
+        var kernelArgs = string.IsNullOrWhiteSpace(tensorArgs) ? "(numel,)" : $"({tensorArgs}, numel,)";
+        var tuningSelectionStatement = $"        block_size = select_and_validate_triton_tuning_parameter({PythonString(kernel.Name)}, \"block_size\", {blockSizeCandidates}, source={PythonString(blockSize.Source)}, kernel={kernel.Name}, kernel_args={kernelArgs}, grid_for_candidate={gridForCandidate}, expected_num_warps={kernel.Launch.NumWarps ?? throw new InvalidOperationException($"Generated PyNTT kernel {kernel.Name} must declare a fixed num_warps.")}, worker_width={PythonValue(kernel.Attrs["worker_width"])}, register_capacity_bytes={PythonValue(kernel.Attrs["register_capacity_bytes"])}, shared_memory_capacity_bytes={PythonValue(kernel.Attrs["shared_memory_capacity_bytes"])}, forbid_spills={PythonValue(kernel.Attrs["forbid_spills"])}{kwargs})";
         return $"""
                     {importStatement}
                     numel = {numel}
-                    block_size = select_tuning_parameter({PythonString(kernel.Name)}, "block_size", {blockSizeCandidates}, source={PythonString(blockSize.Source)})
-                    grid = {grid}
+            {gridBeforeTuning}
             {workspaceSetup}
             {tritonRuntimeSetup}
+            {tuningSelectionStatement}
+            {gridAfterTuning}
             {launchStatement}
             {outputAliases}
             """;

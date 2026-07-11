@@ -207,7 +207,7 @@ public interface ICompilerServicesProvider
     /// <returns>Rewrited expression.</returns>
     IEGraph ERewrite(IEGraph expr, IEnumerable<IRewriteRule> rules, RunPassContext options);
 
-    MicroKernelInfo GetOpMicroKernelInfo(Op op, MicroKernelContext context);
+    TileWorkload GetTileWorkload(Op op, TileWorkloadContext context);
 
     Expr SimplifyForDimension(Expr value);
 
@@ -358,7 +358,7 @@ public static class CompilerServices
     /// <returns>Evaluate result.</returns>
     public static Dictionary<BaseExpr, Metric> EvaluateMetric(BaseExpr expr) => Provider.EvaluateMetric(expr);
 
-    public static MicroKernelInfo GetOpMicroKernelInfo(Op op, MicroKernelContext context) => Provider.GetOpMicroKernelInfo(op, context);
+    public static TileWorkload GetTileWorkload(Op op, TileWorkloadContext context) => Provider.GetTileWorkload(op, context);
 
     /// <summary>
     /// Evaluate cost of operator.
@@ -616,7 +616,7 @@ internal class CompilerServicesProvider : ICompilerServicesProvider, ICompilerSe
     private readonly IEGraphMatchProvider _eGraphMatchProvider;
     private readonly IEGraphRewriteProvider _eGraphrewriteProvider;
     private readonly ITargetProvider _targetProvider;
-    private readonly IMicroKernelInfoProvider _microKernelInfoGetter;
+    private readonly ITileWorkloadProvider _tileWorkloadProvider;
 
     public CompilerServicesProvider(
         IEvaluateProvider evaluateProvider,
@@ -631,7 +631,7 @@ internal class CompilerServicesProvider : ICompilerServicesProvider, ICompilerSe
         IEGraphMatchProvider eGraphMatchProvider,
         IEGraphRewriteProvider eGraphrewriteProvider,
         ITargetProvider targetProvider,
-        IMicroKernelInfoProvider microKernelInfoGetter)
+        ITileWorkloadProvider tileWorkloadProvider)
     {
         // _compileOptions = compileOptions.Value;
         _evaluateProvider = evaluateProvider;
@@ -646,7 +646,7 @@ internal class CompilerServicesProvider : ICompilerServicesProvider, ICompilerSe
         _eGraphMatchProvider = eGraphMatchProvider;
         _eGraphrewriteProvider = eGraphrewriteProvider;
         _targetProvider = targetProvider;
-        _microKernelInfoGetter = microKernelInfoGetter;
+        _tileWorkloadProvider = tileWorkloadProvider;
     }
 
     public IDataTypeServiceProvider DataTypeService { get; }
@@ -761,7 +761,7 @@ internal class CompilerServicesProvider : ICompilerServicesProvider, ICompilerSe
         return _eGraphrewriteProvider.ERewrite(graph, rules, options);
     }
 
-    public MicroKernelInfo GetOpMicroKernelInfo(Op op, MicroKernelContext context) => _microKernelInfoGetter.GetInfo(op, context);
+    public TileWorkload GetTileWorkload(Op op, TileWorkloadContext context) => _tileWorkloadProvider.GetWorkload(op, context);
 
     public Expr SimplifyForDimension(Expr value) => _simplifyProvider.SimplifyForDimension(value);
 

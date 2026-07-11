@@ -15,26 +15,14 @@ using OrtKISharp;
 
 namespace Nncase.Evaluator.TIR.NTT;
 
-public sealed class VectorizedLayerNormEvaluator : ITypeInferencer<VectorizedLayerNorm>, IKernelInfoEvaluator<VectorizedLayerNorm>
+public sealed class VectorizedLayerNormEvaluator : ITypeInferencer<VectorizedLayerNorm>, ITileWorkloadEvaluator<VectorizedLayerNorm>
 {
     /// <inheritdoc/>
     public IRType Visit(ITypeInferenceContext context, VectorizedLayerNorm target) => TupleType.Void;
 
-    public MicroKernelInfo Visit(VectorizedLayerNorm op, MicroKernelContext context)
-    {
-        var domain = context.AccessMaps[0].Domains;
-        var primitives = Enumerable.Range(0, domain.Length).Select(i => 1).ToArray();
-        var tilebounds = Enumerable.Range(0, domain.Length).Select(i => i < op.Axis ? new ValueRange<long>(1, int.MaxValue) : new ValueRange<long>(context.BufferShapes[0][i], int.MaxValue)).ToArray();
-        var bufferInfos = new MicroKernelBufferInfo[context.BufferShapes.Length];
-        var opt = (INTTTargetOptions)context.TargetOptions;
-        bufferInfos[0] = new(opt.MemoryBandWidths[1], opt.MemoryBandWidths[1], MicroKernelBufferInfo.BufferState.Read);
-        bufferInfos[1] = new(opt.MemoryBandWidths[1], opt.MemoryBandWidths[1], MicroKernelBufferInfo.BufferState.Read);
-        bufferInfos[2] = new(opt.MemoryBandWidths[1], opt.MemoryBandWidths[1], MicroKernelBufferInfo.BufferState.Read);
-        bufferInfos[3] = new(opt.MemoryBandWidths[1], opt.MemoryBandWidths[1], MicroKernelBufferInfo.BufferState.Write);
-        return new MicroKernelInfo(tilebounds, bufferInfos, GetComputeCycle);
-    }
+    public TileWorkload Visit(VectorizedLayerNorm op, TileWorkloadContext context) => new ElementwiseTileWorkload(GetComputeWork);
 
-    private static IntExpr GetComputeCycle(IntExpr[][] bufferShapes, Solver solver, MicroKernelContext context)
+    private static IntExpr GetComputeWork(IntExpr[][] bufferShapes, Solver solver, TileWorkloadContext context)
     {
         var factor = System.Math.Min(context.BufferShapes[0][0], 32);
         return factor * (1 + solver.MakeIsLessVar(bufferShapes[0][0], solver.MakeIntConst(factor)));
