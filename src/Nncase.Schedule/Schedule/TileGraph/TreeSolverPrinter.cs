@@ -116,16 +116,16 @@ public sealed class TreeSolverPrinter : TreeSolverBase<IntExpr>, ITreeNodeVisito
         WriteIntExprMatrix(writer, "Shapes", OpNodeMemo[value].Shapes, Solution);
 
         writer.Indent++;
-        for (int i = 0; i < value.ReadAccesses.Length; i++)
+        foreach (var accessIndex in value.ReadAccessIndices)
         {
-            writer.Write($"- read_{i}: ");
-            writer.WriteLine(value.ReadAccesses[i]);
+            writer.Write($"- read_{accessIndex}: ");
+            writer.WriteLine(value.GetAccessMap(accessIndex));
         }
 
-        for (int i = 0; i < value.WriteAccesses.Length; i++)
+        foreach (var accessIndex in value.WriteAccessIndices)
         {
-            writer.Write($"- write_{i}: ");
-            writer.WriteLine(value.WriteAccesses[i]);
+            writer.Write($"- write_{accessIndex}: ");
+            writer.WriteLine(value.GetAccessMap(accessIndex));
         }
         writer.Indent--;
         writer.Indent--;

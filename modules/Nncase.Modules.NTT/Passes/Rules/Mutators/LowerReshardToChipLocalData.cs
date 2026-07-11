@@ -16,46 +16,35 @@ namespace Nncase.Passes.Mutators;
 /// </summary>
 public sealed class LowerReshardToChipLocalData : ExprRewriter
 {
-    protected override BaseExpr VisitSequential(Sequential expr, Unit context)
+    protected override BaseExpr RewriteLeafPrimFunction(PrimFunction expr)
     {
-        var rewritten = (Sequential)base.VisitSequential(expr, context);
-        var fields = rewritten.Fields.ToArray();
-        var reshardCalls = new HashSet<Call>(ReferenceEqualityComparer.Instance);
-        var physicalBufferSets = new PhysicalBufferUnion();
-
-        foreach (var field in fields)
+        var reshardCalls = new HashSet<Call>(
+            ExprCollector.Collect(expr.Body)
+                .OfType<Call>()
+                .Where(call => call.Target is TIR.NTT.GatherReduceScatter gatherReduceScatter &&
+                    TryGetCopyLikeReshard(call, gatherReduceScatter, out _, out _)),
+            ReferenceEqualityComparer.Instance);
+        if (reshardCalls.Count == 0)
         {
-            if (field is not Call call ||
-                call.Target is not TIR.NTT.GatherReduceScatter gatherReduceScatter ||
-                !TryGetCopyLikeReshard(call, gatherReduceScatter, out var input, out var output))
+            return expr;
+        }
+
+        var physicalBufferSets = new PhysicalBufferUnion();
+        foreach (var call in reshardCalls)
+        {
+            var gatherReduceScatter = (TIR.NTT.GatherReduceScatter)call.Target;
+            if (!TryGetCopyLikeReshard(call, gatherReduceScatter, out var input, out var output))
             {
-                continue;
+                throw new InvalidOperationException("A previously classified copy-like reshard changed during analysis.");
             }
 
             physicalBufferSets.Union(input.MemSpan.Buffer, output.MemSpan.Buffer, gatherReduceScatter.OutType.TensorType);
-            reshardCalls.Add(call);
-        }
-
-        if (reshardCalls.Count == 0)
-        {
-            return rewritten;
         }
 
         var physicalBufferMap = physicalBufferSets.BuildChipLocalBufferMap();
-        var bufferRewriter = new ChipLocalBufferViewRewriter(physicalBufferMap);
-        var loweredFields = new List<Expr>(fields.Length);
-        foreach (var field in fields)
-        {
-            if (field is Call call && reshardCalls.Contains(call))
-            {
-                loweredFields.Add(TIR.F.NTT.Barrier(TIR.NTT.BarrierScope.Chip));
-                continue;
-            }
-
-            loweredFields.Add((Expr)bufferRewriter.Rewrite(field));
-        }
-
-        return rewritten.With(CanonicalizeBarriers(loweredFields).ToArray());
+        var withoutReshard = (Sequential)new RemoveCopyLikeReshards(reshardCalls).Rewrite(expr.Body);
+        var rewrittenBody = (Sequential)new ChipLocalBufferViewRewriter(physicalBufferMap).Rewrite(withoutReshard);
+        return expr.With(body: rewrittenBody);
     }
 
     private static bool TryGetCopyLikeReshard(
@@ -102,52 +91,18 @@ public sealed class LowerReshardToChipLocalData : ExprRewriter
     private static bool IsSplitOrBroadcast(DistributedType distributedType)
         => distributedType.AxisPolicies.All(policy => policy is SBPSplit or SBPBroadCast);
 
-    private static IEnumerable<Expr> CanonicalizeBarriers(IEnumerable<Expr> fields)
+    private sealed class RemoveCopyLikeReshards : ExprRewriter
     {
-        var result = new List<Expr>();
-        foreach (var field in fields)
-        {
-            if (TryGetBarrierScope(field, out var scope))
-            {
-                if (result.Count > 0 && TryGetBarrierScope(result[^1], out var previousScope))
-                {
-                    result[^1] = TIR.F.NTT.Barrier(MergeBarrierScope(previousScope, scope));
-                    continue;
-                }
-            }
+        private readonly IReadOnlySet<Call> _calls;
 
-            result.Add(field);
+        public RemoveCopyLikeReshards(IReadOnlySet<Call> calls)
+        {
+            _calls = calls;
         }
 
-        while (result.Count > 0 && TryGetBarrierScope(result[0], out _))
-        {
-            result.RemoveAt(0);
-        }
-
-        while (result.Count > 0 && TryGetBarrierScope(result[^1], out _))
-        {
-            result.RemoveAt(result.Count - 1);
-        }
-
-        return result;
+        protected override BaseExpr RewriteLeafCall(Call expr)
+            => _calls.Contains(expr) ? T.Nop() : expr;
     }
-
-    private static bool TryGetBarrierScope(Expr expr, out TIR.NTT.BarrierScope scope)
-    {
-        if (expr is Call { Target: TIR.NTT.Barrier barrier })
-        {
-            scope = barrier.Scope;
-            return true;
-        }
-
-        scope = default;
-        return false;
-    }
-
-    private static TIR.NTT.BarrierScope MergeBarrierScope(TIR.NTT.BarrierScope lhs, TIR.NTT.BarrierScope rhs)
-        => lhs == TIR.NTT.BarrierScope.Chip || rhs == TIR.NTT.BarrierScope.Chip
-            ? TIR.NTT.BarrierScope.Chip
-            : TIR.NTT.BarrierScope.Block;
 
     private readonly record struct ComponentInfo(int Alignment, Dimension SizeBytes)
     {

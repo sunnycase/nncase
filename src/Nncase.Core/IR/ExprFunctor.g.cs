@@ -219,6 +219,11 @@ public partial class ExprFunctor<TExprResult, TTypeResult, TContext>
     internal protected virtual TExprResult VisitAffineRelation(Affine.AffineRelation expr, TContext context) => DefaultVisit(expr, context);
 
     /// <summary>
+    /// Visit <see cref="Affine.GridAccess"/>.
+    /// </summary>
+    internal protected virtual TExprResult VisitGridAccess(Affine.GridAccess expr, TContext context) => DefaultVisit(expr, context);
+
+    /// <summary>
     /// Visit <see cref="Affine.Grid"/>.
     /// </summary>
     internal protected virtual TExprResult VisitGrid(Affine.Grid expr, TContext context) => DefaultVisit(expr, context);
@@ -491,7 +496,6 @@ public partial class ExprFunctor<TExprResult, TTypeResult>
 
     /// <inheritdoc/>
     internal protected sealed override TExprResult VisitVar(Var expr, Unit context) => VisitVar(expr);
-
     /// <summary>
     /// Visit <see cref="TIR.BufferVar"/>.
     /// </summary>
@@ -499,7 +503,6 @@ public partial class ExprFunctor<TExprResult, TTypeResult>
 
     /// <inheritdoc/>
     internal protected sealed override TExprResult VisitBufferVar(TIR.BufferVar expr, Unit context) => VisitBufferVar(expr);
-
     /// <summary>
     /// Visit <see cref="TIR.Block"/>.
     /// </summary>
@@ -661,6 +664,13 @@ public partial class ExprFunctor<TExprResult, TTypeResult>
 
     /// <inheritdoc/>
     internal protected sealed override TExprResult VisitAffineRelation(Affine.AffineRelation expr, Unit context) => VisitAffineRelation(expr);
+    /// <summary>
+    /// Visit <see cref="Affine.GridAccess"/>.
+    /// </summary>
+    internal protected virtual TExprResult VisitGridAccess(Affine.GridAccess expr) => base.VisitGridAccess(expr, default);
+
+    /// <inheritdoc/>
+    internal protected sealed override TExprResult VisitGridAccess(Affine.GridAccess expr, Unit context) => VisitGridAccess(expr);
     /// <summary>
     /// Visit <see cref="Affine.Grid"/>.
     /// </summary>

@@ -11,16 +11,16 @@ public sealed partial class VectorizedBinary : NTTKernelOp
     /// <summary>
     /// Gets input.
     /// </summary>
-    public static readonly ParameterInfo Lhs = new(typeof(VectorizedBinary), 0, "lhs", ParameterKind.Input);
+    public static readonly ParameterInfo Lhs = new(typeof(VectorizedBinary), 0, "lhs", ParameterKind.Input, MemoryEffect.Read);
 
     /// <summary>
     /// Gets Other.
     /// </summary>
-    public static readonly ParameterInfo Rhs = new(typeof(VectorizedBinary), 1, "rhs", ParameterKind.Input);
+    public static readonly ParameterInfo Rhs = new(typeof(VectorizedBinary), 1, "rhs", ParameterKind.Input, MemoryEffect.Read);
 
-    public static readonly ParameterInfo Output = new(typeof(VectorizedBinary), 2, "output", ParameterKind.Input);
+    public static readonly ParameterInfo Output = new(typeof(VectorizedBinary), 2, "output", ParameterKind.Input, MemoryEffect.Write);
 
-    public static readonly ParameterInfo PostOps = new(typeof(VectorizedBinary), 3, "post_ops", ParameterKind.Attribute);
+    public static readonly ParameterInfo PostOps = new(typeof(VectorizedBinary), 3, "post_ops", ParameterKind.Attribute, MemoryEffect.None);
 
     public BinaryOp BinaryOp { get; }
 

@@ -86,4 +86,8 @@ public abstract class Target : ITarget
     public virtual void RegisterTIRPreBufferizePass(IPassManager passManager, CompileOptions options)
     {
     }
+
+    public virtual void RegisterTIRPostBufferizePass(IPassManager passManager, CompileOptions options)
+    {
+    }
 }

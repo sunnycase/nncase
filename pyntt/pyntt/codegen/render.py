@@ -815,6 +815,62 @@ def _emit_memcopy(model: dict[str, Any]) -> str:
     return _finish(lines)
 
 
+def _emit_tensor_region_copy(model: dict[str, Any]) -> str:
+    rank = len(model["SourceShape"])
+    if rank != len(model["DestinationShape"]):
+        raise ValueError("TensorRegionCopy source and destination ranks must match")
+
+    lines = _standard_header(
+        model,
+        f"# generated from PyNTT Jinja TensorRegionCopy.py.jinja\n# {model['Comment']}; dtype={model['DType']}, source_shape={_shape_tuple(model['SourceShape'])}, destination_shape={_shape_tuple(model['DestinationShape'])}",
+        [("source", "Source"), ("destination", "Destination")],
+    )
+    for axis in range(rank):
+        source_offset = _dim(model["SourceGlobalOffsets"][axis])
+        destination_offset = _dim(model["DestinationGlobalOffsets"][axis])
+        _line(lines, 1, f"copy_start{axis} = tl.maximum({source_offset}, {destination_offset})")
+        _line(lines, 1, f"copy_end{axis} = tl.minimum({source_offset} + {_dim(model['SourceShape'][axis])}, {destination_offset} + {_dim(model['DestinationShape'][axis])})")
+        _line(lines, 1, f"copy_dim{axis} = tl.maximum(copy_end{axis} - copy_start{axis}, 0)")
+        _line(lines, 1, f"source_base{axis} = copy_start{axis} - {source_offset}")
+        _line(lines, 1, f"destination_base{axis} = copy_start{axis} - {destination_offset}")
+
+    dimensions = [f"(copy_dim{axis})" for axis in range(rank)]
+    dimensions.append(f"({model['VectorLaneCount']})")
+    total = " * ".join(dimensions)
+    _line(lines, 1, f"for linear_start in tl.range(0, {total}, block_size):")
+    _line(lines, 2, "linear = linear_start + tl.arange(0, block_size)")
+    _line(lines, 2, f"mask = linear < {total}")
+    if model["VectorLaneCount"] == 1:
+        _line(lines, 2, "tensor_linear = linear")
+        _line(lines, 2, "vector_lane = linear * 0")
+    else:
+        _line(lines, 2, f"tensor_linear = linear // {model['VectorLaneCount']}")
+        _line(lines, 2, f"vector_lane = linear % {model['VectorLaneCount']}")
+    _line(lines, 2, "remaining = tensor_linear")
+    for axis in range(rank - 1, -1, -1):
+        _line(lines, 2, f"idx{axis} = remaining % copy_dim{axis}")
+        _line(lines, 2, f"remaining = remaining // copy_dim{axis}")
+
+    source_terms = [
+        f"(source_base{axis} + idx{axis}) * {_dim(model['SourceStrides'][axis])}"
+        for axis in range(rank)
+    ]
+    destination_terms = [
+        f"(destination_base{axis} + idx{axis}) * {_dim(model['DestinationStrides'][axis])}"
+        for axis in range(rank)
+    ]
+    source_offset = " + ".join(source_terms) if source_terms else "tensor_linear * 0"
+    destination_offset = " + ".join(destination_terms) if destination_terms else "tensor_linear * 0"
+    if model["VectorLaneCount"] != 1:
+        source_offset = f"(({source_offset}) * {model['VectorLaneCount']} + vector_lane)"
+        destination_offset = f"(({destination_offset}) * {model['VectorLaneCount']} + vector_lane)"
+    _line(lines, 2, f"source_offset = {source_offset}")
+    _line(lines, 2, f"destination_offset = {destination_offset}")
+    _line(lines, 2, "value = tl.load(source + source_offset, mask=mask)")
+    _line(lines, 2, "tl.store(destination + destination_offset, value, mask=mask)")
+    return _finish(lines)
+
+
 def _emit_tensor_copy(model: dict[str, Any], *, is_load: bool) -> str:
     local_shape = model["LocalShape"]
     global_shape = model["GlobalShape"]
@@ -2927,23 +2983,10 @@ def _emit_get_position_ids(model: dict[str, Any]) -> str:
         ("cache_meta",),
         comment=f"# generated from PyNTT Jinja GetPositionIds.py.jinja\n# {model['Comment']}; output_dtype={model['OutputDType']}, local_shape={_shape_tuple(model['LocalShape'])}, global_shape={_shape_tuple(model['GlobalShape'])}",
     )
-    _line(lines, 1, "shard_count = tl.num_programs(0)")
     _line(lines, 1, "shard_index = tl.program_id(0).to(tl.int64)")
     _append_pointer_shard_coords(lines, 1, [model["Output"]])
     _line(lines, 1, f"output = {_ptr(model, 'Output')}")
-    shard_axis = model.get("ShardAxis")
-    if shard_axis is not None:
-        split_axes = model.get("SplitAxes", [])
-        axis_split_axes = split_axes[shard_axis] if shard_axis < len(split_axes) else []
-        _line(lines, 1, f"shard_axis_extent = {_dim(model['LocalShape'][shard_axis])}")
-        if axis_split_axes:
-            _append_shard_coords(lines, 1, model["Hierarchy"])
-            split_linear = _split_linear_expression(axis_split_axes, model["Hierarchy"])
-            _line(lines, 1, f"global_start = ({split_linear}) * shard_axis_extent")
-        else:
-            _line(lines, 1, "global_start = tl.full((), 0, tl.int64)")
-    else:
-        _line(lines, 1, "global_start = tl.full((), 0, tl.int64)")
+    _line(lines, 1, f"global_start = {_dim(model['OutputGlobalOffsets'][0])}")
     _line(lines, 1, f"for axis_start in tl.range(0, {_dim(local_extent)}, block_size):")
     _line(lines, 2, "lane = axis_start + tl.arange(0, block_size)")
     _line(lines, 2, f"mask = lane < {_dim(local_extent)}")
@@ -2966,224 +3009,152 @@ def _emit_get_position_ids(model: dict[str, Any]) -> str:
 
 
 def _emit_reshard(model: dict[str, Any]) -> str:
-    if int(model.get("CollectivePoolBytes") or 0) > 0:
-        return _emit_reshard_staged(model)
     return _emit_reshard_direct(model)
 
 
 def _emit_reshard_direct(model: dict[str, Any]) -> str:
     lines = _standard_header(
         model,
-        f"# generated from PyNTT Jinja Reshard.py.jinja\n# {model['Comment']}; dtype={model['DType']}, global_shape={_shape_tuple(model['GlobalShape'])}, input_local_shape={_shape_tuple(model['InputLocalShape'])}, output_local_shape={_shape_tuple(model['OutputLocalShape'])}, lane={model['VectorLaneCount']}",
-        [],
+        f"# generated from PyNTT Jinja Reshard.py.jinja\n# {model['Comment']}; dtype={model['DType']}, global_shape={_shape_tuple(model['GlobalShape'])}, input_tile_shape={_shape_tuple(model['InputActiveShape'])}, output_local_shape={_shape_tuple(model['OutputLocalShape'])}, lane={model['VectorLaneCount']}, stage=tile_scatter",
+        [("input0", "Input")],
     )
-    # _standard_header emits shard_index; no pointers are needed.
-    # Remove pointer-free duplicate generated by _standard_header structure is harmless.
+    if model.get("Stage") != "tile_scatter":
+        raise ValueError(f"Unsupported PyNTT direct reshard stage: {model.get('Stage')}")
+
     _line(lines, 1, "tmp_shard = shard_index")
     for axis in range(len(model["Hierarchy"]) - 1, -1, -1):
         _line(lines, 1, f"shard_coord{axis} = tmp_shard % {model['Hierarchy'][axis]}")
         _line(lines, 1, f"tmp_shard = tmp_shard // {model['Hierarchy'][axis]}")
-    for axis in range(len(model["OutputLocalShape"])):
-        split_axes = model["OutputSplitAxes"][axis]
-        if not split_axes:
-            _line(lines, 1, f"iter_dim{axis} = {_dim(model['OutputLocalShape'][axis])}")
-            _line(lines, 1, f"global_base{axis} = 0")
-        else:
-            _line(lines, 1, f"out_local_dim{axis} = {_dim(model['OutputLocalShape'][axis])}")
-            _line(lines, 1, f"out_split_linear{axis} = {_split_linear_expression(split_axes, model['Hierarchy'])}")
-            _line(lines, 1, f"global_base{axis} = out_split_linear{axis} * out_local_dim{axis}")
-            _line(lines, 1, f"remaining_dim{axis} = {_dim(model['GlobalShape'][axis])} - global_base{axis}")
-            _line(lines, 1, f"iter_dim{axis} = tl.minimum(out_local_dim{axis}, tl.maximum(remaining_dim{axis}, 0))")
-    total = " * ".join([f"(iter_dim{axis})" for axis in range(len(model["OutputLocalShape"]))] + [f"({model['VectorLaneCount']})"])
-    _line(lines, 1, f"for linear_start in tl.range(0, {total}, block_size):")
-    _line(lines, 2, "linear = linear_start + tl.arange(0, block_size)")
-    _line(lines, 2, f"mask = linear < {total}")
+
+    input_split_mesh_axes = {
+        axis
+        for split_axes in model["InputSplitAxes"]
+        for axis in split_axes
+    }
+    input_partial_mesh_axes = set(model["InputPartialAxes"])
+    if input_split_mesh_axes & input_partial_mesh_axes:
+        raise ValueError(
+            "A PyNTT reshard mesh axis cannot be both split and partial: "
+            f"{sorted(input_split_mesh_axes & input_partial_mesh_axes)}"
+        )
+    output_split_mesh_axes = {
+        axis
+        for split_axes in model["OutputSplitAxes"]
+        for axis in split_axes
+    }
+    output_broadcast_mesh_axes = [
+        axis
+        for axis in range(len(model["Hierarchy"]))
+        if axis not in output_split_mesh_axes
+    ]
+
+    indent = 1
+    for axis in output_broadcast_mesh_axes:
+        _line(lines, indent, f"for destination_shard_coord{axis} in tl.range(0, {model['Hierarchy'][axis]}):")
+        indent += 1
+
+    writer_active = "True"
+    for axis in sorted(input_partial_mesh_axes):
+        writer_active = f"({writer_active}) & (shard_coord{axis} == 0)"
+
+    total = " * ".join(
+        [f"({_dim(dim)})" for dim in model["InputActiveShape"]]
+        + [f"({model['VectorLaneCount']})"]
+    )
+    _line(lines, indent, f"for linear_start in tl.range(0, {total}, block_size):")
+    _line(lines, indent + 1, "linear = linear_start + tl.arange(0, block_size)")
+    _line(lines, indent + 1, f"mask = (linear < {total}) & ({writer_active})")
     if model["VectorLaneCount"] == 1:
-        _line(lines, 2, "lane = linear")
-        _line(lines, 2, "lane_value = linear * 0")
+        _line(lines, indent + 1, "lane = linear")
+        _line(lines, indent + 1, "lane_value = linear * 0")
     else:
-        _line(lines, 2, f"lane = linear // {model['VectorLaneCount']}")
-        _line(lines, 2, f"lane_value = linear % {model['VectorLaneCount']}")
-    _line(lines, 2, "remaining = lane")
-    for axis in range(len(model["OutputLocalShape"]) - 1, -1, -1):
-        _line(lines, 2, f"idx{axis} = remaining % iter_dim{axis}")
-        _line(lines, 2, f"remaining = remaining // iter_dim{axis}")
+        _line(lines, indent + 1, f"lane = linear // {model['VectorLaneCount']}")
+        _line(lines, indent + 1, f"lane_value = linear % {model['VectorLaneCount']}")
+    _line(lines, indent + 1, "remaining = lane")
+    for axis in range(len(model["InputActiveShape"]) - 1, -1, -1):
+        _line(lines, indent + 1, f"input_idx{axis} = remaining % {_dim(model['InputActiveShape'][axis])}")
+        _line(lines, indent + 1, f"remaining = remaining // {_dim(model['InputActiveShape'][axis])}")
+
+    for axis in range(len(model["GlobalShape"])):
+        _line(lines, indent + 1, f"global_idx{axis} = input_idx{axis} + {_dim(model['InputGlobalOffsets'][axis])}")
+        _line(lines, indent + 1, f"mask = mask & (global_idx{axis} < {_dim(model['GlobalShape'][axis])})")
+
     for axis in range(len(model["GlobalShape"])):
         split_axes = model["OutputSplitAxes"][axis]
-        if not split_axes:
-            _line(lines, 2, f"global_idx{axis} = idx{axis}")
-        else:
-            _line(lines, 2, f"global_idx{axis} = idx{axis} + global_base{axis}")
-            _line(lines, 2, f"mask = mask & (global_idx{axis} < {_dim(model['GlobalShape'][axis])})")
-    for axis in range(len(model["Hierarchy"])):
-        _line(lines, 2, f"source_shard_coord{axis} = shard_coord{axis}")
-    for axis in range(len(model["GlobalShape"])):
-        split_axes = model["InputSplitAxes"][axis]
-        if not split_axes:
-            _line(lines, 2, f"source_idx{axis} = global_idx{axis}")
-        else:
-            _line(lines, 2, f"in_local_dim{axis} = {_dim(model['InputLocalShape'][axis])}")
-            _line(lines, 2, f"in_split_linear{axis} = global_idx{axis} // in_local_dim{axis}")
-            _line(lines, 2, f"source_idx{axis} = global_idx{axis} - in_split_linear{axis} * in_local_dim{axis}")
-            _line(lines, 2, f"tmp_in_split{axis} = in_split_linear{axis}")
+        if split_axes:
+            _line(lines, indent + 1, f"output_local_dim{axis} = {_dim(model['OutputLocalShape'][axis])}")
+            _line(lines, indent + 1, f"output_split_linear{axis} = global_idx{axis} // output_local_dim{axis}")
+            _line(lines, indent + 1, f"output_idx{axis} = global_idx{axis} - output_split_linear{axis} * output_local_dim{axis}")
+            _line(lines, indent + 1, f"tmp_output_split{axis} = output_split_linear{axis}")
             for index in range(len(split_axes) - 1, -1, -1):
                 placement_axis = split_axes[index]
-                _line(lines, 2, f"source_shard_coord{placement_axis} = tmp_in_split{axis} % {model['Hierarchy'][placement_axis]}")
-                _line(lines, 2, f"tmp_in_split{axis} = tmp_in_split{axis} // {model['Hierarchy'][placement_axis]}")
-    source_shard_index = _split_linear_expression(list(range(len(model["Hierarchy"]))), model["Hierarchy"], "source_shard_coord")
-    input_offsets = _scalar_offset(_tensor_offset("source_idx", model["InputStrides"]), model["VectorLaneCount"])
-    output_offsets = _scalar_offset(_tensor_offset("idx", model["OutputStrides"]), model["VectorLaneCount"])
-    _line(lines, 2, f"source_shard_index = {source_shard_index}")
-    _line(lines, 2, f"input_offsets = {input_offsets}")
-    _line(lines, 2, f"output_offsets = {output_offsets}")
-    _line(lines, 2, f"input_byte_offsets = source_shard_index * {model['InputPoolBytes']} + {model['InputOffsetBytes']} + input_offsets * {model['ScalarElementSizeBytes']}")
-    _line(lines, 2, f"output_byte_offsets = shard_index * {model['OutputPoolBytes']} + {model['OutputOffsetBytes']} + output_offsets * {model['ScalarElementSizeBytes']}")
-    _line(lines, 2, f"value = tl.load(({model['InputBaseName']} + input_byte_offsets).to(tl.pointer_type({model['TritonDType']})), mask=mask)")
-    _line(lines, 2, f"tl.store(({model['OutputBaseName']} + output_byte_offsets).to(tl.pointer_type({model['TritonDType']})), value, mask=mask)")
-    return _finish(lines)
-
-
-def _emit_reshard_staged(model: dict[str, Any]) -> str:
-    global_strides = _contiguous_strides(model["GlobalShape"])
-    stage = model.get("Stage")
-
-    def is_zero_expression(value: Any) -> bool:
-        try:
-            return int(value) == 0
-        except (TypeError, ValueError):
-            return str(value).strip() in ("", "0")
-
-    def buffer_base(base_name: str, offset_bytes: str, pool_bytes: int | str) -> str:
-        expression = base_name
-        if not is_zero_expression(pool_bytes):
-            expression += f" + shard_index * {pool_bytes}"
-        expression += f" + {offset_bytes}"
-        return expression
-
-    def append_axis_ranges(lines: list[str], level: int, prefix: str, local_shape: list[Any], split_axes_by_tensor_axis: list[list[int]]) -> None:
-        for axis in range(len(model["GlobalShape"])):
-            split_axes = split_axes_by_tensor_axis[axis]
-            if not split_axes:
-                _line(lines, level, f"{prefix}_iter_dim{axis} = {_dim(model['GlobalShape'][axis])}")
-                _line(lines, level, f"{prefix}_global_base{axis} = 0")
-            else:
-                _line(lines, level, f"{prefix}_local_dim{axis} = {_dim(local_shape[axis])}")
-                _line(lines, level, f"{prefix}_split_linear{axis} = {_split_linear_expression(split_axes, model['Hierarchy'])}")
-                _line(lines, level, f"{prefix}_global_base{axis} = {prefix}_split_linear{axis} * {prefix}_local_dim{axis}")
-                _line(lines, level, f"{prefix}_remaining_dim{axis} = {_dim(model['GlobalShape'][axis])} - {prefix}_global_base{axis}")
-                _line(lines, level, f"{prefix}_iter_dim{axis} = tl.minimum({prefix}_local_dim{axis}, tl.maximum({prefix}_remaining_dim{axis}, 0))")
-
-    def append_unshard_axis_ranges(lines: list[str], level: int, prefix: str) -> str:
-        input_split_mesh_axes = sorted({axis for split_axes in model["InputSplitAxes"] for axis in split_axes})
-        free_mesh_axes = [axis for axis in range(len(model["Hierarchy"])) if axis not in input_split_mesh_axes]
-        non_split_tensor_axes = [axis for axis, split_axes in enumerate(model["InputSplitAxes"]) if not split_axes]
-        free_split_count = math.prod(model["Hierarchy"][axis] for axis in free_mesh_axes)
-        non_split_counts = _non_split_tensor_axis_split_counts(
-            model["GlobalShape"],
-            non_split_tensor_axes,
-            free_split_count,
-        )
-        non_split_count_by_axis = dict(zip(non_split_tensor_axes, non_split_counts))
-        split_non_split_axes = [axis for axis in non_split_tensor_axes if non_split_count_by_axis[axis] > 1]
-
-        writer_active = "True"
-        if split_non_split_axes:
-            _line(lines, level, f"{prefix}_non_split_linear = {_split_linear_expression(free_mesh_axes, model['Hierarchy'])}")
-            _line(lines, level, f"tmp_{prefix}_non_split = {prefix}_non_split_linear")
-            for axis in reversed(non_split_tensor_axes):
-                split_count = non_split_count_by_axis[axis]
-                _line(lines, level, f"{prefix}_non_split_id{axis} = tmp_{prefix}_non_split % {split_count}")
-                _line(lines, level, f"tmp_{prefix}_non_split = tmp_{prefix}_non_split // {split_count}")
-        elif free_mesh_axes:
-            for axis in free_mesh_axes:
-                writer_active = f"({writer_active}) & (shard_coord{axis} == 0)"
-
-        for axis in range(len(model["GlobalShape"])):
-            split_axes = model["InputSplitAxes"][axis]
-            if split_axes:
-                _line(lines, level, f"{prefix}_local_dim{axis} = {_dim(model['InputLocalShape'][axis])}")
-                _line(lines, level, f"{prefix}_split_linear{axis} = {_split_linear_expression(split_axes, model['Hierarchy'])}")
-                _line(lines, level, f"{prefix}_global_base{axis} = {prefix}_split_linear{axis} * {prefix}_local_dim{axis}")
-                _line(lines, level, f"{prefix}_remaining_dim{axis} = {_dim(model['GlobalShape'][axis])} - {prefix}_global_base{axis}")
-                _line(lines, level, f"{prefix}_iter_dim{axis} = tl.minimum({prefix}_local_dim{axis}, tl.maximum({prefix}_remaining_dim{axis}, 0))")
-                _line(lines, level, f"{prefix}_local_offset{axis} = 0")
-            elif axis in split_non_split_axes:
-                split_count = non_split_count_by_axis[axis]
-                _line(lines, level, f"{prefix}_local_dim{axis} = tl.cdiv({_dim(model['GlobalShape'][axis])}, {split_count})")
-                _line(lines, level, f"{prefix}_global_base{axis} = {prefix}_non_split_id{axis} * {prefix}_local_dim{axis}")
-                _line(lines, level, f"{prefix}_global_end{axis} = tl.minimum({prefix}_global_base{axis} + {prefix}_local_dim{axis}, {_dim(model['GlobalShape'][axis])})")
-                _line(lines, level, f"{prefix}_in_bound{axis} = {prefix}_global_base{axis} < {_dim(model['GlobalShape'][axis])}")
-                _line(lines, level, f"{prefix}_iter_dim{axis} = tl.where({prefix}_in_bound{axis}, {prefix}_global_end{axis} - {prefix}_global_base{axis}, 0)")
-                _line(lines, level, f"{prefix}_local_offset{axis} = tl.where({prefix}_in_bound{axis}, {prefix}_global_base{axis}, 0)")
-            else:
-                _line(lines, level, f"{prefix}_iter_dim{axis} = {_dim(model['GlobalShape'][axis])}")
-                _line(lines, level, f"{prefix}_global_base{axis} = 0")
-                _line(lines, level, f"{prefix}_local_offset{axis} = 0")
-
-        return writer_active
-
-    def append_linear_indices(lines: list[str], level: int, prefix: str) -> None:
-        _line(lines, level, "remaining = lane")
-        for axis in range(len(model["GlobalShape"]) - 1, -1, -1):
-            _line(lines, level, f"{prefix}_idx{axis} = remaining % {prefix}_iter_dim{axis}")
-            _line(lines, level, f"remaining = remaining // {prefix}_iter_dim{axis}")
-        for axis in range(len(model["GlobalShape"])):
-            _line(lines, level, f"{prefix}_global_idx{axis} = {prefix}_idx{axis} + {prefix}_global_base{axis}")
-
-    def total(prefix: str) -> str:
-        return " * ".join([f"({prefix}_iter_dim{axis})" for axis in range(len(model["GlobalShape"]))] + [f"({model['VectorLaneCount']})"])
-
-    lines = _helper_header(
-        model,
-        comment=f"# generated from PyNTT Jinja Reshard.py.jinja\n# {model['Comment']}; dtype={model['DType']}, global_shape={_shape_tuple(model['GlobalShape'])}, input_local_shape={_shape_tuple(model['InputLocalShape'])}, output_local_shape={_shape_tuple(model['OutputLocalShape'])}, lane={model['VectorLaneCount']}, stage={stage}",
-    )
-    _line(lines, 1, "shard_index = tl.program_id(0).to(tl.int64)")
-    _line(lines, 1, f"collective = (data + {model['CollectiveOffsetBytes']}).to(tl.pointer_type({model['TritonDType']}))")
-    _append_shard_coords(lines, 1, model["Hierarchy"])
-
-    if stage == "to_collective":
-        _line(lines, 1, f"input_base = ({buffer_base(model['InputBaseName'], model['InputOffsetBytes'], model['InputPoolBytes'])}).to(tl.pointer_type({model['TritonDType']}))")
-        writer_active = append_unshard_axis_ranges(lines, 1, "in")
-        _line(lines, 1, f"writer_active = {writer_active}")
-        input_total = total("in")
-        _line(lines, 1, f"for linear_start in tl.range(0, {input_total}, block_size):")
-        _line(lines, 2, "linear = linear_start + tl.arange(0, block_size)")
-        _line(lines, 2, f"mask = (linear < {input_total}) & writer_active")
-        if model["VectorLaneCount"] == 1:
-            _line(lines, 2, "lane = linear")
-            _line(lines, 2, "lane_value = linear * 0")
+                _line(lines, indent + 1, f"destination_shard_coord{placement_axis} = tmp_output_split{axis} % {model['Hierarchy'][placement_axis]}")
+                _line(lines, indent + 1, f"tmp_output_split{axis} = tmp_output_split{axis} // {model['Hierarchy'][placement_axis]}")
         else:
-            _line(lines, 2, f"lane = linear // {model['VectorLaneCount']}")
-            _line(lines, 2, f"lane_value = linear % {model['VectorLaneCount']}")
-        append_linear_indices(lines, 2, "in")
-        for axis in range(len(model["GlobalShape"])):
-            _line(lines, 2, f"in_local_idx{axis} = in_idx{axis} + in_local_offset{axis}")
-        input_offsets = _scalar_offset(_tensor_offset("in_local_idx", model["InputStrides"]), model["VectorLaneCount"])
-        collective_input_offsets = _scalar_offset(_tensor_offset("in_global_idx", global_strides), model["VectorLaneCount"])
-        _line(lines, 2, f"value = tl.load(input_base + {input_offsets}, mask=mask)")
-        _line(lines, 2, f"tl.store(collective + {collective_input_offsets}, value, mask=mask)")
-        return _finish(lines)
+            _line(lines, indent + 1, f"output_idx{axis} = global_idx{axis}")
 
-    if stage != "from_collective":
-        raise ValueError(f"Unsupported PyNTT staged reshard stage: {stage}")
+    for axis in range(len(model["Hierarchy"])):
+        if axis not in input_split_mesh_axes and axis not in input_partial_mesh_axes:
+            _line(lines, indent + 1, f"mask = mask & (shard_coord{axis} == destination_shard_coord{axis})")
 
-    _line(lines, 1, f"output_base = ({buffer_base(model['OutputBaseName'], model['OutputOffsetBytes'], model['OutputPoolBytes'])}).to(tl.pointer_type({model['TritonDType']}))")
-    append_axis_ranges(lines, 1, "out", model["OutputLocalShape"], model["OutputSplitAxes"])
-    output_total = total("out")
-    _line(lines, 1, f"for linear_start in tl.range(0, {output_total}, block_size):")
-    _line(lines, 2, "linear = linear_start + tl.arange(0, block_size)")
-    _line(lines, 2, f"mask = linear < {output_total}")
-    if model["VectorLaneCount"] == 1:
-        _line(lines, 2, "lane = linear")
-        _line(lines, 2, "lane_value = linear * 0")
+    destination_shard_index = _split_linear_expression(
+        list(range(len(model["Hierarchy"]))),
+        model["Hierarchy"],
+        "destination_shard_coord",
+    )
+    input_offsets = _scalar_offset(_tensor_offset("input_idx", model["InputStrides"]), model["VectorLaneCount"])
+    output_offsets = _scalar_offset(_tensor_offset("output_idx", model["OutputStrides"]), model["VectorLaneCount"])
+    _line(lines, indent + 1, f"destination_shard_index = {destination_shard_index}")
+    _line(lines, indent + 1, f"input_offsets = {input_offsets}")
+    _line(lines, indent + 1, f"output_offsets = {output_offsets}")
+    destination_pool_index = _pool_index_expression(
+        "destination_shard_index", model["OutputPoolScopeSize"]
+    )
+    _line(lines, indent + 1, f"destination_pool_index = {destination_pool_index}")
+    _line(lines, indent + 1, f"output_byte_offsets = destination_pool_index * {model['OutputPoolBytes']} + {model['OutputOffsetBytes']} + output_offsets * {model['ScalarElementSizeBytes']}")
+    if not input_partial_mesh_axes:
+        _line(lines, indent + 1, "value = tl.load(input0 + input_offsets, mask=mask)")
     else:
-        _line(lines, 2, f"lane = linear // {model['VectorLaneCount']}")
-        _line(lines, 2, f"lane_value = linear % {model['VectorLaneCount']}")
-    append_linear_indices(lines, 2, "out")
-    collective_output_offsets = _scalar_offset(_tensor_offset("out_global_idx", global_strides), model["VectorLaneCount"])
-    output_offsets = _scalar_offset(_tensor_offset("out_idx", model["OutputStrides"]), model["VectorLaneCount"])
-    _line(lines, 2, f"value = tl.load(collective + {collective_output_offsets}, mask=mask)")
-    _line(lines, 2, f"tl.store(output_base + {output_offsets}, value, mask=mask)")
+        dtype = model["DType"]
+        if dtype in ("float16", "bfloat16", "float32"):
+            accumulator_dtype = "tl.float32"
+            zero = "0.0"
+        elif dtype == "float64":
+            accumulator_dtype = "tl.float64"
+            zero = "0.0"
+        elif dtype.startswith("uint"):
+            accumulator_dtype = "tl.uint64"
+            zero = "0"
+        elif dtype.startswith("int"):
+            accumulator_dtype = "tl.int64"
+            zero = "0"
+        else:
+            raise ValueError(f"PyNTT partial Sum does not support dtype {dtype}")
+
+        _line(lines, indent + 1, f"acc = tl.full((block_size,), {zero}, {accumulator_dtype})")
+        for axis in range(len(model["Hierarchy"])):
+            _line(lines, indent + 1, f"source_shard_coord{axis} = shard_coord{axis}")
+        reduce_indent = indent + 1
+        for axis in sorted(input_partial_mesh_axes):
+            _line(lines, reduce_indent, f"for reduce_coord{axis} in tl.range(0, {model['Hierarchy'][axis]}):")
+            reduce_indent += 1
+            _line(lines, reduce_indent, f"source_shard_coord{axis} = reduce_coord{axis}.to(tl.int64)")
+        source_shard_index = _split_linear_expression(
+            list(range(len(model["Hierarchy"]))),
+            model["Hierarchy"],
+            "source_shard_coord",
+        )
+        source_pool_index = _pool_index_expression(
+            "source_shard_index", model["InputPoolScopeSize"]
+        )
+        _line(lines, reduce_indent, f"source_shard_index = {source_shard_index}")
+        _line(lines, reduce_indent, f"source_pool_index = {source_pool_index}")
+        _line(lines, reduce_indent, f"source_byte_offset = source_pool_index * {model['InputPoolBytes']} + {model['InputOffsetBytes']}")
+        _line(lines, reduce_indent, f"source = ({model['InputBaseName']} + source_byte_offset).to(tl.pointer_type({model['TritonDType']}))")
+        _line(lines, reduce_indent, f"source_value = tl.load(source + input_offsets, mask=mask, other={zero}).to({accumulator_dtype})")
+        _line(lines, reduce_indent, "acc += source_value")
+        _line(lines, indent + 1, "value = acc")
+    _line(lines, indent + 1, f"tl.store(({model['OutputBaseName']} + output_byte_offsets).to(tl.pointer_type({model['TritonDType']})), value, mask=mask)")
     return _finish(lines)
 
 
@@ -3196,63 +3167,17 @@ def _scalar_offset(element_offset: str, vector_lane_count: int) -> str:
     return element_offset if vector_lane_count == 1 else f"(({element_offset}) * {vector_lane_count} + lane_value)"
 
 
-def _emit_shard_reduce(model: dict[str, Any]) -> str:
-    lines = _helper_header(
-        model,
-        ("pool_bytes", "source_offset_bytes", "destination_offset_bytes"),
-        comment=f"# generated from PyNTT Jinja ShardReduce.py.jinja\n# {model['Comment']}; dtype={model['DType']}, local_shape={_shape_tuple(model['LocalShape'])}, vector_lane={model['VectorLaneCount']}, broadcast={model['Broadcast']}",
-    )
-    _line(lines, 1, "shard_index = tl.program_id(0).to(tl.int64)")
-    _line(lines, 1, f"destination = ({model['BaseName']} + shard_index * pool_bytes + destination_offset_bytes).to(tl.pointer_type({model['TritonDType']}))")
-    _line(lines, 1, "tmp_shard = shard_index")
-    for axis in range(len(model["Hierarchy"]) - 1, -1, -1):
-        _line(lines, 1, f"shard_coord{axis} = tmp_shard % {model['Hierarchy'][axis]}")
-        _line(lines, 1, f"tmp_shard = tmp_shard // {model['Hierarchy'][axis]}")
-    full_axes = list(range(len(model["Hierarchy"])))
-    full_source_index = _split_linear_expression(full_axes, model["Hierarchy"], "source_shard_coord")
-    if model["Broadcast"]:
-        for axis in range(len(model["Hierarchy"])):
-            source = f"shard_coord{axis} * 0" if axis in model["ReduceAxes"] else f"shard_coord{axis}"
-            _line(lines, 1, f"source_shard_coord{axis} = {source}")
-        _line(lines, 1, f"source_shard_index = {full_source_index}")
-        _line(lines, 1, f"source = ({model['BaseName']} + source_shard_index * pool_bytes + source_offset_bytes).to(tl.pointer_type({model['TritonDType']}))")
-    else:
-        _line(lines, 1, "active = True")
-        for axis in model["ReduceAxes"]:
-            _line(lines, 1, f"active = active & (shard_coord{axis} == 0)")
-    total = " * ".join([f"({_dim(dim)})" for dim in model["LocalShape"]] + [f"({model['VectorLaneCount']})"])
-    _line(lines, 1, f"for linear_start in tl.range(0, {total}, block_size):")
-    _line(lines, 2, "linear = linear_start + tl.arange(0, block_size)")
-    _line(lines, 2, f"mask = linear < {total}")
-    if model["VectorLaneCount"] == 1:
-        _line(lines, 2, "lane = linear")
-        _line(lines, 2, "lane_value = linear * 0")
-    else:
-        _line(lines, 2, f"lane = linear // {model['VectorLaneCount']}")
-        _line(lines, 2, f"lane_value = linear % {model['VectorLaneCount']}")
-    _line(lines, 2, "remaining = lane")
-    for axis in range(len(model["LocalShape"]) - 1, -1, -1):
-        _line(lines, 2, f"idx{axis} = remaining % {_dim(model['LocalShape'][axis])}")
-        _line(lines, 2, f"remaining = remaining // {_dim(model['LocalShape'][axis])}")
-    offset = _scalar_offset(_tensor_offset("idx", model["Strides"]), model["VectorLaneCount"])
-    if model["Broadcast"]:
-        _line(lines, 2, f"value = tl.load(source + {offset}, mask=mask)")
-        _line(lines, 2, f"tl.store(destination + {offset}, value, mask=mask)")
-    else:
-        _line(lines, 2, "acc = tl.full((block_size,), 0.0, tl.float32)")
-        for axis in range(len(model["Hierarchy"])):
-            _line(lines, 2, f"source_shard_coord{axis} = shard_coord{axis}")
-        reduce_indent = 2
-        for axis in model["ReduceAxes"]:
-            _line(lines, reduce_indent, f"for reduce_coord{axis} in tl.range(0, {model['Hierarchy'][axis]}):")
-            reduce_indent += 1
-            _line(lines, reduce_indent, f"source_shard_coord{axis} = reduce_coord{axis}.to(tl.int64)")
-        _line(lines, reduce_indent, f"source_shard_index = {full_source_index}")
-        _line(lines, reduce_indent, f"source = ({model['BaseName']} + source_shard_index * pool_bytes + source_offset_bytes).to(tl.pointer_type({model['TritonDType']}))")
-        _line(lines, reduce_indent, f"source_value = tl.load(source + {offset}, mask=mask & active, other=0.0).to(tl.float32)")
-        _line(lines, reduce_indent, "acc += source_value")
-        _line(lines, 2, f"tl.store(destination + {offset}, acc, mask=mask & active)")
-    return _finish(lines)
+def _pool_index_expression(linear_index: str, pool_scope_size: Any) -> str:
+    expression = str(pool_scope_size).strip()
+    if not expression:
+        raise ValueError("Pool scope size expression must not be empty")
+    try:
+        scope_size = int(expression)
+    except ValueError:
+        return f"(({linear_index}) // ({expression}))"
+    if scope_size <= 0:
+        raise ValueError(f"Pool scope size must be positive, got {scope_size}")
+    return linear_index if scope_size == 1 else f"(({linear_index}) // {scope_size})"
 
 
 def _emit_summa(model: dict[str, Any]) -> str:
@@ -3690,11 +3615,11 @@ _EMITTERS = {
     "Reshard": _emit_reshard,
     "RoPE": _emit_rope,
     "ScatterND": _emit_scatter_nd,
-    "ShardReduce": _emit_shard_reduce,
     "Slice": _emit_slice,
     "Softmax": _emit_softmax,
     "Summa": _emit_summa,
     "TensorLoad": _emit_tensor_load,
+    "TensorRegionCopy": _emit_tensor_region_copy,
     "TensorStore": _emit_tensor_store,
     "Transpose": _emit_transpose,
     "UpdatePagedAttentionKVCache": _emit_update_paged_attention_kv_cache,

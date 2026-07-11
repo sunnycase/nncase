@@ -6,11 +6,11 @@ namespace Nncase.TIR.NTT;
 
 public sealed partial class Cast : NTTKernelOp
 {
-    public static readonly ParameterInfo Input = new(typeof(Cast), 0, "input");
+    public static readonly ParameterInfo Input = new(typeof(Cast), 0, "input", memoryEffect: MemoryEffect.Read);
 
-    public static readonly ParameterInfo Output = new(typeof(Cast), 1, "output");
+    public static readonly ParameterInfo Output = new(typeof(Cast), 1, "output", memoryEffect: MemoryEffect.Write);
 
-    public static readonly ParameterInfo PostOps = new(typeof(Cast), 2, "post_ops", ParameterKind.Attribute);
+    public static readonly ParameterInfo PostOps = new(typeof(Cast), 2, "post_ops", ParameterKind.Attribute, MemoryEffect.None);
 
     public DataType NewType { get; }
 

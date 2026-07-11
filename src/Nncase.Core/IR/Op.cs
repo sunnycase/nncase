@@ -46,12 +46,22 @@ public sealed class ParameterInfo
     /// <param name="index">param index.</param>
     /// <param name="name">param name.</param>
     /// <param name="parameterKind">kind.</param>
-    public ParameterInfo(Type ownerType, int index, string name, ParameterKind parameterKind = ParameterKind.Attribute)
+    /// <param name="memoryEffect">optional operand memory-effect contract.</param>
+    /// <param name="isVariadic">whether the parameter consumes consecutive call arguments.</param>
+    public ParameterInfo(
+        Type ownerType,
+        int index,
+        string name,
+        ParameterKind parameterKind = ParameterKind.Attribute,
+        MemoryEffect? memoryEffect = null,
+        bool isVariadic = false)
     {
         OwnerType = ownerType;
         Index = index;
         Name = name;
         ParameterKind = parameterKind;
+        MemoryEffect = memoryEffect;
+        IsVariadic = isVariadic;
     }
 
     /// <summary>
@@ -63,8 +73,17 @@ public sealed class ParameterInfo
     /// <param name="name">param name.</param>
     /// <param name="pattern">the param condition.</param>
     /// <param name="parameterKind">kind.</param>
-    public ParameterInfo(Type ownerType, int index, string name, TypePattern pattern, ParameterKind parameterKind = ParameterKind.Attribute)
-        : this(ownerType, index, name, parameterKind)
+    /// <param name="memoryEffect">optional operand memory-effect contract.</param>
+    /// <param name="isVariadic">whether the parameter consumes consecutive call arguments.</param>
+    public ParameterInfo(
+        Type ownerType,
+        int index,
+        string name,
+        TypePattern pattern,
+        ParameterKind parameterKind = ParameterKind.Attribute,
+        MemoryEffect? memoryEffect = null,
+        bool isVariadic = false)
+        : this(ownerType, index, name, parameterKind, memoryEffect, isVariadic)
     {
         Pattern = pattern;
     }
@@ -88,6 +107,19 @@ public sealed class ParameterInfo
     /// Gets parameter kind.
     /// </summary>
     public ParameterKind ParameterKind { get; }
+
+    /// <summary>
+    /// Gets the possible memory access performed through this operand.
+    /// A null value means the owning operation does not define an operand-level
+    /// memory-effect contract.
+    /// </summary>
+    public MemoryEffect? MemoryEffect { get; }
+
+    /// <summary>
+    /// Gets a value indicating whether this parameter consumes a variable number
+    /// of consecutive call arguments.
+    /// </summary>
+    public bool IsVariadic { get; }
 
     /// <summary>
     /// Gets this paramter's type condition.

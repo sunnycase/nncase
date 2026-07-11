@@ -6,7 +6,7 @@ namespace Nncase.TIR.NTT;
 
 public sealed partial class ShapeOf : NTTKernelOp
 {
-    public static readonly ParameterInfo Input = new(typeof(ShapeOf), 0, "input");
+    public static readonly ParameterInfo Input = new(typeof(ShapeOf), 0, "input", memoryEffect: MemoryEffect.None);
 
-    public static readonly ParameterInfo Output = new(typeof(ShapeOf), 1, "output");
+    public static readonly ParameterInfo Output = new(typeof(ShapeOf), 1, "output", memoryEffect: MemoryEffect.Write);
 }

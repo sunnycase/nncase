@@ -14,4 +14,6 @@ public sealed partial class Barrier : NTTKernelOp
     public BarrierScope Scope { get; }
 
     public override bool CanFoldConstCall => false;
+
+    public override string DisplayProperty() => $"Scope: {Scope}";
 }

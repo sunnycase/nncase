@@ -126,9 +126,12 @@ internal sealed class AutoTileExprGraphConvertor : ExprGraphConvertor<ExprVertex
 {
     protected override ExprVertex VisitGrid(Grid expr, IMutableVertexAndEdgeListGraph<ExprVertex, ExprEdge> context)
     {
-        foreach (var read in expr.Reads)
+        foreach (var access in expr.Accesses)
         {
-            Visit(read, context);
+            if (access.IsRead)
+            {
+                Visit(access.Value, context);
+            }
         }
 
         return VisitLeafGrid(expr, context);
@@ -138,11 +141,16 @@ internal sealed class AutoTileExprGraphConvertor : ExprGraphConvertor<ExprVertex
     {
         var target = (ExprVertex)ExprVertex.Create(expr);
         graph.AddVertex(target);
-        int count = 0;
-        foreach (var item in expr.Reads)
+        for (var accessIndex = 0; accessIndex < expr.Accesses.Length; accessIndex++)
         {
-            var source = Visit(item, graph);
-            var edge = (ExprEdge)ExprEdge.Create(source, target, count++);
+            var access = expr.Accesses[accessIndex];
+            if (!access.IsRead)
+            {
+                continue;
+            }
+
+            var source = Visit(access.Value, graph);
+            var edge = (ExprEdge)ExprEdge.Create(source, target, accessIndex);
             graph.AddEdge(edge);
         }
 

@@ -12,11 +12,11 @@ namespace Nncase.TIR.NTT;
 
 public sealed partial class Compare : NTTKernelOp
 {
-    public static readonly ParameterInfo Lhs = new(typeof(Compare), 0, "lhs");
+    public static readonly ParameterInfo Lhs = new(typeof(Compare), 0, "lhs", memoryEffect: MemoryEffect.Read);
 
-    public static readonly ParameterInfo Rhs = new(typeof(Compare), 1, "rhs");
+    public static readonly ParameterInfo Rhs = new(typeof(Compare), 1, "rhs", memoryEffect: MemoryEffect.Read);
 
-    public static readonly ParameterInfo Output = new(typeof(Compare), 2, "output");
+    public static readonly ParameterInfo Output = new(typeof(Compare), 2, "output", memoryEffect: MemoryEffect.Write);
 
     public CompareOp CompareOp { get; }
 

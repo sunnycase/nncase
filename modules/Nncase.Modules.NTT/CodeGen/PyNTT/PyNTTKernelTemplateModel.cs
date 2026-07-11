@@ -60,6 +60,24 @@ public sealed record PyNTTMemcopyTemplateModel(
     public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
 }
 
+public sealed record PyNTTRegionCopyTemplateModel(
+    string FunctionName,
+    PyNTTBufferPointerTemplateModel Source,
+    PyNTTBufferPointerTemplateModel Destination,
+    string DType,
+    string TritonDType,
+    PyNTTDimExpression[] SourceShape,
+    PyNTTDimExpression[] DestinationShape,
+    PyNTTDimExpression[] SourceGlobalOffsets,
+    PyNTTDimExpression[] DestinationGlobalOffsets,
+    PyNTTDimExpression[] SourceStrides,
+    PyNTTDimExpression[] DestinationStrides,
+    int VectorLaneCount,
+    string Comment)
+{
+    public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
+}
+
 public sealed record PyNTTElementwiseBinaryTemplateModel(
     string FunctionName,
     PyNTTBufferPointerTemplateModel Lhs,
@@ -235,23 +253,26 @@ public sealed record PyNTTReshardTemplateModel(
     string InputBaseName,
     string InputOffsetBytes,
     string InputPoolBytes,
+    string InputPoolScopeSize,
     string OutputBaseName,
     string OutputOffsetBytes,
     string OutputPoolBytes,
+    string OutputPoolScopeSize,
     int ScalarElementSizeBytes,
     string DType,
     string TritonDType,
     PyNTTDimExpression[] GlobalShape,
     PyNTTDimExpression[] InputLocalShape,
+    PyNTTDimExpression[] InputActiveShape,
+    PyNTTDimExpression[] InputGlobalOffsets,
     PyNTTDimExpression[] OutputLocalShape,
     PyNTTDimExpression[] InputStrides,
     PyNTTDimExpression[] OutputStrides,
     int VectorLaneCount,
     int[] Hierarchy,
     int[][] InputSplitAxes,
+    int[] InputPartialAxes,
     int[][] OutputSplitAxes,
-    string CollectiveOffsetBytes,
-    long CollectivePoolBytes,
     string Stage,
     string Comment)
 {
@@ -459,10 +480,8 @@ public sealed record PyNTTGetPositionIdsTemplateModel(
     string OutputTritonDType,
     PyNTTDimExpression[] LocalShape,
     PyNTTDimExpression[] GlobalShape,
+    PyNTTDimExpression[] OutputGlobalOffsets,
     PyNTTDimExpression[] OutputStrides,
-    int[] Hierarchy,
-    int[][] SplitAxes,
-    int? ShardAxis,
     string Comment)
 {
     public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
@@ -787,22 +806,6 @@ public sealed record PyNTTSummaTemplateModel(
     int RhsNVectorLaneCount,
     int OutputNVectorLaneCount,
     string Scale,
-    string Comment)
-{
-    public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
-}
-
-public sealed record PyNTTShardReduceTemplateModel(
-    string FunctionName,
-    string BaseName,
-    string DType,
-    string TritonDType,
-    PyNTTDimExpression[] LocalShape,
-    PyNTTDimExpression[] Strides,
-    int VectorLaneCount,
-    int[] Hierarchy,
-    int[] ReduceAxes,
-    bool Broadcast,
     string Comment)
 {
     public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();

@@ -7,9 +7,9 @@ namespace Nncase.TIR.NTT;
 
 public sealed partial class GetPositionIds : NTTKernelOp
 {
-    public static readonly ParameterInfo KVCache = new(typeof(GetPositionIds), 0, "kvcache");
+    public static readonly ParameterInfo KVCache = new(typeof(GetPositionIds), 0, "kvcache", memoryEffect: MemoryEffect.ChipRead);
 
-    public static readonly ParameterInfo Output = new(typeof(GetPositionIds), 1, "output");
+    public static readonly ParameterInfo Output = new(typeof(GetPositionIds), 1, "output", memoryEffect: MemoryEffect.Write);
 
     [Browsable(false)]
     public DistributedType DistributedType { get; }

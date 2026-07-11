@@ -490,6 +490,18 @@ public partial class ExprVisitor<TExprResult, TTypeResult, TContext>
     }
 
     /// <inheritdoc />
+    protected internal override TExprResult VisitGridAccess(Affine.GridAccess expr, TContext context)
+    {
+        VisitOperands(expr, context);
+        if (CanVisitAttributes(expr))
+        {
+            VisitAttributes(expr, context);
+        }
+
+        return VisitLeafGridAccess(expr, context);
+    }
+
+    /// <inheritdoc />
     protected internal override TExprResult VisitGrid(Affine.Grid expr, TContext context)
     {
         VisitOperands(expr, context);
@@ -1031,6 +1043,11 @@ public partial class ExprVisitor<TExprResult, TTypeResult, TContext>
     protected virtual TExprResult VisitLeafAffineRelation(Affine.AffineRelation expr, TContext context) => DefaultVisitLeaf(expr, context);
 
     /// <summary>
+    /// Visit leaf <see cref="Affine.GridAccess"/>.
+    /// </summary>
+    protected virtual TExprResult VisitLeafGridAccess(Affine.GridAccess expr, TContext context) => DefaultVisitLeaf(expr, context);
+
+    /// <summary>
     /// Visit leaf <see cref="Affine.Grid"/>.
     /// </summary>
     protected virtual TExprResult VisitLeafGrid(Affine.Grid expr, TContext context) => DefaultVisitLeaf(expr, context);
@@ -1289,7 +1306,6 @@ public partial class ExprVisitor<TExprResult, TTypeResult>
 
     /// <inheritdoc/>
     internal protected sealed override TExprResult VisitVar(Var expr, Unit context) => VisitVar(expr);
-
     /// <summary>
     /// Visit <see cref="TIR.BufferVar"/>.
     /// </summary>
@@ -1297,7 +1313,6 @@ public partial class ExprVisitor<TExprResult, TTypeResult>
 
     /// <inheritdoc/>
     internal protected sealed override TExprResult VisitBufferVar(TIR.BufferVar expr, Unit context) => VisitBufferVar(expr);
-
     /// <summary>
     /// Visit <see cref="TIR.Block"/>.
     /// </summary>
@@ -1452,6 +1467,13 @@ public partial class ExprVisitor<TExprResult, TTypeResult>
 
     /// <inheritdoc/>
     internal protected sealed override TExprResult VisitAffineRelation(Affine.AffineRelation expr, Unit context) => VisitAffineRelation(expr);
+    /// <summary>
+    /// Visit <see cref="Affine.GridAccess"/>.
+    /// </summary>
+    internal protected virtual TExprResult VisitGridAccess(Affine.GridAccess expr) => base.VisitGridAccess(expr, default);
+
+    /// <inheritdoc/>
+    internal protected sealed override TExprResult VisitGridAccess(Affine.GridAccess expr, Unit context) => VisitGridAccess(expr);
     /// <summary>
     /// Visit <see cref="Affine.Grid"/>.
     /// </summary>
@@ -1975,6 +1997,14 @@ public partial class ExprVisitor<TExprResult, TTypeResult>
 
     /// <inheritdoc/>
     protected sealed override TExprResult VisitLeafAffineRelation(Affine.AffineRelation expr, Unit context) => VisitLeafAffineRelation(expr);
+
+    /// <summary>
+    /// Visit leaf <see cref="Affine.GridAccess"/>.
+    /// </summary>
+    protected virtual TExprResult VisitLeafGridAccess(Affine.GridAccess expr) => base.VisitLeafGridAccess(expr, default);
+
+    /// <inheritdoc/>
+    protected sealed override TExprResult VisitLeafGridAccess(Affine.GridAccess expr, Unit context) => VisitLeafGridAccess(expr);
 
     /// <summary>
     /// Visit leaf <see cref="Affine.Grid"/>.

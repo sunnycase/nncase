@@ -133,6 +133,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
 
         private const string ShardCoordDimPrefix = "__shard_coord_";
         private const string DeviceFunctionCallPrefix = "__pyntt_device_call__";
+        private const string PoolScopeSizeSuffix = "_pool_scope_size";
 
         private static readonly string[] WorkspaceParameterNames =
         {
@@ -182,6 +183,8 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
         private readonly Dictionary<TIR.Buffer, BufferViewSource> _bufferViewSourceByBuffer = new(ReferenceEqualityComparer.Instance);
         private readonly Dictionary<IVar, BaseExpr> _letBindings = new(ReferenceEqualityComparer.Instance);
         private readonly IReadOnlyDictionary<IVar, string> _formalTensorParameterBaseNames;
+        private readonly IReadOnlyDictionary<IVar, string> _formalTensorParameterPoolStrideNames;
+        private readonly IReadOnlyDictionary<IVar, string> _formalTensorParameterPoolScopeSizeNames;
         private readonly IReadOnlyDictionary<IVar, PyNTTDimExpression[]> _formalTensorParameterDimensions;
         private readonly IReadOnlyDictionary<IVar, PyNTTDimExpression[]> _formalTensorParameterGlobalOffsets;
         private readonly IReadOnlyDictionary<IVar, int[][]> _formalTensorParameterSourceSplitAxes;
@@ -204,7 +207,6 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
         private readonly HashSet<string> _activeDeviceFunctionNames;
         private readonly Dictionary<PrimFunction, DeviceFunctionDefinition> _deviceFunctionDefinitions;
         private readonly Dictionary<string, DeviceFunctionDefinition> _deviceFunctionDefinitionsByName;
-        private long _collectiveDataPoolBytes;
         private long _nestedBlockLocalDataPoolBytes;
         private PrimFunction _currentFunction;
         private int _bodyIndent;
@@ -224,6 +226,8 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             Dictionary<TIR.Buffer, string>? chipLocalDataBaseNameByBuffer = null,
             Dictionary<TIR.Buffer, string>? blockLocalDataBaseNameByBuffer = null,
             IReadOnlyDictionary<IVar, string>? formalTensorParameterBaseNames = null,
+            IReadOnlyDictionary<IVar, string>? formalTensorParameterPoolStrideNames = null,
+            IReadOnlyDictionary<IVar, string>? formalTensorParameterPoolScopeSizeNames = null,
             IReadOnlyDictionary<IVar, PyNTTDimExpression[]>? formalTensorParameterDimensions = null,
             IReadOnlyDictionary<IVar, PyNTTDimExpression[]>? formalTensorParameterGlobalOffsets = null,
             IReadOnlyDictionary<IVar, int[][]>? formalTensorParameterSourceSplitAxes = null,
@@ -255,6 +259,8 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             _chipLocalDataBaseNameByBuffer = chipLocalDataBaseNameByBuffer ?? new Dictionary<TIR.Buffer, string>(ReferenceEqualityComparer.Instance);
             _blockLocalDataBaseNameByBuffer = blockLocalDataBaseNameByBuffer ?? new Dictionary<TIR.Buffer, string>(ReferenceEqualityComparer.Instance);
             _formalTensorParameterBaseNames = formalTensorParameterBaseNames ?? new Dictionary<IVar, string>(ReferenceEqualityComparer.Instance);
+            _formalTensorParameterPoolStrideNames = formalTensorParameterPoolStrideNames ?? new Dictionary<IVar, string>(ReferenceEqualityComparer.Instance);
+            _formalTensorParameterPoolScopeSizeNames = formalTensorParameterPoolScopeSizeNames ?? new Dictionary<IVar, string>(ReferenceEqualityComparer.Instance);
             _formalTensorParameterDimensions = formalTensorParameterDimensions ?? new Dictionary<IVar, PyNTTDimExpression[]>(ReferenceEqualityComparer.Instance);
             _formalTensorParameterGlobalOffsets = formalTensorParameterGlobalOffsets ?? new Dictionary<IVar, PyNTTDimExpression[]>(ReferenceEqualityComparer.Instance);
             _formalTensorParameterSourceSplitAxes = formalTensorParameterSourceSplitAxes ?? new Dictionary<IVar, int[][]>(ReferenceEqualityComparer.Instance);
@@ -388,7 +394,6 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                         ["data_pool_bytes"] = checked((long)_currentFunction.SchedResult.DataUsage),
                         ["data_pool_elements"] = checked((long)_currentFunction.SchedResult.DataUsage),
                         ["data_dtype"] = "uint8",
-                        ["collective_data_pool_bytes"] = _collectiveDataPoolBytes,
                         ["chip_local_data_pool_bytes"] = checked((long)_currentFunction.SchedResult.ChipLocalDataPoolSize),
                         ["block_local_data_pool_bytes"] = GetBlockLocalDataPoolBytes(),
                         ["block_local_data_scope_count"] = GetBlockLocalDataScopeCount(_targetOptions),
@@ -424,7 +429,6 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 _helperCalls.ToArray(),
                 _opKinds.ToArray(),
                 _attrs.TryGetValue("requires_grid_barrier", out var requiresGridBarrier) && requiresGridBarrier is true,
-                _collectiveDataPoolBytes,
                 GetBlockLocalDataPoolBytes(),
                 new Dictionary<string, PyNTTKVCacheStorageMetadata?>(_formalObjectFieldStorages, StringComparer.Ordinal),
                 new Dictionary<int, string>(_formalObjectOutputAliases));
@@ -765,7 +769,6 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     _attrs["requires_grid_barrier"] = true;
                 }
 
-                _collectiveDataPoolBytes = Math.Max(_collectiveDataPoolBytes, definition.BuildResult.CollectiveDataPoolBytes);
             }
 
             var callArguments = BuildDeviceFunctionInvocationArguments(callee, args, definition.Definition);
@@ -842,6 +845,8 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     validateOutputs: false,
                     currentFunction: callee,
                     formalTensorParameterBaseNames: formalPlan.TensorBaseNames,
+                    formalTensorParameterPoolStrideNames: formalPlan.TensorPoolStrideNames,
+                    formalTensorParameterPoolScopeSizeNames: formalPlan.TensorPoolScopeSizeNames,
                     formalTensorParameterDimensions: formalPlan.TensorDimensions,
                     formalTensorParameterGlobalOffsets: formalPlan.TensorGlobalOffsets,
                     formalTensorParameterSourceSplitAxes: formalPlan.TensorSourceSplitAxes,
@@ -1003,6 +1008,8 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
         {
             var parameterNames = new Dictionary<IVar, string>(ReferenceEqualityComparer.Instance);
             var tensorBaseNames = new Dictionary<IVar, string>(ReferenceEqualityComparer.Instance);
+            var tensorPoolStrideNames = new Dictionary<IVar, string>(ReferenceEqualityComparer.Instance);
+            var tensorPoolScopeSizeNames = new Dictionary<IVar, string>(ReferenceEqualityComparer.Instance);
             var tensorDimensions = new Dictionary<IVar, PyNTTDimExpression[]>(ReferenceEqualityComparer.Instance);
             var tensorGlobalOffsets = new Dictionary<IVar, PyNTTDimExpression[]>(ReferenceEqualityComparer.Instance);
             var formalTensorSourceSplitAxes = new Dictionary<IVar, int[][]>(ReferenceEqualityComparer.Instance);
@@ -1030,21 +1037,21 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     var scalarName = baseName;
                     dimParameterNames[SanitizePythonIdentifier(dimVar.Name)] = scalarName;
                     extraParameters.Add(scalarName);
-                    parameters.Add(new DeviceFunctionFormalParameter(i, parameter, DeviceFunctionFormalParameterKind.Scalar, null, null, Array.Empty<string>(), Array.Empty<string>(), Array.Empty<string>(), scalarName, null));
+                    parameters.Add(new DeviceFunctionFormalParameter(i, parameter, DeviceFunctionFormalParameterKind.Scalar, null, null, null, Array.Empty<string>(), Array.Empty<string>(), Array.Empty<string>(), scalarName, null));
                     continue;
                 }
 
                 if (parameter is BufferVar { Role: BufferVarRole.Workspace } workspace)
                 {
                     workspaceParameters.Add(workspace);
-                    parameters.Add(new DeviceFunctionFormalParameter(i, parameter, DeviceFunctionFormalParameterKind.Workspace, null, null, Array.Empty<string>(), Array.Empty<string>(), Array.Empty<string>(), null, workspace.Location));
+                    parameters.Add(new DeviceFunctionFormalParameter(i, parameter, DeviceFunctionFormalParameterKind.Workspace, null, null, null, Array.Empty<string>(), Array.Empty<string>(), Array.Empty<string>(), null, workspace.Location));
                     continue;
                 }
 
                 if (IsObjectDataType(parameter.CheckedDataType))
                 {
                     objectBaseNames.Add(parameter, baseName);
-                    parameters.Add(new DeviceFunctionFormalParameter(i, parameter, DeviceFunctionFormalParameterKind.Object, null, null, Array.Empty<string>(), Array.Empty<string>(), Array.Empty<string>(), baseName, null));
+                    parameters.Add(new DeviceFunctionFormalParameter(i, parameter, DeviceFunctionFormalParameterKind.Object, null, null, null, Array.Empty<string>(), Array.Empty<string>(), Array.Empty<string>(), baseName, null));
                     continue;
                 }
 
@@ -1052,6 +1059,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 {
                     var tensorType = GetTensorType(bufferVar.CheckedType, $"PyNTT device function {callee.Name} parameter {bufferVar.Name}");
                     var poolStrideName = $"{baseName}{PoolStrideElementsSuffix}";
+                    var poolScopeSizeName = $"{baseName}{PoolScopeSizeSuffix}";
                     var stridePrefix = GetVectorLaneElementCount(tensorType.DType) == 1
                         ? $"{baseName}_scalar_stride"
                         : $"{baseName}_stride";
@@ -1072,6 +1080,8 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                         .Select(name => new PyNTTDimExpression(name, name, RangeMin: 0, RangeMax: null))
                         .ToArray();
                     tensorBaseNames.Add(bufferVar, baseName);
+                    tensorPoolStrideNames.Add(bufferVar, poolStrideName);
+                    tensorPoolScopeSizeNames.Add(bufferVar, poolScopeSizeName);
                     tensorDimensions.Add(bufferVar, formalDimensions);
                     tensorGlobalOffsets.Add(bufferVar, formalGlobalOffsets);
                     formalTensorSourceSplitAxes.Add(
@@ -1081,6 +1091,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                             : CreateEmptySplitAxes(tensorType.Shape.Rank));
                     extraParameters.Add(baseName);
                     extraParameters.Add(poolStrideName);
+                    extraParameters.Add(poolScopeSizeName);
                     foreach (var strideName in strideNames)
                     {
                         extraParameters.Add(strideName);
@@ -1096,7 +1107,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                         extraParameters.Add(globalOffsetName);
                     }
 
-                    parameters.Add(new DeviceFunctionFormalParameter(i, parameter, DeviceFunctionFormalParameterKind.Tensor, baseName, poolStrideName, strideNames, dimensionNames, globalOffsetNames, null, null));
+                    parameters.Add(new DeviceFunctionFormalParameter(i, parameter, DeviceFunctionFormalParameterKind.Tensor, baseName, poolStrideName, poolScopeSizeName, strideNames, dimensionNames, globalOffsetNames, null, null));
                     continue;
                 }
 
@@ -1106,6 +1117,8 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             return new(
                 parameterNames,
                 tensorBaseNames,
+                tensorPoolStrideNames,
+                tensorPoolScopeSizeNames,
                 tensorDimensions,
                 tensorGlobalOffsets,
                 formalTensorSourceSplitAxes,
@@ -1244,6 +1257,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                         var buffer = GetBufferOperand(argument, $"PyNTT call to {callee.Name} tensor parameter {parameter.Parameter.Name}");
                         values[RequireParameterName(parameter.BaseName, definition.Name, parameter.Parameter.Name)] = BuildFormalTensorBasePointerArgument(buffer);
                         values[RequireParameterName(parameter.PoolStrideName, definition.Name, parameter.Parameter.Name)] = BuildFormalTensorPoolStrideElementsArgument(buffer);
+                        values[RequireParameterName(parameter.PoolScopeSizeName, definition.Name, parameter.Parameter.Name)] = BuildFormalTensorPoolScopeSizeArgument(buffer);
                         var strides = GetBufferStrides(buffer);
                         if (strides.Length != parameter.StrideNames.Length)
                         {
@@ -1384,10 +1398,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 return;
             }
 
-            if (destExpr is not TIR.Buffer dest)
-            {
-                throw new NotSupportedException($"PyNTT TensorLoad codegen expects a destination TIR buffer for tensor data, got {destExpr.GetType().Name}.");
-            }
+            var dest = GetBufferOperand(destExpr, "PyNTT TensorLoad destination");
 
             if (srcExpr is TIR.Buffer srcBuffer)
             {
@@ -1433,10 +1444,12 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
 
         private void VisitTensorStore(IReadOnlyList<BaseExpr> args)
         {
-            if (args.Count != 2 || args[0] is not TIR.Buffer src)
+            if (args.Count != 2)
             {
                 throw new NotSupportedException("PyNTT TensorStore codegen expects (source_buffer, dest_tensor).");
             }
+
+            var src = GetBufferOperand(args[0], "PyNTT TensorStore source");
 
             if (args[1] is TIR.Buffer destBuffer)
             {
@@ -1463,71 +1476,51 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
 
         private void VisitInternalTensorLoad(TIR.Buffer dest, TIR.Buffer src)
         {
-            if (IsObjectDataType(dest.ElemType) || IsObjectDataType(src.ElemType))
-            {
-                return;
-            }
-
-            ValidateMatchingBufferDType("PyNTT TensorLoad buffer source/destination", src, dest);
-            var sourcePointer = GetBufferScalarPointer(src);
-            _attrs["tir"] = true;
-            var localShape = GetBufferShape(dest);
-            var globalShape = GetBufferShape(src);
-            var helperName = GetNextHelperName("tensor_load");
-            WriteHelperTemplate(
-                "triton/kernels/TensorLoad.py.jinja",
-                new PyNTTTensorLoadTemplateModel(
-                    helperName,
-                    src.Name,
-                    0,
-                    GetBufferPointer(dest),
-                    GetPyNTTDTypeName(dest.ElemType),
-                    GetTritonDType(dest.ElemType),
-                    localShape,
-                    GetBufferStrides(dest),
-                    globalShape,
-                    GetHierarchy(dest),
-                    GetBufferSplitAxes(dest, globalShape.Length),
-                    GetVectorLaneElementCount(dest.ElemType),
-                    $"{src.Name} -> {dest.Name}")
-                {
-                    Source = sourcePointer,
-                });
-            WriteLine(BuildHelperCall(helperName));
+            VisitInternalTensorCopy(src, dest, "TensorLoad");
         }
 
         private void VisitInternalTensorStore(TIR.Buffer src, TIR.Buffer dest)
+        {
+            VisitInternalTensorCopy(src, dest, "TensorStore");
+        }
+
+        private void VisitInternalTensorCopy(TIR.Buffer src, TIR.Buffer dest, string operation)
         {
             if (IsObjectDataType(src.ElemType) || IsObjectDataType(dest.ElemType))
             {
                 return;
             }
 
-            ValidateMatchingBufferDType("PyNTT TensorStore buffer source/destination", src, dest);
-            var destinationPointer = GetBufferScalarPointer(dest);
+            ValidateMatchingBufferDType($"PyNTT {operation} buffer source/destination", src, dest);
+            var sourceShape = GetBufferActiveShape(src);
+            var destinationShape = GetBufferActiveShape(dest);
+            var sourceGlobalOffsets = GetBufferGlobalOffsets(src);
+            var destinationGlobalOffsets = GetBufferGlobalOffsets(dest);
+            ValidateSameRank($"PyNTT {operation} source/destination", sourceShape, destinationShape);
+            ValidateSameRank($"PyNTT {operation} source offsets", sourceShape, sourceGlobalOffsets);
+            ValidateSameRank($"PyNTT {operation} destination offsets", destinationShape, destinationGlobalOffsets);
+            ValidateSameShape(
+                $"PyNTT {operation} global shape",
+                GetBufferGlobalShape(src),
+                GetBufferGlobalShape(dest));
             _attrs["tir"] = true;
-            var localShape = GetBufferShape(src);
-            var globalShape = GetBufferShape(dest);
-            var helperName = GetNextHelperName("tensor_store");
+            var helperName = GetNextHelperName("tensor_region_copy");
             WriteHelperTemplate(
-                "triton/kernels/TensorStore.py.jinja",
-                new PyNTTTensorStoreTemplateModel(
+                "triton/kernels/TensorRegionCopy.py.jinja",
+                new PyNTTRegionCopyTemplateModel(
                     helperName,
-                    GetBufferPointer(src),
-                    dest.Name,
-                    0,
+                    GetBufferScalarPointer(src),
+                    GetBufferScalarPointer(dest),
                     GetPyNTTDTypeName(src.ElemType),
-                    GetTritonDType(src.ElemType),
-                    localShape,
+                    GetScalarTritonDType(src.ElemType),
+                    sourceShape,
+                    destinationShape,
+                    sourceGlobalOffsets,
+                    destinationGlobalOffsets,
                     GetBufferStrides(src),
-                    globalShape,
-                    GetHierarchy(src),
-                    GetBufferSplitAxes(src, globalShape.Length),
+                    GetBufferStrides(dest),
                     GetVectorLaneElementCount(src.ElemType),
-                    $"{src.Name} -> {dest.Name}")
-                {
-                    Destination = destinationPointer,
-                });
+                    $"{operation}: {src.Name} -> {dest.Name}"));
             WriteLine(BuildHelperCall(helperName));
         }
 
@@ -1958,12 +1951,13 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
 
         private void VisitGatherReduceScatter(Nncase.TIR.NTT.GatherReduceScatter gatherReduceScatter, IReadOnlyList<BaseExpr> args)
         {
-            if (args.Count < 2 ||
-                args[0] is not TIR.Buffer input ||
-                args[1] is not TIR.Buffer output)
+            if (args.Count < 2)
             {
-                throw new NotSupportedException("PyNTT GatherReduceScatter codegen expects input and output TIR buffers.");
+                throw new NotSupportedException($"PyNTT GatherReduceScatter codegen expects 2 buffer operands, got {args.Count}.");
             }
+
+            var input = GetBufferOperand(args[0], "PyNTT GatherReduceScatter input");
+            var output = GetBufferOperand(args[1], "PyNTT GatherReduceScatter output");
 
             if (!gatherReduceScatter.InType.Placement.Hierarchy.SequenceEqual(gatherReduceScatter.OutType.Placement.Hierarchy))
             {
@@ -1972,6 +1966,8 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
 
             SetComputeOp("reshard");
             var inputShape = GetBufferShape(input);
+            var inputActiveShape = GetBufferActiveShape(input);
+            var inputGlobalOffsets = GetBufferGlobalOffsets(input);
             var outputShape = GetBufferShape(output);
             var globalShape = GetRankedShapeDimensions(gatherReduceScatter.OutType.TensorType.Shape, "PyNTT GatherReduceScatter global shape")
                 .Select(GetDimensionExpression)
@@ -1994,6 +1990,18 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             }
 
             var hierarchy = gatherReduceScatter.OutType.Placement.Hierarchy.ToArray();
+            if (gatherReduceScatter.InType.AxisPolicies.Any(policy => policy is SBPPartial) ||
+                gatherReduceScatter.OutType.AxisPolicies.Any(policy => policy is SBPPartial))
+            {
+                throw new NotSupportedException("PyNTT GatherReduceScatter requires partial reduction metadata on DistributedType.Partial, not tensor-axis policies.");
+            }
+
+            if (gatherReduceScatter.OutType.Partial is not null)
+            {
+                throw new NotSupportedException("PyNTT GatherReduceScatter cannot materialize a partial output; partial reduction must be carried by the input type.");
+            }
+
+            var partialAxes = Array.Empty<int>();
             if (gatherReduceScatter.InType.Partial is { } partial)
             {
                 if (partial.Op != ReduceOp.Sum)
@@ -2001,8 +2009,13 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     throw new NotSupportedException($"PyNTT GatherReduceScatter currently supports Sum partial reduction only, got {partial.Op}.");
                 }
 
-                var reduceAxes = partial.Axes.ToArray();
-                foreach (var axis in reduceAxes)
+                partialAxes = partial.Axes.ToArray();
+                if (partialAxes.Length == 0 || partialAxes.Distinct().Count() != partialAxes.Length)
+                {
+                    throw new NotSupportedException($"PyNTT GatherReduceScatter partial axes must be non-empty and unique, got [{string.Join(",", partialAxes)}].");
+                }
+
+                foreach (var axis in partialAxes)
                 {
                     if (axis < 0 || axis >= hierarchy.Length)
                     {
@@ -2010,57 +2023,60 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     }
                 }
 
-                WriteBarrier(HelperBarrierKind.Grid);
-                WriteShardReduceHelper(input, reduceAxes, inputVectorLaneCount, inputScalarDType, hierarchy, false, HelperBarrierKind.Grid, $"{input.Name} partial reduce");
-                WriteShardReduceHelper(input, reduceAxes, inputVectorLaneCount, inputScalarDType, hierarchy, true, HelperBarrierKind.Block, $"{input.Name} partial broadcast");
             }
 
             _attrs["op"] = "reshard";
             _attrs["tir"] = true;
-            _attrs["requires_grid_barrier"] = true;
             _attrs["dtype"] = outputScalarDType;
             _attrs["shape"] = globalShape;
-            var inputRef = ResolveBufferRef(input);
-            var outputRef = ResolveBufferRef(output);
-            var hierarchySize = hierarchy.Aggregate(1L, (acc, value) => checked(acc * value));
-            var collectiveOffsetBytes = $"(data_pool_stride_bytes * {hierarchySize.ToString(CultureInfo.InvariantCulture)})";
-            var collectivePoolBytes = GetTensorMaxSizeBytes(globalShape, inputVectorLaneCount, GetScalarElementSizeBytes(output.ElemType), "PyNTT GatherReduceScatter collective pool");
-            _collectiveDataPoolBytes = Math.Max(_collectiveDataPoolBytes, collectivePoolBytes);
+            var inputRef = ResolveByteAddressedBufferRef(input);
+            var outputRef = ResolveByteAddressedBufferRef(output);
+            var inputSplitAxes = GetSplitAxes(gatherReduceScatter.InType);
+            var conflictingAxes = inputSplitAxes.SelectMany(axes => axes).Intersect(partialAxes).Distinct().ToArray();
+            if (conflictingAxes.Length > 0)
+            {
+                throw new NotSupportedException($"PyNTT GatherReduceScatter placement axes cannot be both split and partial: [{string.Join(",", conflictingAxes)}].");
+            }
 
-            PyNTTReshardTemplateModel MakeModel(string helperName, string stage) => new(
+            var reductionGroupSize = partialAxes.Aggregate(1L, (size, axis) => checked(size * hierarchy[axis]));
+            if (reductionGroupSize > 1 && IsZeroOffset(inputRef.PoolStrideBytes))
+            {
+                throw new NotSupportedException($"PyNTT GatherReduceScatter partial input {input.Name} requires distinct per-block storage.");
+            }
+
+            PyNTTReshardTemplateModel MakeModel(string helperName) => new(
                 helperName,
-                GetBufferScalarPointer(input, "source_shard_index"),
+                GetBufferScalarPointer(input),
                 GetBufferScalarPointer(output),
                 inputRef.BaseName,
                 inputRef.OffsetBytes,
                 inputRef.PoolStrideBytes,
+                inputRef.PoolScopeSize,
                 outputRef.BaseName,
                 outputRef.OffsetBytes,
                 outputRef.PoolStrideBytes,
+                outputRef.PoolScopeSize,
                 GetScalarElementSizeBytes(output.ElemType),
                 outputScalarDType,
                 GetScalarTritonDType(output.ElemType),
                 globalShape,
                 inputShape,
+                inputActiveShape,
+                inputGlobalOffsets,
                 outputShape,
                 GetBufferStrides(input),
                 GetBufferStrides(output),
                 inputVectorLaneCount,
                 hierarchy,
-                GetSplitAxes(gatherReduceScatter.InType),
+                inputSplitAxes,
+                partialAxes,
                 GetSplitAxes(gatherReduceScatter.OutType),
-                collectiveOffsetBytes,
-                collectivePoolBytes,
-                stage,
+                "tile_scatter",
                 $"{input.Name} -> {output.Name}");
 
-            var toCollectiveHelperName = GetNextHelperName("reshard_to_collective");
-            WriteHelperTemplate("triton/kernels/Reshard.py.jinja", MakeModel(toCollectiveHelperName, "to_collective"));
-            var fromCollectiveHelperName = GetNextHelperName("reshard_from_collective");
-            WriteHelperTemplate("triton/kernels/Reshard.py.jinja", MakeModel(fromCollectiveHelperName, "from_collective"));
-            WriteBarrier(HelperBarrierKind.Grid);
-            WriteLine(BuildHelperCall(toCollectiveHelperName), HelperBarrierKind.Grid);
-            WriteLine(BuildHelperCall(fromCollectiveHelperName), HelperBarrierKind.Grid);
+            var helperName = GetNextHelperName("reshard_tile_scatter");
+            WriteHelperTemplate("triton/kernels/Reshard.py.jinja", MakeModel(helperName));
+            WriteLine(BuildHelperCall(helperName));
         }
 
         private void VisitPad(Nncase.TIR.NTT.Pad pad, IReadOnlyList<BaseExpr> args)
@@ -3889,9 +3905,9 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 throw new NotSupportedException($"PyNTT SUMMA expects compatible global matrix shapes, got lhs=[{ShapeText(lhsGlobalShape)}], rhs=[{ShapeText(rhsGlobalShape)}], output=[{ShapeText(outputGlobalShape)}].");
             }
 
-            var lhsRef = ResolveBufferRef(lhs);
-            var rhsRef = ResolveBufferRef(rhs);
-            var outputRef = ResolveBufferRef(output);
+            var lhsRef = ResolveByteAddressedBufferRef(lhs);
+            var rhsRef = ResolveByteAddressedBufferRef(rhs);
+            var outputRef = ResolveByteAddressedBufferRef(output);
             var scale = GetScalarFloat(args[4], "PyNTT SUMMA scale", 1.0f);
             _attrs["op"] = "matmul";
             _attrs["tir"] = true;
@@ -4068,69 +4084,6 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
 
         private static bool IsGemvMatmul(IReadOnlyList<PyNTTDimExpression> outputShape)
             => outputShape.Count >= 2 && outputShape[^2].MaxValue == 1;
-
-        private void WriteShardReduceHelper(
-            TIR.Buffer buffer,
-            int[] reduceAxes,
-            int vectorLaneCount,
-            string scalarDType,
-            int[] hierarchy,
-            bool broadcast,
-            HelperBarrierKind postBarrier,
-            string comment)
-        {
-            var bufferRef = ResolveBufferRef(buffer);
-            if (buffer.MemSpan.Buffer.Location != MemoryLocation.Data)
-            {
-                throw new NotSupportedException($"PyNTT Matmul shard reduce currently supports data workspace buffers only, got {buffer.MemSpan.Buffer.Location}.");
-            }
-
-            var localShape = GetBufferShape(buffer);
-            var strides = GetBufferStrides(buffer);
-            var tritonDType = GetScalarTritonDType(buffer.ElemType);
-            var helperKey = BuildShardReduceHelperKey(
-                bufferRef.BaseName,
-                scalarDType,
-                tritonDType,
-                localShape,
-                strides,
-                vectorLaneCount,
-                hierarchy,
-                reduceAxes,
-                broadcast);
-            var hasSharedHelper = _sharedHelperRegistry.TryGet(helperKey, out var helperName, out var sharedHelperArguments);
-            if (!hasSharedHelper)
-            {
-                helperName = _sharedHelperRegistry.Add(helperKey, _function.Name, broadcast ? "shard_broadcast" : "shard_reduce");
-                var helperArguments = WriteHelperTemplate(
-                    "triton/kernels/ShardReduce.py.jinja",
-                    new PyNTTShardReduceTemplateModel(
-                        helperName,
-                        bufferRef.BaseName,
-                        scalarDType,
-                        tritonDType,
-                        localShape,
-                        strides,
-                        vectorLaneCount,
-                        hierarchy,
-                        reduceAxes,
-                        broadcast,
-                        comment));
-                _sharedHelperRegistry.SetArguments(helperKey, helperArguments);
-            }
-            else
-            {
-                _helperArguments[helperName] = sharedHelperArguments;
-            }
-
-            WriteLine(
-                BuildHelperCall(
-                    helperName,
-                    BuildRawPythonArgument(bufferRef.PoolStrideBytes),
-                    BuildRawPythonArgument(bufferRef.OffsetBytes),
-                    BuildRawPythonArgument(bufferRef.OffsetBytes)),
-                postBarrier);
-        }
 
         private void VisitReduce(Nncase.TIR.NTT.Reduce reduce, IReadOnlyList<BaseExpr> args)
         {
@@ -4555,10 +4508,8 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     GetTritonDType(output.ElemType),
                     outputShape,
                     globalShape,
+                    GetBufferGlobalOffsets(output),
                     GetBufferStrides(output),
-                    GetHierarchy(output),
-                    GetBufferSplitAxes(output, outputShape.Length),
-                    GetShardAxis(output),
                     $"kv-cache -> {output.Name}"));
             WriteLine(BuildHelperCall(helperName, cacheMetaArgument));
         }
@@ -4621,9 +4572,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     GetVectorLaneElementCount(slots.ElemType),
                     cache,
                     $"{slots.Name} -> kv-cache"));
-            _attrs["requires_grid_barrier"] = true;
-            WriteBarrier(HelperBarrierKind.Grid);
-            WriteLine(BuildHelperCall(helperName, slotMappingArgument, storageArgument, storageBlocksArgument, metaArgument), HelperBarrierKind.Grid);
+            WriteLine(BuildHelperCall(helperName, slotMappingArgument, storageArgument, storageBlocksArgument, metaArgument));
         }
 
         private void VisitPagedAttention(Nncase.TIR.NTT.PagedAttention pagedAttention, IReadOnlyList<BaseExpr> args)
@@ -4691,8 +4640,6 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     layerIdExpression,
                     cache,
                     $"{query.Name}, kv-cache -> {output.Name}"));
-            _attrs["requires_grid_barrier"] = true;
-            WriteBarrier(HelperBarrierKind.Grid);
             WriteLine(BuildHelperCall(helperName, blockTablesArgument, storageArgument, storageBlocksArgument, metaArgument));
         }
 
@@ -4838,18 +4785,34 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
         private TIR.Buffer MaterializeAllocateBufferView(string name, Call call)
         {
             var args = call.Arguments.ToArray();
-            if (args.Length != 1)
+            if (args.Length != 2)
             {
-                throw new NotSupportedException($"PyNTT AllocateBufferView codegen expects 1 argument, got {args.Length}.");
+                throw new NotSupportedException($"PyNTT AllocateBufferView codegen expects a buffer and its local logical offset, got {args.Length} arguments.");
             }
 
             var source = GetBufferOperand(args[0], "PyNTT AllocateBufferView source");
+            var localOffsets = GetShapeArgument(args[1], "PyNTT AllocateBufferView local offset")
+                .Select(GetDimensionExpression)
+                .ToArray();
+            if (localOffsets.Length != source.Rank)
+            {
+                throw new NotSupportedException($"PyNTT AllocateBufferView rank mismatch: source rank {source.Rank}, local offset rank {localOffsets.Length}.");
+            }
+
+            var sourceGlobalOffsets = GetBufferGlobalOffsets(source);
+            var globalOffsets = sourceGlobalOffsets
+                .Zip(localOffsets)
+                .Select(pair => AddDimExpression(pair.First, pair.Second))
+                .ToArray();
+            var activeShape = source.Dimensions.ToArray()
+                .Select(GetDimensionExpression)
+                .ToArray();
             var result = source.With(name: SanitizePythonIdentifier(name));
-            _bufferActiveShapeOverrides[result] = GetBufferActiveShape(source);
+            _bufferActiveShapeOverrides[result] = activeShape;
             _bufferGlobalShapeOverrides[result] = GetBufferGlobalShape(source);
-            _bufferGlobalOffsetOverrides[result] = GetBufferGlobalOffsets(source);
+            _bufferGlobalOffsetOverrides[result] = globalOffsets;
             _bufferSourceSplitAxesOverrides[result] = GetBufferSourceSplitAxes(source, source.Rank);
-            _bufferViewSourceByBuffer[result] = new(source, CreateZeroDimExpressions(source.Rank), GetBufferActiveShape(source));
+            _bufferViewSourceByBuffer[result] = new(source, CreateZeroDimExpressions(source.Rank), activeShape);
             TrackObjectViewSource(result, source);
             TrackObjectViewAlias(result, source);
             return result;
@@ -4878,11 +4841,17 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             var activeShape = ClipSubviewShape(sourceActiveShape, offsetShape, requestedShape);
             var offsetElements = TensorUtilities.GetLinearOffset(source.Strides, offsets);
             var offsetBytes = offsetElements * source.ElemType.SizeInBytes;
-            var result = source.With(
-                name: SanitizePythonIdentifier(name),
-                memSpan: source.MemSpan.With(start: source.MemSpan.Start + offsetBytes),
-                dimensions: shape,
-                distributedType: null);
+
+            // A subview is already a concrete local region. Keep its global
+            // distribution in the side tables below, but do not let local
+            // kernel shape queries fall back to the source distributed type.
+            var result = new TIR.Buffer(
+                SanitizePythonIdentifier(name),
+                source.ElemType,
+                source.MemSpan.With(start: source.MemSpan.Start + offsetBytes),
+                shape,
+                source.Strides.ToArray(),
+                null);
             _bufferActiveShapeOverrides[result] = activeShape;
             _bufferGlobalShapeOverrides[result] = GetBufferGlobalShape(source);
             _bufferGlobalOffsetOverrides[result] = sourceGlobalOffsets.Zip(offsetShape).Select(pair => AddDimExpression(pair.First, pair.Second)).ToArray();
@@ -5665,10 +5634,21 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
         }
 
         private string BuildFormalTensorBasePointerArgument(TIR.Buffer buffer)
-            => GetBufferScalarPointer(buffer).Expression;
+        {
+            var bufferRef = ResolveBufferRef(buffer) with { IndexExpression = null };
+            return BuildPointerExpression(bufferRef, GetScalarTritonDType(buffer.ElemType));
+        }
 
         private string BuildFormalTensorPoolStrideElementsArgument(TIR.Buffer buffer)
-            => "0";
+        {
+            var bufferRef = ResolveBufferRef(buffer);
+            return bufferRef.IsByteAddressed
+                ? DivideOffsetExpression(bufferRef.PoolStrideBytes, GetScalarElementSizeBytes(buffer.ElemType))
+                : bufferRef.PoolStrideBytes;
+        }
+
+        private string BuildFormalTensorPoolScopeSizeArgument(TIR.Buffer buffer)
+            => ResolveBufferRef(buffer).PoolScopeSize;
 
         private PyNTTDimExpression[] GetTensorShape(BaseExpr expr, string name)
         {
@@ -5709,13 +5689,44 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 MemoryLocation.Data when buffer.DistributedType is null => new(GetDataBaseName(buffer), offsetBytes, "0", null, shardCoordHierarchy, true),
                 MemoryLocation.Data => new(GetDataBaseName(buffer), offsetBytes, "data_pool_stride_bytes", "shard_index", shardCoordHierarchy, true),
                 MemoryLocation.ChipLocalData => new(GetChipLocalDataBaseName(buffer), offsetBytes, "0", null, shardCoordHierarchy, true),
-                MemoryLocation.BlockLocalData => new(GetBlockLocalDataBaseName(buffer), offsetBytes, "block_local_data_pool_stride_bytes", BuildBlockLocalDataIndexExpression(_targetOptions), shardCoordHierarchy, true),
-                MemoryLocation.Cache => new(GetBlockLocalDataBaseName(buffer), offsetBytes, "block_local_data_pool_stride_bytes", BuildBlockLocalDataIndexExpression(_targetOptions), shardCoordHierarchy, true),
+                MemoryLocation.BlockLocalData => CreateBlockLocalBufferRef(buffer, offsetBytes, shardCoordHierarchy),
+                MemoryLocation.Cache => CreateBlockLocalBufferRef(buffer, offsetBytes, shardCoordHierarchy),
                 MemoryLocation.Rdata => new("rdata", offsetBytes, "0", null, shardCoordHierarchy, true),
                 MemoryLocation.ChipLocalRdata => new("chip_local_rdata", offsetBytes, "0", null, shardCoordHierarchy, true),
                 MemoryLocation.BlockLocalRdata => new("block_local_rdata", offsetBytes, PyNTTRDataUtility.GetLocalRDataTableStrideBytes(_currentFunction.SchedResult.BlockLocalRdatas, _targetOptions, "b").ToString(CultureInfo.InvariantCulture), "shard_index", shardCoordHierarchy, true),
                 var location => throw new NotSupportedException($"PyNTT does not support buffer memory location {location} for Triton template operands yet."),
             };
+        }
+
+        private BufferRef ResolveByteAddressedBufferRef(TIR.Buffer buffer)
+        {
+            var bufferRef = ResolveBufferRef(buffer);
+            if (bufferRef.IsByteAddressed)
+            {
+                return bufferRef;
+            }
+
+            var scalarElementSizeBytes = GetScalarElementSizeBytes(buffer.ElemType);
+            return bufferRef with
+            {
+                BaseName = $"({bufferRef.BaseName}).to(tl.pointer_type(tl.uint8))",
+                OffsetBytes = MultiplyOffsetExpression(bufferRef.OffsetBytes, scalarElementSizeBytes),
+                PoolStrideBytes = MultiplyOffsetExpression(bufferRef.PoolStrideBytes, scalarElementSizeBytes),
+                IsByteAddressed = true,
+            };
+        }
+
+        private BufferRef CreateBlockLocalBufferRef(TIR.Buffer buffer, string offsetBytes, int[]? shardCoordHierarchy)
+        {
+            var poolScopeSize = GetBlockLocalDataScopeSize(_targetOptions);
+            return new(
+                GetBlockLocalDataBaseName(buffer),
+                offsetBytes,
+                "block_local_data_pool_stride_bytes",
+                BuildScopeIndexExpression("shard_index", poolScopeSize),
+                shardCoordHierarchy,
+                true,
+                poolScopeSize.ToString(CultureInfo.InvariantCulture));
         }
 
         private BufferRef ResolveBufferViewRef(BufferViewSource viewSource)
@@ -5794,7 +5805,21 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
         }
 
         private BufferRef ResolveFormalAbiBufferRef(TIR.Buffer buffer, string baseName)
-            => new(baseName, GetBufferSpanOffsetElements(buffer), "0", null, null, false);
+        {
+            if (!TryGetFormalTensorStorageNames(buffer, out var poolStrideName, out var poolScopeSizeName))
+            {
+                throw new NotSupportedException($"PyNTT formal tensor buffer {buffer.Name} is missing backing-pool ABI metadata.");
+            }
+
+            return new(
+                baseName,
+                GetBufferSpanOffsetElements(buffer),
+                poolStrideName,
+                BuildScopeIndexExpression("shard_index", poolScopeSizeName),
+                null,
+                false,
+                poolScopeSizeName);
+        }
 
         private bool TryGetFormalTensorBaseName(TIR.Buffer buffer, out string baseName)
         {
@@ -5802,6 +5827,16 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             return IsAbiBuffer(buffer) &&
                 buffer.MemSpan.Buffer.Start is IVar parameter &&
                 _formalTensorParameterBaseNames.TryGetValue(parameter, out baseName);
+        }
+
+        private bool TryGetFormalTensorStorageNames(TIR.Buffer buffer, out string poolStrideName, out string poolScopeSizeName)
+        {
+            poolStrideName = string.Empty;
+            poolScopeSizeName = string.Empty;
+            return IsAbiBuffer(buffer) &&
+                buffer.MemSpan.Buffer.Start is IVar parameter &&
+                _formalTensorParameterPoolStrideNames.TryGetValue(parameter, out poolStrideName) &&
+                _formalTensorParameterPoolScopeSizeNames.TryGetValue(parameter, out poolScopeSizeName);
         }
 
         private bool TryGetFormalTensorDimensions(TIR.Buffer buffer, out PyNTTDimExpression[] dimensions)
@@ -6210,34 +6245,6 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             return reduceAxes;
         }
 
-        private string BuildShardReduceHelperKey(
-            string baseName,
-            string scalarDType,
-            string tritonDType,
-            IReadOnlyList<PyNTTDimExpression> localShape,
-            IReadOnlyList<PyNTTDimExpression> strides,
-            int vectorLaneCount,
-            IReadOnlyList<int> hierarchy,
-            IReadOnlyList<int> reduceAxes,
-            bool broadcast)
-        {
-            static string DimsKey(IEnumerable<PyNTTDimExpression> dims)
-                => string.Join(",", dims.Select(dim => dim.TritonExpression));
-
-            return string.Join(
-                "|",
-                broadcast ? "broadcast" : "reduce",
-                baseName,
-                scalarDType,
-                tritonDType,
-                $"shape={DimsKey(localShape)}",
-                $"strides={DimsKey(strides)}",
-                $"lane={vectorLaneCount.ToString(CultureInfo.InvariantCulture)}",
-                $"hierarchy={string.Join(",", hierarchy)}",
-                $"reduce={string.Join(",", reduceAxes)}",
-                $"runtime={string.Join(",", _runtimeScalarNames)}");
-        }
-
         private PyNTTDimExpression GetDimensionExpression(Dimension dimension) => _dimEmitter.Emit(dimension);
 
         private static PyNTTDimExpression AddDimExpression(PyNTTDimExpression lhs, PyNTTDimExpression rhs)
@@ -6369,6 +6376,26 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             return $"(({expression}) // {divisor.ToString(CultureInfo.InvariantCulture)})";
         }
 
+        private static string MultiplyOffsetExpression(string expression, int multiplier)
+        {
+            if (multiplier <= 0)
+            {
+                throw new ArgumentOutOfRangeException(nameof(multiplier), multiplier, "Offset multiplier must be positive.");
+            }
+
+            if (multiplier == 1 || IsZeroOffset(expression))
+            {
+                return expression;
+            }
+
+            if (long.TryParse(expression.Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var value))
+            {
+                return checked(value * multiplier).ToString(CultureInfo.InvariantCulture);
+            }
+
+            return $"(({expression}) * {multiplier.ToString(CultureInfo.InvariantCulture)})";
+        }
+
         private static bool IsZeroOffset(string expression)
             => string.Equals(expression.Trim(), "0", StringComparison.Ordinal);
 
@@ -6390,7 +6417,17 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             => GetScopeCount(targetOptions, GetBlockLocalDataScopeSize(targetOptions));
 
         private static string BuildScopeIndexExpression(int scopeSize)
-            => scopeSize <= 1 ? "shard_index" : $"(shard_index // {scopeSize.ToString(CultureInfo.InvariantCulture)})";
+            => BuildScopeIndexExpression("shard_index", scopeSize);
+
+        private static string BuildScopeIndexExpression(string linearIndexExpression, int scopeSize)
+            => scopeSize <= 1
+                ? linearIndexExpression
+                : $"(({linearIndexExpression}) // {scopeSize.ToString(CultureInfo.InvariantCulture)})";
+
+        private static string BuildScopeIndexExpression(string linearIndexExpression, string scopeSizeExpression)
+            => string.Equals(scopeSizeExpression, "1", StringComparison.Ordinal)
+                ? linearIndexExpression
+                : $"(({linearIndexExpression}) // ({scopeSizeExpression}))";
 
         private static int GetScopeCount(PyNTTTargetOptions targetOptions, int scopeSize)
         {
@@ -6857,7 +6894,14 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             public Dictionary<string, DeviceFunctionDefinition> DeviceFunctionDefinitionsByName { get; }
         }
 
-        private sealed record BufferRef(string BaseName, string OffsetBytes, string PoolStrideBytes, string? IndexExpression, int[]? ShardCoordHierarchy, bool IsByteAddressed);
+        private sealed record BufferRef(
+            string BaseName,
+            string OffsetBytes,
+            string PoolStrideBytes,
+            string? IndexExpression,
+            int[]? ShardCoordHierarchy,
+            bool IsByteAddressed,
+            string PoolScopeSize = "1");
 
         public enum DeviceFunctionFormalParameterKind
         {
@@ -6873,6 +6917,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             DeviceFunctionFormalParameterKind Kind,
             string? BaseName,
             string? PoolStrideName,
+            string? PoolScopeSizeName,
             string[] StrideNames,
             string[] DimensionNames,
             string[] GlobalOffsetNames,
@@ -6885,6 +6930,8 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
         public sealed record DeviceFunctionFormalPlan(
             IReadOnlyDictionary<IVar, string> ParameterNames,
             IReadOnlyDictionary<IVar, string> TensorBaseNames,
+            IReadOnlyDictionary<IVar, string> TensorPoolStrideNames,
+            IReadOnlyDictionary<IVar, string> TensorPoolScopeSizeNames,
             IReadOnlyDictionary<IVar, PyNTTDimExpression[]> TensorDimensions,
             IReadOnlyDictionary<IVar, PyNTTDimExpression[]> TensorGlobalOffsets,
             IReadOnlyDictionary<IVar, int[][]> TensorSourceSplitAxes,
@@ -7972,8 +8019,18 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             throw new NotSupportedException($"{context} requires a non-scalar output, got [{ShapeText(outputShape)}].");
         }
 
-        var rotaryDim = RequireFixedDim(MultiplyDim(outputShape[rotaryAxis], laneCount), $"{context} rotary dimension");
-        if (rotaryDim % 2 != 0)
+        var rotaryDim = MultiplyDim(outputShape[rotaryAxis], laneCount);
+        if (laneCount % 2 == 0)
+        {
+            return;
+        }
+
+        if (!rotaryDim.FixedValue.HasValue)
+        {
+            throw new NotSupportedException($"{context} cannot prove that dynamic rotary dimension {rotaryDim.PythonExpression} is even.");
+        }
+
+        if (rotaryDim.FixedValue.Value % 2 != 0)
         {
             throw new NotSupportedException($"{context} requires an even rotary dimension, got axis {rotaryAxis} with shape [{ShapeText(outputShape)}] and lanes {laneCount}.");
         }
@@ -8548,7 +8605,6 @@ internal sealed record DeviceFunctionBuildResult(
     IReadOnlyList<HelperKernelCallMetadata> HelperCalls,
     IReadOnlyList<string> OpKinds,
     bool RequiresGridBarrier,
-    long CollectiveDataPoolBytes,
     long BlockLocalDataPoolBytes,
     IReadOnlyDictionary<string, PyNTTKVCacheStorageMetadata?> FormalObjectFieldStorages,
     IReadOnlyDictionary<int, string> FormalObjectOutputAliases);

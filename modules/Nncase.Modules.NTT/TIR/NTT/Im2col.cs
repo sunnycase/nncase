@@ -20,9 +20,9 @@ public sealed partial class Im2col : NTTKernelOp
     /// <summary>
     /// Gets input.
     /// </summary>
-    public static readonly ParameterInfo Input = new(typeof(Im2col), 0, "input", ParameterKind.Input);
+    public static readonly ParameterInfo Input = new(typeof(Im2col), 0, "input", ParameterKind.Input, MemoryEffect.Read);
 
-    public static readonly ParameterInfo Output = new(typeof(Im2col), 1, "output", ParameterKind.Input);
+    public static readonly ParameterInfo Output = new(typeof(Im2col), 1, "output", ParameterKind.Input, MemoryEffect.Write);
 
     public IRArray<long> Kernel { get; }
 

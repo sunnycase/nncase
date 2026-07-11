@@ -29,11 +29,11 @@ internal sealed class GraphMergePointCollector
                 {
                     foreach (var b in s2.Vertices)
                     {
-                        if (rootGraph.TryGetEdge(a, b, out _))
+                        if (rootGraph.TryGetEdge(a, b, out var forwardEdge) && GraphExtensions.IsFusionLegal(a, b, forwardEdge.Tag))
                         {
                             Points.Add(new MergePoint(b, a, TargetLevel));
                         }
-                        else if (rootGraph.TryGetEdge(b, a, out _))
+                        else if (rootGraph.TryGetEdge(b, a, out var backwardEdge) && GraphExtensions.IsFusionLegal(b, a, backwardEdge.Tag))
                         {
                             Points.Add(new MergePoint(a, b, TargetLevel));
                         }

@@ -318,15 +318,6 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
             _ => false,
         };
 
-    private static long GetMaxCollectiveDataBytes(IReadOnlyList<GeneratedKernelMetadata> kernels)
-        => kernels
-            .Select(GetCollectiveDataBytes)
-            .DefaultIfEmpty(0)
-            .Max();
-
-    private static long GetCollectiveDataBytes(GeneratedKernelMetadata kernel)
-        => GetInt64LaunchMeta(kernel, "collective_data_pool_bytes");
-
     private static long GetMaxBlockLocalDataBytes(IReadOnlyList<GeneratedKernelMetadata> kernels)
         => kernels
             .Select(GetBlockLocalDataBytes)
@@ -690,7 +681,6 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
     private sealed record PreparedWorkspaceRequirements(
         bool UsesData,
         long DataLocalBytes,
-        long CollectiveDataBytes,
         int MaxShardCount,
         bool UsesChipLocalData,
         long ChipLocalDataBytes,
@@ -961,7 +951,6 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
                 .Select(GetShardCount)
                 .DefaultIfEmpty(GetTargetShardCount())
                 .Max();
-            var collectiveDataBytes = GetMaxCollectiveDataBytes(kernels);
             var kernelBlockLocalDataBytes = GetMaxBlockLocalDataBytes(tirKernels);
             var usesData = false;
             var dataLocalBytes = 0L;
@@ -1007,7 +996,6 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
                 var calleeRequirements = GetPreparedWorkspaceRequirements(FindLinkableFunction(directCallee), active);
                 usesData |= calleeRequirements.UsesData;
                 nestedDataLocalBytes = Math.Max(nestedDataLocalBytes, calleeRequirements.DataLocalBytes);
-                collectiveDataBytes = Math.Max(collectiveDataBytes, calleeRequirements.CollectiveDataBytes);
                 maxShardCount = Math.Max(maxShardCount, calleeRequirements.MaxShardCount);
                 usesChipLocalData |= calleeRequirements.UsesChipLocalData;
                 nestedChipLocalDataBytes = Math.Max(nestedChipLocalDataBytes, calleeRequirements.ChipLocalDataBytes);
@@ -1018,7 +1006,6 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
             return new PreparedWorkspaceRequirements(
                 usesData,
                 checked(dataLocalBytes + nestedDataLocalBytes),
-                collectiveDataBytes,
                 maxShardCount,
                 usesChipLocalData,
                 checked(chipLocalDataBytes + nestedChipLocalDataBytes),
@@ -1104,7 +1091,7 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
                 var dataName = context.State.NewTemp("data");
                 context.Data = dataName;
                 statements.Add(
-                    $"{indent}{dataName} = self.allocate_workspace({context.RootInputsExpression}, {PythonString(function.SourceFunction.Name + ".data")}, {requirements.DataLocalBytes.ToString(CultureInfo.InvariantCulture)} * {requirements.MaxShardCount.ToString(CultureInfo.InvariantCulture)} + {requirements.CollectiveDataBytes.ToString(CultureInfo.InvariantCulture)}, {dataDType})");
+                    $"{indent}{dataName} = self.allocate_workspace({context.RootInputsExpression}, {PythonString(function.SourceFunction.Name + ".data")}, {requirements.DataLocalBytes.ToString(CultureInfo.InvariantCulture)} * {requirements.MaxShardCount.ToString(CultureInfo.InvariantCulture)}, {dataDType})");
             }
 
             if (string.IsNullOrWhiteSpace(context.ChipLocalData) && requirements.UsesChipLocalData)
@@ -2250,15 +2237,12 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
             else
             {
                 var dataBytesPerProgram = PythonValue(kernel.Launch.Meta["data_pool_bytes"]);
-                var collectiveDataBytes = kernel.Launch.Meta.TryGetValue("collective_data_pool_bytes", out var collectiveDataValue)
-                    ? PythonValue(collectiveDataValue)
-                    : "0";
                 var blockLocalDataBytesPerScope = PythonValue(kernel.Launch.Meta["block_local_data_pool_bytes"]);
                 var blockLocalDataScopeCount = PythonValue(kernel.Launch.Meta["block_local_data_scope_count"]);
                 var chipLocalDataBytes = PythonValue(kernel.Launch.Meta["chip_local_data_pool_bytes"]);
                 var dataDType = PythonString((string)kernel.Launch.Meta["data_dtype"]);
                 workspaceSetup = $"""
-                        data = self.allocate_workspace({context.RootInputsExpression}, {PythonString(kernel.Name + ".data")}, {dataBytesPerProgram} * grid[0] + {collectiveDataBytes}, {dataDType})
+                        data = self.allocate_workspace({context.RootInputsExpression}, {PythonString(kernel.Name + ".data")}, {dataBytesPerProgram} * grid[0], {dataDType})
                         chip_local_data = self.allocate_workspace({context.RootInputsExpression}, {PythonString(kernel.Name + ".chip_local_data")}, {chipLocalDataBytes}, {dataDType})
                         block_local_data = self.allocate_workspace({context.RootInputsExpression}, {PythonString(kernel.Name + ".block_local_data")}, {blockLocalDataBytesPerScope} * {blockLocalDataScopeCount}, {dataDType})
                         rdata, chip_local_rdata, block_local_rdata = self.materialize_rdata_bundle({context.RootInputsExpression}, {PythonString(functionName)})

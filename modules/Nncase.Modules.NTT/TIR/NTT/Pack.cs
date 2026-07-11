@@ -20,9 +20,9 @@ public sealed partial class Pack : NTTKernelOp
     /// <summary>
     /// Gets input.
     /// </summary>
-    public static readonly ParameterInfo Input = new(typeof(Pack), 0, "input", ParameterKind.Input);
+    public static readonly ParameterInfo Input = new(typeof(Pack), 0, "input", ParameterKind.Input, MemoryEffect.Read);
 
-    public static readonly ParameterInfo Output = new(typeof(Pack), 1, "output", ParameterKind.Input);
+    public static readonly ParameterInfo Output = new(typeof(Pack), 1, "output", ParameterKind.Input, MemoryEffect.Write);
 
     public IRArray<int> Lanes { get; }
 

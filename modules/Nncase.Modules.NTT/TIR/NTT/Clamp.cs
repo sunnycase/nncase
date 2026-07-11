@@ -7,9 +7,9 @@ namespace Nncase.TIR.NTT;
 
 public sealed partial class Clamp : NTTKernelOp
 {
-    public static readonly ParameterInfo Input = new(typeof(Clamp), 0, "input");
+    public static readonly ParameterInfo Input = new(typeof(Clamp), 0, "input", memoryEffect: MemoryEffect.Read);
 
-    public static readonly ParameterInfo Output = new(typeof(Clamp), 1, "output");
+    public static readonly ParameterInfo Output = new(typeof(Clamp), 1, "output", memoryEffect: MemoryEffect.Write);
 
     public float Min { get; }
 

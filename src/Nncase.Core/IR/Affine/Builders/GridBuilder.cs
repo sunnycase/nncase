@@ -1,13 +1,8 @@
 ﻿// Copyright (c) Canaan Inc. All rights reserved.
 // Licensed under the Apache license. See LICENSE file in the project root for full license information.
 
-using System;
-using System.Collections.Generic;
-using System.CommandLine;
-using System.Linq;
 using System.Runtime.InteropServices;
-using System.Text;
-using System.Threading.Tasks;
+
 using Nncase.TIR;
 
 namespace Nncase.IR.Affine.Builders;
@@ -26,21 +21,27 @@ public interface IGridBuilder : IExprBuilder<Grid>
 
     IGridBuilder Read(Expr argument, AffineMap accessMap, out Var parameter);
 
+    IGridBuilder Read(Expr argument, AffineMap accessMap, GridDomainMode domainMode, out Var parameter);
+
     IGridBuilder Write(Expr buffer, AffineMap accessMap, out Var parameter);
+
+    IGridBuilder ReadRoot(Expr argument, AffineMap accessMap, out Var parameter);
+
+    IGridBuilder ReadRoot(Expr argument, AffineMap accessMap, GridDomainMode domainMode, out Var parameter);
+
+    IGridBuilder WriteRoot(Expr buffer, AffineMap accessMap, out Var parameter);
+
+    IGridBuilder WriteRoot(Expr buffer, AffineMap accessMap, GridDomainMode domainMode, out Var parameter);
+
+    IGridBuilder ReadWriteRoot(Expr argument, BaseExpr region, out Var parameter);
 
     IGridBuilder Domain(int dims, out Var parameter);
 }
 
 internal class GridBuilder : IGridBuilder
 {
-    private readonly List<Var> _bodyParameters = new();
+    private readonly List<GridAccess> _accesses = new();
     private readonly List<object> _body = new();
-    private readonly List<Expr> _reads = new();
-    private readonly List<Expr> _readBuffers = new();
-    private readonly List<AffineMap> _readMaps = new();
-    private readonly List<Expr> _writeBuffers = new();
-    private readonly List<AffineMap> _writeMaps = new();
-    private int? _domainDims;
     private Var? _domainParameter;
 
     public GridBuilder()
@@ -57,38 +58,53 @@ internal class GridBuilder : IGridBuilder
     {
         return new Grid(
             _domainParameter ?? throw new InvalidOperationException("domain dims is not set."),
-            CollectionsMarshal.AsSpan(_bodyParameters),
-            _readMaps.Concat(_writeMaps).ToArray(),
-            _readBuffers.Concat(_writeBuffers).ToArray(),
-            CollectionsMarshal.AsSpan(_reads),
+            CollectionsMarshal.AsSpan(_accesses),
             Sequential.Flatten(CollectionsMarshal.AsSpan(_body)));
     }
 
     public IGridBuilder Domain(int dims, out Var parameter)
     {
-        _domainDims = dims;
         parameter = new Var(new IR.TupleType(Enumerable.Repeat(new IR.TupleType(new IRType[] { TensorType.Scalar(DataTypes.Int64), TensorType.Scalar(DataTypes.Int64) }), dims)));
         _domainParameter = parameter;
         return this;
     }
 
     public IGridBuilder Read(Expr argument, AffineMap accessMap, out Var parameter)
-    {
-        parameter = new Var(GetTileParameterType(argument.CheckedType));
-        _bodyParameters.Add(parameter);
-        _reads.Add(argument);
-        _readBuffers.Add(F.Buffer.BufferOf(argument));
-        _readMaps.Add(accessMap);
-        return this;
-    }
+        => Read(argument, accessMap, GridDomainMode.Constraint, out parameter);
+
+    public IGridBuilder Read(Expr argument, AffineMap accessMap, GridDomainMode domainMode, out Var parameter)
+        => AddAccess(argument, F.Buffer.BufferOf(argument), accessMap, GridAccessMode.Read, GridBindingMode.Subview, domainMode, out parameter);
 
     public IGridBuilder Write(Expr buffer, AffineMap accessMap, out Var parameter)
+        => AddAccess(buffer, buffer, accessMap, GridAccessMode.Write, GridBindingMode.Subview, GridDomainMode.Constraint, out parameter);
+
+    public IGridBuilder ReadRoot(Expr argument, AffineMap accessMap, out Var parameter)
+        => ReadRoot(argument, accessMap, GridDomainMode.Constraint, out parameter);
+
+    public IGridBuilder ReadRoot(Expr argument, AffineMap accessMap, GridDomainMode domainMode, out Var parameter)
+        => AddAccess(argument, F.Buffer.BufferOf(argument), accessMap, GridAccessMode.Read, GridBindingMode.Root, domainMode, out parameter);
+
+    public IGridBuilder WriteRoot(Expr buffer, AffineMap accessMap, out Var parameter)
+        => WriteRoot(buffer, accessMap, GridDomainMode.Footprint, out parameter);
+
+    public IGridBuilder WriteRoot(Expr buffer, AffineMap accessMap, GridDomainMode domainMode, out Var parameter)
+        => AddAccess(buffer, buffer, accessMap, GridAccessMode.Write, GridBindingMode.Root, domainMode, out parameter);
+
+    public IGridBuilder ReadWriteRoot(Expr argument, BaseExpr region, out Var parameter)
+        => AddAccess(argument, argument, region, GridAccessMode.ReadWrite, GridBindingMode.Root, GridDomainMode.Footprint, out parameter);
+
+    private static IRType GetParameterType(IRType type, GridBindingMode bindingMode)
     {
-        parameter = new Var(GetTileParameterType(buffer.CheckedType));
-        _bodyParameters.Add(parameter);
-        _writeBuffers.Add(buffer);
-        _writeMaps.Add(accessMap);
-        return this;
+        if (bindingMode == GridBindingMode.Root)
+        {
+            return type switch
+            {
+                DistributedType distributedType => distributedType.TensorType,
+                _ => type,
+            };
+        }
+
+        return GetTileParameterType(type);
     }
 
     private static IRType GetTileParameterType(IRType type)
@@ -101,5 +117,19 @@ internal class GridBuilder : IGridBuilder
             DistributedType distributedType => new TensorType(distributedType.TensorType.DType, Shape.Unknown(distributedType.TensorType.Shape.Rank)),
             _ => type,
         };
+    }
+
+    private IGridBuilder AddAccess(
+        Expr value,
+        Expr buffer,
+        BaseExpr region,
+        GridAccessMode accessMode,
+        GridBindingMode bindingMode,
+        GridDomainMode domainMode,
+        out Var parameter)
+    {
+        parameter = new Var(GetParameterType(value.CheckedType, bindingMode));
+        _accesses.Add(new GridAccess(value, buffer, parameter, region, accessMode, bindingMode, domainMode));
+        return this;
     }
 }

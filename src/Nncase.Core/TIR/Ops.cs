@@ -19,12 +19,12 @@ public sealed partial class Load : Op
     /// <summary>
     /// Gets handle.
     /// </summary>
-    public static readonly ParameterInfo Handle = new(typeof(Load), 0, "handle", IsPointer() | IsIntegralScalar());
+    public static readonly ParameterInfo Handle = new(typeof(Load), 0, "handle", IsPointer() | IsIntegralScalar(), memoryEffect: MemoryEffect.Read);
 
     /// <summary>
     /// Gets index.
     /// </summary>
-    public static readonly ParameterInfo Index = new(typeof(Load), 1, "index", IsDimensionType());
+    public static readonly ParameterInfo Index = new(typeof(Load), 1, "index", IsDimensionType(), memoryEffect: MemoryEffect.None);
 
     /// <inheritdoc/>
     public override bool CanFoldConstCall => false;
@@ -56,17 +56,17 @@ public sealed partial class Store : Op
     /// <summary>
     /// The buffer variable handle.
     /// </summary>
-    public static readonly ParameterInfo Handle = new(typeof(Store), 0, "handle", IsPointer() | IsIntegralScalar());
+    public static readonly ParameterInfo Handle = new(typeof(Store), 0, "handle", IsPointer() | IsIntegralScalar(), memoryEffect: MemoryEffect.Write);
 
     /// <summary>
     /// The index locations to be stored.
     /// </summary>
-    public static readonly ParameterInfo Index = new(typeof(Store), 1, "index", IsIntegralScalar());
+    public static readonly ParameterInfo Index = new(typeof(Store), 1, "index", IsIntegralScalar(), memoryEffect: MemoryEffect.None);
 
     /// <summary>
     /// The value to be stored.
     /// </summary>
-    public static readonly ParameterInfo Value = new(typeof(Store), 2, "value", IsScalar());
+    public static readonly ParameterInfo Value = new(typeof(Store), 2, "value", IsScalar(), memoryEffect: MemoryEffect.None);
 
     /// <inheritdoc/>
     public override bool CanFoldConstCall => false;
@@ -83,9 +83,9 @@ public sealed partial class Nop : Op
 
 public sealed partial class Memcopy : Op
 {
-    public static readonly ParameterInfo Dest = new(typeof(Memcopy), 0, "dest");
+    public static readonly ParameterInfo Dest = new(typeof(Memcopy), 0, "dest", memoryEffect: MemoryEffect.Write);
 
-    public static readonly ParameterInfo Src = new(typeof(Memcopy), 1, "src");
+    public static readonly ParameterInfo Src = new(typeof(Memcopy), 1, "src", memoryEffect: MemoryEffect.Read);
 
     public override bool CanFoldConstCall => false;
 }

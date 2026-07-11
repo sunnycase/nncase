@@ -19,14 +19,13 @@ public sealed class UpdatePagedAttentionKVCacheEvaluator : ITypeInferencer<Updat
         var tileBounds = Enumerable.Repeat(new ValueRange<long>(1, int.MaxValue), domain.Length).ToArray();
         var bufferInfos = new MicroKernelBufferInfo[context.BufferShapes.Length];
         var opt = (INTTTargetOptions)context.TargetOptions;
-        if (bufferInfos.Length != 3)
+        if (bufferInfos.Length != 2)
         {
-            throw new InvalidOperationException($"UpdatePagedAttentionKVCache expects slots, input kv-cache, and output kv-cache buffers, got {bufferInfos.Length}.");
+            throw new InvalidOperationException($"UpdatePagedAttentionKVCache expects slots and one read-write kv-cache resource, got {bufferInfos.Length}.");
         }
 
         bufferInfos[0] = new(opt.MemoryBandWidths[1], opt.MemoryBandWidths[1], MicroKernelBufferInfo.BufferState.Read);
-        bufferInfos[1] = new(opt.MemoryBandWidths[1], opt.MemoryBandWidths[1], MicroKernelBufferInfo.BufferState.Read);
-        bufferInfos[2] = new(opt.MemoryBandWidths[1], opt.MemoryBandWidths[1], MicroKernelBufferInfo.BufferState.Write);
+        bufferInfos[1] = new(opt.MemoryBandWidths[1], opt.MemoryBandWidths[1], MicroKernelBufferInfo.BufferState.Read | MicroKernelBufferInfo.BufferState.Write);
         return new MicroKernelInfo(tileBounds, bufferInfos, GetComputeCycle);
     }
 

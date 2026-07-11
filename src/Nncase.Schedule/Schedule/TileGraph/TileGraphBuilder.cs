@@ -60,9 +60,11 @@ public sealed class TieredTileGraphBuilder : ExprVisitor<Unit, Unit>
             note currently we're not use the affine map's extents for build domain.
             so the domain we built is not consider the primtive shape. wo also can't use extent when building ast.
         */
-        var bufferShapeValues = current.Buffers.AsValueEnumerable().Select(b => TilingUtilities.GetBufferShape(b, true).ToValueArray()).ToArray();
-        var bufferShapes = current.Buffers.AsValueEnumerable().Select(b => TilingUtilities.GetBufferShape(b, false)).ToArray();
-        var bufferRuntimeShapes = current.Buffers.AsValueEnumerable().Select(TilingUtilities.GetBufferRuntimeShape).ToArray();
+        var accesses = current.Accesses.ToArray();
+        var buffers = accesses.Select(access => access.Buffer).ToArray();
+        var bufferShapeValues = buffers.Select(b => TilingUtilities.GetBufferShape(b, true).ToValueArray()).ToArray();
+        var bufferShapes = buffers.Select(b => TilingUtilities.GetBufferShape(b, false)).ToArray();
+        var bufferRuntimeShapes = buffers.Select(TilingUtilities.GetBufferRuntimeShape).ToArray();
         Isl.set[] bufferDomains;
         HashSet<DimVar> dimVars = new();
         {
@@ -71,10 +73,21 @@ public sealed class TieredTileGraphBuilder : ExprVisitor<Unit, Unit>
             dimVars.UnionWith(tps.Select(t => t.paramMap).SelectMany(i => i).ToArray());
         }
 
-        var (domain, domainDynamic, domainBoundValues, domainBoundExprs) = TilingUtilities.InferDomainBounds(bufferRuntimeShapes, bufferDomains, current.AccessMaps.ToArray(), dimVars);
+        var affineDomainRank = accesses.First(access => access.IsAffine).AffineMap.Domains.Length;
+        var accessMaps = accesses.Select(access => access.IsAffine
+            ? access.AffineMap
+            : AffineMap.FromCallable((_, _) => Array.Empty<AffineRange>(), affineDomainRank, 0)).ToArray();
+        var domainConstraintIndices = Enumerable.Range(0, accesses.Length)
+            .Where(index => accesses[index].IsAffine && accesses[index].DomainMode == GridDomainMode.Constraint)
+            .ToArray();
+        var (domain, domainDynamic, domainBoundValues, domainBoundExprs) = TilingUtilities.InferDomainBounds(
+            domainConstraintIndices.Select(index => bufferRuntimeShapes[index]).ToArray(),
+            domainConstraintIndices.Select(index => bufferDomains[index]).ToArray(),
+            domainConstraintIndices.Select(index => accessMaps[index]).ToArray(),
+            dimVars);
 
         var copId = _opId++;
-        var domainDims = current.AccessMaps[0].Domains.Length;
+        var domainDims = affineDomainRank;
         var dimNames = Enumerable.Range(0, domainDims).Select(i => $"Op{copId}_d{i}").ToArray();
         if (current.Body[0] is not Call { Target: Op op })
         {
@@ -98,9 +111,10 @@ public sealed class TieredTileGraphBuilder : ExprVisitor<Unit, Unit>
 
         tileNodeTail.AddVertex(opNode);
 
-        for (int i = 0; i < current.Reads.Length; i++)
+        for (int i = 0; i < current.Accesses.Length; i++)
         {
-            if (GraphExtensions.TryGetProducerGrid(current.Reads[i], out var producer, out _))
+            var access = current.Accesses[i];
+            if (access.IsRead && GraphExtensions.TryGetProducerGrid(access.Value, out var producer, out _))
             {
                 var producerNode = _memo[producer];
                 RootGraph.AddEdge(new(producerNode, opNode, i));

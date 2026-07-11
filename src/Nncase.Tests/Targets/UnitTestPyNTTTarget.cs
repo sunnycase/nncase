@@ -368,7 +368,12 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
             TIR.F.NTT.TensorLoad(featureShard, input, splitByFeatureType.AxisPolicies, placement),
             TIR.F.NTT.GatherReduceScatter(featureShard, tokenShard, splitByFeatureType, splitByTokenType),
             TIR.F.NTT.TensorStore(tokenShard, output, splitByTokenType.AxisPolicies, placement));
-        var main = new TIR.PrimFunction("main_prim", PyNTTTarget.Kind, body, new IVar[] { input, output })
+        var main = new TIR.PrimFunction(
+            "main_prim",
+            PyNTTTarget.Kind,
+            body,
+            new TIR.Return(new Expr[] { output }),
+            new IVar[] { input, output })
         {
             SchedResult =
             {
@@ -380,9 +385,9 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         RenderGeneratedKernels(outputDirectory);
         var generatedKernelsPy = File.ReadAllText(Path.Join(outputDirectory, "generated_kernels.py"));
         Assert.Contains("generated from PyNTT Jinja Reshard.py.jinja", generatedKernelsPy, StringComparison.Ordinal);
-        Assert.Contains("stage=to_collective", generatedKernelsPy, StringComparison.Ordinal);
-        Assert.Contains("stage=from_collective", generatedKernelsPy, StringComparison.Ordinal);
-        Assert.Contains("tle.distributed_barrier(pyntt_grid_mesh)", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("stage=tile_scatter", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.DoesNotContain("stage=to_collective", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.DoesNotContain("stage=from_collective", generatedKernelsPy, StringComparison.Ordinal);
         AssertGeneratedModelRuns(
             outputDirectory,
             "x = ((torch.arange(3 * 128, dtype=torch.float32, device='cuda').reshape(3, 128) - 17) * 0.01).to(torch.bfloat16)",
@@ -417,7 +422,12 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
             TIR.F.NTT.Transpose(vector32Input, vector32Output, new[] { 1, 0, 2 }),
             TIR.F.NTT.Unpack(vector32Output, scalarOutput, new[] { 4, 8 }, new[] { 2, 2 }),
             TIR.F.NTT.TensorStore(scalarOutput, output, outputDistributedType.AxisPolicies, placement));
-        var main = new TIR.PrimFunction("main_prim", PyNTTTarget.Kind, body, new IVar[] { input, output })
+        var main = new TIR.PrimFunction(
+            "main_prim",
+            PyNTTTarget.Kind,
+            body,
+            new TIR.Return(new Expr[] { output }),
+            new IVar[] { input, output })
         {
             SchedResult =
             {
@@ -460,7 +470,12 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
             TIR.F.NTT.Pack(scalarShard, packedShard, new[] { 2, 8 }, new[] { 1, 1 }),
             TIR.F.NTT.Unpack(packedShard, scalarOutputShard, new[] { 2, 8 }, new[] { 1, 1 }),
             TIR.F.NTT.TensorStore(scalarOutputShard, output, scalarDistributedType.AxisPolicies, placement));
-        var main = new TIR.PrimFunction("main_prim", PyNTTTarget.Kind, body, new IVar[] { input, output })
+        var main = new TIR.PrimFunction(
+            "main_prim",
+            PyNTTTarget.Kind,
+            body,
+            new TIR.Return(new Expr[] { output }),
+            new IVar[] { input, output })
         {
             SchedResult =
             {
@@ -509,11 +524,9 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         RenderGeneratedKernels(outputDirectory);
         var generatedKernelsPy = File.ReadAllText(Path.Join(outputDirectory, "generated_kernels.py"));
         Assert.Contains("generated from PyNTT Jinja Reshard.py.jinja", generatedKernelsPy, StringComparison.Ordinal);
-        Assert.Contains("stage=to_collective", generatedKernelsPy, StringComparison.Ordinal);
-        Assert.Contains("in_non_split_linear = shard_coord1", generatedKernelsPy, StringComparison.Ordinal);
-        Assert.Contains("in_local_offset1 = tl.where(in_in_bound1, in_global_base1, 0)", generatedKernelsPy, StringComparison.Ordinal);
-        Assert.Contains("in_local_idx1 = in_idx1 + in_local_offset1", generatedKernelsPy, StringComparison.Ordinal);
-        Assert.DoesNotContain("writer_active = writer_active & (shard_coord1 == 0)", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("stage=tile_scatter", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("for destination_shard_coord1 in tl.range(0, 8)", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("mask = mask & (shard_coord1 == destination_shard_coord1)", generatedKernelsPy, StringComparison.Ordinal);
         AssertGeneratedModelRuns(
             outputDirectory,
             "x = ((torch.arange(3 * 128, dtype=torch.float32, device='cuda').reshape(3, 128) - 33) * 0.015625).to(torch.bfloat16)",
@@ -558,10 +571,9 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         RenderGeneratedKernels(outputDirectory);
         var generatedKernelsPy = File.ReadAllText(Path.Join(outputDirectory, "generated_kernels.py"));
         Assert.Contains("generated from PyNTT Jinja Reshard.py.jinja", generatedKernelsPy, StringComparison.Ordinal);
-        Assert.Contains("stage=to_collective", generatedKernelsPy, StringComparison.Ordinal);
-        Assert.Contains("lane=8, stage=to_collective", generatedKernelsPy, StringComparison.Ordinal);
-        Assert.Contains("in_non_split_linear = shard_coord0", generatedKernelsPy, StringComparison.Ordinal);
-        Assert.Contains("in_local_idx2 = in_idx2 + in_local_offset2", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("lane=8, stage=tile_scatter", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("for destination_shard_coord0 in tl.range(0, 4)", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("mask = mask & (shard_coord0 == destination_shard_coord0)", generatedKernelsPy, StringComparison.Ordinal);
         AssertGeneratedModelRuns(
             outputDirectory,
             "x = ((torch.arange(3 * 16 * 128, dtype=torch.float32, device='cuda').reshape(3, 16, 128) - 59) * 0.0078125).to(torch.bfloat16)",
@@ -594,7 +606,12 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
             TIR.F.NTT.GatherReduceScatter(vectorFeatureShard, vectorTokenShard, vectorFeatureSplitType, vectorTokenSplitType),
             TIR.F.NTT.Unpack(vectorTokenShard, scalarTokenShard, new[] { 8 }, new[] { 1 }),
             TIR.F.NTT.TensorStore(scalarTokenShard, output, scalarTokenSplitType.AxisPolicies, placement));
-        var main = new TIR.PrimFunction("main_prim", PyNTTTarget.Kind, body, new IVar[] { input, output })
+        var main = new TIR.PrimFunction(
+            "main_prim",
+            PyNTTTarget.Kind,
+            body,
+            new TIR.Return(new Expr[] { output }),
+            new IVar[] { input, output })
         {
             SchedResult =
             {
@@ -606,8 +623,8 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         RenderGeneratedKernels(outputDirectory);
         var generatedKernelsPy = File.ReadAllText(Path.Join(outputDirectory, "generated_kernels.py"));
         Assert.Contains("generated from PyNTT Jinja Reshard.py.jinja", generatedKernelsPy, StringComparison.Ordinal);
-        Assert.Contains("lane=8, stage=to_collective", generatedKernelsPy, StringComparison.Ordinal);
-        Assert.Contains("in_split_linear1 = shard_coord0 * 8 + shard_coord1", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("lane=8, stage=tile_scatter", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("destination_shard_coord0 = tmp_output_split0 % 4", generatedKernelsPy, StringComparison.Ordinal);
         AssertGeneratedModelRuns(
             outputDirectory,
             "x = ((torch.arange(3 * 1024, dtype=torch.float32, device='cuda').reshape(3, 1024) - 71) * 0.00390625).to(torch.bfloat16)",
@@ -640,7 +657,12 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
             TIR.F.NTT.GatherReduceScatter(vectorShard, broadcastVectorShard, vectorSplitType, vectorBroadcastType),
             TIR.F.NTT.Unpack(broadcastVectorShard, broadcastScalarShard, new[] { 8 }, new[] { 2 }),
             TIR.F.NTT.TensorStore(broadcastScalarShard, output, scalarBroadcastType.AxisPolicies, placement));
-        var main = new TIR.PrimFunction("main_prim", PyNTTTarget.Kind, body, new IVar[] { input, output })
+        var main = new TIR.PrimFunction(
+            "main_prim",
+            PyNTTTarget.Kind,
+            body,
+            new TIR.Return(new Expr[] { output }),
+            new IVar[] { input, output })
         {
             SchedResult =
             {
@@ -653,7 +675,7 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         var generatedKernelsPy = File.ReadAllText(Path.Join(outputDirectory, "generated_kernels.py"));
         Assert.Contains("generated from PyNTT Jinja Reshard.py.jinja", generatedKernelsPy, StringComparison.Ordinal);
         Assert.Contains("global_shape=(16, 16, 20)", generatedKernelsPy, StringComparison.Ordinal);
-        Assert.Contains("input_local_shape=(2, 16, 5)", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("input_tile_shape=(2, 16, 5)", generatedKernelsPy, StringComparison.Ordinal);
         Assert.Contains("output_local_shape=(16, 16, 20)", generatedKernelsPy, StringComparison.Ordinal);
         AssertGeneratedModelRuns(
             outputDirectory,
@@ -679,7 +701,12 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
             TIR.F.NTT.TensorLoad(featureShard, input, splitFeatureType.AxisPolicies, placement),
             TIR.F.NTT.GatherReduceScatter(featureShard, broadcastShard, splitFeatureType, broadcastFeatureType),
             TIR.F.NTT.TensorStore(broadcastShard, output, broadcastFeatureType.AxisPolicies, placement));
-        var main = new TIR.PrimFunction("main_prim", PyNTTTarget.Kind, body, new IVar[] { input, output })
+        var main = new TIR.PrimFunction(
+            "main_prim",
+            PyNTTTarget.Kind,
+            body,
+            new TIR.Return(new Expr[] { output }),
+            new IVar[] { input, output })
         {
             SchedResult =
             {
@@ -692,7 +719,7 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         var generatedKernelsPy = File.ReadAllText(Path.Join(outputDirectory, "generated_kernels.py"));
         Assert.Contains("generated from PyNTT Jinja Reshard.py.jinja", generatedKernelsPy, StringComparison.Ordinal);
         Assert.Contains("global_shape=(20, 3072)", generatedKernelsPy, StringComparison.Ordinal);
-        Assert.Contains("input_local_shape=(5, 384)", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("input_tile_shape=(5, 384)", generatedKernelsPy, StringComparison.Ordinal);
         Assert.Contains("output_local_shape=(5, 3072)", generatedKernelsPy, StringComparison.Ordinal);
         AssertGeneratedModelRuns(
             outputDirectory,
@@ -1196,10 +1223,26 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         var kvCacheObjVar = new Var("kvCache", TensorType.Scalar(new ReferenceType(new PagedAttentionKVCacheType { Config = config })));
         var output = CreateOutputVar("output", outputType);
         var outputBuffer = CreateBuffer("position_ids", DataTypes.Float32, TIR.MemoryLocation.Data, 0, [5], [1], outputDistributedType);
+        var tile = new DimVar("tile");
+        var tiledGetPositionIds = TIR.T.Let(
+            out var positionTile,
+            IR.F.Buffer.BufferSubview(outputBuffer, new RankedShape(tile), new RankedShape(1)),
+            "position_tile")
+            .Body(TIR.F.NTT.GetPositionIds(kvCacheObjVar, positionTile, outputDistributedType))
+            .Build();
         var body = new TIR.Sequential(
-            TIR.F.NTT.GetPositionIds(kvCacheObjVar, outputBuffer, outputDistributedType),
+            new TIR.For(
+                tile,
+                new TIR.Range(0, 5, 1),
+                TIR.LoopMode.Serial,
+                new TIR.Sequential(tiledGetPositionIds)),
             TIR.F.NTT.TensorStore(outputBuffer, output, outputDistributedType.AxisPolicies, placement));
-        var main = new TIR.PrimFunction("main_prim", PyNTTTarget.Kind, body, new IVar[] { kvCacheObjVar, output })
+        var main = new TIR.PrimFunction(
+            "main_prim",
+            PyNTTTarget.Kind,
+            body,
+            new TIR.Return(new Expr[] { output }),
+            new IVar[] { kvCacheObjVar, output })
         {
             SchedResult =
             {
@@ -1210,8 +1253,9 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         var outputDirectory = GeneratePyNTTModelDirectory("generated_get_position_ids_split_hierarchy_axis_run_model", main);
         RenderGeneratedKernels(outputDirectory);
         var generatedKernelsPy = File.ReadAllText(Path.Join(outputDirectory, "generated_kernels.py"));
-        Assert.Contains("global_start = (shard_coord0) * shard_axis_extent", generatedKernelsPy, StringComparison.Ordinal);
-        Assert.DoesNotContain("global_start = shard_index * shard_axis_extent", generatedKernelsPy, StringComparison.Ordinal);
+        var globalStart = Assert.Single(generatedKernelsPy.Split('\n').Where(line => line.Contains("global_start =", StringComparison.Ordinal)));
+        Assert.Contains("shard_index // 8", globalStart, StringComparison.Ordinal);
+        Assert.Contains("tile", globalStart, StringComparison.Ordinal);
         AssertGeneratedModelRuns(
             outputDirectory,
             "class MockKVCache:",
@@ -1421,6 +1465,359 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         Assert.Contains("main_prim_nested_prim_device_arg1_nested_output_scalar_stride0", generatedKernelsPy, StringComparison.Ordinal);
         Assert.Contains("* 2", generatedKernelsPy, StringComparison.Ordinal);
         Assert.Contains("* 3", generatedKernelsPy, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void TestPyNTTDistributedSubviewUsesRequestedLocalShape()
+    {
+        var targetOptions = Assert.IsType<PyNTTTargetOptions>(CompileOptions.TargetOptions);
+        targetOptions.HierarchyNames = "b";
+        targetOptions.HierarchyLevels = "b";
+        targetOptions.Hierarchies = new[] { new[] { 4 } };
+
+        var globalInputType = new TensorType(DataTypes.BFloat16, new[] { 20, 32 });
+        var placement = new Placement(new[] { 4 }, "b", "b");
+        var inputDistributedType = new DistributedType(
+            globalInputType,
+            new SBP[] { SBP.B, SBP.S([0], 8) },
+            placement);
+        var inputBuffer = CreateBuffer(
+            "distributed_input",
+            DataTypes.BFloat16,
+            TIR.MemoryLocation.Data,
+            0,
+            [20, 8],
+            [8, 1],
+            inputDistributedType);
+        var outputBuffer = CreateBuffer(
+            "tile_output",
+            DataTypes.Float32,
+            TIR.MemoryLocation.Cache,
+            0,
+            [4, 8],
+            [8, 1]);
+        var inputTile = IR.F.Buffer.BufferSubview(inputBuffer, new RankedShape(16, 0), new RankedShape(4, 8));
+        var output = CreateOutputVar("output", new TensorType(DataTypes.Float32, new[] { 4, 8 }));
+        var body = new TIR.Sequential(
+            TIR.F.NTT.Cast(inputTile, outputBuffer, DataTypes.Float32, CastMode.KDefault, Array.Empty<int>(), None.Default),
+            TIR.F.NTT.TensorStore(outputBuffer, output, new[] { SBP.B, SBP.B }, placement));
+        var main = new TIR.PrimFunction("main_prim", PyNTTTarget.Kind, body, new IVar[] { output })
+        {
+            SchedResult =
+            {
+                DataUsage = 320,
+                BlockLocalDataPoolSize = 128,
+            },
+        };
+
+        var outputDirectory = GeneratePyNTTModelDirectory("generated_distributed_subview_shape_model", main);
+        RenderGeneratedKernels(outputDirectory);
+        var generatedKernelsPy = File.ReadAllText(Path.Join(outputDirectory, "generated_kernels.py"));
+        Assert.Contains("shape=(4, 8)", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("for linear_start in tl.range(0, (4) * (8), block_size):", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.DoesNotContain("shape=(20, 8)", generatedKernelsPy, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void TestPyNTTAllocatedTilePreservesLogicalGlobalOffset()
+    {
+        var tensorType = new TensorType(DataTypes.Float32, new[] { 4, 8 });
+        var placement = new Placement(new[] { 1 }, "b", "b");
+        var distributedType = new DistributedType(tensorType, new SBP[] { SBP.B, SBP.B }, placement);
+        var nestedOutput = CreateOutputVar("nested_output", tensorType);
+        var nestedData = new TIR.BufferVar("data", TensorType.Scalar(new PointerType(DataTypes.UInt8)), TIR.BufferVarRole.Workspace, TIR.MemoryLocation.Data);
+        var nestedChipLocalData = new TIR.BufferVar("chip_local_data", TensorType.Scalar(new PointerType(DataTypes.UInt8)), TIR.BufferVarRole.Workspace, TIR.MemoryLocation.ChipLocalData);
+        var nestedBlockLocalData = new TIR.BufferVar("block_local_data", TensorType.Scalar(new PointerType(DataTypes.UInt8)), TIR.BufferVarRole.Workspace, TIR.MemoryLocation.BlockLocalData);
+        var tileBuffer = CreateBuffer("tile", DataTypes.Float32, TIR.MemoryLocation.Cache, 0, [2, 8], [8, 1], distributedType);
+        var nestedBody = TIR.T.Let(
+            out var tile,
+            IR.F.Buffer.AllocateBufferView(tileBuffer, new RankedShape(2, 0)),
+            "tile_view")
+            .Body(TIR.F.NTT.TensorStore(tile, nestedOutput, distributedType.AxisPolicies, placement))
+            .Build();
+        var nested = new TIR.PrimFunction(
+            "nested_prim",
+            PyNTTTarget.Kind,
+            new TIR.Sequential(nestedBody),
+            new IVar[] { nestedOutput, nestedData, nestedChipLocalData, nestedBlockLocalData });
+
+        var output = CreateOutputVar("output", tensorType);
+        var callerOutput = CreateBuffer("caller_output", DataTypes.Float32, TIR.MemoryLocation.Data, 0, [4, 8], [8, 1], distributedType);
+        var callerData = CreateBuffer("callee_data", DataTypes.UInt8, TIR.MemoryLocation.Data, 128, [1], [1]);
+        var callerChipLocalData = CreateBuffer("callee_chip_local_data", DataTypes.UInt8, TIR.MemoryLocation.ChipLocalData, 0, [1], [1]);
+        var callerBlockLocalData = CreateBuffer("callee_block_local_data", DataTypes.UInt8, TIR.MemoryLocation.BlockLocalData, 0, [64], [1]);
+        var main = new TIR.PrimFunction(
+            "main_prim",
+            PyNTTTarget.Kind,
+            new TIR.Sequential(
+                nested,
+                new Call(nested, callerOutput, callerData, callerChipLocalData, callerBlockLocalData),
+                TIR.F.NTT.TensorStore(callerOutput, output, distributedType.AxisPolicies, placement)),
+            new IVar[] { output })
+        {
+            SchedResult =
+            {
+                DataUsage = 256,
+            },
+        };
+
+        var module = new IRModule(main);
+        module.Add(nested);
+        var outputDirectory = GeneratePyNTTModelDirectory("generated_allocated_tile_logical_origin_model", module);
+        RenderGeneratedKernels(outputDirectory);
+        var generatedKernelsPy = File.ReadAllText(Path.Join(outputDirectory, "generated_kernels.py"));
+        Assert.Contains("generated from PyNTT Jinja TensorRegionCopy.py.jinja", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("copy_start0 = tl.maximum(2, main_prim_nested_prim_device_arg0_nested_output_global_offset0)", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("source_base0 = copy_start0 - 2", generatedKernelsPy, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void TestPyNTTAllocatedTileAddsDistributedShardOrigin()
+    {
+        var targetOptions = Assert.IsType<PyNTTTargetOptions>(CompileOptions.TargetOptions);
+        targetOptions.HierarchyNames = "b";
+        targetOptions.HierarchyLevels = "b";
+        targetOptions.Hierarchies = new[] { new[] { 2 } };
+
+        var tensorType = new TensorType(DataTypes.Float32, new[] { 4, 8 });
+        var placement = new Placement(new[] { 2 }, "b", "b");
+        var distributedType = new DistributedType(tensorType, new SBP[] { SBP.S([0], 2), SBP.B }, placement);
+        var nestedOutput = CreateOutputVar("nested_output", tensorType);
+        var nestedData = new TIR.BufferVar("data", TensorType.Scalar(new PointerType(DataTypes.UInt8)), TIR.BufferVarRole.Workspace, TIR.MemoryLocation.Data);
+        var nestedChipLocalData = new TIR.BufferVar("chip_local_data", TensorType.Scalar(new PointerType(DataTypes.UInt8)), TIR.BufferVarRole.Workspace, TIR.MemoryLocation.ChipLocalData);
+        var nestedBlockLocalData = new TIR.BufferVar("block_local_data", TensorType.Scalar(new PointerType(DataTypes.UInt8)), TIR.BufferVarRole.Workspace, TIR.MemoryLocation.BlockLocalData);
+        var tileBuffer = CreateBuffer("tile", DataTypes.Float32, TIR.MemoryLocation.Cache, 0, [1, 8], [8, 1], distributedType);
+        var nestedBody = TIR.T.Let(
+            out var tile,
+            IR.F.Buffer.AllocateBufferView(tileBuffer, new RankedShape(1, 0)),
+            "tile_view")
+            .Body(TIR.F.NTT.TensorStore(tile, nestedOutput, distributedType.AxisPolicies, placement))
+            .Build();
+        var nested = new TIR.PrimFunction(
+            "nested_prim",
+            PyNTTTarget.Kind,
+            new TIR.Sequential(nestedBody),
+            new IVar[] { nestedOutput, nestedData, nestedChipLocalData, nestedBlockLocalData });
+
+        var output = CreateOutputVar("output", tensorType);
+        var callerOutput = CreateBuffer("caller_output", DataTypes.Float32, TIR.MemoryLocation.Data, 0, [2, 8], [8, 1], distributedType);
+        var callerData = CreateBuffer("callee_data", DataTypes.UInt8, TIR.MemoryLocation.Data, 128, [1], [1]);
+        var callerChipLocalData = CreateBuffer("callee_chip_local_data", DataTypes.UInt8, TIR.MemoryLocation.ChipLocalData, 0, [1], [1]);
+        var callerBlockLocalData = CreateBuffer("callee_block_local_data", DataTypes.UInt8, TIR.MemoryLocation.BlockLocalData, 0, [32], [1]);
+        var main = new TIR.PrimFunction(
+            "main_prim",
+            PyNTTTarget.Kind,
+            new TIR.Sequential(
+                nested,
+                new Call(nested, callerOutput, callerData, callerChipLocalData, callerBlockLocalData),
+                TIR.F.NTT.TensorStore(callerOutput, output, distributedType.AxisPolicies, placement)),
+            new IVar[] { output })
+        {
+            SchedResult =
+            {
+                DataUsage = 256,
+            },
+        };
+
+        var module = new IRModule(main);
+        module.Add(nested);
+        var outputDirectory = GeneratePyNTTModelDirectory("generated_allocated_tile_shard_origin_model", module);
+        RenderGeneratedKernels(outputDirectory);
+        var generatedKernelsPy = File.ReadAllText(Path.Join(outputDirectory, "generated_kernels.py"));
+        var copyStart = generatedKernelsPy.Split('\n').Single(line => line.Contains("copy_start0 = tl.maximum", StringComparison.Ordinal));
+        var sourceBase = generatedKernelsPy.Split('\n').Single(line => line.Contains("source_base0 = copy_start0", StringComparison.Ordinal));
+        Assert.Contains("shard_index", copyStart, StringComparison.Ordinal);
+        Assert.Contains("1", copyStart, StringComparison.Ordinal);
+        Assert.Contains("shard_index", sourceBase, StringComparison.Ordinal);
+        Assert.Contains("1", sourceBase, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void TestPyNTTFormalReshardUsesByteAddressedBackingPool()
+    {
+        var targetOptions = Assert.IsType<PyNTTTargetOptions>(CompileOptions.TargetOptions);
+        targetOptions.HierarchyNames = "b";
+        targetOptions.HierarchyLevels = "b";
+        targetOptions.Hierarchies = new[] { new[] { 2 } };
+
+        var tensorType = new TensorType(DataTypes.BFloat16, new[] { 4, 8 });
+        var placement = new Placement(new[] { 2 }, "b", "b");
+        var inputDistributedType = new DistributedType(tensorType, new SBP[] { SBP.B, SBP.S([0], 4) }, placement);
+        var outputDistributedType = new DistributedType(tensorType, new SBP[] { SBP.S([0], 2), SBP.B }, placement);
+        var nestedInput = new TIR.BufferVar("nested_input", inputDistributedType, TIR.BufferVarRole.Input, TIR.MemoryLocation.Input);
+        var nestedOutput = new TIR.BufferVar("nested_output", outputDistributedType, TIR.BufferVarRole.Output, TIR.MemoryLocation.Output);
+        var nestedData = new TIR.BufferVar("data", TensorType.Scalar(new PointerType(DataTypes.UInt8)), TIR.BufferVarRole.Workspace, TIR.MemoryLocation.Data);
+        var nestedChipLocalData = new TIR.BufferVar("chip_local_data", TensorType.Scalar(new PointerType(DataTypes.UInt8)), TIR.BufferVarRole.Workspace, TIR.MemoryLocation.ChipLocalData);
+        var nestedBlockLocalData = new TIR.BufferVar("block_local_data", TensorType.Scalar(new PointerType(DataTypes.UInt8)), TIR.BufferVarRole.Workspace, TIR.MemoryLocation.BlockLocalData);
+        var nestedInputBuffer = TIR.T.AttachBuffer(
+            nestedInput,
+            DistributedUtility.GetDividedTensorType(inputDistributedType),
+            TIR.MemoryLocation.Input,
+            0,
+            out _,
+            "nested_input_buffer",
+            inputDistributedType);
+        var nestedOutputBuffer = TIR.T.AttachBuffer(
+            nestedOutput,
+            DistributedUtility.GetDividedTensorType(outputDistributedType),
+            TIR.MemoryLocation.Output,
+            0,
+            out _,
+            "nested_output_buffer",
+            outputDistributedType);
+        var nested = new TIR.PrimFunction(
+            "nested_prim",
+            PyNTTTarget.Kind,
+            new TIR.Sequential(
+                TIR.F.NTT.GatherReduceScatter(nestedInputBuffer, nestedOutputBuffer, inputDistributedType, outputDistributedType),
+                TIR.F.NTT.TensorStore(nestedOutputBuffer, nestedOutput, outputDistributedType.AxisPolicies, placement)),
+            new IVar[] { nestedInput, nestedOutput, nestedData, nestedChipLocalData, nestedBlockLocalData });
+
+        var input = new Var("input", tensorType);
+        var output = CreateOutputVar("output", tensorType);
+        var callerInput = CreateBuffer("caller_input", DataTypes.BFloat16, TIR.MemoryLocation.Data, 0, [4, 4], [4, 1], inputDistributedType);
+        var callerOutput = CreateBuffer("caller_output", DataTypes.BFloat16, TIR.MemoryLocation.Data, 32, [2, 8], [8, 1], outputDistributedType);
+        var callerData = CreateBuffer("callee_data", DataTypes.UInt8, TIR.MemoryLocation.Data, 64, [1], [1]);
+        var callerChipLocalData = CreateBuffer("callee_chip_local_data", DataTypes.UInt8, TIR.MemoryLocation.ChipLocalData, 0, [1], [1]);
+        var callerBlockLocalData = CreateBuffer("callee_block_local_data", DataTypes.UInt8, TIR.MemoryLocation.BlockLocalData, 0, [1], [1]);
+        var main = new TIR.PrimFunction(
+            "main_prim",
+            PyNTTTarget.Kind,
+            new TIR.Sequential(
+                nested,
+                TIR.F.NTT.TensorLoad(callerInput, input, inputDistributedType.AxisPolicies, placement),
+                new Call(nested, callerInput, callerOutput, callerData, callerChipLocalData, callerBlockLocalData),
+                TIR.F.NTT.TensorStore(callerOutput, output, outputDistributedType.AxisPolicies, placement)),
+            new IVar[] { input, output })
+        {
+            SchedResult =
+            {
+                DataUsage = 128,
+            },
+        };
+
+        var module = new IRModule(main);
+        module.Add(nested);
+        var outputDirectory = GeneratePyNTTModelDirectory("generated_formal_reshard_byte_address_model", module);
+        RenderGeneratedKernels(outputDirectory);
+        var generatedKernelsPy = File.ReadAllText(Path.Join(outputDirectory, "generated_kernels.py"));
+        var lines = generatedKernelsPy.Split('\n');
+        var byteOffsetLine = Assert.Single(lines.Where(line => line.Contains("output_byte_offsets =", StringComparison.Ordinal)));
+        Assert.Contains("_pool_stride_elements) * 2", byteOffsetLine, StringComparison.Ordinal);
+        var storeLine = Assert.Single(lines.Where(line => line.Contains("output_byte_offsets).to(tl.pointer_type(tl.bfloat16))", StringComparison.Ordinal)));
+        Assert.Contains("tl.pointer_type(tl.uint8)", storeLine, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void TestPyNTTPartialReshardIsSinglePhaseAndWritesEachDestinationOnce()
+    {
+        var targetOptions = Assert.IsType<PyNTTTargetOptions>(CompileOptions.TargetOptions);
+        targetOptions.HierarchyNames = "b";
+        targetOptions.HierarchyLevels = "b";
+        targetOptions.Hierarchies = new[] { new[] { 4 } };
+
+        var tensorType = new TensorType(DataTypes.BFloat16, new[] { 8, 16 });
+        var placement = new Placement(new[] { 4 }, "b", "b");
+        var partialType = new DistributedType(
+            tensorType,
+            new SBP[] { SBP.B, SBP.B },
+            placement,
+            SBP.P([0], ReduceOp.Sum));
+        var splitType = new DistributedType(
+            tensorType,
+            new SBP[] { SBP.S([0], 2), SBP.B },
+            placement);
+        var partialBuffer = CreateBuffer("partial", DataTypes.BFloat16, TIR.MemoryLocation.Data, 0, [8, 16], [16, 1], partialType);
+        var splitBuffer = CreateBuffer("split", DataTypes.BFloat16, TIR.MemoryLocation.Data, 256, [2, 16], [16, 1], splitType);
+        var input = new Var("input", tensorType);
+        var output = CreateOutputVar("output", tensorType);
+        var main = new TIR.PrimFunction(
+            "main_prim",
+            PyNTTTarget.Kind,
+            new TIR.Sequential(
+                TIR.F.NTT.TensorLoad(partialBuffer, input, partialType.AxisPolicies, placement),
+                TIR.F.NTT.Barrier(TIR.NTT.BarrierScope.Chip),
+                TIR.F.NTT.GatherReduceScatter(partialBuffer, splitBuffer, partialType, splitType),
+                TIR.F.NTT.Barrier(TIR.NTT.BarrierScope.Chip),
+                TIR.F.NTT.TensorStore(splitBuffer, output, splitType.AxisPolicies, placement)),
+            new TIR.Return(new Expr[] { output }),
+            new IVar[] { input, output })
+        {
+            SchedResult =
+            {
+                DataUsage = 512,
+            },
+        };
+
+        var outputDirectory = GeneratePyNTTModelDirectory("generated_partial_reshard_single_phase_model", main);
+        RenderGeneratedKernels(outputDirectory);
+        var generatedKernelsPy = File.ReadAllText(Path.Join(outputDirectory, "generated_kernels.py"));
+        Assert.Contains("stage=tile_scatter", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("(shard_coord0 == 0)", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("for reduce_coord0 in tl.range(0, 4)", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("source_pool_index = source_shard_index", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("destination_shard_coord0 = tmp_output_split0 % 4", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.DoesNotContain("collective", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.DoesNotContain("shared_shard", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Equal(2, generatedKernelsPy.Split("tle.distributed_barrier", StringSplitOptions.None).Length - 1);
+        AssertGeneratedModelRuns(
+            outputDirectory,
+            "x = ((torch.arange(8 * 16, dtype=torch.float32, device='cuda').reshape(8, 16) - 31) * 0.03125).to(torch.bfloat16)",
+            "output = module(x)",
+            "torch.testing.assert_close(output, x * 4, rtol=0, atol=0)");
+    }
+
+    [Fact]
+    public void TestPyNTTTiledBoxingReadsLocalTilesAndWritesDistributedRoot()
+    {
+        var targetOptions = Assert.IsType<PyNTTTargetOptions>(CompileOptions.TargetOptions);
+        targetOptions.HierarchyNames = "b";
+        targetOptions.HierarchyLevels = "b";
+        targetOptions.Hierarchies = new[] { new[] { 4 } };
+
+        var tensorType = new TensorType(DataTypes.BFloat16, new[] { 8, 16 });
+        var placement = new Placement(new[] { 4 }, "b", "b");
+        var splitType = new DistributedType(tensorType, new SBP[] { SBP.S([0], 2), SBP.B }, placement);
+        var broadcastType = new DistributedType(tensorType, new SBP[] { SBP.B, SBP.B }, placement);
+        var splitBuffer = CreateBuffer("split", DataTypes.BFloat16, TIR.MemoryLocation.Data, 0, [2, 16], [16, 1], splitType);
+        var broadcastBuffer = CreateBuffer("broadcast", DataTypes.BFloat16, TIR.MemoryLocation.Data, 64, [8, 16], [16, 1], broadcastType);
+        var input = new Var("input", tensorType);
+        var output = CreateOutputVar("output", tensorType);
+        var tile = new DimVar("tile");
+        var inputTile = IR.F.Buffer.BufferSubview(splitBuffer, new RankedShape(tile, 0), new RankedShape(1, 16));
+        var tiledTransfer = new TIR.For(
+            tile,
+            new TIR.Range(0, 2, 1),
+            TIR.LoopMode.Serial,
+            new TIR.Sequential(TIR.F.NTT.GatherReduceScatter(inputTile, broadcastBuffer, splitType, broadcastType)));
+        var main = new TIR.PrimFunction(
+            "main_prim",
+            PyNTTTarget.Kind,
+            new TIR.Sequential(
+                TIR.F.NTT.TensorLoad(splitBuffer, input, splitType.AxisPolicies, placement),
+                tiledTransfer,
+                TIR.F.NTT.Barrier(TIR.NTT.BarrierScope.Chip),
+                TIR.F.NTT.TensorStore(broadcastBuffer, output, broadcastType.AxisPolicies, placement)),
+            new TIR.Return(new Expr[] { output }),
+            new IVar[] { input, output })
+        {
+            SchedResult =
+            {
+                DataUsage = 512,
+            },
+        };
+
+        var outputDirectory = GeneratePyNTTModelDirectory("generated_tiled_boxing_root_model", main);
+        RenderGeneratedKernels(outputDirectory);
+        var generatedKernelsPy = File.ReadAllText(Path.Join(outputDirectory, "generated_kernels.py"));
+        Assert.Contains("input_tile_shape=(tl.minimum(1", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("for tile in tl.range(0, 2, 1)", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("for destination_shard_coord0 in tl.range(0, 4)", generatedKernelsPy, StringComparison.Ordinal);
+        AssertGeneratedModelRuns(
+            outputDirectory,
+            "x = ((torch.arange(8 * 16, dtype=torch.float32, device='cuda').reshape(8, 16) - 19) * 0.03125).to(torch.bfloat16)",
+            "output = module(x)",
+            "torch.testing.assert_close(output, x, rtol=0, atol=0)");
     }
 
     [Fact]

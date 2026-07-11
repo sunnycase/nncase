@@ -63,15 +63,21 @@ public sealed class OpNode : ITreeNode
 
     public ImmutableArray<ImmutableArray<long>> BufferShapes => _wrapped.BufferShapes;
 
-    public ReadOnlySpan<AffineMap> ReadAccesses => _wrapped.ReadAccesses;
+    public ImmutableArray<AffineMap> AccessMaps => _wrapped.AccessMaps;
 
-    public ReadOnlySpan<AffineMap> WriteAccesses => _wrapped.WriteAccesses;
+    public ImmutableArray<int> ReadAccessIndices => _wrapped.ReadAccessIndices;
 
-    public AffineMap WriteAccess => _wrapped.WriteAccess;
+    public ImmutableArray<int> WriteAccessIndices => _wrapped.WriteAccessIndices;
+
+    public AffineMap GetAccessMap(int accessIndex) => _wrapped.GetAccessMap(accessIndex);
+
+    public AffineMap GetWriteAccess(int outputIndex) => _wrapped.GetWriteAccess(outputIndex);
+
+    public int GetWriteAccessIndex(int outputIndex) => _wrapped.GetWriteAccessIndex(outputIndex);
 
     public long GetBufferElemSize(int i) => _wrapped.GetBufferElemSize(i);
 
-    public MicroKernelContext GetMicroKernelContext(ITargetOptions targetOptions) => new(Op, Grid.AccessMaps.ToImmutableArray(), BufferShapes, targetOptions);
+    public MicroKernelContext GetMicroKernelContext(ITargetOptions targetOptions) => new(Op, AccessMaps, BufferShapes, targetOptions);
 
     public MicroKernelInfo GetKernelInfo(ITargetOptions targetOptions) => CompilerServices.GetOpMicroKernelInfo(Op, GetMicroKernelContext(targetOptions));
 

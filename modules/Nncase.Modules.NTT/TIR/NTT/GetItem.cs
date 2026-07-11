@@ -22,15 +22,15 @@ public sealed partial class GetItem : NTTKernelOp
     /// <summary>
     /// Gets input.
     /// </summary>
-    public static readonly ParameterInfo Input = new(typeof(GetItem), 0, "input", ParameterKind.Input);
+    public static readonly ParameterInfo Input = new(typeof(GetItem), 0, "input", ParameterKind.Input, MemoryEffect.Read);
 
     /// <summary>
     /// Gets index.
     /// </summary>
-    public static readonly ParameterInfo Index = new(typeof(GetItem), 1, "index", IsDimensionType() | IsShapeType(), ParameterKind.Input);
+    public static readonly ParameterInfo Index = new(typeof(GetItem), 1, "index", IsDimensionType() | IsShapeType(), ParameterKind.Input, MemoryEffect.None);
 
     /// <summary>
     /// Gets index.
     /// </summary>
-    public static readonly ParameterInfo Output = new(typeof(GetItem), 2, "output");
+    public static readonly ParameterInfo Output = new(typeof(GetItem), 2, "output", memoryEffect: MemoryEffect.Write);
 }

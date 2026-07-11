@@ -40,7 +40,8 @@ AffineDomain,true,false,Default,Affine.,Offset;Extent
 AffineRange,true,false,Default,Affine.,Offset;Extent
 AffineMap,true,false,Default,Affine.,@Domains;@Symbols;@Results
 AffineRelation,true,false,Default,Affine.,@Domains;@Symbols;@Results
-Grid,true,false,Default,Affine.,DomainParameter;@BodyParameters;@AccessMaps;@Buffers;@Reads;Body
+GridAccess,true,false,Default,Affine.,Value;Buffer;Parameter;Region
+Grid,true,false,Default,Affine.,DomainParameter;@Accesses;Body
 Load,true,false,Default,Affine.,Source;Region
 For,true,false,Default,Affine.,Domain;Body
 # Buffers

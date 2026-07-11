@@ -169,11 +169,11 @@ public sealed class UnitTestTileGraph : TestClassBase
 
         var selected = Assert.IsType<Function>(await new NTTAffineSelectionPass(CompileOptions).RunAsync(function, new()));
         var selectedGrid = Assert.IsType<IR.Affine.Grid>(selected.Body);
-        Assert.IsType<IR.Affine.AffineView>(Assert.IsType<Call>(selectedGrid.Reads[0]).Target);
+        Assert.IsType<IR.Affine.AffineView>(Assert.IsType<Call>(selectedGrid.Accesses[0].Value).Target);
 
         var composed = Assert.IsType<Function>(await new AffineViewCompositionPass(Targets.CPUTarget.Kind).RunAsync(selected, new()));
         var composedGrid = Assert.IsType<IR.Affine.Grid>(composed.Body);
-        Assert.Same(input, composedGrid.Reads[0]);
+        Assert.Same(input, composedGrid.Accesses[0].Value);
         Assert.DoesNotContain(ExprCollector.Collect(composed.Body).OfType<Call>(), call => call.Target is IR.Affine.AffineView);
     }
 
@@ -188,7 +188,7 @@ public sealed class UnitTestTileGraph : TestClassBase
         var selected = Assert.IsType<Function>(await new NTTAffineSelectionPass(CompileOptions).RunAsync(function, new()));
         var composed = Assert.IsType<Function>(await new AffineViewCompositionPass(Targets.CPUTarget.Kind).RunAsync(selected, new()));
         var grid = Assert.IsType<IR.Affine.Grid>(composed.Body);
-        Assert.IsType<IR.Affine.AffineView>(Assert.IsType<Call>(grid.Reads[0]).Target);
+        Assert.IsType<IR.Affine.AffineView>(Assert.IsType<Call>(grid.Accesses[0].Value).Target);
     }
 
     [Fact]
@@ -202,7 +202,7 @@ public sealed class UnitTestTileGraph : TestClassBase
         var selected = Assert.IsType<Function>(await new NTTAffineSelectionPass(CompileOptions).RunAsync(function, new()));
         var composed = Assert.IsType<Function>(await new AffineViewCompositionPass(Targets.CPUTarget.Kind).RunAsync(selected, new()));
         var grid = Assert.IsType<IR.Affine.Grid>(composed.Body);
-        Assert.IsType<IR.Affine.AffineView>(Assert.IsType<Call>(grid.Reads[0]).Target);
+        Assert.IsType<IR.Affine.AffineView>(Assert.IsType<Call>(grid.Accesses[0].Value).Target);
     }
 
     [Fact]
@@ -266,10 +266,10 @@ public sealed class UnitTestTileGraph : TestClassBase
 
         var post = Assert.IsType<Function>(new NTTAffineSelectionPass(CompileOptions).RunAsync(function, new()).Result);
         var grid = Assert.IsType<IR.Affine.Grid>(post.Body);
-        Assert.Equal(3, grid.Reads.Length);
-        Assert.Equal(1, grid.Writes.Length);
-        Assert.Equal(2, grid.AccessMaps[0].Domains.Length);
-        var kRange = grid.AccessMaps[0].Results[^1];
+        Assert.Equal(3, grid.Accesses.ToArray().Count(access => access.IsRead));
+        Assert.Equal(1, grid.Accesses.ToArray().Count(access => access.IsWrite));
+        Assert.Equal(2, grid.Accesses[0].AffineMap.Domains.Length);
+        var kRange = grid.Accesses[0].AffineMap.Results[^1];
         Assert.Equal(0, Assert.IsType<IR.Affine.AffineConstant>(kRange.Offset).Value);
         Assert.Equal(512, Assert.IsType<IR.Affine.AffineConstant>(kRange.Extent).Value);
         Assert.Equal(1, grid.Body.Fields.Length);
@@ -306,15 +306,15 @@ public sealed class UnitTestTileGraph : TestClassBase
 
         var post = Assert.IsType<Function>(new NTTAffineSelectionPass(CompileOptions).RunAsync(function, new()).Result);
         var grid = Assert.IsType<IR.Affine.Grid>(post.Body);
-        Assert.Equal(4, grid.Reads.Length);
-        Assert.Equal(3, grid.Writes.Length);
-        Assert.All(grid.AccessMaps.ToArray(), map => Assert.Equal(2, map.Domains.Length));
+        Assert.Equal(4, grid.Accesses.ToArray().Count(access => access.IsRead));
+        Assert.Equal(3, grid.Accesses.ToArray().Count(access => access.IsWrite));
+        Assert.All(grid.Accesses.ToArray(), access => Assert.Equal(2, access.AffineMap.Domains.Length));
 
         var domainOffsets = new long[] { 3, 5 };
         var domainExtents = new long[] { 7, 11 };
-        var qWeightRange = grid.AccessMaps[1].Results[0].Apply(domainOffsets, domainExtents);
-        var kWeightRange = grid.AccessMaps[2].Results[0].Apply(domainOffsets, domainExtents);
-        var vWeightRange = grid.AccessMaps[3].Results[0].Apply(domainOffsets, domainExtents);
+        var qWeightRange = grid.Accesses[1].AffineMap.Results[0].Apply(domainOffsets, domainExtents);
+        var kWeightRange = grid.Accesses[2].AffineMap.Results[0].Apply(domainOffsets, domainExtents);
+        var vWeightRange = grid.Accesses[3].AffineMap.Results[0].Apply(domainOffsets, domainExtents);
         Assert.Equal(new ValueRange<long>(10, 22), qWeightRange);
         Assert.Equal(new ValueRange<long>(5, 11), kWeightRange);
         Assert.Equal(new ValueRange<long>(5, 11), vWeightRange);
@@ -340,13 +340,126 @@ public sealed class UnitTestTileGraph : TestClassBase
 
         var post = Assert.IsType<Function>(new NTTAffineSelectionPass(CompileOptions).RunAsync(function, new()).Result);
         var grid = Assert.IsType<IR.Affine.Grid>(post.Body);
-        Assert.Equal(2, grid.Reads.Length);
-        Assert.Equal(1, grid.Writes.Length);
-        Assert.Same(kvCache, grid.Reads[1]);
-        Assert.Same(kvCache, grid.Writes[0]);
+        Assert.Equal(2, grid.Accesses.Length);
+        Assert.Equal(IR.Affine.GridAccessMode.Read, grid.Accesses[0].AccessMode);
+        Assert.Equal(IR.Affine.GridBindingMode.Subview, grid.Accesses[0].BindingMode);
+        Assert.Equal(IR.Affine.GridAccessMode.ReadWrite, grid.Accesses[1].AccessMode);
+        Assert.Equal(IR.Affine.GridBindingMode.Root, grid.Accesses[1].BindingMode);
+        Assert.False(grid.Accesses[1].IsAffine);
+        Assert.Same(kvCache, grid.Accesses[1].Value);
         Assert.Equal(1, grid.Body.Fields.Length);
         var bodyCall = Assert.IsType<Call>(grid.Body.Fields[0]);
         Assert.IsType<TIR.NTT.UpdatePagedAttentionKVCache>(bodyCall.Target);
+        Assert.Equal(MemoryEffect.ChipWrite, TIR.NTT.UpdatePagedAttentionKVCache.KVCaches.MemoryEffect);
+    }
+
+    [Fact]
+    public void TestBoxingAffineSelectionTilesSourceAndKeepsDestinationRootBound()
+    {
+        var placement = new Placement([4], "b", "b");
+        var tensorType = new TensorType(DataTypes.Float32, new[] { 32, 16 });
+        var inputType = new DistributedType(tensorType, new SBP[] { SBP.S([0], 0), SBP.B }, placement);
+        var outputType = new DistributedType(tensorType, new SBP[] { SBP.B, SBP.S([0], 1) }, placement);
+        var input = new Var("input", inputType);
+        var boxing = IR.F.Distributed.Boxing(input, outputType);
+        var function = new Function("main", Targets.CPUTarget.Kind, boxing, [input]);
+
+        var post = Assert.IsType<Function>(new NTTAffineSelectionPass(CompileOptions).RunAsync(function, new()).Result);
+        var grid = Assert.IsType<IR.Affine.Grid>(post.Body);
+        Assert.Equal(2, grid.Accesses.Length);
+        Assert.Equal(IR.Affine.GridAccessMode.Read, grid.Accesses[0].AccessMode);
+        Assert.Equal(IR.Affine.GridBindingMode.Subview, grid.Accesses[0].BindingMode);
+        Assert.Equal(IR.Affine.GridDomainMode.Constraint, grid.Accesses[0].DomainMode);
+        Assert.Equal(IR.Affine.GridAccessMode.Write, grid.Accesses[1].AccessMode);
+        Assert.Equal(IR.Affine.GridBindingMode.Root, grid.Accesses[1].BindingMode);
+        Assert.Equal(IR.Affine.GridDomainMode.Footprint, grid.Accesses[1].DomainMode);
+        Assert.IsType<TIR.NTT.GatherReduceScatter>(Assert.IsType<Call>(Assert.Single(grid.Body.Fields.ToArray())).Target);
+        Assert.Equal(MemoryEffect.ChipRead, TIR.NTT.GatherReduceScatter.Input.MemoryEffect);
+        Assert.Equal(MemoryEffect.ChipWrite, TIR.NTT.GatherReduceScatter.Output.MemoryEffect);
+    }
+
+    [Fact]
+    public void TestTensorToDistributedBoxingKeepsGlobalSourceRootBound()
+    {
+        var placement = new Placement([4], "b", "b");
+        var tensorType = new TensorType(DataTypes.Float32, new[] { 32, 16 });
+        var outputType = new DistributedType(tensorType, new SBP[] { SBP.S([0], 8), SBP.B }, placement);
+        var input = new Var("input", tensorType);
+        var boxing = IR.F.Distributed.Boxing(input, outputType);
+        var function = new Function("main", Targets.CPUTarget.Kind, boxing, [input]);
+
+        var post = Assert.IsType<Function>(new NTTAffineSelectionPass(CompileOptions).RunAsync(function, new()).Result);
+        var grid = Assert.IsType<IR.Affine.Grid>(post.Body);
+
+        Assert.Equal(IR.Affine.GridBindingMode.Root, grid.Accesses[0].BindingMode);
+        Assert.Equal(IR.Affine.GridDomainMode.Footprint, grid.Accesses[0].DomainMode);
+        Assert.Equal(IR.Affine.GridBindingMode.Root, grid.Accesses[1].BindingMode);
+        Assert.Equal(IR.Affine.GridDomainMode.Constraint, grid.Accesses[1].DomainMode);
+        Assert.IsType<TIR.NTT.TensorLoad>(Assert.IsType<Call>(Assert.Single(grid.Body.Fields.ToArray())).Target);
+    }
+
+    [Fact]
+    public async Task TestAutoTileDoesNotChargeCallerAllocatedRootsToLocalCapacity()
+    {
+        var placement = new Placement([4], "b", "b");
+        var tensorType = new TensorType(DataTypes.Float32, new[] { 32, 4096 });
+        var outputType = new DistributedType(tensorType, new SBP[] { SBP.B, SBP.B }, placement);
+        var input = new Var("input", tensorType);
+        var boxing = IR.F.Distributed.Boxing(input, outputType);
+        var selectionInput = new Function("main", Targets.CPUTarget.Kind, boxing, [input]);
+        var selected = Assert.IsType<Function>(await new NTTAffineSelectionPass(CompileOptions).RunAsync(selectionInput, new()));
+
+        var tiled = Assert.IsType<Function>(await new AutoTilePass(Targets.CPUTarget.Kind, CompileOptions).RunAsync(selected, new()));
+
+        var call = Assert.IsType<Call>(tiled.Body);
+        var primFunction = Assert.IsType<PrimFunctionWrapper>(call.Target).Target;
+        Assert.DoesNotContain(
+            ExprCollector.Collect(primFunction.Body).OfType<PhysicalBuffer>(),
+            buffer => buffer.Location == MemoryLocation.Cache && buffer.Size.FixedValue > 0);
+    }
+
+    [Fact]
+    public void TestPartialBoxingReadsAcrossChipAtSubviewGranularity()
+    {
+        var placement = new Placement([4], "b", "b");
+        var tensorType = new TensorType(DataTypes.Float32, new[] { 32, 16 });
+        var inputType = new DistributedType(tensorType, new SBP[] { SBP.B, SBP.S([0], 1) }, placement, SBP.P([0], ReduceOp.Sum));
+        var outputType = new DistributedType(tensorType, new SBP[] { SBP.B, SBP.S([0], 1) }, placement);
+        var input = new Var("input", inputType);
+        var boxing = IR.F.Distributed.Boxing(input, outputType);
+        var function = new Function("main", Targets.CPUTarget.Kind, boxing, [input]);
+
+        var post = Assert.IsType<Function>(new NTTAffineSelectionPass(CompileOptions).RunAsync(function, new()).Result);
+        var grid = Assert.IsType<IR.Affine.Grid>(post.Body);
+
+        Assert.Equal(IR.Affine.GridBindingMode.Subview, grid.Accesses[0].BindingMode);
+        Assert.Equal(IR.Affine.GridBindingMode.Root, grid.Accesses[1].BindingMode);
+        Assert.Equal(MemoryEffect.ChipRead, TIR.NTT.GatherReduceScatter.Input.MemoryEffect);
+        Assert.Equal(MemoryEffect.ChipWrite, TIR.NTT.GatherReduceScatter.Output.MemoryEffect);
+    }
+
+    [Fact]
+    public void TestChipVisibleRootWriteIsTileFusionBoundary()
+    {
+        using var ctx = IntegerSetLibrary.ctx.Create();
+        var placement = new Placement([4], "b", "b");
+        var tensorType = new TensorType(DataTypes.Float32, new[] { 32, 16 });
+        var inputType = new DistributedType(tensorType, new SBP[] { SBP.S([0], 0), SBP.B }, placement);
+        var intermediateType = new DistributedType(tensorType, new SBP[] { SBP.B, SBP.B }, placement);
+        var outputType = new DistributedType(tensorType, new SBP[] { SBP.B, SBP.S([0], 1) }, placement);
+        var input = new Var("input", inputType);
+        var intermediate = IR.F.Distributed.Boxing(input, intermediateType);
+        var output = IR.F.Distributed.Boxing(intermediate, outputType);
+        var function = new Function("main", Targets.CPUTarget.Kind, output, [input]);
+        var selected = Assert.IsType<Function>(new NTTAffineSelectionPass(CompileOptions).RunAsync(function, new()).Result);
+
+        var graph = TieredTileGraphBuilder.Build(selected.Body, 2, out _);
+
+        Assert.Equal(2, graph.VertexCount);
+        Assert.Single(graph.Edges);
+        Assert.Empty(graph.GetMergePoints());
+        var edge = Assert.Single(graph.Edges);
+        Assert.False(graph.Merge(new MergePoint(edge.Target, edge.Source, 1)));
     }
 
     [Fact]
@@ -388,19 +501,18 @@ public sealed class UnitTestTileGraph : TestClassBase
         var boxed = IR.F.Distributed.Boxing(stats, broadcastStatsType);
         var selectionInput = new Function("selection_input", Targets.CPUTarget.Kind, boxed, [input]);
         var selected = Assert.IsType<Function>(await new NTTAffineSelectionPass(CompileOptions).RunAsync(selectionInput, new()));
-        var selectedBoxing = Assert.IsType<Call>(selected.Body);
-        Assert.IsType<IR.Distributed.Boxing>(selectedBoxing.Target);
-        var selectedGrid = Assert.IsType<IR.Affine.Grid>(selectedBoxing.Arguments[0]);
+        var selectedTransfer = Assert.IsType<IR.Affine.Grid>(selected.Body);
+        var selectedGrid = Assert.IsType<IR.Affine.Grid>(selectedTransfer.Accesses[0].Value);
+        Assert.Equal(partialStatsType.Partial, Assert.IsType<DistributedType>(selectedTransfer.Accesses[0].Value.CheckedType).Partial);
         Assert.Equal(partialStatsType.Partial, Assert.IsType<DistributedType>(selectedGrid.CheckedType).Partial);
 
         var tiled = Assert.IsType<Function>(await new AutoTilePass(Targets.CPUTarget.Kind, CompileOptions).RunAsync(selected, new()));
 
-        var boxingCall = Assert.IsType<Call>(tiled.Body);
-        Assert.True(
-            boxingCall.Target is IR.Distributed.Boxing,
-            $"AutoTile changed partial stats into {boxingCall.CheckedType} through {boxingCall.Target.GetType().Name}.\n{CompilerServices.Print(tiled)}");
-        var tiledStatsType = Assert.IsType<DistributedType>(boxingCall.Arguments[0].CheckedType);
-        Assert.Equal(partialStatsType.Partial, tiledStatsType.Partial);
+        Assert.DoesNotContain(ExprCollector.Collect(tiled.Body).OfType<Call>(), call => call.Target is IR.Distributed.Boxing);
+        var tiledCall = Assert.IsType<Call>(tiled.Body);
+        var tiledFunction = Assert.IsType<PrimFunctionWrapper>(tiledCall.Target).Target;
+        var reshard = Assert.Single(ExprCollector.Collect(tiledFunction.Body).OfType<Call>().Select(call => call.Target).OfType<TIR.NTT.GatherReduceScatter>());
+        Assert.Equal(partialStatsType.Partial, reshard.InType.Partial);
     }
 
     [Fact]

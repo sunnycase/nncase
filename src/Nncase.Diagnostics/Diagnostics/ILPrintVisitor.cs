@@ -565,8 +565,8 @@ internal sealed class ILPrintVisitor : ExprFunctor<string, string>
             throw new NotSupportedException($"Inline Mode with {typeof(IR.Affine.Grid)}");
         }
 
-        var reads = expr.Reads.AsValueEnumerable().Select(Visit).ToArray();
-        var buffers = expr.Buffers.AsValueEnumerable().Select(Visit).ToArray();
+        var accesses = expr.Accesses.ToArray();
+        var reads = accesses.Where(access => access.IsRead).Select(access => Visit(access.Value)).ToArray();
         var name = GetNextSSANumber();
 
         // 1. For Loop signature
@@ -576,29 +576,21 @@ internal sealed class ILPrintVisitor : ExprFunctor<string, string>
 
         using (IndentScope())
         {
-            // 2. In buffers
-            _writer.WInd().WriteLine($"Reads:");
+            _writer.WInd().WriteLine("Accesses:");
             using (IndentScope())
             {
-                for (int i = 0; i < expr.Reads.Length; i++)
+                foreach (var access in accesses)
                 {
-                    _writer.WInd().WriteLine($"{buffers[i]}: {expr.AccessMaps[i]}");
-                }
-            }
-
-            // 3. Out buffer
-            _writer.WInd().WriteLine($"Write:");
-            using (IndentScope())
-            {
-                for (int i = 0; i < expr.Writes.Length; i++)
-                {
-                    _writer.WInd().WriteLine($"{buffers[expr.Reads.Length + i]}: {expr.WriteAccessMaps[i]}");
+                    var mode = access.AccessMode.ToString().ToLowerInvariant();
+                    var binding = access.BindingMode.ToString().ToLowerInvariant();
+                    var region = access.IsAffine ? access.AffineMap.ToString() : "opaque";
+                    _writer.WInd().WriteLine($"{mode} {binding} {Visit(access.Buffer)}: {region}");
                 }
             }
 
             // 4. For Body
             var domain_parameters = Visit(expr.DomainParameter);
-            var parameters = expr.BodyParameters.AsValueEnumerable().Select(Visit).ToArray();
+            var parameters = accesses.Select(access => Visit(access.Parameter)).ToArray();
             _writer.WInd().Write($"Body: ({domain_parameters}, {string.Join(", ", parameters)})");
             AppendCheckedType(expr.Body.CheckedType, expr.Body.Metadata.Range, hasNewLine: true);
             _writer.WInd().WriteLine("{");

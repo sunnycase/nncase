@@ -37,17 +37,19 @@ public sealed class BufferRegion : Expr
     /// </summary>
     public BufferRegion this[params Range[] ranges]
     {
-        get => new(Buffer, new(Region.ToArray().Zip(ranges).Select(
-            tp => tp.Second.Equals(System.Range.All) ?
-                  tp.First :
-                  tp.Second.Stop switch
-                  {
-                      // if stop is neg, add the shape
-                      Dimension d when d.Metadata.Range?.Min < 0 => throw new NotSupportedException("Neg Region!"),
+        get => new(
+            Buffer,
+            new(Region.ToArray().Zip(ranges).Select(
+                tp => tp.Second.Equals(System.Range.All) ?
+                      tp.First :
+                      tp.Second.Stop switch
+                      {
+                          // if stop is neg, add the shape
+                          Dimension d when d.Metadata.Range?.Min < 0 => throw new NotSupportedException("Neg Region!"),
 
-                      // else return the origin range.
-                      _ => tp.Second,
-                  }).ToArray()));
+                          // else return the origin range.
+                          _ => tp.Second,
+                      }).ToArray()));
     }
 
     /// <inheritdoc/>

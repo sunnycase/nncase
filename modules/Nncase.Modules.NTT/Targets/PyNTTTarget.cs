@@ -43,6 +43,12 @@ public sealed class PyNTTTarget : NTTTarget
     }
 
     /// <inheritdoc/>
+    public override void RegisterTIRPostBufferizePass(IPassManager passManager, CompileOptions options)
+    {
+        passManager.AddWithName<PlanMemorySynchronizationPass>("PlanMemorySynchronization", Kind);
+    }
+
+    /// <inheritdoc/>
     public override (Command Command, Func<InvocationContext, Command, ITargetOptions> Parser) RegisterCommandAndParser()
     {
         var cmd = new NTTTargetOptionsCommand(Name);

@@ -260,6 +260,12 @@ public partial class ExprRewriter<TContext>
     }
 
     /// <inheritdoc/>
+    protected sealed override BaseExpr VisitLeafGridAccess(Affine.GridAccess expr, TContext context)
+    {
+        return RewriteLeafGridAccess(expr, context);
+    }
+
+    /// <inheritdoc/>
     protected sealed override BaseExpr VisitLeafGrid(Affine.Grid expr, TContext context)
     {
         return RewriteLeafGrid(expr, context);
@@ -643,6 +649,11 @@ public partial class ExprRewriter<TContext>
     /// Rewrite leaf <see cref="Affine.AffineRelation"/>.
     /// </summary>
     protected virtual BaseExpr RewriteLeafAffineRelation(Affine.AffineRelation expr, TContext context) => DefaultRewriteLeaf(expr, context);
+
+    /// <summary>
+    /// Rewrite leaf <see cref="Affine.GridAccess"/>.
+    /// </summary>
+    protected virtual BaseExpr RewriteLeafGridAccess(Affine.GridAccess expr, TContext context) => DefaultRewriteLeaf(expr, context);
 
     /// <summary>
     /// Rewrite leaf <see cref="Affine.Grid"/>.
@@ -1125,6 +1136,14 @@ public partial class ExprRewriter
 
     /// <inheritdoc />
     protected sealed override BaseExpr RewriteLeafAffineRelation(Affine.AffineRelation expr, Unit context) => RewriteLeafAffineRelation(expr);
+
+    /// <summary>
+    /// Rewrite leaf <see cref="Affine.GridAccess"/>.
+    /// </summary>
+    protected virtual BaseExpr RewriteLeafGridAccess(Affine.GridAccess expr) => DefaultRewriteLeaf(expr);
+
+    /// <inheritdoc />
+    protected sealed override BaseExpr RewriteLeafGridAccess(Affine.GridAccess expr, Unit context) => RewriteLeafGridAccess(expr);
 
     /// <summary>
     /// Rewrite leaf <see cref="Affine.Grid"/>.

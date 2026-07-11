@@ -72,6 +72,11 @@ public class K210Target : ITarget
     }
 
     /// <inheritdoc/>
+    public void RegisterTIRPostBufferizePass(IPassManager passManager, CompileOptions options)
+    {
+    }
+
+    /// <inheritdoc/>
     public IModuleBuilder CreateModuleBuilder(string moduleKind, CompileOptions options)
     {
         if (moduleKind == KPURTModule.Kind)

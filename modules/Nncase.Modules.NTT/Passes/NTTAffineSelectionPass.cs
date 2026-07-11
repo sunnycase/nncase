@@ -46,6 +46,8 @@ public partial class NTTAffineSelectionPass : AffineSelectionPass
 
         switch (call.Target)
         {
+            case IR.Distributed.Boxing op:
+                return SelectBoxing(op, call, exprOutput);
             case IR.NTT.PackedMatMul op:
                 return SelectMatMul(op, call, exprOutput);
             case IR.NTT.PackedMatMulGlu op:

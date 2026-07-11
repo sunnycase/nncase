@@ -21,12 +21,12 @@ public sealed partial class Unsqueeze : NTTKernelOp
     /// <summary>
     /// Gets input.
     /// </summary>
-    public static readonly ParameterInfo Input = new(typeof(Unsqueeze), 0, "input");
+    public static readonly ParameterInfo Input = new(typeof(Unsqueeze), 0, "input", memoryEffect: MemoryEffect.Read);
 
     /// <summary>
     /// Gets input.
     /// </summary>
-    public static readonly ParameterInfo Output = new(typeof(Unsqueeze), 1, "output");
+    public static readonly ParameterInfo Output = new(typeof(Unsqueeze), 1, "output", memoryEffect: MemoryEffect.Write);
 
     /// <summary>
     /// Gets begins.

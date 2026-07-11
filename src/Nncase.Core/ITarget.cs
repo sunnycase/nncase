@@ -172,6 +172,12 @@ public interface ITarget
     /// materialized in the module and before bufferization assigns storage.
     /// </summary>
     void RegisterTIRPreBufferizePass(IPassManager passManager, CompileOptions options);
+
+    /// <summary>
+    /// Register target-specific TIR passes that require bufferization to have
+    /// assigned concrete storage and byte offsets.
+    /// </summary>
+    void RegisterTIRPostBufferizePass(IPassManager passManager, CompileOptions options);
 }
 
 public sealed class DefaultTargetCompileOptions : ITargetOptions

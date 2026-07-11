@@ -6,9 +6,11 @@ namespace Nncase.TIR.NTT;
 
 public sealed partial class Where : NTTKernelOp
 {
-    public static readonly ParameterInfo Cond = new(typeof(Where), 0, "cond");
+    public static readonly ParameterInfo Cond = new(typeof(Where), 0, "cond", memoryEffect: MemoryEffect.Read);
 
-    public static readonly ParameterInfo X = new(typeof(Where), 1, "x");
+    public static readonly ParameterInfo X = new(typeof(Where), 1, "x", memoryEffect: MemoryEffect.Read);
 
-    public static readonly ParameterInfo Y = new(typeof(Where), 2, "y");
+    public static readonly ParameterInfo Y = new(typeof(Where), 2, "y", memoryEffect: MemoryEffect.Read);
+
+    public static readonly ParameterInfo Output = new(typeof(Where), 3, "output", memoryEffect: MemoryEffect.Write);
 }

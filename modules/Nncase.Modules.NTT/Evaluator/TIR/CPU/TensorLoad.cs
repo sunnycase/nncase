@@ -2,12 +2,15 @@
 // Licensed under the Apache license. See LICENSE file in the project root for full license information.
 
 using Nncase.IR;
+using Nncase.Schedule;
 using Nncase.TIR.NTT;
 
 namespace Nncase.Evaluator.TIR.NTT;
 
-public class TensorLoadEvaluator : ITypeInferencer<TensorLoad>
+public class TensorLoadEvaluator : ITypeInferencer<TensorLoad>, IKernelInfoEvaluator<TensorLoad>
 {
+    public MicroKernelInfo Visit(TensorLoad target, MicroKernelContext context) => TransferKernelInfo.Create(context);
+
     public IRType Visit(ITypeInferenceContext context, TensorLoad target)
     {
         _ = CheckTensorOrDistributedBuffer(context, target, TensorLoad.Dest);

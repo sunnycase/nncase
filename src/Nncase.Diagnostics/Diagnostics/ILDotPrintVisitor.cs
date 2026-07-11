@@ -251,8 +251,9 @@ internal sealed class ILDotPrintVisitor : ExprFunctor<ILDotOption, string>
             {
                 row.AddCell("Grid"); // key wrods type.
                 int count = 0;
-                foreach (var child in expr.Buffers)
+                foreach (var access in expr.Accesses)
                 {
+                    var child = access.Buffer;
                     var childnode = Visit(child);
                     var portName = $"P{count++}";
                     row.AddCell(childnode.IsDotNode ? string.Empty : childnode.Str, cell => cell.PortName = portName);

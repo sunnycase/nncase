@@ -20,9 +20,9 @@ public sealed partial class ResizeImage : NTTKernelOp
     /// <summary>
     /// Gets input.
     /// </summary>
-    public static readonly ParameterInfo Input = new(typeof(ResizeImage), 0, "input", HasRank(r => r >= 2, "RanK >= 2"), ParameterKind.Input);
+    public static readonly ParameterInfo Input = new(typeof(ResizeImage), 0, "input", HasRank(r => r >= 2, "RanK >= 2"), ParameterKind.Input, MemoryEffect.Read);
 
-    public static readonly ParameterInfo Output = new(typeof(ResizeImage), 1, "output", HasRank(r => r >= 2, "RanK >= 2"), ParameterKind.Input);
+    public static readonly ParameterInfo Output = new(typeof(ResizeImage), 1, "output", HasRank(r => r >= 2, "RanK >= 2"), ParameterKind.Input, MemoryEffect.Write);
 
     public IRArray<int> VectorizedAxes { get; }
 

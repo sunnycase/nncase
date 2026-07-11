@@ -49,10 +49,12 @@ public sealed class AffineViewCompositionPass : FunctionPass
     {
         foreach (var grid in ExprCollector.Collect(root).OfType<Grid>())
         {
-            for (var index = 0; index < grid.Reads.Length; index++)
+            for (var index = 0; index < grid.Accesses.Length; index++)
             {
-                if (grid.Reads[index] is Call { Target: AffineView } viewCall &&
-                    CanCompose((AffineView)viewCall.Target, grid.Reads[index].CheckedType, ((Expr)viewCall[AffineView.Input]).CheckedType))
+                var access = grid.Accesses[index];
+                if (access.IsRead &&
+                    access.Value is Call { Target: AffineView } viewCall &&
+                    CanCompose((AffineView)viewCall.Target, access.Value.CheckedType, ((Expr)viewCall[AffineView.Input]).CheckedType))
                 {
                     throw new InvalidOperationException($"Composable AffineView remains on Grid read {index} after affine-view composition.");
                 }
@@ -143,30 +145,37 @@ public sealed class AffineViewCompositionPass : FunctionPass
 
         protected override BaseExpr RewriteLeafGrid(Grid grid)
         {
-            var accessMaps = grid.AccessMaps.ToArray();
-            var buffers = grid.Buffers.ToArray();
-            var reads = grid.Reads.ToArray();
+            var accesses = grid.Accesses.ToArray();
             var changed = false;
 
-            for (var readIndex = 0; readIndex < reads.Length; readIndex++)
+            for (var accessIndex = 0; accessIndex < accesses.Length; accessIndex++)
             {
-                while (reads[readIndex] is Call { Target: AffineView view } viewCall)
+                var access = accesses[accessIndex];
+                if (!access.IsRead || !access.IsAffine)
+                {
+                    continue;
+                }
+
+                while (access.Value is Call { Target: AffineView view } viewCall)
                 {
                     var source = (Expr)viewCall[AffineView.Input];
-                    if (!CanCompose(view, reads[readIndex].CheckedType, source.CheckedType))
+                    if (!CanCompose(view, access.Value.CheckedType, source.CheckedType))
                     {
                         break;
                     }
 
-                    accessMaps[readIndex] = view.Transform.ComposeResultAccess(accessMaps[readIndex]);
-                    reads[readIndex] = source;
-                    buffers[readIndex] = IR.F.Buffer.BufferOf(source);
+                    access = access.With(
+                        value: source,
+                        buffer: IR.F.Buffer.BufferOf(source),
+                        region: view.Transform.ComposeResultAccess(access.AffineMap));
                     changed = true;
                 }
+
+                accesses[accessIndex] = access;
             }
 
             return changed
-                ? grid.With(accessMaps: accessMaps, buffers: buffers, reads: reads)
+                ? grid.With(accesses: accesses)
                 : grid;
         }
     }

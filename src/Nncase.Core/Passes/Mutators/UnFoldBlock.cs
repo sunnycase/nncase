@@ -25,7 +25,11 @@ public sealed class UnFoldBlock : ExprRewriter
             {
                 if (expr.AllocBuffers.Length > 0)
                 {
-                    var lets = expr.AllocBuffers.ToArray().Select(b => (T.Let(out var v, IR.F.Buffer.AllocateBufferView(b), b.Name), v)).ToArray();
+                    var lets = expr.AllocBuffers.ToArray().Select(b =>
+                    {
+                        var globalOffset = new RankedShape(Enumerable.Repeat<Dimension>(0L, b.Rank).ToArray());
+                        return (T.Let(out var v, IR.F.Buffer.AllocateBufferView(b, globalOffset), b.Name), v);
+                    }).ToArray();
                     for (int i = 0; i < lets.Length - 1; i++)
                     {
                         lets[i].Item1.Body(lets[i + 1].Item1);

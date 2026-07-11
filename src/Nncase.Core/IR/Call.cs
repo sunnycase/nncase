@@ -93,14 +93,20 @@ public sealed class Call : BaseCall, IParameterList<BaseExpr>
     /// <summary>
     /// get param expr.
     /// </summary>
-    public override BaseExpr this[ParameterInfo parameter] => Arguments[ValidateParameterIndex(parameter, Target)];
+    public override BaseExpr this[ParameterInfo parameter] => Arguments[ValidateParameterIndex(parameter, Target, Arguments.Length)];
 
     public override void ParametersForeach(Action<BaseExpr, ParameterInfo> f)
     {
         var parameterInfos = ((Op)Target).Parameters.ToArray();
-        for (int i = 0; i < Arguments.Length; i++)
+        var variadic = GetVariadicParameter(parameterInfos, Arguments.Length);
+        for (var argumentIndex = 0; argumentIndex < Arguments.Length; argumentIndex++)
         {
-            f(Arguments[i], parameterInfos[i]);
+            var parameterIndex = variadic is null || argumentIndex < variadic.Value.ParameterIndex
+                ? argumentIndex
+                : argumentIndex < variadic.Value.ParameterIndex + variadic.Value.ArgumentCount
+                    ? variadic.Value.ParameterIndex
+                    : argumentIndex - variadic.Value.ArgumentCount + 1;
+            f(Arguments[argumentIndex], parameterInfos[parameterIndex]);
         }
     }
 
@@ -122,20 +128,56 @@ public sealed class Call : BaseCall, IParameterList<BaseExpr>
     {
         var newArguments = replaceArguments is null
             ? Arguments.ToArray()
-            : Arguments.AsValueEnumerable().Select((arg, i) => replaceArguments.FirstOrDefault(a => ValidateParameterIndex(a.Parameter, Target) == i).Argument ?? arg).ToArray();
+            : Arguments.AsValueEnumerable().Select((arg, i) => replaceArguments.FirstOrDefault(a => ValidateParameterIndex(a.Parameter, Target, Arguments.Length) == i).Argument ?? arg).ToArray();
         return With(arguments: newArguments, metadata: metadata);
     }
 
-    private static int ValidateParameterIndex(ParameterInfo parameter, Expr target)
+    private static int ValidateParameterIndex(ParameterInfo parameter, Expr target, int argumentCount)
     {
         var type = target.GetType();
-        if (type == parameter.OwnerType)
-        {
-            return parameter.Index;
-        }
-        else
+        if (type != parameter.OwnerType)
         {
             throw new ArgumentOutOfRangeException($"Target {target} doesn't have parameter: {parameter.OwnerType}.{parameter.Name}.");
         }
+
+        var parameters = ((Op)target).Parameters.ToArray();
+        var variadic = GetVariadicParameter(parameters, argumentCount);
+        if (variadic is null || parameter.Index <= variadic.Value.ParameterIndex)
+        {
+            return parameter.Index;
+        }
+
+        return parameter.Index + variadic.Value.ArgumentCount - 1;
+    }
+
+    private static (int ParameterIndex, int ArgumentCount)? GetVariadicParameter(ParameterInfo[] parameters, int argumentCount)
+    {
+        var variadicIndices = parameters
+            .Select((parameter, index) => (parameter, index))
+            .Where(item => item.parameter.IsVariadic)
+            .Select(item => item.index)
+            .ToArray();
+        if (variadicIndices.Length > 1)
+        {
+            throw new InvalidOperationException("An operation may declare at most one variadic parameter.");
+        }
+
+        if (variadicIndices.Length == 0)
+        {
+            if (argumentCount != parameters.Length)
+            {
+                throw new InvalidOperationException($"Operation declares {parameters.Length} parameters but the call has {argumentCount} arguments.");
+            }
+
+            return null;
+        }
+
+        var variadicArgumentCount = argumentCount - parameters.Length + 1;
+        if (variadicArgumentCount <= 0)
+        {
+            throw new InvalidOperationException("A variadic parameter must bind at least one call argument.");
+        }
+
+        return (variadicIndices[0], variadicArgumentCount);
     }
 }

@@ -12,11 +12,11 @@ namespace Nncase.TIR.NTT;
 
 public sealed partial class ScatterND : NTTKernelOp
 {
-    public static readonly ParameterInfo Input = new(typeof(ScatterND), 0, "input");
+    public static readonly ParameterInfo Input = new(typeof(ScatterND), 0, "input", memoryEffect: MemoryEffect.Read);
 
-    public static readonly ParameterInfo Indices = new(typeof(ScatterND), 1, "indices");
+    public static readonly ParameterInfo Indices = new(typeof(ScatterND), 1, "indices", memoryEffect: MemoryEffect.Read);
 
-    public static readonly ParameterInfo Updates = new(typeof(ScatterND), 2, "updates");
+    public static readonly ParameterInfo Updates = new(typeof(ScatterND), 2, "updates", memoryEffect: MemoryEffect.Read);
 
-    public static readonly ParameterInfo Output = new(typeof(ScatterND), 3, "output");
+    public static readonly ParameterInfo Output = new(typeof(ScatterND), 3, "output", memoryEffect: MemoryEffect.Write);
 }

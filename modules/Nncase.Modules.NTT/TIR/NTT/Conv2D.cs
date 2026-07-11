@@ -17,13 +17,13 @@ namespace Nncase.TIR.NTT;
 /// </summary>
 public sealed partial class Conv2D : NTTKernelOp
 {
-    public static readonly ParameterInfo Input = new(typeof(Conv2D), 0, "input", ParameterKind.Input);
+    public static readonly ParameterInfo Input = new(typeof(Conv2D), 0, "input", ParameterKind.Input, MemoryEffect.Read);
 
-    public static readonly ParameterInfo Weights = new(typeof(Conv2D), 1, "weights", ParameterKind.Input);
+    public static readonly ParameterInfo Weights = new(typeof(Conv2D), 1, "weights", ParameterKind.Input, MemoryEffect.Read);
 
-    public static readonly ParameterInfo Bias = new(typeof(Conv2D), 2, "bias", ParameterKind.Input);
+    public static readonly ParameterInfo Bias = new(typeof(Conv2D), 2, "bias", ParameterKind.Input, MemoryEffect.Read);
 
-    public static readonly ParameterInfo Output = new(typeof(Conv2D), 3, "output", ParameterKind.Input);
+    public static readonly ParameterInfo Output = new(typeof(Conv2D), 3, "output", ParameterKind.Input, MemoryEffect.Write);
 
     /// <summary>
     /// Gets Stride.

@@ -84,22 +84,31 @@ public sealed class ITreeNodeComparer : IEqualityComparer<ITreeNode>
     private bool GridEquals(Grid x, Grid y)
     {
         return VarTypeEqualityComparer.Instance.Equals(x.DomainParameter, y.DomainParameter) &&
-            x.BodyParameters.SequenceEqual(y.BodyParameters, VarTypeEqualityComparer.Instance) &&
-            x.AccessMaps.SequenceEqual(y.AccessMaps) &&
-            x.Buffers.SequenceEqual(y.Buffers, ExprTypeEqualityComparer.Instance) &&
-            x.Reads.SequenceEqual(y.Reads, ExprTypeEqualityComparer.Instance) &&
-            new ExprStructuralEqualityVisitor(new[] { (x.DomainParameter, y.DomainParameter) }.Concat(Enumerable.Range(0, x.BodyParameters.Length).Select(i => (x.BodyParameters[i], y.BodyParameters[i])))
+            x.Accesses.Length == y.Accesses.Length &&
+            Enumerable.Range(0, x.Accesses.Length).All(i => GridAccessEquals(x.Accesses[i], y.Accesses[i])) &&
+            new ExprStructuralEqualityVisitor(new[] { (x.DomainParameter, y.DomainParameter) }.Concat(Enumerable.Range(0, x.Accesses.Length).Select(i => (x.Accesses[i].Parameter, y.Accesses[i].Parameter)))
             .ToDictionary(p => p.Item1, p => p.Item2)).Visit(x.Body, y.Body);
+    }
+
+    private static bool GridAccessEquals(GridAccess x, GridAccess y)
+    {
+        return x.AccessMode == y.AccessMode &&
+            x.BindingMode == y.BindingMode &&
+            x.DomainMode == y.DomainMode &&
+            VarTypeEqualityComparer.Instance.Equals(x.Parameter, y.Parameter) &&
+            ExprTypeEqualityComparer.Instance.Equals(x.Value, y.Value) &&
+            ExprTypeEqualityComparer.Instance.Equals(x.Buffer, y.Buffer) &&
+            x.Region.Equals(y.Region);
     }
 
     private int GridHashCode([DisallowNull] Grid obj)
     {
         return HashCode.Combine(
             obj.DomainParameter.TypeAnnotation,
-            HashCode<IRType>.Combine(Enumerable.Range(0, obj.BodyParameters.Length).Select(i => obj.BodyParameters[i].TypeAnnotation).ToArray()),
-            HashCode<AffineMap>.Combine(obj.AccessMaps),
-            HashCode<IRType>.Combine(Enumerable.Range(0, obj.Buffers.Length).Select(i => obj.Buffers[i].CheckedType).ToArray()),
-            HashCode<IRType>.Combine(Enumerable.Range(0, obj.Reads.Length).Select(i => obj.Reads[i].CheckedType).ToArray()),
+            HashCode<IRType>.Combine(obj.Accesses.ToArray().Select(access => access.Parameter.TypeAnnotation).ToArray()),
+            HashCode<GridAccessMode>.Combine(obj.Accesses.ToArray().Select(access => access.AccessMode).ToArray()),
+            HashCode<GridBindingMode>.Combine(obj.Accesses.ToArray().Select(access => access.BindingMode).ToArray()),
+            HashCode<GridDomainMode>.Combine(obj.Accesses.ToArray().Select(access => access.DomainMode).ToArray()),
             new ExprStructuralHashCodeVisitor().Visit(obj.Body));
     }
 

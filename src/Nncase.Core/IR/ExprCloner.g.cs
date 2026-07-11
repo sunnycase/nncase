@@ -1081,6 +1081,47 @@ public partial class ExprCloner<TContext>
     }
 
     /// <inheritdoc />
+    protected override BaseExpr VisitLeafGridAccess(Affine.GridAccess expr, TContext context)
+    {
+        bool IsOperandsMutated()
+        {
+            if (IsMutated(expr.Value, context))
+            {
+                return true;
+            }
+
+            if (IsMutated(expr.Buffer, context))
+            {
+                return true;
+            }
+
+            if (IsMutated(expr.Parameter, context))
+            {
+                return true;
+            }
+
+            if (IsMutated(expr.Region, context))
+            {
+                return true;
+            }
+
+            return false;
+        }
+
+        if (CloneUnmutated || IsOperandsMutated())
+        {
+            return expr.With(
+                value: Clone(expr.Value, context),
+                buffer: Clone(expr.Buffer, context),
+                parameter: Clone(expr.Parameter, context),
+                region: Clone(expr.Region, context)
+            );
+        }
+
+        return expr;
+    }
+
+    /// <inheritdoc />
     protected override BaseExpr VisitLeafGrid(Affine.Grid expr, TContext context)
     {
         bool IsOperandsMutated()
@@ -1090,22 +1131,7 @@ public partial class ExprCloner<TContext>
                 return true;
             }
 
-            if (IsMutatedArray(expr.BodyParameters, context))
-            {
-                return true;
-            }
-
-            if (IsMutatedArray(expr.AccessMaps, context))
-            {
-                return true;
-            }
-
-            if (IsMutatedArray(expr.Buffers, context))
-            {
-                return true;
-            }
-
-            if (IsMutatedArray(expr.Reads, context))
+            if (IsMutatedArray(expr.Accesses, context))
             {
                 return true;
             }
@@ -1122,10 +1148,7 @@ public partial class ExprCloner<TContext>
         {
             return expr.With(
                 domainParameter: Clone(expr.DomainParameter, context),
-                bodyParameters: CloneArray(expr.BodyParameters, context),
-                accessMaps: CloneArray(expr.AccessMaps, context),
-                buffers: CloneArray(expr.Buffers, context),
-                reads: CloneArray(expr.Reads, context),
+                accesses: CloneArray(expr.Accesses, context),
                 body: Clone(expr.Body, context)
             );
         }

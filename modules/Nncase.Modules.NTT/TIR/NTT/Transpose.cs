@@ -21,12 +21,12 @@ public sealed partial class Transpose : NTTKernelOp
     /// <summary>
     /// Gets input.
     /// </summary>
-    public static readonly ParameterInfo Input = new(typeof(Transpose), 0, "input");
+    public static readonly ParameterInfo Input = new(typeof(Transpose), 0, "input", memoryEffect: MemoryEffect.Read);
 
     /// <summary>
     /// Gets input.
     /// </summary>
-    public static readonly ParameterInfo Output = new(typeof(Transpose), 1, "output");
+    public static readonly ParameterInfo Output = new(typeof(Transpose), 1, "output", memoryEffect: MemoryEffect.Write);
 
     /// <summary>
     /// Gets begins.

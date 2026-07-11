@@ -11,21 +11,21 @@ public sealed partial class VectorizedLayerNorm : NTTKernelOp
     /// <summary>
     /// Gets input.
     /// </summary>
-    public static readonly ParameterInfo Input = new(typeof(VectorizedLayerNorm), 0, "input", ParameterKind.Input);
+    public static readonly ParameterInfo Input = new(typeof(VectorizedLayerNorm), 0, "input", ParameterKind.Input, MemoryEffect.Read);
 
     /// <summary>
     /// Gets scale.
     /// </summary>
-    public static readonly ParameterInfo Scale = new(typeof(VectorizedLayerNorm), 1, "scale", ParameterKind.Input);
+    public static readonly ParameterInfo Scale = new(typeof(VectorizedLayerNorm), 1, "scale", ParameterKind.Input, MemoryEffect.Read);
 
     /// <summary>
     /// Gets bias.
     /// </summary>
-    public static readonly ParameterInfo Bias = new(typeof(VectorizedLayerNorm), 2, "bias", ParameterKind.Input);
+    public static readonly ParameterInfo Bias = new(typeof(VectorizedLayerNorm), 2, "bias", ParameterKind.Input, MemoryEffect.Read);
 
-    public static readonly ParameterInfo PostScale = new(typeof(VectorizedLayerNorm), 3, "postScale", ParameterKind.Attribute);
+    public static readonly ParameterInfo PostScale = new(typeof(VectorizedLayerNorm), 3, "postScale", ParameterKind.Attribute, MemoryEffect.Read);
 
-    public static readonly ParameterInfo Output = new(typeof(VectorizedLayerNorm), 4, "output", ParameterKind.Input);
+    public static readonly ParameterInfo Output = new(typeof(VectorizedLayerNorm), 4, "output", ParameterKind.Input, MemoryEffect.Write);
 
     public int Axis { get; }
 

@@ -47,15 +47,15 @@ public static class GraphExtensions
                     var boundCell = new QuikGraph.Graphviz.Dot.GraphvizRecordCell();
                     childCell.Cells.Add(boundCell);
                     childCell.Cells.Add(domainCell);
-                    for (int i = 0; i < arg.Vertex.ReadAccesses.Length; i++)
+                    foreach (var accessIndex in arg.Vertex.ReadAccessIndices)
                     {
-                        var item = arg.Vertex.ReadAccesses[i];
-                        domainCell.Cells.Add(new() { Text = $"read: {item}", Port = $"R{i}" });
+                        var item = arg.Vertex.GetAccessMap(accessIndex);
+                        domainCell.Cells.Add(new() { Text = $"read: {item}", Port = $"R{accessIndex}" });
                     }
 
-                    for (int i = 0; i < arg.Vertex.WriteAccesses.Length; i++)
+                    for (int outputIndex = 0; outputIndex < arg.Vertex.WriteAccessIndices.Length; outputIndex++)
                     {
-                        domainCell.Cells.Add(new() { Text = $"write{i}: {arg.Vertex.WriteAccesses[i]}", Port = $"W{i}" });
+                        domainCell.Cells.Add(new() { Text = $"write{outputIndex}: {arg.Vertex.GetWriteAccess(outputIndex)}", Port = $"W{outputIndex}" });
                     }
 
                     for (int i = 0; i < arg.Vertex.DomainBounds.Length; i++)
@@ -71,7 +71,7 @@ public static class GraphExtensions
 
                 alg.FormatEdge += (_, arg) =>
                 {
-                    arg.EdgeFormat.TailPort = $"W{GetProducerOutputIndex(arg.Edge.Target.Grid.Reads[arg.Edge.Tag], arg.Edge.Source)}:e";
+                    arg.EdgeFormat.TailPort = $"W{GetProducerOutputIndex(arg.Edge.Target.Grid.Accesses[arg.Edge.Tag].Value, arg.Edge.Source)}:e";
                     arg.EdgeFormat.HeadPort = $"R{arg.Edge.Tag}:e";
                 };
             });
@@ -141,6 +141,53 @@ public static class GraphExtensions
         return merger.Visit(graph);
     }
 
+    internal static bool IsFusionLegal(TileGrid producer, TileGrid consumer, int consumerAccessIndex)
+    {
+        var consumerRead = consumer.Grid.Accesses[consumerAccessIndex];
+        if (HasChipMemoryEffect(consumer.Grid, consumerRead.Parameter, MemoryAccessMode.Read))
+        {
+            return false;
+        }
+
+        var producerOutputIndex = GetProducerOutputIndex(consumerRead.Value, producer);
+        var producerWrite = producer.Grid.Accesses[producer.GetWriteAccessIndex(producerOutputIndex)];
+        return producerWrite.BindingMode != GridBindingMode.Root ||
+            !HasChipMemoryEffect(producer.Grid, producerWrite.Parameter, MemoryAccessMode.Write);
+    }
+
+    private static bool HasChipMemoryEffect(Grid grid, Var parameter, MemoryAccessMode mode)
+    {
+        foreach (var call in ExprCollector.Collect(grid.Body).OfType<Call>())
+        {
+            if (call.Target is not Op)
+            {
+                continue;
+            }
+
+            var hasEffect = false;
+            call.ParametersForeach((argument, parameterInfo) =>
+            {
+                if (!hasEffect &&
+                    parameterInfo.MemoryEffect is { Scope: MemoryAccessScope.Chip } effect &&
+                    effect.Mode.HasFlag(mode) &&
+                    References(argument, parameter))
+                {
+                    hasEffect = true;
+                }
+            });
+            if (hasEffect)
+            {
+                return true;
+            }
+        }
+
+        return false;
+
+        static bool References(BaseExpr expression, BaseExpr target)
+            => ReferenceEquals(expression, target) ||
+                ExprCollector.Collect(expression).Any(item => ReferenceEquals(item, target));
+    }
+
     public static List<MergePoint> GetMergePoints(this TieredTileGraph graph)
     {
         var mergePoints = new List<MergePoint>();
@@ -163,7 +210,10 @@ public static class GraphExtensions
                 {
                     if (comsumer.ContainsVertex(edge.Source) && producer.ContainsVertex(edge.Target))
                     {
-                        mergePoints.Add(new(edge.Target, edge.Source, producer.Level));
+                        if (IsFusionLegal(edge.Source, edge.Target, edge.Tag))
+                        {
+                            mergePoints.Add(new(edge.Target, edge.Source, producer.Level));
+                        }
                     }
                 }
             }
@@ -268,8 +318,7 @@ public static class GraphExtensions
 
     public static IR.Expr GetArgument(this IR.Affine.Grid grid, int index)
     {
-        // note why we use bufferof wrapper the reads?
-        return index >= grid.Reads.Length ? grid.Buffers[index] : grid.Reads[index];
+        return grid.Accesses[index].Value;
     }
 
     public static bool TryGetProducerGrid(Expr expr, out Grid producer, out int outputIndex)
@@ -297,12 +346,13 @@ public static class GraphExtensions
 
     public static int GetOutputBufferIndex(this Grid grid, int outputIndex)
     {
-        if (outputIndex < 0 || outputIndex >= grid.Writes.Length)
+        var writeAccesses = grid.Accesses.ToArray().Select((access, index) => (access, index)).Where(pair => pair.access.IsWrite).ToArray();
+        if (outputIndex < 0 || outputIndex >= writeAccesses.Length)
         {
-            throw new ArgumentOutOfRangeException(nameof(outputIndex), $"Grid has {grid.Writes.Length} outputs, got {outputIndex}.");
+            throw new ArgumentOutOfRangeException(nameof(outputIndex), $"Grid has {writeAccesses.Length} outputs, got {outputIndex}.");
         }
 
-        return grid.Reads.Length + outputIndex;
+        return writeAccesses[outputIndex].index;
     }
 
     public static int GetProducerOutputIndex(Expr consumerRead, TileGrid producer)

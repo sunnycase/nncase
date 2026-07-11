@@ -11,19 +11,19 @@ public sealed partial class InstanceNorm : NTTKernelOp
     /// <summary>
     /// Gets input.
     /// </summary>
-    public static readonly ParameterInfo Input = new(typeof(InstanceNorm), 0, "input", ParameterKind.Input);
+    public static readonly ParameterInfo Input = new(typeof(InstanceNorm), 0, "input", ParameterKind.Input, MemoryEffect.Read);
 
     /// <summary>
     /// Gets scale.
     /// </summary>
-    public static readonly ParameterInfo Scale = new(typeof(InstanceNorm), 1, "scale", ParameterKind.Input);
+    public static readonly ParameterInfo Scale = new(typeof(InstanceNorm), 1, "scale", ParameterKind.Input, MemoryEffect.Read);
 
     /// <summary>
     /// Gets bias.
     /// </summary>
-    public static readonly ParameterInfo Bias = new(typeof(InstanceNorm), 2, "bias", ParameterKind.Input);
+    public static readonly ParameterInfo Bias = new(typeof(InstanceNorm), 2, "bias", ParameterKind.Input, MemoryEffect.Read);
 
-    public static readonly ParameterInfo Output = new(typeof(InstanceNorm), 3, "output", ParameterKind.Input);
+    public static readonly ParameterInfo Output = new(typeof(InstanceNorm), 3, "output", ParameterKind.Input, MemoryEffect.Write);
 
     public float Epsilon { get; }
 

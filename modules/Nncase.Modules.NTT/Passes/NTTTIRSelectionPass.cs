@@ -48,8 +48,8 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
                 return GenerateUnary(unary.UnaryOp, arguments, output);
             case IR.Math.Clamp clamp:
                 return GenerateClamp(call, arguments, output);
-            case IR.Distributed.Boxing boxing:
-                return GenerateBoxing(call, boxing, arguments, ref output, context);
+            case IR.Distributed.Boxing:
+                throw new InvalidOperationException("Boxing must be lowered to an affine transfer before TIR selection.");
             case AffineView affineView:
                 return GenerateAffineView(call, affineView, arguments, ref output);
             case IR.Distributed.ForceBoxing forceBoxing:
@@ -410,23 +410,4 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
         return TIR.F.NTT.Clamp((Expr)arguments[0], output, min, max);
     }
 
-    private Expr GenerateBoxing(Call call, IR.Distributed.Boxing boxing, IReadOnlyList<BaseExpr> arguments, ref Expr output, TIRSelectionContext context)
-    {
-        switch (call[IR.Distributed.Boxing.Input].CheckedType, boxing.NewType)
-        {
-            case (TensorType, DistributedType distTensorType):
-                return TIR.F.NTT.TensorLoad(output, (Expr)arguments[0], distTensorType.AxisPolicies, distTensorType.Placement);
-            case (DistributedType distTensorType, TensorType):
-                return TIR.F.NTT.TensorStore((Expr)arguments[0], output, distTensorType.AxisPolicies, distTensorType.Placement);
-            case (DistributedType inType, DistributedType outType):
-                return GenerateReshard((Expr)arguments[0], ref output, inType, outType, context);
-            default:
-                throw new NotSupportedException();
-        }
-    }
-
-    private Expr GenerateReshard(Expr input, ref Expr output, DistributedType inType, DistributedType outType, TIRSelectionContext context)
-    {
-        return TIR.F.NTT.GatherReduceScatter(input, output, inType, outType);
-    }
 }

@@ -20,9 +20,9 @@ public sealed partial class Unpack : NTTKernelOp
     /// <summary>
     /// Gets input.
     /// </summary>
-    public static readonly ParameterInfo Input = new(typeof(Unpack), 0, "input", ParameterKind.Input);
+    public static readonly ParameterInfo Input = new(typeof(Unpack), 0, "input", ParameterKind.Input, MemoryEffect.Read);
 
-    public static readonly ParameterInfo Output = new(typeof(Unpack), 1, "output", ParameterKind.Input);
+    public static readonly ParameterInfo Output = new(typeof(Unpack), 1, "output", ParameterKind.Input, MemoryEffect.Write);
 
     public IRArray<int> Lanes { get; }
 

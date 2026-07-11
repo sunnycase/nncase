@@ -21,17 +21,17 @@ public sealed partial class Pad : NTTKernelOp
     /// <summary>
     /// Gets input.
     /// </summary>
-    public static readonly ParameterInfo Input = new(typeof(Pad), 0, "input");
+    public static readonly ParameterInfo Input = new(typeof(Pad), 0, "input", memoryEffect: MemoryEffect.Read);
 
     /// <summary>
     /// Gets input.
     /// </summary>
-    public static readonly ParameterInfo Pads = new(typeof(Pad), 1, "pads", IsPaddingsType());
+    public static readonly ParameterInfo Pads = new(typeof(Pad), 1, "pads", IsPaddingsType(), memoryEffect: MemoryEffect.None);
 
     /// <summary>
     /// Gets input.
     /// </summary>
-    public static readonly ParameterInfo Output = new(typeof(Pad), 2, "output");
+    public static readonly ParameterInfo Output = new(typeof(Pad), 2, "output", memoryEffect: MemoryEffect.Write);
 
     public float PadValue { get; }
 

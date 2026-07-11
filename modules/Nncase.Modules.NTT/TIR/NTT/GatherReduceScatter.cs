@@ -6,9 +6,9 @@ namespace Nncase.TIR.NTT;
 
 public sealed partial class GatherReduceScatter : NTTKernelOp
 {
-    public static readonly ParameterInfo Input = new(typeof(GatherReduceScatter), 0, "input");
+    public static readonly ParameterInfo Input = new(typeof(GatherReduceScatter), 0, "input", memoryEffect: MemoryEffect.ChipRead);
 
-    public static readonly ParameterInfo Output = new(typeof(GatherReduceScatter), 1, "output");
+    public static readonly ParameterInfo Output = new(typeof(GatherReduceScatter), 1, "output", memoryEffect: MemoryEffect.ChipWrite);
 
     public DistributedType InType { get; }
 

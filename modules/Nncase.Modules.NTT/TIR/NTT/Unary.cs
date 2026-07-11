@@ -7,9 +7,9 @@ namespace Nncase.TIR.NTT;
 [ParameterInPlace(0, 1)]
 public sealed partial class Unary : NTTKernelOp
 {
-    public static readonly ParameterInfo Input = new(typeof(Unary), 0, "input");
+    public static readonly ParameterInfo Input = new(typeof(Unary), 0, "input", memoryEffect: MemoryEffect.Read);
 
-    public static readonly ParameterInfo Output = new(typeof(Unary), 1, "output");
+    public static readonly ParameterInfo Output = new(typeof(Unary), 1, "output", memoryEffect: MemoryEffect.Write);
 
     public UnaryOp UnaryOp { get; }
 

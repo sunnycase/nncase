@@ -6,17 +6,17 @@ namespace Nncase.TIR.NTT;
 
 public sealed partial class Matmul : NTTKernelOp
 {
-    public static readonly ParameterInfo Lhs = new(typeof(Matmul), 0, "lhs");
+    public static readonly ParameterInfo Lhs = new(typeof(Matmul), 0, "lhs", memoryEffect: MemoryEffect.Read);
 
-    public static readonly ParameterInfo Rhs = new(typeof(Matmul), 1, "rhs");
+    public static readonly ParameterInfo Rhs = new(typeof(Matmul), 1, "rhs", memoryEffect: MemoryEffect.Read);
 
-    public static readonly ParameterInfo Output = new(typeof(Matmul), 2, "output");
+    public static readonly ParameterInfo Output = new(typeof(Matmul), 2, "output", memoryEffect: MemoryEffect.ReadWrite);
 
-    public static readonly ParameterInfo LoadC = new(typeof(Matmul), 3, "loadC");
+    public static readonly ParameterInfo LoadC = new(typeof(Matmul), 3, "loadC", memoryEffect: MemoryEffect.None);
 
-    public static readonly ParameterInfo Scale = new(typeof(Matmul), 4, "scale");
+    public static readonly ParameterInfo Scale = new(typeof(Matmul), 4, "scale", memoryEffect: MemoryEffect.Read);
 
-    public static readonly ParameterInfo ExtraWorkload = new(typeof(Matmul), 5, "extraWorkload");
+    public static readonly ParameterInfo ExtraWorkload = new(typeof(Matmul), 5, "extraWorkload", memoryEffect: MemoryEffect.Read);
 
     public IRArray<int> LhsVectorizedAxes { get; }
 

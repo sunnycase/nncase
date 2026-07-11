@@ -6,9 +6,9 @@ namespace Nncase.TIR.NTT;
 
 public sealed partial class Softmax : NTTKernelOp
 {
-    public static readonly ParameterInfo Input = new(typeof(Softmax), 0, "input");
+    public static readonly ParameterInfo Input = new(typeof(Softmax), 0, "input", memoryEffect: MemoryEffect.Read);
 
-    public static readonly ParameterInfo Output = new(typeof(Softmax), 1, "output");
+    public static readonly ParameterInfo Output = new(typeof(Softmax), 1, "output", memoryEffect: MemoryEffect.Write);
 
     public int Axis { get; }
 

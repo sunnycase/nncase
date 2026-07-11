@@ -110,7 +110,11 @@ public sealed class TreeSolverPythonPrinter : TreeSolverBase<IntExpr>, ITreeNode
     {
         var (parent, writer) = context;
         var opinfo = OpNodeMemo[value];
-        var shapes = string.Join(", ", opinfo.Shapes.Select((sp, i) => $"{new BufferIdentity(value.Wrapped, i)}[" + string.Join(',', sp.Select(s => Solution.Value(s.Var()))) + "]"));
+        var shapes = string.Join(", ", opinfo.Shapes.Select((sp, i) =>
+        {
+            var endpoint = value.Grid.Accesses[i].IsRead ? BufferEndpoint.Input : BufferEndpoint.Output;
+            return $"{new BufferIdentity(value.Wrapped, i, endpoint)}[" + string.Join(',', sp.Select(s => Solution.Value(s.Var()))) + "]";
+        }));
         var size = string.Join(", ", opinfo.Sizes.Select(s => Solution.Value(s.Var())));
         writer.WriteLine($"{value.Op.GetType()}({value.Op.DisplayProperty()}, {shapes})  # size: {size}");
         return default;

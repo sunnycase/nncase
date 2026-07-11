@@ -21,12 +21,12 @@ public sealed partial class Concat : NTTKernelOp
     /// <summary>
     /// Gets input.
     /// </summary>
-    public static readonly ParameterInfo Input = new(typeof(Concat), 0, "input");
+    public static readonly ParameterInfo Input = new(typeof(Concat), 0, "input", memoryEffect: MemoryEffect.Read, isVariadic: true);
 
     /// <summary>
     /// Gets input.
     /// </summary>
-    public static readonly ParameterInfo Output = new(typeof(Concat), 1, "output");
+    public static readonly ParameterInfo Output = new(typeof(Concat), 1, "output", memoryEffect: MemoryEffect.Write);
 
     /// <summary>
     /// Gets begins.

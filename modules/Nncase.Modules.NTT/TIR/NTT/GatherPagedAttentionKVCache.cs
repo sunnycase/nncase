@@ -15,9 +15,9 @@ namespace Nncase.TIR.NTT;
 
 public sealed partial class GatherPagedAttentionKVCache : NTTKernelOp
 {
-    public static readonly ParameterInfo ShardId = new(typeof(GatherPagedAttentionKVCache), 0, "ShardId");
+    public static readonly ParameterInfo ShardId = new(typeof(GatherPagedAttentionKVCache), 0, "ShardId", memoryEffect: MemoryEffect.Read);
 
-    public static readonly ParameterInfo KVCaches = new(typeof(GatherPagedAttentionKVCache), 1, "kvCaches");
+    public static readonly ParameterInfo KVCaches = new(typeof(GatherPagedAttentionKVCache), 1, "kvCaches", memoryEffect: MemoryEffect.ChipRead);
 
-    public static readonly ParameterInfo Output = new(typeof(GatherPagedAttentionKVCache), 2, "Output");
+    public static readonly ParameterInfo Output = new(typeof(GatherPagedAttentionKVCache), 2, "Output", memoryEffect: MemoryEffect.Write);
 }

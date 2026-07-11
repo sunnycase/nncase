@@ -18,6 +18,12 @@ public partial class AllocateBufferViewEvaluator : ITypeInferencer<AllocateBuffe
     public IRType Visit(ITypeInferenceContext context, AllocateBufferView target)
     {
         var buffer = context.GetArgument(target, AllocateBufferView.Buffer);
+        var localOffset = (Shape)context.GetArgument(target, AllocateBufferView.LocalOffset);
+        if (localOffset.Rank != buffer.CheckedShape.Rank)
+        {
+            return new InvalidType($"AllocateBufferView local offset rank {localOffset.Rank} does not match buffer rank {buffer.CheckedShape.Rank}.");
+        }
+
         return buffer.CheckedType;
     }
 }

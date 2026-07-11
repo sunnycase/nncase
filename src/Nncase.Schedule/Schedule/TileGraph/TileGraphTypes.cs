@@ -108,6 +108,12 @@ public sealed class TileGrid : ITileable
         DomainBounds = ImmutableArray.CreateRange(domainBounds);
         DomainBoundExprs = ImmutableArray.CreateRange(domainBoundsExpr);
         BufferShapes = ImmutableArray.CreateRange(bufferShapes.Select(x => ImmutableArray.CreateRange(x)));
+        var domainRank = grid.Accesses.ToArray().First(access => access.IsAffine).AffineMap.Domains.Length;
+        AccessMaps = ImmutableArray.CreateRange(grid.Accesses.ToArray().Select(access => access.IsAffine
+            ? access.AffineMap
+            : AffineMap.FromCallable((_, _) => Array.Empty<AffineRange>(), domainRank, 0)));
+        ReadAccessIndices = ImmutableArray.CreateRange(Enumerable.Range(0, grid.Accesses.Length).Where(index => grid.Accesses[index].IsRead));
+        WriteAccessIndices = ImmutableArray.CreateRange(Enumerable.Range(0, grid.Accesses.Length).Where(index => grid.Accesses[index].IsWrite));
     }
 
     public int Level { get; }
@@ -130,19 +136,23 @@ public sealed class TileGrid : ITileable
 
     public ImmutableArray<ImmutableArray<long>> BufferShapes { get; }
 
-    public ReadOnlySpan<AffineMap> ReadAccesses => Grid.AccessMaps[..Grid.Reads.Length];
+    public ImmutableArray<AffineMap> AccessMaps { get; }
 
-    public ReadOnlySpan<AffineMap> WriteAccesses => Grid.WriteAccessMaps;
+    public ImmutableArray<int> ReadAccessIndices { get; }
 
-    public AffineMap WriteAccess => WriteAccesses.Length == 1
-        ? WriteAccesses[0]
-        : throw new InvalidOperationException($"Op{OpId} has {WriteAccesses.Length} write accesses.");
+    public ImmutableArray<int> WriteAccessIndices { get; }
 
-    public long GetBufferElemSize(int i) => Grid.Buffers[i].CheckedDataType is ReferenceType
+    public AffineMap GetAccessMap(int accessIndex) => AccessMaps[accessIndex];
+
+    public AffineMap GetWriteAccess(int outputIndex) => AccessMaps[GetWriteAccessIndex(outputIndex)];
+
+    public int GetWriteAccessIndex(int outputIndex) => WriteAccessIndices[outputIndex];
+
+    public long GetBufferElemSize(int i) => Grid.Accesses[i].Buffer.CheckedDataType is ReferenceType
         ? 0
-        : Grid.Buffers[i].CheckedDataType.SizeInBytes;
+        : Grid.Accesses[i].Buffer.CheckedDataType.SizeInBytes;
 
-    public MicroKernelInfo GetKernelInfo(ITargetOptions targetOptions) => CompilerServices.GetOpMicroKernelInfo(Op, new(Op, Grid.AccessMaps.ToImmutableArray(), BufferShapes, targetOptions));
+    public MicroKernelInfo GetKernelInfo(ITargetOptions targetOptions) => CompilerServices.GetOpMicroKernelInfo(Op, new(Op, AccessMaps, BufferShapes, targetOptions));
 
     public override string ToString()
     {

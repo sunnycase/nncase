@@ -262,30 +262,28 @@ internal sealed partial class TypeInferenceVisitor : ExprVisitor<IRType, Unit>
     {
         VerifySubField(expr, expr.DomainParameter);
 
-        foreach (var p in expr.BodyParameters)
+        foreach (var access in expr.Accesses)
         {
-            VerifySubField(expr, p);
-        }
-
-        foreach (var p in expr.AccessMaps)
-        {
-            VerifySubField(expr, p);
-        }
-
-        foreach (var p in expr.Buffers)
-        {
-            VerifySubField(expr, p);
-        }
-
-        foreach (var p in expr.Reads)
-        {
-            VerifySubField(expr, p);
+            VerifySubField(expr, access);
         }
 
         VerifySubField(expr, expr.Body);
 
-        var outputTypes = expr.Writes.AsValueEnumerable().Select(buffer => buffer.CheckedType).ToArray();
+        var outputTypes = expr.Accesses
+            .ToArray()
+            .Where(access => access.IsWrite)
+            .Select(access => access.Value.CheckedType)
+            .ToArray();
         return outputTypes.Length == 1 ? outputTypes[0] : new TupleType(outputTypes);
+    }
+
+    protected override IRType VisitLeafGridAccess(GridAccess expr)
+    {
+        VerifySubField(expr, expr.Value);
+        VerifySubField(expr, expr.Buffer);
+        VerifySubField(expr, expr.Parameter);
+        VerifySubField(expr, expr.Region);
+        return expr.Value.CheckedType;
     }
 
     protected override IRType VisitLeafAffineExpr(AffineExpr expr) => TensorType.Scalar(DataTypes.Int64);

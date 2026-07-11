@@ -173,9 +173,9 @@ public sealed class TreeSolverInitializer : TreeSolverBase<IntExpr>, ITreeNodeVi
             {
                 shapes[a] = new IntExpr[value.BufferShapes[a].Length];
                 elemSizes[a] = sizes[a] = Solver.MakeIntConst(value.GetBufferElemSize(a));
-                accessMaps[a] = value.Grid.AccessMaps[a];
+                accessMaps[a] = value.AccessMaps[a];
                 var converter = new AffineExprToIntExprConverter(Solver, tileVars);
-                var accessMap = value.DomainRelation.Map * value.Grid.AccessMaps[a];
+                var accessMap = value.DomainRelation.Map * value.AccessMaps[a];
                 for (int i = 0; i < shapes[a].Length; i++)
                 {
                     // note themory solution, the custom affine map is not suitable for compute buffer size.
@@ -208,17 +208,27 @@ public sealed class TreeSolverInitializer : TreeSolverBase<IntExpr>, ITreeNodeVi
         }
 
         // perpare return infos.
-        var bufferResults = new BufferResult[value.Grid.AccessMaps.Length];
-        for (int i = 0; i < value.Grid.AccessMaps.Length; i++)
+        var bufferResults = new List<BufferResult>();
+        for (int i = 0; i < value.Grid.Accesses.Length; i++)
         {
-            BufferIdentity bid = new(value.Wrapped, i);
-            bufferResults[i] = new(bid, new(TimeStamp, TimeStamp + 1), value.DomainRelation.Map * accessMaps[i], elemSizes[i]);
+            var access = value.Grid.Accesses[i];
+            if (access.IsRead)
+            {
+                BufferIdentity inputBid = new(value.Wrapped, i, BufferEndpoint.Input);
+                bufferResults.Add(new(inputBid, new(TimeStamp, TimeStamp + 1), value.DomainRelation.Map * accessMaps[i], elemSizes[i]));
+            }
+
+            if (access.IsWrite)
+            {
+                BufferIdentity outputBid = new(value.Wrapped, i, BufferEndpoint.Output);
+                bufferResults.Add(new(outputBid, new(TimeStamp + 1, TimeStamp + 2), value.DomainRelation.Map * accessMaps[i], elemSizes[i]));
+            }
         }
 
         TimeStamp += 2;
 
         // todo backward extents should times primtives.
-        return new(bufferResults, new(), new[] { dimsMap }, new IntExpr[][] { tileVars.Cast<IntExpr>().ToArray() });
+        return new(bufferResults.ToArray(), new(), new[] { dimsMap }, new IntExpr[][] { tileVars.Cast<IntExpr>().ToArray() });
     }
 
     /// <summary>
@@ -295,7 +305,7 @@ public sealed class TreeSolverInitializer : TreeSolverBase<IntExpr>, ITreeNodeVi
             var subLevelPlace = bufferPlaces[pos] = new IntVar[levelCount];
             for (int sl = 0; sl < subLevelPlace.Length; sl++)
             {
-                subLevelPlace[sl] = Solver.MakeBoolVar($"p[cl{tileNode.Level}, op{bid.Node.OpId}, b{bid.Index}, ci{pos}, sl{sl}]");
+                subLevelPlace[sl] = Solver.MakeBoolVar($"p[cl{tileNode.Level}, op{bid.Node.OpId}, b{bid.Index}_{bid.Endpoint}, ci{pos}, sl{sl}]");
             }
 
             var subDomainShapes = bufferShapes[pos] = new IntExpr[accessMap.Results.Length];
@@ -313,7 +323,7 @@ public sealed class TreeSolverInitializer : TreeSolverBase<IntExpr>, ITreeNodeVi
             }
 
             bufferSizes[pos] = subDomainShapes.Aggregate(elemSize, Solver.MakeProd);
-            bufferSizes[pos].SetName($"size[cl{tileNode.Level}, op{bid.Node.OpId}, b{bid.Index}, ci{pos}]");
+            bufferSizes[pos].SetName($"size[cl{tileNode.Level}, op{bid.Node.OpId}, b{bid.Index}_{bid.Endpoint}, ci{pos}]");
 
             var loop = pos - 1;
             if (loop < 0)

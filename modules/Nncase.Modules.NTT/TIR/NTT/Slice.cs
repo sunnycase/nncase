@@ -21,22 +21,22 @@ public sealed partial class Slice : NTTKernelOp
     /// <summary>
     /// Gets input.
     /// </summary>
-    public static readonly ParameterInfo Input = new(typeof(Slice), 0, "input");
+    public static readonly ParameterInfo Input = new(typeof(Slice), 0, "input", memoryEffect: MemoryEffect.Read);
 
     /// <summary>
     /// Gets input.
     /// </summary>
-    public static readonly ParameterInfo Begins = new(typeof(Slice), 1, "begins");
+    public static readonly ParameterInfo Begins = new(typeof(Slice), 1, "begins", memoryEffect: MemoryEffect.None);
 
     /// <summary>
     /// Gets input.
     /// </summary>
-    public static readonly ParameterInfo Ends = new(typeof(Slice), 2, "ends");
+    public static readonly ParameterInfo Ends = new(typeof(Slice), 2, "ends", memoryEffect: MemoryEffect.None);
 
     /// <summary>
     /// Gets input.
     /// </summary>
-    public static readonly ParameterInfo Output = new(typeof(Slice), 3, "output");
+    public static readonly ParameterInfo Output = new(typeof(Slice), 3, "output", memoryEffect: MemoryEffect.Write);
 
     /// <summary>
     /// Gets axes.

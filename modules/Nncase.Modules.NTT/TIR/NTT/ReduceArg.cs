@@ -20,9 +20,9 @@ public sealed partial class ReduceArg : NTTKernelOp
     /// <summary>
     /// Gets input.
     /// </summary>
-    public static readonly ParameterInfo Input = new(typeof(ReduceArg), 0, "input");
+    public static readonly ParameterInfo Input = new(typeof(ReduceArg), 0, "input", memoryEffect: MemoryEffect.Read);
 
-    public static readonly ParameterInfo Output = new(typeof(ReduceArg), 1, "output");
+    public static readonly ParameterInfo Output = new(typeof(ReduceArg), 1, "output", memoryEffect: MemoryEffect.Write);
 
     /// <summary>
     /// Gets Axis.

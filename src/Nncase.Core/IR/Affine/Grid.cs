@@ -1,11 +1,7 @@
 ﻿// Copyright (c) Canaan Inc. All rights reserved.
 // Licensed under the Apache license. See LICENSE file in the project root for full license information.
 
-using System;
-using System.Collections.Generic;
 using System.Linq;
-using System.Text;
-using System.Threading.Tasks;
 using Nncase.TIR;
 using Nncase.Utilities;
 
@@ -13,58 +9,56 @@ namespace Nncase.IR.Affine;
 
 public sealed class Grid : Expr
 {
-    private readonly int _bodyParametersCount;
-    private readonly int _accessMapsCount;
-    private readonly int _readsCount;
+    private readonly int _accessesCount;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="Grid"/> class.
     /// </summary>
     /// <param name="domainParameter">the grid domain parameter. </param>
-    /// <param name="bodyParameters">Body parameters.</param>
-    /// <param name="accessMaps">Access maps.</param>
-    /// <param name="buffers">output buffers.</param>
-    /// <param name="reads">Reads.</param>
+    /// <param name="accesses">Grid accesses.</param>
     /// <param name="body">The body sequence.</param>
-    public Grid(Var domainParameter, ReadOnlySpan<Var> bodyParameters, ReadOnlySpan<AffineMap> accessMaps, ReadOnlySpan<Expr> buffers, ReadOnlySpan<Expr> reads, Sequential body)
-        : base(new BaseExpr[] { domainParameter }.Concat(bodyParameters.ToArray()).Concat(accessMaps.ToArray()).Concat(buffers.ToArray()).Concat(reads.ToArray()).Append(body))
+    public Grid(Var domainParameter, ReadOnlySpan<GridAccess> accesses, Sequential body)
+        : base(new BaseExpr[] { domainParameter }.Concat(accesses.ToArray()).Append(body))
     {
-        _bodyParametersCount = bodyParameters.Length;
-        _accessMapsCount = accessMaps.Length;
-        _readsCount = reads.Length;
+        _accessesCount = accesses.Length;
 
-        if (buffers.Length != _accessMapsCount
-            || buffers.Length != bodyParameters.Length)
+        if (accesses.IsEmpty)
         {
-            throw new ArgumentException("Invalid buffers count.");
+            throw new ArgumentException("Grid must have at least one access.", nameof(accesses));
         }
 
-        if (reads.Length >= _accessMapsCount)
+        var affineDomainRanks = accesses
+            .ToArray()
+            .Where(access => access.IsAffine)
+            .Select(access => access.AffineMap.Domains.Length)
+            .Distinct()
+            .ToArray();
+        if (affineDomainRanks.Length != 1)
         {
-            throw new ArgumentException("Invalid reads count.");
+            throw new ArgumentException("All affine grid access regions must have the same domain rank.", nameof(accesses));
+        }
+
+        if (!accesses.ToArray().Any(access => access.IsWrite))
+        {
+            throw new ArgumentException("Grid must have at least one write access.", nameof(accesses));
+        }
+
+        if (!accesses.ToArray().Any(access => access.IsAffine && access.DomainMode == GridDomainMode.Constraint))
+        {
+            throw new ArgumentException("Grid must have at least one affine domain constraint.", nameof(accesses));
         }
     }
 
     public Var DomainParameter => (Var)Operands[0];
 
-    public ReadOnlySpan<Var> BodyParameters => SpanUtility.UnsafeCast<BaseExpr, Var>(Operands.Slice(1, _bodyParametersCount));
+    public ReadOnlySpan<GridAccess> Accesses => SpanUtility.UnsafeCast<BaseExpr, GridAccess>(Operands.Slice(1, _accessesCount));
 
-    public ReadOnlySpan<AffineMap> AccessMaps => SpanUtility.UnsafeCast<BaseExpr, AffineMap>(Operands.Slice(1 + _bodyParametersCount, _accessMapsCount));
-
-    public ReadOnlySpan<Expr> Buffers => SpanUtility.UnsafeCast<BaseExpr, Expr>(Operands.Slice(1 + _bodyParametersCount + _accessMapsCount, _accessMapsCount));
-
-    public ReadOnlySpan<Expr> Reads => SpanUtility.UnsafeCast<BaseExpr, Expr>(Operands.Slice(1 + _bodyParametersCount + (_accessMapsCount * 2), _readsCount));
-
-    public ReadOnlySpan<Expr> Writes => Buffers[_readsCount..];
-
-    public ReadOnlySpan<AffineMap> WriteAccessMaps => AccessMaps[_readsCount..];
-
-    public Sequential Body => (Sequential)Operands[1 + _bodyParametersCount + (_accessMapsCount * 2) + _readsCount];
+    public Sequential Body => (Sequential)Operands[1 + _accessesCount];
 
     /// <inheritdoc/>
     public override TExprResult Accept<TExprResult, TTypeResult, TContext>(ExprFunctor<TExprResult, TTypeResult, TContext> functor, TContext context)
         => functor.VisitGrid(this, context);
 
-    public Grid With(Var? domainParameter = null, Var[]? bodyParameters = null, AffineMap[]? accessMaps = null, Expr[]? buffers = null, Expr[]? reads = null, Sequential? body = null)
-        => new Grid(domainParameter ?? DomainParameter, bodyParameters ?? BodyParameters, accessMaps ?? AccessMaps, buffers ?? Buffers, reads ?? Reads, body ?? Body);
+    public Grid With(Var? domainParameter = null, GridAccess[]? accesses = null, Sequential? body = null)
+        => new(domainParameter ?? DomainParameter, accesses ?? Accesses, body ?? Body);
 }

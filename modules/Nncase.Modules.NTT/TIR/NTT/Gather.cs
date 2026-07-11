@@ -22,17 +22,17 @@ public sealed partial class Gather : NTTKernelOp
     /// <summary>
     /// Gets input.
     /// </summary>
-    public static readonly ParameterInfo Input = new(typeof(Gather), 0, "input", ParameterKind.Input);
+    public static readonly ParameterInfo Input = new(typeof(Gather), 0, "input", ParameterKind.Input, MemoryEffect.Read);
 
     /// <summary>
     /// Gets index.
     /// </summary>
-    public static readonly ParameterInfo Index = new(typeof(Gather), 1, "index", IsIntegral(), ParameterKind.Input);
+    public static readonly ParameterInfo Index = new(typeof(Gather), 1, "index", IsIntegral(), ParameterKind.Input, MemoryEffect.Read);
 
     /// <summary>
     /// Gets index.
     /// </summary>
-    public static readonly ParameterInfo Output = new(typeof(Gather), 2, "output");
+    public static readonly ParameterInfo Output = new(typeof(Gather), 2, "output", memoryEffect: MemoryEffect.Write);
 
     /// <summary>
     /// Gets axis.

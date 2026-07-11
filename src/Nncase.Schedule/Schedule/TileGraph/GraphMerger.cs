@@ -82,9 +82,10 @@ public sealed class GraphMerger
         }
 
         // 1.3 build the domain relation betwwen relay op -> producer op.
-        var readAccess = relayOp.ReadAccesses[dependencePath.First().Tag];
-        var producerOutputIndex = GraphExtensions.GetProducerOutputIndex(relayOp.Grid.Reads[dependencePath.First().Tag], ProducerOp);
-        var producerWriteAccess = ProducerOp.WriteAccesses[producerOutputIndex];
+        var consumerAccessIndex = dependencePath.First().Tag;
+        var readAccess = relayOp.GetAccessMap(consumerAccessIndex);
+        var producerOutputIndex = GraphExtensions.GetProducerOutputIndex(relayOp.Grid.Accesses[consumerAccessIndex].Value, ProducerOp);
+        var producerWriteAccess = ProducerOp.GetWriteAccess(producerOutputIndex);
         var relation = readAccess * AffineUtility.Inverse(producerWriteAccess, ProducerOp.DomainBounds.Select(Convert.ToInt64).ToArray());
         if (!relation.IsProjectedPermutation(true))
         {
@@ -127,6 +128,13 @@ public sealed class GraphMerger
         var subGraphGraph = new AdjacencyGraph<TieredTileGraph, Edge<TieredTileGraph>>();
         foreach (var edge in RootGraph.Edges)
         {
+            var crossesSubGraphs = (producer.ContainsVertex(edge.Source) && consumer.ContainsVertex(edge.Target)) ||
+                (consumer.ContainsVertex(edge.Source) && producer.ContainsVertex(edge.Target));
+            if (crossesSubGraphs && !GraphExtensions.IsFusionLegal(edge.Source, edge.Target, edge.Tag))
+            {
+                return false;
+            }
+
             if (producer.ContainsVertex(edge.Source) && consumer.ContainsVertex(edge.Target))
             {
                 subGraphGraph.AddVerticesAndEdge(new(producer, consumer));

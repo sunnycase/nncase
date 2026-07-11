@@ -20,12 +20,10 @@ public partial class NTTAffineSelectionPass
             return call;
         }
 
-        var objectMap = AffineMap.FromCallable((domains, symbols) => Array.Empty<AffineRange>(), rank, 0);
         return IR.F.Affine.Grid()
             .Domain(rank, out var _)
             .Read(slots, AffineMap.Identity(rank), out var slotsTile)
-            .Read(kvCache, objectMap, out var kvCacheTile)
-            .Write(kvCache, objectMap, out var _)
+            .ReadWriteRoot(kvCache, None.Default, out var kvCacheTile)
             .Body(TIR.F.NTT.UpdatePagedAttentionKVCache(slotsTile, kvCacheTile, layerId, op.CacheKind, op.Layout))
             .Build();
     }

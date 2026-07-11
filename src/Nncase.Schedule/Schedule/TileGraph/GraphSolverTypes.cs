@@ -9,16 +9,24 @@ using Nncase.IR.Affine;
 
 namespace Nncase.Schedule.TileGraph;
 
-public sealed record BufferIdentity(TileGrid Node, int Index)
+public enum BufferEndpoint
 {
-    public bool IsOutput => Index >= Node.ReadAccesses.Length;
+    Input,
+    Output,
+}
 
-    public int OutputIndex => IsOutput ? Index - Node.ReadAccesses.Length : -1;
+public sealed record BufferIdentity(TileGrid Node, int Index, BufferEndpoint Endpoint)
+{
+    public GridAccess Access => Node.Grid.Accesses[Index];
+
+    public bool IsOutput => Endpoint == BufferEndpoint.Output;
+
+    public int OutputIndex => IsOutput ? Node.WriteAccessIndices.IndexOf(Index) : -1;
 
     public bool IsOutputLiveOut => IsOutput && Node.Attribute.HasFlag(TileGridAttribute.LiveOut);
 
     public override string ToString() => IsOutput
-        ? (Node.WriteAccesses.Length == 1 ? $"Op{Node.OpId}_Out" : $"Op{Node.OpId}_Out{OutputIndex}")
+        ? (Node.WriteAccessIndices.Length == 1 ? $"Op{Node.OpId}_Out" : $"Op{Node.OpId}_Out{OutputIndex}")
         : $"Op{Node.OpId}_in{Index}";
 }
 

@@ -30,6 +30,17 @@ public sealed class GraphTiler
         int[] memBandWidths = targetOptions.MemoryBandWidths;
         var levelCount = memCapacities.Length - 1;
         TreeSolverInitializer.Init(primTree, bufferGraphMemo, levelCount, targetOptions, out var solver, out var opNodeMemo, out var tileNodeMemo, out var tileableNodeMemo);
+        var primBufferGraph = bufferGraphMemo[primTree.Wrapped];
+        var (externalInputs, externalOutputs) = primBufferGraph.GetInputsOutputs(primBufferGraph.Parent as BufferGraph);
+
+        static int GetStoragePosition(BufferIdentity bid, TileNodeBufferInfo<IntExpr> bufferInfo)
+            => bid.Access.BindingMode == GridBindingMode.Root ? 0 : bufferInfo.GetLastRelatedPos();
+
+        bool RequiresLocalAllocation(BufferIdentity bid)
+        {
+            var isExternal = externalInputs.Contains(bid) || externalOutputs.Contains(bid);
+            return !isExternal || (!targetOptions.UnifiedMemoryArch && bid.Access.BindingMode != GridBindingMode.Root);
+        }
 
         // 0. each level buffer store at last accessed loop.
         var eachLevelStoreBufferConstrains = new Dictionary<int, Constraint[]>();
@@ -40,7 +51,7 @@ public sealed class GraphTiler
             {
                 foreach (var (bid, bufferInfo) in nodeInfo.BufferInfoMap)
                 {
-                    var pos = bufferInfo.GetLastRelatedPos();
+                    var pos = GetStoragePosition(bid, bufferInfo);
                     for (int ci = 0; ci < bufferInfo.Places.Length; ci++)
                     {
                         for (int sl = 0; sl < bufferInfo.Places[ci].Length; sl++)
@@ -102,7 +113,7 @@ public sealed class GraphTiler
                 foreach (var (bid, bufferInfo) in nodeInfo.BufferInfoMap)
                 {
                     var nodeBuffer = new NodeWithBuffer(tileNode, bid);
-                    var ci = bufferInfo.GetLastRelatedPos();
+                    var ci = GetStoragePosition(bid, bufferInfo);
                     var extents = new List<IntExpr>();
                     beginTime = Math.Min(beginTime, bufferInfo.Liveness[ci].Item1);
                     endTime = Math.Max(endTime, bufferInfo.Liveness[ci].Item2);
@@ -114,7 +125,9 @@ public sealed class GraphTiler
                         solver.Add(cons);
                     }
 
-                    nodeBufferSizes[nodeBuffer] = solver.MakeSum(extents);
+                    nodeBufferSizes[nodeBuffer] = RequiresLocalAllocation(bid)
+                        ? solver.MakeSum(extents)
+                        : solver.MakeIntConst(0);
                     nodeBufferShapes[nodeBuffer] = bufferInfo.Shapes[ci];
                     nodeBufferLiveness[nodeBuffer] = bufferInfo.Liveness[ci];
                 }
@@ -180,7 +193,7 @@ public sealed class GraphTiler
                 {
                     // skip the buffer which store at top level
                     var volume = (IntExpr)solver.MakeIntConst(1);
-                    var ci = bufferInfo.GetLastRelatedPos();
+                    var ci = GetStoragePosition(bid, bufferInfo);
                     IntExpr factor = solver.MakeIntConst(1); // todo factor for contiguous load/store.
                     volume = bufferInfo.Places[ci][sl] * bufferInfo.Trips[ci] * bufferInfo.Sizes[ci];
 
@@ -384,7 +397,7 @@ public sealed class GraphTiler
             DumpAssgin(primTree, new TreeSolverPythonPrinter(sol, solver, opNodeMemo, tileNodeMemo, tileableNodeMemo, targetOptions), tileVarConstraints, eachLevelStoreBufferConstrains, levelBufferLifenessConstraints, levelBufferSizes, levelDataReads, levelDataWrites, memoryCycles, computeCycles, totalCyclesVar);
         }
 
-        return new TreeSolveResult(bufferGraphMemo[primTree.Wrapped], sol.ObjectiveValue(), levelBufferInfos, opNodeMemoAssgin, tileNodeMemoAssgin, tileableNodeMemoAssgin, targetOptions, moduleKind);
+        return new TreeSolveResult(primBufferGraph, sol.ObjectiveValue(), levelBufferInfos, opNodeMemoAssgin, tileNodeMemoAssgin, tileableNodeMemoAssgin, targetOptions, moduleKind);
     }
 
     public static void DumpAssgin(ITreeNode tree, TreeSolverPythonPrinter printer, Dictionary<OpNode, Constraint[]> tileVarConstraints, Dictionary<int, Constraint[]> lowestStoreBufferNumsConstrains, Dictionary<int, Constraint[]> levelBufferLifenessConstraints, Dictionary<int, Dictionary<NodeWithBuffer, IntExpr>> levelBufferSizes, IntExpr[] levelDataReads, IntExpr[] levelDataWrites, IntExpr[] memoryCycles, IntExpr computeCycles, IntVar totalCycles)
@@ -511,7 +524,7 @@ public sealed class GraphTiler
                 var inputBidsOrdered = OrderBufferIdentities(inputBids);
                 var outputBidsOrdered = OrderBufferIdentities(outputBids);
                 var callerAllocatedOutputBids = outputBidsOrdered
-                    .Where(bid => !result.ObjectOutputAliases.ContainsKey(bid))
+                    .Where(bid => !result.OutputAliases.ContainsKey(bid))
                     .ToArray();
                 var maxAlign = result.ScheduleBuffers();
                 var bodyBuilder = T.Sequential();
@@ -638,7 +651,7 @@ public sealed class GraphTiler
             {
                 var grid = bid.Node.Grid;
                 var outputIndex = bid.OutputIndex;
-                if (grid.Writes.Length == 1)
+                if (grid.Accesses.ToArray().Count(access => access.IsWrite) == 1)
                 {
                     replaces.TryAdd(grid, value);
                 }
@@ -662,7 +675,8 @@ public sealed class GraphTiler
 
         foreach (var (grid, outputMap) in multiOutputReplaces)
         {
-            var fields = Enumerable.Range(0, grid.Writes.Length).Select(i =>
+            var outputCount = grid.Accesses.ToArray().Count(access => access.IsWrite);
+            var fields = Enumerable.Range(0, outputCount).Select(i =>
             {
                 if (!outputMap.TryGetValue(i, out var output))
                 {
@@ -702,7 +716,7 @@ public sealed class GraphTiler
         }
     }
 
-    private static bool IsObjectBuffer(BufferIdentity bid) => bid.Node.Grid.Buffers[bid.Index].CheckedDataType is ReferenceType;
+    private static bool IsObjectBuffer(BufferIdentity bid) => bid.Access.Buffer.CheckedDataType is ReferenceType;
 
     public sealed record TiledFunc(PrimFunctionWrapper Func, long ObjectValue)
     {

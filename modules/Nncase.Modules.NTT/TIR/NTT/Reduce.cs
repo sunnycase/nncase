@@ -12,13 +12,13 @@ namespace Nncase.TIR.NTT;
 
 public sealed partial class Reduce : NTTKernelOp
 {
-    public static readonly ParameterInfo Input = new(typeof(Reduce), 0, "input");
+    public static readonly ParameterInfo Input = new(typeof(Reduce), 0, "input", memoryEffect: MemoryEffect.Read);
 
     // TODO: support init value
     // public static readonly ParameterInfo InitValue = new(typeof(Reduce), 1, "initValue");
-    public static readonly ParameterInfo Output = new(typeof(Reduce), 1, "output");
+    public static readonly ParameterInfo Output = new(typeof(Reduce), 1, "output", memoryEffect: MemoryEffect.ReadWrite);
 
-    public static readonly ParameterInfo LoadPrevious = new(typeof(Reduce), 2, "loadPrevious");
+    public static readonly ParameterInfo LoadPrevious = new(typeof(Reduce), 2, "loadPrevious", memoryEffect: MemoryEffect.None);
 
     public IRArray<int> VectorizedAxes { get; }
 

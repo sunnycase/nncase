@@ -6,9 +6,9 @@ namespace Nncase.TIR.NTT;
 
 public sealed partial class TensorStore : NTTKernelOp
 {
-    public static readonly ParameterInfo Src = new(typeof(TensorStore), 0, "src");
+    public static readonly ParameterInfo Src = new(typeof(TensorStore), 0, "src", memoryEffect: MemoryEffect.Read);
 
-    public static readonly ParameterInfo Dest = new(typeof(TensorStore), 1, "dest");
+    public static readonly ParameterInfo Dest = new(typeof(TensorStore), 1, "dest", memoryEffect: MemoryEffect.ChipWrite);
 
     public IRArray<SBP> NdSbp { get; }
 
