@@ -20,7 +20,10 @@ public sealed class AsDim : Dimension, IEquatable<AsDim?>
     public override TExprResult Accept<TExprResult, TTypeResult, TContext>(ExprFunctor<TExprResult, TTypeResult, TContext> functor, TContext context) =>
         functor.VisitAsDim(this, context);
 
-    public AsDim With(Expr? dim = null) => new AsDim(dim ?? Dim);
+    public AsDim With(Expr? dim = null) => new AsDim(dim ?? Dim)
+    {
+        Metadata = Metadata,
+    };
 
     /// <inheritdoc/>
     public override bool Equals(object? obj) => Equals(obj as AsDim);

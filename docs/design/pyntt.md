@@ -41,7 +41,8 @@ Target and module kind: `pyntt`.
   changes must be visible in TIR and generated source; they must not be hidden
   behind native NTT kernels or runtime fallbacks.
 - Represent storage-preserving reshape and bitcast operations as first-class
-  affine views. They must not allocate storage or generate Triton/C++ kernels.
+  buffer-alias Grids. They must not allocate storage or generate Triton/C++
+  kernels.
 - Support the first op group:
   - elementwise
   - unary
@@ -478,7 +479,7 @@ Dynamic dimensions must not be emitted as `tl.constexpr`. Doing so would turn
 runtime tensor shapes into Triton specialization keys and break shape-bucket
 execution semantics.
 
-## Affine Views and Function ABI
+## Buffer Alias Views and Function ABI
 
 Storage-preserving `Reshape` and `Bitcast` are view operations, not compute
 operators. Their lowering is target-independent until the final TIR buffer
@@ -486,14 +487,19 @@ alias is created:
 
 ```text
 Reshape / Bitcast
-  -> AffineView(source type, result type, common-domain transform)
-  -> compose into compatible Grid reads when exact
-  -> explicit TIR.Buffer alias when composition is not exact
+  -> view-like Grid(read source, write result, alias-only body)
+  -> solution-local, per-use Grid fusion during MCTS
+  -> logical TIR.Buffer descriptor over the selected physical storage
   -> bufferize/codegen with no view kernel and no copy
 ```
 
-`AffineViewTransform` contains a source map and a result map over one common
-affine domain. Construction and verification enforce:
+The Grid access maps are the canonical scheduling representation. The body op
+implements `IBufferAliasOp`, which identifies the source and result operands;
+memory-effect analysis therefore distinguishes a zero-copy alias from an op
+that merely happens to have no declared effects. `BufferViewTransform` is an
+internal materialization helper derived from those Grid maps. It contains a
+source map and a result map over one common affine domain. Construction and
+verification enforce:
 
 - ranked tensor or distributed tensor source/result types;
 - equal physical byte size;
@@ -505,13 +511,20 @@ affine domain. Construction and verification enforce:
 - explicit singleton-axis projection for dimension insertion/removal;
 - byte-aligned dtype reinterpretation and a contiguous reshaped suffix.
 
-The composition pass is deliberately exact. A view is folded into a Grid read
-only when dtype, rank, distribution, and affine domain permit direct access-map
-composition. Rank-changing or full-suffix reshapes remain explicit aliases.
-TIR selection lowers those aliases to `TIR.Buffer` values sharing the original
-`PhysicalBuffer` and `MemSpan`; no `TIR.NTT.Reshape`, `TIR.NTT.Bitcast`,
-memcopy, or backend template is permitted. `AffineView` must not remain after
-TIR selection.
+MCTS treats a view as a normal zero-cost Grid candidate. Fusion is per use: if a
+view is shared or is a function result, the selected solution clones only the
+schedule node for the fused consumer and preserves the canonical view for other
+uses. It never consumes the semantic expression or mutates another candidate.
+After search, an alias-only condensed component remains a residual Grid instead
+of being wrapped in a descriptor-only `PrimFunction`. AutoTiling substitutes
+its selected producer values but does not restore a concrete `Reshape` or
+`Bitcast` op. TIR selection accepts only these residual alias Grids, follows the
+generic `IBufferAliasOp` summary, and emits `TIR.Buffer` values sharing the
+selected `PhysicalBuffer` and `MemSpan`. Any executable Grid that survives
+AutoTiling is an invariant violation. Likewise, a nested descriptor-only
+`PrimFunction` reaching backend codegen is rejected rather than silently
+elided. No `TIR.NTT.Reshape`, `TIR.NTT.Bitcast`, memcopy, empty device function,
+or backend template is emitted for the alias.
 
 `PrimFunction` has two distinct result concepts:
 

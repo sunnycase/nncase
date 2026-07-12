@@ -137,25 +137,12 @@ public static class GraphExtensions
 
     public static bool Merge(this TieredTileGraph graph, MergePoint mergePoint)
     {
-        var merger = new GraphMerger(mergePoint.Consumer, mergePoint.Producer, mergePoint.Level);
+        var merger = new GraphMerger(
+            mergePoint.Consumer,
+            mergePoint.Producer,
+            mergePoint.Level,
+            mergePoint.ConsumerAccessIndex);
         return merger.Visit(graph);
-    }
-
-    internal static bool IsFusionLegal(TileGrid producer, TileGrid consumer, int consumerAccessIndex)
-    {
-        var consumerRead = consumer.Grid.Accesses[consumerAccessIndex];
-        if (HasChipMemoryEffect(consumer, consumerAccessIndex, MemoryAccessMode.Read))
-        {
-            return false;
-        }
-
-        var producerOutputIndex = GetProducerOutputIndex(consumerRead.Value, producer);
-        var producerWrite = producer.Grid.Accesses[producer.GetWriteAccessIndex(producerOutputIndex)];
-        return producerWrite.BindingMode != GridBindingMode.Root ||
-            !HasChipMemoryEffect(producer, producer.GetWriteAccessIndex(producerOutputIndex), MemoryAccessMode.Write);
-
-        static bool HasChipMemoryEffect(TileGrid grid, int accessIndex, MemoryAccessMode mode)
-            => grid.LocalAccessEffects[accessIndex] is { Scope: MemoryAccessScope.Chip } effect && effect.Mode.HasFlag(mode);
     }
 
     public static List<MergePoint> GetMergePoints(this TieredTileGraph graph)
@@ -180,9 +167,15 @@ public static class GraphExtensions
                 {
                     if (comsumer.ContainsVertex(edge.Source) && producer.ContainsVertex(edge.Target))
                     {
+                        if (edge.Target.IsPureBufferView &&
+                            (edge.Target.Attribute.HasFlag(TileGridAttribute.LiveOut) || graph.OutDegree(edge.Target) > 1))
+                        {
+                            continue;
+                        }
+
                         if (IsFusionLegal(edge.Source, edge.Target, edge.Tag))
                         {
-                            mergePoints.Add(new(edge.Target, edge.Source, producer.Level));
+                            mergePoints.Add(new(edge.Target, edge.Source, producer.Level, edge.Tag));
                         }
                     }
                 }
@@ -248,6 +241,46 @@ public static class GraphExtensions
         return cv.BufferGraphMemo;
     }
 
+    public static void PruneDeadBufferViews(this TieredTileGraph rootGraph)
+    {
+        if (rootGraph.Parent is not null)
+        {
+            throw new InvalidOperationException("Dead buffer views can only be pruned from a root tile graph.");
+        }
+
+        while (true)
+        {
+            var deadViews = rootGraph.Vertices
+                .Where(vertex => vertex.IsPureBufferView &&
+                    !vertex.Attribute.HasFlag(TileGridAttribute.LiveOut) &&
+                    rootGraph.OutDegree(vertex) == 0)
+                .ToArray();
+            if (deadViews.Length == 0)
+            {
+                break;
+            }
+
+            foreach (var deadView in deadViews)
+            {
+                rootGraph.RemoveVertex(deadView);
+            }
+
+            RemoveEmptyClusters(rootGraph);
+        }
+
+        static void RemoveEmptyClusters(TieredTileGraph graph)
+        {
+            foreach (var child in graph.Clusters.OfType<TieredTileGraph>().ToArray())
+            {
+                RemoveEmptyClusters(child);
+                if (child.VertexCount == 0 && child.ClustersCount == 0)
+                {
+                    graph.RemoveCluster(child);
+                }
+            }
+        }
+    }
+
     public static AdjacencyGraph<TieredTileGraph, Edge<TieredTileGraph>> Condense(this TieredTileGraph rootGraph)
     {
         var algo = new CondensationTieredGraphAlgorithm<TieredTileGraph, TileGrid, EquatableTaggedEdge<TileGrid, int>>(rootGraph);
@@ -292,27 +325,7 @@ public static class GraphExtensions
     }
 
     public static bool TryGetProducerGrid(Expr expr, out Grid producer, out int outputIndex)
-    {
-        if (expr is Grid grid)
-        {
-            producer = grid;
-            outputIndex = 0;
-            return true;
-        }
-
-        if (expr is Call { Target: GetItem } getItem &&
-            getItem[GetItem.Input] is Grid inputGrid &&
-            getItem[GetItem.Index] is DimConst index)
-        {
-            producer = inputGrid;
-            outputIndex = checked((int)index.Value);
-            return true;
-        }
-
-        producer = null!;
-        outputIndex = -1;
-        return false;
-    }
+        => TryResolveProducerGrid(expr, out producer, out outputIndex);
 
     public static int GetOutputBufferIndex(this Grid grid, int outputIndex)
     {
@@ -381,6 +394,76 @@ public static class GraphExtensions
         }
 
         return bidict;
+    }
+
+    internal static bool IsFusionLegal(TileGrid producer, TileGrid consumer, int consumerAccessIndex)
+    {
+        var consumerRead = consumer.Grid.Accesses[consumerAccessIndex];
+        if (HasChipMemoryEffect(consumer, consumerAccessIndex, MemoryAccessMode.Read))
+        {
+            return false;
+        }
+
+        var producerOutputIndex = GetProducerOutputIndex(consumerRead.Value, producer);
+        var producerWrite = producer.Grid.Accesses[producer.GetWriteAccessIndex(producerOutputIndex)];
+        return producerWrite.BindingMode != GridBindingMode.Root ||
+            !HasChipMemoryEffect(producer, producer.GetWriteAccessIndex(producerOutputIndex), MemoryAccessMode.Write);
+
+        static bool HasChipMemoryEffect(TileGrid grid, int accessIndex, MemoryAccessMode mode)
+            => grid.LocalAccessEffects[accessIndex] is { Scope: MemoryAccessScope.Chip } effect && effect.Mode.HasFlag(mode);
+    }
+
+    private static bool TryResolveProducerGrid(
+        BaseExpr expression,
+        out Grid producer,
+        out int outputIndex)
+    {
+        int? selectedOutputIndex = null;
+        while (true)
+        {
+            switch (expression)
+            {
+                case Call { Target: GetItem } getItem
+                    when getItem[GetItem.Input].CheckedType is TupleType &&
+                         getItem[GetItem.Index] is DimConst index:
+                    var tupleInput = getItem[GetItem.Input];
+                    if (tupleInput is IR.Tuple tuple)
+                    {
+                        if (index.Value < 0 || index.Value >= tuple.Fields.Length)
+                        {
+                            producer = null!;
+                            outputIndex = -1;
+                            return false;
+                        }
+
+                        expression = tuple.Fields[checked((int)index.Value)];
+                    }
+                    else
+                    {
+                        selectedOutputIndex = checked((int)index.Value);
+                        expression = tupleInput;
+                    }
+
+                    break;
+                case Grid grid:
+                    var outputCount = grid.Accesses.ToArray().Count(access => access.IsWrite);
+                    var resolvedOutputIndex = selectedOutputIndex ?? (outputCount == 1 ? 0 : -1);
+                    if (resolvedOutputIndex < 0 || resolvedOutputIndex >= outputCount)
+                    {
+                        producer = null!;
+                        outputIndex = -1;
+                        return false;
+                    }
+
+                    producer = grid;
+                    outputIndex = resolvedOutputIndex;
+                    return true;
+                default:
+                    producer = null!;
+                    outputIndex = -1;
+                    return false;
+            }
+        }
     }
 
     private static void CloneInternal(TieredTileGraph sourceGraph, TieredTileGraph destGraph, Dictionary<TileGrid, TileGrid> updatedMemo)

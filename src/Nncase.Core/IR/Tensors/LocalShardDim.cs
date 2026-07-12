@@ -16,5 +16,7 @@ public sealed partial class LocalShardDim : Op
     [Browsable(false)]
     public Placement Placement { get; }
 
+    public override bool CanFoldConstCall => false;
+
     public override string DisplayProperty() => $"{nameof(AxisPolicy)}: {AxisPolicy}, {nameof(Placement)}: {Placement}";
 }

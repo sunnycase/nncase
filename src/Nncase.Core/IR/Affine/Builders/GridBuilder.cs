@@ -59,11 +59,15 @@ internal class GridBuilder : IGridBuilder
 
     public Grid Build()
     {
+        var domainParameter = _domainParameter ?? throw new InvalidOperationException("domain dims is not set.");
+        var tileAxisPolicies = _tileAxisPolicies ?? throw new InvalidOperationException("domain tile-axis policies are not set.");
+        var domainBounds = InferDomainBounds();
         return new Grid(
-            _domainParameter ?? throw new InvalidOperationException("domain dims is not set."),
+            domainParameter,
+            domainBounds,
             CollectionsMarshal.AsSpan(_accesses),
             Sequential.Flatten(CollectionsMarshal.AsSpan(_body)),
-            _tileAxisPolicies ?? throw new InvalidOperationException("domain tile-axis policies are not set."));
+            tileAxisPolicies);
     }
 
     public IGridBuilder Domain(int dims, out Var parameter)
@@ -71,11 +75,6 @@ internal class GridBuilder : IGridBuilder
 
     public IGridBuilder Domain(ReadOnlySpan<GridTileAxisPolicy> tileAxisPolicies, out Var parameter)
     {
-        if (tileAxisPolicies.IsEmpty)
-        {
-            throw new ArgumentException("Grid domain must have at least one axis.", nameof(tileAxisPolicies));
-        }
-
         parameter = new Var(new IR.TupleType(Enumerable.Repeat(new IR.TupleType(new IRType[] { TensorType.Scalar(DataTypes.Int64), TensorType.Scalar(DataTypes.Int64) }), tileAxisPolicies.Length)));
         _domainParameter = parameter;
         _tileAxisPolicies = tileAxisPolicies.ToArray();
@@ -106,32 +105,6 @@ internal class GridBuilder : IGridBuilder
     public IGridBuilder ReadWriteRoot(Expr argument, BaseExpr region, out Var parameter)
         => AddAccess(argument, argument, region, GridAccessMode.ReadWrite, GridBindingMode.Root, GridDomainMode.Footprint, out parameter);
 
-    private static IRType GetParameterType(IRType type, GridBindingMode bindingMode)
-    {
-        if (bindingMode == GridBindingMode.Root)
-        {
-            return type switch
-            {
-                DistributedType distributedType => distributedType.TensorType,
-                _ => type,
-            };
-        }
-
-        return GetTileParameterType(type);
-    }
-
-    private static IRType GetTileParameterType(IRType type)
-    {
-        return type switch
-        {
-            TensorType { DType: ReferenceType } tensorType => tensorType,
-            TensorType tensorType => new TensorType(tensorType.DType, Shape.Unknown(tensorType.Shape.Rank)),
-            DistributedType { TensorType.DType: ReferenceType } distributedType => distributedType.TensorType,
-            DistributedType distributedType => new TensorType(distributedType.TensorType.DType, Shape.Unknown(distributedType.TensorType.Shape.Rank)),
-            _ => type,
-        };
-    }
-
     private IGridBuilder AddAccess(
         Expr value,
         Expr buffer,
@@ -141,8 +114,21 @@ internal class GridBuilder : IGridBuilder
         GridDomainMode domainMode,
         out Var parameter)
     {
-        parameter = new Var(GetParameterType(value.CheckedType, bindingMode));
+        parameter = new Var(GridAccess.GetParameterType(value.CheckedType, bindingMode));
         _accesses.Add(new GridAccess(value, buffer, parameter, region, accessMode, bindingMode, domainMode));
         return this;
+    }
+
+    private Dimension[] InferDomainBounds()
+    {
+        var constraintAccesses = _accesses
+            .Where(access => access.IsAffine && access.DomainMode == GridDomainMode.Constraint)
+            .ToArray();
+        var runtimeShapes = constraintAccesses
+            .Select(access => AffineDomainInference.GetBufferRuntimeShape(access.Value))
+            .ToArray();
+        return AffineDomainInference.InferDomainBounds(
+            runtimeShapes,
+            constraintAccesses.Select(access => access.AffineMap).ToArray());
     }
 }

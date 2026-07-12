@@ -64,18 +64,26 @@ public sealed record GridTileAxisPolicy
 public sealed class Grid : Expr
 {
     private readonly int _accessesCount;
+    private readonly int _domainRank;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="Grid"/> class.
     /// </summary>
     /// <param name="domainParameter">the grid domain parameter. </param>
+    /// <param name="domainBounds">The logical extent of each grid domain axis.</param>
     /// <param name="accesses">Grid accesses.</param>
     /// <param name="body">The body sequence.</param>
     /// <param name="tileAxisPolicies">Tiling legality for each domain axis.</param>
-    public Grid(Var domainParameter, ReadOnlySpan<GridAccess> accesses, Sequential body, ReadOnlySpan<GridTileAxisPolicy> tileAxisPolicies)
-        : base(new BaseExpr[] { domainParameter }.Concat(accesses.ToArray()).Append(body))
+    public Grid(
+        Var domainParameter,
+        ReadOnlySpan<Dimension> domainBounds,
+        ReadOnlySpan<GridAccess> accesses,
+        Sequential body,
+        ReadOnlySpan<GridTileAxisPolicy> tileAxisPolicies)
+        : base(new BaseExpr[] { domainParameter }.Concat(domainBounds.ToArray()).Concat(accesses.ToArray()).Append(body))
     {
         _accessesCount = accesses.Length;
+        _domainRank = domainBounds.Length;
 
         if (accesses.IsEmpty)
         {
@@ -104,6 +112,11 @@ public sealed class Grid : Expr
         }
 
         var domainRank = affineDomainRanks[0];
+        if (domainBounds.Length != domainRank)
+        {
+            throw new ArgumentException($"Grid has a rank-{domainRank} domain but {domainBounds.Length} domain bounds.", nameof(domainBounds));
+        }
+
         if (tileAxisPolicies.Length != domainRank)
         {
             throw new ArgumentException($"Grid has a rank-{domainRank} domain but {tileAxisPolicies.Length} tile-axis policies.", nameof(tileAxisPolicies));
@@ -119,9 +132,11 @@ public sealed class Grid : Expr
 
     public Var DomainParameter => (Var)Operands[0];
 
-    public ReadOnlySpan<GridAccess> Accesses => SpanUtility.UnsafeCast<BaseExpr, GridAccess>(Operands.Slice(1, _accessesCount));
+    public ReadOnlySpan<Dimension> DomainBounds => SpanUtility.UnsafeCast<BaseExpr, Dimension>(Operands.Slice(1, _domainRank));
 
-    public Sequential Body => (Sequential)Operands[1 + _accessesCount];
+    public ReadOnlySpan<GridAccess> Accesses => SpanUtility.UnsafeCast<BaseExpr, GridAccess>(Operands.Slice(1 + _domainRank, _accessesCount));
+
+    public Sequential Body => (Sequential)Operands[1 + _domainRank + _accessesCount];
 
     public IReadOnlyList<GridTileAxisPolicy> TileAxisPolicies { get; }
 
@@ -129,6 +144,16 @@ public sealed class Grid : Expr
     public override TExprResult Accept<TExprResult, TTypeResult, TContext>(ExprFunctor<TExprResult, TTypeResult, TContext> functor, TContext context)
         => functor.VisitGrid(this, context);
 
-    public Grid With(Var? domainParameter = null, GridAccess[]? accesses = null, Sequential? body = null, GridTileAxisPolicy[]? tileAxisPolicies = null)
-        => new(domainParameter ?? DomainParameter, accesses ?? Accesses, body ?? Body, tileAxisPolicies ?? TileAxisPolicies.ToArray());
+    public Grid With(
+        Var? domainParameter = null,
+        Dimension[]? domainBounds = null,
+        GridAccess[]? accesses = null,
+        Sequential? body = null,
+        GridTileAxisPolicy[]? tileAxisPolicies = null)
+        => new(
+            domainParameter ?? DomainParameter,
+            domainBounds ?? DomainBounds,
+            accesses ?? Accesses,
+            body ?? Body,
+            tileAxisPolicies ?? TileAxisPolicies.ToArray());
 }

@@ -14,7 +14,6 @@ using Microsoft.Extensions.DependencyInjection;
 using NetFabric.Hyperlinq;
 using Nncase.Diagnostics;
 using Nncase.IR;
-using Nncase.IR.Affine;
 using Nncase.IR.Shapes;
 using Nncase.IR.Tensors;
 using Nncase.Passes.Analysis;
@@ -29,7 +28,7 @@ namespace Nncase.Passes;
 public sealed class NTTTIRSelectionPass : TIRSelectionPass
 {
     private readonly CompileOptions _compileOptions;
-    private int _bufferIndex;
+    private int _shardedViewIndex;
 
     public NTTTIRSelectionPass(CompileOptions compileOptions, string moduleKind = CPUTarget.Kind)
         : base(moduleKind)
@@ -50,8 +49,8 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
                 return GenerateClamp(call, arguments, output);
             case IR.Distributed.Boxing:
                 throw new InvalidOperationException("Boxing must be lowered to an affine transfer before TIR selection.");
-            case AffineView affineView:
-                return GenerateAffineView(call, affineView, arguments, ref output);
+            case IR.Distributed.ShardedView shardedView:
+                return GenerateShardedView(call, shardedView, ref output);
             case IR.Distributed.ForceBoxing forceBoxing:
                 return T.Memcopy(output, (Expr)arguments[0]);
             case IR.Math.Binary binary:
@@ -316,85 +315,15 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
         }
     }
 
-    private Expr GenerateAffineView(Call call, AffineView affineView, IReadOnlyList<BaseExpr> arguments, ref Expr output)
+    private Expr GenerateShardedView(Call call, IR.Distributed.ShardedView shardedView, ref Expr output)
     {
-        if (arguments[AffineView.Input.Index] is not TIR.Buffer inputBuffer)
+        if (call[IR.Distributed.ShardedView.Input] is not TensorConst tensorConst)
         {
-            throw new NotSupportedException($"AffineView input must lower to TIR.Buffer, got {arguments[AffineView.Input.Index].GetType().Name}.");
+            throw new NotSupportedException("ShardedView only supports TensorConst inputs in TIR selection.");
         }
 
-        if (call[AffineView.Input] is TensorConst tensorConst && affineView.NewType is DistributedType shardedType)
-        {
-            output = T.AttachShardedConstView(tensorConst, shardedType, out _, $"affine_const_view_{_bufferIndex++}");
-            return T.Nop();
-        }
-
-        var resultTensorType = affineView.NewType switch
-        {
-            DistributedType distributedType => distributedType.TensorType,
-            TensorType tensorType => tensorType,
-            _ => throw new NotSupportedException($"AffineView result must be a tensor type, got {affineView.NewType}."),
-        };
-        if (resultTensorType.Shape is not RankedShape resultShape)
-        {
-            throw new NotSupportedException("AffineView TIR lowering requires a ranked result shape.");
-        }
-
-        var resultDimensions = resultShape.Dimensions.ToArray();
-        var resultStrides = CreateAffineViewStrides(inputBuffer, resultTensorType, affineView.Transform);
-        var name = output switch
-        {
-            BufferVar outputVar => $"{outputVar.Name}_view",
-            TIR.Buffer outputBuffer => outputBuffer.Name,
-            _ => $"affine_view_{_bufferIndex++}",
-        };
-        output = T.CreateBufferView(
-            inputBuffer,
-            resultTensorType.DType,
-            resultDimensions,
-            resultStrides,
-            0,
-            inputBuffer.MemSpan.Size,
-            affineView.NewType as DistributedType,
-            name);
+        output = T.AttachShardedConstView(tensorConst, shardedView.NewType, out _, $"const_sharded_view_{_shardedViewIndex++}");
         return T.Nop();
-    }
-
-    private static Dimension[] CreateAffineViewStrides(TIR.Buffer source, TensorType resultType, AffineViewTransform transform)
-    {
-        var sourceDefaultStrides = TensorUtilities.GetDefaultStrides(source.Dimensions);
-        var prefixRank = 0;
-        var comparableRank = System.Math.Min(transform.SourceMap.Results.Length, transform.ResultMap.Results.Length);
-        while (prefixRank < comparableRank && transform.SourceMap.Results[prefixRank].Equals(transform.ResultMap.Results[prefixRank]))
-        {
-            prefixRank++;
-        }
-
-        for (var axis = prefixRank; axis < source.Rank; axis++)
-        {
-            if (!source.Strides[axis].Equals(sourceDefaultStrides[axis]))
-            {
-                throw new NotSupportedException(
-                    $"AffineView cannot reshape non-contiguous source suffix at axis {axis}: stride={source.Strides[axis]}, expected={sourceDefaultStrides[axis]}.");
-            }
-        }
-
-        var resultDimensions = ((RankedShape)resultType.Shape).Dimensions.ToArray();
-        var resultStrides = TensorUtilities.GetDefaultStrides(resultDimensions);
-        var sharedPrefixRank = System.Math.Min(prefixRank, System.Math.Min(source.Rank, resultDimensions.Length));
-        for (var axis = 0; axis < sharedPrefixRank; axis++)
-        {
-            var sourceByteStride = source.Strides[axis] * source.ElemType.SizeInBytes;
-            if (sourceByteStride is DimConst byteStride && byteStride.Value % resultType.DType.SizeInBytes != 0)
-            {
-                throw new NotSupportedException(
-                    $"AffineView byte stride {byteStride.Value} at axis {axis} is not aligned to result element size {resultType.DType.SizeInBytes}.");
-            }
-
-            resultStrides[axis] = (sourceByteStride / resultType.DType.SizeInBytes).Simplify();
-        }
-
-        return resultStrides;
     }
 
     private Expr GenerateUnary(UnaryOp unaryOp, IReadOnlyList<BaseExpr> arguments, Expr output)
@@ -409,5 +338,4 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
         var max = ((TensorConst)call[IR.Math.Clamp.Max]).Value.ToScalar<float>();
         return TIR.F.NTT.Clamp((Expr)arguments[0], output, min, max);
     }
-
 }

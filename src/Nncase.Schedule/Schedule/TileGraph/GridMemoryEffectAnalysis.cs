@@ -9,6 +9,12 @@ using Nncase.Utilities;
 
 namespace Nncase.Schedule.TileGraph;
 
+public readonly record struct GridBufferAlias(int SourceAccessIndex, int ResultAccessIndex);
+
+internal sealed record GridBodyAnalysis(
+    ImmutableArray<MemoryEffect> Effects,
+    ImmutableArray<GridBufferAlias> BufferAliases);
+
 /// <summary>
 /// Resolves the effects of a grid body back to its declared access parameters.
 /// GridAccess describes external dataflow; this analysis describes local tile
@@ -16,26 +22,40 @@ namespace Nncase.Schedule.TileGraph;
 /// </summary>
 internal sealed class GridMemoryEffectAnalysis
 {
-    private readonly Dictionary<PrimFunction, ImmutableArray<MemoryEffect>> _functionSummaries = new(ReferenceEqualityComparer.Instance);
+    private readonly Dictionary<PrimFunction, GridBodyAnalysis> _functionSummaries = new(ReferenceEqualityComparer.Instance);
     private readonly HashSet<PrimFunction> _activeFunctions = new(ReferenceEqualityComparer.Instance);
 
-    public ImmutableArray<MemoryEffect> Analyze(Grid grid)
+    public GridBodyAnalysis Analyze(Grid grid)
     {
         var roots = grid.Accesses.ToArray().Select(access => (BaseExpr)access.Parameter).ToArray();
-        var effects = AnalyzeExpression(grid.Body, roots, ResourceBindings.Empty);
-        for (var index = 0; index < effects.Length; index++)
+        var analysis = AnalyzeExpression(grid.Body, roots, ResourceBindings.Empty);
+        foreach (var alias in analysis.BufferAliases)
         {
-            ValidateAccess(grid, index, effects[index]);
+            if (!grid.Accesses[alias.SourceAccessIndex].IsRead || !grid.Accesses[alias.ResultAccessIndex].IsWrite)
+            {
+                throw new InvalidOperationException(
+                    $"Grid buffer alias must map a readable access to a writable access, got {alias.SourceAccessIndex}->{alias.ResultAccessIndex}.");
+            }
         }
 
-        return ImmutableArray.Create(effects);
+        for (var index = 0; index < analysis.Effects.Length; index++)
+        {
+            ValidateAccess(grid, index, analysis.Effects[index], analysis.BufferAliases);
+        }
+
+        return analysis;
     }
 
-    private static void ValidateAccess(Grid grid, int index, MemoryEffect effect)
+    private static void ValidateAccess(Grid grid, int index, MemoryEffect effect, IReadOnlyList<GridBufferAlias> aliases)
     {
         var access = grid.Accesses[index];
         if (effect.Mode == MemoryAccessMode.None)
         {
+            if (aliases.Any(alias => alias.SourceAccessIndex == index || alias.ResultAccessIndex == index))
+            {
+                return;
+            }
+
             throw new InvalidOperationException($"Grid access {index} ({access.AccessMode}) is not referenced by any memory-effect operand in the grid body.");
         }
 
@@ -50,11 +70,12 @@ internal sealed class GridMemoryEffectAnalysis
         }
     }
 
-    private MemoryEffect[] AnalyzeExpression(Expr expression, IReadOnlyList<BaseExpr> roots, ResourceBindings bindings)
+    private GridBodyAnalysis AnalyzeExpression(Expr expression, IReadOnlyList<BaseExpr> roots, ResourceBindings bindings)
     {
         var effects = Enumerable.Repeat(MemoryEffect.None, roots.Count).ToArray();
+        var bufferAliases = new List<GridBufferAlias>();
         Visit(expression, bindings);
-        return effects;
+        return new(ImmutableArray.Create(effects), ImmutableArray.CreateRange(bufferAliases.Distinct()));
 
         void Visit(Expr current, ResourceBindings currentBindings)
         {
@@ -96,6 +117,7 @@ internal sealed class GridMemoryEffectAnalysis
                 case Call { Target: Op } call:
                     VisitCallArguments(call, currentBindings);
                     MemoryEffectUtility.VisitCallEffects(call, (argument, _, effect) => AddEffect(argument, effect, currentBindings));
+                    VisitBufferAliases(call, currentBindings);
                     return;
                 default:
                     foreach (var operand in current.Operands)
@@ -124,14 +146,14 @@ internal sealed class GridMemoryEffectAnalysis
         void InstantiateFunction(PrimFunction callee, ReadOnlySpan<BaseExpr> arguments, ResourceBindings currentBindings)
         {
             var summary = GetFunctionSummary(callee);
-            if (summary.Length != callee.Parameters.Length)
+            if (summary.Effects.Length != callee.Parameters.Length)
             {
                 throw new InvalidOperationException($"Invalid memory-effect summary for PrimFunction {callee.Name}.");
             }
 
-            for (var parameterIndex = 0; parameterIndex < summary.Length; parameterIndex++)
+            for (var parameterIndex = 0; parameterIndex < summary.Effects.Length; parameterIndex++)
             {
-                var effect = summary[parameterIndex];
+                var effect = summary.Effects[parameterIndex];
                 if (effect.Mode == MemoryAccessMode.None)
                 {
                     continue;
@@ -144,6 +166,19 @@ internal sealed class GridMemoryEffectAnalysis
 
                 AddEffect(argument, effect, currentBindings);
             }
+
+            foreach (var alias in summary.BufferAliases)
+            {
+                if (alias.SourceAccessIndex >= arguments.Length || alias.ResultAccessIndex >= arguments.Length ||
+                    arguments[alias.SourceAccessIndex] is not Expr sourceArgument ||
+                    arguments[alias.ResultAccessIndex] is not Expr resultArgument)
+                {
+                    throw new InvalidOperationException(
+                        $"Cannot map buffer alias for PrimFunction {callee.Name} parameters {alias.SourceAccessIndex}->{alias.ResultAccessIndex}.");
+                }
+
+                AddBufferAlias(sourceArgument, resultArgument, currentBindings, $"PrimFunction {callee.Name}");
+            }
         }
 
         void AddEffect(Expr argument, MemoryEffect effect, ResourceBindings currentBindings)
@@ -153,9 +188,39 @@ internal sealed class GridMemoryEffectAnalysis
                 effects[rootIndex] = MemoryEffectUtility.Merge(effects[rootIndex], effect);
             }
         }
+
+        void VisitBufferAliases(Call call, ResourceBindings currentBindings)
+        {
+            if (call.Target is not IBufferAliasOp aliasOp)
+            {
+                return;
+            }
+
+            foreach (var alias in aliasOp.BufferAliases)
+            {
+                AddBufferAlias(
+                    (Expr)call.Arguments[alias.Source.Index],
+                    (Expr)call.Arguments[alias.Result.Index],
+                    currentBindings,
+                    $"{call.Target.GetType().Name}.{alias.Result.Name}->{alias.Source.Name}");
+            }
+        }
+
+        void AddBufferAlias(Expr source, Expr result, ResourceBindings currentBindings, string context)
+        {
+            var sourceRoots = ResolveRoots(source, roots, currentBindings).Distinct().ToArray();
+            var resultRoots = ResolveRoots(result, roots, currentBindings).Distinct().ToArray();
+            if (sourceRoots.Length != 1 || resultRoots.Length != 1)
+            {
+                throw new InvalidOperationException(
+                    $"Buffer alias {context} must resolve to exactly one Grid access on each side.");
+            }
+
+            bufferAliases.Add(new(sourceRoots[0], resultRoots[0]));
+        }
     }
 
-    private ImmutableArray<MemoryEffect> GetFunctionSummary(PrimFunction function)
+    private GridBodyAnalysis GetFunctionSummary(PrimFunction function)
     {
         if (_functionSummaries.TryGetValue(function, out var summary))
         {
@@ -168,7 +233,7 @@ internal sealed class GridMemoryEffectAnalysis
         }
 
         var roots = function.Parameters.ToArray().Select(parameter => (BaseExpr)parameter).ToArray();
-        summary = ImmutableArray.Create(AnalyzeExpression(function.Body, roots, ResourceBindings.Empty));
+        summary = AnalyzeExpression(function.Body, roots, ResourceBindings.Empty);
         _activeFunctions.Remove(function);
         _functionSummaries.Add(function, summary);
         return summary;

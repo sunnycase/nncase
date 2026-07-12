@@ -1,8 +1,6 @@
 ﻿// Copyright (c) Canaan Inc. All rights reserved.
 // Licensed under the Apache license. See LICENSE file in the project root for full license information.
 
-// Copyright (c) Canaan Inc. All rights reserved.
-// Licensed under the Apache license. See LICENSE file in the project root for full license information.
 using System.Collections;
 using System.Collections.Immutable;
 using System.Diagnostics;
@@ -88,7 +86,8 @@ public sealed record DomainRelation(int DomainOp, int RangeOp, AffineMap Map)
             _ => expr.Offset.GetDisplayString(Map.Symbols),
         }));
 
-        return new Isl.map(Isl.ctx.Current, $"{{ [{domains}] -> [{results}] : {string.Join(" and ", constraints)} }}");
+        var constraintClause = constraints.Count == 0 ? string.Empty : $" : {string.Join(" and ", constraints)}";
+        return new Isl.map(Isl.ctx.Current, $"{{ [{domains}] -> [{results}]{constraintClause} }}");
     }
 
     public override string ToString() => $"Op{DomainOp} -> Op{RangeOp}: {Map}";
@@ -110,11 +109,34 @@ public sealed class TileGrid : ITileable
         BufferShapes = ImmutableArray.CreateRange(bufferShapes.Select(x => ImmutableArray.CreateRange(x)));
         BufferDataTypes = ImmutableArray.CreateRange(grid.Accesses.ToArray().Select(access => access.Buffer.CheckedDataType));
         var domainRank = grid.Accesses.ToArray().First(access => access.IsAffine).AffineMap.Domains.Length;
-        AccessMaps = ImmutableArray.CreateRange(grid.Accesses.ToArray().Select(access => access.IsAffine
-            ? access.AffineMap
-            : AffineMap.FromCallable((_, _) => Array.Empty<AffineRange>(), domainRank, 0)));
+        var accessMaps = new AffineMap[grid.Accesses.Length];
+        for (var index = 0; index < grid.Accesses.Length; index++)
+        {
+            var access = grid.Accesses[index];
+            if (!access.IsAffine)
+            {
+                accessMaps[index] = AffineMap.FromCallable((_, _) => Array.Empty<AffineRange>(), domainRank, 0);
+                continue;
+            }
+
+            accessMaps[index] = AffineUtility.RestrictAccessMapToShape(access.AffineMap, BufferShapes[index].AsSpan());
+        }
+
+        AccessMaps = ImmutableArray.CreateRange(accessMaps);
+        for (var index = 0; index < grid.Accesses.Length; index++)
+        {
+            if (grid.Accesses[index].IsAffine && AccessMaps[index].Results.Length != BufferShapes[index].Length)
+            {
+                throw new InvalidOperationException(
+                    $"Grid {op.GetType().Name} access {index} resolves to a rank-{AccessMaps[index].Results.Length} storage map " +
+                    $"for a rank-{BufferShapes[index].Length} backing buffer: {AccessMaps[index]}.");
+            }
+        }
+
         TileAxisPolicies = ImmutableArray.CreateRange(grid.TileAxisPolicies);
-        LocalAccessEffects = new GridMemoryEffectAnalysis().Analyze(grid);
+        var bodyAnalysis = new GridMemoryEffectAnalysis().Analyze(grid);
+        LocalAccessEffects = bodyAnalysis.Effects;
+        BufferAliases = bodyAnalysis.BufferAliases;
         ReadAccessIndices = ImmutableArray.CreateRange(Enumerable.Range(0, grid.Accesses.Length).Where(index => grid.Accesses[index].IsRead));
         WriteAccessIndices = ImmutableArray.CreateRange(Enumerable.Range(0, grid.Accesses.Length).Where(index => grid.Accesses[index].IsWrite));
     }
@@ -147,9 +169,29 @@ public sealed class TileGrid : ITileable
 
     public ImmutableArray<MemoryEffect> LocalAccessEffects { get; }
 
+    public ImmutableArray<GridBufferAlias> BufferAliases { get; }
+
+    public bool IsPureBufferView => BufferAliases.Length > 0 &&
+        LocalAccessEffects.All(effect => effect.Mode == MemoryAccessMode.None);
+
     public ImmutableArray<int> ReadAccessIndices { get; }
 
     public ImmutableArray<int> WriteAccessIndices { get; }
+
+    public bool TryGetAliasSourceAccess(int resultAccessIndex, out int sourceAccessIndex)
+    {
+        foreach (var alias in BufferAliases)
+        {
+            if (alias.ResultAccessIndex == resultAccessIndex)
+            {
+                sourceAccessIndex = alias.SourceAccessIndex;
+                return true;
+            }
+        }
+
+        sourceAccessIndex = -1;
+        return false;
+    }
 
     public AffineMap GetAccessMap(int accessIndex) => AccessMaps[accessIndex];
 

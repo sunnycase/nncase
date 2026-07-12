@@ -361,7 +361,7 @@ public sealed class UnitTestFunctionBoundaryLayoutPropagation : TestClassBase
     }
 
     [Fact]
-    public async Task TestConstWeightDistributedBoundaryUsesAffineView()
+    public async Task TestConstWeightDistributedBoundaryUsesShardedView()
     {
         CompileOptions.TargetOptions = new Nncase.Targets.NTTTargetOptions
         {
@@ -381,7 +381,7 @@ public sealed class UnitTestFunctionBoundaryLayoutPropagation : TestClassBase
 
         var module = new IRModule(main);
         module.Add(layer);
-        var passManager = CompileSession.CreatePassManager("BoundaryConstAffineView");
+        var passManager = CompileSession.CreatePassManager("BoundaryConstShardedView");
         passManager.Add<FunctionBoundaryLayoutPropagationPass>();
         await passManager.RunAsync(module);
 
@@ -389,7 +389,7 @@ public sealed class UnitTestFunctionBoundaryLayoutPropagation : TestClassBase
         var specialized = GetFunction(module, "layer");
         Assert.DoesNotContain("Boxing(", CompilerServices.Print(specialized.Body), StringComparison.Ordinal);
         var mainCalls = ExprCollector.Collect(main.Body).OfType<Call>().ToArray();
-        Assert.Contains(mainCalls, call => call.Target is IR.Affine.AffineView && call.Arguments[IR.Affine.AffineView.Input.Index] is TensorConst);
+        Assert.Contains(mainCalls, call => call.Target is IR.Distributed.ShardedView && call.Arguments[IR.Distributed.ShardedView.Input.Index] is TensorConst);
         Assert.DoesNotContain(mainCalls, call => call.Target is IR.Distributed.Boxing { NewType: DistributedType } && call.Arguments[IR.Distributed.Boxing.Input.Index] is TensorConst);
     }
 

@@ -274,7 +274,10 @@ public sealed class TreeSolverInitializer : TreeSolverBase<IntExpr>, ITreeNodeVi
             if (access.IsWrite)
             {
                 BufferIdentity outputBid = new(value.Wrapped, i, BufferEndpoint.Output);
-                bufferResults.Add(new(outputBid, new(TimeStamp + 1, TimeStamp + 2), value.DomainRelation.Map * accessMaps[i], elemSizes[i]));
+                var outputElemSize = value.TryGetAliasSourceAccess(i, out _)
+                    ? Solver.MakeIntConst(0)
+                    : elemSizes[i];
+                bufferResults.Add(new(outputBid, new(TimeStamp + 1, TimeStamp + 2), value.DomainRelation.Map * accessMaps[i], outputElemSize));
             }
         }
 

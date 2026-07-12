@@ -84,6 +84,7 @@ public sealed class ITreeNodeComparer : IEqualityComparer<ITreeNode>
     private bool GridEquals(Grid x, Grid y)
     {
         return VarTypeEqualityComparer.Instance.Equals(x.DomainParameter, y.DomainParameter) &&
+            x.DomainBounds.SequenceEqual(y.DomainBounds) &&
             x.TileAxisPolicies.SequenceEqual(y.TileAxisPolicies) &&
             x.Accesses.Length == y.Accesses.Length &&
             Enumerable.Range(0, x.Accesses.Length).All(i => GridAccessEquals(x.Accesses[i], y.Accesses[i])) &&
@@ -106,6 +107,7 @@ public sealed class ITreeNodeComparer : IEqualityComparer<ITreeNode>
     {
         return HashCode.Combine(
             obj.DomainParameter.TypeAnnotation,
+            HashCode<Dimension>.Combine(obj.DomainBounds.ToArray()),
             HashCode<IRType>.Combine(obj.Accesses.ToArray().Select(access => access.Parameter.TypeAnnotation).ToArray()),
             HashCode<GridAccessMode>.Combine(obj.Accesses.ToArray().Select(access => access.AccessMode).ToArray()),
             HashCode<GridBindingMode>.Combine(obj.Accesses.ToArray().Select(access => access.BindingMode).ToArray()),

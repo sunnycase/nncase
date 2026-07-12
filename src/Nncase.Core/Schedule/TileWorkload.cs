@@ -17,6 +17,14 @@ public interface ITileWorkloadProvider
 /// </summary>
 public abstract record TileWorkload;
 
+/// <summary>
+/// Descriptor-only operation with no compute or memory traffic.
+/// </summary>
+public sealed record BufferAliasTileWorkload : TileWorkload
+{
+    public static BufferAliasTileWorkload Default { get; } = new();
+}
+
 public sealed record ElementwiseTileWorkload(
     Func<IntExpr[][], Solver, TileWorkloadContext, IntExpr> GetWork) : TileWorkload;
 

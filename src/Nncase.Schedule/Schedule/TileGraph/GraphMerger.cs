@@ -14,18 +14,19 @@ using QuikGraph.Graphviz;
 
 namespace Nncase.Schedule.TileGraph;
 
-public sealed record MergePoint(TileGrid Consumer, TileGrid Producer, int Level)
+public sealed record MergePoint(TileGrid Consumer, TileGrid Producer, int Level, int ConsumerAccessIndex)
 {
-    public override string ToString() => $"merge({Consumer},{Producer},{Level})";
+    public override string ToString() => $"merge({Consumer}.in{ConsumerAccessIndex},{Producer},{Level})";
 }
 
 public sealed class GraphMerger
 {
-    public GraphMerger(TileGrid opConsumer, TileGrid opProducer, int level)
+    public GraphMerger(TileGrid opConsumer, TileGrid opProducer, int level, int consumerAccessIndex)
     {
         ConsumerOp = opConsumer;
         ProducerOp = opProducer;
         TargetLevel = level;
+        ConsumerAccessIndex = consumerAccessIndex;
         RootGraph = null!;
     }
 
@@ -35,12 +36,113 @@ public sealed class GraphMerger
 
     public int TargetLevel { get; }
 
+    public int ConsumerAccessIndex { get; }
+
     public TieredTileGraph RootGraph { get; set; }
 
     public bool Visit(TieredTileGraph graph)
     {
         RootGraph = graph;
+        if (ProducerOp.IsPureBufferView && ConsumerAccessIndex < 0)
+        {
+            throw new InvalidOperationException($"Buffer-view fusion requires an explicit consumer access index for {ProducerOp} -> {ConsumerOp}.");
+        }
+
+        if (ProducerOp.IsPureBufferView &&
+            (ProducerOp.Attribute.HasFlag(TileGridAttribute.LiveOut) || RootGraph.OutDegree(ProducerOp) > 1))
+        {
+            return TryMergeSharedBufferViewUse();
+        }
+
         return VisitRecursion(graph);
+    }
+
+    private bool TryMergeSharedBufferViewUse()
+    {
+        var useEdge = RootGraph.Edges.FirstOrDefault(edge =>
+            ReferenceEquals(edge.Source, ProducerOp) &&
+            ReferenceEquals(edge.Target, ConsumerOp) &&
+            edge.Tag == ConsumerAccessIndex);
+        if (useEdge is null || !TryFindStandaloneTopLevelCluster(ProducerOp, out var producerTopLevel))
+        {
+            return false;
+        }
+
+        var scheduleOpId = RootGraph.Vertices.Select(vertex => vertex.OpId).DefaultIfEmpty(-1).Max() + 1;
+        var clonedView = new TileGrid(
+            ProducerOp.Grid,
+            ProducerOp.Op,
+            scheduleOpId,
+            ProducerOp.DomainBounds,
+            new DomainRelation(scheduleOpId, scheduleOpId, AffineMap.Identity(ProducerOp.DomainBounds.Length)),
+            ProducerOp.DomainBoundExprs.ToArray(),
+            ProducerOp.DomainDynamic,
+            ProducerOp.BufferShapes.Select(shape => shape.AsEnumerable()),
+            TileGridAttribute.None);
+        CloneStandaloneHierarchy(producerTopLevel, clonedView, scheduleOpId);
+
+        foreach (var inputEdge in RootGraph.Edges.Where(edge => ReferenceEquals(edge.Target, ProducerOp)).ToArray())
+        {
+            RootGraph.AddEdge(new(inputEdge.Source, clonedView, inputEdge.Tag));
+        }
+
+        RootGraph.RemoveEdge(useEdge);
+        RootGraph.AddEdge(new(clonedView, ConsumerOp, ConsumerAccessIndex));
+        return new GraphMerger(ConsumerOp, clonedView, TargetLevel, ConsumerAccessIndex).Visit(RootGraph);
+    }
+
+    private bool TryFindStandaloneTopLevelCluster(
+        TileGrid view,
+        [MaybeNullWhen(false)] out TieredTileGraph topLevel)
+    {
+        topLevel = RootGraph.Clusters
+            .OfType<TieredTileGraph>()
+            .SingleOrDefault(cluster => cluster.ContainsVertex(view));
+        if (topLevel is null || topLevel.Vertices.Count() != 1)
+        {
+            return false;
+        }
+
+        var current = topLevel;
+        while (current.ClustersCount != 0)
+        {
+            var children = current.Clusters.OfType<TieredTileGraph>().ToArray();
+            if (children.Length != 1 || children[0].Vertices.Count() != 1)
+            {
+                return false;
+            }
+
+            current = children[0];
+        }
+
+        return current.ContainsVertex(view);
+    }
+
+    private void CloneStandaloneHierarchy(TieredTileGraph source, TileGrid clonedView, int scheduleOpId)
+    {
+        TieredTileGraph CloneLevel(TieredTileGraph sourceLevel, TieredTileGraph destinationParent)
+        {
+            var relation = new DomainRelation(scheduleOpId, scheduleOpId, sourceLevel.DomainRelation.Map);
+            var destination = destinationParent.CreateCluster<TieredTileGraph>(
+                sourceLevel.Level,
+                scheduleOpId,
+                relation,
+                sourceLevel.DomainBoundExprs.ToArray(),
+                sourceLevel.DomainDynamic.ToArray());
+            var child = sourceLevel.Clusters.OfType<TieredTileGraph>().SingleOrDefault();
+            if (child is null)
+            {
+                destination.AddVertex(clonedView);
+            }
+            else
+            {
+                CloneLevel(child, destination);
+            }
+
+            return destination;
+        }
+
+        CloneLevel(source, RootGraph);
     }
 
     private bool TryMerge(TieredTileGraph graph)

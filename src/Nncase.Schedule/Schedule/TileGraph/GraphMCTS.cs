@@ -32,6 +32,8 @@ public sealed class MCTState : IEnvironmentState<MergePoint>
 
     private int _permformCount;
 
+    private bool _hasRolledOut;
+
     public MCTState(TieredTileGraph graph, string moduleKind, string searchPath, GraphTiler graphTiler, INTTTargetOptions targetOptions, DimVar[] dynamicDimVars)
     {
         _graph = graph;
@@ -65,7 +67,11 @@ public sealed class MCTState : IEnvironmentState<MergePoint>
     public IEnvironmentState<MergePoint>? PerformAction(MergePoint mergePoint)
     {
         var newGraph = _graph.Clone(out var memo);
-        var mp = new MergePoint(memo[mergePoint.Consumer], memo[mergePoint.Producer], mergePoint.Level);
+        var mp = new MergePoint(
+            memo[mergePoint.Consumer],
+            memo[mergePoint.Producer],
+            mergePoint.Level,
+            mergePoint.ConsumerAccessIndex);
         if (newGraph.Merge(mp))
         {
             return new MCTState(newGraph, _moduleKind, $"{_path}.{_permformCount}", _graphTiler, _targetOptions, _dynamicDimVars);
@@ -76,12 +82,15 @@ public sealed class MCTState : IEnvironmentState<MergePoint>
 
     public double RollOut()
     {
-        if (ObjectValue == 0)
+        if (!_hasRolledOut)
         {
+            _hasRolledOut = true;
             using var scope = new Diagnostics.DumpScope($"RollOut{_path}");
             try
             {
-                var res = _graphTiler.SolveRootGraph(_graph, _moduleKind, _targetOptions, _dynamicDimVars);
+                var solveGraph = _graph.Clone(out _);
+                solveGraph.PruneDeadBufferViews();
+                var res = _graphTiler.SolveRootGraph(solveGraph, _moduleKind, _targetOptions, _dynamicDimVars);
                 ObjectValue = res.ObjectValue;
 
                 foreach (var item in res.ArgumentMemo)
@@ -201,7 +210,8 @@ public sealed class MCTSearcher : Searcher<MergePoint>
     {
         double coef = Math.Sqrt(2);
         double temp = 0.5;
-        var ucbs = node.Children.Select(c => (-c.QualityValue / BestObjectValue) + (coef * Math.Sqrt(Math.Log(node.VisitTimes) / c.VisitTimes))).ToArray();
+        var objectiveScale = Math.Max(BestObjectValue, 1.0);
+        var ucbs = node.Children.Select(c => (-c.QualityValue / objectiveScale) + (coef * Math.Sqrt(Math.Log(node.VisitTimes) / c.VisitTimes))).ToArray();
         var ucb_exps = ucbs.Select(ucb => Math.Max(Math.Exp(ucb / temp), 1e-10)).ToArray();
         var sum = ucb_exps.Sum();
         var probs = ucb_exps.Select(e => (int)(e / sum * 30)).ToArray(); // conver ucb as prob

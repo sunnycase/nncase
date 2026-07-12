@@ -288,6 +288,15 @@ public class UnitTestAffine
         }
 
         {
+            ctx.set_ast_build_detect_min_max(1);
+            var a = new Isl.pw_aff(ctx, "{ [n] -> [(2)] : n <= 2; [n] -> [(n)] : n > 2 }");
+            var expr = ISLUtility.ToDimension(a, new Dictionary<string, Dimension>() {
+                { "n", new DimVar("n") },
+            });
+            Assert.IsType<DimMax>(expr);
+        }
+
+        {
             var n = new DimVar("n")
             {
                 Metadata = new()

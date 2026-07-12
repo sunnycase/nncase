@@ -8,12 +8,139 @@ namespace Nncase.IR.Affine;
 /// <summary>
 /// Builds and validates target-independent affine tensor views.
 /// </summary>
-public static class AffineViewUtility
+public static class BufferViewUtility
 {
+    /// <summary>
+    /// Materializes a full logical tensor descriptor over existing physical storage.
+    /// </summary>
+    public static TIR.Buffer CreateLogicalBufferView(
+        TIR.Buffer source,
+        IRType resultType,
+        BufferViewTransform transform,
+        string name)
+    {
+        (TensorType ResultTensorType, DistributedType? ResultDistributedType) result = resultType switch
+        {
+            DistributedType distributed => (distributed.TensorType, distributed),
+            TensorType tensor => (tensor, null),
+            _ => throw new ArgumentException($"Buffer view result must be tensor-like, got {resultType}.", nameof(resultType)),
+        };
+        var (resultTensorType, resultDistributedType) = result;
+        if (resultTensorType.Shape is not RankedShape resultShape)
+        {
+            throw new ArgumentException("Buffer view result must have a ranked shape.", nameof(resultType));
+        }
+
+        var zeroDomain = Enumerable.Repeat<Dimension>(0L, transform.DomainBounds.Count).ToArray();
+        var resultOrigin = transform.ResultMap.Apply(zeroDomain, zeroDomain)
+            .Select(range => range.Start.Simplify())
+            .ToArray();
+        if (resultOrigin.Any(offset => !offset.Equals(Dimension.Zero)))
+        {
+            throw new NotSupportedException(
+                $"Logical buffer view result must cover the origin, got [{string.Join(", ", resultOrigin.Select(offset => offset.ToString()))}].");
+        }
+
+        var sourceOrigin = transform.SourceMap.Apply(zeroDomain, zeroDomain)
+            .Select(range => range.Start.Simplify())
+            .ToArray();
+        if (sourceOrigin.Length != source.Rank)
+        {
+            throw new InvalidOperationException(
+                $"Logical buffer view source rank mismatch: map={sourceOrigin.Length}, buffer={source.Rank}.");
+        }
+
+        var resultStrides = CreateBufferViewStrides(source, resultTensorType, transform);
+        var byteOffset = (TensorUtilities.GetLinearOffset(source.Strides, sourceOrigin) * source.ElemType.SizeInBytes).Simplify();
+        var byteSize = (source.MemSpan.Size - byteOffset).Simplify();
+        return TIR.T.CreateBufferView(
+            source,
+            resultTensorType.DType,
+            resultShape.Dimensions,
+            resultStrides,
+            byteOffset,
+            byteSize,
+            resultDistributedType,
+            name);
+    }
+
+    /// <summary>
+    /// Derives element strides for a typed buffer alias over existing storage.
+    /// </summary>
+    public static Dimension[] CreateBufferViewStrides(TIR.Buffer source, TensorType resultType, BufferViewTransform transform)
+    {
+        var sourceDefaultStrides = TensorUtilities.GetDefaultStrides(source.Dimensions);
+        var sourceDenseStrides = GetDenseStrides(source.Dimensions);
+        var prefixRank = 0;
+        var comparableRank = System.Math.Min(transform.SourceMap.Results.Length, transform.ResultMap.Results.Length);
+        while (prefixRank < comparableRank && transform.SourceMap.Results[prefixRank].Equals(transform.ResultMap.Results[prefixRank]))
+        {
+            prefixRank++;
+        }
+
+        for (var axis = prefixRank; axis < source.Rank; axis++)
+        {
+            if (!source.Strides[axis].Equals(sourceDefaultStrides[axis]) &&
+                !source.Strides[axis].Equals(sourceDenseStrides[axis]) &&
+                !IsDegenerateSourceDimension(source, axis))
+            {
+                throw new NotSupportedException(
+                    $"Buffer view cannot reshape non-contiguous source suffix at axis {axis}: stride={source.Strides[axis]}, " +
+                    $"expected={sourceDefaultStrides[axis]} or dense stride {sourceDenseStrides[axis]}.");
+            }
+        }
+
+        var resultDimensions = ((RankedShape)resultType.Shape).Dimensions.ToArray();
+        var resultStrides = TensorUtilities.GetDefaultStrides(resultDimensions);
+        var sharedPrefixRank = System.Math.Min(prefixRank, System.Math.Min(source.Rank, resultDimensions.Length));
+        for (var axis = 0; axis < sharedPrefixRank; axis++)
+        {
+            var sourceByteStride = source.Strides[axis] * source.ElemType.SizeInBytes;
+            if (sourceByteStride is DimConst byteStride && byteStride.Value % resultType.DType.SizeInBytes != 0)
+            {
+                throw new NotSupportedException(
+                    $"Buffer view byte stride {byteStride.Value} at axis {axis} is not aligned to result element size {resultType.DType.SizeInBytes}.");
+            }
+
+            resultStrides[axis] = (sourceByteStride / resultType.DType.SizeInBytes).Simplify();
+        }
+
+        return resultStrides;
+    }
+
+    /// <summary>
+    /// Computes the byte span covered by a strided logical buffer descriptor.
+    /// </summary>
+    public static Dimension GetByteSpanSize(
+        ReadOnlySpan<Dimension> dimensions,
+        ReadOnlySpan<Dimension> strides,
+        int elementSizeInBytes)
+    {
+        if (dimensions.Length != strides.Length)
+        {
+            throw new ArgumentException(
+                $"Buffer span rank mismatch: dimensions={dimensions.Length}, strides={strides.Length}.");
+        }
+
+        Dimension spanElements = 1L;
+        for (var axis = 0; axis < dimensions.Length; axis++)
+        {
+            spanElements += ((dimensions[axis] - 1L) * strides[axis]).Simplify();
+        }
+
+        Dimension byteSize = (spanElements * elementSizeInBytes).Simplify();
+        foreach (var dimension in dimensions)
+        {
+            byteSize = Dimension.Select(dimension, 0L, 0L, byteSize).Simplify();
+        }
+
+        return byteSize;
+    }
+
     /// <summary>
     /// Tries to build a storage-preserving affine transform between two tensor types.
     /// </summary>
-    public static bool TryCreate(IRType sourceType, IRType resultType, out AffineViewTransform transform)
+    public static bool TryCreate(IRType sourceType, IRType resultType, out BufferViewTransform transform)
     {
         transform = null!;
         if (!HaveCompatibleDistributedPlacement(sourceType, resultType))
@@ -34,7 +161,7 @@ public static class AffineViewUtility
         var resultLanes = resultTensor.DType.SizeInBytes / storageUnitBytes;
         if (sourceLanes == resultLanes && HaveSameShape(sourceShape, resultShape))
         {
-            transform = AffineViewTransform.Identity(sourceShape);
+            transform = BufferViewTransform.Identity(sourceShape);
             return HaveCompatibleDistributedStorage(sourceType, resultType, transform);
         }
 
@@ -47,7 +174,7 @@ public static class AffineViewUtility
         {
             if (sourceShape.Rank == resultShape.Rank && sourceTensor.DType.SizeInBytes == resultTensor.DType.SizeInBytes)
             {
-                transform = AffineViewTransform.Identity(sourceShape);
+                transform = BufferViewTransform.Identity(sourceShape);
                 return HaveCompatibleDistributedStorage(sourceType, resultType, transform);
             }
 
@@ -64,58 +191,7 @@ public static class AffineViewUtility
         return created && HaveCompatibleDistributedStorage(sourceType, resultType, transform);
     }
 
-    /// <summary>
-    /// Verifies the structural and storage invariants of an affine view.
-    /// </summary>
-    public static string? Verify(IRType sourceType, IRType resultType, AffineViewTransform transform)
-    {
-        if (!TryGetTensorType(sourceType, out var sourceTensor) || !TryGetTensorType(resultType, out var resultTensor))
-        {
-            return $"AffineView requires tensor or distributed tensor types, got {sourceType} and {resultType}.";
-        }
-
-        if (sourceType is DistributedType { Partial: not null } || resultType is DistributedType { Partial: not null })
-        {
-            return "AffineView does not support partial distributed tensors.";
-        }
-
-        if (!HaveCompatibleDistributedPlacement(sourceType, resultType))
-        {
-            return $"AffineView distributed placement is incompatible: source={sourceType}, result={resultType}.";
-        }
-
-        if (sourceTensor.Shape is not RankedShape sourceShape || resultTensor.Shape is not RankedShape resultShape)
-        {
-            return "AffineView requires ranked source and result shapes.";
-        }
-
-        if (transform.SourceMap.Results.Length != sourceShape.Rank || transform.ResultMap.Results.Length != resultShape.Rank)
-        {
-            return $"AffineView map rank mismatch: source map={transform.SourceMap.Results.Length}, source rank={sourceShape.Rank}, result map={transform.ResultMap.Results.Length}, result rank={resultShape.Rank}.";
-        }
-
-        if (!CoversShape(transform.SourceMap, transform.DomainBounds, sourceShape) ||
-            !CoversShape(transform.ResultMap, transform.DomainBounds, resultShape))
-        {
-            return $"AffineView maps must cover the complete source/result shapes: transform={transform}.";
-        }
-
-        var sourceBytes = (sourceShape.Prod() * sourceTensor.DType.SizeInBytes).Simplify();
-        var resultBytes = (resultShape.Prod() * resultTensor.DType.SizeInBytes).Simplify();
-        if (!sourceBytes.Equals(resultBytes))
-        {
-            return $"AffineView storage size mismatch: source={sourceBytes} bytes, result={resultBytes} bytes.";
-        }
-
-        if (!HaveCompatibleDistributedStorage(sourceType, resultType, transform))
-        {
-            return $"AffineView distributed shard regions are incompatible: source={sourceType}, result={resultType}.";
-        }
-
-        return null;
-    }
-
-    private static bool TryGetFlatToFlatMaps(RankedShape sourceShape, RankedShape resultShape, int prefixRank, int sourceLane, int resultLane, out AffineViewTransform transform)
+    private static bool TryGetFlatToFlatMaps(RankedShape sourceShape, RankedShape resultShape, int prefixRank, int sourceLane, int resultLane, out BufferViewTransform transform)
     {
         transform = null!;
         if (sourceShape.Rank != prefixRank + 1 ||
@@ -153,7 +229,7 @@ public static class AffineViewUtility
         return false;
     }
 
-    private static bool TryGetSingletonDimensionMaps(RankedShape sourceShape, RankedShape resultShape, int sourceLane, int resultLane, out AffineViewTransform transform)
+    private static bool TryGetSingletonDimensionMaps(RankedShape sourceShape, RankedShape resultShape, int sourceLane, int resultLane, out BufferViewTransform transform)
     {
         transform = null!;
         if (sourceLane != resultLane)
@@ -178,7 +254,7 @@ public static class AffineViewUtility
         return true;
     }
 
-    private static bool TryGetFlatInputToOutputMajorMaps(RankedShape sourceShape, RankedShape resultShape, int prefixRank, int sourceLane, int resultLane, out AffineViewTransform transform)
+    private static bool TryGetFlatInputToOutputMajorMaps(RankedShape sourceShape, RankedShape resultShape, int prefixRank, int sourceLane, int resultLane, out BufferViewTransform transform)
     {
         transform = null!;
         if (sourceShape.Rank != prefixRank + 1 ||
@@ -188,6 +264,17 @@ public static class AffineViewUtility
             GetScalarSuffixElementCount(sourceShape, prefixRank, sourceLane) != GetScalarSuffixElementCount(resultShape, prefixRank, resultLane))
         {
             return false;
+        }
+
+        if (sourceLane == resultLane)
+        {
+            var preciseDomains = F.Affine.Domains(resultShape.Rank);
+            transform = CreateTransform(
+                preciseDomains,
+                BuildFlattenedSuffixRanges(preciseDomains, resultShape, prefixRank),
+                preciseDomains.Select(domain => new AffineRange(domain.Offset, domain.Extent)).ToArray(),
+                resultShape.Dimensions);
+            return true;
         }
 
         var scalarElementsPerResultMajor = ProductFixedSuffix(resultShape, prefixRank + 1) * resultLane;
@@ -205,7 +292,28 @@ public static class AffineViewUtility
         return true;
     }
 
-    private static bool TryGetInputMajorToFlatOutputMaps(RankedShape sourceShape, RankedShape resultShape, int prefixRank, int sourceLane, int resultLane, out AffineViewTransform transform)
+    private static AffineRange[] BuildFlattenedSuffixRanges(AffineDomain[] domains, RankedShape expandedShape, int prefixRank)
+    {
+        var ranges = new AffineRange[prefixRank + 1];
+        for (var axis = 0; axis < prefixRank; axis++)
+        {
+            ranges[axis] = new AffineRange(domains[axis].Offset, domains[axis].Extent);
+        }
+
+        AffineExpr offset = 0;
+        AffineExpr extent = 1;
+        for (var axis = prefixRank; axis < expandedShape.Rank; axis++)
+        {
+            var stride = ProductFixedSuffix(expandedShape, axis + 1);
+            offset += domains[axis].Offset * stride;
+            extent += (domains[axis].Extent - 1) * stride;
+        }
+
+        ranges[prefixRank] = new AffineRange(offset, extent);
+        return ranges;
+    }
+
+    private static bool TryGetInputMajorToFlatOutputMaps(RankedShape sourceShape, RankedShape resultShape, int prefixRank, int sourceLane, int resultLane, out BufferViewTransform transform)
     {
         transform = null!;
         if (sourceShape.Rank <= prefixRank + 1 ||
@@ -232,7 +340,7 @@ public static class AffineViewUtility
         return true;
     }
 
-    private static bool TryGetPrefixFullTileMaps(RankedShape sourceShape, RankedShape resultShape, int prefixRank, int sourceLane, int resultLane, out AffineViewTransform transform)
+    private static bool TryGetPrefixFullTileMaps(RankedShape sourceShape, RankedShape resultShape, int prefixRank, int sourceLane, int resultLane, out BufferViewTransform transform)
     {
         transform = null!;
         if (!HasFixedSuffix(sourceShape, prefixRank) ||
@@ -251,7 +359,7 @@ public static class AffineViewUtility
         return true;
     }
 
-    private static AffineViewTransform CreateTransform(AffineDomain[] domains, AffineRange[] sourceRanges, AffineRange[] resultRanges, ReadOnlySpan<Dimension> domainBounds)
+    private static BufferViewTransform CreateTransform(AffineDomain[] domains, AffineRange[] sourceRanges, AffineRange[] resultRanges, ReadOnlySpan<Dimension> domainBounds)
         => new(
             new AffineMap(domains, default, sourceRanges),
             new AffineMap(domains, default, resultRanges),
@@ -369,7 +477,7 @@ public static class AffineViewUtility
             type.AxisPolicies.All(policy => policy is not SBPSplit split ||
                 split.Axes.All(axis => axis >= 0 && axis < type.Placement.Rank));
 
-    private static bool HaveCompatibleDistributedStorage(IRType sourceType, IRType resultType, AffineViewTransform transform)
+    private static bool HaveCompatibleDistributedStorage(IRType sourceType, IRType resultType, BufferViewTransform transform)
     {
         if (sourceType is not DistributedType source || resultType is not DistributedType result)
         {
@@ -388,8 +496,9 @@ public static class AffineViewUtility
         }
 
         var domainBounds = CompilerServices.GetMaxShape(new RankedShape(transform.DomainBounds.ToArray()));
-        var sourceInverse = AffineUtility.Inverse(transform.SourceMap, domainBounds);
-        var resultInverse = AffineUtility.Inverse(transform.ResultMap, domainBounds);
+        var resultMapIsIdentity = transform.ResultMap.Equals(AffineMap.Identity(transform.ResultMap.Results.Length));
+        var sourceInverse = resultMapIsIdentity ? null : AffineUtility.Inverse(transform.SourceMap, domainBounds);
+        var resultInverse = resultMapIsIdentity ? null : AffineUtility.Inverse(transform.ResultMap, domainBounds);
         var hierarchy = source.Placement.Hierarchy.ToArray();
         var shardCount = checked((int)TensorUtilities.GetProduct(hierarchy));
         for (var linearIndex = 0; linearIndex < shardCount; linearIndex++)
@@ -397,30 +506,21 @@ public static class AffineViewUtility
             var shardIndex = DistributedUtility.GetUnraveledIndex(linearIndex, hierarchy);
             var (sourceOffset, sourceShape) = DistributedUtility.GetLocalOffsetAndShape(source, shardIndex);
             var (resultOffset, resultShape) = DistributedUtility.GetLocalOffsetAndShape(result, shardIndex);
-            var sourceDomain = sourceInverse.Apply(sourceOffset, sourceShape);
-            var resultDomain = resultInverse.Apply(resultOffset, resultShape);
-            if (!AreSameRanges(sourceDomain, resultDomain))
+            if (resultMapIsIdentity)
             {
-                return false;
+                var mappedSource = transform.SourceMap.Apply(resultOffset, resultShape);
+                var expectedSource = sourceOffset.Zip(sourceShape).Select(pair => new TIR.Range(pair.First, pair.Second, 1L)).ToArray();
+                if (!AreSameRanges(mappedSource, expectedSource))
+                {
+                    return false;
+                }
+
+                continue;
             }
-        }
 
-        return true;
-    }
-
-    private static bool CoversShape(AffineMap map, IRArray<Dimension> domainBounds, RankedShape shape)
-    {
-        if (map.Domains.Length != domainBounds.Count || map.Results.Length != shape.Rank)
-        {
-            return false;
-        }
-
-        var domainOffsets = Enumerable.Repeat<Dimension>(Dimension.Zero, domainBounds.Count).ToArray();
-        var ranges = map.Apply(domainOffsets, domainBounds.ToArray());
-        for (var axis = 0; axis < ranges.Length; axis++)
-        {
-            if (!ranges[axis].Start.Simplify().Equals(Dimension.Zero) ||
-                !ranges[axis].Stop.Simplify().Equals(shape[axis].Simplify()))
+            var sourceDomain = sourceInverse!.Apply(sourceOffset, sourceShape);
+            var resultDomain = resultInverse!.Apply(resultOffset, resultShape);
+            if (!AreSameRanges(sourceDomain, resultDomain))
             {
                 return false;
             }
@@ -491,9 +591,43 @@ public static class AffineViewUtility
     private static bool IsSameDimension(Dimension lhs, Dimension rhs)
         => lhs.Equals(rhs) || (lhs is DimConst l && rhs is DimConst r && l.Value == r.Value);
 
+    private static Dimension[] GetDenseStrides(ReadOnlySpan<Dimension> dimensions)
+    {
+        var strides = new Dimension[dimensions.Length];
+        Dimension stride = 1;
+        for (var axis = dimensions.Length - 1; axis >= 0; axis--)
+        {
+            strides[axis] = stride;
+            stride = (stride * dimensions[axis]).Simplify();
+        }
+
+        return strides;
+    }
+
     private static bool HaveSameShape(RankedShape lhs, RankedShape rhs)
         => lhs.Rank == rhs.Rank && lhs.Dimensions.ToArray().Zip(rhs.Dimensions.ToArray()).All(pair => IsSameDimension(pair.First, pair.Second));
 
     private static bool IsUnitDimension(Dimension dimension)
         => dimension is DimConst { Value: 1 };
+
+    private static bool IsDegenerateDimension(Dimension dimension)
+        => IsUnitDimension(dimension) ||
+           (dimension.Metadata.Range is { } range && range.Min >= 0 && range.Max <= 1);
+
+    private static bool IsDegenerateSourceDimension(TIR.Buffer source, int axis)
+    {
+        if (IsDegenerateDimension(source.Dimensions[axis]))
+        {
+            return true;
+        }
+
+        if (source.DistributedType is not { } distributedType ||
+            DistributedUtility.GetDividedTensorType(distributedType).Shape is not RankedShape localShape ||
+            localShape.Rank != source.Rank)
+        {
+            return false;
+        }
+
+        return IsDegenerateDimension(localShape[axis]);
+    }
 }

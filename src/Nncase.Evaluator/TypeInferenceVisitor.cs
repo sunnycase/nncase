@@ -262,6 +262,11 @@ internal sealed partial class TypeInferenceVisitor : ExprVisitor<IRType, Unit>
     {
         VerifySubField(expr, expr.DomainParameter);
 
+        foreach (var domainBound in expr.DomainBounds)
+        {
+            VerifySubField(expr, domainBound);
+        }
+
         foreach (var access in expr.Accesses)
         {
             VerifySubField(expr, access);

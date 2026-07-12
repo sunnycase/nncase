@@ -85,6 +85,30 @@ public sealed class GridAccess : Expr
     public AffineMap AffineMap => Region as Nncase.IR.Affine.AffineMap
         ?? throw new InvalidOperationException("Opaque grid access does not have an affine map.");
 
+    /// <summary>
+    /// Gets the local parameter type used to bind a value at a grid access.
+    /// </summary>
+    public static IRType GetParameterType(IRType type, GridBindingMode bindingMode)
+    {
+        if (bindingMode == GridBindingMode.Root)
+        {
+            return type switch
+            {
+                DistributedType distributedType => distributedType.TensorType,
+                _ => type,
+            };
+        }
+
+        return type switch
+        {
+            TensorType { DType: ReferenceType } tensorType => tensorType,
+            TensorType tensorType => new TensorType(tensorType.DType, Shape.Unknown(tensorType.Shape.Rank)),
+            DistributedType { TensorType.DType: ReferenceType } distributedType => distributedType.TensorType,
+            DistributedType distributedType => new TensorType(distributedType.TensorType.DType, Shape.Unknown(distributedType.TensorType.Shape.Rank)),
+            _ => type,
+        };
+    }
+
     public override TExprResult Accept<TExprResult, TTypeResult, TContext>(ExprFunctor<TExprResult, TTypeResult, TContext> functor, TContext context)
         => functor.VisitGridAccess(this, context);
 

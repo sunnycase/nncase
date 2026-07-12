@@ -6,22 +6,22 @@ namespace Nncase.IR.Affine;
 /// <summary>
 /// Describes two tensor index spaces over one common affine domain.
 /// </summary>
-public sealed record AffineViewTransform
+public sealed record BufferViewTransform
 {
     /// <summary>
-    /// Initializes a new instance of the <see cref="AffineViewTransform"/> class.
+    /// Initializes a new instance of the <see cref="BufferViewTransform"/> class.
     /// </summary>
-    public AffineViewTransform(AffineMap sourceMap, AffineMap resultMap, IRArray<Dimension> domainBounds)
+    public BufferViewTransform(AffineMap sourceMap, AffineMap resultMap, IRArray<Dimension> domainBounds)
     {
         if (sourceMap.Domains.Length != resultMap.Domains.Length || sourceMap.Domains.Length != domainBounds.Count)
         {
             throw new ArgumentException(
-                $"Affine view domain mismatch: source={sourceMap.Domains.Length}, result={resultMap.Domains.Length}, bounds={domainBounds.Count}.");
+                $"Buffer view domain mismatch: source={sourceMap.Domains.Length}, result={resultMap.Domains.Length}, bounds={domainBounds.Count}.");
         }
 
         if (sourceMap.Symbols.Length != 0 || resultMap.Symbols.Length != 0)
         {
-            throw new NotSupportedException("Affine views do not support symbolic affine-map parameters.");
+            throw new NotSupportedException("Buffer views do not support symbolic affine-map parameters.");
         }
 
         SourceMap = sourceMap;
@@ -47,30 +47,15 @@ public sealed record AffineViewTransform
     /// <summary>
     /// Creates an identity storage view for a ranked tensor shape.
     /// </summary>
-    public static AffineViewTransform Identity(Shape shape)
+    public static BufferViewTransform Identity(Shape shape)
     {
         if (shape is not RankedShape rankedShape)
         {
-            throw new ArgumentException("Affine views require a ranked shape.", nameof(shape));
+            throw new ArgumentException("Buffer views require a ranked shape.", nameof(shape));
         }
 
         var map = AffineMap.Identity(rankedShape.Rank);
-        return new AffineViewTransform(map, map, new IRArray<Dimension>(rankedShape.Dimensions));
-    }
-
-    /// <summary>
-    /// Composes a result-space access with this view and returns a source-space access.
-    /// </summary>
-    public AffineMap ComposeResultAccess(AffineMap resultAccess)
-    {
-        if (resultAccess.Results.Length != ResultMap.Results.Length)
-        {
-            throw new InvalidOperationException(
-                $"Cannot compose rank-{resultAccess.Results.Length} access with rank-{ResultMap.Results.Length} affine view result.");
-        }
-
-        var bounds = CompilerServices.GetMaxShape(new RankedShape(DomainBounds.ToArray()));
-        return resultAccess * AffineUtility.Inverse(ResultMap, bounds) * SourceMap;
+        return new BufferViewTransform(map, map, new IRArray<Dimension>(rankedShape.Dimensions));
     }
 
     /// <inheritdoc/>

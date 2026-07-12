@@ -63,6 +63,55 @@ public static class ISLUtility
         return new Isl.set(Isl.ctx.Current, $"[{string.Join(',', parameters)}] -> {{ [{string.Join(',', dims)}] : {string.Join(" and ", constraints)} }}");
     }
 
+    /// <summary>
+    /// Converts arbitrary dimension expressions to an ISL domain by representing each
+    /// dynamic extent with a caller-provided shared parameter name.
+    /// </summary>
+    public static Isl.set ToSymbolicDomain(
+        Shape shape,
+        IReadOnlyDictionary<Dimension, string> parameterNames,
+        out Dictionary<string, Dimension> parameterMap)
+    {
+        parameterMap = new Dictionary<string, Dimension>();
+        var dims = new List<string>();
+        var parameters = new List<string>();
+        var constraints = new List<string>();
+        for (var axis = 0; axis < shape.Rank; axis++)
+        {
+            var indexName = $"d{axis}";
+            dims.Add(indexName);
+            var dimension = shape[axis];
+            if (dimension is DimConst fixedDimension)
+            {
+                constraints.Add($"0 <= {indexName} < {fixedDimension.Value}");
+                continue;
+            }
+
+            var range = dimension.Metadata.Range
+                ?? throw new InvalidOperationException($"Dynamic affine domain dimension {dimension} does not have a finite range.");
+            var min = GetIntegerDimensionBound(range.Min, dimension);
+            var max = GetIntegerDimensionBound(range.Max, dimension);
+            if (!parameterNames.TryGetValue(dimension, out var parameterName))
+            {
+                throw new InvalidOperationException($"Dynamic affine domain dimension {dimension} does not have a shared parameter name.");
+            }
+
+            if (!parameterMap.ContainsKey(parameterName))
+            {
+                parameters.Add(parameterName);
+                parameterMap.Add(parameterName, dimension);
+            }
+
+            constraints.Add($"{min} <= {parameterName} <= {max}");
+            constraints.Add($"0 <= {indexName} < {parameterName}");
+        }
+
+        var condition = constraints.Count == 0 ? string.Empty : $" : {string.Join(" and ", constraints)}";
+        return new Isl.set(
+            Isl.ctx.Current,
+            $"[{string.Join(',', parameters)}] -> {{ [{string.Join(',', dims)}]{condition} }}");
+    }
+
     public static Dimension ToDimension(this Isl.pw_aff pa, IReadOnlyDictionary<string, Dimension> feedDict, string[]? dimNames = null)
     {
         var build = Isl.ast_build.from_context(dimNames is not null ? new Isl.set(Isl.ctx.Current, $"{{ [{string.Join(',', dimNames)}] }}") : pa.domain_space().universe_set());
@@ -157,11 +206,14 @@ internal sealed class AstExprToExprConverter
                 Isl.ast_expr_op_type.sub => Visit(astExpr.op_arg(0)) - Visit(astExpr.op_arg(1)),
                 Isl.ast_expr_op_type.mul => Visit(astExpr.op_arg(0)) * Visit(astExpr.op_arg(1)),
                 Isl.ast_expr_op_type.div => Visit(astExpr.op_arg(0)) / Visit(astExpr.op_arg(1)),
+                Isl.ast_expr_op_type.fdiv_q => Visit(astExpr.op_arg(0)) / Visit(astExpr.op_arg(1)),
                 Isl.ast_expr_op_type.pdiv_q => Visit(astExpr.op_arg(0)) / Visit(astExpr.op_arg(1)),
                 Isl.ast_expr_op_type.select => VisitSelect(astExpr),
                 Isl.ast_expr_op_type.min => Dimension.Min(Visit(astExpr.op_arg(0)), Visit(astExpr.op_arg(1))),
+                Isl.ast_expr_op_type.max => Dimension.Max(Visit(astExpr.op_arg(0)), Visit(astExpr.op_arg(1))),
                 Isl.ast_expr_op_type.minus => -Visit(astExpr.op_arg(0)),
                 Isl.ast_expr_op_type.pdiv_r => Visit(astExpr.op_arg(0)) % Visit(astExpr.op_arg(1)),
+                Isl.ast_expr_op_type.zdiv_r => Visit(astExpr.op_arg(0)) % Visit(astExpr.op_arg(1)),
                 _ => throw new NotSupportedException($"Unsupported expr op type: {astExpr.op_type()}"),
             },
             _ => throw new NotSupportedException($"Unsupported expr type: {astExpr.type()}"),
@@ -170,17 +222,32 @@ internal sealed class AstExprToExprConverter
 
     private Dimension VisitSelect(Isl.ast_expr select)
     {
-        var cond = select.op_arg(0);
+        return VisitCondition(
+            select.op_arg(0),
+            Visit(select.op_arg(1)),
+            Visit(select.op_arg(2)));
+    }
+
+    private Dimension VisitCondition(Isl.ast_expr cond, Dimension trueValue, Dimension falseValue)
+    {
         return cond.type() switch
         {
-            Isl.ast_expr_type.int_ => Visit(cond),
+            Isl.ast_expr_type.int_ => cond.val().num_si() != 0 ? trueValue : falseValue,
             Isl.ast_expr_type.op => cond.op_type() switch
             {
-                Isl.ast_expr_op_type.eq => Dimension.Select(Visit(cond.op_arg(0)), Visit(cond.op_arg(1)), Visit(select.op_arg(1)), Visit(select.op_arg(2)), CompareOp.Equal),
-                Isl.ast_expr_op_type.le => Dimension.Select(Visit(cond.op_arg(0)), Visit(cond.op_arg(1)), Visit(select.op_arg(1)), Visit(select.op_arg(2)), CompareOp.LowerOrEqual),
-                Isl.ast_expr_op_type.lt => Dimension.Select(Visit(cond.op_arg(0)), Visit(cond.op_arg(1)), Visit(select.op_arg(1)), Visit(select.op_arg(2)), CompareOp.LowerThan),
-                Isl.ast_expr_op_type.ge => Dimension.Select(Visit(cond.op_arg(0)), Visit(cond.op_arg(1)), Visit(select.op_arg(1)), Visit(select.op_arg(2)), CompareOp.GreaterOrEqual),
-                Isl.ast_expr_op_type.gt => Dimension.Select(Visit(cond.op_arg(0)), Visit(cond.op_arg(1)), Visit(select.op_arg(1)), Visit(select.op_arg(2)), CompareOp.GreaterThan),
+                Isl.ast_expr_op_type.eq => Dimension.Select(Visit(cond.op_arg(0)), Visit(cond.op_arg(1)), trueValue, falseValue, CompareOp.Equal),
+                Isl.ast_expr_op_type.le => Dimension.Select(Visit(cond.op_arg(0)), Visit(cond.op_arg(1)), trueValue, falseValue, CompareOp.LowerOrEqual),
+                Isl.ast_expr_op_type.lt => Dimension.Select(Visit(cond.op_arg(0)), Visit(cond.op_arg(1)), trueValue, falseValue, CompareOp.LowerThan),
+                Isl.ast_expr_op_type.ge => Dimension.Select(Visit(cond.op_arg(0)), Visit(cond.op_arg(1)), trueValue, falseValue, CompareOp.GreaterOrEqual),
+                Isl.ast_expr_op_type.gt => Dimension.Select(Visit(cond.op_arg(0)), Visit(cond.op_arg(1)), trueValue, falseValue, CompareOp.GreaterThan),
+                Isl.ast_expr_op_type.and or Isl.ast_expr_op_type.and_then => VisitCondition(
+                    cond.op_arg(0),
+                    VisitCondition(cond.op_arg(1), trueValue, falseValue),
+                    falseValue),
+                Isl.ast_expr_op_type.or or Isl.ast_expr_op_type.or_else => VisitCondition(
+                    cond.op_arg(0),
+                    trueValue,
+                    VisitCondition(cond.op_arg(1), trueValue, falseValue)),
                 _ => throw new NotSupportedException($"Unsupported select condition op type: {cond.op_type()}"),
             },
             _ => throw new NotSupportedException($"Unsupported select condition type: {cond.type()}"),

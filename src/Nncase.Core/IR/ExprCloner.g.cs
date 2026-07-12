@@ -1131,6 +1131,11 @@ public partial class ExprCloner<TContext>
                 return true;
             }
 
+            if (IsMutatedArray(expr.DomainBounds, context))
+            {
+                return true;
+            }
+
             if (IsMutatedArray(expr.Accesses, context))
             {
                 return true;
@@ -1148,6 +1153,7 @@ public partial class ExprCloner<TContext>
         {
             return expr.With(
                 domainParameter: Clone(expr.DomainParameter, context),
+                domainBounds: CloneArray(expr.DomainBounds, context),
                 accesses: CloneArray(expr.Accesses, context),
                 body: Clone(expr.Body, context)
             );

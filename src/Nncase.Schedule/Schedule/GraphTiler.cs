@@ -42,6 +42,11 @@ public sealed class GraphTiler
 
         bool RequiresLocalAllocation(BufferIdentity bid)
         {
+            if (bid.IsOutput && bid.Node.TryGetAliasSourceAccess(bid.Index, out _))
+            {
+                return false;
+            }
+
             var isExternal = externalInputs.Contains(bid) || externalOutputs.Contains(bid);
             return !isExternal || (!targetOptions.UnifiedMemoryArch && bid.Access.BindingMode != GridBindingMode.Root);
         }
@@ -123,7 +128,7 @@ public sealed class GraphTiler
                     endTime = Math.Max(endTime, bufferInfo.Liveness[ci].Item2);
 
                     extents.Add(solver.MakeProd(bufferInfo.Places[ci][sl], bufferInfo.Sizes[ci]));
-                    if (!IsObjectBuffer(nodeBuffer.Id))
+                    if (!IsObjectBuffer(nodeBuffer.Id) && !nodeBuffer.Id.Node.TryGetAliasSourceAccess(nodeBuffer.Id.Index, out _))
                     {
                         var cons = solver.MakeGreater(bufferInfo.Sizes[ci], 0);
                         solver.Add(cons);
@@ -353,7 +358,7 @@ public sealed class GraphTiler
         var totalCycles = overlappedCycles + synchronizationCycles;
 
         var totalCyclesVar = totalCycles.Var();
-        totalCyclesVar.SetRange(1, long.MaxValue / memReadBandWidths[0]); /* avoid crash. */
+        totalCyclesVar.SetRange(0, long.MaxValue / memReadBandWidths[0]); /* avoid crash. */
         var objectiveMonitor = solver.MakeMinimize(totalCyclesVar, 1);
         var collector = solver.MakeNBestValueSolutionCollector(5, false);
         collector.AddObjective(totalCyclesVar);
@@ -629,6 +634,20 @@ public sealed class GraphTiler
         long objectValue = 0;
         foreach (var (primGraph, i) in condensedGraph.TopologicalSort().Select((s, i) => (s, i)))
         {
+            if (IsAliasOnlyComponent(primGraph))
+            {
+                var (aliasInputBids, aliasOutputBids) = bufferGraphMemo[primGraph].GetInputsOutputs(bufferGraphMemo[rootGraph]);
+                var orderedAliasInputs = OrderBufferIdentities(aliasInputBids);
+                var orderedAliasOutputs = OrderBufferIdentities(aliasOutputBids);
+                var residualOutputs = CreateResidualAliasOutputs(orderedAliasInputs, orderedAliasOutputs, argumentMemo);
+                BindComponentOutputs(
+                    orderedAliasOutputs,
+                    residualOutputs,
+                    bufferGraphMemo[rootGraph],
+                    argumentMemo);
+                continue;
+            }
+
             var funcName = CompileSessionScope.GetCurrentThrowIfNull().GetRequiredService<INamingProvider>().GetName("device_func");
             using var subSubScope = new Diagnostics.DumpScope(funcName, Diagnostics.DumpFlags.Tiling);
             var primTree = treeGraphMemo[primGraph];
@@ -641,9 +660,6 @@ public sealed class GraphTiler
                 (inputBids, outputBids) = (result.Inputs, result.Outputs);
                 var inputBidsOrdered = OrderBufferIdentities(inputBids);
                 var outputBidsOrdered = OrderBufferIdentities(outputBids);
-                var callerAllocatedOutputBids = outputBidsOrdered
-                    .Where(bid => !result.OutputAliases.ContainsKey(bid))
-                    .ToArray();
                 var maxAlign = result.ScheduleBuffers();
                 var bodyBuilder = T.Sequential();
                 var initOffsets = Enumerable.Repeat(new DimConst(0), primTree.DomainBoundExprs.Length).ToArray();
@@ -651,12 +667,12 @@ public sealed class GraphTiler
                 result.Visit(primTree, new(bodyBuilder, initOffsets, initBounds));
                 var parameters = inputBidsOrdered.Select(k => result.InputOutputVars[k]).Concat(
                     dynamicDimVars.Select(v => (IVar)v.With())).Concat(
-                    callerAllocatedOutputBids.Select(k => result.InputOutputVars[k])).ToArray();
+                    result.OutputParameters).ToArray();
                 var primFunc = new PrimFunction(
                     funcName,
                     moduleKind,
                     bodyBuilder.Build(),
-                    new Return(outputBidsOrdered.Select(bid => (Expr)result.InputOutputVars[bid]).ToArray()),
+                    new Return(outputBidsOrdered.Select(bid => result.OutputValues[bid]).ToArray()),
                     parameters);
                 {
                     // note noneed to rewrite shapeof, because we don't use shapeof new.
@@ -667,7 +683,16 @@ public sealed class GraphTiler
 
                 primFunc.SchedResult.IsScheduled = true; // avoid buffersize pass schedule it again.
                 primFunc.SchedResult.DataAlign = (ulong)maxAlign;
-                tiled = new(new PrimFunctionWrapper(primFunc, inputBidsOrdered.Length + dynamicDimVars.Length, inputBidsOrdered.Select(bid => bid.Node.Grid.GetArgument(bid.Index).CheckedType).Concat(dynamicDimVars.Select(v => new DimensionType(DimensionKind.Dynamic))).Concat(callerAllocatedOutputBids.Select(bid => bid.Node.Grid.GetArgument(bid.Index).CheckedType)).ToArray()), result.ObjectiveValue);
+                var typeHints = inputBidsOrdered.Select(bid => bid.Node.Grid.GetArgument(bid.Index).CheckedType)
+                    .Concat(dynamicDimVars.Select(v => new DimensionType(DimensionKind.Dynamic)))
+                    .Concat(result.OutputParameters.Select(parameter => parameter.CheckedType))
+                    .ToArray();
+                tiled = new(
+                    new PrimFunctionWrapper(
+                        primFunc,
+                        inputBidsOrdered.Length + dynamicDimVars.Length,
+                        typeHints),
+                    result.ObjectiveValue);
                 SolveMemo.Add(primTree, tiled);
             }
             else
@@ -679,34 +704,14 @@ public sealed class GraphTiler
             var orderedOutputBids = OrderBufferIdentities(outputBids);
             objectValue += tiled.ObjectValue;
             var finalCall = new Call(tiled.Func, orderedInputBids.Select(bid => argumentMemo[bid]).Concat(dynamicDimVars.OfType<BaseExpr>()).ToArray());
-
-            // save the output.
-            foreach (var (outputBid, outputIndex) in orderedOutputBids.Select((b, i) => (b, i)))
-            {
-                if (!argumentMemo.TryGetValue(outputBid, out var _))
-                {
-                    var outputExpr = finalCall;
-
-                    // process the tuple output.
-                    if (orderedOutputBids.Length > 1)
-                    {
-                        outputExpr = IR.F.Tensors.GetItem(outputExpr, outputIndex);
-                    }
-
-                    argumentMemo.Add(outputBid, outputExpr);
-
-                    // other prim graph's argument requires input bid, so we need to find it.
-                    foreach (var sinkBid in bufferGraphMemo[rootGraph].OutEdges(outputBid).
-                        Where(e => e.Tag is BufferEdgeKind.Inter).
-                        Select(edge => edge.Target))
-                    {
-                        if (!argumentMemo.ContainsKey(sinkBid))
-                        {
-                            argumentMemo.Add(sinkBid, outputExpr);
-                        }
-                    }
-                }
-            }
+            var componentOutputs = orderedOutputBids.Length == 1
+                ? new Expr[] { finalCall }
+                : orderedOutputBids.Select((_, outputIndex) => IR.F.Tensors.GetItem(finalCall, outputIndex)).ToArray();
+            BindComponentOutputs(
+                orderedOutputBids,
+                componentOutputs,
+                bufferGraphMemo[rootGraph],
+                argumentMemo);
         }
 
         return (argumentMemo, objectValue);
@@ -805,6 +810,93 @@ public sealed class GraphTiler
 #endif
     }
 
+    private static bool IsAliasOnlyComponent(TieredTileGraph graph)
+    {
+        var vertices = graph.Vertices.ToArray();
+        return vertices.Length != 0 && vertices.All(vertex => vertex.IsPureBufferView);
+    }
+
+    private static Expr[] CreateResidualAliasOutputs(
+        IReadOnlyList<BufferIdentity> inputBids,
+        IReadOnlyList<BufferIdentity> outputBids,
+        IReadOnlyDictionary<BufferIdentity, Expr> argumentMemo)
+    {
+        var inputReplacements = new Dictionary<BaseExpr, BaseExpr>(ReferenceEqualityComparer.Instance);
+        foreach (var inputBid in inputBids)
+        {
+            if (!argumentMemo.TryGetValue(inputBid, out var selectedInput))
+            {
+                throw new InvalidOperationException($"Residual buffer alias input {inputBid} has no selected producer value.");
+            }
+
+            var sourceValue = inputBid.Node.Grid.GetArgument(inputBid.Index);
+            if (inputReplacements.TryGetValue(sourceValue, out var existing) && !ReferenceEquals(existing, selectedInput))
+            {
+                throw new InvalidOperationException(
+                    $"Residual buffer alias source {sourceValue} resolves to multiple selected values.");
+            }
+
+            inputReplacements[sourceValue] = selectedInput;
+        }
+
+        var originalOutputs = outputBids.Select(GetBufferOutputExpression).ToArray();
+        BaseExpr originalResult = originalOutputs.Length == 1
+            ? originalOutputs[0]
+            : new IR.Tuple(originalOutputs);
+        var residualCloner = new ReplacingExprCloner(inputReplacements)
+        {
+            CloneUnmutated = false,
+        };
+        var residualResult = residualCloner.Clone(originalResult, Unit.Default);
+        return residualResult is IR.Tuple tuple
+            ? tuple.Fields.AsValueEnumerable().Select(field => (Expr)field).ToArray()
+            : [(Expr)residualResult];
+    }
+
+    private static Expr GetBufferOutputExpression(BufferIdentity outputBid)
+    {
+        if (!outputBid.IsOutput)
+        {
+            throw new ArgumentException($"Expected an output buffer identity, got {outputBid}.", nameof(outputBid));
+        }
+
+        var grid = outputBid.Node.Grid;
+        return grid.Accesses.ToArray().Count(access => access.IsWrite) == 1
+            ? grid
+            : IR.F.Tensors.GetItem(grid, outputBid.OutputIndex);
+    }
+
+    private static void BindComponentOutputs(
+        IReadOnlyList<BufferIdentity> outputBids,
+        IReadOnlyList<Expr> outputValues,
+        BufferGraph rootBufferGraph,
+        Dictionary<BufferIdentity, Expr> argumentMemo)
+    {
+        if (outputBids.Count != outputValues.Count)
+        {
+            throw new ArgumentException(
+                $"Component output count mismatch: buffers={outputBids.Count}, values={outputValues.Count}.");
+        }
+
+        for (var outputIndex = 0; outputIndex < outputBids.Count; outputIndex++)
+        {
+            var outputBid = outputBids[outputIndex];
+            if (argumentMemo.ContainsKey(outputBid))
+            {
+                continue;
+            }
+
+            var outputValue = outputValues[outputIndex];
+            argumentMemo.Add(outputBid, outputValue);
+            foreach (var sinkBid in rootBufferGraph.OutEdges(outputBid)
+                .Where(edge => edge.Tag is BufferEdgeKind.Inter)
+                .Select(edge => edge.Target))
+            {
+                argumentMemo.TryAdd(sinkBid, outputValue);
+            }
+        }
+    }
+
     private static BufferIdentity[] OrderBufferIdentities(IEnumerable<BufferIdentity> identities)
         => identities
             .OrderBy(identity => identity.Node.OpId)
@@ -866,6 +958,11 @@ public sealed class GraphTiler
         var fullBufferShapes = context.BufferShapes
             .Select(shape => shape.Select(dimension => (IntExpr)solver.MakeIntConst(dimension)).ToArray())
             .ToArray();
+        if (workload is BufferAliasTileWorkload)
+        {
+            return solver.MakeIntConst(0);
+        }
+
         if (workload is ElementwiseTileWorkload elementwise)
         {
             var elementwiseWork = elementwise.GetWork(fullBufferShapes, solver, context);

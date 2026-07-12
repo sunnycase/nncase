@@ -71,9 +71,16 @@ public sealed class OpNode : ITreeNode
 
     public ImmutableArray<MemoryEffect> LocalAccessEffects => _wrapped.LocalAccessEffects;
 
+    public ImmutableArray<GridBufferAlias> BufferAliases => _wrapped.BufferAliases;
+
+    public bool IsPureBufferView => _wrapped.IsPureBufferView;
+
     public ImmutableArray<int> ReadAccessIndices => _wrapped.ReadAccessIndices;
 
     public ImmutableArray<int> WriteAccessIndices => _wrapped.WriteAccessIndices;
+
+    public bool TryGetAliasSourceAccess(int resultAccessIndex, out int sourceAccessIndex)
+        => _wrapped.TryGetAliasSourceAccess(resultAccessIndex, out sourceAccessIndex);
 
     public AffineMap GetAccessMap(int accessIndex) => _wrapped.GetAccessMap(accessIndex);
 

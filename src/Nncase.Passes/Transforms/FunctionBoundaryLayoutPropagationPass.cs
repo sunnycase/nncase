@@ -8,7 +8,6 @@ using System.Reactive;
 using System.Threading.Tasks;
 using Google.OrTools.Sat;
 using Nncase.IR;
-using Nncase.IR.Affine;
 using Nncase.IR.Distributed;
 using Nncase.IR.Tensors;
 
@@ -41,11 +40,11 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
     /// <inheritdoc/>
     protected override Task<IRModule> RunCoreAsync(IRModule input, RunPassContext context)
     {
-        var supportsConstAffineView = CompileSession.CompileOptions.TargetOptions is INTTTargetOptions targetOptions
-            && Nncase.Passes.Distributed.AutoDistributedRewriter.SupportsConstAffineView(targetOptions);
+        var supportsConstShardedView = CompileSession.CompileOptions.TargetOptions is INTTTargetOptions targetOptions
+            && Nncase.Passes.Distributed.AutoDistributedRewriter.SupportsConstShardedView(targetOptions);
         for (int iteration = 0; iteration < MaxPlanningIterations; iteration++)
         {
-            var specializer = new FunctionLayoutSpecializer(input, supportsConstAffineView);
+            var specializer = new FunctionLayoutSpecializer(input, supportsConstShardedView);
             var enableCallerOutputDemandLayouts = _enableCallerOutputDemandLayouts && iteration == 0;
             var selectedLayouts = ModuleLayoutPlanner.Plan(input, specializer, enableCallerOutputDemandLayouts);
             if (selectedLayouts.Count == 0)
@@ -60,7 +59,7 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
                 var rewriteTarget = selectedLayouts.TryGetValue(function, out var selectedLayout)
                     ? specializer.GetOrCreate(function, selectedLayout)
                     : function;
-                var rewriter = new CallBoundaryLayoutRewriter(selectedLayouts, specializer, supportsConstAffineView);
+                var rewriter = new CallBoundaryLayoutRewriter(selectedLayouts, specializer, supportsConstShardedView);
                 rewriter.Rewrite(rewriteTarget);
                 if (rewriter.IsMutated)
                 {
@@ -189,9 +188,9 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
         }
     }
 
-    private static BaseExpr MakeBoundaryTransform(Expr input, BoundaryTransform transform, bool supportsConstAffineView)
+    private static BaseExpr MakeBoundaryTransform(Expr input, BoundaryTransform transform, bool supportsConstShardedView)
     {
-        var expr = transform.Apply(input, supportsConstAffineView);
+        var expr = transform.Apply(input, supportsConstShardedView);
         Infer(expr, $"{transform.Kind} inserted at function boundary");
         return expr;
     }
@@ -446,17 +445,17 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
     {
         private readonly IReadOnlyDictionary<Function, FunctionBoundaryLayout> _layouts;
         private readonly FunctionLayoutSpecializer _specializer;
-        private readonly bool _supportsConstAffineView;
+        private readonly bool _supportsConstShardedView;
 
         public CallBoundaryLayoutRewriter(
             IReadOnlyDictionary<Function, FunctionBoundaryLayout> layouts,
             FunctionLayoutSpecializer specializer,
-            bool supportsConstAffineView)
+            bool supportsConstShardedView)
             : base(visitOtherFunctions: false)
         {
             _layouts = layouts;
             _specializer = specializer;
-            _supportsConstAffineView = supportsConstAffineView;
+            _supportsConstShardedView = supportsConstShardedView;
         }
 
         protected override BaseExpr RewriteLeafCall(Call expr)
@@ -496,7 +495,7 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
                     throw new InvalidOperationException($"Cannot pack non-expression argument {i} for call to {function.Name}.");
                 }
 
-                args[i] = MakeBoundaryTransform(argExpr, inputLayout.Transform, _supportsConstAffineView);
+                args[i] = MakeBoundaryTransform(argExpr, inputLayout.Transform, _supportsConstShardedView);
             }
 
             var rawCall = expr.With(target: target, arguments: args);
@@ -539,7 +538,7 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
             if (rawCall.CheckedType is not TupleType)
             {
                 var outputLayout = layout.Outputs[0] ?? throw new InvalidOperationException("Single-output call has no output layout to wrap.");
-                return MakeBoundaryTransform(rawCall, outputLayout.Transform, _supportsConstAffineView);
+                return MakeBoundaryTransform(rawCall, outputLayout.Transform, _supportsConstShardedView);
             }
 
             var fields = new BaseExpr[layout.Outputs.Length];
@@ -554,7 +553,7 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
                         throw new InvalidOperationException($"Cannot unpack non-expression output {i} from call to {rawCall.Target}.");
                     }
 
-                    field = MakeBoundaryTransform(fieldExpr, outputLayout.Transform, _supportsConstAffineView);
+                    field = MakeBoundaryTransform(fieldExpr, outputLayout.Transform, _supportsConstShardedView);
                 }
 
                 fields[i] = field;
@@ -569,13 +568,13 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
     private sealed class FunctionLayoutSpecializer
     {
         private readonly IRModule _module;
-        private readonly bool _supportsConstAffineView;
+        private readonly bool _supportsConstShardedView;
         private readonly Dictionary<Function, Dictionary<FunctionBoundaryLayout, Function>> _cache = new(ReferenceEqualityComparer.Instance);
 
-        public FunctionLayoutSpecializer(IRModule module, bool supportsConstAffineView)
+        public FunctionLayoutSpecializer(IRModule module, bool supportsConstShardedView)
         {
             _module = module;
-            _supportsConstAffineView = supportsConstAffineView;
+            _supportsConstShardedView = supportsConstShardedView;
         }
 
         public bool HasReplacements => _cache.Count != 0;
@@ -653,7 +652,7 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
                 }
             }
 
-            var cloner = new SpecializedBodyCloner(mappedParameters, packedInputs, _supportsConstAffineView);
+            var cloner = new SpecializedBodyCloner(mappedParameters, packedInputs, _supportsConstShardedView);
             var body = CloneBodyWithPackedOutputs(function.Body, layout, cloner);
             var varMap = RewriteVarMap(function.VarMap, mappedParameters);
             var specialized = new Function(function.Name, function.ModuleKind, body, specializedParameters, varMap);
@@ -684,7 +683,7 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
                         throw new InvalidOperationException($"Cannot apply output source transform {sourceTransform} to non-expression output.");
                     }
 
-                    source = sourceTransform.Apply(sourceExpr, _supportsConstAffineView);
+                    source = sourceTransform.Apply(sourceExpr, _supportsConstShardedView);
                     Infer(source, $"output source transform {sourceTransform}");
                     if (!Equals(source.CheckedType, outputLayout.TransformedType))
                     {
@@ -744,14 +743,14 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
     {
         private readonly IReadOnlyDictionary<Var, Var> _mappedParameters;
         private readonly Dictionary<Var, PortLayout> _packedInputs;
-        private readonly bool _supportsConstAffineView;
+        private readonly bool _supportsConstShardedView;
 
-        public SpecializedBodyCloner(IReadOnlyDictionary<Var, Var> mappedParameters, Dictionary<Var, PortLayout> packedInputs, bool supportsConstAffineView)
+        public SpecializedBodyCloner(IReadOnlyDictionary<Var, Var> mappedParameters, Dictionary<Var, PortLayout> packedInputs, bool supportsConstShardedView)
             : base(cloneOtherFunctions: false)
         {
             _mappedParameters = mappedParameters;
             _packedInputs = packedInputs;
-            _supportsConstAffineView = supportsConstAffineView;
+            _supportsConstShardedView = supportsConstShardedView;
         }
 
         protected override BaseExpr DispatchVisit(BaseExpr expr, Unit context)
@@ -769,7 +768,7 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
                 if (inputLayout.Transform.IsDistributedBoxing
                     && transform.IsDistributedBoxing)
                 {
-                    return MakeBoundaryTransform(_mappedParameters[parameter], transform, _supportsConstAffineView);
+                    return MakeBoundaryTransform(_mappedParameters[parameter], transform, _supportsConstShardedView);
                 }
             }
 
@@ -1138,7 +1137,7 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
             return false;
         }
 
-        public BaseExpr Apply(Expr input, bool supportsConstAffineView)
+        public BaseExpr Apply(Expr input, bool supportsConstShardedView)
         {
             if (Kind is BoundaryTransformKind.Boxing)
             {
@@ -1148,15 +1147,9 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
                     return input;
                 }
 
-                if (supportsConstAffineView && input is TensorConst && targetType is DistributedType distributedType)
+                if (supportsConstShardedView && input is TensorConst && targetType is DistributedType distributedType)
                 {
-                    if (!AffineViewUtility.TryCreate(input.CheckedType, distributedType, out var transform))
-                    {
-                        throw new InvalidOperationException(
-                            $"Constant boundary view from {input.CheckedType} to {distributedType} is not storage preserving.");
-                    }
-
-                    return IR.F.Affine.View(input, distributedType, transform);
+                    return IR.F.Distributed.ShardedView(input, distributedType);
                 }
             }
 

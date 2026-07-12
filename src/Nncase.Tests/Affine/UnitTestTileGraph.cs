@@ -86,29 +86,87 @@ public sealed class UnitTestTileGraph : TestClassBase
         var function = new Function("main", Targets.CPUTarget.Kind, reshape, [input]);
 
         var post = Assert.IsType<Function>(new NTTAffineSelectionPass(CompileOptions).RunAsync(function, new()).Result);
-        var viewCall = Assert.IsType<Call>(post.Body);
-        var view = Assert.IsType<IR.Affine.AffineView>(viewCall.Target);
-        Assert.Same(input, viewCall.Arguments[IR.Affine.AffineView.Input.Index]);
-        Assert.Equal(vectorType, viewCall.CheckedDataType);
-        Assert.Equal(input.CheckedShape.Rank, view.Transform.SourceMap.Results.Length);
-        Assert.Equal(viewCall.CheckedShape.Rank, view.Transform.ResultMap.Results.Length);
+        var view = Assert.IsType<IR.Affine.Grid>(post.Body);
+        Assert.Same(input, view.Accesses[0].Value);
+        Assert.Equal(vectorType, view.CheckedDataType);
+        Assert.Equal(input.CheckedShape.Rank, view.Accesses[0].AffineMap.Results.Length);
+        Assert.Equal(view.CheckedShape.Rank, view.Accesses[1].AffineMap.Results.Length);
+        Assert.IsType<TIR.NTT.Reshape>(Assert.IsType<Call>(view.Body[0]).Target);
     }
 
     [Fact]
-    public void TestBitcastAffineSelectionUsesZeroCopyAffineView()
+    public void TestBitcastAffineSelectionUsesZeroCopyBufferAliasGrid()
     {
         var input = new Var("input", new TensorType(new VectorType(DataTypes.BFloat16, [8]), new[] { 20, 128 }));
         var bitcast = IR.F.Tensors.Bitcast(input, DataTypes.BFloat16);
         var function = new Function("main", Targets.CPUTarget.Kind, bitcast, [input]);
 
         var post = Assert.IsType<Function>(new NTTAffineSelectionPass(CompileOptions).RunAsync(function, new()).Result);
-        var viewCall = Assert.IsType<Call>(post.Body);
-        var view = Assert.IsType<IR.Affine.AffineView>(viewCall.Target);
-        Assert.Same(input, viewCall.Arguments[IR.Affine.AffineView.Input.Index]);
+        var view = Assert.IsType<IR.Affine.Grid>(post.Body);
+        Assert.Same(input, view.Accesses[0].Value);
         Assert.Equal(new VectorType(DataTypes.BFloat16, [8]), input.CheckedDataType);
-        Assert.Equal(DataTypes.BFloat16, viewCall.CheckedDataType);
-        Assert.Equal(input.CheckedShape.Rank, view.Transform.SourceMap.Results.Length);
-        Assert.Equal(viewCall.CheckedShape.Rank, view.Transform.ResultMap.Results.Length);
+        Assert.Equal(DataTypes.BFloat16, view.CheckedDataType);
+        Assert.Equal(input.CheckedShape.Rank, view.Accesses[0].AffineMap.Results.Length);
+        Assert.Equal(view.CheckedShape.Rank, view.Accesses[1].AffineMap.Results.Length);
+        Assert.IsType<TIR.NTT.Bitcast>(Assert.IsType<Call>(view.Body[0]).Target);
+    }
+
+    [Fact]
+    public void TestNestedPrimFunctionPropagatesBufferAliasSummary()
+    {
+        var input = new Var("input", new TensorType(DataTypes.Float32, new[] { 4, 4 }));
+        var function = new Function(
+            "main",
+            Targets.CPUTarget.Kind,
+            IR.F.Tensors.Reshape(input, new Dimension[] { 2, 8 }),
+            [input]);
+        var selected = Assert.IsType<Function>(new NTTAffineSelectionPass(CompileOptions).RunAsync(function, new()).Result);
+        var view = Assert.IsType<IR.Affine.Grid>(selected.Body);
+        var nestedInput = new Var("nested_input", view.Accesses[0].Parameter.CheckedType);
+        var nestedOutput = new Var("nested_output", view.Accesses[1].Parameter.CheckedType);
+        var nested = new TIR.PrimFunction(
+            "nested_view",
+            Targets.CPUTarget.Kind,
+            new TIR.Sequential(TIR.F.NTT.Reshape(nestedInput, nestedOutput)),
+            new IVar[] { nestedInput, nestedOutput });
+        var nestedView = view.With(
+            body: new TIR.Sequential(
+                TIR.T.Nop(),
+                new Call(nested, view.Accesses[0].Parameter, view.Accesses[1].Parameter)));
+
+        var graph = TieredTileGraphBuilder.Build(nestedView, 1, out _);
+
+        Assert.True(Assert.Single(graph.Vertices).IsPureBufferView);
+    }
+
+    [Fact]
+    public void TestSharedBufferViewFusionIsPerUse()
+    {
+        var input = new Var("input", new TensorType(DataTypes.Float32, new[] { 4, 4 }));
+        var view = IR.F.Tensors.Reshape(input, new Dimension[] { 2, 8 });
+        var lhs = IR.F.Math.Unary(UnaryOp.Neg, view);
+        var rhs = IR.F.Math.Unary(UnaryOp.Abs, view);
+        var function = new Function("main", Targets.CPUTarget.Kind, new IR.Tuple(lhs, rhs), [input]);
+        var selected = Assert.IsType<Function>(new NTTAffineSelectionPass(CompileOptions).RunAsync(function, new()).Result);
+        var graph = TieredTileGraphBuilder.Build(selected.Body, 1, out _);
+        var viewNode = Assert.Single(graph.Vertices.Where(node => node.IsPureBufferView));
+        var viewUses = graph.GetMergePoints()
+            .Where(point => ReferenceEquals(point.Producer, viewNode))
+            .ToArray();
+        Assert.Equal(2, viewUses.Length);
+
+        Assert.True(graph.Merge(viewUses[0]));
+        Assert.Contains(viewNode, graph.Vertices);
+        Assert.Equal(1, graph.OutDegree(viewNode));
+        Assert.Equal(2, graph.Vertices.Count(node => node.IsPureBufferView));
+
+        var remainingUse = Assert.Single(graph.GetMergePoints().Where(point => ReferenceEquals(point.Producer, viewNode)));
+        Assert.True(graph.Merge(remainingUse));
+        Assert.Contains(viewNode, graph.Vertices);
+        Assert.Contains(
+            graph.Clusters.OfType<TieredTileGraph>(),
+            cluster => cluster.ContainsVertex(viewNode) && cluster.ContainsVertex(remainingUse.Consumer));
+        Assert.Equal(2, graph.Vertices.Count(node => node.IsPureBufferView));
     }
 
     [Fact]
@@ -125,13 +183,29 @@ public sealed class UnitTestTileGraph : TestClassBase
             new SBP[] { SBP.B, SBP.B, SBP.S([1], 1) },
             placement);
 
-        Assert.True(IR.Affine.AffineViewUtility.TryCreate(source, result, out var transform));
-        Assert.Null(IR.Affine.AffineViewUtility.Verify(source, result, transform));
+        Assert.True(IR.Affine.BufferViewUtility.TryCreate(source, result, out var transform));
         Assert.Equal(2, transform.SourceMap.Domains.Length);
         Assert.Equal(2, transform.SourceMap.Results.Length);
         Assert.Equal(3, transform.ResultMap.Results.Length);
         Assert.Equal(0, Assert.IsType<IR.Affine.AffineConstant>(transform.ResultMap.Results[1].Offset).Value);
         Assert.Equal(1, Assert.IsType<IR.Affine.AffineConstant>(transform.ResultMap.Results[1].Extent).Value);
+    }
+
+    [Fact]
+    public void TestPackedReshapePreservesDistributedShardRegions()
+    {
+        var placement = new Placement([4, 8], "yx", "bb");
+        var dataType = new VectorType(DataTypes.BFloat16, [4, 8]);
+        var source = new DistributedType(
+            new TensorType(dataType, new[] { 20, 64 }),
+            new SBP[] { SBP.B, SBP.S([1], 8) },
+            placement);
+        var result = new DistributedType(
+            new TensorType(dataType, new[] { 20, 16, 4 }),
+            new SBP[] { SBP.B, SBP.S([1], 2), SBP.B },
+            placement);
+
+        Assert.True(IR.Affine.BufferViewUtility.TryCreate(source, result, out _));
     }
 
     [Fact]
@@ -151,66 +225,443 @@ public sealed class UnitTestTileGraph : TestClassBase
             new SBP[] { SBP.B, SBP.S([0], 8) },
             placement);
 
-        Assert.False(IR.Affine.AffineViewUtility.TryCreate(source, incompatibleResult, out _));
-        Assert.True(IR.Affine.AffineViewUtility.TryCreate(source, compatibleResult, out var transform));
-        Assert.Null(IR.Affine.AffineViewUtility.Verify(source, compatibleResult, transform));
+        Assert.False(IR.Affine.BufferViewUtility.TryCreate(source, incompatibleResult, out _));
+        Assert.True(IR.Affine.BufferViewUtility.TryCreate(source, compatibleResult, out _));
     }
 
     [Fact]
-    public async Task TestPointwiseAffineViewComposesIntoGridRead()
+    public void TestBufferViewAllowsZeroStrideSingletonSuffix()
     {
-        var input = new Var("input", new TensorType(DataTypes.Float32, new[] { 4, 4 }));
-        var view = IR.F.Affine.View(input, input.CheckedType, IR.Affine.AffineViewTransform.Identity(input.CheckedShape));
-        var unary = IR.F.Math.Unary(UnaryOp.Neg, view);
-        var function = new Function("main", Targets.CPUTarget.Kind, unary, [input]);
+        var sourceType = new TensorType(DataTypes.Float32, new[] { 4, 1, 8 });
+        var resultType = new TensorType(DataTypes.Float32, new[] { 4, 8 });
+        Assert.True(IR.Affine.BufferViewUtility.TryCreate(sourceType, resultType, out var transform));
+        var source = T.CreateBuffer(sourceType, MemoryLocation.Data, out _)
+            .With(strides: new Dimension[] { 8, 0, 1 });
+
+        var strides = IR.Affine.BufferViewUtility.CreateBufferViewStrides(source, resultType, transform);
+
+        Assert.Equal(new long[] { 8, 1 }, strides.Select(stride => stride.FixedValue));
+    }
+
+    [Fact]
+    public void TestBufferViewAllowsZeroStrideDynamicDegenerateSuffix()
+    {
+        var sourceType = new TensorType(DataTypes.Float32, new[] { 4, 1 });
+        var resultType = new TensorType(DataTypes.Float32, new[] { 4 });
+        Assert.True(IR.Affine.BufferViewUtility.TryCreate(sourceType, resultType, out var transform));
+        var tailExtent = new DimVar("tail_extent")
+        {
+            Metadata = new()
+            {
+                Range = new(0, 1),
+            },
+        };
+        var source = T.CreateBuffer(sourceType, MemoryLocation.Data, out _)
+            .With(dimensions: new Dimension[] { 4, tailExtent }, strides: new Dimension[] { 1, 0 });
+
+        var strides = IR.Affine.BufferViewUtility.CreateBufferViewStrides(source, resultType, transform);
+
+        Assert.Equal(new long[] { 1 }, strides.Select(stride => stride.FixedValue));
+    }
+
+    [Fact]
+    public void TestBufferViewAllowsZeroStrideDistributedLocalSingleton()
+    {
+        var placement = new Placement([4, 8], "yx", "bb");
+        var sourceType = new DistributedType(
+            new TensorType(new VectorType(DataTypes.BFloat16, [8]), new[] { 4, 8 }),
+            new SBP[] { SBP.S([0], 1), SBP.S([1], 1) },
+            placement);
+        var resultType = new DistributedType(
+            new TensorType(DataTypes.BFloat16, new[] { 4, 64 }),
+            new SBP[] { SBP.S([0], 1), SBP.S([1], 8) },
+            placement);
+        Assert.True(IR.Affine.BufferViewUtility.TryCreate(sourceType, resultType, out var transform));
+        var source = T.CreateBuffer(sourceType.TensorType, MemoryLocation.Input, out _, distributedType: sourceType);
+
+        var strides = IR.Affine.BufferViewUtility.CreateBufferViewStrides(source, resultType.TensorType, transform);
+
+        Assert.Equal(new long[] { 0, 1 }, strides.Select(stride => stride.FixedValue));
+    }
+
+    [Fact]
+    public void TestBufferAliasGridDomainUsesLogicalShape()
+    {
+        var packedType = new VectorType(DataTypes.BFloat16, [4, 8]);
+        var storageType = new TensorType(packedType, new[] { 1, 4748 });
+        var input = new Var("input", storageType);
+        var bitcast = IR.F.Tensors.Bitcast(input, DataTypes.BFloat16);
+        var function = new Function("main", Targets.CPUTarget.Kind, bitcast, [input]);
+        var selected = Assert.IsType<Function>(new NTTAffineSelectionPass(CompileOptions).RunAsync(function, new()).Result);
+        var grid = Assert.IsType<IR.Affine.Grid>(selected.Body);
+
+        Assert.Equal(new long[] { 1, 4748 }, grid.DomainBounds.ToArray().Select(bound => bound.FixedValue));
+        Assert.Equal(new long[] { 1, 151936 }, grid.CheckedShape.ToValueArray());
+    }
+
+    [Fact]
+    public void TestGridDomainPreservesRuntimeLocalShardDimensionRange()
+    {
+        var sequenceLength = new DimVar("sequence_length")
+        {
+            Metadata = new()
+            {
+                Range = new(1, 128),
+            },
+        };
+        var placement = new Placement([4, 8], "yx", "bb");
+        var distributedType = new DistributedType(
+            new TensorType(DataTypes.BFloat16, new Dimension[] { sequenceLength, 8, 128 }),
+            new SBP[] { SBP.S([0], Dimension.CeilDiv(sequenceLength, 4)), SBP.S([1], 1), SBP.B },
+            placement);
+        var input = new Var("input", distributedType);
+        var output = new Var("output", distributedType);
+
+        var grid = IR.F.Affine.Grid()
+            .Domain(3, out _)
+            .Read(input, IR.Affine.AffineMap.Identity(3), out _)
+            .Write(output, IR.Affine.AffineMap.Identity(3), out _)
+            .Body(T.Nop())
+            .Build();
+
+        var localSequenceLength = Assert.IsType<AsDim>(grid.DomainBounds[0]);
+        Assert.Equal(0, localSequenceLength.Metadata.Range!.Value.Min);
+        Assert.Equal(32, localSequenceLength.Metadata.Range!.Value.Max);
+        Assert.Equal(1, grid.DomainBounds[1].FixedValue);
+        Assert.Equal(128, grid.DomainBounds[2].FixedValue);
+        Assert.Equal(new long[] { 32, 1, 128 }, CompilerServices.GetMaxShape(new RankedShape(grid.DomainBounds.ToArray())));
+
+        var clonedGrid = grid.Clone();
+        Assert.Equal(new long[] { 32, 1, 128 }, CompilerServices.GetMaxShape(new RankedShape(clonedGrid.DomainBounds.ToArray())));
+    }
+
+    [Fact]
+    public async Task TestChainedBufferAliasGridsPreserveLogicalTypes()
+    {
+        var packedType = new VectorType(DataTypes.BFloat16, [4, 8]);
+        var storageType = new TensorType(packedType, new[] { 2, 32 });
+        var input = new Var("input", storageType);
+        var reshaped = IR.F.Tensors.Reshape(input, new Dimension[] { 2, 8, 4 });
+        var logical = IR.F.Tensors.Bitcast(reshaped, DataTypes.BFloat16);
+        var function = new Function("main", Targets.CPUTarget.Kind, IR.F.Math.Unary(UnaryOp.Neg, logical), [input]);
 
         var selected = Assert.IsType<Function>(await new NTTAffineSelectionPass(CompileOptions).RunAsync(function, new()));
-        var selectedGrid = Assert.IsType<IR.Affine.Grid>(selected.Body);
-        Assert.IsType<IR.Affine.AffineView>(Assert.IsType<Call>(selectedGrid.Accesses[0].Value).Target);
+        var consumerGrid = Assert.IsType<IR.Affine.Grid>(selected.Body);
+        var bitcastGrid = Assert.IsType<IR.Affine.Grid>(consumerGrid.Accesses[0].Value);
+        var reshapeGrid = Assert.IsType<IR.Affine.Grid>(bitcastGrid.Accesses[0].Value);
+        Assert.Equal(new long[] { 2, 8, 128 }, consumerGrid.CheckedShape.ToValueArray());
+        Assert.Equal(new long[] { 2, 8, 128 }, bitcastGrid.CheckedShape.ToValueArray());
+        Assert.Equal(new long[] { 2, 8, 4 }, reshapeGrid.CheckedShape.ToValueArray());
+        Assert.Equal(new long[] { 2, 8, 128 }, consumerGrid.DomainBounds.ToArray().Select(bound => bound.FixedValue));
 
-        var composed = Assert.IsType<Function>(await new AffineViewCompositionPass(Targets.CPUTarget.Kind).RunAsync(selected, new()));
-        var composedGrid = Assert.IsType<IR.Affine.Grid>(composed.Body);
-        Assert.Same(input, composedGrid.Accesses[0].Value);
-        Assert.DoesNotContain(ExprCollector.Collect(composed.Body).OfType<Call>(), call => call.Target is IR.Affine.AffineView);
+        var graph = TieredTileGraphBuilder.Build(selected.Body, 1, out _);
+        Assert.Equal(3, graph.VertexCount);
+        Assert.Equal(2, graph.Vertices.Count(node => node.IsPureBufferView));
     }
 
     [Fact]
-    public async Task TestRankChangingAffineViewRemainsExplicitAliasBoundary()
+    public void TestTileGraphIntersectsLogicalDomainWithBlockLocalStorageDomain()
     {
-        var input = new Var("input", new TensorType(DataTypes.Float32, new[] { 16 }));
-        var reshape = IR.F.Tensors.Reshape(input, new Dimension[] { 4, 4 });
-        var unary = IR.F.Math.Unary(UnaryOp.Neg, reshape);
-        var function = new Function("main", Targets.CPUTarget.Kind, unary, [input]);
+        var scalarType = new TensorType(DataTypes.BFloat16, new[] { 20, 1024 });
+        var packedType = new TensorType(new VectorType(DataTypes.BFloat16, [8]), new[] { 20, 128 });
+        var logicalInput = new Var("logical_input", scalarType);
+        var logicalOutput = new Var("logical_output", packedType);
+        var domains = IR.F.Affine.Domains(2);
+        var inputMap = new IR.Affine.AffineMap(domains, default, new IR.Affine.AffineRange[]
+        {
+            new(domains[0].Offset, domains[0].Extent),
+            new(domains[1].Offset * 8, domains[1].Extent * 8),
+        });
+        var logicalGrid = IR.F.Affine.Grid()
+            .Domain(2, out _)
+            .Read(logicalInput, inputMap, out var inputTile)
+            .Write(logicalOutput, IR.Affine.AffineMap.Identity(2), out var outputTile)
+            .Body(TIR.F.NTT.Pack(inputTile, outputTile, [8], [1]))
+            .Build();
+        Assert.Equal(new long[] { 20, 128 }, logicalGrid.DomainBounds.ToArray().Select(bound => bound.FixedValue));
+
+        var placement = new Placement([4, 8], "yx", "bb");
+        var physicalInput = new Var(
+            "physical_input",
+            new DistributedType(scalarType, new SBP[] { SBP.B, SBP.S([0, 1], 32) }, placement));
+        var physicalOutput = new Var(
+            "physical_output",
+            new DistributedType(packedType, new SBP[] { SBP.B, SBP.S([0, 1], 4) }, placement));
+        var accesses = logicalGrid.Accesses.ToArray();
+        accesses[0] = accesses[0].With(value: physicalInput, buffer: IR.F.Buffer.BufferOf(physicalInput));
+        accesses[1] = accesses[1].With(value: physicalOutput, buffer: IR.F.Buffer.BufferOf(physicalOutput));
+        var distributedGrid = logicalGrid.With(accesses: accesses);
+
+        var graph = TieredTileGraphBuilder.Build(distributedGrid, 1, out _);
+        var tileGrid = Assert.Single(graph.Vertices);
+        Assert.Equal(new long[] { 20, 4 }, tileGrid.DomainBounds);
+        Assert.Equal(new long[] { 20, 4 }, tileGrid.DomainBoundExprs.Select(bound => bound.FixedValue));
+    }
+
+    [Fact]
+    public void TestAffineDomainIntersectionSupportsOpaqueDynamicDimensions()
+    {
+        var runtimeExtent = new AsDim(new Var("runtime_extent", TensorType.Scalar(DataTypes.Int64)))
+        {
+            Metadata = new()
+            {
+                Range = new(1, 32),
+            },
+        };
+        var domains = IR.F.Affine.Domains(1);
+        var projectedMap = new IR.Affine.AffineMap(
+            domains,
+            default,
+            new IR.Affine.AffineRange[]
+            {
+                new(
+                    new IR.Affine.AffineDivBinary(
+                        IR.Affine.AffineDivBinaryOp.FloorDiv,
+                        domains[0].Offset,
+                        2),
+                    domains[0].Extent),
+            });
+
+        var bounds = IR.Affine.AffineDomainInference.IntersectDomainBounds(
+            new Dimension[] { runtimeExtent },
+            new Shape[] { new RankedShape(new Dimension[] { 4 }) },
+            new[] { projectedMap });
+
+        Assert.Equal(new long[] { 8 }, CompilerServices.GetMaxShape(new RankedShape(bounds)));
+    }
+
+    [Fact]
+    public void TestAffineDomainIntersectionPreservesUnevenLocalShardWithVectorView()
+    {
+        var placement = new Placement([4, 8], "yx", "bb");
+        var localN = new AsDim(IR.F.Tensors.LocalShardDim(4748L, SBP.S([0, 1], 149), placement))
+        {
+            Metadata = new()
+            {
+                Range = new(0, 149),
+            },
+        };
+        var domains = IR.F.Affine.Domains(3);
+        var lhsStorageMap = new IR.Affine.AffineMap(
+            domains,
+            default,
+            new IR.Affine.AffineRange[]
+            {
+                new(domains[0].Offset, domains[0].Extent),
+                new(
+                    new IR.Affine.AffineDivBinary(
+                        IR.Affine.AffineDivBinaryOp.FloorDiv,
+                        domains[2].Offset,
+                        8),
+                    1),
+            });
+        var rhsStorageMap = new IR.Affine.AffineMap(
+            domains,
+            default,
+            new IR.Affine.AffineRange[]
+            {
+                new(domains[1].Offset, domains[1].Extent),
+                new(domains[2].Offset, domains[2].Extent),
+            });
+        var outputStorageMap = new IR.Affine.AffineMap(
+            domains,
+            default,
+            new IR.Affine.AffineRange[]
+            {
+                new(domains[0].Offset, domains[0].Extent),
+                new(domains[1].Offset, domains[1].Extent),
+            });
+
+        var bounds = IR.Affine.AffineDomainInference.IntersectDomainBounds(
+            new Dimension[] { 1, localN, 1024 },
+            new Shape[]
+            {
+                new RankedShape(new Dimension[] { 1, 128 }),
+                new RankedShape(new Dimension[] { 4748, 1024 }),
+                new RankedShape(new Dimension[] { 1, localN }),
+            },
+            new[] { lhsStorageMap, rhsStorageMap, outputStorageMap });
+
+        Assert.Equal(new long[] { 1, 149, 1024 }, CompilerServices.GetMaxShape(new RankedShape(bounds)));
+        var runtimeLocalN = Assert.IsType<AsDim>(bounds[1]);
+        Assert.IsType<IR.Tensors.LocalShardDim>(((Call)runtimeLocalN.Dim).Target);
+    }
+
+    [Fact]
+    public void TestPhysicalAccessMapRestrictsStaticFullAxisRange()
+    {
+        var domains = IR.F.Affine.Domains(1);
+        var map = new IR.Affine.AffineMap(
+            domains,
+            default,
+            new IR.Affine.AffineRange[]
+            {
+                new(domains[0].Offset, domains[0].Extent),
+                new(0, 128),
+            });
+
+        var restricted = IR.Affine.AffineUtility.RestrictAccessMapToShape(map, new long[] { 20, 4 });
+
+        Assert.Equal(128, Assert.IsType<IR.Affine.AffineConstant>(map.Results[1].Extent).Value);
+        Assert.Equal(4, Assert.IsType<IR.Affine.AffineConstant>(restricted.Results[1].Extent).Value);
+    }
+
+    [Fact]
+    public async Task TestTileGraphFusesThroughRankChangingBufferAliasGrid()
+    {
+        using var ctx = IntegerSetLibrary.ctx.Create();
+        var inputType = new TensorType(DataTypes.Float32, new[] { 4, 8 });
+        var input = new Var("input", inputType);
+        var producer = IR.F.Math.Unary(UnaryOp.Neg, input);
+        var view = IR.F.Tensors.Reshape(producer, new Dimension[] { 4, 1, 8 });
+        var consumer = IR.F.Math.Unary(UnaryOp.Abs, view);
+        var function = new Function("main", Targets.CPUTarget.Kind, consumer, [input]);
 
         var selected = Assert.IsType<Function>(await new NTTAffineSelectionPass(CompileOptions).RunAsync(function, new()));
-        var composed = Assert.IsType<Function>(await new AffineViewCompositionPass(Targets.CPUTarget.Kind).RunAsync(selected, new()));
-        var grid = Assert.IsType<IR.Affine.Grid>(composed.Body);
-        Assert.IsType<IR.Affine.AffineView>(Assert.IsType<Call>(grid.Accesses[0].Value).Target);
+        var consumerGrid = Assert.IsType<IR.Affine.Grid>(selected.Body);
+        var viewGrid = Assert.IsType<IR.Affine.Grid>(consumerGrid.Accesses[0].Value);
+        Assert.IsType<IR.Affine.Grid>(viewGrid.Accesses[0].Value);
+        Assert.Equal(new long[] { 4, 8 }, viewGrid.DomainBounds.ToArray().Select(bound => bound.FixedValue));
+
+        var graph = TieredTileGraphBuilder.Build(selected.Body, 1, out _);
+        Assert.Equal(3, graph.VertexCount);
+        var viewNode = Assert.Single(graph.Vertices.Where(node => ReferenceEquals(node.Grid, viewGrid)));
+        var consumerNode = Assert.Single(graph.Vertices.Where(node => ReferenceEquals(node.Grid, consumerGrid)));
+        Assert.True(viewNode.IsPureBufferView, "Reshape Grid must be recognized as a pure buffer alias.");
+        var viewUse = Assert.Single(graph.GetMergePoints().Where(point => ReferenceEquals(point.Producer, viewNode) && ReferenceEquals(point.Consumer, consumerNode)));
+        Assert.True(graph.Merge(viewUse), "Reshape Grid must fuse into its consumer.");
+        var targetOptions = Assert.IsAssignableFrom<INTTTargetOptions>(CompileOptions.TargetOptions);
+        _ = new Schedule.GraphTiler().SolveRootGraph(
+            graph,
+            Targets.CPUTarget.Kind,
+            targetOptions,
+            Array.Empty<DimVar>());
+
+        var tiled = Assert.IsType<Function>(await new AutoTilePass(Targets.CPUTarget.Kind, CompileOptions).RunAsync(selected, new()));
+        Assert.DoesNotContain(ExprCollector.Collect(tiled.Body), expression => expression is IR.Affine.Grid);
+        var deviceFunctions = ExprCollector.Collect(tiled.Body)
+            .OfType<PrimFunctionWrapper>()
+            .Select(wrapper => wrapper.Target)
+            .OfType<TIR.PrimFunction>()
+            .Distinct((IEqualityComparer<TIR.PrimFunction>)ReferenceEqualityComparer.Instance)
+            .ToArray();
+        Assert.NotEmpty(deviceFunctions);
+        Assert.DoesNotContain(
+            deviceFunctions.SelectMany(function => ExprCollector.Collect(function.Body)),
+            expression => expression is Call { Target: TIR.NTT.Reshape });
     }
 
     [Fact]
-    public async Task TestFullSuffixReshapeRemainsExplicitAliasBoundary()
+    public async Task TestProducerFusedIntoBufferAliasResolvesDefStorageView()
     {
-        var input = new Var("input", new TensorType(DataTypes.Float32, new[] { 4, 4 }));
-        var reshape = IR.F.Tensors.Reshape(input, new Dimension[] { 2, 8 });
-        var unary = IR.F.Math.Unary(UnaryOp.Neg, reshape);
-        var function = new Function("main", Targets.CPUTarget.Kind, unary, [input]);
+        using var ctx = IntegerSetLibrary.ctx.Create();
+        var input = new Var("input", new TensorType(DataTypes.Float32, new[] { 4, 8 }));
+        var producer = IR.F.Math.Unary(UnaryOp.Neg, input);
+        var view = IR.F.Tensors.Reshape(producer, new Dimension[] { 4, 1, 8 });
+        var consumer = IR.F.Math.Unary(UnaryOp.Abs, view);
+        var function = new Function("main", Targets.CPUTarget.Kind, consumer, [input]);
+        var selected = Assert.IsType<Function>(await new NTTAffineSelectionPass(CompileOptions).RunAsync(function, new()));
+        var consumerGrid = Assert.IsType<IR.Affine.Grid>(selected.Body);
+        var viewGrid = Assert.IsType<IR.Affine.Grid>(consumerGrid.Accesses[0].Value);
+        var producerGrid = Assert.IsType<IR.Affine.Grid>(viewGrid.Accesses[0].Value);
+        var graph = TieredTileGraphBuilder.Build(selected.Body, 1, out _);
+        var producerNode = Assert.Single(graph.Vertices.Where(node => ReferenceEquals(node.Grid, producerGrid)));
+        var viewNode = Assert.Single(graph.Vertices.Where(node => ReferenceEquals(node.Grid, viewGrid)));
+        var producerIntoView = Assert.Single(graph.GetMergePoints().Where(point =>
+            ReferenceEquals(point.Producer, producerNode) &&
+            ReferenceEquals(point.Consumer, viewNode)));
+        Assert.True(graph.Merge(producerIntoView));
+
+        var targetOptions = Assert.IsAssignableFrom<INTTTargetOptions>(CompileOptions.TargetOptions);
+        _ = new Schedule.GraphTiler().SolveRootGraph(
+            graph,
+            Targets.CPUTarget.Kind,
+            targetOptions,
+            Array.Empty<DimVar>());
+    }
+
+    [Fact]
+    public async Task TestTileGraphFusesThroughDTypeChangingBufferAliasGrid()
+    {
+        using var ctx = IntegerSetLibrary.ctx.Create();
+        var sourceDataType = new VectorType(DataTypes.BFloat16, [8]);
+        var sourceType = new TensorType(sourceDataType, new[] { 1, 8 });
+        var input = new Var("input", sourceType);
+        var producer = IR.F.Math.Unary(UnaryOp.Neg, input);
+        var logicalInput = IR.F.Tensors.Bitcast(producer, DataTypes.BFloat16);
+        var consumer = IR.F.Math.Unary(UnaryOp.Abs, logicalInput);
+        var function = new Function("main", Targets.CPUTarget.Kind, consumer, [input]);
 
         var selected = Assert.IsType<Function>(await new NTTAffineSelectionPass(CompileOptions).RunAsync(function, new()));
-        var composed = Assert.IsType<Function>(await new AffineViewCompositionPass(Targets.CPUTarget.Kind).RunAsync(selected, new()));
-        var grid = Assert.IsType<IR.Affine.Grid>(composed.Body);
-        Assert.IsType<IR.Affine.AffineView>(Assert.IsType<Call>(grid.Accesses[0].Value).Target);
+        var consumerGrid = Assert.IsType<IR.Affine.Grid>(selected.Body);
+        var bitcastGrid = Assert.IsType<IR.Affine.Grid>(consumerGrid.Accesses[0].Value);
+        Assert.IsType<IR.Affine.Grid>(bitcastGrid.Accesses[0].Value);
+        var graph = TieredTileGraphBuilder.Build(selected.Body, 1, out _);
+        var bitcastNode = Assert.Single(graph.Vertices.Where(node => ReferenceEquals(node.Grid, bitcastGrid)));
+        Assert.True(bitcastNode.IsPureBufferView);
+
+        var tiled = Assert.IsType<Function>(await new AutoTilePass(Targets.CPUTarget.Kind, CompileOptions).RunAsync(selected, new()));
+        Assert.DoesNotContain(ExprCollector.Collect(tiled.Body), expression => expression is IR.Affine.Grid);
+        var deviceFunctions = ExprCollector.Collect(tiled.Body)
+            .OfType<PrimFunctionWrapper>()
+            .Select(wrapper => wrapper.Target)
+            .ToArray();
+        Assert.NotEmpty(deviceFunctions);
+        Assert.DoesNotContain(
+            deviceFunctions.SelectMany(function => ExprCollector.Collect(function.Body)),
+            expression => expression is Call { Target: TIR.NTT.Bitcast });
     }
 
     [Fact]
-    public async Task TestRootAffineViewLowersToInputBackedPrimFunctionResult()
+    public void TestTileGraphFusesThroughTupleGetItem()
+    {
+        using var ctx = IntegerSetLibrary.ctx.Create();
+        var input = new Var("input", new TensorType(DataTypes.BFloat16, new[] { 4, 64 }));
+        var packedDataType = new VectorType(DataTypes.BFloat16, [4, 8]);
+        var qWeight = new Var("q_weight", new TensorType(packedDataType, new[] { 4, 64 }));
+        var kWeight = new Var("k_weight", new TensorType(packedDataType, new[] { 2, 64 }));
+        var vWeight = new Var("v_weight", new TensorType(packedDataType, new[] { 2, 64 }));
+        var qkv = IR.F.NTT.PackedQKVParallelLinear(
+            input,
+            qWeight,
+            kWeight,
+            vWeight,
+            None.Default,
+            None.Default,
+            None.Default,
+            None.Default,
+            None.Default,
+            None.Default,
+            None.Default,
+            None.Default,
+            None.Default,
+            numHeads: 4,
+            numKvHeads: 2,
+            outDataType: DataTypes.BFloat16);
+        var key = qkv[1];
+        var consumer = IR.F.Math.Unary(UnaryOp.Neg, key);
+        var function = new Function("main", Targets.CPUTarget.Kind, new IR.Tuple(consumer, qkv[2]), [input, qWeight, kWeight, vWeight]);
+
+        var selected = Assert.IsType<Function>(new NTTAffineSelectionPass(CompileOptions).RunAsync(function, new()).Result);
+        var graph = TieredTileGraphBuilder.Build(selected.Body, 1, out _);
+        Assert.Equal(2, graph.VertexCount);
+        var edge = Assert.Single(graph.Edges);
+        Assert.Equal(1, Nncase.Schedule.TileGraph.GraphExtensions.GetProducerOutputIndex(edge.Target.Grid.Accesses[edge.Tag].Value, edge.Source));
+        Assert.True(graph.Merge(new MergePoint(edge.Target, edge.Source, 0, edge.Tag)));
+    }
+
+    [Fact]
+    public async Task TestRootBufferAliasGridLowersToInputBackedPrimFunctionResult()
     {
         var input = new Var("input", new TensorType(DataTypes.Float32, new[] { 4, 4 }));
         var reshape = IR.F.Tensors.Reshape(input, new Dimension[] { 2, 8 });
         var function = new Function("main", Targets.CPUTarget.Kind, reshape, [input]);
         var selected = Assert.IsType<Function>(await new NTTAffineSelectionPass(CompileOptions).RunAsync(function, new()));
+        var tiled = Assert.IsType<Function>(await new AutoTilePass(Targets.CPUTarget.Kind, CompileOptions).RunAsync(selected, new()));
+        Assert.IsType<IR.Affine.Grid>(tiled.Body);
+        Assert.DoesNotContain(ExprCollector.Collect(tiled.Body), expression => expression is PrimFunctionWrapper);
 
-        var lowered = Assert.IsType<TIR.PrimFunction>(await new NTTTIRSelectionPass(CompileOptions).RunAsync(selected, new()));
+        var lowered = Assert.IsType<TIR.PrimFunction>(await new NTTTIRSelectionPass(CompileOptions).RunAsync(tiled, new()));
         var abi = lowered.GetAbiView();
         Assert.Empty(abi.OutputParameters);
         var result = Assert.Single(abi.Results);
@@ -219,25 +670,30 @@ public sealed class UnitTestTileGraph : TestClassBase
     }
 
     [Fact]
-    public async Task TestAffineViewEliminatesUnobservedDistributedRoundTrip()
+    public async Task TestLiveOutBufferAliasDoesNotCreateEmptyPrimFunction()
     {
-        var sourceType = new TensorType(DataTypes.Float32, new[] { 4, 4 });
-        var resultType = new TensorType(DataTypes.Float32, new[] { 2, 8 });
-        var placement = new Placement(new[] { 2 }, "b", "b");
-        var distributedSourceType = new DistributedType(sourceType, new SBP[] { SBP.B, SBP.B }, placement);
-        var distributedResultType = new DistributedType(resultType, new SBP[] { SBP.B, SBP.B }, placement);
-        var input = new Var("input", sourceType);
-        var distributedInput = IR.F.Distributed.Boxing(input, distributedSourceType);
-        Assert.True(IR.Affine.AffineViewUtility.TryCreate(distributedSourceType, distributedResultType, out var transform));
-        var distributedView = IR.F.Affine.View(distributedInput, distributedResultType, transform);
-        var output = IR.F.Distributed.Boxing(distributedView, resultType);
-        var function = new Function("main", Targets.CPUTarget.Kind, output, [input]);
+        var sequenceLength = new DimVar("sequence_length") { Metadata = { Range = new(1, 16) } };
+        var input = new Var("input", new TensorType(DataTypes.Float32, new Dimension[] { sequenceLength, 4 }));
+        var producer = IR.F.Math.Unary(UnaryOp.Neg, input);
+        var reshape = IR.F.Tensors.Reshape(producer, new Dimension[] { sequenceLength, 2, 2 });
+        var function = new Function("main", Targets.CPUTarget.Kind, reshape, [input]);
+        var selected = Assert.IsType<Function>(await new NTTAffineSelectionPass(CompileOptions).RunAsync(function, new()));
+        var selectedView = Assert.IsType<IR.Affine.Grid>(selected.Body);
+        var tiled = Assert.IsType<Function>(await new AutoTilePass(Targets.CPUTarget.Kind, CompileOptions).RunAsync(selected, new()));
 
-        var rewritten = Assert.IsType<Function>(await new AffineViewCompositionPass(Targets.CPUTarget.Kind).RunAsync(function, new()));
-        var viewCall = Assert.IsType<Call>(rewritten.Body);
-        Assert.IsType<IR.Affine.AffineView>(viewCall.Target);
-        Assert.Same(input, viewCall.Arguments[IR.Affine.AffineView.Input.Index]);
-        Assert.DoesNotContain(ExprCollector.Collect(rewritten.Body).OfType<Call>(), call => call.Target is IR.Distributed.Boxing);
+        var residualView = Assert.IsType<IR.Affine.Grid>(tiled.Body);
+        Assert.Same(selectedView.CheckedShape[0], residualView.CheckedShape[0]);
+        var wrapperCall = Assert.IsType<Call>(residualView.Accesses[0].Value);
+        var wrapper = Assert.IsType<PrimFunctionWrapper>(wrapperCall.Target);
+        Assert.NotEmpty(wrapper.Target.Body.Fields.ToArray());
+        Assert.Single(ExprCollector.Collect(tiled.Body).OfType<Call>().Where(call => call.Target is PrimFunctionWrapper));
+
+        var lowered = Assert.IsType<TIR.PrimFunction>(await new NTTTIRSelectionPass(CompileOptions).RunAsync(tiled, new()));
+        Assert.DoesNotContain(ExprCollector.Collect(lowered), expression => expression is IR.Affine.Grid or PrimFunctionWrapper);
+        var deviceCall = Assert.Single(ExprCollector.Collect(lowered.Body).OfType<Call>().Where(call => call.Target is TIR.PrimFunction));
+        var deviceFunction = Assert.IsType<TIR.PrimFunction>(deviceCall.Target);
+        Assert.Single(ExprCollector.Collect(deviceFunction.Body).OfType<Call>().Where(call => call.Target is TIR.NTT.Unary));
+        Assert.DoesNotContain(ExprCollector.Collect(lowered.Body).OfType<Call>(), call => call.Target is TIR.Memcopy);
     }
 
     [Fact]
@@ -505,7 +961,7 @@ public sealed class UnitTestTileGraph : TestClassBase
         Assert.Single(graph.Edges);
         Assert.Empty(graph.GetMergePoints());
         var edge = Assert.Single(graph.Edges);
-        Assert.False(graph.Merge(new MergePoint(edge.Target, edge.Source, 1)));
+        Assert.False(graph.Merge(new MergePoint(edge.Target, edge.Source, 1, edge.Tag)));
     }
 
     [Fact]
@@ -807,7 +1263,7 @@ public sealed class UnitTestTileGraph : TestClassBase
         for (int i = 0; i < mergePoints.Length; i++)
         {
             var (point, excepted) = mergePoints[i];
-            Assert.Equal(excepted, tileGraph.Merge(new(tileGraph.Vertices.Skip(point.Consumer).First(), tileGraph.Vertices.Skip(point.Producer).First(), point.Level)));
+            Assert.Equal(excepted, tileGraph.Merge(ResolveMergePoint(tileGraph, point)));
             if (excepted)
             {
 #if DEBUG
@@ -841,7 +1297,7 @@ public sealed class UnitTestTileGraph : TestClassBase
         for (int i = 0; i < mergePoints.Length; i++)
         {
             var point = mergePoints[i];
-            tileGraph.Merge(new(tileGraph.Vertices.Skip(point.Consumer).First(), tileGraph.Vertices.Skip(point.Producer).First(), point.Level));
+            tileGraph.Merge(ResolveMergePoint(tileGraph, point));
         }
 #if DEBUG
         tileGraph.Dump($"g{count}_m");
@@ -911,7 +1367,7 @@ public sealed class UnitTestTileGraph : TestClassBase
         for (int i = 0; i < mergePoints.Length; i++)
         {
             var point = mergePoints[i];
-            tileGraph.Merge(new(tileGraph.Vertices.Skip(point.Consumer).First(), tileGraph.Vertices.Skip(point.Producer).First(), point.Level));
+            tileGraph.Merge(ResolveMergePoint(tileGraph, point));
         }
 #if DEBUG
         tileGraph.Dump($"g{count}_m");
@@ -1079,6 +1535,16 @@ public sealed class UnitTestTileGraph : TestClassBase
         Assert.DoesNotContain(exprs, e => e is IR.Affine.Grid);
         var func = Assert.IsType<IR.Function>(post);
         Assert.IsType<IR.Tuple>(func.Body);
+    }
+
+    private static MergePoint ResolveMergePoint(TieredTileGraph graph, IntMergePoint point)
+    {
+        var consumer = graph.Vertices.Skip(point.Consumer).First();
+        var producer = graph.Vertices.Skip(point.Producer).First();
+        var edge = graph.Edges.SingleOrDefault(candidate =>
+            ReferenceEquals(candidate.Source, producer) &&
+            ReferenceEquals(candidate.Target, consumer));
+        return new MergePoint(consumer, producer, point.Level, edge?.Tag ?? -1);
     }
 
     public sealed record IntMergePoint(int Consumer, int Producer, int Level)

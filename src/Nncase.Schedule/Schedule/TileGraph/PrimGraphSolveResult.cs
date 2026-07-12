@@ -53,9 +53,10 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
     {
         PrimBufferGraph = primBufferGraph;
         (Inputs, Outputs) = primBufferGraph.GetInputsOutputs(primBufferGraph.Parent as BufferGraph);
-        OutputAliases = ResolveOutputAliases();
+        OutputStorageBids = ResolveOutputStorageBids();
         InputOutputVars = new();
-        var inOutInputs = OutputAliases.Values.ToHashSet();
+        OutputValues = new();
+        var inOutInputs = OutputStorageBids.Values.Where(Inputs.Contains).ToHashSet();
         foreach (var bid in Inputs)
         {
             var expr = bid.Access.Buffer;
@@ -72,15 +73,16 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
 
         foreach (var bid in Outputs)
         {
-            if (OutputAliases.TryGetValue(bid, out var inputBid))
+            var storageBid = OutputStorageBids[bid];
+            if (!InputOutputVars.TryGetValue(storageBid, out var storageVar))
             {
-                InputOutputVars.Add(bid, InputOutputVars[inputBid]);
-                continue;
+                var storageType = GetBufferType(storageBid.Access.Buffer);
+                storageVar = new BufferVar($"{storageBid}", storageType, BufferVarRole.Output, MemoryLocation.Output);
+                InputOutputVars.Add(storageBid, storageVar);
             }
 
-            var expr = bid.Access.Buffer;
-            var bufferType = GetBufferType(expr);
-            InputOutputVars.Add(bid, new BufferVar($"{bid}", bufferType, BufferVarRole.Output, MemoryLocation.Output));
+            InputOutputVars.TryAdd(bid, storageVar);
+            OutputValues.Add(bid, CreateLogicalResultValue(bid, storageBid, storageVar));
         }
 
         ObjectiveValue = objectiveValue;
@@ -95,9 +97,20 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
 
     public HashSet<BufferIdentity> Outputs { get; }
 
-    public IReadOnlyDictionary<BufferIdentity, BufferIdentity> OutputAliases { get; }
+    public IReadOnlyDictionary<BufferIdentity, BufferIdentity> OutputStorageBids { get; }
 
     public Dictionary<BufferIdentity, IVar> InputOutputVars { get; }
+
+    public Dictionary<BufferIdentity, Expr> OutputValues { get; }
+
+    public IReadOnlyList<BufferVar> OutputParameters => Outputs
+        .OrderBy(output => output.Node.OpId)
+        .ThenBy(output => output.Index)
+        .Select(output => OutputStorageBids[output])
+        .Where(storage => !Inputs.Contains(storage))
+        .Distinct()
+        .Select(storage => (BufferVar)InputOutputVars[storage])
+        .ToArray();
 
     public long ObjectiveValue { get; }
 
@@ -197,7 +210,9 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
                 constraints.Add($"d{i}_out = {tilesize} * (d{i} // {tilesize}) and d{i}_in = d{i} - d{i}_out");
             }
 
-            tilemap = new Isl.map(Isl.ctx.Current, $"{{ [{string.Join(',', dims)}] -> [{string.Join(',', outerDims)},{string.Join(',', innerDims)}] : {string.Join(" and ", constraints)} }}");
+            tilemap = constraints.Count == 0
+                ? new Isl.map(Isl.ctx.Current, "{ [] -> [] }")
+                : new Isl.map(Isl.ctx.Current, $"{{ [{string.Join(',', dims)}] -> [{string.Join(',', outerDims)},{string.Join(',', innerDims)}] : {string.Join(" and ", constraints)} }}");
         }
 
         var currentDomain = parentDomain.apply(value.DomainRelation.ToMap());
@@ -268,7 +283,7 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
 
         for (int ci = 0; ci < loopVars.Length + 1; ci++)
         {
-            foreach (var (bid, bufferInfo) in OrderBufferInfosForViewCreation(nodeMemo.BufferInfoMap))
+            foreach (var (bid, bufferInfo) in OrderBufferInfosForViewCreation(value, nodeMemo.BufferInfoMap))
             {
                 var place = bufferInfo.Places[ci];
                 for (int sl = 0; sl < place.Length; sl++)
@@ -347,6 +362,7 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
         var currentOffsets = currentRanges.Select(r => r.Start).ToArray();
         var currentExtents = currentRanges.Select(r => r.Stop).ToArray();
         var bufferViews = new Expr[value.BufferShapes.Length];
+        var bodyVarReplaces = new Dictionary<BaseExpr, BaseExpr>();
         for (int i = 0; i < value.BufferShapes.Length; i++)
         {
             var access = value.Grid.Accesses[i];
@@ -370,16 +386,17 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
             bufferViews[i] = access.BindingMode == GridBindingMode.Root
                 ? parentViewInfo.ViewVar ?? parentViewInfo.Buffer
                 : IR.F.Buffer.BufferSubview(parentViewInfo.ViewVar ?? parentViewInfo.Buffer, offsets, shape);
-        }
 
-        var bodyVarReplaces = new Dictionary<BaseExpr, BaseExpr>();
-        for (int i = 0; i < value.Grid.Accesses.Length; i++)
-        {
-            bodyVarReplaces.Add(value.Grid.Accesses[i].Parameter, bufferViews[i]);
+            bodyVarReplaces.Add(access.Parameter, bufferViews[i]);
         }
 
         var domain = new IR.Tuple(currentOffsets.Select(off => new IR.Tuple(IR.F.Shapes.AsTensor(off), (Expr)0L)).ToArray());
         bodyVarReplaces.Add(value.Grid.DomainParameter, domain);
+        if (value.IsPureBufferView)
+        {
+            return default;
+        }
+
         var nestBody = new ReplacingExprCloner(bodyVarReplaces).Clone(value.Grid.Body, default);
         parentbuilder.Body(nestBody);
         return default;
@@ -432,6 +449,63 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
         return maxAlign;
     }
 
+    private Expr CreateLogicalResultValue(BufferIdentity resultBid, BufferIdentity storageBid, IVar storageVar)
+    {
+        var resultType = GetBufferType(resultBid.Access.Buffer);
+        var storageType = GetBufferType(storageBid.Access.Buffer);
+        if (Equals(resultType, storageType))
+        {
+            return (Expr)storageVar;
+        }
+
+        if (storageVar is not BufferVar bufferVar ||
+            !TryGetTensorType(storageType, out var storageTensorType, out var storageDistributedType) ||
+            resultType is not (TensorType or DistributedType))
+        {
+            throw new InvalidOperationException(
+                $"Logical result {resultBid} aliases storage {storageBid}, but their types are not compatible tensor buffers: result={resultType}, storage={storageType}.");
+        }
+
+        if (!BufferViewUtility.TryCreate(storageType, resultType, out var transform))
+        {
+            throw new InvalidOperationException(
+                $"Logical result {resultBid} cannot alias storage {storageBid}: result={resultType}, storage={storageType}.");
+        }
+
+        var storageBuffer = T.AttachBuffer(
+            bufferVar,
+            storageTensorType,
+            bufferVar.Location,
+            0,
+            out _,
+            $"{storageBid}_result_storage",
+            storageDistributedType);
+        return BufferViewUtility.CreateLogicalBufferView(
+            storageBuffer,
+            resultType,
+            transform,
+            $"{resultBid}_result_view");
+
+        static bool TryGetTensorType(IRType type, out TensorType tensorType, out DistributedType? distributedType)
+        {
+            switch (type)
+            {
+                case DistributedType distributed:
+                    tensorType = distributed.TensorType;
+                    distributedType = distributed;
+                    return true;
+                case TensorType tensor:
+                    tensorType = tensor;
+                    distributedType = null;
+                    return true;
+                default:
+                    tensorType = null!;
+                    distributedType = null;
+                    return false;
+            }
+        }
+    }
+
     private TensorType GetBufferTensorType(Expr expr)
     {
         TensorType GetTensorType(IRType type) => type switch
@@ -480,6 +554,11 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
 
     private ViewInfo GetViewInfo(int storeLevel, TileNode node, BufferIdentity bid, AffineMap map, Dimension[] forwardOffsets, RankedShape shape)
     {
+        if (bid.IsOutput && bid.Node.TryGetAliasSourceAccess(bid.Index, out var sourceAccessIndex))
+        {
+            return GetBufferAliasViewInfo(node, bid, sourceAccessIndex, map, forwardOffsets, shape);
+        }
+
         if (bid.Access.BindingMode == GridBindingMode.Root)
         {
             return GetRootViewInfo(storeLevel, node, bid, map, forwardOffsets, shape);
@@ -556,7 +635,7 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
         {
             parentViewInfo = null;
             Expr buffer = null!;
-            var fromExternal = Inputs.Contains(bid) || Outputs.Contains(bid);
+            var fromExternal = InputOutputVars.ContainsKey(bid);
 
             if (TargetOptions.UnifiedMemoryArch && fromExternal)
             {
@@ -575,6 +654,103 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
             var view = GetViewExpr(null, buffer, bufferOffsets, offsets, shape);
             var viewVar = new Var($"{bid}_L{node.Level}", AnyType.Default);
             return new ViewInfo(parentViewInfo, view, viewVar, buffer, bufferOffsets, fromExternal ? bufferOffsets : new RankedShape(bufferOffsets.Select(i => 0).ToArray()), shape);
+        }
+    }
+
+    private ViewInfo GetBufferAliasViewInfo(
+        TileNode node,
+        BufferIdentity resultBid,
+        int sourceAccessIndex,
+        AffineMap resultMap,
+        Dimension[] forwardOffsets,
+        RankedShape resultShape)
+    {
+        var sourceBid = new BufferIdentity(resultBid.Node, sourceAccessIndex, BufferEndpoint.Input);
+        if (!TryGetCurrentOrParentViewInfo(node, sourceBid, out var sourceViewInfo))
+        {
+            throw new InvalidOperationException(
+                $"Buffer alias {resultBid} cannot resolve source storage for {sourceBid} at {node}. " +
+                DescribeViewResolution(node, sourceBid));
+        }
+
+        var sourceStorage = sourceViewInfo.Buffer switch
+        {
+            TIR.Buffer buffer => buffer,
+            BufferVar sourceVar => AttachBuffer(sourceVar, GetBufferType(sourceBid.Access.Buffer), $"{sourceBid}_alias_source"),
+            _ => throw new InvalidOperationException(
+                $"Buffer alias source {sourceBid} must resolve to TIR.Buffer or BufferVar, got {sourceViewInfo.Buffer.GetType().Name}."),
+        };
+        var resultType = GetBufferType(resultBid.Access.Buffer);
+        var resultTensorType = resultType switch
+        {
+            DistributedType distributed => distributed.TensorType,
+            TensorType tensor => tensor,
+            _ => throw new InvalidOperationException($"Buffer alias result {resultBid} must be tensor-like, got {resultType}."),
+        };
+        var localResultType = new TensorType(resultTensorType.DType, resultShape);
+        var sourceLayout = sourceStorage.With(dimensions: sourceViewInfo.Shape.Dimensions.ToArray());
+        var transform = new BufferViewTransform(
+            resultBid.Node.Grid.Accesses[sourceAccessIndex].AffineMap,
+            resultBid.Access.AffineMap,
+            new IRArray<Dimension>(resultBid.Node.Grid.DomainBounds.ToArray()));
+        var resultStrides = BufferViewUtility.CreateBufferViewStrides(sourceLayout, localResultType, transform);
+        var physicalOffsets = GetPhysicalStorageOffsets(sourceViewInfo);
+        if (physicalOffsets.Length != sourceStorage.Rank)
+        {
+            throw new InvalidOperationException(
+                $"Buffer alias source rank mismatch for {resultBid}: offsets={physicalOffsets.Length}, storage={sourceStorage.Rank}.");
+        }
+
+        var byteOffset = (TensorUtilities.GetLinearOffset(sourceStorage.Strides, physicalOffsets) * sourceStorage.ElemType.SizeInBytes).Simplify();
+        var byteSize = BufferViewUtility.GetByteSpanSize(resultShape.Dimensions, resultStrides, resultTensorType.DType.SizeInBytes);
+        var resultOffsets = resultMap.Apply(
+            forwardOffsets,
+            Enumerable.Repeat<Dimension>(0L, forwardOffsets.Length).ToArray()).Select(range => range.Start).ToArray();
+        ViewInfo? parentResultView = null;
+        var localOffsets = resultOffsets.Select(_ => (Dimension)0L).ToArray();
+        if (TryGetParentViewInfo(node, resultBid, out parentResultView))
+        {
+            localOffsets = resultOffsets.Zip(parentResultView.GlobalOffsets.Dimensions.ToArray())
+                .Select(pair => (pair.First - pair.Second).Simplify())
+                .ToArray();
+        }
+
+        var aliasBuffer = T.CreateBufferView(
+            sourceStorage,
+            resultTensorType.DType,
+            resultShape.Dimensions,
+            resultStrides,
+            byteOffset,
+            byteSize,
+            resultType as DistributedType,
+            $"{resultBid}_alias");
+        var view = IR.F.Buffer.AllocateBufferView(aliasBuffer, new RankedShape(resultOffsets));
+        var viewVar = new Var($"{resultBid}_L{node.Level}", AnyType.Default);
+        return new ViewInfo(
+            parentResultView,
+            view,
+            viewVar,
+            aliasBuffer,
+            new RankedShape(resultOffsets),
+            new RankedShape(localOffsets),
+            resultShape);
+
+        static TIR.Buffer AttachBuffer(BufferVar sourceVar, IRType sourceType, string name)
+        {
+            var (tensorType, distributedType) = sourceType switch
+            {
+                DistributedType distributed => (distributed.TensorType, distributed),
+                TensorType tensor => (tensor, null),
+                _ => throw new InvalidOperationException($"Buffer alias source must be tensor-like, got {sourceType}."),
+            };
+            return T.AttachBuffer(
+                sourceVar,
+                tensorType,
+                sourceVar.Location,
+                0,
+                out _,
+                name,
+                distributedType);
         }
     }
 
@@ -602,7 +778,7 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
 
         var bufferOffsets = map.Apply(forwardOffsets, Enumerable.Repeat<Dimension>(0L, forwardOffsets.Length).ToArray()).Select(i => i.Start).ToArray();
         var offsets = new RankedShape(bufferOffsets.Select(_ => (Dimension)0L).ToArray());
-        var fromExternal = Inputs.Contains(bid) || Outputs.Contains(bid);
+        var fromExternal = InputOutputVars.ContainsKey(bid);
         ViewInfo? parentViewInfo = null;
         Expr buffer;
         Var? viewVar = null;
@@ -633,15 +809,32 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
         return new ViewInfo(parentViewInfo, view, viewVar, buffer, bufferOffsets, offsets, shape);
     }
 
+    private static Dimension[] GetPhysicalStorageOffsets(ViewInfo viewInfo)
+    {
+        var offsets = viewInfo.LocalOffsets.Dimensions.ToArray();
+        if (viewInfo.Parent is not { } parent || !ReferenceEquals(viewInfo.Buffer, parent.Buffer))
+        {
+            return offsets;
+        }
+
+        var parentOffsets = GetPhysicalStorageOffsets(parent);
+        if (parentOffsets.Length != offsets.Length)
+        {
+            throw new InvalidOperationException(
+                $"ViewInfo physical offset rank mismatch: parent={parentOffsets.Length}, child={offsets.Length}.");
+        }
+
+        return parentOffsets.Zip(offsets).Select(pair => (pair.First + pair.Second).Simplify()).ToArray();
+    }
+
     private bool TryGetAliasSource(TileNode node, BufferIdentity bid, [MaybeNullWhen(false)] out Expr source)
     {
         source = null;
-        if (!bid.IsOutput || bid.Access.AccessMode != GridAccessMode.ReadWrite)
+        if (!TryGetAliasReadBid(bid, out var inputBid))
         {
             return false;
         }
 
-        var inputBid = new BufferIdentity(bid.Node, bid.Index, BufferEndpoint.Input);
         if (TryGetCurrentOrParentViewInfo(node, inputBid, out var readViewInfo))
         {
             source = readViewInfo.ViewVar ?? readViewInfo.Buffer;
@@ -651,9 +844,9 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
         return false;
     }
 
-    private Dictionary<BufferIdentity, BufferIdentity> ResolveOutputAliases()
+    private Dictionary<BufferIdentity, BufferIdentity> ResolveOutputStorageBids()
     {
-        var aliases = new Dictionary<BufferIdentity, BufferIdentity>();
+        var storages = new Dictionary<BufferIdentity, BufferIdentity>();
         var producerByRead = new Dictionary<BufferIdentity, BufferIdentity>();
         foreach (var edge in PrimBufferGraph.Edges.Where(edge => edge.Tag == BufferEdgeKind.Inter))
         {
@@ -665,22 +858,17 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
 
         foreach (var output in Outputs)
         {
-            if (TryResolveAliasInput(output, producerByRead, new HashSet<BufferIdentity>(), out var input))
-            {
-                aliases.Add(output, input);
-            }
+            storages.Add(output, ResolveStorageBid(output, producerByRead, new HashSet<BufferIdentity>()));
         }
 
-        return aliases;
+        return storages;
     }
 
-    private bool TryResolveAliasInput(
+    private BufferIdentity ResolveStorageBid(
         BufferIdentity bid,
         IReadOnlyDictionary<BufferIdentity, BufferIdentity> producerByRead,
-        HashSet<BufferIdentity> visited,
-        [MaybeNullWhen(false)] out BufferIdentity input)
+        HashSet<BufferIdentity> visited)
     {
-        input = null;
         if (!visited.Add(bid))
         {
             throw new InvalidOperationException($"Grid access alias cycle detected at {bid}.");
@@ -688,56 +876,138 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
 
         if (Inputs.Contains(bid))
         {
-            input = bid;
-            return true;
+            return bid;
         }
 
-        if (!bid.IsOutput || bid.Access.AccessMode != GridAccessMode.ReadWrite)
+        if (!TryGetAliasReadBid(bid, out var read))
         {
-            return false;
+            return bid;
         }
 
-        var read = new BufferIdentity(bid.Node, bid.Index, BufferEndpoint.Input);
-        return TryResolveReadInput(read, producerByRead, visited, out input);
-    }
-
-    private bool TryResolveReadInput(
-        BufferIdentity read,
-        IReadOnlyDictionary<BufferIdentity, BufferIdentity> producerByRead,
-        HashSet<BufferIdentity> visited,
-        [MaybeNullWhen(false)] out BufferIdentity input)
-    {
         if (Inputs.Contains(read))
         {
-            input = read;
-            return true;
+            return read;
         }
 
         if (!producerByRead.TryGetValue(read, out var producer))
         {
-            input = null;
+            throw new InvalidOperationException($"Alias result {bid} has no storage producer for source read {read}.");
+        }
+
+        return ResolveStorageBid(producer, producerByRead, visited);
+    }
+
+    private static bool TryGetAliasReadBid(BufferIdentity bid, [MaybeNullWhen(false)] out BufferIdentity read)
+    {
+        read = null;
+        if (!bid.IsOutput)
+        {
             return false;
         }
 
-        return TryResolveAliasInput(producer, producerByRead, visited, out input);
+        if (bid.Node.TryGetAliasSourceAccess(bid.Index, out var sourceAccessIndex))
+        {
+            read = new BufferIdentity(bid.Node, sourceAccessIndex, BufferEndpoint.Input);
+            return true;
+        }
+
+        if (bid.Access.AccessMode == GridAccessMode.ReadWrite)
+        {
+            read = new BufferIdentity(bid.Node, bid.Index, BufferEndpoint.Input);
+            return true;
+        }
+
+        return false;
     }
 
     private bool TryGetCurrentOrParentViewInfo(TileNode node, BufferIdentity bid, [MaybeNullWhen(false)] out ViewInfo viewInfo)
     {
-        if (_viewInfoMemo.TryGetValue(node, out var viewMap) && viewMap.TryGetValue(bid, out viewInfo))
+        var storageBid = GetCurrentStorageBid(node, bid);
+        if (_viewInfoMemo.TryGetValue(node, out var viewMap) && viewMap.TryGetValue(storageBid, out viewInfo))
         {
             return true;
         }
 
-        return TryGetParentViewInfo(node, bid, out viewInfo);
+        return TryGetParentViewInfo(node, storageBid, out viewInfo);
     }
 
-    private static IEnumerable<KeyValuePair<BufferIdentity, TileNodeBufferInfo<long>>> OrderBufferInfosForViewCreation(Dictionary<BufferIdentity, TileNodeBufferInfo<long>> bufferInfoMap)
+    private BufferIdentity GetCurrentStorageBid(TileNode node, BufferIdentity bid)
+        => TileNodeMemo[node].DefUseMap.TryGetByValue(bid, out var producerBid)
+            ? producerBid
+            : bid;
+
+    private string DescribeViewResolution(TileNode node, BufferIdentity bid)
     {
-        return bufferInfoMap
-            .OrderBy(pair => pair.Key.IsOutput ? 1 : 0)
-            .ThenBy(pair => pair.Key.Node.OpId)
-            .ThenBy(pair => pair.Key.Index);
+        var levels = new List<string>();
+        ITreeNode? current = node;
+        var currentBid = bid;
+        while (current is TileNode tileNode && TileNodeMemo.TryGetValue(tileNode, out var nodeInfo))
+        {
+            var storageBid = nodeInfo.DefUseMap.TryGetByValue(currentBid, out var producerBid)
+                ? producerBid
+                : currentBid;
+            var views = _viewInfoMemo.TryGetValue(tileNode, out var viewMap)
+                ? string.Join(",", viewMap.Keys)
+                : "<none>";
+            levels.Add(
+                $"{tileNode}: requested={currentBid}, storage={storageBid}, " +
+                $"buffers=[{string.Join(",", nodeInfo.BufferInfoMap.Keys)}], views=[{views}]");
+            currentBid = storageBid;
+            current = tileNode.Parent;
+        }
+
+        if (current is TileNode root)
+        {
+            levels.Add($"{root}: root sentinel, requested={currentBid}");
+        }
+
+        return $"Resolution path: {string.Join("; ", levels)}; ABI=[{string.Join(",", InputOutputVars.Keys)}].";
+    }
+
+    private IEnumerable<KeyValuePair<BufferIdentity, TileNodeBufferInfo<long>>> OrderBufferInfosForViewCreation(
+        TileNode node,
+        Dictionary<BufferIdentity, TileNodeBufferInfo<long>> bufferInfoMap)
+    {
+        var stableOrder = bufferInfoMap.Keys
+            .OrderBy(pair => pair.IsOutput ? 1 : 0)
+            .ThenBy(pair => pair.Node.OpId)
+            .ThenBy(pair => pair.Index)
+            .ToArray();
+        var states = new Dictionary<BufferIdentity, int>();
+        var result = new List<KeyValuePair<BufferIdentity, TileNodeBufferInfo<long>>>(bufferInfoMap.Count);
+
+        foreach (var bid in stableOrder)
+        {
+            Visit(bid);
+        }
+
+        return result;
+
+        void Visit(BufferIdentity bid)
+        {
+            if (states.TryGetValue(bid, out var state))
+            {
+                if (state == 1)
+                {
+                    throw new InvalidOperationException($"Buffer alias dependency cycle detected at {bid} in {node}.");
+                }
+
+                return;
+            }
+
+            states.Add(bid, 1);
+            if (TryGetAliasReadBid(bid, out var sourceRead))
+            {
+                var sourceStorage = GetCurrentStorageBid(node, sourceRead);
+                if (sourceStorage != bid && bufferInfoMap.ContainsKey(sourceStorage))
+                {
+                    Visit(sourceStorage);
+                }
+            }
+
+            states[bid] = 2;
+            result.Add(new(bid, bufferInfoMap[bid]));
+        }
     }
 
     private int FetchBidOwnerIndex(TileNode node, BufferIdentity bid)

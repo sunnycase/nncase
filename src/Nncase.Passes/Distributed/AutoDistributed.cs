@@ -21,7 +21,6 @@ using Nncase.Diagnostics;
 using Nncase.Evaluator;
 using Nncase.Graphs;
 using Nncase.IR;
-using Nncase.IR.Affine;
 using Nncase.IR.Distributed;
 using Nncase.IR.NN;
 using Nncase.IR.Shapes;
@@ -687,7 +686,7 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         return true;
     }
 
-    public static bool SupportsConstAffineView(INTTTargetOptions targetOptions)
+    public static bool SupportsConstShardedView(INTTTargetOptions targetOptions)
         => targetOptions.UnifiedMemoryArch && targetOptions.MemoryAccessArch == MemoryAccessArchitecture.UMA;
 
     private static bool IsDistributableTensorType(TensorType tensorType)
@@ -1921,7 +1920,7 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
             if (tc2.ValueType is TensorType tensorType && IsDistributableTensorType(tensorType))
             {
                 var distCluster = _rootSearchGraph.CreateCluster<DistributedSearchGraph>(SearchGraphKind.DistributedCluster);
-                DistributedSearchGraph? affineViewInputBucket = null;
+                DistributedSearchGraph? shardedViewInputBucket = null;
                 foreach (var dType in GetLeafCandidateDistTypes(tensorType))
                 {
                     var bucket = distCluster.CreateCluster<DistributedSearchGraph>(SearchGraphKind.Bucket);
@@ -1934,15 +1933,13 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
                     var dnode = new SearchableNode(distConst, dType);
                     bucket.AddVertex(dnode);
 
-                    if (SupportsConstAffineView(TargetOptions))
+                    if (SupportsConstShardedView(TargetOptions))
                     {
-                        var affineViewBucket = distCluster.CreateCluster<DistributedSearchGraph>(SearchGraphKind.Bucket);
-                        var affineViewNode = new SearchableNode(
-                            new AffineView(dType, AffineViewTransform.Identity(tensorType.Shape)),
-                            dType);
-                        affineViewBucket.AddVertex(affineViewNode);
-                        affineViewInputBucket ??= CreateAffineViewInputBucket(tc2);
-                        _rootSearchGraph.AddEdge(new(affineViewNode, affineViewInputBucket.Vertices.First(), 0, affineViewInputBucket));
+                        var shardedViewBucket = distCluster.CreateCluster<DistributedSearchGraph>(SearchGraphKind.Bucket);
+                        var shardedViewNode = new SearchableNode(new IR.Distributed.ShardedView(dType), dType);
+                        shardedViewBucket.AddVertex(shardedViewNode);
+                        shardedViewInputBucket ??= CreateShardedViewInputBucket(tc2);
+                        _rootSearchGraph.AddEdge(new(shardedViewNode, shardedViewInputBucket.Vertices.First(), 0, shardedViewInputBucket));
                     }
                 }
 
@@ -2052,7 +2049,7 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         return distCluster;
     }
 
-    private DistributedSearchGraph CreateAffineViewInputBucket(TensorConst source)
+    private DistributedSearchGraph CreateShardedViewInputBucket(TensorConst source)
     {
         var sourceCluster = _rootSearchGraph.CreateCluster<DistributedSearchGraph>(SearchGraphKind.StandaloneCluster);
         var sourceBucket = sourceCluster.CreateCluster<DistributedSearchGraph>(SearchGraphKind.Bucket);

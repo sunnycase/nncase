@@ -56,35 +56,25 @@ public sealed class TieredTileGraphBuilder : ExprVisitor<Unit, Unit>
             return default;
         }
 
-        /*
-            note currently we're not use the affine map's extents for build domain.
-            so the domain we built is not consider the primtive shape. wo also can't use extent when building ast.
-        */
         var accesses = current.Accesses.ToArray();
         var buffers = accesses.Select(access => access.Buffer).ToArray();
         var bufferShapeValues = buffers.Select(b => TilingUtilities.GetBufferShape(b, true).ToValueArray()).ToArray();
-        var bufferShapes = buffers.Select(b => TilingUtilities.GetBufferShape(b, false)).ToArray();
-        var bufferRuntimeShapes = buffers.Select(TilingUtilities.GetBufferRuntimeShape).ToArray();
-        Isl.set[] bufferDomains;
-        HashSet<DimVar> dimVars = new();
-        {
-            var tps = bufferShapes.AsValueEnumerable().Select(shape => (ISLUtility.ToDomain(shape, out var paramMap), paramMap)).ToArray();
-            bufferDomains = tps.Select(t => t.Item1).ToArray();
-            dimVars.UnionWith(tps.Select(t => t.paramMap).SelectMany(i => i).ToArray());
-        }
-
         var affineDomainRank = accesses.First(access => access.IsAffine).AffineMap.Domains.Length;
-        var accessMaps = accesses.Select(access => access.IsAffine
-            ? access.AffineMap
-            : AffineMap.FromCallable((_, _) => Array.Empty<AffineRange>(), affineDomainRank, 0)).ToArray();
-        var domainConstraintIndices = Enumerable.Range(0, accesses.Length)
-            .Where(index => accesses[index].IsAffine && accesses[index].DomainMode == GridDomainMode.Constraint)
+        var constraintAccesses = accesses
+            .Where(access => access.IsAffine && access.DomainMode == GridDomainMode.Constraint)
             .ToArray();
-        var (domain, domainDynamic, domainBoundValues, domainBoundExprs) = TilingUtilities.InferDomainBounds(
-            domainConstraintIndices.Select(index => bufferRuntimeShapes[index]).ToArray(),
-            domainConstraintIndices.Select(index => bufferDomains[index]).ToArray(),
-            domainConstraintIndices.Select(index => accessMaps[index]).ToArray(),
-            dimVars);
+        var physicalRuntimeShapes = constraintAccesses
+            .Select(access => AffineDomainInference.GetBufferRuntimeShape(access.Buffer))
+            .ToArray();
+        var physicalAccessMaps = constraintAccesses
+            .Select(access => access.AffineMap)
+            .ToArray();
+        var domainBoundExprs = AffineDomainInference.IntersectDomainBounds(
+            current.DomainBounds,
+            physicalRuntimeShapes,
+            physicalAccessMaps);
+        var domainBoundValues = CompilerServices.GetMaxShape(new RankedShape(domainBoundExprs));
+        var domainDynamic = domainBoundExprs.Select(bound => bound is not DimConst).ToArray();
 
         var copId = _opId++;
         var domainDims = affineDomainRank;

@@ -9,6 +9,7 @@ using System.Runtime.CompilerServices;
 using NetFabric.Hyperlinq;
 using Nncase.IR;
 using Nncase.IR.Affine;
+using Nncase.Schedule.TileGraph;
 using Nncase.TIR;
 using Nncase.Utilities;
 
@@ -224,6 +225,49 @@ public abstract class TIRSelectionPass : FunctionPass
             return VisitLeafCall(expr, context);
         }
 
+        protected override BaseExpr VisitGrid(Grid expr, Unit context)
+        {
+            var analysis = new GridMemoryEffectAnalysis().Analyze(expr);
+            if (analysis.BufferAliases.Length == 0 ||
+                analysis.Effects.Any(effect => effect.Mode != MemoryAccessMode.None))
+            {
+                throw new InvalidOperationException(
+                    $"Executable Grid survived AutoTiling before TIR selection: {expr}. Only residual buffer aliases are legal here.");
+            }
+
+            var writeAccessIndices = expr.Accesses.ToArray()
+                .Select((access, index) => (Access: access, Index: index))
+                .Where(pair => pair.Access.IsWrite)
+                .Select(pair => pair.Index)
+                .ToArray();
+            var results = new Expr[writeAccessIndices.Length];
+            for (var outputIndex = 0; outputIndex < writeAccessIndices.Length; outputIndex++)
+            {
+                var resultAccessIndex = writeAccessIndices[outputIndex];
+                var aliases = analysis.BufferAliases
+                    .Where(alias => alias.ResultAccessIndex == resultAccessIndex)
+                    .ToArray();
+                if (aliases.Length != 1)
+                {
+                    throw new InvalidOperationException(
+                        $"Residual buffer alias Grid output access {resultAccessIndex} must have exactly one storage source, got {aliases.Length}.");
+                }
+
+                results[outputIndex] = LowerResidualBufferAlias(
+                    expr,
+                    aliases[0],
+                    context,
+                    outputIndex);
+            }
+
+            return results.Length switch
+            {
+                0 => throw new InvalidOperationException("Residual buffer alias Grid must have at least one output."),
+                1 => results[0],
+                _ => new IR.Tuple(results),
+            };
+        }
+
         protected sealed override BaseExpr VisitLeafCall(Call expr, Unit context)
         {
             var args = expr.Arguments.AsValueEnumerable().Select(x => ExprMemo[x]).ToArray();
@@ -257,6 +301,52 @@ public abstract class TIRSelectionPass : FunctionPass
                 .Else(new Call(WrapIfBranch(expr.Else), arguments))
                 .Build());
             return output;
+        }
+
+        private TIR.Buffer LowerResidualBufferAlias(
+            Grid grid,
+            GridBufferAlias alias,
+            Unit context,
+            int outputIndex)
+        {
+            var sourceAccess = grid.Accesses[alias.SourceAccessIndex];
+            var resultAccess = grid.Accesses[alias.ResultAccessIndex];
+            var selectedSource = Visit(sourceAccess.Value, context);
+            var sourceBuffer = selectedSource switch
+            {
+                TIR.Buffer buffer => buffer,
+                BufferVar bufferVar => AttachBufferVar(bufferVar, sourceAccess.Value.CheckedType, grid, outputIndex),
+                _ => throw new InvalidOperationException(
+                    $"Residual buffer alias Grid source must lower to TIR.Buffer, got {selectedSource.GetType().Name}."),
+            };
+
+            var transform = new BufferViewTransform(
+                sourceAccess.AffineMap,
+                resultAccess.AffineMap,
+                new IRArray<Dimension>(grid.DomainBounds.ToArray()));
+            return BufferViewUtility.CreateLogicalBufferView(
+                sourceBuffer,
+                resultAccess.Value.CheckedType,
+                transform,
+                $"alias_grid_{_bufferIndex++}_out{outputIndex}");
+
+            static TIR.Buffer AttachBufferVar(BufferVar bufferVar, IRType sourceType, Grid grid, int outputIndex)
+            {
+                if (!TryGetTensorType(sourceType, out var tensorType, out var distributedType))
+                {
+                    throw new InvalidOperationException(
+                        $"Residual buffer alias Grid source {grid} output {outputIndex} must have a tensor type, got {sourceType}.");
+                }
+
+                return T.AttachBuffer(
+                    bufferVar,
+                    tensorType,
+                    bufferVar.Location,
+                    0,
+                    out _,
+                    $"{bufferVar.Name}_alias_source",
+                    distributedType);
+            }
         }
 
         private BaseFunction WrapIfBranch(BaseFunction branch)
@@ -327,6 +417,7 @@ public abstract class TIRSelectionPass : FunctionPass
                 }
             }
 
+            var normalizedArguments = NormalizePrimFunctionArguments(primFunction, arguments);
             var resultValues = abi.Results.Select((result, resultIndex) =>
             {
                 var storageIndex = Array.FindIndex(parameters, parameter => ReferenceEquals(parameter, result.Storage));
@@ -336,6 +427,8 @@ public abstract class TIRSelectionPass : FunctionPass
                         $"PrimFunction {primFunction.Name} result {resultIndex} storage {result.Storage.Name} is not bound by the call arguments.");
                 }
 
+                // ABI normalization is local to the callee invocation. Keep the caller-visible
+                // result attached to the original logical storage supplied by the caller.
                 var storage = arguments[storageIndex];
                 return result.Value switch
                 {
@@ -346,7 +439,7 @@ public abstract class TIRSelectionPass : FunctionPass
                 };
             }).ToArray();
             output = resultValues.Length == 1 ? (Expr)resultValues[0] : new IR.Tuple(resultValues.Cast<Expr>().ToArray());
-            selectedCall = new Call(primFunction, arguments.ToArray());
+            selectedCall = new Call(primFunction, normalizedArguments);
             return true;
 
             static BaseExpr CreateResultView(TIR.Buffer descriptor, BaseExpr storage, string functionName, int resultIndex)
@@ -367,6 +460,63 @@ public abstract class TIRSelectionPass : FunctionPass
                     descriptor.DistributedType,
                     $"{functionName}_result_{resultIndex}");
             }
+        }
+
+        private static Call CreatePrimFunctionCall(TIR.PrimFunction primFunction, IReadOnlyList<BaseExpr> arguments)
+            => new(primFunction, NormalizePrimFunctionArguments(primFunction, arguments));
+
+        private static BaseExpr[] NormalizePrimFunctionArguments(TIR.PrimFunction primFunction, IReadOnlyList<BaseExpr> arguments)
+        {
+            var parameters = primFunction.Parameters.ToArray();
+            if (parameters.Length != arguments.Count)
+            {
+                throw new InvalidOperationException(
+                    $"PrimFunction {primFunction.Name} expects {parameters.Length} arguments, got {arguments.Count}.");
+            }
+
+            var normalized = arguments.ToArray();
+            for (var index = 0; index < parameters.Length; index++)
+            {
+                var parameter = parameters[index];
+                if (!TryGetTensorType(parameter.CheckedType, out _, out _))
+                {
+                    continue;
+                }
+
+                if (normalized[index] is not TIR.Buffer argumentBuffer)
+                {
+                    if (!Equals(normalized[index].CheckedType, parameter.CheckedType))
+                    {
+                        throw new InvalidOperationException(
+                            $"PrimFunction {primFunction.Name} tensor parameter {parameter.Name} expects {parameter.CheckedType}, " +
+                            $"but argument {index} is {normalized[index].GetType().Name} with type {normalized[index].CheckedType}.");
+                    }
+
+                    continue;
+                }
+
+                var argumentType = (IRType?)argumentBuffer.DistributedType ??
+                    new TensorType(argumentBuffer.ElemType, new RankedShape(argumentBuffer.Dimensions.ToArray()));
+                if (Equals(argumentType, parameter.CheckedType))
+                {
+                    continue;
+                }
+
+                if (!BufferViewUtility.TryCreate(argumentType, parameter.CheckedType, out var transform))
+                {
+                    throw new InvalidOperationException(
+                        $"PrimFunction {primFunction.Name} tensor parameter {parameter.Name} expects {parameter.CheckedType}, " +
+                        $"but argument {index} has storage-incompatible type {argumentType}.");
+                }
+
+                normalized[index] = BufferViewUtility.CreateLogicalBufferView(
+                    argumentBuffer,
+                    parameter.CheckedType,
+                    transform,
+                    $"{primFunction.Name}_arg{index}_abi_view");
+            }
+
+            return normalized;
         }
 
         private static bool TryGetPrimFunctionTarget(Expr target, out TIR.PrimFunction primFunction)
@@ -429,8 +579,8 @@ public abstract class TIRSelectionPass : FunctionPass
                 var output = CreateOutputBuffer(call);
                 var newCall = call.Target switch
                 {
-                    TIR.PrimFunction deviceFunc => new Call(deviceFunc, arguments.Concat(FlattenOutputArguments(output)).ToArray()),
-                    PrimFunctionWrapper { Target: TIR.PrimFunction deviceFunc } => new Call(deviceFunc, arguments.Concat(FlattenOutputArguments(output)).ToArray()),
+                    TIR.PrimFunction deviceFunc => CreatePrimFunctionCall(deviceFunc, arguments.Concat(FlattenOutputArguments(output)).ToArray()),
+                    PrimFunctionWrapper { Target: TIR.PrimFunction deviceFunc } => CreatePrimFunctionCall(deviceFunc, arguments.Concat(FlattenOutputArguments(output)).ToArray()),
                     Function fn => new Call(new FunctionWrapper(_selectionPass.ModuleKind, fn), arguments.Concat(FlattenOutputArguments(output)).ToArray()),
                     _ => _selectionPass.SelectCall(call, arguments, ref Unsafe.As<BaseExpr, Expr>(ref output), _selectionContext),
                 };

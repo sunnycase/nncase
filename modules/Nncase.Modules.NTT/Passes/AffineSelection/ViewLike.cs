@@ -16,23 +16,44 @@ public partial class NTTAffineSelectionPass
             throw new InvalidOperationException($"Affine Reshape must preserve dtype and lanes, got input={input.CheckedDataType}, output={output.CheckedDataType}.");
         }
 
-        return CreateAffineView(call, input, output);
+        if (!BufferViewUtility.TryCreate(input.CheckedType, output.CheckedType, out var transform))
+        {
+            return call;
+        }
+
+        return IR.F.Affine.Grid()
+            .Domain(transform.DomainBounds.Count, out var _)
+            .Read(input, transform.SourceMap, out var inputTile)
+            .Write(output, transform.ResultMap, out var outputTile)
+            .Body(TIR.F.NTT.Reshape(inputTile, outputTile))
+            .Build();
     }
 
     public Expr SelectBitcast(Call call, Expr output)
     {
         var input = (Expr)call[IR.Tensors.Bitcast.Input];
-        return CreateAffineView(call, input, output);
-    }
-
-    private static Expr CreateAffineView(Call originalCall, Expr input, Expr output)
-    {
-        if (!AffineViewUtility.TryCreate(input.CheckedType, output.CheckedType, out var transform))
+        if (GetScalarDataType(input.CheckedDataType) != GetScalarDataType(output.CheckedDataType))
         {
-            throw new NotSupportedException(
-                $"{originalCall.Target.GetType().Name} from {input.CheckedType} to {output.CheckedType} cannot be represented as a zero-copy affine view.");
+            return call;
         }
 
-        return IR.F.Affine.View(input, output.CheckedType, transform);
+        if (!BufferViewUtility.TryCreate(input.CheckedType, output.CheckedType, out var transform))
+        {
+            return call;
+        }
+
+        return IR.F.Affine.Grid()
+            .Domain(transform.DomainBounds.Count, out var _)
+            .Read(input, transform.SourceMap, out var inputTile)
+            .Write(output, transform.ResultMap, out var outputTile)
+            .Body(TIR.F.NTT.Bitcast(inputTile, outputTile))
+            .Build();
     }
+
+    private static DataType GetScalarDataType(DataType dataType) => dataType switch
+    {
+        VectorType vectorType => vectorType.ElemType,
+        MaskVectorType => DataTypes.Boolean,
+        _ => dataType,
+    };
 }

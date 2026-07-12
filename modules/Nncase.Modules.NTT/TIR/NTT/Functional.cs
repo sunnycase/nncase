@@ -42,6 +42,16 @@ public partial class NTT
         return new Call(new TIR.NTT.Unary(unaryOp), input, output);
     }
 
+    public static Call Reshape(Expr input, Expr output)
+    {
+        return new Call(new TIR.NTT.Reshape(), input, output);
+    }
+
+    public static Call Bitcast(Expr input, Expr output)
+    {
+        return new Call(new TIR.NTT.Bitcast(), input, output);
+    }
+
     public static Call Matmul(Expr lhs, Expr rhs, Expr output, Expr loadC, Expr scale, Expr extra, IRArray<int> lhsVectorizedAxes, IRArray<int> rhsVectorizedAxes, bool transA = false, bool transB = false, bool fusedReduce = false, string cSourcePath = "", string funcName = "")
     {
         return new Call(new Matmul(lhsVectorizedAxes, rhsVectorizedAxes, transA, transB, fusedReduce, cSourcePath, funcName), lhs, rhs, output, loadC, scale, extra);

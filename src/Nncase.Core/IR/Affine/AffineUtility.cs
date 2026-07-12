@@ -14,6 +14,51 @@ namespace Nncase.IR.Affine;
 
 public static class AffineUtility
 {
+    /// <summary>
+    /// Restricts statically addressed access ranges to the physical buffer shape.
+    /// Dynamic ranges are already constrained through the grid domain.
+    /// </summary>
+    public static AffineMap RestrictAccessMapToShape(AffineMap map, ReadOnlySpan<long> shape)
+    {
+        if (map.Results.Length != shape.Length)
+        {
+            throw new ArgumentException(
+                $"Cannot restrict a rank-{map.Results.Length} access map to a rank-{shape.Length} buffer shape.",
+                nameof(shape));
+        }
+
+        var changed = false;
+        var results = map.Results.ToArray();
+        for (var axis = 0; axis < results.Length; axis++)
+        {
+            if (results[axis] is not { Offset: AffineConstant offset, Extent: AffineConstant extent })
+            {
+                continue;
+            }
+
+            if (offset.Value != 0)
+            {
+                var end = checked(offset.Value + extent.Value);
+                if (offset.Value < 0 || end > shape[axis])
+                {
+                    throw new NotSupportedException(
+                        $"Static affine access [{offset.Value}, {end}) exceeds physical axis {axis} bound {shape[axis]}.");
+                }
+
+                continue;
+            }
+
+            var boundedExtent = System.Math.Min(extent.Value, shape[axis]);
+            if (boundedExtent != extent.Value)
+            {
+                results[axis] = new AffineRange(0, boundedExtent);
+                changed = true;
+            }
+        }
+
+        return changed ? map.With(results: results) : map;
+    }
+
     public static AffineExpr Inverse<T>(AffineExpr original, T input, out T? independentVar)
             where T : AffineExpr
     {

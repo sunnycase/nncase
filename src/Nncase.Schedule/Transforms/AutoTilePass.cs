@@ -80,7 +80,7 @@ public sealed class AutoTilePass : FunctionPass
             return (arg.Edge.Source.Expr, arg.Edge.Target.Expr) switch
             {
                 (Grid, Grid) => true,
-                (Grid, IR.Tuple tp) => tp.Fields.AsValueEnumerable().All(x => x is Grid),
+                (Grid, IR.Tuple) => true,
                 _ => false,
             };
         };
@@ -124,6 +124,31 @@ public sealed class AutoTilePass : FunctionPass
 
 internal sealed class AutoTileExprGraphConvertor : ExprGraphConvertor<ExprVertex, ExprEdge>
 {
+    protected override ExprVertex VisitCall(Call expr, IMutableVertexAndEdgeListGraph<ExprVertex, ExprEdge> context)
+    {
+        switch (expr.Target)
+        {
+            case IR.Tensors.GetItem when
+                expr[IR.Tensors.GetItem.Input].CheckedType is TupleType &&
+                expr[IR.Tensors.GetItem.Index] is DimConst index:
+                var input = expr[IR.Tensors.GetItem.Input];
+                if (input is IR.Tuple tuple)
+                {
+                    if (index.Value < 0 || index.Value >= tuple.Fields.Length)
+                    {
+                        throw new InvalidOperationException(
+                            $"Tuple projection index {index.Value} is outside [0, {tuple.Fields.Length}).");
+                    }
+
+                    return Visit(tuple.Fields[checked((int)index.Value)], context);
+                }
+
+                return Visit(input, context);
+            default:
+                return base.VisitCall(expr, context);
+        }
+    }
+
     protected override ExprVertex VisitGrid(Grid expr, IMutableVertexAndEdgeListGraph<ExprVertex, ExprEdge> context)
     {
         foreach (var access in expr.Accesses)
