@@ -12,7 +12,7 @@ public sealed class QKVParallelLinearEvaluator : ITypeInferencer<QKVParallelLine
 {
     public IRType Visit(ITypeInferenceContext context, QKVParallelLinear target) => TupleType.Void;
 
-    public TileWorkload Visit(QKVParallelLinear op, TileWorkloadContext context) => new MatrixTileWorkload(GetMatrixShape);
+    public TileWorkload Visit(QKVParallelLinear op, TileWorkloadContext context) => new MatrixTileWorkload(GetMatrixShape, DataTypes.Float32.SizeInBytes);
 
     private static MatrixTileWorkloadShape GetMatrixShape(Google.OrTools.ConstraintSolver.IntExpr[][] bufferShapes, Google.OrTools.ConstraintSolver.Solver solver, TileWorkloadContext context)
     {

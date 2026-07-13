@@ -77,9 +77,15 @@ public sealed class PrimFunctionWrapper : BaseFunction
 
     public override BaseFunction With(string? name = null, string? moduleKind = null)
     {
-        return new PrimFunctionWrapper(name ?? Name, Target, ParametersCount, TypeHints.ToArray());
+        return new PrimFunctionWrapper(name ?? Name, Target, ParametersCount, TypeHints.ToArray())
+        {
+            Role = Role,
+        };
     }
 
     public PrimFunctionWrapper With(string? name = null, PrimFunction? target = null, int? parametersCount = null, IRType[]? hints = null)
-        => new PrimFunctionWrapper(name ?? Name, target ?? Target, parametersCount ?? ParametersCount, hints ?? TypeHints.ToArray());
+        => new PrimFunctionWrapper(name ?? Name, target ?? Target, parametersCount ?? ParametersCount, hints ?? TypeHints.ToArray())
+        {
+            Role = Role,
+        };
 }

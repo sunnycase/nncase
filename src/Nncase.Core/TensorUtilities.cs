@@ -171,10 +171,17 @@ public static class TensorUtilities
             stride *= dimensions[i];
         }
 
-        // Post process: replace the stride with 0 if the dimension is 1.
+        // Keep dynamic dimensions dense. A runtime-select zero stride is valid
+        // when the extent happens to be one, but it makes equivalent subviews
+        // at different tile levels carry structurally different descriptors.
+        // Zero stride is only the canonical representation for a statically
+        // known singleton dimension.
         for (int i = 0; i < strides.Length; i++)
         {
-            strides[i] = Dimension.Select(dimensions[i], Dimension.One, Dimension.Zero, strides[i]);
+            if (dimensions[i] is DimConst { Value: 1 })
+            {
+                strides[i] = Dimension.Zero;
+            }
         }
 
         return strides;

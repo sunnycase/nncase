@@ -66,6 +66,16 @@ public static class T
         return new Call(new Memcopy(), dest, src);
     }
 
+    public static Call TileLoad(Expr dest, Expr src)
+    {
+        return new Call(new TileLoad(), dest, src);
+    }
+
+    public static Call TileStore(Expr src, Expr dest)
+    {
+        return new Call(new TileStore(), src, dest);
+    }
+
     /// <summary>
     /// Store value to the buffer.
     /// Equivalent to ((DType*)buffer_var)[index] = value.
@@ -107,6 +117,8 @@ public static class T
     /// <param name="var_name">loop var name.</param>
     /// <returns> the for loop. </returns>
     public static ISequentialBuilder<For> Serial(out DimVar loopVar, Range domain, [CallerArgumentExpression("loopVar")] string var_name = "v") => ForLoop(out loopVar, domain, LoopMode.Serial, var_name);
+
+    public static ISequentialBuilder<For> Reduction(out DimVar loopVar, Range domain, [CallerArgumentExpression("loopVar")] string var_name = "v") => ForLoop(out loopVar, domain, LoopMode.Reduction, var_name);
 
     /// <summary>
     /// make unroll for loop.

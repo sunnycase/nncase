@@ -149,12 +149,33 @@ public sealed class UnitTestTritonTargetCostModel : TestClassBase
         Assert.Equal(NTTTargetMachineCatalog.Rtx5060Ti16Gb, rtx.Id);
         Assert.Equal(36, rtx.Execution.ComputeUnitCount);
         Assert.Equal(8, rtx.Execution.WorkersPerBlock);
-        Assert.Equal(MemoryLocation.Shared, rtx.TilingMemorySpaces.Single().TIRBinding?.Location);
-        Assert.Equal(101_376, rtx.TilingMemorySpaces.Single().CapacityBytes);
-        Assert.Equal(16L * 1024 * 1024 * 1024, rtx.GetMemorySpace(rtx.RootMemorySpace).CapacityBytes);
+        Assert.Equal(8 * 1024, rtx.Execution.BackendPrivateAccumulatorCapacityBytes);
+        Assert.Equal(16, rtx.Execution.BackendPrivateMatrixAccumulatorMinM);
+        Assert.Equal(16, rtx.Execution.BackendPrivateMatrixAccumulatorMinN);
+        Assert.Equal(32, rtx.Execution.BackendPrivateGemvAccumulatorMinN);
+        Assert.Equal(
+            [MemoryLocation.Shared, MemoryLocation.BlockLocalData],
+            rtx.TilingMemorySpaces.Select(space => space.TIRBinding!.Value.Location).ToArray());
+        var rtxShared = rtx.TilingMemorySpaces.Single(space => space.TIRBinding?.Location == MemoryLocation.Shared);
+        Assert.Equal(32 * 1024, rtxShared.MaxAllocationBytesPerScope);
+        Assert.Equal(101_376, rtx.GetMemoryResource(rtxShared).CapacityBytes);
+        Assert.Equal(
+            16L * 1024 * 1024 * 1024,
+            rtx.GetMemoryResource(rtx.GetMemorySpace(rtx.RootMemorySpace)).CapacityBytes);
+        Assert.Equal(
+            rtx.GetMemorySpace(rtx.RootMemorySpace).ResourceId,
+            rtx.TilingMemorySpaces.Single(space => space.TIRBinding?.Location == MemoryLocation.BlockLocalData).ResourceId);
+        Assert.True(rtx.RequiresExplicitTransfer(0));
+        Assert.False(rtx.RequiresExplicitTransfer(1));
         Assert.DoesNotContain(rtx.Compute.MatrixPrimitives, primitive => primitive.Name == "wgmma" && primitive.IsSupported);
         Assert.Equal(NTTTargetMachineCatalog.H800Sxm80Gb, h800.Id);
-        Assert.Equal(80L * 1024 * 1024 * 1024, h800.GetMemorySpace(h800.RootMemorySpace).CapacityBytes);
+        Assert.Equal(8 * 1024, h800.Execution.BackendPrivateAccumulatorCapacityBytes);
+        var h800Shared = h800.TilingMemorySpaces.Single(space => space.TIRBinding?.Location == MemoryLocation.Shared);
+        Assert.Equal(64 * 1024, h800Shared.MaxAllocationBytesPerScope);
+        Assert.Equal(227 * 1024, h800.GetMemoryResource(h800Shared).CapacityBytes);
+        Assert.Equal(
+            80L * 1024 * 1024 * 1024,
+            h800.GetMemoryResource(h800.GetMemorySpace(h800.RootMemorySpace)).CapacityBytes);
         Assert.Contains(h800.Compute.MatrixPrimitives, primitive => primitive.Name == "wgmma" && primitive.IsSupported);
     }
 
@@ -204,13 +225,15 @@ public sealed class UnitTestTritonTargetCostModel : TestClassBase
         double wgmmaInstructionsPerCycle = 1,
         long gridSynchronizationCycles = 2200)
     {
-        var register = new TargetMemorySpaceId("test.register");
+        var sharedResource = new TargetMemoryResourceId("test.shared-memory");
+        var globalResource = new TargetMemoryResourceId("test.global-memory");
         var shared = new TargetMemorySpaceId("test.shared");
+        var blockGlobal = new TargetMemorySpaceId("test.block-global");
         var global = new TargetMemorySpaceId("test.global");
         var operandTypes = ImmutableArray.Create<DataType>(DataTypes.Float16, DataTypes.BFloat16, DataTypes.Float32, DataTypes.Int8);
         return new TargetMachineModel(
             "test-gpu",
-            new(BlockExecutionKind.PersistentGpuBlock, 128, 8, 32, 1.0, 128, 4),
+            new(BlockExecutionKind.PersistentGpuBlock, 128, 8, 32, 1.0, 128, 4, 8 * 1024, 16, 16, 32),
             new(
                 elementwiseElementsPerCycle,
                 simtFmaPerCycle,
@@ -219,15 +242,24 @@ public sealed class UnitTestTritonTargetCostModel : TestClassBase
                     new MatrixComputePrimitiveSpec("wgmma", 64, 8, 16, wgmmaInstructionsPerCycle, operandTypes))),
             new(25, gridSynchronizationCycles),
             [
-                new(register, TargetMemorySpaceKind.Register, MemorySharingScope.Block, new(MemoryLocation.Register), 256 * 1024, 4096, 4096, 1, false, -1, false, false, false, 4),
-                new(shared, TargetMemorySpaceKind.Shared, MemorySharingScope.Block, new(MemoryLocation.Shared), 48 * 1024, blockBytesPerCycle, blockBytesPerCycle, 20, true, 0, true, true, true, 16),
-                new(global, TargetMemorySpaceKind.Global, MemorySharingScope.Chip, null, int.MaxValue, rootBytesPerCycle, rootBytesPerCycle, 300, false, -1, true, true, false, 128),
+                new(sharedResource, TargetMemorySpaceKind.Shared, 48 * 1024, blockBytesPerCycle, blockBytesPerCycle, 20, 16),
+                new(globalResource, TargetMemorySpaceKind.Global, int.MaxValue, rootBytesPerCycle, rootBytesPerCycle, 300, 128),
+            ],
+            [
+                new(shared, sharedResource, MemorySharingScope.Block, new(MemoryLocation.Shared), 48 * 1024, TargetMemoryAllocationSizePolicy.PowerOfTwo, true, 0, true, true, true),
+                new(blockGlobal, globalResource, MemorySharingScope.Block, new(MemoryLocation.BlockLocalData), 64 * 1024 * 1024, TargetMemoryAllocationSizePolicy.GranularityAligned, true, 1, true, true, true),
+                new(global, globalResource, MemorySharingScope.Chip, null, int.MaxValue, TargetMemoryAllocationSizePolicy.GranularityAligned, false, -1, true, true, false),
             ],
             global,
             [
-                new(global, shared, blockBytesPerCycle, 300),
-                new(shared, global, blockBytesPerCycle, 300),
+                new(global, blockGlobal, rootBytesPerCycle, 0, TargetMemoryTransferMode.DirectAccess),
+                new(blockGlobal, global, rootBytesPerCycle, 0, TargetMemoryTransferMode.DirectAccess),
+                new(blockGlobal, shared, blockBytesPerCycle, 300, TargetMemoryTransferMode.ExplicitCopy),
+                new(shared, blockGlobal, blockBytesPerCycle, 300, TargetMemoryTransferMode.ExplicitCopy),
             ],
-            new Dictionary<MemoryLocation, TargetMemorySpaceId>());
+            new Dictionary<MemoryLocation, TargetMemorySpaceId>
+            {
+                [MemoryLocation.BlockLocalData] = blockGlobal,
+            });
     }
 }

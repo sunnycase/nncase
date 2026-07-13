@@ -16,7 +16,38 @@
 
   string BiasLine(string bias, string output) =>
       bias == "nullptr" ? string.Empty : $"{Model.Indent}  binary<ops::add>({output}, {bias}, {output});\n";
+
+  string AccumulatingMatmulLine(bool accumulate, string rhs, string output) =>
+      $"{Model.Indent}    packed_matmul<{accumulate.ToString().ToLowerInvariant()}>({input}, {rhs}, {output}, 1.0f);\n";
+
+  string FinalizeLine(string accumulator, string bias, string output) =>
+      BiasLine(bias, accumulator) + $"{Model.Indent}  cast({accumulator}, {output}, fixed_shape_v<>);\n";
 }
+@if (Model.Reduction is { Phase: Nncase.CodeGen.NTT.ReductionKernelPhase.Accumulate } accumulate)
+{
+@Html.Raw($"{Model.Indent}{{\n")
+@Html.Raw($"{Model.Indent}  if ({accumulate.Initialized}) {{\n")
+@Html.Raw(AccumulatingMatmulLine(true, qWeight, accumulate.Accumulators[0]))
+@Html.Raw(AccumulatingMatmulLine(true, kWeight, accumulate.Accumulators[1]))
+@Html.Raw(AccumulatingMatmulLine(true, vWeight, accumulate.Accumulators[2]))
+@Html.Raw($"{Model.Indent}  }} else {{\n")
+@Html.Raw(AccumulatingMatmulLine(false, qWeight, accumulate.Accumulators[0]))
+@Html.Raw(AccumulatingMatmulLine(false, kWeight, accumulate.Accumulators[1]))
+@Html.Raw(AccumulatingMatmulLine(false, vWeight, accumulate.Accumulators[2]))
+@Html.Raw($"{Model.Indent}    {accumulate.Initialized} = true;\n")
+@Html.Raw($"{Model.Indent}  }}\n")
+@Html.Raw($"{Model.Indent}}}\n")
+}
+else if (Model.Reduction is { Phase: Nncase.CodeGen.NTT.ReductionKernelPhase.Finalize } finalize)
+{
+@Html.Raw($"{Model.Indent}{{\n")
+@Html.Raw(FinalizeLine(finalize.Accumulators[0], qBias, qOutput))
+@Html.Raw(FinalizeLine(finalize.Accumulators[1], kBias, kOutput))
+@Html.Raw(FinalizeLine(finalize.Accumulators[2], vBias, vOutput))
+@Html.Raw($"{Model.Indent}}}\n")
+}
+else
+{
 @Html.Raw($"{Model.Indent}{{\n")
 @Html.Raw(MatmulLine(qWeight, qOutput))
 @Html.Raw(BiasLine(qBias, qOutput))
@@ -25,3 +56,4 @@
 @Html.Raw(MatmulLine(vWeight, vOutput))
 @Html.Raw(BiasLine(vBias, vOutput))
 @Html.Raw($"{Model.Indent}}}\n")
+}

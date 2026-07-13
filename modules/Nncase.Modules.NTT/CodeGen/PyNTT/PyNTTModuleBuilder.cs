@@ -35,7 +35,7 @@ public sealed class PyNTTModuleBuilder : IModuleBuilder
     {
         var primFunctions = functions
             .Select(RequirePrimFunction)
-            .Where(function => !PyNTTPrimFunctionRoles.IsAutoTilingDeviceFunction(function))
+            .Where(function => !PyNTTPrimFunctionRoles.IsScheduledRegionFunction(function))
             .ToArray();
         var linkableFunctions = primFunctions
             .Select((function, index) => new PyNTTFunctionBuilder((uint)index, CompileOptions).Build(function))

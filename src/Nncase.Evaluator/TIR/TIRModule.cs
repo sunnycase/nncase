@@ -16,6 +16,8 @@ internal class TIRModule : IApplicationPart
         registrator.RegisterManyInterface<LoadEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<RampEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<MemcopyEvaluator>(reuse: Reuse.Singleton);
+        registrator.RegisterManyInterface<TileLoadEvaluator>(reuse: Reuse.Singleton);
+        registrator.RegisterManyInterface<TileStoreEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<StoreEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<NopEvaluator>(reuse: Reuse.Singleton);
     }

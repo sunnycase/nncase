@@ -73,18 +73,27 @@ public sealed record DomainRelation(int DomainOp, int RangeOp, AffineMap Map)
         }
 
         var constraints = new List<string>();
-        string RangeAddDim(AffineConstant low, AffineConstant up)
+        string ConvertRange(AffineRange range, int index)
         {
-            var dim = $"d{domains.Length + constraints.Count}";
-            constraints.Add($"{low} <= {dim} < {up}");
-            return dim;
+            var offset = range.Offset.GetDisplayString(Map.Symbols);
+            var pointMultiplicity = Map.GetPointMultiplicity(index);
+
+            // A rectangular range map describes how a whole input tile maps
+            // to an output tile. ISL applies relations to individual points:
+            // (scale*d, scale*t) therefore maps one point to scale adjacent
+            // points, while identity and downscale maps remain single-valued.
+            if (pointMultiplicity <= 1)
+            {
+                return offset;
+            }
+
+            var result = $"r{index}";
+            constraints.Add($"({offset}) <= {result}");
+            constraints.Add($"{result} < ({offset}) + {pointMultiplicity}");
+            return result;
         }
 
-        var results = StringUtility.Join(", ", Map.Results.ToArray().Select(expr => expr.Offset switch
-        {
-            AffineConstant c => RangeAddDim(c.Value, (AffineConstant)expr.Extent),
-            _ => expr.Offset.GetDisplayString(Map.Symbols),
-        }));
+        var results = StringUtility.Join(", ", Map.Results.ToArray().Select(ConvertRange));
 
         var constraintClause = constraints.Count == 0 ? string.Empty : $" : {string.Join(" and ", constraints)}";
         return new Isl.map(Isl.ctx.Current, $"{{ [{domains}] -> [{results}]{constraintClause} }}");
@@ -95,12 +104,13 @@ public sealed record DomainRelation(int DomainOp, int RangeOp, AffineMap Map)
 
 public sealed class TileGrid : ITileable
 {
-    public TileGrid(Grid grid, Op op, int opId, IEnumerable<long> domainBounds, DomainRelation relation, Dimension[] domainBoundsExpr, IEnumerable<bool> domainDynamic, IEnumerable<IEnumerable<long>> bufferShapes, TileGridAttribute attribute)
+    public TileGrid(Grid grid, Op op, int opId, int regionOpId, IEnumerable<long> domainBounds, DomainRelation relation, Dimension[] domainBoundsExpr, IEnumerable<bool> domainDynamic, IEnumerable<IEnumerable<long>> bufferShapes, TileGridAttribute attribute)
     {
         Level = -1;
         Grid = grid;
         Op = op;
         OpId = opId;
+        RegionOpId = regionOpId;
         DomainDynamic = ImmutableArray.CreateRange(domainDynamic);
         DomainRelation = relation;
         Attribute = attribute;
@@ -144,6 +154,12 @@ public sealed class TileGrid : ITileable
     public int Level { get; }
 
     public int OpId { get; }
+
+    /// <summary>
+    /// Gets the immutable source-region identity. Schedule-only clones have a
+    /// unique <see cref="OpId"/> but retain their source operation identity.
+    /// </summary>
+    public int RegionOpId { get; }
 
     public DomainRelation DomainRelation { get; set; }
 

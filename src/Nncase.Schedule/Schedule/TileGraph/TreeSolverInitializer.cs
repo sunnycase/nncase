@@ -54,8 +54,11 @@ public sealed class TreeSolverInitializer : TreeSolverBase<IntExpr>, ITreeNodeVi
 
         // TileNode variables are exact hierarchy decomposition factors. Hardware
         // kernel tile extents belong to OpNode and use power-of-two domains below.
+        var reductionAxes = ReductionAxisAnalysis.GetReductionAxes(value);
         var tileVars = domainBounds
-            .Select((bound, n) => Solver.MakeIntVar(1, bound, $"op{value.OpId}_d{n}_L{value.Level}"))
+            .Select((bound, n) => reductionAxes[n] && value.Level > 0
+                ? Solver.MakeIntConst(1).Var()
+                : Solver.MakeIntVar(1, bound, $"op{value.OpId}_d{n}_L{value.Level}"))
             .ToArray();
         var forwardExtents = tileVars.Cast<IntExpr>().ToArray();
         if (!TileableNodeMemo.TryGetValue(value, out var dimInfo))
@@ -116,7 +119,13 @@ public sealed class TreeSolverInitializer : TreeSolverBase<IntExpr>, ITreeNodeVi
         var backWardExtents = GetBackWardExtents(tileVars, childResult.DimsMaps, childResult.BackWardExtents, domainBounds);
 
         // {def bid : use bid}
-        var defUseMap = BufferGraphMemo[value.Wrapped].Edges.Where(e => e.Tag == BufferEdgeKind.Inter).ToBiDictionary(e => e.Source, e => e.Target);
+        var currentBufferGraph = BufferGraphMemo[value.Wrapped];
+        var defUseMap = childResult.DefUseMap;
+        foreach (var edge in currentBufferGraph.GetOwnedInterEdges())
+        {
+            defUseMap.Add(edge.Source, edge.Target);
+        }
+
         var bufferResults = new List<BufferResult>();
 
         // gather the min/max lifeness child.
@@ -158,7 +167,12 @@ public sealed class TreeSolverInitializer : TreeSolverBase<IntExpr>, ITreeNodeVi
                 {
                     bufferInfo = GetBufferInfo(value, curId, currentAccessMap, nodeLifeness, currentLifeness, tileVars, forwardExtents, backWardExtents, result.ElemSize);
                     bufferInfoMap.Add(curId, bufferInfo);
-                    bufferResults.Add(new(curId, currentLifeness, value.DomainRelation.Map * currentAccessMap, result.ElemSize));
+                    var isInternalDefinition = defUseMap.ContainsKey(curId);
+                    var isVisibleToParent = value.Parent is TileNode;
+                    if (!isInternalDefinition || isVisibleToParent)
+                    {
+                        bufferResults.Add(new(curId, currentLifeness, value.DomainRelation.Map * currentAccessMap, result.ElemSize));
+                    }
                 }
             }
 
@@ -443,7 +457,9 @@ public sealed class TreeSolverInitializer : TreeSolverBase<IntExpr>, ITreeNodeVi
                 }
             }
 
-            bufferSizes[pos] = subDomainShapes.Aggregate(elemSize, Solver.MakeProd);
+            var sizeExpr = subDomainShapes.Aggregate(elemSize, Solver.MakeProd);
+            var maxBufferSize = GetMaxBufferSize(bid, elemSize);
+            bufferSizes[pos] = Solver.MakeMin(sizeExpr, maxBufferSize);
             bufferSizes[pos].SetName($"size[cl{tileNode.Level}, op{bid.Node.OpId}, b{bid.Index}_{bid.Endpoint}, ci{pos}]");
 
             var loop = pos - 1;
@@ -471,6 +487,27 @@ public sealed class TreeSolverInitializer : TreeSolverBase<IntExpr>, ITreeNodeVi
 
         var bufferInfo = new TileNodeBufferInfo<IntExpr>(bufferLiveness, accessMap, bufferPlaces, bufferShapes, bufferSizes, bufferTrips, bufferMask);
         return bufferInfo;
+    }
+
+    private static long GetMaxBufferSize(BufferIdentity bid, IntExpr elemSize)
+    {
+        var elemSizeVar = elemSize.Var();
+        if (elemSizeVar.Min() != elemSizeVar.Max())
+        {
+            throw new InvalidOperationException($"Tile buffer {bid} element size must be a compile-time constant.");
+        }
+
+        try
+        {
+            return bid.Node.BufferShapes[bid.Index]
+                .Aggregate(elemSizeVar.Max(), checked((size, extent) => size * extent));
+        }
+        catch (OverflowException ex)
+        {
+            throw new InvalidOperationException(
+                $"Tile buffer {bid} maximum byte size exceeds the 64-bit solver limit.",
+                ex);
+        }
     }
 
     /// <summary>

@@ -194,7 +194,7 @@ def test_pyntt_runtime_materializes_zero_copy_input_result_views():
     assert bytes_view.data_ptr() == x.data_ptr()
 
 
-def test_pyntt_renderer_threads_one_shared_pool_through_device_functions():
+def test_pyntt_renderer_separates_tiling_and_typed_call_frame_shared_arenas():
     _add_pyntt_to_path()
 
     from pyntt.codegen.render import render_manifest
@@ -209,24 +209,38 @@ def test_pyntt_renderer_threads_one_shared_pool_through_device_functions():
                                 "name": "top",
                                 "inputs": [],
                                 "outputs": [],
-                                "attrs": {"shared_memory_bytes": 128},
+                                "attrs": {
+                                    "shared_memory_bytes": 65_536,
+                                    "shared_memory_capacity_bytes": 101_376,
+                                    "shared_memory_allocation_size_policy": "power_of_two",
+                                    "shared_memory_allocation_granularity_bytes": 16,
+                                },
                             },
-                            "body_source": "__pyntt_device_call__child(data)",
+                            "body_source": "__pyntt_device_call__child(data, numel)",
                             "device_functions": [
                                 {
                                     "name": "child",
                                     "noinline": True,
                                     "preserve_helper_call_boundaries": False,
-                                    "pointer_call_frame": [
+                                    "call_frame": [
                                         {
                                             "name": "child_data",
                                             "triton_dtype": "tl.uint8",
-                                        }
+                                            "is_pointer": True,
+                                        },
+                                        {
+                                            "name": "child_extent",
+                                            "triton_dtype": "tl.int64",
+                                            "is_pointer": False,
+                                        },
                                     ],
                                     "helpers": [],
-                                    "body_source": "tl.load(child_data)",
+                                    "body_source": "tl.load(child_data) + child_extent",
                                     "parameter_overrides": {},
-                                    "extra_parameters": ["child_data"],
+                                    "extra_parameters": [
+                                        "child_data",
+                                        "child_extent",
+                                    ],
                                     "extra_parameter_arguments": {},
                                 }
                             ],
@@ -238,14 +252,307 @@ def test_pyntt_renderer_threads_one_shared_pool_through_device_functions():
     )
 
     assert "import triton.experimental.tle.language as tle" in source
-    assert source.count("pyntt_shared_storage = tle.gpu.alloc([256]") == 1
+    assert source.count("pyntt_shared_storage = tle.gpu.alloc([65536]") == 1
+    assert source.count("pyntt_call_frame_storage = tle.gpu.alloc([16]") == 1
     assert "@triton.jit(noinline=True)\ndef child(" in source
     assert "child_data" not in source.split("def child(", 1)[1].split("):", 1)[0]
+    assert "child_extent" not in source.split("def child(", 1)[1].split("):", 1)[0]
     assert "tl.pointer_type(tl.uint64, 3)" in source
+    assert "tl.pointer_type(tl.int64, 3)" in source
     assert "tl.store(" in source
     assert "tl.load(" in source
     assert "pyntt_shared_base" in source
+    assert "pyntt_call_frame_base" in source
     assert "child(" in source
+
+
+def test_pyntt_renderer_compacts_context_before_device_call_frames():
+    _add_pyntt_to_path()
+
+    from pyntt.codegen.render import render_manifest
+
+    source = render_manifest(
+        {
+            "functions": [
+                {
+                    "render_kernels": [
+                        {
+                            "metadata": {
+                                "name": "top",
+                                "inputs": ["input0", "input1"],
+                                "outputs": ["output0"],
+                                "attrs": {
+                                    "shared_memory_capacity_bytes": 64,
+                                    "shared_memory_allocation_size_policy": "power_of_two",
+                                    "shared_memory_allocation_granularity_bytes": 8,
+                                },
+                            },
+                            "body_source": "__pyntt_device_call__child(numel)",
+                            "device_functions": [
+                                {
+                                    "name": "child",
+                                    "noinline": True,
+                                    "preserve_helper_call_boundaries": False,
+                                    "call_frame": [
+                                        {
+                                            "name": "child_extent",
+                                            "triton_dtype": "tl.int64",
+                                            "is_pointer": False,
+                                        }
+                                    ],
+                                    "helpers": [],
+                                    "body_source": "tl.load(rdata) + child_extent",
+                                    "parameter_overrides": {},
+                                    "extra_parameters": ["child_extent"],
+                                    "extra_parameter_arguments": {},
+                                }
+                            ],
+                        }
+                    ]
+                }
+            ]
+        }
+    )
+
+    # rdata is late in the canonical top-kernel parameter list, but it is the
+    # only live context value. Its compact slot must precede the child frame.
+    assert source.count("pyntt_call_frame_storage = tle.gpu.alloc([16]") == 1
+    assert "(pyntt_call_frame_base + 0).to(tl.pointer_type(tl.uint64, 3))" in source
+    assert "(pyntt_call_frame_base + 8).to(tl.pointer_type(tl.int64, 3))" in source
+
+
+def test_pyntt_renderer_reuses_sibling_device_call_frames():
+    _add_pyntt_to_path()
+
+    from pyntt.codegen.render import render_manifest
+
+    def device_function(name, body, frame_count):
+        pointer_names = [f"{name}_ptr{index}" for index in range(frame_count)]
+        return {
+            "name": name,
+            "noinline": True,
+            "preserve_helper_call_boundaries": False,
+            "call_frame": [
+                {
+                    "name": pointer_name,
+                    "triton_dtype": "tl.uint8",
+                    "is_pointer": True,
+                }
+                for pointer_name in pointer_names
+            ],
+            "helpers": [],
+            "body_source": body,
+            "parameter_overrides": {},
+            "extra_parameters": pointer_names,
+            "extra_parameter_arguments": {},
+        }
+
+    source = render_manifest(
+        {
+            "functions": [
+                {
+                    "render_kernels": [
+                        {
+                            "metadata": {
+                                "name": "top",
+                                "inputs": [],
+                                "outputs": [],
+                                "attrs": {
+                                    "shared_memory_bytes": 0,
+                                    "shared_memory_capacity_bytes": 64,
+                                    "shared_memory_allocation_size_policy": "power_of_two",
+                                    "shared_memory_allocation_granularity_bytes": 8,
+                                },
+                            },
+                            "body_source": "__pyntt_device_call__parent(data)",
+                            "device_functions": [
+                                device_function(
+                                    "parent",
+                                    "__pyntt_device_call__left(data, data, data, data)\n"
+                                    "__pyntt_device_call__right(data, data, data, data)",
+                                    1,
+                                ),
+                                device_function("left", "pass", 4),
+                                device_function("right", "pass", 4),
+                            ],
+                        }
+                    ]
+                }
+            ]
+        }
+    )
+
+    # parent: 8 bytes; left/right are sequential siblings sharing the next
+    # 32 bytes. The 40-byte maximum live stack rounds to 64 bytes.
+    assert source.count("pyntt_call_frame_storage = tle.gpu.alloc([64]") == 1
+
+
+def test_pyntt_renderer_structurally_composes_dispatch_functions():
+    _add_pyntt_to_path()
+
+    from pyntt.codegen.render import render_manifest
+
+    def device_function(
+        name, body, *, compose_into_caller=False, extra_parameters=()
+    ):
+        return {
+            "name": name,
+            "compose_into_caller": compose_into_caller,
+            "noinline": not compose_into_caller,
+            "preserve_helper_call_boundaries": False,
+            "call_frame": [],
+            "helpers": [],
+            "body_source": body,
+            "parameter_overrides": {},
+            "extra_parameters": list(extra_parameters),
+            "extra_parameter_arguments": {},
+        }
+
+    manifest = {
+        "functions": [
+            {
+                "render_kernels": [
+                    {
+                        "metadata": {
+                            "name": "top",
+                            "inputs": [],
+                            "outputs": [],
+                            "attrs": {
+                                "shared_memory_capacity_bytes": 128,
+                                "shared_memory_allocation_size_policy": "power_of_two",
+                                "shared_memory_allocation_granularity_bytes": 8,
+                            },
+                        },
+                        "body_source": (
+                            "# pyntt_trace_event: begin_function:dispatch\n"
+                            "__pyntt_device_call__dispatch(data, numel)\n"
+                            "# pyntt_trace_event: end_function:dispatch"
+                        ),
+                        "device_functions": [
+                            {
+                                **device_function(
+                                    "dispatch",
+                                    "# keep dispatch trace\n"
+                                    "__pyntt_device_call__nested("
+                                    "dispatch_data.to(tl.pointer_type(tl.uint8)), "
+                                    "dispatch_extent)",
+                                    compose_into_caller=True,
+                                    extra_parameters=(
+                                        "dispatch_data",
+                                        "dispatch_extent",
+                                    ),
+                                ),
+                                "helpers": [
+                                    {
+                                        "template": "triton/kernels/ElementwiseUnary.py.jinja",
+                                        "model": {},
+                                        "arguments": [],
+                                    }
+                                ],
+                            },
+                            device_function(
+                                "nested",
+                                "__pyntt_device_call__leaf("
+                                "nested_data, nested_extent)",
+                                compose_into_caller=True,
+                                extra_parameters=(
+                                    "nested_data",
+                                    "nested_extent",
+                                ),
+                            ),
+                            device_function(
+                                "leaf",
+                                "tl.load(leaf_data) + leaf_extent",
+                                extra_parameters=("leaf_data", "leaf_extent"),
+                            ),
+                        ],
+                    }
+                ]
+            }
+        ]
+    }
+    from pyntt.codegen.render import _compose_device_functions
+
+    normalized = _compose_device_functions(
+        manifest["functions"][0]["render_kernels"][0]
+    )
+    assert normalized["helpers"][0]["noinline"] is True
+
+    normalized["helpers"] = []
+    source = render_manifest(
+        {"functions": [{"render_kernels": [normalized]}]}
+    )
+
+    assert "def dispatch(" not in source
+    assert "def nested(" not in source
+    assert "dispatch_data" not in source
+    assert "nested_data" not in source
+    assert "# keep dispatch trace" in source
+    assert "@triton.jit(noinline=True)\ndef leaf(" in source
+    assert "leaf((data).to(tl.pointer_type(tl.uint8)), numel)" in source
+
+
+def test_pyntt_renderer_propagates_only_live_canonical_device_parameters():
+    _add_pyntt_to_path()
+
+    from pyntt.codegen.render import render_manifest
+
+    def device_function(name, body):
+        return {
+            "name": name,
+            "noinline": True,
+            "preserve_helper_call_boundaries": False,
+            "call_frame": [],
+            "helpers": [],
+            "body_source": body,
+            "parameter_overrides": {},
+            "extra_parameters": [],
+            "extra_parameter_arguments": {},
+        }
+
+    source = render_manifest(
+        {
+            "functions": [
+                {
+                    "render_kernels": [
+                        {
+                            "metadata": {
+                                "name": "top",
+                                "inputs": ["unused", "live"],
+                                "outputs": [],
+                                "attrs": {
+                                    "runtime_shape_args": ["extent"],
+                                    "shared_memory_capacity_bytes": 128,
+                                    "shared_memory_allocation_size_policy": "power_of_two",
+                                    "shared_memory_allocation_granularity_bytes": 8,
+                                },
+                            },
+                            "body_source": "__pyntt_device_call__parent()",
+                            "device_functions": [
+                                device_function(
+                                    "parent", "__pyntt_device_call__child()"
+                                ),
+                                device_function(
+                                    "child", "tl.load(input1) + extent + tl.load(rdata)"
+                                ),
+                            ],
+                        }
+                    ]
+                }
+            ]
+        }
+    )
+
+    parent_parameters = source.split("def parent(", 1)[1].split("):", 1)[0]
+    child_parameters = source.split("def child(", 1)[1].split("):", 1)[0]
+    assert parent_parameters == "input1, pyntt_call_frame_base"
+    assert child_parameters == "input1, pyntt_call_frame_base"
+    assert "parent(input1, pyntt_call_frame_base)" in source
+    assert "child(input1, pyntt_call_frame_base)" in source
+    assert "tl.store(" in source
+    assert "(rdata).to(tl.uint64)" in source
+    assert "tl.pointer_type(tl.int64, 3)" in source
+    assert "tl.load(" in source
 
 
 class _FakeCompiledKernel:
@@ -278,8 +585,10 @@ class _FakeCompiledKernel:
 class _FakeJitKernel:
     def __init__(self, compiled):
         self.compiled = compiled
+        self.calls = []
 
-    def warmup(self, *args, **kwargs):
+    def run(self, *args, **kwargs):
+        self.calls.append((args, kwargs))
         return self.compiled
 
 
@@ -288,7 +597,7 @@ class _FakeTunableJitKernel:
         self.compiled_by_candidate = compiled_by_candidate
         self.attempts = []
 
-    def warmup(self, *args, **kwargs):
+    def run(self, *args, **kwargs):
         candidate = int(args[-1])
         self.attempts.append(candidate)
         result = self.compiled_by_candidate[candidate]
@@ -302,19 +611,22 @@ def test_pyntt_runtime_accepts_kernel_within_fixed_resource_budget():
 
     from pyntt.runtime.triton import validate_triton_kernel_resources
 
-    validate_triton_kernel_resources(
-        _FakeJitKernel(
+    argument = object()
+    kernel = _FakeJitKernel(
             _FakeCompiledKernel(
                 shared=4096, registers=64, stack=32, local=8
             )
-        ),
+        )
+    validate_triton_kernel_resources(
+        kernel,
+        argument,
         grid=(36,),
         expected_num_warps=8,
-        worker_width=32,
-        register_capacity_bytes=256 * 1024,
         shared_memory_capacity_bytes=101_376,
         forbid_spills=True,
     )
+    assert kernel.calls[0][0][0] is argument
+    assert kernel.calls[0][1]["warmup"] is True
 
 
 @pytest.mark.parametrize(
@@ -322,7 +634,6 @@ def test_pyntt_runtime_accepts_kernel_within_fixed_resource_budget():
     [
         (_FakeCompiledKernel(num_warps=4), "requires 8"),
         (_FakeCompiledKernel(shared=1024), "shared-memory bytes"),
-        (_FakeCompiledKernel(registers=257), "register bytes"),
         (_FakeCompiledKernel(spill_stores=4), "forbids register spilling"),
     ],
 )
@@ -339,8 +650,6 @@ def test_pyntt_runtime_rejects_kernel_outside_fixed_resource_budget(
             _FakeJitKernel(compiled),
             grid=(36,),
             expected_num_warps=8,
-            worker_width=32,
-            register_capacity_bytes=256 * 1024,
             shared_memory_capacity_bytes=shared_capacity,
             forbid_spills=True,
         )
@@ -370,8 +679,6 @@ def test_pyntt_runtime_selects_first_resource_feasible_tuning_candidate():
         kernel_args=(),
         grid_for_candidate=lambda _: (1,),
         expected_num_warps=8,
-        worker_width=32,
-        register_capacity_bytes=256 * 1024,
         shared_memory_capacity_bytes=101_376,
         forbid_spills=True,
         num_warps=8,
@@ -389,8 +696,6 @@ def test_pyntt_runtime_selects_first_resource_feasible_tuning_candidate():
         kernel_args=(),
         grid_for_candidate=lambda _: (1,),
         expected_num_warps=8,
-        worker_width=32,
-        register_capacity_bytes=256 * 1024,
         shared_memory_capacity_bytes=101_376,
         forbid_spills=True,
         num_warps=8,

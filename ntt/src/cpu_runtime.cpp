@@ -138,7 +138,7 @@ extern "C" void block_entry(const cpu_block_entry_params_t &params) {
     ;
 #endif
 
-    const auto program_ids = make_shape(params.cid, params.bid, 0);
+    const auto program_ids = make_shape(params.cid, params.bid);
 
     auto data = params.data;
     auto block_local_data = params.block_local_data;

@@ -4,9 +4,10 @@
 @model Nncase.CodeGen.NTT.NTTTargetOptionsModel
 @{
   var hierarchy = Model.Options.Hierarchies[0];
-  var hierarchyNames = Model.Options.HierarchyNames;
   var worldSize = (int)TensorUtilities.GetProduct(hierarchy);
   var combinations = Nncase.Utilities.LinqUtility.Combination(hierarchy.Length).Select(i => i.ToArray()).ToArray();
+  var placement = new Nncase.IR.Placement(hierarchy, Model.Options.HierarchyNames, Model.Options.HierarchyLevels);
+  var logicalMesh = KernelUtility.PlacementToC(placement);
 
   string GetName(IEnumerable<int> axes, string prefix = "group_") {
     return prefix + string.Join("_", Enumerable.Range(0, hierarchy.Length).Select(i => (axes.Contains(i) ? "r" : string.Empty) + Model.Options.HierarchyNames[i]));
@@ -101,8 +102,9 @@ template <ntt::reduce_op Op, tar::reduce_kind Kind>
 class tensor_reduce_sync_impl {
   public:
     NTT_DEVICE void reduce_group_sync() const noexcept {
+        const auto current_index = @Html.Raw(logicalMesh)::local_index();
         @foreach(var comb in combinations) {
-          var reduce_group_index = string.Join(", ", Enumerable.Range(0, hierarchy.Length).Select(i => comb.Contains(i) ? "0" : "ntt::distributed::" + hierarchyNames[i] + "id()"));
+          var reduce_group_index = string.Join(", ", Enumerable.Range(0, hierarchy.Length).Select(i => comb.Contains(i) ? "0_dim" : $"current_index[{i}_dim]"));
         @:if constexpr (Kind == tar::reduce_kind::@(GetName(comb, string.Empty))) {
         @:    tar::@(GetName(comb))(@(reduce_group_index)).arrive_and_wait();
         @:} 
@@ -145,10 +147,6 @@ class tensor_reduce_sync_impl {
         return group_size;
     }
 
-    @{
-      var cur_index = string.Join(", ", Enumerable.Range(0, hierarchy.Length).Select(i => "ntt::distributed::" + hierarchyNames[i] + "id()"));
-    }
-
     template <class TSliceIn1, class TSliceIn2, class TSliceOut>
     NTT_DEVICE void reduce_impl(TSliceIn1 &local, TSliceIn2 &remote, TSliceOut &dest) {
         if constexpr (Op == ntt::reduce_op::max) {
@@ -170,7 +168,7 @@ class tensor_reduce_sync_impl {
         static_assert(ShardedTensor<TOutBase>, "dest must be sharded tensor");
         constexpr size_t Rank = TIn::rank();
         constexpr auto group_hierarchy = group_hierarchy_getter<Kind>::group_hierarchy;
-        auto cur_index = ntt::make_shape(@(cur_index));
+        auto cur_index = @Html.Raw(logicalMesh)::local_index();
         auto cur_index_g = index_global2group(cur_index);
         reduce_group_sync();
 

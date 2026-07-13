@@ -152,6 +152,39 @@ public sealed class AffineMap : BaseExpr
         return new AffineMap(domains, default, results);
     }
 
+    /// <summary>
+    /// Gets the number of adjacent result points produced by one domain point
+    /// for a rectangular range result. Identity and downscale results have a
+    /// multiplicity of one; an extent such as <c>4 * t0</c> has a
+    /// multiplicity of four.
+    /// </summary>
+    public long GetPointMultiplicity(int resultIndex)
+    {
+        if ((uint)resultIndex >= (uint)Results.Length)
+        {
+            throw new ArgumentOutOfRangeException(nameof(resultIndex), resultIndex, "Affine result index is out of range.");
+        }
+
+        if (Symbols.Length > 0)
+        {
+            throw new NotSupportedException("Point multiplicity does not support affine symbols.");
+        }
+
+        var zeroOffsets = new long[Domains.Length];
+        var unitExtents = Enumerable.Repeat(1L, Domains.Length).ToArray();
+        var multiplicity = Results[resultIndex].Extent.Apply(zeroOffsets, unitExtents);
+        if (multiplicity < 0)
+        {
+            throw new InvalidOperationException(
+                $"Affine result axis {resultIndex} has negative point multiplicity {multiplicity}: {Results[resultIndex]}.");
+        }
+
+        // A floor-divided extent evaluates to zero at unit extent, but its
+        // point relation is a single-valued downscale rather than an empty
+        // relation.
+        return System.Math.Max(1, multiplicity);
+    }
+
     public bool IsProjectedPermutation(bool allowConstInResults)
     {
         if (Symbols.Length > 0)
@@ -200,6 +233,126 @@ public sealed class AffineMap : BaseExpr
         }
 
         return true;
+    }
+
+    /// <summary>
+    /// Tests whether every non-constant result axis is an independent,
+    /// positive integral scale or downscale of one domain axis. Such maps
+    /// preserve rectangular tile regions when the selected tile satisfies the
+    /// scale alignment constraints.
+    /// </summary>
+    public bool IsRectangularProjection(bool allowConstInResults)
+    {
+        if (Symbols.Length > 0)
+        {
+            return false;
+        }
+
+        if (Results.Length > Domains.Length && !allowConstInResults)
+        {
+            return false;
+        }
+
+        var seen = new bool[Domains.Length];
+        foreach (var range in Results)
+        {
+            if (range.Offset is AffineConstant && range.Extent is AffineConstant)
+            {
+                if (!allowConstInResults)
+                {
+                    return false;
+                }
+
+                continue;
+            }
+
+            if (!TryGetAxisScale(range.Offset, false, out var offsetAxis, out var offsetNumerator, out var offsetDenominator) ||
+                !TryGetAxisScale(range.Extent, true, out var extentAxis, out var extentNumerator, out var extentDenominator) ||
+                offsetAxis != extentAxis ||
+                offsetNumerator != extentNumerator ||
+                offsetDenominator != extentDenominator ||
+                seen[offsetAxis])
+            {
+                return false;
+            }
+
+            seen[offsetAxis] = true;
+        }
+
+        return true;
+
+        static bool TryGetAxisScale(
+            AffineExpr expression,
+            bool requireExtent,
+            out int axis,
+            out long numerator,
+            out long denominator)
+        {
+            axis = -1;
+            numerator = 0;
+            denominator = 0;
+            switch (expression)
+            {
+                case AffineDim dim when !requireExtent:
+                    axis = dim.Position;
+                    numerator = 1;
+                    denominator = 1;
+                    return true;
+                case AffineExtent extent when requireExtent:
+                    axis = extent.Position;
+                    numerator = 1;
+                    denominator = 1;
+                    return true;
+                case AffineMulBinary { Lhs: AffineDim dim, Rhs: AffineConstant constant }
+                    when !requireExtent && constant.Value > 0:
+                    axis = dim.Position;
+                    numerator = constant.Value;
+                    denominator = 1;
+                    return true;
+                case AffineMulBinary { Lhs: AffineConstant constant, Rhs: AffineDim dim }
+                    when !requireExtent && constant.Value > 0:
+                    axis = dim.Position;
+                    numerator = constant.Value;
+                    denominator = 1;
+                    return true;
+                case AffineMulBinary { Lhs: AffineExtent extent, Rhs: AffineConstant constant }
+                    when requireExtent && constant.Value > 0:
+                    axis = extent.Position;
+                    numerator = constant.Value;
+                    denominator = 1;
+                    return true;
+                case AffineMulBinary { Lhs: AffineConstant constant, Rhs: AffineExtent extent }
+                    when requireExtent && constant.Value > 0:
+                    axis = extent.Position;
+                    numerator = constant.Value;
+                    denominator = 1;
+                    return true;
+                case AffineDivBinary
+                    {
+                        BinaryOp: AffineDivBinaryOp.FloorDiv,
+                        Lhs: AffineDim dim,
+                        Rhs: AffineConstant constant,
+                    }
+                    when !requireExtent && constant.Value > 0:
+                    axis = dim.Position;
+                    numerator = 1;
+                    denominator = constant.Value;
+                    return true;
+                case AffineDivBinary
+                    {
+                        BinaryOp: AffineDivBinaryOp.FloorDiv,
+                        Lhs: AffineExtent extent,
+                        Rhs: AffineConstant constant,
+                    }
+                    when requireExtent && constant.Value > 0:
+                    axis = extent.Position;
+                    numerator = 1;
+                    denominator = constant.Value;
+                    return true;
+                default:
+                    return false;
+            }
+        }
     }
 
     public bool IsPermutation()

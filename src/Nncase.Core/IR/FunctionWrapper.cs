@@ -62,9 +62,15 @@ public sealed class FunctionWrapper : BaseFunction
 
     public override BaseFunction With(string? name = null, string? moduleKind = null)
     {
-        return new FunctionWrapper(name ?? Name, moduleKind ?? ModuleKind, Target);
+        return new FunctionWrapper(name ?? Name, moduleKind ?? ModuleKind, Target, ReturnOutput)
+        {
+            Role = Role,
+        };
     }
 
     public FunctionWrapper With(string? name = null, string? moduleKind = null, BaseFunction? target = null, bool? returnOutput = null)
-        => new FunctionWrapper(name ?? Name, moduleKind ?? ModuleKind, target ?? Target, returnOutput ?? ReturnOutput);
+        => new FunctionWrapper(name ?? Name, moduleKind ?? ModuleKind, target ?? Target, returnOutput ?? ReturnOutput)
+        {
+            Role = Role,
+        };
 }

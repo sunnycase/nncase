@@ -272,8 +272,11 @@ public sealed class DefaultTargetOpCostModel : ITargetOpCostModel, IHierarchical
         var chipGlobalLoadBytes = ToDouble(GetFactor(cost, CostFactorNames.ChipGlobalMemoryLoadBytes));
         var chipGlobalStoreBytes = ToDouble(GetFactor(cost, CostFactorNames.ChipGlobalMemoryStoreBytes));
         var activeBlocks = Math.Max(1L, context.ActiveBlockCount);
-        var blockMemory = _machine?.TilingMemorySpaces[^1];
-        var chipMemory = _machine?.GetMemorySpace(_machine.RootMemorySpace);
+        var blockSpace = _machine?.TilingMemorySpaces
+            .LastOrDefault(space => _machine.GetMemoryResource(space).Kind != TargetMemorySpaceKind.Global)
+            ?? _machine?.TilingMemorySpaces[^1];
+        var blockMemory = blockSpace is null ? null : _machine?.GetMemoryResource(blockSpace);
+        var chipMemory = _machine is null ? null : _machine.GetMemoryResource(_machine.GetMemorySpace(_machine.RootMemorySpace));
         var blockLocalMemoryCycles = GetMemoryCycles(blockLocalLoadBytes, blockLocalStoreBytes, blockMemory);
         var chipGlobalMemoryCycles = GetMemoryCycles(
             (blockLocalLoadBytes + chipGlobalLoadBytes) * activeBlocks,
@@ -377,7 +380,7 @@ public sealed class DefaultTargetOpCostModel : ITargetOpCostModel, IHierarchical
         return cost.Factors.TryGetValue(name, out var value) ? value : 0;
     }
 
-    private static double GetMemoryCycles(double loadBytes, double storeBytes, TargetMemorySpaceSpec? memorySpace)
+    private static double GetMemoryCycles(double loadBytes, double storeBytes, TargetMemoryResourceSpec? memorySpace)
     {
         if (memorySpace is null)
         {

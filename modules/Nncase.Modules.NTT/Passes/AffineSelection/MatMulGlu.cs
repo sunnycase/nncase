@@ -41,8 +41,10 @@ public partial class NTTAffineSelectionPass
             return call;
         }
 
+        var tileAxisPolicies = Enumerable.Repeat(GridTileAxisPolicy.Search(), domains.Length).ToArray();
+        tileAxisPolicies[^1] = GridTileAxisPolicy.Reduction();
         var builder = IR.F.Affine.Grid()
-            .Domain(domains.Length, out var _)
+            .Domain(tileAxisPolicies, out var _)
             .Read(input, inputMap, out var inputTile)
             .Read(gateWeight, weightMap, out var gateWeightTile)
             .Read(upWeight, weightMap, out var upWeightTile);
@@ -108,7 +110,8 @@ public partial class NTTAffineSelectionPass
             return false;
         }
 
-        domains = IR.F.Affine.Domains(outputShape.Rank);
+        domains = IR.F.Affine.Domains(outputShape.Rank + 1);
+        var reductionDomain = domains[^1];
         var inputResults = new AffineRange[inputShape.Rank];
         var weightResults = new AffineRange[gateWeightShape.Rank];
         if (!TryBuildBatchRanges(inputShape, outputShape, domains, inputResults) ||
@@ -117,13 +120,13 @@ public partial class NTTAffineSelectionPass
             return false;
         }
 
-        inputResults[^2] = DomainRange(domains[^2]);
-        inputResults[^1] = new AffineRange(0, kDim.Value);
-        weightResults[^2] = DomainRange(domains[^1]);
-        weightResults[^1] = new AffineRange(0, kDim.Value);
+        inputResults[^2] = DomainRange(domains[outputShape.Rank - 2]);
+        inputResults[^1] = DomainRange(reductionDomain);
+        weightResults[^2] = DomainRange(domains[outputShape.Rank - 1]);
+        weightResults[^1] = DomainRange(reductionDomain);
         inputMap = new AffineMap(domains, default, inputResults);
         weightMap = new AffineMap(domains, default, weightResults);
-        outputMap = new AffineMap(domains, default, domains.Select(DomainRange).ToArray());
+        outputMap = new AffineMap(domains, default, domains.Take(outputShape.Rank).Select(DomainRange).ToArray());
         return true;
     }
 

@@ -20,9 +20,40 @@ public enum MemoryAccessScope
 }
 
 /// <summary>
+/// Describes when an operand's memory effect becomes externally observable.
+/// </summary>
+public enum MemoryEffectKind
+{
+    /// <summary>
+    /// The operation directly accesses the operand when it executes.
+    /// </summary>
+    Direct,
+
+    /// <summary>
+    /// The operand is the logical state/output of a reduction region. Inside a
+    /// <see cref="TIR.For"/> with <see cref="TIR.LoopMode.Reduction"/>, the
+    /// backend carries this state privately and commits the declared memory
+    /// effect once when the region completes.
+    /// </summary>
+    ReductionAccumulator,
+}
+
+/// <summary>
+/// Refines the default operand effects declared by <see cref="ParameterInfo"/>
+/// when an operation's static attributes change its memory access scope.
+/// </summary>
+public interface IOpMemoryEffectProvider
+{
+    MemoryEffect GetMemoryEffect(ParameterInfo parameter);
+}
+
+/// <summary>
 /// Describes the possible memory accesses performed through one call operand.
 /// </summary>
-public readonly record struct MemoryEffect(MemoryAccessMode Mode, MemoryAccessScope Scope = MemoryAccessScope.Inferred)
+public readonly record struct MemoryEffect(
+    MemoryAccessMode Mode,
+    MemoryAccessScope Scope = MemoryAccessScope.Inferred,
+    MemoryEffectKind Kind = MemoryEffectKind.Direct)
 {
     public static MemoryEffect None { get; } = new(MemoryAccessMode.None);
 
@@ -37,6 +68,16 @@ public readonly record struct MemoryEffect(MemoryAccessMode Mode, MemoryAccessSc
     public static MemoryEffect ChipWrite { get; } = new(MemoryAccessMode.Write, MemoryAccessScope.Chip);
 
     public static MemoryEffect ChipReadWrite { get; } = new(MemoryAccessMode.ReadWrite, MemoryAccessScope.Chip);
+
+    public static MemoryEffect ReductionWrite { get; } = new(
+        MemoryAccessMode.Write,
+        MemoryAccessScope.Inferred,
+        MemoryEffectKind.ReductionAccumulator);
+
+    public static MemoryEffect ReductionReadWrite { get; } = new(
+        MemoryAccessMode.ReadWrite,
+        MemoryAccessScope.Inferred,
+        MemoryEffectKind.ReductionAccumulator);
 }
 
 /// <summary>
@@ -57,7 +98,10 @@ public static class MemoryEffectUtility
 
         call.ParametersForeach((argument, parameter) =>
         {
-            if (parameter.MemoryEffect is not { Mode: not MemoryAccessMode.None } effect)
+            var effect = call.Target is IOpMemoryEffectProvider provider
+                ? provider.GetMemoryEffect(parameter)
+                : parameter.MemoryEffect ?? MemoryEffect.None;
+            if (effect.Mode == MemoryAccessMode.None)
             {
                 return;
             }
@@ -89,7 +133,22 @@ public static class MemoryEffectUtility
     }
 
     public static MemoryEffect Merge(MemoryEffect lhs, MemoryEffect rhs)
-        => new(lhs.Mode | rhs.Mode, MergeScope(lhs.Scope, rhs.Scope));
+    {
+        if (lhs.Mode == MemoryAccessMode.None)
+        {
+            return rhs;
+        }
+
+        if (rhs.Mode == MemoryAccessMode.None)
+        {
+            return lhs;
+        }
+
+        return new(
+            lhs.Mode | rhs.Mode,
+            MergeScope(lhs.Scope, rhs.Scope),
+            lhs.Kind == rhs.Kind ? lhs.Kind : MemoryEffectKind.Direct);
+    }
 
     public static MemoryAccessScope MergeScope(MemoryAccessScope lhs, MemoryAccessScope rhs)
         => lhs == MemoryAccessScope.Chip || rhs == MemoryAccessScope.Chip

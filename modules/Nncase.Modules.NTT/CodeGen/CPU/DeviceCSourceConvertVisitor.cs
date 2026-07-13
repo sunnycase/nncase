@@ -26,6 +26,11 @@ public class DeviceCSourceConvertVisitor : CSourceConvertVisitor
 {
     protected readonly StringBuilder _deviceBuilder;
 
+    private readonly Dictionary<IVar, BaseExpr> _letBindings = new(ReferenceEqualityComparer.Instance);
+    private readonly Stack<Dictionary<Call, ReductionState>> _reductionScopes = new();
+    private int _regionCopyCounter;
+    private int _reductionStateCounter;
+
     public DeviceCSourceConvertVisitor()
     {
         _deviceBuilder = new();
@@ -154,6 +159,8 @@ public class DeviceCSourceConvertVisitor : CSourceConvertVisitor
         var @var = Visit(expr.Var);
         var value = Visit(expr.Expression);
         _exprMemo[(BaseExpr)expr.Var] = new(value.Type, @var.Name);
+        var hadPreviousBinding = _letBindings.TryGetValue(expr.Var, out var previousBinding);
+        _letBindings[expr.Var] = expr.Expression;
 
 #if DEBUG_PRINT
         IndentScope.Writer.IndWrite($"runtime_util->printf(\"let {@var.Name}\\n\");\n");
@@ -168,7 +175,21 @@ public class DeviceCSourceConvertVisitor : CSourceConvertVisitor
             IndentScope.Writer.IndWrite($"{value.Type} {@var.Name} = {value.Name};\n");
         }
 
-        Visit(expr.Body);
+        try
+        {
+            Visit(expr.Body);
+        }
+        finally
+        {
+            if (hadPreviousBinding)
+            {
+                _letBindings[expr.Var] = previousBinding!;
+            }
+            else
+            {
+                _letBindings.Remove(expr.Var);
+            }
+        }
 
         symbol = new(string.Empty, string.Empty);
         _exprMemo.Add(expr, symbol);
@@ -223,7 +244,7 @@ public class DeviceCSourceConvertVisitor : CSourceConvertVisitor
             return symbol;
         }
 
-        var dimensions = expr.DistributedType is null ? expr.Dimensions : ((RankedShape)expr.DistributedType.TensorType.Shape).Dimensions;
+        var dimensions = expr.Dimensions;
         var isFixedDimensions = dimensions.AsValueEnumerable().All(x => x.IsFixed);
         var isFixedStrides = expr.Strides.AsValueEnumerable().All(x => x.IsFixed);
         var dimensionSymbols = dimensions.AsValueEnumerable().Select(Visit).ToArray();
@@ -260,6 +281,15 @@ public class DeviceCSourceConvertVisitor : CSourceConvertVisitor
 
         string str = string.Empty;
         var arguments = expr.Arguments.AsValueEnumerable().Select(Visit).ToArray();
+        if (TryGetReductionState(expr, out var reductionState))
+        {
+            EmitReductionKernel(reductionState, arguments, ReductionKernelPhase.Accumulate);
+            reductionState.UpdateEmitted = true;
+            symbol = new(type, str);
+            _exprMemo.Add(expr, symbol);
+            return symbol;
+        }
+
         switch (expr.Target)
         {
             case PrimFunction deviceFunc:
@@ -321,7 +351,7 @@ public class DeviceCSourceConvertVisitor : CSourceConvertVisitor
             case IR.Buffers.AllocateBufferView op:
                 {
                     var buffer = (TIR.Buffer)expr.Arguments[0];
-                    var dimensions = buffer.DistributedType is null ? buffer.Dimensions : ((RankedShape)buffer.DistributedType.TensorType.Shape).Dimensions;
+                    var dimensions = buffer.Dimensions;
                     var isFixedDimensions = dimensions.AsValueEnumerable().All(x => x.IsFixed);
                     var isFixedStrides = buffer.Strides.AsValueEnumerable().All(x => x.IsFixed);
                     var dimensionSymbols = dimensions.AsValueEnumerable().Select(Visit).ToArray();
@@ -339,6 +369,34 @@ public class DeviceCSourceConvertVisitor : CSourceConvertVisitor
                 break;
             case TIR.Memcopy op:
                 WriteIndWithProfiler($"tensor_copy_sync({arguments[1].Name}, {arguments[0].Name});\n");
+                break;
+            case TIR.NTT.TensorLoad:
+                if (arguments.Length != 2)
+                {
+                    throw new NotSupportedException($"NTT device TensorLoad expects (destination, source), got {arguments.Length} operands.");
+                }
+
+                EmitTensorRegionLoad(expr.Arguments[0], expr.Arguments[1]);
+                break;
+            case TIR.NTT.TensorStore:
+                if (arguments.Length != 2)
+                {
+                    throw new NotSupportedException($"NTT device TensorStore expects (source, destination), got {arguments.Length} operands.");
+                }
+
+                EmitTensorRegionStore(expr.Arguments[0], expr.Arguments[1]);
+                break;
+            case TIR.TileLoad:
+                WriteIndWithProfiler($"tensor_copy_sync({arguments[1].Name}, {arguments[0].Name});\n");
+                break;
+            case TIR.TileStore:
+                WriteIndWithProfiler($"tensor_copy_sync({arguments[0].Name}, {arguments[1].Name});\n");
+                break;
+            case TIR.NTT.Barrier barrier:
+                WriteTopologyBarrier(barrier.Scope);
+                break;
+            case TIR.NTT.SynchronizeThreads:
+                WriteTopologyBarrier(TIR.NTT.BarrierScope.Block);
                 break;
             case TIR.NTT.Unary op:
                 WriteIndWithProfiler(RazorTemplateEngine.RenderAsync("~/CodeGen/CPU/Templates/Kernels/Unary.cshtml", new UnaryKernelTemplateModel
@@ -609,25 +667,553 @@ public class DeviceCSourceConvertVisitor : CSourceConvertVisitor
             return symbol;
         }
 
-        // 1. For Loop signature
-        var loopVar = Visit(expr.LoopVar);
-        IndentScope.Writer.IndWrite($"for ({loopVar.Type} {loopVar.Name} = {Visit(expr.Domain.Start).Name}; {loopVar.Name} < {Visit(expr.Domain.Stop).Name}; {loopVar.Name} += {Visit(expr.Domain.Step).Name}) {{\n");
-#if DEBUG_PRINT
-        IndentScope.Writer.IndWrite($"runtime_util->printf(\"{loopVar.Name} = %d\\n\", {loopVar.Name});\n");
-#endif
-
-        using (_ = new IndentScope())
+        var ownsReductionScope = expr.Mode == LoopMode.Reduction && _reductionScopes.Count == 0;
+        Dictionary<Call, ReductionState>? reductionScope = null;
+        if (ownsReductionScope)
         {
-            // 2. For Body
-            Visit(expr.Body);
+            reductionScope = CreateReductionScope(expr);
+            _reductionScopes.Push(reductionScope);
         }
 
-        // 3. For closing
-        IndentScope.Writer.IndWrite("}\n");
+        try
+        {
+            if (ownsReductionScope)
+            {
+                EmitReductionInitializers(reductionScope!);
+            }
+
+            // 1. For Loop signature
+            var loopVar = Visit(expr.LoopVar);
+            IndentScope.Writer.IndWrite($"for ({loopVar.Type} {loopVar.Name} = {Visit(expr.Domain.Start).Name}; {loopVar.Name} < {Visit(expr.Domain.Stop).Name}; {loopVar.Name} += {Visit(expr.Domain.Step).Name}) {{\n");
+#if DEBUG_PRINT
+            IndentScope.Writer.IndWrite($"runtime_util->printf(\"{loopVar.Name} = %d\\n\", {loopVar.Name});\n");
+#endif
+
+            using (_ = new IndentScope())
+            {
+                // 2. For Body
+                Visit(expr.Body);
+            }
+
+            // 3. For closing
+            IndentScope.Writer.IndWrite("}\n");
+
+            if (ownsReductionScope)
+            {
+                foreach (var state in reductionScope!.Values)
+                {
+                    if (!state.UpdateEmitted)
+                    {
+                        throw new InvalidOperationException(
+                            $"NTT reduction operation {state.Call.Target.GetType().Name} did not emit an accumulator update.");
+                    }
+
+                    var arguments = state.Call.Arguments.AsValueEnumerable().Select(Visit).ToArray();
+                    EmitReductionKernel(state, arguments, ReductionKernelPhase.Finalize);
+                }
+            }
+        }
+        finally
+        {
+            if (ownsReductionScope)
+            {
+                _reductionScopes.Pop();
+            }
+        }
 
         symbol = new(string.Empty, string.Empty);
         _exprMemo.Add(expr, symbol);
         return symbol;
+    }
+
+    private Dictionary<Call, ReductionState> CreateReductionScope(For reductionLoop)
+    {
+        var calls = ReductionCodegenUtility.CollectReductionCalls(reductionLoop.Body);
+        if (calls.Length == 0)
+        {
+            throw new InvalidOperationException(
+                $"NTT reduction loop {reductionLoop.LoopVar.Name} contains no backend reduction operation.");
+        }
+
+        var scope = new Dictionary<Call, ReductionState>(ReferenceEqualityComparer.Instance);
+        foreach (var call in calls)
+        {
+            var kind = call.Target switch
+            {
+                TIR.NTT.Matmul => ReductionKernelKind.Matmul,
+                TIR.NTT.PackedMatMul => ReductionKernelKind.PackedMatmul,
+                TIR.NTT.QKVParallelLinear => ReductionKernelKind.QKVParallelLinear,
+                TIR.NTT.PackedQKVParallelLinear => ReductionKernelKind.PackedQKVParallelLinear,
+                TIR.NTT.MatMulGlu => ReductionKernelKind.MatMulGlu,
+                TIR.NTT.PackedMatMulGlu => ReductionKernelKind.PackedMatMulGlu,
+                TIR.NTT.Reduce => ReductionKernelKind.Reduce,
+                _ => throw new InvalidOperationException(
+                    $"Unsupported NTT reduction operation {call.Target.GetType().Name}."),
+            };
+            var accumulatorOperands = ReductionCodegenUtility.GetAccumulatorOperands(call);
+            var stateOutputs = kind switch
+            {
+                ReductionKernelKind.MatMulGlu or ReductionKernelKind.PackedMatMulGlu
+                    when accumulatorOperands.Length == 1 =>
+                    new[] { accumulatorOperands[0].Argument, accumulatorOperands[0].Argument },
+                _ => accumulatorOperands.Select(operand => operand.Argument).ToArray(),
+            };
+            var expectedStateCount = kind switch
+            {
+                ReductionKernelKind.QKVParallelLinear or ReductionKernelKind.PackedQKVParallelLinear => 3,
+                ReductionKernelKind.MatMulGlu or ReductionKernelKind.PackedMatMulGlu => 2,
+                _ => 1,
+            };
+            if (stateOutputs.Length != expectedStateCount)
+            {
+                throw new InvalidOperationException(
+                    $"NTT reduction operation {call.Target.GetType().Name} requires {expectedStateCount} backend accumulator states, got {stateOutputs.Length} from its operand contract.");
+            }
+
+            var stateId = _reductionStateCounter++;
+            var elementCount = call.Target is TIR.NTT.Reduce { ReduceOp: ReduceOp.Mean }
+                ? $"ntt_reduction_{stateId}_element_count"
+                : null;
+            scope.Add(call, new ReductionState(
+                call,
+                kind,
+                stateOutputs,
+                Enumerable.Range(0, stateOutputs.Length)
+                    .Select(index => $"ntt_reduction_{stateId}_acc{index}")
+                    .ToArray(),
+                $"ntt_reduction_{stateId}_initialized",
+                elementCount));
+        }
+
+        return scope;
+    }
+
+    private static void WriteTopologyBarrier(TIR.NTT.BarrierScope scope)
+    {
+        var topology = scope switch
+        {
+            TIR.NTT.BarrierScope.Block => "block",
+            TIR.NTT.BarrierScope.Chip => "chip",
+            _ => throw new ArgumentOutOfRangeException(nameof(scope), scope, null),
+        };
+        WriteIndWithProfiler($"ntt::distributed::topology_synchronize<ntt::distributed::topology::{topology}>();\n");
+    }
+
+    private bool TryGetReductionState(Call call, out ReductionState state)
+    {
+        foreach (var scope in _reductionScopes)
+        {
+            if (scope.TryGetValue(call, out state!))
+            {
+                return true;
+            }
+        }
+
+        state = null!;
+        return false;
+    }
+
+    private static string GetAccumulatorScalarType(ReductionKernelKind kind, BaseExpr output)
+    {
+        if (kind is not ReductionKernelKind.Reduce)
+        {
+            return "float";
+        }
+
+        var scalarType = output.CheckedDataType switch
+        {
+            PrimType primType => primType,
+            VectorType vectorType => vectorType.ElemType,
+            MaskVectorType => DataTypes.Boolean,
+            var dataType => throw new NotSupportedException(
+                $"NTT Reduce accumulator does not support output dtype {dataType}."),
+        };
+        return scalarType.IsFloat() ? "float" : scalarType.ToC();
+    }
+
+    private static long GetAccumulatorExtent(Dimension dimension, string context)
+    {
+        if (dimension.IsFixed)
+        {
+            if (dimension.FixedValue < 1)
+            {
+                throw new NotSupportedException(
+                    $"{context} requires a positive extent, got {dimension.FixedValue}.");
+            }
+
+            return dimension.FixedValue;
+        }
+
+        if (dimension.Metadata.Range is not { } range ||
+            !double.IsFinite(range.Max) ||
+            range.Max != Math.Truncate(range.Max) ||
+            range.Max < 1 ||
+            range.Max > long.MaxValue)
+        {
+            throw new NotSupportedException(
+                $"{context} requires a positive finite integer maximum extent, got {dimension} with range {dimension.Metadata.Range}.");
+        }
+
+        return checked((long)range.Max);
+    }
+
+    private void EmitReductionInitializers(IReadOnlyDictionary<Call, ReductionState> scope)
+    {
+        foreach (var state in scope.Values)
+        {
+            for (var index = 0; index < state.Outputs.Length; index++)
+            {
+                var output = state.Outputs[index];
+                var outputSymbol = Visit(output).Name;
+                var accumulator = state.Accumulators[index];
+                var storage = $"{accumulator}_storage";
+                var elementType = $"{accumulator}_element_t";
+                var shape = output.CheckedShape
+                    .Select((dimension, axis) => GetAccumulatorExtent(
+                        dimension,
+                        $"NTT {state.Call.Target.GetType().Name} accumulator {index} axis {axis}"))
+                    .ToArray();
+                var fixedShape = $"fixed_shape_v<{string.Join(",", shape)}>";
+                var scalarType = GetAccumulatorScalarType(state.Kind, output);
+                IndentScope.Writer.IndWrite($"using {elementType} = replace_element_t<typename std::decay_t<decltype({outputSymbol})>::element_type, {scalarType}>;\n");
+                IndentScope.Writer.IndWrite($"auto {storage} = make_tensor<{elementType}>({fixedShape});\n");
+                IndentScope.Writer.IndWrite($"auto {accumulator} = make_tensor_view_from_address<{elementType}>({storage}.elements().data(), {outputSymbol}.shape());\n");
+            }
+
+            IndentScope.Writer.IndWrite($"bool {state.Initialized} = false;\n");
+            if (state.ElementCount is not null)
+            {
+                IndentScope.Writer.IndWrite($"size_t {state.ElementCount} = 0;\n");
+            }
+        }
+    }
+
+    private void EmitReductionKernel(
+        ReductionState state,
+        CSymbol[] arguments,
+        ReductionKernelPhase phase)
+    {
+        if (phase == ReductionKernelPhase.Accumulate && state.UpdateEmitted)
+        {
+            throw new InvalidOperationException(
+                $"NTT reduction operation {state.Call.Target.GetType().Name} occurs more than once in one reduction-loop body.");
+        }
+
+        var context = new ReductionKernelTemplateContext(
+            phase,
+            state.Accumulators,
+            state.Initialized,
+            state.ElementCount);
+        if (state.Call.Target is TIR.NTT.QKVParallelLinear or TIR.NTT.PackedQKVParallelLinear)
+        {
+            ValidateQKVParallelLinearScales(state.Call.Arguments.ToArray());
+        }
+        else if (state.Call.Target is TIR.NTT.MatMulGlu or TIR.NTT.PackedMatMulGlu)
+        {
+            ValidateMatMulGluScales(state.Call.Arguments.ToArray());
+        }
+
+        var source = state.Call.Target switch
+        {
+            TIR.NTT.Matmul op => RenderReductionKernelTemplate(
+                "~/CodeGen/CPU/Templates/Kernels/Matmul.cshtml", op, arguments, context),
+            TIR.NTT.PackedMatMul op => RenderReductionKernelTemplate(
+                "~/CodeGen/CPU/Templates/Kernels/PackedMatMul.cshtml", op, arguments, context),
+            TIR.NTT.QKVParallelLinear op => RenderReductionKernelTemplate(
+                "~/CodeGen/CPU/Templates/Kernels/QKVParallelLinear.cshtml", op, arguments, context),
+            TIR.NTT.PackedQKVParallelLinear op => RenderReductionKernelTemplate(
+                "~/CodeGen/CPU/Templates/Kernels/PackedQKVParallelLinear.cshtml", op, arguments, context),
+            TIR.NTT.MatMulGlu op => RenderReductionKernelTemplate(
+                "~/CodeGen/CPU/Templates/Kernels/MatMulGlu.cshtml", op, arguments, context),
+            TIR.NTT.PackedMatMulGlu op => RenderReductionKernelTemplate(
+                "~/CodeGen/CPU/Templates/Kernels/PackedMatMulGlu.cshtml", op, arguments, context),
+            TIR.NTT.Reduce op => RenderReductionKernelTemplate(
+                "~/CodeGen/CPU/Templates/Kernels/Reduce.cshtml", op, arguments, context),
+            _ => throw new InvalidOperationException(
+                $"Unsupported NTT reduction operation {state.Call.Target.GetType().Name}."),
+        };
+        IndentScope.Writer.Write(source);
+    }
+
+    private static string RenderReductionKernelTemplate<TOp>(
+        string templatePath,
+        TOp op,
+        CSymbol[] arguments,
+        ReductionKernelTemplateContext context)
+        where TOp : Op =>
+        RazorTemplateEngine.RenderAsync(templatePath, new TypedKernelTemplateModel<TOp>(op)
+        {
+            Arguments = arguments.Select(argument => new KernelArgument { Symbol = argument }).ToArray(),
+            Indent = new string(' ', IndentScope.Writer.Indent),
+            Reduction = context,
+        }).Result;
+
+    private void EmitTensorRegionLoad(BaseExpr destination, BaseExpr source)
+    {
+        var dest = GetBufferViewDescriptor(destination, "TensorLoad destination");
+        var src = GetBufferViewDescriptor(source, "TensorLoad source");
+        ValidateRegionCopyDescriptors("TensorLoad", src, dest);
+        var sourceOffsets = BuildRelativeOffsets(dest.GlobalOffsets, src.GlobalOffsets);
+        var offsetName = $"ntt_region_copy_{_regionCopyCounter++}_offset";
+        IndentScope.Writer.IndWrite("{\n");
+        using (_ = new IndentScope())
+        {
+            IndentScope.Writer.IndWrite($"auto {offsetName} = make_shape({string.Join(", ", sourceOffsets)});\n");
+            IndentScope.Writer.IndWrite($"tensor_copy_sync({src.Symbol}.view({offsetName}, {dest.Symbol}.shape()), {dest.Symbol});\n");
+        }
+
+        IndentScope.Writer.IndWrite("}\n");
+    }
+
+    private void EmitTensorRegionStore(BaseExpr source, BaseExpr destination)
+    {
+        var src = GetBufferViewDescriptor(source, "TensorStore source");
+        var dest = GetBufferViewDescriptor(destination, "TensorStore destination");
+        ValidateRegionCopyDescriptors("TensorStore", src, dest);
+        var destinationOffsets = BuildRelativeOffsets(src.GlobalOffsets, dest.GlobalOffsets);
+        var offsetName = $"ntt_region_copy_{_regionCopyCounter++}_offset";
+        IndentScope.Writer.IndWrite("{\n");
+        using (_ = new IndentScope())
+        {
+            IndentScope.Writer.IndWrite($"auto {offsetName} = make_shape({string.Join(", ", destinationOffsets)});\n");
+            IndentScope.Writer.IndWrite($"tensor_copy_sync({src.Symbol}, {dest.Symbol}.view({offsetName}, {src.Symbol}.shape()));\n");
+        }
+
+        IndentScope.Writer.IndWrite("}\n");
+    }
+
+    private BufferViewDescriptor GetBufferViewDescriptor(BaseExpr expression, string context)
+    {
+        var symbol = Visit(expression).Name;
+        var resolved = ResolveBoundExpression(expression, context);
+        switch (resolved)
+        {
+            case Call { Target: IR.Buffers.AllocateBufferView } allocate:
+                {
+                    var args = allocate.Arguments.ToArray();
+                    if (args.Length != 2 || args[0] is not TIR.Buffer buffer)
+                    {
+                        throw new NotSupportedException(
+                            $"NTT {context} expects AllocateBufferView(buffer, offsets).");
+                    }
+
+                    var localOffsets = GetShapeDimensions(args[1], $"{context} AllocateBufferView offsets");
+                    if (localOffsets.Length != buffer.Rank)
+                    {
+                        throw new NotSupportedException(
+                            $"NTT {context} AllocateBufferView rank mismatch: buffer rank {buffer.Rank}, offsets rank {localOffsets.Length}.");
+                    }
+
+                    return new BufferViewDescriptor(
+                        symbol,
+                        buffer.ElemType,
+                        buffer.Dimensions.AsValueEnumerable().Select(dimension => Visit(dimension).Name).ToArray(),
+                        AddOffsets(BuildDistributedGlobalOffsets(buffer.DistributedType, buffer.Rank), localOffsets));
+                }
+            case Call { Target: IR.Buffers.BufferSubview } subview:
+                {
+                    var args = subview.Arguments.ToArray();
+                    if (args.Length != 3)
+                    {
+                        throw new NotSupportedException(
+                            $"NTT {context} expects BufferSubview(buffer, offsets, shape).");
+                    }
+
+                    var source = GetBufferViewDescriptor(args[0], $"{context} subview source");
+                    var localOffsets = GetShapeDimensions(args[1], $"{context} subview offsets");
+                    var shape = GetShapeDimensions(args[2], $"{context} subview shape");
+                    if (localOffsets.Length != source.Rank || shape.Length != source.Rank)
+                    {
+                        throw new NotSupportedException(
+                            $"NTT {context} BufferSubview rank mismatch: source rank {source.Rank}, " +
+                            $"offsets rank {localOffsets.Length}, shape rank {shape.Length}.");
+                    }
+
+                    return new BufferViewDescriptor(
+                        symbol,
+                        source.ElemType,
+                        shape.Select(dimension => Visit(dimension).Name).ToArray(),
+                        AddOffsets(source.GlobalOffsets, localOffsets));
+                }
+            case TIR.Buffer buffer:
+                return new BufferViewDescriptor(
+                    symbol,
+                    buffer.ElemType,
+                    buffer.Dimensions.AsValueEnumerable().Select(dimension => Visit(dimension).Name).ToArray(),
+                    BuildDistributedGlobalOffsets(buffer.DistributedType, buffer.Rank));
+            case IVar variable:
+                {
+                    var tensorType = variable.CheckedType switch
+                    {
+                        TensorType type => type,
+                        DistributedType type => type.TensorType,
+                        var type => throw new NotSupportedException(
+                            $"NTT {context} expects a tensor buffer variable, got {type}."),
+                    };
+                    var distributedType = variable.CheckedType as DistributedType;
+                    var dimensions = ((RankedShape)tensorType.Shape).Dimensions;
+                    return new BufferViewDescriptor(
+                        symbol,
+                        tensorType.DType,
+                        dimensions.AsValueEnumerable().Select(dimension => Visit(dimension).Name).ToArray(),
+                        BuildDistributedGlobalOffsets(distributedType, tensorType.Shape.Rank));
+                }
+            default:
+                throw new NotSupportedException(
+                    $"NTT {context} cannot resolve buffer expression {resolved.GetType().Name}.");
+        }
+    }
+
+    private BaseExpr ResolveBoundExpression(BaseExpr expression, string context)
+    {
+        var visited = new HashSet<IVar>(ReferenceEqualityComparer.Instance);
+        while (expression is IVar variable && _letBindings.TryGetValue(variable, out var binding))
+        {
+            if (!visited.Add(variable))
+            {
+                throw new InvalidOperationException($"NTT {context} contains a cyclic Let binding at {variable.Name}.");
+            }
+
+            expression = binding;
+        }
+
+        return expression;
+    }
+
+    private string[] BuildDistributedGlobalOffsets(DistributedType? distributedType, int rank)
+    {
+        if (distributedType is null)
+        {
+            return Enumerable.Repeat("0_dim", rank).ToArray();
+        }
+
+        if (distributedType.TensorType.Shape.Rank != rank)
+        {
+            throw new InvalidOperationException(
+                $"NTT distributed buffer rank mismatch: tensor rank {distributedType.TensorType.Shape.Rank}, buffer rank {rank}.");
+        }
+
+        var globalDimensions = ((RankedShape)distributedType.TensorType.Shape).Dimensions;
+        var globalShape = $"make_shape({string.Join(", ", globalDimensions.AsValueEnumerable().Select(dimension => Visit(dimension).Name).ToArray())})";
+        var sharding = KernelUtility.ShardingToC(distributedType);
+        var mesh = distributedType.Placement.PlacementToC();
+        var globalOffset = $"({sharding}).global_offset({globalShape}, {mesh}::local_index())";
+        return Enumerable.Range(0, rank)
+            .Select(axis => $"{globalOffset}[{axis}_dim]")
+            .ToArray();
+    }
+
+    private string[] AddOffsets(IReadOnlyList<string> baseOffsets, IReadOnlyList<Dimension> localOffsets)
+    {
+        if (baseOffsets.Count != localOffsets.Count)
+        {
+            throw new InvalidOperationException(
+                $"NTT buffer offset rank mismatch: base rank {baseOffsets.Count}, local rank {localOffsets.Count}.");
+        }
+
+        return baseOffsets.Zip(localOffsets)
+            .Select(pair => pair.Second.IsFixed && pair.Second.FixedValue == 0
+                ? pair.First
+                : pair.First == "0_dim"
+                    ? Visit(pair.Second).Name
+                    : $"({pair.First} + {Visit(pair.Second).Name})")
+            .ToArray();
+    }
+
+    private static string[] BuildRelativeOffsets(
+        IReadOnlyList<string> regionOffsets,
+        IReadOnlyList<string> containerOffsets)
+    {
+        if (regionOffsets.Count != containerOffsets.Count)
+        {
+            throw new InvalidOperationException(
+                $"NTT region copy rank mismatch: region rank {regionOffsets.Count}, container rank {containerOffsets.Count}.");
+        }
+
+        return regionOffsets.Zip(containerOffsets)
+            .Select(pair => pair.First == pair.Second
+                ? "0_dim"
+                : pair.Second == "0_dim"
+                    ? pair.First
+                    : $"({pair.First} - {pair.Second})")
+            .ToArray();
+    }
+
+    private static Dimension[] GetShapeDimensions(BaseExpr expression, string context)
+        => expression is RankedShape shape
+            ? shape.Dimensions.ToArray()
+            : throw new NotSupportedException(
+                $"NTT {context} expects a ranked shape expression, got {expression.GetType().Name}.");
+
+    private static void ValidateRegionCopyDescriptors(
+        string operation,
+        BufferViewDescriptor source,
+        BufferViewDescriptor destination)
+    {
+        if (source.Rank != destination.Rank)
+        {
+            throw new NotSupportedException(
+                $"NTT {operation} source/destination rank mismatch: {source.Rank} vs {destination.Rank}.");
+        }
+
+        if (source.ElemType != destination.ElemType)
+        {
+            throw new NotSupportedException(
+                $"NTT {operation} source/destination dtype mismatch: {source.ElemType} vs {destination.ElemType}.");
+        }
+    }
+
+    private enum ReductionKernelKind
+    {
+        Matmul,
+        PackedMatmul,
+        QKVParallelLinear,
+        PackedQKVParallelLinear,
+        MatMulGlu,
+        PackedMatMulGlu,
+        Reduce,
+    }
+
+    private sealed class ReductionState
+    {
+        public ReductionState(
+            Call call,
+            ReductionKernelKind kind,
+            BaseExpr[] outputs,
+            string[] accumulators,
+            string initialized,
+            string? elementCount)
+        {
+            Call = call;
+            Kind = kind;
+            Outputs = outputs;
+            Accumulators = accumulators;
+            Initialized = initialized;
+            ElementCount = elementCount;
+        }
+
+        public Call Call { get; }
+
+        public ReductionKernelKind Kind { get; }
+
+        public BaseExpr[] Outputs { get; }
+
+        public string[] Accumulators { get; }
+
+        public string Initialized { get; }
+
+        public string? ElementCount { get; }
+
+        public bool UpdateEmitted { get; set; }
+    }
+
+    private sealed record BufferViewDescriptor(
+        string Symbol,
+        DataType ElemType,
+        string[] Shape,
+        string[] GlobalOffsets)
+    {
+        public int Rank => Shape.Length;
     }
 
     private static void ValidateQKVParallelLinearScales(IReadOnlyList<BaseExpr> args)

@@ -15,3 +15,23 @@ public class MemcopyEvaluator : ITypeInferencer<Memcopy>
         return TupleType.Void;
     }
 }
+
+public sealed class TileLoadEvaluator : ITypeInferencer<TileLoad>
+{
+    public IRType Visit(ITypeInferenceContext context, TileLoad target)
+    {
+        _ = context.CheckArgumentType<TensorType>(target, TileLoad.Dest);
+        _ = context.CheckArgumentType<TensorType>(target, TileLoad.Src);
+        return TupleType.Void;
+    }
+}
+
+public sealed class TileStoreEvaluator : ITypeInferencer<TileStore>
+{
+    public IRType Visit(ITypeInferenceContext context, TileStore target)
+    {
+        _ = context.CheckArgumentType<TensorType>(target, TileStore.Src);
+        _ = context.CheckArgumentType<TensorType>(target, TileStore.Dest);
+        return TupleType.Void;
+    }
+}

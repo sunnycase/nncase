@@ -18,6 +18,7 @@ public sealed record PyNTTTensorLoadTemplateModel(
     PyNTTDimExpression[] LocalShape,
     PyNTTDimExpression[] DestinationStrides,
     PyNTTDimExpression[] GlobalShape,
+    PyNTTDimExpression[] GlobalOffsets,
     int[] Hierarchy,
     int[][] SplitAxes,
     int VectorLaneCount,
@@ -26,6 +27,8 @@ public sealed record PyNTTTensorLoadTemplateModel(
     public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
 
     public PyNTTBufferPointerTemplateModel? Source { get; set; }
+
+    public PyNTTDimExpression[]? SourceStrides { get; set; }
 }
 
 public sealed record PyNTTTensorStoreTemplateModel(
@@ -38,6 +41,7 @@ public sealed record PyNTTTensorStoreTemplateModel(
     PyNTTDimExpression[] LocalShape,
     PyNTTDimExpression[] SourceStrides,
     PyNTTDimExpression[] GlobalShape,
+    PyNTTDimExpression[] GlobalOffsets,
     int[] Hierarchy,
     int[][] SplitAxes,
     int VectorLaneCount,
@@ -46,6 +50,8 @@ public sealed record PyNTTTensorStoreTemplateModel(
     public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
 
     public PyNTTBufferPointerTemplateModel? Destination { get; set; }
+
+    public PyNTTDimExpression[]? DestinationStrides { get; set; }
 }
 
 public sealed record PyNTTMemcopyTemplateModel(
@@ -588,6 +594,7 @@ public sealed record PyNTTPagedAttentionTemplateModel(
     int DimAxis,
     int GlobalNumQueryHeads,
     string LayerIdExpression,
+    int AttentionBlockSize,
     PyNTTPagedAttentionCacheTemplateModel Cache,
     string Comment)
 {
@@ -677,6 +684,34 @@ public sealed record PyNTTMatmulTemplateModel(
     public int OutputNPackedLaneCount { get; set; } = 1;
 
     public string LoadCExpression { get; set; } = "False";
+
+    public string ReductionPhase { get; set; } = "complete";
+
+    public int ReductionBlockM { get; set; }
+
+    public int ReductionBlockN { get; set; }
+
+    public int ReductionBlockK { get; set; }
+}
+
+public sealed record PyNTTMatmulReductionFinalizeTemplateModel(
+    string FunctionName,
+    PyNTTBufferPointerTemplateModel Output,
+    string OutputDType,
+    string OutputTritonDType,
+    PyNTTDimExpression[] OutputShape,
+    PyNTTDimExpression[] OutputStrides,
+    int OutputNPackedLaneCount,
+    int OutputNVectorLaneCount,
+    string Scale,
+    bool Gemv,
+    int ReductionBlockM,
+    int ReductionBlockN,
+    string Comment)
+{
+    public string ReductionPhase { get; } = "finalize";
+
+    public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
 }
 
 public sealed record PyNTTQKVParallelLinearTemplateModel(
@@ -732,6 +767,61 @@ public sealed record PyNTTQKVParallelLinearTemplateModel(
     public int NPackedLaneCount { get; set; } = 1;
 
     public int NVectorLaneCount { get; set; } = 1;
+
+    public string ReductionPhase { get; set; } = "complete";
+
+    public int ReductionBlockM { get; set; }
+
+    public int ReductionBlockN { get; set; }
+
+    public int ReductionBlockK { get; set; }
+
+    public int ReductionQBlockN { get; set; }
+
+    public int ReductionKBlockN { get; set; }
+
+    public int ReductionVBlockN { get; set; }
+}
+
+public sealed record PyNTTQKVParallelLinearReductionFinalizeTemplateModel(
+    string FunctionName,
+    PyNTTBufferPointerTemplateModel QBias,
+    PyNTTBufferPointerTemplateModel KBias,
+    PyNTTBufferPointerTemplateModel VBias,
+    PyNTTBufferPointerTemplateModel QOutput,
+    PyNTTBufferPointerTemplateModel KOutput,
+    PyNTTBufferPointerTemplateModel VOutput,
+    bool HasQBias,
+    bool HasKBias,
+    bool HasVBias,
+    string BiasDType,
+    string OutputDType,
+    string BiasTritonDType,
+    string OutputTritonDType,
+    PyNTTDimExpression[] QBiasShape,
+    PyNTTDimExpression[] KBiasShape,
+    PyNTTDimExpression[] VBiasShape,
+    PyNTTDimExpression[] QOutputShape,
+    PyNTTDimExpression[] KOutputShape,
+    PyNTTDimExpression[] VOutputShape,
+    PyNTTDimExpression[] QBiasStrides,
+    PyNTTDimExpression[] KBiasStrides,
+    PyNTTDimExpression[] VBiasStrides,
+    PyNTTDimExpression[] QOutputStrides,
+    PyNTTDimExpression[] KOutputStrides,
+    PyNTTDimExpression[] VOutputStrides,
+    bool PackedN,
+    int NPackedLaneCount,
+    int NVectorLaneCount,
+    int ReductionBlockM,
+    int ReductionQBlockN,
+    int ReductionKBlockN,
+    int ReductionVBlockN,
+    string Comment)
+{
+    public string ReductionPhase { get; } = "finalize";
+
+    public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
 }
 
 public sealed record PyNTTMatMulGluTemplateModel(
@@ -774,6 +864,44 @@ public sealed record PyNTTMatMulGluTemplateModel(
     public int NPackedLaneCount { get; set; } = 1;
 
     public int NVectorLaneCount { get; set; } = 1;
+
+    public string ReductionPhase { get; set; } = "complete";
+
+    public int ReductionBlockM { get; set; }
+
+    public int ReductionBlockN { get; set; }
+
+    public int ReductionBlockK { get; set; }
+}
+
+public sealed record PyNTTMatMulGluReductionFinalizeTemplateModel(
+    string FunctionName,
+    PyNTTBufferPointerTemplateModel GateBias,
+    PyNTTBufferPointerTemplateModel UpBias,
+    PyNTTBufferPointerTemplateModel Output,
+    bool HasGateBias,
+    bool HasUpBias,
+    string GluType,
+    string BiasDType,
+    string OutputDType,
+    string BiasTritonDType,
+    string OutputTritonDType,
+    PyNTTDimExpression[] GateBiasShape,
+    PyNTTDimExpression[] UpBiasShape,
+    PyNTTDimExpression[] OutputShape,
+    PyNTTDimExpression[] GateBiasStrides,
+    PyNTTDimExpression[] UpBiasStrides,
+    PyNTTDimExpression[] OutputStrides,
+    bool PackedN,
+    int NPackedLaneCount,
+    int NVectorLaneCount,
+    int ReductionBlockM,
+    int ReductionBlockN,
+    string Comment)
+{
+    public string ReductionPhase { get; } = "finalize";
+
+    public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
 }
 
 public sealed record PyNTTSummaTemplateModel(
@@ -837,6 +965,31 @@ public sealed record PyNTTReduceTemplateModel(
     string FinalizeExpression,
     string Comment)
 {
+    public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
+
+    public string ReductionPhase { get; set; } = "complete";
+
+    public int ReductionBlockSize { get; set; }
+
+    public string AccumulatorTritonDType { get; set; } = "tl.float32";
+
+    public bool TrackReductionElementCount { get; set; }
+}
+
+public sealed record PyNTTReduceReductionFinalizeTemplateModel(
+    string FunctionName,
+    PyNTTBufferPointerTemplateModel Output,
+    string OutputDType,
+    string OutputTritonDType,
+    PyNTTDimExpression[] OutputShape,
+    PyNTTDimExpression[] OutputStrides,
+    string FinalizeExpression,
+    int ReductionBlockSize,
+    bool TrackReductionElementCount,
+    string Comment)
+{
+    public string ReductionPhase { get; } = "finalize";
+
     public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
 }
 

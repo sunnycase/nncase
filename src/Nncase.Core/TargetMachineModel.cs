@@ -37,10 +37,44 @@ public enum MemorySharingScope
 /// </summary>
 public enum TargetMemorySpaceKind
 {
-    Register,
     Cache,
     Shared,
     Global,
+}
+
+/// <summary>
+/// Size constraint imposed by the lowering used to allocate one memory arena.
+/// </summary>
+public enum TargetMemoryAllocationSizePolicy
+{
+    /// <summary>
+    /// Round the requested arena size to the resource allocation granularity.
+    /// </summary>
+    GranularityAligned,
+
+    /// <summary>
+    /// Round the whole arena to a power of two. Triton tensor-backed local
+    /// allocations currently impose this constraint on every shape dimension.
+    /// </summary>
+    PowerOfTwo,
+}
+
+/// <summary>
+/// Semantics of an adjacent memory-hierarchy transfer.
+/// </summary>
+public enum TargetMemoryTransferMode
+{
+    /// <summary>
+    /// The child scope directly addresses the same physical storage as its
+    /// parent. Lowering creates a logical view and does not emit a copy.
+    /// </summary>
+    DirectAccess,
+
+    /// <summary>
+    /// The child scope owns distinct physical storage. Lowering must allocate
+    /// a local tile and emit explicit load/store TIR at the boundary.
+    /// </summary>
+    ExplicitCopy,
 }
 
 /// <summary>
@@ -61,6 +95,16 @@ public readonly record struct TargetMemorySpaceId(string Value)
 }
 
 /// <summary>
+/// Stable identity of one physical memory resource. Multiple logical storage
+/// spaces may share a resource and therefore contend for the same bandwidth.
+/// </summary>
+/// <param name="Value">Target-defined identity.</param>
+public readonly record struct TargetMemoryResourceId(string Value)
+{
+    public override string ToString() => Value;
+}
+
+/// <summary>
 /// Binds a physical target memory space to the existing TIR buffer representation.
 /// </summary>
 /// <param name="Location">TIR storage class.</param>
@@ -70,22 +114,15 @@ public readonly record struct TIRMemorySpaceBinding(MemoryLocation Location, int
 /// <summary>
 /// One physical memory space visible to a block.
 /// </summary>
-public sealed record TargetMemorySpaceSpec
+public sealed record TargetMemoryResourceSpec
 {
-    public TargetMemorySpaceSpec(
-        TargetMemorySpaceId id,
+    public TargetMemoryResourceSpec(
+        TargetMemoryResourceId id,
         TargetMemorySpaceKind kind,
-        MemorySharingScope scope,
-        TIRMemorySpaceBinding? tirBinding,
         long capacityBytes,
         long readBytesPerCycle,
         long writeBytesPerCycle,
         long latencyCycles,
-        bool isTilingCandidate,
-        int tilingLevel,
-        bool isAddressable,
-        bool supportsDynamicIndexing,
-        bool requiresExplicitSynchronization,
         int allocationGranularityBytes = 1)
     {
         if (string.IsNullOrWhiteSpace(id.Value))
@@ -113,6 +150,63 @@ public sealed record TargetMemorySpaceSpec
             throw new ArgumentOutOfRangeException(nameof(allocationGranularityBytes), allocationGranularityBytes, "Allocation granularity must be a positive power of two.");
         }
 
+        Id = id;
+        Kind = kind;
+        CapacityBytes = capacityBytes;
+        ReadBytesPerCycle = readBytesPerCycle;
+        WriteBytesPerCycle = writeBytesPerCycle;
+        LatencyCycles = latencyCycles;
+        AllocationGranularityBytes = allocationGranularityBytes;
+    }
+
+    public TargetMemoryResourceId Id { get; }
+
+    public TargetMemorySpaceKind Kind { get; }
+
+    public long CapacityBytes { get; }
+
+    public long ReadBytesPerCycle { get; }
+
+    public long WriteBytesPerCycle { get; }
+
+    public long LatencyCycles { get; }
+
+    public int AllocationGranularityBytes { get; }
+}
+
+/// <summary>
+/// One logical storage space used by scheduling and TIR lowering.
+/// </summary>
+public sealed record TargetMemorySpaceSpec
+{
+    public TargetMemorySpaceSpec(
+        TargetMemorySpaceId id,
+        TargetMemoryResourceId resourceId,
+        MemorySharingScope scope,
+        TIRMemorySpaceBinding? tirBinding,
+        long maxAllocationBytesPerScope,
+        TargetMemoryAllocationSizePolicy allocationSizePolicy,
+        bool isTilingCandidate,
+        int tilingLevel,
+        bool isAddressable,
+        bool supportsDynamicIndexing,
+        bool requiresExplicitSynchronization)
+    {
+        if (string.IsNullOrWhiteSpace(id.Value))
+        {
+            throw new ArgumentException("Target memory space identity must not be empty.", nameof(id));
+        }
+
+        if (string.IsNullOrWhiteSpace(resourceId.Value))
+        {
+            throw new ArgumentException("Target memory resource identity must not be empty.", nameof(resourceId));
+        }
+
+        if (maxAllocationBytesPerScope <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(maxAllocationBytesPerScope), maxAllocationBytesPerScope, "Storage allocation limit must be positive.");
+        }
+
         if (isTilingCandidate && tirBinding is null)
         {
             throw new ArgumentException($"Tiling memory space {id} must have a TIR binding.", nameof(tirBinding));
@@ -124,36 +218,29 @@ public sealed record TargetMemorySpaceSpec
         }
 
         Id = id;
-        Kind = kind;
+        ResourceId = resourceId;
         Scope = scope;
         TIRBinding = tirBinding;
-        CapacityBytes = capacityBytes;
-        ReadBytesPerCycle = readBytesPerCycle;
-        WriteBytesPerCycle = writeBytesPerCycle;
-        LatencyCycles = latencyCycles;
+        MaxAllocationBytesPerScope = maxAllocationBytesPerScope;
+        AllocationSizePolicy = allocationSizePolicy;
         IsTilingCandidate = isTilingCandidate;
         TilingLevel = tilingLevel;
         IsAddressable = isAddressable;
         SupportsDynamicIndexing = supportsDynamicIndexing;
         RequiresExplicitSynchronization = requiresExplicitSynchronization;
-        AllocationGranularityBytes = allocationGranularityBytes;
     }
 
     public TargetMemorySpaceId Id { get; }
 
-    public TargetMemorySpaceKind Kind { get; }
+    public TargetMemoryResourceId ResourceId { get; }
 
     public MemorySharingScope Scope { get; }
 
     public TIRMemorySpaceBinding? TIRBinding { get; }
 
-    public long CapacityBytes { get; }
+    public long MaxAllocationBytesPerScope { get; }
 
-    public long ReadBytesPerCycle { get; }
-
-    public long WriteBytesPerCycle { get; }
-
-    public long LatencyCycles { get; }
+    public TargetMemoryAllocationSizePolicy AllocationSizePolicy { get; }
 
     public bool IsTilingCandidate { get; }
 
@@ -164,8 +251,6 @@ public sealed record TargetMemorySpaceSpec
     public bool SupportsDynamicIndexing { get; }
 
     public bool RequiresExplicitSynchronization { get; }
-
-    public int AllocationGranularityBytes { get; }
 }
 
 /// <summary>
@@ -176,6 +261,7 @@ public sealed record TargetMemoryTransferSpec(
     TargetMemorySpaceId Destination,
     long BytesPerCycle,
     long LatencyCycles,
+    TargetMemoryTransferMode Mode,
     bool RequiresSynchronization = false);
 
 /// <summary>
@@ -188,7 +274,11 @@ public sealed record BlockExecutionSpec(
     int WorkerWidth,
     double ClockRateGHz,
     int VectorWidthBits,
-    int MatMulNr)
+    int MatMulNr,
+    long BackendPrivateAccumulatorCapacityBytes,
+    int BackendPrivateMatrixAccumulatorMinM,
+    int BackendPrivateMatrixAccumulatorMinN,
+    int BackendPrivateGemvAccumulatorMinN)
 {
     public int ThreadsPerBlock => checked(WorkersPerBlock * WorkerWidth);
 }
@@ -238,6 +328,7 @@ public sealed record TargetSynchronizationSpec(long BlockCycles, long GridCycles
 /// </summary>
 public sealed class TargetMachineModel
 {
+    private readonly ImmutableDictionary<TargetMemoryResourceId, TargetMemoryResourceSpec> _memoryResources;
     private readonly ImmutableDictionary<TargetMemorySpaceId, TargetMemorySpaceSpec> _memorySpaces;
     private readonly ImmutableDictionary<MemoryLocation, TargetMemorySpaceId> _fixedBindings;
     private readonly ImmutableDictionary<(TargetMemorySpaceId Source, TargetMemorySpaceId Destination), TargetMemoryTransferSpec> _transfers;
@@ -247,6 +338,7 @@ public sealed class TargetMachineModel
         BlockExecutionSpec execution,
         BlockComputeSpec compute,
         TargetSynchronizationSpec synchronization,
+        IEnumerable<TargetMemoryResourceSpec> memoryResources,
         IEnumerable<TargetMemorySpaceSpec> memorySpaces,
         TargetMemorySpaceId rootMemorySpace,
         IEnumerable<TargetMemoryTransferSpec> transfers,
@@ -265,6 +357,21 @@ public sealed class TargetMachineModel
         if (execution.VectorWidthBits <= 0 || execution.MatMulNr <= 0)
         {
             throw new ArgumentException("Target vector width and MatMul Nr must be positive.", nameof(execution));
+        }
+
+        if (execution.BackendPrivateAccumulatorCapacityBytes <= 0)
+        {
+            throw new ArgumentException("Target backend-private accumulator capacity must be positive.", nameof(execution));
+        }
+
+        if (execution.BackendPrivateMatrixAccumulatorMinM <= 0 ||
+            execution.BackendPrivateMatrixAccumulatorMinN <= 0 ||
+            execution.BackendPrivateGemvAccumulatorMinN <= 0 ||
+            !System.Numerics.BitOperations.IsPow2((uint)execution.BackendPrivateMatrixAccumulatorMinM) ||
+            !System.Numerics.BitOperations.IsPow2((uint)execution.BackendPrivateMatrixAccumulatorMinN) ||
+            !System.Numerics.BitOperations.IsPow2((uint)execution.BackendPrivateGemvAccumulatorMinN))
+        {
+            throw new ArgumentException("Target backend-private matrix accumulator minima must be positive powers of two.", nameof(execution));
         }
 
         if (!double.IsFinite(compute.ElementwiseElementsPerCycle) || compute.ElementwiseElementsPerCycle <= 0 ||
@@ -296,6 +403,22 @@ public sealed class TargetMachineModel
         Execution = execution;
         Compute = compute;
         Synchronization = synchronization;
+        var memoryResourceArray = memoryResources.ToImmutableArray();
+        if (memoryResourceArray.IsDefaultOrEmpty)
+        {
+            throw new ArgumentException($"Target {id} must declare at least one physical memory resource.", nameof(memoryResources));
+        }
+
+        var duplicateMemoryResource = memoryResourceArray
+            .GroupBy(resource => resource.Id)
+            .FirstOrDefault(group => group.Count() > 1);
+        if (duplicateMemoryResource is not null)
+        {
+            throw new ArgumentException($"Target {id} declares duplicate memory resource {duplicateMemoryResource.Key}.", nameof(memoryResources));
+        }
+
+        _memoryResources = memoryResourceArray.ToImmutableDictionary(resource => resource.Id);
+
         var memorySpaceArray = memorySpaces.ToImmutableArray();
         if (memorySpaceArray.IsDefaultOrEmpty)
         {
@@ -311,6 +434,19 @@ public sealed class TargetMachineModel
         }
 
         _memorySpaces = memorySpaceArray.ToImmutableDictionary(space => space.Id);
+        foreach (var memorySpace in memorySpaceArray)
+        {
+            if (!_memoryResources.ContainsKey(memorySpace.ResourceId))
+            {
+                throw new ArgumentException($"Memory space {memorySpace.Id} references undeclared resource {memorySpace.ResourceId}.", nameof(memorySpaces));
+            }
+
+            if (memorySpace.MaxAllocationBytesPerScope > _memoryResources[memorySpace.ResourceId].CapacityBytes)
+            {
+                throw new ArgumentException($"Memory space {memorySpace.Id} allocation limit exceeds resource {memorySpace.ResourceId} capacity.", nameof(memorySpaces));
+            }
+        }
+
         if (!_memorySpaces.ContainsKey(rootMemorySpace))
         {
             throw new ArgumentException($"Root memory space {rootMemorySpace} is not declared by target {id}.", nameof(rootMemorySpace));
@@ -358,11 +494,6 @@ public sealed class TargetMachineModel
             {
                 throw new ArgumentException($"TIR location {location} is bound to undeclared memory space {memorySpace}.", nameof(fixedBindings));
             }
-
-            if (space.IsTilingCandidate)
-            {
-                throw new ArgumentException($"Fixed TIR location {location} cannot bind to tiling candidate {memorySpace}.", nameof(fixedBindings));
-            }
         }
 
         TilingMemorySpaces = _memorySpaces.Values
@@ -385,10 +516,21 @@ public sealed class TargetMachineModel
             var parentMemorySpace = outerLevel < TilingMemorySpaces.Length
                 ? TilingMemorySpaces[outerLevel].Id
                 : rootMemorySpace;
-            if (!_transfers.ContainsKey((parentMemorySpace, memorySpace.Id)) ||
-                !_transfers.ContainsKey((memorySpace.Id, parentMemorySpace)))
+            if (!_transfers.TryGetValue((parentMemorySpace, memorySpace.Id), out var loadTransfer) ||
+                !_transfers.TryGetValue((memorySpace.Id, parentMemorySpace), out var storeTransfer))
             {
                 throw new ArgumentException($"AutoTiling memory space {memorySpace.Id} requires transfer paths to and from its parent memory {parentMemorySpace}.", nameof(transfers));
+            }
+
+            if (loadTransfer.Mode != storeTransfer.Mode)
+            {
+                throw new ArgumentException($"AutoTiling transfer {parentMemorySpace}<->{memorySpace.Id} must use one symmetric transfer mode.", nameof(transfers));
+            }
+
+            if (loadTransfer.Mode == TargetMemoryTransferMode.DirectAccess &&
+                _memorySpaces[parentMemorySpace].ResourceId != memorySpace.ResourceId)
+            {
+                throw new ArgumentException($"Direct-access transfer {parentMemorySpace}<->{memorySpace.Id} must reference one physical memory resource.", nameof(transfers));
             }
         }
 
@@ -428,7 +570,17 @@ public sealed class TargetMachineModel
 
     public ImmutableArray<TargetMemoryTransferSpec> Transfers { get; }
 
+    public IReadOnlyDictionary<TargetMemoryResourceId, TargetMemoryResourceSpec> MemoryResources => _memoryResources;
+
     public IReadOnlyDictionary<TargetMemorySpaceId, TargetMemorySpaceSpec> MemorySpaces => _memorySpaces;
+
+    public TargetMemoryResourceSpec GetMemoryResource(TargetMemoryResourceId id)
+        => _memoryResources.TryGetValue(id, out var resource)
+            ? resource
+            : throw new KeyNotFoundException($"Target {Id} does not define memory resource {id}.");
+
+    public TargetMemoryResourceSpec GetMemoryResource(TargetMemorySpaceSpec space)
+        => GetMemoryResource(space.ResourceId);
 
     public TargetMemorySpaceSpec GetMemorySpace(TargetMemorySpaceId id)
         => _memorySpaces.TryGetValue(id, out var space)
@@ -444,4 +596,71 @@ public sealed class TargetMachineModel
         => _transfers.TryGetValue((source, destination), out var transfer)
             ? transfer
             : throw new KeyNotFoundException($"Target {Id} does not define memory transfer {source}->{destination}.");
+
+    public TargetMemorySpaceSpec GetTilingParentMemorySpace(int tilingLevel)
+    {
+        if ((uint)tilingLevel >= (uint)TilingMemorySpaces.Length)
+        {
+            throw new ArgumentOutOfRangeException(nameof(tilingLevel), tilingLevel, $"Target {Id} has {TilingMemorySpaces.Length} tiling levels.");
+        }
+
+        return tilingLevel + 1 < TilingMemorySpaces.Length
+            ? TilingMemorySpaces[tilingLevel + 1]
+            : GetMemorySpace(RootMemorySpace);
+    }
+
+    public bool RequiresExplicitTransfer(int tilingLevel)
+    {
+        var local = TilingMemorySpaces[tilingLevel];
+        var parent = GetTilingParentMemorySpace(tilingLevel);
+        return GetTransfer(parent.Id, local.Id).Mode == TargetMemoryTransferMode.ExplicitCopy;
+    }
+
+    public long GetAllocationSizeBytes(TargetMemorySpaceSpec space, long requestedBytes)
+    {
+        if (requestedBytes < 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(requestedBytes), requestedBytes, "Allocation size must not be negative.");
+        }
+
+        if (requestedBytes == 0)
+        {
+            return 0;
+        }
+
+        var granularity = GetMemoryResource(space).AllocationGranularityBytes;
+        return space.AllocationSizePolicy switch
+        {
+            TargetMemoryAllocationSizePolicy.GranularityAligned => AlignUp(requestedBytes, granularity),
+            TargetMemoryAllocationSizePolicy.PowerOfTwo => RoundUpPowerOfTwo(Math.Max(requestedBytes, granularity)),
+            _ => throw new ArgumentOutOfRangeException(nameof(space), space.AllocationSizePolicy, "Unknown memory allocation size policy."),
+        };
+    }
+
+    public long GetMaximumUsableAllocationBytes(TargetMemorySpaceSpec space)
+    {
+        var granularity = GetMemoryResource(space).AllocationGranularityBytes;
+        return space.AllocationSizePolicy switch
+        {
+            TargetMemoryAllocationSizePolicy.GranularityAligned =>
+                (space.MaxAllocationBytesPerScope / granularity) * granularity,
+            TargetMemoryAllocationSizePolicy.PowerOfTwo =>
+                checked((long)(1UL << System.Numerics.BitOperations.Log2((ulong)space.MaxAllocationBytesPerScope))),
+            _ => throw new ArgumentOutOfRangeException(nameof(space), space.AllocationSizePolicy, "Unknown memory allocation size policy."),
+        };
+    }
+
+    private static long AlignUp(long value, long alignment)
+        => checked(((value + alignment - 1) / alignment) * alignment);
+
+    private static long RoundUpPowerOfTwo(long value)
+    {
+        var rounded = System.Numerics.BitOperations.RoundUpToPowerOf2((ulong)value);
+        if (rounded == 0 || rounded > long.MaxValue)
+        {
+            throw new OverflowException($"Allocation size {value} cannot be represented as a power of two.");
+        }
+
+        return checked((long)rounded);
+    }
 }

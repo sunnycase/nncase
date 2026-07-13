@@ -299,6 +299,140 @@ public class UnitTestCPUTarget : TestClassBase
     }
 
     [Fact]
+    public void TestMatmulReductionUsesBackendPrivateAccumulator()
+    {
+        var lhs = CreateBufferParameter("lhs", DataTypes.BFloat16, [2, 4], TIR.BufferVarRole.Input);
+        var rhs = CreateBufferParameter("rhs", DataTypes.BFloat16, [4, 3], TIR.BufferVarRole.Input);
+        var output = CreateBufferParameter("output", DataTypes.BFloat16, [2, 3], TIR.BufferVarRole.Output);
+        var source = GenerateReductionDeviceSource(
+            TIR.F.NTT.Matmul(lhs, rhs, output, false, None.Default),
+            lhs,
+            rhs,
+            output);
+
+        Assert.Contains("replace_element_t<typename std::decay_t<decltype(", source, StringComparison.Ordinal);
+        Assert.Contains("::element_type, float>", source, StringComparison.Ordinal);
+        Assert.Contains("matmul<false, false, false>", source, StringComparison.Ordinal);
+        Assert.Contains("matmul<true, false, false>", source, StringComparison.Ordinal);
+        AssertReductionLifetime(source, "ntt_reduction_0_acc0", IRHelpers.GetIdentityName(output.Name));
+    }
+
+    [Fact]
+    public void TestQKVReductionUsesThreeBackendPrivateAccumulators()
+    {
+        var input = CreateBufferParameter("input", DataTypes.BFloat16, [2, 4], TIR.BufferVarRole.Input);
+        var qWeight = CreateBufferParameter("q_weight", DataTypes.BFloat16, [4, 6], TIR.BufferVarRole.Input);
+        var kWeight = CreateBufferParameter("k_weight", DataTypes.BFloat16, [4, 3], TIR.BufferVarRole.Input);
+        var vWeight = CreateBufferParameter("v_weight", DataTypes.BFloat16, [4, 3], TIR.BufferVarRole.Input);
+        var qOutput = CreateBufferParameter("q_output", DataTypes.BFloat16, [2, 6], TIR.BufferVarRole.Output);
+        var kOutput = CreateBufferParameter("k_output", DataTypes.BFloat16, [2, 3], TIR.BufferVarRole.Output);
+        var vOutput = CreateBufferParameter("v_output", DataTypes.BFloat16, [2, 3], TIR.BufferVarRole.Output);
+        var source = GenerateReductionDeviceSource(
+            TIR.F.NTT.QKVParallelLinear(
+                input,
+                qWeight,
+                kWeight,
+                vWeight,
+                None.Default,
+                None.Default,
+                None.Default,
+                None.Default,
+                None.Default,
+                None.Default,
+                None.Default,
+                None.Default,
+                None.Default,
+                qOutput,
+                kOutput,
+                vOutput,
+                2,
+                1),
+            input,
+            qWeight,
+            kWeight,
+            vWeight,
+            qOutput,
+            kOutput,
+            vOutput);
+
+        Assert.Contains("ntt_reduction_0_acc0", source, StringComparison.Ordinal);
+        Assert.Contains("ntt_reduction_0_acc1", source, StringComparison.Ordinal);
+        Assert.Contains("ntt_reduction_0_acc2", source, StringComparison.Ordinal);
+        Assert.Equal(3, CountOccurrences(source, "matmul<false, false, false>"));
+        Assert.Equal(3, CountOccurrences(source, "matmul<true, false, false>"));
+        AssertReductionLifetime(source, "ntt_reduction_0_acc0", IRHelpers.GetIdentityName(qOutput.Name));
+    }
+
+    [Fact]
+    public void TestGluReductionUsesTwoBackendPrivateAccumulators()
+    {
+        var input = CreateBufferParameter("input", DataTypes.BFloat16, [2, 4], TIR.BufferVarRole.Input);
+        var gateWeight = CreateBufferParameter("gate_weight", DataTypes.BFloat16, [4, 6], TIR.BufferVarRole.Input);
+        var upWeight = CreateBufferParameter("up_weight", DataTypes.BFloat16, [4, 6], TIR.BufferVarRole.Input);
+        var output = CreateBufferParameter("output", DataTypes.BFloat16, [2, 6], TIR.BufferVarRole.Output);
+        var source = GenerateReductionDeviceSource(
+            TIR.F.NTT.MatMulGlu(
+                input,
+                gateWeight,
+                upWeight,
+                None.Default,
+                None.Default,
+                None.Default,
+                None.Default,
+                None.Default,
+                None.Default,
+                output,
+                IR.NN.GluType.SwiGLU),
+            input,
+            gateWeight,
+            upWeight,
+            output);
+
+        Assert.Contains("ntt_reduction_0_acc0", source, StringComparison.Ordinal);
+        Assert.Contains("ntt_reduction_0_acc1", source, StringComparison.Ordinal);
+        Assert.Equal(2, CountOccurrences(source, "matmul<false, false, false>"));
+        Assert.Equal(2, CountOccurrences(source, "matmul<true, false, false>"));
+        Assert.Contains("unary<ops::swish>(ntt_reduction_0_acc0", source, StringComparison.Ordinal);
+        Assert.Contains("binary<ops::mul>(ntt_reduction_0_acc0, ntt_reduction_0_acc1", source, StringComparison.Ordinal);
+        AssertReductionLifetime(source, "ntt_reduction_0_acc0", IRHelpers.GetIdentityName(output.Name));
+    }
+
+    [Fact]
+    public void TestReduceReductionUsesBackendPrivateAccumulator()
+    {
+        var input = CreateBufferParameter("input", DataTypes.BFloat16, [2, 4], TIR.BufferVarRole.Input);
+        var output = CreateBufferParameter("output", DataTypes.BFloat16, [2], TIR.BufferVarRole.Output);
+        var source = GenerateReductionDeviceSource(
+            TIR.F.NTT.Reduce(input, output, false, [], [], [1], false, ReduceOp.Sum),
+            input,
+            output);
+
+        Assert.Contains("replace_element_t<typename std::decay_t<decltype(", source, StringComparison.Ordinal);
+        Assert.Contains("::element_type, float>", source, StringComparison.Ordinal);
+        Assert.Contains("reduce_sum<false>", source, StringComparison.Ordinal);
+        Assert.Contains("reduce_sum<true>", source, StringComparison.Ordinal);
+        AssertReductionLifetime(source, "ntt_reduction_0_acc0", IRHelpers.GetIdentityName(output.Name));
+    }
+
+    [Fact]
+    public void TestReduceMeanReductionTracksDynamicElementCount()
+    {
+        var input = CreateBufferParameter("input", DataTypes.BFloat16, [2, 4], TIR.BufferVarRole.Input);
+        var output = CreateBufferParameter("output", DataTypes.BFloat16, [2], TIR.BufferVarRole.Output);
+        var source = GenerateReductionDeviceSource(
+            TIR.F.NTT.Reduce(input, output, false, [], [], [1], false, ReduceOp.Mean),
+            input,
+            output);
+
+        Assert.Contains("reduce_sum<false>", source, StringComparison.Ordinal);
+        Assert.Contains("reduce_sum<true>", source, StringComparison.Ordinal);
+        Assert.Contains("size_t ntt_reduction_0_element_count = 0", source, StringComparison.Ordinal);
+        Assert.Contains("ntt_reduction_0_element_count += reduction_element_count", source, StringComparison.Ordinal);
+        Assert.Contains("finalize_reduction_mean(ntt_reduction_0_acc0, ntt_reduction_0_element_count)", source, StringComparison.Ordinal);
+        AssertReductionLifetime(source, "ntt_reduction_0_acc0", IRHelpers.GetIdentityName(output.Name));
+    }
+
+    [Fact]
     public void TestCodeGenVisitLeafVar()
     {
         Assert.Throws<InvalidOperationException>(() => TestCodeGen(Var.Scalar("x", DataTypes.Float32), Array.Empty<Var>()));
@@ -520,6 +654,46 @@ public class UnitTestCPUTarget : TestClassBase
             dimensions.Select(dim => (Dimension)dim).ToArray(),
             strides.Select(stride => (Dimension)stride).ToArray(),
             null);
+    }
+
+    private TIR.BufferVar CreateBufferParameter(
+        string name,
+        DataType elemType,
+        long[] dimensions,
+        TIR.BufferVarRole role) =>
+        new(
+            name,
+            new TensorType(elemType, dimensions),
+            role,
+            role == TIR.BufferVarRole.Output ? TIR.MemoryLocation.Output : TIR.MemoryLocation.Input);
+
+    private string GenerateReductionDeviceSource(Expr reductionCall, params TIR.BufferVar[] parameters)
+    {
+        var loopVar = new DimVar("reduction_tile");
+        var loop = new TIR.For(
+            loopVar,
+            new TIR.Range(0, 8, 4),
+            TIR.LoopMode.Reduction,
+            new TIR.Sequential(reductionCall));
+        var function = new TIR.PrimFunction(
+            "device_func_reduction_test",
+            CPUTarget.Kind,
+            new TIR.Sequential(loop),
+            parameters);
+        Assert.True(function.InferenceType());
+        var visitor = new DeviceCSourceConvertVisitor();
+        visitor.Visit(function);
+        return visitor.GetHeader();
+    }
+
+    private void AssertReductionLifetime(string source, string accumulator, string output)
+    {
+        var initializerIndex = source.IndexOf($"auto {accumulator}_storage", StringComparison.Ordinal);
+        var loopIndex = source.IndexOf("for (", StringComparison.Ordinal);
+        var finalizerIndex = source.LastIndexOf($"cast({accumulator}, {output}", StringComparison.Ordinal);
+        Assert.True(initializerIndex >= 0, $"Missing initializer for {accumulator}.\n{source}");
+        Assert.True(loopIndex > initializerIndex, $"Reduction loop must follow {accumulator} initialization.\n{source}");
+        Assert.True(finalizerIndex > loopIndex, $"{accumulator} must be committed after the reduction loop.\n{source}");
     }
 
     private int CountOccurrences(string text, string value)

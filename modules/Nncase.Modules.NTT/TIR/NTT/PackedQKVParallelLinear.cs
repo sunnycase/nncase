@@ -33,11 +33,11 @@ public sealed partial class PackedQKVParallelLinear : NTTKernelOp
 
     public static readonly ParameterInfo VWeightScale = new(typeof(PackedQKVParallelLinear), 12, "v_weight_scale", memoryEffect: MemoryEffect.Read);
 
-    public static readonly ParameterInfo QOutput = new(typeof(PackedQKVParallelLinear), 13, "q_output", memoryEffect: MemoryEffect.Write);
+    public static readonly ParameterInfo QOutput = new(typeof(PackedQKVParallelLinear), 13, "q_output", memoryEffect: MemoryEffect.ReductionWrite);
 
-    public static readonly ParameterInfo KOutput = new(typeof(PackedQKVParallelLinear), 14, "k_output", memoryEffect: MemoryEffect.Write);
+    public static readonly ParameterInfo KOutput = new(typeof(PackedQKVParallelLinear), 14, "k_output", memoryEffect: MemoryEffect.ReductionWrite);
 
-    public static readonly ParameterInfo VOutput = new(typeof(PackedQKVParallelLinear), 15, "v_output", memoryEffect: MemoryEffect.Write);
+    public static readonly ParameterInfo VOutput = new(typeof(PackedQKVParallelLinear), 15, "v_output", memoryEffect: MemoryEffect.ReductionWrite);
 
     public long NumHeads { get; }
 

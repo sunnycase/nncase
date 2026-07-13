@@ -98,13 +98,17 @@ public sealed class PrimFunction : BaseFunction
 
     public override BaseFunction With(string? name = null, string? moduleKind = null)
     {
-        return new PrimFunction(name ?? Name, moduleKind ?? ModuleKind, Body, Results, Parameters);
+        return new PrimFunction(name ?? Name, moduleKind ?? ModuleKind, Body, Results, Parameters)
+        {
+            Role = Role,
+            SchedResult = SchedResult,
+        };
     }
 
-    public PrimFunction With(string? name = null, string? moduleKind = null, Sequential? body = null, Return? results = null, IVar[]? parameters = null, Schedule.SchedFunctionResult? sched = null)
+    public PrimFunction With(string? name = null, string? moduleKind = null, Sequential? body = null, Return? results = null, IVar[]? parameters = null, Schedule.SchedFunctionResult? sched = null, FunctionRole? role = null)
         => new PrimFunction(name ?? Name, moduleKind ?? ModuleKind, body ?? Body, results ?? Results, parameters ?? Parameters)
         {
-            // note maybe add SchedResult into ctor.
+            Role = role ?? Role,
             SchedResult = sched ?? SchedResult,
         };
 }

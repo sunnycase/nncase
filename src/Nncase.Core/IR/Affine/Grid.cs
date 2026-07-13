@@ -15,11 +15,21 @@ public enum GridTileExtentKind
 }
 
 /// <summary>
+/// Semantic role of one grid domain axis. The role is independent from the
+/// legal tile extents selected for that axis.
+/// </summary>
+public enum GridAxisKind
+{
+    Parallel,
+    Reduction,
+}
+
+/// <summary>
 /// Target-independent tiling legality for one grid domain axis.
 /// </summary>
 public sealed record GridTileAxisPolicy
 {
-    private GridTileAxisPolicy(GridTileExtentKind extentKind, long extent, long alignment)
+    private GridTileAxisPolicy(GridAxisKind axisKind, GridTileExtentKind extentKind, long extent, long alignment)
     {
         if (alignment <= 0 || !System.Numerics.BitOperations.IsPow2((ulong)alignment))
         {
@@ -31,10 +41,13 @@ public sealed record GridTileAxisPolicy
             throw new ArgumentOutOfRangeException(nameof(extent), extent, "A fixed tile extent must be positive.");
         }
 
+        AxisKind = axisKind;
         ExtentKind = extentKind;
         Extent = extent;
         Alignment = alignment;
     }
+
+    public GridAxisKind AxisKind { get; }
 
     public GridTileExtentKind ExtentKind { get; }
 
@@ -42,16 +55,25 @@ public sealed record GridTileAxisPolicy
 
     public long Alignment { get; }
 
-    public static GridTileAxisPolicy FullExtent { get; } = new(GridTileExtentKind.FullExtent, 0, 1);
+    public static GridTileAxisPolicy FullExtent { get; } = new(GridAxisKind.Parallel, GridTileExtentKind.FullExtent, 0, 1);
+
+    public static GridTileAxisPolicy FullReductionExtent { get; } = new(GridAxisKind.Reduction, GridTileExtentKind.FullExtent, 0, 1);
 
     public static GridTileAxisPolicy Search(long alignment = 1)
-        => new(GridTileExtentKind.Search, 0, alignment);
+        => new(GridAxisKind.Parallel, GridTileExtentKind.Search, 0, alignment);
+
+    public static GridTileAxisPolicy Reduction(long alignment = 1)
+        => new(GridAxisKind.Reduction, GridTileExtentKind.Search, 0, alignment);
 
     public static GridTileAxisPolicy Fixed(long extent)
-        => new(GridTileExtentKind.Fixed, extent, 1);
+        => new(GridAxisKind.Parallel, GridTileExtentKind.Fixed, extent, 1);
+
+    public static GridTileAxisPolicy FixedReduction(long extent)
+        => new(GridAxisKind.Reduction, GridTileExtentKind.Fixed, extent, 1);
 
     public override string ToString()
-        => ExtentKind switch
+    {
+        var extent = ExtentKind switch
         {
             GridTileExtentKind.Search when Alignment == 1 => "search",
             GridTileExtentKind.Search => $"search-align-{Alignment}",
@@ -59,6 +81,8 @@ public sealed record GridTileAxisPolicy
             GridTileExtentKind.Fixed => $"fixed-{Extent}",
             _ => throw new ArgumentOutOfRangeException(),
         };
+        return AxisKind == GridAxisKind.Reduction ? $"reduce-{extent}" : extent;
+    }
 }
 
 public sealed class Grid : Expr

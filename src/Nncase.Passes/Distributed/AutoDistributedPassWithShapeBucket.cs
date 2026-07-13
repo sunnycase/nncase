@@ -118,7 +118,8 @@ public sealed partial class AutoDistributedWithShapeBucketPass : ModulePass
                                   select new KeyValuePair<DimVar, DimVar>(
                                       dimVar,
                                       dimVar.With(range: newRange))).ToDictionary(kvp => kvp.Key, kvp => kvp.Value, (IEqualityComparer<DimVar>)ReferenceEqualityComparer.Instance);
-                var segmentFunction = (Function)new SegmentFunctionCloner(newDimVars, $"_segment_{segmentIndex}").Clone(functionForSegments, Unit.Default);
+                var segmentFunction = ((Function)new SegmentFunctionCloner(newDimVars, $"_segment_{segmentIndex}").Clone(functionForSegments, Unit.Default))
+                    .With(role: FunctionRole.Dispatch);
                 segmentStates[segmentIndex] = new SegmentAutoDistributedState(
                     segmentFunction,
                     newDimVars);
@@ -330,7 +331,11 @@ public sealed partial class AutoDistributedWithShapeBucketPass : ModulePass
         var mainBody = segmentFunctions.Count == 1
             ? new Call(segmentFunctions[0].SegmentFunction, parameters.AsValueEnumerable().Select(x => (BaseExpr)x).ToArray())
             : CreateShapeBucketIf(segmentFunctions[0].SegmentFunction, elseFunction, segmentFunctions[0].DimVars, parameters);
-        var mainFunction = new Function(inputFunction.Name, inputFunction.ModuleKind, mainBody, parameters, inputFunction.VarMap) { Metadata = inputFunction.Metadata };
+        var mainFunction = new Function(inputFunction.Name, inputFunction.ModuleKind, mainBody, parameters, inputFunction.VarMap)
+        {
+            Metadata = inputFunction.Metadata,
+            Role = FunctionRole.Dispatch,
+        };
         if (!CompilerServices.InferenceType(mainFunction))
         {
             throw new InvalidOperationException($"Type inference failed for shape bucket dispatcher {mainFunction.Name}.");
@@ -357,6 +362,7 @@ public sealed partial class AutoDistributedWithShapeBucketPass : ModulePass
             RemapVarMap(inputFunction.VarMap, inputFunction.Parameters.ToArray(), parameters))
         {
             Metadata = inputFunction.Metadata,
+            Role = FunctionRole.Dispatch,
         };
         if (!CompilerServices.InferenceType(selector))
         {

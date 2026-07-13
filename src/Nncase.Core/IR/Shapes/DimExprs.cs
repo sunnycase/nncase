@@ -103,8 +103,8 @@ public sealed class DimProduct : Dimension, IEquatable<DimProduct?>
                 (DimConst dimConst, _) when dimConst.Value == 1 => rhs,
                 (_, DimConst dimConst) when dimConst.Value == 1 => lhs,
                 (_, _) when lhs.IsUnknown || rhs.IsUnknown => Unknown,
-                (DimSum lhsSum, _) => new DimSum(lhsSum.Operands.AsValueEnumerable().Select(x => x * rhs).ToArray()).Simplify(),
-                (_, DimSum rhsSum) => new DimSum(rhsSum.Operands.AsValueEnumerable().Select(x => lhs * x).ToArray()).Simplify(),
+                (DimSum lhsSum, _) => MultiplySum(lhsSum, rhs),
+                (_, DimSum rhsSum) => MultiplySum(rhsSum, lhs),
                 (DimProduct dimProduct, DimConst dimConst) => dimProduct.With(scale: dimProduct.Scale * dimConst.Value),
                 (DimConst dimConst, DimProduct dimProduct) => dimProduct.With(scale: dimProduct.Scale * dimConst.Value),
                 (DimProduct lhsProduct, DimProduct rhsProduct) => CreateWithSimplify(SpanUtility.Concat(lhsProduct.Operands, rhsProduct.Operands), lhsProduct.Scale * rhsProduct.Scale),
@@ -115,6 +115,17 @@ public sealed class DimProduct : Dimension, IEquatable<DimProduct?>
         }
 
         return lhs;
+    }
+
+    private static Dimension MultiplySum(DimSum sum, Dimension factor)
+    {
+        var operands = sum.Operands.AsValueEnumerable().Select(operand => operand * factor).ToList();
+        if (sum.Bias != 0)
+        {
+            operands.Add(sum.Bias * factor);
+        }
+
+        return new DimSum(operands.ToArray()).Simplify();
     }
 
     /// <inheritdoc/>
@@ -201,7 +212,7 @@ public sealed class DimSum : Dimension, IEquatable<DimSum?>
             return true;
         }
 
-        return other is not null && Operands.SequenceEqual(other.Operands);
+        return other is not null && Bias == other.Bias && Operands.SequenceEqual(other.Operands);
     }
 
     public override string ToString()
@@ -251,7 +262,9 @@ public sealed class DimSum : Dimension, IEquatable<DimSum?>
                 (DimConst dimConst, _) when dimConst.Value == 0 => rhs,
                 (_, DimConst dimConst) when dimConst.Value == 0 => lhs,
                 (_, _) when lhs.IsUnknown || rhs.IsUnknown => Unknown,
-                (DimSum lhsSum, DimSum rhsSum) => CreateWithSimplify(SpanUtility.Concat(lhsSum.Operands, rhsSum.Operands)),
+                (DimSum lhsSum, DimSum rhsSum) => CreateWithSimplify(
+                    SpanUtility.Concat(lhsSum.Operands, rhsSum.Operands),
+                    checked(lhsSum.Bias + rhsSum.Bias)),
                 (DimVar v, DimSum rhsSum) when rhsSum.Operands.Length == 1 && rhsSum.Operands[0] is DimProduct p && p.Operands.Length == 1 && ReferenceEquals(p.Operands[0], v) => CreateWithSimplify([DimProduct.TrySimplify(p.Scale + 1, [v]) ?? new DimProduct([v], p.Scale + 1)], rhsSum.Bias),
                 (DimSum lhsSum, DimVar v) when lhsSum.Operands.Length == 1 && lhsSum.Operands[0] is DimProduct p && p.Operands.Length == 1 && ReferenceEquals(p.Operands[0], v) => CreateWithSimplify([DimProduct.TrySimplify(p.Scale + 1, [v]) ?? new DimProduct([v], p.Scale + 1)], lhsSum.Bias),
                 (DimSum lhsSum, _) => CreateWithSimplify(SpanUtility.Concat(lhsSum.Operands, [rhs]), lhsSum.Bias),
@@ -269,6 +282,7 @@ public sealed class DimSum : Dimension, IEquatable<DimSum?>
     protected override int GetHashCodeCore()
     {
         var hash = default(HashCode);
+        hash.Add(Bias);
         foreach (var operand in Operands)
         {
             hash.Add(operand);
@@ -279,28 +293,58 @@ public sealed class DimSum : Dimension, IEquatable<DimSum?>
 
     private static Dimension CreateWithSimplify(Dimension[] operands, long bias = 0)
     {
-        var scales = new Dictionary<Dimension, long>(ReferenceEqualityComparer.Instance);
+        var scales = new Dictionary<Dimension, long>();
 
         foreach (var operand in operands)
         {
-            if (operand is DimConst dimConst)
-            {
-                bias += dimConst.Value;
-            }
-            else
-            {
-                ref var value = ref CollectionsMarshal.GetValueRefOrAddDefault(scales, operand, out _);
-                value += 1;
-            }
+            AddTerm(operand, 1);
         }
 
-        var newOperands = scales.Select(kvp => kvp.Key * kvp.Value).ToArray();
+        var newOperands = scales
+            .Where(kvp => kvp.Value != 0)
+            .Select(kvp => kvp.Key * kvp.Value)
+            .ToArray();
         return (bias, newOperands.Length) switch
         {
             (_, 0) => new DimConst(bias),
             (0, 1) => newOperands[0],
             _ => new DimSum(newOperands, bias),
         };
+
+        void AddTerm(Dimension term, long coefficient)
+        {
+            switch (term)
+            {
+                case DimConst constant:
+                    bias = checked(bias + (coefficient * constant.Value));
+                    break;
+                case DimSum sum:
+                    bias = checked(bias + (coefficient * sum.Bias));
+                    foreach (var operand in sum.Operands)
+                    {
+                        AddTerm(operand, coefficient);
+                    }
+
+                    break;
+                case DimProduct product:
+                    AddMonomial(NormalizeProduct(product), checked(coefficient * product.Scale));
+                    break;
+                default:
+                    AddMonomial(term, coefficient);
+                    break;
+            }
+        }
+
+        void AddMonomial(Dimension term, long coefficient)
+        {
+            ref var value = ref CollectionsMarshal.GetValueRefOrAddDefault(scales, term, out _);
+            value = checked(value + coefficient);
+        }
+
+        static Dimension NormalizeProduct(DimProduct product)
+            => product.Operands.Length == 1
+                ? product.Operands[0]
+                : new DimProduct(product.Operands.ToArray());
     }
 
     private ValueRange<double> InferRange()

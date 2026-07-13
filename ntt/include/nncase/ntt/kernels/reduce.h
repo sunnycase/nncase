@@ -21,6 +21,37 @@
 #include <limits>
 
 namespace nncase::ntt {
+template <Tensor TIn, Tensor TOut, FixedDimensions TReduceAxes,
+          FixedDimensions VectorizedAxes>
+constexpr size_t
+reduction_element_count(const TIn &input, const TOut &,
+                        const TReduceAxes &reduce_axes,
+                        const VectorizedAxes &) noexcept {
+    using TInElem = typename TIn::element_type;
+    using TOutElem = typename TOut::element_type;
+    size_t count = 1;
+    for (size_t i = 0; i < TReduceAxes::rank(); i++)
+        count *= input.shape()[reduce_axes[i]];
+
+    if constexpr (Vector<TOutElem>) {
+        count = count * TInElem::shape().length() /
+                TOutElem::shape().length();
+    }
+
+    return count;
+}
+
+template <Tensor TAccumulator>
+constexpr void finalize_reduction_mean(TAccumulator &accumulator,
+                                       size_t element_count) noexcept {
+    using TAccumulatorElem = typename TAccumulator::element_type;
+    using TAccumulatorScalar = element_or_scalar_t<TAccumulatorElem>;
+    const auto denominator = (TAccumulatorScalar)(float)element_count;
+    ntt::apply(accumulator.shape(), [&](auto index) {
+        accumulator(index) /= denominator;
+    });
+}
+
 namespace detail {
 template <reduce_op Op, bool Accumulate, Vector TIn, Vector TOut, size_t Axis>
 class inner_reduce_impl;
@@ -106,18 +137,9 @@ class reduce_impl {
 
             // Mean
             if constexpr (Op == reduce_op::mean) {
-                const auto reduce_axis = reduce_axes[0_dim];
-                const auto inner_size =
-                    input.shape()
-                        .template slice<reduce_axis, TReduceAxes::rank()>()
-                        .length();
-                auto denom = (TOutScalar)(float)inner_size;
-                if constexpr (Vector<TOutElem>) {
-                    const auto inner_size_devectorized =
-                        inner_size * TInElem::shape().length() /
-                        TOutElem::shape().length();
-                    denom = (TOutScalar)(float)inner_size_devectorized;
-                }
+                const auto inner_size = reduction_element_count(
+                    input, output, reduce_axes, vectorized_axes);
+                const auto denom = (TOutScalar)(float)inner_size;
                 output(index) /= denom;
             }
         });
@@ -125,6 +147,8 @@ class reduce_impl {
 
     template <FixedDimensions TReduceAxes, FixedDimensions VectorizedAxes>
         requires(Op == reduce_op::sum && TIn::rank() == 2 &&
+                 decltype(TOut::rank())::value ==
+                     decltype(TIn::rank())::value &&
                  TReduceAxes::rank() == 1 && VectorizedAxes::rank() == 0)
     constexpr void operator()(const TIn &input, TOut &output,
                               const TReduceAxes &, const VectorizedAxes &) {
@@ -230,6 +254,7 @@ DEFINE_NTT_REDUCE(mean)
 DEFINE_NTT_REDUCE(min)
 DEFINE_NTT_REDUCE(max)
 DEFINE_NTT_REDUCE(sum)
+DEFINE_NTT_REDUCE(prod)
 
 #undef DEFINE_NTT_REDUCE
 } // namespace nncase::ntt

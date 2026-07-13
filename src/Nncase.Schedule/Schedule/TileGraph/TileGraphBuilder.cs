@@ -90,7 +90,7 @@ public sealed class TieredTileGraphBuilder : ExprVisitor<Unit, Unit>
             attr |= TileGridAttribute.LiveOut;
         }
 
-        var opNode = new TileGrid(current, op, copId, domainBoundValues, new DomainRelation(copId, copId, AffineMap.Identity(domainDims)), domainBoundExprs, domainDynamic, bufferShapeValues, attr);
+        var opNode = new TileGrid(current, op, copId, copId, domainBoundValues, new DomainRelation(copId, copId, AffineMap.Identity(domainDims)), domainBoundExprs, domainDynamic, bufferShapeValues, attr);
 
         var tileNodeRoot = RootGraph.CreateCluster<TieredTileGraph>(LevelCount - 1, copId, new DomainRelation(copId, copId, AffineMap.Identity(domainDims)), domainBoundExprs, domainDynamic);
         var tileNodeTail = tileNodeRoot;

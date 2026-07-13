@@ -14,6 +14,12 @@ public enum LoopMode
     Serial,
 
     /// <summary>
+    /// Serial loop carrying backend-private reduction state. The state is a
+    /// logical value and is not represented by a TIR buffer.
+    /// </summary>
+    Reduction,
+
+    /// <summary>
     /// Parallel execution on NTT.
     /// </summary>
     Parallel,

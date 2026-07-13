@@ -1,8 +1,27 @@
 @model Nncase.CodeGen.NTT.TypedKernelTemplateModel<Nncase.TIR.NTT.PackedMatMul>
 @{
   string scale = Model.Arguments[4].Symbol.Name;
+  string MatmulLine(bool accumulate, string output) =>
+      $"{Model.Indent}  packed_matmul<{accumulate.ToString().ToLowerInvariant()}>({Model.Arguments[0].Symbol.Name}, {Model.Arguments[1].Symbol.Name}, {output}, {scale});\n";
 }
 
+@if (Model.Reduction is { Phase: Nncase.CodeGen.NTT.ReductionKernelPhase.Accumulate } accumulate)
+{
+@Html.Raw($"{Model.Indent}{{\n")
+@Html.Raw($"{Model.Indent}  if ({accumulate.Initialized}) {{\n")
+@Html.Raw(MatmulLine(true, accumulate.Accumulators[0]))
+@Html.Raw($"{Model.Indent}  }} else {{\n")
+@Html.Raw(MatmulLine(false, accumulate.Accumulators[0]))
+@Html.Raw($"{Model.Indent}    {accumulate.Initialized} = true;\n")
+@Html.Raw($"{Model.Indent}  }}\n")
+@Html.Raw($"{Model.Indent}}}\n")
+}
+else if (Model.Reduction is { Phase: Nncase.CodeGen.NTT.ReductionKernelPhase.Finalize } finalize)
+{
+@Html.Raw($"{Model.Indent}cast({finalize.Accumulators[0]}, {Model.Arguments[2].Symbol.Name}, fixed_shape_v<>);\n")
+}
+else
+{
 @(Model.Indent){
 @if (Model.Arguments[3].Symbol.Name != "nullptr")
 {
@@ -23,3 +42,4 @@ else
 @:@(Model.Indent)  packed_matmul<false>(@Html.Raw(Model.Arguments[0].Symbol.Name), @Html.Raw(Model.Arguments[1].Symbol.Name), @Html.Raw(Model.Arguments[2].Symbol.Name), @(scale));
 }
 @(Model.Indent)}
+}

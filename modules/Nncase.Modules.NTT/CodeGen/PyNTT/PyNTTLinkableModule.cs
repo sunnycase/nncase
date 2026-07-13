@@ -555,7 +555,7 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
             CollectRuntimeDispatchCallees(function.SourceFunction, callees);
             foreach (var callee in callees)
             {
-                if (PyNTTPrimFunctionRoles.IsAutoTilingDeviceFunction(callee))
+                if (PyNTTPrimFunctionRoles.IsScheduledRegionFunction(callee))
                 {
                     continue;
                 }
@@ -993,7 +993,7 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
             CollectDirectPrimFunctionCallees(function.SourceFunction, callees);
             foreach (var directCallee in callees)
             {
-                if (PyNTTPrimFunctionRoles.IsAutoTilingDeviceFunction(directCallee))
+                if (PyNTTPrimFunctionRoles.IsScheduledRegionFunction(directCallee))
                 {
                     continue;
                 }
@@ -1146,7 +1146,7 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
                 return BuildDispatchSequential(sequential, currentFunction, context, extraIndent);
             case IfThenElse ifThenElse:
                 return BuildDispatchIfThenElse(ifThenElse, currentFunction, context, extraIndent);
-            case Call { Target: PrimFunction callee } when PyNTTPrimFunctionRoles.IsAutoTilingDeviceFunction(callee):
+            case Call { Target: PrimFunction callee } when PyNTTPrimFunctionRoles.IsScheduledRegionFunction(callee):
                 return string.Empty;
             case Call { Target: PrimFunction callee } call:
                 return BuildFunctionCallDispatch(call, FindLinkableFunction(callee), context, extraIndent);
@@ -1190,7 +1190,7 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
 
             if (field is Call { Target: PrimFunction callee } call)
             {
-                if (!PyNTTPrimFunctionRoles.IsAutoTilingDeviceFunction(callee))
+                if (!PyNTTPrimFunctionRoles.IsScheduledRegionFunction(callee))
                 {
                     pieces.Add(BuildFunctionCallDispatch(call, FindLinkableFunction(callee), context, extraIndent));
                 }
@@ -1255,11 +1255,11 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
                 return CountRuntimeLaunches(function.Body, active);
             case Fusion fusion:
                 return CountRuntimeLaunches(fusion.Body, active);
-            case PrimFunction primFunction when PyNTTPrimFunctionRoles.IsAutoTilingDeviceFunction(primFunction):
+            case PrimFunction primFunction when PyNTTPrimFunctionRoles.IsScheduledRegionFunction(primFunction):
                 return 0;
             case PrimFunction primFunction:
                 return CountRuntimeLaunches(FindLinkableFunction(primFunction), active);
-            case Call { Target: PrimFunction callee } when PyNTTPrimFunctionRoles.IsAutoTilingDeviceFunction(callee):
+            case Call { Target: PrimFunction callee } when PyNTTPrimFunctionRoles.IsScheduledRegionFunction(callee):
                 return 0;
             case Call { Target: PrimFunction callee }:
                 return CountRuntimeLaunches(FindLinkableFunction(callee), active);
@@ -2296,7 +2296,7 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
             : $"from .generated_kernels import {kernel.Name}";
         var launchStatement = $"        {kernel.Name}[grid]({tensorArgs}, numel, block_size{kwargs})";
         var kernelArgs = string.IsNullOrWhiteSpace(tensorArgs) ? "(numel,)" : $"({tensorArgs}, numel,)";
-        var tuningSelectionStatement = $"        block_size = select_and_validate_triton_tuning_parameter({PythonString(kernel.Name)}, \"block_size\", {blockSizeCandidates}, source={PythonString(blockSize.Source)}, kernel={kernel.Name}, kernel_args={kernelArgs}, grid_for_candidate={gridForCandidate}, expected_num_warps={kernel.Launch.NumWarps ?? throw new InvalidOperationException($"Generated PyNTT kernel {kernel.Name} must declare a fixed num_warps.")}, worker_width={PythonValue(kernel.Attrs["worker_width"])}, register_capacity_bytes={PythonValue(kernel.Attrs["register_capacity_bytes"])}, shared_memory_capacity_bytes={PythonValue(kernel.Attrs["shared_memory_capacity_bytes"])}, forbid_spills={PythonValue(kernel.Attrs["forbid_spills"])}{kwargs})";
+        var tuningSelectionStatement = $"        block_size = select_and_validate_triton_tuning_parameter({PythonString(kernel.Name)}, \"block_size\", {blockSizeCandidates}, source={PythonString(blockSize.Source)}, kernel={kernel.Name}, kernel_args={kernelArgs}, grid_for_candidate={gridForCandidate}, expected_num_warps={kernel.Launch.NumWarps ?? throw new InvalidOperationException($"Generated PyNTT kernel {kernel.Name} must declare a fixed num_warps.")}, shared_memory_capacity_bytes={PythonValue(kernel.Attrs["shared_memory_capacity_bytes"])}, forbid_spills={PythonValue(kernel.Attrs["forbid_spills"])}{kwargs})";
         return $"""
                     {importStatement}
                     numel = {numel}
@@ -2578,7 +2578,7 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
             var callees = new List<PrimFunction>();
             CollectDirectPrimFunctionCallees(function.SourceFunction, callees);
             return callees.Any(callee =>
-                PyNTTPrimFunctionRoles.IsAutoTilingDeviceFunction(callee)
+                PyNTTPrimFunctionRoles.IsScheduledRegionFunction(callee)
                     ? UsesTransitiveModuleRData(callee, selector, new HashSet<PrimFunction>(ReferenceEqualityComparer.Instance))
                     : UsesTransitiveModuleRData(FindLinkableFunction(callee), selector, active));
         }

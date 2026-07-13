@@ -17,7 +17,35 @@
 
   string BiasLine(string bias, string dest) =>
       bias == "nullptr" ? string.Empty : $"{Model.Indent}  binary<ops::add>({dest}, {bias}, {dest});\n";
+
+  string AccumulatingMatmulLine(bool accumulate, string rhs, string dest) =>
+      $"{Model.Indent}    matmul<{accumulate.ToString().ToLowerInvariant()}, false, false>({input}, {rhs}, {dest}, nullptr, fixed_shape_v<>, fixed_shape_v<>, fixed_shape_v<>, fixed_shape_v<>);\n";
 }
+@if (Model.Reduction is { Phase: Nncase.CodeGen.NTT.ReductionKernelPhase.Accumulate } accumulate)
+{
+@Html.Raw($"{Model.Indent}{{\n")
+@Html.Raw($"{Model.Indent}  if ({accumulate.Initialized}) {{\n")
+@Html.Raw(AccumulatingMatmulLine(true, gateWeight, accumulate.Accumulators[0]))
+@Html.Raw(AccumulatingMatmulLine(true, upWeight, accumulate.Accumulators[1]))
+@Html.Raw($"{Model.Indent}  }} else {{\n")
+@Html.Raw(AccumulatingMatmulLine(false, gateWeight, accumulate.Accumulators[0]))
+@Html.Raw(AccumulatingMatmulLine(false, upWeight, accumulate.Accumulators[1]))
+@Html.Raw($"{Model.Indent}    {accumulate.Initialized} = true;\n")
+@Html.Raw($"{Model.Indent}  }}\n")
+@Html.Raw($"{Model.Indent}}}\n")
+}
+else if (Model.Reduction is { Phase: Nncase.CodeGen.NTT.ReductionKernelPhase.Finalize } finalize)
+{
+@Html.Raw($"{Model.Indent}{{\n")
+@Html.Raw(BiasLine(gateBias, finalize.Accumulators[0]))
+@Html.Raw(BiasLine(upBias, finalize.Accumulators[1]))
+@Html.Raw($"{Model.Indent}  unary<ops::swish>({finalize.Accumulators[0]}, {finalize.Accumulators[0]});\n")
+@Html.Raw($"{Model.Indent}  binary<ops::mul>({finalize.Accumulators[0]}, {finalize.Accumulators[1]}, {finalize.Accumulators[0]});\n")
+@Html.Raw($"{Model.Indent}  cast({finalize.Accumulators[0]}, {output}, fixed_shape_v<>);\n")
+@Html.Raw($"{Model.Indent}}}\n")
+}
+else
+{
 @Html.Raw($"{Model.Indent}{{\n")
 @Html.Raw($"{Model.Indent}  auto up_output = make_tensor<typename std::decay_t<decltype({output})>::element_type>({output}.shape());\n")
 @Html.Raw(MatmulLine(gateWeight, output))
@@ -27,3 +55,4 @@
 @Html.Raw($"{Model.Indent}  unary<ops::swish>({output}, {output});\n")
 @Html.Raw($"{Model.Indent}  binary<ops::mul>({output}, up_output, {output});\n")
 @Html.Raw($"{Model.Indent}}}\n")
+}

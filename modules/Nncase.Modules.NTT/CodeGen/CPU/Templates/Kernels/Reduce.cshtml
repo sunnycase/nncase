@@ -1,7 +1,45 @@
 @model Nncase.CodeGen.NTT.TypedKernelTemplateModel<Nncase.TIR.NTT.Reduce>
-@(Model.Indent)if (@Html.Raw(Model.Arguments[2].Symbol.Name)) {
-@(Model.Indent)  reduce_@(Model.Target.ReduceOp.ToC())<true>(@Html.Raw(Model.Arguments[0].Symbol.Name), @Html.Raw(Model.Arguments[1].Symbol.Name), fixed_shape_v<@(string.Join(",", Model.Target.Axes))>, fixed_shape_v<@(string.Join(",", Model.Target.VectorizedAxes))>, fixed_shape_v<@(string.Join(",", Model.Target.PadedNums))>);
-@(Model.Indent)} else {
-@(Model.Indent)  reduce_@(Model.Target.ReduceOp.ToC())<false>(@Html.Raw(Model.Arguments[0].Symbol.Name), @Html.Raw(Model.Arguments[1].Symbol.Name), fixed_shape_v<@(string.Join(",", Model.Target.Axes))>, fixed_shape_v<@(string.Join(",", Model.Target.VectorizedAxes))>, fixed_shape_v<@(string.Join(",", Model.Target.PadedNums))>);
-@(Model.Indent)}
-
+@{
+  string reductionOp = Model.Reduction is not null && Model.Target.ReduceOp == Nncase.ReduceOp.Mean
+      ? "sum"
+      : Model.Target.ReduceOp.ToC();
+  string ReduceLine(bool loadPrevious, string output) =>
+      $"{Model.Indent}  reduce_{reductionOp}<{loadPrevious.ToString().ToLowerInvariant()}>({Model.Arguments[0].Symbol.Name}, {output}, fixed_shape_v<{string.Join(",", Model.Target.Axes)}>, fixed_shape_v<{string.Join(",", Model.Target.VectorizedAxes)}>, fixed_shape_v<{string.Join(",", Model.Target.PadedNums)}>);\n";
+}
+@if (Model.Reduction is { Phase: Nncase.CodeGen.NTT.ReductionKernelPhase.Accumulate } accumulate)
+{
+@Html.Raw($"{Model.Indent}if ({accumulate.Initialized}) {{\n")
+@Html.Raw(ReduceLine(true, accumulate.Accumulators[0]))
+@Html.Raw($"{Model.Indent}}} else {{\n")
+@Html.Raw(ReduceLine(false, accumulate.Accumulators[0]))
+@Html.Raw($"{Model.Indent}  {accumulate.Initialized} = true;\n")
+@Html.Raw($"{Model.Indent}}}\n")
+@if (Model.Target.ReduceOp == Nncase.ReduceOp.Mean)
+{
+  if (accumulate.ElementCount is null)
+  {
+    throw new System.InvalidOperationException("NTT tiled ReduceMean requires a backend-private element count.");
+  }
+@Html.Raw($"{Model.Indent}{accumulate.ElementCount} += reduction_element_count({Model.Arguments[0].Symbol.Name}, {accumulate.Accumulators[0]}, fixed_shape_v<{string.Join(",", Model.Target.Axes)}>, fixed_shape_v<{string.Join(",", Model.Target.VectorizedAxes)}>);\n")
+}
+}
+else if (Model.Reduction is { Phase: Nncase.CodeGen.NTT.ReductionKernelPhase.Finalize } finalize)
+{
+@if (Model.Target.ReduceOp == Nncase.ReduceOp.Mean)
+{
+  if (finalize.ElementCount is null)
+  {
+    throw new System.InvalidOperationException("NTT tiled ReduceMean requires a backend-private element count.");
+  }
+@Html.Raw($"{Model.Indent}finalize_reduction_mean({finalize.Accumulators[0]}, {finalize.ElementCount});\n")
+}
+@Html.Raw($"{Model.Indent}cast({finalize.Accumulators[0]}, {Model.Arguments[1].Symbol.Name}, fixed_shape_v<>);\n")
+}
+else
+{
+@Html.Raw($"{Model.Indent}if ({Model.Arguments[2].Symbol.Name}) {{\n")
+@Html.Raw(ReduceLine(true, Model.Arguments[1].Symbol.Name))
+@Html.Raw($"{Model.Indent}}} else {{\n")
+@Html.Raw(ReduceLine(false, Model.Arguments[1].Symbol.Name))
+@Html.Raw($"{Model.Indent}}}\n")
+}

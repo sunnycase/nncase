@@ -41,7 +41,10 @@ public abstract class TIRSelectionPass : FunctionPass
                     ModuleKind,
                     selection.Body,
                     new Return(selection.Results.ToArray()),
-                    parameters);
+                    parameters)
+                {
+                    Role = input.Role,
+                };
                 _ = primFunc.GetAbiView();
                 return Task.FromResult((BaseFunction)primFunc);
             }
@@ -53,7 +56,10 @@ public abstract class TIRSelectionPass : FunctionPass
                     ModuleKind,
                     selection.Body,
                     new Return(selection.Results.ToArray()),
-                    parameters);
+                    parameters)
+                {
+                    Role = input.Role,
+                };
                 var primWrapper = new PrimFunctionWrapper(input.Name, primFunc, selection.InputBuffers.Count);
                 RewriteCallersForPrimFunction(primFunc, callers.OfType<Call>());
                 return Task.FromResult((BaseFunction)primWrapper);

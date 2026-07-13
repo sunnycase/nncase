@@ -247,6 +247,29 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         Assert.Contains("%out_", finalMainTir, StringComparison.Ordinal);
         Assert.Contains("main_segment_", finalMainTir, StringComparison.Ordinal);
         Assert.DoesNotContain("Return(", finalMainTir, StringComparison.Ordinal);
+
+        using var kernelParams = JsonDocument.Parse(File.ReadAllText(Path.Join(outputDirectory, "kernel_params.json")));
+        var deviceFunctions = kernelParams.RootElement.GetProperty("functions").EnumerateArray()
+            .Single(item => item.GetProperty("name").GetString() == "main_prim")
+            .GetProperty("render_kernels").EnumerateArray().Single()
+            .GetProperty("device_functions").EnumerateArray().ToArray();
+        var dispatchFunctions = deviceFunctions
+            .Where(deviceFunction => deviceFunction.GetProperty("compose_into_caller").GetBoolean())
+            .ToArray();
+        var scheduledFunctions = deviceFunctions
+            .Where(deviceFunction => !deviceFunction.GetProperty("compose_into_caller").GetBoolean())
+            .ToArray();
+        Assert.Equal(2, dispatchFunctions.Length);
+        Assert.All(dispatchFunctions, deviceFunction => Assert.False(deviceFunction.GetProperty("noinline").GetBoolean()));
+        Assert.Equal(2, scheduledFunctions.Length);
+        Assert.All(scheduledFunctions, deviceFunction => Assert.True(deviceFunction.GetProperty("noinline").GetBoolean()));
+
+        RenderGeneratedKernels(outputDirectory);
+        var generatedKernels = File.ReadAllText(Path.Join(outputDirectory, "generated_kernels.py"));
+        foreach (var dispatchFunction in dispatchFunctions)
+        {
+            Assert.DoesNotContain($"def {dispatchFunction.GetProperty("name").GetString()}(", generatedKernels, StringComparison.Ordinal);
+        }
     }
 
     [Fact]
@@ -263,6 +286,40 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
             "x = torch.arange(32, dtype=torch.float32, device='cuda').reshape(32, 1) - 8",
             "output = module(x)",
             "torch.testing.assert_close(output, -x, rtol=0, atol=1e-6)");
+    }
+
+    [Fact]
+    public async Task TestPyNTTAutoTilingSharedTileChainRun()
+    {
+        ConfigureAutoDistributedPyNTT();
+        var x = new Var("x", new TensorType(DataTypes.Float32, new[] { 1024 }));
+        var value = IR.F.Math.Unary(UnaryOp.Abs, IR.F.Math.Unary(UnaryOp.Neg, x));
+        var main = new Function("main", PyNTTTarget.Kind, value, new[] { x });
+
+        var outputDirectory = await GeneratePyNTTModelDirectoryWithCompilerPipeline("generated_shared_tile_chain_model", main);
+        var compiler = Assert.IsType<global::Nncase.Compiler.Compiler>(CompileSession.Compiler);
+        Assert.Contains(
+            compiler.Module.Functions.SelectMany(function => ExprCollector.Collect(function).OfType<TIR.PhysicalBuffer>()),
+            buffer => buffer.Location == TIR.MemoryLocation.Shared);
+        Assert.Contains(
+            compiler.Module.Functions.SelectMany(function => ExprCollector.Collect(function).OfType<Call>()),
+            call => call.Target is TIR.TileLoad or TIR.NTT.TensorLoad);
+        Assert.Contains(
+            compiler.Module.Functions.SelectMany(function => ExprCollector.Collect(function).OfType<Call>()),
+            call => call.Target is TIR.TileStore or TIR.NTT.TensorStore);
+
+        RenderGeneratedKernels(outputDirectory);
+        var generatedKernelsPy = File.ReadAllText(Path.Join(outputDirectory, "generated_kernels.py"));
+        Assert.DoesNotContain("pyntt_register_value_", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("generated from PyNTT Jinja TensorRegionCopy.py.jinja", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("tl.load", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("tl.store", generatedKernelsPy, StringComparison.Ordinal);
+
+        AssertGeneratedModelRuns(
+            outputDirectory,
+            "x = torch.arange(1024, dtype=torch.float32, device='cuda') - 511",
+            "output = module(x)",
+            "torch.testing.assert_close(output, torch.abs(-x), rtol=0, atol=1e-6)");
     }
 
     [Fact]
@@ -1077,8 +1134,9 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         var qWeight = new Var("q_weight", new TensorType(DataTypes.BFloat16, new[] { k, qn }));
         var kWeight = new Var("k_weight", new TensorType(DataTypes.BFloat16, new[] { k, kvn }));
         var vWeight = new Var("v_weight", new TensorType(DataTypes.BFloat16, new[] { k, kvn }));
+        var qkvInput = IR.F.Math.Unary(UnaryOp.Abs, input);
         var qkv = IR.F.NN.QKVParallelLinear(
-            input,
+            qkvInput,
             qWeight,
             kWeight,
             vWeight,
@@ -1097,9 +1155,14 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         var main = new Function("main", PyNTTTarget.Kind, qkv, new[] { input, qWeight, kWeight, vWeight });
 
         var outputDirectory = await GeneratePyNTTModelDirectoryWithCompilerPipeline("generated_qwen_like_qkv_run_model", main);
+        var compiler = Assert.IsType<global::Nncase.Compiler.Compiler>(CompileSession.Compiler);
+        Assert.Contains(
+            compiler.Module.Functions.SelectMany(function => ExprCollector.Collect(function).OfType<TIR.PhysicalBuffer>()),
+            buffer => buffer.Location == TIR.MemoryLocation.Shared);
         RenderGeneratedKernels(outputDirectory);
         var generatedKernelsPy = File.ReadAllText(Path.Join(outputDirectory, "generated_kernels.py"));
         Assert.Contains("generated from PyNTT Jinja PackedQKVParallelLinear.py.jinja", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.DoesNotContain("tl.gather(input0", generatedKernelsPy, StringComparison.Ordinal);
         AssertGeneratedModelRuns(
             outputDirectory,
             "torch.manual_seed(0)",
@@ -1108,9 +1171,10 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
             $"k_weight = (torch.randn({k}, {kvn}, dtype=torch.float32, device='cuda') * 0.03).to(torch.bfloat16)",
             $"v_weight = (torch.randn({k}, {kvn}, dtype=torch.float32, device='cuda') * 0.03).to(torch.bfloat16)",
             "q, k_out, v_out = module(input, q_weight, k_weight, v_weight)",
-            "torch.testing.assert_close(q.to(torch.float32), (input @ q_weight).to(torch.bfloat16).to(torch.float32), rtol=2e-2, atol=2e-2)",
-            "torch.testing.assert_close(k_out.to(torch.float32), (input @ k_weight).to(torch.bfloat16).to(torch.float32), rtol=2e-2, atol=2e-2)",
-            "torch.testing.assert_close(v_out.to(torch.float32), (input @ v_weight).to(torch.bfloat16).to(torch.float32), rtol=2e-2, atol=2e-2)");
+            "qkv_input = torch.abs(input)",
+            "torch.testing.assert_close(q.to(torch.float32), (qkv_input @ q_weight).to(torch.bfloat16).to(torch.float32), rtol=2e-2, atol=2e-2)",
+            "torch.testing.assert_close(k_out.to(torch.float32), (qkv_input @ k_weight).to(torch.bfloat16).to(torch.float32), rtol=2e-2, atol=2e-2)",
+            "torch.testing.assert_close(v_out.to(torch.float32), (qkv_input @ v_weight).to(torch.bfloat16).to(torch.float32), rtol=2e-2, atol=2e-2)");
     }
 
     [Fact]
@@ -2358,6 +2422,41 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
             "x = torch.arange(12, dtype=torch.float32, device='cuda').reshape(4, 3) * 0.25",
             "output = module(x)",
             "torch.testing.assert_close(output, x.sum(dim=1), rtol=1e-5, atol=1e-5)");
+    }
+
+    [Fact]
+    public async Task TestPyNTTIRAutoDistributedReduceAxisZeroRun()
+    {
+        ConfigureAutoDistributedPyNTT();
+        var x = new Var("x", new TensorType(DataTypes.Float32, new[] { 3, 4 }));
+        var main = new Function("main", PyNTTTarget.Kind, IR.F.Tensors.Reduce(ReduceOp.Sum, x, new[] { 0L }, 0.0f, false), new[] { x });
+
+        var outputDirectory = await GeneratePyNTTModelDirectoryWithCompilerPipeline("generated_reduce_axis_zero_run_model", main);
+        RenderGeneratedKernels(outputDirectory);
+        AssertGeneratedModelRuns(
+            outputDirectory,
+            "x = torch.arange(12, dtype=torch.float32, device='cuda').reshape(3, 4) * 0.25",
+            "output = module(x)",
+            "torch.testing.assert_close(output, x.sum(dim=0), rtol=1e-5, atol=1e-5)");
+    }
+
+    [Fact]
+    public async Task TestPyNTTIRAutoDistributedReduceMeanTracksElementCountRun()
+    {
+        ConfigureAutoDistributedPyNTT();
+        var x = new Var("x", new TensorType(DataTypes.Float32, new[] { 4, 513 }));
+        var main = new Function("main", PyNTTTarget.Kind, IR.F.Tensors.Reduce(ReduceOp.Mean, x, new[] { 1L }, 0.0f, false), new[] { x });
+
+        var outputDirectory = await GeneratePyNTTModelDirectoryWithCompilerPipeline("generated_reduce_mean_count_run_model", main);
+        RenderGeneratedKernels(outputDirectory);
+        var generatedKernelsPy = File.ReadAllText(Path.Join(outputDirectory, "generated_kernels.py"));
+        Assert.Contains("reduced_element_count +=", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("acc / reduced_element_count.to(tl.float32)", generatedKernelsPy, StringComparison.Ordinal);
+        AssertGeneratedModelRuns(
+            outputDirectory,
+            "x = (torch.arange(4 * 513, dtype=torch.float32, device='cuda').reshape(4, 513) - 719) * 0.001",
+            "output = module(x)",
+            "torch.testing.assert_close(output, x.mean(dim=1), rtol=1e-5, atol=1e-5)");
     }
 
     [Fact]

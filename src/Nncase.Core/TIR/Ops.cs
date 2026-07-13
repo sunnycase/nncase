@@ -89,3 +89,29 @@ public sealed partial class Memcopy : Op
 
     public override bool CanFoldConstCall => false;
 }
+
+/// <summary>
+/// Loads one tensor tile from its parent memory space into explicitly managed
+/// local storage.
+/// </summary>
+public sealed partial class TileLoad : Op
+{
+    public static readonly ParameterInfo Dest = new(typeof(TileLoad), 0, "dest", memoryEffect: MemoryEffect.Write);
+
+    public static readonly ParameterInfo Src = new(typeof(TileLoad), 1, "src", memoryEffect: MemoryEffect.Read);
+
+    public override bool CanFoldConstCall => false;
+}
+
+/// <summary>
+/// Stores one tensor tile from explicitly managed local storage into its parent
+/// memory space.
+/// </summary>
+public sealed partial class TileStore : Op
+{
+    public static readonly ParameterInfo Src = new(typeof(TileStore), 0, "src", memoryEffect: MemoryEffect.Read);
+
+    public static readonly ParameterInfo Dest = new(typeof(TileStore), 1, "dest", memoryEffect: MemoryEffect.Write);
+
+    public override bool CanFoldConstCall => false;
+}

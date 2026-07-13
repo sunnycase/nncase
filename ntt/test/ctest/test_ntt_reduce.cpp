@@ -117,6 +117,28 @@ TEST(ReduceMeanTestFloat, ReduceM_NoVectorize) {
     NTT_REDUCE_VERIFY_REDUCEM_NOPACK_DIM0(M, N, mean)
 }
 
+TEST(ReduceMeanTestFloat, TiledReduceMTracksElementCount) {
+    auto first_tile = ntt::make_tensor<float>(ntt::fixed_shape_v<2, 4>);
+    auto tail_tile = ntt::make_tensor<float>(ntt::fixed_shape_v<1, 4>);
+    std::iota(first_tile.elements().begin(), first_tile.elements().end(), 0.f);
+    std::iota(tail_tile.elements().begin(), tail_tile.elements().end(), 8.f);
+
+    auto accumulator = ntt::make_tensor<float>(ntt::fixed_shape_v<1, 4>);
+    size_t element_count = 0;
+    ntt::reduce_sum<false>(first_tile, accumulator, ntt::fixed_shape_v<0>);
+    element_count += ntt::reduction_element_count(
+        first_tile, accumulator, ntt::fixed_shape_v<0>, ntt::fixed_shape_v<>);
+    ntt::reduce_sum<true>(tail_tile, accumulator, ntt::fixed_shape_v<0>);
+    element_count += ntt::reduction_element_count(
+        tail_tile, accumulator, ntt::fixed_shape_v<0>, ntt::fixed_shape_v<>);
+    ntt::finalize_reduction_mean(accumulator, element_count);
+
+    float golden_array[] = {4.f, 5.f, 6.f, 7.f};
+    auto golden = ntt::make_tensor_view(
+        std::span<float, 4>(golden_array), ntt::fixed_shape_v<1, 4>);
+    EXPECT_TRUE(NttTest::compare_tensor(accumulator, golden));
+}
+
 #define NTT_PACKED_REDUCE_VERIFY_REDUCEM_PACKM(M, N, ntt_reduce_mode)          \
     /* init */                                                                 \
     auto ntt_input = ntt::make_tensor<float>(ntt::fixed_shape_v<M, N>);        \

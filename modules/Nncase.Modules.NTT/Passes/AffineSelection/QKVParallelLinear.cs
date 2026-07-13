@@ -46,8 +46,10 @@ public partial class NTTAffineSelectionPass
             return call;
         }
 
+        var tileAxisPolicies = Enumerable.Repeat(GridTileAxisPolicy.Search(), domains.Length).ToArray();
+        tileAxisPolicies[^1] = GridTileAxisPolicy.Reduction();
         var builder = IR.F.Affine.Grid()
-            .Domain(domains.Length, out var _)
+            .Domain(tileAxisPolicies, out var _)
             .Read(input, inputMap, out var inputTile)
             .Read(qWeight, qWeightMap, out var qWeightTile)
             .Read(kWeight, kWeightMap, out var kWeightTile)
@@ -131,7 +133,7 @@ public partial class NTTAffineSelectionPass
             !IsSameDimension(qWeightShape[0], qOutputShape[1]) ||
             !IsSameDimension(kWeightShape[0], kOutputShape[1]) ||
             !IsSameDimension(vWeightShape[0], vOutputShape[1]) ||
-            inputShape[1] is not DimConst kDim ||
+            inputShape[1] is not DimConst ||
             qWeightShape[0] is not DimConst qNDim ||
             kWeightShape[0] is not DimConst kNDim ||
             vWeightShape[0] is not DimConst vNDim ||
@@ -147,26 +149,26 @@ public partial class NTTAffineSelectionPass
         var kNScale = kNDim.Value / commonN;
         var vNScale = vNDim.Value / commonN;
 
-        domains = IR.F.Affine.Domains(2);
+        domains = IR.F.Affine.Domains(3);
         inputMap = new AffineMap(domains, default, new[]
         {
             new AffineRange(domains[0].Offset, domains[0].Extent),
-            new AffineRange(0, kDim.Value),
+            new AffineRange(domains[2].Offset, domains[2].Extent),
         });
-        qWeightMap = BuildPackedProjectionWeightMap(domains, qNScale, kDim.Value);
-        kWeightMap = BuildPackedProjectionWeightMap(domains, kNScale, kDim.Value);
-        vWeightMap = BuildPackedProjectionWeightMap(domains, vNScale, kDim.Value);
+        qWeightMap = BuildPackedProjectionWeightMap(domains, qNScale);
+        kWeightMap = BuildPackedProjectionWeightMap(domains, kNScale);
+        vWeightMap = BuildPackedProjectionWeightMap(domains, vNScale);
         qOutputMap = BuildPackedProjectionOutputMap(domains, qNScale);
         kOutputMap = BuildPackedProjectionOutputMap(domains, kNScale);
         vOutputMap = BuildPackedProjectionOutputMap(domains, vNScale);
         return true;
     }
 
-    private static AffineMap BuildPackedProjectionWeightMap(AffineDomain[] domains, long nScale, long k)
+    private static AffineMap BuildPackedProjectionWeightMap(AffineDomain[] domains, long nScale)
         => new(domains, default, new[]
         {
             BuildScaledProjectionRange(domains[1], nScale),
-            new AffineRange(0, k),
+            new AffineRange(domains[2].Offset, domains[2].Extent),
         });
 
     private static AffineMap BuildPackedProjectionOutputMap(AffineDomain[] domains, long nScale)

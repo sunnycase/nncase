@@ -13,7 +13,7 @@ public sealed class MatmulEvaluator : ITypeInferencer<Matmul>, ITileWorkloadEval
 {
     public IRType Visit(ITypeInferenceContext context, Matmul target) => TupleType.Void;
 
-    public TileWorkload Visit(Matmul op, TileWorkloadContext context) => new MatrixTileWorkload(GetMatrixShape);
+    public TileWorkload Visit(Matmul op, TileWorkloadContext context) => new MatrixTileWorkload(GetMatrixShape, DataTypes.Float32.SizeInBytes);
 
     private static MatrixTileWorkloadShape GetMatrixShape(Google.OrTools.ConstraintSolver.IntExpr[][] bufferShapes, Google.OrTools.ConstraintSolver.Solver solver, TileWorkloadContext context)
     {

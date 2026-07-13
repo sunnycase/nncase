@@ -10,7 +10,7 @@ public sealed partial class Matmul : NTTKernelOp
 
     public static readonly ParameterInfo Rhs = new(typeof(Matmul), 1, "rhs", memoryEffect: MemoryEffect.Read);
 
-    public static readonly ParameterInfo Output = new(typeof(Matmul), 2, "output", memoryEffect: MemoryEffect.ReadWrite);
+    public static readonly ParameterInfo Output = new(typeof(Matmul), 2, "output", memoryEffect: MemoryEffect.ReductionReadWrite);
 
     public static readonly ParameterInfo LoadC = new(typeof(Matmul), 3, "loadC", memoryEffect: MemoryEffect.None);
 

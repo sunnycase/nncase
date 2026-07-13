@@ -60,6 +60,8 @@ public partial class NTTAffineSelectionPass : AffineSelectionPass
                 return SelectVectorize(op, call, exprOutput);
             case IR.NTT.VectorizedReduce op:
                 return SelectReduce(op, call, exprOutput);
+            case IR.Math.Reduce op:
+                return SelectReduce(op, call, exprOutput);
             case IR.NTT.VectorizedRoPE op:
                 return SelectRoPE(op, call, exprOutput);
             case IR.Tensors.Unpack op:

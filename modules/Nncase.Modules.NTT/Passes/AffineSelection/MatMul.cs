@@ -202,8 +202,10 @@ public partial class NTTAffineSelectionPass
         var lhsMap = new AffineMap(domains, default, lhsRes);
         var rhsMap = new AffineMap(domains, default, rhsRes);
         var outMap = new AffineMap(domains, default, domains.SkipLast(3).Concat([domains[om], domains[on]]).Select(x => new AffineRange(x.Offset, x.Extent)).ToArray());
+        var tileAxisPolicies = Enumerable.Repeat(GridTileAxisPolicy.Search(), rank).ToArray();
+        tileAxisPolicies[ok] = GridTileAxisPolicy.Reduction();
         return IR.F.Affine.Grid()
-            .Domain(rank, out var domainVar)
+            .Domain(tileAxisPolicies, out var domainVar)
             .Read(lhs, lhsMap, out var lhsTile)
             .Read(rhs, rhsMap, out var rhsTile)
             .Write(output, outMap, out var outTile)

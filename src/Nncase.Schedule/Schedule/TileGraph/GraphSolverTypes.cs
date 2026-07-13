@@ -67,18 +67,25 @@ public sealed record TileNodeBufferInfo<T>(Tuple<int, int>[] Liveness, AffineMap
 public sealed record TileNodeInfo<T>(T[] TripCounts, T[][] BackWardExtents, BiDictionary<BufferIdentity, BufferIdentity> DefUseMap, Dictionary<BufferIdentity, TileNodeBufferInfo<T>> BufferInfoMap)
 {
     public BufferIdentity GetByChildBuffer(BufferIdentity sinkBid)
+        => TryGetByChildBuffer(sinkBid, out var sourceBid)
+            ? sourceBid
+            : throw new KeyNotFoundException(sinkBid.ToString());
+
+    public bool TryGetByChildBuffer(BufferIdentity sinkBid, [MaybeNullWhen(false)] out BufferIdentity sourceBid)
     {
-        if (DefUseMap.TryGetByValue(sinkBid, out var sourceBid))
+        if (DefUseMap.TryGetByValue(sinkBid, out sourceBid))
         {
-            return sourceBid;
+            return true;
         }
 
-        if (!BufferInfoMap.ContainsKey(sinkBid))
+        if (BufferInfoMap.ContainsKey(sinkBid))
         {
-            throw new KeyNotFoundException(sinkBid.ToString());
+            sourceBid = sinkBid;
+            return true;
         }
 
-        return sinkBid;
+        sourceBid = null!;
+        return false;
     }
 }
 

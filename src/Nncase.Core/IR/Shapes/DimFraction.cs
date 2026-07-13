@@ -67,7 +67,10 @@ public sealed class DimFraction : Dimension, IEquatable<DimFraction?>
             return true;
         }
 
-        return other is not null && Numerator.Equals(other.Numerator) && Denominator.Equals(other.Denominator);
+        return other is not null &&
+            DivMode == other.DivMode &&
+            Numerator.Equals(other.Numerator) &&
+            Denominator.Equals(other.Denominator);
     }
 
     public override string ToString() => DivMode switch
@@ -112,7 +115,7 @@ public sealed class DimFraction : Dimension, IEquatable<DimFraction?>
     }
 
     /// <inheritdoc/>
-    protected override int GetHashCodeCore() => HashCode.Combine(Numerator, Denominator);
+    protected override int GetHashCodeCore() => HashCode.Combine(DivMode, Numerator, Denominator);
 
     private static Dimension CreateWithSimplify(DimDivideMode divMode, Dimension numerator, Dimension denominator)
     {

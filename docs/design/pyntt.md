@@ -745,28 +745,81 @@ The model stops at the physical block boundary:
 - PyNTT uses eight compute warps with the target warp width. The block count is
   determined by the configured block hierarchy and must not exceed the target
   compute-unit count.
-- Occupancy is not an AutoTiling variable. Register and shared-memory budgets
-  are fixed per block.
+- The target worker width is also the default PagedAttention query tile. On
+  NVIDIA targets this is 32, which bounds the private score/value state without
+  exposing warp decomposition to nncase. The cache block size remains an
+  independent storage-layout property.
+- Occupancy is not an AutoTiling variable. The shared-memory budget is fixed
+  per block.
 - Warp/thread decomposition and tensor layouts remain the responsibility of
   Triton.
 
-Each physical memory is a `TargetMemorySpaceSpec` with a stable identity,
-sharing scope, capacity, directional bandwidth, latency, allocation
-granularity, and optional `MemoryLocation` binding. Directed
-`TargetMemoryTransferSpec` edges describe adjacent parent/local transfer
-channels. Chip-scoped traffic is aggregated across active blocks; block-local
-traffic remains per block.
+`TargetMemoryResourceSpec` models a physical storage resource and its capacity,
+bandwidth, latency, and allocation granularity. `TargetMemorySpaceSpec` models a
+logical scheduling space with a stable identity, sharing scope, compiler-managed
+allocation limit, and optional `MemoryLocation` binding. Multiple logical
+spaces may share one physical resource. The logical allocation limit may be
+smaller than the physical capacity: persistent Triton profiles reserve the
+remainder of shared memory for backend-private dot-operand staging, lowering
+scratch, and the PyNTT device-call ABI. AutoTiling can allocate only the logical
+arena limit, while generated-kernel validation checks total compiled usage
+against the physical resource capacity. Directed `TargetMemoryTransferSpec`
+edges describe adjacent parent/local channels and explicitly distinguish
+`DirectAccess` from `ExplicitCopy`. Chip-scoped traffic is aggregated across
+active blocks; block-scoped traffic remains per block.
 
-All storage resources use the existing TIR buffer vocabulary. Addressable
-AutoTiling placements become buffers with the target-provided
-`MemoryLocation`/hierarchy binding. GPU shared tiles therefore lower to one
-planned TLE shared-memory pool. Registers are also represented in the target
-model and by `MemoryLocation.Register`, but Triton register values are
-non-addressable SSA tensors. PyNTT does not synthesize a pointer-backed register
-array or a warp/thread layout. Instead, operator templates own register tiles,
-while nncase constrains the total CTA register budget and rejects every compiled
-specialization that spills. `BlockLocalData` remains owned by AutoDistributed
-and TIR selection and is not an AutoTiling storage candidate.
+The AutoTiling hierarchy is ordered from the innermost working set to the root:
+
+```text
+GPU: Shared -> BlockLocalData -> chip-global root
+CPU: L1/Cache -> BlockLocalData -> main-memory root
+```
+
+`BlockLocalData` remains a real outer AutoTiling candidate as well as the
+block-scoped workspace vocabulary shared with AutoDistributed and TIR
+selection. On UMA GPUs it normally shares the global-memory resource with the
+root; that adjacent edge is `DirectAccess`, so lowering creates a block-local
+logical view without a copy. The `BlockLocalData -> Shared` edge is
+`ExplicitCopy`. CPU `BlockLocalData -> L1/Cache` follows the same explicit
+staging contract.
+
+All storage resources use the existing TIR buffer vocabulary. A selected
+`Shared` or `Cache` placement allocates a target-bound local buffer. Lowering
+inserts `TileLoad(local, parent_view)` before reads and
+`TileStore(local, parent_view)` after writes according to the operand memory
+effects. Existing NTT `TensorLoad`/`TensorStore` operations retain their
+distributed model-boundary semantics and may directly materialize their local
+buffer in the selected lowest storage space. Direct-access edges never emit a
+copy.
+
+Registers are intentionally absent from the nncase target-memory hierarchy and
+from TIR buffer placement. Triton owns block-internal SSA values, register
+allocation, warp decomposition, and instruction-level scheduling. PyNTT still
+rejects a compiled specialization that spills. nncase does not model a
+register memory space, register placement, or occupancy. A target profile does,
+however, declare a backend-private accumulator byte budget and the minimum
+GEMM/GEMV accumulator tile dimensions imposed by its lowering. These values
+constrain semantic reduction state before codegen; they are not addressable
+storage and do not allocate a TIR buffer.
+
+Reduction axes remain first-class affine grid axes so AutoTiling can choose
+their power-of-two tile extents. A `ReductionAccumulator` operand effect marks
+the logical result carried across the innermost reduction loop; it is not a
+request for an addressable TIR buffer. AutoTiling therefore never places this
+state in `Shared`, `Cache`, or `BlockLocalData`. The backend initializes private
+state before the reduction loop, updates it for each reduction tile, and
+finalizes/casts/stores it once after the loop. PyNTT represents this state as a
+Triton SSA tensor, while NTT uses a backend-local tensor object. Only partials
+that cross block or PrimFunc boundaries remain explicit distributed TIR
+buffers with their required synchronization. Auxiliary reduction state follows
+the same ownership rule: tiled `Mean` carries a backend-private element count,
+adds each dynamic tile's true reduction extent, and divides the accumulated sum
+only once during finalization. `MatrixTileWorkload` derives the live fp32
+accumulator bytes from local M/N/multiplicity after applying the backend's
+minimum GEMM/GEMV accumulator dimensions. `ReductionTileWorkload` reports the
+corresponding state for scalar reductions. OR-Tools rejects tiles whose live
+state exceeds the target budget; codegen repeats the same check as a fail-fast
+contract assertion.
 
 AutoTiling minimizes block latency using:
 
@@ -791,21 +844,24 @@ AutoTiling metadata follows three separate ownership rules:
 - `GridTileAxisPolicy` records tiling legality on the affine domain. Searchable
   axes use power-of-two candidates, while full and fixed axes are exact and may
   have non-power-of-two extents.
-- `TileWorkload` describes only target-independent local compute work. It is an
-  elementwise work expression or a matrix M/N/K/multiplicity expression; the
-  target machine converts that workload into cycles.
+- `TileWorkload` describes target-independent local compute work and, for
+  reductions, the semantic state that must remain live between reduction
+  tiles. It does not choose or expose that state's physical storage. The target
+  machine converts compute work into cycles and applies backend-private state
+  limits and lowering granularity.
 
 There is deliberately no `MicroKernelInfo` contract. Block-internal
 microkernel implementation remains a backend responsibility.
 
 PyNTT currently provides canonical profiles for RTX 5060 Ti 16 GB and H800 SXM
 80 GB, plus generic CPU/CUDA/XPU profiles. The generated manifest records the
-resolved profile and resource contract. At first launch, PyNTT tries tuning
+resolved profile, managed/physical memory limits, and backend-private
+accumulator contract. At first launch, PyNTT tries tuning
 candidates in priority order and accepts only a specialization whose compiled
-warp count, shared memory, register bytes, and ptxas spill-store/spill-load
-counts satisfy that contract. Successful specialization decisions are cached;
-Triton `OutOfResources` rejects only that candidate, while other compilation
-errors fail immediately.
+warp count, shared memory, and ptxas spill-store/spill-load counts satisfy that
+contract. Successful specialization decisions are cached; Triton
+`OutOfResources` rejects only that candidate, while other compilation errors
+fail immediately.
 
 ## Buffer and Memory Model
 
@@ -814,8 +870,40 @@ errors fail immediately.
 - Constants use binary rdata assets and are materialized once by the runtime.
 - `BufferizePass` remains authoritative for buffer shape, strides, size,
   location, workspace offset, and lifetime.
-- Shared-memory pointer call frames preserve ordinary internal PrimFunc call
-  boundaries without expanding all formal pointers into the top-kernel ABI.
+- Shared-memory typed call frames preserve ordinary internal PrimFunc call
+  boundaries without keeping every pointer and dynamic tensor-descriptor field
+  live in the device-function ABI. Private device functions frame only the
+  descriptor fields referenced by their lowered bodies. Caller-allocated
+  AutoTiling PrimFuncs remain `noinline` device functions so their temporary SSA
+  values do not enlarge the caller's live range; operator-template helpers stay
+  inlined within those leaf functions. Call frames occupy a backend-owned arena
+  separate from the AutoTiling staging arena. The renderer assigns frame offsets
+  from the device-call DAG, keeps caller and callee frames disjoint, and reuses
+  storage across sibling or sequential calls.
+  The maximum live call stack is rounded independently from the AutoTiling
+  arena. The compiler-managed arena must fit its logical allocation limit, and
+  the compiled kernel's total usage, including call frames and Triton-private
+  lowering scratch, must fit the target's physical per-block shared-memory
+  capacity.
+- A shared device-context frame stores canonical dynamic launch values once;
+  private device functions load only the fields used by their body. Static
+  specialization values remain `tl.constexpr` direct parameters. This is an ABI
+  representation owned by PyNTT and does not create compiler-visible TIR
+  buffers.
+- Function call-boundary policy is derived from the IR `FunctionRole`, never
+  from function names. Shape-bucket selector and segment-root functions are
+  `Dispatch`; the manifest marks them `compose_into_caller`, and the reader-only
+  renderer structurally expands them before call-frame allocation, ABI
+  liveness, and Triton code generation. This is mandatory composition rather
+  than a request to Triton's optional inliner, so orchestration wrappers cannot
+  survive as spill-prone device functions. Decoder and ordinary compute
+  functions are `Compute`, while AutoTiling-generated leaf PrimFuncs are
+  `ScheduledRegion`; both preserve their noinline device boundaries.
+  Dispatch trace markers are retained. A direct operator helper owned by a
+  Dispatch function moves to the owning top-kernel scope but remains a
+  `noinline` compute leaf; composing an orchestration wrapper must not inline
+  operator register state into the top kernel. Operator-template helpers may
+  still inline inside a scheduled leaf.
 - Triton top kernels consume the generated TIR buffer plan directly; Python
   runtime code must not recompute workspace placement.
 

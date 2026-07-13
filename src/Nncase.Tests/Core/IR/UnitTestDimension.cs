@@ -177,6 +177,22 @@ public sealed class UnitTestDimension
     }
 
     [Fact]
+    public void TestDimensionProductDistributesSumBias()
+    {
+        var value = new DimVar("value");
+        var expression = 256 + (4 * value);
+        var negated = Assert.IsType<DimSum>(-expression);
+        var difference = expression - expression;
+
+        Assert.Equal(-256, negated.Bias);
+        Assert.Equal(Dimension.Zero, difference.Simplify());
+        Assert.NotEqual(new DimSum([value], 1), new DimSum([value], 2));
+        Assert.NotEqual(
+            new DimFraction(DimDivideMode.FloorDiv, value, 8),
+            new DimFraction(DimDivideMode.CeilDiv, value, 8));
+    }
+
+    [Fact]
     public void TestDimensionMinMaxInferRange()
     {
         var lhs = new DimVar("lhs")

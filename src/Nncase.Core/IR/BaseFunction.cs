@@ -26,6 +26,11 @@ public abstract class BaseFunction : Callable
     public Schedule.SchedFunctionResult SchedResult { get; set; }
 
     /// <summary>
+    /// Gets or sets the function's execution role.
+    /// </summary>
+    public FunctionRole Role { get; set; } = FunctionRole.Compute;
+
+    /// <summary>
     /// Gets parameter types.
     /// </summary>
     public abstract IEnumerable<IRType> ParameterTypes { get; }

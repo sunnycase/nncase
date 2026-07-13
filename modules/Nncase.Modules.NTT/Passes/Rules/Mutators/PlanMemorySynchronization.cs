@@ -26,33 +26,51 @@ internal sealed class MemoryEffectAnalyzer
         }
     }
 
-    public EffectSet GetEffects(Expr expr)
-        => GetEffects(expr, ResourceBindingScope.Empty);
+    public EffectSet GetEffects(Expr expr, bool suppressReductionAccumulatorEffects = false)
+        => GetEffects(expr, ResourceBindingScope.Empty, suppressReductionAccumulatorEffects);
 
-    private EffectSet GetEffects(Expr expr, ResourceBindingScope bindings)
+    private EffectSet GetEffects(
+        Expr expr,
+        ResourceBindingScope bindings,
+        bool suppressReductionAccumulatorEffects)
     {
         switch (expr)
         {
             case Block block:
-                return Union([GetEffects(block.InitBody, bindings), GetEffects(block.Body, bindings)]);
+                return Union(
+                    [
+                        GetEffects(block.InitBody, bindings, suppressReductionAccumulatorEffects),
+                        GetEffects(block.Body, bindings, suppressReductionAccumulatorEffects),
+                    ]);
             case Sequential sequential:
-                return Union(sequential.Fields.ToArray().Select(field => GetEffects(field, bindings)));
+                return Union(sequential.Fields.ToArray().Select(
+                    field => GetEffects(field, bindings, suppressReductionAccumulatorEffects)));
             case Nncase.TIR.For @for:
-                return GetEffects(@for.Body, bindings);
+                return GetEffects(@for.Body, bindings, suppressReductionAccumulatorEffects);
             case Let let:
                 var expressionEffects = let.Expression is Expr bindingExpression
-                    ? GetEffects(bindingExpression, bindings)
+                    ? GetEffects(bindingExpression, bindings, suppressReductionAccumulatorEffects)
                     : new EffectSet();
                 return Union(
-                    [expressionEffects, GetEffects(let.Body, bindings.Bind((BaseExpr)let.Var, let.Expression))]);
+                    [
+                        expressionEffects,
+                        GetEffects(
+                            let.Body,
+                            bindings.Bind((BaseExpr)let.Var, let.Expression),
+                            suppressReductionAccumulatorEffects),
+                    ]);
             case IfThenElse ifThenElse:
-                return Union([GetEffects(ifThenElse.Then, bindings), GetEffects(ifThenElse.Else, bindings)]);
+                return Union(
+                    [
+                        GetEffects(ifThenElse.Then, bindings, suppressReductionAccumulatorEffects),
+                        GetEffects(ifThenElse.Else, bindings, suppressReductionAccumulatorEffects),
+                    ]);
             case Call { Target: PrimFunction callee } call when _functions.Contains(callee):
                 return Instantiate(GetFunctionSummary(callee), call.Arguments, bindings);
             case Call { Target: PrimFunctionWrapper }:
                 throw new InvalidOperationException("PrimFunctionWrapper must be eliminated before memory synchronization planning.");
             case Call { Target: Op } call:
-                return GetCallEffects(call, bindings);
+                return GetCallEffects(call, bindings, suppressReductionAccumulatorEffects);
             default:
                 return new EffectSet();
         }
@@ -70,7 +88,7 @@ internal sealed class MemoryEffectAnalyzer
             throw new InvalidOperationException($"Recursive PrimFunction call graph is not supported by memory synchronization planning: {function.Name}.");
         }
 
-        var effects = GetEffects(function.Body, ResourceBindingScope.Empty);
+        var effects = GetEffects(function.Body, ResourceBindingScope.Empty, false);
         var parameterEffects = new Dictionary<int, EffectInfo>();
         foreach (var item in effects.Items)
         {
@@ -114,12 +132,24 @@ internal sealed class MemoryEffectAnalyzer
         return -1;
     }
 
-    private static EffectSet GetCallEffects(Call call, ResourceBindingScope bindings)
+    private static EffectSet GetCallEffects(
+        Call call,
+        ResourceBindingScope bindings,
+        bool suppressReductionAccumulatorEffects)
     {
         var effects = new EffectSet();
         MemoryEffectUtility.VisitCallEffects(
             call,
-            (argument, _, effect) => effects.Add(ResolveResource(argument, effect.Scope, bindings), effect.Mode));
+            (argument, _, effect) =>
+            {
+                if (suppressReductionAccumulatorEffects &&
+                    effect.Kind == MemoryEffectKind.ReductionAccumulator)
+                {
+                    return;
+                }
+
+                effects.Add(ResolveResource(argument, effect.Scope, bindings), effect.Mode);
+            });
 
         return effects;
     }
@@ -444,9 +474,12 @@ internal sealed class MemorySynchronizationPlanner
     }
 
     public PrimFunction Rewrite(PrimFunction function)
-        => function.With(body: RewriteSequential(function.Body, false));
+        => function.With(body: RewriteSequential(function.Body, false, false));
 
-    private Sequential RewriteSequential(Sequential sequential, bool insideLoop)
+    private Sequential RewriteSequential(
+        Sequential sequential,
+        bool insideLoop,
+        bool insideReduction)
     {
         var fields = new List<Expr>();
         var pendingWrites = new EffectSet();
@@ -463,7 +496,7 @@ internal sealed class MemorySynchronizationPlanner
                 continue;
             }
 
-            var effects = _analyzer.GetEffects(field);
+            var effects = _analyzer.GetEffects(field, insideReduction);
             if (pendingWrites.TryGetReadConflict(effects, out var requiredScope))
             {
                 if (insideLoop && requiredScope == TIR.NTT.BarrierScope.Chip)
@@ -475,7 +508,7 @@ internal sealed class MemorySynchronizationPlanner
                 pendingWrites.RemoveWritesAtOrBelow(requiredScope);
             }
 
-            var rewritten = RewriteStatement(field, insideLoop);
+            var rewritten = RewriteStatement(field, insideLoop, insideReduction);
             if (rewritten is Sequential nested)
             {
                 fields.AddRange(nested.Fields.ToArray());
@@ -491,19 +524,26 @@ internal sealed class MemorySynchronizationPlanner
         return new Sequential(fields.ToArray());
     }
 
-    private Expr RewriteStatement(Expr expression, bool insideLoop)
+    private Expr RewriteStatement(
+        Expr expression,
+        bool insideLoop,
+        bool insideReduction)
     {
         return expression switch
         {
             Block block => block.With(
-                body: RewriteSequential(block.Body, insideLoop),
-                initBody: RewriteSequential(block.InitBody, insideLoop)),
-            Nncase.TIR.For @for => @for.With(body: RewriteSequential(@for.Body, true)),
-            Let let => let.With(body: RewriteSequential(let.Body, insideLoop)),
+                body: RewriteSequential(block.Body, insideLoop, insideReduction),
+                initBody: RewriteSequential(block.InitBody, insideLoop, insideReduction)),
+            Nncase.TIR.For @for => @for.With(
+                body: RewriteSequential(
+                    @for.Body,
+                    true,
+                    insideReduction || @for.Mode == LoopMode.Reduction)),
+            Let let => let.With(body: RewriteSequential(let.Body, insideLoop, insideReduction)),
             IfThenElse ifThenElse => ifThenElse.With(
-                then: RewriteSequential(ifThenElse.Then, insideLoop),
-                @else: RewriteSequential(ifThenElse.Else, insideLoop)),
-            Sequential sequential => RewriteSequential(sequential, insideLoop),
+                then: RewriteSequential(ifThenElse.Then, insideLoop, insideReduction),
+                @else: RewriteSequential(ifThenElse.Else, insideLoop, insideReduction)),
+            Sequential sequential => RewriteSequential(sequential, insideLoop, insideReduction),
             _ => expression,
         };
     }

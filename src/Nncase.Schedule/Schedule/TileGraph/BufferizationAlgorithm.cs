@@ -66,14 +66,6 @@ public sealed class BufferizationAlgorithm : AlgorithmBase<TieredTileGraph>
             var wrappedGraph = new AdjacencyGraph<BufferIdentity, EquatableTaggedEdge<BufferIdentity, BufferEdgeKind>>(allowParallelEdges: false);
             var rootBufferGraph = new BufferGraph(rootGraph.Level, wrappedGraph);
             Visit(rootGraph, rootBufferGraph, rootGraph);
-            foreach (var edge in rootGraph.Edges)
-            {
-                var sourceOutputIndex = GraphExtensions.GetProducerOutputIndex(edge.Target.Grid.Accesses[edge.Tag].Value, edge.Source);
-                var source = new BufferIdentity(edge.Source, edge.Source.Grid.GetOutputBufferIndex(sourceOutputIndex), BufferEndpoint.Output);
-                var target = new BufferIdentity(edge.Target, edge.Tag, BufferEndpoint.Input);
-                rootBufferGraph.AddEdge(new(source, target, BufferEdgeKind.Inter));
-            }
-
             BufferGraphMemo.Add(rootGraph, rootBufferGraph);
         }
     }
@@ -102,18 +94,23 @@ public sealed class BufferizationAlgorithm : AlgorithmBase<TieredTileGraph>
         {
             foreach (var childGraph in graph.Clusters.OfType<TieredTileGraph>())
             {
-                if (!BufferGraphMemo.TryGetValue(graph, out _))
+                if (BufferGraphMemo.ContainsKey(childGraph))
                 {
-                    var childBufferGraph = bufferGraph.CreateCluster<BufferGraph>(childGraph.Level, childGraph.OpId);
-                    opnodes.UnionWith(Visit(childGraph, childBufferGraph, rootGraph));
-                    BufferGraphMemo.Add(childGraph, childBufferGraph);
+                    throw new InvalidOperationException($"Tile graph {childGraph} was bufferized more than once.");
                 }
+
+                var childBufferGraph = bufferGraph.CreateCluster<BufferGraph>(childGraph.Level, childGraph.OpId);
+                opnodes.UnionWith(Visit(childGraph, childBufferGraph, rootGraph));
+                BufferGraphMemo.Add(childGraph, childBufferGraph);
             }
         }
 
         foreach (var edge in rootGraph.Edges)
         {
-            if (opnodes.Contains(edge.Source) && opnodes.Contains(edge.Target))
+            if (opnodes.Contains(edge.Source) &&
+                opnodes.Contains(edge.Target) &&
+                !graph.Clusters.OfType<TieredTileGraph>().Any(child =>
+                    child.ContainsVertex(edge.Source) && child.ContainsVertex(edge.Target)))
             {
                 var sourceOutputIndex = GraphExtensions.GetProducerOutputIndex(edge.Target.Grid.Accesses[edge.Tag].Value, edge.Source);
                 var source = new BufferIdentity(edge.Source, edge.Source.Grid.GetOutputBufferIndex(sourceOutputIndex), BufferEndpoint.Output);

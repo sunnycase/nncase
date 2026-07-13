@@ -27,6 +27,28 @@ internal static class OrToolsExtensions
     public static IntExpr CeilDiv(this int numer, IntExpr denom) =>
         denom.solver().MakeDiv(numer + (denom - 1), denom);
 
+    /// <summary>
+    /// Computes ceil(<paramref name="value"/> * <paramref name="scale"/> / <paramref name="divisor"/>)
+    /// without materializing the potentially overflowing scaled numerator.
+    /// </summary>
+    public static IntExpr ScaleAndCeilDiv(this IntExpr value, long scale, long divisor)
+    {
+        if (scale <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(scale), scale, "Scale must be positive.");
+        }
+
+        if (divisor <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(divisor), divisor, "Divisor must be positive.");
+        }
+
+        var solver = value.solver();
+        var quotient = solver.MakeDiv(value, divisor);
+        var remainder = solver.MakeModulo(value, divisor);
+        return (quotient * scale) + (remainder * scale).CeilDiv(divisor);
+    }
+
     public static IntExpr MakeProd(this Solver solver, IEnumerable<IntExpr> ints)
     {
         return ints.Skip(1).Aggregate(ints.First(), solver.MakeProd);

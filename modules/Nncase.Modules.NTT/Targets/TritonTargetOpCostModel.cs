@@ -14,8 +14,8 @@ namespace Nncase.Targets;
 public sealed class TritonTargetOpCostModel : ITargetOpCostModel, IHierarchicalTargetOpCostModel, ITargetOpCostBreakdownModel
 {
     private readonly TargetMachineModel _machine;
-    private readonly TargetMemorySpaceSpec _blockMemory;
-    private readonly TargetMemorySpaceSpec _rootMemory;
+    private readonly TargetMemoryResourceSpec _blockMemory;
+    private readonly TargetMemoryResourceSpec _rootMemory;
 
     public TritonTargetOpCostModel(TargetMachineModel machine)
     {
@@ -25,8 +25,11 @@ public sealed class TritonTargetOpCostModel : ITargetOpCostModel, IHierarchicalT
             throw new ArgumentException($"Triton cost model requires a persistent GPU target machine, got {machine.Id} ({machine.Execution.Kind}).", nameof(machine));
         }
 
-        _blockMemory = machine.TilingMemorySpaces[^1];
-        _rootMemory = machine.GetMemorySpace(machine.RootMemorySpace);
+        var blockSpace = machine.TilingMemorySpaces
+            .LastOrDefault(space => machine.GetMemoryResource(space).Kind != TargetMemorySpaceKind.Global)
+            ?? machine.TilingMemorySpaces[^1];
+        _blockMemory = machine.GetMemoryResource(blockSpace);
+        _rootMemory = machine.GetMemoryResource(machine.GetMemorySpace(machine.RootMemorySpace));
     }
 
     public UInt128 GetLatency(Cost cost) => GetLatency(cost, TargetCostAggregationContext.Local);
@@ -264,7 +267,7 @@ public sealed class TritonTargetOpCostModel : ITargetOpCostModel, IHierarchicalT
         return blockTiles * kTiles / instruction.InstructionsPerCyclePerBlock;
     }
 
-    private static double GetMemoryLatency(double bytes, TargetMemorySpaceSpec memorySpace)
+    private static double GetMemoryLatency(double bytes, TargetMemoryResourceSpec memorySpace)
         => bytes > 0 ? memorySpace.LatencyCycles : 0;
 
     private DataType GetScalarDType(DataType dtype) => dtype switch

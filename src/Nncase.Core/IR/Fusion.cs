@@ -65,9 +65,15 @@ public class Fusion : BaseFunction
 
     public override BaseFunction With(string? name = null, string? moduleKind = null)
     {
-        return new Fusion(name ?? Name, moduleKind ?? ModuleKind, Body, Parameters);
+        return new Fusion(name ?? Name, moduleKind ?? ModuleKind, Body, Parameters)
+        {
+            Role = Role,
+        };
     }
 
     public Fusion With(string? name = null, string? moduleKind = null, BaseExpr? body = null, IVar[]? parameters = null)
-        => new Fusion(name ?? Name, moduleKind ?? ModuleKind, body ?? Body, parameters ?? Parameters);
+        => new Fusion(name ?? Name, moduleKind ?? ModuleKind, body ?? Body, parameters ?? Parameters)
+        {
+            Role = Role,
+        };
 }

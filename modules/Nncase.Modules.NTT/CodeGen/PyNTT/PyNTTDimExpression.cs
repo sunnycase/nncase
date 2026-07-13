@@ -36,12 +36,18 @@ internal sealed class PyNTTDimExpressionEmitter : ExprFunctor<PyNTTDimExpression
     private readonly Action<string>? _registerRuntimeScalar;
     private readonly Func<string, string> _formatRuntimeScalar;
     private readonly string _threadIdExpression;
+    private readonly Func<DimVar, PyNTTDimExpression?>? _resolveDimVar;
 
-    public PyNTTDimExpressionEmitter(Action<string>? registerRuntimeScalar = null, Func<string, string>? formatRuntimeScalar = null, string? threadIdExpression = null)
+    public PyNTTDimExpressionEmitter(
+        Action<string>? registerRuntimeScalar = null,
+        Func<string, string>? formatRuntimeScalar = null,
+        string? threadIdExpression = null,
+        Func<DimVar, PyNTTDimExpression?>? resolveDimVar = null)
     {
         _registerRuntimeScalar = registerRuntimeScalar;
         _formatRuntimeScalar = formatRuntimeScalar ?? (name => name);
         _threadIdExpression = threadIdExpression ?? "pyntt_thread_id";
+        _resolveDimVar = resolveDimVar;
     }
 
     public PyNTTDimExpression Emit(Dimension dimension)
@@ -186,6 +192,21 @@ internal sealed class PyNTTDimExpressionEmitter : ExprFunctor<PyNTTDimExpression
         var name = SanitizePythonIdentifier(expr.Name);
         _registerRuntimeScalar?.Invoke(name);
         var formattedName = _formatRuntimeScalar(name);
+        if (_resolveDimVar?.Invoke(expr) is { } resolved)
+        {
+            if (resolved.FixedValue is { } fixedValue)
+            {
+                var value = fixedValue.ToString(CultureInfo.InvariantCulture);
+                return new(value, value, fixedValue);
+            }
+
+            return resolved with
+            {
+                PythonExpression = formattedName,
+                TritonExpression = formattedName,
+            };
+        }
+
         return WithRangeFromMetadata(new(formattedName, formattedName), expr);
     }
 
@@ -375,10 +396,25 @@ internal sealed class PyNTTDimExpressionEmitter : ExprFunctor<PyNTTDimExpression
             return expression;
         }
 
+        var metadataMin = checked((long)Math.Floor(range.Min));
+        var metadataMax = checked((long)Math.Ceiling(range.Max));
+        var rangeMin = expression.RangeMin.HasValue
+            ? Math.Max(expression.RangeMin.Value, metadataMin)
+            : metadataMin;
+        var rangeMax = expression.RangeMax.HasValue
+            ? Math.Min(expression.RangeMax.Value, metadataMax)
+            : metadataMax;
+        if (rangeMin > rangeMax)
+        {
+            throw new InvalidOperationException(
+                $"Dimension range inference is inconsistent for {source}: " +
+                $"derived=[{expression.RangeMin}, {expression.RangeMax}], metadata=[{metadataMin}, {metadataMax}].");
+        }
+
         return expression with
         {
-            RangeMin = checked((long)Math.Floor(range.Min)),
-            RangeMax = checked((long)Math.Ceiling(range.Max)),
+            RangeMin = rangeMin,
+            RangeMax = rangeMax,
         };
     }
 

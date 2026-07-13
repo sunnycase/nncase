@@ -89,9 +89,15 @@ public sealed class Function : BaseFunction
 
     public override BaseFunction With(string? name = null, string? moduleKind = null)
     {
-        return new Function(name ?? Name, moduleKind ?? ModuleKind, Body, Parameters, VarMap);
+        return new Function(name ?? Name, moduleKind ?? ModuleKind, Body, Parameters, VarMap)
+        {
+            Role = Role,
+        };
     }
 
-    public Function With(string? name = null, string? moduleKind = null, BaseExpr? body = null, IVar[]? parameters = null)
-        => new Function(name ?? Name, moduleKind ?? ModuleKind, body ?? Body, parameters ?? Parameters, VarMap);
+    public Function With(string? name = null, string? moduleKind = null, BaseExpr? body = null, IVar[]? parameters = null, FunctionRole? role = null)
+        => new Function(name ?? Name, moduleKind ?? ModuleKind, body ?? Body, parameters ?? Parameters, VarMap)
+        {
+            Role = role ?? Role,
+        };
 }

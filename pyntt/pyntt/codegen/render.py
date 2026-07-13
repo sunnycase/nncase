@@ -28,12 +28,13 @@ WORKSPACE_STRIDE_PARAMETERS = (
     "block_local_data_pool_stride_bytes: tl.constexpr",
 )
 
-POINTER_CALL_FRAME_ALIGNMENT = 8
-POINTER_CALL_FRAME_ADDRESS_SPACE = 3
+DEVICE_CALL_FRAME_SLOT_BYTES = 8
+DEVICE_CALL_FRAME_ADDRESS_SPACE = 3
 
 DEVICE_CALL_RE = re.compile(
     r"(?m)^(?P<indent>[ \t]*)__pyntt_device_call__(?P<name>[A-Za-z_]\w*)\((?P<args>.*)\)$"
 )
+DEVICE_CALL_NAME_RE = re.compile(r"__pyntt_device_call__(?P<name>[A-Za-z_]\w*)\(")
 
 
 def render_generated_kernels(
@@ -77,7 +78,7 @@ def render_manifest(manifest: dict[str, Any]) -> str:
     )
     needs_shared_memory = any(
         int(_attrs(kernel.get("metadata", {})).get("shared_memory_bytes", 0)) > 0
-        or _pointer_call_frame_bytes(kernel) > 0
+        or _device_call_frame_bytes(kernel) > 0
         for function in manifest.get("functions", ())
         for kernel in function.get("render_kernels", ())
     )
@@ -90,47 +91,150 @@ def render_manifest(manifest: dict[str, Any]) -> str:
     )
 
 
-def _render_kernel(kernel: dict[str, Any]) -> str:
-    env = _make_env()
-    metadata = kernel["metadata"]
-    shared_memory_bytes = int(_attrs(metadata).get("shared_memory_bytes", 0))
-    if shared_memory_bytes < 0:
-        raise ValueError(
-            f"PyNTT kernel {metadata['name']} has invalid shared_memory_bytes={shared_memory_bytes}."
-        )
-    raw_device_functions = tuple(kernel["device_functions"])
-    call_frame_offsets, call_frame_allocation_bytes = _assign_pointer_call_frames(
-        raw_device_functions, shared_memory_bytes
-    )
-    shared_allocation_bytes = shared_memory_bytes + call_frame_allocation_bytes
-    hidden_device_parameters = (
-        ("pyntt_shared_base",) if shared_allocation_bytes > 0 else ()
-    )
-    runtime_shape_args = _runtime_shape_args(metadata)
+def _kernel_parameters(metadata: dict[str, Any]) -> tuple[str, ...]:
     grid_barrier_parameters = (
         ("pyntt_grid_mesh: tl.constexpr",)
         if _attrs(metadata).get("requires_grid_barrier")
         else ()
     )
-    parameters = (
-        tuple(f"input{index}" for index, _ in enumerate(metadata.get("inputs", ())))
-        + tuple(f"output{index}" for index, _ in enumerate(metadata.get("outputs", ())))
-        + tuple(f"input{index}_pool_stride_elements: tl.constexpr" for index, _ in enumerate(metadata.get("inputs", ())))
-        + tuple(f"output{index}_pool_stride_elements: tl.constexpr" for index, _ in enumerate(metadata.get("outputs", ())))
+    return (
+        tuple(
+            f"input{index}"
+            for index, _ in enumerate(metadata.get("inputs", ()))
+        )
+        + tuple(
+            f"output{index}"
+            for index, _ in enumerate(metadata.get("outputs", ()))
+        )
+        + tuple(
+            f"input{index}_pool_stride_elements: tl.constexpr"
+            for index, _ in enumerate(metadata.get("inputs", ()))
+        )
+        + tuple(
+            f"output{index}_pool_stride_elements: tl.constexpr"
+            for index, _ in enumerate(metadata.get("outputs", ()))
+        )
         + _abi_view_stride_args(metadata)
         + WORKSPACE_PARAMETERS
         + WORKSPACE_STRIDE_PARAMETERS
-        + tuple(runtime_shape_args)
+        + tuple(_runtime_shape_args(metadata))
         + grid_barrier_parameters
         + ("numel", "block_size: tl.constexpr")
     )
-    call_arguments = _parameter_call_arguments(parameters)
-    device_functions = tuple(
-        _prepare_device_function(
-            device_function,
-            call_frame_offsets[device_function["name"]],
+
+
+def _build_device_context_frame(
+    metadata: dict[str, Any],
+    device_functions: tuple[dict[str, Any], ...],
+    parameters: tuple[str, ...],
+) -> tuple[dict[str, Any], ...]:
+    if not device_functions:
+        return ()
+
+    pointer_types = {name: "tl.uint8" for name in WORKSPACE_PARAMETERS}
+    scalar_names = {
+        *_parameter_call_arguments(_abi_view_stride_args(metadata)),
+        *_runtime_shape_args(metadata),
+        "numel",
+    }
+    candidates = {
+        **{
+            name: {"name": name, "triton_dtype": dtype, "is_pointer": True}
+            for name, dtype in pointer_types.items()
+        },
+        **{
+            name: {
+                "name": name,
+                "triton_dtype": "tl.int64",
+                "is_pointer": False,
+            }
+            for name in scalar_names
+        },
+    }
+    parameter_names = _parameter_call_arguments(parameters)
+    referenced = set()
+    for device_function in device_functions:
+        referenced.update(
+            _referenced_parameter_names(
+                device_function.get("body_source", ""), parameter_names
+            )
         )
-        for device_function in raw_device_functions
+
+    live_names = tuple(
+        name
+        for name in parameter_names
+        if name in referenced and name in candidates
+    )
+    return tuple(
+        {
+            **candidates[name],
+            "offset": index * DEVICE_CALL_FRAME_SLOT_BYTES,
+        }
+        for index, name in enumerate(live_names)
+    )
+
+
+def _render_kernel(kernel: dict[str, Any]) -> str:
+    kernel = _compose_device_functions(kernel)
+    env = _make_env()
+    metadata = kernel["metadata"]
+    kernel_attrs = _attrs(metadata)
+    parameters = _kernel_parameters(metadata)
+    shared_memory_bytes = int(kernel_attrs.get("shared_memory_bytes", 0))
+    if shared_memory_bytes < 0:
+        raise ValueError(
+            f"PyNTT kernel {metadata['name']} has invalid shared_memory_bytes={shared_memory_bytes}."
+        )
+    raw_device_functions = tuple(kernel["device_functions"])
+    context_frame = _build_device_context_frame(
+        metadata, raw_device_functions, parameters
+    )
+    call_frame_offsets, call_frame_bytes = _assign_device_call_frames(
+        raw_device_functions,
+        base_offset=len(context_frame) * DEVICE_CALL_FRAME_SLOT_BYTES,
+    )
+    shared_allocation_bytes = _round_memory_arena_size(
+        shared_memory_bytes,
+        str(kernel_attrs.get("shared_memory_allocation_size_policy", "")),
+        int(kernel_attrs.get("shared_memory_allocation_granularity_bytes", 0)),
+    )
+    call_frame_allocation_bytes = _round_memory_arena_size(
+        call_frame_bytes,
+        str(kernel_attrs.get("shared_memory_allocation_size_policy", "")),
+        int(kernel_attrs.get("shared_memory_allocation_granularity_bytes", 0)),
+    )
+    total_shared_allocation_bytes = (
+        shared_allocation_bytes + call_frame_allocation_bytes
+    )
+    shared_memory_capacity_bytes = int(
+        kernel_attrs.get("shared_memory_capacity_bytes", 0)
+    )
+    if (
+        shared_memory_capacity_bytes > 0
+        and total_shared_allocation_bytes > shared_memory_capacity_bytes
+    ):
+        raise ValueError(
+            f"PyNTT kernel {metadata['name']} requires "
+            f"{total_shared_allocation_bytes} shared-memory bytes after allocation "
+            f"rounding (AutoTiling arena {shared_memory_bytes} -> "
+            f"{shared_allocation_bytes}, device call frames {call_frame_bytes} -> "
+            f"{call_frame_allocation_bytes}), "
+            f"exceeding target capacity {shared_memory_capacity_bytes}."
+        )
+    hidden_device_parameters = tuple(
+        parameter
+        for parameter, required in (
+            ("pyntt_shared_base", shared_allocation_bytes > 0),
+            ("pyntt_call_frame_base", call_frame_allocation_bytes > 0),
+        )
+        if required
+    )
+    device_functions = _prepare_device_functions(
+        raw_device_functions,
+        parameters,
+        hidden_device_parameters,
+        context_frame,
+        call_frame_offsets,
     )
     device_functions_by_name = {
         device_function["name"]: device_function
@@ -141,7 +245,6 @@ def _render_kernel(kernel: dict[str, Any]) -> str:
         _render_device_function(
             env,
             device_function,
-            parameters,
             hidden_device_parameters,
             device_functions_by_name,
         )
@@ -150,10 +253,14 @@ def _render_kernel(kernel: dict[str, Any]) -> str:
     body_source = _replace_device_function_calls(
         kernel.get("body_source", ""),
         device_functions_by_name,
-        call_arguments + hidden_device_parameters,
     )
     body_source = _with_shard_index_prelude(body_source)
-    body_source = _with_shared_memory_prelude(body_source, shared_allocation_bytes)
+    body_source = _with_shared_memory_prelude(
+        body_source,
+        shared_allocation_bytes,
+        call_frame_allocation_bytes,
+        context_frame,
+    )
     top_kernel = env.get_template("triton/top_kernel.py.jinja").render(
         name=metadata["name"],
         parameters=", ".join(parameters),
@@ -169,7 +276,6 @@ def _render_kernel(kernel: dict[str, Any]) -> str:
 def _render_device_function(
     env: Environment,
     device_function: dict[str, Any],
-    parameters: tuple[str, ...],
     hidden_parameters: tuple[str, ...],
     device_functions_by_name: dict[str, dict[str, Any]],
 ) -> str:
@@ -180,18 +286,16 @@ def _render_device_function(
     )
     parts = [source for source in helper_sources if source]
     device_parameters = (
-        parameters
+        tuple(device_function["direct_parameters"])
         + hidden_parameters
         + tuple(device_function["direct_extra_parameters"])
     )
-    base_call_arguments = _parameter_call_arguments(parameters + hidden_parameters)
     for stage in device_function["stages"]:
         body_source = _replace_device_function_calls(
             stage["body_source"],
             device_functions_by_name,
-            base_call_arguments,
         )
-        body_source = _replace_pointer_call_frame_references(
+        body_source = _replace_device_call_frame_references(
             body_source, device_function
         )
         body_source = _with_shard_index_prelude(body_source)
@@ -210,37 +314,113 @@ def _render_device_function(
     return "\n\n".join(parts)
 
 
-def _prepare_device_function(
-    device_function: dict[str, Any],
-    call_frame_offset: int,
-) -> dict[str, Any]:
-    prepared = dict(device_function)
-    extra_parameters = tuple(device_function["extra_parameters"])
-    pointer_call_frame = tuple(device_function["pointer_call_frame"])
-    framed_names = {parameter["name"] for parameter in pointer_call_frame}
-    unknown_names = framed_names.difference(extra_parameters)
-    if unknown_names:
-        raise RuntimeError(
-            f"PyNTT device function {device_function['name']} frames unknown parameters "
-            f"{sorted(unknown_names)}."
+def _prepare_device_functions(
+    device_functions: tuple[dict[str, Any], ...],
+    parameters: tuple[str, ...],
+    hidden_parameters: tuple[str, ...],
+    context_frame: tuple[dict[str, Any], ...],
+    call_frame_offsets: dict[str, int],
+) -> tuple[dict[str, Any], ...]:
+    parameter_names = _parameter_call_arguments(parameters)
+    parameter_by_name = dict(zip(parameter_names, parameters))
+    context_parameter_names = {parameter["name"] for parameter in context_frame}
+    prepared_functions = []
+    for device_function in device_functions:
+        prepared = dict(device_function)
+        extra_parameters = tuple(device_function["extra_parameters"])
+        call_frame = tuple(device_function["call_frame"])
+        framed_names = {parameter["name"] for parameter in call_frame}
+        unknown_names = framed_names.difference(extra_parameters)
+        if unknown_names:
+            raise RuntimeError(
+                f"PyNTT device function {device_function['name']} frames unknown parameters "
+                f"{sorted(unknown_names)}."
+            )
+        prepared["direct_extra_parameters"] = tuple(
+            parameter for parameter in extra_parameters if parameter not in framed_names
         )
-    prepared["direct_extra_parameters"] = tuple(
-        parameter for parameter in extra_parameters if parameter not in framed_names
-    )
-    prepared["pointer_call_frame"] = tuple(
-        {
-            **parameter,
-            "offset": call_frame_offset + index * POINTER_CALL_FRAME_ALIGNMENT,
-        }
-        for index, parameter in enumerate(pointer_call_frame)
-    )
-    prepared["stages"] = (
-        {
-            "name": device_function["name"],
-            "body_source": device_function.get("body_source", "").rstrip() or "pass",
-        },
-    )
-    return prepared
+        prepared["call_frame"] = tuple(
+            {
+                **parameter,
+                "offset": call_frame_offsets[device_function["name"]]
+                + index * DEVICE_CALL_FRAME_SLOT_BYTES,
+            }
+            for index, parameter in enumerate(call_frame)
+        )
+        prepared["hidden_parameters"] = hidden_parameters
+        prepared["context_frame"] = context_frame
+        prepared["stages"] = (
+            {
+                "name": device_function["name"],
+                "body_source": device_function.get("body_source", "").rstrip()
+                or "pass",
+            },
+        )
+        prepared_functions.append(prepared)
+
+    functions_by_name = {
+        device_function["name"]: device_function
+        for device_function in prepared_functions
+    }
+    required_parameters = {
+        name: _referenced_parameter_names(
+            device_function.get("body_source", ""), parameter_names
+        ).difference(context_parameter_names)
+        for name, device_function in functions_by_name.items()
+    }
+
+    # Keep only canonical top-kernel parameters used by this private function
+    # or a transitive callee. PrimFunc descriptors remain in the typed frame.
+    changed = True
+    while changed:
+        changed = False
+        for name, device_function in functions_by_name.items():
+            for match in DEVICE_CALL_NAME_RE.finditer(
+                device_function.get("body_source", "")
+            ):
+                callee_name = match.group("name")
+                callee = functions_by_name.get(callee_name)
+                if callee is None:
+                    raise RuntimeError(
+                        f"PyNTT device function {name} calls unknown device function "
+                        f"{callee_name}."
+                    )
+                overrides = dict(callee["parameter_overrides"])
+                for parameter in required_parameters[callee_name]:
+                    expression = overrides.get(parameter, parameter)
+                    for dependency in _referenced_parameter_names(
+                        expression, parameter_names
+                    ):
+                        if dependency not in required_parameters[name]:
+                            required_parameters[name].add(dependency)
+                            changed = True
+
+    for device_function in prepared_functions:
+        device_function["direct_parameters"] = tuple(
+            parameter_by_name[name]
+            for name in parameter_names
+            if name in required_parameters[device_function["name"]]
+        )
+    return tuple(prepared_functions)
+
+
+def _referenced_parameter_names(
+    source: str, parameter_names: tuple[str, ...]
+) -> set[str]:
+    if not source.strip():
+        return set()
+    try:
+        tree = ast.parse(source)
+    except SyntaxError as ex:
+        raise RuntimeError(
+            "Invalid PyNTT device-function body while computing ABI liveness."
+        ) from ex
+    candidates = set(parameter_names)
+    return {
+        node.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Name) and node.id in candidates
+    }
 
 
 def _render_helper_sources(
@@ -249,7 +429,7 @@ def _render_helper_sources(
     helper_sources = []
     for helper in helpers:
         model = dict(helper["model"])
-        model["NoInline"] = noinline
+        model["NoInline"] = bool(helper.get("noinline", noinline))
         arguments = tuple(helper.get("arguments", ()) or ())
         if arguments:
             model["Arguments"] = arguments
@@ -263,33 +443,82 @@ def _parameter_call_arguments(parameters: tuple[str, ...]) -> tuple[str, ...]:
     return tuple(parameter.split(":", 1)[0].strip() for parameter in parameters)
 
 
-def _pointer_call_frame_bytes(kernel: dict[str, Any]) -> int:
-    return sum(
-        len(device_function["pointer_call_frame"]) * POINTER_CALL_FRAME_ALIGNMENT
-        for device_function in kernel["device_functions"]
+def _device_call_frame_bytes(kernel: dict[str, Any]) -> int:
+    kernel = _compose_device_functions(kernel)
+    device_functions = tuple(kernel["device_functions"])
+    context_frame = _build_device_context_frame(
+        kernel["metadata"],
+        device_functions,
+        _kernel_parameters(kernel["metadata"]),
+    )
+    return len(context_frame) * DEVICE_CALL_FRAME_SLOT_BYTES + sum(
+        len(device_function["call_frame"]) * DEVICE_CALL_FRAME_SLOT_BYTES
+        for device_function in device_functions
     )
 
 
-def _assign_pointer_call_frames(
-    device_functions: tuple[dict[str, Any], ...], shared_memory_bytes: int
+def _assign_device_call_frames(
+    device_functions: tuple[dict[str, Any], ...],
+    *,
+    base_offset: int = 0,
 ) -> tuple[dict[str, int], int]:
-    frame_start = (
-        (shared_memory_bytes + POINTER_CALL_FRAME_ALIGNMENT - 1)
-        // POINTER_CALL_FRAME_ALIGNMENT
-        * POINTER_CALL_FRAME_ALIGNMENT
-    )
-    next_offset = frame_start
-    offsets: dict[str, int] = {}
+    functions_by_name: dict[str, dict[str, Any]] = {}
     for device_function in device_functions:
         name = device_function["name"]
-        if name in offsets:
+        if name in functions_by_name:
             raise RuntimeError(f"Duplicate PyNTT device function {name}.")
-        offsets[name] = next_offset
-        next_offset += (
-            len(device_function["pointer_call_frame"])
-            * POINTER_CALL_FRAME_ALIGNMENT
+        functions_by_name[name] = device_function
+
+    callees: dict[str, tuple[str, ...]] = {}
+    indegrees = {name: 0 for name in functions_by_name}
+    for name, device_function in functions_by_name.items():
+        nested = tuple(
+            dict.fromkeys(
+                match.group("name")
+                for match in DEVICE_CALL_NAME_RE.finditer(
+                    device_function.get("body_source", "")
+                )
+            )
         )
-    return offsets, next_offset - shared_memory_bytes
+        unknown = [callee for callee in nested if callee not in functions_by_name]
+        if unknown:
+            raise RuntimeError(
+                f"PyNTT device function {name} calls unknown device functions "
+                f"{unknown}."
+            )
+        callees[name] = nested
+        for callee in nested:
+            indegrees[callee] += 1
+
+    # A caller's frame remains live while a synchronous child call executes.
+    # Longest-path offsets preserve that nesting while allowing sibling and
+    # otherwise non-overlapping calls to reuse the same backend-owned arena.
+    ready = [name for name in functions_by_name if indegrees[name] == 0]
+    offsets = {name: base_offset for name in functions_by_name}
+    processed = 0
+    allocation_bytes = base_offset
+    while ready:
+        name = ready.pop(0)
+        processed += 1
+        frame_end = offsets[name] + (
+            len(functions_by_name[name]["call_frame"])
+            * DEVICE_CALL_FRAME_SLOT_BYTES
+        )
+        allocation_bytes = max(allocation_bytes, frame_end)
+        for callee in callees[name]:
+            offsets[callee] = max(offsets[callee], frame_end)
+            indegrees[callee] -= 1
+            if indegrees[callee] == 0:
+                ready.append(callee)
+
+    if processed != len(functions_by_name):
+        cyclic = sorted(name for name, indegree in indegrees.items() if indegree > 0)
+        raise RuntimeError(
+            "Recursive PyNTT device-function call graphs are not supported; "
+            f"cycle includes {cyclic}."
+        )
+
+    return offsets, allocation_bytes
 
 
 def _split_expression_arguments(source: str) -> tuple[str, ...]:
@@ -310,11 +539,48 @@ def _split_expression_arguments(source: str) -> tuple[str, ...]:
     )
 
 
-def _build_device_function_call(
+def _substitute_identifiers(source: str, bindings: dict[str, str]) -> str:
+    if not source or not bindings:
+        return source
+
+    lines = source.splitlines(keepends=True)
+    line_offsets = []
+    offset = 0
+    for line in lines:
+        line_offsets.append(offset)
+        offset += len(line)
+    if not source.endswith(("\n", "\r")):
+        line_offsets.append(offset)
+
+    try:
+        tree = ast.parse(source)
+    except SyntaxError as ex:
+        raise RuntimeError(
+            "Invalid PyNTT device-function body while composing Dispatch functions."
+        ) from ex
+
+    replacements = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Name) or node.id not in bindings:
+            continue
+        if node.end_lineno is None or node.end_col_offset is None:
+            raise RuntimeError(
+                "Python AST does not expose source ranges required for PyNTT "
+                "Dispatch composition."
+            )
+        start = line_offsets[node.lineno - 1] + node.col_offset
+        end = line_offsets[node.end_lineno - 1] + node.end_col_offset
+        replacements.append((start, end, f"({bindings[node.id]})"))
+
+    for start, end, replacement in sorted(replacements, reverse=True):
+        source = source[:start] + replacement + source[end:]
+    return source
+
+
+def _bind_device_function_extra_arguments(
     device_function: dict[str, Any],
-    call_arguments: tuple[str, ...],
     explicit_extra_arguments: tuple[str, ...],
-) -> str:
+) -> dict[str, str]:
     extra_parameters = tuple(device_function["extra_parameters"])
     if explicit_extra_arguments:
         if len(explicit_extra_arguments) != len(extra_parameters):
@@ -323,34 +589,149 @@ def _build_device_function_call(
                 f"{len(explicit_extra_arguments)} extra arguments, expected "
                 f"{len(extra_parameters)}."
             )
-        extra_arguments = dict(zip(extra_parameters, explicit_extra_arguments))
-    else:
-        defaults = dict(device_function["extra_parameter_arguments"])
-        missing = [parameter for parameter in extra_parameters if parameter not in defaults]
-        if missing:
+        return dict(zip(extra_parameters, explicit_extra_arguments))
+
+    defaults = dict(device_function["extra_parameter_arguments"])
+    missing = [parameter for parameter in extra_parameters if parameter not in defaults]
+    if missing:
+        raise RuntimeError(
+            f"PyNTT call to {device_function['name']} is missing extra arguments "
+            f"{missing}."
+        )
+    return {parameter: defaults[parameter] for parameter in extra_parameters}
+
+
+def _compose_device_functions(kernel: dict[str, Any]) -> dict[str, Any]:
+    raw_functions = tuple(kernel.get("device_functions", ()))
+    composed_names = {
+        function["name"]
+        for function in raw_functions
+        if bool(function.get("compose_into_caller", False))
+    }
+    if not composed_names:
+        return kernel
+
+    functions_by_name = {}
+    for function in raw_functions:
+        name = function["name"]
+        if name in functions_by_name:
+            raise RuntimeError(f"Duplicate PyNTT device function {name}.")
+        functions_by_name[name] = function
+
+    for name in composed_names:
+        function = functions_by_name[name]
+        if function["noinline"]:
             raise RuntimeError(
-                f"PyNTT call to {device_function['name']} is missing extra arguments "
-                f"{missing}."
+                f"PyNTT Dispatch function {name} cannot be both composed and noinline."
             )
-        extra_arguments = defaults
+        if function["preserve_helper_call_boundaries"]:
+            raise RuntimeError(
+                f"PyNTT Dispatch function {name} cannot preserve private helper boundaries."
+            )
+
+    def expand(source: str, active: tuple[str, ...]) -> str:
+        def replace(match: re.Match[str]) -> str:
+            name = match.group("name")
+            callee = functions_by_name.get(name)
+            if callee is None:
+                raise RuntimeError(
+                    f"PyNTT kernel references unknown device function {name}."
+                )
+            if name not in composed_names:
+                return match.group(0)
+            if name in active:
+                cycle = " -> ".join((*active, name))
+                raise RuntimeError(
+                    f"Recursive PyNTT Dispatch composition is not supported: {cycle}."
+                )
+
+            extra_arguments = _bind_device_function_extra_arguments(
+                callee, _split_expression_arguments(match.group("args"))
+            )
+            parameter_overrides = {
+                parameter: _substitute_identifiers(expression, extra_arguments)
+                for parameter, expression in dict(
+                    callee["parameter_overrides"]
+                ).items()
+            }
+            overlap = set(extra_arguments).intersection(parameter_overrides)
+            if overlap:
+                raise RuntimeError(
+                    f"PyNTT Dispatch function {name} has conflicting bindings "
+                    f"for {sorted(overlap)}."
+                )
+            body = _substitute_identifiers(
+                callee.get("body_source", "").rstrip() or "pass",
+                {**extra_arguments, **parameter_overrides},
+            )
+            body = expand(body, (*active, name))
+            indent = match.group("indent")
+            return "\n".join(
+                f"{indent}{line}" if line else line
+                for line in body.splitlines()
+            )
+
+        return DEVICE_CALL_RE.sub(replace, source)
+
+    composed_helpers = [
+        {**helper, "noinline": True}
+        for function in raw_functions
+        if function["name"] in composed_names
+        for helper in function.get("helpers", ())
+    ]
+    result = dict(kernel)
+    result["helpers"] = [*kernel.get("helpers", ()), *composed_helpers]
+    result["body_source"] = expand(kernel.get("body_source", ""), ())
+    result["device_functions"] = [
+        {
+            **function,
+            "body_source": expand(function.get("body_source", ""), (function["name"],)),
+        }
+        for function in raw_functions
+        if function["name"] not in composed_names
+    ]
+    return result
+
+
+def _build_device_function_call(
+    device_function: dict[str, Any],
+    explicit_extra_arguments: tuple[str, ...],
+) -> str:
+    extra_arguments = _bind_device_function_extra_arguments(
+        device_function, explicit_extra_arguments
+    )
 
     parameter_overrides = dict(device_function["parameter_overrides"])
     direct_call_arguments = tuple(
-        parameter_overrides.get(argument, argument) for argument in call_arguments
+        parameter_overrides.get(argument, argument)
+        for argument in _parameter_call_arguments(
+            tuple(device_function["direct_parameters"])
+        )
+    ) + tuple(
+        parameter_overrides.get(argument, argument)
+        for argument in device_function["hidden_parameters"]
     ) + tuple(
         extra_arguments[parameter]
         for parameter in device_function["direct_extra_parameters"]
     )
     lines = []
-    for parameter in device_function["pointer_call_frame"]:
+    for parameter in device_function["call_frame"]:
         value = extra_arguments[parameter["name"]]
-        address = (
-            f"(pyntt_shared_base + {parameter['offset']}).to("
-            f"tl.pointer_type(tl.uint64, {POINTER_CALL_FRAME_ADDRESS_SPACE}))"
-        )
-        lines.append(f"tl.store({address}, ({value}).to(tl.uint64))")
-    if device_function["pointer_call_frame"]:
-        if "pyntt_shared_base" not in call_arguments:
+        if parameter["is_pointer"]:
+            address = (
+                f"(pyntt_call_frame_base + {parameter['offset']}).to("
+                f"tl.pointer_type(tl.uint64, {DEVICE_CALL_FRAME_ADDRESS_SPACE}))"
+            )
+            lines.append(f"tl.store({address}, ({value}).to(tl.uint64))")
+        else:
+            address = (
+                f"(pyntt_call_frame_base + {parameter['offset']}).to("
+                f"tl.pointer_type({parameter['triton_dtype']}, "
+                f"{DEVICE_CALL_FRAME_ADDRESS_SPACE}))"
+            )
+            lines.append(f"tl.store({address}, {value})")
+    if device_function["call_frame"]:
+        if "pyntt_call_frame_base" not in device_function["hidden_parameters"]:
             raise RuntimeError(
                 f"PyNTT call to {device_function['name']} requires a shared call frame."
             )
@@ -364,7 +745,6 @@ def _build_device_function_call(
 def _replace_device_function_calls(
     source: str,
     device_functions: dict[str, dict[str, Any]],
-    call_arguments: tuple[str, ...] = (),
 ) -> str:
     def replace(match: re.Match[str]) -> str:
         name = match.group("name")
@@ -373,7 +753,7 @@ def _replace_device_function_calls(
         indent = match.group("indent")
         extra_arguments = _split_expression_arguments(match.group("args"))
         call_source = _build_device_function_call(
-            device_functions[name], call_arguments, extra_arguments
+            device_functions[name], extra_arguments
         )
 
         return "\n".join(
@@ -384,22 +764,31 @@ def _replace_device_function_calls(
     return DEVICE_CALL_RE.sub(replace, source)
 
 
-def _replace_pointer_call_frame_references(
+def _replace_device_call_frame_references(
     source: str, device_function: dict[str, Any]
 ) -> str:
     for parameter in sorted(
-        device_function["pointer_call_frame"],
+        tuple(device_function["call_frame"])
+        + tuple(device_function["context_frame"]),
         key=lambda item: len(item["name"]),
         reverse=True,
     ):
-        address = (
-            f"(pyntt_shared_base + {parameter['offset']}).to("
-            f"tl.pointer_type(tl.uint64, {POINTER_CALL_FRAME_ADDRESS_SPACE}))"
-        )
-        value = (
-            f"tl.load({address}).to(tl.pointer_type("
-            f"{parameter['triton_dtype']}))"
-        )
+        if parameter["is_pointer"]:
+            address = (
+                f"(pyntt_call_frame_base + {parameter['offset']}).to("
+                f"tl.pointer_type(tl.uint64, {DEVICE_CALL_FRAME_ADDRESS_SPACE}))"
+            )
+            value = (
+                f"tl.load({address}).to(tl.pointer_type("
+                f"{parameter['triton_dtype']}))"
+            )
+        else:
+            address = (
+                f"(pyntt_call_frame_base + {parameter['offset']}).to("
+                f"tl.pointer_type({parameter['triton_dtype']}, "
+                f"{DEVICE_CALL_FRAME_ADDRESS_SPACE}))"
+            )
+            value = f"tl.load({address})"
         source = re.sub(rf"\b{re.escape(parameter['name'])}\b", value, source)
     return source
 
@@ -412,17 +801,75 @@ def _with_shard_index_prelude(source: str) -> str:
     return f"{prelude}\n{source}"
 
 
-def _with_shared_memory_prelude(source: str, size_bytes: int) -> str:
-    if size_bytes == 0:
+def _with_shared_memory_prelude(
+    source: str,
+    shared_size_bytes: int,
+    call_frame_size_bytes: int,
+    context_frame: tuple[dict[str, Any], ...],
+) -> str:
+    if shared_size_bytes == 0 and call_frame_size_bytes == 0:
         return source
-    allocation_bytes = 1 << (size_bytes - 1).bit_length()
-    prelude = (
-        f"pyntt_shared_storage = tle.gpu.alloc([{allocation_bytes}], dtype=tl.uint8, "
-        "layout=None, scope=tle.gpu.smem, nv_mma_shared_layout=False)\n"
-        "pyntt_shared_base = tle.gpu.local_ptr(pyntt_shared_storage, (0,))"
-    )
+    lines = []
+    if shared_size_bytes > 0:
+        lines.extend(
+            (
+                f"pyntt_shared_storage = tle.gpu.alloc([{shared_size_bytes}], dtype=tl.uint8, "
+                "layout=None, scope=tle.gpu.smem, nv_mma_shared_layout=False)",
+                "pyntt_shared_base = tle.gpu.local_ptr(pyntt_shared_storage, (0,))",
+            )
+        )
+    if call_frame_size_bytes > 0:
+        lines.extend(
+            (
+                f"pyntt_call_frame_storage = tle.gpu.alloc([{call_frame_size_bytes}], dtype=tl.uint8, "
+                "layout=None, scope=tle.gpu.smem, nv_mma_shared_layout=False)",
+                "pyntt_call_frame_base = tle.gpu.local_ptr(pyntt_call_frame_storage, (0,))",
+            )
+        )
+    for parameter in context_frame:
+        if parameter["is_pointer"]:
+            address = (
+                f"(pyntt_call_frame_base + {parameter['offset']}).to("
+                f"tl.pointer_type(tl.uint64, {DEVICE_CALL_FRAME_ADDRESS_SPACE}))"
+            )
+            lines.append(
+                f"tl.store({address}, ({parameter['name']}).to(tl.uint64))"
+            )
+        else:
+            address = (
+                f"(pyntt_call_frame_base + {parameter['offset']}).to("
+                f"tl.pointer_type({parameter['triton_dtype']}, "
+                f"{DEVICE_CALL_FRAME_ADDRESS_SPACE}))"
+            )
+            lines.append(f"tl.store({address}, {parameter['name']})")
+    if context_frame:
+        lines.append("tl.debug_barrier()")
+    prelude = "\n".join(lines)
     source = source.rstrip()
     return prelude if not source else f"{prelude}\n{source}"
+
+
+def _round_memory_arena_size(
+    requested_bytes: int, policy: str, granularity_bytes: int
+) -> int:
+    if requested_bytes < 0:
+        raise ValueError(
+            f"Shared-memory allocation size must not be negative, got {requested_bytes}."
+        )
+    if requested_bytes == 0:
+        return 0
+    if granularity_bytes <= 0 or granularity_bytes & (granularity_bytes - 1):
+        raise ValueError(
+            "Shared-memory allocation granularity must be a positive power of two, "
+            f"got {granularity_bytes}."
+        )
+    if policy == "granularity_aligned":
+        return (
+            (requested_bytes + granularity_bytes - 1) // granularity_bytes
+        ) * granularity_bytes
+    if policy == "power_of_two":
+        return 1 << (max(requested_bytes, granularity_bytes) - 1).bit_length()
+    raise ValueError(f"Unsupported shared-memory allocation size policy: {policy!r}.")
 
 
 def emit(template_name: str, model: dict[str, Any]) -> str:
@@ -636,6 +1083,44 @@ def _ptr(model: dict[str, Any], name: str) -> str:
     return str(value)
 
 
+def _load_operand(
+    model: dict[str, Any],
+    name: str,
+    local_name: str,
+    offsets: str,
+    mask: str,
+    *,
+    other: str = "0.0",
+    suffix: str = "",
+) -> str:
+    return f"tl.load({local_name} + {offsets}, mask={mask}, other={other}{suffix})"
+
+
+def _load_operand_nd(
+    model: dict[str, Any],
+    name: str,
+    local_name: str,
+    offsets: str,
+    mask: str,
+    shape: tuple[int, ...],
+    *,
+    other: str = "0.0",
+    suffix: str = "",
+) -> str:
+    return f"tl.load({local_name} + {offsets}, mask={mask}, other={other}{suffix})"
+
+
+def _append_store(
+    lines: list[str],
+    level: int,
+    local_name: str,
+    offsets: str,
+    value: str,
+    mask: str,
+) -> None:
+    _line(lines, level, f"tl.store({local_name} + {offsets}, {value}, mask={mask})")
+
+
 def _pointer_shard_coord_hierarchy(pointer: Any) -> tuple[int, ...] | None:
     if not isinstance(pointer, dict):
         return None
@@ -842,7 +1327,11 @@ def _helper_header(
 def _standard_header(model: dict[str, Any], comment: str, pointers: list[tuple[str, str]]) -> list[str]:
     lines = _helper_header(model, comment=comment)
     _line(lines, 1, "shard_index = tl.program_id(0).to(tl.int64)")
-    _append_pointer_shard_coords(lines, 1, [model[model_name] for _, model_name in pointers])
+    _append_pointer_shard_coords(
+        lines,
+        1,
+        [model[model_name] for _, model_name in pointers],
+    )
     for local_name, model_name in pointers:
         _line(lines, 1, f"{local_name} = {_ptr(model, model_name)}")
     return lines
@@ -893,18 +1382,26 @@ def _emit_elementwise_unary(model: dict[str, Any]) -> str:
         f"# generated from PyNTT Jinja ElementwiseUnary.py.jinja\n# {model['Comment']}; op={model['Op']}, input_dtype={model['InputDType']}, output_dtype={model['OutputDType']}, shape={_shape_tuple(shape)}",
         [("input0", "Input"), ("output", "Output")],
     )
+    indent = 2
     _line(lines, 1, f"for linear_start in tl.range(0, {total}, block_size):")
-    _line(lines, 2, "linear = linear_start + tl.arange(0, block_size)")
-    _line(lines, 2, f"mask = linear < {total}")
-    _line(lines, 2, f"lane_flat = linear % {model['OutputVectorLaneCount']}")
-    _line(lines, 2, f"output_tensor_linear = linear // {model['OutputVectorLaneCount']}")
-    _append_tensor_index_decompose(lines, 2, "output_tensor_linear", "idx", model["OutputShape"])
-    _line(lines, 2, f"input_offsets = {input_offset()}")
-    _line(lines, 2, f"output_offsets = {output_offset()}")
-    _line(lines, 2, "value0 = tl.load(input0 + input_offsets, mask=mask)")
-    _line(lines, 2, "value0_f32 = value0.to(tl.float32)")
-    _line(lines, 2, f"result = {model['UnaryExpression']}")
-    _line(lines, 2, f"tl.store(output + output_offsets, {_store_value('result', model['OutputDType'])}, mask=mask)")
+    _line(lines, indent, "linear = linear_start + tl.arange(0, block_size)")
+    _line(lines, indent, f"mask = linear < {total}")
+    _line(lines, indent, f"lane_flat = linear % {model['OutputVectorLaneCount']}")
+    _line(lines, indent, f"output_tensor_linear = linear // {model['OutputVectorLaneCount']}")
+    _append_tensor_index_decompose(lines, indent, "output_tensor_linear", "idx", model["OutputShape"])
+    _line(lines, indent, f"input_offsets = {input_offset()}")
+    _line(lines, indent, f"output_offsets = {output_offset()}")
+    _line(lines, indent, f"value0 = {_load_operand(model, 'Input', 'input0', 'input_offsets', 'mask')}")
+    _line(lines, indent, "value0_f32 = value0.to(tl.float32)")
+    _line(lines, indent, f"result = {model['UnaryExpression']}")
+    _append_store(
+        lines,
+        indent,
+        "output",
+        "output_offsets",
+        _store_value("result", model["OutputDType"]),
+        "mask",
+    )
     return _finish(lines)
 
 
@@ -936,19 +1433,27 @@ def _emit_elementwise_binary(model: dict[str, Any]) -> str:
         f"# generated from PyNTT Jinja ElementwiseBinary.py.jinja\n# {model['Comment']}; op={model['Op']}, lhs_dtype={model['LhsDType']}, rhs_dtype={model['RhsDType']}, output_dtype={model['OutputDType']}, shape={_shape_tuple(model['Shape'])}",
         [("lhs", "Lhs"), ("rhs", "Rhs"), ("output", "Output")],
     )
+    indent = 2
     _line(lines, 1, f"for linear_start in tl.range(0, {total}, block_size):")
-    _line(lines, 2, "linear = linear_start + tl.arange(0, block_size)")
-    _line(lines, 2, f"mask = linear < {total}")
-    _line(lines, 2, f"lane_flat = linear % {model['OutputVectorLaneCount']}")
-    _line(lines, 2, f"output_tensor_linear = linear // {model['OutputVectorLaneCount']}")
-    _append_tensor_index_decompose(lines, 2, "output_tensor_linear", "idx", model["OutputShape"])
-    _line(lines, 2, f"lhs_offsets = {offset(model['LhsShape'], model['LhsStrides'], model['LhsVectorLaneCount'])}")
-    _line(lines, 2, f"rhs_offsets = {offset(model['RhsShape'], model['RhsStrides'], model['RhsVectorLaneCount'])}")
-    _line(lines, 2, f"output_offsets = {output_offset()}")
-    _line(lines, 2, "value0 = tl.load(lhs + lhs_offsets, mask=mask)")
-    _line(lines, 2, "value1 = tl.load(rhs + rhs_offsets, mask=mask)")
-    _line(lines, 2, f"result = {model['BinaryExpression']}")
-    _line(lines, 2, f"tl.store(output + output_offsets, {_store_value('result', model['OutputDType'])}, mask=mask)")
+    _line(lines, indent, "linear = linear_start + tl.arange(0, block_size)")
+    _line(lines, indent, f"mask = linear < {total}")
+    _line(lines, indent, f"lane_flat = linear % {model['OutputVectorLaneCount']}")
+    _line(lines, indent, f"output_tensor_linear = linear // {model['OutputVectorLaneCount']}")
+    _append_tensor_index_decompose(lines, indent, "output_tensor_linear", "idx", model["OutputShape"])
+    _line(lines, indent, f"lhs_offsets = {offset(model['LhsShape'], model['LhsStrides'], model['LhsVectorLaneCount'])}")
+    _line(lines, indent, f"rhs_offsets = {offset(model['RhsShape'], model['RhsStrides'], model['RhsVectorLaneCount'])}")
+    _line(lines, indent, f"output_offsets = {output_offset()}")
+    _line(lines, indent, f"value0 = {_load_operand(model, 'Lhs', 'lhs', 'lhs_offsets', 'mask')}")
+    _line(lines, indent, f"value1 = {_load_operand(model, 'Rhs', 'rhs', 'rhs_offsets', 'mask')}")
+    _line(lines, indent, f"result = {model['BinaryExpression']}")
+    _append_store(
+        lines,
+        indent,
+        "output",
+        "output_offsets",
+        _store_value("result", model["OutputDType"]),
+        "mask",
+    )
     return _finish(lines)
 
 
@@ -973,15 +1478,23 @@ def _emit_elementwise_cast(model: dict[str, Any]) -> str:
         f"# generated from PyNTT Jinja ElementwiseCast.py.jinja\n# {model['Comment']}; cast_mode={model['CastMode']}, input_dtype={model['InputDType']}, output_dtype={model['OutputDType']}, shape={_shape_tuple(model['Shape'])}",
         [("input0", "Input"), ("output", "Output")],
     )
+    indent = 2
     _line(lines, 1, f"for linear_start in tl.range(0, {total}, block_size):")
-    _line(lines, 2, "linear = linear_start + tl.arange(0, block_size)")
-    _line(lines, 2, f"mask = linear < {total}")
-    _append_tensor_index_decompose(lines, 2, "linear", "idx", model["Shape"])
-    _line(lines, 2, f"input_offsets = {tensor_offset('idx', model['InputStrides'], model['InputVectorLaneCount'])}")
-    _line(lines, 2, f"output_offsets = {tensor_offset('idx', model['OutputStrides'], model['OutputVectorLaneCount'])}")
-    _line(lines, 2, "value0 = tl.load(input0 + input_offsets, mask=mask)")
-    _line(lines, 2, f"result = {model['CastExpression']}")
-    _line(lines, 2, f"tl.store(output + output_offsets, {_store_value('result', model['OutputDType'])}, mask=mask)")
+    _line(lines, indent, "linear = linear_start + tl.arange(0, block_size)")
+    _line(lines, indent, f"mask = linear < {total}")
+    _append_tensor_index_decompose(lines, indent, "linear", "idx", model["Shape"])
+    _line(lines, indent, f"input_offsets = {tensor_offset('idx', model['InputStrides'], model['InputVectorLaneCount'])}")
+    _line(lines, indent, f"output_offsets = {tensor_offset('idx', model['OutputStrides'], model['OutputVectorLaneCount'])}")
+    _line(lines, indent, f"value0 = {_load_operand(model, 'Input', 'input0', 'input_offsets', 'mask')}")
+    _line(lines, indent, f"result = {model['CastExpression']}")
+    _append_store(
+        lines,
+        indent,
+        "output",
+        "output_offsets",
+        _store_value("result", model["OutputDType"]),
+        "mask",
+    )
     return _finish(lines)
 
 
@@ -1007,16 +1520,24 @@ def _emit_memcopy(model: dict[str, Any]) -> str:
         f"# generated from PyNTT Jinja Memcopy.py.jinja\n# {model['Comment']}; dtype={model['DType']}, shape={_shape_tuple(model['Shape'])}",
         [("source", "Source"), ("destination", "Destination")],
     )
+    indent = 2
     _line(lines, 1, f"for linear_start in tl.range(0, {total}, block_size):")
-    _line(lines, 2, "linear = linear_start + tl.arange(0, block_size)")
-    _line(lines, 2, f"mask = linear < {total}")
-    _line(lines, 2, f"lane_flat = linear % {model['VectorLaneCount']}")
-    _line(lines, 2, f"tensor_linear = linear // {model['VectorLaneCount']}")
-    _append_tensor_index_decompose(lines, 2, "tensor_linear", "idx", model["Shape"])
-    _line(lines, 2, f"source_offsets = {tensor_offset('idx', model['SourceStrides'], 'lane_flat')}")
-    _line(lines, 2, f"destination_offsets = {tensor_offset('idx', model['DestinationStrides'], 'lane_flat')}")
-    _line(lines, 2, "value = tl.load(source + source_offsets, mask=mask)")
-    _line(lines, 2, "tl.store(destination + destination_offsets, value, mask=mask)")
+    _line(lines, indent, "linear = linear_start + tl.arange(0, block_size)")
+    _line(lines, indent, f"mask = linear < {total}")
+    _line(lines, indent, f"lane_flat = linear % {model['VectorLaneCount']}")
+    _line(lines, indent, f"tensor_linear = linear // {model['VectorLaneCount']}")
+    _append_tensor_index_decompose(lines, indent, "tensor_linear", "idx", model["Shape"])
+    _line(lines, indent, f"source_offsets = {tensor_offset('idx', model['SourceStrides'], 'lane_flat')}")
+    _line(lines, indent, f"destination_offsets = {tensor_offset('idx', model['DestinationStrides'], 'lane_flat')}")
+    _line(lines, indent, f"value = {_load_operand(model, 'Source', 'source', 'source_offsets', 'mask')}")
+    _append_store(
+        lines,
+        indent,
+        "destination",
+        "destination_offsets",
+        "value",
+        "mask",
+    )
     return _finish(lines)
 
 
@@ -1080,7 +1601,8 @@ def _emit_tensor_copy(model: dict[str, Any], *, is_load: bool) -> str:
     local_shape = model["LocalShape"]
     global_shape = model["GlobalShape"]
     local_strides = model["DestinationStrides" if is_load else "SourceStrides"]
-    global_strides = _contiguous_strides(global_shape)
+    explicit_global_strides = model.get("SourceStrides" if is_load else "DestinationStrides")
+    global_strides = explicit_global_strides or _contiguous_strides(global_shape)
     block_axis = _select_block_axis(local_shape, local_strides)
     block_extent = _one() if not local_shape else local_shape[block_axis]
     loop_axes = [axis for axis in range(len(local_shape)) if axis != block_axis]
@@ -1093,14 +1615,14 @@ def _emit_tensor_copy(model: dict[str, Any], *, is_load: bool) -> str:
 
     def local_offset(strides: list[Any]) -> str:
         terms = [f"{axis_index(axis)} * {_dim(strides[axis])}" for axis in range(len(local_shape))]
-        return "lane * 0" if not terms else "lane * 0 + " + " + ".join(terms)
+        return "0" if not terms else " + ".join(terms)
 
     def global_offset() -> str:
         terms = [
             f"global_idx{axis} * {_dim(global_strides[axis])}"
             for axis in range(len(global_shape))
         ]
-        return "lane * 0" if not terms else "lane * 0 + " + " + ".join(terms)
+        return "0" if not terms else " + ".join(terms)
 
     vector_lane_count = int(model.get("VectorLaneCount", 1))
 
@@ -1121,7 +1643,11 @@ def _emit_tensor_copy(model: dict[str, Any], *, is_load: bool) -> str:
         pointer_models = [model["Destination"]]
         if internal_source is not None:
             pointer_models.append(internal_source)
-        _append_pointer_shard_coords(lines, 1, pointer_models)
+        _append_pointer_shard_coords(
+            lines,
+            1,
+            pointer_models,
+        )
         if internal_source is not None:
             _line(lines, 1, f"source = {_ptr(model, 'Source')}")
         _line(lines, 1, f"destination = {_ptr(model, 'Destination')}")
@@ -1137,7 +1663,11 @@ def _emit_tensor_copy(model: dict[str, Any], *, is_load: bool) -> str:
         pointer_models = [model["Source"]]
         if internal_destination is not None:
             pointer_models.append(internal_destination)
-        _append_pointer_shard_coords(lines, 1, pointer_models)
+        _append_pointer_shard_coords(
+            lines,
+            1,
+            pointer_models,
+        )
         _line(lines, 1, f"source = {_ptr(model, 'Source')}")
         if internal_destination is not None:
             _line(lines, 1, f"destination = {_ptr(model, 'Destination')}")
@@ -1154,14 +1684,8 @@ def _emit_tensor_copy(model: dict[str, Any], *, is_load: bool) -> str:
     _line(lines, indent + 1, "lane = axis_start + tl.arange(0, block_size)")
     _line(lines, indent + 1, f"mask = lane < {_dim(block_extent)}")
     for axis in range(len(global_shape)):
-        split_axes = model["SplitAxes"][axis]
-        if not split_axes:
-            _line(lines, indent + 1, f"global_idx{axis} = {axis_index(axis)}")
-        else:
-            _line(lines, indent + 1, f"local_dim{axis} = {_dim(local_shape[axis])}")
-            _line(lines, indent + 1, f"split_linear{axis} = {split_linear(split_axes)}")
-            _line(lines, indent + 1, f"global_idx{axis} = {axis_index(axis)} + split_linear{axis} * local_dim{axis}")
-            _line(lines, indent + 1, f"mask = mask & (global_idx{axis} < {_dim(global_shape[axis])})")
+        _line(lines, indent + 1, f"global_idx{axis} = {axis_index(axis)} + {_dim(model['GlobalOffsets'][axis])}")
+        _line(lines, indent + 1, f"mask = mask & (global_idx{axis} < {_dim(global_shape[axis])})")
     copy_indent = indent + 1
     if vector_lane_count != 1:
         _line(lines, copy_indent, f"for vector_lane in tl.range(0, {vector_lane_count}):")
@@ -1170,13 +1694,13 @@ def _emit_tensor_copy(model: dict[str, Any], *, is_load: bool) -> str:
         source_pool_offset = "0" if internal_source is not None else "source_pool_stride_elements * shard_index"
         _line(lines, copy_indent, f"source_offsets = {source_pool_offset} + {model['SourceOffset']} + {scalar_offset(global_offset())}")
         _line(lines, copy_indent, f"destination_offsets = {scalar_offset(local_offset(local_strides))}")
-        _line(lines, copy_indent, "value = tl.load(source + source_offsets, mask=mask)")
+        _line(lines, copy_indent, f"value = {_load_operand(model, 'Source', 'source', 'source_offsets', 'mask')}")
         _line(lines, copy_indent, "tl.store(destination + destination_offsets, value, mask=mask)")
     else:
         _line(lines, copy_indent, f"source_offsets = {scalar_offset(local_offset(local_strides))}")
         destination_pool_offset = "0" if internal_destination is not None else "destination_pool_stride_elements * shard_index"
         _line(lines, copy_indent, f"destination_offsets = {destination_pool_offset} + {model['DestinationOffset']} + {scalar_offset(global_offset())}")
-        _line(lines, copy_indent, "value = tl.load(source + source_offsets, mask=mask)")
+        _line(lines, copy_indent, f"value = {_load_operand(model, 'Source', 'source', 'source_offsets', 'mask')}")
         _line(lines, copy_indent, "tl.store(destination + destination_offsets, value, mask=mask)")
     return _finish(lines)
 
@@ -1283,19 +1807,20 @@ def _emit_transpose(model: dict[str, Any]) -> str:
         f"# generated from PyNTT Jinja Transpose.py.jinja\n# {model['Comment']}; input_dtype={model['InputDType']}, output_dtype={model['OutputDType']}, input_shape={_shape_tuple(model['InputShape'])}, output_shape={_shape_tuple(model['OutputShape'])}, perm={tuple(model['Perm'])}",
         [("input", "Input"), ("output", "Output")],
     )
+    indent = 2
     _line(lines, 1, f"for linear_start in tl.range(0, {total}, block_size):")
-    _line(lines, 2, "linear = linear_start + tl.arange(0, block_size)")
-    _line(lines, 2, f"mask = linear < {total}")
-    _line(lines, 2, f"lane_flat = linear % {model['OutputVectorLaneCount']}")
-    _line(lines, 2, f"output_tensor_linear = linear // {model['OutputVectorLaneCount']}")
-    _append_tensor_index_decompose(lines, 2, "output_tensor_linear", "out_idx", model["OutputShape"])
+    _line(lines, indent, "linear = linear_start + tl.arange(0, block_size)")
+    _line(lines, indent, f"mask = linear < {total}")
+    _line(lines, indent, f"lane_flat = linear % {model['OutputVectorLaneCount']}")
+    _line(lines, indent, f"output_tensor_linear = linear // {model['OutputVectorLaneCount']}")
+    _append_tensor_index_decompose(lines, indent, "output_tensor_linear", "out_idx", model["OutputShape"])
     for input_axis in range(len(model["InputShape"])):
         output_axis = model["Perm"].index(input_axis)
-        _line(lines, 2, f"in_idx{input_axis} = out_idx{output_axis}")
-    _line(lines, 2, f"input_offsets = {tensor_offset('in_idx', model['InputStrides'], model['InputVectorLaneCount'], 'lane_flat')}")
-    _line(lines, 2, f"output_offsets = {tensor_offset('out_idx', model['OutputStrides'], model['OutputVectorLaneCount'], 'lane_flat')}")
-    _line(lines, 2, "value = tl.load(input + input_offsets, mask=mask)")
-    _line(lines, 2, "tl.store(output + output_offsets, value, mask=mask)")
+        _line(lines, indent, f"in_idx{input_axis} = out_idx{output_axis}")
+    _line(lines, indent, f"input_offsets = {tensor_offset('in_idx', model['InputStrides'], model['InputVectorLaneCount'], 'lane_flat')}")
+    _line(lines, indent, f"output_offsets = {tensor_offset('out_idx', model['OutputStrides'], model['OutputVectorLaneCount'], 'lane_flat')}")
+    _line(lines, indent, f"value = {_load_operand(model, 'Input', 'input', 'input_offsets', 'mask')}")
+    _append_store(lines, indent, "output", "output_offsets", "value", "mask")
     return _finish(lines)
 
 
@@ -1411,51 +1936,52 @@ def _emit_vector_layout(model: dict[str, Any]) -> str:
         f"# generated from PyNTT Jinja VectorLayout.py.jinja\n# {model['Comment']}; op={op}, input_dtype={model['InputDType']}, output_dtype={model['OutputDType']}, input_shape={_shape_tuple(model['InputShape'])}, output_shape={_shape_tuple(model['OutputShape'])}",
         [("input_ptr", "Input"), ("output_ptr", "Output")],
     )
+    value_indent = 2
     _line(lines, 1, f"for linear_start in tl.range(0, {total}, block_size):")
-    _line(lines, 2, "linear = linear_start + tl.arange(0, block_size)")
-    _line(lines, 2, f"mask = linear < {total}")
-    _line(lines, 2, f"lane_flat = linear % {domain_lane_count}")
-    _line(lines, 2, f"tensor_linear = linear // {domain_lane_count}")
+    _line(lines, value_indent, "linear = linear_start + tl.arange(0, block_size)")
+    _line(lines, value_indent, f"mask = linear < {total}")
+    _line(lines, value_indent, f"lane_flat = linear % {domain_lane_count}")
+    _line(lines, value_indent, f"tensor_linear = linear // {domain_lane_count}")
     if model["IsPack"]:
-        _append_tensor_index_decompose(lines, 2, "tensor_linear", "out_idx", model["OutputShape"])
+        _append_tensor_index_decompose(lines, value_indent, "tensor_linear", "out_idx", model["OutputShape"])
         input_lane_flat = "lane_flat * 0" if input_lane_count == 1 else f"lane_flat % {input_lane_count}"
         pack_lane_group = "lane_flat" if input_lane_count == 1 else f"lane_flat // {input_lane_count}"
-        _line(lines, 2, f"input_lane_flat = {input_lane_flat}")
-        _line(lines, 2, f"new_lane_group = {pack_lane_group}")
-        _line(lines, 2, "valid = mask")
+        _line(lines, value_indent, f"input_lane_flat = {input_lane_flat}")
+        _line(lines, value_indent, f"new_lane_group = {pack_lane_group}")
+        _line(lines, value_indent, "valid = mask")
         for axis in range(len(model["InputShape"])):
             packed_axes = axis_lane_indices(axis)
             if packed_axes:
                 lane_product = axis_lane_product(packed_axes)
-                lane_offset = axis_lane_offset(lines, 2, "new_lane_group", packed_axes)
-                _line(lines, 2, f"in_idx{axis} = out_idx{axis} * {lane_product} + {lane_offset}")
-                _line(lines, 2, f"valid = valid & (in_idx{axis} < {_dim(model['InputShape'][axis])})")
+                lane_offset = axis_lane_offset(lines, value_indent, "new_lane_group", packed_axes)
+                _line(lines, value_indent, f"in_idx{axis} = out_idx{axis} * {lane_product} + {lane_offset}")
+                _line(lines, value_indent, f"valid = valid & (in_idx{axis} < {_dim(model['InputShape'][axis])})")
             else:
-                _line(lines, 2, f"in_idx{axis} = out_idx{axis}")
-        _line(lines, 2, f"input_offsets = {tensor_offset('in_idx', model['InputStrides'], input_lane_count, 'input_lane_flat')}")
-        _line(lines, 2, f"output_offsets = {tensor_offset('out_idx', model['OutputStrides'], output_lane_count, 'lane_flat')}")
-        _line(lines, 2, "value = tl.load(input_ptr + input_offsets, mask=valid, other=0)")
-        _line(lines, 2, "tl.store(output_ptr + output_offsets, value, mask=mask)")
+                _line(lines, value_indent, f"in_idx{axis} = out_idx{axis}")
+        _line(lines, value_indent, f"input_offsets = {tensor_offset('in_idx', model['InputStrides'], input_lane_count, 'input_lane_flat')}")
+        _line(lines, value_indent, f"output_offsets = {tensor_offset('out_idx', model['OutputStrides'], output_lane_count, 'lane_flat')}")
+        _line(lines, value_indent, f"value = {_load_operand(model, 'Input', 'input_ptr', 'input_offsets', 'valid', other='0')}")
+        _append_store(lines, value_indent, "output_ptr", "output_offsets", "value", "mask")
     else:
-        _append_tensor_index_decompose(lines, 2, "tensor_linear", "in_idx", model["InputShape"])
+        _append_tensor_index_decompose(lines, value_indent, "tensor_linear", "in_idx", model["InputShape"])
         output_lane_flat = "lane_flat * 0" if output_lane_count == 1 else f"lane_flat % {output_lane_count}"
         unpack_lane_group = "lane_flat" if output_lane_count == 1 else f"lane_flat // {output_lane_count}"
-        _line(lines, 2, f"output_lane_flat = {output_lane_flat}")
-        _line(lines, 2, f"new_lane_group = {unpack_lane_group}")
-        _line(lines, 2, "valid = mask")
+        _line(lines, value_indent, f"output_lane_flat = {output_lane_flat}")
+        _line(lines, value_indent, f"new_lane_group = {unpack_lane_group}")
+        _line(lines, value_indent, "valid = mask")
         for axis in range(len(model["OutputShape"])):
             unpacked_axes = axis_lane_indices(axis)
             if unpacked_axes:
                 lane_product = axis_lane_product(unpacked_axes)
-                lane_offset = axis_lane_offset(lines, 2, "new_lane_group", unpacked_axes)
-                _line(lines, 2, f"out_idx{axis} = in_idx{axis} * {lane_product} + {lane_offset}")
-                _line(lines, 2, f"valid = valid & (out_idx{axis} < {_dim(model['OutputShape'][axis])})")
+                lane_offset = axis_lane_offset(lines, value_indent, "new_lane_group", unpacked_axes)
+                _line(lines, value_indent, f"out_idx{axis} = in_idx{axis} * {lane_product} + {lane_offset}")
+                _line(lines, value_indent, f"valid = valid & (out_idx{axis} < {_dim(model['OutputShape'][axis])})")
             else:
-                _line(lines, 2, f"out_idx{axis} = in_idx{axis}")
-        _line(lines, 2, f"input_offsets = {tensor_offset('in_idx', model['InputStrides'], input_lane_count, 'lane_flat')}")
-        _line(lines, 2, f"output_offsets = {tensor_offset('out_idx', model['OutputStrides'], output_lane_count, 'output_lane_flat')}")
-        _line(lines, 2, "value = tl.load(input_ptr + input_offsets, mask=valid, other=0)")
-        _line(lines, 2, "tl.store(output_ptr + output_offsets, value, mask=valid)")
+                _line(lines, value_indent, f"out_idx{axis} = in_idx{axis}")
+        _line(lines, value_indent, f"input_offsets = {tensor_offset('in_idx', model['InputStrides'], input_lane_count, 'lane_flat')}")
+        _line(lines, value_indent, f"output_offsets = {tensor_offset('out_idx', model['OutputStrides'], output_lane_count, 'output_lane_flat')}")
+        _line(lines, value_indent, f"value = {_load_operand(model, 'Input', 'input_ptr', 'input_offsets', 'valid', other='0')}")
+        _append_store(lines, value_indent, "output_ptr", "output_offsets", "value", "valid")
     return _finish(lines)
 
 
@@ -1498,6 +2024,16 @@ def _emit_gemv(model: dict[str, Any]) -> str:
 
 
 def _emit_qkv_parallel_linear(model: dict[str, Any]) -> str:
+    reduction_phase = str(model.get("ReductionPhase", "complete")).lower()
+    if reduction_phase == "accumulate":
+        return _emit_qkv_reduction_accumulate(model, packed=False)
+    if reduction_phase == "finalize":
+        return _emit_qkv_reduction_finalize(model, packed=False)
+    if reduction_phase != "complete":
+        raise ValueError(
+            f"Unsupported QKVParallelLinear reduction phase: {reduction_phase!r}."
+        )
+
     m = model["QOutputShape"][-2]
     k = model["InputShape"][-1]
     output_batch_rank = len(model["QOutputShape"]) - 2
@@ -1549,6 +2085,16 @@ def _emit_qkv_parallel_linear(model: dict[str, Any]) -> str:
 
 
 def _emit_packed_qkv_parallel_linear(model: dict[str, Any]) -> str:
+    reduction_phase = str(model.get("ReductionPhase", "complete")).lower()
+    if reduction_phase == "accumulate":
+        return _emit_qkv_reduction_accumulate(model, packed=True)
+    if reduction_phase == "finalize":
+        return _emit_qkv_reduction_finalize(model, packed=True)
+    if reduction_phase != "complete":
+        raise ValueError(
+            f"Unsupported PackedQKVParallelLinear reduction phase: {reduction_phase!r}."
+        )
+
     q_logical_output_shape = _packed_qkv_logical_output_shape(model, "Q")
     m = q_logical_output_shape[-2]
     k = model["InputShape"][-1]
@@ -1606,6 +2152,251 @@ def _emit_packed_qkv_parallel_linear(model: dict[str, Any]) -> str:
         _line(lines, indent + 1, f"offs_m = m_start + tl.arange(0, {block_m})")
         for prefix in ("Q", "K", "V"):
             _emit_packed_qkv_matmul_projection(lines, indent + 1, model, prefix, input_batch_offset, block_m, block_n, block_k)
+    return _finish(lines)
+
+
+def _qkv_reduction_logical_output_shape(
+    model: dict[str, Any], prefix: str, *, packed: bool
+) -> list[Any]:
+    shape = [
+        dict(dim) if isinstance(dim, dict) else dim
+        for dim in model[f"{prefix}OutputShape"]
+    ]
+    if packed:
+        shape[-1] = _multiply_dim(
+            shape[-1], model["NPackedLaneCount"] * model["NVectorLaneCount"]
+        )
+    return shape
+
+
+def _emit_qkv_reduction_accumulate(
+    model: dict[str, Any], *, packed: bool
+) -> str:
+    template_name = (
+        "PackedQKVParallelLinear.py.jinja"
+        if packed
+        else "QKVParallelLinear.py.jinja"
+    )
+    output_shapes = {
+        prefix: _qkv_reduction_logical_output_shape(model, prefix, packed=packed)
+        for prefix in ("Q", "K", "V")
+    }
+    if any(len(shape) != 2 for shape in output_shapes.values()):
+        raise ValueError(
+            "QKVParallelLinear backend-private reduction requires rank-2 local output tiles."
+        )
+
+    block_m = int(model["ReductionBlockM"])
+    block_k = int(model["ReductionBlockK"])
+    block_ns = {
+        prefix: int(model[f"Reduction{prefix}BlockN"])
+        for prefix in ("Q", "K", "V")
+    }
+    lines = _helper_header(
+        model,
+        ("q_acc", "k_acc", "v_acc"),
+        comment=(
+            f"# generated from PyNTT Jinja {template_name} reduction accumulate\n"
+            f"# {model['Comment']}; accumulator=backend-private-fp32"
+        ),
+    )
+    _line(lines, 1, "shard_index = tl.program_id(0).to(tl.int64)")
+    _append_pointer_shard_coords(
+        lines,
+        1,
+        [model["Input"], model["QWeight"], model["KWeight"], model["VWeight"]],
+    )
+    _line(lines, 1, f"input0 = {_ptr(model, 'Input')}")
+    for prefix in ("Q", "K", "V"):
+        _line(lines, 1, f"{prefix.lower()}_weight = {_ptr(model, f'{prefix}Weight')}")
+    _line(lines, 1, f"offs_k = tl.arange(0, {block_k})")
+    k = model["InputShape"][-1]
+    m = output_shapes["Q"][-2]
+
+    if block_m == 1:
+        input_offsets = f"offs_k * {_dim(model['InputStrides'][-1])}"
+        input_mask = (
+            f"(0 < {_dim(m)}) & (0 < {_dim(model['InputShape'][-2])}) & "
+            f"(offs_k < {_dim(k)})"
+        )
+        _line(
+            lines,
+            1,
+            f"input_values = {_load_operand(model, 'Input', 'input0', input_offsets, input_mask)}.to(tl.float32)",
+        )
+    else:
+        _line(lines, 1, f"offs_m = tl.arange(0, {block_m})")
+        input_offsets = (
+            f"(offs_m[:, None] * {_dim(model['InputStrides'][-2])} + "
+            f"offs_k[None, :] * {_dim(model['InputStrides'][-1])})"
+        )
+        input_mask = (
+            f"(offs_m[:, None] < {_dim(m)}) & "
+            f"(offs_m[:, None] < {_dim(model['InputShape'][-2])}) & "
+            f"(offs_k[None, :] < {_dim(k)})"
+        )
+        _line(
+            lines,
+            1,
+            f"input_values = {_load_operand_nd(model, 'Input', 'input0', input_offsets, input_mask, (block_m, block_k))}",
+        )
+
+    dot_precision = (
+        ', input_precision="ieee"'
+        if model["InputDType"] == "float32" and model["WeightDType"] == "float32"
+        else ""
+    )
+    for prefix, acc_name in (("Q", "q_acc"), ("K", "k_acc"), ("V", "v_acc")):
+        block_n = block_ns[prefix]
+        n = output_shapes[prefix][-1]
+        weight_shape = model[f"{prefix}WeightShape"]
+        weight_strides = model[f"{prefix}WeightStrides"]
+        weight_k = weight_shape[-1] if packed else weight_shape[-2]
+        offs_n = f"{prefix.lower()}_offs_n"
+        _line(lines, 1, f"{offs_n} = tl.arange(0, {block_n})")
+        if packed:
+            weight_offsets = _packed_qkv_weight_offsets(
+                model,
+                prefix,
+                "0",
+                f"{offs_n}[:, None]" if block_m == 1 else f"{offs_n}[None, :]",
+                "offs_k[None, :]" if block_m == 1 else "offs_k[:, None]",
+            )
+        elif block_m == 1:
+            weight_offsets = (
+                f"(offs_k[None, :] * {_dim(weight_strides[-2])} + "
+                f"{offs_n}[:, None] * {_dim(weight_strides[-1])})"
+            )
+        else:
+            weight_offsets = (
+                f"(offs_k[:, None] * {_dim(weight_strides[-2])} + "
+                f"{offs_n}[None, :] * {_dim(weight_strides[-1])})"
+            )
+        if block_m == 1:
+            weight_mask = (
+                f"({offs_n}[:, None] < {_dim(n)}) & "
+                f"(offs_k[None, :] < {_dim(k)}) & "
+                f"(offs_k[None, :] < {_dim(weight_k)})"
+            )
+            _line(
+                lines,
+                1,
+                f"{prefix.lower()}_weight_values = tl.load({prefix.lower()}_weight + {weight_offsets}, "
+                f"mask={weight_mask}, other=0.0, eviction_policy=\"evict_first\").to(tl.float32)",
+            )
+            _line(
+                lines,
+                1,
+                f"{acc_name} += tl.sum({prefix.lower()}_weight_values * input_values[None, :], axis=1)",
+            )
+        else:
+            weight_mask = (
+                f"(offs_k[:, None] < {_dim(k)}) & "
+                f"(offs_k[:, None] < {_dim(weight_k)}) & "
+                f"({offs_n}[None, :] < {_dim(n)})"
+            )
+            _line(
+                lines,
+                1,
+                f"{prefix.lower()}_weight_values = tl.load({prefix.lower()}_weight + {weight_offsets}, "
+                f"mask={weight_mask}, other=0.0)",
+            )
+            _line(
+                lines,
+                1,
+                f"{acc_name} += tl.dot(input_values, {prefix.lower()}_weight_values{dot_precision})",
+            )
+    _line(lines, 1, "return q_acc, k_acc, v_acc")
+    return _finish(lines)
+
+
+def _emit_qkv_reduction_finalize(
+    model: dict[str, Any], *, packed: bool
+) -> str:
+    template_name = (
+        "PackedQKVParallelLinear.py.jinja"
+        if packed
+        else "QKVParallelLinear.py.jinja"
+    )
+    output_shapes = {
+        prefix: _qkv_reduction_logical_output_shape(model, prefix, packed=packed)
+        for prefix in ("Q", "K", "V")
+    }
+    block_m = int(model["ReductionBlockM"])
+    block_ns = {
+        prefix: int(model[f"Reduction{prefix}BlockN"])
+        for prefix in ("Q", "K", "V")
+    }
+    lines = _helper_header(
+        model,
+        ("q_acc", "k_acc", "v_acc"),
+        comment=(
+            f"# generated from PyNTT Jinja {template_name} reduction finalize\n"
+            f"# {model['Comment']}; accumulator=backend-private-fp32"
+        ),
+    )
+    _line(lines, 1, "shard_index = tl.program_id(0).to(tl.int64)")
+    pointers = [model[f"{prefix}Output"] for prefix in ("Q", "K", "V")]
+    pointers += [
+        model[f"{prefix}Bias"]
+        for prefix in ("Q", "K", "V")
+        if model[f"Has{prefix}Bias"]
+    ]
+    _append_pointer_shard_coords(lines, 1, pointers)
+    for prefix in ("Q", "K", "V"):
+        _line(lines, 1, f"{prefix.lower()}_output = {_ptr(model, f'{prefix}Output')}")
+        if model[f"Has{prefix}Bias"]:
+            _line(lines, 1, f"{prefix.lower()}_bias = {_ptr(model, f'{prefix}Bias')}")
+    if block_m != 1:
+        _line(lines, 1, f"offs_m = tl.arange(0, {block_m})")
+
+    for prefix, acc_name in (("Q", "q_acc"), ("K", "k_acc"), ("V", "v_acc")):
+        block_n = block_ns[prefix]
+        n = output_shapes[prefix][-1]
+        offs_n = f"{prefix.lower()}_offs_n"
+        _line(lines, 1, f"{offs_n} = tl.arange(0, {block_n})")
+        if model[f"Has{prefix}Bias"]:
+            if packed:
+                bias_offsets = _packed_qkv_bias_offsets(model, prefix, offs_n)
+            else:
+                bias_offsets = f"{offs_n} * {_dim(model[f'{prefix}BiasStrides'][-1])}"
+            suffix = "" if block_m == 1 else "[None, :]"
+            _line(
+                lines,
+                1,
+                f"{acc_name} += tl.load({prefix.lower()}_bias + {bias_offsets}, "
+                f"mask={offs_n} < {_dim(n)}, other=0.0).to(tl.float32){suffix}",
+            )
+        if block_m == 1:
+            if packed:
+                output_offsets = _packed_qkv_output_offsets(
+                    model, prefix, "0", offs_n, "0"
+                )
+            else:
+                output_offsets = (
+                    f"(0 * {_dim(model[f'{prefix}OutputStrides'][-2])} + "
+                    f"{offs_n} * {_dim(model[f'{prefix}OutputStrides'][-1])})"
+                )
+            mask = f"{offs_n} < {_dim(n)}"
+        else:
+            if packed:
+                output_offsets = _packed_qkv_output_offsets(
+                    model, prefix, "0", f"{offs_n}[None, :]", "offs_m[:, None]"
+                )
+            else:
+                output_offsets = (
+                    f"(offs_m[:, None] * {_dim(model[f'{prefix}OutputStrides'][-2])} + "
+                    f"{offs_n}[None, :] * {_dim(model[f'{prefix}OutputStrides'][-1])})"
+                )
+            mask = (
+                f"(offs_m[:, None] < {_dim(output_shapes[prefix][-2])}) & "
+                f"({offs_n}[None, :] < {_dim(n)})"
+            )
+        _line(
+            lines,
+            1,
+            f"tl.store({prefix.lower()}_output + {output_offsets}, {acc_name}, mask={mask})",
+        )
     return _finish(lines)
 
 
@@ -1713,17 +2504,29 @@ def _emit_packed_qkv_gemv_concat_n(
         weight_batch_offset = _batch_offset_expression(weight_shape, weight_strides, len(output_shape) - 2)
         local_n = f"{prefix.lower()}_local_n"
         weight_offsets = _packed_qkv_weight_offsets(model, prefix, weight_batch_offset, f"{local_n}[:, None]", "offs_k[None, :]")
-        _line(lines, indent + 2, f"{prefix.lower()}_weight_ptrs = {prefix.lower()}_weight + {weight_offsets}")
+        weight_mask = f"{prefix.lower()}_active[:, None] & (offs_n[:, None] < {_dim(total_n)}) & (offs_k[None, :] < {_dim(k)})"
+        weight_value = _load_operand_nd(
+            model,
+            f"{prefix}Weight",
+            f"{prefix.lower()}_weight",
+            weight_offsets,
+            weight_mask,
+            (block_n, block_k),
+            suffix=', eviction_policy="evict_first"',
+        )
+        _line(lines, indent + 2, f"{prefix.lower()}_weight_values = {weight_value}.to(tl.float32)")
 
-    _line(lines, indent + 2, "weight_ptrs = tl.where(q_active[:, None], q_weight_ptrs, tl.where(k_active[:, None], k_weight_ptrs, v_weight_ptrs))")
-    _line(lines, indent + 2, f"weight_values = tl.load(weight_ptrs, mask=(offs_n[:, None] < {_dim(total_n)}) & (offs_k[None, :] < {_dim(k)}), other=0.0, eviction_policy=\"evict_first\").to(tl.float32)")
-    _line(lines, indent + 2, f"input_values = tl.load(input0 + {input_offsets}, mask=offs_k < {_dim(k)}, other=0.0).to(tl.float32)")
+    _line(lines, indent + 2, "weight_values = tl.where(q_active[:, None], q_weight_values, tl.where(k_active[:, None], k_weight_values, v_weight_values))")
+    input_mask = f"offs_k < {_dim(k)}"
+    _line(lines, indent + 2, f"input_values = {_load_operand(model, 'Input', 'input0', input_offsets, input_mask)}.to(tl.float32)")
     _line(lines, indent + 2, "acc += tl.sum(weight_values * input_values[None, :], axis=1)")
 
     for prefix, active in (("Q", "q_active"), ("K", "k_active"), ("V", "v_active")):
         if model[f"Has{prefix}Bias"]:
             bias_offsets = _packed_qkv_bias_offsets(model, prefix, f"{prefix.lower()}_local_n")
-            _line(lines, indent + 1, f"acc += tl.load({prefix.lower()}_bias + {bias_offsets}, mask={active} & (offs_n < {_dim(total_n)}), other=0.0).to(tl.float32)")
+            bias_mask = f"{active} & (offs_n < {_dim(total_n)})"
+            bias_value = _load_operand(model, f"{prefix}Bias", f"{prefix.lower()}_bias", bias_offsets, bias_mask)
+            _line(lines, indent + 1, f"acc += {bias_value}.to(tl.float32)")
 
     for prefix in ("Q", "K", "V"):
         output_shape = model[f"{prefix}OutputShape"]
@@ -1768,18 +2571,29 @@ def _emit_packed_qkv_matmul_concat_n(
         weight_batch_offset = _batch_offset_expression(weight_shape, weight_strides, len(output_shape) - 2)
         local_n = f"{prefix.lower()}_local_n"
         weight_offsets = _packed_qkv_weight_offsets(model, prefix, weight_batch_offset, f"{local_n}[None, :]", "offs_k[:, None]")
-        _line(lines, indent + 2, f"{prefix.lower()}_weight_ptrs = {prefix.lower()}_weight + {weight_offsets}")
+        weight_mask = f"{prefix.lower()}_active[None, :] & (offs_k[:, None] < {_dim(k)}) & (offs_n[None, :] < {_dim(total_n)})"
+        weight_value = _load_operand_nd(
+            model,
+            f"{prefix}Weight",
+            f"{prefix.lower()}_weight",
+            weight_offsets,
+            weight_mask,
+            (block_k, block_n),
+        )
+        _line(lines, indent + 2, f"{prefix.lower()}_weight_values = {weight_value}")
 
-    _line(lines, indent + 2, "weight_ptrs = tl.where(q_active[None, :], q_weight_ptrs, tl.where(k_active[None, :], k_weight_ptrs, v_weight_ptrs))")
-    _line(lines, indent + 2, f"weight_values = tl.load(weight_ptrs, mask=(offs_k[:, None] < {_dim(k)}) & (offs_n[None, :] < {_dim(total_n)}), other=0.0)")
-    _line(lines, indent + 2, f"input_values = tl.load(input0 + {input_offsets}, mask=(offs_m[:, None] < {_dim(m)}) & (offs_k[None, :] < {_dim(k)}), other=0.0)")
+    _line(lines, indent + 2, "weight_values = tl.where(q_active[None, :], q_weight_values, tl.where(k_active[None, :], k_weight_values, v_weight_values))")
+    input_mask = f"(offs_m[:, None] < {_dim(m)}) & (offs_k[None, :] < {_dim(k)})"
+    _line(lines, indent + 2, f"input_values = {_load_operand_nd(model, 'Input', 'input0', input_offsets, input_mask, (block_m, block_k))}")
     dot_precision = ', input_precision="ieee"' if model["InputDType"] == "float32" and model["WeightDType"] == "float32" else ""
     _line(lines, indent + 2, f"acc += tl.dot(input_values, weight_values{dot_precision})")
 
     for prefix, active in (("Q", "q_active"), ("K", "k_active"), ("V", "v_active")):
         if model[f"Has{prefix}Bias"]:
             bias_offsets = _packed_qkv_bias_offsets(model, prefix, f"{prefix.lower()}_local_n")
-            _line(lines, indent + 1, f"acc += tl.load({prefix.lower()}_bias + {bias_offsets}, mask={active} & (offs_n < {_dim(total_n)}), other=0.0).to(tl.float32)[None, :]")
+            bias_mask = f"{active} & (offs_n < {_dim(total_n)})"
+            bias_value = _load_operand(model, f"{prefix}Bias", f"{prefix.lower()}_bias", bias_offsets, bias_mask)
+            _line(lines, indent + 1, f"acc += {bias_value}.to(tl.float32)[None, :]")
 
     for prefix in ("Q", "K", "V"):
         output_shape = model[f"{prefix}OutputShape"]
@@ -1826,12 +2640,24 @@ def _emit_packed_qkv_gemv_projection(
     _line(lines, indent + 1, f"acc = tl.zeros(({block_n},), tl.float32)")
     _line(lines, indent + 1, f"for k_start in tl.range(0, {_dim(k)}, {block_k}):")
     _line(lines, indent + 2, f"offs_k = k_start + tl.arange(0, {block_k})")
-    _line(lines, indent + 2, f"weight_values = tl.load({ptr_weight} + {weight_offsets}, mask=(offs_n[:, None] < {_dim(n)}) & (offs_k[None, :] < {_dim(k)}), other=0.0, eviction_policy=\"evict_first\").to(tl.float32)")
-    _line(lines, indent + 2, f"input_values = tl.load(input0 + {input_offsets}, mask=offs_k < {_dim(k)}, other=0.0).to(tl.float32)")
+    weight_mask = f"(offs_n[:, None] < {_dim(n)}) & (offs_k[None, :] < {_dim(k)})"
+    weight_value = _load_operand_nd(
+        model,
+        f"{prefix}Weight",
+        ptr_weight,
+        weight_offsets,
+        weight_mask,
+        (block_n, block_k),
+        suffix=', eviction_policy="evict_first"',
+    )
+    _line(lines, indent + 2, f"weight_values = {weight_value}.to(tl.float32)")
+    input_mask = f"offs_k < {_dim(k)}"
+    _line(lines, indent + 2, f"input_values = {_load_operand(model, 'Input', 'input0', input_offsets, input_mask)}.to(tl.float32)")
     _line(lines, indent + 2, "acc += tl.sum(weight_values * input_values[None, :], axis=1)")
     if model[f"Has{prefix}Bias"]:
         bias_offsets = _packed_qkv_bias_offsets(model, prefix, "offs_n")
-        _line(lines, indent + 1, f"bias_values = tl.load({ptr_bias} + {bias_offsets}, mask=offs_n < {_dim(n)}, other=0.0).to(tl.float32)")
+        bias_value = _load_operand(model, f"{prefix}Bias", ptr_bias, bias_offsets, f"offs_n < {_dim(n)}")
+        _line(lines, indent + 1, f"bias_values = {bias_value}.to(tl.float32)")
         _line(lines, indent + 1, "acc += bias_values")
     _line(lines, indent + 1, f"tl.store({ptr_output} + {output_offsets}, acc, mask=offs_n < {_dim(n)})")
 
@@ -1870,13 +2696,24 @@ def _emit_packed_qkv_matmul_projection(
     _line(lines, indent + 1, f"acc = tl.zeros(({block_m}, {block_n}), tl.float32)")
     _line(lines, indent + 1, f"for k_start in tl.range(0, {_dim(k)}, {block_k}, num_stages=5):")
     _line(lines, indent + 2, f"offs_k = k_start + tl.arange(0, {block_k})")
-    _line(lines, indent + 2, f"weight_values = tl.load({ptr_weight} + {weight_offsets}, mask=(offs_k[:, None] < {_dim(k)}) & (offs_n[None, :] < {_dim(n)}), other=0.0)")
-    _line(lines, indent + 2, f"input_values = tl.load(input0 + {input_offsets}, mask=(offs_m[:, None] < {_dim(output_logical_shape[-2])}) & (offs_k[None, :] < {_dim(k)}), other=0.0)")
+    weight_mask = f"(offs_k[:, None] < {_dim(k)}) & (offs_n[None, :] < {_dim(n)})"
+    weight_value = _load_operand_nd(
+        model,
+        f"{prefix}Weight",
+        ptr_weight,
+        weight_offsets,
+        weight_mask,
+        (block_k, block_n),
+    )
+    _line(lines, indent + 2, f"weight_values = {weight_value}")
+    input_mask = f"(offs_m[:, None] < {_dim(output_logical_shape[-2])}) & (offs_k[None, :] < {_dim(k)})"
+    _line(lines, indent + 2, f"input_values = {_load_operand_nd(model, 'Input', 'input0', input_offsets, input_mask, (block_m, block_k))}")
     dot_precision = ', input_precision="ieee"' if model["InputDType"] == "float32" and model["WeightDType"] == "float32" else ""
     _line(lines, indent + 2, f"acc += tl.dot(input_values, weight_values{dot_precision})")
     if model[f"Has{prefix}Bias"]:
         bias_offsets = _packed_qkv_bias_offsets(model, prefix, "offs_n")
-        _line(lines, indent + 1, f"bias_values = tl.load({ptr_bias} + {bias_offsets}, mask=offs_n < {_dim(n)}, other=0.0).to(tl.float32)")
+        bias_value = _load_operand(model, f"{prefix}Bias", ptr_bias, bias_offsets, f"offs_n < {_dim(n)}")
+        _line(lines, indent + 1, f"bias_values = {bias_value}.to(tl.float32)")
         _line(lines, indent + 1, "acc += bias_values[None, :]")
     _line(lines, indent + 1, f"tl.store({ptr_output} + {output_offsets}, acc, mask=(offs_m[:, None] < {_dim(output_logical_shape[-2])}) & (offs_n[None, :] < {_dim(n)}))")
 
@@ -1921,11 +2758,24 @@ def _emit_qkv_gemv_projection(
     _line(lines, indent + 1, f"acc = tl.zeros(({block_n},), tl.float32)")
     _line(lines, indent + 1, f"for k_start in tl.range(0, {_dim(k)}, {block_k}):")
     _line(lines, indent + 2, f"offs_k = k_start + tl.arange(0, {block_k})")
-    _line(lines, indent + 2, f"weight_values = tl.load({ptr_weight} + {weight_offsets}, mask=(offs_n[:, None] < {_dim(n)}) & (offs_k[None, :] < {_dim(k)}), other=0.0, eviction_policy=\"evict_first\").to(tl.float32)")
-    _line(lines, indent + 2, f"input_values = tl.load(input0 + {input_offsets}, mask=offs_k < {_dim(k)}, other=0.0).to(tl.float32)")
+    weight_mask = f"(offs_n[:, None] < {_dim(n)}) & (offs_k[None, :] < {_dim(k)})"
+    weight_value = _load_operand_nd(
+        model,
+        f"{prefix}Weight",
+        ptr_weight,
+        weight_offsets,
+        weight_mask,
+        (block_n, block_k),
+        suffix=', eviction_policy="evict_first"',
+    )
+    _line(lines, indent + 2, f"weight_values = {weight_value}.to(tl.float32)")
+    input_mask = f"offs_k < {_dim(k)}"
+    _line(lines, indent + 2, f"input_values = {_load_operand(model, 'Input', 'input0', input_offsets, input_mask)}.to(tl.float32)")
     _line(lines, indent + 2, "acc += tl.sum(weight_values * input_values[None, :], axis=1)")
     if model[f"Has{prefix}Bias"]:
-        _line(lines, indent + 1, f"bias_values = tl.load({ptr_bias} + offs_n * {_dim(bias_strides[-1])}, mask=offs_n < {_dim(n)}, other=0.0).to(tl.float32)")
+        bias_offsets = f"offs_n * {_dim(bias_strides[-1])}"
+        bias_value = _load_operand(model, f"{prefix}Bias", ptr_bias, bias_offsets, f"offs_n < {_dim(n)}")
+        _line(lines, indent + 1, f"bias_values = {bias_value}.to(tl.float32)")
         _line(lines, indent + 1, "acc += bias_values")
     _line(lines, indent + 1, f"tl.store({ptr_output} + {output_offsets}, acc, mask=offs_n < {_dim(n)})")
 
@@ -1970,12 +2820,24 @@ def _emit_qkv_matmul_projection(
     _line(lines, indent + 1, f"acc = tl.zeros(({block_m}, {block_n}), tl.float32)")
     _line(lines, indent + 1, f"for k_start in tl.range(0, {_dim(k)}, {block_k}, num_stages=5):")
     _line(lines, indent + 2, f"offs_k = k_start + tl.arange(0, {block_k})")
-    _line(lines, indent + 2, f"weight_values = tl.load({ptr_weight} + {weight_offsets}, mask=(offs_k[:, None] < {_dim(k)}) & (offs_n[None, :] < {_dim(n)}), other=0.0)")
-    _line(lines, indent + 2, f"input_values = tl.load(input0 + {input_offsets}, mask=(offs_m[:, None] < {_dim(model['QOutputShape'][-2])}) & (offs_k[None, :] < {_dim(k)}), other=0.0)")
+    weight_mask = f"(offs_k[:, None] < {_dim(k)}) & (offs_n[None, :] < {_dim(n)})"
+    weight_value = _load_operand_nd(
+        model,
+        f"{prefix}Weight",
+        ptr_weight,
+        weight_offsets,
+        weight_mask,
+        (block_k, block_n),
+    )
+    _line(lines, indent + 2, f"weight_values = {weight_value}")
+    input_mask = f"(offs_m[:, None] < {_dim(model['QOutputShape'][-2])}) & (offs_k[None, :] < {_dim(k)})"
+    _line(lines, indent + 2, f"input_values = {_load_operand_nd(model, 'Input', 'input0', input_offsets, input_mask, (block_m, block_k))}")
     dot_precision = ', input_precision="ieee"' if model["InputDType"] == "float32" and model["WeightDType"] == "float32" else ""
     _line(lines, indent + 2, f"acc += tl.dot(input_values, weight_values{dot_precision})")
     if model[f"Has{prefix}Bias"]:
-        _line(lines, indent + 1, f"bias_values = tl.load({ptr_bias} + offs_n * {_dim(bias_strides[-1])}, mask=offs_n < {_dim(n)}, other=0.0).to(tl.float32)")
+        bias_offsets = f"offs_n * {_dim(bias_strides[-1])}"
+        bias_value = _load_operand(model, f"{prefix}Bias", ptr_bias, bias_offsets, f"offs_n < {_dim(n)}")
+        _line(lines, indent + 1, f"bias_values = {bias_value}.to(tl.float32)")
         _line(lines, indent + 1, "acc += bias_values[None, :]")
     _line(lines, indent + 1, f"tl.store({ptr_output} + {output_offsets}, acc, mask=(offs_m[:, None] < {_dim(output_shape[-2])}) & (offs_n[None, :] < {_dim(n)}))")
 
@@ -1989,6 +2851,14 @@ def _emit_packed_matmul_glu(model: dict[str, Any]) -> str:
 
 
 def _emit_matmul_glu_like(model: dict[str, Any], *, packed: bool) -> str:
+    reduction_phase = str(model.get("ReductionPhase", "complete")).lower()
+    if reduction_phase == "accumulate":
+        return _emit_matmul_glu_reduction_accumulate(model, packed=packed)
+    if reduction_phase == "finalize":
+        return _emit_matmul_glu_reduction_finalize(model, packed=packed)
+    if reduction_phase != "complete":
+        raise ValueError(f"Unsupported MatMulGlu reduction phase: {reduction_phase!r}.")
+
     logical_output_shape = _matmul_glu_logical_output_shape(model)
     m = logical_output_shape[-2]
     k = model["InputShape"][-1]
@@ -2037,6 +2907,208 @@ def _emit_matmul_glu_like(model: dict[str, Any], *, packed: bool) -> str:
         _line(lines, indent, f"for m_start in tl.range(0, {_dim(m)}, {block_m}):")
         _line(lines, indent + 1, f"offs_m = m_start + tl.arange(0, {block_m})")
         _emit_matmul_glu_matmul(lines, indent + 1, model, input_batch_offset, block_m, block_n, block_k, packed=packed)
+    return _finish(lines)
+
+
+def _emit_matmul_glu_reduction_accumulate(model: dict[str, Any], *, packed: bool) -> str:
+    logical_output_shape = _matmul_glu_logical_output_shape(model)
+    if len(logical_output_shape) != 2:
+        raise ValueError(
+            "MatMulGlu backend-private reduction requires a rank-2 local output tile."
+        )
+    block_m = int(model["ReductionBlockM"])
+    block_n = int(model["ReductionBlockN"])
+    block_k = int(model["ReductionBlockK"])
+    template_name = "PackedMatMulGlu" if packed else "MatMulGlu"
+    lines = _helper_header(
+        model,
+        ("gate_acc", "up_acc"),
+        comment=(
+            f"# generated from PyNTT Jinja {template_name}.py.jinja reduction accumulate\n"
+            f"# {model['Comment']}; accumulator=backend-private-fp32"
+        ),
+    )
+    _line(lines, 1, "shard_index = tl.program_id(0).to(tl.int64)")
+    _append_pointer_shard_coords(
+        lines,
+        1,
+        [model["Input"], model["GateWeight"], model["UpWeight"]],
+    )
+    _line(lines, 1, f"input0 = {_ptr(model, 'Input')}")
+    _line(lines, 1, f"gate_weight = {_ptr(model, 'GateWeight')}")
+    _line(lines, 1, f"up_weight = {_ptr(model, 'UpWeight')}")
+    _line(lines, 1, f"offs_k = tl.arange(0, {block_k})")
+    _line(lines, 1, f"offs_n = tl.arange(0, {block_n})")
+    k = model["InputShape"][-1]
+    n = logical_output_shape[-1]
+    input_batch_offset = "0"
+
+    if block_m == 1:
+        input_m, input_m_limit = _matmul_glu_input_m_index(model, "0")
+        input_offsets = (
+            f"({input_m} * {_dim(model['InputStrides'][-2])} + "
+            f"offs_k * {_dim(model['InputStrides'][-1])})"
+        )
+        input_mask = f"({input_m} < {_dim(input_m_limit)}) & (offs_k < {_dim(k)})"
+        _line(
+            lines,
+            1,
+            f"input_values = {_load_operand(model, 'Input', 'input0', input_offsets, input_mask)}.to(tl.float32)",
+        )
+        for prefix, acc_name in (("Gate", "gate_acc"), ("Up", "up_acc")):
+            weight_shape = model[f"{prefix}WeightShape"]
+            weight_strides = model[f"{prefix}WeightStrides"]
+            weight_batch_offset = _batch_offset_expression(
+                weight_shape, weight_strides, len(model["OutputShape"]) - 2
+            )
+            weight_offsets, weight_n_limit, weight_k_limit = _matmul_glu_weight_offsets(
+                model,
+                prefix,
+                weight_batch_offset,
+                "offs_n[:, None]",
+                "offs_k[None, :]",
+                packed=packed,
+            )
+            _line(
+                lines,
+                1,
+                f"{prefix.lower()}_weight_values = tl.load({prefix.lower()}_weight + {weight_offsets}, "
+                f"mask=(offs_n[:, None] < {_dim(n)}) & (offs_n[:, None] < {_dim(weight_n_limit)}) "
+                f"& (offs_k[None, :] < {_dim(weight_k_limit)}), other=0.0, "
+                'eviction_policy="evict_first").to(tl.float32)',
+            )
+            _line(
+                lines,
+                1,
+                f"{acc_name} += tl.sum({prefix.lower()}_weight_values * input_values[None, :], axis=1)",
+            )
+    else:
+        _line(lines, 1, f"offs_m = tl.arange(0, {block_m})")
+        input_m, input_m_limit = _matmul_glu_input_m_index(model, "offs_m[:, None]")
+        input_offsets = (
+            f"({input_m} * {_dim(model['InputStrides'][-2])} + "
+            f"offs_k[None, :] * {_dim(model['InputStrides'][-1])})"
+        )
+        input_mask = (
+            f"(offs_m[:, None] < {_dim(logical_output_shape[-2])}) & "
+            f"({input_m} < {_dim(input_m_limit)}) & (offs_k[None, :] < {_dim(k)})"
+        )
+        _line(
+            lines,
+            1,
+            f"input_values = {_load_operand_nd(model, 'Input', 'input0', input_offsets, input_mask, (block_m, block_k))}",
+        )
+        dot_precision = (
+            ', input_precision="ieee"'
+            if model["InputDType"] == "float32" and model["WeightDType"] == "float32"
+            else ""
+        )
+        for prefix, acc_name in (("Gate", "gate_acc"), ("Up", "up_acc")):
+            weight_shape = model[f"{prefix}WeightShape"]
+            weight_strides = model[f"{prefix}WeightStrides"]
+            weight_batch_offset = _batch_offset_expression(
+                weight_shape, weight_strides, len(model["OutputShape"]) - 2
+            )
+            weight_offsets, weight_n_limit, weight_k_limit = _matmul_glu_weight_offsets(
+                model,
+                prefix,
+                weight_batch_offset,
+                "offs_n[None, :]",
+                "offs_k[:, None]",
+                packed=packed,
+            )
+            _line(
+                lines,
+                1,
+                f"{prefix.lower()}_weight_values = tl.load({prefix.lower()}_weight + {weight_offsets}, "
+                f"mask=(offs_k[:, None] < {_dim(weight_k_limit)}) & "
+                f"(offs_n[None, :] < {_dim(n)}) & (offs_n[None, :] < {_dim(weight_n_limit)}), other=0.0)",
+            )
+            _line(
+                lines,
+                1,
+                f"{acc_name} += tl.dot(input_values, {prefix.lower()}_weight_values{dot_precision})",
+            )
+    _line(lines, 1, "return gate_acc, up_acc")
+    return _finish(lines)
+
+
+def _emit_matmul_glu_reduction_finalize(model: dict[str, Any], *, packed: bool) -> str:
+    logical_output_shape = _matmul_glu_logical_output_shape(model)
+    block_m = int(model["ReductionBlockM"])
+    block_n = int(model["ReductionBlockN"])
+    template_name = "PackedMatMulGlu" if packed else "MatMulGlu"
+    lines = _helper_header(
+        model,
+        ("gate_acc", "up_acc"),
+        comment=(
+            f"# generated from PyNTT Jinja {template_name}.py.jinja reduction finalize\n"
+            f"# {model['Comment']}; accumulator=backend-private-fp32"
+        ),
+    )
+    _line(lines, 1, "shard_index = tl.program_id(0).to(tl.int64)")
+    pointer_models = [model["GateBias"], model["UpBias"], model["Output"]]
+    _append_pointer_shard_coords(lines, 1, pointer_models)
+    if model["HasGateBias"]:
+        _line(lines, 1, f"gate_bias = {_ptr(model, 'GateBias')}")
+    if model["HasUpBias"]:
+        _line(lines, 1, f"up_bias = {_ptr(model, 'UpBias')}")
+    _line(lines, 1, f"output = {_ptr(model, 'Output')}")
+    _line(lines, 1, f"offs_n = tl.arange(0, {block_n})")
+    n = logical_output_shape[-1]
+    if block_m == 1:
+        if model["HasGateBias"]:
+            gate_bias_offsets = _matmul_glu_bias_offsets(model, "Gate", "offs_n", packed=packed)
+            _, gate_bias_n_limit = _matmul_glu_bias_n_index(model, "Gate", "offs_n", packed=packed)
+            _line(
+                lines,
+                1,
+                f"gate_acc += tl.load(gate_bias + {gate_bias_offsets}, "
+                f"mask=(offs_n < {_dim(n)}) & (offs_n < {_dim(gate_bias_n_limit)}), other=0.0).to(tl.float32)",
+            )
+        if model["HasUpBias"]:
+            up_bias_offsets = _matmul_glu_bias_offsets(model, "Up", "offs_n", packed=packed)
+            _, up_bias_n_limit = _matmul_glu_bias_n_index(model, "Up", "offs_n", packed=packed)
+            _line(
+                lines,
+                1,
+                f"up_acc += tl.load(up_bias + {up_bias_offsets}, "
+                f"mask=(offs_n < {_dim(n)}) & (offs_n < {_dim(up_bias_n_limit)}), other=0.0).to(tl.float32)",
+            )
+        output_offsets = _matmul_glu_output_offsets(model, "0", "offs_n", "0", packed=packed)
+        _line(lines, 1, f"result = {_matmul_glu_expr(model, 'gate_acc', 'up_acc')}")
+        _line(lines, 1, f"tl.store(output + {output_offsets}, result, mask=offs_n < {_dim(n)})")
+    else:
+        _line(lines, 1, f"offs_m = tl.arange(0, {block_m})")
+        if model["HasGateBias"]:
+            gate_bias_offsets = _matmul_glu_bias_offsets(model, "Gate", "offs_n", packed=packed)
+            _, gate_bias_n_limit = _matmul_glu_bias_n_index(model, "Gate", "offs_n", packed=packed)
+            _line(
+                lines,
+                1,
+                f"gate_acc += tl.load(gate_bias + {gate_bias_offsets}, "
+                f"mask=(offs_n < {_dim(n)}) & (offs_n < {_dim(gate_bias_n_limit)}), other=0.0).to(tl.float32)[None, :]",
+            )
+        if model["HasUpBias"]:
+            up_bias_offsets = _matmul_glu_bias_offsets(model, "Up", "offs_n", packed=packed)
+            _, up_bias_n_limit = _matmul_glu_bias_n_index(model, "Up", "offs_n", packed=packed)
+            _line(
+                lines,
+                1,
+                f"up_acc += tl.load(up_bias + {up_bias_offsets}, "
+                f"mask=(offs_n < {_dim(n)}) & (offs_n < {_dim(up_bias_n_limit)}), other=0.0).to(tl.float32)[None, :]",
+            )
+        output_offsets = _matmul_glu_output_offsets(
+            model, "0", "offs_n[None, :]", "offs_m[:, None]", packed=packed
+        )
+        _line(lines, 1, f"result = {_matmul_glu_expr(model, 'gate_acc', 'up_acc')}")
+        _line(
+            lines,
+            1,
+            f"tl.store(output + {output_offsets}, result, "
+            f"mask=(offs_m[:, None] < {_dim(logical_output_shape[-2])}) & "
+            f"(offs_n[None, :] < {_dim(n)}))",
+        )
     return _finish(lines)
 
 
@@ -2185,7 +3257,8 @@ def _emit_matmul_glu_gemv(
     _line(lines, indent + 1, f"up_acc = tl.zeros(({block_n},), tl.float32)")
     _line(lines, indent + 1, f"for k_start in tl.range(0, {_dim(k)}, {block_k}):")
     _line(lines, indent + 2, f"offs_k = k_start + tl.arange(0, {block_k})")
-    _line(lines, indent + 2, f"input_values = tl.load(input0 + {input_offsets}, mask=(m_idx < {_dim(input_m_limit)}) & (offs_k < {_dim(k)}), other=0.0).to(tl.float32)")
+    input_mask = f"(m_idx < {_dim(input_m_limit)}) & (offs_k < {_dim(k)})"
+    _line(lines, indent + 2, f"input_values = {_load_operand(model, 'Input', 'input0', input_offsets, input_mask)}.to(tl.float32)")
     for prefix, acc_name in (("Gate", "gate_acc"), ("Up", "up_acc")):
         weight_shape = model[f"{prefix}WeightShape"]
         weight_strides = model[f"{prefix}WeightStrides"]
@@ -2235,7 +3308,8 @@ def _emit_matmul_glu_matmul(
     _line(lines, indent + 1, f"up_acc = tl.zeros(({block_m}, {block_n}), tl.float32)")
     _line(lines, indent + 1, f"for k_start in tl.range(0, {_dim(k)}, {block_k}, num_stages=5):")
     _line(lines, indent + 2, f"offs_k = k_start + tl.arange(0, {block_k})")
-    _line(lines, indent + 2, f"input_values = tl.load(input0 + {input_offsets}, mask=(offs_m[:, None] < {_dim(m)}) & ({input_m} < {_dim(input_m_limit)}) & (offs_k[None, :] < {_dim(k)}), other=0.0)")
+    input_mask = f"(offs_m[:, None] < {_dim(m)}) & ({input_m} < {_dim(input_m_limit)}) & (offs_k[None, :] < {_dim(k)})"
+    _line(lines, indent + 2, f"input_values = {_load_operand_nd(model, 'Input', 'input0', input_offsets, input_mask, (block_m, block_k))}")
     dot_precision = ', input_precision="ieee"' if model["InputDType"] == "float32" and model["WeightDType"] == "float32" else ""
     for prefix, acc_name in (("Gate", "gate_acc"), ("Up", "up_acc")):
         weight_shape = model[f"{prefix}WeightShape"]
@@ -2258,6 +3332,14 @@ def _emit_matmul_glu_matmul(
 
 
 def _emit_matmul_like(model: dict[str, Any], *, gemv: bool) -> str:
+    reduction_phase = str(model.get("ReductionPhase", "complete")).lower()
+    if reduction_phase == "accumulate":
+        return _emit_matmul_reduction_accumulate(model, gemv=gemv)
+    if reduction_phase == "finalize":
+        return _emit_matmul_reduction_finalize(model, gemv=gemv)
+    if reduction_phase != "complete":
+        raise ValueError(f"Unsupported Matmul reduction phase: {reduction_phase!r}.")
+
     output_n_scalar_lane_count = model.get("OutputNPackedLaneCount", 1) * model["OutputNVectorLaneCount"]
     rhs_n_scalar_lane_count = model.get("RhsNPackedLaneCount", 1) * model["RhsNVectorLaneCount"]
     logical_output_shape = [dict(dim) if isinstance(dim, dict) else dim for dim in model["OutputShape"]]
@@ -2329,7 +3411,7 @@ def _emit_matmul_like(model: dict[str, Any], *, gemv: bool) -> str:
         rhs_mask = f"(offs_n[:, None] < {_dim(n)}) & (offs_n[:, None] < {_dim(rhs_n)}) & (offs_k[None, :] < {_dim(k)}) & (offs_k[None, :] < {_dim(rhs_k)})"
         lhs_mask = f"(m_idx < {_dim(lhs_m)}) & (offs_k < {_dim(k)})"
         _line(lines, indent + 1, f"rhs_values = tl.load(rhs + {rhs_offsets}, mask={rhs_mask}, other=0.0, eviction_policy=\"evict_first\").to(tl.float32)")
-        _line(lines, indent + 1, f"lhs_values = tl.load(lhs + {lhs_offsets}, mask={lhs_mask}, other=0.0).to(tl.float32)")
+        _line(lines, indent + 1, f"lhs_values = {_load_operand(model, 'Lhs', 'lhs', lhs_offsets, lhs_mask)}.to(tl.float32)")
         _line(lines, indent + 1, "acc += tl.sum(rhs_values * lhs_values[None, :], axis=1)")
         _line(lines, indent, f"result = acc * {model['Scale']}")
         output_mask = f"offs_n < {_dim(n)}"
@@ -2340,23 +3422,220 @@ def _emit_matmul_like(model: dict[str, Any], *, gemv: bool) -> str:
         block_n = 64
         block_k = 64
         lhs_offsets, rhs_offsets, output_offsets = _matmul_offsets(model, lhs_batch_offset, rhs_batch_offset, output_batch_offset)
+        compute_indent = indent + 2
         _line(lines, indent, f"for m_start in tl.range(0, {_dim(m)}, {block_m}):")
         _line(lines, indent + 1, f"offs_m = m_start + tl.arange(0, {block_m})")
         _line(lines, indent + 1, f"for n_start in tl.range(0, {_dim(n)}, {block_n}):")
-        _line(lines, indent + 2, f"offs_n = n_start + tl.arange(0, {block_n})")
-        _line(lines, indent + 2, f"acc = tl.zeros(({block_m}, {block_n}), tl.float32)")
-        _line(lines, indent + 2, f"for k_start in tl.range(0, {_dim(k)}, {block_k}, num_stages=5):")
-        _line(lines, indent + 3, f"offs_k = k_start + tl.arange(0, {block_k})")
+        _line(lines, compute_indent, f"offs_n = n_start + tl.arange(0, {block_n})")
+        _line(lines, compute_indent, f"acc = tl.zeros(({block_m}, {block_n}), tl.float32)")
+        _line(lines, compute_indent, f"for k_start in tl.range(0, {_dim(k)}, {block_k}, num_stages=5):")
+        _line(lines, compute_indent + 1, f"offs_k = k_start + tl.arange(0, {block_k})")
         rhs_mask = f"(offs_k[:, None] < {_dim(k)}) & (offs_k[:, None] < {_dim(rhs_k)}) & (offs_n[None, :] < {_dim(n)}) & (offs_n[None, :] < {_dim(rhs_n)})"
         lhs_mask = f"(offs_m[:, None] < {_dim(m)}) & (offs_m[:, None] < {_dim(lhs_m)}) & (offs_k[None, :] < {_dim(k)})"
-        _line(lines, indent + 3, f"rhs_values = tl.load(rhs + {rhs_offsets}, mask={rhs_mask}, other=0.0)")
-        _line(lines, indent + 3, f"lhs_values = tl.load(lhs + {lhs_offsets}, mask={lhs_mask}, other=0.0)")
+        _line(lines, compute_indent + 1, f"rhs_values = tl.load(rhs + {rhs_offsets}, mask={rhs_mask}, other=0.0)")
+        _line(lines, compute_indent + 1, f"lhs_values = {_load_operand_nd(model, 'Lhs', 'lhs', lhs_offsets, lhs_mask, (block_m, block_k))}")
         dot_precision = ', input_precision="ieee"' if model["LhsDType"] == "float32" and model["RhsDType"] == "float32" else ""
-        _line(lines, indent + 3, f"acc += tl.dot(lhs_values, rhs_values{dot_precision})")
-        _line(lines, indent + 2, f"result = acc * {model['Scale']}")
+        _line(lines, compute_indent + 1, f"acc += tl.dot(lhs_values, rhs_values{dot_precision})")
+        _line(lines, compute_indent, f"result = acc * {model['Scale']}")
         output_mask = f"(offs_m[:, None] < {_dim(m)}) & (offs_n[None, :] < {_dim(n)})"
-        append_load_c(lines, indent + 2, output_offsets, output_mask)
-        _line(lines, indent + 2, f"tl.store(output + {output_offsets}, result, mask={output_mask})")
+        append_load_c(lines, compute_indent, output_offsets, output_mask)
+        _line(lines, compute_indent, f"tl.store(output + {output_offsets}, result, mask={output_mask})")
+    return _finish(lines)
+
+
+def _emit_matmul_reduction_accumulate(
+    model: dict[str, Any], *, gemv: bool
+) -> str:
+    output_lane_count = (
+        model.get("OutputNPackedLaneCount", 1)
+        * model["OutputNVectorLaneCount"]
+    )
+    rhs_lane_count = (
+        model.get("RhsNPackedLaneCount", 1) * model["RhsNVectorLaneCount"]
+    )
+    logical_output_shape = [
+        dict(dim) if isinstance(dim, dict) else dim for dim in model["OutputShape"]
+    ]
+    logical_output_shape[-1] = _multiply_dim(
+        logical_output_shape[-1], output_lane_count
+    )
+    if len(logical_output_shape) != 2:
+        raise ValueError(
+            "Matmul backend-private reduction requires a rank-2 local output tile."
+        )
+
+    block_m = int(model["ReductionBlockM"])
+    block_n = int(model["ReductionBlockN"])
+    block_k = int(model["ReductionBlockK"])
+    template_name = "Gemv" if gemv else "Matmul"
+    lines = _helper_header(
+        model,
+        ("acc",),
+        comment=(
+            f"# generated from PyNTT Jinja {template_name}.py.jinja reduction accumulate\n"
+            f"# {model['Comment']}; accumulator=backend-private-fp32"
+        ),
+    )
+    _line(lines, 1, "shard_index = tl.program_id(0).to(tl.int64)")
+    _append_pointer_shard_coords(lines, 1, [model["Lhs"], model["Rhs"]])
+    _line(lines, 1, f"lhs = {_ptr(model, 'Lhs')}")
+    _line(lines, 1, f"rhs = {_ptr(model, 'Rhs')}")
+    _line(lines, 1, f"offs_k = tl.arange(0, {block_k})")
+    _line(lines, 1, f"offs_n = tl.arange(0, {block_n})")
+
+    m = logical_output_shape[-2]
+    n = logical_output_shape[-1]
+    lhs_m = model["LhsShape"][-1] if model["TransposeA"] else model["LhsShape"][-2]
+    lhs_k = model["LhsShape"][-2] if model["TransposeA"] else model["LhsShape"][-1]
+    rhs_k = model["RhsShape"][-1] if model["TransposeB"] else model["RhsShape"][-2]
+    rhs_n = _multiply_dim(
+        model["RhsShape"][-2] if model["TransposeB"] else model["RhsShape"][-1],
+        rhs_lane_count,
+    )
+
+    if gemv:
+        _line(lines, 1, "m_idx = 0")
+        lhs_offsets = _gemv_lhs_offsets(model, "0")
+        rhs_offsets = _gemv_rhs_offsets(model, "0")
+        rhs_mask = (
+            f"(offs_n[:, None] < {_dim(n)}) & "
+            f"(offs_n[:, None] < {_dim(rhs_n)}) & "
+            f"(offs_k[None, :] < {_dim(lhs_k)}) & "
+            f"(offs_k[None, :] < {_dim(rhs_k)})"
+        )
+        lhs_mask = f"(0 < {_dim(m)}) & (0 < {_dim(lhs_m)}) & (offs_k < {_dim(lhs_k)})"
+        _line(
+            lines,
+            1,
+            f"rhs_values = tl.load(rhs + {rhs_offsets}, mask={rhs_mask}, "
+            'other=0.0, eviction_policy="evict_first").to(tl.float32)',
+        )
+        _line(
+            lines,
+            1,
+            f"lhs_values = {_load_operand(model, 'Lhs', 'lhs', lhs_offsets, lhs_mask)}.to(tl.float32)",
+        )
+        _line(lines, 1, "acc += tl.sum(rhs_values * lhs_values[None, :], axis=1)")
+    else:
+        _line(lines, 1, f"offs_m = tl.arange(0, {block_m})")
+        lhs_offsets, rhs_offsets, _ = _matmul_offsets(model, "0", "0", "0")
+        rhs_mask = (
+            f"(offs_k[:, None] < {_dim(lhs_k)}) & "
+            f"(offs_k[:, None] < {_dim(rhs_k)}) & "
+            f"(offs_n[None, :] < {_dim(n)}) & "
+            f"(offs_n[None, :] < {_dim(rhs_n)})"
+        )
+        lhs_mask = (
+            f"(offs_m[:, None] < {_dim(m)}) & "
+            f"(offs_m[:, None] < {_dim(lhs_m)}) & "
+            f"(offs_k[None, :] < {_dim(lhs_k)})"
+        )
+        _line(
+            lines,
+            1,
+            f"rhs_values = tl.load(rhs + {rhs_offsets}, mask={rhs_mask}, other=0.0)",
+        )
+        _line(
+            lines,
+            1,
+            f"lhs_values = {_load_operand_nd(model, 'Lhs', 'lhs', lhs_offsets, lhs_mask, (block_m, block_k))}",
+        )
+        dot_precision = (
+            ', input_precision="ieee"'
+            if model["LhsDType"] == "float32" and model["RhsDType"] == "float32"
+            else ""
+        )
+        _line(lines, 1, f"acc += tl.dot(lhs_values, rhs_values{dot_precision})")
+    _line(lines, 1, "return acc")
+    return _finish(lines)
+
+
+def _emit_matmul_reduction_finalize(
+    model: dict[str, Any], *, gemv: bool
+) -> str:
+    gemv = bool(model.get("Gemv", gemv))
+    output_lane_count = (
+        model.get("OutputNPackedLaneCount", 1)
+        * model["OutputNVectorLaneCount"]
+    )
+    logical_output_shape = [
+        dict(dim) if isinstance(dim, dict) else dim for dim in model["OutputShape"]
+    ]
+    logical_output_shape[-1] = _multiply_dim(
+        logical_output_shape[-1], output_lane_count
+    )
+    block_m = int(model["ReductionBlockM"])
+    block_n = int(model["ReductionBlockN"])
+    template_name = "Gemv" if gemv else "Matmul"
+    lines = _helper_header(
+        model,
+        ("acc",),
+        comment=(
+            f"# generated from PyNTT Jinja {template_name}.py.jinja reduction finalize\n"
+            f"# {model['Comment']}; accumulator=backend-private-fp32"
+        ),
+    )
+    _line(lines, 1, "shard_index = tl.program_id(0).to(tl.int64)")
+    _append_pointer_shard_coords(lines, 1, [model["Output"]])
+    _line(lines, 1, f"output = {_ptr(model, 'Output')}")
+    _line(lines, 1, f"offs_n = tl.arange(0, {block_n})")
+    n = logical_output_shape[-1]
+    result = f"acc * {model['Scale']}"
+    if gemv:
+        physical_n = _logical_n_index(
+            "offs_n",
+            model.get("OutputNPackedLaneCount", 1),
+            model["OutputNVectorLaneCount"],
+        )
+        physical = (
+            f"(0 * {_dim(model['OutputStrides'][-2])} + "
+            f"{physical_n} * {_dim(model['OutputStrides'][-1])})"
+        )
+        output_offsets = _maybe_vectorized_offset(
+            physical,
+            _logical_packed_lane_index(
+                "offs_n",
+                model.get("OutputNPackedLaneCount", 1),
+                model["OutputNVectorLaneCount"],
+            ),
+            _logical_vector_lane_index(
+                "offs_n", model["OutputNVectorLaneCount"]
+            ),
+            model.get("OutputNPackedLaneCount", 1),
+            model["OutputNVectorLaneCount"],
+        )
+        _line(lines, 1, f"tl.store(output + {output_offsets}, {result}, mask=offs_n < {_dim(n)})")
+    else:
+        _line(lines, 1, f"offs_m = tl.arange(0, {block_m})")
+        physical_n = _logical_n_index(
+            "offs_n[None, :]",
+            model.get("OutputNPackedLaneCount", 1),
+            model["OutputNVectorLaneCount"],
+        )
+        physical = (
+            f"(offs_m[:, None] * {_dim(model['OutputStrides'][-2])} + "
+            f"{physical_n} * {_dim(model['OutputStrides'][-1])})"
+        )
+        output_offsets = _maybe_vectorized_offset(
+            physical,
+            _logical_packed_lane_index(
+                "offs_n[None, :]",
+                model.get("OutputNPackedLaneCount", 1),
+                model["OutputNVectorLaneCount"],
+            ),
+            _logical_vector_lane_index(
+                "offs_n[None, :]", model["OutputNVectorLaneCount"]
+            ),
+            model.get("OutputNPackedLaneCount", 1),
+            model["OutputNVectorLaneCount"],
+        )
+        _line(
+            lines,
+            1,
+            f"tl.store(output + {output_offsets}, {result}, "
+            f"mask=(offs_m[:, None] < {_dim(logical_output_shape[-2])}) & "
+            f"(offs_n[None, :] < {_dim(n)}))",
+        )
     return _finish(lines)
 
 
@@ -2449,6 +3728,14 @@ def _gemv_output_offsets(model: dict[str, Any], output_batch_offset: str) -> str
 
 
 def _emit_reduce(model: dict[str, Any]) -> str:
+    reduction_phase = str(model.get("ReductionPhase", "complete")).lower()
+    if reduction_phase == "accumulate":
+        return _emit_reduce_reduction_accumulate(model)
+    if reduction_phase == "finalize":
+        return _emit_reduce_reduction_finalize(model)
+    if reduction_phase != "complete":
+        raise ValueError(f"Unsupported Reduce reduction phase: {reduction_phase!r}.")
+
     rank = len(model["OutputShape"])
     axis_set = set(model["Axes"])
     block_axis = _select_block_axis(model["OutputShape"], model["OutputStrides"])
@@ -2501,6 +3788,121 @@ def _emit_reduce(model: dict[str, Any]) -> str:
     _line(lines, reduce_indent, f"acc = {model['UpdateExpression']}")
     _line(lines, indent + 1, f"result = {model['FinalizeExpression']}")
     _line(lines, indent + 1, "tl.store(output + output_offsets, result, mask=mask)")
+    return _finish(lines)
+
+
+def _emit_reduce_reduction_accumulate(model: dict[str, Any]) -> str:
+    block_size = int(model["ReductionBlockSize"])
+    axis_set = set(model["Axes"])
+    track_element_count = bool(model.get("TrackReductionElementCount", False))
+    state_parameters = (
+        ("acc", "reduced_element_count")
+        if track_element_count
+        else ("acc",)
+    )
+    lines = _helper_header(
+        model,
+        state_parameters,
+        comment=(
+            "# generated from PyNTT Jinja Reduce.py.jinja reduction accumulate\n"
+            f"# {model['Comment']}; op={model['ReduceOp']}, accumulator=backend-private"
+        ),
+    )
+    _line(lines, 1, "shard_index = tl.program_id(0).to(tl.int64)")
+    _append_pointer_shard_coords(lines, 1, [model["Input"]])
+    _line(lines, 1, f"input0 = {_ptr(model, 'Input')}")
+    _line(lines, 1, f"lane = tl.arange(0, {block_size})")
+    output_elements = _product(model["OutputShape"])
+    _line(lines, 1, f"mask = lane < {_dim(output_elements)}")
+    if model["OutputShape"]:
+        _append_tensor_index_decompose(
+            lines, 1, "lane", "out_idx", model["OutputShape"]
+        )
+
+    input_terms: list[str] = []
+    output_index = 0
+    for input_index in range(len(model["InputShape"])):
+        if input_index in axis_set:
+            if model["KeepDims"]:
+                output_index += 1
+            continue
+        input_terms.append(
+            f"out_idx{output_index} * {_dim(model['InputStrides'][input_index])}"
+        )
+        output_index += 1
+    input_base = "lane * 0" if not input_terms else " + ".join(input_terms)
+    _line(lines, 1, f"input_base = {input_base}")
+
+    indent = 1
+    for axis in model["Axes"]:
+        _line(
+            lines,
+            indent,
+            f"for reduce_idx{axis} in tl.range(0, {_dim(model['InputShape'][axis])}):",
+        )
+        indent += 1
+    reduce_terms = [
+        f"reduce_idx{axis} * {_dim(model['InputStrides'][axis])}"
+        for axis in model["Axes"]
+    ]
+    reduce_offset = "lane * 0" if not reduce_terms else " + ".join(reduce_terms)
+    _line(
+        lines,
+        indent,
+        f"value0 = tl.load(input0 + input_base + {reduce_offset}, "
+        f"mask=mask, other={model['InitValue']})",
+    )
+    _line(lines, indent, f"acc = {model['UpdateExpression']}")
+    if track_element_count:
+        tile_element_count = _product(
+            [model["InputShape"][axis] for axis in model["Axes"]]
+        )
+        _line(
+            lines,
+            1,
+            f"reduced_element_count += {_dim(tile_element_count)}",
+        )
+        _line(lines, 1, "return acc, reduced_element_count")
+    else:
+        _line(lines, 1, "return acc")
+    return _finish(lines)
+
+
+def _emit_reduce_reduction_finalize(model: dict[str, Any]) -> str:
+    block_size = int(model["ReductionBlockSize"])
+    track_element_count = bool(model.get("TrackReductionElementCount", False))
+    state_parameters = (
+        ("acc", "reduced_element_count")
+        if track_element_count
+        else ("acc",)
+    )
+    lines = _helper_header(
+        model,
+        state_parameters,
+        comment=(
+            "# generated from PyNTT Jinja Reduce.py.jinja reduction finalize\n"
+            f"# {model['Comment']}; accumulator=backend-private"
+        ),
+    )
+    _line(lines, 1, "shard_index = tl.program_id(0).to(tl.int64)")
+    _append_pointer_shard_coords(lines, 1, [model["Output"]])
+    _line(lines, 1, f"output = {_ptr(model, 'Output')}")
+    _line(lines, 1, f"lane = tl.arange(0, {block_size})")
+    output_elements = _product(model["OutputShape"])
+    _line(lines, 1, f"mask = lane < {_dim(output_elements)}")
+    if model["OutputShape"]:
+        _append_tensor_index_decompose(
+            lines, 1, "lane", "out_idx", model["OutputShape"]
+        )
+        output_terms = [
+            f"out_idx{axis} * {_dim(model['OutputStrides'][axis])}"
+            for axis in range(len(model["OutputShape"]))
+        ]
+        output_offsets = " + ".join(output_terms)
+    else:
+        output_offsets = "lane * 0"
+    _line(lines, 1, f"result = {model['FinalizeExpression']}")
+    _line(lines, 1, f"tl.store(output + {output_offsets}, result, mask=mask)")
     return _finish(lines)
 
 
@@ -2715,7 +4117,11 @@ def _emit_norm_stats(model: dict[str, Any]) -> str:
     _line(lines, indent + 1, "mask = inner_lane < inner_size")
     append_inner_decode(lines, indent + 1)
     _line(lines, indent + 1, f"input_offsets = {input_offset()}")
-    _line(lines, indent + 1, "value0 = tl.load(input0 + input_offsets, mask=mask, other=0.0).to(tl.float32)")
+    _line(
+        lines,
+        indent + 1,
+        f"value0 = {_load_operand(model, 'Input', 'input0', 'input_offsets', 'mask')}.to(tl.float32)",
+    )
     if model["UseMean"]:
         _line(lines, indent + 1, "mean_sum += tl.sum(value0, axis=0)")
     _line(lines, indent + 1, "square_sum += tl.sum(value0 * value0, axis=0)")
@@ -2787,6 +4193,10 @@ def _emit_norm_apply(model: dict[str, Any]) -> str:
             _line(lines, indent, f"inner_idx{axis} = inner_remaining % {_dim(logical_output_shape[axis])}")
             _line(lines, indent, f"inner_remaining = inner_remaining // {_dim(logical_output_shape[axis])}")
 
+    def stats_load(component: int) -> str:
+        offset_value = stats_offset(component)
+        return f"tl.load(stats0 + {offset_value}).to(tl.float32)"
+
     inner_size = _product(logical_output_shape[model["Axis"] :])
     normalization_size = _product(logical_input_global_shape[model["Axis"] :])
     input_offset = tensor_offset(model["InputShape"], logical_input_shape, model["InputStrides"], model["InputVectorLaneCount"])
@@ -2805,29 +4215,37 @@ def _emit_norm_apply(model: dict[str, Any]) -> str:
     _line(lines, indent, f"inner_size = {inner_size}")
     _line(lines, indent, f"inner_count = ({normalization_size}) + 0.0")
     if model["UseMean"]:
-        _line(lines, indent, f"mean_sum = tl.load(stats0 + {stats_offset(0)}).to(tl.float32)")
-        _line(lines, indent, f"square_sum = tl.load(stats0 + {stats_offset(1)}).to(tl.float32)")
+        _line(lines, indent, f"mean_sum = {stats_load(0)}")
+        _line(lines, indent, f"square_sum = {stats_load(1)}")
         _line(lines, indent, "mean_value = mean_sum / inner_count")
         _line(lines, indent, "variance = (square_sum / inner_count) - (mean_value * mean_value)")
     else:
-        _line(lines, indent, f"square_sum = tl.load(stats0 + {stats_offset(0)}).to(tl.float32)")
+        _line(lines, indent, f"square_sum = {stats_load(0)}")
         _line(lines, indent, "mean_value = 0.0")
         _line(lines, indent, "variance = square_sum / inner_count")
     _line(lines, indent, "variance = tl.maximum(variance, 0.0)")
     _line(lines, indent, f"inv_std = tl.rsqrt(variance + {model['Epsilon']!r})")
+    value_indent = indent + 1
     _line(lines, indent, "for inner_start in tl.range(0, inner_size, block_size):")
-    _line(lines, indent + 1, "inner_lane = inner_start + tl.arange(0, block_size)")
-    _line(lines, indent + 1, "mask = inner_lane < inner_size")
-    append_inner_decode(lines, indent + 1)
-    _line(lines, indent + 1, f"input_offsets = {input_offset}")
-    _line(lines, indent + 1, f"scale_offsets = {scale_offset}")
-    _line(lines, indent + 1, f"bias_offsets = {bias_offset}")
-    _line(lines, indent + 1, f"output_offsets = {output_offset}")
-    _line(lines, indent + 1, "value0 = tl.load(input0 + input_offsets, mask=mask, other=0.0).to(tl.float32)")
-    _line(lines, indent + 1, "scale_value = tl.load(scale0 + scale_offsets, mask=mask, other=0.0).to(tl.float32)")
-    _line(lines, indent + 1, "bias_value = tl.load(bias0 + bias_offsets, mask=mask, other=0.0).to(tl.float32)")
-    _line(lines, indent + 1, "result = ((value0 - mean_value) * inv_std * scale_value) + bias_value")
-    _line(lines, indent + 1, "tl.store(output + output_offsets, result, mask=mask)")
+    _line(lines, value_indent, "inner_lane = inner_start + tl.arange(0, block_size)")
+    _line(lines, value_indent, "mask = inner_lane < inner_size")
+    append_inner_decode(lines, value_indent)
+    _line(lines, value_indent, f"input_offsets = {input_offset}")
+    _line(lines, value_indent, f"scale_offsets = {scale_offset}")
+    _line(lines, value_indent, f"bias_offsets = {bias_offset}")
+    _line(lines, value_indent, f"output_offsets = {output_offset}")
+    _line(lines, value_indent, f"value0 = {_load_operand(model, 'Input', 'input0', 'input_offsets', 'mask')}.to(tl.float32)")
+    _line(lines, value_indent, f"scale_value = {_load_operand(model, 'Scale', 'scale0', 'scale_offsets', 'mask')}.to(tl.float32)")
+    _line(lines, value_indent, f"bias_value = {_load_operand(model, 'Bias', 'bias0', 'bias_offsets', 'mask')}.to(tl.float32)")
+    _line(lines, value_indent, "result = ((value0 - mean_value) * inv_std * scale_value) + bias_value")
+    _append_store(
+        lines,
+        value_indent,
+        "output",
+        "output_offsets",
+        "result",
+        "mask",
+    )
     return _finish(lines)
 
 
@@ -2862,36 +4280,37 @@ def _emit_rope(model: dict[str, Any]) -> str:
         f"# generated from PyNTT Jinja RoPE.py.jinja\n# {model['Comment']}; input_dtype={model['InputDType']}, cos_dtype={model['CosDType']}, sin_dtype={model['SinDType']}, output_dtype={model['OutputDType']}, shape={_shape_tuple(model['OutputShape'])}, rotary_axis={rotary_axis}",
         [("input0", "Input"), ("cos0", "Cos"), ("sin0", "Sin"), ("output", "Output")],
     )
+    indent = 2
     _line(lines, 1, f"for linear_start in tl.range(0, {total}, block_size):")
-    _line(lines, 2, "linear = linear_start + tl.arange(0, block_size)")
-    _line(lines, 2, f"mask = linear < {total}")
-    _line(lines, 2, f"lane_flat = linear % {model['OutputVectorLaneCount']}")
-    _line(lines, 2, f"output_tensor_linear = linear // {model['OutputVectorLaneCount']}")
-    _append_tensor_index_decompose(lines, 2, "output_tensor_linear", "idx", model["OutputShape"])
-    _line(lines, 2, f"logical_rotary = idx{rotary_axis} * {model['OutputVectorLaneCount']} + lane_flat")
-    _line(lines, 2, f"paired_logical = tl.where(logical_rotary < {half_dim}, logical_rotary + {half_dim}, logical_rotary - {half_dim})")
-    _line(lines, 2, f"paired_idx{rotary_axis} = paired_logical // {model['OutputVectorLaneCount']}")
-    _line(lines, 2, f"paired_lane = paired_logical % {model['OutputVectorLaneCount']}")
+    _line(lines, indent, "linear = linear_start + tl.arange(0, block_size)")
+    _line(lines, indent, f"mask = linear < {total}")
+    _line(lines, indent, f"lane_flat = linear % {model['OutputVectorLaneCount']}")
+    _line(lines, indent, f"output_tensor_linear = linear // {model['OutputVectorLaneCount']}")
+    _append_tensor_index_decompose(lines, indent, "output_tensor_linear", "idx", model["OutputShape"])
+    _line(lines, indent, f"logical_rotary = idx{rotary_axis} * {model['OutputVectorLaneCount']} + lane_flat")
+    _line(lines, indent, f"paired_logical = tl.where(logical_rotary < {half_dim}, logical_rotary + {half_dim}, logical_rotary - {half_dim})")
+    _line(lines, indent, f"paired_idx{rotary_axis} = paired_logical // {model['OutputVectorLaneCount']}")
+    _line(lines, indent, f"paired_lane = paired_logical % {model['OutputVectorLaneCount']}")
     if sincos_pack_factor == 1:
         cos_rotary_index = f"idx{rotary_axis}"
         cos_lane_index = "lane_flat"
     else:
-        _line(lines, 2, f"sincos_rotary = logical_rotary // ({sincos_pack_factor} * {model['OutputVectorLaneCount']})")
-        _line(lines, 2, f"sincos_lane = ((logical_rotary // {model['OutputVectorLaneCount']}) % {sincos_pack_factor}) * {model['OutputVectorLaneCount']} + lane_flat")
+        _line(lines, indent, f"sincos_rotary = logical_rotary // ({sincos_pack_factor} * {model['OutputVectorLaneCount']})")
+        _line(lines, indent, f"sincos_lane = ((logical_rotary // {model['OutputVectorLaneCount']}) % {sincos_pack_factor}) * {model['OutputVectorLaneCount']} + lane_flat")
         cos_rotary_index = "sincos_rotary"
         cos_lane_index = "sincos_lane"
-    _line(lines, 2, f"input_offsets = {offset(model['InputShape'], model['InputStrides'], model['InputVectorLaneCount'], f'idx{rotary_axis}', 'lane_flat')}")
-    _line(lines, 2, f"paired_input_offsets = {offset(model['InputShape'], model['InputStrides'], model['InputVectorLaneCount'], f'paired_idx{rotary_axis}', 'paired_lane')}")
-    _line(lines, 2, f"cos_offsets = {offset(model['CosShape'], model['CosStrides'], model['CosVectorLaneCount'], cos_rotary_index, cos_lane_index)}")
-    _line(lines, 2, f"sin_offsets = {offset(model['SinShape'], model['SinStrides'], model['SinVectorLaneCount'], cos_rotary_index, cos_lane_index)}")
-    _line(lines, 2, f"output_offsets = {output_offset()}")
-    _line(lines, 2, "value0 = tl.load(input0 + input_offsets, mask=mask).to(tl.float32)")
-    _line(lines, 2, "paired_value = tl.load(input0 + paired_input_offsets, mask=mask).to(tl.float32)")
-    _line(lines, 2, "cos_value = tl.load(cos0 + cos_offsets, mask=mask).to(tl.float32)")
-    _line(lines, 2, "sin_value = tl.load(sin0 + sin_offsets, mask=mask).to(tl.float32)")
-    _line(lines, 2, f"rotated = tl.where(logical_rotary < {half_dim}, -paired_value, paired_value)")
-    _line(lines, 2, "result = value0 * cos_value + rotated * sin_value")
-    _line(lines, 2, "tl.store(output + output_offsets, result, mask=mask)")
+    _line(lines, indent, f"input_offsets = {offset(model['InputShape'], model['InputStrides'], model['InputVectorLaneCount'], f'idx{rotary_axis}', 'lane_flat')}")
+    _line(lines, indent, f"paired_input_offsets = {offset(model['InputShape'], model['InputStrides'], model['InputVectorLaneCount'], f'paired_idx{rotary_axis}', 'paired_lane')}")
+    _line(lines, indent, f"cos_offsets = {offset(model['CosShape'], model['CosStrides'], model['CosVectorLaneCount'], cos_rotary_index, cos_lane_index)}")
+    _line(lines, indent, f"sin_offsets = {offset(model['SinShape'], model['SinStrides'], model['SinVectorLaneCount'], cos_rotary_index, cos_lane_index)}")
+    _line(lines, indent, f"output_offsets = {output_offset()}")
+    _line(lines, indent, f"value0 = {_load_operand(model, 'Input', 'input0', 'input_offsets', 'mask')}.to(tl.float32)")
+    _line(lines, indent, f"paired_value = {_load_operand(model, 'Input', 'input0', 'paired_input_offsets', 'mask')}.to(tl.float32)")
+    _line(lines, indent, f"cos_value = {_load_operand(model, 'Cos', 'cos0', 'cos_offsets', 'mask')}.to(tl.float32)")
+    _line(lines, indent, f"sin_value = {_load_operand(model, 'Sin', 'sin0', 'sin_offsets', 'mask')}.to(tl.float32)")
+    _line(lines, indent, f"rotated = tl.where(logical_rotary < {half_dim}, -paired_value, paired_value)")
+    _line(lines, indent, "result = value0 * cos_value + rotated * sin_value")
+    _append_store(lines, indent, "output", "output_offsets", "result", "mask")
     return _finish(lines)
 
 
@@ -3192,24 +4611,26 @@ def _emit_get_position_ids(model: dict[str, Any]) -> str:
     _append_pointer_shard_coords(lines, 1, [model["Output"]])
     _line(lines, 1, f"output = {_ptr(model, 'Output')}")
     _line(lines, 1, f"global_start = {_dim(model['OutputGlobalOffsets'][0])}")
+    indent = 2
+    result_shape = "block_size"
     _line(lines, 1, f"for axis_start in tl.range(0, {_dim(local_extent)}, block_size):")
-    _line(lines, 2, "lane = axis_start + tl.arange(0, block_size)")
-    _line(lines, 2, f"mask = lane < {_dim(local_extent)}")
-    _line(lines, 2, "global_lane = global_start + lane")
-    _line(lines, 2, "result = tl.full((block_size,), 0.0, tl.float32)")
-    _line(lines, 2, "active = tl.full((block_size,), False, tl.int1)")
-    _line(lines, 2, "num_seqs = tl.load(cache_meta + 0).to(tl.int64)")
-    _line(lines, 2, "query_start = tl.full((), 0, tl.int64)")
-    _line(lines, 2, "for seq_id in tl.range(0, num_seqs):")
-    _line(lines, 3, "context_len = tl.load(cache_meta + 1 + seq_id * 2)")
-    _line(lines, 3, "seq_len = tl.load(cache_meta + 2 + seq_id * 2)")
-    _line(lines, 3, "query_len = seq_len - context_len")
-    _line(lines, 3, "query_end = query_start + query_len")
-    _line(lines, 3, "in_seq = (global_lane >= query_start) & (global_lane < query_end)")
-    _line(lines, 3, "result = tl.where(in_seq, (context_len + global_lane - query_start).to(tl.float32), result)")
-    _line(lines, 3, "active = active | in_seq")
-    _line(lines, 3, "query_start = query_end")
-    _line(lines, 2, f"tl.store(output + lane * {_dim(model['OutputStrides'][0])}, result, mask=mask & active)")
+    _line(lines, indent, "lane = axis_start + tl.arange(0, block_size)")
+    _line(lines, indent, f"mask = lane < {_dim(local_extent)}")
+    _line(lines, indent, "global_lane = global_start + lane")
+    _line(lines, indent, f"result = tl.full(({result_shape},), 0.0, tl.float32)")
+    _line(lines, indent, f"active = tl.full(({result_shape},), False, tl.int1)")
+    _line(lines, indent, "num_seqs = tl.load(cache_meta + 0).to(tl.int64)")
+    _line(lines, indent, "query_start = tl.full((), 0, tl.int64)")
+    _line(lines, indent, "for seq_id in tl.range(0, num_seqs):")
+    _line(lines, indent + 1, "context_len = tl.load(cache_meta + 1 + seq_id * 2)")
+    _line(lines, indent + 1, "seq_len = tl.load(cache_meta + 2 + seq_id * 2)")
+    _line(lines, indent + 1, "query_len = seq_len - context_len")
+    _line(lines, indent + 1, "query_end = query_start + query_len")
+    _line(lines, indent + 1, "in_seq = (global_lane >= query_start) & (global_lane < query_end)")
+    _line(lines, indent + 1, "result = tl.where(in_seq, (context_len + global_lane - query_start).to(tl.float32), result)")
+    _line(lines, indent + 1, "active = active | in_seq")
+    _line(lines, indent + 1, "query_start = query_end")
+    _line(lines, indent, f"tl.store(output + lane * {_dim(model['OutputStrides'][0])}, result, mask=mask & active)")
     return _finish(lines)
 
 
@@ -3497,7 +4918,16 @@ def _emit_summa(model: dict[str, Any]) -> str:
 
 def _emit_paged_attention(model: dict[str, Any]) -> str:
     cache = model["Cache"]
-    attention_block_size = 64
+    attention_block_size = int(model["AttentionBlockSize"])
+    if (
+        attention_block_size <= 0
+        or attention_block_size & (attention_block_size - 1)
+        or attention_block_size > int(cache["BlockSize"])
+    ):
+        raise ValueError(
+            "PyNTT PagedAttention AttentionBlockSize must be a positive power "
+            f"of two no larger than the cache block size, got {attention_block_size}."
+        )
 
     def tensor_offset(strides: list[Any], seq_axis: int, head_axis: int, dim_axis: int, head: str, dim_block: str, token: str, lane: str, lane_count: int) -> str:
         indices = ["0"] * len(strides)

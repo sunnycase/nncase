@@ -198,6 +198,23 @@ public sealed class UnitTestTensorUtilities
     }
 
     [Fact]
+    public void TestDynamicDefaultStridesRemainDense()
+    {
+        var dynamicExtent = new DimVar("dynamic_extent")
+        {
+            Metadata = new()
+            {
+                Range = new(1, 128),
+            },
+        };
+
+        var actual = TensorUtilities.GetDefaultStrides(new Dimension[] { 4, dynamicExtent });
+
+        Assert.Equal(dynamicExtent, actual[0]);
+        Assert.Equal(Dimension.One, actual[1]);
+    }
+
+    [Fact]
     public void TestGetSize()
     {
         var shapes = new long[] { 1, 2, 4, 8 };

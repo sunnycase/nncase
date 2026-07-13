@@ -26,7 +26,7 @@ public sealed partial class MatMulGlu : NTTKernelOp
 
     public static readonly ParameterInfo UpWeightScale = new(typeof(MatMulGlu), 8, "up_weight_scale", memoryEffect: MemoryEffect.Read);
 
-    public static readonly ParameterInfo Output = new(typeof(MatMulGlu), 9, "output", memoryEffect: MemoryEffect.Write);
+    public static readonly ParameterInfo Output = new(typeof(MatMulGlu), 9, "output", memoryEffect: MemoryEffect.ReductionWrite);
 
     public GluType GluType { get; }
 

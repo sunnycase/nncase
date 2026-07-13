@@ -9,6 +9,18 @@ using System.Threading.Tasks;
 
 namespace Nncase.CodeGen.NTT;
 
+public enum ReductionKernelPhase
+{
+    Accumulate,
+    Finalize,
+}
+
+public sealed record ReductionKernelTemplateContext(
+    ReductionKernelPhase Phase,
+    string[] Accumulators,
+    string Initialized,
+    string? ElementCount);
+
 public class KernelArgument
 {
     public CSymbol Symbol { get; set; } = null!;
@@ -19,6 +31,8 @@ public class KernelTemplateModel
     public KernelArgument[] Arguments { get; set; } = null!;
 
     public string Indent { get; set; } = string.Empty;
+
+    public ReductionKernelTemplateContext? Reduction { get; set; }
 }
 
 public class UnaryKernelTemplateModel : KernelTemplateModel

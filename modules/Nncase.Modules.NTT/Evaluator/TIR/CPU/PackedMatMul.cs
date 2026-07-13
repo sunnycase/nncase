@@ -12,7 +12,7 @@ public sealed class PackedMatMulEvaluator : ITypeInferencer<PackedMatMul>, ITile
 {
     public IRType Visit(ITypeInferenceContext context, PackedMatMul target) => TupleType.Void;
 
-    public TileWorkload Visit(PackedMatMul op, TileWorkloadContext context) => new MatrixTileWorkload(GetMatrixShape);
+    public TileWorkload Visit(PackedMatMul op, TileWorkloadContext context) => new MatrixTileWorkload(GetMatrixShape, DataTypes.Float32.SizeInBytes);
 
     private static MatrixTileWorkloadShape GetMatrixShape(Google.OrTools.ConstraintSolver.IntExpr[][] bufferShapes, Google.OrTools.ConstraintSolver.Solver solver, TileWorkloadContext context)
     {

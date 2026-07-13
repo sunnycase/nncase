@@ -12,7 +12,7 @@ public sealed class MatMulGluEvaluator : ITypeInferencer<MatMulGlu>, ITileWorklo
 {
     public IRType Visit(ITypeInferenceContext context, MatMulGlu target) => TupleType.Void;
 
-    public TileWorkload Visit(MatMulGlu op, TileWorkloadContext context) => new MatrixTileWorkload(GetMatrixShape);
+    public TileWorkload Visit(MatMulGlu op, TileWorkloadContext context) => new MatrixTileWorkload(GetMatrixShape, DataTypes.Float32.SizeInBytes);
 
     private static MatrixTileWorkloadShape GetMatrixShape(Google.OrTools.ConstraintSolver.IntExpr[][] bufferShapes, Google.OrTools.ConstraintSolver.Solver solver, TileWorkloadContext context)
     {

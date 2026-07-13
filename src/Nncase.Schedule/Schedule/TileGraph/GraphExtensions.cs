@@ -135,56 +135,6 @@ public static class GraphExtensions
         }
     }
 
-    public static bool Merge(this TieredTileGraph graph, MergePoint mergePoint)
-    {
-        var merger = new GraphMerger(
-            mergePoint.Consumer,
-            mergePoint.Producer,
-            mergePoint.Level,
-            mergePoint.ConsumerAccessIndex);
-        return merger.Visit(graph);
-    }
-
-    public static List<MergePoint> GetMergePoints(this TieredTileGraph graph)
-    {
-        var mergePoints = new List<MergePoint>();
-        if (graph.Level != -1)
-        {
-            throw new InvalidOperationException("only can merge at top level!");
-        }
-
-        var children = graph.Clusters.OfType<TieredTileGraph>().ToArray();
-        foreach (var producer in children)
-        {
-            foreach (var comsumer in children)
-            {
-                if (ReferenceEquals(producer, comsumer))
-                {
-                    continue;
-                }
-
-                foreach (var edge in graph.Edges)
-                {
-                    if (comsumer.ContainsVertex(edge.Source) && producer.ContainsVertex(edge.Target))
-                    {
-                        if (edge.Target.IsPureBufferView &&
-                            (edge.Target.Attribute.HasFlag(TileGridAttribute.LiveOut) || graph.OutDegree(edge.Target) > 1))
-                        {
-                            continue;
-                        }
-
-                        if (IsFusionLegal(edge.Source, edge.Target, edge.Tag))
-                        {
-                            mergePoints.Add(new(edge.Target, edge.Source, producer.Level, edge.Tag));
-                        }
-                    }
-                }
-            }
-        }
-
-        return mergePoints;
-    }
-
     public static void Walk(this TieredTileGraph graph, Action<ITileable> func, bool postOrder = false)
     {
         if (!postOrder)
@@ -240,6 +190,16 @@ public static class GraphExtensions
         cv.Compute();
         return cv.BufferGraphMemo;
     }
+
+    /// <summary>
+    /// Gets inter-op edges materialized by this exact hierarchy level. A
+    /// tiered graph propagates child edges to its ancestors, so membership in
+    /// <see cref="BufferGraph.Edges"/> alone does not imply ownership.
+    /// </summary>
+    public static IEnumerable<EquatableTaggedEdge<BufferIdentity, BufferEdgeKind>> GetOwnedInterEdges(this BufferGraph graph)
+        => graph.Edges.Where(edge =>
+            edge.Tag == BufferEdgeKind.Inter &&
+            !graph.Clusters.OfType<BufferGraph>().Any(child => child.ContainsEdge(edge)));
 
     public static void PruneDeadBufferViews(this TieredTileGraph rootGraph)
     {
@@ -482,7 +442,7 @@ public static class GraphExtensions
             {
                 if (!updatedMemo.TryGetValue(item, out var newItem))
                 {
-                    newItem = new TileGrid(item.Grid, item.Op, item.OpId, item.DomainBounds.ToArray(), item.DomainRelation, item.DomainBoundExprs.ToArray(), item.DomainDynamic.ToArray(), item.BufferShapes.Select(x => x.ToArray()), item.Attribute);
+                    newItem = new TileGrid(item.Grid, item.Op, item.OpId, item.RegionOpId, item.DomainBounds.ToArray(), item.DomainRelation, item.DomainBoundExprs.ToArray(), item.DomainDynamic.ToArray(), item.BufferShapes.Select(x => x.ToArray()), item.Attribute);
                     updatedMemo.Add(item, newItem);
                 }
 

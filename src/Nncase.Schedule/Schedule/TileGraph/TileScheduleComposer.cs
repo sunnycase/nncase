@@ -7,6 +7,7 @@ using System.Reactive;
 using NetFabric.Hyperlinq;
 using Nncase.IR;
 using Nncase.IR.Affine;
+using Nncase.IR.Shapes;
 using QuikGraph;
 using QuikGraph.Algorithms;
 using QuikGraph.Algorithms.ShortestPath;
@@ -14,14 +15,13 @@ using QuikGraph.Graphviz;
 
 namespace Nncase.Schedule.TileGraph;
 
-public sealed record MergePoint(TileGrid Consumer, TileGrid Producer, int Level, int ConsumerAccessIndex)
+/// <summary>
+/// Materializes an immutable connection plan as a derived schedule graph.
+/// The graph is mutable only while this builder is constructing one plan.
+/// </summary>
+internal sealed class TileScheduleComposer
 {
-    public override string ToString() => $"merge({Consumer}.in{ConsumerAccessIndex},{Producer},{Level})";
-}
-
-public sealed class GraphMerger
-{
-    public GraphMerger(TileGrid opConsumer, TileGrid opProducer, int level, int consumerAccessIndex)
+    private TileScheduleComposer(TileGrid opConsumer, TileGrid opProducer, int level, int consumerAccessIndex)
     {
         ConsumerOp = opConsumer;
         ProducerOp = opProducer;
@@ -39,6 +39,41 @@ public sealed class GraphMerger
     public int ConsumerAccessIndex { get; }
 
     public TieredTileGraph RootGraph { get; set; }
+
+    private string Failure { get; set; } = string.Empty;
+
+    public static bool TryApply(TieredTileGraph graph, TileUseId use, int level, out string failure)
+    {
+        var edge = graph.Edges.SingleOrDefault(candidate =>
+            candidate.Source.RegionOpId == use.ProducerOpId &&
+            candidate.Target.RegionOpId == use.ConsumerOpId &&
+            candidate.Tag == use.ConsumerAccessIndex);
+        if (edge is null)
+        {
+            throw new InvalidOperationException($"Tile region no longer contains use {use}.");
+        }
+
+        var producer = edge.Source;
+        var consumer = edge.Target;
+
+        var actualOutputIndex = GraphExtensions.GetProducerOutputIndex(
+            consumer.Grid.Accesses[use.ConsumerAccessIndex].Value,
+            producer);
+        if (actualOutputIndex != use.ProducerOutputIndex)
+        {
+            throw new InvalidOperationException(
+                $"Tile use {use} resolves to producer output {actualOutputIndex} while constructing its schedule.");
+        }
+
+        var composer = new TileScheduleComposer(consumer, producer, level, use.ConsumerAccessIndex);
+        var success = composer.Visit(graph);
+        failure = success
+            ? string.Empty
+            : string.IsNullOrEmpty(composer.Failure)
+                ? "No legal composition path reaches the requested hierarchy level."
+                : composer.Failure;
+        return success;
+    }
 
     public bool Visit(TieredTileGraph graph)
     {
@@ -65,6 +100,7 @@ public sealed class GraphMerger
             edge.Tag == ConsumerAccessIndex);
         if (useEdge is null || !TryFindStandaloneTopLevelCluster(ProducerOp, out var producerTopLevel))
         {
+            Failure = $"Shared buffer view {ProducerOp} has no standalone hierarchy that can be cloned for this use.";
             return false;
         }
 
@@ -73,6 +109,7 @@ public sealed class GraphMerger
             ProducerOp.Grid,
             ProducerOp.Op,
             scheduleOpId,
+            ProducerOp.RegionOpId,
             ProducerOp.DomainBounds,
             new DomainRelation(scheduleOpId, scheduleOpId, AffineMap.Identity(ProducerOp.DomainBounds.Length)),
             ProducerOp.DomainBoundExprs.ToArray(),
@@ -88,7 +125,7 @@ public sealed class GraphMerger
 
         RootGraph.RemoveEdge(useEdge);
         RootGraph.AddEdge(new(clonedView, ConsumerOp, ConsumerAccessIndex));
-        return new GraphMerger(ConsumerOp, clonedView, TargetLevel, ConsumerAccessIndex).Visit(RootGraph);
+        return new TileScheduleComposer(ConsumerOp, clonedView, TargetLevel, ConsumerAccessIndex).Visit(RootGraph);
     }
 
     private bool TryFindStandaloneTopLevelCluster(
@@ -149,11 +186,13 @@ public sealed class GraphMerger
     {
         if (!GatherSubGraphs(graph, out var producerGraph, out var consumerGraph))
         {
+            Failure = $"Could not locate distinct producer and consumer clusters below {graph}.";
             return false;
         }
 
         if (!CheckSubGraphsDenpendence(producerGraph, consumerGraph))
         {
+            Failure = $"Fusing {producerGraph} into {consumerGraph} violates dependence convexity or a chip-visible memory effect.";
             return false;
         }
 
@@ -168,39 +207,42 @@ public sealed class GraphMerger
         algo.Compute();
         if (!algo.TryGetPath(ProducerOp, ConsumerOp, out var dependencePath))
         {
+            Failure = $"No data-dependence path exists from {ProducerOp} to {ConsumerOp}.";
             return false;
         }
 
         var relayOp = dependencePath.First().Target;
 
-        // 1.2. build the dataflow graph from consumer graph -> sub graph -> relay node.
-        ITileable consumerParent = consumerGraph;
-        var relationChain = new List<ITileable>();
-        while (consumerParent is TieredTileGraph tileGraph)
-        {
-            ITileable consumerChild = tileGraph.Clusters.OfType<TieredTileGraph>().Where(sg => sg.ContainsVertex(relayOp)).Cast<ITileable>().FirstOrDefault(relayOp);
-            relationChain.Add(consumerChild);
-            consumerParent = consumerChild;
-        }
-
-        // 1.3 build the domain relation betwwen relay op -> producer op.
+        // 1.2. build the direct domain relation from the consumer use to the
+        // producer result.
         var consumerAccessIndex = dependencePath.First().Tag;
         var readAccess = relayOp.GetAccessMap(consumerAccessIndex);
         var producerOutputIndex = GraphExtensions.GetProducerOutputIndex(relayOp.Grid.Accesses[consumerAccessIndex].Value, ProducerOp);
         var producerWriteAccess = ProducerOp.GetWriteAccess(producerOutputIndex);
         var relation = readAccess * AffineUtility.Inverse(producerWriteAccess, ProducerOp.DomainBounds.Select(Convert.ToInt64).ToArray());
-        if (!relation.IsProjectedPermutation(true))
+        if (!relation.IsRectangularProjection(true))
         {
+            Failure = $"Connection relation from {ProducerOp} to {relayOp} does not preserve rectangular tile regions: {relation}.";
             return false;
         }
 
-        var domainRel = new DomainRelation(relayOp.OpId, ProducerOp.OpId, relation);
-
-        // 1.4 apply domain relation until consumerGraph
-        foreach (var mappable in relationChain.Reverse<ITileable>())
+        var consumerToRelay = GetDescendantRelation(consumerGraph, relayOp);
+        var consumerToProducerOp = consumerToRelay.ApplyRange(
+            new DomainRelation(relayOp.OpId, ProducerOp.OpId, relation));
+        var producerGraphToProducerOp = GetDescendantRelation(producerGraph, ProducerOp);
+        if (!producerGraphToProducerOp.Map.IsRectangularProjection(true))
         {
-            domainRel = mappable.DomainRelation.ApplyRange(domainRel);
+            Failure = $"Producer cluster relation to {ProducerOp} does not preserve rectangular tile regions: {producerGraphToProducerOp.Map}.";
+            return false;
         }
+
+        var producerGraphBounds = CompilerServices.GetMaxShape(
+            new RankedShape(producerGraph.DomainBoundExprs.ToArray()));
+        var producerOpToGraph = new DomainRelation(
+            ProducerOp.OpId,
+            producerGraph.OpId,
+            AffineUtility.Inverse(producerGraphToProducerOp.Map, producerGraphBounds));
+        var domainRel = consumerToProducerOp.ApplyRange(producerOpToGraph);
 
         // 4. merge producerGraph's subgrph into the consumerGraph.
         commonAncestor.RemoveCluster(producerGraph);
@@ -222,6 +264,33 @@ public sealed class GraphMerger
 
         consumerGraph.AddVertexRange(producerGraph.Vertices);
         return true;
+    }
+
+    private static DomainRelation GetDescendantRelation(TieredTileGraph ancestor, TileGrid descendant)
+    {
+        if (!ancestor.ContainsVertex(descendant))
+        {
+            throw new InvalidOperationException($"{descendant} is not contained by {ancestor}.");
+        }
+
+        DomainRelation? relation = null;
+        TieredTileGraph current = ancestor;
+        while (true)
+        {
+            var childGraph = current.Clusters
+                .OfType<TieredTileGraph>()
+                .SingleOrDefault(cluster => cluster.ContainsVertex(descendant));
+            ITileable child = childGraph is null ? descendant : childGraph;
+            relation = relation is null
+                ? child.DomainRelation
+                : relation.ApplyRange(child.DomainRelation);
+            if (childGraph is null)
+            {
+                return relation;
+            }
+
+            current = childGraph;
+        }
     }
 
     private bool CheckSubGraphsDenpendence(TieredTileGraph producer, TieredTileGraph consumer)
@@ -274,27 +343,26 @@ public sealed class GraphMerger
 
     private bool GatherSubGraphs(TieredTileGraph graph, [MaybeNullWhen(false)] out TieredTileGraph producer, [MaybeNullWhen(false)] out TieredTileGraph consumer)
     {
-        producer = null!;
-        consumer = null!;
-        foreach (var s1 in graph.Clusters.OfType<TieredTileGraph>().Where(s => s.OpId == ProducerOp.OpId))
-        {
-            foreach (var s2 in graph.Clusters.OfType<TieredTileGraph>().Where(s => s.OpId == ConsumerOp.OpId))
-            {
-                if (s1.ContainsVertex(ProducerOp) && !s1.ContainsVertex(ConsumerOp) &&
-                    !s2.ContainsVertex(ProducerOp) && s2.ContainsVertex(ConsumerOp))
-                {
-                    producer = s1;
-                    consumer = s2;
-                    return true;
-                }
-            }
-        }
-
-        return false;
+        producer = graph.Clusters
+            .OfType<TieredTileGraph>()
+            .SingleOrDefault(cluster => cluster.ContainsVertex(ProducerOp));
+        consumer = graph.Clusters
+            .OfType<TieredTileGraph>()
+            .SingleOrDefault(cluster => cluster.ContainsVertex(ConsumerOp));
+        return producer is not null &&
+            consumer is not null &&
+            !ReferenceEquals(producer, consumer);
     }
 
     private bool VisitRecursion(TieredTileGraph graph)
     {
+        if (graph.Level == TargetLevel &&
+            graph.ContainsVertex(ProducerOp) &&
+            graph.ContainsVertex(ConsumerOp))
+        {
+            return true;
+        }
+
         if (graph.Level > 0 && graph.Level <= TargetLevel)
         {
             return false;

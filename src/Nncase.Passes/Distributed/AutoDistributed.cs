@@ -3338,7 +3338,11 @@ internal sealed class DistributedProgramMaterializer
                 .Select(parameter => parameterMap.TryGetValue(parameter, out var mapped) ? mapped : parameter)
                 .ToArray();
             var newVarMap = RemapVarMap(function, parameterMap);
-            var newFunction = new Function(function.Name, function.ModuleKind, body, parameters, newVarMap) { Metadata = function.Metadata };
+            var newFunction = new Function(function.Name, function.ModuleKind, body, parameters, newVarMap)
+            {
+                Metadata = function.Metadata,
+                Role = function.Role,
+            };
             if (!CompilerServices.InferenceType(newFunction) || newFunction.CheckedType is InvalidType)
             {
                 throw new InvalidOperationException($"AutoDistributed materialized function {function.Name} produced invalid type: {newFunction.CheckedType}.");

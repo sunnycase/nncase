@@ -41,19 +41,18 @@ def validate_triton_kernel_resources(
     *args,
     grid,
     expected_num_warps: int,
-    worker_width: int,
-    register_capacity_bytes: int,
     shared_memory_capacity_bytes: int,
     forbid_spills: bool,
     **kwargs,
 ) -> None:
     """Compile and validate one specialization before its first launch."""
-    compiled = kernel.warmup(*args, grid=grid, **kwargs)
+    # Compile the exact specialization that the subsequent launch will use.
+    # KernelInterface.warmup() replaces tensors with MockTensor values and can
+    # therefore drop pointer-alignment attributes from the specialization key.
+    compiled = kernel.run(*args, grid=grid, warmup=True, **kwargs)
     key = (
         compiled.hash,
         expected_num_warps,
-        worker_width,
-        register_capacity_bytes,
         shared_memory_capacity_bytes,
         forbid_spills,
     )
@@ -75,22 +74,13 @@ def validate_triton_kernel_resources(
             f"exceeding the target limit {shared_memory_capacity_bytes}."
         )
 
-    register_bytes = (
-        int(compiled.n_regs) * expected_num_warps * worker_width * 4
-    )
-    if register_bytes > register_capacity_bytes:
-        raise TritonKernelResourceError(
-            f"Triton kernel {compiled.name} uses {register_bytes} register bytes per block, "
-            f"exceeding the target limit {register_capacity_bytes}."
-        )
-
     spill_stores = int(compiled.n_spill_stores)
     spill_loads = int(compiled.n_spill_loads)
     if forbid_spills and (spill_stores != 0 or spill_loads != 0):
         raise TritonKernelResourceError(
             f"Triton kernel {compiled.name} has {spill_stores} spill-store bytes "
             f"and {spill_loads} spill-load bytes with "
-            f"n_regs={int(compiled.n_regs)}, register_bytes={register_bytes}, "
+            f"n_regs={int(compiled.n_regs)}, "
             f"shared_bytes={shared_bytes}, stack_bytes={int(compiled.n_stack_bytes)}, "
             f"local_bytes={int(compiled.n_local_bytes)}; the target model forbids "
             "register spilling."
@@ -109,8 +99,6 @@ def select_and_validate_triton_tuning_parameter(
     kernel_args: tuple[object, ...],
     grid_for_candidate,
     expected_num_warps: int,
-    worker_width: int,
-    register_capacity_bytes: int,
     shared_memory_capacity_bytes: int,
     forbid_spills: bool,
     **launch_options,
@@ -137,8 +125,6 @@ def select_and_validate_triton_tuning_parameter(
             )
         ),
         expected_num_warps,
-        worker_width,
-        register_capacity_bytes,
         shared_memory_capacity_bytes,
         forbid_spills,
     )
@@ -154,8 +140,6 @@ def select_and_validate_triton_tuning_parameter(
                 candidate,
                 grid=grid_for_candidate(candidate),
                 expected_num_warps=expected_num_warps,
-                worker_width=worker_width,
-                register_capacity_bytes=register_capacity_bytes,
                 shared_memory_capacity_bytes=shared_memory_capacity_bytes,
                 forbid_spills=forbid_spills,
                 **launch_options,

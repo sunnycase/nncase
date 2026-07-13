@@ -40,15 +40,17 @@ public record NodeWithBufferInfo(long Size, Tuple<int, int> Liveness, long[] Sha
 /// <param name="GlobalOffsets">The global offsets for the buffer.</param>
 /// <param name="LocalOffsets">The local offsets of parent for the buffer.</param>
 /// <param name="Shape">The shape of the view.</param>
-internal sealed record ViewInfo(ViewInfo? Parent, Expr View, Var? ViewVar, Expr Buffer, RankedShape GlobalOffsets, RankedShape LocalOffsets, RankedShape Shape)
+/// <param name="RequiresParentTransfer">Whether this view owns storage that requires an explicit load/store to its parent.</param>
+internal sealed record ViewInfo(ViewInfo? Parent, Expr View, Var? ViewVar, Expr Buffer, RankedShape GlobalOffsets, RankedShape LocalOffsets, RankedShape Shape, bool RequiresParentTransfer)
 {
+    public Expr Value => ViewVar ?? View;
 }
 
 public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<TreeSolveResult.Context, Unit>
 {
     private readonly Dictionary<ITileable, Dictionary<BufferIdentity, ViewInfo>> _viewInfoMemo;
 
-    public TreeSolveResult(BufferGraph primBufferGraph, long objectiveValue, Dictionary<int, Dictionary<NodeWithBuffer, NodeWithBufferInfo>> levelNodeBufferInfos, Dictionary<OpNode, OpNodeInfo<long>> primitiveBufferInfo, Dictionary<TileNode, TileNodeInfo<long>> levelBufferInfos, Dictionary<ITileable, DomainInfo<long>> domainInfos, INTTTargetOptions targetOptions, string moduleKind)
+    public TreeSolveResult(BufferGraph primBufferGraph, long objectiveValue, Dictionary<int, Dictionary<NodeWithBuffer, NodeWithBufferInfo>> levelNodeBufferInfos, Dictionary<OpNode, OpNodeInfo<long>> primitiveBufferInfo, Dictionary<TileNode, TileNodeInfo<long>> levelBufferInfos, Dictionary<ITileable, DomainInfo<long>> domainInfos, IReadOnlyDictionary<TileUseId, int> selectedUseLevels, INTTTargetOptions targetOptions, string moduleKind)
         : base(null!, primitiveBufferInfo, levelBufferInfos, domainInfos, targetOptions)
     {
         PrimBufferGraph = primBufferGraph;
@@ -87,11 +89,14 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
 
         ObjectiveValue = objectiveValue;
         LevelNodeBufferInfos = levelNodeBufferInfos;
+        SelectedUseLevels = selectedUseLevels;
         ModuleKind = moduleKind;
         _viewInfoMemo = new();
     }
 
     public BufferGraph PrimBufferGraph { get; }
+
+    public IReadOnlyDictionary<TileUseId, int> SelectedUseLevels { get; }
 
     public HashSet<BufferIdentity> Inputs { get; }
 
@@ -193,6 +198,7 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
 
         var nodeMemo = TileNodeMemo[value];
         var domainRank = value.DomainRelation.Map.Results.Length;
+        var reductionAxes = ReductionAxisAnalysis.GetReductionAxes(value);
 
         // create tile map from tile vars
         Isl.map tilemap;
@@ -230,7 +236,10 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
             Dimension start = 0L;
             Dimension stop = currentExtents[i];
             Dimension stride = nodeMemo.BackWardExtents[0][i] / TileableNodeMemo[value].TileVars[i];
-            loopBuilders[i] = T.Serial(out var loopVar, (0L, stop, stride), $"d{i}_Op{value.OpId}_L{value.Level}");
+            DimVar loopVar;
+            loopBuilders[i] = reductionAxes[i] && value.Level == 0
+                ? T.Reduction(out loopVar, (0L, stop, stride), $"d{i}_Op{value.OpId}_L{value.Level}")
+                : T.Serial(out loopVar, (0L, stop, stride), $"d{i}_Op{value.OpId}_L{value.Level}");
             loopVar.Metadata.Range = new(0, nodeMemo.BackWardExtents[0][i]);
             loopVars[i] = loopVar;
             paramDimMap.Add($"d{i}_out", loopVar);
@@ -306,17 +315,17 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
                     // note when create loop is inner loop, the buffer load store should be instert by children's order.
                     {
                         var localBuilder = ci < loopVars.Length ? cntBuilder : childBuilders[FetchBidOwnerIndex(value, bid)];
-                        if (bid.Access.BindingMode == GridBindingMode.Subview && !TargetOptions.UnifiedMemoryArch && viewInfo.Parent is ViewInfo parentViewInfo)
+                        if (viewInfo.RequiresParentTransfer && viewInfo.Parent is ViewInfo parentViewInfo)
                         {
                             var localEffect = bid.Node.LocalAccessEffects[bid.Index];
                             if (!bid.IsOutput && localEffect.Mode.HasFlag(MemoryAccessMode.Read))
                             {
-                                localBuilder.Body(T.Memcopy(viewInfo.ViewVar!, IR.F.Buffer.BufferSubview(parentViewInfo.ViewVar ?? parentViewInfo.Buffer, viewInfo.LocalOffsets, viewInfo.Shape)));
+                                localBuilder.Body(T.TileLoad(viewInfo.ViewVar!, IR.F.Buffer.BufferSubview(parentViewInfo.Value, viewInfo.LocalOffsets, viewInfo.Shape)));
                             }
 
                             if (bid.IsOutput && localEffect.Mode.HasFlag(MemoryAccessMode.Write))
                             {
-                                localBuilder.Tail(T.Memcopy(IR.F.Buffer.BufferSubview(parentViewInfo.ViewVar ?? parentViewInfo.Buffer, viewInfo.LocalOffsets, viewInfo.Shape), viewInfo.ViewVar!));
+                                localBuilder.Tail(T.TileStore(viewInfo.ViewVar!, IR.F.Buffer.BufferSubview(parentViewInfo.Value, viewInfo.LocalOffsets, viewInfo.Shape)));
                             }
                         }
                     }
@@ -384,8 +393,8 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
 
             offsets = ISLUtility.RoundTrip(offsets);
             bufferViews[i] = access.BindingMode == GridBindingMode.Root
-                ? parentViewInfo.ViewVar ?? parentViewInfo.Buffer
-                : IR.F.Buffer.BufferSubview(parentViewInfo.ViewVar ?? parentViewInfo.Buffer, offsets, shape);
+                ? parentViewInfo.Value
+                : IR.F.Buffer.BufferSubview(parentViewInfo.Value, offsets, shape);
 
             bodyVarReplaces.Add(access.Parameter, bufferViews[i]);
         }
@@ -417,7 +426,7 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
                 {
                     var x = model.NewFixedSizeIntervalVar(info.Liveness.Item1, info.Liveness.Item2 - info.Liveness.Item1, $"x{count}");
                     var memorySpace = TargetOptions.TargetMachineModel.TilingMemorySpaces[level];
-                    var ystart = model.NewIntVar(0, memorySpace.CapacityBytes - info.Size, $"ystart{count}");
+                    var ystart = model.NewIntVar(0, memorySpace.MaxAllocationBytesPerScope - info.Size, $"ystart{count}");
                     var align = key.Id.Node.GetBufferElemSize(key.Id.Index);
                     if (ModuleKind == "xpu")
                     {
@@ -538,7 +547,11 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
         parentViewInfo = null;
         while (parentNode is TileNode parentTileNode && parentTileNode.OpId != -1)
         {
-            var pbid = TileNodeMemo[parentTileNode].GetByChildBuffer(cbid);
+            if (!TileNodeMemo[parentTileNode].TryGetByChildBuffer(cbid, out var pbid))
+            {
+                return false;
+            }
+
             if (_viewInfoMemo.TryGetValue(parentTileNode, out var viewMap) && viewMap.TryGetValue(pbid, out var viewInfo))
             {
                 parentViewInfo = viewInfo;
@@ -564,6 +577,10 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
             return GetRootViewInfo(storeLevel, node, bid, map, forwardOffsets, shape);
         }
 
+        var requiresExplicitTransfer =
+            bid.Node.LocalAccessEffects[bid.Index].Scope != MemoryAccessScope.Chip &&
+            TargetOptions.TargetMachineModel.RequiresExplicitTransfer(storeLevel);
+
         TIR.Buffer AllocateBuffer(TileNode tileNode, BufferIdentity bid)
         {
             var expr = bid.Access.Buffer;
@@ -579,29 +596,25 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
             return new TIR.Buffer($"{bid}", tensorType.DType, new MemSpan(physicalBuffer), shape.Dimensions.ToArray(), strides, distributedType);
         }
 
-        Expr GetViewExpr(ViewInfo? parentInfo, Expr buffer, RankedShape forwardOffsets, RankedShape relatedOffsets, RankedShape shape)
+        Expr GetViewExpr(ViewInfo? parentInfo, Expr buffer, RankedShape forwardOffsets, RankedShape relatedOffsets, RankedShape shape, bool ownsStorage)
         {
+            if (ownsStorage)
+            {
+                return buffer switch
+                {
+                    TIR.Buffer buf => IR.F.Buffer.AllocateBufferView(buf, forwardOffsets),
+                    _ => throw new InvalidOperationException($"Owned AutoTiling storage must be a TIR buffer, got {buffer.GetType().Name}."),
+                };
+            }
+
             return parentInfo switch
             {
                 null => buffer switch
                 {
-                    TIR.Buffer buf => IR.F.Buffer.AllocateBufferView(buf, forwardOffsets),
-                    Expr ivar when ivar is IVar => TargetOptions.UnifiedMemoryArch switch
-                    {
-                        true => IR.F.Buffer.BufferSubview(ivar, relatedOffsets, shape),
-                        false => ivar,
-                    },
-                    _ => throw new NotSupportedException(),
+                    Expr ivar when ivar is IVar => IR.F.Buffer.BufferSubview(ivar, relatedOffsets, shape),
+                    _ => throw new InvalidOperationException($"Direct-access AutoTiling storage must be an external buffer view, got {buffer.GetType().Name}."),
                 },
-                ViewInfo info => TargetOptions.UnifiedMemoryArch switch
-                {
-                    true => IR.F.Buffer.BufferSubview(info.ViewVar!, relatedOffsets, shape),
-                    false => buffer switch
-                    {
-                        TIR.Buffer buf => IR.F.Buffer.AllocateBufferView(buf, forwardOffsets),
-                        _ => throw new NotSupportedException(),
-                    },
-                },
+                ViewInfo info => IR.F.Buffer.BufferSubview(info.Value, relatedOffsets, shape),
             };
         }
 
@@ -617,43 +630,44 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
             }
 
             offsets = ISLUtility.RoundTrip(viewOffset);
-            Expr buffer;
-            if (TargetOptions.UnifiedMemoryArch)
-            {
-                buffer = parentViewInfo.Buffer;
-            }
-            else
-            {
-                buffer = AllocateBuffer(node, bid);
-            }
-
-            var view = GetViewExpr(parentViewInfo, buffer, bufferOffsets, offsets, shape);
+            var requiresParentTransfer = requiresExplicitTransfer;
+            var buffer = requiresParentTransfer ? AllocateBuffer(node, bid) : parentViewInfo.Buffer;
+            var view = GetViewExpr(parentViewInfo, buffer, bufferOffsets, offsets, shape, requiresParentTransfer);
             var viewVar = new Var($"{bid}_L{node.Level}", AnyType.Default);
-            return new ViewInfo(parentViewInfo, view, viewVar, buffer, bufferOffsets, offsets, shape);
+            return new ViewInfo(parentViewInfo, view, viewVar, buffer, bufferOffsets, offsets, shape, requiresParentTransfer);
         }
         else
         {
             parentViewInfo = null;
-            Expr buffer = null!;
             var fromExternal = InputOutputVars.ContainsKey(bid);
-
-            if (TargetOptions.UnifiedMemoryArch && fromExternal)
+            var requiresParentTransfer = fromExternal && requiresExplicitTransfer;
+            Expr buffer = requiresParentTransfer || !fromExternal
+                ? AllocateBuffer(node, bid)
+                : (Expr)InputOutputVars[bid];
+            if (requiresParentTransfer)
             {
-                buffer = (Expr)InputOutputVars[bid];
-            }
-            else
-            {
-                buffer = AllocateBuffer(node, bid);
+                parentViewInfo = new ViewInfo(
+                    null,
+                    (Expr)InputOutputVars[bid],
+                    null,
+                    (Expr)InputOutputVars[bid],
+                    new RankedShape(bufferOffsets.Select(_ => (Dimension)0L).ToArray()),
+                    new RankedShape(bufferOffsets.Select(_ => (Dimension)0L).ToArray()),
+                    shape,
+                    false);
             }
 
-            if (!TargetOptions.UnifiedMemoryArch && fromExternal)
-            {
-                parentViewInfo = new ViewInfo(null, null!, null!, (Expr)InputOutputVars[bid], new RankedShape(bufferOffsets.Select(i => 0).ToArray()), new RankedShape(bufferOffsets.Select(i => 0).ToArray()), shape);
-            }
-
-            var view = GetViewExpr(null, buffer, bufferOffsets, offsets, shape);
+            var view = GetViewExpr(parentViewInfo, buffer, bufferOffsets, offsets, shape, requiresParentTransfer || !fromExternal);
             var viewVar = new Var($"{bid}_L{node.Level}", AnyType.Default);
-            return new ViewInfo(parentViewInfo, view, viewVar, buffer, bufferOffsets, fromExternal ? bufferOffsets : new RankedShape(bufferOffsets.Select(i => 0).ToArray()), shape);
+            return new ViewInfo(
+                parentViewInfo,
+                view,
+                viewVar,
+                buffer,
+                bufferOffsets,
+                fromExternal ? bufferOffsets : new RankedShape(bufferOffsets.Select(_ => (Dimension)0L).ToArray()),
+                shape,
+                requiresParentTransfer);
         }
     }
 
@@ -733,7 +747,8 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
             aliasBuffer,
             new RankedShape(resultOffsets),
             new RankedShape(localOffsets),
-            resultShape);
+            resultShape,
+            false);
 
         static TIR.Buffer AttachBuffer(BufferVar sourceVar, IRType sourceType, string name)
         {
@@ -796,7 +811,7 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
         }
         else if (TryGetParentViewInfo(node, bid, out parentViewInfo))
         {
-            buffer = parentViewInfo.ViewVar ?? parentViewInfo.Buffer;
+            buffer = parentViewInfo.Value;
             view = buffer;
         }
         else
@@ -806,7 +821,7 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
             viewVar = new Var($"{bid}_L{node.Level}", AnyType.Default);
         }
 
-        return new ViewInfo(parentViewInfo, view, viewVar, buffer, bufferOffsets, offsets, shape);
+        return new ViewInfo(parentViewInfo, view, viewVar, buffer, bufferOffsets, offsets, shape, false);
     }
 
     private static Dimension[] GetPhysicalStorageOffsets(ViewInfo viewInfo)
@@ -837,7 +852,7 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
 
         if (TryGetCurrentOrParentViewInfo(node, inputBid, out var readViewInfo))
         {
-            source = readViewInfo.ViewVar ?? readViewInfo.Buffer;
+            source = readViewInfo.Value;
             return true;
         }
 

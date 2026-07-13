@@ -10,7 +10,7 @@ public sealed partial class PackedMatMul : NTTKernelOp
 
     public static readonly ParameterInfo Rhs = new(typeof(PackedMatMul), 1, "rhs", memoryEffect: MemoryEffect.Read);
 
-    public static readonly ParameterInfo Output = new(typeof(PackedMatMul), 2, "output", memoryEffect: MemoryEffect.ReadWrite);
+    public static readonly ParameterInfo Output = new(typeof(PackedMatMul), 2, "output", memoryEffect: MemoryEffect.ReductionReadWrite);
 
     public static readonly ParameterInfo LoadC = new(typeof(PackedMatMul), 3, "loadC", memoryEffect: MemoryEffect.None);
 

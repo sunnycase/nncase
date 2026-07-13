@@ -20,6 +20,21 @@ namespace Nncase.Tests.TransformTest;
 public sealed class UnitTestMemorySynchronization : TestClassBase
 {
     [Fact]
+    public void TestNoMemoryEffectIsMergeIdentity()
+    {
+        Assert.Equal(
+            MemoryEffect.ReductionWrite,
+            MemoryEffectUtility.Merge(MemoryEffect.None, MemoryEffect.ReductionWrite));
+        Assert.Equal(
+            MemoryEffect.ReductionReadWrite,
+            MemoryEffectUtility.Merge(MemoryEffect.ReductionReadWrite, MemoryEffect.None));
+
+        var mixed = MemoryEffectUtility.Merge(MemoryEffect.Read, MemoryEffect.ReductionWrite);
+        Assert.Equal(MemoryAccessMode.ReadWrite, mixed.Mode);
+        Assert.Equal(MemoryEffectKind.Direct, mixed.Kind);
+    }
+
+    [Fact]
     public void TestAllNTTKernelOperandsDeclareMemoryEffects()
     {
         var missing = typeof(TIR.NTT.NTTKernelOp).Assembly.GetTypes()

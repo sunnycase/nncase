@@ -34,6 +34,10 @@ extern "C" NTT_DEVICE void thread_main(const nncase::ntt::runtime::thread_inout_
       var rank = shape.Rank;
       var sizeStr = $"input_descs[{i}].size / {input.CheckedDataType.SizeInBytes}";
       var elemType = input.CheckedDataType.ToC();
+      var elementQualifier = input is Nncase.TIR.BufferVar { Role: Nncase.TIR.BufferVarRole.Output or Nncase.TIR.BufferVarRole.InOut }
+        ? string.Empty
+        : "const ";
+      var qualifiedElemType = elementQualifier + elemType;
       var dimStr = $"make_shape({string.Join(", ", Enumerable.Range(0, rank).Select(d => shape[d].IsFixed ? $"{shape[d].FixedValue}_dim" : $"input_descs[{i}].shape[{d}]"))})";
       var strideStr = $"make_strides({string.Join(", ", Enumerable.Range(0, rank).Select(d => $"input_descs[{i}].strides[{d}]"))})";
       if (input.CheckedDataType is ReferenceType referenceType) {
@@ -62,7 +66,7 @@ extern "C" NTT_DEVICE void thread_main(const nncase::ntt::runtime::thread_inout_
   @:auto @(name) = make_tensor_view_from_address((paged_attention_kv_cache_t *)p@(name), @Html.Raw(dimStr), @Html.Raw(strideStr));
         }
       } else {
-  @:auto @(name) = make_tensor_view_from_address((const @Html.Raw(elemType) *)input_descs[@i].data, @Html.Raw(dimStr), @Html.Raw(strideStr));
+  @:auto @(name) = make_tensor_view_from_address((@Html.Raw(qualifiedElemType) *)input_descs[@i].data, @Html.Raw(dimStr), @Html.Raw(strideStr));
       }
     }
   @:

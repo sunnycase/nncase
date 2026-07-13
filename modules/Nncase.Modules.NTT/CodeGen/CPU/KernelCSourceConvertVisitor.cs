@@ -206,6 +206,19 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
         }
 
         var start = Visit(expr.Start);
+        var isReadOnly = expr.Location is MemoryLocation.Rdata or MemoryLocation.BlockLocalRdata ||
+            (expr.Location == MemoryLocation.Input && expr.Start is not BufferVar { Role: BufferVarRole.InOut });
+        if (expr.Location == MemoryLocation.Input)
+        {
+            var byteType = isReadOnly ? "const std::byte" : "std::byte";
+            var spanSize = Visit(expr.Size).Name;
+            var inputSpan = $"span_cast<{byteType}>({start.Name}.elements())";
+            var inputName = $"make_subspan({inputSpan}, 0_dim, {spanSize})";
+            symbol = new(start.Type, inputName);
+            _exprMemo.Add(expr, symbol);
+            return symbol;
+        }
+
         string loc = (expr.Location, expr.Hierarchy) switch
         {
             (MemoryLocation.Rdata, 0) => "rdata",
@@ -218,7 +231,7 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
         };
 
         var ptypeName = "std::byte";
-        if (expr.Location is MemoryLocation.Rdata or MemoryLocation.BlockLocalRdata)
+        if (isReadOnly)
         {
             // Rdata and BlockLocalRdata are const.
             ptypeName = $"const {ptypeName}";
@@ -302,7 +315,7 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
         };
 
         string str = string.Empty;
-        if (expr.Target is Op kop && kop is TIR.NTT.NTTKernelOp or TIR.Memcopy)
+        if (expr.Target is Op kop && kop is TIR.NTT.NTTKernelOp or TIR.Memcopy or TIR.TileLoad or TIR.TileStore)
         {
             foreach (var item in expr.Arguments.ToArray().OfType<TIR.Buffer>())
             {
@@ -502,6 +515,12 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
                     break;
                 case TIR.Memcopy copy:
                     WriteWithProfiler($"tensor_copy_sync({VisitBuffer(args[1], local: true).Name}, {VisitBuffer(args[0], local: true).Name});\n");
+                    break;
+                case TIR.TileLoad:
+                    WriteWithProfiler($"tensor_copy_sync({VisitBuffer(args[1], local: true).Name}, {VisitBuffer(args[0], local: true).Name});\n");
+                    break;
+                case TIR.TileStore:
+                    WriteWithProfiler($"tensor_copy_sync({VisitBuffer(args[0], local: true).Name}, {VisitBuffer(args[1], local: true).Name});\n");
                     break;
                 case TIR.NTT.Gather gather:
                     {
@@ -703,6 +722,15 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
                     break;
                 case TIR.NTT.SynchronizeThreads:
                     WriteIndWithProfiler($"ntt::distributed::topology_synchronize<ntt::distributed::topology::block>();\n");
+                    break;
+                case TIR.NTT.Barrier barrier:
+                    var topology = barrier.Scope switch
+                    {
+                        TIR.NTT.BarrierScope.Block => "block",
+                        TIR.NTT.BarrierScope.Chip => "chip",
+                        _ => throw new NotSupportedException($"Unsupported NTT barrier scope: {barrier.Scope}."),
+                    };
+                    WriteIndWithProfiler($"ntt::distributed::topology_synchronize<ntt::distributed::topology::{topology}>();\n");
                     break;
                 case TIR.NTT.Qwen3MoE qwen3MoE:
                     IndentScope.Writer.IndWrite($"qwen3_moe({VisitBuffer(args[0], local: true).Name}, {VisitBuffer(args[1], local: true).Name}, {VisitBuffer(args[2], local: true).Name}, {VisitBuffer(args[3], local: true).Name}, {VisitBuffer(args[4], local: true).Name}, {VisitBuffer(args[5], local: true).Name}, {VisitBuffer(args[6], local: true).Name}, {VisitBuffer(args[7], local: true).Name}, {VisitBuffer(args[8], local: true).Name},{VisitBuffer(args[9], local: true).Name},{VisitBuffer(args[10], local: true).Name},{VisitBuffer(args[11], local: true).Name}, {qwen3MoE.LayerId}, {qwen3MoE.HiddenSize}, {qwen3MoE.IntermediateSize}, {qwen3MoE.MoEIntermediateSize}, {qwen3MoE.NumExpert}, {qwen3MoE.NumTopK}, {qwen3MoE.IsNormTopkProb});\n");
@@ -1034,7 +1062,9 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
             if (buffer.MemSpan.Buffer.Start is not None)
             {
                 // If the buffer has a start, we create a tensor view
-                var dtypeStr = buffer.ElemType.ToC();
+                var isReadOnly = buffer.MemSpan.Buffer.Location is MemoryLocation.Rdata or MemoryLocation.BlockLocalRdata ||
+                    (buffer.MemSpan.Buffer.Location == MemoryLocation.Input && buffer.MemSpan.Buffer.Start is not BufferVar { Role: BufferVarRole.InOut });
+                var dtypeStr = isReadOnly ? $"const {buffer.ElemType.ToC()}" : buffer.ElemType.ToC();
                 var dimensions = buffer.DistributedType is null ? buffer.Dimensions : ((RankedShape)buffer.DistributedType.TensorType.Shape).Dimensions;
                 var spanStr = $"span_cast<{dtypeStr}>({Visit(buffer.MemSpan).Name})";
                 var dimensionValues = dimensions.AsValueEnumerable().Select(x => Visit(x).Name);
