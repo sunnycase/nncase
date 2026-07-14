@@ -81,19 +81,15 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
             .ToArray();
     }
 
-    private static TensorSpecMetadata[] GetInputTensorSpecs(BaseFunction function)
+    private TensorSpecMetadata[] GetInputTensorSpecs(PyNTTLinkableFunction function)
     {
-        return GetInputTensorSpecs(function, generatedKernelCount: 0);
+        var hasRuntimeKernel = CountRuntimeLaunches(function, new HashSet<PyNTTLinkableFunction>()) > 0;
+        return GetInputTensorSpecs(function.SourceFunction, hasRuntimeKernel);
     }
 
-    private static TensorSpecMetadata[] GetInputTensorSpecs(PyNTTLinkableFunction function)
+    private static TensorSpecMetadata[] GetInputTensorSpecs(BaseFunction function, bool hasRuntimeKernel)
     {
-        return GetInputTensorSpecs(function.SourceFunction, function.GeneratedKernelSource.Kernels.Count);
-    }
-
-    private static TensorSpecMetadata[] GetInputTensorSpecs(BaseFunction function, int generatedKernelCount)
-    {
-        var device = generatedKernelCount > 0 ? "cuda" : "any";
+        var device = hasRuntimeKernel ? "cuda" : "any";
         return GetInputTensorParameters(function)
             .Select(parameter => BuildTensorSpec(parameter.Name, ((BaseExpr)parameter).CheckedType, "input", device))
             .ToArray();
@@ -755,6 +751,26 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
 
         public RuntimeDispatchContext CreateCallee(string scope, Dictionary<string, RuntimeBinding> parameters, Dictionary<string, RuntimeBinding> outputs)
             => new(State, parameters, outputs, ObjectBuffers, scope, DeviceExpression, RootInputsExpression);
+
+        public RuntimeDispatchContext Fork()
+            => new(
+                State,
+                new Dictionary<string, RuntimeBinding>(Parameters, StringComparer.Ordinal),
+                new Dictionary<string, RuntimeBinding>(Outputs, StringComparer.Ordinal),
+                new Dictionary<ObjectBufferKey, RuntimeBinding>(ObjectBuffers),
+                Scope,
+                DeviceExpression,
+                RootInputsExpression)
+            {
+                Data = Data,
+                DataPoolStrideBytes = DataPoolStrideBytes,
+                RData = RData,
+                ChipLocalRData = ChipLocalRData,
+                ChipLocalData = ChipLocalData,
+                BlockLocalRData = BlockLocalRData,
+                BlockLocalData = BlockLocalData,
+                BlockLocalDataPoolStrideBytes = BlockLocalDataPoolStrideBytes,
+            };
     }
 
     private string BuildSpecsPython(string moduleName, string backend)
@@ -971,13 +987,22 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
 
             if (function.SourceFunction is PrimFunction primFunction)
             {
+                var abiWorkspaceLocations = primFunction.GetAbiView().Workspaces
+                    .OfType<BufferVar>()
+                    .Select(workspace => workspace.Location)
+                    .ToHashSet();
                 var dataUsage = GetWorkspaceUsage(function.SourceFunction, MemoryLocation.Data);
                 dataLocalBytes = Math.Max((long)primFunction.SchedResult.DataUsage, dataUsage.LocalBytes);
-                usesData = tirKernels.Length > 0 || primFunction.SchedResult.DataUsage > 0 || dataUsage.IsReferenced;
+                usesData = tirKernels.Length > 0
+                    || primFunction.SchedResult.DataUsage > 0
+                    || dataUsage.IsReferenced
+                    || abiWorkspaceLocations.Contains(MemoryLocation.Data);
 
                 var chipLocalDataUsage = HasWorkspaceReference(function.SourceFunction, MemoryLocation.ChipLocalData);
                 chipLocalDataBytes = (long)primFunction.SchedResult.ChipLocalDataPoolSize;
-                usesChipLocalData = primFunction.SchedResult.ChipLocalDataPoolSize > 0 || chipLocalDataUsage;
+                usesChipLocalData = primFunction.SchedResult.ChipLocalDataPoolSize > 0
+                    || chipLocalDataUsage
+                    || abiWorkspaceLocations.Contains(MemoryLocation.ChipLocalData);
 
                 var blockLocalDataUsage = GetWorkspaceUsage(function.SourceFunction, MemoryLocation.BlockLocalData);
                 blockLocalDataBytes = new[]
@@ -986,7 +1011,11 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
                     blockLocalDataUsage.LocalBytes,
                     kernelBlockLocalDataBytes,
                 }.Max();
-                usesBlockLocalData = tirKernels.Length > 0 || primFunction.SchedResult.BlockLocalDataPoolSize > 0 || blockLocalDataUsage.IsReferenced || kernelBlockLocalDataBytes > 0;
+                usesBlockLocalData = tirKernels.Length > 0
+                    || primFunction.SchedResult.BlockLocalDataPoolSize > 0
+                    || blockLocalDataUsage.IsReferenced
+                    || kernelBlockLocalDataBytes > 0
+                    || abiWorkspaceLocations.Contains(MemoryLocation.BlockLocalData);
             }
 
             var callees = new List<PrimFunction>();
@@ -1067,19 +1096,19 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
 
     private string BuildFunctionDispatch(PyNTTLinkableFunction function, RuntimeDispatchContext context, int extraIndent)
     {
-        var pieces = new List<string>();
-        pieces.Add(BuildPreparedWorkspaceSetup(function, context, extraIndent));
-
-        var body = BuildDispatchLaunchStatements(function.SourceFunction, function, context, extraIndent);
-        if (!string.IsNullOrWhiteSpace(body))
+        if (function.GeneratedKernelSource.Kernels.Count != 0)
         {
-            pieces.Add(body);
+            throw new InvalidOperationException($"PyNTT runtime dispatch cannot interpret executable function {function.SourceFunction.Name} as host control flow.");
         }
 
-        return string.Join(Environment.NewLine, pieces.Where(piece => !string.IsNullOrWhiteSpace(piece)));
+        return BuildDispatchLaunchStatements(function.SourceFunction, function, context, extraIndent);
     }
 
-    private string BuildPreparedWorkspaceSetup(PyNTTLinkableFunction function, RuntimeDispatchContext context, int extraIndent)
+    private string BuildPreparedWorkspaceSetup(
+        PyNTTLinkableFunction function,
+        RuntimeDispatchContext context,
+        int extraIndent,
+        bool materializeRData)
     {
         var statements = new List<string>();
         var indent = new string(' ', 8 + extraIndent);
@@ -1118,7 +1147,8 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
             }
         }
 
-        if (tirKernels.Length > 0
+        if (materializeRData
+            && tirKernels.Length > 0
             && (string.IsNullOrWhiteSpace(context.RData)
                 || string.IsNullOrWhiteSpace(context.ChipLocalRData)
                 || string.IsNullOrWhiteSpace(context.BlockLocalRData)))
@@ -1211,22 +1241,29 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
 
     private string BuildFunctionCallDispatch(Call call, PyNTTLinkableFunction callee, RuntimeDispatchContext callerContext, int extraIndent)
     {
-        var calleeContext = CreateCalleeDispatchContext(call, callee, callerContext);
-        var workspaceSetup = BuildPreparedWorkspaceSetup(callee, calleeContext, extraIndent);
         var kernels = callee.GeneratedKernelSource.Kernels;
         ValidateSingleKernelFunction(callee);
         if (kernels.Count == 0)
         {
+            var dispatchWorkspaceSetup = BuildPreparedWorkspaceSetup(callee, callerContext, extraIndent, materializeRData: false);
+            var calleeContext = CreateCalleeDispatchContext(call, callee, callerContext);
             var dispatch = BuildDispatchLaunchStatements(callee.SourceFunction, callee, calleeContext, extraIndent);
-            return string.Join(Environment.NewLine, new[] { workspaceSetup, dispatch }.Where(piece => !string.IsNullOrWhiteSpace(piece)));
+            return string.Join(
+                Environment.NewLine,
+                new[] { dispatchWorkspaceSetup, dispatch }.Where(piece => !string.IsNullOrWhiteSpace(piece)));
         }
 
+        var callerWorkspaceSetup = BuildPreparedWorkspaceSetup(callee, callerContext, extraIndent, materializeRData: false);
+        var kernelContext = CreateCalleeDispatchContext(call, callee, callerContext);
+        var kernelWorkspaceSetup = BuildPreparedWorkspaceSetup(callee, kernelContext, extraIndent, materializeRData: true);
         var parameterNames = GetParameterNames(callee.SourceFunction);
         var outputNames = GetOutputTensorSpecs(callee.SourceFunction).Select(output => output.Name).ToArray();
         var launches = string.Join(
             Environment.NewLine,
-            kernels.Select(kernel => IndentPythonBlock(BuildModelKernelLaunchPython(callee.SourceFunction.Name, kernel, parameterNames, outputNames, calleeContext, usePreparedWorkspace: HasPreparedKernelWorkspace(calleeContext)), extraIndent)));
-        return string.Join(Environment.NewLine, new[] { workspaceSetup, launches }.Where(piece => !string.IsNullOrWhiteSpace(piece)));
+            kernels.Select(kernel => IndentPythonBlock(BuildModelKernelLaunchPython(callee.SourceFunction.Name, kernel, parameterNames, outputNames, kernelContext, usePreparedWorkspace: HasPreparedKernelWorkspace(kernelContext)), extraIndent)));
+        return string.Join(
+            Environment.NewLine,
+            new[] { callerWorkspaceSetup, kernelWorkspaceSetup, launches }.Where(piece => !string.IsNullOrWhiteSpace(piece)));
     }
 
     private static void ValidateSingleKernelFunction(PyNTTLinkableFunction function)
@@ -1332,8 +1369,8 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
     {
         var indent = new string(' ', 8 + extraIndent);
         var condition = BuildRuntimePythonScalarExpression(expr.Condition);
-        var thenBody = BuildDispatchLaunchStatements(expr.Then, currentFunction, context, extraIndent + 4);
-        var elseBody = BuildDispatchLaunchStatements(expr.Else, currentFunction, context, extraIndent + 4);
+        var thenBody = BuildDispatchLaunchStatements(expr.Then, currentFunction, context.Fork(), extraIndent + 4);
+        var elseBody = BuildDispatchLaunchStatements(expr.Else, currentFunction, context.Fork(), extraIndent + 4);
 
         if (string.IsNullOrWhiteSpace(thenBody))
         {

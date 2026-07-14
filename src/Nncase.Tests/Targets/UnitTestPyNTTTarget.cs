@@ -97,6 +97,81 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
     }
 
     [Fact]
+    public void TestPyNTTCodegenScopeOutlinesSemanticDirectDeviceFunction()
+    {
+        var tensorType = new TensorType(DataTypes.Float32, new[] { 1 });
+        var input = new Var("x", tensorType);
+        var output = CreateOutputVar("output", tensorType);
+        var inputBuffer = TIR.T.AttachBuffer(
+            input,
+            tensorType,
+            TIR.MemoryLocation.Input,
+            0,
+            out _,
+            "input_buffer");
+        var inputDataBuffer = CreateBuffer(
+            "view_op3_packed_mat_mul_in1__l1_data__at_op3_packed_mat_mul",
+            DataTypes.Float32,
+            TIR.MemoryLocation.Data,
+            0,
+            [1],
+            [1]);
+        var tileBuffer = CreateBuffer(
+            "view_op3_packed_mat_mul_in1__l0_gpu_shared__at_op3_packed_mat_mul",
+            DataTypes.Float32,
+            TIR.MemoryLocation.Shared,
+            0,
+            [1],
+            [1]);
+        var resultBuffer = CreateBuffer(
+            "view_op3_packed_mat_mul_out0__l1_data__at_op3_packed_mat_mul",
+            DataTypes.Float32,
+            TIR.MemoryLocation.Data,
+            4,
+            [1],
+            [1]);
+        var placement = new Placement(new[] { 1 }, "b", "b");
+        var scopeName = "fusion[op0:memcopy]";
+        var body = new TIR.Sequential(
+            TIR.T.CodegenScope(
+                scopeName,
+                new TIR.Sequential(
+                    TIR.F.NTT.TensorLoad(inputDataBuffer, inputBuffer, new[] { SBP.B }, placement),
+                    TIR.T.TileLoad(tileBuffer, inputDataBuffer),
+                    TIR.T.TileStore(tileBuffer, resultBuffer),
+                    TIR.F.NTT.TensorStore(resultBuffer, output, new[] { SBP.B }, placement))));
+        var main = new TIR.PrimFunction(
+            "main_prim",
+            PyNTTTarget.Kind,
+            body,
+            new IVar[] { input, output })
+        {
+            SchedResult =
+            {
+                DataUsage = 8,
+            },
+        };
+
+        var outputDirectory = GeneratePyNTTModelDirectory("generated_codegen_scope_model", main);
+        RenderGeneratedKernels(outputDirectory);
+        var generatedKernels = File.ReadAllText(Path.Join(outputDirectory, "generated_kernels.py"));
+        var match = Regex.Match(
+            generatedKernels,
+            @"@triton\.jit\(noinline=True\)\s+def (?<name>main_prim_device_fusion_op0_memcopy_+0)\(",
+            RegexOptions.Multiline);
+
+        Assert.True(match.Success, generatedKernels);
+        var deviceFunctionName = match.Groups["name"].Value;
+        Assert.Contains($"{deviceFunctionName}(input0, output0", generatedKernels, StringComparison.Ordinal);
+        Assert.Contains("# pyntt_trace_event: begin_function:fusion[op0:memcopy]#0", generatedKernels, StringComparison.Ordinal);
+        Assert.Contains("# pyntt_trace_event: end_function:fusion[op0:memcopy]#0", generatedKernels, StringComparison.Ordinal);
+        Assert.Contains("tile_load_op3_packed_mat_mul_in1__l0_gpu_shared__0", generatedKernels, StringComparison.Ordinal);
+        Assert.Contains("tile_store_op3_packed_mat_mul_in1__l0_gpu_shared__0", generatedKernels, StringComparison.Ordinal);
+        Assert.DoesNotContain("tensor_region_copy", generatedKernels, StringComparison.Ordinal);
+        Assert.DoesNotContain("call_frame", generatedKernels, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task TestPyNTTAutoDistributedPassDumps()
     {
         CompileOptions.DumpFlags = DumpFlags.PassIR | DumpFlags.Rewrite | DumpFlags.EGraphCost | DumpFlags.CodeGen | DumpFlags.Compile;
@@ -224,7 +299,8 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         ConfigureAutoDistributedPyNTT();
         CompileOptions.DumpFlags = DumpFlags.PassIR | DumpFlags.CodeGen;
         CompileOptions.ShapeBucketOptions.Enable = true;
-        CompileOptions.ShapeBucketOptions.SegmentsCount = 2;
+        CompileOptions.ShapeBucketOptions.SegmentsCount = 3;
+        CompileOptions.ShapeBucketOptions.SegmentRanges["n"] = [1, 4, 8];
 
         var dimN = new DimVar("n") { Metadata = { Range = new(1, 8) } };
         var shape = new RankedShape(new Dimension[] { dimN, 1 });
@@ -240,6 +316,9 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
             .Single(item => item.GetProperty("is_entry").GetBoolean());
         Assert.Equal("main_prim", function.GetProperty("name").GetString());
         Assert.Equal("output0", function.GetProperty("outputs").EnumerateArray().Single().GetProperty("name").GetString());
+        Assert.All(
+            function.GetProperty("inputs").EnumerateArray().Where(input => input.GetProperty("dtype").GetString() != "object"),
+            input => Assert.Equal("cuda", input.GetProperty("device").GetString()));
 
         var finalMainTir = Directory.GetFiles(Dumpper.Directory, "main_prim.script", SearchOption.AllDirectories)
             .Select(File.ReadAllText)
@@ -249,27 +328,68 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         Assert.DoesNotContain("Return(", finalMainTir, StringComparison.Ordinal);
 
         using var kernelParams = JsonDocument.Parse(File.ReadAllText(Path.Join(outputDirectory, "kernel_params.json")));
-        var deviceFunctions = kernelParams.RootElement.GetProperty("functions").EnumerateArray()
-            .Single(item => item.GetProperty("name").GetString() == "main_prim")
-            .GetProperty("render_kernels").EnumerateArray().Single()
-            .GetProperty("device_functions").EnumerateArray().ToArray();
-        var dispatchFunctions = deviceFunctions
-            .Where(deviceFunction => deviceFunction.GetProperty("compose_into_caller").GetBoolean())
+        var manifestFunctions = kernelParams.RootElement.GetProperty("functions").EnumerateArray().ToArray();
+        var entryManifest = manifestFunctions.Single(item => item.GetProperty("name").GetString() == "main_prim");
+        Assert.Empty(entryManifest.GetProperty("render_kernels").EnumerateArray());
+
+        var segmentManifests = manifestFunctions
+            .Where(item => item.GetProperty("name").GetString() is string name &&
+                name.StartsWith("main_segment_", StringComparison.Ordinal) &&
+                name.EndsWith("_prim", StringComparison.Ordinal))
             .ToArray();
-        var scheduledFunctions = deviceFunctions
-            .Where(deviceFunction => !deviceFunction.GetProperty("compose_into_caller").GetBoolean())
+        Assert.Equal(3, segmentManifests.Length);
+        var topKernelNames = segmentManifests
+            .Select(segment => segment.GetProperty("render_kernels").EnumerateArray().Single()
+                .GetProperty("metadata").GetProperty("name").GetString()!)
             .ToArray();
-        Assert.Equal(2, dispatchFunctions.Length);
-        Assert.All(dispatchFunctions, deviceFunction => Assert.False(deviceFunction.GetProperty("noinline").GetBoolean()));
-        Assert.Equal(2, scheduledFunctions.Length);
-        Assert.All(scheduledFunctions, deviceFunction => Assert.True(deviceFunction.GetProperty("noinline").GetBoolean()));
+        Assert.Equal(3, topKernelNames.Distinct(StringComparer.Ordinal).Count());
+        Assert.All(
+            manifestFunctions.Where(item => item.GetProperty("name").GetString()?.Contains("shape_bucket_selector", StringComparison.Ordinal) == true),
+            selector => Assert.Empty(selector.GetProperty("render_kernels").EnumerateArray()));
 
         RenderGeneratedKernels(outputDirectory);
         var generatedKernels = File.ReadAllText(Path.Join(outputDirectory, "generated_kernels.py"));
-        foreach (var dispatchFunction in dispatchFunctions)
+        foreach (var topKernelName in topKernelNames)
         {
-            Assert.DoesNotContain($"def {dispatchFunction.GetProperty("name").GetString()}(", generatedKernels, StringComparison.Ordinal);
+            Assert.Contains($"def {topKernelName}(", generatedKernels, StringComparison.Ordinal);
         }
+
+        var generatedFunctionNames = Regex.Matches(generatedKernels, @"^def (?<name>[A-Za-z_]\w*)\(", RegexOptions.Multiline)
+            .Select(match => match.Groups["name"].Value)
+            .ToArray();
+        Assert.Equal(generatedFunctionNames.Length, generatedFunctionNames.Distinct(StringComparer.Ordinal).Count());
+        Assert.All(
+            segmentManifests,
+            segment =>
+            {
+                var segmentName = segment.GetProperty("name").GetString()!;
+                Assert.Contains($"def {segmentName}_device_0(", generatedKernels, StringComparison.Ordinal);
+            });
+
+        Assert.DoesNotContain("def main_prim_", generatedKernels, StringComparison.Ordinal);
+        Assert.DoesNotContain("shape_bucket_selector", generatedKernels, StringComparison.Ordinal);
+
+        var modelPy = File.ReadAllText(Path.Join(outputDirectory, "model.py"));
+        Assert.Contains("if (shape_env[\"n\"] <=", modelPy, StringComparison.Ordinal);
+        Assert.DoesNotContain("main_prim.data", modelPy, StringComparison.Ordinal);
+        foreach (var topKernelName in topKernelNames)
+        {
+            Assert.Contains($"from .generated_kernels import {topKernelName}", modelPy, StringComparison.Ordinal);
+            Assert.Contains($"{topKernelName}[grid](", modelPy, StringComparison.Ordinal);
+        }
+
+        var runtimeStatements = topKernelNames
+            .Select(name => $"os.environ['PYNTT_TUNE_{name.ToUpperInvariant()}_BLOCK_SIZE'] = '128'")
+            .Concat(new[]
+            {
+                "for n in (1, 4, 8):",
+                "    lhs = torch.arange(n, dtype=torch.float32, device='cuda').reshape(n, 1)",
+                "    rhs = lhs * 0.25",
+                "    output = module(lhs, rhs)",
+                "    torch.testing.assert_close(output, lhs + rhs, rtol=0, atol=1e-6)",
+            })
+            .ToArray();
+        AssertGeneratedModelRuns(outputDirectory, runtimeStatements);
     }
 
     [Fact]
@@ -980,8 +1100,18 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
 
         var outputDirectory = await GeneratePyNTTModelDirectoryWithCompilerPipeline("generated_paged_attention_qwen_like_two_layers_run_model", main);
         RenderGeneratedKernels(outputDirectory);
-        var generatedKernelsPy = File.ReadAllText(Path.Join(outputDirectory, "generated_kernels.py"));
-        Assert.Contains("layer_id_value = tl.load(layer_id + 0).to(tl.int64)", generatedKernelsPy, StringComparison.Ordinal);
+        using (var kernelParams = JsonDocument.Parse(File.ReadAllText(Path.Join(outputDirectory, "kernel_params.json"))))
+        {
+            var ops = kernelParams.RootElement.GetProperty("functions")
+                .EnumerateArray()
+                .SelectMany(function => function.GetProperty("render_kernels").EnumerateArray())
+                .SelectMany(kernel => kernel.GetProperty("metadata").GetProperty("attrs").GetProperty("ops").EnumerateArray())
+                .Select(op => op.GetString())
+                .ToArray();
+            Assert.Equal(4, ops.Count(op => op == "update_paged_attention_kv_cache"));
+            Assert.Equal(2, ops.Count(op => op == "paged_attention"));
+        }
+
         AssertGeneratedModelRuns(
             outputDirectory,
             "torch.manual_seed(0)",
@@ -1156,6 +1286,15 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
 
         var outputDirectory = await GeneratePyNTTModelDirectoryWithCompilerPipeline("generated_qwen_like_qkv_run_model", main);
         var compiler = Assert.IsType<global::Nncase.Compiler.Compiler>(CompileSession.Compiler);
+        var qkvFunction = Assert.Single(compiler.Module.Functions.OfType<TIR.PrimFunction>().Where(function =>
+            ExprCollector.Collect(function.Body).OfType<Call>().Any(call => call.Target is TIR.NTT.PackedQKVParallelLinear)));
+        var qkvCall = Assert.Single(ExprCollector.Collect(qkvFunction.Body).OfType<Call>().Where(call =>
+            call.Target is TIR.NTT.PackedQKVParallelLinear));
+        var qkvLoops = ExprCollector.Collect(qkvFunction.Body)
+            .OfType<TIR.For>()
+            .Where(loop => ExprCollector.Collect(loop.Body).Any(expr => ReferenceEquals(expr, qkvCall)))
+            .ToArray();
+        Assert.Contains(qkvLoops, loop => loop.Domain.Stop.IsFixed && loop.Domain.Stop.FixedValue == seq);
         Assert.Contains(
             compiler.Module.Functions.SelectMany(function => ExprCollector.Collect(function).OfType<TIR.PhysicalBuffer>()),
             buffer => buffer.Location == TIR.MemoryLocation.Shared);
@@ -1175,6 +1314,79 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
             "torch.testing.assert_close(q.to(torch.float32), (qkv_input @ q_weight).to(torch.bfloat16).to(torch.float32), rtol=2e-2, atol=2e-2)",
             "torch.testing.assert_close(k_out.to(torch.float32), (qkv_input @ k_weight).to(torch.bfloat16).to(torch.float32), rtol=2e-2, atol=2e-2)",
             "torch.testing.assert_close(v_out.to(torch.float32), (qkv_input @ v_weight).to(torch.bfloat16).to(torch.float32), rtol=2e-2, atol=2e-2)");
+    }
+
+    [Fact]
+    public async Task TestPyNTTRoPEQwenLikeRun()
+    {
+        ConfigureAutoDistributedPyNTT();
+        var targetOptions = Assert.IsType<PyNTTTargetOptions>(CompileOptions.TargetOptions);
+        targetOptions.Vectorize = true;
+
+        var seq = 20;
+        var heads = 16;
+        var headDim = 128;
+        var input = new Var("input", new TensorType(DataTypes.BFloat16, new[] { seq, heads, headDim }));
+        var cos = new Var("cos", new TensorType(DataTypes.Float32, new[] { seq, 1, headDim }));
+        var sin = new Var("sin", new TensorType(DataTypes.Float32, new[] { seq, 1, headDim }));
+        var main = new Function("main", PyNTTTarget.Kind, IR.F.NN.RoPE(input, cos, sin), new[] { input, cos, sin });
+
+        var outputDirectory = await GeneratePyNTTModelDirectoryWithCompilerPipeline("generated_qwen_like_rope_run_model", main);
+        RenderGeneratedKernels(outputDirectory);
+        var generatedKernelsPy = File.ReadAllText(Path.Join(outputDirectory, "generated_kernels.py"));
+        Assert.Contains("generated from PyNTT Jinja RoPE.py.jinja", generatedKernelsPy, StringComparison.Ordinal);
+        AssertGeneratedModelRuns(
+            outputDirectory,
+            "torch.manual_seed(3)",
+            $"input = (torch.randn({seq}, {heads}, {headDim}, dtype=torch.float32, device='cuda') * 0.05).to(torch.bfloat16)",
+            $"angles = torch.randn({seq}, 1, {headDim}, dtype=torch.float32, device='cuda')",
+            "cos = torch.cos(angles)",
+            "sin = torch.sin(angles)",
+            $"half = {headDim} // 2",
+            "rotated = torch.cat((-input[..., half:], input[..., :half]), dim=-1)",
+            "expect = (input.to(torch.float32) * cos + rotated.to(torch.float32) * sin).to(torch.bfloat16)",
+            "output = module(input, cos, sin)",
+            "torch.testing.assert_close(output.to(torch.float32), expect.to(torch.float32), rtol=2e-2, atol=2e-2)");
+    }
+
+    [Fact]
+    public async Task TestPyNTTRmsNormRoPEQwenLikeRun()
+    {
+        ConfigureAutoDistributedPyNTT();
+        var targetOptions = Assert.IsType<PyNTTTargetOptions>(CompileOptions.TargetOptions);
+        targetOptions.Vectorize = true;
+
+        var seq = 20;
+        var heads = 16;
+        var headDim = 128;
+        var input = new Var("input", new TensorType(DataTypes.BFloat16, new[] { seq, heads, headDim }));
+        var scale = new Var("scale", new TensorType(DataTypes.BFloat16, new[] { headDim }));
+        var cos = new Var("cos", new TensorType(DataTypes.Float32, new[] { seq, 1, headDim }));
+        var sin = new Var("sin", new TensorType(DataTypes.Float32, new[] { seq, 1, headDim }));
+        var bias = Tensor.Zeros<BFloat16>([headDim]);
+        var normalized = IR.F.NN.LayerNorm(2, 1e-6f, input, scale, bias, hasMean: false);
+        var main = new Function("main", PyNTTTarget.Kind, IR.F.NN.RoPE(normalized, cos, sin), new[] { input, scale, cos, sin });
+
+        var outputDirectory = await GeneratePyNTTModelDirectoryWithCompilerPipeline("generated_qwen_like_rms_norm_rope_run_model", main);
+        RenderGeneratedKernels(outputDirectory);
+        var generatedKernelsPy = File.ReadAllText(Path.Join(outputDirectory, "generated_kernels.py"));
+        Assert.Contains("generated from PyNTT Jinja NormStats.py.jinja", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("generated from PyNTT Jinja NormApply.py.jinja", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("generated from PyNTT Jinja RoPE.py.jinja", generatedKernelsPy, StringComparison.Ordinal);
+        AssertGeneratedModelRuns(
+            outputDirectory,
+            "torch.manual_seed(4)",
+            $"input = (torch.randn({seq}, {heads}, {headDim}, dtype=torch.float32, device='cuda') * 0.05).to(torch.bfloat16)",
+            $"scale = (1.0 + torch.randn({headDim}, dtype=torch.float32, device='cuda') * 0.01).to(torch.bfloat16)",
+            $"angles = torch.randn({seq}, 1, {headDim}, dtype=torch.float32, device='cuda')",
+            "cos = torch.cos(angles)",
+            "sin = torch.sin(angles)",
+            "normalized = input.to(torch.float32) * torch.rsqrt(torch.mean(input.to(torch.float32) ** 2, dim=2, keepdim=True) + 1e-6) * scale.to(torch.float32)",
+            $"half = {headDim} // 2",
+            "rotated = torch.cat((-normalized[..., half:], normalized[..., :half]), dim=-1)",
+            "expect = (normalized * cos + rotated * sin).to(torch.bfloat16)",
+            "output = module(input, scale, cos, sin)",
+            "torch.testing.assert_close(output.to(torch.float32), expect.to(torch.float32), rtol=2e-2, atol=2e-2)");
     }
 
     [Fact]
@@ -1469,15 +1681,70 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         var outputDirectory = GeneratePyNTTModelDirectory("generated_nested_call_workspace_model", module);
         RenderGeneratedKernels(outputDirectory);
         var generatedKernelsPy = File.ReadAllText(Path.Join(outputDirectory, "generated_kernels.py"));
-        Assert.Contains("def main_prim_nested_prim_device", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("def main_prim_nested_prim_device(", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.DoesNotContain("def pyntt_device_", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("main_prim_nested_prim_device_arg0_nested_input_scalar_stride0", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("main_prim_nested_prim_device_arg1_nested_output_scalar_stride0", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("(data).to(tl.pointer_type(tl.float32)), 4, 0, 1, 0, 1", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("(data + 16).to(tl.pointer_type(tl.float32)), 4, 0, 1, 0, 1", generatedKernelsPy, StringComparison.Ordinal);
         Assert.Contains("(data + 64).to(tl.pointer_type(tl.uint8))", generatedKernelsPy, StringComparison.Ordinal);
-        Assert.Contains("tl.store((pyntt_shared_base + 0).to(tl.pointer_type(tl.uint64, 3)), ((data).to(tl.pointer_type(tl.float32))).to(tl.uint64))", generatedKernelsPy, StringComparison.Ordinal);
-        Assert.Contains("tl.store((pyntt_shared_base + 8).to(tl.pointer_type(tl.uint64, 3)), ((data + 16).to(tl.pointer_type(tl.float32))).to(tl.uint64))", generatedKernelsPy, StringComparison.Ordinal);
-        Assert.Contains("tl.store((pyntt_shared_base + 32).to(tl.pointer_type(tl.uint64, 3)), ((data + 64).to(tl.pointer_type(tl.uint8))).to(tl.uint64))", generatedKernelsPy, StringComparison.Ordinal);
-        Assert.Contains("tl.load((pyntt_shared_base + 0).to(tl.pointer_type(tl.uint64, 3))).to(tl.pointer_type(tl.float32))", generatedKernelsPy, StringComparison.Ordinal);
-        Assert.Contains("tl.load((pyntt_shared_base + 8).to(tl.pointer_type(tl.uint64, 3))).to(tl.pointer_type(tl.float32))", generatedKernelsPy, StringComparison.Ordinal);
-        Assert.Contains("tl.load((pyntt_shared_base + 32).to(tl.pointer_type(tl.uint64, 3))).to(tl.pointer_type(tl.uint8))", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.DoesNotContain("pyntt_call_frame", generatedKernelsPy, StringComparison.Ordinal);
         Assert.DoesNotContain("data + 192", generatedKernelsPy, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void TestPyNTTNestedPrimFunctionSupportsCallerAllocatedDataTensorParameter()
+    {
+        var tensorType = new TensorType(DataTypes.Float32, new[] { 4 });
+        var input = new Var("x", tensorType);
+        var publicOutput = CreateOutputVar("public_output", tensorType);
+        var root = new TIR.BufferVar("root", tensorType, TIR.BufferVarRole.InOut, TIR.MemoryLocation.Data);
+        var nestedOutput = CreateOutputVar("nested_output", tensorType);
+        var nestedData = new TIR.BufferVar("data", TensorType.Scalar(new PointerType(DataTypes.UInt8)), TIR.BufferVarRole.Workspace, TIR.MemoryLocation.Data);
+        var nestedChipLocalData = new TIR.BufferVar("chip_local_data", TensorType.Scalar(new PointerType(DataTypes.UInt8)), TIR.BufferVarRole.Workspace, TIR.MemoryLocation.ChipLocalData);
+        var nestedBlockLocalData = new TIR.BufferVar("block_local_data", TensorType.Scalar(new PointerType(DataTypes.UInt8)), TIR.BufferVarRole.Workspace, TIR.MemoryLocation.BlockLocalData);
+        var rootBuffer = TIR.T.AttachBuffer(root, tensorType, TIR.MemoryLocation.Data, 0, out _, "root_buffer");
+        var nestedTemp = CreateBuffer("nested_temp", DataTypes.Float32, TIR.MemoryLocation.Shared, 0, [4], [1]);
+        var placement = new Placement(new[] { 1 }, "b", "b");
+        var nested = new TIR.PrimFunction(
+            "nested_data_tensor",
+            PyNTTTarget.Kind,
+            new TIR.Sequential(
+                TIR.F.NTT.TensorLoad(nestedTemp, rootBuffer, new[] { SBP.B }, placement),
+                TIR.F.NTT.TensorStore(nestedTemp, rootBuffer, new[] { SBP.B }, placement),
+                TIR.F.NTT.TensorStore(nestedTemp, nestedOutput, new[] { SBP.B }, placement)),
+            new IVar[] { root, nestedOutput, nestedData, nestedChipLocalData, nestedBlockLocalData })
+        {
+            Role = FunctionRole.ScheduledRegion,
+        };
+
+        var callerRoot = CreateBuffer("caller_root", DataTypes.Float32, TIR.MemoryLocation.Data, 0, [4], [1]);
+        var callerOutput = CreateBuffer("caller_output", DataTypes.Float32, TIR.MemoryLocation.Data, 16, [4], [1]);
+        var calleeData = CreateBuffer("callee_data", DataTypes.UInt8, TIR.MemoryLocation.Data, 32, [0], [1]);
+        var calleeChipLocalData = CreateBuffer("callee_chip_local_data", DataTypes.UInt8, TIR.MemoryLocation.ChipLocalData, 0, [0], [1]);
+        var calleeBlockLocalData = CreateBuffer("callee_block_local_data", DataTypes.UInt8, TIR.MemoryLocation.BlockLocalData, 0, [0], [1]);
+        var main = new TIR.PrimFunction(
+            "main_prim",
+            PyNTTTarget.Kind,
+            new TIR.Sequential(
+                nested,
+                TIR.F.NTT.TensorLoad(callerRoot, input, new[] { SBP.B }, placement),
+                new Call(nested, callerRoot, callerOutput, calleeData, calleeChipLocalData, calleeBlockLocalData),
+                TIR.F.NTT.TensorStore(callerOutput, publicOutput, new[] { SBP.B }, placement)),
+            new IVar[] { input, publicOutput })
+        {
+            SchedResult =
+            {
+                DataUsage = 32,
+            },
+        };
+
+        var module = new IRModule(main);
+        module.Add(nested);
+        var outputDirectory = GeneratePyNTTModelDirectory("generated_nested_data_tensor_model", module);
+        RenderGeneratedKernels(outputDirectory);
+        var generatedKernelsPy = File.ReadAllText(Path.Join(outputDirectory, "generated_kernels.py"));
+        Assert.Contains("_arg0_root", generatedKernelsPy, StringComparison.Ordinal);
     }
 
     [Fact]

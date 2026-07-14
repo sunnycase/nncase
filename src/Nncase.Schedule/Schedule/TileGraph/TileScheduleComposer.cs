@@ -165,7 +165,9 @@ internal sealed class TileScheduleComposer
                 scheduleOpId,
                 relation,
                 sourceLevel.DomainBoundExprs.ToArray(),
-                sourceLevel.DomainDynamic.ToArray());
+                sourceLevel.DomainDynamic.ToArray(),
+                sourceLevel.LoopOrder,
+                sourceLevel.ScopeKind);
             var child = sourceLevel.Clusters.OfType<TieredTileGraph>().SingleOrDefault();
             if (child is null)
             {
@@ -192,14 +194,14 @@ internal sealed class TileScheduleComposer
 
         if (!CheckSubGraphsDenpendence(producerGraph, consumerGraph))
         {
-            Failure = $"Fusing {producerGraph} into {consumerGraph} violates dependence convexity or a chip-visible memory effect.";
+            Failure = $"Fusing {producerGraph} into {consumerGraph} violates dependence convexity or memory-visibility scope.";
             return false;
         }
 
         System.Diagnostics.Trace.Assert(ReferenceEquals(producerGraph.Parent, consumerGraph.Parent));
         System.Diagnostics.Trace.Assert(producerGraph.Level.Equals(consumerGraph.Level));
 
-        var commonAncestor = producerGraph.Parent!;
+        var commonAncestor = (TieredTileGraph)producerGraph.Parent!;
 
         // 1. find the dataflow graph
         // 1.1 find the directly connected opnode with producer op.
@@ -212,6 +214,28 @@ internal sealed class TileScheduleComposer
         }
 
         var relayOp = dependencePath.First().Target;
+        var requiredScope = GraphExtensions.GetRequiredFusionScope(
+            ProducerOp,
+            ConsumerOp,
+            ConsumerAccessIndex);
+        if (requiredScope == MemoryAccessScope.Chip)
+        {
+            if (producerGraph.Level != GetOutermostLevel())
+            {
+                Failure = $"Chip-visible connection {ProducerOp} -> {ConsumerOp} must be composed at the outermost hierarchy level.";
+                return false;
+            }
+
+            return MergeSequentialScopes(commonAncestor, producerGraph, consumerGraph);
+        }
+
+        if (producerGraph.ScopeKind == TileScopeKind.Sequential ||
+            consumerGraph.ScopeKind == TileScopeKind.Sequential)
+        {
+            Failure = $"Non-chip connection {ProducerOp} -> {ConsumerOp} cannot extend a sequential chip phase. " +
+                "Keep logical aliases or block-local dataflow outside the phase container.";
+            return false;
+        }
 
         // 1.2. build the direct domain relation from the consumer use to the
         // producer result.
@@ -243,6 +267,14 @@ internal sealed class TileScheduleComposer
             producerGraph.OpId,
             AffineUtility.Inverse(producerGraphToProducerOp.Map, producerGraphBounds));
         var domainRel = consumerToProducerOp.ApplyRange(producerOpToGraph);
+        if (producerGraph.ClustersCount == 0 &&
+            consumerGraph.ClustersCount == 0 &&
+            !HasCommonPointIterationSpace(domainRel.Map, consumerGraph.DomainBoundExprs))
+        {
+            Failure = $"Innermost fusion from {producerGraph} into {consumerGraph} requires a pointwise-bijective " +
+                $"iteration relation, got {domainRel.Map}. Preserve the independent child loop nests at an outer hierarchy level.";
+            return false;
+        }
 
         // 4. merge producerGraph's subgrph into the consumerGraph.
         commonAncestor.RemoveCluster(producerGraph);
@@ -266,7 +298,101 @@ internal sealed class TileScheduleComposer
         return true;
     }
 
-    private static DomainRelation GetDescendantRelation(TieredTileGraph ancestor, TileGrid descendant)
+    private bool MergeSequentialScopes(
+        TieredTileGraph commonAncestor,
+        TieredTileGraph producerGraph,
+        TieredTileGraph consumerGraph)
+    {
+        if (producerGraph.ClustersCount == 0 || consumerGraph.ClustersCount == 0)
+        {
+            Failure = $"Sequential chip phases require complete child tile scopes, got " +
+                $"{producerGraph} ({producerGraph.ClustersCount} children) and " +
+                $"{consumerGraph} ({consumerGraph.ClustersCount} children).";
+            return false;
+        }
+
+        TieredTileGraph sequence;
+        if (consumerGraph.ScopeKind == TileScopeKind.Sequential)
+        {
+            sequence = consumerGraph;
+            commonAncestor.RemoveCluster(producerGraph);
+            AddPhases(sequence, producerGraph);
+        }
+        else if (producerGraph.ScopeKind == TileScopeKind.Sequential)
+        {
+            sequence = producerGraph;
+            commonAncestor.RemoveCluster(consumerGraph);
+            AddPhases(sequence, consumerGraph);
+        }
+        else
+        {
+            var scheduleScopeId = GetNextScheduleScopeId();
+            sequence = commonAncestor.CreateCluster<TieredTileGraph>(
+                producerGraph.Level,
+                scheduleScopeId,
+                new DomainRelation(scheduleScopeId, scheduleScopeId, AffineMap.Identity(0)),
+                Array.Empty<Dimension>(),
+                Array.Empty<bool>(),
+                Array.Empty<int>(),
+                TileScopeKind.Sequential);
+            commonAncestor.RemoveCluster(producerGraph);
+            commonAncestor.RemoveCluster(consumerGraph);
+            AddPhases(sequence, producerGraph);
+            AddPhases(sequence, consumerGraph);
+        }
+
+        return true;
+
+        static void AddPhases(TieredTileGraph destination, TieredTileGraph source)
+        {
+            if (source.ScopeKind == TileScopeKind.Sequential)
+            {
+                foreach (var child in source.Clusters.OfType<TieredTileGraph>().ToArray())
+                {
+                    source.RemoveCluster(child);
+                    destination.AddCluster(child);
+                }
+            }
+            else
+            {
+                destination.AddCluster(source);
+            }
+
+            destination.AddVertexRange(source.Vertices);
+        }
+    }
+
+    private bool HasCommonPointIterationSpace(
+        AffineMap relation,
+        IReadOnlyList<Dimension> consumerBounds)
+    {
+        if (relation.Domains.Length != relation.Results.Length ||
+            relation.Domains.Length != consumerBounds.Count ||
+            !relation.IsProjectedPermutation(allowConstInResults: false))
+        {
+            return false;
+        }
+
+        try
+        {
+            var maximumBounds = CompilerServices.GetMaxShape(new RankedShape(consumerBounds.ToArray()));
+            var inverse = AffineUtility.Inverse(relation, maximumBounds);
+            return inverse.IsProjectedPermutation(allowConstInResults: false);
+        }
+        catch (Exception ex) when (ex is ArgumentException or NotSupportedException or System.Diagnostics.UnreachableException)
+        {
+            return false;
+        }
+    }
+
+    private int GetNextScheduleScopeId()
+    {
+        var maximum = -1;
+        RootGraph.Walk(node => maximum = Math.Max(maximum, node.OpId));
+        return checked(maximum + 1);
+    }
+
+    private DomainRelation GetDescendantRelation(TieredTileGraph ancestor, TileGrid descendant)
     {
         if (!ancestor.ContainsVertex(descendant))
         {
@@ -301,7 +427,9 @@ internal sealed class TileScheduleComposer
         {
             var crossesSubGraphs = (producer.ContainsVertex(edge.Source) && consumer.ContainsVertex(edge.Target)) ||
                 (consumer.ContainsVertex(edge.Source) && producer.ContainsVertex(edge.Target));
-            if (crossesSubGraphs && !GraphExtensions.IsFusionLegal(edge.Source, edge.Target, edge.Tag))
+            if (crossesSubGraphs &&
+                GraphExtensions.GetRequiredFusionScope(edge.Source, edge.Target, edge.Tag) == MemoryAccessScope.Chip &&
+                TargetLevel != GetOutermostLevel())
             {
                 return false;
             }
@@ -339,6 +467,21 @@ internal sealed class TileScheduleComposer
         dfs.Compute();
 
         return hasDependence && !hasCycles;
+    }
+
+    private int GetOutermostLevel()
+    {
+        var levels = new List<int>();
+        RootGraph.Walk(node =>
+        {
+            if (node is TieredTileGraph { Level: >= 0 } graph)
+            {
+                levels.Add(graph.Level);
+            }
+        });
+        return levels.Count == 0
+            ? throw new InvalidOperationException("A tile schedule graph has no executable hierarchy levels.")
+            : levels.Max();
     }
 
     private bool GatherSubGraphs(TieredTileGraph graph, [MaybeNullWhen(false)] out TieredTileGraph producer, [MaybeNullWhen(false)] out TieredTileGraph consumer)

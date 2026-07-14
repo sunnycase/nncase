@@ -27,6 +27,23 @@ public enum TileGridAttribute : uint
     LiveOut = 1 << 1,
 }
 
+/// <summary>
+/// Execution semantics of one hierarchical schedule scope.
+/// </summary>
+public enum TileScopeKind
+{
+    /// <summary>
+    /// A normal tiling scope whose domain is decomposed into loops.
+    /// </summary>
+    Iteration,
+
+    /// <summary>
+    /// A zero-dimensional container whose child scopes execute sequentially
+    /// and retain their own independent iteration domains.
+    /// </summary>
+    Sequential,
+}
+
 public interface ITileable
 {
     int Level { get; }
@@ -235,22 +252,48 @@ public sealed class TieredTileGraph : TieredAdjacencyGraph<TileGrid, EquatableTa
     {
         OpId = -1;
         Level = -1;
+        ScopeKind = TileScopeKind.Iteration;
         DomainRelation = new(-1, -1, IR.Affine.AffineMap.Identity(0));
+        LoopOrder = ImmutableArray<int>.Empty;
     }
 
-    public TieredTileGraph([NotNull] TieredTileGraph parentGraph, int level, int opid, DomainRelation relation, Dimension[] domainBoundsExpr, IEnumerable<bool> domainDynamic)
+    public TieredTileGraph(
+        [NotNull] TieredTileGraph parentGraph,
+        int level,
+        int opid,
+        DomainRelation relation,
+        Dimension[] domainBoundsExpr,
+        IEnumerable<bool> domainDynamic,
+        IEnumerable<int> loopOrder,
+        TileScopeKind scopeKind)
         : base(parentGraph)
     {
         OpId = opid;
         Level = level;
+        ScopeKind = scopeKind;
         DomainRelation = relation;
         DomainDynamic = ImmutableArray.CreateRange(domainDynamic);
         DomainBoundExprs = ImmutableArray.CreateRange(domainBoundsExpr);
+        LoopOrder = ImmutableArray.CreateRange(loopOrder);
+        ValidateLoopOrder(LoopOrder, DomainBoundExprs.Length, $"Op{opid}@L{level}");
+
+        if (ScopeKind == TileScopeKind.Sequential &&
+            (DomainRelation.Map.Domains.Length != 0 ||
+             DomainRelation.Map.Results.Length != 0 ||
+             DomainBoundExprs.Length != 0 ||
+             LoopOrder.Length != 0))
+        {
+            throw new ArgumentException(
+                $"Sequential tile scope Op{opid}@L{level} must have a zero-dimensional domain.",
+                nameof(scopeKind));
+        }
     }
 
     public int Level { get; }
 
     public int OpId { get; }
+
+    public TileScopeKind ScopeKind { get; }
 
     public DomainRelation DomainRelation { get; set; }
 
@@ -258,5 +301,31 @@ public sealed class TieredTileGraph : TieredAdjacencyGraph<TileGrid, EquatableTa
 
     public ImmutableArray<Dimension> DomainBoundExprs { get; }
 
-    public override string ToString() => $"Op{OpId}@{Level}";
+    /// <summary>
+    /// Gets the permutation from lexical loop position to canonical domain axis.
+    /// Affine relations always use canonical domain axes and are never rewritten
+    /// when this order changes.
+    /// </summary>
+    public ImmutableArray<int> LoopOrder { get; private set; }
+
+    public void SetLoopOrder(IEnumerable<int> loopOrder)
+    {
+        var order = ImmutableArray.CreateRange(loopOrder);
+        ValidateLoopOrder(order, DomainBoundExprs.Length, ToString());
+        LoopOrder = order;
+    }
+
+    public override string ToString() => ScopeKind == TileScopeKind.Sequential
+        ? $"Sequence{OpId}@{Level}"
+        : $"Op{OpId}@{Level}";
+
+    private static void ValidateLoopOrder(ImmutableArray<int> loopOrder, int rank, string owner)
+    {
+        if (loopOrder.Length != rank || !loopOrder.Order().SequenceEqual(Enumerable.Range(0, rank)))
+        {
+            throw new ArgumentException(
+                $"Tile scope {owner} requires a permutation of canonical axes [0, {rank}), got [{string.Join(", ", loopOrder)}].",
+                nameof(loopOrder));
+        }
+    }
 }

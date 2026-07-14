@@ -118,8 +118,7 @@ public sealed partial class AutoDistributedWithShapeBucketPass : ModulePass
                                   select new KeyValuePair<DimVar, DimVar>(
                                       dimVar,
                                       dimVar.With(range: newRange))).ToDictionary(kvp => kvp.Key, kvp => kvp.Value, (IEqualityComparer<DimVar>)ReferenceEqualityComparer.Instance);
-                var segmentFunction = ((Function)new SegmentFunctionCloner(newDimVars, $"_segment_{segmentIndex}").Clone(functionForSegments, Unit.Default))
-                    .With(role: FunctionRole.Dispatch);
+                var segmentFunction = (Function)new SegmentFunctionCloner(newDimVars, $"_segment_{segmentIndex}").Clone(functionForSegments, Unit.Default);
                 segmentStates[segmentIndex] = new SegmentAutoDistributedState(
                     segmentFunction,
                     newDimVars);

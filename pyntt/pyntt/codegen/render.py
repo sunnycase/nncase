@@ -28,8 +28,7 @@ WORKSPACE_STRIDE_PARAMETERS = (
     "block_local_data_pool_stride_bytes: tl.constexpr",
 )
 
-DEVICE_CALL_FRAME_SLOT_BYTES = 8
-DEVICE_CALL_FRAME_ADDRESS_SPACE = 3
+SHARD_INDEX_PARAMETER = "shard_index"
 
 DEVICE_CALL_RE = re.compile(
     r"(?m)^(?P<indent>[ \t]*)__pyntt_device_call__(?P<name>[A-Za-z_]\w*)\((?P<args>.*)\)$"
@@ -78,7 +77,6 @@ def render_manifest(manifest: dict[str, Any]) -> str:
     )
     needs_shared_memory = any(
         int(_attrs(kernel.get("metadata", {})).get("shared_memory_bytes", 0)) > 0
-        or _device_call_frame_bytes(kernel) > 0
         for function in manifest.get("functions", ())
         for kernel in function.get("render_kernels", ())
     )
@@ -123,59 +121,7 @@ def _kernel_parameters(metadata: dict[str, Any]) -> tuple[str, ...]:
     )
 
 
-def _build_device_context_frame(
-    metadata: dict[str, Any],
-    device_functions: tuple[dict[str, Any], ...],
-    parameters: tuple[str, ...],
-) -> tuple[dict[str, Any], ...]:
-    if not device_functions:
-        return ()
-
-    pointer_types = {name: "tl.uint8" for name in WORKSPACE_PARAMETERS}
-    scalar_names = {
-        *_parameter_call_arguments(_abi_view_stride_args(metadata)),
-        *_runtime_shape_args(metadata),
-        "numel",
-    }
-    candidates = {
-        **{
-            name: {"name": name, "triton_dtype": dtype, "is_pointer": True}
-            for name, dtype in pointer_types.items()
-        },
-        **{
-            name: {
-                "name": name,
-                "triton_dtype": "tl.int64",
-                "is_pointer": False,
-            }
-            for name in scalar_names
-        },
-    }
-    parameter_names = _parameter_call_arguments(parameters)
-    referenced = set()
-    for device_function in device_functions:
-        referenced.update(
-            _referenced_parameter_names(
-                device_function.get("body_source", ""), parameter_names
-            )
-        )
-
-    live_names = tuple(
-        name
-        for name in parameter_names
-        if name in referenced and name in candidates
-    )
-    return tuple(
-        {
-            **candidates[name],
-            "offset": index * DEVICE_CALL_FRAME_SLOT_BYTES,
-        }
-        for index, name in enumerate(live_names)
-    )
-
-
 def _render_kernel(kernel: dict[str, Any]) -> str:
-    kernel = _compose_device_functions(kernel)
     env = _make_env()
     metadata = kernel["metadata"]
     kernel_attrs = _attrs(metadata)
@@ -184,57 +130,33 @@ def _render_kernel(kernel: dict[str, Any]) -> str:
     if shared_memory_bytes < 0:
         raise ValueError(
             f"PyNTT kernel {metadata['name']} has invalid shared_memory_bytes={shared_memory_bytes}."
-        )
+    )
     raw_device_functions = tuple(kernel["device_functions"])
-    context_frame = _build_device_context_frame(
-        metadata, raw_device_functions, parameters
-    )
-    call_frame_offsets, call_frame_bytes = _assign_device_call_frames(
-        raw_device_functions,
-        base_offset=len(context_frame) * DEVICE_CALL_FRAME_SLOT_BYTES,
-    )
     shared_allocation_bytes = _round_memory_arena_size(
         shared_memory_bytes,
         str(kernel_attrs.get("shared_memory_allocation_size_policy", "")),
         int(kernel_attrs.get("shared_memory_allocation_granularity_bytes", 0)),
-    )
-    call_frame_allocation_bytes = _round_memory_arena_size(
-        call_frame_bytes,
-        str(kernel_attrs.get("shared_memory_allocation_size_policy", "")),
-        int(kernel_attrs.get("shared_memory_allocation_granularity_bytes", 0)),
-    )
-    total_shared_allocation_bytes = (
-        shared_allocation_bytes + call_frame_allocation_bytes
     )
     shared_memory_capacity_bytes = int(
         kernel_attrs.get("shared_memory_capacity_bytes", 0)
     )
     if (
         shared_memory_capacity_bytes > 0
-        and total_shared_allocation_bytes > shared_memory_capacity_bytes
+        and shared_allocation_bytes > shared_memory_capacity_bytes
     ):
         raise ValueError(
             f"PyNTT kernel {metadata['name']} requires "
-            f"{total_shared_allocation_bytes} shared-memory bytes after allocation "
-            f"rounding (AutoTiling arena {shared_memory_bytes} -> "
-            f"{shared_allocation_bytes}, device call frames {call_frame_bytes} -> "
-            f"{call_frame_allocation_bytes}), "
+            f"{shared_allocation_bytes} shared-memory bytes after allocation "
+            f"rounding (AutoTiling arena {shared_memory_bytes}), "
             f"exceeding target capacity {shared_memory_capacity_bytes}."
         )
-    hidden_device_parameters = tuple(
-        parameter
-        for parameter, required in (
-            ("pyntt_shared_base", shared_allocation_bytes > 0),
-            ("pyntt_call_frame_base", call_frame_allocation_bytes > 0),
-        )
-        if required
+    hidden_device_parameters = (
+        ("pyntt_shared_base",) if shared_allocation_bytes > 0 else ()
     )
     device_functions = _prepare_device_functions(
         raw_device_functions,
         parameters,
         hidden_device_parameters,
-        context_frame,
-        call_frame_offsets,
     )
     device_functions_by_name = {
         device_function["name"]: device_function
@@ -258,8 +180,6 @@ def _render_kernel(kernel: dict[str, Any]) -> str:
     body_source = _with_shared_memory_prelude(
         body_source,
         shared_allocation_bytes,
-        call_frame_allocation_bytes,
-        context_frame,
     )
     top_kernel = env.get_template("triton/top_kernel.py.jinja").render(
         name=metadata["name"],
@@ -295,10 +215,8 @@ def _render_device_function(
             stage["body_source"],
             device_functions_by_name,
         )
-        body_source = _replace_device_call_frame_references(
-            body_source, device_function
-        )
-        body_source = _with_shard_index_prelude(body_source)
+        if SHARD_INDEX_PARAMETER not in _parameter_call_arguments(device_parameters):
+            body_source = _with_shard_index_prelude(body_source)
         parts.append(
             env.get_template("triton/top_kernel.py.jinja").render(
                 name=stage["name"],
@@ -318,37 +236,15 @@ def _prepare_device_functions(
     device_functions: tuple[dict[str, Any], ...],
     parameters: tuple[str, ...],
     hidden_parameters: tuple[str, ...],
-    context_frame: tuple[dict[str, Any], ...],
-    call_frame_offsets: dict[str, int],
 ) -> tuple[dict[str, Any], ...]:
     parameter_names = _parameter_call_arguments(parameters)
     parameter_by_name = dict(zip(parameter_names, parameters))
-    context_parameter_names = {parameter["name"] for parameter in context_frame}
     prepared_functions = []
     for device_function in device_functions:
         prepared = dict(device_function)
         extra_parameters = tuple(device_function["extra_parameters"])
-        call_frame = tuple(device_function["call_frame"])
-        framed_names = {parameter["name"] for parameter in call_frame}
-        unknown_names = framed_names.difference(extra_parameters)
-        if unknown_names:
-            raise RuntimeError(
-                f"PyNTT device function {device_function['name']} frames unknown parameters "
-                f"{sorted(unknown_names)}."
-            )
-        prepared["direct_extra_parameters"] = tuple(
-            parameter for parameter in extra_parameters if parameter not in framed_names
-        )
-        prepared["call_frame"] = tuple(
-            {
-                **parameter,
-                "offset": call_frame_offsets[device_function["name"]]
-                + index * DEVICE_CALL_FRAME_SLOT_BYTES,
-            }
-            for index, parameter in enumerate(call_frame)
-        )
+        prepared["direct_extra_parameters"] = extra_parameters
         prepared["hidden_parameters"] = hidden_parameters
-        prepared["context_frame"] = context_frame
         prepared["stages"] = (
             {
                 "name": device_function["name"],
@@ -365,12 +261,12 @@ def _prepare_device_functions(
     required_parameters = {
         name: _referenced_parameter_names(
             device_function.get("body_source", ""), parameter_names
-        ).difference(context_parameter_names)
+        )
         for name, device_function in functions_by_name.items()
     }
 
     # Keep only canonical top-kernel parameters used by this private function
-    # or a transitive callee. PrimFunc descriptors remain in the typed frame.
+    # or a transitive callee. PrimFunc descriptors are explicit parameters.
     changed = True
     while changed:
         changed = False
@@ -443,84 +339,6 @@ def _parameter_call_arguments(parameters: tuple[str, ...]) -> tuple[str, ...]:
     return tuple(parameter.split(":", 1)[0].strip() for parameter in parameters)
 
 
-def _device_call_frame_bytes(kernel: dict[str, Any]) -> int:
-    kernel = _compose_device_functions(kernel)
-    device_functions = tuple(kernel["device_functions"])
-    context_frame = _build_device_context_frame(
-        kernel["metadata"],
-        device_functions,
-        _kernel_parameters(kernel["metadata"]),
-    )
-    return len(context_frame) * DEVICE_CALL_FRAME_SLOT_BYTES + sum(
-        len(device_function["call_frame"]) * DEVICE_CALL_FRAME_SLOT_BYTES
-        for device_function in device_functions
-    )
-
-
-def _assign_device_call_frames(
-    device_functions: tuple[dict[str, Any], ...],
-    *,
-    base_offset: int = 0,
-) -> tuple[dict[str, int], int]:
-    functions_by_name: dict[str, dict[str, Any]] = {}
-    for device_function in device_functions:
-        name = device_function["name"]
-        if name in functions_by_name:
-            raise RuntimeError(f"Duplicate PyNTT device function {name}.")
-        functions_by_name[name] = device_function
-
-    callees: dict[str, tuple[str, ...]] = {}
-    indegrees = {name: 0 for name in functions_by_name}
-    for name, device_function in functions_by_name.items():
-        nested = tuple(
-            dict.fromkeys(
-                match.group("name")
-                for match in DEVICE_CALL_NAME_RE.finditer(
-                    device_function.get("body_source", "")
-                )
-            )
-        )
-        unknown = [callee for callee in nested if callee not in functions_by_name]
-        if unknown:
-            raise RuntimeError(
-                f"PyNTT device function {name} calls unknown device functions "
-                f"{unknown}."
-            )
-        callees[name] = nested
-        for callee in nested:
-            indegrees[callee] += 1
-
-    # A caller's frame remains live while a synchronous child call executes.
-    # Longest-path offsets preserve that nesting while allowing sibling and
-    # otherwise non-overlapping calls to reuse the same backend-owned arena.
-    ready = [name for name in functions_by_name if indegrees[name] == 0]
-    offsets = {name: base_offset for name in functions_by_name}
-    processed = 0
-    allocation_bytes = base_offset
-    while ready:
-        name = ready.pop(0)
-        processed += 1
-        frame_end = offsets[name] + (
-            len(functions_by_name[name]["call_frame"])
-            * DEVICE_CALL_FRAME_SLOT_BYTES
-        )
-        allocation_bytes = max(allocation_bytes, frame_end)
-        for callee in callees[name]:
-            offsets[callee] = max(offsets[callee], frame_end)
-            indegrees[callee] -= 1
-            if indegrees[callee] == 0:
-                ready.append(callee)
-
-    if processed != len(functions_by_name):
-        cyclic = sorted(name for name, indegree in indegrees.items() if indegree > 0)
-        raise RuntimeError(
-            "Recursive PyNTT device-function call graphs are not supported; "
-            f"cycle includes {cyclic}."
-        )
-
-    return offsets, allocation_bytes
-
-
 def _split_expression_arguments(source: str) -> tuple[str, ...]:
     if not source.strip():
         return ()
@@ -537,44 +355,6 @@ def _split_expression_arguments(source: str) -> tuple[str, ...]:
         ast.get_source_segment(wrapped, argument) or ast.unparse(argument)
         for argument in expression.args
     )
-
-
-def _substitute_identifiers(source: str, bindings: dict[str, str]) -> str:
-    if not source or not bindings:
-        return source
-
-    lines = source.splitlines(keepends=True)
-    line_offsets = []
-    offset = 0
-    for line in lines:
-        line_offsets.append(offset)
-        offset += len(line)
-    if not source.endswith(("\n", "\r")):
-        line_offsets.append(offset)
-
-    try:
-        tree = ast.parse(source)
-    except SyntaxError as ex:
-        raise RuntimeError(
-            "Invalid PyNTT device-function body while composing Dispatch functions."
-        ) from ex
-
-    replacements = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Name) or node.id not in bindings:
-            continue
-        if node.end_lineno is None or node.end_col_offset is None:
-            raise RuntimeError(
-                "Python AST does not expose source ranges required for PyNTT "
-                "Dispatch composition."
-            )
-        start = line_offsets[node.lineno - 1] + node.col_offset
-        end = line_offsets[node.end_lineno - 1] + node.end_col_offset
-        replacements.append((start, end, f"({bindings[node.id]})"))
-
-    for start, end, replacement in sorted(replacements, reverse=True):
-        source = source[:start] + replacement + source[end:]
-    return source
 
 
 def _bind_device_function_extra_arguments(
@@ -601,98 +381,6 @@ def _bind_device_function_extra_arguments(
     return {parameter: defaults[parameter] for parameter in extra_parameters}
 
 
-def _compose_device_functions(kernel: dict[str, Any]) -> dict[str, Any]:
-    raw_functions = tuple(kernel.get("device_functions", ()))
-    composed_names = {
-        function["name"]
-        for function in raw_functions
-        if bool(function.get("compose_into_caller", False))
-    }
-    if not composed_names:
-        return kernel
-
-    functions_by_name = {}
-    for function in raw_functions:
-        name = function["name"]
-        if name in functions_by_name:
-            raise RuntimeError(f"Duplicate PyNTT device function {name}.")
-        functions_by_name[name] = function
-
-    for name in composed_names:
-        function = functions_by_name[name]
-        if function["noinline"]:
-            raise RuntimeError(
-                f"PyNTT Dispatch function {name} cannot be both composed and noinline."
-            )
-        if function["preserve_helper_call_boundaries"]:
-            raise RuntimeError(
-                f"PyNTT Dispatch function {name} cannot preserve private helper boundaries."
-            )
-
-    def expand(source: str, active: tuple[str, ...]) -> str:
-        def replace(match: re.Match[str]) -> str:
-            name = match.group("name")
-            callee = functions_by_name.get(name)
-            if callee is None:
-                raise RuntimeError(
-                    f"PyNTT kernel references unknown device function {name}."
-                )
-            if name not in composed_names:
-                return match.group(0)
-            if name in active:
-                cycle = " -> ".join((*active, name))
-                raise RuntimeError(
-                    f"Recursive PyNTT Dispatch composition is not supported: {cycle}."
-                )
-
-            extra_arguments = _bind_device_function_extra_arguments(
-                callee, _split_expression_arguments(match.group("args"))
-            )
-            parameter_overrides = {
-                parameter: _substitute_identifiers(expression, extra_arguments)
-                for parameter, expression in dict(
-                    callee["parameter_overrides"]
-                ).items()
-            }
-            overlap = set(extra_arguments).intersection(parameter_overrides)
-            if overlap:
-                raise RuntimeError(
-                    f"PyNTT Dispatch function {name} has conflicting bindings "
-                    f"for {sorted(overlap)}."
-                )
-            body = _substitute_identifiers(
-                callee.get("body_source", "").rstrip() or "pass",
-                {**extra_arguments, **parameter_overrides},
-            )
-            body = expand(body, (*active, name))
-            indent = match.group("indent")
-            return "\n".join(
-                f"{indent}{line}" if line else line
-                for line in body.splitlines()
-            )
-
-        return DEVICE_CALL_RE.sub(replace, source)
-
-    composed_helpers = [
-        {**helper, "noinline": True}
-        for function in raw_functions
-        if function["name"] in composed_names
-        for helper in function.get("helpers", ())
-    ]
-    result = dict(kernel)
-    result["helpers"] = [*kernel.get("helpers", ()), *composed_helpers]
-    result["body_source"] = expand(kernel.get("body_source", ""), ())
-    result["device_functions"] = [
-        {
-            **function,
-            "body_source": expand(function.get("body_source", ""), (function["name"],)),
-        }
-        for function in raw_functions
-        if function["name"] not in composed_names
-    ]
-    return result
-
-
 def _build_device_function_call(
     device_function: dict[str, Any],
     explicit_extra_arguments: tuple[str, ...],
@@ -702,7 +390,7 @@ def _build_device_function_call(
     )
 
     parameter_overrides = dict(device_function["parameter_overrides"])
-    direct_call_arguments = tuple(
+    call_arguments = tuple(
         parameter_overrides.get(argument, argument)
         for argument in _parameter_call_arguments(
             tuple(device_function["direct_parameters"])
@@ -714,32 +402,7 @@ def _build_device_function_call(
         extra_arguments[parameter]
         for parameter in device_function["direct_extra_parameters"]
     )
-    lines = []
-    for parameter in device_function["call_frame"]:
-        value = extra_arguments[parameter["name"]]
-        if parameter["is_pointer"]:
-            address = (
-                f"(pyntt_call_frame_base + {parameter['offset']}).to("
-                f"tl.pointer_type(tl.uint64, {DEVICE_CALL_FRAME_ADDRESS_SPACE}))"
-            )
-            lines.append(f"tl.store({address}, ({value}).to(tl.uint64))")
-        else:
-            address = (
-                f"(pyntt_call_frame_base + {parameter['offset']}).to("
-                f"tl.pointer_type({parameter['triton_dtype']}, "
-                f"{DEVICE_CALL_FRAME_ADDRESS_SPACE}))"
-            )
-            lines.append(f"tl.store({address}, {value})")
-    if device_function["call_frame"]:
-        if "pyntt_call_frame_base" not in device_function["hidden_parameters"]:
-            raise RuntimeError(
-                f"PyNTT call to {device_function['name']} requires a shared call frame."
-            )
-        lines.append("tl.debug_barrier()")
-    lines.append(
-        f"{device_function['name']}({', '.join(direct_call_arguments)})"
-    )
-    return "\n".join(lines)
+    return f"{device_function['name']}({', '.join(call_arguments)})"
 
 
 def _replace_device_function_calls(
@@ -753,7 +416,8 @@ def _replace_device_function_calls(
         indent = match.group("indent")
         extra_arguments = _split_expression_arguments(match.group("args"))
         call_source = _build_device_function_call(
-            device_functions[name], extra_arguments
+            device_functions[name],
+            extra_arguments,
         )
 
         return "\n".join(
@@ -764,37 +428,12 @@ def _replace_device_function_calls(
     return DEVICE_CALL_RE.sub(replace, source)
 
 
-def _replace_device_call_frame_references(
-    source: str, device_function: dict[str, Any]
-) -> str:
-    for parameter in sorted(
-        tuple(device_function["call_frame"])
-        + tuple(device_function["context_frame"]),
-        key=lambda item: len(item["name"]),
-        reverse=True,
-    ):
-        if parameter["is_pointer"]:
-            address = (
-                f"(pyntt_call_frame_base + {parameter['offset']}).to("
-                f"tl.pointer_type(tl.uint64, {DEVICE_CALL_FRAME_ADDRESS_SPACE}))"
-            )
-            value = (
-                f"tl.load({address}).to(tl.pointer_type("
-                f"{parameter['triton_dtype']}))"
-            )
-        else:
-            address = (
-                f"(pyntt_call_frame_base + {parameter['offset']}).to("
-                f"tl.pointer_type({parameter['triton_dtype']}, "
-                f"{DEVICE_CALL_FRAME_ADDRESS_SPACE}))"
-            )
-            value = f"tl.load({address})"
-        source = re.sub(rf"\b{re.escape(parameter['name'])}\b", value, source)
-    return source
-
-
 def _with_shard_index_prelude(source: str) -> str:
     source = source.rstrip()
+    if SHARD_INDEX_PARAMETER not in _referenced_parameter_names(
+        source, (SHARD_INDEX_PARAMETER,)
+    ):
+        return source
     prelude = "shard_index = tl.program_id(0).to(tl.int64)"
     if not source:
         return prelude
@@ -804,47 +443,16 @@ def _with_shard_index_prelude(source: str) -> str:
 def _with_shared_memory_prelude(
     source: str,
     shared_size_bytes: int,
-    call_frame_size_bytes: int,
-    context_frame: tuple[dict[str, Any], ...],
 ) -> str:
-    if shared_size_bytes == 0 and call_frame_size_bytes == 0:
+    if shared_size_bytes == 0:
         return source
-    lines = []
-    if shared_size_bytes > 0:
-        lines.extend(
-            (
-                f"pyntt_shared_storage = tle.gpu.alloc([{shared_size_bytes}], dtype=tl.uint8, "
-                "layout=None, scope=tle.gpu.smem, nv_mma_shared_layout=False)",
-                "pyntt_shared_base = tle.gpu.local_ptr(pyntt_shared_storage, (0,))",
-            )
+    prelude = "\n".join(
+        (
+            f"pyntt_shared_storage = tle.gpu.alloc([{shared_size_bytes}], dtype=tl.uint8, "
+            "layout=None, scope=tle.gpu.smem, nv_mma_shared_layout=False)",
+            "pyntt_shared_base = tle.gpu.local_ptr(pyntt_shared_storage, (0,))",
         )
-    if call_frame_size_bytes > 0:
-        lines.extend(
-            (
-                f"pyntt_call_frame_storage = tle.gpu.alloc([{call_frame_size_bytes}], dtype=tl.uint8, "
-                "layout=None, scope=tle.gpu.smem, nv_mma_shared_layout=False)",
-                "pyntt_call_frame_base = tle.gpu.local_ptr(pyntt_call_frame_storage, (0,))",
-            )
-        )
-    for parameter in context_frame:
-        if parameter["is_pointer"]:
-            address = (
-                f"(pyntt_call_frame_base + {parameter['offset']}).to("
-                f"tl.pointer_type(tl.uint64, {DEVICE_CALL_FRAME_ADDRESS_SPACE}))"
-            )
-            lines.append(
-                f"tl.store({address}, ({parameter['name']}).to(tl.uint64))"
-            )
-        else:
-            address = (
-                f"(pyntt_call_frame_base + {parameter['offset']}).to("
-                f"tl.pointer_type({parameter['triton_dtype']}, "
-                f"{DEVICE_CALL_FRAME_ADDRESS_SPACE}))"
-            )
-            lines.append(f"tl.store({address}, {parameter['name']})")
-    if context_frame:
-        lines.append("tl.debug_barrier()")
-    prelude = "\n".join(lines)
+    )
     source = source.rstrip()
     return prelude if not source else f"{prelude}\n{source}"
 

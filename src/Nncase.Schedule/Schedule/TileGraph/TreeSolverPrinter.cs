@@ -69,7 +69,9 @@ public sealed class TreeSolverPrinter : TreeSolverBase<IntExpr>, ITreeNodeVisito
         writer.WriteLine($"TileNode {value}:");
         writer.Indent++;
 
+        writer.WriteLine($"ScopeKind: {value.ScopeKind}");
         writer.WriteLine($"Domain Relation: {value.DomainRelation}");
+        writer.WriteLine($"LoopOrder: [{string.Join(", ", value.LoopOrder.Select(axis => $"d{axis}"))}]");
         WriteIntExprVector(writer, "TileVars", TileableNodeMemo[value].TileVars, Solution);
 
         WriteIntExprVector(writer, "TripCounts", TileNodeMemo[value].TripCounts, Solution);
@@ -127,6 +129,7 @@ public sealed class TreeSolverPrinter : TreeSolverBase<IntExpr>, ITreeNodeVisito
             writer.Write($"- write_{accessIndex}: ");
             writer.WriteLine(value.GetAccessMap(accessIndex));
         }
+
         writer.Indent--;
         writer.Indent--;
 

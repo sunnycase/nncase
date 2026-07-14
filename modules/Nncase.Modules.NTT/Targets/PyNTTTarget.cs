@@ -45,6 +45,7 @@ public sealed class PyNTTTarget : NTTTarget
     /// <inheritdoc/>
     public override void RegisterTIRPostBufferizePass(IPassManager passManager, CompileOptions options)
     {
+        passManager.AddWithName<InlineSingleCallPrimFunctionsPass>("InlineSingleCallPrimFunctions", Kind);
         passManager.AddWithName<PlanMemorySynchronizationPass>("PlanMemorySynchronization", Kind);
     }
 

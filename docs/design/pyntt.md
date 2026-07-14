@@ -456,8 +456,9 @@ inputs
   -> shape_env
   -> validate input/output tensor specs
   -> allocate outputs using resolved shapes
+  -> select one shape-bucket segment in Python runtime
   -> compute numel/grid expressions
-  -> launch top kernel with runtime dim scalar arguments
+  -> launch that segment's top kernel with runtime dim scalar arguments
 ```
 
 Workspace and constant storage are not dynamically resized in this path. After
@@ -783,6 +784,150 @@ logical view without a copy. The `BlockLocalData -> Shared` edge is
 `ExplicitCopy`. CPU `BlockLocalData -> L1/Cache` follows the same explicit
 staging contract.
 
+AutoTiling separates structural scheduling from exact tile and storage
+selection. A maximal `TileRegion` assigns stable identities to every original
+operator scope, produced value, and producer-consumer use. An immutable
+`TileStructuralSchedule` contains only:
+
+- a fusion level for each use, where `-1` preserves a root materialization;
+- a lexical loop-order permutation for each original hierarchy scope.
+
+Affine maps always use canonical axis identities. Loop order is a permutation
+from lexical loop position to canonical axis, so reordering never rewrites an
+access relation. Schedule construction clones the maximal graph, applies loop
+orders, then composes each selected use from outer levels through its selected
+fusion level. The canonical region is never mutated by a search candidate.
+
+Fusion and loop order use one deterministic MCTS decision tree. Fusion
+decisions and loop-permutation prefix decisions are interleaved, giving every
+complete structural schedule one unique path while allowing a bounded search
+to explore both dimensions. A rollout greedily completes remaining legal
+fusion decisions and preserves undecided loop order. Every terminal rollout is
+evaluated by the same OR-Tools model used for final lowering; structural search
+does not use a separate proxy cost or a maximal-fusion fallback. The fully cut
+schedule remains an ordinary feasible candidate rather than a compatibility
+path. By default the planner evaluates the fully cut and greedy maximal-fusion
+terminal schedules. `NNCASE_TILING_STRUCTURAL_SEARCH_STEPS` assigns an
+additional per-region MCTS budget; a positive value explores alternative
+fusion structures and loop orders, while zero is the deterministic baseline
+through the same exact evaluation and lowering path.
+
+Hierarchical scopes have two explicit execution kinds. An `Iteration` scope
+owns an affine domain, tile variables, loop order, and storage placement. A
+`Sequential` scope is a zero-dimensional ordering container: it owns no tile
+variables, loops, or storage, and each child `Iteration` phase keeps its own
+domain relation, dynamic bounds, loop order, and zero-based phase offsets.
+This distinction is required when a producer writes a chip-visible value and a
+consumer subsequently reads or reduces that value. Such a dependence may be
+composed only at the outermost hierarchy level. Composition creates one
+`Sequential` scope containing the complete producer and consumer iteration
+scopes instead of projecting either phase onto the other phase's iteration
+domain.
+
+The sequential container lets lowering emit both phases in one PrimFunction:
+the producer performs its root `TileStore`, the existing TIR memory-effect and
+synchronization pipeline establishes the required chip visibility, and the
+consumer executes its independent full-domain operation such as
+`GatherReduceScatter`. Root materialization remains one caller-allocated
+buffer shared by the phases. Non-chip dependencies cannot be absorbed into a
+sequential chip phase; they continue to use normal iteration fusion or an
+explicit materialization.
+
+Schedule verification rejects a sequential scope unless it is outermost,
+zero-dimensional, contains at least two same-level iteration phases, and all
+cross-phase edges require chip visibility. Solver initialization and lowering
+visit every child phase independently. This fail-fast contract prevents empty
+loop nests, accidental shared-memory allocation by an ordering-only scope, and
+the domain truncation that results from reusing a consumer tile as a producer
+tile.
+
+Pure buffer-view operators remain in the region's dependence, alias, and
+hierarchy graphs so the exact solver can select and report their logical
+creation scope and loop entry without allocating storage. After buffer views
+have been resolved, the normal TIR no-op canonicalization recursively removes
+descriptor-only `Let` bindings and loop scopes that become empty. Search
+semantics therefore remain intact while backend codegen never receives an
+empty executable loop nest.
+
+For a solved structural schedule, each internal value has placement variables
+of the form:
+
+```text
+place[value, creation_scope, lexical_loop_entry, storage_level]
+```
+
+Exactly one placement is selected. The creation scope must contain the
+producer and dominate every use-owner scope. Entry zero is outside all loops;
+entry `n` is after the first `n` axes in that scope's lexical loop order. A
+scope at hierarchy level `cl` may select any storage level `sl` satisfying
+`0 <= sl <= cl`. This permits, for example, a value whose producer and consumer
+are fused at the outer BlockLocalData scope to be produced directly into an
+inner Shared buffer. Capacity, liveness, transfer, bandwidth, and
+synchronization constraints are charged against the selected storage level and
+the trip count at the selected lexical entry. Non-selected ancestor and
+descendant occurrences are logical views of the one materialization. Alias
+values participate in the same creation/dominance model but select no physical
+storage.
+
+Loop permutation also preserves the backend-private reduction-state contract.
+The first L0 reduction loop owns the accumulator lifetime. Any spatial loop
+lexically nested inside that reduction scope must have a single trip; otherwise
+one backend accumulator would alias several output tiles. The exact solver
+therefore constrains such spatial hierarchy factors to one. This permits an
+`M, K, N` order when the current outer `N` region is consumed as one tile, while
+requiring `N` outside `K` when `N` itself needs multiple tiles. A backend may
+relax this constraint only after exposing indexed accumulator state and its
+capacity through the target contract.
+
+The exact result records `TileMaterialization(value, creation_scope,
+loop_entry, storage_space, uses)`. TIR lowering consumes that solved placement
+directly. It does not rediscover ownership or choose a storage level. An
+explicit `TileLoad`/`TileStore` is emitted only when the selected storage edge
+requires a copy; direct-access edges and fused producer-consumer values do not
+gain an intermediate transfer.
+
+Physical buffer scheduling is also part of the AutoTiling result. For every
+selected target memory space, it minimizes the arena end under liveness,
+non-overlap, and alignment constraints, then records the raw required bytes,
+the target-policy-rounded allocation bytes, the TIR memory binding, and the
+arena alignment. Memory locations backed by caller-allocated mutable pools
+(`Data`, `ChipLocalData`, and `BlockLocalData`) are published to the generated
+`PrimFunction.SchedResult`. Backend-private locations such as `Shared` and
+`Cache` remain explicit physical buffers in the function body. Bufferize skips
+an already scheduled function, so AutoTiling must publish this ABI metadata at
+the point where it marks the function scheduled. PyNTT consumes that published
+size for AutoTiling-generated scheduled regions; generic workspace discovery
+for unscheduled functions is not a substitute for missing schedule metadata.
+
+AutoTiling diagnostics use one provenance-based naming service. Names are
+derived from stable region operation ids, operation kinds, target memory-space
+ids, endpoint roles, and affine axis ids; neither traversal order nor object
+identity participates. The canonical forms are:
+
+```text
+device_[fused_]op<id>_<kind>[__op<id>_<kind>...]
+buffer_<endpoint>__l<level>_<memory>__at_<fusion>
+loop_<fusion>__l<level>_<memory>__{spatial|reduce}_axis<axis>
+tile_<fusion>__l<level>_<memory>__axis<axis>
+extent_<fusion>__l<level>_<memory>__axis<axis>
+```
+
+`loop` is the lowered TIR iteration variable, `tile` is the exact-solver tile
+decision, and `extent` is a dynamic local-shard dimension. Long fusion names
+are shortened with stable head/tail operation provenance and a deterministic
+hash, while the object role, memory level, and axis suffix are always retained.
+This makes solver dumps, TIR dumps, and generated code correlate without a
+side table.
+
+Every AutoTiling scheduled region also carries a semantic `T.CodegenScope`
+whose trace name is `fusion[op<id>:<kind>,...]` (or `op[...]` for one source
+operation). Single-call PrimFunction inlining substitutes the body and caller
+workspace but preserves this nested scope. PyNTT outlines a codegen scope as a
+direct-argument `noinline` Triton device function and emits matching
+`pyntt_trace_event` begin/end markers. Function inlining therefore changes the
+physical call graph without erasing the fusion boundaries used by timeline
+tools.
+
 All storage resources use the existing TIR buffer vocabulary. A selected
 `Shared` or `Cache` placement allocates a target-bound local buffer. Lowering
 inserts `TileLoad(local, parent_view)` before reads and
@@ -870,40 +1015,36 @@ fail immediately.
 - Constants use binary rdata assets and are materialized once by the runtime.
 - `BufferizePass` remains authoritative for buffer shape, strides, size,
   location, workspace offset, and lifetime.
-- Shared-memory typed call frames preserve ordinary internal PrimFunc call
-  boundaries without keeping every pointer and dynamic tensor-descriptor field
-  live in the device-function ABI. Private device functions frame only the
-  descriptor fields referenced by their lowered bodies. Caller-allocated
+- Internal PrimFuncs use an explicit device-function ABI. The compiler manifest
+  records every live tensor base, shape, stride, global offset, workspace base,
+  object field, and dynamic dimension needed by the lowered body. The
+  reader-only renderer computes transitive liveness for canonical top-kernel
+  parameters and passes those values directly through each device-function
+  call. Static specialization values remain `tl.constexpr`; dynamic dimensions
+  remain ordinary Triton scalar parameters.
+- PyNTT does not allocate a shared-memory call frame or context frame. Argument
+  transport must not introduce frame stores, frame loads, frame barriers, or a
+  second shared arena. The only compiler-managed shared arena is the explicit
+  AutoTiling staging allocation represented by TIR buffers. Caller-allocated
   AutoTiling PrimFuncs remain `noinline` device functions so their temporary SSA
   values do not enlarge the caller's live range; operator-template helpers stay
-  inlined within those leaf functions. Call frames occupy a backend-owned arena
-  separate from the AutoTiling staging arena. The renderer assigns frame offsets
-  from the device-call DAG, keeps caller and callee frames disjoint, and reuses
-  storage across sibling or sequential calls.
-  The maximum live call stack is rounded independently from the AutoTiling
-  arena. The compiler-managed arena must fit its logical allocation limit, and
-  the compiled kernel's total usage, including call frames and Triton-private
-  lowering scratch, must fit the target's physical per-block shared-memory
-  capacity.
-- A shared device-context frame stores canonical dynamic launch values once;
-  private device functions load only the fields used by their body. Static
-  specialization values remain `tl.constexpr` direct parameters. This is an ABI
-  representation owned by PyNTT and does not create compiler-visible TIR
-  buffers.
+  inlined within those leaf functions. The physical block identity
+  (`shard_index`) is materialized from `tl.program_id` only in functions that
+  reference it and is passed explicitly when a callee requires that value.
 - Function call-boundary policy is derived from the IR `FunctionRole`, never
-  from function names. Shape-bucket selector and segment-root functions are
-  `Dispatch`; the manifest marks them `compose_into_caller`, and the reader-only
-  renderer structurally expands them before call-frame allocation, ABI
-  liveness, and Triton code generation. This is mandatory composition rather
-  than a request to Triton's optional inliner, so orchestration wrappers cannot
-  survive as spill-prone device functions. Decoder and ordinary compute
-  functions are `Compute`, while AutoTiling-generated leaf PrimFuncs are
-  `ScheduledRegion`; both preserve their noinline device boundaries.
-  Dispatch trace markers are retained. A direct operator helper owned by a
-  Dispatch function moves to the owning top-kernel scope but remains a
-  `noinline` compute leaf; composing an orchestration wrapper must not inline
-  operator register state into the top kernel. Operator-template helpers may
-  still inline inside a scheduled leaf.
+  from function names. Shape-bucket entry and selector functions are
+  `Dispatch`: they emit no render kernel and are translated to Python runtime
+  control flow over `shape_env`. Shape-bucket segment roots retain the source
+  function's `Compute` role and each renders as an independent top Triton
+  kernel. Only the selected branch prepares its workspace, validates/JITs its
+  specialization, and performs one launch. Bucket predicates, selector calls,
+  and unselected segments must not appear in a Triton kernel. A `Compute`
+  function calling a `Dispatch` function is invalid because runtime dispatch
+  must be resolved before device execution. Decoder and ordinary compute
+  functions remain `Compute`, while AutoTiling-generated leaf PrimFuncs are
+  `ScheduledRegion`; both preserve their `noinline` device boundaries inside
+  the selected segment kernel. Operator-template helpers may still inline
+  inside a scheduled leaf.
 - Triton top kernels consume the generated TIR buffer plan directly; Python
   runtime code must not recompute workspace placement.
 
@@ -939,11 +1080,10 @@ The generated model should validate:
 
 Shape mismatch should be an error. It should not trigger dynamic recompilation.
 If a runtime input violates the shape bucket range used by compilation, the
-runtime should reject it before launching Triton.
-
-Future specialization may add multiple generated variants selected by a shape
-bucket key, but the single-variant dynamic path should remain valid for
-dimension values inside the compiled range.
+runtime should reject it before selecting or launching a Triton kernel. Each
+compiled bucket is a separate top-kernel variant selected by generated Python
+control flow. A single-variant dynamic path remains valid when compilation
+produces one segment.
 
 ## Error Handling
 

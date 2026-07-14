@@ -92,11 +92,12 @@ public sealed class TieredTileGraphBuilder : ExprVisitor<Unit, Unit>
 
         var opNode = new TileGrid(current, op, copId, copId, domainBoundValues, new DomainRelation(copId, copId, AffineMap.Identity(domainDims)), domainBoundExprs, domainDynamic, bufferShapeValues, attr);
 
-        var tileNodeRoot = RootGraph.CreateCluster<TieredTileGraph>(LevelCount - 1, copId, new DomainRelation(copId, copId, AffineMap.Identity(domainDims)), domainBoundExprs, domainDynamic);
+        var canonicalLoopOrder = Enumerable.Range(0, domainDims).ToArray();
+        var tileNodeRoot = RootGraph.CreateCluster<TieredTileGraph>(LevelCount - 1, copId, new DomainRelation(copId, copId, AffineMap.Identity(domainDims)), domainBoundExprs, domainDynamic, canonicalLoopOrder, TileScopeKind.Iteration);
         var tileNodeTail = tileNodeRoot;
         for (int l = LevelCount - 2; l >= 0; l--)
         {
-            tileNodeTail = tileNodeTail.CreateCluster<TieredTileGraph>(l, copId, new DomainRelation(copId, copId, AffineMap.Identity(domainDims)), domainBoundExprs, domainDynamic);
+            tileNodeTail = tileNodeTail.CreateCluster<TieredTileGraph>(l, copId, new DomainRelation(copId, copId, AffineMap.Identity(domainDims)), domainBoundExprs, domainDynamic, canonicalLoopOrder, TileScopeKind.Iteration);
         }
 
         tileNodeTail.AddVertex(opNode);

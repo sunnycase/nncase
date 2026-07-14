@@ -11,6 +11,7 @@ using Nncase.Passes;
 using Nncase.Passes.BufferSchedule;
 using Nncase.Passes.Rules.ShapeBucket;
 using Nncase.Passes.Transforms;
+using Nncase.Schedule.Bufferize;
 using Nncase.Tests.TestFixture;
 using Xunit;
 
@@ -77,6 +78,41 @@ public sealed class UnitTestBufferScheduler : TestClassBase
         CpSolverStatus solve_status = solver.Solve(model);
         Assert.Equal(CpSolverStatus.Optimal, solve_status);
         System.Console.WriteLine(solver.Value(by_start));
+    }
+
+    [Fact]
+    public void TestLetBoundBufferViewsExtendRootBufferLifetimes()
+    {
+        var sourcePhysical = new TIR.PhysicalBuffer(DataTypes.Float32.SizeInBytes, 256, TIR.MemoryLocation.Data);
+        var destinationPhysical = new TIR.PhysicalBuffer(DataTypes.Float32.SizeInBytes, 256, TIR.MemoryLocation.Data);
+        var source = new TIR.Buffer(
+            "source",
+            DataTypes.Float32,
+            new TIR.MemSpan(sourcePhysical),
+            new Dimension[] { 64 },
+            new Dimension[] { 1 },
+            null);
+        var destination = new TIR.Buffer(
+            "destination",
+            DataTypes.Float32,
+            new TIR.MemSpan(destinationPhysical),
+            new Dimension[] { 64 },
+            new Dimension[] { 1 },
+            null);
+        var sourceView = new Var("source_view");
+        var destinationView = new Var("destination_view");
+        var body = new TIR.Let(
+            sourceView,
+            IR.F.Buffer.BufferSubview(source, new Dimension[] { 0 }, new Dimension[] { 64 }),
+            new TIR.Sequential(
+                new TIR.Let(
+                    destinationView,
+                    IR.F.Buffer.BufferSubview(destination, new Dimension[] { 0 }, new Dimension[] { 64 }),
+                    new TIR.Sequential(TIR.T.Memcopy(destinationView, sourceView)))));
+
+        var result = new LifetimeCollector().Collect(body);
+
+        Assert.True(result.Lifetimes[sourcePhysical].Time.Overlaps(result.Lifetimes[destinationPhysical].Time));
     }
 
     [Theory]

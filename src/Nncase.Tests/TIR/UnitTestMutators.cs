@@ -28,6 +28,69 @@ public sealed class UnitTestMutators : TestClassBase
     }
 
     [Fact]
+    public void TestFlattenSequentialPreservesTraceScopeWithoutReportingMutation()
+    {
+        var traced = new Sequential(new Expr[] { T.Nop() }, "fusion[op0:test]");
+        var outer = new Sequential(traced);
+        var rewriter = new FlattenSequential();
+
+        var rewritten = rewriter.Rewrite(outer);
+
+        Assert.Same(outer, rewritten);
+        Assert.False(rewriter.IsMutated);
+        Assert.Same(traced, Assert.Single(outer.Fields.ToArray()));
+    }
+
+    [Fact]
+    public void TestUnrollCleanupPreservesTraceScopeWithoutReportingMutation()
+    {
+        var traced = new Sequential(new Expr[] { T.Nop() }, "fusion[op0:test]");
+        var outer = new Sequential(traced);
+        var rewriter = new UnRollLoopSequential();
+
+        var rewritten = rewriter.Rewrite(outer);
+
+        Assert.Same(outer, rewritten);
+        Assert.False(rewriter.IsMutated);
+        Assert.Same(traced, Assert.Single(outer.Fields.ToArray()));
+    }
+
+    [Fact]
+    public void TestFlattenSequentialPreservesCodegenScopeWithoutReportingMutation()
+    {
+        var scoped = T.CodegenScope("fusion[op0:test]", new Sequential(T.Nop()));
+        var outer = new Sequential(scoped);
+        var rewriter = new FlattenSequential();
+
+        var rewritten = rewriter.Rewrite(outer);
+
+        Assert.Same(outer, rewritten);
+        Assert.False(rewriter.IsMutated);
+        Assert.Same(scoped, Assert.Single(outer.Fields.ToArray()));
+        Assert.True(scoped.PreserveCodegenBoundary);
+    }
+
+    [Fact]
+    public void TestTailLoopStrippingPreservesFreeBufferVarIdentity()
+    {
+        var inputType = new TensorType(DataTypes.Float32, new[] { 5 });
+        var input = new BufferVar("input", inputType, BufferVarRole.Input, MemoryLocation.Input);
+        var body = T.Sequential(
+            T.Serial(out var i, (0, 5, 4)).Body(
+                T.Let(
+                    out var view,
+                    IR.F.Buffer.BufferSubview(input, new RankedShape(new Dimension[] { i }), new RankedShape(new Dimension[] { 1 }))).Body(
+                    T.Nop())));
+        var function = new PrimFunction("tail_loop", Callable.CPUModuleKind, body, new[] { input });
+
+        var rewritten = (PrimFunction)new TailLoopStripping().Rewrite(function);
+        var bodyBufferVars = ExprCollector.Collect(rewritten.Body).OfType<BufferVar>().ToArray();
+
+        Assert.NotEmpty(bodyBufferVars);
+        Assert.All(bodyBufferVars, bufferVar => Assert.Same(rewritten.Parameters[0], bufferVar));
+    }
+
+    [Fact]
     public async Task TestFoldConstCallWithTuple()
     {
         T.CreateBufferVar(new TensorType(DataTypes.BFloat16, new[] { 48 }), out var ddr_if);

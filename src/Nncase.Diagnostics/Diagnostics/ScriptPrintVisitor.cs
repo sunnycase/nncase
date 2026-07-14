@@ -565,7 +565,21 @@ internal sealed class ScriptPrintVisitor : ExprFunctor<IPrintSymbol, string>
 
         _scope.Push();
 
-        _scope.AppendLine("(");
+        if (expr.TraceScopeName is { } traceScopeName)
+        {
+            var escapedName = traceScopeName.Replace("\\", "\\\\", StringComparison.Ordinal).Replace("\"", "\\\"", StringComparison.Ordinal);
+            var scopeBuilder = expr.PreserveCodegenBoundary ? "CodegenScope" : "TraceScope";
+            _scope.AppendLine($"T.{scopeBuilder}(\"{escapedName}\",");
+            _scope.IndWriteLine("(");
+        }
+        else if (expr.PreserveCodegenBoundary)
+        {
+            throw new InvalidOperationException("A TIR codegen scope must have a semantic trace name.");
+        }
+        else
+        {
+            _scope.AppendLine("(");
+        }
 
         // 1. Foreach Body
         using (_scope.IndentUp())
@@ -576,7 +590,7 @@ internal sealed class ScriptPrintVisitor : ExprFunctor<IPrintSymbol, string>
             }
         }
 
-        _scope.IndWrite(")");
+        _scope.IndWrite(expr.TraceScopeName is null ? ")" : "))");
 
         doc = new(_scope.Pop().ToString());
         _exprMemo.Add(expr, doc);

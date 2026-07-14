@@ -26,9 +26,16 @@ public static class GraphExtensions
                     if (arg.Cluster is TieredTileGraph tg)
                     {
                         var name = $"Op{tg.OpId}@L{tg.Level}";
+                        if (tg.ScopeKind == TileScopeKind.Sequential)
+                        {
+                            name = $"Sequence{tg.OpId}@L{tg.Level}";
+                        }
+
                         arg.GraphFormat.Label = name;
+                        arg.GraphFormat.Label += System.Environment.NewLine + $"ScopeKind: {tg.ScopeKind}";
                         arg.GraphFormat.Label += System.Environment.NewLine + tg.DomainRelation.ToString();
                         arg.GraphFormat.Label += System.Environment.NewLine + $"DomainBounds: [{string.Join(", ", tg.DomainBoundExprs)}]";
+                        arg.GraphFormat.Label += System.Environment.NewLine + $"LoopOrder: [{string.Join(", ", tg.LoopOrder.Select(axis => $"d{axis}"))}]";
                         arg.GraphFormat.LabelLocation = QuikGraph.Graphviz.Dot.GraphvizLabelLocation.T;
                         arg.GraphFormat.LabelJustification = QuikGraph.Graphviz.Dot.GraphvizLabelJustification.L;
                         arg.GraphFormat.BackgroundColor = _colors[tg.OpId];
@@ -115,6 +122,9 @@ public static class GraphExtensions
                         case BufferEdgeKind.Inter:
                             arg.EdgeFormat.Style = QuikGraph.Graphviz.Dot.GraphvizEdgeStyle.Solid;
                             break;
+                        case BufferEdgeKind.RootMaterialization:
+                            arg.EdgeFormat.Style = QuikGraph.Graphviz.Dot.GraphvizEdgeStyle.Dotted;
+                            break;
                         default:
                             break;
                     }
@@ -194,12 +204,33 @@ public static class GraphExtensions
     /// <summary>
     /// Gets inter-op edges materialized by this exact hierarchy level. A
     /// tiered graph propagates child edges to its ancestors, so membership in
-    /// <see cref="BufferGraph.Edges"/> alone does not imply ownership.
+    /// <c>BufferGraph.Edges</c> alone does not imply ownership.
     /// </summary>
     public static IEnumerable<EquatableTaggedEdge<BufferIdentity, BufferEdgeKind>> GetOwnedInterEdges(this BufferGraph graph)
         => graph.Edges.Where(edge =>
             edge.Tag == BufferEdgeKind.Inter &&
             !graph.Clusters.OfType<BufferGraph>().Any(child => child.ContainsEdge(edge)));
+
+    /// <summary>
+    /// Gets chip-visible phase boundaries owned by this exact hierarchy
+    /// level. These edges preserve root storage while their surrounding
+    /// execution scopes may be composed.
+    /// </summary>
+    public static IEnumerable<EquatableTaggedEdge<BufferIdentity, BufferEdgeKind>> GetOwnedRootMaterializationEdges(this BufferGraph graph)
+        => graph.Edges.Where(edge =>
+            edge.Tag == BufferEdgeKind.RootMaterialization &&
+            !graph.Clusters.OfType<BufferGraph>().Any(child => child.ContainsEdge(edge)));
+
+    /// <summary>
+    /// Returns whether a hierarchy scope contains only logical buffer aliases.
+    /// Such a scope participates in dependence and visibility analysis, but it
+    /// has no executable iteration domain of its own.
+    /// </summary>
+    public static bool IsPureBufferViewScope(this TieredTileGraph graph)
+    {
+        var vertices = graph.Vertices.ToArray();
+        return vertices.Length != 0 && vertices.All(vertex => vertex.IsPureBufferView);
+    }
 
     public static void PruneDeadBufferViews(this TieredTileGraph rootGraph)
     {
@@ -356,18 +387,20 @@ public static class GraphExtensions
         return bidict;
     }
 
-    internal static bool IsFusionLegal(TileGrid producer, TileGrid consumer, int consumerAccessIndex)
+    internal static MemoryAccessScope GetRequiredFusionScope(TileGrid producer, TileGrid consumer, int consumerAccessIndex)
     {
         var consumerRead = consumer.Grid.Accesses[consumerAccessIndex];
         if (HasChipMemoryEffect(consumer, consumerAccessIndex, MemoryAccessMode.Read))
         {
-            return false;
+            return MemoryAccessScope.Chip;
         }
 
         var producerOutputIndex = GetProducerOutputIndex(consumerRead.Value, producer);
         var producerWrite = producer.Grid.Accesses[producer.GetWriteAccessIndex(producerOutputIndex)];
-        return producerWrite.BindingMode != GridBindingMode.Root ||
-            !HasChipMemoryEffect(producer, producer.GetWriteAccessIndex(producerOutputIndex), MemoryAccessMode.Write);
+        return producerWrite.BindingMode == GridBindingMode.Root &&
+            HasChipMemoryEffect(producer, producer.GetWriteAccessIndex(producerOutputIndex), MemoryAccessMode.Write)
+                ? MemoryAccessScope.Chip
+                : MemoryAccessScope.Block;
 
         static bool HasChipMemoryEffect(TileGrid grid, int accessIndex, MemoryAccessMode mode)
             => grid.LocalAccessEffects[accessIndex] is { Scope: MemoryAccessScope.Chip } effect && effect.Mode.HasFlag(mode);
@@ -432,7 +465,7 @@ public static class GraphExtensions
         {
             foreach (var sourceChild in sourceGraph.Clusters.OfType<TieredTileGraph>())
             {
-                var destChild = destGraph.CreateCluster<TieredTileGraph>(sourceChild.Level, sourceChild.OpId, sourceChild.DomainRelation, sourceChild.DomainBoundExprs.ToArray(), sourceChild.DomainDynamic.ToArray());
+                var destChild = destGraph.CreateCluster<TieredTileGraph>(sourceChild.Level, sourceChild.OpId, sourceChild.DomainRelation, sourceChild.DomainBoundExprs.ToArray(), sourceChild.DomainDynamic.ToArray(), sourceChild.LoopOrder, sourceChild.ScopeKind);
                 CloneInternal(sourceChild, destChild, updatedMemo);
             }
         }

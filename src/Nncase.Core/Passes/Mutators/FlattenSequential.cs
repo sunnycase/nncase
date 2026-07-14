@@ -20,9 +20,14 @@ public sealed class FlattenSequential : ExprRewriter
     /// <inheritdoc/>
     protected override Expr RewriteLeafSequential(Sequential expr)
     {
-        if (expr.Fields.AsValueEnumerable().Any(x => x is Sequential))
+        if (expr.Fields.AsValueEnumerable().Any(x => x is Sequential { CanFlatten: true }))
         {
-            return Sequential.Flatten(expr.Fields);
+            var flattened = Sequential.Flatten(expr.Fields);
+            return expr.CanFlatten
+                ? flattened
+                : flattened.With(
+                    traceScopeName: expr.TraceScopeName,
+                    preserveCodegenBoundary: expr.PreserveCodegenBoundary);
         }
 
         return expr;

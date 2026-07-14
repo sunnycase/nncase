@@ -48,6 +48,18 @@ public sealed class UnitTestTileGraph : TestClassBase
     }
 
     [Fact]
+    public void TestTileLifetimeUsesInclusiveExecutionPhases()
+    {
+        var inputLifetime = new TileLifetime(4, 5);
+        var outputLifetime = new TileLifetime(5, 6);
+
+        Assert.Equal(2, inputLifetime.PhaseCount);
+        Assert.Equal(2, outputLifetime.PhaseCount);
+        Assert.True(inputLifetime.Overlaps(outputLifetime));
+        Assert.Equal(new TileLifetime(4, 6), inputLifetime.Union(outputLifetime));
+    }
+
+    [Fact]
     public void TestReshapeAffineSelectionPreservesVectorLanes()
     {
         var vectorType = new VectorType(DataTypes.BFloat16, [8]);
@@ -174,7 +186,7 @@ public sealed class UnitTestTileGraph : TestClassBase
             .ToArray();
         Assert.Equal(2, viewUses.Length);
         Assert.Equal(2, viewUses.Select(use => use.Id.ConsumerOpId).Distinct().Count());
-        Assert.All(viewUses, use => Assert.True(use.IsLocallyConnectable));
+        Assert.All(viewUses, use => Assert.Equal(MemoryAccessScope.Block, use.RequiredMemoryScope));
 
         var targetOptions = Assert.IsAssignableFrom<INTTTargetOptions>(CompileOptions.TargetOptions);
         var tiled = new Schedule.GraphTiler().Tile(
@@ -523,6 +535,57 @@ public sealed class UnitTestTileGraph : TestClassBase
     }
 
     [Fact]
+    public void TestRectangularProjectionNormalizesComposedAxisScale()
+    {
+        var domains = IR.F.Affine.Domains(2);
+        var map = new IR.Affine.AffineMap(
+            domains,
+            default,
+            new IR.Affine.AffineRange[]
+            {
+                new(domains[0].Offset, domains[0].Extent),
+                new(
+                    IR.F.Affine.FloorDiv(2 * domains[1].Offset, 2),
+                    IR.F.Affine.FloorDiv(2 * domains[1].Extent, 2)),
+                new(0, 64),
+            });
+
+        Assert.True(map.IsRectangularProjection(allowConstInResults: true));
+
+        var ceilOffset = new IR.Affine.AffineDivBinary(
+            IR.Affine.AffineDivBinaryOp.CeilDiv,
+            2 * domains[1].Offset,
+            2);
+        var ceilExtent = new IR.Affine.AffineDivBinary(
+            IR.Affine.AffineDivBinaryOp.CeilDiv,
+            2 * domains[1].Extent,
+            2);
+        var ceilMap = new IR.Affine.AffineMap(
+            domains,
+            default,
+            new IR.Affine.AffineRange[]
+            {
+                new(domains[0].Offset, domains[0].Extent),
+                new(
+                    2 * ceilOffset,
+                    2 * ceilExtent),
+            });
+        Assert.True(ceilMap.IsRectangularProjection(allowConstInResults: true));
+
+        var nonEquivalentFloorOrder = new IR.Affine.AffineMap(
+            domains,
+            default,
+            new IR.Affine.AffineRange[]
+            {
+                new(domains[0].Offset, domains[0].Extent),
+                new(
+                    2 * IR.F.Affine.FloorDiv(domains[1].Offset, 2),
+                    domains[1].Extent),
+            });
+        Assert.False(nonEquivalentFloorOrder.IsRectangularProjection(allowConstInResults: true));
+    }
+
+    [Fact]
     public async Task TestTileGraphFusesThroughRankChangingBufferAliasGrid()
     {
         using var ctx = IntegerSetLibrary.ctx.Create();
@@ -579,7 +642,7 @@ public sealed class UnitTestTileGraph : TestClassBase
             region.Uses,
             use => use.Id.ProducerOpId == producerNode.OpId &&
                 use.Id.ConsumerOpId == viewNode.OpId &&
-                use.IsLocallyConnectable);
+                use.RequiredMemoryScope == MemoryAccessScope.Block);
 
         var tiled = Assert.IsType<Function>(await new AutoTilePass(Targets.CPUTarget.Kind, CompileOptions).RunAsync(selected, new()));
         Assert.DoesNotContain(ExprCollector.Collect(tiled.Body), expression => expression is IR.Affine.Grid);
@@ -618,7 +681,31 @@ public sealed class UnitTestTileGraph : TestClassBase
     }
 
     [Fact]
-    public void TestTileGraphFusesThroughTupleGetItem()
+    public async Task TestInputBackedBufferAliasDoesNotCreateEmptyTileScope()
+    {
+        using var ctx = IntegerSetLibrary.ctx.Create();
+        var input = new Var("input", new TensorType(DataTypes.Float32, new[] { 4, 8 }));
+        var view = IR.F.Tensors.Reshape(input, new Dimension[] { 4, 1, 8 });
+        var consumer = IR.F.Math.Unary(UnaryOp.Abs, view);
+        var function = new Function("main", Targets.CPUTarget.Kind, consumer, [input]);
+
+        var selected = Assert.IsType<Function>(
+            await new NTTAffineSelectionPass(CompileOptions).RunAsync(function, new()));
+        var tiled = Assert.IsType<Function>(
+            await new AutoTilePass(Targets.CPUTarget.Kind, CompileOptions).RunAsync(selected, new()));
+        var deviceBodies = ExprCollector.Collect(tiled.Body)
+            .OfType<PrimFunctionWrapper>()
+            .SelectMany(wrapper => ExprCollector.Collect(wrapper.Target.Body))
+            .ToArray();
+
+        Assert.NotEmpty(deviceBodies);
+        Assert.DoesNotContain(deviceBodies.OfType<TIR.Let>(), let => let.Body.Count == 0);
+        Assert.DoesNotContain(deviceBodies.OfType<TIR.For>(), loop => loop.Body.Count == 0);
+        Assert.Single(deviceBodies.OfType<Call>().Where(call => call.Target is TIR.NTT.Unary));
+    }
+
+    [Fact]
+    public void TestTileGraphTracksTupleGetItemUses()
     {
         using var ctx = IntegerSetLibrary.ctx.Create();
         var input = new Var("input", new TensorType(DataTypes.BFloat16, new[] { 4, 64 }));
@@ -643,20 +730,35 @@ public sealed class UnitTestTileGraph : TestClassBase
             numHeads: 4,
             numKvHeads: 2,
             outDataType: DataTypes.BFloat16);
-        var key = qkv[1];
-        var consumer = IR.F.Math.Unary(UnaryOp.Neg, key);
-        var function = new Function("main", Targets.CPUTarget.Kind, new IR.Tuple(consumer, qkv[2]), [input, qWeight, kWeight, vWeight]);
+        var queryConsumer = IR.F.Math.Unary(UnaryOp.Abs, qkv[0]);
+        var keyConsumer = IR.F.Math.Unary(UnaryOp.Neg, qkv[1]);
+        var function = new Function(
+            "main",
+            Targets.CPUTarget.Kind,
+            new IR.Tuple(queryConsumer, keyConsumer, qkv[2]),
+            [input, qWeight, kWeight, vWeight]);
 
         var selected = Assert.IsType<Function>(new NTTAffineSelectionPass(CompileOptions).RunAsync(function, new()).Result);
-        var graph = TieredTileGraphBuilder.Build(selected.Body, 1, out _);
-        Assert.Equal(2, graph.VertexCount);
-        var edge = Assert.Single(graph.Edges);
-        Assert.Equal(1, Nncase.Schedule.TileGraph.GraphExtensions.GetProducerOutputIndex(edge.Target.Grid.Accesses[edge.Tag].Value, edge.Source));
-        var use = Assert.Single(TileRegion.Create(graph).Uses);
-        Assert.Equal(1, use.Id.ProducerOutputIndex);
-        Assert.True(use.IsLocallyConnectable);
-
         var targetOptions = Assert.IsAssignableFrom<INTTTargetOptions>(CompileOptions.TargetOptions);
+        var graph = TieredTileGraphBuilder.Build(
+            selected.Body,
+            targetOptions.TargetMachineModel.TilingMemorySpaces.Length,
+            out _);
+        Assert.Equal(3, graph.VertexCount);
+        var producerOutputIndices = graph.Edges
+            .Select(edge => Nncase.Schedule.TileGraph.GraphExtensions.GetProducerOutputIndex(
+                edge.Target.Grid.Accesses[edge.Tag].Value,
+                edge.Source))
+            .Order()
+            .ToArray();
+        Assert.Equal(new[] { 0, 1 }, producerOutputIndices);
+        var region = TileRegion.Create(graph);
+        Assert.Equal(2, region.Uses.Length);
+        Assert.All(region.Uses, use => Assert.Equal(MemoryAccessScope.Block, use.RequiredMemoryScope));
+
+        var levelCount = targetOptions.TargetMachineModel.TilingMemorySpaces.Length;
+        Assert.All(region.Uses, use => Assert.True(use.CanFuseAtLevel(levelCount - 1, levelCount)));
+
         var tiled = new Schedule.GraphTiler().Tile(
             selected.Body,
             Targets.CPUTarget.Kind,
@@ -709,6 +811,74 @@ public sealed class UnitTestTileGraph : TestClassBase
         var deviceFunction = Assert.IsType<TIR.PrimFunction>(deviceCall.Target);
         Assert.Single(ExprCollector.Collect(deviceFunction.Body).OfType<Call>().Where(call => call.Target is TIR.NTT.Unary));
         Assert.DoesNotContain(ExprCollector.Collect(lowered.Body).OfType<Call>(), call => call.Target is TIR.Memcopy);
+    }
+
+    [Fact]
+    public async Task TestAutoTilePreservesDynamicDimensionParameterIdentity()
+    {
+        var sequenceLength = new DimVar("sequence_length") { Metadata = { Range = new(1, 16) } };
+        var input = new Var("input", new TensorType(DataTypes.Float32, new Dimension[] { sequenceLength, 4 }));
+        var function = new Function(
+            "main",
+            Targets.CPUTarget.Kind,
+            IR.F.Math.Unary(UnaryOp.Neg, input),
+            new IVar[] { input, sequenceLength });
+        var selected = Assert.IsType<Function>(
+            await new NTTAffineSelectionPass(CompileOptions).RunAsync(function, new()));
+        var tiled = Assert.IsType<Function>(
+            await new AutoTilePass(Targets.CPUTarget.Kind, CompileOptions).RunAsync(selected, new()));
+
+        var wrapper = Assert.Single(ExprCollector.Collect(tiled.Body).OfType<PrimFunctionWrapper>());
+        var dimensionParameter = Assert.Single(wrapper.Target.Parameters.ToArray().OfType<DimVar>());
+        Assert.Same(sequenceLength, dimensionParameter);
+        var bodyDimensions = ExprCollector.Collect(wrapper.Target.Body)
+            .OfType<DimVar>()
+            .Where(dimVar => dimVar.Name == sequenceLength.Name)
+            .ToArray();
+        Assert.NotEmpty(bodyDimensions);
+        Assert.All(bodyDimensions, dimension => Assert.Same(dimensionParameter, dimension));
+    }
+
+    [Fact]
+    public async Task TestAutoTilePreservesDynamicDimensionCapturedByGridBody()
+    {
+        var layerId = new DimVar("layer_id") { Metadata = { Range = new(0, 31) } };
+        var slots = new Var("slots", new TensorType(DataTypes.BFloat16, new[] { 1, 1, 8 }));
+        var objectType = TensorType.Scalar(new ReferenceType(DataTypes.Int32));
+        var kvCache = new Var("kv_cache", objectType);
+        var update = IR.F.NN.UpdatePagedAttentionKVCache(
+            slots,
+            kvCache,
+            layerId,
+            IR.NN.AttentionCacheKind.Key,
+            [IR.NN.AttentionDimKind.Seq, IR.NN.AttentionDimKind.Head, IR.NN.AttentionDimKind.Dim]);
+        var function = new Function(
+            "main",
+            Targets.CPUTarget.Kind,
+            update,
+            new IVar[] { slots, kvCache, layerId });
+        var selected = Assert.IsType<Function>(
+            await new NTTAffineSelectionPass(CompileOptions).RunAsync(function, new()));
+        var selectedGrid = Assert.IsType<IR.Affine.Grid>(selected.Body);
+        var selectedUpdate = Assert.IsType<Call>(Assert.Single(selectedGrid.Body.Fields.ToArray()));
+        Assert.Same(layerId, selectedUpdate[TIR.NTT.UpdatePagedAttentionKVCache.LayerId]);
+
+        var tiled = Assert.IsType<Function>(
+            await new AutoTilePass(Targets.CPUTarget.Kind, CompileOptions).RunAsync(selected, new()));
+
+        var wrapper = Assert.Single(ExprCollector.Collect(tiled.Body).OfType<PrimFunctionWrapper>());
+        var dimensionParameter = Assert.Single(wrapper.Target.Parameters.ToArray().OfType<DimVar>());
+        Assert.Same(layerId, dimensionParameter);
+        var bodyUpdates = ExprCollector.Collect(wrapper.Target.Body)
+            .OfType<Call>()
+            .Where(call => call.Target is TIR.NTT.UpdatePagedAttentionKVCache)
+            .ToArray();
+        Assert.NotEmpty(bodyUpdates);
+        Assert.All(
+            bodyUpdates,
+            bodyUpdate => Assert.Same(
+                dimensionParameter,
+                bodyUpdate[TIR.NTT.UpdatePagedAttentionKVCache.LayerId]));
     }
 
     [Fact]
@@ -1016,7 +1186,7 @@ public sealed class UnitTestTileGraph : TestClassBase
     }
 
     [Fact]
-    public void TestChipVisibleRootWriteIsTileFusionBoundary()
+    public void TestChipVisibleRootWriteRequiresOutermostPhaseFusion()
     {
         using var ctx = IntegerSetLibrary.ctx.Create();
         var placement = new Placement([4], "b", "b");
@@ -1035,7 +1205,44 @@ public sealed class UnitTestTileGraph : TestClassBase
         Assert.Equal(2, graph.VertexCount);
         Assert.Single(graph.Edges);
         var use = Assert.Single(TileRegion.Create(graph).Uses);
-        Assert.False(use.IsLocallyConnectable);
+        Assert.Equal(MemoryAccessScope.Chip, use.RequiredMemoryScope);
+        Assert.False(use.CanFuseAtLevel(0, 2));
+        Assert.True(use.CanFuseAtLevel(1, 2));
+    }
+
+    [Fact]
+    public void TestRankChangingProducerReduceFusionPreservesIndependentL0Loops()
+    {
+        using var ctx = IntegerSetLibrary.ctx.Create();
+        var input = new Var("input", new TensorType(DataTypes.Float32, new[] { 4, 8 }));
+        var producer = IR.F.Math.Unary(UnaryOp.Neg, input);
+        var stats = IR.F.NN.NormStats(1, producer, useMean: false);
+        var function = new Function("main", Targets.CPUTarget.Kind, stats, [input]);
+        var selected = Assert.IsType<Function>(
+            new NTTAffineSelectionPass(CompileOptions).RunAsync(function, new()).Result);
+        var statsGrid = Assert.IsType<IR.Affine.Grid>(selected.Body);
+        var producerGrid = Assert.IsType<IR.Affine.Grid>(statsGrid.Accesses[0].Value);
+        var targetOptions = (Targets.NTTTargetOptions)CompileOptions.TargetOptions;
+        var graph = TieredTileGraphBuilder.Build(
+            selected.Body,
+            targetOptions.TargetMachineModel.TilingMemorySpaces.Length,
+            out _);
+        var producerNode = Assert.Single(graph.Vertices.Where(node => ReferenceEquals(node.Grid, producerGrid)));
+        var statsNode = Assert.Single(graph.Vertices.Where(node => ReferenceEquals(node.Grid, statsGrid)));
+        var region = TileRegion.Create(graph);
+        var use = Assert.Single(region.Uses.Where(candidate =>
+            candidate.Id.ProducerOpId == producerNode.OpId &&
+            candidate.Id.ConsumerOpId == statsNode.OpId));
+
+        var plan = new HierarchicalTilePlanner(new Schedule.GraphTiler()).Plan(
+            region,
+            Targets.CPUTarget.Kind,
+            targetOptions,
+            Array.Empty<DimVar>());
+
+        Assert.Equal(
+            targetOptions.TargetMachineModel.TilingMemorySpaces.Length - 1,
+            plan.Structure.GetFusionLevel(use.Id));
     }
 
     [Fact]
@@ -1065,6 +1272,7 @@ public sealed class UnitTestTileGraph : TestClassBase
     [Fact]
     public async Task TestAutoTilePreservesPartialResultBeforeBoxing()
     {
+        using var ctx = IntegerSetLibrary.ctx.Create();
         var placement = new Placement(new[] { 4, 8 }, "yx", "bb");
         var inputType = new DistributedType(
             new TensorType(new VectorType(DataTypes.BFloat16, [8]), new long[] { 20, 128 }),
@@ -1082,13 +1290,120 @@ public sealed class UnitTestTileGraph : TestClassBase
         Assert.Equal(partialStatsType.Partial, Assert.IsType<DistributedType>(selectedTransfer.Accesses[0].Value.CheckedType).Partial);
         Assert.Equal(partialStatsType.Partial, Assert.IsType<DistributedType>(selectedGrid.CheckedType).Partial);
 
+        var targetOptions = (Targets.NTTTargetOptions)CompileOptions.TargetOptions;
+        var graph = TieredTileGraphBuilder.Build(
+            selected.Body,
+            targetOptions.TargetMachineModel.TilingMemorySpaces.Length,
+            out _);
+        var region = TileRegion.Create(graph);
+        var chipUse = Assert.Single(region.Uses.Where(use => use.RequiredMemoryScope == MemoryAccessScope.Chip));
+        var plan = new HierarchicalTilePlanner(new Schedule.GraphTiler()).Plan(
+            region,
+            Targets.CPUTarget.Kind,
+            targetOptions,
+            Array.Empty<DimVar>());
+        Assert.Equal(
+            targetOptions.TargetMachineModel.TilingMemorySpaces.Length - 1,
+            plan.Structure.GetFusionLevel(chipUse.Id));
+        var sequentialScopes = new List<TieredTileGraph>();
+        plan.ScheduleGraph.Walk(node =>
+        {
+            if (node is TieredTileGraph { ScopeKind: TileScopeKind.Sequential } sequence)
+            {
+                sequentialScopes.Add(sequence);
+            }
+        });
+        var sequentialScope = Assert.Single(sequentialScopes);
+        Assert.Equal(targetOptions.TargetMachineModel.TilingMemorySpaces.Length - 1, sequentialScope.Level);
+        Assert.Equal(0, sequentialScope.DomainRelation.Map.Domains.Length);
+        Assert.Equal(0, sequentialScope.DomainRelation.Map.Results.Length);
+        Assert.Empty(sequentialScope.DomainBoundExprs);
+        Assert.Empty(sequentialScope.LoopOrder);
+
+        var phases = sequentialScope.Clusters.OfType<TieredTileGraph>().ToArray();
+        Assert.Equal(2, phases.Length);
+        Assert.All(phases, phase =>
+        {
+            Assert.Equal(TileScopeKind.Iteration, phase.ScopeKind);
+            Assert.Equal(sequentialScope.Level, phase.Level);
+            Assert.Same(sequentialScope, phase.Parent);
+            Assert.NotEmpty(phase.DomainBoundExprs);
+        });
+        var producerPhase = Assert.Single(phases.Where(phase =>
+            phase.Vertices.Any(vertex => vertex.RegionOpId == chipUse.Id.ProducerOpId)));
+        var consumerPhase = Assert.Single(phases.Where(phase =>
+            phase.Vertices.Any(vertex => vertex.RegionOpId == chipUse.Id.ConsumerOpId)));
+        Assert.NotSame(producerPhase, consumerPhase);
+        var originalProducerScope = Assert.Single(graph.Clusters.OfType<TieredTileGraph>().Where(scope =>
+            scope.Vertices.Any(vertex => vertex.RegionOpId == chipUse.Id.ProducerOpId)));
+        var originalConsumerScope = Assert.Single(graph.Clusters.OfType<TieredTileGraph>().Where(scope =>
+            scope.Vertices.Any(vertex => vertex.RegionOpId == chipUse.Id.ConsumerOpId)));
+        Assert.Equal(originalProducerScope.DomainBoundExprs.ToArray(), producerPhase.DomainBoundExprs.ToArray());
+        Assert.Equal(originalConsumerScope.DomainBoundExprs.ToArray(), consumerPhase.DomainBoundExprs.ToArray());
+
+        var rootMaterialization = Assert.Single(plan.Materializations.OfType<TileRootMaterialization>());
+        Assert.Equal(MemoryAccessScope.Chip, rootMaterialization.RequiredMemoryScope);
+        Assert.Contains(chipUse.Id, rootMaterialization.Uses);
+
         var tiled = Assert.IsType<Function>(await new AutoTilePass(Targets.CPUTarget.Kind, CompileOptions).RunAsync(selected, new()));
 
         Assert.DoesNotContain(ExprCollector.Collect(tiled.Body).OfType<Call>(), call => call.Target is IR.Distributed.Boxing);
+        Assert.Single(
+            ExprCollector.Collect(tiled.Body)
+                .OfType<PrimFunctionWrapper>()
+                .Distinct((IEqualityComparer<PrimFunctionWrapper>)ReferenceEqualityComparer.Instance));
         var tiledCall = Assert.IsType<Call>(tiled.Body);
         var tiledFunction = Assert.IsType<PrimFunctionWrapper>(tiledCall.Target).Target;
-        var reshard = Assert.Single(ExprCollector.Collect(tiledFunction.Body).OfType<Call>().Select(call => call.Target).OfType<TIR.NTT.GatherReduceScatter>());
+        var calls = ExprCollector.Collect(tiledFunction.Body).OfType<Call>().ToArray();
+        Assert.Single(calls.Where(call => call.Target is TIR.NTT.NormStats));
+        var tileStore = Assert.Single(calls.Where(call => call.Target is TIR.TileStore));
+        var reshardCall = Assert.Single(calls.Where(call => call.Target is TIR.NTT.GatherReduceScatter));
+        var reshard = Assert.IsType<TIR.NTT.GatherReduceScatter>(reshardCall.Target);
         Assert.Equal(partialStatsType.Partial, reshard.InType.Partial);
+
+        var rootParameter = Assert.Single(
+            tiledFunction.Parameters.ToArray().OfType<BufferVar>().Where(parameter => parameter.Role == BufferVarRole.InOut));
+        var letBindings = ExprCollector.Collect(tiledFunction.Body)
+            .OfType<TIR.Let>()
+            .ToDictionary(
+                let => (BaseExpr)let.Var,
+                let => let.Expression,
+                (IEqualityComparer<BaseExpr>)ReferenceEqualityComparer.Instance);
+        Assert.True(IsBackedBy(tileStore[TIR.TileStore.Dest], rootParameter));
+        Assert.True(IsBackedBy(reshardCall[TIR.NTT.GatherReduceScatter.Input], rootParameter));
+        Assert.DoesNotContain(
+            ExprCollector.Collect(tileStore[TIR.TileStore.Dest]).OfType<PhysicalBuffer>(),
+            buffer => buffer.Location == MemoryLocation.Shared);
+        Assert.True(
+            Array.IndexOf(calls, tileStore) < Array.IndexOf(calls, reshardCall),
+            "The complete producer phase must store its root result before the chip-visible consumer phase starts.");
+
+        bool IsBackedBy(BaseExpr expression, BaseExpr storage)
+        {
+            var pending = new Stack<BaseExpr>();
+            var visited = new HashSet<BaseExpr>(ReferenceEqualityComparer.Instance);
+            pending.Push(expression);
+            while (pending.TryPop(out var current))
+            {
+                if (!visited.Add(current))
+                {
+                    continue;
+                }
+
+                var collected = ExprCollector.Collect(current);
+                if (collected.Any(candidate => ReferenceEquals(candidate, storage)))
+                {
+                    return true;
+                }
+
+                foreach (var reference in collected.Where(letBindings.ContainsKey))
+                {
+                    pending.Push(letBindings[reference]);
+                }
+            }
+
+            return false;
+        }
     }
 
     [Fact]
@@ -1331,7 +1646,7 @@ public sealed class UnitTestTileGraph : TestClassBase
     }
 
     [Fact]
-    public void TestTileConnectionPlanUsesStablePerUseIdentity()
+    public void TestTileStructuralScheduleUsesStablePerUseAndScopeIdentity()
     {
         using var ctx = IntegerSetLibrary.ctx.Create();
         var selected = (Function)new NTTAffineSelectionPass(CompileOptions)
@@ -1342,16 +1657,163 @@ public sealed class UnitTestTileGraph : TestClassBase
             targetOptions.TargetMachineModel.TilingMemorySpaces.Length,
             out _);
         var region = TileRegion.Create(graph);
-        var rootPlan = TileConnectionPlan.CreateRoot(region);
+        var schedule = TileStructuralSchedule.Create(region);
 
         Assert.NotEmpty(region.Uses);
+        Assert.NotEmpty(region.Scopes);
         Assert.Equal(region.Uses.Length, region.Uses.Select(use => use.Id).Distinct().Count());
-        Assert.All(region.Uses, use => Assert.Equal(-1, rootPlan.GetLevel(use.Id)));
+        Assert.Equal(region.Scopes.Length, region.Scopes.Select(scope => scope.Id).Distinct().Count());
+        Assert.All(region.Uses, use => Assert.Equal(-1, schedule.GetFusionLevel(use.Id)));
+        Assert.All(
+            region.Scopes,
+            scope => Assert.Equal(Enumerable.Range(0, scope.Rank), schedule.GetLoopOrder(scope.Id)));
 
-        var first = region.Uses.First(use => use.IsLocallyConnectable);
-        var connected = rootPlan.Connect(first.Id, targetOptions.TargetMachineModel.TilingMemorySpaces.Length - 1);
-        Assert.Equal(-1, rootPlan.GetLevel(first.Id));
-        Assert.NotEqual(rootPlan, connected);
+        var first = region.Uses.First(use => use.RequiredMemoryScope != MemoryAccessScope.Chip);
+        var fused = schedule.WithFusionLevel(first.Id, targetOptions.TargetMachineModel.TilingMemorySpaces.Length - 1);
+        Assert.Equal(-1, schedule.GetFusionLevel(first.Id));
+        Assert.NotEqual(schedule, fused);
+
+        var reorderableScope = region.Scopes.FirstOrDefault(scope => scope.Rank > 1);
+        if (reorderableScope is not null)
+        {
+            var reordered = schedule.WithLoopOrder(
+                reorderableScope.Id,
+                schedule.GetLoopOrder(reorderableScope.Id).Reverse());
+            Assert.NotEqual(schedule, reordered);
+        }
+    }
+
+    [Fact]
+    public void TestLexicalLoopOrderControlsGeneratedTIRNesting()
+    {
+        using var ctx = IntegerSetLibrary.ctx.Create();
+        var targetOptions = Assert.IsAssignableFrom<INTTTargetOptions>(CompileOptions.TargetOptions);
+        var input = new Var("input", new TensorType(DataTypes.Float32, new[] { 8, 16 }));
+        var function = new Function(
+            "main",
+            Targets.CPUTarget.Kind,
+            IR.F.Math.Unary(UnaryOp.Neg, input),
+            [input]);
+        var selected = Assert.IsType<Function>(
+            new NTTAffineSelectionPass(CompileOptions).RunAsync(function, new()).Result);
+        var rootGraph = TieredTileGraphBuilder.Build(
+            selected.Body,
+            targetOptions.TargetMachineModel.TilingMemorySpaces.Length,
+            out _);
+        var outerScope = Assert.Single(rootGraph.Clusters.OfType<TieredTileGraph>());
+        Assert.Equal(2, outerScope.DomainBoundExprs.Length);
+        outerScope.SetLoopOrder([1, 0]);
+
+        var (argumentMemo, _, _) = new Schedule.GraphTiler().SolveRootGraph(
+            rootGraph,
+            Targets.CPUTarget.Kind,
+            targetOptions,
+            Array.Empty<DimVar>());
+        var wrapper = Assert.IsType<PrimFunctionWrapper>(
+            Assert.Single(argumentMemo.Values.OfType<Call>()).Target);
+        var loops = ExprCollector.Collect(wrapper.Target.Body).OfType<TIR.For>().ToArray();
+        var outerLevelMarker = $"__l{outerScope.Level}_";
+        var d1 = Assert.Single(loops.Where(loop =>
+            loop.LoopVar.Name.StartsWith("loop_", StringComparison.Ordinal) &&
+            loop.LoopVar.Name.Contains(outerLevelMarker, StringComparison.Ordinal) &&
+            loop.LoopVar.Name.EndsWith("__spatial_axis1", StringComparison.Ordinal)));
+        var d0 = Assert.Single(loops.Where(loop =>
+            loop.LoopVar.Name.StartsWith("loop_", StringComparison.Ordinal) &&
+            loop.LoopVar.Name.Contains(outerLevelMarker, StringComparison.Ordinal) &&
+            loop.LoopVar.Name.EndsWith("__spatial_axis0", StringComparison.Ordinal)));
+
+        Assert.Contains(d0, ExprCollector.Collect(d1.Body));
+        Assert.DoesNotContain(d1, ExprCollector.Collect(d0.Body));
+    }
+
+    [Fact]
+    public async Task TestAutoTilingUsesSemanticFunctionBufferAndDimensionNames()
+    {
+        using var ctx = IntegerSetLibrary.ctx.Create();
+        var targetOptions = new Targets.NTTTargetOptions
+        {
+            TargetMachineModel = Targets.NTTTargetMachineCatalog.Resolve(Targets.NTTTargetMachineCatalog.Rtx5060Ti16Gb),
+        };
+        CompileOptions.TargetOptions = targetOptions;
+        var sequenceLength = new DimVar("sequence_length") { Metadata = { Range = new(1, 16) } };
+        var input = new Var("input", new TensorType(DataTypes.Float32, new Dimension[] { sequenceLength, 128 }));
+        var function = new Function(
+            "main",
+            Targets.CPUTarget.Kind,
+            IR.F.Math.Unary(UnaryOp.Abs, IR.F.Math.Unary(UnaryOp.Neg, input)),
+            [input, sequenceLength]);
+        var selected = Assert.IsType<Function>(
+            await new NTTAffineSelectionPass(CompileOptions).RunAsync(function, new()));
+
+        var tiled = new Schedule.GraphTiler().Tile(
+            selected.Body,
+            Targets.CPUTarget.Kind,
+            targetOptions,
+            [sequenceLength]);
+        var wrappers = ExprCollector.Collect(tiled).OfType<PrimFunctionWrapper>().ToArray();
+        Assert.NotEmpty(wrappers);
+        Assert.All(wrappers, wrapper => Assert.StartsWith("device_", wrapper.Target.Name, StringComparison.Ordinal));
+        Assert.Contains(wrappers, wrapper => wrapper.Target.Name.Contains("op0_unary", StringComparison.Ordinal));
+
+        var scheduledBodies = wrappers.SelectMany(wrapper => ExprCollector.Collect(wrapper.Target.Body)).ToArray();
+        var generatedDims = scheduledBodies.OfType<DimVar>().ToArray();
+        Assert.DoesNotContain(generatedDims, dim => dim.Name.StartsWith("L0_d", StringComparison.Ordinal) || dim.Name.StartsWith("L1_d", StringComparison.Ordinal));
+        Assert.Contains(generatedDims, dim =>
+            dim.Name.StartsWith("loop_", StringComparison.Ordinal) &&
+            dim.Name.Contains("__l0_gpu_shared__", StringComparison.Ordinal));
+        Assert.Contains(generatedDims, dim =>
+            dim.Name.StartsWith("loop_", StringComparison.Ordinal) &&
+            dim.Name.Contains("__l1_gpu_block_global__", StringComparison.Ordinal));
+
+        var buffers = scheduledBodies.OfType<TIR.Buffer>().ToArray();
+        Assert.Contains(buffers, buffer =>
+            buffer.Name.StartsWith("buffer_", StringComparison.Ordinal) &&
+            buffer.Name.Contains("__l0_gpu_shared__at_", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void TestSpatialLoopInsideReductionScopeHasSingleTrip()
+    {
+        using var ctx = IntegerSetLibrary.ctx.Create();
+        var targetOptions = Assert.IsAssignableFrom<INTTTargetOptions>(CompileOptions.TargetOptions);
+        var selected = Assert.IsType<Function>(
+            new NTTAffineSelectionPass(CompileOptions).RunAsync(FunctionSamples.GetMatmul(), new()).Result);
+        var rootGraph = TieredTileGraphBuilder.Build(
+            selected.Body,
+            targetOptions.TargetMachineModel.TilingMemorySpaces.Length,
+            out _);
+        var outerScope = Assert.Single(rootGraph.Clusters.OfType<TieredTileGraph>());
+        var innerScope = Assert.Single(outerScope.Clusters.OfType<TieredTileGraph>());
+        Assert.Equal(3, innerScope.DomainBoundExprs.Length);
+
+        // M, K, N is legal when the N loop does not multiplex one backend
+        // accumulator across multiple output tiles.
+        innerScope.SetLoopOrder([0, 2, 1]);
+        var (argumentMemo, _, _) = new Schedule.GraphTiler().SolveRootGraph(
+            rootGraph,
+            Targets.CPUTarget.Kind,
+            targetOptions,
+            Array.Empty<DimVar>());
+        var wrapper = Assert.IsType<PrimFunctionWrapper>(
+            Assert.Single(argumentMemo.Values.OfType<Call>()).Target);
+        var loops = ExprCollector.Collect(wrapper.Target.Body).OfType<TIR.For>().ToArray();
+        var innerLevelMarker = $"__l{innerScope.Level}_";
+        var m = Assert.Single(loops.Where(loop =>
+            loop.LoopVar.Name.Contains(innerLevelMarker, StringComparison.Ordinal) &&
+            loop.LoopVar.Name.EndsWith("__spatial_axis0", StringComparison.Ordinal)));
+        var k = Assert.Single(loops.Where(loop =>
+            loop.LoopVar.Name.Contains(innerLevelMarker, StringComparison.Ordinal) &&
+            loop.LoopVar.Name.EndsWith("__reduce_axis2", StringComparison.Ordinal)));
+        var n = Assert.Single(loops.Where(loop =>
+            loop.LoopVar.Name.Contains(innerLevelMarker, StringComparison.Ordinal) &&
+            loop.LoopVar.Name.EndsWith("__spatial_axis1", StringComparison.Ordinal)));
+
+        Assert.Equal(LoopMode.Reduction, k.Mode);
+        Assert.Contains(k, ExprCollector.Collect(m.Body));
+        Assert.Contains(n, ExprCollector.Collect(k.Body));
+        Assert.True(n.Domain.Step.IsFixed);
+        Assert.True(
+            CompilerServices.GetMaxShape(new RankedShape([n.Domain.Stop]))[0] <= n.Domain.Step.FixedValue);
     }
 
     [Fact]
@@ -1404,14 +1866,16 @@ public sealed class UnitTestTileGraph : TestClassBase
             targetOptions,
             Array.Empty<DimVar>());
 
-        Assert.All(
-            aliasUses,
-            use => Assert.Equal(TileUsePlacementKind.AliasView, executionPlan.Placements[use.Id].Kind));
-        Assert.Contains(aliasUses, use => executionPlan.Placements[use.Id].Level >= 0);
+        var aliasMaterializations = executionPlan.Materializations
+            .Where(materialization => materialization.Uses.Any(use => aliasUses.Any(alias => alias.Id == use)))
+            .ToArray();
+        Assert.NotEmpty(aliasMaterializations);
+        Assert.All(aliasMaterializations, materialization => Assert.IsType<TileAliasMaterialization>(materialization));
+        Assert.All(aliasMaterializations, materialization => Assert.True(materialization.CreationScope.Level >= 0));
     }
 
     [Fact]
-    public void TestHierarchicalPlannerLowersSelectedSharedStorageWithExplicitTransfers()
+    public void TestHierarchicalPlannerLowersOuterFusionIntoInnerSharedStorage()
     {
         using var ctx = IntegerSetLibrary.ctx.Create();
         var targetOptions = new Targets.NTTTargetOptions
@@ -1449,8 +1913,8 @@ public sealed class UnitTestTileGraph : TestClassBase
             .SelectMany(wrapper => ExprCollector.Collect(wrapper.Target.Body))
             .OfType<Call>()
             .ToArray();
-        Assert.Contains(calls, call => call.Target is TIR.TileLoad);
-        Assert.Contains(calls, call => call.Target is TIR.TileStore);
+        Assert.Single(calls.Where(call => call.Target is TIR.TileLoad));
+        Assert.Single(calls.Where(call => call.Target is TIR.TileStore));
     }
 
     [Fact]
@@ -1462,7 +1926,10 @@ public sealed class UnitTestTileGraph : TestClassBase
             TargetMachineModel = Targets.NTTTargetMachineCatalog.Resolve(Targets.NTTTargetMachineCatalog.Rtx5060Ti16Gb),
         };
         CompileOptions.TargetOptions = targetOptions;
-        var input = new Var("input", new TensorType(DataTypes.Float32, new[] { 1024 }));
+
+        // The full intermediate exceeds the compiler-managed shared-memory
+        // budget, while a legal power-of-two tile fits.
+        var input = new Var("input", new TensorType(DataTypes.Float32, new[] { 131072 }));
         var function = new Function(
             "main",
             Targets.CPUTarget.Kind,
@@ -1486,6 +1953,12 @@ public sealed class UnitTestTileGraph : TestClassBase
             .ToArray();
         Assert.Equal(new[] { 0 }, ownedEdges);
 
+        var materialization = Assert.Single(executionPlan.Materializations);
+        Assert.Equal(0, materialization.CreationScope.Level);
+        Assert.True(materialization.LoopEntry >= 0);
+        var storage = Assert.IsType<TileStorageMaterialization>(materialization);
+        Assert.Equal(targetOptions.TargetMachineModel.TilingMemorySpaces[0].Id, storage.StorageSpace);
+
         _ = TileNode.FromTileGraph(executionPlan.ScheduleGraph, out var treeMemo);
         var component = Assert.Single(executionPlan.ScheduleGraph.Condense().Vertices);
         var componentTree = treeMemo[component];
@@ -1506,6 +1979,57 @@ public sealed class UnitTestTileGraph : TestClassBase
             .Order()
             .ToArray();
         Assert.Equal(new[] { 0, 1 }, intermediateLevels);
+    }
+
+    [Fact]
+    public void TestAutoTilingPublishesBlockLocalDataPoolUsage()
+    {
+        using var ctx = IntegerSetLibrary.ctx.Create();
+        var targetOptions = new Targets.NTTTargetOptions
+        {
+            TargetMachineModel = CreateTestMachine(2, l0AllocationLimitBytes: 64, l0DirectAccess: true),
+        };
+        CompileOptions.TargetOptions = targetOptions;
+
+        // L0 cannot hold one vector element. Direct-access root operands remain
+        // legal, while the internal value must use the BlockLocalData arena.
+        var vectorType = new VectorType(DataTypes.Float32, [32]);
+        var input = new Var("input", new TensorType(vectorType, new[] { 1024 }));
+        var function = new Function(
+            "main",
+            Targets.CPUTarget.Kind,
+            IR.F.Math.Unary(UnaryOp.Abs, IR.F.Math.Unary(UnaryOp.Neg, input)),
+            [input]);
+        var selected = Assert.IsType<Function>(
+            new NTTAffineSelectionPass(CompileOptions).RunAsync(function, new()).Result);
+
+        var tiled = new Schedule.GraphTiler().Tile(
+            selected.Body,
+            Targets.CPUTarget.Kind,
+            targetOptions,
+            Array.Empty<DimVar>());
+        var wrapper = Assert.Single(ExprCollector.Collect(tiled).OfType<PrimFunctionWrapper>());
+        var blockLocalBuffers = ExprCollector.Collect(wrapper.Target.Body)
+            .OfType<PhysicalBuffer>()
+            .Where(buffer => buffer.Location == MemoryLocation.BlockLocalData && buffer.Size.FixedValue > 0)
+            .ToArray();
+
+        Assert.NotEmpty(blockLocalBuffers);
+        Assert.True(wrapper.Target.SchedResult.IsScheduled);
+        var blockLocalSpace = targetOptions.TargetMachineModel.TilingMemorySpaces[1];
+        var requiredBytes = blockLocalBuffers.Max(buffer =>
+            checked((long)Assert.IsType<TensorConst>(buffer.Start).Value.ToScalar<ulong>()) +
+            buffer.Size.FixedValue);
+        var expectedPoolBytes = targetOptions.TargetMachineModel.GetAllocationSizeBytes(
+            blockLocalSpace,
+            requiredBytes);
+        Assert.True(requiredBytes >= 32L * sizeof(float));
+        Assert.Equal((ulong)expectedPoolBytes, wrapper.Target.SchedResult.BlockLocalDataPoolSize);
+        var resourceAlignment = targetOptions.TargetMachineModel.GetMemoryResource(
+            blockLocalSpace).AllocationGranularityBytes;
+        Assert.Equal(
+            0UL,
+            wrapper.Target.SchedResult.BlockLocalDataPoolSize % (ulong)resourceAlignment);
     }
 
     [Fact]
@@ -1536,7 +2060,10 @@ public sealed class UnitTestTileGraph : TestClassBase
         Assert.Equal(3, set.Count);
     }
 
-    private static TargetMachineModel CreateTestMachine(int levelCount)
+    private static TargetMachineModel CreateTestMachine(
+        int levelCount,
+        long l0AllocationLimitBytes = 256 * 1024,
+        bool l0DirectAccess = false)
     {
         if (levelCount is < 1 or > 2)
         {
@@ -1557,10 +2084,10 @@ public sealed class UnitTestTileGraph : TestClassBase
             .Select(level =>
             {
                 var isBlockGlobal = level == levelCount - 1;
-                var resourceId = isBlockGlobal
+                var resourceId = isBlockGlobal || (level == 0 && l0DirectAccess)
                     ? memoryResourceId
                     : new TargetMemoryResourceId($"test.cache.l{level}");
-                if (!isBlockGlobal)
+                if (!isBlockGlobal && resourceId != memoryResourceId)
                 {
                     resources.Add(new TargetMemoryResourceSpec(
                         resourceId,
@@ -1577,7 +2104,7 @@ public sealed class UnitTestTileGraph : TestClassBase
                     resourceId,
                     MemorySharingScope.Block,
                     new(isBlockGlobal ? MemoryLocation.BlockLocalData : MemoryLocation.Cache, isBlockGlobal ? 0 : level),
-                    isBlockGlobal ? 16 * 1024 * 1024 : 256 * 1024,
+                    isBlockGlobal ? 16 * 1024 * 1024 : level == 0 ? l0AllocationLimitBytes : 256 * 1024,
                     TargetMemoryAllocationSizePolicy.GranularityAligned,
                     true,
                     level,

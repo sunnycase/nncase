@@ -19,6 +19,7 @@ public enum BufferEdgeKind
 {
     Intra,
     Inter,
+    RootMaterialization,
 }
 
 public sealed class BufferGraph : TieredAdjacencyGraph<BufferIdentity, EquatableTaggedEdge<BufferIdentity, BufferEdgeKind>>
@@ -115,7 +116,10 @@ public sealed class BufferizationAlgorithm : AlgorithmBase<TieredTileGraph>
                 var sourceOutputIndex = GraphExtensions.GetProducerOutputIndex(edge.Target.Grid.Accesses[edge.Tag].Value, edge.Source);
                 var source = new BufferIdentity(edge.Source, edge.Source.Grid.GetOutputBufferIndex(sourceOutputIndex), BufferEndpoint.Output);
                 var target = new BufferIdentity(edge.Target, edge.Tag, BufferEndpoint.Input);
-                bufferGraph.AddEdge(new(source, target, BufferEdgeKind.Inter));
+                var edgeKind = GraphExtensions.GetRequiredFusionScope(edge.Source, edge.Target, edge.Tag) == MemoryAccessScope.Chip
+                    ? BufferEdgeKind.RootMaterialization
+                    : BufferEdgeKind.Inter;
+                bufferGraph.AddEdge(new(source, target, edgeKind));
             }
         }
 

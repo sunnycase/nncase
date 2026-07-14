@@ -42,9 +42,14 @@ public sealed class UnRollLoopSequential : ExprRewriter
     /// <inheritdoc/>
     protected override Expr RewriteLeafSequential(TIR.Sequential expr)
     {
-        if (expr.Fields.AsValueEnumerable().Any(f => f is Sequential))
+        if (expr.Fields.AsValueEnumerable().Any(f => f is Sequential { CanFlatten: true }))
         {
-            return Sequential.Flatten(expr.Fields);
+            var flattened = Sequential.Flatten(expr.Fields);
+            return expr.CanFlatten
+                ? flattened
+                : flattened.With(
+                    traceScopeName: expr.TraceScopeName,
+                    preserveCodegenBoundary: expr.PreserveCodegenBoundary);
         }
 
         return expr;
@@ -143,6 +148,19 @@ internal sealed class LoopBodyCloner : ExprCloner<Unit>
         {
             _cmap.Add(p.Key, Value.FromConst(p.Value));
         }
+    }
+
+    protected override BaseExpr DispatchVisit(BaseExpr expr, Unit context)
+    {
+        // Loop cloning substitutes only loop variables. Free variables belong to
+        // the enclosing function and must retain their identity so the cloned
+        // body continues to reference the function ABI and surrounding scopes.
+        if (expr is IVar variable && !_vmap.ContainsKey(variable))
+        {
+            return expr;
+        }
+
+        return base.DispatchVisit(expr, context);
     }
 
     protected override BaseExpr VisitLeafMemSpan(MemSpan expr, Unit context)

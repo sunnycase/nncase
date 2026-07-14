@@ -14,7 +14,7 @@ public enum FunctionRole
     Compute,
 
     /// <summary>
-    /// Control-flow-only dispatcher that may be composed into its caller.
+    /// Control-flow-only dispatcher resolved outside backend compute kernels.
     /// </summary>
     Dispatch,
 

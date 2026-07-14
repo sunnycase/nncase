@@ -38,7 +38,9 @@ public sealed class ITreeNodeComparer : IEqualityComparer<ITreeNode>
     {
         HashCode hascode = default;
         hascode.Add(a.Level);
+        hascode.Add(a.ScopeKind);
         hascode.Add(a.DomainRelation.Map);
+        hascode.Add(StructuralComparisons.StructuralEqualityComparer.GetHashCode(a.LoopOrder));
         hascode.Add(StructuralComparisons.StructuralEqualityComparer.GetHashCode(a.DomainDynamic));
         foreach (var item in a.Children)
         {
@@ -76,7 +78,9 @@ public sealed class ITreeNodeComparer : IEqualityComparer<ITreeNode>
     {
         return a.Children.Length.Equals(b.Children.Length) &&
             a.Level.Equals(b.Level) &&
+            a.ScopeKind.Equals(b.ScopeKind) &&
             a.DomainRelation.Map.Equals(b.DomainRelation.Map) &&
+            StructuralComparisons.StructuralEqualityComparer.Equals(a.LoopOrder, b.LoopOrder) &&
             StructuralComparisons.StructuralEqualityComparer.Equals(a.Wrapped.DomainDynamic, b.Wrapped.DomainDynamic) &&
             Enumerable.Range(0, a.Children.Length).All(i => Equals(a.Children[i], b.Children[i]));
     }

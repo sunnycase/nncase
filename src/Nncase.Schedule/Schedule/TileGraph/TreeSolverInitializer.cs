@@ -38,7 +38,13 @@ public sealed class TreeSolverInitializer : TreeSolverBase<IntExpr>, ITreeNodeVi
 
     public InitResult Visit(TileNode value, Context context)
     {
+        if (value.ScopeKind == TileScopeKind.Sequential)
+        {
+            return VisitSequentialScope(value, context);
+        }
+
         var (pid, pvars, ptrips) = context;
+        var loopOrder = value.LoopOrder;
         var dimsMap = GetDimsMap(value);
         if (!pvars.Any())
         {
@@ -58,8 +64,46 @@ public sealed class TreeSolverInitializer : TreeSolverBase<IntExpr>, ITreeNodeVi
         var tileVars = domainBounds
             .Select((bound, n) => reductionAxes[n] && value.Level > 0
                 ? Solver.MakeIntConst(1).Var()
-                : Solver.MakeIntVar(1, bound, $"op{value.OpId}_d{n}_L{value.Level}"))
+                : Solver.MakeIntVar(
+                    1,
+                    bound,
+                    TileSemanticNaming.GetTileVariableName(value, n, TargetOptions.TargetMachineModel)))
             .ToArray();
+
+        // The backend-private accumulator is scoped by the first L0 reduction
+        // loop. A spatial loop may be lexically inside that scope only when it
+        // has one trip; otherwise one accumulator would alias multiple output
+        // tiles. Backends can relax this contract when they expose indexed
+        // accumulator state explicitly.
+        if (value.Level == 0)
+        {
+            var firstReductionPosition = -1;
+            for (int position = 0; position < loopOrder.Length; position++)
+            {
+                if (reductionAxes[loopOrder[position]])
+                {
+                    firstReductionPosition = position;
+                    break;
+                }
+            }
+
+            if (firstReductionPosition >= 0)
+            {
+                for (int position = firstReductionPosition + 1; position < loopOrder.Length; position++)
+                {
+                    var axis = loopOrder[position];
+                    if (reductionAxes[axis])
+                    {
+                        continue;
+                    }
+
+                    var constraint = Solver.MakeEquality(tileVars[axis], 1);
+                    constraint.SetName($"reduction_inner_spatial_trip[op{value.OpId},d{axis},L{value.Level}]");
+                    Solver.Add(constraint);
+                }
+            }
+        }
+
         var forwardExtents = tileVars.Cast<IntExpr>().ToArray();
         if (!TileableNodeMemo.TryGetValue(value, out var dimInfo))
         {
@@ -87,10 +131,11 @@ public sealed class TreeSolverInitializer : TreeSolverBase<IntExpr>, ITreeNodeVi
             tripCounts[0] = Solver.MakeIntConst(1);
         }
 
-        for (int i = 0; i < tileVars.Length; i++)
+        for (int position = 0; position < loopOrder.Length; position++)
         {
-            tripCounts[1 + i] = tripCounts[i] * tileVars[i];
-            tripCounts[1 + i].SetRange(1, domainVolume);
+            var axis = loopOrder[position];
+            tripCounts[1 + position] = tripCounts[position] * tileVars[axis];
+            tripCounts[1 + position].SetRange(1, domainVolume);
         }
 
         InitResult childResult;
@@ -116,7 +161,7 @@ public sealed class TreeSolverInitializer : TreeSolverBase<IntExpr>, ITreeNodeVi
             childResult = new(results.ToArray(), childDefUseMap, names.ToArray(), extents.ToArray());
         }
 
-        var backWardExtents = GetBackWardExtents(tileVars, childResult.DimsMaps, childResult.BackWardExtents, domainBounds);
+        var backWardExtents = GetBackWardExtents(tileVars, loopOrder, childResult.DimsMaps, childResult.BackWardExtents, domainBounds);
 
         // {def bid : use bid}
         var currentBufferGraph = BufferGraphMemo[value.Wrapped];
@@ -128,12 +173,17 @@ public sealed class TreeSolverInitializer : TreeSolverBase<IntExpr>, ITreeNodeVi
 
         var bufferResults = new List<BufferResult>();
 
-        // gather the min/max lifeness child.
-        Tuple<int, int> nodeLifeness = new(int.MaxValue, int.MinValue);
+        // Gather the inclusive lifetime of this lexical tile scope.
+        TileLifetime? nodeLifetime = null;
         for (int i = 0; i < childResult.BufferResults.Length; i++)
         {
-            var lifeness = childResult.BufferResults[i].Lifeness;
-            nodeLifeness = new(Math.Min(nodeLifeness.Item1, lifeness.Item1), Math.Max(nodeLifeness.Item2, lifeness.Item2));
+            var lifetime = childResult.BufferResults[i].Lifetime;
+            nodeLifetime = nodeLifetime is { } existing ? existing.Union(lifetime) : lifetime;
+        }
+
+        if (nodeLifetime is null)
+        {
+            throw new InvalidOperationException($"Tile node Op{value.OpId}@L{value.Level} has no executable buffer lifetime.");
         }
 
         // each tile node have buffer place vars.
@@ -150,7 +200,7 @@ public sealed class TreeSolverInitializer : TreeSolverBase<IntExpr>, ITreeNodeVi
                 }
 
                 AffineMap currentAccessMap = result.AccessMap;
-                Tuple<int, int> currentLifeness = result.Lifeness;
+                var currentLifetime = result.Lifetime;
                 if (defUseMap.TryGetByKey(curId, out var sinkBIds))
                 {
                     foreach (var sinkBid in sinkBIds)
@@ -158,20 +208,20 @@ public sealed class TreeSolverInitializer : TreeSolverBase<IntExpr>, ITreeNodeVi
                         if (Array.FindIndex(childResult.BufferResults, r => r.Bid == sinkBid) is var sinkIndex && sinkIndex != -1)
                         {
                             currentAccessMap = childResult.BufferResults[sinkIndex].AccessMap;
-                            currentLifeness = new(Math.Min(currentLifeness.Item1, childResult.BufferResults[sinkIndex].Lifeness.Item1), Math.Max(currentLifeness.Item2, childResult.BufferResults[sinkIndex].Lifeness.Item2));
+                            currentLifetime = currentLifetime.Union(childResult.BufferResults[sinkIndex].Lifetime);
                         }
                     }
                 }
 
                 if (!bufferInfoMap.TryGetValue(curId, out var bufferInfo))
                 {
-                    bufferInfo = GetBufferInfo(value, curId, currentAccessMap, nodeLifeness, currentLifeness, tileVars, forwardExtents, backWardExtents, result.ElemSize);
+                    bufferInfo = GetBufferInfo(value, curId, currentAccessMap, nodeLifetime.Value, currentLifetime, tileVars, forwardExtents, backWardExtents, result.ElemSize);
                     bufferInfoMap.Add(curId, bufferInfo);
                     var isInternalDefinition = defUseMap.ContainsKey(curId);
                     var isVisibleToParent = value.Parent is TileNode;
                     if (!isInternalDefinition || isVisibleToParent)
                     {
-                        bufferResults.Add(new(curId, currentLifeness, value.DomainRelation.Map * currentAccessMap, result.ElemSize));
+                        bufferResults.Add(new(curId, currentLifetime, value.DomainRelation.Map * currentAccessMap, result.ElemSize));
                     }
                 }
             }
@@ -209,7 +259,10 @@ public sealed class TreeSolverInitializer : TreeSolverBase<IntExpr>, ITreeNodeVi
                             $"Grid Op{value.OpId} axis {i} has no power-of-two tile extent up to {domainBound} aligned to {policy.Alignment}.");
                     }
 
-                    tileVars[i] = Solver.MakeIntVar(powerOfTwoExtents[0], powerOfTwoExtents[^1], $"op{value.OpId}_d{i}");
+                    tileVars[i] = Solver.MakeIntVar(
+                        powerOfTwoExtents[0],
+                        powerOfTwoExtents[^1],
+                        TileSemanticNaming.GetTileVariableName(value, i, TargetOptions.TargetMachineModel));
                     Solver.Add(Solver.MakeMemberCt(tileVars[i], powerOfTwoExtents));
                     break;
                 case GridTileExtentKind.FullExtent:
@@ -282,7 +335,7 @@ public sealed class TreeSolverInitializer : TreeSolverBase<IntExpr>, ITreeNodeVi
             if (access.IsRead)
             {
                 BufferIdentity inputBid = new(value.Wrapped, i, BufferEndpoint.Input);
-                bufferResults.Add(new(inputBid, new(TimeStamp, TimeStamp + 1), value.DomainRelation.Map * accessMaps[i], elemSizes[i]));
+                bufferResults.Add(new(inputBid, new TileLifetime(TimeStamp, TimeStamp + 1), value.DomainRelation.Map * accessMaps[i], elemSizes[i]));
             }
 
             if (access.IsWrite)
@@ -291,7 +344,7 @@ public sealed class TreeSolverInitializer : TreeSolverBase<IntExpr>, ITreeNodeVi
                 var outputElemSize = value.TryGetAliasSourceAccess(i, out _)
                     ? Solver.MakeIntConst(0)
                     : elemSizes[i];
-                bufferResults.Add(new(outputBid, new(TimeStamp + 1, TimeStamp + 2), value.DomainRelation.Map * accessMaps[i], outputElemSize));
+                bufferResults.Add(new(outputBid, new TileLifetime(TimeStamp + 1, TimeStamp + 2), value.DomainRelation.Map * accessMaps[i], outputElemSize));
             }
         }
 
@@ -299,6 +352,70 @@ public sealed class TreeSolverInitializer : TreeSolverBase<IntExpr>, ITreeNodeVi
 
         // todo backward extents should times primtives.
         return new(bufferResults.ToArray(), new(), new[] { dimsMap }, new IntExpr[][] { tileVars.Cast<IntExpr>().ToArray() });
+    }
+
+    private InitResult VisitSequentialScope(TileNode value, Context context)
+    {
+        if (context.ForwardExtents.Count != 0)
+        {
+            throw new InvalidOperationException(
+                $"Sequential tile scope {value} cannot be nested in an iteration domain. " +
+                "Chip phases must own the outermost executable schedule component.");
+        }
+
+        var bufferGraph = BufferGraphMemo[value.Wrapped];
+        var nonRootEdges = bufferGraph.GetOwnedInterEdges().ToArray();
+        if (nonRootEdges.Length != 0)
+        {
+            throw new InvalidOperationException(
+                $"Sequential tile scope {value} contains non-chip inter-phase values: " +
+                string.Join(", ", nonRootEdges.Select(edge => $"{edge.Source}->{edge.Target}")) + ".");
+        }
+
+        if (!bufferGraph.GetOwnedRootMaterializationEdges().Any())
+        {
+            throw new InvalidOperationException(
+                $"Sequential tile scope {value} has no chip-visible phase boundary.");
+        }
+
+        var results = new List<BufferResult>();
+        var defUseMap = new BiDictionary<BufferIdentity, BufferIdentity>();
+        foreach (var child in value.Children)
+        {
+            if (child is not TileNode phase ||
+                phase.ScopeKind != TileScopeKind.Iteration ||
+                phase.Level != value.Level)
+            {
+                throw new InvalidOperationException(
+                    $"Sequential tile scope {value} requires independent iteration children at L{value.Level}, got {child}.");
+            }
+
+            var childResult = child.Accept(this, Context.Default);
+            results.AddRange(childResult.BufferResults);
+            foreach (var (source, target) in childResult.DefUseMap)
+            {
+                defUseMap.Add(source, target);
+            }
+        }
+
+        var one = Solver.MakeIntConst(1);
+        var emptyExtents = Array.Empty<IntExpr>();
+        TileableNodeMemo.Add(
+            value,
+            new DomainInfo<IntExpr>(Array.Empty<IntExpr>(), Array.Empty<IntExpr>(), new Dictionary<int, int>()));
+        TileNodeMemo.Add(
+            value,
+            new TileNodeInfo<IntExpr>(
+                new[] { one },
+                new[] { emptyExtents },
+                defUseMap,
+                new Dictionary<BufferIdentity, TileNodeBufferInfo<IntExpr>>()));
+
+        return new(
+            results.ToArray(),
+            defUseMap,
+            new[] { new Dictionary<int, int>() },
+            new[] { emptyExtents });
     }
 
     private static long[] GetPowerOfTwoExtents(long min, long max)
@@ -367,7 +484,12 @@ public sealed class TreeSolverInitializer : TreeSolverBase<IntExpr>, ITreeNodeVi
     /// for example. backWardExtents[2] contains extents[3], this extents[0],extents[1] is not accumulated, extents[2] is accumulated.
     /// so backWardExtents[0] means extents[0:domain rank] is accumulated.
     /// </summary>
-    private IntExpr[][] GetBackWardExtents(IntVar[] tileVars, Dictionary<int, int>[] childDimsMaps, IntExpr[][] childBackWardExtents, IReadOnlyList<long> domainBounds)
+    private IntExpr[][] GetBackWardExtents(
+        IntVar[] tileVars,
+        IReadOnlyList<int> loopOrder,
+        Dictionary<int, int>[] childDimsMaps,
+        IntExpr[][] childBackWardExtents,
+        IReadOnlyList<long> domainBounds)
     {
         var backWardExtents = new IntExpr[tileVars.Length + 1][];
         bool ProductExtent(IntExpr[] extents, int i)
@@ -390,21 +512,18 @@ public sealed class TreeSolverInitializer : TreeSolverBase<IntExpr>, ITreeNodeVi
             throw new InvalidOperationException("can't find the child tile var");
         }
 
-        for (int i = 0; i < tileVars.Length + 1; i++)
+        for (int entry = 0; entry < tileVars.Length + 1; entry++)
         {
-            var extents = backWardExtents[i] = new IntExpr[tileVars.Length];
-
-            // [0:i] is not accumulated.
-            for (int j = 0; j < i; j++)
+            var extents = backWardExtents[entry] = new IntExpr[tileVars.Length];
+            for (int position = 0; position < loopOrder.Count; position++)
             {
-                ProductExtent(extents, j);
-            }
+                var axis = loopOrder[position];
+                if (position >= entry)
+                {
+                    extents[axis] = tileVars[axis];
+                }
 
-            // [i:domain] is accumulated
-            for (int j = i; j < tileVars.Length; j++)
-            {
-                extents[j] = tileVars[j];
-                ProductExtent(extents, j);
+                ProductExtent(extents, axis);
             }
 
             for (int j = 0; j < extents.Length; j++)
@@ -416,7 +535,7 @@ public sealed class TreeSolverInitializer : TreeSolverBase<IntExpr>, ITreeNodeVi
         return backWardExtents;
     }
 
-    private TileNodeBufferInfo<IntExpr> GetBufferInfo(TileNode tileNode, BufferIdentity bid, AffineMap accessMap, Tuple<int, int> nodeLiveness, Tuple<int, int> currentLiveness, IntExpr[] tileVars, IntExpr[] forwardExtents, IntExpr[][] backWardExtents, IntExpr elemSize)
+    private TileNodeBufferInfo<IntExpr> GetBufferInfo(TileNode tileNode, BufferIdentity bid, AffineMap accessMap, TileLifetime nodeLifetime, TileLifetime currentLifetime, IntExpr[] tileVars, IntExpr[] forwardExtents, IntExpr[][] backWardExtents, IntExpr elemSize)
     {
         var rank = tileNode.DomainRelation.Map.Results.Length;
         var fullPos = rank + 1;
@@ -425,11 +544,11 @@ public sealed class TreeSolverInitializer : TreeSolverBase<IntExpr>, ITreeNodeVi
         var bufferShapes = Enumerable.Range(0, fullPos).Select(i => Array.Empty<IntExpr>()).ToArray();
         var bufferSizes = new IntExpr[fullPos];
         var bufferTrips = new IntExpr[fullPos];
-        var bufferLiveness = new Tuple<int, int>[fullPos];
-        bufferLiveness[^1] = currentLiveness;
+        var bufferLifetimes = new TileLifetime[fullPos];
+        bufferLifetimes[^1] = currentLifetime;
         for (int i = 0; i < fullPos - 1; i++)
         {
-            bufferLiveness[i] = nodeLiveness;
+            bufferLifetimes[i] = nodeLifetime;
         }
 
         LoopMask bufferMask = new(0);
@@ -462,30 +581,32 @@ public sealed class TreeSolverInitializer : TreeSolverBase<IntExpr>, ITreeNodeVi
             bufferSizes[pos] = Solver.MakeMin(sizeExpr, maxBufferSize);
             bufferSizes[pos].SetName($"size[cl{tileNode.Level}, op{bid.Node.OpId}, b{bid.Index}_{bid.Endpoint}, ci{pos}]");
 
-            var loop = pos - 1;
-            if (loop < 0)
+            var loopPosition = pos - 1;
+            if (loopPosition < 0)
             {
                 bufferTrips[pos] = Solver.MakeIntConst(1);
             }
             else
             {
+                var axis = tileNode.LoopOrder[loopPosition];
+
                 // todo use isl for detect reuse dims.
-                var accessed = resultStr.Contains($"d{loop}", StringComparison.CurrentCulture);
+                var accessed = resultStr.Contains($"d{axis}", StringComparison.CurrentCulture);
                 if (accessed)
                 {
-                    bufferMask.SetRelated(loop);
-                    bufferTrips[pos] = bufferTrips[loop] * tileVars[loop];
+                    bufferMask.SetRelated(loopPosition);
+                    bufferTrips[pos] = bufferTrips[loopPosition] * tileVars[axis];
                 }
                 else
                 {
-                    bufferTrips[pos] = bufferTrips[loop];
+                    bufferTrips[pos] = bufferTrips[loopPosition];
                 }
             }
 
             // note update writes in second visitor.
         }
 
-        var bufferInfo = new TileNodeBufferInfo<IntExpr>(bufferLiveness, accessMap, bufferPlaces, bufferShapes, bufferSizes, bufferTrips, bufferMask);
+        var bufferInfo = new TileNodeBufferInfo<IntExpr>(bufferLifetimes, accessMap, bufferPlaces, bufferShapes, bufferSizes, bufferTrips, bufferMask);
         return bufferInfo;
     }
 
@@ -525,10 +646,10 @@ public sealed class TreeSolverInitializer : TreeSolverBase<IntExpr>, ITreeNodeVi
     /// buffer init result.
     /// </summary>
     /// <param name="Bid">buffer id.</param>
-    /// <param name="Lifeness">buffer's lifetime.</param>
+    /// <param name="Lifetime">Buffer's inclusive execution lifetime.</param>
     /// <param name="AccessMap">access buffer relation from current node's domain, e.g. node.DomainRelation * buffer.AccessMap.</param>
     /// <param name="ElemSize">buffer size.</param>
-    public sealed record BufferResult(BufferIdentity Bid, Tuple<int, int> Lifeness, AffineMap AccessMap, IntExpr ElemSize)
+    public sealed record BufferResult(BufferIdentity Bid, TileLifetime Lifetime, AffineMap AccessMap, IntExpr ElemSize)
     {
     }
 

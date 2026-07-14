@@ -8,6 +8,9 @@ namespace Nncase.CodeGen.PyNTT;
 
 internal static class PyNTTPrimFunctionRoles
 {
+    public static bool IsDispatchFunction(PrimFunction function)
+        => function.Role == FunctionRole.Dispatch;
+
     public static bool IsScheduledRegionFunction(PrimFunction function)
         => function.Role == FunctionRole.ScheduledRegion;
 }

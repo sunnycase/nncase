@@ -128,11 +128,15 @@ public sealed class TileNode : ITreeNode
 
     public int OpId => _wrapped.OpId;
 
+    public TileScopeKind ScopeKind => _wrapped.ScopeKind;
+
     public DomainRelation DomainRelation { get => _wrapped.DomainRelation; set => throw new NotSupportedException(); }
 
     public ImmutableArray<bool> DomainDynamic => _wrapped.DomainDynamic;
 
     public ImmutableArray<Dimension> DomainBoundExprs => _wrapped.DomainBoundExprs;
+
+    public ImmutableArray<int> LoopOrder => _wrapped.LoopOrder;
 
     public static TileNode FromTileGraph(TieredTileGraph rootGraph, out Dictionary<TieredTileGraph, TileNode> memo)
     {
@@ -151,6 +155,12 @@ public sealed class TileNode : ITreeNode
     {
         if (!memo.TryGetValue(tileGraph, out var tnode))
         {
+            if (tileGraph.ScopeKind == TileScopeKind.Sequential && tileGraph.ClustersCount < 2)
+            {
+                throw new InvalidOperationException(
+                    $"Sequential tile scope {tileGraph} must contain at least two independent child phases.");
+            }
+
             if (tileGraph.ClustersCount == 0)
             {
                 // sort

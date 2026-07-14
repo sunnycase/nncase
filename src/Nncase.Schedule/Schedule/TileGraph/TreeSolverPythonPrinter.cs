@@ -23,13 +23,15 @@ public sealed class TreeSolverPythonPrinter : TreeSolverBase<IntExpr>, ITreeNode
     {
         var (parent, writer) = context;
         writer.WriteLine($"# {value}");
+        writer.WriteLine($"# ScopeKind: {value.ScopeKind}");
         writer.WriteLine($"# Domain Relation: {value.DomainRelation}");
         var domainInfo = TileableNodeMemo[value];
-        var bounds = new List<long>();
-        for (int i = 0; i < domainInfo.TileVars.Length; i++)
+        var bounds = Enumerable.Repeat(0L, domainInfo.TileVars.Length).ToList();
+        for (int position = 0; position < value.LoopOrder.Length; position++)
         {
-            WriteBuffer(value, i, writer);
-            var trip = Solution.Value(TileNodeMemo[value].TripCounts[i + 1].Var());
+            var axis = value.LoopOrder[position];
+            WriteBuffer(value, position, writer);
+            var trip = Solution.Value(TileNodeMemo[value].TripCounts[position + 1].Var());
 
             // 2. write loop.
             long parentBounds = 0;
@@ -39,15 +41,15 @@ public sealed class TreeSolverPythonPrinter : TreeSolverBase<IntExpr>, ITreeNode
                 {
                     if (child is OpNode opNode && opNode.OpId == value.OpId)
                     {
-                        parentBounds = opNode.DomainBounds[i];
+                        parentBounds = opNode.DomainBounds[axis];
                     }
                 });
             }
             else if (parent is TileNode parentTile)
             {
-                if (i < _bounds[parentTile].Count)
+                if (axis < _bounds[parentTile].Count)
                 {
-                    parentBounds = (int)_bounds[parentTile][i];
+                    parentBounds = _bounds[parentTile][axis];
                 }
                 else
                 {
@@ -55,15 +57,15 @@ public sealed class TreeSolverPythonPrinter : TreeSolverBase<IntExpr>, ITreeNode
                     {
                         if (child is OpNode opNode && opNode.OpId == value.OpId)
                         {
-                            parentBounds = opNode.DomainBounds[i];
+                            parentBounds = opNode.DomainBounds[axis];
                         }
                     });
                 }
             }
 
-            var tile = Solution.Value(domainInfo.TileVars[i].Var());
-            writer.WriteLine($"for {domainInfo.TileVars[i].ToSimplifyString()} in range(0, {parentBounds}, {parentBounds / tile}):  # trip: {trip}");
-            bounds.Add(parentBounds / tile);
+            var tile = Solution.Value(domainInfo.TileVars[axis].Var());
+            writer.WriteLine($"for {domainInfo.TileVars[axis].ToSimplifyString()} in range(0, {parentBounds}, {parentBounds / tile}):  # trip: {trip}");
+            bounds[axis] = parentBounds / tile;
             writer.Indent++;
         }
 

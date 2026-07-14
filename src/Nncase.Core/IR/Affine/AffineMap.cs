@@ -266,91 +266,71 @@ public sealed class AffineMap : BaseExpr
                 continue;
             }
 
-            if (!TryGetAxisScale(range.Offset, false, out var offsetAxis, out var offsetNumerator, out var offsetDenominator) ||
-                !TryGetAxisScale(range.Extent, true, out var extentAxis, out var extentNumerator, out var extentDenominator) ||
-                offsetAxis != extentAxis ||
-                offsetNumerator != extentNumerator ||
-                offsetDenominator != extentDenominator ||
-                seen[offsetAxis])
+            if (!TryMatchAxisTransform(range.Offset, range.Extent, out var axis) || seen[axis])
             {
                 return false;
             }
 
-            seen[offsetAxis] = true;
+            seen[axis] = true;
         }
 
         return true;
 
-        static bool TryGetAxisScale(
-            AffineExpr expression,
-            bool requireExtent,
-            out int axis,
-            out long numerator,
-            out long denominator)
+        static bool TryMatchAxisTransform(AffineExpr offset, AffineExpr extent, out int axis)
         {
             axis = -1;
-            numerator = 0;
-            denominator = 0;
-            switch (expression)
+            switch (offset, extent)
             {
-                case AffineDim dim when !requireExtent:
+                case (AffineDim dim, AffineExtent axisExtent) when dim.Position == axisExtent.Position:
                     axis = dim.Position;
-                    numerator = 1;
-                    denominator = 1;
                     return true;
-                case AffineExtent extent when requireExtent:
-                    axis = extent.Position;
-                    numerator = 1;
-                    denominator = 1;
-                    return true;
-                case AffineMulBinary { Lhs: AffineDim dim, Rhs: AffineConstant constant }
-                    when !requireExtent && constant.Value > 0:
-                    axis = dim.Position;
-                    numerator = constant.Value;
-                    denominator = 1;
-                    return true;
-                case AffineMulBinary { Lhs: AffineConstant constant, Rhs: AffineDim dim }
-                    when !requireExtent && constant.Value > 0:
-                    axis = dim.Position;
-                    numerator = constant.Value;
-                    denominator = 1;
-                    return true;
-                case AffineMulBinary { Lhs: AffineExtent extent, Rhs: AffineConstant constant }
-                    when requireExtent && constant.Value > 0:
-                    axis = extent.Position;
-                    numerator = constant.Value;
-                    denominator = 1;
-                    return true;
-                case AffineMulBinary { Lhs: AffineConstant constant, Rhs: AffineExtent extent }
-                    when requireExtent && constant.Value > 0:
-                    axis = extent.Position;
-                    numerator = constant.Value;
-                    denominator = 1;
-                    return true;
-                case AffineDivBinary
+                case (AffineMulBinary offsetMul, AffineMulBinary extentMul)
+                    when TryExtractPositiveConstantFactor(offsetMul, out var offsetScale, out var offsetInner) &&
+                         TryExtractPositiveConstantFactor(extentMul, out var extentScale, out var extentInner) &&
+                         offsetScale == extentScale:
+                    return TryMatchAxisTransform(offsetInner, extentInner, out axis);
+                case (
+                    AffineDivBinary
                     {
-                        BinaryOp: AffineDivBinaryOp.FloorDiv,
-                        Lhs: AffineDim dim,
-                        Rhs: AffineConstant constant,
-                    }
-                    when !requireExtent && constant.Value > 0:
-                    axis = dim.Position;
-                    numerator = 1;
-                    denominator = constant.Value;
-                    return true;
-                case AffineDivBinary
+                        BinaryOp: var offsetOp,
+                        Lhs: var offsetInner,
+                        Rhs: AffineConstant offsetDivisor,
+                    },
+                    AffineDivBinary
                     {
-                        BinaryOp: AffineDivBinaryOp.FloorDiv,
-                        Lhs: AffineExtent extent,
-                        Rhs: AffineConstant constant,
-                    }
-                    when requireExtent && constant.Value > 0:
-                    axis = extent.Position;
-                    numerator = 1;
-                    denominator = constant.Value;
-                    return true;
+                        BinaryOp: var extentOp,
+                        Lhs: var extentInner,
+                        Rhs: AffineConstant extentDivisor,
+                    })
+                    when offsetOp is AffineDivBinaryOp.FloorDiv or AffineDivBinaryOp.CeilDiv &&
+                         offsetOp == extentOp &&
+                         offsetDivisor.Value > 0 &&
+                         offsetDivisor.Value == extentDivisor.Value:
+                    return TryMatchAxisTransform(offsetInner, extentInner, out axis);
                 default:
                     return false;
+            }
+
+            static bool TryExtractPositiveConstantFactor(
+                AffineMulBinary expression,
+                out long factor,
+                out AffineExpr inner)
+            {
+                switch (expression)
+                {
+                    case { Lhs: AffineConstant constant, Rhs: var rhs } when constant.Value > 0:
+                        factor = constant.Value;
+                        inner = rhs;
+                        return true;
+                    case { Lhs: var lhs, Rhs: AffineConstant constant } when constant.Value > 0:
+                        factor = constant.Value;
+                        inner = lhs;
+                        return true;
+                    default:
+                        factor = 0;
+                        inner = null!;
+                        return false;
+                }
             }
         }
     }

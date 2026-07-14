@@ -27,29 +27,37 @@ internal sealed class MemoryEffectAnalyzer
     }
 
     public EffectSet GetEffects(Expr expr, bool suppressReductionAccumulatorEffects = false)
-        => GetEffects(expr, ResourceBindingScope.Empty, suppressReductionAccumulatorEffects);
+        => GetEffects(expr, ResourceBindingScope.Empty, suppressReductionAccumulatorEffects, false);
+
+    public EffectSet GetIterationLocalEffects(
+        Sequential body,
+        bool suppressReductionAccumulatorEffects)
+        => GetEffects(body, ResourceBindingScope.Empty, suppressReductionAccumulatorEffects, true);
 
     private EffectSet GetEffects(
         Expr expr,
         ResourceBindingScope bindings,
-        bool suppressReductionAccumulatorEffects)
+        bool suppressReductionAccumulatorEffects,
+        bool stopAtNestedLoops)
     {
         switch (expr)
         {
             case Block block:
                 return Union(
                     [
-                        GetEffects(block.InitBody, bindings, suppressReductionAccumulatorEffects),
-                        GetEffects(block.Body, bindings, suppressReductionAccumulatorEffects),
+                        GetEffects(block.InitBody, bindings, suppressReductionAccumulatorEffects, stopAtNestedLoops),
+                        GetEffects(block.Body, bindings, suppressReductionAccumulatorEffects, stopAtNestedLoops),
                     ]);
             case Sequential sequential:
                 return Union(sequential.Fields.ToArray().Select(
-                    field => GetEffects(field, bindings, suppressReductionAccumulatorEffects)));
+                    field => GetEffects(field, bindings, suppressReductionAccumulatorEffects, stopAtNestedLoops)));
             case Nncase.TIR.For @for:
-                return GetEffects(@for.Body, bindings, suppressReductionAccumulatorEffects);
+                return stopAtNestedLoops
+                    ? new EffectSet()
+                    : GetEffects(@for.Body, bindings, suppressReductionAccumulatorEffects, false);
             case Let let:
                 var expressionEffects = let.Expression is Expr bindingExpression
-                    ? GetEffects(bindingExpression, bindings, suppressReductionAccumulatorEffects)
+                    ? GetEffects(bindingExpression, bindings, suppressReductionAccumulatorEffects, stopAtNestedLoops)
                     : new EffectSet();
                 return Union(
                     [
@@ -57,13 +65,14 @@ internal sealed class MemoryEffectAnalyzer
                         GetEffects(
                             let.Body,
                             bindings.Bind((BaseExpr)let.Var, let.Expression),
-                            suppressReductionAccumulatorEffects),
+                            suppressReductionAccumulatorEffects,
+                            stopAtNestedLoops),
                     ]);
             case IfThenElse ifThenElse:
                 return Union(
                     [
-                        GetEffects(ifThenElse.Then, bindings, suppressReductionAccumulatorEffects),
-                        GetEffects(ifThenElse.Else, bindings, suppressReductionAccumulatorEffects),
+                        GetEffects(ifThenElse.Then, bindings, suppressReductionAccumulatorEffects, stopAtNestedLoops),
+                        GetEffects(ifThenElse.Else, bindings, suppressReductionAccumulatorEffects, stopAtNestedLoops),
                     ]);
             case Call { Target: PrimFunction callee } call when _functions.Contains(callee):
                 return Instantiate(GetFunctionSummary(callee), call.Arguments, bindings);
@@ -88,7 +97,7 @@ internal sealed class MemoryEffectAnalyzer
             throw new InvalidOperationException($"Recursive PrimFunction call graph is not supported by memory synchronization planning: {function.Name}.");
         }
 
-        var effects = GetEffects(function.Body, ResourceBindingScope.Empty, false);
+        var effects = GetEffects(function.Body, ResourceBindingScope.Empty, false, false);
         var parameterEffects = new Dictionary<int, EffectInfo>();
         foreach (var item in effects.Items)
         {
@@ -242,11 +251,12 @@ internal sealed class MemoryEffectAnalyzer
                     var relativeRange = ReferenceEquals(physicalBuffer.Start, identity)
                         ? TryGetRelativeByteRange(buffer.MemSpan)
                         : null;
-                    return new MemoryResource(identity, null, relativeRange, scope);
+                    return new MemoryResource(identity, buffer, null, relativeRange, scope);
                 }
 
                 return new MemoryResource(
                     null,
+                    buffer,
                     new MemoryArena(physicalBuffer.Location, physicalBuffer.Hierarchy),
                     TryGetAbsoluteByteRange(buffer.MemSpan),
                     scope);
@@ -255,9 +265,10 @@ internal sealed class MemoryEffectAnalyzer
                 var variableScope = explicitScope ?? (variableExpr.CheckedDataType is ReferenceType
                     ? TIR.NTT.BarrierScope.Chip
                     : TIR.NTT.BarrierScope.Block);
-                return new MemoryResource(variableExpr, null, null, variableScope);
+                return new MemoryResource(variableExpr, variableExpr, null, null, variableScope);
             default:
                 return new MemoryResource(
+                    expression,
                     expression,
                     null,
                     null,
@@ -482,22 +493,22 @@ internal sealed class MemorySynchronizationPlanner
         bool insideReduction)
     {
         var fields = new List<Expr>();
-        var pendingWrites = new EffectSet();
+        var pendingAccesses = new EffectSet();
         foreach (var field in sequential.Fields)
         {
             if (TryGetBarrierScope(field, out var explicitScope))
             {
-                if (pendingWrites.HasWritesAtOrBelow(explicitScope))
+                if (pendingAccesses.HasAccessesAtOrBelow(explicitScope))
                 {
                     AppendBarrier(fields, explicitScope);
-                    pendingWrites.RemoveWritesAtOrBelow(explicitScope);
+                    pendingAccesses.RemoveAccessesAtOrBelow(explicitScope);
                 }
 
                 continue;
             }
 
             var effects = _analyzer.GetEffects(field, insideReduction);
-            if (pendingWrites.TryGetReadConflict(effects, out var requiredScope))
+            if (pendingAccesses.TryGetConflict(effects, out var requiredScope))
             {
                 if (insideLoop && requiredScope == TIR.NTT.BarrierScope.Chip)
                 {
@@ -505,11 +516,11 @@ internal sealed class MemorySynchronizationPlanner
                 }
 
                 AppendBarrier(fields, requiredScope);
-                pendingWrites.RemoveWritesAtOrBelow(requiredScope);
+                pendingAccesses.RemoveAccessesAtOrBelow(requiredScope);
             }
 
             var rewritten = RewriteStatement(field, insideLoop, insideReduction);
-            if (rewritten is Sequential nested)
+            if (rewritten is Sequential { CanFlatten: true } nested)
             {
                 fields.AddRange(nested.Fields.ToArray());
             }
@@ -518,10 +529,10 @@ internal sealed class MemorySynchronizationPlanner
                 fields.Add(rewritten);
             }
 
-            pendingWrites.AddWrites(effects);
+            pendingAccesses.UnionWith(effects);
         }
 
-        return new Sequential(fields.ToArray());
+        return sequential.With(fields: fields.ToArray());
     }
 
     private Expr RewriteStatement(
@@ -534,11 +545,7 @@ internal sealed class MemorySynchronizationPlanner
             Block block => block.With(
                 body: RewriteSequential(block.Body, insideLoop, insideReduction),
                 initBody: RewriteSequential(block.InitBody, insideLoop, insideReduction)),
-            Nncase.TIR.For @for => @for.With(
-                body: RewriteSequential(
-                    @for.Body,
-                    true,
-                    insideReduction || @for.Mode == LoopMode.Reduction)),
+            Nncase.TIR.For @for => RewriteFor(@for, insideReduction),
             Let let => let.With(body: RewriteSequential(let.Body, insideLoop, insideReduction)),
             IfThenElse ifThenElse => ifThenElse.With(
                 then: RewriteSequential(ifThenElse.Then, insideLoop, insideReduction),
@@ -546,6 +553,28 @@ internal sealed class MemorySynchronizationPlanner
             Sequential sequential => RewriteSequential(sequential, insideLoop, insideReduction),
             _ => expression,
         };
+    }
+
+    private Nncase.TIR.For RewriteFor(Nncase.TIR.For @for, bool insideReduction)
+    {
+        var isReduction = insideReduction || @for.Mode == LoopMode.Reduction;
+        var body = RewriteSequential(@for.Body, true, isReduction);
+        var loopEffects = _analyzer.GetIterationLocalEffects(@for.Body, isReduction);
+        if (loopEffects.TryGetReadWriteAlias(out var requiredScope))
+        {
+            if (requiredScope == TIR.NTT.BarrierScope.Chip)
+            {
+                throw new InvalidOperationException(
+                    $"A chip-wide loop-carried memory dependence remains in loop '{@for.LoopVar.Name}'. " +
+                    "Split the producer and consumer into separate scheduling phases.");
+            }
+
+            var fields = body.Fields.ToArray().ToList();
+            AppendBarrier(fields, requiredScope);
+            body = body.With(fields: fields.ToArray());
+        }
+
+        return @for.With(body: body);
     }
 
     private static void AppendBarrier(List<Expr> fields, TIR.NTT.BarrierScope scope)
@@ -581,12 +610,17 @@ internal readonly record struct MemoryByteRange(long Start, long End)
 
 internal sealed record MemoryResource(
     BaseExpr? ExpressionIdentity,
+    BaseExpr? LogicalIdentity,
     MemoryArena? Arena,
     MemoryByteRange? ByteRange,
     TIR.NTT.BarrierScope Scope)
 {
     public bool HasSameRegion(MemoryResource other)
-        => HasSameBacking(other) && ByteRange == other.ByteRange;
+        => HasSameLogicalResource(other) && HasSameBacking(other) && ByteRange == other.ByteRange;
+
+    public bool HasSameLogicalResource(MemoryResource other)
+        => (LogicalIdentity is not null && ReferenceEquals(LogicalIdentity, other.LogicalIdentity)) ||
+            (ExpressionIdentity is not null && ReferenceEquals(ExpressionIdentity, other.ExpressionIdentity));
 
     public bool MayAlias(MemoryResource other)
     {
@@ -652,34 +686,16 @@ internal sealed class EffectSet
         }
     }
 
-    public void AddWrites(EffectSet effects)
-    {
-        foreach (var item in effects._items)
-        {
-            if (!item.Effect.Mode.HasFlag(MemoryAccessMode.Write))
-            {
-                continue;
-            }
-
-            Add(item.Resource, item.Effect with { Mode = MemoryAccessMode.Write });
-        }
-    }
-
-    public bool TryGetReadConflict(EffectSet consumer, out TIR.NTT.BarrierScope scope)
+    public bool TryGetConflict(EffectSet consumer, out TIR.NTT.BarrierScope scope)
     {
         var found = false;
         scope = TIR.NTT.BarrierScope.Block;
         foreach (var consumerEffect in consumer._items)
         {
-            if (!consumerEffect.Effect.Mode.HasFlag(MemoryAccessMode.Read))
+            foreach (var pendingAccess in _items)
             {
-                continue;
-            }
-
-            foreach (var pendingWrite in _items)
-            {
-                if (!pendingWrite.Effect.Mode.HasFlag(MemoryAccessMode.Write) ||
-                    !pendingWrite.Resource.MayAlias(consumerEffect.Resource))
+                if (!pendingAccess.Resource.MayAlias(consumerEffect.Resource) ||
+                    !RequiresSynchronization(pendingAccess, consumerEffect))
                 {
                     continue;
                 }
@@ -687,22 +703,66 @@ internal sealed class EffectSet
                 found = true;
                 scope = MemoryEffectAnalyzer.MergeScope(
                     scope,
-                    MemoryEffectAnalyzer.MergeScope(consumerEffect.Effect.Scope, pendingWrite.Effect.Scope));
+                    MemoryEffectAnalyzer.MergeScope(consumerEffect.Effect.Scope, pendingAccess.Effect.Scope));
             }
         }
 
         return found;
+
+        static bool RequiresSynchronization(
+            ResolvedMemoryEffect producer,
+            ResolvedMemoryEffect consumer)
+        {
+            var producerReads = producer.Effect.Mode.HasFlag(MemoryAccessMode.Read);
+            var producerWrites = producer.Effect.Mode.HasFlag(MemoryAccessMode.Write);
+            var consumerReads = consumer.Effect.Mode.HasFlag(MemoryAccessMode.Read);
+            var consumerWrites = consumer.Effect.Mode.HasFlag(MemoryAccessMode.Write);
+            return (producerWrites && consumerReads) ||
+                (producerReads && consumerWrites) ||
+                (producerWrites && consumerWrites &&
+                    !producer.Resource.HasSameLogicalResource(consumer.Resource));
+        }
     }
 
-    public bool HasWritesAtOrBelow(TIR.NTT.BarrierScope scope)
-        => _items.Any(item => item.Effect.Mode.HasFlag(MemoryAccessMode.Write) && IsSatisfiedBy(item.Effect.Scope, scope));
+    public bool TryGetReadWriteAlias(out TIR.NTT.BarrierScope scope)
+    {
+        var found = false;
+        scope = TIR.NTT.BarrierScope.Block;
+        for (var lhsIndex = 0; lhsIndex < _items.Count; lhsIndex++)
+        {
+            var lhs = _items[lhsIndex];
+            for (var rhsIndex = lhsIndex; rhsIndex < _items.Count; rhsIndex++)
+            {
+                var rhs = _items[rhsIndex];
+                if (!lhs.Resource.MayAlias(rhs.Resource) ||
+                    !HasReadWriteConflict(lhs.Effect.Mode, rhs.Effect.Mode))
+                {
+                    continue;
+                }
 
-    public void RemoveWritesAtOrBelow(TIR.NTT.BarrierScope scope)
+                found = true;
+                scope = MemoryEffectAnalyzer.MergeScope(
+                    scope,
+                    MemoryEffectAnalyzer.MergeScope(lhs.Effect.Scope, rhs.Effect.Scope));
+            }
+        }
+
+        return found;
+
+        static bool HasReadWriteConflict(MemoryAccessMode lhs, MemoryAccessMode rhs)
+            => (lhs.HasFlag(MemoryAccessMode.Read) && rhs.HasFlag(MemoryAccessMode.Write)) ||
+                (lhs.HasFlag(MemoryAccessMode.Write) && rhs.HasFlag(MemoryAccessMode.Read));
+    }
+
+    public bool HasAccessesAtOrBelow(TIR.NTT.BarrierScope scope)
+        => _items.Any(item => item.Effect.Mode != MemoryAccessMode.None && IsSatisfiedBy(item.Effect.Scope, scope));
+
+    public void RemoveAccessesAtOrBelow(TIR.NTT.BarrierScope scope)
     {
         for (var index = _items.Count - 1; index >= 0; index--)
         {
             var effect = _items[index].Effect;
-            if (effect.Mode.HasFlag(MemoryAccessMode.Write) && IsSatisfiedBy(effect.Scope, scope))
+            if (effect.Mode != MemoryAccessMode.None && IsSatisfiedBy(effect.Scope, scope))
             {
                 _items.RemoveAt(index);
             }

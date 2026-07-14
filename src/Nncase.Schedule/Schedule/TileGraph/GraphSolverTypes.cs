@@ -15,6 +15,39 @@ public enum BufferEndpoint
     Output,
 }
 
+/// <summary>
+/// Inclusive execution phases during which a tile buffer must remain live.
+/// Reads and writes performed by the same operation share a phase, so their
+/// storage overlaps in time unless the IR declares an explicit alias.
+/// </summary>
+public readonly record struct TileLifetime
+{
+    public TileLifetime(int firstPhase, int lastPhase)
+    {
+        if (firstPhase < 0 || lastPhase < firstPhase)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(lastPhase),
+                $"A tile lifetime must be a non-empty inclusive phase range, got [{firstPhase}, {lastPhase}].");
+        }
+
+        FirstPhase = firstPhase;
+        LastPhase = lastPhase;
+    }
+
+    public int FirstPhase { get; }
+
+    public int LastPhase { get; }
+
+    public int PhaseCount => checked(LastPhase - FirstPhase + 1);
+
+    public bool Overlaps(TileLifetime other)
+        => FirstPhase <= other.LastPhase && other.FirstPhase <= LastPhase;
+
+    public TileLifetime Union(TileLifetime other)
+        => new(Math.Min(FirstPhase, other.FirstPhase), Math.Max(LastPhase, other.LastPhase));
+}
+
 public sealed record BufferIdentity(TileGrid Node, int Index, BufferEndpoint Endpoint)
 {
     public GridAccess Access => Node.Grid.Accesses[Index];
@@ -25,28 +58,24 @@ public sealed record BufferIdentity(TileGrid Node, int Index, BufferEndpoint End
 
     public bool IsOutputLiveOut => IsOutput && Node.Attribute.HasFlag(TileGridAttribute.LiveOut);
 
-    public override string ToString() => IsOutput
-        ? (Node.WriteAccessIndices.Length == 1 ? $"Op{Node.OpId}_Out" : $"Op{Node.OpId}_Out{OutputIndex}")
-        : $"Op{Node.OpId}_in{Index}";
+    public override string ToString() => TileSemanticNaming.GetBufferEndpointName(this);
 }
 
 /// <summary>
-/// the placement length = domain rank + 1. if domain dims = 4, create loop will be 0,1,2,3,4.
-/// create loop = 0 means we create buffer in outside of all loops.
-/// for example, create loop = 2, means create buffer d0,d1,(buffer create here) d2,d3.
+/// The placement length is domain rank + 1. Entry 0 is outside every
+/// lexical loop; entry n is after the first n loops in the scope's LoopOrder.
 /// </summary>
-/// <param name="Liveness">this buffer's liveness for each create loop.</param>
+/// <param name="Lifetimes">This buffer's inclusive lifetime for each creation loop.</param>
 /// <param name="Map">this buffers access map.</param>
 /// <param name="Places">
-/// Places[create loop][store level]:
-/// create loop in [0, domain rank] , 0 means out all, 1 means out loop0, domain rank means in loopN.
-/// note only the nodes which store at top level have valid Places[0], else the Places[0] is empty.
-/// store level in [0, create level == top level ? create level : top level - 1), 0 means level 1, 1 means level 2. </param>
+/// Places[lexical loop entry][storage level]. For a creation scope at level
+/// cl, storage level sl is legal when 0 &lt;= sl &lt;= cl. Axis identities remain
+/// canonical in affine maps; only the entry order follows LoopOrder.</param>
 /// <param name="Shapes">the buffer shape according to the placement.</param>
 /// <param name="Sizes">the buffer size according to the placement.</param>
 /// <param name="Trips">related loop trips at current domain.</param>
-/// <param name="Mask">the loop mask of this buffer at current domain.</param>
-public sealed record TileNodeBufferInfo<T>(Tuple<int, int>[] Liveness, AffineMap Map, T[][] Places, T[][] Shapes, T[] Sizes, T[] Trips, LoopMask Mask)
+/// <param name="Mask">The lexical loop-position mask that affects this buffer.</param>
+public sealed record TileNodeBufferInfo<T>(TileLifetime[] Lifetimes, AffineMap Map, T[][] Places, T[][] Shapes, T[] Sizes, T[] Trips, LoopMask Mask)
 {
     public int GetLastRelatedPos()
     {
@@ -56,12 +85,10 @@ public sealed record TileNodeBufferInfo<T>(Tuple<int, int>[] Liveness, AffineMap
 }
 
 /// <summary>
-/// the placement length = domain rank + 1. if domain dims = 4, create loop will be 0,1,2,3,4.
-/// create loop = 0 means we create buffer in outside of all loops.
-/// for example, create loop = 2, means create buffer d0,d1,(buffer create here) d2,d3.
+/// Solver information for one lexical tile scope.
 /// </summary>
-/// <param name="TripCounts">forward trips, length = domainRank+1. the trips[i] means trips accumulated until loop var[i].</param>
-/// <param name="BackWardExtents">accumulated backward extents.</param>
+/// <param name="TripCounts">Forward trip products indexed by lexical loop entry.</param>
+/// <param name="BackWardExtents">Backward extents indexed by lexical loop entry, with each extent vector indexed by canonical axis.</param>
 /// <param name="DefUseMap">key is def, value is use.</param>
 /// <param name="BufferInfoMap">buffer info memo.</param>
 public sealed record TileNodeInfo<T>(T[] TripCounts, T[][] BackWardExtents, BiDictionary<BufferIdentity, BufferIdentity> DefUseMap, Dictionary<BufferIdentity, TileNodeBufferInfo<T>> BufferInfoMap)

@@ -24,9 +24,14 @@ public sealed class Sequential : Expr
 {
     public static readonly Sequential Empty = new Sequential(ReadOnlySpan<Expr>.Empty);
 
-    public Sequential(ReadOnlySpan<Expr> fields)
+    public Sequential(
+        ReadOnlySpan<Expr> fields,
+        string? traceScopeName = null,
+        bool preserveCodegenBoundary = false)
         : base(fields.AsValueEnumerable().Select(x => (BaseExpr)x).ToArray())
     {
+        TraceScopeName = traceScopeName;
+        PreserveCodegenBoundary = preserveCodegenBoundary;
     }
 
     public Sequential(params Expr[] fields)
@@ -37,6 +42,21 @@ public sealed class Sequential : Expr
     public ReadOnlySpan<Expr> Fields => SpanUtility.UnsafeCast<BaseExpr, Expr>(Operands);
 
     public int Count => Fields.Length;
+
+    /// <summary>
+    /// Gets the optional semantic execution scope retained for diagnostics and runtime tracing.
+    /// </summary>
+    public string? TraceScopeName { get; }
+
+    /// <summary>
+    /// Gets a value indicating whether code generation must preserve this sequence as a call boundary.
+    /// </summary>
+    public bool PreserveCodegenBoundary { get; }
+
+    /// <summary>
+    /// Gets a value indicating whether this sequence can be flattened into its parent.
+    /// </summary>
+    public bool CanFlatten => TraceScopeName is null && !PreserveCodegenBoundary;
 
     /// <summary>
     /// get the fields.
@@ -63,14 +83,24 @@ public sealed class Sequential : Expr
     public override TExprResult Accept<TExprResult, TTypeResult, TContext>(ExprFunctor<TExprResult, TTypeResult, TContext> functor, TContext context)
         => functor.VisitSequential(this, context);
 
-    public Sequential With(Expr[]? fields = null) => new Sequential(fields ?? Fields);
+    public Sequential With(
+        Expr[]? fields = null,
+        string? traceScopeName = null,
+        bool? preserveCodegenBoundary = null)
+        => new(
+            fields ?? Fields,
+            traceScopeName ?? TraceScopeName,
+            preserveCodegenBoundary ?? PreserveCodegenBoundary);
 
     private static void Flatten(List<Expr> exprs, object exprOrBuilder)
     {
         switch (exprOrBuilder)
         {
-            case Sequential sub:
+            case Sequential sub when sub.CanFlatten:
                 exprs.AddRange(Flatten(sub.Fields).Fields);
+                break;
+            case Sequential sub:
+                exprs.Add(sub);
                 break;
             case Expr expr:
                 if (expr is not Call { Target: Nop })

@@ -259,6 +259,83 @@ public sealed class UnitTestMemorySynchronization : TestClassBase
         Assert.IsType<Call>(rewrittenMain.Body[2]);
     }
 
+    [Fact]
+    public async Task TestPhysicalWorkspaceReuseSynchronizesDistinctLogicalWriters()
+    {
+        var firstSource = CreateWorkspaceBuffer("first_source", DataTypes.Float32, 512, 256, [64]);
+        var secondSource = CreateWorkspaceBuffer("second_source", DataTypes.Float32, 1024, 256, [64]);
+        var firstLifetime = CreateWorkspaceBuffer("first_lifetime", DataTypes.Float32, 0, 256, [64]);
+        var reusedLifetime = CreateWorkspaceBuffer("reused_lifetime", DataTypes.Float32, 0, 256, [64]);
+        var placement = new Placement([1], "b", "b");
+        var main = new PrimFunction(
+            "main",
+            PyNTTTarget.Kind,
+            new Sequential(
+                TIR.F.NTT.TensorStore(firstSource, firstLifetime, Array.Empty<SBP>(), placement),
+                TIR.F.NTT.TensorStore(secondSource, reusedLifetime, Array.Empty<SBP>(), placement)),
+            Array.Empty<IVar>());
+        var module = new IRModule(main);
+
+        await new PlanMemorySynchronizationPass(PyNTTTarget.Kind).RunAsync(module, new());
+
+        var rewrittenMain = Assert.IsType<PrimFunction>(module.Entry);
+        Assert.Collection(
+            rewrittenMain.Body.Fields.ToArray(),
+            field => Assert.IsType<TIR.NTT.TensorStore>(Assert.IsType<Call>(field).Target),
+            field => Assert.Equal(
+                TIR.NTT.BarrierScope.Chip,
+                Assert.IsType<TIR.NTT.Barrier>(Assert.IsType<Call>(field).Target).Scope),
+            field => Assert.IsType<TIR.NTT.TensorStore>(Assert.IsType<Call>(field).Target));
+    }
+
+    [Fact]
+    public async Task TestReductionLoopProtectsReusedBlockLocalStagingBuffer()
+    {
+        var source = CreateWorkspaceBuffer("source", DataTypes.Float32, 0, 256, [64]);
+        var destination = CreateWorkspaceBuffer("destination", DataTypes.Float32, 512, 256, [64]);
+        var sharedPhysical = new PhysicalBuffer(
+            DataTypes.Float32.SizeInBytes,
+            Tensor.FromPointer(0, DataTypes.Float32),
+            256,
+            MemoryLocation.Shared);
+        var shared = new Nncase.TIR.Buffer(
+            "staging",
+            DataTypes.Float32,
+            new MemSpan(sharedPhysical, 0, 256),
+            new Dimension[] { 64 },
+            new Dimension[] { 1 },
+            null);
+        var tile = new DimVar("k_tile");
+        var loop = new Nncase.TIR.For(
+            tile,
+            new Nncase.TIR.Range(0, 4, 1),
+            LoopMode.Reduction,
+            new Sequential(
+                T.Memcopy(shared, source),
+                T.Memcopy(destination, shared)));
+        var main = new PrimFunction(
+            "main",
+            PyNTTTarget.Kind,
+            new Sequential(loop),
+            Array.Empty<IVar>());
+        var module = new IRModule(main);
+
+        await new PlanMemorySynchronizationPass(PyNTTTarget.Kind).RunAsync(module, new());
+
+        var rewrittenMain = Assert.IsType<PrimFunction>(module.Entry);
+        var rewrittenLoop = Assert.Single(ExprCollector.Collect(rewrittenMain.Body).OfType<Nncase.TIR.For>());
+        Assert.Collection(
+            rewrittenLoop.Body.Fields.ToArray(),
+            field => Assert.IsType<Memcopy>(Assert.IsType<Call>(field).Target),
+            field => Assert.Equal(
+                TIR.NTT.BarrierScope.Block,
+                Assert.IsType<TIR.NTT.Barrier>(Assert.IsType<Call>(field).Target).Scope),
+            field => Assert.IsType<Memcopy>(Assert.IsType<Call>(field).Target),
+            field => Assert.Equal(
+                TIR.NTT.BarrierScope.Block,
+                Assert.IsType<TIR.NTT.Barrier>(Assert.IsType<Call>(field).Target).Scope));
+    }
+
     private static Nncase.TIR.Buffer CreateWorkspaceBuffer(
         string name,
         DataType dataType,

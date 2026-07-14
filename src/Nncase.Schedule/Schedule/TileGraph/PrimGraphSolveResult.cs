@@ -25,10 +25,36 @@ public record class NodeWithBuffer(TileNode Node, BufferIdentity Id)
         : TensorUtilities.GetProduct(Id.Node.BufferShapes[Id.Index].ToArray()) * Id.Node.GetBufferElemSize(Id.Index);
 }
 
-public record NodeWithBufferInfo(long Size, Tuple<int, int> Liveness, long[] Shape, long[] Strides)
+public record NodeWithBufferInfo(long Size, TileLifetime Lifetime, long[] Shape, long[] Strides)
 {
     public ulong Offset { get; set; } = ulong.MaxValue;
 }
+
+/// <summary>
+/// Physical arena usage produced by scheduling one AutoTiling memory space.
+/// </summary>
+/// <param name="MemorySpace">Target memory-space identity.</param>
+/// <param name="Binding">TIR storage binding used by generated buffers.</param>
+/// <param name="RequiredBytes">Highest scheduled buffer end before target allocation rounding.</param>
+/// <param name="AllocationBytes">Arena size after applying the target allocation policy.</param>
+/// <param name="Alignment">Required arena base alignment.</param>
+public sealed record TileBufferPoolSchedule(
+    TargetMemorySpaceId MemorySpace,
+    TIRMemorySpaceBinding Binding,
+    long RequiredBytes,
+    long AllocationBytes,
+    int Alignment);
+
+/// <summary>
+/// Complete physical buffer schedule for one tiled PrimFunction.
+/// </summary>
+public sealed record TileBufferScheduleResult(IReadOnlyList<TileBufferPoolSchedule> Pools);
+
+/// <summary>
+/// Hidden caller binding for one root materialization retained between
+/// sequential phases of a scheduled region.
+/// </summary>
+public sealed record TileRootParameterBinding(BufferIdentity Source, BufferVar Parameter, Expr Argument);
 
 /// <summary>
 /// Represents the view information of a buffer.
@@ -48,9 +74,10 @@ internal sealed record ViewInfo(ViewInfo? Parent, Expr View, Var? ViewVar, Expr 
 
 public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<TreeSolveResult.Context, Unit>
 {
+    private readonly List<TileRootParameterBinding> _rootParameterBindings;
     private readonly Dictionary<ITileable, Dictionary<BufferIdentity, ViewInfo>> _viewInfoMemo;
 
-    public TreeSolveResult(BufferGraph primBufferGraph, long objectiveValue, Dictionary<int, Dictionary<NodeWithBuffer, NodeWithBufferInfo>> levelNodeBufferInfos, Dictionary<OpNode, OpNodeInfo<long>> primitiveBufferInfo, Dictionary<TileNode, TileNodeInfo<long>> levelBufferInfos, Dictionary<ITileable, DomainInfo<long>> domainInfos, IReadOnlyDictionary<TileUseId, int> selectedUseLevels, INTTTargetOptions targetOptions, string moduleKind)
+    public TreeSolveResult(BufferGraph primBufferGraph, long objectiveValue, Dictionary<int, Dictionary<NodeWithBuffer, NodeWithBufferInfo>> levelNodeBufferInfos, Dictionary<OpNode, OpNodeInfo<long>> primitiveBufferInfo, Dictionary<TileNode, TileNodeInfo<long>> levelBufferInfos, Dictionary<ITileable, DomainInfo<long>> domainInfos, IReadOnlyList<TileMaterialization> materializations, INTTTargetOptions targetOptions, string moduleKind)
         : base(null!, primitiveBufferInfo, levelBufferInfos, domainInfos, targetOptions)
     {
         PrimBufferGraph = primBufferGraph;
@@ -58,6 +85,7 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
         OutputStorageBids = ResolveOutputStorageBids();
         InputOutputVars = new();
         OutputValues = new();
+        _rootParameterBindings = new();
         var inOutInputs = OutputStorageBids.Values.Where(Inputs.Contains).ToHashSet();
         foreach (var bid in Inputs)
         {
@@ -67,7 +95,7 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
             InputOutputVars.Add(
                 bid,
                 new BufferVar(
-                    $"{bid}",
+                    TileSemanticNaming.GetBufferEndpointName(bid),
                     bufferType,
                     isInOut ? BufferVarRole.InOut : BufferVarRole.Input,
                     MemoryLocation.Input));
@@ -79,7 +107,7 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
             if (!InputOutputVars.TryGetValue(storageBid, out var storageVar))
             {
                 var storageType = GetBufferType(storageBid.Access.Buffer);
-                storageVar = new BufferVar($"{storageBid}", storageType, BufferVarRole.Output, MemoryLocation.Output);
+                storageVar = new BufferVar(TileSemanticNaming.GetBufferEndpointName(storageBid), storageType, BufferVarRole.Output, MemoryLocation.Output);
                 InputOutputVars.Add(storageBid, storageVar);
             }
 
@@ -87,16 +115,18 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
             OutputValues.Add(bid, CreateLogicalResultValue(bid, storageBid, storageVar));
         }
 
+        BindRootMaterializations();
+
         ObjectiveValue = objectiveValue;
         LevelNodeBufferInfos = levelNodeBufferInfos;
-        SelectedUseLevels = selectedUseLevels;
+        Materializations = materializations;
         ModuleKind = moduleKind;
         _viewInfoMemo = new();
     }
 
     public BufferGraph PrimBufferGraph { get; }
 
-    public IReadOnlyDictionary<TileUseId, int> SelectedUseLevels { get; }
+    public IReadOnlyList<TileMaterialization> Materializations { get; }
 
     public HashSet<BufferIdentity> Inputs { get; }
 
@@ -107,6 +137,8 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
     public Dictionary<BufferIdentity, IVar> InputOutputVars { get; }
 
     public Dictionary<BufferIdentity, Expr> OutputValues { get; }
+
+    public IReadOnlyList<TileRootParameterBinding> RootParameterBindings => _rootParameterBindings;
 
     public IReadOnlyList<BufferVar> OutputParameters => Outputs
         .OrderBy(output => output.Node.OpId)
@@ -123,10 +155,113 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
 
     public string ModuleKind { get; }
 
-    public RankedShape PartialShapeFromDomain(Isl.set parentDomain, DomainRelation domainRel, Isl.set tiledDomain, AffineMap access, uint dim, Dictionary<string, Dimension> paramDimMap)
+    private void BindRootMaterializations()
+    {
+        foreach (var group in PrimBufferGraph.GetOwnedRootMaterializationEdges()
+                     .GroupBy(edge => edge.Source)
+                     .OrderBy(group => group.Key.Node.RegionOpId)
+                     .ThenBy(group => group.Key.OutputIndex))
+        {
+            var source = group.Key;
+            IVar? storageVar = TryResolveExistingStorageVar(source);
+            foreach (var edge in group)
+            {
+                var targetStorage = TryResolveExistingStorageVar(edge.Target);
+                if (storageVar is not null && targetStorage is not null && !ReferenceEquals(storageVar, targetStorage))
+                {
+                    throw new InvalidOperationException(
+                        $"Root materialization {source} resolves to conflicting caller buffers {storageVar} and {targetStorage}.");
+                }
+
+                storageVar ??= targetStorage;
+            }
+
+            if (storageVar is null)
+            {
+                var sourceType = GetBufferType(source.Access.Buffer);
+                var location = GetCallerBufferLocation(source.Access.Buffer);
+                var parameter = new BufferVar(
+                    $"{TileSemanticNaming.GetBufferEndpointName(source)}_root",
+                    sourceType,
+                    BufferVarRole.InOut,
+                    location);
+                storageVar = parameter;
+                _rootParameterBindings.Add(new TileRootParameterBinding(source, parameter, source.Access.Buffer));
+            }
+
+            BindEndpoint(source, storageVar);
+            foreach (var edge in group)
+            {
+                var sourceType = GetBufferType(source.Access.Buffer);
+                var targetType = GetBufferType(edge.Target.Access.Buffer);
+                if (!Equals(sourceType, targetType))
+                {
+                    throw new InvalidOperationException(
+                        $"Root materialization {source} -> {edge.Target} changes buffer type from {sourceType} to {targetType}. " +
+                        "Logical view transformations must remain explicit grid operations.");
+                }
+
+                BindEndpoint(edge.Target, storageVar);
+            }
+        }
+
+        IVar? TryResolveExistingStorageVar(BufferIdentity bid)
+        {
+            if (InputOutputVars.TryGetValue(bid, out var direct))
+            {
+                return direct;
+            }
+
+            return TryGetAliasReadBid(bid, out var aliasRead) && InputOutputVars.TryGetValue(aliasRead, out var aliasStorage)
+                ? aliasStorage
+                : null;
+        }
+
+        void BindEndpoint(BufferIdentity bid, IVar storageVar)
+        {
+            if (InputOutputVars.TryGetValue(bid, out var existing) && !ReferenceEquals(existing, storageVar))
+            {
+                throw new InvalidOperationException(
+                    $"Root materialization endpoint {bid} is already bound to a different buffer {existing}.");
+            }
+
+            InputOutputVars[bid] = storageVar;
+        }
+    }
+
+    private static MemoryLocation GetCallerBufferLocation(Expr buffer)
+        => buffer switch
+        {
+            Call { Target: IR.Buffers.Uninitialized uninitialized } => uninitialized.MemoryLocation,
+            TIR.Buffer tirBuffer => tirBuffer.MemSpan.Buffer.Location,
+            BufferVar bufferVar => bufferVar.Location,
+            _ => throw new InvalidOperationException(
+                $"A root materialization requires caller-allocated storage, got {buffer.GetType().Name}: {buffer}."),
+        };
+
+    public RankedShape PartialShapeFromDomain(
+        Isl.set parentDomain,
+        DomainRelation domainRel,
+        Isl.set tiledDomain,
+        AffineMap access,
+        IReadOnlyList<int> loopOrder,
+        int loopEntry,
+        Dictionary<string, Dimension> paramDimMap)
     {
         var domainRank = tiledDomain.dim(Isl.dim_type.set);
         var shapeRank = access.Results.Length;
+        if (loopOrder.Count != domainRank || loopEntry < 0 || loopEntry > loopOrder.Count)
+        {
+            throw new ArgumentException(
+                $"Partial buffer shape requires a rank-{domainRank} loop order and an entry in [0, {domainRank}], " +
+                $"got order [{string.Join(", ", loopOrder)}] and entry {loopEntry}.");
+        }
+
+        var enteredAxes = new bool[domainRank];
+        for (int position = 0; position < loopEntry; position++)
+        {
+            enteredAxes[loopOrder[position]] = true;
+        }
 
         var (domainRelMinMpa, domainRelMaxMpa) = TilingUtilities.ToMinMaxMpa(domainRel.Map);
         var parentMaxMpa = parentDomain.max_multi_pw_aff();
@@ -137,10 +272,13 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
         var tiledMinMpa = tiledDomain.min_multi_pw_aff();
         var (accessMinMpa, accessMaxMpa) = TilingUtilities.ToMinMaxMpa(access);
 
-        for (int i = (int)dim; i < domainRank; i++)
+        for (int axis = 0; axis < domainRank; axis++)
         {
-            tiledMaxMpa = tiledMaxMpa.set_at(i, currentMaxMpa.at(i));
-            tiledMinMpa = tiledMinMpa.set_at(i, currentMinMpa.at(i));
+            if (!enteredAxes[axis])
+            {
+                tiledMaxMpa = tiledMaxMpa.set_at(axis, currentMaxMpa.at(axis));
+                tiledMinMpa = tiledMinMpa.set_at(axis, currentMinMpa.at(axis));
+            }
         }
 
         var bufferMaxMpa = accessMaxMpa.pullback(tiledMaxMpa.add_constant(1));
@@ -166,6 +304,33 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
 
     public Unit Visit(TileNode value, Context context)
     {
+        if (value.ScopeKind == TileScopeKind.Sequential)
+        {
+            return VisitSequentialScope(value, context);
+        }
+
+        if (value.Wrapped.IsPureBufferViewScope())
+        {
+            var selectedPlacements = TileNodeMemo[value].BufferInfoMap
+                .SelectMany(pair => pair.Value.Places.SelectMany(
+                    (places, loopEntry) => places.Select(
+                        (selected, storageLevel) => (pair.Key, LoopEntry: loopEntry, StorageLevel: storageLevel, Selected: selected))))
+                .Where(placement => placement.Selected != 0)
+                .ToArray();
+            if (selectedPlacements.Length != 0)
+            {
+                throw new InvalidOperationException(
+                    $"Pure buffer-view scope {value} selected physical placements: " +
+                    string.Join(", ", selectedPlacements.Select(
+                        placement => $"{placement.Key}@entry{placement.LoopEntry}/L{placement.StorageLevel}")));
+            }
+
+            // Alias descriptors are created by the nearest executable owner
+            // scope. A pure view has no iteration or storage semantics of its
+            // own, so lowering a loop nest here would only create empty TIR.
+            return default;
+        }
+
         var (parentbuilder, parentOffsets, parentExtents) = context;
         {
             var newParentExtents = new Dimension[parentExtents.Length];
@@ -173,7 +338,10 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
             {
                 if (parentExtents[i] is AsDim { Dim: Call { Target: IR.Tensors.LocalShardDim } } localShardDim)
                 {
-                    var letDim = T.LetDim(out var dimVar, localShardDim, $"L{value.Level}_d{i}");
+                    var letDim = T.LetDim(
+                        out var dimVar,
+                        localShardDim,
+                        TileSemanticNaming.GetLocalExtentName(value, i, TargetOptions.TargetMachineModel));
                     parentbuilder.Body(letDim);
                     parentbuilder = letDim;
                     dimVar.Metadata = new() { Range = localShardDim.Metadata.Range };
@@ -199,6 +367,7 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
         var nodeMemo = TileNodeMemo[value];
         var domainRank = value.DomainRelation.Map.Results.Length;
         var reductionAxes = ReductionAxisAnalysis.GetReductionAxes(value);
+        var loopOrder = value.LoopOrder;
 
         // create tile map from tile vars
         Isl.map tilemap;
@@ -237,9 +406,14 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
             Dimension stop = currentExtents[i];
             Dimension stride = nodeMemo.BackWardExtents[0][i] / TileableNodeMemo[value].TileVars[i];
             DimVar loopVar;
+            var loopName = TileSemanticNaming.GetLoopVariableName(
+                value,
+                i,
+                reductionAxes[i] && value.Level == 0,
+                TargetOptions.TargetMachineModel);
             loopBuilders[i] = reductionAxes[i] && value.Level == 0
-                ? T.Reduction(out loopVar, (0L, stop, stride), $"d{i}_Op{value.OpId}_L{value.Level}")
-                : T.Serial(out loopVar, (0L, stop, stride), $"d{i}_Op{value.OpId}_L{value.Level}");
+                ? T.Reduction(out loopVar, (0L, stop, stride), loopName)
+                : T.Serial(out loopVar, (0L, stop, stride), loopName);
             loopVar.Metadata.Range = new(0, nodeMemo.BackWardExtents[0][i]);
             loopVars[i] = loopVar;
             paramDimMap.Add($"d{i}_out", loopVar);
@@ -271,13 +445,14 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
 
         // forwardOffsets[0] means partentOffsets, forwardOffsets[i] means partentOffsets[0:i] + loop vars[0:i]
         var forwardOffsets = new Dimension[loopVars.Length + 1][];
-        for (int i = 0; i < loopVars.Length + 1; i++)
+        for (int entry = 0; entry < loopVars.Length + 1; entry++)
         {
-            var offsets = forwardOffsets[i] = currentOffsets.ToArray();
+            var offsets = forwardOffsets[entry] = currentOffsets.ToArray();
 
-            for (int j = 0; j < i; j++)
+            for (int position = 0; position < entry; position++)
             {
-                offsets[j] += loopVars[j];
+                var axis = loopOrder[position];
+                offsets[axis] += loopVars[axis];
             }
         }
 
@@ -302,7 +477,14 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
                         continue;
                     }
 
-                    var partialShape = PartialShapeFromDomain(parentDomain, value.DomainRelation, tiledChildDomain, bufferInfo.Map, (uint)ci, paramDimMap);
+                    var partialShape = PartialShapeFromDomain(
+                        parentDomain,
+                        value.DomainRelation,
+                        tiledChildDomain,
+                        bufferInfo.Map,
+                        loopOrder,
+                        ci,
+                        paramDimMap);
 
                     var viewInfo = GetViewInfo(sl, value, bid, bufferInfo.Map, forwardOffsets[ci], partialShape);
                     if (viewInfo.ViewVar is { } viewVar)
@@ -342,8 +524,9 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
 
             if (ci < loopVars.Length)
             {
-                cntBuilder.Body(loopBuilders[ci]);
-                cntBuilder = loopBuilders[ci];
+                var axis = loopOrder[ci];
+                cntBuilder.Body(loopBuilders[axis]);
+                cntBuilder = loopBuilders[axis];
             }
             else
             {
@@ -372,12 +555,20 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
         var currentExtents = currentRanges.Select(r => r.Stop).ToArray();
         var bufferViews = new Expr[value.BufferShapes.Length];
         var bodyVarReplaces = new Dictionary<BaseExpr, BaseExpr>();
+        var opLoopOrder = Enumerable.Range(0, currentDomain.dim(Isl.dim_type.set)).ToArray();
         for (int i = 0; i < value.BufferShapes.Length; i++)
         {
             var access = value.Grid.Accesses[i];
             var endpoint = access.IsRead ? BufferEndpoint.Input : BufferEndpoint.Output;
             var bid = new BufferIdentity(value.Wrapped, i, endpoint);
-            var shape = PartialShapeFromDomain(parentDomain, value.DomainRelation, currentDomain, value.AccessMaps[i], (uint)currentDomain.dim(Isl.dim_type.set), paramDimMap);
+            var shape = PartialShapeFromDomain(
+                parentDomain,
+                value.DomainRelation,
+                currentDomain,
+                value.AccessMaps[i],
+                opLoopOrder,
+                opLoopOrder.Length,
+                paramDimMap);
             if (!TryGetParentViewInfo(value, bid, out var parentViewInfo))
             {
                 throw new InvalidOperationException($"can't find parent view info for {bid} at OpNode {value}!");
@@ -406,26 +597,44 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
             return default;
         }
 
-        var nestBody = new ReplacingExprCloner(bodyVarReplaces).Clone(value.Grid.Body, default);
+        var bodyCloner = new ReplacingExprCloner(bodyVarReplaces)
+        {
+            // Grid parameters are local placeholders, while dimensions captured by
+            // the body belong to the enclosing function. Rebuilding untouched
+            // leaves would create disconnected DimVar identities.
+            CloneUnmutated = false,
+        };
+        var nestBody = bodyCloner.Clone(value.Grid.Body, default);
         parentbuilder.Body(nestBody);
         return default;
     }
 
-    public long ScheduleBuffers()
+    public TileBufferScheduleResult ScheduleBuffers()
     {
-        var maxAlign = 0L;
-        foreach (var (level, nodeBufferInfos) in LevelNodeBufferInfos)
+        var pools = new List<TileBufferPoolSchedule>();
+        foreach (var (level, nodeBufferInfos) in LevelNodeBufferInfos.OrderBy(pair => pair.Key))
         {
+            var memorySpace = TargetOptions.TargetMachineModel.TilingMemorySpaces[level];
+            var binding = memorySpace.TIRBinding
+                ?? throw new InvalidOperationException($"Target tiling memory space {memorySpace.Id} has no TIR binding.");
             var model = new CpModel();
             var rectangles = new Dictionary<NodeWithBuffer, (IntervalVar XInterval, IntervalVar YInterval)>();
+            var memoryEnds = new List<LinearExpr>();
             int count = 0;
             var cons = model.AddNoOverlap2D();
+            var maxAlign = 1L;
             foreach (var (key, info) in nodeBufferInfos)
             {
+                if (info.Size > 0 && TileBufferAliasAnalysis.IsPureAliasEndpoint(key.Id))
+                {
+                    throw new InvalidOperationException(
+                        $"Pure buffer alias endpoint {key.Id} at {key.Node} was assigned {info.Size} bytes in {memorySpace.Id}. " +
+                        "Alias descriptors must not own physical storage.");
+                }
+
                 if (info.Size > 0)
                 {
-                    var x = model.NewFixedSizeIntervalVar(info.Liveness.Item1, info.Liveness.Item2 - info.Liveness.Item1, $"x{count}");
-                    var memorySpace = TargetOptions.TargetMachineModel.TilingMemorySpaces[level];
+                    var x = model.NewFixedSizeIntervalVar(info.Lifetime.FirstPhase, info.Lifetime.PhaseCount, $"x{count}");
                     var ystart = model.NewIntVar(0, memorySpace.MaxAllocationBytesPerScope - info.Size, $"ystart{count}");
                     var align = key.Id.Node.GetBufferElemSize(key.Id.Index);
                     if (ModuleKind == "xpu")
@@ -436,11 +645,27 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
                     maxAlign = Math.Max(maxAlign, align);
                     model.AddModuloEquality(0, ystart, align);
                     var y = model.NewFixedSizeIntervalVar(ystart, info.Size, $"y{count}");
+                    memoryEnds.Add(y.EndExpr());
                     cons.AddRectangle(x, y);
                     rectangles.Add(key, (x, y));
                     count++;
                 }
             }
+
+            if (rectangles.Count == 0)
+            {
+                pools.Add(new(
+                    memorySpace.Id,
+                    binding,
+                    0,
+                    0,
+                    TargetOptions.TargetMachineModel.GetMemoryResource(memorySpace).AllocationGranularityBytes));
+                continue;
+            }
+
+            var memoryPoolEnd = model.NewIntVar(0, memorySpace.MaxAllocationBytesPerScope, $"memory_pool_end_l{level}");
+            model.AddMaxEquality(memoryPoolEnd, memoryEnds);
+            model.Minimize(memoryPoolEnd);
 
             var solver = new CpSolver();
             var status = solver.Solve(model);
@@ -453,9 +678,105 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
             {
                 nodeBufferInfos[k].Offset = (ulong)solver.Value(y.StartExpr());
             }
+
+            VerifyPhysicalSchedule(memorySpace.Id, nodeBufferInfos);
+
+            var requiredBytes = solver.Value(memoryPoolEnd);
+            var allocationBytes = TargetOptions.TargetMachineModel.GetAllocationSizeBytes(memorySpace, requiredBytes);
+            if (allocationBytes > memorySpace.MaxAllocationBytesPerScope)
+            {
+                throw new InvalidOperationException(
+                    $"Scheduled {memorySpace.Id} arena requires {requiredBytes} bytes " +
+                    $"({allocationBytes} after {memorySpace.AllocationSizePolicy} rounding), exceeding " +
+                    $"the target limit {memorySpace.MaxAllocationBytesPerScope}.");
+            }
+
+            var resourceAlignment = TargetOptions.TargetMachineModel.GetMemoryResource(memorySpace).AllocationGranularityBytes;
+            pools.Add(new(
+                memorySpace.Id,
+                binding,
+                requiredBytes,
+                allocationBytes,
+                checked((int)Math.Max(maxAlign, resourceAlignment))));
         }
 
-        return maxAlign;
+        return new(pools);
+    }
+
+    private Unit VisitSequentialScope(TileNode value, Context context)
+    {
+        if (context.ForwardOffsets.Length != 0 || context.ForwardExtents.Length != 0)
+        {
+            throw new InvalidOperationException(
+                $"Sequential tile scope {value} received an iteration context. " +
+                "Independent chip phases must be lowered as an outermost zero-dimensional scope.");
+        }
+
+        var nodeInfo = TileNodeMemo[value];
+        if (nodeInfo.BufferInfoMap.Count != 0 ||
+            nodeInfo.BackWardExtents.Length != 1 ||
+            nodeInfo.BackWardExtents[0].Length != 0)
+        {
+            throw new InvalidOperationException(
+                $"Sequential tile scope {value} must not own tile extents or physical buffer placements.");
+        }
+
+        foreach (var child in value.Children)
+        {
+            if (child is not TileNode phase ||
+                phase.ScopeKind != TileScopeKind.Iteration ||
+                phase.Level != value.Level)
+            {
+                throw new InvalidOperationException(
+                    $"Sequential tile scope {value} requires independent iteration children at L{value.Level}, got {child}.");
+            }
+
+            var childBuilder = T.Sequential();
+            var phaseOffsets = Enumerable.Repeat<Dimension>(0L, phase.DomainBoundExprs.Length).ToArray();
+            ((ITreeNode)phase).Accept(this, new(childBuilder, phaseOffsets, phase.DomainBoundExprs.ToArray()));
+            context.ParentBuilder.Body(childBuilder);
+        }
+
+        return default;
+    }
+
+    private static void VerifyPhysicalSchedule(
+        TargetMemorySpaceId memorySpace,
+        IReadOnlyDictionary<NodeWithBuffer, NodeWithBufferInfo> nodeBufferInfos)
+    {
+        var allocated = nodeBufferInfos
+            .Where(pair => pair.Value.Size > 0)
+            .OrderBy(pair => pair.Value.Offset)
+            .ToArray();
+        for (int i = 0; i < allocated.Length; i++)
+        {
+            var (leftBuffer, leftInfo) = allocated[i];
+            if (leftInfo.Offset == ulong.MaxValue)
+            {
+                throw new InvalidOperationException(
+                    $"Tile buffer {leftBuffer} has no scheduled offset in {memorySpace}.");
+            }
+
+            var leftEnd = checked(leftInfo.Offset + (ulong)leftInfo.Size);
+            for (int j = i + 1; j < allocated.Length; j++)
+            {
+                var (rightBuffer, rightInfo) = allocated[j];
+                if (rightInfo.Offset >= leftEnd)
+                {
+                    break;
+                }
+
+                if (leftInfo.Lifetime.Overlaps(rightInfo.Lifetime))
+                {
+                    var rightEnd = checked(rightInfo.Offset + (ulong)rightInfo.Size);
+                    throw new InvalidOperationException(
+                        $"Tile buffers {leftBuffer} [{leftInfo.Offset}, {leftEnd}) and " +
+                        $"{rightBuffer} [{rightInfo.Offset}, {rightEnd}) overlap in {memorySpace} while both are live " +
+                        $"during inclusive phases [{leftInfo.Lifetime.FirstPhase}, {leftInfo.Lifetime.LastPhase}] and " +
+                        $"[{rightInfo.Lifetime.FirstPhase}, {rightInfo.Lifetime.LastPhase}].");
+                }
+            }
+        }
     }
 
     private Expr CreateLogicalResultValue(BufferIdentity resultBid, BufferIdentity storageBid, IVar storageVar)
@@ -593,7 +914,8 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
             var binding = TargetOptions.TargetMachineModel.TilingMemorySpaces[storeLevel].TIRBinding
                 ?? throw new InvalidOperationException($"Target tiling memory level {storeLevel} has no TIR binding.");
             var physicalBuffer = new PhysicalBuffer(alignment, Tensor.FromPointer(info.Offset, tensorType.DType), info.Size, binding.Location, binding.Hierarchy);
-            return new TIR.Buffer($"{bid}", tensorType.DType, new MemSpan(physicalBuffer), shape.Dimensions.ToArray(), strides, distributedType);
+            var bufferName = TileSemanticNaming.GetStorageBufferName(bid, tileNode, storeLevel, TargetOptions.TargetMachineModel);
+            return new TIR.Buffer(bufferName, tensorType.DType, new MemSpan(physicalBuffer), shape.Dimensions.ToArray(), strides, distributedType);
         }
 
         Expr GetViewExpr(ViewInfo? parentInfo, Expr buffer, RankedShape forwardOffsets, RankedShape relatedOffsets, RankedShape shape, bool ownsStorage)
@@ -633,7 +955,7 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
             var requiresParentTransfer = requiresExplicitTransfer;
             var buffer = requiresParentTransfer ? AllocateBuffer(node, bid) : parentViewInfo.Buffer;
             var view = GetViewExpr(parentViewInfo, buffer, bufferOffsets, offsets, shape, requiresParentTransfer);
-            var viewVar = new Var($"{bid}_L{node.Level}", AnyType.Default);
+            var viewVar = new Var(TileSemanticNaming.GetViewName(bid, node, TargetOptions.TargetMachineModel), AnyType.Default);
             return new ViewInfo(parentViewInfo, view, viewVar, buffer, bufferOffsets, offsets, shape, requiresParentTransfer);
         }
         else
@@ -658,7 +980,7 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
             }
 
             var view = GetViewExpr(parentViewInfo, buffer, bufferOffsets, offsets, shape, requiresParentTransfer || !fromExternal);
-            var viewVar = new Var($"{bid}_L{node.Level}", AnyType.Default);
+            var viewVar = new Var(TileSemanticNaming.GetViewName(bid, node, TargetOptions.TargetMachineModel), AnyType.Default);
             return new ViewInfo(
                 parentViewInfo,
                 view,
@@ -690,7 +1012,10 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
         var sourceStorage = sourceViewInfo.Buffer switch
         {
             TIR.Buffer buffer => buffer,
-            BufferVar sourceVar => AttachBuffer(sourceVar, GetBufferType(sourceBid.Access.Buffer), $"{sourceBid}_alias_source"),
+            BufferVar sourceVar => AttachBuffer(
+                sourceVar,
+                GetBufferType(sourceBid.Access.Buffer),
+                $"{TileSemanticNaming.GetBufferEndpointName(sourceBid)}_alias_source"),
             _ => throw new InvalidOperationException(
                 $"Buffer alias source {sourceBid} must resolve to TIR.Buffer or BufferVar, got {sourceViewInfo.Buffer.GetType().Name}."),
         };
@@ -737,9 +1062,9 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
             byteOffset,
             byteSize,
             resultType as DistributedType,
-            $"{resultBid}_alias");
+            TileSemanticNaming.GetViewName(resultBid, node, TargetOptions.TargetMachineModel, "alias_buffer"));
         var view = IR.F.Buffer.AllocateBufferView(aliasBuffer, new RankedShape(resultOffsets));
-        var viewVar = new Var($"{resultBid}_L{node.Level}", AnyType.Default);
+        var viewVar = new Var(TileSemanticNaming.GetViewName(resultBid, node, TargetOptions.TargetMachineModel, "alias_view"), AnyType.Default);
         return new ViewInfo(
             parentResultView,
             view,
@@ -788,7 +1113,8 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
             var binding = TargetOptions.TargetMachineModel.TilingMemorySpaces[storeLevel].TIRBinding
                 ?? throw new InvalidOperationException($"Target tiling memory level {storeLevel} has no TIR binding.");
             var physicalBuffer = new PhysicalBuffer(alignment, Tensor.FromPointer(info.Offset, tensorType.DType), info.Size, binding.Location, binding.Hierarchy);
-            return new TIR.Buffer($"{bid}", tensorType.DType, new MemSpan(physicalBuffer), shape.Dimensions.ToArray(), strides, distributedType);
+            var bufferName = TileSemanticNaming.GetStorageBufferName(bid, node, storeLevel, TargetOptions.TargetMachineModel);
+            return new TIR.Buffer(bufferName, tensorType.DType, new MemSpan(physicalBuffer), shape.Dimensions.ToArray(), strides, distributedType);
         }
 
         var bufferOffsets = map.Apply(forwardOffsets, Enumerable.Repeat<Dimension>(0L, forwardOffsets.Length).ToArray()).Select(i => i.Start).ToArray();
@@ -818,7 +1144,7 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
         {
             buffer = AllocateRootBuffer();
             view = IR.F.Buffer.AllocateBufferView((TIR.Buffer)buffer, new RankedShape(bufferOffsets));
-            viewVar = new Var($"{bid}_L{node.Level}", AnyType.Default);
+            viewVar = new Var(TileSemanticNaming.GetViewName(bid, node, TargetOptions.TargetMachineModel), AnyType.Default);
         }
 
         return new ViewInfo(parentViewInfo, view, viewVar, buffer, bufferOffsets, offsets, shape, false);
@@ -863,7 +1189,8 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
     {
         var storages = new Dictionary<BufferIdentity, BufferIdentity>();
         var producerByRead = new Dictionary<BufferIdentity, BufferIdentity>();
-        foreach (var edge in PrimBufferGraph.Edges.Where(edge => edge.Tag == BufferEdgeKind.Inter))
+        foreach (var edge in PrimBufferGraph.Edges.Where(edge =>
+                     edge.Tag is BufferEdgeKind.Inter or BufferEdgeKind.RootMaterialization))
         {
             if (!producerByRead.TryAdd(edge.Target, edge.Source))
             {

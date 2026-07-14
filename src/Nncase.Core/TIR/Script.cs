@@ -191,6 +191,32 @@ public static class T
         return TIR.Sequential.Flatten(fields);
     }
 
+    /// <summary>
+    /// Attaches a semantic execution scope used by diagnostics and backend tracing.
+    /// </summary>
+    public static Sequential TraceScope(string name, Sequential body)
+    {
+        if (string.IsNullOrWhiteSpace(name))
+        {
+            throw new ArgumentException("A TIR trace scope name must not be empty.", nameof(name));
+        }
+
+        return body.With(traceScopeName: name);
+    }
+
+    /// <summary>
+    /// Attaches a semantic execution scope that code generation must retain as a call boundary.
+    /// </summary>
+    public static Sequential CodegenScope(string name, Sequential body)
+    {
+        if (string.IsNullOrWhiteSpace(name))
+        {
+            throw new ArgumentException("A TIR codegen scope name must not be empty.", nameof(name));
+        }
+
+        return body.With(traceScopeName: name, preserveCodegenBoundary: true);
+    }
+
     public static ISequentialBuilder<Sequential> Sequential()
     {
         return new SequentialBuilder<Sequential>(body => body);

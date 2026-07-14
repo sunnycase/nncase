@@ -562,6 +562,8 @@ public abstract class TIRSelectionPass : FunctionPass
                 }
                 else
                 {
+                    ExprMemo[(BaseExpr)parameter] = (BaseExpr)parameter;
+                    _selectionContext.RegisterSelectedValue((BaseExpr)parameter, (BaseExpr)parameter);
                     lowered[i] = parameter;
                 }
             }

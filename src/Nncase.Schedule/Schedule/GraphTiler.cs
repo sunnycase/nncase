@@ -1,6 +1,7 @@
 ﻿// Copyright (c) Canaan Inc. All rights reserved.
 // Licensed under the Apache license. See LICENSE file in the project root for full license information.
 
+using System.Collections.Immutable;
 using System.Reactive;
 using Google.OrTools.ConstraintSolver;
 using Microsoft.Extensions.DependencyInjection;
@@ -34,13 +35,18 @@ public sealed class GraphTiler
         TreeSolverInitializer.Init(primTree, bufferGraphMemo, levelCount, targetOptions, out var solver, out var opNodeMemo, out var tileNodeMemo, out var tileableNodeMemo);
         var primBufferGraph = bufferGraphMemo[primTree.Wrapped];
         var (externalInputs, externalOutputs) = primBufferGraph.GetInputsOutputs(primBufferGraph.Parent as BufferGraph);
+        var rootMaterializationEdges = primBufferGraph.GetOwnedRootMaterializationEdges().ToArray();
+        var rootMaterializationEndpoints = rootMaterializationEdges
+            .SelectMany(edge => new[] { edge.Source, edge.Target })
+            .ToHashSet();
 
         static int GetStoragePosition(BufferIdentity bid, TileNodeBufferInfo<IntExpr> bufferInfo)
             => bid.Access.BindingMode == GridBindingMode.Root ? 0 : bufferInfo.GetLastRelatedPos();
 
         bool RequiresLocalAllocation(BufferIdentity bid, int level)
         {
-            if (bid.IsOutput && bid.Node.TryGetAliasSourceAccess(bid.Index, out _))
+            if (TileBufferAliasAnalysis.IsPureAliasEndpoint(bid) ||
+                (bid.IsOutput && bid.Node.TryGetAliasSourceAccess(bid.Index, out _)))
             {
                 return false;
             }
@@ -50,16 +56,58 @@ public sealed class GraphTiler
                 return false;
             }
 
-            var isExternal = externalInputs.Contains(bid) || externalOutputs.Contains(bid);
+            var isExternal = externalInputs.Contains(bid) ||
+                externalOutputs.Contains(bid) ||
+                rootMaterializationEndpoints.Contains(bid);
             return !isExternal ||
                 (bid.Access.BindingMode != GridBindingMode.Root && machine.RequiresExplicitTransfer(level));
         }
 
-        // 0. External views exist at every hierarchy level. Internal def-use
-        // connections choose exactly one (memory level, creation position)
-        // across the maximal fused hierarchy.
+        // Internal values may be created in any lexical scope that contains the
+        // producer and dominates every use. The selected scope chooses one loop
+        // entry and any storage space at or below its creation level. Other
+        // occurrences are logical views of that single materialization.
         var eachLevelStoreBufferConstrains = new Dictionary<int, Constraint[]>();
         var internalPlacementCandidates = new Dictionary<BufferIdentity, List<(TileNode Node, TileNodeBufferInfo<IntExpr> Info)>>();
+        var internalSourcesByEndpoint = new Dictionary<BufferIdentity, HashSet<BufferIdentity>>();
+        var internalUsesBySource = new Dictionary<BufferIdentity, HashSet<TileUseId>>();
+        var internalOwnerNodes = new Dictionary<BufferIdentity, HashSet<TileNode>>();
+        foreach (var tileNode in tileNodeMemo.Keys)
+        {
+            foreach (var edge in bufferGraphMemo[tileNode.Wrapped].GetOwnedInterEdges())
+            {
+                if (!internalOwnerNodes.TryGetValue(edge.Source, out var owners))
+                {
+                    owners = new();
+                    internalOwnerNodes.Add(edge.Source, owners);
+                }
+
+                owners.Add(tileNode);
+                foreach (var endpoint in new[] { edge.Source, edge.Target })
+                {
+                    if (!internalSourcesByEndpoint.TryGetValue(endpoint, out var sources))
+                    {
+                        sources = new();
+                        internalSourcesByEndpoint.Add(endpoint, sources);
+                    }
+
+                    sources.Add(edge.Source);
+                }
+
+                if (!internalUsesBySource.TryGetValue(edge.Source, out var uses))
+                {
+                    uses = new();
+                    internalUsesBySource.Add(edge.Source, uses);
+                }
+
+                uses.Add(new TileUseId(
+                    edge.Source.Node.RegionOpId,
+                    edge.Source.OutputIndex,
+                    edge.Target.Node.RegionOpId,
+                    edge.Target.Index));
+            }
+        }
+
         for (int level = 0; level < levelCount; level++)
         {
             var cons = new List<Constraint>();
@@ -67,29 +115,43 @@ public sealed class GraphTiler
             {
                 foreach (var (bid, bufferInfo) in nodeInfo.BufferInfoMap)
                 {
-                    if (nodeInfo.DefUseMap.ContainsKey(bid))
+                    if (tileNode.Wrapped.IsPureBufferViewScope())
                     {
-                        if (!internalPlacementCandidates.TryGetValue(bid, out var candidates))
+                        AddNoPlacementConstraints(tileNode, bid, bufferInfo, cons);
+                        continue;
+                    }
+
+                    if (TileBufferAliasAnalysis.IsPureAliasSource(bid) && machine.RequiresExplicitTransfer(level))
+                    {
+                        AddNoPlacementConstraints(tileNode, bid, bufferInfo, cons);
+                        continue;
+                    }
+
+                    if (internalSourcesByEndpoint.TryGetValue(bid, out var internalSources))
+                    {
+                        var ownedSources = internalSources
+                            .Where(source => source.Equals(bid))
+                            .ToArray();
+                        if (ownedSources.Length > 1)
                         {
-                            candidates = new();
-                            internalPlacementCandidates.Add(bid, candidates);
+                            throw new InvalidOperationException(
+                                $"Tile buffer {bid} is the creation endpoint of multiple internal values at {tileNode}.");
                         }
 
-                        candidates.Add((tileNode, bufferInfo));
-                        for (int ci = 0; ci < bufferInfo.Places.Length; ci++)
+                        if (ownedSources.Length == 1)
                         {
-                            for (int sl = 0; sl < bufferInfo.Places[ci].Length; sl++)
+                            var source = ownedSources[0];
+                            if (!internalPlacementCandidates.TryGetValue(source, out var candidates))
                             {
-                                if (sl == level)
-                                {
-                                    continue;
-                                }
-
-                                var c = solver.MakeEquality(bufferInfo.Places[ci][sl], 0);
-                                c.SetName($"n_internal_store[{tileNode}_{bid}_cl{ci}_sl{sl}]");
-                                solver.Add(c);
-                                cons.Add(c);
+                                candidates = new();
+                                internalPlacementCandidates.Add(source, candidates);
                             }
+
+                            candidates.Add((tileNode, bufferInfo));
+                        }
+                        else
+                        {
+                            AddNoPlacementConstraints(tileNode, bid, bufferInfo, cons);
                         }
 
                         continue;
@@ -122,14 +184,48 @@ public sealed class GraphTiler
             eachLevelStoreBufferConstrains.Add(level, cons.ToArray());
         }
 
+        void AddNoPlacementConstraints(
+            TileNode tileNode,
+            BufferIdentity bid,
+            TileNodeBufferInfo<IntExpr> bufferInfo,
+            ICollection<Constraint> constraints)
+        {
+            for (int ci = 0; ci < bufferInfo.Places.Length; ci++)
+            {
+                for (int sl = 0; sl < bufferInfo.Places[ci].Length; sl++)
+                {
+                    var constraint = solver.MakeEquality(bufferInfo.Places[ci][sl], 0);
+                    constraint.SetName($"n_propagated_store[{tileNode}_{bid}_ci{ci}_sl{sl}]");
+                    solver.Add(constraint);
+                    constraints.Add(constraint);
+                }
+            }
+        }
+
         foreach (var (bid, candidates) in internalPlacementCandidates)
         {
+            var ownerNodes = internalOwnerNodes[bid];
+            var invalidCandidates = candidates
+                .Where(candidate => ownerNodes.Any(owner => !Dominates(candidate.Node, owner)))
+                .ToArray();
+            foreach (var candidate in invalidCandidates)
+            {
+                var constraints = new List<Constraint>();
+                AddNoPlacementConstraints(candidate.Node, bid, candidate.Info, constraints);
+                eachLevelStoreBufferConstrains[candidate.Node.Level] = eachLevelStoreBufferConstrains[candidate.Node.Level]
+                    .Concat(constraints)
+                    .ToArray();
+                candidates.Remove(candidate);
+            }
+
             var placementVars = candidates
-                .SelectMany(candidate => candidate.Info.Places.Select(place => place[candidate.Node.Level]))
+                .SelectMany(candidate => candidate.Info.Places.SelectMany(place => place))
                 .ToArray();
             if (placementVars.Length == 0)
             {
-                throw new InvalidOperationException($"Internal tile buffer {bid} has no hierarchy placement candidates.");
+                throw new SolveFailedException(
+                    $"Internal tile buffer {bid} has no creation scope that dominates use owners " +
+                    $"[{string.Join(", ", ownerNodes)}].");
             }
 
             var constraint = solver.MakeEquality(solver.MakeSum(placementVars), 1);
@@ -139,6 +235,92 @@ public sealed class GraphTiler
             eachLevelStoreBufferConstrains[ownerLevel] = eachLevelStoreBufferConstrains[ownerLevel]
                 .Append(constraint)
                 .ToArray();
+        }
+
+        static bool Dominates(TileNode ancestor, TileNode descendant)
+        {
+            for (ITreeNode? current = descendant; current is not null; current = current.Parent)
+            {
+                if (ReferenceEquals(current, ancestor))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        foreach (var (tileNode, nodeInfo) in tileNodeMemo)
+        {
+            var aliasConstraints = new List<Constraint>();
+            foreach (var (aliasBid, aliasInfo) in nodeInfo.BufferInfoMap)
+            {
+                if (!aliasBid.IsOutput ||
+                    !aliasBid.Node.TryGetAliasSourceAccess(aliasBid.Index, out var sourceAccessIndex))
+                {
+                    continue;
+                }
+
+                var sourceBid = new BufferIdentity(aliasBid.Node, sourceAccessIndex, BufferEndpoint.Input);
+                for (int aliasEntry = 0; aliasEntry < aliasInfo.Places.Length; aliasEntry++)
+                {
+                    var aliasAtEntry = solver.MakeSum(aliasInfo.Places[aliasEntry]);
+                    var visibleSourcePlacements = GetVisibleSourcePlacements(tileNode, sourceBid, aliasEntry);
+                    if (visibleSourcePlacements.Length == 0)
+                    {
+                        throw new SolveFailedException(
+                            $"Alias buffer {aliasBid} at {tileNode} has no current or ancestor backing view for {sourceBid}.");
+                    }
+
+                    var sourceIsVisible = solver.MakeSum(visibleSourcePlacements);
+                    var constraint = solver.MakeLessOrEqual(aliasAtEntry, sourceIsVisible);
+                    constraint.SetName($"alias_source_dominates[{tileNode}_{aliasBid}_ci{aliasEntry}]");
+                    solver.Add(constraint);
+                    aliasConstraints.Add(constraint);
+                }
+            }
+
+            if (aliasConstraints.Count != 0)
+            {
+                eachLevelStoreBufferConstrains[tileNode.Level] = eachLevelStoreBufferConstrains[tileNode.Level]
+                    .Concat(aliasConstraints)
+                    .ToArray();
+            }
+        }
+
+        IntExpr[] GetVisibleSourcePlacements(TileNode node, BufferIdentity sourceBid, int loopEntry)
+        {
+            var placements = new List<IntExpr>();
+            var currentNode = node;
+            var currentBid = sourceBid;
+            var isCurrentNode = true;
+            while (true)
+            {
+                var currentInfo = tileNodeMemo[currentNode];
+                var storageBid = currentInfo.DefUseMap.TryGetByValue(currentBid, out var producerBid)
+                    ? producerBid
+                    : currentBid;
+                if (currentInfo.BufferInfoMap.TryGetValue(storageBid, out var storageInfo))
+                {
+                    var visibleEntries = isCurrentNode
+                        ? storageInfo.Places.Take(loopEntry + 1)
+                        : storageInfo.Places;
+                    placements.AddRange(visibleEntries.SelectMany(place => place));
+                }
+
+                if (currentNode.Parent is not TileNode parentNode ||
+                    parentNode.OpId == -1 ||
+                    !tileNodeMemo[parentNode].TryGetByChildBuffer(storageBid, out var parentBid))
+                {
+                    break;
+                }
+
+                currentNode = parentNode;
+                currentBid = parentBid;
+                isCurrentNode = false;
+            }
+
+            return placements.Distinct().ToArray();
         }
 
         // 1. tile var constraints
@@ -187,18 +369,18 @@ public sealed class GraphTiler
         // 5.1. sum(place[cl,b,ci,sl]*size[cl,b,ci], sl), sl = [0,toplevel)
         var levelBufferSizes = new Dictionary<int, Dictionary<NodeWithBuffer, IntExpr>>();
         var levelBufferShapes = new Dictionary<int, Dictionary<NodeWithBuffer, IntExpr[]>>();
-        var levelBufferLifeness = new Dictionary<int, Dictionary<NodeWithBuffer, Tuple<int, int>>>();
+        var levelBufferLifetimes = new Dictionary<int, Dictionary<NodeWithBuffer, TileLifetime>>();
         var levelBufferPlacementInfos = new Dictionary<int, Dictionary<NodeWithBuffer, TileNodeBufferInfo<IntExpr>>>();
-        var levelBufferLifenessConstraints = new Dictionary<int, Constraint[]>();
+        var levelBufferLifetimeConstraints = new Dictionary<int, Constraint[]>();
         for (int sl = 0; sl < levelCount; sl++)
         {
             var nodeBufferSizes = levelBufferSizes[sl] = new();
-            var nodeBufferLiveness = levelBufferLifeness[sl] = new();
+            var nodeBufferLifetimes = levelBufferLifetimes[sl] = new();
             var nodeBufferShapes = levelBufferShapes[sl] = new();
             var nodeBufferPlacementInfos = levelBufferPlacementInfos[sl] = new();
             var occupancyByTime = new SortedDictionary<int, List<IntExpr>>();
 
-            foreach (var (tileNode, nodeInfo) in tileNodeMemo.Where(kv => kv.Key.Level == sl)) // only consider create and store at same level.
+            foreach (var (tileNode, nodeInfo) in tileNodeMemo.Where(kv => kv.Key.Level >= sl))
             {
                 foreach (var (bid, bufferInfo) in nodeInfo.BufferInfoMap)
                 {
@@ -220,11 +402,11 @@ public sealed class GraphTiler
                             shapeTerms[axis].Add(solver.MakeProd(place, bufferInfo.Shapes[ci][axis]));
                         }
 
-                        lifetimeStart = Math.Min(lifetimeStart, bufferInfo.Liveness[ci].Item1);
-                        lifetimeEnd = Math.Max(lifetimeEnd, bufferInfo.Liveness[ci].Item2);
+                        lifetimeStart = Math.Min(lifetimeStart, bufferInfo.Lifetimes[ci].FirstPhase);
+                        lifetimeEnd = Math.Max(lifetimeEnd, bufferInfo.Lifetimes[ci].LastPhase);
                         if (requiresLocalAllocation)
                         {
-                            for (int time = bufferInfo.Liveness[ci].Item1; time <= bufferInfo.Liveness[ci].Item2; time++)
+                            for (int time = bufferInfo.Lifetimes[ci].FirstPhase; time <= bufferInfo.Lifetimes[ci].LastPhase; time++)
                             {
                                 if (!occupancyByTime.TryGetValue(time, out var occupancy))
                                 {
@@ -250,7 +432,7 @@ public sealed class GraphTiler
                     nodeBufferShapes[nodeBuffer] = shapeTerms
                         .Select(terms => solver.MakeSum(terms.ToArray()))
                         .ToArray();
-                    nodeBufferLiveness[nodeBuffer] = new(lifetimeStart, lifetimeEnd);
+                    nodeBufferLifetimes[nodeBuffer] = new(lifetimeStart, lifetimeEnd);
                     nodeBufferPlacementInfos[nodeBuffer] = bufferInfo;
                 }
             }
@@ -258,7 +440,7 @@ public sealed class GraphTiler
             // Add constraints according to liveness.
             if (Diagnostics.DumpScope.Current.IsEnabled(Diagnostics.DumpFlags.Tiling))
             {
-                DumpGantt(nodeBufferSizes, nodeBufferLiveness, primTree, sl);
+                DumpGantt(nodeBufferSizes, nodeBufferLifetimes, primTree, sl);
             }
 
             var constraints = new List<Constraint>();
@@ -273,7 +455,7 @@ public sealed class GraphTiler
                 constraints.Add(constraint);
             }
 
-            levelBufferLifenessConstraints.Add(sl, constraints.ToArray());
+            levelBufferLifetimeConstraints.Add(sl, constraints.ToArray());
         }
 
         // when buffer is read, the data read from last level memory.
@@ -517,7 +699,7 @@ public sealed class GraphTiler
             }
         }
 
-        foreach (var (_, v) in levelBufferLifenessConstraints)
+        foreach (var (_, v) in levelBufferLifetimeConstraints)
         {
             foreach (var item in v)
             {
@@ -545,7 +727,7 @@ public sealed class GraphTiler
             var phasePlacementVars = internalPlacementCandidates
                 .SelectMany(pair => pair.Value
                     .OrderBy(candidate => candidate.Node.Level)
-                    .SelectMany(candidate => candidate.Info.Places.Select(place => place[candidate.Node.Level].Var())))
+                    .SelectMany(candidate => candidate.Info.Places.SelectMany(place => place.Select(value => value.Var()))))
                 .Distinct()
                 .ToArray();
             phaseOtherVars.AddRange(searchAbleVars.Except(phaseTileVars).Except(phasePlacementVars));
@@ -593,7 +775,7 @@ public sealed class GraphTiler
         var status = solver.Solve(decisionBuilder, monitors.ToArray());
         if (!status)
         {
-            DumpAssgin(primTree, new TreeSolverPrinter(null, solver, opNodeMemo, tileNodeMemo, tileableNodeMemo, targetOptions), tileVarConstraints, reductionStateBytes, reductionStateConstraints, eachLevelStoreBufferConstrains, levelBufferLifenessConstraints, levelBufferSizes, levelDataReads, levelDataWrites, levelTransferReads, levelTransferWrites, memoryCycles, transferCycles, computeCycles, synchronizationCycles, totalCyclesVar);
+            DumpAssgin(primTree, new TreeSolverPrinter(null, solver, opNodeMemo, tileNodeMemo, tileableNodeMemo, targetOptions), tileVarConstraints, reductionStateBytes, reductionStateConstraints, eachLevelStoreBufferConstrains, levelBufferLifetimeConstraints, levelBufferSizes, levelDataReads, levelDataWrites, levelTransferReads, levelTransferWrites, memoryCycles, transferCycles, computeCycles, synchronizationCycles, totalCyclesVar);
             throw new SolveFailedException(
                 $"tiling solve failed after {solver.WallTime()} ms, {solver.Branches()} branches, and {solver.Failures()} failures.");
         }
@@ -617,8 +799,8 @@ public sealed class GraphTiler
                 }
 
                 var liveness = selectedPositions.Length == 1
-                    ? placementInfo.Liveness[selectedPositions[0]]
-                    : new Tuple<int, int>(0, 0);
+                    ? placementInfo.Lifetimes[selectedPositions[0]]
+                    : new TileLifetime(0, 0);
                 var shapes = levelBufferShapes[level][nodeBuffer].Select(s => sol.Value(s.Var())).ToArray();
                 var strides = TensorUtilities.GetDefaultStrides(shapes);
                 nodeBufferInfos[nodeBuffer] = new NodeWithBufferInfo(sol.Value(sizeVar.Var()), liveness, shapes, strides);
@@ -628,73 +810,96 @@ public sealed class GraphTiler
         }
 
         var opNodeMemoAssgin = opNodeMemo.ToDictionary(kv => kv.Key, kv => new OpNodeInfo<long>(kv.Value.Maps, sol.Value(kv.Value.Shapes), sol.Value(kv.Value.Sizes)));
-        var tileNodeMemoAssgin = tileNodeMemo.ToDictionary(kv => kv.Key, kv => new TileNodeInfo<long>(sol.Value(kv.Value.TripCounts), sol.Value(kv.Value.BackWardExtents), kv.Value.DefUseMap, kv.Value.BufferInfoMap.ToDictionary(p => p.Key, p => new TileNodeBufferInfo<long>(p.Value.Liveness, p.Value.Map, sol.Value(p.Value.Places), sol.Value(p.Value.Shapes), sol.Value(p.Value.Sizes), sol.Value(p.Value.Trips), p.Value.Mask))));
+        var tileNodeMemoAssgin = tileNodeMemo.ToDictionary(kv => kv.Key, kv => new TileNodeInfo<long>(sol.Value(kv.Value.TripCounts), sol.Value(kv.Value.BackWardExtents), kv.Value.DefUseMap, kv.Value.BufferInfoMap.ToDictionary(p => p.Key, p => new TileNodeBufferInfo<long>(p.Value.Lifetimes, p.Value.Map, sol.Value(p.Value.Places), sol.Value(p.Value.Shapes), sol.Value(p.Value.Sizes), sol.Value(p.Value.Trips), p.Value.Mask))));
         var tileableNodeMemoAssgin = tileableNodeMemo.ToDictionary(kv => kv.Key, kv => new DomainInfo<long>(sol.Value(kv.Value.TileVars), sol.Value(kv.Value.ForwardExtents), kv.Value.DimsMap));
-        var selectedProducerLevels = new Dictionary<(int ProducerOpId, int ProducerOutputIndex), int>();
+        var selectedMaterializations = new List<TileMaterialization>();
         foreach (var (source, candidates) in internalPlacementCandidates)
         {
-            var selectedLevels = candidates
-                .Where(candidate => candidate.Info.Places.Any(place => sol.Value(place[candidate.Node.Level].Var()) == 1))
-                .Select(candidate => candidate.Node.Level)
-                .Distinct()
+            var selections = candidates
+                .SelectMany(candidate => candidate.Info.Places.SelectMany(
+                    (places, loopEntry) => places.Select(
+                        (place, storageLevel) => (candidate.Node, LoopEntry: loopEntry, StorageLevel: storageLevel, Selected: sol.Value(place.Var())))))
+                .Where(selection => selection.Selected == 1)
                 .ToArray();
-            if (selectedLevels.Length != 1)
+            if (selections.Length != 1)
             {
                 throw new InvalidOperationException(
-                    $"Internal producer result {source} must select exactly one storage level, got [{string.Join(",", selectedLevels)}].");
+                    $"Internal producer result {source} must select exactly one materialization, got {selections.Length}.");
             }
 
-            var producer = (
-                ProducerOpId: source.Node.RegionOpId,
-                ProducerOutputIndex: source.OutputIndex);
-            if (selectedProducerLevels.TryGetValue(producer, out var existingLevel) && existingLevel != selectedLevels[0])
-            {
-                throw new InvalidOperationException(
-                    $"Producer Op{producer.ProducerOpId}.out{producer.ProducerOutputIndex} selected conflicting memory levels {existingLevel} and {selectedLevels[0]}.");
-            }
-
-            selectedProducerLevels[producer] = selectedLevels[0];
+            var (node, loopEntry, storageLevel, _) = selections[0];
+            var uses = internalUsesBySource[source]
+                .OrderBy(use => use.ProducerOpId)
+                .ThenBy(use => use.ProducerOutputIndex)
+                .ThenBy(use => use.ConsumerOpId)
+                .ThenBy(use => use.ConsumerAccessIndex)
+                .ToImmutableArray();
+            var value = new TileValueId(source.Node.RegionOpId, source.OutputIndex);
+            var creationScope = new TileScopeId(GetStableScopeAnchor(node), node.Level);
+            selectedMaterializations.Add(source.Node.TryGetAliasSourceAccess(source.Index, out _)
+                ? new TileAliasMaterialization(value, creationScope, loopEntry, uses)
+                : new TileStorageMaterialization(
+                    value,
+                    creationScope,
+                    loopEntry,
+                    uses,
+                    tilingMemorySpaces[storageLevel].Id));
         }
 
-        var selectedUseLevels = new Dictionary<TileUseId, int>();
-        foreach (var (tileNode, nodeInfo) in tileNodeMemoAssgin)
+        foreach (var group in rootMaterializationEdges
+                     .GroupBy(edge => edge.Source)
+                     .OrderBy(group => group.Key.Node.RegionOpId)
+                     .ThenBy(group => group.Key.OutputIndex))
         {
-            foreach (var (source, sink) in nodeInfo.DefUseMap)
-            {
-                var producer = (
-                    ProducerOpId: source.Node.RegionOpId,
-                    ProducerOutputIndex: source.OutputIndex);
-                if (!selectedProducerLevels.TryGetValue(producer, out var selectedLevel))
-                {
-                    continue;
-                }
-
-                var use = new TileUseId(
-                    source.Node.RegionOpId,
-                    source.OutputIndex,
-                    sink.Node.RegionOpId,
-                    sink.Index);
-                if (selectedUseLevels.TryGetValue(use, out var existingLevel) && existingLevel != selectedLevel)
-                {
-                    throw new InvalidOperationException(
-                        $"Tile use {use} selected conflicting memory levels {existingLevel} and {selectedLevel}.");
-                }
-
-                selectedUseLevels[use] = selectedLevel;
-            }
+            var source = group.Key;
+            var uses = group
+                .Select(edge => new TileUseId(
+                    edge.Source.Node.RegionOpId,
+                    edge.Source.OutputIndex,
+                    edge.Target.Node.RegionOpId,
+                    edge.Target.Index))
+                .OrderBy(use => use.ProducerOpId)
+                .ThenBy(use => use.ProducerOutputIndex)
+                .ThenBy(use => use.ConsumerOpId)
+                .ThenBy(use => use.ConsumerAccessIndex)
+                .ToImmutableArray();
+            selectedMaterializations.Add(new TileRootMaterialization(
+                new TileValueId(source.Node.RegionOpId, source.OutputIndex),
+                new TileScopeId(GetStableScopeAnchor(primTree), primTree.Level),
+                0,
+                uses,
+                MemoryAccessScope.Chip));
         }
 
         if (Diagnostics.DumpScope.Current.IsEnabled(Diagnostics.DumpFlags.Tiling))
         {
-            DumpAssgin(primTree, new TreeSolverPrinter(sol, solver, opNodeMemo, tileNodeMemo, tileableNodeMemo, targetOptions), tileVarConstraints, reductionStateBytes, reductionStateConstraints, eachLevelStoreBufferConstrains, levelBufferLifenessConstraints, levelBufferSizes, levelDataReads, levelDataWrites, levelTransferReads, levelTransferWrites, memoryCycles, transferCycles, computeCycles, synchronizationCycles, totalCyclesVar);
+            DumpAssgin(primTree, new TreeSolverPrinter(sol, solver, opNodeMemo, tileNodeMemo, tileableNodeMemo, targetOptions), tileVarConstraints, reductionStateBytes, reductionStateConstraints, eachLevelStoreBufferConstrains, levelBufferLifetimeConstraints, levelBufferSizes, levelDataReads, levelDataWrites, levelTransferReads, levelTransferWrites, memoryCycles, transferCycles, computeCycles, synchronizationCycles, totalCyclesVar);
 
-            DumpAssgin(primTree, new TreeSolverPythonPrinter(sol, solver, opNodeMemo, tileNodeMemo, tileableNodeMemo, targetOptions), tileVarConstraints, reductionStateBytes, reductionStateConstraints, eachLevelStoreBufferConstrains, levelBufferLifenessConstraints, levelBufferSizes, levelDataReads, levelDataWrites, levelTransferReads, levelTransferWrites, memoryCycles, transferCycles, computeCycles, synchronizationCycles, totalCyclesVar);
+            DumpAssgin(primTree, new TreeSolverPythonPrinter(sol, solver, opNodeMemo, tileNodeMemo, tileableNodeMemo, targetOptions), tileVarConstraints, reductionStateBytes, reductionStateConstraints, eachLevelStoreBufferConstrains, levelBufferLifetimeConstraints, levelBufferSizes, levelDataReads, levelDataWrites, levelTransferReads, levelTransferWrites, memoryCycles, transferCycles, computeCycles, synchronizationCycles, totalCyclesVar);
         }
 
-        return new TreeSolveResult(primBufferGraph, sol.ObjectiveValue(), levelBufferInfos, opNodeMemoAssgin, tileNodeMemoAssgin, tileableNodeMemoAssgin, selectedUseLevels, targetOptions, moduleKind);
+        return new TreeSolveResult(primBufferGraph, sol.ObjectiveValue(), levelBufferInfos, opNodeMemoAssgin, tileNodeMemoAssgin, tileableNodeMemoAssgin, selectedMaterializations, targetOptions, moduleKind);
+
+        static int GetStableScopeAnchor(TileNode node)
+        {
+            var regionOpIds = new List<int>();
+            node.Walk(child =>
+            {
+                if (child is OpNode opNode)
+                {
+                    regionOpIds.Add(opNode.Wrapped.RegionOpId);
+                }
+            });
+            if (regionOpIds.Count == 0)
+            {
+                throw new InvalidOperationException($"Tile scope {node} contains no operations.");
+            }
+
+            return regionOpIds.Contains(node.OpId) ? node.OpId : regionOpIds.Min();
+        }
     }
 
-    public static void DumpAssgin(ITreeNode tree, TreeSolverPythonPrinter printer, Dictionary<OpNode, Constraint[]> tileVarConstraints, Dictionary<OpNode, IntExpr> reductionStateBytes, Dictionary<OpNode, Constraint> reductionStateConstraints, Dictionary<int, Constraint[]> lowestStoreBufferNumsConstrains, Dictionary<int, Constraint[]> levelBufferLifenessConstraints, Dictionary<int, Dictionary<NodeWithBuffer, IntExpr>> levelBufferSizes, IntExpr[] levelDataReads, IntExpr[] levelDataWrites, IntExpr[] levelTransferReads, IntExpr[] levelTransferWrites, IntExpr[] memoryCycles, IntExpr[] transferCycles, IntExpr computeCycles, IntExpr synchronizationCycles, IntVar totalCycles)
+    public static void DumpAssgin(ITreeNode tree, TreeSolverPythonPrinter printer, Dictionary<OpNode, Constraint[]> tileVarConstraints, Dictionary<OpNode, IntExpr> reductionStateBytes, Dictionary<OpNode, Constraint> reductionStateConstraints, Dictionary<int, Constraint[]> lowestStoreBufferNumsConstrains, Dictionary<int, Constraint[]> levelBufferLifetimeConstraints, Dictionary<int, Dictionary<NodeWithBuffer, IntExpr>> levelBufferSizes, IntExpr[] levelDataReads, IntExpr[] levelDataWrites, IntExpr[] levelTransferReads, IntExpr[] levelTransferWrites, IntExpr[] memoryCycles, IntExpr[] transferCycles, IntExpr computeCycles, IntExpr synchronizationCycles, IntVar totalCycles)
     {
         using (var stream = Diagnostics.DumpScope.Current.OpenFile($"modeling.py"))
         {
@@ -704,7 +909,7 @@ public sealed class GraphTiler
         }
     }
 
-    public static void DumpAssgin(ITreeNode tree, TreeSolverPrinter printer, Dictionary<OpNode, Constraint[]> tileVarConstraints, Dictionary<OpNode, IntExpr> reductionStateBytes, Dictionary<OpNode, Constraint> reductionStateConstraints, Dictionary<int, Constraint[]> eachLevelStoreBufferNumsConstrains, Dictionary<int, Constraint[]> levelBufferLifenessConstraints, Dictionary<int, Dictionary<NodeWithBuffer, IntExpr>> levelBufferSizes, IntExpr[] levelDataReads, IntExpr[] levelDataWrites, IntExpr[] levelTransferReads, IntExpr[] levelTransferWrites, IntExpr[] memoryCycles, IntExpr[] transferCycles, IntExpr computeCycles, IntExpr synchronizationCycles, IntVar totalCycles)
+    public static void DumpAssgin(ITreeNode tree, TreeSolverPrinter printer, Dictionary<OpNode, Constraint[]> tileVarConstraints, Dictionary<OpNode, IntExpr> reductionStateBytes, Dictionary<OpNode, Constraint> reductionStateConstraints, Dictionary<int, Constraint[]> eachLevelStoreBufferNumsConstrains, Dictionary<int, Constraint[]> levelBufferLifetimeConstraints, Dictionary<int, Dictionary<NodeWithBuffer, IntExpr>> levelBufferSizes, IntExpr[] levelDataReads, IntExpr[] levelDataWrites, IntExpr[] levelTransferReads, IntExpr[] levelTransferWrites, IntExpr[] memoryCycles, IntExpr[] transferCycles, IntExpr computeCycles, IntExpr synchronizationCycles, IntVar totalCycles)
     {
         using (var stream = Diagnostics.DumpScope.Current.OpenFile($"modeling.yaml"))
         {
@@ -748,9 +953,9 @@ public sealed class GraphTiler
 
             writer.Indent--;
 
-            writer.WriteLine("EachLevelBufferLifenessConstraints:");
+            writer.WriteLine("EachLevelBufferLifetimeConstraints:");
             writer.Indent++;
-            foreach (var (node, cons) in levelBufferLifenessConstraints)
+            foreach (var (node, cons) in levelBufferLifetimeConstraints)
             {
                 TreeSolverPrinter.WriteIntExprVector(writer, node.ToString(), cons, printer.Solution);
             }
@@ -787,7 +992,7 @@ public sealed class GraphTiler
         }
     }
 
-    public (Dictionary<BufferIdentity, Expr> ArgumentMemo, long ObjectValue, Dictionary<TileUseId, int> SelectedUseLevels) SolveRootGraph(TieredTileGraph rootGraph, string moduleKind, INTTTargetOptions targetOptions, DimVar[] dynamicDimVars)
+    public (Dictionary<BufferIdentity, Expr> ArgumentMemo, long ObjectValue, IReadOnlyList<TileMaterialization> Materializations) SolveRootGraph(TieredTileGraph rootGraph, string moduleKind, INTTTargetOptions targetOptions, DimVar[] dynamicDimVars)
     {
         if (Diagnostics.DumpScope.Current.IsEnabled(Diagnostics.DumpFlags.Tiling))
         {
@@ -825,7 +1030,7 @@ public sealed class GraphTiler
         var rootTree = TileNode.FromTileGraph(rootGraph, out var treeGraphMemo);
 
         var argumentMemo = bufferGraphMemo[rootGraph].GetInputsOutputs(null).Inputs.ToDictionary(k => k, k => k.Node.Grid.GetArgument(k.Index));
-        var selectedUseLevels = new Dictionary<TileUseId, int>();
+        var materializations = new List<TileMaterialization>();
         long objectValue = 0;
         foreach (var (primGraph, i) in condensedGraph.TopologicalSort().Select((s, i) => (s, i)))
         {
@@ -843,9 +1048,12 @@ public sealed class GraphTiler
                 continue;
             }
 
-            var funcName = CompileSessionScope.GetCurrentThrowIfNull().GetRequiredService<INamingProvider>().GetName("device_func");
-            using var subSubScope = new Diagnostics.DumpScope(funcName, Diagnostics.DumpFlags.Tiling);
             var primTree = treeGraphMemo[primGraph];
+            var fusionName = TileSemanticNaming.DescribeFusion(primTree);
+            var funcName = CompileSessionScope.GetCurrentThrowIfNull()
+                .GetRequiredService<INamingProvider>()
+                .GetName($"device_{fusionName.Symbol}");
+            using var subSubScope = new Diagnostics.DumpScope(funcName, Diagnostics.DumpFlags.Tiling);
             HashSet<BufferIdentity> inputBids;
             HashSet<BufferIdentity> outputBids;
 
@@ -855,18 +1063,21 @@ public sealed class GraphTiler
                 (inputBids, outputBids) = (result.Inputs, result.Outputs);
                 var inputBidsOrdered = OrderBufferIdentities(inputBids);
                 var outputBidsOrdered = OrderBufferIdentities(outputBids);
-                var maxAlign = result.ScheduleBuffers();
+                var bufferSchedule = result.ScheduleBuffers();
                 var bodyBuilder = T.Sequential();
                 var initOffsets = Enumerable.Repeat(new DimConst(0), primTree.DomainBoundExprs.Length).ToArray();
                 var initBounds = primTree.DomainBoundExprs.ToArray();
                 result.Visit(primTree, new(bodyBuilder, initOffsets, initBounds));
+                var body = bodyBuilder.Build().With(traceScopeName: fusionName.TraceName);
+                TileLoweringVerifier.Verify(body, funcName);
                 var parameters = inputBidsOrdered.Select(k => result.InputOutputVars[k]).Concat(
-                    dynamicDimVars.Select(v => (IVar)v.With())).Concat(
+                    result.RootParameterBindings.Select(binding => (IVar)binding.Parameter)).Concat(
+                    dynamicDimVars.Select(v => (IVar)v)).Concat(
                     result.OutputParameters).ToArray();
                 var primFunc = new PrimFunction(
                     funcName,
                     moduleKind,
-                    bodyBuilder.Build(),
+                    body,
                     new Return(outputBidsOrdered.Select(bid => result.OutputValues[bid]).ToArray()),
                     parameters)
                 {
@@ -880,18 +1091,20 @@ public sealed class GraphTiler
                 }
 
                 primFunc.SchedResult.IsScheduled = true; // avoid buffersize pass schedule it again.
-                primFunc.SchedResult.DataAlign = (ulong)maxAlign;
+                PublishScheduledDataPools(primFunc.SchedResult, bufferSchedule);
                 var typeHints = inputBidsOrdered.Select(bid => bid.Node.Grid.GetArgument(bid.Index).CheckedType)
+                    .Concat(result.RootParameterBindings.Select(binding => binding.Argument.CheckedType))
                     .Concat(dynamicDimVars.Select(v => new DimensionType(DimensionKind.Dynamic)))
                     .Concat(result.OutputParameters.Select(parameter => parameter.CheckedType))
                     .ToArray();
                 tiled = new(
                     new PrimFunctionWrapper(
                         primFunc,
-                        inputBidsOrdered.Length + dynamicDimVars.Length,
+                        inputBidsOrdered.Length + result.RootParameterBindings.Count + dynamicDimVars.Length,
                         typeHints),
                     result.ObjectiveValue,
-                    CanonicalizeSelectedUseLevels(primTree, result.SelectedUseLevels));
+                    CanonicalizeMaterializations(primTree, result.Materializations),
+                    CanonicalizeRootParameters(primTree, result.RootParameterBindings));
                 SolveMemo.Add(primTree, tiled);
             }
             else
@@ -902,18 +1115,14 @@ public sealed class GraphTiler
             var orderedInputBids = OrderBufferIdentities(inputBids);
             var orderedOutputBids = OrderBufferIdentities(outputBids);
             objectValue += tiled.ObjectValue;
-            foreach (var (use, level) in MaterializeSelectedUseLevels(primTree, tiled.SelectedUseLevels))
-            {
-                if (selectedUseLevels.TryGetValue(use, out var existingLevel) && existingLevel != level)
-                {
-                    throw new InvalidOperationException(
-                        $"Tile use {use} selected conflicting levels {existingLevel} and {level} across solved components.");
-                }
+            materializations.AddRange(MaterializeMaterializations(primTree, tiled.Materializations));
 
-                selectedUseLevels[use] = level;
-            }
-
-            var finalCall = new Call(tiled.Func, orderedInputBids.Select(bid => argumentMemo[bid]).Concat(dynamicDimVars.OfType<BaseExpr>()).ToArray());
+            var finalCall = new Call(
+                tiled.Func,
+                orderedInputBids.Select(bid => argumentMemo[bid])
+                    .Concat(MaterializeRootArguments(primTree, tiled.RootParameters))
+                    .Concat(dynamicDimVars.OfType<BaseExpr>())
+                    .ToArray());
             var componentOutputs = orderedOutputBids.Length == 1
                 ? new Expr[] { finalCall }
                 : orderedOutputBids.Select((_, outputIndex) => IR.F.Tensors.GetItem(finalCall, outputIndex)).ToArray();
@@ -924,7 +1133,7 @@ public sealed class GraphTiler
                 argumentMemo);
         }
 
-        return (argumentMemo, objectValue, selectedUseLevels);
+        return (argumentMemo, objectValue, materializations);
     }
 
     public BaseExpr Tile(BaseExpr preExpr, string moduleKind, INTTTargetOptions targetOptions, DimVar[] dynamicDimVars)
@@ -991,11 +1200,41 @@ public sealed class GraphTiler
         return cloner.Clone(preExpr, default);
     }
 
-    private static bool IsAliasOnlyComponent(TieredTileGraph graph)
+    private static void PublishScheduledDataPools(
+        SchedFunctionResult scheduleResult,
+        TileBufferScheduleResult bufferSchedule)
     {
-        var vertices = graph.Vertices.ToArray();
-        return vertices.Length != 0 && vertices.All(vertex => vertex.IsPureBufferView);
+        foreach (var pool in bufferSchedule.Pools.Where(pool => pool.AllocationBytes != 0))
+        {
+            if (pool.Binding.Hierarchy != 0 &&
+                pool.Binding.Location is MemoryLocation.Data or MemoryLocation.ChipLocalData or MemoryLocation.BlockLocalData)
+            {
+                throw new InvalidOperationException(
+                    $"Externally allocated data pool {pool.MemorySpace} uses unsupported TIR hierarchy {pool.Binding.Hierarchy}.");
+            }
+
+            var bytes = checked((ulong)pool.AllocationBytes);
+            switch (pool.Binding.Location)
+            {
+                case MemoryLocation.Data:
+                    scheduleResult.DataUsage = Math.Max(scheduleResult.DataUsage, bytes);
+                    break;
+                case MemoryLocation.ChipLocalData:
+                    scheduleResult.ChipLocalDataPoolSize = Math.Max(scheduleResult.ChipLocalDataPoolSize, bytes);
+                    break;
+                case MemoryLocation.BlockLocalData:
+                    scheduleResult.BlockLocalDataPoolSize = Math.Max(scheduleResult.BlockLocalDataPoolSize, bytes);
+                    break;
+                default:
+                    continue;
+            }
+
+            scheduleResult.DataAlign = Math.Max(scheduleResult.DataAlign, checked((ulong)pool.Alignment));
+        }
     }
+
+    private static bool IsAliasOnlyComponent(TieredTileGraph graph)
+        => graph.IsPureBufferViewScope();
 
     private static Expr[] CreateResidualAliasOutputs(
         IReadOnlyList<BufferIdentity> inputBids,
@@ -1070,7 +1309,7 @@ public sealed class GraphTiler
             var outputValue = outputValues[outputIndex];
             argumentMemo.Add(outputBid, outputValue);
             foreach (var sinkBid in rootBufferGraph.OutEdges(outputBid)
-                .Where(edge => edge.Tag is BufferEdgeKind.Inter)
+                .Where(edge => edge.Tag is BufferEdgeKind.Inter or BufferEdgeKind.RootMaterialization)
                 .Select(edge => edge.Target))
             {
                 argumentMemo.TryAdd(sinkBid, outputValue);
@@ -1226,7 +1465,7 @@ public sealed class GraphTiler
     private static bool IsVectorDataType(DataType dataType)
         => dataType is VectorType;
 
-    private static void DumpGantt(Dictionary<NodeWithBuffer, IntExpr> nodeBufferSizes, Dictionary<NodeWithBuffer, Tuple<int, int>> nodeBufferLiveness, TileNode primTree, int storeLevel)
+    private static void DumpGantt(Dictionary<NodeWithBuffer, IntExpr> nodeBufferSizes, Dictionary<NodeWithBuffer, TileLifetime> nodeBufferLifetimes, TileNode primTree, int storeLevel)
     {
         string GetStartStr(string name, int start) => $"[{name}] starts D+{start}";
         string GetDurationStr(string name, int duration) => $"[{name}] requires {duration} days";
@@ -1237,11 +1476,11 @@ public sealed class GraphTiler
             writer.WriteLine("@startgantt");
             writer.WriteLine("printscale daily zoom 10");
 
-            foreach (var ((node, bid), liveness) in nodeBufferLiveness)
+            foreach (var ((node, bid), lifetime) in nodeBufferLifetimes)
             {
                 var name = $"cl{node.Level} op{bid.Node.OpId} {bid.Index}";
-                writer.WriteLine(GetDurationStr(name, liveness.Item2 - liveness.Item1));
-                writer.WriteLine(GetStartStr(name, liveness.Item1));
+                writer.WriteLine(GetDurationStr(name, lifetime.PhaseCount));
+                writer.WriteLine(GetStartStr(name, lifetime.FirstPhase));
             }
 
             writer.WriteLine("@endgantt");
@@ -1251,70 +1490,174 @@ public sealed class GraphTiler
 
     private static bool IsObjectBuffer(BufferIdentity bid) => bid.Access.Buffer.CheckedDataType is ReferenceType;
 
-    private static IReadOnlyDictionary<CanonicalTileUseId, int> CanonicalizeSelectedUseLevels(
+    private static IReadOnlyList<CanonicalTileMaterialization> CanonicalizeMaterializations(
         TileNode tree,
-        IReadOnlyDictionary<TileUseId, int> selectedUseLevels)
+        IReadOnlyList<TileMaterialization> materializations)
     {
         var ordinals = GetRegionOpIds(tree)
             .Select((regionOpId, ordinal) => (regionOpId, ordinal))
             .ToDictionary(item => item.regionOpId, item => item.ordinal);
-        var canonical = new Dictionary<CanonicalTileUseId, int>();
-        foreach (var (use, level) in selectedUseLevels)
+        return materializations.Select<TileMaterialization, CanonicalTileMaterialization>(materialization =>
+        {
+            if (!ordinals.TryGetValue(materialization.Value.ProducerOpId, out var producerOrdinal) ||
+                !ordinals.TryGetValue(materialization.CreationScope.AnchorOpId, out var creationAnchorOrdinal))
+            {
+                throw new InvalidOperationException(
+                    $"Selected tile materialization {materialization.Value} at {materialization.CreationScope} does not belong to the solved component.");
+            }
+
+            var value = new CanonicalTileValueId(producerOrdinal, materialization.Value.ProducerOutputIndex);
+            var uses = materialization.Uses.Select(use => CanonicalizeUse(use, ordinals)).ToImmutableArray();
+            return materialization switch
+            {
+                TileStorageMaterialization storage => new CanonicalTileStorageMaterialization(
+                    value,
+                    creationAnchorOrdinal,
+                    materialization.CreationScope.Level,
+                    materialization.LoopEntry,
+                    uses,
+                    storage.StorageSpace),
+                TileAliasMaterialization => new CanonicalTileAliasMaterialization(
+                    value,
+                    creationAnchorOrdinal,
+                    materialization.CreationScope.Level,
+                    materialization.LoopEntry,
+                    uses),
+                TileRootMaterialization root => new CanonicalTileRootMaterialization(
+                    value,
+                    creationAnchorOrdinal,
+                    materialization.CreationScope.Level,
+                    materialization.LoopEntry,
+                    uses,
+                    root.RequiredMemoryScope),
+                _ => throw new InvalidOperationException(
+                    $"Unknown tile materialization {materialization.GetType().Name}."),
+            };
+        }).ToArray();
+
+        static CanonicalTileUseId CanonicalizeUse(TileUseId use, IReadOnlyDictionary<int, int> ordinals)
         {
             if (!ordinals.TryGetValue(use.ProducerOpId, out var producerOrdinal) ||
                 !ordinals.TryGetValue(use.ConsumerOpId, out var consumerOrdinal))
             {
-                throw new InvalidOperationException(
-                    $"Selected tile use {use} does not belong to the solved component.");
+                throw new InvalidOperationException($"Selected tile use {use} does not belong to the solved component.");
             }
 
-            var canonicalUse = new CanonicalTileUseId(
+            return new CanonicalTileUseId(
                 producerOrdinal,
                 use.ProducerOutputIndex,
                 consumerOrdinal,
                 use.ConsumerAccessIndex);
-            if (canonical.TryGetValue(canonicalUse, out var existingLevel) && existingLevel != level)
-            {
-                throw new InvalidOperationException(
-                    $"Canonical tile use {canonicalUse} selected conflicting levels {existingLevel} and {level}.");
-            }
-
-            canonical[canonicalUse] = level;
         }
-
-        return canonical;
     }
 
-    private static IReadOnlyDictionary<TileUseId, int> MaterializeSelectedUseLevels(
+    private static IReadOnlyList<CanonicalTileValueId> CanonicalizeRootParameters(
         TileNode tree,
-        IReadOnlyDictionary<CanonicalTileUseId, int> selectedUseLevels)
+        IReadOnlyList<TileRootParameterBinding> bindings)
     {
-        var regionOpIds = GetRegionOpIds(tree);
-        var materialized = new Dictionary<TileUseId, int>();
-        foreach (var (use, level) in selectedUseLevels)
+        var ordinals = GetRegionOpIds(tree)
+            .Select((regionOpId, ordinal) => (regionOpId, ordinal))
+            .ToDictionary(item => item.regionOpId, item => item.ordinal);
+        return bindings.Select(binding =>
         {
-            if ((uint)use.ProducerOrdinal >= (uint)regionOpIds.Count ||
-                (uint)use.ConsumerOrdinal >= (uint)regionOpIds.Count)
+            if (!ordinals.TryGetValue(binding.Source.Node.RegionOpId, out var producerOrdinal))
             {
                 throw new InvalidOperationException(
-                    $"Canonical tile use {use} is incompatible with a component containing {regionOpIds.Count} operations.");
+                    $"Root parameter source {binding.Source} does not belong to the solved component.");
             }
 
-            var materializedUse = new TileUseId(
+            return new CanonicalTileValueId(producerOrdinal, binding.Source.OutputIndex);
+        }).ToArray();
+    }
+
+    private static IReadOnlyList<Expr> MaterializeRootArguments(
+        TileNode tree,
+        IReadOnlyList<CanonicalTileValueId> parameters)
+    {
+        var regionOpIds = GetRegionOpIds(tree);
+        var opNodes = new List<OpNode>();
+        tree.Walk(node =>
+        {
+            if (node is OpNode opNode)
+            {
+                opNodes.Add(opNode);
+            }
+        });
+
+        return parameters.Select(parameter =>
+        {
+            if ((uint)parameter.ProducerOrdinal >= (uint)regionOpIds.Count)
+            {
+                throw new InvalidOperationException(
+                    $"Root parameter {parameter} is incompatible with a component containing {regionOpIds.Count} operations.");
+            }
+
+            var regionOpId = regionOpIds[parameter.ProducerOrdinal];
+            var producer = opNodes.Single(node => node.Wrapped.RegionOpId == regionOpId);
+            var accessIndex = producer.Wrapped.GetWriteAccessIndex(parameter.ProducerOutputIndex);
+            return producer.Wrapped.Grid.Accesses[accessIndex].Buffer;
+        }).ToArray();
+    }
+
+    private static IReadOnlyList<TileMaterialization> MaterializeMaterializations(
+        TileNode tree,
+        IReadOnlyList<CanonicalTileMaterialization> materializations)
+    {
+        var regionOpIds = GetRegionOpIds(tree);
+        return materializations.Select<CanonicalTileMaterialization, TileMaterialization>(materialization =>
+        {
+            ValidateOrdinal(materialization.Value.ProducerOrdinal, regionOpIds.Count, materialization.Value.ToString());
+            ValidateOrdinal(materialization.CreationAnchorOrdinal, regionOpIds.Count, materialization.ToString());
+            var value = new TileValueId(
+                regionOpIds[materialization.Value.ProducerOrdinal],
+                materialization.Value.ProducerOutputIndex);
+            var creationScope = new TileScopeId(
+                regionOpIds[materialization.CreationAnchorOrdinal],
+                materialization.CreationLevel);
+            var uses = materialization.Uses.Select(use => MaterializeUse(use, regionOpIds)).ToImmutableArray();
+            return materialization switch
+            {
+                CanonicalTileStorageMaterialization storage => new TileStorageMaterialization(
+                    value,
+                    creationScope,
+                    materialization.LoopEntry,
+                    uses,
+                    storage.StorageSpace),
+                CanonicalTileAliasMaterialization => new TileAliasMaterialization(
+                    value,
+                    creationScope,
+                    materialization.LoopEntry,
+                    uses),
+                CanonicalTileRootMaterialization root => new TileRootMaterialization(
+                    value,
+                    creationScope,
+                    materialization.LoopEntry,
+                    uses,
+                    root.RequiredMemoryScope),
+                _ => throw new InvalidOperationException(
+                    $"Unknown canonical tile materialization {materialization.GetType().Name}."),
+            };
+        }).ToArray();
+
+        static TileUseId MaterializeUse(CanonicalTileUseId use, IReadOnlyList<int> regionOpIds)
+        {
+            ValidateOrdinal(use.ProducerOrdinal, regionOpIds.Count, use.ToString());
+            ValidateOrdinal(use.ConsumerOrdinal, regionOpIds.Count, use.ToString());
+            return new TileUseId(
                 regionOpIds[use.ProducerOrdinal],
                 use.ProducerOutputIndex,
                 regionOpIds[use.ConsumerOrdinal],
                 use.ConsumerAccessIndex);
-            if (materialized.TryGetValue(materializedUse, out var existingLevel) && existingLevel != level)
-            {
-                throw new InvalidOperationException(
-                    $"Tile use {materializedUse} selected conflicting levels {existingLevel} and {level} after component remapping.");
-            }
-
-            materialized[materializedUse] = level;
         }
 
-        return materialized;
+        static void ValidateOrdinal(int ordinal, int count, string owner)
+        {
+            if ((uint)ordinal >= (uint)count)
+            {
+                throw new InvalidOperationException(
+                    $"Canonical tile identity {owner} is incompatible with a component containing {count} operations.");
+            }
+        }
     }
 
     private static IReadOnlyList<int> GetRegionOpIds(TileNode tree)
@@ -1350,10 +1693,46 @@ public sealed class GraphTiler
         int ConsumerOrdinal,
         int ConsumerAccessIndex);
 
+    public readonly record struct CanonicalTileValueId(int ProducerOrdinal, int ProducerOutputIndex);
+
+    public abstract record CanonicalTileMaterialization(
+        CanonicalTileValueId Value,
+        int CreationAnchorOrdinal,
+        int CreationLevel,
+        int LoopEntry,
+        ImmutableArray<CanonicalTileUseId> Uses);
+
+    public sealed record CanonicalTileStorageMaterialization(
+        CanonicalTileValueId Value,
+        int CreationAnchorOrdinal,
+        int CreationLevel,
+        int LoopEntry,
+        ImmutableArray<CanonicalTileUseId> Uses,
+        TargetMemorySpaceId StorageSpace)
+        : CanonicalTileMaterialization(Value, CreationAnchorOrdinal, CreationLevel, LoopEntry, Uses);
+
+    public sealed record CanonicalTileAliasMaterialization(
+        CanonicalTileValueId Value,
+        int CreationAnchorOrdinal,
+        int CreationLevel,
+        int LoopEntry,
+        ImmutableArray<CanonicalTileUseId> Uses)
+        : CanonicalTileMaterialization(Value, CreationAnchorOrdinal, CreationLevel, LoopEntry, Uses);
+
+    public sealed record CanonicalTileRootMaterialization(
+        CanonicalTileValueId Value,
+        int CreationAnchorOrdinal,
+        int CreationLevel,
+        int LoopEntry,
+        ImmutableArray<CanonicalTileUseId> Uses,
+        MemoryAccessScope RequiredMemoryScope)
+        : CanonicalTileMaterialization(Value, CreationAnchorOrdinal, CreationLevel, LoopEntry, Uses);
+
     public sealed record TiledFunc(
         PrimFunctionWrapper Func,
         long ObjectValue,
-        IReadOnlyDictionary<CanonicalTileUseId, int> SelectedUseLevels)
+        IReadOnlyList<CanonicalTileMaterialization> Materializations,
+        IReadOnlyList<CanonicalTileValueId> RootParameters)
     {
     }
 
