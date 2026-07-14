@@ -151,7 +151,7 @@ def _render_kernel(kernel: dict[str, Any]) -> str:
             f"exceeding target capacity {shared_memory_capacity_bytes}."
         )
     hidden_device_parameters = (
-        ("pyntt_shared_base",) if shared_allocation_bytes > 0 else ()
+        ("pyntt_shared_arena",) if shared_allocation_bytes > 0 else ()
     )
     device_functions = _prepare_device_functions(
         raw_device_functions,
@@ -325,7 +325,7 @@ def _render_helper_sources(
     helper_sources = []
     for helper in helpers:
         model = dict(helper["model"])
-        model["NoInline"] = bool(helper.get("noinline", noinline))
+        model["NoInline"] = bool(noinline) and not bool(helper["requires_inline"])
         arguments = tuple(helper.get("arguments", ()) or ())
         if arguments:
             model["Arguments"] = arguments
@@ -448,9 +448,8 @@ def _with_shared_memory_prelude(
         return source
     prelude = "\n".join(
         (
-            f"pyntt_shared_storage = tle.gpu.alloc([{shared_size_bytes}], dtype=tl.uint8, "
+            f"pyntt_shared_arena = tle.gpu.alloc([{shared_size_bytes}], dtype=tl.uint8, "
             "layout=None, scope=tle.gpu.smem, nv_mma_shared_layout=False)",
-            "pyntt_shared_base = tle.gpu.local_ptr(pyntt_shared_storage, (0,))",
         )
     )
     source = source.rstrip()
@@ -691,6 +690,94 @@ def _ptr(model: dict[str, Any], name: str) -> str:
     return str(value)
 
 
+def _append_pointer_binding(
+    lines: list[str],
+    level: int,
+    model: dict[str, Any],
+    local_name: str,
+    model_name: str,
+) -> None:
+    if _local_buffer(model[model_name]) is None:
+        _line(lines, level, f"{local_name} = {_ptr(model, model_name)}")
+
+
+def _append_pointer_value_binding(
+    lines: list[str],
+    level: int,
+    pointer: Any,
+    local_name: str,
+) -> None:
+    if _local_buffer(pointer) is None:
+        expression = pointer.get("Expression", pointer.get("expression"))
+        _line(lines, level, f"{local_name} = {expression}")
+
+
+def _local_buffer(pointer: Any) -> dict[str, Any] | None:
+    if not isinstance(pointer, dict):
+        return None
+    value = pointer.get("LocalBuffer", pointer.get("local_buffer"))
+    return value if isinstance(value, dict) else None
+
+
+def _local_buffer_value(buffer: dict[str, Any], name: str) -> Any:
+    snake_name = "".join(
+        f"_{character.lower()}" if character.isupper() else character
+        for character in name
+    ).lstrip("_")
+    return buffer.get(name, buffer.get(snake_name))
+
+
+def _local_pointer(pointer: Any, scalar_offset: str = "0") -> str | None:
+    buffer = _local_buffer(pointer)
+    if buffer is None:
+        return None
+    descriptor = _local_buffer_value(buffer, "DescriptorExpression")
+    descriptor_shape = tuple(
+        int(value) for value in (_local_buffer_value(buffer, "DescriptorShape") or ())
+    )
+    base_offset = str(_local_buffer_value(buffer, "BaseScalarOffset") or "0")
+    if not descriptor or not descriptor_shape or any(value <= 0 for value in descriptor_shape):
+        raise ValueError("PyNTT local buffer requires a descriptor and a positive physical shape")
+
+    if scalar_offset == "0":
+        total_offset = base_offset
+    elif base_offset == "0":
+        total_offset = scalar_offset
+    else:
+        total_offset = f"({base_offset}) + ({scalar_offset})"
+
+    indices = []
+    inner_stride = math.prod(descriptor_shape)
+    for axis, extent in enumerate(descriptor_shape):
+        inner_stride //= extent
+        index = total_offset if inner_stride == 1 else f"(({total_offset}) // {inner_stride})"
+        if axis != 0:
+            index = f"({index}) % {extent}"
+        indices.append(index)
+    suffix = "," if len(indices) == 1 else ""
+    return f"tle.gpu.local_ptr({descriptor}, ({', '.join(indices)}{suffix}))"
+
+
+def _access_pointer(
+    model: dict[str, Any],
+    name: str,
+    local_name: str,
+    scalar_offset: str = "0",
+) -> str:
+    return _access_pointer_value(model[name], local_name, scalar_offset)
+
+
+def _access_pointer_value(
+    pointer: Any,
+    local_name: str,
+    scalar_offset: str = "0",
+) -> str:
+    local_pointer = _local_pointer(pointer, scalar_offset)
+    if local_pointer is not None:
+        return local_pointer
+    return local_name if scalar_offset == "0" else f"{local_name} + {scalar_offset}"
+
+
 def _load_operand(
     model: dict[str, Any],
     name: str,
@@ -701,7 +788,8 @@ def _load_operand(
     other: str = "0.0",
     suffix: str = "",
 ) -> str:
-    return f"tl.load({local_name} + {offsets}, mask={mask}, other={other}{suffix})"
+    pointer = _access_pointer(model, name, local_name, offsets)
+    return f"tl.load({pointer}, mask={mask}, other={other}{suffix})"
 
 
 def _load_operand_nd(
@@ -715,18 +803,22 @@ def _load_operand_nd(
     other: str = "0.0",
     suffix: str = "",
 ) -> str:
-    return f"tl.load({local_name} + {offsets}, mask={mask}, other={other}{suffix})"
+    pointer = _access_pointer(model, name, local_name, offsets)
+    return f"tl.load({pointer}, mask={mask}, other={other}{suffix})"
 
 
 def _append_store(
     lines: list[str],
     level: int,
+    model: dict[str, Any],
+    name: str,
     local_name: str,
     offsets: str,
     value: str,
     mask: str,
 ) -> None:
-    _line(lines, level, f"tl.store({local_name} + {offsets}, {value}, mask={mask})")
+    pointer = _access_pointer(model, name, local_name, offsets)
+    _line(lines, level, f"tl.store({pointer}, {value}, mask={mask})")
 
 
 def _pointer_shard_coord_hierarchy(pointer: Any) -> tuple[int, ...] | None:
@@ -941,7 +1033,7 @@ def _standard_header(model: dict[str, Any], comment: str, pointers: list[tuple[s
         [model[model_name] for _, model_name in pointers],
     )
     for local_name, model_name in pointers:
-        _line(lines, 1, f"{local_name} = {_ptr(model, model_name)}")
+        _append_pointer_binding(lines, 1, model, local_name, model_name)
     return lines
 
 
@@ -1005,6 +1097,8 @@ def _emit_elementwise_unary(model: dict[str, Any]) -> str:
     _append_store(
         lines,
         indent,
+        model,
+        "Output",
         "output",
         "output_offsets",
         _store_value("result", model["OutputDType"]),
@@ -1057,6 +1151,8 @@ def _emit_elementwise_binary(model: dict[str, Any]) -> str:
     _append_store(
         lines,
         indent,
+        model,
+        "Output",
         "output",
         "output_offsets",
         _store_value("result", model["OutputDType"]),
@@ -1098,6 +1194,8 @@ def _emit_elementwise_cast(model: dict[str, Any]) -> str:
     _append_store(
         lines,
         indent,
+        model,
+        "Output",
         "output",
         "output_offsets",
         _store_value("result", model["OutputDType"]),
@@ -1141,6 +1239,8 @@ def _emit_memcopy(model: dict[str, Any]) -> str:
     _append_store(
         lines,
         indent,
+        model,
+        "Destination",
         "destination",
         "destination_offsets",
         "value",
@@ -1149,15 +1249,223 @@ def _emit_memcopy(model: dict[str, Any]) -> str:
     return _finish(lines)
 
 
+def _constant_dim_value(value: Any) -> int | None:
+    fixed = _fixed(value)
+    if fixed is not None:
+        return fixed
+    minimum = _min_value(value)
+    maximum = _max_value(value)
+    return minimum if minimum is not None and minimum == maximum else None
+
+
+def _is_compact_region(shape: list[int], strides: list[int]) -> bool:
+    if len(shape) != len(strides):
+        return False
+    expected_stride = 1
+    for extent, stride in zip(reversed(shape), reversed(strides)):
+        if extent <= 0 or (extent > 1 and stride != expected_stride):
+            return False
+        expected_stride *= extent
+    return True
+
+
+def _region_copy_tle_plan(model: dict[str, Any]) -> dict[str, Any] | None:
+    operation = model.get("OperationKind", model.get("operation_kind"))
+    if operation == "TileLoad":
+        local_name = "destination"
+        local_model_name = "Destination"
+        global_name = "source"
+        global_model_name = "Source"
+    elif operation == "TileStore":
+        local_name = "source"
+        local_model_name = "Source"
+        global_name = "destination"
+        global_model_name = "Destination"
+    else:
+        return None
+    if model.get("RegionsCoincident", model.get("regions_coincident")) is not True:
+        return None
+
+    local_pointer = model[local_model_name]
+    global_pointer = model[global_model_name]
+    local_buffer = _local_buffer(local_pointer)
+    if local_buffer is None:
+        return None
+    if int(local_pointer.get("AddressSpace", 1)) != 3 or int(global_pointer.get("AddressSpace", 1)) != 1:
+        return None
+
+    local_shape = model[f"{local_model_name}Shape"]
+    local_shape_values = [_constant_dim_value(dimension) for dimension in local_shape]
+    if any(dimension is None or dimension <= 0 for dimension in local_shape_values):
+        return None
+    static_shape = [int(dimension) for dimension in local_shape_values]
+    local_strides = [_constant_dim_value(value) for value in model[f"{local_model_name}Strides"]]
+    global_strides = [_constant_dim_value(value) for value in model[f"{global_model_name}Strides"]]
+    if any(stride is None for stride in local_strides + global_strides):
+        return None
+    if not _is_compact_region(static_shape, [int(stride) for stride in local_strides]):
+        return None
+    if not _is_compact_region(static_shape, [int(stride) for stride in global_strides]):
+        return None
+
+    descriptor_shape = tuple(
+        int(value)
+        for value in (_local_buffer_value(local_buffer, "DescriptorShape") or ())
+    )
+    base_scalar_offset = str(
+        _local_buffer_value(local_buffer, "BaseScalarOffset") or "0"
+    )
+    scalar_capacity = math.prod(static_shape) * int(model["VectorLaneCount"])
+    scalar_element_size = int(
+        _local_buffer_value(local_buffer, "ScalarElementSizeBytes") or 0
+    )
+    available_bytes = int(_local_buffer_value(local_buffer, "AvailableBytes") or 0)
+    required_bytes = scalar_capacity * scalar_element_size
+    if (
+        scalar_capacity <= 0
+        or not descriptor_shape
+        or any(
+            extent <= 0 or extent & (extent - 1) != 0
+            for extent in descriptor_shape
+        )
+        or math.prod(descriptor_shape) != scalar_capacity
+        or base_scalar_offset != "0"
+        or scalar_element_size <= 0
+        or required_bytes > available_bytes
+    ):
+        return None
+
+    return {
+        "local_name": local_name,
+        "local_model_name": local_model_name,
+        "global_name": global_name,
+        "global_model_name": global_model_name,
+        "local_buffer": local_buffer,
+        "static_shape": static_shape,
+        "descriptor_shape": descriptor_shape,
+        "scalar_capacity": scalar_capacity,
+    }
+
+
+def _append_tle_region_copy(
+    lines: list[str],
+    level: int,
+    model: dict[str, Any],
+    plan: dict[str, Any],
+) -> None:
+    descriptor_shape = plan["descriptor_shape"]
+    lane_count = int(model["VectorLaneCount"])
+    global_model_name = plan["global_model_name"]
+    global_name = plan["global_name"]
+    local_buffer = plan["local_buffer"]
+    local_descriptor = _local_buffer_value(local_buffer, "DescriptorExpression")
+    if not local_descriptor:
+        raise ValueError("TensorRegionCopy local buffer is missing DescriptorExpression")
+
+    for axis, extent in enumerate(descriptor_shape):
+        if len(descriptor_shape) == 1:
+            expanded_index = f"tl.arange(0, {extent})"
+        else:
+            suffix = f"[{', '.join(':' if position == axis else 'None' for position in range(len(descriptor_shape)))}]"
+            expanded_index = f"tl.arange(0, {extent}){suffix}"
+        _line(lines, level, f"copy_desc_idx{axis} = {expanded_index}")
+
+    linear_terms = []
+    inner_stride = math.prod(descriptor_shape)
+    for axis, extent in enumerate(descriptor_shape):
+        inner_stride //= extent
+        term = f"copy_desc_idx{axis}"
+        if inner_stride != 1:
+            term = f"{term} * {inner_stride}"
+        linear_terms.append(term)
+    _line(lines, level, f"copy_linear = {' + '.join(linear_terms)}")
+    if lane_count == 1:
+        _line(lines, level, "copy_tensor_linear = copy_linear")
+        _line(lines, level, "copy_vector_lane = copy_linear * 0")
+    else:
+        _line(lines, level, f"copy_tensor_linear = copy_linear // {lane_count}")
+        _line(lines, level, f"copy_vector_lane = copy_linear % {lane_count}")
+    _line(lines, level, "copy_remaining = copy_tensor_linear")
+    for axis in range(len(plan["static_shape"]) - 1, -1, -1):
+        _line(lines, level, f"copy_idx{axis} = copy_remaining % {plan['static_shape'][axis]}")
+        _line(lines, level, f"copy_remaining = copy_remaining // {plan['static_shape'][axis]}")
+
+    global_base = f"{global_name}_base"
+    global_terms = [
+        f"({global_base}{axis} + copy_idx{axis}) * {_dim(model[f'{global_model_name}Strides'][axis])}"
+        for axis in range(len(plan["static_shape"]))
+    ]
+    global_offset = "copy_tensor_linear * 0" if not global_terms else " + ".join(global_terms)
+    if lane_count != 1:
+        global_offset = f"(({global_offset}) * {lane_count} + copy_vector_lane)"
+    _line(lines, level, f"copy_global_offset = {global_offset}")
+    copy_shape = f"[{', '.join(str(extent) for extent in descriptor_shape)}]"
+    if plan["local_model_name"] == "Destination":
+        _line(lines, level, f"tle.gpu.copy({global_name} + copy_global_offset, {local_descriptor}, {copy_shape})")
+    else:
+        _line(lines, level, f"tle.gpu.copy({local_descriptor}, {global_name} + copy_global_offset, {copy_shape})")
+
+
+def _append_region_copy_fallback(
+    lines: list[str],
+    level: int,
+    model: dict[str, Any],
+) -> None:
+    rank = len(model["SourceShape"])
+    dimensions = [f"(copy_dim{axis})" for axis in range(rank)]
+    dimensions.append(f"({model['VectorLaneCount']})")
+    total = " * ".join(dimensions)
+    _line(lines, level, f"for linear_start in tl.range(0, {total}, block_size):")
+    body_level = level + 1
+    _line(lines, body_level, "linear = linear_start + tl.arange(0, block_size)")
+    _line(lines, body_level, f"mask = linear < {total}")
+    if model["VectorLaneCount"] == 1:
+        _line(lines, body_level, "tensor_linear = linear")
+        _line(lines, body_level, "vector_lane = linear * 0")
+    else:
+        _line(lines, body_level, f"tensor_linear = linear // {model['VectorLaneCount']}")
+        _line(lines, body_level, f"vector_lane = linear % {model['VectorLaneCount']}")
+    _line(lines, body_level, "remaining = tensor_linear")
+    for axis in range(rank - 1, -1, -1):
+        _line(lines, body_level, f"idx{axis} = remaining % copy_dim{axis}")
+        _line(lines, body_level, f"remaining = remaining // copy_dim{axis}")
+
+    source_terms = [
+        f"(source_base{axis} + idx{axis}) * {_dim(model['SourceStrides'][axis])}"
+        for axis in range(rank)
+    ]
+    destination_terms = [
+        f"(destination_base{axis} + idx{axis}) * {_dim(model['DestinationStrides'][axis])}"
+        for axis in range(rank)
+    ]
+    source_offset = "tensor_linear * 0" if not source_terms else " + ".join(source_terms)
+    destination_offset = "tensor_linear * 0" if not destination_terms else " + ".join(destination_terms)
+    if model["VectorLaneCount"] != 1:
+        source_offset = f"(({source_offset}) * {model['VectorLaneCount']} + vector_lane)"
+        destination_offset = f"(({destination_offset}) * {model['VectorLaneCount']} + vector_lane)"
+    _line(lines, body_level, f"source_offset = {source_offset}")
+    _line(lines, body_level, f"destination_offset = {destination_offset}")
+    source_pointer = _access_pointer(model, "Source", "source", "source_offset")
+    destination_pointer = _access_pointer(
+        model, "Destination", "destination", "destination_offset"
+    )
+    _line(lines, body_level, f"value = tl.load({source_pointer}, mask=mask)")
+    _line(lines, body_level, f"tl.store({destination_pointer}, value, mask=mask)")
+
+
 def _emit_tensor_region_copy(model: dict[str, Any]) -> str:
     rank = len(model["SourceShape"])
     if rank != len(model["DestinationShape"]):
         raise ValueError("TensorRegionCopy source and destination ranks must match")
 
+    plan = _region_copy_tle_plan(model)
+    pointers = [("source", "Source"), ("destination", "Destination")]
+    if plan is not None:
+        pointers = [(plan["global_name"], plan["global_model_name"])]
     lines = _standard_header(
         model,
         f"# generated from PyNTT Jinja TensorRegionCopy.py.jinja\n# {model['Comment']}; dtype={model['DType']}, source_shape={_shape_tuple(model['SourceShape'])}, destination_shape={_shape_tuple(model['DestinationShape'])}",
-        [("source", "Source"), ("destination", "Destination")],
+        pointers,
     )
     for axis in range(rank):
         source_offset = _dim(model["SourceGlobalOffsets"][axis])
@@ -1168,40 +1476,10 @@ def _emit_tensor_region_copy(model: dict[str, Any]) -> str:
         _line(lines, 1, f"source_base{axis} = copy_start{axis} - {source_offset}")
         _line(lines, 1, f"destination_base{axis} = copy_start{axis} - {destination_offset}")
 
-    dimensions = [f"(copy_dim{axis})" for axis in range(rank)]
-    dimensions.append(f"({model['VectorLaneCount']})")
-    total = " * ".join(dimensions)
-    _line(lines, 1, f"for linear_start in tl.range(0, {total}, block_size):")
-    _line(lines, 2, "linear = linear_start + tl.arange(0, block_size)")
-    _line(lines, 2, f"mask = linear < {total}")
-    if model["VectorLaneCount"] == 1:
-        _line(lines, 2, "tensor_linear = linear")
-        _line(lines, 2, "vector_lane = linear * 0")
+    if plan is not None:
+        _append_tle_region_copy(lines, 1, model, plan)
     else:
-        _line(lines, 2, f"tensor_linear = linear // {model['VectorLaneCount']}")
-        _line(lines, 2, f"vector_lane = linear % {model['VectorLaneCount']}")
-    _line(lines, 2, "remaining = tensor_linear")
-    for axis in range(rank - 1, -1, -1):
-        _line(lines, 2, f"idx{axis} = remaining % copy_dim{axis}")
-        _line(lines, 2, f"remaining = remaining // copy_dim{axis}")
-
-    source_terms = [
-        f"(source_base{axis} + idx{axis}) * {_dim(model['SourceStrides'][axis])}"
-        for axis in range(rank)
-    ]
-    destination_terms = [
-        f"(destination_base{axis} + idx{axis}) * {_dim(model['DestinationStrides'][axis])}"
-        for axis in range(rank)
-    ]
-    source_offset = " + ".join(source_terms) if source_terms else "tensor_linear * 0"
-    destination_offset = " + ".join(destination_terms) if destination_terms else "tensor_linear * 0"
-    if model["VectorLaneCount"] != 1:
-        source_offset = f"(({source_offset}) * {model['VectorLaneCount']} + vector_lane)"
-        destination_offset = f"(({destination_offset}) * {model['VectorLaneCount']} + vector_lane)"
-    _line(lines, 2, f"source_offset = {source_offset}")
-    _line(lines, 2, f"destination_offset = {destination_offset}")
-    _line(lines, 2, "value = tl.load(source + source_offset, mask=mask)")
-    _line(lines, 2, "tl.store(destination + destination_offset, value, mask=mask)")
+        _append_region_copy_fallback(lines, 1, model)
     return _finish(lines)
 
 
@@ -1257,8 +1535,8 @@ def _emit_tensor_copy(model: dict[str, Any], *, is_load: bool) -> str:
             pointer_models,
         )
         if internal_source is not None:
-            _line(lines, 1, f"source = {_ptr(model, 'Source')}")
-        _line(lines, 1, f"destination = {_ptr(model, 'Destination')}")
+            _append_pointer_binding(lines, 1, model, "source", "Source")
+        _append_pointer_binding(lines, 1, model, "destination", "Destination")
     else:
         internal_destination = model.get("Destination")
         destination_args = () if internal_destination is not None else ("destination", "destination_pool_stride_elements: tl.constexpr")
@@ -1276,9 +1554,9 @@ def _emit_tensor_copy(model: dict[str, Any], *, is_load: bool) -> str:
             1,
             pointer_models,
         )
-        _line(lines, 1, f"source = {_ptr(model, 'Source')}")
+        _append_pointer_binding(lines, 1, model, "source", "Source")
         if internal_destination is not None:
-            _line(lines, 1, f"destination = {_ptr(model, 'Destination')}")
+            _append_pointer_binding(lines, 1, model, "destination", "Destination")
 
     _line(lines, 1, "tmp_shard = shard_index")
     for axis in range(len(model["Hierarchy"]) - 1, -1, -1):
@@ -1303,13 +1581,31 @@ def _emit_tensor_copy(model: dict[str, Any], *, is_load: bool) -> str:
         _line(lines, copy_indent, f"source_offsets = {source_pool_offset} + {model['SourceOffset']} + {scalar_offset(global_offset())}")
         _line(lines, copy_indent, f"destination_offsets = {scalar_offset(local_offset(local_strides))}")
         _line(lines, copy_indent, f"value = {_load_operand(model, 'Source', 'source', 'source_offsets', 'mask')}")
-        _line(lines, copy_indent, "tl.store(destination + destination_offsets, value, mask=mask)")
+        _append_store(
+            lines,
+            copy_indent,
+            model,
+            "Destination",
+            "destination",
+            "destination_offsets",
+            "value",
+            "mask",
+        )
     else:
         _line(lines, copy_indent, f"source_offsets = {scalar_offset(local_offset(local_strides))}")
         destination_pool_offset = "0" if internal_destination is not None else "destination_pool_stride_elements * shard_index"
         _line(lines, copy_indent, f"destination_offsets = {destination_pool_offset} + {model['DestinationOffset']} + {scalar_offset(global_offset())}")
         _line(lines, copy_indent, f"value = {_load_operand(model, 'Source', 'source', 'source_offsets', 'mask')}")
-        _line(lines, copy_indent, "tl.store(destination + destination_offsets, value, mask=mask)")
+        _append_store(
+            lines,
+            copy_indent,
+            model,
+            "Destination",
+            "destination",
+            "destination_offsets",
+            "value",
+            "mask",
+        )
     return _finish(lines)
 
 
@@ -1355,9 +1651,15 @@ def _emit_pad(model: dict[str, Any]) -> str:
         _line(lines, indent + 1, f"safe_in_idx{axis} = tl.where(axis{axis}_in_bounds, in_idx{axis}, 0)")
     _line(lines, indent + 1, f"input_offsets = {input_offset()}")
     _line(lines, indent + 1, f"output_offsets = {output_offset()}")
-    _line(lines, indent + 1, f"input_value = tl.load(input + input_offsets, mask=in_bounds, other={model['PadValue']})")
+    _line(
+        lines,
+        indent + 1,
+        f"input_value = {_load_operand(model, 'Input', 'input', 'input_offsets', 'in_bounds', other=str(model['PadValue']))}",
+    )
     _line(lines, indent + 1, f"result = tl.where(in_bounds, input_value, {model['PadValue']})")
-    _line(lines, indent + 1, "tl.store(output + output_offsets, result, mask=mask)")
+    _append_store(
+        lines, indent + 1, model, "Output", "output", "output_offsets", "result", "mask"
+    )
     return _finish(lines)
 
 
@@ -1397,8 +1699,14 @@ def _emit_slice(model: dict[str, Any]) -> str:
     _line(lines, indent + 1, f"mask = lane < {_dim(block_extent)}")
     _line(lines, indent + 1, f"input_offsets = {input_offset()}")
     _line(lines, indent + 1, f"output_offsets = {output_offset()}")
-    _line(lines, indent + 1, "value = tl.load(input + input_offsets, mask=mask)")
-    _line(lines, indent + 1, "tl.store(output + output_offsets, value, mask=mask)")
+    _line(
+        lines,
+        indent + 1,
+        f"value = {_load_operand(model, 'Input', 'input', 'input_offsets', 'mask')}",
+    )
+    _append_store(
+        lines, indent + 1, model, "Output", "output", "output_offsets", "value", "mask"
+    )
     return _finish(lines)
 
 
@@ -1428,7 +1736,9 @@ def _emit_transpose(model: dict[str, Any]) -> str:
     _line(lines, indent, f"input_offsets = {tensor_offset('in_idx', model['InputStrides'], model['InputVectorLaneCount'], 'lane_flat')}")
     _line(lines, indent, f"output_offsets = {tensor_offset('out_idx', model['OutputStrides'], model['OutputVectorLaneCount'], 'lane_flat')}")
     _line(lines, indent, f"value = {_load_operand(model, 'Input', 'input', 'input_offsets', 'mask')}")
-    _append_store(lines, indent, "output", "output_offsets", "value", "mask")
+    _append_store(
+        lines, indent, model, "Output", "output", "output_offsets", "value", "mask"
+    )
     return _finish(lines)
 
 
@@ -1480,12 +1790,33 @@ def _emit_elementwise_where(model: dict[str, Any]) -> str:
     _line(lines, indent + 1, f"true_offsets = {offset(model['TrueShape'], logical_true_shape, model['TrueStrides'], model['TrueVectorLaneCount'])}")
     _line(lines, indent + 1, f"false_offsets = {offset(model['FalseShape'], logical_false_shape, model['FalseStrides'], model['FalseVectorLaneCount'])}")
     _line(lines, indent + 1, f"output_offsets = {offset(model['OutputShape'], logical_output_shape, model['OutputStrides'], model['OutputVectorLaneCount'])}")
-    _line(lines, indent + 1, "predicate_value = tl.load(cond + cond_offsets, mask=mask, other=0)")
+    _line(
+        lines,
+        indent + 1,
+        f"predicate_value = {_load_operand(model, 'Cond', 'cond', 'cond_offsets', 'mask', other='0')}",
+    )
     _line(lines, indent + 1, f"predicate = {_as_predicate('predicate_value', model['CondDType'])}")
-    _line(lines, indent + 1, "value0 = tl.load(true_value + true_offsets, mask=mask)")
-    _line(lines, indent + 1, "value1 = tl.load(false_value + false_offsets, mask=mask)")
+    _line(
+        lines,
+        indent + 1,
+        f"value0 = {_load_operand(model, 'TrueValue', 'true_value', 'true_offsets', 'mask')}",
+    )
+    _line(
+        lines,
+        indent + 1,
+        f"value1 = {_load_operand(model, 'FalseValue', 'false_value', 'false_offsets', 'mask')}",
+    )
     _line(lines, indent + 1, "result = tl.where(predicate, value0, value1)")
-    _line(lines, indent + 1, f"tl.store(output + output_offsets, {_store_value('result', model['OutputDType'])}, mask=mask)")
+    _append_store(
+        lines,
+        indent + 1,
+        model,
+        "Output",
+        "output",
+        "output_offsets",
+        _store_value("result", model["OutputDType"]),
+        "mask",
+    )
     return _finish(lines)
 
 
@@ -1569,7 +1900,16 @@ def _emit_vector_layout(model: dict[str, Any]) -> str:
         _line(lines, value_indent, f"input_offsets = {tensor_offset('in_idx', model['InputStrides'], input_lane_count, 'input_lane_flat')}")
         _line(lines, value_indent, f"output_offsets = {tensor_offset('out_idx', model['OutputStrides'], output_lane_count, 'lane_flat')}")
         _line(lines, value_indent, f"value = {_load_operand(model, 'Input', 'input_ptr', 'input_offsets', 'valid', other='0')}")
-        _append_store(lines, value_indent, "output_ptr", "output_offsets", "value", "mask")
+        _append_store(
+            lines,
+            value_indent,
+            model,
+            "Output",
+            "output_ptr",
+            "output_offsets",
+            "value",
+            "mask",
+        )
     else:
         _append_tensor_index_decompose(lines, value_indent, "tensor_linear", "in_idx", model["InputShape"])
         output_lane_flat = "lane_flat * 0" if output_lane_count == 1 else f"lane_flat % {output_lane_count}"
@@ -1589,7 +1929,16 @@ def _emit_vector_layout(model: dict[str, Any]) -> str:
         _line(lines, value_indent, f"input_offsets = {tensor_offset('in_idx', model['InputStrides'], input_lane_count, 'lane_flat')}")
         _line(lines, value_indent, f"output_offsets = {tensor_offset('out_idx', model['OutputStrides'], output_lane_count, 'output_lane_flat')}")
         _line(lines, value_indent, f"value = {_load_operand(model, 'Input', 'input_ptr', 'input_offsets', 'valid', other='0')}")
-        _append_store(lines, value_indent, "output_ptr", "output_offsets", "value", "valid")
+        _append_store(
+            lines,
+            value_indent,
+            model,
+            "Output",
+            "output_ptr",
+            "output_offsets",
+            "value",
+            "valid",
+        )
     return _finish(lines)
 
 
@@ -1814,9 +2163,11 @@ def _emit_qkv_reduction_accumulate(
         1,
         [model["Input"], model["QWeight"], model["KWeight"], model["VWeight"]],
     )
-    _line(lines, 1, f"input0 = {_ptr(model, 'Input')}")
+    _append_pointer_binding(lines, 1, model, "input0", "Input")
     for prefix in ("Q", "K", "V"):
-        _line(lines, 1, f"{prefix.lower()}_weight = {_ptr(model, f'{prefix}Weight')}")
+        _append_pointer_binding(
+            lines, 1, model, f"{prefix.lower()}_weight", f"{prefix}Weight"
+        )
     _line(lines, 1, f"offs_k = tl.arange(0, {block_k})")
     k = model["InputShape"][-1]
     m = output_shapes["Q"][-2]
@@ -1886,11 +2237,19 @@ def _emit_qkv_reduction_accumulate(
                 f"(offs_k[None, :] < {_dim(k)}) & "
                 f"(offs_k[None, :] < {_dim(weight_k)})"
             )
+            weight_value = _load_operand_nd(
+                model,
+                f"{prefix}Weight",
+                f"{prefix.lower()}_weight",
+                weight_offsets,
+                weight_mask,
+                (block_n, block_k),
+                suffix=', eviction_policy="evict_first"',
+            )
             _line(
                 lines,
                 1,
-                f"{prefix.lower()}_weight_values = tl.load({prefix.lower()}_weight + {weight_offsets}, "
-                f"mask={weight_mask}, other=0.0, eviction_policy=\"evict_first\").to(tl.float32)",
+                f"{prefix.lower()}_weight_values = {weight_value}.to(tl.float32)",
             )
             _line(
                 lines,
@@ -1903,11 +2262,18 @@ def _emit_qkv_reduction_accumulate(
                 f"(offs_k[:, None] < {_dim(weight_k)}) & "
                 f"({offs_n}[None, :] < {_dim(n)})"
             )
+            weight_value = _load_operand_nd(
+                model,
+                f"{prefix}Weight",
+                f"{prefix.lower()}_weight",
+                weight_offsets,
+                weight_mask,
+                (block_k, block_n),
+            )
             _line(
                 lines,
                 1,
-                f"{prefix.lower()}_weight_values = tl.load({prefix.lower()}_weight + {weight_offsets}, "
-                f"mask={weight_mask}, other=0.0)",
+                f"{prefix.lower()}_weight_values = {weight_value}",
             )
             _line(
                 lines,
@@ -1952,9 +2318,13 @@ def _emit_qkv_reduction_finalize(
     ]
     _append_pointer_shard_coords(lines, 1, pointers)
     for prefix in ("Q", "K", "V"):
-        _line(lines, 1, f"{prefix.lower()}_output = {_ptr(model, f'{prefix}Output')}")
+        _append_pointer_binding(
+            lines, 1, model, f"{prefix.lower()}_output", f"{prefix}Output"
+        )
         if model[f"Has{prefix}Bias"]:
-            _line(lines, 1, f"{prefix.lower()}_bias = {_ptr(model, f'{prefix}Bias')}")
+            _append_pointer_binding(
+                lines, 1, model, f"{prefix.lower()}_bias", f"{prefix}Bias"
+            )
     if block_m != 1:
         _line(lines, 1, f"offs_m = tl.arange(0, {block_m})")
 
@@ -1969,11 +2339,17 @@ def _emit_qkv_reduction_finalize(
             else:
                 bias_offsets = f"{offs_n} * {_dim(model[f'{prefix}BiasStrides'][-1])}"
             suffix = "" if block_m == 1 else "[None, :]"
+            bias_value = _load_operand(
+                model,
+                f"{prefix}Bias",
+                f"{prefix.lower()}_bias",
+                bias_offsets,
+                f"{offs_n} < {_dim(n)}",
+            )
             _line(
                 lines,
                 1,
-                f"{acc_name} += tl.load({prefix.lower()}_bias + {bias_offsets}, "
-                f"mask={offs_n} < {_dim(n)}, other=0.0).to(tl.float32){suffix}",
+                f"{acc_name} += {bias_value}.to(tl.float32){suffix}",
             )
         if block_m == 1:
             if packed:
@@ -2000,10 +2376,15 @@ def _emit_qkv_reduction_finalize(
                 f"(offs_m[:, None] < {_dim(output_shapes[prefix][-2])}) & "
                 f"({offs_n}[None, :] < {_dim(n)})"
             )
-        _line(
+        _append_store(
             lines,
             1,
-            f"tl.store({prefix.lower()}_output + {output_offsets}, {acc_name}, mask={mask})",
+            model,
+            f"{prefix}Output",
+            f"{prefix.lower()}_output",
+            output_offsets,
+            acc_name,
+            mask,
         )
     return _finish(lines)
 
@@ -2136,15 +2517,25 @@ def _emit_packed_qkv_gemv_concat_n(
             bias_value = _load_operand(model, f"{prefix}Bias", f"{prefix.lower()}_bias", bias_offsets, bias_mask)
             _line(lines, indent + 1, f"acc += {bias_value}.to(tl.float32)")
 
+    output_offsets_by_prefix = {}
     for prefix in ("Q", "K", "V"):
         output_shape = model[f"{prefix}OutputShape"]
         output_strides = model[f"{prefix}OutputStrides"]
         output_batch_offset = _batch_offset_expression(output_shape, output_strides, len(output_shape) - 2)
         output_offsets = _packed_qkv_output_offsets(model, prefix, output_batch_offset, f"{prefix.lower()}_local_n", "m_idx")
-        _line(lines, indent + 1, f"{prefix.lower()}_output_ptrs = {prefix.lower()}_output + {output_offsets}")
+        output_offsets_by_prefix[prefix] = output_offsets
 
-    _line(lines, indent + 1, "output_ptrs = tl.where(q_active, q_output_ptrs, tl.where(k_active, k_output_ptrs, v_output_ptrs))")
-    _line(lines, indent + 1, f"tl.store(output_ptrs, acc, mask=offs_n < {_dim(total_n)})")
+    for prefix, active in (("Q", "q_active"), ("K", "k_active"), ("V", "v_active")):
+        _append_store(
+            lines,
+            indent + 1,
+            model,
+            f"{prefix}Output",
+            f"{prefix.lower()}_output",
+            output_offsets_by_prefix[prefix],
+            "acc",
+            f"{active} & (offs_n < {_dim(total_n)})",
+        )
 
 
 def _emit_packed_qkv_matmul_concat_n(
@@ -2203,15 +2594,25 @@ def _emit_packed_qkv_matmul_concat_n(
             bias_value = _load_operand(model, f"{prefix}Bias", f"{prefix.lower()}_bias", bias_offsets, bias_mask)
             _line(lines, indent + 1, f"acc += {bias_value}.to(tl.float32)[None, :]")
 
+    output_offsets_by_prefix = {}
     for prefix in ("Q", "K", "V"):
         output_shape = model[f"{prefix}OutputShape"]
         output_strides = model[f"{prefix}OutputStrides"]
         output_batch_offset = _batch_offset_expression(output_shape, output_strides, len(output_shape) - 2)
         output_offsets = _packed_qkv_output_offsets(model, prefix, output_batch_offset, f"{prefix.lower()}_local_n[None, :]", "offs_m[:, None]")
-        _line(lines, indent + 1, f"{prefix.lower()}_output_ptrs = {prefix.lower()}_output + {output_offsets}")
+        output_offsets_by_prefix[prefix] = output_offsets
 
-    _line(lines, indent + 1, "output_ptrs = tl.where(q_active[None, :], q_output_ptrs, tl.where(k_active[None, :], k_output_ptrs, v_output_ptrs))")
-    _line(lines, indent + 1, f"tl.store(output_ptrs, acc, mask=(offs_m[:, None] < {_dim(m)}) & (offs_n[None, :] < {_dim(total_n)}))")
+    for prefix, active in (("Q", "q_active"), ("K", "k_active"), ("V", "v_active")):
+        _append_store(
+            lines,
+            indent + 1,
+            model,
+            f"{prefix}Output",
+            f"{prefix.lower()}_output",
+            output_offsets_by_prefix[prefix],
+            "acc",
+            f"(offs_m[:, None] < {_dim(m)}) & {active}[None, :] & (offs_n[None, :] < {_dim(total_n)})",
+        )
 
 
 def _emit_packed_qkv_gemv_projection(
@@ -2267,7 +2668,16 @@ def _emit_packed_qkv_gemv_projection(
         bias_value = _load_operand(model, f"{prefix}Bias", ptr_bias, bias_offsets, f"offs_n < {_dim(n)}")
         _line(lines, indent + 1, f"bias_values = {bias_value}.to(tl.float32)")
         _line(lines, indent + 1, "acc += bias_values")
-    _line(lines, indent + 1, f"tl.store({ptr_output} + {output_offsets}, acc, mask=offs_n < {_dim(n)})")
+    _append_store(
+        lines,
+        indent + 1,
+        model,
+        f"{prefix}Output",
+        ptr_output,
+        output_offsets,
+        "acc",
+        f"offs_n < {_dim(n)}",
+    )
 
 
 def _emit_packed_qkv_matmul_projection(
@@ -2323,7 +2733,16 @@ def _emit_packed_qkv_matmul_projection(
         bias_value = _load_operand(model, f"{prefix}Bias", ptr_bias, bias_offsets, f"offs_n < {_dim(n)}")
         _line(lines, indent + 1, f"bias_values = {bias_value}.to(tl.float32)")
         _line(lines, indent + 1, "acc += bias_values[None, :]")
-    _line(lines, indent + 1, f"tl.store({ptr_output} + {output_offsets}, acc, mask=(offs_m[:, None] < {_dim(output_logical_shape[-2])}) & (offs_n[None, :] < {_dim(n)}))")
+    _append_store(
+        lines,
+        indent + 1,
+        model,
+        f"{prefix}Output",
+        ptr_output,
+        output_offsets,
+        "acc",
+        f"(offs_m[:, None] < {_dim(output_logical_shape[-2])}) & (offs_n[None, :] < {_dim(n)})",
+    )
 
 
 def _emit_qkv_gemv_projection(
@@ -2385,7 +2804,16 @@ def _emit_qkv_gemv_projection(
         bias_value = _load_operand(model, f"{prefix}Bias", ptr_bias, bias_offsets, f"offs_n < {_dim(n)}")
         _line(lines, indent + 1, f"bias_values = {bias_value}.to(tl.float32)")
         _line(lines, indent + 1, "acc += bias_values")
-    _line(lines, indent + 1, f"tl.store({ptr_output} + {output_offsets}, acc, mask=offs_n < {_dim(n)})")
+    _append_store(
+        lines,
+        indent + 1,
+        model,
+        f"{prefix}Output",
+        ptr_output,
+        output_offsets,
+        "acc",
+        f"offs_n < {_dim(n)}",
+    )
 
 
 def _emit_qkv_matmul_projection(
@@ -2447,7 +2875,16 @@ def _emit_qkv_matmul_projection(
         bias_value = _load_operand(model, f"{prefix}Bias", ptr_bias, bias_offsets, f"offs_n < {_dim(n)}")
         _line(lines, indent + 1, f"bias_values = {bias_value}.to(tl.float32)")
         _line(lines, indent + 1, "acc += bias_values[None, :]")
-    _line(lines, indent + 1, f"tl.store({ptr_output} + {output_offsets}, acc, mask=(offs_m[:, None] < {_dim(output_shape[-2])}) & (offs_n[None, :] < {_dim(n)}))")
+    _append_store(
+        lines,
+        indent + 1,
+        model,
+        f"{prefix}Output",
+        ptr_output,
+        output_offsets,
+        "acc",
+        f"(offs_m[:, None] < {_dim(output_shape[-2])}) & (offs_n[None, :] < {_dim(n)})",
+    )
 
 
 def _emit_matmul_glu(model: dict[str, Any]) -> str:
@@ -2542,9 +2979,9 @@ def _emit_matmul_glu_reduction_accumulate(model: dict[str, Any], *, packed: bool
         1,
         [model["Input"], model["GateWeight"], model["UpWeight"]],
     )
-    _line(lines, 1, f"input0 = {_ptr(model, 'Input')}")
-    _line(lines, 1, f"gate_weight = {_ptr(model, 'GateWeight')}")
-    _line(lines, 1, f"up_weight = {_ptr(model, 'UpWeight')}")
+    _append_pointer_binding(lines, 1, model, "input0", "Input")
+    _append_pointer_binding(lines, 1, model, "gate_weight", "GateWeight")
+    _append_pointer_binding(lines, 1, model, "up_weight", "UpWeight")
     _line(lines, 1, f"offs_k = tl.arange(0, {block_k})")
     _line(lines, 1, f"offs_n = tl.arange(0, {block_n})")
     k = model["InputShape"][-1]
@@ -2577,13 +3014,24 @@ def _emit_matmul_glu_reduction_accumulate(model: dict[str, Any], *, packed: bool
                 "offs_k[None, :]",
                 packed=packed,
             )
+            weight_mask = (
+                f"(offs_n[:, None] < {_dim(n)}) & "
+                f"(offs_n[:, None] < {_dim(weight_n_limit)}) & "
+                f"(offs_k[None, :] < {_dim(weight_k_limit)})"
+            )
+            weight_value = _load_operand_nd(
+                model,
+                f"{prefix}Weight",
+                f"{prefix.lower()}_weight",
+                weight_offsets,
+                weight_mask,
+                (block_n, block_k),
+                suffix=', eviction_policy="evict_first"',
+            )
             _line(
                 lines,
                 1,
-                f"{prefix.lower()}_weight_values = tl.load({prefix.lower()}_weight + {weight_offsets}, "
-                f"mask=(offs_n[:, None] < {_dim(n)}) & (offs_n[:, None] < {_dim(weight_n_limit)}) "
-                f"& (offs_k[None, :] < {_dim(weight_k_limit)}), other=0.0, "
-                'eviction_policy="evict_first").to(tl.float32)',
+                f"{prefix.lower()}_weight_values = {weight_value}.to(tl.float32)",
             )
             _line(
                 lines,
@@ -2625,12 +3073,23 @@ def _emit_matmul_glu_reduction_accumulate(model: dict[str, Any], *, packed: bool
                 "offs_k[:, None]",
                 packed=packed,
             )
+            weight_mask = (
+                f"(offs_k[:, None] < {_dim(weight_k_limit)}) & "
+                f"(offs_n[None, :] < {_dim(n)}) & "
+                f"(offs_n[None, :] < {_dim(weight_n_limit)})"
+            )
+            weight_value = _load_operand_nd(
+                model,
+                f"{prefix}Weight",
+                f"{prefix.lower()}_weight",
+                weight_offsets,
+                weight_mask,
+                (block_k, block_n),
+            )
             _line(
                 lines,
                 1,
-                f"{prefix.lower()}_weight_values = tl.load({prefix.lower()}_weight + {weight_offsets}, "
-                f"mask=(offs_k[:, None] < {_dim(weight_k_limit)}) & "
-                f"(offs_n[None, :] < {_dim(n)}) & (offs_n[None, :] < {_dim(weight_n_limit)}), other=0.0)",
+                f"{prefix.lower()}_weight_values = {weight_value}",
             )
             _line(
                 lines,
@@ -2658,64 +3117,97 @@ def _emit_matmul_glu_reduction_finalize(model: dict[str, Any], *, packed: bool) 
     pointer_models = [model["GateBias"], model["UpBias"], model["Output"]]
     _append_pointer_shard_coords(lines, 1, pointer_models)
     if model["HasGateBias"]:
-        _line(lines, 1, f"gate_bias = {_ptr(model, 'GateBias')}")
+        _append_pointer_binding(lines, 1, model, "gate_bias", "GateBias")
     if model["HasUpBias"]:
-        _line(lines, 1, f"up_bias = {_ptr(model, 'UpBias')}")
-    _line(lines, 1, f"output = {_ptr(model, 'Output')}")
+        _append_pointer_binding(lines, 1, model, "up_bias", "UpBias")
+    _append_pointer_binding(lines, 1, model, "output", "Output")
     _line(lines, 1, f"offs_n = tl.arange(0, {block_n})")
     n = logical_output_shape[-1]
     if block_m == 1:
         if model["HasGateBias"]:
             gate_bias_offsets = _matmul_glu_bias_offsets(model, "Gate", "offs_n", packed=packed)
             _, gate_bias_n_limit = _matmul_glu_bias_n_index(model, "Gate", "offs_n", packed=packed)
-            _line(
-                lines,
-                1,
-                f"gate_acc += tl.load(gate_bias + {gate_bias_offsets}, "
-                f"mask=(offs_n < {_dim(n)}) & (offs_n < {_dim(gate_bias_n_limit)}), other=0.0).to(tl.float32)",
+            gate_bias_mask = (
+                f"(offs_n < {_dim(n)}) & (offs_n < {_dim(gate_bias_n_limit)})"
             )
+            gate_bias_value = _load_operand(
+                model,
+                "GateBias",
+                "gate_bias",
+                gate_bias_offsets,
+                gate_bias_mask,
+            )
+            _line(lines, 1, f"gate_acc += {gate_bias_value}.to(tl.float32)")
         if model["HasUpBias"]:
             up_bias_offsets = _matmul_glu_bias_offsets(model, "Up", "offs_n", packed=packed)
             _, up_bias_n_limit = _matmul_glu_bias_n_index(model, "Up", "offs_n", packed=packed)
-            _line(
-                lines,
-                1,
-                f"up_acc += tl.load(up_bias + {up_bias_offsets}, "
-                f"mask=(offs_n < {_dim(n)}) & (offs_n < {_dim(up_bias_n_limit)}), other=0.0).to(tl.float32)",
+            up_bias_mask = (
+                f"(offs_n < {_dim(n)}) & (offs_n < {_dim(up_bias_n_limit)})"
             )
+            up_bias_value = _load_operand(
+                model,
+                "UpBias",
+                "up_bias",
+                up_bias_offsets,
+                up_bias_mask,
+            )
+            _line(lines, 1, f"up_acc += {up_bias_value}.to(tl.float32)")
         output_offsets = _matmul_glu_output_offsets(model, "0", "offs_n", "0", packed=packed)
         _line(lines, 1, f"result = {_matmul_glu_expr(model, 'gate_acc', 'up_acc')}")
-        _line(lines, 1, f"tl.store(output + {output_offsets}, result, mask=offs_n < {_dim(n)})")
+        _append_store(
+            lines,
+            1,
+            model,
+            "Output",
+            "output",
+            output_offsets,
+            "result",
+            f"offs_n < {_dim(n)}",
+        )
     else:
         _line(lines, 1, f"offs_m = tl.arange(0, {block_m})")
         if model["HasGateBias"]:
             gate_bias_offsets = _matmul_glu_bias_offsets(model, "Gate", "offs_n", packed=packed)
             _, gate_bias_n_limit = _matmul_glu_bias_n_index(model, "Gate", "offs_n", packed=packed)
-            _line(
-                lines,
-                1,
-                f"gate_acc += tl.load(gate_bias + {gate_bias_offsets}, "
-                f"mask=(offs_n < {_dim(n)}) & (offs_n < {_dim(gate_bias_n_limit)}), other=0.0).to(tl.float32)[None, :]",
+            gate_bias_mask = (
+                f"(offs_n < {_dim(n)}) & (offs_n < {_dim(gate_bias_n_limit)})"
             )
+            gate_bias_value = _load_operand(
+                model,
+                "GateBias",
+                "gate_bias",
+                gate_bias_offsets,
+                gate_bias_mask,
+            )
+            _line(lines, 1, f"gate_acc += {gate_bias_value}.to(tl.float32)[None, :]")
         if model["HasUpBias"]:
             up_bias_offsets = _matmul_glu_bias_offsets(model, "Up", "offs_n", packed=packed)
             _, up_bias_n_limit = _matmul_glu_bias_n_index(model, "Up", "offs_n", packed=packed)
-            _line(
-                lines,
-                1,
-                f"up_acc += tl.load(up_bias + {up_bias_offsets}, "
-                f"mask=(offs_n < {_dim(n)}) & (offs_n < {_dim(up_bias_n_limit)}), other=0.0).to(tl.float32)[None, :]",
+            up_bias_mask = (
+                f"(offs_n < {_dim(n)}) & (offs_n < {_dim(up_bias_n_limit)})"
             )
+            up_bias_value = _load_operand(
+                model,
+                "UpBias",
+                "up_bias",
+                up_bias_offsets,
+                up_bias_mask,
+            )
+            _line(lines, 1, f"up_acc += {up_bias_value}.to(tl.float32)[None, :]")
         output_offsets = _matmul_glu_output_offsets(
             model, "0", "offs_n[None, :]", "offs_m[:, None]", packed=packed
         )
         _line(lines, 1, f"result = {_matmul_glu_expr(model, 'gate_acc', 'up_acc')}")
-        _line(
+        _append_store(
             lines,
             1,
-            f"tl.store(output + {output_offsets}, result, "
-            f"mask=(offs_m[:, None] < {_dim(logical_output_shape[-2])}) & "
-            f"(offs_n[None, :] < {_dim(n)}))",
+            model,
+            "Output",
+            "output",
+            output_offsets,
+            "result",
+            f"(offs_m[:, None] < {_dim(logical_output_shape[-2])}) & "
+            f"(offs_n[None, :] < {_dim(n)})",
         )
     return _finish(lines)
 
@@ -2873,18 +3365,45 @@ def _emit_matmul_glu_gemv(
         weight_batch_offset = _batch_offset_expression(weight_shape, weight_strides, len(model["OutputShape"]) - 2)
         weight_offsets, weight_n_limit, weight_k_limit = _matmul_glu_weight_offsets(model, prefix, weight_batch_offset, "offs_n[:, None]", "offs_k[None, :]", packed=packed)
         ptr_weight = f"{prefix.lower()}_weight"
-        _line(lines, indent + 2, f"{prefix.lower()}_weight_values = tl.load({ptr_weight} + {weight_offsets}, mask=(offs_n[:, None] < {_dim(n)}) & (offs_n[:, None] < {_dim(weight_n_limit)}) & (offs_k[None, :] < {_dim(weight_k_limit)}), other=0.0, eviction_policy=\"evict_first\").to(tl.float32)")
+        weight_mask = f"(offs_n[:, None] < {_dim(n)}) & (offs_n[:, None] < {_dim(weight_n_limit)}) & (offs_k[None, :] < {_dim(weight_k_limit)})"
+        weight_value = _load_operand_nd(
+            model,
+            f"{prefix}Weight",
+            ptr_weight,
+            weight_offsets,
+            weight_mask,
+            (block_n, block_k),
+            suffix=', eviction_policy="evict_first"',
+        )
+        _line(lines, indent + 2, f"{prefix.lower()}_weight_values = {weight_value}.to(tl.float32)")
         _line(lines, indent + 2, f"{acc_name} += tl.sum({prefix.lower()}_weight_values * input_values[None, :], axis=1)")
     if model["HasGateBias"]:
         gate_bias_offsets = _matmul_glu_bias_offsets(model, "Gate", "offs_n", packed=packed)
         _, gate_bias_n_limit = _matmul_glu_bias_n_index(model, "Gate", "offs_n", packed=packed)
-        _line(lines, indent + 1, f"gate_acc += tl.load(gate_bias + {gate_bias_offsets}, mask=(offs_n < {_dim(n)}) & (offs_n < {_dim(gate_bias_n_limit)}), other=0.0).to(tl.float32)")
+        gate_bias_mask = f"(offs_n < {_dim(n)}) & (offs_n < {_dim(gate_bias_n_limit)})"
+        gate_bias_value = _load_operand(
+            model, "GateBias", "gate_bias", gate_bias_offsets, gate_bias_mask
+        )
+        _line(lines, indent + 1, f"gate_acc += {gate_bias_value}.to(tl.float32)")
     if model["HasUpBias"]:
         up_bias_offsets = _matmul_glu_bias_offsets(model, "Up", "offs_n", packed=packed)
         _, up_bias_n_limit = _matmul_glu_bias_n_index(model, "Up", "offs_n", packed=packed)
-        _line(lines, indent + 1, f"up_acc += tl.load(up_bias + {up_bias_offsets}, mask=(offs_n < {_dim(n)}) & (offs_n < {_dim(up_bias_n_limit)}), other=0.0).to(tl.float32)")
+        up_bias_mask = f"(offs_n < {_dim(n)}) & (offs_n < {_dim(up_bias_n_limit)})"
+        up_bias_value = _load_operand(
+            model, "UpBias", "up_bias", up_bias_offsets, up_bias_mask
+        )
+        _line(lines, indent + 1, f"up_acc += {up_bias_value}.to(tl.float32)")
     _line(lines, indent + 1, f"result = {_matmul_glu_expr(model, 'gate_acc', 'up_acc')}")
-    _line(lines, indent + 1, f"tl.store(output + {output_offsets}, result, mask=offs_n < {_dim(n)})")
+    _append_store(
+        lines,
+        indent + 1,
+        model,
+        "Output",
+        "output",
+        output_offsets,
+        "result",
+        f"offs_n < {_dim(n)}",
+    )
 
 
 def _emit_matmul_glu_matmul(
@@ -2925,18 +3444,44 @@ def _emit_matmul_glu_matmul(
         weight_batch_offset = _batch_offset_expression(weight_shape, weight_strides, len(model["OutputShape"]) - 2)
         weight_offsets, weight_n_limit, weight_k_limit = _matmul_glu_weight_offsets(model, prefix, weight_batch_offset, "offs_n[None, :]", "offs_k[:, None]", packed=packed)
         ptr_weight = f"{prefix.lower()}_weight"
-        _line(lines, indent + 2, f"{prefix.lower()}_weight_values = tl.load({ptr_weight} + {weight_offsets}, mask=(offs_k[:, None] < {_dim(weight_k_limit)}) & (offs_n[None, :] < {_dim(n)}) & (offs_n[None, :] < {_dim(weight_n_limit)}), other=0.0)")
+        weight_mask = f"(offs_k[:, None] < {_dim(weight_k_limit)}) & (offs_n[None, :] < {_dim(n)}) & (offs_n[None, :] < {_dim(weight_n_limit)})"
+        weight_value = _load_operand_nd(
+            model,
+            f"{prefix}Weight",
+            ptr_weight,
+            weight_offsets,
+            weight_mask,
+            (block_k, block_n),
+        )
+        _line(lines, indent + 2, f"{prefix.lower()}_weight_values = {weight_value}")
         _line(lines, indent + 2, f"{acc_name} += tl.dot(input_values, {prefix.lower()}_weight_values{dot_precision})")
     if model["HasGateBias"]:
         gate_bias_offsets = _matmul_glu_bias_offsets(model, "Gate", "offs_n", packed=packed)
         _, gate_bias_n_limit = _matmul_glu_bias_n_index(model, "Gate", "offs_n", packed=packed)
-        _line(lines, indent + 1, f"gate_acc += tl.load(gate_bias + {gate_bias_offsets}, mask=(offs_n < {_dim(n)}) & (offs_n < {_dim(gate_bias_n_limit)}), other=0.0).to(tl.float32)[None, :]")
+        gate_bias_mask = f"(offs_n < {_dim(n)}) & (offs_n < {_dim(gate_bias_n_limit)})"
+        gate_bias_value = _load_operand(
+            model, "GateBias", "gate_bias", gate_bias_offsets, gate_bias_mask
+        )
+        _line(lines, indent + 1, f"gate_acc += {gate_bias_value}.to(tl.float32)[None, :]")
     if model["HasUpBias"]:
         up_bias_offsets = _matmul_glu_bias_offsets(model, "Up", "offs_n", packed=packed)
         _, up_bias_n_limit = _matmul_glu_bias_n_index(model, "Up", "offs_n", packed=packed)
-        _line(lines, indent + 1, f"up_acc += tl.load(up_bias + {up_bias_offsets}, mask=(offs_n < {_dim(n)}) & (offs_n < {_dim(up_bias_n_limit)}), other=0.0).to(tl.float32)[None, :]")
+        up_bias_mask = f"(offs_n < {_dim(n)}) & (offs_n < {_dim(up_bias_n_limit)})"
+        up_bias_value = _load_operand(
+            model, "UpBias", "up_bias", up_bias_offsets, up_bias_mask
+        )
+        _line(lines, indent + 1, f"up_acc += {up_bias_value}.to(tl.float32)[None, :]")
     _line(lines, indent + 1, f"result = {_matmul_glu_expr(model, 'gate_acc', 'up_acc')}")
-    _line(lines, indent + 1, f"tl.store(output + {output_offsets}, result, mask=(offs_m[:, None] < {_dim(m)}) & (offs_n[None, :] < {_dim(n)}))")
+    _append_store(
+        lines,
+        indent + 1,
+        model,
+        "Output",
+        "output",
+        output_offsets,
+        "result",
+        f"(offs_m[:, None] < {_dim(m)}) & (offs_n[None, :] < {_dim(n)})",
+    )
 
 
 def _emit_matmul_like(model: dict[str, Any], *, gemv: bool) -> str:
@@ -2977,7 +3522,8 @@ def _emit_matmul_like(model: dict[str, Any], *, gemv: bool) -> str:
             return
 
         predicate = "True" if load_c_expression in ("True", "true", "1") else f"({load_c_expression})"
-        _line(lines, indent, f"previous = tl.load(output + {output_offsets}, mask=({output_mask}) & ({predicate}), other=0.0).to(tl.float32)")
+        output_pointer = _access_pointer(model, "Output", "output", output_offsets)
+        _line(lines, indent, f"previous = tl.load({output_pointer}, mask=({output_mask}) & ({predicate}), other=0.0).to(tl.float32)")
         if predicate == "True":
             _line(lines, indent, "result = previous + result")
         else:
@@ -3018,13 +3564,31 @@ def _emit_matmul_like(model: dict[str, Any], *, gemv: bool) -> str:
         _line(lines, indent + 1, f"offs_k = k_start + tl.arange(0, {block_k})")
         rhs_mask = f"(offs_n[:, None] < {_dim(n)}) & (offs_n[:, None] < {_dim(rhs_n)}) & (offs_k[None, :] < {_dim(k)}) & (offs_k[None, :] < {_dim(rhs_k)})"
         lhs_mask = f"(m_idx < {_dim(lhs_m)}) & (offs_k < {_dim(k)})"
-        _line(lines, indent + 1, f"rhs_values = tl.load(rhs + {rhs_offsets}, mask={rhs_mask}, other=0.0, eviction_policy=\"evict_first\").to(tl.float32)")
+        rhs_value = _load_operand_nd(
+            model,
+            "Rhs",
+            "rhs",
+            rhs_offsets,
+            rhs_mask,
+            (block_n, block_k),
+            suffix=', eviction_policy="evict_first"',
+        )
+        _line(lines, indent + 1, f"rhs_values = {rhs_value}.to(tl.float32)")
         _line(lines, indent + 1, f"lhs_values = {_load_operand(model, 'Lhs', 'lhs', lhs_offsets, lhs_mask)}.to(tl.float32)")
         _line(lines, indent + 1, "acc += tl.sum(rhs_values * lhs_values[None, :], axis=1)")
         _line(lines, indent, f"result = acc * {model['Scale']}")
         output_mask = f"offs_n < {_dim(n)}"
         append_load_c(lines, indent, output_offsets, output_mask)
-        _line(lines, indent, f"tl.store(output + {output_offsets}, result, mask={output_mask})")
+        _append_store(
+            lines,
+            indent,
+            model,
+            "Output",
+            "output",
+            output_offsets,
+            "result",
+            output_mask,
+        )
     else:
         block_m = 16
         block_n = 64
@@ -3040,14 +3604,27 @@ def _emit_matmul_like(model: dict[str, Any], *, gemv: bool) -> str:
         _line(lines, compute_indent + 1, f"offs_k = k_start + tl.arange(0, {block_k})")
         rhs_mask = f"(offs_k[:, None] < {_dim(k)}) & (offs_k[:, None] < {_dim(rhs_k)}) & (offs_n[None, :] < {_dim(n)}) & (offs_n[None, :] < {_dim(rhs_n)})"
         lhs_mask = f"(offs_m[:, None] < {_dim(m)}) & (offs_m[:, None] < {_dim(lhs_m)}) & (offs_k[None, :] < {_dim(k)})"
-        _line(lines, compute_indent + 1, f"rhs_values = tl.load(rhs + {rhs_offsets}, mask={rhs_mask}, other=0.0)")
+        _line(
+            lines,
+            compute_indent + 1,
+            f"rhs_values = {_load_operand_nd(model, 'Rhs', 'rhs', rhs_offsets, rhs_mask, (block_k, block_n))}",
+        )
         _line(lines, compute_indent + 1, f"lhs_values = {_load_operand_nd(model, 'Lhs', 'lhs', lhs_offsets, lhs_mask, (block_m, block_k))}")
         dot_precision = ', input_precision="ieee"' if model["LhsDType"] == "float32" and model["RhsDType"] == "float32" else ""
         _line(lines, compute_indent + 1, f"acc += tl.dot(lhs_values, rhs_values{dot_precision})")
         _line(lines, compute_indent, f"result = acc * {model['Scale']}")
         output_mask = f"(offs_m[:, None] < {_dim(m)}) & (offs_n[None, :] < {_dim(n)})"
         append_load_c(lines, compute_indent, output_offsets, output_mask)
-        _line(lines, compute_indent, f"tl.store(output + {output_offsets}, result, mask={output_mask})")
+        _append_store(
+            lines,
+            compute_indent,
+            model,
+            "Output",
+            "output",
+            output_offsets,
+            "result",
+            output_mask,
+        )
     return _finish(lines)
 
 
@@ -3086,8 +3663,8 @@ def _emit_matmul_reduction_accumulate(
     )
     _line(lines, 1, "shard_index = tl.program_id(0).to(tl.int64)")
     _append_pointer_shard_coords(lines, 1, [model["Lhs"], model["Rhs"]])
-    _line(lines, 1, f"lhs = {_ptr(model, 'Lhs')}")
-    _line(lines, 1, f"rhs = {_ptr(model, 'Rhs')}")
+    _append_pointer_binding(lines, 1, model, "lhs", "Lhs")
+    _append_pointer_binding(lines, 1, model, "rhs", "Rhs")
     _line(lines, 1, f"offs_k = tl.arange(0, {block_k})")
     _line(lines, 1, f"offs_n = tl.arange(0, {block_n})")
 
@@ -3112,12 +3689,16 @@ def _emit_matmul_reduction_accumulate(
             f"(offs_k[None, :] < {_dim(rhs_k)})"
         )
         lhs_mask = f"(0 < {_dim(m)}) & (0 < {_dim(lhs_m)}) & (offs_k < {_dim(lhs_k)})"
-        _line(
-            lines,
-            1,
-            f"rhs_values = tl.load(rhs + {rhs_offsets}, mask={rhs_mask}, "
-            'other=0.0, eviction_policy="evict_first").to(tl.float32)',
+        rhs_value = _load_operand_nd(
+            model,
+            "Rhs",
+            "rhs",
+            rhs_offsets,
+            rhs_mask,
+            (block_n, block_k),
+            suffix=', eviction_policy="evict_first"',
         )
+        _line(lines, 1, f"rhs_values = {rhs_value}.to(tl.float32)")
         _line(
             lines,
             1,
@@ -3141,7 +3722,7 @@ def _emit_matmul_reduction_accumulate(
         _line(
             lines,
             1,
-            f"rhs_values = tl.load(rhs + {rhs_offsets}, mask={rhs_mask}, other=0.0)",
+            f"rhs_values = {_load_operand_nd(model, 'Rhs', 'rhs', rhs_offsets, rhs_mask, (block_k, block_n))}",
         )
         _line(
             lines,
@@ -3185,7 +3766,7 @@ def _emit_matmul_reduction_finalize(
     )
     _line(lines, 1, "shard_index = tl.program_id(0).to(tl.int64)")
     _append_pointer_shard_coords(lines, 1, [model["Output"]])
-    _line(lines, 1, f"output = {_ptr(model, 'Output')}")
+    _append_pointer_binding(lines, 1, model, "output", "Output")
     _line(lines, 1, f"offs_n = tl.arange(0, {block_n})")
     n = logical_output_shape[-1]
     result = f"acc * {model['Scale']}"
@@ -3212,7 +3793,16 @@ def _emit_matmul_reduction_finalize(
             model.get("OutputNPackedLaneCount", 1),
             model["OutputNVectorLaneCount"],
         )
-        _line(lines, 1, f"tl.store(output + {output_offsets}, {result}, mask=offs_n < {_dim(n)})")
+        _append_store(
+            lines,
+            1,
+            model,
+            "Output",
+            "output",
+            output_offsets,
+            result,
+            f"offs_n < {_dim(n)}",
+        )
     else:
         _line(lines, 1, f"offs_m = tl.arange(0, {block_m})")
         physical_n = _logical_n_index(
@@ -3237,12 +3827,16 @@ def _emit_matmul_reduction_finalize(
             model.get("OutputNPackedLaneCount", 1),
             model["OutputNVectorLaneCount"],
         )
-        _line(
+        _append_store(
             lines,
             1,
-            f"tl.store(output + {output_offsets}, {result}, "
-            f"mask=(offs_m[:, None] < {_dim(logical_output_shape[-2])}) & "
-            f"(offs_n[None, :] < {_dim(n)}))",
+            model,
+            "Output",
+            "output",
+            output_offsets,
+            result,
+            f"(offs_m[:, None] < {_dim(logical_output_shape[-2])}) & "
+            f"(offs_n[None, :] < {_dim(n)})",
         )
     return _finish(lines)
 
@@ -3392,10 +3986,17 @@ def _emit_reduce(model: dict[str, Any]) -> str:
     for axis in model["Axes"]:
         _line(lines, reduce_indent, f"for reduce_idx{axis} in tl.range(0, {_dim(model['InputShape'][axis])}):")
         reduce_indent += 1
-    _line(lines, reduce_indent, f"value0 = tl.load(input0 + input_base + {reduce_offset()}, mask=mask, other={model['InitValue']})")
+    reduce_input_offset = f"input_base + {reduce_offset()}"
+    _line(
+        lines,
+        reduce_indent,
+        f"value0 = {_load_operand(model, 'Input', 'input0', reduce_input_offset, 'mask', other=str(model['InitValue']))}",
+    )
     _line(lines, reduce_indent, f"acc = {model['UpdateExpression']}")
     _line(lines, indent + 1, f"result = {model['FinalizeExpression']}")
-    _line(lines, indent + 1, "tl.store(output + output_offsets, result, mask=mask)")
+    _append_store(
+        lines, indent + 1, model, "Output", "output", "output_offsets", "result", "mask"
+    )
     return _finish(lines)
 
 
@@ -3418,7 +4019,7 @@ def _emit_reduce_reduction_accumulate(model: dict[str, Any]) -> str:
     )
     _line(lines, 1, "shard_index = tl.program_id(0).to(tl.int64)")
     _append_pointer_shard_coords(lines, 1, [model["Input"]])
-    _line(lines, 1, f"input0 = {_ptr(model, 'Input')}")
+    _append_pointer_binding(lines, 1, model, "input0", "Input")
     _line(lines, 1, f"lane = tl.arange(0, {block_size})")
     output_elements = _product(model["OutputShape"])
     _line(lines, 1, f"mask = lane < {_dim(output_elements)}")
@@ -3454,11 +4055,11 @@ def _emit_reduce_reduction_accumulate(model: dict[str, Any]) -> str:
         for axis in model["Axes"]
     ]
     reduce_offset = "lane * 0" if not reduce_terms else " + ".join(reduce_terms)
+    reduce_input_offset = f"input_base + {reduce_offset}"
     _line(
         lines,
         indent,
-        f"value0 = tl.load(input0 + input_base + {reduce_offset}, "
-        f"mask=mask, other={model['InitValue']})",
+        f"value0 = {_load_operand(model, 'Input', 'input0', reduce_input_offset, 'mask', other=str(model['InitValue']))}",
     )
     _line(lines, indent, f"acc = {model['UpdateExpression']}")
     if track_element_count:
@@ -3494,7 +4095,7 @@ def _emit_reduce_reduction_finalize(model: dict[str, Any]) -> str:
     )
     _line(lines, 1, "shard_index = tl.program_id(0).to(tl.int64)")
     _append_pointer_shard_coords(lines, 1, [model["Output"]])
-    _line(lines, 1, f"output = {_ptr(model, 'Output')}")
+    _append_pointer_binding(lines, 1, model, "output", "Output")
     _line(lines, 1, f"lane = tl.arange(0, {block_size})")
     output_elements = _product(model["OutputShape"])
     _line(lines, 1, f"mask = lane < {_dim(output_elements)}")
@@ -3510,7 +4111,9 @@ def _emit_reduce_reduction_finalize(model: dict[str, Any]) -> str:
     else:
         output_offsets = "lane * 0"
     _line(lines, 1, f"result = {model['FinalizeExpression']}")
-    _line(lines, 1, f"tl.store(output + {output_offsets}, result, mask=mask)")
+    _append_store(
+        lines, 1, model, "Output", "output", output_offsets, "result", "mask"
+    )
     return _finish(lines)
 
 
@@ -3551,15 +4154,39 @@ def _emit_softmax(model: dict[str, Any]) -> str:
     _line(lines, indent + 1, f"slice_base = {slice_base()}")
     _line(lines, indent + 1, 'max_value = tl.full((block_size,), -float("inf"), tl.float32)')
     _line(lines, indent + 1, f"for axis_pos in tl.range(0, {_dim(axis_extent)}):")
-    _line(lines, indent + 2, f'values = tl.load(input0 + slice_base + axis_pos * {_dim(model["InputStrides"][model["Axis"]])}, mask=mask, other=-float("inf"))')
+    slice_offset = f'slice_base + axis_pos * {_dim(model["InputStrides"][model["Axis"]])}'
+    negative_infinity = '-float("inf")'
+    _line(
+        lines,
+        indent + 2,
+        f'values = {_load_operand(model, "Input", "input0", slice_offset, "mask", other=negative_infinity)}',
+    )
     _line(lines, indent + 2, "max_value = tl.maximum(max_value, values)")
     _line(lines, indent + 1, "sum_value = tl.full((block_size,), 0.0, tl.float32)")
     _line(lines, indent + 1, f"for axis_pos in tl.range(0, {_dim(axis_extent)}):")
-    _line(lines, indent + 2, f'values = tl.load(input0 + slice_base + axis_pos * {_dim(model["InputStrides"][model["Axis"]])}, mask=mask, other=-float("inf"))')
+    _line(
+        lines,
+        indent + 2,
+        f'values = {_load_operand(model, "Input", "input0", slice_offset, "mask", other=negative_infinity)}',
+    )
     _line(lines, indent + 2, "sum_value += tl.exp(values - max_value)")
-    _line(lines, indent + 1, f'value0 = tl.load(input0 + {offset(model["InputStrides"])}, mask=mask, other=-float("inf"))')
+    input_offset = offset(model["InputStrides"])
+    _line(
+        lines,
+        indent + 1,
+        f'value0 = {_load_operand(model, "Input", "input0", input_offset, "mask", other=negative_infinity)}',
+    )
     _line(lines, indent + 1, "result = tl.exp(value0 - max_value) / sum_value")
-    _line(lines, indent + 1, f"tl.store(output + {offset(model['OutputStrides'])}, result, mask=mask)")
+    _append_store(
+        lines,
+        indent + 1,
+        model,
+        "Output",
+        "output",
+        offset(model["OutputStrides"]),
+        "result",
+        "mask",
+    )
     return _finish(lines)
 
 
@@ -3635,7 +4262,7 @@ def _emit_layer_norm(model: dict[str, Any]) -> str:
         _line(lines, indent + 1, "mask = inner_lane < inner_size")
         append_inner_decode(lines, indent + 1)
         _line(lines, indent + 1, f"input_offsets = {input_offset}")
-        _line(lines, indent + 1, "value0 = tl.load(input0 + input_offsets, mask=mask, other=0.0).to(tl.float32)")
+        _line(lines, indent + 1, f"value0 = {_load_operand(model, 'Input', 'input0', 'input_offsets', 'mask')}.to(tl.float32)")
         _line(lines, indent + 1, "mean_sum += tl.sum(value0, axis=0)")
         _line(lines, indent, "mean_value = mean_sum / inner_count")
     else:
@@ -3646,7 +4273,7 @@ def _emit_layer_norm(model: dict[str, Any]) -> str:
     _line(lines, indent + 1, "mask = inner_lane < inner_size")
     append_inner_decode(lines, indent + 1)
     _line(lines, indent + 1, f"input_offsets = {input_offset}")
-    _line(lines, indent + 1, "value0 = tl.load(input0 + input_offsets, mask=mask, other=0.0).to(tl.float32)")
+    _line(lines, indent + 1, f"value0 = {_load_operand(model, 'Input', 'input0', 'input_offsets', 'mask')}.to(tl.float32)")
     _line(lines, indent + 1, "centered = value0 - mean_value")
     _line(lines, indent + 1, "variance_sum += tl.sum(centered * centered, axis=0)")
     _line(lines, indent, f"inv_std = tl.rsqrt((variance_sum / inner_count) + {model['Epsilon']!r})")
@@ -3658,11 +4285,13 @@ def _emit_layer_norm(model: dict[str, Any]) -> str:
     _line(lines, indent + 1, f"scale_offsets = {scale_offset}")
     _line(lines, indent + 1, f"bias_offsets = {bias_offset}")
     _line(lines, indent + 1, f"output_offsets = {output_offset}")
-    _line(lines, indent + 1, "value0 = tl.load(input0 + input_offsets, mask=mask, other=0.0).to(tl.float32)")
-    _line(lines, indent + 1, "scale_value = tl.load(scale0 + scale_offsets, mask=mask, other=0.0).to(tl.float32)")
-    _line(lines, indent + 1, "bias_value = tl.load(bias0 + bias_offsets, mask=mask, other=0.0).to(tl.float32)")
+    _line(lines, indent + 1, f"value0 = {_load_operand(model, 'Input', 'input0', 'input_offsets', 'mask')}.to(tl.float32)")
+    _line(lines, indent + 1, f"scale_value = {_load_operand(model, 'Scale', 'scale0', 'scale_offsets', 'mask')}.to(tl.float32)")
+    _line(lines, indent + 1, f"bias_value = {_load_operand(model, 'Bias', 'bias0', 'bias_offsets', 'mask')}.to(tl.float32)")
     _line(lines, indent + 1, "result = ((value0 - mean_value) * inv_std * scale_value) + bias_value")
-    _line(lines, indent + 1, "tl.store(output + output_offsets, result, mask=mask)")
+    _append_store(
+        lines, indent + 1, model, "Output", "output", "output_offsets", "result", "mask"
+    )
     return _finish(lines)
 
 
@@ -3734,10 +4363,30 @@ def _emit_norm_stats(model: dict[str, Any]) -> str:
         _line(lines, indent + 1, "mean_sum += tl.sum(value0, axis=0)")
     _line(lines, indent + 1, "square_sum += tl.sum(value0 * value0, axis=0)")
     if model["UseMean"]:
-        _line(lines, indent, f"tl.store(output + {stats_offset(0)}, mean_sum)")
-        _line(lines, indent, f"tl.store(output + {stats_offset(1)}, square_sum)")
+        _append_store(
+            lines, indent, model, "Output", "output", stats_offset(0), "mean_sum", "True"
+        )
+        _append_store(
+            lines,
+            indent,
+            model,
+            "Output",
+            "output",
+            stats_offset(1),
+            "square_sum",
+            "True",
+        )
     else:
-        _line(lines, indent, f"tl.store(output + {stats_offset(0)}, square_sum)")
+        _append_store(
+            lines,
+            indent,
+            model,
+            "Output",
+            "output",
+            stats_offset(0),
+            "square_sum",
+            "True",
+        )
     return _finish(lines)
 
 
@@ -3803,7 +4452,7 @@ def _emit_norm_apply(model: dict[str, Any]) -> str:
 
     def stats_load(component: int) -> str:
         offset_value = stats_offset(component)
-        return f"tl.load(stats0 + {offset_value}).to(tl.float32)"
+        return f"tl.load({_access_pointer(model, 'Stats', 'stats0', offset_value)}).to(tl.float32)"
 
     inner_size = _product(logical_output_shape[model["Axis"] :])
     normalization_size = _product(logical_input_global_shape[model["Axis"] :])
@@ -3849,6 +4498,8 @@ def _emit_norm_apply(model: dict[str, Any]) -> str:
     _append_store(
         lines,
         value_indent,
+        model,
+        "Output",
         "output",
         "output_offsets",
         "result",
@@ -3918,7 +4569,9 @@ def _emit_rope(model: dict[str, Any]) -> str:
     _line(lines, indent, f"sin_value = {_load_operand(model, 'Sin', 'sin0', 'sin_offsets', 'mask')}.to(tl.float32)")
     _line(lines, indent, f"rotated = tl.where(logical_rotary < {half_dim}, -paired_value, paired_value)")
     _line(lines, indent, "result = value0 * cos_value + rotated * sin_value")
-    _append_store(lines, indent, "output", "output_offsets", "result", "mask")
+    _append_store(
+        lines, indent, model, "Output", "output", "output_offsets", "result", "mask"
+    )
     return _finish(lines)
 
 
@@ -3996,7 +4649,11 @@ def _emit_gather(model: dict[str, Any]) -> str:
     _line(lines, indent + 1, "lane = axis_start + tl.arange(0, block_size)")
     _line(lines, indent + 1, f"mask = lane < {_dim(block_extent)}")
     _line(lines, indent + 1, f"index_offsets = {index_offset()}")
-    _line(lines, indent + 1, "gather_index = tl.load(index + index_offsets, mask=mask, other=0)")
+    _line(
+        lines,
+        indent + 1,
+        f"gather_index = {_load_operand(model, 'Index', 'index', 'index_offsets', 'mask', other='0')}",
+    )
     if signed_index:
         _line(lines, indent + 1, f"gather_index = tl.where(gather_index < 0, gather_index + {_dim(model['InputGlobalShape'][model['Axis']])}, gather_index)")
     gather_split_axes = model["InputSplitAxes"][model["Axis"]]
@@ -4011,8 +4668,14 @@ def _emit_gather(model: dict[str, Any]) -> str:
         _line(lines, indent + 1, "input_active = input_active & (gather_index >= input_global_base) & (gather_index < input_global_base + input_local_dim)")
     _line(lines, indent + 1, f"input_offsets = {input_offset()}")
     _line(lines, indent + 1, f"output_offsets = {output_offset()}")
-    _line(lines, indent + 1, "value = tl.load(input + input_offsets, mask=mask & input_active, other=0.0)")
-    _line(lines, indent + 1, "tl.store(output + output_offsets, value, mask=mask)")
+    _line(
+        lines,
+        indent + 1,
+        f"value = {_load_operand(model, 'Input', 'input', 'input_offsets', 'mask & input_active')}",
+    )
+    _append_store(
+        lines, indent + 1, model, "Output", "output", "output_offsets", "value", "mask"
+    )
     return _finish(lines)
 
 
@@ -4042,8 +4705,8 @@ def _emit_concat(model: dict[str, Any]) -> str:
     )
     _append_pointer_shard_coords(lines, 1, list(model["Inputs"]) + [model["Output"]])
     for input_index, input_ptr in enumerate(model["Inputs"]):
-        _line(lines, 1, f"input{input_index} = {input_ptr['Expression']}")
-    _line(lines, 1, f"output = {_ptr(model, 'Output')}")
+        _append_pointer_value_binding(lines, 1, input_ptr, f"input{input_index}")
+    _append_pointer_binding(lines, 1, model, "output", "Output")
     axis_offset = _zero()
     for input_index, input_shape in enumerate(model["InputShapes"]):
         input_strides = model["InputStrides"][input_index]
@@ -4062,8 +4725,20 @@ def _emit_concat(model: dict[str, Any]) -> str:
         _line(lines, indent + 1, f"mask = lane < {_dim(block_extent)}")
         _line(lines, indent + 1, f"input_offsets = {input_offset(input_shape, input_strides, block_axis)}")
         _line(lines, indent + 1, f"output_offsets = {output_offset(block_axis, axis_offset)}")
-        _line(lines, indent + 1, f"value = tl.load(input{input_index} + input_offsets, mask=mask)")
-        _line(lines, indent + 1, "tl.store(output + output_offsets, value, mask=mask)")
+        input_pointer = _access_pointer_value(
+            model["Inputs"][input_index], f"input{input_index}", "input_offsets"
+        )
+        _line(lines, indent + 1, f"value = tl.load({input_pointer}, mask=mask)")
+        _append_store(
+            lines,
+            indent + 1,
+            model,
+            "Output",
+            "output",
+            "output_offsets",
+            "value",
+            "mask",
+        )
         axis_offset = _add_dims(axis_offset, input_shape[model["Axis"]])
     return _finish(lines)
 
@@ -4129,8 +4804,21 @@ def _emit_scatter_nd(model: dict[str, Any]) -> str:
     _line(lines, indent + 1, f"copy_mask = copy_lane < {_dim(copy_block_extent)}")
     _line(lines, indent + 1, f"copy_input_offsets = {offset('copy', model['InputShape'], model['InputStrides'], copy_block_axis)}")
     _line(lines, indent + 1, f"copy_output_offsets = {offset('copy', model['OutputShape'], model['OutputStrides'], copy_block_axis)}")
-    _line(lines, indent + 1, "copy_value = tl.load(input + copy_input_offsets, mask=copy_mask)")
-    _line(lines, indent + 1, "tl.store(output + copy_output_offsets, copy_value, mask=copy_mask)")
+    _line(
+        lines,
+        indent + 1,
+        f"copy_value = {_load_operand(model, 'Input', 'input', 'copy_input_offsets', 'copy_mask')}",
+    )
+    _append_store(
+        lines,
+        indent + 1,
+        model,
+        "Output",
+        "output",
+        "copy_output_offsets",
+        "copy_value",
+        "copy_mask",
+    )
     _line(lines, 0)
     _line(lines, 1, "# scatter updates")
     indent = 1
@@ -4142,13 +4830,33 @@ def _emit_scatter_nd(model: dict[str, Any]) -> str:
     _line(lines, indent + 1, f"upd_mask = upd_lane < {_dim(updates_block_extent)}")
     _line(lines, indent + 1, f"indices_prefix_offsets = {indices_prefix_offset()}")
     for axis in range(index_depth):
-        _line(lines, indent + 1, f"scatter_idx{axis} = tl.load(indices + indices_prefix_offsets + {axis} * {_dim(model['IndicesStrides'][-1])}, mask=upd_mask, other=0)")
+        index_offset = (
+            f"indices_prefix_offsets + {axis} * {_dim(model['IndicesStrides'][-1])}"
+        )
+        _line(
+            lines,
+            indent + 1,
+            f"scatter_idx{axis} = {_load_operand(model, 'Indices', 'indices', index_offset, 'upd_mask', other='0')}",
+        )
         if signed_indices:
             _line(lines, indent + 1, f"scatter_idx{axis} = tl.where(scatter_idx{axis} < 0, scatter_idx{axis} + {_dim(model['OutputShape'][axis])}, scatter_idx{axis})")
     _line(lines, indent + 1, f"updates_offsets = {updates_offset()}")
     _line(lines, indent + 1, f"scatter_output_offsets = {scatter_output_offset()}")
-    _line(lines, indent + 1, "updates_value = tl.load(updates + updates_offsets, mask=upd_mask)")
-    _line(lines, indent + 1, "tl.store(output + scatter_output_offsets, updates_value, mask=upd_mask)")
+    _line(
+        lines,
+        indent + 1,
+        f"updates_value = {_load_operand(model, 'Updates', 'updates', 'updates_offsets', 'upd_mask')}",
+    )
+    _append_store(
+        lines,
+        indent + 1,
+        model,
+        "Output",
+        "output",
+        "scatter_output_offsets",
+        "updates_value",
+        "upd_mask",
+    )
     return _finish(lines)
 
 
@@ -4194,17 +4902,38 @@ def _emit_conv2d(model: dict[str, Any]) -> str:
     _line(lines, indent, f"for axis_start in tl.range(0, {_dim(block_extent)}, block_size):")
     _line(lines, indent + 1, "lane = axis_start + tl.arange(0, block_size)")
     _line(lines, indent + 1, f"mask = lane < {_dim(block_extent)}")
-    _line(lines, indent + 1, f"acc = tl.load(bias + {bias_offset}, mask=mask, other=0.0).to(tl.float32)")
+    _line(
+        lines,
+        indent + 1,
+        f"acc = {_load_operand(model, 'Bias', 'bias', bias_offset, 'mask')}.to(tl.float32)",
+    )
     _line(lines, indent + 1, f"for ic in tl.range(0, {input_channels_per_group}):")
     _line(lines, indent + 2, f"for kh in tl.range(0, {kernel_h}):")
     _line(lines, indent + 3, f"for kw in tl.range(0, {kernel_w}):")
     _line(lines, indent + 4, f"ih = {ih}")
     _line(lines, indent + 4, f"iw = {iw}")
     _line(lines, indent + 4, f"input_mask = mask & (ih >= 0) & (ih < {_dim(model['InputShape'][2])}) & (iw >= 0) & (iw < {_dim(model['InputShape'][3])})")
-    _line(lines, indent + 4, f"input_value = tl.load(input + {input_offset}, mask=input_mask, other=0.0).to(tl.float32)")
-    _line(lines, indent + 4, f"weight_value = tl.load(weights + {weights_offset}, mask=mask, other=0.0).to(tl.float32)")
+    _line(
+        lines,
+        indent + 4,
+        f"input_value = {_load_operand(model, 'Input', 'input', input_offset, 'input_mask')}.to(tl.float32)",
+    )
+    _line(
+        lines,
+        indent + 4,
+        f"weight_value = {_load_operand(model, 'Weights', 'weights', weights_offset, 'mask')}.to(tl.float32)",
+    )
     _line(lines, indent + 4, "acc += input_value * weight_value")
-    _line(lines, indent + 1, f"tl.store(output + {output_offset}, acc.to({model['OutputTritonDType']}), mask=mask)")
+    _append_store(
+        lines,
+        indent + 1,
+        model,
+        "Output",
+        "output",
+        output_offset,
+        f"acc.to({model['OutputTritonDType']})",
+        "mask",
+    )
     return _finish(lines)
 
 
@@ -4217,7 +4946,7 @@ def _emit_get_position_ids(model: dict[str, Any]) -> str:
     )
     _line(lines, 1, "shard_index = tl.program_id(0).to(tl.int64)")
     _append_pointer_shard_coords(lines, 1, [model["Output"]])
-    _line(lines, 1, f"output = {_ptr(model, 'Output')}")
+    _append_pointer_binding(lines, 1, model, "output", "Output")
     _line(lines, 1, f"global_start = {_dim(model['OutputGlobalOffsets'][0])}")
     indent = 2
     result_shape = "block_size"
@@ -4238,7 +4967,16 @@ def _emit_get_position_ids(model: dict[str, Any]) -> str:
     _line(lines, indent + 1, "result = tl.where(in_seq, (context_len + global_lane - query_start).to(tl.float32), result)")
     _line(lines, indent + 1, "active = active | in_seq")
     _line(lines, indent + 1, "query_start = query_end")
-    _line(lines, indent, f"tl.store(output + lane * {_dim(model['OutputStrides'][0])}, result, mask=mask & active)")
+    _append_store(
+        lines,
+        indent,
+        model,
+        "Output",
+        "output",
+        f"lane * {_dim(model['OutputStrides'][0])}",
+        "result",
+        "mask & active",
+    )
     return _finish(lines)
 
 
@@ -4342,13 +5080,17 @@ def _emit_reshard_direct(model: dict[str, Any]) -> str:
     _line(lines, indent + 1, f"input_offsets = {input_offsets}")
     _line(lines, indent + 1, f"output_offsets = {output_offsets}")
     destination_pool_index = _pool_index_expression(
-        "destination_shard_index", model["OutputPoolScopeSize"]
+        "destination_shard_index", model["OutputAddress"]["PoolScopeSize"]
     )
     _line(lines, indent + 1, f"destination_pool_index = {destination_pool_index}")
-    _line(lines, indent + 1, f"output_byte_offsets = destination_pool_index * {model['OutputPoolBytes']} + {model['OutputOffsetBytes']} + output_offsets * {model['ScalarElementSizeBytes']}")
+    _line(lines, indent + 1, f"output_byte_offsets = destination_pool_index * {model['OutputAddress']['PoolStrideBytes']} + {model['OutputAddress']['OffsetBytes']} + output_offsets * {model['ScalarElementSizeBytes']}")
     if not input_partial_mesh_axes:
-        _line(lines, indent + 1, "value = tl.load(input0 + input_offsets, mask=mask)")
+        input_pointer = _access_pointer(model, "Input", "input0", "input_offsets")
+        _line(lines, indent + 1, f"value = tl.load({input_pointer}, mask=mask)")
     else:
+        partial_input_address = model.get("PartialInputAddress")
+        if partial_input_address is None:
+            raise ValueError("PyNTT partial reshard requires PartialInputAddress")
         dtype = model["DType"]
         if dtype in ("float16", "bfloat16", "float32"):
             accumulator_dtype = "tl.float32"
@@ -4379,18 +5121,18 @@ def _emit_reshard_direct(model: dict[str, Any]) -> str:
             "source_shard_coord",
         )
         source_pool_index = _pool_index_expression(
-            "source_shard_index", model["InputPoolScopeSize"]
+            "source_shard_index", partial_input_address["PoolScopeSize"]
         )
         _line(lines, reduce_indent, f"source_shard_index = {source_shard_index}")
         _line(lines, reduce_indent, f"source_pool_index = {source_pool_index}")
-        _line(lines, reduce_indent, f"source_byte_offset = source_pool_index * {model['InputPoolBytes']} + {model['InputOffsetBytes']}")
-        input_pointer_type = _pointer_type(model["TritonDType"], model["Input"]["AddressSpace"])
-        _line(lines, reduce_indent, f"source = ({model['InputBaseName']} + source_byte_offset).to({input_pointer_type})")
+        _line(lines, reduce_indent, f"source_byte_offset = source_pool_index * {partial_input_address['PoolStrideBytes']} + {partial_input_address['OffsetBytes']}")
+        input_pointer_type = _pointer_type(model["TritonDType"], partial_input_address["AddressSpace"])
+        _line(lines, reduce_indent, f"source = ({partial_input_address['BaseName']} + source_byte_offset).to({input_pointer_type})")
         _line(lines, reduce_indent, f"source_value = tl.load(source + input_offsets, mask=mask, other={zero}).to({accumulator_dtype})")
         _line(lines, reduce_indent, "acc += source_value")
         _line(lines, indent + 1, "value = acc")
-    output_pointer_type = _pointer_type(model["TritonDType"], model["Output"]["AddressSpace"])
-    _line(lines, indent + 1, f"tl.store(({model['OutputBaseName']} + output_byte_offsets).to({output_pointer_type}), value, mask=mask)")
+    output_pointer_type = _pointer_type(model["TritonDType"], model["OutputAddress"]["AddressSpace"])
+    _line(lines, indent + 1, f"tl.store(({model['OutputAddress']['BaseName']} + output_byte_offsets).to({output_pointer_type}), value, mask=mask)")
     return _finish(lines)
 
 
@@ -4595,10 +5337,11 @@ def _emit_paged_attention(model: dict[str, Any]) -> str:
     _line(lines, 1, "shard_index = tl.program_id(0).to(tl.int64)")
     _line(lines, 1, f"layer_id_value = (tl.full((), 0, tl.int64) + ({model['LayerIdExpression']})).to(tl.int64)")
     _append_pointer_shard_coords(lines, 1, [model["Query"], model["Scale"], model["Output"]])
-    _line(lines, 1, f"query = {_ptr(model, 'Query')}")
-    _line(lines, 1, f"scale_ptr = {_ptr(model, 'Scale')}")
-    _line(lines, 1, f"output = {_ptr(model, 'Output')}")
-    _line(lines, 1, "scale_value = tl.load(scale_ptr + 0).to(tl.float32)")
+    _append_pointer_binding(lines, 1, model, "query", "Query")
+    _append_pointer_binding(lines, 1, model, "scale_ptr", "Scale")
+    _append_pointer_binding(lines, 1, model, "output", "Output")
+    scale_pointer = _access_pointer(model, "Scale", "scale_ptr")
+    _line(lines, 1, f"scale_value = tl.load({scale_pointer}).to(tl.float32)")
     _line(lines, 1, "num_seqs = tl.load(cache_meta + 0).to(tl.int64)")
     _append_shard_coords(lines, 1, model["Hierarchy"])
     _line(lines, 1, "max_seq_len = tl.full((), 0, tl.int64)")
@@ -4642,7 +5385,11 @@ def _emit_paged_attention(model: dict[str, Any]) -> str:
     _line(lines, 3, f"head_group = {model['GlobalNumQueryHeads']} // {cache['NumKVHeads']}")
     _line(lines, 3, "kv_head = global_q_head // head_group")
     _line(lines, 3, f"q_offsets = {query_vector_offset}")
-    _line(lines, 3, "q_values = tl.load(query + q_offsets, mask=found_seq, other=0.0)")
+    _line(
+        lines,
+        3,
+        f"q_values = {_load_operand(model, 'Query', 'query', 'q_offsets', 'found_seq')}",
+    )
     _line(lines, 3, 'max_score = -float("inf")')
     _line(lines, 3, "sum_exp = 0.0")
     _line(lines, 3, f"acc = tl.zeros((1, {cache['HeadDim']}), tl.float32)")
@@ -4677,7 +5424,9 @@ def _emit_paged_attention(model: dict[str, Any]) -> str:
     _line(lines, 3, "inv_sum = tl.where(sum_exp != 0.0, 1.0 / sum_exp, 0.0)")
     _line(lines, 3, f"result = tl.reshape(acc * inv_sum, ({cache['HeadDim']},))")
     _line(lines, 3, f"output_offsets = {output_vector_offset}")
-    _line(lines, 3, "tl.store(output + output_offsets, result, mask=found_seq)")
+    _append_store(
+        lines, 3, model, "Output", "output", "output_offsets", "result", "found_seq"
+    )
     return _finish(lines)
 
 
@@ -4694,7 +5443,6 @@ def _emit_update_paged_attention_kv_cache(model: dict[str, Any]) -> str:
     slots_lane_count = model["SlotsVectorLaneCount"]
     source_split_axes = sorted({axis for split_axes in model["SlotsSourceSplitAxes"] for axis in split_axes})
     topology_match_axes = [axis for axis in cache["NumBlocksSplitAxes"] if axis not in source_split_axes]
-    full_source_shard_index = _split_linear_expression(list(range(len(model["Hierarchy"]))), model["Hierarchy"], "source_shard_coord")
     block_index = "(topology_id * num_blocks_per_shard + block_id)" if cache["IdLength"] > 1 else "block_id"
     cache_offset = f"({block_index} * {cache['BlockElements']} + {section_offset} + (layer_id_value * {layer_stride} + cache_head_id * {head_stride} + cache_dim_block * {dim_block_stride} + cache_block_offset * {block_offset_stride}) * {lane_count} + cache_lane_id)"
 
@@ -4719,13 +5467,12 @@ def _emit_update_paged_attention_kv_cache(model: dict[str, Any]) -> str:
             return "source_dim_block"
         return f"local_idx{axis}"
 
-    vector_bytes = slots_lane_count * model["ScalarElementSizeBytes"]
     use_key_vector_copy = (
         model["CacheKind"] == 0
         and vectorized_dim == 5
         and slots_lane_count == lane_count
         and slots_lane_count > 1
-        and vector_bytes % 8 == 0
+        and slots_lane_count & (slots_lane_count - 1) == 0
         and cache["HeadDim"] % lane_count == 0
         and cache.get("TritonDType") == model["SlotsTritonDType"]
     )
@@ -4780,8 +5527,6 @@ def _emit_update_paged_attention_kv_cache(model: dict[str, Any]) -> str:
     for axis in range(len(model["SlotsShape"])):
         local_index = local_index_name(axis)
         _line(lines, 2, f"active = active & ({local_index} < {_dim(model['SlotsShape'][axis])})")
-    for axis in range(len(model["Hierarchy"])):
-        _line(lines, 2, f"source_shard_coord{axis} = shard_coord{axis}")
     for axis in range(len(model["SlotsShape"])):
         _line(lines, 2, f"source_idx{axis} = {local_index_name(axis)}")
     if cache["IdLength"] > 1:
@@ -4814,28 +5559,17 @@ def _emit_update_paged_attention_kv_cache(model: dict[str, Any]) -> str:
         _line(lines, 2, "cache_dim_block = logical_dim")
         _line(lines, 2, "cache_block_offset = block_offset")
         _line(lines, 2, "cache_lane_id = 0")
-    _line(lines, 2, f"source_shard_index = {full_source_shard_index}")
     _line(lines, 2, f"slot_offsets = {slot_offset(None) if use_key_vector_copy else slot_offset()}")
-    source_offsets_name = "source_byte_offsets" if model["SlotsAddressIsByteOffset"] else "source_element_offsets"
-    source_slot_offsets = (
-        f"slot_offsets * {model['ScalarElementSizeBytes']}"
-        if model["SlotsAddressIsByteOffset"]
-        else "slot_offsets"
-    )
-    _line(lines, 2, f"{source_offsets_name} = source_shard_index * {model['SlotsPoolBytes']} + {model['SlotsOffsetBytes']} + {source_slot_offsets}")
     _line(lines, 2, f"cache_offsets = {cache_offset}")
     if use_key_vector_copy:
-        word_count = vector_bytes // 8
-        source_word_pointer_type = _pointer_type("tl.uint64", model["Slots"]["AddressSpace"])
-        _line(lines, 2, f"source_words = ({model['SlotsBaseName']} + {source_offsets_name}).to({source_word_pointer_type})")
-        _line(lines, 2, "cache_words = (kv_cache + cache_offsets).to(tl.pointer_type(tl.uint64))")
-        for word_index in range(word_count):
-            suffix = "" if word_index == 0 else f" + {word_index}"
-            _line(lines, 2, f"word{word_index} = tl.load(source_words{suffix}, mask=active, other=0)")
-            _line(lines, 2, f"tl.store(cache_words{suffix}, word{word_index}, mask=active)")
+        _line(lines, 2, f"source_lane_offsets = tl.arange(0, {slots_lane_count})")
+        source_offsets = "slot_offsets[:, None] + source_lane_offsets[None, :]"
+        source_pointer = _access_pointer(model, "Slots", _ptr(model, "Slots"), source_offsets)
+        _line(lines, 2, f"values = tl.load({source_pointer}, mask=active[:, None], other=0.0)")
+        _line(lines, 2, "tl.store(kv_cache + cache_offsets[:, None] + source_lane_offsets[None, :], values, mask=active[:, None])")
     else:
-        source_pointer_type = _pointer_type(model["SlotsTritonDType"], model["Slots"]["AddressSpace"])
-        _line(lines, 2, f"value = tl.load(({model['SlotsBaseName']} + {source_offsets_name}).to({source_pointer_type}), mask=active, other=0.0)")
+        source_pointer = _access_pointer(model, "Slots", _ptr(model, "Slots"), "slot_offsets")
+        _line(lines, 2, f"value = tl.load({source_pointer}, mask=active, other=0.0)")
         _line(lines, 2, "tl.store(kv_cache + cache_offsets, value, mask=active)")
     return _finish(lines)
 

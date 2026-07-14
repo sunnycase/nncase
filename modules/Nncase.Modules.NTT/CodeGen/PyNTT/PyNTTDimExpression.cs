@@ -327,45 +327,71 @@ internal sealed class PyNTTDimExpressionEmitter : ExprFunctor<PyNTTDimExpression
 
     private static PyNTTDimExpression BuildBinaryChain(IReadOnlyList<PyNTTDimExpression> parts, string op, long identity)
     {
-        if (parts.Count == 0)
+        if (op == "*" && parts.Any(part => part.FixedValue == 0))
+        {
+            return Const(0);
+        }
+
+        var effectiveParts = op switch
+        {
+            "+" => parts.Where(part => part.FixedValue != 0).ToArray(),
+            "*" => parts.Where(part => part.FixedValue != 1).ToArray(),
+            _ => parts.ToArray(),
+        };
+        if (effectiveParts.Length == 0)
         {
             var text = identity.ToString(CultureInfo.InvariantCulture);
             return new(text, text, identity);
         }
 
-        if (parts.Count == 1)
+        if (effectiveParts.Length == 1)
         {
-            return parts[0];
+            return effectiveParts[0];
         }
 
         long? fixedValue = null;
-        if (parts.All(part => part.FixedValue.HasValue))
+        if (effectiveParts.All(part => part.FixedValue.HasValue))
         {
             fixedValue = op == "*"
-                ? parts.Aggregate(1L, (value, part) => checked(value * part.FixedValue!.Value))
-                : parts.Aggregate(0L, (value, part) => checked(value + part.FixedValue!.Value));
+                ? effectiveParts.Aggregate(1L, (value, part) => checked(value * part.FixedValue!.Value))
+                : effectiveParts.Aggregate(0L, (value, part) => checked(value + part.FixedValue!.Value));
         }
 
         long? rangeMin = null;
         long? rangeMax = null;
         if (op == "+")
         {
-            rangeMin = parts.All(part => part.MinValue.HasValue)
-                ? parts.Aggregate(0L, (value, part) => checked(value + part.MinValue!.Value))
+            rangeMin = effectiveParts.All(part => part.MinValue.HasValue)
+                ? effectiveParts.Aggregate(0L, (value, part) => checked(value + part.MinValue!.Value))
                 : null;
-            rangeMax = parts.All(part => part.MaxValue.HasValue)
-                ? parts.Aggregate(0L, (value, part) => checked(value + part.MaxValue!.Value))
+            rangeMax = effectiveParts.All(part => part.MaxValue.HasValue)
+                ? effectiveParts.Aggregate(0L, (value, part) => checked(value + part.MaxValue!.Value))
                 : null;
         }
-        else if (op == "*" && parts.All(part => part.MinValue.HasValue && part.MaxValue.HasValue && part.MinValue.Value >= 0))
+        else if (op == "*" && effectiveParts.All(part => part.MinValue.HasValue && part.MaxValue.HasValue))
         {
-            rangeMin = parts.Aggregate(1L, (value, part) => checked(value * part.MinValue!.Value));
-            rangeMax = parts.Aggregate(1L, (value, part) => checked(value * part.MaxValue!.Value));
+            var intervalMin = 1L;
+            var intervalMax = 1L;
+            foreach (var part in effectiveParts)
+            {
+                var products = new[]
+                {
+                    checked(intervalMin * part.MinValue!.Value),
+                    checked(intervalMin * part.MaxValue!.Value),
+                    checked(intervalMax * part.MinValue!.Value),
+                    checked(intervalMax * part.MaxValue!.Value),
+                };
+                intervalMin = products.Min();
+                intervalMax = products.Max();
+            }
+
+            rangeMin = intervalMin;
+            rangeMax = intervalMax;
         }
 
         return new(
-            $"({string.Join($" {op} ", parts.Select(part => part.PythonExpression))})",
-            $"({string.Join($" {op} ", parts.Select(part => part.TritonExpression))})",
+            $"({string.Join($" {op} ", effectiveParts.Select(part => part.PythonExpression))})",
+            $"({string.Join($" {op} ", effectiveParts.Select(part => part.TritonExpression))})",
             fixedValue,
             rangeMin,
             rangeMax);

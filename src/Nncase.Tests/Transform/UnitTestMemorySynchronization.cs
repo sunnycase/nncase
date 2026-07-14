@@ -125,7 +125,7 @@ public sealed class UnitTestMemorySynchronization : TestClassBase
         var module = new IRModule(main);
         module.Add(callee);
 
-        await new PlanMemorySynchronizationPass(PyNTTTarget.Kind).RunAsync(module, new());
+        await new PlanMemorySynchronizationPass(PyNTTTarget.Kind, MemorySynchronizationScopes.All).RunAsync(module, new());
 
         var rewrittenMain = Assert.IsType<PrimFunction>(module.Entry);
         Assert.Equal(4, rewrittenMain.Body.Count);
@@ -165,7 +165,7 @@ public sealed class UnitTestMemorySynchronization : TestClassBase
         var module = new IRModule(main);
         module.Add(callee);
 
-        await new PlanMemorySynchronizationPass(PyNTTTarget.Kind).RunAsync(module, new());
+        await new PlanMemorySynchronizationPass(PyNTTTarget.Kind, MemorySynchronizationScopes.All).RunAsync(module, new());
 
         var rewrittenMain = Assert.IsType<PrimFunction>(module.Entry);
         Assert.Equal(3, rewrittenMain.Body.Count);
@@ -201,7 +201,7 @@ public sealed class UnitTestMemorySynchronization : TestClassBase
         var module = new IRModule(main);
         module.Add(callee);
 
-        await new PlanMemorySynchronizationPass(PyNTTTarget.Kind).RunAsync(module, new());
+        await new PlanMemorySynchronizationPass(PyNTTTarget.Kind, MemorySynchronizationScopes.All).RunAsync(module, new());
 
         var rewrittenMain = Assert.IsType<PrimFunction>(module.Entry);
         Assert.Equal(4, rewrittenMain.Body.Count);
@@ -249,7 +249,7 @@ public sealed class UnitTestMemorySynchronization : TestClassBase
         module.Add(producer);
         module.Add(consumer);
 
-        await new PlanMemorySynchronizationPass(PyNTTTarget.Kind).RunAsync(module, new());
+        await new PlanMemorySynchronizationPass(PyNTTTarget.Kind, MemorySynchronizationScopes.All).RunAsync(module, new());
 
         var rewrittenMain = Assert.IsType<PrimFunction>(module.Entry);
         Assert.Equal(3, rewrittenMain.Body.Count);
@@ -276,7 +276,7 @@ public sealed class UnitTestMemorySynchronization : TestClassBase
             Array.Empty<IVar>());
         var module = new IRModule(main);
 
-        await new PlanMemorySynchronizationPass(PyNTTTarget.Kind).RunAsync(module, new());
+        await new PlanMemorySynchronizationPass(PyNTTTarget.Kind, MemorySynchronizationScopes.All).RunAsync(module, new());
 
         var rewrittenMain = Assert.IsType<PrimFunction>(module.Entry);
         Assert.Collection(
@@ -320,7 +320,7 @@ public sealed class UnitTestMemorySynchronization : TestClassBase
             Array.Empty<IVar>());
         var module = new IRModule(main);
 
-        await new PlanMemorySynchronizationPass(PyNTTTarget.Kind).RunAsync(module, new());
+        await new PlanMemorySynchronizationPass(PyNTTTarget.Kind, MemorySynchronizationScopes.All).RunAsync(module, new());
 
         var rewrittenMain = Assert.IsType<PrimFunction>(module.Entry);
         var rewrittenLoop = Assert.Single(ExprCollector.Collect(rewrittenMain.Body).OfType<Nncase.TIR.For>());
@@ -334,6 +334,47 @@ public sealed class UnitTestMemorySynchronization : TestClassBase
             field => Assert.Equal(
                 TIR.NTT.BarrierScope.Block,
                 Assert.IsType<TIR.NTT.Barrier>(Assert.IsType<Call>(field).Target).Scope));
+    }
+
+    [Fact]
+    public async Task TestBackendManagedBlockSynchronizationIsNotMaterialized()
+    {
+        var source = CreateWorkspaceBuffer("source", DataTypes.Float32, 0, 256, [64]);
+        var destination = CreateWorkspaceBuffer("destination", DataTypes.Float32, 512, 256, [64]);
+        var sharedPhysical = new PhysicalBuffer(
+            DataTypes.Float32.SizeInBytes,
+            Tensor.FromPointer(0, DataTypes.Float32),
+            256,
+            MemoryLocation.Shared);
+        var shared = new Nncase.TIR.Buffer(
+            "staging",
+            DataTypes.Float32,
+            new MemSpan(sharedPhysical, 0, 256),
+            new Dimension[] { 64 },
+            new Dimension[] { 1 },
+            null);
+        var main = new PrimFunction(
+            "main",
+            PyNTTTarget.Kind,
+            new Sequential(
+                T.Memcopy(shared, source),
+                TIR.F.NTT.Barrier(TIR.NTT.BarrierScope.Block),
+                T.Memcopy(destination, shared)),
+            Array.Empty<IVar>());
+        var module = new IRModule(main);
+
+        await new PlanMemorySynchronizationPass(
+            PyNTTTarget.Kind,
+            MemorySynchronizationScopes.Chip).RunAsync(module, new());
+
+        var rewrittenMain = Assert.IsType<PrimFunction>(module.Entry);
+        Assert.Collection(
+            rewrittenMain.Body.Fields.ToArray(),
+            field => Assert.IsType<Memcopy>(Assert.IsType<Call>(field).Target),
+            field => Assert.IsType<Memcopy>(Assert.IsType<Call>(field).Target));
+        Assert.DoesNotContain(
+            ExprCollector.Collect(rewrittenMain.Body).OfType<Call>(),
+            call => call.Target is TIR.NTT.Barrier);
     }
 
     private static Nncase.TIR.Buffer CreateWorkspaceBuffer(

@@ -6,7 +6,22 @@ namespace Nncase.CodeGen.PyNTT;
 public sealed record PyNTTBufferPointerTemplateModel(
     string Expression,
     int[]? ShardCoordHierarchy = null,
-    int AddressSpace = 1);
+    int AddressSpace = 1,
+    PyNTTLocalBufferTemplateModel? LocalBuffer = null);
+
+public sealed record PyNTTLocalBufferTemplateModel(
+    string DescriptorExpression,
+    long[] DescriptorShape,
+    string BaseScalarOffset,
+    long AvailableBytes,
+    int ScalarElementSizeBytes);
+
+public sealed record PyNTTPooledByteAddressTemplateModel(
+    string BaseName,
+    string OffsetBytes,
+    string PoolStrideBytes,
+    string PoolScopeSize,
+    int AddressSpace);
 
 public sealed record PyNTTTensorLoadTemplateModel(
     string FunctionName,
@@ -82,6 +97,8 @@ public sealed record PyNTTRegionCopyTemplateModel(
     PyNTTDimExpression[] SourceStrides,
     PyNTTDimExpression[] DestinationStrides,
     int VectorLaneCount,
+    string OperationKind,
+    bool RegionsCoincident,
     string Comment)
 {
     public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
@@ -259,14 +276,8 @@ public sealed record PyNTTReshardTemplateModel(
     string FunctionName,
     PyNTTBufferPointerTemplateModel Input,
     PyNTTBufferPointerTemplateModel Output,
-    string InputBaseName,
-    string InputOffsetBytes,
-    string InputPoolBytes,
-    string InputPoolScopeSize,
-    string OutputBaseName,
-    string OutputOffsetBytes,
-    string OutputPoolBytes,
-    string OutputPoolScopeSize,
+    PyNTTPooledByteAddressTemplateModel? PartialInputAddress,
+    PyNTTPooledByteAddressTemplateModel OutputAddress,
     int ScalarElementSizeBytes,
     string DType,
     string TritonDType,
@@ -556,11 +567,6 @@ public sealed record PyNTTUpdatePagedAttentionKVCacheTemplateModel(
     int[][] SlotsSplitAxes,
     int[][] SlotsSourceSplitAxes,
     int[] Hierarchy,
-    string SlotsBaseName,
-    string SlotsOffsetBytes,
-    string SlotsPoolBytes,
-    bool SlotsAddressIsByteOffset,
-    int ScalarElementSizeBytes,
     int SeqAxis,
     int HeadAxis,
     int DimAxis,

@@ -322,6 +322,67 @@ public sealed class UnitTestInlineSingleCallPrimFunctionsPass : TestClassBase
     }
 
     [Fact]
+    public async Task TestBufferizePreservesCanonicalSharedCalleeForInlining()
+    {
+        T.CreateBuffer(
+            new TensorType(DataTypes.UInt8, new[] { 4 }),
+            MemoryLocation.Data,
+            out var localBuffer,
+            "leaf_local");
+        var leaf = new PrimFunction(
+            "leaf",
+            ModuleKind,
+            new Sequential(new Call(new LoadT(), localBuffer, localBuffer)),
+            System.Array.Empty<IVar>());
+        var decoder = new PrimFunction(
+            "decoder",
+            ModuleKind,
+            new Sequential(new Call(leaf)),
+            System.Array.Empty<IVar>());
+        var main = new PrimFunction(
+            "main",
+            ModuleKind,
+            new Sequential(new Call(decoder), new Call(decoder)),
+            System.Array.Empty<IVar>());
+        var module = new IRModule(main);
+        module.Add(decoder);
+        module.Add(leaf);
+
+        var bufferizePass = new BufferizePass();
+        await bufferizePass.RunAsync(module, new());
+        await bufferizePass.RunAsync(module, new());
+
+        var bufferedDecoder = module.Functions.OfType<PrimFunction>().Single(function => function.Name == decoder.Name);
+        var bufferedLeaf = module.Functions.OfType<PrimFunction>().Single(function => function.Name == leaf.Name);
+        var mainCalls = GetExecutableStatements(main.Body).Select(Assert.IsType<Call>).ToArray();
+        Assert.Equal(2, mainCalls.Length);
+        Assert.All(mainCalls, call => Assert.Same(bufferedDecoder, call.Target));
+
+        var decoderWorkspaces = bufferedDecoder.Parameters
+            .ToArray()
+            .OfType<BufferVar>()
+            .Where(parameter => parameter.Role == BufferVarRole.Workspace)
+            .ToArray();
+        Assert.Collection(
+            decoderWorkspaces,
+            parameter => Assert.Equal(MemoryLocation.Data, parameter.Location),
+            parameter => Assert.Equal(MemoryLocation.ChipLocalData, parameter.Location),
+            parameter => Assert.Equal(MemoryLocation.BlockLocalData, parameter.Location));
+        var decoderCall = Assert.IsType<Call>(Assert.Single(GetExecutableStatements(bufferedDecoder.Body)));
+        Assert.Same(bufferedLeaf, decoderCall.Target);
+
+        await new InlineSingleCallPrimFunctionsPass(ModuleKind).RunAsync(module, new());
+
+        Assert.Equal(2, module.Functions.Count);
+        Assert.Contains(module.Functions, function => ReferenceEquals(function, bufferedDecoder));
+        Assert.DoesNotContain(module.Functions, function => ReferenceEquals(function, bufferedLeaf));
+        Assert.DoesNotContain(
+            GetExecutableStatements(bufferedDecoder.Body).OfType<Call>(),
+            call => call.Target is PrimFunction);
+        Assert.All(mainCalls, call => Assert.Same(bufferedDecoder, call.Target));
+    }
+
+    [Fact]
     public async Task TestInlineTransitiveSingleCallChain()
     {
         var tensorType = new TensorType(DataTypes.Float32, new[] { 4 });

@@ -16,9 +16,17 @@ namespace Nncase.Schedule.Bufferize;
 
 public sealed class BufferizeVisitor : ExprRewriter
 {
+    private static readonly MemoryLocation[] WorkspaceLocations =
+    [
+        MemoryLocation.Data,
+        MemoryLocation.ChipLocalData,
+        MemoryLocation.BlockLocalData,
+    ];
+
     private readonly IGrouping<string, PrimFunction> _functions;
     private readonly Dictionary<ReadOnlyDataKey, ValueRange<ulong>> _rdataRanges = new();
     private readonly Dictionary<ReadOnlyDataKey, ValueRange<ulong>> _chipLocalRdataRanges = new();
+    private readonly Dictionary<PrimFunction, PrimFunction> _workspaceAbiFunctions = new(new ReferenceEqualityComparer<PrimFunction>());
     private long _currentRdataStart;
     private long _currentChipLocalRdataStart;
     private long _currentBlockLocalRdataStart;
@@ -77,30 +85,132 @@ public sealed class BufferizeVisitor : ExprRewriter
 
     protected override BaseExpr RewriteLeafCall(Call expr)
     {
-        if (expr.Target is PrimFunction func && !func.Name.StartsWith("device_func"))
+        if (expr.Target is not PrimFunction func)
         {
-            if (!func.SchedResult.IsScheduled)
-            {
-                throw new InvalidOperationException($"Function {func.Name} is not scheduled, please run BufferizePass first.");
-            }
-
-            T.CreateBuffer(new TensorType(DataTypes.UInt8, [(long)func.SchedResult.DataUsage]), MemoryLocation.Data, out var dataBuffer, $"data_{_dataBufferId++}");
-            var dataVar = new BufferVar("data", TensorType.Scalar(new PointerType(DataTypes.UInt8)), BufferVarRole.Workspace, MemoryLocation.Data);
-
-            T.CreateBuffer(new TensorType(DataTypes.UInt8, [(long)func.SchedResult.ChipLocalDataPoolSize]), MemoryLocation.ChipLocalData, out var chipLocalDataBuffer, $"chip_local_data_{_dataBufferId++}");
-            var chipLocalDataVar = new BufferVar("chip_local_data", TensorType.Scalar(new PointerType(DataTypes.UInt8)), BufferVarRole.Workspace, MemoryLocation.ChipLocalData);
-
-            T.CreateBuffer(new TensorType(DataTypes.UInt8, [(long)func.SchedResult.BlockLocalDataPoolSize]), MemoryLocation.BlockLocalData, out var blockLocalDataBuffer, $"block_local_data_{_dataBufferId++}");
-            var blockLocalDataVar = new BufferVar("block_local_data", TensorType.Scalar(new PointerType(DataTypes.UInt8)), BufferVarRole.Workspace, MemoryLocation.BlockLocalData);
-
-            var funcParams = func.Parameters.ToArray().Append(dataVar).Append(chipLocalDataVar).Append(blockLocalDataVar).ToArray();
-            var funcArgs = expr.Arguments.ToArray().Append(dataBuffer).Append(chipLocalDataBuffer).Append(blockLocalDataBuffer).ToArray();
-            var newFunc = func.With(parameters: funcParams);
-            return expr.With(target: newFunc, arguments: funcArgs);
+            return expr;
         }
 
-        return expr;
+        if (!func.SchedResult.IsScheduled)
+        {
+            throw new InvalidOperationException($"Function {func.Name} is not scheduled, please run BufferizePass first.");
+        }
+
+        var workspaceParameters = GetWorkspaceParameters(func);
+        if (workspaceParameters.Length != 0)
+        {
+            ValidateWorkspaceParameters(func, workspaceParameters);
+            if (expr.Arguments.Length == func.Parameters.Length)
+            {
+                return expr;
+            }
+
+            var nonWorkspaceParameterCount = func.Parameters.Length - workspaceParameters.Length;
+            if (expr.Arguments.Length != nonWorkspaceParameterCount)
+            {
+                throw new InvalidOperationException(
+                    $"Cannot bufferize call to {func.Name}: expected {nonWorkspaceParameterCount} arguments before " +
+                    $"workspace lowering or {func.Parameters.Length} arguments after lowering, got {expr.Arguments.Length}.");
+            }
+
+            return expr.With(arguments: expr.Arguments.ToArray().Concat(CreateWorkspaceArguments(func)).ToArray());
+        }
+
+        if (expr.Arguments.Length != func.Parameters.Length)
+        {
+            throw new InvalidOperationException(
+                $"Cannot bufferize call to {func.Name}: expected {func.Parameters.Length} arguments, got {expr.Arguments.Length}.");
+        }
+
+        var workspaceAbiFunction = GetOrCreateWorkspaceAbiFunction(func);
+        var arguments = expr.Arguments.ToArray().Concat(CreateWorkspaceArguments(func)).ToArray();
+        return expr.With(target: workspaceAbiFunction, arguments: arguments);
     }
+
+    private PrimFunction GetOrCreateWorkspaceAbiFunction(PrimFunction func)
+    {
+        if (_workspaceAbiFunctions.TryGetValue(func, out var workspaceAbiFunction))
+        {
+            return workspaceAbiFunction;
+        }
+
+        var parameters = func.Parameters.ToArray().Concat(CreateWorkspaceParameters()).ToArray();
+        workspaceAbiFunction = func.With(parameters: parameters);
+        _workspaceAbiFunctions.Add(func, workspaceAbiFunction);
+        return workspaceAbiFunction;
+    }
+
+    private BufferVar[] CreateWorkspaceParameters()
+        => WorkspaceLocations
+            .Select(location => new BufferVar(
+                GetWorkspaceName(location),
+                TensorType.Scalar(new PointerType(DataTypes.UInt8)),
+                BufferVarRole.Workspace,
+                location))
+            .ToArray();
+
+    private BaseExpr[] CreateWorkspaceArguments(PrimFunction func)
+        => WorkspaceLocations.Select(location => (BaseExpr)CreateWorkspaceBuffer(func, location)).ToArray();
+
+    private TIR.Buffer CreateWorkspaceBuffer(PrimFunction func, MemoryLocation location)
+    {
+        var size = location switch
+        {
+            MemoryLocation.Data => func.SchedResult.DataUsage,
+            MemoryLocation.ChipLocalData => func.SchedResult.ChipLocalDataPoolSize,
+            MemoryLocation.BlockLocalData => func.SchedResult.BlockLocalDataPoolSize,
+            _ => throw new ArgumentOutOfRangeException(nameof(location), location, "Unsupported workspace memory location."),
+        };
+        var name = $"{GetWorkspaceName(location)}_{_dataBufferId++}";
+        return T.CreateBuffer(
+            new TensorType(DataTypes.UInt8, [checked((long)size)]),
+            location,
+            out _,
+            name);
+    }
+
+    private BufferVar[] GetWorkspaceParameters(PrimFunction func)
+        => func.Parameters
+            .ToArray()
+            .OfType<BufferVar>()
+            .Where(parameter => parameter.Role == BufferVarRole.Workspace)
+            .ToArray();
+
+    private void ValidateWorkspaceParameters(PrimFunction func, IReadOnlyList<BufferVar> workspaceParameters)
+    {
+        if (workspaceParameters.Count != WorkspaceLocations.Length)
+        {
+            throw new InvalidOperationException(
+                $"PrimFunction {func.Name} must have exactly {WorkspaceLocations.Length} workspace parameters, " +
+                $"got {workspaceParameters.Count}.");
+        }
+
+        var parameters = func.Parameters.ToArray();
+        for (int i = 0; i < WorkspaceLocations.Length; i++)
+        {
+            var parameterIndex = parameters.Length - WorkspaceLocations.Length + i;
+            if (!ReferenceEquals(parameters[parameterIndex], workspaceParameters[i]))
+            {
+                throw new InvalidOperationException(
+                    $"PrimFunction {func.Name} workspace parameters must be the final ABI parameters.");
+            }
+
+            if (workspaceParameters[i].Location != WorkspaceLocations[i])
+            {
+                throw new InvalidOperationException(
+                    $"PrimFunction {func.Name} workspace parameter {workspaceParameters[i].Name} has location " +
+                    $"{workspaceParameters[i].Location}, expected {WorkspaceLocations[i]}.");
+            }
+        }
+    }
+
+    private string GetWorkspaceName(MemoryLocation location)
+        => location switch
+        {
+            MemoryLocation.Data => "data",
+            MemoryLocation.ChipLocalData => "chip_local_data",
+            MemoryLocation.BlockLocalData => "block_local_data",
+            _ => throw new ArgumentOutOfRangeException(nameof(location), location, "Unsupported workspace memory location."),
+        };
 
     private void AssignOutputResult(PrimFunction func, IReadOnlyDictionary<MemoryLocation, BufferScheduleResult> scheduleResult)
     {

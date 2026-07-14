@@ -244,6 +244,15 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             "block_local_data_pool_stride_bytes",
         };
 
+        private static string[] CollectLiveParameters(string bodySource, IEnumerable<string> candidates)
+        {
+            return candidates
+                .Where(name => ContainsIdentifier(bodySource, name))
+                .Distinct(StringComparer.Ordinal)
+                .OrderBy(name => name, StringComparer.Ordinal)
+                .ToArray();
+        }
+
         private readonly PrimFunction _function;
         private readonly BaseExpr _bodyExpr;
         private readonly IReadOnlyDictionary<IVar, string> _parameterNames;
@@ -259,12 +268,12 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
         private readonly List<HelperKernelCallMetadata> _helperCalls = new();
         private readonly Dictionary<string, string[]> _helperArguments = new(StringComparer.Ordinal);
         private readonly Dictionary<string, string[]> _helperScalarArguments = new(StringComparer.Ordinal);
-        private readonly SortedSet<string> _helperHiddenArguments = new(StringComparer.Ordinal);
         private readonly List<PyNTTKVCacheFieldInputMetadata> _kvCacheFieldInputs;
         private readonly Dictionary<string, PyNTTKVCacheStorageMetadata?> _formalObjectFieldStorages = new(StringComparer.Ordinal);
         private readonly SortedSet<string> _runtimeScalarNames;
         private readonly SortedSet<string> _helperScalarNameCandidates = new(StringComparer.Ordinal);
         private readonly Dictionary<string, int> _activeLocalScalarNames = new(StringComparer.Ordinal);
+        private readonly Dictionary<string, int> _activeLocalBufferNames = new(StringComparer.Ordinal);
         private readonly Dictionary<string, Stack<PyNTTDimExpression>> _activeLoopVariableRanges = new(StringComparer.Ordinal);
         private readonly SortedSet<string> _abiViewStrideArgNames;
         private readonly Dictionary<string, int> _helperCounters = new();
@@ -281,6 +290,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
         private readonly Dictionary<TIR.Buffer, PyNTTDimExpression[]> _bufferGlobalOffsetOverrides = new(ReferenceEqualityComparer.Instance);
         private readonly Dictionary<TIR.Buffer, int[][]> _bufferSourceSplitAxesOverrides = new(ReferenceEqualityComparer.Instance);
         private readonly Dictionary<TIR.Buffer, BufferViewSource> _bufferViewSourceByBuffer = new(ReferenceEqualityComparer.Instance);
+        private readonly Dictionary<TIR.Buffer, SharedBufferAllocation> _sharedBufferAllocations = new(ReferenceEqualityComparer.Instance);
         private readonly Dictionary<IVar, BaseExpr> _letBindings = new(ReferenceEqualityComparer.Instance);
         private readonly IReadOnlyDictionary<IVar, string> _formalTensorParameterBaseNames;
         private readonly IReadOnlyDictionary<IVar, string> _formalTensorParameterPoolStrideNames;
@@ -309,12 +319,14 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
         private readonly HashSet<string> _activeDeviceFunctionNames;
         private readonly Dictionary<PrimFunction, DeviceFunctionDefinition> _deviceFunctionDefinitions;
         private readonly Dictionary<string, DeviceFunctionDefinition> _deviceFunctionDefinitionsByName;
+        private readonly Stack<Dictionary<Call, ReductionState>> _reductionScopes = new();
         private long _nestedBlockLocalDataPoolBytes;
         private long _nestedSharedMemoryBytes;
+        private long _sharedAliasRequiredBytes;
         private PrimFunction _currentFunction;
         private int _bodyIndent;
         private int _reductionStateCounter;
-        private readonly Stack<Dictionary<Call, ReductionState>> _reductionScopes = new();
+        private int _sharedBufferAllocationCounter;
         private ReductionState? _currentReductionState;
 
         public PyNTTPrimFunctionSourceVisitor(
@@ -406,7 +418,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     .Select((output, index) => (output.Name, Index: index))
                     .Where(output => !materializedOutputIndices.Contains(output.Index))
                     .Select(output => output.Name);
-                throw new NotSupportedException($"PyNTT PrimFunction {_function.Name} does not contain TensorStore for output(s): {string.Join(", ", missingOutputs)}.");
+                throw new NotSupportedException($"PyNTT PrimFunction {_function.Name} does not materialize output(s): {string.Join(", ", missingOutputs)}.");
             }
 
             var outputs = _outputs
@@ -539,9 +551,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             RegisterInOutObjectOutputAliases();
             var isScheduledRegionFunction = PyNTTPrimFunctionRoles.IsScheduledRegionFunction(_currentFunction);
             var bodySource = _body.ToString().TrimEnd();
-            var liveExtraParameters = _extraWorkspaceBaseNames
-                .Where(name => ContainsIdentifier(bodySource, name))
-                .ToArray();
+            var liveExtraParameters = CollectLiveParameters(bodySource, _extraWorkspaceBaseNames);
             return new(
                 new DeviceFunctionRenderSpec(
                     name,
@@ -655,6 +665,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             }
 
             var outerLocalNames = _activeLocalScalarNames.Keys
+                .Concat(_activeLocalBufferNames.Keys)
                 .OrderBy(name => name, StringComparer.Ordinal)
                 .ToArray();
             var bodyStart = _body.Length;
@@ -671,9 +682,9 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 var deviceFunctionName = _sharedHelperRegistry.GetNextCodegenScopeDeviceFunctionName(
                     _ownerName,
                     scopeName);
-                var extraParameters = outerLocalNames
-                    .Where(name => ContainsIdentifier(bodySource, name))
-                    .ToArray();
+                var extraParameters = CollectLiveParameters(
+                    bodySource,
+                    outerLocalNames.Concat(_extraWorkspaceBaseNames));
                 _deviceFunctions.Add(
                     new DeviceFunctionRenderSpec(
                         deviceFunctionName,
@@ -847,9 +858,23 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 return default;
             }
 
-            var value = MaterializeLetBinding(expr.Var, expr.Expression);
+            var boundExpression = UnwrapInputBoxing(expr.Expression);
+            var value = MaterializeLetBinding(expr.Var, boundExpression);
             var hadPrevious = _letBindings.TryGetValue(expr.Var, out var previous);
             _letBindings[expr.Var] = value;
+            SharedBufferAllocation? sharedAllocation = null;
+            var hadPreviousSharedAllocation = false;
+            SharedBufferAllocation? previousSharedAllocation = null;
+            if (boundExpression is Call allocateBufferView &&
+                allocateBufferView.Target is Nncase.IR.Buffers.AllocateBufferView &&
+                value is TIR.Buffer sharedBuffer &&
+                sharedBuffer.MemSpan.Buffer.Location == MemoryLocation.Shared)
+            {
+                sharedAllocation = EmitSharedBufferAllocation(expr.Var, sharedBuffer);
+                hadPreviousSharedAllocation = _sharedBufferAllocations.TryGetValue(sharedBuffer, out previousSharedAllocation);
+                _sharedBufferAllocations[sharedBuffer] = sharedAllocation;
+                PushLocalBuffer(sharedAllocation.DescriptorName);
+            }
 
             try
             {
@@ -857,6 +882,19 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             }
             finally
             {
+                if (sharedAllocation is not null)
+                {
+                    PopLocalBuffer(sharedAllocation.DescriptorName);
+                    if (hadPreviousSharedAllocation)
+                    {
+                        _sharedBufferAllocations[(TIR.Buffer)value] = previousSharedAllocation!;
+                    }
+                    else
+                    {
+                        _sharedBufferAllocations.Remove((TIR.Buffer)value);
+                    }
+                }
+
                 if (hadPrevious)
                 {
                     _letBindings[expr.Var] = previous!;
@@ -1859,8 +1897,8 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 "triton/kernels/TensorRegionCopy.py.jinja",
                 new PyNTTRegionCopyTemplateModel(
                     helperName,
-                    GetBufferScalarPointer(src),
-                    GetBufferScalarPointer(dest),
+                    GetRegionCopyBufferPointer(src),
+                    GetRegionCopyBufferPointer(dest),
                     GetPyNTTDTypeName(src.ElemType),
                     GetScalarTritonDType(src.ElemType),
                     sourceShape,
@@ -1870,8 +1908,12 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     GetBufferStrides(src),
                     GetBufferStrides(dest),
                     GetVectorLaneElementCount(src.ElemType),
+                    operation,
+                    sourceShape.Zip(destinationShape).All(pair => EquivalentDim(pair.First, pair.Second)) &&
+                    sourceGlobalOffsets.Zip(destinationGlobalOffsets).All(pair => EquivalentDim(pair.First, pair.Second)),
                     $"{operation}: {src.Name} -> {dest.Name}"));
             WriteLine(BuildHelperCall(helperName));
+            MarkStoredOutput(dest, $"PyNTT {operation}");
         }
 
         private static void ValidateMatchingBufferDType(string context, TIR.Buffer src, TIR.Buffer dest)
@@ -2407,8 +2449,10 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             _attrs["op"] = "reshard";
             _attrs["dtype"] = outputScalarDType;
             _attrs["shape"] = globalShape;
-            var inputRef = ResolveByteAddressedBufferRef(input);
             var outputRef = ResolveByteAddressedBufferRef(output);
+            var partialInputRef = partialAxes.Length > 0
+                ? ResolveByteAddressedBufferRef(input)
+                : null;
             var inputSplitAxes = GetSplitAxes(gatherReduceScatter.InType);
             var conflictingAxes = inputSplitAxes.SelectMany(axes => axes).Intersect(partialAxes).Distinct().ToArray();
             if (conflictingAxes.Length > 0)
@@ -2417,7 +2461,9 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             }
 
             var reductionGroupSize = partialAxes.Aggregate(1L, (size, axis) => checked(size * hierarchy[axis]));
-            if (reductionGroupSize > 1 && IsZeroOffset(inputRef.PoolStrideBytes))
+            if (reductionGroupSize > 1 &&
+                partialInputRef is { } reductionInputRef &&
+                IsZeroOffset(reductionInputRef.PoolStrideBytes))
             {
                 throw new NotSupportedException($"PyNTT GatherReduceScatter partial input {input.Name} requires distinct per-block storage.");
             }
@@ -2426,14 +2472,8 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 helperName,
                 GetBufferScalarPointer(input),
                 GetBufferScalarPointer(output),
-                inputRef.BaseName,
-                inputRef.OffsetBytes,
-                inputRef.PoolStrideBytes,
-                inputRef.PoolScopeSize,
-                outputRef.BaseName,
-                outputRef.OffsetBytes,
-                outputRef.PoolStrideBytes,
-                outputRef.PoolScopeSize,
+                partialInputRef is null ? null : GetPooledByteAddressTemplateModel(partialInputRef),
+                GetPooledByteAddressTemplateModel(outputRef),
                 GetScalarElementSizeBytes(output.ElemType),
                 outputScalarDType,
                 GetScalarTritonDType(output.ElemType),
@@ -3978,7 +4018,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 blockNs[2],
                 model.Comment);
 
-            WriteHelperTemplate(templatePath, model);
+            WriteHelperTemplate(templatePath, model, requiresInline: true);
             var updateCall = BuildHelperCall(
                 model.FunctionName,
                 state.Names.Select(BuildRawPythonArgument).ToArray());
@@ -4341,7 +4381,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 blockN,
                 model.Comment);
 
-            WriteHelperTemplate(templatePath, model);
+            WriteHelperTemplate(templatePath, model, requiresInline: true);
             var updateCall = BuildHelperCall(
                 model.FunctionName,
                 state.Names.Select(BuildRawPythonArgument).ToArray());
@@ -4798,7 +4838,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 blockN,
                 model.Comment);
 
-            WriteHelperTemplate(templatePath, model);
+            WriteHelperTemplate(templatePath, model, requiresInline: true);
             var updateCall = BuildHelperCall(model.FunctionName, BuildRawPythonArgument(state.Names[0]));
             WriteControlLine($"{state.Names[0]} = {updateCall}");
             state.UpdateEmitted = true;
@@ -4939,7 +4979,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 trackElementCount,
                 model.Comment);
 
-            WriteHelperTemplate(state.TemplatePath, model);
+            WriteHelperTemplate(state.TemplatePath, model, requiresInline: true);
             var updateCall = BuildHelperCall(
                 model.FunctionName,
                 state.Names.Select(BuildRawPythonArgument).ToArray());
@@ -5343,7 +5383,6 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             _attrs["layer_id"] = layerIdExpression;
             var helperName = GetNextHelperName("update_paged_attention_kv_cache");
             var slotsOperand = GetBufferScalarPointer(slots);
-            var slotsRef = ResolveBufferRef(slots);
             WriteHelperTemplate(
                 "triton/kernels/UpdatePagedAttentionKVCache.py.jinja",
                 new PyNTTUpdatePagedAttentionKVCacheTemplateModel(
@@ -5358,11 +5397,6 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     GetBufferSplitAxes(slots, slots.Dimensions.Length),
                     GetBufferSourceSplitAxes(slots, slots.Dimensions.Length),
                     GetHierarchy(slots),
-                    slotsRef.BaseName,
-                    slotsRef.OffsetBytes,
-                    slotsRef.PoolStrideBytes,
-                    slotsRef.IsByteAddressed,
-                    GetScalarElementSizeBytes(slots.ElemType),
                     seqAxis,
                     headAxis,
                     dimAxis,
@@ -5614,6 +5648,132 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             TrackObjectViewSource(result, source);
             TrackObjectViewAlias(result, source);
             return result;
+        }
+
+        private SharedBufferAllocation EmitSharedBufferAllocation(IVar variable, TIR.Buffer buffer)
+        {
+            var scalarElementSizeBytes = GetScalarElementSizeBytes(buffer.ElemType);
+            var physicalOffsetBytes = GetFixedDimension(
+                buffer.MemSpan.Buffer.Start,
+                $"PyNTT shared buffer {buffer.Name} physical offset");
+            var physicalSizeBytes = GetFixedDimension(
+                buffer.MemSpan.Buffer.Size,
+                $"PyNTT shared buffer {buffer.Name} physical size");
+            var spanOffsetBytes = GetFixedDimension(
+                buffer.MemSpan.Start,
+                $"PyNTT shared buffer {buffer.Name} span offset");
+            var spanSizeBytes = GetFixedDimension(
+                buffer.MemSpan.Size,
+                $"PyNTT shared buffer {buffer.Name} span size");
+            if (physicalOffsetBytes < 0 ||
+                physicalSizeBytes <= 0 ||
+                spanOffsetBytes < 0 ||
+                spanSizeBytes <= 0 ||
+                checked(spanOffsetBytes + spanSizeBytes) > physicalSizeBytes)
+            {
+                throw new NotSupportedException(
+                    $"PyNTT shared AllocateBufferView {variable.Name} has invalid physical range " +
+                    $"[{physicalOffsetBytes}, {checked(physicalOffsetBytes + physicalSizeBytes)}) and span " +
+                    $"[{spanOffsetBytes}, {checked(spanOffsetBytes + spanSizeBytes)}).");
+            }
+
+            var aliasOffsetBytes = checked(physicalOffsetBytes + spanOffsetBytes);
+            if (scalarElementSizeBytes <= 0 ||
+                aliasOffsetBytes % scalarElementSizeBytes != 0 ||
+                spanSizeBytes % scalarElementSizeBytes != 0)
+            {
+                throw new NotSupportedException(
+                    $"PyNTT shared AllocateBufferView {variable.Name} range " +
+                    $"[{aliasOffsetBytes}, {checked(aliasOffsetBytes + spanSizeBytes)}) is not aligned " +
+                    $"to scalar element size {scalarElementSizeBytes}.");
+            }
+
+            var elementCount = checked((ulong)(spanSizeBytes / scalarElementSizeBytes));
+            if (elementCount == 0 || elementCount > long.MaxValue)
+            {
+                throw new NotSupportedException(
+                    $"PyNTT shared AllocateBufferView {variable.Name} with {elementCount} elements " +
+                    "cannot be represented as a Triton memdesc.");
+            }
+
+            var descriptorShape = GetSharedDescriptorShape(variable, buffer, checked((long)elementCount));
+            var descriptorElementCount = descriptorShape.Aggregate(1L, (product, value) => checked(product * value));
+            var descriptorSizeBytes = checked(descriptorElementCount * scalarElementSizeBytes);
+            var descriptorEndBytes = checked(aliasOffsetBytes + descriptorSizeBytes);
+            _sharedAliasRequiredBytes = Math.Max(_sharedAliasRequiredBytes, descriptorEndBytes);
+            var descriptorName = SanitizeBoundedPythonIdentifier(
+                $"{variable.Name}_shared_buffer_{(_sharedBufferAllocationCounter++).ToString(CultureInfo.InvariantCulture)}");
+            var tritonDType = GetScalarTritonDType(buffer.ElemType);
+            WriteControlLine(
+                $"{descriptorName} = tle.gpu.alloc([{string.Join(", ", descriptorShape.Select(value => value.ToString(CultureInfo.InvariantCulture)))}], " +
+                $"dtype={tritonDType}, layout=None, scope=tle.gpu.smem, alias=pyntt_shared_arena, " +
+                $"alias_offset_bytes={aliasOffsetBytes.ToString(CultureInfo.InvariantCulture)}, " +
+                "nv_mma_shared_layout=False)");
+            return new(
+                descriptorName,
+                descriptorShape,
+                spanSizeBytes,
+                scalarElementSizeBytes,
+                tritonDType);
+        }
+
+        private long[] GetSharedDescriptorShape(IVar variable, TIR.Buffer buffer, long elementCount)
+        {
+            var logicalShape = GetBufferShape(buffer);
+            if (logicalShape.Length == 0)
+            {
+                throw new NotSupportedException(
+                    $"PyNTT shared AllocateBufferView {variable.Name} has a rank-zero TIR Buffer. " +
+                    "FlagTree TLE requires a non-empty memdesc shape.");
+            }
+
+            var scalarLogicalShape = logicalShape
+                .Select((dimension, axis) => dimension.MaxValue is { } value && value > 0
+                    ? value
+                    : throw new NotSupportedException(
+                        $"PyNTT shared AllocateBufferView {variable.Name} dimension {axis} must have a positive static maximum, " +
+                        $"got range [{dimension.MinValue}, {dimension.MaxValue}]."))
+                .ToArray();
+            scalarLogicalShape[^1] = checked(scalarLogicalShape[^1] * GetVectorLaneElementCount(buffer.ElemType));
+            var shapeElementCount = scalarLogicalShape.Aggregate(1L, (product, value) => checked(product * value));
+            if (shapeElementCount < elementCount)
+            {
+                throw new NotSupportedException(
+                    $"PyNTT shared AllocateBufferView {variable.Name} physical descriptor shape " +
+                    $"[{string.Join(",", scalarLogicalShape)}] contains {shapeElementCount} scalar elements, " +
+                    $"but its TIR MemSpan contains {elementCount}. The descriptor cannot address the complete physical span; " +
+                    "non-compact logical views must be represented with BufferSubview.");
+            }
+
+            var descriptorShape = scalarLogicalShape.ToArray();
+            var powerOfTwoSuffixStart = descriptorShape.Length;
+            while (powerOfTwoSuffixStart > 0 &&
+                   System.Numerics.BitOperations.IsPow2((ulong)descriptorShape[powerOfTwoSuffixStart - 1]))
+            {
+                powerOfTwoSuffixStart--;
+            }
+
+            if (powerOfTwoSuffixStart > 0)
+            {
+                var collapsedPrefix = 1L;
+                for (var axis = 0; axis < powerOfTwoSuffixStart; axis++)
+                {
+                    collapsedPrefix = checked(collapsedPrefix * descriptorShape[axis]);
+                    descriptorShape[axis] = 1;
+                }
+
+                var paddedPrefix = System.Numerics.BitOperations.RoundUpToPowerOf2((ulong)collapsedPrefix);
+                if (paddedPrefix == 0 || paddedPrefix > long.MaxValue)
+                {
+                    throw new NotSupportedException(
+                        $"PyNTT shared AllocateBufferView {variable.Name} prefix extent {collapsedPrefix} " +
+                        "cannot be represented as a FlagTree TLE descriptor dimension.");
+                }
+
+                descriptorShape[0] = checked((long)paddedPrefix);
+            }
+
+            return descriptorShape;
         }
 
         private TIR.Buffer MaterializeBufferSubview(string name, Call call)
@@ -6531,19 +6691,61 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
         private PyNTTBufferPointerTemplateModel GetBufferPointer(TIR.Buffer buffer)
         {
             var bufferRef = ResolveBufferRef(buffer);
-            return new(BuildPointerExpression(bufferRef, GetTritonDType(buffer.ElemType)), bufferRef.ShardCoordHierarchy, bufferRef.AddressSpace);
+            return new(
+                BuildPointerExpression(bufferRef, GetTritonDType(buffer.ElemType)),
+                bufferRef.ShardCoordHierarchy,
+                bufferRef.AddressSpace,
+                TryCreateLocalBuffer(buffer, bufferRef));
         }
 
         private PyNTTBufferPointerTemplateModel GetBufferScalarPointer(TIR.Buffer buffer)
         {
             var bufferRef = ResolveBufferRef(buffer);
-            return new(BuildPointerExpression(bufferRef, GetScalarTritonDType(buffer.ElemType)), bufferRef.ShardCoordHierarchy, bufferRef.AddressSpace);
+            return new(
+                BuildPointerExpression(bufferRef, GetScalarTritonDType(buffer.ElemType)),
+                bufferRef.ShardCoordHierarchy,
+                bufferRef.AddressSpace,
+                TryCreateLocalBuffer(buffer, bufferRef));
         }
 
         private PyNTTBufferPointerTemplateModel GetBufferScalarPointer(TIR.Buffer buffer, string indexExpression)
         {
             var bufferRef = ResolveBufferRef(buffer) with { IndexExpression = indexExpression };
-            return new(BuildPointerExpression(bufferRef, GetScalarTritonDType(buffer.ElemType)), bufferRef.ShardCoordHierarchy, bufferRef.AddressSpace);
+            return new(
+                BuildPointerExpression(bufferRef, GetScalarTritonDType(buffer.ElemType)),
+                bufferRef.ShardCoordHierarchy,
+                bufferRef.AddressSpace,
+                TryCreateLocalBuffer(buffer, bufferRef));
+        }
+
+        private PyNTTBufferPointerTemplateModel GetRegionCopyBufferPointer(TIR.Buffer buffer)
+        {
+            var bufferRef = ResolveBufferRef(buffer);
+            var pointer = BuildPointerExpression(bufferRef, GetScalarTritonDType(buffer.ElemType));
+            var localBuffer = TryCreateLocalBuffer(buffer, bufferRef);
+            return new(pointer, bufferRef.ShardCoordHierarchy, bufferRef.AddressSpace, localBuffer);
+        }
+
+        private PyNTTLocalBufferTemplateModel? TryCreateLocalBuffer(
+            TIR.Buffer buffer,
+            BufferRef bufferRef)
+        {
+            if (bufferRef.SharedAllocation is not { } sharedAllocation ||
+                bufferRef.PoolStrideBytes != "0" ||
+                bufferRef.IndexExpression is not null ||
+                bufferRef.IsByteAddressed ||
+                sharedAllocation.ScalarElementSizeBytes != GetScalarElementSizeBytes(buffer.ElemType) ||
+                sharedAllocation.TritonDType != GetScalarTritonDType(buffer.ElemType))
+            {
+                return null;
+            }
+
+            return new(
+                sharedAllocation.DescriptorName,
+                sharedAllocation.DescriptorShape,
+                bufferRef.OffsetBytes,
+                sharedAllocation.AvailableBytes,
+                sharedAllocation.ScalarElementSizeBytes);
         }
 
         private string BuildFormalTensorBasePointerArgument(TIR.Buffer buffer)
@@ -6573,6 +6775,19 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
 
         private BufferRef ResolveBufferRef(TIR.Buffer buffer)
         {
+            if (_sharedBufferAllocations.TryGetValue(buffer, out var sharedAllocation))
+            {
+                return new BufferRef(
+                    sharedAllocation.DescriptorName,
+                    "0",
+                    "0",
+                    null,
+                    null,
+                    false,
+                    AddressSpace: 3,
+                    SharedAllocation: sharedAllocation);
+            }
+
             if (_bufferViewSourceByBuffer.TryGetValue(buffer, out var viewSource))
             {
                 return ResolveBufferViewRef(viewSource);
@@ -6599,7 +6814,9 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 : null;
             if (buffer.MemSpan.Buffer.Location == MemoryLocation.Shared)
             {
-                _helperHiddenArguments.Add("pyntt_shared_base");
+                throw new NotSupportedException(
+                    $"PyNTT shared buffer {buffer.Name} is used outside its TIR AllocateBufferView scope. " +
+                    "Shared storage must be allocated by a Let-bound AllocateBufferView before any TIR operation references it.");
             }
 
             return buffer.MemSpan.Buffer.Location switch
@@ -6608,7 +6825,6 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 MemoryLocation.Data => new(GetDataBaseName(buffer), offsetBytes, "data_pool_stride_bytes", "shard_index", shardCoordHierarchy, true),
                 MemoryLocation.ChipLocalData => new(GetChipLocalDataBaseName(buffer), offsetBytes, "0", null, shardCoordHierarchy, true),
                 MemoryLocation.BlockLocalData => CreateBlockLocalBufferRef(buffer, offsetBytes, shardCoordHierarchy),
-                MemoryLocation.Shared => new("pyntt_shared_base", offsetBytes, "0", null, shardCoordHierarchy, true, AddressSpace: 3),
                 MemoryLocation.Rdata => new("rdata", offsetBytes, "0", null, shardCoordHierarchy, true),
                 MemoryLocation.ChipLocalRdata => new("chip_local_rdata", offsetBytes, "0", null, shardCoordHierarchy, true),
                 MemoryLocation.BlockLocalRdata => new("block_local_rdata", offsetBytes, PyNTTRDataUtility.GetLocalRDataTableStrideBytes(_currentFunction.SchedResult.BlockLocalRdatas, _targetOptions, "b").ToString(CultureInfo.InvariantCulture), "shard_index", shardCoordHierarchy, true),
@@ -6619,6 +6835,13 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
         private BufferRef ResolveByteAddressedBufferRef(TIR.Buffer buffer)
         {
             var bufferRef = ResolveBufferRef(buffer);
+            if (bufferRef.SharedAllocation is { } sharedAllocation)
+            {
+                throw new NotSupportedException(
+                    $"PyNTT shared descriptor {sharedAllocation.DescriptorName} cannot be converted to a byte address. " +
+                    "The consuming helper must use PyNTTBufferPointerTemplateModel.LocalBuffer and tle.gpu.local_ptr.");
+            }
+
             if (bufferRef.IsByteAddressed)
             {
                 return bufferRef;
@@ -6633,6 +6856,14 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 IsByteAddressed = true,
             };
         }
+
+        private static PyNTTPooledByteAddressTemplateModel GetPooledByteAddressTemplateModel(BufferRef bufferRef)
+            => new(
+                bufferRef.BaseName,
+                bufferRef.OffsetBytes,
+                bufferRef.PoolStrideBytes,
+                bufferRef.PoolScopeSize,
+                bufferRef.AddressSpace);
 
         private BufferRef CreateBlockLocalBufferRef(TIR.Buffer buffer, string offsetBytes, int[]? shardCoordHierarchy)
         {
@@ -6689,7 +6920,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
         private long GetSharedMemoryBytes()
         {
             var localBytes = GetMemoryLocationPoolSizeBytes(_bodyExpr, MemoryLocation.Shared);
-            var requiredBytes = Math.Max(localBytes, _nestedSharedMemoryBytes);
+            var requiredBytes = Math.Max(Math.Max(localBytes, _nestedSharedMemoryBytes), _sharedAliasRequiredBytes);
             if (requiredBytes == 0)
             {
                 return 0;
@@ -6905,6 +7136,24 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
 
         private string BuildPointerExpression(BufferRef bufferRef, string tritonDType)
         {
+            if (bufferRef.SharedAllocation is { } sharedAllocation)
+            {
+                if (bufferRef.PoolStrideBytes != "0" || bufferRef.IndexExpression is not null || bufferRef.IsByteAddressed)
+                {
+                    throw new NotSupportedException(
+                        $"PyNTT shared descriptor {sharedAllocation.DescriptorName} cannot use byte-addressed or pooled pointer arithmetic.");
+                }
+
+                if (tritonDType != sharedAllocation.TritonDType)
+                {
+                    throw new NotSupportedException(
+                        $"PyNTT shared descriptor {sharedAllocation.DescriptorName} has element type {sharedAllocation.TritonDType}, " +
+                        $"but codegen requested {tritonDType}. A dtype reinterpretation must be represented by a typed TIR buffer view.");
+                }
+
+                return BuildSharedLocalPointerExpression(sharedAllocation, bufferRef.OffsetBytes);
+            }
+
             var expression = bufferRef.BaseName;
             if (!string.IsNullOrWhiteSpace(bufferRef.IndexExpression) && bufferRef.PoolStrideBytes != "0")
             {
@@ -6918,6 +7167,28 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
 
             var pointerType = GetPointerTypeExpression(tritonDType, bufferRef.AddressSpace);
             return $"({expression}).to({pointerType})";
+        }
+
+        private static string BuildSharedLocalPointerExpression(SharedBufferAllocation allocation, string scalarOffset)
+        {
+            var indices = new string[allocation.DescriptorShape.Length];
+            var innerStride = 1L;
+            for (var axis = allocation.DescriptorShape.Length - 1; axis >= 0; axis--)
+            {
+                var index = innerStride == 1
+                    ? scalarOffset
+                    : $"(({scalarOffset}) // {innerStride.ToString(CultureInfo.InvariantCulture)})";
+                if (axis != 0)
+                {
+                    index = $"({index}) % {allocation.DescriptorShape[axis].ToString(CultureInfo.InvariantCulture)}";
+                }
+
+                indices[axis] = index;
+                innerStride = checked(innerStride * allocation.DescriptorShape[axis]);
+            }
+
+            var suffix = indices.Length == 1 ? "," : string.Empty;
+            return $"tle.gpu.local_ptr({allocation.DescriptorName}, ({string.Join(", ", indices)}{suffix}))";
         }
 
         private static string GetPointerTypeExpression(string tritonDType, int addressSpace)
@@ -7540,6 +7811,29 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
         private bool IsActiveLocalScalar(string name)
             => _activeLocalScalarNames.ContainsKey(name);
 
+        private void PushLocalBuffer(string name)
+        {
+            _activeLocalBufferNames.TryGetValue(name, out var count);
+            _activeLocalBufferNames[name] = count + 1;
+        }
+
+        private void PopLocalBuffer(string name)
+        {
+            if (!_activeLocalBufferNames.TryGetValue(name, out var count))
+            {
+                throw new InvalidOperationException($"PyNTT local buffer scope for {name} is unbalanced.");
+            }
+
+            if (count == 1)
+            {
+                _activeLocalBufferNames.Remove(name);
+            }
+            else
+            {
+                _activeLocalBufferNames[name] = count - 1;
+            }
+        }
+
         private void PushLoopVariableRange(string name, PyNTTDimExpression range)
         {
             if (!_activeLoopVariableRanges.TryGetValue(name, out var ranges))
@@ -7835,7 +8129,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             }
 
             var helperName = GetHelperFunctionName(state.FinalizeModel);
-            WriteHelperTemplate(state.TemplatePath, state.FinalizeModel);
+            WriteHelperTemplate(state.TemplatePath, state.FinalizeModel, requiresInline: true);
             WriteControlLine(BuildHelperCall(
                 helperName,
                 state.Names.Select(BuildRawPythonArgument).ToArray()));
@@ -7905,7 +8199,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             return $"{functionName}#{index.ToString(CultureInfo.InvariantCulture)}";
         }
 
-        private void WriteLine(string line, HelperBarrierKind barrierKind = HelperBarrierKind.Block)
+        private void WriteLine(string line, HelperBarrierKind barrierKind = HelperBarrierKind.None)
         {
             _body.Append(new string(' ', _bodyIndent * 4));
             _body.AppendLine(line);
@@ -7940,7 +8234,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             });
         }
 
-        private string[] WriteHelperTemplate(string templatePath, object model)
+        private string[] WriteHelperTemplate(string templatePath, object model, bool requiresInline = false)
         {
             var runtimeShapeArgs = CollectHelperScalarArguments(model, _helperScalarNameCandidates);
             var runtimeShapeArgsProperty = model.GetType().GetProperty("RuntimeShapeArgs");
@@ -7948,13 +8242,13 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
 
             var arguments = CollectHelperArguments(model)
                 .Concat(CollectHelperScalarArguments(model, _extraWorkspaceBaseNames))
-                .Concat(_helperHiddenArguments)
+                .Concat(CollectHelperScalarArguments(model, _activeLocalBufferNames.Keys))
                 .Distinct(StringComparer.Ordinal)
                 .ToArray();
             var functionName = GetHelperFunctionName(model);
             _helperArguments[functionName] = arguments;
             _helperScalarArguments[functionName] = runtimeShapeArgs;
-            _helpers.Add(new(GetJinjaTemplateName(templatePath), model, arguments));
+            _helpers.Add(new(GetJinjaTemplateName(templatePath), model, arguments, requiresInline));
             return arguments;
         }
 
@@ -8178,7 +8472,15 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             int[]? ShardCoordHierarchy,
             bool IsByteAddressed,
             string PoolScopeSize = "1",
-            int AddressSpace = 1);
+            int AddressSpace = 1,
+            SharedBufferAllocation? SharedAllocation = null);
+
+        private sealed record SharedBufferAllocation(
+            string DescriptorName,
+            long[] DescriptorShape,
+            long AvailableBytes,
+            int ScalarElementSizeBytes,
+            string TritonDType);
 
         private sealed class ReductionState
         {
@@ -9991,7 +10293,9 @@ internal sealed record HelperTemplateRenderSpec(
     [property: JsonPropertyName("model")]
     object Model,
     [property: JsonPropertyName("arguments")]
-    string[] Arguments);
+    string[] Arguments,
+    [property: JsonPropertyName("requires_inline")]
+    bool RequiresInline);
 
 internal sealed record GeneratedKernelMetadata(
     [property: JsonPropertyName("name")]

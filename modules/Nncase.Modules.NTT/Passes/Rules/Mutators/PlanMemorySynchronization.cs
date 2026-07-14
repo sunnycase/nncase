@@ -2,6 +2,7 @@
 // Licensed under the Apache license. See LICENSE file in the project root for full license information.
 
 using Nncase.IR;
+using Nncase.Passes.Transforms;
 using Nncase.TIR;
 using Nncase.Utilities;
 
@@ -478,10 +479,14 @@ internal sealed class MemoryEffectAnalyzer
 internal sealed class MemorySynchronizationPlanner
 {
     private readonly MemoryEffectAnalyzer _analyzer;
+    private readonly MemorySynchronizationScopes _materializedScopes;
 
-    public MemorySynchronizationPlanner(MemoryEffectAnalyzer analyzer)
+    public MemorySynchronizationPlanner(
+        MemoryEffectAnalyzer analyzer,
+        MemorySynchronizationScopes materializedScopes)
     {
         _analyzer = analyzer;
+        _materializedScopes = materializedScopes;
     }
 
     public PrimFunction Rewrite(PrimFunction function)
@@ -498,7 +503,8 @@ internal sealed class MemorySynchronizationPlanner
         {
             if (TryGetBarrierScope(field, out var explicitScope))
             {
-                if (pendingAccesses.HasAccessesAtOrBelow(explicitScope))
+                if (ShouldMaterialize(explicitScope) &&
+                    pendingAccesses.HasAccessesAtOrBelow(explicitScope))
                 {
                     AppendBarrier(fields, explicitScope);
                     pendingAccesses.RemoveAccessesAtOrBelow(explicitScope);
@@ -510,13 +516,17 @@ internal sealed class MemorySynchronizationPlanner
             var effects = _analyzer.GetEffects(field, insideReduction);
             if (pendingAccesses.TryGetConflict(effects, out var requiredScope))
             {
-                if (insideLoop && requiredScope == TIR.NTT.BarrierScope.Chip)
+                if (ShouldMaterialize(requiredScope) &&
+                    insideLoop && requiredScope == TIR.NTT.BarrierScope.Chip)
                 {
                     throw new InvalidOperationException("A chip-wide synchronization dependence remains inside a tiled loop. Split the producer and consumer into separate scheduling phases.");
                 }
 
-                AppendBarrier(fields, requiredScope);
-                pendingAccesses.RemoveAccessesAtOrBelow(requiredScope);
+                if (ShouldMaterialize(requiredScope))
+                {
+                    AppendBarrier(fields, requiredScope);
+                    pendingAccesses.RemoveAccessesAtOrBelow(requiredScope);
+                }
             }
 
             var rewritten = RewriteStatement(field, insideLoop, insideReduction);
@@ -562,20 +572,31 @@ internal sealed class MemorySynchronizationPlanner
         var loopEffects = _analyzer.GetIterationLocalEffects(@for.Body, isReduction);
         if (loopEffects.TryGetReadWriteAlias(out var requiredScope))
         {
-            if (requiredScope == TIR.NTT.BarrierScope.Chip)
+            if (ShouldMaterialize(requiredScope) && requiredScope == TIR.NTT.BarrierScope.Chip)
             {
                 throw new InvalidOperationException(
                     $"A chip-wide loop-carried memory dependence remains in loop '{@for.LoopVar.Name}'. " +
                     "Split the producer and consumer into separate scheduling phases.");
             }
 
-            var fields = body.Fields.ToArray().ToList();
-            AppendBarrier(fields, requiredScope);
-            body = body.With(fields: fields.ToArray());
+            if (ShouldMaterialize(requiredScope))
+            {
+                var fields = body.Fields.ToArray().ToList();
+                AppendBarrier(fields, requiredScope);
+                body = body.With(fields: fields.ToArray());
+            }
         }
 
         return @for.With(body: body);
     }
+
+    private bool ShouldMaterialize(TIR.NTT.BarrierScope scope)
+        => scope switch
+        {
+            TIR.NTT.BarrierScope.Block => _materializedScopes.HasFlag(MemorySynchronizationScopes.Block),
+            TIR.NTT.BarrierScope.Chip => _materializedScopes.HasFlag(MemorySynchronizationScopes.Chip),
+            _ => throw new ArgumentOutOfRangeException(nameof(scope), scope, null),
+        };
 
     private static void AppendBarrier(List<Expr> fields, TIR.NTT.BarrierScope scope)
     {

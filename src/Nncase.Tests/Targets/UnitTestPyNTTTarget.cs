@@ -132,18 +132,25 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
             [1]);
         var placement = new Placement(new[] { 1 }, "b", "b");
         var scopeName = "fusion[op0:memcopy]";
-        var body = new TIR.Sequential(
-            TIR.T.CodegenScope(
-                scopeName,
-                new TIR.Sequential(
-                    TIR.F.NTT.TensorLoad(inputDataBuffer, inputBuffer, new[] { SBP.B }, placement),
-                    TIR.T.TileLoad(tileBuffer, inputDataBuffer),
-                    TIR.T.TileStore(tileBuffer, resultBuffer),
-                    TIR.F.NTT.TensorStore(resultBuffer, output, new[] { SBP.B }, placement))));
+        var allocatedScope = TIR.T.Let(
+            out var tile,
+            IR.F.Buffer.AllocateBufferView(tileBuffer, new RankedShape(0)),
+            "tile")
+            .Body(
+                TIR.T.CodegenScope(
+                    scopeName,
+                    new TIR.Sequential(
+                        TIR.F.NTT.TensorLoad(inputDataBuffer, inputBuffer, new[] { SBP.B }, placement),
+                        TIR.T.TileLoad(tile, inputDataBuffer),
+                        TIR.T.TileStore(tile, resultBuffer),
+                        TIR.F.NTT.TensorStore(resultBuffer, output, new[] { SBP.B }, placement))))
+            .Build();
+        var body = new TIR.Sequential(allocatedScope);
         var main = new TIR.PrimFunction(
             "main_prim",
             PyNTTTarget.Kind,
             body,
+            new TIR.Return(new Expr[] { output }),
             new IVar[] { input, output })
         {
             SchedResult =
@@ -165,10 +172,377 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         Assert.Contains($"{deviceFunctionName}(input0, output0", generatedKernels, StringComparison.Ordinal);
         Assert.Contains("# pyntt_trace_event: begin_function:fusion[op0:memcopy]#0", generatedKernels, StringComparison.Ordinal);
         Assert.Contains("# pyntt_trace_event: end_function:fusion[op0:memcopy]#0", generatedKernels, StringComparison.Ordinal);
-        Assert.Contains("tile_load_op3_packed_mat_mul_in1__l0_gpu_shared__0", generatedKernels, StringComparison.Ordinal);
-        Assert.Contains("tile_store_op3_packed_mat_mul_in1__l0_gpu_shared__0", generatedKernels, StringComparison.Ordinal);
+        Assert.Contains("tile_load_tile__0", generatedKernels, StringComparison.Ordinal);
+        Assert.Contains("tile_store_tile__0", generatedKernels, StringComparison.Ordinal);
+        Assert.Contains("pyntt_shared_arena = tle.gpu.alloc([16]", generatedKernels, StringComparison.Ordinal);
+        var allocation = Regex.Match(
+            generatedKernels,
+            @"(?<name>tile_shared_buffer_0) = tle\.gpu\.alloc\(\[1\], dtype=tl\.float32, .*alias=pyntt_shared_arena, alias_offset_bytes=0",
+            RegexOptions.Multiline);
+        Assert.True(allocation.Success, generatedKernels);
+        var sharedBufferName = allocation.Groups["name"].Value;
+        Assert.Single(Regex.Matches(generatedKernels, $@"\b{Regex.Escape(sharedBufferName)} = tle\.gpu\.alloc").Cast<Match>());
+        Assert.Contains($"tle.gpu.copy(source + copy_global_offset, {sharedBufferName}, [1])", generatedKernels, StringComparison.Ordinal);
+        Assert.Contains($"tle.gpu.copy({sharedBufferName}, destination + copy_global_offset, [1])", generatedKernels, StringComparison.Ordinal);
+        Assert.DoesNotContain("copy_shared", generatedKernels, StringComparison.Ordinal);
+        Assert.DoesNotContain("pyntt_shared_base", generatedKernels, StringComparison.Ordinal);
+        Assert.DoesNotContain("tl.debug_barrier()", generatedKernels, StringComparison.Ordinal);
         Assert.DoesNotContain("tensor_region_copy", generatedKernels, StringComparison.Ordinal);
         Assert.DoesNotContain("call_frame", generatedKernels, StringComparison.Ordinal);
+        AssertGeneratedModelRuns(
+            outputDirectory,
+            "x = torch.tensor([3.25], dtype=torch.float32, device='cuda')",
+            "output = module(x)",
+            "torch.testing.assert_close(output, x, rtol=0, atol=0)");
+    }
+
+    [Fact]
+    public void TestPyNTTDimExpressionUsesActiveLoopRange()
+    {
+        var loopVar = new DimVar("k");
+        var tileExtent = Dimension.Min(256L, 1024L - loopVar);
+        var emitter = new Nncase.CodeGen.PyNTT.PyNTTDimExpressionEmitter(
+            resolveDimVar: variable => variable.Name == loopVar.Name
+                ? new(variable.Name, variable.Name, null, 0, 768)
+                : null);
+
+        var expression = emitter.Emit(tileExtent);
+
+        Assert.Equal(256, expression.MinValue);
+        Assert.Equal(256, expression.MaxValue);
+    }
+
+    [Fact]
+    public void TestPyNTTDynamicSharedTileCopyUsesMaskedFallback()
+    {
+        var sequenceLength = new DimVar("sequence_length") { Metadata = { Range = new(1, 32) } };
+        var tensorType = new TensorType(DataTypes.Float32, new Dimension[] { sequenceLength });
+        var input = new Var("x", tensorType);
+        var output = CreateOutputVar("output", tensorType);
+        var inputBuffer = TIR.T.AttachBuffer(
+            input,
+            tensorType,
+            TIR.MemoryLocation.Input,
+            0,
+            out _,
+            "input_buffer");
+        var inputDataBuffer = new TIR.Buffer(
+            "dynamic_tile_input",
+            DataTypes.Float32,
+            new TIR.MemSpan(new TIR.PhysicalBuffer(4, 0, 128, TIR.MemoryLocation.Data)),
+            new Dimension[] { sequenceLength },
+            new Dimension[] { 1 },
+            null);
+        var tileBuffer = new TIR.Buffer(
+            "dynamic_tile_shared",
+            DataTypes.Float32,
+            new TIR.MemSpan(new TIR.PhysicalBuffer(4, 0, 128, TIR.MemoryLocation.Shared)),
+            new Dimension[] { sequenceLength },
+            new Dimension[] { 1 },
+            null);
+        var resultBuffer = new TIR.Buffer(
+            "dynamic_tile_output",
+            DataTypes.Float32,
+            new TIR.MemSpan(new TIR.PhysicalBuffer(4, 128, 128, TIR.MemoryLocation.Data)),
+            new Dimension[] { sequenceLength },
+            new Dimension[] { 1 },
+            null);
+        var placement = new Placement(new[] { 1 }, "b", "b");
+        var tileCopy = TIR.T.Let(
+            out var tile,
+            IR.F.Buffer.AllocateBufferView(tileBuffer, new RankedShape(0)),
+            "dynamic_tile")
+            .Body(
+                new TIR.Sequential(
+                    TIR.T.TileLoad(tile, inputDataBuffer),
+                    TIR.T.TileStore(tile, resultBuffer)))
+            .Build();
+        var body = new TIR.Sequential(
+            TIR.F.NTT.TensorLoad(inputDataBuffer, inputBuffer, new[] { SBP.B }, placement),
+            tileCopy,
+            TIR.F.NTT.TensorStore(resultBuffer, output, new[] { SBP.B }, placement));
+        var main = new TIR.PrimFunction(
+            "main_prim",
+            PyNTTTarget.Kind,
+            body,
+            new TIR.Return(new Expr[] { output }),
+            new IVar[] { input, sequenceLength, output })
+        {
+            SchedResult =
+            {
+                DataUsage = 256,
+            },
+        };
+
+        var outputDirectory = GeneratePyNTTModelDirectory("generated_dynamic_shared_tile_copy_model", main);
+        RenderGeneratedKernels(outputDirectory);
+        var generatedKernels = File.ReadAllText(Path.Join(outputDirectory, "generated_kernels.py"));
+        Assert.DoesNotContain("full_tile", generatedKernels, StringComparison.Ordinal);
+        Assert.DoesNotContain("tle.gpu.copy", generatedKernels, StringComparison.Ordinal);
+        Assert.DoesNotContain("copy_shared", generatedKernels, StringComparison.Ordinal);
+        Assert.Contains("value = tl.load(source + source_offset, mask=mask)", generatedKernels, StringComparison.Ordinal);
+        Assert.Contains("tl.store(destination + destination_offset, value, mask=mask)", generatedKernels, StringComparison.Ordinal);
+        AssertGeneratedModelRuns(
+            outputDirectory,
+            "for extent in (17, 32):",
+            "    x = torch.arange(extent, dtype=torch.float32, device='cuda') - 11",
+            "    outputs = [torch.empty_like(x)]",
+            "    module._run_entry((x,), outputs, {'sequence_length': extent})",
+            "    output = outputs[0]",
+            "    torch.testing.assert_close(output, x, rtol=0, atol=0)");
+    }
+
+    [Fact]
+    public void TestPyNTTSharedBufferSubviewUsesTleCopy()
+    {
+        var tensorType = new TensorType(DataTypes.Float32, new[] { 32 });
+        var input = new Var("x", tensorType);
+        var output = CreateOutputVar("output", tensorType);
+        var inputBuffer = TIR.T.AttachBuffer(
+            input,
+            tensorType,
+            TIR.MemoryLocation.Input,
+            0,
+            out _,
+            "input_buffer");
+        var inputDataBuffer = CreateBuffer(
+            "subview_input",
+            DataTypes.Float32,
+            TIR.MemoryLocation.Data,
+            0,
+            [32],
+            [1]);
+        var sharedBackingBuffer = CreateBuffer(
+            "subview_shared_backing",
+            DataTypes.Float32,
+            TIR.MemoryLocation.Shared,
+            64,
+            [32],
+            [1]);
+        var resultBuffer = CreateBuffer(
+            "subview_output",
+            DataTypes.Float32,
+            TIR.MemoryLocation.Data,
+            128,
+            [32],
+            [1]);
+        var placement = new Placement(new[] { 1 }, "b", "b");
+        var sharedCopy = TIR.T.Let(
+            out var sharedBacking,
+            IR.F.Buffer.AllocateBufferView(sharedBackingBuffer, new RankedShape(0)),
+            "shared_backing")
+            .Body(
+                TIR.T.Let(
+                    out var sharedTile,
+                    IR.F.Buffer.BufferSubview(sharedBacking, new RankedShape(0), new RankedShape(32)),
+                    "shared_tile")
+                    .Body(
+                        new TIR.Sequential(
+                            TIR.T.TileLoad(sharedTile, inputDataBuffer),
+                            TIR.T.TileStore(sharedTile, resultBuffer)))
+                    .Build())
+            .Build();
+        var body = new TIR.Sequential(
+            TIR.F.NTT.TensorLoad(inputDataBuffer, inputBuffer, new[] { SBP.B }, placement),
+            sharedCopy,
+            TIR.F.NTT.TensorStore(resultBuffer, output, new[] { SBP.B }, placement));
+        var main = new TIR.PrimFunction(
+            "main_prim",
+            PyNTTTarget.Kind,
+            body,
+            new TIR.Return(new Expr[] { output }),
+            new IVar[] { input, output })
+        {
+            SchedResult =
+            {
+                DataUsage = 256,
+            },
+        };
+
+        var outputDirectory = GeneratePyNTTModelDirectory("generated_shared_buffer_subview_copy_model", main);
+        var kernelParams = File.ReadAllText(Path.Join(outputDirectory, "kernel_params.json"));
+        Assert.Contains("\"LocalBuffer\"", kernelParams, StringComparison.Ordinal);
+        Assert.DoesNotContain("LocalAllocation", kernelParams, StringComparison.Ordinal);
+        Assert.DoesNotContain("SharedView", kernelParams, StringComparison.Ordinal);
+        RenderGeneratedKernels(outputDirectory);
+        var generatedKernels = File.ReadAllText(Path.Join(outputDirectory, "generated_kernels.py"));
+        Assert.Contains("alias_offset_bytes=64", generatedKernels, StringComparison.Ordinal);
+        Assert.Contains("tle.gpu.copy(source + copy_global_offset, shared_backing_shared_buffer_0, [32])", generatedKernels, StringComparison.Ordinal);
+        Assert.Contains("tle.gpu.copy(shared_backing_shared_buffer_0, destination + copy_global_offset, [32])", generatedKernels, StringComparison.Ordinal);
+        Assert.Single(Regex.Matches(generatedKernels, @"shared_backing_shared_buffer_0 = tle\.gpu\.alloc").Cast<Match>());
+        AssertGeneratedModelRuns(
+            outputDirectory,
+            "x = torch.arange(32, dtype=torch.float32, device='cuda') - 7",
+            "output = module(x)",
+            "torch.testing.assert_close(output, x, rtol=0, atol=0)");
+    }
+
+    [Fact]
+    public void TestPyNTTSharedDescriptorPreservesRankForNonPowerOfTwoShape()
+    {
+        var tensorType = new TensorType(DataTypes.Float32, new[] { 5, 2, 8 });
+        var input = new Var("x", tensorType);
+        var output = CreateOutputVar("output", tensorType);
+        var inputBuffer = TIR.T.AttachBuffer(input, tensorType, TIR.MemoryLocation.Input, 0, out _, "input_buffer");
+        var inputDataBuffer = CreateBuffer("input_data", DataTypes.Float32, TIR.MemoryLocation.Data, 0, [5, 2, 8], [16, 8, 1]);
+        var sharedBuffer = CreateBuffer("shared_tile", DataTypes.Float32, TIR.MemoryLocation.Shared, 0, [5, 2, 8], [16, 8, 1]);
+        var resultBuffer = CreateBuffer("result_data", DataTypes.Float32, TIR.MemoryLocation.Data, 320, [5, 2, 8], [16, 8, 1]);
+        var placement = new Placement(new[] { 1 }, "b", "b");
+        var sharedCopy = TIR.T.Let(
+            out var sharedTile,
+            IR.F.Buffer.AllocateBufferView(sharedBuffer, new RankedShape(0, 0, 0)),
+            "shared_tile")
+            .Body(
+                new TIR.Sequential(
+                    TIR.T.TileLoad(sharedTile, inputDataBuffer),
+                    TIR.T.TileStore(sharedTile, resultBuffer)))
+            .Build();
+        var main = new TIR.PrimFunction(
+            "main_prim",
+            PyNTTTarget.Kind,
+            new TIR.Sequential(
+                TIR.F.NTT.TensorLoad(inputDataBuffer, inputBuffer, new[] { SBP.B, SBP.B, SBP.B }, placement),
+                sharedCopy,
+                TIR.F.NTT.TensorStore(resultBuffer, output, new[] { SBP.B, SBP.B, SBP.B }, placement)),
+            new TIR.Return(new Expr[] { output }),
+            new IVar[] { input, output })
+        {
+            SchedResult =
+            {
+                DataUsage = 640,
+            },
+        };
+
+        var outputDirectory = GeneratePyNTTModelDirectory("generated_non_power_of_two_shared_descriptor_model", main);
+        RenderGeneratedKernels(outputDirectory);
+        var generatedKernels = File.ReadAllText(Path.Join(outputDirectory, "generated_kernels.py"));
+        Assert.Contains("shared_tile_shared_buffer_0 = tle.gpu.alloc([8, 2, 8]", generatedKernels, StringComparison.Ordinal);
+        Assert.DoesNotContain("tle.gpu.copy", generatedKernels, StringComparison.Ordinal);
+        Assert.Contains("tle.gpu.local_ptr(shared_tile_shared_buffer_0, (", generatedKernels, StringComparison.Ordinal);
+        Assert.DoesNotContain("= tle.gpu.local_ptr", generatedKernels, StringComparison.Ordinal);
+        AssertGeneratedModelRuns(
+            outputDirectory,
+            "x = torch.arange(5 * 2 * 8, dtype=torch.float32, device='cuda').reshape(5, 2, 8)",
+            "output = module(x)",
+            "torch.testing.assert_close(output, x, rtol=0, atol=0)");
+    }
+
+    [Fact]
+    public void TestPyNTTAdjacentMultidimensionalSharedDescriptorsDoNotOverlap()
+    {
+        const long firstElements = 5 * 2 * 8;
+        const long secondElements = 2 * 2 * 8;
+        const long firstBytes = firstElements * 4;
+        const long secondBytes = secondElements * 4;
+        const long totalBytes = firstBytes + secondBytes;
+        var tensorType = new TensorType(DataTypes.Float32, new[] { 7, 2, 8 });
+        var input = new Var("x", tensorType);
+        var output = CreateOutputVar("output", tensorType);
+        var inputBuffer = TIR.T.AttachBuffer(input, tensorType, TIR.MemoryLocation.Input, 0, out _, "input_buffer");
+        var inputPhysical = new TIR.PhysicalBuffer(4, 0, totalBytes, TIR.MemoryLocation.Data);
+        var inputDataBuffer = new TIR.Buffer(
+            "input_data",
+            DataTypes.Float32,
+            new TIR.MemSpan(inputPhysical),
+            [7, 2, 8],
+            [16, 8, 1],
+            null);
+        var firstInputTile = new TIR.Buffer(
+            "first_input_tile",
+            DataTypes.Float32,
+            new TIR.MemSpan(inputPhysical, 0, firstBytes),
+            [5, 2, 8],
+            [16, 8, 1],
+            null);
+        var secondInputTile = new TIR.Buffer(
+            "second_input_tile",
+            DataTypes.Float32,
+            new TIR.MemSpan(inputPhysical, firstBytes, secondBytes),
+            [2, 2, 8],
+            [16, 8, 1],
+            null);
+        var firstSharedBuffer = CreateBuffer(
+            "first_shared_tile",
+            DataTypes.Float32,
+            TIR.MemoryLocation.Shared,
+            0,
+            [5, 2, 8],
+            [16, 8, 1]);
+        var secondSharedBuffer = CreateBuffer(
+            "second_shared_tile",
+            DataTypes.Float32,
+            TIR.MemoryLocation.Shared,
+            firstBytes,
+            [2, 2, 8],
+            [16, 8, 1]);
+        var resultPhysical = new TIR.PhysicalBuffer(4, totalBytes, totalBytes, TIR.MemoryLocation.Data);
+        var resultBuffer = new TIR.Buffer(
+            "result_data",
+            DataTypes.Float32,
+            new TIR.MemSpan(resultPhysical),
+            [7, 2, 8],
+            [16, 8, 1],
+            null);
+        var firstResultTile = new TIR.Buffer(
+            "first_result_tile",
+            DataTypes.Float32,
+            new TIR.MemSpan(resultPhysical, 0, firstBytes),
+            [5, 2, 8],
+            [16, 8, 1],
+            null);
+        var secondResultTile = new TIR.Buffer(
+            "second_result_tile",
+            DataTypes.Float32,
+            new TIR.MemSpan(resultPhysical, firstBytes, secondBytes),
+            [2, 2, 8],
+            [16, 8, 1],
+            null);
+        var placement = new Placement(new[] { 1 }, "b", "b");
+        var sharedCopy = TIR.T.Let(
+            out var firstSharedTile,
+            IR.F.Buffer.AllocateBufferView(firstSharedBuffer, new RankedShape(0, 0, 0)),
+            "first_shared_tile")
+            .Body(
+                TIR.T.Let(
+                    out var secondSharedTile,
+                    IR.F.Buffer.AllocateBufferView(secondSharedBuffer, new RankedShape(0, 0, 0)),
+                    "second_shared_tile")
+                    .Body(
+                        new TIR.Sequential(
+                            TIR.T.TileLoad(firstSharedTile, firstInputTile),
+                            TIR.T.TileLoad(secondSharedTile, secondInputTile),
+                            TIR.T.TileStore(firstSharedTile, firstResultTile),
+                            TIR.T.TileStore(secondSharedTile, secondResultTile)))
+                    .Build())
+            .Build();
+        var main = new TIR.PrimFunction(
+            "main_prim",
+            PyNTTTarget.Kind,
+            new TIR.Sequential(
+                TIR.F.NTT.TensorLoad(inputDataBuffer, inputBuffer, new[] { SBP.B, SBP.B, SBP.B }, placement),
+                sharedCopy,
+                TIR.F.NTT.TensorStore(resultBuffer, output, new[] { SBP.B, SBP.B, SBP.B }, placement)),
+            new TIR.Return(new Expr[] { output }),
+            new IVar[] { input, output })
+        {
+            SchedResult =
+            {
+                DataUsage = totalBytes * 2,
+            },
+        };
+
+        var outputDirectory = GeneratePyNTTModelDirectory("generated_adjacent_multidimensional_shared_model", main);
+        RenderGeneratedKernels(outputDirectory);
+        var generatedKernels = File.ReadAllText(Path.Join(outputDirectory, "generated_kernels.py"));
+        Assert.Contains("first_shared_tile_shared_buffer_0 = tle.gpu.alloc([8, 2, 8]", generatedKernels, StringComparison.Ordinal);
+        Assert.Contains("second_shared_tile_shared_buffer_1 = tle.gpu.alloc([2, 2, 8]", generatedKernels, StringComparison.Ordinal);
+        Assert.Contains("alias_offset_bytes=320", generatedKernels, StringComparison.Ordinal);
+        Assert.DoesNotContain("= tle.gpu.local_ptr", generatedKernels, StringComparison.Ordinal);
+        AssertGeneratedModelRuns(
+            outputDirectory,
+            "x = (torch.arange(7 * 2 * 8, dtype=torch.float32, device='cuda') - 53).reshape(7, 2, 8)",
+            "output = module(x)",
+            "torch.testing.assert_close(output, x, rtol=0, atol=0)");
     }
 
     [Fact]
@@ -247,7 +621,7 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         Assert.Contains("def main_prim_elementwise_binary_0(data, rdata, chip_local_rdata, block_local_rdata, block_local_data, block_size: tl.constexpr):", generatedKernelsPy, StringComparison.Ordinal);
         Assert.Contains("def main_prim_tensor_store_0(destination, data, rdata, chip_local_rdata, block_local_rdata, block_local_data, block_size: tl.constexpr):", generatedKernelsPy, StringComparison.Ordinal);
         Assert.Contains("main_prim_tensor_load_0(input0, data, rdata, chip_local_rdata, block_local_rdata, block_local_data, block_size)", generatedKernelsPy, StringComparison.Ordinal);
-        Assert.Contains("tl.debug_barrier()", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.DoesNotContain("tl.debug_barrier()", generatedKernelsPy, StringComparison.Ordinal);
         Assert.Contains("main_prim_tensor_load_1(input1, data, rdata, chip_local_rdata, block_local_rdata, block_local_data, block_size)", generatedKernelsPy, StringComparison.Ordinal);
         Assert.Contains("main_prim_elementwise_binary_0(data, rdata, chip_local_rdata, block_local_rdata, block_local_data, block_size)", generatedKernelsPy, StringComparison.Ordinal);
         Assert.Contains("main_prim_tensor_store_0(output0, data, rdata, chip_local_rdata, block_local_rdata, block_local_data, block_size)", generatedKernelsPy, StringComparison.Ordinal);
@@ -1004,6 +1378,8 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         var generatedKernelsPy = File.ReadAllText(Path.Join(outputDirectory, "generated_kernels.py"));
         Assert.Contains("generated from PyNTT Jinja UpdatePagedAttentionKVCache.py.jinja", generatedKernelsPy, StringComparison.Ordinal);
         Assert.Contains("generated from PyNTT Jinja PagedAttention.py.jinja", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.DoesNotContain("pyntt_shared_arena +", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.DoesNotContain(".to(tl.pointer_type(tl.uint8, 3))", generatedKernelsPy, StringComparison.Ordinal);
         using (var kernelParams = JsonDocument.Parse(File.ReadAllText(Path.Join(outputDirectory, "kernel_params.json"))))
         {
             var kernelInputs = kernelParams.RootElement.GetProperty("functions")
@@ -1597,6 +1973,48 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
     }
 
     [Fact]
+    public void TestPyNTTDirectTileStoreMaterializesCallerAllocatedOutput()
+    {
+        var tensorType = new TensorType(DataTypes.Float32, new[] { 4 });
+        var input = new Var("input", tensorType);
+        var output = CreateOutputVar("output", tensorType);
+        var inputBuffer = TIR.T.AttachBuffer(input, tensorType, TIR.MemoryLocation.Input, 0, out _, "input_buffer");
+        var outputBuffer = TIR.T.AttachBuffer(output, tensorType, TIR.MemoryLocation.Output, 0, out _, "output_buffer");
+        var tileBuffer = CreateDataBuffer("tile", DataTypes.Float32, 0, [4], [1]);
+        var outputSubview = TIR.T.Let(
+            out var outputTile,
+            IR.F.Buffer.BufferSubview(outputBuffer, new RankedShape(0), new RankedShape(4)),
+            "output_tile")
+            .Body(TIR.T.TileStore(tileBuffer, outputTile))
+            .Build();
+        var main = new TIR.PrimFunction(
+            "main_prim",
+            PyNTTTarget.Kind,
+            new TIR.Sequential(
+                TIR.T.TileLoad(tileBuffer, inputBuffer),
+                outputSubview),
+            new TIR.Return(new Expr[] { output }),
+            new IVar[] { input, output })
+        {
+            SchedResult =
+            {
+                DataUsage = 16,
+            },
+        };
+
+        var outputDirectory = GeneratePyNTTModelDirectory("generated_direct_tile_store_output_model", main);
+        RenderGeneratedKernels(outputDirectory);
+        var generatedKernelsPy = File.ReadAllText(Path.Join(outputDirectory, "generated_kernels.py"));
+        Assert.Contains("generated from PyNTT Jinja TensorRegionCopy.py.jinja", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.DoesNotContain("generated from PyNTT Jinja TensorStore.py.jinja", generatedKernelsPy, StringComparison.Ordinal);
+        AssertGeneratedModelRuns(
+            outputDirectory,
+            "x = torch.arange(4, dtype=torch.float32, device='cuda')",
+            "output = module(x)",
+            "torch.testing.assert_close(output, x, rtol=0, atol=0)");
+    }
+
+    [Fact]
     public void TestPyNTTEntryOutputSpecDoesNotCollectNestedFunctionOutputs()
     {
         var input = new Var("x", new TensorType(DataTypes.Float32, new[] { 4 }));
@@ -1693,6 +2111,81 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
     }
 
     [Fact]
+    public void TestPyNTTNestedCodegenScopeCapturesCallerWorkspaceParameters()
+    {
+        var tensorType = new TensorType(DataTypes.Float32, new[] { 4 });
+        var input = new Var("x", tensorType);
+        var publicOutput = CreateOutputVar("public_output", tensorType);
+        var nestedInput = new TIR.BufferVar("nested_input", tensorType, TIR.BufferVarRole.Input, TIR.MemoryLocation.Input);
+        var nestedOutput = CreateOutputVar("nested_output", tensorType);
+        var nestedData = new TIR.BufferVar("data", TensorType.Scalar(new PointerType(DataTypes.UInt8)), TIR.BufferVarRole.Workspace, TIR.MemoryLocation.Data);
+        var nestedChipLocalData = new TIR.BufferVar("chip_local_data", TensorType.Scalar(new PointerType(DataTypes.UInt8)), TIR.BufferVarRole.Workspace, TIR.MemoryLocation.ChipLocalData);
+        var nestedBlockLocalData = new TIR.BufferVar("block_local_data", TensorType.Scalar(new PointerType(DataTypes.UInt8)), TIR.BufferVarRole.Workspace, TIR.MemoryLocation.BlockLocalData);
+        var nestedInputBuffer = TIR.T.AttachBuffer(nestedInput, tensorType, TIR.MemoryLocation.Input, 0, out _, "nested_input_buffer");
+        var nestedTemp = CreateBuffer("nested_temp", DataTypes.Float32, TIR.MemoryLocation.Data, 0, [4], [1]);
+        var placement = new Placement(new[] { 1 }, "b", "b");
+        var nested = new TIR.PrimFunction(
+            "nested_prim",
+            PyNTTTarget.Kind,
+            new TIR.Sequential(
+                TIR.T.CodegenScope(
+                    "fusion[nested_copy]",
+                    new TIR.Sequential(
+                        TIR.F.NTT.TensorLoad(nestedTemp, nestedInputBuffer, new[] { SBP.B }, placement),
+                        TIR.F.NTT.TensorStore(nestedTemp, nestedOutput, new[] { SBP.B }, placement)))),
+            new TIR.Return(new Expr[] { nestedOutput }),
+            new IVar[] { nestedInput, nestedOutput, nestedData, nestedChipLocalData, nestedBlockLocalData })
+        {
+            SchedResult =
+            {
+                DataUsage = 128,
+            },
+        };
+
+        var callerInput = CreateBuffer("caller_input", DataTypes.Float32, TIR.MemoryLocation.Data, 0, [4], [1]);
+        var callerOutput = CreateBuffer("caller_output", DataTypes.Float32, TIR.MemoryLocation.Data, 16, [4], [1]);
+        var calleeData = CreateBuffer("callee_data", DataTypes.UInt8, TIR.MemoryLocation.Data, 64, [128], [1]);
+        var calleeChipLocalData = CreateBuffer("callee_chip_local_data", DataTypes.UInt8, TIR.MemoryLocation.ChipLocalData, 0, [0], [1]);
+        var calleeBlockLocalData = CreateBuffer("callee_block_local_data", DataTypes.UInt8, TIR.MemoryLocation.BlockLocalData, 0, [0], [1]);
+        var main = new TIR.PrimFunction(
+            "main_prim",
+            PyNTTTarget.Kind,
+            new TIR.Sequential(
+                nested,
+                TIR.F.NTT.TensorLoad(callerInput, input, new[] { SBP.B }, placement),
+                new Call(nested, callerInput, callerOutput, calleeData, calleeChipLocalData, calleeBlockLocalData),
+                TIR.F.NTT.TensorStore(callerOutput, publicOutput, new[] { SBP.B }, placement)),
+            new TIR.Return(new Expr[] { publicOutput }),
+            new IVar[] { input, publicOutput })
+        {
+            SchedResult =
+            {
+                DataUsage = 192,
+            },
+        };
+
+        var module = new IRModule(main);
+        module.Add(nested);
+        var outputDirectory = GeneratePyNTTModelDirectory("generated_nested_codegen_scope_model", module);
+        RenderGeneratedKernels(outputDirectory);
+        var generatedKernels = File.ReadAllText(Path.Join(outputDirectory, "generated_kernels.py"));
+        var scopeDefinition = Regex.Match(
+            generatedKernels,
+            @"def main_prim_nested_prim_device_device_fusion_nested_copy_+0\((?<parameters>[^)]*)\):",
+            RegexOptions.Multiline);
+        Assert.True(scopeDefinition.Success, generatedKernels);
+        var parameters = scopeDefinition.Groups["parameters"].Value;
+        Assert.Contains("main_prim_nested_prim_device_data", parameters, StringComparison.Ordinal);
+        Assert.Contains("main_prim_nested_prim_device_arg0_nested_input", parameters, StringComparison.Ordinal);
+        Assert.Contains("main_prim_nested_prim_device_arg1_nested_output", parameters, StringComparison.Ordinal);
+        AssertGeneratedModelRuns(
+            outputDirectory,
+            "x = torch.arange(4, dtype=torch.float32, device='cuda')",
+            "output = module(x)",
+            "torch.testing.assert_close(output, x, rtol=0, atol=0)");
+    }
+
+    [Fact]
     public void TestPyNTTNestedPrimFunctionSupportsCallerAllocatedDataTensorParameter()
     {
         var tensorType = new TensorType(DataTypes.Float32, new[] { 4 });
@@ -1706,13 +2199,20 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         var rootBuffer = TIR.T.AttachBuffer(root, tensorType, TIR.MemoryLocation.Data, 0, out _, "root_buffer");
         var nestedTemp = CreateBuffer("nested_temp", DataTypes.Float32, TIR.MemoryLocation.Shared, 0, [4], [1]);
         var placement = new Placement(new[] { 1 }, "b", "b");
+        var nestedBody = TIR.T.Let(
+            out var temp,
+            IR.F.Buffer.AllocateBufferView(nestedTemp, new RankedShape(0)),
+            "nested_temp")
+            .Body(
+                new TIR.Sequential(
+                    TIR.F.NTT.TensorLoad(temp, rootBuffer, new[] { SBP.B }, placement),
+                    TIR.F.NTT.TensorStore(temp, rootBuffer, new[] { SBP.B }, placement),
+                    TIR.F.NTT.TensorStore(temp, nestedOutput, new[] { SBP.B }, placement)))
+            .Build();
         var nested = new TIR.PrimFunction(
             "nested_data_tensor",
             PyNTTTarget.Kind,
-            new TIR.Sequential(
-                TIR.F.NTT.TensorLoad(nestedTemp, rootBuffer, new[] { SBP.B }, placement),
-                TIR.F.NTT.TensorStore(nestedTemp, rootBuffer, new[] { SBP.B }, placement),
-                TIR.F.NTT.TensorStore(nestedTemp, nestedOutput, new[] { SBP.B }, placement)),
+            new TIR.Sequential(nestedBody),
             new IVar[] { root, nestedOutput, nestedData, nestedChipLocalData, nestedBlockLocalData })
         {
             Role = FunctionRole.ScheduledRegion,
@@ -2013,9 +2513,16 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
             [8, 1]);
         var inputTile = IR.F.Buffer.BufferSubview(inputBuffer, new RankedShape(16, 0), new RankedShape(4, 8));
         var output = CreateOutputVar("output", new TensorType(DataTypes.Float32, new[] { 4, 8 }));
-        var body = new TIR.Sequential(
-            TIR.F.NTT.Cast(inputTile, outputBuffer, DataTypes.Float32, CastMode.KDefault, Array.Empty<int>(), None.Default),
-            TIR.F.NTT.TensorStore(outputBuffer, output, new[] { SBP.B, SBP.B }, placement));
+        var allocatedOutput = TIR.T.Let(
+            out var tileOutput,
+            IR.F.Buffer.AllocateBufferView(outputBuffer, new RankedShape(0, 0)),
+            "tile_output")
+            .Body(
+                new TIR.Sequential(
+                    TIR.F.NTT.Cast(inputTile, tileOutput, DataTypes.Float32, CastMode.KDefault, Array.Empty<int>(), None.Default),
+                    TIR.F.NTT.TensorStore(tileOutput, output, new[] { SBP.B, SBP.B }, placement)))
+            .Build();
+        var body = new TIR.Sequential(allocatedOutput);
         var main = new TIR.PrimFunction("main_prim", PyNTTTarget.Kind, body, new IVar[] { output })
         {
             SchedResult =
@@ -2029,7 +2536,11 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         RenderGeneratedKernels(outputDirectory);
         var generatedKernelsPy = File.ReadAllText(Path.Join(outputDirectory, "generated_kernels.py"));
         Assert.Contains("import triton.experimental.tle.language as tle", generatedKernelsPy, StringComparison.Ordinal);
-        Assert.Contains("pyntt_shared_storage = tle.gpu.alloc([128]", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("pyntt_shared_arena = tle.gpu.alloc([128]", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("tile_output_shared_buffer_0 = tle.gpu.alloc([4, 8]", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("alias=pyntt_shared_arena", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("alias_offset_bytes=0", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("tle.gpu.local_ptr(", generatedKernelsPy, StringComparison.Ordinal);
         Assert.Contains("shape=(4, 8)", generatedKernelsPy, StringComparison.Ordinal);
         Assert.Contains("for linear_start in tl.range(0, (4) * (8), block_size):", generatedKernelsPy, StringComparison.Ordinal);
         Assert.DoesNotContain("shape=(20, 8)", generatedKernelsPy, StringComparison.Ordinal);
@@ -2083,8 +2594,9 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         var outputDirectory = GeneratePyNTTModelDirectory("generated_allocated_tile_logical_origin_model", module);
         RenderGeneratedKernels(outputDirectory);
         var generatedKernelsPy = File.ReadAllText(Path.Join(outputDirectory, "generated_kernels.py"));
-        Assert.Equal(1, generatedKernelsPy.Split("pyntt_shared_storage = tle.gpu.alloc", StringSplitOptions.None).Length - 1);
-        Assert.Contains("pyntt_shared_base", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Equal(1, generatedKernelsPy.Split("pyntt_shared_arena = tle.gpu.alloc", StringSplitOptions.None).Length - 1);
+        Assert.Contains("alias=pyntt_shared_arena", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.DoesNotContain("pyntt_shared_base", generatedKernelsPy, StringComparison.Ordinal);
         Assert.Contains("generated from PyNTT Jinja TensorRegionCopy.py.jinja", generatedKernelsPy, StringComparison.Ordinal);
         Assert.Contains("copy_start0 = tl.maximum(2, main_prim_nested_prim_device_arg0_nested_output_global_offset0)", generatedKernelsPy, StringComparison.Ordinal);
         Assert.Contains("source_base0 = copy_start0 - 2", generatedKernelsPy, StringComparison.Ordinal);
@@ -2329,7 +2841,7 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         var outputDirectory = GeneratePyNTTModelDirectory("generated_tiled_boxing_root_model", main);
         RenderGeneratedKernels(outputDirectory);
         var generatedKernelsPy = File.ReadAllText(Path.Join(outputDirectory, "generated_kernels.py"));
-        Assert.Contains("input_tile_shape=(tl.minimum(1", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("input_tile_shape=(1, 16)", generatedKernelsPy, StringComparison.Ordinal);
         Assert.Contains("for tile in tl.range(0, 2, 1)", generatedKernelsPy, StringComparison.Ordinal);
         Assert.Contains("for destination_shard_coord0 in tl.range(0, 4)", generatedKernelsPy, StringComparison.Ordinal);
         AssertGeneratedModelRuns(

@@ -7,16 +7,29 @@ using Nncase.TIR;
 
 namespace Nncase.Passes.Transforms;
 
+[Flags]
+public enum MemorySynchronizationScopes
+{
+    None = 0,
+    Block = 1 << 0,
+    Chip = 1 << 1,
+    All = Block | Chip,
+}
+
 /// <summary>
 /// Materializes synchronization implied by structured TIR memory effects.
 /// </summary>
 public sealed class PlanMemorySynchronizationPass : ModulePass
 {
     private readonly string _moduleKind;
+    private readonly MemorySynchronizationScopes _materializedScopes;
 
-    public PlanMemorySynchronizationPass(string moduleKind)
+    public PlanMemorySynchronizationPass(
+        string moduleKind,
+        MemorySynchronizationScopes materializedScopes)
     {
         _moduleKind = moduleKind;
+        _materializedScopes = materializedScopes;
     }
 
     protected override Task<IRModule> RunCoreAsync(IRModule input, RunPassContext context)
@@ -30,7 +43,7 @@ public sealed class PlanMemorySynchronizationPass : ModulePass
         analyzer.AnalyzeAll();
 
         var rewrittenFunctions = functions
-            .Select(item => (Function: new MemorySynchronizationPlanner(analyzer).Rewrite(item.Function), item.Index))
+            .Select(item => (Function: new MemorySynchronizationPlanner(analyzer, _materializedScopes).Rewrite(item.Function), item.Index))
             .ToArray();
         foreach (var (function, index) in rewrittenFunctions)
         {

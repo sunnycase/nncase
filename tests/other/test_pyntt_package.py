@@ -240,13 +240,167 @@ def test_pyntt_renderer_uses_explicit_device_arguments_and_tiling_shared_arena()
     )
 
     assert "import triton.experimental.tle.language as tle" in source
-    assert source.count("pyntt_shared_storage = tle.gpu.alloc([65536]") == 1
+    assert source.count("pyntt_shared_arena = tle.gpu.alloc([65536]") == 1
     assert "@triton.jit(noinline=True)\ndef child(" in source
-    assert "def child(pyntt_shared_base, child_data, child_extent):" in source
-    assert "child(pyntt_shared_base, data, numel)" in source
+    assert "def child(pyntt_shared_arena, child_data, child_extent):" in source
+    assert "child(pyntt_shared_arena, data, numel)" in source
     assert "tl.load(" in source
-    assert "pyntt_shared_base" in source
+    assert "pyntt_shared_arena" in source
     assert "pyntt_call_frame" not in source
+
+
+def test_pyntt_renderer_inlines_helpers_with_tensor_value_abi():
+    _add_pyntt_to_path()
+
+    from pyntt.codegen.render import _render_helper_sources
+
+    rendered_models = []
+
+    class CapturingTemplate:
+        def render(self, *, model):
+            rendered_models.append(model)
+            return "helper"
+
+    class CapturingEnvironment:
+        def get_template(self, _):
+            return CapturingTemplate()
+
+    helpers = (
+        {
+            "template": "unused",
+            "model": {},
+            "arguments": (),
+            "requires_inline": True,
+        },
+        {
+            "template": "unused",
+            "model": {},
+            "arguments": (),
+            "requires_inline": False,
+        },
+    )
+    _render_helper_sources(CapturingEnvironment(), helpers, noinline=True)
+
+    assert [model["NoInline"] for model in rendered_models] == [False, True]
+
+
+def test_pyntt_tensor_region_copy_selects_tle_copy_only_for_full_shared_tiles():
+    from copy import deepcopy
+
+    _add_pyntt_to_path()
+
+    from pyntt.codegen.render import emit
+
+    def fixed(value):
+        return {
+            "PythonExpression": str(value),
+            "TritonExpression": str(value),
+            "FixedValue": value,
+        }
+
+    full_tile_model = {
+        "FunctionName": "tile_load",
+        "Source": {
+            "Expression": "source_ptr",
+            "AddressSpace": 1,
+            "LocalBuffer": None,
+        },
+        "Destination": {
+            "Expression": "destination_ptr",
+            "AddressSpace": 3,
+            "LocalBuffer": {
+                "DescriptorExpression": "destination_storage",
+                "DescriptorShape": [32],
+                "BaseScalarOffset": "0",
+                "AvailableBytes": 128,
+                "ScalarElementSizeBytes": 4,
+            },
+        },
+        "DType": "float32",
+        "TritonDType": "tl.float32",
+        "SourceShape": [fixed(32)],
+        "DestinationShape": [fixed(32)],
+        "SourceGlobalOffsets": [fixed(0)],
+        "DestinationGlobalOffsets": [fixed(0)],
+        "SourceStrides": [fixed(1)],
+        "DestinationStrides": [fixed(1)],
+        "VectorLaneCount": 1,
+        "OperationKind": "TileLoad",
+        "RegionsCoincident": True,
+        "Comment": "TileLoad: source -> destination",
+        "RuntimeShapeArgs": [],
+        "Arguments": ["destination_storage"],
+        "NoInline": False,
+    }
+
+    full_tile_source = emit("TensorRegionCopy", full_tile_model)
+    assert "tle.gpu.alloc" not in full_tile_source
+    assert "tle.gpu.copy(source + copy_global_offset, destination_storage, [32])" in full_tile_source
+    assert "if full_tile:" not in full_tile_source
+    assert "value = tl.load(source + source_offset, mask=mask)" not in full_tile_source
+
+    vector_model = deepcopy(full_tile_model)
+    vector_model["SourceShape"] = [fixed(4)]
+    vector_model["DestinationShape"] = [fixed(4)]
+    vector_model["VectorLaneCount"] = 8
+    vector_source = emit("TensorRegionCopy", vector_model)
+    assert "copy_tensor_linear = copy_linear // 8" in vector_source
+    assert "copy_vector_lane = copy_linear % 8" in vector_source
+    assert "copy_global_offset = (((source_base0 + copy_idx0) * 1) * 8 + copy_vector_lane)" in vector_source
+
+    matrix_model = deepcopy(full_tile_model)
+    matrix_model["SourceShape"] = [fixed(4), fixed(8)]
+    matrix_model["DestinationShape"] = [fixed(4), fixed(8)]
+    matrix_model["SourceGlobalOffsets"] = [fixed(0), fixed(0)]
+    matrix_model["DestinationGlobalOffsets"] = [fixed(0), fixed(0)]
+    matrix_model["SourceStrides"] = [fixed(8), fixed(1)]
+    matrix_model["DestinationStrides"] = [fixed(8), fixed(1)]
+    matrix_model["Destination"]["LocalBuffer"]["DescriptorShape"] = [4, 8]
+    matrix_source = emit("TensorRegionCopy", matrix_model)
+    assert "copy_desc_idx0 = tl.arange(0, 4)[:, None]" in matrix_source
+    assert "copy_desc_idx1 = tl.arange(0, 8)[None, :]" in matrix_source
+    assert (
+        "tle.gpu.copy(source + copy_global_offset, destination_storage, [4, 8])"
+        in matrix_source
+    )
+
+    tail_model = deepcopy(full_tile_model)
+    dynamic_extent = {
+        "PythonExpression": "extent",
+        "TritonExpression": "extent",
+        "FixedValue": None,
+        "RangeMin": 1,
+        "RangeMax": 32,
+    }
+    tail_model["SourceShape"] = [dynamic_extent]
+    tail_model["DestinationShape"] = [dynamic_extent]
+    tail_model["RuntimeShapeArgs"] = ["extent"]
+    tail_source = emit("TensorRegionCopy", tail_model)
+    assert "full_tile" not in tail_source
+    assert "tle.gpu.copy" not in tail_source
+    assert "value = tl.load(source + source_offset, mask=mask)" in tail_source
+    assert "tl.store(tle.gpu.local_ptr(destination_storage" in tail_source
+    assert "= tle.gpu.local_ptr" not in tail_source
+
+    noncoincident_model = deepcopy(full_tile_model)
+    noncoincident_model["RegionsCoincident"] = False
+    noncoincident_source = emit("TensorRegionCopy", noncoincident_model)
+    assert "tle.gpu.copy" not in noncoincident_source
+    assert "value = tl.load(source + source_offset, mask=mask)" in noncoincident_source
+    assert "tl.store(tle.gpu.local_ptr(destination_storage" in noncoincident_source
+    assert "= tle.gpu.local_ptr" not in noncoincident_source
+
+    noncompact_model = deepcopy(full_tile_model)
+    noncompact_model["DestinationStrides"] = [fixed(2)]
+    noncompact_source = emit("TensorRegionCopy", noncompact_model)
+    assert "tle.gpu.copy" not in noncompact_source
+    assert "value = tl.load(source + source_offset, mask=mask)" in noncompact_source
+
+    noncompact_global_model = deepcopy(full_tile_model)
+    noncompact_global_model["SourceStrides"] = [fixed(2)]
+    noncompact_global_source = emit("TensorRegionCopy", noncompact_global_model)
+    assert "tle.gpu.copy" not in noncompact_global_source
+    assert "value = tl.load(source + source_offset, mask=mask)" in noncompact_global_source
 
 
 def test_pyntt_renderer_passes_one_materialized_shard_index_to_device_calls():
