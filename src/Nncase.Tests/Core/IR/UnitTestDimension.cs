@@ -223,4 +223,42 @@ public sealed class UnitTestDimension
         var boundedTile = Dimension.Min(1L, 1L, Dimension.Max(0L, 1L - offset));
         Assert.Equal(new ValueRange<double>(0, 1), boundedTile.Metadata.Range);
     }
+
+    [Fact]
+    public void TestDimensionExtremumCanonicalization()
+    {
+        var bounded = new DimVar("bounded")
+        {
+            Metadata = new()
+            {
+                Range = new(8, 16),
+            },
+        };
+
+        var canonicalizer = new DimensionCanonicalizer();
+        Assert.Same(bounded, canonicalizer.Canonicalize(new DimMin(32, new DimMin(bounded, 32), bounded)));
+        Assert.Same(bounded, canonicalizer.Canonicalize(new DimMax(0, new DimMax(bounded, 0), bounded)));
+    }
+
+    [Fact]
+    public void TestDimensionCanonicalizerIsIdempotent()
+    {
+        var value = new DimVar("value")
+        {
+            Metadata = new()
+            {
+                Range = new(0, 256),
+            },
+        };
+        var expression = new DimMin(128, 128, new DimMax(0, value));
+        var canonicalizer = new DimensionCanonicalizer();
+
+        var first = canonicalizer.Canonicalize(expression);
+        var second = new DimensionCanonicalizer().Canonicalize(first);
+
+        Assert.Same(first, second);
+        var min = Assert.IsType<DimMin>(first);
+        Assert.Equal(2, min.Operands.Length);
+        Assert.DoesNotContain(min.Operands.ToArray(), operand => operand is DimMax);
+    }
 }
