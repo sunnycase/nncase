@@ -1,1 +1,102 @@
-{{ emit("PagedAttention", model) }}
+{% import "triton/kernels/_common.py.jinja" as common with context %}
+{% set ctx = paged_attention_context(model) %}
+{% set cache = model["Cache"] %}
+# generated from PyNTT Jinja PagedAttention.py.jinja
+# {{ model["Comment"] }}; query_dtype={{ model["QueryDType"] }}, output_dtype={{ model["OutputDType"] }}, query_shape={{ shape_tuple(model["QueryShape"]) }}, output_shape={{ shape_tuple(model["OutputShape"]) }}, layer={{ model["LayerIdExpression"] }}, block_n={{ ctx["attention_block_size"] }}
+{{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
+def {{ model["FunctionName"] }}({{ helper_parameters(model, ("block_tables", "kv_cache", "num_blocks_per_shard", "cache_meta")) }}):
+    shard_index = tl.program_id(0).to(tl.int64)
+    layer_id_value = (tl.full((), 0, tl.int64) + ({{ model["LayerIdExpression"] }})).to(tl.int64)
+{{ common.shard_coordinates([model["Query"], model["Scale"], model["Output"]]) }}
+{% for name, key in (("query", "Query"), ("scale_ptr", "Scale"), ("output", "Output")) %}
+{% if local_buffer(model[key]) is none %}
+    {{ name }} = {{ ptr(model, key) }}
+{% endif %}
+{% endfor %}
+    scale_value = tl.load({{ access_pointer(model, "Scale", "scale_ptr") }}).to(tl.float32)
+    num_seqs = tl.load(cache_meta + 0).to(tl.int64)
+    tmp_shard_coord = shard_index
+{% for axis in reverse_indices(model["Hierarchy"]) %}
+    shard_coord{{ axis }} = tmp_shard_coord % {{ model["Hierarchy"][axis] }}
+    tmp_shard_coord = tmp_shard_coord // {{ model["Hierarchy"][axis] }}
+{% endfor %}
+    max_seq_len = tl.full((), 0, tl.int64)
+    num_tokens = tl.full((), 0, tl.int64)
+    for seq_scan in tl.range(0, num_seqs):
+        context_len_scan = tl.load(cache_meta + 1 + seq_scan * 2)
+        seq_len_scan = tl.load(cache_meta + 2 + seq_scan * 2)
+        max_seq_len = tl.maximum(max_seq_len, seq_len_scan)
+        num_tokens += seq_len_scan - context_len_scan
+    block_table_blocks = tl.cdiv(max_seq_len, {{ cache["BlockSize"] }})
+    dim_offsets = tl.arange(0, {{ cache["HeadDim"] }})
+    query_dim_blocks = dim_offsets // {{ cache["KeyLaneCount"] }}
+    query_dim_lanes = dim_offsets % {{ cache["KeyLaneCount"] }}
+    key_dim_index = {{ ctx["key_dim_index"] }}
+    key_lane = {{ ctx["key_lane"] }}
+    value_dim_index = {{ ctx["value_dim_index"] }}
+{% if cache["ValueVectorizedDim"] != 3 %}
+    value_lane = {{ ctx["value_lane"] }}
+{% endif %}
+    for local_query_id in tl.range(0, {{ dim(ctx["local_query_tokens"]) }}):
+        global_query_id = {{ ctx["global_query_id"] }}
+        for q_head in tl.range(0, {{ dim(ctx["local_q_heads"]) }}):
+            global_q_head = {{ ctx["global_q_head"] }}
+            query_start = tl.full((), 0, tl.int64)
+            context_len = tl.full((), 0, tl.int64)
+            seq_len = tl.full((), 0, tl.int64)
+            query_id = tl.full((), 0, tl.int64)
+            matched_seq_id = tl.full((), 0, tl.int64)
+            query_active = (local_query_id < {{ dim(ctx["local_query_tokens"]) }}) & (global_query_id < {{ dim(ctx["global_query_tokens"]) }}) & (global_query_id < num_tokens) & (global_q_head < {{ model["GlobalNumQueryHeads"] }})
+            found_seq = False
+            for seq_id in tl.range(0, num_seqs):
+                current_context_len = tl.load(cache_meta + 1 + seq_id * 2)
+                current_seq_len = tl.load(cache_meta + 2 + seq_id * 2)
+                current_query_len = current_seq_len - current_context_len
+                in_seq = query_active & (global_query_id >= query_start) & (global_query_id < query_start + current_query_len)
+                matched_seq_id = tl.where(in_seq, seq_id, matched_seq_id)
+                context_len = tl.where(in_seq, current_context_len, context_len)
+                seq_len = tl.where(in_seq, current_seq_len, seq_len)
+                query_id = tl.where(in_seq, global_query_id - query_start, query_id)
+                found_seq = found_seq | in_seq
+                query_start += current_query_len
+            head_group = {{ model["GlobalNumQueryHeads"] }} // {{ cache["NumKVHeads"] }}
+            kv_head = global_q_head // head_group
+            q_offsets = {{ ctx["query_vector_offset"] }}
+            q_values = tl.load({{ access_pointer(model, "Query", "query", "q_offsets") }}, mask=found_seq, other=0.0)
+            max_score = -float("inf")
+            sum_exp = 0.0
+            acc = tl.zeros((1, {{ cache["HeadDim"] }}), tl.float32)
+            for context_start in tl.range(0, max_seq_len, {{ ctx["attention_block_size"] }}):
+                context_ids = context_start + tl.arange(0, {{ ctx["attention_block_size"] }})
+                context_mask = found_seq & (context_ids < seq_len) & (context_ids <= context_len + query_id)
+                context_bid = context_ids // {{ cache["BlockSize"] }}
+                block_offsets = context_ids % {{ cache["BlockSize"] }}
+                key_block_index = {{ ctx["key_block_index"] }}
+                value_block_index = {{ ctx["value_block_index"] }}
+{% if cache["ValueVectorizedDim"] == 3 %}
+                value_lane = {{ ctx["value_lane"] }}
+{% endif %}
+{% if cache["IdLength"] > 1 %}
+                topology_id = tl.load(block_tables + matched_seq_id * block_table_blocks * {{ cache["IdLength"] }} + context_bid * {{ cache["IdLength"] }}, mask=context_mask, other=0)
+{% endif %}
+                block_id = tl.load(block_tables + matched_seq_id * block_table_blocks * {{ cache["IdLength"] }} + context_bid * {{ cache["IdLength"] }} + {{ cache["IdLength"] - 1 }}, mask=context_mask, other=0)
+                key_offsets = {{ ctx["key_vector_offset"] }}
+                key_values = tl.load(kv_cache + key_offsets, mask=context_mask[None, :], other=0.0)
+                score = tl.reshape(tl.dot(q_values[None, :], key_values), ({{ ctx["attention_block_size"] }},))
+                score = tl.where(context_mask, score * scale_value, -float("inf"))
+                block_max = tl.max(score, axis=0)
+                has_context = block_max != -float("inf")
+                new_max = tl.maximum(max_score, block_max)
+                safe_new_max = tl.where(has_context, new_max, 0.0)
+                safe_prev_max = tl.where(has_context, max_score, 0.0)
+                alpha = tl.exp(safe_prev_max - safe_new_max)
+                prob = tl.exp(tl.where(context_mask, score - safe_new_max, -float("inf")))
+                value_offsets = {{ ctx["value_vector_offset"] }}
+                value_values = tl.load(kv_cache + value_offsets, mask=context_mask[:, None], other=0.0).to(tl.float32)
+                acc = acc * alpha + tl.dot(prob[None, :], value_values, input_precision="ieee")
+                sum_exp = sum_exp * alpha + tl.sum(prob, axis=0)
+                max_score = tl.where(has_context, new_max, max_score)
+            inv_sum = tl.where(sum_exp != 0.0, 1.0 / sum_exp, 0.0)
+            result = tl.reshape(acc * inv_sum, ({{ cache["HeadDim"] }},))
+            output_offsets = {{ ctx["output_vector_offset"] }}
+            tl.store({{ access_pointer(model, "Output", "output", "output_offsets") }}, result, mask=found_seq)

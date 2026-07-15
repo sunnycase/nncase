@@ -1,1 +1,2 @@
-{{ emit("QKVParallelLinear", model) }}
+{% set packed = false %}
+{% include "triton/kernels/_qkv_parallel_linear.py.jinja" %}

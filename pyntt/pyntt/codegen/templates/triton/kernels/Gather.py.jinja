@@ -1,1 +1,43 @@
-{{ emit("Gather", model) }}
+{% import "triton/kernels/_common.py.jinja" as common with context %}
+{% set ctx = gather_context(model) %}
+# generated from PyNTT Jinja Gather.py.jinja
+# {{ model["Comment"] }}; input_dtype={{ model["InputDType"] }}, index_dtype={{ model["IndexDType"] }}, output_dtype={{ model["OutputDType"] }}, input_shape={{ shape_tuple(model["InputShape"]) }}, output_shape={{ shape_tuple(model["OutputShape"]) }}, axis={{ model["Axis"] }}
+{{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
+def {{ model["FunctionName"] }}({{ helper_parameters(model) }}):
+    shard_index = tl.program_id(0).to(tl.int64)
+{{ common.shard_coordinates([model["Input"], model["Index"], model["Output"]]) }}
+{% for name, key in (("input", "Input"), ("index", "Index"), ("output", "Output")) %}
+{% if local_buffer(model[key]) is none %}
+    {{ name }} = {{ ptr(model, key) }}
+{% endif %}
+{% endfor %}
+    tmp_shard = shard_index
+{% for axis in reverse_indices(model["Hierarchy"]) %}
+    shard_coord{{ axis }} = tmp_shard % {{ model["Hierarchy"][axis] }}
+    tmp_shard = tmp_shard // {{ model["Hierarchy"][axis] }}
+{% endfor %}
+{% for axis in ctx["loop_axes"] %}
+{{ "    " * loop.index }}for idx{{ axis }} in tl.range(0, {{ dim(ctx["logical_output_shape"][axis]) }}):
+{% endfor %}
+{{ "    " * ((ctx["loop_axes"] | length) + 1) }}for axis_start in tl.range(0, {{ dim(ctx["block_extent"]) }}, block_size):
+{{ "    " * ((ctx["loop_axes"] | length) + 2) }}lane = axis_start + tl.arange(0, block_size)
+{{ "    " * ((ctx["loop_axes"] | length) + 2) }}mask = lane < {{ dim(ctx["block_extent"]) }}
+{{ "    " * ((ctx["loop_axes"] | length) + 2) }}index_offsets = {{ ctx["index_offset"] }}
+{{ "    " * ((ctx["loop_axes"] | length) + 2) }}gather_index = tl.load({{ access_pointer(model, "Index", "index", "index_offsets") }}, mask=mask, other=0)
+{% if ctx["signed_index"] %}
+{{ "    " * ((ctx["loop_axes"] | length) + 2) }}gather_index = tl.where(gather_index < 0, gather_index + {{ dim(model["InputGlobalShape"][model["Axis"]]) }}, gather_index)
+{% endif %}
+{{ "    " * ((ctx["loop_axes"] | length) + 2) }}input_active = (gather_index >= 0) & (gather_index < {{ dim(model["InputGlobalShape"][model["Axis"]]) }})
+{% if not ctx["gather_split_axes"] %}
+{{ "    " * ((ctx["loop_axes"] | length) + 2) }}local_gather_index = gather_index
+{% else %}
+{{ "    " * ((ctx["loop_axes"] | length) + 2) }}input_local_dim = {{ dim(model["InputShape"][model["Axis"]]) }}
+{{ "    " * ((ctx["loop_axes"] | length) + 2) }}input_split_linear = {{ ctx["input_split_linear"] }}
+{{ "    " * ((ctx["loop_axes"] | length) + 2) }}input_global_base = input_split_linear * input_local_dim
+{{ "    " * ((ctx["loop_axes"] | length) + 2) }}local_gather_index = gather_index - input_global_base
+{{ "    " * ((ctx["loop_axes"] | length) + 2) }}input_active = input_active & (gather_index >= input_global_base) & (gather_index < input_global_base + input_local_dim)
+{% endif %}
+{{ "    " * ((ctx["loop_axes"] | length) + 2) }}input_offsets = {{ ctx["input_offset"] }}
+{{ "    " * ((ctx["loop_axes"] | length) + 2) }}output_offsets = {{ ctx["output_offset"] }}
+{{ "    " * ((ctx["loop_axes"] | length) + 2) }}value = tl.load({{ access_pointer(model, "Input", "input", "input_offsets") }}, mask=mask & input_active, other=0.0)
+{{ "    " * ((ctx["loop_axes"] | length) + 2) }}tl.store({{ access_pointer(model, "Output", "output", "output_offsets") }}, value, mask=mask)

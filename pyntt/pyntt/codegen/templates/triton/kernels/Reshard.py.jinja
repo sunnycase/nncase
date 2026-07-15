@@ -1,1 +1,86 @@
-{{ emit("Reshard", model) }}
+{% import "triton/kernels/_common.py.jinja" as common with context %}
+{% set ctx = reshard_context(model) %}
+# generated from PyNTT Jinja Reshard.py.jinja
+# {{ model["Comment"] }}; dtype={{ model["DType"] }}, global_shape={{ shape_tuple(model["GlobalShape"]) }}, input_tile_shape={{ shape_tuple(model["InputActiveShape"]) }}, output_local_shape={{ shape_tuple(model["OutputLocalShape"]) }}, lane={{ model["VectorLaneCount"] }}, stage=tile_scatter
+{{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
+def {{ model["FunctionName"] }}({{ helper_parameters(model) }}):
+    shard_index = tl.program_id(0).to(tl.int64)
+{{ common.shard_coordinates([model["Input"]]) }}
+{% if local_buffer(model["Input"]) is none %}
+    input0 = {{ ptr(model, "Input") }}
+{% endif %}
+    tmp_shard = shard_index
+{% for axis in reverse_indices(model["Hierarchy"]) %}
+    shard_coord{{ axis }} = tmp_shard % {{ model["Hierarchy"][axis] }}
+    tmp_shard = tmp_shard // {{ model["Hierarchy"][axis] }}
+{% endfor %}
+{% for axis in ctx["output_broadcast_mesh_axes"] %}
+{{ "    " * loop.index }}for destination_shard_coord{{ axis }} in tl.range(0, {{ model["Hierarchy"][axis] }}):
+{% endfor %}
+{% set base = "    " * ((ctx["output_broadcast_mesh_axes"] | length) + 1) %}
+{% set body = "    " * ((ctx["output_broadcast_mesh_axes"] | length) + 2) %}
+{{ base }}for linear_start in tl.range(0, {{ ctx["total"] }}, block_size):
+{{ body }}linear = linear_start + tl.arange(0, block_size)
+{{ body }}mask = (linear < {{ ctx["total"] }}) & ({{ ctx["writer_active"] }})
+{% if model["VectorLaneCount"] == 1 %}
+{{ body }}lane = linear
+{{ body }}lane_value = linear * 0
+{% else %}
+{{ body }}lane = linear // {{ model["VectorLaneCount"] }}
+{{ body }}lane_value = linear % {{ model["VectorLaneCount"] }}
+{% endif %}
+{{ body }}remaining = lane
+{% for axis in reverse_indices(model["InputActiveShape"]) %}
+{{ body }}input_idx{{ axis }} = remaining % {{ dim(model["InputActiveShape"][axis]) }}
+{{ body }}remaining = remaining // {{ dim(model["InputActiveShape"][axis]) }}
+{% endfor %}
+{% for axis in range(model["GlobalShape"] | length) %}
+{{ body }}global_idx{{ axis }} = input_idx{{ axis }} + {{ dim(model["InputGlobalOffsets"][axis]) }}
+{{ body }}mask = mask & (global_idx{{ axis }} < {{ dim(model["GlobalShape"][axis]) }})
+{% endfor %}
+{% for split_axes in model["OutputSplitAxes"] %}
+{% set axis = loop.index0 %}
+{% if split_axes %}
+{{ body }}output_local_dim{{ axis }} = {{ dim(model["OutputLocalShape"][axis]) }}
+{{ body }}output_split_linear{{ axis }} = global_idx{{ axis }} // output_local_dim{{ axis }}
+{{ body }}output_idx{{ axis }} = global_idx{{ axis }} - output_split_linear{{ axis }} * output_local_dim{{ axis }}
+{{ body }}tmp_output_split{{ axis }} = output_split_linear{{ axis }}
+{% for placement_axis in split_axes | reverse %}
+{{ body }}destination_shard_coord{{ placement_axis }} = tmp_output_split{{ axis }} % {{ model["Hierarchy"][placement_axis] }}
+{{ body }}tmp_output_split{{ axis }} = tmp_output_split{{ axis }} // {{ model["Hierarchy"][placement_axis] }}
+{% endfor %}
+{% else %}
+{{ body }}output_idx{{ axis }} = global_idx{{ axis }}
+{% endif %}
+{% endfor %}
+{% for axis in range(model["Hierarchy"] | length) %}
+{% if axis not in ctx["input_split_mesh_axes"] and axis not in ctx["input_partial_mesh_axes"] %}
+{{ body }}mask = mask & (shard_coord{{ axis }} == destination_shard_coord{{ axis }})
+{% endif %}
+{% endfor %}
+{{ body }}destination_shard_index = {{ ctx["destination_shard_index"] }}
+{{ body }}input_offsets = {{ ctx["input_offsets"] }}
+{{ body }}output_offsets = {{ ctx["output_offsets"] }}
+{{ body }}destination_pool_index = {{ ctx["destination_pool_index"] }}
+{{ body }}output_byte_offsets = destination_pool_index * {{ model["OutputAddress"]["PoolStrideBytes"] }} + {{ model["OutputAddress"]["OffsetBytes"] }} + output_offsets * {{ model["ScalarElementSizeBytes"] }}
+{% if ctx["partial"] is none %}
+{{ body }}value = tl.load({{ access_pointer(model, "Input", "input0", "input_offsets") }}, mask=mask)
+{% else %}
+{{ body }}acc = tl.full((block_size,), {{ ctx["partial"]["zero"] }}, {{ ctx["partial"]["accumulator_dtype"] }})
+{% for axis in range(model["Hierarchy"] | length) %}
+{{ body }}source_shard_coord{{ axis }} = shard_coord{{ axis }}
+{% endfor %}
+{% for axis in ctx["partial"]["axes"] %}
+{{ body }}{{ "    " * loop.index0 }}for reduce_coord{{ axis }} in tl.range(0, {{ model["Hierarchy"][axis] }}):
+{{ body }}{{ "    " * loop.index }}source_shard_coord{{ axis }} = reduce_coord{{ axis }}.to(tl.int64)
+{% endfor %}
+{% set reduce_body = body ~ ("    " * (ctx["partial"]["axes"] | length)) %}
+{{ reduce_body }}source_shard_index = {{ ctx["partial"]["source_shard_index"] }}
+{{ reduce_body }}source_pool_index = {{ ctx["partial"]["source_pool_index"] }}
+{{ reduce_body }}source_byte_offset = source_pool_index * {{ ctx["partial"]["address"]["PoolStrideBytes"] }} + {{ ctx["partial"]["address"]["OffsetBytes"] }}
+{{ reduce_body }}source = ({{ ctx["partial"]["address"]["BaseName"] }} + source_byte_offset).to({{ ctx["partial"]["pointer_type"] }})
+{{ reduce_body }}source_value = tl.load(source + input_offsets, mask=mask, other={{ ctx["partial"]["zero"] }}).to({{ ctx["partial"]["accumulator_dtype"] }})
+{{ reduce_body }}acc += source_value
+{{ body }}value = acc
+{% endif %}
+{{ body }}tl.store(({{ model["OutputAddress"]["BaseName"] }} + output_byte_offsets).to({{ ctx["output_pointer_type"] }}), value, mask=mask)

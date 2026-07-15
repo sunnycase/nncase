@@ -1,1 +1,16 @@
-{{ emit("TensorStore", model) }}
+{% import "triton/kernels/_common.py.jinja" as common with context %}
+{% set ctx = tensor_copy_context(model, is_load=False) %}
+{% set args = [] if ctx["internal_destination"] is not none else ["destination", "destination_pool_stride_elements: tl.constexpr"] %}
+# generated from PyNTT Jinja TensorStore.py.jinja
+# {{ model["Comment"] }}; dtype={{ model["DType"] }}, local_shape={{ shape_tuple(ctx["local_shape"]) }}, global_shape={{ shape_tuple(ctx["global_shape"]) }}
+{{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
+def {{ model["FunctionName"] }}({{ helper_parameters(model, args) }}):
+    shard_index = tl.program_id(0).to(tl.int64)
+{{ common.shard_coordinates(([model["Source"], ctx["internal_destination"]] if ctx["internal_destination"] is not none else [model["Source"]])) }}
+{% if local_buffer(model["Source"]) is none %}
+    source = {{ ptr(model, "Source") }}
+{% endif %}
+{% if ctx["internal_destination"] is not none and local_buffer(model["Destination"]) is none %}
+    destination = {{ ptr(model, "Destination") }}
+{% endif %}
+{% include "triton/kernels/_tensor_copy_body.py.jinja" %}

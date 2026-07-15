@@ -1,1 +1,49 @@
-{{ emit("NormApply", model) }}
+{% import "triton/kernels/_common.py.jinja" as common with context %}
+{% set ctx = norm_apply_context(model) %}
+# generated from PyNTT Jinja NormApply.py.jinja
+# {{ model["Comment"] }}; input_dtype={{ model["InputDType"] }}, stats_dtype={{ model["StatsDType"] }}, scale_dtype={{ model["ScaleDType"] }}, bias_dtype={{ model["BiasDType"] }}, output_dtype={{ model["OutputDType"] }}, output_shape={{ shape_tuple(model["OutputShape"]) }}, axis={{ model["Axis"] }}
+{{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
+def {{ model["FunctionName"] }}({{ helper_parameters(model) }}):
+    shard_index = tl.program_id(0).to(tl.int64)
+{{ common.shard_coordinates([model["Input"], model["Stats"], model["Scale"], model["Bias"], model["Output"]]) }}
+{% for name, key in (("input0", "Input"), ("stats0", "Stats"), ("scale0", "Scale"), ("bias0", "Bias"), ("output", "Output")) %}
+{% if local_buffer(model[key]) is none %}
+    {{ name }} = {{ ptr(model, key) }}
+{% endif %}
+{% endfor %}
+{% for axis in ctx["outer_axes"] %}
+{{ "    " * loop.index }}for outer_idx{{ axis }} in tl.range(0, {{ dim(ctx["logical_output_shape"][axis]) }}):
+{% endfor %}
+{% set base = "    " * ((ctx["outer_axes"] | length) + 1) %}
+{% set body = "    " * ((ctx["outer_axes"] | length) + 2) %}
+{{ base }}inner_size = {{ ctx["inner_size"] }}
+{{ base }}inner_count = ({{ ctx["normalization_size"] }}) + 0.0
+{% if model["UseMean"] %}
+{{ base }}mean_sum = tl.load({{ access_pointer(model, "Stats", "stats0", ctx["stats_offsets"][0]) }}).to(tl.float32)
+{{ base }}square_sum = tl.load({{ access_pointer(model, "Stats", "stats0", ctx["stats_offsets"][1]) }}).to(tl.float32)
+{{ base }}mean_value = mean_sum / inner_count
+{{ base }}variance = (square_sum / inner_count) - (mean_value * mean_value)
+{% else %}
+{{ base }}square_sum = tl.load({{ access_pointer(model, "Stats", "stats0", ctx["stats_offsets"][0]) }}).to(tl.float32)
+{{ base }}mean_value = 0.0
+{{ base }}variance = square_sum / inner_count
+{% endif %}
+{{ base }}variance = tl.maximum(variance, 0.0)
+{{ base }}inv_std = tl.rsqrt(variance + {{ pyrepr(model["Epsilon"]) }})
+{{ base }}for inner_start in tl.range(0, inner_size, block_size):
+{{ body }}inner_lane = inner_start + tl.arange(0, block_size)
+{{ body }}mask = inner_lane < inner_size
+{{ body }}inner_remaining = inner_lane
+{% for axis in ctx["inner_axes"] | reverse %}
+{{ body }}inner_idx{{ axis }} = inner_remaining % {{ dim(ctx["logical_output_shape"][axis]) }}
+{{ body }}inner_remaining = inner_remaining // {{ dim(ctx["logical_output_shape"][axis]) }}
+{% endfor %}
+{{ body }}input_offsets = {{ ctx["input_offset"] }}
+{{ body }}scale_offsets = {{ ctx["scale_offset"] }}
+{{ body }}bias_offsets = {{ ctx["bias_offset"] }}
+{{ body }}output_offsets = {{ ctx["output_offset"] }}
+{{ body }}value0 = tl.load({{ access_pointer(model, "Input", "input0", "input_offsets") }}, mask=mask, other=0.0).to(tl.float32)
+{{ body }}scale_value = tl.load({{ access_pointer(model, "Scale", "scale0", "scale_offsets") }}, mask=mask, other=0.0).to(tl.float32)
+{{ body }}bias_value = tl.load({{ access_pointer(model, "Bias", "bias0", "bias_offsets") }}, mask=mask, other=0.0).to(tl.float32)
+{{ body }}result = ((value0 - mean_value) * inv_std * scale_value) + bias_value
+{{ body }}tl.store({{ access_pointer(model, "Output", "output", "output_offsets") }}, result, mask=mask)

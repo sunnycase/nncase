@@ -1,0 +1,110 @@
+{% import "triton/kernels/_common.py.jinja" as common with context %}
+{% set ctx = matmul_glu_context(model, packed=packed) %}
+{% if ctx["phase"] == "complete" %}
+# generated from PyNTT Jinja {{ ctx["template_name"] }}.py.jinja
+# {{ model["Comment"] }}; glu={{ model["GluType"] }}, input_dtype={{ model["InputDType"] }}, weight_dtype={{ model["WeightDType"] }}, output_dtype={{ model["OutputDType"] }}, input_shape={{ shape_tuple(model["InputShape"]) }}, gate_weight_shape={{ shape_tuple(model["GateWeightShape"]) }}, up_weight_shape={{ shape_tuple(model["UpWeightShape"]) }}, output_shape={{ shape_tuple(model["OutputShape"]) }}{{ ", n_packed_lane=" ~ model["NPackedLaneCount"] ~ ", n_lane=" ~ model["NVectorLaneCount"] ~ ", n_scalar_lane=" ~ (model["NPackedLaneCount"] * model["NVectorLaneCount"]) if packed else "" }}
+{{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
+def {{ model["FunctionName"] }}({{ helper_parameters(model) }}):
+    shard_index = tl.program_id(0).to(tl.int64)
+{% set pointer_keys = ("Input", "GateWeight", "UpWeight", "GateBias", "UpBias", "Output") %}
+{% set pointers = namespace(values=[]) %}
+{% for key in pointer_keys %}{% do pointers.values.append(model[key]) %}{% endfor %}
+{{ common.shard_coordinates(pointers.values) }}
+{% for name, key in (("input0", "Input"), ("gate_weight", "GateWeight"), ("up_weight", "UpWeight"), ("gate_bias", "GateBias"), ("up_bias", "UpBias"), ("output", "Output")) %}
+{% if local_buffer(model[key]) is none %}
+    {{ name }} = {{ ptr(model, key) }}
+{% endif %}
+{% endfor %}
+{% for axis in ctx["batch_axes"] %}
+{{ "    " * loop.index }}for idx{{ axis }} in tl.range(0, {{ dim(ctx["logical_output_shape"][axis]) }}):
+{% endfor %}
+{% set base = "    " * ((ctx["batch_axes"] | length) + 1) %}
+{% if ctx["use_gemv"] %}
+{{ base }}for m_idx in tl.range(0, {{ dim(ctx["m"]) }}):
+{% set tile = base ~ "    " %}
+{{ tile }}for n_start in tl.range(0, {{ dim(ctx["n"]) }}, {{ ctx["block_n"] }}, num_stages={{ ctx["n_stages"] }}):
+{% else %}
+{{ base }}for m_start in tl.range(0, {{ dim(ctx["m"]) }}, {{ ctx["block_m"] }}):
+{{ base }}    offs_m = m_start + tl.arange(0, {{ ctx["block_m"] }})
+{% set tile = base ~ "    " %}
+{{ tile }}for n_start in tl.range(0, {{ dim(ctx["n"]) }}, {{ ctx["block_n"] }}):
+{% endif %}
+{{ tile }}    offs_n = n_start + tl.arange(0, {{ ctx["block_n"] }})
+{% if ctx["use_gemv"] %}
+{{ tile }}    gate_acc = tl.zeros(({{ ctx["block_n"] }},), tl.float32)
+{{ tile }}    up_acc = tl.zeros(({{ ctx["block_n"] }},), tl.float32)
+{{ tile }}    for k_start in tl.range(0, {{ dim(ctx["k"]) }}, {{ ctx["block_k"] }}):
+{% else %}
+{{ tile }}    gate_acc = tl.zeros(({{ ctx["block_m"] }}, {{ ctx["block_n"] }}), tl.float32)
+{{ tile }}    up_acc = tl.zeros(({{ ctx["block_m"] }}, {{ ctx["block_n"] }}), tl.float32)
+{{ tile }}    for k_start in tl.range(0, {{ dim(ctx["k"]) }}, {{ ctx["block_k"] }}, num_stages=5):
+{% endif %}
+{{ tile }}        offs_k = k_start + tl.arange(0, {{ ctx["block_k"] }})
+{{ tile }}        input_values = tl.load({{ access_pointer(model, "Input", "input0", ctx["input_offset"]) }}, mask={{ ctx["input_mask"] }}, other=0.0){{ ".to(tl.float32)" if ctx["use_gemv"] else "" }}
+{% for projection in ctx["projections"] %}
+{{ tile }}        {{ projection["lower"] }}_weight_values = tl.load({{ access_pointer(model, projection["prefix"] ~ "Weight", projection["lower"] ~ "_weight", projection["weight_offset"]) }}, mask={{ projection["weight_mask"] }}, other=0.0{{ ", eviction_policy=\"evict_first\"" if ctx["use_gemv"] else "" }}){{ ".to(tl.float32)" if ctx["use_gemv"] else "" }}
+{% if ctx["use_gemv"] %}
+{{ tile }}        {{ projection["accumulator"] }} += tl.sum({{ projection["lower"] }}_weight_values * input_values[None, :], axis=1)
+{% else %}
+{{ tile }}        {{ projection["accumulator"] }} += tl.dot(input_values, {{ projection["lower"] }}_weight_values{{ ctx["dot_precision"] }})
+{% endif %}
+{% endfor %}
+{% for projection in ctx["projections"] %}
+{% if projection["has_bias"] %}
+{{ tile }}    {{ projection["accumulator"] }} += tl.load({{ access_pointer(model, projection["prefix"] ~ "Bias", projection["lower"] ~ "_bias", projection["bias_offset"]) }}, mask={{ projection["bias_mask"] }}, other=0.0).to(tl.float32){{ "[None, :]" if not ctx["use_gemv"] else "" }}
+{% endif %}
+{% endfor %}
+{{ tile }}    result = {{ ctx["result_expression"] }}
+{{ tile }}    tl.store({{ access_pointer(model, "Output", "output", ctx["output_offset"]) }}, result, mask={{ ctx["output_mask"] }})
+{% elif ctx["phase"] == "accumulate" %}
+# generated from PyNTT Jinja {{ ctx["template_name"] }}.py.jinja reduction accumulate
+# {{ model["Comment"] }}; accumulator=backend-private-fp32
+{{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
+def {{ model["FunctionName"] }}({{ helper_parameters(model, ("gate_acc", "up_acc")) }}):
+    shard_index = tl.program_id(0).to(tl.int64)
+{{ common.shard_coordinates([model["Input"], model["GateWeight"], model["UpWeight"]]) }}
+{% for name, key in (("input0", "Input"), ("gate_weight", "GateWeight"), ("up_weight", "UpWeight")) %}
+{% if local_buffer(model[key]) is none %}
+    {{ name }} = {{ ptr(model, key) }}
+{% endif %}
+{% endfor %}
+    offs_k = tl.arange(0, {{ ctx["block_k"] }})
+    offs_n = tl.arange(0, {{ ctx["block_n"] }})
+{% if ctx["block_m"] != 1 %}
+    offs_m = tl.arange(0, {{ ctx["block_m"] }})
+{% endif %}
+    input_values = tl.load({{ access_pointer(model, "Input", "input0", ctx["input_offset"]) }}, mask={{ ctx["input_mask"] }}, other=0.0){{ ".to(tl.float32)" if ctx["block_m"] == 1 else "" }}
+{% for projection in ctx["projections"] %}
+    {{ projection["lower"] }}_weight_values = tl.load({{ access_pointer(model, projection["prefix"] ~ "Weight", projection["lower"] ~ "_weight", projection["weight_offset"]) }}, mask={{ projection["weight_mask"] }}, other=0.0{{ ", eviction_policy=\"evict_first\"" if ctx["block_m"] == 1 else "" }}){{ ".to(tl.float32)" if ctx["block_m"] == 1 else "" }}
+{% if ctx["block_m"] == 1 %}
+    {{ projection["accumulator"] }} += tl.sum({{ projection["lower"] }}_weight_values * input_values[None, :], axis=1)
+{% else %}
+    {{ projection["accumulator"] }} += tl.dot(input_values, {{ projection["lower"] }}_weight_values{{ ctx["dot_precision"] }})
+{% endif %}
+{% endfor %}
+    return gate_acc, up_acc
+{% else %}
+# generated from PyNTT Jinja {{ ctx["template_name"] }}.py.jinja reduction finalize
+# {{ model["Comment"] }}; accumulator=backend-private-fp32
+{{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
+def {{ model["FunctionName"] }}({{ helper_parameters(model, ("gate_acc", "up_acc")) }}):
+    shard_index = tl.program_id(0).to(tl.int64)
+{{ common.shard_coordinates(ctx["pointer_values"]) }}
+{% for name, key in (("gate_bias", "GateBias"), ("up_bias", "UpBias")) %}
+{% if model["Has" ~ key] and local_buffer(model[key]) is none %}
+    {{ name }} = {{ ptr(model, key) }}
+{% endif %}
+{% endfor %}
+{% if local_buffer(model["Output"]) is none %}
+    output = {{ ptr(model, "Output") }}
+{% endif %}
+    offs_n = tl.arange(0, {{ ctx["block_n"] }})
+{% if ctx["block_m"] != 1 %}
+    offs_m = tl.arange(0, {{ ctx["block_m"] }})
+{% endif %}
+{% for bias in ctx["biases"] %}
+    {{ bias["accumulator"] }} += tl.load({{ access_pointer(model, bias["prefix"] ~ "Bias", bias["lower"] ~ "_bias", bias["offset"]) }}, mask={{ bias["mask"] }}, other=0.0).to(tl.float32){{ "[None, :]" if ctx["block_m"] != 1 else "" }}
+{% endfor %}
+    result = {{ ctx["result_expression"] }}
+    tl.store({{ access_pointer(model, "Output", "output", ctx["output_offset"]) }}, result, mask={{ ctx["output_mask"] }})
+{% endif %}

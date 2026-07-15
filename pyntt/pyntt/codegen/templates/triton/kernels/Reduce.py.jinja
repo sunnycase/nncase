@@ -1,1 +1,88 @@
-{{ emit("Reduce", model) }}
+{% import "triton/kernels/_common.py.jinja" as common with context %}
+{% set ctx = reduce_context(model) %}
+{% if ctx["phase"] == "complete" %}
+# generated from PyNTT Jinja Reduce.py.jinja
+# {{ model["Comment"] }}; op={{ model["ReduceOp"] }}, input_dtype={{ model["InputDType"] }}, output_dtype={{ model["OutputDType"] }}, input_shape={{ shape_tuple(model["InputShape"]) }}, output_shape={{ shape_tuple(model["OutputShape"]) }}
+{{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
+def {{ model["FunctionName"] }}({{ helper_parameters(model) }}):
+    shard_index = tl.program_id(0).to(tl.int64)
+{{ common.shard_coordinates([model["Input"], model["Output"]]) }}
+{% if local_buffer(model["Input"]) is none %}
+    input0 = {{ ptr(model, "Input") }}
+{% endif %}
+{% if local_buffer(model["Output"]) is none %}
+    output = {{ ptr(model, "Output") }}
+{% endif %}
+{% for axis in ctx["loop_axes"] %}
+{{ "    " * loop.index }}for out_idx{{ axis }} in tl.range(0, {{ dim(model["OutputShape"][axis]) }}):
+{% endfor %}
+{% set base = "    " * ((ctx["loop_axes"] | length) + 1) %}
+{% set body = base ~ "    " %}
+{{ base }}for axis_start in tl.range(0, {{ dim(ctx["block_extent"]) }}, block_size):
+{{ body }}lane = axis_start + tl.arange(0, block_size)
+{{ body }}mask = lane < {{ dim(ctx["block_extent"]) }}
+{{ body }}input_base = {{ ctx["input_base"] }}
+{{ body }}output_offsets = {{ ctx["output_offset"] }}
+{{ body }}acc = tl.full((block_size,), {{ model["InitValue"] }}, tl.float32)
+{% for axis in model["Axes"] %}
+{{ "    " * ((ctx["loop_axes"] | length) + loop.index + 1) }}for reduce_idx{{ axis }} in tl.range(0, {{ dim(model["InputShape"][axis]) }}):
+{% endfor %}
+{% set reduce_body = "    " * ((ctx["loop_axes"] | length) + (model["Axes"] | length) + 2) %}
+{{ reduce_body }}value0 = tl.load({{ access_pointer(model, "Input", "input0", "input_base + " ~ ctx["reduce_offset"]) }}, mask=mask, other={{ model["InitValue"] }})
+{{ reduce_body }}acc = {{ model["UpdateExpression"] }}
+{{ body }}result = {{ model["FinalizeExpression"] }}
+{{ body }}tl.store({{ access_pointer(model, "Output", "output", "output_offsets") }}, result, mask=mask)
+{% elif ctx["phase"] == "accumulate" %}
+# generated from PyNTT Jinja Reduce.py.jinja reduction accumulate
+# {{ model["Comment"] }}; op={{ model["ReduceOp"] }}, accumulator=backend-private
+{{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
+def {{ model["FunctionName"] }}({{ helper_parameters(model, ctx["state_parameters"]) }}):
+    shard_index = tl.program_id(0).to(tl.int64)
+{{ common.shard_coordinates([model["Input"]]) }}
+{% if local_buffer(model["Input"]) is none %}
+    input0 = {{ ptr(model, "Input") }}
+{% endif %}
+    lane = tl.arange(0, {{ ctx["block_size"] }})
+    mask = lane < {{ dim(ctx["output_elements"]) }}
+{% if model["OutputShape"] %}
+    tmp = lane
+{% for axis in reverse_indices(model["OutputShape"]) %}
+    out_idx{{ axis }} = tmp % {{ dim(model["OutputShape"][axis]) }}
+    tmp = tmp // {{ dim(model["OutputShape"][axis]) }}
+{% endfor %}
+{% endif %}
+    input_base = {{ ctx["input_base"] }}
+{% for axis in model["Axes"] %}
+{{ "    " * loop.index }}for reduce_idx{{ axis }} in tl.range(0, {{ dim(model["InputShape"][axis]) }}):
+{% endfor %}
+{% set body = "    " * ((model["Axes"] | length) + 1) %}
+{{ body }}value0 = tl.load({{ access_pointer(model, "Input", "input0", "input_base + " ~ ctx["reduce_offset"]) }}, mask=mask, other={{ model["InitValue"] }})
+{{ body }}acc = {{ model["UpdateExpression"] }}
+{% if ctx["track_element_count"] %}
+    reduced_element_count += {{ dim(ctx["tile_element_count"]) }}
+    return acc, reduced_element_count
+{% else %}
+    return acc
+{% endif %}
+{% else %}
+# generated from PyNTT Jinja Reduce.py.jinja reduction finalize
+# {{ model["Comment"] }}; accumulator=backend-private
+{{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
+def {{ model["FunctionName"] }}({{ helper_parameters(model, ctx["state_parameters"]) }}):
+    shard_index = tl.program_id(0).to(tl.int64)
+{{ common.shard_coordinates([model["Output"]]) }}
+{% if local_buffer(model["Output"]) is none %}
+    output = {{ ptr(model, "Output") }}
+{% endif %}
+    lane = tl.arange(0, {{ ctx["block_size"] }})
+    mask = lane < {{ dim(ctx["output_elements"]) }}
+{% if model["OutputShape"] %}
+    tmp = lane
+{% for axis in reverse_indices(model["OutputShape"]) %}
+    out_idx{{ axis }} = tmp % {{ dim(model["OutputShape"][axis]) }}
+    tmp = tmp // {{ dim(model["OutputShape"][axis]) }}
+{% endfor %}
+{% endif %}
+    result = {{ model["FinalizeExpression"] }}
+    tl.store({{ access_pointer(model, "Output", "output", ctx["output_offset"]) }}, result, mask=mask)
+{% endif %}

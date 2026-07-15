@@ -1,1 +1,30 @@
-{{ emit("GetPositionIds", model) }}
+{% import "triton/kernels/_common.py.jinja" as common with context %}
+{% set local_extent = model["LocalShape"][0] %}
+# generated from PyNTT Jinja GetPositionIds.py.jinja
+# {{ model["Comment"] }}; output_dtype={{ model["OutputDType"] }}, local_shape={{ shape_tuple(model["LocalShape"]) }}, global_shape={{ shape_tuple(model["GlobalShape"]) }}
+{{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
+def {{ model["FunctionName"] }}({{ helper_parameters(model, ["cache_meta"]) }}):
+    shard_index = tl.program_id(0).to(tl.int64)
+{{ common.shard_coordinates([model["Output"]]) }}
+{% if local_buffer(model["Output"]) is none %}
+    output = {{ ptr(model, "Output") }}
+{% endif %}
+    global_start = {{ dim(model["OutputGlobalOffsets"][0]) }}
+    for axis_start in tl.range(0, {{ dim(local_extent) }}, block_size):
+        lane = axis_start + tl.arange(0, block_size)
+        mask = lane < {{ dim(local_extent) }}
+        global_lane = global_start + lane
+        result = tl.full((block_size,), 0.0, tl.float32)
+        active = tl.full((block_size,), False, tl.int1)
+        num_seqs = tl.load(cache_meta + 0).to(tl.int64)
+        query_start = tl.full((), 0, tl.int64)
+        for seq_id in tl.range(0, num_seqs):
+            context_len = tl.load(cache_meta + 1 + seq_id * 2)
+            seq_len = tl.load(cache_meta + 2 + seq_id * 2)
+            query_len = seq_len - context_len
+            query_end = query_start + query_len
+            in_seq = (global_lane >= query_start) & (global_lane < query_end)
+            result = tl.where(in_seq, (context_len + global_lane - query_start).to(tl.float32), result)
+            active = active | in_seq
+            query_start = query_end
+        tl.store({{ access_pointer(model, "Output", "output", "lane * " ~ dim(model["OutputStrides"][0])) }}, result, mask=mask & active)

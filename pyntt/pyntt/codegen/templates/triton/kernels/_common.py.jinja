@@ -1,0 +1,78 @@
+{% macro shard_coordinates(pointers) -%}
+{% set hierarchy = pointer_shard_hierarchy(pointers) -%}
+{% if hierarchy is not none %}
+    tmp_shard_coord = shard_index
+{% for axis in reverse_indices(hierarchy) %}
+    shard_coord{{ axis }} = tmp_shard_coord % {{ hierarchy[axis] }}
+    tmp_shard_coord = tmp_shard_coord // {{ hierarchy[axis] }}
+{% endfor %}
+{% endif %}
+{%- endmacro %}
+
+{% macro broadcast_offset(shape, strides, output_rank, lane_count, lane_index="lane_flat") -%}
+{% set axis_offset = output_rank - (shape | length) -%}
+{% set terms = namespace(values=[]) -%}
+{% for axis in range(shape | length) -%}
+{% if not is_fixed_one(shape[axis]) -%}
+{% do terms.values.append("idx" ~ (axis_offset + axis) ~ " * " ~ dim(strides[axis])) -%}
+{% endif -%}
+{% endfor -%}
+{% set tensor_offset = (terms.values | join(" + ")) if terms.values else lane_index ~ " * 0" -%}
+{{ tensor_offset if lane_count == 1 else "((" ~ tensor_offset ~ ") * " ~ lane_count ~ " + " ~ lane_index ~ ")" }}
+{%- endmacro %}
+
+{% macro indexed_offset(strides, lane_count, lane_index="lane_flat") -%}
+{% set terms = namespace(values=[]) -%}
+{% for stride in strides -%}
+{% do terms.values.append("idx" ~ loop.index0 ~ " * " ~ dim(stride)) -%}
+{% endfor -%}
+{% set tensor_offset = (terms.values | join(" + ")) if terms.values else lane_index ~ " * 0" -%}
+{{ tensor_offset if lane_count == 1 else "((" ~ tensor_offset ~ ") * " ~ lane_count ~ " + " ~ lane_index ~ ")" }}
+{%- endmacro %}
+
+{% macro prefixed_offset(prefix, strides, lane_count, lane_index="lane_flat") -%}
+{% set terms = namespace(values=[]) -%}
+{% for stride in strides -%}
+{% do terms.values.append(prefix ~ loop.index0 ~ " * " ~ dim(stride)) -%}
+{% endfor -%}
+{% set tensor_offset = (terms.values | join(" + ")) if terms.values else lane_index ~ " * 0" -%}
+{{ tensor_offset if lane_count == 1 else "((" ~ tensor_offset ~ ") * " ~ lane_count ~ " + " ~ lane_index ~ ")" }}
+{%- endmacro %}
+
+{% macro vectorized_offset(strides, vectorized_axis, lane_count) -%}
+{% set terms = namespace(values=[]) -%}
+{% set lane = namespace(value="0") -%}
+{% for stride in strides -%}
+{% set index = "idx" ~ loop.index0 -%}
+{% if loop.index0 == vectorized_axis and lane_count != 1 -%}
+{% set lane.value = index ~ " % " ~ lane_count -%}
+{% set index = index ~ " // " ~ lane_count -%}
+{% endif -%}
+{% do terms.values.append(index ~ " * " ~ dim(stride)) -%}
+{% endfor -%}
+{% set tensor_offset = (terms.values | join(" + ")) if terms.values else "linear * 0" -%}
+{{ tensor_offset if lane_count == 1 else "((" ~ tensor_offset ~ ") * " ~ lane_count ~ " + " ~ lane.value ~ ")" }}
+{%- endmacro %}
+
+{% macro where_offset(physical_shape, logical_shape, strides, lane_count, output_rank, block_axis) -%}
+{% set axis_offset = output_rank - (logical_shape | length) -%}
+{% set terms = namespace(values=[]) -%}
+{% for dim_value in logical_shape -%}
+{% if not is_fixed_one(dim_value) -%}
+{% set output_axis = axis_offset + loop.index0 -%}
+{% set index = "lane" if output_axis == block_axis else "idx" ~ output_axis -%}
+{% if lane_count > 1 and loop.index0 == (physical_shape | length) - 1 -%}
+{% set index = "((" ~ index ~ ") // " ~ lane_count ~ ")" -%}
+{% endif -%}
+{% do terms.values.append(index ~ " * " ~ dim(strides[loop.index0])) -%}
+{% endif -%}
+{% endfor -%}
+{% set physical_index = "lane * 0" if not terms.values else "lane * 0 + " ~ (terms.values | join(" + ")) -%}
+{% if lane_count == 1 -%}
+{{ physical_index }}
+{% else -%}
+{% set logical_last = axis_offset + (logical_shape | length) - 1 -%}
+{% set last_index = "lane" if logical_last == block_axis else "idx" ~ logical_last -%}
+(({{ physical_index }}) * {{ lane_count }} + (({{ last_index }}) % {{ lane_count }}))
+{% endif -%}
+{%- endmacro %}

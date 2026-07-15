@@ -1,1 +1,43 @@
-{{ emit("RoPE", model) }}
+{% import "triton/kernels/_common.py.jinja" as common with context %}
+{% set ctx = rope_context(model) %}
+# generated from PyNTT Jinja RoPE.py.jinja
+# {{ model["Comment"] }}; input_dtype={{ model["InputDType"] }}, cos_dtype={{ model["CosDType"] }}, sin_dtype={{ model["SinDType"] }}, output_dtype={{ model["OutputDType"] }}, shape={{ shape_tuple(model["OutputShape"]) }}, rotary_axis={{ ctx["rotary_axis"] }}
+{{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
+def {{ model["FunctionName"] }}({{ helper_parameters(model) }}):
+    shard_index = tl.program_id(0).to(tl.int64)
+{{ common.shard_coordinates([model["Input"], model["Cos"], model["Sin"], model["Output"]]) }}
+{% for name, key in (("input0", "Input"), ("cos0", "Cos"), ("sin0", "Sin"), ("output", "Output")) %}
+{% if local_buffer(model[key]) is none %}
+    {{ name }} = {{ ptr(model, key) }}
+{% endif %}
+{% endfor %}
+    for linear_start in tl.range(0, {{ ctx["total"] }}, block_size):
+        linear = linear_start + tl.arange(0, block_size)
+        mask = linear < {{ ctx["total"] }}
+        lane_flat = linear % {{ model["OutputVectorLaneCount"] }}
+        output_tensor_linear = linear // {{ model["OutputVectorLaneCount"] }}
+        tmp = output_tensor_linear
+{% for axis in reverse_indices(model["OutputShape"]) %}
+        idx{{ axis }} = tmp % {{ dim(model["OutputShape"][axis]) }}
+        tmp = tmp // {{ dim(model["OutputShape"][axis]) }}
+{% endfor %}
+        logical_rotary = idx{{ ctx["rotary_axis"] }} * {{ model["OutputVectorLaneCount"] }} + lane_flat
+        paired_logical = tl.where(logical_rotary < {{ ctx["half_dim"] }}, logical_rotary + {{ ctx["half_dim"] }}, logical_rotary - {{ ctx["half_dim"] }})
+        paired_idx{{ ctx["rotary_axis"] }} = paired_logical // {{ model["OutputVectorLaneCount"] }}
+        paired_lane = paired_logical % {{ model["OutputVectorLaneCount"] }}
+{% if ctx["sincos_pack_factor"] != 1 %}
+        sincos_rotary = logical_rotary // ({{ ctx["sincos_pack_factor"] }} * {{ model["OutputVectorLaneCount"] }})
+        sincos_lane = ((logical_rotary // {{ model["OutputVectorLaneCount"] }}) % {{ ctx["sincos_pack_factor"] }}) * {{ model["OutputVectorLaneCount"] }} + lane_flat
+{% endif %}
+        input_offsets = {{ ctx["input_offset"] }}
+        paired_input_offsets = {{ ctx["paired_input_offset"] }}
+        cos_offsets = {{ ctx["cos_offset"] }}
+        sin_offsets = {{ ctx["sin_offset"] }}
+        output_offsets = {{ ctx["output_offset"] }}
+        value0 = tl.load({{ access_pointer(model, "Input", "input0", "input_offsets") }}, mask=mask, other=0.0).to(tl.float32)
+        paired_value = tl.load({{ access_pointer(model, "Input", "input0", "paired_input_offsets") }}, mask=mask, other=0.0).to(tl.float32)
+        cos_value = tl.load({{ access_pointer(model, "Cos", "cos0", "cos_offsets") }}, mask=mask, other=0.0).to(tl.float32)
+        sin_value = tl.load({{ access_pointer(model, "Sin", "sin0", "sin_offsets") }}, mask=mask, other=0.0).to(tl.float32)
+        rotated = tl.where(logical_rotary < {{ ctx["half_dim"] }}, -paired_value, paired_value)
+        result = value0 * cos_value + rotated * sin_value
+        tl.store({{ access_pointer(model, "Output", "output", "output_offsets") }}, result, mask=mask)

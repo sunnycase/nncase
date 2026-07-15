@@ -1,1 +1,32 @@
-{{ emit("Conv2D", model) }}
+{% import "triton/kernels/_common.py.jinja" as common with context %}
+{% set ctx = conv2d_context(model) %}
+# generated from PyNTT Jinja Conv2D.py.jinja
+# {{ model["Comment"] }}; input_dtype={{ model["InputDType"] }}, weights_dtype={{ model["WeightsDType"] }}, bias_dtype={{ model["BiasDType"] }}, output_dtype={{ model["OutputDType"] }}
+{{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
+def {{ model["FunctionName"] }}({{ helper_parameters(model) }}):
+    shard_index = tl.program_id(0).to(tl.int64)
+{{ common.shard_coordinates([model["Input"], model["Weights"], model["Bias"], model["Output"]]) }}
+{% for name, key in (("input", "Input"), ("weights", "Weights"), ("bias", "Bias"), ("output", "Output")) %}
+{% if local_buffer(model[key]) is none %}
+    {{ name }} = {{ ptr(model, key) }}
+{% endif %}
+{% endfor %}
+{% for axis in ctx["loop_axes"] %}
+{{ "    " * loop.index }}for idx{{ axis }} in tl.range(0, {{ dim(model["OutputShape"][axis]) }}):
+{% endfor %}
+{% set base = "    " * ((ctx["loop_axes"] | length) + 1) %}
+{% set body = base ~ "    " %}
+{{ base }}for axis_start in tl.range(0, {{ dim(ctx["block_extent"]) }}, block_size):
+{{ body }}lane = axis_start + tl.arange(0, block_size)
+{{ body }}mask = lane < {{ dim(ctx["block_extent"]) }}
+{{ body }}acc = tl.load({{ access_pointer(model, "Bias", "bias", ctx["bias_offset"]) }}, mask=mask, other=0.0).to(tl.float32)
+{{ body }}for ic in tl.range(0, {{ ctx["input_channels_per_group"] }}):
+{{ body }}    for kh in tl.range(0, {{ ctx["kernel_h"] }}):
+{{ body }}        for kw in tl.range(0, {{ ctx["kernel_w"] }}):
+{{ body }}            ih = {{ ctx["ih"] }}
+{{ body }}            iw = {{ ctx["iw"] }}
+{{ body }}            input_mask = mask & (ih >= 0) & (ih < {{ dim(model["InputShape"][2]) }}) & (iw >= 0) & (iw < {{ dim(model["InputShape"][3]) }})
+{{ body }}            input_value = tl.load({{ access_pointer(model, "Input", "input", ctx["input_offset"]) }}, mask=input_mask, other=0.0).to(tl.float32)
+{{ body }}            weight_value = tl.load({{ access_pointer(model, "Weights", "weights", ctx["weights_offset"]) }}, mask=mask, other=0.0).to(tl.float32)
+{{ body }}            acc += input_value * weight_value
+{{ body }}tl.store({{ access_pointer(model, "Output", "output", ctx["output_offset"]) }}, acc.to({{ model["OutputTritonDType"] }}), mask=mask)

@@ -1,1 +1,34 @@
-{{ emit("ElementwiseBinary", model) }}
+{% import "triton/kernels/_common.py.jinja" as common with context %}
+{% set total = multiply_expr(product(model["OutputShape"]), model["OutputVectorLaneCount"]) %}
+# generated from PyNTT Jinja ElementwiseBinary.py.jinja
+# {{ model["Comment"] }}; op={{ model["Op"] }}, lhs_dtype={{ model["LhsDType"] }}, rhs_dtype={{ model["RhsDType"] }}, output_dtype={{ model["OutputDType"] }}, shape={{ shape_tuple(model["Shape"]) }}
+{{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
+def {{ model["FunctionName"] }}({{ helper_parameters(model) }}):
+    shard_index = tl.program_id(0).to(tl.int64)
+{{ common.shard_coordinates([model["Lhs"], model["Rhs"], model["Output"]]) }}
+{% if local_buffer(model["Lhs"]) is none %}
+    lhs = {{ ptr(model, "Lhs") }}
+{% endif %}
+{% if local_buffer(model["Rhs"]) is none %}
+    rhs = {{ ptr(model, "Rhs") }}
+{% endif %}
+{% if local_buffer(model["Output"]) is none %}
+    output = {{ ptr(model, "Output") }}
+{% endif %}
+    for linear_start in tl.range(0, {{ total }}, block_size):
+        linear = linear_start + tl.arange(0, block_size)
+        mask = linear < {{ total }}
+        lane_flat = linear % {{ model["OutputVectorLaneCount"] }}
+        output_tensor_linear = linear // {{ model["OutputVectorLaneCount"] }}
+        tmp = output_tensor_linear
+{% for axis in reverse_indices(model["OutputShape"]) %}
+        idx{{ axis }} = tmp % {{ dim(model["OutputShape"][axis]) }}
+        tmp = tmp // {{ dim(model["OutputShape"][axis]) }}
+{% endfor %}
+        lhs_offsets = {{ common.broadcast_offset(model["LhsShape"], model["LhsStrides"], model["OutputShape"] | length, model["LhsVectorLaneCount"]) }}
+        rhs_offsets = {{ common.broadcast_offset(model["RhsShape"], model["RhsStrides"], model["OutputShape"] | length, model["RhsVectorLaneCount"]) }}
+        output_offsets = {{ common.indexed_offset(model["OutputStrides"], model["OutputVectorLaneCount"]) }}
+        value0 = tl.load({{ access_pointer(model, "Lhs", "lhs", "lhs_offsets") }}, mask=mask, other=0.0)
+        value1 = tl.load({{ access_pointer(model, "Rhs", "rhs", "rhs_offsets") }}, mask=mask, other=0.0)
+        result = {{ model["BinaryExpression"] }}
+        tl.store({{ access_pointer(model, "Output", "output", "output_offsets") }}, {{ "(result).to(tl.uint8)" if is_bool_dtype(model["OutputDType"]) else "result" }}, mask=mask)

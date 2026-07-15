@@ -289,7 +289,14 @@ def test_pyntt_tensor_region_copy_selects_tle_copy_only_for_full_shared_tiles():
 
     _add_pyntt_to_path()
 
-    from pyntt.codegen.render import emit
+    from pyntt.codegen.render import _make_env
+
+    template = _make_env().get_template(
+        "triton/kernels/TensorRegionCopy.py.jinja"
+    )
+
+    def render(model):
+        return template.render(model=model).strip()
 
     def fixed(value):
         return {
@@ -333,7 +340,7 @@ def test_pyntt_tensor_region_copy_selects_tle_copy_only_for_full_shared_tiles():
         "NoInline": False,
     }
 
-    full_tile_source = emit("TensorRegionCopy", full_tile_model)
+    full_tile_source = render(full_tile_model)
     assert "tle.gpu.alloc" not in full_tile_source
     assert "tle.gpu.copy(source + copy_global_offset, destination_storage, [32])" in full_tile_source
     assert "if full_tile:" not in full_tile_source
@@ -343,7 +350,7 @@ def test_pyntt_tensor_region_copy_selects_tle_copy_only_for_full_shared_tiles():
     vector_model["SourceShape"] = [fixed(4)]
     vector_model["DestinationShape"] = [fixed(4)]
     vector_model["VectorLaneCount"] = 8
-    vector_source = emit("TensorRegionCopy", vector_model)
+    vector_source = render(vector_model)
     assert "copy_tensor_linear = copy_linear // 8" in vector_source
     assert "copy_vector_lane = copy_linear % 8" in vector_source
     assert "copy_global_offset = (((source_base0 + copy_idx0) * 1) * 8 + copy_vector_lane)" in vector_source
@@ -356,7 +363,7 @@ def test_pyntt_tensor_region_copy_selects_tle_copy_only_for_full_shared_tiles():
     matrix_model["SourceStrides"] = [fixed(8), fixed(1)]
     matrix_model["DestinationStrides"] = [fixed(8), fixed(1)]
     matrix_model["Destination"]["LocalBuffer"]["DescriptorShape"] = [4, 8]
-    matrix_source = emit("TensorRegionCopy", matrix_model)
+    matrix_source = render(matrix_model)
     assert "copy_desc_idx0 = tl.arange(0, 4)[:, None]" in matrix_source
     assert "copy_desc_idx1 = tl.arange(0, 8)[None, :]" in matrix_source
     assert (
@@ -375,7 +382,7 @@ def test_pyntt_tensor_region_copy_selects_tle_copy_only_for_full_shared_tiles():
     tail_model["SourceShape"] = [dynamic_extent]
     tail_model["DestinationShape"] = [dynamic_extent]
     tail_model["RuntimeShapeArgs"] = ["extent"]
-    tail_source = emit("TensorRegionCopy", tail_model)
+    tail_source = render(tail_model)
     assert "full_tile" not in tail_source
     assert "tle.gpu.copy" not in tail_source
     assert "value = tl.load(source + source_offset, mask=mask)" in tail_source
@@ -384,7 +391,7 @@ def test_pyntt_tensor_region_copy_selects_tle_copy_only_for_full_shared_tiles():
 
     noncoincident_model = deepcopy(full_tile_model)
     noncoincident_model["RegionsCoincident"] = False
-    noncoincident_source = emit("TensorRegionCopy", noncoincident_model)
+    noncoincident_source = render(noncoincident_model)
     assert "tle.gpu.copy" not in noncoincident_source
     assert "value = tl.load(source + source_offset, mask=mask)" in noncoincident_source
     assert "tl.store(tle.gpu.local_ptr(destination_storage" in noncoincident_source
@@ -392,15 +399,36 @@ def test_pyntt_tensor_region_copy_selects_tle_copy_only_for_full_shared_tiles():
 
     noncompact_model = deepcopy(full_tile_model)
     noncompact_model["DestinationStrides"] = [fixed(2)]
-    noncompact_source = emit("TensorRegionCopy", noncompact_model)
+    noncompact_source = render(noncompact_model)
     assert "tle.gpu.copy" not in noncompact_source
     assert "value = tl.load(source + source_offset, mask=mask)" in noncompact_source
 
     noncompact_global_model = deepcopy(full_tile_model)
     noncompact_global_model["SourceStrides"] = [fixed(2)]
-    noncompact_global_source = emit("TensorRegionCopy", noncompact_global_model)
+    noncompact_global_source = render(noncompact_global_model)
     assert "tle.gpu.copy" not in noncompact_global_source
     assert "value = tl.load(source + source_offset, mask=mask)" in noncompact_global_source
+
+
+def test_pyntt_kernel_templates_own_their_triton_source():
+    _add_pyntt_to_path()
+
+    from pyntt.codegen.render import _make_env
+
+    template_dir = (
+        Path(__file__).resolve().parents[2]
+        / "pyntt/pyntt/codegen/templates/triton/kernels"
+    )
+    public_templates = {
+        path.name.removesuffix(".py.jinja")
+        for path in template_dir.glob("*.py.jinja")
+        if not path.name.startswith("_")
+    }
+    env = _make_env()
+    for name in public_templates:
+        source = (template_dir / f"{name}.py.jinja").read_text(encoding="utf-8")
+        assert "{{ emit(" not in source
+        env.get_template(f"triton/kernels/{name}.py.jinja")
 
 
 def test_pyntt_renderer_passes_one_materialized_shard_index_to_device_calls():

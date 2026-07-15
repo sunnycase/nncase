@@ -1,3 +1,17 @@
-{{ decorator }}
+{% if noinline %}
+@triton.jit(noinline=True)
+{% else %}
+@triton.jit
+{% endif %}
 def {{ name }}({{ parameters }}):
-{{ body_source }}
+{% if shared_allocation_bytes > 0 %}
+    pyntt_shared_arena = tle.gpu.alloc([{{ shared_allocation_bytes }}], dtype=tl.uint8, layout=None, scope=tle.gpu.smem, nv_mma_shared_layout=False)
+{% endif %}
+{% if materialize_shard_index %}
+    shard_index = tl.program_id(0).to(tl.int64)
+{% endif %}
+{% if body_source.strip() %}
+{{ body_source | indent(4, true) }}
+{% elif not materialize_shard_index and shared_allocation_bytes == 0 %}
+    pass
+{% endif %}

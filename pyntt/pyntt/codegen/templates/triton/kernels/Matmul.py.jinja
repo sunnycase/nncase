@@ -1,1 +1,2 @@
-{{ emit("Matmul", model) }}
+{% set gemv = false %}
+{% include "triton/kernels/_matmul.py.jinja" %}

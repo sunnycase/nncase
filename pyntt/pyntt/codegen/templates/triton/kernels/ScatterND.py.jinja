@@ -1,1 +1,47 @@
-{{ emit("ScatterND", model) }}
+{% import "triton/kernels/_common.py.jinja" as common with context %}
+{% set ctx = scatter_nd_context(model) %}
+# generated from PyNTT Jinja ScatterND.py.jinja
+# {{ model["Comment"] }}; input_dtype={{ model["InputDType"] }}, indices_dtype={{ model["IndicesDType"] }}, updates_dtype={{ model["UpdatesDType"] }}, output_dtype={{ model["OutputDType"] }}
+{{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
+def {{ model["FunctionName"] }}({{ helper_parameters(model) }}):
+    shard_index = tl.program_id(0).to(tl.int64)
+{{ common.shard_coordinates([model["Input"], model["Indices"], model["Updates"], model["Output"]]) }}
+{% for name, key in (("input", "Input"), ("indices", "Indices"), ("updates", "Updates"), ("output", "Output")) %}
+{% if local_buffer(model[key]) is none %}
+    {{ name }} = {{ ptr(model, key) }}
+{% endif %}
+{% endfor %}
+    # copy input to output
+{% for axis in ctx["copy_loop_axes"] %}
+{{ "    " * loop.index }}for copy_idx{{ axis }} in tl.range(0, {{ dim(model["OutputShape"][axis]) }}):
+{% endfor %}
+{% set copy_base = "    " * ((ctx["copy_loop_axes"] | length) + 1) %}
+{% set copy_body = copy_base ~ "    " %}
+{{ copy_base }}for copy_axis_start in tl.range(0, {{ dim(ctx["copy_block_extent"]) }}, block_size):
+{{ copy_body }}copy_lane = copy_axis_start + tl.arange(0, block_size)
+{{ copy_body }}copy_mask = copy_lane < {{ dim(ctx["copy_block_extent"]) }}
+{{ copy_body }}copy_input_offsets = {{ ctx["copy_input_offset"] }}
+{{ copy_body }}copy_output_offsets = {{ ctx["copy_output_offset"] }}
+{{ copy_body }}copy_value = tl.load({{ access_pointer(model, "Input", "input", "copy_input_offsets") }}, mask=copy_mask, other=0.0)
+{{ copy_body }}tl.store({{ access_pointer(model, "Output", "output", "copy_output_offsets") }}, copy_value, mask=copy_mask)
+
+    # scatter updates
+{% for axis in ctx["updates_loop_axes"] %}
+{{ "    " * loop.index }}for upd_idx{{ axis }} in tl.range(0, {{ dim(model["UpdatesShape"][axis]) }}):
+{% endfor %}
+{% set update_base = "    " * ((ctx["updates_loop_axes"] | length) + 1) %}
+{% set update_body = update_base ~ "    " %}
+{{ update_base }}for upd_axis_start in tl.range(0, {{ dim(ctx["updates_block_extent"]) }}, block_size):
+{{ update_body }}upd_lane = upd_axis_start + tl.arange(0, block_size)
+{{ update_body }}upd_mask = upd_lane < {{ dim(ctx["updates_block_extent"]) }}
+{{ update_body }}indices_prefix_offsets = {{ ctx["indices_prefix_offset"] }}
+{% for axis in range(ctx["index_depth"]) %}
+{{ update_body }}scatter_idx{{ axis }} = tl.load({{ access_pointer(model, "Indices", "indices", "indices_prefix_offsets + " ~ axis ~ " * " ~ dim(model["IndicesStrides"][-1])) }}, mask=upd_mask, other=0)
+{% if ctx["signed_indices"] %}
+{{ update_body }}scatter_idx{{ axis }} = tl.where(scatter_idx{{ axis }} < 0, scatter_idx{{ axis }} + {{ dim(model["OutputShape"][axis]) }}, scatter_idx{{ axis }})
+{% endif %}
+{% endfor %}
+{{ update_body }}updates_offsets = {{ ctx["updates_offset"] }}
+{{ update_body }}scatter_output_offsets = {{ ctx["scatter_output_offset"] }}
+{{ update_body }}updates_value = tl.load({{ access_pointer(model, "Updates", "updates", "updates_offsets") }}, mask=upd_mask, other=0.0)
+{{ update_body }}tl.store({{ access_pointer(model, "Output", "output", "scatter_output_offsets") }}, updates_value, mask=upd_mask)

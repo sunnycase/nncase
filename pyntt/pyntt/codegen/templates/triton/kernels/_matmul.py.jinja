@@ -1,0 +1,99 @@
+{% import "triton/kernels/_common.py.jinja" as common with context %}
+{% set ctx = matmul_context(model, gemv=gemv) %}
+{% if ctx["phase"] == "accumulate" %}
+# generated from PyNTT Jinja {{ ctx["template_name"] }}.py.jinja reduction accumulate
+# {{ model["Comment"] }}; accumulator=backend-private-fp32
+{% elif ctx["phase"] == "finalize" %}
+# generated from PyNTT Jinja {{ ctx["template_name"] }}.py.jinja reduction finalize
+# {{ model["Comment"] }}; accumulator=backend-private-fp32
+{% else %}
+# generated from PyNTT Jinja {{ ctx["template_name"] }}.py.jinja
+# {{ model["Comment"] }}; lhs_dtype={{ model["LhsDType"] }}, rhs_dtype={{ model["RhsDType"] }}, output_dtype={{ model["OutputDType"] }}, lhs_shape={{ shape_tuple(model["LhsShape"]) }}, rhs_shape={{ shape_tuple(model["RhsShape"]) }}, output_shape={{ shape_tuple(model["OutputShape"]) }}, rhs_n_packed_lane={{ model.get("RhsNPackedLaneCount", 1) }}, rhs_n_lane={{ model["RhsNVectorLaneCount"] }}, output_n_packed_lane={{ model.get("OutputNPackedLaneCount", 1) }}, output_n_lane={{ model["OutputNVectorLaneCount"] }}, load_c={{ ctx["load_c_expression"] }}
+{% endif %}
+{{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
+def {{ model["FunctionName"] }}({{ helper_parameters(model, ["acc"] if ctx["phase"] != "complete" else []) }}):
+    shard_index = tl.program_id(0).to(tl.int64)
+{% if ctx["phase"] == "accumulate" %}
+{{ common.shard_coordinates([model["Lhs"], model["Rhs"]]) }}
+{% if local_buffer(model["Lhs"]) is none %}
+    lhs = {{ ptr(model, "Lhs") }}
+{% endif %}
+{% if local_buffer(model["Rhs"]) is none %}
+    rhs = {{ ptr(model, "Rhs") }}
+{% endif %}
+    offs_k = tl.arange(0, {{ ctx["block_k"] }})
+    offs_n = tl.arange(0, {{ ctx["block_n"] }})
+{% if ctx["gemv"] %}
+    m_idx = 0
+    rhs_values = tl.load({{ access_pointer(model, "Rhs", "rhs", ctx["rhs_offsets"]) }}, mask={{ ctx["rhs_mask"] }}, other=0.0, eviction_policy="evict_first").to(tl.float32)
+    lhs_values = tl.load({{ access_pointer(model, "Lhs", "lhs", ctx["lhs_offsets"]) }}, mask={{ ctx["lhs_mask"] }}, other=0.0).to(tl.float32)
+    acc += tl.sum(rhs_values * lhs_values[None, :], axis=1)
+{% else %}
+    offs_m = tl.arange(0, {{ ctx["block_m"] }})
+    rhs_values = tl.load({{ access_pointer(model, "Rhs", "rhs", ctx["rhs_offsets"]) }}, mask={{ ctx["rhs_mask"] }}, other=0.0)
+    lhs_values = tl.load({{ access_pointer(model, "Lhs", "lhs", ctx["lhs_offsets"]) }}, mask={{ ctx["lhs_mask"] }}, other=0.0)
+    acc += tl.dot(lhs_values, rhs_values{{ ctx["dot_precision"] }})
+{% endif %}
+    return acc
+{% elif ctx["phase"] == "finalize" %}
+{{ common.shard_coordinates([model["Output"]]) }}
+{% if local_buffer(model["Output"]) is none %}
+    output = {{ ptr(model, "Output") }}
+{% endif %}
+    offs_n = tl.arange(0, {{ ctx["block_n"] }})
+{% if not ctx["gemv"] %}
+    offs_m = tl.arange(0, {{ ctx["block_m"] }})
+{% endif %}
+    tl.store({{ access_pointer(model, "Output", "output", ctx["output_offsets"]) }}, acc * {{ model["Scale"] }}, mask={{ ctx["output_mask"] }})
+{% else %}
+{{ common.shard_coordinates([model["Lhs"], model["Rhs"], model["Output"]]) }}
+{% for name, key in (("lhs", "Lhs"), ("rhs", "Rhs"), ("output", "Output")) %}
+{% if local_buffer(model[key]) is none %}
+    {{ name }} = {{ ptr(model, key) }}
+{% endif %}
+{% endfor %}
+    tmp_shard = shard_index
+{% for axis in reverse_indices(model["Hierarchy"]) %}
+    shard_coord{{ axis }} = tmp_shard % {{ model["Hierarchy"][axis] }}
+    tmp_shard = tmp_shard // {{ model["Hierarchy"][axis] }}
+{% endfor %}
+{% for axis in ctx["batch_axes"] %}
+{{ "    " * loop.index }}for idx{{ axis }} in tl.range(0, {{ dim(ctx["logical_output_shape"][axis]) }}):
+{% endfor %}
+{% set base = "    " * ((ctx["batch_axes"] | length) + 1) %}
+{% if ctx["gemv"] %}
+{{ base }}for m_idx in tl.range(0, {{ dim(ctx["m"]) }}):
+{{ base }}    for n_start in tl.range(0, {{ dim(ctx["n"]) }}, {{ ctx["block_n"] }}, num_stages={{ ctx["n_stages"] }}):
+{{ base }}        offs_n = n_start + tl.arange(0, {{ ctx["block_n"] }})
+{{ base }}        acc = tl.zeros(({{ ctx["block_n"] }},), tl.float32)
+{{ base }}        for k_start in tl.range(0, {{ dim(ctx["k"]) }}, {{ ctx["block_k"] }}):
+{{ base }}            offs_k = k_start + tl.arange(0, {{ ctx["block_k"] }})
+{{ base }}            rhs_values = tl.load({{ access_pointer(model, "Rhs", "rhs", ctx["rhs_offsets"]) }}, mask={{ ctx["rhs_mask"] }}, other=0.0, eviction_policy="evict_first").to(tl.float32)
+{{ base }}            lhs_values = tl.load({{ access_pointer(model, "Lhs", "lhs", ctx["lhs_offsets"]) }}, mask={{ ctx["lhs_mask"] }}, other=0.0).to(tl.float32)
+{{ base }}            acc += tl.sum(rhs_values * lhs_values[None, :], axis=1)
+{{ base }}        result = acc * {{ model["Scale"] }}
+{% set compute = base ~ "        " %}
+{% else %}
+{{ base }}for m_start in tl.range(0, {{ dim(ctx["m"]) }}, {{ ctx["block_m"] }}):
+{{ base }}    offs_m = m_start + tl.arange(0, {{ ctx["block_m"] }})
+{{ base }}    for n_start in tl.range(0, {{ dim(ctx["n"]) }}, {{ ctx["block_n"] }}):
+{{ base }}        offs_n = n_start + tl.arange(0, {{ ctx["block_n"] }})
+{{ base }}        acc = tl.zeros(({{ ctx["block_m"] }}, {{ ctx["block_n"] }}), tl.float32)
+{{ base }}        for k_start in tl.range(0, {{ dim(ctx["k"]) }}, {{ ctx["block_k"] }}, num_stages=5):
+{{ base }}            offs_k = k_start + tl.arange(0, {{ ctx["block_k"] }})
+{{ base }}            rhs_values = tl.load({{ access_pointer(model, "Rhs", "rhs", ctx["rhs_offsets"]) }}, mask={{ ctx["rhs_mask"] }}, other=0.0)
+{{ base }}            lhs_values = tl.load({{ access_pointer(model, "Lhs", "lhs", ctx["lhs_offsets"]) }}, mask={{ ctx["lhs_mask"] }}, other=0.0)
+{{ base }}            acc += tl.dot(lhs_values, rhs_values{{ ctx["dot_precision"] }})
+{{ base }}        result = acc * {{ model["Scale"] }}
+{% set compute = base ~ "        " %}
+{% endif %}
+{% if ctx["load_c"] %}
+{{ compute }}previous = tl.load({{ access_pointer(model, "Output", "output", ctx["output_offsets"]) }}, mask=({{ ctx["output_mask"] }}) & ({{ ctx["load_c_predicate"] }}), other=0.0).to(tl.float32)
+{% if ctx["load_c_predicate"] == "True" %}
+{{ compute }}result = previous + result
+{% else %}
+{{ compute }}result = tl.where({{ ctx["load_c_predicate"] }}, previous + result, result)
+{% endif %}
+{% endif %}
+{{ compute }}tl.store({{ access_pointer(model, "Output", "output", ctx["output_offsets"]) }}, result, mask={{ ctx["output_mask"] }})
+{% endif %}

@@ -1,1 +1,64 @@
-{{ emit("TensorRegionCopy", model) }}
+{% import "triton/kernels/_common.py.jinja" as common with context %}
+{% set ctx = tensor_region_copy_context(model) %}
+# generated from PyNTT Jinja TensorRegionCopy.py.jinja
+# {{ model["Comment"] }}; dtype={{ model["DType"] }}, source_shape={{ shape_tuple(model["SourceShape"]) }}, destination_shape={{ shape_tuple(model["DestinationShape"]) }}
+{{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
+def {{ model["FunctionName"] }}({{ helper_parameters(model) }}):
+    shard_index = tl.program_id(0).to(tl.int64)
+{{ common.shard_coordinates(ctx["pointer_values"]) }}
+{% for local_name, model_name in ctx["pointers"] %}
+{% if local_buffer(model[model_name]) is none %}
+    {{ local_name }} = {{ ptr(model, model_name) }}
+{% endif %}
+{% endfor %}
+{% for axis in range(ctx["rank"]) %}
+    copy_start{{ axis }} = tl.maximum({{ dim(model["SourceGlobalOffsets"][axis]) }}, {{ dim(model["DestinationGlobalOffsets"][axis]) }})
+    copy_end{{ axis }} = tl.minimum({{ dim(model["SourceGlobalOffsets"][axis]) }} + {{ dim(model["SourceShape"][axis]) }}, {{ dim(model["DestinationGlobalOffsets"][axis]) }} + {{ dim(model["DestinationShape"][axis]) }})
+    copy_dim{{ axis }} = tl.maximum(copy_end{{ axis }} - copy_start{{ axis }}, 0)
+    source_base{{ axis }} = copy_start{{ axis }} - {{ dim(model["SourceGlobalOffsets"][axis]) }}
+    destination_base{{ axis }} = copy_start{{ axis }} - {{ dim(model["DestinationGlobalOffsets"][axis]) }}
+{% endfor %}
+{% if ctx["plan"] is not none %}
+{% for expression in ctx["expanded_indices"] %}
+    copy_desc_idx{{ loop.index0 }} = {{ expression }}
+{% endfor %}
+    copy_linear = {{ ctx["linear_expression"] }}
+{% if ctx["lane_count"] == 1 %}
+    copy_tensor_linear = copy_linear
+    copy_vector_lane = copy_linear * 0
+{% else %}
+    copy_tensor_linear = copy_linear // {{ ctx["lane_count"] }}
+    copy_vector_lane = copy_linear % {{ ctx["lane_count"] }}
+{% endif %}
+    copy_remaining = copy_tensor_linear
+{% for axis in reverse_indices(ctx["plan"]["static_shape"]) %}
+    copy_idx{{ axis }} = copy_remaining % {{ ctx["plan"]["static_shape"][axis] }}
+    copy_remaining = copy_remaining // {{ ctx["plan"]["static_shape"][axis] }}
+{% endfor %}
+    copy_global_offset = {{ ctx["global_offset"] }}
+{% if ctx["plan"]["local_model_name"] == "Destination" %}
+    tle.gpu.copy({{ ctx["plan"]["global_name"] }} + copy_global_offset, {{ ctx["local_descriptor"] }}, {{ ctx["copy_shape"] }})
+{% else %}
+    tle.gpu.copy({{ ctx["local_descriptor"] }}, {{ ctx["plan"]["global_name"] }} + copy_global_offset, {{ ctx["copy_shape"] }})
+{% endif %}
+{% else %}
+    for linear_start in tl.range(0, {{ ctx["total"] }}, block_size):
+        linear = linear_start + tl.arange(0, block_size)
+        mask = linear < {{ ctx["total"] }}
+{% if model["VectorLaneCount"] == 1 %}
+        tensor_linear = linear
+        vector_lane = linear * 0
+{% else %}
+        tensor_linear = linear // {{ model["VectorLaneCount"] }}
+        vector_lane = linear % {{ model["VectorLaneCount"] }}
+{% endif %}
+        remaining = tensor_linear
+{% for axis in reverse_indices(model["SourceShape"]) %}
+        idx{{ axis }} = remaining % copy_dim{{ axis }}
+        remaining = remaining // copy_dim{{ axis }}
+{% endfor %}
+        source_offset = {{ ctx["source_offset"] }}
+        destination_offset = {{ ctx["destination_offset"] }}
+        value = tl.load({{ access_pointer(model, "Source", "source", "source_offset") }}, mask=mask)
+        tl.store({{ access_pointer(model, "Destination", "destination", "destination_offset") }}, value, mask=mask)
+{% endif %}

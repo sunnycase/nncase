@@ -1,1 +1,56 @@
-{{ emit("VectorLayout", model) }}
+{% import "triton/kernels/_common.py.jinja" as common with context %}
+{% set ctx = vector_layout_context(model) %}
+# generated from PyNTT Jinja VectorLayout.py.jinja
+# {{ model["Comment"] }}; op={{ ctx["op"] }}, input_dtype={{ model["InputDType"] }}, output_dtype={{ model["OutputDType"] }}, input_shape={{ shape_tuple(model["InputShape"]) }}, output_shape={{ shape_tuple(model["OutputShape"]) }}
+{{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
+def {{ model["FunctionName"] }}({{ helper_parameters(model) }}):
+    shard_index = tl.program_id(0).to(tl.int64)
+{{ common.shard_coordinates([model["Input"], model["Output"]]) }}
+{% if local_buffer(model["Input"]) is none %}
+    input_ptr = {{ ptr(model, "Input") }}
+{% endif %}
+{% if local_buffer(model["Output"]) is none %}
+    output_ptr = {{ ptr(model, "Output") }}
+{% endif %}
+    for linear_start in tl.range(0, {{ ctx["total"] }}, block_size):
+        linear = linear_start + tl.arange(0, block_size)
+        mask = linear < {{ ctx["total"] }}
+        lane_flat = linear % {{ ctx["domain_lane_count"] }}
+        tensor_linear = linear // {{ ctx["domain_lane_count"] }}
+        tmp = tensor_linear
+{% set domain_prefix = "out_idx" if model["IsPack"] else "in_idx" %}
+{% for axis in reverse_indices(ctx["domain_shape"]) %}
+        {{ domain_prefix }}{{ axis }} = tmp % {{ dim(ctx["domain_shape"][axis]) }}
+        tmp = tmp // {{ dim(ctx["domain_shape"][axis]) }}
+{% endfor %}
+{% if model["IsPack"] %}
+        input_lane_flat = {{ ctx["input_lane_flat"] }}
+{% else %}
+        output_lane_flat = {{ ctx["output_lane_flat"] }}
+{% endif %}
+        new_lane_group = {{ ctx["new_lane_group"] }}
+        valid = mask
+{% for info in ctx["axis_infos"] %}
+{% for lane_name, lane_expression in info["assignments"] %}
+        {{ lane_name }} = {{ lane_expression }}
+{% endfor %}
+{% if model["IsPack"] %}
+{% if info["packed"] %}
+        in_idx{{ loop.index0 }} = out_idx{{ loop.index0 }} * {{ info["lane_product"] }} + {{ info["lane_offset"] }}
+        valid = valid & (in_idx{{ loop.index0 }} < {{ dim(model["InputShape"][loop.index0]) }})
+{% else %}
+        in_idx{{ loop.index0 }} = out_idx{{ loop.index0 }}
+{% endif %}
+{% else %}
+{% if info["packed"] %}
+        out_idx{{ loop.index0 }} = in_idx{{ loop.index0 }} * {{ info["lane_product"] }} + {{ info["lane_offset"] }}
+        valid = valid & (out_idx{{ loop.index0 }} < {{ dim(model["OutputShape"][loop.index0]) }})
+{% else %}
+        out_idx{{ loop.index0 }} = in_idx{{ loop.index0 }}
+{% endif %}
+{% endif %}
+{% endfor %}
+        input_offsets = {{ ctx["input_offset"] }}
+        output_offsets = {{ ctx["output_offset"] }}
+        value = tl.load({{ access_pointer(model, "Input", "input_ptr", "input_offsets") }}, mask=valid, other=0)
+        tl.store({{ access_pointer(model, "Output", "output_ptr", "output_offsets") }}, value, mask={{ "mask" if model["IsPack"] else "valid" }})

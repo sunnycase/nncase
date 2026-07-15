@@ -1,1 +1,39 @@
-{{ emit("Slice", model) }}
+{% import "triton/kernels/_common.py.jinja" as common with context %}
+{% set rank = model["OutputShape"] | length %}
+{% set block_axis = select_block_axis(model["OutputShape"], model["OutputStrides"]) %}
+{% set block_extent = 1 if rank == 0 else model["OutputShape"][block_axis] %}
+{% set loop_axes = axes_except(rank, block_axis) %}
+{% set input_terms = namespace(values=[]) %}
+{% set output_terms = namespace(values=[]) %}
+{% for axis in range(rank) %}
+{% set index = "lane" if axis == block_axis else "idx" ~ axis %}
+{% set sliced_index = index ~ " + " ~ model["Starts"][axis] if model["Strides"][axis] == 1 else model["Starts"][axis] ~ " + " ~ index ~ " * " ~ model["Strides"][axis] %}
+{% do input_terms.values.append("(" ~ sliced_index ~ ") * " ~ dim(model["InputStrides"][axis])) %}
+{% do output_terms.values.append(index ~ " * " ~ dim(model["OutputStrides"][axis])) %}
+{% endfor %}
+{% set input_offset = "lane * 0" if not input_terms.values else "lane * 0 + " ~ (input_terms.values | join(" + ")) %}
+{% set output_offset = "lane * 0" if not output_terms.values else "lane * 0 + " ~ (output_terms.values | join(" + ")) %}
+# generated from PyNTT Jinja Slice.py.jinja
+# {{ model["Comment"] }}; input_dtype={{ model["InputDType"] }}, output_dtype={{ model["OutputDType"] }}, input_shape={{ shape_tuple(model["InputShape"]) }}, output_shape={{ shape_tuple(model["OutputShape"]) }}
+{{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
+def {{ model["FunctionName"] }}({{ helper_parameters(model) }}):
+    shard_index = tl.program_id(0).to(tl.int64)
+{{ common.shard_coordinates([model["Input"], model["Output"]]) }}
+{% if local_buffer(model["Input"]) is none %}
+    input = {{ ptr(model, "Input") }}
+{% endif %}
+{% if local_buffer(model["Output"]) is none %}
+    output = {{ ptr(model, "Output") }}
+{% endif %}
+{% for axis in loop_axes %}
+{{ "    " * loop.index }}for idx{{ axis }} in tl.range(0, {{ dim(model["OutputShape"][axis]) }}):
+{% endfor %}
+{% set base = "    " * ((loop_axes | length) + 1) %}
+{% set body = base ~ "    " %}
+{{ base }}for axis_start in tl.range(0, {{ dim(block_extent) }}, block_size):
+{{ body }}lane = axis_start + tl.arange(0, block_size)
+{{ body }}mask = lane < {{ dim(block_extent) }}
+{{ body }}input_offsets = {{ input_offset }}
+{{ body }}output_offsets = {{ output_offset }}
+{{ body }}value = tl.load({{ access_pointer(model, "Input", "input", "input_offsets") }}, mask=mask, other=0.0)
+{{ body }}tl.store({{ access_pointer(model, "Output", "output", "output_offsets") }}, value, mask=mask)
