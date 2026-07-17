@@ -26,15 +26,10 @@ internal sealed class AffineExprToIntExprConverter : ExprVisitor<IntExpr, Unit>
     }
 
     protected override IntExpr VisitLeafAffineDim(AffineDim expr)
-    {
-        if (!_dims.TryGetValue(expr.Position, out var v))
-        {
-            v = _solver.MakeIntVar(1, int.MaxValue, $"d{expr.Position}_v");
-            _dims.Add(expr.Position, v);
-        }
+        => GetDomainExtent(expr.Position);
 
-        return v;
-    }
+    protected override IntExpr VisitLeafAffineExtent(AffineExtent expr)
+        => GetDomainExtent(expr.Position);
 
     protected override IntExpr VisitLeafAffineConstant(AffineConstant expr) =>
         _solver.MakeIntConst(expr.Value);
@@ -53,4 +48,15 @@ internal sealed class AffineExprToIntExprConverter : ExprVisitor<IntExpr, Unit>
             AffineDivBinaryOp.Mod => _solver.MakeModulo(ExprMemo[expr.Lhs], ExprMemo[expr.Rhs]),
             _ => throw new ArgumentOutOfRangeException(expr.BinaryOp.ToString()),
         };
+
+    private IntExpr GetDomainExtent(int position)
+    {
+        if (!_dims.TryGetValue(position, out var v))
+        {
+            v = _solver.MakeIntVar(1, int.MaxValue, $"d{position}_v");
+            _dims.Add(position, v);
+        }
+
+        return v;
+    }
 }

@@ -5,6 +5,8 @@ using System.Text;
 using Nncase.Diagnostics;
 using Nncase.IR;
 using Nncase.Targets;
+using Nncase.TIR;
+using Nncase.Utilities;
 
 namespace Nncase.CodeGen.NTT;
 
@@ -45,6 +47,19 @@ public sealed class NTTModuleBuilder : IModuleBuilder
     public ILinkableModule Build(IReadOnlyList<BaseFunction> functions)
     {
         var targetOptions = (NTTTargetOptions)CompileOptions.TargetOptions;
+        var primFunctions = functions.OfType<PrimFunction>().ToArray();
+        var rdataPoolSize = primFunctions
+            .SelectMany(function => function.SchedResult.Rdatas.Values)
+            .Select(range => range.Max)
+            .DefaultIfEmpty()
+            .Max();
+        var chipLocalRdataPoolSize = primFunctions
+            .SelectMany(function => function.SchedResult.ChipLocalRdatas.Values)
+            .Select(range => range.Max)
+            .DefaultIfEmpty()
+            .Max();
+        var chipLocalRdataBase = MathUtility.AlignUp(rdataPoolSize, 8UL);
+        var mergedRdataPoolSize = checked(chipLocalRdataBase + chipLocalRdataPoolSize);
 
         // 1. write the module header
         using (var writer = _sectionManager.GetWriter(LinkedModule.ModuleHeaderSectionName))
@@ -57,7 +72,15 @@ public sealed class NTTModuleBuilder : IModuleBuilder
             writer.Write(ref header);
         }
 
-        var linkableFunctions = functions.OfType<BaseFunction>().Select((f, i) => new FunctionBuilder((uint)i, _rdataWriter, _blockLocalRdataWriters, (Targets.NTTTargetOptions)CompileOptions.TargetOptions).Build(f)).ToArray();
+        var linkableFunctions = functions.OfType<BaseFunction>()
+            .Select((function, index) => new FunctionBuilder(
+                (uint)index,
+                _rdataWriter,
+                _blockLocalRdataWriters,
+                targetOptions,
+                chipLocalRdataBase,
+                mergedRdataPoolSize).Build(function))
+            .ToArray();
         _rdataWriter.Flush();
         var blockLocalRdataContents = Enumerable.Range(0, _blockLocalRdataWriters.Length).Select(i =>
         {

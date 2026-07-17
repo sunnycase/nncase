@@ -61,6 +61,10 @@ public interface INTTTargetOptions : ITargetOptions
 
     TargetMachineModel TargetMachineModel { get; }
 
+    Schedule.IBlockMicroKernelModelProvider BlockMicroKernelModel { get; }
+
+    Schedule.ITargetStorageEncodingModelProvider StorageEncodingModel { get; }
+
     string DistributedScheme { get; set; }
 
     string CustomOpScheme { get; set; }

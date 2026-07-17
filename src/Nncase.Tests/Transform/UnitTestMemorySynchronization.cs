@@ -35,6 +35,20 @@ public sealed class UnitTestMemorySynchronization : TestClassBase
     }
 
     [Fact]
+    public void TestReductionAccumulatorReadDoesNotReachPhysicalBuffer()
+    {
+        Assert.Equal(
+            MemoryAccessMode.Write,
+            MemoryEffectUtility.GetPhysicalBufferAccessMode(MemoryEffect.ReductionReadWrite));
+        Assert.Equal(
+            MemoryAccessMode.Write,
+            MemoryEffectUtility.GetPhysicalBufferAccessMode(MemoryEffect.ReductionWrite));
+        Assert.Equal(
+            MemoryAccessMode.ReadWrite,
+            MemoryEffectUtility.GetPhysicalBufferAccessMode(MemoryEffect.ReadWrite));
+    }
+
+    [Fact]
     public void TestAllNTTKernelOperandsDeclareMemoryEffects()
     {
         var missing = typeof(TIR.NTT.NTTKernelOp).Assembly.GetTypes()

@@ -29,6 +29,7 @@ WORKSPACE_STRIDE_PARAMETERS = (
 )
 
 SHARD_INDEX_PARAMETER = "shard_index"
+NVIDIA_MMA_SHARED_ENCODING = "triton.nvidia.mma-shared"
 
 DEVICE_CALL_RE = re.compile(
     r"(?m)^(?P<indent>[ \t]*)__pyntt_device_call__(?P<name>[A-Za-z_]\w*)\((?P<args>.*)\)$"
@@ -125,6 +126,11 @@ def _render_kernel(kernel: dict[str, Any]) -> str:
     env = _make_env()
     metadata = kernel["metadata"]
     kernel_attrs = _attrs(metadata)
+    num_warps = int(metadata.get("launch", {}).get("num_warps") or 0)
+    if num_warps <= 0:
+        raise ValueError(
+            f"PyNTT kernel {metadata['name']} must declare a positive launch.num_warps."
+        )
     parameters = _kernel_parameters(metadata)
     shared_memory_bytes = int(kernel_attrs.get("shared_memory_bytes", 0))
     if shared_memory_bytes < 0:
@@ -162,13 +168,16 @@ def _render_kernel(kernel: dict[str, Any]) -> str:
         device_function["name"]: device_function
         for device_function in device_functions
     }
-    helper_sources = _render_helper_sources(env, kernel.get("helpers", ()))
+    helper_sources = _render_helper_sources(
+        env, kernel.get("helpers", ()), num_warps=num_warps
+    )
     device_function_sources = [
         _render_device_function(
             env,
             device_function,
             hidden_device_parameters,
             device_functions_by_name,
+            num_warps,
         )
         for device_function in device_functions
     ]
@@ -198,11 +207,13 @@ def _render_device_function(
     device_function: dict[str, Any],
     hidden_parameters: tuple[str, ...],
     device_functions_by_name: dict[str, dict[str, Any]],
+    num_warps: int,
 ) -> str:
     helper_sources = _render_helper_sources(
         env,
         device_function.get("helpers", ()),
         noinline=bool(device_function["preserve_helper_call_boundaries"]),
+        num_warps=num_warps,
     )
     parts = [source for source in helper_sources if source]
     device_parameters = (
@@ -330,12 +341,18 @@ def _needs_shard_index_prelude(
 
 
 def _render_helper_sources(
-    env: Environment, helpers: Any, *, noinline: bool = False
+    env: Environment,
+    helpers: Any,
+    *,
+    noinline: bool = False,
+    num_warps: int | None = None,
 ) -> list[str]:
     helper_sources = []
     for helper in helpers:
         model = dict(helper["model"])
         model["NoInline"] = bool(noinline) and not bool(helper["requires_inline"])
+        if num_warps is not None:
+            model["NumWarps"] = num_warps
         arguments = tuple(helper.get("arguments", ()) or ())
         if arguments:
             model["Arguments"] = arguments
@@ -711,6 +728,45 @@ def _local_buffer_value(buffer: dict[str, Any], name: str) -> Any:
     return buffer.get(name, buffer.get(snake_name))
 
 
+def _direct_mma_shared_load(
+    pointer: Any,
+    shape: tuple[int, ...],
+    *,
+    transpose: bool = False,
+) -> str | None:
+    """Return a full-view MMA shared load when the descriptor is exact."""
+
+    buffer = _local_buffer(pointer)
+    if buffer is None:
+        return None
+    if _local_buffer_value(buffer, "StorageEncoding") != NVIDIA_MMA_SHARED_ENCODING:
+        return None
+    if str(_local_buffer_value(buffer, "BaseScalarOffset") or "0") != "0":
+        return None
+
+    descriptor = _local_buffer_value(buffer, "DescriptorExpression")
+    descriptor_shape = tuple(
+        int(value)
+        for value in (_local_buffer_value(buffer, "DescriptorShape") or ())
+    )
+    if not descriptor or descriptor_shape != tuple(shape):
+        return None
+
+    required_bytes = (
+        math.prod(descriptor_shape)
+        * int(_local_buffer_value(buffer, "ScalarElementSizeBytes") or 0)
+    )
+    available_bytes = int(_local_buffer_value(buffer, "AvailableBytes") or 0)
+    if required_bytes <= 0 or required_bytes > available_bytes:
+        raise ValueError(
+            f"MMA shared descriptor {descriptor} exposes {descriptor_shape} "
+            f"outside its {available_bytes}-byte allocation"
+        )
+
+    load = f"tl.load(tle.gpu.local_ptr({descriptor}))"
+    return f"tl.trans({load})" if transpose else load
+
+
 def _local_pointer(pointer: Any, scalar_offset: str = "0") -> str | None:
     buffer = _local_buffer(pointer)
     if buffer is None:
@@ -883,32 +939,70 @@ def _constant_dim_value(value: Any) -> int | None:
     return minimum if minimum is not None and minimum == maximum else None
 
 
-def _is_compact_region(shape: list[int], strides: list[int]) -> bool:
-    if len(shape) != len(strides):
-        return False
-    expected_stride = 1
-    for extent, stride in zip(reversed(shape), reversed(strides)):
-        if extent <= 0 or (extent > 1 and stride != expected_stride):
-            return False
-        expected_stride *= extent
-    return True
+def _region_copy_plan(
+    model: dict[str, Any],
+) -> tuple[dict[str, Any], tuple[dict[str, Any], ...]]:
+    plan = model.get("CopyPlan")
+    if not isinstance(plan, dict):
+        raise ValueError("TensorRegionCopy requires a normalized CopyPlan")
+    axes_value = plan.get("Axes")
+    if not isinstance(axes_value, list) or not axes_value:
+        raise ValueError("TensorRegionCopy CopyPlan requires at least one scalar axis")
+    axes = tuple(axes_value)
+    for axis, value in enumerate(axes):
+        if not isinstance(value, dict):
+            raise ValueError(f"TensorRegionCopy axis {axis} must be an object")
+        for field in (
+            "Extent",
+            "SourceScalarStride",
+            "DestinationScalarStride",
+        ):
+            if field not in value:
+                raise ValueError(
+                    f"TensorRegionCopy axis {axis} is missing {field}"
+                )
+    for field in (
+        "SourceBaseScalarOffset",
+        "DestinationBaseScalarOffset",
+        "CoversWholeSource",
+        "CoversWholeDestination",
+    ):
+        if field not in plan:
+            raise ValueError(f"TensorRegionCopy CopyPlan is missing {field}")
+    return plan, axes
 
 
 def _region_copy_tle_plan(model: dict[str, Any]) -> dict[str, Any] | None:
+    copy_plan, axes = _region_copy_plan(model)
     operation = model.get("OperationKind", model.get("operation_kind"))
     if operation == "TileLoad":
         local_name = "destination"
         local_model_name = "Destination"
         global_name = "source"
         global_model_name = "Source"
+        local_coverage_name = "CoversWholeDestination"
     elif operation == "TileStore":
         local_name = "source"
         local_model_name = "Source"
         global_name = "destination"
         global_model_name = "Destination"
+        local_coverage_name = "CoversWholeSource"
     else:
         return None
-    if model.get("RegionsCoincident", model.get("regions_coincident")) is not True:
+    if copy_plan[local_coverage_name] is not True or len(axes) != 1:
+        return None
+
+    scalar_capacity = _constant_dim_value(axes[0]["Extent"])
+    source_stride = _constant_dim_value(axes[0]["SourceScalarStride"])
+    destination_stride = _constant_dim_value(
+        axes[0]["DestinationScalarStride"]
+    )
+    if (
+        scalar_capacity is None
+        or scalar_capacity <= 0
+        or source_stride != 1
+        or destination_stride != 1
+    ):
         return None
 
     local_pointer = model[local_model_name]
@@ -919,20 +1013,6 @@ def _region_copy_tle_plan(model: dict[str, Any]) -> dict[str, Any] | None:
     if int(local_pointer.get("AddressSpace", 1)) != 3 or int(global_pointer.get("AddressSpace", 1)) != 1:
         return None
 
-    local_shape = model[f"{local_model_name}Shape"]
-    local_shape_values = [_constant_dim_value(dimension) for dimension in local_shape]
-    if any(dimension is None or dimension <= 0 for dimension in local_shape_values):
-        return None
-    static_shape = [int(dimension) for dimension in local_shape_values]
-    local_strides = [_constant_dim_value(value) for value in model[f"{local_model_name}Strides"]]
-    global_strides = [_constant_dim_value(value) for value in model[f"{global_model_name}Strides"]]
-    if any(stride is None for stride in local_strides + global_strides):
-        return None
-    if not _is_compact_region(static_shape, [int(stride) for stride in local_strides]):
-        return None
-    if not _is_compact_region(static_shape, [int(stride) for stride in global_strides]):
-        return None
-
     descriptor_shape = tuple(
         int(value)
         for value in (_local_buffer_value(local_buffer, "DescriptorShape") or ())
@@ -940,7 +1020,6 @@ def _region_copy_tle_plan(model: dict[str, Any]) -> dict[str, Any] | None:
     base_scalar_offset = str(
         _local_buffer_value(local_buffer, "BaseScalarOffset") or "0"
     )
-    scalar_capacity = math.prod(static_shape) * int(model["VectorLaneCount"])
     scalar_element_size = int(
         _local_buffer_value(local_buffer, "ScalarElementSizeBytes") or 0
     )
@@ -966,10 +1045,35 @@ def _region_copy_tle_plan(model: dict[str, Any]) -> dict[str, Any] | None:
         "global_name": global_name,
         "global_model_name": global_model_name,
         "local_buffer": local_buffer,
-        "static_shape": static_shape,
         "descriptor_shape": descriptor_shape,
         "scalar_capacity": scalar_capacity,
+        "global_base_scalar_offset": copy_plan[
+            f"{global_model_name}BaseScalarOffset"
+        ],
     }
+
+
+def _region_copy_offset(
+    plan: dict[str, Any],
+    axes: tuple[dict[str, Any], ...],
+    side: str,
+    block_axis: int,
+) -> str:
+    terms: list[str] = []
+    base = plan[f"{side}BaseScalarOffset"]
+    if _fixed(base) != 0:
+        terms.append(f"({_dim(base)})")
+    stride_name = f"{side}ScalarStride"
+    for axis, value in enumerate(axes):
+        stride = value[stride_name]
+        fixed_stride = _fixed(stride)
+        if fixed_stride == 0:
+            if axis == block_axis:
+                terms.append(f"copy_idx{axis} * 0")
+            continue
+        index = f"copy_idx{axis}"
+        terms.append(index if fixed_stride == 1 else f"{index} * ({_dim(stride)})")
+    return "0" if not terms else " + ".join(terms)
 
 
 def _tensor_region_copy_template_context(model: dict[str, Any]) -> dict[str, Any]:
@@ -978,10 +1082,46 @@ def _tensor_region_copy_template_context(model: dict[str, Any]) -> dict[str, Any
     rank = len(model["SourceShape"])
     if rank != len(model["DestinationShape"]):
         raise ValueError("TensorRegionCopy source and destination ranks must match")
+    copy_plan, axes = _region_copy_plan(model)
     plan = _region_copy_tle_plan(model)
+    zero_fill_descriptor = None
+    if model.get("OperationKind") == "TileLoad":
+        destination_buffer = _local_buffer(model["Destination"])
+        if (
+            destination_buffer is not None
+            and _local_buffer_value(destination_buffer, "StorageEncoding")
+            == NVIDIA_MMA_SHARED_ENCODING
+        ):
+            descriptor_shape = tuple(
+                int(value)
+                for value in (
+                    _local_buffer_value(destination_buffer, "DescriptorShape")
+                    or ()
+                )
+            )
+            fixed_extents = tuple(
+                _constant_dim_value(axis["Extent"]) for axis in axes
+            )
+            fills_descriptor = (
+                copy_plan["CoversWholeDestination"] is True
+                and descriptor_shape
+                and all(extent is not None for extent in fixed_extents)
+                and math.prod(int(extent) for extent in fixed_extents)
+                == math.prod(descriptor_shape)
+            )
+            if not fills_descriptor:
+                zero_fill_descriptor = _local_buffer_value(
+                    destination_buffer, "DescriptorExpression"
+                )
+                if not zero_fill_descriptor:
+                    raise ValueError(
+                        "NVIDIA MMA TileLoad destination is missing its shared descriptor"
+                    )
     context: dict[str, Any] = {
+        "axes": axes,
         "plan": plan,
         "rank": rank,
+        "zero_fill_descriptor": zero_fill_descriptor,
         "pointers": (
             ((plan["global_name"], plan["global_model_name"]),)
             if plan is not None
@@ -992,42 +1132,21 @@ def _tensor_region_copy_template_context(model: dict[str, Any]) -> dict[str, Any
         model[model_name] for _, model_name in context["pointers"]
     )
     if plan is None:
-        dimensions = [f"(copy_dim{axis})" for axis in range(rank)]
-        dimensions.append(f"({model['VectorLaneCount']})")
-        source_terms = [
-            f"(source_base{axis} + idx{axis}) * "
-            f"{_dim(model['SourceStrides'][axis])}"
-            for axis in range(rank)
-        ]
-        destination_terms = [
-            f"(destination_base{axis} + idx{axis}) * "
-            f"{_dim(model['DestinationStrides'][axis])}"
-            for axis in range(rank)
-        ]
-        source_offset = (
-            "tensor_linear * 0" if not source_terms else " + ".join(source_terms)
-        )
-        destination_offset = (
-            "tensor_linear * 0"
-            if not destination_terms
-            else " + ".join(destination_terms)
-        )
-        if model["VectorLaneCount"] != 1:
-            source_offset = (
-                f"(({source_offset}) * {model['VectorLaneCount']} + vector_lane)"
-            )
-            destination_offset = (
-                f"(({destination_offset}) * {model['VectorLaneCount']} + vector_lane)"
-            )
+        inner_axis = len(axes) - 1
         context.update(
-            destination_offset=destination_offset,
-            source_offset=source_offset,
-            total=" * ".join(dimensions),
+            destination_offset=_region_copy_offset(
+                copy_plan, axes, "Destination", inner_axis
+            ),
+            inner_axis=inner_axis,
+            inner_extent=axes[inner_axis]["Extent"],
+            outer_axes=tuple(range(inner_axis)),
+            source_offset=_region_copy_offset(
+                copy_plan, axes, "Source", inner_axis
+            ),
         )
         return context
 
     descriptor_shape = plan["descriptor_shape"]
-    lane_count = int(model["VectorLaneCount"])
     local_descriptor = _local_buffer_value(
         plan["local_buffer"], "DescriptorExpression"
     )
@@ -1055,23 +1174,16 @@ def _tensor_region_copy_template_context(model: dict[str, Any]) -> dict[str, Any
         if inner_stride != 1:
             term = f"{term} * {inner_stride}"
         linear_terms.append(term)
-    global_base = f"{plan['global_name']}_base"
-    global_strides = model[f"{plan['global_model_name']}Strides"]
-    global_terms = [
-        f"({global_base}{axis} + copy_idx{axis}) * "
-        f"{_dim(global_strides[axis])}"
-        for axis in range(len(plan["static_shape"]))
-    ]
+    global_base = plan["global_base_scalar_offset"]
     global_offset = (
-        "copy_tensor_linear * 0" if not global_terms else " + ".join(global_terms)
+        "copy_linear"
+        if _fixed(global_base) == 0
+        else f"({_dim(global_base)}) + copy_linear"
     )
-    if lane_count != 1:
-        global_offset = f"(({global_offset}) * {lane_count} + copy_vector_lane)"
     context.update(
         copy_shape=f"[{', '.join(str(extent) for extent in descriptor_shape)}]",
         expanded_indices=tuple(expanded_indices),
         global_offset=global_offset,
-        lane_count=lane_count,
         linear_expression=" + ".join(linear_terms),
         local_descriptor=local_descriptor,
     )
@@ -1399,6 +1511,14 @@ def _qkv_parallel_linear_template_context(
                     "prefix": prefix,
                     "weight_mask": weight_mask,
                     "weight_offset": weight_offset,
+                    "weight_direct_load": (
+                        _direct_mma_shared_load(
+                            model[f"{prefix}Weight"],
+                            (block_k, block_n),
+                        )
+                        if block_m != 1
+                        else None
+                    ),
                 }
             )
         context.update(
@@ -1412,6 +1532,14 @@ def _qkv_parallel_linear_template_context(
             ),
             input_mask=input_mask,
             input_offset=input_offset,
+            input_direct_load=(
+                _direct_mma_shared_load(
+                    model["Input"],
+                    (block_m, block_k),
+                )
+                if block_m != 1
+                else None
+            ),
             projections=tuple(projections),
         )
         return context
@@ -1874,6 +2002,14 @@ def _matmul_glu_template_context(
                     "prefix": prefix,
                     "weight_mask": weight_mask,
                     "weight_offset": weight_offset,
+                    "weight_direct_load": (
+                        _direct_mma_shared_load(
+                            model[f"{prefix}Weight"],
+                            (block_k, block_n),
+                        )
+                        if block_m != 1
+                        else None
+                    ),
                 }
             )
         context.update(
@@ -1888,6 +2024,14 @@ def _matmul_glu_template_context(
             ),
             input_mask=input_mask,
             input_offset=input_offset,
+            input_direct_load=(
+                _direct_mma_shared_load(
+                    model["Input"],
+                    (block_m, block_k),
+                )
+                if block_m != 1
+                else None
+            ),
             projections=tuple(projections),
         )
         return context
@@ -2243,9 +2387,29 @@ def _matmul_template_context(
     context: dict[str, Any] = {
         "gemv": gemv,
         "logical_output_shape": logical_output_shape,
+        "microkernel_family": str(model.get("MicroKernelFamily", "")),
+        "microkernel_variant": str(model.get("MicroKernelVariant", "")),
         "phase": reduction_phase,
         "template_name": "Gemv" if gemv else "Matmul",
     }
+
+    if reduction_phase != "complete":
+        family = context["microkernel_family"]
+        variant = context["microkernel_variant"]
+        if not family or not variant:
+            raise ValueError(
+                "A Matmul reduction helper requires an AutoTiling-selected "
+                "block microkernel contract."
+            )
+        if variant not in {
+            "register_simt_accumulator",
+            "register_mma_accumulator",
+            "shared_simt_accumulator",
+            "shared_mma_accumulator",
+        }:
+            raise ValueError(
+                f"Unsupported Matmul block microkernel {family}/{variant}."
+            )
 
     if reduction_phase == "finalize":
         block_m = int(model["ReductionBlockM"])
@@ -2278,6 +2442,7 @@ def _matmul_template_context(
         context.update(
             block_m=block_m,
             block_n=block_n,
+            inner_n=int(model.get("MicroKernelInnerN", 0)),
             n=n,
             output_mask=(
                 f"offs_n < {_dim(n)}"
@@ -2319,6 +2484,54 @@ def _matmul_template_context(
         block_m = int(model["ReductionBlockM"])
         block_n = int(model["ReductionBlockN"])
         block_k = int(model["ReductionBlockK"])
+        selected_inner_n = int(model.get("MicroKernelInnerN", 0))
+        if selected_inner_n <= 0 or selected_inner_n & (selected_inner_n - 1):
+            raise ValueError(
+                "A Matmul reduction microkernel requires a positive power-of-two "
+                f"inner N tile, got inner_n={selected_inner_n}."
+            )
+        inner_n = min(selected_inner_n, block_n)
+        shared_accumulator = context["microkernel_variant"] in {
+            "shared_simt_accumulator",
+            "shared_mma_accumulator",
+        }
+        if shared_accumulator and not gemv:
+            raise ValueError("The shared Matmul accumulator currently requires GEMV.")
+        num_warps = int(model.get("NumWarps", 0))
+        if num_warps <= 0:
+            raise ValueError(
+                "A Matmul reduction helper requires a positive NumWarps launch contract."
+            )
+        gemv_dot_m = int(model.get("MicroKernelInnerM", 0))
+        mma_m = int(model.get("MicroKernelMmaM", 0))
+        mma_n = int(model.get("MicroKernelMmaN", 0))
+        mma_k = int(model.get("MicroKernelMmaK", 0))
+        selected_mma = context["microkernel_variant"] in {
+            "register_mma_accumulator",
+            "shared_mma_accumulator",
+        }
+        if selected_mma and not (
+            gemv
+            and model["LhsDType"] == model["RhsDType"]
+            and model["LhsDType"] in {"float16", "bfloat16"}
+            and mma_m > 0
+            and mma_n > 0
+            and mma_k > 0
+            and gemv_dot_m == mma_n
+        ):
+            raise ValueError(
+                "The selected MMA GEMV contract is incompatible with "
+                f"the transposed MMA dtype/M-pad requirements: M_pad={gemv_dot_m}, "
+                f"mma=({mma_m}, {mma_n}, {mma_k}), "
+                f"num_warps={num_warps}, "
+                f"lhs={model['LhsDType']}, rhs={model['RhsDType']}."
+            )
+        gemv_use_dot = selected_mma and (
+            block_k >= mma_k
+            and block_k % mma_k == 0
+            and inner_n >= mma_m
+            and inner_n % mma_m == 0
+        )
         if gemv:
             lhs_offsets = _gemv_lhs_offsets(model, "0")
             rhs_offsets = _gemv_rhs_offsets(model, "0")
@@ -2345,10 +2558,41 @@ def _matmul_template_context(
                 f"(offs_m[:, None] < {_dim(lhs_m)}) & "
                 f"(offs_k[None, :] < {_dim(lhs_k)})"
             )
+        lhs_direct_load = None
+        rhs_direct_load = None
+        if not gemv:
+            lhs_source_shape = (
+                (block_k, block_m)
+                if model["TransposeA"]
+                else (block_m, block_k)
+            )
+            lhs_direct_load = _direct_mma_shared_load(
+                model["Lhs"],
+                lhs_source_shape,
+                transpose=bool(model["TransposeA"]),
+            )
+            rhs_is_packed = (
+                model.get("RhsNPackedLaneCount", 1)
+                * model["RhsNVectorLaneCount"]
+                > 1
+            )
+            rhs_source_shape = (
+                (block_k, block_n)
+                if rhs_is_packed or not model["TransposeB"]
+                else (block_n, block_k)
+            )
+            rhs_direct_load = _direct_mma_shared_load(
+                model["Rhs"],
+                rhs_source_shape,
+                transpose=bool(model["TransposeB"] and not rhs_is_packed),
+            )
         context.update(
             block_k=block_k,
             block_m=block_m,
             block_n=block_n,
+            gemv_dot_m=gemv_dot_m,
+            gemv_use_dot=gemv_use_dot,
+            inner_n=inner_n,
             dot_precision=(
                 ', input_precision="ieee"'
                 if model["LhsDType"] == "float32"
@@ -2357,8 +2601,10 @@ def _matmul_template_context(
             ),
             lhs_mask=lhs_mask,
             lhs_offsets=lhs_offsets,
+            lhs_direct_load=lhs_direct_load,
             rhs_mask=rhs_mask,
             rhs_offsets=rhs_offsets,
+            rhs_direct_load=rhs_direct_load,
         )
         return context
 

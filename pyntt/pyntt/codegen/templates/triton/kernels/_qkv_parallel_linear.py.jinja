@@ -80,10 +80,18 @@ def {{ model["FunctionName"] }}({{ helper_parameters(model, ("q_acc", "k_acc", "
 {% if ctx["block_m"] != 1 %}
     offs_m = tl.arange(0, {{ ctx["block_m"] }})
 {% endif %}
+{% if ctx["input_direct_load"] %}
+    input_values = {{ ctx["input_direct_load"] }}
+{% else %}
     input_values = tl.load({{ access_pointer(model, "Input", "input0", ctx["input_offset"]) }}, mask={{ ctx["input_mask"] }}, other=0.0){{ ".to(tl.float32)" if ctx["block_m"] == 1 else "" }}
+{% endif %}
 {% for projection in ctx["projections"] %}
     {{ projection["offs_n"] }} = tl.arange(0, {{ projection["block_n"] }})
+{% if projection["weight_direct_load"] %}
+    {{ projection["lower"] }}_weight_values = {{ projection["weight_direct_load"] }}
+{% else %}
     {{ projection["lower"] }}_weight_values = tl.load({{ access_pointer(model, projection["prefix"] ~ "Weight", projection["lower"] ~ "_weight", projection["weight_offset"]) }}, mask={{ projection["weight_mask"] }}, other=0.0{{ ", eviction_policy=\"evict_first\"" if ctx["block_m"] == 1 else "" }}){{ ".to(tl.float32)" if ctx["block_m"] == 1 else "" }}
+{% endif %}
 {% if ctx["block_m"] == 1 %}
     {{ projection["accumulator"] }} += tl.sum({{ projection["lower"] }}_weight_values * input_values[None, :], axis=1)
 {% else %}

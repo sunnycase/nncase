@@ -163,6 +163,8 @@ public sealed class UnitTestTIR
         var result = Assert.Single(abi.Results);
         Assert.Same(inOut, result.Value);
         Assert.Same(inOut, result.Storage);
+        Assert.Equal(objectType, Assert.Single(abi.RuntimeParameterTypes));
+        Assert.Equal(objectType, abi.RuntimeReturnType);
         var wrapper = new PrimFunctionWrapper(primFunction, 1, objectType);
         Assert.Equal(objectType, wrapper.ReturnType);
         Assert.Equal(objectType, Assert.Single(wrapper.ParameterTypes));

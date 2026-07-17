@@ -33,12 +33,14 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
     private readonly StringBuilder _kernelBuilder;
     private readonly HashSet<TIR.PrimFunction> _refFuncs;
     private readonly HashSet<TIR.Buffer> _declaredBuffers = new(ReferenceEqualityComparer.Instance);
+    private readonly ulong _chipLocalRdataBase;
     private IVar[]? _tensorParams;
 
-    public KernelCSourceConvertVisitor(NTTTargetOptions targetOptions)
+    public KernelCSourceConvertVisitor(NTTTargetOptions targetOptions, ulong chipLocalRdataBase = 0)
     {
         _kernelBuilder = new StringBuilder();
         _refFuncs = new(ReferenceEqualityComparer.Instance);
+        _chipLocalRdataBase = chipLocalRdataBase;
         CollectivePoolSize = 0;
         TargetOptions = targetOptions;
     }
@@ -172,6 +174,7 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
             using (_ = new IndentScope())
             {
                 Visit(expr.Body);
+                Visit(expr.Results);
             }
 
             // 4. Function closing
@@ -205,16 +208,47 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
             return symbol;
         }
 
-        var start = Visit(expr.Start);
-        var isReadOnly = expr.Location is MemoryLocation.Rdata or MemoryLocation.BlockLocalRdata ||
-            (expr.Location == MemoryLocation.Input && expr.Start is not BufferVar { Role: BufferVarRole.InOut });
-        if (expr.Location == MemoryLocation.Input)
+        if (expr.Start is Call { Target: IR.Buffers.AddressOf })
         {
+            var buffers = expr.Users.OfType<TIR.MemSpan>()
+                .SelectMany(memSpan => memSpan.Users.OfType<TIR.Buffer>())
+                .Select(buffer => buffer.Name)
+                .Distinct(StringComparer.Ordinal)
+                .ToArray();
+            throw new InvalidOperationException(
+                $"NTT C codegen requires bufferized physical storage, but {expr.Location} buffer(s) [{string.Join(", ", buffers)}] still use AddressOf.");
+        }
+
+        var start = Visit(expr.Start);
+        var isReadOnly = expr.Location is MemoryLocation.Rdata or MemoryLocation.ChipLocalRdata or MemoryLocation.BlockLocalRdata ||
+            (expr.Location == MemoryLocation.Input && expr.Start is not BufferVar { Role: BufferVarRole.InOut });
+        if (expr.Location is MemoryLocation.Input or MemoryLocation.Output)
+        {
+            if (expr.Start is not BufferVar)
+            {
+                throw new InvalidOperationException(
+                    $"NTT C codegen requires {expr.Location} storage to be backed by a BufferVar, but found {expr.Start.GetType().Name}.");
+            }
+
             var byteType = isReadOnly ? "const std::byte" : "std::byte";
             var spanSize = Visit(expr.Size).Name;
-            var inputSpan = $"span_cast<{byteType}>({start.Name}.elements())";
-            var inputName = $"make_subspan({inputSpan}, 0_dim, {spanSize})";
-            symbol = new(start.Type, inputName);
+            var parameterSpan = $"span_cast<{byteType}>({start.Name}.elements())";
+            var parameterName = $"make_subspan({parameterSpan}, 0_dim, {spanSize})";
+            symbol = new(start.Type, parameterName);
+            _exprMemo.Add(expr, symbol);
+            return symbol;
+        }
+
+        var ptypeName = isReadOnly ? "const std::byte" : "std::byte";
+        if (expr.Location == MemoryLocation.ChipLocalData)
+        {
+            if (!expr.Size.IsFixed || expr.Size.FixedValue != 0)
+            {
+                throw new NotSupportedException(
+                    "NTT CPU runtime does not provide a chip-local mutable workspace.");
+            }
+
+            symbol = new(start.Type, $"ntt::span<{ptypeName}, 0>()");
             _exprMemo.Add(expr, symbol);
             return symbol;
         }
@@ -222,31 +256,27 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
         string loc = (expr.Location, expr.Hierarchy) switch
         {
             (MemoryLocation.Rdata, 0) => "rdata",
+            (MemoryLocation.ChipLocalRdata, 0) => "rdata",
             (MemoryLocation.BlockLocalRdata, 0) => "block_local_rdata",
             (MemoryLocation.Data, 0) => "data",
             (MemoryLocation.Data, 1) => "data",
             (MemoryLocation.BlockLocalData, 0) => "block_local_data",
-            (MemoryLocation.Output, 0) => "output",
             _ => throw new NotSupportedException($"{expr.Location}, {expr.Hierarchy}"),
         };
 
-        var ptypeName = "std::byte";
-        if (isReadOnly)
-        {
-            // Rdata and BlockLocalRdata are const.
-            ptypeName = $"const {ptypeName}";
-        }
-
         string name;
+        var startName = expr.Location == MemoryLocation.ChipLocalRdata
+            ? $"{_chipLocalRdataBase}UL + {start.Name}UL"
+            : $"{start.Name}UL";
         if (expr.Size is DimConst)
         {
             var spanSize = (ulong)expr.Size.FixedValue;
-            name = $"ntt::span<{ptypeName}, {spanSize}>({loc} + {start.Name}UL, {spanSize})";
+            name = $"ntt::span<{ptypeName}, {spanSize}>({loc} + {startName}, {spanSize})";
         }
         else
         {
             var spanSize = Visit(expr.Size).Name;
-            name = $"ntt::span<{ptypeName}>({loc} + {start.Name}UL, {spanSize})";
+            name = $"ntt::span<{ptypeName}>({loc} + {startName}, {spanSize})";
         }
 
         symbol = new(start.Type, name);
@@ -287,7 +317,7 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
         var dimensionStr = $"shape_t<{StringUtility.Join(", ", dimensionTypes)}>";
         var strideStr = $"strides_t<{StringUtility.Join(", ", strideTypes)}>";
 
-        var type = expr.MemSpan.Buffer.Location is MemoryLocation.Rdata or MemoryLocation.BlockLocalRdata || expr.MemSpan.Buffer.Start is TensorConst
+        var type = expr.MemSpan.Buffer.Location is MemoryLocation.Rdata or MemoryLocation.ChipLocalRdata or MemoryLocation.BlockLocalRdata || expr.MemSpan.Buffer.Start is TensorConst
             ? (expr.DistributedType == null
              ? $"tensor_view<{dtypeStr}, {dimensionStr}, {strideStr}> "
              : $"sharded_tensor_view<{dtypeStr}, {dimensionStr}, {KernelUtility.ShardingToC(expr.DistributedType)}, {strideStr}> ")
@@ -771,34 +801,17 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
             IndentScope.Writer.IndWrite($"runtime_util->printf(\"call {deviceFunc.Name} bid %d tid %d\\n\", bid, tid);\n");
 #endif
             var argumentNames = new List<string>();
-            string? dataName = null;
             foreach (var arg in expr.Arguments)
             {
                 if (arg is TIR.Buffer b)
                 {
                     var buffer = VisitBuffer(b, local: true);
-                    if (b.Name.StartsWith("data_"))
-                    {
-                        dataName = $"rdata, block_local_rdata, (std::byte *){buffer.Name}.buffer().data(), <block_local_data>, output, output_descs";
-                    }
-                    else if (b.Name.StartsWith("block_local_data_"))
-                    {
-                        dataName = dataName!.Replace("<block_local_data>", $"(std::byte *){buffer.Name}.buffer().data()", StringComparison.Ordinal);
-                    }
-                    else
-                    {
-                        argumentNames.Add(buffer.Name);
-                    }
+                    argumentNames.Add(buffer.Name);
                 }
                 else
                 {
                     argumentNames.Add(Visit(arg).Name);
                 }
-            }
-
-            if (dataName is not null)
-            {
-                argumentNames.Add(dataName);
             }
 
             _refFuncs.Add(deviceFunc);
@@ -875,7 +888,7 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
         }
         else
         {
-            throw new NotSupportedException();
+            throw new NotSupportedException($"NTT C codegen does not support constant {expr} with type {expr.CheckedType}.");
         }
 
         symbol = new(type, str);
@@ -1062,7 +1075,7 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
             if (buffer.MemSpan.Buffer.Start is not None)
             {
                 // If the buffer has a start, we create a tensor view
-                var isReadOnly = buffer.MemSpan.Buffer.Location is MemoryLocation.Rdata or MemoryLocation.BlockLocalRdata ||
+                var isReadOnly = buffer.MemSpan.Buffer.Location is MemoryLocation.Rdata or MemoryLocation.ChipLocalRdata or MemoryLocation.BlockLocalRdata ||
                     (buffer.MemSpan.Buffer.Location == MemoryLocation.Input && buffer.MemSpan.Buffer.Start is not BufferVar { Role: BufferVarRole.InOut });
                 var dtypeStr = isReadOnly ? $"const {buffer.ElemType.ToC()}" : buffer.ElemType.ToC();
                 var dimensions = buffer.DistributedType is null ? buffer.Dimensions : ((RankedShape)buffer.DistributedType.TensorType.Shape).Dimensions;

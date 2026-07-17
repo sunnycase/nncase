@@ -4,6 +4,7 @@
 using System.Runtime.CompilerServices;
 using NetFabric.Hyperlinq;
 using Nncase.IR;
+using Nncase.IR.Affine;
 using Nncase.TIR.Builders;
 using Nncase.Utilities;
 
@@ -301,9 +302,31 @@ public static class T
 
         var alignment = tensorType.DType.SizeInBytes;
         var dimensions = ((RankedShape)tensorType.Shape).Dimensions.ToArray();
-        (var size, var strides) = location is MemoryLocation.Input or MemoryLocation.Output
-            ? TensorUtilities.GetTensorSizeAndContiguousStrides(tensorType, distributedType)
-            : TensorUtilities.GetTensorMaxSizeAndStridesExpr(tensorType, distributedType);
+        Dimension size;
+        Dimension[] strides;
+        if (start is BufferVar { LayoutAnnotation.Kind: BufferLayoutKind.ExactStrided } bufferVar)
+        {
+            strides = bufferVar.LayoutAnnotation.Strides.ToArray();
+            var localTensorType = distributedType is null
+                ? tensorType
+                : DistributedUtility.GetDividedTensorType(distributedType);
+            var localDimensions = ((RankedShape)localTensorType.Shape).Dimensions;
+            if (localDimensions.Length != strides.Length)
+            {
+                throw new InvalidOperationException(
+                    $"BufferVar {bufferVar.Name} layout rank mismatch while attaching {name}: " +
+                    $"local rank={localDimensions.Length}, strides={strides.Length}.");
+            }
+
+            size = BufferViewUtility.GetByteSpanSize(localDimensions, strides, tensorType.DType.SizeInBytes);
+        }
+        else
+        {
+            (size, strides) = location is MemoryLocation.Input or MemoryLocation.Output
+                ? TensorUtilities.GetTensorSizeAndContiguousStrides(tensorType, distributedType)
+                : TensorUtilities.GetTensorMaxSizeAndStridesExpr(tensorType, distributedType);
+        }
+
         var physicalBuffer = new PhysicalBuffer(alignment, start, size, location, hierarchy);
         buffer = new Buffer(name, tensorType.DType, new MemSpan(physicalBuffer), dimensions, strides, distributedType);
         return buffer;
@@ -345,7 +368,8 @@ public static class T
             memSpan,
             dimensions.ToArray(),
             strides.ToArray(),
-            distributedType);
+            distributedType,
+            source.StorageEncoding);
     }
 
     /// <summary>

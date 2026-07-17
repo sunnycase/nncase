@@ -71,7 +71,7 @@ public sealed class UnitTestMutators : TestClassBase
     }
 
     [Fact]
-    public void TestTailLoopStrippingPreservesFreeBufferVarIdentity()
+    public void TestTailLoopPeelingPreservesFreeBufferVarIdentity()
     {
         var inputType = new TensorType(DataTypes.Float32, new[] { 5 });
         var input = new BufferVar("input", inputType, BufferVarRole.Input, MemoryLocation.Input);
@@ -83,11 +83,120 @@ public sealed class UnitTestMutators : TestClassBase
                     T.Nop())));
         var function = new PrimFunction("tail_loop", Callable.CPUModuleKind, body, new[] { input });
 
-        var rewritten = (PrimFunction)new TailLoopStripping().Rewrite(function);
+        var rewritten = (PrimFunction)new TailLoopPeeling().Rewrite(function);
         var bodyBufferVars = ExprCollector.Collect(rewritten.Body).OfType<BufferVar>().ToArray();
+        var loops = ExprCollector.Collect(rewritten.Body).OfType<TIR.For>().ToArray();
+        var fullView = Assert.Single(ExprCollector.Collect(loops[0].Body).OfType<Let>()).Var;
+        var tailView = Assert.Single(ExprCollector.Collect(loops[1].Body).OfType<Let>()).Var;
 
         Assert.NotEmpty(bodyBufferVars);
         Assert.All(bodyBufferVars, bufferVar => Assert.Same(rewritten.Parameters[0], bufferVar));
+        Assert.NotSame(fullView, tailView);
+        Assert.Equal(2, loops.Length);
+        Assert.Equal(LoopPartition.Full, loops[0].Partition);
+        Assert.Equal(LoopPartition.Tail, loops[1].Partition);
+        Assert.Equal(4, loops[0].Domain.Stop.FixedValue);
+        Assert.Equal(4, loops[1].Domain.Start.FixedValue);
+
+        var secondRewriter = new TailLoopPeeling();
+        Assert.Same(rewritten, secondRewriter.Rewrite(rewritten));
+        Assert.False(secondRewriter.IsMutated);
+    }
+
+    [Fact]
+    public void TestTailLoopPeelingPreservesPhysicalStorageIdentity()
+    {
+        var inputType = new TensorType(DataTypes.Float32, new[] { 5 });
+        var input = new BufferVar("input", inputType, BufferVarRole.Input, MemoryLocation.Input);
+        var physicalBuffer = new PhysicalBuffer(64, input, 20, MemoryLocation.Input);
+        var body = T.Sequential(
+            T.Serial(out var i, (0, 5, 4)).Body(
+                T.Let(
+                    out _,
+                    IR.F.Buffer.AllocateBufferView(
+                        new TIR.Buffer(
+                            "input_tile",
+                            DataTypes.Float32,
+                            new MemSpan(physicalBuffer, i * 4, 4),
+                            new Dimension[] { 1 },
+                            new Dimension[] { 1 },
+                            null),
+                        new RankedShape(0))).Body(
+                    T.Nop())));
+        var function = new PrimFunction("tail_loop", Callable.CPUModuleKind, body, new[] { input });
+
+        var rewritten = (PrimFunction)new TailLoopPeeling().Rewrite(function);
+        var physicalBuffers = ExprCollector.Collect(rewritten.Body).OfType<PhysicalBuffer>().ToArray();
+        var loops = ExprCollector.Collect(rewritten.Body).OfType<TIR.For>().ToArray();
+        var fullBuffer = Assert.Single(ExprCollector.Collect(loops[0].Body).OfType<TIR.Buffer>());
+        var tailBuffer = Assert.Single(ExprCollector.Collect(loops[1].Body).OfType<TIR.Buffer>());
+
+        Assert.Same(physicalBuffer, Assert.Single(physicalBuffers));
+        Assert.Contains(loops[0].LoopVar, ExprCollector.Collect(fullBuffer.MemSpan.Start));
+        Assert.Contains(loops[1].LoopVar, ExprCollector.Collect(tailBuffer.MemSpan.Start));
+        Assert.DoesNotContain(loops[0].LoopVar, ExprCollector.Collect(tailBuffer.MemSpan.Start));
+    }
+
+    [Fact]
+    public void TestNestedTailLoopPeelingProducesLinearBoundarySlabs()
+    {
+        var i = new DimVar("i");
+        var j = new DimVar("j");
+        var inner = new TIR.For(j, new TIR.Range(0, 7, 4), LoopMode.Serial, new Sequential(T.Nop()));
+        var outer = new TIR.For(i, new TIR.Range(0, 5, 4), LoopMode.Serial, new Sequential(inner));
+
+        var rewritten = Assert.IsType<Sequential>(new TailLoopPeeling().Rewrite(outer));
+        var outerLoops = rewritten.Fields.ToArray().Select(Assert.IsType<TIR.For>).ToArray();
+        var fullOuterInnerLoops = ExprCollector.Collect(outerLoops[0].Body).OfType<TIR.For>().ToArray();
+        var tailOuterInnerLoops = ExprCollector.Collect(outerLoops[1].Body).OfType<TIR.For>().ToArray();
+
+        Assert.Equal(2, outerLoops.Length);
+        Assert.Equal(2, fullOuterInnerLoops.Length);
+        Assert.Single(tailOuterInnerLoops);
+        Assert.NotSame(fullOuterInnerLoops[0].LoopVar, tailOuterInnerLoops[0].LoopVar);
+        Assert.Equal(7, tailOuterInnerLoops[0].Domain.Stop.FixedValue);
+    }
+
+    [Fact]
+    public void TestDynamicReductionTailLoopPeelingPreservesModeAndBounds()
+    {
+        var stop = new DimVar("stop");
+        var reductionAxis = new DimVar("k");
+        var loop = new TIR.For(
+            reductionAxis,
+            new TIR.Range(0, stop, 8),
+            LoopMode.Reduction,
+            new Sequential(T.Nop()));
+
+        var rewritten = Assert.IsType<Sequential>(new TailLoopPeeling().Rewrite(loop));
+        var loops = rewritten.Fields.ToArray().Select(Assert.IsType<TIR.For>).ToArray();
+
+        Assert.Equal(2, loops.Length);
+        Assert.All(loops, peeled => Assert.Equal(LoopMode.Reduction, peeled.Mode));
+        Assert.Equal(LoopPartition.Full, loops[0].Partition);
+        Assert.Equal(LoopPartition.Tail, loops[1].Partition);
+        Assert.Equal(loops[0].Domain.Stop, loops[1].Domain.Start);
+        Assert.Same(stop, loops[1].Domain.Stop);
+        Assert.Equal(8, loops[0].Domain.Step.FixedValue);
+        Assert.Equal(8, loops[1].Domain.Step.FixedValue);
+    }
+
+    [Fact]
+    public void TestEliminateStaticallyEmptyTailLoop()
+    {
+        var loop = new TIR.For(
+            new DimVar("i_tail"),
+            new TIR.Range(2, 2, 2),
+            LoopMode.Serial,
+            new Sequential(T.Nop()),
+            LoopPartition.Tail);
+        var rewriter = new EliminateEmptyLoops();
+
+        var rewritten = rewriter.Rewrite(loop);
+
+        Assert.True(rewriter.IsMutated);
+        Assert.IsType<Call>(rewritten);
+        Assert.IsType<Nop>(Assert.IsType<Call>(rewritten).Target);
     }
 
     [Fact]

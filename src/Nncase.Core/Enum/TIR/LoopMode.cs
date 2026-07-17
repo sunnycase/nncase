@@ -43,3 +43,24 @@ public enum LoopMode
     /// </summary>
     ThreadBinding,
 }
+
+/// <summary>
+/// Identifies a loop produced by a structured full/tail partition.
+/// </summary>
+public enum LoopPartition
+{
+    /// <summary>
+    /// The loop has not been partitioned.
+    /// </summary>
+    Unpartitioned,
+
+    /// <summary>
+    /// The loop covers only complete tiles.
+    /// </summary>
+    Full,
+
+    /// <summary>
+    /// The loop covers the clipped boundary tile, if present.
+    /// </summary>
+    Tail,
+}

@@ -83,6 +83,12 @@ public sealed class PyNTTTargetOptions : NTTTargetOptions
         TargetCostModel = string.Equals(_backend, "triton", StringComparison.OrdinalIgnoreCase)
             ? new TritonTargetOpCostModel(TargetMachineModel)
             : new DefaultTargetOpCostModel(TargetMachineModel);
+        BlockMicroKernelModel = string.Equals(_backend, "triton", StringComparison.OrdinalIgnoreCase)
+            ? new TritonBlockMicroKernelModel()
+            : new DefaultBlockMicroKernelModel();
+        StorageEncodingModel = string.Equals(_backend, "triton", StringComparison.OrdinalIgnoreCase)
+            ? new TritonTargetStorageEncodingModel()
+            : new DefaultTargetStorageEncodingModel();
     }
 
     private void RefreshTargetCostModel() => OnTargetMachineChanged();

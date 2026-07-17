@@ -12,6 +12,7 @@ using DryIoc.ImTools;
 using Nncase.CodeGen.NTT;
 using Nncase.Diagnostics;
 using Nncase.Targets;
+using Nncase.TIR;
 
 namespace Nncase.CodeGen.NTT;
 
@@ -196,7 +197,14 @@ internal sealed class LinkableModule : ILinkableModule
         var elfPath = CompileCSource(codegenDir);
         var funcText = File.ReadAllBytes(elfPath);
         textWriter.Write(funcText);
-        linkedFunctions.Add(new LinkedFunction(mainFunc.Id, mainFunc.SourceFunction, 0, (uint)funcText.Length, mainFunc.Sections));
+        var entryAbi = mainFunc.PrimFunction.GetAbiView();
+        linkedFunctions.Add(new LinkedFunction(
+            mainFunc.Id,
+            entryAbi.RuntimeParameterTypes,
+            entryAbi.RuntimeReturnType,
+            0,
+            (uint)funcText.Length,
+            mainFunc.Sections));
         return new LinkedModule(_moduleKind, linkedFunctions, _desc, manager.GetContent(WellknownSectionNames.Text)!, _rdata, _blockLocalRdatas, rdataAlign);
     }
 

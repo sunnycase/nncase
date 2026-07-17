@@ -13,7 +13,7 @@ TensorConst,true,false,Const,,
 Tuple,true,false,Default,IR.,@Fields
 TupleConst,true,false,Const,,
 PhysicalBuffer,true,false,Default,TIR.,Start;Size;
-MemSpan,true,false,Default,TIR.,Buffer,Start;Size;
+MemSpan,true,false,Default,TIR.,Buffer;Start;Size;
 Var,true,false,Default,,
 BufferVar,true,false,Default,TIR.,
 Block,true,false,Default,TIR.,Body;InitBody;@IterVars;@Reads;@Writes;@AllocBuffers;Predicate
@@ -41,7 +41,7 @@ AffineRange,true,false,Default,Affine.,Offset;Extent
 AffineMap,true,false,Default,Affine.,@Domains;@Symbols;@Results
 AffineRelation,true,false,Default,Affine.,@Domains;@Symbols;@Results
 GridAccess,true,false,Default,Affine.,Value;Buffer;Parameter;Region
-Grid,true,false,Default,Affine.,DomainParameter;@Accesses;Body
+Grid,true,false,Default,Affine.,DomainParameter;@DomainBounds;@Accesses;Body
 Load,true,false,Default,Affine.,Source;Region
 For,true,false,Default,Affine.,Domain;Body
 # Buffers

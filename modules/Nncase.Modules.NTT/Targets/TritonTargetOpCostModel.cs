@@ -82,7 +82,11 @@ public sealed class TritonTargetOpCostModel : ITargetOpCostModel, IHierarchicalT
         }
 
         cost = ElementwiseCost(
-            EstimateElementwiseComputeCycles(elements, CostUtility.GetCPUCyclesOfUnary(query.Op)),
+            EstimateElementwiseComputeCycles(
+                elements,
+                CostUtility.GetCPUCyclesOfUnary(query.Op),
+                query.Input.DType,
+                query.Output.DType),
             GetTensorByteCount(query.Input),
             GetTensorByteCount(query.Output));
         return true;
@@ -97,7 +101,12 @@ public sealed class TritonTargetOpCostModel : ITargetOpCostModel, IHierarchicalT
         }
 
         cost = ElementwiseCost(
-            EstimateElementwiseComputeCycles(elements, CostUtility.GetCPUCyclesOfBinary(query.Op)),
+            EstimateElementwiseComputeCycles(
+                elements,
+                CostUtility.GetCPUCyclesOfBinary(query.Op),
+                query.Lhs.DType,
+                query.Rhs.DType,
+                query.Output.DType),
             GetTensorByteCount(query.Lhs) + GetTensorByteCount(query.Rhs),
             GetTensorByteCount(query.Output));
         return true;
@@ -118,7 +127,10 @@ public sealed class TritonTargetOpCostModel : ITargetOpCostModel, IHierarchicalT
         }
 
         cost = ElementwiseCost(
-            EstimateElementwiseComputeCycles(elements, Math.Max(0.0, query.WorkPerElement)),
+            EstimateElementwiseComputeCycles(
+                elements,
+                Math.Max(0.0, query.WorkPerElement),
+                query.Inputs.Select(input => input.DType).Append(query.Output.DType).ToArray()),
             loadElements,
             GetTensorByteCount(query.Output));
         return true;
@@ -140,14 +152,15 @@ public sealed class TritonTargetOpCostModel : ITargetOpCostModel, IHierarchicalT
         var (m, n, k) = GetMatMulLogicalShape(query, lhsShape, outputShape);
         var batch = Product(outputShape.AsSpan(0, outputShape.Length - 2));
         var outputDType = query.OutputDataType ?? query.Output.DType;
-        var useDotInstructions = HasVectorDType(query.Lhs.DType)
+        var hasVectorLayout = HasVectorDType(query.Lhs.DType)
             || HasVectorDType(query.Rhs.DType)
             || HasVectorDType(query.Output.DType)
             || HasVectorDType(outputDType);
         var computeCycles = query.Kind switch
         {
             MatMulOpCostKind.Simt => EstimateSimtMatMulComputeCycles(m, n, k, batch),
-            _ => EstimateMatMulComputeCycles(m, n, k, batch, query.Lhs.DType, query.Rhs.DType, outputDType, useDotInstructions),
+            _ when !hasVectorLayout => EstimateScalarMatMulComputeCycles(m, n, k, batch),
+            _ => EstimateMatMulComputeCycles(m, n, k, batch, query.Lhs.DType, query.Rhs.DType),
         };
 
         cost = ElementwiseCost(
@@ -157,9 +170,15 @@ public sealed class TritonTargetOpCostModel : ITargetOpCostModel, IHierarchicalT
         return true;
     }
 
-    private double EstimateElementwiseComputeCycles(double elements, double workPerElement)
+    private double EstimateElementwiseComputeCycles(
+        double elements,
+        double workPerElement,
+        params DataType[] dataTypes)
     {
-        return (elements * workPerElement) / Math.Max(1.0, _machine.Compute.ElementwiseElementsPerCycle);
+        var elementsPerCycle = dataTypes.Any(HasVectorDType)
+            ? _machine.Compute.ElementwiseElementsPerCycle
+            : 1.0;
+        return (elements * workPerElement) / Math.Max(1.0, elementsPerCycle);
     }
 
     private (long M, long N, long K) GetMatMulLogicalShape(MatMulOpCostQuery query, long[] lhsShape, long[] outputShape)
@@ -180,20 +199,20 @@ public sealed class TritonTargetOpCostModel : ITargetOpCostModel, IHierarchicalT
         return (m, n, k);
     }
 
-    private double EstimateMatMulComputeCycles(long m, long n, long k, double batch, DataType lhsDType, DataType rhsDType, DataType outputDType, bool useDotInstructions)
+    private double EstimateScalarMatMulComputeCycles(long m, long n, long k, double batch)
+        => Math.Max(0, m) * (double)Math.Max(0, n) * Math.Max(0, k) * batch;
+
+    private double EstimateMatMulComputeCycles(long m, long n, long k, double batch, DataType lhsDType, DataType rhsDType)
     {
         var simtCycles = EstimateSimtMatMulComputeCycles(m, n, k, batch);
-        if (useDotInstructions)
+        var candidates = _machine.Compute.MatrixPrimitives
+            .Where(instruction => instruction.Supports(lhsDType, rhsDType))
+            .Select(instruction => EstimateDotInstructionCycles(instruction, m, n, k, batch))
+            .Where(double.IsFinite)
+            .ToArray();
+        if (candidates.Length > 0)
         {
-            var candidates = _machine.Compute.MatrixPrimitives
-                .Where(instruction => instruction.Supports(lhsDType, rhsDType))
-                .Select(instruction => EstimateDotInstructionCycles(instruction, m, n, k, batch))
-                .Where(double.IsFinite)
-                .ToArray();
-            if (candidates.Length > 0)
-            {
-                return Math.Min(simtCycles, candidates.Min());
-            }
+            return Math.Min(simtCycles, candidates.Min());
         }
 
         return simtCycles;

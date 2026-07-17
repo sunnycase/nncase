@@ -17,6 +17,11 @@ public static class NTTTargetMachineCatalog
     public const string Rtx5060Ti16Gb = "nvidia-rtx5060-ti-16gb";
     public const string H800Sxm80Gb = "nvidia-h800-sxm-80gb";
 
+    public static readonly TargetPrivateResourceId CpuBackendPrivateBytes = new("cpu.backend-private-bytes");
+    public static readonly TargetPrivateResourceId XpuBackendPrivateBytes = new("xpu.backend-private-bytes");
+    public static readonly TargetPrivateResourceId GpuRegisterFile = new("gpu.register-file-r32");
+    public static readonly TargetPrivateResourceId GpuBackendSharedMemory = new("gpu.backend-shared-memory");
+
     private static readonly ImmutableArray<DataType> _tensorCoreOperandDataTypes =
     [
         DataTypes.Float16,
@@ -61,9 +66,10 @@ public static class NTTTargetMachineCatalog
         var root = new TargetMemorySpaceId("cpu.main-memory");
         return new TargetMachineModel(
             CpuGeneric,
-            new(BlockExecutionKind.CpuCore, Math.Max(1, Environment.ProcessorCount), 1, 1, 3.0, 512, 4, 64 * 1024, 1, 1, 1),
+            new(BlockExecutionKind.CpuCore, Math.Max(1, Environment.ProcessorCount), 1, 1, 3.0, 512, 4),
             new(16, 16, ImmutableArray<MatrixComputePrimitiveSpec>.Empty),
             new(25, 25_000),
+            [new(CpuBackendPrivateBytes, TargetPrivateResourceUnit.Bytes, 64 * 1024, 4)],
             [
                 new(cacheResource, TargetMemorySpaceKind.Cache, 512 * 1024, 64, 64, 4, 64),
                 new(memoryResource, TargetMemorySpaceKind.Global, int.MaxValue, 8, 8, 120, 64),
@@ -94,9 +100,13 @@ public static class NTTTargetMachineCatalog
         var root = new TargetMemorySpaceId("cuda.global");
         return new TargetMachineModel(
             CudaGeneric,
-            new(BlockExecutionKind.PersistentGpuBlock, 108, 8, 32, 1.4, 128, 4, 8 * 1024, 16, 16, 32),
+            new(BlockExecutionKind.PersistentGpuBlock, 108, 8, 32, 1.4, 128, 4),
             new(128, 64, ImmutableArray.Create(new MatrixComputePrimitiveSpec("mma", 16, 8, 16, 4, _tensorCoreOperandDataTypes))),
             new(25, 2200),
+            [
+                new(GpuRegisterFile, TargetPrivateResourceUnit.Register32, 255L * 8 * 32, 8 * 32),
+                new(GpuBackendSharedMemory, TargetPrivateResourceUnit.Bytes, sharedCapacityBytes, 16, sharedResource),
+            ],
             [
                 new(sharedResource, TargetMemorySpaceKind.Shared, sharedCapacityBytes, 512, 512, 20, 16),
                 new(globalResource, TargetMemorySpaceKind.Global, int.MaxValue, 1110, 1110, 300, 128),
@@ -126,9 +136,10 @@ public static class NTTTargetMachineCatalog
         var root = new TargetMemorySpaceId("xpu.main-memory");
         return new TargetMachineModel(
             XpuGeneric,
-            new(BlockExecutionKind.CpuCore, 64, 1, 1, 1.0, 128, 4, 64 * 1024, 1, 1, 1),
+            new(BlockExecutionKind.CpuCore, 64, 1, 1, 1.0, 128, 4),
             new(16, 16, ImmutableArray<MatrixComputePrimitiveSpec>.Empty),
             new(25, 25_000),
+            [new(XpuBackendPrivateBytes, TargetPrivateResourceUnit.Bytes, 64 * 1024, 4)],
             [
                 new(sramResource, TargetMemorySpaceKind.Cache, 256 * 1024, 64, 64, 4, 128),
                 new(memoryResource, TargetMemorySpaceKind.Global, 144 * 1024 * 1024, 32, 32, 120, 128),
@@ -194,9 +205,13 @@ public static class NTTTargetMachineCatalog
 
         return new TargetMachineModel(
             id,
-            new(BlockExecutionKind.PersistentGpuBlock, computeUnits, 8, 32, clockRateGHz, 128, 4, 8 * 1024, 16, 16, 32),
+            new(BlockExecutionKind.PersistentGpuBlock, computeUnits, 8, 32, clockRateGHz, 128, 4),
             new(128, 64, matrixPrimitives),
             new(25, 2200),
+            [
+                new(GpuRegisterFile, TargetPrivateResourceUnit.Register32, 255L * 8 * 32, 8 * 32),
+                new(GpuBackendSharedMemory, TargetPrivateResourceUnit.Bytes, sharedCapacityBytes, 16, sharedResource),
+            ],
             [
                 new(sharedResource, TargetMemorySpaceKind.Shared, sharedCapacityBytes, sharedBytesPerCycle, sharedBytesPerCycle, 20, 16),
                 new(globalResource, TargetMemorySpaceKind.Global, globalCapacityBytes, chipGlobalBytesPerCycle, chipGlobalBytesPerCycle, 300, 128),
@@ -218,11 +233,10 @@ public static class NTTTargetMachineCatalog
 
     private static long GetCompilerManagedSharedAllocationLimit(long physicalCapacityBytes)
     {
-        // The generated TIR arena is only one consumer of physical shared
-        // memory. Triton also materializes dot operands and other lowering
-        // scratch, while the PyNTT device ABI owns a separate call-frame arena.
-        // Keep those backend-private resources outside AutoTiling's budget.
-        var budget = physicalCapacityBytes / 3;
+        // Keep one third of physical shared memory available for backend-private
+        // state. GraphTiler separately constrains the compiler arena and every
+        // backed private resource against the full physical capacity.
+        var budget = checked((physicalCapacityBytes * 2) / 3);
         if (budget <= 0)
         {
             throw new ArgumentOutOfRangeException(nameof(physicalCapacityBytes), physicalCapacityBytes, "Physical shared-memory capacity is too small.");

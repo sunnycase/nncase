@@ -507,7 +507,7 @@ internal sealed class ILPrintVisitor : ExprFunctor<string, string>
             return name;
         }
 
-        name += $": {VisitType(expr.TypeAnnotation)} [{expr.Role}, {expr.Location}]";
+        name += $": {VisitType(expr.TypeAnnotation)} [{expr.Role}, {expr.Location}, {expr.LayoutAnnotation}]";
         return name;
     }
 
@@ -542,7 +542,10 @@ internal sealed class ILPrintVisitor : ExprFunctor<string, string>
 
         var name = GetNextSSANumber();
         var type = expr.DistributedType == null ? VisitType(expr.CheckedType) : VisitType(expr.DistributedType);
-        _writer.WInd().WriteLine($"{name} = buffer({type})");
+        var storageEncoding = expr.StorageEncoding is null
+            ? string.Empty
+            : $", storage_encoding={expr.StorageEncoding}";
+        _writer.WInd().WriteLine($"{name} = buffer({type}{storageEncoding})");
         return name;
     }
 

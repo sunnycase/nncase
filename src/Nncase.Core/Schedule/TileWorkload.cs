@@ -14,12 +14,17 @@ public interface ITileWorkloadProvider
 
 /// <summary>
 /// Semantic reduction state that must remain live across reduction tiles.
-/// AutoTiling constrains its size, while the backend owns its physical
-/// lowering and does not expose it as a TIR memory space.
+/// The workload only describes logical state. Target microkernel models own
+/// alignment, physical placement, resource use, and lowering.
 /// </summary>
 public interface IReductionStateTileWorkload
 {
-    IntExpr GetReductionStateBytes(IntExpr[][] bufferShapes, Solver solver, TileWorkloadContext context, TargetMachineModel machine);
+    IReadOnlyList<TileReductionState> GetReductionStates(IntExpr[][] bufferShapes, Solver solver, TileWorkloadContext context);
+}
+
+public sealed record TileReductionState(string Name, IntExpr ElementCount, int ElementSizeBytes)
+{
+    public IntExpr GetLogicalBytes() => ElementCount * ElementSizeBytes;
 }
 
 /// <summary>
@@ -42,15 +47,15 @@ public sealed record ReductionTileWorkload(
     Func<IntExpr[][], Solver, TileWorkloadContext, IntExpr> GetWork,
     Func<IntExpr[][], Solver, TileWorkloadContext, IntExpr> GetStateBytes) : TileWorkload, IReductionStateTileWorkload
 {
-    public IntExpr GetReductionStateBytes(IntExpr[][] bufferShapes, Solver solver, TileWorkloadContext context, TargetMachineModel machine)
-        => GetStateBytes(bufferShapes, solver, context);
+    public IReadOnlyList<TileReductionState> GetReductionStates(IntExpr[][] bufferShapes, Solver solver, TileWorkloadContext context)
+        => [new("reduction", GetStateBytes(bufferShapes, solver, context), 1)];
 }
 
 public sealed record MatrixTileWorkload(
     Func<IntExpr[][], Solver, TileWorkloadContext, MatrixTileWorkloadShape> GetShape,
     int AccumulatorElementSizeBytes) : TileWorkload, IReductionStateTileWorkload
 {
-    public IntExpr GetReductionStateBytes(IntExpr[][] bufferShapes, Solver solver, TileWorkloadContext context, TargetMachineModel machine)
+    public IReadOnlyList<TileReductionState> GetReductionStates(IntExpr[][] bufferShapes, Solver solver, TileWorkloadContext context)
     {
         if (AccumulatorElementSizeBytes <= 0)
         {
@@ -58,31 +63,8 @@ public sealed record MatrixTileWorkload(
         }
 
         var shape = GetShape(bufferShapes, solver, context);
-        var fullBufferShapes = context.BufferShapes
-            .Select(bufferShape => bufferShape
-                .Select(extent => (IntExpr)solver.MakeIntConst(extent))
-                .ToArray())
-            .ToArray();
-        var fullShape = GetShape(fullBufferShapes, solver, context);
-        var fullM = fullShape.M.Var();
-        if (fullM.Min() != fullM.Max())
-        {
-            throw new InvalidOperationException($"Full matrix M extent for {context.Op.GetType().Name} must be constant.");
-        }
-
-        var useGemv = fullM.Max() == 1;
-        var accumulatorM = useGemv
-            ? shape.M
-            : AlignUp(shape.M, machine.Execution.BackendPrivateMatrixAccumulatorMinM, solver);
-        var minimumAccumulatorN = useGemv
-            ? machine.Execution.BackendPrivateGemvAccumulatorMinN
-            : machine.Execution.BackendPrivateMatrixAccumulatorMinN;
-        var accumulatorN = AlignUp(shape.N, minimumAccumulatorN, solver);
-        return accumulatorM * accumulatorN * shape.Multiplicity * AccumulatorElementSizeBytes;
+        return [new("matrix_accumulator", shape.M * shape.N * shape.Multiplicity, AccumulatorElementSizeBytes)];
     }
-
-    private static IntExpr AlignUp(IntExpr value, int alignment, Solver solver)
-        => solver.MakeDiv(value + (alignment - 1), alignment) * alignment;
 }
 
 public sealed record MatrixTileWorkloadShape(

@@ -412,6 +412,72 @@ public sealed class UnitTestInlineSingleCallPrimFunctionsPass : TestClassBase
         Assert.Same(actual, load.Arguments[0]);
     }
 
+    [Fact]
+    public async Task TestSpecializePrimFunctionBufferLayoutUpdatesFormalDescriptor()
+    {
+        var tensorType = new TensorType(DataTypes.Float32, new[] { 4 });
+        var formal = new BufferVar("formal", tensorType, BufferVarRole.Input, MemoryLocation.Input);
+        var formalBuffer = T.AttachBuffer(formal, tensorType, MemoryLocation.Input, 0, out _, "formal_buffer");
+        var callee = new PrimFunction(
+            "callee",
+            ModuleKind,
+            new Sequential(new Call(new LoadT(), formalBuffer, formalBuffer)),
+            new IVar[] { formal });
+        var actual = MakeStridedBuffer("actual", stride: 3);
+        var caller = new PrimFunction(
+            "caller",
+            ModuleKind,
+            new Sequential(new Call(callee, actual)),
+            System.Array.Empty<IVar>());
+        var module = new IRModule(caller);
+        module.Add(callee);
+
+        var specializedModule = await new SpecializePrimFunctionBufferLayoutsPass().RunAsync(module, new());
+
+        var specializedCallee = specializedModule.Functions.OfType<PrimFunction>().Single(function => function.Name == "callee");
+        var specializedParameter = Assert.IsType<BufferVar>(Assert.Single(specializedCallee.Parameters.ToArray()));
+        Assert.Equal(BufferLayoutKind.ExactStrided, specializedParameter.LayoutAnnotation.Kind);
+        Assert.Equal(3L, specializedParameter.LayoutAnnotation.Strides[0].FixedValue);
+        var specializedBuffer = ExprCollector.Collect(specializedCallee.Body)
+            .OfType<Buffer>()
+            .Single(buffer => ReferenceEquals(buffer.MemSpan.Buffer.Start, specializedParameter));
+        Assert.Equal(3L, specializedBuffer.Strides[0].FixedValue);
+        Assert.Equal(40L, specializedBuffer.MemSpan.Size.FixedValue);
+    }
+
+    [Fact]
+    public async Task TestSpecializePrimFunctionBufferLayoutCreatesDistinctVariants()
+    {
+        var tensorType = new TensorType(DataTypes.Float32, new[] { 4 });
+        var formal = new BufferVar("formal", tensorType, BufferVarRole.Input, MemoryLocation.Input);
+        var callee = MakeLoadFunction("callee", formal);
+        var caller = new PrimFunction(
+            "caller",
+            ModuleKind,
+            new Sequential(
+                new Call(callee, MakeStridedBuffer("actual_1", stride: 1)),
+                new Call(callee, MakeStridedBuffer("actual_2", stride: 2))),
+            System.Array.Empty<IVar>());
+        var module = new IRModule(caller);
+        module.Add(callee);
+
+        var specializedModule = await new SpecializePrimFunctionBufferLayoutsPass().RunAsync(module, new());
+
+        var variants = specializedModule.Functions.OfType<PrimFunction>()
+            .Where(function => function.Name.StartsWith("callee", System.StringComparison.Ordinal))
+            .OrderBy(function => function.Name, System.StringComparer.Ordinal)
+            .ToArray();
+        Assert.Equal(2, variants.Length);
+        Assert.Equal(new long[] { 1, 2 }, variants
+            .Select(function => Assert.IsType<BufferVar>(function.Parameters[0]).LayoutAnnotation.Strides[0].FixedValue)
+            .OrderBy(stride => stride)
+            .ToArray());
+        var calls = GetExecutableStatements(Assert.IsType<PrimFunction>(specializedModule.Entry).Body)
+            .Select(Assert.IsType<Call>)
+            .ToArray();
+        Assert.NotSame(calls[0].Target, calls[1].Target);
+    }
+
     private static PrimFunction MakeLoadFunction(string name, BufferVar formal)
         => new(
             name,

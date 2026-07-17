@@ -25,7 +25,13 @@ public record class NodeWithBuffer(TileNode Node, BufferIdentity Id)
         : TensorUtilities.GetProduct(Id.Node.BufferShapes[Id.Index].ToArray()) * Id.Node.GetBufferElemSize(Id.Index);
 }
 
-public record NodeWithBufferInfo(long Size, TileLifetime Lifetime, long[] Shape, long[] Strides)
+public record NodeWithBufferInfo(
+    long Size,
+    TileLifetime Lifetime,
+    long[] Shape,
+    long[] Strides,
+    int AlignmentBytes,
+    TargetStorageEncodingSelection? StorageEncoding)
 {
     public ulong Offset { get; set; } = ulong.MaxValue;
 }
@@ -76,8 +82,9 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
 {
     private readonly List<TileRootParameterBinding> _rootParameterBindings;
     private readonly Dictionary<ITileable, Dictionary<BufferIdentity, ViewInfo>> _viewInfoMemo;
+    private readonly IReadOnlyDictionary<int, BlockMicroKernelSelection> _microKernelSelections;
 
-    public TreeSolveResult(BufferGraph primBufferGraph, long objectiveValue, Dictionary<int, Dictionary<NodeWithBuffer, NodeWithBufferInfo>> levelNodeBufferInfos, Dictionary<OpNode, OpNodeInfo<long>> primitiveBufferInfo, Dictionary<TileNode, TileNodeInfo<long>> levelBufferInfos, Dictionary<ITileable, DomainInfo<long>> domainInfos, IReadOnlyList<TileMaterialization> materializations, INTTTargetOptions targetOptions, string moduleKind)
+    public TreeSolveResult(BufferGraph primBufferGraph, long objectiveValue, Dictionary<int, Dictionary<NodeWithBuffer, NodeWithBufferInfo>> levelNodeBufferInfos, Dictionary<OpNode, OpNodeInfo<long>> primitiveBufferInfo, Dictionary<TileNode, TileNodeInfo<long>> levelBufferInfos, Dictionary<ITileable, DomainInfo<long>> domainInfos, IReadOnlyList<TileMaterialization> materializations, IReadOnlyDictionary<int, BlockMicroKernelSelection> microKernelSelections, INTTTargetOptions targetOptions, string moduleKind)
         : base(null!, primitiveBufferInfo, levelBufferInfos, domainInfos, targetOptions)
     {
         PrimBufferGraph = primBufferGraph;
@@ -120,6 +127,7 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
         ObjectiveValue = objectiveValue;
         LevelNodeBufferInfos = levelNodeBufferInfos;
         Materializations = materializations;
+        _microKernelSelections = microKernelSelections;
         ModuleKind = moduleKind;
         _viewInfoMemo = new();
     }
@@ -605,6 +613,18 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
             CloneUnmutated = false,
         };
         var nestBody = bodyCloner.Clone(value.Grid.Body, default);
+        if (_microKernelSelections.TryGetValue(value.Wrapped.RegionOpId, out var microKernel))
+        {
+            var annotator = new BlockMicroKernelAnnotator(value.Op, microKernel);
+            annotator.Visit(nestBody);
+            if (annotator.MatchCount != 1)
+            {
+                throw new InvalidOperationException(
+                    $"Expected one semantic call for block microkernel Op{value.Wrapped.RegionOpId} " +
+                    $"({value.Op.GetType().Name}), found {annotator.MatchCount}.");
+            }
+        }
+
         parentbuilder.Body(nestBody);
         return default;
     }
@@ -636,7 +656,7 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
                 {
                     var x = model.NewFixedSizeIntervalVar(info.Lifetime.FirstPhase, info.Lifetime.PhaseCount, $"x{count}");
                     var ystart = model.NewIntVar(0, memorySpace.MaxAllocationBytesPerScope - info.Size, $"ystart{count}");
-                    var align = key.Id.Node.GetBufferElemSize(key.Id.Index);
+                    var align = info.AlignmentBytes;
                     if (ModuleKind == "xpu")
                     {
                         align = 128;
@@ -909,13 +929,20 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
             var tensorType = GetBufferTensorType(expr);
             tensorType = new TensorType(tensorType.DType, shape); // according to subtensor shape.
             var info = LevelNodeBufferInfos[storeLevel][new NodeWithBuffer(tileNode, bid)];
-            var alignment = tensorType.DType.SizeInBytes;
+            var alignment = info.AlignmentBytes;
             var strides = info.Strides.Select(i => (Dimension)i).ToArray(); // using fixed strides.
             var binding = TargetOptions.TargetMachineModel.TilingMemorySpaces[storeLevel].TIRBinding
                 ?? throw new InvalidOperationException($"Target tiling memory level {storeLevel} has no TIR binding.");
             var physicalBuffer = new PhysicalBuffer(alignment, Tensor.FromPointer(info.Offset, tensorType.DType), info.Size, binding.Location, binding.Hierarchy);
             var bufferName = TileSemanticNaming.GetStorageBufferName(bid, tileNode, storeLevel, TargetOptions.TargetMachineModel);
-            return new TIR.Buffer(bufferName, tensorType.DType, new MemSpan(physicalBuffer), shape.Dimensions.ToArray(), strides, distributedType);
+            return new TIR.Buffer(
+                bufferName,
+                tensorType.DType,
+                new MemSpan(physicalBuffer),
+                shape.Dimensions.ToArray(),
+                strides,
+                distributedType,
+                info.StorageEncoding);
         }
 
         Expr GetViewExpr(ViewInfo? parentInfo, Expr buffer, RankedShape forwardOffsets, RankedShape relatedOffsets, RankedShape shape, bool ownsStorage)
@@ -942,7 +969,7 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
 
         var bufferOffsets = map.Apply(forwardOffsets, Enumerable.Repeat<Dimension>(0L, forwardOffsets.Length).ToArray()).Select(i => i.Start).ToArray();
         var offsets = new RankedShape(bufferOffsets);
-        if (TryGetParentViewInfo(node, bid, out var parentViewInfo))
+        if (TryGetCurrentOrParentViewInfo(node, bid, out var parentViewInfo))
         {
             var viewOffset = new Dimension[bufferOffsets.Length];
             for (int j = 0; j < viewOffset.Length; j++)
@@ -1108,13 +1135,20 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
             var tensorType = GetBufferTensorType(expr);
             tensorType = new TensorType(tensorType.DType, shape);
             var info = LevelNodeBufferInfos[storeLevel][new NodeWithBuffer(node, bid)];
-            var alignment = tensorType.DType.SizeInBytes;
+            var alignment = info.AlignmentBytes;
             var strides = info.Strides.Select(i => (Dimension)i).ToArray();
             var binding = TargetOptions.TargetMachineModel.TilingMemorySpaces[storeLevel].TIRBinding
                 ?? throw new InvalidOperationException($"Target tiling memory level {storeLevel} has no TIR binding.");
             var physicalBuffer = new PhysicalBuffer(alignment, Tensor.FromPointer(info.Offset, tensorType.DType), info.Size, binding.Location, binding.Hierarchy);
             var bufferName = TileSemanticNaming.GetStorageBufferName(bid, node, storeLevel, TargetOptions.TargetMachineModel);
-            return new TIR.Buffer(bufferName, tensorType.DType, new MemSpan(physicalBuffer), shape.Dimensions.ToArray(), strides, distributedType);
+            return new TIR.Buffer(
+                bufferName,
+                tensorType.DType,
+                new MemSpan(physicalBuffer),
+                shape.Dimensions.ToArray(),
+                strides,
+                distributedType,
+                info.StorageEncoding);
         }
 
         var bufferOffsets = map.Apply(forwardOffsets, Enumerable.Repeat<Dimension>(0L, forwardOffsets.Length).ToArray()).Select(i => i.Start).ToArray();
@@ -1338,6 +1372,13 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
             }
 
             states.Add(bid, 1);
+            if (TileNodeMemo[node].DefUseMap.TryGetByValue(bid, out var definition) &&
+                definition != bid &&
+                bufferInfoMap.ContainsKey(definition))
+            {
+                Visit(definition);
+            }
+
             if (TryGetAliasReadBid(bid, out var sourceRead))
             {
                 var sourceStorage = GetCurrentStorageBid(node, sourceRead);
@@ -1378,5 +1419,30 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
 
     public sealed record Context(ISequentialBuilder<Expr> ParentBuilder, Dimension[] ForwardOffsets, Dimension[] ForwardExtents)
     {
+    }
+
+    private sealed class BlockMicroKernelAnnotator : ExprWalker
+    {
+        private readonly Op _op;
+        private readonly BlockMicroKernelSelection _selection;
+
+        public BlockMicroKernelAnnotator(Op op, BlockMicroKernelSelection selection)
+        {
+            _op = op;
+            _selection = selection;
+        }
+
+        public int MatchCount { get; private set; }
+
+        protected override Unit VisitLeafCall(Call expr)
+        {
+            if (ReferenceEquals(expr.Target, _op))
+            {
+                expr.Metadata.BlockMicroKernel = _selection;
+                MatchCount++;
+            }
+
+            return default;
+        }
     }
 }

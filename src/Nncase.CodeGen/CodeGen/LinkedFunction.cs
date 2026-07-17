@@ -13,10 +13,21 @@ namespace Nncase.CodeGen;
 public class LinkedFunction : ILinkedFunction
 {
     public LinkedFunction(uint id, Callable sourceFunction, ulong textBegin, ulong textLength, IReadOnlyList<ILinkedSection> sections)
+        : this(
+            id,
+            ((CallableType)sourceFunction.CheckedType).Parameters.ToArray(),
+            ((CallableType)sourceFunction.CheckedType).ReturnType,
+            textBegin,
+            textLength,
+            sections)
+    {
+    }
+
+    public LinkedFunction(uint id, IReadOnlyList<IRType> parameterTypes, IRType returnType, ulong textBegin, ulong textLength, IReadOnlyList<ILinkedSection> sections)
     {
         Id = id;
-        ParameterTypes = ((CallableType)sourceFunction.CheckedType).Parameters.ToArray();
-        ReturnType = ((CallableType)sourceFunction.CheckedType).ReturnType;
+        ParameterTypes = parameterTypes;
+        ReturnType = returnType;
         TextBegin = textBegin;
         TextLength = textLength;
         Sections = sections;

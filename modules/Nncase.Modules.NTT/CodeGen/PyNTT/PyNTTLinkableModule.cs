@@ -2333,7 +2333,7 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
             : $"from .generated_kernels import {kernel.Name}";
         var launchStatement = $"        {kernel.Name}[grid]({tensorArgs}, numel, block_size{kwargs})";
         var kernelArgs = string.IsNullOrWhiteSpace(tensorArgs) ? "(numel,)" : $"({tensorArgs}, numel,)";
-        var tuningSelectionStatement = $"        block_size = select_and_validate_triton_tuning_parameter({PythonString(kernel.Name)}, \"block_size\", {blockSizeCandidates}, source={PythonString(blockSize.Source)}, kernel={kernel.Name}, kernel_args={kernelArgs}, grid_for_candidate={gridForCandidate}, expected_num_warps={kernel.Launch.NumWarps ?? throw new InvalidOperationException($"Generated PyNTT kernel {kernel.Name} must declare a fixed num_warps.")}, shared_memory_capacity_bytes={PythonValue(kernel.Attrs["shared_memory_capacity_bytes"])}, forbid_spills={PythonValue(kernel.Attrs["forbid_spills"])}{kwargs})";
+        var tuningSelectionStatement = $"        block_size = select_and_validate_triton_tuning_parameter({PythonString(kernel.Name)}, \"block_size\", {blockSizeCandidates}, source={PythonString(blockSize.Source)}, kernel={kernel.Name}, kernel_args={kernelArgs}, grid_for_candidate={gridForCandidate}, expected_num_warps={kernel.Launch.NumWarps ?? throw new InvalidOperationException($"Generated PyNTT kernel {kernel.Name} must declare a fixed num_warps.")}, registers_per_thread_limit={PythonValue(kernel.Attrs["registers_per_thread_limit"])}, shared_memory_capacity_bytes={PythonValue(kernel.Attrs["shared_memory_capacity_bytes"])}, forbid_spills={PythonValue(kernel.Attrs["forbid_spills"])}{kwargs})";
         return $"""
                     {importStatement}
                     numel = {numel}

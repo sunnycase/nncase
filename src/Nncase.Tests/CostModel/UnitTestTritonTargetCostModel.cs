@@ -5,8 +5,11 @@ using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Linq;
+using System.Threading.Tasks;
 using Nncase.CostModel;
 using Nncase.IR;
+using Nncase.Passes;
+using Nncase.Schedule;
 using Nncase.Targets;
 using Nncase.Tests.TestFixture;
 using Nncase.TIR;
@@ -29,7 +32,7 @@ public sealed class UnitTestTritonTargetCostModel : TestClassBase
 
         var cost = CompilerServices.EvaluateCost(matmul, CompileOptions);
 
-        Assert.Equal((UInt128)4_096, cost[CostFactorNames.CPUCycles]);
+        Assert.Equal((UInt128)163_840, cost[CostFactorNames.CPUCycles]);
     }
 
     [Fact]
@@ -43,7 +46,7 @@ public sealed class UnitTestTritonTargetCostModel : TestClassBase
             DataTypes.BFloat16);
 
         Assert.True(costModel.TryGetMatMulCost(query, out var cost));
-        Assert.Equal((UInt128)8_192, cost[CostFactorNames.CPUCycles]);
+        Assert.Equal((UInt128)524_288, cost[CostFactorNames.CPUCycles]);
     }
 
     [Fact]
@@ -59,6 +62,30 @@ public sealed class UnitTestTritonTargetCostModel : TestClassBase
 
         Assert.True(costModel.TryGetMatMulCost(query, out var cost));
         Assert.Equal((UInt128)16, cost[CostFactorNames.CPUCycles]);
+    }
+
+    [Fact]
+    public async Task TestAutoVectorizeExtractsVectorizedMatMul()
+    {
+        CompileOptions.TargetOptions = CreateOptions(CreateGpuMachine(rootBytesPerCycle: 174));
+        var lhs = new Var("lhs", new TensorType(DataTypes.BFloat16, new RankedShape(1, 3072)));
+        var rhs = new Var("rhs", new TensorType(DataTypes.BFloat16, new RankedShape(3072, 1024)));
+        var function = new Function("main", IR.F.Tensors.MatMul(lhs, rhs), lhs, rhs);
+        Assert.True(function.InferenceType());
+
+        var module = new IRModule(function);
+        var passManager = CompileSession.CreatePassManager("AutoVectorizeMatMulCost");
+        passManager.AddWithName<EGraphRulesPass>("AutoVectorize").Configure(pass =>
+        {
+            pass.Add<Nncase.Passes.Rules.NTT.VectorizeMatMul>(1, 16);
+        });
+
+        await passManager.RunAsync(module);
+
+        var post = Assert.IsType<Function>(module.Entry);
+        Assert.Contains(
+            ExprCollector.Collect(post.Body).OfType<Call>(),
+            call => call.Target is Nncase.IR.NTT.VectorizedMatMul);
     }
 
     [Fact]
@@ -149,15 +176,17 @@ public sealed class UnitTestTritonTargetCostModel : TestClassBase
         Assert.Equal(NTTTargetMachineCatalog.Rtx5060Ti16Gb, rtx.Id);
         Assert.Equal(36, rtx.Execution.ComputeUnitCount);
         Assert.Equal(8, rtx.Execution.WorkersPerBlock);
-        Assert.Equal(8 * 1024, rtx.Execution.BackendPrivateAccumulatorCapacityBytes);
-        Assert.Equal(16, rtx.Execution.BackendPrivateMatrixAccumulatorMinM);
-        Assert.Equal(16, rtx.Execution.BackendPrivateMatrixAccumulatorMinN);
-        Assert.Equal(32, rtx.Execution.BackendPrivateGemvAccumulatorMinN);
+        var rtxRegisters = rtx.GetPrivateResource(NTTTargetMachineCatalog.GpuRegisterFile);
+        Assert.Equal(TargetPrivateResourceUnit.Register32, rtxRegisters.Unit);
+        Assert.Equal(255L * 8 * 32, rtxRegisters.CapacityUnits);
+        var rtxBackendShared = rtx.GetPrivateResource(NTTTargetMachineCatalog.GpuBackendSharedMemory);
+        Assert.Equal(TargetPrivateResourceUnit.Bytes, rtxBackendShared.Unit);
+        Assert.Equal(101_376, rtxBackendShared.CapacityUnits);
         Assert.Equal(
             [MemoryLocation.Shared, MemoryLocation.BlockLocalData],
             rtx.TilingMemorySpaces.Select(space => space.TIRBinding!.Value.Location).ToArray());
         var rtxShared = rtx.TilingMemorySpaces.Single(space => space.TIRBinding?.Location == MemoryLocation.Shared);
-        Assert.Equal(32 * 1024, rtxShared.MaxAllocationBytesPerScope);
+        Assert.Equal(64 * 1024, rtxShared.MaxAllocationBytesPerScope);
         Assert.Equal(101_376, rtx.GetMemoryResource(rtxShared).CapacityBytes);
         Assert.Equal(
             16L * 1024 * 1024 * 1024,
@@ -169,14 +198,208 @@ public sealed class UnitTestTritonTargetCostModel : TestClassBase
         Assert.False(rtx.RequiresExplicitTransfer(1));
         Assert.DoesNotContain(rtx.Compute.MatrixPrimitives, primitive => primitive.Name == "wgmma" && primitive.IsSupported);
         Assert.Equal(NTTTargetMachineCatalog.H800Sxm80Gb, h800.Id);
-        Assert.Equal(8 * 1024, h800.Execution.BackendPrivateAccumulatorCapacityBytes);
+        Assert.Equal(255L * 8 * 32, h800.GetPrivateResource(NTTTargetMachineCatalog.GpuRegisterFile).CapacityUnits);
         var h800Shared = h800.TilingMemorySpaces.Single(space => space.TIRBinding?.Location == MemoryLocation.Shared);
-        Assert.Equal(64 * 1024, h800Shared.MaxAllocationBytesPerScope);
+        Assert.Equal(128 * 1024, h800Shared.MaxAllocationBytesPerScope);
         Assert.Equal(227 * 1024, h800.GetMemoryResource(h800Shared).CapacityBytes);
         Assert.Equal(
             80L * 1024 * 1024 * 1024,
             h800.GetMemoryResource(h800.GetMemorySpace(h800.RootMemorySpace)).CapacityBytes);
         Assert.Contains(h800.Compute.MatrixPrimitives, primitive => primitive.Name == "wgmma" && primitive.IsSupported);
+    }
+
+    [Fact]
+    public void TestTritonGemvMicroKernelCandidatesModelRegisterAndSharedState()
+    {
+        var solver = new Google.OrTools.ConstraintSolver.Solver("triton-gemv-microkernels");
+        var op = new Nncase.TIR.NTT.Matmul(
+            new IRArray<int>(),
+            new IRArray<int>(),
+            false,
+            true,
+            false,
+            null,
+            null);
+        var workload = new MatrixTileWorkload(
+            static (shapes, localSolver, _) => new(
+                shapes[2][0],
+                shapes[2][1],
+                shapes[0][1],
+                localSolver.MakeIntConst(1)),
+            DataTypes.Float32.SizeInBytes);
+        var fullShapes = new long[][]
+        {
+            [1, 1024],
+            [2048, 1024],
+            [1, 2048],
+        };
+        var context = new TileWorkloadContext(
+            op,
+            fullShapes.Select(shape => shape.ToImmutableArray()).ToImmutableArray(),
+            ImmutableArray.Create<DataType>(DataTypes.BFloat16, DataTypes.BFloat16, DataTypes.BFloat16));
+        var localShapes = new Google.OrTools.ConstraintSolver.IntExpr[][]
+        {
+            [solver.MakeIntConst(1), solver.MakeIntConst(4)],
+            [solver.MakeIntConst(2048), solver.MakeIntConst(4)],
+            [solver.MakeIntConst(1), solver.MakeIntConst(2048)],
+        };
+        var symbolicFullShapes = fullShapes
+            .Select(shape => shape.Select(extent => (Google.OrTools.ConstraintSolver.IntExpr)solver.MakeIntConst(extent)).ToArray())
+            .ToArray();
+
+        var candidates = new TritonBlockMicroKernelModel().GetCandidates(new(
+            op,
+            workload,
+            context,
+            localShapes,
+            symbolicFullShapes,
+            solver.MakeIntConst(100),
+            NTTTargetMachineCatalog.Resolve(NTTTargetMachineCatalog.Rtx5060Ti16Gb),
+            solver));
+
+        var register = Assert.Single(candidates, candidate => candidate.Variant == "register_simt_accumulator");
+        var shared = Assert.Single(candidates, candidate => candidate.Variant == "shared_simt_accumulator");
+        var registerMma = Assert.Single(candidates, candidate => candidate.Variant == "register_mma_accumulator");
+        var sharedMma = Assert.Single(candidates, candidate => candidate.Variant == "shared_mma_accumulator");
+        Assert.Equal(1, register.IsLegal.Var().Max());
+        Assert.Equal(1, shared.IsLegal.Var().Max());
+        Assert.Equal(0, registerMma.IsLegal.Var().Max());
+        Assert.Equal(0, sharedMma.IsLegal.Var().Max());
+        Assert.Contains(register.Resources, usage => usage.Resource == NTTTargetMachineCatalog.GpuRegisterFile);
+        Assert.Contains(shared.Resources, usage => usage.Resource == NTTTargetMachineCatalog.GpuBackendSharedMemory);
+        Assert.Equal(2048, shared.Parameters.Single(parameter => parameter.Name == "inner_n").Value.Var().Max());
+        Assert.Equal(2048 * DataTypes.Float32.SizeInBytes, shared.Resources.Single(usage => usage.Resource == NTTTargetMachineCatalog.GpuBackendSharedMemory).Units.Var().Max());
+
+        var mmaLocalShapes = new Google.OrTools.ConstraintSolver.IntExpr[][]
+        {
+            [solver.MakeIntConst(1), solver.MakeIntConst(128)],
+            [solver.MakeIntConst(128), solver.MakeIntConst(128)],
+            [solver.MakeIntConst(1), solver.MakeIntConst(128)],
+        };
+        var mmaCandidates = new TritonBlockMicroKernelModel().GetCandidates(new(
+            op,
+            workload,
+            context,
+            mmaLocalShapes,
+            symbolicFullShapes,
+            solver.MakeIntConst(100),
+            NTTTargetMachineCatalog.Resolve(NTTTargetMachineCatalog.Rtx5060Ti16Gb),
+            solver));
+        var legalRegisterMma = Assert.Single(mmaCandidates, candidate => candidate.Variant == "register_mma_accumulator");
+        var legalSharedMma = Assert.Single(mmaCandidates, candidate => candidate.Variant == "shared_mma_accumulator");
+        var legalSimt = Assert.Single(mmaCandidates, candidate => candidate.Variant == "shared_simt_accumulator");
+        Assert.Equal(1, legalRegisterMma.IsLegal.Var().Min());
+        Assert.Equal(1, legalSharedMma.IsLegal.Var().Min());
+        Assert.Equal(8, legalRegisterMma.Parameters.Single(parameter => parameter.Name == "inner_m").Value.Var().Min());
+        Assert.Equal(16, legalRegisterMma.Parameters.Single(parameter => parameter.Name == "mma_m").Value.Var().Min());
+        Assert.Equal(128, legalRegisterMma.Parameters.Single(parameter => parameter.Name == "inner_n").Value.Var().Min());
+        Assert.True(legalRegisterMma.EstimatedCycles.Var().Max() < legalSimt.EstimatedCycles.Var().Min());
+        Assert.DoesNotContain(
+            legalRegisterMma.Resources,
+            usage => usage.Resource == NTTTargetMachineCatalog.GpuBackendSharedMemory);
+        Assert.Equal(
+            512,
+            legalSharedMma.Resources.Single(usage => usage.Resource == NTTTargetMachineCatalog.GpuBackendSharedMemory).Units.Var().Max());
+        Assert.Equal(2, legalRegisterMma.BufferEncodingRequirements.Length);
+        Assert.All(
+            legalRegisterMma.BufferEncodingRequirements,
+            requirement =>
+            {
+                Assert.Equal("gpu.shared", requirement.MemorySpace.Value);
+                Assert.Equal(
+                    TritonTargetStorageEncodingModel.NvidiaMmaShared,
+                    Assert.Single(requirement.AcceptedEncodings));
+            });
+
+        var n32LocalShapes = new Google.OrTools.ConstraintSolver.IntExpr[][]
+        {
+            [solver.MakeIntConst(1), solver.MakeIntConst(128)],
+            [solver.MakeIntConst(32), solver.MakeIntConst(128)],
+            [solver.MakeIntConst(1), solver.MakeIntConst(32)],
+        };
+        var n32Candidates = new TritonBlockMicroKernelModel().GetCandidates(new(
+            op,
+            workload,
+            context,
+            n32LocalShapes,
+            symbolicFullShapes,
+            solver.MakeIntConst(100),
+            NTTTargetMachineCatalog.Resolve(NTTTargetMachineCatalog.Rtx5060Ti16Gb),
+            solver));
+        var n32Mma = Assert.Single(n32Candidates, candidate => candidate.Variant == "register_mma_accumulator");
+        Assert.Equal(1, n32Mma.IsLegal.Var().Min());
+        Assert.DoesNotContain(
+            n32Mma.Resources,
+            usage => usage.Resource == NTTTargetMachineCatalog.GpuBackendSharedMemory);
+
+        var n32LhsReads = n32Mma.MemoryAccesses.Single(access =>
+            access.BufferAccessIndex == 0 && access.Mode == MemoryAccessMode.Read).Bytes.Var().Max();
+        var n128LhsReads = legalRegisterMma.MemoryAccesses.Single(access =>
+            access.BufferAccessIndex == 0 && access.Mode == MemoryAccessMode.Read).Bytes.Var().Max();
+        var n32RhsReads = n32Mma.MemoryAccesses.Single(access =>
+            access.BufferAccessIndex == 1 && access.Mode == MemoryAccessMode.Read).Bytes.Var().Max();
+        var n128RhsReads = legalRegisterMma.MemoryAccesses.Single(access =>
+            access.BufferAccessIndex == 1 && access.Mode == MemoryAccessMode.Read).Bytes.Var().Max();
+        Assert.Equal(4 * n128LhsReads, n32LhsReads);
+        Assert.Equal(n128RhsReads, n32RhsReads);
+
+        var k256LocalShapes = new Google.OrTools.ConstraintSolver.IntExpr[][]
+        {
+            [solver.MakeIntConst(1), solver.MakeIntConst(256)],
+            [solver.MakeIntConst(128), solver.MakeIntConst(256)],
+            [solver.MakeIntConst(1), solver.MakeIntConst(128)],
+        };
+        var k256Candidates = new TritonBlockMicroKernelModel().GetCandidates(new(
+            op,
+            workload,
+            context,
+            k256LocalShapes,
+            symbolicFullShapes,
+            solver.MakeIntConst(100),
+            NTTTargetMachineCatalog.Resolve(NTTTargetMachineCatalog.Rtx5060Ti16Gb),
+            solver));
+        var k256Mma = Assert.Single(k256Candidates, candidate => candidate.Variant == "register_mma_accumulator");
+        var k128Registers = legalRegisterMma.Resources.Single(usage => usage.Resource == NTTTargetMachineCatalog.GpuRegisterFile).Units.Var().Max();
+        var k256Registers = k256Mma.Resources.Single(usage => usage.Resource == NTTTargetMachineCatalog.GpuRegisterFile).Units.Var().Max();
+        Assert.Equal(k128Registers, k256Registers);
+    }
+
+    [Fact]
+    public void TestTritonStorageEncodingModelExposesMmaSharedOnlyAtSharedLevel()
+    {
+        using var solver = new Google.OrTools.ConstraintSolver.Solver("storage_encoding");
+        var machine = NTTTargetMachineCatalog.Resolve(NTTTargetMachineCatalog.Rtx5060Ti16Gb);
+        var model = new TritonTargetStorageEncodingModel();
+        var shared = machine.TilingMemorySpaces.Single(space =>
+            machine.GetMemoryResource(space).Kind == TargetMemorySpaceKind.Shared);
+        var sharedCandidates = model.GetCandidates(new(
+            shared,
+            DataTypes.BFloat16,
+            [solver.MakeIntConst(16), solver.MakeIntConst(16)],
+            solver.MakeIntConst(512),
+            machine,
+            solver));
+
+        var mma = Assert.Single(
+            sharedCandidates,
+            candidate => candidate.Id == TritonTargetStorageEncodingModel.NvidiaMmaShared);
+        Assert.Equal(1, mma.IsLegal.Var().Min());
+        Assert.Equal(512, mma.PhysicalBytes.Var().Min());
+        Assert.Equal(16, mma.AlignmentBytes);
+        Assert.Contains(
+            sharedCandidates,
+            candidate => candidate.Id == TritonTargetStorageEncodingModel.SwizzledShared);
+
+        var blockGlobal = machine.TilingMemorySpaces.Single(space =>
+            machine.GetMemoryResource(space).Kind == TargetMemorySpaceKind.Global);
+        var globalCandidate = Assert.Single(model.GetCandidates(new(
+            blockGlobal,
+            DataTypes.BFloat16,
+            [solver.MakeIntConst(16), solver.MakeIntConst(16)],
+            solver.MakeIntConst(512),
+            machine,
+            solver)));
+        Assert.Equal(TargetStorageEncodingIds.Linear, globalCandidate.Id);
     }
 
     [Fact]
@@ -233,7 +456,7 @@ public sealed class UnitTestTritonTargetCostModel : TestClassBase
         var operandTypes = ImmutableArray.Create<DataType>(DataTypes.Float16, DataTypes.BFloat16, DataTypes.Float32, DataTypes.Int8);
         return new TargetMachineModel(
             "test-gpu",
-            new(BlockExecutionKind.PersistentGpuBlock, 128, 8, 32, 1.0, 128, 4, 8 * 1024, 16, 16, 32),
+            new(BlockExecutionKind.PersistentGpuBlock, 128, 8, 32, 1.0, 128, 4),
             new(
                 elementwiseElementsPerCycle,
                 simtFmaPerCycle,
@@ -241,6 +464,10 @@ public sealed class UnitTestTritonTargetCostModel : TestClassBase
                     new MatrixComputePrimitiveSpec("mma", 16, 8, 16, mmaInstructionsPerCycle, operandTypes),
                     new MatrixComputePrimitiveSpec("wgmma", 64, 8, 16, wgmmaInstructionsPerCycle, operandTypes))),
             new(25, gridSynchronizationCycles),
+            [
+                new(NTTTargetMachineCatalog.GpuRegisterFile, TargetPrivateResourceUnit.Register32, 255L * 8 * 32, 8 * 32),
+                new(NTTTargetMachineCatalog.GpuBackendSharedMemory, TargetPrivateResourceUnit.Bytes, 48 * 1024, 16, sharedResource),
+            ],
             [
                 new(sharedResource, TargetMemorySpaceKind.Shared, 48 * 1024, blockBytesPerCycle, blockBytesPerCycle, 20, 16),
                 new(globalResource, TargetMemorySpaceKind.Global, int.MaxValue, rootBytesPerCycle, rootBytesPerCycle, 300, 128),

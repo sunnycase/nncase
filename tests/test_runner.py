@@ -580,6 +580,18 @@ class TestRunner(Evaluator, Inference, metaclass=ABCMeta):
                         add_generation_prompt=True
                     )
                     data = self.tokenizer([text], return_tensors="np")
+                    sequence_length = generator_cfg[method].get('sequence_length')
+                    if sequence_length is not None:
+                        if sequence_length <= 0:
+                            raise ValueError(
+                                "text generator sequence_length must be positive")
+                        for key, value in data.items():
+                            if isinstance(value, np.ndarray) and value.ndim >= 2:
+                                data[key] = value[:, :sequence_length]
+                        if data.input_ids.shape[-1] != sequence_length:
+                            raise ValueError(
+                                f"tokenized prompt has {data.input_ids.shape[-1]} tokens, "
+                                f"shorter than requested sequence_length={sequence_length}")
                     if dtype == 'PagedAttentionKVCache':
                         data = input['scheduler'].schedule([0], [data.input_ids[0].shape[0]])
                 if not test_utils.in_ci():

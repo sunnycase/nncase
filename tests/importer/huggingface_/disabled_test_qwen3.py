@@ -24,11 +24,11 @@ def test_qwen3(request):
     cfg = f"""
     [compile_opt]
     dump_ir = true
-    shape_bucket_enable = true
-    shape_bucket_range_info = {{ "sequence_length"=[1, 128] }}
-    shape_bucket_segments_count = 5
-    shape_bucket_segments = {{ "sequence_length"=[1, 16, 32, 64, 128] }}
-    shape_bucket_fix_var_map = {{  }}
+    shape_bucket_enable = false
+    shape_bucket_range_info = {{ }}
+    shape_bucket_segments_count = 0
+    shape_bucket_segments = {{ }}
+    shape_bucket_fix_var_map = {{ "sequence_length"=1 }}
     
     [huggingface_options]
     output_logits = true
@@ -49,6 +49,7 @@ def test_qwen3(request):
 
     [generator.inputs.text]
     args = 'tests/importer/huggingface_/prompt.txt'
+    sequence_length = 1
 
     [generator.calibs]
     method = 'text'
@@ -57,6 +58,7 @@ def test_qwen3(request):
 
     [generator.calibs.text]
     args = 'tests/importer/huggingface_/prompt.txt'
+    sequence_length = 1
     """
     runner = HuggingfaceTestRunner(request.node.name, overwrite_configs=cfg)
 

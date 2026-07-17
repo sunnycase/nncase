@@ -3,6 +3,7 @@
 
 using System.Globalization;
 using System.Reactive;
+using System.Text.Json.Serialization;
 using Nncase.IR;
 using Nncase.IR.Distributed;
 using Nncase.IR.Shapes;
@@ -10,11 +11,103 @@ using Nncase.IR.Tensors;
 
 namespace Nncase.CodeGen.PyNTT;
 
-public sealed record PyNTTDimExpression(string PythonExpression, string TritonExpression, long? FixedValue = null, long? RangeMin = null, long? RangeMax = null)
+internal sealed class PyNTTDimEquivalence : IEquatable<PyNTTDimEquivalence>
 {
-    public static PyNTTDimExpression Zero { get; } = new("0", "0", 0);
+    private const int MaxAffineTerms = 16;
+    private readonly KeyValuePair<string, long>[] _terms;
 
-    public static PyNTTDimExpression One { get; } = new("1", "1", 1);
+    private PyNTTDimEquivalence(long constant, IEnumerable<KeyValuePair<string, long>> terms)
+    {
+        Constant = constant;
+        _terms = terms
+            .Where(term => term.Value != 0)
+            .OrderBy(term => term.Key, StringComparer.Ordinal)
+            .ToArray();
+    }
+
+    public long Constant { get; }
+
+    public int TermCount => _terms.Length;
+
+    public static PyNTTDimEquivalence FromConstant(long value) => new(value, []);
+
+    public static PyNTTDimEquivalence FromAtom(string atom)
+        => new(0, [new KeyValuePair<string, long>(atom, 1)]);
+
+    public static PyNTTDimEquivalence Add(PyNTTDimEquivalence lhs, PyNTTDimEquivalence rhs)
+        => Combine(lhs, rhs, 1);
+
+    public static PyNTTDimEquivalence Subtract(PyNTTDimEquivalence lhs, PyNTTDimEquivalence rhs)
+        => Combine(lhs, rhs, -1);
+
+    public static PyNTTDimEquivalence? TryAdd(PyNTTDimEquivalence lhs, PyNTTDimEquivalence rhs)
+        => lhs.TermCount + rhs.TermCount <= MaxAffineTerms ? Add(lhs, rhs) : null;
+
+    public static PyNTTDimEquivalence? TrySubtract(PyNTTDimEquivalence lhs, PyNTTDimEquivalence rhs)
+        => lhs.TermCount + rhs.TermCount <= MaxAffineTerms ? Subtract(lhs, rhs) : null;
+
+    public static PyNTTDimEquivalence Scale(PyNTTDimEquivalence value, long scale)
+        => new(
+            checked(value.Constant * scale),
+            value._terms.Select(term => new KeyValuePair<string, long>(term.Key, checked(term.Value * scale))));
+
+    public bool Equals(PyNTTDimEquivalence? other)
+        => other is not null &&
+            Constant == other.Constant &&
+            _terms.AsSpan().SequenceEqual(other._terms);
+
+    public override bool Equals(object? obj) => Equals(obj as PyNTTDimEquivalence);
+
+    public override int GetHashCode()
+    {
+        var hash = default(HashCode);
+        hash.Add(Constant);
+        foreach (var term in _terms)
+        {
+            hash.Add(term.Key, StringComparer.Ordinal);
+            hash.Add(term.Value);
+        }
+
+        return hash.ToHashCode();
+    }
+
+    private static PyNTTDimEquivalence Combine(
+        PyNTTDimEquivalence lhs,
+        PyNTTDimEquivalence rhs,
+        long rhsScale)
+    {
+        var terms = new Dictionary<string, long>(StringComparer.Ordinal);
+        AddTerms(lhs, 1);
+        AddTerms(rhs, rhsScale);
+        return new(checked(lhs.Constant + (rhs.Constant * rhsScale)), terms);
+
+        void AddTerms(PyNTTDimEquivalence value, long scale)
+        {
+            foreach (var term in value._terms)
+            {
+                terms.TryGetValue(term.Key, out var coefficient);
+                terms[term.Key] = checked(coefficient + (term.Value * scale));
+            }
+        }
+    }
+}
+
+public sealed record PyNTTDimExpression(
+    string PythonExpression,
+    string TritonExpression,
+    long? FixedValue = null,
+    long? RangeMin = null,
+    long? RangeMax = null)
+{
+    public static PyNTTDimExpression Zero { get; } = new("0", "0", 0)
+    {
+        Equivalence = PyNTTDimEquivalence.FromConstant(0),
+    };
+
+    public static PyNTTDimExpression One { get; } = new("1", "1", 1)
+    {
+        Equivalence = PyNTTDimEquivalence.FromConstant(1),
+    };
 
     public bool IsFixed => FixedValue.HasValue;
 
@@ -26,9 +119,35 @@ public sealed record PyNTTDimExpression(string PythonExpression, string TritonEx
 
     public long? MaxValue => FixedValue ?? RangeMax;
 
+    [JsonIgnore]
+    internal PyNTTDimEquivalence? Equivalence { get; init; }
+
     public object ToPythonLiteral() => FixedValue.HasValue ? FixedValue.Value : PythonExpression;
 
     public override string ToString() => TritonExpression;
+
+    internal bool IsEquivalentTo(PyNTTDimExpression other)
+    {
+        if (FixedValue.HasValue && other.FixedValue.HasValue)
+        {
+            return FixedValue.Value == other.FixedValue.Value;
+        }
+
+        if (Equivalence is { } equivalence &&
+            other.Equivalence is { } otherEquivalence &&
+            equivalence.Equals(otherEquivalence))
+        {
+            return true;
+        }
+
+        return PythonExpression == other.PythonExpression ||
+            TritonExpression == other.TritonExpression;
+    }
+
+    internal PyNTTDimExpression EnsureEquivalence()
+        => Equivalence is null
+            ? this with { Equivalence = PyNTTDimEquivalence.FromAtom(TritonExpression) }
+            : this;
 }
 
 internal sealed class PyNTTDimExpressionEmitter : ExprFunctor<PyNTTDimExpression, Unit>
@@ -52,14 +171,15 @@ internal sealed class PyNTTDimExpressionEmitter : ExprFunctor<PyNTTDimExpression
 
     public PyNTTDimExpression Emit(Dimension dimension)
     {
-        var expression = Visit(dimension);
+        var expression = Visit(dimension).EnsureEquivalence();
         return WithRangeFromMetadata(expression, dimension);
     }
 
     protected override PyNTTDimExpression VisitDimAbs(DimAbs expr)
     {
         var operand = Visit(expr.Operand);
-        return new($"abs({operand.PythonExpression})", $"tl.abs({operand.TritonExpression})");
+        return new PyNTTDimExpression($"abs({operand.PythonExpression})", $"tl.abs({operand.TritonExpression})")
+            .EnsureEquivalence();
     }
 
     protected override PyNTTDimExpression VisitDimClamp(DimClamp expr)
@@ -79,16 +199,14 @@ internal sealed class PyNTTDimExpressionEmitter : ExprFunctor<PyNTTDimExpression
         var op = CompareOpToPython(expr.CompareOp);
         var predicate = $"{value.PythonExpression} {op} {expected.PythonExpression}";
         var tritonPredicate = $"{value.TritonExpression} {op} {expected.TritonExpression}";
-        return new(
+        return new PyNTTDimExpression(
             $"({trueValue.PythonExpression} if ({predicate}) else {falseValue.PythonExpression})",
-            $"tl.where({tritonPredicate}, {trueValue.TritonExpression}, {falseValue.TritonExpression})");
+            $"tl.where({tritonPredicate}, {trueValue.TritonExpression}, {falseValue.TritonExpression})")
+            .EnsureEquivalence();
     }
 
     protected override PyNTTDimExpression VisitDimConst(DimConst expr)
-    {
-        var value = expr.Value.ToString(CultureInfo.InvariantCulture);
-        return new(value, value, expr.Value);
-    }
+        => Const(expr.Value);
 
     protected override PyNTTDimExpression VisitDimFraction(DimFraction expr)
     {
@@ -98,13 +216,15 @@ internal sealed class PyNTTDimExpressionEmitter : ExprFunctor<PyNTTDimExpression
         {
             var expression = new PyNTTDimExpression(
                 $"(({numerator.PythonExpression}) // ({denominator.PythonExpression}))",
-                $"(({numerator.TritonExpression}) // ({denominator.TritonExpression}))");
+                $"(({numerator.TritonExpression}) // ({denominator.TritonExpression}))")
+                .EnsureEquivalence();
             return WithRangeFromMetadata(expression, expr);
         }
 
         var ceilExpression = new PyNTTDimExpression(
             $"(({numerator.PythonExpression} + {denominator.PythonExpression} - 1) // ({denominator.PythonExpression}))",
-            $"(({numerator.TritonExpression} + {denominator.TritonExpression} - 1) // ({denominator.TritonExpression}))");
+            $"(({numerator.TritonExpression} + {denominator.TritonExpression} - 1) // ({denominator.TritonExpression}))")
+            .EnsureEquivalence();
         return WithRangeFromMetadata(ceilExpression, expr);
     }
 
@@ -134,17 +254,19 @@ internal sealed class PyNTTDimExpressionEmitter : ExprFunctor<PyNTTDimExpression
     {
         var operand = Visit(expr.Operand);
         var extent = Visit(expr.Extent);
-        return new(
+        return new PyNTTDimExpression(
             $"(({operand.PythonExpression}) if ({operand.PythonExpression} >= 0) else ({operand.PythonExpression} + {extent.PythonExpression}))",
-            $"tl.where({operand.TritonExpression} >= 0, {operand.TritonExpression}, {operand.TritonExpression} + {extent.TritonExpression})");
+            $"tl.where({operand.TritonExpression} >= 0, {operand.TritonExpression}, {operand.TritonExpression} + {extent.TritonExpression})")
+            .EnsureEquivalence();
     }
 
     protected override PyNTTDimExpression VisitDimPower(DimPower expr)
     {
         var dim = Visit((Dimension)expr.Dim);
-        return new(
+        return new PyNTTDimExpression(
             $"(({dim.PythonExpression}) ** {expr.Power.ToString(CultureInfo.InvariantCulture)})",
-            $"(({dim.TritonExpression}) ** {expr.Power.ToString(CultureInfo.InvariantCulture)})");
+            $"(({dim.TritonExpression}) ** {expr.Power.ToString(CultureInfo.InvariantCulture)})")
+            .EnsureEquivalence();
     }
 
     protected override PyNTTDimExpression VisitDimProduct(DimProduct expr)
@@ -168,7 +290,8 @@ internal sealed class PyNTTDimExpressionEmitter : ExprFunctor<PyNTTDimExpression
         var denominator = Visit(expr.Denominator);
         var expression = new PyNTTDimExpression(
             $"(({numerator.PythonExpression}) % ({denominator.PythonExpression}))",
-            $"(({numerator.TritonExpression}) % ({denominator.TritonExpression}))");
+            $"(({numerator.TritonExpression}) % ({denominator.TritonExpression}))")
+            .EnsureEquivalence();
         return WithRangeFromMetadata(expression, expr);
     }
 
@@ -196,25 +319,33 @@ internal sealed class PyNTTDimExpressionEmitter : ExprFunctor<PyNTTDimExpression
         {
             if (resolved.FixedValue is { } fixedValue)
             {
-                var value = fixedValue.ToString(CultureInfo.InvariantCulture);
-                return new(value, value, fixedValue);
+                return Const(fixedValue);
             }
 
             return resolved with
             {
                 PythonExpression = formattedName,
                 TritonExpression = formattedName,
+                Equivalence = PyNTTDimEquivalence.FromAtom(formattedName),
             };
         }
 
-        return WithRangeFromMetadata(new(formattedName, formattedName), expr);
+        return WithRangeFromMetadata(
+            new PyNTTDimExpression(formattedName, formattedName)
+            {
+                Equivalence = PyNTTDimEquivalence.FromAtom(formattedName),
+            },
+            expr);
     }
 
     protected override PyNTTDimExpression VisitAsDim(AsDim expr)
         => EmitScalarExpression(expr.Dim);
 
     protected override PyNTTDimExpression VisitThreadIdDim(ThreadIdDim expr)
-        => new(_threadIdExpression, _threadIdExpression);
+        => new(_threadIdExpression, _threadIdExpression)
+        {
+            Equivalence = PyNTTDimEquivalence.FromAtom(_threadIdExpression),
+        };
 
     private PyNTTDimExpression EmitScalarExpression(BaseExpr expr)
     {
@@ -310,7 +441,10 @@ internal sealed class PyNTTDimExpressionEmitter : ExprFunctor<PyNTTDimExpression
         }
 
         var expression = $"(({dividend}) % {extent.ToString(CultureInfo.InvariantCulture)})";
-        return new(expression, expression);
+        return new(expression, expression)
+        {
+            Equivalence = PyNTTDimEquivalence.FromAtom(expression),
+        };
     }
 
     private static bool CanUseFullLocalDim(PyNTTDimExpression globalDim, PyNTTDimExpression localDim, int shardCount)
@@ -340,8 +474,7 @@ internal sealed class PyNTTDimExpressionEmitter : ExprFunctor<PyNTTDimExpression
         };
         if (effectiveParts.Length == 0)
         {
-            var text = identity.ToString(CultureInfo.InvariantCulture);
-            return new(text, text, identity);
+            return Const(identity);
         }
 
         if (effectiveParts.Length == 1)
@@ -389,18 +522,22 @@ internal sealed class PyNTTDimExpressionEmitter : ExprFunctor<PyNTTDimExpression
             rangeMax = intervalMax;
         }
 
-        return new(
+        var expression = new PyNTTDimExpression(
             $"({string.Join($" {op} ", effectiveParts.Select(part => part.PythonExpression))})",
             $"({string.Join($" {op} ", effectiveParts.Select(part => part.TritonExpression))})",
             fixedValue,
             rangeMin,
             rangeMax);
+        return WithBinaryEquivalence(expression, effectiveParts, op);
     }
 
     private static PyNTTDimExpression Const(long value)
     {
         var text = value.ToString(CultureInfo.InvariantCulture);
-        return new(text, text, value);
+        return new(text, text, value)
+        {
+            Equivalence = PyNTTDimEquivalence.FromConstant(value),
+        };
     }
 
     private static PyNTTDimExpression FormatScalarConst(long value) => Const(value);
@@ -465,12 +602,17 @@ internal sealed class PyNTTDimExpressionEmitter : ExprFunctor<PyNTTDimExpression
         long? rangeMax = lhs.MaxValue.HasValue && rhs.MinValue.HasValue
             ? checked(lhs.MaxValue.Value - rhs.MinValue.Value)
             : null;
-        return new(
+        var expression = new PyNTTDimExpression(
             $"(({lhs.PythonExpression}) - ({rhs.PythonExpression}))",
             $"(({lhs.TritonExpression}) - ({rhs.TritonExpression}))",
             null,
             rangeMin,
             rangeMax);
+        return lhs.Equivalence is { } lhsEquivalence && rhs.Equivalence is { } rhsEquivalence
+            ? PyNTTDimEquivalence.TrySubtract(lhsEquivalence, rhsEquivalence) is { } equivalence
+                ? expression with { Equivalence = equivalence }
+                : expression.EnsureEquivalence()
+            : expression.EnsureEquivalence();
     }
 
     private static PyNTTDimExpression Multiply(PyNTTDimExpression lhs, PyNTTDimExpression rhs)
@@ -490,12 +632,13 @@ internal sealed class PyNTTDimExpressionEmitter : ExprFunctor<PyNTTDimExpression
         long? rangeMax = numerator.MaxValue.HasValue && denominator.FixedValue is > 0
             ? checked((numerator.MaxValue.Value + denominator.FixedValue.Value - 1) / denominator.FixedValue.Value)
             : null;
-        return new(
+        return new PyNTTDimExpression(
             $"(({numerator.PythonExpression} + {denominator.PythonExpression} - 1) // ({denominator.PythonExpression}))",
             $"(({numerator.TritonExpression} + {denominator.TritonExpression} - 1) // ({denominator.TritonExpression}))",
             null,
             rangeMin,
-            rangeMax);
+            rangeMax)
+            .EnsureEquivalence();
     }
 
     private static PyNTTDimExpression Minimum(PyNTTDimExpression lhs, PyNTTDimExpression rhs)
@@ -509,12 +652,13 @@ internal sealed class PyNTTDimExpressionEmitter : ExprFunctor<PyNTTDimExpression
         var maxValues = new[] { lhs.MaxValue, rhs.MaxValue }.OfType<long>().ToArray();
         long? rangeMin = minValues.Length == 2 ? minValues.Min() : null;
         long? rangeMax = maxValues.Length > 0 ? maxValues.Min() : null;
-        return new(
+        return new PyNTTDimExpression(
             $"min({lhs.PythonExpression}, {rhs.PythonExpression})",
             $"tl.minimum({lhs.TritonExpression}, {rhs.TritonExpression})",
             null,
             rangeMin,
-            rangeMax);
+            rangeMax)
+            .EnsureEquivalence();
     }
 
     private static PyNTTDimExpression Maximum(PyNTTDimExpression lhs, PyNTTDimExpression rhs)
@@ -528,12 +672,56 @@ internal sealed class PyNTTDimExpressionEmitter : ExprFunctor<PyNTTDimExpression
         var maxValues = new[] { lhs.MaxValue, rhs.MaxValue }.OfType<long>().ToArray();
         long? rangeMin = minValues.Length > 0 ? minValues.Max() : null;
         long? rangeMax = maxValues.Length == 2 ? maxValues.Max() : null;
-        return new(
+        return new PyNTTDimExpression(
             $"max({lhs.PythonExpression}, {rhs.PythonExpression})",
             $"tl.maximum({lhs.TritonExpression}, {rhs.TritonExpression})",
             null,
             rangeMin,
-            rangeMax);
+            rangeMax)
+            .EnsureEquivalence();
+    }
+
+    private static PyNTTDimExpression WithBinaryEquivalence(
+        PyNTTDimExpression expression,
+        IReadOnlyList<PyNTTDimExpression> parts,
+        string op)
+    {
+        if (parts.Any(part => part.Equivalence is null))
+        {
+            return expression.EnsureEquivalence();
+        }
+
+        if (op == "+")
+        {
+            PyNTTDimEquivalence? equivalence = PyNTTDimEquivalence.FromConstant(0);
+            foreach (var part in parts)
+            {
+                equivalence = PyNTTDimEquivalence.TryAdd(equivalence!, part.Equivalence!);
+                if (equivalence is null)
+                {
+                    return expression.EnsureEquivalence();
+                }
+            }
+
+            return expression with { Equivalence = equivalence };
+        }
+
+        if (op == "*")
+        {
+            var dynamicParts = parts.Where(part => !part.FixedValue.HasValue).ToArray();
+            if (dynamicParts.Length <= 1)
+            {
+                var scale = parts
+                    .Where(part => part.FixedValue.HasValue)
+                    .Aggregate(1L, (value, part) => checked(value * part.FixedValue!.Value));
+                var equivalence = dynamicParts.Length == 0
+                    ? PyNTTDimEquivalence.FromConstant(scale)
+                    : PyNTTDimEquivalence.Scale(dynamicParts[0].Equivalence!, scale);
+                return expression with { Equivalence = equivalence };
+            }
+        }
+
+        return expression.EnsureEquivalence();
     }
 
     private static string CompareOpToPython(CompareOp compareOp) => compareOp switch

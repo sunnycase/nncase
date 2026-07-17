@@ -105,6 +105,71 @@ public readonly record struct TargetMemoryResourceId(string Value)
 }
 
 /// <summary>
+/// Stable identity of a backend-private block resource. These resources are
+/// visible to scheduling but never become TIR memory locations.
+/// </summary>
+public readonly record struct TargetPrivateResourceId(string Value)
+{
+    public override string ToString() => Value;
+}
+
+public enum TargetPrivateResourceUnit
+{
+    Bytes,
+    Register32,
+}
+
+/// <summary>
+/// A block-scoped resource owned by backend microkernel lowering.
+/// </summary>
+public sealed record TargetPrivateResourceSpec
+{
+    public TargetPrivateResourceSpec(
+        TargetPrivateResourceId id,
+        TargetPrivateResourceUnit unit,
+        long capacityUnits,
+        int allocationGranularityUnits = 1,
+        TargetMemoryResourceId? backingMemoryResource = null)
+    {
+        if (string.IsNullOrWhiteSpace(id.Value))
+        {
+            throw new ArgumentException("Target-private resource identity must not be empty.", nameof(id));
+        }
+
+        if (capacityUnits <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(capacityUnits), capacityUnits, "Target-private resource capacity must be positive.");
+        }
+
+        if (allocationGranularityUnits <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(allocationGranularityUnits), allocationGranularityUnits, "Target-private resource allocation granularity must be positive.");
+        }
+
+        if (backingMemoryResource is not null && unit != TargetPrivateResourceUnit.Bytes)
+        {
+            throw new ArgumentException("A target-private resource backed by a memory resource must use byte units.", nameof(unit));
+        }
+
+        Id = id;
+        Unit = unit;
+        CapacityUnits = capacityUnits;
+        AllocationGranularityUnits = allocationGranularityUnits;
+        BackingMemoryResource = backingMemoryResource;
+    }
+
+    public TargetPrivateResourceId Id { get; }
+
+    public TargetPrivateResourceUnit Unit { get; }
+
+    public long CapacityUnits { get; }
+
+    public int AllocationGranularityUnits { get; }
+
+    public TargetMemoryResourceId? BackingMemoryResource { get; }
+}
+
+/// <summary>
 /// Binds a physical target memory space to the existing TIR buffer representation.
 /// </summary>
 /// <param name="Location">TIR storage class.</param>
@@ -274,11 +339,7 @@ public sealed record BlockExecutionSpec(
     int WorkerWidth,
     double ClockRateGHz,
     int VectorWidthBits,
-    int MatMulNr,
-    long BackendPrivateAccumulatorCapacityBytes,
-    int BackendPrivateMatrixAccumulatorMinM,
-    int BackendPrivateMatrixAccumulatorMinN,
-    int BackendPrivateGemvAccumulatorMinN)
+    int MatMulNr)
 {
     public int ThreadsPerBlock => checked(WorkersPerBlock * WorkerWidth);
 }
@@ -329,6 +390,7 @@ public sealed record TargetSynchronizationSpec(long BlockCycles, long GridCycles
 public sealed class TargetMachineModel
 {
     private readonly ImmutableDictionary<TargetMemoryResourceId, TargetMemoryResourceSpec> _memoryResources;
+    private readonly ImmutableDictionary<TargetPrivateResourceId, TargetPrivateResourceSpec> _privateResources;
     private readonly ImmutableDictionary<TargetMemorySpaceId, TargetMemorySpaceSpec> _memorySpaces;
     private readonly ImmutableDictionary<MemoryLocation, TargetMemorySpaceId> _fixedBindings;
     private readonly ImmutableDictionary<(TargetMemorySpaceId Source, TargetMemorySpaceId Destination), TargetMemoryTransferSpec> _transfers;
@@ -338,6 +400,7 @@ public sealed class TargetMachineModel
         BlockExecutionSpec execution,
         BlockComputeSpec compute,
         TargetSynchronizationSpec synchronization,
+        IEnumerable<TargetPrivateResourceSpec> privateResources,
         IEnumerable<TargetMemoryResourceSpec> memoryResources,
         IEnumerable<TargetMemorySpaceSpec> memorySpaces,
         TargetMemorySpaceId rootMemorySpace,
@@ -357,21 +420,6 @@ public sealed class TargetMachineModel
         if (execution.VectorWidthBits <= 0 || execution.MatMulNr <= 0)
         {
             throw new ArgumentException("Target vector width and MatMul Nr must be positive.", nameof(execution));
-        }
-
-        if (execution.BackendPrivateAccumulatorCapacityBytes <= 0)
-        {
-            throw new ArgumentException("Target backend-private accumulator capacity must be positive.", nameof(execution));
-        }
-
-        if (execution.BackendPrivateMatrixAccumulatorMinM <= 0 ||
-            execution.BackendPrivateMatrixAccumulatorMinN <= 0 ||
-            execution.BackendPrivateGemvAccumulatorMinN <= 0 ||
-            !System.Numerics.BitOperations.IsPow2((uint)execution.BackendPrivateMatrixAccumulatorMinM) ||
-            !System.Numerics.BitOperations.IsPow2((uint)execution.BackendPrivateMatrixAccumulatorMinN) ||
-            !System.Numerics.BitOperations.IsPow2((uint)execution.BackendPrivateGemvAccumulatorMinN))
-        {
-            throw new ArgumentException("Target backend-private matrix accumulator minima must be positive powers of two.", nameof(execution));
         }
 
         if (!double.IsFinite(compute.ElementwiseElementsPerCycle) || compute.ElementwiseElementsPerCycle <= 0 ||
@@ -403,6 +451,21 @@ public sealed class TargetMachineModel
         Execution = execution;
         Compute = compute;
         Synchronization = synchronization;
+        var privateResourceArray = privateResources.ToImmutableArray();
+        if (privateResourceArray.IsDefaultOrEmpty)
+        {
+            throw new ArgumentException($"Target {id} must declare at least one target-private resource.", nameof(privateResources));
+        }
+
+        var duplicatePrivateResource = privateResourceArray
+            .GroupBy(resource => resource.Id)
+            .FirstOrDefault(group => group.Count() > 1);
+        if (duplicatePrivateResource is not null)
+        {
+            throw new ArgumentException($"Target {id} declares duplicate target-private resource {duplicatePrivateResource.Key}.", nameof(privateResources));
+        }
+
+        _privateResources = privateResourceArray.ToImmutableDictionary(resource => resource.Id);
         var memoryResourceArray = memoryResources.ToImmutableArray();
         if (memoryResourceArray.IsDefaultOrEmpty)
         {
@@ -418,6 +481,13 @@ public sealed class TargetMachineModel
         }
 
         _memoryResources = memoryResourceArray.ToImmutableDictionary(resource => resource.Id);
+        foreach (var privateResource in privateResourceArray)
+        {
+            if (privateResource.BackingMemoryResource is { } backing && !_memoryResources.ContainsKey(backing))
+            {
+                throw new ArgumentException($"Target-private resource {privateResource.Id} references undeclared memory resource {backing}.", nameof(privateResources));
+            }
+        }
 
         var memorySpaceArray = memorySpaces.ToImmutableArray();
         if (memorySpaceArray.IsDefaultOrEmpty)
@@ -572,12 +642,19 @@ public sealed class TargetMachineModel
 
     public IReadOnlyDictionary<TargetMemoryResourceId, TargetMemoryResourceSpec> MemoryResources => _memoryResources;
 
+    public IReadOnlyDictionary<TargetPrivateResourceId, TargetPrivateResourceSpec> PrivateResources => _privateResources;
+
     public IReadOnlyDictionary<TargetMemorySpaceId, TargetMemorySpaceSpec> MemorySpaces => _memorySpaces;
 
     public TargetMemoryResourceSpec GetMemoryResource(TargetMemoryResourceId id)
         => _memoryResources.TryGetValue(id, out var resource)
             ? resource
             : throw new KeyNotFoundException($"Target {Id} does not define memory resource {id}.");
+
+    public TargetPrivateResourceSpec GetPrivateResource(TargetPrivateResourceId id)
+        => _privateResources.TryGetValue(id, out var resource)
+            ? resource
+            : throw new KeyNotFoundException($"Target {Id} does not define target-private resource {id}.");
 
     public TargetMemoryResourceSpec GetMemoryResource(TargetMemorySpaceSpec space)
         => GetMemoryResource(space.ResourceId);

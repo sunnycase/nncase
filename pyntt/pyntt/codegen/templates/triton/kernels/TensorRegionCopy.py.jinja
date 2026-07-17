@@ -11,30 +11,14 @@ def {{ model["FunctionName"] }}({{ helper_parameters(model) }}):
     {{ local_name }} = {{ ptr(model, model_name) }}
 {% endif %}
 {% endfor %}
-{% for axis in range(ctx["rank"]) %}
-    copy_start{{ axis }} = tl.maximum({{ dim(model["SourceGlobalOffsets"][axis]) }}, {{ dim(model["DestinationGlobalOffsets"][axis]) }})
-    copy_end{{ axis }} = tl.minimum({{ dim(model["SourceGlobalOffsets"][axis]) }} + {{ dim(model["SourceShape"][axis]) }}, {{ dim(model["DestinationGlobalOffsets"][axis]) }} + {{ dim(model["DestinationShape"][axis]) }})
-    copy_dim{{ axis }} = tl.maximum(copy_end{{ axis }} - copy_start{{ axis }}, 0)
-    source_base{{ axis }} = copy_start{{ axis }} - {{ dim(model["SourceGlobalOffsets"][axis]) }}
-    destination_base{{ axis }} = copy_start{{ axis }} - {{ dim(model["DestinationGlobalOffsets"][axis]) }}
-{% endfor %}
+{% if ctx["zero_fill_descriptor"] %}
+    tl.store(tle.gpu.local_ptr({{ ctx["zero_fill_descriptor"] }}), 0.0)
+{% endif %}
 {% if ctx["plan"] is not none %}
 {% for expression in ctx["expanded_indices"] %}
     copy_desc_idx{{ loop.index0 }} = {{ expression }}
 {% endfor %}
     copy_linear = {{ ctx["linear_expression"] }}
-{% if ctx["lane_count"] == 1 %}
-    copy_tensor_linear = copy_linear
-    copy_vector_lane = copy_linear * 0
-{% else %}
-    copy_tensor_linear = copy_linear // {{ ctx["lane_count"] }}
-    copy_vector_lane = copy_linear % {{ ctx["lane_count"] }}
-{% endif %}
-    copy_remaining = copy_tensor_linear
-{% for axis in reverse_indices(ctx["plan"]["static_shape"]) %}
-    copy_idx{{ axis }} = copy_remaining % {{ ctx["plan"]["static_shape"][axis] }}
-    copy_remaining = copy_remaining // {{ ctx["plan"]["static_shape"][axis] }}
-{% endfor %}
     copy_global_offset = {{ ctx["global_offset"] }}
 {% if ctx["plan"]["local_model_name"] == "Destination" %}
     tle.gpu.copy({{ ctx["plan"]["global_name"] }} + copy_global_offset, {{ ctx["local_descriptor"] }}, {{ ctx["copy_shape"] }})
@@ -42,23 +26,16 @@ def {{ model["FunctionName"] }}({{ helper_parameters(model) }}):
     tle.gpu.copy({{ ctx["local_descriptor"] }}, {{ ctx["plan"]["global_name"] }} + copy_global_offset, {{ ctx["copy_shape"] }})
 {% endif %}
 {% else %}
-    for linear_start in tl.range(0, {{ ctx["total"] }}, block_size):
-        linear = linear_start + tl.arange(0, block_size)
-        mask = linear < {{ ctx["total"] }}
-{% if model["VectorLaneCount"] == 1 %}
-        tensor_linear = linear
-        vector_lane = linear * 0
-{% else %}
-        tensor_linear = linear // {{ model["VectorLaneCount"] }}
-        vector_lane = linear % {{ model["VectorLaneCount"] }}
-{% endif %}
-        remaining = tensor_linear
-{% for axis in reverse_indices(model["SourceShape"]) %}
-        idx{{ axis }} = remaining % copy_dim{{ axis }}
-        remaining = remaining // copy_dim{{ axis }}
+{% for axis in ctx["outer_axes"] %}
+{{ "    " * (loop.index0 + 1) }}for copy_idx{{ axis }} in tl.range(0, {{ dim(ctx["axes"][axis]["Extent"]) }}):
 {% endfor %}
-        source_offset = {{ ctx["source_offset"] }}
-        destination_offset = {{ ctx["destination_offset"] }}
-        value = tl.load({{ access_pointer(model, "Source", "source", "source_offset") }}, mask=mask)
-        tl.store({{ access_pointer(model, "Destination", "destination", "destination_offset") }}, value, mask=mask)
+{% set inner_indent = "    " * ((ctx["outer_axes"] | length) + 1) %}
+{% set body_indent = "    " * ((ctx["outer_axes"] | length) + 2) %}
+{{ inner_indent }}for copy_inner_start in tl.range(0, {{ dim(ctx["inner_extent"]) }}, block_size):
+{{ body_indent }}copy_idx{{ ctx["inner_axis"] }} = copy_inner_start + tl.arange(0, block_size)
+{{ body_indent }}mask = copy_idx{{ ctx["inner_axis"] }} < {{ dim(ctx["inner_extent"]) }}
+{{ body_indent }}source_offset = {{ ctx["source_offset"] }}
+{{ body_indent }}destination_offset = {{ ctx["destination_offset"] }}
+{{ body_indent }}value = tl.load({{ access_pointer(model, "Source", "source", "source_offset") }}, mask=mask)
+{{ body_indent }}tl.store({{ access_pointer(model, "Destination", "destination", "destination_offset") }}, value, mask=mask)
 {% endif %}

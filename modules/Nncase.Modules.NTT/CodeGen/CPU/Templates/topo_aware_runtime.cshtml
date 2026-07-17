@@ -53,10 +53,6 @@ enum reduce_kind {
 NTT_DEVICE constexpr ntt::array<size_t, @(hierarchy.Length)> Hierarchy = {@(string.Join(", ", hierarchy))};
 NTT_DEVICE auto src_ptr_tensor = nncase::ntt::make_tensor<void *>(nncase::ntt::fixed_shape_v<@(string.Join(",", hierarchy))>);
 NTT_DEVICE auto dest_ptr_tensor = nncase::ntt::make_tensor<void *>(nncase::ntt::fixed_shape_v<@(string.Join(",", hierarchy))>);
-
-template <size_t Level> NTT_DEVICE static std::byte *get_cache_address() {
-    return nullptr;
-}
 }
 
 /**

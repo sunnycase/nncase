@@ -414,9 +414,10 @@ public sealed class UnitTestFunctionBoundaryLayoutPropagation : TestClassBase
             input);
         Assert.True(main.InferenceType());
 
-        var module = new IRModule(callee);
-        module.Add(main);
-        module.Entry = main;
+        // Entry-first module order exercises the required callee-first TIR
+        // selection traversal.
+        var module = new IRModule(main);
+        module.Add(callee);
 
         var passManager = CompileSession.CreatePassManager("TIRSelectionCallerAllocatedTupleOutputs");
         passManager.Add<NTTTIRSelectionPass>();
@@ -454,9 +455,10 @@ public sealed class UnitTestFunctionBoundaryLayoutPropagation : TestClassBase
             input);
         Assert.True(main.InferenceType());
 
-        var module = new IRModule(callee);
-        module.Add(main);
-        module.Entry = main;
+        // The alias result must not become a second caller-allocated output
+        // before the callee ABI is known.
+        var module = new IRModule(main);
+        module.Add(callee);
 
         var passManager = CompileSession.CreatePassManager("TIRSelectionInputAliasTupleOutput");
         passManager.Add<NTTTIRSelectionPass>();

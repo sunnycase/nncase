@@ -366,13 +366,25 @@ public partial class ExprCloner<TContext>
                 return true;
             }
 
+            if (IsMutated(expr.Start, context))
+            {
+                return true;
+            }
+
+            if (IsMutated(expr.Size, context))
+            {
+                return true;
+            }
+
             return false;
         }
 
         if (CloneUnmutated || IsOperandsMutated())
         {
             return expr.With(
-                buffer: Clone(expr.Buffer, context)
+                buffer: Clone(expr.Buffer, context),
+                start: Clone(expr.Start, context),
+                size: Clone(expr.Size, context)
             );
         }
 

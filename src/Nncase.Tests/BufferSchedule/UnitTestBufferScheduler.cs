@@ -123,7 +123,6 @@ public sealed class UnitTestBufferScheduler : TestClassBase
         var fusion = fusionGetter();
         var vars = fusion.Parameters.AsValueEnumerable().Select(x => (Var)x).ToArray();
         var module = new IRModule(fusion);
-        module.Add(fusion);
 
         var inputs = vars.AsValueEnumerable().Select(v =>
         {
@@ -138,7 +137,9 @@ public sealed class UnitTestBufferScheduler : TestClassBase
     private async Task Compile(IRModule module)
     {
         var passManager = CompileSession.CreatePassManager("pmgr");
-        passManager.Add<NTTTIRSelectionPass>();
+        CompileSession.Target.RegisterAffineSelectionPass(passManager, CompileOptions);
+        passManager.AddWithName<AutoTilePass>("AutoTiling_cpu", Targets.CPUTarget.Kind);
+        CompileSession.Target.RegisterTIRSelectionPass(passManager, CompileOptions);
         passManager.Add<AddFunctionToModule>();
         passManager.Add<RemoveFunctionWrapperPass>();
 
@@ -147,7 +148,7 @@ public sealed class UnitTestBufferScheduler : TestClassBase
         {
             p.Add<Passes.Mutators.UnFoldBlock>();
             p.Add<Passes.Mutators.FlattenSequential>();
-            p.Add<Passes.Mutators.TailLoopStripping>();
+            p.Add<Passes.Mutators.TailLoopPeeling>();
             p.Add<Passes.Mutators.FoldConstCall>();
         });
 

@@ -189,15 +189,18 @@ internal sealed class PassManager : IPassManager
         public override async Task<IRModule> RunAsync(IRModule module)
         {
             bool replaced = false;
-            for (int i = 0; i < module.Functions.Count; i++)
+            var functionIndices = RequiresCalleeFirstTraversal()
+                ? GetCalleeFirstFunctionIndices(module)
+                : Enumerable.Range(0, module.Functions.Count).ToArray();
+            foreach (var functionIndex in functionIndices)
             {
-                var pre = module.Functions[i];
+                var pre = module.Functions[functionIndex];
                 var runner = new Runner(_compileSession, pre, Passes, StartPassIndex);
                 var post = await runner.RunAsync();
 
                 if (!object.ReferenceEquals(pre, post))
                 {
-                    module.Replace(i, post);
+                    module.Replace(functionIndex, post);
                     replaced = true;
                 }
             }
@@ -209,6 +212,82 @@ internal sealed class PassManager : IPassManager
 
             return module;
         }
+
+        private static int[] GetCalleeFirstFunctionIndices(IRModule module)
+        {
+            var functions = module.Functions.ToArray();
+            var indices = new Dictionary<BaseFunction, int>(ReferenceEqualityComparer.Instance);
+            for (var index = 0; index < functions.Length; index++)
+            {
+                indices.Add(functions[index], index);
+            }
+
+            var dependencies = new int[functions.Length][];
+            for (var index = 0; index < functions.Length; index++)
+            {
+                dependencies[index] = ExprCollector.Collect(functions[index])
+                    .OfType<BaseFunction>()
+                    .Select(UnwrapFunction)
+                    .Where(callee => !ReferenceEquals(callee, functions[index]))
+                    .Where(indices.ContainsKey)
+                    .Select(callee => indices[callee])
+                    .Distinct()
+                    .OrderBy(calleeIndex => calleeIndex)
+                    .ToArray();
+            }
+
+            var states = new byte[functions.Length];
+            var stack = new Stack<int>();
+            var order = new List<int>(functions.Length);
+            for (var index = 0; index < functions.Length; index++)
+            {
+                Visit(index);
+            }
+
+            return order.ToArray();
+
+            void Visit(int index)
+            {
+                if (states[index] == 2)
+                {
+                    return;
+                }
+
+                if (states[index] == 1)
+                {
+                    var cycle = stack
+                        .Reverse()
+                        .SkipWhile(stackIndex => stackIndex != index)
+                        .Append(index)
+                        .Select(stackIndex => functions[stackIndex].Name);
+                    throw new InvalidOperationException(
+                        $"Callee-first function traversal does not support recursive call graph: {string.Join(" -> ", cycle)}.");
+                }
+
+                states[index] = 1;
+                stack.Push(index);
+                foreach (var dependency in dependencies[index])
+                {
+                    Visit(dependency);
+                }
+
+                _ = stack.Pop();
+                states[index] = 2;
+                order.Add(index);
+            }
+
+            static BaseFunction UnwrapFunction(BaseFunction function)
+                => function switch
+                {
+                    FunctionWrapper wrapper => UnwrapFunction(wrapper.Target),
+                    PrimFunctionWrapper wrapper => wrapper.Target,
+                    _ => function,
+                };
+        }
+
+        private bool RequiresCalleeFirstTraversal()
+            => Passes.OfType<FunctionPass>().Any(
+                pass => pass.TraversalOrder == FunctionPassTraversalOrder.CalleeFirst);
 
         private class Runner
         {

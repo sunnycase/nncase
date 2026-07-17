@@ -4,7 +4,8 @@
 @using Nncase.IR
 @model Nncase.CodeGen.NTT.KernelMainModel
 @{
-  var inputCount = Model.PrimFunction.Parameters.Length;
+  var abi = Model.EntryAbi;
+  var inputCount = abi.Abi.Inputs.Count;
   var shardCount = TensorUtilities.GetProduct(Model.Options.Hierarchies[0]);
 }
 
@@ -19,7 +20,7 @@ extern "C" NTT_DEVICE void thread_main(const nncase::ntt::runtime::thread_inout_
   @{
     var names = new List<string>();
   }
-  @foreach(var (input,i) in Model.PrimFunction.Parameters.ToArray().Select((input,i)=>(input,i)))
+  @foreach(var (input,i) in abi.Abi.Inputs.Select((input,i)=>(input,i)))
   {
     var name = IRHelpers.GetIdentityName(input.Name);
     if (input is DimVar)
@@ -34,7 +35,7 @@ extern "C" NTT_DEVICE void thread_main(const nncase::ntt::runtime::thread_inout_
       var rank = shape.Rank;
       var sizeStr = $"input_descs[{i}].size / {input.CheckedDataType.SizeInBytes}";
       var elemType = input.CheckedDataType.ToC();
-      var elementQualifier = input is Nncase.TIR.BufferVar { Role: Nncase.TIR.BufferVarRole.Output or Nncase.TIR.BufferVarRole.InOut }
+      var elementQualifier = input is Nncase.TIR.BufferVar { Role: Nncase.TIR.BufferVarRole.InOut }
         ? string.Empty
         : "const ";
       var qualifiedElemType = elementQualifier + elemType;
@@ -72,6 +73,31 @@ extern "C" NTT_DEVICE void thread_main(const nncase::ntt::runtime::thread_inout_
   @:
   }
 
+  @foreach (var binding in abi.DynamicDimensions)
+  {
+  @:dim_t @Html.Raw(binding.Variable.Name) = input_descs[@binding.InputIndex].shape[@binding.DimensionIndex];
+  }
+
+  /* prepare caller-allocated outputs */
+  @foreach (var outputInfo in abi.Outputs)
+  {
+    var outputParameter = outputInfo.Parameter;
+    var name = IRHelpers.GetIdentityName(outputParameter.Name);
+    var shapeExpressions = outputParameter.CheckedShape.ToArray().Select(Model.RenderDimension).ToArray();
+    var shapeName = $"{name}_shape";
+    var elemType = outputParameter.CheckedDataType.ToC();
+    var strides = outputParameter.LayoutAnnotation.Kind switch
+    {
+      Nncase.TIR.BufferLayoutKind.ExactStrided => $"make_strides({string.Join(", ", outputParameter.LayoutAnnotation.Strides.Select(Model.RenderDimension))})",
+      Nncase.TIR.BufferLayoutKind.RuntimeStrided => $"default_strides({shapeName})",
+      _ => throw new NotSupportedException($"Unsupported NTT output layout {outputParameter.LayoutAnnotation.Kind} for {outputParameter.Name}."),
+    };
+    names.Add(name);
+  @:auto @Html.Raw(shapeName) = make_shape(@Html.Raw(string.Join(", ", shapeExpressions)));
+  @:auto @Html.Raw(name) = make_tensor_view_from_address((@Html.Raw(elemType) *)(output + @outputInfo.Offset.ToString()UL), @Html.Raw(shapeName), @Html.Raw(strides));
+  @:
+  }
+
   @if (Model.Options.Hierarchies.Length > 1) {
     throw new NotSupportedException($"not support multi form topology!");
   }
@@ -83,7 +109,7 @@ extern "C" NTT_DEVICE void thread_main(const nncase::ntt::runtime::thread_inout_
 int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv) {
   std::byte *inputs[@inputCount];
   size_t align = @(Model.Alignment);
-  @foreach(var (b,i) in Model.PrimFunction.Parameters.ToArray().OfType<Nncase.TIR.Buffer>().Select((b,i)=>(Model.GetInfo(b),i)))
+  @foreach(var (b,i) in abi.Abi.Inputs.OfType<Nncase.TIR.Buffer>().Select((b,i)=>(Model.GetInfo(b),i)))
   {
   @:inputs[@i] = (std::byte *)nncase::ntt::runtime::thread_alloc(sizeof(@Html.Raw(b.ElemType)) * @b.Size, align);
   }

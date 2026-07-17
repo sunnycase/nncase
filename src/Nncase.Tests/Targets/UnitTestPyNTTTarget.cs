@@ -18,6 +18,7 @@ using Nncase.IR.Shapes;
 using Nncase.Passes;
 using Nncase.Passes.Distributed;
 using Nncase.Passes.Transforms;
+using Nncase.Schedule;
 using Nncase.Targets;
 using Nncase.Tests.TestFixture;
 using Nncase.Utilities;
@@ -210,6 +211,34 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
 
         Assert.Equal(256, expression.MinValue);
         Assert.Equal(256, expression.MaxValue);
+    }
+
+    [Fact]
+    public void TestPyNTTEquivalentDimUsesAffineSemantics()
+    {
+        var baseOffset = new DimVar("base_offset");
+        var tailOffset = new DimVar("tail_offset");
+        var innerOffset = new DimVar("inner_offset");
+        var emitter = new Nncase.CodeGen.PyNTT.PyNTTDimExpressionEmitter();
+        var lhs = emitter.Emit((baseOffset + tailOffset) + innerOffset) with
+        {
+            PythonExpression = "((base_offset + tail_offset) + inner_offset)",
+            TritonExpression = "((base_offset + tail_offset) + inner_offset)",
+        };
+        var rhs = emitter.Emit(baseOffset + (tailOffset + innerOffset)) with
+        {
+            PythonExpression = "(base_offset + (tail_offset + inner_offset))",
+            TritonExpression = "(base_offset + (tail_offset + inner_offset))",
+        };
+        var different = emitter.Emit(baseOffset + tailOffset) with
+        {
+            PythonExpression = "(base_offset + tail_offset)",
+            TritonExpression = "(base_offset + tail_offset)",
+        };
+
+        Assert.True(lhs.IsEquivalentTo(rhs));
+        Assert.False(lhs.IsEquivalentTo(different));
+        Assert.DoesNotContain("Equivalence", JsonSerializer.Serialize(lhs), StringComparison.Ordinal);
     }
 
     [Fact]
@@ -425,6 +454,209 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
             "x = torch.arange(5 * 2 * 8, dtype=torch.float32, device='cuda').reshape(5, 2, 8)",
             "output = module(x)",
             "torch.testing.assert_close(output, x, rtol=0, atol=0)");
+    }
+
+    [Fact]
+    public void TestPyNTTSharedDescriptorLowersSelectedNvidiaMmaEncoding()
+    {
+        var tensorType = new TensorType(DataTypes.BFloat16, new[] { 16, 16 });
+        var input = new Var("x", tensorType);
+        var output = CreateOutputVar("output", tensorType);
+        var inputBuffer = TIR.T.AttachBuffer(input, tensorType, TIR.MemoryLocation.Input, 0, out _, "input_buffer");
+        var inputDataBuffer = CreateBuffer("input_data", DataTypes.BFloat16, TIR.MemoryLocation.Data, 0, [16, 16], [16, 1]);
+        var sharedBuffer = new TIR.Buffer(
+            "mma_shared_tile",
+            DataTypes.BFloat16,
+            new TIR.MemSpan(new TIR.PhysicalBuffer(2, 0, 512, TIR.MemoryLocation.Shared)),
+            [16, 16],
+            [16, 1],
+            null,
+            new TargetStorageEncodingSelection(
+                TritonTargetStorageEncodingModel.NvidiaMmaShared,
+                512,
+                16,
+                Array.Empty<KeyValuePair<string, long>>()));
+        var resultBuffer = CreateBuffer("result_data", DataTypes.BFloat16, TIR.MemoryLocation.Data, 512, [16, 16], [16, 1]);
+        var placement = new Placement(new[] { 1 }, "b", "b");
+        var sharedCopy = TIR.T.Let(
+            out var sharedTile,
+            IR.F.Buffer.AllocateBufferView(sharedBuffer, new RankedShape(0, 0)),
+            "mma_shared_tile")
+            .Body(
+                new TIR.Sequential(
+                    TIR.T.TileLoad(sharedTile, inputDataBuffer),
+                    TIR.T.TileStore(sharedTile, resultBuffer)))
+            .Build();
+        var main = new TIR.PrimFunction(
+            "main_prim",
+            PyNTTTarget.Kind,
+            new TIR.Sequential(
+                TIR.F.NTT.TensorLoad(inputDataBuffer, inputBuffer, new[] { SBP.B, SBP.B }, placement),
+                sharedCopy,
+                TIR.F.NTT.TensorStore(resultBuffer, output, new[] { SBP.B, SBP.B }, placement)),
+            new TIR.Return(new Expr[] { output }),
+            new IVar[] { input, output })
+        {
+            SchedResult =
+            {
+                DataUsage = 1024,
+                BlockLocalDataPoolSize = 512,
+            },
+        };
+
+        var outputDirectory = GeneratePyNTTModelDirectory("generated_nvidia_mma_shared_descriptor_model", main);
+        RenderGeneratedKernels(outputDirectory);
+        var generatedKernels = File.ReadAllText(Path.Join(outputDirectory, "generated_kernels.py"));
+        Assert.Contains(
+            "mma_shared_tile_shared_buffer_0 = tle.gpu.alloc([16, 16], dtype=tl.bfloat16",
+            generatedKernels,
+            StringComparison.Ordinal);
+        Assert.Contains("nv_mma_shared_layout=True", generatedKernels, StringComparison.Ordinal);
+        AssertGeneratedModelRuns(
+            outputDirectory,
+            "x = (torch.arange(16 * 16, dtype=torch.float32, device='cuda').reshape(16, 16) * 0.01).to(torch.bfloat16)",
+            "output = module(x)",
+            "torch.testing.assert_close(output, x, rtol=0, atol=0)");
+    }
+
+    [Fact]
+    public void TestPyNTTSharedDescriptorAppendsVectorLaneDimensions()
+    {
+        var vectorType = new VectorType(DataTypes.BFloat16, 4, 8);
+        var inputBuffer = CreateBuffer(
+            "packed_input",
+            vectorType,
+            TIR.MemoryLocation.Data,
+            0,
+            [1, 256],
+            [256, 1]);
+        var sharedBuffer = new TIR.Buffer(
+            "shared_packed_tile",
+            vectorType,
+            new TIR.MemSpan(new TIR.PhysicalBuffer(vectorType.SizeInBytes, 0, 32768, TIR.MemoryLocation.Shared)),
+            [1, 256],
+            [256, 1],
+            null);
+        var outputBuffer = CreateBuffer(
+            "packed_output",
+            vectorType,
+            TIR.MemoryLocation.Data,
+            16384,
+            [1, 256],
+            [256, 1]);
+        var publicOutput = CreateOutputVar("output", new TensorType(DataTypes.Float32, new[] { 1 }));
+        var publicOutputBuffer = CreateBuffer(
+            "public_output",
+            DataTypes.Float32,
+            TIR.MemoryLocation.Data,
+            32768,
+            [1],
+            [1]);
+        var placement = new Placement(new[] { 1 }, "b", "b");
+        var body = TIR.T.Let(
+            out var sharedPackedTile,
+            IR.F.Buffer.AllocateBufferView(sharedBuffer, new RankedShape(0, 0)),
+            "shared_packed_tile")
+            .Body(
+                new TIR.Sequential(
+                    TIR.T.TileLoad(sharedPackedTile, inputBuffer),
+                    TIR.T.TileStore(sharedPackedTile, outputBuffer)))
+            .Build();
+        var main = new TIR.PrimFunction(
+            "main_prim",
+            PyNTTTarget.Kind,
+            new TIR.Sequential(
+                body,
+                TIR.F.NTT.TensorStore(publicOutputBuffer, publicOutput, new[] { SBP.B }, placement)),
+            new IVar[] { publicOutput })
+        {
+            SchedResult =
+            {
+                DataUsage = 32772,
+            },
+        };
+
+        var outputDirectory = GeneratePyNTTModelDirectory("generated_vector_shared_descriptor_model", main);
+        RenderGeneratedKernels(outputDirectory);
+        var generatedKernels = File.ReadAllText(Path.Join(outputDirectory, "generated_kernels.py"));
+        Assert.Contains(
+            "shared_packed_tile_shared_buffer_0 = tle.gpu.alloc([1, 256, 4, 8]",
+            generatedKernels,
+            StringComparison.Ordinal);
+        Assert.DoesNotContain("tle.gpu.alloc([1, 8192]", generatedKernels, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void TestPyNTTMmaSharedDescriptorExposesPackedWeightAsDotMatrix()
+    {
+        var vectorType = new VectorType(DataTypes.BFloat16, 4, 8);
+        var inputBuffer = CreateBuffer(
+            "packed_input",
+            vectorType,
+            TIR.MemoryLocation.Data,
+            0,
+            [1, 256],
+            [256, 1]);
+        var sharedBuffer = new TIR.Buffer(
+            "mma_shared_packed_tile",
+            vectorType,
+            new TIR.MemSpan(new TIR.PhysicalBuffer(vectorType.SizeInBytes, 0, 16384, TIR.MemoryLocation.Shared)),
+            [1, 256],
+            [256, 1],
+            null,
+            new TargetStorageEncodingSelection(
+                TritonTargetStorageEncodingModel.NvidiaMmaShared,
+                16384,
+                16,
+                Array.Empty<KeyValuePair<string, long>>()));
+        var outputBuffer = CreateBuffer(
+            "packed_output",
+            vectorType,
+            TIR.MemoryLocation.Data,
+            16384,
+            [1, 256],
+            [256, 1]);
+        var publicOutput = CreateOutputVar("output", new TensorType(DataTypes.Float32, new[] { 1 }));
+        var publicOutputBuffer = CreateBuffer(
+            "public_output",
+            DataTypes.Float32,
+            TIR.MemoryLocation.Data,
+            32768,
+            [1],
+            [1]);
+        var placement = new Placement(new[] { 1 }, "b", "b");
+        var body = TIR.T.Let(
+            out var sharedPackedTile,
+            IR.F.Buffer.AllocateBufferView(sharedBuffer, new RankedShape(0, 0)),
+            "mma_shared_packed_tile")
+            .Body(
+                new TIR.Sequential(
+                    TIR.T.TileLoad(sharedPackedTile, inputBuffer),
+                    TIR.T.TileStore(sharedPackedTile, outputBuffer)))
+            .Build();
+        var main = new TIR.PrimFunction(
+            "main_prim",
+            PyNTTTarget.Kind,
+            new TIR.Sequential(
+                body,
+                TIR.F.NTT.TensorStore(publicOutputBuffer, publicOutput, new[] { SBP.B }, placement)),
+            new IVar[] { publicOutput })
+        {
+            SchedResult =
+            {
+                DataUsage = 32772,
+            },
+        };
+
+        var outputDirectory = GeneratePyNTTModelDirectory("generated_mma_vector_shared_descriptor_model", main);
+        RenderGeneratedKernels(outputDirectory);
+        var generatedKernels = File.ReadAllText(Path.Join(outputDirectory, "generated_kernels.py"));
+        Assert.Contains(
+            "mma_shared_packed_tile_shared_buffer_0 = tle.gpu.alloc([256, 32]",
+            generatedKernels,
+            StringComparison.Ordinal);
+        Assert.Contains("nv_mma_shared_layout=True", generatedKernels, StringComparison.Ordinal);
+        Assert.DoesNotContain("tle.gpu.alloc([1, 256, 4, 8]", generatedKernels, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -1290,11 +1522,60 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         var main = new Function("main", PyNTTTarget.Kind, IR.F.Tensors.MatMul(lhs, rhs), new[] { lhs, rhs });
 
         var outputDirectory = await GeneratePyNTTModelDirectoryWithCompilerPipeline("generated_matmul_run_model", main);
+        var compiler = Assert.IsType<global::Nncase.Compiler.Compiler>(CompileSession.Compiler);
+        var mmaSharedBuffers = compiler.Module.Functions
+            .SelectMany(function => ExprCollector.Collect(function).OfType<TIR.Buffer>())
+            .Where(buffer => buffer.StorageEncoding?.Id == TritonTargetStorageEncodingModel.NvidiaMmaShared)
+            .ToArray();
+        Assert.True(mmaSharedBuffers.Length >= 2);
+        Assert.All(
+            mmaSharedBuffers,
+            buffer => Assert.Equal(TIR.MemoryLocation.Shared, buffer.MemSpan.Buffer.Location));
+        var dotOperandBuffers = compiler.Module.Functions
+            .SelectMany(function => ExprCollector.Collect(function).OfType<TIR.Buffer>())
+            .Where(buffer => buffer.MemSpan.Buffer.Location == TIR.MemoryLocation.Shared)
+            .Where(buffer => buffer.Name.Contains("packed_mat_mul_in", StringComparison.Ordinal))
+            .ToArray();
+        Assert.NotEmpty(dotOperandBuffers);
+        Assert.All(
+            dotOperandBuffers,
+            buffer => Assert.Equal(
+                TritonTargetStorageEncodingModel.NvidiaMmaShared,
+                buffer.StorageEncoding?.Id));
         AssertGeneratedKernel(outputDirectory, "composite", "Matmul.py.jinja");
+        var generatedKernels = File.ReadAllText(Path.Join(outputDirectory, "generated_kernels.py"));
+        Assert.Contains("nv_mma_shared_layout=True", generatedKernels, StringComparison.Ordinal);
+        Assert.DoesNotMatch(
+            @"packed_mat_mul_in[01][^\r\n]+nv_mma_shared_layout=False",
+            generatedKernels);
         AssertGeneratedModelRuns(
             outputDirectory,
             "lhs = torch.arange(256, dtype=torch.float32, device='cuda').reshape(16, 16) * 0.01",
             "rhs = torch.arange(256, dtype=torch.float32, device='cuda').reshape(16, 16) * 0.02",
+            "output = module(lhs, rhs)",
+            "torch.testing.assert_close(output, lhs @ rhs, rtol=1e-5, atol=1e-5)");
+    }
+
+    [Fact]
+    public async Task TestPyNTTIRAutoDistributedMatmulReductionTailRun()
+    {
+        ConfigureAutoDistributedPyNTT();
+        var lhs = new Var("lhs", new TensorType(DataTypes.Float32, new[] { 3, 17 }));
+        var rhs = new Var("rhs", new TensorType(DataTypes.Float32, new[] { 17, 5 }));
+        var main = new Function("main", PyNTTTarget.Kind, IR.F.Tensors.MatMul(lhs, rhs), new[] { lhs, rhs });
+
+        var outputDirectory = await GeneratePyNTTModelDirectoryWithCompilerPipeline("generated_matmul_tail_run_model", main);
+        var compiler = Assert.IsType<global::Nncase.Compiler.Compiler>(CompileSession.Compiler);
+        var reductionLoops = compiler.Module.Functions
+            .SelectMany(function => ExprCollector.Collect(function).OfType<TIR.For>())
+            .Where(loop => loop.Mode == TIR.LoopMode.Reduction)
+            .ToArray();
+        Assert.Contains(reductionLoops, loop => loop.Partition == TIR.LoopPartition.Full);
+        Assert.Contains(reductionLoops, loop => loop.Partition == TIR.LoopPartition.Tail);
+        AssertGeneratedModelRuns(
+            outputDirectory,
+            "lhs = (torch.arange(3 * 17, dtype=torch.float32, device='cuda').reshape(3, 17) - 11) * 0.01",
+            "rhs = (torch.arange(17 * 5, dtype=torch.float32, device='cuda').reshape(17, 5) - 23) * 0.02",
             "output = module(lhs, rhs)",
             "torch.testing.assert_close(output, lhs @ rhs, rtol=1e-5, atol=1e-5)");
     }
@@ -1322,6 +1603,170 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
             "rhs = ((torch.arange(1024 * 2048, dtype=torch.float32, device='cuda').reshape(1024, 2048) - 128) * 0.0001).to(torch.bfloat16)",
             "output = module(lhs)",
             "torch.testing.assert_close(output, (lhs @ rhs).reshape(1, 16, 128), rtol=2e-2, atol=2e-2)");
+    }
+
+    [Fact]
+    public async Task TestPyNTTPackedBFloat16GemvRespectsSharedMemoryCapacityRun()
+    {
+        ConfigureAutoDistributedPyNTT();
+        var targetOptions = Assert.IsType<PyNTTTargetOptions>(CompileOptions.TargetOptions);
+        targetOptions.HierarchyNames = "b";
+        targetOptions.HierarchyLevels = "b";
+        targetOptions.Hierarchies = new[] { new[] { 1 } };
+        const int k = 1024;
+        const int n = 160;
+        var lhs = new Var("lhs", new TensorType(DataTypes.BFloat16, new[] { 1, k }));
+        var rhsValues = Enumerable.Range(0, k * n)
+            .Select(i => (BFloat16)(((float)i - 128f) * 0.0001f))
+            .ToArray();
+        var rhs = Tensor.From<BFloat16>(rhsValues, [k, n]);
+        var main = new Function(
+            "main",
+            PyNTTTarget.Kind,
+            IR.F.Tensors.MatMul(lhs, rhs, DataTypes.BFloat16),
+            new[] { lhs });
+
+        var outputDirectory = await GeneratePyNTTModelDirectoryWithCompilerPipeline(
+            "generated_bf16_resource_feasible_gemv_run_model",
+            main);
+        using var document = JsonDocument.Parse(File.ReadAllText(Path.Join(outputDirectory, "kernel_params.json")));
+        var renderKernels = document.RootElement
+            .GetProperty("functions")
+            .EnumerateArray()
+            .SelectMany(function => function.GetProperty("render_kernels").EnumerateArray())
+            .ToArray();
+        var matrixKernels = renderKernels
+            .Where(kernel => kernel.GetProperty("metadata").GetProperty("attrs").TryGetProperty("block_microkernels", out _))
+            .ToArray();
+        Assert.NotEmpty(matrixKernels);
+        Assert.All(matrixKernels, kernel =>
+        {
+            var attrs = kernel.GetProperty("metadata").GetProperty("attrs");
+            var managedArenaBytes = attrs.GetProperty("shared_memory_bytes").GetInt64();
+            var physicalCapacityBytes = attrs.GetProperty("shared_memory_capacity_bytes").GetInt64();
+            Assert.All(attrs.GetProperty("block_microkernels").EnumerateArray(), microKernel =>
+            {
+                var resources = microKernel.GetProperty("resources");
+                var privateBytes = resources.TryGetProperty("gpu.backend-shared-memory", out var privateResource)
+                    ? privateResource.GetInt64()
+                    : 0;
+                Assert.True(
+                    managedArenaBytes + privateBytes <= physicalCapacityBytes,
+                    $"Managed arena {managedArenaBytes} plus backend-private shared {privateBytes} exceeds physical capacity {physicalCapacityBytes}.");
+            });
+        });
+
+        RenderGeneratedKernels(outputDirectory);
+        AssertGeneratedModelRuns(
+            outputDirectory,
+            $"lhs = ((torch.arange({k}, dtype=torch.float32, device='cuda').reshape(1, {k}) - 16) * 0.001).to(torch.bfloat16)",
+            $"rhs = ((torch.arange({k} * {n}, dtype=torch.float32, device='cuda').reshape({k}, {n}) - 128) * 0.0001).to(torch.bfloat16)",
+            "output = module(lhs)",
+            "torch.testing.assert_close(output.to(torch.float32), (lhs @ rhs).to(torch.bfloat16).to(torch.float32), rtol=2e-2, atol=2e-2)");
+    }
+
+    [Fact]
+    public async Task TestPyNTTPackedBFloat16GemvUsesRegisterMmaRun()
+    {
+        ConfigureAutoDistributedPyNTT();
+        var targetOptions = Assert.IsType<PyNTTTargetOptions>(CompileOptions.TargetOptions);
+        targetOptions.HierarchyNames = "b";
+        targetOptions.HierarchyLevels = "b";
+        targetOptions.Hierarchies = new[] { new[] { 1 } };
+        const int k = 16;
+        const int n = 32;
+        var lhs = new Var("lhs", new TensorType(DataTypes.BFloat16, new[] { 1, k }));
+        var rhsValues = Enumerable.Range(0, k * n)
+            .Select(i => (BFloat16)(((float)i - 64f) * 0.001f))
+            .ToArray();
+        var rhs = Tensor.From<BFloat16>(rhsValues, [k, n]);
+        var main = new Function(
+            "main",
+            PyNTTTarget.Kind,
+            IR.F.Tensors.MatMul(lhs, rhs, DataTypes.BFloat16),
+            new[] { lhs });
+
+        var outputDirectory = await GeneratePyNTTModelDirectoryWithCompilerPipeline(
+            "generated_bf16_register_mma_gemv_run_model",
+            main);
+        using var document = JsonDocument.Parse(File.ReadAllText(Path.Join(outputDirectory, "kernel_params.json")));
+        var accumulateModels = document.RootElement
+            .GetProperty("functions")
+            .EnumerateArray()
+            .SelectMany(function => function.GetProperty("render_kernels").EnumerateArray())
+            .SelectMany(kernel => kernel.GetProperty("helpers").EnumerateArray())
+            .Where(helper => helper.GetProperty("template").GetString() == "triton/kernels/Gemv.py.jinja")
+            .Select(helper => helper.GetProperty("model"))
+            .Where(model => model.GetProperty("ReductionPhase").GetString() == "accumulate")
+            .ToArray();
+        Assert.NotEmpty(accumulateModels);
+        Assert.All(accumulateModels, model =>
+            Assert.Equal("register_mma_accumulator", model.GetProperty("MicroKernelVariant").GetString()));
+
+        RenderGeneratedKernels(outputDirectory);
+        var generatedKernelsPy = File.ReadAllText(Path.Join(outputDirectory, "generated_kernels.py"));
+        Assert.Contains("acc += tl.sum(partial_transposed, axis=1)", generatedKernelsPy, StringComparison.Ordinal);
+        AssertGeneratedModelRuns(
+            outputDirectory,
+            $"lhs = ((torch.arange({k}, dtype=torch.float32, device='cuda').reshape(1, {k}) - 8) * 0.01).to(torch.bfloat16)",
+            $"rhs = ((torch.arange({k} * {n}, dtype=torch.float32, device='cuda').reshape({k}, {n}) - 64) * 0.001).to(torch.bfloat16)",
+            "output = module(lhs)",
+            "torch.testing.assert_close(output.to(torch.float32), (lhs @ rhs).to(torch.bfloat16).to(torch.float32), rtol=2e-2, atol=2e-2)");
+    }
+
+    [Fact]
+    public async Task TestPyNTTIRGemvReductionBlockKUsesLocalTileExtent()
+    {
+        ConfigureAutoDistributedPyNTT();
+        var lhs = new Var("lhs", new TensorType(DataTypes.Float32, new[] { 1, 4 }));
+        var rhs = new Var("rhs", new TensorType(DataTypes.Float32, new[] { 4, 2048 }));
+        var main = new Function("main", PyNTTTarget.Kind, IR.F.Tensors.MatMul(lhs, rhs), new[] { lhs, rhs });
+
+        var outputDirectory = await GeneratePyNTTModelDirectoryWithCompilerPipeline("generated_gemv_local_k_model", main);
+        using var document = JsonDocument.Parse(File.ReadAllText(Path.Join(outputDirectory, "kernel_params.json")));
+        var models = document.RootElement
+            .GetProperty("functions")
+            .EnumerateArray()
+            .SelectMany(function => function.GetProperty("render_kernels").EnumerateArray())
+            .SelectMany(kernel => kernel.GetProperty("helpers").EnumerateArray())
+            .Where(helper => helper.GetProperty("template").GetString() == "triton/kernels/Gemv.py.jinja")
+            .Select(helper => helper.GetProperty("model"))
+            .Where(model => model.GetProperty("ReductionPhase").GetString() == "accumulate")
+            .ToArray();
+
+        Assert.NotEmpty(models);
+        Assert.All(models, model =>
+        {
+            var localK = model.GetProperty("LhsShape").EnumerateArray().Last().GetProperty("MaxValue").GetInt32();
+            var expectedBlockK = 1;
+            while (expectedBlockK < localK)
+            {
+                expectedBlockK *= 2;
+            }
+
+            Assert.InRange(localK, 1, 4);
+            Assert.Equal(expectedBlockK, model.GetProperty("ReductionBlockK").GetInt32());
+            Assert.Equal("triton.gemv", model.GetProperty("MicroKernelFamily").GetString());
+            Assert.Contains(
+                model.GetProperty("MicroKernelVariant").GetString(),
+                new[] { "register_simt_accumulator", "register_mma_accumulator", "shared_simt_accumulator", "shared_mma_accumulator" });
+            Assert.True(model.GetProperty("MicroKernelInnerN").GetInt32() > 0);
+            Assert.True(model.GetProperty("MicroKernelInnerK").GetInt32() > 0);
+        });
+
+        RenderGeneratedKernels(outputDirectory);
+        var generatedKernelsPy = File.ReadAllText(Path.Join(outputDirectory, "generated_kernels.py"));
+        foreach (var blockK in models.Select(model => model.GetProperty("ReductionBlockK").GetInt32()).Distinct())
+        {
+            Assert.Contains($"offs_k = tl.arange(0, {blockK})", generatedKernelsPy, StringComparison.Ordinal);
+        }
+
+        AssertGeneratedModelRuns(
+            outputDirectory,
+            "lhs = torch.arange(4, dtype=torch.float32, device='cuda').reshape(1, 4) * 0.25",
+            "rhs = (torch.arange(4 * 2048, dtype=torch.float32, device='cuda').reshape(4, 2048) - 127) * 0.001",
+            "output = module(lhs, rhs)",
+            "torch.testing.assert_close(output, lhs @ rhs, rtol=1e-5, atol=1e-5)");
     }
 
     [Fact]
@@ -3227,6 +3672,13 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         var main = new Function("main", PyNTTTarget.Kind, IR.F.Tensors.Reduce(ReduceOp.Mean, x, new[] { 1L }, 0.0f, false), new[] { x });
 
         var outputDirectory = await GeneratePyNTTModelDirectoryWithCompilerPipeline("generated_reduce_mean_count_run_model", main);
+        var compiler = Assert.IsType<global::Nncase.Compiler.Compiler>(CompileSession.Compiler);
+        var reductionLoops = compiler.Module.Functions
+            .SelectMany(function => ExprCollector.Collect(function).OfType<TIR.For>())
+            .Where(loop => loop.Mode == TIR.LoopMode.Reduction)
+            .ToArray();
+        Assert.Contains(reductionLoops, loop => loop.Partition == TIR.LoopPartition.Full);
+        Assert.Contains(reductionLoops, loop => loop.Partition == TIR.LoopPartition.Tail);
         RenderGeneratedKernels(outputDirectory);
         var generatedKernelsPy = File.ReadAllText(Path.Join(outputDirectory, "generated_kernels.py"));
         Assert.Contains("reduced_element_count +=", generatedKernelsPy, StringComparison.Ordinal);

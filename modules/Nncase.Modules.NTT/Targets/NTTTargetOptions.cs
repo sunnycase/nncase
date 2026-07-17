@@ -8,6 +8,7 @@ using System.Linq;
 using System.Text;
 using System.Threading.Tasks;
 using Nncase.CostModel;
+using Nncase.Schedule;
 
 namespace Nncase.Targets;
 
@@ -19,6 +20,8 @@ public class NTTTargetOptions : INTTTargetOptions, ITargetOpCostModelProvider, I
     public NTTTargetOptions()
     {
         TargetCostModel = new DefaultTargetOpCostModel(_targetMachineModel);
+        BlockMicroKernelModel = new DefaultBlockMicroKernelModel();
+        StorageEncodingModel = new DefaultTargetStorageEncodingModel();
     }
 
     [DisplayName("--model-name")]
@@ -119,8 +122,14 @@ public class NTTTargetOptions : INTTTargetOptions, ITargetOpCostModelProvider, I
 
     public ITargetOpCostModel TargetCostModel { get; set; }
 
+    public IBlockMicroKernelModelProvider BlockMicroKernelModel { get; protected set; }
+
+    public ITargetStorageEncodingModelProvider StorageEncodingModel { get; protected set; }
+
     protected virtual void OnTargetMachineChanged()
     {
         TargetCostModel = new DefaultTargetOpCostModel(TargetMachineModel);
+        BlockMicroKernelModel = new DefaultBlockMicroKernelModel();
+        StorageEncodingModel = new DefaultTargetStorageEncodingModel();
     }
 }

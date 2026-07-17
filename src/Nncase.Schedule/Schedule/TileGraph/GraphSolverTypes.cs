@@ -72,10 +72,11 @@ public sealed record BufferIdentity(TileGrid Node, int Index, BufferEndpoint End
 /// cl, storage level sl is legal when 0 &lt;= sl &lt;= cl. Axis identities remain
 /// canonical in affine maps; only the entry order follows LoopOrder.</param>
 /// <param name="Shapes">the buffer shape according to the placement.</param>
-/// <param name="Sizes">the buffer size according to the placement.</param>
-/// <param name="Trips">related loop trips at current domain.</param>
+/// <param name="Sizes">Maximum physical capacity in bytes according to the placement.</param>
+/// <param name="Trips">Actual materialization event count at the maximum runtime shape.</param>
+/// <param name="TransferBytes">Actual bytes transferred by all materialization events, including tail regions.</param>
 /// <param name="Mask">The lexical loop-position mask that affects this buffer.</param>
-public sealed record TileNodeBufferInfo<T>(TileLifetime[] Lifetimes, AffineMap Map, T[][] Places, T[][] Shapes, T[] Sizes, T[] Trips, LoopMask Mask)
+public sealed record TileNodeBufferInfo<T>(TileLifetime[] Lifetimes, AffineMap Map, T[][] Places, T[][] Shapes, T[] Sizes, T[] Trips, T[] TransferBytes, LoopMask Mask)
 {
     public int GetLastRelatedPos()
     {
@@ -87,7 +88,7 @@ public sealed record TileNodeBufferInfo<T>(TileLifetime[] Lifetimes, AffineMap M
 /// <summary>
 /// Solver information for one lexical tile scope.
 /// </summary>
-/// <param name="TripCounts">Forward trip products indexed by lexical loop entry.</param>
+/// <param name="TripCounts">Actual schedule-prefix invocation counts at the maximum runtime shape, indexed by lexical loop entry.</param>
 /// <param name="BackWardExtents">Backward extents indexed by lexical loop entry, with each extent vector indexed by canonical axis.</param>
 /// <param name="DefUseMap">key is def, value is use.</param>
 /// <param name="BufferInfoMap">buffer info memo.</param>

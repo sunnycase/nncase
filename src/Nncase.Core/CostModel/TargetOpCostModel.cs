@@ -310,7 +310,10 @@ public sealed class DefaultTargetOpCostModel : ITargetOpCostModel, IHierarchical
         }
 
         cost = ElementwiseCost(
-            EstimateElementwiseCycles(elements * CostUtility.GetCPUCyclesOfUnary(query.Op)),
+            EstimateElementwiseCycles(
+                elements * CostUtility.GetCPUCyclesOfUnary(query.Op),
+                query.Input.DType,
+                query.Output.DType),
             GetTensorByteCount(query.Input),
             GetTensorByteCount(query.Output));
         return true;
@@ -325,7 +328,11 @@ public sealed class DefaultTargetOpCostModel : ITargetOpCostModel, IHierarchical
         }
 
         cost = ElementwiseCost(
-            EstimateElementwiseCycles(elements * CostUtility.GetCPUCyclesOfBinary(query.Op)),
+            EstimateElementwiseCycles(
+                elements * CostUtility.GetCPUCyclesOfBinary(query.Op),
+                query.Lhs.DType,
+                query.Rhs.DType,
+                query.Output.DType),
             GetTensorByteCount(query.Lhs) + GetTensorByteCount(query.Rhs),
             GetTensorByteCount(query.Output));
         return true;
@@ -340,7 +347,9 @@ public sealed class DefaultTargetOpCostModel : ITargetOpCostModel, IHierarchical
         }
 
         cost = ElementwiseCost(
-            EstimateElementwiseCycles(elements * Math.Max(0.0, query.WorkPerElement)),
+            EstimateElementwiseCycles(
+                elements * Math.Max(0.0, query.WorkPerElement),
+                query.Inputs.Select(input => input.DType).Append(query.Output.DType).ToArray()),
             query.Inputs.Sum(GetTensorByteCount),
             GetTensorByteCount(query.Output));
         return true;
@@ -486,6 +495,12 @@ public sealed class DefaultTargetOpCostModel : ITargetOpCostModel, IHierarchical
         return value > ulong.MaxValue ? ulong.MaxValue : (ulong)value;
     }
 
-    private double EstimateElementwiseCycles(double work)
-        => work / Math.Max(1.0, _machine?.Compute.ElementwiseElementsPerCycle ?? 1.0);
+    private double EstimateElementwiseCycles(double work, params DataType[] dataTypes)
+    {
+        var vectorLanes = dataTypes.Select(GetVectorLaneCount).DefaultIfEmpty(1).Max();
+        var elementsPerCycle = vectorLanes > 1
+            ? _machine?.Compute.ElementwiseElementsPerCycle ?? vectorLanes
+            : 1.0;
+        return work / Math.Max(1.0, elementsPerCycle);
+    }
 }

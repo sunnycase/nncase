@@ -12,6 +12,22 @@ using Nncase.IR;
 namespace Nncase.Passes;
 
 /// <summary>
+/// Defines how a function pass group traverses functions in a module.
+/// </summary>
+public enum FunctionPassTraversalOrder
+{
+    /// <summary>
+    /// Preserve the module function order.
+    /// </summary>
+    ModuleOrder,
+
+    /// <summary>
+    /// Process every callee before its callers.
+    /// </summary>
+    CalleeFirst,
+}
+
+/// <summary>
 /// Pass in Callable scope.
 /// </summary>
 public abstract class FunctionPass : Pass<BaseFunction, BaseFunction>
@@ -22,6 +38,11 @@ public abstract class FunctionPass : Pass<BaseFunction, BaseFunction>
     public FunctionPass()
     {
     }
+
+    /// <summary>
+    /// Gets the required module traversal order for this pass.
+    /// </summary>
+    public virtual FunctionPassTraversalOrder TraversalOrder => FunctionPassTraversalOrder.ModuleOrder;
 
     /// <inheritdoc/>
     protected override Task OnPassStartAsync(BaseFunction input, RunPassContext context)

@@ -27,7 +27,24 @@ public sealed record PrimFunctionAbiView(
     IReadOnlyList<IVar> Inputs,
     IReadOnlyList<BufferVar> OutputParameters,
     IReadOnlyList<PrimFunctionResultBinding> Results,
-    IReadOnlyList<BufferVar> Workspaces);
+    IReadOnlyList<BufferVar> Workspaces)
+{
+    /// <summary>
+    /// Gets the logical runtime parameter types. Caller-allocated outputs and
+    /// workspaces are physical ABI details and are not model inputs.
+    /// </summary>
+    public IReadOnlyList<IRType> RuntimeParameterTypes => Inputs.Select(input => ((BaseExpr)input).CheckedType).ToArray();
+
+    /// <summary>
+    /// Gets the logical runtime return type represented by the explicit result bindings.
+    /// </summary>
+    public IRType RuntimeReturnType => Results.Count switch
+    {
+        0 => TupleType.Void,
+        1 => Results[0].Type,
+        _ => new TupleType(Results.Select(result => result.Type).ToArray()),
+    };
+}
 
 /// <summary>
 /// Prim function ABI helpers.

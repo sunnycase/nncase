@@ -32,8 +32,9 @@ public enum MemoryEffectKind
     /// <summary>
     /// The operand is the logical state/output of a reduction region. Inside a
     /// <see cref="TIR.For"/> with <see cref="TIR.LoopMode.Reduction"/>, the
-    /// backend carries this state privately and commits the declared memory
-    /// effect once when the region completes.
+    /// backend carries this state privately. The read component describes
+    /// accumulator feedback rather than physical-buffer traffic; the backend
+    /// commits the write component once when the region completes.
     /// </summary>
     ReductionAccumulator,
 }
@@ -85,6 +86,15 @@ public readonly record struct MemoryEffect(
 /// </summary>
 public static class MemoryEffectUtility
 {
+    /// <summary>
+    /// Gets the accesses that reach the operand's physical buffer. Reduction
+    /// feedback remains backend-private, so only its final write is visible.
+    /// </summary>
+    public static MemoryAccessMode GetPhysicalBufferAccessMode(MemoryEffect effect)
+        => effect.Kind == MemoryEffectKind.ReductionAccumulator
+            ? effect.Mode & MemoryAccessMode.Write
+            : effect.Mode;
+
     /// <summary>
     /// Visits every expression operand with a non-empty memory effect. Tuple and
     /// variadic operands are expanded according to the call's parameter contract.

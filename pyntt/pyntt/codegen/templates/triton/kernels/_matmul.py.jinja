@@ -2,10 +2,10 @@
 {% set ctx = matmul_context(model, gemv=gemv) %}
 {% if ctx["phase"] == "accumulate" %}
 # generated from PyNTT Jinja {{ ctx["template_name"] }}.py.jinja reduction accumulate
-# {{ model["Comment"] }}; accumulator=backend-private-fp32
+# {{ model["Comment"] }}; microkernel={{ ctx["microkernel_family"] }}/{{ ctx["microkernel_variant"] }}
 {% elif ctx["phase"] == "finalize" %}
 # generated from PyNTT Jinja {{ ctx["template_name"] }}.py.jinja reduction finalize
-# {{ model["Comment"] }}; accumulator=backend-private-fp32
+# {{ model["Comment"] }}; microkernel={{ ctx["microkernel_family"] }}/{{ ctx["microkernel_variant"] }}
 {% else %}
 # generated from PyNTT Jinja {{ ctx["template_name"] }}.py.jinja
 # {{ model["Comment"] }}; lhs_dtype={{ model["LhsDType"] }}, rhs_dtype={{ model["RhsDType"] }}, output_dtype={{ model["OutputDType"] }}, lhs_shape={{ shape_tuple(model["LhsShape"]) }}, rhs_shape={{ shape_tuple(model["RhsShape"]) }}, output_shape={{ shape_tuple(model["OutputShape"]) }}, rhs_n_packed_lane={{ model.get("RhsNPackedLaneCount", 1) }}, rhs_n_lane={{ model["RhsNVectorLaneCount"] }}, output_n_packed_lane={{ model.get("OutputNPackedLaneCount", 1) }}, output_n_lane={{ model["OutputNVectorLaneCount"] }}, load_c={{ ctx["load_c_expression"] }}
@@ -22,19 +22,65 @@ def {{ model["FunctionName"] }}({{ helper_parameters(model, ["acc"] if ctx["phas
     rhs = {{ ptr(model, "Rhs") }}
 {% endif %}
     offs_k = tl.arange(0, {{ ctx["block_k"] }})
-    offs_n = tl.arange(0, {{ ctx["block_n"] }})
 {% if ctx["gemv"] %}
     m_idx = 0
+{% if ctx["microkernel_variant"] in ("shared_simt_accumulator", "shared_mma_accumulator") %}
+    lhs_values = tl.load({{ access_pointer(model, "Lhs", "lhs", ctx["lhs_offsets"]) }}, mask={{ ctx["lhs_mask"] }}, other=0.0)
+{% if ctx["gemv_use_dot"] %}
+    # Compute (B.T @ A.T).T and pad only semantic M to the selected MMA N tile.
+    offs_m = tl.arange(0, {{ ctx["gemv_dot_m"] }})
+    lhs_columns = tl.where(offs_m[None, :] == 0, lhs_values[:, None], 0.0)
+{% else %}
+    lhs_values = lhs_values.to(tl.float32)
+{% endif %}
+    for acc_n_start in tl.range(0, {{ ctx["block_n"] }}, {{ ctx["inner_n"] }}):
+        offs_n = acc_n_start + tl.arange(0, {{ ctx["inner_n"] }})
+        rhs_values = tl.load({{ access_pointer(model, "Rhs", "rhs", ctx["rhs_offsets"]) }}, mask={{ ctx["rhs_mask"] }}, other=0.0, eviction_policy="evict_first")
+{% if ctx["gemv_use_dot"] %}
+        partial_transposed = tl.dot(rhs_values, lhs_columns{{ ctx["dot_precision"] }})
+        partial = tl.sum(partial_transposed, axis=1)
+        acc_ptr = tle.gpu.local_ptr(acc, (offs_n,))
+        acc_mask = offs_n < {{ ctx["block_n"] }}
+{% else %}
+        rhs_values = rhs_values.to(tl.float32)
+        partial = tl.sum(rhs_values * lhs_values[None, :], axis=1)
+        acc_ptr = tle.gpu.local_ptr(acc, (offs_n,))
+        acc_mask = offs_n < {{ ctx["block_n"] }}
+{% endif %}
+        acc_values = tl.load(acc_ptr, mask=acc_mask, other=0.0)
+        tl.store(acc_ptr, acc_values + partial, mask=acc_mask)
+{% else %}
+    offs_n = tl.arange(0, {{ ctx["block_n"] }})
+{% if ctx["gemv_use_dot"] %}
+    offs_m = tl.arange(0, {{ ctx["gemv_dot_m"] }})
+    rhs_values = tl.load({{ access_pointer(model, "Rhs", "rhs", ctx["rhs_offsets"]) }}, mask={{ ctx["rhs_mask"] }}, other=0.0, eviction_policy="evict_first")
+    lhs_values = tl.load({{ access_pointer(model, "Lhs", "lhs", ctx["lhs_offsets"]) }}, mask={{ ctx["lhs_mask"] }}, other=0.0)
+    lhs_columns = tl.where(offs_m[None, :] == 0, lhs_values[:, None], 0.0)
+    partial_transposed = tl.dot(rhs_values, lhs_columns{{ ctx["dot_precision"] }})
+    acc += tl.sum(partial_transposed, axis=1)
+{% else %}
     rhs_values = tl.load({{ access_pointer(model, "Rhs", "rhs", ctx["rhs_offsets"]) }}, mask={{ ctx["rhs_mask"] }}, other=0.0, eviction_policy="evict_first").to(tl.float32)
     lhs_values = tl.load({{ access_pointer(model, "Lhs", "lhs", ctx["lhs_offsets"]) }}, mask={{ ctx["lhs_mask"] }}, other=0.0).to(tl.float32)
     acc += tl.sum(rhs_values * lhs_values[None, :], axis=1)
-{% else %}
-    offs_m = tl.arange(0, {{ ctx["block_m"] }})
-    rhs_values = tl.load({{ access_pointer(model, "Rhs", "rhs", ctx["rhs_offsets"]) }}, mask={{ ctx["rhs_mask"] }}, other=0.0)
-    lhs_values = tl.load({{ access_pointer(model, "Lhs", "lhs", ctx["lhs_offsets"]) }}, mask={{ ctx["lhs_mask"] }}, other=0.0)
-    acc += tl.dot(lhs_values, rhs_values{{ ctx["dot_precision"] }})
 {% endif %}
     return acc
+{% endif %}
+{% else %}
+    offs_n = tl.arange(0, {{ ctx["block_n"] }})
+    offs_m = tl.arange(0, {{ ctx["block_m"] }})
+{% if ctx["rhs_direct_load"] %}
+    rhs_values = {{ ctx["rhs_direct_load"] }}
+{% else %}
+    rhs_values = tl.load({{ access_pointer(model, "Rhs", "rhs", ctx["rhs_offsets"]) }}, mask={{ ctx["rhs_mask"] }}, other=0.0)
+{% endif %}
+{% if ctx["lhs_direct_load"] %}
+    lhs_values = {{ ctx["lhs_direct_load"] }}
+{% else %}
+    lhs_values = tl.load({{ access_pointer(model, "Lhs", "lhs", ctx["lhs_offsets"]) }}, mask={{ ctx["lhs_mask"] }}, other=0.0)
+{% endif %}
+    acc += tl.dot(lhs_values, rhs_values{{ ctx["dot_precision"] }})
+    return acc
+{% endif %}
 {% elif ctx["phase"] == "finalize" %}
 {{ common.shard_coordinates([model["Output"]]) }}
 {% if local_buffer(model["Output"]) is none %}
@@ -44,7 +90,12 @@ def {{ model["FunctionName"] }}({{ helper_parameters(model, ["acc"] if ctx["phas
 {% if not ctx["gemv"] %}
     offs_m = tl.arange(0, {{ ctx["block_m"] }})
 {% endif %}
-    tl.store({{ access_pointer(model, "Output", "output", ctx["output_offsets"]) }}, acc * {{ model["Scale"] }}, mask={{ ctx["output_mask"] }})
+{% if ctx["microkernel_variant"] in ("shared_simt_accumulator", "shared_mma_accumulator") %}
+    acc_values = tl.load(tle.gpu.local_ptr(acc, (offs_n,)), mask=offs_n < {{ ctx["block_n"] }}, other=0.0)
+{% else %}
+    acc_values = acc
+{% endif %}
+    tl.store({{ access_pointer(model, "Output", "output", ctx["output_offsets"]) }}, acc_values * {{ model["Scale"] }}, mask={{ ctx["output_mask"] }})
 {% else %}
 {{ common.shard_coordinates([model["Lhs"], model["Rhs"], model["Output"]]) }}
 {% for name, key in (("lhs", "Lhs"), ("rhs", "Rhs"), ("output", "Output")) %}

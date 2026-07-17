@@ -7,6 +7,7 @@ using System.Collections.Immutable;
 using System.Linq;
 using System.Text;
 using Nncase.IR;
+using Nncase.Schedule;
 using Nncase.Utilities;
 
 namespace Nncase.TIR;
@@ -16,13 +17,21 @@ namespace Nncase.TIR;
 /// </summary>
 public sealed class Buffer : Expr
 {
-    public Buffer(string name, DataType elemType, MemSpan memSpan, Dimension[] dimensions, Dimension[] strides, DistributedType? distributedType)
+    public Buffer(
+        string name,
+        DataType elemType,
+        MemSpan memSpan,
+        Dimension[] dimensions,
+        Dimension[] strides,
+        DistributedType? distributedType,
+        TargetStorageEncodingSelection? storageEncoding = null)
         : base(new BaseExpr[] { memSpan }.Concat(dimensions).Concat(strides))
     {
         Name = name;
         ElemType = elemType;
         Rank = dimensions.Length;
         DistributedType = distributedType;
+        StorageEncoding = storageEncoding;
     }
 
     public string Name { get; }
@@ -54,10 +63,24 @@ public sealed class Buffer : Expr
 
     public DistributedType? DistributedType { get; }
 
+    /// <summary>
+    /// Gets the selected physical storage encoding. Logical dimensions and
+    /// strides remain represented independently by <see cref="Dimensions"/>
+    /// and <see cref="Strides"/>.
+    /// </summary>
+    public TargetStorageEncodingSelection? StorageEncoding { get; }
+
     public override TExprResult Accept<TExprResult, TTypeResult, TContext>(ExprFunctor<TExprResult, TTypeResult, TContext> functor, TContext context) => functor.VisitBuffer(this, context);
 
-    public Buffer With(string? name = null, DataType? elemType = null, MemSpan? memSpan = null, Dimension[]? dimensions = null, Dimension[]? strides = null, Expr[]? globalShape = null, DistributedType? distributedType = null)
-        => new Buffer(name ?? Name, elemType ?? ElemType, memSpan ?? MemSpan, dimensions ?? Dimensions.ToArray(), strides ?? Strides.ToArray(), distributedType ?? DistributedType);
+    public Buffer With(string? name = null, DataType? elemType = null, MemSpan? memSpan = null, Dimension[]? dimensions = null, Dimension[]? strides = null, Expr[]? globalShape = null, DistributedType? distributedType = null, TargetStorageEncodingSelection? storageEncoding = null)
+        => new Buffer(
+            name ?? Name,
+            elemType ?? ElemType,
+            memSpan ?? MemSpan,
+            dimensions ?? Dimensions.ToArray(),
+            strides ?? Strides.ToArray(),
+            distributedType ?? DistributedType,
+            storageEncoding ?? StorageEncoding);
 
     /// <inheritdoc/>
     public override bool Equals(object? obj)
@@ -67,8 +90,14 @@ public sealed class Buffer : Expr
             return true;
         }
 
-        return obj is TIR.Buffer other && GetHashCode() == other.GetHashCode() && Name == other.Name && ElemType == other.ElemType && Rank == other.Rank && Operands.SequenceEqual(other.Operands);
+        return obj is TIR.Buffer other
+            && GetHashCode() == other.GetHashCode()
+            && Name == other.Name
+            && ElemType == other.ElemType
+            && Rank == other.Rank
+            && Equals(StorageEncoding, other.StorageEncoding)
+            && Operands.SequenceEqual(other.Operands);
     }
 
-    protected override int GetHashCodeCore() => HashCode.Combine(Name, ElemType, Rank, base.GetHashCodeCore());
+    protected override int GetHashCodeCore() => HashCode.Combine(Name, ElemType, Rank, StorageEncoding, base.GetHashCodeCore());
 }

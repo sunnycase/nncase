@@ -110,9 +110,9 @@ public class UnitTestCPUTarget : TestClassBase
         var kWeight = CreateBuffer("k_weight", DataTypes.Float32, TIR.MemoryLocation.Data, 72, [3, 2], [2, 1]);
         var vWeight = CreateBuffer("v_weight", DataTypes.Float32, TIR.MemoryLocation.Data, 96, [3, 2], [2, 1]);
         var qBias = CreateBuffer("q_bias", DataTypes.Float32, TIR.MemoryLocation.Data, 120, [4], [1]);
-        var qOutput = CreateBuffer("q_output", DataTypes.Float32, TIR.MemoryLocation.Output, 0, [2, 4], [4, 1]);
-        var kOutput = CreateBuffer("k_output", DataTypes.Float32, TIR.MemoryLocation.Output, 32, [2, 2], [2, 1]);
-        var vOutput = CreateBuffer("v_output", DataTypes.Float32, TIR.MemoryLocation.Output, 48, [2, 2], [2, 1]);
+        var (qOutputParameter, qOutput) = CreateOutputBuffer("q_output", DataTypes.Float32, [2, 4], [4, 1]);
+        var (kOutputParameter, kOutput) = CreateOutputBuffer("k_output", DataTypes.Float32, [2, 2], [2, 1]);
+        var (vOutputParameter, vOutput) = CreateOutputBuffer("v_output", DataTypes.Float32, [2, 2], [2, 1]);
         var body = new TIR.Sequential(
             TIR.F.NTT.QKVParallelLinear(
                 input,
@@ -134,7 +134,7 @@ public class UnitTestCPUTarget : TestClassBase
                 2,
                 1),
             TIR.T.Return(qOutput, kOutput, vOutput));
-        var main = new TIR.PrimFunction("main_prim", CPUTarget.Kind, body, Array.Empty<IVar>())
+        var main = new TIR.PrimFunction("main_prim", CPUTarget.Kind, body, [qOutputParameter, kOutputParameter, vOutputParameter])
         {
             SchedResult =
             {
@@ -164,9 +164,9 @@ public class UnitTestCPUTarget : TestClassBase
         var kWeight = CreateBuffer("k_weight", packedType, TIR.MemoryLocation.Data, 72, [1, 3], [3, 1]);
         var vWeight = CreateBuffer("v_weight", packedType, TIR.MemoryLocation.Data, 120, [1, 3], [3, 1]);
         var qBias = CreateBuffer("q_bias", packedType, TIR.MemoryLocation.Data, 168, [1], [1]);
-        var qOutput = CreateBuffer("q_output", packedType, TIR.MemoryLocation.Output, 0, [2, 1], [1, 1]);
-        var kOutput = CreateBuffer("k_output", packedType, TIR.MemoryLocation.Output, 32, [2, 1], [1, 1]);
-        var vOutput = CreateBuffer("v_output", packedType, TIR.MemoryLocation.Output, 64, [2, 1], [1, 1]);
+        var (qOutputParameter, qOutput) = CreateOutputBuffer("q_output", packedType, [2, 1], [1, 1]);
+        var (kOutputParameter, kOutput) = CreateOutputBuffer("k_output", packedType, [2, 1], [1, 1]);
+        var (vOutputParameter, vOutput) = CreateOutputBuffer("v_output", packedType, [2, 1], [1, 1]);
         var body = new TIR.Sequential(
             TIR.F.NTT.PackedQKVParallelLinear(
                 input,
@@ -188,7 +188,7 @@ public class UnitTestCPUTarget : TestClassBase
                 2,
                 1),
             TIR.T.Return(qOutput, kOutput, vOutput));
-        var main = new TIR.PrimFunction("main_prim", CPUTarget.Kind, body, Array.Empty<IVar>())
+        var main = new TIR.PrimFunction("main_prim", CPUTarget.Kind, body, [qOutputParameter, kOutputParameter, vOutputParameter])
         {
             SchedResult =
             {
@@ -216,7 +216,7 @@ public class UnitTestCPUTarget : TestClassBase
         var gateWeight = CreateBuffer("gate_weight", DataTypes.Float32, TIR.MemoryLocation.Data, 24, [3, 4], [4, 1]);
         var upWeight = CreateBuffer("up_weight", DataTypes.Float32, TIR.MemoryLocation.Data, 72, [3, 4], [4, 1]);
         var gateBias = CreateBuffer("gate_bias", DataTypes.Float32, TIR.MemoryLocation.Data, 120, [4], [1]);
-        var output = CreateBuffer("output", DataTypes.Float32, TIR.MemoryLocation.Output, 0, [2, 4], [4, 1]);
+        var (outputParameter, output) = CreateOutputBuffer("output", DataTypes.Float32, [2, 4], [4, 1]);
         var body = new TIR.Sequential(
             TIR.F.NTT.MatMulGlu(
                 input,
@@ -231,7 +231,7 @@ public class UnitTestCPUTarget : TestClassBase
                 output,
                 IR.NN.GluType.SwiGLU),
             TIR.T.Return(output));
-        var main = new TIR.PrimFunction("main_prim", CPUTarget.Kind, body, Array.Empty<IVar>())
+        var main = new TIR.PrimFunction("main_prim", CPUTarget.Kind, body, [outputParameter])
         {
             SchedResult =
             {
@@ -261,7 +261,7 @@ public class UnitTestCPUTarget : TestClassBase
         var gateWeight = CreateBuffer("gate_weight", packedType, TIR.MemoryLocation.Data, 24, [1, 3], [3, 1]);
         var upWeight = CreateBuffer("up_weight", packedType, TIR.MemoryLocation.Data, 72, [1, 3], [3, 1]);
         var gateBias = CreateBuffer("gate_bias", packedType, TIR.MemoryLocation.Data, 120, [1], [1]);
-        var output = CreateBuffer("output", packedType, TIR.MemoryLocation.Output, 0, [2, 1], [1, 1]);
+        var (outputParameter, output) = CreateOutputBuffer("output", packedType, [2, 1], [1, 1]);
         var body = new TIR.Sequential(
             TIR.F.NTT.PackedMatMulGlu(
                 input,
@@ -276,7 +276,7 @@ public class UnitTestCPUTarget : TestClassBase
                 output,
                 IR.NN.GluType.SwiGLU),
             TIR.T.Return(output));
-        var main = new TIR.PrimFunction("main_prim", CPUTarget.Kind, body, Array.Empty<IVar>())
+        var main = new TIR.PrimFunction("main_prim", CPUTarget.Kind, body, [outputParameter])
         {
             SchedResult =
             {
@@ -433,6 +433,49 @@ public class UnitTestCPUTarget : TestClassBase
     }
 
     [Fact]
+    public void TestPartitionedReductionSharesBackendPrivateAccumulator()
+    {
+        var input = CreateBufferParameter("input", DataTypes.BFloat16, [2, 5], TIR.BufferVarRole.Input);
+        var output = CreateBufferParameter("output", DataTypes.BFloat16, [2], TIR.BufferVarRole.Output);
+        var fullUpdate = TIR.F.NTT.Reduce(input, output, false, [], [], [1], false, ReduceOp.Sum);
+        var tailUpdate = TIR.F.NTT.Reduce(input, output, false, [], [], [1], false, ReduceOp.Sum);
+        var fullLoop = new TIR.For(
+            new DimVar("reduction_tile"),
+            new TIR.Range(0, 4, 4),
+            TIR.LoopMode.Reduction,
+            new TIR.Sequential(fullUpdate),
+            TIR.LoopPartition.Full);
+        var tailLoop = new TIR.For(
+            new DimVar("reduction_tile_tail"),
+            new TIR.Range(4, 5, 4),
+            TIR.LoopMode.Reduction,
+            new TIR.Sequential(tailUpdate),
+            TIR.LoopPartition.Tail);
+        var function = new TIR.PrimFunction(
+            "device_func_partitioned_reduction_test",
+            CPUTarget.Kind,
+            new TIR.Sequential(fullLoop, tailLoop),
+            new IVar[] { input, output });
+
+        Assert.True(function.InferenceType());
+        var visitor = new DeviceCSourceConvertVisitor(new NTTTargetOptions());
+        visitor.Visit(function);
+        var source = visitor.GetHeader();
+
+        var storageCount = CountOccurrences(source, "auto ntt_reduction_0_acc0_storage");
+        var firstUpdateCount = CountOccurrences(source, "reduce_sum<false>");
+        var subsequentUpdateCount = CountOccurrences(source, "reduce_sum<true>");
+        var commitCount = CountOccurrences(
+            source,
+            $"cast(ntt_reduction_0_acc0, {IRHelpers.GetIdentityName(output.Name)}");
+        Assert.Equal(1, storageCount);
+        Assert.Equal(2, firstUpdateCount);
+        Assert.Equal(2, subsequentUpdateCount);
+        Assert.Equal(1, commitCount);
+        AssertReductionLifetime(source, "ntt_reduction_0_acc0", IRHelpers.GetIdentityName(output.Name));
+    }
+
+    [Fact]
     public void TestCodeGenVisitLeafVar()
     {
         Assert.Throws<InvalidOperationException>(() => TestCodeGen(Var.Scalar("x", DataTypes.Float32), Array.Empty<Var>()));
@@ -578,7 +621,7 @@ public class UnitTestCPUTarget : TestClassBase
         var pmgr = CompileSession.CreatePassManager("pmgr");
         var compiler = (Nncase.Compiler.Compiler)CompileSession.Compiler;
         compiler.TIRPass(pmgr);
-        pmgr.RunAsync(module).Wait();
+        module = pmgr.RunAsync(module).GetAwaiter().GetResult();
 
         var modelBuilder = CompileSession.GetRequiredService<IModelBuilder>();
         var linkedModel = modelBuilder.Build(module);
@@ -656,6 +699,30 @@ public class UnitTestCPUTarget : TestClassBase
             null);
     }
 
+    private (TIR.BufferVar Parameter, TIR.Buffer Buffer) CreateOutputBuffer(
+        string name,
+        DataType elemType,
+        long[] dimensions,
+        long[] strides)
+    {
+        var parameter = new TIR.BufferVar(
+            $"{name}_storage",
+            new TensorType(elemType, dimensions),
+            TIR.BufferVarRole.Output,
+            TIR.MemoryLocation.Output,
+            TIR.BufferLayoutAnnotation.ExactStrided(strides.Select(stride => (Dimension)stride).ToArray()));
+        var physicalElementCount = dimensions.Aggregate(1L, (acc, dim) => checked(acc * dim));
+        var sizeBytes = checked(physicalElementCount * elemType.SizeInBytes);
+        var buffer = new TIR.Buffer(
+            name,
+            elemType,
+            new TIR.MemSpan(new TIR.PhysicalBuffer(elemType.SizeInBytes, parameter, sizeBytes, TIR.MemoryLocation.Output)),
+            dimensions.Select(dim => (Dimension)dim).ToArray(),
+            strides.Select(stride => (Dimension)stride).ToArray(),
+            null);
+        return (parameter, buffer);
+    }
+
     private TIR.BufferVar CreateBufferParameter(
         string name,
         DataType elemType,
@@ -681,7 +748,7 @@ public class UnitTestCPUTarget : TestClassBase
             new TIR.Sequential(loop),
             parameters);
         Assert.True(function.InferenceType());
-        var visitor = new DeviceCSourceConvertVisitor();
+        var visitor = new DeviceCSourceConvertVisitor(new NTTTargetOptions());
         visitor.Visit(function);
         return visitor.GetHeader();
     }

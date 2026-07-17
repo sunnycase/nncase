@@ -396,7 +396,15 @@ internal sealed partial class TypeInferenceVisitor : ExprVisitor<IRType, Unit>
 
     protected override IRType VisitLeafPhysicalBuffer(PhysicalBuffer expr)
     {
-        VerifySubField(expr, expr.Start, TypePatternUtility.IsNoneType() | TypePatternUtility.IsIntegralScalar() | TypePatternUtility.IsPointer());
+        if (expr.Start is BufferVar)
+        {
+            Visit(expr.Start);
+        }
+        else
+        {
+            VerifySubField(expr, expr.Start, TypePatternUtility.IsNoneType() | TypePatternUtility.IsIntegralScalar() | TypePatternUtility.IsPointer());
+        }
+
         VerifySubField(expr, expr.Size, TypePatternUtility.IsDimensionType());
         return new PointerType(DataTypes.UInt8);
     }

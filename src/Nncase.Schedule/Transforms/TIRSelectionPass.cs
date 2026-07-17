@@ -24,13 +24,16 @@ public abstract class TIRSelectionPass : FunctionPass
 
     public string ModuleKind { get; }
 
+    /// <inheritdoc/>
+    public override FunctionPassTraversalOrder TraversalOrder => FunctionPassTraversalOrder.CalleeFirst;
+
     protected override Task<BaseFunction> RunCoreAsync(BaseFunction input, RunPassContext context)
     {
         if (input is Function func)
         {
             var callers = func.Users.Where(x => x is Call or If or FunctionWrapper).ToArray();
             var isEntry = callers.Length == 0;
-            var visitor = new TIRSelectionVisitor(this);
+            var visitor = new TIRSelectionVisitor(this, isEntry);
             var selection = visitor.Select(func);
             var parameters = selection.InputBuffers.Concat(selection.OutputParameters).ToArray();
 
@@ -112,13 +115,15 @@ public abstract class TIRSelectionPass : FunctionPass
     {
         private readonly TIRSelectionPass _selectionPass;
         private readonly TIRSelectionContext _selectionContext;
+        private readonly bool _isEntry;
         private readonly List<Expr> _body = new();
         private int _bufferIndex;
 
-        public TIRSelectionVisitor(TIRSelectionPass selectionPass)
+        public TIRSelectionVisitor(TIRSelectionPass selectionPass, bool isEntry)
         {
             _selectionPass = selectionPass;
             _selectionContext = new TIRSelectionContext(ExprMemo);
+            _isEntry = isEntry;
         }
 
         public SelectionResult Select(Function function)
@@ -554,7 +559,14 @@ public abstract class TIRSelectionPass : FunctionPass
                 {
                     var bufferVar = parameter is BufferVar { Role: BufferVarRole.Input or BufferVarRole.InOut } inputBufferVar
                         ? inputBufferVar
-                        : new BufferVar(parameter.Name, parameter.CheckedType, BufferVarRole.Input, MemoryLocation.Input);
+                        : new BufferVar(
+                            parameter.Name,
+                            parameter.CheckedType,
+                            BufferVarRole.Input,
+                            MemoryLocation.Input,
+                            _isEntry && IsRuntimeTensorType(parameter.CheckedType)
+                                ? BufferLayoutAnnotation.RuntimeStrided
+                                : null);
                     var buffer = T.AttachBuffer(bufferVar, tensorType, MemoryLocation.Input, 0, out _, $"{parameter.Name}_input", distributedType);
                     ExprMemo[(BaseExpr)parameter] = buffer;
                     _selectionContext.RegisterSelectedValue((BaseExpr)parameter, buffer);
@@ -629,7 +641,22 @@ public abstract class TIRSelectionPass : FunctionPass
         }
 
         private BufferVar CreateOutputBufferVar(IRType type)
-            => new($"out_{_bufferIndex++}", type, BufferVarRole.Output, MemoryLocation.Output);
+            => new(
+                $"out_{_bufferIndex++}",
+                type,
+                BufferVarRole.Output,
+                MemoryLocation.Output,
+                _isEntry && IsRuntimeTensorType(type)
+                    ? BufferLayoutAnnotation.RuntimeStrided
+                    : null);
+
+        private static bool IsRuntimeTensorType(IRType type)
+            => type switch
+            {
+                TensorType { DType: not (PointerType or ReferenceType), Shape: RankedShape } => true,
+                DistributedType { TensorType: { DType: not (PointerType or ReferenceType), Shape: RankedShape } } => true,
+                _ => false,
+            };
 
         private TIR.Buffer CreateBuffer(IRType type, MemoryLocation memoryLocation)
         {

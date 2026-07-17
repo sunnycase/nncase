@@ -1,7 +1,33 @@
-// Copyright (c) Canaan Inc. All rights reserved.
+﻿// Copyright (c) Canaan Inc. All rights reserved.
 // Licensed under the Apache license. See LICENSE file in the project root for full license information.
 
 namespace Nncase.CodeGen.PyNTT;
+
+public interface IPyNTTBlockMicroKernelTemplateModel
+{
+    string FunctionName { get; }
+
+    string MicroKernelFamily { get; set; }
+
+    string MicroKernelVariant { get; set; }
+}
+
+public interface IPyNTTMatrixMicroKernelTemplateModel : IPyNTTBlockMicroKernelTemplateModel
+{
+    int MicroKernelInnerM { get; set; }
+
+    int MicroKernelInnerN { get; set; }
+
+    int MicroKernelInnerK { get; set; }
+
+    int MicroKernelPipelineStages { get; set; }
+
+    int MicroKernelMmaM { get; set; }
+
+    int MicroKernelMmaN { get; set; }
+
+    int MicroKernelMmaK { get; set; }
+}
 
 public sealed record PyNTTBufferPointerTemplateModel(
     string Expression,
@@ -14,7 +40,8 @@ public sealed record PyNTTLocalBufferTemplateModel(
     long[] DescriptorShape,
     string BaseScalarOffset,
     long AvailableBytes,
-    int ScalarElementSizeBytes);
+    int ScalarElementSizeBytes,
+    string StorageEncoding);
 
 public sealed record PyNTTPooledByteAddressTemplateModel(
     string BaseName,
@@ -84,6 +111,18 @@ public sealed record PyNTTMemcopyTemplateModel(
     public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
 }
 
+public sealed record PyNTTRegionCopyAxisTemplateModel(
+    PyNTTDimExpression Extent,
+    PyNTTDimExpression SourceScalarStride,
+    PyNTTDimExpression DestinationScalarStride);
+
+public sealed record PyNTTRegionCopyPlanTemplateModel(
+    PyNTTDimExpression SourceBaseScalarOffset,
+    PyNTTDimExpression DestinationBaseScalarOffset,
+    PyNTTRegionCopyAxisTemplateModel[] Axes,
+    bool CoversWholeSource,
+    bool CoversWholeDestination);
+
 public sealed record PyNTTRegionCopyTemplateModel(
     string FunctionName,
     PyNTTBufferPointerTemplateModel Source,
@@ -96,9 +135,9 @@ public sealed record PyNTTRegionCopyTemplateModel(
     PyNTTDimExpression[] DestinationGlobalOffsets,
     PyNTTDimExpression[] SourceStrides,
     PyNTTDimExpression[] DestinationStrides,
-    int VectorLaneCount,
+    int[] VectorLaneShape,
     string OperationKind,
-    bool RegionsCoincident,
+    PyNTTRegionCopyPlanTemplateModel CopyPlan,
     string Comment)
 {
     public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
@@ -681,7 +720,7 @@ public sealed record PyNTTMatmulTemplateModel(
     int RhsNVectorLaneCount,
     int OutputNVectorLaneCount,
     string Scale,
-    string Comment)
+    string Comment) : IPyNTTMatrixMicroKernelTemplateModel
 {
     public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
 
@@ -698,6 +737,24 @@ public sealed record PyNTTMatmulTemplateModel(
     public int ReductionBlockN { get; set; }
 
     public int ReductionBlockK { get; set; }
+
+    public string MicroKernelFamily { get; set; } = string.Empty;
+
+    public string MicroKernelVariant { get; set; } = string.Empty;
+
+    public int MicroKernelInnerM { get; set; }
+
+    public int MicroKernelInnerN { get; set; }
+
+    public int MicroKernelInnerK { get; set; }
+
+    public int MicroKernelPipelineStages { get; set; }
+
+    public int MicroKernelMmaM { get; set; }
+
+    public int MicroKernelMmaN { get; set; }
+
+    public int MicroKernelMmaK { get; set; }
 }
 
 public sealed record PyNTTMatmulReductionFinalizeTemplateModel(
@@ -713,11 +770,29 @@ public sealed record PyNTTMatmulReductionFinalizeTemplateModel(
     bool Gemv,
     int ReductionBlockM,
     int ReductionBlockN,
-    string Comment)
+    string Comment) : IPyNTTMatrixMicroKernelTemplateModel
 {
     public string ReductionPhase { get; } = "finalize";
 
     public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
+
+    public string MicroKernelFamily { get; set; } = string.Empty;
+
+    public string MicroKernelVariant { get; set; } = string.Empty;
+
+    public int MicroKernelInnerM { get; set; }
+
+    public int MicroKernelInnerN { get; set; }
+
+    public int MicroKernelInnerK { get; set; }
+
+    public int MicroKernelPipelineStages { get; set; }
+
+    public int MicroKernelMmaM { get; set; }
+
+    public int MicroKernelMmaN { get; set; }
+
+    public int MicroKernelMmaK { get; set; }
 }
 
 public sealed record PyNTTQKVParallelLinearTemplateModel(
@@ -764,7 +839,7 @@ public sealed record PyNTTQKVParallelLinearTemplateModel(
     PyNTTDimExpression[] KOutputStrides,
     PyNTTDimExpression[] VOutputStrides,
     int[] Hierarchy,
-    string Comment)
+    string Comment) : IPyNTTMatrixMicroKernelTemplateModel
 {
     public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
 
@@ -787,6 +862,24 @@ public sealed record PyNTTQKVParallelLinearTemplateModel(
     public int ReductionKBlockN { get; set; }
 
     public int ReductionVBlockN { get; set; }
+
+    public string MicroKernelFamily { get; set; } = string.Empty;
+
+    public string MicroKernelVariant { get; set; } = string.Empty;
+
+    public int MicroKernelInnerM { get; set; }
+
+    public int MicroKernelInnerN { get; set; }
+
+    public int MicroKernelInnerK { get; set; }
+
+    public int MicroKernelPipelineStages { get; set; }
+
+    public int MicroKernelMmaM { get; set; }
+
+    public int MicroKernelMmaN { get; set; }
+
+    public int MicroKernelMmaK { get; set; }
 }
 
 public sealed record PyNTTQKVParallelLinearReductionFinalizeTemplateModel(
@@ -823,11 +916,29 @@ public sealed record PyNTTQKVParallelLinearReductionFinalizeTemplateModel(
     int ReductionQBlockN,
     int ReductionKBlockN,
     int ReductionVBlockN,
-    string Comment)
+    string Comment) : IPyNTTMatrixMicroKernelTemplateModel
 {
     public string ReductionPhase { get; } = "finalize";
 
     public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
+
+    public string MicroKernelFamily { get; set; } = string.Empty;
+
+    public string MicroKernelVariant { get; set; } = string.Empty;
+
+    public int MicroKernelInnerM { get; set; }
+
+    public int MicroKernelInnerN { get; set; }
+
+    public int MicroKernelInnerK { get; set; }
+
+    public int MicroKernelPipelineStages { get; set; }
+
+    public int MicroKernelMmaM { get; set; }
+
+    public int MicroKernelMmaN { get; set; }
+
+    public int MicroKernelMmaK { get; set; }
 }
 
 public sealed record PyNTTMatMulGluTemplateModel(
@@ -861,7 +972,7 @@ public sealed record PyNTTMatMulGluTemplateModel(
     PyNTTDimExpression[] GateBiasStrides,
     PyNTTDimExpression[] UpBiasStrides,
     PyNTTDimExpression[] OutputStrides,
-    string Comment)
+    string Comment) : IPyNTTMatrixMicroKernelTemplateModel
 {
     public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
 
@@ -878,6 +989,24 @@ public sealed record PyNTTMatMulGluTemplateModel(
     public int ReductionBlockN { get; set; }
 
     public int ReductionBlockK { get; set; }
+
+    public string MicroKernelFamily { get; set; } = string.Empty;
+
+    public string MicroKernelVariant { get; set; } = string.Empty;
+
+    public int MicroKernelInnerM { get; set; }
+
+    public int MicroKernelInnerN { get; set; }
+
+    public int MicroKernelInnerK { get; set; }
+
+    public int MicroKernelPipelineStages { get; set; }
+
+    public int MicroKernelMmaM { get; set; }
+
+    public int MicroKernelMmaN { get; set; }
+
+    public int MicroKernelMmaK { get; set; }
 }
 
 public sealed record PyNTTMatMulGluReductionFinalizeTemplateModel(
@@ -903,11 +1032,29 @@ public sealed record PyNTTMatMulGluReductionFinalizeTemplateModel(
     int NVectorLaneCount,
     int ReductionBlockM,
     int ReductionBlockN,
-    string Comment)
+    string Comment) : IPyNTTMatrixMicroKernelTemplateModel
 {
     public string ReductionPhase { get; } = "finalize";
 
     public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
+
+    public string MicroKernelFamily { get; set; } = string.Empty;
+
+    public string MicroKernelVariant { get; set; } = string.Empty;
+
+    public int MicroKernelInnerM { get; set; }
+
+    public int MicroKernelInnerN { get; set; }
+
+    public int MicroKernelInnerK { get; set; }
+
+    public int MicroKernelPipelineStages { get; set; }
+
+    public int MicroKernelMmaM { get; set; }
+
+    public int MicroKernelMmaN { get; set; }
+
+    public int MicroKernelMmaK { get; set; }
 }
 
 public sealed record PyNTTSummaTemplateModel(
@@ -969,7 +1116,7 @@ public sealed record PyNTTReduceTemplateModel(
     string InitValue,
     string UpdateExpression,
     string FinalizeExpression,
-    string Comment)
+    string Comment) : IPyNTTBlockMicroKernelTemplateModel
 {
     public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
 
@@ -980,6 +1127,10 @@ public sealed record PyNTTReduceTemplateModel(
     public string AccumulatorTritonDType { get; set; } = "tl.float32";
 
     public bool TrackReductionElementCount { get; set; }
+
+    public string MicroKernelFamily { get; set; } = string.Empty;
+
+    public string MicroKernelVariant { get; set; } = string.Empty;
 }
 
 public sealed record PyNTTReduceReductionFinalizeTemplateModel(
@@ -992,11 +1143,15 @@ public sealed record PyNTTReduceReductionFinalizeTemplateModel(
     string FinalizeExpression,
     int ReductionBlockSize,
     bool TrackReductionElementCount,
-    string Comment)
+    string Comment) : IPyNTTBlockMicroKernelTemplateModel
 {
     public string ReductionPhase { get; } = "finalize";
 
     public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
+
+    public string MicroKernelFamily { get; set; } = string.Empty;
+
+    public string MicroKernelVariant { get; set; } = string.Empty;
 }
 
 public sealed record PyNTTSoftmaxTemplateModel(

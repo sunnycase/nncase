@@ -20,11 +20,6 @@ public partial class NTTAffineSelectionPass
         }
 
         var rank = inputTensorType.Shape.Rank;
-        if (rank <= 0)
-        {
-            throw new NotSupportedException("Scalar Boxing cannot be tiled as an affine transfer.");
-        }
-
         var inputConstrainsDomain = input.CheckedType is DistributedType;
         var inputDomainMode = inputConstrainsDomain ? GridDomainMode.Constraint : GridDomainMode.Footprint;
         var outputDomainMode = inputConstrainsDomain ? GridDomainMode.Footprint : GridDomainMode.Constraint;

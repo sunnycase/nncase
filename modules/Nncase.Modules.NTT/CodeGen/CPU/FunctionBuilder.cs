@@ -22,14 +22,24 @@ internal class FunctionBuilder
     private readonly BinaryWriter _textWriter;
     private readonly BinaryWriter _rdataWriter;
     private readonly IReadOnlyList<BinaryWriter> _blockLocalRdataWriters;
+    private readonly ulong _chipLocalRdataBase;
+    private readonly ulong _mergedRdataPoolSize;
 
-    public FunctionBuilder(uint id, BinaryWriter rdataWriter, IReadOnlyList<BinaryWriter> blockLocalRdataWriters, Targets.NTTTargetOptions targetOptions)
+    public FunctionBuilder(
+        uint id,
+        BinaryWriter rdataWriter,
+        IReadOnlyList<BinaryWriter> blockLocalRdataWriters,
+        Targets.NTTTargetOptions targetOptions,
+        ulong chipLocalRdataBase,
+        ulong mergedRdataPoolSize)
     {
         _id = id;
         _sectionManager = new();
         _textWriter = _sectionManager.GetWriter(WellknownSectionNames.Text);
         _rdataWriter = rdataWriter;
         _blockLocalRdataWriters = blockLocalRdataWriters;
+        _chipLocalRdataBase = chipLocalRdataBase;
+        _mergedRdataPoolSize = mergedRdataPoolSize;
         TargetOptions = targetOptions;
     }
 
@@ -39,53 +49,42 @@ internal class FunctionBuilder
     {
         if (baseFunc is TIR.PrimFunction primFunc)
         {
-            if (!primFunc.Name.Contains("device_func", StringComparison.Ordinal))
+            if (primFunc.Role != FunctionRole.ScheduledRegion)
             {
                 // 1. write the rdata
-                ulong rdataPoolSize = ulong.MinValue;
-                foreach (var (@const, range) in primFunc.SchedResult.Rdatas)
-                {
-                    var tensor = ((TensorConst)@const).Value;
-                    var size = range.Max - range.Min;
-                    rdataPoolSize = System.Math.Max(range.Max, rdataPoolSize);
-                    if ((ulong)tensor.Length * (ulong)tensor.ElementType.SizeInBytes != size)
-                    {
-                        throw new InvalidDataException("The Buffer Size Not Equal!");
-                    }
-
-                    _rdataWriter.Position(checked((long)range.Min));
-                    tensor.Serialize(_rdataWriter.BaseStream);
-                }
+                SerializeGlobalRdata(primFunc.SchedResult.Rdatas, 0, "rdata");
+                SerializeGlobalRdata(primFunc.SchedResult.ChipLocalRdatas, _chipLocalRdataBase, "chip-local rdata");
 
                 // 2. write the local rdatas
                 var blockLocalRdataPoolSize = SerializeLocalRdata(primFunc.SchedResult.BlockLocalRdatas, _blockLocalRdataWriters, "b");
 
                 // 3. build function.
-                var visitor = new KernelCSourceConvertVisitor(TargetOptions);
+                var visitor = new KernelCSourceConvertVisitor(TargetOptions, _chipLocalRdataBase);
                 visitor.Visit(primFunc);
                 var functionCSource = visitor.GetCSource();
 
                 // 4. write the kernel desc
                 using (var writer = _sectionManager.GetWriter(LinkableKernelFunction.KernelHeaderSectionName))
                 {
+                    var entryAbi = KernelEntryAbiLayout.Create(primFunc);
                     var header = default(KernelDescHeader);
-                    header.OutputAlign = (uint)primFunc.SchedResult.OutputAlign;
+                    header.OutputAlign = checked((uint)entryAbi.OutputAlignment);
                     header.LocalDataAlign = (uint)primFunc.SchedResult.DataAlign;
-                    header.OutputPoolSize = primFunc.SchedResult.OutputUsage;
+                    header.OutputPoolSize = entryAbi.OutputPoolSize;
                     header.LocalDataPoolSize = primFunc.SchedResult.DataUsage;
                     header.BlockLocalDataPoolSize = primFunc.SchedResult.BlockLocalDataPoolSize;
                     writer.Write(ref header);
                 }
 
                 var memoryPoolDesc = new KernelMemoryPoolDesc(
-                    rdataPoolSize,
+                    _mergedRdataPoolSize,
                     blockLocalRdataPoolSize);
                 var kernelDescSection = new LinkedSection(_sectionManager.GetContent(LinkableKernelFunction.KernelHeaderSectionName)!, ".desc", 0, 8, (uint)sizeof(KernelDescHeader));
                 return new LinkableKernelFunction(_id, primFunc, functionCSource, memoryPoolDesc, _sectionManager.GetContent(WellknownSectionNames.Text)!, kernelDescSection);
             }
             else
             {
-                var visitor = new DeviceCSourceConvertVisitor();
+                var visitor = new DeviceCSourceConvertVisitor(TargetOptions);
                 visitor.Visit(primFunc);
                 var header = visitor.GetHeader();
                 return new LinkableDeviceFunction(_id, primFunc, header, _sectionManager.GetContent(WellknownSectionNames.Text)!);
@@ -100,6 +99,27 @@ internal class FunctionBuilder
         }
 
         throw new NotSupportedException($"the {baseFunc.GetType()} {baseFunc.Name} is notsupport for codegen!");
+    }
+
+    private void SerializeGlobalRdata(
+        IReadOnlyDictionary<Const, ValueRange<ulong>> rdatas,
+        ulong baseOffset,
+        string poolName)
+    {
+        foreach (var (@const, range) in rdatas)
+        {
+            var tensor = ((TensorConst)@const).Value;
+            var size = range.Max - range.Min;
+            var tensorSize = checked((ulong)tensor.Length * (ulong)tensor.ElementType.SizeInBytes);
+            if (tensorSize != size)
+            {
+                throw new InvalidDataException(
+                    $"The {poolName} allocation for {@const} is {size} bytes, but its tensor payload is {tensorSize} bytes.");
+            }
+
+            _rdataWriter.Position(checked((long)(baseOffset + range.Min)));
+            tensor.Serialize(_rdataWriter.BaseStream);
+        }
     }
 
     private ulong SerializeLocalRdata(IReadOnlyDictionary<Const, ValueRange<ulong>> localRdatas, IReadOnlyList<BinaryWriter> localRdataWriters, string scopeName)

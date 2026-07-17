@@ -381,12 +381,18 @@ public class Compiler : ICompiler
 
         passManager.AddWithName<RemoveFunctionWrapperPass>("RemoveFunctionWrapper");
 
+        passManager.Add<SpecializePrimFunctionBufferLayoutsPass>();
+
         passManager.Add<RemoveUnusedFunctions>();
         passManager.Add<InferRangePass>();
         passManager.Add<OptimizeByRangePass>();
         target.RegisterTIRPreBufferizePass(passManager, _compileSession.CompileOptions);
         passManager.Add<CanonicalizeTIRIndexExpressionsPass>();
         passManager.Add<BufferizePass>();
+        passManager.AddWithName<PrimFuncPass>("PeelTiledLoopTails").Configure(p =>
+        {
+            p.Add<Passes.Mutators.TailLoopPeeling>();
+        });
         target.RegisterTIRPostBufferizePass(passManager, _compileSession.CompileOptions);
         passManager.Add<CanonicalizeTIRIndexExpressionsPass>();
 
@@ -394,8 +400,8 @@ public class Compiler : ICompiler
         {
             p.Add<Passes.Mutators.UnFoldBlock>();
             p.Add<Passes.Mutators.FlattenSequential>();
-            p.Add<Passes.Mutators.TailLoopStripping>();
             p.Add<Passes.Mutators.FoldConstCall>();
+            p.Add<Passes.Mutators.EliminateEmptyLoops>();
             p.Add<Passes.Mutators.FlattenBuffer>();
             p.Add<Passes.Mutators.RemoveNop>();
         });

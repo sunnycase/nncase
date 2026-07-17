@@ -943,6 +943,48 @@ public sealed class UnitTestTileGraph : TestClassBase
     }
 
     [Fact]
+    public void TestPackedMatMulMaterializesBitcastLhsInSharedMemory()
+    {
+        using var ctx = IntegerSetLibrary.ctx.Create();
+        var targetOptions = new Targets.NTTTargetOptions
+        {
+            TargetMachineModel = Targets.NTTTargetMachineCatalog.Resolve(Targets.NTTTargetMachineCatalog.Rtx5060Ti16Gb),
+        };
+        CompileOptions.TargetOptions = targetOptions;
+        var packedInputType = new VectorType(DataTypes.BFloat16, [8]);
+        var input = new Var("input", new TensorType(packedInputType, new[] { 1, 128 }));
+        var logicalInput = IR.F.Tensors.Bitcast(input, DataTypes.BFloat16);
+        var packedWeightType = new VectorType(DataTypes.BFloat16, [2, 16]);
+        var weight = new Var("weight", new TensorType(packedWeightType, new[] { 149, 1024 }));
+        var matmul = IR.F.NTT.PackedMatMul(logicalInput, weight, outDataType: DataTypes.BFloat16);
+        var function = new Function("main", Targets.CPUTarget.Kind, matmul, [input, weight]);
+        var selected = Assert.IsType<Function>(
+            new NTTAffineSelectionPass(CompileOptions).RunAsync(function, new()).Result);
+
+        var tiled = new Schedule.GraphTiler().Tile(
+            selected.Body,
+            Targets.CPUTarget.Kind,
+            targetOptions,
+            Array.Empty<DimVar>());
+        var deviceFunction = Assert.Single(
+            ExprCollector.Collect(tiled)
+                .OfType<PrimFunctionWrapper>()
+                .Select(wrapper => wrapper.Target)
+                .Where(primFunction => ExprCollector.Collect(primFunction.Body)
+                    .OfType<Call>()
+                    .Any(call => call.Target is TIR.NTT.PackedMatMul)));
+        var calls = ExprCollector.Collect(deviceFunction.Body).OfType<Call>().ToArray();
+        var tileLoads = calls.Where(call => call.Target is TIR.TileLoad).ToArray();
+        var sharedBuffers = ExprCollector.Collect(deviceFunction.Body)
+            .OfType<PhysicalBuffer>()
+            .Where(buffer => buffer.Location == MemoryLocation.Shared && buffer.Size.FixedValue > 0)
+            .ToArray();
+
+        Assert.Equal(2, tileLoads.Length);
+        Assert.True(sharedBuffers.Length >= 3, "PackedMatMul lhs, rhs, and output must use explicit shared-memory tiles.");
+    }
+
+    [Fact]
     public void TestPackedQKVParallelLinearAffineSelectionUsesSharedProjectionDomain()
     {
         using var ctx = IntegerSetLibrary.ctx.Create();
@@ -1020,12 +1062,11 @@ public sealed class UnitTestTileGraph : TestClassBase
             .ToArray();
         localShapes[outputAccessIndex][^2] = solver.MakeIntConst(1);
         localShapes[outputAccessIndex][^1] = solver.MakeIntConst(1);
-        var stateBytes = workload.GetReductionStateBytes(
+        var state = Assert.Single(workload.GetReductionStates(
             localShapes,
             solver,
-            new(tileGrid.Op, tileGrid.BufferShapes, tileGrid.BufferDataTypes),
-            Targets.NTTTargetMachineCatalog.Resolve(Targets.NTTTargetMachineCatalog.Rtx5060Ti16Gb));
-        Assert.Equal(16 * 16 * DataTypes.Float32.SizeInBytes, stateBytes.Var().Max());
+            new(tileGrid.Op, tileGrid.BufferShapes, tileGrid.BufferDataTypes)));
+        Assert.Equal(DataTypes.Float32.SizeInBytes, state.GetLogicalBytes().Var().Max());
     }
 
     [Fact]
@@ -1970,6 +2011,8 @@ public sealed class UnitTestTileGraph : TestClassBase
             out _,
             out _,
             out var tileNodeMemo,
+            out _,
+            out _,
             out _);
         var intermediateLevels = tileNodeMemo
             .Where(item => item.Value.BufferInfoMap.Keys.Any(buffer =>
@@ -1979,6 +2022,151 @@ public sealed class UnitTestTileGraph : TestClassBase
             .Order()
             .ToArray();
         Assert.Equal(new[] { 0, 1 }, intermediateLevels);
+    }
+
+    [Fact]
+    public void TestTailCoverageKeepsPowerOfTwoLeafTileForPrimeExtent()
+    {
+        using var ctx = IntegerSetLibrary.ctx.Create();
+        var targetOptions = Assert.IsAssignableFrom<INTTTargetOptions>(CompileOptions.TargetOptions);
+        var input = new Var("input", new TensorType(DataTypes.Float32, new[] { 149 }));
+        var function = new Function(
+            "main",
+            Targets.CPUTarget.Kind,
+            IR.F.Math.Unary(UnaryOp.Neg, input),
+            [input]);
+        var selected = Assert.IsType<Function>(
+            new NTTAffineSelectionPass(CompileOptions).RunAsync(function, new()).Result);
+        var rootGraph = TieredTileGraphBuilder.Build(
+            selected.Body,
+            targetOptions.TargetMachineModel.TilingMemorySpaces.Length,
+            out _);
+        var bufferGraphMemo = rootGraph.Bufferize();
+        _ = TileNode.FromTileGraph(rootGraph, out var treeMemo);
+        var component = Assert.Single(rootGraph.Condense().Vertices);
+        var componentTree = treeMemo[component];
+
+        TreeSolverInitializer.Init(
+            componentTree,
+            bufferGraphMemo,
+            targetOptions.TargetMachineModel.TilingMemorySpaces.Length,
+            targetOptions,
+            out var solver,
+            out var opNodeMemo,
+            out var tileNodeMemo,
+            out var tileableNodeMemo,
+            out var coverageConstraints,
+            out _);
+        var opNode = Assert.Single(opNodeMemo.Keys);
+        solver.Add(solver.MakeEquality(tileableNodeMemo[opNode].TileVars[0], 8));
+        var decisionVars = tileableNodeMemo.Values
+            .SelectMany(info => info.TileVars)
+            .Select(expr => expr.Var())
+            .Distinct()
+            .ToArray();
+        var decisionBuilder = solver.MakePhase(
+            decisionVars,
+            Google.OrTools.ConstraintSolver.Solver.CHOOSE_FIRST_UNBOUND,
+            Google.OrTools.ConstraintSolver.Solver.ASSIGN_MIN_VALUE);
+        var selectedTileVar = tileableNodeMemo[opNode].TileVars[0].Var();
+        var leafOwner = Assert.IsType<TileNode>(opNode.Parent);
+        var leafTripVar = tileNodeMemo[leafOwner].TripCounts[^1].Var();
+        var rootTripVar = tileNodeMemo[componentTree].TripCounts[0].Var();
+        var inputBuffer = Assert.Single(
+            tileNodeMemo[leafOwner].BufferInfoMap,
+            pair => pair.Key.Node == opNode.Wrapped && pair.Key.Endpoint == BufferEndpoint.Input).Value;
+        var inputCapacityVar = inputBuffer.Sizes[^1].Var();
+        var inputEventVar = inputBuffer.Trips[^1].Var();
+        var inputTransferBytesVar = inputBuffer.TransferBytes[^1].Var();
+
+        solver.NewSearch(decisionBuilder);
+        try
+        {
+            Assert.True(solver.NextSolution());
+            Assert.NotEmpty(coverageConstraints[opNode]);
+            Assert.Equal(8, selectedTileVar.Value());
+            Assert.Equal(19, leafTripVar.Value());
+            Assert.Equal(1, rootTripVar.Value());
+            Assert.Equal(8 * sizeof(float), inputCapacityVar.Value());
+            Assert.Equal(19, inputEventVar.Value());
+            Assert.Equal(149 * sizeof(float), inputTransferBytesVar.Value());
+        }
+        finally
+        {
+            solver.EndSearch();
+        }
+    }
+
+    [Fact]
+    public void TestTailTransferBytesEnumerateMultidimensionalBoundarySlabs()
+    {
+        using var ctx = IntegerSetLibrary.ctx.Create();
+        var targetOptions = Assert.IsAssignableFrom<INTTTargetOptions>(CompileOptions.TargetOptions);
+        var input = new Var("input", new TensorType(DataTypes.Float32, new[] { 5, 7 }));
+        var function = new Function(
+            "main",
+            Targets.CPUTarget.Kind,
+            IR.F.Math.Unary(UnaryOp.Neg, input),
+            [input]);
+        var selected = Assert.IsType<Function>(
+            new NTTAffineSelectionPass(CompileOptions).RunAsync(function, new()).Result);
+        var rootGraph = TieredTileGraphBuilder.Build(
+            selected.Body,
+            targetOptions.TargetMachineModel.TilingMemorySpaces.Length,
+            out _);
+        var bufferGraphMemo = rootGraph.Bufferize();
+        _ = TileNode.FromTileGraph(rootGraph, out var treeMemo);
+        var component = Assert.Single(rootGraph.Condense().Vertices);
+        var componentTree = treeMemo[component];
+
+        TreeSolverInitializer.Init(
+            componentTree,
+            bufferGraphMemo,
+            targetOptions.TargetMachineModel.TilingMemorySpaces.Length,
+            targetOptions,
+            out var solver,
+            out var opNodeMemo,
+            out var tileNodeMemo,
+            out var tileableNodeMemo,
+            out var coverageConstraints,
+            out _);
+        var opNode = Assert.Single(opNodeMemo.Keys);
+        var leafTileVars = tileableNodeMemo[opNode].TileVars;
+        Assert.Equal(2, leafTileVars.Length);
+        solver.Add(solver.MakeEquality(leafTileVars[0], 4));
+        solver.Add(solver.MakeEquality(leafTileVars[1], 4));
+        var decisionVars = tileableNodeMemo.Values
+            .SelectMany(info => info.TileVars)
+            .Select(expr => expr.Var())
+            .Distinct()
+            .ToArray();
+        var decisionBuilder = solver.MakePhase(
+            decisionVars,
+            Google.OrTools.ConstraintSolver.Solver.CHOOSE_FIRST_UNBOUND,
+            Google.OrTools.ConstraintSolver.Solver.ASSIGN_MIN_VALUE);
+        var leafOwner = Assert.IsType<TileNode>(opNode.Parent);
+        var inputBuffer = Assert.Single(
+            tileNodeMemo[leafOwner].BufferInfoMap,
+            pair => pair.Key.Node == opNode.Wrapped && pair.Key.Endpoint == BufferEndpoint.Input).Value;
+        var selectedLeafTileVars = leafTileVars.Select(tileVar => tileVar.Var()).ToArray();
+        var inputCapacityVar = inputBuffer.Sizes[^1].Var();
+        var inputEventVar = inputBuffer.Trips[^1].Var();
+        var inputTransferBytesVar = inputBuffer.TransferBytes[^1].Var();
+
+        solver.NewSearch(decisionBuilder);
+        try
+        {
+            Assert.True(solver.NextSolution());
+            Assert.NotEmpty(coverageConstraints[opNode]);
+            Assert.Equal(new long[] { 4, 4 }, selectedLeafTileVars.Select(tileVar => tileVar.Value()));
+            Assert.Equal(4 * 4 * sizeof(float), inputCapacityVar.Value());
+            Assert.Equal(4, inputEventVar.Value());
+            Assert.Equal(5 * 7 * sizeof(float), inputTransferBytesVar.Value());
+        }
+        finally
+        {
+            solver.EndSearch();
+        }
     }
 
     [Fact]
@@ -2128,9 +2316,10 @@ public sealed class UnitTestTileGraph : TestClassBase
             false);
         return new TargetMachineModel(
             $"tile-graph-test-{levelCount}",
-            new(BlockExecutionKind.CpuCore, 1, 1, 1, 1.0, 512, 4, 64 * 1024, 1, 1, 1),
+            new(BlockExecutionKind.CpuCore, 1, 1, 1, 1.0, 512, 4),
             new(16, 16, ImmutableArray<MatrixComputePrimitiveSpec>.Empty),
             new(25, 25_000),
+            [new(new TargetPrivateResourceId("test.backend-private"), TargetPrivateResourceUnit.Bytes, 64 * 1024, 4)],
             resources,
             localSpaces.Append(rootSpace),
             root,

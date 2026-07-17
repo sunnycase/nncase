@@ -41,6 +41,7 @@ def validate_triton_kernel_resources(
     *args,
     grid,
     expected_num_warps: int,
+    registers_per_thread_limit: int,
     shared_memory_capacity_bytes: int,
     forbid_spills: bool,
     **kwargs,
@@ -53,6 +54,7 @@ def validate_triton_kernel_resources(
     key = (
         compiled.hash,
         expected_num_warps,
+        registers_per_thread_limit,
         shared_memory_capacity_bytes,
         forbid_spills,
     )
@@ -65,6 +67,13 @@ def validate_triton_kernel_resources(
         raise TritonKernelResourceError(
             f"Triton kernel {compiled.name} compiled with {actual_num_warps} warps; "
             f"the target execution model requires {expected_num_warps}."
+        )
+
+    registers_per_thread = int(compiled.n_regs)
+    if registers_per_thread > registers_per_thread_limit:
+        raise TritonKernelResourceError(
+            f"Triton kernel {compiled.name} uses {registers_per_thread} registers "
+            f"per thread, exceeding the target limit {registers_per_thread_limit}."
         )
 
     shared_bytes = int(compiled.metadata.shared)
@@ -99,6 +108,7 @@ def select_and_validate_triton_tuning_parameter(
     kernel_args: tuple[object, ...],
     grid_for_candidate,
     expected_num_warps: int,
+    registers_per_thread_limit: int,
     shared_memory_capacity_bytes: int,
     forbid_spills: bool,
     **launch_options,
@@ -125,6 +135,7 @@ def select_and_validate_triton_tuning_parameter(
             )
         ),
         expected_num_warps,
+        registers_per_thread_limit,
         shared_memory_capacity_bytes,
         forbid_spills,
     )
@@ -140,6 +151,7 @@ def select_and_validate_triton_tuning_parameter(
                 candidate,
                 grid=grid_for_candidate(candidate),
                 expected_num_warps=expected_num_warps,
+                registers_per_thread_limit=registers_per_thread_limit,
                 shared_memory_capacity_bytes=shared_memory_capacity_bytes,
                 forbid_spills=forbid_spills,
                 **launch_options,

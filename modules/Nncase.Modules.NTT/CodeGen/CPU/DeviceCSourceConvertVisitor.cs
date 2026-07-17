@@ -16,6 +16,7 @@ using DryIoc;
 using NetFabric.Hyperlinq;
 using Nncase.IR;
 using Nncase.Runtime;
+using Nncase.Targets;
 using Nncase.TIR;
 using Nncase.Utilities;
 using Razor.Templating.Core;
@@ -27,14 +28,18 @@ public class DeviceCSourceConvertVisitor : CSourceConvertVisitor
     protected readonly StringBuilder _deviceBuilder;
 
     private readonly Dictionary<IVar, BaseExpr> _letBindings = new(ReferenceEqualityComparer.Instance);
+    private readonly Dictionary<int, string> _cacheArenaNames = new();
     private readonly Stack<Dictionary<Call, ReductionState>> _reductionScopes = new();
     private int _regionCopyCounter;
     private int _reductionStateCounter;
 
-    public DeviceCSourceConvertVisitor()
+    public DeviceCSourceConvertVisitor(NTTTargetOptions targetOptions)
     {
         _deviceBuilder = new();
+        TargetOptions = targetOptions;
     }
+
+    public NTTTargetOptions TargetOptions { get; }
 
     public static void WriteWithProfiler(string functionName, string tagName = "")
     {
@@ -109,6 +114,13 @@ public class DeviceCSourceConvertVisitor : CSourceConvertVisitor
             // 2. Function body
             using (_ = new IndentScope())
             {
+                foreach (var arena in CollectCacheArenas(expr))
+                {
+                    var name = $"cache_l{arena.Hierarchy}";
+                    _cacheArenaNames.Add(arena.Hierarchy, name);
+                    IndentScope.Writer.IndWrite($"alignas({arena.Alignment}) std::byte {name}[{arena.Size}];\n");
+                }
+
                 Visit(expr.Body);
             }
 
@@ -208,7 +220,9 @@ public class DeviceCSourceConvertVisitor : CSourceConvertVisitor
         var size = Visit(expr.Size);
         string name = expr.Location switch
         {
-            MemoryLocation.Cache => $"tar::get_cache_address<{expr.Hierarchy}>()",
+            MemoryLocation.Cache => _cacheArenaNames.TryGetValue(expr.Hierarchy, out var cacheArenaName)
+                ? cacheArenaName
+                : throw new InvalidOperationException($"Cache hierarchy {expr.Hierarchy} has no function-local arena."),
             MemoryLocation.Input or MemoryLocation.Output => start.Name,
             _ => throw new NotSupportedException(expr.Location.ToString()),
         };
@@ -217,6 +231,61 @@ public class DeviceCSourceConvertVisitor : CSourceConvertVisitor
         symbol = new(start.Type, str);
         _exprMemo.Add(expr, symbol);
         return symbol;
+    }
+
+    private (int Hierarchy, int Alignment, long Size)[] CollectCacheArenas(PrimFunction function)
+    {
+        return ExprCollector.Collect(function.Body)
+            .OfType<PhysicalBuffer>()
+            .Where(buffer => buffer.Location == MemoryLocation.Cache)
+            .GroupBy(buffer => buffer.Hierarchy)
+            .Select(group =>
+            {
+                var space = TargetOptions.TargetMachineModel.TilingMemorySpaces.SingleOrDefault(
+                    candidate => candidate.TIRBinding is { Location: MemoryLocation.Cache } binding &&
+                        binding.Hierarchy == group.Key)
+                    ?? throw new InvalidOperationException(
+                        $"Target {TargetOptions.TargetMachineModel.Id} does not bind cache hierarchy {group.Key}.");
+                var resource = TargetOptions.TargetMachineModel.GetMemoryResource(space);
+                var size = group.Max(buffer => checked(GetFixedBufferStart(buffer) + buffer.Size.FixedValue));
+                if (size <= 0 || size > space.MaxAllocationBytesPerScope)
+                {
+                    throw new InvalidOperationException(
+                        $"Cache hierarchy {group.Key} requires {size} bytes, outside its allocation limit {space.MaxAllocationBytesPerScope}.");
+                }
+
+                var alignment = Math.Max(resource.AllocationGranularityBytes, group.Max(buffer => buffer.Alignment));
+                return (group.Key, alignment, size);
+            })
+            .OrderBy(arena => arena.Key)
+            .Select(arena => (arena.Key, arena.alignment, arena.size))
+            .ToArray();
+    }
+
+    private static long GetFixedBufferStart(PhysicalBuffer buffer)
+    {
+        if (!buffer.Size.IsFixed)
+        {
+            throw new InvalidOperationException(
+                $"Cache buffer allocation size must be fixed before NTT codegen, got {buffer.Size}.");
+        }
+
+        try
+        {
+            return buffer.Start switch
+            {
+                TensorConst { Value: Tensor { ElementType: PointerType, Shape.IsScalar: true } pointer } =>
+                    checked((long)pointer.ToScalar<ulong>()),
+                TensorConst { Value.Shape.IsScalar: true } tensorConst =>
+                    Convert.ToInt64(tensorConst.Value[Array.Empty<long>()]),
+                _ => throw new InvalidOperationException(
+                    $"Cache buffer start must be allocated before NTT codegen, got {buffer.Start}."),
+            };
+        }
+        catch (OverflowException ex)
+        {
+            throw new InvalidOperationException($"Cache buffer start is outside Int64 range: {buffer.Start}.", ex);
+        }
     }
 
     /// <inheritdoc/>
@@ -284,7 +353,7 @@ public class DeviceCSourceConvertVisitor : CSourceConvertVisitor
         if (TryGetReductionState(expr, out var reductionState))
         {
             EmitReductionKernel(reductionState, arguments, ReductionKernelPhase.Accumulate);
-            reductionState.UpdateEmitted = true;
+            reductionState.UpdateCount++;
             symbol = new(type, str);
             _exprMemo.Add(expr, symbol);
             return symbol;
@@ -650,9 +719,25 @@ public class DeviceCSourceConvertVisitor : CSourceConvertVisitor
             return symbol;
         }
 
-        foreach (var field in expr.Fields)
+        for (var index = 0; index < expr.Fields.Length; index++)
         {
-            Visit(field);
+            if (ReductionCodegenUtility.TryGetAdjacentReductionLoopPartitionPair(expr.Fields, index, out var fullLoop, out var tailLoop))
+            {
+                if (_reductionScopes.Count == 0)
+                {
+                    VisitPartitionedReductionLoops(fullLoop, tailLoop);
+                }
+                else
+                {
+                    Visit(fullLoop);
+                    Visit(tailLoop);
+                }
+
+                index++;
+                continue;
+            }
+
+            Visit(expr.Fields[index]);
         }
 
         symbol = new(string.Empty, string.Empty);
@@ -700,17 +785,7 @@ public class DeviceCSourceConvertVisitor : CSourceConvertVisitor
 
             if (ownsReductionScope)
             {
-                foreach (var state in reductionScope!.Values)
-                {
-                    if (!state.UpdateEmitted)
-                    {
-                        throw new InvalidOperationException(
-                            $"NTT reduction operation {state.Call.Target.GetType().Name} did not emit an accumulator update.");
-                    }
-
-                    var arguments = state.Call.Arguments.AsValueEnumerable().Select(Visit).ToArray();
-                    EmitReductionKernel(state, arguments, ReductionKernelPhase.Finalize);
-                }
+                EmitReductionFinalizers(reductionScope!);
             }
         }
         finally
@@ -726,18 +801,38 @@ public class DeviceCSourceConvertVisitor : CSourceConvertVisitor
         return symbol;
     }
 
-    private Dictionary<Call, ReductionState> CreateReductionScope(For reductionLoop)
+    private void VisitPartitionedReductionLoops(For fullLoop, For tailLoop)
     {
-        var calls = ReductionCodegenUtility.CollectReductionCalls(reductionLoop.Body);
-        if (calls.Length == 0)
+        var reductionScope = CreateReductionScope(fullLoop.Body, tailLoop.Body);
+        _reductionScopes.Push(reductionScope);
+        try
         {
-            throw new InvalidOperationException(
-                $"NTT reduction loop {reductionLoop.LoopVar.Name} contains no backend reduction operation.");
+            EmitReductionInitializers(reductionScope);
+            Visit(fullLoop);
+            Visit(tailLoop);
+            EmitReductionFinalizers(reductionScope);
+        }
+        finally
+        {
+            _reductionScopes.Pop();
+        }
+    }
+
+    private Dictionary<Call, ReductionState> CreateReductionScope(For reductionLoop)
+        => CreateReductionScope(reductionLoop.Body);
+
+    private Dictionary<Call, ReductionState> CreateReductionScope(params BaseExpr[] bodies)
+    {
+        var groups = ReductionCodegenUtility.CollectReductionCallGroups(bodies);
+        if (groups.Length == 0)
+        {
+            throw new InvalidOperationException("NTT reduction scope contains no backend reduction operation.");
         }
 
         var scope = new Dictionary<Call, ReductionState>(ReferenceEqualityComparer.Instance);
-        foreach (var call in calls)
+        foreach (var group in groups)
         {
+            var call = group.Prototype;
             var kind = call.Target switch
             {
                 TIR.NTT.Matmul => ReductionKernelKind.Matmul,
@@ -774,7 +869,7 @@ public class DeviceCSourceConvertVisitor : CSourceConvertVisitor
             var elementCount = call.Target is TIR.NTT.Reduce { ReduceOp: ReduceOp.Mean }
                 ? $"ntt_reduction_{stateId}_element_count"
                 : null;
-            scope.Add(call, new ReductionState(
+            var state = new ReductionState(
                 call,
                 kind,
                 stateOutputs,
@@ -782,11 +877,36 @@ public class DeviceCSourceConvertVisitor : CSourceConvertVisitor
                     .Select(index => $"ntt_reduction_{stateId}_acc{index}")
                     .ToArray(),
                 $"ntt_reduction_{stateId}_initialized",
-                elementCount));
+                elementCount,
+                group.Calls.Length);
+            foreach (var groupedCall in group.Calls)
+            {
+                scope.Add(groupedCall, state);
+            }
         }
 
         return scope;
     }
+
+    private void EmitReductionFinalizers(IReadOnlyDictionary<Call, ReductionState> scope)
+    {
+        foreach (var state in GetDistinctReductionStates(scope))
+        {
+            if (state.UpdateCount != state.ExpectedUpdateCount)
+            {
+                throw new InvalidOperationException(
+                    $"NTT reduction operation {state.Call.Target.GetType().Name} emitted " +
+                    $"{state.UpdateCount} of {state.ExpectedUpdateCount} expected accumulator updates.");
+            }
+
+            var arguments = state.Call.Arguments.AsValueEnumerable().Select(Visit).ToArray();
+            EmitReductionKernel(state, arguments, ReductionKernelPhase.Finalize);
+        }
+    }
+
+    private static IEnumerable<ReductionState> GetDistinctReductionStates(
+        IReadOnlyDictionary<Call, ReductionState> scope)
+        => new HashSet<ReductionState>(scope.Values, ReferenceEqualityComparer.Instance);
 
     private static void WriteTopologyBarrier(TIR.NTT.BarrierScope scope)
     {
@@ -859,7 +979,7 @@ public class DeviceCSourceConvertVisitor : CSourceConvertVisitor
 
     private void EmitReductionInitializers(IReadOnlyDictionary<Call, ReductionState> scope)
     {
-        foreach (var state in scope.Values)
+        foreach (var state in GetDistinctReductionStates(scope))
         {
             for (var index = 0; index < state.Outputs.Length; index++)
             {
@@ -893,10 +1013,11 @@ public class DeviceCSourceConvertVisitor : CSourceConvertVisitor
         CSymbol[] arguments,
         ReductionKernelPhase phase)
     {
-        if (phase == ReductionKernelPhase.Accumulate && state.UpdateEmitted)
+        if (phase == ReductionKernelPhase.Accumulate && state.UpdateCount >= state.ExpectedUpdateCount)
         {
             throw new InvalidOperationException(
-                $"NTT reduction operation {state.Call.Target.GetType().Name} occurs more than once in one reduction-loop body.");
+                $"NTT reduction operation {state.Call.Target.GetType().Name} exceeds its " +
+                $"{state.ExpectedUpdateCount} planned accumulator updates.");
         }
 
         var context = new ReductionKernelTemplateContext(
@@ -1182,7 +1303,8 @@ public class DeviceCSourceConvertVisitor : CSourceConvertVisitor
             BaseExpr[] outputs,
             string[] accumulators,
             string initialized,
-            string? elementCount)
+            string? elementCount,
+            int expectedUpdateCount)
         {
             Call = call;
             Kind = kind;
@@ -1190,6 +1312,7 @@ public class DeviceCSourceConvertVisitor : CSourceConvertVisitor
             Accumulators = accumulators;
             Initialized = initialized;
             ElementCount = elementCount;
+            ExpectedUpdateCount = expectedUpdateCount;
         }
 
         public Call Call { get; }
@@ -1204,7 +1327,9 @@ public class DeviceCSourceConvertVisitor : CSourceConvertVisitor
 
         public string? ElementCount { get; }
 
-        public bool UpdateEmitted { get; set; }
+        public int ExpectedUpdateCount { get; }
+
+        public int UpdateCount { get; set; }
     }
 
     private sealed record BufferViewDescriptor(

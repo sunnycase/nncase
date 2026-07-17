@@ -29,6 +29,20 @@ public class IRMetadata
     public IReadOnlyList<string>? OutputNames { get; set; }
 
     public ValueRange<double>? Range { get; set; }
+
+    /// <summary>
+    /// Gets or sets the block microkernel selected by AutoTiling. This is a
+    /// scheduling contract, not a semantic operator attribute.
+    /// </summary>
+    public Schedule.BlockMicroKernelSelection? BlockMicroKernel { get; set; }
+
+    public IRMetadata Clone()
+        => new()
+        {
+            OutputNames = OutputNames,
+            Range = Range,
+            BlockMicroKernel = BlockMicroKernel,
+        };
 }
 
 /// <summary>

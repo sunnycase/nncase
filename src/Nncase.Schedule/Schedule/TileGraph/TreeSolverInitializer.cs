@@ -13,6 +13,9 @@ namespace Nncase.Schedule.TileGraph;
 
 public sealed class TreeSolverInitializer : TreeSolverBase<IntExpr>, ITreeNodeVisitor<TreeSolverInitializer.Context, TreeSolverInitializer.InitResult>
 {
+    private readonly Dictionary<IntExpr, Dictionary<long, TailGeometry>> _tailGeometryMemo = new(new ReferenceEqualityComparer<IntExpr>());
+    private int _tailGeometryId;
+
     public TreeSolverInitializer(Dictionary<TieredTileGraph, BufferGraph> bufferGraphMemo, int levelCount, Solver solver, Dictionary<OpNode, OpNodeInfo<IntExpr>> primitiveBufferInfo, Dictionary<TileNode, TileNodeInfo<IntExpr>> levelBufferInfos, Dictionary<ITileable, DomainInfo<IntExpr>> domainDimInfos, INTTTargetOptions targetOptions)
         : base(solver, primitiveBufferInfo, levelBufferInfos, domainDimInfos, targetOptions)
     {
@@ -26,7 +29,11 @@ public sealed class TreeSolverInitializer : TreeSolverBase<IntExpr>, ITreeNodeVi
 
     public int TopLevel { get; }
 
-    public static void Init(TileNode tree, Dictionary<TieredTileGraph, BufferGraph> bufferGraphMemo, int levelCount, INTTTargetOptions options, out Solver solver, out Dictionary<OpNode, OpNodeInfo<IntExpr>> opNodeMemo, out Dictionary<TileNode, TileNodeInfo<IntExpr>> tileNodeMemo, out Dictionary<ITileable, DomainInfo<IntExpr>> tileableNodeMemo)
+    public Dictionary<OpNode, Constraint[]> CoverageConstraints { get; } = new();
+
+    public Dictionary<OpNode, TileLifetime> OpLifetimes { get; } = new();
+
+    public static void Init(TileNode tree, Dictionary<TieredTileGraph, BufferGraph> bufferGraphMemo, int levelCount, INTTTargetOptions options, out Solver solver, out Dictionary<OpNode, OpNodeInfo<IntExpr>> opNodeMemo, out Dictionary<TileNode, TileNodeInfo<IntExpr>> tileNodeMemo, out Dictionary<ITileable, DomainInfo<IntExpr>> tileableNodeMemo, out Dictionary<OpNode, Constraint[]> coverageConstraints, out Dictionary<OpNode, TileLifetime> opLifetimes)
     {
         solver = new Solver("GraphSolver");
         opNodeMemo = new Dictionary<OpNode, OpNodeInfo<IntExpr>>();
@@ -34,6 +41,8 @@ public sealed class TreeSolverInitializer : TreeSolverBase<IntExpr>, ITreeNodeVi
         tileableNodeMemo = new Dictionary<ITileable, DomainInfo<IntExpr>>();
         var initializer = new TreeSolverInitializer(bufferGraphMemo, levelCount, solver, opNodeMemo, tileNodeMemo, tileableNodeMemo, options);
         initializer.Visit(tree, Context.Default);
+        coverageConstraints = initializer.CoverageConstraints;
+        opLifetimes = initializer.OpLifetimes;
     }
 
     public InitResult Visit(TileNode value, Context context)
@@ -43,7 +52,7 @@ public sealed class TreeSolverInitializer : TreeSolverBase<IntExpr>, ITreeNodeVi
             return VisitSequentialScope(value, context);
         }
 
-        var (pid, pvars, ptrips) = context;
+        var (pid, pvars, parentTailStates) = context;
         var loopOrder = value.LoopOrder;
         var dimsMap = GetDimsMap(value);
         if (!pvars.Any())
@@ -58,16 +67,9 @@ public sealed class TreeSolverInitializer : TreeSolverBase<IntExpr>, ITreeNodeVi
                 $"Tile node Op{value.OpId}@{value.Level} has {value.DomainRelation.Map.Results.Length} domain results, but {domainBounds.Length} domain bounds.");
         }
 
-        // TileNode variables are exact hierarchy decomposition factors. Hardware
-        // kernel tile extents belong to OpNode and use power-of-two domains below.
         var reductionAxes = ReductionAxisAnalysis.GetReductionAxes(value);
-        var tileVars = domainBounds
-            .Select((bound, n) => reductionAxes[n] && value.Level > 0
-                ? Solver.MakeIntConst(1).Var()
-                : Solver.MakeIntVar(
-                    1,
-                    bound,
-                    TileSemanticNaming.GetTileVariableName(value, n, TargetOptions.TargetMachineModel)))
+        var fixedToOne = reductionAxes
+            .Select(isReduction => isReduction && value.Level > 0)
             .ToArray();
 
         // The backend-private accumulator is scoped by the first L0 reduction
@@ -97,10 +99,44 @@ public sealed class TreeSolverInitializer : TreeSolverBase<IntExpr>, ITreeNodeVi
                         continue;
                     }
 
-                    var constraint = Solver.MakeEquality(tileVars[axis], 1);
-                    constraint.SetName($"reduction_inner_spatial_trip[op{value.OpId},d{axis},L{value.Level}]");
-                    Solver.Add(constraint);
+                    fixedToOne[axis] = true;
                 }
+            }
+        }
+
+        // TileNode variables group child tiles at one hierarchy level. The
+        // first structurally variable factor on an axis owns the tail; fixed
+        // factors remain one and cannot silently turn into extra loop trips.
+        var tileVars = domainBounds
+            .Select((bound, axis) => fixedToOne[axis] || bound == 1
+                ? Solver.MakeIntConst(1).Var()
+                : Solver.MakeIntVar(
+                    1,
+                    bound,
+                    TileSemanticNaming.GetTileVariableName(value, axis, TargetOptions.TargetMachineModel)))
+            .ToArray();
+
+        var tailStates = new TailCoverageState?[tileVars.Length];
+        foreach (var (currentAxis, parentAxis) in dimsMap)
+        {
+            if ((uint)parentAxis < (uint)parentTailStates.Count)
+            {
+                tailStates[currentAxis] = parentTailStates[parentAxis];
+            }
+        }
+
+        for (int axis = 0; axis < tileVars.Length; axis++)
+        {
+            if (tailStates[axis] is { } inherited)
+            {
+                tailStates[axis] = inherited with
+                {
+                    InnerFactorProduct = inherited.InnerFactorProduct * tileVars[axis],
+                };
+            }
+            else if (!fixedToOne[axis] && domainBounds[axis] > 1)
+            {
+                tailStates[axis] = new(tileVars[axis], Solver.MakeIntConst(1));
             }
         }
 
@@ -114,33 +150,20 @@ public sealed class TreeSolverInitializer : TreeSolverBase<IntExpr>, ITreeNodeVi
 
             for (int i = 0; i < forwardExtents.Length; i++)
             {
-                forwardExtents[i].SetRange(1, domainBounds[i]);
+                forwardExtents[i].SetRange(1, GetMaximumNominalCoverage(domainBounds[i]));
             }
 
             TileableNodeMemo.Add(value, new(tileVars, forwardExtents, dimsMap));
         }
 
-        var tripCounts = new IntExpr[tileVars.Length + 1];
-        var domainVolume = GetDomainVolume(domainBounds, value);
-        if (pvars.Any())
-        {
-            tripCounts[0] = ptrips;
-        }
-        else
-        {
-            tripCounts[0] = Solver.MakeIntConst(1);
-        }
-
-        for (int position = 0; position < loopOrder.Length; position++)
-        {
-            var axis = loopOrder[position];
-            tripCounts[1 + position] = tripCounts[position] * tileVars[axis];
-            tripCounts[1 + position].SetRange(1, domainVolume);
-        }
-
         InitResult childResult;
         {
-            var childContext = context with { ParentOpId = value.OpId, ForwardExtents = forwardExtents, TripCounts = tripCounts[^1] };
+            var childContext = context with
+            {
+                ParentOpId = value.OpId,
+                ForwardExtents = forwardExtents,
+                TailCoverageStates = tailStates,
+            };
 
             var results = new List<BufferResult>();
             var names = new List<Dictionary<int, int>>();
@@ -162,6 +185,14 @@ public sealed class TreeSolverInitializer : TreeSolverBase<IntExpr>, ITreeNodeVi
         }
 
         var backWardExtents = GetBackWardExtents(tileVars, loopOrder, childResult.DimsMaps, childResult.BackWardExtents, domainBounds);
+        var tripCounts = new IntExpr[tileVars.Length + 1];
+        for (int entry = 0; entry < tripCounts.Length; entry++)
+        {
+            tripCounts[entry] = Enumerable.Range(0, tileVars.Length)
+                .Select(axis => GetTailGeometry(domainBounds[axis], backWardExtents[entry][axis]).TotalTrips)
+                .Aggregate((IntExpr)Solver.MakeIntConst(1), Solver.MakeProd);
+            tripCounts[entry].SetRange(1, GetDomainVolume(domainBounds, value));
+        }
 
         // {def bid : use bid}
         var currentBufferGraph = BufferGraphMemo[value.Wrapped];
@@ -194,7 +225,8 @@ public sealed class TreeSolverInitializer : TreeSolverBase<IntExpr>, ITreeNodeVi
             {
                 var result = childResult.BufferResults[i];
                 var curId = result.Bid;
-                if (defUseMap.ContainsValue(curId))
+                var isUseLocalMaterialization = RequiresUseLocalMaterialization(value, curId, defUseMap);
+                if (defUseMap.ContainsValue(curId) && !isUseLocalMaterialization)
                 {
                     continue;
                 }
@@ -215,11 +247,11 @@ public sealed class TreeSolverInitializer : TreeSolverBase<IntExpr>, ITreeNodeVi
 
                 if (!bufferInfoMap.TryGetValue(curId, out var bufferInfo))
                 {
-                    bufferInfo = GetBufferInfo(value, curId, currentAccessMap, nodeLifetime.Value, currentLifetime, tileVars, forwardExtents, backWardExtents, result.ElemSize);
+                    bufferInfo = GetBufferInfo(value, curId, currentAccessMap, nodeLifetime.Value, currentLifetime, backWardExtents, domainBounds, result.ElemSize);
                     bufferInfoMap.Add(curId, bufferInfo);
                     var isInternalDefinition = defUseMap.ContainsKey(curId);
                     var isVisibleToParent = value.Parent is TileNode;
-                    if (!isInternalDefinition || isVisibleToParent)
+                    if (!isUseLocalMaterialization && (!isInternalDefinition || isVisibleToParent))
                     {
                         bufferResults.Add(new(curId, currentLifetime, value.DomainRelation.Map * currentAccessMap, result.ElemSize));
                     }
@@ -234,7 +266,7 @@ public sealed class TreeSolverInitializer : TreeSolverBase<IntExpr>, ITreeNodeVi
 
     public InitResult Visit(OpNode value, Context context)
     {
-        var (pid, pvars, ptrips) = context;
+        var (pid, pvars, parentTailStates) = context;
         var dimsMap = GetDimsMap(value);
         if (value.TileAxisPolicies.Length != value.DomainBounds.Length)
         {
@@ -325,9 +357,58 @@ public sealed class TreeSolverInitializer : TreeSolverBase<IntExpr>, ITreeNodeVi
             }
 
             TileableNodeMemo.Add(value, new(tileVars, forwardExtents, dimsMap));
+
+            var tailStates = new TailCoverageState?[tileVars.Length];
+            foreach (var (currentAxis, parentAxis) in dimsMap)
+            {
+                if ((uint)parentAxis < (uint)parentTailStates.Count)
+                {
+                    tailStates[currentAxis] = parentTailStates[parentAxis];
+                }
+            }
+
+            var constraints = new Constraint[tileVars.Length][];
+            for (int axis = 0; axis < tileVars.Length; axis++)
+            {
+                var extent = value.DomainBounds[axis];
+                if (tailStates[axis] is { } state)
+                {
+                    var childSpan = state.InnerFactorProduct * tileVars[axis];
+                    var nominalCoverage = state.OwnerFactor * childSpan;
+                    var requiredOwnerFactor = Solver.MakeDiv(Solver.MakeIntConst(extent - 1), childSpan) + 1;
+                    constraints[axis] =
+                    [
+                        AddNamedConstraint(
+                            Solver.MakeEquality(state.OwnerFactor, requiredOwnerFactor),
+                            $"tail_owner_ceil[op{value.OpId},d{axis}]"),
+                        AddNamedConstraint(
+                            Solver.MakeLessOrEqual(childSpan, extent),
+                            $"tail_child_span_le[op{value.OpId},d{axis}]"),
+                        AddNamedConstraint(
+                            Solver.MakeGreaterOrEqual(nominalCoverage, extent),
+                            $"tail_coverage_ge[op{value.OpId},d{axis}]"),
+                        AddNamedConstraint(
+                            Solver.MakeLess(nominalCoverage - childSpan, extent),
+                            $"tail_minimal_coverage[op{value.OpId},d{axis}]"),
+                    ];
+                }
+                else
+                {
+                    constraints[axis] =
+                    [
+                        AddNamedConstraint(
+                            Solver.MakeEquality(forwardExtents[axis], extent),
+                            $"exact_leaf_coverage[op{value.OpId},d{axis}]"),
+                    ];
+                }
+            }
+
+            CoverageConstraints.Add(value, constraints.SelectMany(axisConstraints => axisConstraints).ToArray());
         }
 
-        // perpare return infos.
+        // Prepare return information and retain the operation lifetime for
+        // backend-private resource contention modeling.
+        OpLifetimes.Add(value, new TileLifetime(TimeStamp, TimeStamp + 2));
         var bufferResults = new List<BufferResult>();
         for (int i = 0; i < value.Grid.Accesses.Length; i++)
         {
@@ -418,6 +499,26 @@ public sealed class TreeSolverInitializer : TreeSolverBase<IntExpr>, ITreeNodeVi
             new[] { emptyExtents });
     }
 
+    private bool RequiresUseLocalMaterialization(
+        TileNode tileNode,
+        BufferIdentity use,
+        BiDictionary<BufferIdentity, BufferIdentity> defUseMap)
+    {
+        if (use.IsOutput ||
+            tileNode.Wrapped.IsPureBufferViewScope() ||
+            !TargetOptions.TargetMachineModel.RequiresExplicitTransfer(tileNode.Level) ||
+            !defUseMap.TryGetByValue(use, out var definition) ||
+            !TileBufferAliasAnalysis.IsPureAliasEndpoint(definition))
+        {
+            return false;
+        }
+
+        var effect = use.Node.LocalAccessEffects[use.Index];
+        return use.Access.BindingMode == GridBindingMode.Subview &&
+            effect.Scope != MemoryAccessScope.Chip &&
+            effect.Mode.HasFlag(MemoryAccessMode.Read);
+    }
+
     private static long[] GetPowerOfTwoExtents(long min, long max)
     {
         if (min <= 0 || max < min)
@@ -492,24 +593,36 @@ public sealed class TreeSolverInitializer : TreeSolverBase<IntExpr>, ITreeNodeVi
         IReadOnlyList<long> domainBounds)
     {
         var backWardExtents = new IntExpr[tileVars.Length + 1][];
-        bool ProductExtent(IntExpr[] extents, int i)
+        IntExpr GetSharedChildExtent(int axis)
         {
-            bool find = false;
+            var childExtents = new List<IntExpr>();
             for (int cid = 0; cid < childDimsMaps.Length; cid++)
             {
                 var cmap = childDimsMaps[cid];
                 var cextents = childBackWardExtents[cid];
                 foreach (var (k, v) in cmap)
                 {
-                    if (i == v)
+                    if (axis == v)
                     {
-                        extents[v] = extents[v] is null ? cextents[k] : extents[v] * cextents[k];
-                        return find;
+                        childExtents.Add(cextents[k]);
                     }
                 }
             }
 
-            throw new InvalidOperationException("can't find the child tile var");
+            if (childExtents.Count == 0)
+            {
+                throw new InvalidOperationException($"Cannot find a child tile extent for canonical axis d{axis}.");
+            }
+
+            var canonicalExtent = childExtents[0];
+            for (int childIndex = 1; childIndex < childExtents.Count; childIndex++)
+            {
+                AddNamedConstraint(
+                    Solver.MakeEquality(canonicalExtent, childExtents[childIndex]),
+                    $"shared_child_span_eq[d{axis},c{childIndex}]");
+            }
+
+            return canonicalExtent;
         }
 
         for (int entry = 0; entry < tileVars.Length + 1; entry++)
@@ -518,24 +631,22 @@ public sealed class TreeSolverInitializer : TreeSolverBase<IntExpr>, ITreeNodeVi
             for (int position = 0; position < loopOrder.Count; position++)
             {
                 var axis = loopOrder[position];
-                if (position >= entry)
-                {
-                    extents[axis] = tileVars[axis];
-                }
-
-                ProductExtent(extents, axis);
+                var childExtent = GetSharedChildExtent(axis);
+                extents[axis] = position >= entry
+                    ? tileVars[axis] * childExtent
+                    : childExtent;
             }
 
             for (int j = 0; j < extents.Length; j++)
             {
-                extents[j].SetRange(1, domainBounds[j]);
+                extents[j].SetRange(1, GetMaximumNominalCoverage(domainBounds[j]));
             }
         }
 
         return backWardExtents;
     }
 
-    private TileNodeBufferInfo<IntExpr> GetBufferInfo(TileNode tileNode, BufferIdentity bid, AffineMap accessMap, TileLifetime nodeLifetime, TileLifetime currentLifetime, IntExpr[] tileVars, IntExpr[] forwardExtents, IntExpr[][] backWardExtents, IntExpr elemSize)
+    private TileNodeBufferInfo<IntExpr> GetBufferInfo(TileNode tileNode, BufferIdentity bid, AffineMap accessMap, TileLifetime nodeLifetime, TileLifetime currentLifetime, IntExpr[][] backWardExtents, IReadOnlyList<long> domainBounds, IntExpr elemSize)
     {
         var rank = tileNode.DomainRelation.Map.Results.Length;
         var fullPos = rank + 1;
@@ -544,6 +655,7 @@ public sealed class TreeSolverInitializer : TreeSolverBase<IntExpr>, ITreeNodeVi
         var bufferShapes = Enumerable.Range(0, fullPos).Select(i => Array.Empty<IntExpr>()).ToArray();
         var bufferSizes = new IntExpr[fullPos];
         var bufferTrips = new IntExpr[fullPos];
+        var bufferTransferBytes = new IntExpr[fullPos];
         var bufferLifetimes = new TileLifetime[fullPos];
         bufferLifetimes[^1] = currentLifetime;
         for (int i = 0; i < fullPos - 1; i++)
@@ -553,7 +665,17 @@ public sealed class TreeSolverInitializer : TreeSolverBase<IntExpr>, ITreeNodeVi
 
         LoopMask bufferMask = new(0);
 
-        var resultStr = accessMap.ToString().Split("->")[1];
+        var relatedAxes = Enumerable.Range(0, rank)
+            .Where(axis => AccessMapDependsOnAxis(accessMap, axis))
+            .ToHashSet();
+        for (int position = 0; position < tileNode.LoopOrder.Length; position++)
+        {
+            if (relatedAxes.Contains(tileNode.LoopOrder[position]))
+            {
+                bufferMask.SetRelated(position);
+            }
+        }
+
         for (int pos = 0; pos < fullPos; pos++)
         {
             var subLevelPlace = bufferPlaces[pos] = new IntVar[levelCount];
@@ -562,53 +684,173 @@ public sealed class TreeSolverInitializer : TreeSolverBase<IntExpr>, ITreeNodeVi
                 subLevelPlace[sl] = Solver.MakeBoolVar($"p[cl{tileNode.Level}, op{bid.Node.OpId}, b{bid.Index}_{bid.Endpoint}, ci{pos}, sl{sl}]");
             }
 
-            var subDomainShapes = bufferShapes[pos] = new IntExpr[accessMap.Results.Length];
-            var converter = new AffineExprToIntExprConverter(Solver, backWardExtents[pos]);
-            for (int j = 0; j < accessMap.Results.Length; j++)
-            {
-                if (accessMap.Results[j].Offset is AffineConstant c)
-                {
-                    subDomainShapes[j] = converter.Visit(accessMap.Results[j].Offset) + converter.Visit(accessMap.Results[j].Extent);
-                }
-                else
-                {
-                    subDomainShapes[j] = converter.Visit(accessMap.Results[j].Offset);
-                }
-            }
+            var capacityDomainExtents = backWardExtents[pos]
+                .Select((extent, axis) => Solver.MakeMin(extent, domainBounds[axis]))
+                .ToArray();
+            var subDomainShapes = bufferShapes[pos] = GetBufferShapes(bid, accessMap, capacityDomainExtents);
 
             var sizeExpr = subDomainShapes.Aggregate(elemSize, Solver.MakeProd);
             var maxBufferSize = GetMaxBufferSize(bid, elemSize);
             bufferSizes[pos] = Solver.MakeMin(sizeExpr, maxBufferSize);
             bufferSizes[pos].SetName($"size[cl{tileNode.Level}, op{bid.Node.OpId}, b{bid.Index}_{bid.Endpoint}, ci{pos}]");
 
-            var loopPosition = pos - 1;
-            if (loopPosition < 0)
-            {
-                bufferTrips[pos] = Solver.MakeIntConst(1);
-            }
-            else
-            {
-                var axis = tileNode.LoopOrder[loopPosition];
-
-                // todo use isl for detect reuse dims.
-                var accessed = resultStr.Contains($"d{axis}", StringComparison.CurrentCulture);
-                if (accessed)
-                {
-                    bufferMask.SetRelated(loopPosition);
-                    bufferTrips[pos] = bufferTrips[loopPosition] * tileVars[axis];
-                }
-                else
-                {
-                    bufferTrips[pos] = bufferTrips[loopPosition];
-                }
-            }
+            var enteredAxes = tileNode.LoopOrder
+                .Take(pos)
+                .Distinct()
+                .ToArray();
+            var enteredRelatedAxes = enteredAxes
+                .Where(relatedAxes.Contains)
+                .ToArray();
+            var enteredRepeatedAxes = enteredAxes
+                .Where(axis => !relatedAxes.Contains(axis))
+                .ToArray();
+            bufferTrips[pos] = enteredAxes
+                .Select(axis => GetTailGeometry(domainBounds[axis], backWardExtents[pos][axis]).TotalTrips)
+                .Aggregate((IntExpr)Solver.MakeIntConst(1), Solver.MakeProd);
+            bufferTransferBytes[pos] = GetTailAwareTransferBytes(
+                bid,
+                accessMap,
+                elemSize,
+                domainBounds,
+                backWardExtents[pos],
+                enteredRelatedAxes,
+                enteredRepeatedAxes);
 
             // note update writes in second visitor.
         }
 
-        var bufferInfo = new TileNodeBufferInfo<IntExpr>(bufferLifetimes, accessMap, bufferPlaces, bufferShapes, bufferSizes, bufferTrips, bufferMask);
+        var bufferInfo = new TileNodeBufferInfo<IntExpr>(bufferLifetimes, accessMap, bufferPlaces, bufferShapes, bufferSizes, bufferTrips, bufferTransferBytes, bufferMask);
         return bufferInfo;
     }
+
+    private IntExpr[] GetBufferShapes(BufferIdentity bid, AffineMap accessMap, IReadOnlyList<IntExpr> domainExtents)
+    {
+        var maximumShape = bid.Node.BufferShapes[bid.Index];
+        if (accessMap.Results.Length != maximumShape.Length)
+        {
+            throw new InvalidOperationException(
+                $"Tile buffer {bid} access rank {accessMap.Results.Length} does not match its physical rank {maximumShape.Length}.");
+        }
+
+        var converter = new AffineExprToIntExprConverter(Solver, domainExtents.ToArray());
+        var shapes = new IntExpr[accessMap.Results.Length];
+        for (int axis = 0; axis < shapes.Length; axis++)
+        {
+            var range = accessMap.Results[axis];
+            var shape = range.Offset is AffineConstant
+                ? converter.Visit(range.Offset) + converter.Visit(range.Extent)
+                : converter.Visit(range.Offset);
+            shapes[axis] = Solver.MakeMin(shape, maximumShape[axis]);
+            shapes[axis].SetRange(0, maximumShape[axis]);
+        }
+
+        return shapes;
+    }
+
+    private IntExpr GetTailAwareTransferBytes(
+        BufferIdentity bid,
+        AffineMap accessMap,
+        IntExpr elemSize,
+        IReadOnlyList<long> domainBounds,
+        IReadOnlyList<IntExpr> nominalDomainExtents,
+        IReadOnlyList<int> tiledAxes,
+        IReadOnlyList<int> repeatedAxes)
+    {
+        var regionExtents = nominalDomainExtents
+            .Select((extent, axis) => Solver.MakeMin(extent, domainBounds[axis]))
+            .ToArray();
+        var terms = new List<IntExpr>();
+        var repeatedTrips = repeatedAxes
+            .Select(axis => GetTailGeometry(domainBounds[axis], nominalDomainExtents[axis]).TotalTrips)
+            .Aggregate((IntExpr)Solver.MakeIntConst(1), Solver.MakeProd);
+
+        void Enumerate(int axisIndex, IntExpr multiplicity)
+        {
+            if (axisIndex == tiledAxes.Count)
+            {
+                var regionSize = GetBufferShapes(bid, accessMap, regionExtents)
+                    .Aggregate(elemSize, Solver.MakeProd);
+                terms.Add(multiplicity * Solver.MakeMin(regionSize, GetMaxBufferSize(bid, elemSize)));
+                return;
+            }
+
+            var axis = tiledAxes[axisIndex];
+            var nominalExtent = nominalDomainExtents[axis];
+            var geometry = GetTailGeometry(domainBounds[axis], nominalExtent);
+            var savedExtent = regionExtents[axis];
+
+            regionExtents[axis] = nominalExtent;
+            Enumerate(axisIndex + 1, multiplicity * geometry.FullTrips);
+
+            regionExtents[axis] = geometry.TailExtent;
+            Enumerate(axisIndex + 1, multiplicity * geometry.HasTail);
+
+            regionExtents[axis] = savedExtent;
+        }
+
+        Enumerate(0, repeatedTrips);
+        return terms.Count == 1 ? terms[0] : Solver.MakeSum(terms.ToArray());
+    }
+
+    private TailGeometry GetTailGeometry(long logicalExtent, IntExpr nominalExtent)
+    {
+        if (!_tailGeometryMemo.TryGetValue(nominalExtent, out var byLogicalExtent))
+        {
+            byLogicalExtent = new();
+            _tailGeometryMemo.Add(nominalExtent, byLogicalExtent);
+        }
+
+        if (byLogicalExtent.TryGetValue(logicalExtent, out var geometry))
+        {
+            return geometry;
+        }
+
+        var geometryId = _tailGeometryId++;
+        var logical = Solver.MakeIntConst(logicalExtent);
+        var fullTrips = Solver.MakeDiv(logical, nominalExtent).Var();
+        fullTrips.SetName($"tail_full_trips[{geometryId}]");
+        fullTrips.SetRange(0, logicalExtent);
+        var tailExtent = (logical - (fullTrips * nominalExtent)).Var();
+        tailExtent.SetName($"tail_extent[{geometryId}]");
+        tailExtent.SetRange(0, logicalExtent);
+        var hasTail = Solver.MakeIsGreaterCstVar(tailExtent, 0);
+        hasTail.SetName($"tail_present[{geometryId}]");
+        var totalTrips = (fullTrips + hasTail).Var();
+        totalTrips.SetName($"tail_total_trips[{geometryId}]");
+        totalTrips.SetRange(1, logicalExtent);
+        geometry = new(fullTrips, tailExtent, hasTail, totalTrips);
+        byLogicalExtent.Add(logicalExtent, geometry);
+        return geometry;
+    }
+
+    private static bool AccessMapDependsOnAxis(AffineMap accessMap, int axis)
+        => accessMap.Results.ToArray().Any(range =>
+            AffineExprDependsOnAxis(range.Offset, axis) ||
+            AffineExprDependsOnAxis(range.Extent, axis));
+
+    private static bool AffineExprDependsOnAxis(AffineExpr expression, int axis)
+        => expression switch
+        {
+            AffineDim dim => dim.Position == axis,
+            AffineExtent extent => extent.Position == axis,
+            AffineAddBinary add => AffineExprDependsOnAxis(add.Lhs, axis) || AffineExprDependsOnAxis(add.Rhs, axis),
+            AffineMulBinary mul => AffineExprDependsOnAxis(mul.Lhs, axis) || AffineExprDependsOnAxis(mul.Rhs, axis),
+            AffineDivBinary div => AffineExprDependsOnAxis(div.Lhs, axis) || AffineExprDependsOnAxis(div.Rhs, axis),
+            AffineConstant or AffineSymbol => false,
+            _ => throw new NotSupportedException($"Unsupported affine expression {expression.GetType().Name}."),
+        };
+
+    private Constraint AddNamedConstraint(Constraint constraint, string name)
+    {
+        constraint.SetName(name);
+        Solver.Add(constraint);
+        return constraint;
+    }
+
+    private static long GetMaximumNominalCoverage(long logicalExtent)
+        => logicalExtent > (long.MaxValue / 2)
+            ? long.MaxValue
+            : checked((logicalExtent * 2) - 1);
 
     private static long GetMaxBufferSize(BufferIdentity bid, IntExpr elemSize)
     {
@@ -653,8 +895,12 @@ public sealed class TreeSolverInitializer : TreeSolverBase<IntExpr>, ITreeNodeVi
     {
     }
 
-    public sealed record Context(int ParentOpId, IReadOnlyList<IntExpr> ForwardExtents, IntExpr TripCounts)
+    public sealed record TailCoverageState(IntExpr OwnerFactor, IntExpr InnerFactorProduct);
+
+    public sealed record Context(int ParentOpId, IReadOnlyList<IntExpr> ForwardExtents, IReadOnlyList<TailCoverageState?> TailCoverageStates)
     {
-        public static Context Default => new(-1, Array.Empty<IntVar>(), null!);
+        public static Context Default => new(-1, Array.Empty<IntVar>(), Array.Empty<TailCoverageState?>());
     }
+
+    private sealed record TailGeometry(IntExpr FullTrips, IntExpr TailExtent, IntExpr HasTail, IntExpr TotalTrips);
 }
