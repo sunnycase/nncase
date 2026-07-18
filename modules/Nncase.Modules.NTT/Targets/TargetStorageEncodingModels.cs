@@ -46,6 +46,8 @@ public sealed class TritonTargetStorageEncodingModel : ITargetStorageEncodingMod
 
     public static readonly TargetStorageEncodingId NvidiaMmaShared = new("triton.nvidia.mma-shared");
 
+    public static readonly TargetStorageEncodingId KMajorPackedN = new("triton.shared.k-major-packed-n");
+
     public IReadOnlyList<TargetStorageEncodingCandidate> GetCandidates(TargetStorageEncodingModelContext context)
     {
         if (context.Machine.GetMemoryResource(context.MemorySpace).Kind != TargetMemorySpaceKind.Shared)
@@ -61,6 +63,7 @@ public sealed class TritonTargetStorageEncodingModel : ITargetStorageEncodingMod
         // requirements select it when required. One cycle is a deterministic
         // tie breaker, not a material data-movement cost.
         var nvidiaMmaPreferencePenalty = context.Solver.MakeIntConst(1);
+        var packedNPreferencePenalty = context.Solver.MakeIntConst(1);
         var candidates = new List<TargetStorageEncodingCandidate>
         {
             new(
@@ -70,14 +73,25 @@ public sealed class TritonTargetStorageEncodingModel : ITargetStorageEncodingMod
                 alignment,
                 nvidiaMmaPreferencePenalty,
                 ImmutableArray<TargetStorageEncodingParameter>.Empty),
-            new(
-                SwizzledShared,
+        };
+        if (CanRepresentKMajorPackedN(context))
+        {
+            candidates.Add(new(
+                KMajorPackedN,
                 context.Solver.MakeIntConst(1),
                 physicalBytes,
                 alignment,
-                context.Solver.MakeIntConst(0),
-                ImmutableArray<TargetStorageEncodingParameter>.Empty),
-        };
+                packedNPreferencePenalty,
+                ImmutableArray<TargetStorageEncodingParameter>.Empty));
+        }
+
+        candidates.Add(new(
+            SwizzledShared,
+            context.Solver.MakeIntConst(1),
+            physicalBytes,
+            alignment,
+            context.Solver.MakeIntConst(0),
+            ImmutableArray<TargetStorageEncodingParameter>.Empty));
         return candidates;
     }
 
@@ -127,4 +141,9 @@ public sealed class TritonTargetStorageEncodingModel : ITargetStorageEncodingMod
             || scalar == DataTypes.Float8E5M2
             || scalar == DataTypes.Int8;
     }
+
+    private static bool CanRepresentKMajorPackedN(TargetStorageEncodingModelContext context)
+        => context.DataType is VectorType
+            && context.LogicalShape.Length == 2
+            && SupportsNvidiaMmaShared(context.DataType);
 }

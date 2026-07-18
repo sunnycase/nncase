@@ -30,6 +30,7 @@ WORKSPACE_STRIDE_PARAMETERS = (
 
 SHARD_INDEX_PARAMETER = "shard_index"
 NVIDIA_MMA_SHARED_ENCODING = "triton.nvidia.mma-shared"
+K_MAJOR_PACKED_N_SHARED_ENCODING = "triton.shared.k-major-packed-n"
 PYNTT_CODEGEN_MANIFEST_VERSION = 3
 
 DEVICE_CALL_RE = re.compile(
@@ -943,6 +944,26 @@ def _local_descriptor_coordinates(
 
     storage_encoding = str(_local_buffer_value(buffer, "StorageEncoding") or "")
     direct_shape = logical_shape + lane_shape
+    if (
+        storage_encoding == K_MAJOR_PACKED_N_SHARED_ENCODING
+        and len(logical_shape) == 2
+        and lane_shape
+        and len(descriptor_shape) == 3
+    ):
+        lane_count = _product_int(list(lane_shape))
+        if descriptor_shape != (logical_shape[0], logical_shape[1], lane_count):
+            raise ValueError(
+                "PyNTT K-major packed-N descriptor does not match its TIR buffer: "
+                f"descriptor_shape={descriptor_shape}, logical_shape={logical_shape}, "
+                f"lanes={lane_shape}"
+            )
+        lane_terms: list[str] = []
+        lane_stride = 1
+        for index, extent in reversed(tuple(zip(lane_indices, lane_shape))):
+            lane_terms.append(index if lane_stride == 1 else f"({index}) * {lane_stride}")
+            lane_stride *= extent
+        return tensor_coordinates + (_join_index_terms(list(reversed(lane_terms))),)
+
     if len(descriptor_shape) == len(direct_shape):
         descriptor_strides: list[int] = [1] * len(descriptor_shape)
         for axis in range(len(descriptor_shape) - 2, -1, -1):
@@ -1059,6 +1080,62 @@ def _direct_mma_shared_load(
 
     load = f"tl.load(tle.gpu.local_ptr({descriptor}))"
     return f"tl.trans({load})" if transpose else load
+
+
+def _direct_simt_packed_rhs_pointer(
+    pointer: Any,
+    block_k: int,
+    block_n: int,
+) -> str | None:
+    """Return a KxGxlanes compute view over exact GxKxlanes storage."""
+
+    buffer = _local_buffer(pointer)
+    if buffer is None:
+        return None
+    if _local_buffer_value(buffer, "StorageEncoding") != K_MAJOR_PACKED_N_SHARED_ENCODING:
+        return None
+    if not _local_base_is_zero(buffer):
+        return None
+
+    logical_shape = tuple(
+        int(value) for value in (_local_buffer_value(buffer, "LogicalShape") or ())
+    )
+    lane_shape = tuple(
+        int(value) for value in (_local_buffer_value(buffer, "VectorLaneShape") or ())
+    )
+    descriptor = _local_buffer_value(buffer, "DescriptorExpression")
+    descriptor_shape = tuple(
+        int(value) for value in (_local_buffer_value(buffer, "DescriptorShape") or ())
+    )
+    lane_count = _product_int(list(lane_shape)) if lane_shape else 1
+    group_count = logical_shape[0] if len(logical_shape) == 2 else 0
+    if (
+        not descriptor
+        or len(logical_shape) != 2
+        or logical_shape[1] != block_k
+        or group_count * lane_count != block_n
+        or descriptor_shape != (group_count, block_k, lane_count)
+    ):
+        return None
+
+    required_bytes = (
+        block_k
+        * block_n
+        * int(_local_buffer_value(buffer, "ScalarElementSizeBytes") or 0)
+    )
+    available_bytes = int(_local_buffer_value(buffer, "AvailableBytes") or 0)
+    if required_bytes <= 0 or required_bytes > available_bytes:
+        raise ValueError(
+            f"SIMT packed RHS descriptor {descriptor} exposes {descriptor_shape} "
+            f"outside its {available_bytes}-byte allocation"
+        )
+
+    return (
+        f"tle.gpu.local_ptr({descriptor}, "
+        f"(tl.arange(0, {group_count})[None, :, None], offs_k[:, None, None], "
+        f"tl.arange(0, {lane_count})[None, None, :]), "
+        f"shape=({block_k}, {group_count}, {lane_count}))"
+    )
 
 
 def _direct_full_local_store(
@@ -1309,6 +1386,22 @@ def _constant_dim_value(value: Any) -> int | None:
     return minimum if minimum is not None and minimum == maximum else None
 
 
+def _tile_bounds_mask(
+    bounds: tuple[tuple[str, Any, int], ...],
+) -> str | None:
+    """Build only predicates not discharged by manifest range bounds."""
+
+    predicates = []
+    for coordinate, extent, required_extent in bounds:
+        minimum = _min_value(extent)
+        if minimum is not None and minimum >= required_extent:
+            continue
+        predicate = f"({coordinate} < {_dim(extent)})"
+        if predicate not in predicates:
+            predicates.append(predicate)
+    return " & ".join(predicates) or None
+
+
 def _region_copy_plan(
     model: dict[str, Any],
 ) -> tuple[dict[str, Any], tuple[dict[str, Any], ...]]:
@@ -1354,6 +1447,8 @@ def _is_compact_region(
         fixed_extent = _constant_dim_value(extent)
         if fixed_extent is None or fixed_extent <= 0:
             return False
+        if fixed_extent == 1:
+            continue
         if _constant_dim_value(stride) != expected_stride:
             return False
         expected_stride *= fixed_extent
@@ -3844,7 +3939,7 @@ def _matmul_template_context(
                 f"Unsupported Matmul block microkernel {family}/{variant}."
             )
         contract_version = microkernel_parameter("contract_version")
-        if contract_version != 2:
+        if contract_version != 3:
             raise ValueError(
                 f"Unsupported Matmul microkernel contract version {contract_version}."
             )
@@ -3963,13 +4058,12 @@ def _matmul_template_context(
         selected_inner_k = microkernel_parameter("inner_k")
         if selected_simt:
             if (
-                selected_inner_k > block_k
+                selected_inner_k != block_k
                 or selected_inner_k & (selected_inner_k - 1)
-                or block_k % selected_inner_k != 0
             ):
                 raise ValueError(
-                    "The SIMT GEMV reduction fragment must be a power-of-two "
-                    "divisor of block K, got "
+                    "The SIMT GEMV reduction primitive must cover the complete "
+                    "power-of-two block K, got "
                     f"inner_k={selected_inner_k}, block_k={block_k}."
                 )
             if selected_inner_n != block_n:
@@ -4031,7 +4125,7 @@ def _matmul_template_context(
             rhs_n_axis["rank"],
             0 if (not gemv or simt_k_first) else rhs_n_axis["rank"] - 1,
         )
-        access_k = selected_inner_k if selected_simt else block_k
+        access_k = block_k
         lhs_coordinate_shape = _coordinate_shape(
             (access_k,) if gemv else (block_m, access_k)
         )
@@ -4051,15 +4145,20 @@ def _matmul_template_context(
                 rhs_k_coordinate,
                 _coordinate_shape(rhs_structured_shape),
             )
-            rhs_mask = (
-                f"({rhs_n_axis['logical_coordinate']} < {_dim(n)}) & "
-                f"({rhs_n_axis['logical_coordinate']} < {_dim(rhs_n)}) & "
-                f"({rhs_k_coordinate} < {_dim(lhs_k)}) & "
-                f"({rhs_k_coordinate} < {_dim(rhs_k)})"
+            rhs_mask = _tile_bounds_mask(
+                (
+                    (rhs_n_axis["logical_coordinate"], n, block_n),
+                    (rhs_n_axis["logical_coordinate"], rhs_n, block_n),
+                    (rhs_k_coordinate, lhs_k, block_k),
+                    (rhs_k_coordinate, rhs_k, block_k),
+                )
             )
-            lhs_mask = (
-                f"(0 < {_dim(m)}) & (0 < {_dim(lhs_m)}) & "
-                f"(offs_k < {_dim(lhs_k)})"
+            lhs_mask = _tile_bounds_mask(
+                (
+                    ("0", m, 1),
+                    ("0", lhs_m, 1),
+                    ("offs_k", lhs_k, block_k),
+                )
             )
         else:
             lhs_access = _matmul_lhs_access(
@@ -4076,19 +4175,56 @@ def _matmul_template_context(
                 rhs_k_coordinate,
                 _coordinate_shape(rhs_structured_shape),
             )
-            rhs_mask = (
-                f"({rhs_k_coordinate} < {_dim(lhs_k)}) & "
-                f"({rhs_k_coordinate} < {_dim(rhs_k)}) & "
-                f"({rhs_n_axis['logical_coordinate']} < {_dim(n)}) & "
-                f"({rhs_n_axis['logical_coordinate']} < {_dim(rhs_n)})"
+            rhs_mask = _tile_bounds_mask(
+                (
+                    (rhs_k_coordinate, lhs_k, block_k),
+                    (rhs_k_coordinate, rhs_k, block_k),
+                    (rhs_n_axis["logical_coordinate"], n, block_n),
+                    (rhs_n_axis["logical_coordinate"], rhs_n, block_n),
+                )
             )
-            lhs_mask = (
-                f"(offs_m[:, None] < {_dim(m)}) & "
-                f"(offs_m[:, None] < {_dim(lhs_m)}) & "
-                f"(offs_k[None, :] < {_dim(lhs_k)})"
+            lhs_mask = _tile_bounds_mask(
+                (
+                    ("offs_m[:, None]", m, block_m),
+                    ("offs_m[:, None]", lhs_m, block_m),
+                    ("offs_k[None, :]", lhs_k, block_k),
+                )
             )
         lhs_direct_load = None
         rhs_direct_load = None
+        rhs_simt_direct_pointer = None
+        rhs_simt_direct_mask = None
+        rhs_simt_group_count = 0
+        rhs_simt_group_width = 0
+        lhs_simt_mask = lhs_mask
+        rhs_simt_mask = rhs_mask
+        if gemv and selected_simt:
+            rhs_simt_direct_pointer = _direct_simt_packed_rhs_pointer(
+                model["Rhs"],
+                block_k,
+                block_n,
+            )
+            if rhs_simt_direct_pointer is not None:
+                if rhs_lane_count <= 1 or block_n % rhs_lane_count != 0:
+                    raise ValueError(
+                        "A grouped SIMT packed RHS requires block N to be an "
+                        f"integer multiple of its lane width, got N={block_n}, "
+                        f"lanes={rhs_lane_count}."
+                    )
+                rhs_simt_group_count = block_n // rhs_lane_count
+                rhs_simt_group_width = rhs_lane_count
+                grouped_n = (
+                    f"(tl.arange(0, {rhs_simt_group_count})[None, :, None] * "
+                    f"{rhs_lane_count} + tl.arange(0, {rhs_lane_count})[None, None, :])"
+                )
+                rhs_simt_direct_mask = _tile_bounds_mask(
+                    (
+                        (grouped_n, n, block_n),
+                        (grouped_n, rhs_n, block_n),
+                        ("offs_k[:, None, None]", lhs_k, block_k),
+                        ("offs_k[:, None, None]", rhs_k, block_k),
+                    )
+                )
         if not gemv:
             lhs_source_shape = (
                 (block_k, block_m)
@@ -4132,9 +4268,11 @@ def _matmul_template_context(
                 else ""
             ),
             lhs_mask=lhs_mask,
+            lhs_simt_mask=lhs_simt_mask,
             lhs_access=lhs_access,
             lhs_direct_load=lhs_direct_load,
             rhs_mask=rhs_mask,
+            rhs_simt_mask=rhs_simt_mask,
             rhs_matrix_shape=(
                 (access_k, block_n)
                 if gemv and simt_k_first
@@ -4147,6 +4285,10 @@ def _matmul_template_context(
             rhs_n_axis=rhs_n_axis,
             rhs_access=rhs_access,
             rhs_direct_load=rhs_direct_load,
+            rhs_simt_direct_pointer=rhs_simt_direct_pointer,
+            rhs_simt_direct_mask=rhs_simt_direct_mask,
+            rhs_simt_group_count=rhs_simt_group_count,
+            rhs_simt_group_width=rhs_simt_group_width,
             rhs_structured_shape=rhs_structured_shape,
         )
         return context

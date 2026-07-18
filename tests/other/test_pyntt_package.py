@@ -317,6 +317,15 @@ def test_pyntt_gemv_register_accumulator_is_lowered_by_the_selected_template():
             "MaxValue": value,
         }
 
+    exact_dynamic_k = {
+        "PythonExpression": "min(256, remaining_k)",
+        "TritonExpression": "tl.minimum(256, remaining_k)",
+        "FixedValue": None,
+        "RangeMin": 256,
+        "RangeMax": 256,
+        "MinValue": 256,
+        "MaxValue": 256,
+    }
     pointer = {
         "Expression": "unused",
         "ShardCoordHierarchy": None,
@@ -334,8 +343,8 @@ def test_pyntt_gemv_register_accumulator_is_lowered_by_the_selected_template():
         "LhsTritonDType": "tl.bfloat16",
         "RhsTritonDType": "tl.bfloat16",
         "OutputTritonDType": "tl.bfloat16",
-        "LhsShape": [fixed(1), fixed(256)],
-        "RhsShape": [fixed(256), fixed(256)],
+        "LhsShape": [fixed(1), exact_dynamic_k],
+        "RhsShape": [fixed(256), exact_dynamic_k],
         "OutputShape": [fixed(1), fixed(256)],
         "LhsStrides": [fixed(256), fixed(1)],
         "RhsStrides": [fixed(256), fixed(1)],
@@ -358,7 +367,7 @@ def test_pyntt_gemv_register_accumulator_is_lowered_by_the_selected_template():
         "MicroKernelFamily": "triton.gemv",
         "MicroKernelVariant": "register_mma_accumulator",
         "MicroKernelParameters": {
-            "contract_version": 2,
+            "contract_version": 3,
             "state_block_m": 1,
             "state_block_n": 256,
             "state_block_k": 256,
@@ -388,27 +397,28 @@ def test_pyntt_gemv_register_accumulator_is_lowered_by_the_selected_template():
     assert "acc += tl.sum(partial_transposed, axis=1)" in source
     assert "tl.sum(rhs_values * lhs_values[None, :], axis=1)" not in source
     assert "tle.gpu.local_ptr(acc" not in source
+    assert "mask=" not in source
     assert "return acc" in source
 
     simt_model = dict(model)
     simt_model["MicroKernelVariant"] = "register_simt_accumulator"
     simt_model["MicroKernelParameters"] = {
-        "contract_version": 2,
+        "contract_version": 3,
         "state_block_m": 1,
         "state_block_n": 256,
         "state_block_k": 256,
         "inner_m": 1,
         "inner_n": 256,
-        "inner_k": 32,
+        "inner_k": 256,
         "pipeline_stages": 1,
     }
     simt_source = _make_env().get_template(
         "triton/kernels/Gemv.py.jinja"
     ).render(model=simt_model)
     assert "tl.dot(" not in simt_source
-    assert "for reduction_k_start in tl.range(0, 256, 32):" in simt_source
+    assert "for reduction_k_start" not in simt_source
     assert "partial = acc" in simt_source
-    assert "offs_k = reduction_k_start + tl.arange(0, 32)" in simt_source
+    assert "offs_k = tl.arange(0, 256)" in simt_source
     assert "tl.sum(rhs_values * lhs_values[None, :], axis=1)" in simt_source
     assert "tle.gpu.local_ptr(acc" not in simt_source
     assert "return partial" in simt_source
@@ -421,31 +431,67 @@ def test_pyntt_gemv_register_accumulator_is_lowered_by_the_selected_template():
             "AddressSpace": 3,
             "LocalBuffer": {
                 "DescriptorExpression": "packed_rhs",
-                "DescriptorShape": [8, 256, 4, 8],
-                "LogicalShape": [8, 256],
+                "DescriptorShape": [1, 256, 32],
+                "LogicalShape": [1, 256],
                 "LogicalStrides": [256, 1],
                 "BaseCoordinates": [fixed(0), fixed(0)],
                 "VectorLaneShape": [4, 8],
-                "AvailableBytes": 8 * 256 * 4 * 8 * 2,
+                "AvailableBytes": 256 * 4 * 8 * 2,
                 "ScalarElementSizeBytes": 2,
-                "StorageEncoding": "triton.shared.swizzled",
+                "StorageEncoding": "triton.shared.k-major-packed-n",
             },
         },
-        RhsShape=[fixed(8), fixed(256)],
+        LhsShape=[fixed(1), exact_dynamic_k],
+        RhsShape=[fixed(1), exact_dynamic_k],
         RhsStrides=[fixed(256), fixed(1)],
         RhsNVectorLaneCount=8,
         RhsNPackedLaneCount=4,
+        OutputNVectorLaneCount=8,
+        OutputNPackedLaneCount=4,
+        OutputShape=[fixed(1), fixed(1)],
+        OutputStrides=[fixed(1), fixed(1)],
+        ReductionBlockN=32,
+        MicroKernelParameters=dict(
+            simt_model["MicroKernelParameters"], state_block_n=32, inner_n=32
+        ),
     )
     packed_simt_source = _make_env().get_template(
         "triton/kernels/Gemv.py.jinja"
     ).render(model=packed_simt_model)
-    assert "rhs_n_physical = tl.arange(0, 8)[None, :, None, None]" in packed_simt_source
-    assert "offs_k[:, None, None, None]" in packed_simt_source
-    assert "shape=(32, 8, 4, 8)" in packed_simt_source
-    assert "tl.reshape(tl.load(" in packed_simt_source
-    assert ", (32, 256)).to(tl.float32)" in packed_simt_source
-    assert "tl.sum(rhs_values * lhs_values[:, None], axis=0)" in packed_simt_source
+    assert "rhs_n_physical" not in packed_simt_source
+    assert "shape=(256, 1, 32)" in packed_simt_source
+    assert "tl.reshape(" not in packed_simt_source
+    assert "mask=" not in packed_simt_source
+    assert ").to(tl.float32)" in packed_simt_source
+    assert "tl.sum(rhs_values * lhs_values[:, None, None], axis=0)" in packed_simt_source
     assert "tl.sum(rhs_values * lhs_values[None, :], axis=1)" not in packed_simt_source
+
+    tail_dynamic_k = dict(
+        exact_dynamic_k,
+        RangeMin=1,
+        MinValue=1,
+    )
+    mma_tail_model = dict(
+        model,
+        LhsShape=[fixed(1), tail_dynamic_k],
+        RhsShape=[fixed(256), tail_dynamic_k],
+    )
+    mma_tail_source = _make_env().get_template(
+        "triton/kernels/Gemv.py.jinja"
+    ).render(model=mma_tail_model)
+    assert mma_tail_source.count("mask=") == 2
+    assert mma_tail_source.count("tl.minimum(256, remaining_k)") == 2
+
+    packed_tail_model = dict(
+        packed_simt_model,
+        LhsShape=[fixed(1), tail_dynamic_k],
+        RhsShape=[fixed(1), tail_dynamic_k],
+    )
+    packed_tail_source = _make_env().get_template(
+        "triton/kernels/Gemv.py.jinja"
+    ).render(model=packed_tail_model)
+    assert "mask=(offs_k[:, None, None] < tl.minimum(256, remaining_k))" in packed_tail_source
+    assert "mask=(offs_k < tl.minimum(256, remaining_k))" in packed_tail_source
 
     simt_finalize_model = dict(
         simt_model,
@@ -518,7 +564,7 @@ def test_pyntt_gemv_register_accumulator_is_lowered_by_the_selected_template():
     assert "partial_transposed = tl.dot(rhs_values, lhs_columns)" in tail_source
 
 
-def test_pyntt_simt_gemv_contract_lowers_to_warp_local_k(tmp_path):
+def test_pyntt_simt_gemv_contract_lowers_complete_block_k(tmp_path):
     import importlib.util
     import re
 
@@ -533,7 +579,7 @@ def test_pyntt_simt_gemv_contract_lowers_to_warp_local_k(tmp_path):
 
     block_n = 32
     block_k = 512
-    inner_k = 32
+    inner_k = block_k
 
     def fixed(value):
         return {
@@ -592,7 +638,7 @@ def test_pyntt_simt_gemv_contract_lowers_to_warp_local_k(tmp_path):
         "MicroKernelFamily": "triton.gemv",
         "MicroKernelVariant": "register_simt_accumulator",
         "MicroKernelParameters": {
-            "contract_version": 2,
+            "contract_version": 3,
             "state_block_m": 1,
             "state_block_n": block_n,
             "state_block_k": block_k,
@@ -706,14 +752,15 @@ def gemv_contract_top(data, rdata, output, block_size: tl.constexpr):
     warps_per_cta = [
         int(value) for value in layout_definition.group("warps").split(", ")
     ]
-    assert warps_per_cta == [8, 1]
+    assert warps_per_cta[0] * warps_per_cta[1] == 8
     assert threads_per_warp[0] * threads_per_warp[1] == 32
-    assert size_per_thread[1] * threads_per_warp[1] == inner_k
+    assert (
+        size_per_thread[1] * threads_per_warp[1] * warps_per_cta[1]
+        == inner_k
+    )
     assert "shfl.sync" in ptx
-    assert "ttg.convert_layout" not in ttgir
     assert "ttg.local_load" not in ttgir
     assert "ttg.local_store" not in ttgir
-    assert "bar.sync" not in ptx
     assert compiled.n_spill_loads == 0
     assert compiled.n_spill_stores == 0
 
@@ -726,6 +773,194 @@ def gemv_contract_top(data, rdata, output, block_size: tl.constexpr):
         rtol=2e-3,
         atol=2e-2,
     )
+
+
+def test_pyntt_grouped_simt_packed_gemv_consumes_g_k_lanes_shared_layout(
+    tmp_path,
+):
+    import importlib.util
+
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("triton")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required to compile grouped packed GEMV")
+
+    _add_pyntt_to_path()
+
+    from pyntt.codegen.render import _make_env
+
+    group_count = 64
+    block_k = 8
+    lane_count = 32
+    block_n = group_count * lane_count
+
+    def fixed(value):
+        return {
+            "PythonExpression": str(value),
+            "TritonExpression": str(value),
+            "FixedValue": value,
+            "RangeMin": None,
+            "RangeMax": None,
+            "IsFixed": True,
+            "IsFixedOne": value == 1,
+            "IsFixedNonOne": value != 1,
+            "MinValue": value,
+            "MaxValue": value,
+        }
+
+    def pointer(expression):
+        return {
+            "Expression": expression,
+            "ShardCoordHierarchy": None,
+            "AddressSpace": 1,
+            "LocalBuffer": None,
+        }
+
+    model = {
+        "FunctionName": "grouped_packed_gemv",
+        "Arguments": ["packed_rhs"],
+        "Lhs": pointer("data"),
+        "Rhs": {
+            "Expression": "unused",
+            "ShardCoordHierarchy": None,
+            "AddressSpace": 3,
+            "LocalBuffer": {
+                "DescriptorExpression": "packed_rhs",
+                "DescriptorShape": [group_count, block_k, lane_count],
+                "LogicalShape": [group_count, block_k],
+                "LogicalStrides": [block_k, 1],
+                "BaseCoordinates": [fixed(0), fixed(0)],
+                "VectorLaneShape": [4, 8],
+                "AvailableBytes": group_count * block_k * lane_count * 2,
+                "ScalarElementSizeBytes": 2,
+                "StorageEncoding": "triton.shared.k-major-packed-n",
+            },
+        },
+        "Output": pointer("chip_local_rdata"),
+        "LhsDType": "bfloat16",
+        "RhsDType": "bfloat16",
+        "OutputDType": "float32",
+        "LhsTritonDType": "tl.bfloat16",
+        "RhsTritonDType": "tl.bfloat16",
+        "OutputTritonDType": "tl.float32",
+        "LhsShape": [fixed(1), fixed(block_k)],
+        "RhsShape": [fixed(group_count), fixed(block_k)],
+        "OutputShape": [fixed(1), fixed(group_count)],
+        "LhsStrides": [fixed(block_k), fixed(1)],
+        "RhsStrides": [fixed(block_k), fixed(1)],
+        "OutputStrides": [fixed(group_count), fixed(1)],
+        "TransposeA": False,
+        "TransposeB": True,
+        "Hierarchy": [1],
+        "RhsNVectorLaneCount": 8,
+        "OutputNVectorLaneCount": 8,
+        "RhsNPackedLaneCount": 4,
+        "OutputNPackedLaneCount": 4,
+        "Scale": "1",
+        "Comment": "Grouped packed SIMT GEMV shared-layout regression",
+        "RuntimeShapeArgs": [],
+        "LoadCExpression": "False",
+        "ReductionPhase": "accumulate",
+        "ReductionBlockM": 1,
+        "ReductionBlockN": block_n,
+        "ReductionBlockK": block_k,
+        "MicroKernelFamily": "triton.gemv",
+        "MicroKernelVariant": "register_simt_accumulator",
+        "MicroKernelParameters": {
+            "contract_version": 3,
+            "state_block_m": 1,
+            "state_block_n": block_n,
+            "state_block_k": block_k,
+            "inner_m": 1,
+            "inner_n": block_n,
+            "inner_k": block_k,
+            "pipeline_stages": 1,
+        },
+        "NumWarps": 8,
+        "NoInline": False,
+    }
+    helper_source = _make_env().get_template(
+        "triton/kernels/Gemv.py.jinja"
+    ).render(model=model)
+    assert f"shape=({block_k}, {group_count}, {lane_count})" in helper_source
+    assert "tl.reshape(" not in helper_source
+    assert "axis=0" in helper_source
+
+    module_source = f"""
+import triton
+import triton.language as tl
+import triton.experimental.tle.language as tle
+
+{helper_source}
+
+@triton.jit
+def grouped_packed_gemv_top(lhs, rhs, output, block_size: tl.constexpr):
+    packed_rhs = tle.gpu.alloc(
+        [{group_count}, {block_k}, {lane_count}],
+        dtype=tl.bfloat16,
+        layout=None,
+        scope=tle.gpu.smem,
+        nv_mma_shared_layout=False,
+    )
+    rhs_g = tl.arange(0, {group_count})[:, None, None]
+    rhs_k = tl.arange(0, {block_k})[None, :, None]
+    rhs_lane = tl.arange(0, {lane_count})[None, None, :]
+    rhs_offsets = (rhs_g * {block_k} + rhs_k) * {lane_count} + rhs_lane
+    tle.gpu.copy(
+        rhs + rhs_offsets,
+        packed_rhs,
+        [{group_count}, {block_k}, {lane_count}],
+    )
+    acc = tl.zeros(({group_count}, {lane_count}), tl.float32)
+    acc = grouped_packed_gemv(
+        acc,
+        packed_rhs,
+        lhs,
+        rhs,
+        output,
+        output,
+        output,
+        output,
+        0,
+        0,
+        block_size,
+    )
+    tl.store(output + tl.arange(0, {block_n}), tl.reshape(acc, ({block_n},)))
+"""
+    module_path = tmp_path / "grouped_packed_gemv_module.py"
+    module_path.write_text(module_source, encoding="utf-8")
+    spec = importlib.util.spec_from_file_location(
+        "_grouped_packed_gemv_module", module_path
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    lhs = torch.linspace(
+        -0.5, 0.5, block_k, device="cuda", dtype=torch.bfloat16
+    )
+    rhs = torch.linspace(
+        -0.25,
+        0.25,
+        group_count * block_k * lane_count,
+        device="cuda",
+        dtype=torch.bfloat16,
+    ).reshape(group_count, block_k, lane_count)
+    output = torch.empty((block_n,), device="cuda", dtype=torch.float32)
+    compiled = module.grouped_packed_gemv_top.warmup(
+        lhs, rhs, output, grid=(1,), block_size=1, num_warps=8
+    )
+    compiled._init_handles()
+    assert "warpsPerCTA = [1, 8, 1]" in compiled.asm["ttgir"]
+    assert compiled.metadata.shared == group_count * block_k * lane_count * 2
+    assert compiled.n_spill_loads == 0
+    assert compiled.n_spill_stores == 0
+
+    module.grouped_packed_gemv_top[(1,)](
+        lhs, rhs, output, block_size=1, num_warps=8
+    )
+    expected = torch.einsum("gkl,k->gl", rhs.float(), lhs.float()).reshape(-1)
+    torch.testing.assert_close(output, expected, rtol=2e-3, atol=2e-2)
 
 
 def test_pyntt_mma_shared_load_uses_only_exact_full_descriptors():
@@ -768,6 +1003,38 @@ def test_pyntt_mma_shared_load_uses_only_exact_full_descriptors():
         "FixedValue": 1,
     }
     assert _direct_mma_shared_load(offset_pointer, (128, 32)) is None
+
+
+def test_pyntt_simt_packed_rhs_uses_exact_k_major_descriptor():
+    _add_pyntt_to_path()
+
+    from pyntt.codegen.render import _direct_simt_packed_rhs_pointer
+
+    pointer = {
+        "Expression": "unused",
+        "AddressSpace": 3,
+        "LocalBuffer": {
+            "DescriptorExpression": "packed_weight",
+            "DescriptorShape": [8, 64, 32],
+            "LogicalShape": [8, 64],
+            "LogicalStrides": [64, 1],
+            "BaseCoordinates": [
+                {"TritonExpression": "0", "FixedValue": 0},
+                {"TritonExpression": "0", "FixedValue": 0},
+            ],
+            "VectorLaneShape": [4, 8],
+            "AvailableBytes": 32768,
+            "ScalarElementSizeBytes": 2,
+            "StorageEncoding": "triton.shared.k-major-packed-n",
+        },
+    }
+
+    assert _direct_simt_packed_rhs_pointer(pointer, 64, 256) == (
+        "tle.gpu.local_ptr(packed_weight, "
+        "(tl.arange(0, 8)[None, :, None], offs_k[:, None, None], "
+        "tl.arange(0, 32)[None, None, :]), shape=(64, 8, 32))"
+    )
+    assert _direct_simt_packed_rhs_pointer(pointer, 32, 256) is None
 
 
 def test_pyntt_tensor_region_copy_selects_tle_copy_only_for_full_shared_tiles():
@@ -902,6 +1169,35 @@ def test_pyntt_tensor_region_copy_selects_tle_copy_only_for_full_shared_tiles():
     assert "copy_global_offset = copy_linear" in packed_vector_source
     assert "copy_tensor_linear" not in packed_vector_source
     assert "copy_vector_lane" not in packed_vector_source
+
+    singleton_packed_model = deepcopy(packed_vector_model)
+    exact_dynamic_extent = {
+        "PythonExpression": "tl.minimum(512, remaining_k)",
+        "TritonExpression": "tl.minimum(512, remaining_k)",
+        "FixedValue": None,
+        "RangeMin": 512,
+        "RangeMax": 512,
+    }
+    singleton_packed_model["SourceShape"] = [fixed(1), exact_dynamic_extent]
+    singleton_packed_model["DestinationShape"] = [fixed(1), exact_dynamic_extent]
+    singleton_packed_model["SourceStrides"] = [fixed(2048), fixed(1)]
+    singleton_packed_model["DestinationStrides"] = [fixed(0), fixed(1)]
+    singleton_packed_model["CopyPlan"] = copy_plan(
+        [1, exact_dynamic_extent, 4, 8], source_origins=[0, 0]
+    )
+    singleton_packed_model["Destination"]["LocalBuffer"].update(
+        DescriptorShape=[1, 512, 32],
+        LogicalShape=[1, 512],
+        LogicalStrides=[0, 1],
+        VectorLaneShape=[4, 8],
+        ScalarElementSizeBytes=2,
+        StorageEncoding="triton.shared.k-major-packed-n",
+    )
+    singleton_packed_source = render(singleton_packed_model)
+    assert (
+        "tle.gpu.copy(source + copy_global_offset, destination_storage, [1, 512, 32])"
+        in singleton_packed_source
+    )
 
     matrix_model = deepcopy(full_tile_model)
     matrix_model["SourceShape"] = [fixed(4), fixed(8)]

@@ -5026,11 +5026,15 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             model.ReductionBlockM = blockM;
             model.ReductionBlockN = blockN;
             model.ReductionBlockK = blockK;
+            var accumulatorNGroupWidth = expectedKind == ReductionKernelKind.PackedMatmul
+                ? checked(model.OutputNPackedLaneCount * model.OutputNVectorLaneCount)
+                : 1;
             var initializer = BuildMatrixReductionAccumulatorInitializer(
                 microKernel,
                 useGemv,
                 blockM,
-                blockN);
+                blockN,
+                accumulatorNGroupWidth);
             ConfigureReductionState(
                 state,
                 [initializer],
@@ -5937,6 +5941,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
 
             var storageEncodingId = storageEncoding?.Id ?? TargetStorageEncodingIds.Linear;
             var useNvidiaMmaSharedLayout = storageEncodingId == TritonTargetStorageEncodingModel.NvidiaMmaShared;
+            var useKMajorPackedNLayout = storageEncodingId == TritonTargetStorageEncodingModel.KMajorPackedN;
             var logicalShape = GetBufferShape(buffer)
                 .Select((dimension, axis) => dimension.MaxValue is { } value && value > 0
                     ? value
@@ -5961,6 +5966,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 storageEncodingId == TargetStorageEncodingIds.Linear ||
                     storageEncodingId == TritonTargetStorageEncodingModel.SwizzledShared,
                 useNvidiaMmaSharedLayout,
+                useKMajorPackedNLayout,
                 logicalShape,
                 logicalStrides,
                 vectorLaneShape);
@@ -5973,7 +5979,8 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             var tritonDType = GetScalarTritonDType(buffer.ElemType);
             if (storageEncodingId != TargetStorageEncodingIds.Linear &&
                 storageEncodingId != TritonTargetStorageEncodingModel.SwizzledShared &&
-                !useNvidiaMmaSharedLayout)
+                !useNvidiaMmaSharedLayout &&
+                !useKMajorPackedNLayout)
             {
                 throw new NotSupportedException(
                     $"PyNTT Triton shared allocation does not support storage encoding {storageEncodingId} for {buffer.Name}.");
@@ -6003,6 +6010,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             long descriptorCapacityElements,
             bool allowAffineLinearDescriptor,
             bool useNvidiaMmaSharedLayout,
+            bool useKMajorPackedNLayout,
             IReadOnlyList<long> logicalShape,
             IReadOnlyList<long> logicalStrides,
             IReadOnlyList<int> vectorLaneShape)
@@ -6053,6 +6061,46 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     $"PyNTT shared AllocateBufferView {variable.Name} shape " +
                     $"[{string.Join(",", scalarPhysicalShape)}] and strides [{string.Join(",", logicalStrides)}] " +
                     $"can address {requiredScalarElements} scalar elements, but its TIR MemSpan capacity is only {elementCount}.");
+            }
+
+            // Packed GEMV stores weights logically as [G,K]vec<lanes>. Keep
+            // that grouped physical structure in shared memory so the backend
+            // can reduce K without transposing or flattening G.
+            if (useKMajorPackedNLayout)
+            {
+                if (logicalShape.Count != 2 || vectorLaneShape.Count == 0)
+                {
+                    throw new NotSupportedException(
+                        $"PyNTT K-major packed-N shared buffer {variable.Name} must be a rank-2 vector buffer, " +
+                        $"got rank {logicalShape.Count} and vector-lane shape [{string.Join(",", vectorLaneShape)}].");
+                }
+
+                if (descriptorLogicalStrides[1] != 1)
+                {
+                    throw new NotSupportedException(
+                        $"PyNTT K-major packed-N shared buffer {variable.Name} requires a contiguous K axis " +
+                        $"logical storage, got shape [{string.Join(",", logicalShape)}] and strides " +
+                        $"[{string.Join(",", logicalStrides)}].");
+                }
+
+                var packedDescriptorShape = new[]
+                {
+                    logicalShape[0],
+                    logicalShape[1],
+                    checked((long)vectorLaneCount),
+                };
+                var packedDescriptorElements = packedDescriptorShape.Aggregate(
+                    1L,
+                    (product, value) => checked(product * value));
+                if (packedDescriptorElements > descriptorCapacityElements)
+                {
+                    throw new NotSupportedException(
+                        $"PyNTT K-major packed-N shared descriptor for {variable.Name} requires " +
+                        $"{packedDescriptorElements} scalar elements, but only {descriptorCapacityElements} remain " +
+                        "in its TIR PhysicalBuffer allocation.");
+                }
+
+                return packedDescriptorShape;
             }
 
             // Packed matrix weights use [N / lanes, K]vec<lanes> in TIR. A
@@ -8761,7 +8809,8 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             BlockMicroKernelSelection microKernel,
             bool useGemv,
             int blockM,
-            int blockN)
+            int blockN,
+            int nGroupWidth = 1)
         {
             if (microKernel.Variant is not ("register_simt_accumulator" or "register_mma_accumulator"))
             {
@@ -8769,7 +8818,19 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     $"Unsupported PyNTT matrix microkernel variant {microKernel.Family}/{microKernel.Variant}.");
             }
 
-            var accumulatorShape = useGemv ? $"({blockN},)" : $"({blockM}, {blockN})";
+            if (nGroupWidth <= 0 || blockN % nGroupWidth != 0)
+            {
+                throw new InvalidOperationException(
+                    $"PyNTT matrix accumulator N extent {blockN} must be divisible by grouped width {nGroupWidth}.");
+            }
+
+            var accumulatorShape = useGemv &&
+                microKernel.Variant == "register_simt_accumulator" &&
+                nGroupWidth > 1
+                ? $"({blockN / nGroupWidth}, {nGroupWidth})"
+                : useGemv
+                    ? $"({blockN},)"
+                    : $"({blockM}, {blockN})";
             return ReductionAccumulatorInitializer.Register(
                 $"tl.zeros({accumulatorShape}, tl.float32)");
         }

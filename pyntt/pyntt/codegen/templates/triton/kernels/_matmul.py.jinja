@@ -23,24 +23,31 @@ def {{ model["FunctionName"] }}({{ helper_parameters(model, ["acc"] if ctx["phas
 {% endif %}
 {% if ctx["gemv"] %}
     m_idx = 0
+{% if not ctx["rhs_simt_direct_pointer"] %}
 {{ common.structured_axis(ctx["rhs_n_axis"], "    ") }}
+{% endif %}
 {% if ctx["selected_simt"] %}
+    offs_k = tl.arange(0, {{ ctx["block_k"] }})
     partial = acc
-    for reduction_k_start in tl.range(0, {{ ctx["block_k"] }}, {{ ctx["inner_k"] }}):
-        offs_k = reduction_k_start + tl.arange(0, {{ ctx["inner_k"] }})
-        rhs_values = tl.reshape(tl.load({{ access_pointer(model, "Rhs", "rhs", ctx["rhs_access"]) }}, mask={{ ctx["rhs_mask"] }}, other=0.0, eviction_policy="evict_first"), {{ ctx["rhs_matrix_shape"] }}).to(tl.float32)
-        lhs_values = tl.load({{ access_pointer(model, "Lhs", "lhs", ctx["lhs_access"]) }}, mask={{ ctx["lhs_mask"] }}, other=0.0).to(tl.float32)
-{% if ctx["simt_k_first"] %}
-        partial += tl.sum(rhs_values * lhs_values[:, None], axis=0)
+{% if ctx["rhs_simt_direct_pointer"] %}
+    rhs_values = tl.load({{ ctx["rhs_simt_direct_pointer"] }}{% if ctx["rhs_simt_direct_mask"] %}, mask={{ ctx["rhs_simt_direct_mask"] }}, other=0.0{% endif %}, eviction_policy="evict_first").to(tl.float32)
 {% else %}
-        partial += tl.sum(rhs_values * lhs_values[None, :], axis=1)
+    rhs_values = tl.reshape(tl.load({{ access_pointer(model, "Rhs", "rhs", ctx["rhs_access"]) }}{% if ctx["rhs_simt_mask"] %}, mask={{ ctx["rhs_simt_mask"] }}, other=0.0{% endif %}, eviction_policy="evict_first"), {{ ctx["rhs_matrix_shape"] }}).to(tl.float32)
+{% endif %}
+    lhs_values = tl.load({{ access_pointer(model, "Lhs", "lhs", ctx["lhs_access"]) }}{% if ctx["lhs_simt_mask"] %}, mask={{ ctx["lhs_simt_mask"] }}, other=0.0{% endif %}).to(tl.float32)
+{% if ctx["rhs_simt_direct_pointer"] %}
+    partial += tl.sum(rhs_values * lhs_values[:, None, None], axis=0)
+{% elif ctx["simt_k_first"] %}
+    partial += tl.sum(rhs_values * lhs_values[:, None], axis=0)
+{% else %}
+    partial += tl.sum(rhs_values * lhs_values[None, :], axis=1)
 {% endif %}
     return partial
 {% else %}
     offs_k = tl.arange(0, {{ ctx["block_k"] }})
     offs_m = tl.arange(0, {{ ctx["gemv_dot_m"] }})
-    rhs_values = tl.reshape(tl.load({{ access_pointer(model, "Rhs", "rhs", ctx["rhs_access"]) }}, mask={{ ctx["rhs_mask"] }}, other=0.0, eviction_policy="evict_first"), {{ ctx["rhs_matrix_shape"] }})
-    lhs_values = tl.load({{ access_pointer(model, "Lhs", "lhs", ctx["lhs_access"]) }}, mask={{ ctx["lhs_mask"] }}, other=0.0)
+    rhs_values = tl.reshape(tl.load({{ access_pointer(model, "Rhs", "rhs", ctx["rhs_access"]) }}{% if ctx["rhs_mask"] %}, mask={{ ctx["rhs_mask"] }}, other=0.0{% endif %}, eviction_policy="evict_first"), {{ ctx["rhs_matrix_shape"] }})
+    lhs_values = tl.load({{ access_pointer(model, "Lhs", "lhs", ctx["lhs_access"]) }}{% if ctx["lhs_mask"] %}, mask={{ ctx["lhs_mask"] }}, other=0.0{% endif %})
     lhs_columns = tl.where(offs_m[None, :] == 0, lhs_values[:, None], 0.0)
     partial_transposed = tl.dot(rhs_values, lhs_columns{{ ctx["dot_precision"] }})
     acc += tl.sum(partial_transposed, axis=1)
@@ -53,12 +60,12 @@ def {{ model["FunctionName"] }}({{ helper_parameters(model, ["acc"] if ctx["phas
 {% if ctx["rhs_direct_load"] %}
     rhs_values = {{ ctx["rhs_direct_load"] }}
 {% else %}
-    rhs_values = tl.reshape(tl.load({{ access_pointer(model, "Rhs", "rhs", ctx["rhs_access"]) }}, mask={{ ctx["rhs_mask"] }}, other=0.0), {{ ctx["rhs_matrix_shape"] }})
+    rhs_values = tl.reshape(tl.load({{ access_pointer(model, "Rhs", "rhs", ctx["rhs_access"]) }}{% if ctx["rhs_mask"] %}, mask={{ ctx["rhs_mask"] }}, other=0.0{% endif %}), {{ ctx["rhs_matrix_shape"] }})
 {% endif %}
 {% if ctx["lhs_direct_load"] %}
     lhs_values = {{ ctx["lhs_direct_load"] }}
 {% else %}
-    lhs_values = tl.load({{ access_pointer(model, "Lhs", "lhs", ctx["lhs_access"]) }}, mask={{ ctx["lhs_mask"] }}, other=0.0)
+    lhs_values = tl.load({{ access_pointer(model, "Lhs", "lhs", ctx["lhs_access"]) }}{% if ctx["lhs_mask"] %}, mask={{ ctx["lhs_mask"] }}, other=0.0{% endif %})
 {% endif %}
     acc += tl.dot(lhs_values, rhs_values{{ ctx["dot_precision"] }})
     return acc

@@ -397,11 +397,16 @@ public sealed class UnitTestTritonTargetCostModel : TestClassBase
             candidate => candidate.Variant == "register_simt_accumulator");
         Assert.Equal(equalWorkN32.EstimatedCycles.Var().Max(), equalWorkN256.EstimatedCycles.Var().Max());
         Assert.Equal(
-            32,
+            256,
             equalWorkN32.Parameters.Single(parameter => parameter.Name == TritonBlockMicroKernelContract.InnerKParameter).Value.Var().Max());
         Assert.Equal(
             32,
             equalWorkN256.Parameters.Single(parameter => parameter.Name == TritonBlockMicroKernelContract.InnerKParameter).Value.Var().Max());
+        var equalWorkN32Registers = equalWorkN32.Resources.Single(
+            usage => usage.Resource == NTTTargetMachineCatalog.GpuRegisterFile).Units.Var().Max();
+        Assert.Equal(
+            (56 * 8 * 32) + 256 + (32 * 256 * 2) + 32,
+            equalWorkN32Registers);
         var equalWorkN32LhsReads = equalWorkN32.MemoryAccesses.Single(access =>
             access.BufferAccessIndex == 0 && access.Mode == MemoryAccessMode.Read).Bytes.Var().Max();
         var equalWorkN256LhsReads = equalWorkN256.MemoryAccesses.Single(access =>
@@ -436,6 +441,33 @@ public sealed class UnitTestTritonTargetCostModel : TestClassBase
         Assert.Equal(
             32,
             n4Register.Parameters.Single(parameter => parameter.Name == TritonBlockMicroKernelContract.InnerNParameter).Value.Var().Max());
+
+        var packedOp = new Nncase.TIR.NTT.PackedMatMul(false);
+        var packedContext = new TileWorkloadContext(
+            packedOp,
+            fullShapes.Select(shape => shape.ToImmutableArray()).ToImmutableArray(),
+            ImmutableArray.Create<DataType>(
+                DataTypes.BFloat16,
+                new VectorType(DataTypes.BFloat16, 4, 8),
+                new VectorType(DataTypes.BFloat16, 4, 8)));
+        var packedCandidates = new TritonBlockMicroKernelModel().GetCandidates(new(
+            packedOp,
+            workload,
+            packedContext,
+            n4LocalShapes,
+            symbolicFullShapes,
+            solver.MakeIntConst(100),
+            NTTTargetMachineCatalog.Resolve(NTTTargetMachineCatalog.Rtx5060Ti16Gb),
+            solver));
+        var packedRegister = Assert.Single(
+            packedCandidates,
+            candidate => candidate.Variant == "register_simt_accumulator");
+        var packedRhsRequirement = Assert.Single(packedRegister.BufferEncodingRequirements);
+        Assert.Equal(1, packedRhsRequirement.BufferAccessIndex);
+        Assert.Equal("gpu.shared", packedRhsRequirement.MemorySpace.Value);
+        Assert.Equal(
+            TritonTargetStorageEncodingModel.KMajorPackedN,
+            Assert.Single(packedRhsRequirement.AcceptedEncodings));
     }
 
     [Fact]
@@ -463,6 +495,9 @@ public sealed class UnitTestTritonTargetCostModel : TestClassBase
         Assert.Contains(
             sharedCandidates,
             candidate => candidate.Id == TritonTargetStorageEncodingModel.SwizzledShared);
+        Assert.DoesNotContain(
+            sharedCandidates,
+            candidate => candidate.Id == TritonTargetStorageEncodingModel.KMajorPackedN);
 
         var paddedSharedCandidates = model.GetCandidates(new(
             shared,
@@ -474,6 +509,23 @@ public sealed class UnitTestTritonTargetCostModel : TestClassBase
         Assert.All(
             paddedSharedCandidates,
             candidate => Assert.Equal(16384, candidate.PhysicalBytes.Var().Min()));
+        Assert.Equal(
+            1,
+            Assert.Single(
+                paddedSharedCandidates,
+                candidate => candidate.Id == TritonTargetStorageEncodingModel.KMajorPackedN).IsLegal.Var().Min());
+
+        var groupedPackedCandidates = model.GetCandidates(new(
+            shared,
+            new VectorType(DataTypes.BFloat16, 4, 8),
+            [solver.MakeIntConst(2), solver.MakeIntConst(149)],
+            solver.MakeIntConst(19072),
+            machine,
+            solver));
+        var groupedPacked = Assert.Single(
+            groupedPackedCandidates,
+            candidate => candidate.Id == TritonTargetStorageEncodingModel.KMajorPackedN);
+        Assert.Equal(1, groupedPacked.IsLegal.Var().Min());
 
         var blockGlobal = machine.TilingMemorySpaces.Single(space =>
             machine.GetMemoryResource(space).Kind == TargetMemorySpaceKind.Global);

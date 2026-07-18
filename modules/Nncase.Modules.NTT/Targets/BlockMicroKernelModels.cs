@@ -15,7 +15,7 @@ namespace Nncase.Targets;
 /// </summary>
 public static class TritonBlockMicroKernelContract
 {
-    public const long Version = 2;
+    public const long Version = 3;
 
     public const string VersionParameter = "contract_version";
 
@@ -122,6 +122,8 @@ public sealed class TritonBlockMicroKernelModel : IBlockMicroKernelModelProvider
     private const int FixedRegistersPerThread = 48;
     private const int GemvFixedRegistersPerThread = 56;
     private const int GemvMmaCompilerOverheadRegistersPerThread = 216;
+    private const int SimtComputeElementSizeBytes = 4;
+    private const int SimtRhsLiveValueCount = 2;
     private const int MmaPipelineStages = 2;
 
     public IReadOnlyList<BlockMicroKernelCandidate> GetCandidates(BlockMicroKernelModelContext context)
@@ -196,7 +198,13 @@ public sealed class TritonBlockMicroKernelModel : IBlockMicroKernelModelProvider
             ? AlignUp(solver.MakeMax(local.N, solver.MakeIntConst(simtWorkerWidth)), simtWorkerWidth, solver)
             : AlignUp(local.N, MatrixAccumulatorMinN, solver);
         var registerM = useGemv ? solver.MakeIntConst(1) : alignedM;
-        var simtFragmentK = solver.MakeMin(local.K, simtWorkerWidth);
+
+        // The SIMT helper materializes one complete block-K reduction tile.
+        // Splitting K inside the helper repeats Triton layout propagation and
+        // warp reductions, so block-K itself is the backend primitive extent.
+        // GraphTiler remains responsible for shrinking block-K when aggregate
+        // CTA register or shared-memory capacity requires it.
+        var simtReductionK = local.K;
         var simtFixedRegisters = solver.MakeIntConst(
             checked((long)(useGemv ? GemvFixedRegistersPerThread : FixedRegistersPerThread)
                 * context.Machine.Execution.ThreadsPerBlock));
@@ -204,10 +212,12 @@ public sealed class TritonBlockMicroKernelModel : IBlockMicroKernelModelProvider
             registerM * alignedN * local.Multiplicity * matrix.AccumulatorElementSizeBytes,
             4,
             solver);
-        var lhsScalarBytes = GetScalarElementSizeBytes(context.WorkloadContext.BufferDataTypes[0]);
-        var rhsScalarBytes = GetScalarElementSizeBytes(context.WorkloadContext.BufferDataTypes[1]);
-        var simtOperandBytes = (registerM * simtFragmentK * lhsScalarBytes)
-            + (alignedN * simtFragmentK * local.Multiplicity * rhsScalarBytes);
+
+        // The template computes in fp32 and keeps both the converted RHS tile
+        // and its multiply/reduction intermediate live across the reduction.
+        var simtOperandBytes = (registerM * simtReductionK * SimtComputeElementSizeBytes)
+            + (alignedN * simtReductionK * local.Multiplicity
+                * SimtComputeElementSizeBytes * SimtRhsLiveValueCount);
         var simtOperandRegisters = DefaultBlockMicroKernelModel.CeilDiv(simtOperandBytes, 4, solver);
         var registerSimtUsage = simtFixedRegisters + accumulatorRegisters + simtOperandRegisters;
         var registerResource = GetResource(
@@ -226,6 +236,14 @@ public sealed class TritonBlockMicroKernelModel : IBlockMicroKernelModelProvider
                     [TritonTargetStorageEncodingModel.NvidiaMmaShared]))
                 .ToImmutableArray()
             : ImmutableArray<BlockMicroKernelBufferEncodingRequirement>.Empty;
+        var simtOperandRequirements = useGemv
+            ? GetDirectPackedGemvRhsAccessIndices(context.Op)
+                .Select(index => new BlockMicroKernelBufferEncodingRequirement(
+                    index,
+                    mmaSharedMemorySpace.Id,
+                    [TritonTargetStorageEncodingModel.KMajorPackedN]))
+                .ToImmutableArray()
+            : dotOperandRequirements;
         var sharedResource = GetResource(
             context.Machine,
             NTTTargetMachineCatalog.GpuBackendSharedMemory,
@@ -262,11 +280,11 @@ public sealed class TritonBlockMicroKernelModel : IBlockMicroKernelModelProvider
                 new(TritonBlockMicroKernelContract.StateBlockKParameter, local.K),
                 new(TritonBlockMicroKernelContract.InnerMParameter, registerM),
                 new(TritonBlockMicroKernelContract.InnerNParameter, alignedN),
-                new(TritonBlockMicroKernelContract.InnerKParameter, simtFragmentK),
+                new(TritonBlockMicroKernelContract.InnerKParameter, simtReductionK),
                 new(TritonBlockMicroKernelContract.PipelineStagesParameter, solver.MakeIntConst(1)),
             ])
         {
-            BufferEncodingRequirements = dotOperandRequirements,
+            BufferEncodingRequirements = simtOperandRequirements,
         };
         var candidates = new List<BlockMicroKernelCandidate> { registerSimtCandidate };
 
@@ -283,6 +301,8 @@ public sealed class TritonBlockMicroKernelModel : IBlockMicroKernelModelProvider
             if (mmaPrimitives.Length > 0)
             {
                 var mma = mmaPrimitives[0];
+                var lhsScalarBytes = GetScalarElementSizeBytes(context.WorkloadContext.BufferDataTypes[0]);
+                var rhsScalarBytes = GetScalarElementSizeBytes(context.WorkloadContext.BufferDataTypes[1]);
                 var nIsLargeEnough = 1 - solver.MakeIsLessVar(local.N, solver.MakeIntConst(mma.M));
                 var nIsAligned = solver.MakeIsEqualCstVar(solver.MakeModulo(local.N, mma.M), 0);
                 var kIsLargeEnough = 1 - solver.MakeIsLessVar(local.K, solver.MakeIntConst(mma.K));
@@ -405,6 +425,19 @@ public sealed class TritonBlockMicroKernelModel : IBlockMicroKernelModelProvider
             Nncase.TIR.NTT.MatMulGlu or Nncase.TIR.NTT.PackedMatMulGlu => [0, 1, 2],
             _ => throw new NotSupportedException(
                 $"Triton matrix workload {op.GetType().Name} must declare its dot operand accesses."),
+        };
+
+    private static int[] GetDirectPackedGemvRhsAccessIndices(Op op)
+        => op switch
+        {
+            Nncase.TIR.NTT.PackedMatMul => [1],
+            Nncase.TIR.NTT.Matmul or
+                Nncase.TIR.NTT.QKVParallelLinear or
+                Nncase.TIR.NTT.PackedQKVParallelLinear or
+                Nncase.TIR.NTT.MatMulGlu or
+                Nncase.TIR.NTT.PackedMatMulGlu => [],
+            _ => throw new NotSupportedException(
+                $"Triton matrix workload {op.GetType().Name} must declare its direct packed GEMV RHS accesses."),
         };
 
     private static IntExpr GetHiddenDotOperandStagingBytes(

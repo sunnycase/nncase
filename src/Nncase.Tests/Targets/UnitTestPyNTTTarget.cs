@@ -602,6 +602,82 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
     }
 
     [Fact]
+    public void TestPyNTTKMajorPackedNSharedDescriptorSupportsMultipleGroups()
+    {
+        var vectorType = new VectorType(DataTypes.BFloat16, 4, 8);
+        var inputBuffer = CreateBuffer(
+            "packed_input",
+            vectorType,
+            TIR.MemoryLocation.Data,
+            0,
+            [2, 256],
+            [256, 1]);
+        var sharedBuffer = new TIR.Buffer(
+            "k_major_packed_n_tile",
+            vectorType,
+            new TIR.MemSpan(new TIR.PhysicalBuffer(vectorType.SizeInBytes, 0, 32768, TIR.MemoryLocation.Shared)),
+            [2, 256],
+            [256, 1],
+            null,
+            new TargetStorageEncodingSelection(
+                TritonTargetStorageEncodingModel.KMajorPackedN,
+                32768,
+                16,
+                Array.Empty<KeyValuePair<string, long>>()));
+        var outputBuffer = CreateBuffer(
+            "packed_output",
+            vectorType,
+            TIR.MemoryLocation.Data,
+            32768,
+            [2, 256],
+            [256, 1]);
+        var publicOutput = CreateOutputVar("output", new TensorType(DataTypes.Float32, new[] { 1 }));
+        var publicOutputBuffer = CreateBuffer(
+            "public_output",
+            DataTypes.Float32,
+            TIR.MemoryLocation.Data,
+            65536,
+            [1],
+            [1]);
+        var placement = new Placement(new[] { 1 }, "b", "b");
+        var body = TIR.T.Let(
+            out var sharedPackedTile,
+            IR.F.Buffer.AllocateBufferView(sharedBuffer, new RankedShape(0, 0)),
+            "k_major_packed_n_tile")
+            .Body(
+                new TIR.Sequential(
+                    TIR.T.TileLoad(sharedPackedTile, inputBuffer),
+                    TIR.T.TileStore(sharedPackedTile, outputBuffer)))
+            .Build();
+        var main = new TIR.PrimFunction(
+            "main_prim",
+            PyNTTTarget.Kind,
+            new TIR.Sequential(
+                body,
+                TIR.F.NTT.TensorStore(publicOutputBuffer, publicOutput, new[] { SBP.B }, placement)),
+            new IVar[] { publicOutput })
+        {
+            SchedResult =
+            {
+                DataUsage = 65540,
+            },
+        };
+
+        var outputDirectory = GeneratePyNTTModelDirectory("generated_k_major_packed_n_shared_descriptor_model", main);
+        RenderGeneratedKernels(outputDirectory);
+        var generatedKernels = File.ReadAllText(Path.Join(outputDirectory, "generated_kernels.py"));
+        Assert.Contains(
+            "k_major_packed_n_tile_shared_buffer_0 = tle.gpu.alloc([2, 256, 32]",
+            generatedKernels,
+            StringComparison.Ordinal);
+        Assert.Contains(
+            "tle.gpu.copy(source + copy_global_offset, k_major_packed_n_tile_shared_buffer_0, [2, 256, 32])",
+            generatedKernels,
+            StringComparison.Ordinal);
+        Assert.DoesNotContain("tle.gpu.alloc([2, 256, 4, 8]", generatedKernels, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void TestPyNTTMmaSharedDescriptorExposesPackedWeightAsDotMatrix()
     {
         var vectorType = new VectorType(DataTypes.BFloat16, 4, 8);
@@ -1796,7 +1872,9 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
             var innerK = parameters.GetProperty("inner_k").GetInt32();
             if (model.GetProperty("MicroKernelVariant").GetString()!.Contains("simt", StringComparison.Ordinal))
             {
-                Assert.Contains($"tl.range(0, {blockK}, {innerK})", generatedKernelsPy, StringComparison.Ordinal);
+                Assert.Equal(blockK, innerK);
+                Assert.DoesNotContain($"for reduction_k_start in tl.range(0, {blockK}", generatedKernelsPy, StringComparison.Ordinal);
+                Assert.Contains($"offs_k = tl.arange(0, {blockK})", generatedKernelsPy, StringComparison.Ordinal);
             }
             else
             {
