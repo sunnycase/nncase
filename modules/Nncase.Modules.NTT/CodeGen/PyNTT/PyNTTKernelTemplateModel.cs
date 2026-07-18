@@ -10,23 +10,12 @@ public interface IPyNTTBlockMicroKernelTemplateModel
     string MicroKernelFamily { get; set; }
 
     string MicroKernelVariant { get; set; }
+
+    Dictionary<string, long> MicroKernelParameters { get; set; }
 }
 
 public interface IPyNTTMatrixMicroKernelTemplateModel : IPyNTTBlockMicroKernelTemplateModel
 {
-    int MicroKernelInnerM { get; set; }
-
-    int MicroKernelInnerN { get; set; }
-
-    int MicroKernelInnerK { get; set; }
-
-    int MicroKernelPipelineStages { get; set; }
-
-    int MicroKernelMmaM { get; set; }
-
-    int MicroKernelMmaN { get; set; }
-
-    int MicroKernelMmaK { get; set; }
 }
 
 public sealed record PyNTTBufferPointerTemplateModel(
@@ -38,7 +27,10 @@ public sealed record PyNTTBufferPointerTemplateModel(
 public sealed record PyNTTLocalBufferTemplateModel(
     string DescriptorExpression,
     long[] DescriptorShape,
-    string BaseScalarOffset,
+    long[] LogicalShape,
+    long[] LogicalStrides,
+    PyNTTDimExpression[] BaseCoordinates,
+    int[] VectorLaneShape,
     long AvailableBytes,
     int ScalarElementSizeBytes,
     string StorageEncoding);
@@ -64,6 +56,7 @@ public sealed record PyNTTTensorLoadTemplateModel(
     int[] Hierarchy,
     int[][] SplitAxes,
     int VectorLaneCount,
+    int[] VectorLaneShape,
     string Comment)
 {
     public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
@@ -87,6 +80,7 @@ public sealed record PyNTTTensorStoreTemplateModel(
     int[] Hierarchy,
     int[][] SplitAxes,
     int VectorLaneCount,
+    int[] VectorLaneShape,
     string Comment)
 {
     public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
@@ -106,20 +100,16 @@ public sealed record PyNTTMemcopyTemplateModel(
     PyNTTDimExpression[] SourceStrides,
     PyNTTDimExpression[] DestinationStrides,
     int VectorLaneCount,
+    int[] VectorLaneShape,
     string Comment)
 {
     public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
 }
 
-public sealed record PyNTTRegionCopyAxisTemplateModel(
-    PyNTTDimExpression Extent,
-    PyNTTDimExpression SourceScalarStride,
-    PyNTTDimExpression DestinationScalarStride);
-
 public sealed record PyNTTRegionCopyPlanTemplateModel(
-    PyNTTDimExpression SourceBaseScalarOffset,
-    PyNTTDimExpression DestinationBaseScalarOffset,
-    PyNTTRegionCopyAxisTemplateModel[] Axes,
+    PyNTTDimExpression[] SourceOrigins,
+    PyNTTDimExpression[] DestinationOrigins,
+    PyNTTDimExpression[] Extents,
     bool CoversWholeSource,
     bool CoversWholeDestination);
 
@@ -163,6 +153,9 @@ public sealed record PyNTTElementwiseBinaryTemplateModel(
     int LhsVectorLaneCount,
     int RhsVectorLaneCount,
     int OutputVectorLaneCount,
+    int[] LhsVectorLaneShape,
+    int[] RhsVectorLaneShape,
+    int[] OutputVectorLaneShape,
     PyNTTDimExpression[] Shape,
     string BinaryExpression,
     string Op,
@@ -185,6 +178,8 @@ public sealed record PyNTTElementwiseUnaryTemplateModel(
     PyNTTDimExpression[] OutputStrides,
     int InputVectorLaneCount,
     int OutputVectorLaneCount,
+    int[] InputVectorLaneShape,
+    int[] OutputVectorLaneShape,
     PyNTTDimExpression[] Shape,
     string UnaryExpression,
     string Op,
@@ -207,6 +202,8 @@ public sealed record PyNTTElementwiseCastTemplateModel(
     PyNTTDimExpression[] OutputStrides,
     int InputVectorLaneCount,
     int OutputVectorLaneCount,
+    int[] InputVectorLaneShape,
+    int[] OutputVectorLaneShape,
     int[] VectorizedAxes,
     PyNTTDimExpression[] Shape,
     string CastExpression,
@@ -240,6 +237,10 @@ public sealed record PyNTTElementwiseWhereTemplateModel(
     int TrueVectorLaneCount,
     int FalseVectorLaneCount,
     int OutputVectorLaneCount,
+    int[] CondVectorLaneShape,
+    int[] TrueVectorLaneShape,
+    int[] FalseVectorLaneShape,
+    int[] OutputVectorLaneShape,
     PyNTTDimExpression[] Shape,
     string Comment)
 {
@@ -304,6 +305,7 @@ public sealed record PyNTTGatherTemplateModel(
     PyNTTDimExpression[] OutputStrides,
     int Axis,
     int ValueVectorLaneCount,
+    int[] ValueVectorLaneShape,
     int[] Hierarchy,
     int[][] InputSplitAxes,
     string Comment)
@@ -328,6 +330,7 @@ public sealed record PyNTTReshardTemplateModel(
     PyNTTDimExpression[] InputStrides,
     PyNTTDimExpression[] OutputStrides,
     int VectorLaneCount,
+    int[] VectorLaneShape,
     int[] Hierarchy,
     int[][] InputSplitAxes,
     int[] InputPartialAxes,
@@ -425,6 +428,10 @@ public sealed record PyNTTRoPETemplateModel(
     PyNTTDimExpression[] CosStrides,
     PyNTTDimExpression[] SinStrides,
     PyNTTDimExpression[] OutputStrides,
+    int[] InputVectorLaneShape,
+    int[] CosVectorLaneShape,
+    int[] SinVectorLaneShape,
+    int[] OutputVectorLaneShape,
     int InputVectorLaneCount,
     int CosVectorLaneCount,
     int SinVectorLaneCount,
@@ -462,6 +469,10 @@ public sealed record PyNTTLayerNormTemplateModel(
     int ScaleVectorLaneCount,
     int BiasVectorLaneCount,
     int OutputVectorLaneCount,
+    int[] InputVectorLaneShape,
+    int[] ScaleVectorLaneShape,
+    int[] BiasVectorLaneShape,
+    int[] OutputVectorLaneShape,
     int Axis,
     float Epsilon,
     bool UseMean,
@@ -484,6 +495,8 @@ public sealed record PyNTTNormStatsTemplateModel(
     PyNTTDimExpression[] OutputStrides,
     int InputVectorLaneCount,
     int OutputVectorLaneCount,
+    int[] InputVectorLaneShape,
+    int[] OutputVectorLaneShape,
     int Axis,
     bool UseMean,
     string Comment)
@@ -524,6 +537,11 @@ public sealed record PyNTTNormApplyTemplateModel(
     int ScaleVectorLaneCount,
     int BiasVectorLaneCount,
     int OutputVectorLaneCount,
+    int[] InputVectorLaneShape,
+    int[] StatsVectorLaneShape,
+    int[] ScaleVectorLaneShape,
+    int[] BiasVectorLaneShape,
+    int[] OutputVectorLaneShape,
     int Axis,
     float Epsilon,
     bool UseMean,
@@ -612,6 +630,7 @@ public sealed record PyNTTUpdatePagedAttentionKVCacheTemplateModel(
     string LayerIdExpression,
     int CacheKind,
     int SlotsVectorLaneCount,
+    int[] SlotsVectorLaneShape,
     PyNTTPagedAttentionCacheTemplateModel Cache,
     string Comment)
 {
@@ -632,6 +651,8 @@ public sealed record PyNTTPagedAttentionTemplateModel(
     PyNTTDimExpression[] OutputGlobalShape,
     PyNTTDimExpression[] QueryStrides,
     PyNTTDimExpression[] OutputStrides,
+    int[] QueryVectorLaneShape,
+    int[] OutputVectorLaneShape,
     int[][] OutputSplitAxes,
     int[] Hierarchy,
     int SeqAxis,
@@ -691,6 +712,8 @@ public sealed record PyNTTTransposeTemplateModel(
     PyNTTDimExpression[] OutputStrides,
     int InputVectorLaneCount,
     int OutputVectorLaneCount,
+    int[] InputVectorLaneShape,
+    int[] OutputVectorLaneShape,
     int[] Perm,
     string Comment)
 {
@@ -742,19 +765,7 @@ public sealed record PyNTTMatmulTemplateModel(
 
     public string MicroKernelVariant { get; set; } = string.Empty;
 
-    public int MicroKernelInnerM { get; set; }
-
-    public int MicroKernelInnerN { get; set; }
-
-    public int MicroKernelInnerK { get; set; }
-
-    public int MicroKernelPipelineStages { get; set; }
-
-    public int MicroKernelMmaM { get; set; }
-
-    public int MicroKernelMmaN { get; set; }
-
-    public int MicroKernelMmaK { get; set; }
+    public Dictionary<string, long> MicroKernelParameters { get; set; } = new(StringComparer.Ordinal);
 }
 
 public sealed record PyNTTMatmulReductionFinalizeTemplateModel(
@@ -780,19 +791,7 @@ public sealed record PyNTTMatmulReductionFinalizeTemplateModel(
 
     public string MicroKernelVariant { get; set; } = string.Empty;
 
-    public int MicroKernelInnerM { get; set; }
-
-    public int MicroKernelInnerN { get; set; }
-
-    public int MicroKernelInnerK { get; set; }
-
-    public int MicroKernelPipelineStages { get; set; }
-
-    public int MicroKernelMmaM { get; set; }
-
-    public int MicroKernelMmaN { get; set; }
-
-    public int MicroKernelMmaK { get; set; }
+    public Dictionary<string, long> MicroKernelParameters { get; set; } = new(StringComparer.Ordinal);
 }
 
 public sealed record PyNTTQKVParallelLinearTemplateModel(
@@ -867,19 +866,7 @@ public sealed record PyNTTQKVParallelLinearTemplateModel(
 
     public string MicroKernelVariant { get; set; } = string.Empty;
 
-    public int MicroKernelInnerM { get; set; }
-
-    public int MicroKernelInnerN { get; set; }
-
-    public int MicroKernelInnerK { get; set; }
-
-    public int MicroKernelPipelineStages { get; set; }
-
-    public int MicroKernelMmaM { get; set; }
-
-    public int MicroKernelMmaN { get; set; }
-
-    public int MicroKernelMmaK { get; set; }
+    public Dictionary<string, long> MicroKernelParameters { get; set; } = new(StringComparer.Ordinal);
 }
 
 public sealed record PyNTTQKVParallelLinearReductionFinalizeTemplateModel(
@@ -926,19 +913,7 @@ public sealed record PyNTTQKVParallelLinearReductionFinalizeTemplateModel(
 
     public string MicroKernelVariant { get; set; } = string.Empty;
 
-    public int MicroKernelInnerM { get; set; }
-
-    public int MicroKernelInnerN { get; set; }
-
-    public int MicroKernelInnerK { get; set; }
-
-    public int MicroKernelPipelineStages { get; set; }
-
-    public int MicroKernelMmaM { get; set; }
-
-    public int MicroKernelMmaN { get; set; }
-
-    public int MicroKernelMmaK { get; set; }
+    public Dictionary<string, long> MicroKernelParameters { get; set; } = new(StringComparer.Ordinal);
 }
 
 public sealed record PyNTTMatMulGluTemplateModel(
@@ -994,19 +969,7 @@ public sealed record PyNTTMatMulGluTemplateModel(
 
     public string MicroKernelVariant { get; set; } = string.Empty;
 
-    public int MicroKernelInnerM { get; set; }
-
-    public int MicroKernelInnerN { get; set; }
-
-    public int MicroKernelInnerK { get; set; }
-
-    public int MicroKernelPipelineStages { get; set; }
-
-    public int MicroKernelMmaM { get; set; }
-
-    public int MicroKernelMmaN { get; set; }
-
-    public int MicroKernelMmaK { get; set; }
+    public Dictionary<string, long> MicroKernelParameters { get; set; } = new(StringComparer.Ordinal);
 }
 
 public sealed record PyNTTMatMulGluReductionFinalizeTemplateModel(
@@ -1042,19 +1005,7 @@ public sealed record PyNTTMatMulGluReductionFinalizeTemplateModel(
 
     public string MicroKernelVariant { get; set; } = string.Empty;
 
-    public int MicroKernelInnerM { get; set; }
-
-    public int MicroKernelInnerN { get; set; }
-
-    public int MicroKernelInnerK { get; set; }
-
-    public int MicroKernelPipelineStages { get; set; }
-
-    public int MicroKernelMmaM { get; set; }
-
-    public int MicroKernelMmaN { get; set; }
-
-    public int MicroKernelMmaK { get; set; }
+    public Dictionary<string, long> MicroKernelParameters { get; set; } = new(StringComparer.Ordinal);
 }
 
 public sealed record PyNTTSummaTemplateModel(
@@ -1092,6 +1043,8 @@ public sealed record PyNTTSummaTemplateModel(
     int[] Hierarchy,
     int RhsNVectorLaneCount,
     int OutputNVectorLaneCount,
+    int[] RhsNVectorLaneShape,
+    int[] OutputNVectorLaneShape,
     string Scale,
     string Comment)
 {
@@ -1131,6 +1084,8 @@ public sealed record PyNTTReduceTemplateModel(
     public string MicroKernelFamily { get; set; } = string.Empty;
 
     public string MicroKernelVariant { get; set; } = string.Empty;
+
+    public Dictionary<string, long> MicroKernelParameters { get; set; } = new(StringComparer.Ordinal);
 }
 
 public sealed record PyNTTReduceReductionFinalizeTemplateModel(
@@ -1152,6 +1107,8 @@ public sealed record PyNTTReduceReductionFinalizeTemplateModel(
     public string MicroKernelFamily { get; set; } = string.Empty;
 
     public string MicroKernelVariant { get; set; } = string.Empty;
+
+    public Dictionary<string, long> MicroKernelParameters { get; set; } = new(StringComparer.Ordinal);
 }
 
 public sealed record PyNTTSoftmaxTemplateModel(

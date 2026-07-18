@@ -28,14 +28,12 @@ def {{ model["FunctionName"] }}({{ helper_parameters(model, ("block_tables", "kv
         max_seq_len = tl.maximum(max_seq_len, seq_len_scan)
         num_tokens += seq_len_scan - context_len_scan
     block_table_blocks = tl.cdiv(max_seq_len, {{ cache["BlockSize"] }})
+{{ common.structured_axis(ctx["query_dim_axis"], "    ") }}
+{{ common.structured_axis(ctx["key_dim_axis"], "    ") }}
+{% if ctx["value_axis_kind"] == "dim" %}
+{{ common.structured_axis(ctx["value_axis"], "    ") }}
+{% else %}
     dim_offsets = tl.arange(0, {{ cache["HeadDim"] }})
-    query_dim_blocks = dim_offsets // {{ cache["KeyLaneCount"] }}
-    query_dim_lanes = dim_offsets % {{ cache["KeyLaneCount"] }}
-    key_dim_index = {{ ctx["key_dim_index"] }}
-    key_lane = {{ ctx["key_lane"] }}
-    value_dim_index = {{ ctx["value_dim_index"] }}
-{% if cache["ValueVectorizedDim"] != 3 %}
-    value_lane = {{ ctx["value_lane"] }}
 {% endif %}
     for local_query_id in tl.range(0, {{ dim(ctx["local_query_tokens"]) }}):
         global_query_id = {{ ctx["global_query_id"] }}
@@ -61,27 +59,23 @@ def {{ model["FunctionName"] }}({{ helper_parameters(model, ("block_tables", "kv
                 query_start += current_query_len
             head_group = {{ model["GlobalNumQueryHeads"] }} // {{ cache["NumKVHeads"] }}
             kv_head = global_q_head // head_group
-            q_offsets = {{ ctx["query_vector_offset"] }}
-            q_values = tl.load({{ access_pointer(model, "Query", "query", "q_offsets") }}, mask=found_seq, other=0.0)
+            q_values = tl.reshape(tl.load({{ access_pointer(model, "Query", "query", ctx["query_access"]) }}, mask=found_seq, other=0.0), ({{ cache["HeadDim"] }},))
             max_score = -float("inf")
             sum_exp = 0.0
             acc = tl.zeros((1, {{ cache["HeadDim"] }}), tl.float32)
             for context_start in tl.range(0, max_seq_len, {{ ctx["attention_block_size"] }}):
                 context_ids = context_start + tl.arange(0, {{ ctx["attention_block_size"] }})
                 context_mask = found_seq & (context_ids < seq_len) & (context_ids <= context_len + query_id)
-                context_bid = context_ids // {{ cache["BlockSize"] }}
-                block_offsets = context_ids % {{ cache["BlockSize"] }}
-                key_block_index = {{ ctx["key_block_index"] }}
-                value_block_index = {{ ctx["value_block_index"] }}
-{% if cache["ValueVectorizedDim"] == 3 %}
-                value_lane = {{ ctx["value_lane"] }}
-{% endif %}
+                context_bid = context_start // {{ cache["BlockSize"] }}
+                block_offsets = (context_start % {{ cache["BlockSize"] }}) + tl.arange(0, {{ ctx["attention_block_size"] }})
+                block_table_active = found_seq & (context_start < seq_len)
 {% if cache["IdLength"] > 1 %}
-                topology_id = tl.load(block_tables + matched_seq_id * block_table_blocks * {{ cache["IdLength"] }} + context_bid * {{ cache["IdLength"] }}, mask=context_mask, other=0)
+                topology_id = tl.load(block_tables + matched_seq_id * block_table_blocks * {{ cache["IdLength"] }} + context_bid * {{ cache["IdLength"] }}, mask=block_table_active, other=0)
 {% endif %}
-                block_id = tl.load(block_tables + matched_seq_id * block_table_blocks * {{ cache["IdLength"] }} + context_bid * {{ cache["IdLength"] }} + {{ cache["IdLength"] - 1 }}, mask=context_mask, other=0)
+                block_id = tl.load(block_tables + matched_seq_id * block_table_blocks * {{ cache["IdLength"] }} + context_bid * {{ cache["IdLength"] }} + {{ cache["IdLength"] - 1 }}, mask=block_table_active, other=0)
+                cache_block_id = {{ ctx["cache_block_id"] }}
                 key_offsets = {{ ctx["key_vector_offset"] }}
-                key_values = tl.load(kv_cache + key_offsets, mask=context_mask[None, :], other=0.0)
+                key_values = tl.reshape(tl.load(kv_cache + key_offsets, mask={{ ctx["key_mask"] }}, other=0.0), ({{ cache["HeadDim"] }}, {{ ctx["attention_block_size"] }}))
                 score = tl.reshape(tl.dot(q_values[None, :], key_values), ({{ ctx["attention_block_size"] }},))
                 score = tl.where(context_mask, score * scale_value, -float("inf"))
                 block_max = tl.max(score, axis=0)
@@ -91,12 +85,14 @@ def {{ model["FunctionName"] }}({{ helper_parameters(model, ("block_tables", "kv
                 safe_prev_max = tl.where(has_context, max_score, 0.0)
                 alpha = tl.exp(safe_prev_max - safe_new_max)
                 prob = tl.exp(tl.where(context_mask, score - safe_new_max, -float("inf")))
+{% if ctx["value_axis_kind"] == "context" %}
+{{ common.structured_axis(ctx["value_axis"], "                ") }}
+{% endif %}
                 value_offsets = {{ ctx["value_vector_offset"] }}
-                value_values = tl.load(kv_cache + value_offsets, mask=context_mask[:, None], other=0.0).to(tl.float32)
+                value_values = tl.reshape(tl.load(kv_cache + value_offsets, mask={{ ctx["value_mask"] }}, other=0.0), ({{ ctx["attention_block_size"] }}, {{ cache["HeadDim"] }})).to(tl.float32)
                 acc = acc * alpha + tl.dot(prob[None, :], value_values, input_precision="ieee")
                 sum_exp = sum_exp * alpha + tl.sum(prob, axis=0)
                 max_score = tl.where(has_context, new_max, max_score)
             inv_sum = tl.where(sum_exp != 0.0, 1.0 / sum_exp, 0.0)
             result = tl.reshape(acc * inv_sum, ({{ cache["HeadDim"] }},))
-            output_offsets = {{ ctx["output_vector_offset"] }}
-            tl.store({{ access_pointer(model, "Output", "output", "output_offsets") }}, result, mask=found_seq)
+            tl.store({{ access_pointer(model, "Output", "output", ctx["output_access"]) }}, tl.reshape(result, {{ ctx["query_structured_shape"] }}), mask=found_seq)

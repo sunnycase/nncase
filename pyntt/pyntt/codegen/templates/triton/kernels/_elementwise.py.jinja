@@ -1,0 +1,28 @@
+{% macro iterate(ctx, base_depth=0) %}
+{% for axis in ctx["loop_axes"] %}
+{{ "    " * (base_depth + loop.index) }}for index{{ axis }} in tl.range(0, {{ dim(ctx["tensor_shape"][axis]) }}):
+{% endfor %}
+{% set outer_depth = base_depth + (ctx["loop_axes"] | length) %}
+{{ "    " * (outer_depth + 1) }}for major_start in tl.range(0, {{ dim(ctx["major_extent"]) }}, {{ ctx["major_width"] }}):
+{{ "    " * (outer_depth + 2) }}major_raw = (major_start + tl.arange(0, {{ ctx["major_width"] }})){{ ctx["major_reshape"] }}
+{% for extent in ctx["lane_shape"] %}
+{{ "    " * (outer_depth + 2) }}lane_raw{{ loop.index0 }} = tl.arange(0, {{ extent }}){{ ctx["lane_reshapes"][loop.index0] }}
+{% endfor %}
+{{ "    " * (outer_depth + 2) }}major_coord = tl.broadcast_to(major_raw, {{ ctx["tile_shape"] }})
+{{ "    " * (outer_depth + 2) }}zero_coord = 0
+{% for axis in range(ctx["tensor_shape"] | length) %}
+{% if axis == ctx["major_axis"] %}
+{{ "    " * (outer_depth + 2) }}raw_coord{{ axis }} = major_raw
+{{ "    " * (outer_depth + 2) }}coord{{ axis }} = major_coord
+{% else %}
+{{ "    " * (outer_depth + 2) }}raw_coord{{ axis }} = index{{ axis }}
+{{ "    " * (outer_depth + 2) }}coord{{ axis }} = tl.broadcast_to(raw_coord{{ axis }}, {{ ctx["tile_shape"] }})
+{% endif %}
+{% endfor %}
+{% for extent in ctx["lane_shape"] %}
+{{ "    " * (outer_depth + 2) }}raw_lane_coord{{ loop.index0 }} = lane_raw{{ loop.index0 }}
+{{ "    " * (outer_depth + 2) }}lane_coord{{ loop.index0 }} = tl.broadcast_to(raw_lane_coord{{ loop.index0 }}, {{ ctx["tile_shape"] }})
+{% endfor %}
+{{ "    " * (outer_depth + 2) }}mask = major_coord < {{ dim(ctx["major_extent"]) }}
+{{ caller("    " * (outer_depth + 2)) }}
+{% endmacro %}

@@ -160,7 +160,6 @@ local restore/build/test loop; RID-specific restore rewrites many
 export PYTHONPATH="$PWD/install/lib:$PWD/install/python:$PWD/tests:${PYTHONPATH}"
 export LD_LIBRARY_PATH="$PWD/install/lib:${LD_LIBRARY_PATH}"
 export NNCASE_COMPILER="$PWD/src/Nncase.Compiler/bin/Debug/net8.0/Nncase.Compiler.dll"
-export NNCASE_TILING_MAX_SOLUTIONS=1
 
 python - <<'PY'
 import nncase
@@ -331,7 +330,6 @@ python -m pip install -r requirements.test.txt
 export PYTHONPATH="$PWD/install/lib:$PWD/install/python:$PWD/tests:${PYTHONPATH}"
 export LD_LIBRARY_PATH="$PWD/install/lib:${LD_LIBRARY_PATH}"
 export NNCASE_COMPILER="$PWD/src/Nncase.Compiler/bin/Debug/net8.0/Nncase.Compiler.dll"
-export NNCASE_TILING_MAX_SOLUTIONS=1
 
 pytest tests/other/ --doctest-modules
 pytest -n 2 tests/importer/onnx_/basic/ --doctest-modules

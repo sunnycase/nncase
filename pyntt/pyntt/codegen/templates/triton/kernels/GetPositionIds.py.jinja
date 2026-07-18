@@ -27,4 +27,4 @@ def {{ model["FunctionName"] }}({{ helper_parameters(model, ["cache_meta"]) }}):
             result = tl.where(in_seq, (context_len + global_lane - query_start).to(tl.float32), result)
             active = active | in_seq
             query_start = query_end
-        tl.store({{ access_pointer(model, "Output", "output", "lane * " ~ dim(model["OutputStrides"][0])) }}, result, mask=mask & active)
+        tl.store({{ access_pointer(model, "Output", "output", tensor_access(["lane"], model["OutputStrides"])) }}, result, mask=mask & active)

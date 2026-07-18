@@ -22,14 +22,15 @@ def {{ model["FunctionName"] }}({{ helper_parameters(model) }}):
 {% if ctx["use_gemv"] %}
 {{ base }}for m_idx in tl.range(0, {{ dim(ctx["m"]) }}):
 {% set tile = base ~ "    " %}
-{{ tile }}for n_start in tl.range(0, {{ dim(ctx["n"]) }}, {{ ctx["block_n"] }}, num_stages={{ ctx["n_stages"] }}):
+{{ tile }}for n_start in tl.range(0, {{ dim(ctx["physical_n"]) }}, {{ ctx["physical_block_n"] }}, num_stages={{ ctx["n_stages"] }}):
 {% else %}
 {{ base }}for m_start in tl.range(0, {{ dim(ctx["m"]) }}, {{ ctx["block_m"] }}):
 {{ base }}    offs_m = m_start + tl.arange(0, {{ ctx["block_m"] }})
 {% set tile = base ~ "    " %}
-{{ tile }}for n_start in tl.range(0, {{ dim(ctx["n"]) }}, {{ ctx["block_n"] }}):
+{{ tile }}for n_start in tl.range(0, {{ dim(ctx["physical_n"]) }}, {{ ctx["physical_block_n"] }}):
 {% endif %}
-{{ tile }}    offs_n = n_start + tl.arange(0, {{ ctx["block_n"] }})
+{{ common.structured_axis(ctx["weight_n_axis"], tile ~ "    ") }}
+{{ common.structured_axis(ctx["output_n_axis"], tile ~ "    ") }}
 {% if ctx["use_gemv"] %}
 {{ tile }}    gate_acc = tl.zeros(({{ ctx["block_n"] }},), tl.float32)
 {{ tile }}    up_acc = tl.zeros(({{ ctx["block_n"] }},), tl.float32)
@@ -40,9 +41,9 @@ def {{ model["FunctionName"] }}({{ helper_parameters(model) }}):
 {{ tile }}    for k_start in tl.range(0, {{ dim(ctx["k"]) }}, {{ ctx["block_k"] }}, num_stages=5):
 {% endif %}
 {{ tile }}        offs_k = k_start + tl.arange(0, {{ ctx["block_k"] }})
-{{ tile }}        input_values = tl.load({{ access_pointer(model, "Input", "input0", ctx["input_offset"]) }}, mask={{ ctx["input_mask"] }}, other=0.0){{ ".to(tl.float32)" if ctx["use_gemv"] else "" }}
+{{ tile }}        input_values = tl.load({{ access_pointer(model, "Input", "input0", ctx["input_access"]) }}, mask={{ ctx["input_mask"] }}, other=0.0){{ ".to(tl.float32)" if ctx["use_gemv"] else "" }}
 {% for projection in ctx["projections"] %}
-{{ tile }}        {{ projection["lower"] }}_weight_values = tl.load({{ access_pointer(model, projection["prefix"] ~ "Weight", projection["lower"] ~ "_weight", projection["weight_offset"]) }}, mask={{ projection["weight_mask"] }}, other=0.0{{ ", eviction_policy=\"evict_first\"" if ctx["use_gemv"] else "" }}){{ ".to(tl.float32)" if ctx["use_gemv"] else "" }}
+{{ tile }}        {{ projection["lower"] }}_weight_values = tl.reshape(tl.load({{ access_pointer(model, projection["prefix"] ~ "Weight", projection["lower"] ~ "_weight", projection["weight_access"]) }}, mask={{ projection["weight_mask"] }}, other=0.0{{ ", eviction_policy=\"evict_first\"" if ctx["use_gemv"] else "" }}), {{ ctx["weight_matrix_shape"] }}){{ ".to(tl.float32)" if ctx["use_gemv"] else "" }}
 {% if ctx["use_gemv"] %}
 {{ tile }}        {{ projection["accumulator"] }} += tl.sum({{ projection["lower"] }}_weight_values * input_values[None, :], axis=1)
 {% else %}
@@ -51,11 +52,12 @@ def {{ model["FunctionName"] }}({{ helper_parameters(model) }}):
 {% endfor %}
 {% for projection in ctx["projections"] %}
 {% if projection["has_bias"] %}
-{{ tile }}    {{ projection["accumulator"] }} += tl.load({{ access_pointer(model, projection["prefix"] ~ "Bias", projection["lower"] ~ "_bias", projection["bias_offset"]) }}, mask={{ projection["bias_mask"] }}, other=0.0).to(tl.float32){{ "[None, :]" if not ctx["use_gemv"] else "" }}
+{{ tile }}    {{ projection["lower"] }}_bias_values = tl.reshape(tl.load({{ access_pointer(model, projection["prefix"] ~ "Bias", projection["lower"] ~ "_bias", projection["bias_access"]) }}, mask={{ projection["bias_mask"] }}, other=0.0), ({{ ctx["block_n"] }},)).to(tl.float32)
+{{ tile }}    {{ projection["accumulator"] }} += {{ projection["lower"] }}_bias_values{{ "[None, :]" if not ctx["use_gemv"] else "" }}
 {% endif %}
 {% endfor %}
 {{ tile }}    result = {{ ctx["result_expression"] }}
-{{ tile }}    tl.store({{ access_pointer(model, "Output", "output", ctx["output_offset"]) }}, result, mask={{ ctx["output_mask"] }})
+{{ tile }}    tl.store({{ access_pointer(model, "Output", "output", ctx["output_access"]) }}, tl.reshape(result, {{ ctx["output_structured_shape"] }}), mask={{ ctx["output_mask"] }})
 {% elif ctx["phase"] == "accumulate" %}
 # generated from PyNTT Jinja {{ ctx["template_name"] }}.py.jinja reduction accumulate
 # {{ model["Comment"] }}; accumulator=backend-private-fp32
@@ -69,20 +71,20 @@ def {{ model["FunctionName"] }}({{ helper_parameters(model, ("gate_acc", "up_acc
 {% endif %}
 {% endfor %}
     offs_k = tl.arange(0, {{ ctx["block_k"] }})
-    offs_n = tl.arange(0, {{ ctx["block_n"] }})
 {% if ctx["block_m"] != 1 %}
     offs_m = tl.arange(0, {{ ctx["block_m"] }})
 {% endif %}
+{{ common.structured_axis(ctx["n_axis"], "    ") }}
 {% if ctx["input_direct_load"] %}
     input_values = {{ ctx["input_direct_load"] }}
 {% else %}
-    input_values = tl.load({{ access_pointer(model, "Input", "input0", ctx["input_offset"]) }}, mask={{ ctx["input_mask"] }}, other=0.0){{ ".to(tl.float32)" if ctx["block_m"] == 1 else "" }}
+    input_values = tl.load({{ access_pointer(model, "Input", "input0", ctx["input_access"]) }}, mask={{ ctx["input_mask"] }}, other=0.0){{ ".to(tl.float32)" if ctx["block_m"] == 1 else "" }}
 {% endif %}
 {% for projection in ctx["projections"] %}
 {% if projection["weight_direct_load"] %}
     {{ projection["lower"] }}_weight_values = {{ projection["weight_direct_load"] }}
 {% else %}
-    {{ projection["lower"] }}_weight_values = tl.load({{ access_pointer(model, projection["prefix"] ~ "Weight", projection["lower"] ~ "_weight", projection["weight_offset"]) }}, mask={{ projection["weight_mask"] }}, other=0.0{{ ", eviction_policy=\"evict_first\"" if ctx["block_m"] == 1 else "" }}){{ ".to(tl.float32)" if ctx["block_m"] == 1 else "" }}
+    {{ projection["lower"] }}_weight_values = tl.reshape(tl.load({{ access_pointer(model, projection["prefix"] ~ "Weight", projection["lower"] ~ "_weight", projection["weight_access"]) }}, mask={{ projection["weight_mask"] }}, other=0.0{{ ", eviction_policy=\"evict_first\"" if ctx["block_m"] == 1 else "" }}), {{ ctx["weight_matrix_shape"] }}){{ ".to(tl.float32)" if ctx["block_m"] == 1 else "" }}
 {% endif %}
 {% if ctx["block_m"] == 1 %}
     {{ projection["accumulator"] }} += tl.sum({{ projection["lower"] }}_weight_values * input_values[None, :], axis=1)
@@ -106,13 +108,14 @@ def {{ model["FunctionName"] }}({{ helper_parameters(model, ("gate_acc", "up_acc
 {% if local_buffer(model["Output"]) is none %}
     output = {{ ptr(model, "Output") }}
 {% endif %}
-    offs_n = tl.arange(0, {{ ctx["block_n"] }})
 {% if ctx["block_m"] != 1 %}
     offs_m = tl.arange(0, {{ ctx["block_m"] }})
 {% endif %}
+{{ common.structured_axis(ctx["n_axis"], "    ") }}
 {% for bias in ctx["biases"] %}
-    {{ bias["accumulator"] }} += tl.load({{ access_pointer(model, bias["prefix"] ~ "Bias", bias["lower"] ~ "_bias", bias["offset"]) }}, mask={{ bias["mask"] }}, other=0.0).to(tl.float32){{ "[None, :]" if ctx["block_m"] != 1 else "" }}
+    {{ bias["lower"] }}_bias_values = tl.reshape(tl.load({{ access_pointer(model, bias["prefix"] ~ "Bias", bias["lower"] ~ "_bias", bias["access"]) }}, mask={{ bias["mask"] }}, other=0.0), ({{ ctx["block_n"] }},)).to(tl.float32)
+    {{ bias["accumulator"] }} += {{ bias["lower"] }}_bias_values{{ "[None, :]" if ctx["block_m"] != 1 else "" }}
 {% endfor %}
     result = {{ ctx["result_expression"] }}
-    tl.store({{ access_pointer(model, "Output", "output", ctx["output_offset"]) }}, result, mask={{ ctx["output_mask"] }})
+    tl.store({{ access_pointer(model, "Output", "output", ctx["output_access"]) }}, tl.reshape(result, {{ ctx["output_structured_shape"] }}), mask={{ ctx["output_mask"] }})
 {% endif %}

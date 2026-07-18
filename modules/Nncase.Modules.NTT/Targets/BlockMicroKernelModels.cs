@@ -9,6 +9,38 @@ using Nncase.Schedule;
 namespace Nncase.Targets;
 
 /// <summary>
+/// Stable parameter names shared by the Triton block cost model and PyNTT
+/// code generation. These parameters describe a backend-private CTA
+/// implementation; they do not add warp or thread levels to the TIR hierarchy.
+/// </summary>
+public static class TritonBlockMicroKernelContract
+{
+    public const long Version = 2;
+
+    public const string VersionParameter = "contract_version";
+
+    public const string StateBlockMParameter = "state_block_m";
+
+    public const string StateBlockNParameter = "state_block_n";
+
+    public const string StateBlockKParameter = "state_block_k";
+
+    public const string InnerMParameter = "inner_m";
+
+    public const string InnerNParameter = "inner_n";
+
+    public const string InnerKParameter = "inner_k";
+
+    public const string PipelineStagesParameter = "pipeline_stages";
+
+    public const string MmaMParameter = "mma_m";
+
+    public const string MmaNParameter = "mma_n";
+
+    public const string MmaKParameter = "mma_k";
+}
+
+/// <summary>
 /// Conservative backend-private state model used by native NTT targets.
 /// </summary>
 public sealed class DefaultBlockMicroKernelModel : IBlockMicroKernelModelProvider
@@ -90,7 +122,6 @@ public sealed class TritonBlockMicroKernelModel : IBlockMicroKernelModelProvider
     private const int FixedRegistersPerThread = 48;
     private const int GemvFixedRegistersPerThread = 56;
     private const int GemvMmaCompilerOverheadRegistersPerThread = 216;
-    private const int SimtReductionFragmentK = 32;
     private const int MmaPipelineStages = 2;
 
     public IReadOnlyList<BlockMicroKernelCandidate> GetCandidates(BlockMicroKernelModelContext context)
@@ -148,16 +179,24 @@ public sealed class TritonBlockMicroKernelModel : IBlockMicroKernelModelProvider
         }
 
         var useGemv = fullM.Max() == 1;
+        var simtWorkerWidth = context.Machine.Execution.WorkerWidth;
+        if (!System.Numerics.BitOperations.IsPow2((uint)simtWorkerWidth))
+        {
+            throw new InvalidOperationException(
+                $"Triton SIMT microkernels require a power-of-two worker width, got " +
+                $"{simtWorkerWidth} lanes on {context.Machine.Id}.");
+        }
+
         var simtComputeCycles = DivideByRate(
             full.GetWork(),
             context.Machine.Compute.SimtFmaPerCycle,
             solver);
         var alignedM = useGemv ? local.M : AlignUp(local.M, MatrixAccumulatorMinM, solver);
-        var alignedN = AlignUp(local.N, MatrixAccumulatorMinN, solver);
-        var reductionTileCount = solver.MakeDiv(full.K + local.K - 1, local.K);
-        var hasExternalReduction = solver.MakeIsGreaterCstVar(reductionTileCount, 1);
+        var alignedN = useGemv
+            ? AlignUp(solver.MakeMax(local.N, solver.MakeIntConst(simtWorkerWidth)), simtWorkerWidth, solver)
+            : AlignUp(local.N, MatrixAccumulatorMinN, solver);
         var registerM = useGemv ? solver.MakeIntConst(1) : alignedM;
-        var simtFragmentK = solver.MakeMin(local.K, SimtReductionFragmentK);
+        var simtFragmentK = solver.MakeMin(local.K, simtWorkerWidth);
         var simtFixedRegisters = solver.MakeIntConst(
             checked((long)(useGemv ? GemvFixedRegistersPerThread : FixedRegistersPerThread)
                 * context.Machine.Execution.ThreadsPerBlock));
@@ -217,13 +256,14 @@ public sealed class TritonBlockMicroKernelModel : IBlockMicroKernelModelProvider
             registerSimtResources,
             gemvMemoryAccesses,
             [
-                new("state_block_m", alignedM),
-                new("state_block_n", alignedN),
-                new("state_block_k", local.K),
-                new("inner_m", registerM),
-                new("inner_n", alignedN),
-                new("inner_k", simtFragmentK),
-                new("pipeline_stages", solver.MakeIntConst(1)),
+                new(TritonBlockMicroKernelContract.VersionParameter, solver.MakeIntConst(TritonBlockMicroKernelContract.Version)),
+                new(TritonBlockMicroKernelContract.StateBlockMParameter, alignedM),
+                new(TritonBlockMicroKernelContract.StateBlockNParameter, alignedN),
+                new(TritonBlockMicroKernelContract.StateBlockKParameter, local.K),
+                new(TritonBlockMicroKernelContract.InnerMParameter, registerM),
+                new(TritonBlockMicroKernelContract.InnerNParameter, alignedN),
+                new(TritonBlockMicroKernelContract.InnerKParameter, simtFragmentK),
+                new(TritonBlockMicroKernelContract.PipelineStagesParameter, solver.MakeIntConst(1)),
             ])
         {
             BufferEncodingRequirements = dotOperandRequirements,
@@ -232,39 +272,6 @@ public sealed class TritonBlockMicroKernelModel : IBlockMicroKernelModelProvider
 
         if (isSupportedGemv)
         {
-            var sharedAccumulatorBytes = alignedM * alignedN * local.Multiplicity * matrix.AccumulatorElementSizeBytes;
-            var spatialTileCount = solver.MakeDiv(full.M + local.M - 1, local.M)
-                * solver.MakeDiv(full.N + local.N - 1, local.N);
-            var sharedAccumulatorAccessBytes = sharedAccumulatorBytes
-                * (reductionTileCount + 1)
-                * spatialTileCount;
-            var sharedMemoryAccesses = gemvMemoryAccesses
-                .Add(new(null, sharedMemoryResource.Id, MemoryAccessMode.Read, sharedAccumulatorAccessBytes))
-                .Add(new(null, sharedMemoryResource.Id, MemoryAccessMode.Write, sharedAccumulatorAccessBytes));
-            var sharedSimtRegisterUsage = simtFixedRegisters
-                + (2 * accumulatorRegisters)
-                + simtOperandRegisters;
-            candidates.Add(
-                new(
-                    family,
-                    "shared_simt_accumulator",
-                    hasExternalReduction,
-                    simtComputeCycles,
-                    [
-                        new(registerResource.Id, sharedSimtRegisterUsage),
-                        new(sharedResource.Id, sharedAccumulatorBytes),
-                    ],
-                    sharedMemoryAccesses,
-                    [
-                        new("state_block_m", alignedM),
-                        new("state_block_n", alignedN),
-                        new("state_block_k", local.K),
-                        new("inner_m", solver.MakeIntConst(1)),
-                        new("inner_n", alignedN),
-                        new("inner_k", simtFragmentK),
-                        new("pipeline_stages", solver.MakeIntConst(1)),
-                    ]));
-
             var mmaPrimitives = context.Machine.Compute.MatrixPrimitives
                 .Where(primitive => primitive.Supports(
                     context.WorkloadContext.BufferDataTypes[0],
@@ -335,22 +342,19 @@ public sealed class TritonBlockMicroKernelModel : IBlockMicroKernelModelProvider
                     + accumulatorRegisters
                     + mmaAccumulatorRegisters
                     + mmaOperandRegisters;
-                var sharedMmaRegisterUsage = mmaFixedRegisters
-                    + accumulatorRegisters
-                    + mmaAccumulatorRegisters
-                    + mmaOperandRegisters;
                 var mmaLegality = nIsLargeEnough * nIsAligned * kIsLargeEnough * kIsAligned;
                 var mmaParameters = ImmutableArray.Create(
-                    new BlockMicroKernelParameter("state_block_m", alignedM),
-                    new BlockMicroKernelParameter("state_block_n", alignedN),
-                    new BlockMicroKernelParameter("state_block_k", local.K),
-                    new BlockMicroKernelParameter("inner_m", solver.MakeIntConst(mma.N)),
-                    new BlockMicroKernelParameter("inner_n", alignedN),
-                    new BlockMicroKernelParameter("inner_k", solver.MakeIntConst(mma.K)),
-                    new BlockMicroKernelParameter("pipeline_stages", solver.MakeIntConst(MmaPipelineStages)),
-                    new BlockMicroKernelParameter("mma_m", solver.MakeIntConst(mma.M)),
-                    new BlockMicroKernelParameter("mma_n", solver.MakeIntConst(mma.N)),
-                    new BlockMicroKernelParameter("mma_k", solver.MakeIntConst(mma.K)));
+                    new BlockMicroKernelParameter(TritonBlockMicroKernelContract.VersionParameter, solver.MakeIntConst(TritonBlockMicroKernelContract.Version)),
+                    new BlockMicroKernelParameter(TritonBlockMicroKernelContract.StateBlockMParameter, alignedM),
+                    new BlockMicroKernelParameter(TritonBlockMicroKernelContract.StateBlockNParameter, alignedN),
+                    new BlockMicroKernelParameter(TritonBlockMicroKernelContract.StateBlockKParameter, local.K),
+                    new BlockMicroKernelParameter(TritonBlockMicroKernelContract.InnerMParameter, solver.MakeIntConst(mma.N)),
+                    new BlockMicroKernelParameter(TritonBlockMicroKernelContract.InnerNParameter, alignedN),
+                    new BlockMicroKernelParameter(TritonBlockMicroKernelContract.InnerKParameter, solver.MakeIntConst(mma.K)),
+                    new BlockMicroKernelParameter(TritonBlockMicroKernelContract.PipelineStagesParameter, solver.MakeIntConst(MmaPipelineStages)),
+                    new BlockMicroKernelParameter(TritonBlockMicroKernelContract.MmaMParameter, solver.MakeIntConst(mma.M)),
+                    new BlockMicroKernelParameter(TritonBlockMicroKernelContract.MmaNParameter, solver.MakeIntConst(mma.N)),
+                    new BlockMicroKernelParameter(TritonBlockMicroKernelContract.MmaKParameter, solver.MakeIntConst(mma.K)));
                 var mmaBufferRequirements = ImmutableArray.Create(
                     new BlockMicroKernelBufferEncodingRequirement(
                         0,
@@ -371,21 +375,6 @@ public sealed class TritonBlockMicroKernelModel : IBlockMicroKernelModelProvider
                             new(registerResource.Id, registerMmaUsage),
                         ],
                         gemvMemoryAccesses,
-                        mmaParameters)
-                    {
-                        BufferEncodingRequirements = mmaBufferRequirements,
-                    });
-                candidates.Add(
-                    new(
-                        family,
-                        "shared_mma_accumulator",
-                        hasExternalReduction * mmaLegality,
-                        totalMmaComputeCycles,
-                        [
-                            new(registerResource.Id, sharedMmaRegisterUsage),
-                            new(sharedResource.Id, sharedAccumulatorBytes),
-                        ],
-                        sharedMemoryAccesses,
                         mmaParameters)
                     {
                         BufferEncodingRequirements = mmaBufferRequirements,

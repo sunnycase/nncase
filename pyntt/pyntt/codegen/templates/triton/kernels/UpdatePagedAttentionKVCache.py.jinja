@@ -1,3 +1,4 @@
+{% import "triton/kernels/_elementwise.py.jinja" as elementwise with context %}
 {% set ctx = update_paged_attention_kv_cache_context(model) %}
 {% set cache = model["Cache"] %}
 # generated from PyNTT Jinja UpdatePagedAttentionKVCache.py.jinja
@@ -18,83 +19,52 @@ def {{ model["FunctionName"] }}({{ helper_parameters(model, ("slot_mapping", "kv
         seq_len = tl.load(cache_meta + 2 + seq_id * 2)
         num_tokens += seq_len - context_len
 
-    for linear_start in tl.range(0, {{ ctx["total_elements"] }}, block_size):
-        linear = linear_start + tl.arange(0, block_size)
-        mask = linear < {{ ctx["total_elements"] }}
-{% if not ctx["use_key_vector_copy"] %}
-        source_lane_id = linear % {{ ctx["slots_lane_count"] }}
-        tmp = linear // {{ ctx["slots_lane_count"] }}
-{% else %}
-        tmp = linear
-{% endif %}
-        source_dim_block = tmp % {{ dim(model["SlotsShape"][model["DimAxis"]]) }}
-        tmp = tmp // {{ dim(model["SlotsShape"][model["DimAxis"]]) }}
-        head_id = tmp % {{ dim(model["SlotsShape"][model["HeadAxis"]]) }}
-        token_id = tmp // {{ dim(model["SlotsShape"][model["HeadAxis"]]) }}
+{% call(indent) elementwise.iterate(ctx) %}
+{{ indent }}source_lane_id = {{ ctx["source_lane_id"] }}
+{{ indent }}source_dim_block = coord{{ model["DimAxis"] }}
+{{ indent }}head_id = coord{{ model["HeadAxis"] }}
+{{ indent }}token_id = coord{{ model["SeqAxis"] }}
 {% for axis in ctx["non_data_axes"] %}
-        local_idx{{ axis }} = 0
-        global_idx{{ axis }} = local_idx{{ axis }} + {{ dim(model["SlotsGlobalOffsets"][axis]) }}
+{{ indent }}global_idx{{ axis }} = coord{{ axis }} + {{ dim(model["SlotsGlobalOffsets"][axis]) }}
 {% endfor %}
-        global_token_id = token_id + {{ dim(model["SlotsGlobalOffsets"][model["SeqAxis"]]) }}
-        global_head_id = head_id + {{ dim(model["SlotsGlobalOffsets"][model["HeadAxis"]]) }}
-        global_source_dim_block = source_dim_block + {{ dim(model["SlotsGlobalOffsets"][model["DimAxis"]]) }}
-{% if ctx["use_key_vector_copy"] %}
-        logical_dim = global_source_dim_block * {{ ctx["slots_lane_count"] }}
-{% elif ctx["slots_lane_count"] == 1 %}
-        logical_dim = global_source_dim_block
+{{ indent }}global_token_id = token_id + {{ dim(model["SlotsGlobalOffsets"][model["SeqAxis"]]) }}
+{{ indent }}global_head_id = head_id + {{ dim(model["SlotsGlobalOffsets"][model["HeadAxis"]]) }}
+{{ indent }}global_source_dim_block = source_dim_block + {{ dim(model["SlotsGlobalOffsets"][model["DimAxis"]]) }}
+{% if ctx["slots_lane_count"] == 1 %}
+{{ indent }}logical_dim = global_source_dim_block
 {% else %}
-        logical_dim = global_source_dim_block * {{ ctx["slots_lane_count"] }} + source_lane_id
+{{ indent }}logical_dim = global_source_dim_block * {{ ctx["slots_lane_count"] }} + source_lane_id
 {% endif %}
-        cache_head_id = global_head_id
-        active = mask & (global_token_id < num_tokens) & (cache_head_id < {{ cache["NumKVHeads"] }}) & (logical_dim < {{ cache["HeadDim"] }})
-{% for local_index in ctx["local_indices"] %}
-        active = active & ({{ local_index }} < {{ dim(model["SlotsShape"][loop.index0]) }})
-{% endfor %}
-{% for local_index in ctx["local_indices"] %}
-        source_idx{{ loop.index0 }} = {{ local_index }}
-{% endfor %}
+{{ indent }}cache_head_id = global_head_id
+{{ indent }}active = mask & (global_token_id < num_tokens) & (cache_head_id < {{ cache["NumKVHeads"] }}) & (logical_dim < {{ cache["HeadDim"] }})
 {% if cache["IdLength"] > 1 %}
-        topology_id = tl.load(slot_mapping + global_token_id * {{ cache["IdLength"] }}, mask=active, other=0)
-        tmp_topology = topology_id
+{{ indent }}topology_id = tl.load(slot_mapping + global_token_id * {{ cache["IdLength"] }}, mask=active, other=0)
+{{ indent }}tmp_topology = topology_id
 {% for axis in cache["NumBlocksSplitAxes"] | reverse %}
-        topology_coord{{ axis }} = tmp_topology % {{ model["Hierarchy"][axis] }}
-        tmp_topology = tmp_topology // {{ model["Hierarchy"][axis] }}
+{{ indent }}topology_coord{{ axis }} = tmp_topology % {{ model["Hierarchy"][axis] }}
+{{ indent }}tmp_topology = tmp_topology // {{ model["Hierarchy"][axis] }}
 {% endfor %}
 {% for axis in ctx["topology_match_axes"] %}
-        active = active & (topology_coord{{ axis }} == shard_coord{{ axis }})
+{{ indent }}active = active & (topology_coord{{ axis }} == shard_coord{{ axis }})
 {% endfor %}
 {% endif %}
-        slot_id = tl.load(slot_mapping + global_token_id * {{ cache["IdLength"] }} + {{ cache["IdLength"] - 1 }}, mask=active, other=0)
-        block_id = slot_id // {{ cache["BlockSize"] }}
-        block_offset = slot_id % {{ cache["BlockSize"] }}
+{{ indent }}slot_id = tl.load(slot_mapping + global_token_id * {{ cache["IdLength"] }} + {{ cache["IdLength"] - 1 }}, mask=active, other=0)
+{{ indent }}block_id = slot_id // {{ cache["BlockSize"] }}
+{{ indent }}block_offset = slot_id % {{ cache["BlockSize"] }}
 {% if ctx["vectorized_dim"] == 5 %}
-{% if ctx["use_key_vector_copy"] %}
-        cache_dim_block = source_dim_block
-{% else %}
-        cache_dim_block = logical_dim // {{ ctx["lane_count"] }}
-{% endif %}
-        cache_block_offset = block_offset
-{% if ctx["use_key_vector_copy"] %}
-        cache_lane_id = 0
-{% else %}
-        cache_lane_id = logical_dim % {{ ctx["lane_count"] }}
-{% endif %}
+{{ indent }}cache_dim_block = global_source_dim_block
+{{ indent }}cache_block_offset = block_offset
+{{ indent }}cache_lane_id = source_lane_id
 {% elif ctx["vectorized_dim"] == 3 %}
-        cache_dim_block = logical_dim
-        cache_block_offset = block_offset // {{ ctx["lane_count"] }}
-        cache_lane_id = block_offset % {{ ctx["lane_count"] }}
+{{ indent }}cache_dim_block = logical_dim
+{{ indent }}cache_block_offset = block_offset // {{ ctx["lane_count"] }}
+{{ indent }}cache_lane_id = block_offset % {{ ctx["lane_count"] }}
 {% else %}
-        cache_dim_block = logical_dim
-        cache_block_offset = block_offset
-        cache_lane_id = 0
+{{ indent }}cache_dim_block = logical_dim
+{{ indent }}cache_block_offset = block_offset
+{{ indent }}cache_lane_id = 0
 {% endif %}
-        slot_offsets = {{ ctx["slot_offset"] }}
-        cache_offsets = {{ ctx["cache_offset"] }}
-{% if ctx["use_key_vector_copy"] %}
-        source_lane_offsets = tl.arange(0, {{ ctx["slots_lane_count"] }})
-        values = tl.load({{ access_pointer(model, "Slots", ptr(model, "Slots"), "slot_offsets[:, None] + source_lane_offsets[None, :]") }}, mask=active[:, None], other=0.0)
-        tl.store(kv_cache + cache_offsets[:, None] + source_lane_offsets[None, :], values, mask=active[:, None])
-{% else %}
-        value = tl.load({{ access_pointer(model, "Slots", ptr(model, "Slots"), "slot_offsets") }}, mask=active, other=0.0)
-        tl.store(kv_cache + cache_offsets, value, mask=active)
-{% endif %}
+{{ indent }}cache_offsets = {{ ctx["cache_offset"] }}
+{{ indent }}value = tl.load({{ access_pointer(model, "Slots", ptr(model, "Slots"), ctx["slots_access"]) }}, mask=active, other=0.0)
+{{ indent }}tl.store(kv_cache + cache_offsets, value, mask=active)
+{% endcall %}

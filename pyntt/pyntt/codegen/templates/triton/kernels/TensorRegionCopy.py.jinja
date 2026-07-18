@@ -25,17 +25,26 @@ def {{ model["FunctionName"] }}({{ helper_parameters(model) }}):
 {% else %}
     tle.gpu.copy({{ ctx["local_descriptor"] }}, {{ ctx["plan"]["global_name"] }} + copy_global_offset, {{ ctx["copy_shape"] }})
 {% endif %}
+{% elif ctx["structured_widths"] is not none %}
+{% for width in ctx["structured_widths"] %}
+{% set suffix = "" if (ctx["structured_widths"] | length) == 1 else "[" + ((["None"] * loop.index0 + [":"] + ["None"] * ((ctx["structured_widths"] | length) - loop.index)) | join(", ")) + "]" %}
+    copy_idx{{ loop.index0 }} = tl.arange(0, {{ width }}){{ suffix }}
+{% endfor %}
+    mask = copy_idx0 < {{ dim(ctx["extents"][0]) }}
+{% for axis in range(1, ctx["extents"] | length) %}
+    mask = mask & (copy_idx{{ axis }} < {{ dim(ctx["extents"][axis]) }})
+{% endfor %}
+    value = tl.load({{ access_pointer(model, "Source", "source", ctx["source_access"]) }}, mask=mask)
+    tl.store({{ access_pointer(model, "Destination", "destination", ctx["destination_access"]) }}, value, mask=mask)
 {% else %}
 {% for axis in ctx["outer_axes"] %}
-{{ "    " * (loop.index0 + 1) }}for copy_idx{{ axis }} in tl.range(0, {{ dim(ctx["axes"][axis]["Extent"]) }}):
+{{ "    " * (loop.index0 + 1) }}for copy_idx{{ axis }} in tl.range(0, {{ dim(ctx["extents"][axis]) }}):
 {% endfor %}
 {% set inner_indent = "    " * ((ctx["outer_axes"] | length) + 1) %}
 {% set body_indent = "    " * ((ctx["outer_axes"] | length) + 2) %}
-{{ inner_indent }}for copy_inner_start in tl.range(0, {{ dim(ctx["inner_extent"]) }}, block_size):
-{{ body_indent }}copy_idx{{ ctx["inner_axis"] }} = copy_inner_start + tl.arange(0, block_size)
+{{ inner_indent }}for copy_inner_start in tl.range(0, {{ dim(ctx["inner_extent"]) }}, {{ ctx["inner_width"] }}):
+{{ body_indent }}copy_idx{{ ctx["inner_axis"] }} = copy_inner_start + tl.arange(0, {{ ctx["inner_width"] }})
 {{ body_indent }}mask = copy_idx{{ ctx["inner_axis"] }} < {{ dim(ctx["inner_extent"]) }}
-{{ body_indent }}source_offset = {{ ctx["source_offset"] }}
-{{ body_indent }}destination_offset = {{ ctx["destination_offset"] }}
-{{ body_indent }}value = tl.load({{ access_pointer(model, "Source", "source", "source_offset") }}, mask=mask)
-{{ body_indent }}tl.store({{ access_pointer(model, "Destination", "destination", "destination_offset") }}, value, mask=mask)
+{{ body_indent }}value = tl.load({{ access_pointer(model, "Source", "source", ctx["source_access"]) }}, mask=mask)
+{{ body_indent }}tl.store({{ access_pointer(model, "Destination", "destination", ctx["destination_access"]) }}, value, mask=mask)
 {% endif %}

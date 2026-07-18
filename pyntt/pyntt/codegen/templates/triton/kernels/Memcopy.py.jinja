@@ -1,5 +1,6 @@
 {% import "triton/kernels/_common.py.jinja" as common with context %}
-{% set total = multiply_expr(product(model["Shape"]), model["VectorLaneCount"]) %}
+{% import "triton/kernels/_elementwise.py.jinja" as elementwise with context %}
+{% set ctx = memcopy_context(model) %}
 # generated from PyNTT Jinja Memcopy.py.jinja
 # {{ model["Comment"] }}; dtype={{ model["DType"] }}, shape={{ shape_tuple(model["Shape"]) }}
 {{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
@@ -12,17 +13,7 @@ def {{ model["FunctionName"] }}({{ helper_parameters(model) }}):
 {% if local_buffer(model["Destination"]) is none %}
     destination = {{ ptr(model, "Destination") }}
 {% endif %}
-    for linear_start in tl.range(0, {{ total }}, block_size):
-        linear = linear_start + tl.arange(0, block_size)
-        mask = linear < {{ total }}
-        lane_flat = linear % {{ model["VectorLaneCount"] }}
-        tensor_linear = linear // {{ model["VectorLaneCount"] }}
-        tmp = tensor_linear
-{% for axis in reverse_indices(model["Shape"]) %}
-        idx{{ axis }} = tmp % {{ dim(model["Shape"][axis]) }}
-        tmp = tmp // {{ dim(model["Shape"][axis]) }}
-{% endfor %}
-        source_offsets = {{ common.prefixed_offset("idx", model["SourceStrides"], model["VectorLaneCount"]) }}
-        destination_offsets = {{ common.prefixed_offset("idx", model["DestinationStrides"], model["VectorLaneCount"]) }}
-        value = tl.load({{ access_pointer(model, "Source", "source", "source_offsets") }}, mask=mask, other=0.0)
-        tl.store({{ access_pointer(model, "Destination", "destination", "destination_offsets") }}, value, mask=mask)
+{% call(indent) elementwise.iterate(ctx) %}
+{{ indent }}value = tl.load({{ access_pointer(model, "Source", "source", ctx["source_access"]) }}, mask=mask, other=0.0)
+{{ indent }}tl.store({{ access_pointer(model, "Destination", "destination", ctx["destination_access"]) }}, value, mask=mask)
+{% endcall %}

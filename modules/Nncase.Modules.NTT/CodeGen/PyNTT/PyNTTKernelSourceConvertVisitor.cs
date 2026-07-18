@@ -1893,6 +1893,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     GetHierarchy(dest),
                     GetBufferSplitAxes(dest, globalShape.Length),
                     GetVectorLaneElementCount(dest.ElemType),
+                    GetVectorLanes(dest.ElemType),
                     $"TensorLoad -> {dest.Name}"));
             WriteHelperInvocation(helperName, $"input{inputIndex}", $"input{inputIndex}_pool_stride_elements");
         }
@@ -2076,24 +2077,9 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 destinationOrigins[axis] = destinationOrigin;
             }
 
-            var vectorLaneCount = vectorLaneShape.Count == 0
-                ? 1
-                : vectorLaneShape.Aggregate(1, (value, lane) => checked(value * lane));
-            var sourceBaseScalarOffset = BuildScalarBaseOffset(sourceOrigins, sourceStrides, vectorLaneCount);
-            var destinationBaseScalarOffset = BuildScalarBaseOffset(destinationOrigins, destinationStrides, vectorLaneCount);
-
-            var axes = new List<PyNTTRegionCopyAxisTemplateModel>(rank + vectorLaneShape.Count);
-            for (var axis = 0; axis < rank; axis++)
-            {
-                axes.Add(new(
-                    copyExtents[axis],
-                    MultiplyDim(sourceStrides[axis], vectorLaneCount),
-                    MultiplyDim(destinationStrides[axis], vectorLaneCount)));
-            }
-
-            var laneStride = 1;
-            var laneStrides = new int[vectorLaneShape.Count];
-            for (var axis = vectorLaneShape.Count - 1; axis >= 0; axis--)
+            var extents = new List<PyNTTDimExpression>(rank + vectorLaneShape.Count);
+            extents.AddRange(copyExtents);
+            for (var axis = 0; axis < vectorLaneShape.Count; axis++)
             {
                 if (vectorLaneShape[axis] <= 0)
                 {
@@ -2101,76 +2087,19 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                         $"PyNTT region-copy vector lane {axis} must be positive, got {vectorLaneShape[axis]}.");
                 }
 
-                laneStrides[axis] = laneStride;
-                laneStride = checked(laneStride * vectorLaneShape[axis]);
+                extents.Add(ToDim(vectorLaneShape[axis]));
             }
 
-            for (var axis = 0; axis < vectorLaneShape.Count; axis++)
-            {
-                axes.Add(new(
-                    ToDim(vectorLaneShape[axis]),
-                    ToDim(laneStrides[axis]),
-                    ToDim(laneStrides[axis])));
-            }
-
-            var normalizedAxes = NormalizeRegionCopyAxes(axes);
             var coversWholeSource = sourceOrigins.All(origin => EquivalentDim(origin, PyNTTDimExpression.Zero)) &&
                 copyExtents.Zip(sourceShape).All(pair => EquivalentDim(pair.First, pair.Second));
             var coversWholeDestination = destinationOrigins.All(origin => EquivalentDim(origin, PyNTTDimExpression.Zero)) &&
                 copyExtents.Zip(destinationShape).All(pair => EquivalentDim(pair.First, pair.Second));
             return new(
-                sourceBaseScalarOffset,
-                destinationBaseScalarOffset,
-                normalizedAxes,
+                sourceOrigins,
+                destinationOrigins,
+                extents.ToArray(),
                 coversWholeSource,
                 coversWholeDestination);
-
-            static PyNTTDimExpression BuildScalarBaseOffset(
-                IReadOnlyList<PyNTTDimExpression> origins,
-                IReadOnlyList<PyNTTDimExpression> strides,
-                int laneCount)
-            {
-                var offset = PyNTTDimExpression.Zero;
-                for (var axis = 0; axis < origins.Count; axis++)
-                {
-                    offset = AddDims(offset, MultiplyDimExpressions(origins[axis], strides[axis]));
-                }
-
-                return MultiplyDim(offset, laneCount);
-            }
-        }
-
-        private static PyNTTRegionCopyAxisTemplateModel[] NormalizeRegionCopyAxes(
-            IReadOnlyList<PyNTTRegionCopyAxisTemplateModel> inputAxes)
-        {
-            var axes = inputAxes
-                .Where(axis => axis.Extent.FixedValue != 1)
-                .ToList();
-            if (axes.Count == 0)
-            {
-                return [new(PyNTTDimExpression.One, PyNTTDimExpression.One, PyNTTDimExpression.One)];
-            }
-
-            for (var axis = axes.Count - 2; axis >= 0; axis--)
-            {
-                var outer = axes[axis];
-                var inner = axes[axis + 1];
-                var expectedSourceStride = MultiplyDimExpressions(inner.Extent, inner.SourceScalarStride);
-                var expectedDestinationStride = MultiplyDimExpressions(inner.Extent, inner.DestinationScalarStride);
-                if (!EquivalentDim(outer.SourceScalarStride, expectedSourceStride) ||
-                    !EquivalentDim(outer.DestinationScalarStride, expectedDestinationStride))
-                {
-                    continue;
-                }
-
-                axes[axis] = new(
-                    MultiplyDimExpressions(outer.Extent, inner.Extent),
-                    inner.SourceScalarStride,
-                    inner.DestinationScalarStride);
-                axes.RemoveAt(axis + 1);
-            }
-
-            return axes.ToArray();
         }
 
         private static void ValidateMatchingBufferDType(string context, TIR.Buffer src, TIR.Buffer dest)
@@ -2240,6 +2169,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     GetHierarchy(src),
                     GetBufferSplitAxes(src, globalShape.Length),
                     GetVectorLaneElementCount(src.ElemType),
+                    GetVectorLanes(src.ElemType),
                     comment));
             WriteLine(BuildHelperCall(helperName, outputName, $"{outputName}_pool_stride_elements"));
         }
@@ -2296,6 +2226,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     GetBufferStrides(srcBuffer),
                     GetBufferStrides(destBuffer),
                     GetVectorLaneElementCount(destBuffer.ElemType),
+                    GetVectorLanes(destBuffer.ElemType),
                     $"{srcBuffer.Name} -> {destBuffer.Name}"));
             WriteLine(BuildHelperCall(helperName));
         }
@@ -2501,6 +2432,8 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     GetBufferStrides(output),
                     inputVectorLaneCount,
                     outputVectorLaneCount,
+                    GetVectorLanes(input.ElemType),
+                    GetVectorLanes(output.ElemType),
                     shape,
                     GetUnaryExpression(unaryOp),
                     (string)_attrs["op"],
@@ -2548,6 +2481,8 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     GetBufferStrides(output),
                     inputVectorLaneCount,
                     outputVectorLaneCount,
+                    GetVectorLanes(input.ElemType),
+                    GetVectorLanes(output.ElemType),
                     shape,
                     "value0",
                     "expand",
@@ -2617,6 +2552,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     GetBufferStrides(output),
                     axis,
                     valueVectorLaneCount,
+                    inputVectorLanes,
                     GetHierarchy(input),
                     GetBufferSplitAxes(input, inputGlobalShape.Length),
                     $"{input.Name}, {index.Name} -> {output.Name}"));
@@ -2737,6 +2673,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 GetBufferStrides(input),
                 GetBufferStrides(output),
                 inputVectorLaneCount,
+                GetVectorLanes(input.ElemType),
                 hierarchy,
                 inputSplitAxes,
                 partialAxes,
@@ -2921,6 +2858,8 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     GetBufferStrides(output),
                     inputVectorLaneCount,
                     outputVectorLaneCount,
+                    GetVectorLanes(input.ElemType),
+                    GetVectorLanes(output.ElemType),
                     shape,
                     $"value0_f32 / (1.0 + tl.exp(-({beta}) * value0_f32))",
                     "swish",
@@ -2977,6 +2916,9 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     lhsVectorLaneCount,
                     rhsVectorLaneCount,
                     outputVectorLaneCount,
+                    GetVectorLanes(lhs.ElemType),
+                    GetVectorLanes(rhs.ElemType),
+                    GetVectorLanes(output.ElemType),
                     shape,
                     GetBinaryExpression(binary.BinaryOp),
                     (string)_attrs["op"],
@@ -3163,6 +3105,8 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     GetBufferStrides(output),
                     inputVectorLaneCount,
                     outputVectorLaneCount,
+                    GetVectorLanes(input.ElemType),
+                    GetVectorLanes(output.ElemType),
                     vectorizedAxes,
                     logicalOutputShape,
                     GetCastExpression(cast.CastMode, output.ElemType),
@@ -3235,6 +3179,10 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     trueVectorLaneCount,
                     falseVectorLaneCount,
                     outputVectorLaneCount,
+                    GetVectorLanes(cond.ElemType),
+                    GetVectorLanes(trueValue.ElemType),
+                    GetVectorLanes(falseValue.ElemType),
+                    GetVectorLanes(output.ElemType),
                     logicalShape,
                     $"{cond.Name}, {trueValue.Name}, {falseValue.Name} -> {output.Name}"));
             WriteLine(BuildHelperCall(helperName));
@@ -3279,6 +3227,8 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     GetBufferStrides(output),
                     inputVectorLaneCount,
                     outputVectorLaneCount,
+                    GetVectorLanes(input.ElemType),
+                    GetVectorLanes(output.ElemType),
                     shape,
                     GetClampExpression(clamp.Min, clamp.Max),
                     "clamp",
@@ -3334,6 +3284,9 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     lhsVectorLaneCount,
                     rhsVectorLaneCount,
                     outputVectorLaneCount,
+                    GetVectorLanes(lhs.ElemType),
+                    GetVectorLanes(rhs.ElemType),
+                    GetVectorLanes(output.ElemType),
                     shape,
                     GetCompareExpression(compare.CompareOp),
                     (string)_attrs["op"],
@@ -3564,6 +3517,8 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     GetBufferStrides(output),
                     inputVectorLaneCount,
                     outputVectorLaneCount,
+                    GetVectorLanes(input.ElemType),
+                    GetVectorLanes(output.ElemType),
                     perm,
                     $"{input.Name} -> {output.Name}"));
             WriteHelperInvocation(helperName);
@@ -4224,10 +4179,11 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             model.ReductionKBlockN = blockNs[1];
             model.ReductionVBlockN = blockNs[2];
             var initializers = blockNs
-                .Select(blockN => useGemv
-                    ? $"tl.zeros(({blockN},), tl.float32)"
-                    : $"tl.zeros(({blockM}, {blockN}), tl.float32)")
-                .Select(ReductionAccumulatorInitializer.Register)
+                .Select(blockN => BuildMatrixReductionAccumulatorInitializer(
+                    microKernel,
+                    useGemv,
+                    blockM,
+                    blockN))
                 .ToArray();
             ConfigureReductionState(
                 state,
@@ -4596,11 +4552,10 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             model.ReductionBlockM = blockM;
             model.ReductionBlockN = blockN;
             model.ReductionBlockK = blockK;
-            var accumulatorShape = useGemv ? $"({blockN},)" : $"({blockM}, {blockN})";
             ReductionAccumulatorInitializer[] initializers =
             [
-                ReductionAccumulatorInitializer.Register($"tl.zeros({accumulatorShape}, tl.float32)"),
-                ReductionAccumulatorInitializer.Register($"tl.zeros({accumulatorShape}, tl.float32)"),
+                BuildMatrixReductionAccumulatorInitializer(microKernel, useGemv, blockM, blockN),
+                BuildMatrixReductionAccumulatorInitializer(microKernel, useGemv, blockM, blockN),
             ];
             ConfigureReductionState(
                 state,
@@ -4811,20 +4766,23 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 throw new NotSupportedException($"PyNTT SUMMA currently supports scalar lhs operands only, got lhs lanes [{string.Join(",", lhsVectorLanes)}].");
             }
 
-            if (outputVectorLanes.Length != 0)
+            if (rhsNVectorLaneCount == 1)
             {
-                if (outputVectorLanes.Length != 1 || outputVectorLanes[0] != rhsNVectorLaneCount || rhsNVectorLaneCount == 1)
+                if (outputVectorLanes.Length != 0)
                 {
-                    throw new NotSupportedException($"PyNTT SUMMA currently supports only RHS N-axis vectorization producing the same output N lane, got output lanes [{string.Join(",", outputVectorLanes)}] and rhs N lane {rhsNVectorLaneCount}.");
+                    throw new NotSupportedException($"PyNTT SUMMA scalar RHS requires a scalar output, got output lanes [{string.Join(",", outputVectorLanes)}].");
                 }
-
+            }
+            else if (outputVectorLanes.Length != 1 || outputVectorLanes[0] != rhsNVectorLaneCount)
+            {
+                throw new NotSupportedException($"PyNTT SUMMA vectorized RHS requires the same output N lane so both buffers have direct physical/lane coordinates, got output lanes [{string.Join(",", outputVectorLanes)}] and rhs N lane {rhsNVectorLaneCount}.");
+            }
+            else
+            {
                 outputNVectorLaneCount = outputVectorLanes[0];
             }
 
-            var rhsFullGlobalN = MultiplyDim(rhsGlobalShape[^1], rhsNVectorLaneCount);
-            var outputGlobalNCompatible = outputNVectorLaneCount == 1
-                ? rhsNVectorLaneCount == 1 ? SameDim(outputGlobalShape[^1], rhsGlobalShape[^1]) : CanFitPaddedDim(outputGlobalShape[^1], rhsFullGlobalN)
-                : SameDim(outputGlobalShape[^1], rhsGlobalShape[^1]);
+            var outputGlobalNCompatible = SameDim(outputGlobalShape[^1], rhsGlobalShape[^1]);
             if (!SameDim(lhsGlobalShape[^1], rhsGlobalShape[^2]) ||
                 !SameDim(outputGlobalShape[^2], lhsGlobalShape[^2]) ||
                 !outputGlobalNCompatible)
@@ -4880,6 +4838,8 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     GetHierarchy(output),
                     rhsNVectorLaneCount,
                     outputNVectorLaneCount,
+                    rhsVectorLanes,
+                    outputVectorLanes,
                     scale.ToString("R", CultureInfo.InvariantCulture),
                     $"{lhs.Name}, {rhs.Name} -> {output.Name}"));
             WriteBarrier(HelperBarrierKind.Grid);
@@ -5066,19 +5026,11 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             model.ReductionBlockM = blockM;
             model.ReductionBlockN = blockN;
             model.ReductionBlockK = blockK;
-            var accumulatorShape = useGemv ? $"({blockN},)" : $"({blockM}, {blockN})";
-            var initializer = microKernel.Variant switch
-            {
-                "register_simt_accumulator" or "register_mma_accumulator" => ReductionAccumulatorInitializer.Register(
-                    $"tl.zeros({accumulatorShape}, tl.float32)"),
-                _ when useGemv && IsSharedAccumulatorVariant(microKernel.Variant) => ReductionAccumulatorInitializer.Shared(
-                    "0.0",
-                    blockN),
-                _ when IsSharedAccumulatorVariant(microKernel.Variant) => throw new NotSupportedException(
-                    "PyNTT shared Matmul reduction accumulator currently requires GEMV (M=1)."),
-                _ => throw new NotSupportedException(
-                    $"Unsupported PyNTT Matmul microkernel variant {microKernel.Family}/{microKernel.Variant}."),
-            };
+            var initializer = BuildMatrixReductionAccumulatorInitializer(
+                microKernel,
+                useGemv,
+                blockM,
+                blockN);
             ConfigureReductionState(
                 state,
                 [initializer],
@@ -5102,23 +5054,13 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
 
             WriteHelperTemplate(templatePath, model, requiresInline: true);
             var updateCall = BuildHelperCall(model.FunctionName, BuildRawPythonArgument(state.Names[0]));
-            if (IsSharedAccumulatorVariant(microKernel.Variant))
-            {
-                WriteControlLine(updateCall);
-            }
-            else
-            {
-                WriteControlLine($"{state.Names[0]} = {updateCall}");
-            }
+            WriteControlLine($"{state.Names[0]} = {updateCall}");
 
             state.UpdateCount++;
         }
 
         private static bool IsGemvMatmul(IReadOnlyList<PyNTTDimExpression> outputShape)
             => outputShape.Count >= 2 && outputShape[^2].MaxValue == 1;
-
-        private static bool IsSharedAccumulatorVariant(string variant)
-            => variant is "shared_simt_accumulator" or "shared_mma_accumulator";
 
         private void VisitReduce(Nncase.TIR.NTT.Reduce reduce, IReadOnlyList<BaseExpr> args)
         {
@@ -5322,6 +5264,10 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     GetBufferStrides(cos),
                     GetBufferStrides(sin),
                     GetBufferStrides(output),
+                    inputVectorLanes,
+                    cosVectorLanes,
+                    sinVectorLanes,
+                    outputVectorLanes,
                     inputVectorLaneCount,
                     cosVectorLaneCount,
                     sinVectorLaneCount,
@@ -5431,6 +5377,10 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     scaleVectorLaneCount,
                     biasVectorLaneCount,
                     outputVectorLaneCount,
+                    GetVectorLanes(input.ElemType),
+                    GetVectorLanes(scale.ElemType),
+                    GetVectorLanes(bias.ElemType),
+                    GetVectorLanes(output.ElemType),
                     normalizedAxis,
                     layerNorm.Epsilon,
                     layerNorm.UseMean,
@@ -5482,6 +5432,8 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     GetBufferStrides(output),
                     inputVectorLaneCount,
                     outputVectorLaneCount,
+                    GetVectorLanes(input.ElemType),
+                    GetVectorLanes(output.ElemType),
                     normalizedAxis,
                     normStats.UseMean,
                     $"{input.Name} -> {output.Name}"));
@@ -5579,6 +5531,11 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     scaleVectorLaneCount,
                     biasVectorLaneCount,
                     outputVectorLaneCount,
+                    GetVectorLanes(input.ElemType),
+                    GetVectorLanes(stats.ElemType),
+                    GetVectorLanes(scale.ElemType),
+                    GetVectorLanes(bias.ElemType),
+                    GetVectorLanes(output.ElemType),
                     normalizedAxis,
                     normApply.Epsilon,
                     normApply.UseMean,
@@ -5672,6 +5629,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     layerIdExpression,
                     update.CacheKind == AttentionCacheKind.Key ? 0 : 1,
                     GetVectorLaneElementCount(slots.ElemType),
+                    GetVectorLanes(slots.ElemType),
                     cache,
                     $"{slots.Name} -> kv-cache"));
             WriteLine(BuildHelperCall(helperName, slotMappingArgument, storageArgument, storageBlocksArgument, metaArgument));
@@ -5732,6 +5690,8 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     GetBufferGlobalShape(output),
                     GetBufferStrides(query),
                     GetBufferStrides(output),
+                    GetVectorLanes(query.ElemType),
+                    GetVectorLanes(output.ElemType),
                     outputSplitAxes,
                     GetHierarchy(output),
                     seqAxis,
@@ -5967,6 +5927,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             }
 
             var elementCount = checked((ulong)(spanSizeBytes / scalarElementSizeBytes));
+            var descriptorCapacityElements = checked((ulong)((physicalSizeBytes - spanOffsetBytes) / scalarElementSizeBytes));
             if (elementCount == 0 || elementCount > long.MaxValue)
             {
                 throw new NotSupportedException(
@@ -5976,11 +5937,33 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
 
             var storageEncodingId = storageEncoding?.Id ?? TargetStorageEncodingIds.Linear;
             var useNvidiaMmaSharedLayout = storageEncodingId == TritonTargetStorageEncodingModel.NvidiaMmaShared;
+            var logicalShape = GetBufferShape(buffer)
+                .Select((dimension, axis) => dimension.MaxValue is { } value && value > 0
+                    ? value
+                    : throw new NotSupportedException(
+                        $"PyNTT shared AllocateBufferView {variable.Name} dimension {axis} must have a positive static maximum, " +
+                        $"got range [{dimension.MinValue}, {dimension.MaxValue}]."))
+                .ToArray();
+            var logicalStrides = buffer.Strides.ToArray()
+                .Select((stride, axis) => stride.IsFixed &&
+                    (stride.FixedValue > 0 || (stride.FixedValue == 0 && logicalShape[axis] == 1))
+                    ? stride.FixedValue
+                    : throw new NotSupportedException(
+                        $"PyNTT shared AllocateBufferView {variable.Name} stride {axis} must be positive, " +
+                        $"or zero only for a singleton dimension; shape={logicalShape[axis]}, stride={stride}."))
+                .ToArray();
+            var vectorLaneShape = GetVectorLanes(buffer.ElemType);
             var descriptorShape = GetSharedDescriptorShape(
                 variable,
                 buffer,
                 checked((long)elementCount),
-                useNvidiaMmaSharedLayout);
+                checked((long)descriptorCapacityElements),
+                storageEncodingId == TargetStorageEncodingIds.Linear ||
+                    storageEncodingId == TritonTargetStorageEncodingModel.SwizzledShared,
+                useNvidiaMmaSharedLayout,
+                logicalShape,
+                logicalStrides,
+                vectorLaneShape);
             var descriptorElementCount = descriptorShape.Aggregate(1L, (product, value) => checked(product * value));
             var descriptorSizeBytes = checked(descriptorElementCount * scalarElementSizeBytes);
             var descriptorEndBytes = checked(aliasOffsetBytes + descriptorSizeBytes);
@@ -6004,7 +5987,10 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             return new(
                 descriptorName,
                 descriptorShape,
-                spanSizeBytes,
+                logicalShape,
+                logicalStrides,
+                vectorLaneShape,
+                checked(physicalSizeBytes - spanOffsetBytes),
                 scalarElementSizeBytes,
                 tritonDType,
                 storageEncodingId.Value);
@@ -6014,10 +6000,14 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             IVar variable,
             TIR.Buffer buffer,
             long elementCount,
-            bool useNvidiaMmaSharedLayout)
+            long descriptorCapacityElements,
+            bool allowAffineLinearDescriptor,
+            bool useNvidiaMmaSharedLayout,
+            IReadOnlyList<long> logicalShape,
+            IReadOnlyList<long> logicalStrides,
+            IReadOnlyList<int> vectorLaneShape)
         {
-            var logicalShape = GetBufferShape(buffer);
-            if (logicalShape.Length == 0)
+            if (logicalShape.Count == 0)
             {
                 throw new NotSupportedException(
                     $"PyNTT shared AllocateBufferView {variable.Name} has a rank-zero TIR Buffer. " +
@@ -6026,36 +6016,42 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
 
             // TLE descriptors use scalar dtypes, so vector lanes remain explicit trailing physical dimensions.
             var scalarPhysicalShape = logicalShape
-                .Select((dimension, axis) => dimension.MaxValue is { } value && value > 0
-                    ? value
-                    : throw new NotSupportedException(
-                        $"PyNTT shared AllocateBufferView {variable.Name} dimension {axis} must have a positive static maximum, " +
-                        $"got range [{dimension.MinValue}, {dimension.MaxValue}]."))
-                .Concat(GetVectorLanes(buffer.ElemType).Select(lane => checked((long)lane)))
+                .Concat(vectorLaneShape.Select(lane => checked((long)lane)))
                 .ToArray();
-            var vectorLaneCount = GetVectorLaneElementCount(buffer.ElemType);
-            var requiredVectorElements = 1L;
-            for (var axis = 0; axis < logicalShape.Length; axis++)
+            if (logicalStrides.Count != logicalShape.Count)
             {
-                var stride = buffer.Strides[axis];
-                if (!stride.IsFixed || stride.FixedValue < 0)
-                {
-                    throw new NotSupportedException(
-                        $"PyNTT shared AllocateBufferView {variable.Name} stride {axis} must be a non-negative static value, " +
-                        $"got {stride}.");
-                }
-
-                requiredVectorElements = checked(
-                    requiredVectorElements +
-                    ((scalarPhysicalShape[axis] - 1) * stride.FixedValue));
+                throw new NotSupportedException(
+                    $"PyNTT shared AllocateBufferView {variable.Name} shape/stride rank mismatch: " +
+                    $"shape={logicalShape.Count}, strides={logicalStrides.Count}.");
             }
 
-            var requiredScalarElements = checked(requiredVectorElements * vectorLaneCount);
+            var vectorLaneCount = GetVectorLaneElementCount(buffer.ElemType);
+            var descriptorLogicalStrides = logicalStrides.ToArray();
+            for (var axis = descriptorLogicalStrides.Length - 1; axis >= 0; axis--)
+            {
+                if (descriptorLogicalStrides[axis] != 0)
+                {
+                    continue;
+                }
+
+                descriptorLogicalStrides[axis] = axis == descriptorLogicalStrides.Length - 1
+                    ? 1
+                    : checked(descriptorLogicalStrides[axis + 1] * logicalShape[axis + 1]);
+            }
+
+            var requiredScalarElements = checked((long)vectorLaneCount);
+            for (var axis = 0; axis < logicalShape.Count; axis++)
+            {
+                requiredScalarElements = checked(
+                    requiredScalarElements +
+                    ((logicalShape[axis] - 1) * logicalStrides[axis] * vectorLaneCount));
+            }
+
             if (requiredScalarElements > elementCount)
             {
                 throw new NotSupportedException(
                     $"PyNTT shared AllocateBufferView {variable.Name} shape " +
-                    $"[{string.Join(",", scalarPhysicalShape)}] and strides [{string.Join(",", buffer.Strides.ToArray().Select(stride => stride.FixedValue))}] " +
+                    $"[{string.Join(",", scalarPhysicalShape)}] and strides [{string.Join(",", logicalStrides)}] " +
                     $"can address {requiredScalarElements} scalar elements, but its TIR MemSpan capacity is only {elementCount}.");
             }
 
@@ -6064,12 +6060,12 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             // rectangle consumed by Triton dot. Expose that rectangle as the
             // memdesc shape so FlagTree can lower a full-view load directly to
             // the selected MMA shared allocation instead of staging it again.
-            if (useNvidiaMmaSharedLayout && GetVectorLanes(buffer.ElemType).Length > 0)
+            if (useNvidiaMmaSharedLayout && vectorLaneShape.Count > 0)
             {
-                if (logicalShape.Length != 2)
+                if (logicalShape.Count != 2)
                 {
                     throw new NotSupportedException(
-                        $"PyNTT NVIDIA MMA shared vector buffer {variable.Name} must have rank 2, got rank {logicalShape.Length}.");
+                        $"PyNTT NVIDIA MMA shared vector buffer {variable.Name} must have rank 2, got rank {logicalShape.Count}.");
                 }
 
                 var packedGroupCount = scalarPhysicalShape[0];
@@ -6088,64 +6084,103 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 }
             }
 
+            // A linear shared descriptor is the rectangular physical view of
+            // Buffer.Dimensions/Strides. Keep every logical and vector-lane
+            // axis explicit; do not flatten and later recover coordinates.
             var descriptorShape = scalarPhysicalShape.ToArray();
-            var powerOfTwoSuffixStart = descriptorShape.Length;
-            while (powerOfTwoSuffixStart > 0 &&
-                   System.Numerics.BitOperations.IsPow2((ulong)descriptorShape[powerOfTwoSuffixStart - 1]))
+            var expectedInnerStride = 1L;
+            for (var axis = descriptorShape.Length - 1; axis >= logicalShape.Count; axis--)
             {
-                powerOfTwoSuffixStart--;
+                expectedInnerStride = checked(expectedInnerStride * descriptorShape[axis]);
             }
 
-            if (powerOfTwoSuffixStart > 0)
+            if (checked(descriptorLogicalStrides[^1] * vectorLaneCount) != expectedInnerStride)
             {
-                var collapsedPrefix = 1L;
-                for (var axis = 0; axis < powerOfTwoSuffixStart; axis++)
-                {
-                    collapsedPrefix = checked(collapsedPrefix * descriptorShape[axis]);
-                    descriptorShape[axis] = 1;
-                }
+                throw new NotSupportedException(
+                    $"PyNTT shared buffer {variable.Name} innermost scalar stride " +
+                    $"{checked(descriptorLogicalStrides[^1] * vectorLaneCount)} cannot be represented by the explicit " +
+                    $"vector-lane shape [{string.Join(",", vectorLaneShape)}].");
+            }
 
-                var paddedPrefix = System.Numerics.BitOperations.RoundUpToPowerOf2((ulong)collapsedPrefix);
-                if (paddedPrefix == 0 || paddedPrefix > long.MaxValue)
+            for (var axis = logicalShape.Count - 2; axis >= 0; axis--)
+            {
+                var outerStride = descriptorLogicalStrides[axis];
+                var innerStride = descriptorLogicalStrides[axis + 1];
+                if (outerStride % innerStride != 0)
                 {
                     throw new NotSupportedException(
-                        $"PyNTT shared AllocateBufferView {variable.Name} prefix extent {collapsedPrefix} " +
-                        "cannot be represented as a FlagTree TLE descriptor dimension.");
+                        $"PyNTT shared buffer {variable.Name} strides [{string.Join(",", logicalStrides)}] " +
+                        "do not describe a rectangular strided view.");
                 }
 
-                descriptorShape[0] = checked((long)paddedPrefix);
+                var physicalInnerExtent = outerStride / innerStride;
+                if (physicalInnerExtent < logicalShape[axis + 1])
+                {
+                    throw new NotSupportedException(
+                        $"PyNTT shared buffer {variable.Name} stride {outerStride} overlaps logical axis " +
+                        $"{axis + 1} with extent {logicalShape[axis + 1]} and stride {innerStride}.");
+                }
+
+                descriptorShape[axis + 1] = physicalInnerExtent;
             }
 
             var descriptorElementCount = descriptorShape.Aggregate(1L, (product, value) => checked(product * value));
             if (requiredScalarElements > descriptorElementCount)
             {
-                // The descriptor represents physical backing storage, while
-                // buffer.Dimensions/Strides retain the logical view. Preserve
-                // compact logical dimensions, but materialize a pitched last
-                // logical axis when its strides address padding between rows.
-                var pitchAxis = logicalShape.Length - 1;
-                var currentPitch = descriptorShape[pitchAxis];
-                var elementsPerPitchUnit = descriptorElementCount / currentPitch;
-                var requiredPitch = 1 + ((requiredScalarElements - 1) / elementsPerPitchUnit);
-                var paddedPitch = System.Numerics.BitOperations.RoundUpToPowerOf2((ulong)requiredPitch);
-                if (paddedPitch == 0 || paddedPitch > long.MaxValue)
-                {
-                    throw new NotSupportedException(
-                        $"PyNTT shared AllocateBufferView {variable.Name} physical pitch {requiredPitch} " +
-                        "cannot be represented as a FlagTree TLE descriptor dimension.");
-                }
-
-                descriptorShape[pitchAxis] = Math.Max(currentPitch, checked((long)paddedPitch));
-                descriptorElementCount = descriptorShape.Aggregate(1L, (product, value) => checked(product * value));
+                var scalarOuterStride = checked(descriptorLogicalStrides[0] * vectorLaneCount);
+                descriptorShape[0] = Math.Max(
+                    descriptorShape[0],
+                    checked((requiredScalarElements + scalarOuterStride - 1) / scalarOuterStride));
             }
 
-            if (requiredScalarElements > descriptorElementCount)
+            var hasNonPowerOfTwoInnerExtent = false;
+            for (var axis = 1; axis < descriptorShape.Length; axis++)
+            {
+                if (!System.Numerics.BitOperations.IsPow2((ulong)descriptorShape[axis]))
+                {
+                    hasNonPowerOfTwoInnerExtent = true;
+                    break;
+                }
+            }
+
+            if (hasNonPowerOfTwoInnerExtent)
+            {
+                if (!allowAffineLinearDescriptor)
+                {
+                    throw new NotSupportedException(
+                        $"PyNTT shared buffer {variable.Name} with storage encoding {buffer.StorageEncoding} has " +
+                        $"non-power-of-two inner descriptor shape [{string.Join(",", descriptorShape)}]. " +
+                        "The selected target encoding cannot use the affine one-dimensional descriptor representation.");
+                }
+
+                var linearExtent = System.Numerics.BitOperations.RoundUpToPowerOf2((ulong)requiredScalarElements);
+                if (linearExtent == 0 || linearExtent > (ulong)descriptorCapacityElements)
+                {
+                    throw new NotSupportedException(
+                        $"PyNTT shared buffer {variable.Name} requires a {linearExtent}-element linear descriptor " +
+                        $"for logical shape [{string.Join(",", logicalShape)}] and strides [{string.Join(",", logicalStrides)}], " +
+                        $"but only {descriptorCapacityElements} scalar elements remain in its TIR PhysicalBuffer allocation.");
+                }
+
+                return new[] { checked((long)linearExtent) };
+            }
+
+            var paddedOuterExtent = System.Numerics.BitOperations.RoundUpToPowerOf2((ulong)descriptorShape[0]);
+            if (paddedOuterExtent == 0 || paddedOuterExtent > long.MaxValue)
             {
                 throw new NotSupportedException(
-                    $"PyNTT shared AllocateBufferView {variable.Name} descriptor shape " +
-                    $"[{string.Join(",", descriptorShape)}] contains {descriptorElementCount} scalar elements, " +
-                    $"but the logical buffer can address {requiredScalarElements}. " +
-                    "Represent the non-compact logical layout with an addressable TIR buffer view.");
+                    $"PyNTT shared buffer {variable.Name} outer extent {descriptorShape[0]} cannot be represented " +
+                    "as a FlagTree block descriptor dimension.");
+            }
+
+            descriptorShape[0] = checked((long)paddedOuterExtent);
+
+            var paddedDescriptorElementCount = descriptorShape.Aggregate(1L, (product, value) => checked(product * value));
+            if (paddedDescriptorElementCount > descriptorCapacityElements)
+            {
+                throw new NotSupportedException(
+                    $"PyNTT shared descriptor for {variable.Name} requires {paddedDescriptorElementCount} scalar elements, " +
+                    $"but only {descriptorCapacityElements} remain in its TIR PhysicalBuffer allocation.");
             }
 
             return descriptorShape;
@@ -7140,7 +7175,11 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             return new(
                 sharedAllocation.DescriptorName,
                 sharedAllocation.DescriptorShape,
-                bufferRef.OffsetBytes,
+                sharedAllocation.LogicalShape,
+                sharedAllocation.LogicalStrides,
+                bufferRef.LocalBaseCoordinates ?? throw new InvalidOperationException(
+                    $"PyNTT shared buffer {buffer.Name} is missing logical base coordinates."),
+                sharedAllocation.VectorLaneShape,
                 sharedAllocation.AvailableBytes,
                 sharedAllocation.ScalarElementSizeBytes,
                 sharedAllocation.StorageEncoding);
@@ -7183,7 +7222,8 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     null,
                     false,
                     AddressSpace: 3,
-                    SharedAllocation: sharedAllocation);
+                    SharedAllocation: sharedAllocation,
+                    LocalBaseCoordinates: CreateZeroDimExpressions(sharedAllocation.LogicalShape.Length));
             }
 
             if (_bufferViewSourceByBuffer.TryGetValue(buffer, out var viewSource))
@@ -7280,6 +7320,33 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
         {
             var source = viewSource.Source;
             var sourceRef = ResolveBufferRef(source);
+            if (sourceRef.SharedAllocation is { } sharedAllocation)
+            {
+                var sourceCoordinates = sourceRef.LocalBaseCoordinates
+                    ?? throw new InvalidOperationException(
+                        $"PyNTT shared buffer view {source.Name} is missing logical base coordinates.");
+                if (sourceCoordinates.Length != viewSource.Offsets.Length ||
+                    sourceCoordinates.Length != sharedAllocation.LogicalShape.Length)
+                {
+                    throw new NotSupportedException(
+                        $"PyNTT shared buffer view rank mismatch: allocation logical rank={sharedAllocation.LogicalShape.Length}, " +
+                        $"source coordinates={sourceCoordinates.Length}, offsets={viewSource.Offsets.Length}.");
+                }
+
+                var baseCoordinates = sourceCoordinates
+                    .Zip(viewSource.Offsets)
+                    .Select(pair => AddDimExpression(pair.First, pair.Second))
+                    .ToArray();
+                var sharedShardCoordHierarchy = baseCoordinates.Any(coordinate => RequiresShardCoords(coordinate.TritonExpression))
+                    ? sourceRef.ShardCoordHierarchy ?? GetShardCoordHierarchy(source)
+                    : sourceRef.ShardCoordHierarchy;
+                return sourceRef with
+                {
+                    ShardCoordHierarchy = sharedShardCoordHierarchy,
+                    LocalBaseCoordinates = baseCoordinates,
+                };
+            }
+
             var sourceStrides = GetBufferStrides(source);
             if (sourceStrides.Length != viewSource.Offsets.Length)
             {
@@ -7557,10 +7624,13 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
         {
             if (bufferRef.SharedAllocation is { } sharedAllocation)
             {
-                if (bufferRef.PoolStrideBytes != "0" || bufferRef.IndexExpression is not null || bufferRef.IsByteAddressed)
+                if (bufferRef.PoolStrideBytes != "0" ||
+                    bufferRef.IndexExpression is not null ||
+                    bufferRef.IsByteAddressed ||
+                    bufferRef.OffsetBytes != "0")
                 {
                     throw new NotSupportedException(
-                        $"PyNTT shared descriptor {sharedAllocation.DescriptorName} cannot use byte-addressed or pooled pointer arithmetic.");
+                        $"PyNTT shared descriptor {sharedAllocation.DescriptorName} cannot use scalar, byte-addressed, indexed, or pooled pointer arithmetic.");
                 }
 
                 if (tritonDType != sharedAllocation.TritonDType)
@@ -7570,7 +7640,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                         $"but codegen requested {tritonDType}. A dtype reinterpretation must be represented by a typed TIR buffer view.");
                 }
 
-                return BuildSharedLocalPointerExpression(sharedAllocation, bufferRef.OffsetBytes);
+                return sharedAllocation.DescriptorName;
             }
 
             var expression = bufferRef.BaseName;
@@ -7586,28 +7656,6 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
 
             var pointerType = GetPointerTypeExpression(tritonDType, bufferRef.AddressSpace);
             return $"({expression}).to({pointerType})";
-        }
-
-        private static string BuildSharedLocalPointerExpression(SharedBufferAllocation allocation, string scalarOffset)
-        {
-            var indices = new string[allocation.DescriptorShape.Length];
-            var innerStride = 1L;
-            for (var axis = allocation.DescriptorShape.Length - 1; axis >= 0; axis--)
-            {
-                var index = innerStride == 1
-                    ? scalarOffset
-                    : $"(({scalarOffset}) // {innerStride.ToString(CultureInfo.InvariantCulture)})";
-                if (axis != 0)
-                {
-                    index = $"({index}) % {allocation.DescriptorShape[axis].ToString(CultureInfo.InvariantCulture)}";
-                }
-
-                indices[axis] = index;
-                innerStride = checked(innerStride * allocation.DescriptorShape[axis]);
-            }
-
-            var suffix = indices.Length == 1 ? "," : string.Empty;
-            return $"tle.gpu.local_ptr({allocation.DescriptorName}, ({string.Join(", ", indices)}{suffix}))";
         }
 
         private static string GetPointerTypeExpression(string tritonDType, int addressSpace)
@@ -8607,43 +8655,11 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 {
                     var name = state.Names[index];
                     var initializer = state.Initializers[index];
-                    if (initializer.Storage == ReductionAccumulatorStorage.Register)
-                    {
-                        builder.Append(prefix);
-                        builder.Append(name);
-                        builder.Append(" = ");
-                        builder.AppendLine(initializer.ValueExpression);
-                        continue;
-                    }
-
-                    if (initializer.ElementCount <= 0 ||
-                        !System.Numerics.BitOperations.IsPow2((uint)initializer.ElementCount))
-                    {
-                        throw new InvalidOperationException(
-                            $"PyNTT shared reduction accumulator {name} requires a positive power-of-two element count, got {initializer.ElementCount}.");
-                    }
-
-                    var offsetsName = $"{name}_init_offsets";
                     builder.Append(prefix);
                     builder.Append(name);
-                    builder.Append(" = tle.gpu.alloc([");
-                    builder.Append(initializer.ElementCount.ToString(CultureInfo.InvariantCulture));
-                    builder.Append("], dtype=");
-                    builder.Append(initializer.TritonDType);
-                    builder.AppendLine(", layout=None, scope=tle.gpu.smem, nv_mma_shared_layout=False)");
-                    builder.Append(prefix);
-                    builder.Append(offsetsName);
-                    builder.Append(" = tl.arange(0, ");
-                    builder.Append(initializer.ElementCount.ToString(CultureInfo.InvariantCulture));
-                    builder.AppendLine(")");
-                    builder.Append(prefix);
-                    builder.Append("tl.store(tle.gpu.local_ptr(");
-                    builder.Append(name);
-                    builder.Append(", (");
-                    builder.Append(offsetsName);
-                    builder.Append(",)), ");
+                    builder.Append(" = ");
                     builder.Append(initializer.ValueExpression);
-                    builder.AppendLine(")");
+                    builder.AppendLine();
                 }
             }
 
@@ -8675,15 +8691,23 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
         {
             model.MicroKernelFamily = selection.Family;
             model.MicroKernelVariant = selection.Variant;
-            if (model is IPyNTTMatrixMicroKernelTemplateModel matrixModel)
+            model.MicroKernelParameters = selection.Parameters.ToDictionary(
+                pair => pair.Key,
+                pair => pair.Value,
+                StringComparer.Ordinal);
+            if (model is IPyNTTMatrixMicroKernelTemplateModel)
             {
-                matrixModel.MicroKernelInnerM = GetBlockMicroKernelParameter(selection, "inner_m");
-                matrixModel.MicroKernelInnerN = GetBlockMicroKernelParameter(selection, "inner_n");
-                matrixModel.MicroKernelInnerK = GetBlockMicroKernelParameter(selection, "inner_k");
-                matrixModel.MicroKernelPipelineStages = GetOptionalBlockMicroKernelParameter(selection, "pipeline_stages");
-                matrixModel.MicroKernelMmaM = GetOptionalBlockMicroKernelParameter(selection, "mma_m");
-                matrixModel.MicroKernelMmaN = GetOptionalBlockMicroKernelParameter(selection, "mma_n");
-                matrixModel.MicroKernelMmaK = GetOptionalBlockMicroKernelParameter(selection, "mma_k");
+                var contractVersion = GetBlockMicroKernelParameter(selection, TritonBlockMicroKernelContract.VersionParameter);
+                if (contractVersion != TritonBlockMicroKernelContract.Version)
+                {
+                    throw new InvalidOperationException(
+                        $"Block microkernel {selection.Family}/{selection.Variant} uses unsupported contract version {contractVersion}; " +
+                        $"expected {TritonBlockMicroKernelContract.Version}.");
+                }
+
+                _ = GetBlockMicroKernelParameter(selection, TritonBlockMicroKernelContract.InnerMParameter);
+                _ = GetBlockMicroKernelParameter(selection, TritonBlockMicroKernelContract.InnerNParameter);
+                _ = GetBlockMicroKernelParameter(selection, TritonBlockMicroKernelContract.InnerKParameter);
             }
 
             var contractKey = string.Join(
@@ -8733,12 +8757,22 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             return checked((int)value);
         }
 
-        private static int GetOptionalBlockMicroKernelParameter(
-            BlockMicroKernelSelection selection,
-            string name)
-            => selection.Parameters.ContainsKey(name)
-                ? GetBlockMicroKernelParameter(selection, name)
-                : 0;
+        private static ReductionAccumulatorInitializer BuildMatrixReductionAccumulatorInitializer(
+            BlockMicroKernelSelection microKernel,
+            bool useGemv,
+            int blockM,
+            int blockN)
+        {
+            if (microKernel.Variant is not ("register_simt_accumulator" or "register_mma_accumulator"))
+            {
+                throw new NotSupportedException(
+                    $"Unsupported PyNTT matrix microkernel variant {microKernel.Family}/{microKernel.Variant}.");
+            }
+
+            var accumulatorShape = useGemv ? $"({blockN},)" : $"({blockM}, {blockN})";
+            return ReductionAccumulatorInitializer.Register(
+                $"tl.zeros({accumulatorShape}, tl.float32)");
+        }
 
         private static int GetReductionBlockExtent(PyNTTDimExpression dimension, string context, int minimum = 1)
         {
@@ -9084,11 +9118,15 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             bool IsByteAddressed,
             string PoolScopeSize = "1",
             int AddressSpace = 1,
-            SharedBufferAllocation? SharedAllocation = null);
+            SharedBufferAllocation? SharedAllocation = null,
+            PyNTTDimExpression[]? LocalBaseCoordinates = null);
 
         private sealed record SharedBufferAllocation(
             string DescriptorName,
             long[] DescriptorShape,
+            long[] LogicalShape,
+            long[] LogicalStrides,
+            int[] VectorLaneShape,
             long AvailableBytes,
             int ScalarElementSizeBytes,
             string TritonDType,
@@ -9127,26 +9165,10 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             public int UpdateCount { get; set; }
         }
 
-        private enum ReductionAccumulatorStorage
-        {
-            Register,
-            Shared,
-        }
-
-        private sealed record ReductionAccumulatorInitializer(
-            ReductionAccumulatorStorage Storage,
-            string ValueExpression,
-            int ElementCount = 0,
-            string TritonDType = "tl.float32")
+        private sealed record ReductionAccumulatorInitializer(string ValueExpression)
         {
             public static ReductionAccumulatorInitializer Register(string expression)
-                => new(ReductionAccumulatorStorage.Register, expression);
-
-            public static ReductionAccumulatorInitializer Shared(
-                string expression,
-                int elementCount,
-                string tritonDType = "tl.float32")
-                => new(ReductionAccumulatorStorage.Shared, expression, elementCount, tritonDType);
+                => new(expression);
         }
 
         private sealed record OutputControlFlowState(

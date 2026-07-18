@@ -715,10 +715,12 @@ generated model __call__
 
 Generated kernel metadata and `kernel_params.json` should contain:
 
+- a required codegen manifest version
 - generated top kernel name
 - static launch metadata
 - runtime dimension scalar names
 - Python expressions for dynamic launch values such as `numel`
+- the selected target-owned block microkernel family, variant, and parameter map
 - optional autotune result
 - debug mapping
 
@@ -995,8 +997,32 @@ AutoTiling metadata follows three separate ownership rules:
   machine converts compute work into cycles and applies backend-private state
   limits and lowering granularity.
 
-There is deliberately no `MicroKernelInfo` contract. Block-internal
-microkernel implementation remains a backend responsibility.
+There is deliberately no op-owned or TIR-level `MicroKernelInfo` contract.
+Block-internal implementation remains a backend responsibility. AutoTiling's
+target-owned `BlockMicroKernelSelection` does, however, form a versioned
+selection-to-codegen contract: it carries one family, one variant, and one
+opaque integer parameter map. The same target model that estimates a candidate
+must populate all parameters needed to render it. PyNTT copies this map into
+manifest-v3 helper models without renaming or duplicating fields, and its
+reader-only renderer rejects an unknown contract version, missing parameters,
+or an execution geometry it cannot lower.
+
+For Triton SIMT GEMV, the current contract states that all configured compute
+warps partition N, K remains warp-local, and `inner_k` is the sequential
+reduction fragment implemented by the Jinja kernel. Resource and memory costs
+must be calculated from this same fragment and padded state shape. A compiled
+template regression checks the resulting TTGIR warp layout, PTX reduction,
+spill counts, and numerical result so changes to either the target model or the
+kernel fail when their execution assumptions diverge. This contract does not
+expose warp/thread hierarchy in nncase IR and does not prescribe Triton's
+lane-level blocked encoding. Reduction accumulators are loop-carried SSA values
+and use register-backed microkernel variants only. Shared memory remains an
+explicit TIR-selected staging location for tiles and MMA operands; it is not an
+alternative backing store for reduction state. SIMT finalization must preserve
+the reduction's warp-local N distribution: an exact local descriptor uses a
+full-view store, while a global result uses an explicitly indexed warp-local
+store. A coalescing-driven cross-warp layout conversion is not a valid hidden
+implementation of either path.
 
 PyNTT currently provides canonical profiles for RTX 5060 Ti 16 GB and H800 SXM
 80 GB, plus generic CPU/CUDA/XPU profiles. The generated manifest records the
@@ -1015,6 +1041,43 @@ fail immediately.
 - Constants use binary rdata assets and are materialized once by the runtime.
 - `BufferizePass` remains authoritative for buffer shape, strides, size,
   location, workspace offset, and lifetime.
+- A TIR `Buffer` is the logical tensor descriptor. Its dimensions, strides, and
+  `VectorType` lane shape define coordinates and element addressing. PyNTT does
+  not introduce a second storage-axis layout and never reconstructs those
+  coordinates by applying division or remainder to a flattened lane id. Lane
+  dimensions introduced by dtype-width conversion are physical interleaving,
+  not semantic components: for example, the leading `2` in fp32 `<2, lanes>`
+  paired with bf16 `<lanes>` selects adjacent physical elements and must not be
+  interpreted as a RoPE half/component axis.
+- An `AffineRange(offset, extent)` is the only source of an operation's active
+  region. Jinja templates construct one coordinate tensor per logical/vector
+  axis with `tl.arange`; scalar and singleton-axis coordinates remain in that
+  canonical form until the access boundary. Dynamic extents only contribute
+  masks. For a materialized local tile, each static
+  `tl.arange` width comes from the local buffer's
+  `LogicalShape + VectorLaneShape`, rounded to the target's power-of-two tile
+  requirement; a conservative symbolic `RangeMax` must not enlarge that tile.
+- `MemSpan`, `DescriptorShape`, and the arena offset describe physical
+  allocation and capacity. `TargetStorageEncodingSelection` is reserved for
+  physical layouts that ordinary shape/strides cannot express, such as an MMA
+  shared-memory encoding or swizzle. It does not replace the logical buffer
+  domain. The renderer verifies that every structured tile fits its descriptor
+  and fails immediately when a local pointer lacks structured coordinates.
+- Local block accesses lower to `tle.gpu.local_ptr(descriptor,
+  tuple(raw_coordinates), shape=tile_shape)`. The FlagTree frontend owns
+  broadcasting each scalar or singleton-axis coordinate to `tile_shape`; the
+  PyNTT templates must not pre-broadcast local-pointer coordinates. Omitting
+  `shape` preserves the scalar, equal-shape, and full-view `local_ptr` semantics
+  used by genuinely scalar accesses. Global memory instead computes one scalar
+  stride expression from the same forward coordinates and broadcasts that
+  final offset exactly once at the global pointer boundary. Algebraic shape
+  anchors such as `coordinate * 0`, and materialized invariant tensors such as
+  `tl.full(tile_shape, coordinate, ...)`, are forbidden: they obscure the
+  access map and inhibit Triton layout and address simplification. `TileLoad`
+  and `TileStore` still expose a full rectangular coordinate domain to
+  FlagTree, allowing it to recognize a legal async copy without reverse index
+  analysis. Synchronization between materialized tiles remains explicit TIR
+  planning state and is not inferred by PyNTT templates.
 - Internal PrimFuncs use an explicit device-function ABI. The compiler manifest
   records every live tensor base, shape, stride, global offset, workspace base,
   object field, and dynamic dimension needed by the lowered body. The
@@ -1028,7 +1091,11 @@ fail immediately.
   AutoTiling staging allocation represented by TIR buffers. Caller-allocated
   AutoTiling PrimFuncs remain `noinline` device functions so their temporary SSA
   values do not enlarge the caller's live range; operator-template helpers stay
-  inlined within those leaf functions. The physical block identity
+  inlined within those leaf functions. Every backend dialect operation emitted
+  by an inline-required helper must declare operation-level legality through
+  MLIR's `DialectInlinerInterface`; missing legality is a backend contract error,
+  not a reason to expand templates in C# or materialize an ABI layout conversion.
+  The physical block identity
   (`shard_index`) is materialized from `tl.program_id` only in functions that
   reference it and is passed explicitly when a callee requires that value.
 - Function call-boundary policy is derived from the IR `FunctionRole`, never

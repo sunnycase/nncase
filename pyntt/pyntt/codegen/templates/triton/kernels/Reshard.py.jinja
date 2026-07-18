@@ -1,4 +1,5 @@
 {% import "triton/kernels/_common.py.jinja" as common with context %}
+{% import "triton/kernels/_elementwise.py.jinja" as elementwise with context %}
 {% set ctx = reshard_context(model) %}
 # generated from PyNTT Jinja Reshard.py.jinja
 # {{ model["Comment"] }}; dtype={{ model["DType"] }}, global_shape={{ shape_tuple(model["GlobalShape"]) }}, input_tile_shape={{ shape_tuple(model["InputActiveShape"]) }}, output_local_shape={{ shape_tuple(model["OutputLocalShape"]) }}, lane={{ model["VectorLaneCount"] }}, stage=tile_scatter
@@ -17,25 +18,10 @@ def {{ model["FunctionName"] }}({{ helper_parameters(model) }}):
 {% for axis in ctx["output_broadcast_mesh_axes"] %}
 {{ "    " * loop.index }}for destination_shard_coord{{ axis }} in tl.range(0, {{ model["Hierarchy"][axis] }}):
 {% endfor %}
-{% set base = "    " * ((ctx["output_broadcast_mesh_axes"] | length) + 1) %}
-{% set body = "    " * ((ctx["output_broadcast_mesh_axes"] | length) + 2) %}
-{{ base }}for linear_start in tl.range(0, {{ ctx["total"] }}, block_size):
-{{ body }}linear = linear_start + tl.arange(0, block_size)
-{{ body }}mask = (linear < {{ ctx["total"] }}) & ({{ ctx["writer_active"] }})
-{% if model["VectorLaneCount"] == 1 %}
-{{ body }}lane = linear
-{{ body }}lane_value = linear * 0
-{% else %}
-{{ body }}lane = linear // {{ model["VectorLaneCount"] }}
-{{ body }}lane_value = linear % {{ model["VectorLaneCount"] }}
-{% endif %}
-{{ body }}remaining = lane
-{% for axis in reverse_indices(model["InputActiveShape"]) %}
-{{ body }}input_idx{{ axis }} = remaining % {{ dim(model["InputActiveShape"][axis]) }}
-{{ body }}remaining = remaining // {{ dim(model["InputActiveShape"][axis]) }}
-{% endfor %}
+{% call(body) elementwise.iterate(ctx, ctx["prefix_depth"]) %}
+{{ body }}mask = mask & ({{ ctx["writer_active"] }})
 {% for axis in range(model["GlobalShape"] | length) %}
-{{ body }}global_idx{{ axis }} = input_idx{{ axis }} + {{ dim(model["InputGlobalOffsets"][axis]) }}
+{{ body }}global_idx{{ axis }} = {{ ctx["global_coordinates"][axis] }}
 {{ body }}mask = mask & (global_idx{{ axis }} < {{ dim(model["GlobalShape"][axis]) }})
 {% endfor %}
 {% for split_axes in model["OutputSplitAxes"] %}
@@ -59,14 +45,13 @@ def {{ model["FunctionName"] }}({{ helper_parameters(model) }}):
 {% endif %}
 {% endfor %}
 {{ body }}destination_shard_index = {{ ctx["destination_shard_index"] }}
-{{ body }}input_offsets = {{ ctx["input_offsets"] }}
-{{ body }}output_offsets = {{ ctx["output_offsets"] }}
+{{ body }}output_offsets = {{ ctx["output_access"]["ScalarOffset"] }}
 {{ body }}destination_pool_index = {{ ctx["destination_pool_index"] }}
 {{ body }}output_byte_offsets = destination_pool_index * {{ model["OutputAddress"]["PoolStrideBytes"] }} + {{ model["OutputAddress"]["OffsetBytes"] }} + output_offsets * {{ model["ScalarElementSizeBytes"] }}
 {% if ctx["partial"] is none %}
-{{ body }}value = tl.load({{ access_pointer(model, "Input", "input0", "input_offsets") }}, mask=mask)
+{{ body }}value = tl.load({{ access_pointer(model, "Input", "input0", ctx["input_access"]) }}, mask=mask)
 {% else %}
-{{ body }}acc = tl.full((block_size,), {{ ctx["partial"]["zero"] }}, {{ ctx["partial"]["accumulator_dtype"] }})
+{{ body }}acc = tl.full({{ ctx["tile_shape"] }}, {{ ctx["partial"]["zero"] }}, {{ ctx["partial"]["accumulator_dtype"] }})
 {% for axis in range(model["Hierarchy"] | length) %}
 {{ body }}source_shard_coord{{ axis }} = shard_coord{{ axis }}
 {% endfor %}
@@ -79,8 +64,9 @@ def {{ model["FunctionName"] }}({{ helper_parameters(model) }}):
 {{ reduce_body }}source_pool_index = {{ ctx["partial"]["source_pool_index"] }}
 {{ reduce_body }}source_byte_offset = source_pool_index * {{ ctx["partial"]["address"]["PoolStrideBytes"] }} + {{ ctx["partial"]["address"]["OffsetBytes"] }}
 {{ reduce_body }}source = ({{ ctx["partial"]["address"]["BaseName"] }} + source_byte_offset).to({{ ctx["partial"]["pointer_type"] }})
-{{ reduce_body }}source_value = tl.load(source + input_offsets, mask=mask, other={{ ctx["partial"]["zero"] }}).to({{ ctx["partial"]["accumulator_dtype"] }})
+{{ reduce_body }}source_value = tl.load(source + {{ ctx["input_access"]["ScalarOffset"] }}, mask=mask, other={{ ctx["partial"]["zero"] }}).to({{ ctx["partial"]["accumulator_dtype"] }})
 {{ reduce_body }}acc += source_value
 {{ body }}value = acc
 {% endif %}
 {{ body }}tl.store(({{ model["OutputAddress"]["BaseName"] }} + output_byte_offsets).to({{ ctx["output_pointer_type"] }}), value, mask=mask)
+{% endcall %}

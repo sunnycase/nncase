@@ -1,6 +1,6 @@
 {% import "triton/kernels/_common.py.jinja" as common with context %}
-{% set total = product(model["Shape"]) %}
-{% set vectorized_axis = model["VectorizedAxes"][0] if model.get("VectorizedAxes") else -1 %}
+{% import "triton/kernels/_elementwise.py.jinja" as elementwise with context %}
+{% set ctx = elementwise_cast_context(model) %}
 # generated from PyNTT Jinja ElementwiseCast.py.jinja
 # {{ model["Comment"] }}; cast_mode={{ model["CastMode"] }}, input_dtype={{ model["InputDType"] }}, output_dtype={{ model["OutputDType"] }}, shape={{ shape_tuple(model["Shape"]) }}
 {{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
@@ -13,16 +13,8 @@ def {{ model["FunctionName"] }}({{ helper_parameters(model) }}):
 {% if local_buffer(model["Output"]) is none %}
     output = {{ ptr(model, "Output") }}
 {% endif %}
-    for linear_start in tl.range(0, {{ total }}, block_size):
-        linear = linear_start + tl.arange(0, block_size)
-        mask = linear < {{ total }}
-        tmp = linear
-{% for axis in reverse_indices(model["Shape"]) %}
-        idx{{ axis }} = tmp % {{ dim(model["Shape"][axis]) }}
-        tmp = tmp // {{ dim(model["Shape"][axis]) }}
-{% endfor %}
-        input_offsets = {{ common.vectorized_offset(model["InputStrides"], vectorized_axis, model["InputVectorLaneCount"]) }}
-        output_offsets = {{ common.vectorized_offset(model["OutputStrides"], vectorized_axis, model["OutputVectorLaneCount"]) }}
-        value0 = tl.load({{ access_pointer(model, "Input", "input0", "input_offsets") }}, mask=mask, other=0.0)
-        result = {{ model["CastExpression"] }}
-        tl.store({{ access_pointer(model, "Output", "output", "output_offsets") }}, {{ "(result).to(tl.uint8)" if is_bool_dtype(model["OutputDType"]) else "result" }}, mask=mask)
+{% call(indent) elementwise.iterate(ctx) %}
+{{ indent }}value0 = tl.load({{ access_pointer(model, "Input", "input0", ctx["input_access"]) }}, mask=mask, other=0.0)
+{{ indent }}result = {{ model["CastExpression"] }}
+{{ indent }}tl.store({{ access_pointer(model, "Output", "output", ctx["output_access"]) }}, {{ "(result).to(tl.uint8)" if is_bool_dtype(model["OutputDType"]) else "result" }}, mask=mask)
+{% endcall %}

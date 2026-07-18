@@ -1,5 +1,6 @@
 {% import "triton/kernels/_common.py.jinja" as common with context %}
-{% set total = multiply_expr(product(model["OutputShape"]), model["OutputVectorLaneCount"]) %}
+{% import "triton/kernels/_elementwise.py.jinja" as elementwise with context %}
+{% set ctx = transpose_context(model) %}
 # generated from PyNTT Jinja Transpose.py.jinja
 # {{ model["Comment"] }}; input_dtype={{ model["InputDType"] }}, output_dtype={{ model["OutputDType"] }}, input_shape={{ shape_tuple(model["InputShape"]) }}, output_shape={{ shape_tuple(model["OutputShape"]) }}, perm={{ shape_tuple(model["Perm"]) }}
 {{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
@@ -12,20 +13,7 @@ def {{ model["FunctionName"] }}({{ helper_parameters(model) }}):
 {% if local_buffer(model["Output"]) is none %}
     output = {{ ptr(model, "Output") }}
 {% endif %}
-    for linear_start in tl.range(0, {{ total }}, block_size):
-        linear = linear_start + tl.arange(0, block_size)
-        mask = linear < {{ total }}
-        lane_flat = linear % {{ model["OutputVectorLaneCount"] }}
-        output_tensor_linear = linear // {{ model["OutputVectorLaneCount"] }}
-        tmp = output_tensor_linear
-{% for axis in reverse_indices(model["OutputShape"]) %}
-        out_idx{{ axis }} = tmp % {{ dim(model["OutputShape"][axis]) }}
-        tmp = tmp // {{ dim(model["OutputShape"][axis]) }}
-{% endfor %}
-{% for input_axis in range(model["InputShape"] | length) %}
-        in_idx{{ input_axis }} = out_idx{{ model["Perm"].index(input_axis) }}
-{% endfor %}
-        input_offsets = {{ common.prefixed_offset("in_idx", model["InputStrides"], model["InputVectorLaneCount"]) }}
-        output_offsets = {{ common.prefixed_offset("out_idx", model["OutputStrides"], model["OutputVectorLaneCount"]) }}
-        value = tl.load({{ access_pointer(model, "Input", "input", "input_offsets") }}, mask=mask, other=0.0)
-        tl.store({{ access_pointer(model, "Output", "output", "output_offsets") }}, value, mask=mask)
+{% call(indent) elementwise.iterate(ctx) %}
+{{ indent }}value = tl.load({{ access_pointer(model, "Input", "input", ctx["input_access"]) }}, mask=mask, other=0.0)
+{{ indent }}tl.store({{ access_pointer(model, "Output", "output", ctx["output_access"]) }}, value, mask=mask)
+{% endcall %}

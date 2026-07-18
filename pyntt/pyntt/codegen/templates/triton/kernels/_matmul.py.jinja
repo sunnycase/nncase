@@ -21,62 +21,44 @@ def {{ model["FunctionName"] }}({{ helper_parameters(model, ["acc"] if ctx["phas
 {% if local_buffer(model["Rhs"]) is none %}
     rhs = {{ ptr(model, "Rhs") }}
 {% endif %}
-    offs_k = tl.arange(0, {{ ctx["block_k"] }})
 {% if ctx["gemv"] %}
     m_idx = 0
-{% if ctx["microkernel_variant"] in ("shared_simt_accumulator", "shared_mma_accumulator") %}
-    lhs_values = tl.load({{ access_pointer(model, "Lhs", "lhs", ctx["lhs_offsets"]) }}, mask={{ ctx["lhs_mask"] }}, other=0.0)
-{% if ctx["gemv_use_dot"] %}
-    # Compute (B.T @ A.T).T and pad only semantic M to the selected MMA N tile.
-    offs_m = tl.arange(0, {{ ctx["gemv_dot_m"] }})
-    lhs_columns = tl.where(offs_m[None, :] == 0, lhs_values[:, None], 0.0)
+{{ common.structured_axis(ctx["rhs_n_axis"], "    ") }}
+{% if ctx["selected_simt"] %}
+    partial = acc
+    for reduction_k_start in tl.range(0, {{ ctx["block_k"] }}, {{ ctx["inner_k"] }}):
+        offs_k = reduction_k_start + tl.arange(0, {{ ctx["inner_k"] }})
+        rhs_values = tl.reshape(tl.load({{ access_pointer(model, "Rhs", "rhs", ctx["rhs_access"]) }}, mask={{ ctx["rhs_mask"] }}, other=0.0, eviction_policy="evict_first"), {{ ctx["rhs_matrix_shape"] }}).to(tl.float32)
+        lhs_values = tl.load({{ access_pointer(model, "Lhs", "lhs", ctx["lhs_access"]) }}, mask={{ ctx["lhs_mask"] }}, other=0.0).to(tl.float32)
+{% if ctx["simt_k_first"] %}
+        partial += tl.sum(rhs_values * lhs_values[:, None], axis=0)
 {% else %}
-    lhs_values = lhs_values.to(tl.float32)
+        partial += tl.sum(rhs_values * lhs_values[None, :], axis=1)
 {% endif %}
-    for acc_n_start in tl.range(0, {{ ctx["block_n"] }}, {{ ctx["inner_n"] }}):
-        offs_n = acc_n_start + tl.arange(0, {{ ctx["inner_n"] }})
-        rhs_values = tl.load({{ access_pointer(model, "Rhs", "rhs", ctx["rhs_offsets"]) }}, mask={{ ctx["rhs_mask"] }}, other=0.0, eviction_policy="evict_first")
-{% if ctx["gemv_use_dot"] %}
-        partial_transposed = tl.dot(rhs_values, lhs_columns{{ ctx["dot_precision"] }})
-        partial = tl.sum(partial_transposed, axis=1)
-        acc_ptr = tle.gpu.local_ptr(acc, (offs_n,))
-        acc_mask = offs_n < {{ ctx["block_n"] }}
+    return partial
 {% else %}
-        rhs_values = rhs_values.to(tl.float32)
-        partial = tl.sum(rhs_values * lhs_values[None, :], axis=1)
-        acc_ptr = tle.gpu.local_ptr(acc, (offs_n,))
-        acc_mask = offs_n < {{ ctx["block_n"] }}
-{% endif %}
-        acc_values = tl.load(acc_ptr, mask=acc_mask, other=0.0)
-        tl.store(acc_ptr, acc_values + partial, mask=acc_mask)
-{% else %}
-    offs_n = tl.arange(0, {{ ctx["block_n"] }})
-{% if ctx["gemv_use_dot"] %}
+    offs_k = tl.arange(0, {{ ctx["block_k"] }})
     offs_m = tl.arange(0, {{ ctx["gemv_dot_m"] }})
-    rhs_values = tl.load({{ access_pointer(model, "Rhs", "rhs", ctx["rhs_offsets"]) }}, mask={{ ctx["rhs_mask"] }}, other=0.0, eviction_policy="evict_first")
-    lhs_values = tl.load({{ access_pointer(model, "Lhs", "lhs", ctx["lhs_offsets"]) }}, mask={{ ctx["lhs_mask"] }}, other=0.0)
+    rhs_values = tl.reshape(tl.load({{ access_pointer(model, "Rhs", "rhs", ctx["rhs_access"]) }}, mask={{ ctx["rhs_mask"] }}, other=0.0, eviction_policy="evict_first"), {{ ctx["rhs_matrix_shape"] }})
+    lhs_values = tl.load({{ access_pointer(model, "Lhs", "lhs", ctx["lhs_access"]) }}, mask={{ ctx["lhs_mask"] }}, other=0.0)
     lhs_columns = tl.where(offs_m[None, :] == 0, lhs_values[:, None], 0.0)
     partial_transposed = tl.dot(rhs_values, lhs_columns{{ ctx["dot_precision"] }})
     acc += tl.sum(partial_transposed, axis=1)
-{% else %}
-    rhs_values = tl.load({{ access_pointer(model, "Rhs", "rhs", ctx["rhs_offsets"]) }}, mask={{ ctx["rhs_mask"] }}, other=0.0, eviction_policy="evict_first").to(tl.float32)
-    lhs_values = tl.load({{ access_pointer(model, "Lhs", "lhs", ctx["lhs_offsets"]) }}, mask={{ ctx["lhs_mask"] }}, other=0.0).to(tl.float32)
-    acc += tl.sum(rhs_values * lhs_values[None, :], axis=1)
-{% endif %}
     return acc
 {% endif %}
 {% else %}
-    offs_n = tl.arange(0, {{ ctx["block_n"] }})
+    offs_k = tl.arange(0, {{ ctx["block_k"] }})
     offs_m = tl.arange(0, {{ ctx["block_m"] }})
+{{ common.structured_axis(ctx["rhs_n_axis"], "    ") }}
 {% if ctx["rhs_direct_load"] %}
     rhs_values = {{ ctx["rhs_direct_load"] }}
 {% else %}
-    rhs_values = tl.load({{ access_pointer(model, "Rhs", "rhs", ctx["rhs_offsets"]) }}, mask={{ ctx["rhs_mask"] }}, other=0.0)
+    rhs_values = tl.reshape(tl.load({{ access_pointer(model, "Rhs", "rhs", ctx["rhs_access"]) }}, mask={{ ctx["rhs_mask"] }}, other=0.0), {{ ctx["rhs_matrix_shape"] }})
 {% endif %}
 {% if ctx["lhs_direct_load"] %}
     lhs_values = {{ ctx["lhs_direct_load"] }}
 {% else %}
-    lhs_values = tl.load({{ access_pointer(model, "Lhs", "lhs", ctx["lhs_offsets"]) }}, mask={{ ctx["lhs_mask"] }}, other=0.0)
+    lhs_values = tl.load({{ access_pointer(model, "Lhs", "lhs", ctx["lhs_access"]) }}, mask={{ ctx["lhs_mask"] }}, other=0.0)
 {% endif %}
     acc += tl.dot(lhs_values, rhs_values{{ ctx["dot_precision"] }})
     return acc
@@ -86,16 +68,33 @@ def {{ model["FunctionName"] }}({{ helper_parameters(model, ["acc"] if ctx["phas
 {% if local_buffer(model["Output"]) is none %}
     output = {{ ptr(model, "Output") }}
 {% endif %}
-    offs_n = tl.arange(0, {{ ctx["block_n"] }})
 {% if not ctx["gemv"] %}
     offs_m = tl.arange(0, {{ ctx["block_m"] }})
 {% endif %}
-{% if ctx["microkernel_variant"] in ("shared_simt_accumulator", "shared_mma_accumulator") %}
-    acc_values = tl.load(tle.gpu.local_ptr(acc, (offs_n,)), mask=offs_n < {{ ctx["block_n"] }}, other=0.0)
-{% else %}
+{{ common.structured_axis(ctx["output_n_axis"], "    ") }}
     acc_values = acc
+{% if ctx["output_store"]["kind"] == "full_local" %}
+    pyntt_store_value = (acc_values * {{ model["Scale"] }}).to({{ ctx["output_store"]["triton_dtype"] }})
+    tl.store(
+        tle.gpu.local_ptr({{ ctx["output_store"]["descriptor"] }}),
+        tl.reshape(pyntt_store_value, {{ ctx["output_store"]["shape"] }}),
+    )
+{% elif ctx["output_store"]["kind"] == "global_warp_local" %}
+    pyntt_store_value = (acc_values * {{ model["Scale"] }}).to({{ ctx["output_store"]["triton_dtype"] }})
+    pyntt_store_bits = pyntt_store_value.to({{ ctx["output_store"]["bitcast_dtype"] }}, bitcast=True)
+    pyntt_store_offsets = ({{ ctx["output_scalar_offset"] }}).to(tl.uint64)
+    pyntt_store_mask = tl.reshape({{ ctx["output_mask"] }}, ({{ ctx["block_n"] }},))
+    tl.inline_asm_elementwise(
+        "{ .reg .u64 byte_offset; .reg .u64 address; mul.lo.u64 byte_offset, $3, {{ ctx["output_store"]["element_size"] }}; add.u64 address, $2, byte_offset; @$4 st.global.b{{ ctx["output_store"]["bit_width"] }} [address], {$1}; mov.u32 $0, 0; }",
+        "=r,{{ ctx["output_store"]["value_constraint"] }},l,l,b",
+        [pyntt_store_bits, output, pyntt_store_offsets, pyntt_store_mask],
+        dtype=tl.uint32,
+        is_pure=False,
+        pack=1,
+    )
+{% else %}
+    tl.store({{ access_pointer(model, "Output", "output", ctx["output_access"]) }}, tl.reshape(acc_values * {{ model["Scale"] }}, {{ ctx["output_structured_shape"] }}), mask={{ ctx["output_mask"] }})
 {% endif %}
-    tl.store({{ access_pointer(model, "Output", "output", ctx["output_offsets"]) }}, acc_values * {{ model["Scale"] }}, mask={{ ctx["output_mask"] }})
 {% else %}
 {{ common.shard_coordinates([model["Lhs"], model["Rhs"], model["Output"]]) }}
 {% for name, key in (("lhs", "Lhs"), ("rhs", "Rhs"), ("output", "Output")) %}
@@ -114,37 +113,39 @@ def {{ model["FunctionName"] }}({{ helper_parameters(model, ["acc"] if ctx["phas
 {% set base = "    " * ((ctx["batch_axes"] | length) + 1) %}
 {% if ctx["gemv"] %}
 {{ base }}for m_idx in tl.range(0, {{ dim(ctx["m"]) }}):
-{{ base }}    for n_start in tl.range(0, {{ dim(ctx["n"]) }}, {{ ctx["block_n"] }}, num_stages={{ ctx["n_stages"] }}):
-{{ base }}        offs_n = n_start + tl.arange(0, {{ ctx["block_n"] }})
+{{ base }}    for n_start in tl.range(0, {{ dim(ctx["physical_n"]) }}, {{ ctx["physical_block_n"] }}, num_stages={{ ctx["n_stages"] }}):
+{{ common.structured_axis(ctx["rhs_n_axis"], base ~ "        ") }}
+{{ common.structured_axis(ctx["output_n_axis"], base ~ "        ") }}
 {{ base }}        acc = tl.zeros(({{ ctx["block_n"] }},), tl.float32)
 {{ base }}        for k_start in tl.range(0, {{ dim(ctx["k"]) }}, {{ ctx["block_k"] }}):
 {{ base }}            offs_k = k_start + tl.arange(0, {{ ctx["block_k"] }})
-{{ base }}            rhs_values = tl.load({{ access_pointer(model, "Rhs", "rhs", ctx["rhs_offsets"]) }}, mask={{ ctx["rhs_mask"] }}, other=0.0, eviction_policy="evict_first").to(tl.float32)
-{{ base }}            lhs_values = tl.load({{ access_pointer(model, "Lhs", "lhs", ctx["lhs_offsets"]) }}, mask={{ ctx["lhs_mask"] }}, other=0.0).to(tl.float32)
+{{ base }}            rhs_values = tl.reshape(tl.load({{ access_pointer(model, "Rhs", "rhs", ctx["rhs_access"]) }}, mask={{ ctx["rhs_mask"] }}, other=0.0, eviction_policy="evict_first"), {{ ctx["rhs_matrix_shape"] }}).to(tl.float32)
+{{ base }}            lhs_values = tl.load({{ access_pointer(model, "Lhs", "lhs", ctx["lhs_access"]) }}, mask={{ ctx["lhs_mask"] }}, other=0.0).to(tl.float32)
 {{ base }}            acc += tl.sum(rhs_values * lhs_values[None, :], axis=1)
 {{ base }}        result = acc * {{ model["Scale"] }}
 {% set compute = base ~ "        " %}
 {% else %}
 {{ base }}for m_start in tl.range(0, {{ dim(ctx["m"]) }}, {{ ctx["block_m"] }}):
 {{ base }}    offs_m = m_start + tl.arange(0, {{ ctx["block_m"] }})
-{{ base }}    for n_start in tl.range(0, {{ dim(ctx["n"]) }}, {{ ctx["block_n"] }}):
-{{ base }}        offs_n = n_start + tl.arange(0, {{ ctx["block_n"] }})
+{{ base }}    for n_start in tl.range(0, {{ dim(ctx["physical_n"]) }}, {{ ctx["physical_block_n"] }}):
+{{ common.structured_axis(ctx["rhs_n_axis"], base ~ "        ") }}
+{{ common.structured_axis(ctx["output_n_axis"], base ~ "        ") }}
 {{ base }}        acc = tl.zeros(({{ ctx["block_m"] }}, {{ ctx["block_n"] }}), tl.float32)
 {{ base }}        for k_start in tl.range(0, {{ dim(ctx["k"]) }}, {{ ctx["block_k"] }}, num_stages=5):
 {{ base }}            offs_k = k_start + tl.arange(0, {{ ctx["block_k"] }})
-{{ base }}            rhs_values = tl.load({{ access_pointer(model, "Rhs", "rhs", ctx["rhs_offsets"]) }}, mask={{ ctx["rhs_mask"] }}, other=0.0)
-{{ base }}            lhs_values = tl.load({{ access_pointer(model, "Lhs", "lhs", ctx["lhs_offsets"]) }}, mask={{ ctx["lhs_mask"] }}, other=0.0)
+{{ base }}            rhs_values = tl.reshape(tl.load({{ access_pointer(model, "Rhs", "rhs", ctx["rhs_access"]) }}, mask={{ ctx["rhs_mask"] }}, other=0.0), {{ ctx["rhs_matrix_shape"] }})
+{{ base }}            lhs_values = tl.load({{ access_pointer(model, "Lhs", "lhs", ctx["lhs_access"]) }}, mask={{ ctx["lhs_mask"] }}, other=0.0)
 {{ base }}            acc += tl.dot(lhs_values, rhs_values{{ ctx["dot_precision"] }})
 {{ base }}        result = acc * {{ model["Scale"] }}
 {% set compute = base ~ "        " %}
 {% endif %}
 {% if ctx["load_c"] %}
-{{ compute }}previous = tl.load({{ access_pointer(model, "Output", "output", ctx["output_offsets"]) }}, mask=({{ ctx["output_mask"] }}) & ({{ ctx["load_c_predicate"] }}), other=0.0).to(tl.float32)
+{{ compute }}previous = tl.reshape(tl.load({{ access_pointer(model, "Output", "output", ctx["output_access"]) }}, mask=({{ ctx["output_mask"] }}) & ({{ ctx["load_c_predicate"] }}), other=0.0), {{ "(" ~ ctx["block_n"] ~ ",)" if ctx["gemv"] else "(" ~ ctx["block_m"] ~ ", " ~ ctx["block_n"] ~ ")" }}).to(tl.float32)
 {% if ctx["load_c_predicate"] == "True" %}
 {{ compute }}result = previous + result
 {% else %}
 {{ compute }}result = tl.where({{ ctx["load_c_predicate"] }}, previous + result, result)
 {% endif %}
 {% endif %}
-{{ compute }}tl.store({{ access_pointer(model, "Output", "output", ctx["output_offsets"]) }}, result, mask={{ ctx["output_mask"] }})
+{{ compute }}tl.store({{ access_pointer(model, "Output", "output", ctx["output_access"]) }}, tl.reshape(result, {{ ctx["output_structured_shape"] }}), mask={{ ctx["output_mask"] }})
 {% endif %}

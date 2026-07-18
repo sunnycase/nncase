@@ -499,7 +499,7 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
         var topKernelFunctions = GetRuntimeTopKernelFunctions();
         var manifest = new
         {
-            pyntt_codegen_manifest_version = 1,
+            pyntt_codegen_manifest_version = 3,
             target_kind = _moduleKind,
             backend = targetOptions.Backend,
             functions = _functions.Select(function => new

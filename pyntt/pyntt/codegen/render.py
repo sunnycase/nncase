@@ -30,6 +30,7 @@ WORKSPACE_STRIDE_PARAMETERS = (
 
 SHARD_INDEX_PARAMETER = "shard_index"
 NVIDIA_MMA_SHARED_ENCODING = "triton.nvidia.mma-shared"
+PYNTT_CODEGEN_MANIFEST_VERSION = 3
 
 DEVICE_CALL_RE = re.compile(
     r"(?m)^(?P<indent>[ \t]*)__pyntt_device_call__(?P<name>[A-Za-z_]\w*)\((?P<args>.*)\)$"
@@ -66,6 +67,19 @@ def render_generated_kernels(
 
 
 def render_manifest(manifest: dict[str, Any]) -> str:
+    if not isinstance(manifest, dict):
+        raise ValueError("The PyNTT codegen manifest must be a JSON object.")
+    manifest_version = manifest.get("pyntt_codegen_manifest_version")
+    if (
+        isinstance(manifest_version, bool)
+        or not isinstance(manifest_version, int)
+        or manifest_version != PYNTT_CODEGEN_MANIFEST_VERSION
+    ):
+        raise ValueError(
+            "Unsupported PyNTT codegen manifest version "
+            f"{manifest_version!r}; expected {PYNTT_CODEGEN_MANIFEST_VERSION}."
+        )
+
     kernels = [
         _render_kernel(kernel)
         for function in manifest.get("functions", ())
@@ -496,6 +510,10 @@ def _make_env() -> Environment:
         concat_context=_concat_template_context,
         conv2d_context=_conv2d_template_context,
         dim=_dim,
+        elementwise_binary_context=_elementwise_binary_template_context,
+        elementwise_cast_context=_elementwise_cast_template_context,
+        elementwise_unary_context=_elementwise_unary_template_context,
+        elementwise_where_context=_elementwise_where_template_context,
         fixed=_fixed,
         gather_context=_gather_template_context,
         helper_parameters=_helper_parameters,
@@ -505,6 +523,7 @@ def _make_env() -> Environment:
         local_buffer=_local_buffer,
         logical_shape=_logical_shape,
         logical_strides=_logical_strides,
+        memcopy_context=_memcopy_template_context,
         matmul_glu_context=_matmul_glu_template_context,
         matmul_context=_matmul_template_context,
         multiply_expr=_multiply_expr,
@@ -526,7 +545,9 @@ def _make_env() -> Environment:
         softmax_context=_softmax_template_context,
         summa_context=_summa_template_context,
         tensor_copy_context=_tensor_copy_template_context,
+        tensor_access=_tensor_access,
         tensor_region_copy_context=_tensor_region_copy_template_context,
+        transpose_context=_transpose_template_context,
         update_paged_attention_kv_cache_context=(
             _update_paged_attention_kv_cache_template_context
         ),
@@ -702,6 +723,12 @@ def _shape_tuple(shape: list[Any]) -> str:
     return f"({', '.join(_dim(dim) for dim in shape)}{suffix})"
 
 
+def _coordinate_shape(shape: tuple[Any, ...] | list[Any]) -> str:
+    if not shape:
+        raise ValueError("A PyNTT block access requires a non-empty coordinate shape.")
+    return _shape_tuple(list(shape))
+
+
 def _ptr(model: dict[str, Any], name: str) -> str:
     value = model[name]
     if isinstance(value, dict):
@@ -728,6 +755,273 @@ def _local_buffer_value(buffer: dict[str, Any], name: str) -> Any:
     return buffer.get(name, buffer.get(snake_name))
 
 
+def _local_base_coordinates(buffer: dict[str, Any]) -> tuple[Any, ...]:
+    value = _local_buffer_value(buffer, "BaseCoordinates")
+    if not isinstance(value, list):
+        raise ValueError("PyNTT local buffer requires BaseCoordinates")
+    return tuple(value)
+
+
+def _local_base_is_zero(buffer: dict[str, Any]) -> bool:
+    return all(_fixed(value) == 0 for value in _local_base_coordinates(buffer))
+
+
+def _join_index_terms(terms: list[str]) -> str:
+    return "0" if not terms else " + ".join(terms)
+
+
+def _tensor_access(
+    tensor_indices: tuple[str, ...] | list[str],
+    strides: list[Any],
+    lane_indices: tuple[str, ...] | list[str] = (),
+    lane_shape: tuple[int, ...] | list[int] = (),
+    coordinate_shape: str | None = None,
+) -> dict[str, Any]:
+    """Build one coordinate-preserving tensor access at render time."""
+
+    tensor_indices = tuple(str(value) for value in tensor_indices)
+    lane_indices = tuple(str(value) for value in lane_indices)
+    lane_shape = tuple(int(value) for value in lane_shape)
+    if len(tensor_indices) != len(strides):
+        raise ValueError(
+            "PyNTT tensor access index/stride rank mismatch: "
+            f"indices={len(tensor_indices)}, strides={len(strides)}"
+        )
+    if len(lane_indices) != len(lane_shape):
+        raise ValueError(
+            "PyNTT tensor access lane rank mismatch: "
+            f"indices={len(lane_indices)}, shape={len(lane_shape)}"
+        )
+    if any(value <= 0 for value in lane_shape):
+        raise ValueError(f"PyNTT tensor access lane shape must be positive: {lane_shape}")
+
+    tensor_terms = [
+        index
+        if _fixed(stride) == 1
+        else f"({index}) * ({_dim(stride)})"
+        for index, stride in zip(tensor_indices, strides)
+        if _fixed(stride) != 0 and index != "0"
+    ]
+    tensor_offset = _join_index_terms(tensor_terms)
+    lane_terms: list[str] = []
+    lane_stride = 1
+    for index, extent in reversed(tuple(zip(lane_indices, lane_shape))):
+        if index != "0":
+            lane_terms.append(
+                index
+                if lane_stride == 1
+                else f"({index}) * {lane_stride}"
+            )
+        lane_stride *= extent
+    lane_offset = _join_index_terms(list(reversed(lane_terms)))
+    scalar_offset = tensor_offset
+    if lane_stride != 1:
+        scalar_offset = (
+            "0" if tensor_offset == "0" else f"({tensor_offset}) * {lane_stride}"
+        )
+        if lane_offset != "0":
+            scalar_offset = (
+                lane_offset
+                if scalar_offset == "0"
+                else f"{scalar_offset} + {lane_offset}"
+            )
+    raw_scalar_offset = scalar_offset
+    if coordinate_shape is not None:
+        scalar_offset = f"tl.broadcast_to({scalar_offset}, {coordinate_shape})"
+
+    return {
+        "CoordinateShape": coordinate_shape,
+        "RawScalarOffset": raw_scalar_offset,
+        "ScalarOffset": scalar_offset,
+        "TensorIndices": tensor_indices,
+        "TensorStrides": tuple(strides),
+        "LaneIndices": lane_indices,
+        "LaneShape": lane_shape,
+    }
+
+
+def _access_scalar_offset(access: Any) -> str:
+    if access is None:
+        return "0"
+    if isinstance(access, dict):
+        value = access.get("ScalarOffset", access.get("scalar_offset"))
+        if value is None:
+            raise ValueError("PyNTT structured access requires ScalarOffset")
+        return str(value)
+    return str(access)
+
+
+def _access_raw_scalar_offset(access: Any) -> str:
+    if not isinstance(access, dict):
+        return _access_scalar_offset(access)
+    value = access.get("RawScalarOffset", access.get("raw_scalar_offset"))
+    return str(value) if value is not None else _access_scalar_offset(access)
+
+
+def _add_coordinate(base: Any, index: str) -> str:
+    if _fixed(base) == 0:
+        return index
+    if index == "0":
+        return _dim(base)
+    return f"({_dim(base)}) + ({index})"
+
+
+def _local_descriptor_coordinates(
+    buffer: dict[str, Any], access: Any
+) -> tuple[str, ...]:
+    logical_shape = tuple(
+        int(value) for value in (_local_buffer_value(buffer, "LogicalShape") or ())
+    )
+    lane_shape = tuple(
+        int(value) for value in (_local_buffer_value(buffer, "VectorLaneShape") or ())
+    )
+    logical_strides = tuple(
+        int(value) for value in (_local_buffer_value(buffer, "LogicalStrides") or ())
+    )
+    descriptor_shape = tuple(
+        int(value) for value in (_local_buffer_value(buffer, "DescriptorShape") or ())
+    )
+    base_coordinates = _local_base_coordinates(buffer)
+    if len(base_coordinates) != len(logical_shape):
+        raise ValueError(
+            "PyNTT local buffer logical base rank mismatch: "
+            f"base={len(base_coordinates)}, shape={len(logical_shape)}"
+        )
+    if len(logical_strides) != len(logical_shape):
+        raise ValueError(
+            "PyNTT local buffer logical stride rank mismatch: "
+            f"strides={len(logical_strides)}, shape={len(logical_shape)}"
+        )
+
+    if access is None or access == "0":
+        tensor_indices = ("0",) * len(logical_shape)
+        lane_indices = ("0",) * len(lane_shape)
+    elif isinstance(access, dict):
+        tensor_indices = tuple(
+            str(value)
+            for value in access.get("TensorIndices", access.get("tensor_indices", ()))
+        )
+        lane_indices = tuple(
+            str(value)
+            for value in access.get("LaneIndices", access.get("lane_indices", ()))
+        )
+        access_lane_shape = tuple(
+            int(value)
+            for value in access.get("LaneShape", access.get("lane_shape", ()))
+        )
+        if access_lane_shape != lane_shape:
+            raise ValueError(
+                "PyNTT local access lane shape does not match its TIR buffer: "
+                f"access={access_lane_shape}, buffer={lane_shape}"
+            )
+        access_strides = tuple(
+            _constant_dim_value(value)
+            for value in access.get("TensorStrides", access.get("tensor_strides", ()))
+        )
+        if access_strides != logical_strides:
+            raise ValueError(
+                "PyNTT local access strides do not match its TIR buffer: "
+                f"access={access_strides}, buffer={logical_strides}"
+            )
+    else:
+        raise ValueError(
+            "PyNTT local buffer accesses require structured tensor coordinates; "
+            f"got scalar offset {access!r}"
+        )
+
+    if len(tensor_indices) != len(logical_shape) or len(lane_indices) != len(lane_shape):
+        raise ValueError(
+            "PyNTT local access coordinate rank mismatch: "
+            f"tensor={len(tensor_indices)}/{len(logical_shape)}, "
+            f"lanes={len(lane_indices)}/{len(lane_shape)}"
+        )
+    tensor_coordinates = tuple(
+        _add_coordinate(base, index)
+        for base, index in zip(base_coordinates, tensor_indices)
+    )
+    scalar_offset = _access_raw_scalar_offset(access)
+
+    storage_encoding = str(_local_buffer_value(buffer, "StorageEncoding") or "")
+    direct_shape = logical_shape + lane_shape
+    if len(descriptor_shape) == len(direct_shape):
+        descriptor_strides: list[int] = [1] * len(descriptor_shape)
+        for axis in range(len(descriptor_shape) - 2, -1, -1):
+            descriptor_strides[axis] = (
+                descriptor_strides[axis + 1] * descriptor_shape[axis + 1]
+            )
+        lane_count = _product_int(list(lane_shape)) if lane_shape else 1
+        expected_strides = tuple(stride * lane_count for stride in logical_strides)
+        if any(
+            descriptor_stride != expected_stride
+            and not (logical_shape[axis] == 1 and logical_strides[axis] == 0)
+            for axis, (descriptor_stride, expected_stride) in enumerate(
+                zip(descriptor_strides[: len(logical_shape)], expected_strides)
+            )
+        ):
+            raise ValueError(
+                "PyNTT local descriptor strides do not represent its TIR buffer: "
+                f"descriptor_shape={descriptor_shape}, "
+                f"descriptor_strides={tuple(descriptor_strides)}, "
+                f"logical_strides={logical_strides}, lanes={lane_shape}"
+            )
+        if any(
+            descriptor_shape[axis] < logical_shape[axis]
+            for axis in range(len(logical_shape))
+        ):
+            raise ValueError(
+                "PyNTT local descriptor is smaller than its logical buffer: "
+                f"descriptor_shape={descriptor_shape}, logical_shape={logical_shape}"
+            )
+        return tensor_coordinates + lane_indices
+
+    if storage_encoding in ("linear", "triton.shared.swizzled") and len(descriptor_shape) == 1:
+        lane_count = _product_int(list(lane_shape)) if lane_shape else 1
+        base_terms = [
+            _dim(base)
+            if stride == 1
+            else f"({_dim(base)}) * {stride}"
+            for base, stride in zip(base_coordinates, logical_strides)
+            if _fixed(base) != 0 and stride != 0
+        ]
+        base_offset = _join_index_terms(base_terms)
+        if lane_count != 1 and base_offset != "0":
+            base_offset = f"({base_offset}) * {lane_count}"
+        descriptor_offset = base_offset
+        if scalar_offset != "0":
+            descriptor_offset = (
+                scalar_offset
+                if descriptor_offset == "0"
+                else f"({descriptor_offset}) + ({scalar_offset})"
+            )
+        return (descriptor_offset,)
+
+    if (
+        storage_encoding == NVIDIA_MMA_SHARED_ENCODING
+        and len(logical_shape) == 2
+        and logical_shape[0] == 1
+        and lane_shape
+        and len(descriptor_shape) == 2
+    ):
+        lane_terms: list[str] = []
+        lane_stride = 1
+        for index, extent in reversed(tuple(zip(lane_indices, lane_shape))):
+            lane_terms.append(index if lane_stride == 1 else f"({index}) * {lane_stride}")
+            lane_stride *= extent
+        matrix_row = tensor_coordinates[1]
+        if tensor_coordinates[0] != "0":
+            matrix_row = (
+                f"({tensor_coordinates[0]}) * {logical_shape[1]} + "
+                f"({tensor_coordinates[1]})"
+            )
+        return matrix_row, _join_index_terms(list(reversed(lane_terms)))
+
+    raise ValueError(
+        "PyNTT local buffer descriptor cannot be addressed from its TIR coordinates: "
+        f"logical_shape={logical_shape}, lanes={lane_shape}, "
+        f"descriptor_shape={descriptor_shape}, encoding={storage_encoding!r}"
+    )
+
+
 def _direct_mma_shared_load(
     pointer: Any,
     shape: tuple[int, ...],
@@ -741,7 +1035,7 @@ def _direct_mma_shared_load(
         return None
     if _local_buffer_value(buffer, "StorageEncoding") != NVIDIA_MMA_SHARED_ENCODING:
         return None
-    if str(_local_buffer_value(buffer, "BaseScalarOffset") or "0") != "0":
+    if not _local_base_is_zero(buffer):
         return None
 
     descriptor = _local_buffer_value(buffer, "DescriptorExpression")
@@ -767,7 +1061,89 @@ def _direct_mma_shared_load(
     return f"tl.trans({load})" if transpose else load
 
 
-def _local_pointer(pointer: Any, scalar_offset: str = "0") -> str | None:
+def _direct_full_local_store(
+    pointer: Any,
+    scalar_element_count: int,
+    scalar_element_size: int,
+) -> dict[str, Any] | None:
+    """Return an exact full-view local store without indexed pointer layout."""
+
+    buffer = _local_buffer(pointer)
+    if buffer is None:
+        return None
+    descriptor = _local_buffer_value(buffer, "DescriptorExpression")
+    descriptor_shape = tuple(
+        int(value)
+        for value in (_local_buffer_value(buffer, "DescriptorShape") or ())
+    )
+    base_is_zero = _local_base_is_zero(buffer)
+    element_size = int(
+        _local_buffer_value(buffer, "ScalarElementSizeBytes") or 0
+    )
+    available_bytes = int(_local_buffer_value(buffer, "AvailableBytes") or 0)
+    required_bytes = scalar_element_count * scalar_element_size
+    if (
+        not descriptor
+        or not descriptor_shape
+        or any(extent <= 0 for extent in descriptor_shape)
+        or math.prod(descriptor_shape) != scalar_element_count
+        or not base_is_zero
+        or element_size != scalar_element_size
+        or required_bytes <= 0
+        or required_bytes > available_bytes
+    ):
+        return None
+    return {
+        "descriptor": descriptor,
+        "shape": descriptor_shape,
+    }
+
+
+def _simt_output_store_plan(
+    pointer: Any,
+    dtype: str,
+    triton_dtype: str,
+    scalar_element_count: int,
+) -> dict[str, Any]:
+    store_types = {
+        "float16": (2, "tl.uint16", "h", 16),
+        "bfloat16": (2, "tl.uint16", "h", 16),
+        "float32": (4, "tl.uint32", "r", 32),
+    }
+    if dtype not in store_types:
+        raise ValueError(
+            "The register SIMT Matmul output store supports float16, "
+            f"bfloat16, or float32, got {dtype!r}."
+        )
+    element_size, bitcast_dtype, value_constraint, bit_width = store_types[dtype]
+    full_local_store = _direct_full_local_store(
+        pointer,
+        scalar_element_count,
+        element_size,
+    )
+    if full_local_store is not None:
+        return {
+            "kind": "full_local",
+            "triton_dtype": triton_dtype,
+            **full_local_store,
+        }
+
+    address_space = int(pointer.get("AddressSpace", 1)) if isinstance(pointer, dict) else 1
+    if address_space != 1 or _local_buffer(pointer) is not None:
+        return {
+            "kind": "indexed",
+        }
+    return {
+        "kind": "global_warp_local",
+        "triton_dtype": triton_dtype,
+        "bitcast_dtype": bitcast_dtype,
+        "value_constraint": value_constraint,
+        "bit_width": bit_width,
+        "element_size": element_size,
+    }
+
+
+def _local_pointer(pointer: Any, access: Any = None) -> str | None:
     buffer = _local_buffer(pointer)
     if buffer is None:
         return None
@@ -775,46 +1151,40 @@ def _local_pointer(pointer: Any, scalar_offset: str = "0") -> str | None:
     descriptor_shape = tuple(
         int(value) for value in (_local_buffer_value(buffer, "DescriptorShape") or ())
     )
-    base_offset = str(_local_buffer_value(buffer, "BaseScalarOffset") or "0")
     if not descriptor or not descriptor_shape or any(value <= 0 for value in descriptor_shape):
         raise ValueError("PyNTT local buffer requires a descriptor and a positive physical shape")
-
-    if scalar_offset == "0":
-        total_offset = base_offset
-    elif base_offset == "0":
-        total_offset = scalar_offset
-    else:
-        total_offset = f"({base_offset}) + ({scalar_offset})"
-
-    indices = []
-    inner_stride = math.prod(descriptor_shape)
-    for axis, extent in enumerate(descriptor_shape):
-        inner_stride //= extent
-        index = total_offset if inner_stride == 1 else f"(({total_offset}) // {inner_stride})"
-        if axis != 0:
-            index = f"({index}) % {extent}"
-        indices.append(index)
+    indices = _local_descriptor_coordinates(buffer, access)
     suffix = "," if len(indices) == 1 else ""
-    return f"tle.gpu.local_ptr({descriptor}, ({', '.join(indices)}{suffix}))"
+    coordinate_shape = (
+        access.get("CoordinateShape", access.get("coordinate_shape"))
+        if isinstance(access, dict)
+        else None
+    )
+    shape_argument = "" if coordinate_shape is None else f", shape={coordinate_shape}"
+    return (
+        f"tle.gpu.local_ptr({descriptor}, "
+        f"({', '.join(indices)}{suffix}){shape_argument})"
+    )
 
 
 def _access_pointer(
     model: dict[str, Any],
     name: str,
     local_name: str,
-    scalar_offset: str = "0",
+    access: Any = None,
 ) -> str:
-    return _access_pointer_value(model[name], local_name, scalar_offset)
+    return _access_pointer_value(model[name], local_name, access)
 
 
 def _access_pointer_value(
     pointer: Any,
     local_name: str,
-    scalar_offset: str = "0",
+    access: Any = None,
 ) -> str:
-    local_pointer = _local_pointer(pointer, scalar_offset)
+    local_pointer = _local_pointer(pointer, access)
     if local_pointer is not None:
         return local_pointer
+    scalar_offset = _access_scalar_offset(access)
     return local_name if scalar_offset == "0" else f"{local_name} + {scalar_offset}"
 
 
@@ -944,36 +1314,54 @@ def _region_copy_plan(
 ) -> tuple[dict[str, Any], tuple[dict[str, Any], ...]]:
     plan = model.get("CopyPlan")
     if not isinstance(plan, dict):
-        raise ValueError("TensorRegionCopy requires a normalized CopyPlan")
-    axes_value = plan.get("Axes")
-    if not isinstance(axes_value, list) or not axes_value:
-        raise ValueError("TensorRegionCopy CopyPlan requires at least one scalar axis")
-    axes = tuple(axes_value)
-    for axis, value in enumerate(axes):
-        if not isinstance(value, dict):
-            raise ValueError(f"TensorRegionCopy axis {axis} must be an object")
-        for field in (
-            "Extent",
-            "SourceScalarStride",
-            "DestinationScalarStride",
-        ):
-            if field not in value:
-                raise ValueError(
-                    f"TensorRegionCopy axis {axis} is missing {field}"
-                )
+        raise ValueError("TensorRegionCopy requires a coordinate CopyPlan")
+    extents_value = plan.get("Extents")
+    if not isinstance(extents_value, list) or not extents_value:
+        raise ValueError("TensorRegionCopy CopyPlan requires at least one extent")
+    extents = tuple(extents_value)
     for field in (
-        "SourceBaseScalarOffset",
-        "DestinationBaseScalarOffset",
+        "SourceOrigins",
+        "DestinationOrigins",
         "CoversWholeSource",
         "CoversWholeDestination",
     ):
         if field not in plan:
             raise ValueError(f"TensorRegionCopy CopyPlan is missing {field}")
-    return plan, axes
+    rank = len(model.get("SourceShape", ()))
+    lane_rank = len(model.get("VectorLaneShape", ()))
+    if len(extents) != rank + lane_rank:
+        raise ValueError(
+            "TensorRegionCopy extent rank must equal logical plus vector-lane rank: "
+            f"extents={len(extents)}, logical={rank}, lanes={lane_rank}"
+        )
+    for side in ("Source", "Destination"):
+        origins = plan[f"{side}Origins"]
+        if not isinstance(origins, list) or len(origins) != rank:
+            raise ValueError(
+                f"TensorRegionCopy {side}Origins rank must be {rank}, got "
+                f"{len(origins) if isinstance(origins, list) else 'non-list'}"
+            )
+    return plan, extents
+
+
+def _is_compact_region(
+    logical_extents: tuple[dict[str, Any], ...], strides: list[Any]
+) -> bool:
+    if len(logical_extents) != len(strides):
+        return False
+    expected_stride = 1
+    for extent, stride in reversed(tuple(zip(logical_extents, strides))):
+        fixed_extent = _constant_dim_value(extent)
+        if fixed_extent is None or fixed_extent <= 0:
+            return False
+        if _constant_dim_value(stride) != expected_stride:
+            return False
+        expected_stride *= fixed_extent
+    return True
 
 
 def _region_copy_tle_plan(model: dict[str, Any]) -> dict[str, Any] | None:
-    copy_plan, axes = _region_copy_plan(model)
+    copy_plan, extents = _region_copy_plan(model)
     operation = model.get("OperationKind", model.get("operation_kind"))
     if operation == "TileLoad":
         local_name = "destination"
@@ -989,21 +1377,19 @@ def _region_copy_tle_plan(model: dict[str, Any]) -> dict[str, Any] | None:
         local_coverage_name = "CoversWholeSource"
     else:
         return None
-    if copy_plan[local_coverage_name] is not True or len(axes) != 1:
+    if copy_plan[local_coverage_name] is not True:
         return None
 
-    scalar_capacity = _constant_dim_value(axes[0]["Extent"])
-    source_stride = _constant_dim_value(axes[0]["SourceScalarStride"])
-    destination_stride = _constant_dim_value(
-        axes[0]["DestinationScalarStride"]
-    )
-    if (
-        scalar_capacity is None
-        or scalar_capacity <= 0
-        or source_stride != 1
-        or destination_stride != 1
-    ):
+    rank = len(model["SourceShape"])
+    logical_extents = extents[:rank]
+    fixed_extents = tuple(_constant_dim_value(extent) for extent in extents)
+    if any(extent is None or extent <= 0 for extent in fixed_extents):
         return None
+    if not _is_compact_region(logical_extents, model["SourceStrides"]):
+        return None
+    if not _is_compact_region(logical_extents, model["DestinationStrides"]):
+        return None
+    scalar_capacity = math.prod(int(extent) for extent in fixed_extents)
 
     local_pointer = model[local_model_name]
     global_pointer = model[global_model_name]
@@ -1016,9 +1402,6 @@ def _region_copy_tle_plan(model: dict[str, Any]) -> dict[str, Any] | None:
     descriptor_shape = tuple(
         int(value)
         for value in (_local_buffer_value(local_buffer, "DescriptorShape") or ())
-    )
-    base_scalar_offset = str(
-        _local_buffer_value(local_buffer, "BaseScalarOffset") or "0"
     )
     scalar_element_size = int(
         _local_buffer_value(local_buffer, "ScalarElementSizeBytes") or 0
@@ -1033,12 +1416,22 @@ def _region_copy_tle_plan(model: dict[str, Any]) -> dict[str, Any] | None:
             for extent in descriptor_shape
         )
         or math.prod(descriptor_shape) != scalar_capacity
-        or base_scalar_offset != "0"
+        or not _local_base_is_zero(local_buffer)
         or scalar_element_size <= 0
         or required_bytes > available_bytes
     ):
         return None
 
+    lane_shape = tuple(int(value) for value in model.get("VectorLaneShape", ()))
+    global_origins = tuple(
+        _dim(value) for value in copy_plan[f"{global_model_name}Origins"]
+    )
+    global_access = _tensor_access(
+        global_origins,
+        model[f"{global_model_name}Strides"],
+        ("0",) * len(lane_shape),
+        lane_shape,
+    )
     return {
         "local_name": local_name,
         "local_model_name": local_model_name,
@@ -1047,33 +1440,8 @@ def _region_copy_tle_plan(model: dict[str, Any]) -> dict[str, Any] | None:
         "local_buffer": local_buffer,
         "descriptor_shape": descriptor_shape,
         "scalar_capacity": scalar_capacity,
-        "global_base_scalar_offset": copy_plan[
-            f"{global_model_name}BaseScalarOffset"
-        ],
+        "global_base_scalar_offset": global_access["ScalarOffset"],
     }
-
-
-def _region_copy_offset(
-    plan: dict[str, Any],
-    axes: tuple[dict[str, Any], ...],
-    side: str,
-    block_axis: int,
-) -> str:
-    terms: list[str] = []
-    base = plan[f"{side}BaseScalarOffset"]
-    if _fixed(base) != 0:
-        terms.append(f"({_dim(base)})")
-    stride_name = f"{side}ScalarStride"
-    for axis, value in enumerate(axes):
-        stride = value[stride_name]
-        fixed_stride = _fixed(stride)
-        if fixed_stride == 0:
-            if axis == block_axis:
-                terms.append(f"copy_idx{axis} * 0")
-            continue
-        index = f"copy_idx{axis}"
-        terms.append(index if fixed_stride == 1 else f"{index} * ({_dim(stride)})")
-    return "0" if not terms else " + ".join(terms)
 
 
 def _tensor_region_copy_template_context(model: dict[str, Any]) -> dict[str, Any]:
@@ -1082,7 +1450,7 @@ def _tensor_region_copy_template_context(model: dict[str, Any]) -> dict[str, Any
     rank = len(model["SourceShape"])
     if rank != len(model["DestinationShape"]):
         raise ValueError("TensorRegionCopy source and destination ranks must match")
-    copy_plan, axes = _region_copy_plan(model)
+    copy_plan, extents = _region_copy_plan(model)
     plan = _region_copy_tle_plan(model)
     zero_fill_descriptor = None
     if model.get("OperationKind") == "TileLoad":
@@ -1100,7 +1468,7 @@ def _tensor_region_copy_template_context(model: dict[str, Any]) -> dict[str, Any
                 )
             )
             fixed_extents = tuple(
-                _constant_dim_value(axis["Extent"]) for axis in axes
+                _constant_dim_value(extent) for extent in extents
             )
             fills_descriptor = (
                 copy_plan["CoversWholeDestination"] is True
@@ -1118,9 +1486,10 @@ def _tensor_region_copy_template_context(model: dict[str, Any]) -> dict[str, Any
                         "NVIDIA MMA TileLoad destination is missing its shared descriptor"
                     )
     context: dict[str, Any] = {
-        "axes": axes,
+        "extents": extents,
         "plan": plan,
         "rank": rank,
+        "structured_widths": None,
         "zero_fill_descriptor": zero_fill_descriptor,
         "pointers": (
             ((plan["global_name"], plan["global_model_name"]),)
@@ -1132,17 +1501,116 @@ def _tensor_region_copy_template_context(model: dict[str, Any]) -> dict[str, Any
         model[model_name] for _, model_name in context["pointers"]
     )
     if plan is None:
-        inner_axis = len(axes) - 1
+        non_unit_axes = tuple(
+            axis
+            for axis, extent in enumerate(extents)
+            if _max_value(extent) != 1
+        )
+        inner_axis = non_unit_axes[-1] if non_unit_axes else len(extents) - 1
+        local_buffers = tuple(
+            buffer
+            for buffer in (
+                _local_buffer(model["Source"]),
+                _local_buffer(model["Destination"]),
+            )
+            if buffer is not None
+        )
+        if local_buffers:
+            local_coordinate_shapes = []
+            for buffer in local_buffers:
+                logical_shape = _local_buffer_value(buffer, "LogicalShape")
+                vector_lane_shape = _local_buffer_value(buffer, "VectorLaneShape")
+                if not isinstance(logical_shape, list) or not isinstance(
+                    vector_lane_shape, list
+                ):
+                    raise ValueError(
+                        "TensorRegionCopy local buffer requires static LogicalShape "
+                        "and VectorLaneShape."
+                    )
+                coordinate_shape = tuple(
+                    int(value) for value in logical_shape + vector_lane_shape
+                )
+                if len(coordinate_shape) != len(extents) or any(
+                    value <= 0 for value in coordinate_shape
+                ):
+                    raise ValueError(
+                        "TensorRegionCopy local coordinate shape must match the "
+                        f"copy rank: shape={coordinate_shape}, rank={len(extents)}."
+                    )
+                local_coordinate_shapes.append(coordinate_shape)
+            structured_widths = []
+            for axis, extent in enumerate(extents):
+                local_capacity = min(
+                    shape[axis] for shape in local_coordinate_shapes
+                )
+                extent_capacity = _max_value(extent)
+                capacity = (
+                    local_capacity
+                    if extent_capacity is None
+                    else min(local_capacity, extent_capacity)
+                )
+                structured_widths.append(1 << (capacity - 1).bit_length())
+            required_elements = math.prod(structured_widths)
+            for buffer in local_buffers:
+                descriptor_shape = _local_buffer_value(buffer, "DescriptorShape")
+                if not isinstance(descriptor_shape, list) or any(
+                    not isinstance(value, int) or value <= 0
+                    for value in descriptor_shape
+                ):
+                    raise ValueError(
+                        "TensorRegionCopy local buffer requires a positive static "
+                        "DescriptorShape."
+                    )
+                if math.prod(descriptor_shape) < required_elements:
+                    raise ValueError(
+                        "TensorRegionCopy local descriptor cannot contain its "
+                        f"structured region: descriptor={descriptor_shape}, "
+                        f"required_elements={required_elements}."
+                    )
+            coordinate_expressions = tuple(
+                f"copy_idx{axis}" for axis in range(len(extents))
+            )
+            inner_width = str(structured_widths[inner_axis])
+            coordinate_shape = (
+                f"({', '.join(str(width) for width in structured_widths)}"
+                f"{',' if len(structured_widths) == 1 else ''})"
+            )
+        else:
+            structured_widths = None
+            inner_width = "block_size"
+            coordinate_shape = f"({inner_width},)"
+            coordinate_expressions = tuple(
+                f"copy_idx{axis}"
+                for axis in range(len(extents))
+            )
+        lane_shape = tuple(int(value) for value in model.get("VectorLaneShape", ()))
+
+        def build_access(side: str) -> dict[str, Any]:
+            origins = copy_plan[f"{side}Origins"]
+            tensor_indices = tuple(
+                _add_coordinate(origins[axis], coordinate_expressions[axis])
+                for axis in range(rank)
+            )
+            lane_indices = coordinate_expressions[rank:]
+            return _tensor_access(
+                tensor_indices,
+                model[f"{side}Strides"],
+                lane_indices,
+                lane_shape,
+                coordinate_shape,
+            )
+
         context.update(
-            destination_offset=_region_copy_offset(
-                copy_plan, axes, "Destination", inner_axis
-            ),
+            destination_access=build_access("Destination"),
+            coordinate_shape=coordinate_shape,
             inner_axis=inner_axis,
-            inner_extent=axes[inner_axis]["Extent"],
-            outer_axes=tuple(range(inner_axis)),
-            source_offset=_region_copy_offset(
-                copy_plan, axes, "Source", inner_axis
+            inner_extent=extents[inner_axis],
+            inner_width=inner_width,
+            outer_axes=tuple(
+                axis for axis in range(len(extents)) if axis != inner_axis
             ),
+            source_access=build_access("Source"),
+            structured_widths=structured_widths,
         )
         return context
 
@@ -1174,11 +1642,11 @@ def _tensor_region_copy_template_context(model: dict[str, Any]) -> dict[str, Any
         if inner_stride != 1:
             term = f"{term} * {inner_stride}"
         linear_terms.append(term)
-    global_base = plan["global_base_scalar_offset"]
+    global_base = str(plan["global_base_scalar_offset"])
     global_offset = (
         "copy_linear"
-        if _fixed(global_base) == 0
-        else f"({_dim(global_base)}) + copy_linear"
+        if global_base == "0"
+        else f"({global_base}) + copy_linear"
     )
     context.update(
         copy_shape=f"[{', '.join(str(extent) for extent in descriptor_shape)}]",
@@ -1193,7 +1661,7 @@ def _tensor_region_copy_template_context(model: dict[str, Any]) -> dict[str, Any
 def _tensor_copy_template_context(
     model: dict[str, Any], *, is_load: bool
 ) -> dict[str, Any]:
-    """Prepare TensorLoad/TensorStore address expressions for Jinja."""
+    """Prepare coordinate-native TensorLoad/TensorStore accesses for Jinja."""
 
     local_shape = model["LocalShape"]
     global_shape = model["GlobalShape"]
@@ -1202,70 +1670,79 @@ def _tensor_copy_template_context(
         "SourceStrides" if is_load else "DestinationStrides"
     )
     global_strides = explicit_global_strides or _contiguous_strides(global_shape)
-    block_axis = _select_block_axis(local_shape, local_strides)
-    vector_lane_count = int(model.get("VectorLaneCount", 1))
-
-    def axis_index(axis: int) -> str:
-        return "lane" if axis == block_axis else f"idx{axis}"
-
-    local_terms = [
-        f"{axis_index(axis)} * {_dim(local_strides[axis])}"
-        for axis in range(len(local_shape))
-    ]
-    local_offset = "0" if not local_terms else " + ".join(local_terms)
-    global_terms = [
-        f"global_idx{axis} * {_dim(global_strides[axis])}"
-        for axis in range(len(global_shape))
-    ]
-    global_offset = "0" if not global_terms else " + ".join(global_terms)
-
-    def scalar_offset(value: str) -> str:
-        return (
-            value
-            if vector_lane_count == 1
-            else f"(({value}) * {vector_lane_count} + vector_lane)"
+    if len(local_shape) != len(global_shape):
+        raise ValueError(
+            "PyNTT TensorLoad/TensorStore local/global rank mismatch: "
+            f"local={len(local_shape)}, global={len(global_shape)}"
         )
+    lane_shape = model.get("VectorLaneShape", ())
+    domain_pointer = model["Destination"] if is_load else model["Source"]
+    ctx = _coordinate_iteration_context(
+        local_shape,
+        local_strides,
+        lane_shape,
+        "PyNTT TensorLoad" if is_load else "PyNTT TensorStore",
+        domain_pointer,
+    )
+    local_access = _tensor_access(
+        ctx["tensor_coordinates"],
+        local_strides,
+        ctx["lane_coordinates"],
+        ctx["lane_shape"],
+        ctx["tile_shape"],
+    )
+    global_coordinates = tuple(
+        _add_coordinate(offset, coordinate)
+        for offset, coordinate in zip(
+            model["GlobalOffsets"], ctx["tensor_coordinates"]
+        )
+    )
+    global_access = _tensor_access(
+        global_coordinates,
+        global_strides,
+        ctx["lane_coordinates"],
+        ctx["lane_shape"],
+        ctx["tile_shape"],
+    )
+
+    def add_external_base(access: dict[str, Any], base: str) -> dict[str, Any]:
+        result = dict(access)
+        scalar_offset = _access_scalar_offset(access)
+        result["ScalarOffset"] = (
+            base if scalar_offset == "0" else f"({base}) + ({scalar_offset})"
+        )
+        return result
 
     internal_source = model.get("Source") if is_load else None
     internal_destination = model.get("Destination") if not is_load else None
     if is_load:
-        source_pool_offset = (
-            "0"
-            if internal_source is not None
-            else "source_pool_stride_elements * shard_index"
+        source_access = global_access if internal_source is not None else add_external_base(
+            global_access,
+            f"source_pool_stride_elements * shard_index + {model['SourceOffset']}",
         )
-        source_offsets = (
-            f"{source_pool_offset} + {model['SourceOffset']} + "
-            f"{scalar_offset(global_offset)}"
-        )
-        destination_offsets = scalar_offset(local_offset)
+        destination_access = local_access
     else:
-        destination_pool_offset = (
-            "0"
+        source_access = local_access
+        destination_access = (
+            global_access
             if internal_destination is not None
-            else "destination_pool_stride_elements * shard_index"
-        )
-        source_offsets = scalar_offset(local_offset)
-        destination_offsets = (
-            f"{destination_pool_offset} + {model['DestinationOffset']} + "
-            f"{scalar_offset(global_offset)}"
+            else add_external_base(
+                global_access,
+                f"destination_pool_stride_elements * shard_index + {model['DestinationOffset']}",
+            )
         )
 
-    return {
-        "block_axis": block_axis,
-        "block_extent": _one() if not local_shape else local_shape[block_axis],
-        "destination_offsets": destination_offsets,
-        "global_shape": global_shape,
-        "internal_destination": internal_destination,
-        "internal_source": internal_source,
-        "is_load": is_load,
-        "local_shape": local_shape,
-        "loop_axes": tuple(
-            axis for axis in range(len(local_shape)) if axis != block_axis
-        ),
-        "source_offsets": source_offsets,
-        "vector_lane_count": vector_lane_count,
-    }
+    ctx.update(
+        destination_access=destination_access,
+        global_coordinates=global_coordinates,
+        global_shape=global_shape,
+        internal_destination=internal_destination,
+        internal_source=internal_source,
+        is_load=is_load,
+        local_shape=local_shape,
+        source_access=source_access,
+    )
+    return ctx
 
 
 def _logical_shape(shape: list[Any], lane_count: int) -> list[Any]:
@@ -1282,130 +1759,836 @@ def _logical_strides(strides: list[Any], lane_count: int) -> list[Any]:
     return result
 
 
-def _vector_layout_template_context(model: dict[str, Any]) -> dict[str, Any]:
-    """Prepare pack/unpack lane decomposition without owning kernel flow."""
-
-    input_lane_count = _product_int(model["InputLanes"])
-    output_lane_count = _product_int(model["OutputLanes"])
-    domain_shape = model["OutputShape"] if model["IsPack"] else model["InputShape"]
-    domain_lane_count = output_lane_count if model["IsPack"] else input_lane_count
-
-    def axis_lane_indices(axis: int) -> list[int]:
-        return [
-            lane_index
-            for lane_index, packed_axis in enumerate(model["Axes"])
-            if packed_axis == axis
-        ]
-
-    def axis_lane_product(indices: list[int]) -> int:
-        return _product_int([model["Lanes"][lane_index] for lane_index in indices])
-
-    axis_infos = []
-    rank = len(model["InputShape"] if model["IsPack"] else model["OutputShape"])
-    for axis in range(rank):
-        indices = axis_lane_indices(axis)
-        assignments = []
-        terms = []
-        for index, lane_index in enumerate(indices):
-            suffix_stride = _product_int(model["Lanes"][lane_index + 1 :])
-            lane_expression = (
-                f"(new_lane_group) % {model['Lanes'][lane_index]}"
-                if suffix_stride == 1
-                else f"((new_lane_group) // {suffix_stride}) % {model['Lanes'][lane_index]}"
-            )
-            lane_name = f"lane{lane_index}"
-            lane_stride = axis_lane_product(indices[index + 1 :])
-            assignments.append((lane_name, lane_expression))
-            terms.append(
-                lane_name if lane_stride == 1 else f"{lane_name} * {lane_stride}"
-            )
-        axis_infos.append(
-            {
-                "assignments": tuple(assignments),
-                "lane_offset": "0" if not terms else " + ".join(terms),
-                "lane_product": axis_lane_product(indices),
-                "packed": bool(indices),
-            }
+def _validate_coordinate_lane_shape(lane_shape: list[int], context: str) -> tuple[int, ...]:
+    lanes = tuple(int(value) for value in lane_shape)
+    if any(value <= 0 or value & (value - 1) for value in lanes):
+        raise ValueError(
+            f"{context} lane dimensions must be positive powers of two, got {lanes}."
         )
+    return lanes
 
-    def tensor_offset(
-        prefix: str, strides: list[Any], lane_count: int, lane_flat: str
-    ) -> str:
-        terms = [
-            f"{prefix}{axis} * {_dim(stride)}"
-            for axis, stride in enumerate(strides)
-        ]
-        tensor = "lane_flat * 0" if not terms else " + ".join(terms)
-        return (
-            tensor
-            if lane_count == 1
-            else f"(({tensor}) * {lane_count} + {lane_flat})"
+
+def _flatten_coordinates(indices: tuple[str, ...], shape: tuple[int, ...]) -> str:
+    if len(indices) != len(shape):
+        raise ValueError(
+            "PyNTT coordinate flatten rank mismatch: "
+            f"indices={len(indices)}, shape={len(shape)}"
         )
+    terms: list[str] = []
+    stride = 1
+    for index, extent in reversed(tuple(zip(indices, shape))):
+        if index != "zero_coord":
+            terms.append(index if stride == 1 else f"({index}) * {stride}")
+        stride *= extent
+    return _join_index_terms(list(reversed(terms)))
+
+
+def _coordinate_iteration_context(
+    tensor_shape: list[Any],
+    tensor_strides: list[Any],
+    lane_shape: list[int],
+    context: str = "PyNTT elementwise",
+    domain_pointer: Any | None = None,
+) -> dict[str, Any]:
+    """Build a coordinate-native block tile without scalar unflattening."""
+
+    if len(tensor_shape) != len(tensor_strides):
+        raise ValueError(
+            "PyNTT coordinate iteration shape/stride rank mismatch: "
+            f"shape={len(tensor_shape)}, strides={len(tensor_strides)}"
+        )
+    lanes = _validate_coordinate_lane_shape(lane_shape, context)
+    lane_count = _product_int(list(lanes)) if lanes else 1
+    lane_shift = lane_count.bit_length() - 1
+
+    if tensor_shape:
+        major_axis = _select_block_axis(tensor_shape, tensor_strides)
+        major_extent = tensor_shape[major_axis]
+        loop_axes = tuple(axis for axis in range(len(tensor_shape)) if axis != major_axis)
+        tensor_coordinates = tuple(
+            f"raw_coord{axis}" for axis in range(len(tensor_shape))
+        )
+        block_tensor_coordinates = tuple(
+            f"coord{axis}" for axis in range(len(tensor_shape))
+        )
+    else:
+        major_axis = -1
+        major_extent = _one()
+        loop_axes = ()
+        tensor_coordinates = ()
+        block_tensor_coordinates = ()
+
+    local_buffer = _local_buffer(domain_pointer)
+    if local_buffer is None:
+        major_width = (
+            "block_size" if lane_shift == 0 else f"(block_size >> {lane_shift})"
+        )
+    else:
+        logical_shape = _local_buffer_value(local_buffer, "LogicalShape")
+        if not isinstance(logical_shape, list) or len(logical_shape) < len(tensor_shape):
+            raise ValueError(
+                f"{context} local logical shape must contain the iteration rank: "
+                f"logical={logical_shape}, iteration_rank={len(tensor_shape)}."
+            )
+        logical_axis_offset = len(logical_shape) - len(tensor_shape)
+        local_lanes = _validate_coordinate_lane_shape(
+            _local_buffer_value(local_buffer, "VectorLaneShape") or (),
+            f"{context} local buffer",
+        )
+        local_lane_count = _product_int(list(local_lanes)) if local_lanes else 1
+        if local_lane_count != lane_count:
+            raise ValueError(
+                f"{context} local vector lane count must match the iteration domain: "
+                f"local={local_lane_count}, iteration={lane_count}."
+            )
+        major_capacity = _max_value(logical_shape[logical_axis_offset + major_axis])
+        if major_capacity is None or major_capacity <= 0:
+            raise ValueError(
+                f"{context} local major-axis capacity must have a positive static "
+                "upper bound, got "
+                f"{logical_shape[logical_axis_offset + major_axis]}."
+            )
+        major_capacity = 1 << (major_capacity - 1).bit_length()
+        descriptor_shape = _local_buffer_value(local_buffer, "DescriptorShape")
+        if not isinstance(descriptor_shape, list) or any(
+            not isinstance(value, int) or value <= 0 for value in descriptor_shape
+        ):
+            raise ValueError(
+                f"{context} local buffer requires a positive static DescriptorShape."
+            )
+        required_elements = major_capacity * lane_count
+        for axis in loop_axes:
+            loop_capacity = _max_value(logical_shape[logical_axis_offset + axis])
+            if loop_capacity is None or loop_capacity <= 0:
+                raise ValueError(
+                    f"{context} local loop-axis capacity must have a positive static "
+                    "upper bound, got "
+                    f"{logical_shape[logical_axis_offset + axis]}."
+                )
+            required_elements *= loop_capacity
+        if math.prod(descriptor_shape) < required_elements:
+            raise ValueError(
+                f"{context} local descriptor cannot contain its structured tile: "
+                f"descriptor={descriptor_shape}, required_elements={required_elements}."
+            )
+        major_width = str(major_capacity)
+
+    lane_coordinates = tuple(
+        f"raw_lane_coord{axis}" for axis in range(len(lanes))
+    )
+    block_lane_coordinates = tuple(
+        f"lane_coord{axis}" for axis in range(len(lanes))
+    )
+    tile_extents = (major_width,) + tuple(str(value) for value in lanes)
+    tile_shape = f"({', '.join(tile_extents)}{',' if len(tile_extents) == 1 else ''})"
+    major_reshape = "" if not lanes else "[:, " + ", ".join("None" for _ in lanes) + "]"
+    lane_reshapes = []
+    for axis in range(len(lanes)):
+        dimensions = ["None"] * (len(lanes) + 1)
+        dimensions[axis + 1] = ":"
+        lane_reshapes.append("[" + ", ".join(dimensions) + "]")
 
     return {
-        "axis_infos": tuple(axis_infos),
-        "domain_lane_count": domain_lane_count,
-        "domain_shape": domain_shape,
-        "input_lane_count": input_lane_count,
-        "input_lane_flat": (
-            "lane_flat * 0"
-            if input_lane_count == 1
-            else f"lane_flat % {input_lane_count}"
-        ),
-        "input_offset": tensor_offset(
-            "in_idx", model["InputStrides"], input_lane_count,
-            "input_lane_flat" if model["IsPack"] else "lane_flat",
-        ),
-        "new_lane_group": (
-            "lane_flat"
-            if (input_lane_count if model["IsPack"] else output_lane_count) == 1
-            else f"lane_flat // {input_lane_count if model['IsPack'] else output_lane_count}"
-        ),
-        "op": "pack" if model["IsPack"] else "unpack",
-        "output_lane_count": output_lane_count,
-        "output_lane_flat": (
-            "lane_flat * 0"
-            if output_lane_count == 1
-            else f"lane_flat % {output_lane_count}"
-        ),
-        "output_offset": tensor_offset(
-            "out_idx", model["OutputStrides"], output_lane_count,
-            "lane_flat" if model["IsPack"] else "output_lane_flat",
-        ),
-        "total": _multiply_expr(_product(domain_shape), domain_lane_count),
+        "block_lane_coordinates": block_lane_coordinates,
+        "block_tensor_coordinates": block_tensor_coordinates,
+        "lane_count": lane_count,
+        "lane_coordinates": lane_coordinates,
+        "lane_reshapes": tuple(lane_reshapes),
+        "lane_shape": lanes,
+        "loop_axes": loop_axes,
+        "major_axis": major_axis,
+        "major_extent": major_extent,
+        "major_reshape": major_reshape,
+        "major_width": major_width,
+        "tensor_coordinates": tensor_coordinates,
+        "tensor_shape": tuple(tensor_shape),
+        "tile_shape": tile_shape,
     }
 
 
+def _broadcast_physical_access(
+    shape: list[Any],
+    strides: list[Any],
+    lane_shape: list[int],
+    output_shape: list[Any],
+    output_lane_shape: tuple[int, ...],
+    output_tensor_coordinates: tuple[str, ...],
+    output_lane_coordinates: tuple[str, ...],
+    coordinate_shape: str,
+) -> dict[str, Any]:
+    lanes = tuple(int(value) for value in lane_shape)
+    if len(shape) > len(output_shape):
+        raise ValueError(
+            "PyNTT elementwise operand rank exceeds output rank: "
+            f"operand={len(shape)}, output={len(output_shape)}"
+        )
+    axis_offset = len(output_shape) - len(shape)
+    tensor_coordinates = tuple(
+        "zero_coord"
+        if _is_fixed_one(extent)
+        else output_tensor_coordinates[axis_offset + axis]
+        for axis, extent in enumerate(shape)
+    )
+    if lanes:
+        if lanes != output_lane_shape:
+            raise ValueError(
+                "PyNTT elementwise vector operand lanes must match output lanes: "
+                f"operand={lanes}, output={output_lane_shape}"
+            )
+        lane_coordinates = output_lane_coordinates
+    else:
+        lane_coordinates = ()
+    return _tensor_access(
+        tensor_coordinates,
+        strides,
+        lane_coordinates,
+        lanes,
+        coordinate_shape,
+    )
 
 
-def _logical_n_index(expression: str, packed_lane_count: int, vector_lane_count: int) -> str:
-    scalar_lane_count = packed_lane_count * vector_lane_count
-    return expression if scalar_lane_count == 1 else f"(({expression}) // {scalar_lane_count})"
+def _memcopy_template_context(model: dict[str, Any]) -> dict[str, Any]:
+    """Prepare a coordinate-native copy over the destination buffer domain."""
+
+    lanes = _validate_coordinate_lane_shape(
+        model["VectorLaneShape"], "PyNTT Memcopy"
+    )
+    lane_count = _product_int(list(lanes)) if lanes else 1
+    if lane_count != int(model["VectorLaneCount"]):
+        raise ValueError(
+            "PyNTT Memcopy vector lane shape/count mismatch: "
+            f"shape={lanes}, count={model['VectorLaneCount']}."
+        )
+    ctx = _coordinate_iteration_context(
+        model["Shape"],
+        model["DestinationStrides"],
+        model["VectorLaneShape"],
+        "PyNTT Memcopy",
+        model["Destination"],
+    )
+    ctx["source_access"] = _tensor_access(
+        ctx["tensor_coordinates"],
+        model["SourceStrides"],
+        ctx["lane_coordinates"],
+        lanes,
+        ctx["tile_shape"],
+    )
+    ctx["destination_access"] = _tensor_access(
+        ctx["tensor_coordinates"],
+        model["DestinationStrides"],
+        ctx["lane_coordinates"],
+        lanes,
+        ctx["tile_shape"],
+    )
+    return ctx
 
 
-def _logical_packed_lane_index(expression: str, packed_lane_count: int, vector_lane_count: int) -> str:
-    return "0" if packed_lane_count == 1 else f"((({expression}) // {vector_lane_count}) % {packed_lane_count})"
+def _elementwise_unary_template_context(model: dict[str, Any]) -> dict[str, Any]:
+    ctx = _coordinate_iteration_context(
+        model["OutputShape"],
+        model["OutputStrides"],
+        model["OutputVectorLaneShape"],
+        domain_pointer=model["Output"],
+    )
+    ctx["input_access"] = _broadcast_physical_access(
+        model["InputShape"],
+        model["InputStrides"],
+        model["InputVectorLaneShape"],
+        model["OutputShape"],
+        ctx["lane_shape"],
+        ctx["tensor_coordinates"],
+        ctx["lane_coordinates"],
+        ctx["tile_shape"],
+    )
+    ctx["output_access"] = _tensor_access(
+        ctx["tensor_coordinates"],
+        model["OutputStrides"],
+        ctx["lane_coordinates"],
+        ctx["lane_shape"],
+        ctx["tile_shape"],
+    )
+    return ctx
 
 
-def _logical_vector_lane_index(expression: str, vector_lane_count: int) -> str:
-    return "0" if vector_lane_count == 1 else f"(({expression}) % {vector_lane_count})"
+def _elementwise_binary_template_context(model: dict[str, Any]) -> dict[str, Any]:
+    ctx = _coordinate_iteration_context(
+        model["OutputShape"],
+        model["OutputStrides"],
+        model["OutputVectorLaneShape"],
+        domain_pointer=model["Output"],
+    )
+    for prefix in ("Lhs", "Rhs"):
+        ctx[f"{prefix.lower()}_access"] = _broadcast_physical_access(
+            model[f"{prefix}Shape"],
+            model[f"{prefix}Strides"],
+            model[f"{prefix}VectorLaneShape"],
+            model["OutputShape"],
+            ctx["lane_shape"],
+            ctx["tensor_coordinates"],
+            ctx["lane_coordinates"],
+            ctx["tile_shape"],
+        )
+    ctx["output_access"] = _tensor_access(
+        ctx["tensor_coordinates"],
+        model["OutputStrides"],
+        ctx["lane_coordinates"],
+        ctx["lane_shape"],
+        ctx["tile_shape"],
+    )
+    return ctx
 
 
-def _maybe_vectorized_offset(physical_offset: str, packed_lane_index: str, vector_lane_index: str, packed_lane_count: int, vector_lane_count: int) -> str:
-    scalar_lane_count = packed_lane_count * vector_lane_count
-    return physical_offset if scalar_lane_count == 1 else f"((({physical_offset}) * {packed_lane_count} + {packed_lane_index}) * {vector_lane_count} + {vector_lane_index})"
+def _elementwise_cast_template_context(model: dict[str, Any]) -> dict[str, Any]:
+    input_lanes = _validate_coordinate_lane_shape(
+        model["InputVectorLaneShape"], "PyNTT Cast input"
+    )
+    output_lanes = _validate_coordinate_lane_shape(
+        model["OutputVectorLaneShape"], "PyNTT Cast output"
+    )
+    input_lane_count = _product_int(list(input_lanes)) if input_lanes else 1
+    output_lane_count = _product_int(list(output_lanes)) if output_lanes else 1
+    common_lane_count = max(input_lane_count, output_lane_count)
+    smaller_lane_count = min(input_lane_count, output_lane_count)
+    if common_lane_count % smaller_lane_count != 0:
+        raise ValueError(
+            "PyNTT Cast vector lane counts must divide one another: "
+            f"input={input_lane_count}, output={output_lane_count}"
+        )
+
+    vectorized_axes = tuple(int(value) for value in model["VectorizedAxes"])
+    if common_lane_count != 1 and len(vectorized_axes) != 1:
+        raise ValueError("PyNTT vector Cast requires exactly one vectorized axis")
+    vectorized_axis = vectorized_axes[0] if vectorized_axes else -1
+    if input_lane_count == common_lane_count:
+        domain_shape = model["InputShape"]
+        domain_strides = model["InputStrides"]
+    else:
+        domain_shape = model["OutputShape"]
+        domain_strides = model["OutputStrides"]
+
+    lane_ratio = common_lane_count // smaller_lane_count
+    if common_lane_count == 1:
+        domain_lane_shape: list[int] = []
+    elif lane_ratio == 1:
+        domain_lane_shape = [common_lane_count]
+    else:
+        domain_lane_shape = [lane_ratio]
+        if smaller_lane_count != 1:
+            domain_lane_shape.append(smaller_lane_count)
+    domain_pointer = model["Input"] if input_lane_count == common_lane_count else model["Output"]
+    ctx = _coordinate_iteration_context(
+        domain_shape,
+        domain_strides,
+        domain_lane_shape,
+        domain_pointer=domain_pointer,
+    )
+    domain_lane_coordinates = ctx["lane_coordinates"]
+    common_lane_index = _flatten_coordinates(
+        domain_lane_coordinates, ctx["lane_shape"]
+    )
+    prefix_index = domain_lane_coordinates[0] if lane_ratio != 1 else "zero_coord"
+    smaller_lane_index = (
+        domain_lane_coordinates[-1] if smaller_lane_count != 1 else "zero_coord"
+    )
+
+    def operand_access(prefix: str, lane_count: int, lane_shape: tuple[int, ...]) -> dict[str, Any]:
+        tensor_coordinates = list(ctx["tensor_coordinates"])
+        if lane_count != common_lane_count:
+            tensor_coordinates[vectorized_axis] = (
+                f"({tensor_coordinates[vectorized_axis]}) * {lane_ratio} + {prefix_index}"
+            )
+        lane_coordinates: tuple[str, ...]
+        if lane_count == 1:
+            lane_coordinates = ()
+        elif lane_count == common_lane_count:
+            lane_coordinates = (common_lane_index,)
+        else:
+            lane_coordinates = (smaller_lane_index,)
+        return _tensor_access(
+            tensor_coordinates,
+            model[f"{prefix}Strides"],
+            lane_coordinates,
+            lane_shape,
+            ctx["tile_shape"],
+        )
+
+    ctx["input_access"] = operand_access("Input", input_lane_count, input_lanes)
+    ctx["output_access"] = operand_access("Output", output_lane_count, output_lanes)
+    return ctx
 
 
-def _batch_offset_expression(operand_shape: list[Any], operand_strides: list[Any], output_batch_rank: int) -> str:
-    operand_batch_rank = len(operand_shape) - 2
-    axis_offset = output_batch_rank - operand_batch_rank
-    terms = []
-    for operand_axis in range(operand_batch_rank):
-        if _is_fixed_one(operand_shape[operand_axis]):
+def _where_operand_access(
+    model: dict[str, Any],
+    prefix: str,
+    ctx: dict[str, Any],
+) -> dict[str, Any]:
+    shape = model[f"{prefix}Shape"]
+    strides = model[f"{prefix}Strides"]
+    lanes = tuple(int(value) for value in model[f"{prefix}VectorLaneShape"])
+    output_shape = model["OutputShape"]
+    output_lanes = ctx["lane_shape"]
+    if lanes and lanes != output_lanes:
+        raise ValueError(
+            "PyNTT Where vector operands must be scalar or match output lanes: "
+            f"{prefix}={lanes}, output={output_lanes}"
+        )
+    if len(shape) > len(output_shape):
+        raise ValueError(
+            f"PyNTT Where {prefix} rank exceeds output rank: "
+            f"operand={len(shape)}, output={len(output_shape)}"
+        )
+    axis_offset = len(output_shape) - len(shape)
+    output_lane_count = _product_int(list(output_lanes)) if output_lanes else 1
+    output_lane_index = _flatten_coordinates(ctx["lane_coordinates"], output_lanes)
+    tensor_coordinates: list[str] = []
+    for axis, extent in enumerate(shape):
+        output_axis = axis_offset + axis
+        coordinate = ctx["tensor_coordinates"][output_axis]
+        if (
+            not lanes
+            and output_lane_count != 1
+            and output_axis == len(output_shape) - 1
+        ):
+            coordinate = (
+                f"({coordinate}) * {output_lane_count} + {output_lane_index}"
+            )
+        tensor_coordinates.append("zero_coord" if _is_fixed_one(extent) else coordinate)
+    lane_coordinates = ctx["lane_coordinates"] if lanes else ()
+    return _tensor_access(
+        tensor_coordinates,
+        strides,
+        lane_coordinates,
+        lanes,
+        ctx["tile_shape"],
+    )
+
+
+def _elementwise_where_template_context(model: dict[str, Any]) -> dict[str, Any]:
+    ctx = _coordinate_iteration_context(
+        model["OutputShape"],
+        model["OutputStrides"],
+        model["OutputVectorLaneShape"],
+        domain_pointer=model["Output"],
+    )
+    for prefix in ("Cond", "True", "False"):
+        ctx[f"{prefix.lower()}_access"] = _where_operand_access(model, prefix, ctx)
+    ctx["output_access"] = _tensor_access(
+        ctx["tensor_coordinates"],
+        model["OutputStrides"],
+        ctx["lane_coordinates"],
+        ctx["lane_shape"],
+        ctx["tile_shape"],
+    )
+    return ctx
+
+
+def _vector_layout_template_context(model: dict[str, Any]) -> dict[str, Any]:
+    """Prepare coordinate-native Pack/Unpack access mappings."""
+
+    input_shape = model["InputShape"]
+    output_shape = model["OutputShape"]
+    if len(input_shape) != len(output_shape):
+        raise ValueError(
+            "PyNTT VectorLayout requires equal input/output tensor ranks: "
+            f"input={len(input_shape)}, output={len(output_shape)}"
+        )
+
+    input_lanes = _validate_coordinate_lane_shape(
+        model["InputLanes"], "PyNTT VectorLayout input"
+    )
+    output_lanes = _validate_coordinate_lane_shape(
+        model["OutputLanes"], "PyNTT VectorLayout output"
+    )
+    packed_lanes = _validate_coordinate_lane_shape(
+        model["Lanes"], "PyNTT VectorLayout packed"
+    )
+    axes = tuple(int(value) for value in model["Axes"])
+    if len(axes) != len(packed_lanes):
+        raise ValueError(
+            "PyNTT VectorLayout axes/lanes count mismatch: "
+            f"axes={len(axes)}, lanes={len(packed_lanes)}"
+        )
+    if any(axis < 0 or axis >= len(input_shape) for axis in axes):
+        raise ValueError(
+            f"PyNTT VectorLayout axis is outside rank {len(input_shape)}: {axes}"
+        )
+
+    is_pack = bool(model["IsPack"])
+    expected_lanes = packed_lanes + (input_lanes if is_pack else output_lanes)
+    actual_lanes = output_lanes if is_pack else input_lanes
+    if actual_lanes != expected_lanes:
+        side = "output" if is_pack else "input"
+        raise ValueError(
+            f"PyNTT {'Pack' if is_pack else 'Unpack'} {side} lanes must be "
+            f"the packed-lane prefix followed by the preserved lanes: "
+            f"expected={expected_lanes}, actual={actual_lanes}"
+        )
+
+    domain_shape = output_shape if is_pack else input_shape
+    domain_strides = model["OutputStrides"] if is_pack else model["InputStrides"]
+    domain_lanes = output_lanes if is_pack else input_lanes
+    ctx = _coordinate_iteration_context(
+        domain_shape,
+        domain_strides,
+        list(domain_lanes),
+        f"PyNTT {'Pack' if is_pack else 'Unpack'}",
+        model["Output"] if is_pack else model["Input"],
+    )
+
+    expanded_tensor_coordinates = list(ctx["tensor_coordinates"])
+    bounds = []
+    for axis in range(len(input_shape)):
+        lane_indices = [
+            lane_index
+            for lane_index, packed_axis in enumerate(axes)
+            if packed_axis == axis
+        ]
+        if not lane_indices:
             continue
-        output_axis = axis_offset + operand_axis
-        terms.append(f"idx{output_axis} * {_dim(operand_strides[operand_axis])}")
-    return "0" if not terms else " + ".join(terms)
+
+        lane_product = _product_int([packed_lanes[index] for index in lane_indices])
+        terms = []
+        for position, lane_index in enumerate(lane_indices):
+            lane_stride = _product_int(
+                [packed_lanes[index] for index in lane_indices[position + 1 :]]
+            )
+            coordinate = ctx["lane_coordinates"][lane_index]
+            terms.append(
+                coordinate if lane_stride == 1 else f"({coordinate}) * {lane_stride}"
+            )
+        base = ctx["tensor_coordinates"][axis]
+        base = base if lane_product == 1 else f"({base}) * {lane_product}"
+        expanded = base if not terms else f"{base} + {' + '.join(terms)}"
+        expanded_tensor_coordinates[axis] = expanded
+        bound_shape = input_shape if is_pack else output_shape
+        bounds.append(f"({expanded}) < {_dim(bound_shape[axis])}")
+
+    preserved_lane_coordinates = ctx["lane_coordinates"][len(packed_lanes) :]
+    if is_pack:
+        input_access = _tensor_access(
+            expanded_tensor_coordinates,
+            model["InputStrides"],
+            preserved_lane_coordinates,
+            input_lanes,
+            ctx["tile_shape"],
+        )
+        output_access = _tensor_access(
+            ctx["tensor_coordinates"],
+            model["OutputStrides"],
+            ctx["lane_coordinates"],
+            output_lanes,
+            ctx["tile_shape"],
+        )
+    else:
+        input_access = _tensor_access(
+            ctx["tensor_coordinates"],
+            model["InputStrides"],
+            ctx["lane_coordinates"],
+            input_lanes,
+            ctx["tile_shape"],
+        )
+        output_access = _tensor_access(
+            expanded_tensor_coordinates,
+            model["OutputStrides"],
+            preserved_lane_coordinates,
+            output_lanes,
+            ctx["tile_shape"],
+        )
+
+    ctx.update(
+        bounds=tuple(bounds),
+        input_access=input_access,
+        op="pack" if is_pack else "unpack",
+        output_access=output_access,
+        store_mask="mask" if is_pack else "valid",
+        valid_expression="mask" + "".join(f" & ({bound})" for bound in bounds),
+    )
+    return ctx
+
+
+def _transpose_template_context(model: dict[str, Any]) -> dict[str, Any]:
+    """Prepare a coordinate-native tensor-axis permutation."""
+
+    input_shape = model["InputShape"]
+    output_shape = model["OutputShape"]
+    permutation = tuple(int(value) for value in model["Perm"])
+    rank = len(input_shape)
+    if len(output_shape) != rank or sorted(permutation) != list(range(rank)):
+        raise ValueError(
+            "PyNTT Transpose requires equal input/output ranks and a complete "
+            f"permutation: input={rank}, output={len(output_shape)}, perm={permutation}"
+        )
+
+    input_lanes = _validate_coordinate_lane_shape(
+        model["InputVectorLaneShape"], "PyNTT Transpose input"
+    )
+    output_lanes = _validate_coordinate_lane_shape(
+        model["OutputVectorLaneShape"], "PyNTT Transpose output"
+    )
+    if input_lanes != output_lanes:
+        raise ValueError(
+            "PyNTT Transpose must preserve vector lanes: "
+            f"input={input_lanes}, output={output_lanes}"
+        )
+
+    ctx = _coordinate_iteration_context(
+        output_shape,
+        model["OutputStrides"],
+        list(output_lanes),
+        "PyNTT Transpose",
+        model["Output"],
+    )
+    input_coordinates = ["zero_coord"] * rank
+    for output_axis, input_axis in enumerate(permutation):
+        input_coordinates[input_axis] = ctx["tensor_coordinates"][output_axis]
+    ctx["input_access"] = _tensor_access(
+        input_coordinates,
+        model["InputStrides"],
+        ctx["lane_coordinates"],
+        input_lanes,
+        ctx["tile_shape"],
+    )
+    ctx["output_access"] = _tensor_access(
+        ctx["tensor_coordinates"],
+        model["OutputStrides"],
+        ctx["lane_coordinates"],
+        output_lanes,
+        ctx["tile_shape"],
+    )
+    return ctx
+
+def _aligned_batch_coordinates(
+    operand_shape: list[Any], trailing_rank: int, output_batch_rank: int
+) -> tuple[str, ...]:
+    """Map an operand's broadcast batch axes to the surrounding output loops."""
+
+    operand_batch_rank = len(operand_shape) - trailing_rank
+    if operand_batch_rank < 0 or operand_batch_rank > output_batch_rank:
+        raise ValueError(
+            "PyNTT operand batch rank cannot be aligned to the output: "
+            f"operand_rank={len(operand_shape)}, trailing_rank={trailing_rank}, "
+            f"output_batch_rank={output_batch_rank}"
+        )
+    axis_offset = output_batch_rank - operand_batch_rank
+    return tuple(
+        "0" if _is_fixed_one(operand_shape[axis]) else f"idx{axis_offset + axis}"
+        for axis in range(operand_batch_rank)
+    )
+
+
+def _structured_axis_tile(
+    name: str,
+    lane_shape: tuple[int, ...] | list[int],
+    scalar_block_extent: int | str,
+    logical_extent: Any,
+    *,
+    leading_rank: int = 0,
+    trailing_rank: int = 0,
+    physical_base: str = "0",
+) -> dict[str, Any]:
+    """Describe one rectangular physical/vector axis tile for Jinja."""
+
+    lanes = _validate_coordinate_lane_shape(list(lane_shape), f"PyNTT {name}")
+    lane_count = _product_int(list(lanes)) if lanes else 1
+    if isinstance(scalar_block_extent, int):
+        if scalar_block_extent <= 0 or scalar_block_extent % lane_count != 0:
+            raise ValueError(
+                f"PyNTT {name} scalar tile must be a positive multiple of its "
+                f"vector lanes: block={scalar_block_extent}, lanes={lanes}."
+            )
+        physical_block_extent: int | str = scalar_block_extent // lane_count
+    else:
+        if not scalar_block_extent:
+            raise ValueError(f"PyNTT {name} scalar tile expression is empty.")
+        physical_block_extent = (
+            scalar_block_extent
+            if lane_count == 1
+            else f"(({scalar_block_extent}) // {lane_count})"
+        )
+    if leading_rank < 0 or trailing_rank < 0:
+        raise ValueError(
+            f"PyNTT {name} structured-axis ranks must be non-negative: "
+            f"leading={leading_rank}, trailing={trailing_rank}."
+        )
+
+    physical_position = leading_rank
+    rank = leading_rank + 1 + len(lanes) + trailing_rank
+    physical_coordinate = f"{name}_physical"
+    lane_coordinates = tuple(
+        f"{name}_lane{axis}" for axis in range(len(lanes))
+    )
+    lane_terms: list[str] = []
+    lane_stride = lane_count
+    for coordinate, extent in zip(lane_coordinates, lanes):
+        lane_stride //= extent
+        lane_terms.append(
+            coordinate if lane_stride == 1 else f"({coordinate}) * {lane_stride}"
+        )
+    logical_terms = [
+        physical_coordinate
+        if lane_count == 1
+        else f"({physical_coordinate}) * {lane_count}"
+    ]
+    logical_terms.extend(lane_terms)
+    structured_shape = (physical_block_extent,) + lanes
+    return {
+        "lane_coordinates": lane_coordinates,
+        "lane_count": lane_count,
+        "lane_shape": lanes,
+        "logical_coordinate": f"{name}_logical",
+        "logical_expression": " + ".join(logical_terms),
+        "logical_extent": logical_extent,
+        "name": name,
+        "physical_base": physical_base,
+        "physical_block_extent": physical_block_extent,
+        "physical_coordinate": physical_coordinate,
+        "physical_position": physical_position,
+        "rank": rank,
+        "scalar_block_extent": scalar_block_extent,
+        "structured_shape": structured_shape,
+    }
+
+
+def _broadcast_axis_coordinate(expression: str, rank: int, axis: int) -> str:
+    if rank <= 0 or axis < 0 or axis >= rank:
+        raise ValueError(
+            "PyNTT broadcast-axis coordinate is outside its tensor rank: "
+            f"rank={rank}, axis={axis}."
+        )
+    if rank == 1:
+        return expression
+    indices = ["None"] * rank
+    indices[axis] = ":"
+    return f"{expression}[{', '.join(indices)}]"
+
+
+def _structured_value_shape(
+    axis: dict[str, Any],
+    *,
+    leading_extents: tuple[int, ...] = (),
+    trailing_extents: tuple[int, ...] = (),
+) -> tuple[int, ...]:
+    if len(leading_extents) != axis["physical_position"]:
+        raise ValueError(
+            f"PyNTT {axis['name']} leading value rank mismatch: "
+            f"expected={axis['physical_position']}, got={len(leading_extents)}."
+        )
+    expected_trailing = axis["rank"] - axis["physical_position"] - 1 - len(
+        axis["lane_shape"]
+    )
+    if len(trailing_extents) != expected_trailing:
+        raise ValueError(
+            f"PyNTT {axis['name']} trailing value rank mismatch: "
+            f"expected={expected_trailing}, got={len(trailing_extents)}."
+        )
+    return leading_extents + axis["structured_shape"] + trailing_extents
+
+
+def _qkv_packed_lane_shape(model: dict[str, Any], *, packed: bool) -> tuple[int, ...]:
+    return (
+        (int(model["NPackedLaneCount"]), int(model["NVectorLaneCount"]))
+        if packed
+        else ()
+    )
+
+
+def _qkv_input_access(
+    model: dict[str, Any],
+    output_batch_rank: int,
+    m_expr: str,
+    k_expr: str,
+    coordinate_shape: str,
+) -> dict[str, Any]:
+    coordinates = _aligned_batch_coordinates(
+        model["InputShape"], 2, output_batch_rank
+    ) + (m_expr, k_expr)
+    return _tensor_access(
+        coordinates, model["InputStrides"], coordinate_shape=coordinate_shape
+    )
+
+
+def _qkv_weight_access(
+    model: dict[str, Any],
+    prefix: str,
+    *,
+    packed: bool,
+    output_batch_rank: int,
+    n_axis: dict[str, Any],
+    k_expr: str,
+    coordinate_shape: str,
+) -> dict[str, Any]:
+    lane_shape = _qkv_packed_lane_shape(model, packed=packed)
+    if tuple(lane_shape) != tuple(n_axis["lane_shape"]):
+        raise ValueError(
+            f"PyNTT {prefix} QKV weight lane shape does not match its N tile: "
+            f"weight={lane_shape}, tile={n_axis['lane_shape']}."
+        )
+    batch_coordinates = _aligned_batch_coordinates(
+        model[f"{prefix}WeightShape"], 2, output_batch_rank
+    )
+    matrix_coordinates = (
+        (n_axis["physical_coordinate"], k_expr)
+        if packed
+        else (k_expr, n_axis["physical_coordinate"])
+    )
+    return _tensor_access(
+        batch_coordinates + matrix_coordinates,
+        model[f"{prefix}WeightStrides"],
+        n_axis["lane_coordinates"],
+        lane_shape,
+        coordinate_shape,
+    )
+
+
+def _qkv_output_access(
+    model: dict[str, Any],
+    prefix: str,
+    *,
+    packed: bool,
+    output_batch_rank: int,
+    m_expr: str,
+    n_axis: dict[str, Any],
+    coordinate_shape: str,
+) -> dict[str, Any]:
+    lane_shape = _qkv_packed_lane_shape(model, packed=packed)
+    if tuple(lane_shape) != tuple(n_axis["lane_shape"]):
+        raise ValueError(
+            f"PyNTT {prefix} QKV output lane shape does not match its N tile: "
+            f"output={lane_shape}, tile={n_axis['lane_shape']}."
+        )
+    coordinates = _aligned_batch_coordinates(
+        model[f"{prefix}OutputShape"], 2, output_batch_rank
+    ) + (m_expr, n_axis["physical_coordinate"])
+    return _tensor_access(
+        coordinates,
+        model[f"{prefix}OutputStrides"],
+        n_axis["lane_coordinates"],
+        lane_shape,
+        coordinate_shape,
+    )
+
+
+def _qkv_bias_access(
+    model: dict[str, Any],
+    prefix: str,
+    *,
+    packed: bool,
+    n_axis: dict[str, Any],
+    coordinate_shape: str,
+) -> dict[str, Any]:
+    lane_shape = _qkv_packed_lane_shape(model, packed=packed)
+    if tuple(lane_shape) != tuple(n_axis["lane_shape"]):
+        raise ValueError(
+            f"PyNTT {prefix} QKV bias lane shape does not match its N tile: "
+            f"bias={lane_shape}, tile={n_axis['lane_shape']}."
+        )
+    return _tensor_access(
+        (n_axis["physical_coordinate"],),
+        model[f"{prefix}BiasStrides"],
+        n_axis["lane_coordinates"],
+        lane_shape,
+        coordinate_shape,
+    )
 
 
 def _qkv_parallel_linear_template_context(
@@ -1440,16 +2623,24 @@ def _qkv_parallel_linear_template_context(
         block_k = int(model["ReductionBlockK"])
         k = model["InputShape"][-1]
         m = output_shapes["Q"][-2]
+        input_coordinate_shape = _coordinate_shape(
+            (block_k,) if block_m == 1 else (block_m, block_k)
+        )
         if block_m == 1:
-            input_offset = f"offs_k * {_dim(model['InputStrides'][-1])}"
+            input_access = _qkv_input_access(
+                model, 0, "0", "offs_k", input_coordinate_shape
+            )
             input_mask = (
                 f"(0 < {_dim(m)}) & (0 < {_dim(model['InputShape'][-2])}) & "
                 f"(offs_k < {_dim(k)})"
             )
         else:
-            input_offset = (
-                f"(offs_m[:, None] * {_dim(model['InputStrides'][-2])} + "
-                f"offs_k[None, :] * {_dim(model['InputStrides'][-1])})"
+            input_access = _qkv_input_access(
+                model,
+                0,
+                "offs_m[:, None]",
+                "offs_k[None, :]",
+                input_coordinate_shape,
             )
             input_mask = (
                 f"(offs_m[:, None] < {_dim(m)}) & "
@@ -1466,51 +2657,59 @@ def _qkv_parallel_linear_template_context(
             block_n = int(model[f"Reduction{prefix}BlockN"])
             n = output_shapes[prefix][-1]
             weight_shape = model[f"{prefix}WeightShape"]
-            weight_strides = model[f"{prefix}WeightStrides"]
             weight_k = weight_shape[-1] if packed else weight_shape[-2]
-            offs_n = f"{lower}_offs_n"
-            if packed:
-                weight_offset = _packed_qkv_weight_offsets(
-                    model,
-                    prefix,
-                    "0",
-                    f"{offs_n}[:, None]"
-                    if block_m == 1
-                    else f"{offs_n}[None, :]",
-                    "offs_k[None, :]" if block_m == 1 else "offs_k[:, None]",
-                )
-            elif block_m == 1:
-                weight_offset = (
-                    f"(offs_k[None, :] * {_dim(weight_strides[-2])} + "
-                    f"{offs_n}[:, None] * {_dim(weight_strides[-1])})"
-                )
-            else:
-                weight_offset = (
-                    f"(offs_k[:, None] * {_dim(weight_strides[-2])} + "
-                    f"{offs_n}[None, :] * {_dim(weight_strides[-1])})"
-                )
+            n_axis = _structured_axis_tile(
+                f"{lower}_n",
+                _qkv_packed_lane_shape(model, packed=packed),
+                block_n,
+                n,
+                leading_rank=0 if block_m == 1 else 1,
+                trailing_rank=1 if block_m == 1 else 0,
+            )
+            k_coordinate = _broadcast_axis_coordinate(
+                "offs_k", n_axis["rank"], n_axis["rank"] - 1 if block_m == 1 else 0
+            )
             if block_m == 1:
                 weight_mask = (
-                    f"({offs_n}[:, None] < {_dim(n)}) & "
-                    f"(offs_k[None, :] < {_dim(k)}) & "
-                    f"(offs_k[None, :] < {_dim(weight_k)})"
+                    f"({n_axis['logical_coordinate']} < {_dim(n)}) & "
+                    f"({k_coordinate} < {_dim(k)}) & "
+                    f"({k_coordinate} < {_dim(weight_k)})"
+                )
+                matrix_shape = (block_n, block_k)
+                structured_shape = _structured_value_shape(
+                    n_axis, trailing_extents=(block_k,)
                 )
             else:
                 weight_mask = (
-                    f"(offs_k[:, None] < {_dim(k)}) & "
-                    f"(offs_k[:, None] < {_dim(weight_k)}) & "
-                    f"({offs_n}[None, :] < {_dim(n)})"
+                    f"({k_coordinate} < {_dim(k)}) & "
+                    f"({k_coordinate} < {_dim(weight_k)}) & "
+                    f"({n_axis['logical_coordinate']} < {_dim(n)})"
                 )
+                matrix_shape = (block_k, block_n)
+                structured_shape = _structured_value_shape(
+                    n_axis, leading_extents=(block_k,)
+                )
+            weight_access = _qkv_weight_access(
+                model,
+                prefix,
+                packed=packed,
+                output_batch_rank=0,
+                n_axis=n_axis,
+                k_expr=k_coordinate,
+                coordinate_shape=_coordinate_shape(structured_shape),
+            )
             projections.append(
                 {
                     "accumulator": accumulator,
                     "block_n": block_n,
                     "lower": lower,
+                    "matrix_shape": matrix_shape,
                     "n": n,
-                    "offs_n": offs_n,
+                    "n_axis": n_axis,
                     "prefix": prefix,
+                    "structured_shape": structured_shape,
                     "weight_mask": weight_mask,
-                    "weight_offset": weight_offset,
+                    "weight_access": weight_access,
                     "weight_direct_load": (
                         _direct_mma_shared_load(
                             model[f"{prefix}Weight"],
@@ -1531,7 +2730,7 @@ def _qkv_parallel_linear_template_context(
                 else ""
             ),
             input_mask=input_mask,
-            input_offset=input_offset,
+            input_access=input_access,
             input_direct_load=(
                 _direct_mma_shared_load(
                     model["Input"],
@@ -1561,56 +2760,67 @@ def _qkv_parallel_linear_template_context(
             lower = prefix.lower()
             block_n = int(model[f"Reduction{prefix}BlockN"])
             n = output_shapes[prefix][-1]
-            offs_n = f"{lower}_offs_n"
-            bias_offset = None
+            n_axis = _structured_axis_tile(
+                f"{lower}_n",
+                _qkv_packed_lane_shape(model, packed=packed),
+                block_n,
+                n,
+                leading_rank=0 if block_m == 1 else 1,
+            )
+            bias_structured_shape = _structured_value_shape(n_axis)
+            bias_access = None
             if model[f"Has{prefix}Bias"]:
-                bias_offset = (
-                    _packed_qkv_bias_offsets(model, prefix, offs_n)
-                    if packed
-                    else f"{offs_n} * {_dim(model[f'{prefix}BiasStrides'][-1])}"
+                bias_access = _qkv_bias_access(
+                    model,
+                    prefix,
+                    packed=packed,
+                    n_axis=n_axis,
+                    coordinate_shape=_coordinate_shape(bias_structured_shape),
                 )
             if block_m == 1:
-                output_offset = (
-                    _packed_qkv_output_offsets(model, prefix, "0", offs_n, "0")
-                    if packed
-                    else (
-                        f"(0 * {_dim(model[f'{prefix}OutputStrides'][-2])} + "
-                        f"{offs_n} * {_dim(model[f'{prefix}OutputStrides'][-1])})"
-                    )
+                output_structured_shape = bias_structured_shape
+                output_access = _qkv_output_access(
+                    model,
+                    prefix,
+                    packed=packed,
+                    output_batch_rank=0,
+                    m_expr="0",
+                    n_axis=n_axis,
+                    coordinate_shape=_coordinate_shape(output_structured_shape),
                 )
-                output_mask = f"{offs_n} < {_dim(n)}"
+                output_mask = f"{n_axis['logical_coordinate']} < {_dim(n)}"
             else:
-                output_offset = (
-                    _packed_qkv_output_offsets(
-                        model,
-                        prefix,
-                        "0",
-                        f"{offs_n}[None, :]",
-                        "offs_m[:, None]",
-                    )
-                    if packed
-                    else (
-                        f"(offs_m[:, None] * "
-                        f"{_dim(model[f'{prefix}OutputStrides'][-2])} + "
-                        f"{offs_n}[None, :] * "
-                        f"{_dim(model[f'{prefix}OutputStrides'][-1])})"
-                    )
+                m_coordinate = _broadcast_axis_coordinate(
+                    "offs_m", n_axis["rank"], 0
+                )
+                output_structured_shape = _structured_value_shape(
+                    n_axis, leading_extents=(block_m,)
+                )
+                output_access = _qkv_output_access(
+                    model,
+                    prefix,
+                    packed=packed,
+                    output_batch_rank=0,
+                    m_expr=m_coordinate,
+                    n_axis=n_axis,
+                    coordinate_shape=_coordinate_shape(output_structured_shape),
                 )
                 output_mask = (
-                    f"(offs_m[:, None] < {_dim(output_shapes[prefix][-2])}) & "
-                    f"({offs_n}[None, :] < {_dim(n)})"
+                    f"({m_coordinate} < {_dim(output_shapes[prefix][-2])}) & "
+                    f"({n_axis['logical_coordinate']} < {_dim(n)})"
                 )
             projections.append(
                 {
                     "accumulator": accumulator,
-                    "bias_offset": bias_offset,
+                    "bias_access": bias_access,
                     "block_n": block_n,
                     "has_bias": model[f"Has{prefix}Bias"],
                     "lower": lower,
                     "n": n,
-                    "offs_n": offs_n,
+                    "n_axis": n_axis,
                     "output_mask": output_mask,
-                    "output_offset": output_offset,
+                    "output_access": output_access,
+                    "output_structured_shape": output_structured_shape,
                     "prefix": prefix,
                 }
             )
@@ -1632,9 +2842,6 @@ def _qkv_parallel_linear_template_context(
     m = logical_output_shapes["Q"][-2]
     k = model["InputShape"][-1]
     output_batch_rank = len(model["QOutputShape"]) - 2
-    input_batch_offset = _batch_offset_expression(
-        model["InputShape"], model["InputStrides"], output_batch_rank
-    )
     use_gemv = (_max_value(m) == 1) or (_fixed(m) == 1)
     if use_gemv:
         block_m = 1
@@ -1660,143 +2867,165 @@ def _qkv_parallel_linear_template_context(
     for prefix in ("Q", "K", "V"):
         lower = prefix.lower()
         weight_shape = model[f"{prefix}WeightShape"]
-        output_shape = model[f"{prefix}OutputShape"]
-        weight_strides = model[f"{prefix}WeightStrides"]
-        bias_strides = model[f"{prefix}BiasStrides"]
-        output_strides = model[f"{prefix}OutputStrides"]
         has_bias = model[f"Has{prefix}Bias"]
         logical_output_shape = logical_output_shapes[prefix]
-        weight_batch_offset = _batch_offset_expression(
-            weight_shape, weight_strides, len(output_shape) - 2
-        )
-        output_batch_offset = _batch_offset_expression(
-            output_shape, output_strides, len(output_shape) - 2
-        )
         n = logical_output_shape[-1]
+        lane_shape = _qkv_packed_lane_shape(model, packed=packed)
+        weight_n_axis = _structured_axis_tile(
+            f"{lower}_weight_n",
+            lane_shape,
+            block_n,
+            n,
+            leading_rank=0 if use_gemv else 1,
+            trailing_rank=1 if use_gemv else 0,
+            physical_base=f"{lower}_n_start",
+        )
+        output_n_axis = _structured_axis_tile(
+            f"{lower}_output_n",
+            lane_shape,
+            block_n,
+            n,
+            leading_rank=0 if use_gemv else 1,
+            physical_base=f"{lower}_n_start",
+        )
+        weight_k_coordinate = _broadcast_axis_coordinate(
+            "offs_k",
+            weight_n_axis["rank"],
+            weight_n_axis["rank"] - 1 if use_gemv else 0,
+        )
+        bias_structured_shape = _structured_value_shape(output_n_axis)
         if use_gemv:
-            input_terms = [] if input_batch_offset == "0" else [input_batch_offset]
-            input_terms += [
-                f"m_idx * {_dim(model['InputStrides'][-2])}",
-                f"offs_k * {_dim(model['InputStrides'][-1])}",
-            ]
-            input_offset = f"({' + '.join(input_terms)})"
-            if packed:
-                weight_offset = _packed_qkv_weight_offsets(
+            input_coordinate_shape = _coordinate_shape((block_k,))
+            weight_structured_shape = _structured_value_shape(
+                weight_n_axis, trailing_extents=(block_k,)
+            )
+            output_structured_shape = bias_structured_shape
+            input_access = _qkv_input_access(
+                model,
+                output_batch_rank,
+                "m_idx",
+                "offs_k",
+                input_coordinate_shape,
+            )
+            weight_access = _qkv_weight_access(
+                model,
+                prefix,
+                packed=packed,
+                output_batch_rank=output_batch_rank,
+                n_axis=weight_n_axis,
+                k_expr=weight_k_coordinate,
+                coordinate_shape=_coordinate_shape(weight_structured_shape),
+            )
+            output_access = _qkv_output_access(
+                model,
+                prefix,
+                packed=packed,
+                output_batch_rank=output_batch_rank,
+                m_expr="m_idx",
+                n_axis=output_n_axis,
+                coordinate_shape=_coordinate_shape(output_structured_shape),
+            )
+            bias_access = (
+                _qkv_bias_access(
                     model,
                     prefix,
-                    weight_batch_offset,
-                    "offs_n[:, None]",
-                    "offs_k[None, :]",
+                    packed=packed,
+                    n_axis=output_n_axis,
+                    coordinate_shape=_coordinate_shape(bias_structured_shape),
                 )
-                output_offset = _packed_qkv_output_offsets(
-                    model, prefix, output_batch_offset, "offs_n", "m_idx"
-                )
-                bias_offset = (
-                    _packed_qkv_bias_offsets(model, prefix, "offs_n")
-                    if has_bias
-                    else None
-                )
-            else:
-                weight_terms = (
-                    [] if weight_batch_offset == "0" else [weight_batch_offset]
-                )
-                weight_terms += [
-                    f"offs_k[None, :] * {_dim(weight_strides[-2])}",
-                    f"offs_n[:, None] * {_dim(weight_strides[-1])}",
-                ]
-                weight_offset = f"({' + '.join(weight_terms)})"
-                output_terms = (
-                    [] if output_batch_offset == "0" else [output_batch_offset]
-                )
-                output_terms += [
-                    f"m_idx * {_dim(output_strides[-2])}",
-                    f"offs_n * {_dim(output_strides[-1])}",
-                ]
-                output_offset = f"({' + '.join(output_terms)})"
-                bias_offset = (
-                    f"offs_n * {_dim(bias_strides[-1])}" if has_bias else None
-                )
+                if has_bias
+                else None
+            )
             input_mask = f"offs_k < {_dim(k)}"
             weight_mask = (
-                f"(offs_n[:, None] < {_dim(n)}) & "
-                f"(offs_k[None, :] < {_dim(k)})"
+                f"({weight_n_axis['logical_coordinate']} < {_dim(n)}) & "
+                f"({weight_k_coordinate} < {_dim(k)})"
             )
-            output_mask = f"offs_n < {_dim(n)}"
+            output_mask = f"{output_n_axis['logical_coordinate']} < {_dim(n)}"
             bias_mask = output_mask
+            weight_matrix_shape = (block_n, block_k)
         else:
-            input_terms = [] if input_batch_offset == "0" else [input_batch_offset]
-            input_terms += [
-                f"offs_m[:, None] * {_dim(model['InputStrides'][-2])}",
-                f"offs_k[None, :] * {_dim(model['InputStrides'][-1])}",
-            ]
-            input_offset = f"({' + '.join(input_terms)})"
-            if packed:
-                weight_offset = _packed_qkv_weight_offsets(
+            input_coordinate_shape = _coordinate_shape((block_m, block_k))
+            weight_structured_shape = _structured_value_shape(
+                weight_n_axis, leading_extents=(block_k,)
+            )
+            output_structured_shape = _structured_value_shape(
+                output_n_axis, leading_extents=(block_m,)
+            )
+            input_access = _qkv_input_access(
+                model,
+                output_batch_rank,
+                "offs_m[:, None]",
+                "offs_k[None, :]",
+                input_coordinate_shape,
+            )
+            weight_access = _qkv_weight_access(
+                model,
+                prefix,
+                packed=packed,
+                output_batch_rank=output_batch_rank,
+                n_axis=weight_n_axis,
+                k_expr=weight_k_coordinate,
+                coordinate_shape=_coordinate_shape(weight_structured_shape),
+            )
+            output_m_coordinate = _broadcast_axis_coordinate(
+                "offs_m", output_n_axis["rank"], 0
+            )
+            output_access = _qkv_output_access(
+                model,
+                prefix,
+                packed=packed,
+                output_batch_rank=output_batch_rank,
+                m_expr=output_m_coordinate,
+                n_axis=output_n_axis,
+                coordinate_shape=_coordinate_shape(output_structured_shape),
+            )
+            bias_access = (
+                _qkv_bias_access(
                     model,
                     prefix,
-                    weight_batch_offset,
-                    "offs_n[None, :]",
-                    "offs_k[:, None]",
+                    packed=packed,
+                    n_axis=output_n_axis,
+                    coordinate_shape=_coordinate_shape(bias_structured_shape),
                 )
-                output_offset = _packed_qkv_output_offsets(
-                    model,
-                    prefix,
-                    output_batch_offset,
-                    "offs_n[None, :]",
-                    "offs_m[:, None]",
-                )
-                bias_offset = (
-                    _packed_qkv_bias_offsets(model, prefix, "offs_n")
-                    if has_bias
-                    else None
-                )
-            else:
-                weight_terms = (
-                    [] if weight_batch_offset == "0" else [weight_batch_offset]
-                )
-                weight_terms += [
-                    f"offs_k[:, None] * {_dim(weight_strides[-2])}",
-                    f"offs_n[None, :] * {_dim(weight_strides[-1])}",
-                ]
-                weight_offset = f"({' + '.join(weight_terms)})"
-                output_terms = (
-                    [] if output_batch_offset == "0" else [output_batch_offset]
-                )
-                output_terms += [
-                    f"offs_m[:, None] * {_dim(output_strides[-2])}",
-                    f"offs_n[None, :] * {_dim(output_strides[-1])}",
-                ]
-                output_offset = f"({' + '.join(output_terms)})"
-                bias_offset = (
-                    f"offs_n * {_dim(bias_strides[-1])}" if has_bias else None
-                )
+                if has_bias
+                else None
+            )
             input_mask = (
                 f"(offs_m[:, None] < {_dim(logical_output_shape[-2])}) & "
                 f"(offs_k[None, :] < {_dim(k)})"
             )
             weight_mask = (
-                f"(offs_k[:, None] < {_dim(k)}) & "
-                f"(offs_n[None, :] < {_dim(n)})"
+                f"({weight_k_coordinate} < {_dim(k)}) & "
+                f"({weight_n_axis['logical_coordinate']} < {_dim(n)})"
             )
             output_mask = (
-                f"(offs_m[:, None] < {_dim(logical_output_shape[-2])}) & "
-                f"(offs_n[None, :] < {_dim(n)})"
+                f"({output_m_coordinate} < {_dim(logical_output_shape[-2])}) & "
+                f"({output_n_axis['logical_coordinate']} < {_dim(n)})"
             )
-            bias_mask = f"offs_n < {_dim(n)}"
+            bias_mask = f"{output_n_axis['logical_coordinate']} < {_dim(n)}"
+            weight_matrix_shape = (block_k, block_n)
         projections.append(
             {
                 "bias_mask": bias_mask,
-                "bias_offset": bias_offset,
+                "bias_access": bias_access,
                 "has_bias": has_bias,
                 "input_mask": input_mask,
-                "input_offset": input_offset,
+                "input_access": input_access,
                 "lower": lower,
                 "n": n,
+                "output_n_axis": output_n_axis,
                 "output_mask": output_mask,
-                "output_offset": output_offset,
+                "output_access": output_access,
+                "output_structured_shape": output_structured_shape,
+                "physical_n": model[f"{prefix}OutputShape"][-1],
+                "physical_block_n": output_n_axis["physical_block_extent"],
                 "prefix": prefix,
+                "weight_matrix_shape": weight_matrix_shape,
+                "weight_n_axis": weight_n_axis,
                 "weight_mask": weight_mask,
-                "weight_offset": weight_offset,
+                "weight_access": weight_access,
+                "weight_structured_shape": weight_structured_shape,
             }
         )
     context.update(
@@ -1849,68 +3078,132 @@ def _packed_qkv_logical_output_shape(model: dict[str, Any], prefix: str) -> list
     return shape
 
 
-def _packed_qkv_weight_offsets(model: dict[str, Any], prefix: str, weight_batch_offset: str, n_expr: str, k_expr: str) -> str:
-    weight_strides = model[f"{prefix}WeightStrides"]
-    terms = [] if weight_batch_offset == "0" else [weight_batch_offset]
-    terms += [
-        f"{_logical_n_index(n_expr, model['NPackedLaneCount'], model['NVectorLaneCount'])} * {_dim(weight_strides[-2])}",
-        f"{k_expr} * {_dim(weight_strides[-1])}",
-    ]
-    return _maybe_vectorized_offset(
-        f"({' + '.join(terms)})",
-        _logical_packed_lane_index(n_expr, model["NPackedLaneCount"], model["NVectorLaneCount"]),
-        _logical_vector_lane_index(n_expr, model["NVectorLaneCount"]),
-        model["NPackedLaneCount"],
-        model["NVectorLaneCount"],
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def _matmul_glu_lane_shape(
+    model: dict[str, Any], *, packed: bool
+) -> tuple[int, ...]:
+    return (
+        (int(model["NPackedLaneCount"]), int(model["NVectorLaneCount"]))
+        if packed
+        else ()
     )
 
 
-def _packed_qkv_output_offsets(model: dict[str, Any], prefix: str, output_batch_offset: str, n_expr: str, m_expr: str) -> str:
-    output_strides = model[f"{prefix}OutputStrides"]
-    terms = [] if output_batch_offset == "0" else [output_batch_offset]
-    terms += [
-        f"{m_expr} * {_dim(output_strides[-2])}",
-        f"{_logical_n_index(n_expr, model['NPackedLaneCount'], model['NVectorLaneCount'])} * {_dim(output_strides[-1])}",
-    ]
-    return _maybe_vectorized_offset(
-        f"({' + '.join(terms)})",
-        _logical_packed_lane_index(n_expr, model["NPackedLaneCount"], model["NVectorLaneCount"]),
-        _logical_vector_lane_index(n_expr, model["NVectorLaneCount"]),
-        model["NPackedLaneCount"],
-        model["NVectorLaneCount"],
+def _matmul_glu_input_access(
+    model: dict[str, Any],
+    output_batch_rank: int,
+    m_expr: str,
+    k_expr: str,
+    coordinate_shape: str,
+) -> dict[str, Any]:
+    coordinates = _aligned_batch_coordinates(
+        model["InputShape"], 2, output_batch_rank
+    ) + (m_expr, k_expr)
+    return _tensor_access(
+        coordinates, model["InputStrides"], coordinate_shape=coordinate_shape
     )
 
 
-def _packed_qkv_bias_offsets(model: dict[str, Any], prefix: str, n_expr: str) -> str:
-    bias_strides = model[f"{prefix}BiasStrides"]
-    physical = f"({_logical_n_index(n_expr, model['NPackedLaneCount'], model['NVectorLaneCount'])} * {_dim(bias_strides[-1])})"
-    return _maybe_vectorized_offset(
-        physical,
-        _logical_packed_lane_index(n_expr, model["NPackedLaneCount"], model["NVectorLaneCount"]),
-        _logical_vector_lane_index(n_expr, model["NVectorLaneCount"]),
-        model["NPackedLaneCount"],
-        model["NVectorLaneCount"],
+def _matmul_glu_weight_access(
+    model: dict[str, Any],
+    prefix: str,
+    *,
+    packed: bool,
+    output_batch_rank: int,
+    n_axis: dict[str, Any],
+    k_expr: str,
+    coordinate_shape: str,
+) -> dict[str, Any]:
+    lane_shape = _matmul_glu_lane_shape(model, packed=packed)
+    if tuple(lane_shape) != tuple(n_axis["lane_shape"]):
+        raise ValueError(
+            f"PyNTT {prefix} MatMulGlu weight lane shape does not match its N tile: "
+            f"weight={lane_shape}, tile={n_axis['lane_shape']}."
+        )
+    batch_coordinates = _aligned_batch_coordinates(
+        model[f"{prefix}WeightShape"], 2, output_batch_rank
+    )
+    matrix_coordinates = (
+        (n_axis["physical_coordinate"], k_expr)
+        if packed
+        else (k_expr, n_axis["physical_coordinate"])
+    )
+    return _tensor_access(
+        batch_coordinates + matrix_coordinates,
+        model[f"{prefix}WeightStrides"],
+        n_axis["lane_coordinates"],
+        lane_shape,
+        coordinate_shape,
     )
 
 
+def _matmul_glu_output_access(
+    model: dict[str, Any],
+    *,
+    packed: bool,
+    output_batch_rank: int,
+    m_expr: str,
+    n_axis: dict[str, Any],
+    coordinate_shape: str,
+) -> dict[str, Any]:
+    lane_shape = _matmul_glu_lane_shape(model, packed=packed)
+    if tuple(lane_shape) != tuple(n_axis["lane_shape"]):
+        raise ValueError(
+            "PyNTT MatMulGlu output lane shape does not match its N tile: "
+            f"output={lane_shape}, tile={n_axis['lane_shape']}."
+        )
+    coordinates = _aligned_batch_coordinates(
+        model["OutputShape"], 2, output_batch_rank
+    ) + (m_expr, n_axis["physical_coordinate"])
+    return _tensor_access(
+        coordinates,
+        model["OutputStrides"],
+        n_axis["lane_coordinates"],
+        lane_shape,
+        coordinate_shape,
+    )
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+def _matmul_glu_bias_access(
+    model: dict[str, Any],
+    prefix: str,
+    *,
+    packed: bool,
+    n_axis: dict[str, Any],
+    coordinate_shape: str,
+) -> dict[str, Any]:
+    lane_shape = _matmul_glu_lane_shape(model, packed=packed)
+    if tuple(lane_shape) != tuple(n_axis["lane_shape"]):
+        raise ValueError(
+            f"PyNTT {prefix} MatMulGlu bias lane shape does not match its N tile: "
+            f"bias={lane_shape}, tile={n_axis['lane_shape']}."
+        )
+    return _tensor_access(
+        (n_axis["physical_coordinate"],),
+        model[f"{prefix}BiasStrides"],
+        n_axis["lane_coordinates"],
+        lane_shape,
+        coordinate_shape,
+    )
 
 
 def _matmul_glu_template_context(
@@ -1940,11 +3233,13 @@ def _matmul_glu_template_context(
         block_n = int(model["ReductionBlockN"])
         block_k = int(model["ReductionBlockK"])
         k = model["InputShape"][-1]
+        input_coordinate_shape = _coordinate_shape(
+            (block_k,) if block_m == 1 else (block_m, block_k)
+        )
         if block_m == 1:
             input_m, input_m_limit = _matmul_glu_input_m_index(model, "0")
-            input_offset = (
-                f"({input_m} * {_dim(model['InputStrides'][-2])} + "
-                f"offs_k * {_dim(model['InputStrides'][-1])})"
+            input_access = _matmul_glu_input_access(
+                model, 0, input_m, "offs_k", input_coordinate_shape
             )
             input_mask = (
                 f"({input_m} < {_dim(input_m_limit)}) & "
@@ -1954,9 +3249,8 @@ def _matmul_glu_template_context(
             input_m, input_m_limit = _matmul_glu_input_m_index(
                 model, "offs_m[:, None]"
             )
-            input_offset = (
-                f"({input_m} * {_dim(model['InputStrides'][-2])} + "
-                f"offs_k[None, :] * {_dim(model['InputStrides'][-1])})"
+            input_access = _matmul_glu_input_access(
+                model, 0, input_m, "offs_k[None, :]", input_coordinate_shape
             )
             input_mask = (
                 f"(offs_m[:, None] < {_dim(logical_output_shape[-2])}) & "
@@ -1965,35 +3259,56 @@ def _matmul_glu_template_context(
             )
         projections = []
         n = logical_output_shape[-1]
+        n_axis = _structured_axis_tile(
+            "n",
+            _matmul_glu_lane_shape(model, packed=packed),
+            block_n,
+            n,
+            leading_rank=0 if block_m == 1 else 1,
+            trailing_rank=1 if block_m == 1 else 0,
+        )
+        weight_k_coordinate = _broadcast_axis_coordinate(
+            "offs_k", n_axis["rank"], n_axis["rank"] - 1 if block_m == 1 else 0
+        )
+        weight_structured_shape = _structured_value_shape(
+            n_axis,
+            trailing_extents=(block_k,) if block_m == 1 else (),
+            leading_extents=() if block_m == 1 else (block_k,),
+        )
         for prefix, accumulator in (("Gate", "gate_acc"), ("Up", "up_acc")):
             weight_shape = model[f"{prefix}WeightShape"]
-            weight_strides = model[f"{prefix}WeightStrides"]
-            weight_batch_offset = _batch_offset_expression(
-                weight_shape, weight_strides, len(model["OutputShape"]) - 2
+            _, weight_n_limit = _matmul_glu_weight_n_index(
+                model,
+                prefix,
+                n_axis["logical_coordinate"],
+                packed=packed,
             )
-            weight_offset, weight_n_limit, weight_k_limit = (
-                _matmul_glu_weight_offsets(
-                    model,
-                    prefix,
-                    weight_batch_offset,
-                    "offs_n[:, None]"
-                    if block_m == 1
-                    else "offs_n[None, :]",
-                    "offs_k[None, :]" if block_m == 1 else "offs_k[:, None]",
-                    packed=packed,
-                )
+            _, weight_k_limit = _matmul_glu_weight_k_index(
+                model,
+                prefix,
+                weight_k_coordinate,
+                packed=packed,
+            )
+            weight_access = _matmul_glu_weight_access(
+                model,
+                prefix,
+                packed=packed,
+                output_batch_rank=0,
+                n_axis=n_axis,
+                k_expr=weight_k_coordinate,
+                coordinate_shape=_coordinate_shape(weight_structured_shape),
             )
             if block_m == 1:
                 weight_mask = (
-                    f"(offs_n[:, None] < {_dim(n)}) & "
-                    f"(offs_n[:, None] < {_dim(weight_n_limit)}) & "
-                    f"(offs_k[None, :] < {_dim(weight_k_limit)})"
+                    f"({n_axis['logical_coordinate']} < {_dim(n)}) & "
+                    f"({n_axis['logical_coordinate']} < {_dim(weight_n_limit)}) & "
+                    f"({weight_k_coordinate} < {_dim(weight_k_limit)})"
                 )
             else:
                 weight_mask = (
-                    f"(offs_k[:, None] < {_dim(weight_k_limit)}) & "
-                    f"(offs_n[None, :] < {_dim(n)}) & "
-                    f"(offs_n[None, :] < {_dim(weight_n_limit)})"
+                    f"({weight_k_coordinate} < {_dim(weight_k_limit)}) & "
+                    f"({n_axis['logical_coordinate']} < {_dim(n)}) & "
+                    f"({n_axis['logical_coordinate']} < {_dim(weight_n_limit)})"
                 )
             projections.append(
                 {
@@ -2001,7 +3316,7 @@ def _matmul_glu_template_context(
                     "lower": prefix.lower(),
                     "prefix": prefix,
                     "weight_mask": weight_mask,
-                    "weight_offset": weight_offset,
+                    "weight_access": weight_access,
                     "weight_direct_load": (
                         _direct_mma_shared_load(
                             model[f"{prefix}Weight"],
@@ -2023,7 +3338,7 @@ def _matmul_glu_template_context(
                 else ""
             ),
             input_mask=input_mask,
-            input_offset=input_offset,
+            input_access=input_access,
             input_direct_load=(
                 _direct_mma_shared_load(
                     model["Input"],
@@ -2032,7 +3347,9 @@ def _matmul_glu_template_context(
                 if block_m != 1
                 else None
             ),
+            n_axis=n_axis,
             projections=tuple(projections),
+            weight_matrix_shape=(block_n, block_k) if block_m == 1 else (block_k, block_n),
         )
         return context
 
@@ -2040,52 +3357,78 @@ def _matmul_glu_template_context(
         block_m = int(model["ReductionBlockM"])
         block_n = int(model["ReductionBlockN"])
         n = logical_output_shape[-1]
+        n_axis = _structured_axis_tile(
+            "n",
+            _matmul_glu_lane_shape(model, packed=packed),
+            block_n,
+            n,
+            leading_rank=0 if block_m == 1 else 1,
+        )
+        bias_structured_shape = _structured_value_shape(n_axis)
+        output_structured_shape = _structured_value_shape(
+            n_axis, leading_extents=() if block_m == 1 else (block_m,)
+        )
         biases = []
         pointer_values = [model["GateBias"], model["UpBias"], model["Output"]]
         for prefix, accumulator in (("Gate", "gate_acc"), ("Up", "up_acc")):
             if not model[f"Has{prefix}Bias"]:
                 continue
-            bias_offset = _matmul_glu_bias_offsets(
-                model, prefix, "offs_n", packed=packed
+            bias_access = _matmul_glu_bias_access(
+                model,
+                prefix,
+                packed=packed,
+                n_axis=n_axis,
+                coordinate_shape=_coordinate_shape(bias_structured_shape),
             )
             _, bias_n_limit = _matmul_glu_bias_n_index(
-                model, prefix, "offs_n", packed=packed
+                model, prefix, n_axis["logical_coordinate"], packed=packed
             )
             biases.append(
                 {
                     "accumulator": accumulator,
                     "lower": prefix.lower(),
                     "mask": (
-                        f"(offs_n < {_dim(n)}) & "
-                        f"(offs_n < {_dim(bias_n_limit)})"
+                        f"({n_axis['logical_coordinate']} < {_dim(n)}) & "
+                        f"({n_axis['logical_coordinate']} < {_dim(bias_n_limit)})"
                     ),
-                    "offset": bias_offset,
+                    "access": bias_access,
                     "prefix": prefix,
                 }
             )
         if block_m == 1:
-            output_offset = _matmul_glu_output_offsets(
-                model, "0", "offs_n", "0", packed=packed
-            )
-            output_mask = f"offs_n < {_dim(n)}"
-        else:
-            output_offset = _matmul_glu_output_offsets(
+            output_access = _matmul_glu_output_access(
                 model,
-                "0",
-                "offs_n[None, :]",
-                "offs_m[:, None]",
                 packed=packed,
+                output_batch_rank=0,
+                n_axis=n_axis,
+                m_expr="0",
+                coordinate_shape=_coordinate_shape(output_structured_shape),
+            )
+            output_mask = f"{n_axis['logical_coordinate']} < {_dim(n)}"
+        else:
+            output_m_coordinate = _broadcast_axis_coordinate(
+                "offs_m", n_axis["rank"], 0
+            )
+            output_access = _matmul_glu_output_access(
+                model,
+                packed=packed,
+                output_batch_rank=0,
+                n_axis=n_axis,
+                m_expr=output_m_coordinate,
+                coordinate_shape=_coordinate_shape(output_structured_shape),
             )
             output_mask = (
-                f"(offs_m[:, None] < {_dim(logical_output_shape[-2])}) & "
-                f"(offs_n[None, :] < {_dim(n)})"
+                f"({output_m_coordinate} < {_dim(logical_output_shape[-2])}) & "
+                f"({n_axis['logical_coordinate']} < {_dim(n)})"
             )
         context.update(
             biases=tuple(biases),
             block_m=block_m,
             block_n=block_n,
+            n_axis=n_axis,
             output_mask=output_mask,
-            output_offset=output_offset,
+            output_access=output_access,
+            output_structured_shape=output_structured_shape,
             pointer_values=tuple(pointer_values),
             result_expression=_matmul_glu_expr(model, "gate_acc", "up_acc"),
         )
@@ -2095,12 +3438,6 @@ def _matmul_glu_template_context(
     n = logical_output_shape[-1]
     k = model["InputShape"][-1]
     output_batch_rank = len(model["OutputShape"]) - 2
-    input_batch_offset = _batch_offset_expression(
-        model["InputShape"], model["InputStrides"], output_batch_rank
-    )
-    output_batch_offset = _batch_offset_expression(
-        model["OutputShape"], model["OutputStrides"], output_batch_rank
-    )
     use_gemv = (_max_value(m) == 1) or (_fixed(m) == 1)
     if use_gemv:
         block_m = 1
@@ -2111,91 +3448,142 @@ def _matmul_glu_template_context(
         block_n = 128 if use_large_n else 32
         n_stages = 2 if use_large_n else 1
         input_m, input_m_limit = _matmul_glu_input_m_index(model, "m_idx")
-        input_terms = [] if input_batch_offset == "0" else [input_batch_offset]
-        input_terms += [
-            f"{input_m} * {_dim(model['InputStrides'][-2])}",
-            f"offs_k * {_dim(model['InputStrides'][-1])}",
-        ]
-        input_offset = f"({' + '.join(input_terms)})"
+        input_access = _matmul_glu_input_access(
+            model,
+            output_batch_rank,
+            input_m,
+            "offs_k",
+            _coordinate_shape((block_k,)),
+        )
         input_mask = (
             f"(m_idx < {_dim(input_m_limit)}) & (offs_k < {_dim(k)})"
-        )
-        output_offset = _matmul_glu_output_offsets(
-            model, output_batch_offset, "offs_n", "m_idx", packed=packed
         )
     else:
         block_m, block_n, block_k, n_stages = 16, 64, 64, 5
         input_m, input_m_limit = _matmul_glu_input_m_index(
             model, "offs_m[:, None]"
         )
-        input_terms = [] if input_batch_offset == "0" else [input_batch_offset]
-        input_terms += [
-            f"{input_m} * {_dim(model['InputStrides'][-2])}",
-            f"offs_k[None, :] * {_dim(model['InputStrides'][-1])}",
-        ]
-        input_offset = f"({' + '.join(input_terms)})"
+        input_access = _matmul_glu_input_access(
+            model,
+            output_batch_rank,
+            input_m,
+            "offs_k[None, :]",
+            _coordinate_shape((block_m, block_k)),
+        )
         input_mask = (
             f"(offs_m[:, None] < {_dim(m)}) & "
             f"({input_m} < {_dim(input_m_limit)}) & "
             f"(offs_k[None, :] < {_dim(k)})"
         )
-        output_offset = _matmul_glu_output_offsets(
-            model,
-            output_batch_offset,
-            "offs_n[None, :]",
-            "offs_m[:, None]",
-            packed=packed,
-        )
+    lane_shape = _matmul_glu_lane_shape(model, packed=packed)
+    weight_n_axis = _structured_axis_tile(
+        "weight_n",
+        lane_shape,
+        block_n,
+        n,
+        leading_rank=0 if use_gemv else 1,
+        trailing_rank=1 if use_gemv else 0,
+        physical_base="n_start",
+    )
+    output_n_axis = _structured_axis_tile(
+        "output_n",
+        lane_shape,
+        block_n,
+        n,
+        leading_rank=0 if use_gemv else 1,
+        physical_base="n_start",
+    )
+    weight_k_coordinate = _broadcast_axis_coordinate(
+        "offs_k",
+        weight_n_axis["rank"],
+        weight_n_axis["rank"] - 1 if use_gemv else 0,
+    )
+    output_m_coordinate = (
+        "m_idx"
+        if use_gemv
+        else _broadcast_axis_coordinate("offs_m", output_n_axis["rank"], 0)
+    )
+    weight_structured_shape = _structured_value_shape(
+        weight_n_axis,
+        trailing_extents=(block_k,) if use_gemv else (),
+        leading_extents=() if use_gemv else (block_k,),
+    )
+    bias_structured_shape = _structured_value_shape(output_n_axis)
+    output_structured_shape = _structured_value_shape(
+        output_n_axis,
+        leading_extents=() if use_gemv else (block_m,),
+    )
+    output_access = _matmul_glu_output_access(
+        model,
+        packed=packed,
+        output_batch_rank=output_batch_rank,
+        n_axis=output_n_axis,
+        m_expr=output_m_coordinate,
+        coordinate_shape=_coordinate_shape(output_structured_shape),
+    )
     projections = []
     for prefix, accumulator in (("Gate", "gate_acc"), ("Up", "up_acc")):
         weight_shape = model[f"{prefix}WeightShape"]
-        weight_strides = model[f"{prefix}WeightStrides"]
-        weight_batch_offset = _batch_offset_expression(
-            weight_shape, weight_strides, output_batch_rank
-        )
-        weight_offset, weight_n_limit, weight_k_limit = _matmul_glu_weight_offsets(
+        _, weight_n_limit = _matmul_glu_weight_n_index(
             model,
             prefix,
-            weight_batch_offset,
-            "offs_n[:, None]" if use_gemv else "offs_n[None, :]",
-            "offs_k[None, :]" if use_gemv else "offs_k[:, None]",
+            weight_n_axis["logical_coordinate"],
             packed=packed,
+        )
+        _, weight_k_limit = _matmul_glu_weight_k_index(
+            model,
+            prefix,
+            weight_k_coordinate,
+            packed=packed,
+        )
+        weight_access = _matmul_glu_weight_access(
+            model,
+            prefix,
+            packed=packed,
+            output_batch_rank=output_batch_rank,
+            n_axis=weight_n_axis,
+            k_expr=weight_k_coordinate,
+            coordinate_shape=_coordinate_shape(weight_structured_shape),
         )
         if use_gemv:
             weight_mask = (
-                f"(offs_n[:, None] < {_dim(n)}) & "
-                f"(offs_n[:, None] < {_dim(weight_n_limit)}) & "
-                f"(offs_k[None, :] < {_dim(weight_k_limit)})"
+                f"({weight_n_axis['logical_coordinate']} < {_dim(n)}) & "
+                f"({weight_n_axis['logical_coordinate']} < {_dim(weight_n_limit)}) & "
+                f"({weight_k_coordinate} < {_dim(weight_k_limit)})"
             )
         else:
             weight_mask = (
-                f"(offs_k[:, None] < {_dim(weight_k_limit)}) & "
-                f"(offs_n[None, :] < {_dim(n)}) & "
-                f"(offs_n[None, :] < {_dim(weight_n_limit)})"
+                f"({weight_k_coordinate} < {_dim(weight_k_limit)}) & "
+                f"({weight_n_axis['logical_coordinate']} < {_dim(n)}) & "
+                f"({weight_n_axis['logical_coordinate']} < {_dim(weight_n_limit)})"
             )
-        bias_offset = None
+        bias_access = None
         bias_mask = None
         if model[f"Has{prefix}Bias"]:
-            bias_offset = _matmul_glu_bias_offsets(
-                model, prefix, "offs_n", packed=packed
+            bias_access = _matmul_glu_bias_access(
+                model,
+                prefix,
+                packed=packed,
+                n_axis=output_n_axis,
+                coordinate_shape=_coordinate_shape(bias_structured_shape),
             )
             _, bias_n_limit = _matmul_glu_bias_n_index(
-                model, prefix, "offs_n", packed=packed
+                model, prefix, output_n_axis["logical_coordinate"], packed=packed
             )
             bias_mask = (
-                f"(offs_n < {_dim(n)}) & "
-                f"(offs_n < {_dim(bias_n_limit)})"
+                f"({output_n_axis['logical_coordinate']} < {_dim(n)}) & "
+                f"({output_n_axis['logical_coordinate']} < {_dim(bias_n_limit)})"
             )
         projections.append(
             {
                 "accumulator": accumulator,
                 "bias_mask": bias_mask,
-                "bias_offset": bias_offset,
+                "bias_access": bias_access,
                 "has_bias": model[f"Has{prefix}Bias"],
                 "lower": prefix.lower(),
                 "prefix": prefix,
                 "weight_mask": weight_mask,
-                "weight_offset": weight_offset,
+                "weight_access": weight_access,
             }
         )
     context.update(
@@ -2210,23 +3598,29 @@ def _matmul_glu_template_context(
             else ""
         ),
         input_mask=input_mask,
-        input_offset=input_offset,
+        input_access=input_access,
         k=k,
         m=m,
         n=n,
         n_stages=n_stages,
+        output_n_axis=output_n_axis,
         output_mask=(
-            f"offs_n < {_dim(n)}"
+            f"{output_n_axis['logical_coordinate']} < {_dim(n)}"
             if use_gemv
             else (
-                f"(offs_m[:, None] < {_dim(m)}) & "
-                f"(offs_n[None, :] < {_dim(n)})"
+                f"({output_m_coordinate} < {_dim(m)}) & "
+                f"({output_n_axis['logical_coordinate']} < {_dim(n)})"
             )
         ),
-        output_offset=output_offset,
+        output_access=output_access,
+        output_structured_shape=output_structured_shape,
+        physical_n=model["OutputShape"][-1],
+        physical_block_n=output_n_axis["physical_block_extent"],
         projections=tuple(projections),
         result_expression=_matmul_glu_expr(model, "gate_acc", "up_acc"),
         use_gemv=use_gemv,
+        weight_matrix_shape=(block_n, block_k) if use_gemv else (block_k, block_n),
+        weight_n_axis=weight_n_axis,
     )
     return context
 
@@ -2290,76 +3684,89 @@ def _matmul_glu_expr(model: dict[str, Any], gate: str, up: str) -> str:
     raise NotImplementedError(f"Unsupported MatMulGlu type: {model.get('GluType')}.")
 
 
-def _matmul_glu_weight_offsets(
+def _matmul_n_lane_shape(model: dict[str, Any], prefix: str) -> tuple[int, ...]:
+    packed_lane_count = int(model.get(f"{prefix}NPackedLaneCount", 1))
+    vector_lane_count = int(model[f"{prefix}NVectorLaneCount"])
+    if packed_lane_count > 1:
+        return packed_lane_count, vector_lane_count
+    if vector_lane_count > 1:
+        return (vector_lane_count,)
+    return ()
+
+
+def _matmul_lhs_access(
     model: dict[str, Any],
-    prefix: str,
-    weight_batch_offset: str,
-    n_expr: str,
+    output_batch_rank: int,
+    m_expr: str,
     k_expr: str,
-    *,
-    packed: bool,
-) -> tuple[str, str, str]:
-    weight_strides = model[f"{prefix}WeightStrides"]
-    weight_n, weight_n_limit = _matmul_glu_weight_n_index(model, prefix, n_expr, packed=packed)
-    weight_k, weight_k_limit = _matmul_glu_weight_k_index(model, prefix, k_expr, packed=packed)
-    terms = [] if weight_batch_offset == "0" else [weight_batch_offset]
-    if not packed:
-        terms += [
-            f"{weight_k} * {_dim(weight_strides[-2])}",
-            f"{weight_n} * {_dim(weight_strides[-1])}",
-        ]
-        return f"({' + '.join(terms)})", weight_n_limit, weight_k_limit
-
-    terms += [
-        f"{_logical_n_index(weight_n, model['NPackedLaneCount'], model['NVectorLaneCount'])} * {_dim(weight_strides[-2])}",
-        f"{weight_k} * {_dim(weight_strides[-1])}",
-    ]
-    return _maybe_vectorized_offset(
-        f"({' + '.join(terms)})",
-        _logical_packed_lane_index(weight_n, model["NPackedLaneCount"], model["NVectorLaneCount"]),
-        _logical_vector_lane_index(weight_n, model["NVectorLaneCount"]),
-        model["NPackedLaneCount"],
-        model["NVectorLaneCount"],
-    ), weight_n_limit, weight_k_limit
-
-
-def _matmul_glu_output_offsets(model: dict[str, Any], output_batch_offset: str, n_expr: str, m_expr: str, *, packed: bool) -> str:
-    output_strides = model["OutputStrides"]
-    terms = [] if output_batch_offset == "0" else [output_batch_offset]
-    n_index = _logical_n_index(n_expr, model["NPackedLaneCount"], model["NVectorLaneCount"]) if packed else n_expr
-    terms += [
-        f"{m_expr} * {_dim(output_strides[-2])}",
-        f"{n_index} * {_dim(output_strides[-1])}",
-    ]
-    physical = f"({' + '.join(terms)})"
-    if not packed:
-        return physical
-    return _maybe_vectorized_offset(
-        physical,
-        _logical_packed_lane_index(n_expr, model["NPackedLaneCount"], model["NVectorLaneCount"]),
-        _logical_vector_lane_index(n_expr, model["NVectorLaneCount"]),
-        model["NPackedLaneCount"],
-        model["NVectorLaneCount"],
+    coordinate_shape: str,
+) -> dict[str, Any]:
+    batch_coordinates = _aligned_batch_coordinates(
+        model["LhsShape"], 2, output_batch_rank
+    )
+    matrix_coordinates = (
+        (k_expr, m_expr) if model["TransposeA"] else (m_expr, k_expr)
+    )
+    return _tensor_access(
+        batch_coordinates + matrix_coordinates,
+        model["LhsStrides"],
+        coordinate_shape=coordinate_shape,
     )
 
 
-def _matmul_glu_bias_offsets(model: dict[str, Any], prefix: str, n_expr: str, *, packed: bool) -> str:
-    bias_strides = model[f"{prefix}BiasStrides"]
-    bias_n, _ = _matmul_glu_bias_n_index(model, prefix, n_expr, packed=packed)
-    if not packed:
-        return f"{bias_n} * {_dim(bias_strides[-1])}"
-    physical = f"({_logical_n_index(bias_n, model['NPackedLaneCount'], model['NVectorLaneCount'])} * {_dim(bias_strides[-1])})"
-    return _maybe_vectorized_offset(
-        physical,
-        _logical_packed_lane_index(bias_n, model["NPackedLaneCount"], model["NVectorLaneCount"]),
-        _logical_vector_lane_index(bias_n, model["NVectorLaneCount"]),
-        model["NPackedLaneCount"],
-        model["NVectorLaneCount"],
+def _matmul_rhs_access(
+    model: dict[str, Any],
+    output_batch_rank: int,
+    n_axis: dict[str, Any],
+    k_expr: str,
+    coordinate_shape: str,
+) -> dict[str, Any]:
+    lane_shape = _matmul_n_lane_shape(model, "Rhs")
+    if tuple(lane_shape) != tuple(n_axis["lane_shape"]):
+        raise ValueError(
+            "PyNTT Matmul RHS lane shape does not match its N tile: "
+            f"rhs={lane_shape}, tile={n_axis['lane_shape']}."
+        )
+    batch_coordinates = _aligned_batch_coordinates(
+        model["RhsShape"], 2, output_batch_rank
+    )
+    matrix_coordinates = (
+        (n_axis["physical_coordinate"], k_expr)
+        if model["TransposeB"]
+        else (k_expr, n_axis["physical_coordinate"])
+    )
+    return _tensor_access(
+        batch_coordinates + matrix_coordinates,
+        model["RhsStrides"],
+        n_axis["lane_coordinates"],
+        lane_shape,
+        coordinate_shape,
     )
 
 
-
-
+def _matmul_output_access(
+    model: dict[str, Any],
+    output_batch_rank: int,
+    m_expr: str,
+    n_axis: dict[str, Any],
+    coordinate_shape: str,
+) -> dict[str, Any]:
+    lane_shape = _matmul_n_lane_shape(model, "Output")
+    if tuple(lane_shape) != tuple(n_axis["lane_shape"]):
+        raise ValueError(
+            "PyNTT Matmul output lane shape does not match its N tile: "
+            f"output={lane_shape}, tile={n_axis['lane_shape']}."
+        )
+    batch_coordinates = _aligned_batch_coordinates(
+        model["OutputShape"], 2, output_batch_rank
+    )
+    return _tensor_access(
+        batch_coordinates + (m_expr, n_axis["physical_coordinate"]),
+        model["OutputStrides"],
+        n_axis["lane_coordinates"],
+        lane_shape,
+        coordinate_shape,
+    )
 
 
 def _matmul_template_context(
@@ -2393,6 +3800,34 @@ def _matmul_template_context(
         "template_name": "Gemv" if gemv else "Matmul",
     }
 
+    raw_microkernel_parameters = model.get("MicroKernelParameters", {})
+    if not isinstance(raw_microkernel_parameters, dict):
+        raise ValueError("MicroKernelParameters must be a JSON object.")
+    microkernel_parameters: dict[str, int] = {}
+    for name, value in raw_microkernel_parameters.items():
+        if not isinstance(name, str):
+            raise ValueError("MicroKernelParameters keys must be strings.")
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(
+                f"Matmul microkernel parameter {name!r} must be an integer, "
+                f"got {type(value).__name__}."
+            )
+        microkernel_parameters[name] = value
+
+    def microkernel_parameter(name: str, *, required: bool = True) -> int:
+        if name not in microkernel_parameters:
+            if required:
+                raise ValueError(
+                    f"The selected Matmul microkernel does not define parameter {name!r}."
+                )
+            return 0
+        value = microkernel_parameters[name]
+        if value <= 0:
+            raise ValueError(
+                f"Matmul microkernel parameter {name!r} must be positive, got {value}."
+            )
+        return value
+
     if reduction_phase != "complete":
         family = context["microkernel_family"]
         variant = context["microkernel_variant"]
@@ -2404,53 +3839,81 @@ def _matmul_template_context(
         if variant not in {
             "register_simt_accumulator",
             "register_mma_accumulator",
-            "shared_simt_accumulator",
-            "shared_mma_accumulator",
         }:
             raise ValueError(
                 f"Unsupported Matmul block microkernel {family}/{variant}."
+            )
+        contract_version = microkernel_parameter("contract_version")
+        if contract_version != 2:
+            raise ValueError(
+                f"Unsupported Matmul microkernel contract version {contract_version}."
             )
 
     if reduction_phase == "finalize":
         block_m = int(model["ReductionBlockM"])
         block_n = int(model["ReductionBlockN"])
+        selected_simt = (
+            context["microkernel_variant"] == "register_simt_accumulator"
+        )
+        if selected_simt and not gemv:
+            raise ValueError(
+                "The register SIMT Matmul output layout contract currently "
+                "requires GEMV."
+        )
         n = logical_output_shape[-1]
-        n_expression = "offs_n" if gemv else "offs_n[None, :]"
-        physical_n = _logical_n_index(
-            n_expression,
-            model.get("OutputNPackedLaneCount", 1),
-            model["OutputNVectorLaneCount"],
+        output_n_axis = _structured_axis_tile(
+            "output_n",
+            _matmul_n_lane_shape(model, "Output"),
+            block_n,
+            n,
+            leading_rank=0 if gemv else 1,
         )
-        m_expression = "0" if gemv else "offs_m[:, None]"
-        physical = (
-            f"({m_expression} * {_dim(model['OutputStrides'][-2])} + "
-            f"{physical_n} * {_dim(model['OutputStrides'][-1])})"
+        m_expression = (
+            "0"
+            if gemv
+            else _broadcast_axis_coordinate("offs_m", output_n_axis["rank"], 0)
         )
-        output_offsets = _maybe_vectorized_offset(
-            physical,
-            _logical_packed_lane_index(
-                n_expression,
-                model.get("OutputNPackedLaneCount", 1),
-                model["OutputNVectorLaneCount"],
-            ),
-            _logical_vector_lane_index(
-                n_expression, model["OutputNVectorLaneCount"]
-            ),
-            model.get("OutputNPackedLaneCount", 1),
-            model["OutputNVectorLaneCount"],
+        output_structured_shape = _structured_value_shape(
+            output_n_axis,
+            leading_extents=() if gemv else (block_m,),
         )
+        output_access = _matmul_output_access(
+            model,
+            0,
+            m_expression,
+            output_n_axis,
+            _coordinate_shape(output_structured_shape),
+        )
+        output_mask = (
+            f"{output_n_axis['logical_coordinate']} < {_dim(n)}"
+            if gemv
+            else f"({m_expression} < {_dim(logical_output_shape[-2])}) & "
+            f"({output_n_axis['logical_coordinate']} < {_dim(n)})"
+        )
+        output_scalar_offset = _access_scalar_offset(output_access)
+        if gemv:
+            output_scalar_offset = f"tl.reshape(({output_scalar_offset}), ({block_n},))"
         context.update(
             block_m=block_m,
             block_n=block_n,
-            inner_n=int(model.get("MicroKernelInnerN", 0)),
+            inner_n=microkernel_parameter("inner_n"),
             n=n,
-            output_mask=(
-                f"offs_n < {_dim(n)}"
-                if gemv
-                else f"(offs_m[:, None] < {_dim(logical_output_shape[-2])}) & "
-                f"(offs_n[None, :] < {_dim(n)})"
+            output_n_axis=output_n_axis,
+            selected_simt=selected_simt,
+            output_store=(
+                _simt_output_store_plan(
+                    model["Output"],
+                    str(model["OutputDType"]),
+                    str(model["OutputTritonDType"]),
+                    block_m * block_n,
+                )
+                if selected_simt
+                else {"kind": "indexed"}
             ),
-            output_offsets=output_offsets,
+            output_mask=output_mask,
+            output_access=output_access,
+            output_scalar_offset=output_scalar_offset,
+            output_structured_shape=output_structured_shape,
         )
         return context
 
@@ -2484,32 +3947,41 @@ def _matmul_template_context(
         block_m = int(model["ReductionBlockM"])
         block_n = int(model["ReductionBlockN"])
         block_k = int(model["ReductionBlockK"])
-        selected_inner_n = int(model.get("MicroKernelInnerN", 0))
+        selected_inner_n = microkernel_parameter("inner_n")
         if selected_inner_n <= 0 or selected_inner_n & (selected_inner_n - 1):
             raise ValueError(
                 "A Matmul reduction microkernel requires a positive power-of-two "
                 f"inner N tile, got inner_n={selected_inner_n}."
             )
         inner_n = min(selected_inner_n, block_n)
-        shared_accumulator = context["microkernel_variant"] in {
-            "shared_simt_accumulator",
-            "shared_mma_accumulator",
-        }
-        if shared_accumulator and not gemv:
-            raise ValueError("The shared Matmul accumulator currently requires GEMV.")
         num_warps = int(model.get("NumWarps", 0))
         if num_warps <= 0:
             raise ValueError(
                 "A Matmul reduction helper requires a positive NumWarps launch contract."
             )
-        gemv_dot_m = int(model.get("MicroKernelInnerM", 0))
-        mma_m = int(model.get("MicroKernelMmaM", 0))
-        mma_n = int(model.get("MicroKernelMmaN", 0))
-        mma_k = int(model.get("MicroKernelMmaK", 0))
-        selected_mma = context["microkernel_variant"] in {
-            "register_mma_accumulator",
-            "shared_mma_accumulator",
-        }
+        selected_simt = context["microkernel_variant"] == "register_simt_accumulator"
+        selected_inner_k = microkernel_parameter("inner_k")
+        if selected_simt:
+            if (
+                selected_inner_k > block_k
+                or selected_inner_k & (selected_inner_k - 1)
+                or block_k % selected_inner_k != 0
+            ):
+                raise ValueError(
+                    "The SIMT GEMV reduction fragment must be a power-of-two "
+                    "divisor of block K, got "
+                    f"inner_k={selected_inner_k}, block_k={block_k}."
+                )
+            if selected_inner_n != block_n:
+                raise ValueError(
+                    "The SIMT GEMV N fragment must cover the block, got "
+                    f"inner_n={selected_inner_n}, block_n={block_n}."
+                )
+        gemv_dot_m = microkernel_parameter("inner_m")
+        mma_m = microkernel_parameter("mma_m", required=False)
+        mma_n = microkernel_parameter("mma_n", required=False)
+        mma_k = microkernel_parameter("mma_k", required=False)
+        selected_mma = context["microkernel_variant"] == "register_mma_accumulator"
         if selected_mma and not (
             gemv
             and model["LhsDType"] == model["RhsDType"]
@@ -2532,26 +4004,83 @@ def _matmul_template_context(
             and inner_n >= mma_m
             and inner_n % mma_m == 0
         )
+        if selected_mma and not gemv_use_dot:
+            raise ValueError(
+                "The selected MMA GEMV contract is not legal for the emitted "
+                f"tile: block_n={block_n}, block_k={block_k}, inner_n={inner_n}, "
+                f"mma=({mma_m}, {mma_n}, {mma_k})."
+            )
+        # The SIMT microkernel owns its warp/thread lowering. Present the
+        # reduction tile with the physically contiguous RHS axis innermost so
+        # Triton propagates a coalesced consumer encoding. Packed-N and
+        # non-transposed RHS buffers are N-contiguous; scalar transposed RHS
+        # buffers are K-contiguous.
+        simt_k_first = selected_simt and (
+            not bool(model["TransposeB"]) or rhs_lane_count > 1
+        )
+        rhs_n_axis = _structured_axis_tile(
+            "rhs_n",
+            _matmul_n_lane_shape(model, "Rhs"),
+            block_n,
+            n,
+            leading_rank=1 if (not gemv or simt_k_first) else 0,
+            trailing_rank=0 if (not gemv or simt_k_first) else 1,
+        )
+        rhs_k_coordinate = _broadcast_axis_coordinate(
+            "offs_k",
+            rhs_n_axis["rank"],
+            0 if (not gemv or simt_k_first) else rhs_n_axis["rank"] - 1,
+        )
+        access_k = selected_inner_k if selected_simt else block_k
+        lhs_coordinate_shape = _coordinate_shape(
+            (access_k,) if gemv else (block_m, access_k)
+        )
+        rhs_structured_shape = _structured_value_shape(
+            rhs_n_axis,
+            trailing_extents=(access_k,) if gemv and not simt_k_first else (),
+            leading_extents=(access_k,) if not gemv or simt_k_first else (),
+        )
         if gemv:
-            lhs_offsets = _gemv_lhs_offsets(model, "0")
-            rhs_offsets = _gemv_rhs_offsets(model, "0")
+            lhs_access = _matmul_lhs_access(
+                model, 0, "m_idx", "offs_k", lhs_coordinate_shape
+            )
+            rhs_access = _matmul_rhs_access(
+                model,
+                0,
+                rhs_n_axis,
+                rhs_k_coordinate,
+                _coordinate_shape(rhs_structured_shape),
+            )
             rhs_mask = (
-                f"(offs_n[:, None] < {_dim(n)}) & "
-                f"(offs_n[:, None] < {_dim(rhs_n)}) & "
-                f"(offs_k[None, :] < {_dim(lhs_k)}) & "
-                f"(offs_k[None, :] < {_dim(rhs_k)})"
+                f"({rhs_n_axis['logical_coordinate']} < {_dim(n)}) & "
+                f"({rhs_n_axis['logical_coordinate']} < {_dim(rhs_n)}) & "
+                f"({rhs_k_coordinate} < {_dim(lhs_k)}) & "
+                f"({rhs_k_coordinate} < {_dim(rhs_k)})"
             )
             lhs_mask = (
                 f"(0 < {_dim(m)}) & (0 < {_dim(lhs_m)}) & "
                 f"(offs_k < {_dim(lhs_k)})"
             )
         else:
-            lhs_offsets, rhs_offsets, _ = _matmul_offsets(model, "0", "0", "0")
+            lhs_access = _matmul_lhs_access(
+                model,
+                0,
+                "offs_m[:, None]",
+                "offs_k[None, :]",
+                lhs_coordinate_shape,
+            )
+            rhs_access = _matmul_rhs_access(
+                model,
+                0,
+                rhs_n_axis,
+                rhs_k_coordinate,
+                _coordinate_shape(rhs_structured_shape),
+            )
             rhs_mask = (
-                f"(offs_k[:, None] < {_dim(lhs_k)}) & "
-                f"(offs_k[:, None] < {_dim(rhs_k)}) & "
-                f"(offs_n[None, :] < {_dim(n)}) & "
-                f"(offs_n[None, :] < {_dim(rhs_n)})"
+                f"({rhs_k_coordinate} < {_dim(lhs_k)}) & "
+                f"({rhs_k_coordinate} < {_dim(rhs_k)}) & "
+                f"({rhs_n_axis['logical_coordinate']} < {_dim(n)}) & "
+                f"({rhs_n_axis['logical_coordinate']} < {_dim(rhs_n)})"
             )
             lhs_mask = (
                 f"(offs_m[:, None] < {_dim(m)}) & "
@@ -2592,7 +4121,10 @@ def _matmul_template_context(
             block_n=block_n,
             gemv_dot_m=gemv_dot_m,
             gemv_use_dot=gemv_use_dot,
+            inner_k=selected_inner_k,
             inner_n=inner_n,
+            selected_simt=selected_simt,
+            simt_k_first=simt_k_first,
             dot_precision=(
                 ', input_precision="ieee"'
                 if model["LhsDType"] == "float32"
@@ -2600,25 +4132,27 @@ def _matmul_template_context(
                 else ""
             ),
             lhs_mask=lhs_mask,
-            lhs_offsets=lhs_offsets,
+            lhs_access=lhs_access,
             lhs_direct_load=lhs_direct_load,
             rhs_mask=rhs_mask,
-            rhs_offsets=rhs_offsets,
+            rhs_matrix_shape=(
+                (access_k, block_n)
+                if gemv and simt_k_first
+                else (
+                    ((block_n, access_k) if selected_simt else (block_n, block_k))
+                    if gemv
+                    else (block_k, block_n)
+                )
+            ),
+            rhs_n_axis=rhs_n_axis,
+            rhs_access=rhs_access,
             rhs_direct_load=rhs_direct_load,
+            rhs_structured_shape=rhs_structured_shape,
         )
         return context
 
     k = lhs_k
     output_batch_rank = len(logical_output_shape) - 2
-    lhs_batch_offset = _batch_offset_expression(
-        model["LhsShape"], model["LhsStrides"], output_batch_rank
-    )
-    rhs_batch_offset = _batch_offset_expression(
-        model["RhsShape"], model["RhsStrides"], output_batch_rank
-    )
-    output_batch_offset = _batch_offset_expression(
-        model["OutputShape"], model["OutputStrides"], output_batch_rank
-    )
     load_c_expression = str(model.get("LoadCExpression", "False")).strip() or "False"
     load_c = load_c_expression not in ("False", "false", "0")
     load_c_predicate = (
@@ -2631,6 +4165,13 @@ def _matmul_template_context(
         load_c_expression=load_c_expression,
         load_c_predicate=load_c_predicate,
     )
+    rhs_lane_shape = _matmul_n_lane_shape(model, "Rhs")
+    output_lane_shape = _matmul_n_lane_shape(model, "Output")
+    if rhs_lane_shape != output_lane_shape:
+        raise ValueError(
+            "PyNTT Matmul requires one structured N-axis layout for RHS and "
+            f"output, got rhs={rhs_lane_shape}, output={output_lane_shape}."
+        )
     if gemv:
         block_k = 256
         k_max = _max_value(k)
@@ -2649,26 +4190,98 @@ def _matmul_template_context(
                 else 1
             )
         )
+        rhs_n_axis = _structured_axis_tile(
+            "rhs_n",
+            rhs_lane_shape,
+            block_n,
+            n,
+            trailing_rank=1,
+            physical_base="n_start",
+        )
+        output_n_axis = _structured_axis_tile(
+            "output_n",
+            output_lane_shape,
+            block_n,
+            n,
+            physical_base="n_start",
+        )
+        rhs_k_coordinate = _broadcast_axis_coordinate(
+            "offs_k", rhs_n_axis["rank"], rhs_n_axis["rank"] - 1
+        )
+        rhs_structured_shape = _structured_value_shape(
+            rhs_n_axis, trailing_extents=(block_k,)
+        )
+        output_structured_shape = _structured_value_shape(output_n_axis)
         context.update(
             block_k=block_k,
             block_n=block_n,
             lhs_mask=f"(m_idx < {_dim(lhs_m)}) & (offs_k < {_dim(k)})",
-            lhs_offsets=_gemv_lhs_offsets(model, lhs_batch_offset),
-            n_stages=n_stages,
-            output_mask=f"offs_n < {_dim(n)}",
-            output_offsets=_gemv_output_offsets(model, output_batch_offset),
-            rhs_mask=(
-                f"(offs_n[:, None] < {_dim(n)}) & "
-                f"(offs_n[:, None] < {_dim(rhs_n)}) & "
-                f"(offs_k[None, :] < {_dim(k)}) & "
-                f"(offs_k[None, :] < {_dim(rhs_k)})"
+            lhs_access=_matmul_lhs_access(
+                model,
+                output_batch_rank,
+                "m_idx",
+                "offs_k",
+                _coordinate_shape((block_k,)),
             ),
-            rhs_offsets=_gemv_rhs_offsets(model, rhs_batch_offset),
+            n_stages=n_stages,
+            output_mask=f"{output_n_axis['logical_coordinate']} < {_dim(n)}",
+            output_n_axis=output_n_axis,
+            output_access=_matmul_output_access(
+                model,
+                output_batch_rank,
+                "m_idx",
+                output_n_axis,
+                _coordinate_shape(output_structured_shape),
+            ),
+            output_structured_shape=output_structured_shape,
+            physical_n=model["OutputShape"][-1],
+            physical_block_n=output_n_axis["physical_block_extent"],
+            rhs_mask=(
+                f"({rhs_n_axis['logical_coordinate']} < {_dim(n)}) & "
+                f"({rhs_n_axis['logical_coordinate']} < {_dim(rhs_n)}) & "
+                f"({rhs_k_coordinate} < {_dim(k)}) & "
+                f"({rhs_k_coordinate} < {_dim(rhs_k)})"
+            ),
+            rhs_access=_matmul_rhs_access(
+                model,
+                output_batch_rank,
+                rhs_n_axis,
+                rhs_k_coordinate,
+                _coordinate_shape(rhs_structured_shape),
+            ),
+            rhs_matrix_shape=(block_n, block_k),
+            rhs_n_axis=rhs_n_axis,
+            rhs_structured_shape=rhs_structured_shape,
         )
     else:
         block_m, block_n, block_k = 16, 64, 64
-        lhs_offsets, rhs_offsets, output_offsets = _matmul_offsets(
-            model, lhs_batch_offset, rhs_batch_offset, output_batch_offset
+        rhs_n_axis = _structured_axis_tile(
+            "rhs_n",
+            rhs_lane_shape,
+            block_n,
+            n,
+            leading_rank=1,
+            physical_base="n_start",
+        )
+        output_n_axis = _structured_axis_tile(
+            "output_n",
+            output_lane_shape,
+            block_n,
+            n,
+            leading_rank=1,
+            physical_base="n_start",
+        )
+        rhs_k_coordinate = _broadcast_axis_coordinate(
+            "offs_k", rhs_n_axis["rank"], 0
+        )
+        output_m_coordinate = _broadcast_axis_coordinate(
+            "offs_m", output_n_axis["rank"], 0
+        )
+        rhs_structured_shape = _structured_value_shape(
+            rhs_n_axis, leading_extents=(block_k,)
+        )
+        output_structured_shape = _structured_value_shape(
+            output_n_axis, leading_extents=(block_m,)
         )
         context.update(
             block_k=block_k,
@@ -2685,109 +4298,46 @@ def _matmul_template_context(
                 f"(offs_m[:, None] < {_dim(lhs_m)}) & "
                 f"(offs_k[None, :] < {_dim(k)})"
             ),
-            lhs_offsets=lhs_offsets,
+            lhs_access=_matmul_lhs_access(
+                model,
+                output_batch_rank,
+                "offs_m[:, None]",
+                "offs_k[None, :]",
+                _coordinate_shape((block_m, block_k)),
+            ),
             output_mask=(
-                f"(offs_m[:, None] < {_dim(m)}) & "
-                f"(offs_n[None, :] < {_dim(n)})"
+                f"({output_m_coordinate} < {_dim(m)}) & "
+                f"({output_n_axis['logical_coordinate']} < {_dim(n)})"
             ),
-            output_offsets=output_offsets,
+            output_n_axis=output_n_axis,
+            output_access=_matmul_output_access(
+                model,
+                output_batch_rank,
+                output_m_coordinate,
+                output_n_axis,
+                _coordinate_shape(output_structured_shape),
+            ),
+            output_structured_shape=output_structured_shape,
+            physical_n=model["OutputShape"][-1],
+            physical_block_n=output_n_axis["physical_block_extent"],
             rhs_mask=(
-                f"(offs_k[:, None] < {_dim(k)}) & "
-                f"(offs_k[:, None] < {_dim(rhs_k)}) & "
-                f"(offs_n[None, :] < {_dim(n)}) & "
-                f"(offs_n[None, :] < {_dim(rhs_n)})"
+                f"({rhs_k_coordinate} < {_dim(k)}) & "
+                f"({rhs_k_coordinate} < {_dim(rhs_k)}) & "
+                f"({rhs_n_axis['logical_coordinate']} < {_dim(n)}) & "
+                f"({rhs_n_axis['logical_coordinate']} < {_dim(rhs_n)})"
             ),
-            rhs_offsets=rhs_offsets,
+            rhs_access=_matmul_rhs_access(
+                model,
+                output_batch_rank,
+                rhs_n_axis,
+                rhs_k_coordinate,
+                _coordinate_shape(rhs_structured_shape),
+            ),
+            rhs_matrix_shape=(block_k, block_n),
+            rhs_n_axis=rhs_n_axis,
+            rhs_structured_shape=rhs_structured_shape,
         )
     return context
-
-
-def _matmul_offsets(model: dict[str, Any], lhs_batch_offset: str, rhs_batch_offset: str, output_batch_offset: str) -> tuple[str, str, str]:
-    lhs_terms = [] if lhs_batch_offset == "0" else [lhs_batch_offset]
-    if model["TransposeA"]:
-        lhs_terms += [f"offs_k[None, :] * {_dim(model['LhsStrides'][-2])}", f"offs_m[:, None] * {_dim(model['LhsStrides'][-1])}"]
-    else:
-        lhs_terms += [f"offs_m[:, None] * {_dim(model['LhsStrides'][-2])}", f"offs_k[None, :] * {_dim(model['LhsStrides'][-1])}"]
-    rhs_terms = [] if rhs_batch_offset == "0" else [rhs_batch_offset]
-    if model["TransposeB"]:
-        rhs_terms += [
-            f"{_logical_n_index('offs_n[None, :]', model.get('RhsNPackedLaneCount', 1), model['RhsNVectorLaneCount'])} * {_dim(model['RhsStrides'][-2])}",
-            f"offs_k[:, None] * {_dim(model['RhsStrides'][-1])}",
-        ]
-    else:
-        rhs_terms += [
-            f"offs_k[:, None] * {_dim(model['RhsStrides'][-2])}",
-            f"{_logical_n_index('offs_n[None, :]', model.get('RhsNPackedLaneCount', 1), model['RhsNVectorLaneCount'])} * {_dim(model['RhsStrides'][-1])}",
-        ]
-    lhs_offsets = f"({' + '.join(lhs_terms)})"
-    rhs_physical = f"({' + '.join(rhs_terms)})"
-    rhs_offsets = _maybe_vectorized_offset(
-        rhs_physical,
-        _logical_packed_lane_index("offs_n[None, :]", model.get("RhsNPackedLaneCount", 1), model["RhsNVectorLaneCount"]),
-        _logical_vector_lane_index("offs_n[None, :]", model["RhsNVectorLaneCount"]),
-        model.get("RhsNPackedLaneCount", 1),
-        model["RhsNVectorLaneCount"],
-    )
-    output_terms = [] if output_batch_offset == "0" else [output_batch_offset]
-    output_terms += [
-        f"offs_m[:, None] * {_dim(model['OutputStrides'][-2])}",
-        f"{_logical_n_index('offs_n[None, :]', model.get('OutputNPackedLaneCount', 1), model['OutputNVectorLaneCount'])} * {_dim(model['OutputStrides'][-1])}",
-    ]
-    output_offsets = _maybe_vectorized_offset(
-        f"({' + '.join(output_terms)})",
-        _logical_packed_lane_index("offs_n[None, :]", model.get("OutputNPackedLaneCount", 1), model["OutputNVectorLaneCount"]),
-        _logical_vector_lane_index("offs_n[None, :]", model["OutputNVectorLaneCount"]),
-        model.get("OutputNPackedLaneCount", 1),
-        model["OutputNVectorLaneCount"],
-    )
-    return lhs_offsets, rhs_offsets, output_offsets
-
-
-def _gemv_lhs_offsets(model: dict[str, Any], lhs_batch_offset: str) -> str:
-    terms = [] if lhs_batch_offset == "0" else [lhs_batch_offset]
-    if model["TransposeA"]:
-        terms += [f"offs_k * {_dim(model['LhsStrides'][-2])}", f"m_idx * {_dim(model['LhsStrides'][-1])}"]
-    else:
-        terms += [f"m_idx * {_dim(model['LhsStrides'][-2])}", f"offs_k * {_dim(model['LhsStrides'][-1])}"]
-    return f"({' + '.join(terms)})"
-
-
-def _gemv_rhs_offsets(model: dict[str, Any], rhs_batch_offset: str) -> str:
-    terms = [] if rhs_batch_offset == "0" else [rhs_batch_offset]
-    n_expr = "offs_n[:, None]"
-    k_expr = "offs_k[None, :]"
-    if model["TransposeB"]:
-        terms += [
-            f"{_logical_n_index(n_expr, model.get('RhsNPackedLaneCount', 1), model['RhsNVectorLaneCount'])} * {_dim(model['RhsStrides'][-2])}",
-            f"{k_expr} * {_dim(model['RhsStrides'][-1])}",
-        ]
-    else:
-        terms += [
-            f"{k_expr} * {_dim(model['RhsStrides'][-2])}",
-            f"{_logical_n_index(n_expr, model.get('RhsNPackedLaneCount', 1), model['RhsNVectorLaneCount'])} * {_dim(model['RhsStrides'][-1])}",
-        ]
-    return _maybe_vectorized_offset(
-        f"({' + '.join(terms)})",
-        _logical_packed_lane_index(n_expr, model.get("RhsNPackedLaneCount", 1), model["RhsNVectorLaneCount"]),
-        _logical_vector_lane_index(n_expr, model["RhsNVectorLaneCount"]),
-        model.get("RhsNPackedLaneCount", 1),
-        model["RhsNVectorLaneCount"],
-    )
-
-
-def _gemv_output_offsets(model: dict[str, Any], output_batch_offset: str) -> str:
-    terms = [] if output_batch_offset == "0" else [output_batch_offset]
-    terms += [
-        f"m_idx * {_dim(model['OutputStrides'][-2])}",
-        f"{_logical_n_index('offs_n', model.get('OutputNPackedLaneCount', 1), model['OutputNVectorLaneCount'])} * {_dim(model['OutputStrides'][-1])}",
-    ]
-    return _maybe_vectorized_offset(
-        f"({' + '.join(terms)})",
-        _logical_packed_lane_index("offs_n", model.get("OutputNPackedLaneCount", 1), model["OutputNVectorLaneCount"]),
-        _logical_vector_lane_index("offs_n", model["OutputNVectorLaneCount"]),
-        model.get("OutputNPackedLaneCount", 1),
-        model["OutputNVectorLaneCount"],
-    )
 
 
 def _reduce_template_context(model: dict[str, Any]) -> dict[str, Any]:
@@ -2937,7 +4487,7 @@ def _softmax_template_context(model: dict[str, Any]) -> dict[str, Any]:
 
 
 def _layer_norm_template_context(model: dict[str, Any]) -> dict[str, Any]:
-    """Prepare LayerNorm logical-lane and parameter address expressions."""
+    """Prepare direct physical/lane coordinates for legacy TIR LayerNorm."""
 
     logical_input_shape = _logical_shape(
         model["InputShape"], model["InputVectorLaneCount"]
@@ -2952,475 +4502,581 @@ def _layer_norm_template_context(model: dict[str, Any]) -> dict[str, Any]:
         model["OutputShape"], model["OutputVectorLaneCount"]
     )
     rank = len(logical_output_shape)
+    axis = int(model["Axis"])
+    if axis < 0 or axis >= rank:
+        raise ValueError(f"PyNTT LayerNorm axis {axis} is outside rank {rank}.")
 
-    def axis_index(axis: int) -> str:
-        return f"outer_idx{axis}" if axis < model["Axis"] else f"inner_idx{axis}"
+    lane_shapes: dict[str, tuple[int, ...]] = {}
+    for prefix in ("Input", "Scale", "Bias", "Output"):
+        lanes = _validate_coordinate_lane_shape(
+            model[f"{prefix}VectorLaneShape"], f"PyNTT LayerNorm {prefix}"
+        )
+        lane_count = _product_int(list(lanes)) if lanes else 1
+        if lane_count != int(model[f"{prefix}VectorLaneCount"]):
+            raise ValueError(
+                f"PyNTT LayerNorm {prefix} lane shape/count mismatch: "
+                f"shape={lanes}, count={model[f'{prefix}VectorLaneCount']}."
+            )
+        lane_shapes[prefix] = lanes
+    vector_lane_shapes = {lanes for lanes in lane_shapes.values() if lanes}
+    if len(vector_lane_shapes) > 1:
+        raise ValueError(
+            "PyNTT LayerNorm vector operands must use one lane shape, got "
+            f"{sorted(vector_lane_shapes)}."
+        )
+    common_lanes = next(iter(vector_lane_shapes), ())
+    common_lane_count = _product_int(list(common_lanes)) if common_lanes else 1
+    if common_lanes and not (lane_shapes["Input"] or lane_shapes["Output"]):
+        raise ValueError(
+            "PyNTT LayerNorm requires a vectorized input or output when its "
+            "parameters are vectorized."
+        )
 
-    def tensor_offset(
-        physical_shape: list[Any],
-        logical_shape: list[Any],
-        strides: list[Any],
-        lane_count: int,
-    ) -> str:
-        terms = []
-        for axis in range(rank):
-            if _is_fixed_one(logical_shape[axis]):
-                continue
-            index = axis_index(axis)
-            if lane_count > 1 and axis == len(physical_shape) - 1:
-                index = f"(({index}) // {lane_count})"
-            terms.append(f"{index} * {_dim(strides[axis])}")
-        physical_index = (
-            "inner_lane * 0"
-            if not terms
-            else "inner_lane * 0 + " + " + ".join(terms)
+    if lane_shapes["Input"]:
+        physical_domain_shape = model["InputShape"]
+    elif lane_shapes["Output"]:
+        physical_domain_shape = model["OutputShape"]
+    else:
+        physical_domain_shape = model["OutputShape"]
+    if len(physical_domain_shape) != rank:
+        raise ValueError(
+            "PyNTT LayerNorm input/output rank does not match its logical rank."
         )
-        if lane_count == 1:
-            return physical_index
-        lane_index = f"(({axis_index(len(physical_shape) - 1)}) % {lane_count})"
-        return f"(({physical_index}) * {lane_count} + {lane_index})"
 
-    def parameter_offset(
-        physical_shape: list[Any],
-        logical_shape: list[Any],
-        strides: list[Any],
-        lane_count: int,
-    ) -> str:
-        terms = []
-        for axis in range(len(logical_shape)):
-            if _is_fixed_one(logical_shape[axis]):
-                continue
-            output_axis = model["Axis"] + axis
-            index = axis_index(output_axis)
-            if lane_count > 1 and axis == len(physical_shape) - 1:
-                index = f"(({index}) // {lane_count})"
-            terms.append(f"{index} * {_dim(strides[axis])}")
-        physical_index = (
-            "inner_lane * 0"
-            if not terms
-            else "inner_lane * 0 + " + " + ".join(terms)
+    inner_axis = _structured_axis_tile(
+        "norm_inner",
+        common_lanes,
+        "block_size",
+        logical_output_shape[-1],
+        physical_base="inner_start",
+    )
+    inner_coordinate_shape = _coordinate_shape(inner_axis["structured_shape"])
+
+    def operand_access(prefix: str, parameter: bool) -> dict[str, Any]:
+        shape = model[f"{prefix}Shape"]
+        strides = model[f"{prefix}Strides"]
+        lanes = lane_shapes[prefix]
+        coordinates: list[str] = []
+        for operand_axis in range(len(shape)):
+            output_axis = axis + operand_axis if parameter else operand_axis
+            if output_axis == rank - 1:
+                coordinate = (
+                    inner_axis["physical_coordinate"]
+                    if lanes
+                    else inner_axis["logical_coordinate"]
+                )
+            elif output_axis < axis:
+                coordinate = f"outer_idx{output_axis}"
+            else:
+                coordinate = f"inner_idx{output_axis}"
+            coordinates.append(coordinate)
+        return _tensor_access(
+            coordinates,
+            strides,
+            inner_axis["lane_coordinates"] if lanes else (),
+            lanes,
+            inner_coordinate_shape,
         )
-        if lane_count == 1:
-            return physical_index
-        lane_index = (
-            f"(({axis_index(model['Axis'] + len(physical_shape) - 1)}) % "
-            f"{lane_count})"
-        )
-        return f"(({physical_index}) * {lane_count} + {lane_index})"
 
     return {
-        "bias_offset": parameter_offset(
-            model["BiasShape"],
-            logical_bias_shape,
-            model["BiasStrides"],
-            model["BiasVectorLaneCount"],
-        ),
-        "inner_axes": tuple(range(model["Axis"], rank)),
-        "inner_size": _product(logical_output_shape[model["Axis"] :]),
-        "input_offset": tensor_offset(
-            model["InputShape"],
-            logical_input_shape,
-            model["InputStrides"],
-            model["InputVectorLaneCount"],
-        ),
+        "bias_access": operand_access("Bias", True),
+        "common_lane_count": common_lane_count,
+        "inner_axis": inner_axis,
+        "inner_loop_axes": tuple(range(axis, rank - 1)),
+        "inner_size": _product(logical_output_shape[axis:]),
+        "input_access": operand_access("Input", False),
         "logical_output_shape": logical_output_shape,
-        "outer_axes": tuple(range(model["Axis"])),
-        "output_offset": tensor_offset(
-            model["OutputShape"],
-            logical_output_shape,
-            model["OutputStrides"],
-            model["OutputVectorLaneCount"],
-        ),
-        "scale_offset": parameter_offset(
-            model["ScaleShape"],
-            logical_scale_shape,
-            model["ScaleStrides"],
-            model["ScaleVectorLaneCount"],
-        ),
+        "outer_axes": tuple(range(axis)),
+        "physical_domain_shape": physical_domain_shape,
+        "output_access": operand_access("Output", False),
+        "scale_access": operand_access("Scale", True),
     }
 
 
 
 
 def _norm_stats_template_context(model: dict[str, Any]) -> dict[str, Any]:
-    logical_input_shape = _logical_shape(
-        model["InputShape"], model["InputVectorLaneCount"]
-    )
-    rank = len(logical_input_shape)
-    inner_axes = tuple(range(model["Axis"], rank))
+    rank = len(model["InputShape"])
+    axis = int(model["Axis"])
+    if axis < 0 or axis >= rank:
+        raise ValueError(f"PyNTT NormStats axis {axis} is outside rank {rank}")
     outer_axes = tuple(range(model["Axis"]))
-
-    def axis_index(axis: int) -> str:
-        return f"outer_idx{axis}" if axis < model["Axis"] else f"inner_idx{axis}"
-
-    input_terms = []
-    for axis in range(rank):
-        if _is_fixed_one(logical_input_shape[axis]):
-            continue
-        index = axis_index(axis)
-        if (
-            model["InputVectorLaneCount"] > 1
-            and axis == len(model["InputShape"]) - 1
-        ):
-            index = f"(({index}) // {model['InputVectorLaneCount']})"
-        input_terms.append(f"{index} * {_dim(model['InputStrides'][axis])}")
-    physical_input = (
-        "inner_lane * 0"
-        if not input_terms
-        else "inner_lane * 0 + " + " + ".join(input_terms)
+    context = _coordinate_iteration_context(
+        model["InputShape"][axis:],
+        model["InputStrides"][axis:],
+        model["InputVectorLaneShape"],
+        "PyNTT NormStats",
+        model["Input"],
     )
-    if model["InputVectorLaneCount"] == 1:
-        input_offset = physical_input
-    else:
-        lane_index = (
-            f"(({axis_index(len(model['InputShape']) - 1)}) % "
-            f"{model['InputVectorLaneCount']})"
+    if context["lane_count"] != model["InputVectorLaneCount"]:
+        raise ValueError(
+            "PyNTT NormStats vector lane metadata is inconsistent: "
+            f"shape={context['lane_shape']}, count={model['InputVectorLaneCount']}"
         )
-        input_offset = (
-            f"(({physical_input}) * {model['InputVectorLaneCount']} + {lane_index})"
+    if model["OutputVectorLaneShape"]:
+        raise ValueError("PyNTT NormStats output must have a scalar element type")
+    tensor_coordinates = tuple(f"outer_idx{index}" for index in outer_axes) + tuple(
+        context["tensor_coordinates"]
+    )
+    context["input_access"] = _tensor_access(
+        tensor_coordinates,
+        model["InputStrides"],
+        context["lane_coordinates"],
+        context["lane_shape"],
+        context["tile_shape"],
+    )
+
+    def stats_access(component: int) -> dict[str, Any]:
+        coordinates = (str(component),) + tuple(
+            f"outer_idx{index}" if index < axis else "0"
+            for index in range(rank)
         )
+        return _tensor_access(coordinates, model["OutputStrides"])
 
-    def stats_offset(component: int) -> str:
-        terms = []
-        if component:
-            terms.append(f"{component} * {_dim(model['OutputStrides'][0])}")
-        for axis in outer_axes:
-            if not _is_fixed_one(logical_input_shape[axis]):
-                terms.append(
-                    f"outer_idx{axis} * {_dim(model['OutputStrides'][axis + 1])}"
-                )
-        return "0" if not terms else " + ".join(terms)
-
-    return {
-        "inner_axes": inner_axes,
-        "inner_size": _product(logical_input_shape[model["Axis"] :]),
-        "input_offset": input_offset,
-        "logical_input_shape": logical_input_shape,
+    reduction = "value0"
+    square_reduction = "value0 * value0"
+    for _ in range(1 + len(context["lane_shape"])):
+        reduction = f"tl.sum({reduction}, axis=0)"
+        square_reduction = f"tl.sum({square_reduction}, axis=0)"
+    context.update({
+        "logical_input_shape": _logical_shape(
+            model["InputShape"], model["InputVectorLaneCount"]
+        ),
         "outer_axes": outer_axes,
-        "stats_offsets": (stats_offset(0), stats_offset(1)),
-    }
+        "prefix_depth": len(outer_axes),
+        "reduction": reduction,
+        "square_reduction": square_reduction,
+        "stats_accesses": (stats_access(0), stats_access(1)),
+    })
+    return context
 
 
 def _norm_apply_template_context(model: dict[str, Any]) -> dict[str, Any]:
-    logical_input_shape = _logical_shape(
-        model["InputShape"], model["InputVectorLaneCount"]
-    )
     logical_input_global_shape = _logical_shape(
         model["InputGlobalShape"], model["InputVectorLaneCount"]
-    )
-    logical_scale_shape = _logical_shape(
-        model["ScaleShape"], model["ScaleVectorLaneCount"]
-    )
-    logical_bias_shape = _logical_shape(
-        model["BiasShape"], model["BiasVectorLaneCount"]
     )
     logical_output_shape = _logical_shape(
         model["OutputShape"], model["OutputVectorLaneCount"]
     )
-    rank = len(logical_output_shape)
-    inner_axes = tuple(range(model["Axis"], rank))
-    outer_axes = tuple(range(model["Axis"]))
-
-    def axis_index(axis: int) -> str:
-        return f"outer_idx{axis}" if axis < model["Axis"] else f"inner_idx{axis}"
-
-    def tensor_offset(
-        physical_shape: list[Any],
-        logical_shape_value: list[Any],
-        strides: list[Any],
-        lane_count: int,
-    ) -> str:
-        terms = []
-        for axis in range(rank):
-            if _is_fixed_one(logical_shape_value[axis]):
-                continue
-            index = axis_index(axis)
-            if lane_count > 1 and axis == len(physical_shape) - 1:
-                index = f"(({index}) // {lane_count})"
-            terms.append(f"{index} * {_dim(strides[axis])}")
-        physical_index = (
-            "inner_lane * 0"
-            if not terms
-            else "inner_lane * 0 + " + " + ".join(terms)
+    rank = len(model["OutputShape"])
+    axis = int(model["Axis"])
+    if axis < 0 or axis >= rank:
+        raise ValueError(f"PyNTT NormApply axis {axis} is outside rank {rank}")
+    outer_axes = tuple(range(axis))
+    context = _coordinate_iteration_context(
+        model["OutputShape"][axis:],
+        model["OutputStrides"][axis:],
+        model["OutputVectorLaneShape"],
+        "PyNTT NormApply",
+        model["Output"],
+    )
+    vector_lanes = {
+        tuple(model[f"{name}VectorLaneShape"])
+        for name in ("Input", "Scale", "Bias", "Output")
+    }
+    if len(vector_lanes) != 1 or context["lane_count"] != model["OutputVectorLaneCount"]:
+        raise ValueError(
+            "PyNTT NormApply input/scale/bias/output vector lane shapes must match: "
+            f"{sorted(vector_lanes)}"
         )
-        if lane_count == 1:
-            return physical_index
-        lane_index = f"(({axis_index(len(physical_shape) - 1)}) % {lane_count})"
-        return f"(({physical_index}) * {lane_count} + {lane_index})"
+    if model["StatsVectorLaneShape"]:
+        raise ValueError("PyNTT NormApply stats must have a scalar element type")
 
-    def parameter_offset(
-        physical_shape: list[Any],
-        logical_shape_value: list[Any],
-        strides: list[Any],
-        lane_count: int,
-    ) -> str:
-        terms = []
-        for axis in range(len(logical_shape_value)):
-            if _is_fixed_one(logical_shape_value[axis]):
-                continue
-            index = axis_index(model["Axis"] + axis)
-            if lane_count > 1 and axis == len(physical_shape) - 1:
-                index = f"(({index}) // {lane_count})"
-            terms.append(f"{index} * {_dim(strides[axis])}")
-        physical_index = (
-            "inner_lane * 0"
-            if not terms
-            else "inner_lane * 0 + " + " + ".join(terms)
+    inner_coordinates = tuple(context["tensor_coordinates"])
+    tensor_coordinates = tuple(f"outer_idx{index}" for index in outer_axes) + inner_coordinates
+    context["input_access"] = _tensor_access(
+        tensor_coordinates,
+        model["InputStrides"],
+        context["lane_coordinates"],
+        context["lane_shape"],
+        context["tile_shape"],
+    )
+    context["output_access"] = _tensor_access(
+        tensor_coordinates,
+        model["OutputStrides"],
+        context["lane_coordinates"],
+        context["lane_shape"],
+        context["tile_shape"],
+    )
+    context["scale_access"] = _tensor_access(
+        inner_coordinates,
+        model["ScaleStrides"],
+        context["lane_coordinates"],
+        context["lane_shape"],
+        context["tile_shape"],
+    )
+    context["bias_access"] = _tensor_access(
+        inner_coordinates,
+        model["BiasStrides"],
+        context["lane_coordinates"],
+        context["lane_shape"],
+        context["tile_shape"],
+    )
+
+    def stats_access(component: int) -> dict[str, Any]:
+        coordinates = (str(component),) + tuple(
+            f"outer_idx{index}" if index < axis else "0"
+            for index in range(rank)
         )
-        if lane_count == 1:
-            return physical_index
-        lane_index = (
-            f"(({axis_index(model['Axis'] + len(physical_shape) - 1)}) % "
-            f"{lane_count})"
-        )
-        return f"(({physical_index}) * {lane_count} + {lane_index})"
+        return _tensor_access(coordinates, model["StatsStrides"])
 
-    def stats_offset(component: int) -> str:
-        terms = []
-        if component:
-            terms.append(f"{component} * {_dim(model['StatsStrides'][0])}")
-        for axis in outer_axes:
-            if not _is_fixed_one(logical_output_shape[axis]):
-                terms.append(
-                    f"outer_idx{axis} * {_dim(model['StatsStrides'][axis + 1])}"
-                )
-        return "0" if not terms else " + ".join(terms)
-
-    return {
-        "bias_offset": parameter_offset(
-            model["BiasShape"],
-            logical_bias_shape,
-            model["BiasStrides"],
-            model["BiasVectorLaneCount"],
-        ),
-        "inner_axes": inner_axes,
-        "inner_size": _product(logical_output_shape[model["Axis"] :]),
-        "input_offset": tensor_offset(
-            model["InputShape"],
-            logical_input_shape,
-            model["InputStrides"],
-            model["InputVectorLaneCount"],
-        ),
+    context.update({
         "logical_output_shape": logical_output_shape,
         "normalization_size": _product(
-            logical_input_global_shape[model["Axis"] :]
+            logical_input_global_shape[axis:]
         ),
         "outer_axes": outer_axes,
-        "output_offset": tensor_offset(
-            model["OutputShape"],
-            logical_output_shape,
-            model["OutputStrides"],
-            model["OutputVectorLaneCount"],
-        ),
-        "scale_offset": parameter_offset(
-            model["ScaleShape"],
-            logical_scale_shape,
-            model["ScaleStrides"],
-            model["ScaleVectorLaneCount"],
-        ),
-        "stats_offsets": (stats_offset(0), stats_offset(1)),
-    }
+        "prefix_depth": len(outer_axes),
+        "stats_accesses": (stats_access(0), stats_access(1)),
+    })
+    return context
 
 
 def _rope_template_context(model: dict[str, Any]) -> dict[str, Any]:
-    """Prepare RoPE's scalar-lane pairing and operand offsets."""
+    """Prepare RoPE's physical tensor and vector-lane coordinates."""
 
     rank = len(model["OutputShape"])
     rotary_axis = model["RotaryAxis"]
-    output_lane_count = model["OutputVectorLaneCount"]
-    sincos_pack_factor = int(model.get("SinCosVectorPackFactor", 1))
-    total = _multiply_expr(_product(model["OutputShape"]), output_lane_count)
-    rotary_extent = _multiply_expr(
-        f"({_dim(model['OutputShape'][rotary_axis])})", output_lane_count
+    output_lane_shape = _validate_coordinate_lane_shape(
+        model["OutputVectorLaneShape"], "PyNTT RoPE output"
     )
-    half_dim = f"(({rotary_extent}) // 2)"
+    output_lane_count = (
+        _product_int(list(output_lane_shape)) if output_lane_shape else 1
+    )
+    if output_lane_count != int(model["OutputVectorLaneCount"]):
+        raise ValueError(
+            "PyNTT RoPE output lane shape/count mismatch: "
+            f"shape={output_lane_shape}, count={model['OutputVectorLaneCount']}"
+        )
+    input_lane_shape = _validate_coordinate_lane_shape(
+        model["InputVectorLaneShape"], "PyNTT RoPE input"
+    )
+    if input_lane_shape != output_lane_shape:
+        raise ValueError(
+            "PyNTT RoPE input/output lane shapes must match: "
+            f"input={input_lane_shape}, output={output_lane_shape}."
+        )
+    sincos_pack_factor = int(model.get("SinCosVectorPackFactor", 1))
+    if sincos_pack_factor not in (1, 2):
+        raise ValueError(
+            "PyNTT RoPE direct coordinate lowering supports aligned sin/cos "
+            f"lanes or canonical two-half packing, got {sincos_pack_factor}."
+        )
+    sincos_lane_shape = (
+        output_lane_shape
+        if sincos_pack_factor == 1
+        else (sincos_pack_factor,) + output_lane_shape
+    )
+    for name in ("Cos", "Sin"):
+        actual_shape = _validate_coordinate_lane_shape(
+            model[f"{name}VectorLaneShape"], f"PyNTT RoPE {name.lower()}"
+        )
+        actual_count = int(model[f"{name}VectorLaneCount"])
+        if actual_shape != sincos_lane_shape or actual_count != _product_int(
+            list(sincos_lane_shape)
+        ):
+            raise ValueError(
+                f"PyNTT RoPE {name.lower()} lane layout must be "
+                f"{sincos_lane_shape}, got shape={actual_shape}, "
+                f"count={actual_count}."
+            )
 
-    def offset(
-        operand_shape: list[Any],
-        strides: list[Any],
-        lane_count: int,
-        rotary_index: str,
-        lane_index: str,
-    ) -> str:
-        axis_offset = rank - len(operand_shape)
-        terms = []
-        for axis, dimension in enumerate(operand_shape):
-            if _is_fixed_one(dimension):
-                continue
+    cos_shape = model["CosShape"]
+    cos_strides = model["CosStrides"]
+    if len(cos_shape) != rank or len(cos_strides) != rank:
+        raise ValueError(
+            "PyNTT RoPE sin/cos tensors must retain the output rank for "
+            f"coordinate-native lowering: cos_rank={len(cos_shape)}, output_rank={rank}."
+        )
+
+    def operand_access(
+        context: dict[str, Any],
+        name: str,
+        physical_rotary: str,
+        lane_coordinates: tuple[str, ...],
+        lane_shape: tuple[int, ...],
+    ) -> dict[str, Any]:
+        shape = model[f"{name}Shape"]
+        strides = model[f"{name}Strides"]
+        axis_offset = rank - len(shape)
+        tensor_coordinates = []
+        for axis, dimension in enumerate(shape):
             output_axis = axis_offset + axis
-            index = rotary_index if output_axis == rotary_axis else f"idx{output_axis}"
-            terms.append(f"{index} * {_dim(strides[axis])}")
-        tensor = "lane_flat * 0" if not terms else " + ".join(terms)
-        return (
-            tensor
-            if lane_count == 1
-            else f"(({tensor}) * {lane_count} + {lane_index})"
+            if _is_fixed_one(dimension):
+                coordinate = "zero_coord"
+            elif output_axis == rotary_axis:
+                coordinate = physical_rotary
+            else:
+                coordinate = context["tensor_coordinates"][output_axis]
+            tensor_coordinates.append(coordinate)
+        return _tensor_access(
+            tensor_coordinates,
+            strides,
+            lane_coordinates,
+            lane_shape,
+            context["tile_shape"],
         )
 
     if sincos_pack_factor == 1:
-        cos_rotary_index = f"idx{rotary_axis}"
-        cos_lane_index = "lane_flat"
-    else:
-        cos_rotary_index = "sincos_rotary"
-        cos_lane_index = "sincos_lane"
+        context = _coordinate_iteration_context(
+            model["OutputShape"],
+            model["OutputStrides"],
+            list(output_lane_shape),
+            "PyNTT RoPE",
+            model["Output"],
+        )
+        output_rotary_extent = _constant_dim_value(
+            model["OutputShape"][rotary_axis]
+        )
+        if output_rotary_extent is None or output_rotary_extent % 2 != 0:
+            raise ValueError(
+                "PyNTT RoPE aligned sin/cos lowering requires a static even "
+                "physical rotary extent."
+            )
+        half_physical_extent = output_rotary_extent // 2
+        output_physical_rotary = f"coord{rotary_axis}"
+        first_half = f"{output_physical_rotary} < {half_physical_extent}"
+        paired_physical_rotary = (
+            f"tl.where({first_half}, {output_physical_rotary} + "
+            f"{half_physical_extent}, {output_physical_rotary} - "
+            f"{half_physical_extent})"
+        )
+        lane_flat = _flatten_coordinates(
+            context["lane_coordinates"], output_lane_shape
+        )
+        logical_rotary = (
+            f"({output_physical_rotary}) * {output_lane_count} + ({lane_flat})"
+            if output_lane_count != 1
+            else output_physical_rotary
+        )
+        context.update(
+            cos_access=operand_access(
+                context,
+                "Cos",
+                output_physical_rotary,
+                context["lane_coordinates"],
+                sincos_lane_shape,
+            ),
+            first_half=first_half,
+            input_access=operand_access(
+                context,
+                "Input",
+                output_physical_rotary,
+                context["lane_coordinates"],
+                input_lane_shape,
+            ),
+            lane_flat=lane_flat,
+            logical_rotary=logical_rotary,
+            output_access=operand_access(
+                context,
+                "Output",
+                output_physical_rotary,
+                context["lane_coordinates"],
+                output_lane_shape,
+            ),
+            output_physical_rotary=output_physical_rotary,
+            output_rotary_extent=model["OutputShape"][rotary_axis],
+            paired_input_access=operand_access(
+                context,
+                "Input",
+                paired_physical_rotary,
+                context["lane_coordinates"],
+                input_lane_shape,
+            ),
+            rotary_axis=rotary_axis,
+            sin_access=operand_access(
+                context,
+                "Sin",
+                output_physical_rotary,
+                context["lane_coordinates"],
+                sincos_lane_shape,
+            ),
+        )
+        return context
 
-    output_terms = [
-        f"idx{axis} * {_dim(stride)}"
-        for axis, stride in enumerate(model["OutputStrides"])
+    domain_shape = [
+        dict(value) if isinstance(value, dict) else value
+        for value in model["OutputShape"]
     ]
-    output_physical = "lane_flat * 0" if not output_terms else " + ".join(
-        output_terms
+    domain_strides = [
+        dict(value) if isinstance(value, dict) else value
+        for value in model["OutputStrides"]
+    ]
+    domain_shape[rotary_axis] = cos_shape[rotary_axis]
+    domain_strides[rotary_axis] = cos_strides[rotary_axis]
+    context = _coordinate_iteration_context(
+        domain_shape,
+        domain_strides,
+        list(sincos_lane_shape),
+        "PyNTT RoPE",
+        model["Cos"],
     )
-    output_offset = (
-        output_physical
-        if output_lane_count == 1
-        else f"(({output_physical}) * {output_lane_count} + lane_flat)"
+    pack_coordinate = context["lane_coordinates"][0]
+    vector_lane_coordinates = context["lane_coordinates"][1:]
+    lane_flat = _flatten_coordinates(
+        vector_lane_coordinates, output_lane_shape
     )
-    return {
-        "cos_offset": offset(
-            model["CosShape"],
-            model["CosStrides"],
-            model["CosVectorLaneCount"],
-            cos_rotary_index,
-            cos_lane_index,
+    output_physical_extent = _constant_dim_value(
+        model["OutputShape"][rotary_axis]
+    )
+    sincos_physical_extent = _constant_dim_value(cos_shape[rotary_axis])
+    if (
+        output_physical_extent is None
+        or output_physical_extent % 2 != 0
+        or sincos_physical_extent is None
+        or sincos_physical_extent * sincos_pack_factor
+        != output_physical_extent
+    ):
+        raise ValueError(
+            "PyNTT RoPE packed sin/cos lowering requires a static even "
+            "output rotary extent and an interleaved physical extent matching "
+            "the dtype-width pack factor: "
+            f"output={output_physical_extent}, sincos={sincos_physical_extent}, "
+            f"pack={sincos_pack_factor}."
+        )
+    half_output_physical_extent = output_physical_extent // 2
+    output_physical_rotary = (
+        f"(coord{rotary_axis}) * {sincos_pack_factor} + ({pack_coordinate})"
+    )
+    paired_physical_rotary = (
+        f"tl.where({output_physical_rotary} < {half_output_physical_extent}, "
+        f"{output_physical_rotary} + {half_output_physical_extent}, "
+        f"{output_physical_rotary} - {half_output_physical_extent})"
+    )
+    logical_rotary = (
+        f"({output_physical_rotary}) * {output_lane_count} + ({lane_flat})"
+        if output_lane_count != 1
+        else output_physical_rotary
+    )
+
+    context.update(
+        cos_access=operand_access(
+            context,
+            "Cos",
+            f"coord{rotary_axis}",
+            context["lane_coordinates"],
+            sincos_lane_shape,
         ),
-        "half_dim": half_dim,
-        "input_offset": offset(
-            model["InputShape"],
-            model["InputStrides"],
-            model["InputVectorLaneCount"],
-            f"idx{rotary_axis}",
-            "lane_flat",
+        first_half=(
+            f"{output_physical_rotary} < {half_output_physical_extent}"
         ),
-        "output_offset": output_offset,
-        "paired_input_offset": offset(
-            model["InputShape"],
-            model["InputStrides"],
-            model["InputVectorLaneCount"],
-            f"paired_idx{rotary_axis}",
-            "paired_lane",
+        input_access=operand_access(
+            context,
+            "Input",
+            output_physical_rotary,
+            vector_lane_coordinates,
+            input_lane_shape,
         ),
-        "rotary_axis": rotary_axis,
-        "sin_offset": offset(
-            model["SinShape"],
-            model["SinStrides"],
-            model["SinVectorLaneCount"],
-            cos_rotary_index,
-            cos_lane_index,
+        lane_flat=lane_flat,
+        logical_rotary=logical_rotary,
+        output_access=operand_access(
+            context,
+            "Output",
+            output_physical_rotary,
+            vector_lane_coordinates,
+            output_lane_shape,
         ),
-        "sincos_pack_factor": sincos_pack_factor,
-        "total": total,
-    }
+        output_physical_rotary=output_physical_rotary,
+        output_rotary_extent=model["OutputShape"][rotary_axis],
+        paired_input_access=operand_access(
+            context,
+            "Input",
+            paired_physical_rotary,
+            vector_lane_coordinates,
+            input_lane_shape,
+        ),
+        rotary_axis=rotary_axis,
+        sin_access=operand_access(
+            context,
+            "Sin",
+            f"coord{rotary_axis}",
+            context["lane_coordinates"],
+            sincos_lane_shape,
+        ),
+    )
+    return context
 
 
 
 
 def _gather_template_context(model: dict[str, Any]) -> dict[str, Any]:
-    """Prepare Gather index expressions without owning its Triton control flow."""
+    """Prepare coordinate-native Gather input/index/output accesses."""
 
-    logical_output_shape = [
-        dict(value) if isinstance(value, dict) else value
-        for value in model["OutputShape"]
-    ]
-    logical_output_shape[-1] = _multiply_dim(
-        logical_output_shape[-1], model["ValueVectorLaneCount"]
+    lane_shape = _validate_coordinate_lane_shape(
+        model["ValueVectorLaneShape"], "PyNTT Gather value"
     )
-    logical_output_strides = [
-        dict(value) if isinstance(value, dict) else value
-        for value in model["OutputStrides"]
-    ]
-    if model["ValueVectorLaneCount"] > 1:
-        logical_output_strides[-1] = _one()
-    output_rank = len(logical_output_shape)
+    lane_count = _product_int(list(lane_shape)) if lane_shape else 1
+    if lane_count != int(model["ValueVectorLaneCount"]):
+        raise ValueError(
+            "PyNTT Gather vector lane shape/count mismatch: "
+            f"shape={lane_shape}, count={model['ValueVectorLaneCount']}."
+        )
+    output_rank = len(model["OutputShape"])
     index_rank = len(model["IndexShape"])
-    block_axis = _select_block_axis(logical_output_shape, logical_output_strides)
-
-    def axis_index(axis: int) -> str:
-        return "lane" if axis == block_axis else f"idx{axis}"
-
-    output_terms = []
-    for output_axis in range(len(model["OutputShape"])):
-        index = (
-            f"(({axis_index(output_axis)}) // {model['ValueVectorLaneCount']})"
-            if output_axis == len(model["OutputShape"]) - 1
-            and model["ValueVectorLaneCount"] > 1
-            else axis_index(output_axis)
-        )
-        output_terms.append(
-            f"{index} * {_dim(model['OutputStrides'][output_axis])}"
-        )
-    output_physical = (
-        "lane * 0"
-        if not output_terms
-        else "lane * 0 + " + " + ".join(output_terms)
+    context = _coordinate_iteration_context(
+        model["OutputShape"],
+        model["OutputStrides"],
+        list(lane_shape),
+        "PyNTT Gather",
+        model["Output"],
     )
-    if model["ValueVectorLaneCount"] == 1:
-        output_offset = output_physical
-    else:
-        lane_index = (
-            f"(({axis_index(len(model['OutputShape']) - 1)}) % "
-            f"{model['ValueVectorLaneCount']})"
+    index_coordinates = []
+    for index_axis, extent in enumerate(model["IndexShape"]):
+        output_axis = model["Axis"] + index_axis
+        index_coordinates.append(
+            "zero_coord"
+            if _is_fixed_one(extent)
+            else context["tensor_coordinates"][output_axis]
         )
-        output_offset = (
-            f"(({output_physical}) * {model['ValueVectorLaneCount']} + {lane_index})"
-        )
-
-    index_terms = [
-        f"{axis_index(model['Axis'] + index_axis)} * "
-        f"{_dim(model['IndexStrides'][index_axis])}"
-        for index_axis in range(index_rank)
-    ]
-    index_offset = (
-        "lane * 0" if not index_terms else "lane * 0 + " + " + ".join(index_terms)
+    index_access = _tensor_access(
+        index_coordinates,
+        model["IndexStrides"],
+        coordinate_shape=context["tile_shape"],
     )
 
-    input_terms = []
+    input_coordinates = []
     for input_axis in range(len(model["InputShape"])):
         if input_axis < model["Axis"]:
-            index = axis_index(input_axis)
+            coordinate = context["tensor_coordinates"][input_axis]
         elif input_axis == model["Axis"]:
-            index = "local_gather_index"
+            coordinate = "local_gather_index"
         else:
-            index = axis_index(input_axis + index_rank - 1)
-        if (
-            input_axis == len(model["InputShape"]) - 1
-            and model["ValueVectorLaneCount"] > 1
-        ):
-            index = f"(({index}) // {model['ValueVectorLaneCount']})"
-        input_terms.append(f"{index} * {_dim(model['InputStrides'][input_axis])}")
-    input_physical = (
-        "lane * 0" if not input_terms else "lane * 0 + " + " + ".join(input_terms)
+            coordinate = context["tensor_coordinates"][
+                input_axis + index_rank - 1
+            ]
+        input_coordinates.append(coordinate)
+    input_access = _tensor_access(
+        input_coordinates,
+        model["InputStrides"],
+        context["lane_coordinates"],
+        lane_shape,
+        context["tile_shape"],
     )
-    if model["ValueVectorLaneCount"] == 1:
-        input_offset = input_physical
-    else:
-        value_output_axis = len(model["InputShape"]) + index_rank - 2
-        lane_index = (
-            f"(({axis_index(value_output_axis)}) % {model['ValueVectorLaneCount']})"
-        )
-        input_offset = (
-            f"(({input_physical}) * {model['ValueVectorLaneCount']} + {lane_index})"
-        )
+    output_access = _tensor_access(
+        context["tensor_coordinates"],
+        model["OutputStrides"],
+        context["lane_coordinates"],
+        lane_shape,
+        context["tile_shape"],
+    )
 
     gather_split_axes = model["InputSplitAxes"][model["Axis"]]
-    return {
-        "block_axis": block_axis,
-        "block_extent": _one()
-        if output_rank == 0
-        else logical_output_shape[block_axis],
-        "gather_split_axes": gather_split_axes,
-        "index_offset": index_offset,
-        "input_offset": input_offset,
-        "input_split_linear": _split_linear_expression(
+    context.update(
+        gather_split_axes=gather_split_axes,
+        index_access=index_access,
+        input_access=input_access,
+        input_split_linear=_split_linear_expression(
             gather_split_axes, model["Hierarchy"]
         ),
-        "logical_output_shape": logical_output_shape,
-        "loop_axes": tuple(
-            axis for axis in range(output_rank) if axis != block_axis
-        ),
-        "output_offset": output_offset,
-        "signed_index": not str(model["IndexDType"]).startswith("uint"),
-    }
+        output_access=output_access,
+        signed_index=not str(model["IndexDType"]).startswith("uint"),
+    )
+    if model["Axis"] < 0 or model["Axis"] >= len(model["InputShape"]):
+        raise ValueError(
+            f"PyNTT Gather axis {model['Axis']} is outside input rank "
+            f"{len(model['InputShape'])}."
+        )
+    return context
 
 
 def _concat_template_context(model: dict[str, Any]) -> dict[str, Any]:
@@ -3677,22 +5333,42 @@ def _reshard_template_context(model: dict[str, Any]) -> dict[str, Any]:
     writer_active = "True"
     for axis in sorted(input_partial_mesh_axes):
         writer_active = f"({writer_active}) & (shard_coord{axis} == 0)"
-    total = " * ".join(
-        [f"({_dim(value)})" for value in model["InputActiveShape"]]
-        + [f"({model['VectorLaneCount']})"]
+    context = _coordinate_iteration_context(
+        model["InputActiveShape"],
+        model["InputStrides"],
+        model["VectorLaneShape"],
+        "PyNTT Reshard",
+        model["Input"],
+    )
+    if context["lane_count"] != model["VectorLaneCount"]:
+        raise ValueError(
+            "PyNTT Reshard vector lane metadata is inconsistent: "
+            f"shape={context['lane_shape']}, count={model['VectorLaneCount']}"
+        )
+    context["global_coordinates"] = tuple(
+        _add_coordinate(offset, coordinate)
+        for offset, coordinate in zip(
+            model["InputGlobalOffsets"], context["tensor_coordinates"]
+        )
+    )
+    context["input_access"] = _tensor_access(
+        context["tensor_coordinates"],
+        model["InputStrides"],
+        context["lane_coordinates"],
+        context["lane_shape"],
+        context["tile_shape"],
+    )
+    context["output_access"] = _tensor_access(
+        tuple(f"output_idx{axis}" for axis in range(len(model["OutputStrides"]))),
+        model["OutputStrides"],
+        context["lane_coordinates"],
+        context["lane_shape"],
+        context["tile_shape"],
     )
     destination_shard_index = _split_linear_expression(
         list(range(len(model["Hierarchy"]))),
         model["Hierarchy"],
         "destination_shard_coord",
-    )
-    input_offsets = _scalar_offset(
-        _tensor_offset("input_idx", model["InputStrides"]),
-        model["VectorLaneCount"],
-    )
-    output_offsets = _scalar_offset(
-        _tensor_offset("output_idx", model["OutputStrides"]),
-        model["VectorLaneCount"],
     )
     destination_pool_index = _pool_index_expression(
         "destination_shard_index", model["OutputAddress"]["PoolScopeSize"]
@@ -3731,30 +5407,20 @@ def _reshard_template_context(model: dict[str, Any]) -> dict[str, Any]:
             "source_shard_index": source_shard_index,
             "zero": zero,
         }
-    return {
+    context.update({
         "destination_pool_index": destination_pool_index,
         "destination_shard_index": destination_shard_index,
-        "input_offsets": input_offsets,
         "input_partial_mesh_axes": tuple(sorted(input_partial_mesh_axes)),
         "input_split_mesh_axes": tuple(sorted(input_split_mesh_axes)),
         "output_broadcast_mesh_axes": output_broadcast_mesh_axes,
-        "output_offsets": output_offsets,
         "output_pointer_type": _pointer_type(
             model["TritonDType"], model["OutputAddress"]["AddressSpace"]
         ),
         "partial": partial,
-        "total": total,
+        "prefix_depth": len(output_broadcast_mesh_axes),
         "writer_active": writer_active,
-    }
-
-
-def _tensor_offset(prefix: str, strides: list[Any]) -> str:
-    terms = [f"{prefix}{axis} * {_dim(strides[axis])}" for axis in range(len(strides))]
-    return "lane * 0" if not terms else "lane * 0 + " + " + ".join(terms)
-
-
-def _scalar_offset(element_offset: str, vector_lane_count: int) -> str:
-    return element_offset if vector_lane_count == 1 else f"(({element_offset}) * {vector_lane_count} + lane_value)"
+    })
+    return context
 
 
 def _pool_index_expression(linear_index: str, pool_scope_size: Any) -> str:
@@ -3771,7 +5437,7 @@ def _pool_index_expression(linear_index: str, pool_scope_size: Any) -> str:
 
 
 def _summa_template_context(model: dict[str, Any]) -> dict[str, Any]:
-    """Prepare SUMMA shard-index reconstruction and vector addresses."""
+    """Prepare SUMMA sharding and direct physical/vector N coordinates."""
 
     def output_axis_range(global_extent: Any, split_axes: list[int]) -> dict[str, Any]:
         return {
@@ -3804,33 +5470,67 @@ def _summa_template_context(model: dict[str, Any]) -> dict[str, Any]:
             "split_axes": tuple(split_axes),
         }
 
+    rhs_lanes = _validate_coordinate_lane_shape(
+        model["RhsNVectorLaneShape"], "PyNTT SUMMA RHS N"
+    )
+    output_lanes = _validate_coordinate_lane_shape(
+        model["OutputNVectorLaneShape"], "PyNTT SUMMA output N"
+    )
+    if rhs_lanes != output_lanes:
+        raise ValueError(
+            "PyNTT SUMMA RHS/output N lane shapes must match: "
+            f"rhs={rhs_lanes}, output={output_lanes}."
+        )
+    lane_count = _product_int(list(rhs_lanes)) if rhs_lanes else 1
+    if (
+        lane_count != int(model["RhsNVectorLaneCount"])
+        or lane_count != int(model["OutputNVectorLaneCount"])
+    ):
+        raise ValueError(
+            "PyNTT SUMMA N lane shape/count metadata is inconsistent: "
+            f"shape={rhs_lanes}, rhs={model['RhsNVectorLaneCount']}, "
+            f"output={model['OutputNVectorLaneCount']}."
+        )
+
+    block_k = 32
+    block_m = 16
+    block_n = 16
+    n_axis = _structured_axis_tile(
+        "summa_n",
+        rhs_lanes,
+        block_n,
+        _multiply_dim(model["OutputGlobalShape"][1], lane_count),
+        leading_rank=1,
+        physical_base="n_start",
+    )
+    lane_index = _flatten_coordinates(
+        n_axis["lane_coordinates"], n_axis["lane_shape"]
+    )
     output_global_physical_n = model["OutputGlobalShape"][1]
     output_global_logical_n = _multiply_dim(
-        output_global_physical_n, model["OutputNVectorLaneCount"]
+        output_global_physical_n, lane_count
     )
     rhs_global_logical_n = _multiply_dim(
-        model["RhsGlobalShape"][1], model["RhsNVectorLaneCount"]
+        model["RhsGlobalShape"][1], lane_count
     )
-    rhs_offset = (
-        "rhs_physical_offsets"
-        if model["RhsNVectorLaneCount"] == 1
-        else (
-            f"((rhs_physical_offsets) * {model['RhsNVectorLaneCount']} + "
-            "rhs_lane[None, :])"
+    rhs_offset = "rhs_physical_offsets"
+    output_offset = "output_physical_offsets"
+    if lane_count != 1:
+        rhs_offset = f"((rhs_physical_offsets) * {lane_count} + ({lane_index}))"
+        output_offset = (
+            f"((output_physical_offsets) * {lane_count} + ({lane_index}))"
         )
+    broadcast_global_k = _broadcast_axis_coordinate(
+        "global_k", n_axis["rank"], 0
     )
-    output_offset = (
-        "output_physical_offsets"
-        if model["OutputNVectorLaneCount"] == 1
-        else (
-            f"((output_physical_offsets) * {model['OutputNVectorLaneCount']} + "
-            "out_lane[None, :])"
-        )
+    broadcast_offs_m = _broadcast_axis_coordinate("offs_m", n_axis["rank"], 0)
+    global_n_logical = (
+        f"({n_axis['logical_coordinate']}) + out_n_global_base * {lane_count}"
     )
     return {
-        "block_k": 32,
-        "block_m": 16,
-        "block_n": 16,
+        "block_k": block_k,
+        "block_m": block_m,
+        "block_n": block_n,
         "dot_precision": (
             ', input_precision="ieee"'
             if model["LhsDType"] == "float32"
@@ -3863,21 +5563,37 @@ def _summa_template_context(model: dict[str, Any]) -> dict[str, Any]:
         "out_n": output_axis_range(
             output_global_physical_n, model["OutputSplitAxes"][1]
         ),
+        "broadcast_global_k": broadcast_global_k,
+        "broadcast_offs_m": broadcast_offs_m,
+        "global_n_logical": global_n_logical,
+        "global_n_physical": (
+            f"out_n_global_base + {n_axis['physical_coordinate']}"
+        ),
+        "n_axis": n_axis,
         "output_global_logical_n": output_global_logical_n,
         "output_offset": output_offset,
         "output_pointer_type": _pointer_type(
             model["OutputTritonDType"], model["OutputAddressSpace"]
         ),
+        "output_structured_shape": _structured_value_shape(
+            n_axis, leading_extents=(block_m,)
+        ),
+        "physical_block_n": n_axis["physical_block_extent"],
         "rhs_global_logical_n": rhs_global_logical_n,
+        "rhs_mask": (
+            f"({broadcast_global_k} < {_dim(model['LhsGlobalShape'][1])}) & "
+            f"({n_axis['physical_coordinate']} < out_n_iter_dim) & "
+            f"({global_n_logical} < {_dim(rhs_global_logical_n)})"
+        ),
         "rhs_k": local_index(
             "rhs_k",
-            "global_k[:, None]",
+            _broadcast_axis_coordinate("global_k", n_axis["rank"], 0),
             model["RhsGlobalShape"][0],
             model["RhsSplitAxes"][0],
         ),
         "rhs_n": local_index(
             "rhs_n",
-            "rhs_global_n_physical[None, :]",
+            "global_n_physical",
             model["RhsGlobalShape"][1],
             model["RhsSplitAxes"][1],
         ),
@@ -3885,47 +5601,36 @@ def _summa_template_context(model: dict[str, Any]) -> dict[str, Any]:
         "rhs_pointer_type": _pointer_type(
             model["RhsTritonDType"], model["RhsAddressSpace"]
         ),
+        "rhs_structured_shape": _structured_value_shape(
+            n_axis, leading_extents=(block_k,)
+        ),
+        "output_mask": (
+            f"({broadcast_offs_m} < out_m_iter_dim) & "
+            f"({n_axis['physical_coordinate']} < out_n_iter_dim) & "
+            f"({global_n_logical} < {_dim(output_global_logical_n)})"
+        ),
     }
 
 
 
 
 def _paged_attention_template_context(model: dict[str, Any]) -> dict[str, Any]:
-    """Validate PagedAttention cache layout and prepare vector addresses."""
+    """Validate PagedAttention layouts and prepare coordinate-native accesses."""
 
     cache = model["Cache"]
     attention_block_size = int(model["AttentionBlockSize"])
+    cache_block_size = int(cache["BlockSize"])
     if (
         attention_block_size <= 0
         or attention_block_size & (attention_block_size - 1)
-        or attention_block_size > int(cache["BlockSize"])
+        or attention_block_size > cache_block_size
+        or cache_block_size % attention_block_size != 0
     ):
         raise ValueError(
             "PyNTT PagedAttention AttentionBlockSize must be a positive power "
-            "of two no larger than the cache block size, got "
-            f"{attention_block_size}."
+            "of two that divides the cache block size, got "
+            f"attention={attention_block_size}, cache={cache_block_size}."
         )
-
-    def tensor_offset(
-        strides: list[Any],
-        seq_axis: int,
-        head_axis: int,
-        dim_axis: int,
-        head: str,
-        dim_block: str,
-        token: str,
-        lane: str,
-        lane_count: int,
-    ) -> str:
-        indices = ["0"] * len(strides)
-        indices[seq_axis] = token
-        indices[head_axis] = head
-        indices[dim_axis] = dim_block
-        terms = [
-            f"{indices[axis]} * {_dim(strides[axis])}"
-            for axis in range(len(strides))
-        ]
-        return f"(({' + '.join(terms)}) * {lane_count} + {lane})"
 
     def global_index_expression(
         axis: int, local_index: str, global_extent: Any
@@ -3940,73 +5645,185 @@ def _paged_attention_template_context(model: dict[str, Any]) -> dict[str, Any]:
             f"tl.cdiv({_dim(global_extent)}, {divisor})"
         )
 
-    def cache_dim_index(prefix: str, dim_name: str) -> str:
-        if cache[f"{prefix}VectorizedDim"] == 5:
-            return f"{dim_name} // {cache[f'{prefix}LaneCount']}"
-        return dim_name
-
-    def cache_block_index(prefix: str, block_name: str) -> str:
-        if cache[f"{prefix}VectorizedDim"] == 3:
-            return f"{block_name} // {cache[f'{prefix}LaneCount']}"
-        return block_name
-
-    def cache_lane(prefix: str, dim_name: str, block_name: str) -> str:
-        if cache[f"{prefix}VectorizedDim"] == 5:
-            return f"{dim_name} % {cache[f'{prefix}LaneCount']}"
-        if cache[f"{prefix}VectorizedDim"] == 3:
-            return f"{block_name} % {cache[f'{prefix}LaneCount']}"
-        return "0"
-
     if cache["KeyVectorizedDim"] != 5:
         raise ValueError(
-            "PyNTT PagedAttention currently requires key cache to be "
+            "PyNTT PagedAttention requires the key cache to be "
             "HeadDim-vectorized."
         )
+    if cache["ValueVectorizedDim"] not in (3, 5):
+        raise ValueError(
+            "PyNTT PagedAttention requires the value cache to be vectorized "
+            "over BlockOffset or HeadDim."
+        )
+
+    query_lanes = _validate_coordinate_lane_shape(
+        model["QueryVectorLaneShape"], "PyNTT PagedAttention query"
+    )
+    output_lanes = _validate_coordinate_lane_shape(
+        model["OutputVectorLaneShape"], "PyNTT PagedAttention output"
+    )
+    if query_lanes != output_lanes:
+        raise ValueError(
+            "PyNTT PagedAttention query/output vector lanes must match: "
+            f"query={query_lanes}, output={output_lanes}."
+        )
+    query_lane_count = _product_int(list(query_lanes)) if query_lanes else 1
+    if query_lane_count != int(cache["KeyLaneCount"]):
+        raise ValueError(
+            "PyNTT PagedAttention query lanes must match key-cache HeadDim "
+            f"lanes: query={query_lane_count}, cache={cache['KeyLaneCount']}."
+        )
+
+    dim_axis = int(model["DimAxis"])
+    query_physical_dim = _constant_dim_value(model["QueryShape"][dim_axis])
+    output_physical_dim = _constant_dim_value(model["OutputShape"][dim_axis])
+    expected_physical_dim = int(cache["KeyHeadDimBlocks"])
+    if (
+        query_physical_dim != expected_physical_dim
+        or output_physical_dim != expected_physical_dim
+        or expected_physical_dim * query_lane_count != int(cache["HeadDim"])
+    ):
+        raise ValueError(
+            "PyNTT PagedAttention query/output physical HeadDim does not "
+            "match the cache layout: "
+            f"query={query_physical_dim}, output={output_physical_dim}, "
+            f"cache_blocks={expected_physical_dim}, lanes={query_lane_count}, "
+            f"head_dim={cache['HeadDim']}."
+        )
+
+    query_dim_axis = _structured_axis_tile(
+        "query_dim",
+        query_lanes,
+        int(cache["HeadDim"]),
+        cache["HeadDim"],
+    )
+    key_dim_axis = _structured_axis_tile(
+        "key_dim",
+        query_lanes,
+        int(cache["HeadDim"]),
+        cache["HeadDim"],
+        trailing_rank=1,
+    )
+
+    query_indices = ["0"] * len(model["QueryShape"])
+    query_indices[model["SeqAxis"]] = "local_query_id"
+    query_indices[model["HeadAxis"]] = "q_head"
+    query_indices[dim_axis] = query_dim_axis["physical_coordinate"]
+    output_indices = ["0"] * len(model["OutputShape"])
+    output_indices[model["SeqAxis"]] = "local_query_id"
+    output_indices[model["HeadAxis"]] = "q_head"
+    output_indices[dim_axis] = query_dim_axis["physical_coordinate"]
+
+    key_lane = _flatten_coordinates(
+        key_dim_axis["lane_coordinates"], key_dim_axis["lane_shape"]
+    )
+    key_block_offset = _broadcast_axis_coordinate(
+        "block_offsets", key_dim_axis["rank"], key_dim_axis["rank"] - 1
+    )
+    key_vector_offset = (
+        f"(cache_block_id * {cache['BlockElements']} + "
+        f"{cache['KeySectionOffset']} + ((layer_id_value) * "
+        f"{cache['KeyLayerStride']} + kv_head * {cache['KeyHeadStride']} + "
+        f"({key_dim_axis['physical_coordinate']}) * "
+        f"{cache['KeyDimBlockStride']} + ({key_block_offset}) * "
+        f"{cache['KeyBlockOffsetStride']}) * {cache['KeyLaneCount']} + "
+        f"({key_lane}))"
+    )
+
+    value_lane_count = int(cache["ValueLaneCount"])
+    if value_lane_count <= 0 or value_lane_count & (value_lane_count - 1):
+        raise ValueError(
+            "PyNTT PagedAttention value-cache lane count must be a positive "
+            f"power of two, got {value_lane_count}."
+        )
+    if cache["ValueVectorizedDim"] == 3:
+        if (
+            attention_block_size % value_lane_count != 0
+            or cache_block_size % value_lane_count != 0
+            or int(cache["ValueHeadDimBlocks"]) != int(cache["HeadDim"])
+        ):
+            raise ValueError(
+                "PyNTT PagedAttention BlockOffset-vectorized value cache has "
+                "an incompatible block or HeadDim layout."
+            )
+        value_axis = _structured_axis_tile(
+            "value_context",
+            (value_lane_count,),
+            attention_block_size,
+            attention_block_size,
+            trailing_rank=1,
+            physical_base=(
+                f"((context_start % {cache_block_size}) // {value_lane_count})"
+            ),
+        )
+        value_lane = value_axis["lane_coordinates"][0]
+        value_dim_index = _broadcast_axis_coordinate(
+            "dim_offsets", value_axis["rank"], value_axis["rank"] - 1
+        )
+        value_vector_offset = (
+            f"(cache_block_id * {cache['BlockElements']} + "
+            f"{cache['ValueSectionOffset']} + ((layer_id_value) * "
+            f"{cache['ValueLayerStride']} + kv_head * "
+            f"{cache['ValueHeadStride']} + ({value_dim_index}) * "
+            f"{cache['ValueDimBlockStride']} + "
+            f"({value_axis['physical_coordinate']}) * "
+            f"{cache['ValueBlockOffsetStride']}) * {value_lane_count} + "
+            f"({value_lane}))"
+        )
+        value_mask = (
+            "tl.reshape(context_mask, "
+            f"{value_axis['structured_shape']})[:, :, None]"
+        )
+        value_structured_shape = _structured_value_shape(
+            value_axis, trailing_extents=(int(cache["HeadDim"]),)
+        )
+        value_axis_kind = "context"
+    else:
+        if (
+            int(cache["HeadDim"]) % value_lane_count != 0
+            or int(cache["ValueHeadDimBlocks"])
+            != int(cache["HeadDim"]) // value_lane_count
+        ):
+            raise ValueError(
+                "PyNTT PagedAttention HeadDim-vectorized value cache has an "
+                "incompatible HeadDim layout."
+            )
+        value_axis = _structured_axis_tile(
+            "value_dim",
+            (value_lane_count,),
+            int(cache["HeadDim"]),
+            cache["HeadDim"],
+            leading_rank=1,
+        )
+        value_lane = value_axis["lane_coordinates"][0]
+        value_block_offset = _broadcast_axis_coordinate(
+            "block_offsets", value_axis["rank"], 0
+        )
+        value_vector_offset = (
+            f"(cache_block_id * {cache['BlockElements']} + "
+            f"{cache['ValueSectionOffset']} + ((layer_id_value) * "
+            f"{cache['ValueLayerStride']} + kv_head * "
+            f"{cache['ValueHeadStride']} + "
+            f"({value_axis['physical_coordinate']}) * "
+            f"{cache['ValueDimBlockStride']} + ({value_block_offset}) * "
+            f"{cache['ValueBlockOffsetStride']}) * {value_lane_count} + "
+            f"({value_lane}))"
+        )
+        value_mask = "context_mask[:, None, None]"
+        value_structured_shape = _structured_value_shape(
+            value_axis, leading_extents=(attention_block_size,)
+        )
+        value_axis_kind = "dim"
 
     local_query_tokens = model["OutputShape"][model["SeqAxis"]]
     global_query_tokens = model["OutputGlobalShape"][model["SeqAxis"]]
-    key_block_index = (
-        "(topology_id[None, :] * num_blocks_per_shard + block_id[None, :])"
-        if cache["IdLength"] > 1
-        else "block_id[None, :]"
-    )
-    value_block_index = (
-        "(topology_id[:, None] * num_blocks_per_shard + block_id[:, None])"
-        if cache["IdLength"] > 1
-        else "block_id[:, None]"
-    )
-    key_lane = (
-        "key_lane[:, None]"
-        if cache["KeyVectorizedDim"] == 5
-        else "key_lane[None, :]"
-        if cache["KeyVectorizedDim"] == 3
-        else "0"
-    )
-    value_lane = (
-        "value_lane[None, :]"
-        if cache["ValueVectorizedDim"] == 5
-        else "value_lane[:, None]"
-        if cache["ValueVectorizedDim"] == 3
-        else "0"
-    )
-    key_vector_offset = (
-        f"({key_block_index} * {cache['BlockElements']} + "
-        f"{cache['KeySectionOffset']} + ((layer_id_value) * "
-        f"{cache['KeyLayerStride']} + kv_head * {cache['KeyHeadStride']} + "
-        f"key_dim_index[:, None] * {cache['KeyDimBlockStride']} + "
-        f"key_block_index[None, :] * {cache['KeyBlockOffsetStride']}) * "
-        f"{cache['KeyLaneCount']} + {key_lane})"
-    )
-    value_vector_offset = (
-        f"({value_block_index} * {cache['BlockElements']} + "
-        f"{cache['ValueSectionOffset']} + ((layer_id_value) * "
-        f"{cache['ValueLayerStride']} + kv_head * {cache['ValueHeadStride']} + "
-        f"value_dim_index[None, :] * {cache['ValueDimBlockStride']} + "
-        f"value_block_index[:, None] * {cache['ValueBlockOffsetStride']}) * "
-        f"{cache['ValueLaneCount']} + {value_lane})"
-    )
     return {
         "attention_block_size": attention_block_size,
+        "cache_block_id": (
+            "(topology_id * num_blocks_per_shard + block_id)"
+            if cache["IdLength"] > 1
+            else "block_id"
+        ),
         "global_q_head": global_index_expression(
             model["HeadAxis"], "q_head", model["GlobalNumQueryHeads"]
         ),
@@ -4014,37 +5831,36 @@ def _paged_attention_template_context(model: dict[str, Any]) -> dict[str, Any]:
             model["SeqAxis"], "local_query_id", global_query_tokens
         ),
         "global_query_tokens": global_query_tokens,
-        "key_block_index": cache_block_index("Key", "block_offsets"),
-        "key_dim_index": cache_dim_index("Key", "dim_offsets"),
-        "key_lane": cache_lane("Key", "dim_offsets", "block_offsets"),
+        "key_dim_axis": key_dim_axis,
+        "key_mask": _broadcast_axis_coordinate(
+            "context_mask", key_dim_axis["rank"], key_dim_axis["rank"] - 1
+        ),
+        "key_structured_shape": _structured_value_shape(
+            key_dim_axis, trailing_extents=(attention_block_size,)
+        ),
         "key_vector_offset": key_vector_offset,
         "local_q_heads": model["OutputShape"][model["HeadAxis"]],
         "local_query_tokens": local_query_tokens,
-        "output_vector_offset": tensor_offset(
+        "output_access": _tensor_access(
+            output_indices,
             model["OutputStrides"],
-            model["SeqAxis"],
-            model["HeadAxis"],
-            model["DimAxis"],
-            "q_head",
-            "query_dim_blocks",
-            "local_query_id",
-            "query_dim_lanes",
-            cache["KeyLaneCount"],
+            query_dim_axis["lane_coordinates"],
+            output_lanes,
+            _coordinate_shape(query_dim_axis["structured_shape"]),
         ),
-        "query_vector_offset": tensor_offset(
+        "query_access": _tensor_access(
+            query_indices,
             model["QueryStrides"],
-            model["SeqAxis"],
-            model["HeadAxis"],
-            model["DimAxis"],
-            "q_head",
-            "query_dim_blocks",
-            "local_query_id",
-            "query_dim_lanes",
-            cache["KeyLaneCount"],
+            query_dim_axis["lane_coordinates"],
+            query_lanes,
+            _coordinate_shape(query_dim_axis["structured_shape"]),
         ),
-        "value_block_index": cache_block_index("Value", "block_offsets"),
-        "value_dim_index": cache_dim_index("Value", "dim_offsets"),
-        "value_lane": cache_lane("Value", "dim_offsets", "block_offsets"),
+        "query_dim_axis": query_dim_axis,
+        "query_structured_shape": query_dim_axis["structured_shape"],
+        "value_axis": value_axis,
+        "value_axis_kind": value_axis_kind,
+        "value_mask": value_mask,
+        "value_structured_shape": value_structured_shape,
         "value_vector_offset": value_vector_offset,
     }
 
@@ -4054,13 +5870,28 @@ def _paged_attention_template_context(model: dict[str, Any]) -> dict[str, Any]:
 def _update_paged_attention_kv_cache_template_context(
     model: dict[str, Any],
 ) -> dict[str, Any]:
-    """Prepare UpdatePagedAttentionKVCache's cache and slot addresses."""
+    """Prepare coordinate-native cache and slot addresses."""
 
     cache = model["Cache"]
     kind_prefix = "Key" if model["CacheKind"] == 0 else "Value"
     lane_count = cache[f"{kind_prefix}LaneCount"]
     vectorized_dim = cache[f"{kind_prefix}VectorizedDim"]
-    slots_lane_count = model["SlotsVectorLaneCount"]
+    slots_lane_shape = _validate_coordinate_lane_shape(
+        model["SlotsVectorLaneShape"], "PyNTT UpdatePagedAttentionKVCache slots"
+    )
+    slots_lane_count = (
+        _product_int(list(slots_lane_shape)) if slots_lane_shape else 1
+    )
+    if slots_lane_count != int(model["SlotsVectorLaneCount"]):
+        raise ValueError(
+            "PyNTT UpdatePagedAttentionKVCache slot lane shape/count mismatch: "
+            f"shape={slots_lane_shape}, count={model['SlotsVectorLaneCount']}"
+        )
+    if vectorized_dim == 5 and lane_count != slots_lane_count:
+        raise ValueError(
+            "PyNTT key-cache HeadDim lanes must match the slot tensor lanes: "
+            f"cache={lane_count}, slots={slots_lane_count}."
+        )
     source_split_axes = sorted(
         {
             axis
@@ -4088,60 +5919,35 @@ def _update_paged_attention_kv_cache_template_context(
         "cache_lane_id)"
     )
 
-    def slot_offset(lane_expr: str | None = "source_lane_id") -> str:
-        terms = [
-            f"source_idx{axis} * {_dim(model['SlotsStrides'][axis])}"
-            for axis in range(len(model["SlotsStrides"]))
-        ]
-        element_offset = "linear * 0" if not terms else " + ".join(terms)
-        if slots_lane_count == 1:
-            return element_offset
-        if lane_expr is None:
-            return f"(({element_offset}) * {slots_lane_count})"
-        return f"(({element_offset}) * {slots_lane_count} + {lane_expr})"
-
-    def local_index_name(axis: int) -> str:
-        if axis == model["SeqAxis"]:
-            return "token_id"
-        if axis == model["HeadAxis"]:
-            return "head_id"
-        if axis == model["DimAxis"]:
-            return "source_dim_block"
-        return f"local_idx{axis}"
-
-    use_key_vector_copy = (
-        model["CacheKind"] == 0
-        and vectorized_dim == 5
-        and slots_lane_count == lane_count
-        and slots_lane_count > 1
-        and slots_lane_count & (slots_lane_count - 1) == 0
-        and cache["HeadDim"] % lane_count == 0
-        and cache.get("TritonDType") == model["SlotsTritonDType"]
+    context = _coordinate_iteration_context(
+        model["SlotsShape"],
+        model["SlotsStrides"],
+        model["SlotsVectorLaneShape"],
+        "PyNTT UpdatePagedAttentionKVCache",
+        model["Slots"],
     )
-    total_factors = [
-        _dim(model["SlotsShape"][model["SeqAxis"]]),
-        _dim(model["SlotsShape"][model["HeadAxis"]]),
-        _dim(model["SlotsShape"][model["DimAxis"]]),
-    ]
-    if not use_key_vector_copy:
-        total_factors.append(str(slots_lane_count))
-    total_elements = " * ".join(f"({value})" for value in total_factors)
-    return {
+    source_lane_id = _flatten_coordinates(
+        context["block_lane_coordinates"], context["lane_shape"]
+    )
+    context.update({
         "cache_offset": cache_offset,
         "kind_prefix": kind_prefix,
         "lane_count": lane_count,
-        "local_indices": tuple(
-            local_index_name(axis) for axis in range(len(model["SlotsShape"]))
-        ),
         "non_data_axes": tuple(
             axis
             for axis in range(len(model["SlotsGlobalShape"]))
             if axis not in (model["SeqAxis"], model["HeadAxis"], model["DimAxis"])
         ),
-        "slot_offset": slot_offset(None if use_key_vector_copy else "source_lane_id"),
+        "slots_access": _tensor_access(
+            context["tensor_coordinates"],
+            model["SlotsStrides"],
+            context["lane_coordinates"],
+            context["lane_shape"],
+            context["tile_shape"],
+        ),
         "slots_lane_count": slots_lane_count,
+        "source_lane_id": source_lane_id,
         "topology_match_axes": topology_match_axes,
-        "total_elements": total_elements,
-        "use_key_vector_copy": use_key_vector_copy,
         "vectorized_dim": vectorized_dim,
-    }
+    })
+    return context

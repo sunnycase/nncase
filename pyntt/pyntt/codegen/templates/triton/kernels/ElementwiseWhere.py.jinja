@@ -1,13 +1,6 @@
 {% import "triton/kernels/_common.py.jinja" as common with context %}
-{% set logical_cond_shape = logical_shape(model["CondShape"], model["CondVectorLaneCount"]) %}
-{% set logical_true_shape = logical_shape(model["TrueShape"], model["TrueVectorLaneCount"]) %}
-{% set logical_false_shape = logical_shape(model["FalseShape"], model["FalseVectorLaneCount"]) %}
-{% set logical_output_shape = logical_shape(model["OutputShape"], model["OutputVectorLaneCount"]) %}
-{% set logical_output_strides = logical_strides(model["OutputStrides"], model["OutputVectorLaneCount"]) %}
-{% set rank = logical_output_shape | length %}
-{% set block_axis = select_block_axis(logical_output_shape, logical_output_strides) %}
-{% set block_extent = 1 if rank == 0 else logical_output_shape[block_axis] %}
-{% set loop_axes = axes_except(rank, block_axis) %}
+{% import "triton/kernels/_elementwise.py.jinja" as elementwise with context %}
+{% set ctx = elementwise_where_context(model) %}
 # generated from PyNTT Jinja ElementwiseWhere.py.jinja
 # {{ model["Comment"] }}; cond_dtype={{ model["CondDType"] }}, value_dtype={{ model["ValueDType"] }}, output_dtype={{ model["OutputDType"] }}, shape={{ shape_tuple(model["Shape"]) }}
 {{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
@@ -19,19 +12,11 @@ def {{ model["FunctionName"] }}({{ helper_parameters(model) }}):
     {{ name }} = {{ ptr(model, key) }}
 {% endif %}
 {% endfor %}
-{% for axis in loop_axes %}
-{{ "    " * loop.index }}for idx{{ axis }} in tl.range(0, {{ dim(logical_output_shape[axis]) }}):
-{% endfor %}
-{{ "    " * ((loop_axes | length) + 1) }}for axis_start in tl.range(0, {{ dim(block_extent) }}, block_size):
-{{ "    " * ((loop_axes | length) + 2) }}lane = axis_start + tl.arange(0, block_size)
-{{ "    " * ((loop_axes | length) + 2) }}mask = lane < {{ dim(block_extent) }}
-{{ "    " * ((loop_axes | length) + 2) }}cond_offsets = {{ common.where_offset(model["CondShape"], logical_cond_shape, model["CondStrides"], model["CondVectorLaneCount"], rank, block_axis) }}
-{{ "    " * ((loop_axes | length) + 2) }}true_offsets = {{ common.where_offset(model["TrueShape"], logical_true_shape, model["TrueStrides"], model["TrueVectorLaneCount"], rank, block_axis) }}
-{{ "    " * ((loop_axes | length) + 2) }}false_offsets = {{ common.where_offset(model["FalseShape"], logical_false_shape, model["FalseStrides"], model["FalseVectorLaneCount"], rank, block_axis) }}
-{{ "    " * ((loop_axes | length) + 2) }}output_offsets = {{ common.where_offset(model["OutputShape"], logical_output_shape, model["OutputStrides"], model["OutputVectorLaneCount"], rank, block_axis) }}
-{{ "    " * ((loop_axes | length) + 2) }}predicate_value = tl.load({{ access_pointer(model, "Cond", "cond", "cond_offsets") }}, mask=mask, other=0)
-{{ "    " * ((loop_axes | length) + 2) }}predicate = {{ "(predicate_value != 0)" if is_bool_dtype(model["CondDType"]) else "predicate_value" }}
-{{ "    " * ((loop_axes | length) + 2) }}value0 = tl.load({{ access_pointer(model, "TrueValue", "true_value", "true_offsets") }}, mask=mask, other=0.0)
-{{ "    " * ((loop_axes | length) + 2) }}value1 = tl.load({{ access_pointer(model, "FalseValue", "false_value", "false_offsets") }}, mask=mask, other=0.0)
-{{ "    " * ((loop_axes | length) + 2) }}result = tl.where(predicate, value0, value1)
-{{ "    " * ((loop_axes | length) + 2) }}tl.store({{ access_pointer(model, "Output", "output", "output_offsets") }}, {{ "(result).to(tl.uint8)" if is_bool_dtype(model["OutputDType"]) else "result" }}, mask=mask)
+{% call(indent) elementwise.iterate(ctx) %}
+{{ indent }}predicate_value = tl.load({{ access_pointer(model, "Cond", "cond", ctx["cond_access"]) }}, mask=mask, other=0)
+{{ indent }}predicate = {{ "(predicate_value != 0)" if is_bool_dtype(model["CondDType"]) else "predicate_value" }}
+{{ indent }}value0 = tl.load({{ access_pointer(model, "TrueValue", "true_value", ctx["true_access"]) }}, mask=mask, other=0.0)
+{{ indent }}value1 = tl.load({{ access_pointer(model, "FalseValue", "false_value", ctx["false_access"]) }}, mask=mask, other=0.0)
+{{ indent }}result = tl.where(predicate, value0, value1)
+{{ indent }}tl.store({{ access_pointer(model, "Output", "output", ctx["output_access"]) }}, {{ "(result).to(tl.uint8)" if is_bool_dtype(model["OutputDType"]) else "result" }}, mask=mask)
+{% endcall %}

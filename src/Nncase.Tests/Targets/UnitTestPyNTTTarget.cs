@@ -309,8 +309,9 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         Assert.DoesNotContain("full_tile", generatedKernels, StringComparison.Ordinal);
         Assert.DoesNotContain("tle.gpu.copy", generatedKernels, StringComparison.Ordinal);
         Assert.DoesNotContain("copy_shared", generatedKernels, StringComparison.Ordinal);
-        Assert.Contains("value = tl.load(source + source_offset, mask=mask)", generatedKernels, StringComparison.Ordinal);
-        Assert.Contains("tl.store(destination + destination_offset, value, mask=mask)", generatedKernels, StringComparison.Ordinal);
+        Assert.Contains("value = tl.load(source + copy_idx0, mask=mask)", generatedKernels, StringComparison.Ordinal);
+        Assert.Contains("tl.store(destination + copy_idx0, value, mask=mask)", generatedKernels, StringComparison.Ordinal);
+        Assert.Contains("tle.gpu.local_ptr(dynamic_tile_shared_buffer_0, (copy_idx0,))", generatedKernels, StringComparison.Ordinal);
         AssertGeneratedModelRuns(
             outputDirectory,
             "for extent in (17, 32):",
@@ -414,7 +415,21 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         var output = CreateOutputVar("output", tensorType);
         var inputBuffer = TIR.T.AttachBuffer(input, tensorType, TIR.MemoryLocation.Input, 0, out _, "input_buffer");
         var inputDataBuffer = CreateBuffer("input_data", DataTypes.Float32, TIR.MemoryLocation.Data, 0, [5, 2, 8], [16, 8, 1]);
-        var sharedBuffer = CreateBuffer("shared_tile", DataTypes.Float32, TIR.MemoryLocation.Shared, 0, [5, 2, 8], [16, 8, 1]);
+        var sharedBuffer = new TIR.Buffer(
+            "shared_tile",
+            DataTypes.Float32,
+            new TIR.MemSpan(
+                new TIR.PhysicalBuffer(4, 0, 512, TIR.MemoryLocation.Shared),
+                0,
+                320),
+            [5, 2, 8],
+            [16, 8, 1],
+            null,
+            new TargetStorageEncodingSelection(
+                TritonTargetStorageEncodingModel.SwizzledShared,
+                512,
+                16,
+                Array.Empty<KeyValuePair<string, long>>()));
         var resultBuffer = CreateBuffer("result_data", DataTypes.Float32, TIR.MemoryLocation.Data, 320, [5, 2, 8], [16, 8, 1]);
         var placement = new Placement(new[] { 1 }, "b", "b");
         var sharedCopy = TIR.T.Let(
@@ -1203,9 +1218,13 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         var output = CreateOutputVar("output", outputType);
         var body = new TIR.Sequential(
             TIR.F.NTT.TensorLoad(scalarInput, input, inputDistributedType.AxisPolicies, placement),
+            TIR.F.NTT.Barrier(TIR.NTT.BarrierScope.Block),
             TIR.F.NTT.Pack(scalarInput, vector32Input, new[] { 4, 8 }, new[] { 2, 2 }),
+            TIR.F.NTT.Barrier(TIR.NTT.BarrierScope.Block),
             TIR.F.NTT.Transpose(vector32Input, vector32Output, new[] { 1, 0, 2 }),
+            TIR.F.NTT.Barrier(TIR.NTT.BarrierScope.Block),
             TIR.F.NTT.Unpack(vector32Output, scalarOutput, new[] { 4, 8 }, new[] { 2, 2 }),
+            TIR.F.NTT.Barrier(TIR.NTT.BarrierScope.Block),
             TIR.F.NTT.TensorStore(scalarOutput, output, outputDistributedType.AxisPolicies, placement));
         var main = new TIR.PrimFunction(
             "main_prim",
@@ -1224,9 +1243,10 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         RenderGeneratedKernels(outputDirectory);
         var generatedKernelsPy = File.ReadAllText(Path.Join(outputDirectory, "generated_kernels.py"));
         Assert.Contains("generated from PyNTT Jinja Transpose.py.jinja", generatedKernelsPy, StringComparison.Ordinal);
-        Assert.Contains("lane_flat = linear % 32", generatedKernelsPy, StringComparison.Ordinal);
-        Assert.Contains("in_idx2 = out_idx2 * 32 + lane0 * 8 + lane1", generatedKernelsPy, StringComparison.Ordinal);
-        Assert.Contains("out_idx2 = in_idx2 * 32 + lane0 * 8 + lane1", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.DoesNotContain("lane_flat = linear % 32", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("lane_raw0 = tl.arange(0, 4)", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("lane_raw1 = tl.arange(0, 8)", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("(coord2) * 32 + (lane_coord0) * 8 + lane_coord1", generatedKernelsPy, StringComparison.Ordinal);
         AssertGeneratedModelRuns(
             outputDirectory,
             "x = ((torch.arange(2 * 3 * 32, dtype=torch.float32, device='cuda').reshape(2, 3, 32) - 37) * 0.015625).to(torch.bfloat16)",
@@ -1749,16 +1769,39 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
             Assert.Equal("triton.gemv", model.GetProperty("MicroKernelFamily").GetString());
             Assert.Contains(
                 model.GetProperty("MicroKernelVariant").GetString(),
-                new[] { "register_simt_accumulator", "register_mma_accumulator", "shared_simt_accumulator", "shared_mma_accumulator" });
-            Assert.True(model.GetProperty("MicroKernelInnerN").GetInt32() > 0);
-            Assert.True(model.GetProperty("MicroKernelInnerK").GetInt32() > 0);
+                new[] { "register_simt_accumulator", "register_mma_accumulator" });
+            var parameters = model.GetProperty("MicroKernelParameters");
+            Assert.Equal(
+                TritonBlockMicroKernelContract.Version,
+                parameters.GetProperty("contract_version").GetInt64());
+            Assert.Equal(
+                model.GetProperty("ReductionBlockM").GetInt32(),
+                parameters.GetProperty("state_block_m").GetInt32());
+            Assert.Equal(
+                model.GetProperty("ReductionBlockN").GetInt32(),
+                parameters.GetProperty("state_block_n").GetInt32());
+            Assert.Equal(
+                model.GetProperty("ReductionBlockK").GetInt32(),
+                parameters.GetProperty("state_block_k").GetInt32());
+            Assert.True(parameters.GetProperty("inner_n").GetInt32() > 0);
+            Assert.True(parameters.GetProperty("inner_k").GetInt32() > 0);
         });
 
         RenderGeneratedKernels(outputDirectory);
         var generatedKernelsPy = File.ReadAllText(Path.Join(outputDirectory, "generated_kernels.py"));
-        foreach (var blockK in models.Select(model => model.GetProperty("ReductionBlockK").GetInt32()).Distinct())
+        foreach (var model in models)
         {
-            Assert.Contains($"offs_k = tl.arange(0, {blockK})", generatedKernelsPy, StringComparison.Ordinal);
+            var blockK = model.GetProperty("ReductionBlockK").GetInt32();
+            var parameters = model.GetProperty("MicroKernelParameters");
+            var innerK = parameters.GetProperty("inner_k").GetInt32();
+            if (model.GetProperty("MicroKernelVariant").GetString()!.Contains("simt", StringComparison.Ordinal))
+            {
+                Assert.Contains($"tl.range(0, {blockK}, {innerK})", generatedKernelsPy, StringComparison.Ordinal);
+            }
+            else
+            {
+                Assert.Contains($"offs_k = tl.arange(0, {blockK})", generatedKernelsPy, StringComparison.Ordinal);
+            }
         }
 
         AssertGeneratedModelRuns(
@@ -2167,6 +2210,53 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
             "rotated = torch.cat((-input[..., half:], input[..., :half]), dim=-1)",
             "expect = (input.to(torch.float32) * cos + rotated.to(torch.float32) * sin).to(torch.bfloat16)",
             "output = module(input, cos, sin)",
+            "torch.testing.assert_close(output.to(torch.float32), expect.to(torch.float32), rtol=2e-2, atol=2e-2)");
+    }
+
+    [Fact]
+    public async Task TestPyNTTPackedSinCosRoPEQwenLikeRun()
+    {
+        ConfigureAutoDistributedPyNTT();
+        var targetOptions = Assert.IsType<PyNTTTargetOptions>(CompileOptions.TargetOptions);
+        targetOptions.Hierarchies = [new[] { 1, 1 }];
+
+        const int seq = 2;
+        const int heads = 1;
+        const int headDim = 128;
+        var input = new Var("input", new TensorType(DataTypes.BFloat16, new[] { seq, heads, headDim }));
+        var cos = Tensor.From<float>(
+            Enumerable.Range(0, seq * heads * headDim).Select(i => 0.5f + ((i % 7) * 0.05f)).ToArray(),
+            [seq, heads, headDim]);
+        var sin = Tensor.From<float>(
+            Enumerable.Range(0, seq * heads * headDim).Select(i => -0.3f + ((i % 5) * 0.1f)).ToArray(),
+            [seq, heads, headDim]);
+        var packedInput = IR.F.Tensors.Pack(input, [8], [2]);
+        var packedCos = IR.F.Tensors.Pack(cos, [2, 8], [2, 2]);
+        var packedSin = IR.F.Tensors.Pack(sin, [2, 8], [2, 2]);
+        var output = IR.F.Tensors.Unpack(
+            IR.F.NTT.VectorizedRoPE(packedInput, packedCos, packedSin),
+            [8],
+            [2]);
+        var main = new Function("main", PyNTTTarget.Kind, output, new[] { input });
+
+        var outputDirectory = await GeneratePyNTTModelDirectoryWithCompilerPipeline(
+            "generated_qwen_like_packed_sincos_rope_run_model",
+            main);
+        RenderGeneratedKernels(outputDirectory);
+        var generatedKernelsPy = File.ReadAllText(Path.Join(outputDirectory, "generated_kernels.py"));
+        Assert.Contains("generated from PyNTT Jinja RoPE.py.jinja", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("logical_rotary = ((coord2) * 2 + (raw_lane_coord0)) * 8 + (raw_lane_coord1)", generatedKernelsPy, StringComparison.Ordinal);
+        AssertGeneratedModelRuns(
+            outputDirectory,
+            "torch.manual_seed(13)",
+            $"input = (torch.randn({seq}, {heads}, {headDim}, dtype=torch.float32, device='cuda') * 0.1).to(torch.bfloat16)",
+            $"indices = torch.arange({seq * heads * headDim}, dtype=torch.int64, device='cuda').reshape({seq}, {heads}, {headDim})",
+            "cos = 0.5 + (indices % 7).to(torch.float32) * 0.05",
+            "sin = -0.3 + (indices % 5).to(torch.float32) * 0.1",
+            $"half = {headDim} // 2",
+            "rotated = torch.cat((-input[..., half:], input[..., :half]), dim=-1)",
+            "expect = (input.to(torch.float32) * cos + rotated.to(torch.float32) * sin).to(torch.bfloat16)",
+            "output = module(input)",
             "torch.testing.assert_close(output.to(torch.float32), expect.to(torch.float32), rtol=2e-2, atol=2e-2)");
     }
 

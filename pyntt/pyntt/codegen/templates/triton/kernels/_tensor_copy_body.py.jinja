@@ -1,25 +1,13 @@
+{% import "triton/kernels/_elementwise.py.jinja" as elementwise with context %}
     tmp_shard = shard_index
 {% for axis in reverse_indices(model["Hierarchy"]) %}
     shard_coord{{ axis }} = tmp_shard % {{ model["Hierarchy"][axis] }}
     tmp_shard = tmp_shard // {{ model["Hierarchy"][axis] }}
 {% endfor %}
-{% for axis in ctx["loop_axes"] %}
-{{ "    " * loop.index }}for idx{{ axis }} in tl.range(0, {{ dim(ctx["local_shape"][axis]) }}):
-{% endfor %}
-{% set axis_indent = "    " * ((ctx["loop_axes"] | length) + 1) %}
-{% set body_indent = "    " * ((ctx["loop_axes"] | length) + 2) %}
-{{ axis_indent }}for axis_start in tl.range(0, {{ dim(ctx["block_extent"]) }}, block_size):
-{{ body_indent }}lane = axis_start + tl.arange(0, block_size)
-{{ body_indent }}mask = lane < {{ dim(ctx["block_extent"]) }}
+{% call(indent) elementwise.iterate(ctx) %}
 {% for axis in range(ctx["global_shape"] | length) %}
-{{ body_indent }}global_idx{{ axis }} = {{ "lane" if axis == ctx["block_axis"] else "idx" ~ axis }} + {{ dim(model["GlobalOffsets"][axis]) }}
-{{ body_indent }}mask = mask & (global_idx{{ axis }} < {{ dim(ctx["global_shape"][axis]) }})
+{{ indent }}mask = mask & ({{ ctx["global_coordinates"][axis] }} < {{ dim(ctx["global_shape"][axis]) }})
 {% endfor %}
-{% set copy_indent = body_indent ~ ("    " if ctx["vector_lane_count"] != 1 else "") %}
-{% if ctx["vector_lane_count"] != 1 %}
-{{ body_indent }}for vector_lane in tl.range(0, {{ ctx["vector_lane_count"] }}):
-{% endif %}
-{{ copy_indent }}source_offsets = {{ ctx["source_offsets"] }}
-{{ copy_indent }}destination_offsets = {{ ctx["destination_offsets"] }}
-{{ copy_indent }}value = tl.load({{ access_pointer(model, "Source", "source", "source_offsets") }}, mask=mask, other=0.0)
-{{ copy_indent }}tl.store({{ access_pointer(model, "Destination", "destination", "destination_offsets") }}, value, mask=mask)
+{{ indent }}value = tl.load({{ access_pointer(model, "Source", "source", ctx["source_access"]) }}, mask=mask, other=0.0)
+{{ indent }}tl.store({{ access_pointer(model, "Destination", "destination", ctx["destination_access"]) }}, value, mask=mask)
+{% endcall %}

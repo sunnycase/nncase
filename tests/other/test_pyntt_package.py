@@ -194,6 +194,15 @@ def test_pyntt_runtime_materializes_zero_copy_input_result_views():
     assert bytes_view.data_ptr() == x.data_ptr()
 
 
+def test_pyntt_renderer_rejects_incompatible_manifest_version():
+    _add_pyntt_to_path()
+
+    from pyntt.codegen.render import render_manifest
+
+    with pytest.raises(ValueError, match="expected 3"):
+        render_manifest({"pyntt_codegen_manifest_version": 1, "functions": []})
+
+
 def test_pyntt_renderer_uses_explicit_device_arguments_and_tiling_shared_arena():
     _add_pyntt_to_path()
 
@@ -201,6 +210,7 @@ def test_pyntt_renderer_uses_explicit_device_arguments_and_tiling_shared_arena()
 
     source = render_manifest(
         {
+            "pyntt_codegen_manifest_version": 3,
             "functions": [
                 {
                     "render_kernels": [
@@ -288,7 +298,7 @@ def test_pyntt_renderer_inlines_helpers_with_tensor_value_abi():
     assert [model["NumWarps"] for model in rendered_models] == [8, 8]
 
 
-def test_pyntt_gemv_shared_accumulator_is_lowered_by_the_selected_template():
+def test_pyntt_gemv_register_accumulator_is_lowered_by_the_selected_template():
     _add_pyntt_to_path()
 
     from pyntt.codegen.render import _make_env
@@ -314,7 +324,7 @@ def test_pyntt_gemv_shared_accumulator_is_lowered_by_the_selected_template():
         "LocalBuffer": None,
     }
     model = {
-        "FunctionName": "shared_gemv_accumulate",
+        "FunctionName": "register_gemv_accumulate",
         "Lhs": pointer,
         "Rhs": pointer,
         "Output": pointer,
@@ -338,7 +348,7 @@ def test_pyntt_gemv_shared_accumulator_is_lowered_by_the_selected_template():
         "RhsNPackedLaneCount": 1,
         "OutputNPackedLaneCount": 1,
         "Scale": "1",
-        "Comment": "shared GEMV regression",
+        "Comment": "register GEMV regression",
         "RuntimeShapeArgs": [],
         "LoadCExpression": "False",
         "ReductionPhase": "accumulate",
@@ -346,14 +356,20 @@ def test_pyntt_gemv_shared_accumulator_is_lowered_by_the_selected_template():
         "ReductionBlockN": 256,
         "ReductionBlockK": 256,
         "MicroKernelFamily": "triton.gemv",
-        "MicroKernelVariant": "shared_mma_accumulator",
-        "MicroKernelInnerM": 8,
-        "MicroKernelInnerN": 128,
-        "MicroKernelInnerK": 16,
-        "MicroKernelPipelineStages": 2,
-        "MicroKernelMmaM": 16,
-        "MicroKernelMmaN": 8,
-        "MicroKernelMmaK": 16,
+        "MicroKernelVariant": "register_mma_accumulator",
+        "MicroKernelParameters": {
+            "contract_version": 2,
+            "state_block_m": 1,
+            "state_block_n": 256,
+            "state_block_k": 256,
+            "inner_m": 8,
+            "inner_n": 128,
+            "inner_k": 16,
+            "pipeline_stages": 2,
+            "mma_m": 16,
+            "mma_n": 8,
+            "mma_k": 16,
+        },
         "NumWarps": 8,
         "NoInline": False,
     }
@@ -362,36 +378,354 @@ def test_pyntt_gemv_shared_accumulator_is_lowered_by_the_selected_template():
         model=model
     )
 
-    assert "for acc_n_start in tl.range(0, 256, 128)" in source
+    assert "for acc_n_start" not in source
+    assert "rhs_n_physical = tl.arange(0, 256)[:, None]" in source
+    assert "rhs_n_logical = rhs_n_physical" in source
+    assert "offs_n" not in source
     assert "offs_m = tl.arange(0, 8)" in source
     assert "lhs_columns = tl.where(offs_m[None, :] == 0, lhs_values[:, None], 0.0)" in source
     assert "partial_transposed = tl.dot(rhs_values, lhs_columns)" in source
-    assert "partial = tl.sum(partial_transposed, axis=1)" in source
-    assert "acc_ptr = tle.gpu.local_ptr(acc, (offs_n,))" in source
-    assert "tl.store(acc_ptr, acc_values + partial" in source
+    assert "acc += tl.sum(partial_transposed, axis=1)" in source
     assert "tl.sum(rhs_values * lhs_values[None, :], axis=1)" not in source
-    assert "return acc" not in source
+    assert "tle.gpu.local_ptr(acc" not in source
+    assert "return acc" in source
 
     simt_model = dict(model)
-    simt_model["MicroKernelVariant"] = "shared_simt_accumulator"
-    simt_model["MicroKernelInnerN"] = 64
+    simt_model["MicroKernelVariant"] = "register_simt_accumulator"
+    simt_model["MicroKernelParameters"] = {
+        "contract_version": 2,
+        "state_block_m": 1,
+        "state_block_n": 256,
+        "state_block_k": 256,
+        "inner_m": 1,
+        "inner_n": 256,
+        "inner_k": 32,
+        "pipeline_stages": 1,
+    }
     simt_source = _make_env().get_template(
         "triton/kernels/Gemv.py.jinja"
     ).render(model=simt_model)
     assert "tl.dot(" not in simt_source
+    assert "for reduction_k_start in tl.range(0, 256, 32):" in simt_source
+    assert "partial = acc" in simt_source
+    assert "offs_k = reduction_k_start + tl.arange(0, 32)" in simt_source
     assert "tl.sum(rhs_values * lhs_values[None, :], axis=1)" in simt_source
+    assert "tle.gpu.local_ptr(acc" not in simt_source
+    assert "return partial" in simt_source
+
+    packed_simt_model = dict(simt_model)
+    packed_simt_model.update(
+        Rhs={
+            "Expression": "packed_rhs",
+            "ShardCoordHierarchy": None,
+            "AddressSpace": 3,
+            "LocalBuffer": {
+                "DescriptorExpression": "packed_rhs",
+                "DescriptorShape": [8, 256, 4, 8],
+                "LogicalShape": [8, 256],
+                "LogicalStrides": [256, 1],
+                "BaseCoordinates": [fixed(0), fixed(0)],
+                "VectorLaneShape": [4, 8],
+                "AvailableBytes": 8 * 256 * 4 * 8 * 2,
+                "ScalarElementSizeBytes": 2,
+                "StorageEncoding": "triton.shared.swizzled",
+            },
+        },
+        RhsShape=[fixed(8), fixed(256)],
+        RhsStrides=[fixed(256), fixed(1)],
+        RhsNVectorLaneCount=8,
+        RhsNPackedLaneCount=4,
+    )
+    packed_simt_source = _make_env().get_template(
+        "triton/kernels/Gemv.py.jinja"
+    ).render(model=packed_simt_model)
+    assert "rhs_n_physical = tl.arange(0, 8)[None, :, None, None]" in packed_simt_source
+    assert "offs_k[:, None, None, None]" in packed_simt_source
+    assert "shape=(32, 8, 4, 8)" in packed_simt_source
+    assert "tl.reshape(tl.load(" in packed_simt_source
+    assert ", (32, 256)).to(tl.float32)" in packed_simt_source
+    assert "tl.sum(rhs_values * lhs_values[:, None], axis=0)" in packed_simt_source
+    assert "tl.sum(rhs_values * lhs_values[None, :], axis=1)" not in packed_simt_source
+
+    simt_finalize_model = dict(
+        simt_model,
+        FunctionName="register_gemv_finalize",
+        ReductionPhase="finalize",
+    )
+    simt_finalize_source = _make_env().get_template(
+        "triton/kernels/Gemv.py.jinja"
+    ).render(model=simt_finalize_model)
+    assert "tl.inline_asm_elementwise(" in simt_finalize_source
+    assert "st.global.b16" in simt_finalize_source
+    assert "pyntt_store_offsets" in simt_finalize_source
+
+    local_finalize_model = dict(simt_finalize_model)
+    local_finalize_model["Output"] = {
+        "Expression": "unused",
+        "ShardCoordHierarchy": None,
+        "AddressSpace": 3,
+        "LocalBuffer": {
+            "DescriptorExpression": "output_tile",
+            "DescriptorShape": [1, 1, 8, 32],
+            "LogicalShape": [1, 256],
+            "LogicalStrides": [256, 1],
+            "BaseCoordinates": [fixed(0), fixed(0)],
+            "VectorLaneShape": [],
+            "AvailableBytes": 512,
+            "ScalarElementSizeBytes": 2,
+            "StorageEncoding": "triton.shared.swizzled",
+        },
+    }
+    local_finalize_source = _make_env().get_template(
+        "triton/kernels/Gemv.py.jinja"
+    ).render(model=local_finalize_model)
+    assert "tle.gpu.local_ptr(output_tile)" in local_finalize_source
+    assert "tl.reshape(pyntt_store_value, (1, 1, 8, 32))" in local_finalize_source
+    assert "tl.inline_asm_elementwise(" not in local_finalize_source
+
+    for removed_variant in (
+        "shared_simt_accumulator",
+        "shared_mma_accumulator",
+    ):
+        removed_model = dict(model, MicroKernelVariant=removed_variant)
+        with pytest.raises(ValueError, match="Unsupported Matmul block microkernel"):
+            _make_env().get_template("triton/kernels/Gemv.py.jinja").render(
+                model=removed_model
+            )
+
+    invalid_parameter_model = dict(simt_model)
+    invalid_parameter_model["MicroKernelParameters"] = dict(
+        simt_model["MicroKernelParameters"], inner_k="32"
+    )
+    with pytest.raises(ValueError, match="must be an integer"):
+        _make_env().get_template("triton/kernels/Gemv.py.jinja").render(
+            model=invalid_parameter_model
+        )
 
     tail_model = dict(model)
     tail_model["RhsShape"] = [fixed(32), fixed(256)]
     tail_model["OutputShape"] = [fixed(1), fixed(32)]
     tail_model["OutputStrides"] = [fixed(32), fixed(1)]
     tail_model["ReductionBlockN"] = 32
+    tail_model["MicroKernelParameters"] = dict(
+        model["MicroKernelParameters"], state_block_n=32, inner_n=32
+    )
     tail_source = _make_env().get_template(
         "triton/kernels/Gemv.py.jinja"
     ).render(model=tail_model)
     assert "tl.arange(0, 32)" in tail_source
-    assert "for acc_n_start in tl.range(0, 32, 32)" in tail_source
+    assert "for acc_n_start" not in tail_source
     assert "partial_transposed = tl.dot(rhs_values, lhs_columns)" in tail_source
+
+
+def test_pyntt_simt_gemv_contract_lowers_to_warp_local_k(tmp_path):
+    import importlib.util
+    import re
+
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("triton")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required to inspect compiled Triton layouts")
+
+    _add_pyntt_to_path()
+
+    from pyntt.codegen.render import _make_env
+
+    block_n = 32
+    block_k = 512
+    inner_k = 32
+
+    def fixed(value):
+        return {
+            "PythonExpression": str(value),
+            "TritonExpression": str(value),
+            "FixedValue": value,
+            "RangeMin": None,
+            "RangeMax": None,
+            "IsFixed": True,
+            "IsFixedOne": value == 1,
+            "IsFixedNonOne": value != 1,
+            "MinValue": value,
+            "MaxValue": value,
+        }
+
+    def pointer(expression):
+        return {
+            "Expression": expression,
+            "ShardCoordHierarchy": None,
+            "AddressSpace": 1,
+            "LocalBuffer": None,
+        }
+
+    model = {
+        "FunctionName": "gemv_contract",
+        "Lhs": pointer("data"),
+        "Rhs": pointer("rdata"),
+        "Output": pointer("data"),
+        "LhsDType": "bfloat16",
+        "RhsDType": "bfloat16",
+        "OutputDType": "float32",
+        "LhsTritonDType": "tl.bfloat16",
+        "RhsTritonDType": "tl.bfloat16",
+        "OutputTritonDType": "tl.float32",
+        "LhsShape": [fixed(1), fixed(block_k)],
+        "RhsShape": [fixed(block_n), fixed(block_k)],
+        "OutputShape": [fixed(1), fixed(block_n)],
+        "LhsStrides": [fixed(block_k), fixed(1)],
+        "RhsStrides": [fixed(block_k), fixed(1)],
+        "OutputStrides": [fixed(block_n), fixed(1)],
+        "TransposeA": False,
+        "TransposeB": True,
+        "Hierarchy": [1],
+        "RhsNVectorLaneCount": 1,
+        "OutputNVectorLaneCount": 1,
+        "RhsNPackedLaneCount": 1,
+        "OutputNPackedLaneCount": 1,
+        "Scale": "1",
+        "Comment": "SIMT GEMV execution-contract regression",
+        "RuntimeShapeArgs": [],
+        "LoadCExpression": "False",
+        "ReductionPhase": "accumulate",
+        "ReductionBlockM": 1,
+        "ReductionBlockN": block_n,
+        "ReductionBlockK": block_k,
+        "MicroKernelFamily": "triton.gemv",
+        "MicroKernelVariant": "register_simt_accumulator",
+        "MicroKernelParameters": {
+            "contract_version": 2,
+            "state_block_m": 1,
+            "state_block_n": block_n,
+            "state_block_k": block_k,
+            "inner_m": 1,
+            "inner_n": block_n,
+            "inner_k": inner_k,
+            "pipeline_stages": 1,
+        },
+        "NumWarps": 8,
+        "NoInline": False,
+    }
+    helper_source = _make_env().get_template(
+        "triton/kernels/Gemv.py.jinja"
+    ).render(model=model)
+    assert "tle.gpu.local_ptr(acc" not in helper_source
+    finalize_model = dict(
+        model,
+        FunctionName="gemv_contract_finalize",
+        ReductionPhase="finalize",
+    )
+    finalize_source = _make_env().get_template(
+        "triton/kernels/Gemv.py.jinja"
+    ).render(model=finalize_model)
+    assert "acc_values = acc" in finalize_source
+    assert "tle.gpu.local_ptr(acc" not in finalize_source
+    assert "tl.inline_asm_elementwise(" in finalize_source
+    assert "st.global.b32" in finalize_source
+    module_source = f"""
+import triton
+import triton.language as tl
+import triton.experimental.tle.language as tle
+
+{helper_source}
+{finalize_source}
+
+@triton.jit
+def gemv_contract_top(data, rdata, output, block_size: tl.constexpr):
+    acc = tl.zeros(({block_n},), tl.float32)
+    for _ in tl.range(0, 2):
+        acc = gemv_contract(
+            acc,
+            data,
+            rdata,
+            data,
+            data,
+            data,
+            data,
+            0,
+            0,
+            block_size,
+        )
+    gemv_contract_finalize(
+        acc,
+        output,
+        rdata,
+        output,
+        output,
+        output,
+        output,
+        0,
+        0,
+        block_size,
+    )
+"""
+    module_path = tmp_path / "gemv_contract_module.py"
+    module_path.write_text(module_source, encoding="utf-8")
+    spec = importlib.util.spec_from_file_location("_gemv_contract_module", module_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    lhs = torch.linspace(
+        -0.5, 0.5, block_k, device="cuda", dtype=torch.bfloat16
+    )
+    rhs = torch.linspace(
+        -0.25,
+        0.25,
+        block_n * block_k,
+        device="cuda",
+        dtype=torch.bfloat16,
+    ).reshape(block_n, block_k)
+    output = torch.empty((block_n,), device="cuda", dtype=torch.float32)
+    compiled = module.gemv_contract_top.warmup(
+        lhs, rhs, output, grid=(1,), block_size=1, num_warps=8
+    )
+    compiled._init_handles()
+    ttgir = compiled.asm["ttgir"]
+    ptx = compiled.asm["ptx"]
+
+    reduction = re.search(
+        rf'"tt\.reduce".*?: \(tensor<{block_n}x{inner_k}xf32, #(?P<layout>[A-Za-z0-9_]+)>\)',
+        ttgir,
+        re.DOTALL,
+    )
+    assert reduction is not None, ttgir
+    layout = re.escape(reduction.group("layout"))
+    layout_definition = re.search(
+        rf"#{layout} = #ttg\.blocked<\{{"
+        r"sizePerThread = \[(?P<size>[^]]+)\], "
+        r"threadsPerWarp = \[(?P<threads>[^]]+)\], "
+        r"warpsPerCTA = \[(?P<warps>[^]]+)\]",
+        ttgir,
+    )
+    assert layout_definition is not None, ttgir
+    size_per_thread = [
+        int(value) for value in layout_definition.group("size").split(", ")
+    ]
+    threads_per_warp = [
+        int(value) for value in layout_definition.group("threads").split(", ")
+    ]
+    warps_per_cta = [
+        int(value) for value in layout_definition.group("warps").split(", ")
+    ]
+    assert warps_per_cta == [8, 1]
+    assert threads_per_warp[0] * threads_per_warp[1] == 32
+    assert size_per_thread[1] * threads_per_warp[1] == inner_k
+    assert "shfl.sync" in ptx
+    assert "ttg.convert_layout" not in ttgir
+    assert "ttg.local_load" not in ttgir
+    assert "ttg.local_store" not in ttgir
+    assert "bar.sync" not in ptx
+    assert compiled.n_spill_loads == 0
+    assert compiled.n_spill_stores == 0
+
+    module.gemv_contract_top[(1,)](
+        lhs, rhs, output, block_size=1, num_warps=8
+    )
+    torch.testing.assert_close(
+        output,
+        2 * (rhs.float() @ lhs.float()),
+        rtol=2e-3,
+        atol=2e-2,
+    )
 
 
 def test_pyntt_mma_shared_load_uses_only_exact_full_descriptors():
@@ -407,7 +741,13 @@ def test_pyntt_mma_shared_load_uses_only_exact_full_descriptors():
         "LocalBuffer": {
             "DescriptorExpression": "packed_weight",
             "DescriptorShape": [128, 32],
-            "BaseScalarOffset": "0",
+            "LogicalShape": [1, 128],
+            "LogicalStrides": [128, 1],
+            "BaseCoordinates": [
+                {"TritonExpression": "0", "FixedValue": 0},
+                {"TritonExpression": "0", "FixedValue": 0},
+            ],
+            "VectorLaneShape": [4, 8],
             "AvailableBytes": 8192,
             "ScalarElementSizeBytes": 2,
             "StorageEncoding": "triton.nvidia.mma-shared",
@@ -423,7 +763,10 @@ def test_pyntt_mma_shared_load_uses_only_exact_full_descriptors():
     assert _direct_mma_shared_load(pointer, (32, 128)) is None
 
     offset_pointer = deepcopy(pointer)
-    offset_pointer["LocalBuffer"]["BaseScalarOffset"] = "32"
+    offset_pointer["LocalBuffer"]["BaseCoordinates"][1] = {
+        "TritonExpression": "1",
+        "FixedValue": 1,
+    }
     assert _direct_mma_shared_load(offset_pointer, (128, 32)) is None
 
 
@@ -449,24 +792,23 @@ def test_pyntt_tensor_region_copy_selects_tle_copy_only_for_full_shared_tiles():
         }
 
     def copy_plan(
-        extent,
+        extents,
         *,
-        source_stride=1,
-        destination_stride=1,
-        source_base=0,
-        destination_base=0,
+        source_origins=None,
+        destination_origins=None,
         covers_source=True,
         covers_destination=True,
     ):
+        extents = extents if isinstance(extents, list) else [extents]
+        logical_rank = len(source_origins or destination_origins or [0])
+        source_origins = source_origins or [0] * logical_rank
+        destination_origins = destination_origins or [0] * logical_rank
         return {
-            "SourceBaseScalarOffset": fixed(source_base),
-            "DestinationBaseScalarOffset": fixed(destination_base),
-            "Axes": [
-                {
-                    "Extent": fixed(extent) if isinstance(extent, int) else extent,
-                    "SourceScalarStride": fixed(source_stride),
-                    "DestinationScalarStride": fixed(destination_stride),
-                }
+            "SourceOrigins": [fixed(value) for value in source_origins],
+            "DestinationOrigins": [fixed(value) for value in destination_origins],
+            "Extents": [
+                fixed(extent) if isinstance(extent, int) else extent
+                for extent in extents
             ],
             "CoversWholeSource": covers_source,
             "CoversWholeDestination": covers_destination,
@@ -485,7 +827,10 @@ def test_pyntt_tensor_region_copy_selects_tle_copy_only_for_full_shared_tiles():
             "LocalBuffer": {
                 "DescriptorExpression": "destination_storage",
                 "DescriptorShape": [32],
-                "BaseScalarOffset": "0",
+                "LogicalShape": [32],
+                "LogicalStrides": [1],
+                "BaseCoordinates": [fixed(0)],
+                "VectorLaneShape": [],
                 "AvailableBytes": 128,
                 "ScalarElementSizeBytes": 4,
             },
@@ -517,6 +862,13 @@ def test_pyntt_tensor_region_copy_selects_tle_copy_only_for_full_shared_tiles():
     vector_model["SourceShape"] = [fixed(4)]
     vector_model["DestinationShape"] = [fixed(4)]
     vector_model["VectorLaneShape"] = [8]
+    vector_model["CopyPlan"] = copy_plan([4, 8])
+    vector_model["Destination"]["LocalBuffer"].update(
+        DescriptorShape=[4, 8],
+        LogicalShape=[4],
+        LogicalStrides=[1],
+        VectorLaneShape=[8],
+    )
     vector_source = render(vector_model)
     assert "copy_tensor_linear" not in vector_source
     assert "copy_vector_lane" not in vector_source
@@ -530,7 +882,9 @@ def test_pyntt_tensor_region_copy_selects_tle_copy_only_for_full_shared_tiles():
     packed_vector_model["SourceStrides"] = [fixed(256), fixed(1)]
     packed_vector_model["DestinationStrides"] = [fixed(256), fixed(1)]
     packed_vector_model["VectorLaneShape"] = [4, 8]
-    packed_vector_model["CopyPlan"] = copy_plan(8192)
+    packed_vector_model["CopyPlan"] = copy_plan(
+        [1, 256, 4, 8], source_origins=[0, 0]
+    )
     packed_vector_model["Destination"]["LocalBuffer"]["DescriptorShape"] = [
         1,
         256,
@@ -538,6 +892,12 @@ def test_pyntt_tensor_region_copy_selects_tle_copy_only_for_full_shared_tiles():
         8,
     ]
     packed_vector_model["Destination"]["LocalBuffer"]["AvailableBytes"] = 32768
+    packed_vector_model["Destination"]["LocalBuffer"].update(
+        LogicalShape=[1, 256],
+        LogicalStrides=[256, 1],
+        BaseCoordinates=[fixed(0), fixed(0)],
+        VectorLaneShape=[4, 8],
+    )
     packed_vector_source = render(packed_vector_model)
     assert "copy_global_offset = copy_linear" in packed_vector_source
     assert "copy_tensor_linear" not in packed_vector_source
@@ -550,7 +910,15 @@ def test_pyntt_tensor_region_copy_selects_tle_copy_only_for_full_shared_tiles():
     matrix_model["DestinationGlobalOffsets"] = [fixed(0), fixed(0)]
     matrix_model["SourceStrides"] = [fixed(8), fixed(1)]
     matrix_model["DestinationStrides"] = [fixed(8), fixed(1)]
+    matrix_model["CopyPlan"] = copy_plan(
+        [4, 8], source_origins=[0, 0]
+    )
     matrix_model["Destination"]["LocalBuffer"]["DescriptorShape"] = [4, 8]
+    matrix_model["Destination"]["LocalBuffer"].update(
+        LogicalShape=[4, 8],
+        LogicalStrides=[8, 1],
+        BaseCoordinates=[fixed(0), fixed(0)],
+    )
     matrix_source = render(matrix_model)
     assert "copy_desc_idx0 = tl.arange(0, 4)[:, None]" in matrix_source
     assert "copy_desc_idx1 = tl.arange(0, 8)[None, :]" in matrix_source
@@ -560,7 +928,7 @@ def test_pyntt_tensor_region_copy_selects_tle_copy_only_for_full_shared_tiles():
     )
 
     offset_model = deepcopy(full_tile_model)
-    offset_model["CopyPlan"] = copy_plan(32, source_base=64)
+    offset_model["CopyPlan"] = copy_plan(32, source_origins=[64])
     offset_source = render(offset_model)
     assert "copy_global_offset = (64) + copy_linear" in offset_source
 
@@ -579,9 +947,27 @@ def test_pyntt_tensor_region_copy_selects_tle_copy_only_for_full_shared_tiles():
     tail_source = render(tail_model)
     assert "full_tile" not in tail_source
     assert "tle.gpu.copy" not in tail_source
-    assert "value = tl.load(source + source_offset, mask=mask)" in tail_source
-    assert "tl.store(tle.gpu.local_ptr(destination_storage" in tail_source
+    assert (
+        "value = tl.load(source + tl.broadcast_to(copy_idx0, (32,)), mask=mask)"
+        in tail_source
+    )
+    assert (
+        "tle.gpu.local_ptr(destination_storage, "
+        "(copy_idx0,), shape=(32,))"
+        in tail_source
+    )
+    assert "tle.gpu.local_ptr(destination_storage, (tl.broadcast_to" not in tail_source
     assert "= tle.gpu.local_ptr" not in tail_source
+    assert " // " not in tail_source
+    assert " % " not in tail_source
+
+    loose_extent_model = deepcopy(tail_model)
+    loose_extent = deepcopy(dynamic_extent)
+    loose_extent["RangeMax"] = 256
+    loose_extent_model["CopyPlan"] = copy_plan(loose_extent)
+    loose_extent_source = render(loose_extent_model)
+    assert "copy_idx0 = tl.arange(0, 32)" in loose_extent_source
+    assert "copy_idx0 = tl.arange(0, 256)" not in loose_extent_source
 
     mma_tail_model = deepcopy(tail_model)
     mma_tail_model["Destination"]["LocalBuffer"]["StorageEncoding"] = (
@@ -589,7 +975,10 @@ def test_pyntt_tensor_region_copy_selects_tle_copy_only_for_full_shared_tiles():
     )
     mma_tail_source = render(mma_tail_model)
     assert "tl.store(tle.gpu.local_ptr(destination_storage), 0.0)" in mma_tail_source
-    assert "value = tl.load(source + source_offset, mask=mask)" in mma_tail_source
+    assert (
+        "value = tl.load(source + tl.broadcast_to(copy_idx0, (32,)), mask=mask)"
+        in mma_tail_source
+    )
 
     noncoincident_model = deepcopy(full_tile_model)
     noncoincident_model["CopyPlan"] = copy_plan(
@@ -597,23 +986,24 @@ def test_pyntt_tensor_region_copy_selects_tle_copy_only_for_full_shared_tiles():
     )
     noncoincident_source = render(noncoincident_model)
     assert "tle.gpu.copy" not in noncoincident_source
-    assert "value = tl.load(source + source_offset, mask=mask)" in noncoincident_source
+    assert "tl.broadcast_to(copy_idx0, (32,))" in noncoincident_source
     assert "tl.store(tle.gpu.local_ptr(destination_storage" in noncoincident_source
     assert "= tle.gpu.local_ptr" not in noncoincident_source
 
     noncompact_model = deepcopy(full_tile_model)
     noncompact_model["DestinationStrides"] = [fixed(2)]
-    noncompact_model["CopyPlan"] = copy_plan(32, destination_stride=2)
-    noncompact_source = render(noncompact_model)
-    assert "tle.gpu.copy" not in noncompact_source
-    assert "value = tl.load(source + source_offset, mask=mask)" in noncompact_source
+    noncompact_model["Destination"]["LocalBuffer"]["LogicalStrides"] = [2]
+    with pytest.raises(ValueError, match="descriptor strides"):
+        render(noncompact_model)
 
     noncompact_global_model = deepcopy(full_tile_model)
     noncompact_global_model["SourceStrides"] = [fixed(2)]
-    noncompact_global_model["CopyPlan"] = copy_plan(32, source_stride=2)
     noncompact_global_source = render(noncompact_global_model)
     assert "tle.gpu.copy" not in noncompact_global_source
-    assert "value = tl.load(source + source_offset, mask=mask)" in noncompact_global_source
+    assert (
+        "tl.load(source + tl.broadcast_to((copy_idx0) * (2), (32,)), mask=mask)"
+        in noncompact_global_source
+    )
 
     strided_model = deepcopy(full_tile_model)
     strided_model["Destination"] = {
@@ -622,38 +1012,42 @@ def test_pyntt_tensor_region_copy_selects_tle_copy_only_for_full_shared_tiles():
         "LocalBuffer": None,
     }
     strided_model["Arguments"] = ["source_ptr", "destination_ptr"]
+    strided_model["SourceShape"] = [fixed(4), fixed(8)]
+    strided_model["DestinationShape"] = [fixed(4), fixed(8)]
+    strided_model["SourceGlobalOffsets"] = [fixed(0), fixed(0)]
+    strided_model["DestinationGlobalOffsets"] = [fixed(0), fixed(0)]
+    strided_model["SourceStrides"] = [fixed(16), fixed(1)]
+    strided_model["DestinationStrides"] = [fixed(8), fixed(1)]
     strided_model["CopyPlan"] = {
-        "SourceBaseScalarOffset": fixed(3),
-        "DestinationBaseScalarOffset": fixed(5),
-        "Axes": [
-            {
-                "Extent": fixed(4),
-                "SourceScalarStride": fixed(16),
-                "DestinationScalarStride": fixed(8),
-            },
-            {
-                "Extent": fixed(8),
-                "SourceScalarStride": fixed(1),
-                "DestinationScalarStride": fixed(1),
-            },
-        ],
+        "SourceOrigins": [fixed(0), fixed(3)],
+        "DestinationOrigins": [fixed(0), fixed(5)],
+        "Extents": [fixed(4), fixed(8)],
         "CoversWholeSource": True,
         "CoversWholeDestination": True,
     }
     strided_source = render(strided_model)
     assert "for copy_idx0 in tl.range(0, 4):" in strided_source
-    assert "source_offset = (3) + copy_idx0 * (16) + copy_idx1" in strided_source
-    assert "destination_offset = (5) + copy_idx0 * (8) + copy_idx1" in strided_source
+    assert "tl.full((block_size,), copy_idx0, tl.int64)" not in strided_source
+    assert (
+        "tl.broadcast_to((copy_idx0) * (16) + (3) + (copy_idx1), "
+        "(block_size,))"
+        in strided_source
+    )
+    assert (
+        "tl.broadcast_to((copy_idx0) * (8) + (5) + (copy_idx1), "
+        "(block_size,))"
+        in strided_source
+    )
     assert "copy_remaining" not in strided_source
     assert "tensor_linear" not in strided_source
+    assert " // " not in strided_source
+    assert " % " not in strided_source
 
     zero_stride_model = deepcopy(strided_model)
-    zero_stride_model["CopyPlan"]["Axes"][1]["SourceScalarStride"] = fixed(0)
+    zero_stride_model["SourceStrides"][1] = fixed(0)
     zero_stride_source = render(zero_stride_model)
-    assert (
-        "source_offset = (3) + copy_idx0 * (16) + copy_idx1 * 0"
-        in zero_stride_source
-    )
+    assert "* 0" not in zero_stride_source
+    assert "(3) + (copy_idx1)" not in zero_stride_source
 
 
 def test_pyntt_kernel_templates_own_their_triton_source():
@@ -684,6 +1078,7 @@ def test_pyntt_renderer_passes_one_materialized_shard_index_to_device_calls():
 
     source = render_manifest(
         {
+            "pyntt_codegen_manifest_version": 3,
             "functions": [
                 {
                     "render_kernels": [
@@ -748,6 +1143,7 @@ def test_pyntt_renderer_passes_nested_device_arguments_directly():
 
     source = render_manifest(
         {
+            "pyntt_codegen_manifest_version": 3,
             "functions": [
                 {
                     "render_kernels": [
@@ -808,6 +1204,7 @@ def test_pyntt_renderer_propagates_only_live_canonical_device_parameters():
 
     source = render_manifest(
         {
+            "pyntt_codegen_manifest_version": 3,
             "functions": [
                 {
                     "render_kernels": [

@@ -1,3 +1,4 @@
+{% import "triton/kernels/_common.py.jinja" as common with context %}
 {% set ctx = summa_context(model) %}
 # generated from PyNTT Jinja Summa.py.jinja
 # {{ model["Comment"] }}; lhs_dtype={{ model["LhsDType"] }}, rhs_dtype={{ model["RhsDType"] }}, output_dtype={{ model["OutputDType"] }}, lhs_shape={{ shape_tuple(model["LhsShape"]) }}, rhs_shape={{ shape_tuple(model["RhsShape"]) }}, output_shape={{ shape_tuple(model["OutputShape"]) }}, lhs_global_shape={{ shape_tuple(model["LhsGlobalShape"]) }}, rhs_global_shape={{ shape_tuple(model["RhsGlobalShape"]) }}, output_global_shape={{ shape_tuple(model["OutputGlobalShape"]) }}, rhs_n_lane={{ model["RhsNVectorLaneCount"] }}, output_n_lane={{ model["OutputNVectorLaneCount"] }}
@@ -23,14 +24,13 @@ def {{ model["FunctionName"] }}({{ helper_parameters(model) }}):
     {{ prefix }}_iter_dim = tl.minimum({{ prefix }}_local_dim, tl.maximum({{ prefix }}_remaining, 0))
 {% endif %}
 {% endfor %}
-    out_n_logical_iter_dim = out_n_iter_dim * {{ model["OutputNVectorLaneCount"] }}
-    out_n_logical_global_base = out_n_global_base * {{ model["OutputNVectorLaneCount"] }}
     for m_start in tl.range(0, out_m_iter_dim, {{ ctx["block_m"] }}):
         offs_m = m_start + tl.arange(0, {{ ctx["block_m"] }})
         global_m = out_m_global_base + offs_m
-        for n_start in tl.range(0, out_n_logical_iter_dim, {{ ctx["block_n"] }}):
-            offs_n = n_start + tl.arange(0, {{ ctx["block_n"] }})
-            global_n = out_n_logical_global_base + offs_n
+        for n_start in tl.range(0, out_n_iter_dim, {{ ctx["physical_block_n"] }}):
+{{ common.structured_axis(ctx["n_axis"], "            ") }}
+            global_n_physical = {{ ctx["global_n_physical"] }}
+            global_n_logical = {{ ctx["global_n_logical"] }}
             acc = tl.zeros(({{ ctx["block_m"] }}, {{ ctx["block_n"] }}), tl.float32)
             for k_start in tl.range(0, {{ dim(model["LhsGlobalShape"][1]) }}, {{ ctx["block_k"] }}):
                 global_k = k_start + tl.arange(0, {{ ctx["block_k"] }})
@@ -58,11 +58,6 @@ def {{ model["FunctionName"] }}({{ helper_parameters(model) }}):
 {% for axis in range(model["Hierarchy"] | length) %}
                 source_shard_coord{{ axis }} = shard_coord{{ axis }}
 {% endfor %}
-                rhs_global_n_physical = global_n // {{ model["RhsNVectorLaneCount"] }}
-                rhs_lane = global_n * 0
-{% if model["RhsNVectorLaneCount"] != 1 %}
-                rhs_lane = global_n % {{ model["RhsNVectorLaneCount"] }}
-{% endif %}
 {% for key in ("rhs_k", "rhs_n") %}
 {% set index = ctx[key] %}
 {% if index["split_axes"] %}
@@ -80,17 +75,12 @@ def {{ model["FunctionName"] }}({{ helper_parameters(model) }}):
                 rhs_physical_offsets = {{ ctx["rhs_k"]["result"] }} * {{ dim(model["RhsStrides"][0]) }} + {{ ctx["rhs_n"]["result"] }} * {{ dim(model["RhsStrides"][1]) }}
                 rhs_offsets = {{ ctx["rhs_offset"] }}
                 rhs_ptrs = ({{ model["RhsBaseName"] }} + rhs_shard_index * {{ model["RhsPoolBytes"] }} + {{ model["RhsOffsetBytes"] }}).to({{ ctx["rhs_pointer_type"] }})
-                rhs_mask = (global_k[:, None] < {{ dim(model["LhsGlobalShape"][1]) }}) & (offs_n[None, :] < out_n_logical_iter_dim) & (global_n[None, :] < {{ dim(ctx["rhs_global_logical_n"]) }})
-                rhs_values = tl.load(rhs_ptrs + rhs_offsets, mask=rhs_mask, other=0.0)
+                rhs_mask = {{ ctx["rhs_mask"] }}
+                rhs_values = tl.reshape(tl.load(rhs_ptrs + rhs_offsets, mask=rhs_mask, other=0.0), ({{ ctx["block_k"] }}, {{ ctx["block_n"] }}))
                 acc += tl.dot(lhs_values, rhs_values{{ ctx["dot_precision"] }})
-            out_n_physical = offs_n // {{ model["OutputNVectorLaneCount"] }}
-            out_lane = offs_n * 0
-{% if model["OutputNVectorLaneCount"] != 1 %}
-            out_lane = offs_n % {{ model["OutputNVectorLaneCount"] }}
-{% endif %}
-            output_physical_offsets = offs_m[:, None] * {{ dim(model["OutputStrides"][0]) }} + out_n_physical[None, :] * {{ dim(model["OutputStrides"][1]) }}
+            output_physical_offsets = {{ ctx["broadcast_offs_m"] }} * {{ dim(model["OutputStrides"][0]) }} + summa_n_physical * {{ dim(model["OutputStrides"][1]) }}
             output_offsets = {{ ctx["output_offset"] }}
             output_ptr = ({{ model["OutputBaseName"] }} + shard_index * {{ model["OutputPoolBytes"] }} + {{ model["OutputOffsetBytes"] }}).to({{ ctx["output_pointer_type"] }})
             result = acc * {{ model["Scale"] }}
-            output_mask = (offs_m[:, None] < out_m_iter_dim) & (offs_n[None, :] < out_n_logical_iter_dim) & (global_n[None, :] < {{ dim(ctx["output_global_logical_n"]) }})
-            tl.store(output_ptr + output_offsets, result, mask=output_mask)
+            output_mask = {{ ctx["output_mask"] }}
+            tl.store(output_ptr + output_offsets, tl.reshape(result, {{ ctx["output_structured_shape"] }}), mask=output_mask)

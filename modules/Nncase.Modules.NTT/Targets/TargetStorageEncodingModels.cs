@@ -2,6 +2,7 @@
 // Licensed under the Apache license. See LICENSE file in the project root for full license information.
 
 using System.Collections.Immutable;
+using Google.OrTools.ConstraintSolver;
 using Nncase.IR;
 using Nncase.Schedule;
 
@@ -53,6 +54,7 @@ public sealed class TritonTargetStorageEncodingModel : ITargetStorageEncodingMod
         }
 
         var alignment = Math.Max(16, DefaultTargetStorageEncodingModel.GetNaturalAlignment(context.DataType));
+        var physicalBytes = RoundUpPowerOfTwo(context.LogicalBytes, context.Solver);
 
         // Ordinary accesses may pay for an incompatible shared layout. Keep
         // the specialized encoding out of unrelated buffers while microkernel
@@ -64,19 +66,55 @@ public sealed class TritonTargetStorageEncodingModel : ITargetStorageEncodingMod
             new(
                 NvidiaMmaShared,
                 context.Solver.MakeIntConst(SupportsNvidiaMmaShared(context.DataType) ? 1 : 0),
-                context.LogicalBytes,
+                physicalBytes,
                 alignment,
                 nvidiaMmaPreferencePenalty,
                 ImmutableArray<TargetStorageEncodingParameter>.Empty),
             new(
                 SwizzledShared,
                 context.Solver.MakeIntConst(1),
-                context.LogicalBytes,
+                physicalBytes,
                 alignment,
                 context.Solver.MakeIntConst(0),
                 ImmutableArray<TargetStorageEncodingParameter>.Empty),
         };
         return candidates;
+    }
+
+    private static IntExpr RoundUpPowerOfTwo(IntExpr logicalBytes, Solver solver)
+    {
+        var maximumBytes = logicalBytes.Var().Max();
+        if (maximumBytes < 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(logicalBytes),
+                maximumBytes,
+                "Triton shared storage cannot have a negative logical size.");
+        }
+
+        if (maximumBytes == 0)
+        {
+            return solver.MakeIntConst(0);
+        }
+
+        IntExpr physicalBytes = solver.MakeIntConst(0);
+        long previousBytes = 0;
+        for (long bytes = 1; bytes > 0 && previousBytes < maximumBytes;)
+        {
+            var exceedsPrevious = solver.MakeIsGreaterCstVar(logicalBytes, previousBytes);
+            var fitsCurrent = 1 - solver.MakeIsGreaterCstVar(logicalBytes, bytes);
+            physicalBytes += exceedsPrevious * fitsCurrent * bytes;
+            previousBytes = bytes;
+            bytes = bytes <= long.MaxValue / 2 ? bytes * 2 : 0;
+        }
+
+        if (previousBytes < maximumBytes)
+        {
+            throw new OverflowException(
+                $"Triton shared storage size {maximumBytes} cannot be represented as a power of two.");
+        }
+
+        return physicalBytes;
     }
 
     private static bool SupportsNvidiaMmaShared(DataType dataType)
