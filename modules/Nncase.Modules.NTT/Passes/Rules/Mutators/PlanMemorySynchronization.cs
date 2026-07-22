@@ -3,10 +3,26 @@
 
 using Nncase.IR;
 using Nncase.Passes.Transforms;
+using Nncase.Schedule;
 using Nncase.TIR;
 using Nncase.Utilities;
 
 namespace Nncase.Passes.Mutators;
+
+internal readonly record struct MemoryArena(MemoryLocation Location, int Hierarchy);
+
+internal readonly record struct MemoryByteRange(long Start, long End)
+{
+    public bool Overlaps(MemoryByteRange other) => Start < other.End && other.Start < End;
+}
+
+internal readonly record struct EffectInfo(MemoryAccessMode Mode, TIR.NTT.BarrierScope Scope)
+{
+    public EffectInfo Merge(EffectInfo other)
+        => new(Mode | other.Mode, MemoryEffectAnalyzer.MergeScope(Scope, other.Scope));
+}
+
+internal readonly record struct ResolvedMemoryEffect(MemoryResource Resource, EffectInfo Effect);
 
 internal sealed class MemoryEffectAnalyzer
 {
@@ -52,10 +68,34 @@ internal sealed class MemoryEffectAnalyzer
             case Sequential sequential:
                 return Union(sequential.Fields.ToArray().Select(
                     field => GetEffects(field, bindings, suppressReductionAccumulatorEffects, stopAtNestedLoops)));
+            case PipelineFor pipelineFor:
+                if (stopAtNestedLoops)
+                {
+                    return new EffectSet();
+                }
+
+                var pipelineBindings = bindings;
+                var pipelineAccesses = pipelineFor.StagedAccesses;
+                var pipelineAllocations = pipelineFor.StagedAllocations;
+                for (var index = 0; index < pipelineAccesses.Length; index++)
+                {
+                    pipelineBindings = pipelineBindings.Bind(
+                        (BaseExpr)pipelineAccesses[index],
+                        pipelineAllocations[index]);
+                }
+
+                return Union(
+                [
+                    GetEffects(pipelineFor.ProduceBody, pipelineBindings, suppressReductionAccumulatorEffects, false),
+                    GetEffects(pipelineFor.ConsumeBody, pipelineBindings, suppressReductionAccumulatorEffects, false),
+                ]);
             case Nncase.TIR.For @for:
-                return stopAtNestedLoops
-                    ? new EffectSet()
-                    : GetEffects(@for.Body, bindings, suppressReductionAccumulatorEffects, false);
+                if (stopAtNestedLoops)
+                {
+                    return new EffectSet();
+                }
+
+                return GetEffects(@for.Body, bindings, suppressReductionAccumulatorEffects, false);
             case Let let:
                 var expressionEffects = let.Expression is Expr bindingExpression
                     ? GetEffects(bindingExpression, bindings, suppressReductionAccumulatorEffects, stopAtNestedLoops)
@@ -490,9 +530,9 @@ internal sealed class MemorySynchronizationPlanner
     }
 
     public PrimFunction Rewrite(PrimFunction function)
-        => function.With(body: RewriteSequential(function.Body, false, false));
+        => function.With(body: RewriteSequential(function.Body, false, false).Expression);
 
-    private Sequential RewriteSequential(
+    private SequentialRewrite RewriteSequential(
         Sequential sequential,
         bool insideLoop,
         bool insideReduction)
@@ -530,65 +570,150 @@ internal sealed class MemorySynchronizationPlanner
             }
 
             var rewritten = RewriteStatement(field, insideLoop, insideReduction);
-            if (rewritten is Sequential { CanFlatten: true } nested)
+            if (rewritten.Expression is Sequential { CanFlatten: true } nested)
             {
                 fields.AddRange(nested.Fields.ToArray());
             }
-            else if (rewritten is not Call { Target: Nop })
+            else if (rewritten.Expression is not Call { Target: Nop })
             {
-                fields.Add(rewritten);
+                fields.Add(rewritten.Expression);
             }
 
-            pendingAccesses.UnionWith(effects);
+            var remainingEffects = effects.Clone();
+            remainingEffects.RemoveAccessesAtExactScopes(rewritten.SynchronizedScopes);
+            pendingAccesses.UnionWith(remainingEffects);
         }
 
-        return sequential.With(fields: fields.ToArray());
+        return new(
+            sequential.With(fields: fields.ToArray()),
+            pendingAccesses.GetScopesWithoutAccesses());
     }
 
-    private Expr RewriteStatement(
+    private StatementRewrite RewriteStatement(
         Expr expression,
         bool insideLoop,
         bool insideReduction)
     {
-        return expression switch
+        switch (expression)
         {
-            Block block => block.With(
-                body: RewriteSequential(block.Body, insideLoop, insideReduction),
-                initBody: RewriteSequential(block.InitBody, insideLoop, insideReduction)),
-            Nncase.TIR.For @for => RewriteFor(@for, insideReduction),
-            Let let => let.With(body: RewriteSequential(let.Body, insideLoop, insideReduction)),
-            IfThenElse ifThenElse => ifThenElse.With(
-                then: RewriteSequential(ifThenElse.Then, insideLoop, insideReduction),
-                @else: RewriteSequential(ifThenElse.Else, insideLoop, insideReduction)),
-            Sequential sequential => RewriteSequential(sequential, insideLoop, insideReduction),
-            _ => expression,
-        };
+            case Block block:
+                var initBody = RewriteSequential(block.InitBody, insideLoop, insideReduction);
+                var body = RewriteSequential(block.Body, insideLoop, insideReduction);
+                return new(
+                    block.With(body: body.Expression, initBody: initBody.Expression),
+                    initBody.SynchronizedScopes & body.SynchronizedScopes);
+            case PipelineFor pipelineFor:
+                return RewritePipelineFor(pipelineFor, insideReduction);
+            case Nncase.TIR.For @for:
+                return RewriteFor(@for, insideReduction);
+            case Let let:
+                var letBody = RewriteSequential(let.Body, insideLoop, insideReduction);
+                var expressionScopes = let.Expression is Expr bindingExpression
+                    ? _analyzer.GetEffects(bindingExpression, insideReduction).GetScopesWithoutAccesses()
+                    : MemorySynchronizationScopes.All;
+                return new(
+                    let.With(body: letBody.Expression),
+                    expressionScopes & letBody.SynchronizedScopes);
+            case IfThenElse ifThenElse:
+                var thenBody = RewriteSequential(ifThenElse.Then, insideLoop, insideReduction);
+                var elseBody = RewriteSequential(ifThenElse.Else, insideLoop, insideReduction);
+                return new(
+                    ifThenElse.With(then: thenBody.Expression, @else: elseBody.Expression),
+                    thenBody.SynchronizedScopes & elseBody.SynchronizedScopes);
+            case Sequential sequential:
+                var rewritten = RewriteSequential(sequential, insideLoop, insideReduction);
+                return new(rewritten.Expression, rewritten.SynchronizedScopes);
+            default:
+                return new(
+                    expression,
+                    _analyzer.GetEffects(expression, insideReduction).GetScopesWithoutAccesses());
+        }
     }
 
-    private Nncase.TIR.For RewriteFor(Nncase.TIR.For @for, bool insideReduction)
+    private StatementRewrite RewriteFor(Nncase.TIR.For @for, bool insideReduction)
     {
         var isReduction = insideReduction || @for.Mode == LoopMode.Reduction;
-        var body = RewriteSequential(@for.Body, true, isReduction);
-        var loopEffects = _analyzer.GetIterationLocalEffects(@for.Body, isReduction);
-        if (loopEffects.TryGetReadWriteAlias(out var requiredScope))
+        var body = RewriteLoopPartition(@for.Body, isReduction, $"loop '{@for.LoopVar.Name}'");
+        return new(
+            @for.With(body: body.Expression),
+            body.SynchronizedScopes);
+    }
+
+    private StatementRewrite RewritePipelineFor(PipelineFor pipelineFor, bool insideReduction)
+    {
+        var isReduction = insideReduction || pipelineFor.Mode == LoopMode.Reduction;
+
+        // Cross-phase ordering belongs to the target pipeline template.
+        // Generic synchronization remains responsible only for hazards wholly
+        // contained in one semantic phase.
+        var produceBody = RewriteLoopPartition(
+            pipelineFor.ProduceBody,
+            isReduction,
+            $"pipeline {pipelineFor.Plan.ScheduleId} produce phase");
+        var consumeBody = RewriteLoopPartition(
+            pipelineFor.ConsumeBody,
+            isReduction,
+            $"pipeline {pipelineFor.Plan.ScheduleId} consume phase");
+        var synchronizedScopes = _analyzer
+            .GetEffects(pipelineFor, insideReduction)
+            .GetScopesWithoutAccesses();
+        if (pipelineFor.Plan.Synchronization.RequiresConsumerRelease)
+        {
+            synchronizedScopes |= MemorySynchronizationScopes.Block;
+        }
+
+        return new(
+            pipelineFor.With(
+                produceBody: produceBody.Expression,
+                consumeBody: consumeBody.Expression),
+            synchronizedScopes);
+    }
+
+    private SequentialRewrite RewriteLoopPartition(
+        Sequential originalBody,
+        bool isReduction,
+        string context)
+    {
+        var body = RewriteSequential(originalBody, true, isReduction);
+        var loopEffects = _analyzer.GetIterationLocalEffects(originalBody, isReduction);
+        if (loopEffects.TryGetReadWriteAlias(out var requiredScope) &&
+            !body.SynchronizedScopes.HasFlag(ToSynchronizationScope(requiredScope)))
         {
             if (ShouldMaterialize(requiredScope) && requiredScope == TIR.NTT.BarrierScope.Chip)
             {
                 throw new InvalidOperationException(
-                    $"A chip-wide loop-carried memory dependence remains in loop '{@for.LoopVar.Name}'. " +
+                    $"A chip-wide loop-carried memory dependence remains in {context}. " +
                     "Split the producer and consumer into separate scheduling phases.");
             }
 
             if (ShouldMaterialize(requiredScope))
             {
-                var fields = body.Fields.ToArray().ToList();
+                var fields = body.Expression.Fields.ToArray().ToList();
                 AppendBarrier(fields, requiredScope);
-                body = body.With(fields: fields.ToArray());
+                body = new(
+                    body.Expression.With(fields: fields.ToArray()),
+                    body.SynchronizedScopes | GetScopesSatisfiedBy(requiredScope));
             }
         }
 
-        return @for.With(body: body);
+        return body;
     }
+
+    private static MemorySynchronizationScopes ToSynchronizationScope(TIR.NTT.BarrierScope scope)
+        => scope switch
+        {
+            TIR.NTT.BarrierScope.Block => MemorySynchronizationScopes.Block,
+            TIR.NTT.BarrierScope.Chip => MemorySynchronizationScopes.Chip,
+            _ => throw new ArgumentOutOfRangeException(nameof(scope), scope, null),
+        };
+
+    private static MemorySynchronizationScopes GetScopesSatisfiedBy(TIR.NTT.BarrierScope scope)
+        => scope switch
+        {
+            TIR.NTT.BarrierScope.Block => MemorySynchronizationScopes.Block,
+            TIR.NTT.BarrierScope.Chip => MemorySynchronizationScopes.All,
+            _ => throw new ArgumentOutOfRangeException(nameof(scope), scope, null),
+        };
 
     private bool ShouldMaterialize(TIR.NTT.BarrierScope scope)
         => scope switch
@@ -620,13 +745,14 @@ internal sealed class MemorySynchronizationPlanner
         scope = default;
         return false;
     }
-}
 
-internal readonly record struct MemoryArena(MemoryLocation Location, int Hierarchy);
+    private readonly record struct StatementRewrite(
+        Expr Expression,
+        MemorySynchronizationScopes SynchronizedScopes);
 
-internal readonly record struct MemoryByteRange(long Start, long End)
-{
-    public bool Overlaps(MemoryByteRange other) => Start < other.End && other.Start < End;
+    private readonly record struct SequentialRewrite(
+        Sequential Expression,
+        MemorySynchronizationScopes SynchronizedScopes);
 }
 
 internal sealed record MemoryResource(
@@ -666,15 +792,7 @@ internal sealed record MemoryResource(
     }
 }
 
-internal readonly record struct EffectInfo(MemoryAccessMode Mode, TIR.NTT.BarrierScope Scope)
-{
-    public EffectInfo Merge(EffectInfo other)
-        => new(Mode | other.Mode, MemoryEffectAnalyzer.MergeScope(Scope, other.Scope));
-}
-
 internal sealed record FunctionEffectSummary(IReadOnlyDictionary<int, EffectInfo> ParameterEffects);
-
-internal readonly record struct ResolvedMemoryEffect(MemoryResource Resource, EffectInfo Effect);
 
 internal sealed class EffectSet
 {
@@ -705,6 +823,13 @@ internal sealed class EffectSet
         {
             Add(item.Resource, item.Effect);
         }
+    }
+
+    public EffectSet Clone()
+    {
+        var result = new EffectSet();
+        result.UnionWith(this);
+        return result;
     }
 
     public bool TryGetConflict(EffectSet consumer, out TIR.NTT.BarrierScope scope)
@@ -789,6 +914,40 @@ internal sealed class EffectSet
             }
         }
     }
+
+    public void RemoveAccessesAtExactScopes(MemorySynchronizationScopes scopes)
+    {
+        for (var index = _items.Count - 1; index >= 0; index--)
+        {
+            var effect = _items[index].Effect;
+            if (effect.Mode != MemoryAccessMode.None && scopes.HasFlag(ToSynchronizationScope(effect.Scope)))
+            {
+                _items.RemoveAt(index);
+            }
+        }
+    }
+
+    public MemorySynchronizationScopes GetScopesWithoutAccesses()
+    {
+        var result = MemorySynchronizationScopes.All;
+        foreach (var item in _items)
+        {
+            if (item.Effect.Mode != MemoryAccessMode.None)
+            {
+                result &= ~ToSynchronizationScope(item.Effect.Scope);
+            }
+        }
+
+        return result;
+    }
+
+    private static MemorySynchronizationScopes ToSynchronizationScope(TIR.NTT.BarrierScope scope)
+        => scope switch
+        {
+            TIR.NTT.BarrierScope.Block => MemorySynchronizationScopes.Block,
+            TIR.NTT.BarrierScope.Chip => MemorySynchronizationScopes.Chip,
+            _ => throw new ArgumentOutOfRangeException(nameof(scope), scope, null),
+        };
 
     private static bool IsSatisfiedBy(TIR.NTT.BarrierScope required, TIR.NTT.BarrierScope actual)
         => actual == TIR.NTT.BarrierScope.Chip || required == TIR.NTT.BarrierScope.Block;

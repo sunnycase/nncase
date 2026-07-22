@@ -17,13 +17,14 @@ public sealed class UnitTestReductionCodegenUtility
         var full = CreateLoop("i", 0, 8, LoopPartition.Full);
         var tail = CreateLoop("i_tail", 8, 10, LoopPartition.Tail);
 
-        Assert.True(ReductionCodegenUtility.TryGetAdjacentReductionLoopPartitionPair(
+        Assert.True(ReductionCodegenUtility.TryGetReductionLoopPartitionPair(
             new Expr[] { full, tail },
             0,
-            out var actualFull,
-            out var actualTail));
-        Assert.Same(full, actualFull);
-        Assert.Same(tail, actualTail);
+            out var pair));
+        Assert.Same(full, pair.FullLoop);
+        Assert.Same(tail, pair.TailLoop);
+        Assert.Empty(pair.SynchronizationFields);
+        Assert.Equal(1, pair.TailFieldIndex);
     }
 
     [Fact]
@@ -32,16 +33,31 @@ public sealed class UnitTestReductionCodegenUtility
         var full = CreateLoop("i", 0, 8, LoopPartition.Full);
         var tail = CreateLoop("i_tail", 8, 10, LoopPartition.Tail);
 
-        Assert.False(ReductionCodegenUtility.TryGetAdjacentReductionLoopPartitionPair(
+        Assert.False(ReductionCodegenUtility.TryGetReductionLoopPartitionPair(
             new Expr[] { full, T.Nop(), tail },
             0,
-            out _,
             out _));
-        Assert.False(ReductionCodegenUtility.TryGetAdjacentReductionLoopPartitionPair(
+        Assert.False(ReductionCodegenUtility.TryGetReductionLoopPartitionPair(
             new Expr[] { full, T.Nop(), tail },
             2,
-            out _,
             out _));
+    }
+
+    [Fact]
+    public void TestPreservesSynchronizationBetweenLoopPartitions()
+    {
+        var full = CreateLoop("i", 0, 8, LoopPartition.Full);
+        var barrier = TIR.F.NTT.Barrier(TIR.NTT.BarrierScope.Block);
+        var tail = CreateLoop("i_tail", 8, 10, LoopPartition.Tail);
+
+        Assert.True(ReductionCodegenUtility.TryGetReductionLoopPartitionPair(
+            new Expr[] { full, barrier, tail },
+            0,
+            out var pair));
+        Assert.Same(full, pair.FullLoop);
+        Assert.Same(tail, pair.TailLoop);
+        Assert.Same(barrier, Assert.Single(pair.SynchronizationFields));
+        Assert.Equal(2, pair.TailFieldIndex);
     }
 
     [Fact]
@@ -51,10 +67,9 @@ public sealed class UnitTestReductionCodegenUtility
         var tail = CreateLoop("i_tail", 7, 10, LoopPartition.Tail);
 
         Assert.Throws<InvalidOperationException>(() =>
-            ReductionCodegenUtility.TryGetAdjacentReductionLoopPartitionPair(
+            ReductionCodegenUtility.TryGetReductionLoopPartitionPair(
                 new Expr[] { full, tail },
                 0,
-                out _,
                 out _));
     }
 
@@ -89,6 +104,7 @@ public sealed class UnitTestReductionCodegenUtility
 
         var group = Assert.Single(ReductionCodegenUtility.CollectReductionCallGroups(fullUpdate, tailUpdate));
         Assert.Equal(2, group.Calls.Length);
+        Assert.Equal(2, group.ExpectedUpdateCount);
     }
 
     [Fact]

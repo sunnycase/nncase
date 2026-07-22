@@ -11,7 +11,9 @@ using Nncase.Graphs;
 using Nncase.IR;
 using Nncase.Passes;
 using Nncase.Passes.Transforms;
+using Nncase.Schedule;
 using Nncase.Schedule.TileGraph;
+using Nncase.Targets;
 using Nncase.TIR;
 using QuikGraph;
 using QuikGraph.Graphviz;
@@ -943,10 +945,10 @@ public sealed class UnitTestTileGraph : TestClassBase
     }
 
     [Fact]
-    public void TestPackedMatMulMaterializesBitcastLhsInSharedMemory()
+    public void TestPackedLmHeadMaterializesStagedOperands()
     {
         using var ctx = IntegerSetLibrary.ctx.Create();
-        var targetOptions = new Targets.NTTTargetOptions
+        var targetOptions = new Targets.PyNTTTargetOptions
         {
             TargetMachineModel = Targets.NTTTargetMachineCatalog.Resolve(Targets.NTTTargetMachineCatalog.Rtx5060Ti16Gb),
         };
@@ -963,25 +965,36 @@ public sealed class UnitTestTileGraph : TestClassBase
 
         var tiled = new Schedule.GraphTiler().Tile(
             selected.Body,
-            Targets.CPUTarget.Kind,
+            Targets.PyNTTTarget.Kind,
             targetOptions,
             Array.Empty<DimVar>());
-        var deviceFunction = Assert.Single(
-            ExprCollector.Collect(tiled)
-                .OfType<PrimFunctionWrapper>()
-                .Select(wrapper => wrapper.Target)
-                .Where(primFunction => ExprCollector.Collect(primFunction.Body)
-                    .OfType<Call>()
-                    .Any(call => call.Target is TIR.NTT.PackedMatMul)));
-        var calls = ExprCollector.Collect(deviceFunction.Body).OfType<Call>().ToArray();
-        var tileLoads = calls.Where(call => call.Target is TIR.TileLoad).ToArray();
-        var sharedBuffers = ExprCollector.Collect(deviceFunction.Body)
-            .OfType<PhysicalBuffer>()
-            .Where(buffer => buffer.Location == MemoryLocation.Shared && buffer.Size.FixedValue > 0)
+        var tiledExpressions = ExprCollector.Collect(tiled).Prepend(tiled).ToArray();
+        var deviceFunction = Assert.Single(tiledExpressions
+            .OfType<PrimFunctionWrapper>()
+            .Concat(tiledExpressions
+                .OfType<Call>()
+                .Select(call => call.Target)
+                .OfType<PrimFunctionWrapper>())
+            .Distinct((IEqualityComparer<PrimFunctionWrapper>)ReferenceEqualityComparer.Instance)
+            .Select(wrapper => wrapper.Target)
+            .Where(primFunction => new[] { primFunction.Body }.Concat(ExprCollector.Collect(primFunction.Body))
+                .OfType<Call>()
+                .Any(call => call.Target is TIR.NTT.PackedMatMul)));
+        var calls = new[] { deviceFunction.Body }
+            .Concat(ExprCollector.Collect(deviceFunction.Body))
+            .OfType<Call>()
+            .ToArray();
+        var packedMatmuls = calls
+            .Where(call => call.Target is TIR.NTT.PackedMatMul)
             .ToArray();
 
-        Assert.Equal(2, tileLoads.Length);
-        Assert.True(sharedBuffers.Length >= 3, "PackedMatMul lhs, rhs, and output must use explicit shared-memory tiles.");
+        Assert.NotEmpty(packedMatmuls);
+        Assert.All(
+            packedMatmuls,
+            call => Assert.Contains(
+                Assert.IsType<BlockMicroKernelSelection>(call.Metadata.BlockMicroKernel).Variant,
+                new[] { "register_simt_accumulator", "register_mma_accumulator" }));
+        Assert.Contains(calls, call => call.Target is TIR.TileLoad);
     }
 
     [Fact]
@@ -1284,6 +1297,51 @@ public sealed class UnitTestTileGraph : TestClassBase
         Assert.Equal(
             targetOptions.TargetMachineModel.TilingMemorySpaces.Length - 1,
             plan.Structure.GetFusionLevel(use.Id));
+    }
+
+    [Fact]
+    public void TestFusedReductionAxisSemanticsRemainRegionSpecific()
+    {
+        using var ctx = IntegerSetLibrary.ctx.Create();
+        var input = new Var("input", new TensorType(DataTypes.Float32, new[] { 4, 8 }));
+        var producer = IR.F.Math.Unary(UnaryOp.Neg, input);
+        var reduce = IR.F.Tensors.Reduce(ReduceOp.Sum, producer, new[] { 1L }, 0.0f, false);
+        var function = new Function("main", Targets.CPUTarget.Kind, reduce, [input]);
+        var selected = Assert.IsType<Function>(
+            new NTTAffineSelectionPass(CompileOptions).RunAsync(function, new()).Result);
+        var reduceGrid = Assert.IsType<IR.Affine.Grid>(selected.Body);
+        var producerGrid = Assert.IsType<IR.Affine.Grid>(reduceGrid.Accesses[0].Value);
+        var targetOptions = Assert.IsAssignableFrom<INTTTargetOptions>(CompileOptions.TargetOptions);
+        var levelCount = targetOptions.TargetMachineModel.TilingMemorySpaces.Length;
+        var graph = TieredTileGraphBuilder.Build(selected.Body, levelCount, out _);
+        var producerNode = Assert.Single(graph.Vertices.Where(node => ReferenceEquals(node.Grid, producerGrid)));
+        var reduceNode = Assert.Single(graph.Vertices.Where(node => ReferenceEquals(node.Grid, reduceGrid)));
+        var region = TileRegion.Create(graph);
+        var use = Assert.Single(region.Uses.Where(candidate =>
+            candidate.Id.ProducerOpId == producerNode.OpId &&
+            candidate.Id.ConsumerOpId == reduceNode.OpId));
+        var plan = new HierarchicalTilePlanner(new Schedule.GraphTiler()).Plan(
+            region,
+            Targets.CPUTarget.Kind,
+            targetOptions,
+            Array.Empty<DimVar>());
+        var fusionLevel = plan.Structure.GetFusionLevel(use.Id);
+        Assert.True(fusionLevel >= 0);
+
+        _ = TileNode.FromTileGraph(plan.ScheduleGraph, out var treeMemo);
+        var fusedNode = Assert.Single(treeMemo.Values.Where(node =>
+            node.Level == fusionLevel &&
+            node.DomainAxisSemantics.RegionProjections.ContainsKey(producerNode.RegionOpId) &&
+            node.DomainAxisSemantics.RegionProjections.ContainsKey(reduceNode.RegionOpId)));
+        var producerProjection = fusedNode.DomainAxisSemantics.GetRegionProjection(producerNode.RegionOpId);
+        var reduceProjection = fusedNode.DomainAxisSemantics.GetRegionProjection(reduceNode.RegionOpId);
+        var reductionAxis = Assert.Single(Assert.Single(reduceProjection.ReductionAxisMappings));
+        Assert.Equal(TileAxisRole.Parallel, producerProjection.AxisRoles[reductionAxis]);
+        Assert.Equal(TileAxisRole.Reduction, reduceProjection.AxisRoles[reductionAxis]);
+        Assert.Equal(
+            TileAxisRole.Parallel | TileAxisRole.Reduction,
+            fusedNode.DomainAxisSemantics.AxisRoles[reductionAxis]);
+        Assert.True(fusedNode.DomainAxisSemantics.ReductionAxes[reductionAxis]);
     }
 
     [Fact]
@@ -1666,6 +1724,10 @@ public sealed class UnitTestTileGraph : TestClassBase
 #endif
 
         Assert.Equal(-1, graph.Level);
+        Assert.False(graph.DomainBoundExprs.IsDefault);
+        Assert.False(graph.DomainDynamic.IsDefault);
+        Assert.Empty(graph.DomainBoundExprs);
+        Assert.Empty(graph.DomainDynamic);
     }
 
     [Theory]
@@ -1826,6 +1888,23 @@ public sealed class UnitTestTileGraph : TestClassBase
         var outerScope = Assert.Single(rootGraph.Clusters.OfType<TieredTileGraph>());
         var innerScope = Assert.Single(outerScope.Clusters.OfType<TieredTileGraph>());
         Assert.Equal(3, innerScope.DomainBoundExprs.Length);
+        var matrixGrid = Assert.Single(innerScope.Vertices);
+        Assert.Equal(
+            new[] { TileAxisRole.Parallel, TileAxisRole.Parallel, TileAxisRole.Reduction },
+            matrixGrid.DomainAxisSemantics.AxisRoles.ToArray());
+        Assert.Equal(new[] { false, false, true }, matrixGrid.DomainAxisSemantics.ReductionAxes.ToArray());
+
+        _ = TileNode.FromTileGraph(rootGraph, out var treeMemo);
+        var innerSemantics = treeMemo[innerScope].DomainAxisSemantics;
+        Assert.Equal(
+            matrixGrid.DomainAxisSemantics.AxisRoles.ToArray(),
+            innerSemantics.AxisRoles.ToArray());
+        Assert.Equal(
+            matrixGrid.DomainAxisSemantics.ReductionAxes.ToArray(),
+            innerSemantics.ReductionAxes.ToArray());
+        Assert.Equal(
+            matrixGrid.DomainAxisSemantics.AxisRoles.ToArray(),
+            innerSemantics.GetRegionProjection(matrixGrid.RegionOpId).AxisRoles.ToArray());
 
         // M, K, N is legal when the N loop does not multiplex one backend
         // accumulator across multiple output tiles.
@@ -2169,6 +2248,118 @@ public sealed class UnitTestTileGraph : TestClassBase
         }
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void TestPipelineSelectionCouplesPlanAndPhysicalStageCount(
+        bool preferPipelined)
+    {
+        using var ctx = IntegerSetLibrary.ctx.Create();
+        var targetOptions = new PipelineTestTargetOptions(preferPipelined);
+        CompileOptions.TargetOptions = targetOptions;
+        var input = new Var("input", new TensorType(DataTypes.Float32, new[] { 4, 64 }));
+        var function = new Function(
+            "main",
+            Targets.CPUTarget.Kind,
+            IR.F.Tensors.Reduce(ReduceOp.Sum, input, new[] { 1L }, 0.0f, false),
+            [input]);
+        var selected = Assert.IsType<Function>(
+            new NTTAffineSelectionPass(CompileOptions).RunAsync(function, new()).Result);
+
+        var tiled = new Schedule.GraphTiler().Tile(
+            selected.Body,
+            Targets.CPUTarget.Kind,
+            targetOptions,
+            Array.Empty<DimVar>());
+        var wrapper = Assert.Single(ExprCollector.Collect(tiled).OfType<PrimFunctionWrapper>());
+        var pipelineLoops = ExprCollector.Collect(wrapper.Target.Body)
+            .OfType<PipelineFor>()
+            .ToArray();
+        var stagedBuffers = ExprCollector.Collect(wrapper.Target.Body)
+            .OfType<TIR.Buffer>()
+            .Where(buffer => buffer.StagedLayout is not null)
+            .Distinct((IEqualityComparer<TIR.Buffer>)ReferenceEqualityComparer.Instance)
+            .ToArray();
+        if (!preferPipelined)
+        {
+            Assert.Empty(pipelineLoops);
+            Assert.Empty(stagedBuffers);
+        }
+        else
+        {
+            var pipelineLoop = Assert.Single(pipelineLoops);
+            var plan = pipelineLoop.Plan;
+            var channel = Assert.Single(plan.Channels);
+            var blockGlobal = targetOptions.TargetMachineModel.TilingMemorySpaces.Single(
+                space => space.TIRBinding?.Location == MemoryLocation.BlockLocalData);
+            var shared = targetOptions.TargetMachineModel.TilingMemorySpaces.Single(
+                space => space.TIRBinding?.Location == MemoryLocation.Shared);
+            Assert.Equal(blockGlobal.Id, channel.SourceMemorySpace);
+            Assert.Equal(shared.Id, channel.DestinationMemorySpace);
+            Assert.Equal(2, plan.StageCount);
+            Assert.Equal(TritonLoopPipelineBackend.CpAsyncN2TemplateId, plan.TemplateId);
+            var staged = Assert.Single(stagedBuffers);
+            Assert.Equal(2, staged.StagedLayout!.StageCount);
+            Assert.Equal(staged.StagedLayout.PhysicalBytes, staged.MemSpan.Size.FixedValue);
+            Assert.Equal(
+                checked(staged.StagedLayout.StageCount * staged.StagedLayout.StageStrideBytes),
+                staged.StagedLayout.PhysicalBytes);
+            var producerCalls = ExprCollector.Collect(pipelineLoop.ProduceBody)
+                .OfType<Call>()
+                .ToArray();
+            var consumerCalls = ExprCollector.Collect(pipelineLoop.ConsumeBody)
+                .OfType<Call>()
+                .ToArray();
+            Assert.Contains(producerCalls, call => call.Target is TIR.TileLoad);
+            Assert.DoesNotContain(consumerCalls, call => call.Target is TIR.TileLoad);
+            Assert.DoesNotContain(producerCalls, call => call.Target is TIR.NTT.Reduce);
+            Assert.Contains(consumerCalls, call => call.Target is TIR.NTT.Reduce);
+        }
+    }
+
+    [Fact]
+    public void TestPipelineRejectsParentTransferWhenNearestInternalProducerIsShared()
+    {
+        using var ctx = IntegerSetLibrary.ctx.Create();
+        var targetOptions = new PipelineTestTargetOptions(
+            preferPipelined: true,
+            targetMachineModel: CreatePipelineMachineWithoutBlockGlobalAllocation());
+        CompileOptions.TargetOptions = targetOptions;
+        var input = new Var("input", new TensorType(DataTypes.Float32, new[] { 4, 64 }));
+        var function = new Function(
+            "main",
+            Targets.CPUTarget.Kind,
+            IR.F.Tensors.Reduce(
+                ReduceOp.Sum,
+                IR.F.Math.Unary(UnaryOp.Neg, input),
+                new[] { 1L },
+                0.0f,
+                false),
+            [input]);
+        var selected = Assert.IsType<Function>(
+            new NTTAffineSelectionPass(CompileOptions).RunAsync(function, new()).Result);
+
+        var tiled = new Schedule.GraphTiler().Tile(
+            selected.Body,
+            Targets.CPUTarget.Kind,
+            targetOptions,
+            Array.Empty<DimVar>());
+        var wrapper = Assert.Single(ExprCollector.Collect(tiled).OfType<PrimFunctionWrapper>());
+        var buffers = ExprCollector.Collect(wrapper.Target.Body)
+            .OfType<TIR.Buffer>()
+            .ToArray();
+        Assert.Contains(buffers, buffer =>
+            buffer.MemSpan.Buffer.Location == MemoryLocation.Shared &&
+            buffer.Name.Contains("op0_unary_out0", StringComparison.Ordinal));
+
+        var pipelineChannels = ExprCollector.Collect(wrapper.Target.Body)
+            .OfType<PipelineFor>()
+            .SelectMany(loop => loop.Plan.Channels)
+            .ToArray();
+        Assert.DoesNotContain(pipelineChannels, channel =>
+            channel.ChannelId.Contains("op1_reduce_in0", StringComparison.Ordinal));
+    }
+
     [Fact]
     public void TestAutoTilingPublishesBlockLocalDataPoolUsage()
     {
@@ -2344,10 +2535,87 @@ public sealed class UnitTestTileGraph : TestClassBase
                         parentSpace.ResourceId == localSpace.ResourceId ? 0 : parentResource.LatencyCycles,
                         parentSpace.ResourceId == localSpace.ResourceId ? TargetMemoryTransferMode.DirectAccess : TargetMemoryTransferMode.ExplicitCopy),
                 };
-            }),
-            new Dictionary<MemoryLocation, TargetMemorySpaceId>
+            }));
+    }
+
+    private static TargetMachineModel CreatePipelineMachineWithoutBlockGlobalAllocation()
+    {
+        var machine = Targets.NTTTargetMachineCatalog.Resolve(
+            Targets.NTTTargetMachineCatalog.H800Sxm80Gb);
+        var blockGlobal = machine.TilingMemorySpaces.Single(space =>
+            space.TIRBinding?.Location == MemoryLocation.BlockLocalData);
+        var memorySpaces = machine.MemorySpaces.Values
+            .Select(space => space.Id == blockGlobal.Id
+                ? new TargetMemorySpaceSpec(
+                    space.Id,
+                    space.ResourceId,
+                    space.Scope,
+                    space.TIRBinding,
+                    maxAllocationBytesPerScope: 1,
+                    space.AllocationSizePolicy,
+                    space.IsTilingCandidate,
+                    space.TilingLevel,
+                    space.IsAddressable,
+                    space.SupportsDynamicIndexing,
+                    space.RequiresExplicitSynchronization)
+                : space)
+            .ToArray();
+        return new TargetMachineModel(
+            $"{machine.Id}-no-block-global-allocation",
+            machine.Execution,
+            machine.Compute,
+            machine.Synchronization,
+            machine.PrivateResources.Values,
+            machine.MemoryResources.Values,
+            memorySpaces,
+            machine.RootMemorySpace,
+            machine.Transfers);
+    }
+
+    private sealed class PipelineTestTargetOptions : Targets.NTTTargetOptions
+    {
+        public PipelineTestTargetOptions(
+            bool preferPipelined,
+            TargetMachineModel? targetMachineModel = null)
+        {
+            TargetMachineModel = targetMachineModel ?? Targets.NTTTargetMachineCatalog.Resolve(
+                Targets.NTTTargetMachineCatalog.H800Sxm80Gb);
+            BlockMicroKernelModel = new PipelineTestMicroKernelModel(preferPipelined);
+            StorageEncodingModel = new Targets.TritonTargetStorageEncodingModel();
+            LoopPipelineBackend = TritonLoopPipelineBackend.Instance;
+        }
+    }
+
+    private sealed class PipelineTestMicroKernelModel : IBlockMicroKernelModelProvider
+    {
+        private readonly bool _preferPipelined;
+
+        public PipelineTestMicroKernelModel(bool preferPipelined)
+        {
+            _preferPipelined = preferPipelined;
+        }
+
+        public IReadOnlyList<BlockMicroKernelCandidate> GetCandidates(BlockMicroKernelModelContext context)
+        {
+            if (context.Workload is not IReductionStateTileWorkload)
             {
-                [MemoryLocation.BlockLocalData] = localSpaces[^1].Id,
-            });
+                return Array.Empty<BlockMicroKernelCandidate>();
+            }
+
+            var solver = context.Solver;
+            var resource = context.Machine.GetPrivateResource(Targets.NTTTargetMachineCatalog.GpuRegisterFile);
+            var resources = ImmutableArray.Create(
+                new BlockMicroKernelResourceUsage(resource.Id, solver.MakeIntConst(1)));
+            var computeCycles = solver.MakeIntConst(_preferPipelined ? 1_000_000 : 1);
+            var candidate = new BlockMicroKernelCandidate(
+                "test.pipeline",
+                "reduction",
+                solver.MakeIntConst(1),
+                BlockMicroKernelExecutionCost.ComputeOnly(computeCycles),
+                resources,
+                ImmutableArray<BlockMicroKernelMemoryAccess>.Empty,
+                ImmutableArray<BlockMicroKernelParameter>.Empty);
+            return [candidate];
+        }
     }
 }

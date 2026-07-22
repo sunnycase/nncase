@@ -22,7 +22,7 @@ def {{ model["FunctionName"] }}({{ helper_parameters(model) }}):
 {% if ctx["use_gemv"] %}
 {{ base }}for m_idx in tl.range(0, {{ dim(ctx["m"]) }}):
 {% set tile = base ~ "    " %}
-{{ tile }}for n_start in tl.range(0, {{ dim(ctx["physical_n"]) }}, {{ ctx["physical_block_n"] }}, num_stages={{ ctx["n_stages"] }}):
+{{ tile }}for n_start in tl.range(0, {{ dim(ctx["physical_n"]) }}, {{ ctx["physical_block_n"] }}):
 {% else %}
 {{ base }}for m_start in tl.range(0, {{ dim(ctx["m"]) }}, {{ ctx["block_m"] }}):
 {{ base }}    offs_m = m_start + tl.arange(0, {{ ctx["block_m"] }})
@@ -38,7 +38,7 @@ def {{ model["FunctionName"] }}({{ helper_parameters(model) }}):
 {% else %}
 {{ tile }}    gate_acc = tl.zeros(({{ ctx["block_m"] }}, {{ ctx["block_n"] }}), tl.float32)
 {{ tile }}    up_acc = tl.zeros(({{ ctx["block_m"] }}, {{ ctx["block_n"] }}), tl.float32)
-{{ tile }}    for k_start in tl.range(0, {{ dim(ctx["k"]) }}, {{ ctx["block_k"] }}, num_stages=5):
+{{ tile }}    for k_start in tl.range(0, {{ dim(ctx["k"]) }}, {{ ctx["block_k"] }}):
 {% endif %}
 {{ tile }}        offs_k = k_start + tl.arange(0, {{ ctx["block_k"] }})
 {{ tile }}        input_values = tl.load({{ access_pointer(model, "Input", "input0", ctx["input_access"]) }}, mask={{ ctx["input_mask"] }}, other=0.0){{ ".to(tl.float32)" if ctx["use_gemv"] else "" }}

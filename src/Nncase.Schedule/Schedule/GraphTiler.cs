@@ -25,13 +25,14 @@ public sealed class GraphTiler
     /// <summary>
     /// a simple cost model.
     /// </summary>
-    public static TreeSolveResult SolvePrimGraph(TileNode primTree, Dictionary<TieredTileGraph, BufferGraph> bufferGraphMemo, INTTTargetOptions targetOptions, string moduleKind)
+    public static TreeSolveResult SolvePrimGraph(TileNode primTree, Dictionary<TieredTileGraph, BufferGraph> bufferGraphMemo, INTTTargetOptions targetOptions, string moduleKind, string owningScheduledFunctionId)
     {
         var machine = targetOptions.TargetMachineModel;
         var tilingMemorySpaces = machine.TilingMemorySpaces;
         var rootMemorySpace = machine.GetMemorySpace(machine.RootMemorySpace);
         var memCapacities = tilingMemorySpaces.Select(machine.GetMaximumUsableAllocationBytes).ToArray();
         var levelCount = tilingMemorySpaces.Length;
+        var activeBlockCount = GetActiveBlockCount(targetOptions);
         TreeSolverInitializer.Init(primTree, bufferGraphMemo, levelCount, targetOptions, out var solver, out var opNodeMemo, out var tileNodeMemo, out var tileableNodeMemo, out var coverageConstraints, out var opLifetimes);
         var primBufferGraph = bufferGraphMemo[primTree.Wrapped];
         var (externalInputs, externalOutputs) = primBufferGraph.GetInputsOutputs(primBufferGraph.Parent as BufferGraph);
@@ -39,6 +40,29 @@ public sealed class GraphTiler
         var rootMaterializationEndpoints = rootMaterializationEdges
             .SelectMany(edge => new[] { edge.Source, edge.Target })
             .ToHashSet();
+        var rootEndpoints = externalInputs
+            .Concat(externalOutputs)
+            .Concat(rootMaterializationEndpoints)
+            .ToHashSet();
+
+        bool TryResolveRootEndpoint(BufferIdentity buffer, out BufferIdentity rootEndpoint)
+        {
+            if (rootEndpoints.Contains(buffer))
+            {
+                rootEndpoint = buffer;
+                return true;
+            }
+
+            if (TileBufferPlacementUtility.TryGetAliasReadBuffer(buffer, out var aliasRead) &&
+                rootEndpoints.Contains(aliasRead))
+            {
+                rootEndpoint = aliasRead;
+                return true;
+            }
+
+            rootEndpoint = null!;
+            return false;
+        }
 
         static int GetStoragePosition(BufferIdentity bid, TileNodeBufferInfo<IntExpr> bufferInfo)
             => bid.Access.BindingMode == GridBindingMode.Root ? 0 : bufferInfo.GetLastRelatedPos();
@@ -120,6 +144,122 @@ public sealed class GraphTiler
                     edge.Source.OutputIndex,
                     edge.Target.Node.RegionOpId,
                     edge.Target.Index));
+            }
+        }
+
+        // Build block-microkernel choices before fixing buffer placements:
+        // candidate-specific direct-access contracts participate in the same
+        // global decision as tile extents and physical materialization.
+        var reductionStateBytes = new Dictionary<OpNode, IntExpr>();
+        var reductionStateConstraints = new Dictionary<OpNode, Constraint>();
+        var baseComputeCyclesByOp = new Dictionary<OpNode, IntExpr>();
+        var microKernelDecisions = new Dictionary<OpNode, MicroKernelSolverDecision>();
+        foreach (var (opNode, opNodeInfo) in opNodeMemo)
+        {
+            var workload = opNode.GetTileWorkload();
+            var context = opNode.GetTileWorkloadContext();
+            var fullBufferShapes = context.BufferShapes
+                .Select(shape => shape.Select(extent => (IntExpr)solver.MakeIntConst(extent)).ToArray())
+                .ToArray();
+            var baseComputeCycles = EstimateTotalBlockComputeCycles(
+                machine,
+                workload,
+                opNodeInfo.Shapes,
+                solver,
+                context);
+            baseComputeCyclesByOp.Add(opNode, baseComputeCycles);
+            if (workload is not IReductionStateTileWorkload statefulWorkload)
+            {
+                continue;
+            }
+
+            var stateDescriptors = statefulWorkload.GetReductionStates(
+                opNodeInfo.Shapes,
+                solver,
+                context);
+            if (stateDescriptors.Count == 0)
+            {
+                throw new InvalidOperationException(
+                    $"Reduction workload {context.Op.GetType().Name} returned no logical state descriptors.");
+            }
+
+            var stateBytes = solver.MakeSum(stateDescriptors.Select(state => state.GetLogicalBytes()).ToArray());
+            reductionStateBytes.Add(opNode, stateBytes);
+            var unprunedCandidates = targetOptions.BlockMicroKernelModel.GetCandidates(
+                new(
+                    context.Op,
+                    workload,
+                    context,
+                    opNodeInfo.Shapes,
+                    fullBufferShapes,
+                    baseComputeCycles,
+                    machine,
+                    solver)
+                {
+                    ChipActiveBlockCount = activeBlockCount,
+                });
+            ValidateMicroKernelCandidates(
+                opNode,
+                unprunedCandidates,
+                machine);
+            var candidates = PruneMicroKernelCandidates(unprunedCandidates);
+
+            var selectionVars = candidates
+                .Select((candidate, index) => solver.MakeBoolVar(
+                    $"microkernel[op{opNode.OpId},{index},{candidate.Variant}]"))
+                .ToArray();
+            var exactlyOne = solver.MakeEquality(solver.MakeSum(selectionVars), 1);
+            exactlyOne.SetName($"microkernel_exactly_one[op{opNode.OpId}]");
+            solver.Add(exactlyOne);
+            reductionStateConstraints.Add(opNode, exactlyOne);
+
+            for (var candidateIndex = 0; candidateIndex < candidates.Count; candidateIndex++)
+            {
+                var candidate = candidates[candidateIndex];
+                var selected = selectionVars[candidateIndex];
+                var legal = solver.MakeLessOrEqual(selected, candidate.IsLegal);
+                legal.SetName($"microkernel_legal[op{opNode.OpId},{candidateIndex}]");
+                solver.Add(legal);
+                foreach (var usage in candidate.Resources)
+                {
+                    var resource = machine.GetPrivateResource(usage.Resource);
+                    var allocatedUnits = GetAllocatedPrivateResourceUnits(usage.Units, resource, solver);
+                    var capacity = solver.MakeLessOrEqual(selected * allocatedUnits, resource.CapacityUnits);
+                    capacity.SetName($"microkernel_resource_le[op{opNode.OpId},{candidateIndex},{resource.Id}]");
+                    solver.Add(capacity);
+                }
+            }
+
+            var selectedRegionCycles = solver.MakeSum(candidates
+                .Select((candidate, index) => selectionVars[index] * candidate.ExecutionCost.RegionCycles)
+                .ToArray());
+            microKernelDecisions.Add(
+                opNode,
+                new(candidates, selectionVars, selectedRegionCycles));
+        }
+
+        var microKernelDecisionsByGrid = microKernelDecisions.ToDictionary(
+            pair => pair.Key.Wrapped,
+            pair => pair.Value);
+
+        static IReadOnlyList<OpNode> EnumerateOperationNodes(ITreeNode node)
+        {
+            var result = new List<OpNode>();
+            Visit(node);
+            return result;
+
+            void Visit(ITreeNode current)
+            {
+                if (current is OpNode operationNode)
+                {
+                    result.Add(operationNode);
+                    return;
+                }
+
+                foreach (var child in ((TileNode)current).Children)
+                {
+                    Visit(child);
+                }
             }
         }
 
@@ -339,94 +479,91 @@ public sealed class GraphTiler
             return placements.Distinct().ToArray();
         }
 
-        // Ask the target for legal block microkernels. These choices consume
-        // target-private resources but do not introduce TIR memory locations.
-        // They remain in the same global model as tile extents and placement.
-        var reductionStateBytes = new Dictionary<OpNode, IntExpr>();
-        var reductionStateConstraints = new Dictionary<OpNode, Constraint>();
-        var baseComputeCyclesByOp = new Dictionary<OpNode, IntExpr>();
-        var microKernelDecisions = new Dictionary<OpNode, MicroKernelSolverDecision>();
-        foreach (var (opNode, opNodeInfo) in opNodeMemo)
+        var transferSourceDecisions = new Dictionary<TileBufferPlacement, TileTransferSourceDecision>();
+        foreach (var (tileNode, nodeInfo) in tileNodeMemo.Where(pair => pair.Key.ScopeKind == TileScopeKind.Iteration))
         {
-            var workload = opNode.GetTileWorkload();
-            var context = opNode.GetTileWorkloadContext();
-            var fullBufferShapes = context.BufferShapes
-                .Select(shape => shape.Select(extent => (IntExpr)solver.MakeIntConst(extent)).ToArray())
-                .ToArray();
-            var baseComputeCycles = EstimateTotalBlockComputeCycles(
-                machine,
-                workload,
-                opNodeInfo.Shapes,
-                solver,
-                context);
-            baseComputeCyclesByOp.Add(opNode, baseComputeCycles);
-            if (workload is not IReductionStateTileWorkload statefulWorkload)
+            foreach (var (bid, bufferInfo) in nodeInfo.BufferInfoMap)
             {
-                continue;
-            }
-
-            var stateDescriptors = statefulWorkload.GetReductionStates(
-                opNodeInfo.Shapes,
-                solver,
-                context);
-            if (stateDescriptors.Count == 0)
-            {
-                throw new InvalidOperationException(
-                    $"Reduction workload {context.Op.GetType().Name} returned no logical state descriptors.");
-            }
-
-            var stateBytes = solver.MakeSum(stateDescriptors.Select(state => state.GetLogicalBytes()).ToArray());
-            reductionStateBytes.Add(opNode, stateBytes);
-            var unprunedCandidates = targetOptions.BlockMicroKernelModel.GetCandidates(
-                new(
-                    context.Op,
-                    workload,
-                    context,
-                    opNodeInfo.Shapes,
-                    fullBufferShapes,
-                    baseComputeCycles,
-                    machine,
-                    solver));
-            ValidateMicroKernelCandidates(opNode, unprunedCandidates, machine);
-            var candidates = PruneMicroKernelCandidates(unprunedCandidates);
-
-            var selectionVars = candidates
-                .Select((candidate, index) => solver.MakeBoolVar(
-                    $"microkernel[op{opNode.OpId},{index},{candidate.Variant}]"))
-                .ToArray();
-            var exactlyOne = solver.MakeEquality(solver.MakeSum(selectionVars), 1);
-            exactlyOne.SetName($"microkernel_exactly_one[op{opNode.OpId}]");
-            solver.Add(exactlyOne);
-            reductionStateConstraints.Add(opNode, exactlyOne);
-
-            for (var candidateIndex = 0; candidateIndex < candidates.Count; candidateIndex++)
-            {
-                var candidate = candidates[candidateIndex];
-                var selected = selectionVars[candidateIndex];
-                var legal = solver.MakeLessOrEqual(selected, candidate.IsLegal);
-                legal.SetName($"microkernel_legal[op{opNode.OpId},{candidateIndex}]");
-                solver.Add(legal);
-                foreach (var usage in candidate.Resources)
+                var effect = bid.Node.LocalAccessEffects[bid.Index];
+                if (bid.IsOutput ||
+                    effect.Scope == MemoryAccessScope.Chip ||
+                    !MemoryEffectUtility.GetPhysicalBufferAccessMode(effect).HasFlag(MemoryAccessMode.Read))
                 {
-                    var resource = machine.GetPrivateResource(usage.Resource);
-                    var allocatedUnits = GetAllocatedPrivateResourceUnits(usage.Units, resource, solver);
-                    var capacity = solver.MakeLessOrEqual(selected * allocatedUnits, resource.CapacityUnits);
-                    capacity.SetName($"microkernel_resource_le[op{opNode.OpId},{candidateIndex},{resource.Id}]");
-                    solver.Add(capacity);
+                    continue;
+                }
+
+                for (var loopEntry = 0; loopEntry < bufferInfo.Places.Length; loopEntry++)
+                {
+                    for (var storageLevel = 0; storageLevel < bufferInfo.Places[loopEntry].Length; storageLevel++)
+                    {
+                        if (!RequiresLocalAllocation(bid, storageLevel) ||
+                            !machine.RequiresExplicitTransfer(storageLevel))
+                        {
+                            continue;
+                        }
+
+                        var destination = new TileBufferPlacement(tileNode, bid, loopEntry, storageLevel);
+                        var sourceDecision = CreateTransferSourceDecision(destination);
+                        transferSourceDecisions.Add(destination, sourceDecision);
+                        var sourceDominates = solver.MakeLessOrEqual(
+                            bufferInfo.Places[loopEntry][storageLevel],
+                            sourceDecision.SourceIsAvailable);
+                        sourceDominates.SetName($"transfer_source_dominates[{tileNode}_{bid}_ci{loopEntry}_sl{storageLevel}]");
+                        solver.Add(sourceDominates);
+                        eachLevelStoreBufferConstrains[tileNode.Level] = eachLevelStoreBufferConstrains[tileNode.Level]
+                            .Append(sourceDominates)
+                            .ToArray();
+                    }
                 }
             }
-
-            var selectedCycles = solver.MakeSum(candidates
-                .Select((candidate, index) => selectionVars[index] * candidate.EstimatedCycles)
-                .ToArray());
-            microKernelDecisions.Add(
-                opNode,
-                new(candidates, selectionVars, selectedCycles));
         }
 
-        var microKernelDecisionsByGrid = microKernelDecisions.ToDictionary(
-            pair => pair.Key.Wrapped,
-            pair => pair.Value);
+        TileTransferSourceDecision CreateTransferSourceDecision(TileBufferPlacement destination)
+        {
+            var sourceMemorySpace = machine.GetTilingParentMemorySpace(destination.StorageLevel).Id;
+            var destinationMemorySpace = tilingMemorySpaces[destination.StorageLevel].Id;
+            var visible = TileBufferPlacementUtility.EnumerateVisiblePlacementsBefore(destination, tileNodeMemo);
+            var matchingSources = new List<TileTransferSourceChoice>();
+            IntExpr noNearerView = solver.MakeIntConst(1);
+            foreach (var sourcePlacement in visible.Placements)
+            {
+                var sourceSelected = tileNodeMemo[sourcePlacement.Node]
+                    .BufferInfoMap[sourcePlacement.Buffer]
+                    .Places[sourcePlacement.LoopEntry][sourcePlacement.StorageLevel];
+                var nearest = (noNearerView * sourceSelected).Var();
+                nearest.SetName($"nearest_transfer_source[{destination},{sourcePlacement}]");
+                nearest.SetRange(0, 1);
+                if (tilingMemorySpaces[sourcePlacement.StorageLevel].Id == sourceMemorySpace)
+                {
+                    matchingSources.Add(new(
+                        new SelectedTileBufferPlacementSource(sourcePlacement),
+                        nearest));
+                }
+
+                noNearerView = (noNearerView * (1 - sourceSelected)).Var();
+                noNearerView.SetRange(0, 1);
+            }
+
+            if (machine.RootMemorySpace == sourceMemorySpace &&
+                TryResolveRootEndpoint(visible.RootEndpoint, out var rootEndpoint))
+            {
+                matchingSources.Add(new(
+                    new SelectedTileBufferRootSource(rootEndpoint),
+                    noNearerView));
+            }
+
+            var sourceIsAvailable = matchingSources.Count == 0
+                ? solver.MakeIntConst(0)
+                : solver.MakeSum(matchingSources.Select(source => source.Selected).ToArray()).Var();
+            sourceIsAvailable.SetName($"transfer_source_available[{destination},{sourceMemorySpace}]");
+            sourceIsAvailable.SetRange(0, 1);
+            return new(
+                destination,
+                sourceMemorySpace,
+                destinationMemorySpace,
+                matchingSources,
+                sourceIsAvailable);
+        }
 
         IntExpr GetMicroKernelTrafficOverride(
             TileGrid grid,
@@ -444,7 +581,167 @@ public sealed class GraphTiler
                     ? (IntExpr)decision.SelectionVars[candidateIndex]
                     : solver.MakeIntConst(0))
                 .ToArray();
-            return solver.MakeSum(terms);
+            var result = solver.MakeSum(terms).Var();
+            result.SetRange(0, 1);
+            return result;
+        }
+
+        const int asynchronousStageCount = 2;
+        var loopPipelineDecisions = new Dictionary<LoopPipelineKey, LoopPipelineSolverDecision>();
+        if (targetOptions.LoopPipelineBackend.SupportsStageCount(asynchronousStageCount))
+        {
+            foreach (var (tileNode, nodeInfo) in tileNodeMemo.Where(pair => pair.Key.ScopeKind == TileScopeKind.Iteration))
+            {
+                var regionOpIds = EnumerateOperationNodes(tileNode)
+                    .Select(opNode => opNode.Wrapped.RegionOpId)
+                    .Distinct()
+                    .Order()
+                    .ToImmutableArray();
+                for (var loopEntry = 1; loopEntry <= tileNode.LoopOrder.Length; loopEntry++)
+                {
+                    var channels = new List<LoopPipelineChannelDecision>();
+                    foreach (var (bid, bufferInfo) in nodeInfo.BufferInfoMap)
+                    {
+                        var effect = bid.Node.LocalAccessEffects[bid.Index];
+                        if (bid.IsOutput ||
+                            effect.Scope == MemoryAccessScope.Chip ||
+                            !MemoryEffectUtility.GetPhysicalBufferAccessMode(effect).HasFlag(MemoryAccessMode.Read))
+                        {
+                            continue;
+                        }
+
+                        for (var storageLevel = 0; storageLevel <= tileNode.Level; storageLevel++)
+                        {
+                            if (!RequiresLocalAllocation(bid, storageLevel) ||
+                                !machine.RequiresExplicitTransfer(storageLevel))
+                            {
+                                continue;
+                            }
+
+                            var destinationPlacement = new TileBufferPlacement(
+                                tileNode,
+                                bid,
+                                loopEntry,
+                                storageLevel);
+                            if (!transferSourceDecisions.TryGetValue(destinationPlacement, out var transferSource))
+                            {
+                                throw new InvalidOperationException(
+                                    $"Pipeline destination {destinationPlacement} has no explicit transfer-source decision.");
+                            }
+
+                            var destination = machine.GetMemorySpace(transferSource.DestinationMemorySpace);
+                            var source = machine.GetMemorySpace(transferSource.SourceMemorySpace);
+                            var channelId = $"{TileSemanticNaming.GetBufferEndpointName(bid)}.entry{loopEntry}.{destination.Id}";
+                            var backendLegality = targetOptions.LoopPipelineBackend.GetChannelLegality(
+                                new(
+                                    source,
+                                    destination,
+                                    bid.Node.BufferDataTypes[bid.Index],
+                                    bufferInfo.Shapes[loopEntry].ToImmutableArray(),
+                                    bid.Node.BufferShapes[bid.Index]
+                                        .Select(extent => (IntExpr)solver.MakeIntConst(extent))
+                                        .ToImmutableArray(),
+                                    machine,
+                                    solver),
+                                asynchronousStageCount);
+                            var legality = (backendLegality * transferSource.SourceIsAvailable).Var();
+                            legality.SetName($"loop_pipeline_channel_legal[{channelId}]");
+                            legality.SetRange(0, 1);
+                            channels.Add(new(
+                                channelId,
+                                new(tileNode, bid),
+                                bufferInfo,
+                                loopEntry,
+                                storageLevel,
+                                transferSource,
+                                bufferInfo.Places[loopEntry][storageLevel].Var(),
+                                legality));
+                        }
+                    }
+
+                    if (channels.Count == 0)
+                    {
+                        continue;
+                    }
+
+                    var serial = solver.MakeBoolVar($"loop_stage_1[{tileNode},entry{loopEntry}]");
+                    var asynchronous = solver.MakeBoolVar($"loop_stage_2[{tileNode},entry{loopEntry}]");
+                    var exactlyOne = solver.MakeEquality(serial + asynchronous, 1);
+                    exactlyOne.SetName($"loop_stage_exactly_one[{tileNode},entry{loopEntry}]");
+                    solver.Add(exactlyOne);
+                    var hasChannel = solver.MakeLessOrEqual(
+                        asynchronous,
+                        solver.MakeSum(channels.Select(channel => (IntExpr)channel.Placement).ToArray()));
+                    hasChannel.SetName($"loop_stage_2_has_channel[{tileNode},entry{loopEntry}]");
+                    solver.Add(hasChannel);
+                    foreach (var channel in channels)
+                    {
+                        var representable = solver.MakeLessOrEqual(
+                            asynchronous + channel.Placement,
+                            channel.Legality + 1);
+                        representable.SetName($"loop_stage_2_channel_legal[{channel.ChannelId}]");
+                        solver.Add(representable);
+                    }
+
+                    var stageCount = (serial + (asynchronousStageCount * asynchronous)).Var();
+                    stageCount.SetName($"loop_stage_count[{tileNode},entry{loopEntry}]");
+                    stageCount.SetRange(1, asynchronousStageCount);
+                    var key = new LoopPipelineKey(tileNode, loopEntry);
+                    loopPipelineDecisions.Add(
+                        key,
+                        new(
+                            key,
+                            tileNode.LoopOrder[loopEntry - 1],
+                            serial,
+                            asynchronous,
+                            stageCount,
+                            channels,
+                            regionOpIds));
+                }
+            }
+
+            // Two schedules may overlap only when their consumer regions are
+            // disjoint. This constraint is derived from lexical region
+            // membership, not from a backend candidate's claimed ownership.
+            var decisions = loopPipelineDecisions.Values.ToArray();
+            for (var left = 0; left < decisions.Length; left++)
+            {
+                for (var right = left + 1; right < decisions.Length; right++)
+                {
+                    if (!decisions[left].RegionOpIds.Intersect(decisions[right].RegionOpIds).Any())
+                    {
+                        continue;
+                    }
+
+                    var exclusive = solver.MakeLessOrEqual(
+                        decisions[left].AsynchronousSelected + decisions[right].AsynchronousSelected,
+                        1);
+                    exclusive.SetName($"non_overlapping_loop_pipelines[{decisions[left].Key},{decisions[right].Key}]");
+                    solver.Add(exclusive);
+                }
+            }
+        }
+
+        StagedAllocationContext? GetStagedAllocationContext(
+            NodeWithBuffer buffer,
+            int loopEntry,
+            int storageLevel)
+        {
+            if (!loopPipelineDecisions.TryGetValue(new(buffer.Node, loopEntry), out var decision))
+            {
+                return null;
+            }
+
+            var channels = decision.Channels
+                .Where(channel => channel.Buffer == buffer && channel.StorageLevel == storageLevel)
+                .ToArray();
+            return channels.Length switch
+            {
+                0 => null,
+                1 => new StagedAllocationContext(channels[0].ChannelId, decision.StageCount),
+                _ => throw new InvalidOperationException(
+                    $"Loop schedule {decision.Key} contains duplicate staging channels for {buffer}/L{storageLevel}."),
+            };
         }
 
         foreach (var privateResource in machine.PrivateResources.Values)
@@ -536,15 +833,19 @@ public sealed class GraphTiler
                         IntExpr placedSize;
                         if (requiresLocalAllocation && !IsObjectBuffer(nodeBuffer.Id))
                         {
+                            var stagingContext = GetStagedAllocationContext(nodeBuffer, ci, sl);
                             var encodingContext = new TargetStorageEncodingModelContext(
                                 tilingMemorySpaces[sl],
                                 nodeBuffer.Id.Node.BufferDataTypes[nodeBuffer.Id.Index],
                                 bufferInfo.Shapes[ci].ToImmutableArray(),
                                 bufferInfo.Sizes[ci],
                                 machine,
-                                solver);
+                                solver)
+                            {
+                                StagedAllocation = stagingContext,
+                            };
                             var encodingCandidates = targetOptions.StorageEncodingModel.GetCandidates(encodingContext);
-                            ValidateStorageEncodingCandidates(nodeBuffer, ci, sl, encodingCandidates, machine);
+                            ValidateStorageEncodingCandidates(nodeBuffer, ci, sl, encodingCandidates, machine, stagingContext);
                             var hasIndependentSelectionVars = encodingCandidates.Count > 1;
                             var encodingVars = hasIndependentSelectionVars
                                 ? encodingCandidates
@@ -570,15 +871,22 @@ public sealed class GraphTiler
                             var encodingDecision = new StorageEncodingSolverDecision(
                                 encodingCandidates,
                                 encodingVars,
-                                hasIndependentSelectionVars);
+                                hasIndependentSelectionVars,
+                                stagingContext);
                             var encodingKey = new StorageEncodingPlacementKey(nodeBuffer, ci, sl);
                             if (!storageEncodingDecisions.TryAdd(encodingKey, encodingDecision))
                             {
                                 throw new InvalidOperationException($"Duplicate storage encoding decision for {encodingKey}.");
                             }
 
+                            var usesMultipleStages = stagingContext is null
+                                ? (IntExpr)solver.MakeIntConst(0)
+                                : solver.MakeIsGreaterCstVar(stagingContext.StageCount, 1);
                             placedSize = solver.MakeSum(encodingCandidates
-                                .Select((candidate, index) => encodingVars[index] * candidate.PhysicalBytes)
+                                .Select((candidate, index) => encodingVars[index] * (stagingContext is null
+                                    ? candidate.PhysicalBytes
+                                    : (usesMultipleStages * stagingContext.StageCount * candidate.StageStrideBytes!)
+                                        + ((1 - usesMultipleStages) * candidate.PhysicalBytes)))
                                 .ToArray());
                             storageEncodingCycles += solver.MakeSum(encodingCandidates
                                 .Select((candidate, index) => encodingVars[index] * candidate.EstimatedCycles)
@@ -661,9 +969,13 @@ public sealed class GraphTiler
             for (int candidateIndex = 0; candidateIndex < decision.Candidates.Count; candidateIndex++)
             {
                 var selected = decision.SelectionVars[candidateIndex];
-                foreach (var requirement in decision.Candidates[candidateIndex].BufferEncodingRequirements)
+                var candidate = decision.Candidates[candidateIndex];
+                foreach (var requirement in candidate.BufferEncodingRequirements)
                 {
-                    var operandDecisions = GetOperandStorageEncodingDecisions(opNode, requirement);
+                    var operandDecisions = GetAccessStorageEncodingDecisions(
+                        opNode,
+                        requirement.BufferAccessIndex,
+                        requirement.MemorySpace);
                     var placementVars = operandDecisions
                         .SelectMany(encodingDecision => encodingDecision.SelectionVars)
                         .ToArray();
@@ -696,20 +1008,21 @@ public sealed class GraphTiler
             }
         }
 
-        IReadOnlyList<StorageEncodingSolverDecision> GetOperandStorageEncodingDecisions(
+        IReadOnlyList<StorageEncodingSolverDecision> GetAccessStorageEncodingDecisions(
             OpNode opNode,
-            BlockMicroKernelBufferEncodingRequirement requirement)
+            int accessIndex,
+            TargetMemorySpaceId memorySpace)
         {
             var storageLevel = tilingMemorySpaces
                 .Select((space, index) => (space, index))
-                .Where(item => item.space.Id == requirement.MemorySpace)
+                .Where(item => item.space.Id == memorySpace)
                 .Select(item => item.index)
                 .DefaultIfEmpty(-1)
                 .Single();
             if (storageLevel < 0)
             {
                 throw new InvalidOperationException(
-                    $"Block microkernel Op{opNode.OpId} requires non-tiling memory space {requirement.MemorySpace}.");
+                    $"Block microkernel Op{opNode.OpId} requires non-tiling memory space {memorySpace}.");
             }
 
             if (opNode.Parent is not TileNode ownerNode)
@@ -717,7 +1030,9 @@ public sealed class GraphTiler
                 throw new InvalidOperationException($"Block microkernel Op{opNode.OpId} has no owning tile scope.");
             }
 
-            var operandBid = new BufferIdentity(opNode.Wrapped, requirement.BufferAccessIndex, BufferEndpoint.Input);
+            var access = opNode.Wrapped.Grid.Accesses[accessIndex];
+            var endpoint = access.IsRead ? BufferEndpoint.Input : BufferEndpoint.Output;
+            var operandBid = new BufferIdentity(opNode.Wrapped, accessIndex, endpoint);
             var ownerInfo = tileNodeMemo[ownerNode];
             if (!ownerInfo.BufferInfoMap.TryGetValue(operandBid, out var bufferInfo))
             {
@@ -844,6 +1159,8 @@ public sealed class GraphTiler
         var levelExecutionWrites = Enumerable.Range(0, memoryLevelCount).Select(_ => (IntExpr)solver.MakeIntConst(0)).ToArray();
         var levelTransferReads = Enumerable.Range(0, levelCount).Select(i => (IntExpr)solver.MakeIntConst(0)).ToArray();
         var levelTransferWrites = Enumerable.Range(0, levelCount).Select(i => (IntExpr)solver.MakeIntConst(0)).ToArray();
+        var levelTransferReadSynchronizationVolumes = Enumerable.Range(0, levelCount).Select(_ => (IntExpr)solver.MakeIntConst(0)).ToArray();
+        var levelTransferWriteSynchronizationVolumes = Enumerable.Range(0, levelCount).Select(_ => (IntExpr)solver.MakeIntConst(0)).ToArray();
         var microKernelMemoryReads = machine.MemoryResources.Keys.ToDictionary(
             resource => resource,
             _ => (IntExpr)solver.MakeIntConst(0));
@@ -879,6 +1196,8 @@ public sealed class GraphTiler
             var nodeExecutionReads = Enumerable.Range(0, memoryLevelCount).Select(_ => new List<IntExpr>()).ToArray();
             var nodeTransferReads = Enumerable.Range(0, levelCount).Select(_ => new List<IntExpr>()).ToArray();
             var nodeTransferWrites = Enumerable.Range(0, levelCount).Select(_ => new List<IntExpr>()).ToArray();
+            var nodeTransferReadSynchronizationVolumes = Enumerable.Range(0, levelCount).Select(_ => new List<IntExpr>()).ToArray();
+            var nodeTransferWriteSynchronizationVolumes = Enumerable.Range(0, levelCount).Select(_ => new List<IntExpr>()).ToArray();
             foreach (var (bid, bufferInfo) in nodeInfo.BufferInfoMap)
             {
                 var reused = nodeInfo.DefUseMap.ContainsKey(bid);
@@ -915,6 +1234,7 @@ public sealed class GraphTiler
                                 nodeMaterializationWrites[sl].Add(volume);
                                 nodeMaterializationReads[sl + 1].Add(volume);
                                 nodeTransferReads[sl].Add(volume);
+                                nodeTransferReadSynchronizationVolumes[sl].Add(volume);
                             }
                         }
 
@@ -947,6 +1267,7 @@ public sealed class GraphTiler
                                 nodeMaterializationReads[sl].Add(volume);
                                 nodeMaterializationWrites[sl + 1].Add(volume);
                                 nodeTransferWrites[sl].Add(volume);
+                                nodeTransferWriteSynchronizationVolumes[sl].Add(volume);
                             }
                         }
 
@@ -994,6 +1315,16 @@ public sealed class GraphTiler
                 {
                     levelTransferWrites[l] += solver.MakeSum(nodeTransferWrites[l]);
                 }
+
+                if (nodeTransferReadSynchronizationVolumes[l].Any())
+                {
+                    levelTransferReadSynchronizationVolumes[l] += solver.MakeSum(nodeTransferReadSynchronizationVolumes[l]);
+                }
+
+                if (nodeTransferWriteSynchronizationVolumes[l].Any())
+                {
+                    levelTransferWriteSynchronizationVolumes[l] += solver.MakeSum(nodeTransferWriteSynchronizationVolumes[l]);
+                }
             }
         }
 
@@ -1004,7 +1335,6 @@ public sealed class GraphTiler
             .Zip(levelExecutionWrites, (materialization, execution) => materialization + execution)
             .ToArray();
 
-        var activeBlockCount = GetActiveBlockCount(targetOptions);
         var storageSpaces = tilingMemorySpaces.Append(rootMemorySpace).ToArray();
         var memoryResourceGroups = storageSpaces
             .Select((space, level) => (space, level))
@@ -1040,6 +1370,8 @@ public sealed class GraphTiler
             var writeTransfer = machine.GetTransfer(localMemorySpace.Id, parentMemorySpace.Id);
             var reads = levelTransferReads[i];
             var writes = levelTransferWrites[i];
+            var readSynchronizationVolume = levelTransferReadSynchronizationVolumes[i];
+            var writeSynchronizationVolume = levelTransferWriteSynchronizationVolumes[i];
             if (parentMemorySpace.ResourceId == localMemorySpace.ResourceId)
             {
                 transferCycles[i] = solver.MakeIntConst(0);
@@ -1050,42 +1382,164 @@ public sealed class GraphTiler
             {
                 reads *= activeBlockCount;
                 writes *= activeBlockCount;
+                readSynchronizationVolume *= activeBlockCount;
+                writeSynchronizationVolume *= activeBlockCount;
             }
 
             var readEvent = solver.MakeIsGreaterCstVar(reads, 0);
             var writeEvent = solver.MakeIsGreaterCstVar(writes, 0);
+            var readSynchronizationEvent = solver.MakeIsGreaterCstVar(readSynchronizationVolume, 0);
+            var writeSynchronizationEvent = solver.MakeIsGreaterCstVar(writeSynchronizationVolume, 0);
             transferCycles[i] = reads.CeilDiv(readTransfer.BytesPerCycle)
                 + writes.CeilDiv(writeTransfer.BytesPerCycle)
                 + (readEvent * readTransfer.LatencyCycles)
                 + (writeEvent * writeTransfer.LatencyCycles);
             if (readTransfer.RequiresSynchronization)
             {
-                synchronizationCycles += readEvent * machine.Synchronization.BlockCycles;
+                synchronizationCycles += readSynchronizationEvent * machine.Synchronization.BlockCycles;
             }
 
             if (writeTransfer.RequiresSynchronization)
             {
-                synchronizationCycles += writeEvent * machine.Synchronization.BlockCycles;
+                synchronizationCycles += writeSynchronizationEvent * machine.Synchronization.BlockCycles;
             }
         }
 
         IntExpr computeCycles = solver.MakeIntConst(0);
-        foreach (var (opNode, opNodeInfo) in opNodeMemo)
+        foreach (var (opNode, _) in opNodeMemo)
         {
             computeCycles += microKernelDecisions.TryGetValue(opNode, out var decision)
-                ? decision.SelectedCycles
+                ? decision.SelectedRegionCycles
                 : baseComputeCyclesByOp[opNode];
         }
 
-        var overlappedCycles = memoryCycles.Concat(transferCycles).Aggregate(computeCycles, solver.MakeMax);
-        var totalCycles = overlappedCycles + synchronizationCycles + storageEncodingCycles;
+        // Stage one is a serial loop schedule. Only a selected stage-two loop
+        // is allowed to replace P + C by the template's fill/steady/drain
+        // estimate. The decision is built from the same loop entry, transfer
+        // placements, and operation region that will construct PipelineFor.
+        IntExpr pipelineOverlapSavings = solver.MakeIntConst(0);
+        foreach (var pipelineDecision in loopPipelineDecisions.Values)
+        {
+            var totalIterationCount = pipelineDecision.Channels[0].BufferInfo.Trips[pipelineDecision.Key.LoopEntry];
+            var invocationCount = pipelineDecision.Channels[0].BufferInfo.Trips[pipelineDecision.Key.LoopEntry - 1];
+            var iterationCount = solver.MakeDiv(totalIterationCount, invocationCount).Var();
+            iterationCount.SetName($"loop_iteration_count[{pipelineDecision.Key}]");
+            iterationCount.SetRange(1, totalIterationCount.Var().Max());
+
+            var hasTwoIterations = solver.MakeIsGreaterCstVar(iterationCount, 1);
+            var enoughIterations = solver.MakeLessOrEqual(
+                pipelineDecision.AsynchronousSelected,
+                hasTwoIterations);
+            enoughIterations.SetName($"loop_stage_2_requires_two_iterations[{pipelineDecision.Key}]");
+            solver.Add(enoughIterations);
+
+            var producerRegionCycles = solver.MakeSum(pipelineDecision.Channels
+                .Select(channel =>
+                {
+                    var source = machine.GetMemorySpace(channel.SourceMemorySpace);
+                    var destination = machine.GetMemorySpace(channel.DestinationMemorySpace);
+                    var transfer = machine.GetTransfer(source.Id, destination.Id);
+                    var contentionFactor = source.Scope == MemorySharingScope.Chip ||
+                        destination.Scope == MemorySharingScope.Chip
+                        ? activeBlockCount
+                        : 1;
+                    var bytes = channel.Placement * channel.BufferInfo.TransferBytes[channel.LoopEntry];
+                    var events = channel.Placement * channel.BufferInfo.Trips[channel.LoopEntry];
+                    return bytes.ScaleAndCeilDiv(contentionFactor, transfer.BytesPerCycle)
+                        + (events * transfer.LatencyCycles);
+                })
+                .ToArray());
+            var producerCycles = producerRegionCycles.CeilDiv(totalIterationCount).Var();
+            producerCycles.SetName($"loop_producer_cycles[{pipelineDecision.Key}]");
+            producerCycles.SetRange(0, producerRegionCycles.Var().Max());
+
+            var consumerRegionCycles = solver.MakeSum(EnumerateOperationNodes(pipelineDecision.Key.Node)
+                .Select(opNode => microKernelDecisions.TryGetValue(opNode, out var microKernelDecision)
+                    ? microKernelDecision.SelectedRegionCycles
+                    : baseComputeCyclesByOp[opNode])
+                .ToArray());
+            var consumerCycles = consumerRegionCycles.CeilDiv(totalIterationCount).Var();
+            consumerCycles.SetName($"loop_consumer_cycles[{pipelineDecision.Key}]");
+            consumerCycles.SetRange(0, consumerRegionCycles.Var().Max());
+
+            var template = targetOptions.LoopPipelineBackend.GetTemplate(asynchronousStageCount, machine);
+            var controlCosts = pipelineDecision.Channels
+                .Select(channel => template.Synchronization.GetControlCost(
+                    machine,
+                    machine.GetTransfer(channel.SourceMemorySpace, channel.DestinationMemorySpace)))
+                .ToArray();
+            var estimate = LoopPipelineScheduleEstimate.Create(
+                solver,
+                iterationCount,
+                invocationCount,
+                producerCycles,
+                consumerCycles,
+                solver.MakeIntConst(controlCosts.Max(cost => cost.ProducerCommitCycles)),
+                solver.MakeIntConst(controlCosts.Max(cost => cost.ConsumerWaitAcquireCycles)),
+                solver.MakeIntConst(controlCosts.Max(cost => cost.ConsumerReleaseCycles)));
+            pipelineDecision.Estimate = estimate;
+            var savings = solver.MakeMax(
+                solver.MakeIntConst(0),
+                estimate.SerialRegionCycles - estimate.PipelinedRegionCycles);
+            pipelineOverlapSavings += pipelineDecision.AsynchronousSelected * savings;
+        }
+
+        var serialCycles = computeCycles
+            + solver.MakeSum(memoryCycles)
+            + solver.MakeSum(transferCycles)
+            + synchronizationCycles
+            + storageEncodingCycles;
+        var totalCycles = solver.MakeMax(solver.MakeIntConst(0), serialCycles - pipelineOverlapSavings);
+
+        // Predicted latency is the primary objective. Target-owned candidate
+        // priority is a strict secondary objective used only when two complete
+        // schedules have exactly the same predicted latency. Scalarization is
+        // exact because the multiplier is greater than the largest possible
+        // aggregate priority in this solve.
+        var maximumMicroKernelSelectionPriority = microKernelDecisions.Values.Aggregate(
+            0L,
+            (sum, decision) => checked(sum + decision.Candidates.Max(candidate => (long)candidate.SelectionPriority)));
+        var maximumStorageEncodingSelectionPriority = storageEncodingDecisions.Values.Aggregate(
+            0L,
+            (sum, decision) => checked(sum + decision.Candidates.Max(candidate => (long)candidate.SelectionPriority)));
+        var maximumPipelineSelectionPriority = loopPipelineDecisions.Count;
+        var maximumSelectionPriority = checked(
+            maximumMicroKernelSelectionPriority +
+            maximumStorageEncodingSelectionPriority +
+            maximumPipelineSelectionPriority);
+        var microKernelSelectionPriorityTerms = microKernelDecisions.Values
+            .SelectMany(decision => decision.Candidates.Select(
+                (candidate, index) => (IntExpr)(decision.SelectionVars[index] * candidate.SelectionPriority)))
+            .ToArray();
+        var storageEncodingSelectionPriorityTerms = storageEncodingDecisions.Values
+            .SelectMany(decision => decision.Candidates.Select(
+                (candidate, index) => (IntExpr)(decision.SelectionVars[index] * candidate.SelectionPriority)))
+            .ToArray();
+        var pipelineSelectionPriorityTerms = loopPipelineDecisions.Values
+            .Select(decision => (IntExpr)decision.AsynchronousSelected)
+            .ToArray();
+        var selectionPriorityTerms = microKernelSelectionPriorityTerms
+            .Concat(storageEncodingSelectionPriorityTerms)
+            .Concat(pipelineSelectionPriorityTerms)
+            .ToArray();
+        var selectionPriority = (selectionPriorityTerms.Length == 0
+            ? solver.MakeIntConst(0)
+            : solver.MakeSum(selectionPriorityTerms)).Var();
+        selectionPriority.SetRange(0, maximumSelectionPriority);
+        var objectiveScale = checked(maximumSelectionPriority + 1);
 
         var totalCyclesVar = totalCycles.Var();
-        totalCyclesVar.SetRange(0, long.MaxValue / memoryResourceGroups.Min(group => machine.GetMemoryResource(group.Key).ReadBytesPerCycle)); /* avoid crash. */
-        var objectiveMonitor = solver.MakeMinimize(totalCyclesVar, 1);
+        var arithmeticCycleUpperBound = (long.MaxValue - maximumSelectionPriority) / objectiveScale;
+        var memoryCycleUpperBound = long.MaxValue /
+            memoryResourceGroups.Min(group => machine.GetMemoryResource(group.Key).ReadBytesPerCycle);
+        totalCyclesVar.SetRange(0, Math.Min(arithmeticCycleUpperBound, memoryCycleUpperBound));
+        var optimizationObjective = ((totalCyclesVar * objectiveScale) + selectionPriority).Var();
+        var objectiveMonitor = solver.MakeMinimize(optimizationObjective, 1);
         var collector = solver.MakeNBestValueSolutionCollector(5, false);
-        collector.AddObjective(totalCyclesVar);
+        collector.AddObjective(optimizationObjective);
+        collector.Add(optimizationObjective);
         collector.Add(totalCyclesVar);
+        collector.Add(selectionPriority);
         collector.Add(levelDataReads.Select(i => i.Var()).ToArray());
         collector.Add(levelDataWrites.Select(i => i.Var()).ToArray());
         collector.Add(levelMaterializationReads.Select(i => i.Var()).ToArray());
@@ -1097,6 +1551,7 @@ public sealed class GraphTiler
         collector.Add(levelTransferReads.Select(i => i.Var()).ToArray());
         collector.Add(levelTransferWrites.Select(i => i.Var()).ToArray());
         collector.Add(computeCycles.Var());
+        collector.Add(pipelineOverlapSavings.Var());
         collector.Add(synchronizationCycles.Var());
         collector.Add(storageEncodingCycles.Var());
         collector.Add(memoryCycles.Select(i => i.Var()).ToArray());
@@ -1114,6 +1569,15 @@ public sealed class GraphTiler
 
             collector.Add(decision.SelectionVars);
             collector.Add(decision.Candidates.Select(candidate => candidate.PhysicalBytes.Var()).ToArray());
+            collector.Add(decision.Candidates
+                .Where(candidate => candidate.StageStrideBytes is not null)
+                .Select(candidate => candidate.StageStrideBytes!.Var())
+                .ToArray());
+            if (decision.StagedAllocation is { } stagedAllocation)
+            {
+                collector.Add(stagedAllocation.StageCount.Var());
+            }
+
             collector.Add(decision.Candidates.Select(candidate => candidate.EstimatedCycles.Var()).ToArray());
             collector.Add(decision.Candidates
                 .SelectMany(candidate => candidate.Parameters)
@@ -1125,7 +1589,7 @@ public sealed class GraphTiler
         {
             searchAbleVars.AddRange(decision.SelectionVars);
             collector.Add(decision.SelectionVars);
-            collector.Add(decision.Candidates.Select(candidate => candidate.EstimatedCycles.Var()).ToArray());
+            collector.Add(decision.Candidates.Select(candidate => candidate.ExecutionCost.RegionCycles.Var()).ToArray());
             collector.Add(decision.Candidates
                 .SelectMany(candidate => candidate.Resources)
                 .Select(resource => resource.Units.Var())
@@ -1138,6 +1602,37 @@ public sealed class GraphTiler
                 .SelectMany(candidate => candidate.Parameters)
                 .Select(parameter => parameter.Value.Var())
                 .ToArray());
+        }
+
+        foreach (var decision in transferSourceDecisions.Values)
+        {
+            collector.Add(decision.SourceIsAvailable.Var());
+            collector.Add(decision.Sources.Select(source => source.Selected.Var()).ToArray());
+        }
+
+        foreach (var decision in loopPipelineDecisions.Values)
+        {
+            searchAbleVars.Add(decision.SerialSelected);
+            searchAbleVars.Add(decision.AsynchronousSelected);
+            collector.Add(decision.SerialSelected);
+            collector.Add(decision.AsynchronousSelected);
+            collector.Add(decision.StageCount);
+            collector.Add(decision.Channels.Select(channel => channel.Legality.Var()).ToArray());
+            if (decision.Estimate is not { } estimate)
+            {
+                throw new InvalidOperationException($"Loop pipeline {decision.Key} has no schedule estimate.");
+            }
+
+            collector.Add(new[]
+            {
+                estimate.IterationCount.Var(),
+                estimate.InvocationCount.Var(),
+                estimate.ProducerCycles.Var(),
+                estimate.ConsumerCycles.Var(),
+                estimate.InitiationIntervalCycles.Var(),
+                estimate.SerialRegionCycles.Var(),
+                estimate.PipelinedRegionCycles.Var(),
+            });
         }
 
         foreach (var (node, diminfo) in tileableNodeMemo)
@@ -1252,7 +1747,7 @@ public sealed class GraphTiler
 
         if (Diagnostics.DumpScope.Current.IsEnabled(Diagnostics.DumpFlags.Tiling))
         {
-            monitors.Add(solver.MakeSearchLog(10000, totalCyclesVar));
+            monitors.Add(solver.MakeSearchLog(10000, optimizationObjective));
         }
 
         var status = solver.Solve(decisionBuilder, monitors.ToArray());
@@ -1287,6 +1782,7 @@ public sealed class GraphTiler
                 var shapes = levelBufferShapes[level][nodeBuffer].Select(s => sol.Value(s.Var())).ToArray();
                 var strides = TensorUtilities.GetDefaultStrides(shapes);
                 TargetStorageEncodingSelection? storageEncoding = null;
+                StagedBufferLayout? stagedLayout = null;
                 var alignment = checked((int)Math.Max(1, nodeBuffer.Id.Node.GetBufferElemSize(nodeBuffer.Id.Index)));
                 if (selectedPositions.Length == 1 && sol.Value(sizeVar.Var()) > 0)
                 {
@@ -1310,22 +1806,39 @@ public sealed class GraphTiler
                     }
 
                     var candidate = encodingDecision.Candidates[selectedEncodingIndices[0]];
-                    var physicalBytes = sol.Value(candidate.PhysicalBytes.Var());
+                    var stagePhysicalBytes = sol.Value(candidate.PhysicalBytes.Var());
                     var selectedSize = sol.Value(sizeVar.Var());
-                    if (physicalBytes != selectedSize)
+                    var expectedSize = stagePhysicalBytes;
+                    long? stageStrideBytes = null;
+                    int? stageCount = null;
+                    if (encodingDecision.StagedAllocation is { } stagedAllocation)
+                    {
+                        stageCount = checked((int)sol.Value(stagedAllocation.StageCount.Var()));
+                        stageStrideBytes = sol.Value(candidate.StageStrideBytes!.Var());
+                        expectedSize = stageCount.Value > 1
+                            ? checked(stageCount.Value * stageStrideBytes.Value)
+                            : stagePhysicalBytes;
+                    }
+
+                    if (expectedSize != selectedSize)
                     {
                         throw new InvalidOperationException(
-                            $"Storage encoding {candidate.Id} selected {physicalBytes} bytes for {nodeBuffer}, " +
+                            $"Storage encoding {candidate.Id} selected {expectedSize} bytes for {nodeBuffer}, " +
                             $"but the scheduled buffer size is {selectedSize} bytes.");
                     }
 
                     storageEncoding = new TargetStorageEncodingSelection(
                         candidate.Id,
-                        physicalBytes,
+                        stagePhysicalBytes,
                         candidate.AlignmentBytes,
                         candidate.Parameters.Select(parameter => new KeyValuePair<string, long>(
                             parameter.Name,
                             sol.Value(parameter.Value.Var()))));
+                    if (stageCount is { } concreteStageCount && concreteStageCount > 1 && stageStrideBytes is { } concreteStageStride)
+                    {
+                        stagedLayout = storageEncoding.CreateStagedBufferLayout(concreteStageCount, concreteStageStride);
+                    }
+
                     alignment = candidate.AlignmentBytes;
                 }
 
@@ -1335,7 +1848,8 @@ public sealed class GraphTiler
                     shapes,
                     strides,
                     alignment,
-                    storageEncoding);
+                    storageEncoding,
+                    stagedLayout);
             }
 
             levelBufferInfos[level] = nodeBufferInfos;
@@ -1377,13 +1891,109 @@ public sealed class GraphTiler
             var selection = new BlockMicroKernelSelection(
                 candidate.Family,
                 candidate.Variant,
-                sol.Value(candidate.EstimatedCycles.Var()),
+                sol.Value(candidate.ExecutionCost.RegionCycles.Var()),
                 resources,
                 parameters);
             if (!selectedMicroKernels.TryAdd(opNode.Wrapped.RegionOpId, selection))
             {
                 throw new InvalidOperationException(
                     $"Scheduled region contains multiple block microkernel decisions for source Op{opNode.Wrapped.RegionOpId}.");
+            }
+        }
+
+        var selectedTransferSources = new Dictionary<TileBufferPlacement, SelectedTileBufferSource>();
+        foreach (var decision in transferSourceDecisions.Values)
+        {
+            var destinationSelected = tileNodeMemo[decision.Destination.Node]
+                .BufferInfoMap[decision.Destination.Buffer]
+                .Places[decision.Destination.LoopEntry][decision.Destination.StorageLevel];
+            if (sol.Value(destinationSelected.Var()) == 0)
+            {
+                continue;
+            }
+
+            var sources = decision.Sources
+                .Where(source => sol.Value(source.Selected.Var()) == 1)
+                .ToArray();
+            if (sources.Length != 1)
+            {
+                throw new InvalidOperationException(
+                    $"Selected transfer destination {decision.Destination} requires exactly one " +
+                    $"{decision.SourceMemorySpace} source, got {sources.Length}.");
+            }
+
+            selectedTransferSources.Add(decision.Destination, sources[0].Source);
+        }
+
+        var selectedLoopPipelines = new Dictionary<TileNode, SelectedLoopPipeline>();
+        foreach (var decision in loopPipelineDecisions.Values)
+        {
+            if (sol.Value(decision.AsynchronousSelected) == 0)
+            {
+                continue;
+            }
+
+            var channels = decision.Channels
+                .Where(channel => sol.Value(channel.Placement) == 1)
+                .Select(channel =>
+                {
+                    var destination = new TileBufferPlacement(
+                        decision.Key.Node,
+                        channel.Buffer.Id,
+                        channel.LoopEntry,
+                        channel.StorageLevel);
+                    if (!selectedTransferSources.TryGetValue(destination, out var source))
+                    {
+                        throw new InvalidOperationException(
+                            $"Selected pipeline channel {channel.ChannelId} has no solved transfer source.");
+                    }
+
+                    return new SelectedLoopPipelineChannel(
+                        channel.ChannelId,
+                        channel.Buffer,
+                        channel.StorageLevel,
+                        source,
+                        channel.SourceMemorySpace,
+                        channel.DestinationMemorySpace);
+                })
+                .ToImmutableArray();
+            if (channels.IsDefaultOrEmpty)
+            {
+                throw new InvalidOperationException(
+                    $"Selected loop pipeline {decision.Key} has no staged transfer channel.");
+            }
+
+            var template = targetOptions.LoopPipelineBackend.GetTemplate(asynchronousStageCount, machine);
+            var plan = new PipelineRegionPlan(
+                $"{template.Id}.axis{decision.DomainAxis}.entry{decision.Key.LoopEntry}",
+                template.Id,
+                template.Synchronization,
+                asynchronousStageCount,
+                prefetchDistance: 1,
+                PipelineTailPolicy.Serial,
+                channels.Select(channel => new PipelineStageChannelPlan(
+                    channel.ChannelId,
+                    channel.SourceMemorySpace,
+                    channel.DestinationMemorySpace)));
+            var estimate = decision.Estimate
+                ?? throw new InvalidOperationException($"Selected loop pipeline {decision.Key} has no cost estimate.");
+            var selection = new SelectedLoopPipeline(
+                decision.Key.LoopEntry,
+                decision.DomainAxis,
+                plan,
+                new SelectedLoopPipelineScheduleEstimate(
+                    sol.Value(estimate.IterationCount.Var()),
+                    sol.Value(estimate.InvocationCount.Var()),
+                    sol.Value(estimate.ProducerCycles.Var()),
+                    sol.Value(estimate.ConsumerCycles.Var()),
+                    sol.Value(estimate.InitiationIntervalCycles.Var()),
+                    sol.Value(estimate.SerialRegionCycles.Var()),
+                    sol.Value(estimate.PipelinedRegionCycles.Var())),
+                channels);
+            if (!selectedLoopPipelines.TryAdd(decision.Key.Node, selection))
+            {
+                throw new InvalidOperationException(
+                    $"Tile scope {decision.Key.Node} selected more than one asynchronous loop schedule.");
             }
         }
 
@@ -1453,7 +2063,7 @@ public sealed class GraphTiler
             DumpAssgin(primTree, new TreeSolverPythonPrinter(sol, solver, opNodeMemo, tileNodeMemo, tileableNodeMemo, targetOptions), coverageConstraints, reductionStateBytes, reductionStateConstraints, selectedMicroKernels, eachLevelStoreBufferConstrains, levelBufferLifetimeConstraints, levelBufferSizes, levelDataReads, levelDataWrites, levelTransferReads, levelTransferWrites, memoryCycles, transferCycles, computeCycles, synchronizationCycles, totalCyclesVar);
         }
 
-        return new TreeSolveResult(primBufferGraph, sol.ObjectiveValue(), levelBufferInfos, opNodeMemoAssgin, tileNodeMemoAssgin, tileableNodeMemoAssgin, selectedMaterializations, selectedMicroKernels, targetOptions, moduleKind);
+        return new TreeSolveResult(primBufferGraph, sol.Value(totalCyclesVar), levelBufferInfos, opNodeMemoAssgin, tileNodeMemoAssgin, tileableNodeMemoAssgin, selectedMaterializations, selectedMicroKernels, selectedLoopPipelines, selectedTransferSources, targetOptions, moduleKind, owningScheduledFunctionId);
 
         static int GetStableScopeAnchor(TileNode node)
         {
@@ -1525,7 +2135,7 @@ public sealed class GraphTiler
             {
                 writer.WriteLine($"Op{regionOpId}: {selection.Family}/{selection.Variant}");
                 writer.Indent++;
-                writer.WriteLine($"EstimatedCycles: {selection.EstimatedCycles}");
+                writer.WriteLine($"RegionCycles: {selection.RegionCycles}");
                 writer.WriteLine($"Resources: {string.Join(", ", selection.Resources.OrderBy(pair => pair.Key).Select(pair => $"{pair.Key}={pair.Value}"))}");
                 writer.WriteLine($"Parameters: {string.Join(", ", selection.Parameters.OrderBy(pair => pair.Key).Select(pair => $"{pair.Key}={pair.Value}"))}");
                 writer.Indent--;
@@ -1648,7 +2258,7 @@ public sealed class GraphTiler
 
             if (!SolveMemo.TryGetValue(primTree, out var tiled))
             {
-                var result = SolvePrimGraph(primTree, bufferGraphMemo, targetOptions, moduleKind);
+                var result = SolvePrimGraph(primTree, bufferGraphMemo, targetOptions, moduleKind, funcName);
                 (inputBids, outputBids) = (result.Inputs, result.Outputs);
                 var inputBidsOrdered = OrderBufferIdentities(inputBids);
                 var outputBidsOrdered = OrderBufferIdentities(outputBids);
@@ -1933,16 +2543,18 @@ public sealed class GraphTiler
             if (lhs.IsLegal.Var().Min() != 1 || lhs.IsLegal.Var().Max() != 1 ||
                 rhs.IsLegal.Var().Min() != 1 || rhs.IsLegal.Var().Max() != 1 ||
                 !HaveEquivalentBufferEncodingRequirements(lhs, rhs) ||
-                !TryGetConstant(lhs.EstimatedCycles, out var lhsCycles) ||
-                !TryGetConstant(rhs.EstimatedCycles, out var rhsCycles) ||
-                lhsCycles > rhsCycles)
+                !TryGetConstant(lhs.ExecutionCost.RegionCycles, out var lhsCycles) ||
+                !TryGetConstant(rhs.ExecutionCost.RegionCycles, out var rhsCycles) ||
+                lhsCycles > rhsCycles ||
+                lhs.SelectionPriority > rhs.SelectionPriority)
             {
                 return false;
             }
 
             var lhsResources = lhs.Resources.ToDictionary(usage => usage.Resource);
             var rhsResources = rhs.Resources.ToDictionary(usage => usage.Resource);
-            var strictlyBetter = lhsCycles < rhsCycles;
+            var strictlyBetter = lhsCycles < rhsCycles ||
+                lhs.SelectionPriority < rhs.SelectionPriority;
             foreach (var resource in lhsResources.Keys.Union(rhsResources.Keys))
             {
                 if (!lhsResources.TryGetValue(resource, out var lhsUsage) ||
@@ -2022,7 +2634,8 @@ public sealed class GraphTiler
         if (duplicate is not null)
         {
             throw new InvalidOperationException(
-                $"Target {machine.Id} exposes duplicate block microkernel {duplicate.Key.Family}/{duplicate.Key.Variant} for Op{opNode.OpId}.");
+                $"Target {machine.Id} exposes duplicate block microkernel " +
+                $"{duplicate.Key.Family}/{duplicate.Key.Variant} for Op{opNode.OpId}.");
         }
 
         foreach (var candidate in candidates)
@@ -2032,6 +2645,13 @@ public sealed class GraphTiler
                 throw new InvalidOperationException($"Op{opNode.OpId} has a block microkernel candidate with an empty identity.");
             }
 
+            if (candidate.SelectionPriority < 0)
+            {
+                throw new InvalidOperationException(
+                    $"Block microkernel {candidate.Family}/{candidate.Variant} has negative selection priority " +
+                    $"{candidate.SelectionPriority}.");
+            }
+
             var legality = candidate.IsLegal.Var();
             if (legality.Min() < 0 || legality.Max() > 1)
             {
@@ -2039,12 +2659,12 @@ public sealed class GraphTiler
                     $"Block microkernel {candidate.Family}/{candidate.Variant} legality must be boolean, got [{legality.Min()}, {legality.Max()}].");
             }
 
-            var estimatedCycles = candidate.EstimatedCycles.Var();
+            var estimatedCycles = candidate.ExecutionCost.RegionCycles.Var();
             if (estimatedCycles.Min() < 0)
             {
                 throw new InvalidOperationException(
                     $"Block microkernel {candidate.Family}/{candidate.Variant} has invalid estimated cycles " +
-                    $"[{estimatedCycles.Min()}, {estimatedCycles.Max()}]: {candidate.EstimatedCycles}.");
+                    $"[{estimatedCycles.Min()}, {estimatedCycles.Max()}]: {candidate.ExecutionCost.RegionCycles}.");
             }
 
             var duplicateResource = candidate.Resources.GroupBy(usage => usage.Resource).FirstOrDefault(group => group.Count() > 1);
@@ -2156,7 +2776,8 @@ public sealed class GraphTiler
         int loopEntry,
         int storageLevel,
         IReadOnlyList<TargetStorageEncodingCandidate> candidates,
-        TargetMachineModel machine)
+        TargetMachineModel machine,
+        StagedAllocationContext? staging)
     {
         if (candidates.Count == 0)
         {
@@ -2189,6 +2810,35 @@ public sealed class GraphTiler
             {
                 throw new InvalidOperationException(
                     $"Storage encoding {candidate.Id} for {buffer} has negative physical size or cost.");
+            }
+
+            if (candidate.SelectionPriority < 0)
+            {
+                throw new InvalidOperationException(
+                    $"Storage encoding {candidate.Id} for {buffer} has negative selection priority {candidate.SelectionPriority}.");
+            }
+
+            if (staging is null && candidate.StageStrideBytes is not null)
+            {
+                throw new InvalidOperationException(
+                    $"Ordinary storage encoding {candidate.Id} for {buffer} unexpectedly declares a stage stride.");
+            }
+
+            if (staging is not null)
+            {
+                if (candidate.StageStrideBytes is not { } stageStride)
+                {
+                    throw new InvalidOperationException(
+                        $"Staged storage encoding {candidate.Id} for {buffer} must declare a stage stride.");
+                }
+
+                if (stageStride.Var().Min() < candidate.PhysicalBytes.Var().Min())
+                {
+                    throw new InvalidOperationException(
+                        $"Staged storage encoding {candidate.Id} for {buffer} has stage stride " +
+                        $"[{stageStride.Var().Min()},{stageStride.Var().Max()}] smaller than its encoded stage " +
+                        $"[{candidate.PhysicalBytes.Var().Min()},{candidate.PhysicalBytes.Var().Max()}].");
+                }
             }
 
             if (candidate.AlignmentBytes <= 0 ||
@@ -2239,7 +2889,12 @@ public sealed class GraphTiler
         writer.Indent++;
         foreach (var primitive in machine.Compute.MatrixPrimitives)
         {
-            writer.WriteLine($"- {primitive.Name}: m={primitive.M}, n={primitive.N}, k={primitive.K}, instructions_per_cycle={primitive.InstructionsPerCyclePerBlock}, supported={primitive.IsSupported}");
+            writer.WriteLine(
+                $"- {primitive.Name}: m={primitive.M}, n={primitive.N}, k={primitive.K}, " +
+                $"dependency_latency_cycles={primitive.DependencyLatencyCycles}, " +
+                $"worker_reciprocal_throughput_cycles={primitive.ReciprocalThroughputCyclesPerWorker}, " +
+                $"max_instructions_per_cycle={primitive.MaxInstructionsPerCyclePerBlock}, " +
+                $"cooperative_workers={primitive.CooperativeWorkers}, supported={primitive.IsSupported}");
         }
 
         writer.Indent--;
@@ -2312,15 +2967,23 @@ public sealed class GraphTiler
             .Where(primitive => primitive.Supports(operandDataTypes[0], operandDataTypes[1]))
             .Select(primitive =>
             {
-                // Sum primitive tiles over all full and tail regions without
-                // multiplying a nominal local tile by a hierarchy-factor
-                // product. This is the factored form of the M/N/K Cartesian
-                // full-tail classes and therefore does not grow exponentially.
-                var totalInstructionCount = GetTotalPrimitiveTileCount(fullShape.M, shape.M, primitive.M, solver)
+                // Keep output accumulator chains separate from their dependent
+                // reduction length so the target timing model can enforce both
+                // instruction latency and throughput bounds.
+                var accumulatorChains = GetTotalPrimitiveTileCount(fullShape.M, shape.M, primitive.M, solver)
                     * GetTotalPrimitiveTileCount(fullShape.N, shape.N, primitive.N, solver)
-                    * GetTotalPrimitiveTileCount(fullShape.K, shape.K, primitive.K, solver)
                     * fullShape.Multiplicity;
-                return DivideByRate(totalInstructionCount, primitive.InstructionsPerCyclePerBlock);
+                var dependentInstructionsPerChain = GetTotalPrimitiveTileCount(
+                    fullShape.K,
+                    shape.K,
+                    primitive.K,
+                    solver);
+                return MatrixComputeCostModel.EstimateCycles(
+                    primitive,
+                    accumulatorChains,
+                    dependentInstructionsPerChain,
+                    machine.Execution,
+                    solver);
             })
             .ToArray();
         return candidates.Aggregate(simtCycles, solver.MakeMin);
@@ -2711,10 +3374,75 @@ public sealed class GraphTiler
     {
     }
 
+    private sealed record LoopPipelineKey(TileNode Node, int LoopEntry);
+
     private sealed record MicroKernelSolverDecision(
         IReadOnlyList<BlockMicroKernelCandidate> Candidates,
         IntVar[] SelectionVars,
-        IntExpr SelectedCycles);
+        IntExpr SelectedRegionCycles);
+
+    private sealed record TileTransferSourceChoice(
+        SelectedTileBufferSource Source,
+        IntExpr Selected);
+
+    private sealed record TileTransferSourceDecision(
+        TileBufferPlacement Destination,
+        TargetMemorySpaceId SourceMemorySpace,
+        TargetMemorySpaceId DestinationMemorySpace,
+        IReadOnlyList<TileTransferSourceChoice> Sources,
+        IntExpr SourceIsAvailable);
+
+    private sealed record LoopPipelineChannelDecision(
+        string ChannelId,
+        NodeWithBuffer Buffer,
+        TileNodeBufferInfo<IntExpr> BufferInfo,
+        int LoopEntry,
+        int StorageLevel,
+        TileTransferSourceDecision TransferSource,
+        IntVar Placement,
+        IntExpr Legality)
+    {
+        public TargetMemorySpaceId SourceMemorySpace => TransferSource.SourceMemorySpace;
+
+        public TargetMemorySpaceId DestinationMemorySpace => TransferSource.DestinationMemorySpace;
+    }
+
+    private sealed class LoopPipelineSolverDecision
+    {
+        public LoopPipelineSolverDecision(
+            LoopPipelineKey key,
+            int domainAxis,
+            IntVar serialSelected,
+            IntVar asynchronousSelected,
+            IntVar stageCount,
+            IReadOnlyList<LoopPipelineChannelDecision> channels,
+            ImmutableArray<int> regionOpIds)
+        {
+            Key = key;
+            DomainAxis = domainAxis;
+            SerialSelected = serialSelected;
+            AsynchronousSelected = asynchronousSelected;
+            StageCount = stageCount;
+            Channels = channels;
+            RegionOpIds = regionOpIds;
+        }
+
+        public LoopPipelineKey Key { get; }
+
+        public int DomainAxis { get; }
+
+        public IntVar SerialSelected { get; }
+
+        public IntVar AsynchronousSelected { get; }
+
+        public IntVar StageCount { get; }
+
+        public IReadOnlyList<LoopPipelineChannelDecision> Channels { get; }
+
+        public ImmutableArray<int> RegionOpIds { get; }
+
+        public LoopPipelineScheduleEstimate? Estimate { get; set; }
+    }
 
     private sealed record StorageEncodingPlacementKey(
         NodeWithBuffer Buffer,
@@ -2724,7 +3452,8 @@ public sealed class GraphTiler
     private sealed record StorageEncodingSolverDecision(
         IReadOnlyList<TargetStorageEncodingCandidate> Candidates,
         IntVar[] SelectionVars,
-        bool HasIndependentSelectionVars);
+        bool HasIndependentSelectionVars,
+        StagedAllocationContext? StagedAllocation);
 
     private sealed class TiledOutputReplacingExprCloner : ExprCloner<Unit>
     {

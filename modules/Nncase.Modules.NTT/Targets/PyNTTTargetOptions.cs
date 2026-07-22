@@ -4,6 +4,7 @@
 using System;
 using System.ComponentModel;
 using Nncase.CostModel;
+using Nncase.Schedule;
 
 namespace Nncase.Targets;
 
@@ -89,6 +90,9 @@ public sealed class PyNTTTargetOptions : NTTTargetOptions
         StorageEncodingModel = string.Equals(_backend, "triton", StringComparison.OrdinalIgnoreCase)
             ? new TritonTargetStorageEncodingModel()
             : new DefaultTargetStorageEncodingModel();
+        LoopPipelineBackend = string.Equals(_backend, "triton", StringComparison.OrdinalIgnoreCase)
+            ? TritonLoopPipelineBackend.Instance
+            : new EmptyLoopPipelineBackend();
     }
 
     private void RefreshTargetCostModel() => OnTargetMachineChanged();

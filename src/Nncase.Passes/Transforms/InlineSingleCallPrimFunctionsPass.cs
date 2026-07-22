@@ -436,29 +436,71 @@ public sealed class InlineSingleCallPrimFunctionsPass : ModulePass
 
         private static bool TryGetFixedInt64(BaseExpr expression, out long value)
         {
-            try
+            switch (expression)
             {
-                switch (expression)
+                case None:
+                    value = 0;
+                    return true;
+                case DimConst dimConst:
+                    value = dimConst.Value;
+                    return true;
+                case Dimension { IsFixed: true } dimension:
+                    value = dimension.FixedValue;
+                    return true;
+                case TensorConst { Value.Shape.IsScalar: true } tensorConst:
+                    return TryReadScalarInt64(tensorConst.Value, out value);
+                default:
+                    value = 0;
+                    return false;
+            }
+        }
+
+        private static bool TryReadScalarInt64(Tensor tensor, out long value)
+        {
+            var scalar = tensor[Array.Empty<long>()];
+            switch (scalar)
+            {
+                case sbyte signed8:
+                    value = signed8;
+                    return true;
+                case byte unsigned8:
+                    value = unsigned8;
+                    return true;
+                case short signed16:
+                    value = signed16;
+                    return true;
+                case ushort unsigned16:
+                    value = unsigned16;
+                    return true;
+                case int signed32:
+                    value = signed32;
+                    return true;
+                case uint unsigned32:
+                    value = unsigned32;
+                    return true;
+                case long signed64:
+                    value = signed64;
+                    return true;
+                case ulong unsigned64 when unsigned64 <= long.MaxValue:
+                    value = (long)unsigned64;
+                    return true;
+            }
+
+            if (scalar is not null)
+            {
+                var scalarType = scalar.GetType();
+                if (scalarType.IsGenericType
+                    && scalarType.GetGenericTypeDefinition() == typeof(Pointer<>)
+                    && scalarType.GetProperty(nameof(Pointer<byte>.Value))?.GetValue(scalar) is ulong pointer
+                    && pointer <= long.MaxValue)
                 {
-                    case None:
-                        value = 0;
-                        return true;
-                    case DimConst dimConst:
-                        value = dimConst.Value;
-                        return true;
-                    case TensorConst { Value.Shape.IsScalar: true } tensorConst:
-                        value = Convert.ToInt64(tensorConst.Value[Array.Empty<long>()]);
-                        return true;
-                    default:
-                        value = 0;
-                        return false;
+                    value = (long)pointer;
+                    return true;
                 }
             }
-            catch (OverflowException)
-            {
-                value = 0;
-                return false;
-            }
+
+            value = 0;
+            return false;
         }
 
         private static bool UsesBackingTensorLogicalLayout(TIR.Buffer buffer, IVar backingParameter)

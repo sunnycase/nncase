@@ -270,6 +270,18 @@ public partial class ExprVisitor<TExprResult, TTypeResult, TContext>
     }
 
     /// <inheritdoc />
+    protected internal override TExprResult VisitPipelineFor(TIR.PipelineFor expr, TContext context)
+    {
+        VisitOperands(expr, context);
+        if (CanVisitAttributes(expr))
+        {
+            VisitAttributes(expr, context);
+        }
+
+        return VisitLeafPipelineFor(expr, context);
+    }
+
+    /// <inheritdoc />
     protected internal override TExprResult VisitIfThenElse(TIR.IfThenElse expr, TContext context)
     {
         VisitOperands(expr, context);
@@ -948,6 +960,11 @@ public partial class ExprVisitor<TExprResult, TTypeResult, TContext>
     protected virtual TExprResult VisitLeafFor(TIR.For expr, TContext context) => DefaultVisitLeaf(expr, context);
 
     /// <summary>
+    /// Visit leaf <see cref="TIR.PipelineFor"/>.
+    /// </summary>
+    protected virtual TExprResult VisitLeafPipelineFor(TIR.PipelineFor expr, TContext context) => DefaultVisitLeaf(expr, context);
+
+    /// <summary>
     /// Visit leaf <see cref="TIR.IfThenElse"/>.
     /// </summary>
     protected virtual TExprResult VisitLeafIfThenElse(TIR.IfThenElse expr, TContext context) => DefaultVisitLeaf(expr, context);
@@ -1341,6 +1358,13 @@ public partial class ExprVisitor<TExprResult, TTypeResult>
 
     /// <inheritdoc/>
     internal protected sealed override TExprResult VisitFor(TIR.For expr, Unit context) => VisitFor(expr);
+    /// <summary>
+    /// Visit <see cref="TIR.PipelineFor"/>.
+    /// </summary>
+    internal protected virtual TExprResult VisitPipelineFor(TIR.PipelineFor expr) => base.VisitPipelineFor(expr, default);
+
+    /// <inheritdoc/>
+    internal protected sealed override TExprResult VisitPipelineFor(TIR.PipelineFor expr, Unit context) => VisitPipelineFor(expr);
     /// <summary>
     /// Visit <see cref="TIR.IfThenElse"/>.
     /// </summary>
@@ -1845,6 +1869,14 @@ public partial class ExprVisitor<TExprResult, TTypeResult>
 
     /// <inheritdoc/>
     protected sealed override TExprResult VisitLeafFor(TIR.For expr, Unit context) => VisitLeafFor(expr);
+
+    /// <summary>
+    /// Visit leaf <see cref="TIR.PipelineFor"/>.
+    /// </summary>
+    protected virtual TExprResult VisitLeafPipelineFor(TIR.PipelineFor expr) => base.VisitLeafPipelineFor(expr, default);
+
+    /// <inheritdoc/>
+    protected sealed override TExprResult VisitLeafPipelineFor(TIR.PipelineFor expr, Unit context) => VisitLeafPipelineFor(expr);
 
     /// <summary>
     /// Visit leaf <see cref="TIR.IfThenElse"/>.

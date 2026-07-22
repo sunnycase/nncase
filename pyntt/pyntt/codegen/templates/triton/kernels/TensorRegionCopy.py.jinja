@@ -18,10 +18,12 @@ def {{ model["FunctionName"] }}({{ helper_parameters(model) }}):
 {% for expression in ctx["expanded_indices"] %}
     copy_desc_idx{{ loop.index0 }} = {{ expression }}
 {% endfor %}
+{% if ctx["linear_expression"] is not none %}
     copy_linear = {{ ctx["linear_expression"] }}
+{% endif %}
     copy_global_offset = {{ ctx["global_offset"] }}
 {% if ctx["plan"]["local_model_name"] == "Destination" %}
-    tle.gpu.copy({{ ctx["plan"]["global_name"] }} + copy_global_offset, {{ ctx["local_descriptor"] }}, {{ ctx["copy_shape"] }})
+    tle.gpu.copy({{ ctx["plan"]["global_name"] }} + copy_global_offset, {{ ctx["local_descriptor"] }}, {{ ctx["copy_shape"] }}{% if model.get("IsAsync", False) %}, is_async=True{% endif %})
 {% else %}
     tle.gpu.copy({{ ctx["local_descriptor"] }}, {{ ctx["plan"]["global_name"] }} + copy_global_offset, {{ ctx["copy_shape"] }})
 {% endif %}

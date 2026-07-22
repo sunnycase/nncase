@@ -721,19 +721,30 @@ public class DeviceCSourceConvertVisitor : CSourceConvertVisitor
 
         for (var index = 0; index < expr.Fields.Length; index++)
         {
-            if (ReductionCodegenUtility.TryGetAdjacentReductionLoopPartitionPair(expr.Fields, index, out var fullLoop, out var tailLoop))
+            if (ReductionCodegenUtility.TryGetReductionLoopPartitionPair(expr.Fields, index, out var partitionPair))
             {
+                if (partitionPair.FullLoop is not For)
+                {
+                    throw new NotSupportedException(
+                        $"NTT CPU codegen does not support {partitionPair.FullLoop.GetType().Name} reduction pipelines.");
+                }
+
                 if (_reductionScopes.Count == 0)
                 {
-                    VisitPartitionedReductionLoops(fullLoop, tailLoop);
+                    VisitPartitionedReductionLoops(partitionPair);
                 }
                 else
                 {
-                    Visit(fullLoop);
-                    Visit(tailLoop);
+                    Visit(partitionPair.FullLoop);
+                    foreach (var synchronization in partitionPair.SynchronizationFields)
+                    {
+                        Visit(synchronization);
+                    }
+
+                    Visit(partitionPair.TailLoop);
                 }
 
-                index++;
+                index = partitionPair.TailFieldIndex;
                 continue;
             }
 
@@ -801,15 +812,20 @@ public class DeviceCSourceConvertVisitor : CSourceConvertVisitor
         return symbol;
     }
 
-    private void VisitPartitionedReductionLoops(For fullLoop, For tailLoop)
+    private void VisitPartitionedReductionLoops(ReductionLoopPartitionPair pair)
     {
-        var reductionScope = CreateReductionScope(fullLoop.Body, tailLoop.Body);
+        var reductionScope = CreateReductionScope(pair.FullBody, pair.TailBody);
         _reductionScopes.Push(reductionScope);
         try
         {
             EmitReductionInitializers(reductionScope);
-            Visit(fullLoop);
-            Visit(tailLoop);
+            Visit(pair.FullLoop);
+            foreach (var synchronization in pair.SynchronizationFields)
+            {
+                Visit(synchronization);
+            }
+
+            Visit(pair.TailLoop);
             EmitReductionFinalizers(reductionScope);
         }
         finally
@@ -878,7 +894,7 @@ public class DeviceCSourceConvertVisitor : CSourceConvertVisitor
                     .ToArray(),
                 $"ntt_reduction_{stateId}_initialized",
                 elementCount,
-                group.Calls.Length);
+                group.ExpectedUpdateCount);
             foreach (var groupedCall in group.Calls)
             {
                 scope.Add(groupedCall, state);

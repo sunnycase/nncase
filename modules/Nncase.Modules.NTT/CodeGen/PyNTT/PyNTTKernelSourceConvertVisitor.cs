@@ -27,7 +27,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
     private const int MaxGeneratedIdentifierLength = 220;
     private const string PoolStrideElementsSuffix = "_pool_stride_elements";
 
-    private static readonly long[] ElementwiseBlockSizeSearchSpace = { 128, 256, 512, 1024 };
+    private static readonly long[] ElementwiseThroughputBlockSizeSearchSpace = { 128, 256, 512, 1024 };
     private static readonly Regex InputReferenceRegex = new(@"\binput(?<index>\d+)(?<suffix>_pool_stride_elements|_(?:scalar_)?stride\d+)?\b", RegexOptions.Compiled | RegexOptions.CultureInvariant);
     private static readonly Regex AbiArgumentReferenceRegex = new(@"\b(?:input|output)\d+(?:_pool_stride_elements|_(?:scalar_)?stride\d+)?\b", RegexOptions.Compiled | RegexOptions.CultureInvariant);
     private static readonly Regex AbiArgumentSuffixRegex = new(@"_(?:pool_stride_elements|(?:scalar_)?stride\d+)$", RegexOptions.Compiled | RegexOptions.CultureInvariant);
@@ -232,6 +232,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
         private const string ShardCoordDimPrefix = "__shard_coord_";
         private const string DeviceFunctionCallPrefix = "__pyntt_device_call__";
         private const string PoolScopeSizeSuffix = "_pool_scope_size";
+        private const string SharedArenaId = "pyntt_shared_arena";
 
         private static readonly string[] WorkspaceParameterNames =
         {
@@ -267,6 +268,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
         private readonly List<string> _inputNames;
         private readonly List<string> _opKinds = new();
         private readonly List<HelperKernelCallMetadata> _helperCalls = new();
+        private readonly List<PipelineExecutionRenderSpec> _pipelineExecutions = new();
         private readonly Dictionary<string, string[]> _helperArguments = new(StringComparer.Ordinal);
         private readonly Dictionary<string, string[]> _helperScalarArguments = new(StringComparer.Ordinal);
         private readonly List<PyNTTKVCacheFieldInputMetadata> _kvCacheFieldInputs;
@@ -292,6 +294,8 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
         private readonly Dictionary<TIR.Buffer, int[][]> _bufferSourceSplitAxesOverrides = new(ReferenceEqualityComparer.Instance);
         private readonly Dictionary<TIR.Buffer, BufferViewSource> _bufferViewSourceByBuffer = new(ReferenceEqualityComparer.Instance);
         private readonly Dictionary<TIR.Buffer, SharedBufferAllocation> _sharedBufferAllocations = new(ReferenceEqualityComparer.Instance);
+        private readonly Dictionary<TIR.Buffer, PipelineStageAliasBinding> _pipelineStageAliases = new(ReferenceEqualityComparer.Instance);
+        private readonly Dictionary<TIR.Buffer, PipelineBufferBindingDescriptor> _activePipelineBufferBindings = new(ReferenceEqualityComparer.Instance);
         private readonly Dictionary<IVar, BaseExpr> _letBindings = new(ReferenceEqualityComparer.Instance);
         private readonly IReadOnlyDictionary<IVar, string> _formalTensorParameterBaseNames;
         private readonly IReadOnlyDictionary<IVar, string> _formalTensorParameterPoolStrideNames;
@@ -332,6 +336,8 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
         private int _sharedBufferAllocationCounter;
         private ReductionState? _currentReductionState;
         private BlockMicroKernelSelection? _currentBlockMicroKernel;
+        private bool _emittingPipelineProducePhase;
+        private int _pipelineExecutionCounter;
 
         public PyNTTPrimFunctionSourceVisitor(
             PrimFunction function,
@@ -414,7 +420,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             Visit(_bodyExpr);
             RegisterInOutObjectOutputAliases();
             var bodySource = _body.ToString().TrimEnd();
-            var inputLayout = BuildKernelInputLayout(bodySource, _deviceFunctions);
+            var inputLayout = BuildKernelInputLayout(bodySource, _deviceFunctions, _pipelineExecutions);
             var materializedOutputIndices = _definitelyStoredOutputIndices.Concat(_outputAliases.Keys).ToHashSet();
             if (_validateOutputs && materializedOutputIndices.Count != _outputs.Length)
             {
@@ -542,6 +548,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 metadata,
                 inputLayout.Helpers,
                 inputLayout.DeviceFunctions,
+                inputLayout.PipelineExecutions,
                 inputLayout.BodySource);
             return new(metadata, renderSpec);
         }
@@ -555,7 +562,9 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             RegisterInOutObjectOutputAliases();
             var isScheduledRegionFunction = PyNTTPrimFunctionRoles.IsScheduledRegionFunction(_currentFunction);
             var bodySource = _body.ToString().TrimEnd();
-            var liveExtraParameters = CollectLiveParameters(bodySource, _extraWorkspaceBaseNames);
+            var liveExtraParameters = CollectLiveParameters(
+                BuildPipelineExecutionLivenessSource(bodySource, _pipelineExecutions),
+                _extraWorkspaceBaseNames);
             return new(
                 new DeviceFunctionRenderSpec(
                     name,
@@ -565,7 +574,8 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     bodySource,
                     parameterOverrides,
                     liveExtraParameters,
-                    extraParameterArguments),
+                    extraParameterArguments,
+                    _pipelineExecutions.ToArray()),
                 _deviceFunctions.ToArray(),
                 _helperCalls.ToArray(),
                 _opKinds.ToArray(),
@@ -674,9 +684,16 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 .ToArray();
             var bodyStart = _body.Length;
             var scopeIndent = _bodyIndent;
+            var pipelineExecutionStart = _pipelineExecutions.Count;
             VisitSequentialFields(expr);
             var capturedBody = _body.ToString(bodyStart, _body.Length - bodyStart);
             _body.Remove(bodyStart, _body.Length - bodyStart);
+            var scopedPipelineExecutions = _pipelineExecutions
+                .Skip(pipelineExecutionStart)
+                .ToArray();
+            _pipelineExecutions.RemoveRange(
+                pipelineExecutionStart,
+                _pipelineExecutions.Count - pipelineExecutionStart);
 
             var bodySource = DedentGeneratedBody(capturedBody, scopeIndent);
             var traceLabel = GetPrimFunctionCallTraceLabel(scopeName);
@@ -687,7 +704,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     _ownerName,
                     scopeName);
                 var extraParameters = CollectLiveParameters(
-                    bodySource,
+                    BuildPipelineExecutionLivenessSource(bodySource, scopedPipelineExecutions),
                     outerLocalNames.Concat(_extraWorkspaceBaseNames));
                 _deviceFunctions.Add(
                     new DeviceFunctionRenderSpec(
@@ -698,7 +715,8 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                         bodySource,
                         new Dictionary<string, string>(StringComparer.Ordinal),
                         extraParameters,
-                        new Dictionary<string, string>(StringComparer.Ordinal)));
+                        new Dictionary<string, string>(StringComparer.Ordinal),
+                        scopedPipelineExecutions));
                 WriteControlLine(BuildDeviceFunctionCallPlaceholder(deviceFunctionName, extraParameters));
             }
 
@@ -721,19 +739,27 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     continue;
                 }
 
-                if (ReductionCodegenUtility.TryGetAdjacentReductionLoopPartitionPair(expr.Fields, index, out var fullLoop, out var tailLoop))
+                if (ReductionCodegenUtility.TryGetReductionLoopPartitionPair(
+                    expr.Fields,
+                    index,
+                    out var partitionPair))
                 {
                     if (_reductionScopes.Count == 0)
                     {
-                        VisitPartitionedReductionLoops(fullLoop, tailLoop);
+                        VisitPartitionedReductionLoops(partitionPair);
                     }
                     else
                     {
-                        Visit(fullLoop);
-                        Visit(tailLoop);
+                        Visit(partitionPair.FullLoop);
+                        foreach (var synchronization in partitionPair.SynchronizationFields)
+                        {
+                            Visit(synchronization);
+                        }
+
+                        Visit(partitionPair.TailLoop);
                     }
 
-                    index++;
+                    index = partitionPair.TailFieldIndex;
                     continue;
                 }
 
@@ -848,15 +874,311 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             return default;
         }
 
-        private void VisitPartitionedReductionLoops(For fullLoop, For tailLoop)
+        protected override Unit VisitPipelineFor(PipelineFor expr)
         {
-            var reductionScope = CreateReductionScope(fullLoop.Body, tailLoop.Body);
+            var plan = expr.Plan;
+            if (expr.Mode is not (LoopMode.Serial or LoopMode.Reduction) ||
+                plan.StageCount <= 1 ||
+                !plan.Synchronization.AsynchronousProduce)
+            {
+                throw new InvalidOperationException(
+                    $"PyNTT PipelineFor {plan.ScheduleId} must describe an asynchronous multi-stage loop.");
+            }
+
+            if (plan.Channels.IsDefaultOrEmpty)
+            {
+                throw new InvalidOperationException(
+                    $"PyNTT PipelineFor {plan.ScheduleId} has no staged transfer channels.");
+            }
+
+            if (!expr.Domain.Step.IsFixed || expr.Domain.Step.FixedValue <= 0)
+            {
+                throw new InvalidOperationException(
+                    $"PyNTT PipelineFor {plan.ScheduleId} " +
+                    $"requires a fixed positive loop step, got {expr.Domain.Step}.");
+            }
+
+            var ownsReductionScope = expr.Mode == LoopMode.Reduction && _reductionScopes.Count == 0;
+            var loopStart = _body.Length;
+            Dictionary<Call, ReductionState>? reductionScope = null;
+            if (ownsReductionScope)
+            {
+                reductionScope = CreateReductionScope(expr.ConsumeBody);
+                _reductionScopes.Push(reductionScope);
+            }
+
+            var loopVar = SanitizePythonIdentifier(expr.LoopVar.Name);
+            var start = GetDimensionExpression(expr.Domain.Start);
+            var stop = GetDimensionExpression(expr.Domain.Stop);
+            var step = GetDimensionExpression(expr.Domain.Step);
+            var materializedBindings = new List<MaterializedPipelineCodegenBinding>();
+            PushLocalScalar(loopVar);
+            PushLoopVariableRange(loopVar, GetLoopVariableRange(loopVar, start, stop, step));
+            try
+            {
+                var accesses = expr.StagedAccesses;
+                var allocations = expr.StagedAllocations;
+                var buffers = expr.StagedBuffers;
+                for (var index = 0; index < expr.BindingDescriptors.Length; index++)
+                {
+                    var descriptor = expr.BindingDescriptors[index];
+                    var accessVariable = accesses[index];
+                    if (_letBindings.ContainsKey(accessVariable))
+                    {
+                        throw new InvalidOperationException(
+                            $"PyNTT pipeline allocation variable {accessVariable.Name} is already bound outside " +
+                            $"region {plan.ScheduleId}; staged descriptors require one lexical owner.");
+                    }
+
+                    var value = MaterializeLetBinding(accessVariable, allocations[index]);
+                    if (value is not TIR.Buffer buffer ||
+                        buffer.StagedLayout is null ||
+                        !_bufferViewSourceByBuffer.TryGetValue(buffer, out var sourceView) ||
+                        !ReferenceEquals(sourceView.Source, buffers[index]))
+                    {
+                        throw new InvalidOperationException(
+                            $"PyNTT pipeline binding {descriptor.ChannelId} must materialize one " +
+                            "staged AllocateBufferView from its typed physical buffer.");
+                    }
+
+                    _letBindings.Add(accessVariable, buffer);
+                    var allocation = EmitSharedBufferAllocation(accessVariable, buffer, emitDeclaration: false);
+                    if (_sharedBufferAllocations.ContainsKey(buffer))
+                    {
+                        throw new InvalidOperationException(
+                            $"PyNTT pipeline {plan.ScheduleId} materialized staged allocation {buffer.Name} more than once.");
+                    }
+
+                    _sharedBufferAllocations.Add(buffer, allocation);
+                    if (!_activePipelineBufferBindings.TryAdd(buffer, descriptor))
+                    {
+                        _sharedBufferAllocations.Remove(buffer);
+                        throw new InvalidOperationException(
+                            $"PyNTT pipeline buffer {buffer.Name} is already owned by an active pipeline binding.");
+                    }
+
+                    try
+                    {
+                        PushLocalBuffer(allocation.DescriptorName);
+                    }
+                    catch
+                    {
+                        _activePipelineBufferBindings.Remove(buffer);
+                        _sharedBufferAllocations.Remove(buffer);
+                        throw;
+                    }
+
+                    materializedBindings.Add(new(descriptor, accessVariable, buffer, allocation));
+                }
+
+                var produceSource = CaptureGeneratedBody(() => EmitPipelineProducePhase(
+                    expr.ProduceBody,
+                    asynchronous: expr.Partition != LoopPartition.Tail));
+                var consumeSource = CaptureGeneratedBody(() => Visit(expr.ConsumeBody));
+                var marker = $"__PYNTT_PIPELINE_EXECUTION_{_pipelineExecutionCounter++.ToString(CultureInfo.InvariantCulture)}__";
+                _pipelineExecutions.Add(BuildPipelineExecutionRenderSpec(
+                    expr,
+                    marker,
+                    loopVar,
+                    start,
+                    stop,
+                    step,
+                    materializedBindings,
+                    produceSource,
+                    consumeSource));
+                WriteControlLine($"# {marker}");
+            }
+            finally
+            {
+                for (var index = materializedBindings.Count - 1; index >= 0; index--)
+                {
+                    var binding = materializedBindings[index];
+                    PopLocalBuffer(binding.Allocation.DescriptorName);
+                    _activePipelineBufferBindings.Remove(binding.Buffer);
+                    _sharedBufferAllocations.Remove(binding.Buffer);
+                    _letBindings.Remove(binding.AccessVariable);
+                }
+
+                _emittingPipelineProducePhase = false;
+                PopLoopVariableRange(loopVar);
+                PopLocalScalar(loopVar);
+            }
+
+            if (ownsReductionScope)
+            {
+                try
+                {
+                    _body.Insert(loopStart, BuildReductionInitializers(reductionScope!, _bodyIndent));
+                    foreach (var state in GetDistinctReductionStates(reductionScope!))
+                    {
+                        EmitReductionFinalize(state);
+                    }
+                }
+                finally
+                {
+                    _reductionScopes.Pop();
+                }
+            }
+
+            return default;
+        }
+
+        private string CaptureGeneratedBody(Action emit)
+        {
+            var bodyStart = _body.Length;
+            var indent = _bodyIndent;
+            emit();
+            var source = _body.ToString(bodyStart, _body.Length - bodyStart);
+            _body.Remove(bodyStart, _body.Length - bodyStart);
+            return DedentGeneratedBody(source, indent);
+        }
+
+        private void EmitPipelineProducePhase(Sequential produceBody, bool asynchronous)
+        {
+            if (asynchronous && _emittingPipelineProducePhase)
+            {
+                throw new InvalidOperationException("PyNTT pipeline produce phases cannot be nested.");
+            }
+
+            _emittingPipelineProducePhase = asynchronous;
+            try
+            {
+                Visit(produceBody);
+            }
+            finally
+            {
+                _emittingPipelineProducePhase = false;
+            }
+        }
+
+        private static PipelineExecutionRenderSpec BuildPipelineExecutionRenderSpec(
+            PipelineFor loop,
+            string marker,
+            string loopVariable,
+            PyNTTDimExpression start,
+            PyNTTDimExpression stop,
+            PyNTTDimExpression step,
+            IReadOnlyList<MaterializedPipelineCodegenBinding> bindings,
+            string produceSource,
+            string consumeSource)
+        {
+            var plan = loop.Plan;
+            var bindingByChannel = bindings.ToDictionary(
+                binding => binding.Descriptor.ChannelId,
+                StringComparer.Ordinal);
+            var channels = plan.Channels.Select(channel =>
+            {
+                if (!bindingByChannel.TryGetValue(channel.ChannelId, out var binding) ||
+                    binding.Descriptor.SourceMemorySpace != channel.SourceMemorySpace ||
+                    binding.Descriptor.DestinationMemorySpace != channel.DestinationMemorySpace)
+                {
+                    throw new InvalidOperationException(
+                        $"PyNTT pipeline {plan.ScheduleId} has no exact allocation for channel {channel.ChannelId}.");
+                }
+
+                return new PipelineChannelRenderSpec(
+                    channel.ChannelId,
+                    channel.SourceMemorySpace.Value,
+                    channel.DestinationMemorySpace.Value,
+                    BuildPipelineAllocationRenderSpec(binding));
+            }).ToArray();
+            if (channels.Length != bindings.Count)
+            {
+                throw new InvalidOperationException(
+                    $"PyNTT pipeline {plan.ScheduleId} has unowned materialized staged allocations.");
+            }
+
+            return new(
+                marker,
+                loop.RegionId.Value,
+                plan.ScheduleId,
+                plan.TemplateId.Value,
+                plan.StageCount,
+                plan.PrefetchDistance,
+                loop.Partition switch
+                {
+                    LoopPartition.Unpartitioned => "unpartitioned",
+                    LoopPartition.Full => "full",
+                    LoopPartition.Tail => "tail",
+                    var partition => throw new NotSupportedException(
+                        $"PyNTT does not support pipeline loop partition {partition}."),
+                },
+                new(
+                    plan.Synchronization.AsynchronousProduce,
+                    plan.Synchronization.RequiresProducerCommit,
+                    plan.Synchronization.RequiresConsumerWait,
+                    plan.Synchronization.WaitProvidesConsumerAcquire,
+                    plan.Synchronization.RequiresConsumerRelease),
+                plan.TailPolicy switch
+                {
+                    PipelineTailPolicy.Serial => "serial",
+                    var policy => throw new NotSupportedException($"PyNTT does not support pipeline tail policy {policy}."),
+                },
+                loopVariable,
+                start.TritonExpression,
+                stop.TritonExpression,
+                step.TritonExpression,
+                channels,
+                produceSource,
+                consumeSource);
+        }
+
+        private static PipelineBufferAllocationRenderSpec BuildPipelineAllocationRenderSpec(
+            MaterializedPipelineCodegenBinding binding)
+        {
+            var allocation = binding.Allocation;
+            var stagedLayout = allocation.StagedLayout ?? throw new InvalidOperationException(
+                $"PyNTT pipeline allocation {allocation.DescriptorName} is not staged.");
+            return new(
+                binding.Buffer.Name,
+                allocation.DescriptorName,
+                stagedLayout.StageCount,
+                stagedLayout.StagePhysicalBytes,
+                stagedLayout.StageStrideBytes,
+                stagedLayout.PhysicalBytes,
+                allocation.ArenaId,
+                allocation.ArenaOffsetBytes,
+                allocation.ScalarElementSizeBytes,
+                allocation.TritonDType,
+                allocation.LogicalShape,
+                allocation.LogicalStrides,
+                allocation.VectorLaneShape,
+                allocation.DescriptorShape,
+                allocation.StorageEncoding,
+                allocation.StorageEncoding == TritonTargetStorageEncodingModel.NvidiaMmaShared.Value);
+        }
+
+        private static string BuildPipelineExecutionLivenessSource(
+            string bodySource,
+            IReadOnlyList<PipelineExecutionRenderSpec> executions)
+            => string.Join(
+                '\n',
+                new[] { bodySource }.Concat(executions.SelectMany(execution => new[]
+                {
+                    execution.LoopStart,
+                    execution.LoopStop,
+                    execution.LoopStep,
+                    execution.ProduceSource,
+                    execution.ConsumeSource,
+                })));
+
+        private void VisitPartitionedReductionLoops(ReductionLoopPartitionPair pair)
+        {
+            var reductionScope = CreateReductionScope(
+                pair.FullBody,
+                pair.TailBody);
             var loopStart = _body.Length;
             _reductionScopes.Push(reductionScope);
             try
             {
-                Visit(fullLoop);
-                Visit(tailLoop);
+                Visit(pair.FullLoop);
+                foreach (var synchronization in pair.SynchronizationFields)
+                {
+                    Visit(synchronization);
+                }
+
+                Visit(pair.TailLoop);
+
                 _body.Insert(loopStart, BuildReductionInitializers(reductionScope, _bodyIndent));
                 foreach (var state in GetDistinctReductionStates(reductionScope))
                 {
@@ -915,6 +1237,14 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 sharedAllocation = EmitSharedBufferAllocation(expr.Var, sharedBuffer);
                 hadPreviousSharedAllocation = _sharedBufferAllocations.TryGetValue(sharedBuffer, out previousSharedAllocation);
                 _sharedBufferAllocations[sharedBuffer] = sharedAllocation;
+                PushLocalBuffer(sharedAllocation.DescriptorName);
+            }
+            else if (value is TIR.Buffer slotBuffer &&
+                _pipelineStageAliases.TryGetValue(slotBuffer, out var stageAlias))
+            {
+                sharedAllocation = EmitSharedPipelineStageAlias(expr.Var, slotBuffer, stageAlias);
+                hadPreviousSharedAllocation = _sharedBufferAllocations.TryGetValue(slotBuffer, out previousSharedAllocation);
+                _sharedBufferAllocations[slotBuffer] = sharedAllocation;
                 PushLocalBuffer(sharedAllocation.DescriptorName);
             }
 
@@ -1995,9 +2325,20 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 destinationStrides,
                 vectorLaneShape);
             var helperName = GetNextHelperName(GetTensorCopyHelperKind(operation, src, dest));
-            WriteHelperTemplate(
-                "triton/kernels/TensorRegionCopy.py.jinja",
-                new PyNTTRegionCopyTemplateModel(
+            if (_emittingPipelineProducePhase)
+            {
+                if (operation != "TileLoad" ||
+                    (dest.MemSpan.Buffer.Location & MemoryLocation.Shared) == 0 ||
+                    (src.MemSpan.Buffer.Location & (MemoryLocation.Shared | MemoryLocation.Register)) != 0 ||
+                    !_pipelineStageAliases.ContainsKey(dest))
+                {
+                    throw new NotSupportedException(
+                        $"PyNTT explicit cp.async phase only accepts a global-to-staged-SMEM TileLoad, got " +
+                        $"{operation}: {src.Name}@{src.MemSpan.Buffer.Location} -> {dest.Name}@{dest.MemSpan.Buffer.Location}.");
+                }
+            }
+
+            var model = new PyNTTRegionCopyTemplateModel(
                     helperName,
                     GetRegionCopyBufferPointer(src),
                     GetRegionCopyBufferPointer(dest),
@@ -2012,7 +2353,14 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     vectorLaneShape,
                     operation,
                     copyPlan,
-                    $"{operation}: {src.Name} -> {dest.Name}"));
+                    $"{operation}: {src.Name} -> {dest.Name}")
+            {
+                IsAsync = _emittingPipelineProducePhase,
+            };
+            WriteHelperTemplate(
+                "triton/kernels/TensorRegionCopy.py.jinja",
+                model,
+                requiresInline: _emittingPipelineProducePhase);
             WriteLine(BuildHelperCall(helperName));
             MarkStoredOutput(dest, $"PyNTT {operation}");
         }
@@ -3690,7 +4038,9 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             _attrs["n_lane"] = nVectorLaneCount;
             _attrs["n_scalar_lane"] = rhsNScalarLaneCount;
             _attrs["scale"] = scale;
-            var useGemv = IsGemvMatmul(outputShape);
+            var useGemv = ResolveMatmulTemplateKind(
+                outputShape,
+                "PyNTT PackedMatMul");
             if (useGemv)
             {
                 _attrs["gemv"] = true;
@@ -3845,7 +4195,9 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             _attrs["v_shape"] = vOutputShape;
             _attrs["num_heads"] = qkv.NumHeads;
             _attrs["num_kv_heads"] = qkv.NumKvHeads;
-            var useGemv = IsGemvMatmul(qOutputShape);
+            var useGemv = ResolveMatmulTemplateKind(
+                qOutputShape,
+                "PyNTT QKVParallelLinear");
             if (useGemv)
             {
                 _attrs["gemv"] = true;
@@ -4033,7 +4385,9 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             _attrs["num_kv_heads"] = qkv.NumKvHeads;
             var qLogicalOutputShape = qOutputShape.ToArray();
             qLogicalOutputShape[^1] = MultiplyDim(qLogicalOutputShape[^1], checked(nPackedLaneCount * nVectorLaneCount));
-            var useGemv = IsGemvMatmul(qLogicalOutputShape);
+            var useGemv = ResolveMatmulTemplateKind(
+                qLogicalOutputShape,
+                "PyNTT PackedQKVParallelLinear");
             if (useGemv)
             {
                 _attrs["gemv"] = true;
@@ -4306,7 +4660,9 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             _attrs["has_bias"] = gateBias is not null || upBias is not null;
             _attrs["shape"] = outputShape;
             _attrs["glu_type"] = GetGluTypeName(matMulGlu.GluType);
-            var useGemv = IsGemvMatmul(outputShape);
+            var useGemv = ResolveMatmulTemplateKind(
+                outputShape,
+                "PyNTT MatMulGlu");
             if (useGemv)
             {
                 _attrs["gemv"] = true;
@@ -4449,7 +4805,9 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             _attrs["glu_type"] = GetGluTypeName(matMulGlu.GluType);
             var logicalOutputShape = outputShape.ToArray();
             logicalOutputShape[^1] = MultiplyDim(logicalOutputShape[^1], checked(nPackedLaneCount * nVectorLaneCount));
-            var useGemv = IsGemvMatmul(logicalOutputShape);
+            var useGemv = ResolveMatmulTemplateKind(
+                logicalOutputShape,
+                "PyNTT PackedMatMulGlu");
             if (useGemv)
             {
                 _attrs["gemv"] = true;
@@ -4929,7 +5287,9 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             _attrs["transpose_a"] = transposeA;
             _attrs["transpose_b"] = transposeB;
             _attrs["scale"] = scale;
-            var useGemv = IsGemvMatmul(outputShape);
+            var useGemv = ResolveMatmulTemplateKind(
+                outputShape,
+                "PyNTT Matmul");
             if (useGemv)
             {
                 _attrs["gemv"] = true;
@@ -5026,15 +5386,15 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             model.ReductionBlockM = blockM;
             model.ReductionBlockN = blockN;
             model.ReductionBlockK = blockK;
-            var accumulatorNGroupWidth = expectedKind == ReductionKernelKind.PackedMatmul
-                ? checked(model.OutputNPackedLaneCount * model.OutputNVectorLaneCount)
-                : 1;
+            IReadOnlyList<int> accumulatorNLaneShape = expectedKind == ReductionKernelKind.PackedMatmul
+                ? new[] { model.OutputNPackedLaneCount, model.OutputNVectorLaneCount }
+                : Array.Empty<int>();
             var initializer = BuildMatrixReductionAccumulatorInitializer(
                 microKernel,
                 useGemv,
                 blockM,
                 blockN,
-                accumulatorNGroupWidth);
+                accumulatorNLaneShape);
             ConfigureReductionState(
                 state,
                 [initializer],
@@ -5061,6 +5421,35 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             WriteControlLine($"{state.Names[0]} = {updateCall}");
 
             state.UpdateCount++;
+        }
+
+        private bool ResolveMatmulTemplateKind(
+            IReadOnlyList<PyNTTDimExpression> outputShape,
+            string context)
+        {
+            var shapeIsGemv = IsGemvMatmul(outputShape);
+            if (_currentReductionState is null)
+            {
+                return shapeIsGemv;
+            }
+
+            var microKernel = RequireCurrentBlockMicroKernel($"{context} reduction");
+            var selectedIsGemv = microKernel.Family switch
+            {
+                TritonBlockMicroKernelContract.GemvFamily => true,
+                TritonBlockMicroKernelContract.MatmulFamily => false,
+                _ => throw new InvalidOperationException(
+                    $"{context} reduction selected unsupported matrix microkernel family " +
+                    $"{microKernel.Family}/{microKernel.Variant}."),
+            };
+            if (selectedIsGemv && !shapeIsGemv)
+            {
+                throw new InvalidOperationException(
+                    $"{context} selected a GEMV microkernel for active output shape " +
+                    $"[{ShapeText(outputShape)}].");
+            }
+
+            return selectedIsGemv;
         }
 
         private static bool IsGemvMatmul(IReadOnlyList<PyNTTDimExpression> outputShape)
@@ -5192,7 +5581,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     model.FinalizeExpression,
                     blockSize,
                     trackElementCount,
-                    model.Comment), microKernel));
+                    "structured reduction finalize"), microKernel));
 
             WriteHelperTemplate("triton/kernels/Reduce.py.jinja", model, requiresInline: true);
             var updateCall = BuildHelperCall(
@@ -5839,12 +6228,76 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
         private BaseExpr MaterializeLetBinding(IVar var, BaseExpr value)
         {
             value = UnwrapInputBoxing(value);
+            if (value is TIR.Buffer alias &&
+                TryMaterializePipelineStageAlias(var.Name, alias, out var materializedAlias))
+            {
+                return materializedAlias;
+            }
+
             return value switch
             {
                 Call { Target: Nncase.IR.Buffers.AllocateBufferView } allocate => MaterializeAllocateBufferView(var.Name, allocate),
                 Call { Target: Nncase.IR.Buffers.BufferSubview } subview => MaterializeBufferSubview(var.Name, subview),
                 _ => ResolveBoundExpression(value),
             };
+        }
+
+        private bool TryMaterializePipelineStageAlias(
+            string name,
+            TIR.Buffer alias,
+            out TIR.Buffer materializedAlias)
+        {
+            materializedAlias = null!;
+            var candidates = _activePipelineBufferBindings.Keys
+                .Where(source => IsPipelineStageAliasOf(alias, source))
+                .ToArray();
+            if (candidates.Length == 0)
+            {
+                return false;
+            }
+
+            if (candidates.Length != 1)
+            {
+                throw new InvalidOperationException(
+                    $"PyNTT buffer alias {alias.Name} matches {candidates.Length} active pipeline allocations; " +
+                    "each stage alias must have one lexical owner.");
+            }
+
+            var source = candidates[0];
+            var activeShape = GetBufferActiveShape(source);
+            materializedAlias = alias.With(name: SanitizePythonIdentifier(name));
+            _bufferActiveShapeOverrides[materializedAlias] = activeShape;
+            _bufferGlobalShapeOverrides[materializedAlias] = GetBufferGlobalShape(source);
+            _bufferGlobalOffsetOverrides[materializedAlias] = GetBufferGlobalOffsets(source);
+            _bufferSourceSplitAxesOverrides[materializedAlias] = GetBufferSourceSplitAxes(source, source.Rank);
+            _bufferViewSourceByBuffer[materializedAlias] = new(source, CreateZeroDimExpressions(source.Rank), activeShape);
+            var layout = source.StagedLayout!;
+            var relativeByteOffset = (alias.MemSpan.Start - source.MemSpan.Start).Simplify();
+            var stageIndex = (relativeByteOffset / layout.StageStrideBytes).Simplify();
+            _pipelineStageAliases[materializedAlias] = new(
+                source,
+                stageIndex);
+            TrackObjectViewSource(materializedAlias, source);
+            TrackObjectViewAlias(materializedAlias, source);
+            return true;
+        }
+
+        private static bool IsPipelineStageAliasOf(TIR.Buffer alias, TIR.Buffer source)
+        {
+            if (alias.StagedLayout is not null ||
+                source.StagedLayout is not { } layout ||
+                !ReferenceEquals(alias.MemSpan.Buffer, source.MemSpan.Buffer) ||
+                alias.ElemType != source.ElemType ||
+                !Equals(alias.StorageEncoding, source.StorageEncoding) ||
+                !alias.Dimensions.SequenceEqual(source.Dimensions) ||
+                !alias.Strides.SequenceEqual(source.Strides) ||
+                !alias.MemSpan.Size.IsFixed ||
+                alias.MemSpan.Size.FixedValue != layout.StagePhysicalBytes)
+            {
+                return false;
+            }
+
+            return true;
         }
 
         private TIR.Buffer MaterializeAllocateBufferView(string name, Call call)
@@ -5883,7 +6336,10 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             return result;
         }
 
-        private SharedBufferAllocation EmitSharedBufferAllocation(IVar variable, TIR.Buffer buffer)
+        private SharedBufferAllocation EmitSharedBufferAllocation(
+            IVar variable,
+            TIR.Buffer buffer,
+            bool emitDeclaration = true)
         {
             var scalarElementSizeBytes = GetScalarElementSizeBytes(buffer.ElemType);
             var physicalOffsetBytes = GetFixedDimension(
@@ -5912,17 +6368,32 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
 
             var aliasOffsetBytes = checked(physicalOffsetBytes + spanOffsetBytes);
             var storageEncoding = buffer.StorageEncoding;
+            var stagedLayout = buffer.StagedLayout;
             var storageAlignmentBytes = storageEncoding?.AlignmentBytes ?? scalarElementSizeBytes;
-            if (storageEncoding is not null && storageEncoding.PhysicalBytes != physicalSizeBytes)
+            var expectedEncodingPhysicalBytes = stagedLayout?.StagePhysicalBytes ?? physicalSizeBytes;
+            if (storageEncoding is not null && storageEncoding.PhysicalBytes != expectedEncodingPhysicalBytes)
             {
                 throw new NotSupportedException(
                     $"PyNTT shared buffer {buffer.Name} carries storage encoding {storageEncoding} with " +
-                    $"{storageEncoding.PhysicalBytes} physical bytes, but its TIR PhysicalBuffer has {physicalSizeBytes} bytes.");
+                    $"{storageEncoding.PhysicalBytes} physical bytes, but its " +
+                    (stagedLayout is null
+                        ? $"TIR PhysicalBuffer has {physicalSizeBytes} bytes."
+                        : $"StagedBufferLayout stage has {stagedLayout.StagePhysicalBytes} bytes."));
+            }
+
+            if (stagedLayout is not null && spanSizeBytes != stagedLayout.PhysicalBytes)
+            {
+                throw new NotSupportedException(
+                    $"PyNTT staged shared buffer {buffer.Name} span has {spanSizeBytes} bytes, " +
+                    $"but its StagedBufferLayout owns {stagedLayout.PhysicalBytes} bytes.");
             }
 
             if (scalarElementSizeBytes <= 0 ||
                 aliasOffsetBytes % storageAlignmentBytes != 0 ||
-                spanSizeBytes % scalarElementSizeBytes != 0)
+                spanSizeBytes % scalarElementSizeBytes != 0 ||
+                (stagedLayout is not null &&
+                    (stagedLayout.StagePhysicalBytes % scalarElementSizeBytes != 0 ||
+                     stagedLayout.StageStrideBytes % scalarElementSizeBytes != 0)))
             {
                 throw new NotSupportedException(
                     $"PyNTT shared AllocateBufferView {variable.Name} range " +
@@ -5930,8 +6401,8 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     $"to storage alignment {storageAlignmentBytes} and scalar element size {scalarElementSizeBytes}.");
             }
 
-            var elementCount = checked((ulong)(spanSizeBytes / scalarElementSizeBytes));
-            var descriptorCapacityElements = checked((ulong)((physicalSizeBytes - spanOffsetBytes) / scalarElementSizeBytes));
+            var elementCount = checked((ulong)((stagedLayout?.StagePhysicalBytes ?? spanSizeBytes) / scalarElementSizeBytes));
+            var descriptorCapacityElements = checked((ulong)((stagedLayout?.StageStrideBytes ?? (physicalSizeBytes - spanOffsetBytes)) / scalarElementSizeBytes));
             if (elementCount == 0 || elementCount > long.MaxValue)
             {
                 throw new NotSupportedException(
@@ -5970,8 +6441,29 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 logicalShape,
                 logicalStrides,
                 vectorLaneShape);
-            var descriptorElementCount = descriptorShape.Aggregate(1L, (product, value) => checked(product * value));
+            var stageDescriptorElementCount = descriptorShape.Aggregate(1L, (product, value) => checked(product * value));
+            var stageDescriptorSizeBytes = checked(stageDescriptorElementCount * scalarElementSizeBytes);
+            if (stagedLayout is not null && stageDescriptorSizeBytes != stagedLayout.StageStrideBytes)
+            {
+                throw new NotSupportedException(
+                    $"PyNTT staged shared descriptor for {variable.Name} occupies {stageDescriptorSizeBytes} bytes per stage, " +
+                    $"but StagedBufferLayout declares stage stride {stagedLayout.StageStrideBytes}. " +
+                    "FlagTree buffered_tensor.slot(stage) derives its stride from the descriptor's leading dimension, " +
+                    "so inter-stage padding must be represented by the per-stage descriptor shape.");
+            }
+
+            var allocationDescriptorShape = stagedLayout is null
+                ? descriptorShape
+                : new[] { checked((long)stagedLayout.StageCount) }.Concat(descriptorShape).ToArray();
+            var descriptorElementCount = allocationDescriptorShape.Aggregate(1L, (product, value) => checked(product * value));
             var descriptorSizeBytes = checked(descriptorElementCount * scalarElementSizeBytes);
+            if (stagedLayout is not null && descriptorSizeBytes != stagedLayout.PhysicalBytes)
+            {
+                throw new NotSupportedException(
+                    $"PyNTT staged shared descriptor for {variable.Name} occupies {descriptorSizeBytes} total bytes, " +
+                    $"but StagedBufferLayout owns {stagedLayout.PhysicalBytes} bytes.");
+            }
+
             var descriptorEndBytes = checked(aliasOffsetBytes + descriptorSizeBytes);
             _sharedAliasRequiredBytes = Math.Max(_sharedAliasRequiredBytes, descriptorEndBytes);
             var descriptorName = SanitizeBoundedPythonIdentifier(
@@ -5986,21 +6478,77 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     $"PyNTT Triton shared allocation does not support storage encoding {storageEncodingId} for {buffer.Name}.");
             }
 
-            WriteControlLine(
-                $"{descriptorName} = tle.gpu.alloc([{string.Join(", ", descriptorShape.Select(value => value.ToString(CultureInfo.InvariantCulture)))}], " +
-                $"dtype={tritonDType}, layout=None, scope=tle.gpu.smem, alias=pyntt_shared_arena, " +
-                $"alias_offset_bytes={aliasOffsetBytes.ToString(CultureInfo.InvariantCulture)}, " +
-                $"nv_mma_shared_layout={(useNvidiaMmaSharedLayout ? "True" : "False")})");
-            return new(
+            if (emitDeclaration)
+            {
+                WriteControlLine(
+                    $"{descriptorName} = tle.gpu.alloc([{string.Join(", ", allocationDescriptorShape.Select(value => value.ToString(CultureInfo.InvariantCulture)))}], " +
+                    $"dtype={tritonDType}, layout=None, scope=tle.gpu.smem, alias={SharedArenaId}, " +
+                    $"alias_offset_bytes={aliasOffsetBytes.ToString(CultureInfo.InvariantCulture)}, " +
+                    $"nv_mma_shared_layout={(useNvidiaMmaSharedLayout ? "True" : "False")})");
+            }
+
+            var allocation = new SharedBufferAllocation(
                 descriptorName,
-                descriptorShape,
+                allocationDescriptorShape,
                 logicalShape,
                 logicalStrides,
                 vectorLaneShape,
-                checked(physicalSizeBytes - spanOffsetBytes),
+                stagedLayout?.PhysicalBytes ?? checked(physicalSizeBytes - spanOffsetBytes),
                 scalarElementSizeBytes,
                 tritonDType,
-                storageEncodingId.Value);
+                storageEncodingId.Value,
+                stagedLayout,
+                SharedArenaId,
+                aliasOffsetBytes);
+            return allocation;
+        }
+
+        private SharedBufferAllocation EmitSharedPipelineStageAlias(
+            IVar variable,
+            TIR.Buffer buffer,
+            PipelineStageAliasBinding stageAlias)
+        {
+            if (!_sharedBufferAllocations.TryGetValue(stageAlias.Source, out var stagedAllocation) ||
+                stagedAllocation.StagedLayout is not { } stagedLayout)
+            {
+                throw new NotSupportedException(
+                    $"PyNTT pipeline stage alias {variable.Name} must be lexically nested under the Let-bound " +
+                    $"staged shared allocation for {stageAlias.Source.Name}.");
+            }
+
+            if (stagedAllocation.DescriptorShape.Length < 2 ||
+                stagedAllocation.DescriptorShape[0] != stagedLayout.StageCount)
+            {
+                throw new InvalidOperationException(
+                    $"PyNTT staged descriptor {stagedAllocation.DescriptorName} shape " +
+                    $"[{string.Join(",", stagedAllocation.DescriptorShape)}] does not begin with " +
+                    $"its stage count {stagedLayout.StageCount}.");
+            }
+
+            var descriptorName = SanitizeBoundedPythonIdentifier(
+                $"{variable.Name}_stage_{_sharedBufferAllocationCounter++.ToString(CultureInfo.InvariantCulture)}");
+            var stageExpression = BuildPipelineStageIndex(stageAlias.StageIndex);
+
+            WriteControlLine($"{descriptorName} = {stagedAllocation.DescriptorName}.slot({stageExpression})");
+            return new(
+                descriptorName,
+                stagedAllocation.DescriptorShape[1..],
+                stagedAllocation.LogicalShape,
+                stagedAllocation.LogicalStrides,
+                stagedAllocation.VectorLaneShape,
+                stagedLayout.StageStrideBytes,
+                stagedAllocation.ScalarElementSizeBytes,
+                stagedAllocation.TritonDType,
+                stagedAllocation.StorageEncoding,
+                null,
+                stagedAllocation.ArenaId,
+                stagedAllocation.ArenaOffsetBytes);
+        }
+
+        private string BuildPipelineStageIndex(Dimension stageIndex)
+        {
+            var expression = BuildScalarExpression(stageIndex);
+            return $"tl.cast({expression}, tl.int32)";
         }
 
         private long[] GetSharedDescriptorShape(
@@ -6034,18 +6582,9 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             }
 
             var vectorLaneCount = GetVectorLaneElementCount(buffer.ElemType);
-            var descriptorLogicalStrides = logicalStrides.ToArray();
-            for (var axis = descriptorLogicalStrides.Length - 1; axis >= 0; axis--)
-            {
-                if (descriptorLogicalStrides[axis] != 0)
-                {
-                    continue;
-                }
-
-                descriptorLogicalStrides[axis] = axis == descriptorLogicalStrides.Length - 1
-                    ? 1
-                    : checked(descriptorLogicalStrides[axis + 1] * logicalShape[axis + 1]);
-            }
+            var storageAxes = Enumerable.Range(0, logicalShape.Count)
+                .Where(axis => logicalStrides[axis] != 0)
+                .ToArray();
 
             var requiredScalarElements = checked((long)vectorLaneCount);
             for (var axis = 0; axis < logicalShape.Count; axis++)
@@ -6063,9 +6602,9 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     $"can address {requiredScalarElements} scalar elements, but its TIR MemSpan capacity is only {elementCount}.");
             }
 
-            // Packed GEMV stores weights logically as [G,K]vec<lanes>. Keep
-            // that grouped physical structure in shared memory so the backend
-            // can reduce K without transposing or flattening G.
+            // Packed GEMV stores weights logically as [G,K]vec<lane...>. Keep
+            // every vector lane as a physical descriptor axis so staging and
+            // compute share the exact same rectangular iteration domain.
             if (useKMajorPackedNLayout)
             {
                 if (logicalShape.Count != 2 || vectorLaneShape.Count == 0)
@@ -6075,7 +6614,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                         $"got rank {logicalShape.Count} and vector-lane shape [{string.Join(",", vectorLaneShape)}].");
                 }
 
-                if (descriptorLogicalStrides[1] != 1)
+                if (logicalStrides[1] != 1)
                 {
                     throw new NotSupportedException(
                         $"PyNTT K-major packed-N shared buffer {variable.Name} requires a contiguous K axis " +
@@ -6083,12 +6622,9 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                         $"[{string.Join(",", logicalStrides)}].");
                 }
 
-                var packedDescriptorShape = new[]
-                {
-                    logicalShape[0],
-                    logicalShape[1],
-                    checked((long)vectorLaneCount),
-                };
+                var packedDescriptorShape = logicalShape
+                    .Concat(vectorLaneShape.Select(lane => checked((long)lane)))
+                    .ToArray();
                 var packedDescriptorElements = packedDescriptorShape.Aggregate(
                     1L,
                     (product, value) => checked(product * value));
@@ -6142,18 +6678,30 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 expectedInnerStride = checked(expectedInnerStride * descriptorShape[axis]);
             }
 
-            if (checked(descriptorLogicalStrides[^1] * vectorLaneCount) != expectedInnerStride)
+            if (storageAxes.Length > 0 &&
+                checked(logicalStrides[storageAxes[^1]] * vectorLaneCount) != expectedInnerStride)
             {
+                var innermostStorageAxis = storageAxes[^1];
                 throw new NotSupportedException(
                     $"PyNTT shared buffer {variable.Name} innermost scalar stride " +
-                    $"{checked(descriptorLogicalStrides[^1] * vectorLaneCount)} cannot be represented by the explicit " +
+                    $"{checked(logicalStrides[innermostStorageAxis] * vectorLaneCount)} at logical axis " +
+                    $"{innermostStorageAxis} cannot be represented by the explicit " +
                     $"vector-lane shape [{string.Join(",", vectorLaneShape)}].");
             }
 
-            for (var axis = logicalShape.Count - 2; axis >= 0; axis--)
+            // A zero stride is legal only on a singleton logical axis (validated
+            // by EmitSharedBufferAllocation). Such an axis does not constrain
+            // the physical rectangle: its coordinate is always zero. Derive
+            // padding from adjacent non-broadcast storage axes instead of
+            // inventing a stride for the singleton axis. For example,
+            // shape=[3,1,4], strides=[6,0,1] maps to the physical rectangle
+            // [3,1,6], preserving the two-element pitch after the last axis.
+            for (var storageAxisIndex = storageAxes.Length - 2; storageAxisIndex >= 0; storageAxisIndex--)
             {
-                var outerStride = descriptorLogicalStrides[axis];
-                var innerStride = descriptorLogicalStrides[axis + 1];
+                var outerAxis = storageAxes[storageAxisIndex];
+                var innerAxis = storageAxes[storageAxisIndex + 1];
+                var outerStride = logicalStrides[outerAxis];
+                var innerStride = logicalStrides[innerAxis];
                 if (outerStride % innerStride != 0)
                 {
                     throw new NotSupportedException(
@@ -6162,22 +6710,30 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 }
 
                 var physicalInnerExtent = outerStride / innerStride;
-                if (physicalInnerExtent < logicalShape[axis + 1])
+                if (physicalInnerExtent < logicalShape[innerAxis])
                 {
                     throw new NotSupportedException(
                         $"PyNTT shared buffer {variable.Name} stride {outerStride} overlaps logical axis " +
-                        $"{axis + 1} with extent {logicalShape[axis + 1]} and stride {innerStride}.");
+                        $"{innerAxis} with extent {logicalShape[innerAxis]} and stride {innerStride}.");
                 }
 
-                descriptorShape[axis + 1] = physicalInnerExtent;
+                descriptorShape[innerAxis] = physicalInnerExtent;
             }
 
             var descriptorElementCount = descriptorShape.Aggregate(1L, (product, value) => checked(product * value));
             if (requiredScalarElements > descriptorElementCount)
             {
-                var scalarOuterStride = checked(descriptorLogicalStrides[0] * vectorLaneCount);
-                descriptorShape[0] = Math.Max(
-                    descriptorShape[0],
+                if (storageAxes.Length == 0)
+                {
+                    throw new InvalidOperationException(
+                        $"PyNTT all-broadcast shared descriptor for {variable.Name} cannot cover " +
+                        $"{requiredScalarElements} scalar elements with shape [{string.Join(",", descriptorShape)}].");
+                }
+
+                var outerStorageAxis = storageAxes[0];
+                var scalarOuterStride = checked(logicalStrides[outerStorageAxis] * vectorLaneCount);
+                descriptorShape[outerStorageAxis] = Math.Max(
+                    descriptorShape[outerStorageAxis],
                     checked((requiredScalarElements + scalarOuterStride - 1) / scalarOuterStride));
             }
 
@@ -6745,7 +7301,10 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             return GetTensorName(expr, _parameterNames);
         }
 
-        private KernelInputLayout BuildKernelInputLayout(string bodySource, IReadOnlyList<DeviceFunctionRenderSpec> deviceFunctions)
+        private KernelInputLayout BuildKernelInputLayout(
+            string bodySource,
+            IReadOnlyList<DeviceFunctionRenderSpec> deviceFunctions,
+            IReadOnlyList<PipelineExecutionRenderSpec> pipelineExecutions)
         {
             var names = new List<string>(_inputNames.Count);
             var indexMap = new Dictionary<int, int>();
@@ -6771,7 +7330,21 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             var remappedDeviceFunctions = deviceFunctions
                 .Select(deviceFunction => RemapDeviceFunctionInputReferences(deviceFunction, indexMap, removedIndexes))
                 .ToArray();
-            return new(names.ToArray(), indexMap, removedIndexes, remappedBodySource, helpers, remappedDeviceFunctions);
+            var remappedPipelineExecutions = pipelineExecutions
+                .Select(execution => RemapPipelineExecutionInputReferences(
+                    execution,
+                    indexMap,
+                    removedIndexes,
+                    $"PyNTT PrimFunction {_function.Name} pipeline {execution.RegionId}"))
+                .ToArray();
+            return new(
+                names.ToArray(),
+                indexMap,
+                removedIndexes,
+                remappedBodySource,
+                helpers,
+                remappedDeviceFunctions,
+                remappedPipelineExecutions);
         }
 
         private bool IsObjectKernelInput(string name)
@@ -6824,8 +7397,29 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 BodySource = RemapInputReferences(deviceFunction.BodySource, indexMap, removedIndexes, $"{context} body"),
                 ParameterOverrides = parameterOverrides,
                 ExtraParameterArguments = extraParameterArguments,
+                PipelineExecutions = deviceFunction.PipelineExecutions
+                    .Select(execution => RemapPipelineExecutionInputReferences(
+                        execution,
+                        indexMap,
+                        removedIndexes,
+                        $"{context} pipeline {execution.RegionId}"))
+                    .ToArray(),
             };
         }
+
+        private static PipelineExecutionRenderSpec RemapPipelineExecutionInputReferences(
+            PipelineExecutionRenderSpec execution,
+            IReadOnlyDictionary<int, int> indexMap,
+            IReadOnlySet<int> removedIndexes,
+            string context)
+            => execution with
+            {
+                LoopStart = RemapInputReferences(execution.LoopStart, indexMap, removedIndexes, $"{context} loop start"),
+                LoopStop = RemapInputReferences(execution.LoopStop, indexMap, removedIndexes, $"{context} loop stop"),
+                LoopStep = RemapInputReferences(execution.LoopStep, indexMap, removedIndexes, $"{context} loop step"),
+                ProduceSource = RemapInputReferences(execution.ProduceSource, indexMap, removedIndexes, $"{context} produce source"),
+                ConsumeSource = RemapInputReferences(execution.ConsumeSource, indexMap, removedIndexes, $"{context} consume source"),
+            };
 
         private static JsonNode? RemapJsonInputReferences(
             JsonNode? node,
@@ -7262,6 +7856,13 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
         {
             if (_sharedBufferAllocations.TryGetValue(buffer, out var sharedAllocation))
             {
+                if (sharedAllocation.StagedLayout is not null)
+                {
+                    throw new NotSupportedException(
+                        $"PyNTT staged shared buffer {buffer.Name} cannot be accessed as one logical tile. " +
+                        "Every producer or consumer access must use a Let-bound single-slot Buffer alias.");
+                }
+
                 return new BufferRef(
                     sharedAllocation.DescriptorName,
                     "0",
@@ -7458,6 +8059,8 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 ?? throw new InvalidOperationException($"PyNTT target machine {machine.Id} does not define a shared memory space.");
             var sharedResource = machine.GetMemoryResource(sharedSpace);
             _attrs["target_machine"] = machine.Id;
+            _attrs["target_worker_width"] = machine.Execution.WorkerWidth;
+            _attrs["target_threads_per_block"] = machine.Execution.ThreadsPerBlock;
             _attrs["block_microkernels"] = _blockMicroKernelContracts;
             _attrs["target_private_resources"] = machine.PrivateResources.Values
                 .OrderBy(resource => resource.Id.Value, StringComparer.Ordinal)
@@ -8511,6 +9114,8 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 {
                     AsTensor when args.Length == 1 =>
                         BuildScalarExpression(args[0]),
+                    Nncase.IR.Tensors.Cast cast when args.Length == 1 =>
+                        $"({BuildScalarExpression(args[0])}).to({GetScalarTritonDType(cast.NewType)})",
                     LocalShardDim when args.Length == 1 =>
                         _dimEmitter.Emit(call.AsDim()).TritonExpression,
                     Nncase.IR.Math.Compare compare when args.Length >= 2 =>
@@ -8614,7 +9219,11 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 var names = Enumerable.Range(0, stateCount)
                     .Select(index => $"pyntt_reduction_{stateId}_acc{index}")
                     .ToArray();
-                var state = new ReductionState(call, kind, names, group.Calls.Length);
+                var state = new ReductionState(
+                    call,
+                    kind,
+                    names,
+                    group.ExpectedUpdateCount);
                 foreach (var groupedCall in group.Calls)
                 {
                     scope.Add(groupedCall, state);
@@ -8771,7 +9380,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     ["helper"] = model.FunctionName,
                     ["family"] = selection.Family,
                     ["variant"] = selection.Variant,
-                    ["estimated_cycles"] = selection.EstimatedCycles,
+                    ["region_cycles"] = selection.RegionCycles,
                     ["resources"] = selection.Resources,
                     ["parameters"] = selection.Parameters,
                 });
@@ -8810,27 +9419,41 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             bool useGemv,
             int blockM,
             int blockN,
-            int nGroupWidth = 1)
+            IReadOnlyList<int>? nLaneShape = null)
         {
-            if (microKernel.Variant is not ("register_simt_accumulator" or "register_mma_accumulator"))
+            var isRegisterSimt = microKernel.Variant == "register_simt_accumulator";
+            if (!isRegisterSimt && microKernel.Variant != "register_mma_accumulator")
             {
                 throw new NotSupportedException(
                     $"Unsupported PyNTT matrix microkernel variant {microKernel.Family}/{microKernel.Variant}.");
             }
 
-            if (nGroupWidth <= 0 || blockN % nGroupWidth != 0)
+            nLaneShape ??= Array.Empty<int>();
+            if (nLaneShape.Any(lane => lane <= 0))
             {
                 throw new InvalidOperationException(
-                    $"PyNTT matrix accumulator N extent {blockN} must be divisible by grouped width {nGroupWidth}.");
+                    $"PyNTT matrix accumulator lane shape [{string.Join(",", nLaneShape)}] must be positive.");
             }
 
-            var accumulatorShape = useGemv &&
-                microKernel.Variant == "register_simt_accumulator" &&
-                nGroupWidth > 1
-                ? $"({blockN / nGroupWidth}, {nGroupWidth})"
-                : useGemv
-                    ? $"({blockN},)"
-                    : $"({blockM}, {blockN})";
+            var nGroupWidth = nLaneShape.Aggregate(1, (product, lane) => checked(product * lane));
+            if (blockN % nGroupWidth != 0)
+            {
+                throw new InvalidOperationException(
+                    $"PyNTT matrix accumulator N extent {blockN} must be divisible by lane shape " +
+                    $"[{string.Join(",", nLaneShape)}] with width {nGroupWidth}.");
+            }
+
+            string accumulatorShape;
+            if (useGemv && microKernel.Variant == "register_simt_accumulator" && nLaneShape.Count > 0)
+            {
+                var dimensions = new[] { blockN / nGroupWidth }.Concat(nLaneShape);
+                accumulatorShape = $"({string.Join(", ", dimensions)})";
+            }
+            else
+            {
+                accumulatorShape = useGemv ? $"({blockN},)" : $"({blockM}, {blockN})";
+            }
+
             return ReductionAccumulatorInitializer.Register(
                 $"tl.zeros({accumulatorShape}, tl.float32)");
         }
@@ -9191,7 +9814,16 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             long AvailableBytes,
             int ScalarElementSizeBytes,
             string TritonDType,
-            string StorageEncoding);
+            string StorageEncoding,
+            StagedBufferLayout? StagedLayout,
+            string ArenaId,
+            long ArenaOffsetBytes);
+
+        private sealed record MaterializedPipelineCodegenBinding(
+            PipelineBufferBindingDescriptor Descriptor,
+            IVar AccessVariable,
+            TIR.Buffer Buffer,
+            SharedBufferAllocation Allocation);
 
         private sealed class ReductionState
         {
@@ -9288,8 +9920,40 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             IReadOnlyDictionary<IVar, int[][]> TensorSourceSplitAxes);
     }
 
+    internal static int GetTargetLaunchNumWarps(string targetId, BlockExecutionSpec execution)
+    {
+        var numWarps = execution.WorkersPerBlock;
+        int launchThreads;
+        try
+        {
+            launchThreads = checked(numWarps * execution.WorkerWidth);
+        }
+        catch (OverflowException ex)
+        {
+            throw new InvalidOperationException(
+                $"PyNTT target {targetId} launch geometry overflows: " +
+                $"num_warps={numWarps}, worker_width={execution.WorkerWidth}.",
+                ex);
+        }
+
+        if (numWarps <= 0 || execution.WorkerWidth <= 0 || launchThreads != execution.ThreadsPerBlock)
+        {
+            throw new InvalidOperationException(
+                $"PyNTT target {targetId} launch geometry must satisfy " +
+                $"num_warps * worker_width == threads_per_block, got " +
+                $"{numWarps} * {execution.WorkerWidth} != {execution.ThreadsPerBlock}.");
+        }
+
+        return numWarps;
+    }
+
     private static LaunchMetadata BuildLaunchMetadata(OutputInfo output, PyNTTTargetOptions targetOptions, Dictionary<string, object>? extraMeta = null)
     {
+        var execution = targetOptions.TargetMachineModel.Execution;
+        var numWarps = GetTargetLaunchNumWarps(targetOptions.TargetMachineModel.Id, execution);
+        var blockSizeSearchSpace = GetElementwiseBlockSizeSearchSpace(
+            targetOptions.TargetMachineModel.Id,
+            execution);
         var numel = Product(output.Shape);
         var meta = new Dictionary<string, object>
         {
@@ -9309,11 +9973,39 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             new(
                 new()
                 {
-                    ["block_size"] = new TuningParameterMetadata("search_space", ElementwiseBlockSizeSearchSpace),
+                    ["block_size"] = new TuningParameterMetadata("search_space", blockSizeSearchSpace),
                 }),
             BuildShardingMetadata(output, targetOptions),
-            8,
-            null);
+            numWarps,
+            1);
+    }
+
+    private static long[] GetElementwiseBlockSizeSearchSpace(
+        string targetId,
+        BlockExecutionSpec execution)
+    {
+        if (execution.WorkerWidth <= 0)
+        {
+            throw new InvalidOperationException(
+                $"PyNTT target {targetId} requires a positive worker width for block-size tuning, " +
+                $"got {execution.WorkerWidth}.");
+        }
+
+        // Large vector blocks remain the throughput-first choices. One full
+        // target worker is the exact lower resource bound: it preserves
+        // coalesced worker-wide execution while allowing the existing compiled
+        // resource gate to select a zero-spill specialization for composite
+        // kernels whose outlined helpers otherwise keep too many values live.
+        // Filtering by the worker width keeps every candidate representable as
+        // an integral number of target workers on machines with a wider worker.
+        return ElementwiseThroughputBlockSizeSearchSpace
+            .Where(blockSize =>
+                blockSize >= execution.WorkerWidth &&
+                blockSize % execution.WorkerWidth == 0)
+            .Append((long)execution.WorkerWidth)
+            .Distinct()
+            .OrderBy(blockSize => blockSize)
+            .ToArray();
     }
 
     private static ShardMetadata BuildShardingMetadata(OutputInfo output, PyNTTTargetOptions targetOptions)
@@ -11010,8 +11702,100 @@ internal sealed record KernelRenderSpec(
     IReadOnlyList<HelperTemplateRenderSpec> Helpers,
     [property: JsonPropertyName("device_functions")]
     IReadOnlyList<DeviceFunctionRenderSpec> DeviceFunctions,
+    [property: JsonPropertyName("pipeline_executions")]
+    IReadOnlyList<PipelineExecutionRenderSpec> PipelineExecutions,
     [property: JsonPropertyName("body_source")]
     string BodySource);
+
+internal sealed record PipelineExecutionRenderSpec(
+    [property: JsonPropertyName("marker")]
+    string Marker,
+    [property: JsonPropertyName("region_id")]
+    string RegionId,
+    [property: JsonPropertyName("schedule_id")]
+    string ScheduleId,
+    [property: JsonPropertyName("template_id")]
+    string TemplateId,
+    [property: JsonPropertyName("stage_count")]
+    int StageCount,
+    [property: JsonPropertyName("prefetch_distance")]
+    int PrefetchDistance,
+    [property: JsonPropertyName("partition")]
+    string Partition,
+    [property: JsonPropertyName("synchronization")]
+    PipelineSynchronizationProtocolRenderSpec Synchronization,
+    [property: JsonPropertyName("tail_policy")]
+    string TailPolicy,
+    [property: JsonPropertyName("loop_variable")]
+    string LoopVariable,
+    [property: JsonPropertyName("loop_start")]
+    string LoopStart,
+    [property: JsonPropertyName("loop_stop")]
+    string LoopStop,
+    [property: JsonPropertyName("loop_step")]
+    string LoopStep,
+    [property: JsonPropertyName("channels")]
+    IReadOnlyList<PipelineChannelRenderSpec> Channels,
+    [property: JsonPropertyName("produce_source")]
+    string ProduceSource,
+    [property: JsonPropertyName("consume_source")]
+    string ConsumeSource);
+
+internal sealed record PipelineSynchronizationProtocolRenderSpec(
+    [property: JsonPropertyName("asynchronous_produce")]
+    bool AsynchronousProduce,
+    [property: JsonPropertyName("requires_producer_commit")]
+    bool RequiresProducerCommit,
+    [property: JsonPropertyName("requires_consumer_wait")]
+    bool RequiresConsumerWait,
+    [property: JsonPropertyName("wait_provides_consumer_acquire")]
+    bool WaitProvidesConsumerAcquire,
+    [property: JsonPropertyName("requires_consumer_release")]
+    bool RequiresConsumerRelease);
+
+internal sealed record PipelineChannelRenderSpec(
+    [property: JsonPropertyName("channel_id")]
+    string ChannelId,
+    [property: JsonPropertyName("source_memory_space")]
+    string SourceMemorySpace,
+    [property: JsonPropertyName("destination_memory_space")]
+    string DestinationMemorySpace,
+    [property: JsonPropertyName("allocation")]
+    PipelineBufferAllocationRenderSpec Allocation);
+
+internal sealed record PipelineBufferAllocationRenderSpec(
+    [property: JsonPropertyName("buffer_name")]
+    string BufferName,
+    [property: JsonPropertyName("descriptor_name")]
+    string DescriptorName,
+    [property: JsonPropertyName("stage_count")]
+    int StageCount,
+    [property: JsonPropertyName("stage_physical_bytes")]
+    long StagePhysicalBytes,
+    [property: JsonPropertyName("stage_stride_bytes")]
+    long StageStrideBytes,
+    [property: JsonPropertyName("physical_bytes")]
+    long PhysicalBytes,
+    [property: JsonPropertyName("arena_id")]
+    string ArenaId,
+    [property: JsonPropertyName("arena_offset_bytes")]
+    long ArenaOffsetBytes,
+    [property: JsonPropertyName("scalar_element_size_bytes")]
+    int ScalarElementSizeBytes,
+    [property: JsonPropertyName("triton_dtype")]
+    string TritonDType,
+    [property: JsonPropertyName("logical_stage_shape")]
+    IReadOnlyList<long> LogicalStageShape,
+    [property: JsonPropertyName("logical_stage_strides")]
+    IReadOnlyList<long> LogicalStageStrides,
+    [property: JsonPropertyName("vector_lane_shape")]
+    IReadOnlyList<int> VectorLaneShape,
+    [property: JsonPropertyName("descriptor_shape")]
+    IReadOnlyList<long> DescriptorShape,
+    [property: JsonPropertyName("storage_encoding")]
+    string StorageEncoding,
+    [property: JsonPropertyName("nv_mma_shared_layout")]
+    bool NvidiaMmaSharedLayout);
 
 internal sealed record KernelInputLayout(
     string[] Names,
@@ -11019,12 +11803,17 @@ internal sealed record KernelInputLayout(
     IReadOnlySet<int> RemovedIndexes,
     string BodySource,
     HelperTemplateRenderSpec[] Helpers,
-    DeviceFunctionRenderSpec[] DeviceFunctions);
+    DeviceFunctionRenderSpec[] DeviceFunctions,
+    PipelineExecutionRenderSpec[] PipelineExecutions);
 
 internal sealed record BufferViewSource(
     Nncase.TIR.Buffer Source,
     PyNTTDimExpression[] Offsets,
     PyNTTDimExpression[] Shape);
+
+internal sealed record PipelineStageAliasBinding(
+    Nncase.TIR.Buffer Source,
+    Dimension StageIndex);
 
 internal sealed record DeviceFunctionBuildResult(
     DeviceFunctionRenderSpec Function,
@@ -11053,7 +11842,9 @@ internal sealed record DeviceFunctionRenderSpec(
     [property: JsonPropertyName("extra_parameters")]
     IReadOnlyList<string> ExtraParameters,
     [property: JsonPropertyName("extra_parameter_arguments")]
-    IReadOnlyDictionary<string, string> ExtraParameterArguments);
+    IReadOnlyDictionary<string, string> ExtraParameterArguments,
+    [property: JsonPropertyName("pipeline_executions")]
+    IReadOnlyList<PipelineExecutionRenderSpec> PipelineExecutions);
 
 internal sealed record HelperTemplateRenderSpec(
     [property: JsonPropertyName("template")]
@@ -11093,9 +11884,9 @@ internal sealed record LaunchMetadata(
     [property: JsonPropertyName("sharding")]
     ShardMetadata Sharding,
     [property: JsonPropertyName("num_warps")]
-    int? NumWarps,
+    int NumWarps,
     [property: JsonPropertyName("num_stages")]
-    int? NumStages);
+    int NumStages);
 
 internal sealed record ShardMetadata(
     [property: JsonPropertyName("strategy")]

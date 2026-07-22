@@ -31,12 +31,530 @@ WORKSPACE_STRIDE_PARAMETERS = (
 SHARD_INDEX_PARAMETER = "shard_index"
 NVIDIA_MMA_SHARED_ENCODING = "triton.nvidia.mma-shared"
 K_MAJOR_PACKED_N_SHARED_ENCODING = "triton.shared.k-major-packed-n"
-PYNTT_CODEGEN_MANIFEST_VERSION = 3
+PYNTT_CODEGEN_MANIFEST_VERSION = 6
+TRITON_BLOCK_MICROKERNEL_CONTRACT_VERSION = 4
+TRITON_LOOP_CP_ASYNC_N2_TEMPLATE_ID = "triton.loop.cp_async.n2.v1"
 
 DEVICE_CALL_RE = re.compile(
     r"(?m)^(?P<indent>[ \t]*)__pyntt_device_call__(?P<name>[A-Za-z_]\w*)\((?P<args>.*)\)$"
 )
 DEVICE_CALL_NAME_RE = re.compile(r"__pyntt_device_call__(?P<name>[A-Za-z_]\w*)\(")
+
+
+def _require_exact_object(
+    value: Any, path: str, expected_keys: set[str]
+) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError(f"{path} must be a JSON object.")
+    actual_keys = set(value)
+    missing = sorted(expected_keys - actual_keys)
+    unexpected = sorted(actual_keys - expected_keys)
+    if missing or unexpected:
+        details = []
+        if missing:
+            details.append(f"missing fields {missing}")
+        if unexpected:
+            details.append(f"unexpected fields {unexpected}")
+        raise ValueError(f"{path} has {' and '.join(details)}.")
+    return value
+
+
+def _require_int(value: Any, path: str, *, minimum: int | None = None) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{path} must be an integer.")
+    if minimum is not None and value < minimum:
+        raise ValueError(f"{path} must be at least {minimum}, got {value}.")
+    return value
+
+
+def _require_string(value: Any, path: str, *, nonempty: bool = False) -> str:
+    if not isinstance(value, str) or (nonempty and not value):
+        suffix = " a non-empty string" if nonempty else " a string"
+        raise ValueError(f"{path} must be{suffix}.")
+    return value
+
+
+def _require_list(value: Any, path: str) -> list[Any]:
+    if not isinstance(value, list):
+        raise ValueError(f"{path} must be a JSON array.")
+    return value
+
+
+def _require_string_list(value: Any, path: str) -> list[str]:
+    values = _require_list(value, path)
+    for index, item in enumerate(values):
+        _require_string(item, f"{path}[{index}]")
+    return values
+
+
+def _require_string_map(value: Any, path: str) -> dict[str, str]:
+    if not isinstance(value, dict):
+        raise ValueError(f"{path} must be a JSON object.")
+    for key, item in value.items():
+        _require_string(key, f"{path} key", nonempty=True)
+        _require_string(item, f"{path}[{key!r}]")
+    return value
+
+
+def _validate_helper(helper: Any, path: str) -> None:
+    helper = _require_exact_object(
+        helper,
+        path,
+        {"template", "model", "arguments", "requires_inline"},
+    )
+    _require_string(helper["template"], f"{path}.template", nonempty=True)
+    if not isinstance(helper["model"], dict):
+        raise ValueError(f"{path}.model must be a JSON object.")
+    _require_string_list(helper["arguments"], f"{path}.arguments")
+    if not isinstance(helper["requires_inline"], bool):
+        raise ValueError(f"{path}.requires_inline must be a boolean.")
+
+
+def _validate_device_function(device_function: Any, path: str) -> None:
+    device_function = _require_exact_object(
+        device_function,
+        path,
+        {
+            "name",
+            "noinline",
+            "preserve_helper_call_boundaries",
+            "helpers",
+            "body_source",
+            "parameter_overrides",
+            "extra_parameters",
+            "extra_parameter_arguments",
+            "pipeline_executions",
+        },
+    )
+    _require_string(device_function["name"], f"{path}.name", nonempty=True)
+    for field in ("noinline", "preserve_helper_call_boundaries"):
+        if not isinstance(device_function[field], bool):
+            raise ValueError(f"{path}.{field} must be a boolean.")
+    helpers = _require_list(device_function["helpers"], f"{path}.helpers")
+    for index, helper in enumerate(helpers):
+        _validate_helper(helper, f"{path}.helpers[{index}]")
+    _require_string(device_function["body_source"], f"{path}.body_source")
+    _require_string_map(
+        device_function["parameter_overrides"], f"{path}.parameter_overrides"
+    )
+    _require_string_list(
+        device_function["extra_parameters"], f"{path}.extra_parameters"
+    )
+    _require_string_map(
+        device_function["extra_parameter_arguments"],
+        f"{path}.extra_parameter_arguments",
+    )
+    _validate_pipeline_executions(
+        device_function["pipeline_executions"],
+        device_function["body_source"],
+        f"{path}.pipeline_executions",
+    )
+
+
+def _require_positive_int_list(value: Any, path: str) -> list[int]:
+    values = _require_list(value, path)
+    for index, item in enumerate(values):
+        _require_int(item, f"{path}[{index}]", minimum=1)
+    return values
+
+
+def _validate_launch(launch: Any, path: str) -> None:
+    launch = _require_exact_object(
+        launch,
+        path,
+        {"meta", "tuning", "sharding", "num_warps", "num_stages"},
+    )
+    if not isinstance(launch["meta"], dict):
+        raise ValueError(f"{path}.meta must be a JSON object.")
+    _require_int(launch["num_warps"], f"{path}.num_warps", minimum=1)
+    _require_int(launch["num_stages"], f"{path}.num_stages", minimum=1)
+
+    tuning = _require_exact_object(launch["tuning"], f"{path}.tuning", {"parameters"})
+    parameters = tuning["parameters"]
+    if not isinstance(parameters, dict):
+        raise ValueError(f"{path}.tuning.parameters must be a JSON object.")
+    for name, parameter in parameters.items():
+        _require_string(name, f"{path}.tuning.parameters key", nonempty=True)
+        parameter_path = f"{path}.tuning.parameters[{name!r}]"
+        parameter = _require_exact_object(
+            parameter, parameter_path, {"source", "candidates"}
+        )
+        _require_string(parameter["source"], f"{parameter_path}.source", nonempty=True)
+        candidates = _require_list(
+            parameter["candidates"], f"{parameter_path}.candidates"
+        )
+        if not candidates:
+            raise ValueError(f"{parameter_path}.candidates must not be empty.")
+        for index, candidate in enumerate(candidates):
+            _require_int(
+                candidate,
+                f"{parameter_path}.candidates[{index}]",
+                minimum=1,
+            )
+
+    sharding = _require_exact_object(
+        launch["sharding"],
+        f"{path}.sharding",
+        {
+            "strategy",
+            "placement_axis",
+            "tensor_axis",
+            "extent",
+            "hierarchy",
+            "hierarchy_levels",
+            "global_shape",
+        },
+    )
+    for field in ("strategy", "placement_axis", "extent", "hierarchy_levels"):
+        _require_string(sharding[field], f"{path}.sharding.{field}")
+    _require_int(sharding["tensor_axis"], f"{path}.sharding.tensor_axis")
+    hierarchy = _require_list(sharding["hierarchy"], f"{path}.sharding.hierarchy")
+    for index, extent in enumerate(hierarchy):
+        _require_int(extent, f"{path}.sharding.hierarchy[{index}]", minimum=1)
+    _require_string_list(sharding["global_shape"], f"{path}.sharding.global_shape")
+
+
+def _validate_python_expression(value: Any, path: str) -> str:
+    source = _require_string(value, path, nonempty=True)
+    try:
+        ast.parse(source, mode="eval")
+    except SyntaxError as ex:
+        raise ValueError(f"{path} is not a valid Python expression.") from ex
+    return source
+
+
+def _validate_python_statements(value: Any, path: str) -> str:
+    source = _require_string(value, path, nonempty=True)
+    try:
+        ast.parse(source)
+    except SyntaxError as ex:
+        raise ValueError(f"{path} is not valid Python source.") from ex
+    return source
+
+
+def _validate_pipeline_allocation(allocation: Any, path: str) -> None:
+    allocation = _require_exact_object(
+        allocation,
+        path,
+        {
+            "buffer_name",
+            "descriptor_name",
+            "stage_count",
+            "stage_physical_bytes",
+            "stage_stride_bytes",
+            "physical_bytes",
+            "arena_id",
+            "arena_offset_bytes",
+            "scalar_element_size_bytes",
+            "triton_dtype",
+            "logical_stage_shape",
+            "logical_stage_strides",
+            "vector_lane_shape",
+            "descriptor_shape",
+            "storage_encoding",
+            "nv_mma_shared_layout",
+        },
+    )
+    for field in (
+        "buffer_name",
+        "descriptor_name",
+        "arena_id",
+        "triton_dtype",
+        "storage_encoding",
+    ):
+        _require_string(allocation[field], f"{path}.{field}", nonempty=True)
+    stage_count = _require_int(
+        allocation["stage_count"], f"{path}.stage_count", minimum=2
+    )
+    stage_physical_bytes = _require_int(
+        allocation["stage_physical_bytes"],
+        f"{path}.stage_physical_bytes",
+        minimum=1,
+    )
+    stage_stride_bytes = _require_int(
+        allocation["stage_stride_bytes"],
+        f"{path}.stage_stride_bytes",
+        minimum=stage_physical_bytes,
+    )
+    physical_bytes = _require_int(
+        allocation["physical_bytes"], f"{path}.physical_bytes", minimum=1
+    )
+    if physical_bytes != stage_count * stage_stride_bytes:
+        raise ValueError(
+            f"{path}.physical_bytes must equal stage_count * stage_stride_bytes."
+        )
+    _require_int(
+        allocation["arena_offset_bytes"],
+        f"{path}.arena_offset_bytes",
+        minimum=0,
+    )
+    scalar_bytes = _require_int(
+        allocation["scalar_element_size_bytes"],
+        f"{path}.scalar_element_size_bytes",
+        minimum=1,
+    )
+    logical_shape = _require_positive_int_list(
+        allocation["logical_stage_shape"], f"{path}.logical_stage_shape"
+    )
+    logical_strides = _require_list(
+        allocation["logical_stage_strides"], f"{path}.logical_stage_strides"
+    )
+    if len(logical_strides) != len(logical_shape):
+        raise ValueError(
+            f"{path}.logical_stage_strides must match logical_stage_shape rank."
+        )
+    for index, stride in enumerate(logical_strides):
+        _require_int(stride, f"{path}.logical_stage_strides[{index}]", minimum=0)
+    _require_positive_int_list(
+        allocation["vector_lane_shape"], f"{path}.vector_lane_shape"
+    )
+    descriptor_shape = _require_positive_int_list(
+        allocation["descriptor_shape"], f"{path}.descriptor_shape"
+    )
+    if descriptor_shape[0] != stage_count:
+        raise ValueError(
+            f"{path}.descriptor_shape must begin with stage_count={stage_count}."
+        )
+    descriptor_bytes = math.prod(descriptor_shape) * scalar_bytes
+    if descriptor_bytes != physical_bytes:
+        raise ValueError(
+            f"{path}.descriptor_shape occupies {descriptor_bytes} bytes, "
+            f"expected physical_bytes={physical_bytes}."
+        )
+    if not isinstance(allocation["nv_mma_shared_layout"], bool):
+        raise ValueError(f"{path}.nv_mma_shared_layout must be a boolean.")
+
+
+def _validate_pipeline_execution(execution: Any, path: str) -> None:
+    execution = _require_exact_object(
+        execution,
+        path,
+        {
+            "marker",
+            "region_id",
+            "schedule_id",
+            "template_id",
+            "stage_count",
+            "prefetch_distance",
+            "partition",
+            "synchronization",
+            "tail_policy",
+            "loop_variable",
+            "loop_start",
+            "loop_stop",
+            "loop_step",
+            "channels",
+            "produce_source",
+            "consume_source",
+        },
+    )
+    marker = _require_string(execution["marker"], f"{path}.marker", nonempty=True)
+    if re.fullmatch(r"__PYNTT_PIPELINE_EXECUTION_[0-9]+__", marker) is None:
+        raise ValueError(f"{path}.marker has an invalid pipeline marker identity.")
+    for field in ("region_id", "schedule_id", "loop_variable"):
+        _require_string(execution[field], f"{path}.{field}", nonempty=True)
+    template_id = _require_string(
+        execution["template_id"], f"{path}.template_id", nonempty=True
+    )
+    if template_id != TRITON_LOOP_CP_ASYNC_N2_TEMPLATE_ID:
+        raise ValueError(f"{path}.template_id is unsupported: {template_id!r}.")
+
+    stage_count = _require_int(
+        execution["stage_count"], f"{path}.stage_count", minimum=2
+    )
+    if stage_count != 2:
+        raise ValueError(f"{path}.stage_count must be 2 for {template_id}.")
+    prefetch_distance = _require_int(
+        execution["prefetch_distance"], f"{path}.prefetch_distance", minimum=1
+    )
+    if prefetch_distance != 1:
+        raise ValueError(f"{path}.prefetch_distance must be 1 for {template_id}.")
+    partition = _require_string(
+        execution["partition"], f"{path}.partition", nonempty=True
+    )
+    if partition not in {"unpartitioned", "full", "tail"}:
+        raise ValueError(f"{path}.partition is unsupported: {partition!r}.")
+
+    synchronization = _require_exact_object(
+        execution["synchronization"],
+        f"{path}.synchronization",
+        {
+            "asynchronous_produce",
+            "requires_producer_commit",
+            "requires_consumer_wait",
+            "wait_provides_consumer_acquire",
+            "requires_consumer_release",
+        },
+    )
+    expected_protocol = {
+        "asynchronous_produce": True,
+        "requires_producer_commit": True,
+        "requires_consumer_wait": True,
+        "wait_provides_consumer_acquire": False,
+        "requires_consumer_release": True,
+    }
+    if synchronization != expected_protocol:
+        raise ValueError(
+            f"{path}.synchronization does not match {template_id}: "
+            f"expected {expected_protocol}."
+        )
+
+    if execution["tail_policy"] != "serial":
+        raise ValueError(f"{path}.tail_policy must be 'serial'.")
+    for field in ("loop_start", "loop_stop", "loop_step"):
+        _validate_python_expression(execution[field], f"{path}.{field}")
+    _validate_python_statements(execution["produce_source"], f"{path}.produce_source")
+    _validate_python_statements(execution["consume_source"], f"{path}.consume_source")
+
+    channels = _require_list(execution["channels"], f"{path}.channels")
+    if not channels:
+        raise ValueError(f"{path}.channels must not be empty.")
+    channel_ids: set[str] = set()
+    descriptor_names: set[str] = set()
+    for channel_index, channel in enumerate(channels):
+        channel_path = f"{path}.channels[{channel_index}]"
+        channel = _require_exact_object(
+            channel,
+            channel_path,
+            {
+                "channel_id",
+                "source_memory_space",
+                "destination_memory_space",
+                "allocation",
+            },
+        )
+        channel_id = _require_string(
+            channel["channel_id"], f"{channel_path}.channel_id", nonempty=True
+        )
+        if channel_id in channel_ids:
+            raise ValueError(
+                f"{path}.channels contains duplicate channel_id {channel_id!r}."
+            )
+        channel_ids.add(channel_id)
+        source_memory_space = _require_string(
+            channel["source_memory_space"],
+            f"{channel_path}.source_memory_space",
+            nonempty=True,
+        )
+        destination_memory_space = _require_string(
+            channel["destination_memory_space"],
+            f"{channel_path}.destination_memory_space",
+            nonempty=True,
+        )
+        if source_memory_space == destination_memory_space:
+            raise ValueError(
+                f"{channel_path} source and destination memory spaces must differ."
+            )
+        allocation_path = f"{channel_path}.allocation"
+        _validate_pipeline_allocation(channel["allocation"], allocation_path)
+        if channel["allocation"]["stage_count"] != stage_count:
+            raise ValueError(
+                f"{allocation_path}.stage_count must match "
+                f"{path}.stage_count={stage_count}."
+            )
+        descriptor_name = channel["allocation"]["descriptor_name"]
+        if descriptor_name in descriptor_names:
+            raise ValueError(
+                f"{path} contains duplicate descriptor_name {descriptor_name!r}."
+            )
+        descriptor_names.add(descriptor_name)
+
+
+def _validate_pipeline_executions(value: Any, body_source: Any, path: str) -> None:
+    body_source = _require_string(body_source, path.rsplit(".", 1)[0] + ".body_source")
+    executions = _require_list(value, path)
+    markers: set[str] = set()
+    regions: set[str] = set()
+    for index, execution in enumerate(executions):
+        execution_path = f"{path}[{index}]"
+        _validate_pipeline_execution(execution, execution_path)
+        marker = execution["marker"]
+        region_id = execution["region_id"]
+        if marker in markers or region_id in regions:
+            raise ValueError(
+                f"{path} contains a duplicate marker or region identity at index {index}."
+            )
+        markers.add(marker)
+        regions.add(region_id)
+        marker_pattern = re.compile(
+            rf"(?m)^[ \t]*# {re.escape(marker)}[ \t]*$"
+        )
+        if len(marker_pattern.findall(body_source)) != 1:
+            raise ValueError(
+                f"{execution_path}.marker must occur exactly once in its owning body_source."
+            )
+
+
+def _validate_codegen_manifest_v6(manifest: dict[str, Any]) -> None:
+    manifest = _require_exact_object(
+        manifest,
+        "PyNTT codegen manifest",
+        {"pyntt_codegen_manifest_version", "target_kind", "backend", "functions"},
+    )
+    _require_string(manifest["target_kind"], "manifest.target_kind", nonempty=True)
+    _require_string(manifest["backend"], "manifest.backend", nonempty=True)
+    functions = _require_list(manifest["functions"], "manifest.functions")
+    for function_index, function in enumerate(functions):
+        function_path = f"manifest.functions[{function_index}]"
+        function = _require_exact_object(
+            function,
+            function_path,
+            {"id", "name", "module_kind", "is_entry", "render_kernels"},
+        )
+        _require_int(function["id"], f"{function_path}.id", minimum=0)
+        _require_string(function["name"], f"{function_path}.name", nonempty=True)
+        _require_string(
+            function["module_kind"], f"{function_path}.module_kind", nonempty=True
+        )
+        if not isinstance(function["is_entry"], bool):
+            raise ValueError(f"{function_path}.is_entry must be a boolean.")
+        kernels = _require_list(
+            function["render_kernels"], f"{function_path}.render_kernels"
+        )
+        for kernel_index, kernel in enumerate(kernels):
+            kernel_path = f"{function_path}.render_kernels[{kernel_index}]"
+            kernel = _require_exact_object(
+                kernel,
+                kernel_path,
+                {
+                    "metadata",
+                    "helpers",
+                    "device_functions",
+                    "pipeline_executions",
+                    "body_source",
+                },
+            )
+            metadata_path = f"{kernel_path}.metadata"
+            metadata = _require_exact_object(
+                kernel["metadata"],
+                metadata_path,
+                {"name", "op_kind", "inputs", "outputs", "attrs", "launch"},
+            )
+            _require_string(metadata["name"], f"{metadata_path}.name", nonempty=True)
+            _require_string(
+                metadata["op_kind"], f"{metadata_path}.op_kind", nonempty=True
+            )
+            _require_string_list(metadata["inputs"], f"{metadata_path}.inputs")
+            _require_string_list(metadata["outputs"], f"{metadata_path}.outputs")
+            if not isinstance(metadata["attrs"], dict):
+                raise ValueError(f"{metadata_path}.attrs must be a JSON object.")
+            _validate_launch(metadata["launch"], f"{metadata_path}.launch")
+            helpers = _require_list(kernel["helpers"], f"{kernel_path}.helpers")
+            for helper_index, helper in enumerate(helpers):
+                _validate_helper(helper, f"{kernel_path}.helpers[{helper_index}]")
+            device_functions = _require_list(
+                kernel["device_functions"], f"{kernel_path}.device_functions"
+            )
+            for device_index, device_function in enumerate(device_functions):
+                _validate_device_function(
+                    device_function,
+                    f"{kernel_path}.device_functions[{device_index}]",
+                )
+            _validate_pipeline_executions(
+                kernel["pipeline_executions"],
+                kernel["body_source"],
+                f"{kernel_path}.pipeline_executions",
+            )
 
 
 def render_generated_kernels(
@@ -67,7 +585,9 @@ def render_generated_kernels(
     return output_path
 
 
-def render_manifest(manifest: dict[str, Any]) -> str:
+def validate_manifest(manifest: dict[str, Any]) -> None:
+    """Validate the compiler-to-PyNTT manifest reader contract."""
+
     if not isinstance(manifest, dict):
         raise ValueError("The PyNTT codegen manifest must be a JSON object.")
     manifest_version = manifest.get("pyntt_codegen_manifest_version")
@@ -80,6 +600,11 @@ def render_manifest(manifest: dict[str, Any]) -> str:
             "Unsupported PyNTT codegen manifest version "
             f"{manifest_version!r}; expected {PYNTT_CODEGEN_MANIFEST_VERSION}."
         )
+    _validate_codegen_manifest_v6(manifest)
+
+
+def render_manifest(manifest: dict[str, Any]) -> str:
+    validate_manifest(manifest)
 
     kernels = [
         _render_kernel(kernel)
@@ -96,10 +621,19 @@ def render_manifest(manifest: dict[str, Any]) -> str:
         for function in manifest.get("functions", ())
         for kernel in function.get("render_kernels", ())
     )
+    needs_explicit_pipeline = any(
+        bool(kernel.get("pipeline_executions"))
+        or any(
+            bool(device_function.get("pipeline_executions"))
+            for device_function in kernel.get("device_functions", ())
+        )
+        for function in manifest.get("functions", ())
+        for kernel in function.get("render_kernels", ())
+    )
     env = _make_env()
     return env.get_template("triton/module.py.jinja").render(
         kernels=kernels,
-        needs_tle=needs_grid_barrier or needs_shared_memory,
+        needs_tle=needs_grid_barrier or needs_shared_memory or needs_explicit_pipeline,
         needs_grid_barrier=needs_grid_barrier,
         grid_mesh_size=_grid_mesh_size(manifest),
     )
@@ -112,14 +646,8 @@ def _kernel_parameters(metadata: dict[str, Any]) -> tuple[str, ...]:
         else ()
     )
     return (
-        tuple(
-            f"input{index}"
-            for index, _ in enumerate(metadata.get("inputs", ()))
-        )
-        + tuple(
-            f"output{index}"
-            for index, _ in enumerate(metadata.get("outputs", ()))
-        )
+        tuple(f"input{index}" for index, _ in enumerate(metadata.get("inputs", ())))
+        + tuple(f"output{index}" for index, _ in enumerate(metadata.get("outputs", ())))
         + tuple(
             f"input{index}_pool_stride_elements: tl.constexpr"
             for index, _ in enumerate(metadata.get("inputs", ()))
@@ -137,6 +665,56 @@ def _kernel_parameters(metadata: dict[str, Any]) -> tuple[str, ...]:
     )
 
 
+def _render_pipeline_executions(
+    env: Environment,
+    body_source: str,
+    executions: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+    context: str,
+) -> str:
+    result = body_source
+    template_paths = {
+        TRITON_LOOP_CP_ASYNC_N2_TEMPLATE_ID: "triton/pipelines/cp_async_n2.py.jinja",
+    }
+    for execution_index, execution in enumerate(executions):
+        template_id = execution["template_id"]
+        try:
+            template_path = template_paths[template_id]
+        except KeyError as ex:
+            raise ValueError(
+                f"{context} has no Jinja implementation for pipeline template "
+                f"{template_id!r}."
+            ) from ex
+        marker = execution["marker"]
+        model = dict(execution)
+        model["symbol_suffix"] = f"pipeline_{execution_index}"
+        fragment = env.get_template(template_path).render(execution=model).strip()
+        try:
+            ast.parse(fragment)
+        except SyntaxError as ex:
+            raise RuntimeError(
+                f"{context} pipeline template {template_id!r} rendered invalid Python."
+            ) from ex
+        marker_pattern = re.compile(
+            rf"(?m)^(?P<indent>[ \t]*)# {re.escape(marker)}[ \t]*$"
+        )
+
+        def replace_marker(match: re.Match[str]) -> str:
+            indent = match.group("indent")
+            return "\n".join(
+                f"{indent}{line}" if line else line for line in fragment.splitlines()
+            )
+
+        result, replacement_count = marker_pattern.subn(replace_marker, result)
+        if replacement_count != 1:
+            raise RuntimeError(
+                f"{context} pipeline marker {marker!r} was replaced "
+                f"{replacement_count} times; expected exactly once."
+            )
+    if "__PYNTT_PIPELINE_EXECUTION_" in result:
+        raise RuntimeError(f"{context} retains an unresolved pipeline marker.")
+    return result
+
+
 def _render_kernel(kernel: dict[str, Any]) -> str:
     env = _make_env()
     metadata = kernel["metadata"]
@@ -146,12 +724,29 @@ def _render_kernel(kernel: dict[str, Any]) -> str:
         raise ValueError(
             f"PyNTT kernel {metadata['name']} must declare a positive launch.num_warps."
         )
+    target_worker_width = _require_int(
+        kernel_attrs.get("target_worker_width"),
+        f"PyNTT kernel {metadata['name']} attrs.target_worker_width",
+        minimum=1,
+    )
+    target_threads_per_block = _require_int(
+        kernel_attrs.get("target_threads_per_block"),
+        f"PyNTT kernel {metadata['name']} attrs.target_threads_per_block",
+        minimum=1,
+    )
+    launch_threads = num_warps * target_worker_width
+    if launch_threads != target_threads_per_block:
+        raise ValueError(
+            f"PyNTT kernel {metadata['name']} launch geometry must satisfy "
+            "num_warps * target_worker_width == target_threads_per_block, got "
+            f"{num_warps} * {target_worker_width} != {target_threads_per_block}."
+        )
     parameters = _kernel_parameters(metadata)
     shared_memory_bytes = int(kernel_attrs.get("shared_memory_bytes", 0))
     if shared_memory_bytes < 0:
         raise ValueError(
             f"PyNTT kernel {metadata['name']} has invalid shared_memory_bytes={shared_memory_bytes}."
-    )
+        )
     raw_device_functions = tuple(kernel["device_functions"])
     shared_allocation_bytes = _round_memory_arena_size(
         shared_memory_bytes,
@@ -175,16 +770,19 @@ def _render_kernel(kernel: dict[str, Any]) -> str:
         ("pyntt_shared_arena",) if shared_allocation_bytes > 0 else ()
     )
     device_functions = _prepare_device_functions(
+        env,
         raw_device_functions,
         parameters,
         hidden_device_parameters,
     )
     device_functions_by_name = {
-        device_function["name"]: device_function
-        for device_function in device_functions
+        device_function["name"]: device_function for device_function in device_functions
     }
     helper_sources = _render_helper_sources(
-        env, kernel.get("helpers", ()), num_warps=num_warps
+        env,
+        kernel.get("helpers", ()),
+        num_warps=num_warps,
+        target_worker_width=target_worker_width,
     )
     device_function_sources = [
         _render_device_function(
@@ -193,24 +791,35 @@ def _render_kernel(kernel: dict[str, Any]) -> str:
             hidden_device_parameters,
             device_functions_by_name,
             num_warps,
+            target_worker_width,
         )
         for device_function in device_functions
     ]
-    body_source = _replace_device_function_calls(
+    body_source = _render_pipeline_executions(
+        env,
         kernel.get("body_source", ""),
+        kernel["pipeline_executions"],
+        f"PyNTT kernel {metadata['name']!r}",
+    )
+    body_source = _replace_device_function_calls(
+        body_source,
         device_functions_by_name,
     )
-    top_kernel = env.get_template("triton/top_kernel.py.jinja").render(
-        name=metadata["name"],
-        parameters=", ".join(parameters),
-        body_source=body_source.rstrip(),
-        materialize_shard_index=_needs_shard_index_prelude(
-            body_source,
-            parameters,
-        ),
-        shared_allocation_bytes=shared_allocation_bytes,
-        noinline=False,
-    ).strip()
+    top_kernel = (
+        env.get_template("triton/top_kernel.py.jinja")
+        .render(
+            name=metadata["name"],
+            parameters=", ".join(parameters),
+            body_source=body_source.rstrip(),
+            materialize_shard_index=_needs_shard_index_prelude(
+                body_source,
+                parameters,
+            ),
+            shared_allocation_bytes=shared_allocation_bytes,
+            noinline=False,
+        )
+        .strip()
+    )
     parts = [source for source in helper_sources if source]
     parts.extend(source for source in device_function_sources if source)
     parts.append(top_kernel)
@@ -223,12 +832,14 @@ def _render_device_function(
     hidden_parameters: tuple[str, ...],
     device_functions_by_name: dict[str, dict[str, Any]],
     num_warps: int,
+    target_worker_width: int,
 ) -> str:
     helper_sources = _render_helper_sources(
         env,
         device_function.get("helpers", ()),
         noinline=bool(device_function["preserve_helper_call_boundaries"]),
         num_warps=num_warps,
+        target_worker_width=target_worker_width,
     )
     parts = [source for source in helper_sources if source]
     device_parameters = (
@@ -237,12 +848,19 @@ def _render_device_function(
         + tuple(device_function["direct_extra_parameters"])
     )
     for stage in device_function["stages"]:
-        body_source = _replace_device_function_calls(
+        body_source = _render_pipeline_executions(
+            env,
             stage["body_source"],
+            stage["pipeline_executions"],
+            f"PyNTT device function {stage['name']!r}",
+        )
+        body_source = _replace_device_function_calls(
+            body_source,
             device_functions_by_name,
         )
         parts.append(
-            env.get_template("triton/top_kernel.py.jinja").render(
+            env.get_template("triton/top_kernel.py.jinja")
+            .render(
                 name=stage["name"],
                 parameters=", ".join(device_parameters),
                 body_source=body_source.rstrip(),
@@ -252,12 +870,14 @@ def _render_device_function(
                 ),
                 shared_allocation_bytes=0,
                 noinline=device_function["noinline"],
-            ).strip()
+            )
+            .strip()
         )
     return "\n\n".join(parts)
 
 
 def _prepare_device_functions(
+    env: Environment,
     device_functions: tuple[dict[str, Any], ...],
     parameters: tuple[str, ...],
     hidden_parameters: tuple[str, ...],
@@ -270,13 +890,21 @@ def _prepare_device_functions(
         extra_parameters = tuple(device_function["extra_parameters"])
         prepared["direct_extra_parameters"] = extra_parameters
         prepared["hidden_parameters"] = hidden_parameters
+        pipeline_executions = tuple(device_function["pipeline_executions"])
+        body_source = _render_pipeline_executions(
+            env,
+            device_function.get("body_source", "").rstrip() or "pass",
+            pipeline_executions,
+            f"PyNTT device function {device_function['name']!r}",
+        )
         prepared["stages"] = (
             {
                 "name": device_function["name"],
-                "body_source": device_function.get("body_source", "").rstrip()
-                or "pass",
+                "body_source": body_source,
+                "pipeline_executions": (),
             },
         )
+        prepared["liveness_source"] = body_source
         prepared_functions.append(prepared)
 
     functions_by_name = {
@@ -285,7 +913,7 @@ def _prepare_device_functions(
     }
     required_parameters = {
         name: _referenced_parameter_names(
-            device_function.get("body_source", ""), parameter_names
+            device_function["liveness_source"], parameter_names
         )
         for name, device_function in functions_by_name.items()
     }
@@ -297,7 +925,7 @@ def _prepare_device_functions(
         changed = False
         for name, device_function in functions_by_name.items():
             for match in DEVICE_CALL_NAME_RE.finditer(
-                device_function.get("body_source", "")
+                device_function["liveness_source"]
             ):
                 callee_name = match.group("name")
                 callee = functions_by_name.get(callee_name)
@@ -348,10 +976,10 @@ def _needs_shard_index_prelude(
     source: str,
     parameters: tuple[str, ...],
 ) -> bool:
-    return (
-        SHARD_INDEX_PARAMETER not in _parameter_call_arguments(parameters)
-        and SHARD_INDEX_PARAMETER
-        in _referenced_parameter_names(source, (SHARD_INDEX_PARAMETER,))
+    return SHARD_INDEX_PARAMETER not in _parameter_call_arguments(
+        parameters
+    ) and SHARD_INDEX_PARAMETER in _referenced_parameter_names(
+        source, (SHARD_INDEX_PARAMETER,)
     )
 
 
@@ -361,6 +989,7 @@ def _render_helper_sources(
     *,
     noinline: bool = False,
     num_warps: int | None = None,
+    target_worker_width: int | None = None,
 ) -> list[str]:
     helper_sources = []
     for helper in helpers:
@@ -368,6 +997,8 @@ def _render_helper_sources(
         model["NoInline"] = bool(noinline) and not bool(helper["requires_inline"])
         if num_warps is not None:
             model["NumWarps"] = num_warps
+        if target_worker_width is not None:
+            model["TargetWorkerWidth"] = target_worker_width
         arguments = tuple(helper.get("arguments", ()) or ())
         if arguments:
             model["Arguments"] = arguments
@@ -388,9 +1019,7 @@ def _split_expression_arguments(source: str) -> tuple[str, ...]:
     try:
         expression = ast.parse(wrapped, mode="eval").body
     except SyntaxError as ex:
-        raise RuntimeError(
-            f"Invalid PyNTT device-function arguments: {source}"
-        ) from ex
+        raise RuntimeError(f"Invalid PyNTT device-function arguments: {source}") from ex
     if not isinstance(expression, ast.Call):
         raise RuntimeError(f"Invalid PyNTT device-function arguments: {source}")
     return tuple(
@@ -427,24 +1056,37 @@ def _build_device_function_call(
     device_function: dict[str, Any],
     explicit_extra_arguments: tuple[str, ...],
 ) -> str:
+    call_arguments = _build_device_function_arguments(
+        device_function, explicit_extra_arguments
+    )
+    return f"{device_function['name']}({', '.join(call_arguments)})"
+
+
+def _build_device_function_arguments(
+    device_function: dict[str, Any],
+    explicit_extra_arguments: tuple[str, ...],
+) -> tuple[str, ...]:
     extra_arguments = _bind_device_function_extra_arguments(
         device_function, explicit_extra_arguments
     )
 
     parameter_overrides = dict(device_function["parameter_overrides"])
-    call_arguments = tuple(
-        parameter_overrides.get(argument, argument)
-        for argument in _parameter_call_arguments(
-            tuple(device_function["direct_parameters"])
+    return (
+        tuple(
+            parameter_overrides.get(argument, argument)
+            for argument in _parameter_call_arguments(
+                tuple(device_function["direct_parameters"])
+            )
         )
-    ) + tuple(
-        parameter_overrides.get(argument, argument)
-        for argument in device_function["hidden_parameters"]
-    ) + tuple(
-        extra_arguments[parameter]
-        for parameter in device_function["direct_extra_parameters"]
+        + tuple(
+            parameter_overrides.get(argument, argument)
+            for argument in device_function["hidden_parameters"]
+        )
+        + tuple(
+            extra_arguments[parameter]
+            for parameter in device_function["direct_extra_parameters"]
+        )
     )
-    return f"{device_function['name']}({', '.join(call_arguments)})"
 
 
 def _replace_device_function_calls(
@@ -454,7 +1096,9 @@ def _replace_device_function_calls(
     def replace(match: re.Match[str]) -> str:
         name = match.group("name")
         if name not in device_functions:
-            raise RuntimeError(f"PyNTT kernel references unknown device function {name}.")
+            raise RuntimeError(
+                f"PyNTT kernel references unknown device function {name}."
+            )
         indent = match.group("indent")
         extra_arguments = _split_expression_arguments(match.group("args"))
         call_source = _build_device_function_call(
@@ -463,8 +1107,7 @@ def _replace_device_function_calls(
         )
 
         return "\n".join(
-            f"{indent}{line}" if line else line
-            for line in call_source.splitlines()
+            f"{indent}{line}" if line else line for line in call_source.splitlines()
         )
 
     return DEVICE_CALL_RE.sub(replace, source)
@@ -565,9 +1208,7 @@ def _grid_mesh_size(manifest: dict[str, Any]) -> int:
             if not _attrs(metadata).get("requires_grid_barrier"):
                 continue
             hierarchy = (
-                metadata.get("launch", {})
-                .get("sharding", {})
-                .get("hierarchy", (1,))
+                metadata.get("launch", {}).get("sharding", {}).get("hierarchy", (1,))
             )
             product = 1
             for value in hierarchy:
@@ -616,7 +1257,9 @@ def _pointer_type(dtype: str, address_space: Any) -> str:
 
 def _py_dim(value: Any) -> str:
     if isinstance(value, dict):
-        return str(value.get("PythonExpression", value.get("python_expression", _dim(value))))
+        return str(
+            value.get("PythonExpression", value.get("python_expression", _dim(value)))
+        )
     return str(value)
 
 
@@ -661,11 +1304,15 @@ def _zero() -> dict[str, Any]:
 
 def _multiply_dim(dim: Any, lane: int) -> dict[str, Any]:
     if lane == 1:
-        return dict(dim) if isinstance(dim, dict) else {
-            "PythonExpression": str(dim),
-            "TritonExpression": str(dim),
-            "FixedValue": dim if isinstance(dim, int) else None,
-        }
+        return (
+            dict(dim)
+            if isinstance(dim, dict)
+            else {
+                "PythonExpression": str(dim),
+                "TritonExpression": str(dim),
+                "FixedValue": dim if isinstance(dim, int) else None,
+            }
+        )
     fixed = _fixed(dim)
     range_min = _min_value(dim)
     range_max = _max_value(dim)
@@ -737,10 +1384,6 @@ def _ptr(model: dict[str, Any], name: str) -> str:
     return str(value)
 
 
-
-
-
-
 def _local_buffer(pointer: Any) -> dict[str, Any] | None:
     if not isinstance(pointer, dict):
         return None
@@ -754,6 +1397,76 @@ def _local_buffer_value(buffer: dict[str, Any], name: str) -> Any:
         for character in name
     ).lstrip("_")
     return buffer.get(name, buffer.get(snake_name))
+
+
+def _validate_local_buffer_descriptor(buffer: dict[str, Any]) -> None:
+    """Validate that a local descriptor contains its logical affine buffer."""
+
+    descriptor_shape = _local_buffer_value(buffer, "DescriptorShape")
+    logical_shape = _local_buffer_value(buffer, "LogicalShape")
+    logical_strides = _local_buffer_value(buffer, "LogicalStrides")
+    lane_shape = _local_buffer_value(buffer, "VectorLaneShape")
+    scalar_element_size = _local_buffer_value(buffer, "ScalarElementSizeBytes")
+    available_bytes = _local_buffer_value(buffer, "AvailableBytes")
+    if (
+        not isinstance(descriptor_shape, list)
+        or not descriptor_shape
+        or any(not isinstance(value, int) or value <= 0 for value in descriptor_shape)
+    ):
+        raise ValueError(
+            "PyNTT local buffer requires a positive static DescriptorShape."
+        )
+    if (
+        not isinstance(logical_shape, list)
+        or not logical_shape
+        or any(not isinstance(value, int) or value <= 0 for value in logical_shape)
+    ):
+        raise ValueError("PyNTT local buffer requires a positive static LogicalShape.")
+    if (
+        not isinstance(logical_strides, list)
+        or len(logical_strides) != len(logical_shape)
+        or any(not isinstance(value, int) or value < 0 for value in logical_strides)
+    ):
+        raise ValueError(
+            "PyNTT local buffer requires non-negative static LogicalStrides "
+            "matching LogicalShape."
+        )
+    if not isinstance(lane_shape, list) or any(
+        not isinstance(value, int) or value <= 0 for value in lane_shape
+    ):
+        raise ValueError("PyNTT local buffer requires a positive VectorLaneShape.")
+    if not isinstance(scalar_element_size, int) or scalar_element_size <= 0:
+        raise ValueError(
+            "PyNTT local buffer requires a positive ScalarElementSizeBytes."
+        )
+    if not isinstance(available_bytes, int) or available_bytes <= 0:
+        raise ValueError("PyNTT local buffer requires positive AvailableBytes.")
+
+    descriptor_elements = math.prod(descriptor_shape)
+    descriptor_bytes = descriptor_elements * scalar_element_size
+    if descriptor_bytes > available_bytes:
+        raise ValueError(
+            "PyNTT local descriptor exceeds its allocation: "
+            f"descriptor={descriptor_shape}, descriptor_bytes={descriptor_bytes}, "
+            f"available_bytes={available_bytes}."
+        )
+
+    lane_count = math.prod(lane_shape) if lane_shape else 1
+    logical_span_elements = (
+        sum(
+            (extent - 1) * stride
+            for extent, stride in zip(logical_shape, logical_strides)
+        )
+        * lane_count
+        + lane_count
+    )
+    if logical_span_elements > descriptor_elements:
+        raise ValueError(
+            "PyNTT local descriptor cannot contain its logical affine buffer: "
+            f"descriptor={descriptor_shape}, logical_shape={logical_shape}, "
+            f"logical_strides={logical_strides}, lanes={lane_shape}, "
+            f"required_elements={logical_span_elements}."
+        )
 
 
 def _local_base_coordinates(buffer: dict[str, Any]) -> tuple[Any, ...]:
@@ -794,12 +1507,12 @@ def _tensor_access(
             f"indices={len(lane_indices)}, shape={len(lane_shape)}"
         )
     if any(value <= 0 for value in lane_shape):
-        raise ValueError(f"PyNTT tensor access lane shape must be positive: {lane_shape}")
+        raise ValueError(
+            f"PyNTT tensor access lane shape must be positive: {lane_shape}"
+        )
 
     tensor_terms = [
-        index
-        if _fixed(stride) == 1
-        else f"({index}) * ({_dim(stride)})"
+        index if _fixed(stride) == 1 else f"({index}) * ({_dim(stride)})"
         for index, stride in zip(tensor_indices, strides)
         if _fixed(stride) != 0 and index != "0"
     ]
@@ -809,9 +1522,7 @@ def _tensor_access(
     for index, extent in reversed(tuple(zip(lane_indices, lane_shape))):
         if index != "0":
             lane_terms.append(
-                index
-                if lane_stride == 1
-                else f"({index}) * {lane_stride}"
+                index if lane_stride == 1 else f"({index}) * {lane_stride}"
             )
         lane_stride *= extent
     lane_offset = _join_index_terms(list(reversed(lane_terms)))
@@ -870,6 +1581,7 @@ def _add_coordinate(base: Any, index: str) -> str:
 def _local_descriptor_coordinates(
     buffer: dict[str, Any], access: Any
 ) -> tuple[str, ...]:
+    _validate_local_buffer_descriptor(buffer)
     logical_shape = tuple(
         int(value) for value in (_local_buffer_value(buffer, "LogicalShape") or ())
     )
@@ -882,6 +1594,7 @@ def _local_descriptor_coordinates(
     descriptor_shape = tuple(
         int(value) for value in (_local_buffer_value(buffer, "DescriptorShape") or ())
     )
+    storage_encoding = str(_local_buffer_value(buffer, "StorageEncoding") or "")
     base_coordinates = _local_base_coordinates(buffer)
     if len(base_coordinates) != len(logical_shape):
         raise ValueError(
@@ -897,6 +1610,7 @@ def _local_descriptor_coordinates(
     if access is None or access == "0":
         tensor_indices = ("0",) * len(logical_shape)
         lane_indices = ("0",) * len(lane_shape)
+        access_lane_shape = lane_shape
     elif isinstance(access, dict):
         tensor_indices = tuple(
             str(value)
@@ -910,7 +1624,13 @@ def _local_descriptor_coordinates(
             int(value)
             for value in access.get("LaneShape", access.get("lane_shape", ()))
         )
-        if access_lane_shape != lane_shape:
+        equivalent_linear_lane_view = (
+            storage_encoding in ("linear", "triton.shared.swizzled")
+            and len(descriptor_shape) == 1
+            and _product_int(list(access_lane_shape))
+            == _product_int(list(lane_shape))
+        )
+        if access_lane_shape != lane_shape and not equivalent_linear_lane_view:
             raise ValueError(
                 "PyNTT local access lane shape does not match its TIR buffer: "
                 f"access={access_lane_shape}, buffer={lane_shape}"
@@ -930,11 +1650,13 @@ def _local_descriptor_coordinates(
             f"got scalar offset {access!r}"
         )
 
-    if len(tensor_indices) != len(logical_shape) or len(lane_indices) != len(lane_shape):
+    if len(tensor_indices) != len(logical_shape) or len(lane_indices) != len(
+        access_lane_shape
+    ):
         raise ValueError(
             "PyNTT local access coordinate rank mismatch: "
             f"tensor={len(tensor_indices)}/{len(logical_shape)}, "
-            f"lanes={len(lane_indices)}/{len(lane_shape)}"
+            f"lanes={len(lane_indices)}/{len(access_lane_shape)}"
         )
     tensor_coordinates = tuple(
         _add_coordinate(base, index)
@@ -942,27 +1664,18 @@ def _local_descriptor_coordinates(
     )
     scalar_offset = _access_raw_scalar_offset(access)
 
-    storage_encoding = str(_local_buffer_value(buffer, "StorageEncoding") or "")
     direct_shape = logical_shape + lane_shape
     if (
         storage_encoding == K_MAJOR_PACKED_N_SHARED_ENCODING
         and len(logical_shape) == 2
         and lane_shape
-        and len(descriptor_shape) == 3
     ):
-        lane_count = _product_int(list(lane_shape))
-        if descriptor_shape != (logical_shape[0], logical_shape[1], lane_count):
+        if descriptor_shape != direct_shape:
             raise ValueError(
                 "PyNTT K-major packed-N descriptor does not match its TIR buffer: "
                 f"descriptor_shape={descriptor_shape}, logical_shape={logical_shape}, "
                 f"lanes={lane_shape}"
             )
-        lane_terms: list[str] = []
-        lane_stride = 1
-        for index, extent in reversed(tuple(zip(lane_indices, lane_shape))):
-            lane_terms.append(index if lane_stride == 1 else f"({index}) * {lane_stride}")
-            lane_stride *= extent
-        return tensor_coordinates + (_join_index_terms(list(reversed(lane_terms))),)
 
     if len(descriptor_shape) == len(direct_shape):
         descriptor_strides: list[int] = [1] * len(descriptor_shape)
@@ -995,12 +1708,13 @@ def _local_descriptor_coordinates(
             )
         return tensor_coordinates + lane_indices
 
-    if storage_encoding in ("linear", "triton.shared.swizzled") and len(descriptor_shape) == 1:
+    if (
+        storage_encoding in ("linear", "triton.shared.swizzled")
+        and len(descriptor_shape) == 1
+    ):
         lane_count = _product_int(list(lane_shape)) if lane_shape else 1
         base_terms = [
-            _dim(base)
-            if stride == 1
-            else f"({_dim(base)}) * {stride}"
+            _dim(base) if stride == 1 else f"({_dim(base)}) * {stride}"
             for base, stride in zip(base_coordinates, logical_strides)
             if _fixed(base) != 0 and stride != 0
         ]
@@ -1026,7 +1740,9 @@ def _local_descriptor_coordinates(
         lane_terms: list[str] = []
         lane_stride = 1
         for index, extent in reversed(tuple(zip(lane_indices, lane_shape))):
-            lane_terms.append(index if lane_stride == 1 else f"({index}) * {lane_stride}")
+            lane_terms.append(
+                index if lane_stride == 1 else f"({index}) * {lane_stride}"
+            )
             lane_stride *= extent
         matrix_row = tensor_coordinates[1]
         if tensor_coordinates[0] != "0":
@@ -1061,15 +1777,13 @@ def _direct_mma_shared_load(
 
     descriptor = _local_buffer_value(buffer, "DescriptorExpression")
     descriptor_shape = tuple(
-        int(value)
-        for value in (_local_buffer_value(buffer, "DescriptorShape") or ())
+        int(value) for value in (_local_buffer_value(buffer, "DescriptorShape") or ())
     )
     if not descriptor or descriptor_shape != tuple(shape):
         return None
 
-    required_bytes = (
-        math.prod(descriptor_shape)
-        * int(_local_buffer_value(buffer, "ScalarElementSizeBytes") or 0)
+    required_bytes = math.prod(descriptor_shape) * int(
+        _local_buffer_value(buffer, "ScalarElementSizeBytes") or 0
     )
     available_bytes = int(_local_buffer_value(buffer, "AvailableBytes") or 0)
     if required_bytes <= 0 or required_bytes > available_bytes:
@@ -1082,17 +1796,21 @@ def _direct_mma_shared_load(
     return f"tl.trans({load})" if transpose else load
 
 
-def _direct_simt_packed_rhs_pointer(
+def _full_local_simt_packed_rhs_pointer(
     pointer: Any,
     block_k: int,
     block_n: int,
+    expected_lane_shape: tuple[int, ...] | None = None,
 ) -> str | None:
-    """Return a KxGxlanes compute view over exact GxKxlanes storage."""
+    """Return the exact GxKxlane... compute view over packed shared storage."""
 
     buffer = _local_buffer(pointer)
     if buffer is None:
         return None
-    if _local_buffer_value(buffer, "StorageEncoding") != K_MAJOR_PACKED_N_SHARED_ENCODING:
+    if (
+        _local_buffer_value(buffer, "StorageEncoding")
+        != K_MAJOR_PACKED_N_SHARED_ENCODING
+    ):
         return None
     if not _local_base_is_zero(buffer):
         return None
@@ -1103,18 +1821,21 @@ def _direct_simt_packed_rhs_pointer(
     lane_shape = tuple(
         int(value) for value in (_local_buffer_value(buffer, "VectorLaneShape") or ())
     )
+    if expected_lane_shape is not None and lane_shape != expected_lane_shape:
+        return None
     descriptor = _local_buffer_value(buffer, "DescriptorExpression")
     descriptor_shape = tuple(
         int(value) for value in (_local_buffer_value(buffer, "DescriptorShape") or ())
     )
     lane_count = _product_int(list(lane_shape)) if lane_shape else 1
     group_count = logical_shape[0] if len(logical_shape) == 2 else 0
+    value_shape = (group_count, block_k) + lane_shape
     if (
         not descriptor
         or len(logical_shape) != 2
         or logical_shape[1] != block_k
         or group_count * lane_count != block_n
-        or descriptor_shape != (group_count, block_k, lane_count)
+        or descriptor_shape != value_shape
     ):
         return None
 
@@ -1130,11 +1851,24 @@ def _direct_simt_packed_rhs_pointer(
             f"outside its {available_bytes}-byte allocation"
         )
 
+    rank = len(value_shape)
+
+    def broadcast_index(expression: str, axis: int) -> str:
+        indices = ["None"] * rank
+        indices[axis] = ":"
+        return f"{expression}[{', '.join(indices)}]"
+
+    coordinates = [
+        broadcast_index(f"tl.arange(0, {group_count})", 0),
+        broadcast_index("offs_k", 1),
+    ]
+    coordinates.extend(
+        broadcast_index(f"tl.arange(0, {extent})", axis + 2)
+        for axis, extent in enumerate(lane_shape)
+    )
     return (
-        f"tle.gpu.local_ptr({descriptor}, "
-        f"(tl.arange(0, {group_count})[None, :, None], offs_k[:, None, None], "
-        f"tl.arange(0, {lane_count})[None, None, :]), "
-        f"shape=({block_k}, {group_count}, {lane_count}))"
+        f"tle.gpu.local_ptr({descriptor}, ({', '.join(coordinates)}), "
+        f"shape={_shape_tuple(list(value_shape))})"
     )
 
 
@@ -1150,13 +1884,10 @@ def _direct_full_local_store(
         return None
     descriptor = _local_buffer_value(buffer, "DescriptorExpression")
     descriptor_shape = tuple(
-        int(value)
-        for value in (_local_buffer_value(buffer, "DescriptorShape") or ())
+        int(value) for value in (_local_buffer_value(buffer, "DescriptorShape") or ())
     )
     base_is_zero = _local_base_is_zero(buffer)
-    element_size = int(
-        _local_buffer_value(buffer, "ScalarElementSizeBytes") or 0
-    )
+    element_size = int(_local_buffer_value(buffer, "ScalarElementSizeBytes") or 0)
     available_bytes = int(_local_buffer_value(buffer, "AvailableBytes") or 0)
     required_bytes = scalar_element_count * scalar_element_size
     if (
@@ -1205,7 +1936,9 @@ def _simt_output_store_plan(
             **full_local_store,
         }
 
-    address_space = int(pointer.get("AddressSpace", 1)) if isinstance(pointer, dict) else 1
+    address_space = (
+        int(pointer.get("AddressSpace", 1)) if isinstance(pointer, dict) else 1
+    )
     if address_space != 1 or _local_buffer(pointer) is not None:
         return {
             "kind": "indexed",
@@ -1228,8 +1961,14 @@ def _local_pointer(pointer: Any, access: Any = None) -> str | None:
     descriptor_shape = tuple(
         int(value) for value in (_local_buffer_value(buffer, "DescriptorShape") or ())
     )
-    if not descriptor or not descriptor_shape or any(value <= 0 for value in descriptor_shape):
-        raise ValueError("PyNTT local buffer requires a descriptor and a positive physical shape")
+    if (
+        not descriptor
+        or not descriptor_shape
+        or any(value <= 0 for value in descriptor_shape)
+    ):
+        raise ValueError(
+            "PyNTT local buffer requires a descriptor and a positive physical shape"
+        )
     indices = _local_descriptor_coordinates(buffer, access)
     suffix = "," if len(indices) == 1 else ""
     coordinate_shape = (
@@ -1265,12 +2004,6 @@ def _access_pointer_value(
     return local_name if scalar_offset == "0" else f"{local_name} + {scalar_offset}"
 
 
-
-
-
-
-
-
 def _pointer_shard_coord_hierarchy(pointer: Any) -> tuple[int, ...] | None:
     if not isinstance(pointer, dict):
         return None
@@ -1280,10 +2013,31 @@ def _pointer_shard_coord_hierarchy(pointer: Any) -> tuple[int, ...] | None:
     return tuple(int(axis) for axis in value)
 
 
+def _require_staged_matrix_weight(model: dict[str, Any]) -> None:
+    pointer = model.get("Rhs")
+    if not isinstance(pointer, dict):
+        raise ValueError(
+            "A PyNTT matrix reduction consumer requires a structured Rhs pointer contract."
+        )
+    local_buffer = _local_buffer(pointer)
+    descriptor = (
+        _local_buffer_value(local_buffer, "DescriptorExpression")
+        if local_buffer is not None
+        else None
+    )
+    if not isinstance(descriptor, str) or not descriptor:
+        raise ValueError(
+            "A PyNTT matrix reduction weight must be staged in block-local memory "
+            "before the consumer; Rhs must carry a local buffer descriptor."
+        )
+
+
 def _pointer_shard_hierarchy(pointers: list[Any]) -> tuple[int, ...] | None:
     hierarchies = {
         hierarchy
-        for hierarchy in (_pointer_shard_coord_hierarchy(pointer) for pointer in pointers)
+        for hierarchy in (
+            _pointer_shard_coord_hierarchy(pointer) for pointer in pointers
+        )
         if hierarchy is not None
     }
     if not hierarchies:
@@ -1294,8 +2048,6 @@ def _pointer_shard_hierarchy(pointers: list[Any]) -> tuple[int, ...] | None:
             f"hierarchies: {sorted(hierarchies)}."
         )
     return next(iter(hierarchies))
-
-
 
 
 def _select_block_axis(shape: list[Any], strides: list[Any]) -> int:
@@ -1327,7 +2079,9 @@ def _contiguous_strides(shape: list[Any]) -> list[dict[str, Any]]:
     return strides
 
 
-def _split_linear_expression(split_axes: list[int], hierarchy: list[int], coord_prefix: str = "shard_coord") -> str:
+def _split_linear_expression(
+    split_axes: list[int], hierarchy: list[int], coord_prefix: str = "shard_coord"
+) -> str:
     if not split_axes:
         return "0"
     terms = []
@@ -1363,18 +2117,8 @@ def _helper_parameters(
     )
 
 
-
-
-
-
-
-
 def _is_bool_dtype(dtype: Any) -> bool:
     return str(dtype) == "bool"
-
-
-
-
 
 
 def _constant_dim_value(value: Any) -> int | None:
@@ -1480,10 +2224,13 @@ def _region_copy_tle_plan(model: dict[str, Any]) -> dict[str, Any] | None:
     fixed_extents = tuple(_constant_dim_value(extent) for extent in extents)
     if any(extent is None or extent <= 0 for extent in fixed_extents):
         return None
-    if not _is_compact_region(logical_extents, model["SourceStrides"]):
+    if not _is_compact_region(
+        logical_extents, model[f"{local_model_name}Strides"]
+    ):
         return None
-    if not _is_compact_region(logical_extents, model["DestinationStrides"]):
-        return None
+    global_is_compact = _is_compact_region(
+        logical_extents, model[f"{global_model_name}Strides"]
+    )
     scalar_capacity = math.prod(int(extent) for extent in fixed_extents)
 
     local_pointer = model[local_model_name]
@@ -1491,7 +2238,11 @@ def _region_copy_tle_plan(model: dict[str, Any]) -> dict[str, Any] | None:
     local_buffer = _local_buffer(local_pointer)
     if local_buffer is None:
         return None
-    if int(local_pointer.get("AddressSpace", 1)) != 3 or int(global_pointer.get("AddressSpace", 1)) != 1:
+    _validate_local_buffer_descriptor(local_buffer)
+    if (
+        int(local_pointer.get("AddressSpace", 1)) != 3
+        or int(global_pointer.get("AddressSpace", 1)) != 1
+    ):
         return None
 
     descriptor_shape = tuple(
@@ -1506,10 +2257,7 @@ def _region_copy_tle_plan(model: dict[str, Any]) -> dict[str, Any] | None:
     if (
         scalar_capacity <= 0
         or not descriptor_shape
-        or any(
-            extent <= 0 or extent & (extent - 1) != 0
-            for extent in descriptor_shape
-        )
+        or any(extent <= 0 or extent & (extent - 1) != 0 for extent in descriptor_shape)
         or math.prod(descriptor_shape) != scalar_capacity
         or not _local_base_is_zero(local_buffer)
         or scalar_element_size <= 0
@@ -1518,15 +2266,30 @@ def _region_copy_tle_plan(model: dict[str, Any]) -> dict[str, Any] | None:
         return None
 
     lane_shape = tuple(int(value) for value in model.get("VectorLaneShape", ()))
-    global_origins = tuple(
-        _dim(value) for value in copy_plan[f"{global_model_name}Origins"]
-    )
-    global_access = _tensor_access(
-        global_origins,
-        model[f"{global_model_name}Strides"],
-        ("0",) * len(lane_shape),
-        lane_shape,
-    )
+    global_origins = copy_plan[f"{global_model_name}Origins"]
+    if global_is_compact:
+        global_access = _tensor_access(
+            tuple(_dim(value) for value in global_origins),
+            model[f"{global_model_name}Strides"],
+            ("0",) * len(lane_shape),
+            lane_shape,
+        )
+    else:
+        if descriptor_shape != tuple(int(extent) for extent in fixed_extents):
+            return None
+        coordinate_shape = _shape_tuple(list(descriptor_shape))
+        global_access = _tensor_access(
+            tuple(
+                _add_coordinate(global_origins[axis], f"copy_desc_idx{axis}")
+                for axis in range(rank)
+            ),
+            model[f"{global_model_name}Strides"],
+            tuple(
+                f"copy_desc_idx{rank + axis}" for axis in range(len(lane_shape))
+            ),
+            lane_shape,
+            coordinate_shape,
+        )
     return {
         "local_name": local_name,
         "local_model_name": local_model_name,
@@ -1536,6 +2299,7 @@ def _region_copy_tle_plan(model: dict[str, Any]) -> dict[str, Any] | None:
         "descriptor_shape": descriptor_shape,
         "scalar_capacity": scalar_capacity,
         "global_base_scalar_offset": global_access["ScalarOffset"],
+        "global_is_compact": global_is_compact,
     }
 
 
@@ -1547,6 +2311,20 @@ def _tensor_region_copy_template_context(model: dict[str, Any]) -> dict[str, Any
         raise ValueError("TensorRegionCopy source and destination ranks must match")
     copy_plan, extents = _region_copy_plan(model)
     plan = _region_copy_tle_plan(model)
+    is_async = model.get("IsAsync", False)
+    if not isinstance(is_async, bool):
+        raise ValueError("TensorRegionCopy IsAsync must be a boolean")
+    if is_async and (plan is None or plan["local_model_name"] != "Destination"):
+        function_name = str(model.get("FunctionName", "<unnamed>"))
+        operation = str(model.get("OperationKind", "<unknown>"))
+        comment = str(model.get("Comment", ""))
+        context = f" ({comment})" if comment else ""
+        raise ValueError(
+            f"TensorRegionCopy {function_name!r} {operation}{context} requested "
+            "IsAsync=True, but no legal global-to-shared tle.gpu.copy plan exists. "
+            "Async copies require a fixed-size, compact region that covers the "
+            "whole destination descriptor exactly."
+        )
     zero_fill_descriptor = None
     if model.get("OperationKind") == "TileLoad":
         destination_buffer = _local_buffer(model["Destination"])
@@ -1558,13 +2336,10 @@ def _tensor_region_copy_template_context(model: dict[str, Any]) -> dict[str, Any
             descriptor_shape = tuple(
                 int(value)
                 for value in (
-                    _local_buffer_value(destination_buffer, "DescriptorShape")
-                    or ()
+                    _local_buffer_value(destination_buffer, "DescriptorShape") or ()
                 )
             )
-            fixed_extents = tuple(
-                _constant_dim_value(extent) for extent in extents
-            )
+            fixed_extents = tuple(_constant_dim_value(extent) for extent in extents)
             fills_descriptor = (
                 copy_plan["CoversWholeDestination"] is True
                 and descriptor_shape
@@ -1597,9 +2372,7 @@ def _tensor_region_copy_template_context(model: dict[str, Any]) -> dict[str, Any
     )
     if plan is None:
         non_unit_axes = tuple(
-            axis
-            for axis, extent in enumerate(extents)
-            if _max_value(extent) != 1
+            axis for axis, extent in enumerate(extents) if _max_value(extent) != 1
         )
         inner_axis = non_unit_axes[-1] if non_unit_axes else len(extents) - 1
         local_buffers = tuple(
@@ -1613,6 +2386,7 @@ def _tensor_region_copy_template_context(model: dict[str, Any]) -> dict[str, Any
         if local_buffers:
             local_coordinate_shapes = []
             for buffer in local_buffers:
+                _validate_local_buffer_descriptor(buffer)
                 logical_shape = _local_buffer_value(buffer, "LogicalShape")
                 vector_lane_shape = _local_buffer_value(buffer, "VectorLaneShape")
                 if not isinstance(logical_shape, list) or not isinstance(
@@ -1635,9 +2409,7 @@ def _tensor_region_copy_template_context(model: dict[str, Any]) -> dict[str, Any
                 local_coordinate_shapes.append(coordinate_shape)
             structured_widths = []
             for axis, extent in enumerate(extents):
-                local_capacity = min(
-                    shape[axis] for shape in local_coordinate_shapes
-                )
+                local_capacity = min(shape[axis] for shape in local_coordinate_shapes)
                 extent_capacity = _max_value(extent)
                 capacity = (
                     local_capacity
@@ -1645,23 +2417,6 @@ def _tensor_region_copy_template_context(model: dict[str, Any]) -> dict[str, Any
                     else min(local_capacity, extent_capacity)
                 )
                 structured_widths.append(1 << (capacity - 1).bit_length())
-            required_elements = math.prod(structured_widths)
-            for buffer in local_buffers:
-                descriptor_shape = _local_buffer_value(buffer, "DescriptorShape")
-                if not isinstance(descriptor_shape, list) or any(
-                    not isinstance(value, int) or value <= 0
-                    for value in descriptor_shape
-                ):
-                    raise ValueError(
-                        "TensorRegionCopy local buffer requires a positive static "
-                        "DescriptorShape."
-                    )
-                if math.prod(descriptor_shape) < required_elements:
-                    raise ValueError(
-                        "TensorRegionCopy local descriptor cannot contain its "
-                        f"structured region: descriptor={descriptor_shape}, "
-                        f"required_elements={required_elements}."
-                    )
             coordinate_expressions = tuple(
                 f"copy_idx{axis}" for axis in range(len(extents))
             )
@@ -1675,8 +2430,7 @@ def _tensor_region_copy_template_context(model: dict[str, Any]) -> dict[str, Any
             inner_width = "block_size"
             coordinate_shape = f"({inner_width},)"
             coordinate_expressions = tuple(
-                f"copy_idx{axis}"
-                for axis in range(len(extents))
+                f"copy_idx{axis}" for axis in range(len(extents))
             )
         lane_shape = tuple(int(value) for value in model.get("VectorLaneShape", ()))
 
@@ -1710,11 +2464,11 @@ def _tensor_region_copy_template_context(model: dict[str, Any]) -> dict[str, Any
         return context
 
     descriptor_shape = plan["descriptor_shape"]
-    local_descriptor = _local_buffer_value(
-        plan["local_buffer"], "DescriptorExpression"
-    )
+    local_descriptor = _local_buffer_value(plan["local_buffer"], "DescriptorExpression")
     if not local_descriptor:
-        raise ValueError("TensorRegionCopy local buffer is missing DescriptorExpression")
+        raise ValueError(
+            "TensorRegionCopy local buffer is missing DescriptorExpression"
+        )
     expanded_indices = []
     for axis, extent in enumerate(descriptor_shape):
         if len(descriptor_shape) == 1:
@@ -1738,16 +2492,21 @@ def _tensor_region_copy_template_context(model: dict[str, Any]) -> dict[str, Any
             term = f"{term} * {inner_stride}"
         linear_terms.append(term)
     global_base = str(plan["global_base_scalar_offset"])
-    global_offset = (
-        "copy_linear"
-        if global_base == "0"
-        else f"({global_base}) + copy_linear"
-    )
+    if plan["global_is_compact"]:
+        global_offset = (
+            "copy_linear"
+            if global_base == "0"
+            else f"({global_base}) + copy_linear"
+        )
+        linear_expression = " + ".join(linear_terms)
+    else:
+        global_offset = global_base
+        linear_expression = None
     context.update(
         copy_shape=f"[{', '.join(str(extent) for extent in descriptor_shape)}]",
         expanded_indices=tuple(expanded_indices),
         global_offset=global_offset,
-        linear_expression=" + ".join(linear_terms),
+        linear_expression=linear_expression,
         local_descriptor=local_descriptor,
     )
     return context
@@ -1788,9 +2547,7 @@ def _tensor_copy_template_context(
     )
     global_coordinates = tuple(
         _add_coordinate(offset, coordinate)
-        for offset, coordinate in zip(
-            model["GlobalOffsets"], ctx["tensor_coordinates"]
-        )
+        for offset, coordinate in zip(model["GlobalOffsets"], ctx["tensor_coordinates"])
     )
     global_access = _tensor_access(
         global_coordinates,
@@ -1811,9 +2568,13 @@ def _tensor_copy_template_context(
     internal_source = model.get("Source") if is_load else None
     internal_destination = model.get("Destination") if not is_load else None
     if is_load:
-        source_access = global_access if internal_source is not None else add_external_base(
-            global_access,
-            f"source_pool_stride_elements * shard_index + {model['SourceOffset']}",
+        source_access = (
+            global_access
+            if internal_source is not None
+            else add_external_base(
+                global_access,
+                f"source_pool_stride_elements * shard_index + {model['SourceOffset']}",
+            )
         )
         destination_access = local_access
     else:
@@ -1854,7 +2615,9 @@ def _logical_strides(strides: list[Any], lane_count: int) -> list[Any]:
     return result
 
 
-def _validate_coordinate_lane_shape(lane_shape: list[int], context: str) -> tuple[int, ...]:
+def _validate_coordinate_lane_shape(
+    lane_shape: list[int], context: str
+) -> tuple[int, ...]:
     lanes = tuple(int(value) for value in lane_shape)
     if any(value <= 0 or value & (value - 1) for value in lanes):
         raise ValueError(
@@ -1899,7 +2662,9 @@ def _coordinate_iteration_context(
     if tensor_shape:
         major_axis = _select_block_axis(tensor_shape, tensor_strides)
         major_extent = tensor_shape[major_axis]
-        loop_axes = tuple(axis for axis in range(len(tensor_shape)) if axis != major_axis)
+        loop_axes = tuple(
+            axis for axis in range(len(tensor_shape)) if axis != major_axis
+        )
         tensor_coordinates = tuple(
             f"raw_coord{axis}" for axis in range(len(tensor_shape))
         )
@@ -1920,7 +2685,9 @@ def _coordinate_iteration_context(
         )
     else:
         logical_shape = _local_buffer_value(local_buffer, "LogicalShape")
-        if not isinstance(logical_shape, list) or len(logical_shape) < len(tensor_shape):
+        if not isinstance(logical_shape, list) or len(logical_shape) < len(
+            tensor_shape
+        ):
             raise ValueError(
                 f"{context} local logical shape must contain the iteration rank: "
                 f"logical={logical_shape}, iteration_rank={len(tensor_shape)}."
@@ -1968,12 +2735,8 @@ def _coordinate_iteration_context(
             )
         major_width = str(major_capacity)
 
-    lane_coordinates = tuple(
-        f"raw_lane_coord{axis}" for axis in range(len(lanes))
-    )
-    block_lane_coordinates = tuple(
-        f"lane_coord{axis}" for axis in range(len(lanes))
-    )
+    lane_coordinates = tuple(f"raw_lane_coord{axis}" for axis in range(len(lanes)))
+    block_lane_coordinates = tuple(f"lane_coord{axis}" for axis in range(len(lanes)))
     tile_extents = (major_width,) + tuple(str(value) for value in lanes)
     tile_shape = f"({', '.join(tile_extents)}{',' if len(tile_extents) == 1 else ''})"
     major_reshape = "" if not lanes else "[:, " + ", ".join("None" for _ in lanes) + "]"
@@ -2045,9 +2808,7 @@ def _broadcast_physical_access(
 def _memcopy_template_context(model: dict[str, Any]) -> dict[str, Any]:
     """Prepare a coordinate-native copy over the destination buffer domain."""
 
-    lanes = _validate_coordinate_lane_shape(
-        model["VectorLaneShape"], "PyNTT Memcopy"
-    )
+    lanes = _validate_coordinate_lane_shape(model["VectorLaneShape"], "PyNTT Memcopy")
     lane_count = _product_int(list(lanes)) if lanes else 1
     if lane_count != int(model["VectorLaneCount"]):
         raise ValueError(
@@ -2170,7 +2931,9 @@ def _elementwise_cast_template_context(model: dict[str, Any]) -> dict[str, Any]:
         domain_lane_shape = [lane_ratio]
         if smaller_lane_count != 1:
             domain_lane_shape.append(smaller_lane_count)
-    domain_pointer = model["Input"] if input_lane_count == common_lane_count else model["Output"]
+    domain_pointer = (
+        model["Input"] if input_lane_count == common_lane_count else model["Output"]
+    )
     ctx = _coordinate_iteration_context(
         domain_shape,
         domain_strides,
@@ -2178,15 +2941,15 @@ def _elementwise_cast_template_context(model: dict[str, Any]) -> dict[str, Any]:
         domain_pointer=domain_pointer,
     )
     domain_lane_coordinates = ctx["lane_coordinates"]
-    common_lane_index = _flatten_coordinates(
-        domain_lane_coordinates, ctx["lane_shape"]
-    )
+    common_lane_index = _flatten_coordinates(domain_lane_coordinates, ctx["lane_shape"])
     prefix_index = domain_lane_coordinates[0] if lane_ratio != 1 else "zero_coord"
     smaller_lane_index = (
         domain_lane_coordinates[-1] if smaller_lane_count != 1 else "zero_coord"
     )
 
-    def operand_access(prefix: str, lane_count: int, lane_shape: tuple[int, ...]) -> dict[str, Any]:
+    def operand_access(
+        prefix: str, lane_count: int, lane_shape: tuple[int, ...]
+    ) -> dict[str, Any]:
         tensor_coordinates = list(ctx["tensor_coordinates"])
         if lane_count != common_lane_count:
             tensor_coordinates[vectorized_axis] = (
@@ -2244,9 +3007,7 @@ def _where_operand_access(
             and output_lane_count != 1
             and output_axis == len(output_shape) - 1
         ):
-            coordinate = (
-                f"({coordinate}) * {output_lane_count} + {output_lane_index}"
-            )
+            coordinate = f"({coordinate}) * {output_lane_count} + {output_lane_index}"
         tensor_coordinates.append("zero_coord" if _is_fixed_one(extent) else coordinate)
     lane_coordinates = ctx["lane_coordinates"] if lanes else ()
     return _tensor_access(
@@ -2452,6 +3213,7 @@ def _transpose_template_context(model: dict[str, Any]) -> dict[str, Any]:
     )
     return ctx
 
+
 def _aligned_batch_coordinates(
     operand_shape: list[Any], trailing_rank: int, output_batch_rank: int
 ) -> tuple[str, ...]:
@@ -2509,9 +3271,7 @@ def _structured_axis_tile(
     physical_position = leading_rank
     rank = leading_rank + 1 + len(lanes) + trailing_rank
     physical_coordinate = f"{name}_physical"
-    lane_coordinates = tuple(
-        f"{name}_lane{axis}" for axis in range(len(lanes))
-    )
+    lane_coordinates = tuple(f"{name}_lane{axis}" for axis in range(len(lanes)))
     lane_terms: list[str] = []
     lane_stride = lane_count
     for coordinate, extent in zip(lane_coordinates, lanes):
@@ -2568,8 +3328,8 @@ def _structured_value_shape(
             f"PyNTT {axis['name']} leading value rank mismatch: "
             f"expected={axis['physical_position']}, got={len(leading_extents)}."
         )
-    expected_trailing = axis["rank"] - axis["physical_position"] - 1 - len(
-        axis["lane_shape"]
+    expected_trailing = (
+        axis["rank"] - axis["physical_position"] - 1 - len(axis["lane_shape"])
     )
     if len(trailing_extents) != expected_trailing:
         raise ValueError(
@@ -2855,41 +3615,52 @@ def _qkv_parallel_linear_template_context(
             lower = prefix.lower()
             block_n = int(model[f"Reduction{prefix}BlockN"])
             n = output_shapes[prefix][-1]
-            n_axis = _structured_axis_tile(
+            output_n_axis = _structured_axis_tile(
                 f"{lower}_n",
                 _qkv_packed_lane_shape(model, packed=packed),
                 block_n,
                 n,
                 leading_rank=0 if block_m == 1 else 1,
             )
-            bias_structured_shape = _structured_value_shape(n_axis)
+            bias_n_axis = None
             bias_access = None
             if model[f"Has{prefix}Bias"]:
+                # Bias is an N-only value.  Its coordinate rank must not inherit
+                # the leading M dimension required by a block-M output tile.
+                bias_n_axis = _structured_axis_tile(
+                    f"{lower}_bias_n",
+                    _qkv_packed_lane_shape(model, packed=packed),
+                    block_n,
+                    n,
+                )
+                bias_structured_shape = _structured_value_shape(bias_n_axis)
                 bias_access = _qkv_bias_access(
                     model,
                     prefix,
                     packed=packed,
-                    n_axis=n_axis,
+                    n_axis=bias_n_axis,
                     coordinate_shape=_coordinate_shape(bias_structured_shape),
                 )
             if block_m == 1:
-                output_structured_shape = bias_structured_shape
+                output_structured_shape = _structured_value_shape(output_n_axis)
                 output_access = _qkv_output_access(
                     model,
                     prefix,
                     packed=packed,
                     output_batch_rank=0,
                     m_expr="0",
-                    n_axis=n_axis,
+                    n_axis=output_n_axis,
                     coordinate_shape=_coordinate_shape(output_structured_shape),
                 )
-                output_mask = f"{n_axis['logical_coordinate']} < {_dim(n)}"
+                output_mask = (
+                    f"{output_n_axis['logical_coordinate']} < {_dim(n)}"
+                )
             else:
                 m_coordinate = _broadcast_axis_coordinate(
-                    "offs_m", n_axis["rank"], 0
+                    "offs_m", output_n_axis["rank"], 0
                 )
                 output_structured_shape = _structured_value_shape(
-                    n_axis, leading_extents=(block_m,)
+                    output_n_axis, leading_extents=(block_m,)
                 )
                 output_access = _qkv_output_access(
                     model,
@@ -2897,22 +3668,23 @@ def _qkv_parallel_linear_template_context(
                     packed=packed,
                     output_batch_rank=0,
                     m_expr=m_coordinate,
-                    n_axis=n_axis,
+                    n_axis=output_n_axis,
                     coordinate_shape=_coordinate_shape(output_structured_shape),
                 )
                 output_mask = (
                     f"({m_coordinate} < {_dim(output_shapes[prefix][-2])}) & "
-                    f"({n_axis['logical_coordinate']} < {_dim(n)})"
+                    f"({output_n_axis['logical_coordinate']} < {_dim(n)})"
                 )
             projections.append(
                 {
                     "accumulator": accumulator,
                     "bias_access": bias_access,
+                    "bias_n_axis": bias_n_axis,
                     "block_n": block_n,
                     "has_bias": model[f"Has{prefix}Bias"],
                     "lower": lower,
                     "n": n,
-                    "n_axis": n_axis,
+                    "n_axis": output_n_axis,
                     "output_mask": output_mask,
                     "output_access": output_access,
                     "output_structured_shape": output_structured_shape,
@@ -2948,16 +3720,12 @@ def _qkv_parallel_linear_template_context(
         )
         use_large_n = k_max is not None and k_max <= block_k and n_max >= 4096
         block_n = 128 if use_large_n else 32
-        n_stages = 2 if use_large_n else 1
     else:
         block_m = 16
         block_n = (
-            model["NPackedLaneCount"] * model["NVectorLaneCount"]
-            if packed
-            else 64
+            model["NPackedLaneCount"] * model["NVectorLaneCount"] if packed else 64
         )
         block_k = 64
-        n_stages = 5
     projections = []
     for prefix in ("Q", "K", "V"):
         lower = prefix.lower()
@@ -3130,22 +3898,16 @@ def _qkv_parallel_linear_template_context(
         block_n=block_n,
         dot_precision=(
             ', input_precision="ieee"'
-            if model["InputDType"] == "float32"
-            and model["WeightDType"] == "float32"
+            if model["InputDType"] == "float32" and model["WeightDType"] == "float32"
             else ""
         ),
         k=k,
         logical_output_shapes=logical_output_shapes,
         m=m,
-        n_stages=n_stages,
         projections=tuple(projections),
         use_gemv=use_gemv,
     )
     return context
-
-
-
-
 
 
 def _qkv_reduction_logical_output_shape(
@@ -3162,40 +3924,17 @@ def _qkv_reduction_logical_output_shape(
     return shape
 
 
-
-
-
-
 def _packed_qkv_logical_output_shape(model: dict[str, Any], prefix: str) -> list[Any]:
     scalar_lane_count = model["NPackedLaneCount"] * model["NVectorLaneCount"]
-    shape = [dict(dim) if isinstance(dim, dict) else dim for dim in model[f"{prefix}OutputShape"]]
+    shape = [
+        dict(dim) if isinstance(dim, dict) else dim
+        for dim in model[f"{prefix}OutputShape"]
+    ]
     shape[-1] = _multiply_dim(shape[-1], scalar_lane_count)
     return shape
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-def _matmul_glu_lane_shape(
-    model: dict[str, Any], *, packed: bool
-) -> tuple[int, ...]:
+def _matmul_glu_lane_shape(model: dict[str, Any], *, packed: bool) -> tuple[int, ...]:
     return (
         (int(model["NPackedLaneCount"]), int(model["NVectorLaneCount"]))
         if packed
@@ -3336,14 +4075,9 @@ def _matmul_glu_template_context(
             input_access = _matmul_glu_input_access(
                 model, 0, input_m, "offs_k", input_coordinate_shape
             )
-            input_mask = (
-                f"({input_m} < {_dim(input_m_limit)}) & "
-                f"(offs_k < {_dim(k)})"
-            )
+            input_mask = f"({input_m} < {_dim(input_m_limit)}) & (offs_k < {_dim(k)})"
         else:
-            input_m, input_m_limit = _matmul_glu_input_m_index(
-                model, "offs_m[:, None]"
-            )
+            input_m, input_m_limit = _matmul_glu_input_m_index(model, "offs_m[:, None]")
             input_access = _matmul_glu_input_access(
                 model, 0, input_m, "offs_k[None, :]", input_coordinate_shape
             )
@@ -3444,7 +4178,9 @@ def _matmul_glu_template_context(
             ),
             n_axis=n_axis,
             projections=tuple(projections),
-            weight_matrix_shape=(block_n, block_k) if block_m == 1 else (block_k, block_n),
+            weight_matrix_shape=(block_n, block_k)
+            if block_m == 1
+            else (block_k, block_n),
         )
         return context
 
@@ -3459,7 +4195,11 @@ def _matmul_glu_template_context(
             n,
             leading_rank=0 if block_m == 1 else 1,
         )
-        bias_structured_shape = _structured_value_shape(n_axis)
+        # Bias is N-only.  For a block-M output tile the leading coordinate
+        # dimension is a broadcast dimension, not a semantic bias axis.
+        bias_structured_shape = _structured_value_shape(
+            n_axis, leading_extents=() if block_m == 1 else (1,)
+        )
         output_structured_shape = _structured_value_shape(
             n_axis, leading_extents=() if block_m == 1 else (block_m,)
         )
@@ -3541,7 +4281,6 @@ def _matmul_glu_template_context(
         n_max = _max_value(n) or 0
         use_large_n = k_max is not None and k_max <= block_k and n_max >= 4096
         block_n = 128 if use_large_n else 32
-        n_stages = 2 if use_large_n else 1
         input_m, input_m_limit = _matmul_glu_input_m_index(model, "m_idx")
         input_access = _matmul_glu_input_access(
             model,
@@ -3550,14 +4289,10 @@ def _matmul_glu_template_context(
             "offs_k",
             _coordinate_shape((block_k,)),
         )
-        input_mask = (
-            f"(m_idx < {_dim(input_m_limit)}) & (offs_k < {_dim(k)})"
-        )
+        input_mask = f"(m_idx < {_dim(input_m_limit)}) & (offs_k < {_dim(k)})"
     else:
-        block_m, block_n, block_k, n_stages = 16, 64, 64, 5
-        input_m, input_m_limit = _matmul_glu_input_m_index(
-            model, "offs_m[:, None]"
-        )
+        block_m, block_n, block_k = 16, 64, 64
+        input_m, input_m_limit = _matmul_glu_input_m_index(model, "offs_m[:, None]")
         input_access = _matmul_glu_input_access(
             model,
             output_batch_rank,
@@ -3688,8 +4423,7 @@ def _matmul_glu_template_context(
         block_n=block_n,
         dot_precision=(
             ', input_precision="ieee"'
-            if model["InputDType"] == "float32"
-            and model["WeightDType"] == "float32"
+            if model["InputDType"] == "float32" and model["WeightDType"] == "float32"
             else ""
         ),
         input_mask=input_mask,
@@ -3697,7 +4431,6 @@ def _matmul_glu_template_context(
         k=k,
         m=m,
         n=n,
-        n_stages=n_stages,
         output_n_axis=output_n_axis,
         output_mask=(
             f"{output_n_axis['logical_coordinate']} < {_dim(n)}"
@@ -3720,20 +4453,14 @@ def _matmul_glu_template_context(
     return context
 
 
-
-
-
-
-
-
-
-
-
-
 def _matmul_glu_logical_output_shape(model: dict[str, Any]) -> list[Any]:
-    shape = [dict(dim) if isinstance(dim, dict) else dim for dim in model["OutputShape"]]
+    shape = [
+        dict(dim) if isinstance(dim, dict) else dim for dim in model["OutputShape"]
+    ]
     if model.get("PackedN"):
-        shape[-1] = _multiply_dim(shape[-1], model["NPackedLaneCount"] * model["NVectorLaneCount"])
+        shape[-1] = _multiply_dim(
+            shape[-1], model["NPackedLaneCount"] * model["NVectorLaneCount"]
+        )
     return shape
 
 
@@ -3741,7 +4468,9 @@ def _matmul_glu_input_m_index(model: dict[str, Any], m_expr: str) -> tuple[str, 
     return m_expr, model["InputShape"][-2]
 
 
-def _matmul_glu_weight_k_index(model: dict[str, Any], prefix: str, k_expr: str, *, packed: bool) -> tuple[str, Any]:
+def _matmul_glu_weight_k_index(
+    model: dict[str, Any], prefix: str, k_expr: str, *, packed: bool
+) -> tuple[str, Any]:
     weight_shape = model[f"{prefix}WeightShape"]
     weight_axis = -1 if packed else -2
     return k_expr, weight_shape[weight_axis]
@@ -3799,9 +4528,7 @@ def _matmul_lhs_access(
     batch_coordinates = _aligned_batch_coordinates(
         model["LhsShape"], 2, output_batch_rank
     )
-    matrix_coordinates = (
-        (k_expr, m_expr) if model["TransposeA"] else (m_expr, k_expr)
-    )
+    matrix_coordinates = (k_expr, m_expr) if model["TransposeA"] else (m_expr, k_expr)
     return _tensor_access(
         batch_coordinates + matrix_coordinates,
         model["LhsStrides"],
@@ -3845,8 +4572,20 @@ def _matmul_output_access(
     m_expr: str,
     n_axis: dict[str, Any],
     coordinate_shape: str,
+    *,
+    lane_shape_override: tuple[int, ...] | None = None,
 ) -> dict[str, Any]:
-    lane_shape = _matmul_n_lane_shape(model, "Output")
+    logical_lane_shape = _matmul_n_lane_shape(model, "Output")
+    lane_shape = (
+        tuple(logical_lane_shape)
+        if lane_shape_override is None
+        else tuple(lane_shape_override)
+    )
+    if _product_int(list(lane_shape)) != _product_int(list(logical_lane_shape)):
+        raise ValueError(
+            "PyNTT Matmul output access lane override must preserve the "
+            f"scalar lane count: output={logical_lane_shape}, override={lane_shape}."
+        )
     if tuple(lane_shape) != tuple(n_axis["lane_shape"]):
         raise ValueError(
             "PyNTT Matmul output lane shape does not match its N tile: "
@@ -3864,9 +4603,138 @@ def _matmul_output_access(
     )
 
 
-def _matmul_template_context(
-    model: dict[str, Any], *, gemv: bool
+def _is_positive_power_of_two(value: int) -> bool:
+    return value > 0 and value & (value - 1) == 0
+
+
+def _simt_gemv_encoding_plan(
+    *,
+    function_name: str,
+    value_shape: tuple[int, ...],
+    reduction_axis: int,
+    block_k: int,
+    block_n: int,
+    num_warps: int,
+    worker_width: int,
+    order: tuple[int, ...],
 ) -> dict[str, Any]:
+    """Derive the backend-owned warp/lane layout for one SIMT GEMV tile."""
+
+    rank = len(value_shape)
+    if rank < 2:
+        raise ValueError(
+            f"SIMT GEMV explicit encoding requires rank >= 2, got {value_shape}."
+        )
+    if reduction_axis < 0 or reduction_axis >= rank:
+        raise ValueError(
+            "SIMT GEMV explicit encoding has an invalid reduction axis "
+            f"{reduction_axis} for shape {value_shape}."
+        )
+    if not function_name.isidentifier():
+        raise ValueError(
+            f"SIMT GEMV helper name must be a Python identifier, got {function_name!r}."
+        )
+    if sorted(order) != list(range(rank)):
+        raise ValueError(
+            f"SIMT GEMV encoding order must permute rank {rank}, got {order}."
+        )
+    if any(not _is_positive_power_of_two(extent) for extent in value_shape):
+        raise ValueError(
+            "SIMT GEMV explicit encoding requires power-of-two physical tile "
+            f"extents, got {value_shape}."
+        )
+    if value_shape[reduction_axis] != block_k:
+        raise ValueError(
+            "SIMT GEMV reduction extent must equal block K, got "
+            f"shape[{reduction_axis}]={value_shape[reduction_axis]} and K={block_k}."
+        )
+
+    n_axes = tuple(axis for axis in range(rank) if axis != reduction_axis)
+    physical_n = math.prod(value_shape[axis] for axis in n_axes)
+    if physical_n != block_n:
+        raise ValueError(
+            "SIMT GEMV non-reduction extents must equal block N, got "
+            f"shape={value_shape}, N={block_n}."
+        )
+    if not _is_positive_power_of_two(num_warps):
+        raise ValueError(
+            f"SIMT GEMV requires a power-of-two NumWarps, got {num_warps}."
+        )
+    if not _is_positive_power_of_two(worker_width):
+        raise ValueError(
+            "SIMT GEMV requires a power-of-two target worker width, got "
+            f"{worker_width}."
+        )
+
+    threads_per_warp = [1] * rank
+    warps_per_cta = [1] * rank
+    k_threads = min(worker_width, block_k)
+    threads_per_warp[reduction_axis] = k_threads
+
+    def distribute_parallel_factor(
+        factor: int,
+        destination: list[int],
+    ) -> None:
+        remaining = factor
+        for axis in n_axes:
+            occupied = threads_per_warp[axis] * warps_per_cta[axis]
+            capacity = max(1, value_shape[axis] // occupied)
+            assigned = min(remaining, capacity)
+            destination[axis] *= assigned
+            remaining //= assigned
+            if remaining == 1:
+                return
+
+        # A blocked encoding may deliberately over-distribute a short N tile;
+        # Triton predicates duplicate workers. Keep that over-distribution on
+        # the innermost N axis and never place warps on the reduction axis.
+        destination[n_axes[-1]] *= remaining
+
+    distribute_parallel_factor(worker_width // k_threads, threads_per_warp)
+    distribute_parallel_factor(num_warps, warps_per_cta)
+
+    if math.prod(threads_per_warp) != worker_width:
+        raise ValueError(
+            "SIMT GEMV thread layout does not cover one target worker: "
+            f"{threads_per_warp} vs width {worker_width}."
+        )
+    if math.prod(warps_per_cta) != num_warps:
+        raise ValueError(
+            "SIMT GEMV warp layout does not cover the launch: "
+            f"{warps_per_cta} vs {num_warps} warps."
+        )
+    if warps_per_cta[reduction_axis] != 1:
+        raise ValueError("SIMT GEMV K reduction must remain warp-local.")
+
+    size_per_thread = []
+    for extent, threads, warps in zip(
+        value_shape, threads_per_warp, warps_per_cta
+    ):
+        parallel = threads * warps
+        size_per_thread.append(max(1, (extent + parallel - 1) // parallel))
+
+    value_encoding_name = f"{function_name}__simt_value_encoding"
+    return {
+        "value_shape": value_shape,
+        "accumulator_shape": tuple(
+            extent
+            for axis, extent in enumerate(value_shape)
+            if axis != reduction_axis
+        ),
+        "reduction_axis": reduction_axis,
+        "size_per_thread": tuple(size_per_thread),
+        "threads_per_warp": tuple(threads_per_warp),
+        "warps_per_cta": tuple(warps_per_cta),
+        "order": order,
+        "value_encoding_name": value_encoding_name,
+        "accumulator_encoding_name": f"{function_name}__simt_accumulator_encoding",
+        "lhs_expansion": "["
+        + ", ".join(":" if axis == reduction_axis else "None" for axis in range(rank))
+        + "]",
+    }
+
+
+def _matmul_template_context(model: dict[str, Any], *, gemv: bool) -> dict[str, Any]:
     """Prepare Matmul/Gemv dimensions and addresses for Jinja-owned kernels."""
 
     reduction_phase = str(model.get("ReductionPhase", "complete")).lower()
@@ -3876,8 +4744,7 @@ def _matmul_template_context(
         gemv = bool(model.get("Gemv", gemv))
 
     output_lane_count = (
-        model.get("OutputNPackedLaneCount", 1)
-        * model["OutputNVectorLaneCount"]
+        model.get("OutputNPackedLaneCount", 1) * model["OutputNVectorLaneCount"]
     )
     logical_output_shape = [
         dict(value) if isinstance(value, dict) else value
@@ -3939,26 +4806,67 @@ def _matmul_template_context(
                 f"Unsupported Matmul block microkernel {family}/{variant}."
             )
         contract_version = microkernel_parameter("contract_version")
-        if contract_version != 3:
+        if contract_version != TRITON_BLOCK_MICROKERNEL_CONTRACT_VERSION:
             raise ValueError(
-                f"Unsupported Matmul microkernel contract version {contract_version}."
+                "Unsupported Matmul microkernel contract version "
+                f"{contract_version}; expected "
+                f"{TRITON_BLOCK_MICROKERNEL_CONTRACT_VERSION}."
             )
-
+        if reduction_phase == "accumulate":
+            _require_staged_matrix_weight(model)
     if reduction_phase == "finalize":
         block_m = int(model["ReductionBlockM"])
         block_n = int(model["ReductionBlockN"])
-        selected_simt = (
-            context["microkernel_variant"] == "register_simt_accumulator"
-        )
-        if selected_simt and not gemv:
-            raise ValueError(
-                "The register SIMT Matmul output layout contract currently "
-                "requires GEMV."
-        )
+        selected_simt = context["microkernel_variant"] == "register_simt_accumulator"
         n = logical_output_shape[-1]
+        output_store = (
+            _simt_output_store_plan(
+                model["Output"],
+                str(model["OutputDType"]),
+                str(model["OutputTritonDType"]),
+                block_m * block_n,
+            )
+            if selected_simt and gemv
+            else {"kind": "indexed"}
+        )
+        output_lane_shape = _matmul_n_lane_shape(model, "Output")
+        output_axis_lane_shape = output_lane_shape
+        simt_encoding = None
+        simt_output_direct = False
+        if selected_simt and gemv and output_store["kind"] == "indexed":
+            block_k = microkernel_parameter("state_block_k")
+            output_lane_count = _product_int(list(output_lane_shape))
+            if output_lane_count > 1:
+                if block_n % output_lane_count != 0:
+                    raise ValueError(
+                        "A grouped SIMT packed output requires block N to be an "
+                        f"integer multiple of its lane width, got N={block_n}, "
+                        f"lanes={output_lane_count}."
+                    )
+                group_count = block_n // output_lane_count
+                target_worker_width = int(model.get("TargetWorkerWidth", 0))
+                if target_worker_width <= 0:
+                    raise ValueError(
+                        "A SIMT GEMV finalize helper requires a positive "
+                        "TargetWorkerWidth backend launch contract."
+                    )
+                simt_encoding = _simt_gemv_encoding_plan(
+                    function_name=str(model["FunctionName"]),
+                    value_shape=(group_count, block_k) + output_lane_shape,
+                    reduction_axis=1,
+                    block_k=block_k,
+                    block_n=block_n,
+                    num_warps=int(model.get("NumWarps", 0)),
+                    worker_width=target_worker_width,
+                    order=tuple(
+                        range(1 + len(output_lane_shape), -1, -1)
+                    ),
+                )
+                output_axis_lane_shape = output_lane_shape
+                simt_output_direct = True
         output_n_axis = _structured_axis_tile(
             "output_n",
-            _matmul_n_lane_shape(model, "Output"),
+            output_axis_lane_shape,
             block_n,
             n,
             leading_rank=0 if gemv else 1,
@@ -3978,6 +4886,7 @@ def _matmul_template_context(
             m_expression,
             output_n_axis,
             _coordinate_shape(output_structured_shape),
+            lane_shape_override=tuple(output_axis_lane_shape),
         )
         output_mask = (
             f"{output_n_axis['logical_coordinate']} < {_dim(n)}"
@@ -3988,6 +4897,14 @@ def _matmul_template_context(
         output_scalar_offset = _access_scalar_offset(output_access)
         if gemv:
             output_scalar_offset = f"tl.reshape(({output_scalar_offset}), ({block_n},))"
+        if simt_output_direct and tuple(output_structured_shape) != tuple(
+            simt_encoding["accumulator_shape"]
+        ):
+            raise ValueError(
+                "The grouped SIMT output view must match its accumulator: "
+                f"output={output_structured_shape}, "
+                f"accumulator={simt_encoding['accumulator_shape']}."
+            )
         context.update(
             block_m=block_m,
             block_n=block_n,
@@ -3995,41 +4912,24 @@ def _matmul_template_context(
             n=n,
             output_n_axis=output_n_axis,
             selected_simt=selected_simt,
-            output_store=(
-                _simt_output_store_plan(
-                    model["Output"],
-                    str(model["OutputDType"]),
-                    str(model["OutputTritonDType"]),
-                    block_m * block_n,
-                )
-                if selected_simt
-                else {"kind": "indexed"}
-            ),
+            output_store=output_store,
             output_mask=output_mask,
             output_access=output_access,
             output_scalar_offset=output_scalar_offset,
             output_structured_shape=output_structured_shape,
+            simt_encoding=simt_encoding,
+            simt_output_direct=simt_output_direct,
         )
         return context
 
-    rhs_lane_count = (
-        model.get("RhsNPackedLaneCount", 1) * model["RhsNVectorLaneCount"]
-    )
+    rhs_lane_count = model.get("RhsNPackedLaneCount", 1) * model["RhsNVectorLaneCount"]
     m = logical_output_shape[-2]
     n = logical_output_shape[-1]
-    lhs_m = (
-        model["LhsShape"][-1] if model["TransposeA"] else model["LhsShape"][-2]
-    )
-    lhs_k = (
-        model["LhsShape"][-2] if model["TransposeA"] else model["LhsShape"][-1]
-    )
-    rhs_k = (
-        model["RhsShape"][-1] if model["TransposeB"] else model["RhsShape"][-2]
-    )
+    lhs_m = model["LhsShape"][-1] if model["TransposeA"] else model["LhsShape"][-2]
+    lhs_k = model["LhsShape"][-2] if model["TransposeA"] else model["LhsShape"][-1]
+    rhs_k = model["RhsShape"][-1] if model["TransposeB"] else model["RhsShape"][-2]
     rhs_n = _multiply_dim(
-        model["RhsShape"][-2]
-        if model["TransposeB"]
-        else model["RhsShape"][-1],
+        model["RhsShape"][-2] if model["TransposeB"] else model["RhsShape"][-1],
         rhs_lane_count,
     )
     context.update(m=m, n=n, lhs_m=lhs_m, lhs_k=lhs_k, rhs_k=rhs_k, rhs_n=rhs_n)
@@ -4057,10 +4957,7 @@ def _matmul_template_context(
         selected_simt = context["microkernel_variant"] == "register_simt_accumulator"
         selected_inner_k = microkernel_parameter("inner_k")
         if selected_simt:
-            if (
-                selected_inner_k != block_k
-                or selected_inner_k & (selected_inner_k - 1)
-            ):
+            if selected_inner_k != block_k or selected_inner_k & (selected_inner_k - 1):
                 raise ValueError(
                     "The SIMT GEMV reduction primitive must cover the complete "
                     "power-of-two block K, got "
@@ -4092,6 +4989,11 @@ def _matmul_template_context(
                 f"num_warps={num_warps}, "
                 f"lhs={model['LhsDType']}, rhs={model['RhsDType']}."
             )
+        if selected_mma and selected_inner_k != mma_k:
+            raise ValueError(
+                "The selected MMA GEMV inner K fragment must match the target "
+                f"primitive, got inner_k={selected_inner_k}, mma_k={mma_k}."
+            )
         gemv_use_dot = selected_mma and (
             block_k >= mma_k
             and block_k % mma_k == 0
@@ -4109,8 +5011,9 @@ def _matmul_template_context(
         # Triton propagates a coalesced consumer encoding. Packed-N and
         # non-transposed RHS buffers are N-contiguous; scalar transposed RHS
         # buffers are K-contiguous.
-        simt_k_first = selected_simt and (
-            not bool(model["TransposeB"]) or rhs_lane_count > 1
+        simt_k_first = (
+            selected_simt
+            and (not bool(model["TransposeB"]) or rhs_lane_count > 1)
         )
         rhs_n_axis = _structured_axis_tile(
             "rhs_n",
@@ -4125,7 +5028,13 @@ def _matmul_template_context(
             rhs_n_axis["rank"],
             0 if (not gemv or simt_k_first) else rhs_n_axis["rank"] - 1,
         )
-        access_k = block_k
+        # The selected microkernel contract distinguishes the complete TIR
+        # reduction state tile from one backend fragment. SIMT consumes the
+        # complete state block in one invocation; MMA iterates over exact
+        # primitive-width K fragments in the Jinja template. Access shapes and
+        # masks must describe that fragment, otherwise Triton materializes a
+        # block-K-wide synthetic M pad and exhausts the register file.
+        access_k = selected_inner_k if selected_mma else block_k
         lhs_coordinate_shape = _coordinate_shape(
             (access_k,) if gemv else (block_m, access_k)
         )
@@ -4149,15 +5058,15 @@ def _matmul_template_context(
                 (
                     (rhs_n_axis["logical_coordinate"], n, block_n),
                     (rhs_n_axis["logical_coordinate"], rhs_n, block_n),
-                    (rhs_k_coordinate, lhs_k, block_k),
-                    (rhs_k_coordinate, rhs_k, block_k),
+                    (rhs_k_coordinate, lhs_k, access_k),
+                    (rhs_k_coordinate, rhs_k, access_k),
                 )
             )
             lhs_mask = _tile_bounds_mask(
                 (
                     ("0", m, 1),
                     ("0", lhs_m, 1),
-                    ("offs_k", lhs_k, block_k),
+                    ("offs_k", lhs_k, access_k),
                 )
             )
         else:
@@ -4177,8 +5086,8 @@ def _matmul_template_context(
             )
             rhs_mask = _tile_bounds_mask(
                 (
-                    (rhs_k_coordinate, lhs_k, block_k),
-                    (rhs_k_coordinate, rhs_k, block_k),
+                    (rhs_k_coordinate, lhs_k, access_k),
+                    (rhs_k_coordinate, rhs_k, access_k),
                     (rhs_n_axis["logical_coordinate"], n, block_n),
                     (rhs_n_axis["logical_coordinate"], rhs_n, block_n),
                 )
@@ -4187,24 +5096,32 @@ def _matmul_template_context(
                 (
                     ("offs_m[:, None]", m, block_m),
                     ("offs_m[:, None]", lhs_m, block_m),
-                    ("offs_k[None, :]", lhs_k, block_k),
+                    ("offs_k[None, :]", lhs_k, access_k),
                 )
             )
         lhs_direct_load = None
         rhs_direct_load = None
-        rhs_simt_direct_pointer = None
-        rhs_simt_direct_mask = None
+        rhs_full_local_pointer = None
+        rhs_full_local_mask = None
         rhs_simt_group_count = 0
-        rhs_simt_group_width = 0
+        rhs_simt_lane_shape: tuple[int, ...] = ()
         lhs_simt_mask = lhs_mask
         rhs_simt_mask = rhs_mask
+        simt_encoding = None
         if gemv and selected_simt:
-            rhs_simt_direct_pointer = _direct_simt_packed_rhs_pointer(
+            rhs_simt_lane_shape = _matmul_n_lane_shape(model, "Rhs")
+            rhs_full_local_pointer = _full_local_simt_packed_rhs_pointer(
                 model["Rhs"],
                 block_k,
                 block_n,
+                rhs_simt_lane_shape,
             )
-            if rhs_simt_direct_pointer is not None:
+            if rhs_lane_count > 1 and rhs_full_local_pointer is None:
+                raise ValueError(
+                    "A grouped SIMT packed RHS requires an exact K-major "
+                    "block-local descriptor."
+                )
+            if rhs_full_local_pointer is not None:
                 if rhs_lane_count <= 1 or block_n % rhs_lane_count != 0:
                     raise ValueError(
                         "A grouped SIMT packed RHS requires block N to be an "
@@ -4212,24 +5129,81 @@ def _matmul_template_context(
                         f"lanes={rhs_lane_count}."
                     )
                 rhs_simt_group_count = block_n // rhs_lane_count
-                rhs_simt_group_width = rhs_lane_count
-                grouped_n = (
-                    f"(tl.arange(0, {rhs_simt_group_count})[None, :, None] * "
-                    f"{rhs_lane_count} + tl.arange(0, {rhs_lane_count})[None, None, :])"
-                )
-                rhs_simt_direct_mask = _tile_bounds_mask(
+                rank = 2 + len(rhs_simt_lane_shape)
+
+                def broadcast_simt_index(expression: str, axis: int) -> str:
+                    indices = ["None"] * rank
+                    indices[axis] = ":"
+                    return f"{expression}[{', '.join(indices)}]"
+
+                grouped_n_terms = [
+                    f"({broadcast_simt_index(f'tl.arange(0, {rhs_simt_group_count})', 0)}) * {rhs_lane_count}"
+                ]
+                lane_stride = rhs_lane_count
+                for axis, lane in enumerate(rhs_simt_lane_shape):
+                    lane_stride //= lane
+                    coordinate = broadcast_simt_index(
+                        f"tl.arange(0, {lane})", axis + 2
+                    )
+                    grouped_n_terms.append(
+                        coordinate
+                        if lane_stride == 1
+                        else f"({coordinate}) * {lane_stride}"
+                    )
+                grouped_n = "(" + " + ".join(grouped_n_terms) + ")"
+                grouped_k = broadcast_simt_index("offs_k", 1)
+                rhs_full_local_mask = _tile_bounds_mask(
                     (
                         (grouped_n, n, block_n),
                         (grouped_n, rhs_n, block_n),
-                        ("offs_k[:, None, None]", lhs_k, block_k),
-                        ("offs_k[:, None, None]", rhs_k, block_k),
+                        (grouped_k, lhs_k, block_k),
+                        (grouped_k, rhs_k, block_k),
                     )
                 )
+        rhs_matrix_shape = (
+            (access_k, block_n)
+            if gemv and simt_k_first
+            else (
+                (block_n, access_k)
+                if gemv
+                else (access_k, block_n)
+            )
+        )
+        if selected_simt:
+            if not gemv:
+                raise ValueError(
+                    "The register SIMT accumulator is only valid for GEMV."
+                )
+            target_worker_width = int(model.get("TargetWorkerWidth", 0))
+            if target_worker_width <= 0:
+                raise ValueError(
+                    "A SIMT GEMV helper requires a positive TargetWorkerWidth "
+                    "backend launch contract."
+                )
+            if rhs_full_local_pointer is not None:
+                simt_value_shape = (
+                    rhs_simt_group_count,
+                    block_k,
+                ) + rhs_simt_lane_shape
+                simt_reduction_axis = 1
+                simt_order = tuple(range(len(simt_value_shape) - 1, -1, -1))
+            else:
+                simt_value_shape = rhs_matrix_shape
+                simt_reduction_axis = 0 if simt_k_first else 1
+                simt_order = tuple(range(len(simt_value_shape) - 1, -1, -1))
+            simt_encoding = _simt_gemv_encoding_plan(
+                function_name=str(model["FunctionName"]),
+                value_shape=simt_value_shape,
+                reduction_axis=simt_reduction_axis,
+                block_k=block_k,
+                block_n=block_n,
+                num_warps=num_warps,
+                worker_width=target_worker_width,
+                order=simt_order,
+            )
         if not gemv:
             lhs_source_shape = (
-                (block_k, block_m)
-                if model["TransposeA"]
-                else (block_m, block_k)
+                (block_k, block_m) if model["TransposeA"] else (block_m, block_k)
             )
             lhs_direct_load = _direct_mma_shared_load(
                 model["Lhs"],
@@ -4237,9 +5211,7 @@ def _matmul_template_context(
                 transpose=bool(model["TransposeA"]),
             )
             rhs_is_packed = (
-                model.get("RhsNPackedLaneCount", 1)
-                * model["RhsNVectorLaneCount"]
-                > 1
+                model.get("RhsNPackedLaneCount", 1) * model["RhsNVectorLaneCount"] > 1
             )
             rhs_source_shape = (
                 (block_k, block_n)
@@ -4263,8 +5235,7 @@ def _matmul_template_context(
             simt_k_first=simt_k_first,
             dot_precision=(
                 ', input_precision="ieee"'
-                if model["LhsDType"] == "float32"
-                and model["RhsDType"] == "float32"
+                if model["LhsDType"] == "float32" and model["RhsDType"] == "float32"
                 else ""
             ),
             lhs_mask=lhs_mask,
@@ -4273,23 +5244,16 @@ def _matmul_template_context(
             lhs_direct_load=lhs_direct_load,
             rhs_mask=rhs_mask,
             rhs_simt_mask=rhs_simt_mask,
-            rhs_matrix_shape=(
-                (access_k, block_n)
-                if gemv and simt_k_first
-                else (
-                    ((block_n, access_k) if selected_simt else (block_n, block_k))
-                    if gemv
-                    else (block_k, block_n)
-                )
-            ),
+            rhs_matrix_shape=rhs_matrix_shape,
             rhs_n_axis=rhs_n_axis,
             rhs_access=rhs_access,
             rhs_direct_load=rhs_direct_load,
-            rhs_simt_direct_pointer=rhs_simt_direct_pointer,
-            rhs_simt_direct_mask=rhs_simt_direct_mask,
+            rhs_full_local_pointer=rhs_full_local_pointer,
+            rhs_full_local_mask=rhs_full_local_mask,
             rhs_simt_group_count=rhs_simt_group_count,
-            rhs_simt_group_width=rhs_simt_group_width,
+            rhs_simt_lane_shape=rhs_simt_lane_shape,
             rhs_structured_shape=rhs_structured_shape,
+            simt_encoding=simt_encoding,
         )
         return context
 
@@ -4298,7 +5262,9 @@ def _matmul_template_context(
     load_c_expression = str(model.get("LoadCExpression", "False")).strip() or "False"
     load_c = load_c_expression not in ("False", "false", "0")
     load_c_predicate = (
-        "True" if load_c_expression in ("True", "true", "1") else f"({load_c_expression})"
+        "True"
+        if load_c_expression in ("True", "true", "1")
+        else f"({load_c_expression})"
     )
     context.update(
         batch_axes=tuple(range(output_batch_rank)),
@@ -4317,21 +5283,9 @@ def _matmul_template_context(
     if gemv:
         block_k = 256
         k_max = _max_value(k)
-        n_min = _min_value(n) or 0
         n_max = _max_value(n) or 0
         use_large_n = k_max is not None and k_max <= block_k and n_max >= 4096
         block_n = 128 if use_large_n else 32
-        n_stages = (
-            2
-            if use_large_n
-            else (
-                3
-                if k_max is not None
-                and k_max <= block_k
-                and n_min >= block_n * 4
-                else 1
-            )
-        )
         rhs_n_axis = _structured_axis_tile(
             "rhs_n",
             rhs_lane_shape,
@@ -4365,7 +5319,6 @@ def _matmul_template_context(
                 "offs_k",
                 _coordinate_shape((block_k,)),
             ),
-            n_stages=n_stages,
             output_mask=f"{output_n_axis['logical_coordinate']} < {_dim(n)}",
             output_n_axis=output_n_axis,
             output_access=_matmul_output_access(
@@ -4413,9 +5366,7 @@ def _matmul_template_context(
             leading_rank=1,
             physical_base="n_start",
         )
-        rhs_k_coordinate = _broadcast_axis_coordinate(
-            "offs_k", rhs_n_axis["rank"], 0
-        )
+        rhs_k_coordinate = _broadcast_axis_coordinate("offs_k", rhs_n_axis["rank"], 0)
         output_m_coordinate = _broadcast_axis_coordinate(
             "offs_m", output_n_axis["rank"], 0
         )
@@ -4431,8 +5382,7 @@ def _matmul_template_context(
             block_n=block_n,
             dot_precision=(
                 ', input_precision="ieee"'
-                if model["LhsDType"] == "float32"
-                and model["RhsDType"] == "float32"
+                if model["LhsDType"] == "float32" and model["RhsDType"] == "float32"
                 else ""
             ),
             lhs_mask=(
@@ -4497,17 +5447,20 @@ def _reduce_template_context(model: dict[str, Any]) -> dict[str, Any]:
     }
     if phase == "finalize":
         track_element_count = bool(model.get("TrackReductionElementCount", False))
-        output_terms = [
-            f"out_idx{axis} * {_dim(model['OutputStrides'][axis])}"
-            for axis in range(len(output_shape))
-        ]
+        reduction_block_size = int(model["ReductionBlockSize"])
+        coordinate_shape = f"({reduction_block_size},)"
+        output_coordinates = tuple(
+            f"out_idx{axis}" for axis in range(len(output_shape))
+        )
         context.update(
-            block_size=int(model["ReductionBlockSize"]),
-            output_offset=" + ".join(output_terms) if output_terms else "lane * 0",
+            block_size=reduction_block_size,
+            output_access=_tensor_access(
+                output_coordinates,
+                model["OutputStrides"],
+                coordinate_shape=coordinate_shape,
+            ),
             state_parameters=(
-                ("acc", "reduced_element_count")
-                if track_element_count
-                else ("acc",)
+                ("acc", "reduced_element_count") if track_element_count else ("acc",)
             ),
             track_element_count=track_element_count,
         )
@@ -4515,38 +5468,39 @@ def _reduce_template_context(model: dict[str, Any]) -> dict[str, Any]:
 
     axis_set = set(model["Axes"])
     output_index = 0
-    input_terms = []
+    input_coordinates: list[str] = []
     for input_index in range(len(model["InputShape"])):
         if input_index in axis_set:
+            input_coordinates.append(f"reduce_idx{input_index}")
             if model["KeepDims"]:
                 output_index += 1
             continue
-        index = "lane" if phase == "complete" and output_index == _select_block_axis(
-            output_shape, model["OutputStrides"]
-        ) else f"out_idx{output_index}"
-        input_terms.append(
-            f"{index} * {_dim(model['InputStrides'][input_index])}"
+        index = (
+            "lane"
+            if phase == "complete"
+            and output_index == _select_block_axis(output_shape, model["OutputStrides"])
+            else f"out_idx{output_index}"
         )
+        input_coordinates.append(index)
         output_index += 1
-    input_base = "lane * 0" if not input_terms else " + ".join(input_terms)
-    if phase == "complete" and input_terms:
-        input_base = "lane * 0 + " + input_base
-    reduce_terms = [
-        f"reduce_idx{axis} * {_dim(model['InputStrides'][axis])}"
-        for axis in model["Axes"]
-    ]
-    reduce_offset = "lane * 0" if not reduce_terms else " + ".join(reduce_terms)
+    coordinate_shape = (
+        "(block_size,)"
+        if phase == "complete"
+        else f"({int(model['ReductionBlockSize'])},)"
+    )
+    input_access = _tensor_access(
+        input_coordinates,
+        model["InputStrides"],
+        coordinate_shape=coordinate_shape,
+    )
 
     if phase == "accumulate":
         track_element_count = bool(model.get("TrackReductionElementCount", False))
         context.update(
             block_size=int(model["ReductionBlockSize"]),
-            input_base=input_base,
-            reduce_offset=reduce_offset,
+            input_access=input_access,
             state_parameters=(
-                ("acc", "reduced_element_count")
-                if track_element_count
-                else ("acc",)
+                ("acc", "reduced_element_count") if track_element_count else ("acc",)
             ),
             tile_element_count=_product(
                 [model["InputShape"][axis] for axis in model["Axes"]]
@@ -4562,29 +5516,19 @@ def _reduce_template_context(model: dict[str, Any]) -> dict[str, Any]:
     def axis_index(axis: int) -> str:
         return "lane" if axis == block_axis else f"out_idx{axis}"
 
-    output_terms = [
-        f"{axis_index(axis)} * {_dim(model['OutputStrides'][axis])}"
-        for axis in range(rank)
-    ]
+    output_coordinates = tuple(axis_index(axis) for axis in range(rank))
     context.update(
         block_axis=block_axis,
         block_extent=block_extent,
-        input_base=input_base,
+        input_access=input_access,
         loop_axes=tuple(axis for axis in range(rank) if axis != block_axis),
-        output_offset=(
-            "lane * 0"
-            if not output_terms
-            else "lane * 0 + " + " + ".join(output_terms)
+        output_access=_tensor_access(
+            output_coordinates,
+            model["OutputStrides"],
+            coordinate_shape="(block_size,)",
         ),
-        reduce_offset=reduce_offset,
     )
     return context
-
-
-
-
-
-
 
 
 def _softmax_template_context(model: dict[str, Any]) -> dict[str, Any]:
@@ -4597,10 +5541,7 @@ def _softmax_template_context(model: dict[str, Any]) -> dict[str, Any]:
         return "lane" if axis == block_axis else f"idx{axis}"
 
     def offset(strides: list[Any]) -> str:
-        terms = [
-            f"{axis_index(axis)} * {_dim(strides[axis])}"
-            for axis in range(rank)
-        ]
+        terms = [f"{axis_index(axis)} * {_dim(strides[axis])}" for axis in range(rank)]
         return "lane * 0" if not terms else "lane * 0 + " + " + ".join(terms)
 
     slice_terms = [
@@ -4615,17 +5556,12 @@ def _softmax_template_context(model: dict[str, Any]) -> dict[str, Any]:
         "loop_axes": tuple(axis for axis in range(rank) if axis != block_axis),
         "output_offset": offset(model["OutputStrides"]),
         "slice_base": (
-            "lane * 0"
-            if not slice_terms
-            else "lane * 0 + " + " + ".join(slice_terms)
+            "lane * 0" if not slice_terms else "lane * 0 + " + " + ".join(slice_terms)
         ),
         "slice_offset": (
-            "slice_base + axis_pos * "
-            f"{_dim(model['InputStrides'][model['Axis']])}"
+            f"slice_base + axis_pos * {_dim(model['InputStrides'][model['Axis']])}"
         ),
     }
-
-
 
 
 def _layer_norm_template_context(model: dict[str, Any]) -> dict[str, Any]:
@@ -4735,8 +5671,6 @@ def _layer_norm_template_context(model: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-
-
 def _norm_stats_template_context(model: dict[str, Any]) -> dict[str, Any]:
     rank = len(model["InputShape"])
     axis = int(model["Axis"])
@@ -4770,8 +5704,7 @@ def _norm_stats_template_context(model: dict[str, Any]) -> dict[str, Any]:
 
     def stats_access(component: int) -> dict[str, Any]:
         coordinates = (str(component),) + tuple(
-            f"outer_idx{index}" if index < axis else "0"
-            for index in range(rank)
+            f"outer_idx{index}" if index < axis else "0" for index in range(rank)
         )
         return _tensor_access(coordinates, model["OutputStrides"])
 
@@ -4780,16 +5713,18 @@ def _norm_stats_template_context(model: dict[str, Any]) -> dict[str, Any]:
     for _ in range(1 + len(context["lane_shape"])):
         reduction = f"tl.sum({reduction}, axis=0)"
         square_reduction = f"tl.sum({square_reduction}, axis=0)"
-    context.update({
-        "logical_input_shape": _logical_shape(
-            model["InputShape"], model["InputVectorLaneCount"]
-        ),
-        "outer_axes": outer_axes,
-        "prefix_depth": len(outer_axes),
-        "reduction": reduction,
-        "square_reduction": square_reduction,
-        "stats_accesses": (stats_access(0), stats_access(1)),
-    })
+    context.update(
+        {
+            "logical_input_shape": _logical_shape(
+                model["InputShape"], model["InputVectorLaneCount"]
+            ),
+            "outer_axes": outer_axes,
+            "prefix_depth": len(outer_axes),
+            "reduction": reduction,
+            "square_reduction": square_reduction,
+            "stats_accesses": (stats_access(0), stats_access(1)),
+        }
+    )
     return context
 
 
@@ -4816,7 +5751,10 @@ def _norm_apply_template_context(model: dict[str, Any]) -> dict[str, Any]:
         tuple(model[f"{name}VectorLaneShape"])
         for name in ("Input", "Scale", "Bias", "Output")
     }
-    if len(vector_lanes) != 1 or context["lane_count"] != model["OutputVectorLaneCount"]:
+    if (
+        len(vector_lanes) != 1
+        or context["lane_count"] != model["OutputVectorLaneCount"]
+    ):
         raise ValueError(
             "PyNTT NormApply input/scale/bias/output vector lane shapes must match: "
             f"{sorted(vector_lanes)}"
@@ -4825,7 +5763,9 @@ def _norm_apply_template_context(model: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("PyNTT NormApply stats must have a scalar element type")
 
     inner_coordinates = tuple(context["tensor_coordinates"])
-    tensor_coordinates = tuple(f"outer_idx{index}" for index in outer_axes) + inner_coordinates
+    tensor_coordinates = (
+        tuple(f"outer_idx{index}" for index in outer_axes) + inner_coordinates
+    )
     context["input_access"] = _tensor_access(
         tensor_coordinates,
         model["InputStrides"],
@@ -4857,20 +5797,19 @@ def _norm_apply_template_context(model: dict[str, Any]) -> dict[str, Any]:
 
     def stats_access(component: int) -> dict[str, Any]:
         coordinates = (str(component),) + tuple(
-            f"outer_idx{index}" if index < axis else "0"
-            for index in range(rank)
+            f"outer_idx{index}" if index < axis else "0" for index in range(rank)
         )
         return _tensor_access(coordinates, model["StatsStrides"])
 
-    context.update({
-        "logical_output_shape": logical_output_shape,
-        "normalization_size": _product(
-            logical_input_global_shape[axis:]
-        ),
-        "outer_axes": outer_axes,
-        "prefix_depth": len(outer_axes),
-        "stats_accesses": (stats_access(0), stats_access(1)),
-    })
+    context.update(
+        {
+            "logical_output_shape": logical_output_shape,
+            "normalization_size": _product(logical_input_global_shape[axis:]),
+            "outer_axes": outer_axes,
+            "prefix_depth": len(outer_axes),
+            "stats_accesses": (stats_access(0), stats_access(1)),
+        }
+    )
     return context
 
 
@@ -4967,9 +5906,7 @@ def _rope_template_context(model: dict[str, Any]) -> dict[str, Any]:
             "PyNTT RoPE",
             model["Output"],
         )
-        output_rotary_extent = _constant_dim_value(
-            model["OutputShape"][rotary_axis]
-        )
+        output_rotary_extent = _constant_dim_value(model["OutputShape"][rotary_axis])
         if output_rotary_extent is None or output_rotary_extent % 2 != 0:
             raise ValueError(
                 "PyNTT RoPE aligned sin/cos lowering requires a static even "
@@ -4983,9 +5920,7 @@ def _rope_template_context(model: dict[str, Any]) -> dict[str, Any]:
             f"{half_physical_extent}, {output_physical_rotary} - "
             f"{half_physical_extent})"
         )
-        lane_flat = _flatten_coordinates(
-            context["lane_coordinates"], output_lane_shape
-        )
+        lane_flat = _flatten_coordinates(context["lane_coordinates"], output_lane_shape)
         logical_rotary = (
             f"({output_physical_rotary}) * {output_lane_count} + ({lane_flat})"
             if output_lane_count != 1
@@ -5055,19 +5990,14 @@ def _rope_template_context(model: dict[str, Any]) -> dict[str, Any]:
     )
     pack_coordinate = context["lane_coordinates"][0]
     vector_lane_coordinates = context["lane_coordinates"][1:]
-    lane_flat = _flatten_coordinates(
-        vector_lane_coordinates, output_lane_shape
-    )
-    output_physical_extent = _constant_dim_value(
-        model["OutputShape"][rotary_axis]
-    )
+    lane_flat = _flatten_coordinates(vector_lane_coordinates, output_lane_shape)
+    output_physical_extent = _constant_dim_value(model["OutputShape"][rotary_axis])
     sincos_physical_extent = _constant_dim_value(cos_shape[rotary_axis])
     if (
         output_physical_extent is None
         or output_physical_extent % 2 != 0
         or sincos_physical_extent is None
-        or sincos_physical_extent * sincos_pack_factor
-        != output_physical_extent
+        or sincos_physical_extent * sincos_pack_factor != output_physical_extent
     ):
         raise ValueError(
             "PyNTT RoPE packed sin/cos lowering requires a static even "
@@ -5099,9 +6029,7 @@ def _rope_template_context(model: dict[str, Any]) -> dict[str, Any]:
             context["lane_coordinates"],
             sincos_lane_shape,
         ),
-        first_half=(
-            f"{output_physical_rotary} < {half_output_physical_extent}"
-        ),
+        first_half=(f"{output_physical_rotary} < {half_output_physical_extent}"),
         input_access=operand_access(
             context,
             "Input",
@@ -5137,8 +6065,6 @@ def _rope_template_context(model: dict[str, Any]) -> dict[str, Any]:
         ),
     )
     return context
-
-
 
 
 def _gather_template_context(model: dict[str, Any]) -> dict[str, Any]:
@@ -5183,9 +6109,7 @@ def _gather_template_context(model: dict[str, Any]) -> dict[str, Any]:
         elif input_axis == model["Axis"]:
             coordinate = "local_gather_index"
         else:
-            coordinate = context["tensor_coordinates"][
-                input_axis + index_rank - 1
-            ]
+            coordinate = context["tensor_coordinates"][input_axis + index_rank - 1]
         input_coordinates.append(coordinate)
     input_access = _tensor_access(
         input_coordinates,
@@ -5243,9 +6167,7 @@ def _concat_template_context(model: dict[str, Any]) -> dict[str, Any]:
             index = axis_index(axis, block_axis)
             if axis == model["Axis"] and _fixed(axis_offset) != 0:
                 index = f"({index} + {_dim(axis_offset)})"
-            output_terms.append(
-                f"{index} * {_dim(model['OutputStrides'][axis])}"
-            )
+            output_terms.append(f"{index} * {_dim(model['OutputStrides'][axis])}")
         entries.append(
             {
                 "block_extent": _one() if not input_shape else input_shape[block_axis],
@@ -5276,8 +6198,6 @@ def _concat_template_context(model: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-
-
 def _scatter_nd_template_context(model: dict[str, Any]) -> dict[str, Any]:
     """Prepare ScatterND copy/scatter domains and index expressions."""
 
@@ -5289,9 +6209,7 @@ def _scatter_nd_template_context(model: dict[str, Any]) -> dict[str, Any]:
     if index_depth is None:
         raise RuntimeError("ScatterND index depth must be fixed in PyNTT renderer.")
     slice_rank = input_rank - index_depth
-    copy_block_axis = _select_block_axis(
-        model["OutputShape"], model["OutputStrides"]
-    )
+    copy_block_axis = _select_block_axis(model["OutputShape"], model["OutputStrides"])
     updates_block_axis = _select_block_axis(
         model["UpdatesShape"], model["UpdatesStrides"]
     )
@@ -5344,9 +6262,7 @@ def _scatter_nd_template_context(model: dict[str, Any]) -> dict[str, Any]:
             "copy", model["InputShape"], model["InputStrides"], copy_block_axis
         ),
         "copy_loop_axes": tuple(
-            axis
-            for axis in range(len(model["OutputShape"]))
-            if axis != copy_block_axis
+            axis for axis in range(len(model["OutputShape"])) if axis != copy_block_axis
         ),
         "copy_output_offset": offset(
             "copy", model["OutputShape"], model["OutputStrides"], copy_block_axis
@@ -5381,8 +6297,6 @@ def _scatter_nd_template_context(model: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-
-
 def _conv2d_template_context(model: dict[str, Any]) -> dict[str, Any]:
     """Validate Conv2D's fixed microkernel axes and prepare offsets."""
 
@@ -5404,15 +6318,9 @@ def _conv2d_template_context(model: dict[str, Any]) -> dict[str, Any]:
         return "lane" if axis == block_axis else f"idx{axis}"
 
     n, oc, oh, ow = (axis_index(axis) for axis in range(4))
-    group = (
-        "0"
-        if model["Groups"] == 1
-        else f"{oc} // {output_channels_per_group}"
-    )
+    group = "0" if model["Groups"] == 1 else f"{oc} // {output_channels_per_group}"
     input_channel = (
-        "ic"
-        if model["Groups"] == 1
-        else f"({group}) * {input_channels_per_group} + ic"
+        "ic" if model["Groups"] == 1 else f"({group}) * {input_channels_per_group} + ic"
     )
     ih = f"{oh} * {stride_h} + kh * {dilation_h} - {pad_top}"
     iw = f"{ow} * {stride_w} + kw * {dilation_w} - {pad_left}"
@@ -5448,13 +6356,13 @@ def _conv2d_template_context(model: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-
-
 def _reshard_template_context(model: dict[str, Any]) -> dict[str, Any]:
     """Validate Reshard placement and prepare its address expressions."""
 
     if model.get("Stage") != "tile_scatter":
-        raise ValueError(f"Unsupported PyNTT direct reshard stage: {model.get('Stage')}")
+        raise ValueError(
+            f"Unsupported PyNTT direct reshard stage: {model.get('Stage')}"
+        )
     input_split_mesh_axes = {
         axis for split_axes in model["InputSplitAxes"] for axis in split_axes
     }
@@ -5549,19 +6457,21 @@ def _reshard_template_context(model: dict[str, Any]) -> dict[str, Any]:
             "source_shard_index": source_shard_index,
             "zero": zero,
         }
-    context.update({
-        "destination_pool_index": destination_pool_index,
-        "destination_shard_index": destination_shard_index,
-        "input_partial_mesh_axes": tuple(sorted(input_partial_mesh_axes)),
-        "input_split_mesh_axes": tuple(sorted(input_split_mesh_axes)),
-        "output_broadcast_mesh_axes": output_broadcast_mesh_axes,
-        "output_pointer_type": _pointer_type(
-            model["TritonDType"], model["OutputAddress"]["AddressSpace"]
-        ),
-        "partial": partial,
-        "prefix_depth": len(output_broadcast_mesh_axes),
-        "writer_active": writer_active,
-    })
+    context.update(
+        {
+            "destination_pool_index": destination_pool_index,
+            "destination_shard_index": destination_shard_index,
+            "input_partial_mesh_axes": tuple(sorted(input_partial_mesh_axes)),
+            "input_split_mesh_axes": tuple(sorted(input_split_mesh_axes)),
+            "output_broadcast_mesh_axes": output_broadcast_mesh_axes,
+            "output_pointer_type": _pointer_type(
+                model["TritonDType"], model["OutputAddress"]["AddressSpace"]
+            ),
+            "partial": partial,
+            "prefix_depth": len(output_broadcast_mesh_axes),
+            "writer_active": writer_active,
+        }
+    )
     return context
 
 
@@ -5588,9 +6498,7 @@ def _summa_template_context(model: dict[str, Any]) -> dict[str, Any]:
             else 1,
             "global_extent": global_extent,
             "split_axes": tuple(split_axes),
-            "split_linear": _split_linear_expression(
-                split_axes, model["Hierarchy"]
-            )
+            "split_linear": _split_linear_expression(split_axes, model["Hierarchy"])
             if split_axes
             else "0",
         }
@@ -5624,9 +6532,8 @@ def _summa_template_context(model: dict[str, Any]) -> dict[str, Any]:
             f"rhs={rhs_lanes}, output={output_lanes}."
         )
     lane_count = _product_int(list(rhs_lanes)) if rhs_lanes else 1
-    if (
-        lane_count != int(model["RhsNVectorLaneCount"])
-        or lane_count != int(model["OutputNVectorLaneCount"])
+    if lane_count != int(model["RhsNVectorLaneCount"]) or lane_count != int(
+        model["OutputNVectorLaneCount"]
     ):
         raise ValueError(
             "PyNTT SUMMA N lane shape/count metadata is inconsistent: "
@@ -5645,26 +6552,16 @@ def _summa_template_context(model: dict[str, Any]) -> dict[str, Any]:
         leading_rank=1,
         physical_base="n_start",
     )
-    lane_index = _flatten_coordinates(
-        n_axis["lane_coordinates"], n_axis["lane_shape"]
-    )
+    lane_index = _flatten_coordinates(n_axis["lane_coordinates"], n_axis["lane_shape"])
     output_global_physical_n = model["OutputGlobalShape"][1]
-    output_global_logical_n = _multiply_dim(
-        output_global_physical_n, lane_count
-    )
-    rhs_global_logical_n = _multiply_dim(
-        model["RhsGlobalShape"][1], lane_count
-    )
+    output_global_logical_n = _multiply_dim(output_global_physical_n, lane_count)
+    rhs_global_logical_n = _multiply_dim(model["RhsGlobalShape"][1], lane_count)
     rhs_offset = "rhs_physical_offsets"
     output_offset = "output_physical_offsets"
     if lane_count != 1:
         rhs_offset = f"((rhs_physical_offsets) * {lane_count} + ({lane_index}))"
-        output_offset = (
-            f"((output_physical_offsets) * {lane_count} + ({lane_index}))"
-        )
-    broadcast_global_k = _broadcast_axis_coordinate(
-        "global_k", n_axis["rank"], 0
-    )
+        output_offset = f"((output_physical_offsets) * {lane_count} + ({lane_index}))"
+    broadcast_global_k = _broadcast_axis_coordinate("global_k", n_axis["rank"], 0)
     broadcast_offs_m = _broadcast_axis_coordinate("offs_m", n_axis["rank"], 0)
     global_n_logical = (
         f"({n_axis['logical_coordinate']}) + out_n_global_base * {lane_count}"
@@ -5675,8 +6572,7 @@ def _summa_template_context(model: dict[str, Any]) -> dict[str, Any]:
         "block_n": block_n,
         "dot_precision": (
             ', input_precision="ieee"'
-            if model["LhsDType"] == "float32"
-            and model["RhsDType"] == "float32"
+            if model["LhsDType"] == "float32" and model["RhsDType"] == "float32"
             else ""
         ),
         "full_source_shard_index": _split_linear_expression(
@@ -5708,9 +6604,7 @@ def _summa_template_context(model: dict[str, Any]) -> dict[str, Any]:
         "broadcast_global_k": broadcast_global_k,
         "broadcast_offs_m": broadcast_offs_m,
         "global_n_logical": global_n_logical,
-        "global_n_physical": (
-            f"out_n_global_base + {n_axis['physical_coordinate']}"
-        ),
+        "global_n_physical": (f"out_n_global_base + {n_axis['physical_coordinate']}"),
         "n_axis": n_axis,
         "output_global_logical_n": output_global_logical_n,
         "output_offset": output_offset,
@@ -5754,8 +6648,6 @@ def _summa_template_context(model: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-
-
 def _paged_attention_template_context(model: dict[str, Any]) -> dict[str, Any]:
     """Validate PagedAttention layouts and prepare coordinate-native accesses."""
 
@@ -5774,9 +6666,7 @@ def _paged_attention_template_context(model: dict[str, Any]) -> dict[str, Any]:
             f"attention={attention_block_size}, cache={cache_block_size}."
         )
 
-    def global_index_expression(
-        axis: int, local_index: str, global_extent: Any
-    ) -> str:
+    def global_index_expression(axis: int, local_index: str, global_extent: Any) -> str:
         split_axes = model["OutputSplitAxes"][axis]
         if not split_axes:
             return local_index
@@ -5789,8 +6679,7 @@ def _paged_attention_template_context(model: dict[str, Any]) -> dict[str, Any]:
 
     if cache["KeyVectorizedDim"] != 5:
         raise ValueError(
-            "PyNTT PagedAttention requires the key cache to be "
-            "HeadDim-vectorized."
+            "PyNTT PagedAttention requires the key cache to be HeadDim-vectorized."
         )
     if cache["ValueVectorizedDim"] not in (3, 5):
         raise ValueError(
@@ -5913,8 +6802,7 @@ def _paged_attention_template_context(model: dict[str, Any]) -> dict[str, Any]:
             f"({value_lane}))"
         )
         value_mask = (
-            "tl.reshape(context_mask, "
-            f"{value_axis['structured_shape']})[:, :, None]"
+            f"tl.reshape(context_mask, {value_axis['structured_shape']})[:, :, None]"
         )
         value_structured_shape = _structured_value_shape(
             value_axis, trailing_extents=(int(cache["HeadDim"]),)
@@ -6007,8 +6895,6 @@ def _paged_attention_template_context(model: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-
-
 def _update_paged_attention_kv_cache_template_context(
     model: dict[str, Any],
 ) -> dict[str, Any]:
@@ -6021,9 +6907,7 @@ def _update_paged_attention_kv_cache_template_context(
     slots_lane_shape = _validate_coordinate_lane_shape(
         model["SlotsVectorLaneShape"], "PyNTT UpdatePagedAttentionKVCache slots"
     )
-    slots_lane_count = (
-        _product_int(list(slots_lane_shape)) if slots_lane_shape else 1
-    )
+    slots_lane_count = _product_int(list(slots_lane_shape)) if slots_lane_shape else 1
     if slots_lane_count != int(model["SlotsVectorLaneCount"]):
         raise ValueError(
             "PyNTT UpdatePagedAttentionKVCache slot lane shape/count mismatch: "
@@ -6035,16 +6919,10 @@ def _update_paged_attention_kv_cache_template_context(
             f"cache={lane_count}, slots={slots_lane_count}."
         )
     source_split_axes = sorted(
-        {
-            axis
-            for split_axes in model["SlotsSourceSplitAxes"]
-            for axis in split_axes
-        }
+        {axis for split_axes in model["SlotsSourceSplitAxes"] for axis in split_axes}
     )
     topology_match_axes = tuple(
-        axis
-        for axis in cache["NumBlocksSplitAxes"]
-        if axis not in source_split_axes
+        axis for axis in cache["NumBlocksSplitAxes"] if axis not in source_split_axes
     )
     block_index = (
         "(topology_id * num_blocks_per_shard + block_id)"
@@ -6071,25 +6949,27 @@ def _update_paged_attention_kv_cache_template_context(
     source_lane_id = _flatten_coordinates(
         context["block_lane_coordinates"], context["lane_shape"]
     )
-    context.update({
-        "cache_offset": cache_offset,
-        "kind_prefix": kind_prefix,
-        "lane_count": lane_count,
-        "non_data_axes": tuple(
-            axis
-            for axis in range(len(model["SlotsGlobalShape"]))
-            if axis not in (model["SeqAxis"], model["HeadAxis"], model["DimAxis"])
-        ),
-        "slots_access": _tensor_access(
-            context["tensor_coordinates"],
-            model["SlotsStrides"],
-            context["lane_coordinates"],
-            context["lane_shape"],
-            context["tile_shape"],
-        ),
-        "slots_lane_count": slots_lane_count,
-        "source_lane_id": source_lane_id,
-        "topology_match_axes": topology_match_axes,
-        "vectorized_dim": vectorized_dim,
-    })
+    context.update(
+        {
+            "cache_offset": cache_offset,
+            "kind_prefix": kind_prefix,
+            "lane_count": lane_count,
+            "non_data_axes": tuple(
+                axis
+                for axis in range(len(model["SlotsGlobalShape"]))
+                if axis not in (model["SeqAxis"], model["HeadAxis"], model["DimAxis"])
+            ),
+            "slots_access": _tensor_access(
+                context["tensor_coordinates"],
+                model["SlotsStrides"],
+                context["lane_coordinates"],
+                context["lane_shape"],
+                context["tile_shape"],
+            ),
+            "slots_lane_count": slots_lane_count,
+            "source_lane_id": source_lane_id,
+            "topology_match_axes": topology_match_axes,
+            "vectorized_dim": vectorized_dim,
+        }
+    )
     return context

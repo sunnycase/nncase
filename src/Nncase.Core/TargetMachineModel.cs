@@ -77,6 +77,12 @@ public enum TargetMemoryTransferMode
     ExplicitCopy,
 }
 
+public enum TargetPrivateResourceUnit
+{
+    Bytes,
+    Register32,
+}
+
 /// <summary>
 /// Target options exposing one fully-resolved machine model.
 /// </summary>
@@ -113,11 +119,12 @@ public readonly record struct TargetPrivateResourceId(string Value)
     public override string ToString() => Value;
 }
 
-public enum TargetPrivateResourceUnit
-{
-    Bytes,
-    Register32,
-}
+/// <summary>
+/// Binds a physical target memory space to the existing TIR buffer representation.
+/// </summary>
+/// <param name="Location">TIR storage class.</param>
+/// <param name="Hierarchy">Storage level within that class.</param>
+public readonly record struct TIRMemorySpaceBinding(MemoryLocation Location, int Hierarchy = 0);
 
 /// <summary>
 /// A block-scoped resource owned by backend microkernel lowering.
@@ -168,13 +175,6 @@ public sealed record TargetPrivateResourceSpec
 
     public TargetMemoryResourceId? BackingMemoryResource { get; }
 }
-
-/// <summary>
-/// Binds a physical target memory space to the existing TIR buffer representation.
-/// </summary>
-/// <param name="Location">TIR storage class.</param>
-/// <param name="Hierarchy">Storage level within that class.</param>
-public readonly record struct TIRMemorySpaceBinding(MemoryLocation Location, int Hierarchy = 0);
 
 /// <summary>
 /// One physical memory space visible to a block.
@@ -319,6 +319,69 @@ public sealed record TargetMemorySpaceSpec
 }
 
 /// <summary>
+/// Target support for asynchronous transfers on one directed memory edge.
+/// This describes hardware/runtime transfer semantics and deliberately does
+/// not name a compiler or backend pipeline template.
+/// </summary>
+public sealed class TargetAsynchronousTransferSpec : IEquatable<TargetAsynchronousTransferSpec>
+{
+    public TargetAsynchronousTransferSpec(
+        IEnumerable<int> supportedStageCounts,
+        long commitCycles,
+        long waitCycles)
+    {
+        SupportedStageCounts = supportedStageCounts?.Distinct().Order().ToImmutableArray()
+            ?? throw new ArgumentNullException(nameof(supportedStageCounts));
+        if (SupportedStageCounts.IsDefaultOrEmpty || SupportedStageCounts.Any(count => count <= 1))
+        {
+            throw new ArgumentException("Asynchronous transfers must declare stage counts greater than one.", nameof(supportedStageCounts));
+        }
+
+        if (commitCycles < 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(commitCycles), commitCycles, "Asynchronous transfer commit cost must not be negative.");
+        }
+
+        if (waitCycles < 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(waitCycles), waitCycles, "Asynchronous transfer wait cost must not be negative.");
+        }
+
+        CommitCycles = commitCycles;
+        WaitCycles = waitCycles;
+    }
+
+    public ImmutableArray<int> SupportedStageCounts { get; }
+
+    public long CommitCycles { get; }
+
+    public long WaitCycles { get; }
+
+    public bool SupportsStageCount(int stageCount) => SupportedStageCounts.Contains(stageCount);
+
+    public bool Equals(TargetAsynchronousTransferSpec? other)
+        => other is not null
+        && SupportedStageCounts.SequenceEqual(other.SupportedStageCounts)
+        && CommitCycles == other.CommitCycles
+        && WaitCycles == other.WaitCycles;
+
+    public override bool Equals(object? obj) => obj is TargetAsynchronousTransferSpec other && Equals(other);
+
+    public override int GetHashCode()
+    {
+        HashCode hash = default;
+        hash.Add(CommitCycles);
+        hash.Add(WaitCycles);
+        foreach (var stageCount in SupportedStageCounts)
+        {
+            hash.Add(stageCount);
+        }
+
+        return hash.ToHashCode();
+    }
+}
+
+/// <summary>
 /// Directed transfer path between two physical memory spaces.
 /// </summary>
 public sealed record TargetMemoryTransferSpec(
@@ -327,7 +390,8 @@ public sealed record TargetMemoryTransferSpec(
     long BytesPerCycle,
     long LatencyCycles,
     TargetMemoryTransferMode Mode,
-    bool RequiresSynchronization = false);
+    bool RequiresSynchronization = false,
+    TargetAsynchronousTransferSpec? Asynchronous = null);
 
 /// <summary>
 /// Fixed execution resources for one block.
@@ -352,7 +416,10 @@ public sealed record MatrixComputePrimitiveSpec(
     int M,
     int N,
     int K,
-    double InstructionsPerCyclePerBlock,
+    double DependencyLatencyCycles,
+    double ReciprocalThroughputCyclesPerWorker,
+    double MaxInstructionsPerCyclePerBlock,
+    int CooperativeWorkers,
     ImmutableArray<DataType> SupportedOperandDataTypes,
     bool IsSupported = true)
 {
@@ -385,6 +452,47 @@ public sealed record BlockComputeSpec(
 public sealed record TargetSynchronizationSpec(long BlockCycles, long GridCycles);
 
 /// <summary>
+/// Target-cycle cost and visibility contract for one pipeline protocol.
+/// A consumer barrier is priced through <see cref="TargetSynchronizationSpec.BlockCycles"/>
+/// so the target keeps a single source of truth for CTA-barrier latency.
+/// </summary>
+public sealed record TargetPipelineControlCostSpec
+{
+    public TargetPipelineControlCostSpec(
+        long producerCommitCycles,
+        long consumerWaitAcquireCycles,
+        long consumerReleaseCycles)
+    {
+        if (producerCommitCycles < 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(producerCommitCycles), producerCommitCycles, "Pipeline producer-commit cost must not be negative.");
+        }
+
+        if (consumerWaitAcquireCycles < 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(consumerWaitAcquireCycles), consumerWaitAcquireCycles, "Pipeline consumer wait/acquire cost must not be negative.");
+        }
+
+        if (consumerReleaseCycles < 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(consumerReleaseCycles), consumerReleaseCycles, "Pipeline consumer-release cost must not be negative.");
+        }
+
+        ProducerCommitCycles = producerCommitCycles;
+        ConsumerWaitAcquireCycles = consumerWaitAcquireCycles;
+        ConsumerReleaseCycles = consumerReleaseCycles;
+    }
+
+    public long ProducerCommitCycles { get; }
+
+    public long ConsumerWaitAcquireCycles { get; }
+
+    public long ConsumerReleaseCycles { get; }
+
+    public static TargetPipelineControlCostSpec None { get; } = new(0, 0, 0);
+}
+
+/// <summary>
 /// Immutable, resolved hardware model shared by target cost models and AutoTiling.
 /// </summary>
 public sealed class TargetMachineModel
@@ -392,7 +500,6 @@ public sealed class TargetMachineModel
     private readonly ImmutableDictionary<TargetMemoryResourceId, TargetMemoryResourceSpec> _memoryResources;
     private readonly ImmutableDictionary<TargetPrivateResourceId, TargetPrivateResourceSpec> _privateResources;
     private readonly ImmutableDictionary<TargetMemorySpaceId, TargetMemorySpaceSpec> _memorySpaces;
-    private readonly ImmutableDictionary<MemoryLocation, TargetMemorySpaceId> _fixedBindings;
     private readonly ImmutableDictionary<(TargetMemorySpaceId Source, TargetMemorySpaceId Destination), TargetMemoryTransferSpec> _transfers;
 
     public TargetMachineModel(
@@ -404,15 +511,15 @@ public sealed class TargetMachineModel
         IEnumerable<TargetMemoryResourceSpec> memoryResources,
         IEnumerable<TargetMemorySpaceSpec> memorySpaces,
         TargetMemorySpaceId rootMemorySpace,
-        IEnumerable<TargetMemoryTransferSpec> transfers,
-        IReadOnlyDictionary<MemoryLocation, TargetMemorySpaceId> fixedBindings)
+        IEnumerable<TargetMemoryTransferSpec> transfers)
     {
         if (string.IsNullOrWhiteSpace(id))
         {
             throw new ArgumentException("Target machine identity must not be empty.", nameof(id));
         }
 
-        if (execution.ComputeUnitCount <= 0 || execution.WorkersPerBlock <= 0 || execution.WorkerWidth <= 0 || !double.IsFinite(execution.ClockRateGHz) || execution.ClockRateGHz <= 0)
+        if (execution.ComputeUnitCount <= 0 || execution.WorkersPerBlock <= 0 || execution.WorkerWidth <= 0 ||
+            !double.IsFinite(execution.ClockRateGHz) || execution.ClockRateGHz <= 0)
         {
             throw new ArgumentException("Target block execution resources must be positive.", nameof(execution));
         }
@@ -431,9 +538,15 @@ public sealed class TargetMachineModel
         foreach (var primitive in compute.MatrixPrimitives)
         {
             if (string.IsNullOrWhiteSpace(primitive.Name) || primitive.M <= 0 || primitive.N <= 0 || primitive.K <= 0 ||
-                !double.IsFinite(primitive.InstructionsPerCyclePerBlock) || primitive.InstructionsPerCyclePerBlock <= 0)
+                !double.IsFinite(primitive.DependencyLatencyCycles) || primitive.DependencyLatencyCycles <= 0 ||
+                !double.IsFinite(primitive.ReciprocalThroughputCyclesPerWorker) || primitive.ReciprocalThroughputCyclesPerWorker <= 0 ||
+                !double.IsFinite(primitive.MaxInstructionsPerCyclePerBlock) || primitive.MaxInstructionsPerCyclePerBlock <= 0 ||
+                primitive.CooperativeWorkers <= 0 ||
+                execution.WorkersPerBlock % primitive.CooperativeWorkers != 0)
             {
-                throw new ArgumentException("Target matrix primitives require a name, positive dimensions, and finite positive throughput.", nameof(compute));
+                throw new ArgumentException(
+                    "Target matrix primitives require a name, positive dimensions/timing, and a cooperative worker count that divides the block.",
+                    nameof(compute));
             }
 
             if (primitive.SupportedOperandDataTypes.IsDefaultOrEmpty)
@@ -545,6 +658,13 @@ public sealed class TargetMachineModel
             {
                 throw new ArgumentException($"Transfer {transfer.Source}->{transfer.Destination} has invalid bandwidth or latency.", nameof(transfers));
             }
+
+            if (transfer.Asynchronous is not null && transfer.Mode != TargetMemoryTransferMode.ExplicitCopy)
+            {
+                throw new ArgumentException(
+                    $"Asynchronous transfer {transfer.Source}->{transfer.Destination} must use explicit-copy semantics.",
+                    nameof(transfers));
+            }
         }
 
         var duplicateTransfer = Transfers
@@ -556,15 +676,6 @@ public sealed class TargetMachineModel
         }
 
         _transfers = Transfers.ToImmutableDictionary(transfer => (transfer.Source, transfer.Destination));
-
-        _fixedBindings = fixedBindings.ToImmutableDictionary();
-        foreach (var (location, memorySpace) in _fixedBindings)
-        {
-            if (!_memorySpaces.TryGetValue(memorySpace, out var space))
-            {
-                throw new ArgumentException($"TIR location {location} is bound to undeclared memory space {memorySpace}.", nameof(fixedBindings));
-            }
-        }
 
         TilingMemorySpaces = _memorySpaces.Values
             .Where(space => space.IsTilingCandidate)
@@ -663,11 +774,6 @@ public sealed class TargetMachineModel
         => _memorySpaces.TryGetValue(id, out var space)
             ? space
             : throw new KeyNotFoundException($"Target {Id} does not define memory space {id}.");
-
-    public TargetMemorySpaceSpec GetFixedMemorySpace(MemoryLocation location)
-        => _fixedBindings.TryGetValue(location, out var id)
-            ? GetMemorySpace(id)
-            : throw new KeyNotFoundException($"Target {Id} does not bind TIR memory location {location} to a physical memory space.");
 
     public TargetMemoryTransferSpec GetTransfer(TargetMemorySpaceId source, TargetMemorySpaceId destination)
         => _transfers.TryGetValue((source, destination), out var transfer)

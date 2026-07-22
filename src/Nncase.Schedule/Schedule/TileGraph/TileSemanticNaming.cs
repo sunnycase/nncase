@@ -4,6 +4,7 @@
 using System.Collections.Immutable;
 using System.Globalization;
 using System.Text;
+using Nncase.TIR;
 
 namespace Nncase.Schedule.TileGraph;
 
@@ -66,6 +67,31 @@ internal static class TileSemanticNaming
             "loop_",
             fusion.Operations,
             $"__{level}__{axisKind}_axis{axis.ToString(CultureInfo.InvariantCulture)}");
+    }
+
+    /// <summary>
+    /// Builds a stable identity for one loop-owned pipeline schedule.
+    /// </summary>
+    public static PipelineRegionId GetPipelineRegionId(
+        string owningScheduledFunctionId,
+        TileNode scope,
+        int loopEntry,
+        int domainAxis)
+    {
+        if (loopEntry <= 0 || domainAxis < 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(loopEntry),
+                $"Pipeline loop identity requires a positive entry and nonnegative axis, got entry{loopEntry}/axis{domainAxis}.");
+        }
+
+        var fusion = DescribeFusion(scope);
+        return new PipelineRegionId(
+            owningScheduledFunctionId,
+            ComposeSymbol(
+                "pipeline_",
+                fusion.Operations,
+                $"__entry{loopEntry.ToString(CultureInfo.InvariantCulture)}__axis{domainAxis.ToString(CultureInfo.InvariantCulture)}"));
     }
 
     public static string GetTileVariableName(

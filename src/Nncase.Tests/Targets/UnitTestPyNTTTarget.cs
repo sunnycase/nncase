@@ -3,6 +3,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.Collections.Immutable;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
@@ -11,6 +12,7 @@ using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using Nncase.CodeGen;
+using Nncase.CodeGen.PyNTT;
 using Nncase.Diagnostics;
 using Nncase.IR;
 using Nncase.IR.NN;
@@ -51,6 +53,21 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
     }
 
     [Fact]
+    [AutoSetupTestMethod(InitSession = false)]
+    public void TestPyNTTLaunchNumWarpsComesFromTargetExecutionCapability()
+    {
+        var execution = NTTTargetMachineCatalog
+            .Resolve(NTTTargetMachineCatalog.Rtx5060Ti16Gb)
+            .Execution with
+        {
+            WorkersPerBlock = 4,
+        };
+
+        Assert.Equal(4, PyNTTKernelSourceConvertVisitor.GetTargetLaunchNumWarps("test-gpu", execution));
+        Assert.Equal(128, execution.ThreadsPerBlock);
+    }
+
+    [Fact]
     public void TestCreatePyNTTModuleBuilder()
     {
         var moduleBuilder = CompileSession.Target.GetModuleCompiler(PyNTTTarget.Kind).CreateModuleBuilder(CompileOptions);
@@ -82,11 +99,48 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         var root = document.RootElement;
         Assert.Equal(PyNTTTarget.Kind, root.GetProperty("target_kind").GetString());
         Assert.Equal("triton", root.GetProperty("backend").GetString());
+        Assert.Equal(NTTTargetMachineCatalog.Rtx5060Ti16Gb, root.GetProperty("target_machine").GetString());
+        Assert.False(root.TryGetProperty("pipeline_policy", out _));
         var function = root.GetProperty("functions").EnumerateArray().Single();
         Assert.Equal("main", function.GetProperty("name").GetString());
         Assert.Equal("x", function.GetProperty("inputs").EnumerateArray().Single().GetProperty("name").GetString());
         Assert.Equal("float32", function.GetProperty("inputs").EnumerateArray().Single().GetProperty("dtype").GetString());
         Assert.Equal(1, function.GetProperty("outputs").EnumerateArray().Single().GetProperty("shape").EnumerateArray().Single().GetInt64());
+
+        var kernelParams = File.ReadAllText(Path.Join(outputDirectory, "kernel_params.json"));
+        using var kernelParamsDocument = JsonDocument.Parse(kernelParams);
+        var kernelParamsRoot = kernelParamsDocument.RootElement;
+        Assert.Equal(6, kernelParamsRoot.GetProperty("pyntt_codegen_manifest_version").GetInt32());
+        var renderKernel = kernelParamsRoot
+            .GetProperty("functions")
+            .EnumerateArray()
+            .SelectMany(generatedFunction => generatedFunction.GetProperty("render_kernels").EnumerateArray())
+            .Single();
+        var kernelMetadata = renderKernel.GetProperty("metadata");
+        var launch = kernelMetadata.GetProperty("launch");
+        var targetExecution = Assert.IsType<PyNTTTargetOptions>(CompileOptions.TargetOptions)
+            .TargetMachineModel.Execution;
+        Assert.Equal(targetExecution.WorkersPerBlock, launch.GetProperty("num_warps").GetInt32());
+        Assert.Equal(1, launch.GetProperty("num_stages").GetInt32());
+        Assert.Equal(
+            targetExecution.WorkerWidth,
+            kernelMetadata.GetProperty("attrs").GetProperty("target_worker_width").GetInt32());
+        Assert.Equal(
+            targetExecution.ThreadsPerBlock,
+            kernelMetadata.GetProperty("attrs").GetProperty("target_threads_per_block").GetInt32());
+        Assert.Equal(
+            targetExecution.ThreadsPerBlock,
+            launch.GetProperty("num_warps").GetInt32() * targetExecution.WorkerWidth);
+        Assert.Equal(
+            new long[] { targetExecution.WorkerWidth, 128, 256, 512, 1024 },
+            launch
+                .GetProperty("tuning")
+                .GetProperty("parameters")
+                .GetProperty("block_size")
+                .GetProperty("candidates")
+                .EnumerateArray()
+                .Select(candidate => candidate.GetInt64()));
+        Assert.Empty(renderKernel.GetProperty("pipeline_executions").EnumerateArray());
 
         var modelPy = File.ReadAllText(Path.Join(outputDirectory, "model.py"));
         Assert.Contains("PyNTTGeneratedModel", modelPy, StringComparison.Ordinal);
@@ -309,9 +363,22 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         Assert.DoesNotContain("full_tile", generatedKernels, StringComparison.Ordinal);
         Assert.DoesNotContain("tle.gpu.copy", generatedKernels, StringComparison.Ordinal);
         Assert.DoesNotContain("copy_shared", generatedKernels, StringComparison.Ordinal);
-        Assert.Contains("value = tl.load(source + copy_idx0, mask=mask)", generatedKernels, StringComparison.Ordinal);
-        Assert.Contains("tl.store(destination + copy_idx0, value, mask=mask)", generatedKernels, StringComparison.Ordinal);
-        Assert.Contains("tle.gpu.local_ptr(dynamic_tile_shared_buffer_0, (copy_idx0,))", generatedKernels, StringComparison.Ordinal);
+        Assert.Contains(
+            "value = tl.load(source + tl.broadcast_to(copy_idx0, (32,)), mask=mask)",
+            generatedKernels,
+            StringComparison.Ordinal);
+        Assert.Contains(
+            "tl.store(tle.gpu.local_ptr(dynamic_tile_shared_buffer_0, (copy_idx0,), shape=(32,)), value, mask=mask)",
+            generatedKernels,
+            StringComparison.Ordinal);
+        Assert.Contains(
+            "value = tl.load(tle.gpu.local_ptr(dynamic_tile_shared_buffer_0, (copy_idx0,), shape=(32,)), mask=mask)",
+            generatedKernels,
+            StringComparison.Ordinal);
+        Assert.Contains(
+            "tl.store(destination + tl.broadcast_to(copy_idx0, (32,)), value, mask=mask)",
+            generatedKernels,
+            StringComparison.Ordinal);
         AssertGeneratedModelRuns(
             outputDirectory,
             "for extent in (17, 32):",
@@ -439,6 +506,7 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
             .Body(
                 new TIR.Sequential(
                     TIR.T.TileLoad(sharedTile, inputDataBuffer),
+                    TIR.F.NTT.Barrier(TIR.NTT.BarrierScope.Block),
                     TIR.T.TileStore(sharedTile, resultBuffer)))
             .Build();
         var main = new TIR.PrimFunction(
@@ -446,7 +514,9 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
             PyNTTTarget.Kind,
             new TIR.Sequential(
                 TIR.F.NTT.TensorLoad(inputDataBuffer, inputBuffer, new[] { SBP.B, SBP.B, SBP.B }, placement),
+                TIR.F.NTT.Barrier(TIR.NTT.BarrierScope.Block),
                 sharedCopy,
+                TIR.F.NTT.Barrier(TIR.NTT.BarrierScope.Block),
                 TIR.F.NTT.TensorStore(resultBuffer, output, new[] { SBP.B, SBP.B, SBP.B }, placement)),
             new TIR.Return(new Expr[] { output }),
             new IVar[] { input, output })
@@ -469,6 +539,319 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
             "x = torch.arange(5 * 2 * 8, dtype=torch.float32, device='cuda').reshape(5, 2, 8)",
             "output = module(x)",
             "torch.testing.assert_close(output, x, rtol=0, atol=0)");
+    }
+
+    [Fact]
+    public void TestPyNTTRejectsUnboundStagedSharedDescriptorManifest()
+    {
+        var tensorType = new TensorType(DataTypes.Float32, new[] { 16 });
+        var input = new Var("x", tensorType);
+        var output = CreateOutputVar("output", tensorType);
+        var inputBuffer = TIR.T.AttachBuffer(input, tensorType, TIR.MemoryLocation.Input, 0, out _, "input_buffer");
+        var inputDataBuffer = CreateBuffer("input_data", DataTypes.Float32, TIR.MemoryLocation.Data, 0, [16], [1]);
+        var encoding = new TargetStorageEncodingSelection(
+            TargetStorageEncodingIds.Linear,
+            64,
+            4,
+            Array.Empty<KeyValuePair<string, long>>());
+        var stagedBuffer = new TIR.Buffer(
+            "staged_tile",
+            DataTypes.Float32,
+            new TIR.MemSpan(new TIR.PhysicalBuffer(4, 0, 128, TIR.MemoryLocation.Shared)),
+            [16],
+            [1],
+            null,
+            encoding,
+            encoding.CreateStagedBufferLayout(stageCount: 2, stageStrideBytes: 64));
+        var resultBuffer = CreateBuffer("result_data", DataTypes.Float32, TIR.MemoryLocation.Data, 64, [16], [1]);
+        var placement = new Placement(new[] { 1 }, "b", "b");
+        var stagedAllocationBuilder = TIR.T.Let(
+            out var stagedTile,
+            IR.F.Buffer.AllocateBufferView(stagedBuffer, new RankedShape(0)),
+            "staged_tile");
+        var slotCopy = TIR.T.Let(
+            out var slot,
+            CreatePipelineStageAlias(stagedBuffer, "staged_tile_stage_buffer", 0),
+            "staged_tile_stage")
+            .Body(
+                new TIR.Sequential(
+                    TIR.T.TileLoad(slot, inputDataBuffer),
+                    TIR.T.TileStore(slot, resultBuffer)))
+            .Build();
+        var stagedCopy = stagedAllocationBuilder
+            .Body(slotCopy)
+            .Build();
+        var main = new TIR.PrimFunction(
+            "main_prim",
+            PyNTTTarget.Kind,
+            new TIR.Sequential(
+                TIR.F.NTT.TensorLoad(inputDataBuffer, inputBuffer, new[] { SBP.B }, placement),
+                stagedCopy,
+                TIR.F.NTT.TensorStore(resultBuffer, output, new[] { SBP.B }, placement)),
+            new TIR.Return(new Expr[] { output }),
+            new IVar[] { input, output })
+        {
+            SchedResult =
+            {
+                DataUsage = 128,
+            },
+        };
+
+        var exception = Assert.Throws<NotSupportedException>(
+            () => GeneratePyNTTModelDirectory("generated_staged_shared_descriptor_model", main));
+        Assert.Contains("outside its TIR AllocateBufferView scope", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void TestPyNTTStructuredCpAsyncPipelineLowersExplicitN2Protocol()
+    {
+        var inputType = new TensorType(DataTypes.Float32, new[] { 24 });
+        var outputType = new TensorType(DataTypes.Float32, new[] { 1 });
+        var input = new Var("x", inputType);
+        var output = CreateOutputVar("output", outputType);
+        var inputBuffer = TIR.T.AttachBuffer(input, inputType, TIR.MemoryLocation.Input, 0, out _, "input_buffer");
+        var inputDataBuffer = CreateBuffer("input_data", DataTypes.Float32, TIR.MemoryLocation.Data, 0, [24], [1]);
+        var resultBuffer = CreateBuffer("result_data", DataTypes.Float32, TIR.MemoryLocation.Data, 96, [1], [1]);
+        var encoding = new TargetStorageEncodingSelection(
+            TargetStorageEncodingIds.Linear,
+            32,
+            4,
+            Array.Empty<KeyValuePair<string, long>>());
+        var stagedBuffer = new TIR.Buffer(
+            "staged_tile",
+            DataTypes.Float32,
+            new TIR.MemSpan(new TIR.PhysicalBuffer(4, 0, 64, TIR.MemoryLocation.Shared), 0, 64),
+            [8],
+            [1],
+            null,
+            encoding,
+            encoding.CreateStagedBufferLayout(stageCount: 2, stageStrideBytes: 32));
+        var pipeline = new PipelineRegionPlan(
+            "reduction.cp_async.n2",
+            TritonLoopPipelineBackend.CpAsyncN2TemplateId,
+            TritonLoopPipelineBackend.CpAsyncN2Synchronization,
+            stageCount: 2,
+            prefetchDistance: 1,
+            PipelineTailPolicy.Serial,
+            [
+                new PipelineStageChannelPlan(
+                    "lhs",
+                    new TargetMemorySpaceId("gpu.block-global"),
+                    new TargetMemorySpaceId("gpu.shared")),
+            ]);
+        var selection = new BlockMicroKernelSelection(
+            "test.reduce.cp_async",
+            "cp_async.n2",
+            1,
+            ImmutableDictionary<string, long>.Empty,
+            ImmutableDictionary<string, long>.Empty);
+        var logicalSequence = new DimVar("logical_sequence");
+        var stage = logicalSequence % 2;
+        var stagedTile = new Var("staged_tile");
+        var allocationExpression = IR.F.Buffer.AllocateBufferView(stagedBuffer, new RankedShape(0));
+        var producerSource = TIR.T.CreateBufferView(
+            inputDataBuffer,
+            DataTypes.Float32,
+            [8],
+            [1],
+            logicalSequence * 32,
+            32);
+        var producerBody = TIR.T.Let(
+            out var producerSlot,
+            CreatePipelineStageAlias(
+                stagedBuffer,
+                "producer_stage_buffer",
+                stage * 32L),
+            "producer_stage")
+            .Body(new TIR.Sequential(TIR.T.TileLoad(producerSlot, producerSource)))
+            .Build();
+        var consumerBody = TIR.T.Let(
+            out var consumerSlot,
+            CreatePipelineStageAlias(
+                stagedBuffer,
+                "consumer_stage_buffer",
+                stage * 32L),
+            "consumer_stage")
+            .Body(new TIR.Sequential(
+                TIR.F.NTT.Reduce(
+                    consumerSlot,
+                    resultBuffer,
+                    false,
+                    Array.Empty<int>(),
+                    Array.Empty<Dimension>(),
+                    [0],
+                    keepDims: true,
+                    ReduceOp.Sum)))
+            .Build();
+        var consumerReduce = Assert.IsType<Call>(consumerBody.Body.Fields.ToArray().Single());
+        consumerReduce.Metadata.BlockMicroKernel = selection;
+        var loop = new TIR.PipelineFor(
+            logicalSequence,
+            new TIR.Range(0, 2, 1),
+            TIR.LoopMode.Reduction,
+            TIR.LoopPartition.Full,
+            new TIR.Sequential(producerBody),
+            new TIR.Sequential(consumerBody),
+            pipeline,
+            new TIR.PipelineRegionId("main", "test/op0/reduction0/full"),
+            [new TIR.PipelineBufferBindingDescriptor(
+                "lhs",
+                new TargetMemorySpaceId("gpu.block-global"),
+                new TargetMemorySpaceId("gpu.shared"))],
+            [stagedTile],
+            [allocationExpression],
+            [stagedBuffer]);
+        var tailLogicalSequence = new DimVar("logical_sequence_tail");
+        var tailStage = tailLogicalSequence % 2;
+        var tailStagedTile = new Var("staged_tile_tail");
+        var tailAllocationExpression = IR.F.Buffer.AllocateBufferView(stagedBuffer, new RankedShape(0));
+        var tailProducerSource = TIR.T.CreateBufferView(
+            inputDataBuffer,
+            DataTypes.Float32,
+            [8],
+            [1],
+            tailLogicalSequence * 32,
+            32);
+        var tailProducerBody = TIR.T.Let(
+            out var tailProducerStage,
+            CreatePipelineStageAlias(
+                stagedBuffer,
+                "tail_producer_stage_buffer",
+                tailStage * 32L),
+            "tail_producer_stage")
+            .Body(new TIR.Sequential(TIR.T.TileLoad(tailProducerStage, tailProducerSource)))
+            .Build();
+        var tailConsumerBody = TIR.T.Let(
+            out var tailConsumerStage,
+            CreatePipelineStageAlias(
+                stagedBuffer,
+                "tail_consumer_stage_buffer",
+                tailStage * 32L),
+            "tail_consumer_stage")
+            .Body(new TIR.Sequential(
+                TIR.F.NTT.Reduce(
+                    tailConsumerStage,
+                    resultBuffer,
+                    false,
+                    Array.Empty<int>(),
+                    Array.Empty<Dimension>(),
+                    [0],
+                    keepDims: true,
+                    ReduceOp.Sum)))
+            .Build();
+        var tailReduce = Assert.IsType<Call>(tailConsumerBody.Body.Fields.ToArray().Single());
+        tailReduce.Metadata.BlockMicroKernel = selection;
+        var tailLoop = new TIR.PipelineFor(
+            tailLogicalSequence,
+            new TIR.Range(2, 3, 1),
+            TIR.LoopMode.Reduction,
+            TIR.LoopPartition.Tail,
+            new TIR.Sequential(tailProducerBody),
+            new TIR.Sequential(tailConsumerBody),
+            pipeline,
+            new TIR.PipelineRegionId("main", "test/op0/reduction0/tail"),
+            [new TIR.PipelineBufferBindingDescriptor(
+                "lhs",
+                new TargetMemorySpaceId("gpu.block-global"),
+                new TargetMemorySpaceId("gpu.shared"))],
+            [tailStagedTile],
+            [tailAllocationExpression],
+            [stagedBuffer]);
+        var placement = new Placement(new[] { 1 }, "b", "b");
+        var main = new TIR.PrimFunction(
+            "main",
+            PyNTTTarget.Kind,
+            new TIR.Sequential(
+                TIR.F.NTT.TensorLoad(inputDataBuffer, inputBuffer, new[] { SBP.B }, placement),
+                loop,
+                tailLoop,
+                TIR.F.NTT.TensorStore(resultBuffer, output, new[] { SBP.B }, placement)),
+            new TIR.Return(new Expr[] { output }),
+            new IVar[] { input, output })
+        {
+            SchedResult =
+            {
+                DataUsage = 100,
+            },
+        };
+
+        var outputDirectory = GeneratePyNTTModelDirectory("structured_cp_async_pipeline_model", main);
+        RenderGeneratedKernels(outputDirectory);
+        var generated = File.ReadAllText(Path.Join(outputDirectory, "generated_kernels.py"));
+        Assert.Contains("tle.gpu.alloc([2, 8]", generated, StringComparison.Ordinal);
+        Assert.Equal(2, Regex.Matches(generated, @"tle\.gpu\.alloc\(\[2, 8\]").Count);
+        Assert.Contains(".slot(", generated, StringComparison.Ordinal);
+        Assert.Contains(
+            ".slot(tl.cast(((logical_sequence) % (2)), tl.int32))",
+            generated,
+            StringComparison.Ordinal);
+        Assert.DoesNotContain("logical_sequence & 1", generated, StringComparison.Ordinal);
+        Assert.Contains("tle.gpu.copy(", generated, StringComparison.Ordinal);
+        Assert.Contains("is_async=True", generated, StringComparison.Ordinal);
+        Assert.Contains(
+            generated.Split('\n'),
+            line => line.Contains("tle.gpu.copy", StringComparison.Ordinal) &&
+                line.Contains("tail_producer_stage", StringComparison.Ordinal) &&
+                !line.Contains("is_async=True", StringComparison.Ordinal));
+        Assert.Contains("tle.gpu.async_commit_group()", generated, StringComparison.Ordinal);
+        Assert.Contains("tle.gpu.async_wait_group(1)", generated, StringComparison.Ordinal);
+        Assert.Contains("tle.gpu.async_wait_group(0)", generated, StringComparison.Ordinal);
+        Assert.DoesNotContain("tle.pipe", generated, StringComparison.Ordinal);
+        Assert.DoesNotContain("warp_specialize", generated, StringComparison.Ordinal);
+        Assert.DoesNotContain("num_stages=", generated, StringComparison.Ordinal);
+        Assert.DoesNotContain("tl.range(0, 2, 1, num_stages", generated, StringComparison.Ordinal);
+        Assert.Single(Regex.Matches(generated, @"pyntt_reduction_\d+_acc0 = tl\.full").Cast<Match>());
+        var computeMatches = Regex.Matches(
+            generated,
+            @"pyntt_reduction_\d+_acc0 = [^\r\n]*__reduce_compute__\d+\(");
+        Assert.Collection(computeMatches.Cast<Match>(), _ => { }, _ => { }, _ => { });
+        var finalizeMatches = Regex.Matches(
+            generated,
+            @"(?m)^\s+[^\r\n]*__reduce_finalize__\d+\(pyntt_reduction_\d+_acc0");
+        Assert.Single(finalizeMatches.Cast<Match>());
+
+        using var document = JsonDocument.Parse(File.ReadAllText(Path.Join(outputDirectory, "kernel_params.json")));
+        var kernel = document.RootElement.GetProperty("functions").EnumerateArray()
+            .SelectMany(function => function.GetProperty("render_kernels").EnumerateArray())
+            .Single();
+        Assert.False(kernel.TryGetProperty("pipeline_regions", out _));
+        Assert.False(kernel.TryGetProperty("staged_smem_allocations", out _));
+        Assert.False(kernel.TryGetProperty("staged_smem_bindings", out _));
+        var executions = kernel.GetProperty("pipeline_executions").EnumerateArray().ToArray();
+        Assert.Equal(2, executions.Length);
+        var execution = Assert.Single(executions, item => item.GetProperty("partition").GetString() == "full");
+        var tailExecution = Assert.Single(executions, item => item.GetProperty("partition").GetString() == "tail");
+        Assert.Equal("main/test/op0/reduction0/full", execution.GetProperty("region_id").GetString());
+        Assert.Equal("main/test/op0/reduction0/tail", tailExecution.GetProperty("region_id").GetString());
+        Assert.Equal("reduction.cp_async.n2", execution.GetProperty("schedule_id").GetString());
+        Assert.Equal(
+            TritonLoopPipelineBackend.CpAsyncN2TemplateId.Value,
+            execution.GetProperty("template_id").GetString());
+        Assert.Equal(2, execution.GetProperty("stage_count").GetInt32());
+        Assert.Equal(1, execution.GetProperty("prefetch_distance").GetInt32());
+        Assert.Equal("serial", execution.GetProperty("tail_policy").GetString());
+        var synchronization = execution.GetProperty("synchronization");
+        Assert.True(synchronization.GetProperty("asynchronous_produce").GetBoolean());
+        Assert.True(synchronization.GetProperty("requires_producer_commit").GetBoolean());
+        Assert.True(synchronization.GetProperty("requires_consumer_wait").GetBoolean());
+        Assert.False(synchronization.GetProperty("wait_provides_consumer_acquire").GetBoolean());
+        Assert.True(synchronization.GetProperty("requires_consumer_release").GetBoolean());
+        var channel = execution.GetProperty("channels").EnumerateArray().Single();
+        Assert.Equal("lhs", channel.GetProperty("channel_id").GetString());
+        Assert.Equal("gpu.block-global", channel.GetProperty("source_memory_space").GetString());
+        Assert.Equal("gpu.shared", channel.GetProperty("destination_memory_space").GetString());
+        var allocation = channel.GetProperty("allocation");
+        Assert.Equal(2, allocation.GetProperty("stage_count").GetInt32());
+        Assert.Equal("pyntt_shared_arena", allocation.GetProperty("arena_id").GetString());
+        Assert.Equal(0, allocation.GetProperty("arena_offset_bytes").GetInt64());
+        Assert.Equal(64, allocation.GetProperty("physical_bytes").GetInt64());
+        Assert.Equal(1, kernel.GetProperty("metadata").GetProperty("launch").GetProperty("num_stages").GetInt32());
+
+        AssertGeneratedModelRuns(
+            outputDirectory,
+            "x = torch.arange(24, dtype=torch.float32, device='cuda')",
+            "output = module(x)",
+            "torch.testing.assert_close(output, x.sum().reshape(1), rtol=0, atol=0)");
     }
 
     [Fact]
@@ -500,6 +883,7 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
             .Body(
                 new TIR.Sequential(
                     TIR.T.TileLoad(sharedTile, inputDataBuffer),
+                    TIR.F.NTT.Barrier(TIR.NTT.BarrierScope.Block),
                     TIR.T.TileStore(sharedTile, resultBuffer)))
             .Build();
         var main = new TIR.PrimFunction(
@@ -507,7 +891,9 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
             PyNTTTarget.Kind,
             new TIR.Sequential(
                 TIR.F.NTT.TensorLoad(inputDataBuffer, inputBuffer, new[] { SBP.B, SBP.B }, placement),
+                TIR.F.NTT.Barrier(TIR.NTT.BarrierScope.Block),
                 sharedCopy,
+                TIR.F.NTT.Barrier(TIR.NTT.BarrierScope.Block),
                 TIR.F.NTT.TensorStore(resultBuffer, output, new[] { SBP.B, SBP.B }, placement)),
             new TIR.Return(new Expr[] { output }),
             new IVar[] { input, output })
@@ -527,6 +913,7 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
             generatedKernels,
             StringComparison.Ordinal);
         Assert.Contains("nv_mma_shared_layout=True", generatedKernels, StringComparison.Ordinal);
+        Assert.Equal(3, Regex.Matches(generatedKernels, @"tl\.debug_barrier\(\)").Count);
         AssertGeneratedModelRuns(
             outputDirectory,
             "x = (torch.arange(16 * 16, dtype=torch.float32, device='cuda').reshape(16, 16) * 0.01).to(torch.bfloat16)",
@@ -602,6 +989,77 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
     }
 
     [Fact]
+    public void TestPyNTTSingletonBroadcastStrideUsesAffineSharedDescriptor()
+    {
+        var vectorType = new VectorType(DataTypes.BFloat16, 8);
+        var inputBuffer = new TIR.Buffer(
+            "broadcast_input",
+            vectorType,
+            new TIR.MemSpan(new TIR.PhysicalBuffer(vectorType.SizeInBytes, 0, 256, TIR.MemoryLocation.Data)),
+            [3, 1, 4],
+            [6, 0, 1],
+            null);
+        var sharedBuffer = new TIR.Buffer(
+            "broadcast_shared",
+            vectorType,
+            new TIR.MemSpan(new TIR.PhysicalBuffer(vectorType.SizeInBytes, 0, 512, TIR.MemoryLocation.Shared)),
+            [3, 1, 4],
+            [6, 0, 1],
+            null);
+        var resultBuffer = new TIR.Buffer(
+            "broadcast_result",
+            vectorType,
+            new TIR.MemSpan(new TIR.PhysicalBuffer(vectorType.SizeInBytes, 288, 256, TIR.MemoryLocation.Data)),
+            [3, 1, 4],
+            [6, 0, 1],
+            null);
+        var publicOutput = CreateOutputVar("output", new TensorType(DataTypes.Float32, new[] { 1 }));
+        var publicOutputBuffer = CreateBuffer(
+            "public_output",
+            DataTypes.Float32,
+            TIR.MemoryLocation.Data,
+            576,
+            [1],
+            [1]);
+        var placement = new Placement(new[] { 1 }, "b", "b");
+        var sharedCopy = TIR.T.Let(
+            out var sharedTile,
+            IR.F.Buffer.AllocateBufferView(sharedBuffer, new RankedShape(0, 0, 0)),
+            "broadcast_shared_tile")
+            .Body(
+                new TIR.Sequential(
+                    TIR.T.TileLoad(sharedTile, inputBuffer),
+                    TIR.T.TileStore(sharedTile, resultBuffer)))
+            .Build();
+        var main = new TIR.PrimFunction(
+            "main_prim",
+            PyNTTTarget.Kind,
+            new TIR.Sequential(
+                sharedCopy,
+                TIR.F.NTT.TensorStore(publicOutputBuffer, publicOutput, new[] { SBP.B }, placement)),
+            new TIR.Return(new Expr[] { publicOutput }),
+            new IVar[] { publicOutput })
+        {
+            SchedResult =
+            {
+                DataUsage = 580,
+            },
+        };
+
+        var outputDirectory = GeneratePyNTTModelDirectory("generated_singleton_broadcast_stride_shared_model", main);
+        RenderGeneratedKernels(outputDirectory);
+        var generatedKernels = File.ReadAllText(Path.Join(outputDirectory, "generated_kernels.py"));
+        Assert.Contains(
+            "broadcast_shared_tile_shared_buffer_0 = tle.gpu.alloc([128]",
+            generatedKernels,
+            StringComparison.Ordinal);
+        Assert.Contains(
+            "tle.gpu.local_ptr(broadcast_shared_tile_shared_buffer_0",
+            generatedKernels,
+            StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void TestPyNTTKMajorPackedNSharedDescriptorSupportsMultipleGroups()
     {
         var vectorType = new VectorType(DataTypes.BFloat16, 4, 8);
@@ -667,14 +1125,13 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         RenderGeneratedKernels(outputDirectory);
         var generatedKernels = File.ReadAllText(Path.Join(outputDirectory, "generated_kernels.py"));
         Assert.Contains(
-            "k_major_packed_n_tile_shared_buffer_0 = tle.gpu.alloc([2, 256, 32]",
+            "k_major_packed_n_tile_shared_buffer_0 = tle.gpu.alloc([2, 256, 4, 8]",
             generatedKernels,
             StringComparison.Ordinal);
         Assert.Contains(
-            "tle.gpu.copy(source + copy_global_offset, k_major_packed_n_tile_shared_buffer_0, [2, 256, 32])",
+            "tle.gpu.copy(source + copy_global_offset, k_major_packed_n_tile_shared_buffer_0, [2, 256, 4, 8])",
             generatedKernels,
             StringComparison.Ordinal);
-        Assert.DoesNotContain("tle.gpu.alloc([2, 256, 4, 8]", generatedKernels, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -757,6 +1214,7 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         const long secondElements = 2 * 2 * 8;
         const long firstBytes = firstElements * 4;
         const long secondBytes = secondElements * 4;
+        const long firstDescriptorBytes = 8 * 2 * 8 * 4;
         const long totalBytes = firstBytes + secondBytes;
         var tensorType = new TensorType(DataTypes.Float32, new[] { 7, 2, 8 });
         var input = new Var("x", tensorType);
@@ -784,20 +1242,26 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
             [2, 2, 8],
             [16, 8, 1],
             null);
-        var firstSharedBuffer = CreateBuffer(
+        var firstSharedBuffer = new TIR.Buffer(
             "first_shared_tile",
             DataTypes.Float32,
-            TIR.MemoryLocation.Shared,
-            0,
+            new TIR.MemSpan(
+                new TIR.PhysicalBuffer(4, 0, firstDescriptorBytes, TIR.MemoryLocation.Shared),
+                0,
+                firstBytes),
             [5, 2, 8],
-            [16, 8, 1]);
-        var secondSharedBuffer = CreateBuffer(
+            [16, 8, 1],
+            null);
+        var secondSharedBuffer = new TIR.Buffer(
             "second_shared_tile",
             DataTypes.Float32,
-            TIR.MemoryLocation.Shared,
-            firstBytes,
+            new TIR.MemSpan(
+                new TIR.PhysicalBuffer(4, firstDescriptorBytes, secondBytes, TIR.MemoryLocation.Shared),
+                0,
+                secondBytes),
             [2, 2, 8],
-            [16, 8, 1]);
+            [16, 8, 1],
+            null);
         var resultPhysical = new TIR.PhysicalBuffer(4, totalBytes, totalBytes, TIR.MemoryLocation.Data);
         var resultBuffer = new TIR.Buffer(
             "result_data",
@@ -834,6 +1298,7 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
                         new TIR.Sequential(
                             TIR.T.TileLoad(firstSharedTile, firstInputTile),
                             TIR.T.TileLoad(secondSharedTile, secondInputTile),
+                            TIR.F.NTT.Barrier(TIR.NTT.BarrierScope.Block),
                             TIR.T.TileStore(firstSharedTile, firstResultTile),
                             TIR.T.TileStore(secondSharedTile, secondResultTile)))
                     .Build())
@@ -843,7 +1308,9 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
             PyNTTTarget.Kind,
             new TIR.Sequential(
                 TIR.F.NTT.TensorLoad(inputDataBuffer, inputBuffer, new[] { SBP.B, SBP.B, SBP.B }, placement),
+                TIR.F.NTT.Barrier(TIR.NTT.BarrierScope.Block),
                 sharedCopy,
+                TIR.F.NTT.Barrier(TIR.NTT.BarrierScope.Block),
                 TIR.F.NTT.TensorStore(resultBuffer, output, new[] { SBP.B, SBP.B, SBP.B }, placement)),
             new TIR.Return(new Expr[] { output }),
             new IVar[] { input, output })
@@ -859,7 +1326,7 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         var generatedKernels = File.ReadAllText(Path.Join(outputDirectory, "generated_kernels.py"));
         Assert.Contains("first_shared_tile_shared_buffer_0 = tle.gpu.alloc([8, 2, 8]", generatedKernels, StringComparison.Ordinal);
         Assert.Contains("second_shared_tile_shared_buffer_1 = tle.gpu.alloc([2, 2, 8]", generatedKernels, StringComparison.Ordinal);
-        Assert.Contains("alias_offset_bytes=320", generatedKernels, StringComparison.Ordinal);
+        Assert.Contains("alias_offset_bytes=512", generatedKernels, StringComparison.Ordinal);
         Assert.DoesNotContain("= tle.gpu.local_ptr", generatedKernels, StringComparison.Ordinal);
         AssertGeneratedModelRuns(
             outputDirectory,
@@ -1676,29 +2143,64 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
             "torch.testing.assert_close(output, lhs @ rhs, rtol=1e-5, atol=1e-5)");
     }
 
-    [Fact]
-    public async Task TestPyNTTIRAutoDistributedPackedBFloat16MatmulRun()
+    [Theory]
+    [InlineData(1024, 32)]
+    [InlineData(2048, 64)]
+    public async Task TestPyNTTIRAutoDistributedPackedBFloat16MatmulRun(
+        int outputFeatures,
+        int expectedLocalScalarN)
     {
         ConfigureAutoDistributedPyNTT();
-        var lhs = new Var("lhs", new TensorType(DataTypes.BFloat16, new[] { 1, 1024 }));
-        var rhsValues = Enumerable.Range(0, 1024 * 2048)
+        const int inputFeatures = 1024;
+        var lhs = new Var("lhs", new TensorType(DataTypes.BFloat16, new[] { 1, inputFeatures }));
+        var rhsValues = Enumerable.Range(0, inputFeatures * outputFeatures)
             .Select(i => (BFloat16)(((float)i - 128f) * 0.0001f))
             .ToArray();
-        var rhs = Tensor.From<BFloat16>(rhsValues, [1024, 2048]);
+        var rhs = Tensor.From<BFloat16>(rhsValues, [inputFeatures, outputFeatures]);
         var matmul = IR.F.Tensors.MatMul(lhs, rhs, DataTypes.BFloat16);
-        var reshaped = IR.F.Tensors.Reshape(matmul, [1, 16, 128]);
-        var main = new Function("main", PyNTTTarget.Kind, reshaped, new[] { lhs });
+        var main = new Function("main", PyNTTTarget.Kind, matmul, new[] { lhs });
 
-        var outputDirectory = await GeneratePyNTTModelDirectoryWithCompilerPipeline("generated_bf16_packed_matmul_run_model", main);
+        var outputDirectory = await GeneratePyNTTModelDirectoryWithCompilerPipeline(
+            $"generated_bf16_packed_matmul_n{expectedLocalScalarN}_run_model",
+            main);
+        using var document = JsonDocument.Parse(File.ReadAllText(Path.Join(outputDirectory, "kernel_params.json")));
+        var accumulateModels = document.RootElement
+            .GetProperty("functions")
+            .EnumerateArray()
+            .SelectMany(function => function.GetProperty("render_kernels").EnumerateArray())
+            .SelectMany(kernel => kernel.GetProperty("helpers").EnumerateArray())
+            .Where(helper => helper.GetProperty("template").GetString() == "triton/kernels/Gemv.py.jinja")
+            .Select(helper => helper.GetProperty("model"))
+            .Where(model => model.GetProperty("ReductionPhase").GetString() == "accumulate")
+            .ToArray();
+        Assert.NotEmpty(accumulateModels);
+        Assert.All(accumulateModels, model =>
+        {
+            Assert.Equal(TritonBlockMicroKernelContract.GemvFamily, model.GetProperty("MicroKernelFamily").GetString());
+            Assert.Equal(
+                TritonBlockMicroKernelContract.Version,
+                model.GetProperty("MicroKernelParameters")
+                    .GetProperty(TritonBlockMicroKernelContract.VersionParameter)
+                    .GetInt64());
+            var outputShape = model.GetProperty("OutputShape").EnumerateArray().ToArray();
+            var localScalarN = outputShape[^1].GetProperty("FixedValue").GetInt32()
+                * model.GetProperty("OutputNPackedLaneCount").GetInt32()
+                * model.GetProperty("OutputNVectorLaneCount").GetInt32();
+            Assert.Equal(expectedLocalScalarN, localScalarN);
+        });
+
         RenderGeneratedKernels(outputDirectory);
         var generatedKernelsPy = File.ReadAllText(Path.Join(outputDirectory, "generated_kernels.py"));
-        Assert.Contains("rhs_n_packed_lane=4, rhs_n_lane=8", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains(
+            "generated from PyNTT Jinja Gemv.py.jinja reduction accumulate",
+            generatedKernelsPy,
+            StringComparison.Ordinal);
         AssertGeneratedModelRuns(
             outputDirectory,
-            "lhs = ((torch.arange(1024, dtype=torch.float32, device='cuda').reshape(1, 1024) - 16) * 0.001).to(torch.bfloat16)",
-            "rhs = ((torch.arange(1024 * 2048, dtype=torch.float32, device='cuda').reshape(1024, 2048) - 128) * 0.0001).to(torch.bfloat16)",
+            $"lhs = ((torch.arange({inputFeatures}, dtype=torch.float32, device='cuda').reshape(1, {inputFeatures}) - 16) * 0.001).to(torch.bfloat16)",
+            $"rhs = ((torch.arange({inputFeatures} * {outputFeatures}, dtype=torch.float32, device='cuda').reshape({inputFeatures}, {outputFeatures}) - 128) * 0.0001).to(torch.bfloat16)",
             "output = module(lhs)",
-            "torch.testing.assert_close(output, (lhs @ rhs).reshape(1, 16, 128), rtol=2e-2, atol=2e-2)");
+            "torch.testing.assert_close(output, lhs @ rhs, rtol=2e-2, atol=2e-2)");
     }
 
     [Fact]
@@ -1762,18 +2264,19 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
     }
 
     [Fact]
-    public async Task TestPyNTTPackedBFloat16GemvUsesRegisterMmaRun()
+    public async Task TestPyNTTPackedBFloat16LargeKGemvRun()
     {
         ConfigureAutoDistributedPyNTT();
         var targetOptions = Assert.IsType<PyNTTTargetOptions>(CompileOptions.TargetOptions);
         targetOptions.HierarchyNames = "b";
         targetOptions.HierarchyLevels = "b";
         targetOptions.Hierarchies = new[] { new[] { 1 } };
-        const int k = 16;
+        const int k = 3072;
         const int n = 32;
+        const int stateBlockK = 512;
         var lhs = new Var("lhs", new TensorType(DataTypes.BFloat16, new[] { 1, k }));
         var rhsValues = Enumerable.Range(0, k * n)
-            .Select(i => (BFloat16)(((float)i - 64f) * 0.001f))
+            .Select(i => (BFloat16)(((float)i - (k * n / 2f)) * 0.00001f))
             .ToArray();
         var rhs = Tensor.From<BFloat16>(rhsValues, [k, n]);
         var main = new Function(
@@ -1783,7 +2286,7 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
             new[] { lhs });
 
         var outputDirectory = await GeneratePyNTTModelDirectoryWithCompilerPipeline(
-            "generated_bf16_register_mma_gemv_run_model",
+            "generated_bf16_large_k_gemv_run_model",
             main);
         using var document = JsonDocument.Parse(File.ReadAllText(Path.Join(outputDirectory, "kernel_params.json")));
         var accumulateModels = document.RootElement
@@ -1797,15 +2300,21 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
             .ToArray();
         Assert.NotEmpty(accumulateModels);
         Assert.All(accumulateModels, model =>
-            Assert.Equal("register_mma_accumulator", model.GetProperty("MicroKernelVariant").GetString()));
+        {
+            var parameters = model.GetProperty("MicroKernelParameters");
+            Assert.Equal(
+                TritonBlockMicroKernelContract.Version,
+                parameters.GetProperty(TritonBlockMicroKernelContract.VersionParameter).GetInt64());
+            Assert.Equal(stateBlockK, parameters.GetProperty("state_block_k").GetInt32());
+        });
 
         RenderGeneratedKernels(outputDirectory);
         var generatedKernelsPy = File.ReadAllText(Path.Join(outputDirectory, "generated_kernels.py"));
-        Assert.Contains("acc += tl.sum(partial_transposed, axis=1)", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.DoesNotContain($"offs_k = tl.arange(0, {k})", generatedKernelsPy, StringComparison.Ordinal);
         AssertGeneratedModelRuns(
             outputDirectory,
-            $"lhs = ((torch.arange({k}, dtype=torch.float32, device='cuda').reshape(1, {k}) - 8) * 0.01).to(torch.bfloat16)",
-            $"rhs = ((torch.arange({k} * {n}, dtype=torch.float32, device='cuda').reshape({k}, {n}) - 64) * 0.001).to(torch.bfloat16)",
+            $"lhs = ((torch.arange({k}, dtype=torch.float32, device='cuda').reshape(1, {k}) - 256) * 0.001).to(torch.bfloat16)",
+            $"rhs = ((torch.arange({k} * {n}, dtype=torch.float32, device='cuda').reshape({k}, {n}) - {k * n / 2}) * 0.00001).to(torch.bfloat16)",
             "output = module(lhs)",
             "torch.testing.assert_close(output.to(torch.float32), (lhs @ rhs).to(torch.bfloat16).to(torch.float32), rtol=2e-2, atol=2e-2)");
     }
@@ -2044,14 +2553,38 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         RenderGeneratedKernels(outputDirectory);
         using (var kernelParams = JsonDocument.Parse(File.ReadAllText(Path.Join(outputDirectory, "kernel_params.json"))))
         {
-            var ops = kernelParams.RootElement.GetProperty("functions")
+            var helpers = kernelParams.RootElement.GetProperty("functions")
                 .EnumerateArray()
                 .SelectMany(function => function.GetProperty("render_kernels").EnumerateArray())
-                .SelectMany(kernel => kernel.GetProperty("metadata").GetProperty("attrs").GetProperty("ops").EnumerateArray())
-                .Select(op => op.GetString())
+                .SelectMany(kernel => kernel.GetProperty("helpers").EnumerateArray())
                 .ToArray();
-            Assert.Equal(4, ops.Count(op => op == "update_paged_attention_kv_cache"));
-            Assert.Equal(2, ops.Count(op => op == "paged_attention"));
+            var updateHelpers = helpers
+                .Where(helper => helper.GetProperty("template").GetString() == "triton/kernels/UpdatePagedAttentionKVCache.py.jinja")
+                .ToArray();
+            var semanticUpdates = updateHelpers
+                .Select(helper => helper.GetProperty("model"))
+                .Select(model => (
+                    LayerId: model.GetProperty("LayerIdExpression").GetString(),
+                    CacheKind: model.GetProperty("CacheKind").GetInt32()))
+                .Distinct()
+                .ToArray();
+            Assert.Equal(6, updateHelpers.Length);
+            Assert.Equal(4, semanticUpdates.Length);
+            Assert.Contains(("0", 0), semanticUpdates);
+            Assert.Contains(("0", 1), semanticUpdates);
+            Assert.Contains(("1", 0), semanticUpdates);
+            Assert.Contains(("1", 1), semanticUpdates);
+
+            var pagedAttentionHelpers = helpers
+                .Where(helper => helper.GetProperty("template").GetString() == "triton/kernels/PagedAttention.py.jinja")
+                .ToArray();
+            Assert.Equal(2, pagedAttentionHelpers.Length);
+            Assert.Equal(
+                new[] { "0", "1" },
+                pagedAttentionHelpers
+                    .Select(helper => helper.GetProperty("model").GetProperty("LayerIdExpression").GetString())
+                    .OrderBy(layerId => layerId, StringComparer.Ordinal)
+                    .ToArray());
         }
 
         AssertGeneratedModelRuns(
@@ -2244,6 +2777,10 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         var generatedKernelsPy = File.ReadAllText(Path.Join(outputDirectory, "generated_kernels.py"));
         Assert.Contains("generated from PyNTT Jinja PackedQKVParallelLinear.py.jinja", generatedKernelsPy, StringComparison.Ordinal);
         Assert.DoesNotContain("tl.gather(input0", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("q_acc = tl.dot(input_values, q_weight_values, q_acc)", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("k_acc = tl.dot(input_values, k_weight_values, k_acc)", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("v_acc = tl.dot(input_values, v_weight_values, v_acc)", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.DoesNotContain("_acc += tl.dot", generatedKernelsPy, StringComparison.Ordinal);
         AssertGeneratedModelRuns(
             outputDirectory,
             "torch.manual_seed(0)",
@@ -3691,11 +4228,20 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         var placement = new Placement(new[] { 1 }, "b", "b");
         var body = new TIR.Sequential(
             TIR.F.NTT.TensorLoad(lhsBuffer, lhs, new[] { SBP.B, SBP.B }, placement),
+            TIR.F.NTT.Barrier(TIR.NTT.BarrierScope.Block),
             TIR.F.NTT.PackedMatMul(lhsBuffer, rhsBuffer, packedOutputBuffer, None.Default, 1.0f),
+            TIR.F.NTT.Barrier(TIR.NTT.BarrierScope.Block),
             TIR.F.NTT.Unpack(packedOutputBuffer, vectorOutputBuffer, new[] { 4 }, new[] { 1 }),
+            TIR.F.NTT.Barrier(TIR.NTT.BarrierScope.Block),
             TIR.F.NTT.Unpack(vectorOutputBuffer, outputBuffer, new[] { 8 }, new[] { 1 }),
+            TIR.F.NTT.Barrier(TIR.NTT.BarrierScope.Block),
             TIR.F.NTT.TensorStore(outputBuffer, output, new[] { SBP.B, SBP.B }, placement));
-        var main = new TIR.PrimFunction("main_prim", PyNTTTarget.Kind, body, new IVar[] { lhs, output })
+        var main = new TIR.PrimFunction(
+            "main_prim",
+            PyNTTTarget.Kind,
+            body,
+            new TIR.Return(new Expr[] { output }),
+            new IVar[] { lhs, output })
         {
             SchedResult =
             {
@@ -3708,6 +4254,14 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         RenderGeneratedKernels(outputDirectory);
         var generatedKernelsPy = File.ReadAllText(Path.Join(outputDirectory, "generated_kernels.py"));
         Assert.Contains("rhs_n_packed_lane=4, rhs_n_lane=8", generatedKernelsPy, StringComparison.Ordinal);
+        AssertGeneratedBlockBarrierChain(
+            generatedKernelsPy,
+            "main_prim_composite_0",
+            "main_prim__tensor_load__0",
+            "main_prim__gemv_compute__0",
+            "main_prim__unpack_compute__0",
+            "main_prim__unpack_compute__1",
+            "main_prim__output_tensor_store__0");
         AssertGeneratedModelRuns(
             outputDirectory,
             "lhs = (torch.arange(64, dtype=torch.float32, device='cuda').reshape(1, 64) - 16) * 0.01",
@@ -3774,11 +4328,20 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         var outputBuffer = CreateBuffer("output_buffer", DataTypes.BFloat16, TIR.MemoryLocation.Data, lhsBytes + packedOutputBytes + vectorOutputBytes, [localM, localN], [localN, 1], outputDistributedType);
         var body = new TIR.Sequential(
             TIR.F.NTT.TensorLoad(lhsBuffer, lhs, lhsDistributedType.AxisPolicies.ToArray(), placement),
+            TIR.F.NTT.Barrier(TIR.NTT.BarrierScope.Block),
             TIR.F.NTT.PackedMatMul(lhsBuffer, rhsBuffer, packedOutputBuffer, None.Default, 1.0f),
+            TIR.F.NTT.Barrier(TIR.NTT.BarrierScope.Block),
             TIR.F.NTT.Unpack(packedOutputBuffer, vectorOutputBuffer, new[] { nPackedLane }, new[] { 1 }),
+            TIR.F.NTT.Barrier(TIR.NTT.BarrierScope.Block),
             TIR.F.NTT.Unpack(vectorOutputBuffer, outputBuffer, new[] { nLane }, new[] { 1 }),
+            TIR.F.NTT.Barrier(TIR.NTT.BarrierScope.Block),
             TIR.F.NTT.TensorStore(outputBuffer, output, outputDistributedType.AxisPolicies.ToArray(), placement));
-        var main = new TIR.PrimFunction("main_prim", PyNTTTarget.Kind, body, new IVar[] { lhs, output })
+        var main = new TIR.PrimFunction(
+            "main_prim",
+            PyNTTTarget.Kind,
+            body,
+            new TIR.Return(new Expr[] { output }),
+            new IVar[] { lhs, output })
         {
             SchedResult =
             {
@@ -3792,6 +4355,14 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         RenderGeneratedKernels(outputDirectory);
         var generatedKernelsPy = File.ReadAllText(Path.Join(outputDirectory, "generated_kernels.py"));
         Assert.Contains("rhs_n_packed_lane=4, rhs_n_lane=8", generatedKernelsPy, StringComparison.Ordinal);
+        AssertGeneratedBlockBarrierChain(
+            generatedKernelsPy,
+            "main_prim_composite_0",
+            "main_prim__tensor_load__0",
+            "main_prim__matmul_compute__0",
+            "main_prim__unpack_compute__0",
+            "main_prim__unpack_compute__1",
+            "main_prim__output_tensor_store__0");
         AssertGeneratedModelRuns(
             outputDirectory,
             $"lhs = ((torch.arange({m} * {k}, dtype=torch.float32, device='cuda').reshape({m}, {k}) - 257) * 0.0005).to(torch.bfloat16)",
@@ -4083,6 +4654,26 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         return outputDirectory;
     }
 
+    private TIR.Buffer CreatePipelineStageAlias(
+        TIR.Buffer source,
+        string name,
+        Dimension byteOffset)
+    {
+        var layout = source.StagedLayout ?? throw new ArgumentException(
+            $"Buffer {source.Name} is not a staged allocation.",
+            nameof(source));
+        return new TIR.Buffer(
+            name,
+            source.ElemType,
+            source.MemSpan.With(
+                start: source.MemSpan.Start + byteOffset,
+                size: layout.StagePhysicalBytes),
+            source.Dimensions.ToArray(),
+            source.Strides.ToArray(),
+            source.DistributedType,
+            source.StorageEncoding);
+    }
+
     private TIR.Buffer CreateDataBuffer(string name, DataType elemType, long startBytes, long[] dimensions, long[] strides)
         => CreateBuffer(name, elemType, TIR.MemoryLocation.Data, startBytes, dimensions, strides);
 
@@ -4206,6 +4797,30 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         Assert.True(
             result.ExitCode == 0,
             $"Generated PyNTT model execution failed.{Environment.NewLine}{result.Stdout}{Environment.NewLine}{result.Stderr}");
+    }
+
+    private void AssertGeneratedBlockBarrierChain(
+        string generatedSource,
+        string topKernelName,
+        params string[] helperNames)
+    {
+        Assert.True(helperNames.Length >= 2, "A barrier chain requires at least two helpers.");
+        var topKernelMarker = $"def {topKernelName}(";
+        var topKernelStart = generatedSource.LastIndexOf(topKernelMarker, StringComparison.Ordinal);
+        Assert.True(topKernelStart >= 0, $"Generated source does not define top kernel {topKernelName}.");
+        var topKernelSource = generatedSource[topKernelStart..];
+        Assert.Equal(
+            helperNames.Length - 1,
+            Regex.Matches(topKernelSource, @"^    tl\.debug_barrier\(\)$", RegexOptions.Multiline).Count);
+
+        for (var index = 0; index + 1 < helperNames.Length; index++)
+        {
+            var producer = Regex.Escape(helperNames[index]);
+            var consumer = Regex.Escape(helperNames[index + 1]);
+            Assert.Matches(
+                $@"    {producer}\([^\r\n]*\)\r?\n    tl\.debug_barrier\(\)\r?\n    {consumer}\(",
+                topKernelSource);
+        }
     }
 
     private (int ExitCode, string Stdout, string Stderr) RunPythonScript(string script)

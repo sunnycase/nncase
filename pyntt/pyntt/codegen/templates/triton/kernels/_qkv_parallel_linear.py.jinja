@@ -30,7 +30,7 @@ def {{ model["FunctionName"] }}({{ helper_parameters(model) }}):
 {{ base }}for m_idx in tl.range(0, {{ dim(ctx["m"]) }}):
 {% set projection_base = base ~ "    " %}
 {% for projection in ctx["projections"] %}
-{{ projection_base }}for {{ projection["lower"] }}_n_start in tl.range(0, {{ dim(projection["physical_n"]) }}, {{ projection["physical_block_n"] }}, num_stages={{ ctx["n_stages"] }}):
+{{ projection_base }}for {{ projection["lower"] }}_n_start in tl.range(0, {{ dim(projection["physical_n"]) }}, {{ projection["physical_block_n"] }}):
 {{ common.structured_axis(projection["weight_n_axis"], projection_base ~ "    ") }}
 {{ common.structured_axis(projection["output_n_axis"], projection_base ~ "    ") }}
 {{ projection_base }}    acc = tl.zeros(({{ ctx["block_n"] }},), tl.float32)
@@ -54,7 +54,7 @@ def {{ model["FunctionName"] }}({{ helper_parameters(model) }}):
 {{ common.structured_axis(projection["weight_n_axis"], projection_base ~ "    ") }}
 {{ common.structured_axis(projection["output_n_axis"], projection_base ~ "    ") }}
 {{ projection_base }}    acc = tl.zeros(({{ ctx["block_m"] }}, {{ ctx["block_n"] }}), tl.float32)
-{{ projection_base }}    for k_start in tl.range(0, {{ dim(ctx["k"]) }}, {{ ctx["block_k"] }}, num_stages=5):
+{{ projection_base }}    for k_start in tl.range(0, {{ dim(ctx["k"]) }}, {{ ctx["block_k"] }}):
 {{ projection_base }}        offs_k = k_start + tl.arange(0, {{ ctx["block_k"] }})
 {{ projection_base }}        weight_values = tl.reshape(tl.load({{ access_pointer(model, projection["prefix"] ~ "Weight", projection["lower"] ~ "_weight", projection["weight_access"]) }}, mask={{ projection["weight_mask"] }}, other=0.0), {{ projection["weight_matrix_shape"] }})
 {{ projection_base }}        input_values = tl.load({{ access_pointer(model, "Input", "input0", projection["input_access"]) }}, mask={{ projection["input_mask"] }}, other=0.0)
@@ -97,7 +97,7 @@ def {{ model["FunctionName"] }}({{ helper_parameters(model, ("q_acc", "k_acc", "
 {% if ctx["block_m"] == 1 %}
     {{ projection["accumulator"] }} += tl.sum({{ projection["lower"] }}_weight_values * input_values[None, :], axis=1)
 {% else %}
-    {{ projection["accumulator"] }} += tl.dot(input_values, {{ projection["lower"] }}_weight_values{{ ctx["dot_precision"] }})
+    {{ projection["accumulator"] }} = tl.dot(input_values, {{ projection["lower"] }}_weight_values, {{ projection["accumulator"] }}{{ ctx["dot_precision"] }})
 {% endif %}
 {% endfor %}
     return q_acc, k_acc, v_acc
@@ -122,7 +122,8 @@ def {{ model["FunctionName"] }}({{ helper_parameters(model, ("q_acc", "k_acc", "
 {% for projection in ctx["projections"] %}
 {{ common.structured_axis(projection["n_axis"], "    ") }}
 {% if projection["has_bias"] %}
-    {{ projection["lower"] }}_bias_values = tl.reshape(tl.load({{ access_pointer(model, projection["prefix"] ~ "Bias", projection["lower"] ~ "_bias", projection["bias_access"]) }}, mask={{ projection["n_axis"]["logical_coordinate"] }} < {{ dim(projection["n"]) }}, other=0.0), ({{ projection["block_n"] }},)).to(tl.float32)
+{{ common.structured_axis(projection["bias_n_axis"], "    ") }}
+    {{ projection["lower"] }}_bias_values = tl.reshape(tl.load({{ access_pointer(model, projection["prefix"] ~ "Bias", projection["lower"] ~ "_bias", projection["bias_access"]) }}, mask={{ projection["bias_n_axis"]["logical_coordinate"] }} < {{ dim(projection["n"]) }}, other=0.0), ({{ projection["block_n"] }},)).to(tl.float32)
     {{ projection["accumulator"] }} += {{ projection["lower"] }}_bias_values{% if ctx["block_m"] != 1 %}[None, :]{% endif %}
 {% endif %}
     tl.store({{ access_pointer(model, projection["prefix"] ~ "Output", projection["lower"] ~ "_output", projection["output_access"]) }}, tl.reshape({{ projection["accumulator"] }}, {{ projection["output_structured_shape"] }}), mask={{ projection["output_mask"] }})

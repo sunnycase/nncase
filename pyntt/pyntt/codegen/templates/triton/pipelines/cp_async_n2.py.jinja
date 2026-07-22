@@ -1,0 +1,31 @@
+{% for channel in execution.channels %}
+{{ channel.allocation.descriptor_name }} = tle.gpu.alloc([{{ channel.allocation.descriptor_shape | join(", ") }}], dtype={{ channel.allocation.triton_dtype }}, layout=None, scope=tle.gpu.smem, alias={{ channel.allocation.arena_id }}, alias_offset_bytes={{ channel.allocation.arena_offset_bytes }}, nv_mma_shared_layout={{ "True" if channel.allocation.nv_mma_shared_layout else "False" }})
+{% endfor %}
+pyntt_{{ execution.symbol_suffix }}_trip_count = tl.cdiv(({{ execution.loop_stop }}) - ({{ execution.loop_start }}), {{ execution.loop_step }})
+{% if execution.partition == "tail" %}
+for pyntt_{{ execution.symbol_suffix }}_sequence in tl.range(0, pyntt_{{ execution.symbol_suffix }}_trip_count):
+    {{ execution.loop_variable }} = ({{ execution.loop_start }}) + pyntt_{{ execution.symbol_suffix }}_sequence * ({{ execution.loop_step }})
+{{ execution.produce_source | indent(4, true) }}
+    tl.debug_barrier()
+{{ execution.consume_source | indent(4, true) }}
+    tl.debug_barrier()
+{% else %}
+if pyntt_{{ execution.symbol_suffix }}_trip_count > 0:
+    {{ execution.loop_variable }} = {{ execution.loop_start }}
+{{ execution.produce_source | indent(4, true) }}
+    tle.gpu.async_commit_group()
+    for pyntt_{{ execution.symbol_suffix }}_sequence in tl.range(0, pyntt_{{ execution.symbol_suffix }}_trip_count - 1):
+        {{ execution.loop_variable }} = ({{ execution.loop_start }}) + (pyntt_{{ execution.symbol_suffix }}_sequence + 1) * ({{ execution.loop_step }})
+{{ execution.produce_source | indent(8, true) }}
+        tle.gpu.async_commit_group()
+        tle.gpu.async_wait_group(1)
+        tl.debug_barrier()
+        {{ execution.loop_variable }} = ({{ execution.loop_start }}) + pyntt_{{ execution.symbol_suffix }}_sequence * ({{ execution.loop_step }})
+{{ execution.consume_source | indent(8, true) }}
+        tl.debug_barrier()
+    tle.gpu.async_wait_group(0)
+    tl.debug_barrier()
+    {{ execution.loop_variable }} = ({{ execution.loop_start }}) + (pyntt_{{ execution.symbol_suffix }}_trip_count - 1) * ({{ execution.loop_step }})
+{{ execution.consume_source | indent(4, true) }}
+    tl.debug_barrier()
+{% endif %}

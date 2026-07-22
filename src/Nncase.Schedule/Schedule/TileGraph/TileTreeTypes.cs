@@ -1,8 +1,6 @@
 ﻿// Copyright (c) Canaan Inc. All rights reserved.
 // Licensed under the Apache license. See LICENSE file in the project root for full license information.
 
-// Copyright (c) Canaan Inc. All rights reserved.
-// Licensed under the Apache license. See LICENSE file in the project root for full license information.
 using System.Collections;
 using System.Collections.Immutable;
 using System.Diagnostics;
@@ -20,6 +18,8 @@ namespace Nncase.Schedule.TileGraph;
 public interface ITreeNode : ITileable
 {
     ITreeNode? Parent { get; }
+
+    TileDomainAxisSemantics DomainAxisSemantics { get; }
 
     TReturn Accept<TArg1, TReturn>(ITreeNodeVisitor<TArg1, TReturn> visitor, TArg1 arg1);
 }
@@ -69,6 +69,8 @@ public sealed class OpNode : ITreeNode
 
     public ImmutableArray<GridTileAxisPolicy> TileAxisPolicies => _wrapped.TileAxisPolicies;
 
+    public TileDomainAxisSemantics DomainAxisSemantics => _wrapped.DomainAxisSemantics;
+
     public ImmutableArray<MemoryEffect> LocalAccessEffects => _wrapped.LocalAccessEffects;
 
     public ImmutableArray<GridBufferAlias> BufferAliases => _wrapped.BufferAliases;
@@ -104,13 +106,6 @@ public sealed class TileNode : ITreeNode
     private readonly TieredTileGraph _wrapped;
     private readonly ITreeNode[] _children;
 
-    public TileNode(ITreeNode? parent, TieredTileGraph wrapped, ITreeNode[] children)
-    {
-        Parent = parent;
-        _wrapped = wrapped;
-        _children = children.ToArray();
-    }
-
     private TileNode(ITreeNode? parent, TieredTileGraph wrapped, int childCount)
     {
         Parent = parent;
@@ -137,6 +132,8 @@ public sealed class TileNode : ITreeNode
     public ImmutableArray<Dimension> DomainBoundExprs => _wrapped.DomainBoundExprs;
 
     public ImmutableArray<int> LoopOrder => _wrapped.LoopOrder;
+
+    public TileDomainAxisSemantics DomainAxisSemantics { get; private set; } = null!;
 
     public static TileNode FromTileGraph(TieredTileGraph rootGraph, out Dictionary<TieredTileGraph, TileNode> memo)
     {
@@ -189,6 +186,8 @@ public sealed class TileNode : ITreeNode
                 {
                     tnode._children[count++] = new OpNode(tnode, item);
                 }
+
+                tnode.CompleteConstruction();
             }
             else
             {
@@ -218,11 +217,40 @@ public sealed class TileNode : ITreeNode
                 {
                     tnode._children[count++] = ConvertToTree(tnode, item, rootGraph, memo);
                 }
+
+                tnode.CompleteConstruction();
             }
 
             memo.Add(tileGraph, tnode);
         }
 
         return tnode;
+    }
+
+    private void CompleteConstruction()
+    {
+        if (DomainAxisSemantics is not null)
+        {
+            throw new InvalidOperationException($"Tile-tree node {this} was completed more than once.");
+        }
+
+        if (_children.Any(child => child is null))
+        {
+            throw new InvalidOperationException($"Tile-tree node {this} has uninitialized children.");
+        }
+
+        var rank = DomainRelation.Map.Results.Length;
+        if (DomainBoundExprs.Length != rank)
+        {
+            throw new InvalidOperationException(
+                $"Tile-tree node {this} has rank-{rank} domain relation but {DomainBoundExprs.Length} domain bounds.");
+        }
+
+        DomainAxisSemantics = OpId == -1 || ScopeKind == TileScopeKind.Sequential
+            ? TileDomainAxisSemantics.Empty(rank)
+            : TileDomainAxisSemantics.Compose(
+                ToString(),
+                rank,
+                _children.Select(child => (child.DomainRelation, child.DomainAxisSemantics)));
     }
 }

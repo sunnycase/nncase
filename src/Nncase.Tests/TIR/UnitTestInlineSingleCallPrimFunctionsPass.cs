@@ -267,6 +267,57 @@ public sealed class UnitTestInlineSingleCallPrimFunctionsPass : TestClassBase
     }
 
     [Fact]
+    public async Task TestInlineSingleCallRebasesPointerBackedWorkspace()
+    {
+        var workspace = new BufferVar(
+            "data",
+            TensorType.Scalar(new PointerType(DataTypes.UInt8)),
+            BufferVarRole.Workspace,
+            MemoryLocation.Data);
+        var localBuffer = new Buffer(
+            "local",
+            DataTypes.Float32,
+            new MemSpan(
+                new PhysicalBuffer(DataTypes.Float32.SizeInBytes, 16, 16, MemoryLocation.Data),
+                0,
+                16),
+            new Dimension[] { 4 },
+            new Dimension[] { 1 },
+            null);
+        var callee = new PrimFunction(
+            "callee",
+            ModuleKind,
+            new Sequential(new Call(new LoadT(), localBuffer, localBuffer)),
+            new IVar[] { workspace });
+        var pointerStart = new TensorConst(Tensor.FromScalar(new Pointer<byte>(100)));
+        var actualWorkspace = new Buffer(
+            "actual_workspace",
+            DataTypes.UInt8,
+            new MemSpan(
+                new PhysicalBuffer(DataTypes.UInt8.SizeInBytes, pointerStart, 64, MemoryLocation.Data),
+                4,
+                32),
+            new Dimension[] { 32 },
+            new Dimension[] { 1 },
+            null);
+        var caller = new PrimFunction(
+            "caller",
+            ModuleKind,
+            new Sequential(new Call(callee, actualWorkspace)),
+            System.Array.Empty<IVar>());
+        var module = new IRModule(caller);
+        module.Add(callee);
+
+        await new InlineSingleCallPrimFunctionsPass(ModuleKind).RunAsync(module, new());
+
+        var load = Assert.IsType<Call>(Assert.Single(GetExecutableStatements(caller.Body)));
+        var inlinedBuffer = Assert.IsType<Buffer>(load.Arguments[0]);
+        var start = Assert.IsType<TensorConst>(inlinedBuffer.MemSpan.Buffer.Start);
+        Assert.Equal(120L, start.Value.ToScalar<long>());
+        Assert.Equal(16L, inlinedBuffer.MemSpan.Buffer.Size.FixedValue);
+    }
+
+    [Fact]
     public async Task TestInlineSingleCallTransfersReadOnlyDataAllocations()
     {
         var rdata = new TensorConst(Tensor.FromScalar(1.0f));

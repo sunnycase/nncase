@@ -114,11 +114,43 @@ internal sealed partial class TypeInferenceVisitor : ExprVisitor<IRType, Unit>
     {
         VerifySubField(expr, expr.Domain.Start, TypePatternUtility.IsDimensionType());
         VerifySubField(expr, expr.Domain.Stop, TypePatternUtility.IsDimensionType());
+        VerifySubField(expr, expr.Domain.Step, TypePatternUtility.IsDimensionType());
         VerifySubField(expr, expr.LoopVar, TypePatternUtility.IsDimensionType());
         VerifySubField(expr, expr.Body, TypePatternUtility.IsUnit());
 
         var type = TupleType.Void;
         return type;
+    }
+
+    /// <inheritdoc/>
+    protected override IRType VisitLeafPipelineFor(PipelineFor expr)
+    {
+        VerifySubField(expr, expr.Domain.Start, TypePatternUtility.IsDimensionType());
+        VerifySubField(expr, expr.Domain.Stop, TypePatternUtility.IsDimensionType());
+        VerifySubField(expr, expr.Domain.Step, TypePatternUtility.IsDimensionType());
+        VerifySubField(expr, expr.LoopVar, TypePatternUtility.IsDimensionType());
+        VerifySubField(expr, expr.ProduceBody, TypePatternUtility.IsUnit());
+        VerifySubField(expr, expr.ConsumeBody, TypePatternUtility.IsUnit());
+
+        var accesses = expr.StagedAccesses;
+        var allocations = expr.StagedAllocations;
+        var buffers = expr.StagedBuffers;
+        for (var index = 0; index < expr.BindingDescriptors.Length; index++)
+        {
+            var access = (BaseExpr)accesses[index];
+            VerifySubField(expr, access, TypePatternUtility.IsTensor());
+            VerifySubField(expr, allocations[index], TypePatternUtility.IsTensor());
+            VerifySubField(expr, buffers[index], TypePatternUtility.IsTensor());
+            if (!access.CheckedType.Equals(allocations[index].CheckedType) ||
+                !access.CheckedType.Equals(buffers[index].CheckedType))
+            {
+                return new InvalidType(
+                    $"Pipeline binding {expr.BindingDescriptors[index].ChannelId} " +
+                    "must use one consistent descriptor type.");
+            }
+        }
+
+        return TupleType.Void;
     }
 
     /// <inheritdoc/>
@@ -434,6 +466,48 @@ internal sealed partial class TypeInferenceVisitor : ExprVisitor<IRType, Unit>
             Visit(expr.Body);
             return VisitLeafLet(expr);
         }
+    }
+
+    /// <inheritdoc/>
+    protected override IRType VisitPipelineFor(PipelineFor expr)
+    {
+        if (HasVisited(expr, out var type))
+        {
+            return type;
+        }
+
+        Visit(expr.LoopVar);
+        Visit(expr.Domain);
+
+        var accesses = expr.StagedAccesses;
+        var allocations = expr.StagedAllocations;
+        var buffers = expr.StagedBuffers;
+        for (var index = 0; index < expr.BindingDescriptors.Length; index++)
+        {
+            Visit(buffers[index]);
+            Visit(allocations[index]);
+            var access = (BaseExpr)accesses[index];
+            if (access is not Var accessVariable)
+            {
+                return new InvalidType(
+                    $"Pipeline binding {expr.BindingDescriptors[index].ChannelId} " +
+                    "requires a descriptor Var.");
+            }
+
+            if (accessVariable.TypeAnnotation is not AnyType &&
+                !accessVariable.TypeAnnotation.Equals(allocations[index].CheckedType))
+            {
+                return new InvalidType(
+                    $"Pipeline binding {expr.BindingDescriptors[index].ChannelId} " +
+                    $"annotates {accessVariable.TypeAnnotation}, but its allocation has type {allocations[index].CheckedType}.");
+            }
+
+            SetCheckedType(access, allocations[index].CheckedType);
+        }
+
+        Visit(expr.ProduceBody);
+        Visit(expr.ConsumeBody);
+        return VisitLeafPipelineFor(expr);
     }
 
     protected override IRType DispatchVisit(BaseExpr expr)

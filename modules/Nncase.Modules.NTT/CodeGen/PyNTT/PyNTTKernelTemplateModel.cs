@@ -131,6 +131,13 @@ public sealed record PyNTTRegionCopyTemplateModel(
     string Comment)
 {
     public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
+
+    /// <summary>
+    /// Gets or sets a value indicating whether this global-to-shared copy is
+    /// enqueued into the explicit cp.async group owned by the surrounding
+    /// pipeline schedule. The default remains synchronous.
+    /// </summary>
+    public bool IsAsync { get; set; }
 }
 
 public sealed record PyNTTElementwiseBinaryTemplateModel(

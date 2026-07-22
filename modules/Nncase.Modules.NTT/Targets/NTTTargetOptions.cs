@@ -22,6 +22,7 @@ public class NTTTargetOptions : INTTTargetOptions, ITargetOpCostModelProvider, I
         TargetCostModel = new DefaultTargetOpCostModel(_targetMachineModel);
         BlockMicroKernelModel = new DefaultBlockMicroKernelModel();
         StorageEncodingModel = new DefaultTargetStorageEncodingModel();
+        LoopPipelineBackend = new EmptyLoopPipelineBackend();
     }
 
     [DisplayName("--model-name")]
@@ -126,10 +127,13 @@ public class NTTTargetOptions : INTTTargetOptions, ITargetOpCostModelProvider, I
 
     public ITargetStorageEncodingModelProvider StorageEncodingModel { get; protected set; }
 
+    public ILoopPipelineBackend LoopPipelineBackend { get; protected set; }
+
     protected virtual void OnTargetMachineChanged()
     {
         TargetCostModel = new DefaultTargetOpCostModel(TargetMachineModel);
         BlockMicroKernelModel = new DefaultBlockMicroKernelModel();
         StorageEncodingModel = new DefaultTargetStorageEncodingModel();
+        LoopPipelineBackend = new EmptyLoopPipelineBackend();
     }
 }

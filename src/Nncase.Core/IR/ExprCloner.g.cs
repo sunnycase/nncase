@@ -590,6 +590,65 @@ public partial class ExprCloner<TContext>
     }
 
     /// <inheritdoc />
+    protected override BaseExpr VisitLeafPipelineFor(TIR.PipelineFor expr, TContext context)
+    {
+        bool IsOperandsMutated()
+        {
+            if (IsMutated(expr.LoopVar, context))
+            {
+                return true;
+            }
+
+            if (IsMutated(expr.Domain, context))
+            {
+                return true;
+            }
+
+            if (IsMutated(expr.ProduceBody, context))
+            {
+                return true;
+            }
+
+            if (IsMutated(expr.ConsumeBody, context))
+            {
+                return true;
+            }
+
+            if (IsMutatedArray(expr.StagedAccesses, context))
+            {
+                return true;
+            }
+
+            if (IsMutatedArray(expr.StagedAllocations, context))
+            {
+                return true;
+            }
+
+            if (IsMutatedArray(expr.StagedBuffers, context))
+            {
+                return true;
+            }
+
+            return false;
+        }
+
+        if (CloneUnmutated || IsOperandsMutated())
+        {
+            return expr.With(
+                loopVar: Clone(expr.LoopVar, context),
+                domain: Clone(expr.Domain, context),
+                produceBody: Clone(expr.ProduceBody, context),
+                consumeBody: Clone(expr.ConsumeBody, context),
+                stagedAccesses: CloneArray(expr.StagedAccesses, context),
+                stagedAllocations: CloneArray(expr.StagedAllocations, context),
+                stagedBuffers: CloneArray(expr.StagedBuffers, context)
+            );
+        }
+
+        return expr;
+    }
+
+    /// <inheritdoc />
     protected override BaseExpr VisitLeafIfThenElse(TIR.IfThenElse expr, TContext context)
     {
         bool IsOperandsMutated()

@@ -70,6 +70,9 @@ public sealed class CanonicalizeTIRIndexExpressionsPass : ModulePass
                 case For loop:
                     RewriteFor(loop, context, root);
                     break;
+                case PipelineFor loop:
+                    RewritePipelineFor(loop, context, root);
+                    break;
                 case Let let:
                     RewriteLet(let, context, root);
                     break;
@@ -96,8 +99,34 @@ public sealed class CanonicalizeTIRIndexExpressionsPass : ModulePass
                     "index canonicalization requires positive-step half-open loop semantics.");
             }
 
-            var bodyContext = context.WithLoop(loop.LoopVar, domain);
-            ReplaceOperand(loop, 2, RewriteExpression(loop.Body, bodyContext, root));
+            var bodyContext = context.WithLoop(loop.LoopVar, domain, loop.Partition);
+            for (var index = 2; index < loop.Operands.Length; index++)
+            {
+                // A structured async-copy loop carries its copy/compute phases
+                // and staged descriptors as typed operands after its domain.
+                // They have the same lexical loop constraints as Body and
+                // must not bypass index canonicalization.
+                ReplaceOperand(loop, index, RewriteExpression(loop.Operands[index], bodyContext, root));
+            }
+        }
+
+        private void RewritePipelineFor(PipelineFor loop, ConstraintContext context, PrimFunction root)
+        {
+            ReplaceOperand(loop, 1, RewriteExpression(loop.Domain, context, root));
+
+            var domain = loop.Domain;
+            if (domain.Step.IsFixed && domain.Step.FixedValue <= 0)
+            {
+                throw new InvalidOperationException(
+                    $"TIR pipeline loop {loop.LoopVar.Name} has non-positive step {domain.Step.FixedValue}; " +
+                    "index canonicalization requires positive-step half-open loop semantics.");
+            }
+
+            var bodyContext = context.WithLoop(loop.LoopVar, domain, loop.Partition);
+            for (var index = 2; index < loop.Operands.Length; index++)
+            {
+                ReplaceOperand(loop, index, RewriteExpression(loop.Operands[index], bodyContext, root));
+            }
         }
 
         private void RewriteLet(Let let, ConstraintContext context, PrimFunction root)
@@ -170,16 +199,46 @@ public sealed class CanonicalizeTIRIndexExpressionsPass : ModulePass
                         ValidateSharedExpressionCore(loop.Domain, previousContext, currentContext, root, visited);
                         var previousBodyContext = previousContext.WithLoop(
                             loop.LoopVar,
-                            CanonicalizeRange(loop.Domain, previousContext));
+                            CanonicalizeRange(loop.Domain, previousContext),
+                            loop.Partition);
                         var currentBodyContext = currentContext.WithLoop(
                             loop.LoopVar,
-                            CanonicalizeRange(loop.Domain, currentContext));
-                        ValidateSharedExpressionCore(
-                            loop.Body,
-                            previousBodyContext,
-                            currentBodyContext,
-                            root,
-                            visited);
+                            CanonicalizeRange(loop.Domain, currentContext),
+                            loop.Partition);
+                        for (var index = 2; index < loop.Operands.Length; index++)
+                        {
+                            ValidateSharedExpressionCore(
+                                loop.Operands[index],
+                                previousBodyContext,
+                                currentBodyContext,
+                                root,
+                                visited);
+                        }
+
+                        break;
+                    }
+
+                case PipelineFor loop:
+                    {
+                        ValidateSharedExpressionCore(loop.Domain, previousContext, currentContext, root, visited);
+                        var previousBodyContext = previousContext.WithLoop(
+                            loop.LoopVar,
+                            CanonicalizeRange(loop.Domain, previousContext),
+                            loop.Partition);
+                        var currentBodyContext = currentContext.WithLoop(
+                            loop.LoopVar,
+                            CanonicalizeRange(loop.Domain, currentContext),
+                            loop.Partition);
+                        for (var index = 2; index < loop.Operands.Length; index++)
+                        {
+                            ValidateSharedExpressionCore(
+                                loop.Operands[index],
+                                previousBodyContext,
+                                currentBodyContext,
+                                root,
+                                visited);
+                        }
+
                         break;
                     }
 
@@ -329,7 +388,10 @@ public sealed class CanonicalizeTIRIndexExpressionsPass : ModulePass
         public ConstraintContext WithSubstitution(DimVar variable, Dimension value)
             => new(this, variable, value, Array.Empty<LinearConstraint>());
 
-        public ConstraintContext WithLoop(DimVar variable, TIR.Range domain)
+        public ConstraintContext WithLoop(
+            DimVar variable,
+            TIR.Range domain,
+            LoopPartition partition)
         {
             Dimension? substitution = null;
             if (domain.Start.IsFixed && domain.Stop.IsFixed && domain.Step.IsFixed)
@@ -346,7 +408,7 @@ public sealed class CanonicalizeTIRIndexExpressionsPass : ModulePass
             var hasPositiveStep = domain.Step.IsFixed
                 ? domain.Step.FixedValue > 0
                 : domain.Step.Metadata.Range is { Min: > 0 };
-            var constraints = new List<LinearConstraint>(2);
+            var constraints = new List<LinearConstraint>(3);
             if (hasPositiveStep)
             {
                 if (LinearConstraint.TryCreate(domain.Start, variable, out var lowerBound))
@@ -354,9 +416,18 @@ public sealed class CanonicalizeTIRIndexExpressionsPass : ModulePass
                     constraints.Add(lowerBound);
                 }
 
-                if (LinearConstraint.TryCreate(variable + 1, domain.Stop, out var upperBound))
+                var requiredRemaining = LoopFullTileProof.CanProveEveryIterationIsFull(domain, partition)
+                    ? domain.Step
+                    : (Dimension)1;
+                if (LinearConstraint.TryCreate(variable + requiredRemaining, domain.Stop, out var upperBound))
                 {
                     constraints.Add(upperBound);
+                }
+
+                if (LoopFullTileProof.TryGetLogicalStop(domain, partition, out var logicalStop) &&
+                    LinearConstraint.TryCreate(variable + requiredRemaining, logicalStop, out var logicalUpperBound))
+                {
+                    constraints.Add(logicalUpperBound);
                 }
             }
 

@@ -35,6 +35,35 @@ public static class TargetStorageEncodingIds
 }
 
 /// <summary>
+/// Symbolic staged-allocation ownership for one physical placement. Stage
+/// count is the exact one-hot expression selected by the owning lexical loop.
+/// </summary>
+public sealed record StagedAllocationContext
+{
+    public StagedAllocationContext(string channelId, IntExpr stageCount)
+    {
+        if (string.IsNullOrWhiteSpace(channelId))
+        {
+            throw new ArgumentException("Staged allocation channel identity must not be empty.", nameof(channelId));
+        }
+
+        ArgumentNullException.ThrowIfNull(stageCount);
+        var stageCountVar = stageCount.Var();
+        if (stageCountVar.Min() < 1 || stageCountVar.Max() > int.MaxValue)
+        {
+            throw new ArgumentOutOfRangeException(nameof(stageCount), $"Stage-count domain must be in [1,{int.MaxValue}], got [{stageCountVar.Min()},{stageCountVar.Max()}].");
+        }
+
+        ChannelId = channelId;
+        StageCount = stageCount;
+    }
+
+    public string ChannelId { get; }
+
+    public IntExpr StageCount { get; }
+}
+
+/// <summary>
 /// Symbolic information available when the target enumerates physical storage
 /// encodings for one candidate buffer materialization.
 /// </summary>
@@ -44,7 +73,15 @@ public sealed record TargetStorageEncodingModelContext(
     ImmutableArray<IntExpr> LogicalShape,
     IntExpr LogicalBytes,
     TargetMachineModel Machine,
-    Solver Solver);
+    Solver Solver)
+{
+    /// <summary>
+    /// Gets loop-selected staging information when this logical
+    /// materialization crosses from a producer phase to a consumer phase.
+    /// <see langword="null"/> denotes an ordinary allocation.
+    /// </summary>
+    public StagedAllocationContext? StagedAllocation { get; init; }
+}
 
 /// <summary>
 /// One symbolic parameter of a target storage encoding.
@@ -60,7 +97,23 @@ public sealed record TargetStorageEncodingCandidate(
     IntExpr PhysicalBytes,
     int AlignmentBytes,
     IntExpr EstimatedCycles,
-    ImmutableArray<TargetStorageEncodingParameter> Parameters);
+    ImmutableArray<TargetStorageEncodingParameter> Parameters)
+{
+    /// <summary>
+    /// Gets the target-owned deterministic tie-break priority. Lower values
+    /// are preferred only when complete schedules have identical predicted
+    /// latency.
+    /// </summary>
+    public int SelectionPriority { get; init; }
+
+    /// <summary>
+    /// Gets the encoded byte stride between adjacent physical stages. A target
+    /// must provide this expression when the model context has
+    /// <see cref="TargetStorageEncodingModelContext.StagedAllocation"/>; it remains
+    /// <see langword="null"/> for ordinary allocations.
+    /// </summary>
+    public IntExpr? StageStrideBytes { get; init; }
+}
 
 /// <summary>
 /// Concrete physical storage encoding carried by the selected TIR buffer.
@@ -104,6 +157,23 @@ public sealed class TargetStorageEncodingSelection : IEquatable<TargetStorageEnc
     public int AlignmentBytes { get; }
 
     public ImmutableSortedDictionary<string, long> Parameters { get; }
+
+    /// <summary>
+    /// Creates the complete physical staged layout using this encoding as the
+    /// representation of one logical stage.
+    /// </summary>
+    public StagedBufferLayout CreateStagedBufferLayout(int stageCount, long stageStrideBytes)
+    {
+        if ((stageStrideBytes % AlignmentBytes) != 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(stageStrideBytes),
+                stageStrideBytes,
+                $"Stage stride must be aligned to {AlignmentBytes} bytes for encoding {Id}.");
+        }
+
+        return new StagedBufferLayout(stageCount, PhysicalBytes, stageStrideBytes);
+    }
 
     public bool Equals(TargetStorageEncodingSelection? other)
         => other is not null

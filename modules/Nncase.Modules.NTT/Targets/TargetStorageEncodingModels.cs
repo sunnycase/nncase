@@ -14,16 +14,22 @@ namespace Nncase.Targets;
 public sealed class DefaultTargetStorageEncodingModel : ITargetStorageEncodingModelProvider
 {
     public IReadOnlyList<TargetStorageEncodingCandidate> GetCandidates(TargetStorageEncodingModelContext context)
-        =>
-        [
-            new(
-                TargetStorageEncodingIds.Linear,
-                context.Solver.MakeIntConst(1),
-                context.LogicalBytes,
-                GetNaturalAlignment(context.DataType),
-                context.Solver.MakeIntConst(0),
-                ImmutableArray<TargetStorageEncodingParameter>.Empty),
-        ];
+    {
+        var alignment = GetNaturalAlignment(context.DataType);
+        var candidate = new TargetStorageEncodingCandidate(
+            TargetStorageEncodingIds.Linear,
+            context.Solver.MakeIntConst(1),
+            context.LogicalBytes,
+            alignment,
+            context.Solver.MakeIntConst(0),
+            ImmutableArray<TargetStorageEncodingParameter>.Empty)
+        {
+            StageStrideBytes = context.StagedAllocation is null
+                ? null
+                : AlignUp(context.LogicalBytes, alignment, context.Solver),
+        };
+        return [candidate];
+    }
 
     internal static int GetNaturalAlignment(DataType dataType)
     {
@@ -33,6 +39,9 @@ public sealed class DefaultTargetStorageEncodingModel : ITargetStorageEncodingMo
 
     internal static DataType GetScalarDataType(DataType dataType)
         => dataType is VectorType vector ? GetScalarDataType(vector.ElemType) : dataType;
+
+    internal static IntExpr AlignUp(IntExpr value, int alignment, Solver solver)
+        => solver.MakeDiv(value + (alignment - 1), alignment) * alignment;
 }
 
 /// <summary>
@@ -56,14 +65,20 @@ public sealed class TritonTargetStorageEncodingModel : ITargetStorageEncodingMod
         }
 
         var alignment = Math.Max(16, DefaultTargetStorageEncodingModel.GetNaturalAlignment(context.DataType));
-        var physicalBytes = RoundUpPowerOfTwo(context.LogicalBytes, context.Solver);
+        var roundedPhysicalBytes = RoundUpPowerOfTwo(context.LogicalBytes, context.Solver);
+        var hasStorage = context.Solver.MakeIsGreaterCstVar(context.LogicalBytes, 0);
+        var physicalBytes = hasStorage * context.Solver.MakeMax(
+            roundedPhysicalBytes,
+            context.Solver.MakeIntConst(alignment));
 
-        // Ordinary accesses may pay for an incompatible shared layout. Keep
-        // the specialized encoding out of unrelated buffers while microkernel
-        // requirements select it when required. One cycle is a deterministic
-        // tie breaker, not a material data-movement cost.
-        var nvidiaMmaPreferencePenalty = context.Solver.MakeIntConst(1);
-        var packedNPreferencePenalty = context.Solver.MakeIntConst(1);
+        // Storage encoding selection changes the physical representation of
+        // an allocation; it does not execute an additional operation. Any
+        // consumer-specific benefit or restriction belongs to that
+        // microkernel's encoding requirement and execution cost. In
+        // particular, never encode a layout preference as a fake cycle: that
+        // would bias a memory-bound region after compute has already been
+        // combined with the memory envelope.
+        var encodingCycles = context.Solver.MakeIntConst(0);
         var candidates = new List<TargetStorageEncodingCandidate>
         {
             new(
@@ -71,8 +86,12 @@ public sealed class TritonTargetStorageEncodingModel : ITargetStorageEncodingMod
                 context.Solver.MakeIntConst(SupportsNvidiaMmaShared(context.DataType) ? 1 : 0),
                 physicalBytes,
                 alignment,
-                nvidiaMmaPreferencePenalty,
-                ImmutableArray<TargetStorageEncodingParameter>.Empty),
+                encodingCycles,
+                ImmutableArray<TargetStorageEncodingParameter>.Empty)
+            {
+                SelectionPriority = 2,
+                StageStrideBytes = context.StagedAllocation is null ? null : physicalBytes,
+            },
         };
         if (CanRepresentKMajorPackedN(context))
         {
@@ -81,8 +100,12 @@ public sealed class TritonTargetStorageEncodingModel : ITargetStorageEncodingMod
                 context.Solver.MakeIntConst(1),
                 physicalBytes,
                 alignment,
-                packedNPreferencePenalty,
-                ImmutableArray<TargetStorageEncodingParameter>.Empty));
+                encodingCycles,
+                ImmutableArray<TargetStorageEncodingParameter>.Empty)
+            {
+                SelectionPriority = 1,
+                StageStrideBytes = context.StagedAllocation is null ? null : physicalBytes,
+            });
         }
 
         candidates.Add(new(
@@ -91,11 +114,21 @@ public sealed class TritonTargetStorageEncodingModel : ITargetStorageEncodingMod
             physicalBytes,
             alignment,
             context.Solver.MakeIntConst(0),
-            ImmutableArray<TargetStorageEncodingParameter>.Empty));
+            ImmutableArray<TargetStorageEncodingParameter>.Empty)
+        {
+            SelectionPriority = 0,
+            StageStrideBytes = context.StagedAllocation is null ? null : physicalBytes,
+        });
         return candidates;
     }
 
-    private static IntExpr RoundUpPowerOfTwo(IntExpr logicalBytes, Solver solver)
+    /// <summary>
+    /// Gets the common physical byte size/stage stride used by every Triton
+    /// shared encoding. Keeping this target-owned helper shared with pipeline
+    /// residency accounting prevents logical copy bytes from standing in for
+    /// the actual encoded stage allocation.
+    /// </summary>
+    internal static IntExpr RoundUpPowerOfTwo(IntExpr logicalBytes, Solver solver)
     {
         var maximumBytes = logicalBytes.Var().Max();
         if (maximumBytes < 0)

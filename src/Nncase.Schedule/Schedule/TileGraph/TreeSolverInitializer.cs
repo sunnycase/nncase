@@ -67,7 +67,7 @@ public sealed class TreeSolverInitializer : TreeSolverBase<IntExpr>, ITreeNodeVi
                 $"Tile node Op{value.OpId}@{value.Level} has {value.DomainRelation.Map.Results.Length} domain results, but {domainBounds.Length} domain bounds.");
         }
 
-        var reductionAxes = ReductionAxisAnalysis.GetReductionAxes(value);
+        var reductionAxes = value.DomainAxisSemantics.ReductionAxes;
         var fixedToOne = reductionAxes
             .Select(isReduction => isReduction && value.Level > 0)
             .ToArray();

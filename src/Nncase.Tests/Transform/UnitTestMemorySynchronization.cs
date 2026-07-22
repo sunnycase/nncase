@@ -10,6 +10,7 @@ using Nncase.IR.Math;
 using Nncase.IR.NN;
 using Nncase.Passes;
 using Nncase.Passes.Transforms;
+using Nncase.Schedule;
 using Nncase.Targets;
 using Nncase.TIR;
 using Xunit;
@@ -274,6 +275,52 @@ public sealed class UnitTestMemorySynchronization : TestClassBase
     }
 
     [Fact]
+    public async Task TestInterproceduralBlockLocalProducerConsumerIsSynchronized()
+    {
+        var dataType = new TensorType(DataTypes.Float32, new[] { 64 });
+        var producerInput = new BufferVar("producer_input", dataType, BufferVarRole.Input, MemoryLocation.Input);
+        var producerOutput = new BufferVar("producer_output", dataType, BufferVarRole.Output, MemoryLocation.Data);
+        var producer = new PrimFunction(
+            "produce_data",
+            PyNTTTarget.Kind,
+            new Sequential(T.Memcopy(producerOutput, producerInput)),
+            new IVar[] { producerInput, producerOutput });
+
+        var consumerInput = new BufferVar("consumer_input", dataType, BufferVarRole.Input, MemoryLocation.Data);
+        var consumerOutput = new BufferVar("consumer_output", dataType, BufferVarRole.Output, MemoryLocation.Output);
+        var consumer = new PrimFunction(
+            "consume_data",
+            PyNTTTarget.Kind,
+            new Sequential(T.Memcopy(consumerOutput, consumerInput)),
+            new IVar[] { consumerInput, consumerOutput });
+
+        var source = CreateWorkspaceBuffer("source", DataTypes.Float32, 512, 256, [64]);
+        var intermediate = CreateWorkspaceBuffer("intermediate", DataTypes.Float32, 0, 256, [64]);
+        var destination = CreateWorkspaceBuffer("destination", DataTypes.Float32, 1024, 256, [64]);
+        var main = new PrimFunction(
+            "main",
+            PyNTTTarget.Kind,
+            new Sequential(
+                new Call(producer, source, intermediate),
+                new Call(consumer, intermediate, destination)),
+            Array.Empty<IVar>());
+        var module = new IRModule(main);
+        module.Add(producer);
+        module.Add(consumer);
+
+        await new PlanMemorySynchronizationPass(PyNTTTarget.Kind, MemorySynchronizationScopes.All).RunAsync(module, new());
+
+        var rewrittenMain = Assert.IsType<PrimFunction>(module.Entry);
+        Assert.Collection(
+            rewrittenMain.Body.Fields.ToArray(),
+            field => Assert.Equal("produce_data", Assert.IsType<PrimFunction>(Assert.IsType<Call>(field).Target).Name),
+            field => Assert.Equal(
+                TIR.NTT.BarrierScope.Block,
+                Assert.IsType<TIR.NTT.Barrier>(Assert.IsType<Call>(field).Target).Scope),
+            field => Assert.Equal("consume_data", Assert.IsType<PrimFunction>(Assert.IsType<Call>(field).Target).Name));
+    }
+
+    [Fact]
     public async Task TestPhysicalWorkspaceReuseSynchronizesDistinctLogicalWriters()
     {
         var firstSource = CreateWorkspaceBuffer("first_source", DataTypes.Float32, 512, 256, [64]);
@@ -351,6 +398,156 @@ public sealed class UnitTestMemorySynchronization : TestClassBase
     }
 
     [Fact]
+    public async Task TestNestedSynchronizedLoopDoesNotAddOuterExitBarrier()
+    {
+        var source = CreateWorkspaceBuffer("nested_source", DataTypes.Float32, 0, 256, [64]);
+        var destination = CreateWorkspaceBuffer("nested_destination", DataTypes.Float32, 512, 256, [64]);
+        var shared = CreateSharedBuffer("nested_staging", 0);
+        var inner = new Nncase.TIR.For(
+            new DimVar("nested_inner"),
+            new Nncase.TIR.Range(0, 4, 1),
+            LoopMode.Reduction,
+            new Sequential(
+                T.Memcopy(shared, source),
+                T.Memcopy(destination, shared)));
+        var outer = new Nncase.TIR.For(
+            new DimVar("nested_outer"),
+            new Nncase.TIR.Range(0, 2, 1),
+            LoopMode.Serial,
+            new Sequential(inner));
+        var main = new PrimFunction(
+            "main",
+            PyNTTTarget.Kind,
+            new Sequential(outer),
+            Array.Empty<IVar>());
+        var module = new IRModule(main);
+
+        await new PlanMemorySynchronizationPass(PyNTTTarget.Kind, MemorySynchronizationScopes.All).RunAsync(module, new());
+
+        var rewrittenMain = Assert.IsType<PrimFunction>(module.Entry);
+        var rewrittenOuter = Assert.IsType<Nncase.TIR.For>(Assert.Single(rewrittenMain.Body.Fields.ToArray()));
+        var rewrittenInner = Assert.IsType<Nncase.TIR.For>(Assert.Single(rewrittenOuter.Body.Fields.ToArray()));
+        Assert.Equal(
+            2,
+            ExprCollector.Collect(rewrittenInner.Body)
+                .OfType<Call>()
+                .Count(call => call.Target is TIR.NTT.Barrier));
+    }
+
+    [Fact]
+    public async Task TestSynchronizedZeroTripLoopDoesNotDischargeEarlierEffects()
+    {
+        var source = CreateWorkspaceBuffer("zero_trip_source", DataTypes.Float32, 0, 256, [64]);
+        var destination = CreateWorkspaceBuffer("zero_trip_destination", DataTypes.Float32, 512, 256, [64]);
+        var loopSource = CreateWorkspaceBuffer("zero_trip_loop_source", DataTypes.Float32, 1024, 256, [64]);
+        var loopDestination = CreateWorkspaceBuffer("zero_trip_loop_destination", DataTypes.Float32, 1536, 256, [64]);
+        var shared = CreateSharedBuffer("zero_trip_pending", 0);
+        var loopShared = CreateSharedBuffer("zero_trip_loop_staging", 256);
+        var loop = new Nncase.TIR.For(
+            new DimVar("zero_trip_loop"),
+            new Nncase.TIR.Range(0, 0, 1),
+            LoopMode.Reduction,
+            new Sequential(
+                T.Memcopy(loopShared, loopSource),
+                T.Memcopy(loopDestination, loopShared)));
+        var main = new PrimFunction(
+            "main",
+            PyNTTTarget.Kind,
+            new Sequential(
+                T.Memcopy(shared, source),
+                loop,
+                T.Memcopy(destination, shared)),
+            Array.Empty<IVar>());
+        var module = new IRModule(main);
+
+        await new PlanMemorySynchronizationPass(PyNTTTarget.Kind, MemorySynchronizationScopes.All).RunAsync(module, new());
+
+        var rewrittenMain = Assert.IsType<PrimFunction>(module.Entry);
+        Assert.Collection(
+            rewrittenMain.Body.Fields.ToArray(),
+            field => Assert.IsType<Memcopy>(Assert.IsType<Call>(field).Target),
+            field => Assert.IsType<Nncase.TIR.For>(field),
+            field => Assert.Equal(
+                TIR.NTT.BarrierScope.Block,
+                Assert.IsType<TIR.NTT.Barrier>(Assert.IsType<Call>(field).Target).Scope),
+            field => Assert.IsType<Memcopy>(Assert.IsType<Call>(field).Target));
+    }
+
+    [Fact]
+    public async Task TestUnsynchronizedLoopEffectStillRequiresBoundaryBarrier()
+    {
+        var source = CreateWorkspaceBuffer("boundary_source", DataTypes.Float32, 0, 256, [64]);
+        var destination = CreateWorkspaceBuffer("boundary_destination", DataTypes.Float32, 512, 256, [64]);
+        var shared = CreateSharedBuffer("boundary_staging", 0);
+        var loop = new Nncase.TIR.For(
+            new DimVar("boundary_loop"),
+            new Nncase.TIR.Range(0, 4, 1),
+            LoopMode.Serial,
+            new Sequential(T.Memcopy(shared, source)));
+        var main = new PrimFunction(
+            "main",
+            PyNTTTarget.Kind,
+            new Sequential(loop, T.Memcopy(destination, shared)),
+            Array.Empty<IVar>());
+        var module = new IRModule(main);
+
+        await new PlanMemorySynchronizationPass(PyNTTTarget.Kind, MemorySynchronizationScopes.All).RunAsync(module, new());
+
+        var rewrittenMain = Assert.IsType<PrimFunction>(module.Entry);
+        Assert.Collection(
+            rewrittenMain.Body.Fields.ToArray(),
+            field => Assert.IsType<Nncase.TIR.For>(field),
+            field => Assert.Equal(
+                TIR.NTT.BarrierScope.Block,
+                Assert.IsType<TIR.NTT.Barrier>(Assert.IsType<Call>(field).Target).Scope),
+            field => Assert.IsType<Memcopy>(Assert.IsType<Call>(field).Target));
+    }
+
+    [Fact]
+    public async Task TestAsyncCopyPipelinePlansPhasesIndependentlyAndDischargesBlockEffects()
+    {
+        var source = CreateWorkspaceBuffer("pipeline_source", DataTypes.Float32, 4096, 256, [64]);
+        var destination = CreateWorkspaceBuffer("pipeline_destination", DataTypes.Float32, 8192, 256, [64]);
+        var boundaryDestination = CreateWorkspaceBuffer("pipeline_boundary_destination", DataTypes.Float32, 12288, 256, [64]);
+        var staged = CreateStagedSharedBuffer("pipeline_staged", 0);
+        var stagedAccess = new Var(
+            "pipeline_staged_access",
+            new TensorType(DataTypes.Float32, new[] { 64 }));
+        var allocation = IR.F.Buffer.AllocateBufferView(staged, new RankedShape(0));
+        var stage = CreatePipelineStageAlias(staged, "pipeline_staged_stage", 0);
+        var loop = CreateAsyncCopyPipelineLoop(
+            stagedAccess,
+            allocation,
+            staged,
+            new Sequential(T.Memcopy(stage, source)),
+            new Sequential(T.Memcopy(destination, stage)));
+        var main = new PrimFunction(
+            "main",
+            PyNTTTarget.Kind,
+            new Sequential(loop, T.Memcopy(boundaryDestination, staged)),
+            Array.Empty<IVar>());
+        Assert.True(main.InferenceType());
+        var module = new IRModule(main);
+
+        await new PlanMemorySynchronizationPass(PyNTTTarget.Kind, MemorySynchronizationScopes.All).RunAsync(module, new());
+
+        var rewrittenMain = Assert.IsType<PrimFunction>(module.Entry);
+        Assert.Collection(
+            rewrittenMain.Body.Fields.ToArray(),
+            field =>
+            {
+                var rewrittenLoop = Assert.IsType<Nncase.TIR.PipelineFor>(field);
+                Assert.DoesNotContain(
+                    ExprCollector.Collect(rewrittenLoop.ProduceBody).OfType<Call>(),
+                    call => call.Target is TIR.NTT.Barrier);
+                Assert.DoesNotContain(
+                    ExprCollector.Collect(rewrittenLoop.ConsumeBody).OfType<Call>(),
+                    call => call.Target is TIR.NTT.Barrier);
+            },
+            field => Assert.IsType<Memcopy>(Assert.IsType<Call>(field).Target));
+    }
+
+    [Fact]
     public async Task TestBackendManagedBlockSynchronizationIsNotMaterialized()
     {
         var source = CreateWorkspaceBuffer("source", DataTypes.Float32, 0, 256, [64]);
@@ -410,6 +607,107 @@ public sealed class UnitTestMemorySynchronization : TestClassBase
             shape,
             TensorUtilities.GetDefaultStrides(shape).Select(stride => (Dimension)stride).ToArray(),
             null);
+    }
+
+    private static Nncase.TIR.Buffer CreateSharedBuffer(string name, ulong offset)
+    {
+        const long sizeBytes = 256;
+        var physical = new PhysicalBuffer(
+            DataTypes.Float32.SizeInBytes,
+            Tensor.FromPointer(offset, DataTypes.Float32),
+            sizeBytes,
+            MemoryLocation.Shared);
+        return new Nncase.TIR.Buffer(
+            name,
+            DataTypes.Float32,
+            new MemSpan(physical, 0, sizeBytes),
+            new Dimension[] { 64 },
+            new Dimension[] { 1 },
+            null);
+    }
+
+    private static Nncase.TIR.Buffer CreateStagedSharedBuffer(string name, ulong offset)
+    {
+        const long stageBytes = 256;
+        const int stageCount = 2;
+        var encoding = new TargetStorageEncodingSelection(
+            TargetStorageEncodingIds.Linear,
+            stageBytes,
+            DataTypes.Float32.SizeInBytes,
+            Array.Empty<KeyValuePair<string, long>>());
+        var layout = encoding.CreateStagedBufferLayout(stageCount, stageBytes);
+        var physical = new PhysicalBuffer(
+            DataTypes.Float32.SizeInBytes,
+            Tensor.FromPointer(offset, DataTypes.Float32),
+            layout.PhysicalBytes,
+            MemoryLocation.Shared);
+        return new Nncase.TIR.Buffer(
+            name,
+            DataTypes.Float32,
+            new MemSpan(physical, 0, layout.PhysicalBytes),
+            new Dimension[] { 64 },
+            new Dimension[] { 1 },
+            null,
+            encoding,
+            layout);
+    }
+
+    private static Nncase.TIR.Buffer CreatePipelineStageAlias(
+        Nncase.TIR.Buffer source,
+        string name,
+        Dimension byteOffset)
+    {
+        var layout = source.StagedLayout ?? throw new ArgumentException(
+            $"Buffer {source.Name} is not a staged allocation.",
+            nameof(source));
+        return new Nncase.TIR.Buffer(
+            name,
+            source.ElemType,
+            source.MemSpan.With(
+                start: source.MemSpan.Start + byteOffset,
+                size: layout.StagePhysicalBytes),
+            source.Dimensions.ToArray(),
+            source.Strides.ToArray(),
+            source.DistributedType,
+            source.StorageEncoding);
+    }
+
+    private static Nncase.TIR.PipelineFor CreateAsyncCopyPipelineLoop(
+        IVar stagedAccess,
+        Expr allocation,
+        Nncase.TIR.Buffer staged,
+        Sequential copyBody,
+        Sequential computeBody)
+    {
+        var plan = new PipelineRegionPlan(
+            "test.cp_async.n2",
+            TritonLoopPipelineBackend.CpAsyncN2TemplateId,
+            TritonLoopPipelineBackend.CpAsyncN2Synchronization,
+            stageCount: 2,
+            prefetchDistance: 1,
+            PipelineTailPolicy.Serial,
+            [
+                new PipelineStageChannelPlan(
+                    "tile",
+                    new TargetMemorySpaceId("gpu.block-global"),
+                    new TargetMemorySpaceId("gpu.shared")),
+            ]);
+        return new Nncase.TIR.PipelineFor(
+            new DimVar("pipeline_k"),
+            new Nncase.TIR.Range(0, 2, 1),
+            LoopMode.Reduction,
+            LoopPartition.Full,
+            copyBody,
+            computeBody,
+            plan,
+            new PipelineRegionId("test", "op0/reduction0"),
+            [new(
+                "tile",
+                new TargetMemorySpaceId("gpu.block-global"),
+                new TargetMemorySpaceId("gpu.shared"))],
+            [stagedAccess],
+            [allocation],
+            [staged]);
     }
 
     private static Call CreateChipTransfer(Expr buffer)

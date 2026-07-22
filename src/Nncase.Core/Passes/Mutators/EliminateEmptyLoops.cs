@@ -13,23 +13,29 @@ public sealed class EliminateEmptyLoops : ExprRewriter
 {
     /// <inheritdoc/>
     protected override BaseExpr RewriteLeafFor(For expr)
+        => RewriteLoop(expr, expr.LoopVar, expr.Domain);
+
+    /// <inheritdoc/>
+    protected override BaseExpr RewriteLeafPipelineFor(PipelineFor expr)
+        => RewriteLoop(expr, expr.LoopVar, expr.Domain);
+
+    private BaseExpr RewriteLoop(BaseExpr loop, DimVar loopVar, TIR.Range domain)
     {
-        var domain = expr.Domain;
         if (!domain.Start.IsFixed || !domain.Stop.IsFixed || !domain.Step.IsFixed)
         {
-            return expr;
+            return loop;
         }
 
         if (domain.Step.FixedValue <= 0)
         {
             throw new InvalidOperationException(
-                $"TIR loop {expr.LoopVar.Name} has non-positive step {domain.Step.FixedValue}; " +
+                $"TIR loop {loopVar.Name} has non-positive step {domain.Step.FixedValue}; " +
                 "empty-loop elimination requires positive-step half-open loop semantics.");
         }
 
         if (domain.Start.FixedValue < domain.Stop.FixedValue)
         {
-            return expr;
+            return loop;
         }
 
         SetMutated();

@@ -161,6 +161,7 @@ public sealed class TileGrid : ITileable
         }
 
         TileAxisPolicies = ImmutableArray.CreateRange(grid.TileAxisPolicies);
+        DomainAxisSemantics = TileDomainAxisSemantics.FromGrid(RegionOpId, TileAxisPolicies);
         var bodyAnalysis = new GridMemoryEffectAnalysis().Analyze(grid);
         LocalAccessEffects = bodyAnalysis.Effects;
         BufferAliases = bodyAnalysis.BufferAliases;
@@ -199,6 +200,8 @@ public sealed class TileGrid : ITileable
     public ImmutableArray<AffineMap> AccessMaps { get; }
 
     public ImmutableArray<GridTileAxisPolicy> TileAxisPolicies { get; }
+
+    public TileDomainAxisSemantics DomainAxisSemantics { get; }
 
     public ImmutableArray<MemoryEffect> LocalAccessEffects { get; }
 
@@ -254,6 +257,8 @@ public sealed class TieredTileGraph : TieredAdjacencyGraph<TileGrid, EquatableTa
         Level = -1;
         ScopeKind = TileScopeKind.Iteration;
         DomainRelation = new(-1, -1, IR.Affine.AffineMap.Identity(0));
+        DomainDynamic = ImmutableArray<bool>.Empty;
+        DomainBoundExprs = ImmutableArray<Dimension>.Empty;
         LoopOrder = ImmutableArray<int>.Empty;
     }
 
@@ -275,6 +280,22 @@ public sealed class TieredTileGraph : TieredAdjacencyGraph<TileGrid, EquatableTa
         DomainDynamic = ImmutableArray.CreateRange(domainDynamic);
         DomainBoundExprs = ImmutableArray.CreateRange(domainBoundsExpr);
         LoopOrder = ImmutableArray.CreateRange(loopOrder);
+        if (DomainRelation.Map.Results.Length != DomainBoundExprs.Length)
+        {
+            throw new ArgumentException(
+                $"Tile scope Op{opid}@L{level} has a rank-{DomainRelation.Map.Results.Length} domain relation " +
+                $"but {DomainBoundExprs.Length} domain bounds.",
+                nameof(relation));
+        }
+
+        if (DomainDynamic.Length != DomainBoundExprs.Length)
+        {
+            throw new ArgumentException(
+                $"Tile scope Op{opid}@L{level} has {DomainBoundExprs.Length} domain bounds " +
+                $"but {DomainDynamic.Length} dynamic-axis flags.",
+                nameof(domainDynamic));
+        }
+
         ValidateLoopOrder(LoopOrder, DomainBoundExprs.Length, $"Op{opid}@L{level}");
 
         if (ScopeKind == TileScopeKind.Sequential &&

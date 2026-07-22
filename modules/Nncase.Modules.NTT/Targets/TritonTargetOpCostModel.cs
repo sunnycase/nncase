@@ -5,6 +5,7 @@ using System;
 using System.Linq;
 using Nncase.CostModel;
 using Nncase.IR;
+using Nncase.Schedule;
 
 namespace Nncase.Targets;
 
@@ -274,7 +275,7 @@ public sealed class TritonTargetOpCostModel : ITargetOpCostModel, IHierarchicalT
 
     private double EstimateDotInstructionCycles(MatrixComputePrimitiveSpec instruction, long m, long n, long k, double batch)
     {
-        if (instruction.M <= 0 || instruction.N <= 0 || instruction.K <= 0 || instruction.InstructionsPerCyclePerBlock <= 0)
+        if (instruction.M <= 0 || instruction.N <= 0 || instruction.K <= 0)
         {
             return double.PositiveInfinity;
         }
@@ -282,8 +283,12 @@ public sealed class TritonTargetOpCostModel : ITargetOpCostModel, IHierarchicalT
         var mTiles = CeilDiv(m, instruction.M);
         var nTiles = CeilDiv(n, instruction.N);
         var kTiles = CeilDiv(k, instruction.K);
-        var blockTiles = Math.Max(1.0, mTiles * nTiles * batch);
-        return blockTiles * kTiles / instruction.InstructionsPerCyclePerBlock;
+        var accumulatorChains = Math.Max(1.0, mTiles * nTiles * batch);
+        return MatrixComputeCostModel.EstimateCycles(
+            instruction,
+            accumulatorChains,
+            kTiles,
+            _machine.Execution);
     }
 
     private static double GetMemoryLatency(double bytes, TargetMemoryResourceSpec memorySpace)

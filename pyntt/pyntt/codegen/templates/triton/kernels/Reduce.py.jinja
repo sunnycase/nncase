@@ -21,17 +21,15 @@ def {{ model["FunctionName"] }}({{ helper_parameters(model) }}):
 {{ base }}for axis_start in tl.range(0, {{ dim(ctx["block_extent"]) }}, block_size):
 {{ body }}lane = axis_start + tl.arange(0, block_size)
 {{ body }}mask = lane < {{ dim(ctx["block_extent"]) }}
-{{ body }}input_base = {{ ctx["input_base"] }}
-{{ body }}output_offsets = {{ ctx["output_offset"] }}
 {{ body }}acc = tl.full((block_size,), {{ model["InitValue"] }}, tl.float32)
 {% for axis in model["Axes"] %}
 {{ "    " * ((ctx["loop_axes"] | length) + loop.index + 1) }}for reduce_idx{{ axis }} in tl.range(0, {{ dim(model["InputShape"][axis]) }}):
 {% endfor %}
 {% set reduce_body = "    " * ((ctx["loop_axes"] | length) + (model["Axes"] | length) + 2) %}
-{{ reduce_body }}value0 = tl.load({{ access_pointer(model, "Input", "input0", "input_base + " ~ ctx["reduce_offset"]) }}, mask=mask, other={{ model["InitValue"] }})
+{{ reduce_body }}value0 = tl.load({{ access_pointer(model, "Input", "input0", ctx["input_access"]) }}, mask=mask, other={{ model["InitValue"] }})
 {{ reduce_body }}acc = {{ model["UpdateExpression"] }}
 {{ body }}result = {{ model["FinalizeExpression"] }}
-{{ body }}tl.store({{ access_pointer(model, "Output", "output", "output_offsets") }}, result, mask=mask)
+{{ body }}tl.store({{ access_pointer(model, "Output", "output", ctx["output_access"]) }}, result, mask=mask)
 {% elif ctx["phase"] == "accumulate" %}
 # generated from PyNTT Jinja Reduce.py.jinja reduction accumulate
 # {{ model["Comment"] }}; op={{ model["ReduceOp"] }}, accumulator=backend-private
@@ -51,12 +49,11 @@ def {{ model["FunctionName"] }}({{ helper_parameters(model, ctx["state_parameter
     tmp = tmp // {{ dim(model["OutputShape"][axis]) }}
 {% endfor %}
 {% endif %}
-    input_base = {{ ctx["input_base"] }}
 {% for axis in model["Axes"] %}
 {{ "    " * loop.index }}for reduce_idx{{ axis }} in tl.range(0, {{ dim(model["InputShape"][axis]) }}):
 {% endfor %}
 {% set body = "    " * ((model["Axes"] | length) + 1) %}
-{{ body }}value0 = tl.load({{ access_pointer(model, "Input", "input0", "input_base + " ~ ctx["reduce_offset"]) }}, mask=mask, other={{ model["InitValue"] }})
+{{ body }}value0 = tl.load({{ access_pointer(model, "Input", "input0", ctx["input_access"]) }}, mask=mask, other={{ model["InitValue"] }})
 {{ body }}acc = {{ model["UpdateExpression"] }}
 {% if ctx["track_element_count"] %}
     reduced_element_count += {{ dim(ctx["tile_element_count"]) }}
@@ -84,5 +81,5 @@ def {{ model["FunctionName"] }}({{ helper_parameters(model, ctx["state_parameter
 {% endfor %}
 {% endif %}
     result = {{ model["FinalizeExpression"] }}
-    tl.store({{ access_pointer(model, "Output", "output", ctx["output_offset"]) }}, result, mask=mask)
+    tl.store({{ access_pointer(model, "Output", "output", ctx["output_access"]) }}, result, mask=mask)
 {% endif %}

@@ -2,10 +2,13 @@
 // Licensed under the Apache license. See LICENSE file in the project root for full license information.
 
 using System;
+using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
 using Nncase.IR;
 using Nncase.Passes.Transforms;
+using Nncase.Schedule;
+using Nncase.Targets;
 using Nncase.Tests.TestFixture;
 using Nncase.TIR;
 using Xunit;
@@ -57,6 +60,74 @@ public sealed class UnitTestCanonicalizeTIRIndexExpressionsPass : TestClassBase
     }
 
     [Fact]
+    public async Task TestFullPartitionCanonicalizesDynamicFullTileExtent()
+    {
+        var stop = MakeDynamicDimension("full_end", 128, 1024);
+        var loopVar = new DimVar("reduce_offset");
+        var extent = Dimension.Min(128, stop - loopVar);
+        var physicalBuffer = new PhysicalBuffer(16, 4096, MemoryLocation.Data);
+        var buffer = new Nncase.TIR.Buffer(
+            "full_tile",
+            DataTypes.UInt8,
+            new MemSpan(physicalBuffer, 0, 4096),
+            [extent],
+            [1],
+            null);
+        var load = new Call(new LoadT(), buffer, buffer);
+        var loop = new For(
+            loopVar,
+            new TIR.Range(0, stop, 128),
+            LoopMode.Reduction,
+            new Sequential(load),
+            LoopPartition.Full);
+        var function = new PrimFunction(
+            "canonicalize_full_partition",
+            ModuleKind,
+            new Sequential(loop),
+            [stop]);
+        var module = new IRModule(function);
+
+        await new CanonicalizeTIRIndexExpressionsPass().RunAsync(module, new());
+
+        Assert.Equal(128L, buffer.Dimensions[0].FixedValue);
+    }
+
+    [Fact]
+    public async Task TestPeeledFullPartitionCanonicalizesExtentAgainstLogicalStop()
+    {
+        var remaining = MakeDynamicDimension("remaining", 0, 149);
+        var logicalStop = Dimension.Min(8, remaining);
+        var loopVar = new DimVar("n_offset");
+        var extent = Dimension.Min(2, logicalStop - loopVar);
+        var fullEnd = (logicalStop / 2) * 2;
+        var physicalBuffer = new PhysicalBuffer(16, 4096, MemoryLocation.Shared);
+        var buffer = new Nncase.TIR.Buffer(
+            "peeled_full_tile",
+            DataTypes.UInt8,
+            new MemSpan(physicalBuffer, 0, 4096),
+            [extent, 256],
+            [256, 1],
+            null);
+        var loop = new For(
+            loopVar,
+            new TIR.Range(0, fullEnd, 2),
+            LoopMode.Serial,
+            new Sequential(new Call(new LoadT(), buffer, buffer)),
+            LoopPartition.Full);
+        var function = new PrimFunction(
+            "canonicalize_peeled_full_partition",
+            ModuleKind,
+            new Sequential(loop),
+            [remaining]);
+        var module = new IRModule(function);
+
+        await new CanonicalizeTIRIndexExpressionsPass().RunAsync(module, new());
+
+        Assert.Equal(2L, buffer.Dimensions[0].FixedValue);
+        Assert.Equal(256L, buffer.Dimensions[1].FixedValue);
+    }
+
+    [Fact]
     public async Task TestDynamicTiledLoopPreservesTailMinAndRemovesRedundantClamp()
     {
         var sequenceLength = MakeDynamicDimension("sequence_length", 1, 1024);
@@ -78,6 +149,95 @@ public sealed class UnitTestCanonicalizeTIRIndexExpressionsPass : TestClassBase
         Assert.Contains(tailExtent.Operands.ToArray(), operand => operand.IsFixed && operand.FixedValue == 128);
         Assert.Contains(ExprCollector.Collect(tailExtent), expression => ReferenceEquals(expression, loopVar));
         Assert.DoesNotContain(ExprCollector.Collect(tailExtent), expression => expression is DimMax);
+    }
+
+    [Fact]
+    public async Task TestFixedDivisibleAsyncCopyLoopCanonicalizesFullTransportTile()
+    {
+        var loopVar = new DimVar("reduce_offset");
+        var clippedExtent = Dimension.Select(8, loopVar + 1, 2, 4);
+        var source = new Nncase.TIR.Buffer(
+            "source_tile",
+            DataTypes.Float32,
+            new MemSpan(new PhysicalBuffer(4, 32, MemoryLocation.Data)),
+            [clippedExtent],
+            [1],
+            null);
+        var encoding = new TargetStorageEncodingSelection(
+            new TargetStorageEncodingId("test.shared"),
+            physicalBytes: 16,
+            alignmentBytes: 4,
+            Array.Empty<KeyValuePair<string, long>>());
+        var layout = encoding.CreateStagedBufferLayout(stageCount: 2, stageStrideBytes: 16);
+        var staged = new Nncase.TIR.Buffer(
+            "staged_tile",
+            DataTypes.Float32,
+            new MemSpan(new PhysicalBuffer(4, layout.PhysicalBytes, MemoryLocation.Shared)),
+            [clippedExtent],
+            [1],
+            null,
+            encoding,
+            layout);
+        var access = new Var("staged_access");
+        var allocation = IR.F.Buffer.AllocateBufferView(staged, new RankedShape(0));
+        var stageBuffer = new Nncase.TIR.Buffer(
+            "copy_stage_buffer",
+            staged.ElemType,
+            staged.MemSpan.With(size: layout.StagePhysicalBytes),
+            staged.Dimensions.ToArray(),
+            staged.Strides.ToArray(),
+            staged.DistributedType,
+            staged.StorageEncoding);
+        var copyBody = TIR.T.Let(
+            out var stage,
+            stageBuffer,
+            "copy_stage")
+            .Body(new Sequential(TIR.T.TileLoad(stage, source)))
+            .Build();
+        var plan = MakeCpAsyncPlan();
+        var loop = new PipelineFor(
+            loopVar,
+            new TIR.Range(0, 8, 4),
+            LoopMode.Reduction,
+            LoopPartition.Unpartitioned,
+            new Sequential(copyBody),
+            new Sequential(TIR.T.Nop()),
+            plan,
+            new PipelineRegionId("canonicalize_async_copy", "test/full-transport"),
+            [new(
+                "lhs",
+                new TargetMemorySpaceId("gpu.block-global"),
+                new TargetMemorySpaceId("gpu.shared"))],
+            [access],
+            [allocation],
+            [staged]);
+        var function = new PrimFunction(
+            "canonicalize_async_copy",
+            ModuleKind,
+            new Sequential(loop),
+            Array.Empty<IVar>());
+        var module = new IRModule(function);
+
+        await new CanonicalizeTIRIndexExpressionsPass().RunAsync(module, new());
+
+        Assert.Equal(4L, source.Dimensions[0].FixedValue);
+        Assert.Equal(4L, staged.Dimensions[0].FixedValue);
+        Assert.Same(staged, Assert.Single(loop.StagedBuffers.ToArray()));
+    }
+
+    [Fact]
+    public async Task TestNonDivisibleUnpartitionedLoopPreservesClippedTransportTile()
+    {
+        var loopVar = new DimVar("reduce_offset");
+        var extent = Dimension.Min(4, 10 - loopVar);
+        var (module, _, buffer, _) = MakeLoopFunction(
+            loopVar,
+            new TIR.Range(0, 10, 4),
+            extent);
+
+        await new CanonicalizeTIRIndexExpressionsPass().RunAsync(module, new());
+
+        Assert.IsType<DimMin>(buffer.Dimensions[0]);
     }
 
     [Fact]
@@ -172,6 +332,21 @@ public sealed class UnitTestCanonicalizeTIRIndexExpressionsPass : TestClassBase
                 Range = new(min, max),
             },
         };
+
+    private static PipelineRegionPlan MakeCpAsyncPlan()
+        => new(
+            "test.cp_async.n2",
+            TritonLoopPipelineBackend.CpAsyncN2TemplateId,
+            TritonLoopPipelineBackend.CpAsyncN2Synchronization,
+            stageCount: 2,
+            prefetchDistance: 1,
+            PipelineTailPolicy.Serial,
+            [
+                new PipelineStageChannelPlan(
+                    "lhs",
+                    new TargetMemorySpaceId("gpu.block-global"),
+                    new TargetMemorySpaceId("gpu.shared")),
+            ]);
 
     private static (IRModule Module, PrimFunction Function, TIR.Buffer Buffer, PhysicalBuffer PhysicalBuffer) MakeLoopFunction(
         DimVar loopVar,

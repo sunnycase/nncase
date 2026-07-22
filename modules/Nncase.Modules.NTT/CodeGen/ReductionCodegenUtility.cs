@@ -67,37 +67,94 @@ internal static class ReductionCodegenUtility
         return operands.ToArray();
     }
 
-    internal static bool TryGetAdjacentReductionLoopPartitionPair(
+    internal static bool TryGetReductionLoopPartitionPair(
         ReadOnlySpan<Expr> fields,
         int index,
-        out For fullLoop,
-        out For tailLoop)
+        out ReductionLoopPartitionPair pair)
     {
-        fullLoop = null!;
-        tailLoop = null!;
-        if (fields[index] is not For { Partition: LoopPartition.Full, Mode: LoopMode.Reduction } loop ||
-            index + 1 >= fields.Length ||
-            fields[index + 1] is not For { Partition: LoopPartition.Tail } candidateTail)
+        pair = null!;
+        if ((uint)index >= (uint)fields.Length)
         {
             return false;
         }
 
-        if (loop.Mode != candidateTail.Mode ||
-            !loop.Domain.Stop.Equals(candidateTail.Domain.Start) ||
-            !loop.Domain.Step.Equals(candidateTail.Domain.Step))
+        var fullLoop = fields[index];
+        var fullDomain = fullLoop switch
         {
-            throw new InvalidOperationException(
-                $"Malformed full/tail loop pair {loop.LoopVar.Name}/{candidateTail.LoopVar.Name}: " +
-                "the loops must have the same mode and step, and share the partition boundary.");
+            For { Partition: LoopPartition.Full, Mode: LoopMode.Reduction } loop => loop.Domain,
+            PipelineFor { Partition: LoopPartition.Full, Mode: LoopMode.Reduction } loop => loop.Domain,
+            _ => null,
+        };
+        if (fullDomain is null)
+        {
+            return false;
         }
 
-        fullLoop = loop;
-        tailLoop = candidateTail;
+        var synchronizationFields = new List<Expr>();
+        var tailIndex = index + 1;
+        while (tailIndex < fields.Length && IsInterPartitionSynchronization(fields[tailIndex]))
+        {
+            synchronizationFields.Add(fields[tailIndex]);
+            tailIndex++;
+        }
+
+        if (tailIndex >= fields.Length)
+        {
+            return false;
+        }
+
+        var tailLoop = fields[tailIndex];
+        var tailDomain = tailLoop switch
+        {
+            For { Partition: LoopPartition.Tail, Mode: LoopMode.Reduction } loop => loop.Domain,
+            PipelineFor { Partition: LoopPartition.Tail, Mode: LoopMode.Reduction } loop => loop.Domain,
+            _ => null,
+        };
+        if (tailDomain is null)
+        {
+            return false;
+        }
+
+        if ((fullLoop is PipelineFor) != (tailLoop is PipelineFor))
+        {
+            throw new InvalidOperationException(
+                $"Malformed full/tail reduction loop pair at fields {index}/{tailIndex}: " +
+                "both partitions must use the same TIR loop representation.");
+        }
+
+        if (fullLoop is PipelineFor fullPipeline && tailLoop is PipelineFor tailPipeline &&
+            (fullPipeline.Plan != tailPipeline.Plan ||
+             fullPipeline.BindingDescriptors.Length != tailPipeline.BindingDescriptors.Length ||
+             !fullPipeline.BindingDescriptors.SequenceEqual(tailPipeline.BindingDescriptors)))
+        {
+            throw new InvalidOperationException(
+                $"Malformed pipeline reduction pair at fields {index}/{tailIndex}: " +
+                "full and tail partitions must share one schedule and channel contract.");
+        }
+
+        if (!fullDomain.Stop.Equals(tailDomain.Start) ||
+            !fullDomain.Step.Equals(tailDomain.Step))
+        {
+            throw new InvalidOperationException(
+                $"Malformed full/tail reduction loop pair at fields {index}/{tailIndex}: " +
+                "the loops must have the same step and share the partition boundary.");
+        }
+
+        pair = new(
+            fullLoop,
+            tailLoop,
+            synchronizationFields.ToArray(),
+            tailIndex);
         return true;
     }
 
     internal static ReductionCallGroup[] CollectReductionCallGroups(params BaseExpr[] expressions)
     {
+        if (expressions.Length == 0)
+        {
+            return Array.Empty<ReductionCallGroup>();
+        }
+
         var groups = new List<MutableReductionCallGroup>();
         for (var expressionIndex = 0; expressionIndex < expressions.Length; expressionIndex++)
         {
@@ -136,9 +193,15 @@ internal static class ReductionCodegenUtility
         }
 
         return groups
-            .Select(group => new ReductionCallGroup(group.Prototype, group.Calls.ToArray()))
+            .Select(group => new ReductionCallGroup(
+                group.Prototype,
+                group.Calls.ToArray(),
+                group.ExpectedUpdateCount))
             .ToArray();
     }
+
+    private static bool IsInterPartitionSynchronization(Expr expression)
+        => expression is Call { Target: TIR.NTT.Barrier };
 
     private static bool SameAccumulatorIdentities(
         IReadOnlyList<BaseExpr> lhs,
@@ -176,6 +239,8 @@ internal static class ReductionCodegenUtility
 
         public bool HasOneCallPerExpression => _callsPerExpression.All(count => count == 1);
 
+        public int ExpectedUpdateCount => _callsPerExpression.Sum();
+
         public void Add(Call call, int expressionIndex)
         {
             Calls.Add(call);
@@ -184,7 +249,33 @@ internal static class ReductionCodegenUtility
     }
 }
 
-internal sealed record ReductionCallGroup(Call Prototype, Call[] Calls);
+internal sealed record ReductionLoopPartitionPair(
+    Expr FullLoop,
+    Expr TailLoop,
+    IReadOnlyList<Expr> SynchronizationFields,
+    int TailFieldIndex)
+{
+    public BaseExpr FullBody => FullLoop switch
+    {
+        For loop => loop.Body,
+        PipelineFor loop => loop.ConsumeBody,
+        _ => throw new InvalidOperationException(
+            $"Unsupported full reduction partition {FullLoop.GetType().Name}."),
+    };
+
+    public BaseExpr TailBody => TailLoop switch
+    {
+        For loop => loop.Body,
+        PipelineFor loop => loop.ConsumeBody,
+        _ => throw new InvalidOperationException(
+            $"Unsupported tail reduction partition {TailLoop.GetType().Name}."),
+    };
+}
+
+internal sealed record ReductionCallGroup(
+    Call Prototype,
+    Call[] Calls,
+    int ExpectedUpdateCount);
 
 internal sealed record ReductionAccumulatorOperand(
     ParameterInfo Parameter,

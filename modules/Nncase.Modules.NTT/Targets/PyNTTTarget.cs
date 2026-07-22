@@ -49,7 +49,7 @@ public sealed class PyNTTTarget : NTTTarget
         passManager.AddWithName<PlanMemorySynchronizationPass>(
             "PlanMemorySynchronization",
             Kind,
-            MemorySynchronizationScopes.Chip);
+            MemorySynchronizationScopes.All);
     }
 
     /// <inheritdoc/>

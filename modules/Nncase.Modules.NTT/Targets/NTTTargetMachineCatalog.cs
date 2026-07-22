@@ -85,8 +85,7 @@ public static class NTTTargetMachineCatalog
                 new(blockGlobal, root, 8, 0, TargetMemoryTransferMode.DirectAccess),
                 new(blockGlobal, cache, 8, 120, TargetMemoryTransferMode.ExplicitCopy),
                 new(cache, blockGlobal, 8, 120, TargetMemoryTransferMode.ExplicitCopy),
-            ],
-            CreateBindings(root, blockGlobal));
+            ]);
     }
 
     private static TargetMachineModel CreateCudaGeneric()
@@ -101,7 +100,20 @@ public static class NTTTargetMachineCatalog
         return new TargetMachineModel(
             CudaGeneric,
             new(BlockExecutionKind.PersistentGpuBlock, 108, 8, 32, 1.4, 128, 4),
-            new(128, 64, ImmutableArray.Create(new MatrixComputePrimitiveSpec("mma", 16, 8, 16, 4, _tensorCoreOperandDataTypes))),
+            new(
+                128,
+                64,
+                ImmutableArray.Create(
+                    new MatrixComputePrimitiveSpec(
+                        "mma",
+                        16,
+                        8,
+                        16,
+                        32,
+                        32,
+                        0.25,
+                        1,
+                        _tensorCoreOperandDataTypes))),
             new(25, 2200),
             [
                 new(GpuRegisterFile, TargetPrivateResourceUnit.Register32, 255L * 8 * 32, 8 * 32),
@@ -122,8 +134,7 @@ public static class NTTTargetMachineCatalog
                 new(blockGlobal, root, 1110, 0, TargetMemoryTransferMode.DirectAccess),
                 new(blockGlobal, shared, 512, 300, TargetMemoryTransferMode.ExplicitCopy),
                 new(shared, blockGlobal, 512, 300, TargetMemoryTransferMode.ExplicitCopy),
-            ],
-            CreateBindings(root, blockGlobal));
+            ]);
     }
 
     private static TargetMachineModel CreateXpuGeneric()
@@ -155,8 +166,7 @@ public static class NTTTargetMachineCatalog
                 new(blockGlobal, root, 32, 0, TargetMemoryTransferMode.DirectAccess),
                 new(blockGlobal, cache, 32, 120, TargetMemoryTransferMode.ExplicitCopy),
                 new(cache, blockGlobal, 32, 120, TargetMemoryTransferMode.ExplicitCopy),
-            ],
-            CreateBindings(root, blockGlobal));
+            ]);
     }
 
     private static TargetMachineModel CreateRtx5060Ti16Gb()
@@ -168,7 +178,26 @@ public static class NTTTargetMachineCatalog
             chipGlobalBytesPerCycle: 174,
             sharedCapacityBytes: 101_376,
             sharedBytesPerCycle: 512,
-            supportsWgmma: false);
+            supportsCpAsync: true,
+            matrixPrimitives:
+            [
+
+                // Source: https://zartbot.github.io/micro_arch/nvidia/sm_120/paper.html
+                // SM120 non-FP64 mma.sync: 29-cycle dependency latency,
+                // 23-cycle saturated per-warp recurrence, and 0.25
+                // aggregate warp-level instructions/cycle at SM scope. PyNTT's
+                // one-persistent-block-per-SM execution maps that peak to a block.
+                new MatrixComputePrimitiveSpec(
+                    "mma",
+                    16,
+                    8,
+                    16,
+                    29,
+                    23,
+                    0.25,
+                    1,
+                    _tensorCoreOperandDataTypes),
+            ]);
 
     private static TargetMachineModel CreateH800Sxm80Gb()
         => CreatePersistentNvidiaGpu(
@@ -179,7 +208,30 @@ public static class NTTTargetMachineCatalog
             chipGlobalBytesPerCycle: 1908,
             sharedCapacityBytes: 227 * 1024,
             sharedBytesPerCycle: 1024,
-            supportsWgmma: true);
+            supportsCpAsync: true,
+            matrixPrimitives:
+            [
+                new MatrixComputePrimitiveSpec(
+                    "mma",
+                    16,
+                    8,
+                    16,
+                    16,
+                    8,
+                    4,
+                    1,
+                    _tensorCoreOperandDataTypes),
+                new MatrixComputePrimitiveSpec(
+                    "wgmma",
+                    64,
+                    8,
+                    16,
+                    16,
+                    8,
+                    8,
+                    4,
+                    _tensorCoreOperandDataTypes),
+            ]);
 
     private static TargetMachineModel CreatePersistentNvidiaGpu(
         string id,
@@ -189,7 +241,8 @@ public static class NTTTargetMachineCatalog
         long chipGlobalBytesPerCycle,
         long sharedCapacityBytes,
         long sharedBytesPerCycle,
-        bool supportsWgmma)
+        bool supportsCpAsync,
+        ImmutableArray<MatrixComputePrimitiveSpec> matrixPrimitives)
     {
         const long blockLocalWorkspaceBytes = 64L * 1024 * 1024;
         var sharedResource = new TargetMemoryResourceId("gpu.shared-memory");
@@ -199,13 +252,22 @@ public static class NTTTargetMachineCatalog
         var root = new TargetMemorySpaceId("gpu.global");
         var globalSharedBytesPerCycle = Math.Min(chipGlobalBytesPerCycle, sharedBytesPerCycle);
         var compilerManagedSharedBytes = GetCompilerManagedSharedAllocationLimit(sharedCapacityBytes);
-        var matrixPrimitives = ImmutableArray.Create(
-            new MatrixComputePrimitiveSpec("mma", 16, 8, 16, 4, _tensorCoreOperandDataTypes),
-            new MatrixComputePrimitiveSpec("wgmma", 64, 8, 16, 8, _tensorCoreOperandDataTypes, supportsWgmma));
-
+        var asynchronousGlobalToShared = supportsCpAsync
+            ? new TargetAsynchronousTransferSpec(
+                supportedStageCounts: [2],
+                commitCycles: 1,
+                waitCycles: 1)
+            : null;
         return new TargetMachineModel(
             id,
-            new(BlockExecutionKind.PersistentGpuBlock, computeUnits, 8, 32, clockRateGHz, 128, 4),
+            new(
+                BlockExecutionKind.PersistentGpuBlock,
+                computeUnits,
+                8,
+                32,
+                clockRateGHz,
+                128,
+                4),
             new(128, 64, matrixPrimitives),
             new(25, 2200),
             [
@@ -225,10 +287,15 @@ public static class NTTTargetMachineCatalog
             [
                 new(root, blockGlobal, chipGlobalBytesPerCycle, 0, TargetMemoryTransferMode.DirectAccess),
                 new(blockGlobal, root, chipGlobalBytesPerCycle, 0, TargetMemoryTransferMode.DirectAccess),
-                new(blockGlobal, shared, globalSharedBytesPerCycle, 300, TargetMemoryTransferMode.ExplicitCopy),
+                new(
+                    blockGlobal,
+                    shared,
+                    globalSharedBytesPerCycle,
+                    300,
+                    TargetMemoryTransferMode.ExplicitCopy,
+                    Asynchronous: asynchronousGlobalToShared),
                 new(shared, blockGlobal, globalSharedBytesPerCycle, 300, TargetMemoryTransferMode.ExplicitCopy),
-            ],
-            CreateBindings(root, blockGlobal));
+            ]);
     }
 
     private static long GetCompilerManagedSharedAllocationLimit(long physicalCapacityBytes)
@@ -244,18 +311,4 @@ public static class NTTTargetMachineCatalog
 
         return checked((long)(1UL << System.Numerics.BitOperations.Log2((ulong)budget)));
     }
-
-    private static IReadOnlyDictionary<MemoryLocation, TargetMemorySpaceId> CreateBindings(TargetMemorySpaceId root, TargetMemorySpaceId blockGlobal)
-        => new Dictionary<MemoryLocation, TargetMemorySpaceId>
-        {
-            [MemoryLocation.Input] = root,
-            [MemoryLocation.Output] = root,
-            [MemoryLocation.Rdata] = root,
-            [MemoryLocation.ChipLocalRdata] = root,
-            [MemoryLocation.BlockLocalRdata] = blockGlobal,
-            [MemoryLocation.Data] = root,
-            [MemoryLocation.ChipLocalData] = root,
-            [MemoryLocation.BlockLocalData] = blockGlobal,
-            [MemoryLocation.PrivateBase] = root,
-        };
 }

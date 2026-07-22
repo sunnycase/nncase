@@ -188,12 +188,7 @@ public sealed class DimensionCanonicalizer
                 Canonicalize(clamp.Operand),
                 Canonicalize(clamp.MinValue),
                 Canonicalize(clamp.MaxValue)),
-            DimCompareAndSelect select => Dimension.Select(
-                Canonicalize(select.Value),
-                Canonicalize(select.Expected),
-                Canonicalize(select.TrueValue),
-                Canonicalize(select.FalseValue),
-                select.CompareOp),
+            DimCompareAndSelect select => CanonicalizeSelect(select),
             DimMin min => SimplifyMin(
                 min.Operands.ToArray().Select(Canonicalize).ToArray(),
                 CanProveLessOrEqual),
@@ -240,4 +235,49 @@ public sealed class DimensionCanonicalizer
     private bool CanProveLessOrEqual(Dimension lhs, Dimension rhs)
         => DefaultCanProveLessOrEqual(lhs, rhs)
             || (_canProveLessOrEqual?.Invoke(lhs, rhs) ?? false);
+
+    private Dimension CanonicalizeSelect(DimCompareAndSelect select)
+    {
+        var value = Canonicalize(select.Value);
+        var expected = Canonicalize(select.Expected);
+        var trueValue = Canonicalize(select.TrueValue);
+        var falseValue = Canonicalize(select.FalseValue);
+        var condition = select.CompareOp switch
+        {
+            CompareOp.Equal when CanProveEqual(value, expected) => true,
+            CompareOp.Equal when CanProveLessThan(value, expected) || CanProveLessThan(expected, value) => false,
+            CompareOp.NotEqual when CanProveLessThan(value, expected) || CanProveLessThan(expected, value) => true,
+            CompareOp.NotEqual when CanProveEqual(value, expected) => false,
+            CompareOp.LowerThan when CanProveLessThan(value, expected) => true,
+            CompareOp.LowerThan when CanProveLessOrEqual(expected, value) => false,
+            CompareOp.LowerOrEqual when CanProveLessOrEqual(value, expected) => true,
+            CompareOp.LowerOrEqual when CanProveLessThan(expected, value) => false,
+            CompareOp.GreaterThan when CanProveLessThan(expected, value) => true,
+            CompareOp.GreaterThan when CanProveLessOrEqual(value, expected) => false,
+            CompareOp.GreaterOrEqual when CanProveLessOrEqual(expected, value) => true,
+            CompareOp.GreaterOrEqual when CanProveLessThan(value, expected) => false,
+            _ => (bool?)null,
+        };
+        return condition switch
+        {
+            true => trueValue,
+            false => falseValue,
+            null => Dimension.Select(value, expected, trueValue, falseValue, select.CompareOp),
+        };
+    }
+
+    private bool CanProveEqual(Dimension lhs, Dimension rhs)
+        => CanProveLessOrEqual(lhs, rhs) && CanProveLessOrEqual(rhs, lhs);
+
+    private bool CanProveLessThan(Dimension lhs, Dimension rhs)
+    {
+        try
+        {
+            return CanProveLessOrEqual(lhs + 1, rhs);
+        }
+        catch (OverflowException)
+        {
+            return false;
+        }
+    }
 }

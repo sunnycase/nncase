@@ -771,6 +771,15 @@ edges describe adjacent parent/local channels and explicitly distinguish
 `DirectAccess` from `ExplicitCopy`. Chip-scoped traffic is aggregated across
 active blocks; block-scoped traffic remains per block.
 
+An explicit-copy edge may also expose target-generic asynchronous transfer
+stages and commit/wait costs. Backend loop-pipeline templates map onto this edge
+capability; the machine model does not contain Triton template identities.
+AutoTiling selects the stage count at the lexical loop, couples that decision
+directly to staged-buffer capacity, and constructs separate producer and
+consumer TIR bodies without a recovery pass. The complete contract and manifest
+lowering are specified in
+[AutoTiling N-Buffer Pipelines](tiling/n-buffer-pipeline.md).
+
 The AutoTiling hierarchy is ordered from the innermost working set to the root:
 
 ```text

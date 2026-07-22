@@ -33,7 +33,10 @@ public sealed class TailLoopPeeling : ExprRewriter
         var fullEnd = domain.Start + (((domain.Stop - domain.Start) / domain.Step) * domain.Step);
         var fields = new List<Expr>(2);
         var tailLoopVar = expr.LoopVar.With(name: $"{expr.LoopVar.Name}_tail");
-        var tailBody = new LoopSlabCloner(expr.Body, expr.LoopVar, tailLoopVar).Clone(expr.Body, default);
+        var tailBody = new LoopSlabCloner(
+            expr.Body,
+            expr.LoopVar,
+            tailLoopVar).Clone(expr.Body, default);
         if (ExprCollector.Collect(tailBody).Any(node => ReferenceEquals(node, expr.LoopVar)))
         {
             throw new InvalidOperationException(
@@ -64,9 +67,72 @@ public sealed class TailLoopPeeling : ExprRewriter
         return new Sequential(fields.ToArray());
     }
 
-    private static bool CanPeel(For loop, TIR.Range domain)
+    protected internal override BaseExpr VisitPipelineFor(PipelineFor expr, Unit context)
     {
-        if (loop.Mode is not (LoopMode.Serial or LoopMode.Reduction) ||
+        if (expr.Partition != LoopPartition.Unpartitioned)
+        {
+            return expr;
+        }
+
+        var domain = (TIR.Range)Visit(expr.Domain, context);
+        if (!CanPeel(expr.Mode, domain))
+        {
+            return VisitLeafPipelineFor(expr, context);
+        }
+
+        var fullEnd = domain.Start + (((domain.Stop - domain.Start) / domain.Step) * domain.Step);
+        var fields = new List<Expr>(2);
+        var fullProduce = (Sequential)Visit(expr.ProduceBody, context);
+        var fullConsume = (Sequential)Visit(expr.ConsumeBody, context);
+        if (!IsStaticallyEmpty(domain.Start, fullEnd))
+        {
+            fields.Add(expr.With(
+                domain: new TIR.Range(domain.Start, fullEnd, domain.Step),
+                partition: LoopPartition.Full,
+                produceBody: fullProduce,
+                consumeBody: fullConsume,
+                regionId: expr.RegionId.ForPartition(LoopPartition.Full)));
+        }
+
+        var tailLoopVar = expr.LoopVar.With(name: $"{expr.LoopVar.Name}_tail");
+        var tailCloner = new LoopSlabCloner(
+            [expr.ProduceBody, expr.ConsumeBody],
+            expr.LoopVar,
+            tailLoopVar,
+            expr.StagedAccesses.ToArray());
+        var tailAccesses = expr.StagedAccesses
+            .ToArray()
+            .Select(access => (IVar)tailCloner.Clone((BaseExpr)access, default))
+            .ToArray();
+        var tailAllocations = expr.StagedAllocations
+            .ToArray()
+            .Select(allocation => tailCloner.Clone(allocation, default))
+            .ToArray();
+        var tailBuffers = expr.StagedBuffers
+            .ToArray()
+            .Select(buffer => (TIR.Buffer)tailCloner.Clone(buffer, default))
+            .ToArray();
+        var tailProduce = (Sequential)tailCloner.Clone(expr.ProduceBody, default);
+        var tailConsume = (Sequential)tailCloner.Clone(expr.ConsumeBody, default);
+        fields.Add(expr.With(
+            loopVar: tailLoopVar,
+            domain: new TIR.Range(fullEnd, domain.Stop, domain.Step),
+            partition: LoopPartition.Tail,
+            produceBody: tailProduce,
+            consumeBody: tailConsume,
+            stagedAccesses: tailAccesses,
+            stagedAllocations: tailAllocations,
+            stagedBuffers: tailBuffers,
+            regionId: expr.RegionId.ForPartition(LoopPartition.Tail)));
+        return new Sequential(fields.ToArray());
+    }
+
+    private static bool CanPeel(For loop, TIR.Range domain)
+        => CanPeel(loop.Mode, domain);
+
+    private static bool CanPeel(LoopMode mode, TIR.Range domain)
+    {
+        if (mode is not (LoopMode.Serial or LoopMode.Reduction) ||
             !domain.Step.IsFixed ||
             domain.Step.FixedValue <= 1)
         {
@@ -91,12 +157,29 @@ public sealed class TailLoopPeeling : ExprRewriter
         private readonly DimVar _source;
         private readonly DimVar _replacement;
 
-        public LoopSlabCloner(Sequential body, DimVar source, DimVar replacement)
+        public LoopSlabCloner(
+            Sequential body,
+            DimVar source,
+            DimVar replacement)
+            : this([body], source, replacement, [])
+        {
+        }
+
+        public LoopSlabCloner(
+            IEnumerable<Sequential> bodies,
+            DimVar source,
+            DimVar replacement,
+            IEnumerable<IVar> ownedBinders)
         {
             _source = source;
             _replacement = replacement;
 
-            foreach (var node in ExprCollector.Collect(body))
+            foreach (var binder in ownedBinders)
+            {
+                _localBinders.Add((BaseExpr)binder);
+            }
+
+            foreach (var node in bodies.SelectMany(ExprCollector.Collect))
             {
                 switch (node)
                 {
@@ -105,6 +188,14 @@ public sealed class TailLoopPeeling : ExprRewriter
                         break;
                     case For loop:
                         _localBinders.Add(loop.LoopVar);
+                        break;
+                    case PipelineFor loop:
+                        _localBinders.Add(loop.LoopVar);
+                        foreach (var access in loop.StagedAccesses)
+                        {
+                            _localBinders.Add((BaseExpr)access);
+                        }
+
                         break;
                 }
             }
@@ -127,6 +218,11 @@ public sealed class TailLoopPeeling : ExprRewriter
 
             return base.DispatchVisit(expr, context);
         }
+
+        protected override BaseExpr VisitLeafPipelineFor(PipelineFor expr, Unit context)
+            => ((PipelineFor)base.VisitLeafPipelineFor(expr, context)).With(
+                partition: LoopPartition.Tail,
+                regionId: expr.RegionId.ForBoundary(_source.Name));
 
         protected override BaseExpr VisitLeafPhysicalBuffer(PhysicalBuffer expr, Unit context)
         {

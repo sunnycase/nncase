@@ -124,6 +124,11 @@ public partial class ExprFunctor<TExprResult, TTypeResult, TContext>
     internal protected virtual TExprResult VisitFor(TIR.For expr, TContext context) => DefaultVisit(expr, context);
 
     /// <summary>
+    /// Visit <see cref="TIR.PipelineFor"/>.
+    /// </summary>
+    internal protected virtual TExprResult VisitPipelineFor(TIR.PipelineFor expr, TContext context) => DefaultVisit(expr, context);
+
+    /// <summary>
     /// Visit <see cref="TIR.IfThenElse"/>.
     /// </summary>
     internal protected virtual TExprResult VisitIfThenElse(TIR.IfThenElse expr, TContext context) => DefaultVisit(expr, context);
@@ -531,6 +536,13 @@ public partial class ExprFunctor<TExprResult, TTypeResult>
 
     /// <inheritdoc/>
     internal protected sealed override TExprResult VisitFor(TIR.For expr, Unit context) => VisitFor(expr);
+    /// <summary>
+    /// Visit <see cref="TIR.PipelineFor"/>.
+    /// </summary>
+    internal protected virtual TExprResult VisitPipelineFor(TIR.PipelineFor expr) => base.VisitPipelineFor(expr, default);
+
+    /// <inheritdoc/>
+    internal protected sealed override TExprResult VisitPipelineFor(TIR.PipelineFor expr, Unit context) => VisitPipelineFor(expr);
     /// <summary>
     /// Visit <see cref="TIR.IfThenElse"/>.
     /// </summary>

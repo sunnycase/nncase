@@ -65,6 +65,8 @@ public interface INTTTargetOptions : ITargetOptions
 
     Schedule.ITargetStorageEncodingModelProvider StorageEncodingModel { get; }
 
+    Schedule.ILoopPipelineBackend LoopPipelineBackend { get; }
+
     string DistributedScheme { get; set; }
 
     string CustomOpScheme { get; set; }

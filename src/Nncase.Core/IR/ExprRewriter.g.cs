@@ -146,6 +146,12 @@ public partial class ExprRewriter<TContext>
     }
 
     /// <inheritdoc/>
+    protected sealed override BaseExpr VisitLeafPipelineFor(TIR.PipelineFor expr, TContext context)
+    {
+        return RewriteLeafPipelineFor(expr, context);
+    }
+
+    /// <inheritdoc/>
     protected sealed override BaseExpr VisitLeafIfThenElse(TIR.IfThenElse expr, TContext context)
     {
         return RewriteLeafIfThenElse(expr, context);
@@ -554,6 +560,11 @@ public partial class ExprRewriter<TContext>
     /// Rewrite leaf <see cref="TIR.For"/>.
     /// </summary>
     protected virtual BaseExpr RewriteLeafFor(TIR.For expr, TContext context) => DefaultRewriteLeaf(expr, context);
+
+    /// <summary>
+    /// Rewrite leaf <see cref="TIR.PipelineFor"/>.
+    /// </summary>
+    protected virtual BaseExpr RewriteLeafPipelineFor(TIR.PipelineFor expr, TContext context) => DefaultRewriteLeaf(expr, context);
 
     /// <summary>
     /// Rewrite leaf <see cref="TIR.IfThenElse"/>.
@@ -984,6 +995,14 @@ public partial class ExprRewriter
 
     /// <inheritdoc />
     protected sealed override BaseExpr RewriteLeafFor(TIR.For expr, Unit context) => RewriteLeafFor(expr);
+
+    /// <summary>
+    /// Rewrite leaf <see cref="TIR.PipelineFor"/>.
+    /// </summary>
+    protected virtual BaseExpr RewriteLeafPipelineFor(TIR.PipelineFor expr) => DefaultRewriteLeaf(expr);
+
+    /// <inheritdoc />
+    protected sealed override BaseExpr RewriteLeafPipelineFor(TIR.PipelineFor expr, Unit context) => RewriteLeafPipelineFor(expr);
 
     /// <summary>
     /// Rewrite leaf <see cref="TIR.IfThenElse"/>.

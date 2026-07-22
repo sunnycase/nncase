@@ -1,6 +1,7 @@
 ﻿// Copyright (c) Canaan Inc. All rights reserved.
 // Licensed under the Apache license. See LICENSE file in the project root for full license information.
 
+using System.Collections.Immutable;
 using System.Diagnostics.CodeAnalysis;
 using System.Reactive;
 using Google.OrTools.Sat;
@@ -31,10 +32,33 @@ public record NodeWithBufferInfo(
     long[] Shape,
     long[] Strides,
     int AlignmentBytes,
-    TargetStorageEncodingSelection? StorageEncoding)
+    TargetStorageEncodingSelection? StorageEncoding,
+    StagedBufferLayout? StagedLayout)
 {
     public ulong Offset { get; set; } = ulong.MaxValue;
 }
+
+/// <summary>
+/// One concrete staged transfer selected at a lexical loop entry.
+/// </summary>
+public sealed record SelectedLoopPipelineChannel(
+    string ChannelId,
+    NodeWithBuffer Buffer,
+    int StorageLevel,
+    SelectedTileBufferSource Source,
+    TargetMemorySpaceId SourceMemorySpace,
+    TargetMemorySpaceId DestinationMemorySpace);
+
+/// <summary>
+/// Complete loop-owned pipeline selection consumed directly while building
+/// TIR. It contains no backend microkernel ownership or inferred phase data.
+/// </summary>
+public sealed record SelectedLoopPipeline(
+    int LoopEntry,
+    int DomainAxis,
+    PipelineRegionPlan Plan,
+    SelectedLoopPipelineScheduleEstimate Estimate,
+    ImmutableArray<SelectedLoopPipelineChannel> Channels);
 
 /// <summary>
 /// Physical arena usage produced by scheduling one AutoTiling memory space.
@@ -81,12 +105,16 @@ internal sealed record ViewInfo(ViewInfo? Parent, Expr View, Var? ViewVar, Expr 
 public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<TreeSolveResult.Context, Unit>
 {
     private readonly List<TileRootParameterBinding> _rootParameterBindings;
-    private readonly Dictionary<ITileable, Dictionary<BufferIdentity, ViewInfo>> _viewInfoMemo;
+    private readonly Dictionary<ITileable, Dictionary<BufferIdentity, ViewInfo>> _latestViewInfoMemo;
+    private readonly Dictionary<TileBufferPlacement, ViewInfo> _viewInfoByPlacement;
     private readonly IReadOnlyDictionary<int, BlockMicroKernelSelection> _microKernelSelections;
+    private readonly IReadOnlyDictionary<TileNode, SelectedLoopPipeline> _loopPipelines;
+    private readonly IReadOnlyDictionary<TileBufferPlacement, SelectedTileBufferSource> _transferSources;
 
-    public TreeSolveResult(BufferGraph primBufferGraph, long objectiveValue, Dictionary<int, Dictionary<NodeWithBuffer, NodeWithBufferInfo>> levelNodeBufferInfos, Dictionary<OpNode, OpNodeInfo<long>> primitiveBufferInfo, Dictionary<TileNode, TileNodeInfo<long>> levelBufferInfos, Dictionary<ITileable, DomainInfo<long>> domainInfos, IReadOnlyList<TileMaterialization> materializations, IReadOnlyDictionary<int, BlockMicroKernelSelection> microKernelSelections, INTTTargetOptions targetOptions, string moduleKind)
+    public TreeSolveResult(BufferGraph primBufferGraph, long objectiveValue, Dictionary<int, Dictionary<NodeWithBuffer, NodeWithBufferInfo>> levelNodeBufferInfos, Dictionary<OpNode, OpNodeInfo<long>> primitiveBufferInfo, Dictionary<TileNode, TileNodeInfo<long>> levelBufferInfos, Dictionary<ITileable, DomainInfo<long>> domainInfos, IReadOnlyList<TileMaterialization> materializations, IReadOnlyDictionary<int, BlockMicroKernelSelection> microKernelSelections, IReadOnlyDictionary<TileNode, SelectedLoopPipeline> loopPipelines, IReadOnlyDictionary<TileBufferPlacement, SelectedTileBufferSource> transferSources, INTTTargetOptions targetOptions, string moduleKind, string owningScheduledFunctionId)
         : base(null!, primitiveBufferInfo, levelBufferInfos, domainInfos, targetOptions)
     {
+        ArgumentException.ThrowIfNullOrWhiteSpace(owningScheduledFunctionId);
         PrimBufferGraph = primBufferGraph;
         (Inputs, Outputs) = primBufferGraph.GetInputsOutputs(primBufferGraph.Parent as BufferGraph);
         OutputStorageBids = ResolveOutputStorageBids();
@@ -128,8 +156,12 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
         LevelNodeBufferInfos = levelNodeBufferInfos;
         Materializations = materializations;
         _microKernelSelections = microKernelSelections;
+        _loopPipelines = loopPipelines;
+        _transferSources = transferSources;
         ModuleKind = moduleKind;
-        _viewInfoMemo = new();
+        OwningScheduledFunctionId = owningScheduledFunctionId;
+        _latestViewInfoMemo = new();
+        _viewInfoByPlacement = new();
     }
 
     public BufferGraph PrimBufferGraph { get; }
@@ -162,6 +194,12 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
     public Dictionary<int, Dictionary<NodeWithBuffer, NodeWithBufferInfo>> LevelNodeBufferInfos { get; }
 
     public string ModuleKind { get; }
+
+    /// <summary>
+    /// Gets the stable IR identity used to namespace pipeline regions created
+    /// by this scheduled function before any later function inlining.
+    /// </summary>
+    public string OwningScheduledFunctionId { get; }
 
     private void BindRootMaterializations()
     {
@@ -369,13 +407,39 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
         var parentDomain = ISLUtility.ToParametricDomain(parentExtents, out var paramVarMap);
         var paramDimMap = paramVarMap.Select(p => (p.Key.Name, p.Value)).Concat(parentExtents.Select((d, i) => ($"d{i}", d))).ToDictionary();
 
-        var loopBuilders = new ISequentialBuilder<TIR.For>[value.DomainRelation.Map.Results.Length];
+        var loopBuilders = new ISequentialBuilder<Expr>[value.DomainRelation.Map.Results.Length];
         var loopVars = new DimVar[value.DomainRelation.Map.Results.Length];
 
         var nodeMemo = TileNodeMemo[value];
         var domainRank = value.DomainRelation.Map.Results.Length;
-        var reductionAxes = ReductionAxisAnalysis.GetReductionAxes(value);
+        var reductionAxes = value.DomainAxisSemantics.ReductionAxes;
         var loopOrder = value.LoopOrder;
+        _loopPipelines.TryGetValue(value, out var selectedPipeline);
+        PipelineForBuilder? pipelineBuilder = null;
+        PipelineRegionId? pipelineRegionId = null;
+        if (selectedPipeline is not null)
+        {
+            if (selectedPipeline.LoopEntry <= 0 || selectedPipeline.LoopEntry > loopOrder.Length)
+            {
+                throw new InvalidOperationException(
+                    $"Pipeline {selectedPipeline.Plan.ScheduleId} selects invalid loop entry " +
+                    $"{selectedPipeline.LoopEntry} for rank {loopOrder.Length}.");
+            }
+
+            var selectedAxis = loopOrder[selectedPipeline.LoopEntry - 1];
+            if (selectedAxis != selectedPipeline.DomainAxis)
+            {
+                throw new InvalidOperationException(
+                    $"Pipeline {selectedPipeline.Plan.ScheduleId} selected entry{selectedPipeline.LoopEntry}/" +
+                    $"axis{selectedPipeline.DomainAxis}, but the solved loop order maps that entry to axis{selectedAxis}.");
+            }
+
+            pipelineRegionId = TileSemanticNaming.GetPipelineRegionId(
+                OwningScheduledFunctionId,
+                value,
+                selectedPipeline.LoopEntry,
+                selectedPipeline.DomainAxis);
+        }
 
         // create tile map from tile vars
         Isl.map tilemap;
@@ -419,9 +483,28 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
                 i,
                 reductionAxes[i] && value.Level == 0,
                 TargetOptions.TargetMachineModel);
-            loopBuilders[i] = reductionAxes[i] && value.Level == 0
-                ? T.Reduction(out loopVar, (0L, stop, stride), loopName)
-                : T.Serial(out loopVar, (0L, stop, stride), loopName);
+            if (selectedPipeline is not null && i == selectedPipeline.DomainAxis)
+            {
+                loopVar = new DimVar(loopName);
+                var loopMode = reductionAxes[i] && value.Level == 0
+                    ? LoopMode.Reduction
+                    : LoopMode.Serial;
+                pipelineBuilder = new PipelineForBuilder(
+                    loopVar,
+                    new TIR.Range(0L, stop, stride),
+                    loopMode,
+                    selectedPipeline.Plan,
+                    pipelineRegionId ?? throw new InvalidOperationException(
+                        $"Pipeline {selectedPipeline.Plan.ScheduleId} has no semantic region identity."));
+                loopBuilders[i] = pipelineBuilder;
+            }
+            else
+            {
+                loopBuilders[i] = reductionAxes[i] && value.Level == 0
+                    ? T.Reduction(out loopVar, (0L, stop, stride), loopName)
+                    : T.Serial(out loopVar, (0L, stop, stride), loopName);
+            }
+
             loopVar.Metadata.Range = new(0, nodeMemo.BackWardExtents[0][i]);
             loopVars[i] = loopVar;
             paramDimMap.Add($"d{i}_out", loopVar);
@@ -494,12 +577,59 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
                         ci,
                         paramDimMap);
 
-                    var viewInfo = GetViewInfo(sl, value, bid, bufferInfo.Map, forwardOffsets[ci], partialShape);
+                    var placement = new TileBufferPlacement(value, bid, ci, sl);
+                    var selectedChannel = selectedPipeline is not null && ci == selectedPipeline.LoopEntry
+                        ? selectedPipeline.Channels.SingleOrDefault(channel =>
+                            channel.Buffer == new NodeWithBuffer(value, bid) &&
+                            channel.StorageLevel == sl)
+                        : null;
+                    _transferSources.TryGetValue(placement, out var transferSource);
+                    if (selectedChannel is not null && !Equals(selectedChannel.Source, transferSource))
+                    {
+                        throw new InvalidOperationException(
+                            $"Pipeline channel {selectedChannel.ChannelId} source {selectedChannel.Source} " +
+                            $"does not match solved transfer source {transferSource}.");
+                    }
+
+                    var viewInfo = GetViewInfo(
+                        sl,
+                        value,
+                        bid,
+                        bufferInfo.Map,
+                        forwardOffsets[ci],
+                        partialShape,
+                        placement,
+                        transferSource);
                     if (viewInfo.ViewVar is { } viewVar)
                     {
-                        var letBuilder = T.Let(viewVar, viewInfo.View);
-                        cntBuilder.Body(letBuilder);
-                        cntBuilder = letBuilder;
+                        if (selectedChannel is not null)
+                        {
+                            if (pipelineBuilder is null || viewInfo.Buffer is not TIR.Buffer stagedBuffer)
+                            {
+                                throw new InvalidOperationException(
+                                    $"Pipeline channel {selectedChannel.ChannelId} does not resolve to an owned TIR buffer.");
+                            }
+
+                            pipelineBuilder.Bind(
+                                new PipelineBufferBindingDescriptor(
+                                    selectedChannel.ChannelId,
+                                    selectedChannel.SourceMemorySpace,
+                                    selectedChannel.DestinationMemorySpace),
+                                viewVar,
+                                viewInfo.View,
+                                stagedBuffer);
+                        }
+                        else
+                        {
+                            var letBuilder = T.Let(viewVar, viewInfo.View);
+                            cntBuilder.Body(letBuilder);
+                            cntBuilder = letBuilder;
+                        }
+                    }
+                    else if (selectedChannel is not null)
+                    {
+                        throw new InvalidOperationException(
+                            $"Pipeline channel {selectedChannel.ChannelId} has no staged descriptor variable.");
                     }
 
                     // note when create loop is inner loop, the buffer load store should be instert by children's order.
@@ -510,7 +640,25 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
                             var localEffect = bid.Node.LocalAccessEffects[bid.Index];
                             if (!bid.IsOutput && localEffect.Mode.HasFlag(MemoryAccessMode.Read))
                             {
-                                localBuilder.Body(T.TileLoad(viewInfo.ViewVar!, IR.F.Buffer.BufferSubview(parentViewInfo.Value, viewInfo.LocalOffsets, viewInfo.Shape)));
+                                if (selectedChannel is not null)
+                                {
+                                    ValidateTransferSourceMemorySpace(
+                                        placement,
+                                        selectedChannel.Source,
+                                        selectedChannel.SourceMemorySpace);
+                                }
+
+                                var load = T.TileLoad(
+                                    viewInfo.ViewVar!,
+                                    IR.F.Buffer.BufferSubview(parentViewInfo.Value, viewInfo.LocalOffsets, viewInfo.Shape));
+                                if (selectedChannel is not null)
+                                {
+                                    pipelineBuilder!.Produce(load);
+                                }
+                                else
+                                {
+                                    localBuilder.Body(load);
+                                }
                             }
 
                             if (bid.IsOutput && localEffect.Mode.HasFlag(MemoryAccessMode.Write))
@@ -518,12 +666,22 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
                                 localBuilder.Tail(T.TileStore(viewInfo.ViewVar!, IR.F.Buffer.BufferSubview(parentViewInfo.Value, viewInfo.LocalOffsets, viewInfo.Shape)));
                             }
                         }
+                        else if (selectedChannel is not null)
+                        {
+                            throw new InvalidOperationException(
+                                $"Pipeline channel {selectedChannel.ChannelId} does not own an explicit parent-to-local transfer.");
+                        }
                     }
 
-                    if (!_viewInfoMemo.TryGetValue(value, out var subViewMap))
+                    if (!_viewInfoByPlacement.TryAdd(placement, viewInfo))
+                    {
+                        throw new InvalidOperationException($"Tile buffer placement {placement} was constructed more than once.");
+                    }
+
+                    if (!_latestViewInfoMemo.TryGetValue(value, out var subViewMap))
                     {
                         subViewMap = new();
-                        _viewInfoMemo.Add(value, subViewMap);
+                        _latestViewInfoMemo.Add(value, subViewMap);
                     }
 
                     subViewMap[bid] = viewInfo;
@@ -615,7 +773,9 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
         var nestBody = bodyCloner.Clone(value.Grid.Body, default);
         if (_microKernelSelections.TryGetValue(value.Wrapped.RegionOpId, out var microKernel))
         {
-            var annotator = new BlockMicroKernelAnnotator(value.Op, microKernel);
+            var annotator = new BlockMicroKernelAnnotator(
+                value.Op,
+                microKernel);
             annotator.Visit(nestBody);
             if (annotator.MatchCount != 1)
             {
@@ -721,6 +881,73 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
         }
 
         return new(pools);
+    }
+
+    private ViewInfo ResolveSelectedTransferSource(
+        TileBufferPlacement destination,
+        SelectedTileBufferSource source,
+        RankedShape destinationShape,
+        int rank)
+    {
+        var expectedMemorySpace = TargetOptions.TargetMachineModel
+            .GetTilingParentMemorySpace(destination.StorageLevel)
+            .Id;
+        ValidateTransferSourceMemorySpace(destination, source, expectedMemorySpace);
+        return source switch
+        {
+            SelectedTileBufferPlacementSource placementSource =>
+                _viewInfoByPlacement.TryGetValue(placementSource.Placement, out var viewInfo)
+                    ? viewInfo
+                    : throw new InvalidOperationException(
+                        $"Transfer destination {destination} selected source placement " +
+                        $"{placementSource.Placement}, but that view does not lexically dominate its use."),
+            SelectedTileBufferRootSource rootSource => CreateRootSourceView(rootSource.Buffer),
+            _ => throw new ArgumentOutOfRangeException(nameof(source), source, "Unknown tile-buffer source."),
+        };
+
+        ViewInfo CreateRootSourceView(BufferIdentity rootBuffer)
+        {
+            if (!InputOutputVars.TryGetValue(rootBuffer, out var rootVar))
+            {
+                throw new InvalidOperationException(
+                    $"Transfer destination {destination} selected unbound root source {rootBuffer}.");
+            }
+
+            var zeros = new RankedShape(Enumerable.Repeat<Dimension>(0L, rank).ToArray());
+            return new ViewInfo(null, (Expr)rootVar, null, (Expr)rootVar, zeros, zeros, destinationShape, false);
+        }
+    }
+
+    private void ValidateTransferSourceMemorySpace(
+        TileBufferPlacement destination,
+        SelectedTileBufferSource source,
+        TargetMemorySpaceId expectedMemorySpace)
+    {
+        var machine = TargetOptions.TargetMachineModel;
+        var modeledMemorySpace = machine.GetTilingParentMemorySpace(destination.StorageLevel).Id;
+        if (modeledMemorySpace != expectedMemorySpace)
+        {
+            throw new InvalidOperationException(
+                $"Transfer destination {destination} expects modeled source {modeledMemorySpace}, " +
+                $"but its selected channel declares {expectedMemorySpace}.");
+        }
+
+        var sourceMemorySpace = source switch
+        {
+            SelectedTileBufferPlacementSource placementSource =>
+                machine.TilingMemorySpaces[placementSource.Placement.StorageLevel].Id,
+            SelectedTileBufferRootSource rootSource when InputOutputVars.ContainsKey(rootSource.Buffer) =>
+                machine.RootMemorySpace,
+            SelectedTileBufferRootSource rootSource => throw new InvalidOperationException(
+                $"Selected root transfer source {rootSource.Buffer} is not bound to caller storage."),
+            _ => throw new ArgumentOutOfRangeException(nameof(source), source, "Unknown tile-buffer source."),
+        };
+        if (sourceMemorySpace != expectedMemorySpace)
+        {
+            throw new InvalidOperationException(
+                $"Transfer destination {destination} requires source {expectedMemorySpace}, " +
+                $"but solved source {source} belongs to {sourceMemorySpace}.");
+        }
     }
 
     private Unit VisitSequentialScope(TileNode value, Context context)
@@ -893,7 +1120,7 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
                 return false;
             }
 
-            if (_viewInfoMemo.TryGetValue(parentTileNode, out var viewMap) && viewMap.TryGetValue(pbid, out var viewInfo))
+            if (_latestViewInfoMemo.TryGetValue(parentTileNode, out var viewMap) && viewMap.TryGetValue(pbid, out var viewInfo))
             {
                 parentViewInfo = viewInfo;
                 return true;
@@ -906,7 +1133,15 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
         return false;
     }
 
-    private ViewInfo GetViewInfo(int storeLevel, TileNode node, BufferIdentity bid, AffineMap map, Dimension[] forwardOffsets, RankedShape shape)
+    private ViewInfo GetViewInfo(
+        int storeLevel,
+        TileNode node,
+        BufferIdentity bid,
+        AffineMap map,
+        Dimension[] forwardOffsets,
+        RankedShape shape,
+        TileBufferPlacement placement,
+        SelectedTileBufferSource? selectedTransferSource)
     {
         if (bid.IsOutput && bid.Node.TryGetAliasSourceAccess(bid.Index, out var sourceAccessIndex))
         {
@@ -942,7 +1177,8 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
                 shape.Dimensions.ToArray(),
                 strides,
                 distributedType,
-                info.StorageEncoding);
+                info.StorageEncoding,
+                info.StagedLayout);
         }
 
         Expr GetViewExpr(ViewInfo? parentInfo, Expr buffer, RankedShape forwardOffsets, RankedShape relatedOffsets, RankedShape shape, bool ownsStorage)
@@ -969,7 +1205,21 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
 
         var bufferOffsets = map.Apply(forwardOffsets, Enumerable.Repeat<Dimension>(0L, forwardOffsets.Length).ToArray()).Select(i => i.Start).ToArray();
         var offsets = new RankedShape(bufferOffsets);
-        if (TryGetCurrentOrParentViewInfo(node, bid, out var parentViewInfo))
+        ViewInfo? parentViewInfo;
+        if (selectedTransferSource is not null)
+        {
+            parentViewInfo = ResolveSelectedTransferSource(
+                placement,
+                selectedTransferSource,
+                shape,
+                bufferOffsets.Length);
+        }
+        else
+        {
+            TryGetCurrentOrParentViewInfo(node, bid, out parentViewInfo);
+        }
+
+        if (parentViewInfo is not null)
         {
             var viewOffset = new Dimension[bufferOffsets.Length];
             for (int j = 0; j < viewOffset.Length; j++)
@@ -987,6 +1237,12 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
         }
         else
         {
+            if (selectedTransferSource is not null)
+            {
+                throw new InvalidOperationException(
+                    $"Selected transfer source {selectedTransferSource} for {bid}@L{storeLevel} did not resolve to a view.");
+            }
+
             parentViewInfo = null;
             var fromExternal = InputOutputVars.ContainsKey(bid);
             var requiresParentTransfer = fromExternal && requiresExplicitTransfer;
@@ -1148,7 +1404,8 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
                 shape.Dimensions.ToArray(),
                 strides,
                 distributedType,
-                info.StorageEncoding);
+                info.StorageEncoding,
+                info.StagedLayout);
         }
 
         var bufferOffsets = map.Apply(forwardOffsets, Enumerable.Repeat<Dimension>(0L, forwardOffsets.Length).ToArray()).Select(i => i.Start).ToArray();
@@ -1274,32 +1531,12 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
     }
 
     private static bool TryGetAliasReadBid(BufferIdentity bid, [MaybeNullWhen(false)] out BufferIdentity read)
-    {
-        read = null;
-        if (!bid.IsOutput)
-        {
-            return false;
-        }
-
-        if (bid.Node.TryGetAliasSourceAccess(bid.Index, out var sourceAccessIndex))
-        {
-            read = new BufferIdentity(bid.Node, sourceAccessIndex, BufferEndpoint.Input);
-            return true;
-        }
-
-        if (bid.Access.AccessMode == GridAccessMode.ReadWrite)
-        {
-            read = new BufferIdentity(bid.Node, bid.Index, BufferEndpoint.Input);
-            return true;
-        }
-
-        return false;
-    }
+        => TileBufferPlacementUtility.TryGetAliasReadBuffer(bid, out read);
 
     private bool TryGetCurrentOrParentViewInfo(TileNode node, BufferIdentity bid, [MaybeNullWhen(false)] out ViewInfo viewInfo)
     {
         var storageBid = GetCurrentStorageBid(node, bid);
-        if (_viewInfoMemo.TryGetValue(node, out var viewMap) && viewMap.TryGetValue(storageBid, out viewInfo))
+        if (_latestViewInfoMemo.TryGetValue(node, out var viewMap) && viewMap.TryGetValue(storageBid, out viewInfo))
         {
             return true;
         }
@@ -1308,9 +1545,7 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
     }
 
     private BufferIdentity GetCurrentStorageBid(TileNode node, BufferIdentity bid)
-        => TileNodeMemo[node].DefUseMap.TryGetByValue(bid, out var producerBid)
-            ? producerBid
-            : bid;
+        => TileBufferPlacementUtility.GetCurrentStorageBuffer(node, bid, TileNodeMemo);
 
     private string DescribeViewResolution(TileNode node, BufferIdentity bid)
     {
@@ -1322,7 +1557,7 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
             var storageBid = nodeInfo.DefUseMap.TryGetByValue(currentBid, out var producerBid)
                 ? producerBid
                 : currentBid;
-            var views = _viewInfoMemo.TryGetValue(tileNode, out var viewMap)
+            var views = _latestViewInfoMemo.TryGetValue(tileNode, out var viewMap)
                 ? string.Join(",", viewMap.Keys)
                 : "<none>";
             levels.Add(
@@ -1343,55 +1578,8 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
     private IEnumerable<KeyValuePair<BufferIdentity, TileNodeBufferInfo<long>>> OrderBufferInfosForViewCreation(
         TileNode node,
         Dictionary<BufferIdentity, TileNodeBufferInfo<long>> bufferInfoMap)
-    {
-        var stableOrder = bufferInfoMap.Keys
-            .OrderBy(pair => pair.IsOutput ? 1 : 0)
-            .ThenBy(pair => pair.Node.OpId)
-            .ThenBy(pair => pair.Index)
-            .ToArray();
-        var states = new Dictionary<BufferIdentity, int>();
-        var result = new List<KeyValuePair<BufferIdentity, TileNodeBufferInfo<long>>>(bufferInfoMap.Count);
-
-        foreach (var bid in stableOrder)
-        {
-            Visit(bid);
-        }
-
-        return result;
-
-        void Visit(BufferIdentity bid)
-        {
-            if (states.TryGetValue(bid, out var state))
-            {
-                if (state == 1)
-                {
-                    throw new InvalidOperationException($"Buffer alias dependency cycle detected at {bid} in {node}.");
-                }
-
-                return;
-            }
-
-            states.Add(bid, 1);
-            if (TileNodeMemo[node].DefUseMap.TryGetByValue(bid, out var definition) &&
-                definition != bid &&
-                bufferInfoMap.ContainsKey(definition))
-            {
-                Visit(definition);
-            }
-
-            if (TryGetAliasReadBid(bid, out var sourceRead))
-            {
-                var sourceStorage = GetCurrentStorageBid(node, sourceRead);
-                if (sourceStorage != bid && bufferInfoMap.ContainsKey(sourceStorage))
-                {
-                    Visit(sourceStorage);
-                }
-            }
-
-            states[bid] = 2;
-            result.Add(new(bid, bufferInfoMap[bid]));
-        }
-    }
+        => TileBufferPlacementUtility.OrderBuffersForViewCreation(node, TileNodeMemo[node])
+            .Select(buffer => new KeyValuePair<BufferIdentity, TileNodeBufferInfo<long>>(buffer, bufferInfoMap[buffer]));
 
     private int FetchBidOwnerIndex(TileNode node, BufferIdentity bid)
     {
@@ -1426,7 +1614,9 @@ public sealed class TreeSolveResult : TreeSolverBase<long>, ITreeNodeVisitor<Tre
         private readonly Op _op;
         private readonly BlockMicroKernelSelection _selection;
 
-        public BlockMicroKernelAnnotator(Op op, BlockMicroKernelSelection selection)
+        public BlockMicroKernelAnnotator(
+            Op op,
+            BlockMicroKernelSelection selection)
         {
             _op = op;
             _selection = selection;

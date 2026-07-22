@@ -20,6 +20,7 @@ Block,true,false,Default,TIR.,Body;InitBody;@IterVars;@Reads;@Writes;@AllocBuffe
 Buffer,true,false,Default,TIR.,MemSpan;@Dimensions;@Strides;!DistributedType
 BufferRegion,true,false,Default,TIR.,Buffer;@Region
 For,true,false,Default,TIR.,LoopVar;Domain;Body
+PipelineFor,true,false,Default,TIR.,LoopVar;Domain;ProduceBody;ConsumeBody;@StagedAccesses;@StagedAllocations;@StagedBuffers
 IfThenElse,true,false,Default,TIR.,Condition;Then;Else
 Let,true,false,Default,TIR.,Var;Expression;Body
 PrimFunction,true,true,BaseFunction,TIR.,@Parameters;Body;Results

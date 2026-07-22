@@ -10,8 +10,9 @@ namespace Nncase.Schedule;
 /// <summary>
 /// Target-owned model that maps one semantic block tile to legal backend
 /// microkernel implementations. The model stops at block scope: warp, thread,
-/// register layout, instruction selection, and software pipelines remain
-/// backend-private decisions.
+/// register layout, instruction selection, and accumulator lowering remain
+/// backend-private. Compiler-visible loop scheduling is modeled independently
+/// from these implementation candidates.
 /// </summary>
 public interface IBlockMicroKernelModelProvider
 {
@@ -29,7 +30,16 @@ public sealed record BlockMicroKernelModelContext(
     IntExpr[][] FullBufferShapes,
     IntExpr BaseComputeCycles,
     TargetMachineModel Machine,
-    Solver Solver);
+    Solver Solver)
+{
+    /// <summary>
+    /// Gets the number of concurrently placed blocks that contend for
+    /// chip-scoped services. Candidate-local compute and block-scoped memory
+    /// remain per block; only a service backed by a chip-shared resource may
+    /// use this scale.
+    /// </summary>
+    public long ChipActiveBlockCount { get; init; } = 1;
+}
 
 /// <summary>
 /// One target-private resource consumption term.
@@ -80,11 +90,19 @@ public sealed record BlockMicroKernelCandidate(
     string Family,
     string Variant,
     IntExpr IsLegal,
-    IntExpr EstimatedCycles,
+    BlockMicroKernelExecutionCost ExecutionCost,
     ImmutableArray<BlockMicroKernelResourceUsage> Resources,
     ImmutableArray<BlockMicroKernelMemoryAccess> MemoryAccesses,
     ImmutableArray<BlockMicroKernelParameter> Parameters)
 {
+    /// <summary>
+    /// Gets the target-owned deterministic preference among candidates with
+    /// identical predicted end-to-end latency. Lower values are preferred.
+    /// This value is never interpreted as cycles and cannot outweigh a
+    /// one-cycle improvement in the primary objective.
+    /// </summary>
+    public int SelectionPriority { get; init; }
+
     public ImmutableArray<BlockMicroKernelBufferEncodingRequirement> BufferEncodingRequirements { get; init; } = [];
 }
 
@@ -95,6 +113,6 @@ public sealed record BlockMicroKernelCandidate(
 public sealed record BlockMicroKernelSelection(
     string Family,
     string Variant,
-    long EstimatedCycles,
+    long RegionCycles,
     ImmutableDictionary<string, long> Resources,
     ImmutableDictionary<string, long> Parameters);

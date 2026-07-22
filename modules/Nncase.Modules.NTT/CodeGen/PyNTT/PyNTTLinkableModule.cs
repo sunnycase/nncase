@@ -474,6 +474,7 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
             pyntt_spec_version = 0,
             target_kind = _moduleKind,
             backend = targetOptions.Backend,
+            target_machine = targetOptions.TargetMachine,
             strict = targetOptions.Strict,
             functions = _functions.Select(function => new
             {
@@ -499,7 +500,7 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
         var topKernelFunctions = GetRuntimeTopKernelFunctions();
         var manifest = new
         {
-            pyntt_codegen_manifest_version = 3,
+            pyntt_codegen_manifest_version = 6,
             target_kind = _moduleKind,
             backend = targetOptions.Backend,
             functions = _functions.Select(function => new
@@ -2316,24 +2317,13 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
         var tritonRuntimeSetup = requiresGridBarrier
             ? $"{Environment.NewLine}        ensure_triton_allocator({context.DeviceExpression})"
             : string.Empty;
-        var launchKwargs = new List<string>();
-        if (kernel.Launch.NumWarps.HasValue)
-        {
-            launchKwargs.Add($"num_warps={kernel.Launch.NumWarps.Value}");
-        }
-
-        if (kernel.Launch.NumStages.HasValue)
-        {
-            launchKwargs.Add($"num_stages={kernel.Launch.NumStages.Value}");
-        }
-
-        var kwargs = launchKwargs.Count == 0 ? string.Empty : $", {string.Join(", ", launchKwargs)}";
+        var kwargs = $", num_warps={kernel.Launch.NumWarps}, num_stages={kernel.Launch.NumStages}";
         var importStatement = requiresGridBarrier
             ? $"from .generated_kernels import {kernel.Name}, PYNTT_GRID_MESH"
             : $"from .generated_kernels import {kernel.Name}";
         var launchStatement = $"        {kernel.Name}[grid]({tensorArgs}, numel, block_size{kwargs})";
         var kernelArgs = string.IsNullOrWhiteSpace(tensorArgs) ? "(numel,)" : $"({tensorArgs}, numel,)";
-        var tuningSelectionStatement = $"        block_size = select_and_validate_triton_tuning_parameter({PythonString(kernel.Name)}, \"block_size\", {blockSizeCandidates}, source={PythonString(blockSize.Source)}, kernel={kernel.Name}, kernel_args={kernelArgs}, grid_for_candidate={gridForCandidate}, expected_num_warps={kernel.Launch.NumWarps ?? throw new InvalidOperationException($"Generated PyNTT kernel {kernel.Name} must declare a fixed num_warps.")}, registers_per_thread_limit={PythonValue(kernel.Attrs["registers_per_thread_limit"])}, shared_memory_capacity_bytes={PythonValue(kernel.Attrs["shared_memory_capacity_bytes"])}, forbid_spills={PythonValue(kernel.Attrs["forbid_spills"])}{kwargs})";
+        var tuningSelectionStatement = $"        block_size = select_and_validate_triton_tuning_parameter({PythonString(kernel.Name)}, \"block_size\", {blockSizeCandidates}, source={PythonString(blockSize.Source)}, kernel={kernel.Name}, kernel_args={kernelArgs}, grid_for_candidate={gridForCandidate}, expected_num_warps={kernel.Launch.NumWarps}, registers_per_thread_limit={PythonValue(kernel.Attrs["registers_per_thread_limit"])}, shared_memory_capacity_bytes={PythonValue(kernel.Attrs["shared_memory_capacity_bytes"])}, forbid_spills={PythonValue(kernel.Attrs["forbid_spills"])}{kwargs})";
         return $"""
                     {importStatement}
                     numel = {numel}

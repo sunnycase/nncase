@@ -15,7 +15,11 @@ namespace Nncase.Targets;
 /// </summary>
 public static class TritonBlockMicroKernelContract
 {
-    public const long Version = 3;
+    public const long Version = 4;
+
+    public const string MatmulFamily = "triton.matmul";
+
+    public const string GemvFamily = "triton.gemv";
 
     public const string VersionParameter = "contract_version";
 
@@ -30,8 +34,6 @@ public static class TritonBlockMicroKernelContract
     public const string InnerNParameter = "inner_n";
 
     public const string InnerKParameter = "inner_k";
-
-    public const string PipelineStagesParameter = "pipeline_stages";
 
     public const string MmaMParameter = "mma_m";
 
@@ -71,7 +73,7 @@ public sealed class DefaultBlockMicroKernelModel : IBlockMicroKernelModelProvide
                 "default.block",
                 "backend_private",
                 context.Solver.MakeIntConst(1),
-                context.BaseComputeCycles,
+                BlockMicroKernelExecutionCost.ComputeOnly(context.BaseComputeCycles),
                 [new(resource.Id, units)],
                 ImmutableArray<BlockMicroKernelMemoryAccess>.Empty,
                 ImmutableArray<BlockMicroKernelParameter>.Empty),
@@ -124,7 +126,6 @@ public sealed class TritonBlockMicroKernelModel : IBlockMicroKernelModelProvider
     private const int GemvMmaCompilerOverheadRegistersPerThread = 216;
     private const int SimtComputeElementSizeBytes = 4;
     private const int SimtRhsLiveValueCount = 2;
-    private const int MmaPipelineStages = 2;
 
     public IReadOnlyList<BlockMicroKernelCandidate> GetCandidates(BlockMicroKernelModelContext context)
     {
@@ -159,7 +160,7 @@ public sealed class TritonBlockMicroKernelModel : IBlockMicroKernelModelProvider
                 "triton.reduce",
                 "register_accumulator",
                 context.Solver.MakeIntConst(1),
-                context.BaseComputeCycles,
+                BlockMicroKernelExecutionCost.ComputeOnly(context.BaseComputeCycles),
                 [new(registerResource.Id, fixedRegisters + stateRegisters)],
                 ImmutableArray<BlockMicroKernelMemoryAccess>.Empty,
                 ImmutableArray<BlockMicroKernelParameter>.Empty),
@@ -189,7 +190,7 @@ public sealed class TritonBlockMicroKernelModel : IBlockMicroKernelModelProvider
                 $"{simtWorkerWidth} lanes on {context.Machine.Id}.");
         }
 
-        var simtComputeCycles = DivideByRate(
+        var simtArithmeticCycles = DivideByRate(
             full.GetWork(),
             context.Machine.Compute.SimtFmaPerCycle,
             solver);
@@ -198,6 +199,30 @@ public sealed class TritonBlockMicroKernelModel : IBlockMicroKernelModelProvider
             ? AlignUp(solver.MakeMax(local.N, solver.MakeIntConst(simtWorkerWidth)), simtWorkerWidth, solver)
             : AlignUp(local.N, MatrixAccumulatorMinN, solver);
         var registerM = useGemv ? solver.MakeIntConst(1) : alignedM;
+        var simtReductionInvocationCount = MakePositiveCeilDiv(
+                full.M,
+                local.M,
+                solver,
+                "simt_reduction_m_invocations")
+            * MakePositiveCeilDiv(
+                full.N,
+                local.N,
+                solver,
+                "simt_reduction_n_invocations")
+            * MakePositiveCeilDiv(
+                full.K,
+                local.K,
+                solver,
+                "simt_reduction_k_invocations")
+            * full.Multiplicity;
+
+        // This is backend-private reduction work only. Shared-memory
+        // acquire/release barriers belong to the selected execution schedule
+        // and are accounted exactly once by the serial or pipelined region.
+        var simtReductionFixedCycles = solver.MakeIntConst(
+            System.Numerics.BitOperations.Log2((uint)simtWorkerWidth));
+        var simtComputeCycles = simtArithmeticCycles
+            + (simtReductionInvocationCount * simtReductionFixedCycles);
 
         // The SIMT helper materializes one complete block-K reduction tile.
         // Splitting K inside the helper repeats Triton layout propagation and
@@ -224,12 +249,25 @@ public sealed class TritonBlockMicroKernelModel : IBlockMicroKernelModelProvider
             context.Machine,
             NTTTargetMachineCatalog.GpuRegisterFile,
             TargetPrivateResourceUnit.Register32);
+        var backendSharedResource = GetResource(
+            context.Machine,
+            NTTTargetMachineCatalog.GpuBackendSharedMemory,
+            TargetPrivateResourceUnit.Bytes);
+        var simtReductionScratchBytes = DefaultBlockMicroKernelModel.CeilDiv(
+                alignedN * local.Multiplicity,
+                simtWorkerWidth,
+                solver)
+            * context.Machine.Execution.ThreadsPerBlock
+            * SimtComputeElementSizeBytes;
 
-        var family = useGemv ? "triton.gemv" : "triton.matmul";
+        var family = useGemv
+            ? TritonBlockMicroKernelContract.GemvFamily
+            : TritonBlockMicroKernelContract.MatmulFamily;
         var isSupportedGemv = useGemv && context.Op is (Nncase.TIR.NTT.Matmul or Nncase.TIR.NTT.PackedMatMul);
         var mmaSharedMemorySpace = GetMmaSharedMemorySpace(context.Machine);
+        var dotOperandAccessIndices = GetDotOperandAccessIndices(context.Op);
         var dotOperandRequirements = !useGemv
-            ? GetDotOperandAccessIndices(context.Op)
+            ? dotOperandAccessIndices
                 .Select(index => new BlockMicroKernelBufferEncodingRequirement(
                     index,
                     mmaSharedMemorySpace.Id,
@@ -237,40 +275,21 @@ public sealed class TritonBlockMicroKernelModel : IBlockMicroKernelModelProvider
                 .ToImmutableArray()
             : ImmutableArray<BlockMicroKernelBufferEncodingRequirement>.Empty;
         var simtOperandRequirements = useGemv
-            ? GetDirectPackedGemvRhsAccessIndices(context.Op)
-                .Select(index => new BlockMicroKernelBufferEncodingRequirement(
-                    index,
-                    mmaSharedMemorySpace.Id,
-                    [TritonTargetStorageEncodingModel.KMajorPackedN]))
-                .ToImmutableArray()
+            ? GetGemvSimtSharedEncodingRequirements(context.Op, mmaSharedMemorySpace.Id)
             : dotOperandRequirements;
-        var sharedResource = GetResource(
-            context.Machine,
-            NTTTargetMachineCatalog.GpuBackendSharedMemory,
-            TargetPrivateResourceUnit.Bytes);
-        var sharedMemoryResource = sharedResource.BackingMemoryResource is { } backing
-            ? context.Machine.GetMemoryResource(backing)
-            : throw new InvalidOperationException(
-                "Triton backend-private shared memory must name its physical backing resource.");
+        var sharedMemoryResource = context.Machine.GetMemoryResource(mmaSharedMemorySpace);
         var gemvMemoryAccesses = isSupportedGemv
             ? GetGemvMemoryAccesses(context, local, full, sharedMemoryResource.Id)
             : ImmutableArray<BlockMicroKernelMemoryAccess>.Empty;
-        var hiddenDotStagingBytes = useGemv
-            ? solver.MakeIntConst(0)
-            : GetHiddenDotOperandStagingBytes(context, GetDotOperandAccessIndices(context.Op));
         var registerSimtResources = ImmutableArray.Create(
-            new BlockMicroKernelResourceUsage(registerResource.Id, registerSimtUsage));
-        if (hiddenDotStagingBytes.Var().Max() > 0)
-        {
-            registerSimtResources = registerSimtResources.Add(
-                new(sharedResource.Id, hiddenDotStagingBytes));
-        }
+            new BlockMicroKernelResourceUsage(registerResource.Id, registerSimtUsage),
+            new BlockMicroKernelResourceUsage(backendSharedResource.Id, simtReductionScratchBytes));
 
         var registerSimtCandidate = new BlockMicroKernelCandidate(
             family,
             "register_simt_accumulator",
             solver.MakeIntConst(1),
-            useGemv ? simtComputeCycles : context.BaseComputeCycles,
+            BlockMicroKernelExecutionCost.ComputeOnly(simtComputeCycles),
             registerSimtResources,
             gemvMemoryAccesses,
             [
@@ -281,12 +300,14 @@ public sealed class TritonBlockMicroKernelModel : IBlockMicroKernelModelProvider
                 new(TritonBlockMicroKernelContract.InnerMParameter, registerM),
                 new(TritonBlockMicroKernelContract.InnerNParameter, alignedN),
                 new(TritonBlockMicroKernelContract.InnerKParameter, simtReductionK),
-                new(TritonBlockMicroKernelContract.PipelineStagesParameter, solver.MakeIntConst(1)),
             ])
         {
+            SelectionPriority = 2,
             BufferEncodingRequirements = simtOperandRequirements,
         };
-        var candidates = new List<BlockMicroKernelCandidate> { registerSimtCandidate };
+        var candidates = new List<BlockMicroKernelCandidate>();
+
+        candidates.Add(registerSimtCandidate);
 
         if (isSupportedGemv)
         {
@@ -314,26 +335,42 @@ public sealed class TritonBlockMicroKernelModel : IBlockMicroKernelModelProvider
                 var tailN = (full.N - (fullNTileCount * local.N)).Var();
                 tailN.SetRange(0, fullNBound);
                 var tailUsesMma = 1 - solver.MakeIsLessVar(tailN, solver.MakeIntConst(mma.M));
-                var mmaNTileCount = (fullNTileCount * solver.MakeDiv(local.N, mma.M))
-                    + (tailUsesMma * DefaultBlockMicroKernelModel.CeilDiv(tailN, mma.M, solver));
                 var simtTailNElements = (1 - tailUsesMma) * tailN;
-                var mmaInstructionCount = mmaNTileCount
-                    * DefaultBlockMicroKernelModel.CeilDiv(full.M, mma.N, solver)
-                    * GetTotalPrimitiveTileCount(full.K, local.K, mma.K, solver)
-                    * full.Multiplicity;
-                var mmaComputeCycles = DivideByRate(
-                    mmaInstructionCount,
-                    mma.InstructionsPerCyclePerBlock,
+                var mAccumulatorFragments = DefaultBlockMicroKernelModel.CeilDiv(full.M, mma.N, solver);
+                var dependentInstructionsPerChain = GetTotalPrimitiveTileCount(
+                    full.K,
+                    local.K,
+                    mma.K,
                     solver);
+                var fullTileAccumulatorChains = solver.MakeDiv(local.N, mma.M)
+                    * mAccumulatorFragments
+                    * full.Multiplicity;
+                var tailAccumulatorChains = DefaultBlockMicroKernelModel.CeilDiv(tailN, mma.M, solver)
+                    * mAccumulatorFragments
+                    * full.Multiplicity;
+                var fullTileMmaCycles = MatrixComputeCostModel.EstimateCycles(
+                    mma,
+                    fullTileAccumulatorChains,
+                    dependentInstructionsPerChain,
+                    context.Machine.Execution,
+                    solver);
+                var tailMmaCycles = MatrixComputeCostModel.EstimateCycles(
+                    mma,
+                    tailAccumulatorChains,
+                    dependentInstructionsPerChain,
+                    context.Machine.Execution,
+                    solver);
+                var mmaComputeCycles = (fullNTileCount * fullTileMmaCycles)
+                    + (tailUsesMma * tailMmaCycles);
                 var simtTailCycles = DivideByRate(
                     full.M * simtTailNElements * full.K * full.Multiplicity,
                     context.Machine.Compute.SimtFmaPerCycle,
                     solver);
                 var totalMmaComputeCycles = mmaComputeCycles + simtTailCycles;
 
-                // Registers are modeled from simultaneously live instruction
-                // fragments and pipeline stages. Full reduction extent K does
-                // not multiply the live set because K fragments are consumed
+                // Registers are modeled from one simultaneously live serial
+                // instruction-fragment set. Full reduction extent K does not
+                // multiply the live set because K fragments are consumed
                 // sequentially by the backend microkernel.
                 var nFragments = DefaultBlockMicroKernelModel.CeilDiv(alignedN, mma.M, solver);
                 var mFragments = DefaultBlockMicroKernelModel.CeilDiv(alignedM, mma.N, solver);
@@ -342,14 +379,14 @@ public sealed class TritonBlockMicroKernelModel : IBlockMicroKernelModelProvider
                     * mma.M
                     * mma.N
                     * local.Multiplicity;
-                var mmaOperandBytesPerStage = nFragments
+                var mmaOperandBytes = nFragments
                     * mFragments
                     * local.Multiplicity
                     * ((mma.M * mma.K * rhsScalarBytes) + (mma.K * mma.N * lhsScalarBytes));
                 var mmaOperandRegisters = DefaultBlockMicroKernelModel.CeilDiv(
-                    mmaOperandBytesPerStage,
+                    mmaOperandBytes,
                     4,
-                    solver) * MmaPipelineStages;
+                    solver);
 
                 // Calibrated backend overhead for the fixed eight-warp persistent
                 // execution model. Shape-dependent state remains represented by
@@ -371,7 +408,6 @@ public sealed class TritonBlockMicroKernelModel : IBlockMicroKernelModelProvider
                     new BlockMicroKernelParameter(TritonBlockMicroKernelContract.InnerMParameter, solver.MakeIntConst(mma.N)),
                     new BlockMicroKernelParameter(TritonBlockMicroKernelContract.InnerNParameter, alignedN),
                     new BlockMicroKernelParameter(TritonBlockMicroKernelContract.InnerKParameter, solver.MakeIntConst(mma.K)),
-                    new BlockMicroKernelParameter(TritonBlockMicroKernelContract.PipelineStagesParameter, solver.MakeIntConst(MmaPipelineStages)),
                     new BlockMicroKernelParameter(TritonBlockMicroKernelContract.MmaMParameter, solver.MakeIntConst(mma.M)),
                     new BlockMicroKernelParameter(TritonBlockMicroKernelContract.MmaNParameter, solver.MakeIntConst(mma.N)),
                     new BlockMicroKernelParameter(TritonBlockMicroKernelContract.MmaKParameter, solver.MakeIntConst(mma.K)));
@@ -385,24 +421,40 @@ public sealed class TritonBlockMicroKernelModel : IBlockMicroKernelModelProvider
                         mmaSharedMemorySpace.Id,
                         [TritonTargetStorageEncodingModel.NvidiaMmaShared]));
 
-                candidates.Add(
-                    new(
+                var registerMmaCandidate = new BlockMicroKernelCandidate(
                         family,
                         "register_mma_accumulator",
                         mmaLegality,
-                        totalMmaComputeCycles,
+                        BlockMicroKernelExecutionCost.ComputeOnly(totalMmaComputeCycles),
                         [
                             new(registerResource.Id, registerMmaUsage),
                         ],
                         gemvMemoryAccesses,
                         mmaParameters)
-                    {
-                        BufferEncodingRequirements = mmaBufferRequirements,
-                    });
+                {
+                    SelectionPriority = 0,
+                    BufferEncodingRequirements = mmaBufferRequirements,
+                };
+                candidates.Add(registerMmaCandidate);
             }
         }
 
         return candidates;
+    }
+
+    private static IntExpr MakePositiveCeilDiv(IntExpr value, IntExpr divisor, Solver solver, string name)
+    {
+        if (value.Var().Min() < 1 || divisor.Var().Min() < 1)
+        {
+            throw new InvalidOperationException(
+                $"Staged matrix extent {name} requires positive value and divisor, got " +
+                $"[{value.Var().Min()},{value.Var().Max()}] / [{divisor.Var().Min()},{divisor.Var().Max()}].");
+        }
+
+        var result = solver.MakeDiv(value + divisor - 1, divisor).Var();
+        result.SetName(name);
+        result.SetRange(1, Math.Max(1, value.Var().Max()));
+        return result;
     }
 
     private static TargetMemorySpaceSpec GetMmaSharedMemorySpace(TargetMachineModel machine)
@@ -427,44 +479,29 @@ public sealed class TritonBlockMicroKernelModel : IBlockMicroKernelModelProvider
                 $"Triton matrix workload {op.GetType().Name} must declare its dot operand accesses."),
         };
 
-    private static int[] GetDirectPackedGemvRhsAccessIndices(Op op)
-        => op switch
+    private static ImmutableArray<BlockMicroKernelBufferEncodingRequirement> GetGemvSimtSharedEncodingRequirements(
+        Op op,
+        TargetMemorySpaceId sharedMemorySpace)
+    {
+        var packedRhs = op switch
         {
-            Nncase.TIR.NTT.PackedMatMul => [1],
+            Nncase.TIR.NTT.PackedMatMul => new HashSet<int> { 1 },
+            Nncase.TIR.NTT.PackedQKVParallelLinear => new HashSet<int> { 1, 2, 3 },
+            Nncase.TIR.NTT.PackedMatMulGlu => new HashSet<int> { 1, 2 },
             Nncase.TIR.NTT.Matmul or
                 Nncase.TIR.NTT.QKVParallelLinear or
-                Nncase.TIR.NTT.PackedQKVParallelLinear or
-                Nncase.TIR.NTT.MatMulGlu or
-                Nncase.TIR.NTT.PackedMatMulGlu => [],
+                Nncase.TIR.NTT.MatMulGlu => [],
             _ => throw new NotSupportedException(
-                $"Triton matrix workload {op.GetType().Name} must declare its direct packed GEMV RHS accesses."),
+                $"Triton GEMV workload {op.GetType().Name} must declare its SIMT shared encodings."),
         };
-
-    private static IntExpr GetHiddenDotOperandStagingBytes(
-        BlockMicroKernelModelContext context,
-        IReadOnlyList<int> accessIndices)
-    {
-        var solver = context.Solver;
-        var total = (IntExpr)solver.MakeIntConst(0);
-        foreach (var accessIndex in accessIndices)
-        {
-            var dataType = context.WorkloadContext.BufferDataTypes[accessIndex];
-            if (dataType is not VectorType)
-            {
-                continue;
-            }
-
-            var shape = context.LocalBufferShapes[accessIndex];
-            var bytes = shape.Aggregate(
-                (IntExpr)solver.MakeIntConst(dataType.SizeInBytes),
-                (product, extent) => product * extent);
-            var directlyConsumable = shape.Length == 2
-                ? solver.MakeIsEqualCstVar(shape[0], 1)
-                : solver.MakeIntConst(0);
-            total += (1 - directlyConsumable) * bytes;
-        }
-
-        return total;
+        return GetDotOperandAccessIndices(op)
+            .Select(index => new BlockMicroKernelBufferEncodingRequirement(
+                index,
+                sharedMemorySpace,
+                [packedRhs.Contains(index)
+                    ? TritonTargetStorageEncodingModel.KMajorPackedN
+                    : TritonTargetStorageEncodingModel.SwizzledShared]))
+            .ToImmutableArray();
     }
 
     private static ImmutableArray<BlockMicroKernelMemoryAccess> GetGemvMemoryAccesses(

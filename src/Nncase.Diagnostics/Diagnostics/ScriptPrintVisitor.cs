@@ -556,6 +556,52 @@ internal sealed class ScriptPrintVisitor : ExprFunctor<IPrintSymbol, string>
     }
 
     /// <inheritdoc/>
+    protected override IPrintSymbol VisitPipelineFor(PipelineFor expr)
+    {
+        static string Escape(string value)
+            => value.Replace("\\", "\\\\", StringComparison.Ordinal)
+                .Replace("\"", "\\\"", StringComparison.Ordinal);
+
+        if (_exprMemo.TryGetValue(expr, out var doc))
+        {
+            return doc;
+        }
+
+        _scope.Push();
+        var loopVar = Visit(expr.LoopVar);
+        var templateId = Escape(expr.Plan.TemplateId.Value);
+        var scheduleId = Escape(expr.Plan.ScheduleId);
+        var regionId = Escape(expr.RegionId.Value);
+        _scope.AppendLine(
+            $"T.Pipeline(out var {loopVar}, ({Visit(expr.Domain.Start)}, {Visit(expr.Domain.Stop)}, {Visit(expr.Domain.Step)}), " +
+            $"LoopMode.{expr.Mode}, LoopPartition.{expr.Partition}, template: \"{templateId}\", " +
+            $"schedule: \"{scheduleId}\", stages: {expr.Plan.StageCount}, region: \"{regionId}\").");
+
+        var accesses = expr.StagedAccesses;
+        var allocations = expr.StagedAllocations;
+        var buffers = expr.StagedBuffers;
+        for (var index = 0; index < expr.BindingDescriptors.Length; index++)
+        {
+            var binding = expr.BindingDescriptors[index];
+            _scope.IndWriteLine(
+                $"Bind(\"{Escape(binding.ChannelId)}\", " +
+                $"transfer: \"{binding.SourceMemorySpace}->{binding.DestinationMemorySpace}\", " +
+                $"source: {Visit(accesses[index])}, allocation: {Visit(allocations[index])}, " +
+                $"buffer: {Visit(buffers[index])}).");
+        }
+
+        _scope.IndWrite("Produce");
+        _scope.Append(VisitTypeSequential(expr.ProduceBody, string.Empty).ToString());
+        _scope.Append(".");
+        _scope.Append("Consume");
+        _scope.AppendLine(VisitTypeSequential(expr.ConsumeBody, VisitType(expr.CheckedType)).ToString());
+
+        doc = new(_scope.Pop().ToString());
+        _exprMemo.Add(expr, doc);
+        return doc;
+    }
+
+    /// <inheritdoc/>
     protected override IPrintSymbol VisitSequential(Sequential expr)
     {
         if (_exprMemo.TryGetValue(expr, out var doc))
