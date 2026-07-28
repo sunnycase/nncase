@@ -20,9 +20,13 @@ public sealed class BufferizePass : ModulePass
 {
     protected override async Task<IRModule> RunCoreAsync(IRModule input, RunPassContext context)
     {
+        var targetMachine = (CompileSession.CompileOptions.TargetOptions as ITargetMachineModelProvider)?.TargetMachineModel;
+
         foreach (var funcs in input.Functions.OfType<PrimFunction>().GroupBy(x => x.ModuleKind))
         {
-            var bufferizeVisitor = new BufferizeVisitor(funcs);
+            var bufferizeVisitor = new BufferizeVisitor(
+                funcs,
+                targetMachine);
             bufferizeVisitor.Bufferize();
         }
 

@@ -1,15 +1,13 @@
 {% import "triton/kernels/_common.py.jinja" as common with context %}
+{% import "triton/kernels/_producer_consumer.py.jinja" as phases with context %}
 {% set ctx = scatter_nd_context(model) %}
 # generated from PyNTT Jinja ScatterND.py.jinja
 # {{ model["Comment"] }}; input_dtype={{ model["InputDType"] }}, indices_dtype={{ model["IndicesDType"] }}, updates_dtype={{ model["UpdatesDType"] }}, output_dtype={{ model["OutputDType"] }}
-{{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
-def {{ model["FunctionName"] }}({{ helper_parameters(model) }}):
+{{ phases.consumer_header(model) }}
     shard_index = tl.program_id(0).to(tl.int64)
 {{ common.shard_coordinates([model["Input"], model["Indices"], model["Updates"], model["Output"]]) }}
 {% for name, key in (("input", "Input"), ("indices", "Indices"), ("updates", "Updates"), ("output", "Output")) %}
-{% if local_buffer(model[key]) is none %}
     {{ name }} = {{ ptr(model, key) }}
-{% endif %}
 {% endfor %}
     # copy input to output
 {% for axis in ctx["copy_loop_axes"] %}
@@ -45,3 +43,6 @@ def {{ model["FunctionName"] }}({{ helper_parameters(model) }}):
 {{ update_body }}scatter_output_offsets = {{ ctx["scatter_output_offset"] }}
 {{ update_body }}updates_value = tl.load({{ access_pointer(model, "Updates", "updates", "updates_offsets") }}, mask=upd_mask, other=0.0)
 {{ update_body }}tl.store({{ access_pointer(model, "Output", "output", "scatter_output_offsets") }}, updates_value, mask=upd_mask)
+
+
+{{ phases.dispatch(model) }}

@@ -48,9 +48,15 @@ public partial class NTT
         return new Call(new InstacneNorm(epsilon, vectorizedAxes), input, scale, bias, padedNums);
     }
 
-    public static Expr PackedMatMul(Expr lhs, Expr rhs, bool fusedReduce = false, DataType? outDataType = null, Expr? scale = null)
+    public static Expr PackedMatMul(
+        Expr lhs,
+        Expr rhs,
+        bool fusedReduce = false,
+        DataType? outDataType = null,
+        Expr? scale = null,
+        PackedMatMulRhsLayout rhsLayout = PackedMatMulRhsLayout.NMajor)
     {
-        return new Call(new PackedMatMul(outDataType ?? DataTypes.Float32, fusedReduce), lhs, rhs, scale ?? None.Default);
+        return new Call(new PackedMatMul(outDataType ?? DataTypes.Float32, fusedReduce, rhsLayout), lhs, rhs, scale ?? None.Default);
     }
 
     public static Expr PackedQKVParallelLinear(

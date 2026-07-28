@@ -4,7 +4,7 @@ using Nncase.IR;
 
 namespace Nncase.TIR.NTT;
 
-public sealed partial class GatherReduceScatter : NTTKernelOp, IOpMemoryEffectProvider
+public sealed partial class GatherReduceScatter : NTTKernelOp
 {
     public static readonly ParameterInfo Input = new(typeof(GatherReduceScatter), 0, "input", memoryEffect: MemoryEffect.Read);
 
@@ -14,7 +14,7 @@ public sealed partial class GatherReduceScatter : NTTKernelOp, IOpMemoryEffectPr
 
     public DistributedType OutType { get; }
 
-    public MemoryEffect GetMemoryEffect(ParameterInfo parameter)
+    public override MemoryEffect GetMemoryEffect(ParameterInfo parameter)
     {
         if (ReferenceEquals(parameter, Input))
         {
@@ -26,6 +26,6 @@ public sealed partial class GatherReduceScatter : NTTKernelOp, IOpMemoryEffectPr
             return MemoryEffect.ChipWrite;
         }
 
-        throw new ArgumentOutOfRangeException(nameof(parameter), parameter, "Unknown GatherReduceScatter operand.");
+        return base.GetMemoryEffect(parameter);
     }
 }

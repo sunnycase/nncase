@@ -274,6 +274,19 @@ public sealed class UnitTestTileGraph : TestClassBase
     }
 
     [Fact]
+    public void TestSameRankReshapeRecomputesChangedAxisStride()
+    {
+        var sourceType = new TensorType(DataTypes.Float32, new[] { 4, 4 });
+        var resultType = new TensorType(DataTypes.Float32, new[] { 2, 8 });
+        Assert.True(IR.Affine.BufferViewUtility.TryCreate(sourceType, resultType, out var transform));
+        var source = T.CreateBuffer(sourceType, MemoryLocation.Data, out _);
+
+        var strides = IR.Affine.BufferViewUtility.CreateBufferViewStrides(source, resultType, transform);
+
+        Assert.Equal(new long[] { 8, 1 }, strides.Select(stride => stride.FixedValue));
+    }
+
+    [Fact]
     public void TestBufferViewAllowsZeroStrideDynamicDegenerateSuffix()
     {
         var sourceType = new TensorType(DataTypes.Float32, new[] { 4, 1 });

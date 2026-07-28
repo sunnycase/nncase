@@ -21,6 +21,7 @@ public class NTTTargetOptions : INTTTargetOptions, ITargetOpCostModelProvider, I
     {
         TargetCostModel = new DefaultTargetOpCostModel(_targetMachineModel);
         BlockMicroKernelModel = new DefaultBlockMicroKernelModel();
+        TIRMicroKernelSelector = new EmptyTIRMicroKernelSelector();
         StorageEncodingModel = new DefaultTargetStorageEncodingModel();
         LoopPipelineBackend = new EmptyLoopPipelineBackend();
     }
@@ -125,6 +126,8 @@ public class NTTTargetOptions : INTTTargetOptions, ITargetOpCostModelProvider, I
 
     public IBlockMicroKernelModelProvider BlockMicroKernelModel { get; protected set; }
 
+    public ITIRMicroKernelSelector TIRMicroKernelSelector { get; protected set; }
+
     public ITargetStorageEncodingModelProvider StorageEncodingModel { get; protected set; }
 
     public ILoopPipelineBackend LoopPipelineBackend { get; protected set; }
@@ -133,6 +136,7 @@ public class NTTTargetOptions : INTTTargetOptions, ITargetOpCostModelProvider, I
     {
         TargetCostModel = new DefaultTargetOpCostModel(TargetMachineModel);
         BlockMicroKernelModel = new DefaultBlockMicroKernelModel();
+        TIRMicroKernelSelector = new EmptyTIRMicroKernelSelector();
         StorageEncodingModel = new DefaultTargetStorageEncodingModel();
         LoopPipelineBackend = new EmptyLoopPipelineBackend();
     }

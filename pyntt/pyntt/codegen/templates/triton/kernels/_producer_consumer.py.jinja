@@ -1,0 +1,28 @@
+{% macro consumer_header(model, args=[]) -%}
+{{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
+def {{ model["FunctionName"] }}__consumer({{ helper_parameters(model, args) }}):
+{%- endmacro %}
+
+{% macro dispatch(model, args=[]) -%}
+@triton.jit
+def {{ model["FunctionName"] }}__producer():
+    pass
+
+
+{{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
+def {{ model["FunctionName"] }}({{ helper_parameters(model, args) }}):
+    tle.gpu.warp_specialize(
+        [
+            (
+                {{ model["FunctionName"] }}__consumer,
+                ({{ helper_argument_names(model, args) }},),
+            ),
+            (
+                {{ model["FunctionName"] }}__producer,
+                (),
+            ),
+        ],
+        [{{ model["ProducerWarps"] }}],
+        [{{ model["WorkerRegisters"] }}],
+    )
+{%- endmacro %}

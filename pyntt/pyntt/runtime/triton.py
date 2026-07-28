@@ -40,20 +40,30 @@ def validate_triton_kernel_resources(
     kernel,
     *args,
     grid,
-    expected_num_warps: int,
+    expected_compute_num_warps: int,
     registers_per_thread_limit: int,
     shared_memory_capacity_bytes: int,
     forbid_spills: bool,
     **kwargs,
 ) -> None:
     """Compile and validate one specialization before its first launch."""
+    requested_num_warps = kwargs.get("num_warps")
+    if (
+        requested_num_warps is not None
+        and int(requested_num_warps) != expected_compute_num_warps
+    ):
+        raise TritonKernelResourceError(
+            f"Triton launch requests {int(requested_num_warps)} compute warps; "
+            f"the target execution model requires {expected_compute_num_warps}."
+        )
+
     # Compile the exact specialization that the subsequent launch will use.
     # KernelInterface.warmup() replaces tensors with MockTensor values and can
     # therefore drop pointer-alignment attributes from the specialization key.
     compiled = kernel.run(*args, grid=grid, warmup=True, **kwargs)
     key = (
         compiled.hash,
-        expected_num_warps,
+        expected_compute_num_warps,
         registers_per_thread_limit,
         shared_memory_capacity_bytes,
         forbid_spills,
@@ -63,10 +73,14 @@ def validate_triton_kernel_resources(
 
     compiled._init_handles()
     actual_num_warps = int(compiled.metadata.num_warps)
-    if actual_num_warps != expected_num_warps:
+    # FlagTree reports the physical total after adding and warp-group-aligning
+    # explicit warp-specialized workers. The launch option still describes the
+    # default compute partition, so additional backend workers are valid.
+    if actual_num_warps < expected_compute_num_warps:
         raise TritonKernelResourceError(
             f"Triton kernel {compiled.name} compiled with {actual_num_warps} warps; "
-            f"the target execution model requires {expected_num_warps}."
+            f"the target execution model requires at least "
+            f"{expected_compute_num_warps} compute warps."
         )
 
     registers_per_thread = int(compiled.n_regs)
@@ -107,7 +121,7 @@ def select_and_validate_triton_tuning_parameter(
     kernel,
     kernel_args: tuple[object, ...],
     grid_for_candidate,
-    expected_num_warps: int,
+    expected_compute_num_warps: int,
     registers_per_thread_limit: int,
     shared_memory_capacity_bytes: int,
     forbid_spills: bool,
@@ -134,7 +148,7 @@ def select_and_validate_triton_tuning_parameter(
                 for name, value in launch_options.items()
             )
         ),
-        expected_num_warps,
+        expected_compute_num_warps,
         registers_per_thread_limit,
         shared_memory_capacity_bytes,
         forbid_spills,
@@ -150,7 +164,7 @@ def select_and_validate_triton_tuning_parameter(
                 *kernel_args,
                 candidate,
                 grid=grid_for_candidate(candidate),
-                expected_num_warps=expected_num_warps,
+                expected_compute_num_warps=expected_compute_num_warps,
                 registers_per_thread_limit=registers_per_thread_limit,
                 shared_memory_capacity_bytes=shared_memory_capacity_bytes,
                 forbid_spills=forbid_spills,

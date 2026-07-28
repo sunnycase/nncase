@@ -1,52 +1,23 @@
 {% import "triton/kernels/_common.py.jinja" as common with context %}
+{% import "triton/kernels/_producer_consumer.py.jinja" as phases with context %}
 {% set ctx = tensor_region_copy_context(model) %}
 # generated from PyNTT Jinja TensorRegionCopy.py.jinja
 # {{ model["Comment"] }}; dtype={{ model["DType"] }}, source_shape={{ shape_tuple(model["SourceShape"]) }}, destination_shape={{ shape_tuple(model["DestinationShape"]) }}
-{{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
-def {{ model["FunctionName"] }}({{ helper_parameters(model) }}):
+{{ phases.consumer_header(model) }}
     shard_index = tl.program_id(0).to(tl.int64)
 {{ common.shard_coordinates(ctx["pointer_values"]) }}
-{% for local_name, model_name in ctx["pointers"] %}
-{% if local_buffer(model[model_name]) is none %}
-    {{ local_name }} = {{ ptr(model, model_name) }}
-{% endif %}
-{% endfor %}
-{% if ctx["zero_fill_descriptor"] %}
-    tl.store(tle.gpu.local_ptr({{ ctx["zero_fill_descriptor"] }}), 0.0)
-{% endif %}
-{% if ctx["plan"] is not none %}
-{% for expression in ctx["expanded_indices"] %}
-    copy_desc_idx{{ loop.index0 }} = {{ expression }}
-{% endfor %}
-{% if ctx["linear_expression"] is not none %}
-    copy_linear = {{ ctx["linear_expression"] }}
-{% endif %}
-    copy_global_offset = {{ ctx["global_offset"] }}
-{% if ctx["plan"]["local_model_name"] == "Destination" %}
-    tle.gpu.copy({{ ctx["plan"]["global_name"] }} + copy_global_offset, {{ ctx["local_descriptor"] }}, {{ ctx["copy_shape"] }}{% if model.get("IsAsync", False) %}, is_async=True{% endif %})
-{% else %}
-    tle.gpu.copy({{ ctx["local_descriptor"] }}, {{ ctx["plan"]["global_name"] }} + copy_global_offset, {{ ctx["copy_shape"] }})
-{% endif %}
-{% elif ctx["structured_widths"] is not none %}
-{% for width in ctx["structured_widths"] %}
-{% set suffix = "" if (ctx["structured_widths"] | length) == 1 else "[" + ((["None"] * loop.index0 + [":"] + ["None"] * ((ctx["structured_widths"] | length) - loop.index)) | join(", ")) + "]" %}
-    copy_idx{{ loop.index0 }} = tl.arange(0, {{ width }}){{ suffix }}
-{% endfor %}
-    mask = copy_idx0 < {{ dim(ctx["extents"][0]) }}
-{% for axis in range(1, ctx["extents"] | length) %}
-    mask = mask & (copy_idx{{ axis }} < {{ dim(ctx["extents"][axis]) }})
-{% endfor %}
-    value = tl.load({{ access_pointer(model, "Source", "source", ctx["source_access"]) }}, mask=mask)
-    tl.store({{ access_pointer(model, "Destination", "destination", ctx["destination_access"]) }}, value, mask=mask)
-{% else %}
+    source = {{ ptr(model, "Source") }}
+    destination = {{ ptr(model, "Destination") }}
 {% for axis in ctx["outer_axes"] %}
 {{ "    " * (loop.index0 + 1) }}for copy_idx{{ axis }} in tl.range(0, {{ dim(ctx["extents"][axis]) }}):
 {% endfor %}
 {% set inner_indent = "    " * ((ctx["outer_axes"] | length) + 1) %}
 {% set body_indent = "    " * ((ctx["outer_axes"] | length) + 2) %}
-{{ inner_indent }}for copy_inner_start in tl.range(0, {{ dim(ctx["inner_extent"]) }}, {{ ctx["inner_width"] }}):
-{{ body_indent }}copy_idx{{ ctx["inner_axis"] }} = copy_inner_start + tl.arange(0, {{ ctx["inner_width"] }})
+{{ inner_indent }}for copy_inner_start in tl.range(0, {{ dim(ctx["inner_extent"]) }}, block_size):
+{{ body_indent }}copy_idx{{ ctx["inner_axis"] }} = copy_inner_start + tl.arange(0, block_size)
 {{ body_indent }}mask = copy_idx{{ ctx["inner_axis"] }} < {{ dim(ctx["inner_extent"]) }}
 {{ body_indent }}value = tl.load({{ access_pointer(model, "Source", "source", ctx["source_access"]) }}, mask=mask)
 {{ body_indent }}tl.store({{ access_pointer(model, "Destination", "destination", ctx["destination_access"]) }}, value, mask=mask)
-{% endif %}
+
+
+{{ phases.dispatch(model) }}

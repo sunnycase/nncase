@@ -36,6 +36,8 @@ public abstract class NTTTarget : Target
 
     public override IReadOnlyList<IModuleCompiler> ModuleCompilers { get; }
 
+    public override bool IsAutoTilingEnabled => true;
+
     protected abstract INTTModuleCompiler NTTModuleCompiler { get; }
 
     protected virtual string DefaultTargetMachine => NTTTargetMachineCatalog.CpuGeneric;
@@ -56,6 +58,15 @@ public abstract class NTTTarget : Target
     public override void RegisterAffineSelectionPass(IPassManager passManager, CompileOptions options)
     {
         passManager.Add<NTTAffineSelectionPass>(NTTModuleCompiler.ModuleKind);
+    }
+
+    public override void RegisterAutoTilingPass(IPassManager passManager, CompileOptions options)
+    {
+        RegisterAffineSelectionPass(passManager, options);
+        passManager.AddWithName<AutoTilePass>($"AutoTiling_{NTTModuleCompiler.ModuleKind}", NTTModuleCompiler.ModuleKind);
+        passManager.Add<AddFunctionToModule>();
+        passManager.Add<InferRangePass>();
+        passManager.Add<OptimizeByRangePass>();
     }
 
     public override void RegisterAutoPackingRules(IRulesAddable pass, CompileOptions options)

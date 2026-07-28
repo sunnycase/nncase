@@ -361,16 +361,7 @@ public class Compiler : ICompiler
     public void AutoTilingPass(IPassManager passManager)
     {
         var target = _compileSession.Target;
-        target.RegisterAffineSelectionPass(passManager, _compileSession.CompileOptions);
-
-        foreach (var moduleCompiler in _compileSession.Target.ModuleCompilers)
-        {
-            passManager.AddWithName<AutoTilePass>($"AutoTiling_{moduleCompiler.ModuleKind}", moduleCompiler.ModuleKind);
-        }
-
-        passManager.Add<AddFunctionToModule>();
-        passManager.Add<InferRangePass>();
-        passManager.Add<OptimizeByRangePass>();
+        target.RegisterAutoTilingPass(passManager, _compileSession.CompileOptions);
     }
 
     public void TIRPass(IPassManager passManager)
@@ -428,7 +419,11 @@ public class Compiler : ICompiler
         await RunPassAsync(AutoPackingPass, "AutoPackingPass");
         await RunPassAsync(AutoDistributedPass, "AutoDistributedPass");
 
-        await RunPassAsync(AutoTilingPass, "AutoTilingPass");
+        if (target.IsAutoTilingEnabled)
+        {
+            await RunPassAsync(AutoTilingPass, "AutoTilingPass");
+        }
+
         await RunPassAsync(TIRPass, "TIRPass");
 
         await RunPassAsync(

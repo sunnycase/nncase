@@ -42,11 +42,16 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
     {
         var supportsConstShardedView = CompileSession.CompileOptions.TargetOptions is INTTTargetOptions targetOptions
             && Nncase.Passes.Distributed.AutoDistributedRewriter.SupportsConstShardedView(targetOptions);
+        var compilerInsertedRestoreTransforms = new HashSet<Call>(ReferenceEqualityComparer.Instance);
         for (int iteration = 0; iteration < MaxPlanningIterations; iteration++)
         {
-            var specializer = new FunctionLayoutSpecializer(input, supportsConstShardedView);
+            var specializer = new FunctionLayoutSpecializer(input, supportsConstShardedView, compilerInsertedRestoreTransforms);
             var enableCallerOutputDemandLayouts = _enableCallerOutputDemandLayouts && iteration == 0;
-            var selectedLayouts = ModuleLayoutPlanner.Plan(input, specializer, enableCallerOutputDemandLayouts);
+            var selectedLayouts = ModuleLayoutPlanner.Plan(
+                input,
+                specializer,
+                compilerInsertedRestoreTransforms,
+                enableCallerOutputDemandLayouts);
             if (selectedLayouts.Count == 0)
             {
                 return Task.FromResult(input);
@@ -90,7 +95,10 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
             }
         }
 
-        var remainingLayoutMap = ModuleLayoutPlanner.CollectCandidateLayouts(input, _enableCallerOutputDemandLayouts);
+        var remainingLayoutMap = ModuleLayoutPlanner.CollectCandidateLayouts(
+            input,
+            compilerInsertedRestoreTransforms,
+            _enableCallerOutputDemandLayouts);
         var remainingLayoutFunctions = remainingLayoutMap.Keys.ToArray();
         var remainingLayouts = string.Join(", ", remainingLayoutMap.Select(kv => $"{kv.Key.Name}: {string.Join(" | ", kv.Value.Select(value => value.ToString()))}"));
         var lastSignature = remainingLayoutFunctions.LastOrDefault() is { } last
@@ -233,9 +241,13 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
         public static IReadOnlyDictionary<Function, FunctionBoundaryLayout> Plan(
             IRModule module,
             FunctionLayoutSpecializer specializer,
+            IReadOnlySet<Call> compilerInsertedRestoreTransforms,
             bool enableCallerOutputDemandLayouts)
         {
-            var candidates = CollectCandidateLayouts(module, enableCallerOutputDemandLayouts);
+            var candidates = CollectCandidateLayouts(
+                module,
+                compilerInsertedRestoreTransforms,
+                enableCallerOutputDemandLayouts);
             if (candidates.Count == 0)
             {
                 return new Dictionary<Function, FunctionBoundaryLayout>(ReferenceEqualityComparer.Instance);
@@ -294,7 +306,10 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
             return selected;
         }
 
-        public static Dictionary<Function, FunctionBoundaryLayout[]> CollectCandidateLayouts(IRModule module, bool enableCallerOutputDemandLayouts = true)
+        public static Dictionary<Function, FunctionBoundaryLayout[]> CollectCandidateLayouts(
+            IRModule module,
+            IReadOnlySet<Call>? compilerInsertedRestoreTransforms = null,
+            bool enableCallerOutputDemandLayouts = true)
         {
             var layouts = new Dictionary<Function, FunctionBoundaryLayout[]>(ReferenceEqualityComparer.Instance);
             foreach (var function in module.Functions.OfType<Function>())
@@ -305,7 +320,9 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
                 }
 
                 var candidates = new List<FunctionBoundaryLayout> { FunctionBoundaryLayout.Identity(function) };
-                var internalLayout = FunctionBoundaryLayout.TryCreate(function);
+                var internalLayout = FunctionBoundaryLayout.TryCreate(
+                    function,
+                    compilerInsertedRestoreTransforms);
                 if (internalLayout is not null)
                 {
                     candidates.Add(internalLayout);
@@ -569,12 +586,17 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
     {
         private readonly IRModule _module;
         private readonly bool _supportsConstShardedView;
+        private readonly ISet<Call> _compilerInsertedRestoreTransforms;
         private readonly Dictionary<Function, Dictionary<FunctionBoundaryLayout, Function>> _cache = new(ReferenceEqualityComparer.Instance);
 
-        public FunctionLayoutSpecializer(IRModule module, bool supportsConstShardedView)
+        public FunctionLayoutSpecializer(
+            IRModule module,
+            bool supportsConstShardedView,
+            ISet<Call> compilerInsertedRestoreTransforms)
         {
             _module = module;
             _supportsConstShardedView = supportsConstShardedView;
+            _compilerInsertedRestoreTransforms = compilerInsertedRestoreTransforms;
         }
 
         public bool HasReplacements => _cache.Count != 0;
@@ -592,12 +614,12 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
                 return existing;
             }
 
-            var specialized = Create(function, layout);
+            var specialized = Create(function, layout, _compilerInsertedRestoreTransforms);
             perFunction.Add(layout, specialized);
             return specialized;
         }
 
-        public Function CreateDetached(Function function, FunctionBoundaryLayout layout) => Create(function, layout);
+        public Function CreateDetached(Function function, FunctionBoundaryLayout layout) => Create(function, layout, null);
 
         public void CommitReplacements()
         {
@@ -619,7 +641,10 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
             }
         }
 
-        private Function Create(Function function, FunctionBoundaryLayout layout)
+        private Function Create(
+            Function function,
+            FunctionBoundaryLayout layout,
+            ISet<Call>? compilerInsertedRestoreTransforms)
         {
             var parameters = function.Parameters.ToArray();
             var mappedParameters = new Dictionary<Var, Var>(ReferenceEqualityComparer.Instance);
@@ -652,7 +677,11 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
                 }
             }
 
-            var cloner = new SpecializedBodyCloner(mappedParameters, packedInputs, _supportsConstShardedView);
+            var cloner = new SpecializedBodyCloner(
+                mappedParameters,
+                packedInputs,
+                _supportsConstShardedView,
+                compilerInsertedRestoreTransforms);
             var body = CloneBodyWithPackedOutputs(function.Body, layout, cloner);
             var varMap = RewriteVarMap(function.VarMap, mappedParameters);
             var specialized = new Function(function.Name, function.ModuleKind, body, specializedParameters, varMap);
@@ -744,13 +773,19 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
         private readonly IReadOnlyDictionary<Var, Var> _mappedParameters;
         private readonly Dictionary<Var, PortLayout> _packedInputs;
         private readonly bool _supportsConstShardedView;
+        private readonly ISet<Call>? _compilerInsertedRestoreTransforms;
 
-        public SpecializedBodyCloner(IReadOnlyDictionary<Var, Var> mappedParameters, Dictionary<Var, PortLayout> packedInputs, bool supportsConstShardedView)
+        public SpecializedBodyCloner(
+            IReadOnlyDictionary<Var, Var> mappedParameters,
+            Dictionary<Var, PortLayout> packedInputs,
+            bool supportsConstShardedView,
+            ISet<Call>? compilerInsertedRestoreTransforms)
             : base(cloneOtherFunctions: false)
         {
             _mappedParameters = mappedParameters;
             _packedInputs = packedInputs;
             _supportsConstShardedView = supportsConstShardedView;
+            _compilerInsertedRestoreTransforms = compilerInsertedRestoreTransforms;
         }
 
         protected override BaseExpr DispatchVisit(BaseExpr expr, Unit context)
@@ -784,7 +819,16 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
 
             if (_packedInputs.TryGetValue(expr, out var inputLayout))
             {
-                return MakeInverseBoundaryTransform(mapped, inputLayout.Transform, expr.CheckedType);
+                var restore = MakeInverseBoundaryTransform(
+                    mapped,
+                    inputLayout.Transform,
+                    expr.CheckedType);
+                if (restore is Call restoreCall)
+                {
+                    _compilerInsertedRestoreTransforms?.Add(restoreCall);
+                }
+
+                return restore;
             }
 
             return mapped;
@@ -817,9 +861,11 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
             return new FunctionBoundaryLayout(new PortLayout?[function.Parameters.Length], CreateEmptyOutputs(function.Body.CheckedType), true);
         }
 
-        public static FunctionBoundaryLayout? TryCreate(Function function)
+        public static FunctionBoundaryLayout? TryCreate(
+            Function function,
+            IReadOnlySet<Call>? compilerInsertedRestoreTransforms = null)
         {
-            var inputs = AnalyzeInputs(function);
+            var inputs = AnalyzeInputs(function, compilerInsertedRestoreTransforms);
             var outputs = AnalyzeOutputs(function.Body);
             if (inputs.All(x => x is null) && outputs.All(x => x is null))
             {
@@ -889,7 +935,9 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
                 : $"inputs=[{string.Join(", ", Inputs.Select(x => x?.ToString() ?? "-"))}], outputs=[{string.Join(", ", Outputs.Select(x => x?.ToString() ?? "-"))}]";
         }
 
-        private static PortLayout?[] AnalyzeInputs(Function function)
+        private static PortLayout?[] AnalyzeInputs(
+            Function function,
+            IReadOnlySet<Call>? compilerInsertedRestoreTransforms)
         {
             var parameters = function.Parameters.ToArray();
             var result = new PortLayout?[parameters.Length];
@@ -914,6 +962,7 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
                     }
 
                     if (user is Call call
+                        && !(compilerInsertedRestoreTransforms?.Contains(call) ?? false)
                         && BoundaryTransform.TryCreateInputTransform(call, out var transform, out var input)
                         && ReferenceEquals(input, parameter))
                     {
@@ -1113,7 +1162,9 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
         public static bool TryCreateInputTransform(Call call, out BoundaryTransform transform, out BaseExpr input)
         {
             if (TryCreate(call, out transform, out input)
-                && (transform.Kind is BoundaryTransformKind.Pack or BoundaryTransformKind.Transpose
+                && (transform.Kind is BoundaryTransformKind.Pack
+                    or BoundaryTransformKind.Unpack
+                    or BoundaryTransformKind.Transpose
                     || (transform.Kind is BoundaryTransformKind.Boxing && transform.NewIRType is DistributedType)))
             {
                 return true;

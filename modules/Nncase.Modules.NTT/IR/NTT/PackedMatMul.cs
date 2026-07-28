@@ -6,6 +6,22 @@ using Nncase.PatternMatch;
 
 namespace Nncase.IR.NTT;
 
+/// <summary>
+/// Physical RHS layout used by <see cref="PackedMatMul"/>.
+/// </summary>
+public enum PackedMatMulRhsLayout
+{
+    /// <summary>
+    /// CPU-oriented [..., N, K]&lt;NPack, NVector&gt; layout.
+    /// </summary>
+    NMajor,
+
+    /// <summary>
+    /// GPU-oriented [..., K, N]&lt;NVector, KPack, KVector&gt; layout.
+    /// </summary>
+    KMajor,
+}
+
 [PatternFunctionalGenerator]
 public sealed partial class PackedMatMul : Op
 {
@@ -28,5 +44,7 @@ public sealed partial class PackedMatMul : Op
 
     public bool FusedReduce { get; }
 
-    public override string DisplayProperty() => $"FusedReduce: {FusedReduce}";
+    public PackedMatMulRhsLayout RhsLayout { get; }
+
+    public override string DisplayProperty() => $"FusedReduce: {FusedReduce}, RhsLayout: {RhsLayout}";
 }

@@ -1,0 +1,110 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="760" viewBox="0 0 1200 760" role="img" aria-labelledby="title desc">
+  <title id="title">Measured SM120 packed GEMV pipeline validation</title>
+  <desc id="desc">The checked-in N12288 benchmark records stage three through stage six within 0.4 percent, while the managed stage-three and stage-four candidates have equal cold medians and the second measured shape first reaches its minimum at stage four. The checked-in NCU result records full global sectors, vector shared loads, zero shared bank conflicts, and 94.433 percent of peak sustained DRAM throughput.</desc>
+  <style>
+    .bg { fill: #f6f8fb; }
+    .panel { fill: #ffffff; stroke: #cbd5e1; stroke-width: 1.5; }
+    .title { fill: #172033; font: 700 26px system-ui, sans-serif; }
+    .subtitle { fill: #526176; font: 400 14px system-ui, sans-serif; }
+    .head { fill: #172033; font: 700 16px system-ui, sans-serif; }
+    .body { fill: #334155; font: 400 12px system-ui, sans-serif; }
+    .small { fill: #64748b; font: 400 11px system-ui, sans-serif; }
+    .mono { fill: #172033; font: 600 12px ui-monospace, SFMono-Regular, monospace; }
+    .axis { stroke: #64748b; stroke-width: 1.2; }
+    .grid { stroke: #e2e8f0; stroke-width: 1; }
+    .cold { fill: none; stroke: #2563eb; stroke-width: 3; }
+    .warm { fill: none; stroke: #b45309; stroke-width: 3; }
+    .cold-point { fill: #2563eb; stroke: #ffffff; stroke-width: 2; }
+    .warm-point { fill: #b45309; stroke: #ffffff; stroke-width: 2; }
+    .plateau { fill: #dcfce7; fill-opacity: 0.55; stroke: #15803d; stroke-width: 1.5; stroke-dasharray: 6 4; }
+    .selection { stroke: #7e22ce; stroke-width: 2; stroke-dasharray: 7 5; }
+    .good { fill: #e9f7ef; stroke: #15803d; stroke-width: 1.5; }
+    .metric { fill: #e8f1fb; stroke: #2563eb; stroke-width: 1.5; }
+    .result { fill: #f1e9fb; stroke: #7e22ce; stroke-width: 1.8; }
+  </style>
+
+  <rect class="bg" width="1200" height="760"/>
+  <text class="title" x="48" y="48">SM120 packed BF16 GEMV: measured validation</text>
+  <text class="subtitle" x="48" y="73">B1/N1: RTX 5060 Ti, M1 K4096 N12288, 36 persistent CTAs, 8 consumer warps + 1 producer warp</text>
+
+  <rect class="panel" x="40" y="98" width="662" height="606" rx="6"/>
+  <text class="head" x="64" y="130">B1: pipeline stage sweep</text>
+  <text class="small" x="64" y="151">Cache-cleared cold medians select the pipeline; warm medians show the steady-state plateau.</text>
+
+  <rect class="plateau" x="298" y="174" width="365" height="378" rx="4"/>
+  <text class="small" x="480" y="194" text-anchor="middle">B1: S3-S6 within 0.4%; managed S3/S4 equal</text>
+
+  <line class="grid" x1="100" y1="184" x2="670" y2="184"/>
+  <line class="grid" x1="100" y1="267" x2="670" y2="267"/>
+  <line class="grid" x1="100" y1="350" x2="670" y2="350"/>
+  <line class="grid" x1="100" y1="433" x2="670" y2="433"/>
+  <line class="grid" x1="100" y1="516" x2="670" y2="516"/>
+  <line class="axis" x1="100" y1="174" x2="100" y2="552"/>
+  <line class="axis" x1="100" y1="552" x2="670" y2="552"/>
+  <text class="small" x="88" y="188" text-anchor="end">0.305</text>
+  <text class="small" x="88" y="271" text-anchor="end">0.287</text>
+  <text class="small" x="88" y="354" text-anchor="end">0.270</text>
+  <text class="small" x="88" y="437" text-anchor="end">0.252</text>
+  <text class="small" x="88" y="520" text-anchor="end">0.235 ms</text>
+
+  <line class="selection" x1="447" y1="174" x2="447" y2="552"/>
+  <text class="small" x="455" y="232">C1: selected S4</text>
+
+  <polyline class="cold" points="132,202 237,368 342,426 447,426 552,431 657,426"/>
+  <circle class="cold-point" cx="132" cy="202" r="6"/>
+  <circle class="cold-point" cx="237" cy="368" r="6"/>
+  <circle class="cold-point" cx="342" cy="426" r="6"/>
+  <circle class="cold-point" cx="447" cy="426" r="6"/>
+  <circle class="cold-point" cx="552" cy="431" r="6"/>
+  <circle class="cold-point" cx="657" cy="426" r="6"/>
+
+  <polyline class="warm" points="132,373 237,460 342,491 447,491 552,491 657,489"/>
+  <circle class="warm-point" cx="132" cy="373" r="5"/>
+  <circle class="warm-point" cx="237" cy="460" r="5"/>
+  <circle class="warm-point" cx="342" cy="491" r="5"/>
+  <circle class="warm-point" cx="447" cy="491" r="5"/>
+  <circle class="warm-point" cx="552" cy="491" r="5"/>
+  <circle class="warm-point" cx="657" cy="489" r="5"/>
+
+  <text class="small" x="132" y="572" text-anchor="middle">S1</text>
+  <text class="small" x="237" y="572" text-anchor="middle">S2</text>
+  <text class="small" x="342" y="572" text-anchor="middle">S3</text>
+  <text class="small" x="447" y="572" text-anchor="middle">S4</text>
+  <text class="small" x="552" y="572" text-anchor="middle">S5</text>
+  <text class="small" x="657" y="572" text-anchor="middle">S6</text>
+
+  <line class="cold" x1="82" y1="610" x2="112" y2="610"/>
+  <text class="body" x="120" y="614">Cold: 0.3011, 0.2662, 0.2540, 0.2540, 0.2530, 0.2540 ms</text>
+  <line class="warm" x1="82" y1="638" x2="112" y2="638"/>
+  <text class="body" x="120" y="642">Warm: 0.2650, 0.2467, 0.2402, 0.2402, 0.2406, 0.2404 ms</text>
+  <text class="body" x="82" y="674">B1: managed S3/S4 are equal on N12288; N4096 first reaches its minimum at S4.</text>
+  <text class="small" x="82" y="692">C1 selects S4 as the cross-shape production point inside the managed arena.</text>
+
+  <rect class="panel" x="726" y="98" width="434" height="606" rx="6"/>
+  <text class="head" x="750" y="130">N1: counters for the selected S4 path</text>
+
+  <rect class="good" x="750" y="154" width="386" height="128" rx="5"/>
+  <text class="head" x="770" y="181">Global copy</text>
+  <text class="mono" x="770" y="207">16 sectors x 32 B = 512 B/request</text>
+  <text class="mono" x="770" y="232">196,608 LDGSTS instructions</text>
+  <text class="body" x="770" y="258">N1 records 1.0 global sector utilization.</text>
+
+  <rect class="good" x="750" y="302" width="386" height="146" rx="5"/>
+  <text class="head" x="770" y="329">Shared consumer load</text>
+  <text class="mono" x="770" y="355">B1 PTX: ld.shared.v4.b32</text>
+  <text class="mono" x="770" y="380">N1 bank conflicts: 0</text>
+  <text class="mono" x="770" y="405">N1: 127.9535 useful B/wavefront</text>
+  <text class="body" x="770" y="431">N1 records zero shared-load bank conflicts.</text>
+
+  <rect class="metric" x="750" y="468" width="386" height="100" rx="5"/>
+  <text class="head" x="770" y="495">Recorded NCU values</text>
+  <text class="mono" x="770" y="521">duration: 245.248 us</text>
+  <text class="mono" x="770" y="546">DRAM: 94.433% peak sustained</text>
+
+  <rect class="result" x="750" y="588" width="386" height="82" rx="5"/>
+  <text class="head" x="770" y="616">C1 selected profile</text>
+  <text class="mono" x="770" y="642">N64 x K128, S4, 8 consumer warps</text>
+  <text class="small" x="770" y="661">Vectorized tt.load; no 5D shared descriptor.</text>
+
+  <text class="small" x="48" y="738">Sources: B1 results-sm120-rtx5060ti.json, N1 ncu-results-sm120-rtx5060ti.json, and C1 selector.</text>
+</svg>

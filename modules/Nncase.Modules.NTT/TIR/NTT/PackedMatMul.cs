@@ -18,5 +18,7 @@ public sealed partial class PackedMatMul : NTTKernelOp
 
     public bool FusedReduce { get; }
 
-    public override string DisplayProperty() => $"FusedReduce: {FusedReduce}";
+    public IR.NTT.PackedMatMulRhsLayout RhsLayout { get; }
+
+    public override string DisplayProperty() => $"FusedReduce: {FusedReduce}, RhsLayout: {RhsLayout}";
 }

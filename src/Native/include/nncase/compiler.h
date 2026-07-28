@@ -307,7 +307,6 @@ typedef struct {
     clr_object_handle_t (*pyntt_target_options_create)();
     void (*pyntt_target_options_set_backend)(clr_object_handle_t handle, const char* value, size_t length);
     void (*pyntt_target_options_set_output_directory)(clr_object_handle_t handle, const char* value, size_t length);
-    void (*pyntt_target_options_set_strict)(clr_object_handle_t handle, uint8_t value);
     /* end the auto generated block by tools/stackvm_gen/CApiGen at 12/20/2024 3:41:05 PM +08:00. */
     // clang-format on
 
@@ -799,9 +798,6 @@ class pyntt_target_options : public cpu_target_options {
         nncase_clr_api()->pyntt_target_options_set_output_directory(obj_.get(), value.data(), value.length());
     }
 
-    void strict(bool value) {
-        nncase_clr_api()->pyntt_target_options_set_strict(obj_.get(), value);
-    }
 };
 /* end the auto generated block by tools/stackvm_gen/CApiGen at 12/20/2024 3:41:05 PM +08:00. */
 // clang-format on

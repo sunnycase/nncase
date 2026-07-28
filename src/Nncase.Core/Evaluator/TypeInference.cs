@@ -467,6 +467,52 @@ public static class TypeInference
         return PackType(input.Shape, vType, lanes, axes);
     }
 
+    /// <summary>
+    /// Pack a distributed tensor while preserving its physical shard boundaries.
+    /// </summary>
+    public static IRType PackType(DistributedType input, ReadOnlySpan<int> lanes, ReadOnlySpan<int> axes)
+    {
+        if (lanes.Length != axes.Length)
+        {
+            return new InvalidType("pack lanes and axes must have the same length");
+        }
+
+        for (int i = 0; i < lanes.Length; i++)
+        {
+            if (lanes[i] <= 0)
+            {
+                return new InvalidType("pack lane <= 0");
+            }
+        }
+
+        if (PackType(input.TensorType, lanes, axes) is not TensorType tensorType)
+        {
+            return new InvalidType($"Cannot pack distributed tensor type {input.TensorType}.");
+        }
+
+        var axisLaneProducts = GetAxisLaneProducts(lanes, axes.ToArray());
+        var policies = input.AxisPolicies.ToArray();
+        foreach (var (policy, axis) in input.AxisPolicies.Select((policy, axis) => (policy, axis)))
+        {
+            if (policy is not SBPSplit split || !axisLaneProducts.TryGetValue(axis, out var laneProduct))
+            {
+                continue;
+            }
+
+            var localGranularity = split.Granularity
+                ?? Dimension.CeilDiv(input.TensorType.Shape[axis], GetSplitDivisor(split, input.Placement));
+            if (!Dimension.TryDivExactly(localGranularity, laneProduct, out var dividedGranularity))
+            {
+                return new InvalidType(
+                    $"{input}, pack axis {axis} split granularity {localGranularity} cuts vector lane group {laneProduct}");
+            }
+
+            policies[axis] = SBP.S(split.Axes, split.Granularity is null ? null : dividedGranularity);
+        }
+
+        return input with { TensorType = tensorType, AxisPolicies = policies };
+    }
+
     public static IRType VectorizeMaskType(TensorType input, MaskVectorStyle style, int elementBits, int lanes, int axis)
     {
         if (input.DType is not BooleanType)
@@ -486,6 +532,56 @@ public static class TypeInference
             VectorType vt => UnpackType(input.Shape, UnpackType(vt, axes), vt.Lanes.Take(axes.Count).ToArray(), axes),
             _ => new InvalidType($"UnpackType does not support {input.DType}"),
         };
+    }
+
+    /// <summary>
+    /// Unpack a distributed tensor while preserving its physical shard boundaries.
+    /// </summary>
+    public static IRType UnpackType(DistributedType input, IRArray<int> axes)
+    {
+        if (UnpackType(input.TensorType, axes) is not TensorType tensorType)
+        {
+            return new InvalidType($"Cannot unpack distributed tensor type {input.TensorType}.");
+        }
+
+        var lanes = input.TensorType.DType switch
+        {
+            MaskVectorType maskVectorType => new[] { maskVectorType.Lanes },
+            VectorType vectorType when axes.Count <= vectorType.Lanes.Count => vectorType.Lanes.Take(axes.Count).ToArray(),
+            _ => Array.Empty<int>(),
+        };
+        if (lanes.Length != axes.Count)
+        {
+            return new InvalidType($"Cannot unpack {input.TensorType.DType} with axes [{string.Join(",", axes)}].");
+        }
+
+        var axisLaneProducts = GetAxisLaneProducts(lanes, axes.ToArray());
+        var policies = input.AxisPolicies.ToArray();
+        foreach (var (policy, axis) in input.AxisPolicies.Select((policy, axis) => (policy, axis)))
+        {
+            if (policy is not SBPSplit split || !axisLaneProducts.TryGetValue(axis, out var laneProduct))
+            {
+                continue;
+            }
+
+            Dimension? granularity;
+            if (split.Granularity is { } splitGranularity)
+            {
+                granularity = splitGranularity * laneProduct;
+            }
+            else
+            {
+                var divisor = GetSplitDivisor(split, input.Placement);
+                var dimension = input.TensorType.Shape[axis];
+                granularity = dimension.IsFixed && dimension.FixedValue % divisor == 0
+                    ? null
+                    : Dimension.CeilDiv(dimension, divisor) * laneProduct;
+            }
+
+            policies[axis] = SBP.S(split.Axes, granularity);
+        }
+
+        return input with { TensorType = tensorType, AxisPolicies = policies };
     }
 
     /// <summary>
@@ -737,6 +833,30 @@ public static class TypeInference
         }
 
         return new TensorType(vectorType, Shape.Unranked);
+    }
+
+    private static Dictionary<int, int> GetAxisLaneProducts(ReadOnlySpan<int> lanes, ReadOnlySpan<int> axes)
+    {
+        var products = new Dictionary<int, int>();
+        for (int i = 0; i < axes.Length; i++)
+        {
+            products[axes[i]] = products.TryGetValue(axes[i], out var product)
+                ? checked(product * lanes[i])
+                : lanes[i];
+        }
+
+        return products;
+    }
+
+    private static int GetSplitDivisor(SBPSplit split, Placement placement)
+    {
+        var divisor = 1;
+        foreach (var axis in split.Axes)
+        {
+            divisor = checked(divisor * placement.Hierarchy[axis]);
+        }
+
+        return divisor;
     }
 
     private static IRType UnpackType(Shape inputShape, DataType elementType, ReadOnlySpan<int> lanes, ReadOnlySpan<int> axes)

@@ -355,6 +355,17 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
             IndentScope.Writer.Write($"auto start_{CallCount} = get_ms_time();\n");
 #endif
             var args = expr.Arguments.ToArray();
+            if (kop is TIR.NTT.NTTKernelOp)
+            {
+                if (args.Length == 0 || args[^1] is not None)
+                {
+                    throw new NotSupportedException(
+                        $"NTT CPU kernel {kop.GetType().Name} requires a None shared_workspace operand.");
+                }
+
+                args = args[..^1];
+            }
+
             if (args.Any(x => x is TIR.Buffer { MemSpan: { Buffer: { Location: MemoryLocation.BlockLocalData } } }))
             {
                 // Ensure all threads reach this point before a kernel using BlockLocalData

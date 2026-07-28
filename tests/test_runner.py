@@ -415,7 +415,6 @@ class TestRunner(Evaluator, Inference, metaclass=ABCMeta):
             "custom_op_scheme": "CustomOpScheme",
             "backend": "Backend",
             "output_directory": "OutputDirectory",
-            "strict": "Strict",
         }
         return aliases.get(name, name)
 

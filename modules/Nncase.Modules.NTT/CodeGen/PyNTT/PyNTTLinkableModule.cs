@@ -66,7 +66,9 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
         if (function is PrimFunction primFunction)
         {
             var abi = primFunction.GetAbiView();
-            return abi.Inputs.Concat<IVar>(abi.Workspaces).ToArray();
+            return abi.Inputs
+                .Concat<IVar>(abi.Workspaces.Where(IsRuntimeWorkspaceParameter))
+                .ToArray();
         }
 
         return GetParameters(function)
@@ -475,7 +477,6 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
             target_kind = _moduleKind,
             backend = targetOptions.Backend,
             target_machine = targetOptions.TargetMachine,
-            strict = targetOptions.Strict,
             functions = _functions.Select(function => new
             {
                 id = function.Id,
@@ -500,7 +501,7 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
         var topKernelFunctions = GetRuntimeTopKernelFunctions();
         var manifest = new
         {
-            pyntt_codegen_manifest_version = 6,
+            pyntt_codegen_manifest_version = 8,
             target_kind = _moduleKind,
             backend = targetOptions.Backend,
             functions = _functions.Select(function => new
@@ -552,11 +553,6 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
             CollectRuntimeDispatchCallees(function.SourceFunction, callees);
             foreach (var callee in callees)
             {
-                if (PyNTTPrimFunctionRoles.IsScheduledRegionFunction(callee))
-                {
-                    continue;
-                }
-
                 CollectRuntimeTopKernelFunctions(FindLinkableFunction(callee), result, active);
             }
         }
@@ -615,7 +611,6 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
         var moduleName = GetModuleName();
         var runtimeConfig = $"""
             BACKEND = {PythonString(backend)}
-            STRICT = {PythonBool(targetOptions.Strict)}
             """;
         var requirements = """
             torch
@@ -1023,11 +1018,6 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
             CollectDirectPrimFunctionCallees(function.SourceFunction, callees);
             foreach (var directCallee in callees)
             {
-                if (PyNTTPrimFunctionRoles.IsScheduledRegionFunction(directCallee))
-                {
-                    continue;
-                }
-
                 var calleeRequirements = GetPreparedWorkspaceRequirements(FindLinkableFunction(directCallee), active);
                 usesData |= calleeRequirements.UsesData;
                 nestedDataLocalBytes = Math.Max(nestedDataLocalBytes, calleeRequirements.DataLocalBytes);
@@ -1177,8 +1167,6 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
                 return BuildDispatchSequential(sequential, currentFunction, context, extraIndent);
             case IfThenElse ifThenElse:
                 return BuildDispatchIfThenElse(ifThenElse, currentFunction, context, extraIndent);
-            case Call { Target: PrimFunction callee } when PyNTTPrimFunctionRoles.IsScheduledRegionFunction(callee):
-                return string.Empty;
             case Call { Target: PrimFunction callee } call:
                 return BuildFunctionCallDispatch(call, FindLinkableFunction(callee), context, extraIndent);
             case Call { Target: BaseFunction callee }:
@@ -1221,11 +1209,7 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
 
             if (field is Call { Target: PrimFunction callee } call)
             {
-                if (!PyNTTPrimFunctionRoles.IsScheduledRegionFunction(callee))
-                {
-                    pieces.Add(BuildFunctionCallDispatch(call, FindLinkableFunction(callee), context, extraIndent));
-                }
-
+                pieces.Add(BuildFunctionCallDispatch(call, FindLinkableFunction(callee), context, extraIndent));
                 continue;
             }
 
@@ -1293,12 +1277,8 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
                 return CountRuntimeLaunches(function.Body, active);
             case Fusion fusion:
                 return CountRuntimeLaunches(fusion.Body, active);
-            case PrimFunction primFunction when PyNTTPrimFunctionRoles.IsScheduledRegionFunction(primFunction):
-                return 0;
             case PrimFunction primFunction:
                 return CountRuntimeLaunches(FindLinkableFunction(primFunction), active);
-            case Call { Target: PrimFunction callee } when PyNTTPrimFunctionRoles.IsScheduledRegionFunction(callee):
-                return 0;
             case Call { Target: PrimFunction callee }:
                 return CountRuntimeLaunches(FindLinkableFunction(callee), active);
             case Call { Target: BaseFunction callee }:
@@ -1460,7 +1440,7 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
         IReadOnlyList<IVar> inputParameters,
         IReadOnlyList<IRType> outputTypes)
     {
-        var arguments = call.Arguments.ToArray();
+        var arguments = StripInternalWorkspaceArguments(call, callee);
         var trailingWorkspaceCount = CountTrailingRuntimeWorkspaceParameters(inputParameters);
         var regularInputCount = inputParameters.Count - trailingWorkspaceCount;
         if (trailingWorkspaceCount == 0)
@@ -1518,7 +1498,48 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
     }
 
     private static bool IsRuntimeWorkspaceParameter(IVar parameter)
-        => parameter is BufferVar { Role: BufferVarRole.Workspace };
+        => parameter is BufferVar
+        {
+            Role: BufferVarRole.Workspace,
+            Location: not MemoryLocation.Shared,
+        };
+
+    private static BaseExpr[] StripInternalWorkspaceArguments(Call call, BaseFunction callee)
+    {
+        if (callee is not PrimFunction primFunction)
+        {
+            return call.Arguments.ToArray();
+        }
+
+        var internalWorkspaces = primFunction.GetAbiView().Workspaces
+            .Where(parameter => parameter.Location == MemoryLocation.Shared)
+            .ToArray();
+        var arguments = call.Arguments.ToArray();
+        if (internalWorkspaces.Length == 0)
+        {
+            return arguments;
+        }
+
+        if (arguments.Length < internalWorkspaces.Length)
+        {
+            throw new NotSupportedException(
+                $"PyNTT call to {callee.Name} is missing {internalWorkspaces.Length} internal Shared workspace argument(s).");
+        }
+
+        var internalArguments = arguments[^internalWorkspaces.Length..];
+        for (var index = 0; index < internalWorkspaces.Length; index++)
+        {
+            if (internalArguments[index] is not TIR.Buffer buffer ||
+                buffer.MemSpan.Buffer.Location != MemoryLocation.Shared)
+            {
+                throw new NotSupportedException(
+                    $"PyNTT call to {callee.Name} internal workspace {internalWorkspaces[index].Name} " +
+                    $"must be a Shared buffer, got {internalArguments[index].GetType().Name}.");
+            }
+        }
+
+        return arguments[..^internalWorkspaces.Length];
+    }
 
     private static bool AreCompatibleRuntimeWorkspaceArguments(IReadOnlyList<IVar> parameters, IReadOnlyList<BaseExpr> arguments)
     {
@@ -2254,8 +2275,6 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
 
         var runtimeShapeArgNames = GetRuntimeShapeArgs(kernel);
         var numel = RuntimePythonExpression(kernel.Launch.Meta["numel_expr"], runtimeShapeArgNames);
-        var blockSize = kernel.Launch.Tuning.Parameters["block_size"];
-        var blockSizeCandidates = PythonTuple(blockSize.Candidates.Select(value => value.ToString()));
         var shardCount = kernel.Launch.Sharding.Hierarchy.Aggregate(1, (product, value) => product * value);
         var isTir = IsTirKernel(kernel);
         var grid = isTir
@@ -2317,15 +2336,16 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
         var tritonRuntimeSetup = requiresGridBarrier
             ? $"{Environment.NewLine}        ensure_triton_allocator({context.DeviceExpression})"
             : string.Empty;
-        var kwargs = $", num_warps={kernel.Launch.NumWarps}, num_stages={kernel.Launch.NumStages}";
+        const string kwargs = ", num_warps=pyntt_kernel_config['num_warps'], num_stages=pyntt_kernel_config['num_stages']";
         var importStatement = requiresGridBarrier
-            ? $"from .generated_kernels import {kernel.Name}, PYNTT_GRID_MESH"
-            : $"from .generated_kernels import {kernel.Name}";
+            ? $"from .generated_kernels import {kernel.Name}, PYNTT_GRID_MESH, PYNTT_KERNEL_CONFIGS"
+            : $"from .generated_kernels import {kernel.Name}, PYNTT_KERNEL_CONFIGS";
         var launchStatement = $"        {kernel.Name}[grid]({tensorArgs}, numel, block_size{kwargs})";
         var kernelArgs = string.IsNullOrWhiteSpace(tensorArgs) ? "(numel,)" : $"({tensorArgs}, numel,)";
-        var tuningSelectionStatement = $"        block_size = select_and_validate_triton_tuning_parameter({PythonString(kernel.Name)}, \"block_size\", {blockSizeCandidates}, source={PythonString(blockSize.Source)}, kernel={kernel.Name}, kernel_args={kernelArgs}, grid_for_candidate={gridForCandidate}, expected_num_warps={kernel.Launch.NumWarps}, registers_per_thread_limit={PythonValue(kernel.Attrs["registers_per_thread_limit"])}, shared_memory_capacity_bytes={PythonValue(kernel.Attrs["shared_memory_capacity_bytes"])}, forbid_spills={PythonValue(kernel.Attrs["forbid_spills"])}{kwargs})";
+        var tuningSelectionStatement = $"        block_size = select_and_validate_triton_tuning_parameter({PythonString(kernel.Name)}, \"block_size\", pyntt_kernel_config[\"block_size\"][\"candidates\"], source=pyntt_kernel_config[\"block_size\"][\"source\"], kernel={kernel.Name}, kernel_args={kernelArgs}, grid_for_candidate={gridForCandidate}, expected_compute_num_warps=pyntt_kernel_config[\"num_warps\"], registers_per_thread_limit={PythonValue(kernel.Attrs["registers_per_thread_limit"])}, shared_memory_capacity_bytes={PythonValue(kernel.Attrs["shared_memory_capacity_bytes"])}, forbid_spills={PythonValue(kernel.Attrs["forbid_spills"])}{kwargs})";
         return $"""
                     {importStatement}
+                    pyntt_kernel_config = PYNTT_KERNEL_CONFIGS[{PythonString(kernel.Name)}]
                     numel = {numel}
             {gridBeforeTuning}
             {workspaceSetup}
@@ -2604,10 +2624,7 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
 
             var callees = new List<PrimFunction>();
             CollectDirectPrimFunctionCallees(function.SourceFunction, callees);
-            return callees.Any(callee =>
-                PyNTTPrimFunctionRoles.IsScheduledRegionFunction(callee)
-                    ? UsesTransitiveModuleRData(callee, selector, new HashSet<PrimFunction>(ReferenceEqualityComparer.Instance))
-                    : UsesTransitiveModuleRData(FindLinkableFunction(callee), selector, active));
+            return callees.Any(callee => UsesTransitiveModuleRData(FindLinkableFunction(callee), selector, active));
         }
         finally
         {

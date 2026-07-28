@@ -1,0 +1,86 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="720" viewBox="0 0 1200 720" role="img" aria-labelledby="title desc">
+  <title id="title">Source-traceable GEMV shared-load evidence</title>
+  <desc id="desc">The template emits a vectorized consumer mapping, the benchmark records vector shared instructions, and NCU records zero bank conflicts and nearly 128 useful bytes per wavefront. No throughput in cycles is inferred.</desc>
+  <style>
+    .bg { fill: #f7f9fc; }
+    .panel { fill: #ffffff; stroke: #cbd5e1; stroke-width: 1.5; }
+    .code { fill: #e8f1fb; stroke: #2563eb; stroke-width: 1.5; }
+    .bench { fill: #e9f7ef; stroke: #15803d; stroke-width: 1.5; }
+    .ncu { fill: #fff4d6; stroke: #b45309; stroke-width: 1.5; }
+    .boundary { fill: #f1e9fb; stroke: #7e22ce; stroke-width: 1.8; }
+    .lane0 { fill: #bfdbfe; stroke: #2563eb; stroke-width: 1; }
+    .lane1 { fill: #bbf7d0; stroke: #16a34a; stroke-width: 1; }
+    .title { fill: #172033; font: 700 26px system-ui, sans-serif; }
+    .subtitle { fill: #526176; font: 400 14px system-ui, sans-serif; }
+    .head { fill: #172033; font: 700 16px system-ui, sans-serif; }
+    .body { fill: #334155; font: 400 13px system-ui, sans-serif; }
+    .small { fill: #64748b; font: 400 11px system-ui, sans-serif; }
+    .mono { fill: #172033; font: 600 13px ui-monospace, SFMono-Regular, monospace; }
+    .arrow { fill: none; stroke: #475569; stroke-width: 2; marker-end: url(#arrow); }
+  </style>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#475569"/>
+    </marker>
+  </defs>
+
+  <rect class="bg" width="1200" height="720"/>
+  <text class="title" x="48" y="48">Packed GEMV shared load: code, PTX, and NCU evidence</text>
+  <text class="subtitle" x="48" y="73">C2 = template, B1 = checked-in benchmark, N1 = checked-in NCU result</text>
+
+  <rect class="panel" x="40" y="98" width="1120" height="242" rx="6"/>
+  <text class="head" x="64" y="128">C2: consumer mapping emitted by the template</text>
+
+  <rect class="code" x="64" y="150" width="390" height="160" rx="5"/>
+  <text class="mono" x="84" y="179">logical tile    = [64, 32]</text>
+  <text class="mono" x="84" y="205">sizePerThread   = [1, 8]</text>
+  <text class="mono" x="84" y="231">threadsPerWarp  = [8, 4]</text>
+  <text class="mono" x="84" y="257">warpsPerCTA     = [8, 1]</text>
+  <text class="mono" x="84" y="283">order           = [1, 0]</text>
+
+  <text class="body" x="488" y="174">One four-lane group in the generated mapping:</text>
+  <rect class="lane0" x="488" y="194" width="145" height="72" rx="4"/>
+  <rect class="lane1" x="645" y="194" width="145" height="72" rx="4"/>
+  <rect class="lane0" x="802" y="194" width="145" height="72" rx="4"/>
+  <rect class="lane1" x="959" y="194" width="145" height="72" rx="4"/>
+  <text class="mono" x="560" y="221" text-anchor="middle">lane 0</text>
+  <text class="small" x="560" y="246" text-anchor="middle">K0..K7</text>
+  <text class="mono" x="717" y="221" text-anchor="middle">lane 1</text>
+  <text class="small" x="717" y="246" text-anchor="middle">K8..K15</text>
+  <text class="mono" x="874" y="221" text-anchor="middle">lane 2</text>
+  <text class="small" x="874" y="246" text-anchor="middle">K16..K23</text>
+  <text class="mono" x="1031" y="221" text-anchor="middle">lane 3</text>
+  <text class="small" x="1031" y="246" text-anchor="middle">K24..K31</text>
+  <text class="small" x="488" y="294">Source: C2. These are code-generation parameters, not measured hardware rates.</text>
+
+  <path class="arrow" d="M 250 342 L 250 376"/>
+  <path class="arrow" d="M 950 342 L 950 376"/>
+
+  <rect class="panel" x="40" y="378" width="1120" height="268" rx="6"/>
+
+  <rect class="bench" x="64" y="404" width="330" height="210" rx="5"/>
+  <text class="head" x="84" y="434">B1: compiled evidence</text>
+  <text class="mono" x="84" y="468">ld.shared.v4.b32 sites = 4</text>
+  <text class="mono" x="84" y="498">ld.shared.b16 sites    = 0</text>
+  <text class="mono" x="84" y="528">spill load bytes       = 0</text>
+  <text class="mono" x="84" y="558">spill store bytes      = 0</text>
+  <text class="small" x="84" y="590">Source: B1 candidates with N64, K128.</text>
+
+  <rect class="ncu" x="430" y="404" width="390" height="210" rx="5"/>
+  <text class="head" x="450" y="434">N1: runtime counters</text>
+  <text class="mono" x="450" y="468">shared payload   = 100,663,584 B</text>
+  <text class="mono" x="450" y="498">wavefronts       = 786,720</text>
+  <text class="mono" x="450" y="528">bank conflicts   = 0</text>
+  <text class="mono" x="450" y="558">useful/wavefront = 127.953508 B</text>
+  <text class="small" x="450" y="590">Source: N1 profile and derived fields.</text>
+
+  <rect class="boundary" x="856" y="404" width="280" height="210" rx="5"/>
+  <text class="head" x="876" y="434">Evidence boundary</text>
+  <text class="body" x="876" y="469">The records prove vector PTX</text>
+  <text class="body" x="876" y="492">and zero reported conflicts.</text>
+  <text class="body" x="876" y="527">They do not record shared</text>
+  <text class="body" x="876" y="550">wavefronts per cycle.</text>
+  <text class="small" x="876" y="586">No shared cycle count is inferred.</text>
+
+  <text class="small" x="48" y="688">All numerical values come from C2, B1, or N1 as defined in sm120-pipeline-sizing.md.</text>
+</svg>

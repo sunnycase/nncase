@@ -166,7 +166,9 @@ public sealed class SpecializePrimFunctionBufferLayoutsPass : ModulePass
                 DataUsage = source.DataUsage,
                 ChipLocalDataPoolSize = source.ChipLocalDataPoolSize,
                 BlockLocalDataPoolSize = source.BlockLocalDataPoolSize,
+                SharedDataPoolSize = source.SharedDataPoolSize,
                 DataAlign = source.DataAlign,
+                SharedDataAlign = source.SharedDataAlign,
                 OutputUsage = source.OutputUsage,
                 OutputAlign = source.OutputAlign,
                 IsScheduled = source.IsScheduled,
@@ -266,9 +268,13 @@ public sealed class SpecializePrimFunctionBufferLayoutsPass : ModulePass
                     return backingLayout;
                 }
 
-                if (UsesBackingTensorLogicalLayout(buffer, backingParameter))
+                if (TryDeriveExactBufferViewStrides(
+                    buffer,
+                    backingParameter,
+                    backingLayout.Strides,
+                    out var derivedStrides))
                 {
-                    return backingLayout;
+                    return BufferLayoutAnnotation.ExactStrided(derivedStrides);
                 }
             }
 
@@ -302,23 +308,56 @@ public sealed class SpecializePrimFunctionBufferLayoutsPass : ModulePass
             }
         }
 
-        private static bool UsesBackingTensorLogicalLayout(TIR.Buffer buffer, BufferVar backingParameter)
+        private static bool TryDeriveExactBufferViewStrides(
+            TIR.Buffer buffer,
+            BufferVar backingParameter,
+            ReadOnlySpan<Dimension> backingStrides,
+            out Dimension[] strides)
         {
-            var backingTensorType = backingParameter.CheckedType switch
+            strides = Array.Empty<Dimension>();
+            var (backingTensorType, backingDistributedType) = backingParameter.CheckedType switch
             {
-                TensorType tensorType => tensorType,
-                DistributedType distributedType => distributedType.TensorType,
-                _ => null,
+                DistributedType distributedType => (distributedType.TensorType, distributedType),
+                TensorType tensorType => (tensorType, null),
+                _ => (null, null),
             };
-            if (backingTensorType?.Shape is not RankedShape backingShape
-                || buffer.Rank != backingShape.Rank
-                || !buffer.ElemType.Equals(backingTensorType.DType)
-                || !buffer.Dimensions.SequenceEqual(backingShape.Dimensions))
+            if (backingTensorType?.Shape is not RankedShape backingShape ||
+                backingShape.Rank != backingStrides.Length)
             {
                 return false;
             }
 
-            return Equals(buffer.DistributedType, backingParameter.CheckedType as DistributedType);
+            var bufferType = (IRType?)buffer.DistributedType ??
+                new TensorType(buffer.ElemType, buffer.Dimensions.ToArray());
+            if (!BufferViewUtility.TryCreate(backingParameter.CheckedType, bufferType, out var transform))
+            {
+                return false;
+            }
+
+            var resultTensorType = bufferType switch
+            {
+                DistributedType distributedType => distributedType.TensorType,
+                TensorType tensorType => tensorType,
+                _ => throw new InvalidOperationException(
+                    $"Buffer {buffer.Name} has non-tensor logical type {bufferType}."),
+            };
+            strides = BufferViewUtility.CreateBufferViewStrides(
+                backingTensorType.DType,
+                backingShape.Dimensions,
+                backingStrides,
+                backingDistributedType,
+                resultTensorType,
+                transform);
+            return true;
+        }
+
+        private static RankedShape GetLocalBufferShape(TIR.Buffer buffer)
+        {
+            var tensorType = buffer.DistributedType is { } distributedType
+                ? DistributedUtility.GetDividedTensorType(distributedType)
+                : new TensorType(buffer.ElemType, buffer.Dimensions.ToArray());
+            return tensorType.Shape as RankedShape
+                ?? throw new InvalidOperationException($"Buffer {buffer.Name} must have a ranked local shape.");
         }
 
         private sealed class VariantCloner : ExprCloner<Unit>
@@ -368,23 +407,20 @@ public sealed class SpecializePrimFunctionBufferLayoutsPass : ModulePass
                     || !_replacements.TryGetValue(backingParameter, out var replacement)
                     || replacement is not BufferVar specializedParameter
                     || specializedParameter.LayoutAnnotation.Kind != BufferLayoutKind.ExactStrided
-                    || !UsesBackingTensorLogicalLayout(expr, backingParameter))
+                    || !TryDeriveExactBufferViewStrides(
+                        expr,
+                        backingParameter,
+                        specializedParameter.LayoutAnnotation.Strides,
+                        out var strides))
                 {
                     return cloned;
                 }
 
-                var localTensorType = specializedParameter.CheckedType switch
-                {
-                    DistributedType distributedType => DistributedUtility.GetDividedTensorType(distributedType),
-                    TensorType tensorType => tensorType,
-                    _ => throw new InvalidOperationException(
-                        $"Exact BufferVar {specializedParameter.Name} does not have a tensor type."),
-                };
-                var localShape = localTensorType.Shape as RankedShape
-                    ?? throw new InvalidOperationException($"Exact BufferVar {specializedParameter.Name} must have a ranked shape.");
-                var strides = specializedParameter.LayoutAnnotation.Strides.ToArray();
+                var localShape = GetLocalBufferShape(expr);
                 var byteSpan = BufferViewUtility.GetByteSpanSize(localShape.Dimensions, strides, cloned.ElemType.SizeInBytes);
-                var physicalBuffer = cloned.MemSpan.Buffer.With(size: byteSpan);
+                var requiredPhysicalSize = (cloned.MemSpan.Start + byteSpan).Simplify();
+                var physicalSize = Dimension.Max(cloned.MemSpan.Buffer.Size, requiredPhysicalSize).Simplify();
+                var physicalBuffer = cloned.MemSpan.Buffer.With(size: physicalSize);
                 var memSpan = cloned.MemSpan.With(buffer: physicalBuffer, size: byteSpan);
                 return cloned.With(memSpan: memSpan, strides: strides);
             }

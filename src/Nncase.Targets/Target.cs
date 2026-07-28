@@ -17,6 +17,8 @@ public abstract class Target : ITarget
 
     public virtual IReadOnlyList<IModuleCompiler> ModuleCompilers => Array.Empty<IModuleCompiler>();
 
+    public virtual bool IsAutoTilingEnabled => false;
+
     public IModuleCompiler GetModuleCompiler(string moduleKind)
     {
         return ModuleCompilers.FirstOrDefault(m => m.ModuleKind == moduleKind) ??
@@ -60,6 +62,10 @@ public abstract class Target : ITarget
     }
 
     public virtual void RegisterAffineSelectionPass(IPassManager passManager, CompileOptions options)
+    {
+    }
+
+    public virtual void RegisterAutoTilingPass(IPassManager passManager, CompileOptions options)
     {
     }
 

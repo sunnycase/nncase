@@ -289,6 +289,55 @@ public sealed class UnitTestDistributedTypeInfer : TestClassBase
     }
 
     [Fact]
+    public void TestPackAndUnpackPreserveNonUniformPhysicalShardBoundaries()
+    {
+        var placement = new Placement(new[] { 4, 8 }, "yx", "bb");
+        var packedType = new DistributedType(
+            new TensorType(new VectorType(DataTypes.BFloat16, [8]), new long[] { 64, 18992 }),
+            new SBP[] { SBP.B, SBP.S([0, 1], 594) },
+            placement);
+        var packed = new Var("packed", packedType);
+
+        var unpacked = IR.F.Tensors.Unpack(packed, [8], [1]);
+        var unpackedType = Assert.IsType<DistributedType>(unpacked.CheckedType);
+        Assert.Equal(new TensorType(DataTypes.BFloat16, new long[] { 64, 151936 }), unpackedType.TensorType);
+        Assert.Equal(new SBP[] { SBP.B, SBP.S([0, 1], 4752) }, unpackedType.AxisPolicies.ToArray());
+
+        var repacked = IR.F.Tensors.Pack(unpacked, [8], [1]);
+        Assert.Equal(packedType, repacked.CheckedType);
+    }
+
+    [Fact]
+    public void TestKMajorPackedMatMulAcceptsNonUniformOutputSharding()
+    {
+        var placement = new Placement(new[] { 4, 8 }, "yx", "bb");
+        var lhs = new Var(
+            "lhs",
+            new DistributedType(
+                new TensorType(DataTypes.BFloat16, new long[] { 1, 1024 }),
+                new SBP[] { SBP.B, SBP.B },
+                placement));
+        var rhs = new Var(
+            "rhs",
+            new DistributedType(
+                new TensorType(new VectorType(DataTypes.BFloat16, [8, 2, 8]), new long[] { 64, 18992 }),
+                new SBP[] { SBP.B, SBP.S([0, 1], 594) },
+                placement));
+
+        var matmul = IR.F.NTT.PackedMatMul(
+            lhs,
+            rhs,
+            outDataType: DataTypes.BFloat16,
+            rhsLayout: IR.NTT.PackedMatMulRhsLayout.KMajor);
+
+        var outputType = Assert.IsType<DistributedType>(matmul.CheckedType);
+        Assert.Equal(
+            new TensorType(new VectorType(DataTypes.BFloat16, [8]), new long[] { 1, 18992 }),
+            outputType.TensorType);
+        Assert.Equal(new SBP[] { SBP.B, SBP.S([0, 1], 594) }, outputType.AxisPolicies.ToArray());
+    }
+
+    [Fact]
     public void TestNormStatsProducesPartialAndNormApplyRequiresBroadcastStats()
     {
         var placement = new Placement(new[] { 4 }, "b", "b");

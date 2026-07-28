@@ -1,4 +1,5 @@
 {% import "triton/kernels/_common.py.jinja" as common with context %}
+{% import "triton/kernels/_producer_consumer.py.jinja" as phases with context %}
 {% set rank = model["OutputShape"] | length %}
 {% set block_axis = select_block_axis(model["OutputShape"], model["OutputStrides"]) %}
 {% set block_extent = 1 if rank == 0 else model["OutputShape"][block_axis] %}
@@ -14,16 +15,11 @@
 {% set output_offset = "lane * 0" if not output_terms.values else "lane * 0 + " ~ (output_terms.values | join(" + ")) %}
 # generated from PyNTT Jinja Pad.py.jinja
 # {{ model["Comment"] }}; input_dtype={{ model["InputDType"] }}, output_dtype={{ model["OutputDType"] }}, input_shape={{ shape_tuple(model["InputShape"]) }}, output_shape={{ shape_tuple(model["OutputShape"]) }}
-{{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
-def {{ model["FunctionName"] }}({{ helper_parameters(model) }}):
+{{ phases.consumer_header(model) }}
     shard_index = tl.program_id(0).to(tl.int64)
 {{ common.shard_coordinates([model["Input"], model["Output"]]) }}
-{% if local_buffer(model["Input"]) is none %}
     input = {{ ptr(model, "Input") }}
-{% endif %}
-{% if local_buffer(model["Output"]) is none %}
     output = {{ ptr(model, "Output") }}
-{% endif %}
 {% for axis in loop_axes %}
 {{ "    " * loop.index }}for idx{{ axis }} in tl.range(0, {{ dim(model["OutputShape"][axis]) }}):
 {% endfor %}
@@ -45,3 +41,6 @@ def {{ model["FunctionName"] }}({{ helper_parameters(model) }}):
 {{ body }}input_value = tl.load({{ access_pointer(model, "Input", "input", "input_offsets") }}, mask=in_bounds, other={{ model["PadValue"] }})
 {{ body }}result = tl.where(in_bounds, input_value, {{ model["PadValue"] }})
 {{ body }}tl.store({{ access_pointer(model, "Output", "output", "output_offsets") }}, result, mask=mask)
+
+
+{{ phases.dispatch(model) }}

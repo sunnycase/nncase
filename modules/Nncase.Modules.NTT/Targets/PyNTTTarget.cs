@@ -22,18 +22,27 @@ public sealed class PyNTTTarget : NTTTarget
     private readonly PyNTTModuleCompiler _moduleCompiler = new();
 
     /// <inheritdoc/>
+    public override bool IsAutoTilingEnabled => false;
+
+    /// <inheritdoc/>
     protected override INTTModuleCompiler NTTModuleCompiler => _moduleCompiler;
 
     /// <inheritdoc/>
     public override void RegisterAutoPackingRules(IRulesAddable pass, CompileOptions options)
     {
-        base.RegisterAutoPackingRules(pass, options);
+        const int kPack = 2;
+        var nr = NTTModuleCompiler.GetNr(options);
+        var vectorBytes = NTTModuleCompiler.GetLane(options);
+
+        pass.Add<Passes.Rules.NTT.PackMatMulRhsKMajor>(vectorBytes, kPack);
+        pass.Add<Passes.Rules.NTT.PackQKVParallelLinearByN>(nr, vectorBytes);
+        pass.Add<Passes.Rules.NTT.PackMatMulGluByN>(nr, vectorBytes);
     }
 
     /// <inheritdoc/>
-    public override void RegisterAutoVectorizeRules(IRulesAddable pass, CompileOptions options)
+    public override void RegisterAutoTilingPass(IPassManager passManager, CompileOptions options)
     {
-        base.RegisterAutoVectorizeRules(pass, options);
+        // PyNTT templates own all block-local tiling, staging, and pipelining.
     }
 
     /// <inheritdoc/>
@@ -64,13 +73,8 @@ public sealed class PyNTTTarget : NTTTarget
             name: "--pyntt-output-dir",
             description: "PyNTT generated Python model directory.",
             getDefaultValue: () => string.Empty);
-        var strictOption = new Option<bool>(
-            name: "--pyntt-strict",
-            description: "Reject unsupported PyNTT constructs instead of falling back.",
-            getDefaultValue: () => true);
         cmd.Add(backendOption);
         cmd.Add(outputDirOption);
-        cmd.Add(strictOption);
 
         ITargetOptions ParseTargetCompileOptions(InvocationContext context, Command command)
         {
@@ -78,7 +82,6 @@ public sealed class PyNTTTarget : NTTTarget
             var pynttOptions = PyNTTTargetOptions.FromNTTTargetOptions(nttOptions);
             pynttOptions.Backend = context.ParseResult.GetValueForOption(backendOption)!;
             pynttOptions.OutputDirectory = context.ParseResult.GetValueForOption(outputDirOption)!;
-            pynttOptions.Strict = context.ParseResult.GetValueForOption(strictOption);
             return pynttOptions;
         }
 

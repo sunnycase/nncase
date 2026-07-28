@@ -1,0 +1,164 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="1080" viewBox="0 0 1440 1080" role="img" aria-labelledby="title desc">
+  <title id="title">SM120 packed GEMV tile and pipeline derivation</title>
+  <desc id="desc">Little's law derives the N64 K32 minimum work unit. Modulo scheduling predicts five stages for K128, while the 64 KiB managed shared-memory limit selects K128 with four stages.</desc>
+  <style>
+    .bg { fill: #f7f9fc; }
+    .panel { fill: #ffffff; stroke: #cbd5e1; stroke-width: 1.5; }
+    .source { fill: #eaf3fb; stroke: #2563eb; stroke-width: 1.5; }
+    .law { fill: #f5edfb; stroke: #7e22ce; stroke-width: 1.5; }
+    .schedule { fill: #fff4d6; stroke: #b45309; stroke-width: 1.5; }
+    .result { fill: #e8f7ef; stroke: #15803d; stroke-width: 1.8; }
+    .limit { fill: #fff0ed; stroke: #c2410c; stroke-width: 1.5; }
+    .title { fill: #172033; font: 700 27px system-ui, sans-serif; }
+    .subtitle { fill: #526176; font: 400 14px system-ui, sans-serif; }
+    .head { fill: #172033; font: 700 17px system-ui, sans-serif; }
+    .body { fill: #334155; font: 400 13px system-ui, sans-serif; }
+    .small { fill: #64748b; font: 400 11px system-ui, sans-serif; }
+    .mono { fill: #172033; font: 600 13px ui-monospace, SFMono-Regular, monospace; }
+    .tablehead { fill: #475569; font: 700 12px system-ui, sans-serif; }
+    .tablerow { fill: #172033; font: 500 12px ui-monospace, SFMono-Regular, monospace; }
+    .rule { stroke: #d7dee8; stroke-width: 1; }
+    .arrow { fill: none; stroke: #475569; stroke-width: 2; marker-end: url(#arrow); }
+  </style>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#475569"/>
+    </marker>
+  </defs>
+
+  <rect class="bg" width="1440" height="1080"/>
+  <text class="title" x="42" y="44">SM120 packed BF16 GEMV: theory before validation</text>
+  <text class="subtitle" x="42" y="70">Architecture inputs and one-tile calibration feed the model. Full GEMV timings and NCU counters are withheld until validation.</text>
+
+  <rect class="panel" x="34" y="94" width="1372" height="138" rx="6"/>
+  <text class="head" x="54" y="122">1. Sourced model inputs</text>
+
+  <rect class="source" x="54" y="142" width="410" height="70" rx="5"/>
+  <text class="mono" x="72" y="167">SMEM: 66 B/cyc, 33.90 cyc</text>
+  <text class="mono" x="72" y="189">FFMA: 4 cyc, 1.03 cyc/op</text>
+  <text class="small" x="72" y="205">Cross-SKU SM120 priors: Z2, Z4</text>
+
+  <rect class="source" x="486" y="142" width="440" height="70" rx="5"/>
+  <text class="mono" x="504" y="167">cp.async: 512 B/request</text>
+  <text class="mono" x="504" y="189">RTX 5060 Ti: 448 GB/s, 36 SM</text>
+  <text class="small" x="504" y="205">Generated C2 geometry; NVIDIA N2 target spec</text>
+
+  <rect class="source" x="948" y="142" width="438" height="70" rx="5"/>
+  <text class="mono" x="966" y="167">C_A / C_L / L_R for K32..K256</text>
+  <text class="mono" x="966" y="189">managed shared arena = 65,536 B</text>
+  <text class="small" x="966" y="205">Target-local calibration B3; compiler policy C3</text>
+
+  <path class="arrow" d="M 720 232 L 720 254"/>
+
+  <rect class="panel" x="34" y="256" width="1372" height="248" rx="6"/>
+  <text class="head" x="54" y="285">2. Little's law derives the minimum work unit</text>
+  <text class="mono" x="54" y="309">Q_r &gt;= ceil(target_rate_r * dependent_latency_r)</text>
+
+  <rect class="law" x="54" y="330" width="408" height="116" rx="5"/>
+  <text class="head" x="72" y="357">FFMA chains</text>
+  <text class="mono" x="72" y="382">ceil(4 / 1.03) = 4 pairs</text>
+  <text class="body" x="72" y="406">Eight K values/thread provide four pairs.</text>
+  <text class="mono" x="72" y="429">minimum reduction group = K32</text>
+
+  <rect class="law" x="486" y="330" width="440" height="116" rx="5"/>
+  <text class="head" x="504" y="357">Shared-memory concurrency</text>
+  <text class="mono" x="504" y="382">ceil(66 * 33.90 / 512) = 5 loads</text>
+  <text class="body" x="504" y="406">Eight consumer warps expose eight loads.</text>
+  <text class="mono" x="504" y="429">consumer coverage = N64</text>
+
+  <rect class="law" x="950" y="330" width="436" height="116" rx="5"/>
+  <text class="head" x="968" y="357">Global-copy screen</text>
+  <text class="mono" x="968" y="382">ceil(4.0275 * 385.1 / 512) = 4</text>
+  <text class="body" x="968" y="406">N64/K32 supplies eight 512-byte requests.</text>
+  <text class="mono" x="968" y="429">global concurrency bound satisfied</text>
+
+  <rect class="result" x="54" y="462" width="1332" height="26" rx="4"/>
+  <text class="body" x="70" y="480">Little's-law result: base tile N64/K32; legal K candidates are 32, 64, 128, and 256. No stage count has been assumed.</text>
+
+  <path class="arrow" d="M 720 504 L 720 526"/>
+
+  <rect class="panel" x="34" y="528" width="1372" height="314" rx="6"/>
+  <text class="head" x="54" y="557">3. Modulo scheduling calculates full-hiding depth and capacity-feasible depth</text>
+
+  <rect class="schedule" x="54" y="578" width="625" height="102" rx="5"/>
+  <text class="mono" x="72" y="604">C_P = C_A + C_L</text>
+  <text class="mono" x="72" y="627">C_Q = (K/32) * 63 + 31</text>
+  <text class="mono" x="72" y="650">ResMII = max(C_P, 5 + C_Q)</text>
+  <text class="small" x="72" y="671">Loader service is explicit; shared and FFMA resource service use max.</text>
+
+  <rect class="schedule" x="701" y="578" width="685" height="102" rx="5"/>
+  <text class="mono" x="719" y="604">D_slot = C_A + L_R + C_Q</text>
+  <text class="mono" x="719" y="627">RecMII(S) = ceil(D_slot / S)</text>
+  <text class="mono" x="719" y="650">S_hide = ceil(D_slot / ResMII)</text>
+  <text class="small" x="719" y="671">Slot reuse is the loop-carried recurrence from producer acquire to release.</text>
+
+  <text class="tablehead" x="66" y="713">Candidate</text>
+  <text class="tablehead" x="184" y="713">ResMII</text>
+  <text class="tablehead" x="286" y="713">D_slot</text>
+  <text class="tablehead" x="390" y="713">S_hide</text>
+  <text class="tablehead" x="492" y="713">S_max</text>
+  <text class="tablehead" x="586" y="713">Selected S</text>
+  <text class="tablehead" x="716" y="713">II</text>
+  <text class="tablehead" x="814" y="713">K4096 local cycles</text>
+  <line class="rule" x1="54" y1="722" x2="1000" y2="722"/>
+
+  <text class="tablerow" x="66" y="744">K32</text>
+  <text class="tablerow" x="184" y="744">118</text>
+  <text class="tablerow" x="286" y="744">706</text>
+  <text class="tablerow" x="390" y="744">6</text>
+  <text class="tablerow" x="492" y="744">16</text>
+  <text class="tablerow" x="586" y="744">6</text>
+  <text class="tablerow" x="716" y="744">118</text>
+  <text class="tablerow" x="814" y="744">15,104</text>
+
+  <text class="tablerow" x="66" y="768">K64</text>
+  <text class="tablerow" x="184" y="768">169</text>
+  <text class="tablerow" x="286" y="768">893</text>
+  <text class="tablerow" x="390" y="768">6</text>
+  <text class="tablerow" x="492" y="768">8</text>
+  <text class="tablerow" x="586" y="768">6</text>
+  <text class="tablerow" x="716" y="768">169</text>
+  <text class="tablerow" x="814" y="768">10,816</text>
+
+  <rect class="result" x="55" y="776" width="945" height="26" rx="3"/>
+  <text class="tablerow" x="66" y="794">K128</text>
+  <text class="tablerow" x="184" y="794">288</text>
+  <text class="tablerow" x="286" y="794">1,291</text>
+  <text class="tablerow" x="390" y="794">5</text>
+  <text class="tablerow" x="492" y="794">4</text>
+  <text class="tablerow" x="586" y="794">4</text>
+  <text class="tablerow" x="716" y="794">323</text>
+  <text class="tablerow" x="814" y="794">10,336</text>
+
+  <text class="tablerow" x="66" y="824">K256</text>
+  <text class="tablerow" x="184" y="824">540</text>
+  <text class="tablerow" x="286" y="824">2,059</text>
+  <text class="tablerow" x="390" y="824">4</text>
+  <text class="tablerow" x="492" y="824">2</text>
+  <text class="tablerow" x="586" y="824">2</text>
+  <text class="tablerow" x="716" y="824">1,030</text>
+  <text class="tablerow" x="814" y="824">16,480</text>
+
+  <rect class="limit" x="1024" y="706" width="362" height="112" rx="5"/>
+  <text class="head" x="1042" y="733">K128 capacity boundary</text>
+  <text class="mono" x="1042" y="758">S_hide = ceil(1291/288) = 5</text>
+  <text class="mono" x="1042" y="781">S5 bytes = 81,920 &gt; 65,536</text>
+  <text class="mono" x="1042" y="804">S4 II = ceil(1291/4) = 323</text>
+
+  <path class="arrow" d="M 720 842 L 720 864"/>
+
+  <rect class="panel" x="34" y="866" width="1372" height="166" rx="6"/>
+  <text class="head" x="54" y="895">4. Prediction, then independent validation</text>
+
+  <rect class="result" x="54" y="916" width="600" height="92" rx="5"/>
+  <text class="head" x="72" y="944">Capacity-constrained prediction</text>
+  <text class="mono" x="72" y="970">N64 / K128 / S4</text>
+  <text class="body" x="72" y="993">Full hiding is S5; current managed capacity selects S4.</text>
+
+  <rect class="source" x="680" y="916" width="706" height="92" rx="5"/>
+  <text class="head" x="698" y="944">Validation is not a model input</text>
+  <text class="mono" x="698" y="970">full sweep: K128/S4 reaches the cold plateau</text>
+  <text class="mono" x="698" y="993">NCU: 512-B copies, no bank conflicts, 94.43% DRAM</text>
+
+  <text class="small" x="42" y="1057">Z2/Z4/Z6 are cross-SKU priors. B3 and B1 environment fields calibrate the target. B1 timings and N1 counters are used only after prediction.</text>
+</svg>

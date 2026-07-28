@@ -2,6 +2,7 @@
 // Licensed under the Apache license. See LICENSE file in the project root for full license information.
 
 using System.Collections.Generic;
+using System.Linq;
 using Nncase.IR;
 using Nncase.Passes.Rules.Neutral;
 using Nncase.Passes.Rules.NTT;
@@ -34,6 +35,34 @@ public class UnitTestVectorizeVectorizedMatMul : TransformTestBase
         Assert.Contains("PackedMatMul", printed, System.StringComparison.Ordinal);
         Assert.Contains("Unpack(Lanes: {4}", printed, System.StringComparison.Ordinal);
         Assert.DoesNotContain("Unpack(Lanes: {8}", printed, System.StringComparison.Ordinal);
+        var packedMatMul = Assert.Single(
+            ExprCollector.Collect(post).OfType<Call>().Where(call => call.Target is IR.NTT.PackedMatMul));
+        Assert.Equal(
+            IR.NTT.PackedMatMulRhsLayout.NMajor,
+            Assert.IsType<IR.NTT.PackedMatMul>(packedMatMul.Target).RhsLayout);
+    }
+
+    [Fact]
+    public void TestPackMatMulRhsKMajorPreservesVectorizedResultType()
+    {
+        var lhs = new Var("lhs", new TensorType(DataTypes.BFloat16, new RankedShape(1, 64)));
+        var rhs = new Var("rhs", new TensorType(new VectorType(DataTypes.BFloat16, [8]), new RankedShape(64, 16)));
+        var expr = VectorizedMatMul(lhs, rhs, [], new[] { 1 }, outDataType: DataTypes.BFloat16);
+        CompilerServices.InferenceType(expr);
+
+        var context = new Nncase.Passes.RunPassContext();
+        var post = (Expr)CompilerServices.Rewrite(expr, [new PackMatMulRhsKMajor(16, 2)], context);
+        CompilerServices.InferenceType(post);
+        var packedMatMul = Assert.Single(
+            ExprCollector.Collect(post).OfType<Call>().Where(call => call.Target is IR.NTT.PackedMatMul));
+        var packedOp = Assert.IsType<IR.NTT.PackedMatMul>(packedMatMul.Target);
+        var packedRhs = (Expr)packedMatMul.Arguments[IR.NTT.PackedMatMul.Rhs.Index];
+
+        Assert.False(ReferenceEquals(expr, post));
+        Assert.Equal(expr.CheckedType, post.CheckedType);
+        Assert.Equal(IR.NTT.PackedMatMulRhsLayout.KMajor, packedOp.RhsLayout);
+        Assert.Equal(new RankedShape(4, 16), packedRhs.CheckedShape);
+        Assert.Equal(new VectorType(DataTypes.BFloat16, [8, 2, 8]), packedRhs.CheckedDataType);
     }
 
     [Fact]

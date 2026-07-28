@@ -19,6 +19,28 @@ namespace Nncase.Tests.CoreTest;
 public sealed class UnitTestTIRUtilities
 {
     [Fact]
+    public void TestSharedWorkspaceCanonicalPacking()
+    {
+        var first = new Var("first", TensorType.Scalar(DataTypes.UInt8));
+        var second = new Var("second", TensorType.Scalar(DataTypes.UInt8));
+
+        Assert.IsType<None>(TIRSharedWorkspace.Pack(Array.Empty<BaseExpr>()));
+        Assert.Same(first, TIRSharedWorkspace.Pack([first]));
+
+        var pair = Assert.IsType<IR.Tuple>(TIRSharedWorkspace.Pack([first, second]));
+        Assert.Equal(2, pair.Count);
+        Assert.Collection(
+            TIRSharedWorkspace.Unpack(pair),
+            item => Assert.Same(first, item),
+            item => Assert.Same(second, item));
+        Assert.Empty(TIRSharedWorkspace.Unpack(None.Default));
+        Assert.Same(first, Assert.Single(TIRSharedWorkspace.Unpack(first)));
+
+        Assert.Throws<InvalidOperationException>(() => TIRSharedWorkspace.Unpack(new IR.Tuple()));
+        Assert.Throws<InvalidOperationException>(() => TIRSharedWorkspace.Unpack(new IR.Tuple(first)));
+    }
+
+    [Fact]
     public void TestComputePaddings()
     {
         // Arrange

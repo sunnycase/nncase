@@ -1,9 +1,10 @@
 import triton
 import triton.language as tl
-{% if needs_tle %}
 import triton.experimental.tle.language as tle
-{% endif %}
 from triton.language.extra import libdevice
+
+
+PYNTT_KERNEL_CONFIGS = {{ pyrepr(kernel_configs) }}
 {% if needs_grid_barrier %}
 
 PYNTT_GRID_MESH = tle.device_mesh({"block": [("block_x", {{ grid_mesh_size }})]})

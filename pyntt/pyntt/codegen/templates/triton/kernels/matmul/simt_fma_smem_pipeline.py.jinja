@@ -1,0 +1,269 @@
+{% import "triton/kernels/_common.py.jinja" as common with context %}
+{% set ctx = packed_gemv_pipeline_context(model) %}
+# generated from PyNTT algorithm triton.matmul/simt_fma_smem_pipeline
+# {{ model["Comment"] }}; lhs_dtype={{ model["LhsDType"] }}, rhs_dtype={{ model["RhsDType"] }}, output_dtype={{ model["OutputDType"] }}, lhs_shape={{ shape_tuple(model["LhsShape"]) }}, rhs_shape={{ shape_tuple(model["RhsShape"]) }}, output_shape={{ shape_tuple(model["OutputShape"]) }}, rhs_layout={{ ctx["rhs_layout"] }}, rhs_n_lane={{ model["RhsNVectorLaneCount"] }}, rhs_k_pack={{ model["RhsKPackLaneCount"] }}, rhs_k_lane={{ model["RhsKVectorLaneCount"] }}, block_n={{ ctx["block_n"] }}, block_k={{ ctx["block_k"] }}, num_stages={{ ctx["num_stages"] }}
+{{ ctx["consumer_weight_layout_name"] }} = tl.constexpr(
+    tle.gpu.BlockEncoding(
+        [{{ ctx["consumer_size_per_thread"] | join(", ") }}],
+        [{{ ctx["consumer_threads_per_warp"] | join(", ") }}],
+        [{{ ctx["consumer_warps_per_cta"] | join(", ") }}],
+        [1, 0],
+    )
+)
+{{ ctx["consumer_lhs_layout_name"] }} = tl.constexpr(
+    tle.gpu.SlicedEncoding(
+        0,
+        {{ ctx["consumer_weight_layout_name"] }}.value,
+    )
+)
+{{ ctx["consumer_output_layout_name"] }} = tl.constexpr(
+    tle.gpu.SlicedEncoding(
+        1,
+        {{ ctx["consumer_weight_layout_name"] }}.value,
+    )
+)
+
+
+@triton.jit
+def {{ model["FunctionName"] }}__producer(writer, {{ helper_parameters(model) }}):
+    shard_index = tl.program_id(0).to(tl.int64)
+{{ common.shard_coordinates([model["Rhs"]]) }}
+    rhs = {{ ptr(model, "Rhs") }}
+    active_n = {{ dim(ctx["n"]) }}
+    active_rhs_n = {{ dim(ctx["rhs_n"]) }}
+    num_full_n_tiles = {{ ctx["runtime_num_full_n_tiles"] }}
+    for n_tile in tl.range(0, num_full_n_tiles):
+        n_start = n_tile * {{ ctx["block_n"] }}
+        for k_tile in tl.range(0, {{ ctx["num_k_tiles"] }}):
+            sequence = (
+                n_tile * {{ ctx["num_k_tiles"] }} + k_tile
+            ).to(tl.int32)
+            slot = writer.acquire(sequence)
+            local_row = tl.arange(0, {{ ctx["shared_rows"] }})[:, None]
+            local_col = tl.arange(0, {{ ctx["shared_cols"] }})[None, :]
+            pipeline_k_outer = (
+                k_tile * {{ ctx["packed_k_outer"] }}
+                + local_row // {{ ctx["packed_n_outer"] }}
+            )
+            pipeline_n_outer = (
+                n_start // {{ model["RhsNVectorLaneCount"] }}
+                + local_row % {{ ctx["packed_n_outer"] }}
+            )
+            pipeline_n_lane = local_col // {{ ctx["k_atom"] }}
+            pipeline_k_inner = local_col % {{ ctx["k_atom"] }}
+            pipeline_k_pack = pipeline_k_inner // {{ model["RhsKVectorLaneCount"] }}
+            pipeline_k_lane = pipeline_k_inner % {{ model["RhsKVectorLaneCount"] }}
+            tle.gpu.copy(
+                tl.max_contiguous(
+                    {{ access_pointer(model, "Rhs", "rhs", ctx["pipeline_rhs_access"]) }},
+                    [1, {{ ctx["shared_cols"] }}],
+                ),
+                slot.weight,
+                [{{ ctx["shared_rows"] }}, {{ ctx["shared_cols"] }}],
+            )
+            writer.commit(sequence)
+
+    for n_tile in tl.range(
+        num_full_n_tiles,
+        {{ ctx["runtime_num_n_tiles"] }},
+    ):
+        n_start = n_tile * {{ ctx["block_n"] }}
+        for k_tile in tl.range(0, {{ ctx["num_k_tiles"] }}):
+            sequence = (
+                n_tile * {{ ctx["num_k_tiles"] }} + k_tile
+            ).to(tl.int32)
+            slot = writer.acquire(sequence)
+            tail_local_row = tl.arange(
+                0,
+                {{ ctx["shared_rows"] }},
+            )[:, None]
+            tail_local_col = tl.arange(
+                0,
+                {{ ctx["shared_cols"] }},
+            )[None, :]
+            tail_pipeline_k_outer = (
+                k_tile * {{ ctx["packed_k_outer"] }}
+                + tail_local_row // {{ ctx["packed_n_outer"] }}
+            )
+            tail_pipeline_n_outer = (
+                n_start // {{ model["RhsNVectorLaneCount"] }}
+                + tail_local_row % {{ ctx["packed_n_outer"] }}
+            )
+            tail_pipeline_n_lane = (
+                tail_local_col // {{ ctx["k_atom"] }}
+            )
+            tail_pipeline_k_inner = (
+                tail_local_col % {{ ctx["k_atom"] }}
+            )
+            tail_pipeline_k_pack = (
+                tail_pipeline_k_inner
+                // {{ model["RhsKVectorLaneCount"] }}
+            )
+            tail_pipeline_k_lane = (
+                tail_pipeline_k_inner
+                % {{ model["RhsKVectorLaneCount"] }}
+            )
+            rhs_tile = tl.load(
+                tl.max_contiguous(
+                    {{ access_pointer(model, "Rhs", "rhs", ctx["pipeline_tail_rhs_access"]) }},
+                    [1, {{ ctx["shared_cols"] }}],
+                ),
+                mask={{ ctx["pipeline_rhs_mask"] }},
+                other=0.0,
+            )
+            rhs_stage_ptr = tle.gpu.local_ptr(
+                slot.weight,
+                (tail_local_row, tail_local_col),
+                shape=(
+                    {{ ctx["shared_rows"] }},
+                    {{ ctx["shared_cols"] }},
+                ),
+            )
+            tl.store(rhs_stage_ptr, rhs_tile)
+            writer.commit(sequence)
+
+
+@triton.jit
+def {{ model["FunctionName"] }}__consumer(reader, {{ helper_parameters(model) }}):
+    shard_index = tl.program_id(0).to(tl.int64)
+{{ common.shard_coordinates([model["Lhs"], model["Output"]]) }}
+    lhs = {{ ptr(model, "Lhs") }}
+    output = {{ ptr(model, "Output") }}
+    local_n = tle.encoding(
+        tle.encoding(
+            tl.arange(0, {{ ctx["block_n"] }}),
+            {{ ctx["consumer_output_layout_name"] }},
+        )[:, None],
+        {{ ctx["consumer_weight_layout_name"] }},
+    )
+    local_k_vector = tle.encoding(
+        tl.arange(0, {{ ctx["reduction_group"] }}),
+        {{ ctx["consumer_lhs_layout_name"] }},
+    )
+    local_k = tle.encoding(
+        local_k_vector[None, :],
+        {{ ctx["consumer_weight_layout_name"] }},
+    )
+    active_n = {{ dim(ctx["n"]) }}
+    for n_tile in tl.range(0, {{ ctx["runtime_num_n_tiles"] }}):
+        n_start = n_tile * {{ ctx["block_n"] }}
+        partial = tle.encoding(
+            tl.zeros(
+                ({{ ctx["block_n"] }}, {{ ctx["reduction_group"] }}),
+                tl.float32,
+            ),
+            {{ ctx["consumer_weight_layout_name"] }},
+        )
+        for k_tile in tl.range(0, {{ ctx["num_k_tiles"] }}):
+            sequence = (
+                n_tile * {{ ctx["num_k_tiles"] }} + k_tile
+            ).to(tl.int32)
+            ready = reader.wait(sequence)
+            for k_group in tl.static_range(0, {{ ctx["reduction_groups_per_stage"] }}):
+                shared_k = k_group * {{ ctx["reduction_group"] }} + local_k
+                shared_row = (
+                    shared_k // {{ ctx["k_atom"] }} * {{ ctx["packed_n_outer"] }}
+                    + local_n // {{ model["RhsNVectorLaneCount"] }}
+                )
+                shared_col = (
+                    local_n % {{ model["RhsNVectorLaneCount"] }}
+                    * {{ ctx["k_atom"] }}
+                    + shared_k % {{ ctx["k_atom"] }}
+                )
+                weight_ptr = tle.gpu.local_ptr(
+                    ready.slot.weight,
+                    (shared_row, shared_col),
+                    shape=({{ ctx["block_n"] }}, {{ ctx["reduction_group"] }}),
+                )
+                weight_ptr = tl.max_contiguous(weight_ptr, [1, 8])
+                weight_ptr = tl.multiple_of(weight_ptr, [1, 16])
+                pipeline_offs_k = (
+                    k_tile * {{ ctx["block_k"] }}
+                    + k_group * {{ ctx["reduction_group"] }}
+                    + local_k_vector
+                )
+                weight_value = tle.encoding(
+                    tl.load(weight_ptr),
+                    {{ ctx["consumer_weight_layout_name"] }},
+                )
+                lhs_value = tle.encoding(
+                    tl.load(
+                        {{ access_pointer(model, "Lhs", "lhs", ctx["pipeline_lhs_access"]) }}
+                    ),
+                    {{ ctx["consumer_lhs_layout_name"] }},
+                )
+                lhs_value = tle.encoding(
+                    lhs_value[None, :],
+                    {{ ctx["consumer_weight_layout_name"] }},
+                )
+                partial += (
+                    weight_value.to(tl.float32)
+                    * lhs_value.to(tl.float32)
+                )
+            reader.release(sequence)
+
+        result = tl.sum(partial, axis=1) * {{ model["Scale"] }}
+        pipeline_output_n = n_start + tle.encoding(
+            tl.arange(0, {{ ctx["block_n"] }}),
+            {{ ctx["consumer_output_layout_name"] }},
+        )
+{% if ctx["load_c"] %}
+        previous = tl.load(
+            {{ access_pointer(model, "Output", "output", ctx["pipeline_output_access"]) }},
+            mask=({{ ctx["pipeline_output_mask"] }}) & ({{ ctx["load_c_predicate"] }}),
+            other=0.0,
+        ).to(tl.float32)
+{% if ctx["load_c_predicate"] == "True" %}
+        result = previous + result
+{% else %}
+        result = tl.where({{ ctx["load_c_predicate"] }}, previous + result, result)
+{% endif %}
+{% endif %}
+        tl.store(
+            {{ access_pointer(model, "Output", "output", ctx["pipeline_output_access"]) }},
+            result,
+            mask={{ ctx["pipeline_output_mask"] }},
+        )
+
+
+{{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
+def {{ model["FunctionName"] }}({{ helper_parameters(model) }}):
+    weight_shared_layout: tl.constexpr = tle.gpu.swizzled_shared_layout(
+        vectorSize=8,
+        perPhase={{ ctx["shared_per_phase"] }},
+        maxPhase={{ ctx["shared_max_phase"] }},
+        order=[{{ ctx["shared_stage_order"] | join(", ") }}],
+        numCTAs=[{% for _ in ctx["shared_stage_order"] %}1{{ ", " if not loop.last else "" }}{% endfor %}],
+        numCTAsPerCGA=[{% for _ in ctx["shared_stage_order"] %}1{{ ", " if not loop.last else "" }}{% endfor %}],
+        numCTASplit=[{% for _ in ctx["shared_stage_order"] %}1{{ ", " if not loop.last else "" }}{% endfor %}],
+        numCTAOrder=[{{ ctx["shared_stage_order"] | join(", ") }}],
+    )
+    rhs_stages = tle.gpu.alloc(
+        [{{ ctx["num_stages"] }}, {{ ctx["shared_stage_shape"] | join(", ") }}],
+        dtype={{ model["RhsTritonDType"] }},
+        layout=weight_shared_layout,
+        scope=tle.gpu.smem,
+        alias=pyntt_shared_arena,
+        alias_offset_bytes={{ ctx["microkernel"]["shared_workspace_offsets"]["rhs_stage"] }},
+        nv_mma_shared_layout=False,
+    )
+    weight_pipe = tle.pipe(
+        capacity={{ ctx["num_stages"] }},
+        scope="cta",
+        name="{{ model["FunctionName"] }}_weight",
+        weight=rhs_stages,
+    )
+    tle.gpu.warp_specialize(
+        [
+            (
+                {{ model["FunctionName"] }}__consumer,
+                (weight_pipe.reader(), {{ helper_argument_names(model) }}),
+            ),
+            (
+                {{ model["FunctionName"] }}__producer,
+                (weight_pipe.writer(), {{ helper_argument_names(model) }}),
+            ),
+        ],
+        [{{ model["ProducerWarps"] }}],
+        [{{ ctx["producer_registers"] }}],
+    )

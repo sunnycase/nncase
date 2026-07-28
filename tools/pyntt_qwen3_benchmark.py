@@ -21,16 +21,11 @@ session.  The last prefill call produces the first generated token.
 Use the ``svg`` subcommand to render an existing result, or pass
 ``--output-svg`` to ``run``.  SVG output is byte-for-byte deterministic for the
 same input JSON documents.
-
-The ``run`` command is also the acceptance gate for explicit two-slot
-GEMM/GEMV pipelines.  Use ``--allow-ordinary`` only when recording an intentional
-ordinary non-pipelined baseline.
 """
 
 from __future__ import annotations
 
 import argparse
-import ast
 import gc
 import hashlib
 import importlib.util
@@ -38,7 +33,6 @@ import json
 import math
 import os
 import platform
-import re
 import statistics
 import subprocess
 import sys
@@ -101,7 +95,6 @@ class PackageContract:
     input_shape: tuple[int, ...]
     detected_layer_ids: tuple[str, ...]
     manifest_summary: Mapping[str, Any]
-    pipeline_gate_summary: Mapping[str, Any]
     source_file_sha256: Mapping[str, str]
     asset_file_bytes: Mapping[str, int]
     asset_file_sha256: Mapping[str, str]
@@ -293,177 +286,6 @@ def _collect_named_values(value: Any, key: str) -> list[Any]:
     return result
 
 
-_MATRIX_OPERATION_MARKERS = (
-    "matmul",
-    "gemm",
-    "gemv",
-    "qkvparallellinear",
-)
-_CP_ASYNC_PIPELINE_TEMPLATE = "triton.loop.cp_async.n2.v1"
-
-
-def _normalized_operation_name(value: Any) -> str:
-    return re.sub(r"[^a-z0-9]", "", str(value).lower())
-
-
-def _is_matrix_render_kernel(kernel: Mapping[str, Any]) -> bool:
-    metadata = kernel.get("metadata")
-    if not isinstance(metadata, Mapping):
-        return False
-    candidates: list[Any] = [metadata.get("name"), metadata.get("op_kind")]
-    attrs = metadata.get("attrs")
-    if isinstance(attrs, Mapping):
-        candidates.append(attrs.get("op"))
-        operations = attrs.get("ops")
-        if isinstance(operations, list):
-            candidates.extend(operations)
-        microkernels = attrs.get("block_microkernels")
-        if isinstance(microkernels, list):
-            for microkernel in microkernels:
-                if isinstance(microkernel, Mapping):
-                    candidates.extend(
-                        (microkernel.get("family"), microkernel.get("helper"))
-                    )
-    return any(
-        marker in _normalized_operation_name(candidate)
-        for candidate in candidates
-        if candidate is not None
-        for marker in _MATRIX_OPERATION_MARKERS
-    )
-
-
-def _call_name(function: ast.expr) -> str:
-    if isinstance(function, ast.Name):
-        return function.id
-    if isinstance(function, ast.Attribute):
-        owner = _call_name(function.value)
-        return f"{owner}.{function.attr}" if owner else function.attr
-    return ""
-
-
-def _constant_int(argument: ast.expr) -> int | None:
-    if (
-        isinstance(argument, ast.Constant)
-        and isinstance(argument.value, int)
-        and not isinstance(argument.value, bool)
-    ):
-        return int(argument.value)
-    return None
-
-
-def _pipeline_source_evidence(nodes: Iterable[ast.AST]) -> dict[str, bool]:
-    """Inspect the functions statically reachable from one exact kernel."""
-
-    evidence = {
-        "async_copy": False,
-        "async_commit_group": False,
-        "async_wait_group_1": False,
-        "async_wait_group_0": False,
-        "staged_slot": False,
-    }
-    for node in nodes:
-        for child in ast.walk(node):
-            if not isinstance(child, ast.Call):
-                continue
-            name = _call_name(child.func)
-            if name == "tle.gpu.copy":
-                evidence["async_copy"] |= any(
-                    keyword.arg == "is_async"
-                    and isinstance(keyword.value, ast.Constant)
-                    and keyword.value.value is True
-                    for keyword in child.keywords
-                )
-            elif name == "tle.gpu.async_commit_group":
-                evidence["async_commit_group"] = True
-            elif name == "tle.gpu.async_wait_group":
-                pending = _constant_int(child.args[0]) if child.args else None
-                if pending is None:
-                    for keyword in child.keywords:
-                        if keyword.arg in {"max_pending", "num"}:
-                            pending = _constant_int(keyword.value)
-                            break
-                if pending == 1:
-                    evidence["async_wait_group_1"] = True
-                elif pending == 0:
-                    evidence["async_wait_group_0"] = True
-            if isinstance(child.func, ast.Attribute) and child.func.attr == "slot":
-                evidence["staged_slot"] = True
-    return evidence
-
-
-def _inspect_pipeline_source(
-    source: str, source_path: Path, kernel_symbols: Iterable[str]
-) -> dict[str, dict[str, bool]]:
-    """Return evidence from each exact matrix kernel's reachable call graph."""
-
-    try:
-        tree = ast.parse(source, filename=str(source_path))
-    except SyntaxError as ex:
-        raise ValueError(
-            f"generated source is not valid Python and cannot satisfy the pipeline "
-            f"gate: {source_path}: {ex}"
-        ) from ex
-
-    forbidden: list[str] = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
-            continue
-        name = _call_name(node.func)
-        if name == "tle.pipe":
-            forbidden.append("tle.pipe")
-        if "warp_specialize" in name or any(
-            keyword.arg == "warp_specialize" for keyword in node.keywords
-        ):
-            forbidden.append("warp_specialize")
-        if name == "tl.range" and any(
-            keyword.arg == "num_stages" for keyword in node.keywords
-        ):
-            forbidden.append("tl.range(..., num_stages=...)")
-
-    if forbidden:
-        raise ValueError(
-            "generated source uses forbidden pipeline constructs: "
-            + ", ".join(sorted(set(forbidden)))
-        )
-
-    functions: dict[str, list[ast.AST]] = {}
-    for node in tree.body:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            functions.setdefault(node.name, []).append(node)
-
-    result: dict[str, dict[str, bool]] = {}
-    for symbol in kernel_symbols:
-        matches = functions.get(symbol, [])
-        if len(matches) != 1:
-            raise ValueError(
-                "generated source must define exactly one top-level function for "
-                f"matrix kernel symbol {symbol!r}, found {len(matches)} in {source_path}"
-            )
-        reachable_names: set[str] = set()
-        pending = [symbol]
-        while pending:
-            name = pending.pop()
-            if name in reachable_names:
-                continue
-            local_matches = functions.get(name, [])
-            if len(local_matches) != 1:
-                raise ValueError(
-                    f"generated source call graph for matrix kernel {symbol!r} has "
-                    f"{len(local_matches)} definitions of reachable function {name!r}"
-                )
-            reachable_names.add(name)
-            for child in ast.walk(local_matches[0]):
-                if not isinstance(child, ast.Call):
-                    continue
-                called_name = _call_name(child.func)
-                if called_name in functions and called_name not in reachable_names:
-                    pending.append(called_name)
-        result[symbol] = _pipeline_source_evidence(
-            functions[name][0] for name in sorted(reachable_names)
-        )
-    return result
-
-
 def _validate_pyntt_codegen_manifest(manifest: Mapping[str, Any]) -> None:
     """Use the PyNTT reader as the single owner of the manifest contract."""
 
@@ -477,639 +299,7 @@ def _validate_pyntt_codegen_manifest(manifest: Mapping[str, Any]) -> None:
     validate_manifest(manifest)
 
 
-def _required_string(value: Mapping[str, Any], field: str, path: str) -> str:
-    item = value.get(field)
-    if not isinstance(item, str) or not item:
-        raise ValueError(f"{path}.{field} must be a non-empty string")
-    return item
-
-
-def _physical_capacity_bytes(
-    ranges: Iterable[tuple[str, int, int]],
-) -> int:
-    return sum(size for _, _, size in set(ranges))
-
-
-def _pipeline_owners(
-    kernel: Mapping[str, Any], kernel_path: str, kernel_name: str
-) -> Iterable[tuple[str, str, str, Mapping[str, Any]]]:
-    yield "render_kernel", kernel_name, kernel_path, kernel
-    for index, device_function in enumerate(kernel["device_functions"]):
-        device_path = f"{kernel_path}.device_functions[{index}]"
-        yield (
-            "device_function",
-            _required_string(device_function, "name", device_path),
-            device_path,
-            device_function,
-        )
-
-
-def _validate_pipeline_gate(
-    manifest: Mapping[str, Any],
-    generated_source: str,
-    source_path: Path,
-    allow_ordinary: bool,
-) -> dict[str, Any]:
-    _validate_pyntt_codegen_manifest(manifest)
-
-    functions = manifest["functions"]
-    matrix_kernels: list[dict[str, Any]] = []
-    matrix_kernel_symbols: set[str] = set()
-    declared_execution_symbols: dict[str, str] = {}
-    declared_async_execution_count = 0
-    staged_buffer_count = 0
-    maximum_stage_count = 1
-    total_physical_capacity_bytes = 0
-
-    for function_index, function in enumerate(functions):
-        for kernel_index, kernel in enumerate(function["render_kernels"]):
-            kernel_path = (
-                f"manifest.functions[{function_index}].render_kernels[{kernel_index}]"
-            )
-            metadata = kernel["metadata"]
-            kernel_name = _required_string(metadata, "name", f"{kernel_path}.metadata")
-            is_matrix = _is_matrix_render_kernel(kernel)
-            if is_matrix:
-                if kernel_name in matrix_kernel_symbols:
-                    raise ValueError(
-                        "matrix render kernel symbols must be unique for compiled "
-                        f"artifact correlation, duplicate {kernel_name!r}"
-                    )
-                matrix_kernel_symbols.add(kernel_name)
-
-            execution_evidence: list[dict[str, Any]] = []
-            kernel_physical_ranges: set[tuple[str, int, int]] = set()
-            for owner_kind, owner_name, owner_path, owner in _pipeline_owners(
-                kernel, kernel_path, kernel_name
-            ):
-                for execution_index, execution in enumerate(
-                    owner["pipeline_executions"]
-                ):
-                    execution_path = (
-                        f"{owner_path}.pipeline_executions[{execution_index}]"
-                    )
-                    region_id = _required_string(
-                        execution, "region_id", execution_path
-                    )
-                    previous_symbol = declared_execution_symbols.get(region_id)
-                    if previous_symbol is not None:
-                        raise ValueError(
-                            "pipeline execution region_id values must be globally "
-                            "unique for execution-to-artifact correlation; "
-                            f"{region_id!r} occurs in both {previous_symbol!r} and "
-                            f"{kernel_name!r}"
-                        )
-                    declared_execution_symbols[region_id] = kernel_name
-
-                    channels = execution["channels"]
-                    execution_buffer_count = len(channels)
-                    execution_stage_count = int(execution["stage_count"])
-                    for channel in channels:
-                        allocation = channel["allocation"]
-                        kernel_physical_ranges.add(
-                            (
-                                str(allocation["arena_id"]),
-                                int(allocation["arena_offset_bytes"]),
-                                int(allocation["physical_bytes"]),
-                            )
-                        )
-                    partition = _required_string(
-                        execution, "partition", execution_path
-                    )
-                    if partition != "tail":
-                        declared_async_execution_count += 1
-                    staged_buffer_count += execution_buffer_count
-                    maximum_stage_count = max(
-                        maximum_stage_count, execution_stage_count
-                    )
-                    execution_evidence.append(
-                        {
-                            "region_id": region_id,
-                            "schedule_id": _required_string(
-                                execution, "schedule_id", execution_path
-                            ),
-                            "template_id": _required_string(
-                                execution, "template_id", execution_path
-                            ),
-                            "partition": partition,
-                            "owner_kind": owner_kind,
-                            "owner_name": owner_name,
-                            "staged_buffer_count": execution_buffer_count,
-                            "stage_count": execution_stage_count,
-                        }
-                    )
-
-            if not is_matrix:
-                continue
-            kernel_capacity_bytes = _physical_capacity_bytes(
-                kernel_physical_ranges
-            )
-            total_physical_capacity_bytes += kernel_capacity_bytes
-            matrix_kernels.append(
-                {
-                    "manifest_path": kernel_path,
-                    "kernel_symbol": kernel_name,
-                    "pipeline_mode": "cp_async_n2"
-                    if any(item["partition"] != "tail" for item in execution_evidence)
-                    else "ordinary",
-                    "async_execution_ids": sorted(
-                        item["region_id"]
-                        for item in execution_evidence
-                        if item["partition"] != "tail"
-                    ),
-                    "schedule_ids": sorted(
-                        {item["schedule_id"] for item in execution_evidence}
-                    ),
-                    "pipeline_execution_count": len(execution_evidence),
-                    "staged_buffer_count": sum(
-                        item["staged_buffer_count"] for item in execution_evidence
-                    ),
-                    "unique_physical_range_count": len(kernel_physical_ranges),
-                    "physical_staged_capacity_bytes": kernel_capacity_bytes,
-                    "pipeline_executions": sorted(
-                        execution_evidence, key=lambda item: item["region_id"]
-                    ),
-                }
-            )
-
-    if not matrix_kernels:
-        raise ValueError(
-            "Qwen3 pipeline gate found no GEMM/GEMV matrix render kernels "
-            "(MatMul/PackedMatMul/MatMulGlu/QKVParallelLinear families)"
-        )
-
-    source_evidence = _inspect_pipeline_source(
-        generated_source,
-        source_path,
-        (kernel["kernel_symbol"] for kernel in matrix_kernels),
-    )
-    async_matrix_kernels = 0
-    async_matrix_execution_count = 0
-    for kernel in matrix_kernels:
-        symbol = kernel["kernel_symbol"]
-        evidence = source_evidence[symbol]
-        kernel["source_evidence"] = evidence
-        if kernel["async_execution_ids"]:
-            async_matrix_kernels += 1
-            async_matrix_execution_count += len(kernel["async_execution_ids"])
-            missing_evidence = [
-                name for name, present in evidence.items() if not present
-            ]
-            if missing_evidence:
-                raise ValueError(
-                    "generated source function for declared cp.async matrix kernel "
-                    f"{symbol!r} is missing evidence: "
-                    + ", ".join(missing_evidence)
-                )
-        else:
-            unexpected_async_evidence = [
-                name
-                for name in (
-                    "async_copy",
-                    "async_commit_group",
-                    "async_wait_group_1",
-                    "async_wait_group_0",
-                )
-                if evidence[name]
-            ]
-            if unexpected_async_evidence:
-                raise ValueError(
-                    "generated source function for ordinary matrix kernel "
-                    f"{symbol!r} contains undeclared async pipeline evidence: "
-                    + ", ".join(unexpected_async_evidence)
-                )
-
-    has_async_matrix_pipeline = async_matrix_execution_count > 0
-    if not has_async_matrix_pipeline and not allow_ordinary:
-        raise ValueError(
-            "Qwen3 pipeline gate requires at least one GEMM/GEMV matrix execution "
-            f"using {_CP_ASYNC_PIPELINE_TEMPLATE}"
-        )
-
-    return {
-        "status": (
-            "passed" if has_async_matrix_pipeline else "ordinary_baseline_allowed"
-        ),
-        "enforced": not allow_ordinary,
-        "allow_ordinary": bool(allow_ordinary),
-        "manifest_version": 6,
-        "matrix_kernel_count": len(matrix_kernels),
-        "async_matrix_kernel_count": async_matrix_kernels,
-        "ordinary_matrix_kernel_count": len(matrix_kernels) - async_matrix_kernels,
-        "async_matrix_execution_count": async_matrix_execution_count,
-        "declared_async_execution_count": declared_async_execution_count,
-        "staged_buffer_count": staged_buffer_count,
-        "maximum_stage_count": maximum_stage_count,
-        "physical_staged_capacity_bytes": total_physical_capacity_bytes,
-        "matrix_kernels": matrix_kernels,
-        "source_evidence_scope": "exact_matrix_kernel_transitive_static_call_graph",
-    }
-
-
-def _count_matches(pattern: str, text: str) -> int:
-    return len(re.findall(pattern, text, flags=re.MULTILINE))
-
-
-def _count_lines_matching_all(text: str, patterns: Sequence[str]) -> int:
-    compiled = [re.compile(pattern) for pattern in patterns]
-    return sum(
-        all(pattern.search(line) is not None for pattern in compiled)
-        for line in text.splitlines()
-    )
-
-
-def _count_ptx_wait_then_thread_rendezvous(text: str, max_pending: int) -> int:
-    """Count waits followed by a CTA thread rendezvous before shared use.
-
-    PTX ``membar`` and ``fence`` instructions only order memory accesses; they
-    do not wait for the other CTA threads that issued their own asynchronous
-    copies.  Accept only the ``sync`` forms of the PTX ``bar``/``barrier``
-    instruction families, including their canonical CTA/aligned spellings.
-    """
-
-    wait = re.compile(rf"\bcp\.async\.wait_group\s+{max_pending}\s*;", re.IGNORECASE)
-    thread_rendezvous = re.compile(
-        r"^(?:@!?%[A-Za-z0-9_$]+\s+)?"
-        r"(?:bar|barrier)(?:\.cta)?\.sync(?:\.aligned)?\b",
-        re.IGNORECASE,
-    )
-    boundary = re.compile(
-        r"\b(?:cp\.async\.(?:commit_group|wait_group|ca|cg)|"
-        r"ld(?:matrix)?[^;\n]*\.shared|mma(?:\.sync)?|call(?:\.uni)?|ret)\b",
-        re.IGNORECASE,
-    )
-    lines = text.splitlines()
-    count = 0
-    for index, line in enumerate(lines):
-        if wait.search(line) is None:
-            continue
-        for following in lines[index + 1 : index + 65]:
-            instruction = following.split("//", 1)[0].strip()
-            if not instruction or instruction.startswith((".", "$")):
-                continue
-            if thread_rendezvous.search(instruction):
-                count += 1
-                break
-            if boundary.search(instruction):
-                break
-    return count
-
-
-def _compiled_artifact_evidence(
-    cache_root: Path,
-    metadata_path: Path,
-    expected_symbol: str,
-    expected_async_execution_count: int,
-) -> dict[str, Any]:
-    if expected_async_execution_count < 1:
-        raise ValueError(
-            "compiled async artifact requires at least one async execution"
-        )
-    for path in (
-        metadata_path,
-        metadata_path.with_suffix(".ttgir"),
-        metadata_path.with_suffix(".ptx"),
-    ):
-        if path.is_symlink():
-            raise ValueError(
-                f"compiled artifact gate rejects symlinks in the isolated cache: {path}"
-            )
-        try:
-            path.resolve(strict=True).relative_to(cache_root)
-        except (FileNotFoundError, ValueError) as ex:
-            raise ValueError(
-                f"compiled artifact gate requires {path.name} inside isolated cache "
-                f"{cache_root}"
-            ) from ex
-
-    metadata = _read_json(metadata_path)
-    if not isinstance(metadata, Mapping):
-        raise ValueError(f"Triton kernel metadata must be an object: {metadata_path}")
-    actual_symbol = metadata.get("name")
-    if actual_symbol != expected_symbol:
-        raise ValueError(
-            f"Triton artifact {metadata_path} declares kernel symbol "
-            f"{actual_symbol!r}, expected {expected_symbol!r}"
-        )
-
-    ttgir_path = metadata_path.with_suffix(".ttgir")
-    ptx_path = metadata_path.with_suffix(".ptx")
-    try:
-        ttgir = ttgir_path.read_text(encoding="utf-8")
-        ptx = ptx_path.read_text(encoding="utf-8")
-    except UnicodeDecodeError as ex:
-        raise ValueError(f"compiled text artifact is not UTF-8: {ex}") from ex
-
-    ttgir_evidence = {
-        "kernel_symbol_definition_count": _count_matches(
-            rf"\btt\.func\s+public\s+@{re.escape(expected_symbol)}\b", ttgir
-        ),
-        "async_copy_global_to_local_count": _count_matches(
-            r"\bttg\.async_copy_global_to_local\b", ttgir
-        ),
-        "required_async_copy_marker_count": _count_lines_matching_all(
-            ttgir,
-            (
-                r"\bttg\.async_copy_global_to_local\b",
-                r"\btle\.required_async_copy\b",
-            ),
-        ),
-        "async_commit_group_count": _count_matches(
-            r"\bttg\.async_commit_group\b", ttgir
-        ),
-        "async_wait_group_1_count": _count_matches(
-            r"\bttg\.async_wait\b[^\n]*\bnum\s*=\s*1\s*:\s*i32", ttgir
-        ),
-        "async_wait_group_0_count": _count_matches(
-            r"\bttg\.async_wait\b[^\n]*\bnum\s*=\s*0\s*:\s*i32", ttgir
-        ),
-        "explicit_async_wait_marker_count": _count_matches(
-            r"\btle\.explicit_async_wait\b", ttgir
-        ),
-        "explicit_async_wait_group_1_count": _count_lines_matching_all(
-            ttgir,
-            (
-                r"\bttg\.async_wait\b",
-                r"\bnum\s*=\s*1\s*:\s*i32",
-                r"\btle\.explicit_async_wait\b",
-            ),
-        ),
-        "explicit_async_wait_group_0_count": _count_lines_matching_all(
-            ttgir,
-            (
-                r"\bttg\.async_wait\b",
-                r"\bnum\s*=\s*0\s*:\s*i32",
-                r"\btle\.explicit_async_wait\b",
-            ),
-        ),
-    }
-    ptx_evidence = {
-        "kernel_symbol_entry_count": _count_matches(
-            rf"(?:\.visible\s+)?\.entry\s+{re.escape(expected_symbol)}\s*\(", ptx
-        ),
-        "cp_async_copy_count": _count_matches(
-            r"^\s*(?:@!?%[A-Za-z0-9_$]+\s+)?"
-            r"cp\.async\.(?:ca|cg)\.shared\.global(?:\.[^\s;]+)*\s+",
-            ptx,
-        ),
-        "cp_async_commit_group_count": _count_matches(
-            r"\bcp\.async\.commit_group\s*;", ptx
-        ),
-        "cp_async_wait_group_1_count": _count_matches(
-            r"\bcp\.async\.wait_group\s+1\s*;", ptx
-        ),
-        "cp_async_wait_group_0_count": _count_matches(
-            r"\bcp\.async\.wait_group\s+0\s*;", ptx
-        ),
-        "wait_group_1_then_barrier_count": (
-            _count_ptx_wait_then_thread_rendezvous(ptx, 1)
-        ),
-        "wait_group_0_then_barrier_count": (
-            _count_ptx_wait_then_thread_rendezvous(ptx, 0)
-        ),
-    }
-
-    missing: list[str] = []
-    missing.extend(
-        f"TTGIR {name}"
-        for name in (
-            "kernel_symbol_definition_count",
-            "async_copy_global_to_local_count",
-            "async_commit_group_count",
-            "async_wait_group_1_count",
-            "async_wait_group_0_count",
-            "explicit_async_wait_group_1_count",
-            "explicit_async_wait_group_0_count",
-        )
-        if ttgir_evidence[name] < 1
-    )
-    if (
-        ttgir_evidence["required_async_copy_marker_count"]
-        < expected_async_execution_count
-    ):
-        missing.append(
-            "TTGIR required_async_copy_marker_count>="
-            f"{expected_async_execution_count}"
-        )
-    missing.extend(
-        f"PTX {name}"
-        for name in (
-            "kernel_symbol_entry_count",
-            "cp_async_copy_count",
-            "cp_async_commit_group_count",
-            "cp_async_wait_group_1_count",
-            "cp_async_wait_group_0_count",
-            "wait_group_1_then_barrier_count",
-            "wait_group_0_then_barrier_count",
-        )
-        if ptx_evidence[name] < 1
-    )
-    if missing:
-        raise ValueError(
-            f"compiled cp.async gate failed for kernel {expected_symbol!r} in "
-            f"{metadata_path.parent}: missing {', '.join(missing)}. Required async "
-            "transport must fail lowering instead of being silently downgraded."
-        )
-
-    def file_evidence(path: Path) -> dict[str, Any]:
-        return {
-            "relative_path": path.relative_to(cache_root).as_posix(),
-            "bytes": path.stat().st_size,
-            "sha256": _sha256_file(path),
-        }
-
-    return {
-        "cache_key": metadata_path.parent.relative_to(cache_root).as_posix(),
-        "actual_kernel_symbol": actual_symbol,
-        "compiler_metadata": {
-            "hash": metadata.get("hash"),
-            "target": metadata.get("target"),
-            "num_warps": metadata.get("num_warps"),
-            "num_stages": metadata.get("num_stages"),
-            "shared_bytes": metadata.get("shared"),
-        },
-        "files": {
-            "metadata": file_evidence(metadata_path),
-            "ttgir": file_evidence(ttgir_path),
-            "ptx": file_evidence(ptx_path),
-        },
-        "ttgir_evidence": ttgir_evidence,
-        "ptx_evidence": ptx_evidence,
-    }
-
-
-def inspect_compiled_pipeline_artifacts(
-    cache_dir: Path, pipeline_gate: Mapping[str, Any]
-) -> dict[str, Any]:
-    """Validate actual artifacts for async matrix symbols observed in this run.
-
-    Ordinary matrix kernels are reported but can neither satisfy the gate nor lend
-    their source or compiled instructions to an async execution. An async matrix
-    symbol that was not launched is reported as unobserved.  At least one
-    corresponding symbol must be observed and pass the complete TTGIR/PTX gate.
-    """
-
-    cache_root = cache_dir.resolve(strict=True)
-    if not cache_root.is_dir():
-        raise ValueError(f"Triton cache is not a directory: {cache_root}")
-    raw_kernels = pipeline_gate.get("matrix_kernels")
-    if not isinstance(raw_kernels, list) or not raw_kernels:
-        raise ValueError(
-            "compiled artifact gate requires non-empty matrix_kernels evidence "
-            "from the generated manifest"
-        )
-
-    expectations: dict[str, Mapping[str, Any]] = {}
-    async_expectations: dict[str, Mapping[str, Any]] = {}
-    declared_execution_symbols: dict[str, str] = {}
-    for index, kernel in enumerate(raw_kernels):
-        path = f"pipeline_gate.matrix_kernels[{index}]"
-        if not isinstance(kernel, Mapping):
-            raise ValueError(f"{path} must be an object")
-        symbol = _required_string(kernel, "kernel_symbol", path)
-        if re.fullmatch(r"[A-Za-z_]\w*", symbol) is None:
-            raise ValueError(
-                f"{path}.kernel_symbol is not a Python identifier: {symbol!r}"
-            )
-        if symbol in expectations:
-            raise ValueError(f"duplicate matrix kernel symbol {symbol!r}")
-        execution_ids = kernel.get("async_execution_ids")
-        if not isinstance(execution_ids, list) or any(
-            not isinstance(execution_id, str) or not execution_id
-            for execution_id in execution_ids
-        ):
-            raise ValueError(
-                f"{path}.async_execution_ids must be an array of non-empty strings"
-            )
-        if len(execution_ids) != len(set(execution_ids)):
-            raise ValueError(f"{path}.async_execution_ids contains duplicates")
-        for execution_id in execution_ids:
-            previous_symbol = declared_execution_symbols.get(execution_id)
-            if previous_symbol is not None:
-                raise ValueError(
-                    f"async execution {execution_id!r} is ambiguously linked to matrix "
-                    f"symbols {previous_symbol!r} and {symbol!r}"
-                )
-            declared_execution_symbols[execution_id] = symbol
-        expectations[symbol] = kernel
-        if execution_ids:
-            async_expectations[symbol] = kernel
-
-    status = pipeline_gate.get("status")
-    if status == "passed" and not async_expectations:
-        raise ValueError(
-            "compiled artifact gate received passed status without an async matrix execution"
-        )
-    if status not in {"passed", "ordinary_baseline_allowed"}:
-        raise ValueError(f"compiled artifact gate received invalid status {status!r}")
-    declared_kernel_count = pipeline_gate.get("async_matrix_kernel_count")
-    declared_execution_count = pipeline_gate.get("async_matrix_execution_count")
-    if declared_kernel_count != len(async_expectations):
-        raise ValueError(
-            "pipeline gate async_matrix_kernel_count does not match matrix_kernels: "
-            f"{declared_kernel_count!r} != {len(async_expectations)}"
-        )
-    if declared_execution_count != len(declared_execution_symbols):
-        raise ValueError(
-            "pipeline gate async_matrix_execution_count does not match "
-            f"matrix_kernels: {declared_execution_count!r} != "
-            f"{len(declared_execution_symbols)}"
-        )
-
-    metadata_by_symbol: dict[str, list[Path]] = {
-        symbol: [] for symbol in async_expectations
-    }
-    expected_names = {f"{symbol}.json": symbol for symbol in async_expectations}
-    for metadata_path in sorted(cache_root.rglob("*.json")):
-        symbol = expected_names.get(metadata_path.name)
-        if symbol is not None:
-            metadata_by_symbol[symbol].append(metadata_path)
-
-    kernels: list[dict[str, Any]] = []
-    execution_artifact_bindings: list[dict[str, Any]] = []
-    artifact_count = 0
-    for symbol, expectation in expectations.items():
-        execution_ids = list(expectation["async_execution_ids"])
-        if not execution_ids:
-            kernels.append(
-                {
-                    **dict(expectation),
-                    "artifact_status": "not_applicable_ordinary",
-                    "compiled_artifacts": [],
-                }
-            )
-            continue
-        metadata_paths = metadata_by_symbol[symbol]
-        if not metadata_paths:
-            kernels.append(
-                {
-                    **dict(expectation),
-                    "artifact_status": "not_observed_in_isolated_run",
-                    "compiled_artifacts": [],
-                }
-            )
-            continue
-        artifacts = [
-            _compiled_artifact_evidence(
-                cache_root,
-                metadata_path,
-                symbol,
-                expected_async_execution_count=len(execution_ids),
-            )
-            for metadata_path in metadata_paths
-        ]
-        artifact_count += len(artifacts)
-        cache_keys = [artifact["cache_key"] for artifact in artifacts]
-        for execution_id in execution_ids:
-            execution_artifact_bindings.append(
-                {
-                    "execution_id": execution_id,
-                    "kernel_symbol": symbol,
-                    "artifact_cache_keys": cache_keys,
-                    "evidence_scope": "containing_kernel_artifact",
-                }
-            )
-        kernels.append(
-            {
-                **dict(expectation),
-                "artifact_status": "validated_cp_async",
-                "compiled_artifacts": artifacts,
-            }
-        )
-
-    validated_async_kernel_count = sum(
-        kernel["artifact_status"] == "validated_cp_async" for kernel in kernels
-    )
-    if async_expectations and validated_async_kernel_count == 0:
-        raise ValueError(
-            f"isolated Triton cache {cache_root} has no compiled metadata/TTGIR/PTX "
-            "for any declared async matrix kernel symbol; global historical caches "
-            "are not searched"
-        )
-
-    return {
-        "status": status,
-        "cache_scope": "isolated_run",
-        "cache_dir": str(cache_root),
-        "global_cache_search": False,
-        "matrix_kernel_count": len(kernels),
-        "declared_async_matrix_kernel_count": len(async_expectations),
-        "validated_async_matrix_kernel_count": validated_async_kernel_count,
-        "unobserved_async_matrix_kernel_symbols": sorted(
-            symbol for symbol in async_expectations if not metadata_by_symbol[symbol]
-        ),
-        "compiled_artifact_count": artifact_count,
-        "declared_async_matrix_execution_count": len(declared_execution_symbols),
-        "artifact_linked_async_execution_count": len(execution_artifact_bindings),
-        "execution_evidence_scope": "containing_kernel_artifact",
-        "kernels": kernels,
-        "execution_artifact_bindings": execution_artifact_bindings,
-    }
-
-
-def inspect_generated_package(
-    generated_dir: Path, *, allow_ordinary: bool = False
-) -> PackageContract:
+def inspect_generated_package(generated_dir: Path) -> PackageContract:
     """Validate the one-layer, single-token ABI and fingerprint the package."""
 
     generated_dir = generated_dir.resolve()
@@ -1213,7 +403,6 @@ def inspect_generated_package(
         "target_kind": metadata.get("target_kind"),
         "target_machine": metadata.get("target_machine"),
         "backend": metadata.get("backend"),
-        "strict": metadata.get("strict"),
         "function_count": len(functions),
     }
     kernel_params_path = generated_dir / "kernel_params.json"
@@ -1229,16 +418,7 @@ def inspect_generated_package(
     manifest_summary["pyntt_codegen_manifest_version"] = kernel_params.get(
         "pyntt_codegen_manifest_version"
     )
-    source_path = generated_dir / "generated_kernels.py"
-    try:
-        generated_source = source_path.read_text(encoding="utf-8-sig")
-    except FileNotFoundError as ex:
-        raise FileNotFoundError(
-            f"required generated-package file not found: {source_path}"
-        ) from ex
-    pipeline_gate_summary = _validate_pipeline_gate(
-        kernel_params, generated_source, source_path, allow_ordinary
-    )
+    _validate_pyntt_codegen_manifest(kernel_params)
 
     return PackageContract(
         entry_function=str(entry.get("name", "")),
@@ -1247,7 +427,6 @@ def inspect_generated_package(
         input_shape=input_shape,
         detected_layer_ids=layer_ids,
         manifest_summary=manifest_summary,
-        pipeline_gate_summary=pipeline_gate_summary,
         source_file_sha256=dict(sorted(file_hashes.items())),
         asset_file_bytes=asset_file_bytes,
         asset_file_sha256=asset_file_sha256,
@@ -1634,11 +813,7 @@ def _summarize_scenario(
 def _package_contract_json(
     contract: PackageContract,
     generated_dir: Path,
-    compiled_artifacts: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    pipeline_gate = dict(contract.pipeline_gate_summary)
-    if compiled_artifacts is not None:
-        pipeline_gate["compiled_artifacts"] = dict(compiled_artifacts)
     return {
         "generated_dir": str(generated_dir.resolve()),
         "entry_function": contract.entry_function,
@@ -1650,7 +825,6 @@ def _package_contract_json(
         },
         "detected_layer_ids": list(contract.detected_layer_ids),
         "manifest": dict(contract.manifest_summary),
-        "pipeline_gate": pipeline_gate,
         "source_file_sha256": dict(contract.source_file_sha256),
         "asset_file_bytes": dict(contract.asset_file_bytes),
         "asset_file_sha256": dict(contract.asset_file_sha256),
@@ -1741,9 +915,7 @@ def _run_benchmark_in_cache(
 
     scenarios = parse_scenarios(args.scenario)
     annotations = parse_annotations(args.annotation)
-    contract = inspect_generated_package(
-        args.generated_dir, allow_ordinary=bool(args.allow_ordinary)
-    )
+    contract = inspect_generated_package(args.generated_dir)
     max_prompt_tokens = max(scenario.prompt_tokens for scenario in scenarios)
     max_sequence_tokens = max(
         scenario.prompt_tokens + scenario.output_tokens - 1 for scenario in scenarios
@@ -1805,9 +977,6 @@ def _run_benchmark_in_cache(
             )
 
         runtime_metadata = _runtime_metadata(torch, args.device, repo)
-        compiled_artifacts = inspect_compiled_pipeline_artifacts(
-            cache_dir, contract.pipeline_gate_summary
-        )
         report = {
             "schema_version": SCHEMA_VERSION,
             "benchmark": BENCHMARK_NAME,
@@ -1844,9 +1013,7 @@ def _run_benchmark_in_cache(
                 "triton_cache_dir": str(cache_dir),
                 "annotations": annotations,
             },
-            "model_package": _package_contract_json(
-                contract, args.generated_dir, compiled_artifacts
-            ),
+            "model_package": _package_contract_json(contract, args.generated_dir),
             "paged_attention_config": _runner_config_metadata(runner),
             **runtime_metadata,
             "scenarios": scenario_results,
@@ -1960,17 +1127,6 @@ def _validate_comparable_reports(
     if candidate_scenarios != baseline_scenarios:
         differences.append(
             "scenarios.prompt_tokens/output_tokens/model_calls_per_request"
-        )
-    candidate_pipeline_count = _report_path(
-        candidate, "model_package.pipeline_gate.async_matrix_execution_count"
-    )
-    baseline_pipeline_count = _report_path(
-        baseline, "model_package.pipeline_gate.async_matrix_execution_count"
-    )
-    if candidate_pipeline_count <= 0 or baseline_pipeline_count != 0:
-        differences.append(
-            "model_package.pipeline_gate.async_matrix_execution_count"
-            "(candidate>0,baseline=0)"
         )
     if differences:
         raise ValueError(
@@ -2221,24 +1377,15 @@ def build_argument_parser(repo: Path) -> argparse.ArgumentParser:
         "--triton-cache-dir",
         type=Path,
         help=(
-            "Fresh persistent Triton cache used for compiled TTGIR/PTX evidence. "
+            "Fresh persistent Triton cache used by generated kernels. "
             "Defaults to <output-json>.triton-cache and must be empty."
-        ),
-    )
-    run.add_argument(
-        "--allow-ordinary",
-        action="store_true",
-        help=(
-            "Allow an intentional ordinary non-pipelined baseline. By default at "
-            "least one GEMM/GEMV matrix execution must pass the explicit two-slot "
-            "cp.async artifact gate."
         ),
     )
     run.add_argument(
         "--annotation",
         action="append",
         default=[],
-        help="Repeatable KEY=JSON configuration annotation, e.g. pipeline_depth=2.",
+        help="Repeatable KEY=JSON configuration annotation, e.g. template_revision=2.",
     )
     run.add_argument("--output-json", type=Path, required=True)
     run.add_argument("--baseline-json", type=Path)

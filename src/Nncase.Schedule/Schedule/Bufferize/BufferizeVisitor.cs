@@ -16,7 +16,7 @@ namespace Nncase.Schedule.Bufferize;
 
 public sealed class BufferizeVisitor : ExprRewriter
 {
-    private static readonly MemoryLocation[] WorkspaceLocations =
+    private static readonly MemoryLocation[] RuntimeWorkspaceLocations =
     [
         MemoryLocation.Data,
         MemoryLocation.ChipLocalData,
@@ -24,6 +24,7 @@ public sealed class BufferizeVisitor : ExprRewriter
     ];
 
     private readonly IGrouping<string, PrimFunction> _functions;
+    private readonly TargetMachineModel? _targetMachine;
     private readonly Dictionary<ReadOnlyDataKey, ValueRange<ulong>> _rdataRanges = new();
     private readonly Dictionary<ReadOnlyDataKey, ValueRange<ulong>> _chipLocalRdataRanges = new();
     private readonly Dictionary<PrimFunction, PrimFunction> _workspaceAbiFunctions = new(new ReferenceEqualityComparer<PrimFunction>());
@@ -32,10 +33,13 @@ public sealed class BufferizeVisitor : ExprRewriter
     private long _currentBlockLocalRdataStart;
     private int _dataBufferId;
 
-    public BufferizeVisitor(IGrouping<string, PrimFunction> functions)
+    public BufferizeVisitor(
+        IGrouping<string, PrimFunction> functions,
+        TargetMachineModel? targetMachine)
         : base(visitOtherFunctions: true)
     {
         _functions = functions;
+        _targetMachine = targetMachine;
     }
 
     public void Bufferize()
@@ -71,6 +75,7 @@ public sealed class BufferizeVisitor : ExprRewriter
             AssignDataResult(func, scheduleResult);
             AssignChipLocalDataResult(func, scheduleResult);
             AssignBlockLocalDataResult(func, scheduleResult);
+            AssignSharedDataResult(func, scheduleResult);
             AssignRdataResult(func, scheduleResult);
             AssignChipLocalRdataResult(func, scheduleResult);
             AssignBlockLocalRdataResult(func, scheduleResult);
@@ -133,14 +138,14 @@ public sealed class BufferizeVisitor : ExprRewriter
             return workspaceAbiFunction;
         }
 
-        var parameters = func.Parameters.ToArray().Concat(CreateWorkspaceParameters()).ToArray();
+        var parameters = func.Parameters.ToArray().Concat(CreateWorkspaceParameters(func)).ToArray();
         workspaceAbiFunction = func.With(parameters: parameters);
         _workspaceAbiFunctions.Add(func, workspaceAbiFunction);
         return workspaceAbiFunction;
     }
 
-    private BufferVar[] CreateWorkspaceParameters()
-        => WorkspaceLocations
+    private BufferVar[] CreateWorkspaceParameters(PrimFunction func)
+        => GetRequiredWorkspaceLocations(func)
             .Select(location => new BufferVar(
                 GetWorkspaceName(location),
                 TensorType.Scalar(new PointerType(DataTypes.UInt8)),
@@ -149,7 +154,9 @@ public sealed class BufferizeVisitor : ExprRewriter
             .ToArray();
 
     private BaseExpr[] CreateWorkspaceArguments(PrimFunction func)
-        => WorkspaceLocations.Select(location => (BaseExpr)CreateWorkspaceBuffer(func, location)).ToArray();
+        => GetRequiredWorkspaceLocations(func)
+            .Select(location => (BaseExpr)CreateWorkspaceBuffer(func, location))
+            .ToArray();
 
     private TIR.Buffer CreateWorkspaceBuffer(PrimFunction func, MemoryLocation location)
     {
@@ -158,9 +165,26 @@ public sealed class BufferizeVisitor : ExprRewriter
             MemoryLocation.Data => func.SchedResult.DataUsage,
             MemoryLocation.ChipLocalData => func.SchedResult.ChipLocalDataPoolSize,
             MemoryLocation.BlockLocalData => func.SchedResult.BlockLocalDataPoolSize,
+            MemoryLocation.Shared => func.SchedResult.SharedDataPoolSize,
             _ => throw new ArgumentOutOfRangeException(nameof(location), location, "Unsupported workspace memory location."),
         };
         var name = $"{GetWorkspaceName(location)}_{_dataBufferId++}";
+        if (location == MemoryLocation.Shared)
+        {
+            Dimension sizeDimension = checked((long)size);
+            var storage = new PhysicalBuffer(
+                checked((int)func.SchedResult.SharedDataAlign),
+                sizeDimension,
+                MemoryLocation.Shared);
+            return new TIR.Buffer(
+                name,
+                DataTypes.UInt8,
+                new MemSpan(storage),
+                [sizeDimension],
+                [Dimension.One],
+                distributedType: null);
+        }
+
         return T.CreateBuffer(
             new TensorType(DataTypes.UInt8, [checked((long)size)]),
             location,
@@ -177,30 +201,42 @@ public sealed class BufferizeVisitor : ExprRewriter
 
     private void ValidateWorkspaceParameters(PrimFunction func, IReadOnlyList<BufferVar> workspaceParameters)
     {
-        if (workspaceParameters.Count != WorkspaceLocations.Length)
+        var workspaceLocations = GetRequiredWorkspaceLocations(func);
+        if (workspaceParameters.Count != workspaceLocations.Length)
         {
             throw new InvalidOperationException(
-                $"PrimFunction {func.Name} must have exactly {WorkspaceLocations.Length} workspace parameters, " +
+                $"PrimFunction {func.Name} must have exactly {workspaceLocations.Length} workspace parameters, " +
                 $"got {workspaceParameters.Count}.");
         }
 
         var parameters = func.Parameters.ToArray();
-        for (int i = 0; i < WorkspaceLocations.Length; i++)
+        for (int i = 0; i < workspaceLocations.Length; i++)
         {
-            var parameterIndex = parameters.Length - WorkspaceLocations.Length + i;
+            var parameterIndex = parameters.Length - workspaceLocations.Length + i;
             if (!ReferenceEquals(parameters[parameterIndex], workspaceParameters[i]))
             {
                 throw new InvalidOperationException(
                     $"PrimFunction {func.Name} workspace parameters must be the final ABI parameters.");
             }
 
-            if (workspaceParameters[i].Location != WorkspaceLocations[i])
+            if (workspaceParameters[i].Location != workspaceLocations[i])
             {
                 throw new InvalidOperationException(
                     $"PrimFunction {func.Name} workspace parameter {workspaceParameters[i].Name} has location " +
-                    $"{workspaceParameters[i].Location}, expected {WorkspaceLocations[i]}.");
+                    $"{workspaceParameters[i].Location}, expected {workspaceLocations[i]}.");
             }
         }
+    }
+
+    private MemoryLocation[] GetRequiredWorkspaceLocations(PrimFunction func)
+    {
+        var hasSharedWorkspace = func.SchedResult.SharedDataPoolSize > 0 ||
+            func.Parameters.ToArray().OfType<BufferVar>().Any(
+                parameter => parameter.Role == BufferVarRole.Workspace &&
+                    parameter.Location == MemoryLocation.Shared);
+        return hasSharedWorkspace
+            ? [.. RuntimeWorkspaceLocations, MemoryLocation.Shared]
+            : RuntimeWorkspaceLocations;
     }
 
     private string GetWorkspaceName(MemoryLocation location)
@@ -209,6 +245,7 @@ public sealed class BufferizeVisitor : ExprRewriter
             MemoryLocation.Data => "data",
             MemoryLocation.ChipLocalData => "chip_local_data",
             MemoryLocation.BlockLocalData => "block_local_data",
+            MemoryLocation.Shared => "shared",
             _ => throw new ArgumentOutOfRangeException(nameof(location), location, "Unsupported workspace memory location."),
         };
 
@@ -245,6 +282,51 @@ public sealed class BufferizeVisitor : ExprRewriter
         {
             func.SchedResult.DataAlign = Math.Max(8, (ulong)blockLocalDataResult.Alignment);
             func.SchedResult.BlockLocalDataPoolSize = MathUtility.AlignUp((ulong)blockLocalDataResult.MemoryPoolEnd, func.SchedResult.DataAlign);
+        }
+    }
+
+    private void AssignSharedDataResult(PrimFunction func, IReadOnlyDictionary<MemoryLocation, BufferScheduleResult> scheduleResult)
+    {
+        if (scheduleResult.TryGetValue(MemoryLocation.Shared, out var sharedDataResult))
+        {
+            if (_targetMachine is null)
+            {
+                throw new InvalidOperationException(
+                    $"PrimFunction {func.Name} uses Shared memory, but its target does not provide a machine model.");
+            }
+
+            func.SchedResult.SharedDataAlign = Math.Max(8, (ulong)sharedDataResult.Alignment);
+            var requiredBytes = MathUtility.AlignUp(
+                (ulong)sharedDataResult.MemoryPoolEnd,
+                func.SchedResult.SharedDataAlign);
+            var memorySpaces = _targetMachine.MemorySpaces.Values
+                .Where(space => space.TIRBinding is
+                {
+                    Location: MemoryLocation.Shared,
+                    Hierarchy: 0,
+                })
+                .ToArray();
+            if (memorySpaces.Length != 1)
+            {
+                throw new InvalidOperationException(
+                    $"Target {_targetMachine.Id} must define exactly one Shared TIR memory space at hierarchy 0, " +
+                    $"got {memorySpaces.Length}.");
+            }
+
+            var memorySpace = memorySpaces[0];
+            var allocationBytes = _targetMachine.GetAllocationSizeBytes(
+                memorySpace,
+                checked((long)requiredBytes));
+            var maximumBytes = _targetMachine.GetMaximumUsableAllocationBytes(memorySpace);
+            if (allocationBytes > maximumBytes)
+            {
+                throw new InvalidOperationException(
+                    $"PrimFunction {func.Name} requires {requiredBytes} Shared bytes " +
+                    $"({allocationBytes} after {memorySpace.AllocationSizePolicy} allocation rounding), " +
+                    $"exceeding target {_targetMachine.Id} limit {maximumBytes}.");
+            }
+
+            func.SchedResult.SharedDataPoolSize = checked((ulong)allocationBytes);
         }
     }
 

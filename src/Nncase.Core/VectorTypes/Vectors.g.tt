@@ -24,22 +24,24 @@ namespace Nncase;
 // NOTE fixed array not suppot generic
 
 <#
-var lanesValues = new[] { 
-  (0, 4), (0, 8), (0, 16), (0, 32), (0, 64), (0, 128),
-  (2, 4), (2, 8), (2, 16), (2, 32),
-  (4, 4), (4, 8), (4, 16), (4, 32),
-  (8, 8), (16, 16), (32, 16), (32, 32), (32, 64), (32, 128), (64, 32), (64, 64), (64, 128), (128, 64) };
+var lanesValues = new[] {
+  new[] { 4 }, new[] { 8 }, new[] { 16 }, new[] { 32 }, new[] { 64 }, new[] { 128 },
+  new[] { 2, 4 }, new[] { 2, 8 }, new[] { 2, 16 }, new[] { 2, 32 },
+  new[] { 4, 4 }, new[] { 4, 8 }, new[] { 4, 16 }, new[] { 4, 32 },
+  new[] { 8, 8 }, new[] { 16, 16 }, new[] { 32, 16 }, new[] { 32, 32 }, new[] { 32, 64 },
+  new[] { 32, 128 }, new[] { 64, 32 }, new[] { 64, 64 }, new[] { 64, 128 }, new[] { 128, 64 },
+  new[] { 2, 2, 2 }, new[] { 4, 2, 4 }, new[] { 8, 2, 8 }, new[] { 16, 2, 16 }, new[] { 32, 2, 32 } };
 #>
 public partial record VectorType
 {
     public override Type CLRType => Lanes.ToArray() switch
     {
 <#
-foreach (var (lanesA, lanesB) in lanesValues)
+foreach (var lanesValue in lanesValues)
 {
-    var typePrefix = lanesA == 0 ? $"Vector{lanesB.ToString()}" : $"Vector{lanesA.ToString()}x{lanesB.ToString()}";
+    var typePrefix = $"Vector{string.Join("x", lanesValue)}";
     var typeName = typePrefix + "<>";
-    var lanes = lanesA == 0 ? $"[{lanesB}]" : $"[{lanesA}, {lanesB}]";#>
+    var lanes = $"[{string.Join(", ", lanesValue)}]";#>
         <#=lanes#> => typeof(<#=typeName#>).MakeGenericType(ElemType.CLRType),
 <#}#>
         _ => throw new NotSupportedException($"Unsupported vector lanes: {string.Join(", ", Lanes)}"),
@@ -51,35 +53,48 @@ public partial record DataType
     private static Dictionary<Type, int[]> _clrTypeLanes = new()
     {
 <#
-foreach (var (lanesA, lanesB) in lanesValues)
+foreach (var lanesValue in lanesValues)
 {
-    var typePrefix = lanesA == 0 ? $"Vector{lanesB.ToString()}" : $"Vector{lanesA.ToString()}x{lanesB.ToString()}";
+    var typePrefix = $"Vector{string.Join("x", lanesValue)}";
     var typeName = typePrefix + "<>";
-    var lanes = lanesA == 0 ? $"[{lanesB}]" : $"[{lanesA}, {lanesB}]";#>
+    var lanes = $"[{string.Join(", ", lanesValue)}]";#>
         { typeof(<#=typeName#>), <#=lanes#> },
 <#}#>
     };
 }
 
 <# 
-foreach (var (lanesA, lanesB) in lanesValues)
+foreach (var lanesValue in lanesValues)
 {
-var typePrefix = lanesA == 0 ? $"Vector{lanesB.ToString()}" : $"Vector{lanesA.ToString()}x{lanesB.ToString()}";
+var typePrefix = $"Vector{string.Join("x", lanesValue)}";
 var typeName = typePrefix + "<T>";
+var firstFieldName = lanesValue.Length switch
+{
+    1 => "_item_0_0",
+    2 => "_item_0_0",
+    3 => "_item_0_0_0",
+    _ => throw new NotSupportedException(),
+};
 #>
 [StructLayout(LayoutKind.Sequential)]
 public unsafe struct <#=typeName#> : IVector<T>, IEquatable<<#=typeName#>>
     where T : unmanaged, IEquatable<T>
 {
-<# if (lanesA == 0) {#>
-<# foreach (var i in Enumerable.Range(0, lanesB)) { #>
+<# if (lanesValue.Length == 1) {#>
+<# foreach (var i in Enumerable.Range(0, lanesValue[0])) { #>
     private T _item_0_<#=i#>;
 <#}#>
-<#} else {#>
-<# foreach (var i in Enumerable.Range(0, lanesA)) { 
-   foreach (var j in Enumerable.Range(0, lanesB)) {#>
+<#} else if (lanesValue.Length == 2) {#>
+<# foreach (var i in Enumerable.Range(0, lanesValue[0])) {
+   foreach (var j in Enumerable.Range(0, lanesValue[1])) {#>
     private T _item_<#=i#>_<#=j#>;
 <#}}#>
+<#} else {#>
+<# foreach (var i in Enumerable.Range(0, lanesValue[0])) {
+   foreach (var j in Enumerable.Range(0, lanesValue[1])) {
+   foreach (var k in Enumerable.Range(0, lanesValue[2])) {#>
+    private T _item_<#=i#>_<#=j#>_<#=k#>;
+<#}}}#>
 <#}#>
 
     static <#=typePrefix#>()
@@ -90,7 +105,7 @@ public unsafe struct <#=typeName#> : IVector<T>, IEquatable<<#=typeName#>>
         }
     }
 
-    public static <#=typeName#> Create(T[] array) 
+    public static <#=typeName#> Create(T[] array)
     {
         <#=typeName#> vec = default;
         var src = array.AsSpan();
@@ -98,9 +113,9 @@ public unsafe struct <#=typeName#> : IVector<T>, IEquatable<<#=typeName#>>
         src.CopyTo(dest);
         return vec;
     }
-<# if (lanesA != 0) {#>
+<# if (lanesValue.Length == 2) {#>
 
-    public static <#=typeName#> Create(T[,] array) 
+    public static <#=typeName#> Create(T[,] array)
     {
         <#=typeName#> vec = default;
         var src = array.AsSpan2D();
@@ -110,17 +125,23 @@ public unsafe struct <#=typeName#> : IVector<T>, IEquatable<<#=typeName#>>
     }
 <#}#>
 
-<# if (lanesA == 0) {#>
+<# if (lanesValue.Length == 1) {#>
     public T this[int i]
     {
         get => Unsafe.Add(ref Unsafe.AsRef(in _item_0_0), i);
         set => Unsafe.Add(ref Unsafe.AsRef(in _item_0_0), i) = value;
     }
-<#} else {#>
+<#} else if (lanesValue.Length == 2) {#>
     public T this[int i, int j]
     {
         get => Unsafe.Add(ref Unsafe.AsRef(in _item_0_0), i * Width + j);
         set => Unsafe.Add(ref Unsafe.AsRef(in _item_0_0), i * Width + j) = value;
+    }
+<#} else {#>
+    public T this[int i, int j, int k]
+    {
+        get => Unsafe.Add(ref Unsafe.AsRef(in _item_0_0_0), ((i * Height) + j) * Width + k);
+        set => Unsafe.Add(ref Unsafe.AsRef(in _item_0_0_0), ((i * Height) + j) * Width + k) = value;
     }
 <#}#>
 
@@ -128,21 +149,32 @@ public unsafe struct <#=typeName#> : IVector<T>, IEquatable<<#=typeName#>>
 
     public override bool Equals([NotNullWhen(true)] object obj) => obj is <#=typeName#> other && Equals(other);
 
-    public Span<T> AsSpan() => MemoryMarshal.CreateSpan(ref Unsafe.AsRef(in _item_0_0), Count);
+    public Span<T> AsSpan() => MemoryMarshal.CreateSpan(ref Unsafe.AsRef(in <#=firstFieldName#>), Count);
 
-<# if (lanesA != 0) {#>
+<# if (lanesValue.Length == 2) {#>
 
     public Span<T> AsSpan(int i) => MemoryMarshal.CreateSpan(ref Unsafe.Add(ref Unsafe.AsRef(in _item_0_0), i * Width), Width);
 
     public Span2D<T> AsSpan2D() => Span2D<T>.DangerousCreate(ref Unsafe.AsRef(in _item_0_0), Height, Width, 1);
 
-    public static int Height => <#=lanesA#>;
+    public static int Height => <#=lanesValue[0]#>;
 
-    public static int Width => <#=lanesB#>;
+    public static int Width => <#=lanesValue[1]#>;
 
     public static int Count => Height * Width;
+<# } else if (lanesValue.Length == 3) {#>
+
+    public Span<T> AsSpan(int i, int j) => MemoryMarshal.CreateSpan(ref Unsafe.Add(ref Unsafe.AsRef(in _item_0_0_0), ((i * Height) + j) * Width), Width);
+
+    public static int Depth => <#=lanesValue[0]#>;
+
+    public static int Height => <#=lanesValue[1]#>;
+
+    public static int Width => <#=lanesValue[2]#>;
+
+    public static int Count => Depth * Height * Width;
 <# } else {#>
-    public static int Count => <#=lanesB#>;
+    public static int Count => <#=lanesValue[0]#>;
 <#}#>
 
 <#foreach (var op in new string[] { }) {#>
@@ -163,9 +195,9 @@ public unsafe struct <#=typeName#> : IVector<T>, IEquatable<<#=typeName#>>
 
     public override string ToString()
     {
-<# if (lanesA == 0) {#>
+<# if (lanesValue.Length == 1) {#>
         return $"<{Nncase.Utilities.StringUtility.Join<T>(',', AsSpan())}>";
-<#} else {#>
+<#} else if (lanesValue.Length == 2) {#>
         var sb = new System.Text.StringBuilder();
         sb.Append("<");
         for (int i = 0; i < Height; i++)
@@ -176,6 +208,30 @@ public unsafe struct <#=typeName#> : IVector<T>, IEquatable<<#=typeName#>>
                 sb.Append(",");
             }
         }
+        sb.Append(">");
+        return sb.ToString();
+<#} else {#>
+        var sb = new System.Text.StringBuilder();
+        sb.Append("<");
+        for (int i = 0; i < Depth; i++)
+        {
+            sb.Append("<");
+            for (int j = 0; j < Height; j++)
+            {
+                sb.Append($"<{Nncase.Utilities.StringUtility.Join<T>(',', AsSpan(i, j))}>");
+                if (j < Height - 1)
+                {
+                    sb.Append(",");
+                }
+            }
+
+            sb.Append(">");
+            if (i < Depth - 1)
+            {
+                sb.Append(",");
+            }
+        }
+
         sb.Append(">");
         return sb.ToString();
 <#}#>

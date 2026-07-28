@@ -1,0 +1,49 @@
+{% import "triton/kernels/_common.py.jinja" as common with context %}
+{% import "triton/kernels/_producer_consumer.py.jinja" as phases with context %}
+{% set packed = model.get("PackedN", false) %}
+{% set ctx = qkv_parallel_linear_context(model, packed=packed) %}
+# generated from PyNTT algorithm triton.qkv_parallel_linear/mma
+# {{ model["Comment"] }}; input_dtype={{ model["InputDType"] }}, weight_dtype={{ model["WeightDType"] }}, output_dtype={{ model["OutputDType"] }}, input_shape={{ shape_tuple(model["InputShape"]) }}, q_weight_shape={{ shape_tuple(model["QWeightShape"]) }}, k_weight_shape={{ shape_tuple(model["KWeightShape"]) }}, v_weight_shape={{ shape_tuple(model["VWeightShape"]) }}, q_output_shape={{ shape_tuple(model["QOutputShape"]) }}, k_output_shape={{ shape_tuple(model["KOutputShape"]) }}, v_output_shape={{ shape_tuple(model["VOutputShape"]) }}{{ ", n_packed_lane=" ~ model["NPackedLaneCount"] ~ ", n_lane=" ~ model["NVectorLaneCount"] ~ ", n_scalar_lane=" ~ (model["NPackedLaneCount"] * model["NVectorLaneCount"]) if packed else "" }}
+{{ phases.consumer_header(model) }}
+    shard_index = tl.program_id(0).to(tl.int64)
+{{ common.matrix_shared_aliases(ctx, model["InputTritonDType"], model["WeightTritonDType"], [ctx["block_m"], ctx["block_k"]], [ctx["block_k"], ctx["block_n"]], true) }}
+{% set pointer_keys = ("Input", "QWeight", "KWeight", "VWeight", "QBias", "KBias", "VBias", "QOutput", "KOutput", "VOutput") %}
+{% set pointers = namespace(values=[]) %}
+{% for key in pointer_keys %}{% do pointers.values.append(model[key]) %}{% endfor %}
+{{ common.shard_coordinates(pointers.values) }}
+{% for name, key in (("input0", "Input"), ("q_weight", "QWeight"), ("k_weight", "KWeight"), ("v_weight", "VWeight"), ("q_bias", "QBias"), ("k_bias", "KBias"), ("v_bias", "VBias"), ("q_output", "QOutput"), ("k_output", "KOutput"), ("v_output", "VOutput")) %}
+    {{ name }} = {{ ptr(model, key) }}
+{% endfor %}
+{% if packed %}
+    tmp_shard = shard_index
+{% for axis in reverse_indices(model["Hierarchy"]) %}
+    shard_coord{{ axis }} = tmp_shard % {{ model["Hierarchy"][axis] }}
+    tmp_shard = tmp_shard // {{ model["Hierarchy"][axis] }}
+{% endfor %}
+{% endif %}
+{% for axis in ctx["batch_axes"] %}
+{{ "    " * loop.index }}for idx{{ axis }} in tl.range(0, {{ dim(ctx["logical_output_shapes"]["Q"][axis]) }}):
+{% endfor %}
+{% set base = "    " * ((ctx["batch_axes"] | length) + 1) %}
+{{ base }}for m_start in tl.range(0, {{ dim(ctx["m"]) }}, {{ ctx["block_m"] }}):
+{{ base }}    offs_m = m_start + tl.arange(0, {{ ctx["block_m"] }})
+{% set projection_base = base ~ "    " %}
+{% for projection in ctx["projections"] %}
+{{ projection_base }}for {{ projection["lower"] }}_n_start in tl.range(0, {{ dim(projection["physical_n"]) }}, {{ projection["physical_block_n"] }}):
+{{ common.structured_axis(projection["weight_n_axis"], projection_base ~ "    ") }}
+{{ common.structured_axis(projection["output_n_axis"], projection_base ~ "    ") }}
+{{ projection_base }}    acc = tl.zeros(({{ ctx["block_m"] }}, {{ ctx["block_n"] }}), tl.float32)
+{{ projection_base }}    for k_start in tl.range(0, {{ dim(ctx["k"]) }}, {{ ctx["block_k"] }}):
+{{ projection_base }}        offs_k = k_start + tl.arange(0, {{ ctx["block_k"] }})
+{{ projection_base }}        weight_values = tl.reshape(tl.load({{ access_pointer(model, projection["prefix"] ~ "Weight", projection["lower"] ~ "_weight", projection["weight_access"]) }}, mask={{ projection["weight_mask"] }}, other=0.0), {{ projection["weight_matrix_shape"] }})
+{{ projection_base }}        input_values = tl.load({{ access_pointer(model, "Input", "input0", projection["input_access"]) }}, mask={{ projection["input_mask"] }}, other=0.0)
+{{ projection_base }}        acc += tl.dot(input_values, weight_values{{ ctx["dot_precision"] }})
+{% if projection["has_bias"] %}
+{{ projection_base }}    bias_values = tl.reshape(tl.load({{ access_pointer(model, projection["prefix"] ~ "Bias", projection["lower"] ~ "_bias", projection["bias_access"]) }}, mask={{ projection["bias_mask"] }}, other=0.0), ({{ ctx["block_n"] }},)).to(tl.float32)
+{{ projection_base }}    acc += bias_values[None, :]
+{% endif %}
+{{ projection_base }}    tl.store({{ access_pointer(model, projection["prefix"] ~ "Output", projection["lower"] ~ "_output", projection["output_access"]) }}, tl.reshape(acc, {{ projection["output_structured_shape"] }}), mask={{ projection["output_mask"] }})
+{% endfor %}
+
+
+{{ phases.dispatch(model) }}

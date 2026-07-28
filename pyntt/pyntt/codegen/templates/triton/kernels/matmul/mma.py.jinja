@@ -1,0 +1,45 @@
+{% import "triton/kernels/_common.py.jinja" as common with context %}
+{% import "triton/kernels/_producer_consumer.py.jinja" as phases with context %}
+{% set ctx = matmul_context(model, gemv=false) %}
+# generated from PyNTT algorithm triton.matmul/mma
+# {{ model["Comment"] }}; lhs_dtype={{ model["LhsDType"] }}, rhs_dtype={{ model["RhsDType"] }}, output_dtype={{ model["OutputDType"] }}, lhs_shape={{ shape_tuple(model["LhsShape"]) }}, rhs_shape={{ shape_tuple(model["RhsShape"]) }}, output_shape={{ shape_tuple(model["OutputShape"]) }}, rhs_layout={{ ctx["rhs_layout"] }}, rhs_n_packed_lane={{ model.get("RhsNPackedLaneCount", 1) }}, rhs_n_lane={{ model["RhsNVectorLaneCount"] }}, rhs_k_pack={{ model.get("RhsKPackLaneCount", 1) }}, rhs_k_lane={{ model.get("RhsKVectorLaneCount", 1) }}, output_n_packed_lane={{ model.get("OutputNPackedLaneCount", 1) }}, output_n_lane={{ model["OutputNVectorLaneCount"] }}, load_c={{ ctx["load_c_expression"] }}
+{{ phases.consumer_header(model) }}
+    shard_index = tl.program_id(0).to(tl.int64)
+{{ common.matrix_shared_aliases(ctx, model["LhsTritonDType"], model["RhsTritonDType"], [ctx["block_m"], ctx["block_k"]], [ctx["block_k"], ctx["block_n"]], true) }}
+{{ common.shard_coordinates([model["Lhs"], model["Rhs"], model["Output"]]) }}
+{% for name, key in (("lhs", "Lhs"), ("rhs", "Rhs"), ("output", "Output")) %}
+    {{ name }} = {{ ptr(model, key) }}
+{% endfor %}
+    tmp_shard = shard_index
+{% for axis in reverse_indices(model["Hierarchy"]) %}
+    shard_coord{{ axis }} = tmp_shard % {{ model["Hierarchy"][axis] }}
+    tmp_shard = tmp_shard // {{ model["Hierarchy"][axis] }}
+{% endfor %}
+{% for axis in ctx["batch_axes"] %}
+{{ "    " * loop.index }}for idx{{ axis }} in tl.range(0, {{ dim(ctx["logical_output_shape"][axis]) }}):
+{% endfor %}
+{% set base = "    " * ((ctx["batch_axes"] | length) + 1) %}
+{{ base }}for m_start in tl.range(0, {{ dim(ctx["m"]) }}, {{ ctx["block_m"] }}):
+{{ base }}    offs_m = m_start + tl.arange(0, {{ ctx["block_m"] }})
+{{ base }}    for n_start in tl.range(0, {{ dim(ctx["physical_n"]) }}, {{ ctx["physical_block_n"] }}):
+{{ common.structured_axis(ctx["rhs_n_axis"], base ~ "        ") }}
+{{ common.structured_axis(ctx["output_n_axis"], base ~ "        ") }}
+{{ base }}        acc = tl.zeros(({{ ctx["block_m"] }}, {{ ctx["block_n"] }}), tl.float32)
+{{ base }}        for k_start in tl.range(0, {{ dim(ctx["k"]) }}, {{ ctx["block_k"] }}):
+{{ base }}            offs_k = k_start + tl.arange(0, {{ ctx["block_k"] }})
+{{ base }}            rhs_values = tl.reshape(tl.load({{ access_pointer(model, "Rhs", "rhs", ctx["rhs_access"]) }}, mask={{ ctx["rhs_mask"] }}, other=0.0), {{ ctx["rhs_matrix_shape"] }})
+{{ base }}            lhs_values = tl.load({{ access_pointer(model, "Lhs", "lhs", ctx["lhs_access"]) }}, mask={{ ctx["lhs_mask"] }}, other=0.0)
+{{ base }}            acc += tl.dot(lhs_values, rhs_values{{ ctx["dot_precision"] }})
+{{ base }}        result = acc * {{ model["Scale"] }}
+{% if ctx["load_c"] %}
+{{ base }}        previous = tl.reshape(tl.load({{ access_pointer(model, "Output", "output", ctx["output_access"]) }}, mask=({{ ctx["output_mask"] }}) & ({{ ctx["load_c_predicate"] }}), other=0.0), ({{ ctx["block_m"] }}, {{ ctx["block_n"] }})).to(tl.float32)
+{% if ctx["load_c_predicate"] == "True" %}
+{{ base }}        result = previous + result
+{% else %}
+{{ base }}        result = tl.where({{ ctx["load_c_predicate"] }}, previous + result, result)
+{% endif %}
+{% endif %}
+{{ base }}        tl.store({{ access_pointer(model, "Output", "output", ctx["output_access"]) }}, tl.reshape(result, {{ ctx["output_structured_shape"] }}), mask={{ ctx["output_mask"] }})
+
+
+{{ phases.dispatch(model) }}

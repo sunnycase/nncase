@@ -364,11 +364,7 @@ PYBIND11_MODULE(_nncase, m) {
       .def_property(
         "OutputDirectory",
         []() {},
-        py::overload_cast<std::string_view>(&pyntt_target_options::output_directory))
-      .def_property(
-        "Strict",
-        []() {},
-        py::overload_cast<bool>(&pyntt_target_options::strict)) ;
+        py::overload_cast<std::string_view>(&pyntt_target_options::output_directory)) ;
 
     /* end the auto generated block by tools/stackvm_gen/CApiGen at 12/20/2024 3:41:05 PM +08:00. */
     // clang-format on

@@ -89,6 +89,7 @@ public sealed class SchedFunctionResult
         DataUsage = 0;
         ChipLocalDataPoolSize = 0;
         BlockLocalDataPoolSize = 0;
+        SharedDataPoolSize = 0;
         IsScheduled = false;
     }
 
@@ -123,9 +124,19 @@ public sealed class SchedFunctionResult
     public ulong BlockLocalDataPoolSize { get; set; }
 
     /// <summary>
+    /// Gets or sets the target block shared-memory pool length.
+    /// </summary>
+    public ulong SharedDataPoolSize { get; set; }
+
+    /// <summary>
     /// Gets or sets the data section align.
     /// </summary>
     public ulong DataAlign { get; set; } = 8;
+
+    /// <summary>
+    /// Gets or sets the target block shared-memory pool alignment.
+    /// </summary>
+    public ulong SharedDataAlign { get; set; } = 8;
 
     public ulong OutputUsage { get; set; }
 
@@ -162,7 +173,9 @@ public sealed class SchedFunctionResult
                 EqualityComparer<ulong>.Default.Equals(DataUsage, result.DataUsage) &&
                 EqualityComparer<ulong>.Default.Equals(ChipLocalDataPoolSize, result.ChipLocalDataPoolSize) &&
                 EqualityComparer<ulong>.Default.Equals(BlockLocalDataPoolSize, result.BlockLocalDataPoolSize) &&
-                EqualityComparer<ulong>.Default.Equals(DataAlign, result.DataAlign);
+                EqualityComparer<ulong>.Default.Equals(SharedDataPoolSize, result.SharedDataPoolSize) &&
+                EqualityComparer<ulong>.Default.Equals(DataAlign, result.DataAlign) &&
+                EqualityComparer<ulong>.Default.Equals(SharedDataAlign, result.SharedDataAlign);
     }
 
     /// <inheritdoc/>

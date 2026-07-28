@@ -1,16 +1,14 @@
 {% import "triton/kernels/_common.py.jinja" as common with context %}
 {% import "triton/kernels/_elementwise.py.jinja" as elementwise with context %}
+{% import "triton/kernels/_producer_consumer.py.jinja" as phases with context %}
 {% set ctx = gather_context(model) %}
 # generated from PyNTT Jinja Gather.py.jinja
 # {{ model["Comment"] }}; input_dtype={{ model["InputDType"] }}, index_dtype={{ model["IndexDType"] }}, output_dtype={{ model["OutputDType"] }}, input_shape={{ shape_tuple(model["InputShape"]) }}, output_shape={{ shape_tuple(model["OutputShape"]) }}, axis={{ model["Axis"] }}
-{{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
-def {{ model["FunctionName"] }}({{ helper_parameters(model) }}):
+{{ phases.consumer_header(model) }}
     shard_index = tl.program_id(0).to(tl.int64)
 {{ common.shard_coordinates([model["Input"], model["Index"], model["Output"]]) }}
 {% for name, key in (("input", "Input"), ("index", "Index"), ("output", "Output")) %}
-{% if local_buffer(model[key]) is none %}
     {{ name }} = {{ ptr(model, key) }}
-{% endif %}
 {% endfor %}
     tmp_shard = shard_index
 {% for axis in reverse_indices(model["Hierarchy"]) %}
@@ -35,3 +33,6 @@ def {{ model["FunctionName"] }}({{ helper_parameters(model) }}):
 {{ indent }}value = tl.load({{ access_pointer(model, "Input", "input", ctx["input_access"]) }}, mask=mask & input_active, other=0.0)
 {{ indent }}tl.store({{ access_pointer(model, "Output", "output", ctx["output_access"]) }}, value, mask=mask)
 {% endcall %}
+
+
+{{ phases.dispatch(model) }}

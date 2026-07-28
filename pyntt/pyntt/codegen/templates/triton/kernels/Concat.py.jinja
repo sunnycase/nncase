@@ -1,19 +1,15 @@
 {% import "triton/kernels/_common.py.jinja" as common with context %}
+{% import "triton/kernels/_producer_consumer.py.jinja" as phases with context %}
 {% set ctx = concat_context(model) %}
 # generated from PyNTT Jinja Concat.py.jinja
 # {{ model["Comment"] }}; dtype={{ model["OutputDType"] }}, axis={{ model["Axis"] }}, output_shape={{ shape_tuple(model["OutputShape"]) }}
-{{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
-def {{ model["FunctionName"] }}({{ helper_parameters(model) }}):
+{{ phases.consumer_header(model) }}
     shard_index = tl.program_id(0).to(tl.int64)
 {{ common.shard_coordinates(ctx["pointer_values"]) }}
 {% for entry in ctx["entries"] %}
-{% if local_buffer(model["Inputs"][entry["index"]]) is none %}
     input{{ entry["index"] }} = {{ entry["input_expression"] }}
-{% endif %}
 {% endfor %}
-{% if local_buffer(model["Output"]) is none %}
     output = {{ ptr(model, "Output") }}
-{% endif %}
 {% for entry in ctx["entries"] %}
 {% if not loop.first %}
 
@@ -32,3 +28,6 @@ def {{ model["FunctionName"] }}({{ helper_parameters(model) }}):
 {{ body }}value = tl.load({{ access_pointer_value(model["Inputs"][entry["index"]], "input" ~ entry["index"], "input_offsets") }}, mask=mask)
 {{ body }}tl.store({{ access_pointer(model, "Output", "output", "output_offsets") }}, value, mask=mask)
 {% endfor %}
+
+
+{{ phases.dispatch(model) }}

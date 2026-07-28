@@ -155,18 +155,15 @@ internal sealed class PyNTTDimExpressionEmitter : ExprFunctor<PyNTTDimExpression
     private readonly Action<string>? _registerRuntimeScalar;
     private readonly Func<string, string> _formatRuntimeScalar;
     private readonly string _threadIdExpression;
-    private readonly Func<DimVar, PyNTTDimExpression?>? _resolveDimVar;
 
     public PyNTTDimExpressionEmitter(
         Action<string>? registerRuntimeScalar = null,
         Func<string, string>? formatRuntimeScalar = null,
-        string? threadIdExpression = null,
-        Func<DimVar, PyNTTDimExpression?>? resolveDimVar = null)
+        string? threadIdExpression = null)
     {
         _registerRuntimeScalar = registerRuntimeScalar;
         _formatRuntimeScalar = formatRuntimeScalar ?? (name => name);
         _threadIdExpression = threadIdExpression ?? "pyntt_thread_id";
-        _resolveDimVar = resolveDimVar;
     }
 
     public PyNTTDimExpression Emit(Dimension dimension)
@@ -315,21 +312,6 @@ internal sealed class PyNTTDimExpressionEmitter : ExprFunctor<PyNTTDimExpression
         var name = SanitizePythonIdentifier(expr.Name);
         _registerRuntimeScalar?.Invoke(name);
         var formattedName = _formatRuntimeScalar(name);
-        if (_resolveDimVar?.Invoke(expr) is { } resolved)
-        {
-            if (resolved.FixedValue is { } fixedValue)
-            {
-                return Const(fixedValue);
-            }
-
-            return resolved with
-            {
-                PythonExpression = formattedName,
-                TritonExpression = formattedName,
-                Equivalence = PyNTTDimEquivalence.FromAtom(formattedName),
-            };
-        }
-
         return WithRangeFromMetadata(
             new PyNTTDimExpression(formattedName, formattedName)
             {

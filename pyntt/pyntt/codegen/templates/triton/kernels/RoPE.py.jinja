@@ -1,16 +1,14 @@
 {% import "triton/kernels/_common.py.jinja" as common with context %}
 {% import "triton/kernels/_elementwise.py.jinja" as elementwise with context %}
+{% import "triton/kernels/_producer_consumer.py.jinja" as phases with context %}
 {% set ctx = rope_context(model) %}
 # generated from PyNTT Jinja RoPE.py.jinja
 # {{ model["Comment"] }}; input_dtype={{ model["InputDType"] }}, cos_dtype={{ model["CosDType"] }}, sin_dtype={{ model["SinDType"] }}, output_dtype={{ model["OutputDType"] }}, shape={{ shape_tuple(model["OutputShape"]) }}, rotary_axis={{ ctx["rotary_axis"] }}
-{{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
-def {{ model["FunctionName"] }}({{ helper_parameters(model) }}):
+{{ phases.consumer_header(model) }}
     shard_index = tl.program_id(0).to(tl.int64)
 {{ common.shard_coordinates([model["Input"], model["Cos"], model["Sin"], model["Output"]]) }}
 {% for name, key in (("input0", "Input"), ("cos0", "Cos"), ("sin0", "Sin"), ("output", "Output")) %}
-{% if local_buffer(model[key]) is none %}
     {{ name }} = {{ ptr(model, key) }}
-{% endif %}
 {% endfor %}
 {% call(indent) elementwise.iterate(ctx) %}
 {{ indent }}mask = mask & ({{ ctx["output_physical_rotary"] }} < {{ dim(ctx["output_rotary_extent"]) }})
@@ -23,3 +21,6 @@ def {{ model["FunctionName"] }}({{ helper_parameters(model) }}):
 {{ indent }}result = value0 * cos_value + rotated * sin_value
 {{ indent }}tl.store({{ access_pointer(model, "Output", "output", ctx["output_access"]) }}, result, mask=mask)
 {% endcall %}
+
+
+{{ phases.dispatch(model) }}

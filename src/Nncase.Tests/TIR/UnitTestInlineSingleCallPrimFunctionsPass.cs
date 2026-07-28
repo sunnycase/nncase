@@ -497,6 +497,83 @@ public sealed class UnitTestInlineSingleCallPrimFunctionsPass : TestClassBase
     }
 
     [Fact]
+    public async Task TestSpecializePrimFunctionBufferLayoutUpdatesDerivedBitcastView()
+    {
+        var placement = new Placement([2], "b", "b");
+        var packedType = new TensorType(
+            new VectorType(DataTypes.BFloat16, [8]),
+            new[] { 4, 8 });
+        var packedDistributedType = new DistributedType(
+            packedType,
+            new SBP[] { SBP.B, SBP.S([0], 4) },
+            placement);
+        var scalarDistributedType = new DistributedType(
+            new TensorType(DataTypes.BFloat16, new[] { 4, 64 }),
+            new SBP[] { SBP.B, SBP.S([0], 32) },
+            placement);
+        var formal = new BufferVar(
+            "formal",
+            packedDistributedType,
+            BufferVarRole.Input,
+            MemoryLocation.Input);
+        var formalBuffer = T.AttachBuffer(
+            formal,
+            packedType,
+            MemoryLocation.Input,
+            0,
+            out _,
+            "formal_buffer",
+            packedDistributedType);
+        Assert.True(IR.Affine.BufferViewUtility.TryCreate(
+            packedDistributedType,
+            scalarDistributedType,
+            out var transform));
+        var scalarView = IR.Affine.BufferViewUtility.CreateLogicalBufferView(
+            formalBuffer,
+            scalarDistributedType,
+            transform,
+            "scalar_view");
+        Assert.Equal(new long[] { 32, 1 }, scalarView.Strides.ToArray().Select(stride => stride.FixedValue));
+        var callee = new PrimFunction(
+            "callee",
+            ModuleKind,
+            new Sequential(new Call(new LoadT(), scalarView, scalarView)),
+            new IVar[] { formal });
+        var actual = new Buffer(
+            "actual",
+            packedType.DType,
+            new MemSpan(new PhysicalBuffer(packedType.DType.SizeInBytes, 512, MemoryLocation.ChipLocalRdata)),
+            ((RankedShape)packedType.Shape).Dimensions.ToArray(),
+            new Dimension[] { 8, 1 },
+            packedDistributedType);
+        var caller = new PrimFunction(
+            "caller",
+            ModuleKind,
+            new Sequential(new Call(callee, actual)),
+            System.Array.Empty<IVar>());
+        var module = new IRModule(caller);
+        module.Add(callee);
+
+        var specializedModule = await new SpecializePrimFunctionBufferLayoutsPass().RunAsync(module, new());
+
+        var specializedCallee = specializedModule.Functions
+            .OfType<PrimFunction>()
+            .Single(function => function.Name == "callee");
+        var specializedParameter = Assert.IsType<BufferVar>(Assert.Single(specializedCallee.Parameters.ToArray()));
+        Assert.Equal(new long[] { 8, 1 }, specializedParameter.LayoutAnnotation.Strides
+            .ToArray()
+            .Select(stride => stride.FixedValue));
+        var specializedScalarView = ExprCollector.Collect(specializedCallee.Body)
+            .OfType<Buffer>()
+            .Single(buffer => buffer.ElemType.Equals(DataTypes.BFloat16));
+        Assert.Equal(new long[] { 64, 1 }, specializedScalarView.Strides
+            .ToArray()
+            .Select(stride => stride.FixedValue));
+        Assert.Equal(448L, specializedScalarView.MemSpan.Size.FixedValue);
+        Assert.Equal(448L, specializedScalarView.MemSpan.Buffer.Size.FixedValue);
+    }
+
+    [Fact]
     public async Task TestSpecializePrimFunctionBufferLayoutCreatesDistinctVariants()
     {
         var tensorType = new TensorType(DataTypes.Float32, new[] { 4 });

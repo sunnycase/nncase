@@ -17,6 +17,9 @@ namespace Nncase.TIR.F;
 
 public partial class NTT
 {
+    private static Call KernelCall(NTTKernelOp op, params BaseExpr[] arguments)
+        => op.CreateCall(arguments);
+
     /// <summary>
     /// the ptr of can create the *PtrName in the c code.
     /// </summary>
@@ -29,42 +32,49 @@ public partial class NTT
 
     public static Call TensorLoad(Expr dest, Expr src, IRArray<SBP> ndsbp, Placement placement)
     {
-        return new Call(new TensorLoad(ndsbp, placement), dest, src);
+        return KernelCall(new TensorLoad(ndsbp, placement), dest, src);
     }
 
     public static Call TensorStore(Expr src, Expr dest, IRArray<SBP> ndsbp, Placement placement)
     {
-        return new Call(new TensorStore(ndsbp, placement), src, dest);
+        return KernelCall(new TensorStore(ndsbp, placement), src, dest);
     }
 
     public static Call Unary(UnaryOp unaryOp, Expr input, Expr output)
     {
-        return new Call(new TIR.NTT.Unary(unaryOp), input, output);
+        return KernelCall(new TIR.NTT.Unary(unaryOp), input, output);
     }
 
     public static Call Reshape(Expr input, Expr output)
     {
-        return new Call(new TIR.NTT.Reshape(), input, output);
+        return KernelCall(new TIR.NTT.Reshape(), input, output);
     }
 
     public static Call Bitcast(Expr input, Expr output)
     {
-        return new Call(new TIR.NTT.Bitcast(), input, output);
+        return KernelCall(new TIR.NTT.Bitcast(), input, output);
     }
 
     public static Call Matmul(Expr lhs, Expr rhs, Expr output, Expr loadC, Expr scale, Expr extra, IRArray<int> lhsVectorizedAxes, IRArray<int> rhsVectorizedAxes, bool transA = false, bool transB = false, bool fusedReduce = false, string cSourcePath = "", string funcName = "")
     {
-        return new Call(new Matmul(lhsVectorizedAxes, rhsVectorizedAxes, transA, transB, fusedReduce, cSourcePath, funcName), lhs, rhs, output, loadC, scale, extra);
+        return KernelCall(new Matmul(lhsVectorizedAxes, rhsVectorizedAxes, transA, transB, fusedReduce, cSourcePath, funcName), lhs, rhs, output, loadC, scale, extra);
     }
 
     public static Call Matmul(Expr lhs, Expr rhs, Expr output, Expr loadC, Expr scale)
     {
-        return new Call(new Matmul(new IRArray<int>(), new IRArray<int>(), false, false, false, null, null), lhs, rhs, output, loadC, scale, None.Default);
+        return KernelCall(new Matmul(new IRArray<int>(), new IRArray<int>(), false, false, false, null, null), lhs, rhs, output, loadC, scale, None.Default);
     }
 
-    public static Call PackedMatMul(Expr lhs, Expr rhs, Expr output, Expr loadC, Expr scale, bool fusedReduce = false)
+    public static Call PackedMatMul(
+        Expr lhs,
+        Expr rhs,
+        Expr output,
+        Expr loadC,
+        Expr scale,
+        bool fusedReduce = false,
+        IR.NTT.PackedMatMulRhsLayout rhsLayout = IR.NTT.PackedMatMulRhsLayout.NMajor)
     {
-        return new Call(new PackedMatMul(fusedReduce), lhs, rhs, output, loadC, scale);
+        return KernelCall(new PackedMatMul(fusedReduce, rhsLayout), lhs, rhs, output, loadC, scale);
     }
 
     public static Call QKVParallelLinear(
@@ -87,7 +97,7 @@ public partial class NTT
         long numHeads,
         long numKvHeads)
     {
-        return new Call(
+        return KernelCall(
             new QKVParallelLinear(numHeads, numKvHeads),
             input,
             qWeight,
@@ -127,7 +137,7 @@ public partial class NTT
         long numHeads,
         long numKvHeads)
     {
-        return new Call(
+        return KernelCall(
             new PackedQKVParallelLinear(numHeads, numKvHeads),
             input,
             qWeight,
@@ -160,7 +170,7 @@ public partial class NTT
         Expr output,
         IR.NN.GluType gluType)
     {
-        return new Call(
+        return KernelCall(
             new MatMulGlu(gluType),
             input,
             gateWeight,
@@ -187,7 +197,7 @@ public partial class NTT
         Expr output,
         IR.NN.GluType gluType)
     {
-        return new Call(
+        return KernelCall(
             new PackedMatMulGlu(gluType),
             input,
             gateWeight,
@@ -203,238 +213,238 @@ public partial class NTT
 
     public static Call SUMMA(Expr lhs, Expr rhs, Expr output, Expr loadC, Expr scale, IRArray<int> lhsVectorizedAxes, IRArray<int> rhsVectorizedAxes, bool transA = false, bool transB = false)
     {
-        return new Call(new SUMMA(lhsVectorizedAxes, rhsVectorizedAxes, transA, transB), lhs, rhs, output, loadC, scale);
+        return KernelCall(new SUMMA(lhsVectorizedAxes, rhsVectorizedAxes, transA, transB), lhs, rhs, output, loadC, scale);
     }
 
     public static Call SUMMA(Expr lhs, Expr rhs, Expr output, Expr loadC, Expr scale)
     {
-        return new Call(new SUMMA(new IRArray<int>(), new IRArray<int>(), false, false), lhs, rhs, output, loadC, scale);
+        return KernelCall(new SUMMA(new IRArray<int>(), new IRArray<int>(), false, false), lhs, rhs, output, loadC, scale);
     }
 
     public static Expr Pack(Expr input, Expr output, IRArray<int> lanes, IRArray<int> axes)
     {
-        return new Call(new Pack(lanes, axes), input, output);
+        return KernelCall(new Pack(lanes, axes), input, output);
     }
 
-    public static Call Conv2D(Expr input, Expr weights, Expr bias, Expr output, long[] stride, long[] padding, long[] dilation, long groups, PadMode padMode, DistributedType distributedType) => new Call(new Conv2D(stride, padding, dilation, groups, padMode, distributedType), input, weights, bias, output);
+    public static Call Conv2D(Expr input, Expr weights, Expr bias, Expr output, long[] stride, long[] padding, long[] dilation, long groups, PadMode padMode, DistributedType distributedType) => KernelCall(new Conv2D(stride, padding, dilation, groups, padMode, distributedType), input, weights, bias, output);
 
     public static Expr Unpack(Expr input, Expr output, IRArray<int> lanes, IRArray<int> axes)
     {
-        return new Call(new Unpack(lanes, axes), input, output);
+        return KernelCall(new Unpack(lanes, axes), input, output);
     }
 
     public static Expr VectorizedSoftmax(Expr input, Expr output, int axis, IRArray<int> vectorizedAxes)
     {
-        return new Call(new VectorizedSoftmax(axis, vectorizedAxes), input, output);
+        return KernelCall(new VectorizedSoftmax(axis, vectorizedAxes), input, output);
     }
 
     public static Expr VectorizedLayerNorm(Expr input, Expr scale, Expr bias, Expr output, int axis, float epsilon, bool usemean, IRArray<int> vectorizedAxes, IRArray<Dimension> padedNums, string cSourcePath = "", string funcName = "")
     {
-        return new Call(new VectorizedLayerNorm(axis, epsilon, usemean, vectorizedAxes, padedNums, null!, cSourcePath, funcName), input, scale, bias, None.Default, output);
+        return KernelCall(new VectorizedLayerNorm(axis, epsilon, usemean, vectorizedAxes, padedNums, null!, cSourcePath, funcName), input, scale, bias, None.Default, output);
     }
 
     public static Expr VectorizedLayerNorm(Expr input, Expr scale, Expr bias, Expr output, int axis, float epsilon, bool usemean, IRArray<int> vectorizedAxes, IRArray<Dimension> padedNums, Expr postScale, string cSourcePath = "", string funcName = "")
     {
-        return new Call(new VectorizedLayerNorm(axis, epsilon, usemean, vectorizedAxes, padedNums, null!, cSourcePath, funcName), input, scale, bias, postScale, output);
+        return KernelCall(new VectorizedLayerNorm(axis, epsilon, usemean, vectorizedAxes, padedNums, null!, cSourcePath, funcName), input, scale, bias, postScale, output);
     }
 
     public static Expr NormStats(Expr input, Expr output, int axis, bool useMean)
     {
-        return new Call(new NormStats(axis, useMean), input, output);
+        return KernelCall(new NormStats(axis, useMean), input, output);
     }
 
     public static Expr NormApply(Expr input, Expr stats, Expr scale, Expr bias, Expr output, int axis, float epsilon, bool useMean)
     {
-        return new Call(new NormApply(axis, epsilon, useMean), input, stats, scale, bias, output);
+        return KernelCall(new NormApply(axis, epsilon, useMean), input, stats, scale, bias, output);
     }
 
     public static Expr InstanceNorm(Expr input, Expr scale, Expr bias, Expr output, float epsilon, IRArray<int> vectorizedAxes, IRArray<Dimension> padedNums, DistributedType distributedType)
     {
-        return new Call(new InstanceNorm(epsilon, vectorizedAxes, padedNums, distributedType), input, scale, bias, output);
+        return KernelCall(new InstanceNorm(epsilon, vectorizedAxes, padedNums, distributedType), input, scale, bias, output);
     }
 
     public static Expr VectorizedBinary(Expr lhs, Expr rhs, Expr output, BaseExpr postOps, BinaryOp binaryOp, IRArray<int>? lhsVectorizedAxes = null, IRArray<Dimension>? lhsPadedNums = null, IRArray<int>? rhsVectorizedAxes = null, IRArray<Dimension>? rhsPadedNums = null)
     {
-        return new Call(new VectorizedBinary(binaryOp, lhsVectorizedAxes ?? Array.Empty<int>(), lhsPadedNums ?? Array.Empty<Dimension>(), rhsVectorizedAxes ?? Array.Empty<int>(), rhsPadedNums ?? Array.Empty<Dimension>()), lhs, rhs, output, postOps);
+        return KernelCall(new VectorizedBinary(binaryOp, lhsVectorizedAxes ?? Array.Empty<int>(), lhsPadedNums ?? Array.Empty<Dimension>(), rhsVectorizedAxes ?? Array.Empty<int>(), rhsPadedNums ?? Array.Empty<Dimension>()), lhs, rhs, output, postOps);
     }
 
     public static Call ResizeImage(Expr input, Expr output, int[] vectorizedAxes, Dimension[] padedNums, int[] newSize, ImageResizeMode resizeMode, ImageResizeTransformationMode transformationMode, ImageResizeNearestMode nearestMode)
     {
-        return new Call(new ResizeImage(vectorizedAxes, padedNums, newSize, resizeMode, transformationMode, nearestMode), input, output);
+        return KernelCall(new ResizeImage(vectorizedAxes, padedNums, newSize, resizeMode, transformationMode, nearestMode), input, output);
     }
 
     public static Expr Slice(Expr input, RankedShape begins, RankedShape ends, Expr ret, int[] axes, int[] strides)
     {
-        return new Call(new Slice(axes, strides), input, begins, ends, ret);
+        return KernelCall(new Slice(axes, strides), input, begins, ends, ret);
     }
 
     public static Expr Concat(Expr[] inputs, Expr ret, int axis)
     {
-        return new Call(new Concat(axis), inputs.Concat(new[] { ret }).ToArray());
+        return KernelCall(new Concat(axis), inputs.Concat(new[] { ret }).ToArray());
     }
 
     public static Expr PagedAttention(Expr q, Expr kvcache, Expr extra, Expr scale, Dimension layerId, Expr ret, IRArray<IR.NN.AttentionDimKind> layout, int hiddenSize)
     {
-        return new Call(new PagedAttention(layout, hiddenSize), q, kvcache, extra, scale, layerId, ret);
+        return KernelCall(new PagedAttention(layout, hiddenSize), q, kvcache, extra, scale, layerId, ret);
     }
 
     public static Expr UpdatePagedAttentionKVCache(Expr value, Expr kvcache, Dimension layerId, IR.NN.AttentionCacheKind kind, IRArray<IR.NN.AttentionDimKind> layout)
     {
-        return new Call(new UpdatePagedAttentionKVCache(kind, layout), value, kvcache, layerId);
+        return KernelCall(new UpdatePagedAttentionKVCache(kind, layout), value, kvcache, layerId);
     }
 
     public static Expr GatherPagedAttentionKVCache(Expr value, Expr kvcache, Expr output)
     {
-        return new Call(new GatherPagedAttentionKVCache(), value, kvcache, output);
+        return KernelCall(new GatherPagedAttentionKVCache(), value, kvcache, output);
     }
 
     public static Expr CreatePagedAttentionKVCache(IR.NN.PagedAttentionConfig config, Expr numSeqs, Expr numTokens, Expr contextLens, Expr seqLens, Expr blockTable, Expr slotMapping, Expr numBlocks, Expr kvCaches, Expr output)
     {
-        return new Call(new CreatePagedAttentionKVCache(config), numSeqs, numTokens, contextLens, seqLens, blockTable, slotMapping, numBlocks, kvCaches, output);
+        return KernelCall(new CreatePagedAttentionKVCache(config), numSeqs, numTokens, contextLens, seqLens, blockTable, slotMapping, numBlocks, kvCaches, output);
     }
 
     public static Expr IdentityPagedAttentionKVCache(Expr input, Expr numSeqs, Expr numTokens, Expr contextLens, Expr seqLens, Expr blockTable, Expr slotMapping, Expr numBlocks, Expr kvCaches)
     {
-        return new Call(new IdentityPagedAttentionKVCache(), input, numSeqs, numTokens, contextLens, seqLens, blockTable, slotMapping, numBlocks, kvCaches);
+        return KernelCall(new IdentityPagedAttentionKVCache(), input, numSeqs, numTokens, contextLens, seqLens, blockTable, slotMapping, numBlocks, kvCaches);
     }
 
     public static Expr Swish(Expr buffer, Expr ret, float v)
     {
-        return new Call(new Swish(v), buffer, ret);
+        return KernelCall(new Swish(v), buffer, ret);
     }
 
     public static Expr Gather(Expr input, Expr indcies, Expr ret, int axis)
     {
-        return new Call(new Gather(axis), input, indcies, ret);
+        return KernelCall(new Gather(axis), input, indcies, ret);
     }
 
     public static Expr GetItem(Expr input, BaseExpr index, Expr ret)
     {
-        return new Call(new GetItem(), input, index, ret);
+        return KernelCall(new GetItem(), input, index, ret);
     }
 
     public static Expr Transpose(Expr buffer, Expr ret, int[] perm)
     {
-        return new Call(new Transpose(perm), buffer, ret);
+        return KernelCall(new Transpose(perm), buffer, ret);
     }
 
     public static Expr Pad(Expr input, Expr ret, Paddings pads, float padValue, IRArray<int> actualPadAxes)
     {
-        return new Call(new Pad(padValue, actualPadAxes), input, pads, ret);
+        return KernelCall(new Pad(padValue, actualPadAxes), input, pads, ret);
     }
 
     public static Expr Im2col(Expr input, Expr output, IRArray<long> kernel, IRArray<int> stride, IRArray<int> padding, IRArray<int> vectorizedAxes, IRArray<int> padedNums)
     {
-        return new Call(new Im2col(kernel, stride, padding, vectorizedAxes, padedNums), input, output);
+        return KernelCall(new Im2col(kernel, stride, padding, vectorizedAxes, padedNums), input, output);
     }
 
     public static Expr Reduce(Expr input, Expr ret, Expr loadPrevious, int[] vectorizedAxes, Dimension[] padedNums, IRArray<int> axis, bool keepDims, ReduceOp reduceOp)
     {
-        return new Call(new TIR.NTT.Reduce(vectorizedAxes, padedNums, axis, keepDims, reduceOp), input, ret, loadPrevious);
+        return KernelCall(new TIR.NTT.Reduce(vectorizedAxes, padedNums, axis, keepDims, reduceOp), input, ret, loadPrevious);
     }
 
     public static Expr ReduceArg(Expr input, Expr ret, int axis, bool keepDims, bool selectLastIndex, ReduceArgOp reduceArgOp, DataType destType)
     {
-        return new Call(new TIR.NTT.ReduceArg(axis, keepDims, selectLastIndex, reduceArgOp, destType), input, ret);
+        return KernelCall(new TIR.NTT.ReduceArg(axis, keepDims, selectLastIndex, reduceArgOp, destType), input, ret);
     }
 
     public static Call RoPE(Expr input, Expr cos, Expr sin, Expr output)
     {
-        return new Call(new TIR.NTT.RoPE(), input, cos, sin, output);
+        return KernelCall(new TIR.NTT.RoPE(), input, cos, sin, output);
     }
 
     public static Call GatherReduceScatter(Expr input, Expr output, DistributedType inType, DistributedType outType)
     {
-        return new Call(new TIR.NTT.GatherReduceScatter(inType, outType), input, output);
+        return KernelCall(new TIR.NTT.GatherReduceScatter(inType, outType), input, output);
     }
 
     public static Call Clamp(Expr input, Expr output, float min, float max)
     {
-        return new Call(new TIR.NTT.Clamp(min, max), input, output);
+        return KernelCall(new TIR.NTT.Clamp(min, max), input, output);
     }
 
     public static Call Cast(Expr input, Expr output, DataType newType, CastMode castMode, IRArray<int> vectorizeAxes = default, Expr? postOps = null)
     {
-        return new Call(new TIR.NTT.Cast(newType, castMode, vectorizeAxes.IsDefaultOrEmpty ? Array.Empty<int>() : vectorizeAxes), input, output, postOps ?? None.Default);
+        return KernelCall(new TIR.NTT.Cast(newType, castMode, vectorizeAxes.IsDefaultOrEmpty ? Array.Empty<int>() : vectorizeAxes), input, output, postOps ?? None.Default);
     }
 
     public static Call SynchronizeThreads()
     {
-        return new Call(new TIR.NTT.SynchronizeThreads());
+        return KernelCall(new TIR.NTT.SynchronizeThreads());
     }
 
     public static Call Barrier(BarrierScope scope)
     {
-        return new Call(new TIR.NTT.Barrier(scope));
+        return KernelCall(new TIR.NTT.Barrier(scope));
     }
 
     public static Call Where(Expr cond, Expr x, Expr y, Expr output)
     {
-        return new Call(new TIR.NTT.Where(), cond, x, y, output);
+        return KernelCall(new TIR.NTT.Where(), cond, x, y, output);
     }
 
     public static Call Expand(Expr input, Expr output)
     {
-        return new Call(new TIR.NTT.Expand(), input, output);
+        return KernelCall(new TIR.NTT.Expand(), input, output);
     }
 
     public static Call Erf(Expr input, Expr output)
     {
-        return new Call(new TIR.NTT.Erf(), input, output);
+        return KernelCall(new TIR.NTT.Erf(), input, output);
     }
 
     public static Call Compare(CompareOp compareOp, Expr lhs, Expr rhs, Expr output)
     {
-        return new Call(new TIR.NTT.Compare(compareOp), lhs, rhs, output);
+        return KernelCall(new TIR.NTT.Compare(compareOp), lhs, rhs, output);
     }
 
     public static Call ScatterND(Expr input, Expr indices, Expr updates, Expr output)
     {
-        return new Call(new TIR.NTT.ScatterND(), input, indices, updates, output);
+        return KernelCall(new TIR.NTT.ScatterND(), input, indices, updates, output);
     }
 
     public static Expr Stack(Expr[] inputs, Expr ret, int axis)
     {
-        return new Call(new Stack(axis), inputs.Concat(new[] { ret }).ToArray());
+        return KernelCall(new Stack(axis), inputs.Concat(new[] { ret }).ToArray());
     }
 
     public static Expr ShapeOf(Expr inputs, Expr ret)
     {
-        return new Call(new TIR.NTT.ShapeOf(), inputs, ret);
+        return KernelCall(new TIR.NTT.ShapeOf(), inputs, ret);
     }
 
     public static Expr ConstantOfShape(Shape shape, Expr value, Expr ret)
     {
-        return new Call(new TIR.NTT.ConstantOfShape(), shape, value, ret);
+        return KernelCall(new TIR.NTT.ConstantOfShape(), shape, value, ret);
     }
 
     public static Expr Range(Expr begin, Expr end, Expr step, Expr ret)
     {
-        return new Call(new TIR.NTT.Range(), begin, end, step, ret);
+        return KernelCall(new TIR.NTT.Range(), begin, end, step, ret);
     }
 
     public static Expr GetPositionIds(Expr kvCache, Expr ret, DistributedType distributedType)
     {
-        return new Call(new TIR.NTT.GetPositionIds(distributedType), kvCache, ret);
+        return KernelCall(new TIR.NTT.GetPositionIds(distributedType), kvCache, ret);
     }
 
     public static Expr Qwen3MoE(Expr hiddenStates, Expr moeGateW, Expr moeExpertGateInputScale, Expr moeExpertGateProjW, Expr moeExpertGateProjScale, Expr moeExpertDownInputScale, Expr moeExpertDownProjW, Expr moeExpertDownProjScale, Expr moeExpertUpInputScale, Expr moeExpertUpProjW, Expr moeExpertUpProjScale, Expr ret, long layerId, long hiddenSize, long intermediateSize, long moeIntermediateSize, long numExpert, long numTopK, long isNormTopkProb)
     {
-        return new Call(new TIR.NTT.Qwen3MoE(layerId, hiddenSize, intermediateSize, moeIntermediateSize, numExpert, numTopK, isNormTopkProb), hiddenStates, moeGateW, moeExpertGateInputScale, moeExpertGateProjW, moeExpertGateProjScale, moeExpertDownInputScale, moeExpertDownProjW, moeExpertDownProjScale, moeExpertUpInputScale, moeExpertUpProjW, moeExpertUpProjScale, ret);
+        return KernelCall(new TIR.NTT.Qwen3MoE(layerId, hiddenSize, intermediateSize, moeIntermediateSize, numExpert, numTopK, isNormTopkProb), hiddenStates, moeGateW, moeExpertGateInputScale, moeExpertGateProjW, moeExpertGateProjScale, moeExpertDownInputScale, moeExpertDownProjW, moeExpertDownProjScale, moeExpertUpInputScale, moeExpertUpProjW, moeExpertUpProjScale, ret);
     }
 
     public static Expr SparseExperts(Expr q, Expr routerIdx, Expr routerWeights, Expr moeExpertGateInputScale, Expr moeExpertGateProjW, Expr moeExpertGateProjScale, Expr moeExpertDownInputScale, Expr moeExpertDownProjW, Expr moeExpertDownProjScale, Expr moeExpertUpInputScale, Expr moeExpertUpProjW, Expr moeExpertUpProjScale, Expr ret, long hiddenSize, long moeIntermediateSize, long numExpert, long numTopK, long chunkSize)
     {
-        return new Call(new TIR.NTT.SparseExperts(Array.Empty<int>(), Array.Empty<int>(), Array.Empty<int>(), Array.Empty<int>(), Array.Empty<SBP>(), Array.Empty<SBP>(), Array.Empty<SBP>(), Array.Empty<SBP>(), hiddenSize, moeIntermediateSize, numExpert, numTopK, chunkSize, null, string.Empty, string.Empty), q, routerIdx, routerWeights, moeExpertGateInputScale, moeExpertGateProjW, moeExpertGateProjScale, moeExpertDownInputScale, moeExpertDownProjW, moeExpertDownProjScale, moeExpertUpInputScale, moeExpertUpProjW, moeExpertUpProjScale, None.Default, ret);
+        return KernelCall(new TIR.NTT.SparseExperts(Array.Empty<int>(), Array.Empty<int>(), Array.Empty<int>(), Array.Empty<int>(), Array.Empty<SBP>(), Array.Empty<SBP>(), Array.Empty<SBP>(), Array.Empty<SBP>(), hiddenSize, moeIntermediateSize, numExpert, numTopK, chunkSize, null, string.Empty, string.Empty), q, routerIdx, routerWeights, moeExpertGateInputScale, moeExpertGateProjW, moeExpertGateProjScale, moeExpertDownInputScale, moeExpertDownProjW, moeExpertDownProjScale, moeExpertUpInputScale, moeExpertUpProjW, moeExpertUpProjScale, None.Default, ret);
     }
 
     public static Expr SparseExperts(Expr q, Expr routerIdx, Expr routerWeights, Expr moeExpertGateInputScale, Expr moeExpertGateProjW, Expr moeExpertGateProjScale, Expr moeExpertDownInputScale, Expr moeExpertDownProjW, Expr moeExpertDownProjScale, Expr moeExpertUpInputScale, Expr moeExpertUpProjW, Expr moeExpertUpProjScale, Expr extra, Expr ret, IRArray<int> qVectorizedAxes, IRArray<int> gateVectorizedAxes, IRArray<int> downVectorizedAxes, IRArray<int> upVectorizedAxes, IRArray<SBP> qSBPs, IRArray<SBP> gateSBPs, IRArray<SBP> downSBPs, IRArray<SBP> upSBPs, long hiddenSize, long moeIntermediateSize, long numExpert, long numTopK, long chunkSize, Cost costmodel, string cSourcePath = "", string funcName = "")
     {
-        return new Call(new TIR.NTT.SparseExperts(qVectorizedAxes, gateVectorizedAxes, downVectorizedAxes, upVectorizedAxes, qSBPs, gateSBPs, downSBPs, upSBPs, hiddenSize, moeIntermediateSize, numExpert, numTopK, chunkSize, costmodel, cSourcePath, funcName), q, routerIdx, routerWeights, moeExpertGateInputScale, moeExpertGateProjW, moeExpertGateProjScale, moeExpertDownInputScale, moeExpertDownProjW, moeExpertDownProjScale, moeExpertUpInputScale, moeExpertUpProjW, moeExpertUpProjScale, extra, ret);
+        return KernelCall(new TIR.NTT.SparseExperts(qVectorizedAxes, gateVectorizedAxes, downVectorizedAxes, upVectorizedAxes, qSBPs, gateSBPs, downSBPs, upSBPs, hiddenSize, moeIntermediateSize, numExpert, numTopK, chunkSize, costmodel, cSourcePath, funcName), q, routerIdx, routerWeights, moeExpertGateInputScale, moeExpertGateProjW, moeExpertGateProjScale, moeExpertDownInputScale, moeExpertDownProjW, moeExpertDownProjScale, moeExpertUpInputScale, moeExpertUpProjW, moeExpertUpProjScale, extra, ret);
     }
 
     public static Expr TopK(Expr x, Expr k, Expr output, long axis, long largest, long sorted)
     {
-        return new Call(new TIR.NTT.TopK(axis, largest, sorted), x, k, output);
+        return KernelCall(new TIR.NTT.TopK(axis, largest, sorted), x, k, output);
     }
 }

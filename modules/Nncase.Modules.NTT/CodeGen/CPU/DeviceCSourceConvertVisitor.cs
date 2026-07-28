@@ -349,7 +349,19 @@ public class DeviceCSourceConvertVisitor : CSourceConvertVisitor
         };
 
         string str = string.Empty;
-        var arguments = expr.Arguments.AsValueEnumerable().Select(Visit).ToArray();
+        var sourceArguments = expr.Arguments.ToArray();
+        if (expr.Target is TIR.NTT.NTTKernelOp kernelOp)
+        {
+            if (sourceArguments.Length == 0 || sourceArguments[^1] is not None)
+            {
+                throw new NotSupportedException(
+                    $"NTT CPU device kernel {kernelOp.GetType().Name} requires a None shared_workspace operand.");
+            }
+
+            sourceArguments = sourceArguments[..^1];
+        }
+
+        var arguments = sourceArguments.Select(Visit).ToArray();
         if (TryGetReductionState(expr, out var reductionState))
         {
             EmitReductionKernel(reductionState, arguments, ReductionKernelPhase.Accumulate);
@@ -445,7 +457,7 @@ public class DeviceCSourceConvertVisitor : CSourceConvertVisitor
                     throw new NotSupportedException($"NTT device TensorLoad expects (destination, source), got {arguments.Length} operands.");
                 }
 
-                EmitTensorRegionLoad(expr.Arguments[0], expr.Arguments[1]);
+                EmitTensorRegionLoad(sourceArguments[0], sourceArguments[1]);
                 break;
             case TIR.NTT.TensorStore:
                 if (arguments.Length != 2)
@@ -453,7 +465,7 @@ public class DeviceCSourceConvertVisitor : CSourceConvertVisitor
                     throw new NotSupportedException($"NTT device TensorStore expects (source, destination), got {arguments.Length} operands.");
                 }
 
-                EmitTensorRegionStore(expr.Arguments[0], expr.Arguments[1]);
+                EmitTensorRegionStore(sourceArguments[0], sourceArguments[1]);
                 break;
             case TIR.TileLoad:
                 WriteIndWithProfiler($"tensor_copy_sync({arguments[1].Name}, {arguments[0].Name});\n");
@@ -510,7 +522,7 @@ public class DeviceCSourceConvertVisitor : CSourceConvertVisitor
 
                 break;
             case TIR.NTT.QKVParallelLinear qkvParallelLinear:
-                ValidateQKVParallelLinearScales(expr.Arguments.ToArray());
+                ValidateQKVParallelLinearScales(sourceArguments);
                 IndentScope.Writer.Write(RazorTemplateEngine.RenderAsync("~/CodeGen/CPU/Templates/Kernels/QKVParallelLinear.cshtml", new TypedKernelTemplateModel<TIR.NTT.QKVParallelLinear>(qkvParallelLinear)
                 {
                     Arguments = arguments.Select(x => new KernelArgument { Symbol = x }).ToArray(),
@@ -519,7 +531,7 @@ public class DeviceCSourceConvertVisitor : CSourceConvertVisitor
 
                 break;
             case TIR.NTT.PackedQKVParallelLinear packedQKVParallelLinear:
-                ValidateQKVParallelLinearScales(expr.Arguments.ToArray());
+                ValidateQKVParallelLinearScales(sourceArguments);
                 IndentScope.Writer.Write(RazorTemplateEngine.RenderAsync("~/CodeGen/CPU/Templates/Kernels/PackedQKVParallelLinear.cshtml", new TypedKernelTemplateModel<TIR.NTT.PackedQKVParallelLinear>(packedQKVParallelLinear)
                 {
                     Arguments = arguments.Select(x => new KernelArgument { Symbol = x }).ToArray(),
@@ -528,7 +540,7 @@ public class DeviceCSourceConvertVisitor : CSourceConvertVisitor
 
                 break;
             case TIR.NTT.MatMulGlu matMulGlu:
-                ValidateMatMulGluScales(expr.Arguments.ToArray());
+                ValidateMatMulGluScales(sourceArguments);
                 IndentScope.Writer.Write(RazorTemplateEngine.RenderAsync("~/CodeGen/CPU/Templates/Kernels/MatMulGlu.cshtml", new TypedKernelTemplateModel<TIR.NTT.MatMulGlu>(matMulGlu)
                 {
                     Arguments = arguments.Select(x => new KernelArgument { Symbol = x }).ToArray(),
@@ -537,7 +549,7 @@ public class DeviceCSourceConvertVisitor : CSourceConvertVisitor
 
                 break;
             case TIR.NTT.PackedMatMulGlu packedMatMulGlu:
-                ValidateMatMulGluScales(expr.Arguments.ToArray());
+                ValidateMatMulGluScales(sourceArguments);
                 IndentScope.Writer.Write(RazorTemplateEngine.RenderAsync("~/CodeGen/CPU/Templates/Kernels/PackedMatMulGlu.cshtml", new TypedKernelTemplateModel<TIR.NTT.PackedMatMulGlu>(packedMatMulGlu)
                 {
                     Arguments = arguments.Select(x => new KernelArgument { Symbol = x }).ToArray(),
@@ -594,15 +606,15 @@ public class DeviceCSourceConvertVisitor : CSourceConvertVisitor
                     {
                         Arguments = arguments.Select(x => new KernelArgument { Symbol = x }).Concat(lm.PadedNums.Select(Visit).Select(x => new KernelArgument { Symbol = x })).ToArray(),
                         Indent = new string(' ', IndentScope.Writer.Indent),
-                        Args = expr.Arguments[..1].ToArray(),
+                        Args = sourceArguments[..1],
                     }).Result);
                 }
 
                 break;
             case TIR.NTT.Pad pad:
                 {
-                    var padValueType = expr.Arguments[0].CheckedTensorType.DType is VectorType vt ? vt.ElemType : expr.Arguments[0].CheckedTensorType.DType;
-                    WriteWithProfiler($"pad({arguments[0].Name}, {arguments[2].Name}, {arguments[1].Name}, {expr.Arguments[0].CheckedDataType.ToC()} {{ ({padValueType.ToC()}){pad.PadValue} }});\n");
+                    var padValueType = sourceArguments[0].CheckedTensorType.DType is VectorType vt ? vt.ElemType : sourceArguments[0].CheckedTensorType.DType;
+                    WriteWithProfiler($"pad({arguments[0].Name}, {arguments[2].Name}, {arguments[1].Name}, {sourceArguments[0].CheckedDataType.ToC()} {{ ({padValueType.ToC()}){pad.PadValue} }});\n");
                 }
 
                 break;

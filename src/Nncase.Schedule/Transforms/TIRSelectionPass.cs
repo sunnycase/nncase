@@ -74,6 +74,16 @@ public abstract class TIRSelectionPass : FunctionPass
 
     protected abstract Expr SelectCall(Call call, IReadOnlyList<BaseExpr> arguments, ref Expr output, TIRSelectionContext context);
 
+    /// <summary>
+    /// Finalizes a target-selected expression after its semantic TIR operands
+    /// have been materialized.
+    /// </summary>
+    protected virtual Expr FinalizeSelectedExpr(
+        Call sourceCall,
+        Expr selectedExpr,
+        TIRSelectionContext context)
+        => selectedExpr;
+
     protected IRType GetArgumentType(BaseExpr argument)
     {
         return argument switch
@@ -602,7 +612,10 @@ public abstract class TIRSelectionPass : FunctionPass
                     TIR.PrimFunction deviceFunc => CreatePrimFunctionCall(deviceFunc, arguments.Concat(FlattenOutputArguments(output)).ToArray()),
                     PrimFunctionWrapper { Target: TIR.PrimFunction deviceFunc } => CreatePrimFunctionCall(deviceFunc, arguments.Concat(FlattenOutputArguments(output)).ToArray()),
                     Function fn => new Call(new FunctionWrapper(_selectionPass.ModuleKind, fn), arguments.Concat(FlattenOutputArguments(output)).ToArray()),
-                    _ => _selectionPass.SelectCall(call, arguments, ref Unsafe.As<BaseExpr, Expr>(ref output), _selectionContext),
+                    _ => _selectionPass.FinalizeSelectedExpr(
+                        call,
+                        _selectionPass.SelectCall(call, arguments, ref Unsafe.As<BaseExpr, Expr>(ref output), _selectionContext),
+                        _selectionContext),
                 };
                 _body.Add(newCall);
                 return output;

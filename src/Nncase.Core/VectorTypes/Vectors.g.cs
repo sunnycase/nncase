@@ -44,6 +44,11 @@ public partial record VectorType
         [64, 64] => typeof(Vector64x64<>).MakeGenericType(ElemType.CLRType),
         [64, 128] => typeof(Vector64x128<>).MakeGenericType(ElemType.CLRType),
         [128, 64] => typeof(Vector128x64<>).MakeGenericType(ElemType.CLRType),
+        [2, 2, 2] => typeof(Vector2x2x2<>).MakeGenericType(ElemType.CLRType),
+        [4, 2, 4] => typeof(Vector4x2x4<>).MakeGenericType(ElemType.CLRType),
+        [8, 2, 8] => typeof(Vector8x2x8<>).MakeGenericType(ElemType.CLRType),
+        [16, 2, 16] => typeof(Vector16x2x16<>).MakeGenericType(ElemType.CLRType),
+        [32, 2, 32] => typeof(Vector32x2x32<>).MakeGenericType(ElemType.CLRType),
         _ => throw new NotSupportedException($"Unsupported vector lanes: {string.Join(", ", Lanes)}"),
     };
 }
@@ -76,6 +81,11 @@ public partial record DataType
         { typeof(Vector64x64<>), [64, 64] },
         { typeof(Vector64x128<>), [64, 128] },
         { typeof(Vector128x64<>), [128, 64] },
+        { typeof(Vector2x2x2<>), [2, 2, 2] },
+        { typeof(Vector4x2x4<>), [4, 2, 4] },
+        { typeof(Vector8x2x8<>), [8, 2, 8] },
+        { typeof(Vector16x2x16<>), [16, 2, 16] },
+        { typeof(Vector32x2x32<>), [32, 2, 32] },
     };
 }
 
@@ -96,7 +106,7 @@ public unsafe struct Vector4<T> : IVector<T>, IEquatable<Vector4<T>>
         }
     }
 
-    public static Vector4<T> Create(T[] array) 
+    public static Vector4<T> Create(T[] array)
     {
         Vector4<T> vec = default;
         var src = array.AsSpan();
@@ -147,7 +157,7 @@ public unsafe struct Vector8<T> : IVector<T>, IEquatable<Vector8<T>>
         }
     }
 
-    public static Vector8<T> Create(T[] array) 
+    public static Vector8<T> Create(T[] array)
     {
         Vector8<T> vec = default;
         var src = array.AsSpan();
@@ -206,7 +216,7 @@ public unsafe struct Vector16<T> : IVector<T>, IEquatable<Vector16<T>>
         }
     }
 
-    public static Vector16<T> Create(T[] array) 
+    public static Vector16<T> Create(T[] array)
     {
         Vector16<T> vec = default;
         var src = array.AsSpan();
@@ -281,7 +291,7 @@ public unsafe struct Vector32<T> : IVector<T>, IEquatable<Vector32<T>>
         }
     }
 
-    public static Vector32<T> Create(T[] array) 
+    public static Vector32<T> Create(T[] array)
     {
         Vector32<T> vec = default;
         var src = array.AsSpan();
@@ -388,7 +398,7 @@ public unsafe struct Vector64<T> : IVector<T>, IEquatable<Vector64<T>>
         }
     }
 
-    public static Vector64<T> Create(T[] array) 
+    public static Vector64<T> Create(T[] array)
     {
         Vector64<T> vec = default;
         var src = array.AsSpan();
@@ -559,7 +569,7 @@ public unsafe struct Vector128<T> : IVector<T>, IEquatable<Vector128<T>>
         }
     }
 
-    public static Vector128<T> Create(T[] array) 
+    public static Vector128<T> Create(T[] array)
     {
         Vector128<T> vec = default;
         var src = array.AsSpan();
@@ -610,7 +620,7 @@ public unsafe struct Vector2x4<T> : IVector<T>, IEquatable<Vector2x4<T>>
         }
     }
 
-    public static Vector2x4<T> Create(T[] array) 
+    public static Vector2x4<T> Create(T[] array)
     {
         Vector2x4<T> vec = default;
         var src = array.AsSpan();
@@ -619,7 +629,7 @@ public unsafe struct Vector2x4<T> : IVector<T>, IEquatable<Vector2x4<T>>
         return vec;
     }
 
-    public static Vector2x4<T> Create(T[,] array) 
+    public static Vector2x4<T> Create(T[,] array)
     {
         Vector2x4<T> vec = default;
         var src = array.AsSpan2D();
@@ -698,7 +708,7 @@ public unsafe struct Vector2x8<T> : IVector<T>, IEquatable<Vector2x8<T>>
         }
     }
 
-    public static Vector2x8<T> Create(T[] array) 
+    public static Vector2x8<T> Create(T[] array)
     {
         Vector2x8<T> vec = default;
         var src = array.AsSpan();
@@ -707,7 +717,7 @@ public unsafe struct Vector2x8<T> : IVector<T>, IEquatable<Vector2x8<T>>
         return vec;
     }
 
-    public static Vector2x8<T> Create(T[,] array) 
+    public static Vector2x8<T> Create(T[,] array)
     {
         Vector2x8<T> vec = default;
         var src = array.AsSpan2D();
@@ -802,7 +812,7 @@ public unsafe struct Vector2x16<T> : IVector<T>, IEquatable<Vector2x16<T>>
         }
     }
 
-    public static Vector2x16<T> Create(T[] array) 
+    public static Vector2x16<T> Create(T[] array)
     {
         Vector2x16<T> vec = default;
         var src = array.AsSpan();
@@ -811,7 +821,7 @@ public unsafe struct Vector2x16<T> : IVector<T>, IEquatable<Vector2x16<T>>
         return vec;
     }
 
-    public static Vector2x16<T> Create(T[,] array) 
+    public static Vector2x16<T> Create(T[,] array)
     {
         Vector2x16<T> vec = default;
         var src = array.AsSpan2D();
@@ -938,7 +948,7 @@ public unsafe struct Vector2x32<T> : IVector<T>, IEquatable<Vector2x32<T>>
         }
     }
 
-    public static Vector2x32<T> Create(T[] array) 
+    public static Vector2x32<T> Create(T[] array)
     {
         Vector2x32<T> vec = default;
         var src = array.AsSpan();
@@ -947,7 +957,7 @@ public unsafe struct Vector2x32<T> : IVector<T>, IEquatable<Vector2x32<T>>
         return vec;
     }
 
-    public static Vector2x32<T> Create(T[,] array) 
+    public static Vector2x32<T> Create(T[,] array)
     {
         Vector2x32<T> vec = default;
         var src = array.AsSpan2D();
@@ -1026,7 +1036,7 @@ public unsafe struct Vector4x4<T> : IVector<T>, IEquatable<Vector4x4<T>>
         }
     }
 
-    public static Vector4x4<T> Create(T[] array) 
+    public static Vector4x4<T> Create(T[] array)
     {
         Vector4x4<T> vec = default;
         var src = array.AsSpan();
@@ -1035,7 +1045,7 @@ public unsafe struct Vector4x4<T> : IVector<T>, IEquatable<Vector4x4<T>>
         return vec;
     }
 
-    public static Vector4x4<T> Create(T[,] array) 
+    public static Vector4x4<T> Create(T[,] array)
     {
         Vector4x4<T> vec = default;
         var src = array.AsSpan2D();
@@ -1130,7 +1140,7 @@ public unsafe struct Vector4x8<T> : IVector<T>, IEquatable<Vector4x8<T>>
         }
     }
 
-    public static Vector4x8<T> Create(T[] array) 
+    public static Vector4x8<T> Create(T[] array)
     {
         Vector4x8<T> vec = default;
         var src = array.AsSpan();
@@ -1139,7 +1149,7 @@ public unsafe struct Vector4x8<T> : IVector<T>, IEquatable<Vector4x8<T>>
         return vec;
     }
 
-    public static Vector4x8<T> Create(T[,] array) 
+    public static Vector4x8<T> Create(T[,] array)
     {
         Vector4x8<T> vec = default;
         var src = array.AsSpan2D();
@@ -1266,7 +1276,7 @@ public unsafe struct Vector4x16<T> : IVector<T>, IEquatable<Vector4x16<T>>
         }
     }
 
-    public static Vector4x16<T> Create(T[] array) 
+    public static Vector4x16<T> Create(T[] array)
     {
         Vector4x16<T> vec = default;
         var src = array.AsSpan();
@@ -1275,7 +1285,7 @@ public unsafe struct Vector4x16<T> : IVector<T>, IEquatable<Vector4x16<T>>
         return vec;
     }
 
-    public static Vector4x16<T> Create(T[,] array) 
+    public static Vector4x16<T> Create(T[,] array)
     {
         Vector4x16<T> vec = default;
         var src = array.AsSpan2D();
@@ -1466,7 +1476,7 @@ public unsafe struct Vector4x32<T> : IVector<T>, IEquatable<Vector4x32<T>>
         }
     }
 
-    public static Vector4x32<T> Create(T[] array) 
+    public static Vector4x32<T> Create(T[] array)
     {
         Vector4x32<T> vec = default;
         var src = array.AsSpan();
@@ -1475,7 +1485,7 @@ public unsafe struct Vector4x32<T> : IVector<T>, IEquatable<Vector4x32<T>>
         return vec;
     }
 
-    public static Vector4x32<T> Create(T[,] array) 
+    public static Vector4x32<T> Create(T[,] array)
     {
         Vector4x32<T> vec = default;
         var src = array.AsSpan2D();
@@ -1602,7 +1612,7 @@ public unsafe struct Vector8x8<T> : IVector<T>, IEquatable<Vector8x8<T>>
         }
     }
 
-    public static Vector8x8<T> Create(T[] array) 
+    public static Vector8x8<T> Create(T[] array)
     {
         Vector8x8<T> vec = default;
         var src = array.AsSpan();
@@ -1611,7 +1621,7 @@ public unsafe struct Vector8x8<T> : IVector<T>, IEquatable<Vector8x8<T>>
         return vec;
     }
 
-    public static Vector8x8<T> Create(T[,] array) 
+    public static Vector8x8<T> Create(T[,] array)
     {
         Vector8x8<T> vec = default;
         var src = array.AsSpan2D();
@@ -1930,7 +1940,7 @@ public unsafe struct Vector16x16<T> : IVector<T>, IEquatable<Vector16x16<T>>
         }
     }
 
-    public static Vector16x16<T> Create(T[] array) 
+    public static Vector16x16<T> Create(T[] array)
     {
         Vector16x16<T> vec = default;
         var src = array.AsSpan();
@@ -1939,7 +1949,7 @@ public unsafe struct Vector16x16<T> : IVector<T>, IEquatable<Vector16x16<T>>
         return vec;
     }
 
-    public static Vector16x16<T> Create(T[,] array) 
+    public static Vector16x16<T> Create(T[,] array)
     {
         Vector16x16<T> vec = default;
         var src = array.AsSpan2D();
@@ -2514,7 +2524,7 @@ public unsafe struct Vector32x16<T> : IVector<T>, IEquatable<Vector32x16<T>>
         }
     }
 
-    public static Vector32x16<T> Create(T[] array) 
+    public static Vector32x16<T> Create(T[] array)
     {
         Vector32x16<T> vec = default;
         var src = array.AsSpan();
@@ -2523,7 +2533,7 @@ public unsafe struct Vector32x16<T> : IVector<T>, IEquatable<Vector32x16<T>>
         return vec;
     }
 
-    public static Vector32x16<T> Create(T[,] array) 
+    public static Vector32x16<T> Create(T[,] array)
     {
         Vector32x16<T> vec = default;
         var src = array.AsSpan2D();
@@ -3610,7 +3620,7 @@ public unsafe struct Vector32x32<T> : IVector<T>, IEquatable<Vector32x32<T>>
         }
     }
 
-    public static Vector32x32<T> Create(T[] array) 
+    public static Vector32x32<T> Create(T[] array)
     {
         Vector32x32<T> vec = default;
         var src = array.AsSpan();
@@ -3619,7 +3629,7 @@ public unsafe struct Vector32x32<T> : IVector<T>, IEquatable<Vector32x32<T>>
         return vec;
     }
 
-    public static Vector32x32<T> Create(T[,] array) 
+    public static Vector32x32<T> Create(T[,] array)
     {
         Vector32x32<T> vec = default;
         var src = array.AsSpan2D();
@@ -5730,7 +5740,7 @@ public unsafe struct Vector32x64<T> : IVector<T>, IEquatable<Vector32x64<T>>
         }
     }
 
-    public static Vector32x64<T> Create(T[] array) 
+    public static Vector32x64<T> Create(T[] array)
     {
         Vector32x64<T> vec = default;
         var src = array.AsSpan();
@@ -5739,7 +5749,7 @@ public unsafe struct Vector32x64<T> : IVector<T>, IEquatable<Vector32x64<T>>
         return vec;
     }
 
-    public static Vector32x64<T> Create(T[,] array) 
+    public static Vector32x64<T> Create(T[,] array)
     {
         Vector32x64<T> vec = default;
         var src = array.AsSpan2D();
@@ -9898,7 +9908,7 @@ public unsafe struct Vector32x128<T> : IVector<T>, IEquatable<Vector32x128<T>>
         }
     }
 
-    public static Vector32x128<T> Create(T[] array) 
+    public static Vector32x128<T> Create(T[] array)
     {
         Vector32x128<T> vec = default;
         var src = array.AsSpan();
@@ -9907,7 +9917,7 @@ public unsafe struct Vector32x128<T> : IVector<T>, IEquatable<Vector32x128<T>>
         return vec;
     }
 
-    public static Vector32x128<T> Create(T[,] array) 
+    public static Vector32x128<T> Create(T[,] array)
     {
         Vector32x128<T> vec = default;
         var src = array.AsSpan2D();
@@ -12018,7 +12028,7 @@ public unsafe struct Vector64x32<T> : IVector<T>, IEquatable<Vector64x32<T>>
         }
     }
 
-    public static Vector64x32<T> Create(T[] array) 
+    public static Vector64x32<T> Create(T[] array)
     {
         Vector64x32<T> vec = default;
         var src = array.AsSpan();
@@ -12027,7 +12037,7 @@ public unsafe struct Vector64x32<T> : IVector<T>, IEquatable<Vector64x32<T>>
         return vec;
     }
 
-    public static Vector64x32<T> Create(T[,] array) 
+    public static Vector64x32<T> Create(T[,] array)
     {
         Vector64x32<T> vec = default;
         var src = array.AsSpan2D();
@@ -16186,7 +16196,7 @@ public unsafe struct Vector64x64<T> : IVector<T>, IEquatable<Vector64x64<T>>
         }
     }
 
-    public static Vector64x64<T> Create(T[] array) 
+    public static Vector64x64<T> Create(T[] array)
     {
         Vector64x64<T> vec = default;
         var src = array.AsSpan();
@@ -16195,7 +16205,7 @@ public unsafe struct Vector64x64<T> : IVector<T>, IEquatable<Vector64x64<T>>
         return vec;
     }
 
-    public static Vector64x64<T> Create(T[,] array) 
+    public static Vector64x64<T> Create(T[,] array)
     {
         Vector64x64<T> vec = default;
         var src = array.AsSpan2D();
@@ -24450,7 +24460,7 @@ public unsafe struct Vector64x128<T> : IVector<T>, IEquatable<Vector64x128<T>>
         }
     }
 
-    public static Vector64x128<T> Create(T[] array) 
+    public static Vector64x128<T> Create(T[] array)
     {
         Vector64x128<T> vec = default;
         var src = array.AsSpan();
@@ -24459,7 +24469,7 @@ public unsafe struct Vector64x128<T> : IVector<T>, IEquatable<Vector64x128<T>>
         return vec;
     }
 
-    public static Vector64x128<T> Create(T[,] array) 
+    public static Vector64x128<T> Create(T[,] array)
     {
         Vector64x128<T> vec = default;
         var src = array.AsSpan2D();
@@ -32714,7 +32724,7 @@ public unsafe struct Vector128x64<T> : IVector<T>, IEquatable<Vector128x64<T>>
         }
     }
 
-    public static Vector128x64<T> Create(T[] array) 
+    public static Vector128x64<T> Create(T[] array)
     {
         Vector128x64<T> vec = default;
         var src = array.AsSpan();
@@ -32723,7 +32733,7 @@ public unsafe struct Vector128x64<T> : IVector<T>, IEquatable<Vector128x64<T>>
         return vec;
     }
 
-    public static Vector128x64<T> Create(T[,] array) 
+    public static Vector128x64<T> Create(T[,] array)
     {
         Vector128x64<T> vec = default;
         var src = array.AsSpan2D();
@@ -32768,6 +32778,3104 @@ public unsafe struct Vector128x64<T> : IVector<T>, IEquatable<Vector128x64<T>>
                 sb.Append(",");
             }
         }
+        sb.Append(">");
+        return sb.ToString();
+    }
+}
+
+[StructLayout(LayoutKind.Sequential)]
+public unsafe struct Vector2x2x2<T> : IVector<T>, IEquatable<Vector2x2x2<T>>
+    where T : unmanaged, IEquatable<T>
+{
+    private T _item_0_0_0;
+    private T _item_0_0_1;
+    private T _item_0_1_0;
+    private T _item_0_1_1;
+    private T _item_1_0_0;
+    private T _item_1_0_1;
+    private T _item_1_1_0;
+    private T _item_1_1_1;
+
+    static Vector2x2x2()
+    {
+        if (typeof(T) == typeof(bool))
+        {
+            throw new ArgumentException("Boolean is not supported in vector type.");
+        }
+    }
+
+    public static Vector2x2x2<T> Create(T[] array)
+    {
+        Vector2x2x2<T> vec = default;
+        var src = array.AsSpan();
+        var dest = vec.AsSpan();
+        src.CopyTo(dest);
+        return vec;
+    }
+
+    public T this[int i, int j, int k]
+    {
+        get => Unsafe.Add(ref Unsafe.AsRef(in _item_0_0_0), ((i * Height) + j) * Width + k);
+        set => Unsafe.Add(ref Unsafe.AsRef(in _item_0_0_0), ((i * Height) + j) * Width + k) = value;
+    }
+
+    public bool Equals(Vector2x2x2<T> other) => AsSpan().SequenceEqual(other.AsSpan());
+
+    public override bool Equals([NotNullWhen(true)] object obj) => obj is Vector2x2x2<T> other && Equals(other);
+
+    public Span<T> AsSpan() => MemoryMarshal.CreateSpan(ref Unsafe.AsRef(in _item_0_0_0), Count);
+
+
+    public Span<T> AsSpan(int i, int j) => MemoryMarshal.CreateSpan(ref Unsafe.Add(ref Unsafe.AsRef(in _item_0_0_0), ((i * Height) + j) * Width), Width);
+
+    public static int Depth => 2;
+
+    public static int Height => 2;
+
+    public static int Width => 2;
+
+    public static int Count => Depth * Height * Width;
+
+
+    public override string ToString()
+    {
+        var sb = new System.Text.StringBuilder();
+        sb.Append("<");
+        for (int i = 0; i < Depth; i++)
+        {
+            sb.Append("<");
+            for (int j = 0; j < Height; j++)
+            {
+                sb.Append($"<{Nncase.Utilities.StringUtility.Join<T>(',', AsSpan(i, j))}>");
+                if (j < Height - 1)
+                {
+                    sb.Append(",");
+                }
+            }
+
+            sb.Append(">");
+            if (i < Depth - 1)
+            {
+                sb.Append(",");
+            }
+        }
+
+        sb.Append(">");
+        return sb.ToString();
+    }
+}
+
+[StructLayout(LayoutKind.Sequential)]
+public unsafe struct Vector4x2x4<T> : IVector<T>, IEquatable<Vector4x2x4<T>>
+    where T : unmanaged, IEquatable<T>
+{
+    private T _item_0_0_0;
+    private T _item_0_0_1;
+    private T _item_0_0_2;
+    private T _item_0_0_3;
+    private T _item_0_1_0;
+    private T _item_0_1_1;
+    private T _item_0_1_2;
+    private T _item_0_1_3;
+    private T _item_1_0_0;
+    private T _item_1_0_1;
+    private T _item_1_0_2;
+    private T _item_1_0_3;
+    private T _item_1_1_0;
+    private T _item_1_1_1;
+    private T _item_1_1_2;
+    private T _item_1_1_3;
+    private T _item_2_0_0;
+    private T _item_2_0_1;
+    private T _item_2_0_2;
+    private T _item_2_0_3;
+    private T _item_2_1_0;
+    private T _item_2_1_1;
+    private T _item_2_1_2;
+    private T _item_2_1_3;
+    private T _item_3_0_0;
+    private T _item_3_0_1;
+    private T _item_3_0_2;
+    private T _item_3_0_3;
+    private T _item_3_1_0;
+    private T _item_3_1_1;
+    private T _item_3_1_2;
+    private T _item_3_1_3;
+
+    static Vector4x2x4()
+    {
+        if (typeof(T) == typeof(bool))
+        {
+            throw new ArgumentException("Boolean is not supported in vector type.");
+        }
+    }
+
+    public static Vector4x2x4<T> Create(T[] array)
+    {
+        Vector4x2x4<T> vec = default;
+        var src = array.AsSpan();
+        var dest = vec.AsSpan();
+        src.CopyTo(dest);
+        return vec;
+    }
+
+    public T this[int i, int j, int k]
+    {
+        get => Unsafe.Add(ref Unsafe.AsRef(in _item_0_0_0), ((i * Height) + j) * Width + k);
+        set => Unsafe.Add(ref Unsafe.AsRef(in _item_0_0_0), ((i * Height) + j) * Width + k) = value;
+    }
+
+    public bool Equals(Vector4x2x4<T> other) => AsSpan().SequenceEqual(other.AsSpan());
+
+    public override bool Equals([NotNullWhen(true)] object obj) => obj is Vector4x2x4<T> other && Equals(other);
+
+    public Span<T> AsSpan() => MemoryMarshal.CreateSpan(ref Unsafe.AsRef(in _item_0_0_0), Count);
+
+
+    public Span<T> AsSpan(int i, int j) => MemoryMarshal.CreateSpan(ref Unsafe.Add(ref Unsafe.AsRef(in _item_0_0_0), ((i * Height) + j) * Width), Width);
+
+    public static int Depth => 4;
+
+    public static int Height => 2;
+
+    public static int Width => 4;
+
+    public static int Count => Depth * Height * Width;
+
+
+    public override string ToString()
+    {
+        var sb = new System.Text.StringBuilder();
+        sb.Append("<");
+        for (int i = 0; i < Depth; i++)
+        {
+            sb.Append("<");
+            for (int j = 0; j < Height; j++)
+            {
+                sb.Append($"<{Nncase.Utilities.StringUtility.Join<T>(',', AsSpan(i, j))}>");
+                if (j < Height - 1)
+                {
+                    sb.Append(",");
+                }
+            }
+
+            sb.Append(">");
+            if (i < Depth - 1)
+            {
+                sb.Append(",");
+            }
+        }
+
+        sb.Append(">");
+        return sb.ToString();
+    }
+}
+
+[StructLayout(LayoutKind.Sequential)]
+public unsafe struct Vector8x2x8<T> : IVector<T>, IEquatable<Vector8x2x8<T>>
+    where T : unmanaged, IEquatable<T>
+{
+    private T _item_0_0_0;
+    private T _item_0_0_1;
+    private T _item_0_0_2;
+    private T _item_0_0_3;
+    private T _item_0_0_4;
+    private T _item_0_0_5;
+    private T _item_0_0_6;
+    private T _item_0_0_7;
+    private T _item_0_1_0;
+    private T _item_0_1_1;
+    private T _item_0_1_2;
+    private T _item_0_1_3;
+    private T _item_0_1_4;
+    private T _item_0_1_5;
+    private T _item_0_1_6;
+    private T _item_0_1_7;
+    private T _item_1_0_0;
+    private T _item_1_0_1;
+    private T _item_1_0_2;
+    private T _item_1_0_3;
+    private T _item_1_0_4;
+    private T _item_1_0_5;
+    private T _item_1_0_6;
+    private T _item_1_0_7;
+    private T _item_1_1_0;
+    private T _item_1_1_1;
+    private T _item_1_1_2;
+    private T _item_1_1_3;
+    private T _item_1_1_4;
+    private T _item_1_1_5;
+    private T _item_1_1_6;
+    private T _item_1_1_7;
+    private T _item_2_0_0;
+    private T _item_2_0_1;
+    private T _item_2_0_2;
+    private T _item_2_0_3;
+    private T _item_2_0_4;
+    private T _item_2_0_5;
+    private T _item_2_0_6;
+    private T _item_2_0_7;
+    private T _item_2_1_0;
+    private T _item_2_1_1;
+    private T _item_2_1_2;
+    private T _item_2_1_3;
+    private T _item_2_1_4;
+    private T _item_2_1_5;
+    private T _item_2_1_6;
+    private T _item_2_1_7;
+    private T _item_3_0_0;
+    private T _item_3_0_1;
+    private T _item_3_0_2;
+    private T _item_3_0_3;
+    private T _item_3_0_4;
+    private T _item_3_0_5;
+    private T _item_3_0_6;
+    private T _item_3_0_7;
+    private T _item_3_1_0;
+    private T _item_3_1_1;
+    private T _item_3_1_2;
+    private T _item_3_1_3;
+    private T _item_3_1_4;
+    private T _item_3_1_5;
+    private T _item_3_1_6;
+    private T _item_3_1_7;
+    private T _item_4_0_0;
+    private T _item_4_0_1;
+    private T _item_4_0_2;
+    private T _item_4_0_3;
+    private T _item_4_0_4;
+    private T _item_4_0_5;
+    private T _item_4_0_6;
+    private T _item_4_0_7;
+    private T _item_4_1_0;
+    private T _item_4_1_1;
+    private T _item_4_1_2;
+    private T _item_4_1_3;
+    private T _item_4_1_4;
+    private T _item_4_1_5;
+    private T _item_4_1_6;
+    private T _item_4_1_7;
+    private T _item_5_0_0;
+    private T _item_5_0_1;
+    private T _item_5_0_2;
+    private T _item_5_0_3;
+    private T _item_5_0_4;
+    private T _item_5_0_5;
+    private T _item_5_0_6;
+    private T _item_5_0_7;
+    private T _item_5_1_0;
+    private T _item_5_1_1;
+    private T _item_5_1_2;
+    private T _item_5_1_3;
+    private T _item_5_1_4;
+    private T _item_5_1_5;
+    private T _item_5_1_6;
+    private T _item_5_1_7;
+    private T _item_6_0_0;
+    private T _item_6_0_1;
+    private T _item_6_0_2;
+    private T _item_6_0_3;
+    private T _item_6_0_4;
+    private T _item_6_0_5;
+    private T _item_6_0_6;
+    private T _item_6_0_7;
+    private T _item_6_1_0;
+    private T _item_6_1_1;
+    private T _item_6_1_2;
+    private T _item_6_1_3;
+    private T _item_6_1_4;
+    private T _item_6_1_5;
+    private T _item_6_1_6;
+    private T _item_6_1_7;
+    private T _item_7_0_0;
+    private T _item_7_0_1;
+    private T _item_7_0_2;
+    private T _item_7_0_3;
+    private T _item_7_0_4;
+    private T _item_7_0_5;
+    private T _item_7_0_6;
+    private T _item_7_0_7;
+    private T _item_7_1_0;
+    private T _item_7_1_1;
+    private T _item_7_1_2;
+    private T _item_7_1_3;
+    private T _item_7_1_4;
+    private T _item_7_1_5;
+    private T _item_7_1_6;
+    private T _item_7_1_7;
+
+    static Vector8x2x8()
+    {
+        if (typeof(T) == typeof(bool))
+        {
+            throw new ArgumentException("Boolean is not supported in vector type.");
+        }
+    }
+
+    public static Vector8x2x8<T> Create(T[] array)
+    {
+        Vector8x2x8<T> vec = default;
+        var src = array.AsSpan();
+        var dest = vec.AsSpan();
+        src.CopyTo(dest);
+        return vec;
+    }
+
+    public T this[int i, int j, int k]
+    {
+        get => Unsafe.Add(ref Unsafe.AsRef(in _item_0_0_0), ((i * Height) + j) * Width + k);
+        set => Unsafe.Add(ref Unsafe.AsRef(in _item_0_0_0), ((i * Height) + j) * Width + k) = value;
+    }
+
+    public bool Equals(Vector8x2x8<T> other) => AsSpan().SequenceEqual(other.AsSpan());
+
+    public override bool Equals([NotNullWhen(true)] object obj) => obj is Vector8x2x8<T> other && Equals(other);
+
+    public Span<T> AsSpan() => MemoryMarshal.CreateSpan(ref Unsafe.AsRef(in _item_0_0_0), Count);
+
+
+    public Span<T> AsSpan(int i, int j) => MemoryMarshal.CreateSpan(ref Unsafe.Add(ref Unsafe.AsRef(in _item_0_0_0), ((i * Height) + j) * Width), Width);
+
+    public static int Depth => 8;
+
+    public static int Height => 2;
+
+    public static int Width => 8;
+
+    public static int Count => Depth * Height * Width;
+
+
+    public override string ToString()
+    {
+        var sb = new System.Text.StringBuilder();
+        sb.Append("<");
+        for (int i = 0; i < Depth; i++)
+        {
+            sb.Append("<");
+            for (int j = 0; j < Height; j++)
+            {
+                sb.Append($"<{Nncase.Utilities.StringUtility.Join<T>(',', AsSpan(i, j))}>");
+                if (j < Height - 1)
+                {
+                    sb.Append(",");
+                }
+            }
+
+            sb.Append(">");
+            if (i < Depth - 1)
+            {
+                sb.Append(",");
+            }
+        }
+
+        sb.Append(">");
+        return sb.ToString();
+    }
+}
+
+[StructLayout(LayoutKind.Sequential)]
+public unsafe struct Vector16x2x16<T> : IVector<T>, IEquatable<Vector16x2x16<T>>
+    where T : unmanaged, IEquatable<T>
+{
+    private T _item_0_0_0;
+    private T _item_0_0_1;
+    private T _item_0_0_2;
+    private T _item_0_0_3;
+    private T _item_0_0_4;
+    private T _item_0_0_5;
+    private T _item_0_0_6;
+    private T _item_0_0_7;
+    private T _item_0_0_8;
+    private T _item_0_0_9;
+    private T _item_0_0_10;
+    private T _item_0_0_11;
+    private T _item_0_0_12;
+    private T _item_0_0_13;
+    private T _item_0_0_14;
+    private T _item_0_0_15;
+    private T _item_0_1_0;
+    private T _item_0_1_1;
+    private T _item_0_1_2;
+    private T _item_0_1_3;
+    private T _item_0_1_4;
+    private T _item_0_1_5;
+    private T _item_0_1_6;
+    private T _item_0_1_7;
+    private T _item_0_1_8;
+    private T _item_0_1_9;
+    private T _item_0_1_10;
+    private T _item_0_1_11;
+    private T _item_0_1_12;
+    private T _item_0_1_13;
+    private T _item_0_1_14;
+    private T _item_0_1_15;
+    private T _item_1_0_0;
+    private T _item_1_0_1;
+    private T _item_1_0_2;
+    private T _item_1_0_3;
+    private T _item_1_0_4;
+    private T _item_1_0_5;
+    private T _item_1_0_6;
+    private T _item_1_0_7;
+    private T _item_1_0_8;
+    private T _item_1_0_9;
+    private T _item_1_0_10;
+    private T _item_1_0_11;
+    private T _item_1_0_12;
+    private T _item_1_0_13;
+    private T _item_1_0_14;
+    private T _item_1_0_15;
+    private T _item_1_1_0;
+    private T _item_1_1_1;
+    private T _item_1_1_2;
+    private T _item_1_1_3;
+    private T _item_1_1_4;
+    private T _item_1_1_5;
+    private T _item_1_1_6;
+    private T _item_1_1_7;
+    private T _item_1_1_8;
+    private T _item_1_1_9;
+    private T _item_1_1_10;
+    private T _item_1_1_11;
+    private T _item_1_1_12;
+    private T _item_1_1_13;
+    private T _item_1_1_14;
+    private T _item_1_1_15;
+    private T _item_2_0_0;
+    private T _item_2_0_1;
+    private T _item_2_0_2;
+    private T _item_2_0_3;
+    private T _item_2_0_4;
+    private T _item_2_0_5;
+    private T _item_2_0_6;
+    private T _item_2_0_7;
+    private T _item_2_0_8;
+    private T _item_2_0_9;
+    private T _item_2_0_10;
+    private T _item_2_0_11;
+    private T _item_2_0_12;
+    private T _item_2_0_13;
+    private T _item_2_0_14;
+    private T _item_2_0_15;
+    private T _item_2_1_0;
+    private T _item_2_1_1;
+    private T _item_2_1_2;
+    private T _item_2_1_3;
+    private T _item_2_1_4;
+    private T _item_2_1_5;
+    private T _item_2_1_6;
+    private T _item_2_1_7;
+    private T _item_2_1_8;
+    private T _item_2_1_9;
+    private T _item_2_1_10;
+    private T _item_2_1_11;
+    private T _item_2_1_12;
+    private T _item_2_1_13;
+    private T _item_2_1_14;
+    private T _item_2_1_15;
+    private T _item_3_0_0;
+    private T _item_3_0_1;
+    private T _item_3_0_2;
+    private T _item_3_0_3;
+    private T _item_3_0_4;
+    private T _item_3_0_5;
+    private T _item_3_0_6;
+    private T _item_3_0_7;
+    private T _item_3_0_8;
+    private T _item_3_0_9;
+    private T _item_3_0_10;
+    private T _item_3_0_11;
+    private T _item_3_0_12;
+    private T _item_3_0_13;
+    private T _item_3_0_14;
+    private T _item_3_0_15;
+    private T _item_3_1_0;
+    private T _item_3_1_1;
+    private T _item_3_1_2;
+    private T _item_3_1_3;
+    private T _item_3_1_4;
+    private T _item_3_1_5;
+    private T _item_3_1_6;
+    private T _item_3_1_7;
+    private T _item_3_1_8;
+    private T _item_3_1_9;
+    private T _item_3_1_10;
+    private T _item_3_1_11;
+    private T _item_3_1_12;
+    private T _item_3_1_13;
+    private T _item_3_1_14;
+    private T _item_3_1_15;
+    private T _item_4_0_0;
+    private T _item_4_0_1;
+    private T _item_4_0_2;
+    private T _item_4_0_3;
+    private T _item_4_0_4;
+    private T _item_4_0_5;
+    private T _item_4_0_6;
+    private T _item_4_0_7;
+    private T _item_4_0_8;
+    private T _item_4_0_9;
+    private T _item_4_0_10;
+    private T _item_4_0_11;
+    private T _item_4_0_12;
+    private T _item_4_0_13;
+    private T _item_4_0_14;
+    private T _item_4_0_15;
+    private T _item_4_1_0;
+    private T _item_4_1_1;
+    private T _item_4_1_2;
+    private T _item_4_1_3;
+    private T _item_4_1_4;
+    private T _item_4_1_5;
+    private T _item_4_1_6;
+    private T _item_4_1_7;
+    private T _item_4_1_8;
+    private T _item_4_1_9;
+    private T _item_4_1_10;
+    private T _item_4_1_11;
+    private T _item_4_1_12;
+    private T _item_4_1_13;
+    private T _item_4_1_14;
+    private T _item_4_1_15;
+    private T _item_5_0_0;
+    private T _item_5_0_1;
+    private T _item_5_0_2;
+    private T _item_5_0_3;
+    private T _item_5_0_4;
+    private T _item_5_0_5;
+    private T _item_5_0_6;
+    private T _item_5_0_7;
+    private T _item_5_0_8;
+    private T _item_5_0_9;
+    private T _item_5_0_10;
+    private T _item_5_0_11;
+    private T _item_5_0_12;
+    private T _item_5_0_13;
+    private T _item_5_0_14;
+    private T _item_5_0_15;
+    private T _item_5_1_0;
+    private T _item_5_1_1;
+    private T _item_5_1_2;
+    private T _item_5_1_3;
+    private T _item_5_1_4;
+    private T _item_5_1_5;
+    private T _item_5_1_6;
+    private T _item_5_1_7;
+    private T _item_5_1_8;
+    private T _item_5_1_9;
+    private T _item_5_1_10;
+    private T _item_5_1_11;
+    private T _item_5_1_12;
+    private T _item_5_1_13;
+    private T _item_5_1_14;
+    private T _item_5_1_15;
+    private T _item_6_0_0;
+    private T _item_6_0_1;
+    private T _item_6_0_2;
+    private T _item_6_0_3;
+    private T _item_6_0_4;
+    private T _item_6_0_5;
+    private T _item_6_0_6;
+    private T _item_6_0_7;
+    private T _item_6_0_8;
+    private T _item_6_0_9;
+    private T _item_6_0_10;
+    private T _item_6_0_11;
+    private T _item_6_0_12;
+    private T _item_6_0_13;
+    private T _item_6_0_14;
+    private T _item_6_0_15;
+    private T _item_6_1_0;
+    private T _item_6_1_1;
+    private T _item_6_1_2;
+    private T _item_6_1_3;
+    private T _item_6_1_4;
+    private T _item_6_1_5;
+    private T _item_6_1_6;
+    private T _item_6_1_7;
+    private T _item_6_1_8;
+    private T _item_6_1_9;
+    private T _item_6_1_10;
+    private T _item_6_1_11;
+    private T _item_6_1_12;
+    private T _item_6_1_13;
+    private T _item_6_1_14;
+    private T _item_6_1_15;
+    private T _item_7_0_0;
+    private T _item_7_0_1;
+    private T _item_7_0_2;
+    private T _item_7_0_3;
+    private T _item_7_0_4;
+    private T _item_7_0_5;
+    private T _item_7_0_6;
+    private T _item_7_0_7;
+    private T _item_7_0_8;
+    private T _item_7_0_9;
+    private T _item_7_0_10;
+    private T _item_7_0_11;
+    private T _item_7_0_12;
+    private T _item_7_0_13;
+    private T _item_7_0_14;
+    private T _item_7_0_15;
+    private T _item_7_1_0;
+    private T _item_7_1_1;
+    private T _item_7_1_2;
+    private T _item_7_1_3;
+    private T _item_7_1_4;
+    private T _item_7_1_5;
+    private T _item_7_1_6;
+    private T _item_7_1_7;
+    private T _item_7_1_8;
+    private T _item_7_1_9;
+    private T _item_7_1_10;
+    private T _item_7_1_11;
+    private T _item_7_1_12;
+    private T _item_7_1_13;
+    private T _item_7_1_14;
+    private T _item_7_1_15;
+    private T _item_8_0_0;
+    private T _item_8_0_1;
+    private T _item_8_0_2;
+    private T _item_8_0_3;
+    private T _item_8_0_4;
+    private T _item_8_0_5;
+    private T _item_8_0_6;
+    private T _item_8_0_7;
+    private T _item_8_0_8;
+    private T _item_8_0_9;
+    private T _item_8_0_10;
+    private T _item_8_0_11;
+    private T _item_8_0_12;
+    private T _item_8_0_13;
+    private T _item_8_0_14;
+    private T _item_8_0_15;
+    private T _item_8_1_0;
+    private T _item_8_1_1;
+    private T _item_8_1_2;
+    private T _item_8_1_3;
+    private T _item_8_1_4;
+    private T _item_8_1_5;
+    private T _item_8_1_6;
+    private T _item_8_1_7;
+    private T _item_8_1_8;
+    private T _item_8_1_9;
+    private T _item_8_1_10;
+    private T _item_8_1_11;
+    private T _item_8_1_12;
+    private T _item_8_1_13;
+    private T _item_8_1_14;
+    private T _item_8_1_15;
+    private T _item_9_0_0;
+    private T _item_9_0_1;
+    private T _item_9_0_2;
+    private T _item_9_0_3;
+    private T _item_9_0_4;
+    private T _item_9_0_5;
+    private T _item_9_0_6;
+    private T _item_9_0_7;
+    private T _item_9_0_8;
+    private T _item_9_0_9;
+    private T _item_9_0_10;
+    private T _item_9_0_11;
+    private T _item_9_0_12;
+    private T _item_9_0_13;
+    private T _item_9_0_14;
+    private T _item_9_0_15;
+    private T _item_9_1_0;
+    private T _item_9_1_1;
+    private T _item_9_1_2;
+    private T _item_9_1_3;
+    private T _item_9_1_4;
+    private T _item_9_1_5;
+    private T _item_9_1_6;
+    private T _item_9_1_7;
+    private T _item_9_1_8;
+    private T _item_9_1_9;
+    private T _item_9_1_10;
+    private T _item_9_1_11;
+    private T _item_9_1_12;
+    private T _item_9_1_13;
+    private T _item_9_1_14;
+    private T _item_9_1_15;
+    private T _item_10_0_0;
+    private T _item_10_0_1;
+    private T _item_10_0_2;
+    private T _item_10_0_3;
+    private T _item_10_0_4;
+    private T _item_10_0_5;
+    private T _item_10_0_6;
+    private T _item_10_0_7;
+    private T _item_10_0_8;
+    private T _item_10_0_9;
+    private T _item_10_0_10;
+    private T _item_10_0_11;
+    private T _item_10_0_12;
+    private T _item_10_0_13;
+    private T _item_10_0_14;
+    private T _item_10_0_15;
+    private T _item_10_1_0;
+    private T _item_10_1_1;
+    private T _item_10_1_2;
+    private T _item_10_1_3;
+    private T _item_10_1_4;
+    private T _item_10_1_5;
+    private T _item_10_1_6;
+    private T _item_10_1_7;
+    private T _item_10_1_8;
+    private T _item_10_1_9;
+    private T _item_10_1_10;
+    private T _item_10_1_11;
+    private T _item_10_1_12;
+    private T _item_10_1_13;
+    private T _item_10_1_14;
+    private T _item_10_1_15;
+    private T _item_11_0_0;
+    private T _item_11_0_1;
+    private T _item_11_0_2;
+    private T _item_11_0_3;
+    private T _item_11_0_4;
+    private T _item_11_0_5;
+    private T _item_11_0_6;
+    private T _item_11_0_7;
+    private T _item_11_0_8;
+    private T _item_11_0_9;
+    private T _item_11_0_10;
+    private T _item_11_0_11;
+    private T _item_11_0_12;
+    private T _item_11_0_13;
+    private T _item_11_0_14;
+    private T _item_11_0_15;
+    private T _item_11_1_0;
+    private T _item_11_1_1;
+    private T _item_11_1_2;
+    private T _item_11_1_3;
+    private T _item_11_1_4;
+    private T _item_11_1_5;
+    private T _item_11_1_6;
+    private T _item_11_1_7;
+    private T _item_11_1_8;
+    private T _item_11_1_9;
+    private T _item_11_1_10;
+    private T _item_11_1_11;
+    private T _item_11_1_12;
+    private T _item_11_1_13;
+    private T _item_11_1_14;
+    private T _item_11_1_15;
+    private T _item_12_0_0;
+    private T _item_12_0_1;
+    private T _item_12_0_2;
+    private T _item_12_0_3;
+    private T _item_12_0_4;
+    private T _item_12_0_5;
+    private T _item_12_0_6;
+    private T _item_12_0_7;
+    private T _item_12_0_8;
+    private T _item_12_0_9;
+    private T _item_12_0_10;
+    private T _item_12_0_11;
+    private T _item_12_0_12;
+    private T _item_12_0_13;
+    private T _item_12_0_14;
+    private T _item_12_0_15;
+    private T _item_12_1_0;
+    private T _item_12_1_1;
+    private T _item_12_1_2;
+    private T _item_12_1_3;
+    private T _item_12_1_4;
+    private T _item_12_1_5;
+    private T _item_12_1_6;
+    private T _item_12_1_7;
+    private T _item_12_1_8;
+    private T _item_12_1_9;
+    private T _item_12_1_10;
+    private T _item_12_1_11;
+    private T _item_12_1_12;
+    private T _item_12_1_13;
+    private T _item_12_1_14;
+    private T _item_12_1_15;
+    private T _item_13_0_0;
+    private T _item_13_0_1;
+    private T _item_13_0_2;
+    private T _item_13_0_3;
+    private T _item_13_0_4;
+    private T _item_13_0_5;
+    private T _item_13_0_6;
+    private T _item_13_0_7;
+    private T _item_13_0_8;
+    private T _item_13_0_9;
+    private T _item_13_0_10;
+    private T _item_13_0_11;
+    private T _item_13_0_12;
+    private T _item_13_0_13;
+    private T _item_13_0_14;
+    private T _item_13_0_15;
+    private T _item_13_1_0;
+    private T _item_13_1_1;
+    private T _item_13_1_2;
+    private T _item_13_1_3;
+    private T _item_13_1_4;
+    private T _item_13_1_5;
+    private T _item_13_1_6;
+    private T _item_13_1_7;
+    private T _item_13_1_8;
+    private T _item_13_1_9;
+    private T _item_13_1_10;
+    private T _item_13_1_11;
+    private T _item_13_1_12;
+    private T _item_13_1_13;
+    private T _item_13_1_14;
+    private T _item_13_1_15;
+    private T _item_14_0_0;
+    private T _item_14_0_1;
+    private T _item_14_0_2;
+    private T _item_14_0_3;
+    private T _item_14_0_4;
+    private T _item_14_0_5;
+    private T _item_14_0_6;
+    private T _item_14_0_7;
+    private T _item_14_0_8;
+    private T _item_14_0_9;
+    private T _item_14_0_10;
+    private T _item_14_0_11;
+    private T _item_14_0_12;
+    private T _item_14_0_13;
+    private T _item_14_0_14;
+    private T _item_14_0_15;
+    private T _item_14_1_0;
+    private T _item_14_1_1;
+    private T _item_14_1_2;
+    private T _item_14_1_3;
+    private T _item_14_1_4;
+    private T _item_14_1_5;
+    private T _item_14_1_6;
+    private T _item_14_1_7;
+    private T _item_14_1_8;
+    private T _item_14_1_9;
+    private T _item_14_1_10;
+    private T _item_14_1_11;
+    private T _item_14_1_12;
+    private T _item_14_1_13;
+    private T _item_14_1_14;
+    private T _item_14_1_15;
+    private T _item_15_0_0;
+    private T _item_15_0_1;
+    private T _item_15_0_2;
+    private T _item_15_0_3;
+    private T _item_15_0_4;
+    private T _item_15_0_5;
+    private T _item_15_0_6;
+    private T _item_15_0_7;
+    private T _item_15_0_8;
+    private T _item_15_0_9;
+    private T _item_15_0_10;
+    private T _item_15_0_11;
+    private T _item_15_0_12;
+    private T _item_15_0_13;
+    private T _item_15_0_14;
+    private T _item_15_0_15;
+    private T _item_15_1_0;
+    private T _item_15_1_1;
+    private T _item_15_1_2;
+    private T _item_15_1_3;
+    private T _item_15_1_4;
+    private T _item_15_1_5;
+    private T _item_15_1_6;
+    private T _item_15_1_7;
+    private T _item_15_1_8;
+    private T _item_15_1_9;
+    private T _item_15_1_10;
+    private T _item_15_1_11;
+    private T _item_15_1_12;
+    private T _item_15_1_13;
+    private T _item_15_1_14;
+    private T _item_15_1_15;
+
+    static Vector16x2x16()
+    {
+        if (typeof(T) == typeof(bool))
+        {
+            throw new ArgumentException("Boolean is not supported in vector type.");
+        }
+    }
+
+    public static Vector16x2x16<T> Create(T[] array)
+    {
+        Vector16x2x16<T> vec = default;
+        var src = array.AsSpan();
+        var dest = vec.AsSpan();
+        src.CopyTo(dest);
+        return vec;
+    }
+
+    public T this[int i, int j, int k]
+    {
+        get => Unsafe.Add(ref Unsafe.AsRef(in _item_0_0_0), ((i * Height) + j) * Width + k);
+        set => Unsafe.Add(ref Unsafe.AsRef(in _item_0_0_0), ((i * Height) + j) * Width + k) = value;
+    }
+
+    public bool Equals(Vector16x2x16<T> other) => AsSpan().SequenceEqual(other.AsSpan());
+
+    public override bool Equals([NotNullWhen(true)] object obj) => obj is Vector16x2x16<T> other && Equals(other);
+
+    public Span<T> AsSpan() => MemoryMarshal.CreateSpan(ref Unsafe.AsRef(in _item_0_0_0), Count);
+
+
+    public Span<T> AsSpan(int i, int j) => MemoryMarshal.CreateSpan(ref Unsafe.Add(ref Unsafe.AsRef(in _item_0_0_0), ((i * Height) + j) * Width), Width);
+
+    public static int Depth => 16;
+
+    public static int Height => 2;
+
+    public static int Width => 16;
+
+    public static int Count => Depth * Height * Width;
+
+
+    public override string ToString()
+    {
+        var sb = new System.Text.StringBuilder();
+        sb.Append("<");
+        for (int i = 0; i < Depth; i++)
+        {
+            sb.Append("<");
+            for (int j = 0; j < Height; j++)
+            {
+                sb.Append($"<{Nncase.Utilities.StringUtility.Join<T>(',', AsSpan(i, j))}>");
+                if (j < Height - 1)
+                {
+                    sb.Append(",");
+                }
+            }
+
+            sb.Append(">");
+            if (i < Depth - 1)
+            {
+                sb.Append(",");
+            }
+        }
+
+        sb.Append(">");
+        return sb.ToString();
+    }
+}
+
+[StructLayout(LayoutKind.Sequential)]
+public unsafe struct Vector32x2x32<T> : IVector<T>, IEquatable<Vector32x2x32<T>>
+    where T : unmanaged, IEquatable<T>
+{
+    private T _item_0_0_0;
+    private T _item_0_0_1;
+    private T _item_0_0_2;
+    private T _item_0_0_3;
+    private T _item_0_0_4;
+    private T _item_0_0_5;
+    private T _item_0_0_6;
+    private T _item_0_0_7;
+    private T _item_0_0_8;
+    private T _item_0_0_9;
+    private T _item_0_0_10;
+    private T _item_0_0_11;
+    private T _item_0_0_12;
+    private T _item_0_0_13;
+    private T _item_0_0_14;
+    private T _item_0_0_15;
+    private T _item_0_0_16;
+    private T _item_0_0_17;
+    private T _item_0_0_18;
+    private T _item_0_0_19;
+    private T _item_0_0_20;
+    private T _item_0_0_21;
+    private T _item_0_0_22;
+    private T _item_0_0_23;
+    private T _item_0_0_24;
+    private T _item_0_0_25;
+    private T _item_0_0_26;
+    private T _item_0_0_27;
+    private T _item_0_0_28;
+    private T _item_0_0_29;
+    private T _item_0_0_30;
+    private T _item_0_0_31;
+    private T _item_0_1_0;
+    private T _item_0_1_1;
+    private T _item_0_1_2;
+    private T _item_0_1_3;
+    private T _item_0_1_4;
+    private T _item_0_1_5;
+    private T _item_0_1_6;
+    private T _item_0_1_7;
+    private T _item_0_1_8;
+    private T _item_0_1_9;
+    private T _item_0_1_10;
+    private T _item_0_1_11;
+    private T _item_0_1_12;
+    private T _item_0_1_13;
+    private T _item_0_1_14;
+    private T _item_0_1_15;
+    private T _item_0_1_16;
+    private T _item_0_1_17;
+    private T _item_0_1_18;
+    private T _item_0_1_19;
+    private T _item_0_1_20;
+    private T _item_0_1_21;
+    private T _item_0_1_22;
+    private T _item_0_1_23;
+    private T _item_0_1_24;
+    private T _item_0_1_25;
+    private T _item_0_1_26;
+    private T _item_0_1_27;
+    private T _item_0_1_28;
+    private T _item_0_1_29;
+    private T _item_0_1_30;
+    private T _item_0_1_31;
+    private T _item_1_0_0;
+    private T _item_1_0_1;
+    private T _item_1_0_2;
+    private T _item_1_0_3;
+    private T _item_1_0_4;
+    private T _item_1_0_5;
+    private T _item_1_0_6;
+    private T _item_1_0_7;
+    private T _item_1_0_8;
+    private T _item_1_0_9;
+    private T _item_1_0_10;
+    private T _item_1_0_11;
+    private T _item_1_0_12;
+    private T _item_1_0_13;
+    private T _item_1_0_14;
+    private T _item_1_0_15;
+    private T _item_1_0_16;
+    private T _item_1_0_17;
+    private T _item_1_0_18;
+    private T _item_1_0_19;
+    private T _item_1_0_20;
+    private T _item_1_0_21;
+    private T _item_1_0_22;
+    private T _item_1_0_23;
+    private T _item_1_0_24;
+    private T _item_1_0_25;
+    private T _item_1_0_26;
+    private T _item_1_0_27;
+    private T _item_1_0_28;
+    private T _item_1_0_29;
+    private T _item_1_0_30;
+    private T _item_1_0_31;
+    private T _item_1_1_0;
+    private T _item_1_1_1;
+    private T _item_1_1_2;
+    private T _item_1_1_3;
+    private T _item_1_1_4;
+    private T _item_1_1_5;
+    private T _item_1_1_6;
+    private T _item_1_1_7;
+    private T _item_1_1_8;
+    private T _item_1_1_9;
+    private T _item_1_1_10;
+    private T _item_1_1_11;
+    private T _item_1_1_12;
+    private T _item_1_1_13;
+    private T _item_1_1_14;
+    private T _item_1_1_15;
+    private T _item_1_1_16;
+    private T _item_1_1_17;
+    private T _item_1_1_18;
+    private T _item_1_1_19;
+    private T _item_1_1_20;
+    private T _item_1_1_21;
+    private T _item_1_1_22;
+    private T _item_1_1_23;
+    private T _item_1_1_24;
+    private T _item_1_1_25;
+    private T _item_1_1_26;
+    private T _item_1_1_27;
+    private T _item_1_1_28;
+    private T _item_1_1_29;
+    private T _item_1_1_30;
+    private T _item_1_1_31;
+    private T _item_2_0_0;
+    private T _item_2_0_1;
+    private T _item_2_0_2;
+    private T _item_2_0_3;
+    private T _item_2_0_4;
+    private T _item_2_0_5;
+    private T _item_2_0_6;
+    private T _item_2_0_7;
+    private T _item_2_0_8;
+    private T _item_2_0_9;
+    private T _item_2_0_10;
+    private T _item_2_0_11;
+    private T _item_2_0_12;
+    private T _item_2_0_13;
+    private T _item_2_0_14;
+    private T _item_2_0_15;
+    private T _item_2_0_16;
+    private T _item_2_0_17;
+    private T _item_2_0_18;
+    private T _item_2_0_19;
+    private T _item_2_0_20;
+    private T _item_2_0_21;
+    private T _item_2_0_22;
+    private T _item_2_0_23;
+    private T _item_2_0_24;
+    private T _item_2_0_25;
+    private T _item_2_0_26;
+    private T _item_2_0_27;
+    private T _item_2_0_28;
+    private T _item_2_0_29;
+    private T _item_2_0_30;
+    private T _item_2_0_31;
+    private T _item_2_1_0;
+    private T _item_2_1_1;
+    private T _item_2_1_2;
+    private T _item_2_1_3;
+    private T _item_2_1_4;
+    private T _item_2_1_5;
+    private T _item_2_1_6;
+    private T _item_2_1_7;
+    private T _item_2_1_8;
+    private T _item_2_1_9;
+    private T _item_2_1_10;
+    private T _item_2_1_11;
+    private T _item_2_1_12;
+    private T _item_2_1_13;
+    private T _item_2_1_14;
+    private T _item_2_1_15;
+    private T _item_2_1_16;
+    private T _item_2_1_17;
+    private T _item_2_1_18;
+    private T _item_2_1_19;
+    private T _item_2_1_20;
+    private T _item_2_1_21;
+    private T _item_2_1_22;
+    private T _item_2_1_23;
+    private T _item_2_1_24;
+    private T _item_2_1_25;
+    private T _item_2_1_26;
+    private T _item_2_1_27;
+    private T _item_2_1_28;
+    private T _item_2_1_29;
+    private T _item_2_1_30;
+    private T _item_2_1_31;
+    private T _item_3_0_0;
+    private T _item_3_0_1;
+    private T _item_3_0_2;
+    private T _item_3_0_3;
+    private T _item_3_0_4;
+    private T _item_3_0_5;
+    private T _item_3_0_6;
+    private T _item_3_0_7;
+    private T _item_3_0_8;
+    private T _item_3_0_9;
+    private T _item_3_0_10;
+    private T _item_3_0_11;
+    private T _item_3_0_12;
+    private T _item_3_0_13;
+    private T _item_3_0_14;
+    private T _item_3_0_15;
+    private T _item_3_0_16;
+    private T _item_3_0_17;
+    private T _item_3_0_18;
+    private T _item_3_0_19;
+    private T _item_3_0_20;
+    private T _item_3_0_21;
+    private T _item_3_0_22;
+    private T _item_3_0_23;
+    private T _item_3_0_24;
+    private T _item_3_0_25;
+    private T _item_3_0_26;
+    private T _item_3_0_27;
+    private T _item_3_0_28;
+    private T _item_3_0_29;
+    private T _item_3_0_30;
+    private T _item_3_0_31;
+    private T _item_3_1_0;
+    private T _item_3_1_1;
+    private T _item_3_1_2;
+    private T _item_3_1_3;
+    private T _item_3_1_4;
+    private T _item_3_1_5;
+    private T _item_3_1_6;
+    private T _item_3_1_7;
+    private T _item_3_1_8;
+    private T _item_3_1_9;
+    private T _item_3_1_10;
+    private T _item_3_1_11;
+    private T _item_3_1_12;
+    private T _item_3_1_13;
+    private T _item_3_1_14;
+    private T _item_3_1_15;
+    private T _item_3_1_16;
+    private T _item_3_1_17;
+    private T _item_3_1_18;
+    private T _item_3_1_19;
+    private T _item_3_1_20;
+    private T _item_3_1_21;
+    private T _item_3_1_22;
+    private T _item_3_1_23;
+    private T _item_3_1_24;
+    private T _item_3_1_25;
+    private T _item_3_1_26;
+    private T _item_3_1_27;
+    private T _item_3_1_28;
+    private T _item_3_1_29;
+    private T _item_3_1_30;
+    private T _item_3_1_31;
+    private T _item_4_0_0;
+    private T _item_4_0_1;
+    private T _item_4_0_2;
+    private T _item_4_0_3;
+    private T _item_4_0_4;
+    private T _item_4_0_5;
+    private T _item_4_0_6;
+    private T _item_4_0_7;
+    private T _item_4_0_8;
+    private T _item_4_0_9;
+    private T _item_4_0_10;
+    private T _item_4_0_11;
+    private T _item_4_0_12;
+    private T _item_4_0_13;
+    private T _item_4_0_14;
+    private T _item_4_0_15;
+    private T _item_4_0_16;
+    private T _item_4_0_17;
+    private T _item_4_0_18;
+    private T _item_4_0_19;
+    private T _item_4_0_20;
+    private T _item_4_0_21;
+    private T _item_4_0_22;
+    private T _item_4_0_23;
+    private T _item_4_0_24;
+    private T _item_4_0_25;
+    private T _item_4_0_26;
+    private T _item_4_0_27;
+    private T _item_4_0_28;
+    private T _item_4_0_29;
+    private T _item_4_0_30;
+    private T _item_4_0_31;
+    private T _item_4_1_0;
+    private T _item_4_1_1;
+    private T _item_4_1_2;
+    private T _item_4_1_3;
+    private T _item_4_1_4;
+    private T _item_4_1_5;
+    private T _item_4_1_6;
+    private T _item_4_1_7;
+    private T _item_4_1_8;
+    private T _item_4_1_9;
+    private T _item_4_1_10;
+    private T _item_4_1_11;
+    private T _item_4_1_12;
+    private T _item_4_1_13;
+    private T _item_4_1_14;
+    private T _item_4_1_15;
+    private T _item_4_1_16;
+    private T _item_4_1_17;
+    private T _item_4_1_18;
+    private T _item_4_1_19;
+    private T _item_4_1_20;
+    private T _item_4_1_21;
+    private T _item_4_1_22;
+    private T _item_4_1_23;
+    private T _item_4_1_24;
+    private T _item_4_1_25;
+    private T _item_4_1_26;
+    private T _item_4_1_27;
+    private T _item_4_1_28;
+    private T _item_4_1_29;
+    private T _item_4_1_30;
+    private T _item_4_1_31;
+    private T _item_5_0_0;
+    private T _item_5_0_1;
+    private T _item_5_0_2;
+    private T _item_5_0_3;
+    private T _item_5_0_4;
+    private T _item_5_0_5;
+    private T _item_5_0_6;
+    private T _item_5_0_7;
+    private T _item_5_0_8;
+    private T _item_5_0_9;
+    private T _item_5_0_10;
+    private T _item_5_0_11;
+    private T _item_5_0_12;
+    private T _item_5_0_13;
+    private T _item_5_0_14;
+    private T _item_5_0_15;
+    private T _item_5_0_16;
+    private T _item_5_0_17;
+    private T _item_5_0_18;
+    private T _item_5_0_19;
+    private T _item_5_0_20;
+    private T _item_5_0_21;
+    private T _item_5_0_22;
+    private T _item_5_0_23;
+    private T _item_5_0_24;
+    private T _item_5_0_25;
+    private T _item_5_0_26;
+    private T _item_5_0_27;
+    private T _item_5_0_28;
+    private T _item_5_0_29;
+    private T _item_5_0_30;
+    private T _item_5_0_31;
+    private T _item_5_1_0;
+    private T _item_5_1_1;
+    private T _item_5_1_2;
+    private T _item_5_1_3;
+    private T _item_5_1_4;
+    private T _item_5_1_5;
+    private T _item_5_1_6;
+    private T _item_5_1_7;
+    private T _item_5_1_8;
+    private T _item_5_1_9;
+    private T _item_5_1_10;
+    private T _item_5_1_11;
+    private T _item_5_1_12;
+    private T _item_5_1_13;
+    private T _item_5_1_14;
+    private T _item_5_1_15;
+    private T _item_5_1_16;
+    private T _item_5_1_17;
+    private T _item_5_1_18;
+    private T _item_5_1_19;
+    private T _item_5_1_20;
+    private T _item_5_1_21;
+    private T _item_5_1_22;
+    private T _item_5_1_23;
+    private T _item_5_1_24;
+    private T _item_5_1_25;
+    private T _item_5_1_26;
+    private T _item_5_1_27;
+    private T _item_5_1_28;
+    private T _item_5_1_29;
+    private T _item_5_1_30;
+    private T _item_5_1_31;
+    private T _item_6_0_0;
+    private T _item_6_0_1;
+    private T _item_6_0_2;
+    private T _item_6_0_3;
+    private T _item_6_0_4;
+    private T _item_6_0_5;
+    private T _item_6_0_6;
+    private T _item_6_0_7;
+    private T _item_6_0_8;
+    private T _item_6_0_9;
+    private T _item_6_0_10;
+    private T _item_6_0_11;
+    private T _item_6_0_12;
+    private T _item_6_0_13;
+    private T _item_6_0_14;
+    private T _item_6_0_15;
+    private T _item_6_0_16;
+    private T _item_6_0_17;
+    private T _item_6_0_18;
+    private T _item_6_0_19;
+    private T _item_6_0_20;
+    private T _item_6_0_21;
+    private T _item_6_0_22;
+    private T _item_6_0_23;
+    private T _item_6_0_24;
+    private T _item_6_0_25;
+    private T _item_6_0_26;
+    private T _item_6_0_27;
+    private T _item_6_0_28;
+    private T _item_6_0_29;
+    private T _item_6_0_30;
+    private T _item_6_0_31;
+    private T _item_6_1_0;
+    private T _item_6_1_1;
+    private T _item_6_1_2;
+    private T _item_6_1_3;
+    private T _item_6_1_4;
+    private T _item_6_1_5;
+    private T _item_6_1_6;
+    private T _item_6_1_7;
+    private T _item_6_1_8;
+    private T _item_6_1_9;
+    private T _item_6_1_10;
+    private T _item_6_1_11;
+    private T _item_6_1_12;
+    private T _item_6_1_13;
+    private T _item_6_1_14;
+    private T _item_6_1_15;
+    private T _item_6_1_16;
+    private T _item_6_1_17;
+    private T _item_6_1_18;
+    private T _item_6_1_19;
+    private T _item_6_1_20;
+    private T _item_6_1_21;
+    private T _item_6_1_22;
+    private T _item_6_1_23;
+    private T _item_6_1_24;
+    private T _item_6_1_25;
+    private T _item_6_1_26;
+    private T _item_6_1_27;
+    private T _item_6_1_28;
+    private T _item_6_1_29;
+    private T _item_6_1_30;
+    private T _item_6_1_31;
+    private T _item_7_0_0;
+    private T _item_7_0_1;
+    private T _item_7_0_2;
+    private T _item_7_0_3;
+    private T _item_7_0_4;
+    private T _item_7_0_5;
+    private T _item_7_0_6;
+    private T _item_7_0_7;
+    private T _item_7_0_8;
+    private T _item_7_0_9;
+    private T _item_7_0_10;
+    private T _item_7_0_11;
+    private T _item_7_0_12;
+    private T _item_7_0_13;
+    private T _item_7_0_14;
+    private T _item_7_0_15;
+    private T _item_7_0_16;
+    private T _item_7_0_17;
+    private T _item_7_0_18;
+    private T _item_7_0_19;
+    private T _item_7_0_20;
+    private T _item_7_0_21;
+    private T _item_7_0_22;
+    private T _item_7_0_23;
+    private T _item_7_0_24;
+    private T _item_7_0_25;
+    private T _item_7_0_26;
+    private T _item_7_0_27;
+    private T _item_7_0_28;
+    private T _item_7_0_29;
+    private T _item_7_0_30;
+    private T _item_7_0_31;
+    private T _item_7_1_0;
+    private T _item_7_1_1;
+    private T _item_7_1_2;
+    private T _item_7_1_3;
+    private T _item_7_1_4;
+    private T _item_7_1_5;
+    private T _item_7_1_6;
+    private T _item_7_1_7;
+    private T _item_7_1_8;
+    private T _item_7_1_9;
+    private T _item_7_1_10;
+    private T _item_7_1_11;
+    private T _item_7_1_12;
+    private T _item_7_1_13;
+    private T _item_7_1_14;
+    private T _item_7_1_15;
+    private T _item_7_1_16;
+    private T _item_7_1_17;
+    private T _item_7_1_18;
+    private T _item_7_1_19;
+    private T _item_7_1_20;
+    private T _item_7_1_21;
+    private T _item_7_1_22;
+    private T _item_7_1_23;
+    private T _item_7_1_24;
+    private T _item_7_1_25;
+    private T _item_7_1_26;
+    private T _item_7_1_27;
+    private T _item_7_1_28;
+    private T _item_7_1_29;
+    private T _item_7_1_30;
+    private T _item_7_1_31;
+    private T _item_8_0_0;
+    private T _item_8_0_1;
+    private T _item_8_0_2;
+    private T _item_8_0_3;
+    private T _item_8_0_4;
+    private T _item_8_0_5;
+    private T _item_8_0_6;
+    private T _item_8_0_7;
+    private T _item_8_0_8;
+    private T _item_8_0_9;
+    private T _item_8_0_10;
+    private T _item_8_0_11;
+    private T _item_8_0_12;
+    private T _item_8_0_13;
+    private T _item_8_0_14;
+    private T _item_8_0_15;
+    private T _item_8_0_16;
+    private T _item_8_0_17;
+    private T _item_8_0_18;
+    private T _item_8_0_19;
+    private T _item_8_0_20;
+    private T _item_8_0_21;
+    private T _item_8_0_22;
+    private T _item_8_0_23;
+    private T _item_8_0_24;
+    private T _item_8_0_25;
+    private T _item_8_0_26;
+    private T _item_8_0_27;
+    private T _item_8_0_28;
+    private T _item_8_0_29;
+    private T _item_8_0_30;
+    private T _item_8_0_31;
+    private T _item_8_1_0;
+    private T _item_8_1_1;
+    private T _item_8_1_2;
+    private T _item_8_1_3;
+    private T _item_8_1_4;
+    private T _item_8_1_5;
+    private T _item_8_1_6;
+    private T _item_8_1_7;
+    private T _item_8_1_8;
+    private T _item_8_1_9;
+    private T _item_8_1_10;
+    private T _item_8_1_11;
+    private T _item_8_1_12;
+    private T _item_8_1_13;
+    private T _item_8_1_14;
+    private T _item_8_1_15;
+    private T _item_8_1_16;
+    private T _item_8_1_17;
+    private T _item_8_1_18;
+    private T _item_8_1_19;
+    private T _item_8_1_20;
+    private T _item_8_1_21;
+    private T _item_8_1_22;
+    private T _item_8_1_23;
+    private T _item_8_1_24;
+    private T _item_8_1_25;
+    private T _item_8_1_26;
+    private T _item_8_1_27;
+    private T _item_8_1_28;
+    private T _item_8_1_29;
+    private T _item_8_1_30;
+    private T _item_8_1_31;
+    private T _item_9_0_0;
+    private T _item_9_0_1;
+    private T _item_9_0_2;
+    private T _item_9_0_3;
+    private T _item_9_0_4;
+    private T _item_9_0_5;
+    private T _item_9_0_6;
+    private T _item_9_0_7;
+    private T _item_9_0_8;
+    private T _item_9_0_9;
+    private T _item_9_0_10;
+    private T _item_9_0_11;
+    private T _item_9_0_12;
+    private T _item_9_0_13;
+    private T _item_9_0_14;
+    private T _item_9_0_15;
+    private T _item_9_0_16;
+    private T _item_9_0_17;
+    private T _item_9_0_18;
+    private T _item_9_0_19;
+    private T _item_9_0_20;
+    private T _item_9_0_21;
+    private T _item_9_0_22;
+    private T _item_9_0_23;
+    private T _item_9_0_24;
+    private T _item_9_0_25;
+    private T _item_9_0_26;
+    private T _item_9_0_27;
+    private T _item_9_0_28;
+    private T _item_9_0_29;
+    private T _item_9_0_30;
+    private T _item_9_0_31;
+    private T _item_9_1_0;
+    private T _item_9_1_1;
+    private T _item_9_1_2;
+    private T _item_9_1_3;
+    private T _item_9_1_4;
+    private T _item_9_1_5;
+    private T _item_9_1_6;
+    private T _item_9_1_7;
+    private T _item_9_1_8;
+    private T _item_9_1_9;
+    private T _item_9_1_10;
+    private T _item_9_1_11;
+    private T _item_9_1_12;
+    private T _item_9_1_13;
+    private T _item_9_1_14;
+    private T _item_9_1_15;
+    private T _item_9_1_16;
+    private T _item_9_1_17;
+    private T _item_9_1_18;
+    private T _item_9_1_19;
+    private T _item_9_1_20;
+    private T _item_9_1_21;
+    private T _item_9_1_22;
+    private T _item_9_1_23;
+    private T _item_9_1_24;
+    private T _item_9_1_25;
+    private T _item_9_1_26;
+    private T _item_9_1_27;
+    private T _item_9_1_28;
+    private T _item_9_1_29;
+    private T _item_9_1_30;
+    private T _item_9_1_31;
+    private T _item_10_0_0;
+    private T _item_10_0_1;
+    private T _item_10_0_2;
+    private T _item_10_0_3;
+    private T _item_10_0_4;
+    private T _item_10_0_5;
+    private T _item_10_0_6;
+    private T _item_10_0_7;
+    private T _item_10_0_8;
+    private T _item_10_0_9;
+    private T _item_10_0_10;
+    private T _item_10_0_11;
+    private T _item_10_0_12;
+    private T _item_10_0_13;
+    private T _item_10_0_14;
+    private T _item_10_0_15;
+    private T _item_10_0_16;
+    private T _item_10_0_17;
+    private T _item_10_0_18;
+    private T _item_10_0_19;
+    private T _item_10_0_20;
+    private T _item_10_0_21;
+    private T _item_10_0_22;
+    private T _item_10_0_23;
+    private T _item_10_0_24;
+    private T _item_10_0_25;
+    private T _item_10_0_26;
+    private T _item_10_0_27;
+    private T _item_10_0_28;
+    private T _item_10_0_29;
+    private T _item_10_0_30;
+    private T _item_10_0_31;
+    private T _item_10_1_0;
+    private T _item_10_1_1;
+    private T _item_10_1_2;
+    private T _item_10_1_3;
+    private T _item_10_1_4;
+    private T _item_10_1_5;
+    private T _item_10_1_6;
+    private T _item_10_1_7;
+    private T _item_10_1_8;
+    private T _item_10_1_9;
+    private T _item_10_1_10;
+    private T _item_10_1_11;
+    private T _item_10_1_12;
+    private T _item_10_1_13;
+    private T _item_10_1_14;
+    private T _item_10_1_15;
+    private T _item_10_1_16;
+    private T _item_10_1_17;
+    private T _item_10_1_18;
+    private T _item_10_1_19;
+    private T _item_10_1_20;
+    private T _item_10_1_21;
+    private T _item_10_1_22;
+    private T _item_10_1_23;
+    private T _item_10_1_24;
+    private T _item_10_1_25;
+    private T _item_10_1_26;
+    private T _item_10_1_27;
+    private T _item_10_1_28;
+    private T _item_10_1_29;
+    private T _item_10_1_30;
+    private T _item_10_1_31;
+    private T _item_11_0_0;
+    private T _item_11_0_1;
+    private T _item_11_0_2;
+    private T _item_11_0_3;
+    private T _item_11_0_4;
+    private T _item_11_0_5;
+    private T _item_11_0_6;
+    private T _item_11_0_7;
+    private T _item_11_0_8;
+    private T _item_11_0_9;
+    private T _item_11_0_10;
+    private T _item_11_0_11;
+    private T _item_11_0_12;
+    private T _item_11_0_13;
+    private T _item_11_0_14;
+    private T _item_11_0_15;
+    private T _item_11_0_16;
+    private T _item_11_0_17;
+    private T _item_11_0_18;
+    private T _item_11_0_19;
+    private T _item_11_0_20;
+    private T _item_11_0_21;
+    private T _item_11_0_22;
+    private T _item_11_0_23;
+    private T _item_11_0_24;
+    private T _item_11_0_25;
+    private T _item_11_0_26;
+    private T _item_11_0_27;
+    private T _item_11_0_28;
+    private T _item_11_0_29;
+    private T _item_11_0_30;
+    private T _item_11_0_31;
+    private T _item_11_1_0;
+    private T _item_11_1_1;
+    private T _item_11_1_2;
+    private T _item_11_1_3;
+    private T _item_11_1_4;
+    private T _item_11_1_5;
+    private T _item_11_1_6;
+    private T _item_11_1_7;
+    private T _item_11_1_8;
+    private T _item_11_1_9;
+    private T _item_11_1_10;
+    private T _item_11_1_11;
+    private T _item_11_1_12;
+    private T _item_11_1_13;
+    private T _item_11_1_14;
+    private T _item_11_1_15;
+    private T _item_11_1_16;
+    private T _item_11_1_17;
+    private T _item_11_1_18;
+    private T _item_11_1_19;
+    private T _item_11_1_20;
+    private T _item_11_1_21;
+    private T _item_11_1_22;
+    private T _item_11_1_23;
+    private T _item_11_1_24;
+    private T _item_11_1_25;
+    private T _item_11_1_26;
+    private T _item_11_1_27;
+    private T _item_11_1_28;
+    private T _item_11_1_29;
+    private T _item_11_1_30;
+    private T _item_11_1_31;
+    private T _item_12_0_0;
+    private T _item_12_0_1;
+    private T _item_12_0_2;
+    private T _item_12_0_3;
+    private T _item_12_0_4;
+    private T _item_12_0_5;
+    private T _item_12_0_6;
+    private T _item_12_0_7;
+    private T _item_12_0_8;
+    private T _item_12_0_9;
+    private T _item_12_0_10;
+    private T _item_12_0_11;
+    private T _item_12_0_12;
+    private T _item_12_0_13;
+    private T _item_12_0_14;
+    private T _item_12_0_15;
+    private T _item_12_0_16;
+    private T _item_12_0_17;
+    private T _item_12_0_18;
+    private T _item_12_0_19;
+    private T _item_12_0_20;
+    private T _item_12_0_21;
+    private T _item_12_0_22;
+    private T _item_12_0_23;
+    private T _item_12_0_24;
+    private T _item_12_0_25;
+    private T _item_12_0_26;
+    private T _item_12_0_27;
+    private T _item_12_0_28;
+    private T _item_12_0_29;
+    private T _item_12_0_30;
+    private T _item_12_0_31;
+    private T _item_12_1_0;
+    private T _item_12_1_1;
+    private T _item_12_1_2;
+    private T _item_12_1_3;
+    private T _item_12_1_4;
+    private T _item_12_1_5;
+    private T _item_12_1_6;
+    private T _item_12_1_7;
+    private T _item_12_1_8;
+    private T _item_12_1_9;
+    private T _item_12_1_10;
+    private T _item_12_1_11;
+    private T _item_12_1_12;
+    private T _item_12_1_13;
+    private T _item_12_1_14;
+    private T _item_12_1_15;
+    private T _item_12_1_16;
+    private T _item_12_1_17;
+    private T _item_12_1_18;
+    private T _item_12_1_19;
+    private T _item_12_1_20;
+    private T _item_12_1_21;
+    private T _item_12_1_22;
+    private T _item_12_1_23;
+    private T _item_12_1_24;
+    private T _item_12_1_25;
+    private T _item_12_1_26;
+    private T _item_12_1_27;
+    private T _item_12_1_28;
+    private T _item_12_1_29;
+    private T _item_12_1_30;
+    private T _item_12_1_31;
+    private T _item_13_0_0;
+    private T _item_13_0_1;
+    private T _item_13_0_2;
+    private T _item_13_0_3;
+    private T _item_13_0_4;
+    private T _item_13_0_5;
+    private T _item_13_0_6;
+    private T _item_13_0_7;
+    private T _item_13_0_8;
+    private T _item_13_0_9;
+    private T _item_13_0_10;
+    private T _item_13_0_11;
+    private T _item_13_0_12;
+    private T _item_13_0_13;
+    private T _item_13_0_14;
+    private T _item_13_0_15;
+    private T _item_13_0_16;
+    private T _item_13_0_17;
+    private T _item_13_0_18;
+    private T _item_13_0_19;
+    private T _item_13_0_20;
+    private T _item_13_0_21;
+    private T _item_13_0_22;
+    private T _item_13_0_23;
+    private T _item_13_0_24;
+    private T _item_13_0_25;
+    private T _item_13_0_26;
+    private T _item_13_0_27;
+    private T _item_13_0_28;
+    private T _item_13_0_29;
+    private T _item_13_0_30;
+    private T _item_13_0_31;
+    private T _item_13_1_0;
+    private T _item_13_1_1;
+    private T _item_13_1_2;
+    private T _item_13_1_3;
+    private T _item_13_1_4;
+    private T _item_13_1_5;
+    private T _item_13_1_6;
+    private T _item_13_1_7;
+    private T _item_13_1_8;
+    private T _item_13_1_9;
+    private T _item_13_1_10;
+    private T _item_13_1_11;
+    private T _item_13_1_12;
+    private T _item_13_1_13;
+    private T _item_13_1_14;
+    private T _item_13_1_15;
+    private T _item_13_1_16;
+    private T _item_13_1_17;
+    private T _item_13_1_18;
+    private T _item_13_1_19;
+    private T _item_13_1_20;
+    private T _item_13_1_21;
+    private T _item_13_1_22;
+    private T _item_13_1_23;
+    private T _item_13_1_24;
+    private T _item_13_1_25;
+    private T _item_13_1_26;
+    private T _item_13_1_27;
+    private T _item_13_1_28;
+    private T _item_13_1_29;
+    private T _item_13_1_30;
+    private T _item_13_1_31;
+    private T _item_14_0_0;
+    private T _item_14_0_1;
+    private T _item_14_0_2;
+    private T _item_14_0_3;
+    private T _item_14_0_4;
+    private T _item_14_0_5;
+    private T _item_14_0_6;
+    private T _item_14_0_7;
+    private T _item_14_0_8;
+    private T _item_14_0_9;
+    private T _item_14_0_10;
+    private T _item_14_0_11;
+    private T _item_14_0_12;
+    private T _item_14_0_13;
+    private T _item_14_0_14;
+    private T _item_14_0_15;
+    private T _item_14_0_16;
+    private T _item_14_0_17;
+    private T _item_14_0_18;
+    private T _item_14_0_19;
+    private T _item_14_0_20;
+    private T _item_14_0_21;
+    private T _item_14_0_22;
+    private T _item_14_0_23;
+    private T _item_14_0_24;
+    private T _item_14_0_25;
+    private T _item_14_0_26;
+    private T _item_14_0_27;
+    private T _item_14_0_28;
+    private T _item_14_0_29;
+    private T _item_14_0_30;
+    private T _item_14_0_31;
+    private T _item_14_1_0;
+    private T _item_14_1_1;
+    private T _item_14_1_2;
+    private T _item_14_1_3;
+    private T _item_14_1_4;
+    private T _item_14_1_5;
+    private T _item_14_1_6;
+    private T _item_14_1_7;
+    private T _item_14_1_8;
+    private T _item_14_1_9;
+    private T _item_14_1_10;
+    private T _item_14_1_11;
+    private T _item_14_1_12;
+    private T _item_14_1_13;
+    private T _item_14_1_14;
+    private T _item_14_1_15;
+    private T _item_14_1_16;
+    private T _item_14_1_17;
+    private T _item_14_1_18;
+    private T _item_14_1_19;
+    private T _item_14_1_20;
+    private T _item_14_1_21;
+    private T _item_14_1_22;
+    private T _item_14_1_23;
+    private T _item_14_1_24;
+    private T _item_14_1_25;
+    private T _item_14_1_26;
+    private T _item_14_1_27;
+    private T _item_14_1_28;
+    private T _item_14_1_29;
+    private T _item_14_1_30;
+    private T _item_14_1_31;
+    private T _item_15_0_0;
+    private T _item_15_0_1;
+    private T _item_15_0_2;
+    private T _item_15_0_3;
+    private T _item_15_0_4;
+    private T _item_15_0_5;
+    private T _item_15_0_6;
+    private T _item_15_0_7;
+    private T _item_15_0_8;
+    private T _item_15_0_9;
+    private T _item_15_0_10;
+    private T _item_15_0_11;
+    private T _item_15_0_12;
+    private T _item_15_0_13;
+    private T _item_15_0_14;
+    private T _item_15_0_15;
+    private T _item_15_0_16;
+    private T _item_15_0_17;
+    private T _item_15_0_18;
+    private T _item_15_0_19;
+    private T _item_15_0_20;
+    private T _item_15_0_21;
+    private T _item_15_0_22;
+    private T _item_15_0_23;
+    private T _item_15_0_24;
+    private T _item_15_0_25;
+    private T _item_15_0_26;
+    private T _item_15_0_27;
+    private T _item_15_0_28;
+    private T _item_15_0_29;
+    private T _item_15_0_30;
+    private T _item_15_0_31;
+    private T _item_15_1_0;
+    private T _item_15_1_1;
+    private T _item_15_1_2;
+    private T _item_15_1_3;
+    private T _item_15_1_4;
+    private T _item_15_1_5;
+    private T _item_15_1_6;
+    private T _item_15_1_7;
+    private T _item_15_1_8;
+    private T _item_15_1_9;
+    private T _item_15_1_10;
+    private T _item_15_1_11;
+    private T _item_15_1_12;
+    private T _item_15_1_13;
+    private T _item_15_1_14;
+    private T _item_15_1_15;
+    private T _item_15_1_16;
+    private T _item_15_1_17;
+    private T _item_15_1_18;
+    private T _item_15_1_19;
+    private T _item_15_1_20;
+    private T _item_15_1_21;
+    private T _item_15_1_22;
+    private T _item_15_1_23;
+    private T _item_15_1_24;
+    private T _item_15_1_25;
+    private T _item_15_1_26;
+    private T _item_15_1_27;
+    private T _item_15_1_28;
+    private T _item_15_1_29;
+    private T _item_15_1_30;
+    private T _item_15_1_31;
+    private T _item_16_0_0;
+    private T _item_16_0_1;
+    private T _item_16_0_2;
+    private T _item_16_0_3;
+    private T _item_16_0_4;
+    private T _item_16_0_5;
+    private T _item_16_0_6;
+    private T _item_16_0_7;
+    private T _item_16_0_8;
+    private T _item_16_0_9;
+    private T _item_16_0_10;
+    private T _item_16_0_11;
+    private T _item_16_0_12;
+    private T _item_16_0_13;
+    private T _item_16_0_14;
+    private T _item_16_0_15;
+    private T _item_16_0_16;
+    private T _item_16_0_17;
+    private T _item_16_0_18;
+    private T _item_16_0_19;
+    private T _item_16_0_20;
+    private T _item_16_0_21;
+    private T _item_16_0_22;
+    private T _item_16_0_23;
+    private T _item_16_0_24;
+    private T _item_16_0_25;
+    private T _item_16_0_26;
+    private T _item_16_0_27;
+    private T _item_16_0_28;
+    private T _item_16_0_29;
+    private T _item_16_0_30;
+    private T _item_16_0_31;
+    private T _item_16_1_0;
+    private T _item_16_1_1;
+    private T _item_16_1_2;
+    private T _item_16_1_3;
+    private T _item_16_1_4;
+    private T _item_16_1_5;
+    private T _item_16_1_6;
+    private T _item_16_1_7;
+    private T _item_16_1_8;
+    private T _item_16_1_9;
+    private T _item_16_1_10;
+    private T _item_16_1_11;
+    private T _item_16_1_12;
+    private T _item_16_1_13;
+    private T _item_16_1_14;
+    private T _item_16_1_15;
+    private T _item_16_1_16;
+    private T _item_16_1_17;
+    private T _item_16_1_18;
+    private T _item_16_1_19;
+    private T _item_16_1_20;
+    private T _item_16_1_21;
+    private T _item_16_1_22;
+    private T _item_16_1_23;
+    private T _item_16_1_24;
+    private T _item_16_1_25;
+    private T _item_16_1_26;
+    private T _item_16_1_27;
+    private T _item_16_1_28;
+    private T _item_16_1_29;
+    private T _item_16_1_30;
+    private T _item_16_1_31;
+    private T _item_17_0_0;
+    private T _item_17_0_1;
+    private T _item_17_0_2;
+    private T _item_17_0_3;
+    private T _item_17_0_4;
+    private T _item_17_0_5;
+    private T _item_17_0_6;
+    private T _item_17_0_7;
+    private T _item_17_0_8;
+    private T _item_17_0_9;
+    private T _item_17_0_10;
+    private T _item_17_0_11;
+    private T _item_17_0_12;
+    private T _item_17_0_13;
+    private T _item_17_0_14;
+    private T _item_17_0_15;
+    private T _item_17_0_16;
+    private T _item_17_0_17;
+    private T _item_17_0_18;
+    private T _item_17_0_19;
+    private T _item_17_0_20;
+    private T _item_17_0_21;
+    private T _item_17_0_22;
+    private T _item_17_0_23;
+    private T _item_17_0_24;
+    private T _item_17_0_25;
+    private T _item_17_0_26;
+    private T _item_17_0_27;
+    private T _item_17_0_28;
+    private T _item_17_0_29;
+    private T _item_17_0_30;
+    private T _item_17_0_31;
+    private T _item_17_1_0;
+    private T _item_17_1_1;
+    private T _item_17_1_2;
+    private T _item_17_1_3;
+    private T _item_17_1_4;
+    private T _item_17_1_5;
+    private T _item_17_1_6;
+    private T _item_17_1_7;
+    private T _item_17_1_8;
+    private T _item_17_1_9;
+    private T _item_17_1_10;
+    private T _item_17_1_11;
+    private T _item_17_1_12;
+    private T _item_17_1_13;
+    private T _item_17_1_14;
+    private T _item_17_1_15;
+    private T _item_17_1_16;
+    private T _item_17_1_17;
+    private T _item_17_1_18;
+    private T _item_17_1_19;
+    private T _item_17_1_20;
+    private T _item_17_1_21;
+    private T _item_17_1_22;
+    private T _item_17_1_23;
+    private T _item_17_1_24;
+    private T _item_17_1_25;
+    private T _item_17_1_26;
+    private T _item_17_1_27;
+    private T _item_17_1_28;
+    private T _item_17_1_29;
+    private T _item_17_1_30;
+    private T _item_17_1_31;
+    private T _item_18_0_0;
+    private T _item_18_0_1;
+    private T _item_18_0_2;
+    private T _item_18_0_3;
+    private T _item_18_0_4;
+    private T _item_18_0_5;
+    private T _item_18_0_6;
+    private T _item_18_0_7;
+    private T _item_18_0_8;
+    private T _item_18_0_9;
+    private T _item_18_0_10;
+    private T _item_18_0_11;
+    private T _item_18_0_12;
+    private T _item_18_0_13;
+    private T _item_18_0_14;
+    private T _item_18_0_15;
+    private T _item_18_0_16;
+    private T _item_18_0_17;
+    private T _item_18_0_18;
+    private T _item_18_0_19;
+    private T _item_18_0_20;
+    private T _item_18_0_21;
+    private T _item_18_0_22;
+    private T _item_18_0_23;
+    private T _item_18_0_24;
+    private T _item_18_0_25;
+    private T _item_18_0_26;
+    private T _item_18_0_27;
+    private T _item_18_0_28;
+    private T _item_18_0_29;
+    private T _item_18_0_30;
+    private T _item_18_0_31;
+    private T _item_18_1_0;
+    private T _item_18_1_1;
+    private T _item_18_1_2;
+    private T _item_18_1_3;
+    private T _item_18_1_4;
+    private T _item_18_1_5;
+    private T _item_18_1_6;
+    private T _item_18_1_7;
+    private T _item_18_1_8;
+    private T _item_18_1_9;
+    private T _item_18_1_10;
+    private T _item_18_1_11;
+    private T _item_18_1_12;
+    private T _item_18_1_13;
+    private T _item_18_1_14;
+    private T _item_18_1_15;
+    private T _item_18_1_16;
+    private T _item_18_1_17;
+    private T _item_18_1_18;
+    private T _item_18_1_19;
+    private T _item_18_1_20;
+    private T _item_18_1_21;
+    private T _item_18_1_22;
+    private T _item_18_1_23;
+    private T _item_18_1_24;
+    private T _item_18_1_25;
+    private T _item_18_1_26;
+    private T _item_18_1_27;
+    private T _item_18_1_28;
+    private T _item_18_1_29;
+    private T _item_18_1_30;
+    private T _item_18_1_31;
+    private T _item_19_0_0;
+    private T _item_19_0_1;
+    private T _item_19_0_2;
+    private T _item_19_0_3;
+    private T _item_19_0_4;
+    private T _item_19_0_5;
+    private T _item_19_0_6;
+    private T _item_19_0_7;
+    private T _item_19_0_8;
+    private T _item_19_0_9;
+    private T _item_19_0_10;
+    private T _item_19_0_11;
+    private T _item_19_0_12;
+    private T _item_19_0_13;
+    private T _item_19_0_14;
+    private T _item_19_0_15;
+    private T _item_19_0_16;
+    private T _item_19_0_17;
+    private T _item_19_0_18;
+    private T _item_19_0_19;
+    private T _item_19_0_20;
+    private T _item_19_0_21;
+    private T _item_19_0_22;
+    private T _item_19_0_23;
+    private T _item_19_0_24;
+    private T _item_19_0_25;
+    private T _item_19_0_26;
+    private T _item_19_0_27;
+    private T _item_19_0_28;
+    private T _item_19_0_29;
+    private T _item_19_0_30;
+    private T _item_19_0_31;
+    private T _item_19_1_0;
+    private T _item_19_1_1;
+    private T _item_19_1_2;
+    private T _item_19_1_3;
+    private T _item_19_1_4;
+    private T _item_19_1_5;
+    private T _item_19_1_6;
+    private T _item_19_1_7;
+    private T _item_19_1_8;
+    private T _item_19_1_9;
+    private T _item_19_1_10;
+    private T _item_19_1_11;
+    private T _item_19_1_12;
+    private T _item_19_1_13;
+    private T _item_19_1_14;
+    private T _item_19_1_15;
+    private T _item_19_1_16;
+    private T _item_19_1_17;
+    private T _item_19_1_18;
+    private T _item_19_1_19;
+    private T _item_19_1_20;
+    private T _item_19_1_21;
+    private T _item_19_1_22;
+    private T _item_19_1_23;
+    private T _item_19_1_24;
+    private T _item_19_1_25;
+    private T _item_19_1_26;
+    private T _item_19_1_27;
+    private T _item_19_1_28;
+    private T _item_19_1_29;
+    private T _item_19_1_30;
+    private T _item_19_1_31;
+    private T _item_20_0_0;
+    private T _item_20_0_1;
+    private T _item_20_0_2;
+    private T _item_20_0_3;
+    private T _item_20_0_4;
+    private T _item_20_0_5;
+    private T _item_20_0_6;
+    private T _item_20_0_7;
+    private T _item_20_0_8;
+    private T _item_20_0_9;
+    private T _item_20_0_10;
+    private T _item_20_0_11;
+    private T _item_20_0_12;
+    private T _item_20_0_13;
+    private T _item_20_0_14;
+    private T _item_20_0_15;
+    private T _item_20_0_16;
+    private T _item_20_0_17;
+    private T _item_20_0_18;
+    private T _item_20_0_19;
+    private T _item_20_0_20;
+    private T _item_20_0_21;
+    private T _item_20_0_22;
+    private T _item_20_0_23;
+    private T _item_20_0_24;
+    private T _item_20_0_25;
+    private T _item_20_0_26;
+    private T _item_20_0_27;
+    private T _item_20_0_28;
+    private T _item_20_0_29;
+    private T _item_20_0_30;
+    private T _item_20_0_31;
+    private T _item_20_1_0;
+    private T _item_20_1_1;
+    private T _item_20_1_2;
+    private T _item_20_1_3;
+    private T _item_20_1_4;
+    private T _item_20_1_5;
+    private T _item_20_1_6;
+    private T _item_20_1_7;
+    private T _item_20_1_8;
+    private T _item_20_1_9;
+    private T _item_20_1_10;
+    private T _item_20_1_11;
+    private T _item_20_1_12;
+    private T _item_20_1_13;
+    private T _item_20_1_14;
+    private T _item_20_1_15;
+    private T _item_20_1_16;
+    private T _item_20_1_17;
+    private T _item_20_1_18;
+    private T _item_20_1_19;
+    private T _item_20_1_20;
+    private T _item_20_1_21;
+    private T _item_20_1_22;
+    private T _item_20_1_23;
+    private T _item_20_1_24;
+    private T _item_20_1_25;
+    private T _item_20_1_26;
+    private T _item_20_1_27;
+    private T _item_20_1_28;
+    private T _item_20_1_29;
+    private T _item_20_1_30;
+    private T _item_20_1_31;
+    private T _item_21_0_0;
+    private T _item_21_0_1;
+    private T _item_21_0_2;
+    private T _item_21_0_3;
+    private T _item_21_0_4;
+    private T _item_21_0_5;
+    private T _item_21_0_6;
+    private T _item_21_0_7;
+    private T _item_21_0_8;
+    private T _item_21_0_9;
+    private T _item_21_0_10;
+    private T _item_21_0_11;
+    private T _item_21_0_12;
+    private T _item_21_0_13;
+    private T _item_21_0_14;
+    private T _item_21_0_15;
+    private T _item_21_0_16;
+    private T _item_21_0_17;
+    private T _item_21_0_18;
+    private T _item_21_0_19;
+    private T _item_21_0_20;
+    private T _item_21_0_21;
+    private T _item_21_0_22;
+    private T _item_21_0_23;
+    private T _item_21_0_24;
+    private T _item_21_0_25;
+    private T _item_21_0_26;
+    private T _item_21_0_27;
+    private T _item_21_0_28;
+    private T _item_21_0_29;
+    private T _item_21_0_30;
+    private T _item_21_0_31;
+    private T _item_21_1_0;
+    private T _item_21_1_1;
+    private T _item_21_1_2;
+    private T _item_21_1_3;
+    private T _item_21_1_4;
+    private T _item_21_1_5;
+    private T _item_21_1_6;
+    private T _item_21_1_7;
+    private T _item_21_1_8;
+    private T _item_21_1_9;
+    private T _item_21_1_10;
+    private T _item_21_1_11;
+    private T _item_21_1_12;
+    private T _item_21_1_13;
+    private T _item_21_1_14;
+    private T _item_21_1_15;
+    private T _item_21_1_16;
+    private T _item_21_1_17;
+    private T _item_21_1_18;
+    private T _item_21_1_19;
+    private T _item_21_1_20;
+    private T _item_21_1_21;
+    private T _item_21_1_22;
+    private T _item_21_1_23;
+    private T _item_21_1_24;
+    private T _item_21_1_25;
+    private T _item_21_1_26;
+    private T _item_21_1_27;
+    private T _item_21_1_28;
+    private T _item_21_1_29;
+    private T _item_21_1_30;
+    private T _item_21_1_31;
+    private T _item_22_0_0;
+    private T _item_22_0_1;
+    private T _item_22_0_2;
+    private T _item_22_0_3;
+    private T _item_22_0_4;
+    private T _item_22_0_5;
+    private T _item_22_0_6;
+    private T _item_22_0_7;
+    private T _item_22_0_8;
+    private T _item_22_0_9;
+    private T _item_22_0_10;
+    private T _item_22_0_11;
+    private T _item_22_0_12;
+    private T _item_22_0_13;
+    private T _item_22_0_14;
+    private T _item_22_0_15;
+    private T _item_22_0_16;
+    private T _item_22_0_17;
+    private T _item_22_0_18;
+    private T _item_22_0_19;
+    private T _item_22_0_20;
+    private T _item_22_0_21;
+    private T _item_22_0_22;
+    private T _item_22_0_23;
+    private T _item_22_0_24;
+    private T _item_22_0_25;
+    private T _item_22_0_26;
+    private T _item_22_0_27;
+    private T _item_22_0_28;
+    private T _item_22_0_29;
+    private T _item_22_0_30;
+    private T _item_22_0_31;
+    private T _item_22_1_0;
+    private T _item_22_1_1;
+    private T _item_22_1_2;
+    private T _item_22_1_3;
+    private T _item_22_1_4;
+    private T _item_22_1_5;
+    private T _item_22_1_6;
+    private T _item_22_1_7;
+    private T _item_22_1_8;
+    private T _item_22_1_9;
+    private T _item_22_1_10;
+    private T _item_22_1_11;
+    private T _item_22_1_12;
+    private T _item_22_1_13;
+    private T _item_22_1_14;
+    private T _item_22_1_15;
+    private T _item_22_1_16;
+    private T _item_22_1_17;
+    private T _item_22_1_18;
+    private T _item_22_1_19;
+    private T _item_22_1_20;
+    private T _item_22_1_21;
+    private T _item_22_1_22;
+    private T _item_22_1_23;
+    private T _item_22_1_24;
+    private T _item_22_1_25;
+    private T _item_22_1_26;
+    private T _item_22_1_27;
+    private T _item_22_1_28;
+    private T _item_22_1_29;
+    private T _item_22_1_30;
+    private T _item_22_1_31;
+    private T _item_23_0_0;
+    private T _item_23_0_1;
+    private T _item_23_0_2;
+    private T _item_23_0_3;
+    private T _item_23_0_4;
+    private T _item_23_0_5;
+    private T _item_23_0_6;
+    private T _item_23_0_7;
+    private T _item_23_0_8;
+    private T _item_23_0_9;
+    private T _item_23_0_10;
+    private T _item_23_0_11;
+    private T _item_23_0_12;
+    private T _item_23_0_13;
+    private T _item_23_0_14;
+    private T _item_23_0_15;
+    private T _item_23_0_16;
+    private T _item_23_0_17;
+    private T _item_23_0_18;
+    private T _item_23_0_19;
+    private T _item_23_0_20;
+    private T _item_23_0_21;
+    private T _item_23_0_22;
+    private T _item_23_0_23;
+    private T _item_23_0_24;
+    private T _item_23_0_25;
+    private T _item_23_0_26;
+    private T _item_23_0_27;
+    private T _item_23_0_28;
+    private T _item_23_0_29;
+    private T _item_23_0_30;
+    private T _item_23_0_31;
+    private T _item_23_1_0;
+    private T _item_23_1_1;
+    private T _item_23_1_2;
+    private T _item_23_1_3;
+    private T _item_23_1_4;
+    private T _item_23_1_5;
+    private T _item_23_1_6;
+    private T _item_23_1_7;
+    private T _item_23_1_8;
+    private T _item_23_1_9;
+    private T _item_23_1_10;
+    private T _item_23_1_11;
+    private T _item_23_1_12;
+    private T _item_23_1_13;
+    private T _item_23_1_14;
+    private T _item_23_1_15;
+    private T _item_23_1_16;
+    private T _item_23_1_17;
+    private T _item_23_1_18;
+    private T _item_23_1_19;
+    private T _item_23_1_20;
+    private T _item_23_1_21;
+    private T _item_23_1_22;
+    private T _item_23_1_23;
+    private T _item_23_1_24;
+    private T _item_23_1_25;
+    private T _item_23_1_26;
+    private T _item_23_1_27;
+    private T _item_23_1_28;
+    private T _item_23_1_29;
+    private T _item_23_1_30;
+    private T _item_23_1_31;
+    private T _item_24_0_0;
+    private T _item_24_0_1;
+    private T _item_24_0_2;
+    private T _item_24_0_3;
+    private T _item_24_0_4;
+    private T _item_24_0_5;
+    private T _item_24_0_6;
+    private T _item_24_0_7;
+    private T _item_24_0_8;
+    private T _item_24_0_9;
+    private T _item_24_0_10;
+    private T _item_24_0_11;
+    private T _item_24_0_12;
+    private T _item_24_0_13;
+    private T _item_24_0_14;
+    private T _item_24_0_15;
+    private T _item_24_0_16;
+    private T _item_24_0_17;
+    private T _item_24_0_18;
+    private T _item_24_0_19;
+    private T _item_24_0_20;
+    private T _item_24_0_21;
+    private T _item_24_0_22;
+    private T _item_24_0_23;
+    private T _item_24_0_24;
+    private T _item_24_0_25;
+    private T _item_24_0_26;
+    private T _item_24_0_27;
+    private T _item_24_0_28;
+    private T _item_24_0_29;
+    private T _item_24_0_30;
+    private T _item_24_0_31;
+    private T _item_24_1_0;
+    private T _item_24_1_1;
+    private T _item_24_1_2;
+    private T _item_24_1_3;
+    private T _item_24_1_4;
+    private T _item_24_1_5;
+    private T _item_24_1_6;
+    private T _item_24_1_7;
+    private T _item_24_1_8;
+    private T _item_24_1_9;
+    private T _item_24_1_10;
+    private T _item_24_1_11;
+    private T _item_24_1_12;
+    private T _item_24_1_13;
+    private T _item_24_1_14;
+    private T _item_24_1_15;
+    private T _item_24_1_16;
+    private T _item_24_1_17;
+    private T _item_24_1_18;
+    private T _item_24_1_19;
+    private T _item_24_1_20;
+    private T _item_24_1_21;
+    private T _item_24_1_22;
+    private T _item_24_1_23;
+    private T _item_24_1_24;
+    private T _item_24_1_25;
+    private T _item_24_1_26;
+    private T _item_24_1_27;
+    private T _item_24_1_28;
+    private T _item_24_1_29;
+    private T _item_24_1_30;
+    private T _item_24_1_31;
+    private T _item_25_0_0;
+    private T _item_25_0_1;
+    private T _item_25_0_2;
+    private T _item_25_0_3;
+    private T _item_25_0_4;
+    private T _item_25_0_5;
+    private T _item_25_0_6;
+    private T _item_25_0_7;
+    private T _item_25_0_8;
+    private T _item_25_0_9;
+    private T _item_25_0_10;
+    private T _item_25_0_11;
+    private T _item_25_0_12;
+    private T _item_25_0_13;
+    private T _item_25_0_14;
+    private T _item_25_0_15;
+    private T _item_25_0_16;
+    private T _item_25_0_17;
+    private T _item_25_0_18;
+    private T _item_25_0_19;
+    private T _item_25_0_20;
+    private T _item_25_0_21;
+    private T _item_25_0_22;
+    private T _item_25_0_23;
+    private T _item_25_0_24;
+    private T _item_25_0_25;
+    private T _item_25_0_26;
+    private T _item_25_0_27;
+    private T _item_25_0_28;
+    private T _item_25_0_29;
+    private T _item_25_0_30;
+    private T _item_25_0_31;
+    private T _item_25_1_0;
+    private T _item_25_1_1;
+    private T _item_25_1_2;
+    private T _item_25_1_3;
+    private T _item_25_1_4;
+    private T _item_25_1_5;
+    private T _item_25_1_6;
+    private T _item_25_1_7;
+    private T _item_25_1_8;
+    private T _item_25_1_9;
+    private T _item_25_1_10;
+    private T _item_25_1_11;
+    private T _item_25_1_12;
+    private T _item_25_1_13;
+    private T _item_25_1_14;
+    private T _item_25_1_15;
+    private T _item_25_1_16;
+    private T _item_25_1_17;
+    private T _item_25_1_18;
+    private T _item_25_1_19;
+    private T _item_25_1_20;
+    private T _item_25_1_21;
+    private T _item_25_1_22;
+    private T _item_25_1_23;
+    private T _item_25_1_24;
+    private T _item_25_1_25;
+    private T _item_25_1_26;
+    private T _item_25_1_27;
+    private T _item_25_1_28;
+    private T _item_25_1_29;
+    private T _item_25_1_30;
+    private T _item_25_1_31;
+    private T _item_26_0_0;
+    private T _item_26_0_1;
+    private T _item_26_0_2;
+    private T _item_26_0_3;
+    private T _item_26_0_4;
+    private T _item_26_0_5;
+    private T _item_26_0_6;
+    private T _item_26_0_7;
+    private T _item_26_0_8;
+    private T _item_26_0_9;
+    private T _item_26_0_10;
+    private T _item_26_0_11;
+    private T _item_26_0_12;
+    private T _item_26_0_13;
+    private T _item_26_0_14;
+    private T _item_26_0_15;
+    private T _item_26_0_16;
+    private T _item_26_0_17;
+    private T _item_26_0_18;
+    private T _item_26_0_19;
+    private T _item_26_0_20;
+    private T _item_26_0_21;
+    private T _item_26_0_22;
+    private T _item_26_0_23;
+    private T _item_26_0_24;
+    private T _item_26_0_25;
+    private T _item_26_0_26;
+    private T _item_26_0_27;
+    private T _item_26_0_28;
+    private T _item_26_0_29;
+    private T _item_26_0_30;
+    private T _item_26_0_31;
+    private T _item_26_1_0;
+    private T _item_26_1_1;
+    private T _item_26_1_2;
+    private T _item_26_1_3;
+    private T _item_26_1_4;
+    private T _item_26_1_5;
+    private T _item_26_1_6;
+    private T _item_26_1_7;
+    private T _item_26_1_8;
+    private T _item_26_1_9;
+    private T _item_26_1_10;
+    private T _item_26_1_11;
+    private T _item_26_1_12;
+    private T _item_26_1_13;
+    private T _item_26_1_14;
+    private T _item_26_1_15;
+    private T _item_26_1_16;
+    private T _item_26_1_17;
+    private T _item_26_1_18;
+    private T _item_26_1_19;
+    private T _item_26_1_20;
+    private T _item_26_1_21;
+    private T _item_26_1_22;
+    private T _item_26_1_23;
+    private T _item_26_1_24;
+    private T _item_26_1_25;
+    private T _item_26_1_26;
+    private T _item_26_1_27;
+    private T _item_26_1_28;
+    private T _item_26_1_29;
+    private T _item_26_1_30;
+    private T _item_26_1_31;
+    private T _item_27_0_0;
+    private T _item_27_0_1;
+    private T _item_27_0_2;
+    private T _item_27_0_3;
+    private T _item_27_0_4;
+    private T _item_27_0_5;
+    private T _item_27_0_6;
+    private T _item_27_0_7;
+    private T _item_27_0_8;
+    private T _item_27_0_9;
+    private T _item_27_0_10;
+    private T _item_27_0_11;
+    private T _item_27_0_12;
+    private T _item_27_0_13;
+    private T _item_27_0_14;
+    private T _item_27_0_15;
+    private T _item_27_0_16;
+    private T _item_27_0_17;
+    private T _item_27_0_18;
+    private T _item_27_0_19;
+    private T _item_27_0_20;
+    private T _item_27_0_21;
+    private T _item_27_0_22;
+    private T _item_27_0_23;
+    private T _item_27_0_24;
+    private T _item_27_0_25;
+    private T _item_27_0_26;
+    private T _item_27_0_27;
+    private T _item_27_0_28;
+    private T _item_27_0_29;
+    private T _item_27_0_30;
+    private T _item_27_0_31;
+    private T _item_27_1_0;
+    private T _item_27_1_1;
+    private T _item_27_1_2;
+    private T _item_27_1_3;
+    private T _item_27_1_4;
+    private T _item_27_1_5;
+    private T _item_27_1_6;
+    private T _item_27_1_7;
+    private T _item_27_1_8;
+    private T _item_27_1_9;
+    private T _item_27_1_10;
+    private T _item_27_1_11;
+    private T _item_27_1_12;
+    private T _item_27_1_13;
+    private T _item_27_1_14;
+    private T _item_27_1_15;
+    private T _item_27_1_16;
+    private T _item_27_1_17;
+    private T _item_27_1_18;
+    private T _item_27_1_19;
+    private T _item_27_1_20;
+    private T _item_27_1_21;
+    private T _item_27_1_22;
+    private T _item_27_1_23;
+    private T _item_27_1_24;
+    private T _item_27_1_25;
+    private T _item_27_1_26;
+    private T _item_27_1_27;
+    private T _item_27_1_28;
+    private T _item_27_1_29;
+    private T _item_27_1_30;
+    private T _item_27_1_31;
+    private T _item_28_0_0;
+    private T _item_28_0_1;
+    private T _item_28_0_2;
+    private T _item_28_0_3;
+    private T _item_28_0_4;
+    private T _item_28_0_5;
+    private T _item_28_0_6;
+    private T _item_28_0_7;
+    private T _item_28_0_8;
+    private T _item_28_0_9;
+    private T _item_28_0_10;
+    private T _item_28_0_11;
+    private T _item_28_0_12;
+    private T _item_28_0_13;
+    private T _item_28_0_14;
+    private T _item_28_0_15;
+    private T _item_28_0_16;
+    private T _item_28_0_17;
+    private T _item_28_0_18;
+    private T _item_28_0_19;
+    private T _item_28_0_20;
+    private T _item_28_0_21;
+    private T _item_28_0_22;
+    private T _item_28_0_23;
+    private T _item_28_0_24;
+    private T _item_28_0_25;
+    private T _item_28_0_26;
+    private T _item_28_0_27;
+    private T _item_28_0_28;
+    private T _item_28_0_29;
+    private T _item_28_0_30;
+    private T _item_28_0_31;
+    private T _item_28_1_0;
+    private T _item_28_1_1;
+    private T _item_28_1_2;
+    private T _item_28_1_3;
+    private T _item_28_1_4;
+    private T _item_28_1_5;
+    private T _item_28_1_6;
+    private T _item_28_1_7;
+    private T _item_28_1_8;
+    private T _item_28_1_9;
+    private T _item_28_1_10;
+    private T _item_28_1_11;
+    private T _item_28_1_12;
+    private T _item_28_1_13;
+    private T _item_28_1_14;
+    private T _item_28_1_15;
+    private T _item_28_1_16;
+    private T _item_28_1_17;
+    private T _item_28_1_18;
+    private T _item_28_1_19;
+    private T _item_28_1_20;
+    private T _item_28_1_21;
+    private T _item_28_1_22;
+    private T _item_28_1_23;
+    private T _item_28_1_24;
+    private T _item_28_1_25;
+    private T _item_28_1_26;
+    private T _item_28_1_27;
+    private T _item_28_1_28;
+    private T _item_28_1_29;
+    private T _item_28_1_30;
+    private T _item_28_1_31;
+    private T _item_29_0_0;
+    private T _item_29_0_1;
+    private T _item_29_0_2;
+    private T _item_29_0_3;
+    private T _item_29_0_4;
+    private T _item_29_0_5;
+    private T _item_29_0_6;
+    private T _item_29_0_7;
+    private T _item_29_0_8;
+    private T _item_29_0_9;
+    private T _item_29_0_10;
+    private T _item_29_0_11;
+    private T _item_29_0_12;
+    private T _item_29_0_13;
+    private T _item_29_0_14;
+    private T _item_29_0_15;
+    private T _item_29_0_16;
+    private T _item_29_0_17;
+    private T _item_29_0_18;
+    private T _item_29_0_19;
+    private T _item_29_0_20;
+    private T _item_29_0_21;
+    private T _item_29_0_22;
+    private T _item_29_0_23;
+    private T _item_29_0_24;
+    private T _item_29_0_25;
+    private T _item_29_0_26;
+    private T _item_29_0_27;
+    private T _item_29_0_28;
+    private T _item_29_0_29;
+    private T _item_29_0_30;
+    private T _item_29_0_31;
+    private T _item_29_1_0;
+    private T _item_29_1_1;
+    private T _item_29_1_2;
+    private T _item_29_1_3;
+    private T _item_29_1_4;
+    private T _item_29_1_5;
+    private T _item_29_1_6;
+    private T _item_29_1_7;
+    private T _item_29_1_8;
+    private T _item_29_1_9;
+    private T _item_29_1_10;
+    private T _item_29_1_11;
+    private T _item_29_1_12;
+    private T _item_29_1_13;
+    private T _item_29_1_14;
+    private T _item_29_1_15;
+    private T _item_29_1_16;
+    private T _item_29_1_17;
+    private T _item_29_1_18;
+    private T _item_29_1_19;
+    private T _item_29_1_20;
+    private T _item_29_1_21;
+    private T _item_29_1_22;
+    private T _item_29_1_23;
+    private T _item_29_1_24;
+    private T _item_29_1_25;
+    private T _item_29_1_26;
+    private T _item_29_1_27;
+    private T _item_29_1_28;
+    private T _item_29_1_29;
+    private T _item_29_1_30;
+    private T _item_29_1_31;
+    private T _item_30_0_0;
+    private T _item_30_0_1;
+    private T _item_30_0_2;
+    private T _item_30_0_3;
+    private T _item_30_0_4;
+    private T _item_30_0_5;
+    private T _item_30_0_6;
+    private T _item_30_0_7;
+    private T _item_30_0_8;
+    private T _item_30_0_9;
+    private T _item_30_0_10;
+    private T _item_30_0_11;
+    private T _item_30_0_12;
+    private T _item_30_0_13;
+    private T _item_30_0_14;
+    private T _item_30_0_15;
+    private T _item_30_0_16;
+    private T _item_30_0_17;
+    private T _item_30_0_18;
+    private T _item_30_0_19;
+    private T _item_30_0_20;
+    private T _item_30_0_21;
+    private T _item_30_0_22;
+    private T _item_30_0_23;
+    private T _item_30_0_24;
+    private T _item_30_0_25;
+    private T _item_30_0_26;
+    private T _item_30_0_27;
+    private T _item_30_0_28;
+    private T _item_30_0_29;
+    private T _item_30_0_30;
+    private T _item_30_0_31;
+    private T _item_30_1_0;
+    private T _item_30_1_1;
+    private T _item_30_1_2;
+    private T _item_30_1_3;
+    private T _item_30_1_4;
+    private T _item_30_1_5;
+    private T _item_30_1_6;
+    private T _item_30_1_7;
+    private T _item_30_1_8;
+    private T _item_30_1_9;
+    private T _item_30_1_10;
+    private T _item_30_1_11;
+    private T _item_30_1_12;
+    private T _item_30_1_13;
+    private T _item_30_1_14;
+    private T _item_30_1_15;
+    private T _item_30_1_16;
+    private T _item_30_1_17;
+    private T _item_30_1_18;
+    private T _item_30_1_19;
+    private T _item_30_1_20;
+    private T _item_30_1_21;
+    private T _item_30_1_22;
+    private T _item_30_1_23;
+    private T _item_30_1_24;
+    private T _item_30_1_25;
+    private T _item_30_1_26;
+    private T _item_30_1_27;
+    private T _item_30_1_28;
+    private T _item_30_1_29;
+    private T _item_30_1_30;
+    private T _item_30_1_31;
+    private T _item_31_0_0;
+    private T _item_31_0_1;
+    private T _item_31_0_2;
+    private T _item_31_0_3;
+    private T _item_31_0_4;
+    private T _item_31_0_5;
+    private T _item_31_0_6;
+    private T _item_31_0_7;
+    private T _item_31_0_8;
+    private T _item_31_0_9;
+    private T _item_31_0_10;
+    private T _item_31_0_11;
+    private T _item_31_0_12;
+    private T _item_31_0_13;
+    private T _item_31_0_14;
+    private T _item_31_0_15;
+    private T _item_31_0_16;
+    private T _item_31_0_17;
+    private T _item_31_0_18;
+    private T _item_31_0_19;
+    private T _item_31_0_20;
+    private T _item_31_0_21;
+    private T _item_31_0_22;
+    private T _item_31_0_23;
+    private T _item_31_0_24;
+    private T _item_31_0_25;
+    private T _item_31_0_26;
+    private T _item_31_0_27;
+    private T _item_31_0_28;
+    private T _item_31_0_29;
+    private T _item_31_0_30;
+    private T _item_31_0_31;
+    private T _item_31_1_0;
+    private T _item_31_1_1;
+    private T _item_31_1_2;
+    private T _item_31_1_3;
+    private T _item_31_1_4;
+    private T _item_31_1_5;
+    private T _item_31_1_6;
+    private T _item_31_1_7;
+    private T _item_31_1_8;
+    private T _item_31_1_9;
+    private T _item_31_1_10;
+    private T _item_31_1_11;
+    private T _item_31_1_12;
+    private T _item_31_1_13;
+    private T _item_31_1_14;
+    private T _item_31_1_15;
+    private T _item_31_1_16;
+    private T _item_31_1_17;
+    private T _item_31_1_18;
+    private T _item_31_1_19;
+    private T _item_31_1_20;
+    private T _item_31_1_21;
+    private T _item_31_1_22;
+    private T _item_31_1_23;
+    private T _item_31_1_24;
+    private T _item_31_1_25;
+    private T _item_31_1_26;
+    private T _item_31_1_27;
+    private T _item_31_1_28;
+    private T _item_31_1_29;
+    private T _item_31_1_30;
+    private T _item_31_1_31;
+
+    static Vector32x2x32()
+    {
+        if (typeof(T) == typeof(bool))
+        {
+            throw new ArgumentException("Boolean is not supported in vector type.");
+        }
+    }
+
+    public static Vector32x2x32<T> Create(T[] array)
+    {
+        Vector32x2x32<T> vec = default;
+        var src = array.AsSpan();
+        var dest = vec.AsSpan();
+        src.CopyTo(dest);
+        return vec;
+    }
+
+    public T this[int i, int j, int k]
+    {
+        get => Unsafe.Add(ref Unsafe.AsRef(in _item_0_0_0), ((i * Height) + j) * Width + k);
+        set => Unsafe.Add(ref Unsafe.AsRef(in _item_0_0_0), ((i * Height) + j) * Width + k) = value;
+    }
+
+    public bool Equals(Vector32x2x32<T> other) => AsSpan().SequenceEqual(other.AsSpan());
+
+    public override bool Equals([NotNullWhen(true)] object obj) => obj is Vector32x2x32<T> other && Equals(other);
+
+    public Span<T> AsSpan() => MemoryMarshal.CreateSpan(ref Unsafe.AsRef(in _item_0_0_0), Count);
+
+
+    public Span<T> AsSpan(int i, int j) => MemoryMarshal.CreateSpan(ref Unsafe.Add(ref Unsafe.AsRef(in _item_0_0_0), ((i * Height) + j) * Width), Width);
+
+    public static int Depth => 32;
+
+    public static int Height => 2;
+
+    public static int Width => 32;
+
+    public static int Count => Depth * Height * Width;
+
+
+    public override string ToString()
+    {
+        var sb = new System.Text.StringBuilder();
+        sb.Append("<");
+        for (int i = 0; i < Depth; i++)
+        {
+            sb.Append("<");
+            for (int j = 0; j < Height; j++)
+            {
+                sb.Append($"<{Nncase.Utilities.StringUtility.Join<T>(',', AsSpan(i, j))}>");
+                if (j < Height - 1)
+                {
+                    sb.Append(",");
+                }
+            }
+
+            sb.Append(">");
+            if (i < Depth - 1)
+            {
+                sb.Append(",");
+            }
+        }
+
         sb.Append(">");
         return sb.ToString();
     }

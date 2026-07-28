@@ -1,0 +1,46 @@
+{% import "triton/kernels/_common.py.jinja" as common with context %}
+{% import "triton/kernels/_producer_consumer.py.jinja" as phases with context %}
+{% set packed = model.get("PackedN", false) %}
+{% set ctx = matmul_glu_context(model, packed=packed) %}
+# generated from PyNTT algorithm triton.matmul_glu/mma
+# {{ model["Comment"] }}; glu={{ model["GluType"] }}, input_dtype={{ model["InputDType"] }}, weight_dtype={{ model["WeightDType"] }}, output_dtype={{ model["OutputDType"] }}, input_shape={{ shape_tuple(model["InputShape"]) }}, gate_weight_shape={{ shape_tuple(model["GateWeightShape"]) }}, up_weight_shape={{ shape_tuple(model["UpWeightShape"]) }}, output_shape={{ shape_tuple(model["OutputShape"]) }}{{ ", n_packed_lane=" ~ model["NPackedLaneCount"] ~ ", n_lane=" ~ model["NVectorLaneCount"] ~ ", n_scalar_lane=" ~ (model["NPackedLaneCount"] * model["NVectorLaneCount"]) if packed else "" }}
+{{ phases.consumer_header(model) }}
+    shard_index = tl.program_id(0).to(tl.int64)
+{{ common.matrix_shared_aliases(ctx, model["InputTritonDType"], model["WeightTritonDType"], [ctx["block_m"], ctx["block_k"]], [ctx["block_k"], ctx["block_n"]], true) }}
+{% set pointer_keys = ("Input", "GateWeight", "UpWeight", "GateBias", "UpBias", "Output") %}
+{% set pointers = namespace(values=[]) %}
+{% for key in pointer_keys %}{% do pointers.values.append(model[key]) %}{% endfor %}
+{{ common.shard_coordinates(pointers.values) }}
+{% for name, key in (("input0", "Input"), ("gate_weight", "GateWeight"), ("up_weight", "UpWeight"), ("gate_bias", "GateBias"), ("up_bias", "UpBias"), ("output", "Output")) %}
+    {{ name }} = {{ ptr(model, key) }}
+{% endfor %}
+{% for axis in ctx["batch_axes"] %}
+{{ "    " * loop.index }}for idx{{ axis }} in tl.range(0, {{ dim(ctx["logical_output_shape"][axis]) }}):
+{% endfor %}
+{% set base = "    " * ((ctx["batch_axes"] | length) + 1) %}
+{{ base }}for m_start in tl.range(0, {{ dim(ctx["m"]) }}, {{ ctx["block_m"] }}):
+{{ base }}    offs_m = m_start + tl.arange(0, {{ ctx["block_m"] }})
+{% set tile = base ~ "    " %}
+{{ tile }}for n_start in tl.range(0, {{ dim(ctx["physical_n"]) }}, {{ ctx["physical_block_n"] }}):
+{{ common.structured_axis(ctx["weight_n_axis"], tile ~ "    ") }}
+{{ common.structured_axis(ctx["output_n_axis"], tile ~ "    ") }}
+{{ tile }}    gate_acc = tl.zeros(({{ ctx["block_m"] }}, {{ ctx["block_n"] }}), tl.float32)
+{{ tile }}    up_acc = tl.zeros(({{ ctx["block_m"] }}, {{ ctx["block_n"] }}), tl.float32)
+{{ tile }}    for k_start in tl.range(0, {{ dim(ctx["k"]) }}, {{ ctx["block_k"] }}):
+{{ tile }}        offs_k = k_start + tl.arange(0, {{ ctx["block_k"] }})
+{{ tile }}        input_values = tl.load({{ access_pointer(model, "Input", "input0", ctx["input_access"]) }}, mask={{ ctx["input_mask"] }}, other=0.0)
+{% for projection in ctx["projections"] %}
+{{ tile }}        {{ projection["lower"] }}_weight_values = tl.reshape(tl.load({{ access_pointer(model, projection["prefix"] ~ "Weight", projection["lower"] ~ "_weight", projection["weight_access"]) }}, mask={{ projection["weight_mask"] }}, other=0.0), {{ ctx["weight_matrix_shape"] }})
+{{ tile }}        {{ projection["accumulator"] }} += tl.dot(input_values, {{ projection["lower"] }}_weight_values{{ ctx["dot_precision"] }})
+{% endfor %}
+{% for projection in ctx["projections"] %}
+{% if projection["has_bias"] %}
+{{ tile }}    {{ projection["lower"] }}_bias_values = tl.reshape(tl.load({{ access_pointer(model, projection["prefix"] ~ "Bias", projection["lower"] ~ "_bias", projection["bias_access"]) }}, mask={{ projection["bias_mask"] }}, other=0.0), ({{ ctx["block_n"] }},)).to(tl.float32)
+{{ tile }}    {{ projection["accumulator"] }} += {{ projection["lower"] }}_bias_values[None, :]
+{% endif %}
+{% endfor %}
+{{ tile }}    result = {{ ctx["result_expression"] }}
+{{ tile }}    tl.store({{ access_pointer(model, "Output", "output", ctx["output_access"]) }}, tl.reshape(result, {{ ctx["output_structured_shape"] }}), mask={{ ctx["output_mask"] }})
+
+
+{{ phases.dispatch(model) }}

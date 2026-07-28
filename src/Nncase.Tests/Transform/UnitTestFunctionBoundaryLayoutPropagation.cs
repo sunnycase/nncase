@@ -209,6 +209,79 @@ public sealed class UnitTestFunctionBoundaryLayoutPropagation : TestClassBase
     }
 
     [Fact]
+    public async Task TestInputRelayoutChainIsHoistedByFixedPoint()
+    {
+        var layerInput = new Var("layer_input", new TensorType(DataTypes.Float32, new RankedShape(8, 16)));
+        var oldLayout = Pack(layerInput, [4], [1]);
+        var scalar = Unpack(oldLayout, [4], [1]);
+        var newLayout = Pack(scalar, [2], [0]);
+        var layer = new Function("layer", IR.F.Math.Unary(UnaryOp.Abs, newLayout), layerInput);
+        Assert.True(layer.InferenceType());
+
+        var input = new Var("input", new TensorType(DataTypes.Float32, new RankedShape(8, 16)));
+        var main = new Function("main", new Call(layer, input), input);
+        Assert.True(main.InferenceType());
+
+        var module = new IRModule(main);
+        module.Add(layer);
+        await new FunctionBoundaryLayoutPropagationPass().RunAsync(module, new());
+
+        AssertNoLayoutFunctions(module);
+        var specialized = GetFunction(module, "layer");
+        var parameter = Assert.IsType<Var>(Assert.Single(specialized.Parameters.ToArray()));
+        Assert.Equal(
+            new TensorType(new VectorType(DataTypes.Float32, [2]), new RankedShape(4, 16)),
+            parameter.CheckedType);
+
+        var specializedBody = CompilerServices.Print(specialized.Body);
+        Assert.DoesNotContain("Pack(", specializedBody, StringComparison.Ordinal);
+        Assert.DoesNotContain("Unpack(", specializedBody, StringComparison.Ordinal);
+
+        var specializedCall = Assert.IsType<Call>(main.Body);
+        var boundaryPack = Assert.IsType<Call>(specializedCall.Arguments[0]);
+        var pack = Assert.IsType<Nncase.IR.Tensors.Pack>(boundaryPack.Target);
+        Assert.Equal(new[] { 2 }, pack.Lanes.ToArray());
+        Assert.Equal(new[] { 0 }, pack.Axes.ToArray());
+    }
+
+    [Fact]
+    public async Task TestCompilerInsertedRestoreDoesNotReverseInputPropagation()
+    {
+        var packedType = new TensorType(
+            new VectorType(DataTypes.Float32, [4]),
+            new RankedShape(4, 4));
+        var scalarType = new TensorType(DataTypes.Float32, new RankedShape(4, 16));
+        var layerInput = new Var("layer_input", packedType);
+        var scalar = Unpack(layerInput, [4], [1]);
+        var layer = new Function(
+            "layer",
+            new IR.Tuple(layerInput, IR.F.Math.Unary(UnaryOp.Abs, scalar)),
+            layerInput);
+        Assert.True(layer.InferenceType());
+
+        var input = new Var("input", packedType);
+        var main = new Function("main", new Call(layer, input), input);
+        Assert.True(main.InferenceType());
+
+        var module = new IRModule(main);
+        module.Add(layer);
+        await new FunctionBoundaryLayoutPropagationPass().RunAsync(module, new());
+
+        AssertNoLayoutFunctions(module);
+        var specialized = GetFunction(module, "layer");
+        var parameter = Assert.IsType<Var>(Assert.Single(specialized.Parameters.ToArray()));
+        Assert.Equal(scalarType, parameter.CheckedType);
+
+        var specializedBody = CompilerServices.Print(specialized.Body);
+        Assert.Equal(1, Count(specializedBody, "Pack("));
+        Assert.DoesNotContain("Unpack(", specializedBody, StringComparison.Ordinal);
+
+        var specializedCall = Assert.IsType<Call>(main.Body);
+        var boundaryUnpack = Assert.IsType<Call>(specializedCall.Arguments[0]);
+        Assert.IsType<Nncase.IR.Tensors.Unpack>(boundaryUnpack.Target);
+    }
+
+    [Fact]
     public async Task TestNonTensorParametersArePreserved()
     {
         var layerInput = new Var("layer_input", new TensorType(DataTypes.Float32, new RankedShape(4, 16)));

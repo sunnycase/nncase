@@ -509,7 +509,9 @@ public sealed class UnitTestTritonTargetCostModel : TestClassBase
             32,
             n4Register.Parameters.Single(parameter => parameter.Name == TritonBlockMicroKernelContract.InnerNParameter).Value.Var().Max());
 
-        var packedOp = new Nncase.TIR.NTT.PackedMatMul(false);
+        var packedOp = new Nncase.TIR.NTT.PackedMatMul(
+            false,
+            Nncase.IR.NTT.PackedMatMulRhsLayout.NMajor);
         var packedContext = new TileWorkloadContext(
             packedOp,
             fullShapes.Select(shape => shape.ToImmutableArray()).ToImmutableArray(),

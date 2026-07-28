@@ -1,17 +1,13 @@
 {% import "triton/kernels/_common.py.jinja" as common with context %}
+{% import "triton/kernels/_producer_consumer.py.jinja" as phases with context %}
 {% set ctx = softmax_context(model) %}
 # generated from PyNTT Jinja Softmax.py.jinja
 # {{ model["Comment"] }}; input_dtype={{ model["InputDType"] }}, output_dtype={{ model["OutputDType"] }}, shape={{ shape_tuple(model["Shape"]) }}, axis={{ model["Axis"] }}
-{{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
-def {{ model["FunctionName"] }}({{ helper_parameters(model) }}):
+{{ phases.consumer_header(model) }}
     shard_index = tl.program_id(0).to(tl.int64)
 {{ common.shard_coordinates([model["Input"], model["Output"]]) }}
-{% if local_buffer(model["Input"]) is none %}
     input0 = {{ ptr(model, "Input") }}
-{% endif %}
-{% if local_buffer(model["Output"]) is none %}
     output = {{ ptr(model, "Output") }}
-{% endif %}
 {% for axis in ctx["loop_axes"] %}
 {{ "    " * loop.index }}for idx{{ axis }} in tl.range(0, {{ dim(model["Shape"][axis]) }}):
 {% endfor %}
@@ -32,3 +28,6 @@ def {{ model["FunctionName"] }}({{ helper_parameters(model) }}):
 {{ body }}value0 = tl.load({{ access_pointer(model, "Input", "input0", ctx["input_offset"]) }}, mask=mask, other=-float("inf"))
 {{ body }}result = tl.exp(value0 - max_value) / sum_value
 {{ body }}tl.store({{ access_pointer(model, "Output", "output", ctx["output_offset"]) }}, result, mask=mask)
+
+
+{{ phases.dispatch(model) }}

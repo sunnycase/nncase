@@ -17,3 +17,8 @@
 {% endfor %}
 {{ indent }}{{ axis["name"] }}_logical = {{ axis["logical_expression"] }}
 {%- endmacro %}
+
+{% macro matrix_shared_aliases(ctx, lhs_dtype, rhs_dtype, lhs_shape, rhs_shape, use_mma_layout) %}
+    lhs_stage = tle.gpu.alloc({{ pyrepr(lhs_shape) }}, dtype={{ lhs_dtype }}, layout=None, scope=tle.gpu.smem, alias=pyntt_shared_arena, alias_offset_bytes={{ ctx["microkernel"]["shared_workspace_offsets"]["lhs_stage"] }}, nv_mma_shared_layout={{ "True" if use_mma_layout else "False" }})
+    rhs_stage = tle.gpu.alloc({{ pyrepr(rhs_shape) }}, dtype={{ rhs_dtype }}, layout=None, scope=tle.gpu.smem, alias=pyntt_shared_arena, alias_offset_bytes={{ ctx["microkernel"]["shared_workspace_offsets"]["rhs_stage"] }}, nv_mma_shared_layout={{ "True" if use_mma_layout else "False" }})
+{%- endmacro %}

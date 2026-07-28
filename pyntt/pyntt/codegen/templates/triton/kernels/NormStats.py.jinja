@@ -1,18 +1,14 @@
 {% import "triton/kernels/_common.py.jinja" as common with context %}
 {% import "triton/kernels/_elementwise.py.jinja" as elementwise with context %}
+{% import "triton/kernels/_producer_consumer.py.jinja" as phases with context %}
 {% set ctx = norm_stats_context(model) %}
 # generated from PyNTT Jinja NormStats.py.jinja
 # {{ model["Comment"] }}; input_dtype={{ model["InputDType"] }}, output_dtype={{ model["OutputDType"] }}, input_shape={{ shape_tuple(model["InputShape"]) }}, output_shape={{ shape_tuple(model["OutputShape"]) }}, axis={{ model["Axis"] }}
-{{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
-def {{ model["FunctionName"] }}({{ helper_parameters(model) }}):
+{{ phases.consumer_header(model) }}
     shard_index = tl.program_id(0).to(tl.int64)
 {{ common.shard_coordinates([model["Input"], model["Output"]]) }}
-{% if local_buffer(model["Input"]) is none %}
     input0 = {{ ptr(model, "Input") }}
-{% endif %}
-{% if local_buffer(model["Output"]) is none %}
     output = {{ ptr(model, "Output") }}
-{% endif %}
 {% for axis in ctx["outer_axes"] %}
 {{ "    " * loop.index }}for outer_idx{{ axis }} in tl.range(0, {{ dim(ctx["logical_input_shape"][axis]) }}):
 {% endfor %}
@@ -35,3 +31,6 @@ def {{ model["FunctionName"] }}({{ helper_parameters(model) }}):
 {% else %}
 {{ base }}tl.store({{ access_pointer(model, "Output", "output", ctx["stats_accesses"][0]) }}, square_sum, mask=True)
 {% endif %}
+
+
+{{ phases.dispatch(model) }}

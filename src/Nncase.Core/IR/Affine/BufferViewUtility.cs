@@ -68,34 +68,63 @@ public static class BufferViewUtility
     /// Derives element strides for a typed buffer alias over existing storage.
     /// </summary>
     public static Dimension[] CreateBufferViewStrides(TIR.Buffer source, TensorType resultType, BufferViewTransform transform)
+        => CreateBufferViewStrides(
+            source.ElemType,
+            source.Dimensions,
+            source.Strides,
+            source.DistributedType,
+            resultType,
+            transform);
+
+    /// <summary>
+    /// Derives element strides for a typed buffer alias from an explicit source
+    /// layout descriptor.
+    /// </summary>
+    public static Dimension[] CreateBufferViewStrides(
+        DataType sourceElemType,
+        ReadOnlySpan<Dimension> sourceDimensions,
+        ReadOnlySpan<Dimension> sourceStrides,
+        DistributedType? sourceDistributedType,
+        TensorType resultType,
+        BufferViewTransform transform)
     {
-        var sourceDefaultStrides = TensorUtilities.GetDefaultStrides(source.Dimensions);
-        var sourceDenseStrides = GetDenseStrides(source.Dimensions);
+        if (sourceDimensions.Length != sourceStrides.Length)
+        {
+            throw new ArgumentException(
+                $"Buffer view source rank mismatch: dimensions={sourceDimensions.Length}, strides={sourceStrides.Length}.");
+        }
+
+        var sourceDefaultStrides = TensorUtilities.GetDefaultStrides(sourceDimensions);
+        var sourceDenseStrides = GetDenseStrides(sourceDimensions);
+        var resultDimensions = ((RankedShape)resultType.Shape).Dimensions.ToArray();
         var prefixRank = 0;
-        var comparableRank = System.Math.Min(transform.SourceMap.Results.Length, transform.ResultMap.Results.Length);
-        while (prefixRank < comparableRank && transform.SourceMap.Results[prefixRank].Equals(transform.ResultMap.Results[prefixRank]))
+        var comparableRank = System.Math.Min(
+            System.Math.Min(transform.SourceMap.Results.Length, transform.ResultMap.Results.Length),
+            System.Math.Min(sourceDimensions.Length, resultDimensions.Length));
+        while (prefixRank < comparableRank &&
+               sourceDimensions[prefixRank].Equals(resultDimensions[prefixRank]) &&
+               transform.SourceMap.Results[prefixRank].Equals(transform.ResultMap.Results[prefixRank]))
         {
             prefixRank++;
         }
 
-        for (var axis = prefixRank; axis < source.Rank; axis++)
+        for (var axis = prefixRank; axis < sourceDimensions.Length; axis++)
         {
-            if (!source.Strides[axis].Equals(sourceDefaultStrides[axis]) &&
-                !source.Strides[axis].Equals(sourceDenseStrides[axis]) &&
-                !IsDegenerateSourceDimension(source, axis))
+            if (!sourceStrides[axis].Equals(sourceDefaultStrides[axis]) &&
+                !sourceStrides[axis].Equals(sourceDenseStrides[axis]) &&
+                !IsDegenerateSourceDimension(sourceDimensions, sourceDistributedType, axis))
             {
                 throw new NotSupportedException(
-                    $"Buffer view cannot reshape non-contiguous source suffix at axis {axis}: stride={source.Strides[axis]}, " +
+                    $"Buffer view cannot reshape non-contiguous source suffix at axis {axis}: stride={sourceStrides[axis]}, " +
                     $"expected={sourceDefaultStrides[axis]} or dense stride {sourceDenseStrides[axis]}.");
             }
         }
 
-        var resultDimensions = ((RankedShape)resultType.Shape).Dimensions.ToArray();
         var resultStrides = TensorUtilities.GetDefaultStrides(resultDimensions);
-        var sharedPrefixRank = System.Math.Min(prefixRank, System.Math.Min(source.Rank, resultDimensions.Length));
+        var sharedPrefixRank = System.Math.Min(prefixRank, System.Math.Min(sourceDimensions.Length, resultDimensions.Length));
         for (var axis = 0; axis < sharedPrefixRank; axis++)
         {
-            var sourceByteStride = source.Strides[axis] * source.ElemType.SizeInBytes;
+            var sourceByteStride = sourceStrides[axis] * sourceElemType.SizeInBytes;
             if (sourceByteStride is DimConst byteStride && byteStride.Value % resultType.DType.SizeInBytes != 0)
             {
                 throw new NotSupportedException(
@@ -614,16 +643,19 @@ public static class BufferViewUtility
         => IsUnitDimension(dimension) ||
            (dimension.Metadata.Range is { } range && range.Min >= 0 && range.Max <= 1);
 
-    private static bool IsDegenerateSourceDimension(TIR.Buffer source, int axis)
+    private static bool IsDegenerateSourceDimension(
+        ReadOnlySpan<Dimension> sourceDimensions,
+        DistributedType? sourceDistributedType,
+        int axis)
     {
-        if (IsDegenerateDimension(source.Dimensions[axis]))
+        if (IsDegenerateDimension(sourceDimensions[axis]))
         {
             return true;
         }
 
-        if (source.DistributedType is not { } distributedType ||
-            DistributedUtility.GetDividedTensorType(distributedType).Shape is not RankedShape localShape ||
-            localShape.Rank != source.Rank)
+        if (sourceDistributedType is null ||
+            DistributedUtility.GetDividedTensorType(sourceDistributedType).Shape is not RankedShape localShape ||
+            localShape.Rank != sourceDimensions.Length)
         {
             return false;
         }

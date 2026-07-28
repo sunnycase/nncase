@@ -1,16 +1,14 @@
 {% import "triton/kernels/_common.py.jinja" as common with context %}
 {% import "triton/kernels/_elementwise.py.jinja" as elementwise with context %}
+{% import "triton/kernels/_producer_consumer.py.jinja" as phases with context %}
 {% set ctx = elementwise_where_context(model) %}
 # generated from PyNTT Jinja ElementwiseWhere.py.jinja
 # {{ model["Comment"] }}; cond_dtype={{ model["CondDType"] }}, value_dtype={{ model["ValueDType"] }}, output_dtype={{ model["OutputDType"] }}, shape={{ shape_tuple(model["Shape"]) }}
-{{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
-def {{ model["FunctionName"] }}({{ helper_parameters(model) }}):
+{{ phases.consumer_header(model) }}
     shard_index = tl.program_id(0).to(tl.int64)
 {{ common.shard_coordinates([model["Cond"], model["TrueValue"], model["FalseValue"], model["Output"]]) }}
 {% for name, key in (("cond", "Cond"), ("true_value", "TrueValue"), ("false_value", "FalseValue"), ("output", "Output")) %}
-{% if local_buffer(model[key]) is none %}
     {{ name }} = {{ ptr(model, key) }}
-{% endif %}
 {% endfor %}
 {% call(indent) elementwise.iterate(ctx) %}
 {{ indent }}predicate_value = tl.load({{ access_pointer(model, "Cond", "cond", ctx["cond_access"]) }}, mask=mask, other=0)
@@ -20,3 +18,6 @@ def {{ model["FunctionName"] }}({{ helper_parameters(model) }}):
 {{ indent }}result = tl.where(predicate, value0, value1)
 {{ indent }}tl.store({{ access_pointer(model, "Output", "output", ctx["output_access"]) }}, {{ "(result).to(tl.uint8)" if is_bool_dtype(model["OutputDType"]) else "result" }}, mask=mask)
 {% endcall %}
+
+
+{{ phases.dispatch(model) }}

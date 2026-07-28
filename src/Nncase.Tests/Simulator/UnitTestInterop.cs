@@ -38,7 +38,9 @@ public class UnitTestInteropIntegrated : TestClassBase
         var main = new PrimFunction("main_prim", CPUTarget.Kind, body, new[] { x });
         var module = new IRModule(main);
         var funcGroups = module.Functions.OfType<PrimFunction>().GroupBy(x => x.ModuleKind);
-        new BufferizeVisitor(funcGroups.First()).Bufferize();
+        new BufferizeVisitor(
+            funcGroups.First(),
+            ((ITargetMachineModelProvider)CompileOptions.TargetOptions).TargetMachineModel).Bufferize();
         var target = CompilerServices.GetTarget(CPUTarget.Kind);
         var modelBuilder = new ModelBuilder(target, CompileOptions);
         var linkedModel = modelBuilder.Build(module);

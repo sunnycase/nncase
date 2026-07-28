@@ -1,15 +1,13 @@
 {% import "triton/kernels/_common.py.jinja" as common with context %}
+{% import "triton/kernels/_producer_consumer.py.jinja" as phases with context %}
 {% set ctx = layer_norm_context(model) %}
 # generated from PyNTT Jinja LayerNorm.py.jinja
 # {{ model["Comment"] }}; input_dtype={{ model["InputDType"] }}, scale_dtype={{ model["ScaleDType"] }}, bias_dtype={{ model["BiasDType"] }}, output_dtype={{ model["OutputDType"] }}, output_shape={{ shape_tuple(model["OutputShape"]) }}, axis={{ model["Axis"] }}
-{{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
-def {{ model["FunctionName"] }}({{ helper_parameters(model) }}):
+{{ phases.consumer_header(model) }}
     shard_index = tl.program_id(0).to(tl.int64)
 {{ common.shard_coordinates([model["Input"], model["Scale"], model["Bias"], model["Output"]]) }}
 {% for name, key in (("input0", "Input"), ("scale0", "Scale"), ("bias0", "Bias"), ("output", "Output")) %}
-{% if local_buffer(model[key]) is none %}
     {{ name }} = {{ ptr(model, key) }}
-{% endif %}
 {% endfor %}
     tl.static_assert(block_size % {{ ctx["common_lane_count"] }} == 0, "LayerNorm block_size must contain whole vector lanes")
 {% for axis in ctx["outer_axes"] %}
@@ -60,3 +58,6 @@ def {{ model["FunctionName"] }}({{ helper_parameters(model) }}):
 {{ body }}bias_value = tl.load({{ access_pointer(model, "Bias", "bias0", ctx["bias_access"]) }}, mask=mask, other=0.0).to(tl.float32)
 {{ body }}result = ((value0 - mean_value) * inv_std * scale_value) + bias_value
 {{ body }}tl.store({{ access_pointer(model, "Output", "output", ctx["output_access"]) }}, result, mask=mask)
+
+
+{{ phases.dispatch(model) }}

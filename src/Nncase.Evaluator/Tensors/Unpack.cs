@@ -2,7 +2,6 @@
 // Licensed under the Apache license. See LICENSE file in the project root for full license information.
 #pragma warning disable SA1010, SA1008
 using System;
-using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
 using DryIoc.ImTools;
@@ -41,19 +40,6 @@ public sealed class UnpackEvaluator : ITypeInferencer<Unpack>, ICostEvaluator<Un
         };
 
         return input.ToOrtTensor(preType).Unpack(oldLanesCount, axes).ToTensor(postType);
-    }
-
-    private static Dictionary<int, int> GetAxisLaneProducts(IRArray<int> lanes, IRArray<int> axes)
-    {
-        var products = new Dictionary<int, int>();
-        for (int i = 0; i < axes.Count; i++)
-        {
-            products[axes[i]] = products.TryGetValue(axes[i], out var product)
-                ? checked(product * lanes[i])
-                : lanes[i];
-        }
-
-        return products;
     }
 
     /// <inheritdoc/>
@@ -116,29 +102,11 @@ public sealed class UnpackEvaluator : ITypeInferencer<Unpack>, ICostEvaluator<Un
 
     private IRType Visit(ITypeInferenceContext context, Unpack target, DistributedType input)
     {
-        if (Visit(context, target, input.TensorType) is not TensorType tensorType)
+        if (Visit(context, target, input.TensorType) is not TensorType)
         {
             throw new InvalidOperationException();
         }
 
-        // [m]<8>@8@4 -> [m*8]@8@4, when max(m)=256 and runtime m=12, input and output have different local shape.
-        var axisLaneProducts = GetAxisLaneProducts(target.Lanes, target.Axes);
-        var newPolicies = input.AxisPolicies.ToArray();
-        foreach (var (s, r) in input.AxisPolicies.Select((s, r) => (s, r)))
-        {
-            if (s is SBPSplit split && axisLaneProducts.TryGetValue(r, out var laneProduct))
-            {
-                var divisor = split.Axes.Select(a => input.Placement.Hierarchy[a]).Aggregate(1, (a, b) => a * b);
-                var dim = input.TensorType.Shape[r];
-                if (!(dim.IsFixed && dim.FixedValue % divisor == 0))
-                {
-                    return new InvalidType("Not support non-divisible input");
-                }
-
-                newPolicies[r] = SBP.S(split.Axes, split.Granularity is not null ? split.Granularity * laneProduct : null);
-            }
-        }
-
-        return new DistributedType(tensorType, newPolicies, input.Placement);
+        return TypeInference.UnpackType(input, target.Axes);
     }
 }

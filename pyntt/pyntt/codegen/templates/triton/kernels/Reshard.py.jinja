@@ -1,15 +1,13 @@
 {% import "triton/kernels/_common.py.jinja" as common with context %}
 {% import "triton/kernels/_elementwise.py.jinja" as elementwise with context %}
+{% import "triton/kernels/_producer_consumer.py.jinja" as phases with context %}
 {% set ctx = reshard_context(model) %}
 # generated from PyNTT Jinja Reshard.py.jinja
 # {{ model["Comment"] }}; dtype={{ model["DType"] }}, global_shape={{ shape_tuple(model["GlobalShape"]) }}, input_tile_shape={{ shape_tuple(model["InputActiveShape"]) }}, output_local_shape={{ shape_tuple(model["OutputLocalShape"]) }}, lane={{ model["VectorLaneCount"] }}, stage=tile_scatter
-{{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
-def {{ model["FunctionName"] }}({{ helper_parameters(model) }}):
+{{ phases.consumer_header(model) }}
     shard_index = tl.program_id(0).to(tl.int64)
 {{ common.shard_coordinates([model["Input"]]) }}
-{% if local_buffer(model["Input"]) is none %}
     input0 = {{ ptr(model, "Input") }}
-{% endif %}
     tmp_shard = shard_index
 {% for axis in reverse_indices(model["Hierarchy"]) %}
     shard_coord{{ axis }} = tmp_shard % {{ model["Hierarchy"][axis] }}
@@ -70,3 +68,6 @@ def {{ model["FunctionName"] }}({{ helper_parameters(model) }}):
 {% endif %}
 {{ body }}tl.store(({{ model["OutputAddress"]["BaseName"] }} + output_byte_offsets).to({{ ctx["output_pointer_type"] }}), value, mask=mask)
 {% endcall %}
+
+
+{{ phases.dispatch(model) }}

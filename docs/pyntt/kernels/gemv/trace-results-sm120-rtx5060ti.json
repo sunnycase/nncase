@@ -1,0 +1,161 @@
+{
+  "schema_version": 2,
+  "environment": {
+    "torch_version": "2.8.0+cu128",
+    "triton_version": "3.6.0",
+    "device": "NVIDIA GeForce RTX 5060 Ti",
+    "compute_capability": "12.0",
+    "sm_count": 36,
+    "warp_size": 32,
+    "l2_cache_bytes": 33554432
+  },
+  "measurement": {
+    "clock": "%clock64",
+    "timer_read_delta_median_cycles": 1.0,
+    "raw_output_policy": "Full per-sample traces are generated under build/ and are not versioned.",
+    "trace_tool": "trace_pipeline.py",
+    "model_calibration_policy": "Warm one-tile median with one active CTA and an empty one-stage pipe.",
+    "samples_per_mode": 101
+  },
+  "isolated_one_tile_candidates": {
+    "timestamp_utc_range": [
+      "2026-07-27T06:23:05Z",
+      "2026-07-27T06:23:15Z"
+    ],
+    "common_configuration": {
+      "n": 64,
+      "tile_n": 64,
+      "stages": 1,
+      "grid": 36,
+      "active_ctas": 1,
+      "consumer_warps": 8,
+      "producer_warps": 1
+    },
+    "component_probe": {
+      "group_shape": [
+        64,
+        32
+      ],
+      "group_payload_bytes": 4096,
+      "ffma_cycles_per_group_barrier_corrected_median": 27.0390625,
+      "barrier_cycles_median": 18.0
+    },
+    "candidates": [
+      {
+        "tile_k": 32,
+        "warm_cycles": {
+          "acquire_median": 48.0,
+          "issue_commit_median": 70.0,
+          "issue_commit_mad": 0.0,
+          "issue_to_consume_median": 564.0,
+          "issue_to_consume_mad": 1.0
+        },
+        "compiled": {
+          "cp_async": 8,
+          "shared_vector_loads": 1,
+          "spill_load_bytes": 0,
+          "spill_store_bytes": 0
+        },
+        "maximum_absolute_trace_overhead_fraction": 0.04071619996122566
+      },
+      {
+        "tile_k": 64,
+        "warm_cycles": {
+          "acquire_median": 53.0,
+          "issue_commit_median": 116.0,
+          "issue_commit_mad": 0.0,
+          "issue_to_consume_median": 683.0,
+          "issue_to_consume_mad": 1.0
+        },
+        "compiled": {
+          "cp_async": 16,
+          "shared_vector_loads": 2,
+          "spill_load_bytes": 0,
+          "spill_store_bytes": 0
+        },
+        "maximum_absolute_trace_overhead_fraction": 0.0361222785319808
+      },
+      {
+        "tile_k": 128,
+        "warm_cycles": {
+          "acquire_median": 59.0,
+          "issue_commit_median": 227.0,
+          "issue_commit_mad": 1.0,
+          "issue_to_consume_median": 949.0,
+          "issue_to_consume_mad": 1.0
+        },
+        "compiled": {
+          "cp_async": 32,
+          "shared_vector_loads": 4,
+          "spill_load_bytes": 0,
+          "spill_store_bytes": 0
+        },
+        "maximum_absolute_trace_overhead_fraction": 0.048845264136243904
+      },
+      {
+        "tile_k": 256,
+        "warm_cycles": {
+          "acquire_median": 68.0,
+          "issue_commit_median": 443.0,
+          "issue_commit_mad": 0.0,
+          "issue_to_consume_median": 1456.0,
+          "issue_to_consume_mad": 2.0
+        },
+        "compiled": {
+          "cp_async": 64,
+          "shared_vector_loads": 8,
+          "spill_load_bytes": 0,
+          "spill_store_bytes": 0
+        },
+        "maximum_absolute_trace_overhead_fraction": 0.04305408658510512
+      }
+    ]
+  },
+  "persistent_full_shape": {
+    "timestamp_utc": "2026-07-27T05:57:06Z",
+    "configuration": {
+      "k": 4096,
+      "n": 12288,
+      "tile_n": 64,
+      "tile_k": 128,
+      "trace_k_tile": 8,
+      "grid": 36,
+      "consumer_warps": 8,
+      "producer_warps": 1,
+      "samples_per_mode": 21
+    },
+    "maximum_absolute_trace_overhead_fraction": 0.004904869329197092,
+    "cold_issue_commit_cycles": [
+      {
+        "stages": 1,
+        "median": 411.0,
+        "mad": 2.0
+      },
+      {
+        "stages": 2,
+        "median": 453.0,
+        "mad": 26.0
+      },
+      {
+        "stages": 3,
+        "median": 506.0,
+        "mad": 15.0
+      },
+      {
+        "stages": 4,
+        "median": 521.0,
+        "mad": 9.0
+      },
+      {
+        "stages": 5,
+        "median": 507.0,
+        "mad": 7.0
+      },
+      {
+        "stages": 6,
+        "median": 506.0,
+        "mad": 3.0
+      }
+    ]
+  }
+}

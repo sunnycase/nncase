@@ -135,7 +135,6 @@ public unsafe struct CApiMT
     public delegate* unmanaged<IntPtr> PyNTTTargetOptionsCreatePtr;
     public delegate* unmanaged<IntPtr, byte*, nuint, void> PyNTTTargetOptionsSetBackendPtr;
     public delegate* unmanaged<IntPtr, byte*, nuint, void> PyNTTTargetOptionsSetOutputDirectoryPtr;
-    public delegate* unmanaged<IntPtr, byte, void> PyNTTTargetOptionsSetStrictPtr;
     /* end the auto generated block by tools/stackvm_gen/CApiGen at 12/20/2024 5:31:31 PM +08:00. */
     public delegate* unmanaged<IntPtr, IntPtr> RTValueFromHandlePtr;
     public delegate* unmanaged<IntPtr, IntPtr> RTValueGetHandlePtr;
@@ -277,7 +276,6 @@ public static unsafe class CApi
         mt->PyNTTTargetOptionsCreatePtr = &PyNTTTargetOptionsCreate;
         mt->PyNTTTargetOptionsSetBackendPtr = &PyNTTTargetOptionsSetBackend;
         mt->PyNTTTargetOptionsSetOutputDirectoryPtr = &PyNTTTargetOptionsSetOutputDirectory;
-        mt->PyNTTTargetOptionsSetStrictPtr = &PyNTTTargetOptionsSetStrict;
         /* end the auto generated block by tools/stackvm_gen/CApiGen at 12/20/2024 3:41:05 PM +08:00. */
         mt->RTValueFromHandlePtr = &RTValueFromHandle;
         mt->RTValueGetHandlePtr = &RTValueGetHandle;
@@ -1138,12 +1136,6 @@ public static unsafe class CApi
     private static void PyNTTTargetOptionsSetOutputDirectory(IntPtr handle, byte* value, nuint length)
     {
         Get<PyNTTTargetOptions>(handle).OutputDirectory = ToString(value, length);
-    }
-
-    [UnmanagedCallersOnly]
-    private static void PyNTTTargetOptionsSetStrict(IntPtr handle, byte value)
-    {
-        Get<PyNTTTargetOptions>(handle).Strict = value != 0;
     }
 
     /* end the auto generated block by tools/stackvm_gen/CApiGen at 12/20/2024 3:41:05 PM +08:00. */

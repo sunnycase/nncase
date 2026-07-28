@@ -36,12 +36,20 @@ public class IRMetadata
     /// </summary>
     public Schedule.BlockMicroKernelSelection? BlockMicroKernel { get; set; }
 
+    /// <summary>
+    /// Gets or sets the concrete target microkernel selected during TIR
+    /// Selection. Its shared workspaces are also represented explicitly as TIR
+    /// operands; this metadata carries only the target implementation choice.
+    /// </summary>
+    public Schedule.TIRMicroKernelSelection? TIRMicroKernel { get; set; }
+
     public IRMetadata Clone()
         => new()
         {
             OutputNames = OutputNames,
             Range = Range,
             BlockMicroKernel = BlockMicroKernel,
+            TIRMicroKernel = TIRMicroKernel,
         };
 }
 

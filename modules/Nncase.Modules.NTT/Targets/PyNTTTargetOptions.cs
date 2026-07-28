@@ -3,7 +3,6 @@
 
 using System;
 using System.ComponentModel;
-using Nncase.CostModel;
 using Nncase.Schedule;
 
 namespace Nncase.Targets;
@@ -37,7 +36,12 @@ public sealed class PyNTTTargetOptions : NTTTargetOptions
         get => _backend;
         set
         {
-            _backend = value;
+            if (!string.Equals(value, "triton", StringComparison.OrdinalIgnoreCase))
+            {
+                throw new ArgumentException($"PyNTT supports only the triton backend, got '{value}'.", nameof(value));
+            }
+
+            _backend = "triton";
             RefreshTargetCostModel();
         }
     }
@@ -49,14 +53,6 @@ public sealed class PyNTTTargetOptions : NTTTargetOptions
     [Description("PyNTT generated Python model directory.")]
     [DefaultValue("")]
     public string OutputDirectory { get; set; } = string.Empty;
-
-    /// <summary>
-    /// Gets or sets a value indicating whether PyNTT should reject unsupported constructs strictly.
-    /// </summary>
-    [DisplayName("--pyntt-strict")]
-    [Description("Reject unsupported PyNTT constructs instead of falling back.")]
-    [DefaultValue(true)]
-    public bool Strict { get; set; } = true;
 
     public static PyNTTTargetOptions FromNTTTargetOptions(NTTTargetOptions nttOptions)
     {
@@ -81,18 +77,11 @@ public sealed class PyNTTTargetOptions : NTTTargetOptions
 
     protected override void OnTargetMachineChanged()
     {
-        TargetCostModel = string.Equals(_backend, "triton", StringComparison.OrdinalIgnoreCase)
-            ? new TritonTargetOpCostModel(TargetMachineModel)
-            : new DefaultTargetOpCostModel(TargetMachineModel);
-        BlockMicroKernelModel = string.Equals(_backend, "triton", StringComparison.OrdinalIgnoreCase)
-            ? new TritonBlockMicroKernelModel()
-            : new DefaultBlockMicroKernelModel();
-        StorageEncodingModel = string.Equals(_backend, "triton", StringComparison.OrdinalIgnoreCase)
-            ? new TritonTargetStorageEncodingModel()
-            : new DefaultTargetStorageEncodingModel();
-        LoopPipelineBackend = string.Equals(_backend, "triton", StringComparison.OrdinalIgnoreCase)
-            ? TritonLoopPipelineBackend.Instance
-            : new EmptyLoopPipelineBackend();
+        TargetCostModel = new TritonTargetOpCostModel(TargetMachineModel);
+        BlockMicroKernelModel = new DefaultBlockMicroKernelModel();
+        TIRMicroKernelSelector = new TritonTIRMicroKernelSelector();
+        StorageEncodingModel = new DefaultTargetStorageEncodingModel();
+        LoopPipelineBackend = new EmptyLoopPipelineBackend();
     }
 
     private void RefreshTargetCostModel() => OnTargetMachineChanged();

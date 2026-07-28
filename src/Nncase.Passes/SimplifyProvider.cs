@@ -41,6 +41,8 @@ internal sealed class SimplifyTarget : ITarget
 
     public void RegisterAffineSelectionPass(IPassManager passManager, CompileOptions options) => throw new NotImplementedException();
 
+    public void RegisterAutoTilingPass(IPassManager passManager, CompileOptions options) => throw new NotImplementedException();
+
     public void RegisterAutoPackingRules(IRulesAddable pass, CompileOptions options) => throw new NotImplementedException();
 
     public void RegisterAutoVectorizeRules(IRulesAddable pass, CompileOptions options) => throw new NotImplementedException();

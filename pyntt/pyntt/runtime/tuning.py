@@ -55,7 +55,7 @@ def tuning_parameter_candidates(
 
         return (value,)
 
-    if source not in ("search_space", "autotune", "auto_tiling"):
+    if source not in ("search_space", "autotune"):
         raise PyNTTSpecError(
             f"Unsupported PyNTT tuning source for {kernel_name}.{parameter_name}: {source}."
         )

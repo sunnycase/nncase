@@ -25,7 +25,6 @@ from tools.pyntt_qwen3_benchmark import StepMeasurement
 from tools.pyntt_qwen3_benchmark import _package_contract_json
 from tools.pyntt_qwen3_benchmark import build_argument_parser
 from tools.pyntt_qwen3_benchmark import drive_token_by_token
-from tools.pyntt_qwen3_benchmark import inspect_compiled_pipeline_artifacts
 from tools.pyntt_qwen3_benchmark import inspect_generated_package
 from tools.pyntt_qwen3_benchmark import main
 from tools.pyntt_qwen3_benchmark import parse_annotations
@@ -35,9 +34,6 @@ from tools.pyntt_qwen3_benchmark import prepare_isolated_triton_cache
 from tools.pyntt_qwen3_benchmark import render_comparison_svg
 from tools.pyntt_qwen3_benchmark import run_benchmark
 from tools.pyntt_qwen3_benchmark import summarize_ms
-
-
-_REGION_ID = "main_prim/pipeline_op0_packed_mat_mul__reduction0"
 
 
 def test_latency_summary_uses_linear_percentiles():
@@ -59,11 +55,11 @@ def test_scenario_and_annotation_parsing_are_strict():
     assert scenario.model_calls == 22
 
     assert parse_annotations(
-        ["pipeline_depth=2", 'policy="explicit"', "tag=nightly"]
+        ["template_revision=2", 'policy="explicit"', "tag=nightly"]
     ) == {
-        "pipeline_depth": 2,
         "policy": "explicit",
         "tag": "nightly",
+        "template_revision": 2,
     }
     with pytest.raises(ValueError, match="positive"):
         parse_scenario("bad:0:3")
@@ -88,11 +84,8 @@ def test_token_driver_prefills_and_decodes_one_token_per_call():
 
     result = drive_token_by_token([10, 11, 12], 3, schedule_one, invoke_one)
 
-    # Three prompt calls produce token 100; only tokens 100 and 101 are fed
-    # back to obtain three output tokens in total.
     assert [item[0] for item in invocations] == [10, 11, 12, 100, 101]
     assert [item[2] for item in invocations] == [False, False, True, True, True]
-    assert [item[1]["query_len"] for item in invocations] == [1, 1, 1, 1, 1]
     assert scheduled_contexts == [0, 1, 2, 3, 4]
     assert result["generated_token_ids"] == [100, 101, 102]
     assert result["prefill_cuda_ms"] == [1.0, 1.0, 1.0]
@@ -100,80 +93,9 @@ def test_token_driver_prefills_and_decodes_one_token_per_call():
     assert result["total_model_cuda_ms"] == pytest.approx(5.0)
 
 
-def _pipeline_execution(
-    *,
-    region_id=_REGION_ID,
-    marker="__PYNTT_PIPELINE_EXECUTION_0__",
-    descriptor_name="rhs_shared_buffer_0",
-    arena_offset_bytes=0,
-):
-    allocation = {
-        "buffer_name": "rhs_shared",
-        "descriptor_name": descriptor_name,
-        "stage_count": 2,
-        "stage_physical_bytes": 64,
-        "stage_stride_bytes": 64,
-        "physical_bytes": 128,
-        "arena_id": "pyntt_shared_arena",
-        "arena_offset_bytes": arena_offset_bytes,
-        "scalar_element_size_bytes": 2,
-        "triton_dtype": "tl.float16",
-        "logical_stage_shape": [32],
-        "logical_stage_strides": [1],
-        "vector_lane_shape": [1],
-        "descriptor_shape": [2, 32],
-        "storage_encoding": "linear",
-        "nv_mma_shared_layout": False,
-    }
-    return {
-        "marker": marker,
-        "region_id": region_id,
-        "schedule_id": "qwen3.packed-matmul.k.cp-async.n2",
-        "template_id": "triton.loop.cp_async.n2.v1",
-        "stage_count": 2,
-        "prefetch_distance": 1,
-        "partition": "full",
-        "synchronization": {
-            "asynchronous_produce": True,
-            "requires_producer_commit": True,
-            "requires_consumer_wait": True,
-            "wait_provides_consumer_acquire": False,
-            "requires_consumer_release": True,
-        },
-        "tail_policy": "serial",
-        "loop_variable": "logical_sequence",
-        "loop_start": "0",
-        "loop_stop": "4",
-        "loop_step": "1",
-        "channels": [
-            {
-                "channel_id": "rhs",
-                "source_memory_space": "gpu.block-global",
-                "destination_memory_space": "gpu.shared",
-                "allocation": allocation,
-            }
-        ],
-        "produce_source": "\n".join(
-            [
-                "rhs_slot = "
-                f"{descriptor_name}.slot(tl.cast(logical_sequence % 2, tl.int32))",
-                "tle.gpu.copy(input0, rhs_slot, [32], is_async=True)",
-            ]
-        ),
-        "consume_source": "\n".join(
-            [
-                "rhs_slot = "
-                f"{descriptor_name}.slot(tl.cast(logical_sequence % 2, tl.int32))",
-                "value = tl.load(rhs_slot)",
-            ]
-        ),
-    }
-
-
 def _strict_launch():
     return {
         "meta": {},
-        "tuning": {"parameters": {}},
         "sharding": {
             "strategy": "replicated",
             "placement_axis": "b",
@@ -183,42 +105,27 @@ def _strict_launch():
             "hierarchy_levels": "b",
             "global_shape": [],
         },
-        "num_warps": 8,
-        "num_stages": 1,
     }
 
 
-def _matrix_render_kernel(symbol, *, async_pipeline):
-    execution = _pipeline_execution() if async_pipeline else None
+def _render_kernel(symbol="main_prim"):
     return {
         "metadata": {
             "name": symbol,
-            "op_kind": "packed_mat_mul",
-            "inputs": ["input0", "input1"],
-            "outputs": ["output0"],
+            "op_kind": "entry",
+            "inputs": ["input_ids", "kv_cache"],
+            "outputs": ["logits"],
             "attrs": {
-                "ops": ["packed_mat_mul"],
-                "block_microkernels": [
-                    {
-                        "helper": "packed_matmul_gemv_compute",
-                        "family": "triton.gemv",
-                    }
-                ],
                 "target_worker_width": 32,
                 "target_threads_per_block": 256,
-                "shared_memory_bytes": 128 if async_pipeline else 0,
-                "shared_memory_allocation_size_policy": "granularity_aligned",
-                "shared_memory_allocation_granularity_bytes": 1,
-                "shared_memory_capacity_bytes": 48 * 1024,
+                "register_file_capacity_units": 65280,
+                "register_file_allocation_granularity_units": 256,
             },
             "launch": _strict_launch(),
         },
         "helpers": [],
         "device_functions": [],
-        "pipeline_executions": [execution] if execution is not None else [],
-        "body_source": (
-            f"# {execution['marker']}" if execution is not None else "pass"
-        ),
+        "body_source": "pass",
     }
 
 
@@ -241,20 +148,13 @@ def _write_codegen_manifest(path, manifest):
     )
 
 
-def _write_generated_package(
-    path,
-    input_shape=(1,),
-    layer_ids=("0",),
-    *,
-    async_pipeline=True,
-):
+def _write_generated_package(path, input_shape=(1,), layer_ids=("0",)):
     path.mkdir()
     metadata = {
         "pyntt_spec_version": 4,
         "target_kind": "pyntt",
         "target_machine": "cuda_rtx5060",
         "backend": "triton",
-        "strict": True,
         "functions": [
             {
                 "name": "main_prim",
@@ -276,8 +176,8 @@ def _write_generated_package(
     (path / "metadata.json").write_text(
         "\ufeff" + json.dumps(metadata), encoding="utf-8"
     )
-    kernel_params = {
-        "pyntt_codegen_manifest_version": 6,
+    manifest = {
+        "pyntt_codegen_manifest_version": 8,
         "target_kind": "pyntt",
         "backend": "triton",
         "functions": [
@@ -286,42 +186,15 @@ def _write_generated_package(
                 "name": "main_prim",
                 "module_kind": "pyntt",
                 "is_entry": True,
-                "render_kernels": [
-                    _matrix_render_kernel(
-                        "main_prim_packed_mat_mul_0",
-                        async_pipeline=async_pipeline,
-                    )
-                ],
+                "render_kernels": [_render_kernel()],
             }
         ],
     }
-    _write_codegen_manifest(path, kernel_params)
+    _write_codegen_manifest(path, manifest)
     (path / "__init__.py").write_text("# __init__.py\n", encoding="utf-8")
     (path / "model.py").write_text("# model.py\n", encoding="utf-8")
     (path / "assets").mkdir()
     (path / "assets" / "module_rdata.bin").write_bytes(b"weights")
-
-
-def _append_matrix_render_kernel(path, symbol, *, async_pipeline):
-    manifest_path = path / "kernel_params.json"
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    kernel = _matrix_render_kernel(symbol, async_pipeline=async_pipeline)
-    if async_pipeline:
-        execution = kernel["pipeline_executions"][0]
-        execution["region_id"] = f"main_prim/{symbol}__reduction0"
-        execution["marker"] = "__PYNTT_PIPELINE_EXECUTION_1__"
-        allocation = execution["channels"][0]["allocation"]
-        old_descriptor = allocation["descriptor_name"]
-        allocation["descriptor_name"] = f"{symbol}_rhs"
-        execution["produce_source"] = execution["produce_source"].replace(
-            old_descriptor, allocation["descriptor_name"]
-        )
-        execution["consume_source"] = execution["consume_source"].replace(
-            old_descriptor, allocation["descriptor_name"]
-        )
-        kernel["body_source"] = f"# {execution['marker']}"
-    manifest["functions"][0]["render_kernels"].append(kernel)
-    _write_codegen_manifest(path, manifest)
 
 
 def test_generated_package_contract_and_fingerprint(tmp_path):
@@ -338,49 +211,13 @@ def test_generated_package_contract_and_fingerprint(tmp_path):
     assert first.code_manifest_sha256 == second.code_manifest_sha256
     assert first.source_file_sha256 == second.source_file_sha256
     assert first.asset_file_bytes == {"assets/module_rdata.bin": 7}
-    assert first.asset_file_bytes == second.asset_file_bytes
-    assert len(first.asset_file_sha256["assets/module_rdata.bin"]) == 64
     assert first.asset_file_sha256 == second.asset_file_sha256
-    assert first.manifest_summary["pyntt_codegen_manifest_version"] == 6
+    assert len(first.asset_file_sha256["assets/module_rdata.bin"]) == 64
+    assert first.manifest_summary["pyntt_codegen_manifest_version"] == 8
 
-    gate = first.pipeline_gate_summary
-    assert gate["status"] == "passed"
-    assert gate["maximum_stage_count"] == 2
-    assert gate["async_matrix_execution_count"] == 1
-    assert gate["declared_async_execution_count"] == 1
-    assert gate["physical_staged_capacity_bytes"] == 128
-    assert gate["matrix_kernels"] == [
-        {
-            "manifest_path": "manifest.functions[0].render_kernels[0]",
-            "kernel_symbol": "main_prim_packed_mat_mul_0",
-            "pipeline_mode": "cp_async_n2",
-            "async_execution_ids": [_REGION_ID],
-            "schedule_ids": ["qwen3.packed-matmul.k.cp-async.n2"],
-            "pipeline_execution_count": 1,
-            "staged_buffer_count": 1,
-            "unique_physical_range_count": 1,
-            "physical_staged_capacity_bytes": 128,
-            "pipeline_executions": [
-                {
-                    "region_id": _REGION_ID,
-                    "schedule_id": "qwen3.packed-matmul.k.cp-async.n2",
-                    "template_id": "triton.loop.cp_async.n2.v1",
-                    "partition": "full",
-                    "owner_kind": "render_kernel",
-                    "owner_name": "main_prim_packed_mat_mul_0",
-                    "staged_buffer_count": 1,
-                    "stage_count": 2,
-                }
-            ],
-            "source_evidence": {
-                "async_copy": True,
-                "async_commit_group": True,
-                "async_wait_group_1": True,
-                "async_wait_group_0": True,
-                "staged_slot": True,
-            },
-        }
-    ]
+    report_contract = _package_contract_json(first, generated_dir)
+    assert report_contract["manifest"]["pyntt_codegen_manifest_version"] == 8
+    assert "pipeline_gate" not in report_contract
 
 
 @pytest.mark.parametrize(
@@ -401,532 +238,49 @@ def test_generated_package_rejects_incompatible_contract(
         inspect_generated_package(generated_dir)
 
 
-def test_generated_package_pipeline_gate_requires_v6(tmp_path):
+def test_generated_package_requires_manifest_v8(tmp_path):
     generated_dir = tmp_path / "generated"
     _write_generated_package(generated_dir)
     manifest_path = generated_dir / "kernel_params.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    manifest["pyntt_codegen_manifest_version"] = 4
+    manifest["pyntt_codegen_manifest_version"] = 7
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
-    with pytest.raises(ValueError, match="expected 6"):
+    with pytest.raises(ValueError, match="expected 8"):
         inspect_generated_package(generated_dir)
 
 
-def test_generated_package_rejects_v4_pipeline_tables(tmp_path):
+@pytest.mark.parametrize(
+    "removed_field", ("pipeline_executions", "shared_arena", "microkernels")
+)
+def test_generated_package_rejects_removed_compiler_scheduling_fields(
+    tmp_path, removed_field
+):
     generated_dir = tmp_path / "generated"
     _write_generated_package(generated_dir)
     manifest_path = generated_dir / "kernel_params.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    kernel = manifest["functions"][0]["render_kernels"][0]
-    kernel["pipeline_regions"] = []
-    kernel["staged_smem_allocations"] = []
-    kernel["staged_smem_bindings"] = []
+    manifest["functions"][0]["render_kernels"][0][removed_field] = []
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
     with pytest.raises(ValueError, match="unexpected fields"):
         inspect_generated_package(generated_dir)
 
 
-def test_generated_package_allows_only_explicit_ordinary_baseline(tmp_path):
-    generated_dir = tmp_path / "generated"
-    _write_generated_package(generated_dir, async_pipeline=False)
-
-    with pytest.raises(ValueError, match="at least one GEMM/GEMV matrix execution"):
-        inspect_generated_package(generated_dir)
-
-    contract = inspect_generated_package(generated_dir, allow_ordinary=True)
-    gate = contract.pipeline_gate_summary
-    assert gate["status"] == "ordinary_baseline_allowed"
-    assert gate["manifest_version"] == 6
-    assert gate["matrix_kernel_count"] == 1
-    assert gate["async_matrix_kernel_count"] == 0
-    assert gate["ordinary_matrix_kernel_count"] == 1
-    assert gate["async_matrix_execution_count"] == 0
-    assert gate["declared_async_execution_count"] == 0
-    assert gate["staged_buffer_count"] == 0
-    assert gate["maximum_stage_count"] == 1
-    assert gate["physical_staged_capacity_bytes"] == 0
-    assert gate["matrix_kernels"][0]["pipeline_mode"] == "ordinary"
-    assert gate["matrix_kernels"][0]["async_execution_ids"] == []
-    assert not any(gate["matrix_kernels"][0]["source_evidence"].values())
-
-
-def test_pipeline_gate_requires_one_async_matrix_execution_not_every_matrix_kernel(
-    tmp_path,
-):
-    generated_dir = tmp_path / "generated"
-    _write_generated_package(generated_dir)
-    _append_matrix_render_kernel(
-        generated_dir, "main_prim_packed_mat_mul_ordinary", async_pipeline=False
-    )
-
-    gate = inspect_generated_package(generated_dir).pipeline_gate_summary
-
-    assert gate["matrix_kernel_count"] == 2
-    assert gate["async_matrix_kernel_count"] == 1
-    assert gate["ordinary_matrix_kernel_count"] == 1
-    ordinary = next(
-        kernel
-        for kernel in gate["matrix_kernels"]
-        if kernel["kernel_symbol"] == "main_prim_packed_mat_mul_ordinary"
-    )
-    assert ordinary["pipeline_mode"] == "ordinary"
-    assert ordinary["async_execution_ids"] == []
-    assert not any(ordinary["source_evidence"].values())
-
-
-def test_pipeline_gate_does_not_borrow_async_source_from_another_function(tmp_path):
-    generated_dir = tmp_path / "generated"
-    _write_generated_package(generated_dir)
-    source_path = generated_dir / "generated_kernels.py"
-    source = source_path.read_text(encoding="utf-8")
-    source_path.write_text(
-        source.replace(
-            "def main_prim_packed_mat_mul_0(",
-            "def unrelated_async_kernel(",
-            1,
-        )
-        + "\ndef main_prim_packed_mat_mul_0():\n    pass\n",
-        encoding="utf-8",
-    )
-
-    with pytest.raises(ValueError, match="missing evidence"):
-        inspect_generated_package(generated_dir)
-
-
-def test_pipeline_gate_follows_only_reachable_generated_helpers(tmp_path):
-    generated_dir = tmp_path / "generated"
-    _write_generated_package(generated_dir)
-    source_path = generated_dir / "generated_kernels.py"
-    source = source_path.read_text(encoding="utf-8")
-    helper_source = source.replace(
-        "def main_prim_packed_mat_mul_0(",
-        "def reachable_async_helper(",
-        1,
-    )
-    source_path.write_text(
-        "def main_prim_packed_mat_mul_0():\n"
-        "    reachable_async_helper()\n\n"
-        + helper_source,
-        encoding="utf-8",
-    )
-
-    gate = inspect_generated_package(generated_dir).pipeline_gate_summary
-
-    assert all(gate["matrix_kernels"][0]["source_evidence"].values())
-
-
-def test_pipeline_gate_does_not_count_non_matrix_async_execution(tmp_path):
-    generated_dir = tmp_path / "generated"
-    _write_generated_package(generated_dir, async_pipeline=False)
-    _append_matrix_render_kernel(
-        generated_dir, "main_prim_elementwise_async", async_pipeline=True
-    )
-    manifest_path = generated_dir / "kernel_params.json"
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    non_matrix = manifest["functions"][0]["render_kernels"][1]
-    non_matrix["metadata"]["op_kind"] = "elementwise"
-    non_matrix["metadata"]["attrs"]["ops"] = ["relu"]
-    non_matrix["metadata"]["attrs"]["block_microkernels"] = []
-    _write_codegen_manifest(generated_dir, manifest)
-
-    with pytest.raises(ValueError, match="at least one GEMM/GEMV matrix execution"):
-        inspect_generated_package(generated_dir)
-
-
-def test_pipeline_gate_requires_globally_unique_execution_ids(tmp_path):
-    generated_dir = tmp_path / "generated"
-    _write_generated_package(generated_dir)
-    _append_matrix_render_kernel(
-        generated_dir, "main_prim_packed_mat_mul_1", async_pipeline=True
-    )
-    manifest_path = generated_dir / "kernel_params.json"
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    second = manifest["functions"][0]["render_kernels"][1]
-    second["pipeline_executions"][0]["region_id"] = _REGION_ID
-    _write_codegen_manifest(generated_dir, manifest)
-
-    with pytest.raises(ValueError, match="globally unique"):
-        inspect_generated_package(generated_dir)
-
-
-@pytest.mark.parametrize(
-    "source_edit,missing",
-    [
-        (lambda source: source.replace(", is_async=True", ""), "async_copy"),
-        (
-            lambda source: source.replace("tle.gpu.async_commit_group()", ""),
-            "async_commit_group",
-        ),
-        (
-            lambda source: source.replace("tle.gpu.async_wait_group(1)", "", 1),
-            "async_wait_group_1",
-        ),
-        (
-            lambda source: source.replace("tle.gpu.async_wait_group(0)", "", 1),
-            "async_wait_group_0",
-        ),
-        (
-            lambda source: source.replace(".slot(", ".not_slot("),
-            "staged_slot",
-        ),
-    ],
-)
-def test_generated_package_pipeline_gate_requires_source_evidence(
-    tmp_path, source_edit, missing
-):
-    generated_dir = tmp_path / "generated"
-    _write_generated_package(generated_dir)
-    source_path = generated_dir / "generated_kernels.py"
-    source_path.write_text(
-        source_edit(source_path.read_text(encoding="utf-8")), encoding="utf-8"
-    )
-
-    with pytest.raises(ValueError, match=missing):
-        inspect_generated_package(generated_dir)
-
-
-@pytest.mark.parametrize(
-    "forbidden_source,construct",
-    [
-        ("def bad():\n    tle.pipe()\n", r"tle\.pipe"),
-        ("def bad():\n    tle.gpu.warp_specialize()\n", "warp_specialize"),
-        (
-            "def bad():\n    return tl.range(0, 4, warp_specialize=True)\n",
-            "warp_specialize",
-        ),
-        (
-            "def bad():\n    return tl.range(0, 4, num_stages=2)\n",
-            r"tl\.range",
-        ),
-    ],
-)
-def test_generated_package_pipeline_gate_rejects_implicit_or_warp_pipeline(
-    tmp_path, forbidden_source, construct
-):
-    generated_dir = tmp_path / "generated"
-    _write_generated_package(generated_dir, async_pipeline=False)
-    (generated_dir / "generated_kernels.py").write_text(
-        forbidden_source, encoding="utf-8"
-    )
-
-    with pytest.raises(ValueError, match=construct):
-        inspect_generated_package(generated_dir, allow_ordinary=True)
-
-
-def test_run_parser_requires_opt_in_for_ordinary_baseline(tmp_path):
+def test_run_parser_has_no_compiler_pipeline_mode(tmp_path):
     parser = build_argument_parser(tmp_path)
-    common = [
-        "run",
-        "--generated-dir",
-        str(tmp_path / "generated"),
-        "--output-json",
-        str(tmp_path / "result.json"),
-    ]
-    assert parser.parse_args(common).allow_ordinary is False
-    assert parser.parse_args([*common, "--allow-ordinary"]).allow_ordinary is True
-    run_parser = next(
-        action.choices["run"]
-        for action in parser._actions
-        if getattr(action, "choices", None) and "run" in action.choices
-    )
-    assert "ordinary non-pipelined baseline" in run_parser.format_help()
-
-
-_SYNTHETIC_TTGIR = """
-module {
-  tt.func public @main_prim_packed_mat_mul_0() {
-    %copy0 = ttg.async_copy_global_to_local %src0, %slot0 {tle.required_async_copy}
-    %commit0 = ttg.async_commit_group tokens %copy0
-    %wait1 = ttg.async_wait %commit0 {num = 1 : i32, tle.explicit_async_wait}
-    %copy1 = ttg.async_copy_global_to_local %src1, %slot1 {tle.required_async_copy}
-    %commit1 = ttg.async_commit_group tokens %copy1
-    %wait0 = ttg.async_wait %commit1 {num = 0 : i32, tle.explicit_async_wait}
-  }
-}
-"""
-
-_SYNTHETIC_PTX = """
-.visible .entry main_prim_packed_mat_mul_0() {
-    cp.async.ca.shared.global [ %r1 ], [ %rd1 ], 0x10;
-    cp.async.commit_group;
-    cp.async.wait_group 1;
-    bar.sync 0;
-    ld.shared.b32 %r2, [ %r1 ];
-    cp.async.ca.shared.global [ %r3 ], [ %rd2 ], 0x10;
-    cp.async.commit_group;
-    cp.async.wait_group 0;
-    bar.sync 0;
-    ld.shared.b32 %r4, [ %r3 ];
-    ret;
-}
-"""
-
-
-def _write_synthetic_compiled_artifact(
-    cache_dir,
-    *,
-    symbol="main_prim_packed_mat_mul_0",
-    cache_key="SYNTHETIC_CACHE_KEY",
-    ttgir=_SYNTHETIC_TTGIR,
-    ptx=_SYNTHETIC_PTX,
-):
-    ttgir = ttgir.replace("main_prim_packed_mat_mul_0", symbol)
-    ptx = ptx.replace("main_prim_packed_mat_mul_0", symbol)
-    artifact_dir = cache_dir / cache_key
-    artifact_dir.mkdir()
-    (artifact_dir / f"{symbol}.json").write_text(
-        json.dumps({"name": symbol, "target": {"backend": "cuda", "arch": 90}}),
-        encoding="utf-8",
-    )
-    (artifact_dir / f"{symbol}.ttgir").write_text(ttgir, encoding="utf-8")
-    (artifact_dir / f"{symbol}.ptx").write_text(ptx, encoding="utf-8")
-
-
-def test_compiled_pipeline_gate_uses_execution_linked_isolated_artifacts(tmp_path):
-    generated_dir = tmp_path / "generated"
-    _write_generated_package(generated_dir)
-    contract = inspect_generated_package(generated_dir)
-    cache_dir = prepare_isolated_triton_cache(tmp_path / "triton-cache")
-    _write_synthetic_compiled_artifact(cache_dir)
-
-    evidence = inspect_compiled_pipeline_artifacts(
-        cache_dir, contract.pipeline_gate_summary
+    args = parser.parse_args(
+        [
+            "run",
+            "--generated-dir",
+            str(tmp_path / "generated"),
+            "--output-json",
+            str(tmp_path / "result.json"),
+        ]
     )
 
-    assert evidence["status"] == "passed"
-    assert evidence["cache_scope"] == "isolated_run"
-    assert evidence["global_cache_search"] is False
-    assert evidence["compiled_artifact_count"] == 1
-    assert evidence["validated_async_matrix_kernel_count"] == 1
-    assert evidence["artifact_linked_async_execution_count"] == 1
-    assert evidence["execution_artifact_bindings"] == [
-        {
-            "execution_id": _REGION_ID,
-            "kernel_symbol": "main_prim_packed_mat_mul_0",
-            "artifact_cache_keys": ["SYNTHETIC_CACHE_KEY"],
-            "evidence_scope": "containing_kernel_artifact",
-        }
-    ]
-    artifact = evidence["kernels"][0]["compiled_artifacts"][0]
-    assert artifact["actual_kernel_symbol"] == "main_prim_packed_mat_mul_0"
-    assert artifact["ttgir_evidence"]["kernel_symbol_definition_count"] == 1
-    assert artifact["ttgir_evidence"]["async_copy_global_to_local_count"] == 2
-    assert artifact["ttgir_evidence"]["required_async_copy_marker_count"] == 2
-    assert artifact["ttgir_evidence"]["async_wait_group_1_count"] == 1
-    assert artifact["ttgir_evidence"]["async_wait_group_0_count"] == 1
-    assert artifact["ptx_evidence"]["cp_async_copy_count"] == 2
-    assert artifact["ptx_evidence"]["kernel_symbol_entry_count"] == 1
-    assert artifact["ptx_evidence"]["wait_group_1_then_barrier_count"] == 1
-    assert artifact["ptx_evidence"]["wait_group_0_then_barrier_count"] == 1
-    assert len(artifact["files"]["ttgir"]["sha256"]) == 64
-    package_json = _package_contract_json(contract, generated_dir, evidence)
-    assert package_json["pipeline_gate"]["compiled_artifacts"] == evidence
-
-
-@pytest.mark.parametrize(
-    "rendezvous",
-    (
-        "bar.sync 0;",
-        "bar.cta.sync 0;",
-        "barrier.sync.aligned 0;",
-        "barrier.cta.sync.aligned 0;",
-    ),
-)
-def test_compiled_pipeline_gate_accepts_ptx_cta_thread_rendezvous(tmp_path, rendezvous):
-    generated_dir = tmp_path / "generated"
-    _write_generated_package(generated_dir)
-    contract = inspect_generated_package(generated_dir)
-    cache_dir = prepare_isolated_triton_cache(tmp_path / "triton-cache")
-    _write_synthetic_compiled_artifact(
-        cache_dir, ptx=_SYNTHETIC_PTX.replace("bar.sync 0;", rendezvous)
-    )
-
-    evidence = inspect_compiled_pipeline_artifacts(
-        cache_dir, contract.pipeline_gate_summary
-    )
-
-    ptx_evidence = evidence["kernels"][0]["compiled_artifacts"][0]["ptx_evidence"]
-    assert ptx_evidence["wait_group_1_then_barrier_count"] == 1
-    assert ptx_evidence["wait_group_0_then_barrier_count"] == 1
-
-
-def test_compiled_gate_reports_ordinary_kernel_without_requiring_its_artifact(
-    tmp_path,
-):
-    generated_dir = tmp_path / "generated"
-    _write_generated_package(generated_dir)
-    ordinary_symbol = "main_prim_packed_mat_mul_ordinary"
-    _append_matrix_render_kernel(generated_dir, ordinary_symbol, async_pipeline=False)
-    contract = inspect_generated_package(generated_dir)
-    cache_dir = prepare_isolated_triton_cache(tmp_path / "triton-cache")
-    _write_synthetic_compiled_artifact(cache_dir)
-
-    evidence = inspect_compiled_pipeline_artifacts(
-        cache_dir, contract.pipeline_gate_summary
-    )
-
-    assert evidence["validated_async_matrix_kernel_count"] == 1
-    ordinary = next(
-        kernel
-        for kernel in evidence["kernels"]
-        if kernel["kernel_symbol"] == ordinary_symbol
-    )
-    assert ordinary["artifact_status"] == "not_applicable_ordinary"
-    assert ordinary["compiled_artifacts"] == []
-
-
-def test_compiled_gate_allows_explicit_ordinary_baseline_without_async_artifact(
-    tmp_path,
-):
-    generated_dir = tmp_path / "generated"
-    _write_generated_package(generated_dir, async_pipeline=False)
-    contract = inspect_generated_package(generated_dir, allow_ordinary=True)
-    cache_dir = prepare_isolated_triton_cache(tmp_path / "triton-cache")
-
-    evidence = inspect_compiled_pipeline_artifacts(
-        cache_dir, contract.pipeline_gate_summary
-    )
-
-    assert evidence["status"] == "ordinary_baseline_allowed"
-    assert evidence["validated_async_matrix_kernel_count"] == 0
-    assert evidence["compiled_artifact_count"] == 0
-    assert evidence["kernels"][0]["artifact_status"] == (
-        "not_applicable_ordinary"
-    )
-
-
-def test_compiled_gate_does_not_borrow_ordinary_symbol_artifact(tmp_path):
-    generated_dir = tmp_path / "generated"
-    _write_generated_package(generated_dir)
-    ordinary_symbol = "main_prim_packed_mat_mul_ordinary"
-    _append_matrix_render_kernel(generated_dir, ordinary_symbol, async_pipeline=False)
-    contract = inspect_generated_package(generated_dir)
-    cache_dir = prepare_isolated_triton_cache(tmp_path / "triton-cache")
-    _write_synthetic_compiled_artifact(cache_dir, symbol=ordinary_symbol)
-
-    with pytest.raises(ValueError, match="no compiled metadata/TTGIR/PTX"):
-        inspect_compiled_pipeline_artifacts(cache_dir, contract.pipeline_gate_summary)
-
-
-def test_compiled_gate_requires_at_least_one_observed_async_matrix_symbol(tmp_path):
-    generated_dir = tmp_path / "generated"
-    _write_generated_package(generated_dir)
-    unobserved_symbol = "main_prim_packed_mat_mul_unobserved"
-    _append_matrix_render_kernel(generated_dir, unobserved_symbol, async_pipeline=True)
-    contract = inspect_generated_package(generated_dir)
-    cache_dir = prepare_isolated_triton_cache(tmp_path / "triton-cache")
-    _write_synthetic_compiled_artifact(cache_dir)
-
-    evidence = inspect_compiled_pipeline_artifacts(
-        cache_dir, contract.pipeline_gate_summary
-    )
-
-    assert evidence["declared_async_matrix_kernel_count"] == 2
-    assert evidence["validated_async_matrix_kernel_count"] == 1
-    assert evidence["unobserved_async_matrix_kernel_symbols"] == [unobserved_symbol]
-
-
-def test_compiled_pipeline_gate_does_not_search_another_cache(tmp_path):
-    generated_dir = tmp_path / "generated"
-    _write_generated_package(generated_dir)
-    contract = inspect_generated_package(generated_dir)
-    isolated_cache = prepare_isolated_triton_cache(tmp_path / "isolated")
-    historical_cache = prepare_isolated_triton_cache(tmp_path / "historical")
-    _write_synthetic_compiled_artifact(historical_cache)
-
-    with pytest.raises(ValueError, match="global historical caches are not searched"):
-        inspect_compiled_pipeline_artifacts(
-            isolated_cache, contract.pipeline_gate_summary
-        )
-
-
-def test_compiled_pipeline_gate_rejects_missing_required_async_transport(tmp_path):
-    generated_dir = tmp_path / "generated"
-    _write_generated_package(generated_dir)
-    contract = inspect_generated_package(generated_dir)
-    cache_dir = prepare_isolated_triton_cache(tmp_path / "triton-cache")
-    _write_synthetic_compiled_artifact(
-        cache_dir,
-        ttgir=_SYNTHETIC_TTGIR.replace(
-            "ttg.async_copy_global_to_local", "ttg.local_store"
-        ).replace("ttg.async_commit_group", "arith.constant"),
-    )
-
-    with pytest.raises(ValueError, match="Required async transport"):
-        inspect_compiled_pipeline_artifacts(cache_dir, contract.pipeline_gate_summary)
-
-
-def test_compiled_pipeline_gate_requires_marker_per_declared_async_execution(tmp_path):
-    generated_dir = tmp_path / "generated"
-    _write_generated_package(generated_dir)
-    manifest_path = generated_dir / "kernel_params.json"
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    kernel = manifest["functions"][0]["render_kernels"][0]
-    second_execution = _pipeline_execution(
-        region_id="main_prim/pipeline_op1_packed_mat_mul__reduction0",
-        marker="__PYNTT_PIPELINE_EXECUTION_1__",
-        descriptor_name="rhs_shared_buffer_1",
-        arena_offset_bytes=128,
-    )
-    kernel["pipeline_executions"].append(second_execution)
-    kernel["body_source"] += f"\n# {second_execution['marker']}"
-    kernel["metadata"]["attrs"]["shared_memory_bytes"] = 256
-    _write_codegen_manifest(generated_dir, manifest)
-    contract = inspect_generated_package(generated_dir)
-    cache_dir = prepare_isolated_triton_cache(tmp_path / "triton-cache")
-    ttgir_with_one_required_marker = _SYNTHETIC_TTGIR.replace(
-        " {tle.required_async_copy}", "", 1
-    )
-    _write_synthetic_compiled_artifact(cache_dir, ttgir=ttgir_with_one_required_marker)
-
-    with pytest.raises(ValueError, match=r"required_async_copy_marker_count>=2"):
-        inspect_compiled_pipeline_artifacts(cache_dir, contract.pipeline_gate_summary)
-
-
-def test_compiled_pipeline_gate_requires_barrier_before_shared_consumer(tmp_path):
-    generated_dir = tmp_path / "generated"
-    _write_generated_package(generated_dir)
-    contract = inspect_generated_package(generated_dir)
-    cache_dir = prepare_isolated_triton_cache(tmp_path / "triton-cache")
-    ptx_without_steady_barrier = _SYNTHETIC_PTX.replace(
-        "    cp.async.wait_group 1;\n    bar.sync 0;\n    ld.shared.b32",
-        "    cp.async.wait_group 1;\n    ld.shared.b32",
-    )
-    _write_synthetic_compiled_artifact(cache_dir, ptx=ptx_without_steady_barrier)
-
-    with pytest.raises(ValueError, match="wait_group_1_then_barrier_count"):
-        inspect_compiled_pipeline_artifacts(cache_dir, contract.pipeline_gate_summary)
-
-
-def test_compiled_pipeline_gate_rejects_membar_cta_as_thread_rendezvous(tmp_path):
-    generated_dir = tmp_path / "generated"
-    _write_generated_package(generated_dir)
-    contract = inspect_generated_package(generated_dir)
-    cache_dir = prepare_isolated_triton_cache(tmp_path / "triton-cache")
-    _write_synthetic_compiled_artifact(
-        cache_dir, ptx=_SYNTHETIC_PTX.replace("bar.sync 0;", "membar.cta;")
-    )
-
-    with pytest.raises(ValueError, match="wait_group_1_then_barrier_count"):
-        inspect_compiled_pipeline_artifacts(cache_dir, contract.pipeline_gate_summary)
-
-
-def test_compiled_pipeline_gate_does_not_accept_cp_async_bulk_as_cp_async(tmp_path):
-    generated_dir = tmp_path / "generated"
-    _write_generated_package(generated_dir)
-    contract = inspect_generated_package(generated_dir)
-    cache_dir = prepare_isolated_triton_cache(tmp_path / "triton-cache")
-    _write_synthetic_compiled_artifact(
-        cache_dir,
-        ptx=_SYNTHETIC_PTX.replace(
-            "cp.async.ca.shared.global", "cp.async.bulk.shared.global"
-        ),
-    )
-
-    with pytest.raises(ValueError, match="cp_async_copy_count"):
-        inspect_compiled_pipeline_artifacts(cache_dir, contract.pipeline_gate_summary)
+    assert not hasattr(args, "allow_ordinary")
+    assert "allow-ordinary" not in parser.format_help()
 
 
 def test_isolated_triton_cache_rejects_preexisting_artifacts(tmp_path):
@@ -971,7 +325,6 @@ def _summary(p50, p90):
 
 
 def _report(label, scale):
-    is_baseline = "baseline" in label or label.startswith("n=1")
     scenarios = []
     for name, prompt_tokens, output_tokens, latency in (
         ("decode_1x3", 1, 3, 3.0),
@@ -1006,10 +359,7 @@ def _report(label, scale):
             "compute_capability": [9, 0],
             "driver_version": "999.1",
         },
-        "measurement": {
-            "timing": "cuda-events",
-            "fixed_output_tokens": True,
-        },
+        "measurement": {"timing": "cuda-events", "fixed_output_tokens": True},
         "run_config": {
             "warmup_iterations_per_scenario": 5,
             "timed_iterations_per_scenario": 20,
@@ -1031,9 +381,6 @@ def _report(label, scale):
                 "target_kind": "pyntt",
                 "target_machine": "cuda_rtx5060",
                 "backend": "triton",
-            },
-            "pipeline_gate": {
-                "async_matrix_execution_count": 0 if is_baseline else 1,
             },
             "asset_file_sha256": {"assets/module_rdata.bin": "asset-hash"},
         },

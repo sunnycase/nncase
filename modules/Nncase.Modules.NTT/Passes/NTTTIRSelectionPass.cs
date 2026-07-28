@@ -14,11 +14,13 @@ using Microsoft.Extensions.DependencyInjection;
 using NetFabric.Hyperlinq;
 using Nncase.Diagnostics;
 using Nncase.IR;
+using Nncase.IR.Affine;
 using Nncase.IR.Shapes;
 using Nncase.IR.Tensors;
 using Nncase.Passes.Analysis;
 using Nncase.Passes.Mutators;
 using Nncase.Passes.Transforms;
+using Nncase.Schedule;
 using Nncase.Targets;
 using Nncase.TIR;
 using Nncase.Utilities;
@@ -28,12 +30,52 @@ namespace Nncase.Passes;
 public sealed class NTTTIRSelectionPass : TIRSelectionPass
 {
     private readonly CompileOptions _compileOptions;
+    private int _bufferIndex;
     private int _shardedViewIndex;
 
     public NTTTIRSelectionPass(CompileOptions compileOptions, string moduleKind = CPUTarget.Kind)
         : base(moduleKind)
     {
         _compileOptions = compileOptions;
+    }
+
+    protected override Expr FinalizeSelectedExpr(
+        Call sourceCall,
+        Expr selectedExpr,
+        TIRSelectionContext context)
+    {
+        if (selectedExpr is not Call { Target: TIR.NTT.NTTKernelOp kernelOp } selectedCall)
+        {
+            return selectedExpr;
+        }
+
+        var arguments = selectedCall.Arguments.ToArray();
+        if (arguments.Length == 0 || arguments[^1] is not None)
+        {
+            throw new InvalidOperationException(
+                $"TIR kernel {kernelOp.GetType().Name} must carry an initially None shared_workspace operand.");
+        }
+
+        if (_compileOptions.TargetOptions is not INTTTargetOptions targetOptions)
+        {
+            throw new InvalidOperationException(
+                $"NTT TIR Selection requires {nameof(INTTTargetOptions)}, got {_compileOptions.TargetOptions?.GetType().Name ?? "null"}.");
+        }
+
+        var semanticArguments = arguments[..^1];
+        var selection = targetOptions.TIRMicroKernelSelector.Select(
+            new TIRMicroKernelSelectionContext(
+                kernelOp,
+                semanticArguments,
+                targetOptions.TargetMachineModel));
+        var workspaces = selection is null
+            ? Array.Empty<BaseExpr>()
+            : selection.SharedWorkspaces
+                .Select(descriptor => (BaseExpr)CreateSharedWorkspaceBuffer(kernelOp, descriptor))
+                .ToArray();
+        var result = selectedCall.With(arguments: [.. semanticArguments, TIRSharedWorkspace.Pack(workspaces)]);
+        result.Metadata.TIRMicroKernel = selection;
+        return result;
     }
 
     protected override Expr SelectCall(Call call, IReadOnlyList<BaseExpr> arguments, ref Expr output, TIRSelectionContext context)
@@ -47,14 +89,16 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
                 return GenerateUnary(unary.UnaryOp, arguments, output);
             case IR.Math.Clamp clamp:
                 return GenerateClamp(call, arguments, output);
-            case IR.Distributed.Boxing:
-                throw new InvalidOperationException("Boxing must be lowered to an affine transfer before TIR selection.");
+            case IR.Distributed.Boxing boxing:
+                return GenerateBoxing(call, boxing, arguments, ref output);
             case IR.Distributed.ShardedView shardedView:
                 return GenerateShardedView(call, shardedView, ref output);
             case IR.Distributed.ForceBoxing forceBoxing:
                 return T.Memcopy(output, (Expr)arguments[0]);
             case IR.Math.Binary binary:
                 return TIR.F.NTT.VectorizedBinary((Expr)arguments[0], (Expr)arguments[1], output, None.Default, binary.BinaryOp, Array.Empty<int>(), Array.Empty<Dimension>(), Array.Empty<int>(), Array.Empty<Dimension>());
+            case IR.Tensors.Bitcast:
+                return GenerateBufferView("Bitcast", (Expr)arguments[0], ref output);
             case IR.Tensors.Pack pack:
                 return TIR.F.NTT.Pack((Expr)arguments[0], output, pack.Lanes, pack.Axes);
             case IR.Tensors.VectorizeMask pack:
@@ -93,7 +137,7 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
             case IR.CustomNTT.MatMul matmul:
                 return TIR.F.NTT.Matmul((Expr)arguments[0], (Expr)arguments[1], output, None.Default, (Expr)call[IR.CustomNTT.MatMul.Scale], (Expr)arguments[3], matmul.LhsVectorizedAxes, matmul.RhsVectorizedAxes, matmul.TransposeA, matmul.TransposeB, false, matmul.CSourcePath, matmul.FuncName);
             case IR.NTT.PackedMatMul matmul:
-                return TIR.F.NTT.PackedMatMul((Expr)arguments[0], (Expr)arguments[1], output, None.Default, (Expr)call[IR.NTT.PackedMatMul.Scale], matmul.FusedReduce);
+                return TIR.F.NTT.PackedMatMul((Expr)arguments[0], (Expr)arguments[1], output, None.Default, (Expr)call[IR.NTT.PackedMatMul.Scale], matmul.FusedReduce, matmul.RhsLayout);
             case IR.NTT.PackedMatMulGlu matmulGlu:
                 return TIR.F.NTT.PackedMatMulGlu(
                     (Expr)arguments[0],
@@ -248,10 +292,14 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
                 return TIR.F.NTT.Compare(compare.CompareOp, (Expr)arguments[0], (Expr)arguments[1], output);
             case IR.Tensors.GetItem getItem:
                 return TIR.F.NTT.GetItem((Expr)arguments[0], arguments[1], output);
+            case IR.Tensors.Reshape:
+                return GenerateBufferView("Reshape", (Expr)arguments[0], ref output);
             case IR.Tensors.ScatterND scatterND:
                 return TIR.F.NTT.ScatterND((Expr)arguments[0], (Expr)arguments[1], (Expr)arguments[2], output);
             case IR.Tensors.Stack stack:
                 return TIR.F.NTT.Stack(((IR.Tuple)arguments[0]).Fields.AsValueEnumerable().Select(x => (Expr)x).ToArray(), output, ((TensorConst)call[IR.Tensors.Stack.Axis]).Value.ToScalar<int>());
+            case IR.Tensors.Unsqueeze:
+                return GenerateBufferView("Unsqueeze", (Expr)arguments[0], ref output);
             case IR.NN.UpdatePagedAttentionKVCache upkv:
                 output = (Expr)arguments[1];
                 return TIR.F.NTT.UpdatePagedAttentionKVCache((Expr)arguments[0], (Expr)arguments[1], (Dimension)arguments[2], upkv.CacheKind, upkv.Layout);
@@ -325,6 +373,134 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
         output = T.AttachShardedConstView(tensorConst, shardedView.NewType, out _, $"const_sharded_view_{_shardedViewIndex++}");
         return T.Nop();
     }
+
+    private Expr GenerateBufferView(string opName, Expr input, ref Expr output)
+    {
+        if (input is not TIR.Buffer inputBuffer)
+        {
+            throw new NotSupportedException($"{opName} only supports buffer input, got {input.GetType().Name}.");
+        }
+
+        if (output is BufferVar { Role: BufferVarRole.Output })
+        {
+            var outputBuffer = CreateMetadataBuffer(output, MemoryLocation.Output, $"{opName}_output");
+            return GenerateTensorStore(CreateLogicalView(opName, inputBuffer, outputBuffer), output);
+        }
+
+        if (output is not TIR.Buffer selectedOutput)
+        {
+            throw new NotSupportedException(
+                $"{opName} output must be a buffer or caller output BufferVar, got {output.GetType().Name}.");
+        }
+
+        output = CreateLogicalView(opName, inputBuffer, selectedOutput);
+        return T.Nop();
+    }
+
+    private static TIR.Buffer CreateLogicalView(string opName, TIR.Buffer input, TIR.Buffer output)
+    {
+        var inputType = GetBufferType(input);
+        var outputType = GetBufferType(output);
+        if (!BufferViewUtility.TryCreate(inputType, outputType, out var transform))
+        {
+            throw new InvalidOperationException(
+                $"{opName} cannot create a storage-preserving buffer view from {inputType} to {outputType}.");
+        }
+
+        return BufferViewUtility.CreateLogicalBufferView(input, outputType, transform, output.Name);
+    }
+
+    private TIR.Buffer CreateMetadataBuffer(Expr expr, MemoryLocation location, string namePrefix)
+    {
+        var (tensorType, distributedType) = GetTensorTypeAndDistributedType(expr.CheckedType, namePrefix);
+        T.CreateBuffer(tensorType, location, out var buffer, $"{namePrefix}_{_bufferIndex++}", distributedType);
+        return buffer;
+    }
+
+    private TIR.Buffer CreateSharedWorkspaceBuffer(
+        TIR.NTT.NTTKernelOp kernelOp,
+        TIRSharedWorkspaceDescriptor descriptor)
+    {
+        if (string.IsNullOrWhiteSpace(descriptor.Name))
+        {
+            throw new InvalidOperationException(
+                $"TIR microkernel {kernelOp.GetType().Name} declared an unnamed shared workspace.");
+        }
+
+        if (descriptor.Type.Shape is not RankedShape shape)
+        {
+            throw new InvalidOperationException(
+                $"TIR microkernel {kernelOp.GetType().Name} shared workspace {descriptor.Name} must have a ranked shape.");
+        }
+
+        if (descriptor.AlignmentBytes <= 0 ||
+            (descriptor.AlignmentBytes & (descriptor.AlignmentBytes - 1)) != 0 ||
+            descriptor.AlignmentBytes < descriptor.Type.DType.SizeInBytes)
+        {
+            throw new InvalidOperationException(
+                $"TIR microkernel {kernelOp.GetType().Name} shared workspace {descriptor.Name} has invalid " +
+                $"alignment {descriptor.AlignmentBytes} for {descriptor.Type.DType}.");
+        }
+
+        (var size, var strides) = TensorUtilities.GetTensorMaxSizeAndStridesExpr(descriptor.Type, distributedType: null);
+        if (CompilerServices.GetMaxShape([size])[0] <= 0)
+        {
+            throw new InvalidOperationException(
+                $"TIR microkernel {kernelOp.GetType().Name} shared workspace {descriptor.Name} must contain at least one byte.");
+        }
+
+        var storage = new PhysicalBuffer(
+            descriptor.AlignmentBytes,
+            size,
+            MemoryLocation.Shared);
+        return new TIR.Buffer(
+            $"{kernelOp.GetType().Name}_{descriptor.Name}_shared_{_bufferIndex++}",
+            descriptor.Type.DType,
+            new MemSpan(storage),
+            shape.Dimensions.ToArray(),
+            strides,
+            distributedType: null);
+    }
+
+    private static (TensorType TensorType, DistributedType? DistributedType) GetTensorTypeAndDistributedType(IRType type, string context)
+        => type switch
+        {
+            DistributedType distributedType => (distributedType.TensorType, distributedType),
+            TensorType tensorType => (tensorType, null),
+            _ => throw new NotSupportedException($"{context} expects a tensor type, got {type}."),
+        };
+
+    private static IRType GetBufferType(TIR.Buffer buffer)
+        => (IRType?)buffer.DistributedType ?? new TensorType(buffer.ElemType, buffer.Dimensions.ToArray());
+
+    private static Expr GenerateTensorStore(TIR.Buffer source, Expr destination)
+    {
+        var distributedType = source.DistributedType;
+        return TIR.F.NTT.TensorStore(
+            source,
+            destination,
+            distributedType?.AxisPolicies ?? new IRArray<SBP>(),
+            distributedType?.Placement ?? new Placement(new IRArray<int>(), string.Empty, string.Empty));
+    }
+
+    private static Expr GenerateBoxing(
+        Call call,
+        IR.Distributed.Boxing boxing,
+        IReadOnlyList<BaseExpr> arguments,
+        ref Expr output)
+    {
+        return (call[IR.Distributed.Boxing.Input].CheckedType, boxing.NewType) switch
+        {
+            (TensorType, DistributedType outputType) => TIR.F.NTT.TensorLoad(output, (Expr)arguments[0], outputType.AxisPolicies, outputType.Placement),
+            (DistributedType inputType, TensorType) => TIR.F.NTT.TensorStore((Expr)arguments[0], output, inputType.AxisPolicies, inputType.Placement),
+            (DistributedType inputType, DistributedType outputType) => GenerateReshard((Expr)arguments[0], output, inputType, outputType),
+            _ => throw new NotSupportedException(
+                $"Unsupported Boxing TIR selection from {call[IR.Distributed.Boxing.Input].CheckedType} to {boxing.NewType}."),
+        };
+    }
+
+    private static Expr GenerateReshard(Expr input, Expr output, DistributedType inputType, DistributedType outputType)
+        => TIR.F.NTT.GatherReduceScatter(input, output, inputType, outputType);
 
     private Expr GenerateUnary(UnaryOp unaryOp, IReadOnlyList<BaseExpr> arguments, Expr output)
     {

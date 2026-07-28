@@ -63,6 +63,8 @@ public interface INTTTargetOptions : ITargetOptions
 
     Schedule.IBlockMicroKernelModelProvider BlockMicroKernelModel { get; }
 
+    Schedule.ITIRMicroKernelSelector TIRMicroKernelSelector { get; }
+
     Schedule.ITargetStorageEncodingModelProvider StorageEncodingModel { get; }
 
     Schedule.ILoopPipelineBackend LoopPipelineBackend { get; }
@@ -90,6 +92,12 @@ public interface ITarget
     string Name { get; }
 
     IReadOnlyList<IModuleCompiler> ModuleCompilers { get; }
+
+    /// <summary>
+    /// Gets a value indicating whether the compiler should run the target's
+    /// AutoTiling pipeline.
+    /// </summary>
+    bool IsAutoTilingEnabled => false;
 
     IModuleCompiler GetModuleCompiler(string moduleKind);
 
@@ -160,6 +168,15 @@ public interface ITarget
     void RegisterTargetDependentBeforeCodeGen(IPassManager passManager, CompileOptions options);
 
     void RegisterAffineSelectionPass(IPassManager passManager, CompileOptions options);
+
+    /// <summary>
+    /// Register the complete target-specific AutoTiling pipeline.
+    /// </summary>
+    /// <param name="passManager">Pass manager.</param>
+    /// <param name="options">Compile options.</param>
+    void RegisterAutoTilingPass(IPassManager passManager, CompileOptions options)
+    {
+    }
 
     void RegisterAutoPackingRules(IRulesAddable pass, CompileOptions options);
 

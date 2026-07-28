@@ -1,10 +1,11 @@
 {% import "triton/kernels/_common.py.jinja" as common with context %}
+{% import "triton/kernels/_producer_consumer.py.jinja" as phases with context %}
 {% set ctx = summa_context(model) %}
 # generated from PyNTT Jinja Summa.py.jinja
 # {{ model["Comment"] }}; lhs_dtype={{ model["LhsDType"] }}, rhs_dtype={{ model["RhsDType"] }}, output_dtype={{ model["OutputDType"] }}, lhs_shape={{ shape_tuple(model["LhsShape"]) }}, rhs_shape={{ shape_tuple(model["RhsShape"]) }}, output_shape={{ shape_tuple(model["OutputShape"]) }}, lhs_global_shape={{ shape_tuple(model["LhsGlobalShape"]) }}, rhs_global_shape={{ shape_tuple(model["RhsGlobalShape"]) }}, output_global_shape={{ shape_tuple(model["OutputGlobalShape"]) }}, rhs_n_lane={{ model["RhsNVectorLaneCount"] }}, output_n_lane={{ model["OutputNVectorLaneCount"] }}
-{{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
-def {{ model["FunctionName"] }}({{ helper_parameters(model) }}):
+{{ phases.consumer_header(model) }}
     shard_index = tl.program_id(0).to(tl.int64)
+{{ common.matrix_shared_aliases(ctx, model["LhsTritonDType"], model["RhsTritonDType"], [ctx["block_m"], ctx["block_k"]], [ctx["block_k"], ctx["block_n"]], true) }}
     tmp_shard_coord = shard_index
 {% for axis in reverse_indices(model["Hierarchy"]) %}
     shard_coord{{ axis }} = tmp_shard_coord % {{ model["Hierarchy"][axis] }}
@@ -84,3 +85,6 @@ def {{ model["FunctionName"] }}({{ helper_parameters(model) }}):
             result = acc * {{ model["Scale"] }}
             output_mask = {{ ctx["output_mask"] }}
             tl.store(output_ptr + output_offsets, tl.reshape(result, {{ ctx["output_structured_shape"] }}), mask=output_mask)
+
+
+{{ phases.dispatch(model) }}

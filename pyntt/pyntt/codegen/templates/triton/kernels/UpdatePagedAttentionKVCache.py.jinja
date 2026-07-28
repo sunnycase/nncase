@@ -1,10 +1,11 @@
 {% import "triton/kernels/_elementwise.py.jinja" as elementwise with context %}
+{% import "triton/kernels/_producer_consumer.py.jinja" as phases with context %}
 {% set ctx = update_paged_attention_kv_cache_context(model) %}
 {% set cache = model["Cache"] %}
+{% set args = ("slot_mapping", "kv_cache", "num_blocks_per_shard", "cache_meta") %}
 # generated from PyNTT Jinja UpdatePagedAttentionKVCache.py.jinja
 # {{ model["Comment"] }}; dtype={{ model["SlotsDType"] }}, slots_shape={{ shape_tuple(model["SlotsShape"]) }}, slots_global_shape={{ shape_tuple(model["SlotsGlobalShape"]) }}, layer={{ model["LayerIdExpression"] }}, cache_kind={{ model["CacheKind"] }}
-{{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
-def {{ model["FunctionName"] }}({{ helper_parameters(model, ("slot_mapping", "kv_cache", "num_blocks_per_shard", "cache_meta")) }}):
+{{ phases.consumer_header(model, args) }}
     shard_index = tl.program_id(0).to(tl.int64)
     layer_id_value = (tl.full((), 0, tl.int64) + ({{ model["LayerIdExpression"] }})).to(tl.int64)
     tmp_shard_coord = shard_index
@@ -68,3 +69,6 @@ def {{ model["FunctionName"] }}({{ helper_parameters(model, ("slot_mapping", "kv
 {{ indent }}value = tl.load({{ access_pointer(model, "Slots", ptr(model, "Slots"), ctx["slots_access"]) }}, mask=active, other=0.0)
 {{ indent }}tl.store(kv_cache + cache_offsets, value, mask=active)
 {% endcall %}
+
+
+{{ phases.dispatch(model, args) }}

@@ -1,20 +1,19 @@
 {% import "triton/kernels/_common.py.jinja" as common with context %}
 {% import "triton/kernels/_elementwise.py.jinja" as elementwise with context %}
+{% import "triton/kernels/_producer_consumer.py.jinja" as phases with context %}
 {% set ctx = vector_layout_context(model) %}
 # generated from PyNTT Jinja VectorLayout.py.jinja
 # {{ model["Comment"] }}; op={{ ctx["op"] }}, input_dtype={{ model["InputDType"] }}, output_dtype={{ model["OutputDType"] }}, input_shape={{ shape_tuple(model["InputShape"]) }}, output_shape={{ shape_tuple(model["OutputShape"]) }}
-{{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
-def {{ model["FunctionName"] }}({{ helper_parameters(model) }}):
+{{ phases.consumer_header(model) }}
     shard_index = tl.program_id(0).to(tl.int64)
 {{ common.shard_coordinates([model["Input"], model["Output"]]) }}
-{% if local_buffer(model["Input"]) is none %}
     input_ptr = {{ ptr(model, "Input") }}
-{% endif %}
-{% if local_buffer(model["Output"]) is none %}
     output_ptr = {{ ptr(model, "Output") }}
-{% endif %}
 {% call(indent) elementwise.iterate(ctx) %}
 {{ indent }}valid = {{ ctx["valid_expression"] }}
 {{ indent }}value = tl.load({{ access_pointer(model, "Input", "input_ptr", ctx["input_access"]) }}, mask=valid, other=0)
 {{ indent }}tl.store({{ access_pointer(model, "Output", "output_ptr", ctx["output_access"]) }}, value, mask={{ ctx["store_mask"] }})
 {% endcall %}
+
+
+{{ phases.dispatch(model) }}

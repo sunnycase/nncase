@@ -1,0 +1,66 @@
+{
+  "schema_version": 2,
+  "timestamp_utc": "2026-07-24T10:11:12Z",
+  "environment": {
+    "device": "NVIDIA GeForce RTX 5060 Ti",
+    "compute_capability": "12.0",
+    "sm_count": 36,
+    "nsight_compute_version": "2025.4.1.0",
+    "torch_version": "2.8.0+cu128",
+    "triton_version": "3.6.0"
+  },
+  "configuration": {
+    "m": 1,
+    "k": 4096,
+    "n": 12288,
+    "tile_n": 64,
+    "tile_k": 128,
+    "stages": 4,
+    "global_weight_layout": "[K/16,N/8]<NVector=8,KPack=2,KVector=8>",
+    "shared_stage_shape": [
+      64,
+      128
+    ],
+    "consumer_tile_shape": [
+      64,
+      32
+    ],
+    "consumer_warps": 8,
+    "producer_warps": 1,
+    "persistent_grid_ctas": 36
+  },
+  "collection": {
+    "tool": "docs/pyntt/kernels/gemv/profile_pipeline.py",
+    "metric_list": "docs/pyntt/kernels/gemv/ncu_metrics.txt",
+    "kernel_filter": "regex:packed_gemv_pipeline",
+    "replay_passes": 3,
+    "raw_report": "build/pyntt_gemv_kmajor_ncu/bk128_s4.ncu-rep"
+  },
+  "profile": {
+    "duration_ns": 245248,
+    "sm_cycles_elapsed_avg": 585138.666667,
+    "dram_read_bytes": 100694272,
+    "dram_write_bytes": 1474560,
+    "dram_throughput_pct_of_peak_sustained": 94.433113,
+    "l2_bytes": 101133536,
+    "registers_per_thread": 168,
+    "shared_memory_per_block_bytes": 66692,
+    "ldgsts_instructions": 196608,
+    "ldgsts_payload_bytes": 100663296,
+    "ldgsts_requests": 196608,
+    "ldgsts_sectors": 3145728,
+    "ldgsts_average_bytes_per_sector": 32.0,
+    "shared_load_payload_bytes": 100663584,
+    "shared_load_wavefronts": 786720,
+    "shared_load_bank_conflicts": 0,
+    "shared_load_average_bytes_per_wavefront": 127.953508
+  },
+  "derived": {
+    "ldgsts_sectors_per_request": 16.0,
+    "ldgsts_bytes_per_request": 512.0,
+    "global_sector_utilization": 1.0,
+    "ideal_shared_bytes_per_wavefront": 128.0,
+    "shared_wavefront_efficiency": 0.999636,
+    "shared_wavefront_expansion": 1.000364
+  }
+}

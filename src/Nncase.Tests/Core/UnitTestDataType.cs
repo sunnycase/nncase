@@ -46,6 +46,25 @@ public sealed class UnitTestDataType
     }
 
     [Fact]
+    public void TestThreeDimensionalVectorType()
+    {
+        var values = new int[8 * 2 * 8];
+        for (int index = 0; index < values.Length; index++)
+        {
+            values[index] = index;
+        }
+
+        var vector = Vector8x2x8<int>.Create(values);
+        var dataType = new VectorType(DataTypes.Int32, [8, 2, 8]);
+
+        Assert.Equal(values, vector.AsSpan().ToArray());
+        Assert.Equal(0, vector[0, 0, 0]);
+        Assert.Equal(127, vector[7, 1, 7]);
+        Assert.Equal(typeof(Vector8x2x8<int>), dataType.CLRType);
+        Assert.Equal(dataType, DataType.FromType(typeof(Vector8x2x8<int>)));
+    }
+
+    [Fact]
     public void TestDataTypeSerialize()
     {
         var path = "UnitTestDataType_TestSeriable.json";

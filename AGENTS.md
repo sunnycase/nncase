@@ -204,6 +204,43 @@ rerun the generated package. Recompile the model only when changing the C#
 manifest emitter, TIR/codegen metadata, IR passes, rdata layout, runtime model
 signature, or target options.
 
+PyNTT deliberately skips nncase AutoTiling. Its codegen input is selected,
+bufferized semantic TIR whose Input, Output, Data, RData, ChipLocal, and
+BlockLocal backing buffers are globally addressable. PyNTT templates own all
+block-internal tiling, shared-memory/register staging, pipelines, Triton
+encodings, and tails. TIR Selection may choose a target microkernel and attach
+typed Shared resource reservations; Bufferize owns their lifetime, reuse,
+alignment, target allocation-policy rounding, arena size, and byte offsets.
+The final `NTTKernelOp` shared operand must be `None`, a single Buffer, or a
+flat Tuple of two or more Buffers. PyNTT passes only the arena and compiler-owned
+offsets; Jinja creates typed aliases and chooses their Triton/MMA layout. Do not
+introduce compiler `Grid`/`For`/`PipelineFor`, executable Shared buffers,
+Register buffers, `TileLoad`/`TileStore`, storage encodings, or AutoTiling
+block-microkernel metadata. Manifest version 8 is the only supported reader
+contract; each helper records the exact live workspace arguments separately
+from operation arguments. Do not add a legacy manifest reader or fallback path.
+`num_warps`, producer allocation, register partitioning, and renderer tuning
+candidates belong to `PYNTT_KERNEL_CONFIGS`; a selected microkernel parameter
+may enter the manifest only when it determines the compiler-reserved resource
+contract.
+
+Every executable PyNTT helper follows the producer/consumer specialization ABI.
+Algorithms with an independent gmem-to-Shared transfer phase use a real
+`tle.pipe` producer and consumer. Algorithms without a legal or profitable
+independent transfer phase use an empty producer and execute their semantics in
+the consumer; do not invent Shared staging just to make both phases non-empty.
+The renderer derives one spill-free worker register partition from target
+register-file capacity and allocation granularity and applies it consistently
+to all helper variants.
+
+For matrix-like PyNTT kernels, keep one complete Jinja file per selected
+algorithm under a family directory, for example
+`triton/kernels/matmul/simt_fma.py.jinja` and
+`triton/kernels/matmul/mma.py.jinja`. TIR microkernel selection chooses the
+variant; Jinja validates and implements it without reselecting another
+algorithm. Do not restore wrapper templates that combine GEMV/GEMM/MMA or
+include algorithm fragments from another file.
+
 ```sh
 export PYTHONPATH="$PWD/pyntt:${PYTHONPATH}"
 

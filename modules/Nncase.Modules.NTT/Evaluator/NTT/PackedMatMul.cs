@@ -19,30 +19,48 @@ public sealed class PackedMatMulEvaluator : IEvaluator<PackedMatMul>, ITypeInfer
     public IValue Visit(IEvaluateContext context, PackedMatMul target)
     {
         var lhs = context.GetOrtArgumentValue(target, PackedMatMul.Lhs); // [x, m, k]
-        var rhs = context.GetArgumentValueAsTensor(target, PackedMatMul.Rhs); // [x, n/Nr/lanes, k, Nr, lanes]
+        var rhs = context.GetArgumentValueAsTensor(target, PackedMatMul.Rhs);
         var scale = context.GetArgumentValue(target, PackedMatMul.Scale);
         var rhsOrt = rhs.ToOrtTensor();
 
-        var rhsVectorType = (VectorType)rhs.ElementType;
-        var nr = rhsVectorType.Lanes[0];
-        var nLanes = rhsVectorType.Lanes[1];
-        var outRank = context.CurrentCall.CheckedShape.Rank;
-
-        // 1. Unpack B to scalar reference layout.
-        var rN = rhs.Rank - 2;
-        rhsOrt = rhsOrt.Unpack(rhsVectorType.Lanes.Count, [rN, rN]);
-
-        // 2. Transpose B
+        if (rhs.ElementType is not VectorType rhsVectorType)
         {
-            var perm = Enumerable.Range(0, rhsOrt.Rank).Select(i => (long)i).ToArray();
-            (perm[^2], perm[^1]) = (perm[^1], perm[^2]);
-            rhsOrt = OrtKI.Transpose(rhsOrt, perm);
+            throw new InvalidOperationException($"PackedMatMul expects a vector RHS, got {rhs.ElementType}.");
+        }
+
+        int[] outputLanes;
+        var outRank = context.CurrentCall.CheckedShape.Rank;
+        switch (target.RhsLayout)
+        {
+            case PackedMatMulRhsLayout.NMajor when rhsVectorType.Lanes.Count == 2:
+                {
+                    var rN = rhs.Rank - 2;
+                    rhsOrt = rhsOrt.Unpack(rhsVectorType.Lanes.Count, [rN, rN]);
+                    var perm = Enumerable.Range(0, rhsOrt.Rank).Select(i => (long)i).ToArray();
+                    (perm[^2], perm[^1]) = (perm[^1], perm[^2]);
+                    rhsOrt = OrtKI.Transpose(rhsOrt, perm);
+                    outputLanes = rhsVectorType.Lanes.ToArray();
+                    break;
+                }
+
+            case PackedMatMulRhsLayout.KMajor when rhsVectorType.Lanes.Count == 3:
+                {
+                    var rK = rhs.Rank - 2;
+                    var rN = rhs.Rank - 1;
+                    rhsOrt = rhsOrt.Unpack(rhsVectorType.Lanes.Count, [rN, rK, rK]);
+                    outputLanes = [rhsVectorType.Lanes[0]];
+                    break;
+                }
+
+            default:
+                throw new InvalidOperationException(
+                    $"PackedMatMul {target.RhsLayout} RHS has invalid vector lanes [{string.Join(",", rhsVectorType.Lanes)}].");
         }
 
         var matmul = Math.MatMulEvaluator.InferValue(lhs.DataType.ToDataType(), lhs.ToTensor(), rhsOrt.ToTensor(), target.OutputDataType, scale).AsTensor().ToOrtTensor();
         var cN = matmul.Rank - 1;
-        matmul = matmul.Pack(0, [nr, nLanes], [cN, cN]);
-        return matmul.ToValue(new VectorType(target.OutputDataType, [nr, nLanes]));
+        matmul = matmul.Pack(0, outputLanes, Enumerable.Repeat(cN, outputLanes.Length).ToArray());
+        return matmul.ToValue(new VectorType(target.OutputDataType, outputLanes));
     }
 
     public IRType Visit(ITypeInferenceContext context, PackedMatMul target)
@@ -56,11 +74,28 @@ public sealed class PackedMatMulEvaluator : IEvaluator<PackedMatMul>, ITypeInfer
         {
             case (DistributedType a, DistributedType b):
                 {
-                    var bVectorType = (VectorType)b.TensorType.DType;
-                    var nr = bVectorType.Lanes[0];
-                    var unpackedB = b with { TensorType = UnpackedBType(b.TensorType) };
-                    var dimInfo = VectorizedMatMul.GetDimInfo(false, true, a.TensorType.Shape.Rank, unpackedB.TensorType.Shape.Rank);
-                    rType = Math.MatMulEvaluator.VisitDistributedType(a, unpackedB, scale, dimInfo: dimInfo, transB: true, outputDataType: target.OutputDataType);
+                    if (b.TensorType.DType is not VectorType bVectorType ||
+                        !TryGetLayoutInfo(target.RhsLayout, bVectorType, b.TensorType.Shape.Rank, out var rhsUnpackAxes, out var outputLanes, out var transposeB, out errorMessage))
+                    {
+                        return new InvalidType(errorMessage ?? $"PackedMatMul expects a vector RHS, got {b.TensorType.DType}.");
+                    }
+
+                    var unpackedBType = UnpackType(b, rhsUnpackAxes);
+                    if (unpackedBType is not DistributedType unpackedB)
+                    {
+                        return unpackedBType;
+                    }
+
+                    var dimInfo = VectorizedMatMul.GetDimInfo(false, transposeB, a.TensorType.Shape.Rank, unpackedB.TensorType.Shape.Rank);
+                    if (a.AxisPolicies[dimInfo.Lk] != unpackedB.AxisPolicies[dimInfo.Rk])
+                    {
+                        return new InvalidType(
+                            "PackedMatMul requires lhs and rhs reduction axes to use the same " +
+                            $"distributed policy, got lhs={a.AxisPolicies[dimInfo.Lk]} and " +
+                            $"rhs={unpackedB.AxisPolicies[dimInfo.Rk]}.");
+                    }
+
+                    rType = Math.MatMulEvaluator.VisitDistributedType(a, unpackedB, scale, dimInfo: dimInfo, transB: transposeB, outputDataType: target.OutputDataType);
                     if (rType is not DistributedType drType)
                     {
                         return rType;
@@ -71,18 +106,30 @@ public sealed class PackedMatMulEvaluator : IEvaluator<PackedMatMul>, ITypeInfer
                         drType = (DistributedType)Math.MatMulEvaluator.ConvertPartialToBroadcast(drType);
                     }
 
-                    rType = drType with { TensorType = (TensorType)TypeInference.PackType(drType.TensorType, [nr], [drType.TensorType.Shape.Rank - 1]) };
+                    rType = PackType(drType, outputLanes, Enumerable.Repeat(drType.TensorType.Shape.Rank - 1, outputLanes.Length).ToArray());
                 }
 
                 break;
             case (TensorType a, TensorType b):
                 {
-                    var bVectorType = (VectorType)b.DType;
-                    var nr = bVectorType.Lanes[0];
-                    var unpackedB = UnpackedBType(b);
-                    var dimInfo = VectorizedMatMul.GetDimInfo(false, true, a.Shape.Rank, unpackedB.Shape.Rank);
+                    if (b.DType is not VectorType bVectorType ||
+                        !TryGetLayoutInfo(target.RhsLayout, bVectorType, b.Shape.Rank, out var rhsUnpackAxes, out var outputLanes, out var transposeB, out errorMessage))
+                    {
+                        return new InvalidType(errorMessage ?? $"PackedMatMul expects a vector RHS, got {b.DType}.");
+                    }
+
+                    var unpackedBType = UnpackType(b, rhsUnpackAxes);
+                    if (unpackedBType is not TensorType unpackedB)
+                    {
+                        return unpackedBType;
+                    }
+
+                    var dimInfo = VectorizedMatMul.GetDimInfo(false, transposeB, a.Shape.Rank, unpackedB.Shape.Rank);
                     rType = Math.MatMulEvaluator.VisitTensorType(a, unpackedB, scale, dimInfo: dimInfo, outputDataType: target.OutputDataType);
-                    rType = TypeInference.PackType((TensorType)rType, [nr], [((TensorType)rType).Shape.Rank - 1]);
+                    if (rType is TensorType outputType)
+                    {
+                        rType = TypeInference.PackType(outputType, outputLanes, Enumerable.Repeat(outputType.Shape.Rank - 1, outputLanes.Length).ToArray());
+                    }
                 }
 
                 break;
@@ -129,19 +176,57 @@ public sealed class PackedMatMulEvaluator : IEvaluator<PackedMatMul>, ITypeInfer
         return AddAllReduceCost(cost, outputType, hasAllReduce);
     }
 
-    private TensorType UnpackedBType(TensorType tensorType)
+    private static bool TryGetLayoutInfo(
+        PackedMatMulRhsLayout layout,
+        VectorType vectorType,
+        int rhsRank,
+        out int[] rhsUnpackAxes,
+        out int[] outputLanes,
+        out bool transposeB,
+        out string? errorMessage)
     {
-        var vectorType = (VectorType)tensorType.DType;
-        var nr = vectorType.Lanes[0];
-        var nLanes = vectorType.Lanes[1];
-        var newShape = tensorType.Shape.ToArray();
-        newShape[^2] *= nr;
-        return tensorType with { DType = vectorType with { Lanes = [nLanes] }, Shape = newShape };
+        switch (layout, vectorType.Lanes.Count)
+        {
+            case (PackedMatMulRhsLayout.NMajor, 2):
+                rhsUnpackAxes = [rhsRank - 2, rhsRank - 2];
+                outputLanes = vectorType.Lanes.ToArray();
+                transposeB = true;
+                errorMessage = null;
+                return true;
+            case (PackedMatMulRhsLayout.KMajor, 3):
+                rhsUnpackAxes = [rhsRank - 1, rhsRank - 2, rhsRank - 2];
+                outputLanes = [vectorType.Lanes[0]];
+                transposeB = false;
+                errorMessage = null;
+                return true;
+            default:
+                rhsUnpackAxes = [];
+                outputLanes = [];
+                transposeB = false;
+                errorMessage = $"PackedMatMul {layout} expects {(layout == PackedMatMulRhsLayout.NMajor ? 2 : 3)} RHS vector lanes, got [{string.Join(",", vectorType.Lanes)}].";
+                return false;
+        }
     }
 
     private bool TryGetTargetCost(ICostEvaluateContext context, PackedMatMul target, IRType lhs, IRType rhs, IRType outputType, out Cost cost, out bool hasAllReduce)
     {
         hasAllReduce = lhs is DistributedType distributedType && distributedType.AxisPolicies[^1] is SBPSplit;
+        if (target.RhsLayout == PackedMatMulRhsLayout.KMajor)
+        {
+            if (GetTensorType(rhs)?.DType is not VectorType rhsVectorType ||
+                !TryGetLayoutInfo(target.RhsLayout, rhsVectorType, GetTensorType(rhs)!.Shape.Rank, out var rhsUnpackAxes, out _, out _, out _) ||
+                UnpackType(rhs, rhsUnpackAxes) is not { } logicalRhs ||
+                GetTensorType(outputType)?.DType is not VectorType ||
+                UnpackType(outputType, [GetTensorType(outputType)!.Shape.Rank - 1]) is not { } logicalOutput)
+            {
+                cost = Cost.Zero;
+                return false;
+            }
+
+            rhs = logicalRhs;
+            outputType = logicalOutput;
+        }
+
         if (!TargetCostTensor.TryFromType(lhs, out var lhsTensor)
             || !TargetCostTensor.TryFromType(rhs, out var rhsTensor)
             || !TargetCostTensor.TryFromType(outputType, out var outputTensor)
@@ -153,6 +238,27 @@ public sealed class PackedMatMulEvaluator : IEvaluator<PackedMatMul>, ITypeInfer
 
         return true;
     }
+
+    private static TensorType? GetTensorType(IRType type) => type switch
+    {
+        TensorType tensorType => tensorType,
+        DistributedType distributedType => distributedType.TensorType,
+        _ => null,
+    };
+
+    private static IRType UnpackType(IRType input, int[] axes) => input switch
+    {
+        DistributedType distributedType => TypeInference.UnpackType(distributedType, axes),
+        TensorType tensorType => TypeInference.UnpackType(tensorType, axes),
+        _ => new InvalidType($"Cannot unpack {input} with axes [{string.Join(",", axes)}]."),
+    };
+
+    private static IRType PackType(IRType input, int[] lanes, int[] axes) => input switch
+    {
+        DistributedType distributedType => TypeInference.PackType(distributedType, lanes, axes),
+        TensorType tensorType => TypeInference.PackType(tensorType, lanes, axes),
+        _ => new InvalidType($"Cannot pack {input}."),
+    };
 
     private DataType GetScalarType(DataType dtype) => dtype switch
     {
