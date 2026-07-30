@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Any, Mapping, Optional, Sequence
+
+from pyntt.runtime.tensor import dtype_item_size, view_typed_buffer
 
 _TRITON_ALLOCATOR_INSTALLED = False
 _VALIDATED_KERNEL_RESOURCES: set[tuple[object, ...]] = set()
@@ -11,6 +13,185 @@ _SELECTED_TUNING_PARAMETERS: dict[tuple[object, ...], int] = {}
 
 class TritonKernelResourceError(RuntimeError):
     """A compiled specialization violates the target resource contract."""
+
+
+class TritonTensorDescriptorCache:
+    """Materialize bounded, reusable host tensor descriptors for generated kernels."""
+
+    _DESCRIPTOR_ALIGNMENT_BYTES = 16
+    _MAX_BLOCK_ELEMENTS = 1_048_576
+    _SPEC_FIELDS = frozenset(
+        {
+            "name",
+            "source",
+            "offset_bytes",
+            "dtype",
+            "shape",
+            "strides",
+            "block_shape",
+            "padding",
+        }
+    )
+
+    def __init__(self) -> None:
+        self._entries: dict[str, tuple[tuple[object, ...], object]] = {}
+
+    def materialize_many(
+        self,
+        kernel_name: str,
+        specs: Sequence[Mapping[str, Any]],
+        sources: Mapping[str, Any],
+    ) -> tuple[object, ...]:
+        """Return descriptors in compiler-defined ABI order."""
+        descriptors = []
+        for spec in specs:
+            fields = frozenset(spec)
+            if fields != self._SPEC_FIELDS:
+                missing = sorted(self._SPEC_FIELDS - fields)
+                unexpected = sorted(fields - self._SPEC_FIELDS)
+                raise ValueError(
+                    f"PyNTT host tensor descriptor spec has missing fields "
+                    f"{missing} and unexpected fields {unexpected}."
+                )
+            name = str(spec["name"])
+            source_name = str(spec["source"])
+            if not name or not source_name:
+                raise ValueError(
+                    "PyNTT host tensor descriptor name/source must be non-empty."
+                )
+            try:
+                storage = sources[source_name]
+            except KeyError as ex:
+                raise ValueError(
+                    f"PyNTT host tensor descriptor {name!r} references "
+                    f"unbound source {source_name!r}."
+                ) from ex
+            descriptors.append(
+                self._materialize(
+                    f"{kernel_name}:{name}",
+                    storage,
+                    offset_bytes=int(spec["offset_bytes"]),
+                    dtype=str(spec["dtype"]),
+                    shape=tuple(int(value) for value in spec["shape"]),
+                    strides=tuple(int(value) for value in spec["strides"]),
+                    block_shape=tuple(int(value) for value in spec["block_shape"]),
+                    padding=str(spec["padding"]),
+                )
+            )
+        return tuple(descriptors)
+
+    def _materialize(
+        self,
+        slot: str,
+        storage: Any,
+        *,
+        offset_bytes: int,
+        dtype: str,
+        shape: tuple[int, ...],
+        strides: tuple[int, ...],
+        block_shape: tuple[int, ...],
+        padding: str,
+    ) -> object:
+        if len(shape) == 0 or len(shape) > 5:
+            raise ValueError(
+                f"PyNTT host tensor descriptor {slot} rank must be in [1, 5], "
+                f"got {len(shape)}."
+            )
+        if len(strides) != len(shape) or len(block_shape) != len(shape):
+            raise ValueError(
+                f"PyNTT host tensor descriptor {slot} shape/stride/block ranks "
+                f"differ: {len(shape)}/{len(strides)}/{len(block_shape)}."
+            )
+        if any(value <= 0 for value in (*shape, *strides, *block_shape)):
+            raise ValueError(
+                f"PyNTT host tensor descriptor {slot} dimensions, strides, and "
+                "block dimensions must be positive."
+            )
+        if strides[-1] != 1:
+            raise ValueError(
+                f"PyNTT host tensor descriptor {slot} requires a contiguous "
+                f"last dimension, got stride {strides[-1]}."
+            )
+        item_size = dtype_item_size(dtype)
+        for axis, stride in enumerate(strides[:-1]):
+            if (stride * item_size) % self._DESCRIPTOR_ALIGNMENT_BYTES != 0:
+                raise ValueError(
+                    f"PyNTT host tensor descriptor {slot} stride {stride} on "
+                    f"axis {axis} is not {self._DESCRIPTOR_ALIGNMENT_BYTES}-byte "
+                    "aligned."
+                )
+        block_elements = 1
+        for axis, extent in enumerate(block_shape):
+            if extent & (extent - 1):
+                raise ValueError(
+                    f"PyNTT host tensor descriptor {slot} block extent {extent} "
+                    f"on axis {axis} is not a power of two."
+                )
+            block_elements *= extent
+        if block_elements > self._MAX_BLOCK_ELEMENTS:
+            raise ValueError(
+                f"PyNTT host tensor descriptor {slot} block has "
+                f"{block_elements} elements, exceeding the Triton limit "
+                f"{self._MAX_BLOCK_ELEMENTS}."
+            )
+        if offset_bytes < 0:
+            raise ValueError(
+                f"PyNTT host tensor descriptor {slot} has negative byte offset "
+                f"{offset_bytes}."
+            )
+        if padding not in ("zero", "nan"):
+            raise ValueError(
+                f"PyNTT host tensor descriptor {slot} has invalid padding "
+                f"{padding!r}."
+            )
+        if not hasattr(storage, "data_ptr") or not hasattr(storage, "device"):
+            raise TypeError(
+                f"PyNTT host tensor descriptor {slot} expects tensor storage, "
+                f"got {type(storage).__name__}."
+            )
+
+        signature = (
+            int(storage.data_ptr()),
+            str(storage.device),
+            str(getattr(storage, "dtype", "")),
+            offset_bytes,
+            dtype,
+            shape,
+            strides,
+            block_shape,
+            padding,
+        )
+        cached = self._entries.get(slot)
+        if cached is not None and cached[0] == signature:
+            return cached[1]
+
+        span_elements = 1 + sum(
+            (extent - 1) * stride for extent, stride in zip(shape, strides)
+        )
+        size_bytes = span_elements * item_size
+        base = view_typed_buffer(storage, offset_bytes, size_bytes, dtype)
+        if int(base.data_ptr()) % self._DESCRIPTOR_ALIGNMENT_BYTES != 0:
+            raise ValueError(
+                f"PyNTT host tensor descriptor {slot} base address after byte "
+                f"offset {offset_bytes} is not "
+                f"{self._DESCRIPTOR_ALIGNMENT_BYTES}-byte aligned."
+            )
+        if padding == "nan" and not base.dtype.is_floating_point:
+            raise ValueError(
+                f"PyNTT host tensor descriptor {slot} cannot use NaN padding "
+                f"with dtype {dtype}."
+            )
+        from triton.tools.tensor_descriptor import TensorDescriptor
+
+        descriptor = TensorDescriptor(
+            base,
+            shape=list(shape),
+            strides=list(strides),
+            block_shape=list(block_shape),
+            padding=padding,
+        )
+        self._entries[slot] = (signature, descriptor)
+        return descriptor
 
 
 def ensure_triton_allocator(device: Optional[object] = None) -> None:
@@ -185,6 +366,20 @@ def select_and_validate_triton_tuning_parameter(
 
 def _specialization_signature(value: object) -> tuple[object, ...]:
     """Describe compile-relevant argument properties without retaining buffers."""
+    try:
+        from triton.tools.tensor_descriptor import TensorDescriptor
+    except ImportError:
+        TensorDescriptor = ()  # type: ignore[assignment]
+    if isinstance(value, TensorDescriptor):
+        return (
+            "tensor_descriptor",
+            _specialization_signature(value.base),
+            tuple(int(item) for item in value.shape),
+            tuple(int(item) for item in value.strides),
+            tuple(int(item) for item in value.block_shape),
+            str(value.padding),
+        )
+
     if hasattr(value, "data_ptr") and hasattr(value, "dtype"):
         pointer = int(value.data_ptr())
         device = getattr(value, "device", None)

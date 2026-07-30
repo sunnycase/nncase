@@ -150,7 +150,8 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
                     (Expr)arguments[7],
                     (Expr)arguments[8],
                     output,
-                    matmulGlu.GluType);
+                    matmulGlu.GluType,
+                    matmulGlu.RhsLayout);
             case IR.NTT.PackedQKVParallelLinear qkv:
                 {
                     var outputBase = Unsafe.As<Expr, BaseExpr>(ref output);
@@ -177,7 +178,8 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
                         (Expr)outputs[1],
                         (Expr)outputs[2],
                         qkv.NumHeads,
-                        qkv.NumKvHeads);
+                        qkv.NumKvHeads,
+                        qkv.RhsLayout);
                 }
 
             case IR.NN.QKVParallelLinear qkv:

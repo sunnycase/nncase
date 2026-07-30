@@ -40,8 +40,8 @@ addressable backing pools. They are not Triton shared memory.
   target `ITIRMicroKernelSelector` for microkernel parameters and Shared
   reservations.
 - `PyNTTLinkableModule` owns generated Python dispatch, input/output binding,
-  shape buckets, workspace allocation, rdata materialization, and launch
-  arguments.
+  shape buckets, workspace allocation, rdata materialization, host tensor
+  descriptor binding, and launch arguments.
 - `PyNTTKernelSourceConvertVisitor` validates direct TIR and emits typed helper
   models plus semantic metadata.
 - `pyntt/pyntt/codegen/render.py` is the strict, reader-only manifest renderer.
@@ -75,9 +75,10 @@ body_source
 
 There are no pipeline execution tables, typed Shared aliases, local-buffer
 tables, storage encodings, or compiler-generated reduction-phase plans.
-Launch metadata may carry the total Shared arena bytes; a helper model may
-carry selected microkernel family/variant/static parameters and named Shared
-byte-offset expressions. Each helper contains exactly:
+Launch metadata carries the total Shared arena bytes and Bufferize-computed
+arena alignment; a helper model may carry selected microkernel
+family/variant/static parameters and named Shared byte-offset expressions. Each
+helper contains exactly:
 
 ```text
 template
@@ -100,6 +101,14 @@ must not carry `num_warps` or renderer tuning candidates. A microkernel
 Renderer-owned choices are emitted in `PYNTT_KERNEL_CONFIGS`; changes that fit
 the existing resource reservation can be applied by re-rendering without model
 compilation.
+
+Launch metadata may also contain host tensor descriptor backing records. These
+records contain only compiler-owned facts: descriptor ABI name, backing source,
+fixed byte offset, scalar dtype, global logical shape/strides, and vector lane
+shape. The renderer combines a backing record with the selected algorithm and
+emits concrete `PYNTT_HOST_TENSOR_DESCRIPTOR_SPECS`, including TMA shape,
+strides, block shape, and padding. Do not serialize an algorithm-specific TMA
+block shape from C#.
 
 ## Producer/Consumer Contract
 
@@ -140,6 +149,8 @@ runtime pointer:
 
 - Bufferize gives a `PrimFunction` one Shared byte-arena workspace when needed.
 - The generated top Triton function allocates the arena once.
+- The allocation uses the exact alignment emitted by Bufferize; templates must
+  not infer alignment from an operation name or encoding.
 - Nested device functions receive a compile-time base byte offset.
 - Operation-local named offsets are relative to that base.
 - Templates create typed aliases with
@@ -181,6 +192,32 @@ canonical final `NTTKernelOp` operand is:
 Empty, singleton, or nested workspace Tuples are invalid. Typed Triton Shared
 memdescs and all register descriptors are created only inside a kernel
 template.
+
+## Host Tensor Descriptors
+
+TMA-capable helpers receive host-created
+`triton.tools.tensor_descriptor.TensorDescriptor` values as kernel arguments.
+Do not call `tl.make_tensor_descriptor` in generated device code.
+
+- Build the descriptor from the authoritative global backing, never from a
+  local shard pointer.
+- Add compiler-derived global shard offsets to descriptor coordinates in the
+  helper, so each block still computes only its local shard.
+- Reject per-shard Data/RData and BlockLocal backing when one global descriptor
+  cannot represent it.
+- Validate static shape, strides, byte offset, block shape, rank, and storage
+  span before launch. Do not fall back to device descriptor construction.
+- Cache one descriptor per generated kernel ABI slot and replace that entry
+  when the backing pointer or descriptor configuration changes.
+- Keep the concrete descriptor layout renderer-owned so template-only TMA tile
+  changes remain re-render-only changes.
+- Model fused QKV as one concatenated logical N stream. Generate one N/K tile
+  loop pair, route portions of each N tile to the Q/K/V descriptors, and stage
+  those portions into disjoint regions of one Shared tile. Do not emit
+  projection-specific Q, K, and V tile loops.
+
+The Triton scratch allocator is unrelated to host descriptors. Install it only
+for kernels whose grid synchronization path requires runtime scratch storage.
 
 ## Synchronization
 
@@ -233,6 +270,10 @@ target options.
   PTXAS stack/spill bytes.
 - Re-render `generated_kernels.py` and inspect that tiling/pipeline logic comes
   from Jinja templates.
+- For TMA helpers, verify TTGIR contains
+  `async_tma_copy_global_to_local`, PTX contains
+  `cp.async.bulk.tensor`, and generated source contains no
+  `tl.make_tensor_descriptor`.
 - Run focused C# target tests and Python package/benchmark tests.
 - Run the smallest existing importer pytest with `NNCASE_TEST_TARGETS=pyntt`.
 - For shared ABI changes, run one-layer Qwen3 and compare all generated tokens.

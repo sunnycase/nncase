@@ -727,6 +727,10 @@ public sealed record PyNTTMatmulTemplateModel(
 {
     public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
 
+    public PyNTTDimExpression[] RhsGlobalOffsets { get; set; } = Array.Empty<PyNTTDimExpression>();
+
+    public string? RhsDescriptorName { get; set; }
+
     public int RhsNPackedLaneCount { get; set; } = 1;
 
     public int OutputNPackedLaneCount { get; set; } = 1;
@@ -794,6 +798,24 @@ public sealed record PyNTTQKVParallelLinearTemplateModel(
     public int NPackedLaneCount { get; set; } = 1;
 
     public int NVectorLaneCount { get; set; } = 1;
+
+    public string RhsLayout { get; set; } = "n_major";
+
+    public int KPackLaneCount { get; set; } = 1;
+
+    public int KVectorLaneCount { get; set; } = 1;
+
+    public PyNTTDimExpression[] QWeightGlobalOffsets { get; set; } = Array.Empty<PyNTTDimExpression>();
+
+    public PyNTTDimExpression[] KWeightGlobalOffsets { get; set; } = Array.Empty<PyNTTDimExpression>();
+
+    public PyNTTDimExpression[] VWeightGlobalOffsets { get; set; } = Array.Empty<PyNTTDimExpression>();
+
+    public string? QWeightDescriptorName { get; set; }
+
+    public string? KWeightDescriptorName { get; set; }
+
+    public string? VWeightDescriptorName { get; set; }
 }
 
 public sealed record PyNTTMatMulGluTemplateModel(
@@ -837,6 +859,20 @@ public sealed record PyNTTMatMulGluTemplateModel(
     public int NPackedLaneCount { get; set; } = 1;
 
     public int NVectorLaneCount { get; set; } = 1;
+
+    public string RhsLayout { get; set; } = "n_major";
+
+    public int KPackLaneCount { get; set; } = 1;
+
+    public int KVectorLaneCount { get; set; } = 1;
+
+    public PyNTTDimExpression[] GateWeightGlobalOffsets { get; set; } = Array.Empty<PyNTTDimExpression>();
+
+    public PyNTTDimExpression[] UpWeightGlobalOffsets { get; set; } = Array.Empty<PyNTTDimExpression>();
+
+    public string? GateWeightDescriptorName { get; set; }
+
+    public string? UpWeightDescriptorName { get; set; }
 }
 
 public sealed record PyNTTSummaTemplateModel(

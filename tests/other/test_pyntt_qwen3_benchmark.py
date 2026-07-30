@@ -95,7 +95,11 @@ def test_token_driver_prefills_and_decodes_one_token_per_call():
 
 def _strict_launch():
     return {
-        "meta": {},
+        "meta": {
+            "shared_data_pool_bytes": 0,
+            "shared_data_pool_alignment_bytes": 8,
+        },
+        "host_tensor_descriptors": [],
         "sharding": {
             "strategy": "replicated",
             "placement_axis": "b",
@@ -120,6 +124,8 @@ def _render_kernel(symbol="main_prim"):
                 "target_threads_per_block": 256,
                 "register_file_capacity_units": 65280,
                 "register_file_allocation_granularity_units": 256,
+                "registers_per_thread_limit": 255,
+                "shared_memory_capacity_bytes": 101376,
             },
             "launch": _strict_launch(),
         },

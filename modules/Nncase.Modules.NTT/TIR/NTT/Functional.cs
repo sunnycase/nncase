@@ -135,10 +135,11 @@ public partial class NTT
         Expr kOutput,
         Expr vOutput,
         long numHeads,
-        long numKvHeads)
+        long numKvHeads,
+        IR.NTT.PackedMatMulRhsLayout rhsLayout = IR.NTT.PackedMatMulRhsLayout.NMajor)
     {
         return KernelCall(
-            new PackedQKVParallelLinear(numHeads, numKvHeads),
+            new PackedQKVParallelLinear(numHeads, numKvHeads, rhsLayout),
             input,
             qWeight,
             kWeight,
@@ -195,10 +196,11 @@ public partial class NTT
         Expr gateWeightScale,
         Expr upWeightScale,
         Expr output,
-        IR.NN.GluType gluType)
+        IR.NN.GluType gluType,
+        IR.NTT.PackedMatMulRhsLayout rhsLayout = IR.NTT.PackedMatMulRhsLayout.NMajor)
     {
         return KernelCall(
-            new PackedMatMulGlu(gluType),
+            new PackedMatMulGlu(gluType, rhsLayout),
             input,
             gateWeight,
             upWeight,

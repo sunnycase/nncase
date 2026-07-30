@@ -30,5 +30,7 @@ public sealed partial class PackedMatMulGlu : NTTKernelOp
 
     public GluType GluType { get; }
 
-    public override string DisplayProperty() => $"GluType: {GluType}";
+    public IR.NTT.PackedMatMulRhsLayout RhsLayout { get; }
+
+    public override string DisplayProperty() => $"GluType: {GluType}, RhsLayout: {RhsLayout}";
 }

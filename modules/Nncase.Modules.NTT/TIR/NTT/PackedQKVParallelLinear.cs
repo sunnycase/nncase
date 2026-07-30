@@ -43,5 +43,7 @@ public sealed partial class PackedQKVParallelLinear : NTTKernelOp
 
     public long NumKvHeads { get; }
 
-    public override string DisplayProperty() => $"NumHeads: {NumHeads}, NumKvHeads: {NumKvHeads}";
+    public IR.NTT.PackedMatMulRhsLayout RhsLayout { get; }
+
+    public override string DisplayProperty() => $"NumHeads: {NumHeads}, NumKvHeads: {NumKvHeads}, RhsLayout: {RhsLayout}";
 }

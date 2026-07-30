@@ -5,6 +5,7 @@ from triton.language.extra import libdevice
 
 
 PYNTT_KERNEL_CONFIGS = {{ pyrepr(kernel_configs) }}
+PYNTT_HOST_TENSOR_DESCRIPTOR_SPECS = {{ pyrepr(host_tensor_descriptor_specs) }}
 {% if needs_grid_barrier %}
 
 PYNTT_GRID_MESH = tle.device_mesh({"block": [("block_x", {{ grid_mesh_size }})]})

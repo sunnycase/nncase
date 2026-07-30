@@ -93,7 +93,8 @@ public partial class NTTAffineSelectionPass
                 kOutputTile,
                 vOutputTile,
                 qkv.NumHeads,
-                qkv.NumKvHeads))
+                qkv.NumKvHeads,
+                qkv.RhsLayout))
             .Build();
     }
 

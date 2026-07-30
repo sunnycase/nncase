@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from functools import lru_cache
 from typing import Any, Mapping
 
 from pyntt.ir import FunctionSpec, TensorResultSpec, TensorSpec
@@ -168,6 +169,13 @@ def resolve_execution_device(inputs: tuple[Any, ...], outputs: tuple[Any, ...] |
         if device is not None:
             return device
     return "cpu"
+
+
+@lru_cache(maxsize=None)
+def dtype_item_size(dtype: str) -> int:
+    """Return the storage size in bytes for one PyNTT scalar dtype."""
+    torch = _import_torch()
+    return torch.empty((), dtype=_torch_dtype(torch, dtype)).element_size()
 
 
 def view_typed_buffer(storage: Any, offset_bytes: int, size_bytes: int, dtype: str):

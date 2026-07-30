@@ -6,7 +6,7 @@ using Nncase.PatternMatch;
 namespace Nncase.IR.NTT;
 
 /// <summary>
-/// Fused Q/K/V linear projection with packed-N RHS and output layout.
+/// Fused Q/K/V linear projection with packed RHS and output layout.
 /// </summary>
 [PatternFunctionalGenerator]
 public sealed partial class PackedQKVParallelLinear : Op
@@ -43,5 +43,7 @@ public sealed partial class PackedQKVParallelLinear : Op
 
     public DataType OutputDataType { get; }
 
-    public override string DisplayProperty() => $"NumHeads: {NumHeads}, NumKvHeads: {NumKvHeads}, OutputDataType: {OutputDataType}";
+    public PackedMatMulRhsLayout RhsLayout { get; }
+
+    public override string DisplayProperty() => $"NumHeads: {NumHeads}, NumKvHeads: {NumKvHeads}, OutputDataType: {OutputDataType}, RhsLayout: {RhsLayout}";
 }

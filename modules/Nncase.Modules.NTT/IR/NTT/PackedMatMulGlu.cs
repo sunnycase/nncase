@@ -7,7 +7,7 @@ using Nncase.PatternMatch;
 namespace Nncase.IR.NTT;
 
 /// <summary>
-/// Fused gate/up linear projection with packed-N RHS and output layout.
+/// Fused gate/up linear projection with packed RHS and output layout.
 /// </summary>
 [PatternFunctionalGenerator]
 public sealed partial class PackedMatMulGlu : Op
@@ -34,5 +34,7 @@ public sealed partial class PackedMatMulGlu : Op
 
     public DataType OutputDataType { get; }
 
-    public override string DisplayProperty() => $"GluType: {GluType}, OutputDataType: {OutputDataType}";
+    public PackedMatMulRhsLayout RhsLayout { get; }
+
+    public override string DisplayProperty() => $"GluType: {GluType}, OutputDataType: {OutputDataType}, RhsLayout: {RhsLayout}";
 }

@@ -75,10 +75,11 @@ public partial class NTT
         Expr vWeightScale,
         long numHeads,
         long numKvHeads,
-        DataType? outDataType = null)
+        DataType? outDataType = null,
+        PackedMatMulRhsLayout rhsLayout = PackedMatMulRhsLayout.NMajor)
     {
         return new Call(
-            new PackedQKVParallelLinear(numHeads, numKvHeads, outDataType ?? DataTypes.Float32),
+            new PackedQKVParallelLinear(numHeads, numKvHeads, outDataType ?? DataTypes.Float32, rhsLayout),
             input,
             qWeight,
             kWeight,
@@ -105,10 +106,11 @@ public partial class NTT
         Expr gateWeightScale,
         Expr upWeightScale,
         IR.NN.GluType gluType,
-        DataType? outDataType = null)
+        DataType? outDataType = null,
+        PackedMatMulRhsLayout rhsLayout = PackedMatMulRhsLayout.NMajor)
     {
         return new Call(
-            new PackedMatMulGlu(gluType, outDataType ?? DataTypes.Float32),
+            new PackedMatMulGlu(gluType, outDataType ?? DataTypes.Float32, rhsLayout),
             input,
             gateWeight,
             upWeight,

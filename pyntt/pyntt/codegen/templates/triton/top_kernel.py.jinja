@@ -5,7 +5,7 @@
 {% endif %}
 def {{ name }}({{ parameters }}):
 {% if shared_allocation_bytes > 0 %}
-    pyntt_shared_arena = tle.gpu.alloc([{{ shared_allocation_bytes }}], dtype=tl.uint8, layout=None, scope=tle.gpu.smem, nv_mma_shared_layout=False)
+    pyntt_shared_arena = tle.gpu.alloc([{{ shared_allocation_bytes }}], dtype=tl.uint8, layout=None, scope=tle.gpu.smem, nv_mma_shared_layout=False, alignment={{ shared_allocation_alignment_bytes }})
 {% endif %}
 {% if materialize_shard_index %}
     shard_index = tl.program_id(0).to(tl.int64)

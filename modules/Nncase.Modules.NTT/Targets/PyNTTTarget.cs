@@ -31,12 +31,11 @@ public sealed class PyNTTTarget : NTTTarget
     public override void RegisterAutoPackingRules(IRulesAddable pass, CompileOptions options)
     {
         const int kPack = 2;
-        var nr = NTTModuleCompiler.GetNr(options);
         var vectorBytes = NTTModuleCompiler.GetLane(options);
 
         pass.Add<Passes.Rules.NTT.PackMatMulRhsKMajor>(vectorBytes, kPack);
-        pass.Add<Passes.Rules.NTT.PackQKVParallelLinearByN>(nr, vectorBytes);
-        pass.Add<Passes.Rules.NTT.PackMatMulGluByN>(nr, vectorBytes);
+        pass.Add<Passes.Rules.NTT.PackQKVParallelLinearRhsKMajor>(vectorBytes, kPack);
+        pass.Add<Passes.Rules.NTT.PackMatMulGluRhsKMajor>(vectorBytes, kPack);
     }
 
     /// <inheritdoc/>

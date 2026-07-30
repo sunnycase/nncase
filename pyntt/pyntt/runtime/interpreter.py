@@ -12,6 +12,7 @@ from pyntt.runtime.tensor import (
     resolve_shape_env,
     validate_inputs,
 )
+from pyntt.runtime.triton import TritonTensorDescriptorCache
 from pyntt.runtime.workspace import RDataCache, WorkspacePool
 
 
@@ -28,6 +29,7 @@ class PyNTTInterpreter:
         self.rdata_bundles = dict(rdata_bundles or {})
         self.workspace_pool = WorkspacePool()
         self.rdata_cache = RDataCache()
+        self.triton_tensor_descriptor_cache = TritonTensorDescriptorCache()
         self.loaded = False
 
     def load(self, device: Any | None = None):
@@ -72,6 +74,16 @@ class PyNTTInterpreter:
         except KeyError as ex:
             raise PyNTTSpecError(f"PyNTT rdata bundle {name!r} was not found.") from ex
         return self.rdata_cache.materialize_bundle(inputs, dict(bundle))
+
+    def materialize_triton_tensor_descriptors(
+        self,
+        kernel_name: str,
+        specs,
+        sources: Mapping[str, Any],
+    ):
+        return self.triton_tensor_descriptor_cache.materialize_many(
+            kernel_name, specs, sources
+        )
 
     def _run_entry(self, inputs: tuple[Any, ...], outputs: list[Any], shape_env: dict[str, int]) -> None:
         # Base interpreter keeps PyNTTModule-compatible behavior for tests and

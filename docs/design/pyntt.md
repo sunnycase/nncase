@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted architecture, revised 2026-07-27.
+Accepted architecture, revised 2026-07-28.
 
 PyNTT is a formal nncase inference backend and the Python-DSL foundation for
 megakernels. Triton is the only supported backend. Generated models execute
@@ -75,6 +75,7 @@ The compiler owns:
 - TIR semantic operation selection;
 - global backing buffers, shapes, strides, byte offsets, byte spans, and
   memory locations;
+- authoritative backing metadata for host-created Triton tensor descriptors;
 - caller-allocated output and workspace ABI;
 - target microkernel family/variant selection and the static parameters needed
   to determine its resource requirements;
@@ -105,6 +106,8 @@ Templates under `pyntt/pyntt/codegen/templates/triton/` own:
   stages within the compiler-reserved byte arena;
 - producer/consumer synchronization internal to a template;
 - Triton encodings and implementation of the selected microkernel contract;
+- deriving a concrete host TMA descriptor shape, stride, block shape, and
+  padding policy from the selected algorithm and compiler-provided backing;
 - use of `tl.dot`, reductions, vectorized accesses, and backend hints;
 - architecture-specific decision trees and optional Triton autotuning.
 
@@ -125,6 +128,10 @@ Generated `model.py` and the PyNTT runtime own:
 - shape-bucket selection;
 - direct Triton launch binding;
 - passing dimensions, strides, workspace pointers, and tuning choices;
+- materializing and caching host Triton tensor descriptors from generated
+  descriptor specifications;
+- installing the Triton scratch allocator only when grid synchronization
+  requires it;
 - load/run separation and stable model state.
 
 The runtime does not reinterpret TIR, select an operator implementation, or
@@ -228,6 +235,39 @@ an address without guessing:
 Templates may derive a local tile from these descriptors. They may not replace
 or reinterpret the backing layout.
 
+### Host Tensor Descriptor ABI
+
+Algorithms that use TMA receive a host-created Triton tensor descriptor as a
+kernel argument. Device code must not call `tl.make_tensor_descriptor`.
+
+The compiler serializes only facts owned by TIR and Bufferize:
+
+- descriptor ABI name and backing source;
+- fixed backing byte offset;
+- scalar dtype and vector lane shape;
+- global logical shape and element strides.
+
+The reader-only renderer combines those facts with the selected Jinja
+algorithm to derive the concrete TMA rank, scalar shape/strides, block shape,
+and padding policy. It emits the result in
+`PYNTT_HOST_TENSOR_DESCRIPTOR_SPECS`. Therefore a template may change its TMA
+tile and re-render an existing manifest without recompiling the model, provided
+the selected microkernel resource reservation remains valid.
+
+Generated `model.py` binds each descriptor source, and the runtime constructs a
+`triton.tools.tensor_descriptor.TensorDescriptor` before launch. Descriptors
+are cached by kernel/ABI slot and replaced when the backing pointer or
+descriptor configuration changes, so repeated inference does not rebuild them
+or retain an unbounded set of allocations.
+
+A descriptor for a distributed tensor describes the single global backing.
+The generated device helper adds its compiler-derived shard origin to TMA
+coordinates and accesses only the local shard. Per-shard backing pools and
+block-local storage cannot be exposed as one global descriptor and fail
+codegen. Descriptor shape, strides, offsets, and block shape are validated
+before construction; unsupported dynamic descriptor metadata fails rather
+than becoming a device-side fallback.
+
 ## Distribution and Launch
 
 nncase distributes only at chip/die/block levels. A logical topology such as
@@ -321,10 +361,13 @@ body_source
 
 Metadata carries semantic operation attributes, tensor names, distributed
 launch metadata, fixed worker geometry, target resource capability, and total
-Shared arena bytes. Helper models may carry a selected microkernel
-family/variant, static parameters, and named Shared byte-offset expressions.
-They do not carry typed Triton aliases, encodings, copies, or pipeline bodies.
-Device functions carry a direct parameter ABI and body source.
+Shared arena bytes plus the Bufferize-computed arena alignment. Helper models
+may carry a selected microkernel family/variant, static parameters, and named
+Shared byte-offset expressions. Launch metadata may carry authoritative host
+tensor descriptor backing records; the renderer, not the compiler, derives
+their algorithm-specific TMA block shape. Helper models do not carry typed
+Triton aliases, encodings, copies, or pipeline bodies. Device functions carry a
+direct parameter ABI and body source.
 
 Each helper contains exactly:
 
@@ -353,7 +396,7 @@ A generated package includes:
 
 - `kernel_params.json`: stable compiler-to-template boundary;
 - `generated_kernels.py`: Jinja-rendered Triton source and backend-owned
-  `PYNTT_KERNEL_CONFIGS`;
+  `PYNTT_KERNEL_CONFIGS` plus host tensor descriptor specifications;
 - `metadata.json`: runtime function/tensor/result ABI;
 - `model.py`: direct launch and load/run implementation;
 - `specs.py` and `runtime_config.py`: runtime descriptors;
@@ -380,6 +423,7 @@ triton/kernels/
     mma.py.jinja
   qkv_parallel_linear/
     simt_fma.py.jinja
+    simt_fma_smem_pipeline.py.jinja
     mma.py.jinja
   matmul_glu/
     simt_fma.py.jinja
@@ -408,6 +452,16 @@ Typical matrix templates should:
 4. stage gmem operands and pipeline them when profitable;
 5. handle full and tail tiles with masks;
 6. accumulate at the required precision and store only the local output shard.
+
+Fused projections such as QKV use one concatenated logical N domain. Their
+producer and consumer each contain one N-tile loop and one nested K-tile loop;
+they must not render separate Q-tile, K-tile, and V-tile loop nests. The
+producer routes each fixed-size portion of the current logical N tile to its
+Q, K, or V host descriptor and places all portions in one contiguous Shared
+stage. The consumer computes that complete tile once, then masks and rebases
+the result into the three output buffers. A tile crossing a projection
+boundary therefore performs multiple TMA transfers into disjoint Shared
+subviews without duplicating the tile computation.
 
 The same principle applies to reduction, normalization, attention, reshard,
 and elementwise templates.
@@ -533,7 +587,9 @@ This architecture is implemented when:
 - PyNTT codegen accepts direct selected/bufferized semantic TIR;
 - scheduled TIR is rejected at the codegen boundary;
 - target microkernel resource reservations are bufferized into one Shared arena
-  and emitted as named byte offsets;
+  and emitted as named byte offsets with the arena size and alignment;
+- TMA algorithms receive validated host-created descriptors and emit no
+  device-side descriptor construction;
 - manifest v8 contains no compiler-generated block schedule or typed Shared
   alias representation;
 - templates own loops, tails, shared staging, pipelines, encodings, and

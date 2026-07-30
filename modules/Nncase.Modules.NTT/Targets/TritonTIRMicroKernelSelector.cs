@@ -15,7 +15,7 @@ namespace Nncase.Targets;
 /// </summary>
 public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
 {
-    private const int SharedAlignmentBytes = 16;
+    private const int NvidiaNvmmaSharedAlignmentBytes = 1024;
 
     public TIRMicroKernelSelection? Select(TIRMicroKernelSelectionContext context)
     {
@@ -44,24 +44,18 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
                 inputIndex: 0,
                 weightIndex: 1,
                 outputIndex: 13),
-            Nncase.TIR.NTT.PackedQKVParallelLinear => SelectFusedLinear(
+            Nncase.TIR.NTT.PackedQKVParallelLinear packedQkv => SelectPackedQkv(
                 context,
-                "triton.qkv_parallel_linear",
-                inputIndex: 0,
-                weightIndex: 1,
-                outputIndex: 13),
+                packedQkv),
             Nncase.TIR.NTT.MatMulGlu => SelectFusedLinear(
                 context,
                 "triton.matmul_glu",
                 inputIndex: 0,
                 weightIndex: 1,
                 outputIndex: 9),
-            Nncase.TIR.NTT.PackedMatMulGlu => SelectFusedLinear(
+            Nncase.TIR.NTT.PackedMatMulGlu packedMatmulGlu => SelectPackedMatMulGlu(
                 context,
-                "triton.matmul_glu",
-                inputIndex: 0,
-                weightIndex: 1,
-                outputIndex: 9),
+                packedMatmulGlu),
             _ => null,
         };
     }
@@ -132,6 +126,102 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
             kMajorPacked: false);
     }
 
+    private static TIRMicroKernelSelection SelectPackedQkv(
+        TIRMicroKernelSelectionContext context,
+        Nncase.TIR.NTT.PackedQKVParallelLinear qkv)
+    {
+        var input = GetBuffer(context, 0, "input");
+        var qWeight = GetBuffer(context, 1, "q weight");
+        var kWeight = GetBuffer(context, 2, "k weight");
+        var vWeight = GetBuffer(context, 3, "v weight");
+        var qOutput = GetBuffer(context, 13, "q output");
+        var kOutput = GetBuffer(context, 14, "k output");
+        var vOutput = GetBuffer(context, 15, "v output");
+        RequireRank(input, 2, context.Op, "input");
+        RequireRank(qWeight, 2, context.Op, "q weight");
+        RequireRank(kWeight, 2, context.Op, "k weight");
+        RequireRank(vWeight, 2, context.Op, "v weight");
+        RequireRank(qOutput, 2, context.Op, "q output");
+        RequireRank(kOutput, 2, context.Op, "k output");
+        RequireRank(vOutput, 2, context.Op, "v output");
+
+        var inputDimensions = GetLocalDimensions(input);
+        var outputDimensions = new[]
+        {
+            GetLocalDimensions(qOutput),
+            GetLocalDimensions(kOutput),
+            GetLocalDimensions(vOutput),
+        };
+        var m = GetMax(outputDimensions[0][^2]);
+        if (outputDimensions.Skip(1).Any(dimensions => GetMax(dimensions[^2]) != m))
+        {
+            throw new InvalidOperationException(
+                "PackedQKVParallelLinear microkernel selection requires Q/K/V to have the same local M extent.");
+        }
+
+        var n = checked(
+            GetScalarExtent(outputDimensions[0][^1], qOutput.ElemType) +
+            GetScalarExtent(outputDimensions[1][^1], kOutput.ElemType) +
+            GetScalarExtent(outputDimensions[2][^1], vOutput.ElemType));
+        var kDimension = inputDimensions[^1];
+        return CreateMatrixSelection(
+            context.Machine,
+            "triton.qkv_parallel_linear",
+            GetScalarDataType(input.ElemType),
+            GetScalarDataType(qWeight.ElemType),
+            m,
+            n,
+            GetScalarExtent(kDimension, input.ElemType),
+            kDimension.IsFixed,
+            qkv.RhsLayout == IR.NTT.PackedMatMulRhsLayout.KMajor);
+    }
+
+    private static TIRMicroKernelSelection SelectPackedMatMulGlu(
+        TIRMicroKernelSelectionContext context,
+        Nncase.TIR.NTT.PackedMatMulGlu matmulGlu)
+    {
+        var input = GetBuffer(context, 0, "input");
+        var gateWeight = GetBuffer(context, 1, "gate weight");
+        var upWeight = GetBuffer(context, 2, "up weight");
+        var output = GetBuffer(context, 9, "output");
+        RequireRank(input, 2, context.Op, "input");
+        RequireRank(gateWeight, 2, context.Op, "gate weight");
+        RequireRank(upWeight, 2, context.Op, "up weight");
+        RequireRank(output, 2, context.Op, "output");
+
+        var gateDimensions = GetLocalDimensions(gateWeight);
+        var upDimensions = GetLocalDimensions(upWeight);
+        if (gateDimensions.Length != upDimensions.Length ||
+            gateDimensions.Where((dimension, index) => GetMax(dimension) != GetMax(upDimensions[index])).Any())
+        {
+            throw new InvalidOperationException(
+                "PackedMatMulGlu microkernel selection requires gate/up weights to have the same local shape.");
+        }
+
+        if (GetScalarDataType(gateWeight.ElemType) != GetScalarDataType(upWeight.ElemType))
+        {
+            throw new InvalidOperationException(
+                "PackedMatMulGlu microkernel selection requires gate/up weights to have the same scalar dtype.");
+        }
+
+        var inputDimensions = GetLocalDimensions(input);
+        var outputDimensions = GetLocalDimensions(output);
+        var m = GetMax(outputDimensions[^2]);
+        var n = GetScalarExtent(outputDimensions[^1], output.ElemType);
+        var kDimension = inputDimensions[^1];
+        return CreateMatrixSelection(
+            context.Machine,
+            "triton.matmul_glu",
+            GetScalarDataType(input.ElemType),
+            GetScalarDataType(gateWeight.ElemType),
+            m,
+            n,
+            GetScalarExtent(kDimension, input.ElemType),
+            kDimension.IsFixed,
+            matmulGlu.RhsLayout == IR.NTT.PackedMatMulRhsLayout.KMajor,
+            simultaneousRhsTileCount: 2);
+    }
+
     private static TIRMicroKernelSelection SelectSumma(
         TIRMicroKernelSelectionContext context,
         Nncase.TIR.NTT.SUMMA summa)
@@ -160,12 +250,13 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
         long n,
         long k,
         bool fixedK,
-        bool kMajorPacked)
+        bool kMajorPacked,
+        int simultaneousRhsTileCount = 1)
     {
         var gemv = m == 1;
         if (gemv)
         {
-            if (CanUsePackedBFloat16GemvPipeline(
+            if (TryGetPackedBFloat16GemvPipelineStages(
                     machine,
                     family,
                     lhsType,
@@ -173,11 +264,12 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
                     n,
                     k,
                     fixedK,
-                    kMajorPacked))
+                    kMajorPacked,
+                    simultaneousRhsTileCount,
+                    out var numStages))
             {
                 const int pipelineBlockN = 64;
                 const int pipelineBlockK = 128;
-                const int numStages = 4;
                 const int nVector = 8;
                 const int kAtom = 16;
                 var rhsShape = new TensorType(
@@ -197,7 +289,7 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
                         new TIRSharedWorkspaceDescriptor(
                             "rhs_stage",
                             rhsShape,
-                            SharedAlignmentBytes)));
+                            NvidiaNvmmaSharedAlignmentBytes)));
             }
 
             const int blockK = 256;
@@ -255,8 +347,8 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
             variant,
             CreateParameters(blockM, blockN, blockK, numStages: 1),
             ImmutableArray.Create(
-                new TIRSharedWorkspaceDescriptor("lhs_stage", lhsShape, SharedAlignmentBytes),
-                new TIRSharedWorkspaceDescriptor("rhs_stage", rhsShape, SharedAlignmentBytes)));
+                new TIRSharedWorkspaceDescriptor("lhs_stage", lhsShape, NvidiaNvmmaSharedAlignmentBytes),
+                new TIRSharedWorkspaceDescriptor("rhs_stage", rhsShape, NvidiaNvmmaSharedAlignmentBytes)));
     }
 
     private static ImmutableDictionary<string, long> CreateParameters(
@@ -272,7 +364,7 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
             ["num_stages"] = numStages,
         }.ToImmutableDictionary(StringComparer.Ordinal);
 
-    private static bool CanUsePackedBFloat16GemvPipeline(
+    private static bool TryGetPackedBFloat16GemvPipelineStages(
         TargetMachineModel machine,
         string family,
         DataType lhsType,
@@ -280,10 +372,15 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
         long n,
         long k,
         bool fixedK,
-        bool kMajorPacked)
+        bool kMajorPacked,
+        int simultaneousRhsTileCount,
+        out int numStages)
     {
-        const long requiredSharedBytes = 4L * 2 * 128 * 32 * 2;
-        if (family != "triton.matmul" ||
+        numStages = 0;
+        if ((family != "triton.matmul" &&
+             family != "triton.qkv_parallel_linear" &&
+             family != "triton.matmul_glu") ||
+            simultaneousRhsTileCount <= 0 ||
             !kMajorPacked ||
             lhsType != DataTypes.BFloat16 ||
             rhsType != DataTypes.BFloat16 ||
@@ -300,9 +397,34 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
 
         var sharedSpace = machine.MemorySpaces.Values.SingleOrDefault(
             space => space.TIRBinding?.Location == MemoryLocation.Shared);
-        return sharedSpace is not null &&
-            machine.GetAllocationSizeBytes(sharedSpace, requiredSharedBytes) <=
-            machine.GetMaximumUsableAllocationBytes(sharedSpace);
+        if (sharedSpace is null)
+        {
+            return false;
+        }
+
+        const long stageElementsPerRhs = 64L * 128;
+        const long elementBytes = 2;
+        var stageBytes = checked(stageElementsPerRhs * elementBytes);
+        for (var candidateStages = 4; candidateStages >= 2; candidateStages--)
+        {
+            // A physical pipe slot owns one RHS transfer. Fused projections
+            // consume adjacent slots and require at least two logical tile groups.
+            if (candidateStages % simultaneousRhsTileCount != 0 ||
+                candidateStages / simultaneousRhsTileCount < 2)
+            {
+                continue;
+            }
+
+            var requiredSharedBytes = checked(candidateStages * stageBytes);
+            if (machine.GetAllocationSizeBytes(sharedSpace, requiredSharedBytes) <=
+                machine.GetMaximumUsableAllocationBytes(sharedSpace))
+            {
+                numStages = candidateStages;
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private static Nncase.TIR.Buffer GetBuffer(

@@ -17,6 +17,7 @@ namespace Nncase.CodeGen.PyNTT;
 internal sealed class PyNTTLinkableModule : ILinkableModule
 {
     private static readonly Regex AbiViewStrideArgRegex = new(@"^(?<kind>input|output)(?<index>\d+)_(?<scalar>scalar_)?stride(?<axis>\d+)$", RegexOptions.Compiled | RegexOptions.CultureInvariant);
+    private static readonly Regex KernelTensorArgRegex = new(@"^(?<kind>input|output)(?<index>\d+)$", RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
     private readonly string _moduleKind;
     private readonly IReadOnlyList<PyNTTLinkableFunction> _functions;
@@ -2330,16 +2331,34 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
         }
 
         var runtimeShapeArgs = runtimeShapeArgNames.Select(arg => ResolveRuntimeScalarArgument(arg, context)).ToArray();
+        var hostTensorDescriptorSources = kernel.Launch.HostTensorDescriptors
+            .Select(descriptor => descriptor.Source)
+            .Distinct(StringComparer.Ordinal)
+            .ToDictionary(
+                source => source,
+                source => ResolveHostTensorDescriptorSource(
+                    source,
+                    inputArgs,
+                    outputArgs,
+                    workspaceArgs,
+                    kernel.Name),
+                StringComparer.Ordinal);
+        var hostTensorDescriptorSetup = kernel.Launch.HostTensorDescriptors.Length == 0
+            ? string.Empty
+            : $"        pyntt_host_tensor_descriptors = self.materialize_triton_tensor_descriptors({PythonString(kernel.Name)}, PYNTT_HOST_TENSOR_DESCRIPTOR_SPECS[{PythonString(kernel.Name)}], {{{string.Join(", ", hostTensorDescriptorSources.Select(pair => $"{PythonString(pair.Key)}: {pair.Value}"))}}})";
+        var hostTensorDescriptorArgs = kernel.Launch.HostTensorDescriptors.Length == 0
+            ? Array.Empty<string>()
+            : new[] { "*pyntt_host_tensor_descriptors" };
         var requiresGridBarrier = kernel.Attrs.ContainsKey("requires_grid_barrier");
         var gridBarrierArgs = requiresGridBarrier ? new[] { "PYNTT_GRID_MESH" } : Array.Empty<string>();
-        var tensorArgs = string.Join(", ", inputArgs.Concat(outputArgs).Concat(tensorStrideArgs).Concat(abiViewStrideArgs).Concat(workspaceArgs).Concat(workspaceStrideArgs).Concat(runtimeShapeArgs).Concat(gridBarrierArgs));
+        var tensorArgs = string.Join(", ", inputArgs.Concat(outputArgs).Concat(tensorStrideArgs).Concat(abiViewStrideArgs).Concat(workspaceArgs).Concat(workspaceStrideArgs).Concat(runtimeShapeArgs).Concat(hostTensorDescriptorArgs).Concat(gridBarrierArgs));
         var tritonRuntimeSetup = requiresGridBarrier
             ? $"{Environment.NewLine}        ensure_triton_allocator({context.DeviceExpression})"
             : string.Empty;
         const string kwargs = ", num_warps=pyntt_kernel_config['num_warps'], num_stages=pyntt_kernel_config['num_stages']";
         var importStatement = requiresGridBarrier
-            ? $"from .generated_kernels import {kernel.Name}, PYNTT_GRID_MESH, PYNTT_KERNEL_CONFIGS"
-            : $"from .generated_kernels import {kernel.Name}, PYNTT_KERNEL_CONFIGS";
+            ? $"from .generated_kernels import {kernel.Name}, PYNTT_GRID_MESH, PYNTT_HOST_TENSOR_DESCRIPTOR_SPECS, PYNTT_KERNEL_CONFIGS"
+            : $"from .generated_kernels import {kernel.Name}, PYNTT_HOST_TENSOR_DESCRIPTOR_SPECS, PYNTT_KERNEL_CONFIGS";
         var launchStatement = $"        {kernel.Name}[grid]({tensorArgs}, numel, block_size{kwargs})";
         var kernelArgs = string.IsNullOrWhiteSpace(tensorArgs) ? "(numel,)" : $"({tensorArgs}, numel,)";
         var tuningSelectionStatement = $"        block_size = select_and_validate_triton_tuning_parameter({PythonString(kernel.Name)}, \"block_size\", pyntt_kernel_config[\"block_size\"][\"candidates\"], source=pyntt_kernel_config[\"block_size\"][\"source\"], kernel={kernel.Name}, kernel_args={kernelArgs}, grid_for_candidate={gridForCandidate}, expected_compute_num_warps=pyntt_kernel_config[\"num_warps\"], registers_per_thread_limit={PythonValue(kernel.Attrs["registers_per_thread_limit"])}, shared_memory_capacity_bytes={PythonValue(kernel.Attrs["shared_memory_capacity_bytes"])}, forbid_spills={PythonValue(kernel.Attrs["forbid_spills"])}{kwargs})";
@@ -2349,6 +2368,7 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
                     numel = {numel}
             {gridBeforeTuning}
             {workspaceSetup}
+            {hostTensorDescriptorSetup}
             {tritonRuntimeSetup}
             {tuningSelectionStatement}
             {gridAfterTuning}
@@ -2372,6 +2392,47 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
                 jsonElement.EnumerateArray().Select(item => item.GetString() ?? throw new NotSupportedException($"Generated PyNTT kernel {kernel.Name} has a non-string ABI view stride arg.")).ToArray(),
             _ => throw new NotSupportedException($"Generated PyNTT kernel {kernel.Name} has unsupported abi_view_stride_args metadata type {value.GetType().Name}."),
         };
+    }
+
+    private static string ResolveHostTensorDescriptorSource(
+        string source,
+        IReadOnlyList<string> inputArgs,
+        IReadOnlyList<string> outputArgs,
+        IReadOnlyList<string> workspaceArgs,
+        string kernelName)
+    {
+        var tensorMatch = KernelTensorArgRegex.Match(source);
+        if (tensorMatch.Success)
+        {
+            var index = int.Parse(tensorMatch.Groups["index"].Value, CultureInfo.InvariantCulture);
+            var args = tensorMatch.Groups["kind"].Value == "input" ? inputArgs : outputArgs;
+            if (index < args.Count)
+            {
+                return args[index];
+            }
+
+            throw new NotSupportedException(
+                $"Generated PyNTT kernel {kernelName} host tensor descriptor source {source} " +
+                $"references index {index}, but only {args.Count} {tensorMatch.Groups["kind"].Value} arguments exist.");
+        }
+
+        var workspaceNames = new[]
+        {
+            "data",
+            "rdata",
+            "chip_local_rdata",
+            "chip_local_data",
+            "block_local_rdata",
+            "block_local_data",
+        };
+        var workspaceIndex = Array.IndexOf(workspaceNames, source);
+        if (workspaceIndex >= 0 && workspaceIndex < workspaceArgs.Count)
+        {
+            return workspaceArgs[workspaceIndex];
+        }
+
+        throw new NotSupportedException(
+            $"Generated PyNTT kernel {kernelName} has unbound host tensor descriptor source {source}.");
     }
 
     private static string ResolveAbiViewStrideArgument(string argument, RuntimeBinding[] inputBindings, RuntimeBinding[] outputBindings, string kernelName)

@@ -1128,6 +1128,12 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
             .Where(helper => helper.GetProperty("template").GetString() == expectedTemplate)
             .Select(helper => helper.GetProperty("model"))
             .ToArray();
+        var hostTensorDescriptors = document.RootElement
+            .GetProperty("functions")
+            .EnumerateArray()
+            .SelectMany(function => function.GetProperty("render_kernels").EnumerateArray())
+            .SelectMany(kernel => kernel.GetProperty("metadata").GetProperty("launch").GetProperty("host_tensor_descriptors").EnumerateArray())
+            .ToArray();
         Assert.NotEmpty(accumulateModels);
         Assert.All(accumulateModels, model =>
         {
@@ -1174,19 +1180,30 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         Assert.Contains("rhs_layout=k_major", generatedKernelsPy, StringComparison.Ordinal);
         if (expectedVariant == "simt_fma_smem_pipeline")
         {
+            var descriptor = Assert.Single(hostTensorDescriptors);
+            Assert.Equal("chip_local_rdata", descriptor.GetProperty("source").GetString());
+            Assert.Equal("bfloat16", descriptor.GetProperty("scalar_dtype").GetString());
+            Assert.Equal(new[] { 8, 2, 8 }, descriptor.GetProperty("vector_lane_shape").EnumerateArray().Select(value => value.GetInt32()).ToArray());
             Assert.Contains(").to(tl.int32)", generatedKernelsPy, StringComparison.Ordinal);
-            Assert.Contains("tle.gpu.copy(", generatedKernelsPy, StringComparison.Ordinal);
-            Assert.Contains("mask=tl.max_constancy(", generatedKernelsPy, StringComparison.Ordinal);
-            Assert.Contains(", [1, 16])", generatedKernelsPy, StringComparison.Ordinal);
+            Assert.Contains("PYNTT_HOST_TENSOR_DESCRIPTOR_SPECS", generatedKernelsPy, StringComparison.Ordinal);
+            Assert.Contains("'block_shape': (8, 8, 2, 64)", generatedKernelsPy, StringComparison.Ordinal);
+            Assert.Contains("__rhs_descriptor,\n                slot.weight,", generatedKernelsPy, StringComparison.Ordinal);
+            Assert.DoesNotContain("tl.make_tensor_descriptor", generatedKernelsPy, StringComparison.Ordinal);
+            Assert.Contains("nv_mma_shared_layout=True", generatedKernelsPy, StringComparison.Ordinal);
+            Assert.Contains("alignment=1024", generatedKernelsPy, StringComparison.Ordinal);
             Assert.Contains("tle.gpu.BlockEncoding(", generatedKernelsPy, StringComparison.Ordinal);
             Assert.Contains("tle.gpu.SlicedEncoding(", generatedKernelsPy, StringComparison.Ordinal);
             Assert.Contains("tle.encoding(", generatedKernelsPy, StringComparison.Ordinal);
-            Assert.Contains(
-                "num_full_n_tiles = (tl.minimum(active_n, active_rhs_n) // 64)",
-                generatedKernelsPy,
-                StringComparison.Ordinal);
             Assert.Contains("tl.cdiv(active_n, 64)", generatedKernelsPy, StringComparison.Ordinal);
             Assert.Contains("[48]", generatedKernelsPy, StringComparison.Ordinal);
+            Assert.DoesNotContain("num_full_n_tiles", generatedKernelsPy, StringComparison.Ordinal);
+            Assert.DoesNotContain("tail_pipeline_", generatedKernelsPy, StringComparison.Ordinal);
+            Assert.DoesNotContain("mask=tl.max_constancy(", generatedKernelsPy, StringComparison.Ordinal);
+            Assert.DoesNotContain("weight_shared_layout", generatedKernelsPy, StringComparison.Ordinal);
+        }
+        else
+        {
+            Assert.Empty(hostTensorDescriptors);
         }
 
         AssertGeneratedModelRuns(
@@ -1651,6 +1668,142 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
     }
 
     [Fact]
+    public async Task TestPyNTTPackedQKVParallelLinearQwenLikeGemvPipelineRun()
+    {
+        ConfigureAutoDistributedPyNTT();
+        var targetOptions = Assert.IsType<PyNTTTargetOptions>(CompileOptions.TargetOptions);
+        targetOptions.Vectorize = true;
+
+        const int seq = 1;
+        const int k = 1024;
+        const int qn = 2048;
+        const int kvn = 1024;
+        var input = new Var("input", new TensorType(DataTypes.BFloat16, new[] { seq, k }));
+        var qWeight = Tensor.From<BFloat16>(
+            Enumerable.Range(0, k * qn)
+                .Select(i => (BFloat16)(((i % 251) - 125f) * 0.0001f))
+                .ToArray(),
+            [k, qn]);
+        var kWeight = Tensor.From<BFloat16>(
+            Enumerable.Range(0, k * kvn)
+                .Select(i => (BFloat16)(((i % 241) - 120f) * 0.0001f))
+                .ToArray(),
+            [k, kvn]);
+        var vWeight = Tensor.From<BFloat16>(
+            Enumerable.Range(0, k * kvn)
+                .Select(i => (BFloat16)(((i % 239) - 119f) * 0.0001f))
+                .ToArray(),
+            [k, kvn]);
+        var qkvInput = IR.F.Math.Unary(UnaryOp.Abs, input);
+        var qkv = IR.F.NN.QKVParallelLinear(
+            qkvInput,
+            qWeight,
+            kWeight,
+            vWeight,
+            None.Default,
+            None.Default,
+            None.Default,
+            None.Default,
+            None.Default,
+            None.Default,
+            None.Default,
+            None.Default,
+            None.Default,
+            numHeads: 16,
+            numKvHeads: 8,
+            outputDataType: DataTypes.BFloat16);
+        var main = new Function("main", PyNTTTarget.Kind, qkv, new[] { input });
+
+        var outputDirectory = await GeneratePyNTTModelDirectoryWithCompilerPipeline(
+            "generated_qwen_like_qkv_gemv_pipeline_run_model",
+            main);
+        var compiler = Assert.IsType<global::Nncase.Compiler.Compiler>(CompileSession.Compiler);
+        var qkvCall = Assert.Single(compiler.Module.Functions
+            .SelectMany(function => ExprCollector.Collect(function).OfType<Call>())
+            .Where(call => call.Target is TIR.NTT.PackedQKVParallelLinear));
+        var microKernel = Assert.IsType<Nncase.Schedule.TIRMicroKernelSelection>(qkvCall.Metadata.TIRMicroKernel);
+        Assert.Equal("triton.qkv_parallel_linear", microKernel.Family);
+        Assert.Equal("simt_fma_smem_pipeline", microKernel.Variant);
+        Assert.Equal(new[] { "rhs_stage" }, microKernel.SharedWorkspaces.Select(workspace => workspace.Name).ToArray());
+        Assert.Equal(
+            TIR.MemoryLocation.Shared,
+            Assert.IsType<TIR.Buffer>(qkvCall.Arguments[^1]).MemSpan.Buffer.Location);
+
+        using var document = JsonDocument.Parse(File.ReadAllText(Path.Join(outputDirectory, "kernel_params.json")));
+        var descriptorSpecs = document.RootElement
+            .GetProperty("functions")
+            .EnumerateArray()
+            .SelectMany(function => function.GetProperty("render_kernels").EnumerateArray())
+            .SelectMany(kernel => kernel.GetProperty("metadata").GetProperty("launch").GetProperty("host_tensor_descriptors").EnumerateArray())
+            .ToArray();
+        Assert.Equal(3, descriptorSpecs.Length);
+        Assert.Equal(
+            new[]
+            {
+                new[] { k / 16, kvn / 8 },
+                new[] { k / 16, kvn / 8 },
+                new[] { k / 16, qn / 8 },
+            },
+            descriptorSpecs
+                .Select(descriptor => descriptor.GetProperty("logical_shape").EnumerateArray().Select(value => value.GetInt32()).ToArray())
+                .OrderBy(shape => shape[1])
+                .ToArray());
+        Assert.All(descriptorSpecs, descriptor =>
+        {
+            Assert.Equal("chip_local_rdata", descriptor.GetProperty("source").GetString());
+            Assert.Equal("bfloat16", descriptor.GetProperty("scalar_dtype").GetString());
+            Assert.Equal(
+                new[] { 8, 2, 8 },
+                descriptor.GetProperty("vector_lane_shape").EnumerateArray().Select(value => value.GetInt32()).ToArray());
+        });
+
+        RenderGeneratedKernels(outputDirectory);
+        var generatedKernelsPy = File.ReadAllText(Path.Join(outputDirectory, "generated_kernels.py"));
+        Assert.Contains(
+            "generated from PyNTT algorithm triton.qkv_parallel_linear/simt_fma_smem_pipeline",
+            generatedKernelsPy,
+            StringComparison.Ordinal);
+        Assert.Contains("rhs_layout=k_major", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Equal(3, Regex.Matches(generatedKernelsPy, @"tle\.gpu\.copy\(", RegexOptions.CultureInvariant).Count);
+        var nTileLoops = Regex.Matches(
+            generatedKernelsPy,
+            @"for n_tile in tl\.static_range\(0, 2\):",
+            RegexOptions.CultureInvariant);
+        var kTileLoops = Regex.Matches(
+            generatedKernelsPy,
+            $@"for k_tile in tl\.range\(0, {k / 128}\):",
+            RegexOptions.CultureInvariant);
+        var sharedSubSlices = Regex.Matches(
+            generatedKernelsPy,
+            @"slot\.weight\.subslice\(",
+            RegexOptions.CultureInvariant);
+        Assert.Equal(2, nTileLoops.Count);
+        Assert.Equal(2, kTileLoops.Count);
+        Assert.Single(sharedSubSlices.Cast<Match>());
+        var descriptorMatches = Regex.Matches(
+            generatedKernelsPy,
+            @"'block_shape': \(4, 8, 2, 64\)",
+            RegexOptions.CultureInvariant);
+        Assert.Equal(3, descriptorMatches.Count);
+        Assert.Contains("capacity=4", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("[1]", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.DoesNotContain("tl.make_tensor_descriptor", generatedKernelsPy, StringComparison.Ordinal);
+
+        AssertGeneratedModelRuns(
+            outputDirectory,
+            "torch.manual_seed(0)",
+            $"input = (torch.randn({seq}, {k}, dtype=torch.float32, device='cuda') * 0.05).to(torch.bfloat16)",
+            $"q_weight = (((torch.arange({k} * {qn}, device='cuda') % 251) - 125).reshape({k}, {qn}) * 0.0001).to(torch.bfloat16)",
+            $"k_weight = (((torch.arange({k} * {kvn}, device='cuda') % 241) - 120).reshape({k}, {kvn}) * 0.0001).to(torch.bfloat16)",
+            $"v_weight = (((torch.arange({k} * {kvn}, device='cuda') % 239) - 119).reshape({k}, {kvn}) * 0.0001).to(torch.bfloat16)",
+            "q, k_out, v_out = module(input)",
+            "qkv_input = torch.abs(input)",
+            "torch.testing.assert_close(q.to(torch.float32), (qkv_input @ q_weight).to(torch.bfloat16).to(torch.float32), rtol=2e-2, atol=2e-2)",
+            "torch.testing.assert_close(k_out.to(torch.float32), (qkv_input @ k_weight).to(torch.bfloat16).to(torch.float32), rtol=2e-2, atol=2e-2)",
+            "torch.testing.assert_close(v_out.to(torch.float32), (qkv_input @ v_weight).to(torch.bfloat16).to(torch.float32), rtol=2e-2, atol=2e-2)");
+    }
+
+    [Fact]
     public async Task TestPyNTTRoPEQwenLikeRun()
     {
         ConfigureAutoDistributedPyNTT();
@@ -1812,6 +1965,108 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
             "up = input @ up_weight",
             "expect = (gate.to(torch.float32) * torch.sigmoid(gate.to(torch.float32)) * up.to(torch.float32)).to(torch.bfloat16).to(torch.float32)",
             "torch.testing.assert_close(output.to(torch.float32), expect, rtol=2e-2, atol=2e-2)");
+    }
+
+    [Fact]
+    public async Task TestPyNTTPackedMatMulGluQwenLikeGemvPipelineRun()
+    {
+        ConfigureAutoDistributedPyNTT();
+        var targetOptions = Assert.IsType<PyNTTTargetOptions>(CompileOptions.TargetOptions);
+        targetOptions.Vectorize = true;
+
+        const int seq = 1;
+        const int k = 1024;
+        const int n = 3072;
+        var input = new Var("input", new TensorType(DataTypes.BFloat16, new[] { seq, k }));
+        var gateWeight = Tensor.From<BFloat16>(
+            Enumerable.Range(0, k * n)
+                .Select(i => (BFloat16)(((i % 251) - 125f) * 0.0001f))
+                .ToArray(),
+            [k, n]);
+        var upWeight = Tensor.From<BFloat16>(
+            Enumerable.Range(0, k * n)
+                .Select(i => (BFloat16)(((i % 241) - 120f) * 0.0001f))
+                .ToArray(),
+            [k, n]);
+        var glu = IR.F.NN.MatMulGlu(
+            input,
+            gateWeight,
+            upWeight,
+            None.Default,
+            None.Default,
+            None.Default,
+            None.Default,
+            None.Default,
+            None.Default,
+            IR.NN.GluType.SwiGLU,
+            DataTypes.BFloat16);
+        var main = new Function("main", PyNTTTarget.Kind, glu, new[] { input });
+
+        var outputDirectory = await GeneratePyNTTModelDirectoryWithCompilerPipeline(
+            "generated_qwen_like_glu_gemv_pipeline_run_model",
+            main);
+        var compiler = Assert.IsType<global::Nncase.Compiler.Compiler>(CompileSession.Compiler);
+        var gluCall = Assert.Single(compiler.Module.Functions
+            .SelectMany(function => ExprCollector.Collect(function).OfType<Call>())
+            .Where(call => call.Target is TIR.NTT.PackedMatMulGlu));
+        var gluOp = Assert.IsType<TIR.NTT.PackedMatMulGlu>(gluCall.Target);
+        Assert.Equal(IR.NTT.PackedMatMulRhsLayout.KMajor, gluOp.RhsLayout);
+        var microKernel = Assert.IsType<Nncase.Schedule.TIRMicroKernelSelection>(gluCall.Metadata.TIRMicroKernel);
+        Assert.Equal("triton.matmul_glu", microKernel.Family);
+        Assert.Equal("simt_fma_smem_pipeline", microKernel.Variant);
+        Assert.Equal(4L, microKernel.Parameters["num_stages"]);
+        Assert.Equal(new[] { "rhs_stage" }, microKernel.SharedWorkspaces.Select(workspace => workspace.Name).ToArray());
+        Assert.Equal(
+            TIR.MemoryLocation.Shared,
+            Assert.IsType<TIR.Buffer>(gluCall.Arguments[^1]).MemSpan.Buffer.Location);
+
+        using var document = JsonDocument.Parse(File.ReadAllText(Path.Join(outputDirectory, "kernel_params.json")));
+        var descriptorSpecs = document.RootElement
+            .GetProperty("functions")
+            .EnumerateArray()
+            .SelectMany(function => function.GetProperty("render_kernels").EnumerateArray())
+            .SelectMany(kernel => kernel.GetProperty("metadata").GetProperty("launch").GetProperty("host_tensor_descriptors").EnumerateArray())
+            .ToArray();
+        Assert.Equal(2, descriptorSpecs.Length);
+        Assert.All(descriptorSpecs, descriptor =>
+        {
+            Assert.Equal("chip_local_rdata", descriptor.GetProperty("source").GetString());
+            Assert.Equal("bfloat16", descriptor.GetProperty("scalar_dtype").GetString());
+            Assert.Equal(
+                new[] { 8, 2, 8 },
+                descriptor.GetProperty("vector_lane_shape").EnumerateArray().Select(value => value.GetInt32()).ToArray());
+        });
+
+        RenderGeneratedKernels(outputDirectory);
+        var generatedKernelsPy = File.ReadAllText(Path.Join(outputDirectory, "generated_kernels.py"));
+        Assert.Contains(
+            "generated from PyNTT algorithm triton.matmul_glu/simt_fma_smem_pipeline",
+            generatedKernelsPy,
+            StringComparison.Ordinal);
+        Assert.Contains("rhs_layout=k_major", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Equal(2, Regex.Matches(generatedKernelsPy, @"tle\.gpu\.copy\(", RegexOptions.CultureInvariant).Count);
+        Assert.DoesNotContain("slot.weight.subslice(", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Equal(2, Regex.Matches(generatedKernelsPy, @"writer\.acquire\(", RegexOptions.CultureInvariant).Count);
+        Assert.Equal(2, Regex.Matches(generatedKernelsPy, @"reader\.wait\(", RegexOptions.CultureInvariant).Count);
+        Assert.Equal(2, Regex.Matches(
+            generatedKernelsPy,
+            @"'block_shape': \(8, 8, 2, 64\)",
+            RegexOptions.CultureInvariant).Count);
+        Assert.Contains("capacity=4", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("[4, 8, 8, 2, 64]", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.DoesNotContain("tl.make_tensor_descriptor", generatedKernelsPy, StringComparison.Ordinal);
+
+        AssertGeneratedModelRuns(
+            outputDirectory,
+            "torch.manual_seed(1)",
+            $"input = (torch.randn({seq}, {k}, dtype=torch.float32, device='cuda') * 0.05).to(torch.bfloat16)",
+            $"gate_weight = (((torch.arange({k} * {n}, device='cuda') % 251) - 125).reshape({k}, {n}) * 0.0001).to(torch.bfloat16)",
+            $"up_weight = (((torch.arange({k} * {n}, device='cuda') % 241) - 120).reshape({k}, {n}) * 0.0001).to(torch.bfloat16)",
+            "output = module(input)",
+            "gate = input @ gate_weight",
+            "up = input @ up_weight",
+            "expect = (gate.to(torch.float32) * torch.sigmoid(gate.to(torch.float32)) * up.to(torch.float32)).to(torch.bfloat16)",
+            "torch.testing.assert_close(output.to(torch.float32), expect.to(torch.float32), rtol=2e-2, atol=2e-2)");
     }
 
     [Fact]

@@ -18,6 +18,8 @@ def _test_pyntt_codegen_manifest(render_kernel):
     attrs.setdefault("target_threads_per_block", 256)
     attrs.setdefault("register_file_capacity_units", 255 * 8 * 32)
     attrs.setdefault("register_file_allocation_granularity_units", 8 * 32)
+    attrs.setdefault("registers_per_thread_limit", 255)
+    attrs.setdefault("shared_memory_capacity_bytes", 101376)
     strict_metadata = {
         "name": metadata["name"],
         "op_kind": metadata.get("op_kind", "test"),
@@ -25,7 +27,11 @@ def _test_pyntt_codegen_manifest(render_kernel):
         "outputs": metadata.get("outputs", []),
         "attrs": attrs,
         "launch": {
-            "meta": {},
+            "meta": {
+                "shared_data_pool_bytes": 0,
+                "shared_data_pool_alignment_bytes": 8,
+            },
+            "host_tensor_descriptors": [],
             "sharding": {
                 "strategy": "replicated",
                 "placement_axis": "b",
@@ -227,6 +233,72 @@ def test_pyntt_runtime_validates_torch_inputs_and_reuses_storage(tmp_path):
     assert rdata_table_again.data_ptr() == rdata_table.data_ptr()
 
 
+def test_pyntt_runtime_reuses_bounded_host_tensor_descriptors():
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("triton.tools.tensor_descriptor")
+    _add_pyntt_to_path()
+
+    from pyntt.runtime.triton import TritonTensorDescriptorCache
+
+    cache = TritonTensorDescriptorCache()
+    spec = {
+        "name": "rhs_descriptor",
+        "source": "rdata",
+        "offset_bytes": 0,
+        "dtype": "uint8",
+        "shape": (4, 16),
+        "strides": (16, 1),
+        "block_shape": (4, 16),
+        "padding": "zero",
+    }
+    storage = torch.empty((64,), dtype=torch.uint8)
+    first = cache.materialize_many("kernel", (spec,), {"rdata": storage})[0]
+    second = cache.materialize_many("kernel", (spec,), {"rdata": storage})[0]
+    assert second is first
+
+    replacement_storage = torch.empty_like(storage)
+    replacement = cache.materialize_many(
+        "kernel", (spec,), {"rdata": replacement_storage}
+    )[0]
+    assert replacement is not first
+
+
+@pytest.mark.parametrize(
+    "field,value,message",
+    [
+        ("strides", (16, 2), "contiguous last dimension"),
+        ("strides", (15, 1), "16-byte aligned"),
+        ("block_shape", (3, 16), "power of two"),
+    ],
+)
+def test_pyntt_runtime_validates_host_tensor_descriptor_layout(
+    field, value, message
+):
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("triton.tools.tensor_descriptor")
+    _add_pyntt_to_path()
+
+    from pyntt.runtime.triton import TritonTensorDescriptorCache
+
+    spec = {
+        "name": "rhs_descriptor",
+        "source": "rdata",
+        "offset_bytes": 0,
+        "dtype": "uint8",
+        "shape": (4, 16),
+        "strides": (16, 1),
+        "block_shape": (4, 16),
+        "padding": "zero",
+    }
+    spec[field] = value
+    with pytest.raises(ValueError, match=message):
+        TritonTensorDescriptorCache().materialize_many(
+            "kernel",
+            (spec,),
+            {"rdata": torch.empty((64,), dtype=torch.uint8)},
+        )
+
+
 def test_pyntt_runtime_materializes_zero_copy_input_result_views():
     torch = pytest.importorskip("torch")
     _add_pyntt_to_path()
@@ -275,6 +347,41 @@ def test_pyntt_renderer_requires_manifest_v8():
 
     with pytest.raises(ValueError, match="expected 8"):
         render_manifest({"pyntt_codegen_manifest_version": 7, "functions": []})
+
+
+@pytest.mark.parametrize("alignment", [None, 3])
+def test_pyntt_renderer_requires_valid_shared_arena_alignment(alignment):
+    _add_pyntt_to_path()
+    from pyntt.codegen.render import render_manifest
+
+    manifest = _test_pyntt_codegen_manifest(
+        {"metadata": {"name": "top"}, "body_source": "pass"}
+    )
+    meta = manifest["functions"][0]["render_kernels"][0]["metadata"]["launch"]["meta"]
+    if alignment is None:
+        meta.pop("shared_data_pool_alignment_bytes")
+        message = "must be an integer"
+    else:
+        meta["shared_data_pool_alignment_bytes"] = alignment
+        message = "positive power of two"
+
+    with pytest.raises(ValueError, match=message):
+        render_manifest(manifest)
+
+
+def test_pyntt_renderer_preserves_shared_arena_alignment():
+    _add_pyntt_to_path()
+    from pyntt.codegen.render import render_manifest
+
+    manifest = _test_pyntt_codegen_manifest(
+        {"metadata": {"name": "top"}, "body_source": "pass"}
+    )
+    meta = manifest["functions"][0]["render_kernels"][0]["metadata"]["launch"]["meta"]
+    meta["shared_data_pool_bytes"] = 65536
+    meta["shared_data_pool_alignment_bytes"] = 1024
+
+    source = render_manifest(manifest)
+    assert "alignment=1024" in source
 
 
 def test_pyntt_renderer_owns_block_schedule_config():
