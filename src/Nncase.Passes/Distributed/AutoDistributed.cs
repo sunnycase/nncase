@@ -1220,14 +1220,14 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         }
 
         // 4. add not infered type in search space.
-        var addedBuckets = bucketMemo.Values.ToArray();
+        var directOutputBuckets = bucketMemo.Values.ToArray();
 
         if (expr.CheckedType is not TensorType tensorType || !IsDistributableTensorType(tensorType))
         {
             return default;
         }
 
-        AddSupplementalReshardCandidates(expr, callCluster, addedBuckets);
+        CompleteOutputReshardClosure(callCluster, tensorType, directOutputBuckets);
 
         // 5. filter
         FilterByScheme(expr, callCluster);
@@ -1498,69 +1498,84 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         _candidateDiagnostics[key] = _candidateDiagnostics.TryGetValue(key, out var count) ? count + 1 : 1;
     }
 
-    private void AddSupplementalReshardCandidates(
-        Call expr,
+    private void CompleteOutputReshardClosure(
         DistributedSearchGraph callCluster,
-        IReadOnlyList<DistributedSearchGraph> inferredBuckets)
+        TensorType tensorType,
+        IReadOnlyList<DistributedSearchGraph> directOutputBuckets)
     {
-        var sourceBuckets = ShouldLinkAllSupplementalReshardSources(expr, inferredBuckets)
-            ? inferredBuckets
-            : inferredBuckets.Take(1).ToArray();
-
-        var targetTypes = _profiler.Time("supplemental_get_target_types", () => GetLeafCandidateDistTypes(expr.CheckedTensorType));
-        _profiler.Count("supplemental_target_types", targetTypes.Count);
-        _profiler.Count("supplemental_source_buckets", sourceBuckets.Count);
+        var sources = directOutputBuckets
+            .Select(bucket => (
+                Bucket: bucket,
+                Node: bucket.Vertices.FirstOrDefault()
+                    ?? throw new InvalidOperationException("An inferred output bucket cannot be empty when completing its reshard closure.")))
+            .ToArray();
+        var targetTypes = _profiler.Time(
+            "output_reshard_get_target_types",
+            () => GetLeafCandidateDistTypes(tensorType).Distinct().ToArray());
+        _profiler.Count("output_reshard_target_types", targetTypes.Length);
+        _profiler.Count("output_reshard_source_buckets", sources.Length);
 
         foreach (var targetType in targetTypes)
         {
-            foreach (var sourceBucket in sourceBuckets)
+            // Keep reshard endpoints out of directly inferred buckets to preserve a DAG,
+            // while coalescing equivalent target states into one consumer-visible bucket.
+            DistributedSearchGraph? targetBucket = null;
+            foreach (var source in sources)
             {
-                var sourceNode = sourceBucket.Vertices.FirstOrDefault();
-                if (sourceNode is null)
-                {
-                    continue;
-                }
-
-                var plans = _profiler.Time("supplemental_plan_reshard", () => GetReshardPlans(sourceNode.IRType, targetType).ToArray());
-                _profiler.Count("supplemental_reshard_plans", plans.Length);
+                var plans = _profiler.Time(
+                    "output_reshard_plan",
+                    () => GetReshardPlans(source.Node.IRType, targetType));
+                _profiler.Count("output_reshard_plans", plans.Count);
                 foreach (var plan in plans)
                 {
-                    _profiler.Count("supplemental_reshard_steps", plan.StepTypes.Count);
-                    AddSupplementalReshardPath(callCluster, sourceBucket, sourceNode, plan.StepTypes);
+                    if (plan.StepTypes.Count == 0
+                        || !EqualityComparer<IRType>.Default.Equals(plan.StepTypes[^1], targetType))
+                    {
+                        throw new InvalidOperationException(
+                            $"Reshard planner returned an invalid path from {source.Node.IRType} to {targetType}.");
+                    }
+
+                    targetBucket ??= callCluster.CreateCluster<DistributedSearchGraph>(SearchGraphKind.Bucket);
+                    _profiler.Count("output_reshard_paths");
+                    _profiler.Count("output_reshard_steps", plan.StepTypes.Count);
+                    AddOutputReshardPath(
+                        callCluster,
+                        source.Bucket,
+                        source.Node,
+                        targetBucket,
+                        plan.StepTypes);
                 }
+            }
+
+            if (targetBucket is not null)
+            {
+                _profiler.Count("output_reshard_target_buckets");
             }
         }
     }
 
-    private void AddSupplementalReshardPath(
+    private void AddOutputReshardPath(
         DistributedSearchGraph callCluster,
         DistributedSearchGraph sourceBucket,
         SearchableNode sourceNode,
+        DistributedSearchGraph targetBucket,
         IReadOnlyList<IRType> stepTypes)
     {
         var inputBucket = sourceBucket;
         var inputNode = sourceNode;
-        foreach (var stepType in stepTypes)
+        for (int i = 0; i < stepTypes.Count; i++)
         {
             var (bucket, node) = GetOrCreateBoxingCandidate(
                 callCluster,
                 inputBucket,
                 inputNode,
-                stepType,
+                stepTypes[i],
+                outputBucket: i == stepTypes.Count - 1 ? targetBucket : null,
                 addDataEdgeToOwnerCluster: true);
             inputBucket = bucket;
             inputNode = node;
         }
     }
-
-    private bool ShouldLinkAllSupplementalReshardSources(Call expr, IReadOnlyList<DistributedSearchGraph> inferredBuckets)
-        => inferredBuckets.Any(bucket => bucket.Vertices.Any(node => ContainsPartial(node.IRType)))
-            || expr.Users.Any(u => u is Call call && call.Target.GetType().FullName!.Contains("CustomNTT", StringComparison.Ordinal))
-            || expr.Target.GetType().FullName!.Contains("CustomNTT", StringComparison.Ordinal)
-            || expr.Target.GetType().FullName!.Contains("VectorizedRoPE", StringComparison.Ordinal)
-            || expr.Target.GetType().FullName!.Contains("Matmul", StringComparison.InvariantCultureIgnoreCase)
-            || expr.Target is PagedAttention
-            || expr.Target is Gather;
 
     private bool CanBoxingType(IRType inputType, IRType outputType) => CheckBoxingTypeCached(inputType, outputType) is not InvalidType;
 

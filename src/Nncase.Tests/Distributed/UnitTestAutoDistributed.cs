@@ -263,6 +263,58 @@ public sealed class UnitTestDistribAutoDistributed : TestClassBase
     }
 
     [Fact]
+    public void TestGetItemOutputReshardClosureLinksEveryInferredSource()
+    {
+        var targetOptions = (NTTTargetOptions)CompileOptions.TargetOptions;
+        targetOptions.HierarchyNames = "yx";
+        targetOptions.HierarchyLevels = "bb";
+        targetOptions.Hierarchies = [new[] { 4, 8 }];
+
+        var tensorType = new TensorType(DataTypes.Float32, [32]);
+        var input = new Var("input", tensorType);
+        var tuple = new IR.Tuple(input, new DimConst(0));
+        var item = IR.F.Tensors.GetItem(tuple, 0);
+        var main = new Function("main", item, [input]);
+        Assert.True(main.InferenceType());
+
+        var rewriter = new AutoDistributedRewriter(
+            CompileOptions,
+            targetOptions,
+            AutoDistributedPhase.Final,
+            CPUTarget.Kind);
+        _ = rewriter.BuildSearchGraph(main);
+
+        var graphField = typeof(AutoDistributedRewriter).GetField(
+            "_rootSearchGraph",
+            BindingFlags.Instance | BindingFlags.NonPublic);
+        var graph = Assert.IsType<DistributedSearchGraph>(graphField?.GetValue(rewriter));
+        var placement = new Placement([4, 8], "yx", "bb");
+        var splitYXGetItems = graph.Vertices
+            .Where(node => node.Expr is IR.Tensors.GetItem && HasSplit(node.IRType, [0, 1]))
+            .ToHashSet(ReferenceEqualityComparer.Instance);
+        Assert.NotEmpty(splitYXGetItems);
+
+        var matchingTargetBuckets = graph.Clusters
+            .OfType<DistributedSearchGraph>()
+            .SelectMany(cluster => cluster.Clusters.OfType<DistributedSearchGraph>())
+            .Where(bucket => bucket.Vertices.Any(node =>
+                node.Expr is IR.Distributed.Boxing
+                && HasSplit(node.IRType, [1])
+                && graph.TryGetOutEdges(node, out var edges)
+                && edges.Any(edge => splitYXGetItems.Contains(edge.Target))))
+            .ToArray();
+
+        Assert.Single(matchingTargetBuckets);
+
+        bool HasSplit(IRType type, int[] axes)
+            => type is DistributedType distributed
+                && distributed.TensorType == tensorType
+                && distributed.Placement == placement
+                && distributed.AxisPolicies is [SBPSplit split]
+                && split.Axes.SequenceEqual(axes);
+    }
+
+    [Fact]
     public void TestDynamicSplitGranularityUsesRuntimeShape()
     {
         var sequenceLength = new DimVar("sequence_length") { Metadata = { Range = (1, 1024) } };
