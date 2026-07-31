@@ -192,6 +192,22 @@ public static class T
         return TIR.Sequential.Flatten(fields);
     }
 
+    public static ProducerConsumerRegion ProducerConsumer(
+        Sequential produceBody,
+        Sequential consumeBody)
+        => new(produceBody, consumeBody);
+
+    public static PipelineStage PipelineStage(string stageId, Call operation)
+        => new(stageId, operation);
+
+    public static PipelineDrain PipelineDrain(string stageId)
+        => new(stageId);
+
+    public static PipelineHandoff PipelineHandoff(
+        string handoffId,
+        long sharedOffsetBytes)
+        => new(handoffId, sharedOffsetBytes);
+
     /// <summary>
     /// Attaches a semantic execution scope used by diagnostics and backend tracing.
     /// </summary>

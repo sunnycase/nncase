@@ -58,6 +58,9 @@ public sealed class PyNTTTarget : NTTTarget
             "PlanMemorySynchronization",
             Kind,
             MemorySynchronizationScopes.All);
+        passManager.AddWithName<LowerWeightPipelineRegionsPass>(
+            "LowerWeightPipelineRegions",
+            Kind);
     }
 
     /// <inheritdoc/>

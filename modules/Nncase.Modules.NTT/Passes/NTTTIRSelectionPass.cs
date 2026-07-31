@@ -68,6 +68,15 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
                 kernelOp,
                 semanticArguments,
                 targetOptions.TargetMachineModel));
+        if (selection?.WeightPipeline is { } weightPipeline)
+        {
+            ValidateWeightPipelineContract(
+                kernelOp,
+                semanticArguments,
+                selection,
+                weightPipeline);
+        }
+
         var workspaces = selection is null
             ? Array.Empty<BaseExpr>()
             : selection.SharedWorkspaces
@@ -362,6 +371,44 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
                 return TIR.F.NTT.SparseExperts((Expr)arguments[0], (Expr)arguments[1], (Expr)arguments[2], (Expr)arguments[3], (Expr)arguments[4], (Expr)arguments[5], (Expr)arguments[6], (Expr)arguments[7], (Expr)arguments[8], (Expr)arguments[9], (Expr)arguments[10], (Expr)arguments[11], extraNew, output, sparseExperts.QVectorizedAxes, sparseExperts.GateVectorizedAxes, sparseExperts.DownVectorizedAxes, sparseExperts.UpVectorizedAxes, sparseExperts.QSBPs, sparseExperts.GateSBPs, sparseExperts.DownSBPs, sparseExperts.UpSBPs, sparseExperts.HiddenSize, sparseExperts.MoEIntermediateSize, sparseExperts.NumExpert, sparseExperts.NumTopK, sparseExperts.ChunkSize, sparseExperts.Cost, sparseExperts.CSourcePath, sparseExperts.FuncName);
             default:
                 throw new NotSupportedException($"Not supported: {op}");
+        }
+    }
+
+    private static void ValidateWeightPipelineContract(
+        TIR.NTT.NTTKernelOp kernelOp,
+        IReadOnlyList<BaseExpr> semanticArguments,
+        TIRMicroKernelSelection selection,
+        TIRWeightPipelineContract contract)
+    {
+        foreach (var argumentIndex in contract.WeightArgumentIndices)
+        {
+            if ((uint)argumentIndex >= (uint)semanticArguments.Count ||
+                semanticArguments[argumentIndex] is not TIR.Buffer)
+            {
+                throw new InvalidOperationException(
+                    $"TIR microkernel {selection.Family}/{selection.Variant} for " +
+                    $"{kernelOp.GetType().Name} declares invalid weight operand {argumentIndex}.");
+            }
+
+            var parameter = kernelOp.Parameters[argumentIndex];
+            var effect = kernelOp.GetMemoryEffect(parameter);
+            if (MemoryEffectUtility.GetPhysicalBufferAccessMode(effect) != MemoryAccessMode.Read)
+            {
+                throw new InvalidOperationException(
+                    $"TIR microkernel {selection.Family}/{selection.Variant} for " +
+                    $"{kernelOp.GetType().Name} declares weight operand {argumentIndex} " +
+                    $"({parameter.Name}) with non-read-only memory effect {effect.Mode}.");
+            }
+        }
+
+        foreach (var workspaceIndex in contract.SharedWorkspaceIndices)
+        {
+            if ((uint)workspaceIndex >= (uint)selection.SharedWorkspaces.Length)
+            {
+                throw new InvalidOperationException(
+                    $"TIR microkernel {selection.Family}/{selection.Variant} for " +
+                    $"{kernelOp.GetType().Name} declares invalid Shared workspace {workspaceIndex}.");
+            }
         }
     }
 

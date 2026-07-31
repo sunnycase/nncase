@@ -602,6 +602,73 @@ internal sealed class ScriptPrintVisitor : ExprFunctor<IPrintSymbol, string>
     }
 
     /// <inheritdoc/>
+    protected override IPrintSymbol VisitProducerConsumerRegion(ProducerConsumerRegion expr)
+    {
+        if (_exprMemo.TryGetValue(expr, out var doc))
+        {
+            return doc;
+        }
+
+        _scope.Push();
+        _scope.Append("T.ProducerConsumer(");
+        _scope.Append(VisitTypeSequential(expr.ProduceBody, string.Empty).ToString());
+        _scope.Append(", ");
+        _scope.Append(VisitTypeSequential(expr.ConsumeBody, VisitType(expr.CheckedType)).ToString());
+        _scope.Append(")");
+        doc = new(_scope.Pop().ToString());
+        _exprMemo.Add(expr, doc);
+        return doc;
+    }
+
+    /// <inheritdoc/>
+    protected override IPrintSymbol VisitPipelineStage(PipelineStage expr)
+    {
+        if (_exprMemo.TryGetValue(expr, out var doc))
+        {
+            return doc;
+        }
+
+        var stageId = expr.StageId
+            .Replace("\\", "\\\\", StringComparison.Ordinal)
+            .Replace("\"", "\\\"", StringComparison.Ordinal);
+        doc = new($"T.PipelineStage(\"{stageId}\", {Visit(expr.Operation)})");
+        _exprMemo.Add(expr, doc);
+        return doc;
+    }
+
+    /// <inheritdoc/>
+    protected override IPrintSymbol VisitPipelineDrain(PipelineDrain expr)
+    {
+        if (_exprMemo.TryGetValue(expr, out var doc))
+        {
+            return doc;
+        }
+
+        var stageId = expr.StageId
+            .Replace("\\", "\\\\", StringComparison.Ordinal)
+            .Replace("\"", "\\\"", StringComparison.Ordinal);
+        doc = new($"T.PipelineDrain(\"{stageId}\")");
+        _exprMemo.Add(expr, doc);
+        return doc;
+    }
+
+    /// <inheritdoc/>
+    protected override IPrintSymbol VisitPipelineHandoff(PipelineHandoff expr)
+    {
+        if (_exprMemo.TryGetValue(expr, out var doc))
+        {
+            return doc;
+        }
+
+        var handoffId = expr.HandoffId
+            .Replace("\\", "\\\\", StringComparison.Ordinal)
+            .Replace("\"", "\\\"", StringComparison.Ordinal);
+        doc = new($"T.PipelineHandoff(\"{handoffId}\", {expr.SharedOffsetBytes})");
+        _exprMemo.Add(expr, doc);
+        return doc;
+    }
+
+    /// <inheritdoc/>
     protected override IPrintSymbol VisitSequential(Sequential expr)
     {
         if (_exprMemo.TryGetValue(expr, out var doc))

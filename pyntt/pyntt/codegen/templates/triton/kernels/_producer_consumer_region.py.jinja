@@ -1,0 +1,64 @@
+@triton.jit
+def {{ model["ConsumerFunctionName"] }}(
+    {{ helper_parameters(model, model["ConsumerEndpointNames"]) }}
+):
+{% if model["ConsumerNeedsShardIndex"] %}
+    shard_index = tl.program_id(0).to(tl.int64)
+{% endif %}
+{% if model["ConsumerBodySource"].strip() %}
+{{ model["ConsumerBodySource"] | indent(4, true) }}
+{% elif not model["ConsumerNeedsShardIndex"] %}
+    pass
+{% endif %}
+
+
+@triton.jit
+def {{ model["ProducerFunctionName"] }}(
+    {{ helper_parameters(model, model["ProducerEndpointNames"]) }}
+):
+{% if model["ProducerNeedsShardIndex"] %}
+    shard_index = tl.program_id(0).to(tl.int64)
+{% endif %}
+{% if model["ProducerBodySource"].strip() %}
+{{ model["ProducerBodySource"] | indent(4, true) }}
+{% elif not model["ProducerNeedsShardIndex"] %}
+    pass
+{% endif %}
+
+
+{{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
+def {{ model["FunctionName"] }}({{ helper_parameters(model) }}):
+{% for stage in model["Stages"] %}
+{% import stage["Template"] as algorithm %}
+{{ algorithm.pipeline_setup(stage) | indent(4, true) }}
+    {{ stage["ReaderName"] }} = {{ stage["PipeName"] }}.reader()
+    {{ stage["WriterName"] }} = {{ stage["PipeName"] }}.writer()
+{% endfor %}
+{% for handoff in model["Handoffs"] %}
+    {{ handoff["PipeName"] }} = tle.pipe(
+        capacity=1,
+        scope="cta",
+        name="{{ handoff["HandoffName"] }}",
+        one_shot=True,
+    )
+    {{ handoff["ReaderName"] }} = {{ handoff["PipeName"] }}.reader()
+    {{ handoff["WriterName"] }} = {{ handoff["PipeName"] }}.writer()
+{% endfor %}
+    tle.gpu.warp_specialize(
+        [
+            (
+                {{ model["ConsumerFunctionName"] }},
+                (
+                    {{ helper_argument_names(model, model["ConsumerEndpointNames"]) }},
+                ),
+            ),
+            (
+                {{ model["ProducerFunctionName"] }},
+                (
+                    {{ helper_argument_names(model, model["ProducerEndpointNames"]) }},
+                ),
+            ),
+        ],
+        [{{ model["ProducerWarps"] }}],
+        [{{ model["WorkerRegisters"] }}],
+    )

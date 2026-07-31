@@ -1195,7 +1195,25 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
             Assert.Contains("tle.gpu.SlicedEncoding(", generatedKernelsPy, StringComparison.Ordinal);
             Assert.Contains("tle.encoding(", generatedKernelsPy, StringComparison.Ordinal);
             Assert.Contains("tl.cdiv(active_n, 64)", generatedKernelsPy, StringComparison.Ordinal);
-            Assert.Contains("[48]", generatedKernelsPy, StringComparison.Ordinal);
+            var configuredWorkerRegisters = Assert.Single(
+                    Regex.Matches(
+                            generatedKernelsPy,
+                            @"'worker_registers': (?<registers>\d+)",
+                            RegexOptions.CultureInvariant)
+                        .Cast<Match>())
+                .Groups["registers"]
+                .Value;
+            var warpSpecializeRegisterAllocations = Regex.Matches(
+                    generatedKernelsPy,
+                    @"tle\.gpu\.warp_specialize\([\s\S]*?\n\s*\[\d+\],\n\s*\[(?<registers>\d+)\],\n\s*\)",
+                    RegexOptions.CultureInvariant)
+                .Cast<Match>()
+                .Select(match => match.Groups["registers"].Value)
+                .ToArray();
+            Assert.NotEmpty(warpSpecializeRegisterAllocations);
+            Assert.All(
+                warpSpecializeRegisterAllocations,
+                registers => Assert.Equal(configuredWorkerRegisters, registers));
             Assert.DoesNotContain("num_full_n_tiles", generatedKernelsPy, StringComparison.Ordinal);
             Assert.DoesNotContain("tail_pipeline_", generatedKernelsPy, StringComparison.Ordinal);
             Assert.DoesNotContain("mask=tl.max_constancy(", generatedKernelsPy, StringComparison.Ordinal);
@@ -1212,6 +1230,85 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
             $"rhs = ((torch.arange({inputFeatures} * {outputFeatures}, dtype=torch.float32, device='cuda').reshape({inputFeatures}, {outputFeatures}) - 128) * 0.0001).to(torch.bfloat16)",
             "output = module(lhs)",
             "torch.testing.assert_close(output, lhs @ rhs, rtol=2e-2, atol=2e-2)");
+    }
+
+    [Fact]
+    public async Task TestPyNTTSharedOwnerHandoffToWeightPipelineRun()
+    {
+        ConfigureAutoDistributedPyNTT();
+        var targetOptions = Assert.IsType<PyNTTTargetOptions>(CompileOptions.TargetOptions);
+        targetOptions.HierarchyNames = "b";
+        targetOptions.HierarchyLevels = "b";
+        targetOptions.Hierarchies = new[] { new[] { 1 } };
+
+        const int k = 128;
+        const int n = 64;
+        var gemmInput = new Var(
+            "gemm_input",
+            new TensorType(DataTypes.BFloat16, new[] { 16, k }));
+        var gemvInput = new Var(
+            "gemv_input",
+            new TensorType(DataTypes.BFloat16, new[] { 1, k }));
+        var gemmWeight = Tensor.From<BFloat16>(
+            Enumerable.Range(0, k * n)
+                .Select(index => (BFloat16)((index - 127) * 0.0005f))
+                .ToArray(),
+            [k, n]);
+        var gemvWeight = Tensor.From<BFloat16>(
+            Enumerable.Range(0, k * n)
+                .Select(index => (BFloat16)((index - 63) * 0.00025f))
+                .ToArray(),
+            [k, n]);
+        var body = new IR.Tuple(
+            IR.F.Tensors.MatMul(gemmInput, gemmWeight, DataTypes.BFloat16),
+            IR.F.Tensors.MatMul(gemvInput, gemvWeight, DataTypes.BFloat16));
+        var main = new Function(
+            "main",
+            PyNTTTarget.Kind,
+            body,
+            new[] { gemmInput, gemvInput });
+
+        var outputDirectory = await GeneratePyNTTModelDirectoryWithCompilerPipeline(
+            "generated_shared_owner_handoff_run_model",
+            main);
+        RenderGeneratedKernels(outputDirectory);
+        var generatedKernels = File.ReadAllText(
+            Path.Join(outputDirectory, "generated_kernels.py"));
+        var handoffName = Assert.Single(
+                Regex.Matches(
+                        generatedKernels,
+                        @"(?<name>[A-Za-z_]\w*__handoff_\d+)__pipe\s*=\s*tle\.pipe\(",
+                        RegexOptions.CultureInvariant)
+                    .Cast<Match>())
+            .Groups["name"]
+            .Value;
+        Assert.Contains("one_shot=True", generatedKernels, StringComparison.Ordinal);
+        Assert.Contains(
+            $"{handoffName}__writer.commit(0)",
+            generatedKernels,
+            StringComparison.Ordinal);
+        Assert.Contains(
+            $"{handoffName}__reader.wait(0)",
+            generatedKernels,
+            StringComparison.Ordinal);
+        Assert.DoesNotContain(
+            $"{handoffName}__writer.acquire",
+            generatedKernels,
+            StringComparison.Ordinal);
+        Assert.DoesNotContain(
+            $"{handoffName}__reader.release",
+            generatedKernels,
+            StringComparison.Ordinal);
+        Assert.DoesNotContain(
+            $"{handoffName}__storage",
+            generatedKernels,
+            StringComparison.Ordinal);
+
+        AssertGeneratedModelRuns(
+            outputDirectory,
+            $"gemm_input = ((torch.arange(16 * {k}, dtype=torch.float32, device='cuda').reshape(16, {k}) - 31) * 0.001).to(torch.bfloat16); gemv_input = ((torch.arange({k}, dtype=torch.float32, device='cuda').reshape(1, {k}) - 17) * 0.002).to(torch.bfloat16)",
+            "gemm_output, gemv_output = module(gemm_input, gemv_input)",
+            $"gemm_weight = ((torch.arange({k} * {n}, dtype=torch.float32, device='cuda').reshape({k}, {n}) - 127) * 0.0005).to(torch.bfloat16); gemv_weight = ((torch.arange({k} * {n}, dtype=torch.float32, device='cuda').reshape({k}, {n}) - 63) * 0.00025).to(torch.bfloat16); torch.testing.assert_close(gemm_output, gemm_input @ gemm_weight, rtol=2e-2, atol=2e-2); torch.testing.assert_close(gemv_output, gemv_input @ gemv_weight, rtol=2e-2, atol=2e-2)");
     }
 
     [Fact]
@@ -1767,7 +1864,7 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         Assert.Equal(3, Regex.Matches(generatedKernelsPy, @"tle\.gpu\.copy\(", RegexOptions.CultureInvariant).Count);
         var nTileLoops = Regex.Matches(
             generatedKernelsPy,
-            @"for n_tile in tl\.static_range\(0, 2\):",
+            @"for n_tile in tl\.range\(\s*0,\s*2,\s*loop_unroll_factor=1,\s*\):",
             RegexOptions.CultureInvariant);
         var kTileLoops = Regex.Matches(
             generatedKernelsPy,

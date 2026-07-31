@@ -649,6 +649,92 @@ public partial class ExprCloner<TContext>
     }
 
     /// <inheritdoc />
+    protected override BaseExpr VisitLeafProducerConsumerRegion(TIR.ProducerConsumerRegion expr, TContext context)
+    {
+        bool IsOperandsMutated()
+        {
+            if (IsMutated(expr.ProduceBody, context))
+            {
+                return true;
+            }
+
+            if (IsMutated(expr.ConsumeBody, context))
+            {
+                return true;
+            }
+
+            return false;
+        }
+
+        if (CloneUnmutated || IsOperandsMutated())
+        {
+            return expr.With(
+                produceBody: Clone(expr.ProduceBody, context),
+                consumeBody: Clone(expr.ConsumeBody, context)
+            );
+        }
+
+        return expr;
+    }
+
+    /// <inheritdoc />
+    protected override BaseExpr VisitLeafPipelineStage(TIR.PipelineStage expr, TContext context)
+    {
+        bool IsOperandsMutated()
+        {
+            if (IsMutated(expr.Operation, context))
+            {
+                return true;
+            }
+
+            return false;
+        }
+
+        if (CloneUnmutated || IsOperandsMutated())
+        {
+            return expr.With(
+                operation: Clone(expr.Operation, context)
+            );
+        }
+
+        return expr;
+    }
+
+    /// <inheritdoc />
+    protected override BaseExpr VisitLeafPipelineDrain(TIR.PipelineDrain expr, TContext context)
+    {
+        bool IsOperandsMutated()
+        {
+            return false;
+        }
+
+        if (CloneUnmutated || IsOperandsMutated())
+        {
+            return expr.With(
+            );
+        }
+
+        return expr;
+    }
+
+    /// <inheritdoc />
+    protected override BaseExpr VisitLeafPipelineHandoff(TIR.PipelineHandoff expr, TContext context)
+    {
+        bool IsOperandsMutated()
+        {
+            return false;
+        }
+
+        if (CloneUnmutated || IsOperandsMutated())
+        {
+            return expr.With(
+            );
+        }
+
+        return expr;
+    }
+
+    /// <inheritdoc />
     protected override BaseExpr VisitLeafIfThenElse(TIR.IfThenElse expr, TContext context)
     {
         bool IsOperandsMutated()

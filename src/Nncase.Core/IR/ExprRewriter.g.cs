@@ -152,6 +152,30 @@ public partial class ExprRewriter<TContext>
     }
 
     /// <inheritdoc/>
+    protected sealed override BaseExpr VisitLeafProducerConsumerRegion(TIR.ProducerConsumerRegion expr, TContext context)
+    {
+        return RewriteLeafProducerConsumerRegion(expr, context);
+    }
+
+    /// <inheritdoc/>
+    protected sealed override BaseExpr VisitLeafPipelineStage(TIR.PipelineStage expr, TContext context)
+    {
+        return RewriteLeafPipelineStage(expr, context);
+    }
+
+    /// <inheritdoc/>
+    protected sealed override BaseExpr VisitLeafPipelineDrain(TIR.PipelineDrain expr, TContext context)
+    {
+        return RewriteLeafPipelineDrain(expr, context);
+    }
+
+    /// <inheritdoc/>
+    protected sealed override BaseExpr VisitLeafPipelineHandoff(TIR.PipelineHandoff expr, TContext context)
+    {
+        return RewriteLeafPipelineHandoff(expr, context);
+    }
+
+    /// <inheritdoc/>
     protected sealed override BaseExpr VisitLeafIfThenElse(TIR.IfThenElse expr, TContext context)
     {
         return RewriteLeafIfThenElse(expr, context);
@@ -565,6 +589,26 @@ public partial class ExprRewriter<TContext>
     /// Rewrite leaf <see cref="TIR.PipelineFor"/>.
     /// </summary>
     protected virtual BaseExpr RewriteLeafPipelineFor(TIR.PipelineFor expr, TContext context) => DefaultRewriteLeaf(expr, context);
+
+    /// <summary>
+    /// Rewrite leaf <see cref="TIR.ProducerConsumerRegion"/>.
+    /// </summary>
+    protected virtual BaseExpr RewriteLeafProducerConsumerRegion(TIR.ProducerConsumerRegion expr, TContext context) => DefaultRewriteLeaf(expr, context);
+
+    /// <summary>
+    /// Rewrite leaf <see cref="TIR.PipelineStage"/>.
+    /// </summary>
+    protected virtual BaseExpr RewriteLeafPipelineStage(TIR.PipelineStage expr, TContext context) => DefaultRewriteLeaf(expr, context);
+
+    /// <summary>
+    /// Rewrite leaf <see cref="TIR.PipelineDrain"/>.
+    /// </summary>
+    protected virtual BaseExpr RewriteLeafPipelineDrain(TIR.PipelineDrain expr, TContext context) => DefaultRewriteLeaf(expr, context);
+
+    /// <summary>
+    /// Rewrite leaf <see cref="TIR.PipelineHandoff"/>.
+    /// </summary>
+    protected virtual BaseExpr RewriteLeafPipelineHandoff(TIR.PipelineHandoff expr, TContext context) => DefaultRewriteLeaf(expr, context);
 
     /// <summary>
     /// Rewrite leaf <see cref="TIR.IfThenElse"/>.
@@ -1003,6 +1047,38 @@ public partial class ExprRewriter
 
     /// <inheritdoc />
     protected sealed override BaseExpr RewriteLeafPipelineFor(TIR.PipelineFor expr, Unit context) => RewriteLeafPipelineFor(expr);
+
+    /// <summary>
+    /// Rewrite leaf <see cref="TIR.ProducerConsumerRegion"/>.
+    /// </summary>
+    protected virtual BaseExpr RewriteLeafProducerConsumerRegion(TIR.ProducerConsumerRegion expr) => DefaultRewriteLeaf(expr);
+
+    /// <inheritdoc />
+    protected sealed override BaseExpr RewriteLeafProducerConsumerRegion(TIR.ProducerConsumerRegion expr, Unit context) => RewriteLeafProducerConsumerRegion(expr);
+
+    /// <summary>
+    /// Rewrite leaf <see cref="TIR.PipelineStage"/>.
+    /// </summary>
+    protected virtual BaseExpr RewriteLeafPipelineStage(TIR.PipelineStage expr) => DefaultRewriteLeaf(expr);
+
+    /// <inheritdoc />
+    protected sealed override BaseExpr RewriteLeafPipelineStage(TIR.PipelineStage expr, Unit context) => RewriteLeafPipelineStage(expr);
+
+    /// <summary>
+    /// Rewrite leaf <see cref="TIR.PipelineDrain"/>.
+    /// </summary>
+    protected virtual BaseExpr RewriteLeafPipelineDrain(TIR.PipelineDrain expr) => DefaultRewriteLeaf(expr);
+
+    /// <inheritdoc />
+    protected sealed override BaseExpr RewriteLeafPipelineDrain(TIR.PipelineDrain expr, Unit context) => RewriteLeafPipelineDrain(expr);
+
+    /// <summary>
+    /// Rewrite leaf <see cref="TIR.PipelineHandoff"/>.
+    /// </summary>
+    protected virtual BaseExpr RewriteLeafPipelineHandoff(TIR.PipelineHandoff expr) => DefaultRewriteLeaf(expr);
+
+    /// <inheritdoc />
+    protected sealed override BaseExpr RewriteLeafPipelineHandoff(TIR.PipelineHandoff expr, Unit context) => RewriteLeafPipelineHandoff(expr);
 
     /// <summary>
     /// Rewrite leaf <see cref="TIR.IfThenElse"/>.

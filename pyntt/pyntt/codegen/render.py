@@ -528,11 +528,6 @@ def _kernel_parameters(metadata: dict[str, Any]) -> tuple[str, ...]:
             "host_tensor_descriptors", ()
         )
     )
-    grid_barrier_parameters = (
-        ("pyntt_grid_mesh: tl.constexpr",)
-        if _attrs(metadata).get("requires_grid_barrier")
-        else ()
-    )
     return (
         tuple(f"input{index}" for index, _ in enumerate(metadata.get("inputs", ())))
         + tuple(f"output{index}" for index, _ in enumerate(metadata.get("outputs", ())))
@@ -549,7 +544,6 @@ def _kernel_parameters(metadata: dict[str, Any]) -> tuple[str, ...]:
         + WORKSPACE_STRIDE_PARAMETERS
         + tuple(_runtime_shape_args(metadata))
         + host_tensor_descriptor_parameters
-        + grid_barrier_parameters
         + ("numel", "block_size: tl.constexpr")
     )
 
@@ -566,70 +560,123 @@ def _kernel_host_tensor_descriptor_specs(
 
     backing_by_name = {backing["name"]: backing for backing in backings}
     specs_by_name: dict[str, dict[str, Any]] = {}
-    helpers = list(kernel.get("helpers", ()))
-    for device_function in kernel.get("device_functions", ()):
-        helpers.extend(device_function.get("helpers", ()))
-    for helper in helpers:
-        model = helper["model"]
-        if (
-            helper["template"]
-            == "triton/kernels/matmul/simt_fma_smem_pipeline.py.jinja"
-        ):
-            descriptor_names = (model.get("RhsDescriptorName"),)
-            descriptor_specs = (
-                _packed_gemv_host_descriptor_spec,
-            )
-        elif (
-            helper["template"]
-            == "triton/kernels/qkv_parallel_linear/simt_fma_smem_pipeline.py.jinja"
-        ):
-            descriptor_names = tuple(
-                model.get(f"{prefix}WeightDescriptorName")
-                for prefix in ("Q", "K", "V")
-            )
-            descriptor_specs = tuple(
-                (
-                    lambda current_model, backing, current_prefix=prefix:
-                    _packed_qkv_gemv_host_descriptor_spec(
-                        current_model, backing, current_prefix
-                    )
-                )
-                for prefix in ("Q", "K", "V")
-            )
-        elif (
-            helper["template"]
-            == "triton/kernels/matmul_glu/simt_fma_smem_pipeline.py.jinja"
-        ):
-            descriptor_names = tuple(
-                model.get(f"{prefix}WeightDescriptorName")
-                for prefix in ("Gate", "Up")
-            )
-            descriptor_specs = (
-                _packed_matmul_glu_gemv_host_descriptor_spec,
-                _packed_matmul_glu_gemv_host_descriptor_spec,
-            )
-        else:
-            continue
+    device_functions = {
+        function["name"]: function
+        for function in kernel.get("device_functions", ())
+    }
+    active_functions: set[str] = set()
 
-        for descriptor_name, make_spec in zip(descriptor_names, descriptor_specs):
-            if not isinstance(descriptor_name, str) or not descriptor_name:
-                raise ValueError(
-                    f"PyNTT pipeline helper {model.get('FunctionName')} requires "
-                    "a host tensor descriptor name."
+    def resolve_descriptor_name(
+        formal_name: str,
+        environment: dict[str, str],
+        context: str,
+    ) -> str:
+        actual_name = environment.get(formal_name, formal_name)
+        if actual_name not in backing_by_name:
+            raise ValueError(
+                f"{context} binds host descriptor {formal_name!r} to unknown "
+                f"backing {actual_name!r}."
+            )
+        return actual_name
+
+    def consume_helpers(
+        helpers: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+        environment: dict[str, str],
+        owner: str,
+    ) -> None:
+        for helper in helpers:
+            model = helper["model"]
+            for formal_name, make_spec in _pipeline_helper_descriptor_specs(helper):
+                actual_name = resolve_descriptor_name(
+                    formal_name,
+                    environment,
+                    f"PyNTT helper {model.get('FunctionName')} in {owner}",
                 )
+                spec = make_spec(model, backing_by_name[actual_name])
+                previous = specs_by_name.get(actual_name)
+                if previous is not None and previous != spec:
+                    raise ValueError(
+                        f"PyNTT host descriptor {actual_name!r} has "
+                        "incompatible consumers."
+                    )
+                specs_by_name[actual_name] = spec
+            for body_key in ("ConsumerBodySource", "ProducerBodySource"):
+                body_source = model.get(body_key)
+                if isinstance(body_source, str) and body_source.strip():
+                    walk_calls(
+                        body_source,
+                        environment,
+                        f"{owner}.{model.get('FunctionName')}.{body_key}",
+                    )
+
+    def walk_calls(
+        source: str,
+        environment: dict[str, str],
+        owner: str,
+    ) -> None:
+        for match in DEVICE_CALL_RE.finditer(source):
+            callee_name = match.group("name")
             try:
-                backing = backing_by_name[descriptor_name]
+                callee = device_functions[callee_name]
             except KeyError as ex:
                 raise ValueError(
-                    f"PyNTT pipeline helper {model.get('FunctionName')} references "
-                    f"unknown host descriptor {descriptor_name!r}."
+                    f"PyNTT {owner} calls unknown device function "
+                    f"{callee_name!r} while resolving host descriptors."
                 ) from ex
-            if descriptor_name in specs_by_name:
+            if callee_name in active_functions:
                 raise ValueError(
-                    f"PyNTT host tensor descriptor {descriptor_name!r} is consumed "
-                    "by more than one helper."
+                    f"Recursive PyNTT device call involving {callee_name!r}."
                 )
-            specs_by_name[descriptor_name] = make_spec(model, backing)
+
+            explicit_arguments = _split_expression_arguments(match.group("args"))
+            formal_parameters = _parameter_call_arguments(
+                tuple(callee["extra_parameters"])
+            )
+            if explicit_arguments:
+                if len(explicit_arguments) != len(formal_parameters):
+                    raise ValueError(
+                        f"PyNTT call to {callee_name} passes "
+                        f"{len(explicit_arguments)} explicit parameters, expected "
+                        f"{len(formal_parameters)}."
+                    )
+                raw_bindings = dict(zip(formal_parameters, explicit_arguments))
+            else:
+                raw_bindings = dict(callee["extra_parameter_arguments"])
+
+            callee_environment: dict[str, str] = {}
+            for formal_name, expression in raw_bindings.items():
+                if not isinstance(expression, str):
+                    continue
+                actual_name = environment.get(expression, expression)
+                if actual_name in backing_by_name:
+                    callee_environment[formal_name] = actual_name
+
+            active_functions.add(callee_name)
+            try:
+                consume_helpers(
+                    callee.get("helpers", ()),
+                    callee_environment,
+                    callee_name,
+                )
+                walk_calls(
+                    callee.get("body_source", ""),
+                    callee_environment,
+                    callee_name,
+                )
+            finally:
+                active_functions.remove(callee_name)
+
+    root_environment = {name: name for name in backing_by_name}
+    consume_helpers(
+        kernel.get("helpers", ()),
+        root_environment,
+        kernel["metadata"]["name"],
+    )
+    walk_calls(
+        kernel.get("body_source", ""),
+        root_environment,
+        kernel["metadata"]["name"],
+    )
 
     unused = sorted(set(backing_by_name) - set(specs_by_name))
     if unused:
@@ -638,6 +685,57 @@ def _kernel_host_tensor_descriptor_specs(
             f"descriptor backing(s): {unused}."
         )
     return tuple(specs_by_name[backing["name"]] for backing in backings)
+
+
+def _pipeline_helper_descriptor_specs(
+    helper: dict[str, Any],
+) -> tuple[tuple[str, Any], ...]:
+    model = helper["model"]
+    template = helper["template"]
+    if template == "triton/kernels/matmul/simt_fma_smem_pipeline.py.jinja":
+        descriptor_names = (model.get("RhsDescriptorName"),)
+        descriptor_specs = (_packed_gemv_host_descriptor_spec,)
+    elif (
+        template
+        == "triton/kernels/qkv_parallel_linear/simt_fma_smem_pipeline.py.jinja"
+    ):
+        descriptor_names = tuple(
+            model.get(f"{prefix}WeightDescriptorName")
+            for prefix in ("Q", "K", "V")
+        )
+        descriptor_specs = tuple(
+            (
+                lambda current_model, backing, current_prefix=prefix:
+                _packed_qkv_gemv_host_descriptor_spec(
+                    current_model, backing, current_prefix
+                )
+            )
+            for prefix in ("Q", "K", "V")
+        )
+    elif (
+        template
+        == "triton/kernels/matmul_glu/simt_fma_smem_pipeline.py.jinja"
+    ):
+        descriptor_names = tuple(
+            model.get(f"{prefix}WeightDescriptorName")
+            for prefix in ("Gate", "Up")
+        )
+        descriptor_specs = (
+            _packed_matmul_glu_gemv_host_descriptor_spec,
+            _packed_matmul_glu_gemv_host_descriptor_spec,
+        )
+    else:
+        return ()
+
+    result = []
+    for descriptor_name, make_spec in zip(descriptor_names, descriptor_specs):
+        if not isinstance(descriptor_name, str) or not descriptor_name:
+            raise ValueError(
+                f"PyNTT pipeline helper {model.get('FunctionName')} requires "
+                "a host tensor descriptor name."
+            )
+        result.append((descriptor_name, make_spec))
+    return tuple(result)
 
 
 def _packed_gemv_host_descriptor_spec(
@@ -855,6 +953,7 @@ def _render_kernel(kernel: dict[str, Any]) -> str:
         worker_registers=backend_config["worker_registers"],
         register_granularity=backend_config["register_granularity"],
         registers_per_thread_limit=backend_config["registers_per_thread_limit"],
+        device_functions_by_name=device_functions_by_name,
     )
     device_function_sources = [
         _render_device_function(
@@ -918,6 +1017,7 @@ def _render_device_function(
         worker_registers=worker_registers,
         register_granularity=register_granularity,
         registers_per_thread_limit=registers_per_thread_limit,
+        device_functions_by_name=device_functions_by_name,
     )
     parts = [source for source in helper_sources if source]
     device_parameters = tuple(device_function["direct_parameters"]) + tuple(
@@ -1052,29 +1152,89 @@ def _render_helper_sources(
     worker_registers: int | None = None,
     register_granularity: int | None = None,
     registers_per_thread_limit: int | None = None,
+    device_functions_by_name: dict[str, dict[str, Any]] | None = None,
 ) -> list[str]:
     helper_sources = []
     for helper in helpers:
-        model = dict(helper["model"])
-        model["NoInline"] = bool(noinline)
-        if num_warps is not None:
-            model["NumWarps"] = num_warps
-        if target_worker_width is not None:
-            model["TargetWorkerWidth"] = target_worker_width
-        if producer_warps is not None:
-            model["ProducerWarps"] = producer_warps
-        if worker_registers is not None:
-            model["WorkerRegisters"] = worker_registers
-        if register_granularity is not None:
-            model["RegisterGranularity"] = register_granularity
-        if registers_per_thread_limit is not None:
-            model["RegistersPerThreadLimit"] = registers_per_thread_limit
+        model = _prepare_helper_model(
+            helper["model"],
+            noinline=noinline,
+            num_warps=num_warps,
+            target_worker_width=target_worker_width,
+            producer_warps=producer_warps,
+            worker_registers=worker_registers,
+            register_granularity=register_granularity,
+            registers_per_thread_limit=registers_per_thread_limit,
+            device_functions_by_name=device_functions_by_name,
+        )
         model["Arguments"] = tuple(helper["arguments"])
         model["WorkspaceArguments"] = tuple(helper["workspace_arguments"])
         helper_sources.append(
             env.get_template(helper["template"]).render(model=model).strip()
         )
     return helper_sources
+
+
+def _prepare_helper_model(
+    raw_model: dict[str, Any],
+    *,
+    noinline: bool,
+    num_warps: int | None,
+    target_worker_width: int | None,
+    producer_warps: int | None,
+    worker_registers: int | None,
+    register_granularity: int | None,
+    registers_per_thread_limit: int | None,
+    device_functions_by_name: dict[str, dict[str, Any]] | None,
+) -> dict[str, Any]:
+    model = dict(raw_model)
+    model["NoInline"] = bool(noinline)
+    if num_warps is not None:
+        model["NumWarps"] = num_warps
+    if target_worker_width is not None:
+        model["TargetWorkerWidth"] = target_worker_width
+    if producer_warps is not None:
+        model["ProducerWarps"] = producer_warps
+    if worker_registers is not None:
+        model["WorkerRegisters"] = worker_registers
+    if register_granularity is not None:
+        model["RegisterGranularity"] = register_granularity
+    if registers_per_thread_limit is not None:
+        model["RegistersPerThreadLimit"] = registers_per_thread_limit
+
+    if "Stages" in model:
+        stages = []
+        for raw_stage in model["Stages"]:
+            stage = dict(raw_stage)
+            stage["Model"] = _prepare_helper_model(
+                stage["Model"],
+                noinline=noinline,
+                num_warps=num_warps,
+                target_worker_width=target_worker_width,
+                producer_warps=producer_warps,
+                worker_registers=worker_registers,
+                register_granularity=register_granularity,
+                registers_per_thread_limit=registers_per_thread_limit,
+                device_functions_by_name=device_functions_by_name,
+            )
+            stages.append(stage)
+        model["Stages"] = tuple(stages)
+    if device_functions_by_name is not None:
+        for body_key in ("ConsumerBodySource", "ProducerBodySource"):
+            body_source = model.get(body_key)
+            if isinstance(body_source, str):
+                model[body_key] = _replace_device_function_calls(
+                    body_source,
+                    device_functions_by_name,
+                )
+    for role in ("Consumer", "Producer"):
+        body_source = model.get(f"{role}BodySource")
+        if isinstance(body_source, str):
+            model[f"{role}NeedsShardIndex"] = _needs_shard_index_prelude(
+                body_source,
+                (),
+            )
+    return model
 
 
 def _parameter_call_arguments(parameters: tuple[str, ...]) -> tuple[str, ...]:
@@ -3875,19 +4035,6 @@ def _packed_gemv_pipeline_template_context(
         consumer_threads_per_warp_k,
     )
     consumer_warps_per_cta = (consumer_warps_n, 1)
-    register_granularity = int(model["RegisterGranularity"])
-    producer_registers = 48
-    producer_registers = (
-        (producer_registers + register_granularity - 1)
-        // register_granularity
-        * register_granularity
-    )
-    if producer_registers > int(model["RegistersPerThreadLimit"]):
-        raise ValueError(
-            "PyNTT K-major GEMV TMA producer requires "
-            f"{producer_registers} producer registers per thread, exceeding "
-            f"the target limit {model['RegistersPerThreadLimit']}."
-        )
     tma_contiguous_extent = n_lane * k_lane
     tma_block_shape = (
         packed_k_outer,
@@ -3905,7 +4052,6 @@ def _packed_gemv_pipeline_template_context(
         "packed_n_outer": packed_n_outer,
         "reduction_group": reduction_group,
         "reduction_groups_per_stage": block_k // reduction_group,
-        "producer_registers": producer_registers,
         "shared_stage_shape": tma_block_shape,
         "tma_block_shape": tma_block_shape,
         "tma_contiguous_extent": tma_contiguous_extent,
@@ -4128,17 +4274,6 @@ def _packed_qkv_gemv_pipeline_template_context(
             "PyNTT packed QKV GEMV requires one consumer warp partition per N "
             f"slice: expected {consumer_warps_n}, got {consumer_warps}."
         )
-    register_granularity = int(model["RegisterGranularity"])
-    producer_registers = (
-        (48 + register_granularity - 1) // register_granularity
-    ) * register_granularity
-    if producer_registers > int(model["RegistersPerThreadLimit"]):
-        raise ValueError(
-            "PyNTT packed QKV GEMV TMA producer register requirement exceeds "
-            f"the target limit: {producer_registers} > "
-            f"{model['RegistersPerThreadLimit']}."
-        )
-
     context.update(
         block_n=block_n,
         block_k=block_k,
@@ -4155,7 +4290,6 @@ def _packed_qkv_gemv_pipeline_template_context(
         packed_k_outer=packed_k_outer,
         reduction_group=reduction_group,
         reduction_groups_per_stage=block_k // reduction_group,
-        producer_registers=producer_registers,
         shared_stage_shape=(
             packed_n_outer,
             packed_k_outer,
@@ -4304,17 +4438,6 @@ def _packed_matmul_glu_gemv_pipeline_template_context(
             "PyNTT packed MatMulGlu GEMV requires one consumer warp partition "
             f"per N slice: expected {consumer_warps_n}, got {consumer_warps}."
         )
-    register_granularity = int(model["RegisterGranularity"])
-    producer_registers = (
-        (48 + register_granularity - 1) // register_granularity
-    ) * register_granularity
-    if producer_registers > int(model["RegistersPerThreadLimit"]):
-        raise ValueError(
-            "PyNTT packed MatMulGlu GEMV TMA producer register requirement "
-            f"exceeds the target limit: {producer_registers} > "
-            f"{model['RegistersPerThreadLimit']}."
-        )
-
     tma_contiguous_extent = n_lane * k_lane
     tma_block_shape = (
         packed_k_outer,
@@ -4369,7 +4492,6 @@ def _packed_matmul_glu_gemv_pipeline_template_context(
         packed_n_outer=packed_n_outer,
         reduction_group=reduction_group,
         reduction_groups_per_stage=block_k // reduction_group,
-        producer_registers=producer_registers,
         shared_stage_shape=(
             packed_k_outer,
             packed_n_outer,

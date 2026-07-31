@@ -2350,15 +2350,12 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
             ? Array.Empty<string>()
             : new[] { "*pyntt_host_tensor_descriptors" };
         var requiresGridBarrier = kernel.Attrs.ContainsKey("requires_grid_barrier");
-        var gridBarrierArgs = requiresGridBarrier ? new[] { "PYNTT_GRID_MESH" } : Array.Empty<string>();
-        var tensorArgs = string.Join(", ", inputArgs.Concat(outputArgs).Concat(tensorStrideArgs).Concat(abiViewStrideArgs).Concat(workspaceArgs).Concat(workspaceStrideArgs).Concat(runtimeShapeArgs).Concat(hostTensorDescriptorArgs).Concat(gridBarrierArgs));
+        var tensorArgs = string.Join(", ", inputArgs.Concat(outputArgs).Concat(tensorStrideArgs).Concat(abiViewStrideArgs).Concat(workspaceArgs).Concat(workspaceStrideArgs).Concat(runtimeShapeArgs).Concat(hostTensorDescriptorArgs));
         var tritonRuntimeSetup = requiresGridBarrier
             ? $"{Environment.NewLine}        ensure_triton_allocator({context.DeviceExpression})"
             : string.Empty;
         const string kwargs = ", num_warps=pyntt_kernel_config['num_warps'], num_stages=pyntt_kernel_config['num_stages']";
-        var importStatement = requiresGridBarrier
-            ? $"from .generated_kernels import {kernel.Name}, PYNTT_GRID_MESH, PYNTT_HOST_TENSOR_DESCRIPTOR_SPECS, PYNTT_KERNEL_CONFIGS"
-            : $"from .generated_kernels import {kernel.Name}, PYNTT_HOST_TENSOR_DESCRIPTOR_SPECS, PYNTT_KERNEL_CONFIGS";
+        var importStatement = $"from .generated_kernels import {kernel.Name}, PYNTT_HOST_TENSOR_DESCRIPTOR_SPECS, PYNTT_KERNEL_CONFIGS";
         var launchStatement = $"        {kernel.Name}[grid]({tensorArgs}, numel, block_size{kwargs})";
         var kernelArgs = string.IsNullOrWhiteSpace(tensorArgs) ? "(numel,)" : $"({tensorArgs}, numel,)";
         var tuningSelectionStatement = $"        block_size = select_and_validate_triton_tuning_parameter({PythonString(kernel.Name)}, \"block_size\", pyntt_kernel_config[\"block_size\"][\"candidates\"], source=pyntt_kernel_config[\"block_size\"][\"source\"], kernel={kernel.Name}, kernel_args={kernelArgs}, grid_for_candidate={gridForCandidate}, expected_compute_num_warps=pyntt_kernel_config[\"num_warps\"], registers_per_thread_limit={PythonValue(kernel.Attrs["registers_per_thread_limit"])}, shared_memory_capacity_bytes={PythonValue(kernel.Attrs["shared_memory_capacity_bytes"])}, forbid_spills={PythonValue(kernel.Attrs["forbid_spills"])}{kwargs})";

@@ -1,3 +1,23 @@
+{% macro pipeline_setup(stage) -%}
+{% set stage_model = stage["Model"] %}
+{% set stage_ctx = packed_matmul_glu_gemv_pipeline_context(stage_model) %}
+{{ stage["StageName"] }}__rhs_stages = tle.gpu.alloc(
+    [{{ stage_ctx["num_stages"] }}, {{ stage_ctx["shared_stage_shape"] | join(", ") }}],
+    dtype={{ stage_model["WeightTritonDType"] }},
+    layout=None,
+    scope=tle.gpu.smem,
+    alias=pyntt_shared_arena,
+    alias_offset_bytes={{ stage["SharedWorkspaceOffsets"]["rhs_stage"] }},
+    nv_mma_shared_layout=True,
+)
+{{ stage["PipeName"] }} = tle.pipe(
+    capacity={{ stage_ctx["num_stages"] }},
+    scope="cta",
+    name="{{ stage["StageName"] }}_weight",
+    weight={{ stage["StageName"] }}__rhs_stages,
+)
+{%- endmacro %}
+{% if model is defined %}
 {% import "triton/kernels/_common.py.jinja" as common with context %}
 {% set ctx = packed_matmul_glu_gemv_pipeline_context(model) %}
 # generated from PyNTT algorithm triton.matmul_glu/simt_fma_smem_pipeline
@@ -58,9 +78,17 @@ def {{ model["FunctionName"] }}__producer(writer, {{ helper_parameters(model) }}
                     0,
                     0,
                 ],
+                eviction_policy="evict_first",
             )
             writer.commit({{ projection["lower"] }}_sequence)
 {% endfor %}
+    writer.close(
+        (
+            {{ ctx["runtime_num_n_tiles"] }}
+            * {{ ctx["num_k_tiles"] }}
+            * {{ ctx["projection_count"] }}
+        ).to(tl.int32)
+    )
 
 
 @triton.jit
@@ -199,34 +227,4 @@ def {{ model["FunctionName"] }}__consumer(reader, {{ helper_parameters(model) }}
         )
 
 
-{{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
-def {{ model["FunctionName"] }}({{ helper_parameters(model) }}):
-    rhs_stages = tle.gpu.alloc(
-        [{{ ctx["num_stages"] }}, {{ ctx["shared_stage_shape"] | join(", ") }}],
-        dtype={{ model["WeightTritonDType"] }},
-        layout=None,
-        scope=tle.gpu.smem,
-        alias=pyntt_shared_arena,
-        alias_offset_bytes={{ ctx["microkernel"]["shared_workspace_offsets"]["rhs_stage"] }},
-        nv_mma_shared_layout=True,
-    )
-    weight_pipe = tle.pipe(
-        capacity={{ ctx["num_stages"] }},
-        scope="cta",
-        name="{{ model["FunctionName"] }}_weight",
-        weight=rhs_stages,
-    )
-    tle.gpu.warp_specialize(
-        [
-            (
-                {{ model["FunctionName"] }}__consumer,
-                (weight_pipe.reader(), {{ helper_argument_names(model) }}),
-            ),
-            (
-                {{ model["FunctionName"] }}__producer,
-                (weight_pipe.writer(), {{ helper_argument_names(model) }}),
-            ),
-        ],
-        [{{ model["ProducerWarps"] }}],
-        [{{ ctx["producer_registers"] }}],
-    )
+{% endif %}

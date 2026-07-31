@@ -154,6 +154,29 @@ internal sealed partial class TypeInferenceVisitor : ExprVisitor<IRType, Unit>
     }
 
     /// <inheritdoc/>
+    protected override IRType VisitLeafProducerConsumerRegion(ProducerConsumerRegion expr)
+    {
+        VerifySubField(expr, expr.ProduceBody, TypePatternUtility.IsUnit());
+        VerifySubField(expr, expr.ConsumeBody);
+        return expr.ConsumeBody.CheckedType;
+    }
+
+    /// <inheritdoc/>
+    protected override IRType VisitLeafPipelineStage(PipelineStage expr)
+    {
+        VerifySubField(expr, expr.Operation);
+        return expr.Operation.CheckedType;
+    }
+
+    /// <inheritdoc/>
+    protected override IRType VisitLeafPipelineDrain(PipelineDrain expr)
+        => TupleType.Void;
+
+    /// <inheritdoc/>
+    protected override IRType VisitLeafPipelineHandoff(PipelineHandoff expr)
+        => TupleType.Void;
+
+    /// <inheritdoc/>
     protected override IRType VisitLeafFunction(Function expr)
     {
         foreach (var p in expr.Parameters)

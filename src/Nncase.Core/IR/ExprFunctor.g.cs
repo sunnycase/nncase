@@ -129,6 +129,26 @@ public partial class ExprFunctor<TExprResult, TTypeResult, TContext>
     internal protected virtual TExprResult VisitPipelineFor(TIR.PipelineFor expr, TContext context) => DefaultVisit(expr, context);
 
     /// <summary>
+    /// Visit <see cref="TIR.ProducerConsumerRegion"/>.
+    /// </summary>
+    internal protected virtual TExprResult VisitProducerConsumerRegion(TIR.ProducerConsumerRegion expr, TContext context) => DefaultVisit(expr, context);
+
+    /// <summary>
+    /// Visit <see cref="TIR.PipelineStage"/>.
+    /// </summary>
+    internal protected virtual TExprResult VisitPipelineStage(TIR.PipelineStage expr, TContext context) => DefaultVisit(expr, context);
+
+    /// <summary>
+    /// Visit <see cref="TIR.PipelineDrain"/>.
+    /// </summary>
+    internal protected virtual TExprResult VisitPipelineDrain(TIR.PipelineDrain expr, TContext context) => DefaultVisit(expr, context);
+
+    /// <summary>
+    /// Visit <see cref="TIR.PipelineHandoff"/>.
+    /// </summary>
+    internal protected virtual TExprResult VisitPipelineHandoff(TIR.PipelineHandoff expr, TContext context) => DefaultVisit(expr, context);
+
+    /// <summary>
     /// Visit <see cref="TIR.IfThenElse"/>.
     /// </summary>
     internal protected virtual TExprResult VisitIfThenElse(TIR.IfThenElse expr, TContext context) => DefaultVisit(expr, context);
@@ -543,6 +563,34 @@ public partial class ExprFunctor<TExprResult, TTypeResult>
 
     /// <inheritdoc/>
     internal protected sealed override TExprResult VisitPipelineFor(TIR.PipelineFor expr, Unit context) => VisitPipelineFor(expr);
+    /// <summary>
+    /// Visit <see cref="TIR.ProducerConsumerRegion"/>.
+    /// </summary>
+    internal protected virtual TExprResult VisitProducerConsumerRegion(TIR.ProducerConsumerRegion expr) => base.VisitProducerConsumerRegion(expr, default);
+
+    /// <inheritdoc/>
+    internal protected sealed override TExprResult VisitProducerConsumerRegion(TIR.ProducerConsumerRegion expr, Unit context) => VisitProducerConsumerRegion(expr);
+    /// <summary>
+    /// Visit <see cref="TIR.PipelineStage"/>.
+    /// </summary>
+    internal protected virtual TExprResult VisitPipelineStage(TIR.PipelineStage expr) => base.VisitPipelineStage(expr, default);
+
+    /// <inheritdoc/>
+    internal protected sealed override TExprResult VisitPipelineStage(TIR.PipelineStage expr, Unit context) => VisitPipelineStage(expr);
+    /// <summary>
+    /// Visit <see cref="TIR.PipelineDrain"/>.
+    /// </summary>
+    internal protected virtual TExprResult VisitPipelineDrain(TIR.PipelineDrain expr) => base.VisitPipelineDrain(expr, default);
+
+    /// <inheritdoc/>
+    internal protected sealed override TExprResult VisitPipelineDrain(TIR.PipelineDrain expr, Unit context) => VisitPipelineDrain(expr);
+    /// <summary>
+    /// Visit <see cref="TIR.PipelineHandoff"/>.
+    /// </summary>
+    internal protected virtual TExprResult VisitPipelineHandoff(TIR.PipelineHandoff expr) => base.VisitPipelineHandoff(expr, default);
+
+    /// <inheritdoc/>
+    internal protected sealed override TExprResult VisitPipelineHandoff(TIR.PipelineHandoff expr, Unit context) => VisitPipelineHandoff(expr);
     /// <summary>
     /// Visit <see cref="TIR.IfThenElse"/>.
     /// </summary>

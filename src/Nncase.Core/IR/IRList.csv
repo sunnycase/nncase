@@ -21,6 +21,10 @@ Buffer,true,false,Default,TIR.,MemSpan;@Dimensions;@Strides;!DistributedType
 BufferRegion,true,false,Default,TIR.,Buffer;@Region
 For,true,false,Default,TIR.,LoopVar;Domain;Body
 PipelineFor,true,false,Default,TIR.,LoopVar;Domain;ProduceBody;ConsumeBody;@StagedAccesses;@StagedAllocations;@StagedBuffers
+ProducerConsumerRegion,true,false,Default,TIR.,ProduceBody;ConsumeBody
+PipelineStage,true,false,Default,TIR.,Operation
+PipelineDrain,true,false,Default,TIR.,
+PipelineHandoff,true,false,Default,TIR.,
 IfThenElse,true,false,Default,TIR.,Condition;Then;Else
 Let,true,false,Default,TIR.,Var;Expression;Body
 PrimFunction,true,true,BaseFunction,TIR.,@Parameters;Body;Results

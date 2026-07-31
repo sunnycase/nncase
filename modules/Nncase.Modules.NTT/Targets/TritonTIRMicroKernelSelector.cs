@@ -91,7 +91,8 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
             n,
             k,
             kDimension.IsFixed,
-            kMajorPacked);
+            kMajorPacked,
+            weightArgumentIndices: [rhsIndex]);
     }
 
     private static TIRMicroKernelSelection SelectFusedLinear(
@@ -123,7 +124,8 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
             n,
             k,
             kDimension.IsFixed,
-            kMajorPacked: false);
+            kMajorPacked: false,
+            weightArgumentIndices: [weightIndex]);
     }
 
     private static TIRMicroKernelSelection SelectPackedQkv(
@@ -173,7 +175,8 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
             n,
             GetScalarExtent(kDimension, input.ElemType),
             kDimension.IsFixed,
-            qkv.RhsLayout == IR.NTT.PackedMatMulRhsLayout.KMajor);
+            qkv.RhsLayout == IR.NTT.PackedMatMulRhsLayout.KMajor,
+            weightArgumentIndices: [1, 2, 3]);
     }
 
     private static TIRMicroKernelSelection SelectPackedMatMulGlu(
@@ -219,7 +222,8 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
             GetScalarExtent(kDimension, input.ElemType),
             kDimension.IsFixed,
             matmulGlu.RhsLayout == IR.NTT.PackedMatMulRhsLayout.KMajor,
-            simultaneousRhsTileCount: 2);
+            simultaneousRhsTileCount: 2,
+            weightArgumentIndices: [1, 2]);
     }
 
     private static TIRMicroKernelSelection SelectSumma(
@@ -251,7 +255,8 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
         long k,
         bool fixedK,
         bool kMajorPacked,
-        int simultaneousRhsTileCount = 1)
+        int simultaneousRhsTileCount = 1,
+        IReadOnlyList<int>? weightArgumentIndices = null)
     {
         var gemv = m == 1;
         if (gemv)
@@ -289,7 +294,11 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
                         new TIRSharedWorkspaceDescriptor(
                             "rhs_stage",
                             rhsShape,
-                            NvidiaNvmmaSharedAlignmentBytes)));
+                            NvidiaNvmmaSharedAlignmentBytes)),
+                    new TIRWeightPipelineContract(
+                        weightArgumentIndices ?? throw new InvalidOperationException(
+                            $"{family}/simt_fma_smem_pipeline is missing weight operand indexes."),
+                        [0]));
             }
 
             const int blockK = 256;
@@ -332,7 +341,8 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
                 family,
                 variant,
                 CreateParameters(blockM, blockN, blockK, numStages: 1),
-                ImmutableArray<TIRSharedWorkspaceDescriptor>.Empty);
+                ImmutableArray<TIRSharedWorkspaceDescriptor>.Empty,
+                WeightPipeline: null);
         }
 
         var gemv = blockM == 1;
@@ -348,7 +358,8 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
             CreateParameters(blockM, blockN, blockK, numStages: 1),
             ImmutableArray.Create(
                 new TIRSharedWorkspaceDescriptor("lhs_stage", lhsShape, NvidiaNvmmaSharedAlignmentBytes),
-                new TIRSharedWorkspaceDescriptor("rhs_stage", rhsShape, NvidiaNvmmaSharedAlignmentBytes)));
+                new TIRSharedWorkspaceDescriptor("rhs_stage", rhsShape, NvidiaNvmmaSharedAlignmentBytes)),
+            WeightPipeline: null);
     }
 
     private static ImmutableDictionary<string, long> CreateParameters(

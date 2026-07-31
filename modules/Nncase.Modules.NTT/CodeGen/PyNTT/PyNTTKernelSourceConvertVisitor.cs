@@ -367,10 +367,21 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             Grid,
         }
 
+        private enum PipelineExecutionRole
+        {
+            None,
+            Consumer,
+            Producer,
+        }
+
         private const string ShardCoordDimPrefix = "__shard_coord_";
         private const string DeviceFunctionCallPrefix = "__pyntt_device_call__";
         private const string PoolScopeSizeSuffix = "_pool_scope_size";
         private const string SharedArenaId = "pyntt_shared_arena";
+
+        private static readonly Regex DeviceFunctionCallNameRegex = new(
+            $@"\b{DeviceFunctionCallPrefix}(?<name>[A-Za-z_]\w*)\(",
+            RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
         private static readonly string[] WorkspaceParameterNames =
         {
@@ -400,7 +411,6 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
         private readonly PyNTTTargetOptions _targetOptions;
         private readonly string _ownerName;
         private readonly bool _validateOutputs;
-        private readonly StringBuilder _body = new();
         private readonly List<HelperTemplateRenderSpec> _helpers = new();
         private readonly List<DeviceFunctionRenderSpec> _deviceFunctions = new();
         private readonly List<HostTensorDescriptorBackingMetadata> _hostTensorDescriptors = new();
@@ -460,8 +470,14 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
         private readonly HashSet<string> _activeDeviceFunctionNames;
         private readonly Dictionary<PrimFunction, DeviceFunctionDefinition> _deviceFunctionDefinitions;
         private readonly Dictionary<string, DeviceFunctionDefinition> _deviceFunctionDefinitionsByName;
-        private long _nestedBlockLocalDataPoolBytes;
+        private readonly Dictionary<PrimFunction, PipelineDeviceFunctionDefinition> _pipelineDeviceFunctionDefinitions;
+        private readonly Dictionary<string, PipelineDeviceFunctionDefinition> _pipelineDeviceFunctionDefinitionsByName;
         private readonly PrimFunction _currentFunction;
+        private StringBuilder _body = new();
+        private long _nestedBlockLocalDataPoolBytes;
+        private PipelineExecutionRole _pipelineRole;
+        private PipelineRegionCodegenState? _activePipelineRegion;
+        private PipelineStage? _activePipelineStage;
         private int _bodyIndent;
 
         public PyNTTPrimFunctionSourceVisitor(
@@ -540,6 +556,8 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             _activeDeviceFunctionNames = abiState.ActiveDeviceFunctionNames;
             _deviceFunctionDefinitions = abiState.DeviceFunctionDefinitions;
             _deviceFunctionDefinitionsByName = abiState.DeviceFunctionDefinitionsByName;
+            _pipelineDeviceFunctionDefinitions = abiState.PipelineDeviceFunctionDefinitions;
+            _pipelineDeviceFunctionDefinitionsByName = abiState.PipelineDeviceFunctionDefinitionsByName;
             _dimEmitter = new(RegisterRuntimeScalar, FormatRuntimeScalar, BuildThreadIdExpression(targetOptions));
         }
 
@@ -754,6 +772,161 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 new Dictionary<int, string>(_formalObjectOutputAliases));
         }
 
+        private PipelineDeviceFunctionBuildResult BuildPipelineDeviceFunctions(
+            string name,
+            IReadOnlyDictionary<string, string> parameterOverrides,
+            IReadOnlyDictionary<string, string> extraParameterArguments)
+        {
+            var region = RequireSingleProducerConsumerRegion(_bodyExpr, _currentFunction.Name);
+            var stages = CollectPipelineStages(region.ConsumeBody)
+                .Select((stage, index) => PipelineStageCodegenState.Create(
+                    stage,
+                    name,
+                    index))
+                .ToArray();
+            if (stages.Length == 0)
+            {
+                throw new InvalidOperationException(
+                    $"Pipeline PrimFunction {_currentFunction.Name} has no stages.");
+            }
+
+            var handoffs = CollectPipelineHandoffs(region.ConsumeBody)
+                .Select((handoff, index) => PipelineHandoffCodegenState.Create(
+                    handoff,
+                    name,
+                    index))
+                .ToArray();
+            var state = new PipelineRegionCodegenState(
+                stages,
+                handoffs,
+                CollectPipelineDrainIds(region.ConsumeBody));
+            _activePipelineRegion = state;
+
+            try
+            {
+                var consumerBody = RenderPipelineRole(
+                    region.ConsumeBody,
+                    PipelineExecutionRole.Consumer);
+                var producerBody = RenderPipelineRole(
+                    region.ProduceBody,
+                    PipelineExecutionRole.Producer);
+                var unboundStages = stages
+                    .Where(stage => !stage.IsBound)
+                    .Select(stage => stage.StageId)
+                    .ToArray();
+                if (unboundStages.Length != 0)
+                {
+                    throw new InvalidOperationException(
+                        $"Pipeline PrimFunction {_currentFunction.Name} did not bind " +
+                        $"stage(s): {string.Join(", ", unboundStages)}.");
+                }
+
+                RegisterInOutObjectOutputAliases();
+                foreach (var endpoint in state.ConsumerEndpointNames
+                             .Concat(state.ProducerEndpointNames))
+                {
+                    _extraWorkspaceBaseNames.Add(endpoint);
+                }
+
+                var consumerParameters = CollectLiveParameters(
+                        consumerBody,
+                        _extraWorkspaceBaseNames)
+                    .Select(FormatExtraParameterDeclaration)
+                    .ToArray();
+                var producerParameters = CollectLiveParameters(
+                        producerBody,
+                        _extraWorkspaceBaseNames)
+                    .Select(FormatExtraParameterDeclaration)
+                    .ToArray();
+                var consumerFunction = new DeviceFunctionRenderSpec(
+                    $"{name}__consumer",
+                    NoInline: true,
+                    PreserveHelperCallBoundaries: true,
+                    _helpers.ToArray(),
+                    consumerBody,
+                    parameterOverrides,
+                    consumerParameters,
+                    extraParameterArguments);
+                var producerFunction = new DeviceFunctionRenderSpec(
+                    $"{name}__producer",
+                    NoInline: true,
+                    PreserveHelperCallBoundaries: true,
+                    Array.Empty<HelperTemplateRenderSpec>(),
+                    producerBody,
+                    parameterOverrides,
+                    producerParameters,
+                    extraParameterArguments);
+                var requiresGridBarrier =
+                    _attrs.TryGetValue("requires_grid_barrier", out var value) &&
+                    value is true;
+                return new(
+                    consumerFunction,
+                    producerFunction,
+                    _deviceFunctions.ToArray(),
+                    _helperCalls.ToArray(),
+                    _opKinds.ToArray(),
+                    requiresGridBarrier,
+                    GetBlockLocalDataPoolBytes(),
+                    _formalHostTensorDescriptors.ToArray(),
+                    new Dictionary<string, PyNTTKVCacheStorageMetadata?>(
+                        _formalObjectFieldStorages,
+                        StringComparer.Ordinal),
+                    new Dictionary<int, string>(_formalObjectOutputAliases),
+                    new PipelineDeviceFunctionInterface(
+                        state.PipeStages,
+                        state.Handoffs,
+                        state.ConsumerEndpointNames,
+                        state.ProducerEndpointNames,
+                        state.ConsumerDrainEndpointNames,
+                        state.ProducerDrainEndpointNames));
+            }
+            finally
+            {
+                _activePipelineRegion = null;
+                _activePipelineStage = null;
+                _pipelineRole = PipelineExecutionRole.None;
+            }
+        }
+
+        private static ProducerConsumerRegion RequireSingleProducerConsumerRegion(
+            BaseExpr body,
+            string functionName)
+        {
+            if (TryGetSingleProducerConsumerRegion(body, out var region))
+            {
+                return region;
+            }
+
+            throw new InvalidOperationException(
+                $"Pipeline PrimFunction {functionName} must contain exactly one " +
+                "top-level producer/consumer region.");
+        }
+
+        private static bool TryGetSingleProducerConsumerRegion(
+            BaseExpr body,
+            out ProducerConsumerRegion region)
+        {
+            if (body is ProducerConsumerRegion directRegion)
+            {
+                region = directRegion;
+                return true;
+            }
+
+            if (body is Sequential sequential)
+            {
+                var fields = sequential.Fields.ToArray();
+                if (fields.Length == 1 &&
+                    fields[0] is ProducerConsumerRegion nestedRegion)
+                {
+                    region = nestedRegion;
+                    return true;
+                }
+            }
+
+            region = null!;
+            return false;
+        }
+
         private void RegisterInOutObjectOutputAliases()
         {
             var outputs = _currentFunction.GetAbiView().OutputParameters;
@@ -800,7 +973,9 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
 
             try
             {
-                var traceLabel = semanticScopeName is not null && !ReferenceEquals(expr, _currentFunction.Body)
+                var traceLabel = _pipelineRole != PipelineExecutionRole.Producer &&
+                    semanticScopeName is not null &&
+                    !ReferenceEquals(expr, _currentFunction.Body)
                     ? GetPrimFunctionCallTraceLabel(semanticScopeName)
                     : null;
                 if (traceLabel is not null)
@@ -822,6 +997,290 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 if (semanticScopeName is not null)
                 {
                     _semanticHelperScopes.Pop();
+                }
+            }
+        }
+
+        protected override Unit VisitProducerConsumerRegion(ProducerConsumerRegion expr)
+        {
+            if (_activePipelineRegion is not null ||
+                _pipelineRole != PipelineExecutionRole.None)
+            {
+                throw new NotSupportedException(
+                    $"PyNTT does not support nested producer/consumer regions in {_currentFunction.Name}.");
+            }
+
+            var helperName = GetNextHelperName("producer_consumer_region");
+            var stageNodes = CollectPipelineStages(expr.ConsumeBody);
+            if (stageNodes.Count == 0)
+            {
+                throw new InvalidOperationException(
+                    $"Producer/consumer region in {_currentFunction.Name} has no pipeline stages.");
+            }
+
+            var stages = stageNodes
+                .Select((stage, index) => PipelineStageCodegenState.Create(
+                    stage,
+                    helperName,
+                    index))
+                .ToArray();
+            var handoffs = CollectPipelineHandoffs(expr.ConsumeBody)
+                .Select((handoff, index) => PipelineHandoffCodegenState.Create(
+                    handoff,
+                    helperName,
+                    index))
+                .ToArray();
+            var state = new PipelineRegionCodegenState(
+                stages,
+                handoffs,
+                CollectPipelineDrainIds(expr.ConsumeBody));
+            _activePipelineRegion = state;
+
+            try
+            {
+                var consumerBody = RenderPipelineRole(
+                    expr.ConsumeBody,
+                    PipelineExecutionRole.Consumer);
+                var producerBody = RenderPipelineRole(
+                    expr.ProduceBody,
+                    PipelineExecutionRole.Producer);
+                var unboundStages = stages
+                    .Where(stage => !stage.IsBound)
+                    .Select(stage => stage.StageId)
+                    .ToArray();
+                if (unboundStages.Length != 0)
+                {
+                    throw new InvalidOperationException(
+                        $"PyNTT producer/consumer region in {_currentFunction.Name} did not bind helper(s) for stage(s): " +
+                        string.Join(", ", unboundStages));
+                }
+
+                var templateModel = new PyNTTProducerConsumerRegionTemplateModel(
+                    helperName,
+                    $"{helperName}__producer",
+                    $"{helperName}__consumer",
+                    producerBody,
+                    consumerBody,
+                    state.PipeStages.ToArray(),
+                    state.Handoffs.ToArray(),
+                    state.ProducerEndpointNames.ToArray(),
+                    state.ConsumerEndpointNames.ToArray());
+                WriteHelperTemplate(
+                    "triton/kernels/_producer_consumer_region.py.jinja",
+                    templateModel,
+                    usesSharedArena: true);
+                WriteLine(BuildHelperCall(helperName));
+            }
+            finally
+            {
+                _activePipelineRegion = null;
+                _activePipelineStage = null;
+                _pipelineRole = PipelineExecutionRole.None;
+            }
+
+            return default;
+        }
+
+        protected override Unit VisitPipelineStage(PipelineStage expr)
+        {
+            var region = _activePipelineRegion
+                ?? throw new InvalidOperationException(
+                    $"Pipeline stage {expr.StageId} is not enclosed by a producer/consumer region.");
+            var state = region.GetStage(expr.StageId);
+            switch (_pipelineRole)
+            {
+                case PipelineExecutionRole.Consumer:
+                    if (_activePipelineStage is not null)
+                    {
+                        throw new InvalidOperationException(
+                            $"Pipeline stage {expr.StageId} is nested under {_activePipelineStage.StageId}.");
+                    }
+
+                    _activePipelineStage = expr;
+                    try
+                    {
+                        Visit(expr.Operation);
+                    }
+                    finally
+                    {
+                        _activePipelineStage = null;
+                    }
+
+                    if (!state.IsBound)
+                    {
+                        throw new InvalidOperationException(
+                            $"Pipeline stage {expr.StageId} did not emit a weight-pipelined helper.");
+                    }
+
+                    break;
+                case PipelineExecutionRole.Producer:
+                    if (state.IsDirectHelper)
+                    {
+                        WriteLine(
+                            BuildHelperRoleCall(
+                                state.DirectHelperName,
+                                "producer",
+                                state.WriterName,
+                                recordMetadata: false));
+                        break;
+                    }
+
+                    _activePipelineStage = expr;
+                    try
+                    {
+                        Visit(expr.Operation);
+                    }
+                    finally
+                    {
+                        _activePipelineStage = null;
+                    }
+
+                    break;
+                default:
+                    throw new InvalidOperationException(
+                        $"Pipeline stage {expr.StageId} was visited outside a producer or consumer role.");
+            }
+
+            return default;
+        }
+
+        protected override Unit VisitPipelineDrain(PipelineDrain expr)
+        {
+            var stage = (_activePipelineRegion
+                ?? throw new InvalidOperationException(
+                    $"Pipeline drain {expr.StageId} is not enclosed by a producer/consumer region."))
+                .GetStage(expr.StageId);
+            var endpoints = _pipelineRole switch
+            {
+                PipelineExecutionRole.Consumer => stage.ConsumerDrainEndpointNames,
+                PipelineExecutionRole.Producer => stage.ProducerDrainEndpointNames,
+                _ => throw new InvalidOperationException(
+                    $"Pipeline drain {expr.StageId} was visited outside a producer or consumer role."),
+            };
+            foreach (var endpoint in endpoints)
+            {
+                WriteControlLine($"{endpoint}.pipe.wait_drained()");
+            }
+
+            return default;
+        }
+
+        protected override Unit VisitPipelineHandoff(PipelineHandoff expr)
+        {
+            var handoff = (_activePipelineRegion
+                ?? throw new InvalidOperationException(
+                    $"Pipeline handoff {expr.HandoffId} is not enclosed by a producer/consumer region."))
+                .GetHandoff(expr.HandoffId);
+            switch (_pipelineRole)
+            {
+                case PipelineExecutionRole.Consumer:
+                    WriteControlLine($"{handoff.WriterName}.commit(0)");
+                    break;
+                case PipelineExecutionRole.Producer:
+                    WriteControlLine($"{handoff.ReaderName}.wait(0)");
+                    break;
+                default:
+                    throw new InvalidOperationException(
+                        $"Pipeline handoff {expr.HandoffId} was visited outside a producer or consumer role.");
+            }
+
+            return default;
+        }
+
+        private string RenderPipelineRole(
+            Sequential body,
+            PipelineExecutionRole role)
+        {
+            var previousBody = _body;
+            var previousIndent = _bodyIndent;
+            var previousRole = _pipelineRole;
+            _body = new StringBuilder();
+            _bodyIndent = 0;
+            _pipelineRole = role;
+            try
+            {
+                Visit(body);
+                return _body.ToString().TrimEnd();
+            }
+            finally
+            {
+                _body = previousBody;
+                _bodyIndent = previousIndent;
+                _pipelineRole = previousRole;
+            }
+        }
+
+        private static IReadOnlyList<PipelineStage> CollectPipelineStages(
+            Sequential body)
+        {
+            var stages = new List<PipelineStage>();
+            Collect(body);
+            return stages;
+
+            void Collect(Expr expression)
+            {
+                switch (expression)
+                {
+                    case PipelineStage stage:
+                        stages.Add(stage);
+                        break;
+                    case Sequential sequential:
+                        foreach (var field in sequential.Fields)
+                        {
+                            Collect(field);
+                        }
+
+                        break;
+                }
+            }
+        }
+
+        private static IReadOnlySet<string> CollectPipelineDrainIds(
+            Sequential body)
+        {
+            var drains = new HashSet<string>(StringComparer.Ordinal);
+            Collect(body);
+            return drains;
+
+            void Collect(Expr expression)
+            {
+                switch (expression)
+                {
+                    case PipelineDrain drain:
+                        drains.Add(drain.StageId);
+                        break;
+                    case Sequential sequential:
+                        foreach (var field in sequential.Fields)
+                        {
+                            Collect(field);
+                        }
+
+                        break;
+                }
+            }
+        }
+
+        private static IReadOnlyList<PipelineHandoff> CollectPipelineHandoffs(
+            Sequential body)
+        {
+            var handoffs = new List<PipelineHandoff>();
+            Collect(body);
+            return handoffs;
+
+            void Collect(Expr expression)
+            {
+                switch (expression)
+                {
+                    case PipelineHandoff handoff:
+                        handoffs.Add(handoff);
+                        break;
+                    case Sequential sequential:
+                        foreach (var field in sequential.Fields)
+                        {
+                            Collect(field);
+                        }
+
+                        break;
                 }
             }
         }
@@ -941,6 +1400,16 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
 
         protected override Unit VisitCall(Call expr)
         {
+            if (expr.Metadata.TIRMicroKernel?.WeightPipeline is not null &&
+                (_pipelineRole != PipelineExecutionRole.Consumer ||
+                 _activePipelineStage is null ||
+                 !ReferenceEquals(_activePipelineStage.Operation, expr)))
+            {
+                throw new InvalidOperationException(
+                    $"Weight-pipelined call {expr.Target.GetType().Name} in {_currentFunction.Name} " +
+                    "must be owned by an explicit consumer PipelineStage.");
+            }
+
             var sourceArguments = expr.Arguments.ToArray();
             PyNTTMicroKernelTemplateModel? microKernel = null;
             if (expr.Target is Nncase.TIR.NTT.NTTKernelOp kernelOp)
@@ -1150,7 +1619,8 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 selection.Family,
                 selection.Variant,
                 selection.Parameters,
-                offsets);
+                offsets,
+                selection.WeightPipeline is not null);
         }
 
         private long GetFixedSharedWorkspaceOffsetBytes(
@@ -1208,6 +1678,19 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     "Residual buffer aliases must be materialized as TIR.Buffer descriptors before PyNTT codegen.");
             }
 
+            if (TryGetSingleProducerConsumerRegion(callee.Body, out _))
+            {
+                VisitPipelinePrimFunctionCall(callee, args);
+                return;
+            }
+
+            if (_activePipelineStage is not null)
+            {
+                throw new InvalidOperationException(
+                    $"Pipeline stage {_activePipelineStage.StageId} calls ordinary " +
+                    $"PrimFunction {callee.Name}.");
+            }
+
             var traceLabel = GetPrimFunctionCallTraceLabel(callee.Name);
             var tensorSourceSplitAxes = BuildDeviceFunctionActualTensorSourceSplitAxes(callee, args);
             var (definition, buildResult, wasAdded) = GetOrBuildDeviceFunctionDefinition(callee, tensorSourceSplitAxes);
@@ -1236,6 +1719,152 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             TrackPrimFunctionCallObjectAliases(callee, args, definition);
         }
 
+        private void VisitPipelinePrimFunctionCall(
+            PrimFunction callee,
+            IReadOnlyList<BaseExpr> args)
+        {
+            var pipelineStage = _activePipelineStage
+                ?? throw new InvalidOperationException(
+                    $"Pipeline PrimFunction {callee.Name} must be called from a PipelineStage.");
+            if (!ReferenceEquals(pipelineStage.Operation.Target, callee))
+            {
+                throw new InvalidOperationException(
+                    $"Pipeline stage {pipelineStage.StageId} target does not match {callee.Name}.");
+            }
+
+            var region = _activePipelineRegion
+                ?? throw new InvalidOperationException(
+                    $"Pipeline PrimFunction {callee.Name} is not enclosed by a producer/consumer region.");
+            var stageState = region.GetStage(pipelineStage.StageId);
+            var tensorSourceSplitAxes = BuildDeviceFunctionActualTensorSourceSplitAxes(
+                callee,
+                args);
+            var (definition, buildResult, wasAdded) =
+                GetOrBuildPipelineDeviceFunctionDefinition(
+                    callee,
+                    tensorSourceSplitAxes);
+            _nestedBlockLocalDataPoolBytes = Math.Max(
+                _nestedBlockLocalDataPoolBytes,
+                buildResult.BlockLocalDataPoolBytes);
+            if (wasAdded)
+            {
+                _deviceFunctions.AddRange(buildResult.NestedDeviceFunctions);
+                _deviceFunctions.Add(buildResult.ConsumerFunction);
+                _deviceFunctions.Add(buildResult.ProducerFunction);
+                _helperCalls.AddRange(buildResult.HelperCalls);
+                foreach (var opKind in buildResult.OpKinds)
+                {
+                    _opKinds.Add(opKind);
+                }
+
+                if (buildResult.RequiresGridBarrier)
+                {
+                    _attrs["requires_grid_barrier"] = true;
+                }
+            }
+
+            switch (_pipelineRole)
+            {
+                case PipelineExecutionRole.Consumer:
+                    var consumerValues = BuildDeviceFunctionInvocationBindings(
+                        callee,
+                        args,
+                        definition.Name,
+                        definition.Parameters,
+                        buildResult.FormalHostTensorDescriptors,
+                        buildResult.FormalObjectFieldStorages);
+                    if (!consumerValues.TryGetValue(
+                            definition.SharedBaseOffsetParameter,
+                            out var actualSharedBaseOffset))
+                    {
+                        throw new InvalidOperationException(
+                            $"Pipeline call to {callee.Name} did not bind Shared base " +
+                            $"{definition.SharedBaseOffsetParameter}.");
+                    }
+
+                    if (!stageState.IsBound)
+                    {
+                        stageState.BindPipeline(
+                            definition,
+                            actualSharedBaseOffset,
+                            consumerValues);
+                    }
+                    else if (!ReferenceEquals(stageState.PipelineDefinition, definition))
+                    {
+                        throw new InvalidOperationException(
+                            $"Pipeline stage {pipelineStage.StageId} was bound to " +
+                            "incompatible device functions.");
+                    }
+
+                    AddEndpointBindings(
+                        consumerValues,
+                        stageState.ConsumerEndpointBindings,
+                        pipelineStage.StageId);
+                    var consumerArguments = OrderDeviceFunctionInvocationArguments(
+                        callee,
+                        buildResult.ConsumerFunction,
+                        consumerValues);
+                    var traceLabel = GetPrimFunctionCallTraceLabel(callee.Name);
+                    WriteTraceMarker($"begin_function:{traceLabel}");
+                    WriteControlLine(BuildDeviceFunctionCallPlaceholder(
+                        buildResult.ConsumerFunction.Name,
+                        consumerArguments));
+                    WriteTraceMarker($"end_function:{traceLabel}");
+                    TrackPrimFunctionCallTensorOutputs(callee, args);
+                    TrackPrimFunctionCallObjectAliases(
+                        callee,
+                        args,
+                        definition.Name,
+                        definition.Parameters,
+                        buildResult.FormalObjectOutputAliases);
+                    break;
+                case PipelineExecutionRole.Producer:
+                    if (!stageState.IsBound ||
+                        !ReferenceEquals(stageState.PipelineDefinition, definition))
+                    {
+                        throw new InvalidOperationException(
+                            $"Producer pipeline stage {pipelineStage.StageId} was not " +
+                            "bound by its consumer traversal.");
+                    }
+
+                    var producerValues = new Dictionary<string, string>(
+                        stageState.InvocationBindings,
+                        StringComparer.Ordinal);
+                    AddEndpointBindings(
+                        producerValues,
+                        stageState.ProducerEndpointBindings,
+                        pipelineStage.StageId);
+                    var producerArguments = OrderDeviceFunctionInvocationArguments(
+                        callee,
+                        buildResult.ProducerFunction,
+                        producerValues);
+                    WriteControlLine(BuildDeviceFunctionCallPlaceholder(
+                        buildResult.ProducerFunction.Name,
+                        producerArguments));
+                    break;
+                default:
+                    throw new InvalidOperationException(
+                        $"Pipeline PrimFunction {callee.Name} was called outside a " +
+                        "producer or consumer role.");
+            }
+        }
+
+        private static void AddEndpointBindings(
+            IDictionary<string, string> values,
+            IReadOnlyDictionary<string, string> endpointBindings,
+            string stageId)
+        {
+            foreach (var (formal, actual) in endpointBindings)
+            {
+                if (!values.TryAdd(formal, actual))
+                {
+                    throw new InvalidOperationException(
+                        $"Pipeline stage {stageId} endpoint {formal} conflicts with " +
+                        "an ordinary device-function ABI parameter.");
+                }
+            }
+        }
+
         private (DeviceFunctionDefinition Definition, DeviceFunctionBuildResult BuildResult, bool WasAdded) GetOrBuildDeviceFunctionDefinition(
             PrimFunction callee,
             IReadOnlyDictionary<IVar, int[][]> tensorSourceSplitAxes)
@@ -1247,6 +1876,13 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             }
 
             var deviceFunctionName = GetDeviceFunctionName(_function.Name, callee.Name);
+
+            if (_pipelineDeviceFunctionDefinitionsByName.ContainsKey(deviceFunctionName))
+            {
+                throw new InvalidOperationException(
+                    $"PyNTT device function {deviceFunctionName} cannot be both " +
+                    "producer/consumer and ordinary.");
+            }
 
             if (_deviceFunctionDefinitionsByName.TryGetValue(deviceFunctionName, out var existingByName))
             {
@@ -1277,46 +1913,11 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             {
                 var formalPlan = BuildDeviceFunctionFormalPlan(callee, deviceFunctionName, tensorSourceSplitAxes);
                 var calleeOutputs = GetOutputInfos(callee);
-                var deviceAbiState = new KernelAbiState(
-                    _inputNames,
-                    _kvCacheFieldInputs,
-                    _runtimeScalarNames,
-                    _abiViewStrideArgNames,
-                    _bufferInputIndices,
-                    _abiBufferMemo,
-                    new HashSet<int>(),
-                    new DistributedType?[calleeOutputs.Length],
-                    new Dictionary<int, int>(),
-                    _activePrimFunctionCalls,
-                    _activeDeviceFunctionNames,
-                    _deviceFunctionDefinitions,
-                    _deviceFunctionDefinitionsByName);
-                var deviceFunction = new PyNTTPrimFunctionSourceVisitor(
-                    _function,
-                    callee.Body,
-                    formalPlan.ParameterNames,
-                    calleeOutputs,
-                    _targetOptions,
-                    deviceAbiState,
+                var deviceFunction = CreateDeviceFunctionVisitor(
+                    callee,
                     deviceFunctionName,
-                    validateOutputs: false,
-                    currentFunction: callee,
-                    formalTensorParameterBaseNames: formalPlan.TensorBaseNames,
-                    formalTensorParameterPoolStrideNames: formalPlan.TensorPoolStrideNames,
-                    formalTensorParameterPoolScopeSizeNames: formalPlan.TensorPoolScopeSizeNames,
-                    formalTensorParameterDimensions: formalPlan.TensorDimensions,
-                    formalTensorParameterGlobalOffsets: formalPlan.TensorGlobalOffsets,
-                    formalTensorParameterSourceSplitAxes: formalPlan.TensorSourceSplitAxes,
-                    formalDimParameterNames: formalPlan.DimParameterNames,
-                    formalObjectParameterBaseNames: formalPlan.ObjectBaseNames,
-                    formalWorkspaceParameters: formalPlan.WorkspaceParameters,
-                    extraWorkspaceBaseNames: formalPlan.ExtraParameters,
-                    extraPointerParameterTritonTypes: formalPlan.ExtraPointerParameterTritonTypes,
-                    extraParameterAnnotations: formalPlan.ExtraParameterAnnotations,
-                    dataBaseName: formalPlan.DataBaseName,
-                    chipLocalDataBaseName: formalPlan.ChipLocalDataBaseName,
-                    blockLocalDataBaseName: formalPlan.BlockLocalDataBaseName,
-                    sharedBaseOffsetBytes: formalPlan.SharedBaseOffsetBytes)
+                    formalPlan,
+                    calleeOutputs)
                     .BuildDeviceFunction(deviceFunctionName, new Dictionary<string, string>(StringComparer.Ordinal), new Dictionary<string, string>(StringComparer.Ordinal));
 
                 var definition = new DeviceFunctionDefinition(deviceFunctionName, deviceFunction, formalPlan.Parameters, formalPlan.TensorSourceSplitAxes);
@@ -1338,40 +1939,207 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             }
         }
 
+        private (PipelineDeviceFunctionDefinition Definition, PipelineDeviceFunctionBuildResult BuildResult, bool WasAdded)
+            GetOrBuildPipelineDeviceFunctionDefinition(
+                PrimFunction callee,
+                IReadOnlyDictionary<IVar, int[][]> tensorSourceSplitAxes)
+        {
+            if (_pipelineDeviceFunctionDefinitions.TryGetValue(callee, out var existing))
+            {
+                ValidateCompatibleTensorSourceSplitAxes(
+                    callee,
+                    tensorSourceSplitAxes,
+                    existing.Name,
+                    existing.Parameters,
+                    existing.TensorSourceSplitAxes);
+                return (existing, existing.BuildResult, false);
+            }
+
+            var deviceFunctionName = GetDeviceFunctionName(_function.Name, callee.Name);
+            if (_pipelineDeviceFunctionDefinitionsByName.TryGetValue(
+                    deviceFunctionName,
+                    out var existingByName))
+            {
+                ValidateCompatibleDeviceFunctionDefinition(
+                    callee,
+                    existingByName.Name,
+                    existingByName.Parameters);
+                ValidateCompatibleTensorSourceSplitAxes(
+                    callee,
+                    tensorSourceSplitAxes,
+                    existingByName.Name,
+                    existingByName.Parameters,
+                    existingByName.TensorSourceSplitAxes);
+                _pipelineDeviceFunctionDefinitions.Add(callee, existingByName);
+                return (existingByName, existingByName.BuildResult, false);
+            }
+
+            if (_deviceFunctionDefinitionsByName.ContainsKey(deviceFunctionName))
+            {
+                throw new InvalidOperationException(
+                    $"PyNTT device function {deviceFunctionName} cannot be both " +
+                    "ordinary and producer/consumer.");
+            }
+
+            var addedActiveFunction = _activePrimFunctionCalls.Add(callee);
+            var addedActiveName = _activeDeviceFunctionNames.Add(deviceFunctionName);
+            if (!addedActiveFunction || !addedActiveName)
+            {
+                if (addedActiveFunction)
+                {
+                    _activePrimFunctionCalls.Remove(callee);
+                }
+
+                if (addedActiveName)
+                {
+                    _activeDeviceFunctionNames.Remove(deviceFunctionName);
+                }
+
+                throw new NotSupportedException(
+                    $"PyNTT PrimFunction call graph contains a recursive call involving {callee.Name}.");
+            }
+
+            try
+            {
+                var formalPlan = BuildDeviceFunctionFormalPlan(
+                    callee,
+                    deviceFunctionName,
+                    tensorSourceSplitAxes);
+                if (IsZeroOffset(formalPlan.SharedBaseOffsetBytes))
+                {
+                    throw new InvalidOperationException(
+                        $"Pipeline PrimFunction {callee.Name} has no Shared workspace ABI.");
+                }
+
+                var calleeOutputs = GetOutputInfos(callee);
+                var buildResult = CreateDeviceFunctionVisitor(
+                        callee,
+                        deviceFunctionName,
+                        formalPlan,
+                        calleeOutputs)
+                    .BuildPipelineDeviceFunctions(
+                        deviceFunctionName,
+                        new Dictionary<string, string>(StringComparer.Ordinal),
+                        new Dictionary<string, string>(StringComparer.Ordinal));
+                var definition = new PipelineDeviceFunctionDefinition(
+                    deviceFunctionName,
+                    buildResult,
+                    formalPlan.Parameters,
+                    formalPlan.TensorSourceSplitAxes,
+                    formalPlan.SharedBaseOffsetBytes);
+                _pipelineDeviceFunctionDefinitions.Add(callee, definition);
+                _pipelineDeviceFunctionDefinitionsByName.Add(
+                    deviceFunctionName,
+                    definition);
+                return (definition, buildResult, true);
+            }
+            finally
+            {
+                if (addedActiveFunction)
+                {
+                    _activePrimFunctionCalls.Remove(callee);
+                }
+
+                if (addedActiveName)
+                {
+                    _activeDeviceFunctionNames.Remove(deviceFunctionName);
+                }
+            }
+        }
+
+        private PyNTTPrimFunctionSourceVisitor CreateDeviceFunctionVisitor(
+            PrimFunction callee,
+            string deviceFunctionName,
+            DeviceFunctionFormalPlan formalPlan,
+            OutputInfo[] calleeOutputs)
+        {
+            var deviceAbiState = new KernelAbiState(
+                _inputNames,
+                _kvCacheFieldInputs,
+                _runtimeScalarNames,
+                _abiViewStrideArgNames,
+                _bufferInputIndices,
+                _abiBufferMemo,
+                new HashSet<int>(),
+                new DistributedType?[calleeOutputs.Length],
+                new Dictionary<int, int>(),
+                _activePrimFunctionCalls,
+                _activeDeviceFunctionNames,
+                _deviceFunctionDefinitions,
+                _deviceFunctionDefinitionsByName,
+                _pipelineDeviceFunctionDefinitions,
+                _pipelineDeviceFunctionDefinitionsByName);
+            return new PyNTTPrimFunctionSourceVisitor(
+                _function,
+                callee.Body,
+                formalPlan.ParameterNames,
+                calleeOutputs,
+                _targetOptions,
+                deviceAbiState,
+                deviceFunctionName,
+                validateOutputs: false,
+                currentFunction: callee,
+                formalTensorParameterBaseNames: formalPlan.TensorBaseNames,
+                formalTensorParameterPoolStrideNames: formalPlan.TensorPoolStrideNames,
+                formalTensorParameterPoolScopeSizeNames: formalPlan.TensorPoolScopeSizeNames,
+                formalTensorParameterDimensions: formalPlan.TensorDimensions,
+                formalTensorParameterGlobalOffsets: formalPlan.TensorGlobalOffsets,
+                formalTensorParameterSourceSplitAxes: formalPlan.TensorSourceSplitAxes,
+                formalDimParameterNames: formalPlan.DimParameterNames,
+                formalObjectParameterBaseNames: formalPlan.ObjectBaseNames,
+                formalWorkspaceParameters: formalPlan.WorkspaceParameters,
+                extraWorkspaceBaseNames: formalPlan.ExtraParameters,
+                extraPointerParameterTritonTypes: formalPlan.ExtraPointerParameterTritonTypes,
+                extraParameterAnnotations: formalPlan.ExtraParameterAnnotations,
+                dataBaseName: formalPlan.DataBaseName,
+                chipLocalDataBaseName: formalPlan.ChipLocalDataBaseName,
+                blockLocalDataBaseName: formalPlan.BlockLocalDataBaseName,
+                sharedBaseOffsetBytes: formalPlan.SharedBaseOffsetBytes);
+        }
+
         private static void ValidateCompatibleDeviceFunctionDefinition(PrimFunction callee, DeviceFunctionDefinition existing)
+            => ValidateCompatibleDeviceFunctionDefinition(
+                callee,
+                existing.Name,
+                existing.Parameters);
+
+        private static void ValidateCompatibleDeviceFunctionDefinition(
+            PrimFunction callee,
+            string existingName,
+            IReadOnlyList<DeviceFunctionFormalParameter> existingParameters)
         {
             var parameters = callee.Parameters.ToArray();
-            if (parameters.Length != existing.Parameters.Count)
+            if (parameters.Length != existingParameters.Count)
             {
-                throw new NotSupportedException($"PyNTT device function name collision for {existing.Name}: existing ABI has {existing.Parameters.Count} parameters, but PrimFunction {callee.Name} has {parameters.Length}.");
+                throw new NotSupportedException($"PyNTT device function name collision for {existingName}: existing ABI has {existingParameters.Count} parameters, but PrimFunction {callee.Name} has {parameters.Length}.");
             }
 
             for (var i = 0; i < parameters.Length; i++)
             {
                 var parameter = parameters[i];
-                var existingParameter = existing.Parameters[i];
+                var existingParameter = existingParameters[i];
                 var kind = GetDeviceFunctionFormalParameterKind(parameter);
                 if (kind != existingParameter.Kind)
                 {
-                    throw new NotSupportedException($"PyNTT device function name collision for {existing.Name}: parameter {i} has kind {kind}, but existing ABI has {existingParameter.Kind}.");
+                    throw new NotSupportedException($"PyNTT device function name collision for {existingName}: parameter {i} has kind {kind}, but existing ABI has {existingParameter.Kind}.");
                 }
 
                 if (!string.Equals(parameter.Name, existingParameter.Parameter.Name, StringComparison.Ordinal))
                 {
-                    throw new NotSupportedException($"PyNTT device function name collision for {existing.Name}: parameter {i} is named {parameter.Name}, but existing ABI uses {existingParameter.Parameter.Name}.");
+                    throw new NotSupportedException($"PyNTT device function name collision for {existingName}: parameter {i} is named {parameter.Name}, but existing ABI uses {existingParameter.Parameter.Name}.");
                 }
 
                 var parameterType = CompilerServices.Print(parameter.CheckedType);
                 var existingType = CompilerServices.Print(existingParameter.Parameter.CheckedType);
                 if (!string.Equals(parameterType, existingType, StringComparison.Ordinal))
                 {
-                    throw new NotSupportedException($"PyNTT device function name collision for {existing.Name}: parameter {parameter.Name} has type {parameterType}, but existing ABI uses {existingType}.");
+                    throw new NotSupportedException($"PyNTT device function name collision for {existingName}: parameter {parameter.Name} has type {parameterType}, but existing ABI uses {existingType}.");
                 }
 
                 if (parameter is BufferVar { Role: BufferVarRole.Workspace } workspace &&
                     existingParameter.WorkspaceLocation != workspace.Location)
                 {
-                    throw new NotSupportedException($"PyNTT device function name collision for {existing.Name}: workspace parameter {parameter.Name} uses {workspace.Location}, but existing ABI uses {existingParameter.WorkspaceLocation}.");
+                    throw new NotSupportedException($"PyNTT device function name collision for {existingName}: workspace parameter {parameter.Name} uses {workspace.Location}, but existing ABI uses {existingParameter.WorkspaceLocation}.");
                 }
 
                 if (parameter is BufferVar bufferVar &&
@@ -1379,7 +2147,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     bufferVar.LayoutAnnotation != existingBufferVar.LayoutAnnotation)
                 {
                     throw new NotSupportedException(
-                        $"PyNTT device function name collision for {existing.Name}: parameter {parameter.Name} uses layout {bufferVar.LayoutAnnotation}, " +
+                        $"PyNTT device function name collision for {existingName}: parameter {parameter.Name} uses layout {bufferVar.LayoutAnnotation}, " +
                         $"but existing ABI uses {existingBufferVar.LayoutAnnotation}.");
                 }
             }
@@ -1389,6 +2157,19 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             PrimFunction callee,
             IReadOnlyDictionary<IVar, int[][]> requested,
             DeviceFunctionDefinition existing)
+            => ValidateCompatibleTensorSourceSplitAxes(
+                callee,
+                requested,
+                existing.Name,
+                existing.Parameters,
+                existing.TensorSourceSplitAxes);
+
+        private static void ValidateCompatibleTensorSourceSplitAxes(
+            PrimFunction callee,
+            IReadOnlyDictionary<IVar, int[][]> requested,
+            string existingName,
+            IReadOnlyList<DeviceFunctionFormalParameter> existingParameters,
+            IReadOnlyDictionary<IVar, int[][]> existingTensorSourceSplitAxes)
         {
             var parameters = callee.Parameters.ToArray();
             var matchedParameterCount = 0;
@@ -1401,15 +2182,15 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 }
 
                 matchedParameterCount++;
-                var existingParameter = existing.Parameters[index].Parameter;
-                if (!existing.TensorSourceSplitAxes.TryGetValue(existingParameter, out var existingSplitAxes))
+                var existingParameter = existingParameters[index].Parameter;
+                if (!existingTensorSourceSplitAxes.TryGetValue(existingParameter, out var existingSplitAxes))
                 {
-                    throw new NotSupportedException($"PyNTT device function {existing.Name} has no tensor source split metadata for ABI parameter {index} ({parameter.Name}) in PrimFunction {callee.Name}.");
+                    throw new NotSupportedException($"PyNTT device function {existingName} has no tensor source split metadata for ABI parameter {index} ({parameter.Name}) in PrimFunction {callee.Name}.");
                 }
 
                 if (!AreSplitAxesEqual(requestedSplitAxes, existingSplitAxes))
                 {
-                    throw new NotSupportedException($"PyNTT device function {existing.Name} for PrimFunction {callee.Name} is called with incompatible source sharding for ABI parameter {index} ({parameter.Name}): existing {FormatSplitAxes(existingSplitAxes)}, requested {FormatSplitAxes(requestedSplitAxes)}.");
+                    throw new NotSupportedException($"PyNTT device function {existingName} for PrimFunction {callee.Name} is called with incompatible source sharding for ABI parameter {index} ({parameter.Name}): existing {FormatSplitAxes(existingSplitAxes)}, requested {FormatSplitAxes(requestedSplitAxes)}.");
                 }
             }
 
@@ -1701,19 +2482,32 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
         }
 
         private void TrackPrimFunctionCallObjectAliases(PrimFunction callee, IReadOnlyList<BaseExpr> args, DeviceFunctionDefinition definition)
+            => TrackPrimFunctionCallObjectAliases(
+                callee,
+                args,
+                definition.Name,
+                definition.Parameters,
+                definition.BuildResult.FormalObjectOutputAliases);
+
+        private void TrackPrimFunctionCallObjectAliases(
+            PrimFunction callee,
+            IReadOnlyList<BaseExpr> args,
+            string definitionName,
+            IReadOnlyList<DeviceFunctionFormalParameter> definitionParameters,
+            IReadOnlyDictionary<int, string> formalObjectOutputAliases)
         {
-            if (definition.BuildResult.FormalObjectOutputAliases.Count == 0)
+            if (formalObjectOutputAliases.Count == 0)
             {
                 return;
             }
 
             var parameters = callee.Parameters.ToArray();
             var outputs = PyNTTFunctionOutputs.GetOutputParameters(callee);
-            foreach (var pair in definition.BuildResult.FormalObjectOutputAliases)
+            foreach (var pair in formalObjectOutputAliases)
             {
                 if ((uint)pair.Key >= (uint)outputs.Length)
                 {
-                    throw new NotSupportedException($"PyNTT device function {definition.Name} reports object output alias index {pair.Key}, but {callee.Name} only has {outputs.Length} outputs.");
+                    throw new NotSupportedException($"PyNTT device function {definitionName} reports object output alias index {pair.Key}, but {callee.Name} only has {outputs.Length} outputs.");
                 }
 
                 var outputParameter = outputs[pair.Key];
@@ -1723,12 +2517,12 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     throw new NotSupportedException($"PyNTT cannot find output parameter {outputParameter.Name} in PrimFunction {callee.Name}.");
                 }
 
-                var sourceParameter = definition.Parameters.SingleOrDefault(parameter =>
+                var sourceParameter = definitionParameters.SingleOrDefault(parameter =>
                     parameter.Kind == DeviceFunctionFormalParameterKind.Object &&
                     string.Equals(parameter.ObjectBaseName, pair.Value, StringComparison.Ordinal));
                 if (sourceParameter is null)
                 {
-                    throw new NotSupportedException($"PyNTT device function {definition.Name} reports object output {outputParameter.Name} aliases unknown formal object {pair.Value}.");
+                    throw new NotSupportedException($"PyNTT device function {definitionName} reports object output {outputParameter.Name} aliases unknown formal object {pair.Value}.");
                 }
 
                 VisitObjectAssignment(
@@ -1762,14 +2556,35 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
 
         private string[] BuildDeviceFunctionInvocationArguments(PrimFunction callee, IReadOnlyList<BaseExpr> args, DeviceFunctionDefinition definition)
         {
+            var values = BuildDeviceFunctionInvocationBindings(
+                callee,
+                args,
+                definition.Name,
+                definition.Parameters,
+                definition.BuildResult.FormalHostTensorDescriptors,
+                definition.BuildResult.FormalObjectFieldStorages);
+            return OrderDeviceFunctionInvocationArguments(
+                callee,
+                definition.BuildResult.Function,
+                values);
+        }
+
+        private Dictionary<string, string> BuildDeviceFunctionInvocationBindings(
+            PrimFunction callee,
+            IReadOnlyList<BaseExpr> args,
+            string definitionName,
+            IReadOnlyList<DeviceFunctionFormalParameter> definitionParameters,
+            IReadOnlyList<FormalHostTensorDescriptorRequirement> formalHostTensorDescriptors,
+            IReadOnlyDictionary<string, PyNTTKVCacheStorageMetadata?> formalObjectFieldStorages)
+        {
             var values = new Dictionary<string, string>(StringComparer.Ordinal)
             {
-                [$"{definition.Name}_data"] = _dataBaseName,
-                [$"{definition.Name}_chip_local_data"] = _chipLocalDataBaseName,
-                [$"{definition.Name}_block_local_data"] = _blockLocalDataBaseName,
+                [$"{definitionName}_data"] = _dataBaseName,
+                [$"{definitionName}_chip_local_data"] = _chipLocalDataBaseName,
+                [$"{definitionName}_block_local_data"] = _blockLocalDataBaseName,
                 [SharedArenaId] = SharedArenaId,
             };
-            foreach (var parameter in definition.Parameters)
+            foreach (var parameter in definitionParameters)
             {
                 var argument = NormalizeParameterAlias(parameter.Parameter, ResolveBoundExpression(args[parameter.Index]));
                 switch (parameter.Kind)
@@ -1777,23 +2592,23 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     case DeviceFunctionFormalParameterKind.Workspace:
                         if (parameter.WorkspaceLocation is not { } workspaceLocation)
                         {
-                            throw new NotSupportedException($"PyNTT device function {definition.Name} workspace parameter {parameter.Parameter.Name} is missing its memory location.");
+                            throw new NotSupportedException($"PyNTT device function {definitionName} workspace parameter {parameter.Parameter.Name} is missing its memory location.");
                         }
 
                         values[workspaceLocation switch
                         {
-                            MemoryLocation.Data => $"{definition.Name}_data",
-                            MemoryLocation.ChipLocalData => $"{definition.Name}_chip_local_data",
-                            MemoryLocation.BlockLocalData => $"{definition.Name}_block_local_data",
-                            MemoryLocation.Shared => $"{definition.Name}_shared_offset_bytes",
+                            MemoryLocation.Data => $"{definitionName}_data",
+                            MemoryLocation.ChipLocalData => $"{definitionName}_chip_local_data",
+                            MemoryLocation.BlockLocalData => $"{definitionName}_block_local_data",
+                            MemoryLocation.Shared => $"{definitionName}_shared_offset_bytes",
                             var location => throw new NotSupportedException($"PyNTT call to {callee.Name} workspace parameter {parameter.Parameter.Name} cannot use memory location {location}."),
                         }] = BuildWorkspaceArgumentExpression(callee, (BufferVar)parameter.Parameter, argument);
                         break;
                     case DeviceFunctionFormalParameterKind.Tensor:
                         var buffer = GetBufferOperand(argument, $"PyNTT call to {callee.Name} tensor parameter {parameter.Parameter.Name}");
-                        values[RequireParameterName(parameter.BaseName, definition.Name, parameter.Parameter.Name)] = BuildFormalTensorBasePointerArgument(buffer);
-                        values[RequireParameterName(parameter.PoolStrideName, definition.Name, parameter.Parameter.Name)] = BuildFormalTensorPoolStrideElementsArgument(buffer);
-                        values[RequireParameterName(parameter.PoolScopeSizeName, definition.Name, parameter.Parameter.Name)] = BuildFormalTensorPoolScopeSizeArgument(buffer);
+                        values[RequireParameterName(parameter.BaseName, definitionName, parameter.Parameter.Name)] = BuildFormalTensorBasePointerArgument(buffer);
+                        values[RequireParameterName(parameter.PoolStrideName, definitionName, parameter.Parameter.Name)] = BuildFormalTensorPoolStrideElementsArgument(buffer);
+                        values[RequireParameterName(parameter.PoolScopeSizeName, definitionName, parameter.Parameter.Name)] = BuildFormalTensorPoolScopeSizeArgument(buffer);
                         if (parameter.StrideNames.Length != 0)
                         {
                             var strides = GetBufferStrides(buffer);
@@ -1838,12 +2653,12 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
 
                         break;
                     case DeviceFunctionFormalParameterKind.Scalar:
-                        values[RequireParameterName(parameter.ScalarName, definition.Name, parameter.Parameter.Name)] = BuildScalarExpression(argument);
+                        values[RequireParameterName(parameter.ScalarName, definitionName, parameter.Parameter.Name)] = BuildScalarExpression(argument);
                         break;
                     case DeviceFunctionFormalParameterKind.Object:
-                        var objectBaseName = RequireParameterName(parameter.ObjectBaseName, definition.Name, parameter.Parameter.Name);
+                        var objectBaseName = RequireParameterName(parameter.ObjectBaseName, definitionName, parameter.Parameter.Name);
                         var prefix = objectBaseName + "_";
-                        foreach (var pair in definition.BuildResult.FormalObjectFieldStorages)
+                        foreach (var pair in formalObjectFieldStorages)
                         {
                             if (!pair.Key.StartsWith(prefix, StringComparison.Ordinal))
                             {
@@ -1860,12 +2675,12 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 }
             }
 
-            foreach (var descriptor in definition.BuildResult.FormalHostTensorDescriptors)
+            foreach (var descriptor in formalHostTensorDescriptors)
             {
                 if ((uint)descriptor.ParameterIndex >= (uint)args.Count)
                 {
                     throw new InvalidOperationException(
-                        $"PyNTT device function {definition.Name} host descriptor {descriptor.Name} " +
+                        $"PyNTT device function {definitionName} host descriptor {descriptor.Name} " +
                         $"references parameter {descriptor.ParameterIndex}, but {callee.Name} has {args.Count} arguments.");
                 }
 
@@ -1878,7 +2693,14 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     $"{descriptor.Name}__binding{_hostTensorDescriptors.Count.ToString(CultureInfo.InvariantCulture)}");
             }
 
-            return definition.BuildResult.Function.ExtraParameters
+            return values;
+        }
+
+        private static string[] OrderDeviceFunctionInvocationArguments(
+            PrimFunction callee,
+            DeviceFunctionRenderSpec function,
+            IReadOnlyDictionary<string, string> values)
+            => function.ExtraParameters
                 .Select(declaration =>
                 {
                     var parameter = GetParameterNameFromDeclaration(declaration);
@@ -1890,7 +2712,6 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     return value;
                 })
                 .ToArray();
-        }
 
         private static string GetParameterNameFromDeclaration(string declaration)
             => declaration.Split(':', 2, StringSplitOptions.TrimEntries)[0];
@@ -3877,11 +4698,10 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 LoadCExpression = loadCExpression,
             };
 
-            WriteHelperTemplate(
-                GetMicroKernelTemplatePath(microKernel),
+            WriteSelectedMicroKernelHelper(
+                microKernel,
                 templateModel,
-                usesSharedArena: UsesSharedArena(microKernel));
-            WriteHelperInvocation(helperName);
+                helperName);
         }
 
         private void VisitQKVParallelLinear(
@@ -4039,8 +4859,10 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 microKernel,
                 $"{input.Name}, ({qWeight.Name}, {kWeight.Name}, {vWeight.Name}) -> ({qOutput.Name}, {kOutput.Name}, {vOutput.Name})");
 
-            WriteHelperTemplate(GetMicroKernelTemplatePath(microKernel), templateModel, usesSharedArena: UsesSharedArena(microKernel));
-            WriteLine(BuildHelperCall(helperName));
+            WriteSelectedMicroKernelHelper(
+                microKernel,
+                templateModel,
+                helperName);
         }
 
         private void VisitPackedQKVParallelLinear(
@@ -4274,8 +5096,10 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 VWeightDescriptorName = vWeightDescriptorName,
             };
 
-            WriteHelperTemplate(GetMicroKernelTemplatePath(microKernel), templateModel, usesSharedArena: UsesSharedArena(microKernel));
-            WriteLine(BuildHelperCall(helperName));
+            WriteSelectedMicroKernelHelper(
+                microKernel,
+                templateModel,
+                helperName);
         }
 
         private void VisitMatMulGlu(
@@ -4393,8 +5217,10 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 microKernel,
                 $"{input.Name}, ({gateWeight.Name}, {upWeight.Name}) -> {output.Name}");
 
-            WriteHelperTemplate(GetMicroKernelTemplatePath(microKernel), templateModel, usesSharedArena: UsesSharedArena(microKernel));
-            WriteLine(BuildHelperCall(helperName));
+            WriteSelectedMicroKernelHelper(
+                microKernel,
+                templateModel,
+                helperName);
         }
 
         private void VisitPackedMatMulGlu(
@@ -4573,8 +5399,10 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 UpWeightDescriptorName = upWeightDescriptorName,
             };
 
-            WriteHelperTemplate(GetMicroKernelTemplatePath(microKernel), templateModel, usesSharedArena: UsesSharedArena(microKernel));
-            WriteLine(BuildHelperCall(helperName));
+            WriteSelectedMicroKernelHelper(
+                microKernel,
+                templateModel,
+                helperName);
         }
 
         private static void ValidateMatMulGluProjectionShape(
@@ -5045,15 +5873,57 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 LoadCExpression = loadCExpression,
             };
 
-            WriteHelperTemplate(
-                GetMicroKernelTemplatePath(microKernel),
+            WriteSelectedMicroKernelHelper(
+                microKernel,
                 templateModel,
-                usesSharedArena: UsesSharedArena(microKernel));
-            WriteHelperInvocation(helperName);
+                helperName);
         }
 
         private static bool IsGemvMatmul(IReadOnlyList<PyNTTDimExpression> outputShape)
             => outputShape.Count >= 2 && outputShape[^2].MaxValue == 1;
+
+        private void WriteSelectedMicroKernelHelper(
+            PyNTTMicroKernelTemplateModel microKernel,
+            object templateModel,
+            string helperName)
+        {
+            var templatePath = GetMicroKernelTemplatePath(microKernel);
+            if (!microKernel.HasWeightPipeline)
+            {
+                WriteHelperTemplate(
+                    templatePath,
+                    templateModel,
+                    usesSharedArena: UsesSharedArena(microKernel));
+                WriteLine(BuildHelperCall(helperName));
+                return;
+            }
+
+            if (_pipelineRole != PipelineExecutionRole.Consumer ||
+                _activePipelineStage is null ||
+                _activePipelineRegion is null)
+            {
+                throw new InvalidOperationException(
+                    $"Weight-pipelined microkernel {microKernel.Family}/{microKernel.Variant} " +
+                    $"must be emitted from an explicit consumer PipelineStage.");
+            }
+
+            var stage = _activePipelineRegion.GetStage(_activePipelineStage.StageId);
+            WriteHelperTemplate(
+                templatePath,
+                templateModel,
+                usesSharedArena: false);
+            stage.BindDirect(
+                helperName,
+                templatePath,
+                templateModel,
+                microKernel.SharedWorkspaceOffsets);
+            WriteLine(
+                BuildHelperRoleCall(
+                    helperName,
+                    "consumer",
+                    stage.ReaderName,
+                    recordMetadata: true));
+        }
 
         private static string GetMicroKernelTemplatePath(PyNTTMicroKernelTemplateModel microKernel)
             => (microKernel.Family, microKernel.Variant) switch
@@ -7219,15 +8089,8 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
 
         private string BuildHelperCall(string helperName, params string[] leadingArguments)
         {
-            var helperArguments = _helperArguments.TryGetValue(helperName, out var arguments)
-                ? arguments
-                : Array.Empty<string>();
-            var helperWorkspaceArguments = _helperWorkspaceArguments.TryGetValue(helperName, out var workspaceArguments)
-                ? workspaceArguments
-                : Array.Empty<string>();
-            var helperScalarArguments = _helperScalarArguments.TryGetValue(helperName, out var scalarArguments)
-                ? scalarArguments
-                : Array.Empty<string>();
+            var (helperArguments, helperWorkspaceArguments, helperScalarArguments) =
+                GetHelperCallArguments(helperName);
             var callArguments = leadingArguments.Concat(helperArguments).ToArray();
             _helperCalls.Add(new(helperName, callArguments));
             var args = leadingArguments
@@ -7236,7 +8099,46 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 .Concat(helperWorkspaceArguments)
                 .Concat(helperScalarArguments)
                 .Concat(new[] { "block_size" });
-            return $"{helperName}({string.Join(", ", args)})";
+            var targetName = _pipelineRole == PipelineExecutionRole.Consumer &&
+                _activePipelineRegion is not null
+                ? $"{helperName}__consumer"
+                : helperName;
+            return $"{targetName}({string.Join(", ", args)})";
+        }
+
+        private string BuildHelperRoleCall(
+            string helperName,
+            string role,
+            string endpoint,
+            bool recordMetadata)
+        {
+            var (helperArguments, helperWorkspaceArguments, helperScalarArguments) =
+                GetHelperCallArguments(helperName);
+            if (recordMetadata)
+            {
+                _helperCalls.Add(new(helperName, helperArguments));
+            }
+
+            var args = new[] { endpoint }
+                .Concat(helperArguments)
+                .Concat(helperWorkspaceArguments)
+                .Concat(helperScalarArguments)
+                .Concat(new[] { "block_size" });
+            return $"{helperName}__{role}({string.Join(", ", args)})";
+        }
+
+        private (string[] Arguments, string[] WorkspaceArguments, string[] ScalarArguments)
+            GetHelperCallArguments(string helperName)
+        {
+            if (!_helperArguments.TryGetValue(helperName, out var arguments) ||
+                !_helperWorkspaceArguments.TryGetValue(helperName, out var workspaceArguments) ||
+                !_helperScalarArguments.TryGetValue(helperName, out var scalarArguments))
+            {
+                throw new InvalidOperationException(
+                    $"PyNTT helper {helperName} was invoked before its ABI was registered.");
+            }
+
+            return (arguments, workspaceArguments, scalarArguments);
         }
 
         private void WriteHelperInvocation(string helperName, params string[] leadingArguments)
@@ -7722,6 +8624,30 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             return $"(({lhs}) + ({rhs}))";
         }
 
+        private static string SubstituteIdentifier(
+            string expression,
+            string identifier,
+            string replacement)
+        {
+            if (IsZeroOffset(identifier))
+            {
+                if (!IsZeroOffset(replacement))
+                {
+                    throw new InvalidOperationException(
+                        "A pipeline function without a Shared ABI base cannot be " +
+                        "instantiated at a non-zero Shared offset.");
+                }
+
+                return expression;
+            }
+
+            return Regex.Replace(
+                expression,
+                $@"\b{Regex.Escape(identifier)}\b",
+                _ => $"({replacement})",
+                RegexOptions.CultureInvariant);
+        }
+
         private static string DivideOffsetExpression(string expression, int divisor)
         {
             if (divisor <= 0)
@@ -8040,7 +8966,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             _body.AppendLine(barrierKind switch
             {
                 HelperBarrierKind.Block => "tl.debug_barrier()",
-                HelperBarrierKind.Grid => "tle.distributed_barrier(pyntt_grid_mesh)",
+                HelperBarrierKind.Grid => "tle.distributed_barrier(PYNTT_GRID_MESH)",
                 _ => throw new ArgumentOutOfRangeException(nameof(barrierKind), barrierKind, null),
             });
         }
@@ -8050,17 +8976,25 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             object model,
             bool usesSharedArena = false)
         {
-            var runtimeShapeArgs = CollectHelperScalarArguments(model, _helperScalarNameCandidates);
+            var dependencySource = CollectTransitiveDeviceFunctionDependencySource(model);
+            var runtimeShapeArgs = CollectHelperScalarArguments(
+                dependencySource,
+                _helperScalarNameCandidates);
             var runtimeShapeArgsProperty = model.GetType().GetProperty("RuntimeShapeArgs");
             runtimeShapeArgsProperty?.SetValue(model, runtimeShapeArgs);
 
-            var workspaceArguments = CollectHelperScalarArguments(model, GetCurrentWorkspaceParameterNames())
+            var workspaceArguments = CollectHelperScalarArguments(
+                    dependencySource,
+                    GetCurrentWorkspaceParameterNames())
                 .Concat(usesSharedArena ? new[] { SharedArenaId } : Array.Empty<string>())
                 .Distinct(StringComparer.Ordinal)
                 .ToArray();
             var workspaceArgumentSet = workspaceArguments.ToHashSet(StringComparer.Ordinal);
             var argumentNames = CollectHelperArguments(model)
-                .Concat(CollectHelperScalarArguments(model, _extraWorkspaceBaseNames))
+                .Concat(CollectHelperArguments(dependencySource))
+                .Concat(CollectHelperScalarArguments(
+                    dependencySource,
+                    _extraWorkspaceBaseNames))
                 .Where(argument => !workspaceArgumentSet.Contains(argument))
                 .Distinct(StringComparer.Ordinal)
                 .ToArray();
@@ -8087,6 +9021,111 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             return argumentNames;
         }
 
+        private string CollectTransitiveDeviceFunctionDependencySource(object model)
+        {
+            var source = CollectModelText(model);
+            var result = new StringBuilder(source);
+            var visited = new HashSet<string>(StringComparer.Ordinal);
+            AppendDependencies(source);
+            return result.ToString();
+
+            void AppendDependencies(string bodySource)
+            {
+                foreach (Match match in DeviceFunctionCallNameRegex.Matches(bodySource))
+                {
+                    var functionName = match.Groups["name"].Value;
+                    if (!visited.Add(functionName))
+                    {
+                        continue;
+                    }
+
+                    var function = GetDeviceFunctionRenderSpec(functionName);
+                    result.AppendLine();
+                    result.Append(function.BodySource);
+                    foreach (var helper in function.Helpers)
+                    {
+                        var helperSource = CollectModelText(helper.Model);
+                        result.AppendLine();
+                        result.Append(helperSource);
+                        AppendDependencies(helperSource);
+                    }
+
+                    AppendDependencies(function.BodySource);
+                }
+            }
+        }
+
+        private static string CollectModelText(object model)
+        {
+            var result = new StringBuilder();
+            AppendModelText(JsonSerializer.SerializeToNode(model), result);
+            return result.ToString();
+        }
+
+        private static void AppendModelText(JsonNode? node, StringBuilder result)
+        {
+            switch (node)
+            {
+                case null:
+                    return;
+                case JsonValue value when value.TryGetValue<string>(out var text):
+                    result.AppendLine(text);
+                    return;
+                case JsonValue:
+                    return;
+                case JsonArray array:
+                    foreach (var item in array)
+                    {
+                        AppendModelText(item, result);
+                    }
+
+                    return;
+                case JsonObject obj:
+                    foreach (var property in obj)
+                    {
+                        AppendModelText(property.Value, result);
+                    }
+
+                    return;
+            }
+        }
+
+        private DeviceFunctionRenderSpec GetDeviceFunctionRenderSpec(string functionName)
+        {
+            foreach (var definition in _deviceFunctionDefinitionsByName.Values)
+            {
+                if (string.Equals(
+                        definition.BuildResult.Function.Name,
+                        functionName,
+                        StringComparison.Ordinal))
+                {
+                    return definition.BuildResult.Function;
+                }
+            }
+
+            foreach (var definition in _pipelineDeviceFunctionDefinitionsByName.Values)
+            {
+                if (string.Equals(
+                        definition.BuildResult.ConsumerFunction.Name,
+                        functionName,
+                        StringComparison.Ordinal))
+                {
+                    return definition.BuildResult.ConsumerFunction;
+                }
+
+                if (string.Equals(
+                        definition.BuildResult.ProducerFunction.Name,
+                        functionName,
+                        StringComparison.Ordinal))
+                {
+                    return definition.BuildResult.ProducerFunction;
+                }
+            }
+
+            throw new InvalidOperationException(
+                $"PyNTT helper references unknown device function {functionName}.");
+        }
+
         private string FormatWorkspaceParameterDeclaration(string name)
             => name is "data_pool_stride_bytes" or "block_local_data_pool_stride_bytes"
                 ? $"{name}: tl.constexpr"
@@ -8109,19 +9148,31 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
         {
             var arguments = new HashSet<string>(StringComparer.Ordinal);
             CollectHelperArguments(JsonSerializer.SerializeToNode(model), arguments);
-            return arguments
+            return OrderHelperArguments(arguments);
+        }
+
+        private static string[] CollectHelperArguments(string source)
+        {
+            var arguments = AbiArgumentReferenceRegex.Matches(source)
+                .Select(match => match.Value)
+                .ToHashSet(StringComparer.Ordinal);
+            return OrderHelperArguments(arguments);
+        }
+
+        private static string[] OrderHelperArguments(IEnumerable<string> arguments)
+            => arguments
                 .OrderBy(argument => argument.StartsWith("input", StringComparison.Ordinal) ? 0 : 1)
                 .ThenBy(ParseAbiArgumentIndex)
                 .ThenBy(GetAbiArgumentKind)
                 .ThenBy(argument => argument, StringComparer.Ordinal)
                 .ToArray();
-        }
 
-        private static string[] CollectHelperScalarArguments(object model, IEnumerable<string> candidates)
+        private static string[] CollectHelperScalarArguments(
+            string source,
+            IEnumerable<string> candidates)
         {
-            var text = JsonSerializer.Serialize(model);
             return candidates
-                .Where(candidate => ContainsIdentifier(text, candidate))
+                .Where(candidate => ContainsIdentifier(source, candidate))
                 .Distinct(StringComparer.Ordinal)
                 .ToArray();
         }
@@ -8247,7 +9298,9 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     new HashSet<PrimFunction>(ReferenceEqualityComparer.Instance),
                     new HashSet<string>(StringComparer.Ordinal),
                     new Dictionary<PrimFunction, DeviceFunctionDefinition>(ReferenceEqualityComparer.Instance),
-                    new Dictionary<string, DeviceFunctionDefinition>(StringComparer.Ordinal))
+                    new Dictionary<string, DeviceFunctionDefinition>(StringComparer.Ordinal),
+                    new Dictionary<PrimFunction, PipelineDeviceFunctionDefinition>(ReferenceEqualityComparer.Instance),
+                    new Dictionary<string, PipelineDeviceFunctionDefinition>(StringComparer.Ordinal))
             {
             }
 
@@ -8264,7 +9317,9 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 HashSet<PrimFunction> activePrimFunctionCalls,
                 HashSet<string> activeDeviceFunctionNames,
                 Dictionary<PrimFunction, DeviceFunctionDefinition>? deviceFunctionDefinitions = null,
-                Dictionary<string, DeviceFunctionDefinition>? deviceFunctionDefinitionsByName = null)
+                Dictionary<string, DeviceFunctionDefinition>? deviceFunctionDefinitionsByName = null,
+                Dictionary<PrimFunction, PipelineDeviceFunctionDefinition>? pipelineDeviceFunctionDefinitions = null,
+                Dictionary<string, PipelineDeviceFunctionDefinition>? pipelineDeviceFunctionDefinitionsByName = null)
             {
                 InputNames = inputNames;
                 KVCacheFieldInputs = kvCacheFieldInputs;
@@ -8279,6 +9334,8 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 ActiveDeviceFunctionNames = activeDeviceFunctionNames;
                 DeviceFunctionDefinitions = deviceFunctionDefinitions ?? new Dictionary<PrimFunction, DeviceFunctionDefinition>(ReferenceEqualityComparer.Instance);
                 DeviceFunctionDefinitionsByName = deviceFunctionDefinitionsByName ?? new Dictionary<string, DeviceFunctionDefinition>(StringComparer.Ordinal);
+                PipelineDeviceFunctionDefinitions = pipelineDeviceFunctionDefinitions ?? new Dictionary<PrimFunction, PipelineDeviceFunctionDefinition>(ReferenceEqualityComparer.Instance);
+                PipelineDeviceFunctionDefinitionsByName = pipelineDeviceFunctionDefinitionsByName ?? new Dictionary<string, PipelineDeviceFunctionDefinition>(StringComparer.Ordinal);
             }
 
             public List<string> InputNames { get; }
@@ -8306,6 +9363,10 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             public Dictionary<PrimFunction, DeviceFunctionDefinition> DeviceFunctionDefinitions { get; }
 
             public Dictionary<string, DeviceFunctionDefinition> DeviceFunctionDefinitionsByName { get; }
+
+            public Dictionary<PrimFunction, PipelineDeviceFunctionDefinition> PipelineDeviceFunctionDefinitions { get; }
+
+            public Dictionary<string, PipelineDeviceFunctionDefinition> PipelineDeviceFunctionDefinitionsByName { get; }
         }
 
         private sealed record BufferRef(
@@ -8324,6 +9385,315 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             DistributedType?[] OutputDistributedTypes,
             Dictionary<int, int> OutputAliases,
             Dictionary<int, string> FormalObjectOutputAliases);
+
+        private sealed class PipelineRegionCodegenState
+        {
+            private readonly IReadOnlyList<PipelineStageCodegenState> _stageOrder;
+            private readonly IReadOnlyList<PipelineHandoffCodegenState> _handoffOrder;
+            private readonly IReadOnlyDictionary<string, PipelineStageCodegenState> _stages;
+            private readonly IReadOnlyDictionary<string, PipelineHandoffCodegenState> _handoffs;
+            private readonly IReadOnlySet<string> _drainedStageIds;
+
+            public PipelineRegionCodegenState(
+                IEnumerable<PipelineStageCodegenState> stages,
+                IEnumerable<PipelineHandoffCodegenState> handoffs,
+                IReadOnlySet<string> drainedStageIds)
+            {
+                _stageOrder = stages.ToArray();
+                _handoffOrder = handoffs.ToArray();
+                _stages = ToUniqueDictionary(
+                    _stageOrder,
+                    stage => stage.StageId,
+                    "pipeline stage");
+                _handoffs = ToUniqueDictionary(
+                    _handoffOrder,
+                    handoff => handoff.HandoffId,
+                    "pipeline handoff");
+                _drainedStageIds = drainedStageIds;
+            }
+
+            public IReadOnlyList<PyNTTPipelineStageTemplateModel> PipeStages
+                => _stageOrder
+                    .SelectMany(stage => stage.PipeStages)
+                    .ToArray();
+
+            public IReadOnlyList<PyNTTPipelineHandoffTemplateModel> Handoffs
+                => _stageOrder
+                    .SelectMany(stage => stage.Handoffs)
+                    .Concat(_handoffOrder.Select(handoff => handoff.ToTemplateModel()))
+                    .ToArray();
+
+            public IReadOnlyList<string> ConsumerEndpointNames
+                => PipeStages.Select(stage => stage.ReaderName)
+                    .Concat(Handoffs.Select(handoff => handoff.WriterName))
+                    .ToArray();
+
+            public IReadOnlyList<string> ProducerEndpointNames
+                => PipeStages.Select(stage => stage.WriterName)
+                    .Concat(Handoffs.Select(handoff => handoff.ReaderName))
+                    .ToArray();
+
+            public IReadOnlyList<string> ConsumerDrainEndpointNames
+                => _stageOrder
+                    .Where(stage => !_drainedStageIds.Contains(stage.StageId))
+                    .SelectMany(stage => stage.ConsumerDrainEndpointNames)
+                    .ToArray();
+
+            public IReadOnlyList<string> ProducerDrainEndpointNames
+                => _stageOrder
+                    .Where(stage => !_drainedStageIds.Contains(stage.StageId))
+                    .SelectMany(stage => stage.ProducerDrainEndpointNames)
+                    .ToArray();
+
+            public PipelineStageCodegenState GetStage(string stageId)
+                => _stages.TryGetValue(stageId, out var stage)
+                    ? stage
+                    : throw new InvalidOperationException(
+                        $"Producer/consumer region references unknown pipeline stage {stageId}.");
+
+            public PipelineHandoffCodegenState GetHandoff(string handoffId)
+                => _handoffs.TryGetValue(handoffId, out var handoff)
+                    ? handoff
+                    : throw new InvalidOperationException(
+                        $"Producer/consumer region references unknown pipeline handoff {handoffId}.");
+
+            private static IReadOnlyDictionary<string, T> ToUniqueDictionary<T>(
+                IEnumerable<T> values,
+                Func<T, string> getKey,
+                string kind)
+            {
+                var result = new Dictionary<string, T>(StringComparer.Ordinal);
+                foreach (var value in values)
+                {
+                    var key = getKey(value);
+                    if (!result.TryAdd(key, value))
+                    {
+                        throw new InvalidOperationException(
+                            $"Producer/consumer region contains duplicate {kind} {key}.");
+                    }
+                }
+
+                return result;
+            }
+        }
+
+        private sealed class PipelineStageCodegenState
+        {
+            private IReadOnlyList<PyNTTPipelineStageTemplateModel> _pipeStages =
+                Array.Empty<PyNTTPipelineStageTemplateModel>();
+
+            private IReadOnlyList<PyNTTPipelineHandoffTemplateModel> _handoffs =
+                Array.Empty<PyNTTPipelineHandoffTemplateModel>();
+
+            private IReadOnlyList<string> _consumerDrainEndpointNames =
+                Array.Empty<string>();
+
+            private IReadOnlyList<string> _producerDrainEndpointNames =
+                Array.Empty<string>();
+
+            private IReadOnlyDictionary<string, string> _consumerEndpointBindings =
+                new Dictionary<string, string>(StringComparer.Ordinal);
+
+            private IReadOnlyDictionary<string, string> _producerEndpointBindings =
+                new Dictionary<string, string>(StringComparer.Ordinal);
+
+            private IReadOnlyDictionary<string, string> _invocationBindings =
+                new Dictionary<string, string>(StringComparer.Ordinal);
+
+            private PipelineStageCodegenState(
+                string stageId,
+                string stageName)
+            {
+                StageId = stageId;
+                StageName = stageName;
+                PipeName = $"{stageName}__pipe";
+                ReaderName = $"{stageName}__reader";
+                WriterName = $"{stageName}__writer";
+            }
+
+            public string StageId { get; }
+
+            public string StageName { get; }
+
+            public string PipeName { get; }
+
+            public string ReaderName { get; }
+
+            public string WriterName { get; }
+
+            public string DirectHelperName { get; private set; } = string.Empty;
+
+            public PipelineDeviceFunctionDefinition? PipelineDefinition { get; private set; }
+
+            public IReadOnlyList<PyNTTPipelineStageTemplateModel> PipeStages => _pipeStages;
+
+            public IReadOnlyList<PyNTTPipelineHandoffTemplateModel> Handoffs => _handoffs;
+
+            public IReadOnlyList<string> ConsumerDrainEndpointNames => _consumerDrainEndpointNames;
+
+            public IReadOnlyList<string> ProducerDrainEndpointNames => _producerDrainEndpointNames;
+
+            public IReadOnlyDictionary<string, string> ConsumerEndpointBindings => _consumerEndpointBindings;
+
+            public IReadOnlyDictionary<string, string> ProducerEndpointBindings => _producerEndpointBindings;
+
+            public IReadOnlyDictionary<string, string> InvocationBindings => _invocationBindings;
+
+            public bool IsBound => _pipeStages.Count != 0;
+
+            public bool IsDirectHelper => !string.IsNullOrEmpty(DirectHelperName);
+
+            public static PipelineStageCodegenState Create(
+                PipelineStage stage,
+                string regionName,
+                int index)
+                => new(
+                    stage.StageId,
+                    SanitizeBoundedPythonIdentifier(
+                        $"{regionName}__stage_{index.ToString(CultureInfo.InvariantCulture)}"));
+
+            public void BindDirect(
+                string helperName,
+                string template,
+                object model,
+                IReadOnlyDictionary<string, string> sharedWorkspaceOffsets)
+            {
+                if (IsBound)
+                {
+                    throw new InvalidOperationException(
+                        $"Pipeline stage {StageId} emitted more than one helper.");
+                }
+
+                DirectHelperName = helperName;
+                var pipeStage = new PyNTTPipelineStageTemplateModel(
+                    StageId,
+                    StageName,
+                    helperName,
+                    template,
+                    model,
+                    sharedWorkspaceOffsets,
+                    PipeName,
+                    ReaderName,
+                    WriterName);
+                _pipeStages = new[] { pipeStage };
+                _consumerDrainEndpointNames = new[] { ReaderName };
+                _producerDrainEndpointNames = new[] { WriterName };
+            }
+
+            public void BindPipeline(
+                PipelineDeviceFunctionDefinition definition,
+                string actualSharedBaseOffset,
+                IReadOnlyDictionary<string, string> invocationBindings)
+            {
+                if (IsBound)
+                {
+                    throw new InvalidOperationException(
+                        $"Pipeline stage {StageId} was bound more than once.");
+                }
+
+                PipelineDefinition = definition;
+                _invocationBindings = new Dictionary<string, string>(
+                    invocationBindings,
+                    StringComparer.Ordinal);
+                var consumerBindings = new Dictionary<string, string>(StringComparer.Ordinal);
+                var producerBindings = new Dictionary<string, string>(StringComparer.Ordinal);
+                var pipeStages = new List<PyNTTPipelineStageTemplateModel>();
+                foreach (var (formal, index) in definition.BuildResult.Interface.PipeStages.Select(
+                    (stage, index) => (stage, index)))
+                {
+                    var instanceName = SanitizeBoundedPythonIdentifier(
+                        $"{StageName}__pipe_{index.ToString(CultureInfo.InvariantCulture)}");
+                    var instance = formal with
+                    {
+                        StageId = $"{StageId}/{formal.StageId}",
+                        StageName = instanceName,
+                        SharedWorkspaceOffsets = formal.SharedWorkspaceOffsets.ToDictionary(
+                            pair => pair.Key,
+                            pair => SubstituteIdentifier(
+                                pair.Value,
+                                definition.SharedBaseOffsetParameter,
+                                actualSharedBaseOffset),
+                            StringComparer.Ordinal),
+                        PipeName = $"{instanceName}__pipe",
+                        ReaderName = $"{instanceName}__reader",
+                        WriterName = $"{instanceName}__writer",
+                    };
+                    pipeStages.Add(instance);
+                    consumerBindings.Add(formal.ReaderName, instance.ReaderName);
+                    producerBindings.Add(formal.WriterName, instance.WriterName);
+                }
+
+                var handoffs = new List<PyNTTPipelineHandoffTemplateModel>();
+                foreach (var (formal, index) in definition.BuildResult.Interface.Handoffs.Select(
+                    (handoff, index) => (handoff, index)))
+                {
+                    var instanceName = SanitizeBoundedPythonIdentifier(
+                        $"{StageName}__handoff_{index.ToString(CultureInfo.InvariantCulture)}");
+                    var instance = formal with
+                    {
+                        HandoffId = $"{StageId}/{formal.HandoffId}",
+                        HandoffName = instanceName,
+                        PipeName = $"{instanceName}__pipe",
+                        ReaderName = $"{instanceName}__reader",
+                        WriterName = $"{instanceName}__writer",
+                    };
+                    handoffs.Add(instance);
+                    consumerBindings.Add(formal.WriterName, instance.WriterName);
+                    producerBindings.Add(formal.ReaderName, instance.ReaderName);
+                }
+
+                _pipeStages = pipeStages;
+                _handoffs = handoffs;
+                _consumerEndpointBindings = consumerBindings;
+                _producerEndpointBindings = producerBindings;
+                _consumerDrainEndpointNames = definition.BuildResult.Interface.ConsumerDrainEndpointNames
+                    .Select(name => GetRequiredBinding(consumerBindings, name, StageId))
+                    .ToArray();
+                _producerDrainEndpointNames = definition.BuildResult.Interface.ProducerDrainEndpointNames
+                    .Select(name => GetRequiredBinding(producerBindings, name, StageId))
+                    .ToArray();
+            }
+
+            private static string GetRequiredBinding(
+                IReadOnlyDictionary<string, string> bindings,
+                string formalName,
+                string stageId)
+                => bindings.TryGetValue(formalName, out var actualName)
+                    ? actualName
+                    : throw new InvalidOperationException(
+                        $"Pipeline stage {stageId} has no endpoint binding for {formalName}.");
+        }
+
+        private sealed record PipelineHandoffCodegenState(
+            string HandoffId,
+            string HandoffName,
+            string PipeName,
+            string ReaderName,
+            string WriterName)
+        {
+            public static PipelineHandoffCodegenState Create(
+                PipelineHandoff handoff,
+                string regionName,
+                int index)
+            {
+                var handoffName = SanitizeBoundedPythonIdentifier(
+                    $"{regionName}__handoff_{index.ToString(CultureInfo.InvariantCulture)}");
+                return new(
+                    handoff.HandoffId,
+                    handoffName,
+                    $"{handoffName}__pipe",
+                    $"{handoffName}__reader",
+                    $"{handoffName}__writer");
+            }
+
+            public PyNTTPipelineHandoffTemplateModel ToTemplateModel()
+                => new(
+                    HandoffId,
+                    HandoffName,
+                    PipeName,
+                    ReaderName,
+                    WriterName);
+        }
 
         public enum DeviceFunctionFormalParameterKind
         {
@@ -8374,6 +9744,13 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             DeviceFunctionBuildResult BuildResult,
             IReadOnlyList<DeviceFunctionFormalParameter> Parameters,
             IReadOnlyDictionary<IVar, int[][]> TensorSourceSplitAxes);
+
+        public sealed record PipelineDeviceFunctionDefinition(
+            string Name,
+            PipelineDeviceFunctionBuildResult BuildResult,
+            IReadOnlyList<DeviceFunctionFormalParameter> Parameters,
+            IReadOnlyDictionary<IVar, int[][]> TensorSourceSplitAxes,
+            string SharedBaseOffsetParameter);
     }
 
     private static LaunchMetadata BuildLaunchMetadata(
@@ -8466,44 +9843,6 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
     {
         var hierarchy = GetBlockHierarchy(targetOptions);
         return Placement.NormalizeHierarchyLevels(targetOptions.HierarchyLevels, targetOptions.HierarchyNames, hierarchy.Length);
-    }
-
-    private static string BuildGeneratedTopKernelPython(GeneratedKernelMetadata kernel, string bodySource, string helperSource)
-    {
-        var inputs = kernel.Inputs.Select((_, index) => $"input{index}").ToArray();
-        var outputs = kernel.Outputs.Select((_, index) => $"output{index}").ToArray();
-        var workspaceParameters = new[] { "data", "rdata", "chip_local_rdata", "chip_local_data", "block_local_rdata", "block_local_data" };
-        var runtimeShapeArgs = GetRuntimeShapeArgs(kernel);
-        var gridBarrierParameters = kernel.Attrs.ContainsKey("requires_grid_barrier")
-            ? new[] { "pyntt_grid_mesh: tl.constexpr" }
-            : Array.Empty<string>();
-        var parameters = string.Join(", ", inputs.Concat(outputs).Concat(workspaceParameters).Concat(runtimeShapeArgs).Concat(gridBarrierParameters).Concat(new[] { "numel", "block_size: tl.constexpr" }));
-        if (kernel.Attrs.TryGetValue("abi_view_stride_args", out var abiStrideArgsValue))
-        {
-            var abiStrideArgs = abiStrideArgsValue switch
-            {
-                string[] array => array,
-                IEnumerable<string> enumerable => enumerable.ToArray(),
-                _ => throw new NotSupportedException($"PyNTT kernel {kernel.Name} has unsupported abi_view_stride_args metadata type {abiStrideArgsValue.GetType().Name}."),
-            };
-            parameters = string.Join(", ", inputs.Concat(outputs).Concat(abiStrideArgs).Concat(workspaceParameters).Concat(runtimeShapeArgs).Concat(gridBarrierParameters).Concat(new[] { "numel", "block_size: tl.constexpr" }));
-        }
-
-        var call = IndentGeneratedCall(bodySource);
-
-        var topKernelSource = $$"""
-            @triton.jit
-            def {{kernel.Name}}({{parameters}}):
-                {{call}}
-            """;
-        return string.IsNullOrWhiteSpace(helperSource)
-            ? topKernelSource
-            : $"{helperSource.TrimEnd()}{Environment.NewLine}{Environment.NewLine}{topKernelSource}";
-    }
-
-    private static string IndentGeneratedCall(string call)
-    {
-        return call.Replace(Environment.NewLine, Environment.NewLine + "    ", StringComparison.Ordinal);
     }
 
     private static string GetTensorName(BaseExpr expr, IReadOnlyDictionary<IVar, string> parameterNames)
@@ -9988,11 +11327,6 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
     private static string[] ToPythonExpressions(IEnumerable<PyNTTDimExpression> values)
         => values.Select(value => value.PythonExpression).ToArray();
 
-    private static string[] GetRuntimeShapeArgs(GeneratedKernelMetadata kernel)
-        => kernel.Attrs.TryGetValue("runtime_shape_args", out var value) && value is string[] args
-            ? args
-            : Array.Empty<string>();
-
     private static string SanitizePythonIdentifier(string value)
     {
         var chars = value.Select(ch => char.IsAsciiLetterOrDigit(ch) || ch == '_' ? ch : '_').ToArray();
@@ -10078,6 +11412,27 @@ internal sealed record DeviceFunctionBuildResult(
     IReadOnlyList<FormalHostTensorDescriptorRequirement> FormalHostTensorDescriptors,
     IReadOnlyDictionary<string, PyNTTKVCacheStorageMetadata?> FormalObjectFieldStorages,
     IReadOnlyDictionary<int, string> FormalObjectOutputAliases);
+
+internal sealed record PipelineDeviceFunctionBuildResult(
+    DeviceFunctionRenderSpec ConsumerFunction,
+    DeviceFunctionRenderSpec ProducerFunction,
+    IReadOnlyList<DeviceFunctionRenderSpec> NestedDeviceFunctions,
+    IReadOnlyList<HelperKernelCallMetadata> HelperCalls,
+    IReadOnlyList<string> OpKinds,
+    bool RequiresGridBarrier,
+    long BlockLocalDataPoolBytes,
+    IReadOnlyList<FormalHostTensorDescriptorRequirement> FormalHostTensorDescriptors,
+    IReadOnlyDictionary<string, PyNTTKVCacheStorageMetadata?> FormalObjectFieldStorages,
+    IReadOnlyDictionary<int, string> FormalObjectOutputAliases,
+    PipelineDeviceFunctionInterface Interface);
+
+internal sealed record PipelineDeviceFunctionInterface(
+    IReadOnlyList<PyNTTPipelineStageTemplateModel> PipeStages,
+    IReadOnlyList<PyNTTPipelineHandoffTemplateModel> Handoffs,
+    IReadOnlyList<string> ConsumerEndpointNames,
+    IReadOnlyList<string> ProducerEndpointNames,
+    IReadOnlyList<string> ConsumerDrainEndpointNames,
+    IReadOnlyList<string> ProducerDrainEndpointNames);
 
 internal sealed record FormalHostTensorDescriptorRequirement(
     string Name,

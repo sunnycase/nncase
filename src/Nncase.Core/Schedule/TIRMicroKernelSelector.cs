@@ -39,13 +39,56 @@ public sealed record TIRSharedWorkspaceDescriptor(
     int AlignmentBytes);
 
 /// <summary>
+/// Declares the independently executable weight-transfer phase of a selected
+/// microkernel. Argument indexes refer to semantic kernel operands; workspace
+/// indexes refer to <see cref="TIRMicroKernelSelection.SharedWorkspaces"/>.
+/// </summary>
+public sealed record TIRWeightPipelineContract
+{
+    public TIRWeightPipelineContract(
+        IEnumerable<int> weightArgumentIndices,
+        IEnumerable<int> sharedWorkspaceIndices)
+    {
+        WeightArgumentIndices = ValidateIndices(
+            weightArgumentIndices,
+            nameof(weightArgumentIndices));
+        SharedWorkspaceIndices = ValidateIndices(
+            sharedWorkspaceIndices,
+            nameof(sharedWorkspaceIndices));
+    }
+
+    public ImmutableArray<int> WeightArgumentIndices { get; }
+
+    public ImmutableArray<int> SharedWorkspaceIndices { get; }
+
+    private static ImmutableArray<int> ValidateIndices(
+        IEnumerable<int> indices,
+        string parameterName)
+    {
+        ArgumentNullException.ThrowIfNull(indices);
+        var values = indices.ToImmutableArray();
+        if (values.IsDefaultOrEmpty ||
+            values.Any(index => index < 0) ||
+            values.Distinct().Count() != values.Length)
+        {
+            throw new ArgumentException(
+                "Pipeline operand indexes must be non-empty, non-negative, and unique.",
+                parameterName);
+        }
+
+        return values;
+    }
+}
+
+/// <summary>
 /// Concrete target microkernel selected during TIR Selection.
 /// </summary>
 public sealed record TIRMicroKernelSelection(
     string Family,
     string Variant,
     ImmutableDictionary<string, long> Parameters,
-    ImmutableArray<TIRSharedWorkspaceDescriptor> SharedWorkspaces);
+    ImmutableArray<TIRSharedWorkspaceDescriptor> SharedWorkspaces,
+    TIRWeightPipelineContract? WeightPipeline);
 
 /// <summary>
 /// Canonical expression representation for a microkernel's shared workspaces.

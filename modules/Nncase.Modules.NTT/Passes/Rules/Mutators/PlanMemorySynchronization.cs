@@ -51,6 +51,27 @@ internal sealed class MemoryEffectAnalyzer
         bool suppressReductionAccumulatorEffects)
         => GetEffects(body, ResourceBindingScope.Empty, suppressReductionAccumulatorEffects, true);
 
+    internal static MemoryByteRange? TryGetAbsoluteByteRange(MemSpan span)
+    {
+        if (!TryGetFixedInt64(span.Buffer.Start, out var allocationStart) ||
+            !TryGetFixedDimension(span.Start, out var spanStart) ||
+            !TryGetFixedDimension(span.Size, out var spanSize) ||
+            spanSize < 0)
+        {
+            return null;
+        }
+
+        try
+        {
+            var start = checked(allocationStart + spanStart);
+            return new MemoryByteRange(start, checked(start + spanSize));
+        }
+        catch (OverflowException)
+        {
+            return null;
+        }
+    }
+
     private EffectSet GetEffects(
         Expr expr,
         ResourceBindingScope bindings,
@@ -316,27 +337,6 @@ internal sealed class MemoryEffectAnalyzer
                     explicitScope ?? (expression.CheckedDataType is ReferenceType
                         ? TIR.NTT.BarrierScope.Chip
                         : TIR.NTT.BarrierScope.Block));
-        }
-    }
-
-    private static MemoryByteRange? TryGetAbsoluteByteRange(MemSpan span)
-    {
-        if (!TryGetFixedInt64(span.Buffer.Start, out var allocationStart) ||
-            !TryGetFixedDimension(span.Start, out var spanStart) ||
-            !TryGetFixedDimension(span.Size, out var spanSize) ||
-            spanSize < 0)
-        {
-            return null;
-        }
-
-        try
-        {
-            var start = checked(allocationStart + spanStart);
-            return new MemoryByteRange(start, checked(start + spanSize));
-        }
-        catch (OverflowException)
-        {
-            return null;
         }
     }
 

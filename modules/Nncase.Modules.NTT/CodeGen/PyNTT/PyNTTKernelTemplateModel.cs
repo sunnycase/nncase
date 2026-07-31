@@ -12,7 +12,40 @@ public sealed record PyNTTMicroKernelTemplateModel(
     string Family,
     string Variant,
     IReadOnlyDictionary<string, long> Parameters,
-    IReadOnlyDictionary<string, string> SharedWorkspaceOffsets);
+    IReadOnlyDictionary<string, string> SharedWorkspaceOffsets,
+    bool HasWeightPipeline);
+
+public sealed record PyNTTPipelineStageTemplateModel(
+    string StageId,
+    string StageName,
+    string HelperName,
+    string Template,
+    object Model,
+    IReadOnlyDictionary<string, string> SharedWorkspaceOffsets,
+    string PipeName,
+    string ReaderName,
+    string WriterName);
+
+public sealed record PyNTTPipelineHandoffTemplateModel(
+    string HandoffId,
+    string HandoffName,
+    string PipeName,
+    string ReaderName,
+    string WriterName);
+
+public sealed record PyNTTProducerConsumerRegionTemplateModel(
+    string FunctionName,
+    string ProducerFunctionName,
+    string ConsumerFunctionName,
+    string ProducerBodySource,
+    string ConsumerBodySource,
+    PyNTTPipelineStageTemplateModel[] Stages,
+    PyNTTPipelineHandoffTemplateModel[] Handoffs,
+    string[] ProducerEndpointNames,
+    string[] ConsumerEndpointNames)
+{
+    public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
+}
 
 public sealed record PyNTTPooledByteAddressTemplateModel(
     string BaseName,
