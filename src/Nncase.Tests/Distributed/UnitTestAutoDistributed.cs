@@ -178,6 +178,389 @@ public sealed class UnitTestDistribAutoDistributed : TestClassBase
     }
 
     [Fact]
+    public void TestAutoDistributedMaterializerReusesSameSourceAndTargetShardedView()
+    {
+        var tensorType = new TensorType(DataTypes.Float32, [32]);
+        var placement = new Placement([4, 8], "yx", "bb");
+        var inputType = new DistributedType(tensorType, [SBP.S([0, 1])], placement);
+        var outputType = new DistributedType(tensorType, [SBP.B], placement);
+        var input = new Var("input", inputType);
+
+        var graph = new DistributedSearchGraph(new AdjacencyGraph<SearchableNode, CrossEdge>(true), SearchGraphKind.Root);
+        var rootBucket = graph.CreateCluster<DistributedSearchGraph>(SearchGraphKind.Bucket);
+        var inputBucket = graph.CreateCluster<DistributedSearchGraph>(SearchGraphKind.Bucket);
+        var viewBucket0 = graph.CreateCluster<DistributedSearchGraph>(SearchGraphKind.Bucket);
+        var viewBucket1 = graph.CreateCluster<DistributedSearchGraph>(SearchGraphKind.Bucket);
+
+        var tupleNode = new SearchableNode(new IR.Tuple(), new TupleType([outputType, outputType]));
+        var inputNode = new SearchableNode(input, inputType);
+        var viewNode0 = new SearchableNode(new IR.Distributed.ShardedView(outputType), outputType);
+        var viewNode1 = new SearchableNode(new IR.Distributed.ShardedView(outputType), outputType);
+        rootBucket.AddVertex(tupleNode);
+        inputBucket.AddVertex(inputNode);
+        viewBucket0.AddVertex(viewNode0);
+        viewBucket1.AddVertex(viewNode1);
+        graph.AddEdge(new(tupleNode, viewNode0, 0, viewBucket0));
+        graph.AddEdge(new(tupleNode, viewNode1, 1, viewBucket1));
+        graph.AddEdge(new(viewNode0, inputNode, 0, inputBucket));
+        graph.AddEdge(new(viewNode1, inputNode, 0, inputBucket));
+
+        var picks = new Dictionary<SearchableNode, bool>
+        {
+            [tupleNode] = true,
+            [inputNode] = true,
+            [viewNode0] = true,
+            [viewNode1] = true,
+        };
+
+        var tuple = Assert.IsType<IR.Tuple>(new ExprBuildVisitor(graph, picks).Visit([rootBucket]));
+        Assert.Same(tuple.Fields[0], tuple.Fields[1]);
+        Assert.Single(ExprCollector.Collect(tuple).OfType<Call>().Where(call => call.Target is IR.Distributed.ShardedView));
+        Assert.DoesNotContain(ExprCollector.Collect(tuple).OfType<Call>(), call => call.Target is IR.Distributed.Boxing);
+    }
+
+    [Fact]
+    public void TestAutoDistributedMaterializerKeepsBoundaryAndInternalRealizationsDistinct()
+    {
+        var tensorType = new TensorType(DataTypes.Float32, [32]);
+        var placement = new Placement([4, 8], "yx", "bb");
+        var inputType = new DistributedType(tensorType, [SBP.S([0, 1])], placement);
+        var outputType = new DistributedType(tensorType, [SBP.B], placement);
+        var input = new Var("input", inputType);
+
+        var graph = new DistributedSearchGraph(new AdjacencyGraph<SearchableNode, CrossEdge>(true), SearchGraphKind.Root);
+        var rootBucket = graph.CreateCluster<DistributedSearchGraph>(SearchGraphKind.Bucket);
+        var inputBucket = graph.CreateCluster<DistributedSearchGraph>(SearchGraphKind.Bucket);
+        var viewBucket = graph.CreateCluster<DistributedSearchGraph>(SearchGraphKind.Bucket);
+        var boxingBucket = graph.CreateCluster<DistributedSearchGraph>(SearchGraphKind.Bucket);
+
+        var tupleNode = new SearchableNode(new IR.Tuple(), new TupleType([outputType, outputType]));
+        var inputNode = new SearchableNode(input, inputType);
+        var viewNode = new SearchableNode(new IR.Distributed.ShardedView(outputType), outputType);
+        var boxingNode = new SearchableNode(new IR.Distributed.Boxing(outputType), outputType);
+        rootBucket.AddVertex(tupleNode);
+        inputBucket.AddVertex(inputNode);
+        viewBucket.AddVertex(viewNode);
+        boxingBucket.AddVertex(boxingNode);
+        graph.AddEdge(new(tupleNode, viewNode, 0, viewBucket));
+        graph.AddEdge(new(tupleNode, boxingNode, 1, boxingBucket));
+        graph.AddEdge(new(viewNode, inputNode, 0, inputBucket));
+        graph.AddEdge(new(boxingNode, inputNode, 0, inputBucket));
+
+        var picks = new Dictionary<SearchableNode, bool>
+        {
+            [tupleNode] = true,
+            [inputNode] = true,
+            [viewNode] = true,
+            [boxingNode] = true,
+        };
+
+        var tuple = Assert.IsType<IR.Tuple>(new ExprBuildVisitor(graph, picks).Visit([rootBucket]));
+        Assert.NotSame(tuple.Fields[0], tuple.Fields[1]);
+        Assert.IsType<IR.Distributed.ShardedView>(Assert.IsType<Call>(tuple.Fields[0]).Target);
+        Assert.IsType<IR.Distributed.Boxing>(Assert.IsType<Call>(tuple.Fields[1]).Target);
+    }
+
+    [Fact]
+    public void TestPyNTTReshardPolicySelectsOneLegalRealization()
+    {
+        var options = new PyNTTTargetOptions();
+        var policy = options.ReshardRealizationPolicy;
+        var tensorType = new TensorType(DataTypes.Float32, [32, 64]);
+        var placement = new Placement([4, 8], "yx", "bb");
+        var exclusiveSplit = new DistributedType(
+            tensorType,
+            [SBP.S([0]), SBP.S([1])],
+            placement);
+        var ySplitXReplicated = new DistributedType(
+            tensorType,
+            [SBP.S([0]), SBP.B],
+            placement);
+        var yReplicatedXSplit = new DistributedType(
+            tensorType,
+            [SBP.B, SBP.S([1])],
+            placement);
+        var broadcast = new DistributedType(tensorType, [SBP.B, SBP.B], placement);
+        var partial = new DistributedType(
+            tensorType,
+            [SBP.B, SBP.B],
+            placement,
+            SBP.P([0, 1]));
+        var reduceScatter = new DistributedType(
+            tensorType,
+            [SBP.S([0, 1], 1), SBP.B],
+            placement);
+
+        Assert.Equal(
+            DistributedReshardRealization.ShardedView,
+            Classify(tensorType, exclusiveSplit, DistributedReshardSourceKind.Constant));
+        Assert.Equal(
+            DistributedReshardRealization.ShardedView,
+            Classify(exclusiveSplit, broadcast, DistributedReshardSourceKind.Internal));
+        Assert.Equal(
+            DistributedReshardRealization.ShardedView,
+            Classify(ySplitXReplicated, broadcast, DistributedReshardSourceKind.Internal));
+        Assert.Equal(
+            DistributedReshardRealization.ShardedView,
+            Classify(yReplicatedXSplit, broadcast, DistributedReshardSourceKind.Internal));
+        Assert.Equal(
+            DistributedReshardRealization.ShardedView,
+            Classify(broadcast, exclusiveSplit, DistributedReshardSourceKind.Internal));
+        Assert.Equal(
+            DistributedReshardRealization.ShardedView,
+            Classify(broadcast, exclusiveSplit, DistributedReshardSourceKind.FunctionParameter));
+        Assert.Equal(
+            DistributedReshardRealization.Unsupported,
+            Classify(partial, broadcast, DistributedReshardSourceKind.Internal));
+        Assert.Equal(
+            DistributedReshardRealization.Boxing,
+            Classify(partial, reduceScatter, DistributedReshardSourceKind.Internal));
+        Assert.Equal(
+            DistributedReshardRealization.ShardedView,
+            Classify(reduceScatter, broadcast, DistributedReshardSourceKind.Internal));
+        Assert.Equal(
+            DistributedReshardRealization.Boxing,
+            Classify(
+                exclusiveSplit,
+                broadcast,
+                DistributedReshardSourceKind.Internal,
+                DistributedReshardUsageKind.FunctionBoundary));
+
+        var multiLevelPlacement = new Placement([2, 4], "cb", "cb");
+        var multiLevelSource = new DistributedType(
+            tensorType,
+            [SBP.S([0]), SBP.S([1])],
+            multiLevelPlacement);
+        var sameChipShardTarget = new DistributedType(
+            tensorType,
+            [SBP.S([0]), SBP.B],
+            multiLevelPlacement);
+        var crossChipTarget = new DistributedType(
+            tensorType,
+            [SBP.B, SBP.B],
+            multiLevelPlacement);
+        Assert.Equal(
+            DistributedReshardRealization.ShardedView,
+            Classify(multiLevelSource, sameChipShardTarget, DistributedReshardSourceKind.Internal));
+        Assert.Equal(
+            DistributedReshardRealization.Boxing,
+            Classify(multiLevelSource, crossChipTarget, DistributedReshardSourceKind.Internal));
+
+        var degenerateBlockPlacement = new Placement([2, 1], "yx", "bb");
+        var degenerateSource = new DistributedType(
+            tensorType,
+            [SBP.S([0]), SBP.B],
+            degenerateBlockPlacement);
+        var degenerateTarget = new DistributedType(
+            tensorType,
+            [SBP.B, SBP.B],
+            degenerateBlockPlacement);
+        Assert.Equal(
+            DistributedReshardRealization.ShardedView,
+            Classify(degenerateSource, degenerateTarget, DistributedReshardSourceKind.Internal));
+
+        options.MemoryAccessArch = MemoryAccessArchitecture.NUMA;
+        Assert.Equal(
+            DistributedReshardRealization.Boxing,
+            Classify(exclusiveSplit, broadcast, DistributedReshardSourceKind.Internal));
+
+        DistributedReshardRealization Classify(
+            IRType source,
+            IRType target,
+            DistributedReshardSourceKind sourceKind,
+            DistributedReshardUsageKind usageKind = DistributedReshardUsageKind.Internal)
+            => policy.Classify(
+                new DistributedReshardRealizationContext(
+                    options,
+                    PyNTTTarget.Kind,
+                    source,
+                    target,
+                    sourceKind,
+                    usageKind));
+    }
+
+    [Fact]
+    public void TestPyNTTFunctionResultReshardCandidatesUseBoundaryRealization()
+    {
+        var options = new PyNTTTargetOptions
+        {
+            HierarchyNames = "yx",
+            HierarchyLevels = "bb",
+            Hierarchies = [new[] { 4, 8 }],
+        };
+        CompileOptions.TargetOptions = options;
+        var tensorType = new TensorType(DataTypes.Float32, [32, 64]);
+        var input = new Var("input", tensorType);
+        var function = new Function(
+            "layer",
+            IR.F.Math.Unary(UnaryOp.Abs, input),
+            [input]);
+        Assert.True(function.InferenceType());
+
+        var rewriter = new AutoDistributedRewriter(
+            CompileOptions,
+            options,
+            AutoDistributedPhase.Final,
+            PyNTTTarget.Kind);
+        var buildMethod = typeof(AutoDistributedRewriter).GetMethod(
+            "BuildFunctionSearchGraph",
+            BindingFlags.Instance | BindingFlags.NonPublic);
+        Assert.NotNull(buildMethod);
+        var resultCluster = Assert.IsType<DistributedSearchGraph>(
+            buildMethod!.Invoke(rewriter, [function, false]));
+        var resultCandidates = resultCluster.Clusters
+            .OfType<DistributedSearchGraph>()
+            .SelectMany(bucket => bucket.Vertices)
+            .ToArray();
+        Assert.DoesNotContain(resultCandidates, node => node.Expr is IR.Distributed.ShardedView);
+
+        var memoField = typeof(AutoDistributedRewriter).GetField(
+            "_reshardCandidateMemo",
+            BindingFlags.Instance | BindingFlags.NonPublic);
+        var memo = Assert.IsType<
+            Dictionary<
+                ReshardCandidateKey,
+                (DistributedSearchGraph Bucket, SearchableNode Node)>>(memoField?.GetValue(rewriter));
+        var boundaryCandidates = memo
+            .Where(entry =>
+                ReferenceEquals(entry.Key.OwnerCluster, resultCluster) &&
+                entry.Key.UsageKind == DistributedReshardUsageKind.FunctionBoundary)
+            .Select(entry => entry.Value.Node)
+            .ToArray();
+        Assert.NotEmpty(boundaryCandidates);
+        Assert.All(
+            boundaryCandidates,
+            candidate => Assert.IsType<IR.Distributed.Boxing>(candidate.Expr));
+    }
+
+    [Fact]
+    public void TestPyNTTFunctionParameterUsesCanNarrowBroadcastSignatureLocally()
+    {
+        var options = new PyNTTTargetOptions
+        {
+            HierarchyNames = "yx",
+            HierarchyLevels = "bb",
+            Hierarchies = [new[] { 4, 8 }],
+        };
+        CompileOptions.TargetOptions = options;
+        var tensorType = new TensorType(DataTypes.Float32, [32, 64]);
+        var placement = new Placement([4, 8], "yx", "bb");
+        var broadcastType = new DistributedType(
+            tensorType,
+            [SBP.B, SBP.B],
+            placement);
+        var input = new Var("input", tensorType);
+        var function = new Function(
+            "layer",
+            IR.F.Math.Unary(UnaryOp.Abs, input),
+            [input]);
+        Assert.True(function.InferenceType());
+
+        var rewriter = new AutoDistributedRewriter(
+            CompileOptions,
+            options,
+            AutoDistributedPhase.Final,
+            PyNTTTarget.Kind);
+        var buildMethod = typeof(AutoDistributedRewriter).GetMethod(
+            "BuildFunctionSearchGraph",
+            BindingFlags.Instance | BindingFlags.NonPublic);
+        Assert.NotNull(buildMethod);
+        _ = buildMethod!.Invoke(rewriter, [function, false]);
+
+        var memoField = typeof(AutoDistributedRewriter).GetField(
+            "_reshardCandidateMemo",
+            BindingFlags.Instance | BindingFlags.NonPublic);
+        var memo = Assert.IsType<
+            Dictionary<
+                ReshardCandidateKey,
+                (DistributedSearchGraph Bucket, SearchableNode Node)>>(memoField?.GetValue(rewriter));
+        var candidates = memo.Where(entry =>
+            entry.Key.InputNode.Kind == SearchableNodeKind.TypeAdapter &&
+            entry.Key.InputNode.IRType is DistributedType sourceType &&
+            sourceType.AxisPolicies.All(policy => policy is SBPBroadCast) &&
+            entry.Key.TargetType is DistributedType targetType &&
+            targetType.AxisPolicies[0] is SBPBroadCast &&
+            targetType.AxisPolicies[1] is SBPSplit split &&
+            split.Axes.Order().SequenceEqual(new[] { 0, 1 }) &&
+            entry.Key.UsageKind == DistributedReshardUsageKind.Internal).ToArray();
+        Assert.NotEmpty(candidates);
+        Assert.All(
+            candidates,
+            candidate => Assert.IsType<IR.Distributed.ShardedView>(candidate.Value.Node.Expr));
+
+        var graphField = typeof(AutoDistributedRewriter).GetField(
+            "_rootSearchGraph",
+            BindingFlags.Instance | BindingFlags.NonPublic);
+        var graph = Assert.IsType<DistributedSearchGraph>(graphField?.GetValue(rewriter));
+        foreach (var candidate in candidates)
+        {
+            Assert.True(graph.TryGetOutEdges(candidate.Key.InputNode, out var edges));
+            Assert.Contains(
+                edges,
+                edge =>
+                    edge.Input.Kind == SearchableNodeKind.FunctionParameter &&
+                    edge.Input.IRType == broadcastType);
+        }
+    }
+
+    [Fact]
+    public void TestPyNTTInternalReshardUsesOnlyOneTargetRealizationKind()
+    {
+        var options = new PyNTTTargetOptions
+        {
+            HierarchyNames = "yx",
+            HierarchyLevels = "bb",
+            Hierarchies = [new[] { 4, 8 }],
+        };
+        CompileOptions.TargetOptions = options;
+        var tensorType = new TensorType(DataTypes.Float32, [32, 64]);
+        var input = new Var("input", tensorType);
+        var producer = IR.F.Math.Unary(UnaryOp.Abs, input);
+        var main = new Function(
+            "main",
+            IR.F.Math.Unary(UnaryOp.Neg, producer),
+            [input]);
+        Assert.True(main.InferenceType());
+
+        var rewriter = new AutoDistributedRewriter(
+            CompileOptions,
+            options,
+            AutoDistributedPhase.Final,
+            PyNTTTarget.Kind);
+        _ = rewriter.BuildSearchGraph(main);
+
+        var graphField = typeof(AutoDistributedRewriter).GetField(
+            "_rootSearchGraph",
+            BindingFlags.Instance | BindingFlags.NonPublic);
+        var graph = Assert.IsType<DistributedSearchGraph>(graphField?.GetValue(rewriter));
+        var realizations = graph.Vertices.Where(node =>
+        {
+            if (node.Expr is not (IR.Distributed.Boxing or IR.Distributed.ShardedView) ||
+                node.IRType is not DistributedType targetType ||
+                targetType.AxisPolicies.Any(policy => policy is not SBPBroadCast) ||
+                !graph.TryGetOutEdges(node, out var edges))
+            {
+                return false;
+            }
+
+            return edges.Any(edge =>
+                edge.InputIndex == 0 &&
+                edge.Target.Expr is IR.Math.Unary { UnaryOp: UnaryOp.Abs } &&
+                edge.Target.IRType is DistributedType sourceType &&
+                sourceType.AxisPolicies
+                    .OfType<SBPSplit>()
+                    .SelectMany(split => split.Axes)
+                    .Order()
+                    .SequenceEqual(new[] { 0, 1 }));
+        }).ToArray();
+
+        Assert.NotEmpty(realizations);
+        Assert.All(
+            realizations,
+            realization => Assert.IsType<IR.Distributed.ShardedView>(realization.Expr));
+    }
+
+    [Fact]
     public async Task TestShapeBucketSegmentsFromEntryAndClonesInternalFunctions()
     {
         var n = new DimVar("n") { Metadata = { Range = (1, 32) } };
@@ -363,6 +746,53 @@ public sealed class UnitTestDistribAutoDistributed : TestClassBase
                 (DistributedType i, DistributedType o) when i == broadcast && o == target => true,
                 _ => false,
             };
+    }
+
+    [Fact]
+    public void TestReshardPlannerDecomposesPartialAllReduceThroughReduceScatter()
+    {
+        var tensorType = new TensorType(DataTypes.Float32, [32, 64]);
+        var placement = new Placement([4, 8], "yx", "bb");
+        var source = new DistributedType(
+            tensorType,
+            new SBP[] { SBP.B, SBP.B },
+            placement,
+            SBP.P([0, 1]));
+        var target = new DistributedType(
+            tensorType,
+            new SBP[] { SBP.B, SBP.B },
+            placement);
+
+        var plans = DistributedReshardPlanner.Plan(source, target, CanRealize);
+
+        Assert.NotEmpty(plans);
+        Assert.All(
+            plans,
+            plan =>
+            {
+                Assert.Equal(2, plan.StepTypes.Count);
+                var reduceScatter = Assert.IsType<DistributedType>(plan.StepTypes[0]);
+                Assert.Null(reduceScatter.Partial);
+                var split = Assert.Single(reduceScatter.AxisPolicies.OfType<SBPSplit>());
+                Assert.Equal(new[] { 0, 1 }, split.Axes.ToArray());
+                Assert.Equal(target, plan.StepTypes[1]);
+            });
+
+        bool CanRealize(IRType input, IRType output)
+        {
+            if (input == source && output == target)
+            {
+                return false;
+            }
+
+            return input == source
+                ? output is DistributedType intermediate &&
+                    intermediate.Partial is null &&
+                    intermediate.AxisPolicies
+                        .OfType<SBPSplit>()
+                        .Any(split => split.Axes.SequenceEqual(new[] { 0, 1 }))
+                : output == target;
+        }
     }
 
     [Fact]

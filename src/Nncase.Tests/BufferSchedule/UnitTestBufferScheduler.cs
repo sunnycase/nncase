@@ -115,6 +115,39 @@ public sealed class UnitTestBufferScheduler : TestClassBase
         Assert.True(result.Lifetimes[sourcePhysical].Time.Overlaps(result.Lifetimes[destinationPhysical].Time));
     }
 
+    [Fact]
+    public void TestBufferizeDeduplicatesMultipleShardedViewsOfSameConstant()
+    {
+        var tensorConst = new TensorConst(Tensor.FromScalar(1.0f, [8]));
+        var placement = new Placement([2], "b", "b");
+        var splitType = new DistributedType(
+            tensorConst.CheckedTensorType,
+            [SBP.S([0])],
+            placement);
+        var broadcastType = new DistributedType(
+            tensorConst.CheckedTensorType,
+            [SBP.B],
+            placement);
+        TIR.T.AttachShardedConstView(tensorConst, splitType, out var splitView, "split_view");
+        TIR.T.AttachShardedConstView(tensorConst, broadcastType, out var broadcastView, "broadcast_view");
+        TIR.T.CreateBuffer(new TensorType(DataTypes.Float32, [4]), TIR.MemoryLocation.Data, out var splitOutput);
+        TIR.T.CreateBuffer(broadcastType.TensorType, TIR.MemoryLocation.Data, out var broadcastOutput);
+        var function = new TIR.PrimFunction(
+            "multiple_sharded_const_views",
+            Targets.CPUTarget.Kind,
+            new TIR.Sequential(
+                TIR.T.Memcopy(splitOutput, splitView),
+                TIR.T.Memcopy(broadcastOutput, broadcastView)),
+            []);
+        var functions = new[] { function }.GroupBy(candidate => candidate.ModuleKind).Single();
+
+        new BufferizeVisitor(functions, targetMachine: null).Bufferize();
+
+        var allocation = Assert.Single(function.SchedResult.ChipLocalRdatas);
+        Assert.Same(tensorConst, allocation.Key);
+        Assert.Equal((ulong)tensorConst.Value.BytesBuffer.Length, allocation.Value.Max - allocation.Value.Min);
+    }
+
     [Theory]
     [MemberData(nameof(ScheduleGetItemDatas))]
     public async Task TestScheduleGetItem(Func<Function> fusionGetter, int capacity, int number)

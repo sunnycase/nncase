@@ -353,6 +353,119 @@ public static class DistributedUtility
         }
     }
 
+    /// <summary>
+    /// Validates the target-independent semantic contract of a distributed alias view.
+    /// </summary>
+    public static bool TryValidateShardedView(
+        IRType sourceType,
+        DistributedType targetType,
+        [NotNullWhen(false)] out string? reason)
+    {
+        reason = null;
+        TensorType sourceTensorType;
+        switch (sourceType)
+        {
+            case TensorType tensorType:
+                sourceTensorType = tensorType;
+                break;
+            case DistributedType distributedType:
+                sourceTensorType = distributedType.TensorType;
+                if (distributedType.Placement != targetType.Placement)
+                {
+                    reason = $"ShardedView requires the same placement, but got {distributedType.Placement} -> {targetType.Placement}.";
+                    return false;
+                }
+
+                if (HasPartial(distributedType))
+                {
+                    reason = "ShardedView source cannot contain a partial value.";
+                    return false;
+                }
+
+                if (!HasOnlySplitOrBroadcast(distributedType))
+                {
+                    reason = "ShardedView source policies must contain only Split or Broadcast.";
+                    return false;
+                }
+
+                if (distributedType == targetType)
+                {
+                    reason = "ShardedView source and target distributed types must differ.";
+                    return false;
+                }
+
+                break;
+            default:
+                reason = $"ShardedView expects a tensor or distributed tensor input, got {sourceType}.";
+                return false;
+        }
+
+        if (sourceTensorType != targetType.TensorType)
+        {
+            reason = $"ShardedView input tensor type {sourceTensorType} does not match target tensor type {targetType.TensorType}.";
+            return false;
+        }
+
+        if (HasPartial(targetType))
+        {
+            reason = "ShardedView target cannot contain a partial value.";
+            return false;
+        }
+
+        if (!HasOnlySplitOrBroadcast(targetType))
+        {
+            reason = "ShardedView target policies must contain only Split or Broadcast.";
+            return false;
+        }
+
+        return true;
+
+        static bool HasPartial(DistributedType type)
+            => type.Partial is not null || type.AxisPolicies.Any(policy => policy is SBPPartial);
+
+        static bool HasOnlySplitOrBroadcast(DistributedType type)
+            => type.AxisPolicies.All(policy => policy is SBPSplit or SBPBroadCast);
+    }
+
+    /// <summary>
+    /// Returns whether every target local shard is provably a subview of the source
+    /// local shard at the same placement coordinate.
+    /// </summary>
+    /// <remarks>
+    /// This is intentionally structural: an existing split must remain identical,
+    /// while a broadcast axis may become split. More general split refinements can
+    /// depend on granularity arithmetic and are not considered aliases unless that
+    /// containment can be proven by construction.
+    /// </remarks>
+    public static bool IsLocalShardSubview(DistributedType sourceType, DistributedType targetType)
+    {
+        if (sourceType.TensorType != targetType.TensorType ||
+            sourceType.Placement != targetType.Placement ||
+            sourceType.Partial is not null ||
+            targetType.Partial is not null ||
+            sourceType.AxisPolicies.Count != targetType.AxisPolicies.Count)
+        {
+            return false;
+        }
+
+        for (var tensorAxis = 0; tensorAxis < sourceType.AxisPolicies.Count; tensorAxis++)
+        {
+            var sourcePolicy = sourceType.AxisPolicies[tensorAxis];
+            var targetPolicy = targetType.AxisPolicies[tensorAxis];
+            switch (sourcePolicy, targetPolicy)
+            {
+                case (SBPBroadCast, SBPBroadCast or SBPSplit):
+                    break;
+                case (SBPSplit sourceSplit, SBPSplit targetSplit) when sourceSplit == targetSplit:
+                    break;
+                default:
+                    return false;
+            }
+        }
+
+        return true;
+    }
+
     public static float GetDividedTensorEfficiency(DistributedType distributedType, int burstLength)
     {
         var (tiles, shape) = GetDividedTile(distributedType);

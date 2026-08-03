@@ -17,7 +17,6 @@
 {{ "    " * loop.index }}for destination_shard_coord{{ axis }} in tl.range(0, {{ model["Hierarchy"][axis] }}):
 {% endfor %}
 {% call(body) elementwise.iterate(ctx, ctx["prefix_depth"]) %}
-{{ body }}mask = mask & ({{ ctx["writer_active"] }})
 {% for axis in range(model["GlobalShape"] | length) %}
 {{ body }}global_idx{{ axis }} = {{ ctx["global_coordinates"][axis] }}
 {{ body }}mask = mask & (global_idx{{ axis }} < {{ dim(model["GlobalShape"][axis]) }})
@@ -37,6 +36,7 @@
 {{ body }}output_idx{{ axis }} = global_idx{{ axis }}
 {% endif %}
 {% endfor %}
+{{ body }}mask = mask & ({{ ctx["writer_active"] }})
 {% for axis in range(model["Hierarchy"] | length) %}
 {% if axis not in ctx["input_split_mesh_axes"] and axis not in ctx["input_partial_mesh_axes"] %}
 {{ body }}mask = mask & (shard_coord{{ axis }} == destination_shard_coord{{ axis }})

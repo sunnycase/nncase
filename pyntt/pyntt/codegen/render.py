@@ -5404,7 +5404,12 @@ def _reshard_template_context(model: dict[str, Any]) -> dict[str, Any]:
     )
     writer_active = "True"
     for axis in sorted(input_partial_mesh_axes):
-        writer_active = f"({writer_active}) & (shard_coord{axis} == 0)"
+        owner = (
+            f"destination_shard_coord{axis}"
+            if axis in output_split_mesh_axes
+            else "0"
+        )
+        writer_active = f"({writer_active}) & (shard_coord{axis} == {owner})"
     context = _coordinate_iteration_context(
         model["InputActiveShape"],
         model["InputStrides"],

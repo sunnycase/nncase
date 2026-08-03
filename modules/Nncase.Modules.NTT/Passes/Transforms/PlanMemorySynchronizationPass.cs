@@ -49,7 +49,15 @@ public sealed class PlanMemorySynchronizationPass : ModulePass
         {
             if (!CompilerServices.InferenceType(function))
             {
-                throw new InvalidOperationException($"Type inference failed after memory synchronization planning in {function.Name}.");
+                var invalidExpressions = ExprCollector.Collect(function)
+                    .Where(expression => expression.CheckedType is InvalidType)
+                    .Take(8)
+                    .Select(expression =>
+                        $"{expression.GetType().Name}: {((InvalidType)expression.CheckedType).Reason}")
+                    .ToArray();
+                throw new InvalidOperationException(
+                    $"Type inference failed after memory synchronization planning in {function.Name}: " +
+                    string.Join("; ", invalidExpressions));
             }
 
             input.Replace(index, function);

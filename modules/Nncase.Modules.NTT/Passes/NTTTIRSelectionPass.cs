@@ -30,6 +30,10 @@ namespace Nncase.Passes;
 public sealed class NTTTIRSelectionPass : TIRSelectionPass
 {
     private readonly CompileOptions _compileOptions;
+    private readonly Dictionary<TIR.Buffer, Dimension> _shardedComponentBases =
+        new(ReferenceEqualityComparer.Instance);
+
+    private readonly Dictionary<Placement, Dimension[]> _shardCoordinates = new();
     private int _bufferIndex;
     private int _shardedViewIndex;
 
@@ -101,7 +105,7 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
             case IR.Distributed.Boxing boxing:
                 return GenerateBoxing(call, boxing, arguments, ref output);
             case IR.Distributed.ShardedView shardedView:
-                return GenerateShardedView(call, shardedView, ref output);
+                return GenerateShardedView(call, shardedView, arguments, ref output, context);
             case IR.Distributed.ForceBoxing forceBoxing:
                 return T.Memcopy(output, (Expr)arguments[0]);
             case IR.Math.Binary binary:
@@ -412,15 +416,245 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
         }
     }
 
-    private Expr GenerateShardedView(Call call, IR.Distributed.ShardedView shardedView, ref Expr output)
+    private Expr GenerateShardedView(
+        Call call,
+        IR.Distributed.ShardedView shardedView,
+        IReadOnlyList<BaseExpr> arguments,
+        ref Expr output,
+        TIRSelectionContext context)
     {
-        if (call[IR.Distributed.ShardedView.Input] is not TensorConst tensorConst)
+        if (call[IR.Distributed.ShardedView.Input] is TensorConst tensorConst)
         {
-            throw new NotSupportedException("ShardedView only supports TensorConst inputs in TIR selection.");
+            output = T.AttachShardedConstView(tensorConst, shardedView.NewType, out _, $"const_sharded_view_{_shardedViewIndex++}");
+            return T.Nop();
         }
 
-        output = T.AttachShardedConstView(tensorConst, shardedView.NewType, out _, $"const_sharded_view_{_shardedViewIndex++}");
+        if (call[IR.Distributed.ShardedView.Input].CheckedType is not DistributedType sourceType)
+        {
+            throw new InvalidOperationException(
+                $"ShardedView TIR selection expects a TensorConst or DistributedType source, got " +
+                $"{call[IR.Distributed.ShardedView.Input].CheckedType}.");
+        }
+
+        if (arguments[IR.Distributed.ShardedView.Input.Index] is not TIR.Buffer sourceBuffer)
+        {
+            throw new InvalidOperationException(
+                $"ShardedView TIR selection expects its distributed source to lower to Buffer, got " +
+                $"{arguments[IR.Distributed.ShardedView.Input.Index].GetType().Name}.");
+        }
+
+        if (!DistributedUtility.TryValidateShardedView(sourceType, shardedView.NewType, out var reason))
+        {
+            throw new InvalidOperationException($"Invalid ShardedView reached TIR selection: {reason}");
+        }
+
+        if (DistributedUtility.IsLocalShardSubview(sourceType, shardedView.NewType))
+        {
+            var localAlias = CreateLocalShardedAlias(
+                sourceBuffer,
+                sourceType,
+                shardedView.NewType,
+                $"local_sharded_view_{_shardedViewIndex++}");
+            var localComponentBase = _shardedComponentBases.TryGetValue(sourceBuffer, out var knownComponentBase)
+                ? knownComponentBase
+                : sourceBuffer.MemSpan.Start;
+            _shardedComponentBases.TryAdd(sourceBuffer, localComponentBase);
+            _shardedComponentBases.Add(localAlias, localComponentBase);
+            output = localAlias;
+            return T.Nop();
+        }
+
+        var (canonicalSource, componentBase) = EnsureChipLocalShardedBacking(sourceBuffer, context);
+        var alias = CreateShardedAlias(
+            canonicalSource,
+            shardedView.NewType,
+            componentBase,
+            $"sharded_view_{_shardedViewIndex++}");
+        _shardedComponentBases.Add(alias, componentBase);
+        output = alias;
         return T.Nop();
+    }
+
+    private (TIR.Buffer Buffer, Dimension ComponentBase) EnsureChipLocalShardedBacking(
+        TIR.Buffer source,
+        TIRSelectionContext context)
+    {
+        var oldPhysicalBuffer = source.MemSpan.Buffer;
+        if (oldPhysicalBuffer.Location == MemoryLocation.ChipLocalData)
+        {
+            if (!_shardedComponentBases.TryGetValue(source, out var componentBase))
+            {
+                throw new InvalidOperationException(
+                    $"ChipLocalData buffer {source.Name} reached ShardedView without a canonical component-base binding.");
+            }
+
+            return (source, componentBase);
+        }
+
+        if (oldPhysicalBuffer.Location != MemoryLocation.Data ||
+            oldPhysicalBuffer.Start is not None)
+        {
+            throw new InvalidOperationException(
+                $"ShardedView mutable source must own internal Data or ChipLocalData storage, got " +
+                $"{oldPhysicalBuffer.Location}/{oldPhysicalBuffer.Start.GetType().Name}.");
+        }
+
+        var userBuffers = oldPhysicalBuffer.Users
+            .OfType<TIR.MemSpan>()
+            .SelectMany(memSpan => memSpan.Users.OfType<TIR.Buffer>())
+            .Distinct((IEqualityComparer<TIR.Buffer>)ReferenceEqualityComparer.Instance)
+            .ToArray();
+        if (!userBuffers.Contains(source, (IEqualityComparer<TIR.Buffer>)ReferenceEqualityComparer.Instance))
+        {
+            throw new InvalidOperationException(
+                $"ShardedView source {source.Name} is not attached to its physical buffer.");
+        }
+
+        var alignment = oldPhysicalBuffer.Alignment;
+        Dimension physicalSize = oldPhysicalBuffer.Size;
+        foreach (var buffer in userBuffers)
+        {
+            if (buffer.DistributedType is not { } distributedType)
+            {
+                throw new InvalidOperationException(
+                    $"ShardedView cannot promote physical storage shared with non-distributed buffer {buffer.Name}.");
+            }
+
+            var (tensorSize, _) = TensorUtilities.GetTensorMaxSizeAndStridesExpr(
+                distributedType.TensorType,
+                null);
+            var componentBase = _shardedComponentBases.TryGetValue(buffer, out var knownComponentBase)
+                ? knownComponentBase
+                : buffer.MemSpan.Start;
+            alignment = Math.Max(alignment, distributedType.TensorType.DType.SizeInBytes);
+            physicalSize = Dimension.Max(
+                physicalSize,
+                (componentBase + tensorSize).Simplify());
+        }
+
+        var chipLocalBuffer = new TIR.PhysicalBuffer(
+            alignment,
+            physicalSize.Simplify(),
+            MemoryLocation.ChipLocalData);
+        var rewrittenBuffers = new Dictionary<TIR.Buffer, TIR.Buffer>(
+            ReferenceEqualityComparer.Instance);
+        foreach (var buffer in userBuffers)
+        {
+            var componentBase = _shardedComponentBases.TryGetValue(buffer, out var knownComponentBase)
+                ? knownComponentBase
+                : buffer.MemSpan.Start;
+            var rewritten = CreateCanonicalShardedBuffer(
+                buffer,
+                chipLocalBuffer,
+                buffer.DistributedType!,
+                componentBase);
+            rewrittenBuffers.Add(buffer, rewritten);
+            _shardedComponentBases.Add(rewritten, componentBase);
+        }
+
+        foreach (var (buffer, rewritten) in rewrittenBuffers)
+        {
+            ReplaceUtility.ReplaceAllUsesWith(buffer, rewritten);
+            context.ReplaceSelectedValue(buffer, rewritten);
+        }
+
+        var canonicalSource = rewrittenBuffers[source];
+        return (canonicalSource, _shardedComponentBases[canonicalSource]);
+    }
+
+    private TIR.Buffer CreateLocalShardedAlias(
+        TIR.Buffer source,
+        DistributedType sourceType,
+        DistributedType targetType,
+        string name)
+    {
+        var (sourceOffset, _, _, _) = GetShardedBufferLayout(sourceType);
+        var (targetOffset, targetShape, _, _) = GetShardedBufferLayout(targetType);
+        if (sourceOffset.Length != source.Rank || targetOffset.Length != source.Rank)
+        {
+            throw new InvalidOperationException(
+                $"Local ShardedView rank mismatch: source buffer={source.Rank}, " +
+                $"source type={sourceOffset.Length}, target type={targetOffset.Length}.");
+        }
+
+        var relativeOffset = targetOffset
+            .Zip(sourceOffset, (target, source) => (target - source).Simplify())
+            .ToArray();
+        var relativeElementOffset = TensorUtilities.GetLinearOffset(source.Strides, relativeOffset);
+        var byteOffset = (relativeElementOffset * source.ElemType.SizeInBytes).Simplify();
+        var byteSpanSize = BufferViewUtility.GetByteSpanSize(
+            targetShape,
+            source.Strides,
+            source.ElemType.SizeInBytes);
+        return T.CreateBufferView(
+            source,
+            targetType.TensorType.DType,
+            targetShape,
+            source.Strides,
+            byteOffset,
+            byteSpanSize,
+            targetType,
+            name);
+    }
+
+    private TIR.Buffer CreateCanonicalShardedBuffer(
+        TIR.Buffer source,
+        TIR.PhysicalBuffer physicalBuffer,
+        DistributedType distributedType,
+        Dimension componentBase)
+    {
+        var (localOffset, localShape, globalStrides, byteSpanSize) = GetShardedBufferLayout(distributedType);
+        var localElementOffset = TensorUtilities.GetLinearOffset(globalStrides, localOffset);
+        return source.With(
+            memSpan: new TIR.MemSpan(
+                physicalBuffer,
+                (componentBase + (localElementOffset * source.ElemType.SizeInBytes)).Simplify(),
+                byteSpanSize),
+            dimensions: localShape,
+            strides: globalStrides);
+    }
+
+    private TIR.Buffer CreateShardedAlias(
+        TIR.Buffer source,
+        DistributedType targetType,
+        Dimension componentBase,
+        string name)
+    {
+        var (targetOffset, targetShape, targetStrides, targetByteSpanSize) = GetShardedBufferLayout(targetType);
+        var targetElementOffset = TensorUtilities.GetLinearOffset(targetStrides, targetOffset);
+        return new TIR.Buffer(
+            name,
+            targetType.TensorType.DType,
+            new TIR.MemSpan(
+                source.MemSpan.Buffer,
+                (componentBase + (targetElementOffset * targetType.TensorType.DType.SizeInBytes)).Simplify(),
+                targetByteSpanSize),
+            targetShape,
+            targetStrides,
+            targetType,
+            source.StorageEncoding);
+    }
+
+    private (Dimension[] Offset, Dimension[] Shape, Dimension[] Strides, Dimension ByteSpanSize) GetShardedBufferLayout(
+        DistributedType distributedType)
+    {
+        if (!_shardCoordinates.TryGetValue(distributedType.Placement, out var shardIndex))
+        {
+            shardIndex = Enumerable.Range(0, distributedType.Placement.Rank)
+                .Select(axis => (Dimension)new DimVar($"__shard_coord_{axis}"))
+                .ToArray();
+            _shardCoordinates.Add(distributedType.Placement, shardIndex);
+        }
+
+        var (localOffset, localShape) = DistributedUtility.GetLocalOffsetAndShape(distributedType, shardIndex);
+        var (_, globalStrides) = TensorUtilities.GetTensorMaxSizeAndStridesExpr(
+            distributedType.TensorType,
+            null);
+        var byteSpanSize = BufferViewUtility.GetByteSpanSize(
+            localShape,
+            globalStrides,
+            distributedType.TensorType.DType.SizeInBytes);
+        return (localOffset, localShape, globalStrides, byteSpanSize);
     }
 
     private Expr GenerateBufferView(string opName, Expr input, ref Expr output)
@@ -442,7 +676,13 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
                 $"{opName} output must be a buffer or caller output BufferVar, got {output.GetType().Name}.");
         }
 
-        output = CreateLogicalView(opName, inputBuffer, selectedOutput);
+        var logicalView = CreateLogicalView(opName, inputBuffer, selectedOutput);
+        if (_shardedComponentBases.TryGetValue(inputBuffer, out var componentBase))
+        {
+            _shardedComponentBases.Add(logicalView, componentBase);
+        }
+
+        output = logicalView;
         return T.Nop();
     }
 

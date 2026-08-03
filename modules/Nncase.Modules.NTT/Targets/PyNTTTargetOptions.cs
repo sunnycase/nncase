@@ -3,6 +3,7 @@
 
 using System;
 using System.ComponentModel;
+using Nncase.Passes.Distributed;
 using Nncase.Schedule;
 
 namespace Nncase.Targets;
@@ -53,6 +54,10 @@ public sealed class PyNTTTargetOptions : NTTTargetOptions
     [Description("PyNTT generated Python model directory.")]
     [DefaultValue("")]
     public string OutputDirectory { get; set; } = string.Empty;
+
+    /// <inheritdoc/>
+    public override IDistributedReshardRealizationPolicy ReshardRealizationPolicy
+        => PyNTTDistributedReshardRealizationPolicy.Instance;
 
     public static PyNTTTargetOptions FromNTTTargetOptions(NTTTargetOptions nttOptions)
     {

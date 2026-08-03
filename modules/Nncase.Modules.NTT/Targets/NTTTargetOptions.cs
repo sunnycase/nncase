@@ -8,11 +8,12 @@ using System.Linq;
 using System.Text;
 using System.Threading.Tasks;
 using Nncase.CostModel;
+using Nncase.Passes.Distributed;
 using Nncase.Schedule;
 
 namespace Nncase.Targets;
 
-public class NTTTargetOptions : INTTTargetOptions, ITargetOpCostModelProvider, ITargetMachineModelProvider
+public class NTTTargetOptions : INTTTargetOptions, ITargetOpCostModelProvider, ITargetMachineModelProvider, IDistributedReshardRealizationPolicyProvider
 {
     private string _targetMachine = NTTTargetMachineCatalog.CpuGeneric;
     private TargetMachineModel _targetMachineModel = NTTTargetMachineCatalog.Resolve(NTTTargetMachineCatalog.CpuGeneric);
@@ -123,6 +124,9 @@ public class NTTTargetOptions : INTTTargetOptions, ITargetOpCostModelProvider, I
     public string CustomOpScheme { get; set; } = string.Empty;
 
     public ITargetOpCostModel TargetCostModel { get; set; }
+
+    public virtual IDistributedReshardRealizationPolicy ReshardRealizationPolicy
+        => NTTDistributedReshardRealizationPolicy.Instance;
 
     public IBlockMicroKernelModelProvider BlockMicroKernelModel { get; protected set; }
 

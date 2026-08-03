@@ -223,12 +223,23 @@ internal static class UserRebuilder
 
 internal sealed class SearchableNode
 {
-    public SearchableNode(BaseExpr expr, IRType type, bool isBidirect = false, SearchableNodeKind kind = SearchableNodeKind.Normal)
+    public SearchableNode(
+        BaseExpr expr,
+        IRType type,
+        bool isBidirect = false,
+        SearchableNodeKind kind = SearchableNodeKind.Normal,
+        DistributedReshardSourceKind? sourceKind = null)
     {
         Expr = expr;
         IRType = type;
         IsBidirect = isBidirect;
         Kind = kind;
+        SourceKind = sourceKind ??
+            (kind == SearchableNodeKind.FunctionParameter
+                ? DistributedReshardSourceKind.FunctionParameter
+                : expr is TensorConst
+                    ? DistributedReshardSourceKind.Constant
+                    : DistributedReshardSourceKind.Internal);
     }
 
     public BaseExpr Expr { get; }
@@ -238,6 +249,8 @@ internal sealed class SearchableNode
     public bool IsBidirect { get; }
 
     public SearchableNodeKind Kind { get; }
+
+    public DistributedReshardSourceKind SourceKind { get; }
 }
 
 internal sealed record CrossEdge : IEdge<SearchableNode>
@@ -292,14 +305,20 @@ internal sealed record BoxingTypeKey(IRType InputType, IRType OutputType, bool I
 
 internal sealed record LeafCandidateKey(TensorType TensorType);
 
-internal sealed record ReshardPlanKey(IRType SourceType, IRType TargetType, int MaxHops);
+internal sealed record ReshardPlanKey(
+    IRType SourceType,
+    IRType TargetType,
+    DistributedReshardSourceKind SourceKind,
+    DistributedReshardUsageKind UsageKind,
+    int MaxHops);
 
-internal sealed record BoxingCandidateKey(
+internal sealed record ReshardCandidateKey(
     DistributedSearchGraph OwnerCluster,
     DistributedSearchGraph? OutputBucket,
     DistributedSearchGraph InputBucket,
     SearchableNode InputNode,
     IRType TargetType,
+    DistributedReshardUsageKind UsageKind,
     SearchableNodeKind Kind,
     bool IsBidirect,
     DistributedSearchGraph? DependencyBucket,
@@ -574,6 +593,8 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
 
     private readonly IDistributedCandidateProviderResolver? _candidateProviderResolver;
 
+    private readonly IDistributedReshardRealizationPolicy _reshardRealizationPolicy;
+
     private readonly Dictionary<Type, ITypeInferencer> _inferencer_cache = new Dictionary<Type, ITypeInferencer>();
 
     private readonly Dictionary<CandidateDiagnosticKey, int> _candidateDiagnostics = new();
@@ -588,7 +609,7 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
 
     private readonly Dictionary<BoxingTypeKey, IRType> _boxingTypeMemo = new();
 
-    private readonly Dictionary<BoxingCandidateKey, (DistributedSearchGraph Bucket, SearchableNode Node)> _boxingCandidateMemo = new();
+    private readonly Dictionary<ReshardCandidateKey, (DistributedSearchGraph Bucket, SearchableNode Node)> _reshardCandidateMemo = new();
 
     private readonly Dictionary<TypeInferenceCacheKey, (bool Success, IRType CheckedType)> _typeInferenceMemo = new();
 
@@ -598,18 +619,22 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
 
     private readonly Dictionary<Function, Dictionary<IVar, DistributedSearchGraph>> _functionParameterClusters = new(ReferenceEqualityComparer.Instance);
 
+    private readonly Dictionary<Function, Dictionary<IVar, DistributedSearchGraph>> _functionParameterUseClusters = new(ReferenceEqualityComparer.Instance);
+
     private readonly HashSet<DistributedSearchGraph> _singleChoiceClusters = new(ReferenceEqualityComparer.Instance);
-
-    private Function? _currentFunction;
-
-    private bool _currentFunctionIsEntry;
-
-    private Dictionary<SearchableNode, bool>? _lastPicks;
 
     /// <summary>
     /// The original tensor consts that are distributed.
     /// </summary>
     private readonly Dictionary<TensorConst, TensorConst> _distributedConstSources = new(ReferenceEqualityComparer.Instance);
+
+    private Function? _currentFunction;
+
+    private bool _currentFunctionIsEntry;
+
+    private HashSet<BaseExpr>? _currentFunctionResultLeaves;
+
+    private Dictionary<SearchableNode, bool>? _lastPicks;
 
     private int _candidateDiagnosticTotal;
 
@@ -625,6 +650,7 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         CompileOptions = compileOptions;
         TargetOptions = targetOptions;
         _candidateProviderResolver = CompilerServices.GetService<IDistributedCandidateProviderResolver>();
+        _reshardRealizationPolicy = DistributedReshardRealizationPolicy.Get(targetOptions);
         _moduleKind = moduleKind;
         _phase = phase;
         if (Path.Exists(TargetOptions.DistributedScheme) && System.Text.Json.JsonSerializer.Deserialize<DistributedSchema>(File.ReadAllText(TargetOptions.DistributedScheme)) is DistributedSchema scheme)
@@ -687,7 +713,7 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
     }
 
     public static bool SupportsConstShardedView(INTTTargetOptions targetOptions)
-        => targetOptions.UnifiedMemoryArch && targetOptions.MemoryAccessArch == MemoryAccessArchitecture.UMA;
+        => DistributedReshardRealizationPolicy.Get(targetOptions).UsesShardedViewsForConstants(targetOptions);
 
     private static bool IsDistributableTensorType(TensorType tensorType)
         => tensorType.DType is not ReferenceType;
@@ -884,6 +910,7 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
     {
         _currentFunction = function;
         _currentFunctionIsEntry = isEntry;
+        _currentFunctionResultLeaves = CollectFunctionResultLeaves(function.Body);
         try
         {
             Visit(function.Body);
@@ -901,8 +928,37 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         {
             _currentFunction = null;
             _currentFunctionIsEntry = false;
+            _currentFunctionResultLeaves = null;
         }
     }
+
+    private HashSet<BaseExpr> CollectFunctionResultLeaves(BaseExpr body)
+    {
+        var leaves = new HashSet<BaseExpr>(ReferenceEqualityComparer.Instance);
+        Visit(body);
+        return leaves;
+
+        void Visit(BaseExpr expression)
+        {
+            if (expression is IR.Tuple tuple)
+            {
+                foreach (var field in tuple.Fields)
+                {
+                    Visit(field);
+                }
+
+                return;
+            }
+
+            leaves.Add(expression);
+        }
+    }
+
+    private DistributedReshardUsageKind GetResultAwareReshardUsageKind(BaseExpr expression)
+        => !_currentFunctionIsEntry &&
+            _currentFunctionResultLeaves?.Contains(expression) == true
+            ? DistributedReshardUsageKind.FunctionBoundary
+            : DistributedReshardUsageKind.Internal;
 
     public Function SolveAndExtract(Function function, DistributedSearchGraph root)
     {
@@ -1197,8 +1253,12 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
             return default;
         }
 
-        // 3. add bidirectional connections.
-        if (Bidirectional)
+        var outputReshardUsageKind = GetResultAwareReshardUsageKind(expr);
+
+        // 3. add bidirectional connections for values that remain inside the
+        // function. Function results use the separate output closure below so
+        // every reshard endpoint is realized with function-boundary semantics.
+        if (Bidirectional && outputReshardUsageKind == DistributedReshardUsageKind.Internal)
         {
             foreach (var (lType, lBucket) in bucketMemo.Where(kv => kv.Key is DistributedType))
             {
@@ -1206,11 +1266,12 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
                 {
                     if (CheckBoxingTypeCached(lType, rType) is not InvalidType)
                     {
-                        GetOrCreateBoxingCandidate(
+                        GetOrCreateReshardCandidate(
                             callCluster,
                             lBucket,
                             lBucket.Vertices.First(),
                             rType,
+                            usageKind: GetResultAwareReshardUsageKind(expr),
                             isBidirect: true,
                             outputBucket: rBucket,
                             addDataEdgeToOwnerCluster: true);
@@ -1227,7 +1288,11 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
             return default;
         }
 
-        CompleteOutputReshardClosure(callCluster, tensorType, directOutputBuckets);
+        CompleteOutputReshardClosure(
+            callCluster,
+            tensorType,
+            directOutputBuckets,
+            outputReshardUsageKind);
 
         // 5. filter
         FilterByScheme(expr, callCluster);
@@ -1267,9 +1332,14 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         return candidates;
     }
 
-    private IReadOnlyList<DistributedReshardPlan> GetReshardPlans(IRType sourceType, IRType targetType, int maxHops = DistributedReshardPlanner.DefaultMaxHops)
+    private IReadOnlyList<DistributedReshardPlan> GetReshardPlans(
+        IRType sourceType,
+        IRType targetType,
+        DistributedReshardSourceKind sourceKind,
+        DistributedReshardUsageKind usageKind,
+        int maxHops = DistributedReshardPlanner.DefaultMaxHops)
     {
-        var key = new ReshardPlanKey(sourceType, targetType, maxHops);
+        var key = new ReshardPlanKey(sourceType, targetType, sourceKind, usageKind, maxHops);
         if (_reshardPlanMemo.TryGetValue(key, out var cached))
         {
             _profiler.Count("reshard_plan_cache_hit");
@@ -1277,9 +1347,29 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         }
 
         _profiler.Count("reshard_plan_cache_miss");
-        var plans = DistributedReshardPlanner.Plan(sourceType, targetType, CanBoxingType, maxHops);
+        var plans = DistributedReshardPlanner.Plan(sourceType, targetType, CanRealize, maxHops);
         _reshardPlanMemo.Add(key, plans);
         return plans;
+
+        bool CanRealize(IRType edgeSourceType, IRType edgeTargetType)
+        {
+            if (!CanBoxingType(edgeSourceType, edgeTargetType))
+            {
+                return false;
+            }
+
+            var edgeSourceKind = EqualityComparer<IRType>.Default.Equals(edgeSourceType, sourceType)
+                ? sourceKind
+                : DistributedReshardSourceKind.Internal;
+            var edgeUsageKind = EqualityComparer<IRType>.Default.Equals(edgeTargetType, targetType)
+                ? usageKind
+                : DistributedReshardUsageKind.Internal;
+            return ClassifyReshardRealization(
+                edgeSourceType,
+                edgeTargetType,
+                edgeSourceKind,
+                edgeUsageKind) != DistributedReshardRealization.Unsupported;
+        }
     }
 
     private IRType CheckBoxingTypeCached(IRType inType, IRType outType, bool isReshape = false)
@@ -1501,8 +1591,10 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
     private void CompleteOutputReshardClosure(
         DistributedSearchGraph callCluster,
         TensorType tensorType,
-        IReadOnlyList<DistributedSearchGraph> directOutputBuckets)
+        IReadOnlyList<DistributedSearchGraph> directOutputBuckets,
+        DistributedReshardUsageKind usageKind)
     {
+        DistributedSearchGraph? pathCluster = null;
         var sources = directOutputBuckets
             .Select(bucket => (
                 Bucket: bucket,
@@ -1524,7 +1616,11 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
             {
                 var plans = _profiler.Time(
                     "output_reshard_plan",
-                    () => GetReshardPlans(source.Node.IRType, targetType));
+                    () => GetReshardPlans(
+                        source.Node.IRType,
+                        targetType,
+                        GetReshardSourceKind(source.Node),
+                        usageKind));
                 _profiler.Count("output_reshard_plans", plans.Count);
                 foreach (var plan in plans)
                 {
@@ -1540,10 +1636,12 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
                     _profiler.Count("output_reshard_steps", plan.StepTypes.Count);
                     AddOutputReshardPath(
                         callCluster,
+                        ref pathCluster,
                         source.Bucket,
                         source.Node,
                         targetBucket,
-                        plan.StepTypes);
+                        plan.StepTypes,
+                        usageKind);
                 }
             }
 
@@ -1556,22 +1654,31 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
 
     private void AddOutputReshardPath(
         DistributedSearchGraph callCluster,
+        ref DistributedSearchGraph? pathCluster,
         DistributedSearchGraph sourceBucket,
         SearchableNode sourceNode,
         DistributedSearchGraph targetBucket,
-        IReadOnlyList<IRType> stepTypes)
+        IReadOnlyList<IRType> stepTypes,
+        DistributedReshardUsageKind usageKind)
     {
         var inputBucket = sourceBucket;
         var inputNode = sourceNode;
         for (int i = 0; i < stepTypes.Count; i++)
         {
-            var (bucket, node) = GetOrCreateBoxingCandidate(
-                callCluster,
+            var isFinalStep = i == stepTypes.Count - 1;
+            var stepUsageKind = isFinalStep
+                ? usageKind
+                : DistributedReshardUsageKind.Internal;
+            var ownerCluster = isFinalStep
+                ? callCluster
+                : pathCluster ??= _rootSearchGraph.CreateCluster<DistributedSearchGraph>(SearchGraphKind.DistributedCluster);
+            var (bucket, node) = GetOrCreateReshardCandidate(
+                ownerCluster,
                 inputBucket,
                 inputNode,
                 stepTypes[i],
-                outputBucket: i == stepTypes.Count - 1 ? targetBucket : null,
-                addDataEdgeToOwnerCluster: true);
+                usageKind: stepUsageKind,
+                outputBucket: isFinalStep ? targetBucket : null);
             inputBucket = bucket;
             inputNode = node;
         }
@@ -1579,12 +1686,13 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
 
     private bool CanBoxingType(IRType inputType, IRType outputType) => CheckBoxingTypeCached(inputType, outputType) is not InvalidType;
 
-    private (DistributedSearchGraph Bucket, SearchableNode Node) GetOrCreateBoxingCandidate(
+    private (DistributedSearchGraph Bucket, SearchableNode Node) GetOrCreateReshardCandidate(
         DistributedSearchGraph ownerCluster,
         DistributedSearchGraph inputBucket,
         SearchableNode inputNode,
         IRType targetType,
         SearchableNodeKind kind = SearchableNodeKind.Normal,
+        DistributedReshardUsageKind? usageKind = null,
         bool isBidirect = false,
         DistributedSearchGraph? outputBucket = null,
         DistributedSearchGraph? dependencyBucket = null,
@@ -1593,26 +1701,55 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
     {
         if ((dependencyBucket is null) != (dependencyNode is null))
         {
-            throw new InvalidOperationException("A boxing candidate dependency must provide both bucket and node.");
+            throw new InvalidOperationException("A reshard candidate dependency must provide both bucket and node.");
         }
 
-        var key = new BoxingCandidateKey(
+        var resolvedUsageKind = usageKind ?? GetReshardUsageKind(inputNode, kind);
+        var key = new ReshardCandidateKey(
             ownerCluster,
             outputBucket,
             inputBucket,
             inputNode,
             targetType,
+            resolvedUsageKind,
             kind,
             isBidirect,
             dependencyBucket,
             dependencyNode);
-        if (_boxingCandidateMemo.TryGetValue(key, out var existing))
+        if (_reshardCandidateMemo.TryGetValue(key, out var existing))
         {
             return existing;
         }
 
         var bucket = outputBucket ?? ownerCluster.CreateCluster<DistributedSearchGraph>(SearchGraphKind.Bucket);
-        var node = new SearchableNode(new Boxing(targetType), targetType, isBidirect, kind);
+        var realization = ClassifyReshardRealization(
+            inputNode.IRType,
+            targetType,
+            GetReshardSourceKind(inputNode),
+            resolvedUsageKind);
+        var op = realization switch
+        {
+            DistributedReshardRealization.Boxing => (Op)new Boxing(targetType),
+            DistributedReshardRealization.ShardedView when targetType is DistributedType distributedType
+                => new IR.Distributed.ShardedView(distributedType),
+            DistributedReshardRealization.ShardedView
+                => throw new InvalidOperationException(
+                    $"ShardedView realization requires a DistributedType target, got {targetType}."),
+            DistributedReshardRealization.Unsupported
+                => throw new InvalidOperationException(
+                    $"Target {TargetOptions.GetType().Name} cannot realize reshard {inputNode.IRType} -> {targetType} " +
+                    $"from {GetReshardSourceKind(inputNode)} storage for {resolvedUsageKind} use."),
+            _ => throw new InvalidOperationException($"Unknown distributed reshard realization {realization}."),
+        };
+        var outputSourceKind = realization == DistributedReshardRealization.Boxing
+            ? DistributedReshardSourceKind.Internal
+            : inputNode.SourceKind;
+        var node = new SearchableNode(
+            op,
+            targetType,
+            isBidirect,
+            kind,
+            outputSourceKind);
         bucket.AddVertex(node);
         var dataEdge = new CrossEdge(node, inputNode, 0, inputBucket);
         if (addDataEdgeToOwnerCluster)
@@ -1630,10 +1767,35 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         }
 
         var created = (bucket, node);
-        _boxingCandidateMemo.Add(key, created);
-        _profiler.Count("boxing_candidate_created");
+        _reshardCandidateMemo.Add(key, created);
+        _profiler.Count($"reshard_candidate_created:{realization}");
         return created;
     }
+
+    private DistributedReshardRealization ClassifyReshardRealization(
+        IRType sourceType,
+        IRType targetType,
+        DistributedReshardSourceKind sourceKind,
+        DistributedReshardUsageKind usageKind)
+        => _reshardRealizationPolicy.Classify(
+            new DistributedReshardRealizationContext(
+                TargetOptions,
+                _moduleKind,
+                sourceType,
+                targetType,
+                sourceKind,
+                usageKind));
+
+    private DistributedReshardSourceKind GetReshardSourceKind(SearchableNode inputNode)
+        => inputNode.SourceKind;
+
+    private DistributedReshardUsageKind GetReshardUsageKind(
+        SearchableNode inputNode,
+        SearchableNodeKind candidateKind)
+        => candidateKind == SearchableNodeKind.FunctionBoundaryAdapter ||
+            inputNode.Kind == SearchableNodeKind.FunctionBoundaryAdapter
+            ? DistributedReshardUsageKind.FunctionBoundary
+            : DistributedReshardUsageKind.Internal;
 
     private Unit VisitLeafFunctionCall(Call expr, Function callee)
     {
@@ -1693,6 +1855,7 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
     {
         var callTargetName = call.Target is Callable callable ? callable.Name : call.Target.GetType().Name;
         var boundaryCluster = _rootSearchGraph.CreateCluster<DistributedSearchGraph>(SearchGraphKind.DistributedCluster);
+        DistributedSearchGraph? pathCluster = null;
         var formalBuckets = formalCluster.Clusters.OfType<DistributedSearchGraph>().ToArray();
         var actualBuckets = actualCluster.Clusters.OfType<DistributedSearchGraph>().ToArray();
         foreach (var formalBucket in formalBuckets)
@@ -1703,11 +1866,20 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
             {
                 var actualNode = actualBucket.Vertices.FirstOrDefault()
                     ?? throw new InvalidOperationException($"Function call {callTargetName} actual argument {argumentIndex} has an empty candidate bucket.");
-                foreach (var plan in GetFunctionBoundaryReshardPlans(actualNode.IRType, formalNode.IRType))
+                foreach (var plan in GetFunctionBoundaryReshardPlans(
+                             actualNode.IRType,
+                             formalNode.IRType,
+                             GetReshardSourceKind(actualNode)))
                 {
-                    var finalBucket = AddFunctionBoundaryReshardPath(boundaryCluster, actualBucket, actualNode, plan.StepTypes);
+                    var finalBucket = plan.StepTypes.Count == 0
+                        ? actualBucket
+                        : AddFunctionBoundaryReshardPath(
+                            pathCluster ??= _rootSearchGraph.CreateCluster<DistributedSearchGraph>(SearchGraphKind.DistributedCluster),
+                            actualBucket,
+                            actualNode,
+                            plan.StepTypes);
                     var finalNode = finalBucket.Vertices.First();
-                    GetOrCreateBoxingCandidate(
+                    GetOrCreateReshardCandidate(
                         boundaryCluster,
                         finalBucket,
                         finalNode,
@@ -1727,14 +1899,21 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         return boundaryCluster;
     }
 
-    private IEnumerable<DistributedReshardPlan> GetFunctionBoundaryReshardPlans(IRType sourceType, IRType targetType)
+    private IEnumerable<DistributedReshardPlan> GetFunctionBoundaryReshardPlans(
+        IRType sourceType,
+        IRType targetType,
+        DistributedReshardSourceKind sourceKind)
     {
         if (EqualityComparer<IRType>.Default.Equals(sourceType, targetType))
         {
             return new[] { new DistributedReshardPlan(Array.Empty<IRType>()) };
         }
 
-        return GetReshardPlans(sourceType, targetType);
+        return GetReshardPlans(
+            sourceType,
+            targetType,
+            sourceKind,
+            DistributedReshardUsageKind.FunctionBoundary);
     }
 
     private DistributedSearchGraph AddFunctionBoundaryReshardPath(
@@ -1745,13 +1924,17 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
     {
         var inputBucket = sourceBucket;
         var inputNode = sourceNode;
-        foreach (var stepType in stepTypes)
+        for (var index = 0; index < stepTypes.Count; index++)
         {
-            var (bucket, node) = GetOrCreateBoxingCandidate(
+            var stepUsageKind = index == stepTypes.Count - 1
+                ? DistributedReshardUsageKind.FunctionBoundary
+                : DistributedReshardUsageKind.Internal;
+            var (bucket, node) = GetOrCreateReshardCandidate(
                 boundaryCluster,
                 inputBucket,
                 inputNode,
-                stepType);
+                stepTypes[index],
+                usageKind: stepUsageKind);
             inputBucket = bucket;
             inputNode = node;
         }
@@ -1849,6 +2032,17 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         return clusters;
     }
 
+    private Dictionary<IVar, DistributedSearchGraph> GetFunctionParameterUseClusters(Function function)
+    {
+        if (!_functionParameterUseClusters.TryGetValue(function, out var clusters))
+        {
+            clusters = new Dictionary<IVar, DistributedSearchGraph>(ReferenceEqualityComparer.Instance);
+            _functionParameterUseClusters.Add(function, clusters);
+        }
+
+        return clusters;
+    }
+
     private bool TryGetCurrentInternalTensorParameter(Var var, [NotNullWhen(true)] out Function? function)
     {
         function = null;
@@ -1896,6 +2090,61 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         return distCluster;
     }
 
+    private DistributedSearchGraph CreateFunctionParameterUseCluster(
+        Function function,
+        Var parameter,
+        DistributedSearchGraph signatureCluster)
+    {
+        var clusters = GetFunctionParameterUseClusters(function);
+        if (clusters.TryGetValue(parameter, out var existing))
+        {
+            return existing;
+        }
+
+        if (parameter.CheckedType is not TensorType tensorType || !IsDistributableTensorType(tensorType))
+        {
+            throw new InvalidOperationException(
+                $"AutoDistributed function parameter uses only support distributable tensor parameters, got {parameter.CheckedType}.");
+        }
+
+        var useCluster = _rootSearchGraph.CreateCluster<DistributedSearchGraph>(SearchGraphKind.DistributedCluster);
+        var directUseBuckets = new List<DistributedSearchGraph>();
+        foreach (var signatureBucket in signatureCluster.Clusters.OfType<DistributedSearchGraph>())
+        {
+            var signatureNode = signatureBucket.Vertices.FirstOrDefault()
+                ?? throw new InvalidOperationException(
+                    $"Function {function.Name} parameter {parameter.Name} has an empty signature bucket.");
+            if (signatureNode.IRType is not DistributedType)
+            {
+                continue;
+            }
+
+            var useBucket = useCluster.CreateCluster<DistributedSearchGraph>(SearchGraphKind.Bucket);
+            var useNode = new SearchableNode(
+                parameter,
+                signatureNode.IRType,
+                kind: SearchableNodeKind.TypeAdapter,
+                sourceKind: DistributedReshardSourceKind.FunctionParameter);
+            useBucket.AddVertex(useNode);
+            _rootSearchGraph.AddEdge(new(useNode, signatureNode, 0, signatureBucket));
+            directUseBuckets.Add(useBucket);
+        }
+
+        if (directUseBuckets.Count == 0)
+        {
+            throw new InvalidOperationException(
+                $"Function {function.Name} parameter {parameter.Name} has no distributed signature candidates.");
+        }
+
+        CompleteOutputReshardClosure(
+            useCluster,
+            tensorType,
+            directUseBuckets,
+            DistributedReshardUsageKind.Internal);
+        clusters.Add(parameter, useCluster);
+        return useCluster;
+    }
+
     private DistributedSearchGraph CreateOriginatorCluster(BaseExpr expr, bool init)
     {
         if (expr is IR.Tuple tp)
@@ -1939,23 +2188,39 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
                 foreach (var dType in GetLeafCandidateDistTypes(tensorType))
                 {
                     var bucket = distCluster.CreateCluster<DistributedSearchGraph>(SearchGraphKind.Bucket);
-                    var distConst = new TensorConst(tc2.Value, dType.AxisPolicies, dType.Placement);
-                    if (_phase == AutoDistributedPhase.SearchConstant)
+                    var realization = _reshardRealizationPolicy.Classify(
+                        new DistributedReshardRealizationContext(
+                            TargetOptions,
+                            _moduleKind,
+                            tensorType,
+                            dType,
+                            DistributedReshardSourceKind.Constant,
+                            DistributedReshardUsageKind.Internal));
+                    switch (realization)
                     {
-                        _distributedConstSources.Add(distConst, tc2);
+                        case DistributedReshardRealization.Boxing:
+                            var distConst = new TensorConst(tc2.Value, dType.AxisPolicies, dType.Placement);
+                            if (_phase == AutoDistributedPhase.SearchConstant)
+                            {
+                                _distributedConstSources.Add(distConst, tc2);
+                            }
+
+                            bucket.AddVertex(new SearchableNode(distConst, dType));
+                            break;
+                        case DistributedReshardRealization.ShardedView:
+                            var shardedViewNode = new SearchableNode(new IR.Distributed.ShardedView(dType), dType);
+                            bucket.AddVertex(shardedViewNode);
+                            shardedViewInputBucket ??= CreateShardedViewInputBucket(tc2);
+                            _rootSearchGraph.AddEdge(new(shardedViewNode, shardedViewInputBucket.Vertices.First(), 0, shardedViewInputBucket));
+                            break;
+                        case DistributedReshardRealization.Unsupported:
+                            throw new InvalidOperationException(
+                                $"Target {TargetOptions.GetType().Name} cannot realize constant reshard {tensorType} -> {dType}.");
+                        default:
+                            throw new InvalidOperationException($"Unknown distributed reshard realization {realization}.");
                     }
 
-                    var dnode = new SearchableNode(distConst, dType);
-                    bucket.AddVertex(dnode);
-
-                    if (SupportsConstShardedView(TargetOptions))
-                    {
-                        var shardedViewBucket = distCluster.CreateCluster<DistributedSearchGraph>(SearchGraphKind.Bucket);
-                        var shardedViewNode = new SearchableNode(new IR.Distributed.ShardedView(dType), dType);
-                        shardedViewBucket.AddVertex(shardedViewNode);
-                        shardedViewInputBucket ??= CreateShardedViewInputBucket(tc2);
-                        _rootSearchGraph.AddEdge(new(shardedViewNode, shardedViewInputBucket.Vertices.First(), 0, shardedViewInputBucket));
-                    }
+                    _profiler.Count($"constant_reshard_realization:{realization}");
                 }
 
                 return distCluster;
@@ -2020,11 +2285,12 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
                 {
                     var inputBucket = inferCluster.Clusters.OfType<DistributedSearchGraph>().First();
                     var inputNode = inputBucket.Vertices.First();
-                    GetOrCreateBoxingCandidate(
+                    GetOrCreateReshardCandidate(
                         distCluster,
                         inputBucket,
                         inputNode,
-                        dType);
+                        dType,
+                        usageKind: GetResultAwareReshardUsageKind(expr));
                 }
 
                 return distCluster;
@@ -2082,6 +2348,12 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
 
         if (inferCluster.Kind is SearchGraphKind.DistributedCluster)
         {
+            if (expr is Var parameter &&
+                TryGetCurrentInternalTensorParameter(parameter, out var function))
+            {
+                return CreateFunctionParameterUseCluster(function, parameter, inferCluster);
+            }
+
             return inferCluster;
         }
 
@@ -2965,7 +3237,7 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
             {
                 var keep = group
                     .OrderBy(node => GetScore(costScoreMemo, node))
-                    .ThenBy(node => node.Expr is IR.Distributed.Boxing ? 1 : 0)
+                    .ThenBy(node => IsReshardRealization(node.Expr) ? 1 : 0)
                     .ThenBy(node => Array.IndexOf(vertices, node))
                     .First();
 
@@ -3092,7 +3364,7 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
                         var boolVar = cpmodel.NewBoolVar(string.Empty);
                         varMemo.Add(enode, boolVar);
                         if (_singleChoiceClusters.Contains(cluster)
-                            || enode.Expr is Op o && o is not Boxing)
+                            || enode.Expr is Op o && !IsReshardRealization(o))
                         {
                             clusterVarMemo[cluster].Add(boolVar);
                         }
@@ -3254,6 +3526,9 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
 
         return picks;
     }
+
+    private bool IsReshardRealization(BaseExpr expr)
+        => expr is IR.Distributed.Boxing or IR.Distributed.ShardedView;
 
     private BaseExpr ExtractSelectedExpression(DistributedSearchGraph rootCluster, Dictionary<SearchableNode, bool> picks)
         => _profiler.Time("extract_expr", () => new ExprBuildVisitor(_rootSearchGraph, picks).Visit(rootCluster.Clusters.OfType<DistributedSearchGraph>()));
@@ -3431,7 +3706,7 @@ internal sealed class ExprBuildVisitor
     private readonly Dictionary<SearchableNode, bool> _picks;
     private readonly DistributedSearchGraph _rootSearchGraph;
     private readonly Dictionary<SearchableNode, BaseExpr> _memo;
-    private readonly Dictionary<BaseExpr, Dictionary<IRType, BaseExpr>> _materializedBoxings;
+    private readonly Dictionary<BaseExpr, Dictionary<ReshardMaterializationKey, BaseExpr>> _materializedReshards;
     private readonly IReadOnlyDictionary<IVar, IVar> _parameterMap;
     private readonly IReadOnlyDictionary<Function, Function> _functionMap;
 
@@ -3444,7 +3719,7 @@ internal sealed class ExprBuildVisitor
         _rootSearchGraph = rootSearchGraph;
         _picks = picks;
         _memo = new();
-        _materializedBoxings = new(ReferenceEqualityComparer.Instance);
+        _materializedReshards = new(ReferenceEqualityComparer.Instance);
         _parameterMap = parameterMap ?? new Dictionary<IVar, IVar>(ReferenceEqualityComparer.Instance);
         _functionMap = functionMap ?? new Dictionary<Function, Function>(ReferenceEqualityComparer.Instance);
     }
@@ -3469,13 +3744,31 @@ internal sealed class ExprBuildVisitor
                 .ToArray();
             switch (root.Kind, root.Expr)
             {
-                case (SearchableNodeKind.FunctionBoundaryAdapter or SearchableNodeKind.TypeAdapter, _):
+                case (SearchableNodeKind.FunctionBoundaryAdapter, Op realization):
                     if (children.Length != 1)
                     {
                         throw new InvalidOperationException($"{root.Kind} expects one data input, got {children.Length}.");
                     }
 
-                    expr = MaterializeBoxing(children[0], root.IRType, $"{root.Kind} node");
+                    expr = MaterializeReshard(children[0], realization, root.IRType, $"{root.Kind} node");
+                    break;
+                case (SearchableNodeKind.FunctionBoundaryAdapter, _):
+                    throw new InvalidOperationException(
+                        $"{SearchableNodeKind.FunctionBoundaryAdapter} requires an explicit reshard op, got {root.Expr.GetType().Name}.");
+                case (SearchableNodeKind.TypeAdapter, _):
+                    if (children.Length != 1)
+                    {
+                        throw new InvalidOperationException($"{root.Kind} expects one data input, got {children.Length}.");
+                    }
+
+                    var childType = EnsureMaterializedType(children[0], $"{root.Kind} input");
+                    if (!EqualityComparer<IRType>.Default.Equals(childType, root.IRType))
+                    {
+                        throw new InvalidOperationException(
+                            $"{root.Kind} cannot change {childType} to {root.IRType} without an explicit reshard node.");
+                    }
+
+                    expr = children[0];
                     break;
                 case (_, Var var):
                     expr = _parameterMap.TryGetValue(var, out var mapped) ? (BaseExpr)mapped : var;
@@ -3489,7 +3782,15 @@ internal sealed class ExprBuildVisitor
                         throw new InvalidOperationException($"Cannot rebuild boxing call: expected one argument, got {children.Length}.");
                     }
 
-                    expr = MaterializeBoxing(children[0], boxing.NewType, "selected boxing call");
+                    expr = MaterializeReshard(children[0], boxing, boxing.NewType, "selected boxing call");
+                    break;
+                case (_, Call { Target: IR.Distributed.ShardedView shardedView }):
+                    if (children.Length != 1)
+                    {
+                        throw new InvalidOperationException($"Cannot rebuild sharded view call: expected one argument, got {children.Length}.");
+                    }
+
+                    expr = MaterializeReshard(children[0], shardedView, shardedView.NewType, "selected sharded view call");
                     break;
                 case (_, Call call):
                     if (children.Length == call.Arguments.Length)
@@ -3525,7 +3826,15 @@ internal sealed class ExprBuildVisitor
                         throw new InvalidOperationException($"Cannot rebuild boxing op: expected one argument, got {children.Length}.");
                     }
 
-                    expr = MaterializeBoxing(children[0], boxing.NewType, "selected boxing op");
+                    expr = MaterializeReshard(children[0], boxing, boxing.NewType, "selected boxing op");
+                    break;
+                case (_, IR.Distributed.ShardedView shardedView):
+                    if (children.Length != 1)
+                    {
+                        throw new InvalidOperationException($"Cannot rebuild sharded view op: expected one argument, got {children.Length}.");
+                    }
+
+                    expr = MaterializeReshard(children[0], shardedView, shardedView.NewType, "selected sharded view op");
                     break;
                 case (_, Op op):
                     expr = new Call(target: op, arguments: children);
@@ -3559,9 +3868,18 @@ internal sealed class ExprBuildVisitor
         for (int i = 0; i < children.Length; i++)
         {
             var parameterType = parameters[i].CheckedType;
-            arguments[i] = RequiresExactFunctionArgumentType(parameterType)
-                ? EnsureType(children[i], parameterType, $"function {target.Name} argument {i}")
-                : children[i];
+            if (RequiresExactFunctionArgumentType(parameterType))
+            {
+                var argumentType = EnsureMaterializedType(children[i], $"function {target.Name} argument {i}");
+                if (!EqualityComparer<IRType>.Default.Equals(argumentType, parameterType))
+                {
+                    throw new InvalidOperationException(
+                        $"Function {target.Name} argument {i} requires {parameterType}, but the selected boundary produced " +
+                        $"{argumentType} without an explicit reshard node.");
+                }
+            }
+
+            arguments[i] = children[i];
         }
 
         return arguments;
@@ -3574,12 +3892,7 @@ internal sealed class ExprBuildVisitor
         _ => false,
     };
 
-    private BaseExpr EnsureType(BaseExpr value, IRType targetType, string context)
-    {
-        return MaterializeBoxing(value, targetType, context);
-    }
-
-    private BaseExpr MaterializeBoxing(BaseExpr value, IRType targetType, string context)
+    private BaseExpr MaterializeReshard(BaseExpr value, Op realization, IRType targetType, string context)
     {
         var valueType = EnsureMaterializedType(value, context);
         if (EqualityComparer<IRType>.Default.Equals(valueType, targetType))
@@ -3587,25 +3900,33 @@ internal sealed class ExprBuildVisitor
             return value;
         }
 
-        if (!_materializedBoxings.TryGetValue(value, out var byTargetType))
+        if (!_materializedReshards.TryGetValue(value, out var byTargetType))
         {
-            byTargetType = new Dictionary<IRType, BaseExpr>();
-            _materializedBoxings.Add(value, byTargetType);
+            byTargetType = new Dictionary<ReshardMaterializationKey, BaseExpr>();
+            _materializedReshards.Add(value, byTargetType);
         }
 
-        if (byTargetType.TryGetValue(targetType, out var existing))
+        var realizationKind = realization switch
+        {
+            Boxing => DistributedReshardRealization.Boxing,
+            IR.Distributed.ShardedView => DistributedReshardRealization.ShardedView,
+            _ => throw new InvalidOperationException(
+                $"AutoDistributed cannot materialize {context} with non-reshard op {realization.GetType().Name}."),
+        };
+        var key = new ReshardMaterializationKey(targetType, realizationKind);
+        if (byTargetType.TryGetValue(key, out var existing))
         {
             return existing;
         }
 
-        var boxed = new Call(new Boxing(targetType), value);
-        if (!CompilerServices.InferenceType(boxed) || boxed.CheckedType is InvalidType)
+        var resharded = new Call(realization, value);
+        if (!CompilerServices.InferenceType(resharded) || resharded.CheckedType is InvalidType)
         {
             throw new InvalidOperationException($"AutoDistributed cannot materialize {context}: cannot convert {value.CheckedType} to {targetType}.");
         }
 
-        byTargetType.Add(targetType, boxed);
-        return boxed;
+        byTargetType.Add(key, resharded);
+        return resharded;
     }
 
     private IRType EnsureMaterializedType(BaseExpr value, string context)
@@ -3687,6 +4008,10 @@ internal sealed class ExprBuildVisitor
 
     private string FormatOneLine(string text)
         => text.Replace("\r", " ", StringComparison.Ordinal).Replace("\n", " ", StringComparison.Ordinal);
+
+    private readonly record struct ReshardMaterializationKey(
+        IRType TargetType,
+        DistributedReshardRealization Realization);
 }
 
 internal sealed class DistributedCostEvaluateContext : Evaluator.ICostEvaluateContext

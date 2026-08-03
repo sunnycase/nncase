@@ -6,7 +6,7 @@ using Nncase.PatternMatch;
 namespace Nncase.IR.Distributed;
 
 /// <summary>
-/// Read-only distributed alias view over an unsharded tensor.
+/// Read-only distributed alias view over immutable or canonical shared tensor storage.
 /// </summary>
 [PatternFunctionalGenerator]
 public sealed partial class ShardedView : Op

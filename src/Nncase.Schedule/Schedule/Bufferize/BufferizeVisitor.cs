@@ -338,7 +338,7 @@ public sealed class BufferizeVisitor : ExprRewriter
             {
                 var constValue = (Const)((Call)buffer.Start)[IR.Buffers.AddressOf.Input];
                 var range = new ValueRange<ulong>((ulong)lifetime.Memory.Start, (ulong)lifetime.Memory.Stop);
-                func.SchedResult.Rdatas.Add(constValue, range);
+                AddReadOnlyDataAllocation(func, MemoryLocation.Rdata, func.SchedResult.Rdatas, constValue, range);
             }
 
             _currentRdataStart = GetReadOnlyRDataEnd(_rdataRanges);
@@ -353,7 +353,12 @@ public sealed class BufferizeVisitor : ExprRewriter
             {
                 var constValue = (Const)((Call)buffer.Start)[IR.Buffers.AddressOf.Input];
                 var range = new ValueRange<ulong>((ulong)lifetime.Memory.Start, (ulong)lifetime.Memory.Stop);
-                func.SchedResult.ChipLocalRdatas.Add(constValue, range);
+                AddReadOnlyDataAllocation(
+                    func,
+                    MemoryLocation.ChipLocalRdata,
+                    func.SchedResult.ChipLocalRdatas,
+                    constValue,
+                    range);
             }
 
             _currentChipLocalRdataStart = GetReadOnlyRDataEnd(_chipLocalRdataRanges);
@@ -368,11 +373,38 @@ public sealed class BufferizeVisitor : ExprRewriter
             {
                 var constValue = (Const)((Call)buffer.Start)[IR.Buffers.AddressOf.Input];
                 var range = new ValueRange<ulong>((ulong)lifetime.Memory.Start, (ulong)lifetime.Memory.Stop);
-                func.SchedResult.BlockLocalRdatas.Add(constValue, range);
+                AddReadOnlyDataAllocation(
+                    func,
+                    MemoryLocation.BlockLocalRdata,
+                    func.SchedResult.BlockLocalRdatas,
+                    constValue,
+                    range);
             }
 
             _currentBlockLocalRdataStart = blockLocalRdataResult.MemoryPoolEnd;
         }
+    }
+
+    private void AddReadOnlyDataAllocation(
+        PrimFunction function,
+        MemoryLocation location,
+        Dictionary<Const, ValueRange<ulong>> allocations,
+        Const constValue,
+        ValueRange<ulong> range)
+    {
+        if (allocations.TryGetValue(constValue, out var existing))
+        {
+            if (existing != range)
+            {
+                throw new InvalidOperationException(
+                    $"PrimFunction {function.Name} assigns the same {location} constant to conflicting ranges " +
+                    $"{existing} and {range}.");
+            }
+
+            return;
+        }
+
+        allocations.Add(constValue, range);
     }
 
     private void ReuseReadOnlyRDataResult(

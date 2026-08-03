@@ -42,6 +42,23 @@ internal static class DistributedReshardPlanner
             return plans;
         }
 
+        foreach (var reduceScatterType in
+                 DistributedReshardDecomposition.GetPartialReduceScatterIntermediates(source, target))
+        {
+            AddPlanIfValid(
+                sourceType,
+                new IRType[] { reduceScatterType, targetType },
+                canBox,
+                maxHops,
+                plans,
+                seen);
+        }
+
+        if (plans.Count > 0)
+        {
+            return plans;
+        }
+
         var sourceNoPartial = source.Partial is null
             ? source
             : new DistributedType(source.TensorType, source.AxisPolicies, source.Placement);

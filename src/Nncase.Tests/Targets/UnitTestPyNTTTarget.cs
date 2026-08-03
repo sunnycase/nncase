@@ -2753,7 +2753,8 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         RenderGeneratedKernels(outputDirectory);
         var generatedKernelsPy = File.ReadAllText(Path.Join(outputDirectory, "generated_kernels.py"));
         Assert.Contains("stage=tile_scatter", generatedKernelsPy, StringComparison.Ordinal);
-        Assert.Contains("(shard_coord0 == 0)", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("(shard_coord0 == destination_shard_coord0)", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.DoesNotContain("(shard_coord0 == 0)", generatedKernelsPy, StringComparison.Ordinal);
         Assert.Contains("for reduce_coord0 in tl.range(0, 4)", generatedKernelsPy, StringComparison.Ordinal);
         Assert.Contains("source_pool_index = source_shard_index", generatedKernelsPy, StringComparison.Ordinal);
         Assert.Contains("destination_shard_coord0 = tmp_output_split0 % 4", generatedKernelsPy, StringComparison.Ordinal);

@@ -145,6 +145,44 @@ public sealed class UnitTestTritonTargetCostModel : TestClassBase
     }
 
     [Fact]
+    public void TestShardedViewCostsSynchronizationWithoutCopyTraffic()
+    {
+        CompileOptions.TargetOptions = CreateOptions(CreateGpuMachine());
+        var placement = new Placement([4, 8], "yx", "bb");
+        var tensorType = new TensorType(DataTypes.BFloat16, new RankedShape(32, 128));
+        var inputType = new DistributedType(tensorType, [SBP.S([0]), SBP.S([1])], placement);
+        var outputType = new DistributedType(tensorType, [SBP.B, SBP.B], placement);
+        var input = new Var("input", inputType);
+        var shardedView = IR.F.Distributed.ShardedView(input, outputType);
+        CompilerServices.InferenceType(shardedView);
+
+        var cost = CompilerServices.EvaluateCost(shardedView, CompileOptions);
+
+        Assert.Equal((UInt128)1, cost[CostFactorNames.GridSynchronization]);
+        Assert.False(cost.Factors.ContainsKey(CostFactorNames.BlockLocalMemoryLoadBytes));
+        Assert.False(cost.Factors.ContainsKey(CostFactorNames.BlockLocalMemoryStoreBytes));
+        Assert.False(cost.Factors.ContainsKey(CostFactorNames.ChipGlobalMemoryLoadBytes));
+        Assert.False(cost.Factors.ContainsKey(CostFactorNames.ChipGlobalMemoryStoreBytes));
+    }
+
+    [Fact]
+    public void TestLocalShardSubviewHasNoSynchronizationOrCopyCost()
+    {
+        CompileOptions.TargetOptions = CreateOptions(CreateGpuMachine());
+        var placement = new Placement([4, 8], "yx", "bb");
+        var tensorType = new TensorType(DataTypes.BFloat16, new RankedShape(32, 128));
+        var inputType = new DistributedType(tensorType, [SBP.B, SBP.B], placement);
+        var outputType = new DistributedType(tensorType, [SBP.S([0]), SBP.S([1])], placement);
+        var input = new Var("input", inputType);
+        var shardedView = IR.F.Distributed.ShardedView(input, outputType);
+        CompilerServices.InferenceType(shardedView);
+
+        var cost = CompilerServices.EvaluateCost(shardedView, CompileOptions);
+
+        Assert.Empty(cost.Factors);
+    }
+
+    [Fact]
     public void TestPackedMatMulUsesLocalSimtModel()
     {
         CompileOptions.TargetOptions = CreateOptions(CreateGpuMachine(rootBytesPerCycle: 1_000_000));

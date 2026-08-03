@@ -45,12 +45,6 @@ public sealed class PyNTTTarget : NTTTarget
     }
 
     /// <inheritdoc/>
-    public override void RegisterTIRPreBufferizePass(IPassManager passManager, CompileOptions options)
-    {
-        passManager.AddWithName<LowerReshardToChipLocalDataPass>("LowerReshardToChipLocalData", Kind);
-    }
-
-    /// <inheritdoc/>
     public override void RegisterTIRPostBufferizePass(IPassManager passManager, CompileOptions options)
     {
         passManager.AddWithName<InlineSingleCallPrimFunctionsPass>("InlineSingleCallPrimFunctions", Kind);

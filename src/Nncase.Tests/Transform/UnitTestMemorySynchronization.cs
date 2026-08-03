@@ -99,6 +99,262 @@ public sealed class UnitTestMemorySynchronization : TestClassBase
     }
 
     [Fact]
+    public async Task TestPyNTTShardedViewLowersDirectlyToChipLocalAlias()
+    {
+        CompileOptions.TargetOptions = new PyNTTTargetOptions();
+        var tensorType = new TensorType(DataTypes.Float32, new[] { 32, 64 });
+        var placement = new Placement([4, 8], "yx", "bb");
+        var splitType = new DistributedType(
+            tensorType,
+            [SBP.S([0]), SBP.S([1])],
+            placement);
+        var broadcastType = new DistributedType(
+            tensorType,
+            [SBP.B, SBP.B],
+            placement);
+        var input = new Var("input", splitType);
+        var producer = IR.F.Math.Unary(UnaryOp.Abs, input);
+        var view = IR.F.Distributed.ShardedView(producer, broadcastType);
+        var consumer = IR.F.Math.Unary(UnaryOp.Neg, view);
+        var result = IR.F.Distributed.Boxing(consumer, tensorType);
+        var function = new Function(
+            "main",
+            PyNTTTarget.Kind,
+            result,
+            new[] { input });
+        Assert.True(function.InferenceType());
+
+        var lowered = Assert.IsType<PrimFunction>(
+            await new NTTTIRSelectionPass(CompileOptions, PyNTTTarget.Kind).RunAsync(function, new()));
+        var unaryCalls = ExprCollector.Collect(lowered.Body)
+            .OfType<Call>()
+            .Where(call => call.Target is TIR.NTT.Unary)
+            .ToArray();
+        Assert.Equal(2, unaryCalls.Length);
+        var producerOutput = Assert.IsType<TIR.Buffer>(unaryCalls[0][TIR.NTT.Unary.Output]);
+        var consumerInput = Assert.IsType<TIR.Buffer>(unaryCalls[1][TIR.NTT.Unary.Input]);
+
+        Assert.Equal(MemoryLocation.ChipLocalData, producerOutput.MemSpan.Buffer.Location);
+        Assert.Same(producerOutput.MemSpan.Buffer, consumerInput.MemSpan.Buffer);
+        Assert.Equal(splitType, producerOutput.DistributedType);
+        Assert.Equal(broadcastType, consumerInput.DistributedType);
+        Assert.Equal(new long[] { 64, 1 }, producerOutput.Strides.ToArray().Select(stride => stride.FixedValue).ToArray());
+        Assert.Equal(new long[] { 64, 1 }, consumerInput.Strides.ToArray().Select(stride => stride.FixedValue).ToArray());
+        Assert.Equal(8192, producerOutput.MemSpan.Buffer.Size.FixedValue);
+        Assert.Equal(1824, producerOutput.MemSpan.Size.FixedValue);
+        Assert.Equal(8192, consumerInput.MemSpan.Size.FixedValue);
+        Assert.DoesNotContain(
+            ExprCollector.Collect(lowered),
+            expression => expression is IR.Distributed.ShardedView);
+        Assert.Single(
+            ExprCollector.Collect(lowered.Body)
+                .OfType<Call>()
+                .Where(call => call.Target is TIR.NTT.TensorStore));
+
+        var module = new IRModule(lowered);
+        await new PlanMemorySynchronizationPass(
+            PyNTTTarget.Kind,
+            MemorySynchronizationScopes.All).RunAsync(module, new());
+        var planned = Assert.IsType<PrimFunction>(module.Entry);
+        _ = Assert.Single(
+            ExprCollector.Collect(planned.Body)
+                .OfType<Call>()
+                .Where(call => call.Target is TIR.NTT.Barrier { Scope: TIR.NTT.BarrierScope.Chip }));
+    }
+
+    [Fact]
+    public async Task TestPyNTTReplicatedBlockShardedViewUsesIdempotentCanonicalWrites()
+    {
+        CompileOptions.TargetOptions = new PyNTTTargetOptions();
+        var tensorType = new TensorType(DataTypes.Float32, new[] { 32, 64 });
+        var placement = new Placement([4, 8], "yx", "bb");
+        var xSplitType = new DistributedType(
+            tensorType,
+            [SBP.B, SBP.S([1])],
+            placement);
+        var broadcastType = new DistributedType(
+            tensorType,
+            [SBP.B, SBP.B],
+            placement);
+        var input = new Var("input", xSplitType);
+        var producer = IR.F.Math.Unary(UnaryOp.Abs, input);
+        var view = IR.F.Distributed.ShardedView(producer, broadcastType);
+        var consumer = IR.F.Math.Unary(UnaryOp.Neg, view);
+        var result = IR.F.Distributed.Boxing(consumer, tensorType);
+        var function = new Function(
+            "main",
+            PyNTTTarget.Kind,
+            result,
+            new[] { input });
+        Assert.True(function.InferenceType());
+
+        var lowered = Assert.IsType<PrimFunction>(
+            await new NTTTIRSelectionPass(CompileOptions, PyNTTTarget.Kind).RunAsync(function, new()));
+        var unaryCalls = ExprCollector.Collect(lowered.Body)
+            .OfType<Call>()
+            .Where(call => call.Target is TIR.NTT.Unary)
+            .ToArray();
+        Assert.Equal(2, unaryCalls.Length);
+        var producerOutput = Assert.IsType<TIR.Buffer>(unaryCalls[0][TIR.NTT.Unary.Output]);
+        var consumerInput = Assert.IsType<TIR.Buffer>(unaryCalls[1][TIR.NTT.Unary.Input]);
+
+        Assert.Equal(MemoryLocation.ChipLocalData, producerOutput.MemSpan.Buffer.Location);
+        Assert.Same(producerOutput.MemSpan.Buffer, consumerInput.MemSpan.Buffer);
+        Assert.Equal(xSplitType, producerOutput.DistributedType);
+        Assert.Equal(broadcastType, consumerInput.DistributedType);
+        Assert.Equal(new long[] { 32, 8 }, producerOutput.Dimensions.ToArray().Select(dim => dim.FixedValue).ToArray());
+        Assert.Equal(new long[] { 64, 1 }, producerOutput.Strides.ToArray().Select(stride => stride.FixedValue).ToArray());
+        var producerCoordinates = ExprCollector.Collect(producerOutput.MemSpan.Start)
+            .OfType<DimVar>()
+            .Select(dimVar => dimVar.Name)
+            .ToArray();
+        Assert.Contains("__shard_coord_1", producerCoordinates);
+        Assert.DoesNotContain("__shard_coord_0", producerCoordinates);
+        Assert.Empty(ExprCollector.Collect(consumerInput.MemSpan.Start).OfType<DimVar>());
+
+        var module = new IRModule(lowered);
+        await new PlanMemorySynchronizationPass(
+            PyNTTTarget.Kind,
+            MemorySynchronizationScopes.All).RunAsync(module, new());
+        var planned = Assert.IsType<PrimFunction>(module.Entry);
+        Assert.Single(
+            ExprCollector.Collect(planned.Body)
+                .OfType<Call>()
+                .Where(call => call.Target is TIR.NTT.Barrier { Scope: TIR.NTT.BarrierScope.Chip }));
+    }
+
+    [Fact]
+    public async Task TestPyNTTLocalShardSubviewAliasesCallerBackingWithoutGridSynchronization()
+    {
+        CompileOptions.TargetOptions = new PyNTTTargetOptions();
+        var tensorType = new TensorType(DataTypes.Float32, new[] { 32, 64 });
+        var placement = new Placement([4, 8], "yx", "bb");
+        var broadcastType = new DistributedType(
+            tensorType,
+            [SBP.B, SBP.B],
+            placement);
+        var splitType = new DistributedType(
+            tensorType,
+            [SBP.S([0]), SBP.S([1])],
+            placement);
+        var residual = new Var("residual", broadcastType);
+        var projected = new Var("projected", splitType);
+        var localResidual = IR.F.Distributed.ShardedView(residual, splitType);
+        var localSum = IR.F.Math.Binary(BinaryOp.Add, localResidual, projected);
+        var broadcastResult = IR.F.Distributed.ShardedView(localSum, broadcastType);
+        var result = IR.F.Distributed.Boxing(broadcastResult, tensorType);
+        var function = new Function(
+            "main",
+            PyNTTTarget.Kind,
+            result,
+            new[] { residual, projected });
+        Assert.True(function.InferenceType());
+
+        var lowered = Assert.IsType<PrimFunction>(
+            await new NTTTIRSelectionPass(CompileOptions, PyNTTTarget.Kind).RunAsync(function, new()));
+        var binaryCall = Assert.Single(
+            ExprCollector.Collect(lowered.Body)
+                .OfType<Call>()
+                .Where(call => call.Target is TIR.NTT.VectorizedBinary));
+        var residualView = Assert.IsType<TIR.Buffer>(binaryCall[TIR.NTT.VectorizedBinary.Lhs]);
+        var localSumBuffer = Assert.IsType<TIR.Buffer>(binaryCall[TIR.NTT.VectorizedBinary.Output]);
+        var tensorStore = Assert.Single(
+            ExprCollector.Collect(lowered.Body)
+                .OfType<Call>()
+                .Where(call => call.Target is TIR.NTT.TensorStore));
+        var broadcastResultBuffer = Assert.IsType<TIR.Buffer>(tensorStore[TIR.NTT.TensorStore.Src]);
+
+        Assert.Equal(MemoryLocation.Input, residualView.MemSpan.Buffer.Location);
+        Assert.Equal(splitType, residualView.DistributedType);
+        Assert.Equal(new long[] { 8, 8 }, residualView.Dimensions.ToArray().Select(dim => dim.FixedValue).ToArray());
+        Assert.Equal(new long[] { 64, 1 }, residualView.Strides.ToArray().Select(stride => stride.FixedValue).ToArray());
+        Assert.Equal(1824, residualView.MemSpan.Size.FixedValue);
+        Assert.Equal(MemoryLocation.ChipLocalData, localSumBuffer.MemSpan.Buffer.Location);
+        Assert.Same(localSumBuffer.MemSpan.Buffer, broadcastResultBuffer.MemSpan.Buffer);
+        Assert.Equal(splitType, localSumBuffer.DistributedType);
+        Assert.Equal(broadcastType, broadcastResultBuffer.DistributedType);
+        Assert.DoesNotContain(
+            ExprCollector.Collect(lowered),
+            expression => expression is IR.Distributed.ShardedView);
+
+        var module = new IRModule(lowered);
+        await new PlanMemorySynchronizationPass(
+            PyNTTTarget.Kind,
+            MemorySynchronizationScopes.All).RunAsync(module, new());
+        var planned = Assert.IsType<PrimFunction>(module.Entry);
+        Assert.Single(
+            ExprCollector.Collect(planned.Body)
+                .OfType<Call>()
+                .Where(call => call.Target is TIR.NTT.Barrier { Scope: TIR.NTT.BarrierScope.Chip }));
+    }
+
+    [Fact]
+    public async Task TestPyNTTPartialReduceScatterFeedsBroadcastShardedView()
+    {
+        CompileOptions.TargetOptions = new PyNTTTargetOptions();
+        var placement = new Placement([4, 8], "yx", "bb");
+        var inputType = new DistributedType(
+            new TensorType(DataTypes.Float32, new[] { 1, 128 }),
+            [SBP.B, SBP.S([0, 1], 4)],
+            placement);
+        var input = new Var("input", inputType);
+        var stats = IR.F.NN.NormStats(1, input, useMean: false);
+        var partialType = Assert.IsType<DistributedType>(stats.CheckedType);
+        Assert.Equal(SBP.P([0, 1], ReduceOp.Sum), partialType.Partial);
+        var reduceScatterType = new DistributedType(
+            partialType.TensorType,
+            [SBP.S([0, 1], 1), SBP.B, SBP.B],
+            placement);
+        var broadcastType = new DistributedType(
+            partialType.TensorType,
+            [SBP.B, SBP.B, SBP.B],
+            placement);
+        var reduceScatter = IR.F.Distributed.Boxing(stats, reduceScatterType);
+        var broadcastView = IR.F.Distributed.ShardedView(reduceScatter, broadcastType);
+        var consumer = IR.F.Math.Unary(UnaryOp.Neg, broadcastView);
+        var result = IR.F.Distributed.Boxing(consumer, partialType.TensorType);
+        var function = new Function(
+            "main",
+            PyNTTTarget.Kind,
+            result,
+            new[] { input });
+        Assert.True(function.InferenceType());
+
+        var lowered = Assert.IsType<PrimFunction>(
+            await new NTTTIRSelectionPass(CompileOptions, PyNTTTarget.Kind).RunAsync(function, new()));
+        var reduceScatterCall = Assert.Single(
+            ExprCollector.Collect(lowered.Body)
+                .OfType<Call>()
+                .Where(call => call.Target is TIR.NTT.GatherReduceScatter));
+        var consumerCall = Assert.Single(
+            ExprCollector.Collect(lowered.Body)
+                .OfType<Call>()
+                .Where(call => call.Target is TIR.NTT.Unary));
+        var reduceScatterOutput = Assert.IsType<TIR.Buffer>(
+            reduceScatterCall[TIR.NTT.GatherReduceScatter.Output]);
+        var consumerInput = Assert.IsType<TIR.Buffer>(consumerCall[TIR.NTT.Unary.Input]);
+
+        Assert.Equal(MemoryLocation.ChipLocalData, reduceScatterOutput.MemSpan.Buffer.Location);
+        Assert.Same(reduceScatterOutput.MemSpan.Buffer, consumerInput.MemSpan.Buffer);
+        Assert.Equal(reduceScatterType, reduceScatterOutput.DistributedType);
+        Assert.Equal(broadcastType, consumerInput.DistributedType);
+        Assert.DoesNotContain(
+            ExprCollector.Collect(lowered),
+            expression => expression is IR.Distributed.ShardedView);
+
+        var module = new IRModule(lowered);
+        await new PlanMemorySynchronizationPass(
+            PyNTTTarget.Kind,
+            MemorySynchronizationScopes.All).RunAsync(module, new());
+        var planned = Assert.IsType<PrimFunction>(module.Entry);
+        Assert.Equal(
+            2,
+            ExprCollector.Collect(planned.Body)
+                .OfType<Call>()
+                .Count(call => call.Target is TIR.NTT.Barrier { Scope: TIR.NTT.BarrierScope.Chip }));
+    }
+
+    [Fact]
     public async Task TestInterproceduralUpdatesShareOneOuterChipBarrier()
     {
         var cacheType = TensorType.Scalar(new ReferenceType(DataTypes.Int32));
