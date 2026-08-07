@@ -47,55 +47,46 @@
 @triton.jit
 def {{ model["FunctionName"] }}__producer(writer, {{ helper_parameters(model) }}):
     shard_index = tl.program_id(0).to(tl.int64)
-    for n_tile in tl.range(
+    for n_tile in tl.static_range(
         0,
         {{ ctx["num_n_tiles"] }},
-        loop_unroll_factor=1,
     ):
-        n_start = n_tile * {{ ctx["block_n"] }}
         for k_tile in tl.range(0, {{ ctx["num_k_tiles"] }}):
             sequence = (
                 n_tile * {{ ctx["num_k_tiles"] }} + k_tile
             ).to(tl.int32)
             slot = writer.acquire(sequence)
-            for n_chunk in tl.static_range(0, {{ ctx["copies_per_tile"] }}):
-                copy_global_n = n_start + n_chunk * {{ ctx["copy_n"] }}
-{% if ctx["copy_is_full_stage"] %}
+{% for tile in ctx["transfer_tiles"] %}
+            {{ "if" if loop.first else "elif" }} n_tile == {{ tile["tile_index"] }}:
+{% for copy in tile["copies"] %}
+                descriptor_k = (
+                    {{ dim(copy["descriptor_global_k_outer_offset"]) }}
+                    + k_tile * {{ ctx["packed_k_outer"] }}
+                ).to(tl.int32)
+                descriptor_n = (
+                    {{ dim(copy["descriptor_global_n_outer_offset"]) }}
+                    + {{ copy["descriptor_projection_n_outer_offset"] }}
+                ).to(tl.int32)
+{% if copy["copy_is_full_stage"] %}
                 copy_destination = slot.weight
 {% else %}
                 copy_destination = slot.weight.subslice(
-                    [n_chunk * {{ ctx["copy_n_outer"] }}, 0, 0, 0],
-                    [{{ ctx["copy_shape"] | join(", ") }}],
+                    [{{ copy["destination_n_outer_offset"] }}, 0, 0, 0],
+                    [{{ copy["copy_shape"] | join(", ") }}],
                 )
 {% endif %}
-{% for projection in ctx["projections"] %}
-                {{ "if" if loop.first else "elif" }} (
-                    copy_global_n >= {{ projection["projection_start"] }}
-                    and copy_global_n < {{ projection["copy_end"] }}
-                ):
-                    descriptor_k = (
-                        {{ dim(projection["descriptor_global_k_outer_offset"]) }}
-                        + k_tile * {{ ctx["packed_k_outer"] }}
-                    ).to(tl.int32)
-                    descriptor_n = (
-                        {{ dim(projection["descriptor_global_n_outer_offset"]) }}
-                        + (
-                            copy_global_n
-                            - {{ projection["projection_start"] }}
-                        ) // {{ model["NVectorLaneCount"] }}
-                    ).to(tl.int32)
-                    tle.gpu.copy(
-                        {{ projection["descriptor_name"] }},
-                        copy_destination,
-                        [{{ ctx["copy_shape"] | join(", ") }}],
-                        offsets=[
-                            descriptor_n,
-                            descriptor_k,
-                            0,
-                            0,
-                        ],
-                        eviction_policy="evict_first",
-                    )
+                tle.gpu.copy(
+                    {{ copy["descriptor_name"] }},
+                    copy_destination,
+                    [{{ copy["copy_shape"] | join(", ") }}],
+                    offsets=[
+                        descriptor_n,
+                        descriptor_k,
+                        0,
+                        0,
+                    ],
+                )
+{% endfor %}
 {% endfor %}
             writer.commit(sequence)
     writer.close({{ ctx["num_n_tiles"] * ctx["num_k_tiles"] }})

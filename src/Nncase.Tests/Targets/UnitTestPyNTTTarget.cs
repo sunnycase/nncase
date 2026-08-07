@@ -5,6 +5,7 @@ using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Text.Encodings.Web;
@@ -373,7 +374,7 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         var modelPy = File.ReadAllText(Path.Join(outputDirectory, "model.py"));
         Assert.Contains("grid = (32,)", modelPy, StringComparison.Ordinal);
         Assert.Contains("from .generated_kernels import main_prim_binary_0", modelPy, StringComparison.Ordinal);
-        Assert.Contains("main_prim_binary_0[grid](", modelPy, StringComparison.Ordinal);
+        Assert.Contains("pyntt_prepared_kernel.launch(", modelPy, StringComparison.Ordinal);
         Assert.DoesNotContain("from . import generated_kernels as _generated_kernels", modelPy, StringComparison.Ordinal);
         Assert.DoesNotContain("_generated_kernels.", modelPy, StringComparison.Ordinal);
         Assert.Contains("data = self.allocate_workspace(inputs, ", modelPy, StringComparison.Ordinal);
@@ -467,7 +468,7 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         foreach (var topKernelName in topKernelNames)
         {
             Assert.Contains($"from .generated_kernels import {topKernelName}", modelPy, StringComparison.Ordinal);
-            Assert.Contains($"{topKernelName}[grid](", modelPy, StringComparison.Ordinal);
+            Assert.Contains("pyntt_prepared_kernel.launch(", modelPy, StringComparison.Ordinal);
         }
 
         var runtimeStatements = topKernelNames
@@ -1425,7 +1426,9 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
                 .Select(input => input.GetString())
                 .ToArray();
             Assert.DoesNotContain(kvCacheObjVar.Name, kernelInputs);
-            Assert.Contains($"{kvCacheObjVar.Name}.__metadata", kernelInputs);
+            Assert.Contains($"{kvCacheObjVar.Name}.__query_start_loc", kernelInputs);
+            Assert.Contains($"{kvCacheObjVar.Name}.__seq_lens", kernelInputs);
+            Assert.Contains($"{kvCacheObjVar.Name}.__num_seqs", kernelInputs);
         }
 
         AssertGeneratedModelRuns(
@@ -1441,10 +1444,10 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
             "class MockKVCache:",
             "    pass",
             "cache = MockKVCache()",
-            "cache.context_lens = torch.tensor([0], dtype=torch.int64)",
-            "cache.seq_lens = torch.tensor([seq_len], dtype=torch.int64)",
-            "cache.block_tables = torch.tensor([[[0, 0]]], dtype=torch.int64)",
-            "cache.slot_mapping = torch.stack([torch.zeros(seq_len, dtype=torch.int64), torch.arange(seq_len, dtype=torch.int64)], dim=1)",
+            "cache.query_start_loc = torch.tensor([0, seq_len], dtype=torch.int32, device='cuda')",
+            "cache.seq_lens = torch.tensor([seq_len], dtype=torch.int32, device='cuda')",
+            "cache.block_table = torch.tensor([[[0, 0]]], dtype=torch.int32, device='cuda')",
+            "cache.slot_mapping = torch.stack([torch.zeros(seq_len, dtype=torch.int64, device='cuda'), torch.arange(seq_len, dtype=torch.int64, device='cuda')], dim=1)",
             "cache.num_blocks = 32",
             "cache.kv_caches = torch.zeros((4, 8, 1, 2 * num_kv_heads * (head_dim // 8) * 256 * 8), dtype=torch.bfloat16, device='cuda')",
             "output = module(query, key, value, cache)",
@@ -1563,10 +1566,10 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
             "class MockKVCache:",
             "    pass",
             "cache = MockKVCache()",
-            "cache.context_lens = torch.tensor([0], dtype=torch.int64)",
-            "cache.seq_lens = torch.tensor([seq_len], dtype=torch.int64)",
-            "cache.block_tables = torch.tensor([[[0, 0]]], dtype=torch.int64)",
-            "cache.slot_mapping = torch.stack([torch.zeros(seq_len, dtype=torch.int64), torch.arange(seq_len, dtype=torch.int64)], dim=1)",
+            "cache.query_start_loc = torch.tensor([0, seq_len], dtype=torch.int32, device='cuda')",
+            "cache.seq_lens = torch.tensor([seq_len], dtype=torch.int32, device='cuda')",
+            "cache.block_table = torch.tensor([[[0, 0]]], dtype=torch.int32, device='cuda')",
+            "cache.slot_mapping = torch.stack([torch.zeros(seq_len, dtype=torch.int64, device='cuda'), torch.arange(seq_len, dtype=torch.int64, device='cuda')], dim=1)",
             "cache.num_blocks = 32",
             "cache.kv_caches = torch.zeros((4, 8, 1, 2 * num_kv_heads * (head_dim // 8) * 256 * 8), dtype=torch.bfloat16, device='cuda')",
             "output = module(query, key0, value0, key1, value1, cache)",
@@ -1659,18 +1662,18 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
             "    pass",
             "storage = torch.zeros((4, 8, 1, 2 * num_kv_heads * (head_dim // 8) * 256 * 8), dtype=torch.bfloat16, device='cuda')",
             "prefill_cache = MockKVCache()",
-            "prefill_cache.context_lens = torch.tensor([0], dtype=torch.int64)",
-            "prefill_cache.seq_lens = torch.tensor([prefill_len], dtype=torch.int64)",
-            "prefill_cache.block_tables = torch.tensor([[[0, 0]]], dtype=torch.int64)",
-            "prefill_cache.slot_mapping = torch.stack([torch.zeros(prefill_len, dtype=torch.int64), torch.arange(prefill_len, dtype=torch.int64)], dim=1)",
+            "prefill_cache.query_start_loc = torch.tensor([0, prefill_len], dtype=torch.int32, device='cuda')",
+            "prefill_cache.seq_lens = torch.tensor([prefill_len], dtype=torch.int32, device='cuda')",
+            "prefill_cache.block_table = torch.tensor([[[0, 0]]], dtype=torch.int32, device='cuda')",
+            "prefill_cache.slot_mapping = torch.stack([torch.zeros(prefill_len, dtype=torch.int64, device='cuda'), torch.arange(prefill_len, dtype=torch.int64, device='cuda')], dim=1)",
             "prefill_cache.num_blocks = 32",
             "prefill_cache.kv_caches = storage",
             "_ = module(prefill_query, prefill_key, prefill_value, prefill_cache)",
             "decode_cache = MockKVCache()",
-            "decode_cache.context_lens = torch.tensor([prefill_len], dtype=torch.int64)",
-            "decode_cache.seq_lens = torch.tensor([prefill_len + 1], dtype=torch.int64)",
-            "decode_cache.block_tables = torch.tensor([[[0, 0]]], dtype=torch.int64)",
-            "decode_cache.slot_mapping = torch.tensor([[0, prefill_len]], dtype=torch.int64)",
+            "decode_cache.query_start_loc = torch.tensor([0, 1], dtype=torch.int32, device='cuda')",
+            "decode_cache.seq_lens = torch.tensor([prefill_len + 1], dtype=torch.int32, device='cuda')",
+            "decode_cache.block_table = torch.tensor([[[0, 0]]], dtype=torch.int32, device='cuda')",
+            "decode_cache.slot_mapping = torch.tensor([[0, prefill_len]], dtype=torch.int64, device='cuda')",
             "decode_cache.num_blocks = 32",
             "decode_cache.kv_caches = storage",
             "output = module(decode_query, decode_key, decode_value, decode_cache)",
@@ -1862,6 +1865,11 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
             StringComparison.Ordinal);
         Assert.Contains("rhs_layout=k_major", generatedKernelsPy, StringComparison.Ordinal);
         Assert.Equal(3, Regex.Matches(generatedKernelsPy, @"tle\.gpu\.copy\(", RegexOptions.CultureInvariant).Count);
+        Assert.DoesNotContain("eviction_policy=", generatedKernelsPy, StringComparison.Ordinal);
+        var producerNTileLoops = Regex.Matches(
+            generatedKernelsPy,
+            @"for n_tile in tl\.static_range\(\s*0,\s*2,\s*\):",
+            RegexOptions.CultureInvariant);
         var nTileLoops = Regex.Matches(
             generatedKernelsPy,
             @"for n_tile in tl\.range\(\s*0,\s*2,\s*loop_unroll_factor=1,\s*\):",
@@ -1874,14 +1882,20 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
             generatedKernelsPy,
             @"slot\.weight\.subslice\(",
             RegexOptions.CultureInvariant);
-        Assert.Equal(2, nTileLoops.Count);
+        Assert.Single(producerNTileLoops.Cast<Match>());
+        Assert.Single(nTileLoops.Cast<Match>());
         Assert.Equal(2, kTileLoops.Count);
-        Assert.Single(sharedSubSlices.Cast<Match>());
-        var descriptorMatches = Regex.Matches(
+        Assert.Equal(2, sharedSubSlices.Count);
+        var qDescriptorMatches = Regex.Matches(
+            generatedKernelsPy,
+            @"'block_shape': \(8, 8, 2, 64\)",
+            RegexOptions.CultureInvariant);
+        var kvDescriptorMatches = Regex.Matches(
             generatedKernelsPy,
             @"'block_shape': \(4, 8, 2, 64\)",
             RegexOptions.CultureInvariant);
-        Assert.Equal(3, descriptorMatches.Count);
+        Assert.Single(qDescriptorMatches.Cast<Match>());
+        Assert.Equal(2, kvDescriptorMatches.Count);
         Assert.Contains("capacity=4", generatedKernelsPy, StringComparison.Ordinal);
         Assert.Contains("[1]", generatedKernelsPy, StringComparison.Ordinal);
         Assert.DoesNotContain("tl.make_tensor_descriptor", generatedKernelsPy, StringComparison.Ordinal);
@@ -2077,12 +2091,12 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         var input = new Var("input", new TensorType(DataTypes.BFloat16, new[] { seq, k }));
         var gateWeight = Tensor.From<BFloat16>(
             Enumerable.Range(0, k * n)
-                .Select(i => (BFloat16)(((i % 251) - 125f) * 0.0001f))
+                .Select(i => (BFloat16)(((i % 251) - 125f) * 0.001f))
                 .ToArray(),
             [k, n]);
         var upWeight = Tensor.From<BFloat16>(
             Enumerable.Range(0, k * n)
-                .Select(i => (BFloat16)(((i % 241) - 120f) * 0.0001f))
+                .Select(i => (BFloat16)(((i % 241) - 120f) * 0.001f))
                 .ToArray(),
             [k, n]);
         var glu = IR.F.NN.MatMulGlu(
@@ -2145,10 +2159,12 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         Assert.DoesNotContain("slot.weight.subslice(", generatedKernelsPy, StringComparison.Ordinal);
         Assert.Equal(2, Regex.Matches(generatedKernelsPy, @"writer\.acquire\(", RegexOptions.CultureInvariant).Count);
         Assert.Equal(2, Regex.Matches(generatedKernelsPy, @"reader\.wait\(", RegexOptions.CultureInvariant).Count);
-        Assert.Equal(2, Regex.Matches(
+        var descriptorBlockShapeCount = Regex.Matches(
             generatedKernelsPy,
             @"'block_shape': \(8, 8, 2, 64\)",
-            RegexOptions.CultureInvariant).Count);
+            RegexOptions.CultureInvariant).Count;
+        Assert.Equal(2, descriptorBlockShapeCount);
+        Assert.Equal(2, Regex.Matches(generatedKernelsPy, @"eviction_policy=""evict_last""", RegexOptions.CultureInvariant).Count);
         Assert.Contains("capacity=4", generatedKernelsPy, StringComparison.Ordinal);
         Assert.Contains("[4, 8, 8, 2, 64]", generatedKernelsPy, StringComparison.Ordinal);
         Assert.DoesNotContain("tl.make_tensor_descriptor", generatedKernelsPy, StringComparison.Ordinal);
@@ -2157,13 +2173,15 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
             outputDirectory,
             "torch.manual_seed(1)",
             $"input = (torch.randn({seq}, {k}, dtype=torch.float32, device='cuda') * 0.05).to(torch.bfloat16)",
-            $"gate_weight = (((torch.arange({k} * {n}, device='cuda') % 251) - 125).reshape({k}, {n}) * 0.0001).to(torch.bfloat16)",
-            $"up_weight = (((torch.arange({k} * {n}, device='cuda') % 241) - 120).reshape({k}, {n}) * 0.0001).to(torch.bfloat16)",
+            $"gate_weight = (((torch.arange({k} * {n}, device='cuda') % 251) - 125).reshape({k}, {n}) * 0.001).to(torch.bfloat16)",
+            $"up_weight = (((torch.arange({k} * {n}, device='cuda') % 241) - 120).reshape({k}, {n}) * 0.001).to(torch.bfloat16)",
             "output = module(input)",
             "gate = input @ gate_weight",
             "up = input @ up_weight",
             "expect = (gate.to(torch.float32) * torch.sigmoid(gate.to(torch.float32)) * up.to(torch.float32)).to(torch.bfloat16)",
-            "torch.testing.assert_close(output.to(torch.float32), expect.to(torch.float32), rtol=2e-2, atol=2e-2)");
+            $"tail_mask = torch.arange({n}, device='cuda') % 96 >= 64",
+            "assert torch.max(torch.abs(expect[:, tail_mask].to(torch.float32))).item() > 1e-2",
+            "torch.testing.assert_close(output.to(torch.float32), expect.to(torch.float32), rtol=2e-2, atol=5e-4)");
     }
 
     [Fact]
@@ -2273,8 +2291,8 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
             "    pass",
             "cache = MockKVCache()",
             "cache.device = torch.device('cuda')",
-            "cache.context_lens = torch.tensor([0], dtype=torch.int64)",
-            "cache.seq_lens = torch.tensor([20], dtype=torch.int64)",
+            "cache.query_start_loc = torch.tensor([0, 20], dtype=torch.int32, device='cuda')",
+            "cache.seq_lens = torch.tensor([20], dtype=torch.int32, device='cuda')",
             "output = module(cache)",
             "torch.testing.assert_close(output, torch.arange(20, dtype=torch.float32, device='cuda'), rtol=0, atol=0)");
     }
@@ -2709,6 +2727,66 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
     }
 
     [Fact]
+    public void TestPyNTTGatherReduceScatterMaterializesCallerAllocatedOutput()
+    {
+        var targetOptions = Assert.IsType<PyNTTTargetOptions>(CompileOptions.TargetOptions);
+        targetOptions.HierarchyNames = "b";
+        targetOptions.HierarchyLevels = "b";
+        targetOptions.Hierarchies = new[] { new[] { 2 } };
+
+        var tensorType = new TensorType(DataTypes.BFloat16, new[] { 4, 8 });
+        var placement = new Placement(new[] { 2 }, "b", "b");
+        var inputType = new DistributedType(
+            tensorType,
+            new SBP[] { SBP.B, SBP.S([0], 4) },
+            placement);
+        var outputType = new DistributedType(
+            tensorType,
+            new SBP[] { SBP.S([0], 2), SBP.B },
+            placement);
+        var input = CreateBuffer(
+            "input_shard",
+            DataTypes.BFloat16,
+            TIR.MemoryLocation.Data,
+            0,
+            [4, 4],
+            [4, 1],
+            inputType);
+        var output = CreateOutputVar("output", outputType);
+        var main = new TIR.PrimFunction(
+            "main_prim",
+            PyNTTTarget.Kind,
+            new TIR.Sequential(
+                TIR.F.NTT.GatherReduceScatter(input, output, inputType, outputType)),
+            new TIR.Return(new Expr[] { output }),
+            new IVar[] { output })
+        {
+            SchedResult =
+            {
+                DataUsage = 64,
+            },
+        };
+
+        var outputDirectory = GeneratePyNTTModelDirectory(
+            "generated_direct_reshard_output_model",
+            main);
+        using var manifest = JsonDocument.Parse(
+            File.ReadAllText(Path.Join(outputDirectory, "kernel_params.json")));
+        var renderKernel = manifest.RootElement
+            .GetProperty("functions")
+            .EnumerateArray()
+            .SelectMany(function => function.GetProperty("render_kernels").EnumerateArray())
+            .Single();
+        Assert.Equal(
+            new[] { "output0" },
+            renderKernel.GetProperty("metadata")
+                .GetProperty("outputs")
+                .EnumerateArray()
+                .Select(value => value.GetString())
+                .ToArray());
+    }
+
+    [Fact]
     public void TestPyNTTPartialReshardIsSinglePhaseAndWritesEachDestinationOnce()
     {
         var targetOptions = Assert.IsType<PyNTTTargetOptions>(CompileOptions.TargetOptions);
@@ -2766,6 +2844,64 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
             "x = ((torch.arange(8 * 16, dtype=torch.float32, device='cuda').reshape(8, 16) - 31) * 0.03125).to(torch.bfloat16)",
             "output = module(x)",
             "torch.testing.assert_close(output, x * 4, rtol=0, atol=0)");
+    }
+
+    [Fact]
+    public void TestPyNTTGridBarrierPreservesLogicalMeshAndRendersAxisGroups()
+    {
+        var targetOptions = Assert.IsType<PyNTTTargetOptions>(CompileOptions.TargetOptions);
+        targetOptions.HierarchyNames = "yx";
+        targetOptions.HierarchyLevels = "bb";
+        targetOptions.Hierarchies = new[] { new[] { 4, 8 } };
+
+        var tensorType = new TensorType(DataTypes.Float32, new[] { 1 });
+        var input = new Var("input", tensorType);
+        var output = CreateOutputVar("output", tensorType);
+        var main = new TIR.PrimFunction(
+            "main_prim",
+            PyNTTTarget.Kind,
+            new TIR.Sequential(
+                TIR.T.Memcopy(output, input),
+                TIR.F.NTT.Barrier(TIR.NTT.BarrierScope.Chip, [0]),
+                TIR.F.NTT.Barrier(TIR.NTT.BarrierScope.Chip, [1]),
+                TIR.F.NTT.Barrier(TIR.NTT.BarrierScope.Chip)),
+            new IVar[] { input, output });
+        var outputDirectory = GeneratePyNTTModelDirectory("generated_grid_axis_group_barrier_model", main);
+
+        using (var document = JsonDocument.Parse(File.ReadAllText(Path.Join(outputDirectory, "kernel_params.json"))))
+        {
+            var attrs = document.RootElement
+                .GetProperty("functions")
+                .EnumerateArray()
+                .Single()
+                .GetProperty("render_kernels")
+                .EnumerateArray()
+                .Single()
+                .GetProperty("metadata")
+                .GetProperty("attrs");
+            Assert.True(attrs.GetProperty("requires_grid_barrier").GetBoolean());
+            Assert.Collection(
+                attrs.GetProperty("grid_barrier_axis_groups").EnumerateArray().ToArray(),
+                group => Assert.Equal(new[] { 0 }, group.EnumerateArray().Select(axis => axis.GetInt32()).ToArray()),
+                group => Assert.Equal(new[] { 1 }, group.EnumerateArray().Select(axis => axis.GetInt32()).ToArray()));
+        }
+
+        RenderGeneratedKernels(outputDirectory);
+        var generatedKernelsPy = File.ReadAllText(Path.Join(outputDirectory, "generated_kernels.py"));
+        Assert.Contains(
+            "_PYNTT_GRID_MESH_VALUE = tle.device_mesh({\"block\": [('block_y', 4), ('block_x', 8)]})",
+            generatedKernelsPy,
+            StringComparison.Ordinal);
+        Assert.Contains("PYNTT_GRID_MESH = tl.constexpr(_PYNTT_GRID_MESH_VALUE)", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("PYNTT_GRID_AXIS_GROUP_0 = tl.constexpr(", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("_PYNTT_GRID_MESH_VALUE.axis_group(('block_y',))", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("PYNTT_GRID_AXIS_GROUP_1 = tl.constexpr(", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("_PYNTT_GRID_MESH_VALUE.axis_group(('block_x',))", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("tle.distributed_barrier(PYNTT_GRID_AXIS_GROUP_0)", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("tle.distributed_barrier(PYNTT_GRID_AXIS_GROUP_1)", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("tle.distributed_barrier(PYNTT_GRID_MESH)", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.DoesNotContain("tle.shard_id", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.DoesNotContain("PYNTT_GRID_SUBMESH", generatedKernelsPy, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -2933,14 +3069,35 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
             .GetProperty("render_kernels")
             .EnumerateArray()
             .Single();
-        var fieldInput = kernel
-            .GetProperty("metadata")
-            .GetProperty("attrs")
+        var metadata = kernel.GetProperty("metadata");
+        var attrs = metadata.GetProperty("attrs");
+        var fieldInputs = attrs
             .GetProperty("kv_cache_field_inputs")
             .EnumerateArray()
-            .Single();
-        Assert.Equal("cache", fieldInput.GetProperty("SourceName").GetString());
-        Assert.Equal("metadata", fieldInput.GetProperty("Field").GetString());
+            .ToArray();
+        Assert.All(fieldInputs, fieldInput => Assert.Equal("cache", fieldInput.GetProperty("SourceName").GetString()));
+        Assert.Equal(
+            new[] { "num_seqs", "query_start_loc", "seq_lens" },
+            fieldInputs
+                .Select(fieldInput => fieldInput.GetProperty("Field").GetString())
+                .OrderBy(field => field, StringComparer.Ordinal)
+                .ToArray());
+        var scalarInputName = fieldInputs
+            .Single(fieldInput => fieldInput.GetProperty("Field").GetString() == "num_seqs")
+            .GetProperty("Name")
+            .GetString();
+        var scalarInputIndex = metadata
+            .GetProperty("inputs")
+            .EnumerateArray()
+            .Select((input, index) => (Name: input.GetString(), Index: index))
+            .Single(input => input.Name == scalarInputName)
+            .Index;
+        Assert.Equal(
+            new[] { $"input{scalarInputIndex.ToString(CultureInfo.InvariantCulture)}" },
+            attrs.GetProperty("runtime_scalar_input_args")
+                .EnumerateArray()
+                .Select(argument => argument.GetString())
+                .ToArray());
     }
 
     [Fact]

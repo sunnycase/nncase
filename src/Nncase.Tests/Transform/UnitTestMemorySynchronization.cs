@@ -9,6 +9,7 @@ using Nncase.IR;
 using Nncase.IR.Math;
 using Nncase.IR.NN;
 using Nncase.Passes;
+using Nncase.Passes.Mutators;
 using Nncase.Passes.Transforms;
 using Nncase.Schedule;
 using Nncase.Targets;
@@ -71,16 +72,21 @@ public sealed class UnitTestMemorySynchronization : TestClassBase
         var input1 = new Var("input1", new TensorType(DataTypes.Float32, new[] { 3 }));
         var output = new Var("output", new TensorType(DataTypes.Float32, new[] { 5 }));
         var call = Assert.IsType<Call>(TIR.F.NTT.Concat([input0, input1], output, 0));
+        var concat = Assert.IsType<TIR.NTT.Concat>(call.Target);
         var parameters = new List<ParameterInfo>();
         call.ParametersForeach((_, parameter) => parameters.Add(parameter));
 
-        Assert.Equal([TIR.NTT.Concat.Input, TIR.NTT.Concat.Input, TIR.NTT.Concat.Output], parameters);
+        Assert.Equal(
+            [TIR.NTT.Concat.Input, TIR.NTT.Concat.Input, TIR.NTT.Concat.Output, concat.SharedWorkspaceParameter],
+            parameters);
         Assert.Same(output, call[TIR.NTT.Concat.Output]);
+        Assert.IsType<None>(call[concat.SharedWorkspaceParameter]);
     }
 
     [Fact]
     public async Task TestPyNTTTIRSelectionUsesOperandMemoryEffects()
     {
+        CompileOptions.TargetOptions = new PyNTTTargetOptions();
         var input = new Var("input", new TensorType(DataTypes.Float32, new[] { 4 }));
         var function = new Function(
             "main",
@@ -217,10 +223,97 @@ public sealed class UnitTestMemorySynchronization : TestClassBase
             PyNTTTarget.Kind,
             MemorySynchronizationScopes.All).RunAsync(module, new());
         var planned = Assert.IsType<PrimFunction>(module.Entry);
-        Assert.Single(
+        var barrier = Assert.Single(
             ExprCollector.Collect(planned.Body)
                 .OfType<Call>()
                 .Where(call => call.Target is TIR.NTT.Barrier { Scope: TIR.NTT.BarrierScope.Chip }));
+        Assert.Equal(
+            new[] { 1 },
+            Assert.IsType<TIR.NTT.Barrier>(barrier.Target).AxisGroupAxes.ToArray());
+    }
+
+    [Fact]
+    public async Task TestAxisGroupBarrierCoverageDoesNotHideLaterFullMeshHazard()
+    {
+        var placement = new Placement([4, 8], "yx", "bb");
+        var tensorType = new TensorType(DataTypes.Float32, new[] { 64 });
+        var yxSplitType = new DistributedType(tensorType, [SBP.S([0, 1])], placement);
+        var ySplitType = new DistributedType(tensorType, [SBP.S([0])], placement);
+        var broadcastType = new DistributedType(tensorType, [SBP.B], placement);
+        var physical = new PhysicalBuffer(
+            DataTypes.Float32.SizeInBytes,
+            Tensor.FromPointer(4096, DataTypes.Float32),
+            256,
+            MemoryLocation.ChipLocalData);
+        var producer = CreateDistributedAlias("producer_yx", physical, yxSplitType);
+        var yView = CreateDistributedAlias("view_y", physical, ySplitType);
+        var broadcastView = CreateDistributedAlias("view_b", physical, broadcastType);
+        var input = CreateWorkspaceBuffer("input", DataTypes.Float32, 0, 256, [64]);
+        var yOutput = CreateWorkspaceBuffer("y_output", DataTypes.Float32, 512, 256, [64]);
+        var broadcastOutput = CreateWorkspaceBuffer("broadcast_output", DataTypes.Float32, 1024, 256, [64]);
+        var main = new PrimFunction(
+            "main",
+            PyNTTTarget.Kind,
+            new Sequential(
+                T.Memcopy(producer, input),
+                T.Memcopy(yOutput, yView),
+                T.Memcopy(broadcastOutput, broadcastView)),
+            Array.Empty<IVar>());
+        var module = new IRModule(main);
+
+        await new PlanMemorySynchronizationPass(
+            PyNTTTarget.Kind,
+            MemorySynchronizationScopes.All).RunAsync(module, new());
+
+        var rewritten = Assert.IsType<PrimFunction>(module.Entry);
+        var barriers = rewritten.Body.Fields
+            .ToArray()
+            .OfType<Call>()
+            .Select(call => call.Target)
+            .OfType<TIR.NTT.Barrier>()
+            .ToArray();
+        Assert.Collection(
+            barriers,
+            barrier => Assert.Equal(new[] { 1 }, barrier.AxisGroupAxes.ToArray()),
+            barrier => Assert.Empty(barrier.AxisGroupAxes));
+    }
+
+    [Fact]
+    public async Task TestNonPrefixShardedViewCoarseningUsesFullMeshBarrier()
+    {
+        var placement = new Placement([4, 8], "yx", "bb");
+        var tensorType = new TensorType(DataTypes.Float32, new[] { 64 });
+        var yxSplitType = new DistributedType(tensorType, [SBP.S([0, 1])], placement);
+        var xSplitType = new DistributedType(tensorType, [SBP.S([1])], placement);
+        var physical = new PhysicalBuffer(
+            DataTypes.Float32.SizeInBytes,
+            Tensor.FromPointer(4096, DataTypes.Float32),
+            256,
+            MemoryLocation.ChipLocalData);
+        var producer = CreateDistributedAlias("producer_yx", physical, yxSplitType);
+        var xView = CreateDistributedAlias("view_x", physical, xSplitType);
+        var input = CreateWorkspaceBuffer("input", DataTypes.Float32, 0, 256, [64]);
+        var output = CreateWorkspaceBuffer("output", DataTypes.Float32, 512, 256, [64]);
+        var main = new PrimFunction(
+            "main",
+            PyNTTTarget.Kind,
+            new Sequential(T.Memcopy(producer, input), T.Memcopy(output, xView)),
+            Array.Empty<IVar>());
+        var module = new IRModule(main);
+
+        await new PlanMemorySynchronizationPass(
+            PyNTTTarget.Kind,
+            MemorySynchronizationScopes.All).RunAsync(module, new());
+
+        var rewritten = Assert.IsType<PrimFunction>(module.Entry);
+        var barrier = Assert.Single(
+            rewritten.Body.Fields
+                .ToArray()
+                .OfType<Call>()
+                .Select(call => call.Target)
+                .OfType<TIR.NTT.Barrier>());
+        Assert.Equal(TIR.NTT.BarrierScope.Chip, barrier.Scope);
+        Assert.Empty(barrier.AxisGroupAxes);
     }
 
     [Fact]
@@ -347,11 +440,14 @@ public sealed class UnitTestMemorySynchronization : TestClassBase
             PyNTTTarget.Kind,
             MemorySynchronizationScopes.All).RunAsync(module, new());
         var planned = Assert.IsType<PrimFunction>(module.Entry);
-        Assert.Equal(
-            2,
-            ExprCollector.Collect(planned.Body)
-                .OfType<Call>()
-                .Count(call => call.Target is TIR.NTT.Barrier { Scope: TIR.NTT.BarrierScope.Chip }));
+        var barriers = ExprCollector.Collect(planned.Body)
+            .OfType<Call>()
+            .Select(call => call.Target)
+            .OfType<TIR.NTT.Barrier>()
+            .Where(barrier => barrier.Scope == TIR.NTT.BarrierScope.Chip)
+            .ToArray();
+        Assert.Equal(2, barriers.Length);
+        Assert.All(barriers, barrier => Assert.Empty(barrier.AxisGroupAxes));
     }
 
     [Fact]
@@ -863,6 +959,23 @@ public sealed class UnitTestMemorySynchronization : TestClassBase
             shape,
             TensorUtilities.GetDefaultStrides(shape).Select(stride => (Dimension)stride).ToArray(),
             null);
+    }
+
+    private static Nncase.TIR.Buffer CreateDistributedAlias(
+        string name,
+        PhysicalBuffer physical,
+        DistributedType distributedType)
+    {
+        var shape = distributedType.TensorType.Shape;
+        var strides = TensorUtilities.GetDefaultStrides(
+            shape.ToValueArray().Select(value => checked((int)value)).ToArray());
+        return new(
+            name,
+            distributedType.TensorType.DType,
+            new MemSpan(physical, 0, physical.Size),
+            shape.ToArray(),
+            strides.Select(stride => (Dimension)stride).ToArray(),
+            distributedType);
     }
 
     private static Nncase.TIR.Buffer CreateSharedBuffer(string name, ulong offset)

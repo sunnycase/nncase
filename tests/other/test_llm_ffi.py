@@ -152,6 +152,7 @@ def test_paged_attention_config():
 def test_huggface_options():
     opt = nncase.HuggingFaceOptions()
     opt.max_model_len = 1234
+    opt.input_ids_type = "int32"
     cfg = nncase.PagedAttentionConfig(1, 2, 3, np.dtype(np.float32), 16)
     opt.config = cfg
 

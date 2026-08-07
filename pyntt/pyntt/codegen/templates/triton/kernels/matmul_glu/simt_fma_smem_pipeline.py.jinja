@@ -78,7 +78,7 @@ def {{ model["FunctionName"] }}__producer(writer, {{ helper_parameters(model) }}
                     0,
                     0,
                 ],
-                eviction_policy="evict_first",
+                eviction_policy="evict_last",
             )
             writer.commit({{ projection["lower"] }}_sequence)
 {% endfor %}

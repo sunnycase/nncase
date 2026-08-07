@@ -23,6 +23,8 @@ public record HuggingFaceOptions
 
     public string TensorType { get; set; } = string.Empty;
 
+    public string InputIdsType { get; set; } = "int64";
+
     // public bool UseCache { get; set; }
     public HuggingFaceAttentionBackendKind AttenionBackend { get; set; }
 

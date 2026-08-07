@@ -661,7 +661,8 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
         string? PoolStrideElements = null,
         string? WorkspacePoolStrideBytes = null,
         string[]? StrideElements = null,
-        string[]? ScalarStrideElements = null);
+        string[]? ScalarStrideElements = null,
+        string? SetupStatement = null);
 
     private sealed record FunctionCallArgumentLayout(
         BaseExpr[] InputArguments,
@@ -794,6 +795,11 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
     {
         var entry = _functions.FirstOrDefault(function => function.SourceFunction.IsEntry);
         var launchStatements = entry is null ? string.Empty : BuildModelLaunchStatements(entry);
+        if (entry is not null && !string.IsNullOrWhiteSpace(launchStatements))
+        {
+            launchStatements = $"        pyntt_execution_device = resolve_execution_device(inputs, outputs){Environment.NewLine}{launchStatements}";
+        }
+
         if (string.IsNullOrWhiteSpace(launchStatements))
         {
             launchStatements = "        pass";
@@ -804,15 +810,15 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
             .SelectMany(function => function.GeneratedKernelSource.Kernels)
             .Any(kernel => kernel.Attrs.ContainsKey("requires_grid_barrier"));
         var tritonRuntimeImport = needsGridBarrier
-            ? "from pyntt.runtime.triton import ensure_triton_allocator, select_and_validate_triton_tuning_parameter"
-            : "from pyntt.runtime.triton import select_and_validate_triton_tuning_parameter";
+            ? "from pyntt.runtime.triton import ensure_triton_allocator, prepare_and_validate_triton_kernel"
+            : "from pyntt.runtime.triton import prepare_and_validate_triton_kernel";
 
         return $$"""
             from pathlib import Path
 
             from pyntt.codegen.render import render_generated_kernels
             from pyntt.runtime.interpreter import PyNTTInterpreter
-            from pyntt.runtime.tensor import materialize_kv_cache_blocks_per_shard, materialize_kv_cache_metadata, materialize_kv_cache_storage, materialize_kv_cache_tensor_field, resolve_execution_device, view_typed_buffer
+            from pyntt.runtime.tensor import get_kv_cache_num_seqs, materialize_kv_cache_blocks_per_shard, materialize_kv_cache_storage, require_kv_cache_tensor_field, resolve_execution_device, view_typed_buffer
             {{tritonRuntimeImport}}
             from .rdata import RDATA_BUNDLES
             from .specs import MODULE_SPEC
@@ -884,7 +890,7 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
             $"outputs[{index.ToString(CultureInfo.InvariantCulture)}]",
             StrideElements: BuildTorchTensorStrideExpressions($"outputs[{index.ToString(CultureInfo.InvariantCulture)}]", PyNTTFunctionOutputs.GetOutputParameterTypes(function)[index]),
             ScalarStrideElements: BuildTorchTensorScalarStrideExpressions($"outputs[{index.ToString(CultureInfo.InvariantCulture)}]", PyNTTFunctionOutputs.GetOutputParameterTypes(function)[index])));
-        return new RuntimeDispatchContext(state, parameters, outputs, new Dictionary<ObjectBufferKey, RuntimeBinding>(), function.Name, "resolve_execution_device(inputs, outputs)", "inputs");
+        return new RuntimeDispatchContext(state, parameters, outputs, new Dictionary<ObjectBufferKey, RuntimeBinding>(), function.Name, "pyntt_execution_device", "inputs");
     }
 
     private static Dictionary<string, RuntimeBinding> CreateRuntimeOutputBindings(BaseFunction function, Func<int, RuntimeBinding> createBinding)
@@ -2245,6 +2251,11 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
         var kvCacheFieldInputs = GetKVCacheFieldInputs(kernel).ToDictionary(input => input.Name, StringComparer.Ordinal);
         var inputBindings = kernel.Inputs.Select(name => BuildKernelInputBinding(name, parameterNames, context, kvCacheFieldInputs)).ToArray();
         var inputArgs = inputBindings.Select(binding => binding.Expression).ToArray();
+        var inputSetup = string.Join(
+            Environment.NewLine,
+            inputBindings
+                .Select(binding => binding.SetupStatement)
+                .Where(statement => !string.IsNullOrWhiteSpace(statement)));
         var outputAliasMap = GetKernelOutputAliases(kernel);
         var outputBindings = kernel.Outputs.Select((name, index) =>
         {
@@ -2271,7 +2282,7 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
         var outputAliases = BuildRuntimeOutputAliasStatements(kernel, context, parameterNames, inputArgs);
         if (kernel.Attrs.TryGetValue("pure_alias", out var pureAliasValue) && pureAliasValue is bool pureAlias && pureAlias)
         {
-            return outputAliases;
+            return string.Join(Environment.NewLine, new[] { inputSetup, outputAliases }.Where(statement => !string.IsNullOrWhiteSpace(statement)));
         }
 
         var runtimeShapeArgNames = GetRuntimeShapeArgs(kernel);
@@ -2289,7 +2300,9 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
             : shardCount > 1
             ? $"lambda _: ({shardCount},)"
             : "lambda candidate: ((numel + candidate - 1) // candidate,)";
-        var gridAfterTuning = isTir ? string.Empty : $"        grid = {grid}";
+        var gridAfterPrepare = isTir
+            ? string.Empty
+            : $"        block_size = pyntt_prepared_kernel.parameter_value{Environment.NewLine}        grid = {grid}";
         var workspaceSetup = string.Empty;
         var workspaceArgs = Array.Empty<string>();
         var workspaceStrideArgs = Array.Empty<string>();
@@ -2349,26 +2362,108 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
         var hostTensorDescriptorArgs = kernel.Launch.HostTensorDescriptors.Length == 0
             ? Array.Empty<string>()
             : new[] { "*pyntt_host_tensor_descriptors" };
+        var cacheHostTensorDescriptors = false;
+        if (isTir && !usePreparedWorkspace)
+        {
+            var persistentWorkspaceSources = new HashSet<string>(
+                new[] { "data", "rdata", "chip_local_rdata", "chip_local_data", "block_local_rdata", "block_local_data" },
+                StringComparer.Ordinal);
+            cacheHostTensorDescriptors = kernel.Launch.HostTensorDescriptors.Length > 0 &&
+                kernel.Launch.HostTensorDescriptors.All(descriptor => persistentWorkspaceSources.Contains(descriptor.Source));
+            var initializationSetup = string.Join(
+                Environment.NewLine,
+                new[] { workspaceSetup, cacheHostTensorDescriptors ? hostTensorDescriptorSetup : string.Empty }
+                    .Where(statement => !string.IsNullOrWhiteSpace(statement)));
+            var persistentResourceNames = workspaceArgs
+                .Concat(cacheHostTensorDescriptors ? new[] { "pyntt_host_tensor_descriptors" } : Array.Empty<string>())
+                .ToArray();
+            var persistentResources = $"({string.Join(", ", persistentResourceNames)},)";
+            workspaceSetup = $"""
+                        pyntt_launch_resources = self.lookup_launch_resources({PythonString(kernel.Name)}, pyntt_execution_device)
+                        if pyntt_launch_resources is None:
+                {IndentPythonBlock(initializationSetup, 4)}
+                            pyntt_launch_resources = {persistentResources}
+                            self.store_launch_resources({PythonString(kernel.Name)}, pyntt_execution_device, pyntt_launch_resources)
+                        else:
+                            {string.Join(", ", persistentResourceNames)} = pyntt_launch_resources
+                """;
+            if (cacheHostTensorDescriptors)
+            {
+                hostTensorDescriptorSetup = string.Empty;
+            }
+        }
+
         var requiresGridBarrier = kernel.Attrs.ContainsKey("requires_grid_barrier");
-        var tensorArgs = string.Join(", ", inputArgs.Concat(outputArgs).Concat(tensorStrideArgs).Concat(abiViewStrideArgs).Concat(workspaceArgs).Concat(workspaceStrideArgs).Concat(runtimeShapeArgs).Concat(hostTensorDescriptorArgs));
+        var kernelArgumentExpressions = new List<string>();
+        var dynamicArgumentExpressions = new List<string>();
+        var dynamicArgumentIndices = new List<int>();
+        var kernelArgumentIndex = 0;
+        void AddArgumentGroup(IEnumerable<string> expressions, bool isDynamic)
+        {
+            foreach (var expression in expressions)
+            {
+                kernelArgumentExpressions.Add(expression);
+                if (isDynamic)
+                {
+                    dynamicArgumentExpressions.Add(expression);
+                    dynamicArgumentIndices.Add(kernelArgumentIndex);
+                }
+
+                kernelArgumentIndex++;
+            }
+        }
+
+        AddArgumentGroup(inputArgs, true);
+        AddArgumentGroup(outputArgs, true);
+        AddArgumentGroup(tensorStrideArgs, false);
+        AddArgumentGroup(abiViewStrideArgs, true);
+        AddArgumentGroup(workspaceArgs, false);
+        AddArgumentGroup(workspaceStrideArgs, false);
+        AddArgumentGroup(runtimeShapeArgs, true);
+        if (hostTensorDescriptorArgs.Length > 0)
+        {
+            kernelArgumentExpressions.Add(hostTensorDescriptorArgs[0]);
+            if (!cacheHostTensorDescriptors)
+            {
+                dynamicArgumentExpressions.Add(hostTensorDescriptorArgs[0]);
+                dynamicArgumentIndices.AddRange(
+                    Enumerable.Range(kernelArgumentIndex, kernel.Launch.HostTensorDescriptors.Length));
+            }
+
+            kernelArgumentIndex += kernel.Launch.HostTensorDescriptors.Length;
+        }
+
+        AddArgumentGroup(new[] { "numel" }, true);
+        var allKernelArgs = string.Join(", ", kernelArgumentExpressions);
+        var dynamicKernelArgs = string.Join(", ", dynamicArgumentExpressions);
         var tritonRuntimeSetup = requiresGridBarrier
             ? $"{Environment.NewLine}        ensure_triton_allocator({context.DeviceExpression})"
             : string.Empty;
         const string kwargs = ", num_warps=pyntt_kernel_config['num_warps'], num_stages=pyntt_kernel_config['num_stages']";
         var importStatement = $"from .generated_kernels import {kernel.Name}, PYNTT_HOST_TENSOR_DESCRIPTOR_SPECS, PYNTT_KERNEL_CONFIGS";
-        var launchStatement = $"        {kernel.Name}[grid]({tensorArgs}, numel, block_size{kwargs})";
-        var kernelArgs = string.IsNullOrWhiteSpace(tensorArgs) ? "(numel,)" : $"({tensorArgs}, numel,)";
-        var tuningSelectionStatement = $"        block_size = select_and_validate_triton_tuning_parameter({PythonString(kernel.Name)}, \"block_size\", pyntt_kernel_config[\"block_size\"][\"candidates\"], source=pyntt_kernel_config[\"block_size\"][\"source\"], kernel={kernel.Name}, kernel_args={kernelArgs}, grid_for_candidate={gridForCandidate}, expected_compute_num_warps=pyntt_kernel_config[\"num_warps\"], registers_per_thread_limit={PythonValue(kernel.Attrs["registers_per_thread_limit"])}, shared_memory_capacity_bytes={PythonValue(kernel.Attrs["shared_memory_capacity_bytes"])}, forbid_spills={PythonValue(kernel.Attrs["forbid_spills"])}{kwargs})";
+        var launchStatement = string.IsNullOrWhiteSpace(dynamicKernelArgs)
+            ? "        pyntt_prepared_kernel.launch(grid=grid)"
+            : $"        pyntt_prepared_kernel.launch({dynamicKernelArgs}, grid=grid)";
+        var kernelArgs = $"({allKernelArgs},)";
+        var dynamicIndices = PythonTuple(
+            dynamicArgumentIndices.Select(index => index.ToString(CultureInfo.InvariantCulture)));
+        var prepareStatement = $"""
+                    pyntt_prepared_kernel = self.lookup_prepared_triton_kernel({PythonString(kernel.Name)}, pyntt_execution_device)
+                    if pyntt_prepared_kernel is None:
+                        pyntt_prepared_kernel = prepare_and_validate_triton_kernel({PythonString(kernel.Name)}, "block_size", pyntt_kernel_config["block_size"]["candidates"], source=pyntt_kernel_config["block_size"]["source"], kernel={kernel.Name}, kernel_args={kernelArgs}, dynamic_argument_indices={dynamicIndices}, grid_for_candidate={gridForCandidate}, expected_compute_num_warps=pyntt_kernel_config["num_warps"], registers_per_thread_limit={PythonValue(kernel.Attrs["registers_per_thread_limit"])}, shared_memory_capacity_bytes={PythonValue(kernel.Attrs["shared_memory_capacity_bytes"])}, forbid_spills={PythonValue(kernel.Attrs["forbid_spills"])}{kwargs})
+                        self.store_prepared_triton_kernel({PythonString(kernel.Name)}, pyntt_execution_device, pyntt_prepared_kernel)
+            """;
         return $"""
                     {importStatement}
                     pyntt_kernel_config = PYNTT_KERNEL_CONFIGS[{PythonString(kernel.Name)}]
                     numel = {numel}
+            {inputSetup}
             {gridBeforeTuning}
             {workspaceSetup}
             {hostTensorDescriptorSetup}
             {tritonRuntimeSetup}
-            {tuningSelectionStatement}
-            {gridAfterTuning}
+            {prepareStatement}
+            {gridAfterPrepare}
             {launchStatement}
             {outputAliases}
             """;
@@ -2474,9 +2569,9 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
         var sourceExpression = ResolveParameterBinding(context, kvCacheField.SourceName, parameterNames).Expression;
         var expression = kvCacheField.Field switch
         {
-            "metadata" => $"materialize_kv_cache_metadata({sourceExpression}, {context.DeviceExpression})",
-            "slot_mapping" or "block_tables" or "context_lens" or "seq_lens" =>
-                $"materialize_kv_cache_tensor_field({sourceExpression}, {PythonString(kvCacheField.Field)}, {context.DeviceExpression})",
+            "query_start_loc" or "seq_lens" or "block_table" or "slot_mapping" when kvCacheField.DType is { } dtype =>
+                $"require_kv_cache_tensor_field({sourceExpression}, {PythonString(kvCacheField.Field)}, {context.DeviceExpression}, dtype={PythonString(dtype)})",
+            "num_seqs" => $"get_kv_cache_num_seqs({sourceExpression})",
             "kv_caches" when kvCacheField.Storage is { } storage =>
                 $"materialize_kv_cache_storage({sourceExpression}, {context.DeviceExpression}, dtype={PythonString(storage.DType)}, topology_shape={PythonTuple(storage.TopologyShape.Select(value => value.ToString(CultureInfo.InvariantCulture)))}, key_tail_shape={PythonTuple(storage.KeyTailShape.Select(value => value.ToString(CultureInfo.InvariantCulture)))}, value_tail_shape={PythonTuple(storage.ValueTailShape.Select(value => value.ToString(CultureInfo.InvariantCulture)))}, key_section_elements={storage.KeySectionElements.ToString(CultureInfo.InvariantCulture)}, value_section_elements={storage.ValueSectionElements.ToString(CultureInfo.InvariantCulture)}, block_elements={storage.BlockElements.ToString(CultureInfo.InvariantCulture)}, block_size={storage.BlockSize.ToString(CultureInfo.InvariantCulture)})",
             "kv_caches_blocks" when kvCacheField.Storage is { } storage =>
@@ -2485,7 +2580,8 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
             "kv_caches_blocks" => throw new NotSupportedException($"Generated PyNTT kernel input {name} is missing KV-cache storage metadata."),
             _ => throw new NotSupportedException($"Generated PyNTT kernel input {name} references unsupported KV-cache field {kvCacheField.Field}."),
         };
-        return new RuntimeBinding(expression);
+        var localName = context.State.NewTemp($"kv_cache_{SanitizePythonIdentifier(kvCacheField.Field)}");
+        return new RuntimeBinding(localName, SetupStatement: $"        {localName} = {expression}");
     }
 
     private RuntimeBinding ResolveParameterBinding(RuntimeDispatchContext context, string name, IReadOnlyList<string> parameterNames)

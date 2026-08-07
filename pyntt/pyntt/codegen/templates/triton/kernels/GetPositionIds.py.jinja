@@ -1,7 +1,7 @@
 {% import "triton/kernels/_common.py.jinja" as common with context %}
 {% import "triton/kernels/_producer_consumer.py.jinja" as phases with context %}
 {% set local_extent = model["LocalShape"][0] %}
-{% set args = ["cache_meta"] %}
+{% set args = ["query_start_loc", "seq_lens", "num_seqs"] %}
 # generated from PyNTT Jinja GetPositionIds.py.jinja
 # {{ model["Comment"] }}; output_dtype={{ model["OutputDType"] }}, local_shape={{ shape_tuple(model["LocalShape"]) }}, global_shape={{ shape_tuple(model["GlobalShape"]) }}
 {{ phases.consumer_header(model, args) }}
@@ -15,17 +15,14 @@
         global_lane = global_start + lane
         result = tl.full((block_size,), 0.0, tl.float32)
         active = tl.full((block_size,), False, tl.int1)
-        num_seqs = tl.load(cache_meta + 0).to(tl.int64)
-        query_start = tl.full((), 0, tl.int64)
         for seq_id in tl.range(0, num_seqs):
-            context_len = tl.load(cache_meta + 1 + seq_id * 2)
-            seq_len = tl.load(cache_meta + 2 + seq_id * 2)
-            query_len = seq_len - context_len
-            query_end = query_start + query_len
+            query_start = tl.load(query_start_loc + seq_id).to(tl.int64)
+            query_end = tl.load(query_start_loc + seq_id + 1).to(tl.int64)
+            seq_len = tl.load(seq_lens + seq_id).to(tl.int64)
+            context_len = seq_len - (query_end - query_start)
             in_seq = (global_lane >= query_start) & (global_lane < query_end)
             result = tl.where(in_seq, (context_len + global_lane - query_start).to(tl.float32), result)
             active = active | in_seq
-            query_start = query_end
         tl.store({{ access_pointer(model, "Output", "output", tensor_access(["lane"], model["OutputStrides"], coordinate_shape="(block_size,)")) }}, result, mask=mask & active)
 
 

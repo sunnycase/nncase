@@ -375,9 +375,19 @@ public partial class NTT
         return KernelCall(new TIR.NTT.SynchronizeThreads());
     }
 
-    public static Call Barrier(BarrierScope scope)
+    public static Call Barrier(BarrierScope scope, IRArray<int> axisGroupAxes = default)
     {
-        return KernelCall(new TIR.NTT.Barrier(scope));
+        var normalizedAxes = axisGroupAxes.IsDefaultOrEmpty
+            ? new IRArray<int>()
+            : new IRArray<int>(axisGroupAxes.Distinct().Order().ToArray());
+        if (scope == BarrierScope.Block && normalizedAxes.Count != 0)
+        {
+            throw new ArgumentException(
+                "Block barriers cannot carry chip axis-group axes.",
+                nameof(axisGroupAxes));
+        }
+
+        return KernelCall(new TIR.NTT.Barrier(scope, normalizedAxes));
     }
 
     public static Call Where(Expr cond, Expr x, Expr y, Expr output)

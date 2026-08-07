@@ -429,6 +429,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
         private readonly SortedSet<string> _abiViewStrideArgNames;
         private readonly Dictionary<string, int> _helperCounters = new();
         private readonly Dictionary<string, int> _primFunctionCallCounters = new(StringComparer.Ordinal);
+        private readonly SortedDictionary<string, int[]> _gridBarrierAxisGroups = new(StringComparer.Ordinal);
         private readonly Stack<string> _semanticHelperScopes = new();
         private readonly Dictionary<string, object> _attrs = new();
         private readonly Dictionary<TIR.Buffer, int> _bufferInputIndices;
@@ -565,6 +566,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
         {
             _attrs["tir"] = true;
             Visit(_bodyExpr);
+            AddGridBarrierAxisMetadata();
             RegisterInOutObjectOutputAliases();
             var bodySource = _body.ToString().TrimEnd();
             var inputLayout = BuildKernelInputLayout(bodySource, _deviceFunctions);
@@ -633,6 +635,24 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             if (_runtimeScalarNames.Count > 0)
             {
                 _attrs["runtime_shape_args"] = _runtimeScalarNames.ToArray();
+            }
+
+            var runtimeScalarInputArgs = new SortedSet<string>(StringComparer.Ordinal);
+            foreach (var scalarInput in _kvCacheFieldInputs.Where(input => input.DType is null))
+            {
+                var sourceIndex = _inputNames.IndexOf(scalarInput.Name);
+                if (sourceIndex < 0 || !inputLayout.IndexMap.TryGetValue(sourceIndex, out var kernelInputIndex))
+                {
+                    throw new NotSupportedException(
+                        $"PyNTT runtime scalar input {scalarInput.Name} is absent from the rendered kernel ABI for {_function.Name}.");
+                }
+
+                runtimeScalarInputArgs.Add($"input{kernelInputIndex.ToString(CultureInfo.InvariantCulture)}");
+            }
+
+            if (runtimeScalarInputArgs.Count > 0)
+            {
+                _attrs["runtime_scalar_input_args"] = runtimeScalarInputArgs.ToArray();
             }
 
             if (_abiViewStrideArgNames.Count > 0)
@@ -766,6 +786,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 _helperCalls.ToArray(),
                 _opKinds.ToArray(),
                 _attrs.TryGetValue("requires_grid_barrier", out var requiresGridBarrier) && requiresGridBarrier is true,
+                _gridBarrierAxisGroups.Values.ToArray(),
                 GetBlockLocalDataPoolBytes(),
                 _formalHostTensorDescriptors.ToArray(),
                 new Dictionary<string, PyNTTKVCacheStorageMetadata?>(_formalObjectFieldStorages, StringComparer.Ordinal),
@@ -866,6 +887,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     _helperCalls.ToArray(),
                     _opKinds.ToArray(),
                     requiresGridBarrier,
+                    _gridBarrierAxisGroups.Values.ToArray(),
                     GetBlockLocalDataPoolBytes(),
                     _formalHostTensorDescriptors.ToArray(),
                     new Dictionary<string, PyNTTKVCacheStorageMetadata?>(
@@ -1546,7 +1568,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                         WriteBarrier(HelperBarrierKind.Grid);
                         break;
                     case Nncase.TIR.NTT.Barrier barrier:
-                        WriteExplicitBarrier(barrier.Scope);
+                        WriteExplicitBarrier(barrier);
                         break;
                     case Nncase.TIR.NTT.VectorizedSoftmax softmax:
                         VisitSoftmax(softmax.Axis, softmax.VectorizedAxes, args, "softmax");
@@ -1709,6 +1731,8 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 {
                     _attrs["requires_grid_barrier"] = true;
                 }
+
+                AddGridBarrierAxisGroups(buildResult.GridBarrierAxisGroups);
             }
 
             var callArguments = BuildDeviceFunctionInvocationArguments(callee, args, definition);
@@ -1761,6 +1785,8 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 {
                     _attrs["requires_grid_barrier"] = true;
                 }
+
+                AddGridBarrierAxisGroups(buildResult.GridBarrierAxisGroups);
             }
 
             switch (_pipelineRole)
@@ -3596,6 +3622,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             var helperName = GetNextHelperName("reshard_tile_scatter");
             WriteHelperTemplate("triton/kernels/Reshard.py.jinja", MakeModel(helperName));
             WriteLine(BuildHelperCall(helperName));
+            MarkStoredOutput(output, "PyNTT GatherReduceScatter");
         }
 
         private void VisitPad(Nncase.TIR.NTT.Pad pad, IReadOnlyList<BaseExpr> args)
@@ -6362,7 +6389,9 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 .Select(GetDimensionExpression)
                 .ToArray();
             ValidateRank("PyNTT GetPositionIds global output", globalShape, 1);
-            var cacheMetaArgument = GetKVCacheFieldArgument(args[0], "metadata");
+            var queryStartLocArgument = GetKVCacheFieldArgument(args[0], "query_start_loc");
+            var seqLensArgument = GetKVCacheFieldArgument(args[0], "seq_lens");
+            var numSeqsArgument = GetKVCacheFieldArgument(args[0], "num_seqs");
             SetComputeOp("get_position_ids");
             _attrs["op"] = "get_position_ids";
             _attrs["dtype"] = GetPyNTTDTypeName(output.ElemType);
@@ -6380,7 +6409,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     GetBufferGlobalOffsets(output),
                     GetBufferStrides(output),
                     $"kv-cache -> {output.Name}"));
-            WriteHelperInvocation(helperName, cacheMetaArgument);
+            WriteHelperInvocation(helperName, queryStartLocArgument, seqLensArgument, numSeqsArgument);
         }
 
         private void VisitUpdatePagedAttentionKVCache(Nncase.TIR.NTT.UpdatePagedAttentionKVCache update, IReadOnlyList<BaseExpr> args)
@@ -6394,7 +6423,8 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             var cache = GetPagedAttentionCacheTemplateModel(args[1], "PyNTT UpdatePagedAttentionKVCache");
             var layerIdExpression = GetDimensionExpression(args[2], "PyNTT UpdatePagedAttentionKVCache layer id").TritonExpression;
             var storage = GetKVCacheStorageMetadata(cache);
-            var metaArgument = GetKVCacheFieldArgument(args[1], "metadata");
+            var queryStartLocArgument = GetKVCacheFieldArgument(args[1], "query_start_loc");
+            var numSeqsArgument = GetKVCacheFieldArgument(args[1], "num_seqs");
             var slotMappingArgument = GetKVCacheFieldArgument(args[1], "slot_mapping");
             var storageArgument = GetKVCacheFieldArgument(args[1], "kv_caches", storage);
             var storageBlocksArgument = GetKVCacheFieldArgument(args[1], "kv_caches_blocks", storage);
@@ -6436,7 +6466,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     GetVectorLanes(slots.ElemType),
                     cache,
                     $"{slots.Name} -> kv-cache"));
-            WriteLine(BuildHelperCall(helperName, slotMappingArgument, storageArgument, storageBlocksArgument, metaArgument));
+            WriteLine(BuildHelperCall(helperName, slotMappingArgument, storageArgument, storageBlocksArgument, queryStartLocArgument, numSeqsArgument));
         }
 
         private void VisitPagedAttention(Nncase.TIR.NTT.PagedAttention pagedAttention, IReadOnlyList<BaseExpr> args)
@@ -6453,8 +6483,10 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             var cache = GetPagedAttentionCacheTemplateModel(args[1], "PyNTT PagedAttention");
             var layerIdExpression = GetDimensionExpression(args[4], "PyNTT PagedAttention layer id").TritonExpression;
             var storage = GetKVCacheStorageMetadata(cache);
-            var metaArgument = GetKVCacheFieldArgument(args[1], "metadata");
-            var blockTablesArgument = GetKVCacheFieldArgument(args[1], "block_tables");
+            var queryStartLocArgument = GetKVCacheFieldArgument(args[1], "query_start_loc");
+            var seqLensArgument = GetKVCacheFieldArgument(args[1], "seq_lens");
+            var numSeqsArgument = GetKVCacheFieldArgument(args[1], "num_seqs");
+            var blockTableArgument = GetKVCacheFieldArgument(args[1], "block_table");
             var storageArgument = GetKVCacheFieldArgument(args[1], "kv_caches", storage);
             var storageBlocksArgument = GetKVCacheFieldArgument(args[1], "kv_caches_blocks", storage);
             var layout = pagedAttention.Layout.ToArray();
@@ -6506,7 +6538,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     _targetOptions.TargetMachineModel.Execution.WorkerWidth,
                     cache,
                     $"{query.Name}, kv-cache -> {output.Name}"));
-            WriteLine(BuildHelperCall(helperName, blockTablesArgument, storageArgument, storageBlocksArgument, metaArgument));
+            WriteLine(BuildHelperCall(helperName, blockTableArgument, storageArgument, storageBlocksArgument, queryStartLocArgument, seqLensArgument, numSeqsArgument));
         }
 
         private void VisitSoftmax(int axis, IRArray<int> vectorizedAxes, IReadOnlyList<BaseExpr> args, string opKind)
@@ -7098,15 +7130,8 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             {
                 var argumentName = SanitizePythonIdentifier($"{objectBaseName}_{field}");
                 _extraWorkspaceBaseNames.Add(argumentName);
-                var tritonDType = field switch
-                {
-                    "kv_caches" => storage is null
-                        ? throw new NotSupportedException($"PyNTT formal KV-cache field {argumentName} is missing storage metadata.")
-                        : GetTritonDType(storage.DType),
-                    "metadata" or "slot_mapping" or "block_tables" => "tl.int64",
-                    "kv_caches_blocks" => null,
-                    _ => throw new NotSupportedException($"PyNTT formal KV-cache field {argumentName} has unknown ABI kind."),
-                };
+                var runtimeDType = GetKVCacheFieldRuntimeDType(field, storage);
+                var tritonDType = runtimeDType is null ? null : GetTritonDType(runtimeDType);
                 if (tritonDType is not null &&
                     _extraPointerParameterTritonTypes.TryGetValue(argumentName, out var existingTritonDType) &&
                     existingTritonDType != tritonDType)
@@ -7139,11 +7164,22 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
 
             if (!_kvCacheFieldInputs.Any(input => input.Name == syntheticName))
             {
-                _kvCacheFieldInputs.Add(new(syntheticName, sourceName, field, storage));
+                _kvCacheFieldInputs.Add(new(syntheticName, sourceName, field, storage, GetKVCacheFieldRuntimeDType(field, storage)));
             }
 
             return inputIndex;
         }
+
+        private static string? GetKVCacheFieldRuntimeDType(string field, PyNTTKVCacheStorageMetadata? storage)
+            => field switch
+            {
+                "query_start_loc" or "seq_lens" or "block_table" => "int32",
+                "slot_mapping" => "int64",
+                "kv_caches" => storage?.DType
+                    ?? throw new NotSupportedException($"PyNTT KV-cache field {field} is missing storage metadata."),
+                "num_seqs" or "kv_caches_blocks" => null,
+                _ => throw new NotSupportedException($"PyNTT KV-cache field {field} has unknown ABI kind."),
+            };
 
         private bool TryGetFormalObjectBaseName(BaseExpr expr, out string baseName)
         {
@@ -8943,16 +8979,72 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             WriteBarrier(barrierKind);
         }
 
-        private void WriteExplicitBarrier(TIR.NTT.BarrierScope scope)
+        private void WriteExplicitBarrier(TIR.NTT.Barrier barrier)
         {
-            if (scope == TIR.NTT.BarrierScope.Chip)
+            if (barrier.Scope == TIR.NTT.BarrierScope.Chip)
             {
                 _attrs["requires_grid_barrier"] = true;
+                var axes = NormalizeGridBarrierAxisGroupAxes(barrier.AxisGroupAxes);
+                if (axes.Length != 0)
+                {
+                    var key = string.Join("_", axes.Select(axis => axis.ToString(CultureInfo.InvariantCulture)));
+                    _gridBarrierAxisGroups.TryAdd(key, axes);
+                    WriteLine($"tle.distributed_barrier(PYNTT_GRID_AXIS_GROUP_{key})");
+                    return;
+                }
+
                 WriteBarrier(HelperBarrierKind.Grid);
                 return;
             }
 
             WriteBarrier(HelperBarrierKind.Block);
+        }
+
+        private int[] NormalizeGridBarrierAxisGroupAxes(IRArray<int> axisGroupAxes)
+        {
+            if (axisGroupAxes.IsDefaultOrEmpty)
+            {
+                return Array.Empty<int>();
+            }
+
+            var hierarchy = GetBlockHierarchy(_targetOptions);
+            var levels = GetBlockHierarchyLevels(_targetOptions);
+            var blockAxes = Enumerable.Range(0, hierarchy.Length)
+                .Where(axis => levels[axis] == 'b')
+                .ToArray();
+            var axes = axisGroupAxes.Distinct().Order().ToArray();
+            var unsupported = axes.Where(axis => !blockAxes.Contains(axis)).ToArray();
+            if (unsupported.Length != 0)
+            {
+                throw new NotSupportedException(
+                    $"PyNTT chip axis-group barrier axes [{string.Join(",", unsupported)}] are not physical block axes " +
+                    $"for hierarchy levels '{levels}'.");
+            }
+
+            return axes.SequenceEqual(blockAxes) ? Array.Empty<int>() : axes;
+        }
+
+        private void AddGridBarrierAxisGroups(IEnumerable<int[]> groups)
+        {
+            foreach (var group in groups)
+            {
+                var axes = NormalizeGridBarrierAxisGroupAxes(new IRArray<int>(group));
+                if (axes.Length == 0)
+                {
+                    continue;
+                }
+
+                var key = string.Join("_", axes.Select(axis => axis.ToString(CultureInfo.InvariantCulture)));
+                _gridBarrierAxisGroups.TryAdd(key, axes);
+            }
+        }
+
+        private void AddGridBarrierAxisMetadata()
+        {
+            if (_gridBarrierAxisGroups.Count != 0)
+            {
+                _attrs["grid_barrier_axis_groups"] = _gridBarrierAxisGroups.Values.ToArray();
+            }
         }
 
         private void WriteBarrier(HelperBarrierKind barrierKind)
@@ -11408,6 +11500,7 @@ internal sealed record DeviceFunctionBuildResult(
     IReadOnlyList<HelperKernelCallMetadata> HelperCalls,
     IReadOnlyList<string> OpKinds,
     bool RequiresGridBarrier,
+    IReadOnlyList<int[]> GridBarrierAxisGroups,
     long BlockLocalDataPoolBytes,
     IReadOnlyList<FormalHostTensorDescriptorRequirement> FormalHostTensorDescriptors,
     IReadOnlyDictionary<string, PyNTTKVCacheStorageMetadata?> FormalObjectFieldStorages,
@@ -11420,6 +11513,7 @@ internal sealed record PipelineDeviceFunctionBuildResult(
     IReadOnlyList<HelperKernelCallMetadata> HelperCalls,
     IReadOnlyList<string> OpKinds,
     bool RequiresGridBarrier,
+    IReadOnlyList<int[]> GridBarrierAxisGroups,
     long BlockLocalDataPoolBytes,
     IReadOnlyList<FormalHostTensorDescriptorRequirement> FormalHostTensorDescriptors,
     IReadOnlyDictionary<string, PyNTTKVCacheStorageMetadata?> FormalObjectFieldStorages,

@@ -428,13 +428,20 @@ def render_manifest(manifest: dict[str, Any]) -> str:
         for function in manifest.get("functions", ())
         for kernel in function.get("render_kernels", ())
     )
+    grid_mesh_topology = _grid_mesh_topology(manifest)
+    grid_barrier_axis_groups = _grid_barrier_axis_groups(
+        manifest, grid_mesh_topology
+    )
     env = _make_env()
     return env.get_template("triton/module.py.jinja").render(
         kernels=kernels,
         kernel_configs=kernel_configs,
         host_tensor_descriptor_specs=host_tensor_descriptor_specs,
         needs_grid_barrier=needs_grid_barrier,
-        grid_mesh_size=_grid_mesh_size(manifest),
+        grid_mesh_axes=[
+            (axis["name"], axis["size"]) for axis in grid_mesh_topology
+        ],
+        grid_barrier_axis_groups=grid_barrier_axis_groups,
     )
 
 
@@ -765,7 +772,8 @@ def _packed_qkv_gemv_host_descriptor_spec(
     projection_ns = _packed_qkv_fixed_projection_ns(model)
     if prefix not in projection_ns:
         raise ValueError(f"Unknown PyNTT QKV projection prefix {prefix!r}.")
-    descriptor_block_n = _packed_qkv_copy_n(block_n, projection_ns)
+    descriptor_block_ns, _ = _packed_qkv_transfer_plan(block_n, projection_ns)
+    descriptor_block_n = descriptor_block_ns[prefix]
     spec = _k_major_gemv_host_descriptor_spec(
         model,
         backing,
@@ -832,6 +840,101 @@ def _packed_qkv_copy_n(block_n: int, projection_ns: dict[str, int]) -> int:
             f"PyNTT packed QKV GEMV derived invalid TMA copy N extent {copy_n}."
         )
     return copy_n
+
+
+def _packed_qkv_transfer_plan(
+    block_n: int,
+    projection_ns: dict[str, int],
+) -> tuple[dict[str, int], tuple[tuple[dict[str, int | str], ...], ...]]:
+    """Plan exact per-projection TMA copies over the concatenated Q/K/V N stream."""
+
+    prefixes = ("Q", "K", "V")
+    projection_starts: dict[str, int] = {}
+    total_n = 0
+    for prefix in prefixes:
+        projection_starts[prefix] = total_n
+        total_n += projection_ns[prefix]
+
+    candidate_block_ns = {
+        prefix: gcd(block_n, projection_ns[prefix]) for prefix in prefixes
+    }
+    if total_n % block_n == 0:
+        candidate_tiles: list[tuple[dict[str, int | str], ...]] = []
+        candidate_is_exact = True
+        for tile_start in range(0, total_n, block_n):
+            tile_end = tile_start + block_n
+            position = tile_start
+            copies: list[dict[str, int | str]] = []
+            while position < tile_end:
+                prefix = next(
+                    (
+                        value
+                        for value in prefixes
+                        if projection_starts[value]
+                        <= position
+                        < projection_starts[value] + projection_ns[value]
+                    ),
+                    None,
+                )
+                if prefix is None:
+                    candidate_is_exact = False
+                    break
+                copy_n = candidate_block_ns[prefix]
+                projection_end = projection_starts[prefix] + projection_ns[prefix]
+                if position + copy_n > min(tile_end, projection_end):
+                    candidate_is_exact = False
+                    break
+                copies.append(
+                    {
+                        "prefix": prefix,
+                        "tile_offset": position - tile_start,
+                        "projection_offset": position - projection_starts[prefix],
+                        "copy_n": copy_n,
+                    }
+                )
+                position += copy_n
+            if not candidate_is_exact:
+                break
+            candidate_tiles.append(tuple(copies))
+        if candidate_is_exact:
+            return candidate_block_ns, tuple(candidate_tiles)
+
+    common_copy_n = _packed_qkv_copy_n(block_n, projection_ns)
+    common_block_ns = {prefix: common_copy_n for prefix in prefixes}
+    padded_total_n = ((total_n + block_n - 1) // block_n) * block_n
+    fallback_tiles: list[tuple[dict[str, int | str], ...]] = []
+    for tile_start in range(0, padded_total_n, block_n):
+        copies = []
+        for tile_offset in range(0, block_n, common_copy_n):
+            position = tile_start + tile_offset
+            prefix = next(
+                (
+                    value
+                    for value in prefixes
+                    if projection_starts[value]
+                    <= position
+                    < projection_starts[value] + projection_ns[value]
+                ),
+                "V",
+            )
+            projection_offset = position - projection_starts[prefix]
+            if position < total_n and (
+                projection_offset < 0
+                or projection_offset + common_copy_n > projection_ns[prefix]
+            ):
+                raise ValueError(
+                    "PyNTT packed QKV GEMV common TMA copy crosses a projection boundary."
+                )
+            copies.append(
+                {
+                    "prefix": prefix,
+                    "tile_offset": tile_offset,
+                    "projection_offset": projection_offset,
+                    "copy_n": common_copy_n,
+                }
+            )
+        fallback_tiles.append(tuple(copies))
+    return common_block_ns, tuple(fallback_tiles)
 
 
 def _k_major_gemv_host_descriptor_spec(
@@ -979,6 +1082,18 @@ def _render_kernel(kernel: dict[str, Any]) -> str:
         .render(
             name=metadata["name"],
             parameters=", ".join(parameters),
+            do_not_specialize=repr(
+                tuple(
+                    dict.fromkeys(
+                        (
+                            *_runtime_scalar_input_args(metadata),
+                            *_abi_view_stride_args(metadata),
+                            *_runtime_shape_args(metadata),
+                            "numel",
+                        )
+                    )
+                )
+            ),
             body_source=body_source.rstrip(),
             materialize_shard_index=_needs_shard_index_prelude(
                 body_source,
@@ -1032,6 +1147,7 @@ def _render_device_function(
         .render(
             name=device_function["name"],
             parameters=", ".join(device_parameters),
+            do_not_specialize="",
             body_source=body_source.rstrip(),
             materialize_shard_index=_needs_shard_index_prelude(
                 body_source,
@@ -1408,28 +1524,118 @@ def _make_env() -> Environment:
     return env
 
 
-def _grid_mesh_size(manifest: dict[str, Any]) -> int:
-    sizes = set()
+def _grid_mesh_topology(manifest: dict[str, Any]) -> tuple[dict[str, Any], ...]:
+    topologies: set[tuple[tuple[int, str, int], ...]] = set()
     for function in manifest.get("functions", ()):
         for kernel in function.get("render_kernels", ()):
             metadata = kernel.get("metadata", {})
             if not _attrs(metadata).get("requires_grid_barrier"):
                 continue
-            hierarchy = (
-                metadata.get("launch", {}).get("sharding", {}).get("hierarchy", (1,))
+            sharding = metadata.get("launch", {}).get("sharding", {})
+            hierarchy = tuple(
+                _require_int(value, "launch.sharding.hierarchy", minimum=1)
+                for value in sharding.get("hierarchy", ())
             )
-            product = 1
-            for value in hierarchy:
-                product *= int(value)
-            sizes.add(max(product, 1))
-    if not sizes:
-        return 1
-    if len(sizes) != 1:
+            names = _require_string(
+                sharding.get("placement_axis"),
+                "launch.sharding.placement_axis",
+                nonempty=True,
+            )
+            levels = _require_string(
+                sharding.get("hierarchy_levels"),
+                "launch.sharding.hierarchy_levels",
+                nonempty=True,
+            ).lower()
+            if len(hierarchy) != len(names) or len(hierarchy) != len(levels):
+                raise RuntimeError(
+                    "PyNTT grid mesh hierarchy, placement-axis names, and hierarchy "
+                    f"levels must have equal rank, got {hierarchy}, {names!r}, {levels!r}."
+                )
+            if any(level != "b" and hierarchy[index] != 1 for index, level in enumerate(levels)):
+                raise RuntimeError(
+                    "PyNTT cooperative grid barriers only support non-trivial physical "
+                    f"block axes, got hierarchy {hierarchy} with levels {levels!r}."
+                )
+            topology = tuple(
+                (index, f"block_{names[index]}", hierarchy[index])
+                for index, level in enumerate(levels)
+                if level == "b"
+            )
+            if not topology:
+                raise RuntimeError("PyNTT grid barrier launch has no physical block axes.")
+            if len({item[1] for item in topology}) != len(topology):
+                raise RuntimeError(f"PyNTT grid mesh axis names must be unique, got {topology}.")
+            topologies.add(topology)
+    if not topologies:
+        return ({"placement_axis": 0, "name": "block_b", "size": 1},)
+    if len(topologies) != 1:
         raise RuntimeError(
             "PyNTT generated kernels with grid barriers must use one grid mesh "
-            f"size, got {sorted(sizes)}."
+            f"topology, got {sorted(topologies)}."
         )
-    return next(iter(sizes))
+    return tuple(
+        {"placement_axis": axis, "name": name, "size": size}
+        for axis, name, size in next(iter(topologies))
+    )
+
+
+def _grid_barrier_axis_groups(
+    manifest: dict[str, Any],
+    topology: tuple[dict[str, Any], ...],
+) -> tuple[dict[str, Any], ...]:
+    physical_axes = {int(axis["placement_axis"]) for axis in topology}
+    axis_groups: set[tuple[int, ...]] = set()
+    for function in manifest.get("functions", ()):
+        for kernel in function.get("render_kernels", ()):
+            metadata = kernel.get("metadata", {})
+            raw_groups = _attrs(metadata).get("grid_barrier_axis_groups", ())
+            if not isinstance(raw_groups, (list, tuple)):
+                raise ValueError("attrs.grid_barrier_axis_groups must be an array.")
+            for group_index, raw_group in enumerate(raw_groups):
+                if not isinstance(raw_group, (list, tuple)):
+                    raise ValueError(
+                        f"attrs.grid_barrier_axis_groups[{group_index}] must be an array."
+                    )
+                axes = tuple(
+                    sorted(
+                        {
+                            _require_int(
+                                axis,
+                                f"attrs.grid_barrier_axis_groups[{group_index}]",
+                                minimum=0,
+                            )
+                            for axis in raw_group
+                        }
+                    )
+                )
+                if not axes:
+                    raise ValueError("A grid barrier axis group cannot be empty.")
+                unknown = set(axes) - physical_axes
+                if unknown:
+                    raise ValueError(
+                        f"Grid barrier axis-group axes {sorted(unknown)} are not block axes in {topology}."
+                    )
+                if set(axes) == physical_axes:
+                    raise ValueError(
+                        f"Full-mesh barrier axes {axes} must use the canonical full grid barrier."
+                    )
+                axis_groups.add(axes)
+
+    groups: list[dict[str, Any]] = []
+    for axes in sorted(axis_groups):
+        key = "_".join(str(axis) for axis in axes)
+        axis_names = tuple(
+            axis["name"]
+            for axis in topology
+            if int(axis["placement_axis"]) in axes
+        )
+        groups.append(
+            {
+                "key": key,
+                "axis_names": axis_names,
+            }
+        )
+    return tuple(groups)
 
 
 def _attrs(metadata: dict[str, Any]) -> dict[str, Any]:
@@ -1438,6 +1644,11 @@ def _attrs(metadata: dict[str, Any]) -> dict[str, Any]:
 
 def _runtime_shape_args(metadata: dict[str, Any]) -> tuple[str, ...]:
     value = _attrs(metadata).get("runtime_shape_args", ())
+    return tuple(value or ())
+
+
+def _runtime_scalar_input_args(metadata: dict[str, Any]) -> tuple[str, ...]:
+    value = _attrs(metadata).get("runtime_scalar_input_args", ())
     return tuple(value or ())
 
 
@@ -4182,7 +4393,6 @@ def _packed_qkv_gemv_pipeline_template_context(
         total_n += projection_ns[prefix]
     num_n_tiles = (total_n + block_n - 1) // block_n
     num_k_tiles = k // block_k
-    padded_total_n = num_n_tiles * block_n
     max_sequence_count = num_n_tiles * num_k_tiles
     if max_sequence_count > (2**31 - 1):
         raise ValueError(
@@ -4190,20 +4400,14 @@ def _packed_qkv_gemv_pipeline_template_context(
             f"{max_sequence_count}."
         )
 
-    copy_n = _packed_qkv_copy_n(block_n, projection_ns)
-    if copy_n % n_lane != 0:
-        raise ValueError(
-            "PyNTT packed QKV GEMV cannot form an NVector-aligned common "
-            f"TMA copy extent from block_n={block_n} and projections={projection_ns}."
-        )
-    copy_n_outer = copy_n // n_lane
-    copies_per_tile = block_n // copy_n
-    copy_shape = (
-        copy_n_outer,
-        packed_k_outer,
-        k_pack,
-        n_lane * k_lane,
+    descriptor_block_ns, transfer_plan = _packed_qkv_transfer_plan(
+        block_n, projection_ns
     )
+    if any(copy_n % n_lane != 0 for copy_n in descriptor_block_ns.values()):
+        raise ValueError(
+            "PyNTT packed QKV GEMV cannot form NVector-aligned per-projection "
+            f"TMA copy extents from block_n={block_n} and projections={projection_ns}."
+        )
     projection_by_prefix = {
         projection["prefix"]: projection for projection in context["projections"]
     }
@@ -4249,15 +4453,53 @@ def _packed_qkv_gemv_pipeline_template_context(
                 ][-1],
                 "projection_start": projection_start,
                 "projection_end": projection_end,
-                "copy_end": (
-                    padded_total_n if prefix == "V" else projection_end
-                ),
                 "projection_n_expr": projection_n_expr,
                 "projection_mask": projection_mask,
                 "has_bias": has_bias,
                 "bias_access": bias_access,
                 "output_access": output_access,
             }
+        )
+
+    projection_metadata = {
+        projection["prefix"]: projection for projection in projections
+    }
+    transfer_tiles = []
+    for tile_index, copies in enumerate(transfer_plan):
+        transfer_copies = []
+        for copy in copies:
+            prefix = str(copy["prefix"])
+            copy_n = int(copy["copy_n"])
+            copy_n_outer = copy_n // n_lane
+            projection = projection_metadata[prefix]
+            transfer_copies.append(
+                {
+                    "prefix": prefix,
+                    "lower": projection["lower"],
+                    "descriptor_name": projection["descriptor_name"],
+                    "descriptor_global_k_outer_offset": projection[
+                        "descriptor_global_k_outer_offset"
+                    ],
+                    "descriptor_global_n_outer_offset": projection[
+                        "descriptor_global_n_outer_offset"
+                    ],
+                    "descriptor_projection_n_outer_offset": int(
+                        copy["projection_offset"]
+                    )
+                    // n_lane,
+                    "destination_n_outer_offset": int(copy["tile_offset"])
+                    // n_lane,
+                    "copy_shape": (
+                        copy_n_outer,
+                        packed_k_outer,
+                        k_pack,
+                        n_lane * k_lane,
+                    ),
+                    "copy_is_full_stage": copy_n == block_n,
+                }
+            )
+        transfer_tiles.append(
+            {"tile_index": tile_index, "copies": tuple(transfer_copies)}
         )
 
     reduction_group = 32
@@ -4281,11 +4523,7 @@ def _packed_qkv_gemv_pipeline_template_context(
         num_k_tiles=num_k_tiles,
         num_n_tiles=num_n_tiles,
         projections=tuple(projections),
-        copy_n=copy_n,
-        copy_n_outer=copy_n_outer,
-        copies_per_tile=copies_per_tile,
-        copy_shape=copy_shape,
-        copy_is_full_stage=copy_n == block_n,
+        transfer_tiles=tuple(transfer_tiles),
         k_atom=k_atom,
         packed_k_outer=packed_k_outer,
         reduction_group=reduction_group,
@@ -5940,11 +6178,6 @@ def _update_paged_attention_kv_cache_template_context(
         raise ValueError(
             "PyNTT UpdatePagedAttentionKVCache slot lane shape/count mismatch: "
             f"shape={slots_lane_shape}, count={model['SlotsVectorLaneCount']}"
-        )
-    if vectorized_dim == 5 and lane_count != slots_lane_count:
-        raise ValueError(
-            "PyNTT key-cache HeadDim lanes must match the slot tensor lanes: "
-            f"cache={lane_count}, slots={slots_lane_count}."
         )
     source_split_axes = sorted(
         {axis for split_axes in model["SlotsSourceSplitAxes"] for axis in split_axes}

@@ -16,10 +16,16 @@ internal readonly record struct MemoryByteRange(long Start, long End)
     public bool Overlaps(MemoryByteRange other) => Start < other.End && other.Start < End;
 }
 
-internal readonly record struct EffectInfo(MemoryAccessMode Mode, TIR.NTT.BarrierScope Scope)
+internal readonly record struct EffectInfo(
+    MemoryAccessMode Mode,
+    TIR.NTT.BarrierScope Scope,
+    bool RequiresFullChipSynchronization)
 {
     public EffectInfo Merge(EffectInfo other)
-        => new(Mode | other.Mode, MemoryEffectAnalyzer.MergeScope(Scope, other.Scope));
+        => new(
+            Mode | other.Mode,
+            MemoryEffectAnalyzer.MergeScope(Scope, other.Scope),
+            RequiresFullChipSynchronization || other.RequiresFullChipSynchronization);
 }
 
 internal readonly record struct ResolvedMemoryEffect(MemoryResource Resource, EffectInfo Effect);
@@ -219,7 +225,13 @@ internal sealed class MemoryEffectAnalyzer
                     return;
                 }
 
-                effects.Add(ResolveResource(argument, effect.Scope, bindings), effect.Mode);
+                var resource = ResolveResource(argument, effect.Scope, bindings);
+                effects.Add(
+                    resource,
+                    new EffectInfo(
+                        effect.Mode,
+                        resource.Scope,
+                        effect.Scope == MemoryAccessScope.Chip));
             });
 
         return effects;
@@ -239,7 +251,9 @@ internal sealed class MemoryEffectAnalyzer
             }
 
             var resource = ResolveResource(argument, MemoryAccessScope.Inferred, bindings);
-            effects.Add(resource with { Scope = MergeScope(resource.Scope, effect.Scope) }, effect.Mode);
+            effects.Add(
+                resource with { Scope = MergeScope(resource.Scope, effect.Scope) },
+                effect);
         }
 
         return effects;
@@ -292,16 +306,23 @@ internal sealed class MemoryEffectAnalyzer
                     $"TIR resource alias '{((IVar)expression).Name}' is bound to non-expression {boundExpression.GetType().Name}.");
             }
 
+            var aliasDistributedType = GetDistributedType(expression);
             var resource = ResolveResource(boundResource, synchronizationScope, bindings, resolving);
             resolving.Remove(expression);
-            return resource;
+            return aliasDistributedType is null
+                ? resource
+                : resource with { DistributedType = aliasDistributedType };
         }
 
         switch (expression)
         {
             case Call { Target: IR.Buffers.BufferSubview or IR.Buffers.AllocateBufferView } call
                 when call.Arguments.Length > 0 && call.Arguments[0] is Expr source:
-                return ResolveResource(source, synchronizationScope, bindings, resolving);
+                var viewDistributedType = GetDistributedType(expression);
+                var sourceResource = ResolveResource(source, synchronizationScope, bindings, resolving);
+                return viewDistributedType is null
+                    ? sourceResource
+                    : sourceResource with { DistributedType = viewDistributedType };
             case TIR.Buffer buffer:
                 var physicalBuffer = buffer.MemSpan.Buffer;
                 var scope = explicitScope ?? (physicalBuffer.Location is MemoryLocation.ChipLocalData or MemoryLocation.ChipLocalRdata ||
@@ -313,7 +334,7 @@ internal sealed class MemoryEffectAnalyzer
                     var relativeRange = ReferenceEquals(physicalBuffer.Start, identity)
                         ? TryGetRelativeByteRange(buffer.MemSpan)
                         : null;
-                    return new MemoryResource(identity, buffer, null, relativeRange, scope);
+                    return new MemoryResource(identity, buffer, null, relativeRange, scope, buffer.DistributedType);
                 }
 
                 return new MemoryResource(
@@ -321,13 +342,20 @@ internal sealed class MemoryEffectAnalyzer
                     buffer,
                     new MemoryArena(physicalBuffer.Location, physicalBuffer.Hierarchy),
                     TryGetAbsoluteByteRange(buffer.MemSpan),
-                    scope);
+                    scope,
+                    buffer.DistributedType);
             case IVar variable:
                 var variableExpr = (BaseExpr)variable;
                 var variableScope = explicitScope ?? (variableExpr.CheckedDataType is ReferenceType
                     ? TIR.NTT.BarrierScope.Chip
                     : TIR.NTT.BarrierScope.Block);
-                return new MemoryResource(variableExpr, variableExpr, null, null, variableScope);
+                return new MemoryResource(
+                    variableExpr,
+                    variableExpr,
+                    null,
+                    null,
+                    variableScope,
+                    GetDistributedType(variableExpr));
             default:
                 return new MemoryResource(
                     expression,
@@ -336,9 +364,18 @@ internal sealed class MemoryEffectAnalyzer
                     null,
                     explicitScope ?? (expression.CheckedDataType is ReferenceType
                         ? TIR.NTT.BarrierScope.Chip
-                        : TIR.NTT.BarrierScope.Block));
+                        : TIR.NTT.BarrierScope.Block),
+                    GetDistributedType(expression));
         }
     }
+
+    private static DistributedType? GetDistributedType(BaseExpr expression)
+        => expression switch
+        {
+            TIR.Buffer buffer => buffer.DistributedType,
+            BufferVar bufferVar => bufferVar.TypeAnnotation as DistributedType,
+            _ => expression.CheckedType as DistributedType,
+        };
 
     private static MemoryByteRange? TryGetRelativeByteRange(MemSpan span)
     {
@@ -516,6 +553,243 @@ internal sealed class MemoryEffectAnalyzer
     }
 }
 
+internal readonly record struct SynchronizationRequirement(
+    TIR.NTT.BarrierScope Scope,
+    Placement? Placement,
+    IRArray<int> AxisGroupAxes,
+    bool IsFullChip)
+{
+    public static SynchronizationRequirement Block { get; } = new(
+        TIR.NTT.BarrierScope.Block,
+        null,
+        new IRArray<int>(),
+        false);
+
+    public static SynchronizationRequirement FullChip(Placement? placement = null)
+        => new(
+            TIR.NTT.BarrierScope.Chip,
+            placement,
+            new IRArray<int>(),
+            true);
+
+    public static SynchronizationRequirement ChipAxisGroup(
+        Placement placement,
+        IEnumerable<int> axisGroupAxes)
+    {
+        var axes = axisGroupAxes.Distinct().Order().ToArray();
+        if (axes.Length == 0)
+        {
+            return Block;
+        }
+
+        var blockAxes = GetBlockAxes(placement);
+        if (axes.Any(axis => !blockAxes.Contains(axis)))
+        {
+            return FullChip(placement);
+        }
+
+        return axes.SequenceEqual(blockAxes)
+            ? FullChip(placement)
+            : new(
+                TIR.NTT.BarrierScope.Chip,
+                placement,
+                new IRArray<int>(axes),
+                false);
+    }
+
+    public static SynchronizationRequirement FromBarrier(
+        TIR.NTT.Barrier barrier,
+        Placement? placement = null)
+        => barrier.Scope switch
+        {
+            TIR.NTT.BarrierScope.Block => Block,
+            TIR.NTT.BarrierScope.Chip when barrier.AxisGroupAxes.IsDefaultOrEmpty => FullChip(placement),
+            TIR.NTT.BarrierScope.Chip => new(
+                TIR.NTT.BarrierScope.Chip,
+                placement,
+                new IRArray<int>(barrier.AxisGroupAxes.Distinct().Order().ToArray()),
+                false),
+            _ => throw new ArgumentOutOfRangeException(nameof(barrier)),
+        };
+
+    public SynchronizationRequirement Merge(SynchronizationRequirement other)
+    {
+        if (Scope == TIR.NTT.BarrierScope.Block)
+        {
+            return other;
+        }
+
+        if (other.Scope == TIR.NTT.BarrierScope.Block)
+        {
+            return this;
+        }
+
+        if (IsFullChip || other.IsFullChip ||
+            Placement is null || other.Placement is null || Placement != other.Placement)
+        {
+            return FullChip(Placement == other.Placement ? Placement : null);
+        }
+
+        return ChipAxisGroup(Placement, AxisGroupAxes.Concat(other.AxisGroupAxes));
+    }
+
+    public IRArray<int> ToBarrierAxisGroupAxes()
+        => Scope == TIR.NTT.BarrierScope.Chip && !IsFullChip
+            ? AxisGroupAxes
+            : new IRArray<int>();
+
+    public static int[] GetBlockAxes(Placement placement)
+        => Enumerable.Range(0, placement.Rank)
+            .Where(placement.IsPhysicalBlockAxis)
+            .ToArray();
+}
+
+internal static class SynchronizationRequirementInference
+{
+    public static SynchronizationRequirement ForHazard(
+        ResolvedMemoryEffect producer,
+        ResolvedMemoryEffect consumer)
+    {
+        var mergedScope = MemoryEffectAnalyzer.MergeScope(
+            producer.Effect.Scope,
+            consumer.Effect.Scope);
+        if (mergedScope == TIR.NTT.BarrierScope.Block)
+        {
+            return SynchronizationRequirement.Block;
+        }
+
+        if (producer.Effect.RequiresFullChipSynchronization ||
+            consumer.Effect.RequiresFullChipSynchronization)
+        {
+            var fullPlacement = producer.Resource.DistributedType?.Placement ==
+                consumer.Resource.DistributedType?.Placement
+                ? producer.Resource.DistributedType?.Placement
+                : null;
+            return SynchronizationRequirement.FullChip(fullPlacement);
+        }
+
+        var producerReads = producer.Effect.Mode.HasFlag(MemoryAccessMode.Read);
+        var producerWrites = producer.Effect.Mode.HasFlag(MemoryAccessMode.Write);
+        var consumerReads = consumer.Effect.Mode.HasFlag(MemoryAccessMode.Read);
+        var consumerWrites = consumer.Effect.Mode.HasFlag(MemoryAccessMode.Write);
+        var hasRaw = producerWrites && consumerReads;
+        var hasOtherHazard = (producerReads && consumerWrites) ||
+            (producerWrites && consumerWrites &&
+                !producer.Resource.HasSameLogicalResource(consumer.Resource));
+        if (hasRaw && !hasOtherHazard &&
+            TryInferRawAxisGroup(
+                producer.Resource.DistributedType,
+                consumer.Resource.DistributedType,
+                out var requirement))
+        {
+            return requirement;
+        }
+
+        var placement = producer.Resource.DistributedType?.Placement ==
+            consumer.Resource.DistributedType?.Placement
+            ? producer.Resource.DistributedType?.Placement
+            : null;
+        return SynchronizationRequirement.FullChip(placement);
+    }
+
+    internal static bool TryInferRawAxisGroup(
+        DistributedType? producer,
+        DistributedType? consumer,
+        out SynchronizationRequirement requirement)
+    {
+        requirement = default;
+        if (producer is null || consumer is null ||
+            producer.Placement != consumer.Placement ||
+            producer.Partial != consumer.Partial)
+        {
+            return false;
+        }
+
+        var placement = producer.Placement;
+        if (!TryGetSplitAssignments(producer, out var producerAssignments, out var producerOrders) ||
+            !TryGetSplitAssignments(consumer, out var consumerAssignments, out var consumerOrders))
+        {
+            return false;
+        }
+
+        for (var tensorAxis = 0; tensorAxis < Math.Max(producer.AxisPolicies.Count, consumer.AxisPolicies.Count); tensorAxis++)
+        {
+            var producerOrder = producerOrders.GetValueOrDefault(tensorAxis, Array.Empty<int>());
+            var consumerOrder = consumerOrders.GetValueOrDefault(tensorAxis, Array.Empty<int>());
+            var common = producerOrder.Where(consumerOrder.Contains).ToArray();
+            if (!common.SequenceEqual(consumerOrder.Where(producerOrder.Contains)))
+            {
+                return false;
+            }
+
+            var removesProducerAxis = producerOrder.Any(axis => !consumerOrder.Contains(axis));
+            if (removesProducerAxis &&
+                (consumerOrder.Length > producerOrder.Length ||
+                    !producerOrder.Take(consumerOrder.Length).SequenceEqual(consumerOrder)))
+            {
+                // A zero-copy coarsening forms a valid axis group only when
+                // it removes a suffix of the producer's split order.
+                return false;
+            }
+        }
+
+        var requiredAxes = new List<int>();
+        foreach (var meshAxis in producerAssignments.Keys.Union(consumerAssignments.Keys).Order())
+        {
+            var hasProducer = producerAssignments.TryGetValue(meshAxis, out var producerTensorAxis);
+            var hasConsumer = consumerAssignments.TryGetValue(meshAxis, out var consumerTensorAxis);
+            if (hasProducer && hasConsumer && producerTensorAxis != consumerTensorAxis)
+            {
+                return false;
+            }
+
+            if (hasProducer && !hasConsumer)
+            {
+                requiredAxes.Add(meshAxis);
+            }
+        }
+
+        requirement = SynchronizationRequirement.ChipAxisGroup(placement, requiredAxes);
+        return true;
+
+        static bool TryGetSplitAssignments(
+            DistributedType type,
+            out Dictionary<int, int> assignments,
+            out Dictionary<int, int[]> orders)
+        {
+            assignments = new Dictionary<int, int>();
+            orders = new Dictionary<int, int[]>();
+            for (var tensorAxis = 0; tensorAxis < type.AxisPolicies.Count; tensorAxis++)
+            {
+                if (type.AxisPolicies[tensorAxis] is not SBPSplit split)
+                {
+                    continue;
+                }
+
+                var axes = split.Axes.ToArray();
+                if (axes.Distinct().Count() != axes.Length ||
+                    axes.Any(axis => axis < 0 ||
+                        axis >= type.Placement.Rank ||
+                        !type.Placement.IsPhysicalBlockAxis(axis)))
+                {
+                    return false;
+                }
+
+                orders.Add(tensorAxis, axes);
+                foreach (var meshAxis in axes)
+                {
+                    if (!assignments.TryAdd(meshAxis, tensorAxis))
+                    {
+                        return false;
+                    }
+                }
+            }
+
+            return true;
+        }
+    }
+}
+
 internal sealed class MemorySynchronizationPlanner
 {
     private readonly MemoryEffectAnalyzer _analyzer;
@@ -538,34 +812,35 @@ internal sealed class MemorySynchronizationPlanner
         bool insideReduction)
     {
         var fields = new List<Expr>();
-        var pendingAccesses = new EffectSet();
+        var pendingAccesses = new PendingEffectSet();
         foreach (var field in sequential.Fields)
         {
-            if (TryGetBarrierScope(field, out var explicitScope))
+            if (TryGetBarrier(field, out var explicitBarrier))
             {
-                if (ShouldMaterialize(explicitScope) &&
-                    pendingAccesses.HasAccessesAtOrBelow(explicitScope))
+                var explicitRequirement = SynchronizationRequirement.FromBarrier(explicitBarrier);
+                if (ShouldMaterialize(explicitRequirement.Scope) &&
+                    pendingAccesses.HasUnsynchronizedAccesses(explicitRequirement))
                 {
-                    AppendBarrier(fields, explicitScope);
-                    pendingAccesses.RemoveAccessesAtOrBelow(explicitScope);
+                    AppendBarrier(fields, explicitRequirement);
+                    pendingAccesses.Synchronize(explicitRequirement);
                 }
 
                 continue;
             }
 
             var effects = _analyzer.GetEffects(field, insideReduction);
-            if (pendingAccesses.TryGetConflict(effects, out var requiredScope))
+            if (pendingAccesses.TryGetConflict(effects, out var requirement))
             {
-                if (ShouldMaterialize(requiredScope) &&
-                    insideLoop && requiredScope == TIR.NTT.BarrierScope.Chip)
+                if (ShouldMaterialize(requirement.Scope) &&
+                    insideLoop && requirement.Scope == TIR.NTT.BarrierScope.Chip)
                 {
                     throw new InvalidOperationException("A chip-wide synchronization dependence remains inside a tiled loop. Split the producer and consumer into separate scheduling phases.");
                 }
 
-                if (ShouldMaterialize(requiredScope))
+                if (ShouldMaterialize(requirement.Scope))
                 {
-                    AppendBarrier(fields, requiredScope);
-                    pendingAccesses.RemoveAccessesAtOrBelow(requiredScope);
+                    AppendBarrier(fields, requirement);
+                    pendingAccesses.Synchronize(requirement);
                 }
             }
 
@@ -581,7 +856,7 @@ internal sealed class MemorySynchronizationPlanner
 
             var remainingEffects = effects.Clone();
             remainingEffects.RemoveAccessesAtExactScopes(rewritten.SynchronizedScopes);
-            pendingAccesses.UnionWith(remainingEffects);
+            pendingAccesses.Add(remainingEffects);
         }
 
         return new(
@@ -689,7 +964,11 @@ internal sealed class MemorySynchronizationPlanner
             if (ShouldMaterialize(requiredScope))
             {
                 var fields = body.Expression.Fields.ToArray().ToList();
-                AppendBarrier(fields, requiredScope);
+                AppendBarrier(
+                    fields,
+                    requiredScope == TIR.NTT.BarrierScope.Chip
+                        ? SynchronizationRequirement.FullChip()
+                        : SynchronizationRequirement.Block);
                 body = new(
                     body.Expression.With(fields: fields.ToArray()),
                     body.SynchronizedScopes | GetScopesSatisfiedBy(requiredScope));
@@ -723,26 +1002,32 @@ internal sealed class MemorySynchronizationPlanner
             _ => throw new ArgumentOutOfRangeException(nameof(scope), scope, null),
         };
 
-    private static void AppendBarrier(List<Expr> fields, TIR.NTT.BarrierScope scope)
+    private static void AppendBarrier(
+        List<Expr> fields,
+        SynchronizationRequirement requirement)
     {
-        if (fields.Count > 0 && TryGetBarrierScope(fields[^1], out var previousScope))
+        if (fields.Count > 0 && TryGetBarrier(fields[^1], out var previousBarrier))
         {
-            fields[^1] = TIR.F.NTT.Barrier(MemoryEffectAnalyzer.MergeScope(previousScope, scope));
+            var previous = SynchronizationRequirement.FromBarrier(
+                previousBarrier,
+                requirement.Placement);
+            var merged = previous.Merge(requirement);
+            fields[^1] = TIR.F.NTT.Barrier(merged.Scope, merged.ToBarrierAxisGroupAxes());
             return;
         }
 
-        fields.Add(TIR.F.NTT.Barrier(scope));
+        fields.Add(TIR.F.NTT.Barrier(requirement.Scope, requirement.ToBarrierAxisGroupAxes()));
     }
 
-    private static bool TryGetBarrierScope(Expr expression, out TIR.NTT.BarrierScope scope)
+    private static bool TryGetBarrier(Expr expression, out TIR.NTT.Barrier barrier)
     {
-        if (expression is Call { Target: TIR.NTT.Barrier barrier })
+        if (expression is Call { Target: TIR.NTT.Barrier target })
         {
-            scope = barrier.Scope;
+            barrier = target;
             return true;
         }
 
-        scope = default;
+        barrier = null!;
         return false;
     }
 
@@ -760,7 +1045,8 @@ internal sealed record MemoryResource(
     BaseExpr? LogicalIdentity,
     MemoryArena? Arena,
     MemoryByteRange? ByteRange,
-    TIR.NTT.BarrierScope Scope)
+    TIR.NTT.BarrierScope Scope,
+    DistributedType? DistributedType)
 {
     public bool HasSameRegion(MemoryResource other)
         => HasSameLogicalResource(other) && HasSameBacking(other) && ByteRange == other.ByteRange;
@@ -800,10 +1086,7 @@ internal sealed class EffectSet
 
     public IEnumerable<ResolvedMemoryEffect> Items => _items;
 
-    public void Add(MemoryResource resource, MemoryAccessMode mode)
-        => Add(resource, new EffectInfo(mode, resource.Scope));
-
-    private void Add(MemoryResource resource, EffectInfo effect)
+    public void Add(MemoryResource resource, EffectInfo effect)
     {
         var index = _items.FindIndex(item => item.Resource.HasSameRegion(resource));
         if (index >= 0)
@@ -830,44 +1113,6 @@ internal sealed class EffectSet
         var result = new EffectSet();
         result.UnionWith(this);
         return result;
-    }
-
-    public bool TryGetConflict(EffectSet consumer, out TIR.NTT.BarrierScope scope)
-    {
-        var found = false;
-        scope = TIR.NTT.BarrierScope.Block;
-        foreach (var consumerEffect in consumer._items)
-        {
-            foreach (var pendingAccess in _items)
-            {
-                if (!pendingAccess.Resource.MayAlias(consumerEffect.Resource) ||
-                    !RequiresSynchronization(pendingAccess, consumerEffect))
-                {
-                    continue;
-                }
-
-                found = true;
-                scope = MemoryEffectAnalyzer.MergeScope(
-                    scope,
-                    MemoryEffectAnalyzer.MergeScope(consumerEffect.Effect.Scope, pendingAccess.Effect.Scope));
-            }
-        }
-
-        return found;
-
-        static bool RequiresSynchronization(
-            ResolvedMemoryEffect producer,
-            ResolvedMemoryEffect consumer)
-        {
-            var producerReads = producer.Effect.Mode.HasFlag(MemoryAccessMode.Read);
-            var producerWrites = producer.Effect.Mode.HasFlag(MemoryAccessMode.Write);
-            var consumerReads = consumer.Effect.Mode.HasFlag(MemoryAccessMode.Read);
-            var consumerWrites = consumer.Effect.Mode.HasFlag(MemoryAccessMode.Write);
-            return (producerWrites && consumerReads) ||
-                (producerReads && consumerWrites) ||
-                (producerWrites && consumerWrites &&
-                    !producer.Resource.HasSameLogicalResource(consumer.Resource));
-        }
     }
 
     public bool TryGetReadWriteAlias(out TIR.NTT.BarrierScope scope)
@@ -898,21 +1143,6 @@ internal sealed class EffectSet
         static bool HasReadWriteConflict(MemoryAccessMode lhs, MemoryAccessMode rhs)
             => (lhs.HasFlag(MemoryAccessMode.Read) && rhs.HasFlag(MemoryAccessMode.Write)) ||
                 (lhs.HasFlag(MemoryAccessMode.Write) && rhs.HasFlag(MemoryAccessMode.Read));
-    }
-
-    public bool HasAccessesAtOrBelow(TIR.NTT.BarrierScope scope)
-        => _items.Any(item => item.Effect.Mode != MemoryAccessMode.None && IsSatisfiedBy(item.Effect.Scope, scope));
-
-    public void RemoveAccessesAtOrBelow(TIR.NTT.BarrierScope scope)
-    {
-        for (var index = _items.Count - 1; index >= 0; index--)
-        {
-            var effect = _items[index].Effect;
-            if (effect.Mode != MemoryAccessMode.None && IsSatisfiedBy(effect.Scope, scope))
-            {
-                _items.RemoveAt(index);
-            }
-        }
     }
 
     public void RemoveAccessesAtExactScopes(MemorySynchronizationScopes scopes)
@@ -949,6 +1179,185 @@ internal sealed class EffectSet
             _ => throw new ArgumentOutOfRangeException(nameof(scope), scope, null),
         };
 
-    private static bool IsSatisfiedBy(TIR.NTT.BarrierScope required, TIR.NTT.BarrierScope actual)
-        => actual == TIR.NTT.BarrierScope.Chip || required == TIR.NTT.BarrierScope.Block;
+}
+
+internal sealed class PendingEffectSet
+{
+    private readonly List<PendingEffect> _items = new();
+
+    public void Add(EffectSet effects)
+    {
+        foreach (var effect in effects.Items)
+        {
+            if (effect.Effect.Mode != MemoryAccessMode.None)
+            {
+                _items.Add(new PendingEffect(effect));
+            }
+        }
+    }
+
+    public bool TryGetConflict(
+        EffectSet consumer,
+        out SynchronizationRequirement requirement)
+    {
+        SynchronizationRequirement? merged = null;
+        foreach (var consumerEffect in consumer.Items)
+        {
+            foreach (var pending in _items)
+            {
+                if (!pending.Access.Resource.MayAlias(consumerEffect.Resource) ||
+                    !RequiresSynchronization(pending.Access, consumerEffect))
+                {
+                    continue;
+                }
+
+                var current = SynchronizationRequirementInference.ForHazard(
+                    pending.Access,
+                    consumerEffect);
+                if (pending.Coverage.Covers(current))
+                {
+                    continue;
+                }
+
+                merged = merged is { } existing
+                    ? existing.Merge(current)
+                    : current;
+            }
+        }
+
+        requirement = merged ?? default;
+        return merged is not null;
+    }
+
+    public bool HasUnsynchronizedAccesses(SynchronizationRequirement requirement)
+        => _items.Any(item =>
+            IsSatisfiedBy(item.Access.Effect.Scope, requirement.Scope) &&
+            !item.Coverage.Covers(requirement));
+
+    public void Synchronize(SynchronizationRequirement requirement)
+    {
+        foreach (var item in _items)
+        {
+            item.Coverage.Apply(requirement, item.Access.Resource.DistributedType);
+        }
+
+        _items.RemoveAll(item =>
+            item.Access.Effect.Scope == TIR.NTT.BarrierScope.Block
+                ? item.Coverage.BlockSynchronized
+                : item.Coverage.FullChipSynchronized);
+    }
+
+    public MemorySynchronizationScopes GetScopesWithoutAccesses()
+    {
+        var result = MemorySynchronizationScopes.All;
+        foreach (var item in _items)
+        {
+            result &= ~ToSynchronizationScope(item.Access.Effect.Scope);
+        }
+
+        return result;
+    }
+
+    private static bool RequiresSynchronization(
+        ResolvedMemoryEffect producer,
+        ResolvedMemoryEffect consumer)
+    {
+        var producerReads = producer.Effect.Mode.HasFlag(MemoryAccessMode.Read);
+        var producerWrites = producer.Effect.Mode.HasFlag(MemoryAccessMode.Write);
+        var consumerReads = consumer.Effect.Mode.HasFlag(MemoryAccessMode.Read);
+        var consumerWrites = consumer.Effect.Mode.HasFlag(MemoryAccessMode.Write);
+        return (producerWrites && consumerReads) ||
+            (producerReads && consumerWrites) ||
+            (producerWrites && consumerWrites &&
+                !producer.Resource.HasSameLogicalResource(consumer.Resource));
+    }
+
+    private static MemorySynchronizationScopes ToSynchronizationScope(
+        TIR.NTT.BarrierScope scope)
+        => scope switch
+        {
+            TIR.NTT.BarrierScope.Block => MemorySynchronizationScopes.Block,
+            TIR.NTT.BarrierScope.Chip => MemorySynchronizationScopes.Chip,
+            _ => throw new ArgumentOutOfRangeException(nameof(scope), scope, null),
+        };
+
+    private static bool IsSatisfiedBy(
+        TIR.NTT.BarrierScope required,
+        TIR.NTT.BarrierScope actual)
+        => actual == TIR.NTT.BarrierScope.Chip ||
+            required == TIR.NTT.BarrierScope.Block;
+
+    private sealed class PendingEffect
+    {
+        public PendingEffect(ResolvedMemoryEffect access)
+        {
+            Access = access;
+        }
+
+        public ResolvedMemoryEffect Access { get; }
+
+        public BarrierCoverage Coverage { get; } = new();
+    }
+
+    private sealed class BarrierCoverage
+    {
+        private readonly HashSet<int> _axisGroupAxes = new();
+        private Placement? _placement;
+
+        public bool BlockSynchronized { get; private set; }
+
+        public bool FullChipSynchronized { get; private set; }
+
+        public bool Covers(SynchronizationRequirement requirement)
+        {
+            if (requirement.Scope == TIR.NTT.BarrierScope.Block)
+            {
+                return BlockSynchronized;
+            }
+
+            if (FullChipSynchronized)
+            {
+                return true;
+            }
+
+            return !requirement.IsFullChip &&
+                requirement.Placement is not null &&
+                _placement == requirement.Placement &&
+                requirement.AxisGroupAxes.All(_axisGroupAxes.Contains);
+        }
+
+        public void Apply(
+            SynchronizationRequirement requirement,
+            DistributedType? distributedType)
+        {
+            BlockSynchronized = true;
+            if (requirement.Scope == TIR.NTT.BarrierScope.Block)
+            {
+                return;
+            }
+
+            if (requirement.IsFullChip)
+            {
+                FullChipSynchronized = true;
+                return;
+            }
+
+            var placement = requirement.Placement ?? distributedType?.Placement;
+            if (placement is null ||
+                (distributedType is not null && distributedType.Placement != placement))
+            {
+                return;
+            }
+
+            if (_placement is not null && _placement != placement)
+            {
+                return;
+            }
+
+            _placement = placement;
+            _axisGroupAxes.UnionWith(requirement.AxisGroupAxes);
+            var blockAxes = SynchronizationRequirement.GetBlockAxes(placement);
+            FullChipSynchronized = blockAxes.All(_axisGroupAxes.Contains);
+        }
+    }
 }

@@ -17,6 +17,48 @@ import logging
 logging.getLogger("transformers").setLevel(logging.ERROR)
 
 
+class _PyNTTPagedAttentionKVCache:
+    pass
+
+
+def _to_pyntt_paged_attention_kv_cache(cache, block_size, hierarchy):
+    context_lens = np.asarray(cache.context_lens.to_numpy(), dtype=np.int64).reshape(-1)
+    seq_lens = np.asarray(cache.seq_lens.to_numpy(), dtype=np.int64).reshape(-1)
+    block_table = np.asarray(cache.block_tables.to_numpy(), dtype=np.int64)
+    slot_mapping = np.asarray(cache.slot_mapping.to_numpy(), dtype=np.int64)
+    if context_lens.shape != seq_lens.shape:
+        raise ValueError("Paged-attention context_lens and seq_lens must have the same shape")
+
+    query_lens = seq_lens - context_lens
+    if np.any(query_lens < 0):
+        raise ValueError("Paged-attention query lengths must be non-negative")
+    query_start_loc64 = np.concatenate(
+        [np.zeros((1,), dtype=np.int64), np.cumsum(query_lens, dtype=np.int64)])
+    if query_start_loc64[-1] > np.iinfo(np.int32).max:
+        raise ValueError("Paged-attention query_start_loc exceeds int32 range")
+
+    block_size = int(block_size)
+    topology_extent = math.prod(hierarchy) if hierarchy else 1
+    local_blocks = 1
+    if block_table.size:
+        local_blocks = max(local_blocks, int(block_table[..., -1].max()) + 1)
+    if slot_mapping.size:
+        local_blocks = max(
+            local_blocks, int(slot_mapping[..., -1].max()) // block_size + 1)
+
+    result = _PyNTTPagedAttentionKVCache()
+    result.query_start_loc = torch.from_numpy(
+        query_start_loc64.astype(np.int32)).cuda()
+    result.seq_lens = torch.from_numpy(seq_lens.astype(np.int32)).cuda()
+    result.block_table = torch.from_numpy(
+        np.ascontiguousarray(block_table, dtype=np.int32)).cuda()
+    result.slot_mapping = torch.from_numpy(
+        np.ascontiguousarray(slot_mapping, dtype=np.int64)).cuda()
+    result.num_blocks = local_blocks * topology_extent
+    result.kv_caches = cache.kv_caches
+    return result
+
+
 def download_from_huggingface(model_api, tokenizer_api, model_name, need_save=False):
     print(f" Downloading \033[32m\033[1m {model_name} \033[0m from huggingface ... ")
     model_dir = os.path.join(os.path.dirname(__file__), "llm", model_name)
@@ -269,7 +311,8 @@ class HuggingfaceTestRunner(TestRunner):
         torch_inputs = []
         for value in input_data:
             if isinstance(value, nncase.PagedAttentionKVCache):
-                torch_inputs.append(value)
+                torch_inputs.append(_to_pyntt_paged_attention_kv_cache(
+                    value, self.block_size, self.hierarchy))
             else:
                 torch_inputs.append(torch.from_numpy(np.ascontiguousarray(value)).cuda())
 
@@ -279,7 +322,10 @@ class HuggingfaceTestRunner(TestRunner):
         return self.get_pyntt_result(torch_outputs, token_num)
 
     def pipeline_run(self, model, infer_or_eval):
-        input_ids = self.local_inputs[0]['data'][0].input_ids[0].astype(np.int64)
+        input_ids_dtype = np.dtype(
+            self.cfg['huggingface_options']['input_ids_type'])
+        input_ids = self.local_inputs[0]['data'][0].input_ids[0].astype(
+            input_ids_dtype)
         loop_data = [input_ids, self.local_inputs[1]['data'][0]]
 
         token_ids = []
@@ -310,7 +356,7 @@ class HuggingfaceTestRunner(TestRunner):
             token_ids.append(next_token_id)
             tokens.append(next_token)
 
-            loop_data[0] = np.array([next_token_id], dtype=np.int64)
+            loop_data[0] = np.array([next_token_id], dtype=input_ids_dtype)
 
             results.append(result)
         return results, token_ids, tokens
@@ -603,7 +649,7 @@ class HuggingfaceTestRunner(TestRunner):
         input_dict = {}
         for input_ in self.model.dummy_inputs:
             input_dict["name"] = input_
-            input_dict["dtype"] = self.model.dummy_inputs[input_].dtype.__repr__().split('.')[1]
+            input_dict["dtype"] = self.cfg['huggingface_options']['input_ids_type']
             # TODO: fix dynamic shape
             input_dict['shape'] = [1, "sequence_length"]
             input_dict['model_shape'] = [1, "sequence_length"]

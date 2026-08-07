@@ -580,7 +580,8 @@ internal sealed record PyNTTKVCacheFieldInputMetadata(
     string Name,
     string SourceName,
     string Field,
-    PyNTTKVCacheStorageMetadata? Storage);
+    PyNTTKVCacheStorageMetadata? Storage,
+    string? DType);
 
 internal sealed record PyNTTKVCacheStorageMetadata(
     string DType,

@@ -8,7 +8,13 @@ PYNTT_KERNEL_CONFIGS = {{ pyrepr(kernel_configs) }}
 PYNTT_HOST_TENSOR_DESCRIPTOR_SPECS = {{ pyrepr(host_tensor_descriptor_specs) }}
 {% if needs_grid_barrier %}
 
-PYNTT_GRID_MESH = tl.constexpr(tle.device_mesh({"block": [("block_x", {{ grid_mesh_size }})]}))
+_PYNTT_GRID_MESH_VALUE = tle.device_mesh({"block": {{ pyrepr(grid_mesh_axes) }}})
+PYNTT_GRID_MESH = tl.constexpr(_PYNTT_GRID_MESH_VALUE)
+{% for group in grid_barrier_axis_groups %}
+PYNTT_GRID_AXIS_GROUP_{{ group.key }} = tl.constexpr(
+    _PYNTT_GRID_MESH_VALUE.axis_group({{ pyrepr(group.axis_names) }})
+)
+{% endfor %}
 {% endif %}
 
 

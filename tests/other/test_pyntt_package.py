@@ -194,7 +194,11 @@ def test_pyntt_runtime_validates_torch_inputs_and_reuses_storage(tmp_path):
         ),
     )
     module = PyNTTModule(spec)
-    interpreter = PyNTTInterpreter(spec).load()
+    class CopyInterpreter(PyNTTInterpreter):
+        def _run_entry(self, inputs, outputs, shape_env):
+            outputs[0].copy_(inputs[0])
+
+    interpreter = CopyInterpreter(spec).load()
 
     x = torch.ones((2, 3), dtype=torch.float32)
     y = module(x)
@@ -203,6 +207,19 @@ def test_pyntt_runtime_validates_torch_inputs_and_reuses_storage(tmp_path):
     assert y.dtype == x.dtype
     assert y.device == x.device
     assert z.shape == x.shape
+
+    caller_output = torch.empty_like(x)
+    assert interpreter.run_into((caller_output,), x) is None
+    torch.testing.assert_close(caller_output, x)
+    with pytest.raises(PyNTTArgumentError, match="output 0.*dtype"):
+        interpreter.run_into(
+            (torch.empty_like(x, dtype=torch.float16),),
+            x,
+        )
+    if torch.cuda.is_available():
+        unaligned = torch.empty((7,), dtype=torch.float32, device="cuda")[1:].view(2, 3)
+        with pytest.raises(PyNTTArgumentError, match="16-byte aligned"):
+            interpreter.run_into((torch.empty_like(unaligned),), unaligned)
 
     workspace = allocate_workspace((x,), 8, "uint8")
     workspace.fill_(7)
@@ -231,6 +248,74 @@ def test_pyntt_runtime_validates_torch_inputs_and_reuses_storage(tmp_path):
     rdata_table_again = materialize_rdata_table((x,), sources, 1)
     assert rdata_table.tolist() == [1, 2]
     assert rdata_table_again.data_ptr() == rdata_table.data_ptr()
+
+
+def test_pyntt_runtime_uses_authoritative_kv_cache_capacity_without_scanning():
+    torch = pytest.importorskip("torch")
+    _add_pyntt_to_path()
+
+    from pyntt.runtime.tensor import (
+        get_kv_cache_num_seqs,
+        materialize_kv_cache_blocks_per_shard,
+        materialize_kv_cache_storage,
+    )
+    from pyntt.runtime.errors import PyNTTArgumentError
+
+    class DirectKVCache:
+        num_blocks = 8
+        num_seqs = 3
+
+        def __init__(self):
+            self.kv_caches = torch.empty((8, 16), dtype=torch.bfloat16)
+
+        @property
+        def slot_mapping(self):
+            raise AssertionError("explicit capacity must not scan slot_mapping")
+
+        @property
+        def block_table(self):
+            raise AssertionError("explicit capacity must not scan block_table")
+
+        @property
+        def query_start_loc(self):
+            raise AssertionError("explicit num_seqs must not inspect query metadata")
+
+        @property
+        def seq_lens(self):
+            raise AssertionError("explicit num_seqs must not inspect query metadata")
+
+    cache = DirectKVCache()
+    storage = materialize_kv_cache_storage(
+        cache,
+        dtype="bfloat16",
+        topology_shape=(),
+        key_tail_shape=(8,),
+        value_tail_shape=(8,),
+        key_section_elements=8,
+        value_section_elements=8,
+        block_elements=16,
+        block_size=4,
+    )
+
+    assert storage is cache.kv_caches
+    assert materialize_kv_cache_blocks_per_shard(
+        cache, topology_shape=(), block_size=4
+    ) == 8
+    assert get_kv_cache_num_seqs(cache) == 3
+
+    cache.num_blocks = 9
+    with pytest.raises(PyNTTArgumentError, match="fewer blocks"):
+        materialize_kv_cache_storage(
+            cache,
+            dtype="bfloat16",
+            topology_shape=(),
+            key_tail_shape=(8,),
+            value_tail_shape=(8,),
+            key_section_elements=8,
+            value_section_elements=8,
+            block_elements=16,
+            block_size=4,
+        )
 
 
 def test_pyntt_runtime_reuses_bounded_host_tensor_descriptors():
@@ -410,6 +495,83 @@ def test_pyntt_renderer_owns_block_schedule_config():
     launch["tuning"] = {"parameters": {}}
     with pytest.raises(ValueError, match=r"unexpected fields \['tuning'\]"):
         render_manifest(manifest)
+
+
+def test_pyntt_qkv_transfer_plan_uses_exact_projection_copy_extents():
+    _add_pyntt_to_path()
+    from pyntt.codegen.render import _packed_qkv_transfer_plan
+
+    descriptor_block_ns, tiles = _packed_qkv_transfer_plan(
+        64, {"Q": 64, "K": 32, "V": 32}
+    )
+
+    assert descriptor_block_ns == {"Q": 64, "K": 32, "V": 32}
+    assert [
+        [
+            (
+                copy["prefix"],
+                copy["tile_offset"],
+                copy["projection_offset"],
+                copy["copy_n"],
+            )
+            for copy in tile
+        ]
+        for tile in tiles
+    ] == [
+        [("Q", 0, 0, 64)],
+        [("K", 0, 0, 32), ("V", 32, 0, 32)],
+    ]
+
+
+def test_pyntt_qkv_transfer_plan_preserves_common_copy_tail_fallback():
+    _add_pyntt_to_path()
+    from pyntt.codegen.render import _packed_qkv_transfer_plan
+
+    descriptor_block_ns, tiles = _packed_qkv_transfer_plan(
+        64, {"Q": 96, "K": 32, "V": 32}
+    )
+
+    assert descriptor_block_ns == {"Q": 32, "K": 32, "V": 32}
+    assert [
+        [
+            (
+                copy["prefix"],
+                copy["tile_offset"],
+                copy["projection_offset"],
+            )
+            for copy in tile
+        ]
+        for tile in tiles
+    ] == [
+        [("Q", 0, 0), ("Q", 32, 32)],
+        [("Q", 0, 64), ("K", 32, 0)],
+        [("V", 0, 0), ("V", 32, 32)],
+    ]
+
+
+def test_pyntt_renderer_marks_dynamic_top_kernel_scalars_non_specializing():
+    _add_pyntt_to_path()
+    from pyntt.codegen.render import render_manifest
+
+    manifest = _test_pyntt_codegen_manifest(
+        {
+            "metadata": {
+                "name": "top",
+                "attrs": {
+                    "runtime_scalar_input_args": ["input0"],
+                    "runtime_shape_args": ["sequence_length"],
+                    "abi_view_stride_args": ["input0_scalar_stride0"],
+                },
+            },
+            "body_source": "pass",
+        }
+    )
+
+    source = render_manifest(manifest)
+    assert (
+        "@triton.jit(do_not_specialize=('input0', 'input0_scalar_stride0', "
+        "'sequence_length', 'numel'))" in source
+    )
 
 
 def test_pyntt_renderer_rejects_non_integral_target_worker_geometry():
@@ -658,14 +820,26 @@ class _FakeTunableJitKernel:
     def __init__(self, compiled_by_candidate):
         self.compiled_by_candidate = compiled_by_candidate
         self.attempts = []
+        self.prepared = []
 
-    def run(self, *args, **kwargs):
+    def prepare(self, *args, **kwargs):
         candidate = int(args[-1])
         self.attempts.append(candidate)
         result = self.compiled_by_candidate[candidate]
         if isinstance(result, BaseException):
             raise result
-        return result
+        prepared = _FakePreparedKernel(result)
+        self.prepared.append(prepared)
+        return prepared
+
+
+class _FakePreparedKernel:
+    def __init__(self, compiled):
+        self.compiled_kernel = compiled
+        self.launches = []
+
+    def launch(self, *args, **kwargs):
+        self.launches.append((args, kwargs))
 
 
 def test_pyntt_runtime_accepts_kernel_within_fixed_resource_budget():
@@ -730,9 +904,9 @@ def test_pyntt_runtime_rejects_kernel_outside_fixed_resource_budget(compiled, me
         )
 
 
-def test_pyntt_runtime_selects_first_resource_feasible_tuning_candidate():
+def test_pyntt_runtime_prepares_first_resource_feasible_tuning_candidate():
     _add_pyntt_to_path()
-    from pyntt.runtime.triton import select_and_validate_triton_tuning_parameter
+    from pyntt.runtime.triton import prepare_and_validate_triton_kernel
     from triton.runtime.errors import OutOfResources
 
     kernel = _FakeTunableJitKernel(
@@ -753,14 +927,54 @@ def test_pyntt_runtime_selects_first_resource_feasible_tuning_candidate():
         "forbid_spills": True,
         "num_warps": 8,
     }
-    selected = select_and_validate_triton_tuning_parameter(
+    prepared = prepare_and_validate_triton_kernel(
         "test_kernel", "block_size", (128, 256, 512), **kwargs
     )
-    assert selected == 128
+    assert prepared.parameter_value == 128
     assert kernel.attempts == [512, 256, 128]
 
-    selected_again = select_and_validate_triton_tuning_parameter(
-        "test_kernel", "block_size", (128, 256, 512), **kwargs
-    )
-    assert selected_again == 128
-    assert kernel.attempts == [512, 256, 128]
+    prepared.launch(grid=(4,))
+    assert kernel.prepared[-1].launches == [((), {"grid": (4,), "stream": None})]
+
+
+def test_pyntt_runtime_requires_prepared_triton_abi():
+    _add_pyntt_to_path()
+    from pyntt.runtime.triton import prepare_and_validate_triton_kernel
+
+    with pytest.raises(RuntimeError, match=r"JITFunction\.prepare"):
+        prepare_and_validate_triton_kernel(
+            "test_kernel",
+            "block_size",
+            (128,),
+            source="search_space",
+            kernel=_FakeJitKernel(_FakeCompiledKernel()),
+            kernel_args=(),
+            grid_for_candidate=lambda _: (1,),
+            expected_compute_num_warps=8,
+            registers_per_thread_limit=255,
+            shared_memory_capacity_bytes=101_376,
+            forbid_spills=True,
+            num_warps=8,
+        )
+
+
+def test_pyntt_interpreter_isolates_prepared_state_by_execution_device():
+    _add_pyntt_to_path()
+    from pyntt.ir import ModuleSpec
+    from pyntt.runtime.interpreter import PyNTTInterpreter
+
+    interpreter = PyNTTInterpreter(ModuleSpec("test", "triton", ()))
+    prepared0 = object()
+    prepared1 = object()
+    resources0 = (object(),)
+    resources1 = (object(),)
+
+    interpreter.store_prepared_triton_kernel("top", "cuda:0", prepared0)
+    interpreter.store_prepared_triton_kernel("top", "cuda:1", prepared1)
+    interpreter.store_launch_resources("top", "cuda:0", resources0)
+    interpreter.store_launch_resources("top", "cuda:1", resources1)
+
+    assert interpreter.lookup_prepared_triton_kernel("top", "cuda:0") is prepared0
+    assert interpreter.lookup_prepared_triton_kernel("top", "cuda:1") is prepared1
+    assert interpreter.lookup_launch_resources("top", "cuda:0") is resources0
+    assert interpreter.lookup_launch_resources("top", "cuda:1") is resources1

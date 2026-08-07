@@ -1,5 +1,7 @@
 {% if noinline %}
 @triton.jit(noinline=True)
+{% elif do_not_specialize %}
+@triton.jit(do_not_specialize={{ do_not_specialize }})
 {% else %}
 @triton.jit
 {% endif %}

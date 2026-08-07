@@ -153,6 +153,9 @@ typedef struct {
     void (*huggingface_options_tensor_type)(
         clr_object_handle_t huggingface_options, const char *tensor_type,
         size_t tensor_type_length);
+    void (*huggingface_options_input_ids_type)(
+        clr_object_handle_t huggingface_options, const char *input_ids_type,
+        size_t input_ids_type_length);
     uint8_t (*huggingface_options_get_attention_backend)(
         clr_object_handle_t huggingface_options);
     void (*huggingface_options_set_attention_backend)(
@@ -645,6 +648,12 @@ class huggingface_options : public clr_object_base {
     std::string tensor_type() { return ""; }
     void tensor_type(std::string value) {
         nncase_clr_api()->huggingface_options_tensor_type(
+            obj_.get(), value.data(), value.length());
+    }
+
+    std::string input_ids_type() { return "int64"; }
+    void input_ids_type(std::string value) {
+        nncase_clr_api()->huggingface_options_input_ids_type(
             obj_.get(), value.data(), value.length());
     }
 

@@ -8,11 +8,49 @@ from pyntt.runtime.tensor import dtype_item_size, view_typed_buffer
 
 _TRITON_ALLOCATOR_INSTALLED = False
 _VALIDATED_KERNEL_RESOURCES: set[tuple[object, ...]] = set()
-_SELECTED_TUNING_PARAMETERS: dict[tuple[object, ...], int] = {}
 
 
 class TritonKernelResourceError(RuntimeError):
     """A compiled specialization violates the target resource contract."""
+
+
+class PreparedTritonKernel:
+    """One resource-validated Triton specialization ready for direct launch."""
+
+    __slots__ = (
+        "kernel_name",
+        "parameter_name",
+        "parameter_value",
+        "_prepared",
+        "_runtime_argument_count",
+    )
+
+    def __init__(
+        self,
+        kernel_name: str,
+        parameter_name: str,
+        parameter_value: int,
+        prepared: object,
+        runtime_argument_count: int,
+    ) -> None:
+        self.kernel_name = str(kernel_name)
+        self.parameter_name = str(parameter_name)
+        self.parameter_value = int(parameter_value)
+        self._prepared = prepared
+        self._runtime_argument_count = int(runtime_argument_count)
+
+    @property
+    def compiled_kernel(self):
+        return self._prepared.compiled_kernel
+
+    def launch(self, *kernel_args: object, grid, stream=None) -> None:
+        if len(kernel_args) != self._runtime_argument_count:
+            raise TypeError(
+                f"Prepared PyNTT kernel {self.kernel_name} expects "
+                f"{self._runtime_argument_count} runtime arguments before "
+                f"{self.parameter_name}, got {len(kernel_args)}."
+            )
+        self._prepared.launch(*kernel_args, grid=grid, stream=stream)
 
 
 class TritonTensorDescriptorCache:
@@ -253,6 +291,33 @@ def validate_triton_kernel_resources(
         return
 
     compiled._init_handles()
+    _validate_compiled_triton_kernel_resources(
+        compiled,
+        expected_compute_num_warps=expected_compute_num_warps,
+        registers_per_thread_limit=registers_per_thread_limit,
+        shared_memory_capacity_bytes=shared_memory_capacity_bytes,
+        forbid_spills=forbid_spills,
+    )
+
+
+def _validate_compiled_triton_kernel_resources(
+    compiled,
+    *,
+    expected_compute_num_warps: int,
+    registers_per_thread_limit: int,
+    shared_memory_capacity_bytes: int,
+    forbid_spills: bool,
+) -> None:
+    key = (
+        compiled.hash,
+        expected_compute_num_warps,
+        registers_per_thread_limit,
+        shared_memory_capacity_bytes,
+        forbid_spills,
+    )
+    if key in _VALIDATED_KERNEL_RESOURCES:
+        return
+
     actual_num_warps = int(compiled.metadata.num_warps)
     # FlagTree reports the physical total after adding and warp-group-aligning
     # explicit warp-specialized workers. The launch option still describes the
@@ -293,7 +358,7 @@ def validate_triton_kernel_resources(
     _VALIDATED_KERNEL_RESOURCES.add(key)
 
 
-def select_and_validate_triton_tuning_parameter(
+def prepare_and_validate_triton_kernel(
     kernel_name: str,
     parameter_name: str,
     candidates,
@@ -301,115 +366,82 @@ def select_and_validate_triton_tuning_parameter(
     source: str,
     kernel,
     kernel_args: tuple[object, ...],
+    dynamic_argument_indices: tuple[int, ...] | None = None,
     grid_for_candidate,
     expected_compute_num_warps: int,
     registers_per_thread_limit: int,
     shared_memory_capacity_bytes: int,
     forbid_spills: bool,
     **launch_options,
-) -> int:
-    """Select the highest-priority specialization satisfying target resources."""
+) -> PreparedTritonKernel:
+    """Select, validate, and prepare one specialization for repeated launch."""
     from pyntt.runtime.tuning import tuning_parameter_candidates
     from triton.runtime.errors import OutOfResources
 
+    requested_num_warps = launch_options.get("num_warps")
+    if (
+        requested_num_warps is not None
+        and int(requested_num_warps) != expected_compute_num_warps
+    ):
+        raise TritonKernelResourceError(
+            f"Triton launch requests {int(requested_num_warps)} compute warps; "
+            f"the target execution model requires {expected_compute_num_warps}."
+        )
+
+    prepare = getattr(kernel, "prepare", None)
+    if not callable(prepare):
+        raise TritonKernelResourceError(
+            "The installed Triton runtime does not provide JITFunction.prepare(); "
+            "PyNTT requires the prepared C-launcher ABI."
+        )
+
     failures = []
+    if dynamic_argument_indices is None:
+        dynamic_argument_indices = tuple(range(len(kernel_args)))
+    else:
+        dynamic_argument_indices = tuple(int(index) for index in dynamic_argument_indices)
+    if len(set(dynamic_argument_indices)) != len(dynamic_argument_indices):
+        raise TritonKernelResourceError(
+            f"PyNTT kernel {kernel_name} dynamic argument indices must be unique."
+        )
+    if any(index < 0 or index >= len(kernel_args) for index in dynamic_argument_indices):
+        raise TritonKernelResourceError(
+            f"PyNTT kernel {kernel_name} has dynamic argument indices outside "
+            f"[0, {len(kernel_args)})."
+        )
     ordered_candidates = tuning_parameter_candidates(
         kernel_name, parameter_name, candidates, source=source
     )
-    selection_key = (
-        kernel,
-        kernel_name,
-        parameter_name,
-        ordered_candidates,
-        source,
-        tuple(_specialization_signature(arg) for arg in kernel_args),
-        tuple(
-            sorted(
-                (name, _specialization_signature(value))
-                for name, value in launch_options.items()
-            )
-        ),
-        expected_compute_num_warps,
-        registers_per_thread_limit,
-        shared_memory_capacity_bytes,
-        forbid_spills,
-    )
-    selected = _SELECTED_TUNING_PARAMETERS.get(selection_key)
-    if selected is not None:
-        return selected
-
     for candidate in ordered_candidates:
         try:
-            validate_triton_kernel_resources(
-                kernel,
+            prepared = prepare(
                 *kernel_args,
                 candidate,
                 grid=grid_for_candidate(candidate),
+                dynamic_arg_indices=dynamic_argument_indices,
+                trusted_pointer_arguments=True,
+                **launch_options,
+            )
+            _validate_compiled_triton_kernel_resources(
+                prepared.compiled_kernel,
                 expected_compute_num_warps=expected_compute_num_warps,
                 registers_per_thread_limit=registers_per_thread_limit,
                 shared_memory_capacity_bytes=shared_memory_capacity_bytes,
                 forbid_spills=forbid_spills,
-                **launch_options,
             )
         except (TritonKernelResourceError, OutOfResources) as ex:
             failures.append(f"{candidate}: {ex}")
             continue
-        _SELECTED_TUNING_PARAMETERS[selection_key] = candidate
-        return candidate
+        return PreparedTritonKernel(
+            kernel_name,
+            parameter_name,
+            candidate,
+            prepared,
+            len(dynamic_argument_indices),
+        )
 
     detail = "; ".join(failures)
     raise TritonKernelResourceError(
         f"No resource-feasible candidate for {kernel_name}.{parameter_name} "
         f"from {ordered_candidates}. {detail}"
     )
-
-
-def _specialization_signature(value: object) -> tuple[object, ...]:
-    """Describe compile-relevant argument properties without retaining buffers."""
-    try:
-        from triton.tools.tensor_descriptor import TensorDescriptor
-    except ImportError:
-        TensorDescriptor = ()  # type: ignore[assignment]
-    if isinstance(value, TensorDescriptor):
-        return (
-            "tensor_descriptor",
-            _specialization_signature(value.base),
-            tuple(int(item) for item in value.shape),
-            tuple(int(item) for item in value.strides),
-            tuple(int(item) for item in value.block_shape),
-            str(value.padding),
-        )
-
-    if hasattr(value, "data_ptr") and hasattr(value, "dtype"):
-        pointer = int(value.data_ptr())
-        device = getattr(value, "device", None)
-        return (
-            "tensor",
-            type(value).__module__,
-            type(value).__qualname__,
-            str(value.dtype),
-            str(device),
-            pointer % 16,
-        )
-
-    if isinstance(value, tuple):
-        return ("tuple", *(_specialization_signature(item) for item in value))
-
-    if isinstance(value, list):
-        return ("list", *(_specialization_signature(item) for item in value))
-
-    if isinstance(value, dict):
-        return (
-            "dict",
-            *(
-                (str(key), _specialization_signature(item))
-                for key, item in sorted(value.items(), key=lambda item: str(item[0]))
-            ),
-        )
-
-    try:
-        hash(value)
-    except TypeError:
-        return ("object", type(value).__module__, type(value).__qualname__, repr(value))
-
-    return ("value", type(value).__module__, type(value).__qualname__, value)

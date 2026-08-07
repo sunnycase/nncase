@@ -262,7 +262,7 @@ public abstract class HuggingFaceModel
         //                                              headDim, };
         var inputIds = new Var(
             "input_ids",
-            new TensorType(DataTypes.Int64, new RankedShape(inputIdsShapeExpr)));
+            new TensorType(GetInputIdsType(), new RankedShape(inputIdsShapeExpr)));
 
         // var attentionMask = new Var(
         //     "attention_mask",
@@ -990,7 +990,8 @@ public abstract class HuggingFaceModel
         else
         {
             var zeros = Tensor.Zeros(embedingWeight.ElementType, [1]);
-            var paddingMask = IR.F.Math.Equal(input, paddingIdx);
+            var paddingIndex = Tensor.FromScalar(input.CheckedDataType, paddingIdx.Value);
+            var paddingMask = IR.F.Math.Equal(input, paddingIndex);
             paddingMask = IR.F.Tensors.Unsqueeze(paddingMask, [1]);
             var results = IR.F.Tensors.Where(paddingMask, zeros, gatherResult);
             return results;
@@ -1306,6 +1307,19 @@ public abstract class HuggingFaceModel
         return string.IsNullOrWhiteSpace(tensorType) || tensorType == "default"
             ? null
             : HuggingFaceUtils.Str2Dtype(tensorType);
+    }
+
+    protected PrimType GetInputIdsType()
+    {
+        var typeName = ImportOptions.HuggingFaceOptions.InputIdsType;
+        var inputIdsType = HuggingFaceUtils.Str2Dtype(typeName);
+        if (inputIdsType != DataTypes.Int32 && inputIdsType != DataTypes.Int64)
+        {
+            throw new NotSupportedException(
+                $"HuggingFace input_ids_type must be int32 or int64, got {typeName}.");
+        }
+
+        return inputIdsType;
     }
 
     protected virtual Tuple<Call, Call, Call> BuildQKVParallelLinear(int count, Expr hiddenStates, RankedShape hiddenShape)

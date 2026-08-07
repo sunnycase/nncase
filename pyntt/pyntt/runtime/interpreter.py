@@ -11,6 +11,7 @@ from pyntt.runtime.tensor import (
     materialize_results,
     resolve_shape_env,
     validate_inputs,
+    validate_outputs,
 )
 from pyntt.runtime.triton import TritonTensorDescriptorCache
 from pyntt.runtime.workspace import RDataCache, WorkspacePool
@@ -30,6 +31,8 @@ class PyNTTInterpreter:
         self.workspace_pool = WorkspacePool()
         self.rdata_cache = RDataCache()
         self.triton_tensor_descriptor_cache = TritonTensorDescriptorCache()
+        self._prepared_triton_kernels: dict[tuple[str, str], Any] = {}
+        self._launch_resources: dict[tuple[str, str], tuple[Any, ...]] = {}
         self.loaded = False
 
     def load(self, device: Any | None = None):
@@ -62,6 +65,29 @@ class PyNTTInterpreter:
             return results[0]
         return results
 
+    def run_into(self, outputs, *inputs) -> None:
+        """Execute into caller-owned ABI output buffers.
+
+        This API deliberately does not allocate outputs or materialize logical
+        result views. The caller owns output lifetime and may reuse the buffers
+        after respecting the execution stream's ordering.
+        """
+        entry = self.spec.entry
+        if entry is None:
+            raise PyNTTSpecError(
+                f"PyNTT module {self.spec.name} does not declare an entry function."
+            )
+
+        if not self.loaded:
+            self.load()
+
+        inputs = tuple(inputs)
+        outputs = tuple(outputs)
+        shape_env = resolve_shape_env(entry, inputs)
+        validate_inputs(entry, inputs, shape_env)
+        validate_outputs(entry, inputs, outputs, shape_env)
+        self._run_entry(inputs, list(outputs), shape_env)
+
     def __call__(self, *inputs):
         return self.run(*inputs)
 
@@ -84,6 +110,46 @@ class PyNTTInterpreter:
         return self.triton_tensor_descriptor_cache.materialize_many(
             kernel_name, specs, sources
         )
+
+    @staticmethod
+    def _launch_cache_key(kernel_name: str, device: Any) -> tuple[str, str]:
+        return str(kernel_name), str(device)
+
+    def lookup_prepared_triton_kernel(self, kernel_name: str, device: Any):
+        """Return the device-bound launch plan for a generated top kernel."""
+        return self._prepared_triton_kernels.get(
+            self._launch_cache_key(kernel_name, device)
+        )
+
+    def store_prepared_triton_kernel(
+        self, kernel_name: str, device: Any, prepared
+    ) -> None:
+        """Publish one immutable prepared specialization."""
+        key = self._launch_cache_key(kernel_name, device)
+        existing = self._prepared_triton_kernels.get(key)
+        if existing is not None and existing is not prepared:
+            raise RuntimeError(
+                f"PyNTT kernel {key[0]} on {key[1]} already has a different "
+                "prepared specialization."
+            )
+        self._prepared_triton_kernels[key] = prepared
+
+    def lookup_launch_resources(self, kernel_name: str, device: Any):
+        """Return persistent workspace/rdata/descriptor bindings for a launch."""
+        return self._launch_resources.get(self._launch_cache_key(kernel_name, device))
+
+    def store_launch_resources(
+        self, kernel_name: str, device: Any, resources: tuple[Any, ...]
+    ) -> None:
+        """Retain immutable launch bindings and their backing tensor lifetimes."""
+        key = self._launch_cache_key(kernel_name, device)
+        existing = self._launch_resources.get(key)
+        if existing is not None and existing is not resources:
+            raise RuntimeError(
+                f"PyNTT kernel {key[0]} on {key[1]} already has different "
+                "persistent launch resources."
+            )
+        self._launch_resources[key] = resources
 
     def _run_entry(self, inputs: tuple[Any, ...], outputs: list[Any], shape_env: dict[str, int]) -> None:
         # Base interpreter keeps PyNTTModule-compatible behavior for tests and

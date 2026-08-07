@@ -35,6 +35,7 @@ def test_qwen3(request):
     output_hidden_states = false
     num_layers = {num_layers}
     tensor_type = "bfloat16"
+    input_ids_type = "int32"
 
     [paged_attention_config]
     kv_type = "bfloat16"

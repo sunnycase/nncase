@@ -123,10 +123,11 @@ Qwen-specific shape.
 Generated `model.py` and the PyNTT runtime own:
 
 - `torch.Tensor` argument validation;
-- output allocation and result view materialization;
+- output allocation and result view materialization for the convenient
+  `run()` API, plus caller-owned output execution through `run_into()`;
 - one-time rdata loading and reusable workspace allocation;
 - shape-bucket selection;
-- direct Triton launch binding;
+- one-time Triton specialization and direct prepared-launch binding;
 - passing dimensions, strides, workspace pointers, and tuning choices;
 - materializing and caching host Triton tensor descriptors from generated
   descriptor specifications;
@@ -282,6 +283,43 @@ selected shard.
 The generated model owns launch count. Persistent launch policy normally uses
 the configured block hierarchy, for example one block per resident SM. The
 kernel owns all work loops performed by that block.
+
+### Prepared Launch ABI
+
+The first invocation of a generated top kernel calls
+`JITFunction.prepare()`. The generated model passes the complete kernel ABI and
+an explicit ordered list of dynamic argument indices. The prepared launch plan
+retains compiler-owned workspace/rdata pointers, static strides and extents,
+host TMA descriptors, tuning constants, and the compiled CUDA launcher. Its hot
+path receives only runtime input/output pointers, dynamic ABI strides and
+dimensions, and other truly dynamic scalar values. It does not rebuild a
+specialization key, query the JIT cache, recreate TMA descriptors, or expand
+the full argument list in Python.
+
+The CUDA backend lowers the prepared plan into a native capsule. `prepare()`
+parses static pointers, scalars, launch metadata, and by-value TMA maps once;
+`launch_prepared()` parses only the flattened dynamic ABI. Each launch copies
+the immutable native argument storage to its stack before filling dynamic
+slots, so concurrent launches do not mutate shared argument state.
+
+FlagTree's prepared launcher validates pointer arguments by default. PyNTT may
+enable its trusted-pointer fast path because `run()`/`run_into()` and generated
+KV-cache field access validate tensor dtype, shape, stride, device,
+contiguity, and the 16-byte Triton specialization alignment before every
+launch. This validation is part of the PyNTT runtime ABI and must not be
+removed or bypassed by an integration.
+
+Prepared cooperative launches retain global synchronization scratch per
+prepared kernel, stream, and grid. The native CUDA launcher clears the barrier
+counter storage immediately before every launch; the allocation is persistent,
+but synchronization state is not. Different streams and grid shapes never
+share that storage.
+
+`run_into(outputs, *inputs)` is the low-overhead integration API. The caller
+allocates and owns ABI output buffers, and PyNTT validates and writes them
+without allocating outputs or materializing logical result views. The caller
+must preserve stream ordering before reusing a buffer. `run(*inputs)` remains
+the convenience API for callers that require runtime-owned outputs.
 
 `num_warps`, producer allocation, register partitioning, and resource-neutral
 tuning parameters are backend launch choices, not nncase loop schedules. A

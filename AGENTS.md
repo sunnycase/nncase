@@ -233,6 +233,20 @@ The renderer derives one spill-free worker register partition from target
 register-file capacity and allocation granularity and applies it consistently
 to all helper variants.
 
+Generated top kernels use FlagTree's prepared-launch ABI. Bind static
+workspace/rdata pointers, static extents/strides, host TMA descriptors, and
+tuning constants once per kernel/device; pass only explicit dynamic arguments
+on the hot path. FlagTree stores the parsed static CUDA ABI in a native capsule
+and copies it to per-launch stack storage before filling dynamic slots; do not
+reintroduce Python full-argument reconstruction. PyNTT may request trusted
+pointer arguments only because its runtime validates dtype, shape, stride,
+device, contiguity, and 16-byte pointer alignment before each launch. Do not
+remove those checks or use the trusted mode from an unvalidated caller.
+Cooperative global scratch is persistent per prepared kernel/stream/grid, while
+the native launcher must reset barrier state before every launch. Integrations
+with reusable output storage should call `run_into(outputs, *inputs)` rather
+than allocate and materialize results on every decode step.
+
 For matrix-like PyNTT kernels, keep one complete Jinja file per selected
 algorithm under a family directory, for example
 `triton/kernels/matmul/simt_fma.py.jinja` and

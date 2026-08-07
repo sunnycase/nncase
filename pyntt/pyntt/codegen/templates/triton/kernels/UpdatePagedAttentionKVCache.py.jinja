@@ -2,7 +2,7 @@
 {% import "triton/kernels/_producer_consumer.py.jinja" as phases with context %}
 {% set ctx = update_paged_attention_kv_cache_context(model) %}
 {% set cache = model["Cache"] %}
-{% set args = ("slot_mapping", "kv_cache", "num_blocks_per_shard", "cache_meta") %}
+{% set args = ("slot_mapping", "kv_cache", "num_blocks_per_shard", "query_start_loc", "num_seqs") %}
 # generated from PyNTT Jinja UpdatePagedAttentionKVCache.py.jinja
 # {{ model["Comment"] }}; dtype={{ model["SlotsDType"] }}, slots_shape={{ shape_tuple(model["SlotsShape"]) }}, slots_global_shape={{ shape_tuple(model["SlotsGlobalShape"]) }}, layer={{ model["LayerIdExpression"] }}, cache_kind={{ model["CacheKind"] }}
 {{ phases.consumer_header(model, args) }}
@@ -13,12 +13,7 @@
     shard_coord{{ axis }} = tmp_shard_coord % {{ model["Hierarchy"][axis] }}
     tmp_shard_coord = tmp_shard_coord // {{ model["Hierarchy"][axis] }}
 {% endfor %}
-    num_seqs = tl.load(cache_meta + 0).to(tl.int64)
-    num_tokens = tl.full((), 0, tl.int64)
-    for seq_id in tl.range(0, num_seqs):
-        context_len = tl.load(cache_meta + 1 + seq_id * 2)
-        seq_len = tl.load(cache_meta + 2 + seq_id * 2)
-        num_tokens += seq_len - context_len
+    num_tokens = tl.load(query_start_loc + num_seqs).to(tl.int64)
 
 {% call(indent) elementwise.iterate(ctx) %}
 {{ indent }}source_lane_id = {{ ctx["source_lane_id"] }}
@@ -53,9 +48,9 @@
 {{ indent }}block_id = slot_id // {{ cache["BlockSize"] }}
 {{ indent }}block_offset = slot_id % {{ cache["BlockSize"] }}
 {% if ctx["vectorized_dim"] == 5 %}
-{{ indent }}cache_dim_block = global_source_dim_block
+{{ indent }}cache_dim_block = logical_dim // {{ ctx["lane_count"] }}
 {{ indent }}cache_block_offset = block_offset
-{{ indent }}cache_lane_id = source_lane_id
+{{ indent }}cache_lane_id = logical_dim % {{ ctx["lane_count"] }}
 {% elif ctx["vectorized_dim"] == 3 %}
 {{ indent }}cache_dim_block = logical_dim
 {{ indent }}cache_block_offset = block_offset // {{ ctx["lane_count"] }}
