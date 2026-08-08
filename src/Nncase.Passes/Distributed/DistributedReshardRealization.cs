@@ -1,4 +1,4 @@
-// Copyright (c) Canaan Inc. All rights reserved.
+﻿// Copyright (c) Canaan Inc. All rights reserved.
 // Licensed under the Apache license. See LICENSE file in the project root for full license information.
 
 namespace Nncase.Passes.Distributed;
@@ -59,4 +59,9 @@ public enum DistributedReshardUsageKind
     /// Value crosses a high-level function ABI boundary.
     /// </summary>
     FunctionBoundary,
+
+    /// <summary>
+    /// Value is returned from the program entry through caller-allocated output storage.
+    /// </summary>
+    ProgramOutput,
 }

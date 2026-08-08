@@ -41,6 +41,7 @@ internal class NTTModule : IApplicationPart
         registrator.RegisterManyInterface<VectorizedLayerNormEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<NormStatsEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<NormApplyEvaluator>(reuse: Reuse.Singleton);
+        registrator.RegisterManyInterface<QKVRoPEWithCacheEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<VectorizedBinaryEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<UnpackEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<SliceEvaluator>(reuse: Reuse.Singleton);

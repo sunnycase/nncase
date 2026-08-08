@@ -77,6 +77,7 @@ public sealed class PyNTTModuleCompiler : INTTModuleCompiler
                 or IR.NN.RoPE
                 or IR.NN.Swish
                 or IR.NN.QKVParallelLinear
+                or IR.NN.QKVRoPEWithCache
                 or IR.NN.MatMulGlu
                 or IR.Math.MatMul
                 or IR.NTT.VectorizedMatMul

@@ -1,4 +1,4 @@
-// Copyright (c) Canaan Inc. All rights reserved.
+﻿// Copyright (c) Canaan Inc. All rights reserved.
 // Licensed under the Apache license. See LICENSE file in the project root for full license information.
 
 using System;
@@ -15,68 +15,37 @@ namespace Nncase.Evaluator.NN;
 /// </summary>
 public sealed class NormApplyEvaluator : IEvaluator<NormApply>, ITypeInferencer<NormApply>, ICostEvaluator<NormApply>
 {
+    public static IRType InferType(NormApply target, IRType input, IRType stats, IRType scale, IRType bias)
+    {
+        return (input, stats, scale, bias) switch
+        {
+            (TensorType inputTensor, TensorType statsTensor, TensorType scaleTensor, TensorType biasTensor) => Visit(target, inputTensor, statsTensor, scaleTensor, biasTensor),
+            (DistributedType inputDistributed, DistributedType statsDistributed, DistributedType scaleDistributed, DistributedType biasDistributed) => Visit(target, inputDistributed, statsDistributed, scaleDistributed, biasDistributed),
+            _ => new InvalidType($"{nameof(NormApply)} arguments must all be tensor or all be distributed tensors."),
+        };
+    }
+
     public IValue Visit(IEvaluateContext context, NormApply target)
     {
         var inputRaw = context.GetArgumentValueAsTensor(target, NormApply.Input);
         var statsRaw = context.GetArgumentValueAsTensor(target, NormApply.Stats);
         var scaleRaw = context.GetArgumentValueAsTensor(target, NormApply.Scale);
         var biasRaw = context.GetArgumentValueAsTensor(target, NormApply.Bias);
-        if (inputRaw.ElementType is VectorType || statsRaw.ElementType is VectorType)
-        {
-            throw new NotSupportedException("NormApply evaluator does not support vector tensor values.");
-        }
-
-        var input = inputRaw.CastElementTo(DataTypes.Float32).Cast<float>();
-        var stats = statsRaw.CastElementTo(DataTypes.Float32).Cast<float>();
-        var scale = scaleRaw.CastElementTo(DataTypes.Float32).Cast<float>();
-        var bias = biasRaw.CastElementTo(DataTypes.Float32).Cast<float>();
         var originType = context.CurrentCall.Arguments[NormApply.Input.Index].CheckedDataType;
-
-        var shape = input.Shape.ToValueArray();
-        var rank = shape.Length;
-        var normalizedAxis = NormUtility.NormalizeAxis(target.Axis, rank);
-        var outerSize = TensorUtilities.GetProduct(shape.AsSpan(0, normalizedAxis));
+        var shape = inputRaw.Shape.ToValueArray();
+        var normalizedAxis = NormUtility.NormalizeAxis(target.Axis, shape.Length);
         var innerSize = TensorUtilities.GetProduct(shape.AsSpan(normalizedAxis));
         var normalizationSize = GetNormalizationSize(context, target, innerSize);
-
-        var output = new float[input.Length];
-        var inputSpan = input.Buffer.Span;
-        var statsSpan = stats.Buffer.Span;
-        var scaleSpan = scale.Buffer.Span;
-        var biasSpan = bias.Buffer.Span;
-        for (int outer = 0; outer < outerSize; outer++)
-        {
-            float mean = 0f;
-            float sumSq;
-            if (target.UseMean)
-            {
-                mean = statsSpan[outer] / normalizationSize;
-                sumSq = statsSpan[checked((int)(outerSize + outer))];
-            }
-            else
-            {
-                sumSq = statsSpan[outer];
-            }
-
-            var variance = sumSq / normalizationSize;
-            if (target.UseMean)
-            {
-                variance -= mean * mean;
-            }
-
-            variance = MathF.Max(variance, 0f);
-            var rstd = 1f / MathF.Sqrt(variance + target.Epsilon);
-            var baseOffset = outer * innerSize;
-            for (int inner = 0; inner < innerSize; inner++)
-            {
-                var localOffset = checked((int)(baseOffset + inner));
-                var value = inputSpan[localOffset];
-                var centered = target.UseMean ? value - mean : value;
-                output[localOffset] = (centered * rstd * scaleSpan[inner % scaleSpan.Length]) + biasSpan[inner % biasSpan.Length];
-            }
-        }
-
-        return Value.FromTensor(Tensor.From(output, shape).CastTo(originType));
+        return Value.FromTensor(Evaluate(
+            inputRaw,
+            statsRaw,
+            scaleRaw,
+            biasRaw,
+            originType,
+            target.Axis,
+            target.Epsilon,
+            target.UseMean,
+            normalizationSize));
     }
 
     public IRType Visit(ITypeInferenceContext context, NormApply target)
@@ -86,12 +55,7 @@ public sealed class NormApplyEvaluator : IEvaluator<NormApply>, ITypeInferencer<
         var scale = context.CheckArgumentType<IRType>(target, NormApply.Scale);
         var bias = context.CheckArgumentType<IRType>(target, NormApply.Bias);
 
-        return (input, stats, scale, bias) switch
-        {
-            (TensorType inputTensor, TensorType statsTensor, TensorType scaleTensor, TensorType biasTensor) => Visit(target, inputTensor, statsTensor, scaleTensor, biasTensor),
-            (DistributedType inputDistributed, DistributedType statsDistributed, DistributedType scaleDistributed, DistributedType biasDistributed) => Visit(target, inputDistributed, statsDistributed, scaleDistributed, biasDistributed),
-            _ => new InvalidType($"{nameof(NormApply)} arguments must all be tensor or all be distributed tensors."),
-        };
+        return InferType(target, input, stats, scale, bias);
     }
 
     public Cost Visit(ICostEvaluateContext context, NormApply target)
@@ -111,6 +75,73 @@ public sealed class NormApplyEvaluator : IEvaluator<NormApply>, ITypeInferencer<
             [CostFactorNames.BlockLocalMemoryStoreBytes] = CostUtility.GetMemoryAccess(output),
             [CostFactorNames.CPUCycles] = CostUtility.GetCPUCycles(input, target.UseMean ? 7 : 5),
         };
+    }
+
+    internal static Tensor Evaluate(
+        Tensor inputRaw,
+        Tensor statsRaw,
+        Tensor scaleRaw,
+        Tensor biasRaw,
+        DataType originType,
+        int axis,
+        float epsilon,
+        bool useMean,
+        long normalizationSize)
+    {
+        if (inputRaw.ElementType is VectorType || statsRaw.ElementType is VectorType)
+        {
+            throw new NotSupportedException("NormApply evaluator does not support vector tensor values.");
+        }
+
+        var input = inputRaw.CastElementTo(DataTypes.Float32).Cast<float>();
+        var stats = statsRaw.CastElementTo(DataTypes.Float32).Cast<float>();
+        var scale = scaleRaw.CastElementTo(DataTypes.Float32).Cast<float>();
+        var bias = biasRaw.CastElementTo(DataTypes.Float32).Cast<float>();
+
+        var shape = input.Shape.ToValueArray();
+        var rank = shape.Length;
+        var normalizedAxis = NormUtility.NormalizeAxis(axis, rank);
+        var outerSize = TensorUtilities.GetProduct(shape.AsSpan(0, normalizedAxis));
+        var innerSize = TensorUtilities.GetProduct(shape.AsSpan(normalizedAxis));
+
+        var output = new float[input.Length];
+        var inputSpan = input.Buffer.Span;
+        var statsSpan = stats.Buffer.Span;
+        var scaleSpan = scale.Buffer.Span;
+        var biasSpan = bias.Buffer.Span;
+        for (int outer = 0; outer < outerSize; outer++)
+        {
+            float mean = 0f;
+            float sumSq;
+            if (useMean)
+            {
+                mean = statsSpan[outer] / normalizationSize;
+                sumSq = statsSpan[checked((int)(outerSize + outer))];
+            }
+            else
+            {
+                sumSq = statsSpan[outer];
+            }
+
+            var variance = sumSq / normalizationSize;
+            if (useMean)
+            {
+                variance -= mean * mean;
+            }
+
+            variance = MathF.Max(variance, 0f);
+            var rstd = 1f / MathF.Sqrt(variance + epsilon);
+            var baseOffset = outer * innerSize;
+            for (int inner = 0; inner < innerSize; inner++)
+            {
+                var localOffset = checked((int)(baseOffset + inner));
+                var value = inputSpan[localOffset];
+                var centered = useMean ? value - mean : value;
+                output[localOffset] = (centered * rstd * scaleSpan[inner % scaleSpan.Length]) + biasSpan[inner % biasSpan.Length];
+            }
+        }
+
+        return Tensor.From(output, shape).CastTo(originType);
     }
 
     private static IRType Visit(NormApply target, TensorType input, TensorType stats, TensorType scale, TensorType bias)

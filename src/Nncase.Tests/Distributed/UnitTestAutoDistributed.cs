@@ -72,6 +72,32 @@ public sealed class UnitTestDistribAutoDistributed : TestClassBase
     }
 
     [Fact]
+    public void TestStaticInvocationCountsAccumulateAcrossRepeatedFunctionCalls()
+    {
+        var inputType = new TensorType(DataTypes.Float32, [16, 32]);
+        var leafInput = new Var("leaf_input", inputType);
+        var leaf = new Function("leaf", IR.F.Math.Unary(UnaryOp.Abs, leafInput), [leafInput]);
+
+        var layerInput = new Var("layer_input", inputType);
+        var layerCall0 = new Call(leaf, layerInput);
+        var layerCall1 = new Call(leaf, layerCall0);
+        var layer = new Function("layer", layerCall1, [layerInput]);
+
+        var input = new Var("input", inputType);
+        var mainCall0 = new Call(layer, input);
+        var mainCall1 = new Call(layer, mainCall0);
+        var main = new Function("main", mainCall1, [input]);
+        Assert.True(main.InferenceType());
+
+        var reachable = DistributedFunctionGraphUtility.GetReachableFunctionsInCalleeFirstOrder(main);
+        var invocationCounts = DistributedFunctionGraphUtility.GetStaticInvocationCounts(main, reachable);
+
+        Assert.Equal(1L, invocationCounts[main]);
+        Assert.Equal(2L, invocationCounts[layer]);
+        Assert.Equal(4L, invocationCounts[leaf]);
+    }
+
+    [Fact]
     public void TestFunctionCallUsesDistributedParameterSignature()
     {
         var inputType = new TensorType(DataTypes.Float32, [16, 32]);
@@ -325,6 +351,13 @@ public sealed class UnitTestDistribAutoDistributed : TestClassBase
                 broadcast,
                 DistributedReshardSourceKind.Internal,
                 DistributedReshardUsageKind.FunctionBoundary));
+        Assert.Equal(
+            DistributedReshardRealization.ShardedView,
+            Classify(
+                exclusiveSplit,
+                broadcast,
+                DistributedReshardSourceKind.Internal,
+                DistributedReshardUsageKind.ProgramOutput));
 
         var multiLevelPlacement = new Placement([2, 4], "cb", "cb");
         var multiLevelSource = new DistributedType(
@@ -380,7 +413,65 @@ public sealed class UnitTestDistribAutoDistributed : TestClassBase
     }
 
     [Fact]
-    public void TestPyNTTFunctionResultReshardCandidatesUseBoundaryRealization()
+    public void TestPyNTTEntryTerminatorOffersProgramOutputShardedView()
+    {
+        var options = new PyNTTTargetOptions
+        {
+            HierarchyNames = "yx",
+            HierarchyLevels = "bb",
+            Hierarchies = [new[] { 4, 8 }],
+        };
+        CompileOptions.TargetOptions = options;
+        var tensorType = new TensorType(DataTypes.Float32, [32, 64]);
+        var input = new Var("input", tensorType);
+        var output = IR.F.Math.Unary(UnaryOp.Abs, input);
+        var function = new Function(
+            "main",
+            new IR.Tuple(output),
+            [input]);
+        Assert.True(function.InferenceType());
+
+        var rewriter = new AutoDistributedRewriter(
+            CompileOptions,
+            options,
+            AutoDistributedPhase.Final,
+            PyNTTTarget.Kind);
+        var buildMethod = typeof(AutoDistributedRewriter).GetMethod(
+            "BuildFunctionSearchGraph",
+            BindingFlags.Instance | BindingFlags.NonPublic);
+        Assert.NotNull(buildMethod);
+        var resultCluster = Assert.IsType<DistributedSearchGraph>(
+            buildMethod!.Invoke(rewriter, [function, true]));
+
+        var memoField = typeof(AutoDistributedRewriter).GetField(
+            "_reshardCandidateMemo",
+            BindingFlags.Instance | BindingFlags.NonPublic);
+        var memo = Assert.IsType<
+            Dictionary<
+                ReshardCandidateKey,
+                (DistributedSearchGraph Bucket, SearchableNode Node)>>(memoField?.GetValue(rewriter));
+        var outputViews = memo
+            .Where(entry =>
+                entry.Key.UsageKind == DistributedReshardUsageKind.ProgramOutput)
+            .Select(entry => entry.Value.Node)
+            .ToArray();
+
+        Assert.NotEmpty(outputViews);
+        Assert.All(outputViews, candidate =>
+        {
+            Assert.IsType<IR.Distributed.ShardedView>(candidate.Expr);
+            var outputType = Assert.IsType<DistributedType>(candidate.IRType);
+            Assert.All(outputType.AxisPolicies, policy => Assert.IsType<SBPBroadCast>(policy));
+        });
+
+        var post = rewriter.SolveAndExtract(function, resultCluster);
+        var resultTuple = Assert.IsType<IR.Tuple>(post.Body);
+        var resultView = Assert.IsType<Call>(Assert.Single(resultTuple.Fields.ToArray()));
+        Assert.IsType<IR.Distributed.ShardedView>(resultView.Target);
+    }
+
+    [Fact]
+    public void TestFunctionResultSignatureUsesOnlyDirectProducerCandidates()
     {
         var options = new PyNTTTargetOptions
         {
@@ -412,7 +503,23 @@ public sealed class UnitTestDistribAutoDistributed : TestClassBase
             .OfType<DistributedSearchGraph>()
             .SelectMany(bucket => bucket.Vertices)
             .ToArray();
-        Assert.DoesNotContain(resultCandidates, node => node.Expr is IR.Distributed.ShardedView);
+        Assert.NotEmpty(resultCandidates);
+        Assert.All(resultCandidates, candidate => Assert.Equal(SearchableNodeKind.FunctionResult, candidate.Kind));
+        Assert.DoesNotContain(
+            resultCandidates,
+            node => node.Expr is IR.Distributed.Boxing or IR.Distributed.ShardedView);
+
+        var graphField = typeof(AutoDistributedRewriter).GetField(
+            "_rootSearchGraph",
+            BindingFlags.Instance | BindingFlags.NonPublic);
+        var graph = Assert.IsType<DistributedSearchGraph>(graphField?.GetValue(rewriter));
+        foreach (var candidate in resultCandidates)
+        {
+            Assert.True(graph.TryGetOutEdges(candidate, out var edges));
+            var producer = Assert.Single(edges.Where(edge => edge.InputIndex == 0));
+            Assert.IsType<IR.Math.Unary>(producer.Input.Expr);
+            Assert.Equal(candidate.IRType, producer.Input.IRType);
+        }
 
         var memoField = typeof(AutoDistributedRewriter).GetField(
             "_reshardCandidateMemo",
@@ -421,16 +528,80 @@ public sealed class UnitTestDistribAutoDistributed : TestClassBase
             Dictionary<
                 ReshardCandidateKey,
                 (DistributedSearchGraph Bucket, SearchableNode Node)>>(memoField?.GetValue(rewriter));
-        var boundaryCandidates = memo
-            .Where(entry =>
-                ReferenceEquals(entry.Key.OwnerCluster, resultCluster) &&
-                entry.Key.UsageKind == DistributedReshardUsageKind.FunctionBoundary)
-            .Select(entry => entry.Value.Node)
-            .ToArray();
-        Assert.NotEmpty(boundaryCandidates);
+        Assert.DoesNotContain(memo, entry => ReferenceEquals(entry.Key.OwnerCluster, resultCluster));
+        Assert.Contains(
+            memo,
+            entry => entry.Key.UsageKind == DistributedReshardUsageKind.Internal &&
+                entry.Value.Node.Expr is IR.Distributed.ShardedView);
+
+        var mainInput = new Var("main_input", tensorType);
+        var main = new Function("main", new Call(function, mainInput), [mainInput]);
+        Assert.True(main.InferenceType());
+        var post = new AutoDistributedRewriter(
+            CompileOptions,
+            options,
+            AutoDistributedPhase.Final,
+            PyNTTTarget.Kind).RewriteProgram(main, [function, main]);
+        var layerCall = Assert.Single(
+            ExprCollector.Collect(post.Body).OfType<Call>().Where(call => call.Target is Function { Name: "layer" }));
+        var rewrittenLayer = Assert.IsType<Function>(layerCall.Target);
+        Assert.DoesNotContain(
+            ExprCollector.Collect(rewrittenLayer.Body).OfType<Call>(),
+            call => call.Target is IR.Distributed.Boxing or IR.Distributed.ShardedView);
+    }
+
+    [Fact]
+    public void TestFunctionCallResultOffersConsumerSideShardedViews()
+    {
+        var options = new PyNTTTargetOptions
+        {
+            HierarchyNames = "yx",
+            HierarchyLevels = "bb",
+            Hierarchies = [new[] { 4, 8 }],
+        };
+        CompileOptions.TargetOptions = options;
+        var tensorType = new TensorType(DataTypes.Float32, [32, 64]);
+        var layerInput = new Var("layer_input", tensorType);
+        var layer = new Function(
+            "layer",
+            IR.F.Math.Unary(UnaryOp.Abs, layerInput),
+            [layerInput]);
+        Assert.True(layer.InferenceType());
+
+        var input = new Var("input", tensorType);
+        var layerCall = new Call(layer, input);
+        var main = new Function("main", layerCall, [input]);
+        Assert.True(main.InferenceType());
+
+        var rewriter = new AutoDistributedRewriter(
+            CompileOptions,
+            options,
+            AutoDistributedPhase.Final,
+            PyNTTTarget.Kind);
+        var buildMethod = typeof(AutoDistributedRewriter).GetMethod(
+            "BuildFunctionSearchGraph",
+            BindingFlags.Instance | BindingFlags.NonPublic);
+        Assert.NotNull(buildMethod);
+        var layerResultCluster = Assert.IsType<DistributedSearchGraph>(
+            buildMethod!.Invoke(rewriter, [layer, false]));
+        _ = Assert.IsType<DistributedSearchGraph>(buildMethod.Invoke(rewriter, [main, true]));
+
+        var memoField = typeof(AutoDistributedRewriter).GetField(
+            "_reshardCandidateMemo",
+            BindingFlags.Instance | BindingFlags.NonPublic);
+        var memo = Assert.IsType<
+            Dictionary<
+                ReshardCandidateKey,
+                (DistributedSearchGraph Bucket, SearchableNode Node)>>(memoField?.GetValue(rewriter));
+        var callerViews = memo.Where(entry =>
+            entry.Key.InputNode.Kind == SearchableNodeKind.FunctionCall &&
+            entry.Key.UsageKind == DistributedReshardUsageKind.Internal &&
+            entry.Value.Node.Expr is IR.Distributed.ShardedView).ToArray();
+
+        Assert.NotEmpty(callerViews);
         Assert.All(
-            boundaryCandidates,
-            candidate => Assert.IsType<IR.Distributed.Boxing>(candidate.Expr));
+            callerViews,
+            entry => Assert.False(ReferenceEquals(entry.Key.OwnerCluster, layerResultCluster)));
     }
 
     [Fact]

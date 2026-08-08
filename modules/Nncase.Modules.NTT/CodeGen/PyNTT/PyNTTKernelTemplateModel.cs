@@ -650,6 +650,19 @@ public sealed record PyNTTUpdatePagedAttentionKVCacheTemplateModel(
     public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
 }
 
+public sealed record PyNTTQKVRoPEWithCacheTemplateModel(
+    string FunctionName,
+    PyNTTNormApplyTemplateModel QNorm,
+    PyNTTNormApplyTemplateModel KNorm,
+    PyNTTRoPETemplateModel QRoPE,
+    PyNTTRoPETemplateModel KRoPE,
+    PyNTTUpdatePagedAttentionKVCacheTemplateModel KUpdate,
+    PyNTTUpdatePagedAttentionKVCacheTemplateModel VUpdate,
+    string Comment)
+{
+    public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
+}
+
 public sealed record PyNTTPagedAttentionTemplateModel(
     string FunctionName,
     PyNTTBufferPointerTemplateModel Query,
@@ -765,6 +778,8 @@ public sealed record PyNTTMatmulTemplateModel(
 
     public string? RhsDescriptorName { get; set; }
 
+    public string RhsDescriptorOriginElements { get; set; } = "0";
+
     public int RhsNPackedLaneCount { get; set; } = 1;
 
     public int OutputNPackedLaneCount { get; set; } = 1;
@@ -847,9 +862,15 @@ public sealed record PyNTTQKVParallelLinearTemplateModel(
 
     public string? QWeightDescriptorName { get; set; }
 
+    public string QWeightDescriptorOriginElements { get; set; } = "0";
+
     public string? KWeightDescriptorName { get; set; }
 
+    public string KWeightDescriptorOriginElements { get; set; } = "0";
+
     public string? VWeightDescriptorName { get; set; }
+
+    public string VWeightDescriptorOriginElements { get; set; } = "0";
 }
 
 public sealed record PyNTTMatMulGluTemplateModel(
@@ -906,7 +927,11 @@ public sealed record PyNTTMatMulGluTemplateModel(
 
     public string? GateWeightDescriptorName { get; set; }
 
+    public string GateWeightDescriptorOriginElements { get; set; } = "0";
+
     public string? UpWeightDescriptorName { get; set; }
+
+    public string UpWeightDescriptorOriginElements { get; set; } = "0";
 }
 
 public sealed record PyNTTSummaTemplateModel(

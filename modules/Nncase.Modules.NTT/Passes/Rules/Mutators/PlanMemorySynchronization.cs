@@ -1,4 +1,4 @@
-// Copyright (c) Canaan Inc. All rights reserved.
+﻿// Copyright (c) Canaan Inc. All rights reserved.
 // Licensed under the Apache license. See LICENSE file in the project root for full license information.
 
 using Nncase.IR;
@@ -57,7 +57,7 @@ internal sealed class MemoryEffectAnalyzer
         bool suppressReductionAccumulatorEffects)
         => GetEffects(body, ResourceBindingScope.Empty, suppressReductionAccumulatorEffects, true);
 
-    internal static MemoryByteRange? TryGetAbsoluteByteRange(MemSpan span)
+    internal static MemoryByteRange? TryGetAbsoluteAccessByteRange(MemSpan span)
     {
         if (!TryGetFixedInt64(span.Buffer.Start, out var allocationStart) ||
             !TryGetFixedDimension(span.Start, out var spanStart) ||
@@ -71,6 +71,27 @@ internal sealed class MemoryEffectAnalyzer
         {
             var start = checked(allocationStart + spanStart);
             return new MemoryByteRange(start, checked(start + spanSize));
+        }
+        catch (OverflowException)
+        {
+            return null;
+        }
+    }
+
+    private static MemoryByteRange? TryGetAbsoluteAllocationByteRange(PhysicalBuffer buffer)
+    {
+        if (!TryGetFixedInt64(buffer.Start, out var allocationStart) ||
+            !TryGetFixedDimension(buffer.Size, out var allocationSize) ||
+            allocationSize < 0)
+        {
+            return null;
+        }
+
+        try
+        {
+            return new MemoryByteRange(
+                allocationStart,
+                checked(allocationStart + allocationSize));
         }
         catch (OverflowException)
         {
@@ -331,17 +352,29 @@ internal sealed class MemoryEffectAnalyzer
                     : TIR.NTT.BarrierScope.Block);
                 if (TryGetSingleVariable(physicalBuffer.Start) is { } identity)
                 {
-                    var relativeRange = ReferenceEquals(physicalBuffer.Start, identity)
-                        ? TryGetRelativeByteRange(buffer.MemSpan)
+                    var hasRelativeBase = ReferenceEquals(physicalBuffer.Start, identity);
+                    var relativeAllocationRange = hasRelativeBase
+                        ? TryGetRelativeAllocationByteRange(physicalBuffer)
                         : null;
-                    return new MemoryResource(identity, buffer, null, relativeRange, scope, buffer.DistributedType);
+                    var relativeRange = hasRelativeBase
+                        ? TryGetRelativeAccessByteRange(buffer.MemSpan)
+                        : null;
+                    return new MemoryResource(
+                        identity,
+                        buffer,
+                        null,
+                        relativeAllocationRange,
+                        relativeRange,
+                        scope,
+                        buffer.DistributedType);
                 }
 
                 return new MemoryResource(
                     null,
                     buffer,
                     new MemoryArena(physicalBuffer.Location, physicalBuffer.Hierarchy),
-                    TryGetAbsoluteByteRange(buffer.MemSpan),
+                    TryGetAbsoluteAllocationByteRange(physicalBuffer),
+                    TryGetAbsoluteAccessByteRange(buffer.MemSpan),
                     scope,
                     buffer.DistributedType);
             case IVar variable:
@@ -354,12 +387,14 @@ internal sealed class MemoryEffectAnalyzer
                     variableExpr,
                     null,
                     null,
+                    null,
                     variableScope,
                     GetDistributedType(variableExpr));
             default:
                 return new MemoryResource(
                     expression,
                     expression,
+                    null,
                     null,
                     null,
                     explicitScope ?? (expression.CheckedDataType is ReferenceType
@@ -377,7 +412,7 @@ internal sealed class MemoryEffectAnalyzer
             _ => expression.CheckedType as DistributedType,
         };
 
-    private static MemoryByteRange? TryGetRelativeByteRange(MemSpan span)
+    private static MemoryByteRange? TryGetRelativeAccessByteRange(MemSpan span)
     {
         if (!TryGetFixedDimension(span.Start, out var start) ||
             !TryGetFixedDimension(span.Size, out var size) ||
@@ -394,6 +429,16 @@ internal sealed class MemoryEffectAnalyzer
         {
             return null;
         }
+    }
+
+    private static MemoryByteRange? TryGetRelativeAllocationByteRange(PhysicalBuffer buffer)
+    {
+        if (!TryGetFixedDimension(buffer.Size, out var size) || size < 0)
+        {
+            return null;
+        }
+
+        return new MemoryByteRange(0, size);
     }
 
     private static bool TryGetFixedDimension(Dimension dimension, out long value)
@@ -1044,12 +1089,16 @@ internal sealed record MemoryResource(
     BaseExpr? ExpressionIdentity,
     BaseExpr? LogicalIdentity,
     MemoryArena? Arena,
-    MemoryByteRange? ByteRange,
+    MemoryByteRange? AllocationRange,
+    MemoryByteRange? AccessRange,
     TIR.NTT.BarrierScope Scope,
     DistributedType? DistributedType)
 {
     public bool HasSameRegion(MemoryResource other)
-        => HasSameLogicalResource(other) && HasSameBacking(other) && ByteRange == other.ByteRange;
+        => HasSameLogicalResource(other) &&
+            HasSameBacking(other) &&
+            AllocationRange == other.AllocationRange &&
+            AccessRange == other.AccessRange;
 
     public bool HasSameLogicalResource(MemoryResource other)
         => (LogicalIdentity is not null && ReferenceEquals(LogicalIdentity, other.LogicalIdentity)) ||
@@ -1062,7 +1111,16 @@ internal sealed record MemoryResource(
             return false;
         }
 
-        return ByteRange is not { } lhs || other.ByteRange is not { } rhs || lhs.Overlaps(rhs);
+        var lhsBound = AccessRange ?? AllocationRange;
+        var rhsBound = other.AccessRange ?? other.AllocationRange;
+        if (lhsBound is { } lhs && rhsBound is { } rhs && !lhs.Overlaps(rhs))
+        {
+            return false;
+        }
+
+        return AccessRange is not { } lhsAccess ||
+            other.AccessRange is not { } rhsAccess ||
+            lhsAccess.Overlaps(rhsAccess);
     }
 
     private bool HasSameBacking(MemoryResource other)

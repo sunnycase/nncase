@@ -1,5 +1,4 @@
-{% macro shard_coordinates(pointers) -%}
-{% set hierarchy = pointer_shard_hierarchy(pointers) -%}
+{% macro hierarchy_coordinates(hierarchy) -%}
 {% if hierarchy is not none %}
     tmp_shard_coord = shard_index
 {% for axis in reverse_indices(hierarchy) %}
@@ -7,6 +6,10 @@
     tmp_shard_coord = tmp_shard_coord // {{ hierarchy[axis] }}
 {% endfor %}
 {% endif %}
+{%- endmacro %}
+
+{% macro shard_coordinates(pointers) -%}
+{{ hierarchy_coordinates(pointer_shard_hierarchy(pointers)) }}
 {%- endmacro %}
 
 {% macro structured_axis(axis, indent="") -%}

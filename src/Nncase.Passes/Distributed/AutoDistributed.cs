@@ -52,6 +52,7 @@ internal enum SearchableNodeKind : int
 {
     Normal,
     FunctionParameter,
+    FunctionResult,
     FunctionCall,
     FunctionBoundaryAdapter,
     TypeAdapter,
@@ -132,6 +133,111 @@ internal static class DistributedFunctionGraphUtility
         }
 
         return refs;
+    }
+
+    public static IReadOnlyDictionary<Function, long> GetStaticInvocationCounts(
+        Function root,
+        IReadOnlyList<Function> reachableFunctions)
+    {
+        var functionOrder = new Dictionary<Function, int>(ReferenceEqualityComparer.Instance);
+        for (var index = 0; index < reachableFunctions.Count; index++)
+        {
+            var function = reachableFunctions[index];
+            if (!functionOrder.TryAdd(function, index))
+            {
+                throw new InvalidOperationException(
+                    $"AutoDistributed reachable function list contains duplicate function {function.Name}.");
+            }
+        }
+
+        if (!functionOrder.ContainsKey(root))
+        {
+            throw new InvalidOperationException(
+                $"AutoDistributed reachable function list does not contain root function {root.Name}.");
+        }
+
+        var invocationCounts = new Dictionary<Function, long>(ReferenceEqualityComparer.Instance)
+        {
+            [root] = 1,
+        };
+
+        for (var callerIndex = reachableFunctions.Count - 1; callerIndex >= 0; callerIndex--)
+        {
+            var caller = reachableFunctions[callerIndex];
+            if (!invocationCounts.TryGetValue(caller, out var callerCount))
+            {
+                continue;
+            }
+
+            foreach (var (callee, callsPerInvocation) in GetDirectFunctionCallCounts(caller.Body))
+            {
+                if (!functionOrder.TryGetValue(callee, out var calleeIndex))
+                {
+                    throw new InvalidOperationException(
+                        $"AutoDistributed reachable function list does not contain callee {callee.Name} referenced by {caller.Name}.");
+                }
+
+                if (calleeIndex >= callerIndex)
+                {
+                    throw new InvalidOperationException(
+                        $"AutoDistributed requires callee-first function order, but {callee.Name} is not before caller {caller.Name}.");
+                }
+
+                var addedCount = checked(callerCount * callsPerInvocation);
+                invocationCounts[callee] = checked(
+                    invocationCounts.GetValueOrDefault(callee) + addedCount);
+            }
+        }
+
+        foreach (var function in reachableFunctions)
+        {
+            if (!invocationCounts.ContainsKey(function))
+            {
+                throw new InvalidOperationException(
+                    $"Reachable function {function.Name} has no static call path from entry function {root.Name}.");
+            }
+        }
+
+        return invocationCounts;
+    }
+
+    private static IReadOnlyDictionary<Function, long> GetDirectFunctionCallCounts(BaseExpr root)
+    {
+        var counts = new Dictionary<Function, long>(ReferenceEqualityComparer.Instance);
+        var seenExprs = new HashSet<BaseExpr>(ReferenceEqualityComparer.Instance);
+        var stack = new Stack<BaseExpr>();
+        stack.Push(root);
+        while (stack.Count != 0)
+        {
+            var expr = stack.Pop();
+            if (!seenExprs.Add(expr))
+            {
+                continue;
+            }
+
+            if (expr is Call { Target: Function callee } call)
+            {
+                counts[callee] = checked(counts.GetValueOrDefault(callee) + 1);
+                foreach (var argument in call.Arguments)
+                {
+                    stack.Push(argument);
+                }
+
+                continue;
+            }
+
+            if (expr is BaseFunction && !ReferenceEquals(expr, root))
+            {
+                continue;
+            }
+
+            foreach (var operand in expr.Operands)
+            {
+                stack.Push(operand);
+            }
+        }
+
+        return counts;
     }
 }
 
@@ -228,12 +334,14 @@ internal sealed class SearchableNode
         IRType type,
         bool isBidirect = false,
         SearchableNodeKind kind = SearchableNodeKind.Normal,
-        DistributedReshardSourceKind? sourceKind = null)
+        DistributedReshardSourceKind? sourceKind = null,
+        DistributedReshardUsageKind? reshardUsageKind = null)
     {
         Expr = expr;
         IRType = type;
         IsBidirect = isBidirect;
         Kind = kind;
+        ReshardUsageKind = reshardUsageKind;
         SourceKind = sourceKind ??
             (kind == SearchableNodeKind.FunctionParameter
                 ? DistributedReshardSourceKind.FunctionParameter
@@ -251,6 +359,8 @@ internal sealed class SearchableNode
     public SearchableNodeKind Kind { get; }
 
     public DistributedReshardSourceKind SourceKind { get; }
+
+    public DistributedReshardUsageKind? ReshardUsageKind { get; }
 }
 
 internal sealed record CrossEdge : IEdge<SearchableNode>
@@ -621,7 +731,13 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
 
     private readonly Dictionary<Function, Dictionary<IVar, DistributedSearchGraph>> _functionParameterUseClusters = new(ReferenceEqualityComparer.Instance);
 
+    private readonly Dictionary<BaseExpr, IReadOnlyList<DistributedSearchGraph>> _directValueBuckets = new(ReferenceEqualityComparer.Instance);
+
     private readonly HashSet<DistributedSearchGraph> _singleChoiceClusters = new(ReferenceEqualityComparer.Instance);
+
+    private readonly Dictionary<Function, long> _functionInvocationCounts = new(ReferenceEqualityComparer.Instance);
+
+    private readonly Dictionary<SearchableNode, Function> _nodeOwnerFunctions = new(ReferenceEqualityComparer.Instance);
 
     /// <summary>
     /// The original tensor consts that are distributed.
@@ -631,8 +747,6 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
     private Function? _currentFunction;
 
     private bool _currentFunctionIsEntry;
-
-    private HashSet<BaseExpr>? _currentFunctionResultLeaves;
 
     private Dictionary<SearchableNode, bool>? _lastPicks;
 
@@ -821,6 +935,16 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
             throw new InvalidOperationException($"AutoDistributed reachable function list does not contain root function {rootFunction.Name}.");
         }
 
+        foreach (var (function, invocationCount) in DistributedFunctionGraphUtility.GetStaticInvocationCounts(rootFunction, reachableFunctions))
+        {
+            if (!_functionInvocationCounts.TryAdd(function, invocationCount) &&
+                _functionInvocationCounts[function] != invocationCount)
+            {
+                throw new InvalidOperationException(
+                    $"Function {function.Name} invocation count changed from {_functionInvocationCounts[function]} to {invocationCount} within one AutoDistributed search.");
+            }
+        }
+
         _profiler.SetFunction(rootFunction.Name);
         DistributedSearchGraph root = null!;
         using (Nncase.IR.UserTrackingScope.Suppress())
@@ -881,24 +1005,35 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
     public DistributedSearchGraph BuildSearchGraph(Function function)
     {
         _profiler.SetFunction(function.Name);
+        _functionInvocationCounts.TryAdd(function, 1);
         return _profiler.TimeActive(() =>
         {
             DistributedSearchGraph root = null!;
+            var existingNodes = new HashSet<SearchableNode>(
+                _rootSearchGraph.Vertices,
+                ReferenceEqualityComparer.Instance);
             using (Nncase.IR.UserTrackingScope.Suppress())
             {
-                _profiler.Time("build_search_graph", () =>
+                try
                 {
-                    Visit(function.Body);
-                    root = TryInstertTerminator(function.Body);
-                });
-
-                if (Diagnostics.DumpScope.Current.IsEnabled(Diagnostics.DumpFlags.EGraphCost))
-                {
-                    _profiler.Time("dump_search_graph_dot", () =>
+                    _profiler.Time("build_search_graph", () =>
                     {
-                        using var stream = Diagnostics.DumpScope.Current.OpenFile("DistributedSearchGraph.dot");
-                        Dump(stream, new Dictionary<SearchableNode, bool>() { }, new Dictionary<SearchableNode, CostModel.Cost>() { }, new Dictionary<SearchableNode, UInt128>() { });
+                        Visit(function.Body);
+                        root = TryInstertTerminator(function.Body);
                     });
+
+                    if (Diagnostics.DumpScope.Current.IsEnabled(Diagnostics.DumpFlags.EGraphCost))
+                    {
+                        _profiler.Time("dump_search_graph_dot", () =>
+                        {
+                            using var stream = Diagnostics.DumpScope.Current.OpenFile("DistributedSearchGraph.dot");
+                            Dump(stream, new Dictionary<SearchableNode, bool>() { }, new Dictionary<SearchableNode, CostModel.Cost>() { }, new Dictionary<SearchableNode, UInt128>() { });
+                        });
+                    }
+                }
+                finally
+                {
+                    RecordNewFunctionNodes(function, existingNodes);
                 }
             }
 
@@ -908,13 +1043,16 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
 
     private DistributedSearchGraph BuildFunctionSearchGraph(Function function, bool isEntry)
     {
+        _functionInvocationCounts.TryAdd(function, 1);
+        var existingNodes = new HashSet<SearchableNode>(
+            _rootSearchGraph.Vertices,
+            ReferenceEqualityComparer.Instance);
         _currentFunction = function;
         _currentFunctionIsEntry = isEntry;
-        _currentFunctionResultLeaves = CollectFunctionResultLeaves(function.Body);
         try
         {
             Visit(function.Body);
-            var root = isEntry ? TryInstertTerminator(function.Body) : TryAddOriginator(function.Body);
+            var root = isEntry ? TryInstertTerminator(function.Body) : CreateFunctionResultCluster(function.Body);
             _functionRootClusters[function] = root;
             if (!isEntry)
             {
@@ -926,39 +1064,98 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         }
         finally
         {
+            RecordNewFunctionNodes(function, existingNodes);
             _currentFunction = null;
             _currentFunctionIsEntry = false;
-            _currentFunctionResultLeaves = null;
         }
     }
 
-    private HashSet<BaseExpr> CollectFunctionResultLeaves(BaseExpr body)
+    private void RecordNewFunctionNodes(Function function, IReadOnlySet<SearchableNode> existingNodes)
     {
-        var leaves = new HashSet<BaseExpr>(ReferenceEqualityComparer.Instance);
-        Visit(body);
-        return leaves;
-
-        void Visit(BaseExpr expression)
+        foreach (var node in _rootSearchGraph.Vertices.Where(node => !existingNodes.Contains(node)))
         {
-            if (expression is IR.Tuple tuple)
+            if (_nodeOwnerFunctions.TryGetValue(node, out var owner) && !ReferenceEquals(owner, function))
             {
-                foreach (var field in tuple.Fields)
-                {
-                    Visit(field);
-                }
-
-                return;
+                throw new InvalidOperationException(
+                    $"AutoDistributed search node is owned by both {owner.Name} and {function.Name}.");
             }
 
-            leaves.Add(expression);
+            _nodeOwnerFunctions[node] = function;
         }
     }
 
-    private DistributedReshardUsageKind GetResultAwareReshardUsageKind(BaseExpr expression)
-        => !_currentFunctionIsEntry &&
-            _currentFunctionResultLeaves?.Contains(expression) == true
-            ? DistributedReshardUsageKind.FunctionBoundary
-            : DistributedReshardUsageKind.Internal;
+    private DistributedSearchGraph CreateFunctionResultCluster(BaseExpr result)
+    {
+        if (result is IR.Tuple tuple)
+        {
+            var fieldClusters = tuple.Fields
+                .AsValueEnumerable()
+                .Select(CreateFunctionResultCluster)
+                .ToArray();
+            var tupleCluster = _rootSearchGraph.CreateCluster<DistributedSearchGraph>(SearchGraphKind.DistributedCluster);
+            var fieldBuckets = fieldClusters
+                .Select((cluster, fieldIndex) =>
+                {
+                    var buckets = cluster.Clusters.OfType<DistributedSearchGraph>().ToArray();
+                    if (buckets.Length == 0)
+                    {
+                        throw new InvalidOperationException(
+                            $"Function result tuple field {fieldIndex} has no direct producer candidates.");
+                    }
+
+                    return buckets;
+                })
+                .ToArray();
+            foreach (var combination in fieldBuckets.Select(buckets => buckets.AsEnumerable()).CartesianProduct())
+            {
+                var selectedBuckets = combination.ToArray();
+                var tupleNode = new SearchableNode(
+                    new IR.Tuple(),
+                    new TupleType(selectedBuckets.Select(GetBucketType).ToArray()),
+                    kind: SearchableNodeKind.FunctionResult);
+                var tupleBucket = tupleCluster.CreateCluster<DistributedSearchGraph>(SearchGraphKind.Bucket);
+                tupleBucket.AddVertex(tupleNode);
+                for (var index = 0; index < selectedBuckets.Length; index++)
+                {
+                    var fieldBucket = selectedBuckets[index];
+                    _rootSearchGraph.AddEdge(new(tupleNode, fieldBucket.Vertices.First(), index, fieldBucket));
+                }
+            }
+
+            return tupleCluster;
+        }
+
+        var valueCluster = TryAddOriginator(result);
+        var sourceBuckets = _directValueBuckets.TryGetValue(result, out var directBuckets)
+            ? directBuckets
+            : valueCluster.Clusters.OfType<DistributedSearchGraph>().ToArray();
+        if (sourceBuckets.Count == 0)
+        {
+            throw new InvalidOperationException(
+                $"Function result {result.GetType().Name} has no direct producer candidates.");
+        }
+
+        var resultCluster = _rootSearchGraph.CreateCluster<DistributedSearchGraph>(valueCluster.Kind);
+        foreach (var sourceBucket in sourceBuckets)
+        {
+            var sourceNode = sourceBucket.Vertices.FirstOrDefault()
+                ?? throw new InvalidOperationException("Function result source bucket is empty.");
+            var resultBucket = resultCluster.CreateCluster<DistributedSearchGraph>(SearchGraphKind.Bucket);
+            var resultNode = new SearchableNode(
+                result,
+                sourceNode.IRType,
+                kind: SearchableNodeKind.FunctionResult,
+                sourceKind: sourceNode.SourceKind);
+            resultBucket.AddVertex(resultNode);
+            _rootSearchGraph.AddEdge(new(resultNode, sourceNode, 0, sourceBucket));
+        }
+
+        return resultCluster;
+
+        static IRType GetBucketType(DistributedSearchGraph bucket)
+            => bucket.Vertices.FirstOrDefault()?.IRType
+                ?? throw new InvalidOperationException("Function result bucket is empty.");
+    }
 
     public Function SolveAndExtract(Function function, DistributedSearchGraph root)
     {
@@ -1246,6 +1443,8 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
             throw new InvalidOperationException(failureMessage);
         }
 
+        var directOutputBuckets = bucketMemo.Values.ToArray();
+        RecordDirectValueBuckets(expr, directOutputBuckets);
         _inferedMemo.Add(expr, callCluster);
 
         if (!isSupported || isStandalone)
@@ -1253,12 +1452,10 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
             return default;
         }
 
-        var outputReshardUsageKind = GetResultAwareReshardUsageKind(expr);
-
-        // 3. add bidirectional connections for values that remain inside the
-        // function. Function results use the separate output closure below so
-        // every reshard endpoint is realized with function-boundary semantics.
-        if (Bidirectional && outputReshardUsageKind == DistributedReshardUsageKind.Internal)
+        // 3. add bidirectional connections. Function signatures are projected
+        // from direct producer buckets separately, so these reshard candidates
+        // remain consumer-side alternatives even when the value is returned.
+        if (Bidirectional)
         {
             foreach (var (lType, lBucket) in bucketMemo.Where(kv => kv.Key is DistributedType))
             {
@@ -1271,7 +1468,7 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
                             lBucket,
                             lBucket.Vertices.First(),
                             rType,
-                            usageKind: GetResultAwareReshardUsageKind(expr),
+                            usageKind: DistributedReshardUsageKind.Internal,
                             isBidirect: true,
                             outputBucket: rBucket,
                             addDataEdgeToOwnerCluster: true);
@@ -1281,8 +1478,6 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         }
 
         // 4. add not infered type in search space.
-        var directOutputBuckets = bucketMemo.Values.ToArray();
-
         if (expr.CheckedType is not TensorType tensorType || !IsDistributableTensorType(tensorType))
         {
             return default;
@@ -1292,7 +1487,7 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
             callCluster,
             tensorType,
             directOutputBuckets,
-            outputReshardUsageKind);
+            DistributedReshardUsageKind.Internal);
 
         // 5. filter
         FilterByScheme(expr, callCluster);
@@ -1749,7 +1944,8 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
             targetType,
             isBidirect,
             kind,
-            outputSourceKind);
+            outputSourceKind,
+            resolvedUsageKind);
         bucket.AddVertex(node);
         var dataEdge = new CrossEdge(node, inputNode, 0, inputBucket);
         if (addDataEdgeToOwnerCluster)
@@ -1827,11 +2023,13 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         }
 
         var callCluster = _rootSearchGraph.CreateCluster<DistributedSearchGraph>(SearchGraphKind.DistributedCluster);
+        var directCallBuckets = new List<DistributedSearchGraph>();
         foreach (var returnBucket in calleeReturnCluster.Clusters.OfType<DistributedSearchGraph>())
         {
             var returnNode = returnBucket.Vertices.FirstOrDefault()
                 ?? throw new InvalidOperationException($"Function {callee.Name} has an empty return candidate bucket.");
             var bucket = callCluster.CreateCluster<DistributedSearchGraph>(SearchGraphKind.Bucket);
+            directCallBuckets.Add(bucket);
             var callNode = new SearchableNode(callee, returnNode.IRType, kind: SearchableNodeKind.FunctionCall);
             bucket.AddVertex(callNode);
             _rootSearchGraph.AddEdge(new(callNode, returnNode, HiddenFunctionDependencyIndex, returnBucket));
@@ -1844,6 +2042,16 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
                     _rootSearchGraph.AddEdge(new(callNode, boundaryNode, i, boundaryBucket));
                 }
             }
+        }
+
+        RecordDirectValueBuckets(expr, directCallBuckets);
+        if (expr.CheckedType is TensorType tensorType && IsDistributableTensorType(tensorType))
+        {
+            CompleteOutputReshardClosure(
+                callCluster,
+                tensorType,
+                directCallBuckets,
+                DistributedReshardUsageKind.Internal);
         }
 
         _inferedMemo.Add(expr, callCluster);
@@ -2141,8 +2349,32 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
             tensorType,
             directUseBuckets,
             DistributedReshardUsageKind.Internal);
+        RecordDirectValueBuckets(parameter, directUseBuckets);
         clusters.Add(parameter, useCluster);
         return useCluster;
+    }
+
+    private void RecordDirectValueBuckets(BaseExpr expression, IReadOnlyList<DistributedSearchGraph> buckets)
+    {
+        if (buckets.Count == 0)
+        {
+            throw new InvalidOperationException(
+                $"Cannot record direct producer candidates for {expression.GetType().Name}: the bucket list is empty.");
+        }
+
+        if (_directValueBuckets.TryGetValue(expression, out var existing))
+        {
+            if (existing.Count != buckets.Count ||
+                existing.Where((bucket, index) => !ReferenceEquals(bucket, buckets[index])).Any())
+            {
+                throw new InvalidOperationException(
+                    $"Direct producer candidates for {expression.GetType().Name} were recorded inconsistently.");
+            }
+
+            return;
+        }
+
+        _directValueBuckets.Add(expression, buckets.ToArray());
     }
 
     private DistributedSearchGraph CreateOriginatorCluster(BaseExpr expr, bool init)
@@ -2290,7 +2522,7 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
                         inputBucket,
                         inputNode,
                         dType,
-                        usageKind: GetResultAwareReshardUsageKind(expr));
+                        usageKind: DistributedReshardUsageKind.Internal);
                 }
 
                 return distCluster;
@@ -2383,19 +2615,14 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
 
         if (expr is IR.Tuple tp)
         {
-            var buckets = new DistributedSearchGraph[tp.Fields.Length];
-            foreach (var (f, fGraph, i) in tp.Fields.AsValueEnumerable().Select((f, i) => (f, Visit(f), i)))
+            var fieldClusters = new DistributedSearchGraph[tp.Fields.Length];
+            foreach (var (field, index) in tp.Fields.AsValueEnumerable().Select((field, index) => (field, index)))
             {
-                buckets[i] = TryInstertTerminator(f).Clusters.OfType<DistributedSearchGraph>().First();
+                Visit(field);
+                fieldClusters[index] = TryInstertTerminator(field);
             }
 
-            var tpnode = new SearchableNode(new IR.Tuple(), new TupleType(buckets.Select(g => g.Vertices.First().IRType).ToArray()));
-            var bucket = standCluster.CreateCluster<DistributedSearchGraph>(SearchGraphKind.Bucket);
-            bucket.AddVertex(tpnode);
-            for (int i = 0; i < tp.Fields.Length; i++)
-            {
-                _rootSearchGraph.AddEdge(new(tpnode, buckets[i].Vertices.First(), i, buckets[i]));
-            }
+            AddTupleTerminatorCandidates(standCluster, fieldClusters);
         }
         else if (expr.CheckedType is TupleType tupleType)
         {
@@ -2407,20 +2634,14 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
             }
             else
             {
-                var buckets = new DistributedSearchGraph[tupleType.Fields.Count];
+                var fieldClusters = new DistributedSearchGraph[tupleType.Fields.Count];
                 for (int i = 0; i < tupleType.Fields.Count; i++)
                 {
                     var field = IR.F.Tensors.GetItem(expr, i);
-                    buckets[i] = TryInstertTerminator(field).Clusters.OfType<DistributedSearchGraph>().First();
+                    fieldClusters[i] = TryInstertTerminator(field);
                 }
 
-                var tpnode = new SearchableNode(new IR.Tuple(), new TupleType(buckets.Select(g => g.Vertices.First().IRType).ToArray()));
-                var bucket = standCluster.CreateCluster<DistributedSearchGraph>(SearchGraphKind.Bucket);
-                bucket.AddVertex(tpnode);
-                for (int i = 0; i < tupleType.Fields.Count; i++)
-                {
-                    _rootSearchGraph.AddEdge(new(tpnode, buckets[i].Vertices.First(), i, buckets[i]));
-                }
+                AddTupleTerminatorCandidates(standCluster, fieldClusters);
             }
         }
         else if (expr is TensorConst tc && tc.ValueType is TensorType tensorType)
@@ -2468,7 +2689,10 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
                     return standCluster;
                 }
 
-                var onode = new SearchableNode(new Boxing(expr.CheckedType), expr.CheckedType);
+                var onode = new SearchableNode(
+                    new Boxing(expr.CheckedType),
+                    expr.CheckedType,
+                    reshardUsageKind: DistributedReshardUsageKind.ProgramOutput);
                 var inputBuckets = _inferedMemo[expr].Clusters.OfType<DistributedSearchGraph>().ToArray();
 
                 var bucket = standCluster.CreateCluster<DistributedSearchGraph>(SearchGraphKind.Bucket);
@@ -2480,10 +2704,104 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
                         _rootSearchGraph.AddEdge(new(onode, inputBucket.Vertices.First(), 0, inputBucket));
                     }
                 }
+
+                AddProgramOutputShardedViewCandidates(standCluster, inputBuckets);
             }
         }
 
         return standCluster;
+    }
+
+    private void AddTupleTerminatorCandidates(
+        DistributedSearchGraph terminatorCluster,
+        IReadOnlyList<DistributedSearchGraph> fieldClusters)
+    {
+        var fieldBuckets = fieldClusters
+            .Select((cluster, fieldIndex) =>
+            {
+                var buckets = cluster.Clusters.OfType<DistributedSearchGraph>().ToArray();
+                if (buckets.Length == 0)
+                {
+                    throw new InvalidOperationException(
+                        $"Tuple terminator field {fieldIndex} has no output candidate buckets.");
+                }
+
+                return buckets;
+            })
+            .ToArray();
+        var selectedBuckets = new DistributedSearchGraph[fieldBuckets.Length];
+        AddCombinations(0);
+
+        void AddCombinations(int fieldIndex)
+        {
+            if (fieldIndex < fieldBuckets.Length)
+            {
+                foreach (var fieldBucket in fieldBuckets[fieldIndex])
+                {
+                    selectedBuckets[fieldIndex] = fieldBucket;
+                    AddCombinations(fieldIndex + 1);
+                }
+
+                return;
+            }
+
+            var tupleNode = new SearchableNode(
+                new IR.Tuple(),
+                new TupleType(selectedBuckets.Select(GetBucketType).ToArray()));
+            var tupleBucket = terminatorCluster.CreateCluster<DistributedSearchGraph>(SearchGraphKind.Bucket);
+            tupleBucket.AddVertex(tupleNode);
+            for (var index = 0; index < selectedBuckets.Length; index++)
+            {
+                var fieldBucket = selectedBuckets[index];
+                _rootSearchGraph.AddEdge(new(tupleNode, fieldBucket.Vertices.First(), index, fieldBucket));
+            }
+        }
+
+        static IRType GetBucketType(DistributedSearchGraph bucket)
+            => bucket.Vertices.FirstOrDefault()?.IRType ??
+                throw new InvalidOperationException("Tuple terminator candidate bucket is empty.");
+    }
+
+    private void AddProgramOutputShardedViewCandidates(
+        DistributedSearchGraph terminatorCluster,
+        IReadOnlyList<DistributedSearchGraph> inputBuckets)
+    {
+        var outputBuckets = new Dictionary<DistributedType, DistributedSearchGraph>();
+        foreach (var inputBucket in inputBuckets)
+        {
+            var inputNode = inputBucket.Vertices.FirstOrDefault();
+            if (inputNode?.IRType is not DistributedType sourceType)
+            {
+                continue;
+            }
+
+            var outputType = new DistributedType(
+                sourceType.TensorType,
+                Enumerable.Repeat<SBP>(SBP.B, sourceType.AxisPolicies.Count).ToArray(),
+                sourceType.Placement);
+            if (ClassifyReshardRealization(
+                    sourceType,
+                    outputType,
+                    GetReshardSourceKind(inputNode),
+                    DistributedReshardUsageKind.ProgramOutput) != DistributedReshardRealization.ShardedView)
+            {
+                continue;
+            }
+
+            if (!outputBuckets.TryGetValue(outputType, out var outputBucket))
+            {
+                outputBucket = terminatorCluster.CreateCluster<DistributedSearchGraph>(SearchGraphKind.Bucket);
+                outputBuckets.Add(outputType, outputBucket);
+            }
+
+            GetOrCreateReshardCandidate(
+                terminatorCluster,
+                inputBucket,
+                inputNode,
+                outputType,
+                usageKind: DistributedReshardUsageKind.ProgramOutput,
+                outputBucket: outputBucket);
+        }
     }
 
     private IRType CheckBoxingType(IRType inType, IRType outType, bool isReshape = false)
@@ -2695,7 +3013,9 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
                         row1.Cells.Add(new() { Text = $"{k}: {v}" });
                     }
 
-                    row1.Cells.Add(new() { Text = $"Score: {costScoreMemo[arg.Vertex]}" });
+                    row1.Cells.Add(new() { Text = $"Local score: {costScoreMemo[arg.Vertex]}" });
+                    row1.Cells.Add(new() { Text = $"Invocation count: {GetInvocationCount(arg.Vertex)}" });
+                    row1.Cells.Add(new() { Text = $"Objective score: {GetObjectiveScore(costScoreMemo, arg.Vertex)}" });
                     col1.Cells.Add(row1);
                 }
 
@@ -2723,10 +3043,15 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         writer.WriteLine("# AutoDistributed Cost Pick Summary");
         writer.WriteLine($"top_k: {topK}");
         writer.WriteLine($"focus_terms: {string.Join(", ", focusTerms)}");
-        writer.WriteLine($"selected_score_sum: {pickMemo.Where(kv => kv.Value).Aggregate((UInt128)0, (sum, kv) => sum + GetScore(costScoreMemo, kv.Key))}");
+        writer.WriteLine($"selected_local_score_sum: {pickMemo.Where(kv => kv.Value).Aggregate((UInt128)0, (sum, kv) => sum + GetScore(costScoreMemo, kv.Key))}");
+        writer.WriteLine($"selected_objective_score_sum: {pickMemo.Where(kv => kv.Value).Aggregate((UInt128)0, (sum, kv) => checked(sum + GetObjectiveScore(costScoreMemo, kv.Key)))}");
         var selectedAggregateCost = pickMemo.Where(kv => kv.Value).Aggregate(CostModel.Cost.Zero, (sum, kv) => sum + (costMemo.TryGetValue(kv.Key, out var cost) ? cost : CostModel.Cost.Zero));
-        writer.WriteLine($"selected_aggregate_cost: {FormatCost(selectedAggregateCost)}");
-        writer.WriteLine($"selected_aggregate_latency: {FormatLatencyBreakdown(dump.TargetCostModel, selectedAggregateCost, null)}");
+        var selectedExecutionWeightedCost = pickMemo.Where(kv => kv.Value).Aggregate(
+            CostModel.Cost.Zero,
+            (sum, kv) => sum + ((costMemo.TryGetValue(kv.Key, out var cost) ? cost : CostModel.Cost.Zero) * (UInt128)GetInvocationCount(kv.Key)));
+        writer.WriteLine($"selected_local_aggregate_cost: {FormatCost(selectedAggregateCost)}");
+        writer.WriteLine($"selected_local_aggregate_latency: {FormatLatencyBreakdown(dump.TargetCostModel, selectedAggregateCost, null)}");
+        writer.WriteLine($"selected_execution_weighted_cost: {FormatCost(selectedExecutionWeightedCost)}");
         writer.WriteLine($"root_cluster: {dump.GetGraphName(rootCluster)}");
         writer.WriteLine();
 
@@ -2855,14 +3180,14 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
                 .OrderBy(e => dump.GetNodeName(e.Root))
                 .ThenBy(e => e.InputIndex))
             {
-                writer.WriteLine($"    <- P{edge.InputIndex} {dump.GetNodeName(edge.Root)} {GetNodeLabel(edge.Root)} picked={dump.IsPicked(edge.Root)} score={GetScore(dump.CostScoreMemo, edge.Root)} bucket={dump.GetGraphName(dump.GetBucket(edge.Root))}");
+                writer.WriteLine($"    <- P{edge.InputIndex} {dump.GetNodeName(edge.Root)} {GetNodeLabel(edge.Root)} picked={dump.IsPicked(edge.Root)} local_score={GetScore(dump.CostScoreMemo, edge.Root)} objective_score={GetObjectiveScore(dump.CostScoreMemo, edge.Root)} bucket={dump.GetGraphName(dump.GetBucket(edge.Root))}");
             }
         }
     }
 
     private void DumpCandidate(StreamWriter writer, SearchableNode node, CostDumpContext dump, string indent, int rank)
     {
-        writer.WriteLine($"{indent}[{rank}] {dump.GetNodeName(node)} picked={dump.IsPicked(node)} score={GetScore(dump.CostScoreMemo, node)} expr={GetNodeLabel(node)}");
+        writer.WriteLine($"{indent}[{rank}] {dump.GetNodeName(node)} picked={dump.IsPicked(node)} local_score={GetScore(dump.CostScoreMemo, node)} invocation_count={GetInvocationCount(node)} objective_score={GetObjectiveScore(dump.CostScoreMemo, node)} expr={GetNodeLabel(node)}");
         writer.WriteLine($"{indent}    type: {GetOneLine(node.IRType.ToString() ?? string.Empty)}");
         var cost = dump.CostMemo.TryGetValue(node, out var nodeCost) ? nodeCost : CostModel.Cost.Zero;
         writer.WriteLine($"{indent}    cost: {FormatCost(cost)}");
@@ -2889,11 +3214,11 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
             var selected = edge.InputGraph.Vertices.FirstOrDefault(dump.IsPicked);
             var selectedText = selected is null
                 ? "<none>"
-                : $"{dump.GetNodeName(selected)} {GetNodeLabel(selected)} score={GetScore(dump.CostScoreMemo, selected)}";
+                : $"{dump.GetNodeName(selected)} {GetNodeLabel(selected)} local_score={GetScore(dump.CostScoreMemo, selected)} objective_score={GetObjectiveScore(dump.CostScoreMemo, selected)}";
             var best = dump.GetBestNode(edge.InputGraph);
             var bestText = best is null
                 ? "<none>"
-                : $"{dump.GetNodeName(best)} {GetNodeLabel(best)} score={GetScore(dump.CostScoreMemo, best)}";
+                : $"{dump.GetNodeName(best)} {GetNodeLabel(best)} local_score={GetScore(dump.CostScoreMemo, best)} objective_score={GetObjectiveScore(dump.CostScoreMemo, best)}";
             writer.WriteLine($"{indent}  P{edge.InputIndex} -> {dump.GetGraphName(edge.InputGraph)} root_reachable={dump.IsRootReachable(edge.InputGraph)} selected_tree={dump.IsSelectedDependency(edge.InputGraph)} selected={selectedText} best={bestText}");
         }
     }
@@ -2920,7 +3245,7 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
 
         if (active.Contains(node))
         {
-            writer.WriteLine($"{indent}{dump.GetNodeName(node)} <cycle> bucket={dump.GetGraphName(dump.GetBucket(node))} score={GetScore(dump.CostScoreMemo, node)} expr={GetNodeLabel(node)}");
+            writer.WriteLine($"{indent}{dump.GetNodeName(node)} <cycle> bucket={dump.GetGraphName(dump.GetBucket(node))} local_score={GetScore(dump.CostScoreMemo, node)} objective_score={GetObjectiveScore(dump.CostScoreMemo, node)} expr={GetNodeLabel(node)}");
             truncated = true;
             return;
         }
@@ -2928,7 +3253,7 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         if (!emitted.Add(node))
         {
             references++;
-            writer.WriteLine($"{indent}{dump.GetNodeName(node)} <ref> bucket={dump.GetGraphName(dump.GetBucket(node))} score={GetScore(dump.CostScoreMemo, node)} expr={GetNodeLabel(node)}");
+            writer.WriteLine($"{indent}{dump.GetNodeName(node)} <ref> bucket={dump.GetGraphName(dump.GetBucket(node))} local_score={GetScore(dump.CostScoreMemo, node)} objective_score={GetObjectiveScore(dump.CostScoreMemo, node)} expr={GetNodeLabel(node)}");
             return;
         }
 
@@ -2939,7 +3264,7 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
             return;
         }
 
-        writer.WriteLine($"{indent}{dump.GetNodeName(node)} bucket={dump.GetGraphName(dump.GetBucket(node))} score={GetScore(dump.CostScoreMemo, node)} expr={GetNodeLabel(node)}");
+        writer.WriteLine($"{indent}{dump.GetNodeName(node)} bucket={dump.GetGraphName(dump.GetBucket(node))} local_score={GetScore(dump.CostScoreMemo, node)} invocation_count={GetInvocationCount(node)} objective_score={GetObjectiveScore(dump.CostScoreMemo, node)} expr={GetNodeLabel(node)}");
         writer.WriteLine($"{indent}  type: {GetOneLine(node.IRType.ToString() ?? string.Empty)}");
         var cost = dump.CostMemo.TryGetValue(node, out var nodeCost) ? nodeCost : CostModel.Cost.Zero;
         writer.WriteLine($"{indent}  cost: {FormatCost(cost)}");
@@ -3119,6 +3444,33 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
 
     private UInt128 GetScore(IReadOnlyDictionary<SearchableNode, UInt128> costScoreMemo, SearchableNode node)
         => costScoreMemo.TryGetValue(node, out var score) ? score : 0;
+
+    private long GetInvocationCount(SearchableNode node)
+    {
+        if (!_nodeOwnerFunctions.TryGetValue(node, out var function))
+        {
+            return 1;
+        }
+
+        if (!_functionInvocationCounts.TryGetValue(function, out var invocationCount))
+        {
+            throw new InvalidOperationException(
+                $"Function {function.Name} has no static invocation count.");
+        }
+
+        if (invocationCount <= 0)
+        {
+            throw new InvalidOperationException(
+                $"Function {function.Name} has invalid static invocation count {invocationCount}.");
+        }
+
+        return invocationCount;
+    }
+
+    private UInt128 GetObjectiveScore(
+        IReadOnlyDictionary<SearchableNode, UInt128> costScoreMemo,
+        SearchableNode node)
+        => checked(GetScore(costScoreMemo, node) * (UInt128)GetInvocationCount(node));
 
     private string FormatCost(CostModel.Cost cost)
         => cost.Factors.Count == 0
@@ -3300,50 +3652,60 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
                     foreach (var enode in bucket.Vertices)
                     {
                         CostModel.Cost cost;
-                        if (enode.Kind is SearchableNodeKind.FunctionBoundaryAdapter or SearchableNodeKind.TypeAdapter)
+                        if (enode is
+                            {
+                                Expr: IR.Distributed.ShardedView,
+                                ReshardUsageKind: DistributedReshardUsageKind.ProgramOutput,
+                            })
+                        {
+                            // Kernel completion publishes caller-allocated outputs. Unlike an
+                            // internal widened view, this terminal alias has no grid consumer.
+                            cost = CostModel.Cost.Zero;
+                        }
+                        else if (enode.Kind is SearchableNodeKind.FunctionResult or SearchableNodeKind.FunctionBoundaryAdapter or SearchableNodeKind.TypeAdapter)
                         {
                             cost = new CostModel.Cost() { [CostModel.CostFactorNames.CPUCycles] = 0 };
                         }
                         else
                         {
-                        switch (enode.Expr)
-                        {
-                            case TensorConst { ValueType: DistributedType distributedType }:
-                                cost = new CostModel.Cost()
-                                {
-                                    [CostModel.CostFactorNames.BlockLocalMemoryStoreBytes] = GetLocalTensorBytes(distributedType),
-                                };
-                                break;
-                            case Const or Var or If or IR.Tuple or BaseFunction or Shape or Padding or Paddings or Dimension or None or Call:
-                                cost = new CostModel.Cost() { [CostModel.CostFactorNames.CPUCycles] = 1 };
-                                break;
-                            case Op op:
-                                {
-                                    _profiler.Count("cost_evaluate_ops");
-                                    _profiler.Count($"cost_evaluate_op:{op.GetType().Name}");
-                                    if (!_rootSearchGraph.TryGetOutEdges(enode, out var edges))
+                            switch (enode.Expr)
+                            {
+                                case TensorConst { ValueType: DistributedType distributedType }:
+                                    cost = new CostModel.Cost()
                                     {
-                                        throw new NotSupportedException("graph doesn't contain the vertex.");
+                                        [CostModel.CostFactorNames.BlockLocalMemoryStoreBytes] = GetLocalTensorBytes(distributedType),
+                                    };
+                                    break;
+                                case Const or Var or If or IR.Tuple or BaseFunction or Shape or Padding or Paddings or Dimension or None or Call:
+                                    cost = new CostModel.Cost() { [CostModel.CostFactorNames.CPUCycles] = 1 };
+                                    break;
+                                case Op op:
+                                    {
+                                        _profiler.Count("cost_evaluate_ops");
+                                        _profiler.Count($"cost_evaluate_op:{op.GetType().Name}");
+                                        if (!_rootSearchGraph.TryGetOutEdges(enode, out var edges))
+                                        {
+                                            throw new NotSupportedException("graph doesn't contain the vertex.");
+                                        }
+
+                                        var tempArgs = edges.Where(e => e.InputIndex >= 0).OrderBy(e => e.InputIndex).Select<CrossEdge, BaseExpr>(e => e.Target switch
+                                        {
+                                            SearchableNode { Expr: Dimension attr } => attr,
+                                            SearchableNode { Expr: Shape attr } => attr,
+                                            SearchableNode { Expr: Padding attr } => attr,
+                                            SearchableNode { Expr: Paddings attr } => attr,
+                                            SearchableNode { Expr: Const attr } => attr,
+                                            SearchableNode n => new Var(n.IRType),
+                                        }).ToArray();
+
+                                        var context = new DistributedCostEvaluateContext(op, enode.IRType, tempArgs, CompileOptions);
+                                        cost = _profiler.Time("cost_evaluate", () => CompilerServices.EvaluateOpCost(op, context));
                                     }
 
-                                    var tempArgs = edges.Where(e => e.InputIndex >= 0).OrderBy(e => e.InputIndex).Select<CrossEdge, BaseExpr>(e => e.Target switch
-                                    {
-                                        SearchableNode { Expr: Dimension attr } => attr,
-                                        SearchableNode { Expr: Shape attr } => attr,
-                                        SearchableNode { Expr: Padding attr } => attr,
-                                        SearchableNode { Expr: Paddings attr } => attr,
-                                        SearchableNode { Expr: Const attr } => attr,
-                                        SearchableNode n => new Var(n.IRType),
-                                    }).ToArray();
-
-                                    var context = new DistributedCostEvaluateContext(op, enode.IRType, tempArgs, CompileOptions);
-                                    cost = _profiler.Time("cost_evaluate", () => CompilerServices.EvaluateOpCost(op, context));
-                                }
-
-                                break;
-                            default:
-                                throw new NotSupportedException($"extract not support {enode.Expr.GetType()}");
-                        }
+                                    break;
+                                default:
+                                    throw new NotSupportedException($"extract not support {enode.Expr.GetType()}");
+                            }
                         }
 
                         costMemo.Add(enode, cost);
@@ -3425,7 +3787,9 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
 
         // 5. add pick weights for all enode.
         _profiler.Time("sat_set_objective", () =>
-            cpmodel.Minimize(LinearExpr.WeightedSum(_rootSearchGraph.Vertices.Select(n => varMemo[n]), _rootSearchGraph.Vertices.Select(n => checked((long)costScoreMemo[n])))));
+            cpmodel.Minimize(LinearExpr.WeightedSum(
+                _rootSearchGraph.Vertices.Select(n => varMemo[n]),
+                _rootSearchGraph.Vertices.Select(n => checked((long)GetObjectiveScore(costScoreMemo, n))))));
 
         var validation = _profiler.Time("sat_validate", () => cpmodel.Validate());
         if (validation.Any())
@@ -3744,6 +4108,24 @@ internal sealed class ExprBuildVisitor
                 .ToArray();
             switch (root.Kind, root.Expr)
             {
+                case (SearchableNodeKind.FunctionResult, IR.Tuple tuple):
+                    expr = tuple.With(fields: children);
+                    break;
+                case (SearchableNodeKind.FunctionResult, _):
+                    if (children.Length != 1)
+                    {
+                        throw new InvalidOperationException($"{root.Kind} expects one direct producer, got {children.Length}.");
+                    }
+
+                    var resultType = EnsureMaterializedType(children[0], $"{root.Kind} input");
+                    if (!EqualityComparer<IRType>.Default.Equals(resultType, root.IRType))
+                    {
+                        throw new InvalidOperationException(
+                            $"{root.Kind} cannot change direct producer type {resultType} to signature type {root.IRType}.");
+                    }
+
+                    expr = children[0];
+                    break;
                 case (SearchableNodeKind.FunctionBoundaryAdapter, Op realization):
                     if (children.Length != 1)
                     {

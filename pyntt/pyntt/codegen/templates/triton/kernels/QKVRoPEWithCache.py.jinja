@@ -1,0 +1,97 @@
+{% import "triton/kernels/_common.py.jinja" as common with context %}
+{% import "triton/kernels/_elementwise.py.jinja" as elementwise with context %}
+{% import "triton/kernels/_paged_attention_kv_cache.py.jinja" as cache_io with context %}
+{% import "triton/kernels/_producer_consumer.py.jinja" as phases with context %}
+{% set ctx = qkv_rope_with_cache_context(model) %}
+{% set q_norm = model["QNorm"] %}
+{% set k_norm = model["KNorm"] %}
+{% set q_rope = model["QRoPE"] %}
+{% set k_rope = model["KRoPE"] %}
+{% set k_update = model["KUpdate"] %}
+{% set v_update = model["VUpdate"] %}
+{% set args = ("slot_mapping", "kv_cache", "num_blocks_per_shard", "query_start_loc", "num_seqs") %}
+# generated from PyNTT Jinja QKVRoPEWithCache.py.jinja
+# {{ model["Comment"] }}; q_shape={{ shape_tuple(q_norm["OutputShape"]) }}, k_shape={{ shape_tuple(k_norm["OutputShape"]) }}, v_shape={{ shape_tuple(v_update["SlotsShape"]) }}, layer={{ k_update["LayerIdExpression"] }}
+{{ phases.consumer_header(model, args) }}
+    shard_index = tl.program_id(0).to(tl.int64)
+{{ common.hierarchy_coordinates(k_update["Hierarchy"]) }}
+    q_input = {{ ptr(q_norm, "Input") }}
+    q_stats = {{ ptr(q_norm, "Stats") }}
+    q_scale = {{ ptr(q_norm, "Scale") }}
+    q_bias = {{ ptr(q_norm, "Bias") }}
+    q_output = {{ ptr(q_norm, "Output") }}
+    k_input = {{ ptr(k_norm, "Input") }}
+    k_stats = {{ ptr(k_norm, "Stats") }}
+    k_scale = {{ ptr(k_norm, "Scale") }}
+    k_bias = {{ ptr(k_norm, "Bias") }}
+    cos = {{ ptr(q_rope, "Cos") }}
+    sin = {{ ptr(q_rope, "Sin") }}
+    v_input = {{ ptr(v_update, "Slots") }}
+    layer_id_value = (tl.full((), 0, tl.int64) + ({{ k_update["LayerIdExpression"] }})).to(tl.int64)
+    num_tokens = tl.load(query_start_loc + num_seqs).to(tl.int64)
+
+{% call(indent) elementwise.iterate(ctx["q"]) %}
+{{ indent }}mask = mask & ({{ ctx["q"]["output_physical_rotary"] }} < {{ dim(ctx["q"]["output_rotary_extent"]) }})
+{{ indent }}q_inner_count = ({{ ctx["q"]["normalization_size"] }}) + 0.0
+{% if q_norm["UseMean"] %}
+{{ indent }}q_mean_sum = tl.load({{ access_pointer(q_norm, "Stats", "q_stats", ctx["q"]["stats_accesses"][0]) }}).to(tl.float32)
+{{ indent }}q_square_sum = tl.load({{ access_pointer(q_norm, "Stats", "q_stats", ctx["q"]["stats_accesses"][1]) }}).to(tl.float32)
+{{ indent }}q_mean = q_mean_sum / q_inner_count
+{{ indent }}q_variance = (q_square_sum / q_inner_count) - (q_mean * q_mean)
+{% else %}
+{{ indent }}q_square_sum = tl.load({{ access_pointer(q_norm, "Stats", "q_stats", ctx["q"]["stats_accesses"][0]) }}).to(tl.float32)
+{{ indent }}q_mean = 0.0
+{{ indent }}q_variance = q_square_sum / q_inner_count
+{% endif %}
+{{ indent }}q_inv_std = tl.rsqrt(tl.maximum(q_variance, 0.0) + {{ pyrepr(q_norm["Epsilon"]) }})
+{{ indent }}q_value = tl.load({{ access_pointer(q_norm, "Input", "q_input", ctx["q"]["input_access"]) }}, mask=mask, other=0.0).to(tl.float32)
+{{ indent }}q_pair = tl.load({{ access_pointer(q_norm, "Input", "q_input", ctx["q"]["paired_input_access"]) }}, mask=mask, other=0.0).to(tl.float32)
+{{ indent }}q_scale_value = tl.load({{ access_pointer(q_norm, "Scale", "q_scale", ctx["q"]["scale_access"]) }}, mask=mask, other=0.0).to(tl.float32)
+{{ indent }}q_pair_scale = tl.load({{ access_pointer(q_norm, "Scale", "q_scale", ctx["q"]["paired_scale_access"]) }}, mask=mask, other=0.0).to(tl.float32)
+{{ indent }}q_bias_value = tl.load({{ access_pointer(q_norm, "Bias", "q_bias", ctx["q"]["bias_access"]) }}, mask=mask, other=0.0).to(tl.float32)
+{{ indent }}q_pair_bias = tl.load({{ access_pointer(q_norm, "Bias", "q_bias", ctx["q"]["paired_bias_access"]) }}, mask=mask, other=0.0).to(tl.float32)
+{{ indent }}q_normalized = ((q_value - q_mean) * q_inv_std * q_scale_value) + q_bias_value
+{{ indent }}q_pair_normalized = ((q_pair - q_mean) * q_inv_std * q_pair_scale) + q_pair_bias
+{{ indent }}q_cos = tl.load({{ access_pointer(q_rope, "Cos", "cos", ctx["q"]["cos_access"]) }}, mask=mask, other=0.0).to(tl.float32)
+{{ indent }}q_sin = tl.load({{ access_pointer(q_rope, "Sin", "sin", ctx["q"]["sin_access"]) }}, mask=mask, other=0.0).to(tl.float32)
+{{ indent }}q_rotated = tl.where({{ ctx["q"]["first_half"] }}, -q_pair_normalized, q_pair_normalized)
+{{ indent }}q_result = q_normalized * q_cos + q_rotated * q_sin
+{{ indent }}tl.store({{ access_pointer(q_norm, "Output", "q_output", ctx["q"]["output_access"]) }}, q_result, mask=mask)
+{% endcall %}
+
+{% call(indent) elementwise.iterate(ctx["k"]) %}
+{{ indent }}mask = mask & ({{ ctx["k"]["output_physical_rotary"] }} < {{ dim(ctx["k"]["output_rotary_extent"]) }})
+{{ indent }}k_inner_count = ({{ ctx["k"]["normalization_size"] }}) + 0.0
+{% if k_norm["UseMean"] %}
+{{ indent }}k_mean_sum = tl.load({{ access_pointer(k_norm, "Stats", "k_stats", ctx["k"]["stats_accesses"][0]) }}).to(tl.float32)
+{{ indent }}k_square_sum = tl.load({{ access_pointer(k_norm, "Stats", "k_stats", ctx["k"]["stats_accesses"][1]) }}).to(tl.float32)
+{{ indent }}k_mean = k_mean_sum / k_inner_count
+{{ indent }}k_variance = (k_square_sum / k_inner_count) - (k_mean * k_mean)
+{% else %}
+{{ indent }}k_square_sum = tl.load({{ access_pointer(k_norm, "Stats", "k_stats", ctx["k"]["stats_accesses"][0]) }}).to(tl.float32)
+{{ indent }}k_mean = 0.0
+{{ indent }}k_variance = k_square_sum / k_inner_count
+{% endif %}
+{{ indent }}k_inv_std = tl.rsqrt(tl.maximum(k_variance, 0.0) + {{ pyrepr(k_norm["Epsilon"]) }})
+{{ indent }}k_value = tl.load({{ access_pointer(k_norm, "Input", "k_input", ctx["k"]["input_access"]) }}, mask=mask, other=0.0).to(tl.float32)
+{{ indent }}k_pair = tl.load({{ access_pointer(k_norm, "Input", "k_input", ctx["k"]["paired_input_access"]) }}, mask=mask, other=0.0).to(tl.float32)
+{{ indent }}k_scale_value = tl.load({{ access_pointer(k_norm, "Scale", "k_scale", ctx["k"]["scale_access"]) }}, mask=mask, other=0.0).to(tl.float32)
+{{ indent }}k_pair_scale = tl.load({{ access_pointer(k_norm, "Scale", "k_scale", ctx["k"]["paired_scale_access"]) }}, mask=mask, other=0.0).to(tl.float32)
+{{ indent }}k_bias_value = tl.load({{ access_pointer(k_norm, "Bias", "k_bias", ctx["k"]["bias_access"]) }}, mask=mask, other=0.0).to(tl.float32)
+{{ indent }}k_pair_bias = tl.load({{ access_pointer(k_norm, "Bias", "k_bias", ctx["k"]["paired_bias_access"]) }}, mask=mask, other=0.0).to(tl.float32)
+{{ indent }}k_normalized = ((k_value - k_mean) * k_inv_std * k_scale_value) + k_bias_value
+{{ indent }}k_pair_normalized = ((k_pair - k_mean) * k_inv_std * k_pair_scale) + k_pair_bias
+{{ indent }}k_cos = tl.load({{ access_pointer(k_rope, "Cos", "cos", ctx["k"]["cos_access"]) }}, mask=mask, other=0.0).to(tl.float32)
+{{ indent }}k_sin = tl.load({{ access_pointer(k_rope, "Sin", "sin", ctx["k"]["sin_access"]) }}, mask=mask, other=0.0).to(tl.float32)
+{{ indent }}k_rotated = tl.where({{ ctx["k"]["first_half"] }}, -k_pair_normalized, k_pair_normalized)
+{{ indent }}k_result = k_normalized * k_cos + k_rotated * k_sin
+{{ cache_io.store(k_update, ctx["k"]["cache"], "k_result", "mask", indent) }}
+{% endcall %}
+
+{% call(indent) elementwise.iterate(ctx["v"]) %}
+{{ indent }}v_value = tl.load({{ access_pointer(v_update, "Slots", "v_input", ctx["v"]["slots_access"]) }}, mask=mask, other=0.0)
+{{ cache_io.store(v_update, ctx["v"], "v_value", "mask", indent) }}
+{% endcall %}
+
+
+{{ phases.dispatch(model, args) }}

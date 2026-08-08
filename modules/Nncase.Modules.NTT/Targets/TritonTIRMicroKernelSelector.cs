@@ -1,4 +1,4 @@
-// Copyright (c) Canaan Inc. All rights reserved.
+﻿// Copyright (c) Canaan Inc. All rights reserved.
 // Licensed under the Apache license. See LICENSE file in the project root for full license information.
 
 using System.Collections.Immutable;
@@ -261,7 +261,7 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
         var gemv = m == 1;
         if (gemv)
         {
-            if (TryGetPackedBFloat16GemvPipelineStages(
+            if (TryGetPackedBFloat16GemvPipelineConfiguration(
                     machine,
                     family,
                     lhsType,
@@ -271,10 +271,8 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
                     fixedK,
                     kMajorPacked,
                     simultaneousRhsTileCount,
-                    out var numStages))
+                    out var pipeline))
             {
-                const int pipelineBlockN = 64;
-                const int pipelineBlockK = 128;
                 const int nVector = 8;
                 const int kAtom = 16;
                 var rhsShape = new TensorType(
@@ -282,14 +280,14 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
                     new RankedShape(
                         new[]
                         {
-                            numStages,
-                            (pipelineBlockK / kAtom) * (pipelineBlockN / nVector),
+                            pipeline.NumStages,
+                            (pipeline.BlockK / kAtom) * (pipeline.BlockN / nVector),
                             nVector * kAtom,
                         }));
                 return new(
                     family,
                     "simt_fma_smem_pipeline",
-                    CreateParameters(1, pipelineBlockN, pipelineBlockK, numStages),
+                    CreateParameters(1, pipeline.BlockN, pipeline.BlockK, pipeline.NumStages),
                     ImmutableArray.Create(
                         new TIRSharedWorkspaceDescriptor(
                             "rhs_stage",
@@ -375,7 +373,7 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
             ["num_stages"] = numStages,
         }.ToImmutableDictionary(StringComparer.Ordinal);
 
-    private static bool TryGetPackedBFloat16GemvPipelineStages(
+    private static bool TryGetPackedBFloat16GemvPipelineConfiguration(
         TargetMachineModel machine,
         string family,
         DataType lhsType,
@@ -385,9 +383,9 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
         bool fixedK,
         bool kMajorPacked,
         int simultaneousRhsTileCount,
-        out int numStages)
+        out PackedGemvPipelineConfiguration configuration)
     {
-        numStages = 0;
+        configuration = default;
         if ((family != "triton.matmul" &&
              family != "triton.qkv_parallel_linear" &&
              family != "triton.matmul_glu") ||
@@ -395,7 +393,7 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
             !kMajorPacked ||
             lhsType != DataTypes.BFloat16 ||
             rhsType != DataTypes.BFloat16 ||
-            n < 64 ||
+            n < 8 ||
             !fixedK ||
             k <= 0 ||
             k % 128 != 0 ||
@@ -406,6 +404,8 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
             return false;
         }
 
+        const int blockK = 128;
+        var blockN = GetPackedGemvPipelineBlockN(n);
         var sharedSpace = machine.MemorySpaces.Values.SingleOrDefault(
             space => space.TIRBinding?.Location == MemoryLocation.Shared);
         if (sharedSpace is null)
@@ -413,9 +413,8 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
             return false;
         }
 
-        const long stageElementsPerRhs = 64L * 128;
         const long elementBytes = 2;
-        var stageBytes = checked(stageElementsPerRhs * elementBytes);
+        var stageBytes = checked((long)blockN * blockK * elementBytes);
         for (var candidateStages = 4; candidateStages >= 2; candidateStages--)
         {
             // A physical pipe slot owns one RHS transfer. Fused projections
@@ -430,12 +429,26 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
             if (machine.GetAllocationSizeBytes(sharedSpace, requiredSharedBytes) <=
                 machine.GetMaximumUsableAllocationBytes(sharedSpace))
             {
-                numStages = candidateStages;
+                configuration = new(blockN, blockK, candidateStages);
                 return true;
             }
         }
 
         return false;
+    }
+
+    private static int GetPackedGemvPipelineBlockN(long n)
+    {
+        const int minimumBlockN = 8;
+        const int maximumBlockN = 64;
+        var boundedN = Math.Min(n, maximumBlockN);
+        var blockN = minimumBlockN;
+        while (blockN < boundedN)
+        {
+            blockN *= 2;
+        }
+
+        return blockN;
     }
 
     private static Nncase.TIR.Buffer GetBuffer(
@@ -495,4 +508,9 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
         => dataType is VectorType vectorType
             ? GetScalarDataType(vectorType.ElemType)
             : dataType;
+
+    private readonly record struct PackedGemvPipelineConfiguration(
+        int BlockN,
+        int BlockK,
+        int NumStages);
 }

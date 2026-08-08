@@ -191,7 +191,8 @@ public abstract class TIRSelectionPass : FunctionPass
                         return;
                     case BufferVar { Role: BufferVarRole.Input or BufferVarRole.InOut }:
                         return;
-                    case None when physicalBuffer.Location is MemoryLocation.Data or MemoryLocation.Cache:
+                    case None when physicalBuffer.Location is MemoryLocation.Data or MemoryLocation.Cache ||
+                        (_isEntry && physicalBuffer.Location == MemoryLocation.ChipLocalData):
                         if (!buffer.MemSpan.Start.Simplify().Equals(Dimension.Zero) ||
                             !buffer.MemSpan.Size.Simplify().Equals(physicalBuffer.Size.Simplify()))
                         {

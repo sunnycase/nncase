@@ -201,6 +201,7 @@ def _validate_launch(launch: Any, path: str) -> None:
                 "logical_shape",
                 "logical_strides",
                 "vector_lane_shape",
+                "contiguous_rebase_extent_elements",
             },
         )
         name = _require_string(
@@ -245,6 +246,11 @@ def _validate_launch(launch: Any, path: str) -> None:
         _require_positive_int_list(
             descriptor["vector_lane_shape"],
             f"{descriptor_path}.vector_lane_shape",
+        )
+        _require_int(
+            descriptor["contiguous_rebase_extent_elements"],
+            f"{descriptor_path}.contiguous_rebase_extent_elements",
+            minimum=0,
         )
 
     sharding = _require_exact_object(
@@ -968,6 +974,15 @@ def _k_major_gemv_host_descriptor_spec(
         )
     scalar_lanes_per_logical_element = n_lane * k_pack * k_lane
     contiguous_extent = n_lane * k_lane
+    contiguous_rebase_extent = int(
+        backing["contiguous_rebase_extent_elements"]
+    )
+    descriptor_contiguous_extent = contiguous_extent + contiguous_rebase_extent
+    if descriptor_contiguous_extent > 2**31 - 1:
+        raise ValueError(
+            "PyNTT packed GEMV host descriptor contiguous rebase domain "
+            f"exceeds signed int32 coordinates: {descriptor_contiguous_extent}."
+        )
     return {
         "name": backing["name"],
         "source": backing["source"],
@@ -977,7 +992,7 @@ def _k_major_gemv_host_descriptor_spec(
             logical_shape[0],
             logical_shape[1],
             k_pack,
-            contiguous_extent,
+            descriptor_contiguous_extent,
         ),
         "strides": (
             logical_strides[0] * scalar_lanes_per_logical_element,
@@ -1050,6 +1065,8 @@ def _render_kernel(kernel: dict[str, Any]) -> str:
     helper_sources = _render_helper_sources(
         env,
         kernel.get("helpers", ()),
+        noinline=True,
+        rematerialize_entry_indices=True,
         num_warps=num_warps,
         target_worker_width=target_worker_width,
         producer_warps=backend_config["producer_warps"],
@@ -1262,6 +1279,7 @@ def _render_helper_sources(
     helpers: Any,
     *,
     noinline: bool = False,
+    rematerialize_entry_indices: bool = False,
     num_warps: int | None = None,
     target_worker_width: int | None = None,
     producer_warps: int | None = None,
@@ -1282,6 +1300,9 @@ def _render_helper_sources(
             register_granularity=register_granularity,
             registers_per_thread_limit=registers_per_thread_limit,
             device_functions_by_name=device_functions_by_name,
+        )
+        model["RematerializeEntryIndices"] = bool(
+            rematerialize_entry_indices
         )
         model["Arguments"] = tuple(helper["arguments"])
         model["WorkspaceArguments"] = tuple(helper["workspace_arguments"])
@@ -1305,6 +1326,7 @@ def _prepare_helper_model(
 ) -> dict[str, Any]:
     model = dict(raw_model)
     model["NoInline"] = bool(noinline)
+    model["RematerializeEntryIndices"] = False
     if num_warps is not None:
         model["NumWarps"] = num_warps
     if target_worker_width is not None:
@@ -1500,6 +1522,7 @@ def _make_env() -> Environment:
         packed_qkv_gemv_pipeline_context=_packed_qkv_gemv_pipeline_template_context,
         pointer_shard_hierarchy=_pointer_shard_hierarchy,
         product=_product,
+        qkv_rope_with_cache_context=_qkv_rope_with_cache_template_context,
         qkv_parallel_linear_context=_qkv_parallel_linear_template_context,
         reduce_context=_reduce_template_context,
         ptr=_ptr,
@@ -4095,6 +4118,50 @@ def _matmul_template_context(
     return context
 
 
+def _packed_gemv_consumer_layout(
+    *,
+    block_n: int,
+    reduction_group: int,
+    consumer_warps: int,
+    target_worker_width: int,
+) -> dict[str, tuple[int, int]]:
+    """Derive a warp-local N/K partition that covers one GEMV tile exactly."""
+
+    if (
+        not _is_positive_power_of_two(block_n)
+        or consumer_warps <= 0
+        or block_n % consumer_warps != 0
+    ):
+        raise ValueError(
+            "PyNTT K-major GEMV requires a power-of-two block_n divisible "
+            f"by its consumer warps, got block_n={block_n}, "
+            f"consumer_warps={consumer_warps}."
+        )
+    threads_per_warp_n = block_n // consumer_warps
+    if (
+        threads_per_warp_n <= 0
+        or target_worker_width % threads_per_warp_n != 0
+    ):
+        raise ValueError(
+            "PyNTT K-major GEMV cannot partition a worker across N: "
+            f"worker_width={target_worker_width}, "
+            f"threads_per_warp_n={threads_per_warp_n}."
+        )
+    threads_per_warp_k = target_worker_width // threads_per_warp_n
+    if reduction_group % threads_per_warp_k != 0:
+        raise ValueError(
+            "PyNTT K-major GEMV cannot cover its reduction group exactly: "
+            f"reduction_group={reduction_group}, "
+            f"threads_per_warp_k={threads_per_warp_k}."
+        )
+    k_values_per_thread = reduction_group // threads_per_warp_k
+    return {
+        "size_per_thread": (1, k_values_per_thread),
+        "threads_per_warp": (threads_per_warp_n, threads_per_warp_k),
+        "warps_per_cta": (consumer_warps, 1),
+    }
+
+
 def _packed_gemv_pipeline_template_context(
     model: dict[str, Any],
 ) -> dict[str, Any]:
@@ -4140,6 +4207,11 @@ def _packed_gemv_pipeline_template_context(
         raise ValueError(
             "PyNTT packed GEMV pipeline requires a host RHS descriptor."
         )
+    descriptor_origin_elements = model.get("RhsDescriptorOriginElements")
+    if not isinstance(descriptor_origin_elements, str) or not descriptor_origin_elements:
+        raise ValueError(
+            "PyNTT packed GEMV pipeline requires an RHS descriptor origin."
+        )
     rhs_global_offsets = model.get("RhsGlobalOffsets")
     if not isinstance(rhs_global_offsets, list) or len(rhs_global_offsets) != 2:
         raise ValueError(
@@ -4149,10 +4221,14 @@ def _packed_gemv_pipeline_template_context(
     block_n = context["block_n"]
     block_k = context["block_k"]
     num_stages = context["microkernel"]["parameters"]["num_stages"]
-    if block_n != 64 or block_k != 128 or num_stages != 4:
+    if (
+        block_k != 128
+        or not 8 <= block_n <= 64
+        or not 2 <= num_stages <= 4
+    ):
         raise ValueError(
             "PyNTT packed GEMV pipeline resource contract must be "
-            f"block_n=64, block_k=128, num_stages=4; got "
+            "block_n in [8, 64], block_k=128, num_stages in [2, 4]; got "
             f"{block_n}, {block_k}, {num_stages}."
         )
     n_lane = int(model["RhsNVectorLaneCount"])
@@ -4200,7 +4276,8 @@ def _packed_gemv_pipeline_template_context(
     ):
         raise ValueError(
             "PyNTT K-major GEMV staging requires block_k divisible by "
-            "KPack*KVector and block_n/32 divisible by NVector."
+            "KPack*KVector, and both block_n and the 32-element reduction "
+            "group divisible by NVector."
         )
     packed_k_outer = block_k // k_atom
     packed_n_outer = block_n // n_lane
@@ -4212,40 +4289,12 @@ def _packed_gemv_pipeline_template_context(
         )
     target_worker_width = int(model["TargetWorkerWidth"])
     consumer_warps = int(model["NumWarps"])
-    consumer_k_values_per_thread = 8
-    consumer_threads_per_warp_k = reduction_group // consumer_k_values_per_thread
-    if (
-        reduction_group % consumer_k_values_per_thread != 0
-        or target_worker_width % consumer_threads_per_warp_k != 0
-    ):
-        raise ValueError(
-            "PyNTT K-major GEMV consumer encoding cannot cover its reduction "
-            f"group: reduction_group={reduction_group}, "
-            f"values_per_thread={consumer_k_values_per_thread}, "
-            f"worker_width={target_worker_width}."
-        )
-    consumer_threads_per_warp_n = (
-        target_worker_width // consumer_threads_per_warp_k
+    consumer_layout = _packed_gemv_consumer_layout(
+        block_n=block_n,
+        reduction_group=reduction_group,
+        consumer_warps=consumer_warps,
+        target_worker_width=target_worker_width,
     )
-    if block_n % consumer_threads_per_warp_n != 0:
-        raise ValueError(
-            "PyNTT K-major GEMV consumer encoding cannot cover block_n: "
-            f"block_n={block_n}, "
-            f"threads_per_warp_n={consumer_threads_per_warp_n}."
-        )
-    consumer_warps_n = block_n // consumer_threads_per_warp_n
-    if consumer_warps != consumer_warps_n:
-        raise ValueError(
-            "PyNTT K-major GEMV requires one consumer warp partition per N "
-            f"slice: expected {consumer_warps_n} warps for block_n={block_n}, "
-            f"got {consumer_warps}."
-        )
-    consumer_size_per_thread = (1, consumer_k_values_per_thread)
-    consumer_threads_per_warp = (
-        consumer_threads_per_warp_n,
-        consumer_threads_per_warp_k,
-    )
-    consumer_warps_per_cta = (consumer_warps_n, 1)
     tma_contiguous_extent = n_lane * k_lane
     tma_block_shape = (
         packed_k_outer,
@@ -4267,11 +4316,12 @@ def _packed_gemv_pipeline_template_context(
         "tma_block_shape": tma_block_shape,
         "tma_contiguous_extent": tma_contiguous_extent,
         "rhs_descriptor_name": descriptor_name,
+        "rhs_descriptor_origin_elements": descriptor_origin_elements,
         "rhs_global_k_outer_offset": rhs_global_offsets[-2],
         "rhs_global_n_outer_offset": rhs_global_offsets[-1],
-        "consumer_size_per_thread": consumer_size_per_thread,
-        "consumer_threads_per_warp": consumer_threads_per_warp,
-        "consumer_warps_per_cta": consumer_warps_per_cta,
+        "consumer_size_per_thread": consumer_layout["size_per_thread"],
+        "consumer_threads_per_warp": consumer_layout["threads_per_warp"],
+        "consumer_warps_per_cta": consumer_layout["warps_per_cta"],
         "consumer_weight_layout_name": (
             f"{model['FunctionName']}__weight_layout"
         ),
@@ -4340,10 +4390,14 @@ def _packed_qkv_gemv_pipeline_template_context(
     block_n = microkernel["parameters"]["block_n"]
     block_k = microkernel["parameters"]["block_k"]
     num_stages = microkernel["parameters"]["num_stages"]
-    if block_n != 64 or block_k != 128 or num_stages != 4:
+    if (
+        block_k != 128
+        or not 8 <= block_n <= 64
+        or not 2 <= num_stages <= 4
+    ):
         raise ValueError(
             "PyNTT packed QKV GEMV pipeline resource contract must be "
-            f"block_n=64, block_k=128, num_stages=4; got "
+            "block_n in [8, 64], block_k=128, num_stages in [2, 4]; got "
             f"{block_n}, {block_k}, {num_stages}."
         )
 
@@ -4351,6 +4405,12 @@ def _packed_qkv_gemv_pipeline_template_context(
     k_pack = int(model["KPackLaneCount"])
     k_lane = int(model["KVectorLaneCount"])
     k_atom = k_pack * k_lane
+    if block_n % n_lane != 0 or block_k % k_atom != 0:
+        raise ValueError(
+            "PyNTT packed QKV GEMV pipeline tile is incompatible with its "
+            f"packed lanes: block_n={block_n}, block_k={block_k}, "
+            f"n_lane={n_lane}, k_atom={k_atom}."
+        )
     k = _fixed(context["k"])
     if k is None or k <= 0 or k % block_k != 0:
         raise ValueError(
@@ -4360,11 +4420,19 @@ def _packed_qkv_gemv_pipeline_template_context(
     packed_n_outer = block_n // n_lane
     for prefix in ("Q", "K", "V"):
         descriptor_name = model.get(f"{prefix}WeightDescriptorName")
+        descriptor_origin_elements = model.get(
+            f"{prefix}WeightDescriptorOriginElements"
+        )
         global_offsets = model.get(f"{prefix}WeightGlobalOffsets")
         weight_shape = model[f"{prefix}WeightShape"]
         if not isinstance(descriptor_name, str) or not descriptor_name:
             raise ValueError(
                 f"PyNTT packed QKV GEMV pipeline requires a host {prefix} weight descriptor."
+            )
+        if not isinstance(descriptor_origin_elements, str) or not descriptor_origin_elements:
+            raise ValueError(
+                f"PyNTT packed QKV GEMV pipeline requires a {prefix} "
+                "weight descriptor origin."
             )
         if not isinstance(global_offsets, list) or len(global_offsets) != 2:
             raise ValueError(
@@ -4445,6 +4513,9 @@ def _packed_qkv_gemv_pipeline_template_context(
                 "prefix": prefix,
                 "lower": lower,
                 "descriptor_name": model[f"{prefix}WeightDescriptorName"],
+                "descriptor_origin_elements": model[
+                    f"{prefix}WeightDescriptorOriginElements"
+                ],
                 "descriptor_global_k_outer_offset": model[
                     f"{prefix}WeightGlobalOffsets"
                 ][-2],
@@ -4477,6 +4548,9 @@ def _packed_qkv_gemv_pipeline_template_context(
                     "prefix": prefix,
                     "lower": projection["lower"],
                     "descriptor_name": projection["descriptor_name"],
+                    "descriptor_origin_elements": projection[
+                        "descriptor_origin_elements"
+                    ],
                     "descriptor_global_k_outer_offset": projection[
                         "descriptor_global_k_outer_offset"
                     ],
@@ -4503,19 +4577,14 @@ def _packed_qkv_gemv_pipeline_template_context(
         )
 
     reduction_group = 32
-    consumer_k_values_per_thread = 8
     target_worker_width = int(model["TargetWorkerWidth"])
     consumer_warps = int(model["NumWarps"])
-    consumer_threads_per_warp_k = reduction_group // consumer_k_values_per_thread
-    consumer_threads_per_warp_n = (
-        target_worker_width // consumer_threads_per_warp_k
+    consumer_layout = _packed_gemv_consumer_layout(
+        block_n=block_n,
+        reduction_group=reduction_group,
+        consumer_warps=consumer_warps,
+        target_worker_width=target_worker_width,
     )
-    consumer_warps_n = block_n // consumer_threads_per_warp_n
-    if consumer_warps != consumer_warps_n:
-        raise ValueError(
-            "PyNTT packed QKV GEMV requires one consumer warp partition per N "
-            f"slice: expected {consumer_warps_n}, got {consumer_warps}."
-        )
     context.update(
         block_n=block_n,
         block_k=block_k,
@@ -4535,12 +4604,9 @@ def _packed_qkv_gemv_pipeline_template_context(
             n_lane * k_lane,
         ),
         tma_contiguous_extent=n_lane * k_lane,
-        consumer_size_per_thread=(1, consumer_k_values_per_thread),
-        consumer_threads_per_warp=(
-            consumer_threads_per_warp_n,
-            consumer_threads_per_warp_k,
-        ),
-        consumer_warps_per_cta=(consumer_warps_n, 1),
+        consumer_size_per_thread=consumer_layout["size_per_thread"],
+        consumer_threads_per_warp=consumer_layout["threads_per_warp"],
+        consumer_warps_per_cta=consumer_layout["warps_per_cta"],
         consumer_weight_layout_name=f"{model['FunctionName']}__weight_layout",
         consumer_lhs_layout_name=f"{model['FunctionName']}__lhs_layout",
         consumer_output_layout_name=f"{model['FunctionName']}__output_layout",
@@ -4599,7 +4665,7 @@ def _packed_matmul_glu_gemv_pipeline_template_context(
     num_stages = microkernel["parameters"]["num_stages"]
     projection_count = 2
     if (
-        block_n != 64
+        not 8 <= block_n <= 64
         or block_k != 128
         or not 2 <= num_stages <= 4
         or num_stages % projection_count != 0
@@ -4607,7 +4673,7 @@ def _packed_matmul_glu_gemv_pipeline_template_context(
     ):
         raise ValueError(
             "PyNTT packed MatMulGlu GEMV pipeline resource contract requires "
-            "block_n=64, block_k=128, and at least two complete gate/up "
+            "block_n in [8, 64], block_k=128, and at least two complete gate/up "
             "transfer groups in 2-4 physical stages; got "
             f"{block_n}, {block_k}, {num_stages}."
         )
@@ -4616,6 +4682,12 @@ def _packed_matmul_glu_gemv_pipeline_template_context(
     k_pack = int(model["KPackLaneCount"])
     k_lane = int(model["KVectorLaneCount"])
     k_atom = k_pack * k_lane
+    if block_n % n_lane != 0 or block_k % k_atom != 0:
+        raise ValueError(
+            "PyNTT packed MatMulGlu GEMV pipeline tile is incompatible with "
+            f"its packed lanes: block_n={block_n}, block_k={block_k}, "
+            f"n_lane={n_lane}, k_atom={k_atom}."
+        )
     k = _fixed(context["k"])
     if k is None or k <= 0 or k % block_k != 0:
         raise ValueError(
@@ -4626,12 +4698,20 @@ def _packed_matmul_glu_gemv_pipeline_template_context(
     packed_n_outer = block_n // n_lane
     for prefix in ("Gate", "Up"):
         descriptor_name = model.get(f"{prefix}WeightDescriptorName")
+        descriptor_origin_elements = model.get(
+            f"{prefix}WeightDescriptorOriginElements"
+        )
         global_offsets = model.get(f"{prefix}WeightGlobalOffsets")
         weight_shape = model[f"{prefix}WeightShape"]
         if not isinstance(descriptor_name, str) or not descriptor_name:
             raise ValueError(
                 "PyNTT packed MatMulGlu GEMV pipeline requires a host "
                 f"{prefix.lower()} weight descriptor."
+            )
+        if not isinstance(descriptor_origin_elements, str) or not descriptor_origin_elements:
+            raise ValueError(
+                "PyNTT packed MatMulGlu GEMV pipeline requires a host "
+                f"{prefix.lower()} weight descriptor origin."
             )
         if not isinstance(global_offsets, list) or len(global_offsets) != 2:
             raise ValueError(
@@ -4663,19 +4743,14 @@ def _packed_matmul_glu_gemv_pipeline_template_context(
         )
 
     reduction_group = 32
-    consumer_k_values_per_thread = 8
     target_worker_width = int(model["TargetWorkerWidth"])
     consumer_warps = int(model["NumWarps"])
-    consumer_threads_per_warp_k = reduction_group // consumer_k_values_per_thread
-    consumer_threads_per_warp_n = (
-        target_worker_width // consumer_threads_per_warp_k
+    consumer_layout = _packed_gemv_consumer_layout(
+        block_n=block_n,
+        reduction_group=reduction_group,
+        consumer_warps=consumer_warps,
+        target_worker_width=target_worker_width,
     )
-    consumer_warps_n = block_n // consumer_threads_per_warp_n
-    if consumer_warps != consumer_warps_n:
-        raise ValueError(
-            "PyNTT packed MatMulGlu GEMV requires one consumer warp partition "
-            f"per N slice: expected {consumer_warps_n}, got {consumer_warps}."
-        )
     tma_contiguous_extent = n_lane * k_lane
     tma_block_shape = (
         packed_k_outer,
@@ -4693,6 +4768,9 @@ def _packed_matmul_glu_gemv_pipeline_template_context(
                 "prefix": prefix,
                 "lower": lower,
                 "descriptor_name": model[f"{prefix}WeightDescriptorName"],
+                "descriptor_origin_elements": model[
+                    f"{prefix}WeightDescriptorOriginElements"
+                ],
                 "descriptor_global_k_outer_offset": model[
                     f"{prefix}WeightGlobalOffsets"
                 ][-2],
@@ -4738,12 +4816,9 @@ def _packed_matmul_glu_gemv_pipeline_template_context(
         ),
         tma_block_shape=tma_block_shape,
         tma_contiguous_extent=tma_contiguous_extent,
-        consumer_size_per_thread=(1, consumer_k_values_per_thread),
-        consumer_threads_per_warp=(
-            consumer_threads_per_warp_n,
-            consumer_threads_per_warp_k,
-        ),
-        consumer_warps_per_cta=(consumer_warps_n, 1),
+        consumer_size_per_thread=consumer_layout["size_per_thread"],
+        consumer_threads_per_warp=consumer_layout["threads_per_warp"],
+        consumer_warps_per_cta=consumer_layout["warps_per_cta"],
         consumer_weight_layout_name=f"{model['FunctionName']}__weight_layout",
         consumer_lhs_layout_name=f"{model['FunctionName']}__lhs_layout",
         consumer_output_layout_name=f"{model['FunctionName']}__output_layout",
@@ -5327,6 +5402,115 @@ def _rope_template_context(model: dict[str, Any]) -> dict[str, Any]:
         ),
     )
     return context
+
+
+def _norm_rope_template_context(
+    norm: dict[str, Any], rope: dict[str, Any], context_name: str
+) -> dict[str, Any]:
+    """Compose NormApply addressing into RoPE's coordinate domain."""
+
+    context = _rope_template_context(rope)
+    rank = len(norm["OutputShape"])
+    axis = int(norm["Axis"])
+    if axis < 0 or axis >= rank:
+        raise ValueError(f"{context_name} normalization axis {axis} is outside rank {rank}")
+    if (
+        norm["InputShape"] != rope["InputShape"]
+        or norm["OutputShape"] != rope["OutputShape"]
+        or norm["InputStrides"] != rope["InputStrides"]
+        or norm["OutputStrides"] != rope["OutputStrides"]
+        or norm["InputVectorLaneShape"] != rope["InputVectorLaneShape"]
+        or norm["OutputVectorLaneShape"] != rope["OutputVectorLaneShape"]
+    ):
+        raise ValueError(
+            f"{context_name} NormApply and RoPE must describe the same input/output layout"
+        )
+
+    current = context["input_access"]
+    paired = context["paired_input_access"]
+    lane_shape = tuple(int(value) for value in norm["InputVectorLaneShape"])
+
+    def parameter_access(name: str, source: dict[str, Any]) -> dict[str, Any]:
+        coordinates = tuple(source["TensorIndices"])[axis:]
+        strides = norm[f"{name}Strides"]
+        if len(coordinates) != len(strides):
+            raise ValueError(
+                f"{context_name} {name.lower()} rank does not match the normalized suffix: "
+                f"coordinates={len(coordinates)}, strides={len(strides)}"
+            )
+        return _tensor_access(
+            coordinates,
+            strides,
+            source["LaneIndices"],
+            lane_shape,
+            context["tile_shape"],
+        )
+
+    def stats_access(component: int) -> dict[str, Any]:
+        input_coordinates = tuple(current["TensorIndices"])
+        coordinates = (str(component),) + tuple(
+            input_coordinates[index] if index < axis else "0"
+            for index in range(rank)
+        )
+        return _tensor_access(
+            coordinates,
+            norm["StatsStrides"],
+            coordinate_shape=context["tile_shape"],
+        )
+
+    context.update(
+        {
+            "bias_access": parameter_access("Bias", current),
+            "normalization_size": _product(
+                _logical_shape(
+                    norm["InputGlobalShape"], norm["InputVectorLaneCount"]
+                )[axis:]
+            ),
+            "paired_bias_access": parameter_access("Bias", paired),
+            "paired_scale_access": parameter_access("Scale", paired),
+            "scale_access": parameter_access("Scale", current),
+            "stats_accesses": (stats_access(0), stats_access(1)),
+        }
+    )
+    return context
+
+
+def _qkv_rope_with_cache_template_context(
+    model: dict[str, Any],
+) -> dict[str, Any]:
+    q_context = _norm_rope_template_context(
+        model["QNorm"], model["QRoPE"], "PyNTT QKVRoPEWithCache Q"
+    )
+    k_context = _norm_rope_template_context(
+        model["KNorm"], model["KRoPE"], "PyNTT QKVRoPEWithCache K"
+    )
+    k_cache_context = _update_paged_attention_kv_cache_template_context(
+        model["KUpdate"]
+    )
+    v_cache_context = _update_paged_attention_kv_cache_template_context(
+        model["VUpdate"]
+    )
+    if model["KUpdate"]["Cache"] != model["VUpdate"]["Cache"]:
+        raise ValueError("PyNTT QKVRoPEWithCache K/V updates must use one cache")
+    if model["KUpdate"]["LayerIdExpression"] != model["VUpdate"]["LayerIdExpression"]:
+        raise ValueError("PyNTT QKVRoPEWithCache K/V updates must use one layer id")
+    if model["KUpdate"]["Hierarchy"] != model["VUpdate"]["Hierarchy"]:
+        raise ValueError("PyNTT QKVRoPEWithCache K/V updates must use one hierarchy")
+
+    k_cache_context.update(
+        {
+            "source_dim_block": k_context["output_physical_rotary"],
+            "source_lane_id": _flatten_coordinates(
+                k_context["input_access"]["LaneIndices"],
+                k_context["input_access"]["LaneShape"],
+            ),
+            "source_tensor_coordinates": k_context["input_access"][
+                "TensorIndices"
+            ],
+        }
+    )
+    k_context["cache"] = k_cache_context
+    return {"q": q_context, "k": k_context, "v": v_cache_context}
 
 
 def _gather_template_context(model: dict[str, Any]) -> dict[str, Any]:
@@ -6018,8 +6202,7 @@ def _paged_attention_template_context(model: dict[str, Any]) -> dict[str, Any]:
         "block_offsets", key_dim_axis["rank"], key_dim_axis["rank"] - 1
     )
     key_vector_offset = (
-        f"(cache_block_id * {cache['BlockElements']} + "
-        f"{cache['KeySectionOffset']} + ((layer_id_value) * "
+        f"({cache['KeySectionOffset']} + ((layer_id_value) * "
         f"{cache['KeyLayerStride']} + kv_head * {cache['KeyHeadStride']} + "
         f"({key_dim_axis['physical_coordinate']}) * "
         f"{cache['KeyDimBlockStride']} + ({key_block_offset}) * "
@@ -6050,7 +6233,7 @@ def _paged_attention_template_context(model: dict[str, Any]) -> dict[str, Any]:
             attention_block_size,
             trailing_rank=1,
             physical_base=(
-                f"((context_start % {cache_block_size}) // {value_lane_count})"
+                f"((context_start_i32 % {cache_block_size}) // {value_lane_count})"
             ),
         )
         value_lane = value_axis["lane_coordinates"][0]
@@ -6058,8 +6241,7 @@ def _paged_attention_template_context(model: dict[str, Any]) -> dict[str, Any]:
             "dim_offsets", value_axis["rank"], value_axis["rank"] - 1
         )
         value_vector_offset = (
-            f"(cache_block_id * {cache['BlockElements']} + "
-            f"{cache['ValueSectionOffset']} + ((layer_id_value) * "
+            f"({cache['ValueSectionOffset']} + ((layer_id_value) * "
             f"{cache['ValueLayerStride']} + kv_head * "
             f"{cache['ValueHeadStride']} + ({value_dim_index}) * "
             f"{cache['ValueDimBlockStride']} + "
@@ -6096,8 +6278,7 @@ def _paged_attention_template_context(model: dict[str, Any]) -> dict[str, Any]:
             "block_offsets", value_axis["rank"], 0
         )
         value_vector_offset = (
-            f"(cache_block_id * {cache['BlockElements']} + "
-            f"{cache['ValueSectionOffset']} + ((layer_id_value) * "
+            f"({cache['ValueSectionOffset']} + ((layer_id_value) * "
             f"{cache['ValueLayerStride']} + kv_head * "
             f"{cache['ValueHeadStride']} + "
             f"({value_axis['physical_coordinate']}) * "
@@ -6115,10 +6296,15 @@ def _paged_attention_template_context(model: dict[str, Any]) -> dict[str, Any]:
     global_query_tokens = model["OutputGlobalShape"][model["SeqAxis"]]
     return {
         "attention_block_size": attention_block_size,
-        "cache_block_id": (
-            "(topology_id * num_blocks_per_shard + block_id)"
+        "key_cache_block_id": (
+            "(key_topology_id * num_blocks_per_shard + key_block_id)"
             if cache["IdLength"] > 1
-            else "block_id"
+            else "key_block_id"
+        ),
+        "value_cache_block_id": (
+            "(value_topology_id * num_blocks_per_shard + value_block_id)"
+            if cache["IdLength"] > 1
+            else "value_block_id"
         ),
         "global_q_head": global_index_expression(
             model["HeadAxis"], "q_head", model["GlobalNumQueryHeads"]
@@ -6227,7 +6413,9 @@ def _update_paged_attention_kv_cache_template_context(
                 context["tile_shape"],
             ),
             "slots_lane_count": slots_lane_count,
+            "source_dim_block": f"coord{model['DimAxis']}",
             "source_lane_id": source_lane_id,
+            "source_tensor_coordinates": context["tensor_coordinates"],
             "topology_match_axes": topology_match_axes,
             "vectorized_dim": vectorized_dim,
         }

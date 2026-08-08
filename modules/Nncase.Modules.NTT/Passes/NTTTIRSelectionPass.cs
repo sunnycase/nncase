@@ -224,6 +224,48 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
                         qkv.NumKvHeads);
                 }
 
+            case IR.NN.QKVRoPEWithCache fused:
+                {
+                    if (arguments[IR.NN.QKVRoPEWithCache.QKV.Index] is not IR.Tuple { Count: 3 } qkvInputs)
+                    {
+                        throw new NotSupportedException(
+                            "QKVRoPEWithCache TIR selection expects a tuple of Q, K, and V buffers.");
+                    }
+
+                    var outputBase = Unsafe.As<Expr, BaseExpr>(ref output);
+                    if (outputBase is not IR.Tuple { Count: 2 } outputs)
+                    {
+                        throw new NotSupportedException(
+                            "QKVRoPEWithCache TIR selection expects Q and KV-cache outputs.");
+                    }
+
+                    var qOutput = (Expr)outputs[0];
+                    Unsafe.As<Expr, BaseExpr>(ref output) =
+                        new IR.Tuple(qOutput, (Expr)arguments[IR.NN.QKVRoPEWithCache.KVCaches.Index]);
+                    return TIR.F.NTT.QKVRoPEWithCache(
+                        (Expr)qkvInputs[0],
+                        (Expr)qkvInputs[1],
+                        (Expr)qkvInputs[2],
+                        (Expr)arguments[IR.NN.QKVRoPEWithCache.QStats.Index],
+                        (Expr)arguments[IR.NN.QKVRoPEWithCache.KStats.Index],
+                        (Expr)arguments[IR.NN.QKVRoPEWithCache.QScale.Index],
+                        (Expr)arguments[IR.NN.QKVRoPEWithCache.KScale.Index],
+                        (Expr)arguments[IR.NN.QKVRoPEWithCache.QBias.Index],
+                        (Expr)arguments[IR.NN.QKVRoPEWithCache.KBias.Index],
+                        (Expr)arguments[IR.NN.QKVRoPEWithCache.Cos.Index],
+                        (Expr)arguments[IR.NN.QKVRoPEWithCache.Sin.Index],
+                        (Expr)arguments[IR.NN.QKVRoPEWithCache.KVCaches.Index],
+                        (Dimension)arguments[IR.NN.QKVRoPEWithCache.LayerId.Index],
+                        qOutput,
+                        fused.QAxis,
+                        fused.QEpsilon,
+                        fused.QUseMean,
+                        fused.KAxis,
+                        fused.KEpsilon,
+                        fused.KUseMean,
+                        fused.Layout);
+                }
+
             case IR.NN.MatMulGlu matmulGlu:
                 return TIR.F.NTT.MatMulGlu(
                     (Expr)arguments[0],

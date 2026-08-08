@@ -260,6 +260,47 @@ public partial class NTT
         return KernelCall(new NormApply(axis, epsilon, useMean), input, stats, scale, bias, output);
     }
 
+    public static Expr QKVRoPEWithCache(
+        Expr q,
+        Expr k,
+        Expr v,
+        Expr qStats,
+        Expr kStats,
+        Expr qScale,
+        Expr kScale,
+        Expr qBias,
+        Expr kBias,
+        Expr cos,
+        Expr sin,
+        Expr kvCaches,
+        Dimension layerId,
+        Expr qOutput,
+        int qAxis,
+        float qEpsilon,
+        bool qUseMean,
+        int kAxis,
+        float kEpsilon,
+        bool kUseMean,
+        IRArray<IR.NN.AttentionDimKind> layout)
+    {
+        return KernelCall(
+            new QKVRoPEWithCache(qAxis, qEpsilon, qUseMean, kAxis, kEpsilon, kUseMean, layout),
+            q,
+            k,
+            v,
+            qStats,
+            kStats,
+            qScale,
+            kScale,
+            qBias,
+            kBias,
+            cos,
+            sin,
+            kvCaches,
+            layerId,
+            qOutput);
+    }
+
     public static Expr InstanceNorm(Expr input, Expr scale, Expr bias, Expr output, float epsilon, IRArray<int> vectorizedAxes, IRArray<Dimension> padedNums, DistributedType distributedType)
     {
         return KernelCall(new InstanceNorm(epsilon, vectorizedAxes, padedNums, distributedType), input, scale, bias, output);

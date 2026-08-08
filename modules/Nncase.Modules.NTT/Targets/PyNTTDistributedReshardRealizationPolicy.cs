@@ -1,4 +1,4 @@
-// Copyright (c) Canaan Inc. All rights reserved.
+﻿// Copyright (c) Canaan Inc. All rights reserved.
 // Licensed under the Apache license. See LICENSE file in the project root for full license information.
 
 using Nncase.IR;
@@ -58,7 +58,7 @@ public sealed class PyNTTDistributedReshardRealizationPolicy : IDistributedResha
             return DistributedReshardRealization.ShardedView;
         }
 
-        if (context.UsageKind != DistributedReshardUsageKind.Internal ||
+        if (context.UsageKind is not (DistributedReshardUsageKind.Internal or DistributedReshardUsageKind.ProgramOutput) ||
             context.SourceType is not DistributedType sourceType)
         {
             return DistributedReshardRealization.Boxing;

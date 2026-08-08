@@ -414,6 +414,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
         private readonly List<HelperTemplateRenderSpec> _helpers = new();
         private readonly List<DeviceFunctionRenderSpec> _deviceFunctions = new();
         private readonly List<HostTensorDescriptorBackingMetadata> _hostTensorDescriptors = new();
+        private readonly Dictionary<string, List<int>> _hostTensorDescriptorResourceIndexes = new(StringComparer.Ordinal);
         private readonly List<FormalHostTensorDescriptorRequirement> _formalHostTensorDescriptors = new();
         private readonly List<string> _inputNames;
         private readonly List<string> _opKinds = new();
@@ -1452,137 +1453,140 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 .ToArray();
             switch (expr.Target)
             {
-                    case Nncase.TIR.NTT.TensorLoad:
-                        VisitTensorLoad(args);
-                        break;
-                    case Nncase.TIR.NTT.TensorStore:
-                        VisitTensorStore(args);
-                        break;
-                    case Nncase.TIR.Memcopy:
-                        VisitMemcopy(args);
-                        break;
-                    case Nncase.TIR.NTT.Unary unary:
-                        VisitUnary(unary, args);
-                        break;
-                    case Nncase.TIR.NTT.Erf:
-                        VisitElementwiseUnary(UnaryOp.Erf, "PyNTT Erf", args);
-                        break;
-                    case Nncase.TIR.NTT.Expand:
-                        VisitExpand(args);
-                        break;
-                    case Nncase.TIR.NTT.Gather gather:
-                        VisitGather(gather, args);
-                        break;
-                    case Nncase.TIR.NTT.GatherReduceScatter gatherReduceScatter:
-                        VisitGatherReduceScatter(gatherReduceScatter, args);
-                        break;
-                    case Nncase.TIR.NTT.Pad pad:
-                        VisitPad(pad, args);
-                        break;
-                    case Nncase.TIR.NTT.ScatterND:
-                        VisitScatterND(args);
-                        break;
-                    case Nncase.TIR.NTT.Slice slice:
-                        VisitSlice(slice, args);
-                        break;
-                    case Nncase.TIR.NTT.Swish swish:
-                        VisitSwish(swish, args);
-                        break;
-                    case Nncase.TIR.NTT.VectorizedBinary binary:
-                        VisitVectorizedBinary(binary, args);
-                        break;
-                    case Nncase.TIR.NTT.Pack pack:
-                        VisitPack(pack, args);
-                        break;
-                    case Nncase.TIR.NTT.Unpack unpack:
-                        VisitUnpack(unpack, args);
-                        break;
-                    case Nncase.TIR.NTT.Cast cast:
-                        VisitCast(cast, args);
-                        break;
-                    case Nncase.TIR.NTT.Where:
-                        VisitWhere(args);
-                        break;
-                    case Nncase.TIR.NTT.Clamp clamp:
-                        VisitClamp(clamp, args);
-                        break;
-                    case Nncase.TIR.NTT.Compare compare:
-                        VisitCompare(compare, args);
-                        break;
-                    case Nncase.TIR.NTT.Concat concat:
-                        VisitConcat(concat, args);
-                        break;
-                    case Nncase.TIR.NTT.Conv2D conv2D:
-                        VisitConv2D(conv2D, args);
-                        break;
-                    case Nncase.TIR.NTT.Transpose transpose:
-                        VisitTranspose(transpose, args);
-                        break;
-                    case Nncase.TIR.NTT.Matmul matmul:
-                        VisitMatmul(matmul, args, RequireMicroKernel(microKernel, matmul));
-                        break;
-                    case Nncase.TIR.NTT.PackedMatMul packedMatmul:
-                        VisitPackedMatmul(packedMatmul, args, RequireMicroKernel(microKernel, packedMatmul));
-                        break;
-                    case Nncase.TIR.NTT.QKVParallelLinear qkvParallelLinear:
-                        VisitQKVParallelLinear(qkvParallelLinear, args, RequireMicroKernel(microKernel, qkvParallelLinear));
-                        break;
-                    case Nncase.TIR.NTT.PackedQKVParallelLinear packedQKVParallelLinear:
-                        VisitPackedQKVParallelLinear(packedQKVParallelLinear, args, RequireMicroKernel(microKernel, packedQKVParallelLinear));
-                        break;
-                    case Nncase.TIR.NTT.MatMulGlu matMulGlu:
-                        VisitMatMulGlu(matMulGlu, args, RequireMicroKernel(microKernel, matMulGlu));
-                        break;
-                    case Nncase.TIR.NTT.PackedMatMulGlu packedMatMulGlu:
-                        VisitPackedMatMulGlu(packedMatMulGlu, args, RequireMicroKernel(microKernel, packedMatMulGlu));
-                        break;
-                    case Nncase.TIR.NTT.SUMMA summa:
-                        VisitSUMMA(summa, args, RequireMicroKernel(microKernel, summa));
-                        break;
-                    case Nncase.TIR.NTT.Reduce reduce:
-                        VisitReduce(reduce, args);
-                        break;
-                    case Nncase.TIR.NTT.RoPE:
-                        VisitRoPE(args);
-                        break;
-                    case Nncase.TIR.NTT.GetPositionIds getPositionIds:
-                        VisitGetPositionIds(getPositionIds, args);
-                        break;
-                    case Nncase.TIR.NTT.UpdatePagedAttentionKVCache updatePagedAttentionKVCache:
-                        VisitUpdatePagedAttentionKVCache(updatePagedAttentionKVCache, args);
-                        break;
-                    case Nncase.TIR.NTT.PagedAttention pagedAttention:
-                        VisitPagedAttention(pagedAttention, args);
-                        break;
-                    case Nncase.TIR.NTT.VectorizedLayerNorm layerNorm:
-                        VisitLayerNorm(layerNorm, args);
-                        break;
-                    case Nncase.TIR.NTT.NormStats normStats:
-                        VisitNormStats(normStats, args);
-                        break;
-                    case Nncase.TIR.NTT.NormApply normApply:
-                        VisitNormApply(normApply, args);
-                        break;
-                    case Nncase.TIR.NTT.SynchronizeThreads:
-                        _attrs["requires_grid_barrier"] = true;
-                        WriteBarrier(HelperBarrierKind.Grid);
-                        break;
-                    case Nncase.TIR.NTT.Barrier barrier:
-                        WriteExplicitBarrier(barrier);
-                        break;
-                    case Nncase.TIR.NTT.VectorizedSoftmax softmax:
-                        VisitSoftmax(softmax.Axis, softmax.VectorizedAxes, args, "softmax");
-                        break;
-                    case Nncase.TIR.NTT.Softmax softmax:
-                        VisitSoftmax(softmax.Axis, default, args, "softmax");
-                        break;
-                    case PrimFunction callee:
-                        VisitPrimFunctionCall(callee, args);
-                        break;
-                    case BaseFunction callee:
-                        throw new NotSupportedException($"PyNTT kernel codegen expects direct PrimFunction call targets, got {callee.GetType().Name} {callee.Name}.");
-                    default:
-                        throw new NotSupportedException($"Unsupported PyNTT PrimFunction call target: {expr.Target.GetType().Name}.");
+                case Nncase.TIR.NTT.TensorLoad:
+                    VisitTensorLoad(args);
+                    break;
+                case Nncase.TIR.NTT.TensorStore:
+                    VisitTensorStore(args);
+                    break;
+                case Nncase.TIR.Memcopy:
+                    VisitMemcopy(args);
+                    break;
+                case Nncase.TIR.NTT.Unary unary:
+                    VisitUnary(unary, args);
+                    break;
+                case Nncase.TIR.NTT.Erf:
+                    VisitElementwiseUnary(UnaryOp.Erf, "PyNTT Erf", args);
+                    break;
+                case Nncase.TIR.NTT.Expand:
+                    VisitExpand(args);
+                    break;
+                case Nncase.TIR.NTT.Gather gather:
+                    VisitGather(gather, args);
+                    break;
+                case Nncase.TIR.NTT.GatherReduceScatter gatherReduceScatter:
+                    VisitGatherReduceScatter(gatherReduceScatter, args);
+                    break;
+                case Nncase.TIR.NTT.Pad pad:
+                    VisitPad(pad, args);
+                    break;
+                case Nncase.TIR.NTT.ScatterND:
+                    VisitScatterND(args);
+                    break;
+                case Nncase.TIR.NTT.Slice slice:
+                    VisitSlice(slice, args);
+                    break;
+                case Nncase.TIR.NTT.Swish swish:
+                    VisitSwish(swish, args);
+                    break;
+                case Nncase.TIR.NTT.VectorizedBinary binary:
+                    VisitVectorizedBinary(binary, args);
+                    break;
+                case Nncase.TIR.NTT.Pack pack:
+                    VisitPack(pack, args);
+                    break;
+                case Nncase.TIR.NTT.Unpack unpack:
+                    VisitUnpack(unpack, args);
+                    break;
+                case Nncase.TIR.NTT.Cast cast:
+                    VisitCast(cast, args);
+                    break;
+                case Nncase.TIR.NTT.Where:
+                    VisitWhere(args);
+                    break;
+                case Nncase.TIR.NTT.Clamp clamp:
+                    VisitClamp(clamp, args);
+                    break;
+                case Nncase.TIR.NTT.Compare compare:
+                    VisitCompare(compare, args);
+                    break;
+                case Nncase.TIR.NTT.Concat concat:
+                    VisitConcat(concat, args);
+                    break;
+                case Nncase.TIR.NTT.Conv2D conv2D:
+                    VisitConv2D(conv2D, args);
+                    break;
+                case Nncase.TIR.NTT.Transpose transpose:
+                    VisitTranspose(transpose, args);
+                    break;
+                case Nncase.TIR.NTT.Matmul matmul:
+                    VisitMatmul(matmul, args, RequireMicroKernel(microKernel, matmul));
+                    break;
+                case Nncase.TIR.NTT.PackedMatMul packedMatmul:
+                    VisitPackedMatmul(packedMatmul, args, RequireMicroKernel(microKernel, packedMatmul));
+                    break;
+                case Nncase.TIR.NTT.QKVParallelLinear qkvParallelLinear:
+                    VisitQKVParallelLinear(qkvParallelLinear, args, RequireMicroKernel(microKernel, qkvParallelLinear));
+                    break;
+                case Nncase.TIR.NTT.PackedQKVParallelLinear packedQKVParallelLinear:
+                    VisitPackedQKVParallelLinear(packedQKVParallelLinear, args, RequireMicroKernel(microKernel, packedQKVParallelLinear));
+                    break;
+                case Nncase.TIR.NTT.MatMulGlu matMulGlu:
+                    VisitMatMulGlu(matMulGlu, args, RequireMicroKernel(microKernel, matMulGlu));
+                    break;
+                case Nncase.TIR.NTT.PackedMatMulGlu packedMatMulGlu:
+                    VisitPackedMatMulGlu(packedMatMulGlu, args, RequireMicroKernel(microKernel, packedMatMulGlu));
+                    break;
+                case Nncase.TIR.NTT.SUMMA summa:
+                    VisitSUMMA(summa, args, RequireMicroKernel(microKernel, summa));
+                    break;
+                case Nncase.TIR.NTT.Reduce reduce:
+                    VisitReduce(reduce, args);
+                    break;
+                case Nncase.TIR.NTT.RoPE:
+                    VisitRoPE(args);
+                    break;
+                case Nncase.TIR.NTT.GetPositionIds getPositionIds:
+                    VisitGetPositionIds(getPositionIds, args);
+                    break;
+                case Nncase.TIR.NTT.UpdatePagedAttentionKVCache updatePagedAttentionKVCache:
+                    VisitUpdatePagedAttentionKVCache(updatePagedAttentionKVCache, args);
+                    break;
+                case Nncase.TIR.NTT.QKVRoPEWithCache qkvRoPEWithCache:
+                    VisitQKVRoPEWithCache(qkvRoPEWithCache, args);
+                    break;
+                case Nncase.TIR.NTT.PagedAttention pagedAttention:
+                    VisitPagedAttention(pagedAttention, args);
+                    break;
+                case Nncase.TIR.NTT.VectorizedLayerNorm layerNorm:
+                    VisitLayerNorm(layerNorm, args);
+                    break;
+                case Nncase.TIR.NTT.NormStats normStats:
+                    VisitNormStats(normStats, args);
+                    break;
+                case Nncase.TIR.NTT.NormApply normApply:
+                    VisitNormApply(normApply, args);
+                    break;
+                case Nncase.TIR.NTT.SynchronizeThreads:
+                    _attrs["requires_grid_barrier"] = true;
+                    WriteBarrier(HelperBarrierKind.Grid);
+                    break;
+                case Nncase.TIR.NTT.Barrier barrier:
+                    WriteExplicitBarrier(barrier);
+                    break;
+                case Nncase.TIR.NTT.VectorizedSoftmax softmax:
+                    VisitSoftmax(softmax.Axis, softmax.VectorizedAxes, args, "softmax");
+                    break;
+                case Nncase.TIR.NTT.Softmax softmax:
+                    VisitSoftmax(softmax.Axis, default, args, "softmax");
+                    break;
+                case PrimFunction callee:
+                    VisitPrimFunctionCall(callee, args);
+                    break;
+                case BaseFunction callee:
+                    throw new NotSupportedException($"PyNTT kernel codegen expects direct PrimFunction call targets, got {callee.GetType().Name} {callee.Name}.");
+                default:
+                    throw new NotSupportedException($"Unsupported PyNTT PrimFunction call target: {expr.Target.GetType().Name}.");
             }
 
             return default;
@@ -2714,9 +2718,9 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 var buffer = GetBufferOperand(
                     argument,
                     $"PyNTT call to {callee.Name} host descriptor {descriptor.Name}");
-                values[descriptor.Name] = RegisterHostTensorDescriptor(
-                    buffer,
-                    $"{descriptor.Name}__binding{_hostTensorDescriptors.Count.ToString(CultureInfo.InvariantCulture)}");
+                var binding = RegisterReusableHostTensorDescriptor(buffer, descriptor.Name);
+                values[descriptor.Name] = binding.Name;
+                values[descriptor.OriginElementsName] = binding.OriginElements;
             }
 
             return values;
@@ -4684,15 +4688,15 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             var usesHostRhsDescriptor =
                 microKernel.Family == "triton.matmul" &&
                 microKernel.Variant == "simt_fma_smem_pipeline";
-            var rhsDescriptorName = usesHostRhsDescriptor
+            var rhsDescriptor = usesHostRhsDescriptor
                 ? RegisterHostTensorDescriptor(rhs, $"{helperName}__rhs_descriptor")
                 : null;
             var templateModel = new PyNTTMatmulTemplateModel(
                 helperName,
                 GetBufferScalarPointer(lhs),
-                rhsDescriptorName is null
+                rhsDescriptor is null
                     ? GetBufferScalarPointer(rhs)
-                    : new PyNTTBufferPointerTemplateModel(rhsDescriptorName),
+                    : new PyNTTBufferPointerTemplateModel(rhsDescriptor.Name),
                 GetBufferScalarPointer(output),
                 GetPyNTTScalarDTypeName(lhs.ElemType),
                 GetPyNTTScalarDTypeName(rhs.ElemType),
@@ -4716,7 +4720,8 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 $"{lhs.Name}, {rhs.Name} -> {output.Name}")
             {
                 RhsGlobalOffsets = GetBufferGlobalOffsets(rhs),
-                RhsDescriptorName = rhsDescriptorName,
+                RhsDescriptorName = rhsDescriptor?.Name,
+                RhsDescriptorOriginElements = rhsDescriptor?.OriginElements ?? "0",
                 RhsNPackedLaneCount = nPackedLaneCount,
                 OutputNPackedLaneCount = nPackedLaneCount,
                 RhsLayout = rhsLayout,
@@ -5047,27 +5052,27 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             var usesHostWeightDescriptors =
                 microKernel.Family == "triton.qkv_parallel_linear" &&
                 microKernel.Variant == "simt_fma_smem_pipeline";
-            var qWeightDescriptorName = usesHostWeightDescriptors
+            var qWeightDescriptor = usesHostWeightDescriptors
                 ? RegisterHostTensorDescriptor(qWeight, $"{helperName}__q_weight_descriptor")
                 : null;
-            var kWeightDescriptorName = usesHostWeightDescriptors
+            var kWeightDescriptor = usesHostWeightDescriptors
                 ? RegisterHostTensorDescriptor(kWeight, $"{helperName}__k_weight_descriptor")
                 : null;
-            var vWeightDescriptorName = usesHostWeightDescriptors
+            var vWeightDescriptor = usesHostWeightDescriptors
                 ? RegisterHostTensorDescriptor(vWeight, $"{helperName}__v_weight_descriptor")
                 : null;
             var templateModel = new PyNTTQKVParallelLinearTemplateModel(
                 helperName,
                 GetBufferScalarPointer(input),
-                qWeightDescriptorName is null
+                qWeightDescriptor is null
                     ? GetBufferScalarPointer(qWeight)
-                    : new PyNTTBufferPointerTemplateModel(qWeightDescriptorName),
-                kWeightDescriptorName is null
+                    : new PyNTTBufferPointerTemplateModel(qWeightDescriptor.Name),
+                kWeightDescriptor is null
                     ? GetBufferScalarPointer(kWeight)
-                    : new PyNTTBufferPointerTemplateModel(kWeightDescriptorName),
-                vWeightDescriptorName is null
+                    : new PyNTTBufferPointerTemplateModel(kWeightDescriptor.Name),
+                vWeightDescriptor is null
                     ? GetBufferScalarPointer(vWeight)
-                    : new PyNTTBufferPointerTemplateModel(vWeightDescriptorName),
+                    : new PyNTTBufferPointerTemplateModel(vWeightDescriptor.Name),
                 qBias is null ? new PyNTTBufferPointerTemplateModel("None") : GetBufferScalarPointer(qBias),
                 kBias is null ? new PyNTTBufferPointerTemplateModel("None") : GetBufferScalarPointer(kBias),
                 vBias is null ? new PyNTTBufferPointerTemplateModel("None") : GetBufferScalarPointer(vBias),
@@ -5118,9 +5123,12 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 QWeightGlobalOffsets = GetBufferGlobalOffsets(qWeight),
                 KWeightGlobalOffsets = GetBufferGlobalOffsets(kWeight),
                 VWeightGlobalOffsets = GetBufferGlobalOffsets(vWeight),
-                QWeightDescriptorName = qWeightDescriptorName,
-                KWeightDescriptorName = kWeightDescriptorName,
-                VWeightDescriptorName = vWeightDescriptorName,
+                QWeightDescriptorName = qWeightDescriptor?.Name,
+                QWeightDescriptorOriginElements = qWeightDescriptor?.OriginElements ?? "0",
+                KWeightDescriptorName = kWeightDescriptor?.Name,
+                KWeightDescriptorOriginElements = kWeightDescriptor?.OriginElements ?? "0",
+                VWeightDescriptorName = vWeightDescriptor?.Name,
+                VWeightDescriptorOriginElements = vWeightDescriptor?.OriginElements ?? "0",
             };
 
             WriteSelectedMicroKernelHelper(
@@ -5370,21 +5378,21 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             var usesHostWeightDescriptors =
                 microKernel.Family == "triton.matmul_glu" &&
                 microKernel.Variant == "simt_fma_smem_pipeline";
-            var gateWeightDescriptorName = usesHostWeightDescriptors
+            var gateWeightDescriptor = usesHostWeightDescriptors
                 ? RegisterHostTensorDescriptor(gateWeight, $"{helperName}__gate_weight_descriptor")
                 : null;
-            var upWeightDescriptorName = usesHostWeightDescriptors
+            var upWeightDescriptor = usesHostWeightDescriptors
                 ? RegisterHostTensorDescriptor(upWeight, $"{helperName}__up_weight_descriptor")
                 : null;
             var templateModel = new PyNTTMatMulGluTemplateModel(
                 helperName,
                 GetBufferScalarPointer(input),
-                gateWeightDescriptorName is null
+                gateWeightDescriptor is null
                     ? GetBufferScalarPointer(gateWeight)
-                    : new PyNTTBufferPointerTemplateModel(gateWeightDescriptorName),
-                upWeightDescriptorName is null
+                    : new PyNTTBufferPointerTemplateModel(gateWeightDescriptor.Name),
+                upWeightDescriptor is null
                     ? GetBufferScalarPointer(upWeight)
-                    : new PyNTTBufferPointerTemplateModel(upWeightDescriptorName),
+                    : new PyNTTBufferPointerTemplateModel(upWeightDescriptor.Name),
                 gateBias is null ? new PyNTTBufferPointerTemplateModel("None") : GetBufferScalarPointer(gateBias),
                 upBias is null ? new PyNTTBufferPointerTemplateModel("None") : GetBufferScalarPointer(upBias),
                 GetBufferScalarPointer(output),
@@ -5422,8 +5430,10 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 KVectorLaneCount = kVectorLaneCount,
                 GateWeightGlobalOffsets = GetBufferGlobalOffsets(gateWeight),
                 UpWeightGlobalOffsets = GetBufferGlobalOffsets(upWeight),
-                GateWeightDescriptorName = gateWeightDescriptorName,
-                UpWeightDescriptorName = upWeightDescriptorName,
+                GateWeightDescriptorName = gateWeightDescriptor?.Name,
+                GateWeightDescriptorOriginElements = gateWeightDescriptor?.OriginElements ?? "0",
+                UpWeightDescriptorName = upWeightDescriptor?.Name,
+                UpWeightDescriptorOriginElements = upWeightDescriptor?.OriginElements ?? "0",
             };
 
             WriteSelectedMicroKernelHelper(
@@ -6041,6 +6051,23 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             }
 
             SetComputeOp("rope");
+            var helperName = GetNextHelperName("rope_compute");
+            var templateModel = BuildRoPETemplateModel(helperName, input, cos, sin, output, "PyNTT RoPE");
+            _attrs["op"] = "rope";
+            _attrs["dtype"] = templateModel.OutputDType;
+            _attrs["shape"] = templateModel.OutputShape;
+            WriteHelperTemplate("triton/kernels/RoPE.py.jinja", templateModel);
+            WriteHelperInvocation(helperName);
+        }
+
+        private PyNTTRoPETemplateModel BuildRoPETemplateModel(
+            string helperName,
+            TIR.Buffer input,
+            TIR.Buffer cos,
+            TIR.Buffer sin,
+            TIR.Buffer output,
+            string context)
+        {
             var inputShape = GetBufferShape(input);
             var cosShape = GetBufferShape(cos);
             var sinShape = GetBufferShape(sin);
@@ -6058,55 +6085,48 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             var rotaryAxis = outputShape.Length - 1;
             if (rotaryAxis < 0)
             {
-                throw new NotSupportedException($"PyNTT RoPE requires a non-scalar output, got [{ShapeText(outputShape)}].");
+                throw new NotSupportedException($"{context} requires a non-scalar output, got [{ShapeText(outputShape)}].");
             }
 
-            ValidateRoPEShape("PyNTT RoPE", inputShape, cosShape, sinShape, outputShape, rotaryAxis, outputVectorLaneCount, sinCosVectorPackFactor);
+            ValidateRoPEShape(context, inputShape, cosShape, sinShape, outputShape, rotaryAxis, outputVectorLaneCount, sinCosVectorPackFactor);
             if (GetShardAxis(output) == rotaryAxis || GetShardAxis(input) == rotaryAxis)
             {
-                throw new NotSupportedException("PyNTT RoPE codegen does not support sharding along the rotary dimension yet.");
+                throw new NotSupportedException($"{context} does not support sharding along the rotary dimension yet.");
             }
 
-            _attrs["op"] = "rope";
-            _attrs["dtype"] = GetPyNTTScalarDTypeName(output.ElemType);
-            _attrs["shape"] = outputShape;
-            var helperName = GetNextHelperName("rope_compute");
-            WriteHelperTemplate(
-                "triton/kernels/RoPE.py.jinja",
-                new PyNTTRoPETemplateModel(
-                    helperName,
-                    GetBufferScalarPointer(input),
-                    GetBufferScalarPointer(cos),
-                    GetBufferScalarPointer(sin),
-                    GetBufferScalarPointer(output),
-                    GetPyNTTScalarDTypeName(input.ElemType),
-                    GetPyNTTScalarDTypeName(cos.ElemType),
-                    GetPyNTTScalarDTypeName(sin.ElemType),
-                    GetPyNTTScalarDTypeName(output.ElemType),
-                    GetScalarTritonDType(input.ElemType),
-                    GetScalarTritonDType(cos.ElemType),
-                    GetScalarTritonDType(sin.ElemType),
-                    GetScalarTritonDType(output.ElemType),
-                    inputShape,
-                    cosShape,
-                    sinShape,
-                    outputShape,
-                    GetBufferStrides(input),
-                    GetBufferStrides(cos),
-                    GetBufferStrides(sin),
-                    GetBufferStrides(output),
-                    inputVectorLanes,
-                    cosVectorLanes,
-                    sinVectorLanes,
-                    outputVectorLanes,
-                    inputVectorLaneCount,
-                    cosVectorLaneCount,
-                    sinVectorLaneCount,
-                    outputVectorLaneCount,
-                    sinCosVectorPackFactor,
-                    rotaryAxis,
-                    $"{input.Name} -> {output.Name}"));
-            WriteHelperInvocation(helperName);
+            return new PyNTTRoPETemplateModel(
+                helperName,
+                GetBufferScalarPointer(input),
+                GetBufferScalarPointer(cos),
+                GetBufferScalarPointer(sin),
+                GetBufferScalarPointer(output),
+                GetPyNTTScalarDTypeName(input.ElemType),
+                GetPyNTTScalarDTypeName(cos.ElemType),
+                GetPyNTTScalarDTypeName(sin.ElemType),
+                GetPyNTTScalarDTypeName(output.ElemType),
+                GetScalarTritonDType(input.ElemType),
+                GetScalarTritonDType(cos.ElemType),
+                GetScalarTritonDType(sin.ElemType),
+                GetScalarTritonDType(output.ElemType),
+                inputShape,
+                cosShape,
+                sinShape,
+                outputShape,
+                GetBufferStrides(input),
+                GetBufferStrides(cos),
+                GetBufferStrides(sin),
+                GetBufferStrides(output),
+                inputVectorLanes,
+                cosVectorLanes,
+                sinVectorLanes,
+                outputVectorLanes,
+                inputVectorLaneCount,
+                cosVectorLaneCount,
+                sinVectorLaneCount,
+                outputVectorLaneCount,
+                sinCosVectorPackFactor,
+                rotaryAxis,
+                $"{input.Name} -> {output.Name}");
         }
 
         private void VisitLayerNorm(Nncase.TIR.NTT.VectorizedLayerNorm layerNorm, IReadOnlyList<BaseExpr> args)
@@ -6284,31 +6304,62 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             var bias = GetBufferOperand(args[3], "PyNTT NormApply bias");
             var output = GetBufferOperand(args[4], "PyNTT NormApply output");
             SetComputeOp(normApply.UseMean ? "norm_apply" : "rms_norm_apply");
+            var helperName = GetNextHelperName("norm_apply_compute");
+            var templateModel = BuildNormApplyTemplateModel(
+                helperName,
+                normApply,
+                input,
+                stats,
+                scale,
+                bias,
+                output,
+                "PyNTT NormApply");
+            _attrs["op"] = normApply.UseMean ? "norm_apply" : "rms_norm_apply";
+            _attrs["dtype"] = templateModel.OutputDType;
+            _attrs["shape"] = GetLogicalVectorShape(templateModel.OutputShape, templateModel.OutputVectorLaneCount);
+            _attrs["axis"] = templateModel.Axis;
+            _attrs["epsilon"] = normApply.Epsilon;
+            _attrs["use_mean"] = normApply.UseMean;
+            WriteHelperTemplate("triton/kernels/NormApply.py.jinja", templateModel);
+            WriteHelperInvocation(helperName);
+            MarkStoredOutput(output, "PyNTT NormApply");
+        }
+
+        private PyNTTNormApplyTemplateModel BuildNormApplyTemplateModel(
+            string helperName,
+            Nncase.TIR.NTT.NormApply normApply,
+            TIR.Buffer input,
+            TIR.Buffer stats,
+            TIR.Buffer scale,
+            TIR.Buffer bias,
+            TIR.Buffer output,
+            string context)
+        {
             var inputShape = GetBufferActiveShape(input);
             var inputGlobalShape = GetBufferGlobalShape(input);
             var statsShape = GetBufferActiveShape(stats);
             var scaleShape = GetBufferActiveShape(scale);
             var biasShape = GetBufferActiveShape(bias);
             var outputShape = GetBufferActiveShape(output);
-            var normalizedAxis = NormalizeAxis(normApply.Axis, outputShape.Length, "PyNTT NormApply");
-            var inputVectorLaneCount = GetSingleVectorLaneCount(input.ElemType, "PyNTT NormApply input");
-            var statsVectorLaneCount = GetSingleVectorLaneCount(stats.ElemType, "PyNTT NormApply stats");
-            var scaleVectorLaneCount = GetSingleVectorLaneCount(scale.ElemType, "PyNTT NormApply scale");
-            var biasVectorLaneCount = GetSingleVectorLaneCount(bias.ElemType, "PyNTT NormApply bias");
-            var outputVectorLaneCount = GetSingleVectorLaneCount(output.ElemType, "PyNTT NormApply output");
+            var normalizedAxis = NormalizeAxis(normApply.Axis, outputShape.Length, context);
+            var inputVectorLaneCount = GetSingleVectorLaneCount(input.ElemType, $"{context} input");
+            var statsVectorLaneCount = GetSingleVectorLaneCount(stats.ElemType, $"{context} stats");
+            var scaleVectorLaneCount = GetSingleVectorLaneCount(scale.ElemType, $"{context} scale");
+            var biasVectorLaneCount = GetSingleVectorLaneCount(bias.ElemType, $"{context} bias");
+            var outputVectorLaneCount = GetSingleVectorLaneCount(output.ElemType, $"{context} output");
             if (statsVectorLaneCount != 1)
             {
-                throw new NotSupportedException("PyNTT NormApply expects scalar stats buffer dtype.");
+                throw new NotSupportedException($"{context} expects scalar stats buffer dtype.");
             }
 
             if (new[] { inputVectorLaneCount, scaleVectorLaneCount, biasVectorLaneCount, outputVectorLaneCount }.Distinct().Count() != 1)
             {
-                throw new NotSupportedException($"PyNTT NormApply expects matching input/scale/bias/output vector lanes, got input={inputVectorLaneCount}, scale={scaleVectorLaneCount}, bias={biasVectorLaneCount}, output={outputVectorLaneCount}.");
+                throw new NotSupportedException($"{context} expects matching input/scale/bias/output vector lanes, got input={inputVectorLaneCount}, scale={scaleVectorLaneCount}, bias={biasVectorLaneCount}, output={outputVectorLaneCount}.");
             }
 
             if (inputVectorLaneCount != 1 && normalizedAxis > outputShape.Length - 1)
             {
-                throw new NotSupportedException("PyNTT NormApply vectorized axis must be inside the normalized dimensions.");
+                throw new NotSupportedException($"{context} vectorized axis must be inside the normalized dimensions.");
             }
 
             var logicalInputShape = GetLogicalVectorShape(inputShape, inputVectorLaneCount);
@@ -6316,63 +6367,52 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             var logicalScaleShape = GetLogicalVectorShape(scaleShape, scaleVectorLaneCount);
             var logicalBiasShape = GetLogicalVectorShape(biasShape, biasVectorLaneCount);
             var logicalOutputShape = GetLogicalVectorShape(outputShape, outputVectorLaneCount);
-            ValidateSameShape("PyNTT NormApply", logicalInputShape, logicalOutputShape);
-            ValidateNormStatsShape("PyNTT NormApply stats", logicalOutputShape, logicalStatsShape, normalizedAxis, normApply.UseMean);
-            ValidateLayerNormShape("PyNTT NormApply scale", logicalScaleShape, logicalOutputShape, normalizedAxis);
-            ValidateLayerNormShape("PyNTT NormApply bias", logicalBiasShape, logicalOutputShape, normalizedAxis);
-            _attrs["op"] = normApply.UseMean ? "norm_apply" : "rms_norm_apply";
-            _attrs["dtype"] = GetPyNTTScalarDTypeName(output.ElemType);
-            _attrs["shape"] = logicalOutputShape;
-            _attrs["axis"] = normalizedAxis;
-            _attrs["epsilon"] = normApply.Epsilon;
-            _attrs["use_mean"] = normApply.UseMean;
-            var helperName = GetNextHelperName("norm_apply_compute");
-            WriteHelperTemplate(
-                "triton/kernels/NormApply.py.jinja",
-                new PyNTTNormApplyTemplateModel(
-                    helperName,
-                    GetBufferScalarPointer(input),
-                    GetBufferScalarPointer(stats),
-                    GetBufferScalarPointer(scale),
-                    GetBufferScalarPointer(bias),
-                    GetBufferScalarPointer(output),
-                    GetPyNTTScalarDTypeName(input.ElemType),
-                    GetPyNTTScalarDTypeName(stats.ElemType),
-                    GetPyNTTScalarDTypeName(scale.ElemType),
-                    GetPyNTTScalarDTypeName(bias.ElemType),
-                    GetPyNTTScalarDTypeName(output.ElemType),
-                    GetScalarTritonDType(input.ElemType),
-                    GetScalarTritonDType(stats.ElemType),
-                    GetScalarTritonDType(scale.ElemType),
-                    GetScalarTritonDType(bias.ElemType),
-                    GetScalarTritonDType(output.ElemType),
-                    inputShape,
-                    inputGlobalShape,
-                    statsShape,
-                    scaleShape,
-                    biasShape,
-                    outputShape,
-                    GetBufferStrides(input),
-                    GetBufferStrides(stats),
-                    GetBufferStrides(scale),
-                    GetBufferStrides(bias),
-                    GetBufferStrides(output),
-                    inputVectorLaneCount,
-                    statsVectorLaneCount,
-                    scaleVectorLaneCount,
-                    biasVectorLaneCount,
-                    outputVectorLaneCount,
-                    GetVectorLanes(input.ElemType),
-                    GetVectorLanes(stats.ElemType),
-                    GetVectorLanes(scale.ElemType),
-                    GetVectorLanes(bias.ElemType),
-                    GetVectorLanes(output.ElemType),
-                    normalizedAxis,
-                    normApply.Epsilon,
-                    normApply.UseMean,
-                    $"{input.Name}, {stats.Name}, {scale.Name}, {bias.Name} -> {output.Name}"));
-            WriteHelperInvocation(helperName);
-            MarkStoredOutput(output, "PyNTT NormApply");
+            ValidateSameShape(context, logicalInputShape, logicalOutputShape);
+            ValidateNormStatsShape($"{context} stats", logicalOutputShape, logicalStatsShape, normalizedAxis, normApply.UseMean);
+            ValidateLayerNormShape($"{context} scale", logicalScaleShape, logicalOutputShape, normalizedAxis);
+            ValidateLayerNormShape($"{context} bias", logicalBiasShape, logicalOutputShape, normalizedAxis);
+            return new PyNTTNormApplyTemplateModel(
+                helperName,
+                GetBufferScalarPointer(input),
+                GetBufferScalarPointer(stats),
+                GetBufferScalarPointer(scale),
+                GetBufferScalarPointer(bias),
+                GetBufferScalarPointer(output),
+                GetPyNTTScalarDTypeName(input.ElemType),
+                GetPyNTTScalarDTypeName(stats.ElemType),
+                GetPyNTTScalarDTypeName(scale.ElemType),
+                GetPyNTTScalarDTypeName(bias.ElemType),
+                GetPyNTTScalarDTypeName(output.ElemType),
+                GetScalarTritonDType(input.ElemType),
+                GetScalarTritonDType(stats.ElemType),
+                GetScalarTritonDType(scale.ElemType),
+                GetScalarTritonDType(bias.ElemType),
+                GetScalarTritonDType(output.ElemType),
+                inputShape,
+                inputGlobalShape,
+                statsShape,
+                scaleShape,
+                biasShape,
+                outputShape,
+                GetBufferStrides(input),
+                GetBufferStrides(stats),
+                GetBufferStrides(scale),
+                GetBufferStrides(bias),
+                GetBufferStrides(output),
+                inputVectorLaneCount,
+                statsVectorLaneCount,
+                scaleVectorLaneCount,
+                biasVectorLaneCount,
+                outputVectorLaneCount,
+                GetVectorLanes(input.ElemType),
+                GetVectorLanes(stats.ElemType),
+                GetVectorLanes(scale.ElemType),
+                GetVectorLanes(bias.ElemType),
+                GetVectorLanes(output.ElemType),
+                normalizedAxis,
+                normApply.Epsilon,
+                normApply.UseMean,
+                $"{input.Name}, {stats.Name}, {scale.Name}, {bias.Name} -> {output.Name}");
         }
 
         private void VisitGetPositionIds(Nncase.TIR.NTT.GetPositionIds getPositionIds, IReadOnlyList<BaseExpr> args)
@@ -6420,31 +6460,49 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 throw new NotSupportedException("PyNTT UpdatePagedAttentionKVCache codegen expects slots buffer, kv-cache object, and layer id.");
             }
 
-            var cache = GetPagedAttentionCacheTemplateModel(args[1], "PyNTT UpdatePagedAttentionKVCache");
-            var layerIdExpression = GetDimensionExpression(args[2], "PyNTT UpdatePagedAttentionKVCache layer id").TritonExpression;
+            SetComputeOp("update_paged_attention_kv_cache");
+            var helperName = GetNextHelperName("update_paged_attention_kv_cache");
+            var (templateModel, leadingArguments) = BuildUpdatePagedAttentionKVCacheTemplateModel(
+                helperName,
+                update,
+                slots,
+                args[1],
+                args[2],
+                "PyNTT UpdatePagedAttentionKVCache");
+            _attrs["op"] = "update_paged_attention_kv_cache";
+            _attrs["cache_kind"] = update.CacheKind.ToString();
+            _attrs["layer_id"] = templateModel.LayerIdExpression;
+            WriteHelperTemplate("triton/kernels/UpdatePagedAttentionKVCache.py.jinja", templateModel);
+            WriteLine(BuildHelperCall(helperName, leadingArguments));
+        }
+
+        private (PyNTTUpdatePagedAttentionKVCacheTemplateModel Model, string[] LeadingArguments) BuildUpdatePagedAttentionKVCacheTemplateModel(
+            string helperName,
+            Nncase.TIR.NTT.UpdatePagedAttentionKVCache update,
+            TIR.Buffer slots,
+            BaseExpr kvCaches,
+            BaseExpr layerId,
+            string context)
+        {
+            var cache = GetPagedAttentionCacheTemplateModel(kvCaches, context);
+            var layerIdExpression = GetDimensionExpression(layerId, $"{context} layer id").TritonExpression;
             var storage = GetKVCacheStorageMetadata(cache);
-            var queryStartLocArgument = GetKVCacheFieldArgument(args[1], "query_start_loc");
-            var numSeqsArgument = GetKVCacheFieldArgument(args[1], "num_seqs");
-            var slotMappingArgument = GetKVCacheFieldArgument(args[1], "slot_mapping");
-            var storageArgument = GetKVCacheFieldArgument(args[1], "kv_caches", storage);
-            var storageBlocksArgument = GetKVCacheFieldArgument(args[1], "kv_caches_blocks", storage);
+            var queryStartLocArgument = GetKVCacheFieldArgument(kvCaches, "query_start_loc");
+            var numSeqsArgument = GetKVCacheFieldArgument(kvCaches, "num_seqs");
+            var slotMappingArgument = GetKVCacheFieldArgument(kvCaches, "slot_mapping");
+            var storageArgument = GetKVCacheFieldArgument(kvCaches, "kv_caches", storage);
+            var storageBlocksArgument = GetKVCacheFieldArgument(kvCaches, "kv_caches_blocks", storage);
             var layout = update.Layout.ToArray();
             var seqAxis = Array.IndexOf(layout, AttentionDimKind.Seq);
             var headAxis = Array.IndexOf(layout, AttentionDimKind.Head);
             var dimAxis = Array.IndexOf(layout, AttentionDimKind.Dim);
             if (seqAxis < 0 || headAxis < 0 || dimAxis < 0)
             {
-                throw new NotSupportedException("PyNTT UpdatePagedAttentionKVCache layout must contain Seq, Head, and Dim.");
+                throw new NotSupportedException($"{context} layout must contain Seq, Head, and Dim.");
             }
 
-            SetComputeOp("update_paged_attention_kv_cache");
-            _attrs["op"] = "update_paged_attention_kv_cache";
-            _attrs["cache_kind"] = update.CacheKind.ToString();
-            _attrs["layer_id"] = layerIdExpression;
-            var helperName = GetNextHelperName("update_paged_attention_kv_cache");
             var slotsOperand = GetBufferScalarPointer(slots);
-            WriteHelperTemplate(
-                "triton/kernels/UpdatePagedAttentionKVCache.py.jinja",
+            return (
                 new PyNTTUpdatePagedAttentionKVCacheTemplateModel(
                     helperName,
                     slotsOperand,
@@ -6465,8 +6523,100 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     GetVectorLaneElementCount(slots.ElemType),
                     GetVectorLanes(slots.ElemType),
                     cache,
-                    $"{slots.Name} -> kv-cache"));
-            WriteLine(BuildHelperCall(helperName, slotMappingArgument, storageArgument, storageBlocksArgument, queryStartLocArgument, numSeqsArgument));
+                    $"{slots.Name} -> kv-cache"),
+                [slotMappingArgument, storageArgument, storageBlocksArgument, queryStartLocArgument, numSeqsArgument]);
+        }
+
+        private void VisitQKVRoPEWithCache(Nncase.TIR.NTT.QKVRoPEWithCache fused, IReadOnlyList<BaseExpr> args)
+        {
+            if (args.Count < 14)
+            {
+                throw new NotSupportedException(
+                    "PyNTT QKVRoPEWithCache codegen expects Q/K/V, Q/K stats, Q/K scale/bias, cos/sin, kv-cache, layer id, and Q output operands.");
+            }
+
+            var q = GetBufferOperand(args[0], "PyNTT QKVRoPEWithCache Q");
+            var k = GetBufferOperand(args[1], "PyNTT QKVRoPEWithCache K");
+            var v = GetBufferOperand(args[2], "PyNTT QKVRoPEWithCache V");
+            var qStats = GetBufferOperand(args[3], "PyNTT QKVRoPEWithCache Q stats");
+            var kStats = GetBufferOperand(args[4], "PyNTT QKVRoPEWithCache K stats");
+            var qScale = GetBufferOperand(args[5], "PyNTT QKVRoPEWithCache Q scale");
+            var kScale = GetBufferOperand(args[6], "PyNTT QKVRoPEWithCache K scale");
+            var qBias = GetBufferOperand(args[7], "PyNTT QKVRoPEWithCache Q bias");
+            var kBias = GetBufferOperand(args[8], "PyNTT QKVRoPEWithCache K bias");
+            var cos = GetBufferOperand(args[9], "PyNTT QKVRoPEWithCache cos");
+            var sin = GetBufferOperand(args[10], "PyNTT QKVRoPEWithCache sin");
+            var qOutput = GetBufferOperand(args[13], "PyNTT QKVRoPEWithCache Q output");
+            var helperName = GetNextHelperName("qkv_rope_with_cache");
+            var qNorm = BuildNormApplyTemplateModel(
+                $"{helperName}_q_norm",
+                new Nncase.TIR.NTT.NormApply(fused.QAxis, fused.QEpsilon, fused.QUseMean),
+                q,
+                qStats,
+                qScale,
+                qBias,
+                qOutput,
+                "PyNTT QKVRoPEWithCache Q NormApply");
+            var kNorm = BuildNormApplyTemplateModel(
+                $"{helperName}_k_norm",
+                new Nncase.TIR.NTT.NormApply(fused.KAxis, fused.KEpsilon, fused.KUseMean),
+                k,
+                kStats,
+                kScale,
+                kBias,
+                k,
+                "PyNTT QKVRoPEWithCache K NormApply");
+            var qRoPE = BuildRoPETemplateModel(
+                $"{helperName}_q_rope",
+                q,
+                cos,
+                sin,
+                qOutput,
+                "PyNTT QKVRoPEWithCache Q RoPE");
+            var kRoPE = BuildRoPETemplateModel(
+                $"{helperName}_k_rope",
+                k,
+                cos,
+                sin,
+                k,
+                "PyNTT QKVRoPEWithCache K RoPE");
+            var (kUpdate, kLeadingArguments) = BuildUpdatePagedAttentionKVCacheTemplateModel(
+                $"{helperName}_k_update",
+                new Nncase.TIR.NTT.UpdatePagedAttentionKVCache(AttentionCacheKind.Key, fused.Layout),
+                k,
+                args[11],
+                args[12],
+                "PyNTT QKVRoPEWithCache K update");
+            var (vUpdate, vLeadingArguments) = BuildUpdatePagedAttentionKVCacheTemplateModel(
+                $"{helperName}_v_update",
+                new Nncase.TIR.NTT.UpdatePagedAttentionKVCache(AttentionCacheKind.Value, fused.Layout),
+                v,
+                args[11],
+                args[12],
+                "PyNTT QKVRoPEWithCache V update");
+            if (!kLeadingArguments.SequenceEqual(vLeadingArguments, StringComparer.Ordinal))
+            {
+                throw new InvalidOperationException(
+                    "PyNTT QKVRoPEWithCache K/V updates resolved different kv-cache runtime arguments.");
+            }
+
+            SetComputeOp("qkv_rope_with_cache");
+            _attrs["op"] = "qkv_rope_with_cache";
+            _attrs["dtype"] = qNorm.OutputDType;
+            _attrs["shape"] = GetLogicalVectorShape(qNorm.OutputShape, qNorm.OutputVectorLaneCount);
+            _attrs["layer_id"] = kUpdate.LayerIdExpression;
+            var templateModel = new PyNTTQKVRoPEWithCacheTemplateModel(
+                helperName,
+                qNorm,
+                kNorm,
+                qRoPE,
+                kRoPE,
+                kUpdate,
+                vUpdate,
+                $"{q.Name}, {k.Name}, {v.Name} -> {qOutput.Name}, kv-cache");
+            WriteHelperTemplate("triton/kernels/QKVRoPEWithCache.py.jinja", templateModel);
+            WriteLine(BuildHelperCall(helperName, kLeadingArguments));
+            MarkStoredOutput(qOutput, "PyNTT QKVRoPEWithCache");
         }
 
         private void VisitPagedAttention(Nncase.TIR.NTT.PagedAttention pagedAttention, IReadOnlyList<BaseExpr> args)
@@ -7670,7 +7820,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 bufferRef.AddressSpace);
         }
 
-        private string RegisterHostTensorDescriptor(TIR.Buffer buffer, string name)
+        private HostTensorDescriptorBinding RegisterHostTensorDescriptor(TIR.Buffer buffer, string name)
         {
             if (!ReferenceEquals(_currentFunction, _function))
             {
@@ -7693,17 +7843,89 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 }
 
                 name = SanitizeBoundedPythonIdentifier(name);
+                var originElementsName = SanitizeBoundedPythonIdentifier($"{name}__origin_elements");
                 if (_formalHostTensorDescriptors.Any(descriptor => descriptor.Name == name))
                 {
                     throw new InvalidOperationException(
                         $"PyNTT nested PrimFunction {_currentFunction.Name} contains duplicate formal host tensor descriptor {name}.");
                 }
 
-                _formalHostTensorDescriptors.Add(new(name, parameterIndex));
+                _formalHostTensorDescriptors.Add(new(name, originElementsName, parameterIndex));
                 _extraWorkspaceBaseNames.Add(name);
-                return name;
+                _extraWorkspaceBaseNames.Add(originElementsName);
+                return new(name, originElementsName);
             }
 
+            var descriptor = CreateHostTensorDescriptorBacking(buffer, name);
+            AddHostTensorDescriptorBacking(descriptor);
+            return new(descriptor.Name, "0");
+        }
+
+        private HostTensorDescriptorBinding RegisterReusableHostTensorDescriptor(
+            TIR.Buffer buffer,
+            string resourceKey)
+        {
+            if (!ReferenceEquals(_currentFunction, _function))
+            {
+                throw new InvalidOperationException(
+                    "Reusable host tensor descriptors can only be bound in the owning PrimFunction.");
+            }
+
+            resourceKey = SanitizeBoundedPythonIdentifier(resourceKey);
+            if (!_hostTensorDescriptorResourceIndexes.TryGetValue(resourceKey, out var resourceIndexes))
+            {
+                resourceIndexes = new List<int>();
+                _hostTensorDescriptorResourceIndexes.Add(resourceKey, resourceIndexes);
+            }
+
+            var candidate = CreateHostTensorDescriptorBacking(buffer, resourceKey);
+            var scalarElementSizeBytes = GetScalarElementSizeBytes(buffer.ElemType);
+            foreach (var resourceIndex in resourceIndexes)
+            {
+                var resource = _hostTensorDescriptors[resourceIndex];
+                if (!CanReuseHostTensorDescriptor(resource, candidate) ||
+                    candidate.OffsetBytes < resource.OffsetBytes)
+                {
+                    continue;
+                }
+
+                var deltaBytes = checked(candidate.OffsetBytes - resource.OffsetBytes);
+                if (deltaBytes % scalarElementSizeBytes != 0)
+                {
+                    continue;
+                }
+
+                var originElements = deltaBytes / scalarElementSizeBytes;
+                if (originElements > int.MaxValue)
+                {
+                    continue;
+                }
+
+                if (originElements > resource.ContiguousRebaseExtentElements)
+                {
+                    _hostTensorDescriptors[resourceIndex] = resource with
+                    {
+                        ContiguousRebaseExtentElements = originElements,
+                    };
+                }
+
+                return new(
+                    resource.Name,
+                    originElements.ToString(CultureInfo.InvariantCulture));
+            }
+
+            var resourceName = SanitizeBoundedPythonIdentifier(
+                $"{resourceKey}__resource{resourceIndexes.Count.ToString(CultureInfo.InvariantCulture)}");
+            candidate = candidate with { Name = resourceName };
+            resourceIndexes.Add(_hostTensorDescriptors.Count);
+            AddHostTensorDescriptorBacking(candidate);
+            return new(candidate.Name, "0");
+        }
+
+        private HostTensorDescriptorBackingMetadata CreateHostTensorDescriptorBacking(
+            TIR.Buffer buffer,
+            string name)
+        {
             if (_bufferViewSourceByBuffer.ContainsKey(buffer))
             {
                 throw new NotSupportedException(
@@ -7771,23 +7993,38 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             }
 
             name = SanitizeBoundedPythonIdentifier(name);
-            if (_hostTensorDescriptors.Any(descriptor => descriptor.Name == name))
-            {
-                throw new InvalidOperationException(
-                    $"PyNTT PrimFunction {_function.Name} contains duplicate host tensor descriptor resource {name}.");
-            }
-
-            _hostTensorDescriptors.Add(new(
+            return new(
                 name,
                 source,
                 offsetBytes,
                 GetPyNTTScalarDTypeName(buffer.ElemType),
                 globalShape,
                 logicalStrides,
-                GetVectorLanes(buffer.ElemType)));
-            _extraWorkspaceBaseNames.Add(name);
-            return name;
+                GetVectorLanes(buffer.ElemType),
+                0);
         }
+
+        private void AddHostTensorDescriptorBacking(HostTensorDescriptorBackingMetadata descriptor)
+        {
+            var name = descriptor.Name;
+            if (_hostTensorDescriptors.Any(descriptor => descriptor.Name == name))
+            {
+                throw new InvalidOperationException(
+                    $"PyNTT PrimFunction {_function.Name} contains duplicate host tensor descriptor resource {name}.");
+            }
+
+            _hostTensorDescriptors.Add(descriptor);
+            _extraWorkspaceBaseNames.Add(name);
+        }
+
+        private static bool CanReuseHostTensorDescriptor(
+            HostTensorDescriptorBackingMetadata resource,
+            HostTensorDescriptorBackingMetadata candidate)
+            => resource.Source == candidate.Source &&
+               resource.ScalarDType == candidate.ScalarDType &&
+               resource.LogicalShape.SequenceEqual(candidate.LogicalShape) &&
+               resource.LogicalStrides.SequenceEqual(candidate.LogicalStrides) &&
+               resource.VectorLaneShape.SequenceEqual(candidate.VectorLaneShape);
 
         private PyNTTBufferPointerTemplateModel GetBufferScalarPointer(TIR.Buffer buffer)
         {
@@ -8077,6 +8314,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
         private BufferRef ResolveAbiBufferRef(TIR.Buffer buffer, string baseName, bool registerAbiViewStrideArgs = true)
         {
             var spanOffsetElements = GetBufferSpanOffsetElements(buffer);
+            var spanHasShardOffset = ContainsShardCoordinate(buffer.MemSpan.Start);
             if (buffer.DistributedType is not { })
             {
                 return new(baseName, spanOffsetElements, "0", null, null, false);
@@ -8090,8 +8328,11 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
 
             var localOffsetElements = GetDistributedCompactLocalOffsetElements(buffer);
             var offsetElements = spanOffsetElements;
-            if (!IsZeroOffset(localOffsetElements))
+            if (!spanHasShardOffset && !IsZeroOffset(localOffsetElements))
             {
+                // A shard-dependent MemSpan.Start is already an absolute offset in
+                // canonical backing storage. Only synthesize the compact-shard
+                // offset for ABI buffers whose span starts at a shard-local base.
                 offsetElements = AddOffsetExpressions(offsetElements, $"tl.where({poolStrideElements} == 0, {localOffsetElements}, 0)");
             }
 
@@ -8734,6 +8975,26 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
 
         private static bool RequiresShardCoords(string expression)
             => expression.Contains("shard_coord", StringComparison.Ordinal);
+
+        private static bool ContainsShardCoordinate(BaseExpr expression)
+        {
+            expression = UnwrapInputBoxing(expression);
+            if (expression is DimVar dimVar &&
+                dimVar.Name.StartsWith(ShardCoordDimPrefix, StringComparison.Ordinal))
+            {
+                return true;
+            }
+
+            foreach (var operand in expression.Operands)
+            {
+                if (ContainsShardCoordinate(operand))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
 
         private int[] GetShardCoordHierarchy(TIR.Buffer buffer)
             => buffer.DistributedType is { } distributedType
@@ -11530,7 +11791,12 @@ internal sealed record PipelineDeviceFunctionInterface(
 
 internal sealed record FormalHostTensorDescriptorRequirement(
     string Name,
+    string OriginElementsName,
     int ParameterIndex);
+
+internal sealed record HostTensorDescriptorBinding(
+    string Name,
+    string OriginElements);
 
 internal sealed record DeviceFunctionRenderSpec(
     [property: JsonPropertyName("name")]
@@ -11602,7 +11868,9 @@ internal sealed record HostTensorDescriptorBackingMetadata(
     [property: JsonPropertyName("logical_strides")]
     long[] LogicalStrides,
     [property: JsonPropertyName("vector_lane_shape")]
-    int[] VectorLaneShape);
+    int[] VectorLaneShape,
+    [property: JsonPropertyName("contiguous_rebase_extent_elements")]
+    long ContiguousRebaseExtentElements);
 
 internal sealed record ShardMetadata(
     [property: JsonPropertyName("strategy")]

@@ -1,4 +1,4 @@
-// Copyright (c) Canaan Inc. All rights reserved.
+﻿// Copyright (c) Canaan Inc. All rights reserved.
 // Licensed under the Apache license. See LICENSE file in the project root for full license information.
 
 using Nncase.IR;
@@ -333,7 +333,7 @@ public sealed class LowerWeightPipelineRegionsPass : ModulePass
         {
             AddSharedRange(
                 ranges,
-                MemoryEffectAnalyzer.TryGetAbsoluteByteRange(buffer.MemSpan),
+                MemoryEffectAnalyzer.TryGetAbsoluteAccessByteRange(buffer.MemSpan),
                 buffer.Name,
                 functionName);
         }
@@ -356,7 +356,7 @@ public sealed class LowerWeightPipelineRegionsPass : ModulePass
 
             AddSharedRange(
                 ranges,
-                item.Resource.ByteRange,
+                item.Resource.AccessRange,
                 GetResourceName(item.Resource),
                 functionName);
         }

@@ -1,4 +1,4 @@
-// Copyright (c) Canaan Inc. All rights reserved.
+﻿// Copyright (c) Canaan Inc. All rights reserved.
 // Licensed under the Apache license. See LICENSE file in the project root for full license information.
 
 using System;
@@ -702,6 +702,93 @@ public sealed class UnitTestMemorySynchronization : TestClassBase
     }
 
     [Fact]
+    public async Task TestDynamicSubviewOfDisjointPhysicalAllocationDoesNotRequireChipBarrier()
+    {
+        var shardCoordinate = new DimVar("shard_coordinate") { Metadata = { Range = new(0, 31) } };
+        var producerInput = CreateBufferView(
+            "producer_input",
+            DataTypes.Float32,
+            10240,
+            4096,
+            MemoryLocation.ChipLocalData,
+            0,
+            64,
+            [16]);
+        var consumerOutput = CreateBufferView(
+            "consumer_output",
+            DataTypes.Float32,
+            14336,
+            2048,
+            MemoryLocation.ChipLocalData,
+            shardCoordinate * 64,
+            64,
+            [16]);
+        var intermediate = CreateWorkspaceBuffer("intermediate", DataTypes.Float32, 0, 64, [16]);
+        var main = new PrimFunction(
+            "main",
+            PyNTTTarget.Kind,
+            new Sequential(
+                T.Memcopy(intermediate, producerInput),
+                T.Memcopy(consumerOutput, intermediate)),
+            Array.Empty<IVar>());
+        var module = new IRModule(main);
+
+        await new PlanMemorySynchronizationPass(
+            PyNTTTarget.Kind,
+            MemorySynchronizationScopes.All).RunAsync(module, new());
+
+        var rewrittenMain = Assert.IsType<PrimFunction>(module.Entry);
+        Assert.Collection(
+            rewrittenMain.Body.Fields.ToArray(),
+            field => Assert.IsType<Memcopy>(Assert.IsType<Call>(field).Target),
+            field => Assert.Equal(
+                TIR.NTT.BarrierScope.Block,
+                Assert.IsType<TIR.NTT.Barrier>(Assert.IsType<Call>(field).Target).Scope),
+            field => Assert.IsType<Memcopy>(Assert.IsType<Call>(field).Target));
+    }
+
+    [Fact]
+    public async Task TestDynamicSubviewOfSamePhysicalAllocationRemainsConservativelyAliased()
+    {
+        var shardCoordinate = new DimVar("shard_coordinate") { Metadata = { Range = new(0, 31) } };
+        var physical = new PhysicalBuffer(
+            DataTypes.Float32.SizeInBytes,
+            Tensor.FromPointer(10240, DataTypes.Float32),
+            4096,
+            MemoryLocation.ChipLocalData);
+        var producerInput = CreateBufferView("producer_input", DataTypes.Float32, physical, 0, 64, [16]);
+        var consumerOutput = CreateBufferView(
+            "consumer_output",
+            DataTypes.Float32,
+            physical,
+            shardCoordinate * 64,
+            64,
+            [16]);
+        var intermediate = CreateWorkspaceBuffer("intermediate", DataTypes.Float32, 0, 64, [16]);
+        var main = new PrimFunction(
+            "main",
+            PyNTTTarget.Kind,
+            new Sequential(
+                T.Memcopy(intermediate, producerInput),
+                T.Memcopy(consumerOutput, intermediate)),
+            Array.Empty<IVar>());
+        var module = new IRModule(main);
+
+        await new PlanMemorySynchronizationPass(
+            PyNTTTarget.Kind,
+            MemorySynchronizationScopes.All).RunAsync(module, new());
+
+        var rewrittenMain = Assert.IsType<PrimFunction>(module.Entry);
+        Assert.Collection(
+            rewrittenMain.Body.Fields.ToArray(),
+            field => Assert.IsType<Memcopy>(Assert.IsType<Call>(field).Target),
+            field => Assert.Equal(
+                TIR.NTT.BarrierScope.Chip,
+                Assert.IsType<TIR.NTT.Barrier>(Assert.IsType<Call>(field).Target).Scope),
+            field => Assert.IsType<Memcopy>(Assert.IsType<Call>(field).Target));
+    }
+
+    [Fact]
     public async Task TestReductionLoopProtectsReusedBlockLocalStagingBuffer()
     {
         var source = CreateWorkspaceBuffer("source", DataTypes.Float32, 0, 256, [64]);
@@ -946,16 +1033,46 @@ public sealed class UnitTestMemorySynchronization : TestClassBase
         ulong offset,
         long sizeBytes,
         Dimension[] shape)
+        => CreateBufferView(
+            name,
+            dataType,
+            offset,
+            sizeBytes,
+            MemoryLocation.Data,
+            0,
+            sizeBytes,
+            shape);
+
+    private static Nncase.TIR.Buffer CreateBufferView(
+        string name,
+        DataType dataType,
+        ulong allocationOffset,
+        long allocationSizeBytes,
+        MemoryLocation location,
+        Dimension spanStart,
+        Dimension spanSize,
+        Dimension[] shape)
     {
         var physical = new PhysicalBuffer(
             dataType.SizeInBytes,
-            Tensor.FromPointer(offset, dataType),
-            sizeBytes,
-            MemoryLocation.Data);
+            Tensor.FromPointer(allocationOffset, dataType),
+            allocationSizeBytes,
+            location);
+        return CreateBufferView(name, dataType, physical, spanStart, spanSize, shape);
+    }
+
+    private static Nncase.TIR.Buffer CreateBufferView(
+        string name,
+        DataType dataType,
+        PhysicalBuffer physical,
+        Dimension spanStart,
+        Dimension spanSize,
+        Dimension[] shape)
+    {
         return new Nncase.TIR.Buffer(
             name,
             dataType,
-            new MemSpan(physical, 0, sizeBytes),
+            new MemSpan(physical, spanStart, spanSize),
             shape,
             TensorUtilities.GetDefaultStrides(shape).Select(stride => (Dimension)stride).ToArray(),
             null);

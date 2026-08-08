@@ -42,6 +42,39 @@ public static class NN
 
     public static Call NormApply(int axis, float epsilon, Expr input, Expr stats, Expr scale, Expr bias, bool useMean) => new Call(new NormApply(axis, epsilon, useMean), input, stats, scale, bias);
 
+    public static Call QKVRoPEWithCache(
+        BaseExpr qkv,
+        Expr qStats,
+        Expr kStats,
+        Expr qScale,
+        Expr kScale,
+        Expr qBias,
+        Expr kBias,
+        Expr cos,
+        Expr sin,
+        Expr kvCaches,
+        Dimension layerId,
+        int qAxis,
+        float qEpsilon,
+        bool qUseMean,
+        int kAxis,
+        float kEpsilon,
+        bool kUseMean,
+        IRArray<AttentionDimKind> layout) =>
+        new Call(
+            new QKVRoPEWithCache(qAxis, qEpsilon, qUseMean, kAxis, kEpsilon, kUseMean, layout),
+            qkv,
+            qStats,
+            kStats,
+            qScale,
+            kScale,
+            qBias,
+            kBias,
+            cos,
+            sin,
+            kvCaches,
+            layerId);
+
     public static Call BatchToSpace(Expr input, Shape blockShape, Paddings crops) => new Call(new BatchToSpace(), input, blockShape, crops);
 
     public static Call InstanceNormalization(Expr input, Expr scale, Expr bias, Expr eps) => new Call(new InstanceNormalization(), input, scale, bias, eps);

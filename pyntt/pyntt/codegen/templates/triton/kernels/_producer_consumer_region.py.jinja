@@ -26,7 +26,7 @@ def {{ model["ProducerFunctionName"] }}(
 {% endif %}
 
 
-{{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
+@triton.jit
 def {{ model["FunctionName"] }}({{ helper_parameters(model) }}):
 {% for stage in model["Stages"] %}
 {% import stage["Template"] as algorithm %}

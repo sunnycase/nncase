@@ -1,4 +1,6 @@
+{% import "triton/kernels/_common.py.jinja" as common with context %}
 {% import "triton/kernels/_elementwise.py.jinja" as elementwise with context %}
+{% import "triton/kernels/_paged_attention_kv_cache.py.jinja" as cache_io with context %}
 {% import "triton/kernels/_producer_consumer.py.jinja" as phases with context %}
 {% set ctx = update_paged_attention_kv_cache_context(model) %}
 {% set cache = model["Cache"] %}
@@ -8,61 +10,12 @@
 {{ phases.consumer_header(model, args) }}
     shard_index = tl.program_id(0).to(tl.int64)
     layer_id_value = (tl.full((), 0, tl.int64) + ({{ model["LayerIdExpression"] }})).to(tl.int64)
-    tmp_shard_coord = shard_index
-{% for axis in reverse_indices(model["Hierarchy"]) %}
-    shard_coord{{ axis }} = tmp_shard_coord % {{ model["Hierarchy"][axis] }}
-    tmp_shard_coord = tmp_shard_coord // {{ model["Hierarchy"][axis] }}
-{% endfor %}
+{{ common.hierarchy_coordinates(model["Hierarchy"]) }}
     num_tokens = tl.load(query_start_loc + num_seqs).to(tl.int64)
 
 {% call(indent) elementwise.iterate(ctx) %}
-{{ indent }}source_lane_id = {{ ctx["source_lane_id"] }}
-{{ indent }}source_dim_block = coord{{ model["DimAxis"] }}
-{{ indent }}head_id = coord{{ model["HeadAxis"] }}
-{{ indent }}token_id = coord{{ model["SeqAxis"] }}
-{% for axis in ctx["non_data_axes"] %}
-{{ indent }}global_idx{{ axis }} = coord{{ axis }} + {{ dim(model["SlotsGlobalOffsets"][axis]) }}
-{% endfor %}
-{{ indent }}global_token_id = token_id + {{ dim(model["SlotsGlobalOffsets"][model["SeqAxis"]]) }}
-{{ indent }}global_head_id = head_id + {{ dim(model["SlotsGlobalOffsets"][model["HeadAxis"]]) }}
-{{ indent }}global_source_dim_block = source_dim_block + {{ dim(model["SlotsGlobalOffsets"][model["DimAxis"]]) }}
-{% if ctx["slots_lane_count"] == 1 %}
-{{ indent }}logical_dim = global_source_dim_block
-{% else %}
-{{ indent }}logical_dim = global_source_dim_block * {{ ctx["slots_lane_count"] }} + source_lane_id
-{% endif %}
-{{ indent }}cache_head_id = global_head_id
-{{ indent }}active = mask & (global_token_id < num_tokens) & (cache_head_id < {{ cache["NumKVHeads"] }}) & (logical_dim < {{ cache["HeadDim"] }})
-{% if cache["IdLength"] > 1 %}
-{{ indent }}topology_id = tl.load(slot_mapping + global_token_id * {{ cache["IdLength"] }}, mask=active, other=0)
-{{ indent }}tmp_topology = topology_id
-{% for axis in cache["NumBlocksSplitAxes"] | reverse %}
-{{ indent }}topology_coord{{ axis }} = tmp_topology % {{ model["Hierarchy"][axis] }}
-{{ indent }}tmp_topology = tmp_topology // {{ model["Hierarchy"][axis] }}
-{% endfor %}
-{% for axis in ctx["topology_match_axes"] %}
-{{ indent }}active = active & (topology_coord{{ axis }} == shard_coord{{ axis }})
-{% endfor %}
-{% endif %}
-{{ indent }}slot_id = tl.load(slot_mapping + global_token_id * {{ cache["IdLength"] }} + {{ cache["IdLength"] - 1 }}, mask=active, other=0)
-{{ indent }}block_id = slot_id // {{ cache["BlockSize"] }}
-{{ indent }}block_offset = slot_id % {{ cache["BlockSize"] }}
-{% if ctx["vectorized_dim"] == 5 %}
-{{ indent }}cache_dim_block = logical_dim // {{ ctx["lane_count"] }}
-{{ indent }}cache_block_offset = block_offset
-{{ indent }}cache_lane_id = logical_dim % {{ ctx["lane_count"] }}
-{% elif ctx["vectorized_dim"] == 3 %}
-{{ indent }}cache_dim_block = logical_dim
-{{ indent }}cache_block_offset = block_offset // {{ ctx["lane_count"] }}
-{{ indent }}cache_lane_id = block_offset % {{ ctx["lane_count"] }}
-{% else %}
-{{ indent }}cache_dim_block = logical_dim
-{{ indent }}cache_block_offset = block_offset
-{{ indent }}cache_lane_id = 0
-{% endif %}
-{{ indent }}cache_offsets = {{ ctx["cache_offset"] }}
-{{ indent }}value = tl.load({{ access_pointer(model, "Slots", ptr(model, "Slots"), ctx["slots_access"]) }}, mask=active, other=0.0)
-{{ indent }}tl.store(kv_cache + cache_offsets, value, mask=active)
+{{ indent }}value = tl.load({{ access_pointer(model, "Slots", ptr(model, "Slots"), ctx["slots_access"]) }}, mask=mask, other=0.0)
+{{ cache_io.store(model, ctx, "value", "mask", indent) }}
 {% endcall %}
 
 

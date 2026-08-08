@@ -44,7 +44,7 @@
 )
 
 
-@triton.jit
+{{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
 def {{ model["FunctionName"] }}__producer(writer, {{ helper_parameters(model) }}):
     shard_index = tl.program_id(0).to(tl.int64)
     active_n = {{ dim(ctx["n"]) }}
@@ -71,7 +71,7 @@ def {{ model["FunctionName"] }}__producer(writer, {{ helper_parameters(model) }}
                     descriptor_k,
                     descriptor_n,
                     0,
-                    0,
+                    {{ ctx["rhs_descriptor_origin_elements"] }},
                 ],
                 eviction_policy="evict_first",
             )
@@ -81,15 +81,20 @@ def {{ model["FunctionName"] }}__producer(writer, {{ helper_parameters(model) }}
     )
 
 
-@triton.jit
+{{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
 def {{ model["FunctionName"] }}__consumer(reader, {{ helper_parameters(model) }}):
     shard_index = tl.program_id(0).to(tl.int64)
 {{ common.shard_coordinates([model["Lhs"], model["Output"]]) }}
     lhs = {{ ptr(model, "Lhs") }}
     output = {{ ptr(model, "Output") }}
+{% if model["RematerializeEntryIndices"] %}
+    local_n_source = tle.gpu.rematerialize_index(tl.arange(0, {{ ctx["block_n"] }}))
+{% else %}
+    local_n_source = tl.arange(0, {{ ctx["block_n"] }})
+{% endif %}
     local_n = tle.encoding(
         tle.encoding(
-            tl.arange(0, {{ ctx["block_n"] }}),
+            local_n_source,
             {{ ctx["consumer_output_layout_name"] }},
         )[:, None],
         {{ ctx["consumer_weight_layout_name"] }},

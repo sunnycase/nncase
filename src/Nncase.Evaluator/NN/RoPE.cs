@@ -36,33 +36,23 @@ public class RoPEEvaluator : IEvaluator<RoPE>, ITypeInferencer<RoPE>, ICostEvalu
         return true;
     }
 
+    public static IRType InferType(IRType input, IRType cos, IRType sin)
+    {
+        return (input, cos, sin) switch
+        {
+            (DistributedType a, DistributedType b, DistributedType c) => Visit(a, b, c),
+            (TensorType a, TensorType, TensorType) => Visit(a),
+            _ => new InvalidType(input.GetType().ToString()),
+        };
+    }
+
     /// <inheritdoc/>
     public IValue Visit(IEvaluateContext context, RoPE target)
     {
         var inputTensor = context.GetArgumentValueAsTensor(target, RoPE.Input);
         var cosTensor = context.GetArgumentValueAsTensor(target, RoPE.Cos);
         var sinTensor = context.GetArgumentValueAsTensor(target, RoPE.Sin);
-
-        var originDtype = inputTensor.ElementType;
-        var computeDtype = originDtype.IsFloat() && originDtype != DataTypes.Float32
-            ? DataTypes.Float32
-            : originDtype;
-        inputTensor = inputTensor.CastElementTo(computeDtype);
-        cosTensor = cosTensor.CastElementTo(DataTypes.Float32);
-        sinTensor = sinTensor.CastElementTo(DataTypes.Float32);
-
-        var input = inputTensor.ToOrtTensor();
-        var cos = cosTensor.ToOrtTensor();
-        var sin = sinTensor.ToOrtTensor();
-
-        var sliceAxis = inputTensor.Dimensions.Length - 1;
-        var sliceDim = inputTensor.Dimensions[sliceAxis] / 2;
-        var parts = OrtKI.Split(input, new[] { sliceDim, sliceDim }, sliceAxis);
-
-        // rotate half
-        var rotated = OrtKI.Concat([OrtKI.Neg(parts[1]), parts[0]], sliceAxis);
-        var output = OrtKI.Add(OrtKI.Mul(input, cos), OrtKI.Mul(rotated, sin)).ToTensor(computeDtype);
-        return Value.FromTensor(output.CastElementTo(originDtype));
+        return Value.FromTensor(Evaluate(inputTensor, cosTensor, sinTensor));
     }
 
     /// <inheritdoc/>
@@ -72,12 +62,7 @@ public class RoPEEvaluator : IEvaluator<RoPE>, ITypeInferencer<RoPE>, ICostEvalu
         var cos = context.CheckArgumentType<IRType>(target, RoPE.Cos);
         var sin = context.CheckArgumentType<IRType>(target, RoPE.Sin);
 
-        return (input, cos, sin) switch
-        {
-            (DistributedType a, DistributedType b, DistributedType c) => Visit(a, b, c),
-            (TensorType a, TensorType, TensorType) => Visit(a),
-            _ => new InvalidType(input.GetType().ToString()),
-        };
+        return InferType(input, cos, sin);
     }
 
     /// <inheritdoc/>
@@ -111,12 +96,36 @@ public class RoPEEvaluator : IEvaluator<RoPE>, ITypeInferencer<RoPE>, ICostEvalu
         };
     }
 
-    private IRType Visit(TensorType input)
+    internal static Tensor Evaluate(Tensor inputTensor, Tensor cosTensor, Tensor sinTensor)
+    {
+        var originDtype = inputTensor.ElementType;
+        var computeDtype = originDtype.IsFloat() && originDtype != DataTypes.Float32
+            ? DataTypes.Float32
+            : originDtype;
+        inputTensor = inputTensor.CastElementTo(computeDtype);
+        cosTensor = cosTensor.CastElementTo(DataTypes.Float32);
+        sinTensor = sinTensor.CastElementTo(DataTypes.Float32);
+
+        var input = inputTensor.ToOrtTensor();
+        var cos = cosTensor.ToOrtTensor();
+        var sin = sinTensor.ToOrtTensor();
+
+        var sliceAxis = inputTensor.Dimensions.Length - 1;
+        var sliceDim = inputTensor.Dimensions[sliceAxis] / 2;
+        var parts = OrtKI.Split(input, new[] { sliceDim, sliceDim }, sliceAxis);
+
+        // rotate half
+        var rotated = OrtKI.Concat([OrtKI.Neg(parts[1]), parts[0]], sliceAxis);
+        var output = OrtKI.Add(OrtKI.Mul(input, cos), OrtKI.Mul(rotated, sin)).ToTensor(computeDtype);
+        return output.CastElementTo(originDtype);
+    }
+
+    private static IRType Visit(TensorType input)
     {
         return input;
     }
 
-    private IRType Visit(DistributedType input, DistributedType scale, DistributedType bias)
+    private static IRType Visit(DistributedType input, DistributedType scale, DistributedType bias)
     {
         // only unsupported print without to-string
         if (input.Placement != scale.Placement || scale.Placement != bias.Placement

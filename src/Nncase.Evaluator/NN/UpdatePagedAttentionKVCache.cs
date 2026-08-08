@@ -15,17 +15,22 @@ namespace Nncase.Evaluator.NN;
 
 public sealed class UpdatePagedAttentionKVCacheEvaluator : ITypeInferencer<UpdatePagedAttentionKVCache>, ICostEvaluator<UpdatePagedAttentionKVCache>, IEvaluator<UpdatePagedAttentionKVCache>
 {
+    public static IRType InferType(UpdatePagedAttentionKVCache target, IRType slots, IRType kvCache)
+    {
+        return slots switch
+        {
+            DistributedType dslots => Visit(target, dslots, kvCache),
+            TensorType tslots => Visit(target, tslots, kvCache),
+            _ => new InvalidType("not support type"),
+        };
+    }
+
     public IRType Visit(ITypeInferenceContext context, UpdatePagedAttentionKVCache target)
     {
         var slots = context.CheckArgumentType<IRType>(target, UpdatePagedAttentionKVCache.Slots);
         var kvCache = context.CheckArgumentType<IRType>(target, UpdatePagedAttentionKVCache.KVCaches);
         _ = context.CheckArgumentType<DimensionType>(target, UpdatePagedAttentionKVCache.LayerId);
-        return slots switch
-        {
-            DistributedType dslots => Visit(context, target, dslots, kvCache),
-            TensorType tslots => Visit(context, target, tslots, kvCache),
-            _ => new InvalidType("not support type"),
-        };
+        return InferType(target, slots, kvCache);
     }
 
     public Cost Visit(ICostEvaluateContext context, UpdatePagedAttentionKVCache target)
@@ -47,7 +52,7 @@ public sealed class UpdatePagedAttentionKVCacheEvaluator : ITypeInferencer<Updat
         return kvCaches;
     }
 
-    private static void UpdateCache(Tensor slots, Tensor<Reference<IPagedAttentionKVCache>> kvCaches, AttentionCacheKind cacheKind, int layerId, IRArray<AttentionDimKind> layout)
+    internal static void UpdateCache(Tensor slots, Tensor<Reference<IPagedAttentionKVCache>> kvCaches, AttentionCacheKind cacheKind, int layerId, IRArray<AttentionDimKind> layout)
     {
         // TODO: Support DP
         if (kvCaches.Length != 1)
@@ -94,12 +99,12 @@ public sealed class UpdatePagedAttentionKVCacheEvaluator : ITypeInferencer<Updat
         }
     }
 
-    private IRType Visit(ITypeInferenceContext context, UpdatePagedAttentionKVCache target, TensorType slots, IRType kvCache)
+    private static IRType Visit(UpdatePagedAttentionKVCache target, TensorType slots, IRType kvCache)
     {
         return kvCache;
     }
 
-    private IRType Visit(ITypeInferenceContext context, UpdatePagedAttentionKVCache target, DistributedType slots, IRType kvCache)
+    private static IRType Visit(UpdatePagedAttentionKVCache target, DistributedType slots, IRType kvCache)
     {
         // for xpu.
         if (slots.Placement.Name == "cdyxb")

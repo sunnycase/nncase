@@ -44,7 +44,7 @@
 )
 
 
-@triton.jit
+{{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
 def {{ model["FunctionName"] }}__producer(writer, {{ helper_parameters(model) }}):
     shard_index = tl.program_id(0).to(tl.int64)
     active_n = {{ dim(ctx["n"]) }}
@@ -76,7 +76,7 @@ def {{ model["FunctionName"] }}__producer(writer, {{ helper_parameters(model) }}
                     {{ projection["lower"] }}_descriptor_k,
                     {{ projection["lower"] }}_descriptor_n,
                     0,
-                    0,
+                    {{ projection["descriptor_origin_elements"] }},
                 ],
                 eviction_policy="evict_last",
             )
@@ -91,7 +91,7 @@ def {{ model["FunctionName"] }}__producer(writer, {{ helper_parameters(model) }}
     )
 
 
-@triton.jit
+{{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
 def {{ model["FunctionName"] }}__consumer(reader, {{ helper_parameters(model) }}):
     shard_index = tl.program_id(0).to(tl.int64)
 {% set pointer_keys = namespace(values=[model["Input"], model["Output"]]) %}
@@ -106,9 +106,14 @@ def {{ model["FunctionName"] }}__consumer(reader, {{ helper_parameters(model) }}
     {{ prefix | lower }}_bias = {{ ptr(model, prefix ~ "Bias") }}
 {% endif %}
 {% endfor %}
+{% if model["RematerializeEntryIndices"] %}
+    local_n_source = tle.gpu.rematerialize_index(tl.arange(0, {{ ctx["block_n"] }}))
+{% else %}
+    local_n_source = tl.arange(0, {{ ctx["block_n"] }})
+{% endif %}
     local_n = tle.encoding(
         tle.encoding(
-            tl.arange(0, {{ ctx["block_n"] }}),
+            local_n_source,
             {{ ctx["consumer_output_layout_name"] }},
         )[:, None],
         {{ ctx["consumer_weight_layout_name"] }},

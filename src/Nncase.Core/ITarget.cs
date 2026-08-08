@@ -186,6 +186,14 @@ public interface ITarget
 
     void RegisterPostAutoVectorizePass(IPassManager passManager, CompileOptions options);
 
+    /// <summary>
+    /// Register target-specific high-level IR passes that run after AutoPacking
+    /// and before AutoDistributed.
+    /// </summary>
+    void RegisterPostAutoPackingPass(IPassManager passManager, CompileOptions options)
+    {
+    }
+
     void RegisterTIRSelectionPass(IPassManager passManager, CompileOptions options);
 
     /// <summary>

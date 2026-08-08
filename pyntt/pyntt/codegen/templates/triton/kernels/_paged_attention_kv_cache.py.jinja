@@ -1,0 +1,50 @@
+{% macro store(update, ctx, value, element_mask, indent) -%}
+{% set cache = update["Cache"] %}
+{{ indent }}source_lane_id = {{ ctx["source_lane_id"] }}
+{{ indent }}source_dim_block = {{ ctx["source_dim_block"] }}
+{{ indent }}head_id = {{ ctx["source_tensor_coordinates"][update["HeadAxis"]] }}
+{{ indent }}token_id = {{ ctx["source_tensor_coordinates"][update["SeqAxis"]] }}
+{% for axis in ctx["non_data_axes"] %}
+{{ indent }}global_idx{{ axis }} = {{ ctx["source_tensor_coordinates"][axis] }} + {{ dim(update["SlotsGlobalOffsets"][axis]) }}
+{% endfor %}
+{{ indent }}global_token_id = token_id + {{ dim(update["SlotsGlobalOffsets"][update["SeqAxis"]]) }}
+{{ indent }}global_head_id = head_id + {{ dim(update["SlotsGlobalOffsets"][update["HeadAxis"]]) }}
+{{ indent }}global_source_dim_block = source_dim_block + {{ dim(update["SlotsGlobalOffsets"][update["DimAxis"]]) }}
+{% if ctx["slots_lane_count"] == 1 %}
+{{ indent }}logical_dim = global_source_dim_block
+{% else %}
+{{ indent }}logical_dim = global_source_dim_block * {{ ctx["slots_lane_count"] }} + source_lane_id
+{% endif %}
+{{ indent }}cache_head_id = global_head_id
+{{ indent }}token_active = (global_token_id >= 0) & (global_token_id < num_tokens)
+{% if cache["IdLength"] > 1 %}
+{{ indent }}topology_id = tl.load(slot_mapping + global_token_id * {{ cache["IdLength"] }}, mask=token_active, other=0)
+{{ indent }}tmp_topology = topology_id
+{% for axis in cache["NumBlocksSplitAxes"] | reverse %}
+{{ indent }}topology_coord{{ axis }} = tmp_topology % {{ update["Hierarchy"][axis] }}
+{{ indent }}tmp_topology = tmp_topology // {{ update["Hierarchy"][axis] }}
+{% endfor %}
+{% for axis in ctx["topology_match_axes"] %}
+{{ indent }}token_active = token_active & (topology_coord{{ axis }} == shard_coord{{ axis }})
+{% endfor %}
+{% endif %}
+{{ indent }}slot_id = tl.load(slot_mapping + global_token_id * {{ cache["IdLength"] }} + {{ cache["IdLength"] - 1 }}, mask=token_active, other=0)
+{{ indent }}block_id = slot_id // {{ cache["BlockSize"] }}
+{{ indent }}block_offset = slot_id % {{ cache["BlockSize"] }}
+{% if ctx["vectorized_dim"] == 5 %}
+{{ indent }}cache_dim_block = logical_dim // {{ ctx["lane_count"] }}
+{{ indent }}cache_block_offset = block_offset
+{{ indent }}cache_lane_id = logical_dim % {{ ctx["lane_count"] }}
+{% elif ctx["vectorized_dim"] == 3 %}
+{{ indent }}cache_dim_block = logical_dim
+{{ indent }}cache_block_offset = block_offset // {{ ctx["lane_count"] }}
+{{ indent }}cache_lane_id = block_offset % {{ ctx["lane_count"] }}
+{% else %}
+{{ indent }}cache_dim_block = logical_dim
+{{ indent }}cache_block_offset = block_offset
+{{ indent }}cache_lane_id = 0
+{% endif %}
+{{ indent }}cache_offsets = {{ ctx["cache_offset"] }}
+{{ indent }}active = {{ element_mask }} & token_active & (cache_head_id < {{ cache["NumKVHeads"] }}) & (logical_dim < {{ cache["HeadDim"] }})
+{{ indent }}tl.store(kv_cache + cache_offsets, {{ value }}, mask=active)
+{%- endmacro %}

@@ -317,6 +317,7 @@ public class Compiler : ICompiler
             p.Add<Passes.Rules.Neutral.FoldBitcastBitcast>();
         });
 
+        target.RegisterPostAutoPackingPass(passManager, _compileSession.CompileOptions);
         passManager.Add<RemoveUnusedFunctions>();
         passManager.Add<InferRangePass>();
         passManager.Add<OptimizeByRangePass>();

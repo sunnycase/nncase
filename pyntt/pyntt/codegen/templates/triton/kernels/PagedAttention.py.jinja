@@ -7,7 +7,7 @@
 # {{ model["Comment"] }}; query_dtype={{ model["QueryDType"] }}, output_dtype={{ model["OutputDType"] }}, query_shape={{ shape_tuple(model["QueryShape"]) }}, output_shape={{ shape_tuple(model["OutputShape"]) }}, layer={{ model["LayerIdExpression"] }}, block_n={{ ctx["attention_block_size"] }}
 {{ phases.consumer_header(model, args) }}
     shard_index = tl.program_id(0).to(tl.int64)
-    layer_id_value = (tl.full((), 0, tl.int64) + ({{ model["LayerIdExpression"] }})).to(tl.int64)
+    layer_id_value = (tl.full((), 0, tl.int32) + ({{ model["LayerIdExpression"] }})).to(tl.int32)
 {{ common.shard_coordinates([model["Query"], model["Scale"], model["Output"]]) }}
 {% for name, key in (("query", "Query"), ("scale_ptr", "Scale"), ("output", "Output")) %}
     {{ name }} = {{ ptr(model, key) }}
@@ -53,24 +53,26 @@
                 query_id = tl.where(in_seq, global_query_id - current_query_start, query_id)
                 found_seq = found_seq | in_seq
             head_group = {{ model["GlobalNumQueryHeads"] }} // {{ cache["NumKVHeads"] }}
-            kv_head = global_q_head // head_group
+            kv_head = (global_q_head // head_group).to(tl.int32)
             q_values = tl.reshape(tl.load({{ access_pointer(model, "Query", "query", ctx["query_access"]) }}, mask=found_seq, other=0.0), ({{ cache["HeadDim"] }},))
             max_score = -float("inf")
             sum_exp = 0.0
             acc = tl.zeros((1, {{ cache["HeadDim"] }}), tl.float32)
             for context_start in tl.range(0, max_seq_len, {{ ctx["attention_block_size"] }}):
+                context_start_i32 = context_start.to(tl.int32)
                 context_ids = context_start + tl.arange(0, {{ ctx["attention_block_size"] }})
                 context_mask = found_seq & (context_ids < seq_len) & (context_ids <= context_len + query_id)
                 context_bid = context_start // {{ cache["BlockSize"] }}
-                block_offsets = (context_start % {{ cache["BlockSize"] }}) + tl.arange(0, {{ ctx["attention_block_size"] }})
+                block_offsets = ((context_start_i32 % {{ cache["BlockSize"] }}) + tl.arange(0, {{ ctx["attention_block_size"] }})).to(tl.int32)
                 block_table_active = found_seq & (context_start < seq_len)
 {% if cache["IdLength"] > 1 %}
-                topology_id = tl.load(block_table + matched_seq_id * block_table_blocks * {{ cache["IdLength"] }} + context_bid * {{ cache["IdLength"] }}, mask=block_table_active, other=0)
+                key_topology_id = tl.load(block_table + matched_seq_id * block_table_blocks * {{ cache["IdLength"] }} + context_bid * {{ cache["IdLength"] }}, mask=block_table_active, other=0).to(tl.int64)
 {% endif %}
-                block_id = tl.load(block_table + matched_seq_id * block_table_blocks * {{ cache["IdLength"] }} + context_bid * {{ cache["IdLength"] }} + {{ cache["IdLength"] - 1 }}, mask=block_table_active, other=0)
-                cache_block_id = {{ ctx["cache_block_id"] }}
-                key_offsets = {{ ctx["key_vector_offset"] }}
-                key_values = tl.reshape(tl.load(kv_cache + key_offsets, mask={{ ctx["key_mask"] }}, other=0.0), ({{ cache["HeadDim"] }}, {{ ctx["attention_block_size"] }}))
+                key_block_id = tl.load(block_table + matched_seq_id * block_table_blocks * {{ cache["IdLength"] }} + context_bid * {{ cache["IdLength"] }} + {{ cache["IdLength"] - 1 }}, mask=block_table_active, other=0).to(tl.int64)
+                key_cache_block_id = {{ ctx["key_cache_block_id"] }}
+                key_cache_page = kv_cache + key_cache_block_id * {{ cache["BlockElements"] }}
+                key_offsets = ({{ ctx["key_vector_offset"] }}).to(tl.int32)
+                key_values = tl.reshape(tl.load(key_cache_page + key_offsets, mask={{ ctx["key_mask"] }}, other=0.0), ({{ cache["HeadDim"] }}, {{ ctx["attention_block_size"] }}))
                 score = tl.reshape(tl.dot(q_values[None, :], key_values), ({{ ctx["attention_block_size"] }},))
                 score = tl.where(context_mask, score * scale_value, -float("inf"))
                 block_max = tl.max(score, axis=0)
@@ -83,8 +85,14 @@
 {% if ctx["value_axis_kind"] == "context" %}
 {{ common.structured_axis(ctx["value_axis"], "                ") }}
 {% endif %}
-                value_offsets = {{ ctx["value_vector_offset"] }}
-                value_values = tl.reshape(tl.load(kv_cache + value_offsets, mask={{ ctx["value_mask"] }}, other=0.0), ({{ ctx["attention_block_size"] }}, {{ cache["HeadDim"] }})).to(tl.float32)
+{% if cache["IdLength"] > 1 %}
+                value_topology_id = tl.load(block_table + matched_seq_id * block_table_blocks * {{ cache["IdLength"] }} + context_bid * {{ cache["IdLength"] }}, mask=block_table_active, other=0, volatile=True).to(tl.int64)
+{% endif %}
+                value_block_id = tl.load(block_table + matched_seq_id * block_table_blocks * {{ cache["IdLength"] }} + context_bid * {{ cache["IdLength"] }} + {{ cache["IdLength"] - 1 }}, mask=block_table_active, other=0, volatile=True).to(tl.int64)
+                value_cache_block_id = {{ ctx["value_cache_block_id"] }}
+                value_cache_page = kv_cache + value_cache_block_id * {{ cache["BlockElements"] }}
+                value_offsets = ({{ ctx["value_vector_offset"] }}).to(tl.int32)
+                value_values = tl.reshape(tl.load(value_cache_page + value_offsets, mask={{ ctx["value_mask"] }}, other=0.0), ({{ ctx["attention_block_size"] }}, {{ cache["HeadDim"] }})).to(tl.float32)
                 acc = acc * alpha + tl.dot(prob[None, :], value_values, input_precision="ieee")
                 sum_exp = sum_exp * alpha + tl.sum(prob, axis=0)
                 max_score = tl.where(has_context, new_max, max_score)
