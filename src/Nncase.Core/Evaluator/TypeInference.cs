@@ -698,19 +698,15 @@ public static class TypeInference
 
         IRType DistributedCommonTypeImpl(DistributedType a, DistributedType b)
         {
-            var tA = DistributedUtility.GetDividedTensorType(a);
-            var tB = DistributedUtility.GetDividedTensorType(b);
-            if (tA == tB)
+            if (a == b)
             {
                 return a;
             }
 
-            if (tA.DType != tB.DType)
-            {
-                return new InvalidType($"Inputs DType of if should be same, then: {tA.DType}, else: {tB.DType}");
-            }
-
-            return new TensorType(tA.DType, Shape.Unknown(tA.Shape.Rank));
+            // Different branch shardings have no single distributed result
+            // policy. Their logical result is the common global tensor type;
+            // local shard shapes are an implementation detail and may differ.
+            return CommonTypeImpl(a.TensorType, b.TensorType);
         }
 
         return (thenType, elseType) switch

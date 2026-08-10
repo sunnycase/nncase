@@ -44,7 +44,7 @@ def _test_pyntt_codegen_manifest(render_kernel):
         },
     }
     return {
-        "pyntt_codegen_manifest_version": 8,
+        "pyntt_codegen_manifest_version": 9,
         "target_kind": "pyntt",
         "backend": "triton",
         "functions": [
@@ -334,6 +334,7 @@ def test_pyntt_runtime_reuses_bounded_host_tensor_descriptors():
         "shape": (4, 16),
         "strides": (16, 1),
         "block_shape": (4, 16),
+        "source_shape_axes": ((), ()),
         "padding": "zero",
     }
     storage = torch.empty((64,), dtype=torch.uint8)
@@ -373,6 +374,7 @@ def test_pyntt_runtime_validates_host_tensor_descriptor_layout(
         "shape": (4, 16),
         "strides": (16, 1),
         "block_shape": (4, 16),
+        "source_shape_axes": ((), ()),
         "padding": "zero",
     }
     spec[field] = value
@@ -426,12 +428,12 @@ def test_pyntt_runtime_materializes_zero_copy_input_result_views():
     assert bytes_view.data_ptr() == x.data_ptr()
 
 
-def test_pyntt_renderer_requires_manifest_v8():
+def test_pyntt_renderer_requires_manifest_v9():
     _add_pyntt_to_path()
     from pyntt.codegen.render import render_manifest
 
-    with pytest.raises(ValueError, match="expected 8"):
-        render_manifest({"pyntt_codegen_manifest_version": 7, "functions": []})
+    with pytest.raises(ValueError, match="expected 9"):
+        render_manifest({"pyntt_codegen_manifest_version": 8, "functions": []})
 
 
 @pytest.mark.parametrize("alignment", [None, 3])
@@ -495,6 +497,38 @@ def test_pyntt_renderer_owns_block_schedule_config():
     launch["tuning"] = {"parameters": {}}
     with pytest.raises(ValueError, match=r"unexpected fields \['tuning'\]"):
         render_manifest(manifest)
+
+
+@pytest.mark.parametrize(
+    ("cache_block_size", "expected_block_n", "expected_candidates"),
+    [(32, 32, (32,)), (256, 64, (32, 64))],
+)
+def test_pyntt_renderer_constrains_attention_tile_to_cache_page(
+    cache_block_size, expected_block_n, expected_candidates
+):
+    _add_pyntt_to_path()
+    from pyntt.codegen.render import _paged_attention_backend_config
+
+    kernel = {
+        "metadata": {"name": "top"},
+        "helpers": [],
+        "device_functions": [
+            {
+                "helpers": [
+                    {
+                        "template": (
+                            "triton/kernels/paged_attention/mma_direct.py.jinja"
+                        ),
+                        "model": {"Cache": {"BlockSize": cache_block_size}},
+                    }
+                ]
+            }
+        ],
+    }
+
+    config = _paged_attention_backend_config(kernel)
+    assert config["block_n"] == expected_block_n
+    assert config["block_n_candidates"] == expected_candidates
 
 
 def test_pyntt_qkv_transfer_plan_uses_exact_projection_copy_extents():

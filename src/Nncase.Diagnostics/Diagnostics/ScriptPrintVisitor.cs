@@ -663,7 +663,7 @@ internal sealed class ScriptPrintVisitor : ExprFunctor<IPrintSymbol, string>
         var handoffId = expr.HandoffId
             .Replace("\\", "\\\\", StringComparison.Ordinal)
             .Replace("\"", "\\\"", StringComparison.Ordinal);
-        doc = new($"T.PipelineHandoff(\"{handoffId}\", {expr.SharedOffsetBytes})");
+        doc = new($"T.PipelineHandoff(\"{handoffId}\")");
         _exprMemo.Add(expr, doc);
         return doc;
     }

@@ -56,4 +56,27 @@ public class UnitTestEvaluatorTypeInference
         var expect7 = AnyType.Default;
         Assert.Equal(expect7, actual7);
     }
+
+    [Fact]
+    public void TestDistributedCommonTypeUsesGlobalTensorShape()
+    {
+        var numTokens = new DimVar("num_tokens");
+        var tensorType = new TensorType(
+            DataTypes.BFloat16,
+            new RankedShape(numTokens, 16, 128));
+        var placement = new Placement([4, 8], "y,x", "bb");
+        var thenType = new DistributedType(
+            tensorType,
+            [SBP.B, SBP.S([1]), SBP.B],
+            placement);
+        var elseType = new DistributedType(
+            tensorType,
+            [SBP.S([0]), SBP.B, SBP.B],
+            placement);
+
+        var commonType = TypeInference.CommonType(thenType, elseType);
+
+        Assert.Equal(tensorType, commonType);
+        Assert.Equal(thenType, TypeInference.CommonType(thenType, thenType));
+    }
 }

@@ -1,0 +1,270 @@
+{% macro pipeline_setup(stage) -%}
+{% set stage_model = stage["Model"] %}
+{% set stage_ctx = paged_attention_partial_context(stage_model) %}
+{{ stage["StageName"] }}__key_stages = tle.gpu.alloc(
+    [{{ stage_ctx["attention_num_stages"] }}, 1, 1, {{ stage_ctx["attention_block_size"] }}, 1, {{ stage_model["Cache"]["HeadDim"] }}],
+    dtype={{ stage_model["Cache"]["TritonDType"] }},
+    layout=None,
+    scope=tle.gpu.smem,
+    alias=pyntt_shared_arena,
+    alias_offset_bytes={{ stage["SharedWorkspaceOffsets"]["key_stage"] }},
+    nv_mma_shared_layout=True,
+)
+{{ stage["StageName"] }}__value_stages = tle.gpu.alloc(
+    [{{ stage_ctx["attention_num_stages"] }}, 1, 1, {{ stage_ctx["attention_block_size"] }}, 1, {{ stage_model["Cache"]["HeadDim"] }}],
+    dtype={{ stage_model["Cache"]["TritonDType"] }},
+    layout=None,
+    scope=tle.gpu.smem,
+    alias=pyntt_shared_arena,
+    alias_offset_bytes={{ stage["SharedWorkspaceOffsets"]["value_stage"] }},
+    nv_mma_shared_layout=True,
+)
+{{ stage["PipeName"] }} = tle.pipe(
+    capacity={{ stage_ctx["attention_num_stages"] }},
+    scope="cta",
+    name="{{ stage["StageName"] }}_kv",
+    key={{ stage["StageName"] }}__key_stages,
+    value={{ stage["StageName"] }}__value_stages,
+)
+{%- endmacro %}
+{% if model is defined %}
+{% import "triton/kernels/_common.py.jinja" as common with context %}
+{% set ctx = paged_attention_partial_context(model) %}
+{% set cache = model["Cache"] %}
+# generated from PyNTT algorithm triton.paged_attention_partial/simt_tma_smem_pipeline
+# {{ model["Comment"] }}; query_dtype={{ model["QueryDType"] }}, query_shape={{ shape_tuple(model["QueryShape"]) }}, layer={{ model["LayerIdExpression"] }}, split_axis={{ model["SplitHierarchyAxis"] }}, split_count={{ model["SplitCount"] }}, block_n={{ ctx["attention_block_size"] }}, stages={{ ctx["attention_num_stages"] }}
+{{ ctx["simt_product_layout_name"] }} = tl.constexpr(
+    tle.gpu.BlockEncoding(
+        [{{ ctx["simt_product_size_per_thread"] | join(", ") }}],
+        [{{ ctx["simt_product_threads_per_warp"] | join(", ") }}],
+        [{{ ctx["simt_product_warps_per_cta"] | join(", ") }}],
+        [2, 1, 0],
+    )
+)
+{{ ctx["simt_query_layout_name"] }} = tl.constexpr(
+    tle.gpu.SlicedEncoding(
+        1,
+        {{ ctx["simt_product_layout_name"] }}.value,
+    )
+)
+{{ ctx["simt_score_layout_name"] }} = tl.constexpr(
+    tle.gpu.SlicedEncoding(
+        2,
+        {{ ctx["simt_product_layout_name"] }}.value,
+    )
+)
+{{ ctx["simt_acc_layout_name"] }} = tl.constexpr(
+    tle.gpu.SlicedEncoding(
+        1,
+        {{ ctx["simt_product_layout_name"] }}.value,
+    )
+)
+{{ model["FunctionName"] }}__head_layout = tl.constexpr(
+    tle.gpu.SlicedEncoding(
+        1,
+        {{ ctx["simt_acc_layout_name"] }}.value,
+    )
+)
+
+
+{{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
+def {{ model["FunctionName"] }}__producer(writer, {{ helper_parameters(model) }}):
+    shard_index = tl.program_id(0).to(tl.int64)
+    block_table = {{ model["BlockTableArgument"] }}
+    num_blocks_per_shard = {{ model["NumBlocksPerShardArgument"] }}
+    query_start_loc = {{ model["QueryStartLocArgument"] }}
+    seq_lens = {{ model["SeqLensArgument"] }}
+    num_seqs = {{ model["NumSeqsArgument"] }}
+    key_descriptor = {{ model["KeyDescriptorName"] }}
+    value_descriptor = {{ model["ValueDescriptorName"] }}
+    layer_id_value = (tl.full((), 0, tl.int32) + ({{ model["LayerIdExpression"] }})).to(tl.int32)
+{{ common.hierarchy_coordinates(model["Hierarchy"]) }}
+    max_seq_len = tl.full((), 0, tl.int64)
+    num_tokens = tl.load(query_start_loc + num_seqs).to(tl.int64)
+    for seq_scan in tl.range(0, num_seqs):
+        max_seq_len = tl.maximum(max_seq_len, tl.load(seq_lens + seq_scan).to(tl.int64))
+    block_table_blocks = tl.cdiv(max_seq_len, {{ cache["BlockSize"] }})
+    split_span = tl.cdiv(max_seq_len, {{ ctx["split_count"] * ctx["attention_block_size"] }}) * {{ ctx["attention_block_size"] }}
+    split_begin = tl.minimum(({{ ctx["split_coord"] }}).to(tl.int64) * split_span, max_seq_len)
+    split_end = tl.minimum(split_begin + split_span, max_seq_len)
+    first_page = split_begin // {{ cache["BlockSize"] }}
+    end_page = tl.cdiv(split_end, {{ cache["BlockSize"] }})
+    sequence = tl.full((), 0, tl.int32)
+    for local_query_id in tl.range(0, {{ dim(ctx["local_query_tokens"]) }}):
+        global_query_id = {{ ctx["global_query_id"] }}
+        matched_seq_id = tl.full((), 0, tl.int64)
+        found_seq = False
+        for seq_id in tl.range(0, num_seqs):
+            current_query_start = tl.load(query_start_loc + seq_id).to(tl.int64)
+            current_query_end = tl.load(query_start_loc + seq_id + 1).to(tl.int64)
+            in_seq = (global_query_id < num_tokens) & (global_query_id >= current_query_start) & (global_query_id < current_query_end)
+            matched_seq_id = tl.where(in_seq, seq_id, matched_seq_id)
+            found_seq = found_seq | in_seq
+        global_q_head_begin = ({{ ctx["global_q_head_begin"] }}).to(tl.int32)
+        first_kv_head = global_q_head_begin // {{ ctx["q_head_group_size"] }}
+        local_kv_groups = tl.cdiv((global_q_head_begin % {{ ctx["q_head_group_size"] }}) + {{ ctx["local_q_heads"] }}, {{ ctx["q_head_group_size"] }})
+        for local_kv_group in tl.range(0, local_kv_groups):
+            kv_head = (first_kv_head + local_kv_group).to(tl.int32)
+            for context_bid in tl.range(first_page, end_page):
+                page_start = context_bid * {{ cache["BlockSize"] }}
+                tile_begin = tl.maximum(split_begin, page_start)
+                tile_end = tl.minimum(split_end, page_start + {{ cache["BlockSize"] }})
+                block_table_active = found_seq & (tile_begin < max_seq_len)
+{% if cache["IdLength"] > 1 %}
+                key_topology_id = tl.load(block_table + matched_seq_id * block_table_blocks * {{ cache["IdLength"] }} + context_bid * {{ cache["IdLength"] }}, mask=block_table_active, other=0).to(tl.int64)
+{% endif %}
+                key_block_id = tl.load(block_table + matched_seq_id * block_table_blocks * {{ cache["IdLength"] }} + context_bid * {{ cache["IdLength"] }} + {{ cache["IdLength"] - 1 }}, mask=block_table_active, other=0).to(tl.int64)
+                flat_block_id = ({{ ctx["key_cache_block_id"] }}).to(tl.int32)
+                for context_start in tl.range(tile_begin, tile_end, {{ ctx["attention_block_size"] }}):
+                    slot = writer.acquire(sequence)
+                    page_offset = (context_start - page_start).to(tl.int32)
+                    tle.gpu.copy(
+                        key_descriptor,
+                        slot.key,
+                        [1, 1, {{ ctx["attention_block_size"] }}, 1, {{ cache["HeadDim"] }}],
+                        offsets=[flat_block_id, layer_id_value, page_offset, kv_head, 0],
+                        eviction_policy="evict_first",
+                    )
+                    tle.gpu.copy(
+                        value_descriptor,
+                        slot.value,
+                        [1, 1, {{ ctx["attention_block_size"] }}, 1, {{ cache["HeadDim"] }}],
+                        offsets=[flat_block_id, layer_id_value, page_offset, kv_head, 0],
+                        eviction_policy="evict_first",
+                    )
+                    writer.commit(sequence)
+                    sequence += 1
+    writer.close(sequence)
+
+
+{{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
+def {{ model["FunctionName"] }}__consumer(reader, {{ helper_parameters(model) }}):
+    shard_index = tl.program_id(0).to(tl.int64)
+    query_start_loc = {{ model["QueryStartLocArgument"] }}
+    seq_lens = {{ model["SeqLensArgument"] }}
+    num_seqs = {{ model["NumSeqsArgument"] }}
+{{ common.hierarchy_coordinates(model["Hierarchy"]) }}
+{% for name, key in (("query", "Query"), ("scale_ptr", "Scale"), ("max_state", "MaxState"), ("sum_state", "SumState"), ("acc_state", "AccState")) %}
+    {{ name }} = {{ ptr(model, key) }}
+{% endfor %}
+    scale_value = tl.load({{ access_pointer(model, "Scale", "scale_ptr") }}).to(tl.float32)
+    scale_log2_value = scale_value * 1.4426950408889634
+    max_seq_len = tl.full((), 0, tl.int64)
+    num_tokens = tl.load(query_start_loc + num_seqs).to(tl.int64)
+    for seq_scan in tl.range(0, num_seqs):
+        max_seq_len = tl.maximum(max_seq_len, tl.load(seq_lens + seq_scan).to(tl.int64))
+    split_span = tl.cdiv(max_seq_len, {{ ctx["split_count"] * ctx["attention_block_size"] }}) * {{ ctx["attention_block_size"] }}
+    split_active = {{ ctx["split_coord"] }} < {{ ctx["split_count"] }}
+    split_begin = tl.minimum(({{ ctx["split_coord"] }}).to(tl.int64) * split_span, max_seq_len)
+    split_end = tl.minimum(split_begin + split_span, max_seq_len)
+    first_page = split_begin // {{ cache["BlockSize"] }}
+    end_page = tl.cdiv(split_end, {{ cache["BlockSize"] }})
+{{ common.structured_axis(ctx["query_dim_axis"], "    ") }}
+    dim_offsets = tl.arange(0, {{ cache["HeadDim"] }})
+    product_rows = tle.encoding(
+        tl.broadcast_to(tl.arange(0, {{ ctx["attention_block_size"] }})[None, :, None], ({{ ctx["q_head_group_tile"] }}, {{ ctx["attention_block_size"] }}, {{ cache["HeadDim"] }})),
+        {{ ctx["simt_product_layout_name"] }},
+    )
+    product_dims = tle.encoding(
+        tl.broadcast_to(dim_offsets[None, None, :], ({{ ctx["q_head_group_tile"] }}, {{ ctx["attention_block_size"] }}, {{ cache["HeadDim"] }})),
+        {{ ctx["simt_product_layout_name"] }},
+    )
+    product_zero = tle.encoding(
+        tl.zeros(({{ ctx["q_head_group_tile"] }}, {{ ctx["attention_block_size"] }}, {{ cache["HeadDim"] }}), tl.int32),
+        {{ ctx["simt_product_layout_name"] }},
+    )
+    sequence = tl.full((), 0, tl.int32)
+    for local_query_id in tl.range(0, {{ dim(ctx["local_query_tokens"]) }}):
+        global_query_id = {{ ctx["global_query_id"] }}
+        context_len = tl.full((), 0, tl.int64)
+        seq_len = tl.full((), 0, tl.int64)
+        query_id = tl.full((), 0, tl.int64)
+        matched_seq_id = tl.full((), 0, tl.int64)
+        query_active = split_active & (global_query_id < {{ dim(ctx["global_query_tokens"]) }}) & (global_query_id < num_tokens)
+        found_seq = False
+        for seq_id in tl.range(0, num_seqs):
+            current_query_start = tl.load(query_start_loc + seq_id).to(tl.int64)
+            current_query_end = tl.load(query_start_loc + seq_id + 1).to(tl.int64)
+            current_seq_len = tl.load(seq_lens + seq_id).to(tl.int64)
+            current_context_len = current_seq_len - (current_query_end - current_query_start)
+            in_seq = query_active & (global_query_id >= current_query_start) & (global_query_id < current_query_end)
+            matched_seq_id = tl.where(in_seq, seq_id, matched_seq_id)
+            context_len = tl.where(in_seq, current_context_len, context_len)
+            seq_len = tl.where(in_seq, current_seq_len, seq_len)
+            query_id = tl.where(in_seq, global_query_id - current_query_start, query_id)
+            found_seq = found_seq | in_seq
+        global_q_head_begin = ({{ ctx["global_q_head_begin"] }}).to(tl.int32)
+        first_kv_head = global_q_head_begin // {{ ctx["q_head_group_size"] }}
+        local_kv_groups = tl.cdiv((global_q_head_begin % {{ ctx["q_head_group_size"] }}) + {{ ctx["local_q_heads"] }}, {{ ctx["q_head_group_size"] }})
+        for local_kv_group in tl.range(0, local_kv_groups):
+            kv_head = (first_kv_head + local_kv_group).to(tl.int32)
+            q_group_offsets = tl.arange(0, {{ ctx["q_head_group_tile"] }})
+            global_q_heads = kv_head * {{ ctx["q_head_group_size"] }} + q_group_offsets
+            local_q_heads = global_q_heads - global_q_head_begin
+            q_head_mask = (q_group_offsets < {{ ctx["q_head_group_size"] }}) & (local_q_heads >= 0) & (local_q_heads < {{ ctx["local_q_heads"] }}) & (global_q_heads < {{ model["GlobalNumQueryHeads"] }})
+            safe_local_q_heads = tl.maximum(0, tl.minimum(local_q_heads, {{ ctx["local_q_heads"] - 1 }}))
+            q_values = tle.encoding(
+                tl.reshape(tl.load({{ access_pointer(model, "Query", "query", ctx["query_access"]) }}, mask=found_seq & {{ ctx["query_mask"] }}, other=0.0), ({{ ctx["q_head_group_tile"] }}, {{ cache["HeadDim"] }})),
+                {{ ctx["simt_query_layout_name"] }},
+            ).to(tl.float32)
+            max_score = tl.full(({{ ctx["q_head_group_tile"] }},), -float("inf"), tl.float32)
+            sum_exp = tl.zeros(({{ ctx["q_head_group_tile"] }},), tl.float32)
+            acc = tle.encoding(
+                tl.zeros(({{ ctx["q_head_group_tile"] }}, {{ cache["HeadDim"] }}), tl.float32),
+                {{ ctx["simt_acc_layout_name"] }},
+            )
+            for context_bid in tl.range(first_page, end_page):
+                page_start = context_bid * {{ cache["BlockSize"] }}
+                tile_begin = tl.maximum(split_begin, page_start)
+                tile_end = tl.minimum(split_end, page_start + {{ cache["BlockSize"] }})
+                for context_start in tl.range(tile_begin, tile_end, {{ ctx["attention_block_size"] }}):
+                    context_ids = context_start + tl.arange(0, {{ ctx["attention_block_size"] }})
+                    context_mask = found_seq & (context_ids < seq_len) & (context_ids <= context_len + query_id)
+                    ready = reader.wait(sequence)
+                    key_ptr = tle.gpu.local_ptr(
+                        ready.slot.key,
+                        (product_zero, product_zero, product_rows, product_zero, product_dims),
+                        shape=({{ ctx["q_head_group_tile"] }}, {{ ctx["attention_block_size"] }}, {{ cache["HeadDim"] }}),
+                    )
+                    key_ptr = tl.max_contiguous(key_ptr, [1, 1, 8])
+                    key_ptr = tl.multiple_of(key_ptr, [1, 1, 16])
+                    key_values = tl.load(key_ptr).to(tl.float32)
+                    q_product = tle.encoding(q_values[:, None, :], {{ ctx["simt_product_layout_name"] }})
+                    score = tl.sum(q_product * key_values, axis=2)
+                    attention_mask = tle.encoding(
+                        q_head_mask[:, None] & context_mask[None, :],
+                        {{ ctx["simt_score_layout_name"] }},
+                    )
+                    score = tl.where(attention_mask, score * scale_log2_value, -float("inf"))
+                    block_max = tl.max(score, axis=1)
+                    has_context = block_max != -float("inf")
+                    new_max = tl.maximum(max_score, block_max)
+                    safe_new_max = tl.where(has_context, new_max, 0.0)
+                    safe_prev_max = tl.where(has_context, max_score, 0.0)
+                    alpha = tl.exp2(safe_prev_max - safe_new_max)
+                    prob = tl.exp2(tl.where(attention_mask, score - safe_new_max[:, None], -float("inf")))
+                    value_ptr = tle.gpu.local_ptr(
+                        ready.slot.value,
+                        (product_zero, product_zero, product_rows, product_zero, product_dims),
+                        shape=({{ ctx["q_head_group_tile"] }}, {{ ctx["attention_block_size"] }}, {{ cache["HeadDim"] }}),
+                    )
+                    value_ptr = tl.max_contiguous(value_ptr, [1, 1, 8])
+                    value_ptr = tl.multiple_of(value_ptr, [1, 1, 16])
+                    value_values = tl.load(value_ptr).to(tl.float32)
+                    value_prob = tle.encoding(prob[:, :, None], {{ ctx["simt_product_layout_name"] }})
+                    value_partial = tl.sum(value_prob * value_values, axis=1)
+                    acc_alpha = tle.encoding(alpha[:, None], {{ ctx["simt_acc_layout_name"] }})
+                    acc = acc * acc_alpha + value_partial
+                    sum_exp = sum_exp * alpha + tl.sum(prob, axis=1)
+                    max_score = tl.where(has_context, new_max, max_score)
+                    reader.release(sequence)
+                    sequence += 1
+            state_scalar_q_heads = tle.encoding(safe_local_q_heads, {{ model["FunctionName"] }}__head_layout)
+            state_scalar_mask = tle.encoding(q_head_mask, {{ model["FunctionName"] }}__head_layout)
+            state_local_q_heads = tle.encoding(safe_local_q_heads[:, None], {{ ctx["simt_acc_layout_name"] }})
+            state_dim_offsets = tle.encoding(dim_offsets[None, :], {{ ctx["simt_acc_layout_name"] }})
+            state_acc_mask = tle.encoding(q_head_mask[:, None], {{ ctx["simt_acc_layout_name"] }})
+            tl.store({{ access_pointer(model, "MaxState", "max_state", ctx["simt_max_state_access"]) }}, tle.encoding(max_score, {{ model["FunctionName"] }}__head_layout), mask=split_active & state_scalar_mask)
+            tl.store({{ access_pointer(model, "SumState", "sum_state", ctx["simt_sum_state_access"]) }}, tle.encoding(sum_exp, {{ model["FunctionName"] }}__head_layout), mask=split_active & state_scalar_mask)
+            tl.store({{ access_pointer(model, "AccState", "acc_state", ctx["simt_acc_state_access"]) }}, acc, mask=split_active & state_acc_mask)
+{% endif %}

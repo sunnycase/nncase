@@ -1,15 +1,20 @@
 {% import "triton/kernels/_common.py.jinja" as common with context %}
 {% import "triton/kernels/_producer_consumer.py.jinja" as phases with context %}
-{% set ctx = paged_attention_context(model) %}
+{% set ctx = paged_attention_partial_context(model) %}
 {% set cache = model["Cache"] %}
-{% set args = ("block_table", "kv_cache", "num_blocks_per_shard", "query_start_loc", "seq_lens", "num_seqs") %}
-# generated from PyNTT Jinja PagedAttention.py.jinja
-# {{ model["Comment"] }}; query_dtype={{ model["QueryDType"] }}, output_dtype={{ model["OutputDType"] }}, query_shape={{ shape_tuple(model["QueryShape"]) }}, output_shape={{ shape_tuple(model["OutputShape"]) }}, layer={{ model["LayerIdExpression"] }}, block_n={{ ctx["attention_block_size"] }}
-{{ phases.consumer_header(model, args) }}
+# generated from PyNTT algorithm triton.paged_attention_partial/mma_direct
+# {{ model["Comment"] }}; query_dtype={{ model["QueryDType"] }}, query_shape={{ shape_tuple(model["QueryShape"]) }}, layer={{ model["LayerIdExpression"] }}, split_axis={{ model["SplitHierarchyAxis"] }}, split_count={{ model["SplitCount"] }}
+{{ phases.consumer_header(model) }}
     shard_index = tl.program_id(0).to(tl.int64)
+    block_table = {{ model["BlockTableArgument"] }}
+    kv_cache = {{ model["KVCacheArgument"] }}
+    num_blocks_per_shard = {{ model["NumBlocksPerShardArgument"] }}
+    query_start_loc = {{ model["QueryStartLocArgument"] }}
+    seq_lens = {{ model["SeqLensArgument"] }}
+    num_seqs = {{ model["NumSeqsArgument"] }}
     layer_id_value = (tl.full((), 0, tl.int32) + ({{ model["LayerIdExpression"] }})).to(tl.int32)
 {{ common.hierarchy_coordinates(model["Hierarchy"]) }}
-{% for name, key in (("query", "Query"), ("scale_ptr", "Scale"), ("output", "Output")) %}
+{% for name, key in (("query", "Query"), ("scale_ptr", "Scale"), ("max_state", "MaxState"), ("sum_state", "SumState"), ("acc_state", "AccState")) %}
     {{ name }} = {{ ptr(model, key) }}
 {% endfor %}
     scale_value = tl.load({{ access_pointer(model, "Scale", "scale_ptr") }}).to(tl.float32)
@@ -20,20 +25,23 @@
         seq_len_scan = tl.load(seq_lens + seq_scan).to(tl.int64)
         max_seq_len = tl.maximum(max_seq_len, seq_len_scan)
     block_table_blocks = tl.cdiv(max_seq_len, {{ cache["BlockSize"] }})
+    split_span = tl.cdiv(max_seq_len, {{ ctx["split_count"] * ctx["attention_block_size"] }}) * {{ ctx["attention_block_size"] }}
+    split_active = {{ ctx["split_coord"] }} < {{ ctx["split_count"] }}
+    split_begin = tl.minimum(({{ ctx["split_coord"] }}).to(tl.int64) * split_span, max_seq_len)
+    split_end = tl.minimum(split_begin + split_span, max_seq_len)
 {{ common.structured_axis(ctx["query_dim_axis"], "    ") }}
 {{ common.structured_axis(ctx["key_dim_axis"], "    ") }}
 {% if ctx["value_axis_kind"] == "dim" %}
 {{ common.structured_axis(ctx["value_axis"], "    ") }}
-{% else %}
-    dim_offsets = tl.arange(0, {{ cache["HeadDim"] }})
 {% endif %}
+    dim_offsets = tl.arange(0, {{ cache["HeadDim"] }})
     for local_query_id in tl.range(0, {{ dim(ctx["local_query_tokens"]) }}):
         global_query_id = {{ ctx["global_query_id"] }}
         context_len = tl.full((), 0, tl.int64)
         seq_len = tl.full((), 0, tl.int64)
         query_id = tl.full((), 0, tl.int64)
         matched_seq_id = tl.full((), 0, tl.int64)
-        query_active = (local_query_id < {{ dim(ctx["local_query_tokens"]) }}) & (global_query_id < {{ dim(ctx["global_query_tokens"]) }}) & (global_query_id < num_tokens)
+        query_active = split_active & (global_query_id < {{ dim(ctx["global_query_tokens"]) }}) & (global_query_id < num_tokens)
         found_seq = False
         for seq_id in tl.range(0, num_seqs):
             current_query_start = tl.load(query_start_loc + seq_id).to(tl.int64)
@@ -60,7 +68,7 @@
             max_score = tl.full(({{ ctx["q_head_group_tile"] }},), -float("inf"), tl.float32)
             sum_exp = tl.zeros(({{ ctx["q_head_group_tile"] }},), tl.float32)
             acc = tl.zeros(({{ ctx["q_head_group_tile"] }}, {{ cache["HeadDim"] }}), tl.float32)
-            for context_start in tl.range(0, max_seq_len, {{ ctx["attention_block_size"] }}, num_stages={{ ctx["attention_num_stages"] }}):
+            for context_start in tl.range(split_begin, split_end, {{ ctx["attention_block_size"] }}, num_stages={{ ctx["attention_num_stages"] }}):
                 context_start_i32 = context_start.to(tl.int32)
                 context_ids = context_start + tl.arange(0, {{ ctx["attention_block_size"] }})
                 context_mask = found_seq & (context_ids < seq_len) & (context_ids <= context_len + query_id)
@@ -95,9 +103,9 @@
                 acc = tl.dot(prob.to({{ cache["TritonDType"] }}), value_values, acc * alpha[:, None], input_precision="ieee")
                 sum_exp = sum_exp * alpha + tl.sum(prob, axis=1)
                 max_score = tl.where(has_context, new_max, max_score)
-            inv_sum = tl.where(sum_exp != 0.0, 1.0 / sum_exp, 0.0)
-            result = tl.reshape(acc * inv_sum[:, None], {{ ctx["query_structured_shape"] }})
-            tl.store({{ access_pointer(model, "Output", "output", ctx["output_access"]) }}, result, mask=found_seq & {{ ctx["output_mask"] }})
+            tl.store({{ access_pointer(model, "MaxState", "max_state", ctx["max_state_access"]) }}, max_score, mask=split_active & q_head_mask)
+            tl.store({{ access_pointer(model, "SumState", "sum_state", ctx["sum_state_access"]) }}, sum_exp, mask=split_active & q_head_mask)
+            tl.store({{ access_pointer(model, "AccState", "acc_state", ctx["acc_state_access"]) }}, acc, mask=split_active & q_head_mask[:, None])
 
 
-{{ phases.dispatch(model, args) }}
+{{ phases.dispatch(model) }}

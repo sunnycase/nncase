@@ -6,7 +6,6 @@
 using System;
 using System.Diagnostics.CodeAnalysis;
 using System.Linq;
-using System.Numerics;
 using System.Runtime.InteropServices;
 using Nncase.CostModel;
 using Nncase.Diagnostics;
@@ -106,30 +105,49 @@ public class VectorizedCastEvaluator : IEvaluator<VectorizedCast>, ITypeInferenc
 
     private IRType Visit(VectorizedCast target, TensorType input)
     {
-        if (input.DType is VectorType vt)
+        if (input.DType is VectorType inputVectorType)
         {
-            if (!target.VectorizeAxes.IsDefaultOrEmpty && target.VectorizeAxes.Any(a => input.Shape[a] is { IsFixed: false }))
+            if (target.NewType is not VectorType outputVectorType)
             {
-                return new InvalidType("Vectorize axes must be fixed");
+                return new InvalidType("A VectorizedCast with vectorized input requires a vectorized output dtype");
             }
 
-            var scale = 1f;
-            var newShape = input.Shape.ToArray();
-            if (!target.VectorizeAxes.IsDefaultOrEmpty)
+            if (target.VectorizeAxes.IsDefaultOrEmpty)
             {
-                scale = 1f * ((VectorType)target.NewType).ElemType.SizeInBytes / vt.ElemType.SizeInBytes;
-                if (target.VectorizeAxes.Any(a => input.Shape[a].FixedValue * scale % 1 != 0))
-                {
-                    return new InvalidType("Vectorize axes must be divisible by scale");
-                }
+                return new TensorType(target.NewType, input.Shape);
+            }
 
-                foreach (var a in target.VectorizeAxes)
+            var axes = target.VectorizeAxes.ToArray();
+            if (axes.Length != inputVectorType.Lanes.Count || axes.Length != outputVectorType.Lanes.Count)
+            {
+                return new InvalidType(
+                    $"VectorizedCast requires one input and output lane group per vectorized axis, but got " +
+                    $"{axes.Length} axes, {inputVectorType.Lanes.Count} input lane groups, and " +
+                    $"{outputVectorType.Lanes.Count} output lane groups");
+            }
+
+            if (axes.Distinct().Count() != axes.Length || axes.Any(axis => axis < 0 || axis >= input.Shape.Rank))
+            {
+                return new InvalidType("VectorizedCast axes must be distinct and in range");
+            }
+
+            if (TypeInference.UnpackType(input, axes) is not TensorType unpackedInput)
+            {
+                return new InvalidType($"VectorizedCast cannot unpack input type {input}");
+            }
+
+            for (int i = 0; i < axes.Length; i++)
+            {
+                if (!Dimension.TryDivExactly(unpackedInput.Shape[axes[i]], outputVectorType.Lanes[i], out _))
                 {
-                    newShape[a] = (int)(newShape[a].FixedValue * scale);
+                    return new InvalidType(
+                        $"VectorizedCast unpacked axis {axes[i]} extent {unpackedInput.Shape[axes[i]]} " +
+                        $"is not divisible by output lane {outputVectorType.Lanes[i]}");
                 }
             }
 
-            return new TensorType(target.NewType, newShape);
+            var scalarOutput = new TensorType(outputVectorType.ElemType, unpackedInput.Shape);
+            return TypeInference.PackType(scalarOutput, outputVectorType.Lanes.ToArray(), axes);
         }
 
         return new TensorType(target.NewType, input.Shape);
@@ -137,36 +155,36 @@ public class VectorizedCastEvaluator : IEvaluator<VectorizedCast>, ITypeInferenc
 
     private IRType Visit(VectorizedCast target, DistributedType inType)
     {
-        var invalid = new InvalidType(inType.ToString());
         var outType = Visit(target, inType.TensorType);
-        var ndsbp = inType.AxisPolicies.ToArray();
-        var shape = CompilerServices.GetMaxShape(inType.TensorType.Shape);
-        for (int i = 0; i < ndsbp.Length; i++)
+        if (outType is not TensorType outTensorType)
         {
-            if (inType.AxisPolicies[i] is SBPPartial)
-            {
-                return invalid;
-            }
-
-            if (inType.AxisPolicies[i] is SBPSplit split && inType.TensorType.DType is VectorType vtIn && outType is TensorType ttOut && ttOut.DType is VectorType vtOut)
-            {
-                var outShape = CompilerServices.GetMaxShape(ttOut.Shape);
-                if (vtIn.ElemType != vtOut.ElemType)
-                {
-                    var divisor = split.Axes.Select(a => inType.Placement.Hierarchy[a]).Aggregate(1, (a, b) => a * b);
-                    if (shape[i] % divisor != 0 || outShape[i] % divisor != 0)
-                    {
-                        return invalid;
-                    }
-                    else
-                    {
-                        var scale = 1f * outShape[i] / shape[i];
-                        ndsbp[i] = SBP.S(split.Axes, split.Granularity is not null ? (scale >= 1 ? split.Granularity * (long)scale : split.Granularity / (long)(1f / scale)) : null);
-                    }
-                }
-            }
+            return outType;
         }
 
-        return new DistributedType((TensorType)outType, ndsbp, inType.Placement);
+        if (inType.AxisPolicies.Any(static policy => policy is SBPPartial))
+        {
+            return new InvalidType("VectorizedCast does not support partial distributed inputs");
+        }
+
+        if (target.VectorizeAxes.IsDefaultOrEmpty || inType.TensorType.DType is not VectorType)
+        {
+            return inType with { TensorType = outTensorType };
+        }
+
+        if (target.NewType is not VectorType outputVectorType ||
+            TypeInference.UnpackType(inType, target.VectorizeAxes) is not DistributedType unpackedInput)
+        {
+            return new InvalidType($"VectorizedCast cannot unpack distributed input type {inType}");
+        }
+
+        var scalarOutput = unpackedInput with
+        {
+            TensorType = new TensorType(outputVectorType.ElemType, unpackedInput.TensorType.Shape),
+        };
+
+        return TypeInference.PackType(
+            scalarOutput,
+            outputVectorType.Lanes.ToArray(),
+            target.VectorizeAxes.ToArray());
     }
 }

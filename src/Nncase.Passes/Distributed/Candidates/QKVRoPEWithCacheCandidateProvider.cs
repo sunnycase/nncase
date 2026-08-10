@@ -19,14 +19,14 @@ internal sealed class QKVRoPEWithCacheCandidateProvider : DistributedCandidatePr
     {
         var results = new List<DistributedCandidateTuple>();
         tuples = results;
-        if (returnType is not TupleType { Count: 2 } output || context.AvailableInputTypes.Count != 11)
+        if (returnType is not TupleType { Count: 2 } || context.AvailableInputTypes.Count != 11)
         {
             return false;
         }
 
         foreach (var qkv in context.AvailableInputTypes[QKVRoPEWithCache.QKV.Index].OfType<TupleType>())
         {
-            if (qkv.Count != 3 || qkv[0] != output[0])
+            if (qkv.Count != 3)
             {
                 continue;
             }

@@ -1,4 +1,4 @@
-// Copyright (c) Canaan Inc. All rights reserved.
+﻿// Copyright (c) Canaan Inc. All rights reserved.
 // Licensed under the Apache license. See LICENSE file in the project root for full license information.
 
 using System;
@@ -8,6 +8,7 @@ using System.Linq;
 using System.Threading.Tasks;
 using Nncase.CostModel;
 using Nncase.IR;
+using Nncase.IR.NN;
 using Nncase.Passes;
 using Nncase.Schedule;
 using Nncase.Targets;
@@ -743,6 +744,185 @@ public sealed class UnitTestTritonTargetCostModel : TestClassBase
         };
 
         Assert.Equal((UInt128)3010, costModel.GetLatency(cost));
+    }
+
+    [Fact]
+    public void TestPagedAttentionPlannerUsesUnusedBlockAxisForLongContext()
+    {
+        var placement = new Placement([4, 8], "y,x", "bb");
+        var queryType = new DistributedType(
+            new TensorType(DataTypes.BFloat16, new RankedShape(1, 16, 128)),
+            [SBP.B, SBP.S([1]), SBP.B],
+            placement);
+        var planner = new TritonPagedAttentionExecutionPlanner(
+            CreateGpuMachine(rootBytesPerCycle: 32));
+
+        var plan = planner.Plan(new(
+            queryType,
+            QuerySequenceLength: 1,
+            LocalQueryHeads: 2,
+            LocalKVHeads: 1,
+            HeadDimension: 128,
+            ContextLength: 512,
+            QueryElementType: DataTypes.BFloat16,
+            KVElementType: DataTypes.BFloat16));
+
+        Assert.Equal(PagedAttentionExecutionKind.SplitKV, plan.Kind);
+        Assert.Equal(0, plan.SplitHierarchyAxis);
+        Assert.Equal(4, plan.SplitCount);
+    }
+
+    [Fact]
+    public void TestPagedAttentionPlannerKeepsShortContextDirect()
+    {
+        var placement = new Placement([4, 8], "y,x", "bb");
+        var queryType = new DistributedType(
+            new TensorType(DataTypes.BFloat16, new RankedShape(1, 16, 128)),
+            [SBP.B, SBP.S([1]), SBP.B],
+            placement);
+        var planner = new TritonPagedAttentionExecutionPlanner(
+            CreateGpuMachine(rootBytesPerCycle: 32));
+
+        var plan = planner.Plan(new(
+            queryType,
+            QuerySequenceLength: 1,
+            LocalQueryHeads: 2,
+            LocalKVHeads: 1,
+            HeadDimension: 128,
+            ContextLength: 1,
+            QueryElementType: DataTypes.BFloat16,
+            KVElementType: DataTypes.BFloat16));
+
+        Assert.Equal(PagedAttentionExecutionPlan.Direct, plan);
+    }
+
+    [Fact]
+    public void TestPagedAttentionPlannerSupportsNonPowerOfTwoSplitCount()
+    {
+        var placement = new Placement([3, 8], "y,x", "bb");
+        var queryType = new DistributedType(
+            new TensorType(DataTypes.BFloat16, new RankedShape(1, 16, 128)),
+            [SBP.B, SBP.S([1]), SBP.B],
+            placement);
+        var planner = new TritonPagedAttentionExecutionPlanner(
+            CreateGpuMachine(rootBytesPerCycle: 32));
+
+        var plan = planner.Plan(new(
+            queryType,
+            QuerySequenceLength: 1,
+            LocalQueryHeads: 2,
+            LocalKVHeads: 1,
+            HeadDimension: 128,
+            ContextLength: 4096,
+            QueryElementType: DataTypes.BFloat16,
+            KVElementType: DataTypes.BFloat16));
+
+        Assert.Equal(PagedAttentionExecutionKind.SplitKV, plan.Kind);
+        Assert.Equal(0, plan.SplitHierarchyAxis);
+        Assert.Equal(3, plan.SplitCount);
+    }
+
+    [Fact]
+    public void TestPagedAttentionPlannerChoosesLowestCostUnusedAxis()
+    {
+        var placement = new Placement([4, 8], "y,x", "bb");
+        var queryType = new DistributedType(
+            new TensorType(DataTypes.BFloat16, new RankedShape(1, 16, 128)),
+            [SBP.B, SBP.B, SBP.B],
+            placement);
+        var planner = new TritonPagedAttentionExecutionPlanner(
+            CreateGpuMachine(rootBytesPerCycle: 32));
+
+        var plan = planner.Plan(new(
+            queryType,
+            QuerySequenceLength: 1,
+            LocalQueryHeads: 16,
+            LocalKVHeads: 8,
+            HeadDimension: 128,
+            ContextLength: 4096,
+            QueryElementType: DataTypes.BFloat16,
+            KVElementType: DataTypes.BFloat16));
+
+        Assert.Equal(PagedAttentionExecutionKind.SplitKV, plan.Kind);
+        Assert.Equal(1, plan.SplitHierarchyAxis);
+        Assert.Equal(8, plan.SplitCount);
+    }
+
+    [Fact]
+    public void TestPagedAttentionSplitCostUsesAverageOwnerTraffic()
+    {
+        CompileOptions.TargetOptions = CreateOptions(
+            CreateGpuMachine(rootBytesPerCycle: 32));
+        var placement = new Placement([4, 8], "y,x", "bb");
+        var queryType = new DistributedType(
+            new TensorType(DataTypes.BFloat16, new RankedShape(1, 16, 128)),
+            [SBP.B, SBP.S([1]), SBP.B],
+            placement);
+        var extraType = new DistributedType(
+            new TensorType(DataTypes.BFloat16, new RankedShape(8_404_992)),
+            [SBP.S([0, 1])],
+            placement);
+        var config = new PagedAttentionConfig(
+            1,
+            8,
+            128,
+            DataTypes.BFloat16,
+            256,
+            [
+                PagedKVCacheDimKind.NumBlocks,
+                PagedKVCacheDimKind.NumLayers,
+                PagedKVCacheDimKind.KV,
+                PagedKVCacheDimKind.NumKVHeads,
+                PagedKVCacheDimKind.HeadDim,
+                PagedKVCacheDimKind.BlockSize,
+            ],
+            [
+                PagedKVCacheDimKind.NumBlocks,
+                PagedKVCacheDimKind.NumLayers,
+                PagedKVCacheDimKind.KV,
+                PagedKVCacheDimKind.NumKVHeads,
+                PagedKVCacheDimKind.BlockSize,
+                PagedKVCacheDimKind.HeadDim,
+            ],
+            [PagedKVCacheDimKind.HeadDim],
+            [PagedKVCacheDimKind.BlockSize],
+            [8],
+            [8],
+            [PagedKVCacheDimKind.NumBlocks],
+            [SBP.S([0, 1])]);
+        var query = new Var("query", queryType);
+        var extra = new Var("extra", extraType);
+        var kvCaches = new Var(
+            "kv_caches",
+            TensorType.Scalar(new ReferenceType(
+                new PagedAttentionKVCacheType { Config = config })));
+        var scale = new Var("scale", TensorType.Scalar(DataTypes.BFloat16));
+        var pagedAttention = IR.F.NN.PagedAttention(
+            query,
+            kvCaches,
+            extra,
+            scale,
+            0,
+            [AttentionDimKind.Seq, AttentionDimKind.Head, AttentionDimKind.Dim],
+            2048);
+        CompilerServices.InferenceType(pagedAttention);
+
+        Assert.True(PagedAttentionExecutionPlanQuery.TryCreate(
+            queryType,
+            extraType,
+            Assert.IsType<TensorType>(kvCaches.CheckedType),
+            [AttentionDimKind.Seq, AttentionDimKind.Head, AttentionDimKind.Dim],
+            2048,
+            out var executionQuery));
+        Assert.Equal(2, executionQuery.LocalQueryHeads);
+        Assert.Equal(1, executionQuery.LocalKVHeads);
+
+        var cost = CompilerServices.EvaluateCost(pagedAttention, CompileOptions);
+
+        Assert.Equal((UInt128)67_088, cost[CostFactorNames.BlockLocalMemoryLoadBytes]);
+        Assert.Equal((UInt128)1_168, cost[CostFactorNames.BlockLocalMemoryStoreBytes]);
+        Assert.Equal((UInt128)68_624, cost[CostFactorNames.CPUCycles]);
+        Assert.Equal((UInt128)2, cost[CostFactorNames.GridSynchronization]);
     }
 
     private static PyNTTTargetOptions CreateOptions(TargetMachineModel machine)

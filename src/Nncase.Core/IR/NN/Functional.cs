@@ -60,9 +60,18 @@ public static class NN
         int kAxis,
         float kEpsilon,
         bool kUseMean,
-        IRArray<AttentionDimKind> layout) =>
+        IRArray<AttentionDimKind> qkvLayout,
+        IRArray<AttentionDimKind> attentionLayout) =>
         new Call(
-            new QKVRoPEWithCache(qAxis, qEpsilon, qUseMean, kAxis, kEpsilon, kUseMean, layout),
+            new QKVRoPEWithCache(
+                qAxis,
+                qEpsilon,
+                qUseMean,
+                kAxis,
+                kEpsilon,
+                kUseMean,
+                qkvLayout,
+                attentionLayout),
             qkv,
             qStats,
             kStats,

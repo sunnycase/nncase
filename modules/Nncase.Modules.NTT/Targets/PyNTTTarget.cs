@@ -45,14 +45,6 @@ public sealed class PyNTTTarget : NTTTarget
     }
 
     /// <inheritdoc/>
-    public override void RegisterPostAutoPackingPass(IPassManager passManager, CompileOptions options)
-    {
-        passManager.AddWithName<FuseQKVRoPEWithCachePass>(
-            "FuseQKVRoPEWithCache",
-            Kind);
-    }
-
-    /// <inheritdoc/>
     public override void RegisterTIRPostBufferizePass(IPassManager passManager, CompileOptions options)
     {
         passManager.AddWithName<InlineSingleCallPrimFunctionsPass>("InlineSingleCallPrimFunctions", Kind);
@@ -60,8 +52,8 @@ public sealed class PyNTTTarget : NTTTarget
             "PlanMemorySynchronization",
             Kind,
             MemorySynchronizationScopes.All);
-        passManager.AddWithName<LowerWeightPipelineRegionsPass>(
-            "LowerWeightPipelineRegions",
+        passManager.AddWithName<LowerTransferPipelineRegionsPass>(
+            "LowerTransferPipelineRegions",
             Kind);
     }
 

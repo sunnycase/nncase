@@ -85,7 +85,7 @@ public sealed partial class FoldPackReshape : IRewriteRule
                 }
 
                 if (vectorizeAxisIndex == newAxes.Count - 1 ||
-                    newAxes.Skip(vectorizeAxisIndex + 1).All(x => x == 1))
+                    newAxes.Skip(vectorizeAxisIndex + 1).All(axis => newShape[axis] == 1))
                 {
                     inputAxes.Add(inAxis);
                     inputLanes.Add(lanes);

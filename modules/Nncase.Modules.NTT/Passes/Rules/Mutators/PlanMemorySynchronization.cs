@@ -35,6 +35,8 @@ internal sealed class MemoryEffectAnalyzer
     private readonly HashSet<PrimFunction> _functions;
     private readonly Dictionary<PrimFunction, FunctionEffectSummary> _summaries = new(ReferenceEqualityComparer.Instance);
     private readonly HashSet<PrimFunction> _active = new(ReferenceEqualityComparer.Instance);
+    private readonly Dictionary<PrimFunction, FunctionEffectSummary> _transferSourceSummaries = new(ReferenceEqualityComparer.Instance);
+    private readonly HashSet<PrimFunction> _activeTransferSources = new(ReferenceEqualityComparer.Instance);
 
     public MemoryEffectAnalyzer(IEnumerable<PrimFunction> functions)
     {
@@ -51,6 +53,9 @@ internal sealed class MemoryEffectAnalyzer
 
     public EffectSet GetEffects(Expr expr, bool suppressReductionAccumulatorEffects = false)
         => GetEffects(expr, ResourceBindingScope.Empty, suppressReductionAccumulatorEffects, false);
+
+    public EffectSet GetTransferSourceEffects(Call call)
+        => GetTransferSourceEffects(call, ResourceBindingScope.Empty);
 
     public EffectSet GetIterationLocalEffects(
         Sequential body,
@@ -187,6 +192,36 @@ internal sealed class MemoryEffectAnalyzer
         }
 
         var effects = GetEffects(function.Body, ResourceBindingScope.Empty, false, false);
+        summary = CreateFunctionSummary(function, effects);
+        _active.Remove(function);
+        _summaries.Add(function, summary);
+        return summary;
+    }
+
+    private FunctionEffectSummary GetTransferSourceSummary(PrimFunction function)
+    {
+        if (_transferSourceSummaries.TryGetValue(function, out var summary))
+        {
+            return summary;
+        }
+
+        if (!_activeTransferSources.Add(function))
+        {
+            throw new InvalidOperationException(
+                $"Recursive PrimFunction call graph is not supported by transfer-source analysis: {function.Name}.");
+        }
+
+        var effects = GetTransferSourceEffects(function.Body, ResourceBindingScope.Empty);
+        summary = CreateFunctionSummary(function, effects);
+        _activeTransferSources.Remove(function);
+        _transferSourceSummaries.Add(function, summary);
+        return summary;
+    }
+
+    private static FunctionEffectSummary CreateFunctionSummary(
+        PrimFunction function,
+        EffectSet effects)
+    {
         var parameterEffects = new Dictionary<int, EffectInfo>();
         foreach (var item in effects.Items)
         {
@@ -211,10 +246,87 @@ internal sealed class MemoryEffectAnalyzer
             }
         }
 
-        _active.Remove(function);
-        summary = new FunctionEffectSummary(parameterEffects);
-        _summaries.Add(function, summary);
-        return summary;
+        return new FunctionEffectSummary(parameterEffects);
+    }
+
+    private EffectSet GetTransferSourceEffects(
+        Expr expression,
+        ResourceBindingScope bindings)
+    {
+        switch (expression)
+        {
+            case Block block:
+                return Union(
+                    [
+                        GetTransferSourceEffects(block.InitBody, bindings),
+                        GetTransferSourceEffects(block.Body, bindings),
+                    ]);
+            case Sequential sequential:
+                return Union(sequential.Fields.ToArray().Select(
+                    field => GetTransferSourceEffects(field, bindings)));
+            case PipelineFor pipelineFor:
+                var pipelineBindings = bindings;
+                for (var index = 0; index < pipelineFor.StagedAccesses.Length; index++)
+                {
+                    pipelineBindings = pipelineBindings.Bind(
+                        (BaseExpr)pipelineFor.StagedAccesses[index],
+                        pipelineFor.StagedAllocations[index]);
+                }
+
+                return Union(
+                    [
+                        GetTransferSourceEffects(pipelineFor.ProduceBody, pipelineBindings),
+                        GetTransferSourceEffects(pipelineFor.ConsumeBody, pipelineBindings),
+                    ]);
+            case Nncase.TIR.For @for:
+                return GetTransferSourceEffects(@for.Body, bindings);
+            case Let let:
+                var expressionEffects = let.Expression is Expr bindingExpression
+                    ? GetTransferSourceEffects(bindingExpression, bindings)
+                    : new EffectSet();
+                return Union(
+                    [
+                        expressionEffects,
+                        GetTransferSourceEffects(
+                            let.Body,
+                            bindings.Bind((BaseExpr)let.Var, let.Expression)),
+                    ]);
+            case IfThenElse ifThenElse:
+                return Union(
+                    [
+                        GetTransferSourceEffects(ifThenElse.Then, bindings),
+                        GetTransferSourceEffects(ifThenElse.Else, bindings),
+                    ]);
+            case Call call:
+                return GetTransferSourceEffects(call, bindings);
+            default:
+                return new EffectSet();
+        }
+    }
+
+    private EffectSet GetTransferSourceEffects(
+        Call call,
+        ResourceBindingScope bindings)
+    {
+        if (call.Target is PrimFunction callee && _functions.Contains(callee))
+        {
+            return Instantiate(
+                GetTransferSourceSummary(callee),
+                call.Arguments,
+                bindings);
+        }
+
+        if (call.Target is not Op ||
+            call.Metadata.TIRMicroKernel?.TransferPipeline is not { } contract)
+        {
+            return new EffectSet();
+        }
+
+        return GetCallEffects(
+            call,
+            bindings,
+            suppressReductionAccumulatorEffects: false,
+            contract.SourceArgumentIndices.ToHashSet());
     }
 
     private static int FindParameterIndex(PrimFunction function, BaseExpr identity)
@@ -233,13 +345,20 @@ internal sealed class MemoryEffectAnalyzer
     private static EffectSet GetCallEffects(
         Call call,
         ResourceBindingScope bindings,
-        bool suppressReductionAccumulatorEffects)
+        bool suppressReductionAccumulatorEffects,
+        IReadOnlySet<int>? includedArgumentIndices = null)
     {
         var effects = new EffectSet();
         MemoryEffectUtility.VisitCallEffects(
             call,
-            (argument, _, effect) =>
+            (argument, _, argumentIndex, effect) =>
             {
+                if (includedArgumentIndices is not null &&
+                    !includedArgumentIndices.Contains(argumentIndex))
+                {
+                    return;
+                }
+
                 if (suppressReductionAccumulatorEffects &&
                     effect.Kind == MemoryEffectKind.ReductionAccumulator)
                 {
@@ -1064,7 +1183,7 @@ internal sealed class MemorySynchronizationPlanner
         fields.Add(TIR.F.NTT.Barrier(requirement.Scope, requirement.ToBarrierAxisGroupAxes()));
     }
 
-    private static bool TryGetBarrier(Expr expression, out TIR.NTT.Barrier barrier)
+    internal static bool TryGetBarrier(Expr expression, out TIR.NTT.Barrier barrier)
     {
         if (expression is Call { Target: TIR.NTT.Barrier target })
         {

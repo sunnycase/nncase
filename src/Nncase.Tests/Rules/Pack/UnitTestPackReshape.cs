@@ -46,6 +46,18 @@ public class UnitTestVectorizeReshape : TransformTestBase
     }
 
     [Fact]
+    public void TestVectorizeReshapePropagationAcrossTrailingUnitAxis()
+    {
+        var input = Testing.Rand<float>(1, 16, 128);
+        var inputVar = new Var(new TensorType(input.ElementType, input.Shape));
+        Expr expr = Pack(Reshape(inputVar, [16, 128, 1]), [8], [1]);
+        expr = Unpack(expr, [8], [1]);
+        TestMatched<VectorizeReshapePropagation>(
+            expr,
+            new Dictionary<IVar, IValue> { { inputVar, Value.FromTensor(input) } });
+    }
+
+    [Fact]
     public void TestReshapeDevectorizePropagationDynamicUnsqueeze()
     {
         var dimX = new DimVar("x") { Metadata = { Range = (1, 256) } };
@@ -73,5 +85,16 @@ public class UnitTestVectorizeReshape : TransformTestBase
         var inputVar = new Var(new TensorType(input.ElementType, [dimX, 9]));
         Expr expr = Reshape(Unpack(inputVar, [8], [1]), [1, dimX, 3, 24]);
         TestMatched<ReshapeDevectorizePropagation>(expr, new Dictionary<IVar, IValue> { { inputVar, Value.FromTensor(input) } });
+    }
+
+    [Fact]
+    public void TestReshapeDevectorizePropagationAcrossTrailingUnitAxis()
+    {
+        var input = Pack(Testing.Rand<float>(16, 128, 1), [8], [1]).Evaluate().AsTensor();
+        var inputVar = new Var(new TensorType(input.ElementType, input.Shape));
+        Expr expr = Reshape(Unpack(inputVar, [8], [1]), [1, 16, 128]);
+        TestMatched<ReshapeDevectorizePropagation>(
+            expr,
+            new Dictionary<IVar, IValue> { { inputVar, Value.FromTensor(input) } });
     }
 }

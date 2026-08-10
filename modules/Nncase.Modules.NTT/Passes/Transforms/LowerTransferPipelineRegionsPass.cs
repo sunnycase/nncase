@@ -9,14 +9,14 @@ using Nncase.TIR;
 namespace Nncase.Passes.Transforms;
 
 /// <summary>
-/// Splits selected weight-pipelined kernels into explicit producer and consumer
-/// tasks after Bufferize has fixed Shared allocation ranges.
+/// Splits selected transfer-pipelined kernels into explicit producer and
+/// consumer tasks after Bufferize has fixed Shared allocation ranges.
 /// </summary>
-public sealed class LowerWeightPipelineRegionsPass : ModulePass
+public sealed class LowerTransferPipelineRegionsPass : ModulePass
 {
     private readonly string _moduleKind;
 
-    public LowerWeightPipelineRegionsPass(string moduleKind)
+    public LowerTransferPipelineRegionsPass(string moduleKind)
     {
         _moduleKind = moduleKind;
     }
@@ -77,7 +77,7 @@ public sealed class LowerWeightPipelineRegionsPass : ModulePass
             if (!CompilerServices.InferenceType(replacement))
             {
                 throw new InvalidOperationException(
-                    $"Type inference failed after lowering weight pipelines in {function.Name}.");
+                    $"Type inference failed after lowering transfer pipelines in {function.Name}.");
             }
 
             input.Replace(index, replacement);
@@ -93,7 +93,7 @@ public sealed class LowerWeightPipelineRegionsPass : ModulePass
         var result = new HashSet<PrimFunction>(ReferenceEqualityComparer.Instance);
         foreach (var function in allFunctions)
         {
-            if (EnumerateCalls(function.Body).Any(IsWeightPipelineCall))
+            if (EnumerateCalls(function.Body).Any(IsTransferPipelineCall))
             {
                 result.Add(function);
             }
@@ -133,17 +133,17 @@ public sealed class LowerWeightPipelineRegionsPass : ModulePass
             pipelineFunctions,
             function.Name,
             ref stageIndex);
-        var ownership = BuildOwnershipPlan(
+        var synchronization = BuildSynchronizationPlan(
             consumer,
             function.Name,
             effectAnalyzer);
-        var consumeBody = InsertConsumerSynchronization(consumer, ownership);
-        var produceBody = BuildProducerBody(consumer, ownership);
+        var consumeBody = InsertConsumerSynchronization(consumer, synchronization);
+        var produceBody = BuildProducerBody(consumer, synchronization);
         var region = new ProducerConsumerRegion(produceBody, consumeBody);
         return new Sequential(region);
     }
 
-    private static SharedOwnershipPlan BuildOwnershipPlan(
+    private static PipelineSynchronizationPlan BuildSynchronizationPlan(
         Sequential consumer,
         string functionName,
         MemoryEffectAnalyzer effectAnalyzer)
@@ -207,17 +207,94 @@ public sealed class LowerWeightPipelineRegionsPass : ModulePass
                 }
 
                 var handoff = new PipelineHandoff(
-                    $"{functionName}_shared_handoff_{handoffIndex++}",
-                    sharedOffsetBytes);
+                    $"{functionName}_shared_handoff_{handoffIndex++}_at_{sharedOffsetBytes}");
                 AddMarker(consumerMarkers, predecessor.Expression, handoff);
                 AddMarker(producerMarkers, owner.Expression, handoff);
             }
         }
 
+        AddTransferSourceHandoffs(
+            consumer,
+            functionName,
+            effectAnalyzer,
+            consumerMarkers,
+            producerMarkers,
+            ref handoffIndex);
+
         return new(
             drainedStages,
             consumerMarkers,
             producerMarkers);
+    }
+
+    private static void AddTransferSourceHandoffs(
+        Sequential consumer,
+        string functionName,
+        MemoryEffectAnalyzer effectAnalyzer,
+        IDictionary<Expr, List<PipelineHandoff>> consumerMarkers,
+        IDictionary<Expr, List<PipelineHandoff>> producerMarkers,
+        ref int handoffIndex)
+    {
+        var executionOrder = EnumerateExecutionOrder(consumer).ToArray();
+        for (var stageIndex = 0; stageIndex < executionOrder.Length; stageIndex++)
+        {
+            if (executionOrder[stageIndex] is not PipelineStage stage)
+            {
+                continue;
+            }
+
+            var sourceEffects = effectAnalyzer.GetTransferSourceEffects(stage.Operation);
+            if (!sourceEffects.Items.Any())
+            {
+                throw new InvalidOperationException(
+                    $"Transfer-pipeline stage {stage.StageId} in {functionName} has no " +
+                    "physical source effects.");
+            }
+
+            var pending = new PendingEffectSet();
+            Expr? releaseBoundary = null;
+            for (var expressionIndex = 0; expressionIndex < stageIndex; expressionIndex++)
+            {
+                var expression = executionOrder[expressionIndex];
+                if (MemorySynchronizationPlanner.TryGetBarrier(expression, out var barrier))
+                {
+                    var hadConflict = pending.TryGetConflict(sourceEffects, out _);
+                    pending.Synchronize(SynchronizationRequirement.FromBarrier(barrier));
+                    if (hadConflict && !pending.TryGetConflict(sourceEffects, out _))
+                    {
+                        releaseBoundary = expression;
+                    }
+
+                    continue;
+                }
+
+                var effects = expression is PipelineStage precedingStage
+                    ? effectAnalyzer.GetEffects(precedingStage.Operation)
+                    : effectAnalyzer.GetEffects(expression);
+                pending.Add(effects);
+                if (pending.TryGetConflict(sourceEffects, out _))
+                {
+                    releaseBoundary = null;
+                }
+            }
+
+            if (pending.TryGetConflict(sourceEffects, out var unsynchronized))
+            {
+                throw new InvalidOperationException(
+                    $"Transfer-pipeline stage {stage.StageId} in {functionName} reads a " +
+                    $"source after a conflicting write without an effective {unsynchronized.Scope} barrier.");
+            }
+
+            if (releaseBoundary is null)
+            {
+                continue;
+            }
+
+            var handoff = new PipelineHandoff(
+                $"{functionName}_source_handoff_{handoffIndex++}");
+            AddMarker(consumerMarkers, releaseBoundary, handoff);
+            AddMarker(producerMarkers, stage, handoff);
+        }
     }
 
     private static IEnumerable<SharedOwner> EnumerateSharedOwners(
@@ -241,7 +318,7 @@ public sealed class LowerWeightPipelineRegionsPass : ModulePass
                 if (stage is not null)
                 {
                     throw new InvalidOperationException(
-                        $"Weight-pipeline stage {stage.StageId} in {functionName} has no " +
+                        $"Transfer-pipeline stage {stage.StageId} in {functionName} has no " +
                         "physical Shared workspace after Bufferize.");
                 }
 
@@ -264,15 +341,15 @@ public sealed class LowerWeightPipelineRegionsPass : ModulePass
             case TIR.NTT.NTTKernelOp:
                 var selection = call.Metadata.TIRMicroKernel
                     ?? throw new InvalidOperationException(
-                        $"Weight-pipeline kernel in {functionName} has no TIR microkernel selection.");
-                var contract = selection.WeightPipeline
+                        $"Transfer-pipeline kernel in {functionName} has no TIR microkernel selection.");
+                var contract = selection.TransferPipeline
                     ?? throw new InvalidOperationException(
-                        $"Weight-pipeline kernel {selection.Family}/{selection.Variant} in " +
-                        $"{functionName} has no weight-pipeline contract.");
+                        $"Transfer-pipeline kernel {selection.Family}/{selection.Variant} in " +
+                        $"{functionName} has no transfer-pipeline contract.");
                 if (call.Arguments.Length == 0)
                 {
                     throw new InvalidOperationException(
-                        $"Weight-pipeline kernel {selection.Family}/{selection.Variant} in " +
+                        $"Transfer-pipeline kernel {selection.Family}/{selection.Variant} in " +
                         $"{functionName} has no Shared workspace operand.");
                 }
 
@@ -281,7 +358,7 @@ public sealed class LowerWeightPipelineRegionsPass : ModulePass
                     .Select(index => (uint)index < (uint)workspaces.Length
                         ? workspaces[index]
                         : throw new InvalidOperationException(
-                            $"Weight-pipeline kernel {selection.Family}/{selection.Variant} in " +
+                            $"Transfer-pipeline kernel {selection.Family}/{selection.Variant} in " +
                             $"{functionName} references missing Shared workspace {index}."))
                     .ToArray();
             case PrimFunction callee:
@@ -461,19 +538,19 @@ public sealed class LowerWeightPipelineRegionsPass : ModulePass
 
     private static Sequential InsertConsumerSynchronization(
         Sequential body,
-        SharedOwnershipPlan ownership)
+        PipelineSynchronizationPlan synchronization)
         => RewriteSequential(
             body,
             field =>
             {
-                var fields = new List<Expr> { RewriteConsumerExpression(field, ownership) };
+                var fields = new List<Expr> { RewriteConsumerExpression(field, synchronization) };
                 if (field is PipelineStage stage &&
-                    ownership.DrainedStages.Contains(stage.StageId))
+                    synchronization.DrainedStages.Contains(stage.StageId))
                 {
                     fields.Add(new PipelineDrain(stage.StageId));
                 }
 
-                if (ownership.ConsumerHandoffs.TryGetValue(field, out var handoffs))
+                if (synchronization.ConsumerHandoffs.TryGetValue(field, out var handoffs))
                 {
                     fields.AddRange(handoffs);
                 }
@@ -483,22 +560,22 @@ public sealed class LowerWeightPipelineRegionsPass : ModulePass
 
     private static Expr RewriteConsumerExpression(
         Expr expression,
-        SharedOwnershipPlan ownership)
+        PipelineSynchronizationPlan synchronization)
         => expression switch
         {
-            Sequential sequential => InsertConsumerSynchronization(sequential, ownership),
+            Sequential sequential => InsertConsumerSynchronization(sequential, synchronization),
             _ => expression,
         };
 
     private static Sequential BuildProducerBody(
         Sequential consumer,
-        SharedOwnershipPlan ownership)
+        PipelineSynchronizationPlan synchronization)
         => RewriteSequential(
             consumer,
             field =>
             {
                 var fields = new List<Expr>();
-                if (ownership.ProducerHandoffs.TryGetValue(field, out var handoffs))
+                if (synchronization.ProducerHandoffs.TryGetValue(field, out var handoffs))
                 {
                     fields.AddRange(handoffs);
                 }
@@ -507,7 +584,7 @@ public sealed class LowerWeightPipelineRegionsPass : ModulePass
                 {
                     case PipelineStage stage:
                         fields.Add(stage);
-                        if (ownership.DrainedStages.Contains(stage.StageId))
+                        if (synchronization.DrainedStages.Contains(stage.StageId))
                         {
                             fields.Add(new PipelineDrain(stage.StageId));
                         }
@@ -516,7 +593,7 @@ public sealed class LowerWeightPipelineRegionsPass : ModulePass
                     case Sequential sequential:
                         var nested = BuildProducerBody(
                             sequential,
-                            ownership);
+                            synchronization);
                         if (nested.Count > 0)
                         {
                             fields.Add(nested);
@@ -559,7 +636,7 @@ public sealed class LowerWeightPipelineRegionsPass : ModulePass
                     break;
                 case Call call when IsPipelineInvocation(call, pipelineFunctions):
                     fields.Add(new PipelineStage(
-                        $"{functionName}_weight_stage_{stageIndex++}",
+                        $"{functionName}_transfer_stage_{stageIndex++}",
                         call));
                     break;
                 default:
@@ -620,7 +697,7 @@ public sealed class LowerWeightPipelineRegionsPass : ModulePass
         string functionName,
         string construct)
         => new(
-            $"PrimFunction {functionName} contains a weight-pipeline stage under " +
+            $"PrimFunction {functionName} contains a transfer-pipeline stage under " +
             $"{construct}. Producer/consumer lowering requires a straight-line " +
             "stage order until structured task control flow is represented in TIR.");
 
@@ -633,12 +710,12 @@ public sealed class LowerWeightPipelineRegionsPass : ModulePass
     private static bool IsPipelineInvocation(
         Call call,
         IReadOnlySet<PrimFunction> pipelineFunctions)
-        => IsWeightPipelineCall(call) ||
+        => IsTransferPipelineCall(call) ||
             (call.Target is PrimFunction callee &&
              pipelineFunctions.Contains(callee));
 
-    private static bool IsWeightPipelineCall(Call call)
-        => call.Metadata.TIRMicroKernel?.WeightPipeline is not null;
+    private static bool IsTransferPipelineCall(Call call)
+        => call.Metadata.TIRMicroKernel?.TransferPipeline is not null;
 
     private static IEnumerable<Call> EnumerateCalls(BaseExpr expression)
     {
@@ -823,7 +900,7 @@ public sealed class LowerWeightPipelineRegionsPass : ModulePass
         IReadOnlyList<MemoryByteRange> Ranges,
         PipelineStage? Stage);
 
-    private sealed record SharedOwnershipPlan(
+    private sealed record PipelineSynchronizationPlan(
         IReadOnlySet<string> DrainedStages,
         IReadOnlyDictionary<Expr, List<PipelineHandoff>> ConsumerHandoffs,
         IReadOnlyDictionary<Expr, List<PipelineHandoff>> ProducerHandoffs);

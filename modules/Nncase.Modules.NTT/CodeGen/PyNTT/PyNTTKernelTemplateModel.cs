@@ -13,7 +13,7 @@ public sealed record PyNTTMicroKernelTemplateModel(
     string Variant,
     IReadOnlyDictionary<string, long> Parameters,
     IReadOnlyDictionary<string, string> SharedWorkspaceOffsets,
-    bool HasWeightPipeline);
+    bool HasTransferPipeline);
 
 public sealed record PyNTTPipelineStageTemplateModel(
     string StageId,
@@ -658,6 +658,15 @@ public sealed record PyNTTQKVRoPEWithCacheTemplateModel(
     PyNTTRoPETemplateModel KRoPE,
     PyNTTUpdatePagedAttentionKVCacheTemplateModel KUpdate,
     PyNTTUpdatePagedAttentionKVCacheTemplateModel VUpdate,
+    PyNTTBufferPointerTemplateModel QOutput,
+    string QOutputDType,
+    string QOutputTritonDType,
+    PyNTTDimExpression[] QOutputShape,
+    PyNTTDimExpression[] QOutputStrides,
+    int QOutputVectorLaneCount,
+    int[] QOutputVectorLaneShape,
+    int[] QKVLayout,
+    int[] AttentionLayout,
     string Comment)
 {
     public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
@@ -686,8 +695,85 @@ public sealed record PyNTTPagedAttentionTemplateModel(
     int DimAxis,
     int GlobalNumQueryHeads,
     string LayerIdExpression,
-    int AttentionBlockSize,
     PyNTTPagedAttentionCacheTemplateModel Cache,
+    string Comment)
+{
+    public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
+}
+
+public sealed record PyNTTPagedAttentionPartialTemplateModel(
+    string FunctionName,
+    PyNTTBufferPointerTemplateModel Query,
+    PyNTTBufferPointerTemplateModel Scale,
+    PyNTTBufferPointerTemplateModel MaxState,
+    PyNTTBufferPointerTemplateModel SumState,
+    PyNTTBufferPointerTemplateModel AccState,
+    string QueryDType,
+    string QueryTritonDType,
+    PyNTTDimExpression[] QueryShape,
+    PyNTTDimExpression[] QueryStrides,
+    int[] QueryVectorLaneShape,
+    PyNTTDimExpression[] OutputShape,
+    PyNTTDimExpression[] OutputGlobalShape,
+    PyNTTDimExpression[] OutputStrides,
+    int[] OutputVectorLaneShape,
+    int[][] OutputSplitAxes,
+    PyNTTDimExpression[] MaxStateShape,
+    PyNTTDimExpression[] MaxStateStrides,
+    PyNTTDimExpression[] SumStateShape,
+    PyNTTDimExpression[] SumStateStrides,
+    PyNTTDimExpression[] AccStateShape,
+    PyNTTDimExpression[] AccStateStrides,
+    int[] Hierarchy,
+    int SeqAxis,
+    int HeadAxis,
+    int DimAxis,
+    int GlobalNumQueryHeads,
+    string LayerIdExpression,
+    int SplitHierarchyAxis,
+    int SplitCount,
+    PyNTTMicroKernelTemplateModel MicroKernel,
+    string? KeyDescriptorName,
+    string? ValueDescriptorName,
+    string BlockTableArgument,
+    string? KVCacheArgument,
+    string NumBlocksPerShardArgument,
+    string QueryStartLocArgument,
+    string SeqLensArgument,
+    string NumSeqsArgument,
+    PyNTTPagedAttentionCacheTemplateModel Cache,
+    string Comment)
+{
+    public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
+}
+
+public sealed record PyNTTPagedAttentionMergeTemplateModel(
+    string FunctionName,
+    PyNTTBufferPointerTemplateModel MaxState,
+    PyNTTBufferPointerTemplateModel SumState,
+    PyNTTBufferPointerTemplateModel AccState,
+    PyNTTBufferPointerTemplateModel Output,
+    string OutputDType,
+    string OutputTritonDType,
+    PyNTTDimExpression[] MaxStateShape,
+    PyNTTDimExpression[] MaxStateStrides,
+    PyNTTDimExpression[] SumStateShape,
+    PyNTTDimExpression[] SumStateStrides,
+    PyNTTDimExpression[] AccStateShape,
+    PyNTTDimExpression[] AccStateStrides,
+    PyNTTDimExpression[] OutputShape,
+    PyNTTDimExpression[] OutputGlobalShape,
+    PyNTTDimExpression[] OutputStrides,
+    int[] OutputVectorLaneShape,
+    int[][] OutputSplitAxes,
+    int[] Hierarchy,
+    int SeqAxis,
+    int HeadAxis,
+    int DimAxis,
+    int HeadDimension,
+    int GlobalNumQueryHeads,
+    int SplitHierarchyAxis,
+    int SplitCount,
     string Comment)
 {
     public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();

@@ -190,6 +190,7 @@ public class Compiler : ICompiler
 
         passManager.Add<InferRangePass>();
         passManager.Add<OptimizeByRangePass>();
+        passManager.AddWithName<FormQKVRoPEWithCachePass>("FormQKVRoPEWithCache");
 
         passManager.AddWithName<EGraphRulesPass>("NeutralOptimizeTranspose").Configure(p =>
         {

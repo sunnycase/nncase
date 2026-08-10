@@ -28,6 +28,9 @@ internal sealed class CostEvaluateVisitor : ExprVisitor<Cost, Unit>
     protected override Cost VisitLeafConst(Const expr) => Cost.Zero;
 
     /// <inheritdoc/>
+    protected override Cost VisitLeafDimension(Dimension expr) => Cost.Zero;
+
+    /// <inheritdoc/>
     protected override Cost VisitLeafMarker(Marker expr) => ExprMemo[expr.Target];
 
     /// <inheritdoc/>

@@ -50,12 +50,21 @@ public sealed partial class QKVRoPEWithCache : Op
 
     public bool KUseMean { get; }
 
-    public IRArray<AttentionDimKind> Layout { get; }
+    /// <summary>
+    /// Gets the semantic axis layout of the Q, K, and V inputs.
+    /// </summary>
+    public IRArray<AttentionDimKind> QKVLayout { get; }
+
+    /// <summary>
+    /// Gets the semantic axis layout of the returned query and cache slots.
+    /// </summary>
+    public IRArray<AttentionDimKind> AttentionLayout { get; }
 
     public override bool CanFoldConstCall => false;
 
     public override string DisplayProperty() =>
         $"QAxis: {QAxis}, QEpsilon: {QEpsilon}, QUseMean: {QUseMean}, " +
         $"KAxis: {KAxis}, KEpsilon: {KEpsilon}, KUseMean: {KUseMean}, " +
-        $"Layout [{string.Join(',', Layout)}]";
+        $"QKVLayout [{string.Join(',', QKVLayout)}], " +
+        $"AttentionLayout [{string.Join(',', AttentionLayout)}]";
 }

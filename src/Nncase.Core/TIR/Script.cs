@@ -203,10 +203,8 @@ public static class T
     public static PipelineDrain PipelineDrain(string stageId)
         => new(stageId);
 
-    public static PipelineHandoff PipelineHandoff(
-        string handoffId,
-        long sharedOffsetBytes)
-        => new(handoffId, sharedOffsetBytes);
+    public static PipelineHandoff PipelineHandoff(string handoffId)
+        => new(handoffId);
 
     /// <summary>
     /// Attaches a semantic execution scope used by diagnostics and backend tracing.

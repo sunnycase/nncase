@@ -15,25 +15,25 @@ using Xunit;
 namespace Nncase.Tests.TransformTest;
 
 [TestFixture.AutoSetupTestMethod(InitSession = true)]
-public sealed class UnitTestWeightPipelineRegions : TestClassBase
+public sealed class UnitTestTransferPipelineRegions : TestClassBase
 {
     [Fact]
     public async Task TestOverlappingPipelineStagesDrainPreviousOwner()
     {
         var source = CreateBuffer("source", MemoryLocation.Data, 4096);
         var shared = CreateBuffer("shared", MemoryLocation.Shared, 0);
-        var first = CreateWeightPipelineCall(source, shared);
-        var second = CreateWeightPipelineCall(source, shared);
+        var first = CreateTransferPipelineCall(source, shared);
+        var second = CreateTransferPipelineCall(source, shared);
         var module = CreateModule(new Sequential(first, second));
 
         await RunPass(module);
 
         var region = GetRegion(Assert.IsType<PrimFunction>(module.Entry));
         Assert.Equal(
-            ["main_weight_stage_0"],
+            ["main_transfer_stage_0"],
             region.ConsumeBody.Fields.ToArray().OfType<PipelineDrain>().Select(drain => drain.StageId));
         Assert.Equal(
-            ["main_weight_stage_0"],
+            ["main_transfer_stage_0"],
             region.ProduceBody.Fields.ToArray().OfType<PipelineDrain>().Select(drain => drain.StageId));
     }
 
@@ -45,8 +45,8 @@ public sealed class UnitTestWeightPipelineRegions : TestClassBase
         var secondShared = CreateBuffer("second_shared", MemoryLocation.Shared, 512);
         var module = CreateModule(
             new Sequential(
-                CreateWeightPipelineCall(source, firstShared),
-                CreateWeightPipelineCall(source, secondShared)));
+                CreateTransferPipelineCall(source, firstShared),
+                CreateTransferPipelineCall(source, secondShared)));
 
         await RunPass(module);
 
@@ -64,7 +64,7 @@ public sealed class UnitTestWeightPipelineRegions : TestClassBase
         var module = CreateModule(
             new Sequential(
                 T.Memcopy(destination, shared),
-                CreateWeightPipelineCall(source, shared)));
+                CreateTransferPipelineCall(source, shared)));
 
         await RunPass(module);
 
@@ -74,8 +74,6 @@ public sealed class UnitTestWeightPipelineRegions : TestClassBase
         var producerHandoff = Assert.Single(
             region.ProduceBody.Fields.ToArray().OfType<PipelineHandoff>());
         Assert.Equal(consumerHandoff.HandoffId, producerHandoff.HandoffId);
-        Assert.Equal(0, consumerHandoff.SharedOffsetBytes);
-        Assert.Equal(consumerHandoff.SharedOffsetBytes, producerHandoff.SharedOffsetBytes);
         Assert.True(
             Array.IndexOf(region.ConsumeBody.Fields.ToArray(), consumerHandoff) <
             Array.FindIndex(
@@ -86,6 +84,103 @@ public sealed class UnitTestWeightPipelineRegions : TestClassBase
             Array.FindIndex(
                 region.ProduceBody.Fields.ToArray(),
                 expression => expression is PipelineStage));
+    }
+
+    [Fact]
+    public async Task TestMutableTransferSourceWaitsForConsumerBarrier()
+    {
+        var update = CreateBuffer("update", MemoryLocation.Data, 8192);
+        var source = CreateBuffer("source", MemoryLocation.Data, 4096);
+        var shared = CreateBuffer("shared", MemoryLocation.Shared, 0);
+        var barrier = TIR.F.NTT.Barrier(TIR.NTT.BarrierScope.Block);
+        var module = CreateModule(
+            new Sequential(
+                T.Memcopy(source, update),
+                barrier,
+                CreateTransferPipelineCall(source, shared)));
+
+        await RunPass(module);
+
+        var region = GetRegion(Assert.IsType<PrimFunction>(module.Entry));
+        var consumerFields = region.ConsumeBody.Fields.ToArray();
+        var producerFields = region.ProduceBody.Fields.ToArray();
+        var consumerHandoff = Assert.Single(consumerFields.OfType<PipelineHandoff>());
+        var producerHandoff = Assert.Single(producerFields.OfType<PipelineHandoff>());
+        Assert.Equal(consumerHandoff.HandoffId, producerHandoff.HandoffId);
+        Assert.Equal(
+            Array.IndexOf(consumerFields, barrier) + 1,
+            Array.IndexOf(consumerFields, consumerHandoff));
+        Assert.Equal(
+            Array.FindIndex(producerFields, expression => expression is PipelineStage) - 1,
+            Array.IndexOf(producerFields, producerHandoff));
+    }
+
+    [Fact]
+    public async Task TestMutableTransferSourceWithoutBarrierFailsFast()
+    {
+        var update = CreateBuffer("update", MemoryLocation.Data, 8192);
+        var source = CreateBuffer("source", MemoryLocation.Data, 4096);
+        var shared = CreateBuffer("shared", MemoryLocation.Shared, 0);
+        var module = CreateModule(
+            new Sequential(
+                T.Memcopy(source, update),
+                CreateTransferPipelineCall(source, shared)));
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => RunPass(module));
+
+        Assert.Contains("without an effective Block barrier", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task TestNestedTransferSourceWaitsForCallerBarrier()
+    {
+        var tensorType = new TensorType(DataTypes.Float32, new[] { 64 });
+        var formalSource = new BufferVar(
+            "formal_source",
+            tensorType,
+            BufferVarRole.Input,
+            MemoryLocation.Data);
+        var formalShared = new BufferVar(
+            "formal_shared",
+            TensorType.Scalar(new PointerType(DataTypes.UInt8)),
+            BufferVarRole.Workspace,
+            MemoryLocation.Shared);
+        var calleeShared = CreateBuffer("callee_shared", MemoryLocation.Shared, 0);
+        var callee = new PrimFunction(
+            "pipeline_callee",
+            PyNTTTarget.Kind,
+            new Sequential(CreateTransferPipelineCall(formalSource, calleeShared)),
+            new IVar[] { formalSource, formalShared });
+        var update = CreateBuffer("update", MemoryLocation.Data, 8192);
+        var source = CreateBuffer("source", MemoryLocation.Data, 4096);
+        var shared = CreateBuffer("shared", MemoryLocation.Shared, 0);
+        var barrier = TIR.F.NTT.Barrier(TIR.NTT.BarrierScope.Block);
+        var main = new PrimFunction(
+            "main",
+            PyNTTTarget.Kind,
+            new Sequential(
+                T.Memcopy(source, update),
+                barrier,
+                new Call(callee, source, shared)),
+            Array.Empty<IVar>());
+        var module = new IRModule(main);
+        module.Add(callee);
+
+        await RunPass(module);
+
+        var region = GetRegion(Assert.IsType<PrimFunction>(module.Entry));
+        var consumerFields = region.ConsumeBody.Fields.ToArray();
+        var producerFields = region.ProduceBody.Fields.ToArray();
+        var consumerHandoff = Assert.Single(consumerFields.OfType<PipelineHandoff>());
+        var producerHandoff = Assert.Single(producerFields.OfType<PipelineHandoff>());
+        Assert.Equal(consumerHandoff.HandoffId, producerHandoff.HandoffId);
+        Assert.Equal(
+            Array.IndexOf(consumerFields, barrier) + 1,
+            Array.IndexOf(consumerFields, consumerHandoff));
+        Assert.Equal(
+            Array.FindIndex(producerFields, expression => expression is PipelineStage) - 1,
+            Array.IndexOf(producerFields, producerHandoff));
     }
 
     [Fact]
@@ -100,7 +195,7 @@ public sealed class UnitTestWeightPipelineRegions : TestClassBase
         var module = CreateModule(
             new Sequential(
                 conditionalOwner,
-                CreateWeightPipelineCall(source, shared)));
+                CreateTransferPipelineCall(source, shared)));
 
         await RunPass(module);
 
@@ -130,7 +225,7 @@ public sealed class UnitTestWeightPipelineRegions : TestClassBase
         var module = CreateModule(
             new Sequential(
                 T.Memcopy(destination, consumerShared),
-                CreateWeightPipelineCall(
+                CreateTransferPipelineCall(
                     source,
                     pipelineShared,
                     lhs: consumerShared,
@@ -164,7 +259,7 @@ public sealed class UnitTestWeightPipelineRegions : TestClassBase
             PyNTTTarget.Kind,
             new Sequential(
                 new Call(callee, shared),
-                CreateWeightPipelineCall(source, shared)),
+                CreateTransferPipelineCall(source, shared)),
             Array.Empty<IVar>());
         var module = new IRModule(main);
         module.Add(callee);
@@ -183,7 +278,7 @@ public sealed class UnitTestWeightPipelineRegions : TestClassBase
         var shared = CreateBuffer("shared", MemoryLocation.Shared, 0);
         var conditional = new IfThenElse(
             IR.F.Math.Equal(1, 1),
-            new Sequential(CreateWeightPipelineCall(source, shared)));
+            new Sequential(CreateTransferPipelineCall(source, shared)));
         var module = CreateModule(new Sequential(conditional));
 
         var exception = await Assert.ThrowsAsync<NotSupportedException>(
@@ -203,7 +298,7 @@ public sealed class UnitTestWeightPipelineRegions : TestClassBase
             BufferVarRole.Workspace,
             MemoryLocation.Shared);
         var module = CreateModule(
-            new Sequential(CreateWeightPipelineCall(source, unbufferizedShared)));
+            new Sequential(CreateTransferPipelineCall(source, unbufferizedShared)));
 
         var exception = await Assert.ThrowsAsync<InvalidOperationException>(
             () => RunPass(module));
@@ -229,7 +324,7 @@ public sealed class UnitTestWeightPipelineRegions : TestClassBase
         var callee = new PrimFunction(
             "pipeline_callee",
             PyNTTTarget.Kind,
-            new Sequential(CreateWeightPipelineCall(formalSource, calleeShared)),
+            new Sequential(CreateTransferPipelineCall(formalSource, calleeShared)),
             new IVar[] { formalSource, formalShared });
         var shared = CreateBuffer("shared", MemoryLocation.Shared, 0);
         var source = CreateBuffer("source", MemoryLocation.Data, 4096);
@@ -262,7 +357,7 @@ public sealed class UnitTestWeightPipelineRegions : TestClassBase
     }
 
     private static Task<IRModule> RunPass(IRModule module)
-        => new LowerWeightPipelineRegionsPass(PyNTTTarget.Kind).RunAsync(module, new());
+        => new LowerTransferPipelineRegionsPass(PyNTTTarget.Kind).RunAsync(module, new());
 
     private static IRModule CreateModule(Sequential body)
         => new(new PrimFunction(
@@ -274,7 +369,7 @@ public sealed class UnitTestWeightPipelineRegions : TestClassBase
     private static ProducerConsumerRegion GetRegion(PrimFunction function)
         => Assert.IsType<ProducerConsumerRegion>(Assert.Single(function.Body.Fields.ToArray()));
 
-    private static Call CreateWeightPipelineCall(
+    private static Call CreateTransferPipelineCall(
         Expr weight,
         Expr sharedWorkspace,
         Expr? lhs = null,
@@ -283,7 +378,7 @@ public sealed class UnitTestWeightPipelineRegions : TestClassBase
         var call = TIR.F.NTT.PackedMatMul(
             lhs ?? weight,
             weight,
-            output ?? weight,
+            output ?? CreateBuffer("pipeline_output", MemoryLocation.Data, 16384),
             None.Default,
             1.0f);
         var arguments = call.Arguments.ToArray();
@@ -298,7 +393,7 @@ public sealed class UnitTestWeightPipelineRegions : TestClassBase
                     "shared",
                     new TensorType(DataTypes.Float32, new[] { 64 }),
                     256)),
-            new TIRWeightPipelineContract([1], [0]));
+            new TIRTransferPipelineContract([1], [0]));
         return call;
     }
 

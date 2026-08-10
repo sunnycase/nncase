@@ -3,6 +3,7 @@
 
 using System;
 using System.ComponentModel;
+using Nncase.CostModel;
 using Nncase.Passes.Distributed;
 using Nncase.Schedule;
 
@@ -11,9 +12,10 @@ namespace Nncase.Targets;
 /// <summary>
 /// Target options for PyNTT.
 /// </summary>
-public sealed class PyNTTTargetOptions : NTTTargetOptions
+public sealed class PyNTTTargetOptions : NTTTargetOptions, IPagedAttentionExecutionPlanProvider
 {
     private string _backend = "triton";
+    private TritonPagedAttentionExecutionPlanner _pagedAttentionExecutionPlanner = null!;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="PyNTTTargetOptions"/> class.
@@ -59,6 +61,10 @@ public sealed class PyNTTTargetOptions : NTTTargetOptions
     public override IDistributedReshardRealizationPolicy ReshardRealizationPolicy
         => PyNTTDistributedReshardRealizationPolicy.Instance;
 
+    public PagedAttentionExecutionPlan GetPagedAttentionExecutionPlan(
+        PagedAttentionExecutionPlanQuery query)
+        => _pagedAttentionExecutionPlanner.Plan(query);
+
     public static PyNTTTargetOptions FromNTTTargetOptions(NTTTargetOptions nttOptions)
     {
         return new PyNTTTargetOptions
@@ -83,6 +89,7 @@ public sealed class PyNTTTargetOptions : NTTTargetOptions
     protected override void OnTargetMachineChanged()
     {
         TargetCostModel = new TritonTargetOpCostModel(TargetMachineModel);
+        _pagedAttentionExecutionPlanner = new TritonPagedAttentionExecutionPlanner(TargetMachineModel);
         BlockMicroKernelModel = new DefaultBlockMicroKernelModel();
         TIRMicroKernelSelector = new TritonTIRMicroKernelSelector();
         StorageEncodingModel = new DefaultTargetStorageEncodingModel();

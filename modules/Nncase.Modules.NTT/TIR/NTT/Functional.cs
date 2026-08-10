@@ -281,10 +281,19 @@ public partial class NTT
         int kAxis,
         float kEpsilon,
         bool kUseMean,
-        IRArray<IR.NN.AttentionDimKind> layout)
+        IRArray<IR.NN.AttentionDimKind> qkvLayout,
+        IRArray<IR.NN.AttentionDimKind> attentionLayout)
     {
         return KernelCall(
-            new QKVRoPEWithCache(qAxis, qEpsilon, qUseMean, kAxis, kEpsilon, kUseMean, layout),
+            new QKVRoPEWithCache(
+                qAxis,
+                qEpsilon,
+                qUseMean,
+                kAxis,
+                kEpsilon,
+                kUseMean,
+                qkvLayout,
+                attentionLayout),
             q,
             k,
             v,
@@ -329,6 +338,50 @@ public partial class NTT
     public static Expr PagedAttention(Expr q, Expr kvcache, Expr extra, Expr scale, Dimension layerId, Expr ret, IRArray<IR.NN.AttentionDimKind> layout, int hiddenSize)
     {
         return KernelCall(new PagedAttention(layout, hiddenSize), q, kvcache, extra, scale, layerId, ret);
+    }
+
+    public static Expr PagedAttentionPartial(
+        Expr q,
+        Expr kvcache,
+        Expr extra,
+        Expr scale,
+        Dimension layerId,
+        Expr maxState,
+        Expr sumState,
+        Expr accState,
+        IRArray<IR.NN.AttentionDimKind> layout,
+        int hiddenSize,
+        int splitHierarchyAxis,
+        int splitCount)
+    {
+        return KernelCall(
+            new PagedAttentionPartial(layout, hiddenSize, splitHierarchyAxis, splitCount),
+            q,
+            kvcache,
+            extra,
+            scale,
+            layerId,
+            maxState,
+            sumState,
+            accState);
+    }
+
+    public static Expr PagedAttentionMerge(
+        Expr maxState,
+        Expr sumState,
+        Expr accState,
+        Expr output,
+        IRArray<IR.NN.AttentionDimKind> layout,
+        int hiddenSize,
+        int splitHierarchyAxis,
+        int splitCount)
+    {
+        return KernelCall(
+            new PagedAttentionMerge(layout, hiddenSize, splitHierarchyAxis, splitCount),
+            maxState,
+            sumState,
+            accState,
+            output);
     }
 
     public static Expr UpdatePagedAttentionKVCache(Expr value, Expr kvcache, Dimension layerId, IR.NN.AttentionCacheKind kind, IRArray<IR.NN.AttentionDimKind> layout)

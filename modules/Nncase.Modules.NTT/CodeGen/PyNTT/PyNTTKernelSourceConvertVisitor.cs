@@ -1132,7 +1132,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     if (!state.IsBound)
                     {
                         throw new InvalidOperationException(
-                            $"Pipeline stage {expr.StageId} did not emit a weight-pipelined helper.");
+                            $"Pipeline stage {expr.StageId} did not emit a transfer-pipelined helper.");
                     }
 
                     break;
@@ -1423,13 +1423,13 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
 
         protected override Unit VisitCall(Call expr)
         {
-            if (expr.Metadata.TIRMicroKernel?.WeightPipeline is not null &&
+            if (expr.Metadata.TIRMicroKernel?.TransferPipeline is not null &&
                 (_pipelineRole != PipelineExecutionRole.Consumer ||
                  _activePipelineStage is null ||
                  !ReferenceEquals(_activePipelineStage.Operation, expr)))
             {
                 throw new InvalidOperationException(
-                    $"Weight-pipelined call {expr.Target.GetType().Name} in {_currentFunction.Name} " +
+                    $"Transfer-pipelined call {expr.Target.GetType().Name} in {_currentFunction.Name} " +
                     "must be owned by an explicit consumer PipelineStage.");
             }
 
@@ -1558,6 +1558,15 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 case Nncase.TIR.NTT.PagedAttention pagedAttention:
                     VisitPagedAttention(pagedAttention, args);
                     break;
+                case Nncase.TIR.NTT.PagedAttentionPartial pagedAttentionPartial:
+                    VisitPagedAttentionPartial(
+                        pagedAttentionPartial,
+                        args,
+                        RequireMicroKernel(microKernel, pagedAttentionPartial));
+                    break;
+                case Nncase.TIR.NTT.PagedAttentionMerge pagedAttentionMerge:
+                    VisitPagedAttentionMerge(pagedAttentionMerge, args);
+                    break;
                 case Nncase.TIR.NTT.VectorizedLayerNorm layerNorm:
                     VisitLayerNorm(layerNorm, args);
                     break;
@@ -1646,7 +1655,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 selection.Variant,
                 selection.Parameters,
                 offsets,
-                selection.WeightPipeline is not null);
+                selection.TransferPipeline is not null);
         }
 
         private long GetFixedSharedWorkspaceOffsetBytes(
@@ -2715,10 +2724,27 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 }
 
                 var argument = ResolveBoundExpression(args[descriptor.ParameterIndex]);
-                var buffer = GetBufferOperand(
-                    argument,
-                    $"PyNTT call to {callee.Name} host descriptor {descriptor.Name}");
-                var binding = RegisterReusableHostTensorDescriptor(buffer, descriptor.Name);
+                HostTensorDescriptorBinding binding;
+                if (descriptor.ObjectSource is { } objectSource)
+                {
+                    var source = GetKVCacheFieldArgument(
+                        argument,
+                        objectSource.Field,
+                        objectSource.Storage);
+                    binding = RegisterObjectHostTensorDescriptor(
+                        argument,
+                        source,
+                        descriptor.Name,
+                        objectSource);
+                }
+                else
+                {
+                    var buffer = GetBufferOperand(
+                        argument,
+                        $"PyNTT call to {callee.Name} host descriptor {descriptor.Name}");
+                    binding = RegisterReusableHostTensorDescriptor(buffer, descriptor.Name);
+                }
+
                 values[descriptor.Name] = binding.Name;
                 values[descriptor.OriginElementsName] = binding.OriginElements;
             }
@@ -4003,8 +4029,8 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             }
 
             SetComputeOp("cast");
-            var inputShape = GetBufferShape(input);
-            var outputShape = GetBufferShape(output);
+            var inputShape = GetBufferActiveShape(input);
+            var outputShape = GetBufferActiveShape(output);
             var inputVectorLaneCount = GetSingleVectorLaneCount(input.ElemType, "PyNTT Cast input");
             var outputVectorLaneCount = GetSingleVectorLaneCount(output.ElemType, "PyNTT Cast output");
             var vectorizedAxes = cast.VectorizeAxes.ToArray();
@@ -4465,6 +4491,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     perm,
                     $"{input.Name} -> {output.Name}"));
             WriteHelperInvocation(helperName);
+            MarkStoredOutput(output, "PyNTT Transpose");
         }
 
         private void PropagatePackLayoutMetadata(TIR.Buffer input, TIR.Buffer output, IReadOnlyList<int> axes, IReadOnlyList<int> lanes)
@@ -5925,7 +5952,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             string helperName)
         {
             var templatePath = GetMicroKernelTemplatePath(microKernel);
-            if (!microKernel.HasWeightPipeline)
+            if (!microKernel.HasTransferPipeline)
             {
                 WriteHelperTemplate(
                     templatePath,
@@ -5940,7 +5967,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 _activePipelineRegion is null)
             {
                 throw new InvalidOperationException(
-                    $"Weight-pipelined microkernel {microKernel.Family}/{microKernel.Variant} " +
+                    $"Transfer-pipelined microkernel {microKernel.Family}/{microKernel.Variant} " +
                     $"must be emitted from an explicit consumer PipelineStage.");
             }
 
@@ -5974,6 +6001,9 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 ("triton.matmul_glu", "simt_fma") => "triton/kernels/matmul_glu/simt_fma.py.jinja",
                 ("triton.matmul_glu", "simt_fma_smem_pipeline") => "triton/kernels/matmul_glu/simt_fma_smem_pipeline.py.jinja",
                 ("triton.matmul_glu", "mma") => "triton/kernels/matmul_glu/mma.py.jinja",
+                ("triton.paged_attention_partial", "mma_direct") => "triton/kernels/paged_attention/mma_direct.py.jinja",
+                ("triton.paged_attention_partial", "mma_tma_smem_pipeline") => "triton/kernels/paged_attention/mma_tma_smem_pipeline.py.jinja",
+                ("triton.paged_attention_partial", "simt_tma_smem_pipeline") => "triton/kernels/paged_attention/simt_tma_smem_pipeline.py.jinja",
                 _ => throw new NotSupportedException(
                     $"PyNTT has no Jinja algorithm for selected microkernel " +
                     $"{microKernel.Family}/{microKernel.Variant}."),
@@ -6555,7 +6585,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 qStats,
                 qScale,
                 qBias,
-                qOutput,
+                q,
                 "PyNTT QKVRoPEWithCache Q NormApply");
             var kNorm = BuildNormApplyTemplateModel(
                 $"{helperName}_k_norm",
@@ -6571,7 +6601,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 q,
                 cos,
                 sin,
-                qOutput,
+                q,
                 "PyNTT QKVRoPEWithCache Q RoPE");
             var kRoPE = BuildRoPETemplateModel(
                 $"{helperName}_k_rope",
@@ -6582,14 +6612,14 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 "PyNTT QKVRoPEWithCache K RoPE");
             var (kUpdate, kLeadingArguments) = BuildUpdatePagedAttentionKVCacheTemplateModel(
                 $"{helperName}_k_update",
-                new Nncase.TIR.NTT.UpdatePagedAttentionKVCache(AttentionCacheKind.Key, fused.Layout),
+                new Nncase.TIR.NTT.UpdatePagedAttentionKVCache(AttentionCacheKind.Key, fused.QKVLayout),
                 k,
                 args[11],
                 args[12],
                 "PyNTT QKVRoPEWithCache K update");
             var (vUpdate, vLeadingArguments) = BuildUpdatePagedAttentionKVCacheTemplateModel(
                 $"{helperName}_v_update",
-                new Nncase.TIR.NTT.UpdatePagedAttentionKVCache(AttentionCacheKind.Value, fused.Layout),
+                new Nncase.TIR.NTT.UpdatePagedAttentionKVCache(AttentionCacheKind.Value, fused.QKVLayout),
                 v,
                 args[11],
                 args[12],
@@ -6602,8 +6632,10 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
 
             SetComputeOp("qkv_rope_with_cache");
             _attrs["op"] = "qkv_rope_with_cache";
-            _attrs["dtype"] = qNorm.OutputDType;
-            _attrs["shape"] = GetLogicalVectorShape(qNorm.OutputShape, qNorm.OutputVectorLaneCount);
+            _attrs["dtype"] = GetPyNTTScalarDTypeName(qOutput.ElemType);
+            _attrs["shape"] = GetLogicalVectorShape(
+                GetBufferShape(qOutput),
+                GetVectorLaneElementCount(qOutput.ElemType));
             _attrs["layer_id"] = kUpdate.LayerIdExpression;
             var templateModel = new PyNTTQKVRoPEWithCacheTemplateModel(
                 helperName,
@@ -6613,6 +6645,15 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 kRoPE,
                 kUpdate,
                 vUpdate,
+                GetBufferScalarPointer(qOutput),
+                GetPyNTTScalarDTypeName(qOutput.ElemType),
+                GetScalarTritonDType(qOutput.ElemType),
+                GetBufferShape(qOutput),
+                GetBufferStrides(qOutput),
+                GetVectorLaneElementCount(qOutput.ElemType),
+                GetVectorLanes(qOutput.ElemType),
+                fused.QKVLayout.Select(axis => (int)axis).ToArray(),
+                fused.AttentionLayout.Select(axis => (int)axis).ToArray(),
                 $"{q.Name}, {k.Name}, {v.Name} -> {qOutput.Name}, kv-cache");
             WriteHelperTemplate("triton/kernels/QKVRoPEWithCache.py.jinja", templateModel);
             WriteLine(BuildHelperCall(helperName, kLeadingArguments));
@@ -6685,10 +6726,247 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     dimAxis,
                     GetGlobalNumQueryHeads(pagedAttention, cache),
                     layerIdExpression,
-                    _targetOptions.TargetMachineModel.Execution.WorkerWidth,
                     cache,
                     $"{query.Name}, kv-cache -> {output.Name}"));
             WriteLine(BuildHelperCall(helperName, blockTableArgument, storageArgument, storageBlocksArgument, queryStartLocArgument, seqLensArgument, numSeqsArgument));
+            MarkStoredOutput(output, "PyNTT PagedAttention");
+        }
+
+        private void VisitPagedAttentionPartial(
+            Nncase.TIR.NTT.PagedAttentionPartial pagedAttention,
+            IReadOnlyList<BaseExpr> args,
+            PyNTTMicroKernelTemplateModel microKernel)
+        {
+            if (args.Count < 8 ||
+                args[0] is not TIR.Buffer query ||
+                args[2] is not TIR.Buffer ||
+                args[3] is not TIR.Buffer scale ||
+                args[5] is not TIR.Buffer maxState ||
+                args[6] is not TIR.Buffer sumState ||
+                args[7] is not TIR.Buffer accState)
+            {
+                throw new NotSupportedException(
+                    "PyNTT PagedAttentionPartial codegen expects query, kv-cache, extra, scale, layer id, and three state buffers.");
+            }
+
+            if (maxState.ElemType != DataTypes.Float32 ||
+                sumState.ElemType != DataTypes.Float32 ||
+                accState.ElemType != DataTypes.Float32)
+            {
+                throw new NotSupportedException(
+                    "PyNTT PagedAttentionPartial requires FP32 max, sum, and accumulator states.");
+            }
+
+            var cache = GetPagedAttentionCacheTemplateModel(
+                args[1],
+                "PyNTT PagedAttentionPartial");
+            var layerIdExpression = GetDimensionExpression(
+                args[4],
+                "PyNTT PagedAttentionPartial layer id").TritonExpression;
+            var storage = GetKVCacheStorageMetadata(cache);
+            var queryStartLocArgument = GetKVCacheFieldArgument(args[1], "query_start_loc");
+            var seqLensArgument = GetKVCacheFieldArgument(args[1], "seq_lens");
+            var numSeqsArgument = GetKVCacheFieldArgument(args[1], "num_seqs");
+            var blockTableArgument = GetKVCacheFieldArgument(args[1], "block_table");
+            var storageArgument = GetKVCacheFieldArgument(args[1], "kv_caches", storage);
+            var storageBlocksArgument = GetKVCacheFieldArgument(args[1], "kv_caches_blocks", storage);
+            var helperName = GetNextHelperName("paged_attention_partial");
+            var usesHostCacheDescriptors =
+                microKernel.Family == "triton.paged_attention_partial" &&
+                microKernel.HasTransferPipeline;
+            var keyDescriptor = usesHostCacheDescriptors
+                ? RegisterPagedAttentionCacheHostTensorDescriptor(
+                    args[1],
+                    storageArgument,
+                    cache,
+                    storage,
+                    AttentionCacheKind.Key,
+                    $"{helperName}__key_descriptor")
+                : null;
+            var valueDescriptor = usesHostCacheDescriptors
+                ? RegisterPagedAttentionCacheHostTensorDescriptor(
+                    args[1],
+                    storageArgument,
+                    cache,
+                    storage,
+                    AttentionCacheKind.Value,
+                    $"{helperName}__value_descriptor")
+                : null;
+            var layout = pagedAttention.Layout.ToArray();
+            var seqAxis = Array.IndexOf(layout, AttentionDimKind.Seq);
+            var headAxis = Array.IndexOf(layout, AttentionDimKind.Head);
+            var dimAxis = Array.IndexOf(layout, AttentionDimKind.Dim);
+            if (seqAxis < 0 || headAxis < 0 || dimAxis < 0)
+            {
+                throw new NotSupportedException(
+                    "PyNTT PagedAttentionPartial layout must contain Seq, Head, and Dim.");
+            }
+
+            if (maxState.Rank != query.Rank + 1 ||
+                sumState.Rank != query.Rank + 1 ||
+                accState.Rank != query.Rank + 1)
+            {
+                throw new NotSupportedException(
+                    "PyNTT PagedAttentionPartial state rank must equal query rank plus the KV-split axis.");
+            }
+
+            var querySplitAxes = GetBufferSplitAxes(query, query.Dimensions.Length);
+            if (querySplitAxes[dimAxis].Length != 0)
+            {
+                throw new NotSupportedException(
+                    "PyNTT PagedAttentionPartial requires the attention Dim axis to be unsplit.");
+            }
+
+            SetComputeOp("paged_attention_partial");
+            _attrs["op"] = "paged_attention_partial";
+            _attrs["layer_id"] = layerIdExpression;
+            _attrs["hidden_size"] = pagedAttention.HiddenSize;
+            _attrs["split_hierarchy_axis"] = pagedAttention.SplitHierarchyAxis;
+            _attrs["split_count"] = pagedAttention.SplitCount;
+            var queryShape = GetBufferShape(query);
+            var queryGlobalShape = GetBufferGlobalShape(query);
+            var queryStrides = GetBufferStrides(query);
+            var queryVectorLanes = GetVectorLanes(query.ElemType);
+            var templateModel = new PyNTTPagedAttentionPartialTemplateModel(
+                    helperName,
+                    GetBufferScalarPointer(query),
+                    GetBufferScalarPointer(scale),
+                    GetBufferScalarPointer(maxState),
+                    GetBufferScalarPointer(sumState),
+                    GetBufferScalarPointer(accState),
+                    GetPyNTTScalarDTypeName(query.ElemType),
+                    GetScalarTritonDType(query.ElemType),
+                    queryShape,
+                    queryStrides,
+                    queryVectorLanes,
+                    queryShape,
+                    queryGlobalShape,
+                    queryStrides,
+                    queryVectorLanes,
+                    querySplitAxes,
+                    GetBufferShape(maxState),
+                    GetBufferStrides(maxState),
+                    GetBufferShape(sumState),
+                    GetBufferStrides(sumState),
+                    GetBufferShape(accState),
+                    GetBufferStrides(accState),
+                    GetHierarchy(query),
+                    seqAxis,
+                    headAxis,
+                    dimAxis,
+                    GetGlobalNumQueryHeads(pagedAttention.HiddenSize, cache),
+                    layerIdExpression,
+                    pagedAttention.SplitHierarchyAxis,
+                    pagedAttention.SplitCount,
+                    microKernel,
+                    keyDescriptor?.Name,
+                    valueDescriptor?.Name,
+                    blockTableArgument,
+                    usesHostCacheDescriptors ? null : storageArgument,
+                    storageBlocksArgument,
+                    queryStartLocArgument,
+                    seqLensArgument,
+                    numSeqsArgument,
+                    cache,
+                    $"{query.Name}, kv-cache -> {maxState.Name}, {sumState.Name}, {accState.Name}");
+            WriteSelectedMicroKernelHelper(
+                microKernel,
+                templateModel,
+                helperName);
+        }
+
+        private void VisitPagedAttentionMerge(
+            Nncase.TIR.NTT.PagedAttentionMerge pagedAttention,
+            IReadOnlyList<BaseExpr> args)
+        {
+            if (args.Count < 4 ||
+                args[0] is not TIR.Buffer maxState ||
+                args[1] is not TIR.Buffer sumState ||
+                args[2] is not TIR.Buffer accState ||
+                args[3] is not TIR.Buffer output)
+            {
+                throw new NotSupportedException(
+                    "PyNTT PagedAttentionMerge codegen expects three state buffers and one output buffer.");
+            }
+
+            if (maxState.ElemType != DataTypes.Float32 ||
+                sumState.ElemType != DataTypes.Float32 ||
+                accState.ElemType != DataTypes.Float32)
+            {
+                throw new NotSupportedException(
+                    "PyNTT PagedAttentionMerge requires FP32 max, sum, and accumulator states.");
+            }
+
+            var layout = pagedAttention.Layout.ToArray();
+            var seqAxis = Array.IndexOf(layout, AttentionDimKind.Seq);
+            var headAxis = Array.IndexOf(layout, AttentionDimKind.Head);
+            var dimAxis = Array.IndexOf(layout, AttentionDimKind.Dim);
+            if (seqAxis < 0 || headAxis < 0 || dimAxis < 0 ||
+                maxState.Rank != output.Rank + 1 ||
+                sumState.Rank != output.Rank + 1 ||
+                accState.Rank != output.Rank + 1)
+            {
+                throw new NotSupportedException(
+                    "PyNTT PagedAttentionMerge requires Seq/Head/Dim output axes and rank+1 state buffers.");
+            }
+
+            var accGlobalShape = GetBufferGlobalShape(accState);
+            var headDimension = checked((int)RequireFixedDim(
+                accGlobalShape[dimAxis],
+                "PyNTT PagedAttentionMerge accumulator HeadDim"));
+            if (pagedAttention.HiddenSize <= 0 ||
+                pagedAttention.HiddenSize % headDimension != 0)
+            {
+                throw new NotSupportedException(
+                    $"PyNTT PagedAttentionMerge requires hidden_size divisible by head_dim, got " +
+                    $"hidden_size={pagedAttention.HiddenSize}, head_dim={headDimension}.");
+            }
+
+            var outputSplitAxes = GetBufferSplitAxes(output, output.Dimensions.Length);
+            if (outputSplitAxes[dimAxis].Length != 0)
+            {
+                throw new NotSupportedException(
+                    "PyNTT PagedAttentionMerge requires the attention Dim axis to be unsplit.");
+            }
+
+            SetComputeOp("paged_attention_merge");
+            _attrs["op"] = "paged_attention_merge";
+            _attrs["hidden_size"] = pagedAttention.HiddenSize;
+            _attrs["split_hierarchy_axis"] = pagedAttention.SplitHierarchyAxis;
+            _attrs["split_count"] = pagedAttention.SplitCount;
+            var helperName = GetNextHelperName("paged_attention_merge");
+            WriteHelperTemplate(
+                "triton/kernels/PagedAttentionMerge.py.jinja",
+                new PyNTTPagedAttentionMergeTemplateModel(
+                    helperName,
+                    GetBufferScalarPointer(maxState),
+                    GetBufferScalarPointer(sumState),
+                    GetBufferScalarPointer(accState),
+                    GetBufferScalarPointer(output),
+                    GetPyNTTScalarDTypeName(output.ElemType),
+                    GetScalarTritonDType(output.ElemType),
+                    GetBufferShape(maxState),
+                    GetBufferStrides(maxState),
+                    GetBufferShape(sumState),
+                    GetBufferStrides(sumState),
+                    GetBufferShape(accState),
+                    GetBufferStrides(accState),
+                    GetBufferShape(output),
+                    GetBufferGlobalShape(output),
+                    GetBufferStrides(output),
+                    GetVectorLanes(output.ElemType),
+                    outputSplitAxes,
+                    GetHierarchy(output),
+                    seqAxis,
+                    headAxis,
+                    dimAxis,
+                    headDimension,
+                    pagedAttention.HiddenSize / headDimension,
+                    pagedAttention.SplitHierarchyAxis,
+                    pagedAttention.SplitCount,
+                    $"{maxState.Name}, {sumState.Name}, {accState.Name} -> {output.Name}"));
+            WriteLine(BuildHelperCall(helperName));
+            MarkStoredOutput(output, "PyNTT PagedAttentionMerge");
         }
 
         private void VisitSoftmax(int axis, IRArray<int> vectorizedAxes, IReadOnlyList<BaseExpr> args, string opKind)
@@ -7725,14 +8003,90 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 cache.BlockSize);
         }
 
-        private static int GetGlobalNumQueryHeads(Nncase.TIR.NTT.PagedAttention pagedAttention, PyNTTPagedAttentionCacheTemplateModel cache)
+        private HostTensorDescriptorBinding RegisterPagedAttentionCacheHostTensorDescriptor(
+            BaseExpr kvCaches,
+            string storageArgument,
+            PyNTTPagedAttentionCacheTemplateModel cache,
+            PyNTTKVCacheStorageMetadata storage,
+            AttentionCacheKind kind,
+            string name)
         {
-            if (pagedAttention.HiddenSize <= 0 || pagedAttention.HiddenSize % cache.HeadDim != 0)
+            var isKey = kind == AttentionCacheKind.Key;
+            var laneCount = isKey ? cache.KeyLaneCount : cache.ValueLaneCount;
+            var vectorizedDim = isKey ? cache.KeyVectorizedDim : cache.ValueVectorizedDim;
+            var layerStride = isKey ? cache.KeyLayerStride : cache.ValueLayerStride;
+            var blockOffsetStride = isKey ? cache.KeyBlockOffsetStride : cache.ValueBlockOffsetStride;
+            var headStride = isKey ? cache.KeyHeadStride : cache.ValueHeadStride;
+            var dimBlockStride = isKey ? cache.KeyDimBlockStride : cache.ValueDimBlockStride;
+            var sectionOffset = isKey ? cache.KeySectionOffset : cache.ValueSectionOffset;
+            if (vectorizedDim != (int)PagedKVCacheDimKind.HeadDim ||
+                laneCount != 8 ||
+                dimBlockStride != 1)
             {
-                throw new NotSupportedException($"PyNTT PagedAttention requires hidden_size divisible by head_dim, got hidden_size={pagedAttention.HiddenSize}, head_dim={cache.HeadDim}.");
+                throw new NotSupportedException(
+                    $"PyNTT PagedAttention TMA {kind} descriptor requires contiguous " +
+                    $"HeadDim vectorization by 8, got axis={vectorizedDim}, lanes={laneCount}, " +
+                    $"dim_block_stride={dimBlockStride}.");
             }
 
-            var numQueryHeads = checked(pagedAttention.HiddenSize / cache.HeadDim);
+            var scalarElementSizeBytes = GetScalarElementSizeBytes(
+                GetPagedAttentionConfig(kvCaches, "PyNTT PagedAttention descriptor").KVPrimType);
+            var shape = new long[]
+            {
+                1,
+                cache.NumLayers,
+                cache.BlockSize,
+                cache.NumKVHeads,
+                cache.HeadDim,
+            };
+            var strides = new long[]
+            {
+                cache.BlockElements,
+                checked((long)layerStride * laneCount),
+                checked((long)blockOffsetStride * laneCount),
+                checked((long)headStride * laneCount),
+                1,
+            };
+            var sourceShapeAxes = new[]
+            {
+                Enumerable.Range(0, storage.TopologyShape.Length + 1).ToArray(),
+                Array.Empty<int>(),
+                Array.Empty<int>(),
+                Array.Empty<int>(),
+                Array.Empty<int>(),
+            };
+            var prototype = new HostTensorDescriptorBackingMetadata(
+                name,
+                storageArgument,
+                checked((long)sectionOffset * scalarElementSizeBytes),
+                cache.DType,
+                shape,
+                strides,
+                Array.Empty<int>(),
+                0,
+                sourceShapeAxes);
+            return RegisterObjectHostTensorDescriptor(
+                kvCaches,
+                storageArgument,
+                name,
+                new FormalObjectHostTensorDescriptorSource(
+                    "kv_caches",
+                    storage,
+                    scalarElementSizeBytes,
+                    prototype));
+        }
+
+        private static int GetGlobalNumQueryHeads(Nncase.TIR.NTT.PagedAttention pagedAttention, PyNTTPagedAttentionCacheTemplateModel cache)
+            => GetGlobalNumQueryHeads(pagedAttention.HiddenSize, cache);
+
+        private static int GetGlobalNumQueryHeads(int hiddenSize, PyNTTPagedAttentionCacheTemplateModel cache)
+        {
+            if (hiddenSize <= 0 || hiddenSize % cache.HeadDim != 0)
+            {
+                throw new NotSupportedException($"PyNTT PagedAttention requires hidden_size divisible by head_dim, got hidden_size={hiddenSize}, head_dim={cache.HeadDim}.");
+            }
+
+            var numQueryHeads = checked(hiddenSize / cache.HeadDim);
             if (numQueryHeads <= 0 || numQueryHeads % cache.NumKVHeads != 0)
             {
                 throw new NotSupportedException($"PyNTT PagedAttention requires num_query_heads divisible by num_kv_heads, got num_query_heads={numQueryHeads}, num_kv_heads={cache.NumKVHeads}.");
@@ -7871,6 +8225,90 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     "Reusable host tensor descriptors can only be bound in the owning PrimFunction.");
             }
 
+            var candidate = CreateHostTensorDescriptorBacking(buffer, resourceKey);
+            return RegisterReusableHostTensorDescriptor(
+                candidate,
+                resourceKey,
+                GetScalarElementSizeBytes(buffer.ElemType));
+        }
+
+        private HostTensorDescriptorBinding RegisterObjectHostTensorDescriptor(
+            BaseExpr objectExpression,
+            string source,
+            string name,
+            FormalObjectHostTensorDescriptorSource objectSource)
+        {
+            name = SanitizeBoundedPythonIdentifier(name);
+            var prototype = objectSource.Prototype with
+            {
+                Name = name,
+                Source = source,
+            };
+            if (!ReferenceEquals(_currentFunction, _function))
+            {
+                var parameterIndex = GetFormalObjectParameterIndex(
+                    objectExpression,
+                    $"PyNTT host descriptor {name}");
+                var originElementsName = SanitizeBoundedPythonIdentifier(
+                    $"{name}__origin_elements");
+                if (_formalHostTensorDescriptors.Any(descriptor => descriptor.Name == name))
+                {
+                    throw new InvalidOperationException(
+                        $"PyNTT nested PrimFunction {_currentFunction.Name} contains duplicate formal host tensor descriptor {name}.");
+                }
+
+                _formalHostTensorDescriptors.Add(new(
+                    name,
+                    originElementsName,
+                    parameterIndex,
+                    objectSource with { Prototype = prototype }));
+                _extraWorkspaceBaseNames.Add(name);
+                _extraWorkspaceBaseNames.Add(originElementsName);
+                return new(name, originElementsName);
+            }
+
+            return RegisterReusableHostTensorDescriptor(
+                prototype,
+                name,
+                objectSource.ScalarElementSizeBytes);
+        }
+
+        private int GetFormalObjectParameterIndex(BaseExpr expression, string context)
+        {
+            if (!TryGetFormalObjectBaseName(expression, out var baseName))
+            {
+                throw new NotSupportedException(
+                    $"{context} in nested PrimFunction {_currentFunction.Name} must bind a formal object parameter.");
+            }
+
+            var parameter = _formalObjectParameterBaseNames
+                .SingleOrDefault(pair => string.Equals(pair.Value, baseName, StringComparison.Ordinal))
+                .Key;
+            var parameterIndex = parameter is null
+                ? -1
+                : Array.FindIndex(
+                    _currentFunction.Parameters.ToArray(),
+                    candidate => ReferenceEquals(candidate, parameter));
+            if (parameterIndex < 0)
+            {
+                throw new NotSupportedException(
+                    $"{context} cannot resolve formal object {baseName} in {_currentFunction.Name}.");
+            }
+
+            return parameterIndex;
+        }
+
+        private HostTensorDescriptorBinding RegisterReusableHostTensorDescriptor(
+            HostTensorDescriptorBackingMetadata candidate,
+            string resourceKey,
+            int scalarElementSizeBytes)
+        {
+            if (!ReferenceEquals(_currentFunction, _function))
+            {
+                throw new InvalidOperationException(
+                    "Reusable host tensor descriptors can only be bound in the owning PrimFunction.");
+            }
+
             resourceKey = SanitizeBoundedPythonIdentifier(resourceKey);
             if (!_hostTensorDescriptorResourceIndexes.TryGetValue(resourceKey, out var resourceIndexes))
             {
@@ -7878,8 +8316,6 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 _hostTensorDescriptorResourceIndexes.Add(resourceKey, resourceIndexes);
             }
 
-            var candidate = CreateHostTensorDescriptorBacking(buffer, resourceKey);
-            var scalarElementSizeBytes = GetScalarElementSizeBytes(buffer.ElemType);
             foreach (var resourceIndex in resourceIndexes)
             {
                 var resource = _hostTensorDescriptors[resourceIndex];
@@ -8001,7 +8437,8 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 globalShape,
                 logicalStrides,
                 GetVectorLanes(buffer.ElemType),
-                0);
+                0,
+                globalShape.Select(_ => Array.Empty<int>()).ToArray());
         }
 
         private void AddHostTensorDescriptorBacking(HostTensorDescriptorBackingMetadata descriptor)
@@ -8024,7 +8461,10 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                resource.ScalarDType == candidate.ScalarDType &&
                resource.LogicalShape.SequenceEqual(candidate.LogicalShape) &&
                resource.LogicalStrides.SequenceEqual(candidate.LogicalStrides) &&
-               resource.VectorLaneShape.SequenceEqual(candidate.VectorLaneShape);
+               resource.VectorLaneShape.SequenceEqual(candidate.VectorLaneShape) &&
+               resource.SourceShapeAxes.Length == candidate.SourceShapeAxes.Length &&
+               resource.SourceShapeAxes.Zip(candidate.SourceShapeAxes)
+                   .All(pair => pair.First.SequenceEqual(pair.Second));
 
         private PyNTTBufferPointerTemplateModel GetBufferScalarPointer(TIR.Buffer buffer)
         {
@@ -11792,7 +12232,14 @@ internal sealed record PipelineDeviceFunctionInterface(
 internal sealed record FormalHostTensorDescriptorRequirement(
     string Name,
     string OriginElementsName,
-    int ParameterIndex);
+    int ParameterIndex,
+    FormalObjectHostTensorDescriptorSource? ObjectSource = null);
+
+internal sealed record FormalObjectHostTensorDescriptorSource(
+    string Field,
+    PyNTTKVCacheStorageMetadata Storage,
+    int ScalarElementSizeBytes,
+    HostTensorDescriptorBackingMetadata Prototype);
 
 internal sealed record HostTensorDescriptorBinding(
     string Name,
@@ -11870,7 +12317,9 @@ internal sealed record HostTensorDescriptorBackingMetadata(
     [property: JsonPropertyName("vector_lane_shape")]
     int[] VectorLaneShape,
     [property: JsonPropertyName("contiguous_rebase_extent_elements")]
-    long ContiguousRebaseExtentElements);
+    long ContiguousRebaseExtentElements,
+    [property: JsonPropertyName("source_shape_axes")]
+    int[][] SourceShapeAxes);
 
 internal sealed record ShardMetadata(
     [property: JsonPropertyName("strategy")]

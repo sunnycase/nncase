@@ -1,0 +1,35 @@
+{% import "triton/kernels/_common.py.jinja" as common with context %}
+{% import "triton/kernels/_producer_consumer.py.jinja" as phases with context %}
+{% set ctx = paged_attention_merge_context(model) %}
+# generated from PyNTT Jinja PagedAttentionMerge.py.jinja
+# {{ model["Comment"] }}; output_dtype={{ model["OutputDType"] }}, output_shape={{ shape_tuple(model["OutputShape"]) }}, split_axis={{ model["SplitHierarchyAxis"] }}, split_count={{ model["SplitCount"] }}
+{{ phases.consumer_header(model) }}
+    shard_index = tl.program_id(0).to(tl.int64)
+{{ common.hierarchy_coordinates(model["Hierarchy"]) }}
+{% for name, key in (("max_state", "MaxState"), ("sum_state", "SumState"), ("acc_state", "AccState"), ("output", "Output")) %}
+    {{ name }} = {{ ptr(model, key) }}
+{% endfor %}
+{{ common.structured_axis(ctx["output_dim_axis"], "    ") }}
+    if {{ ctx["owner"] }}:
+        split_offsets = tl.arange(0, {{ ctx["split_tile"] }})
+        split_mask = split_offsets < {{ ctx["split_count"] }}
+        split_grid = split_offsets[:, None]
+        dim_grid = tl.arange(0, {{ model["HeadDimension"] }})[None, :]
+        for local_query_id in tl.range(0, {{ dim(ctx["local_query_tokens"]) }}):
+            global_query_id = {{ ctx["global_query_id"] }}
+            for q_head in tl.range(0, {{ dim(ctx["local_q_heads"]) }}):
+                global_q_head = {{ ctx["global_q_head"] }}
+                max_values = tl.load({{ access_pointer(model, "MaxState", "max_state", ctx["max_state_access"]) }}, mask=split_mask, other=-float("inf"))
+                sum_values = tl.load({{ access_pointer(model, "SumState", "sum_state", ctx["sum_state_access"]) }}, mask=split_mask, other=0.0)
+                valid = split_mask & (sum_values > 0.0)
+                merged_max = tl.max(tl.where(valid, max_values, -float("inf")), axis=0)
+                safe_max = tl.where(merged_max == -float("inf"), 0.0, merged_max)
+                weights = tl.where(valid, tl.exp2(max_values - safe_max), 0.0)
+                merged_sum = tl.sum(weights * sum_values, axis=0)
+                acc_values = tl.load({{ access_pointer(model, "AccState", "acc_state", ctx["acc_state_access"]) }}, mask=split_mask[:, None], other=0.0)
+                merged_acc = tl.sum(weights[:, None] * acc_values, axis=0)
+                result = tl.where(merged_sum > 0.0, merged_acc / merged_sum, 0.0)
+                tl.store({{ access_pointer(model, "Output", "output", ctx["output_access"]) }}, tl.reshape(result, {{ ctx["output_structured_shape"] }}), mask={{ ctx["output_active"] }})
+
+
+{{ phases.dispatch(model) }}

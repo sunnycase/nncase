@@ -56,8 +56,204 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
             Nncase.TIR.NTT.PackedMatMulGlu packedMatmulGlu => SelectPackedMatMulGlu(
                 context,
                 packedMatmulGlu),
+            Nncase.TIR.NTT.PagedAttentionPartial pagedAttention =>
+                SelectPagedAttentionPartial(context, pagedAttention),
             _ => null,
         };
+    }
+
+    private static TIRMicroKernelSelection SelectPagedAttentionPartial(
+        TIRMicroKernelSelectionContext context,
+        Nncase.TIR.NTT.PagedAttentionPartial pagedAttention)
+    {
+        const int numStages = 2;
+        var config = GetPagedAttentionConfig(context, 1);
+        var blockN = SelectPagedAttentionBlockN(config.BlockSize);
+        var parameters = new Dictionary<string, long>(StringComparer.Ordinal)
+        {
+            ["block_m"] = 1,
+            ["block_n"] = blockN,
+            ["block_k"] = config.HeadDim,
+            ["num_stages"] = numStages,
+            ["head_dim"] = config.HeadDim,
+            ["page_size"] = config.BlockSize,
+        }.ToImmutableDictionary(StringComparer.Ordinal);
+
+        if (!CanUsePagedAttentionTmaPipeline(context.Machine, config, blockN, numStages))
+        {
+            return new(
+                "triton.paged_attention_partial",
+                "mma_direct",
+                parameters,
+                ImmutableArray<TIRSharedWorkspaceDescriptor>.Empty,
+                TransferPipeline: null);
+        }
+
+        var stageType = new TensorType(
+            config.KVPrimType,
+            new RankedShape(new[] { numStages, 1, 1, blockN, 1, config.HeadDim }));
+        var variant = CanUsePagedAttentionDecodeGqaSimt(
+            context,
+            pagedAttention,
+            config)
+            ? "simt_tma_smem_pipeline"
+            : "mma_tma_smem_pipeline";
+        return new(
+            "triton.paged_attention_partial",
+            variant,
+            parameters,
+            ImmutableArray.Create(
+                new TIRSharedWorkspaceDescriptor(
+                    "key_stage",
+                    stageType,
+                    NvidiaNvmmaSharedAlignmentBytes),
+                new TIRSharedWorkspaceDescriptor(
+                    "value_stage",
+                    stageType,
+                    NvidiaNvmmaSharedAlignmentBytes)),
+            new TIRTransferPipelineContract([1], [0, 1]));
+    }
+
+    private static int SelectPagedAttentionBlockN(int pageSize)
+    {
+        if (pageSize <= 0)
+        {
+            throw new InvalidOperationException(
+                $"PagedAttention cache page size must be positive, got {pageSize}.");
+        }
+
+        for (var candidate = 64; candidate >= 1; candidate /= 2)
+        {
+            if (pageSize % candidate == 0)
+            {
+                return candidate;
+            }
+        }
+
+        throw new InvalidOperationException(
+            $"PagedAttention cache page size {pageSize} has no legal block-N tile.");
+    }
+
+    private static bool CanUsePagedAttentionDecodeGqaSimt(
+        TIRMicroKernelSelectionContext context,
+        Nncase.TIR.NTT.PagedAttentionPartial pagedAttention,
+        IR.NN.IPagedAttentionConfig config)
+    {
+        var query = GetBuffer(context, 0, "query");
+        var layout = pagedAttention.Layout.ToArray();
+        var seqAxis = Array.IndexOf(layout, IR.NN.AttentionDimKind.Seq);
+        if (seqAxis < 0 || seqAxis >= query.Rank)
+        {
+            throw new InvalidOperationException(
+                "PagedAttentionPartial layout must contain a valid sequence axis.");
+        }
+
+        if (pagedAttention.HiddenSize <= 0 ||
+            pagedAttention.HiddenSize % config.HeadDim != 0 ||
+            GetScalarDataType(query.ElemType) != DataTypes.BFloat16 ||
+            GetVectorLaneCount(query.ElemType) != 8 ||
+            GetMax(GetLocalDimensions(query)[seqAxis]) != 1)
+        {
+            return false;
+        }
+
+        var queryHeads = pagedAttention.HiddenSize / config.HeadDim;
+        if (queryHeads % config.NumKVHeads != 0)
+        {
+            return false;
+        }
+
+        var groupSize = queryHeads / config.NumKVHeads;
+        if (groupSize <= 1)
+        {
+            return false;
+        }
+
+        var groupTile = 1;
+        while (groupTile < groupSize)
+        {
+            groupTile *= 2;
+        }
+
+        const int consumerWarps = 8;
+        return groupTile <= consumerWarps && consumerWarps % groupTile == 0;
+    }
+
+    private static bool CanUsePagedAttentionTmaPipeline(
+        TargetMachineModel machine,
+        IR.NN.IPagedAttentionConfig config,
+        int blockN,
+        int numStages)
+    {
+        ReadOnlySpan<IR.NN.PagedKVCacheDimKind> canonicalLayout =
+        [
+            IR.NN.PagedKVCacheDimKind.NumBlocks,
+            IR.NN.PagedKVCacheDimKind.NumLayers,
+            IR.NN.PagedKVCacheDimKind.KV,
+            IR.NN.PagedKVCacheDimKind.BlockSize,
+            IR.NN.PagedKVCacheDimKind.NumKVHeads,
+            IR.NN.PagedKVCacheDimKind.HeadDim,
+        ];
+        if (config.KVPrimType != DataTypes.BFloat16 ||
+            config.HeadDim != 128 ||
+            config.BlockSize % blockN != 0 ||
+            !config.KeyCacheLayout.ToArray().AsSpan().SequenceEqual(canonicalLayout) ||
+            !config.ValueCacheLayout.ToArray().AsSpan().SequenceEqual(canonicalLayout) ||
+            !HasHeadDimVectorization(config, IR.NN.AttentionCacheKind.Key) ||
+            !HasHeadDimVectorization(config, IR.NN.AttentionCacheKind.Value))
+        {
+            return false;
+        }
+
+        var sharedSpace = machine.MemorySpaces.Values.SingleOrDefault(
+            space => space.TIRBinding?.Location == MemoryLocation.Shared);
+        if (sharedSpace is null)
+        {
+            return false;
+        }
+
+        var stageBytes = checked(
+            (long)numStages * blockN * config.HeadDim *
+            config.KVPrimType.SizeInBytes);
+        var requiredBytes = checked(stageBytes * 2);
+        return machine.GetAllocationSizeBytes(sharedSpace, requiredBytes) <=
+            machine.GetMaximumUsableAllocationBytes(sharedSpace);
+    }
+
+    private static bool HasHeadDimVectorization(
+        IR.NN.IPagedAttentionConfig config,
+        IR.NN.AttentionCacheKind kind)
+    {
+        var axes = config.GetVectorizedAxes(kind).ToArray();
+        var lanes = config.GetLanes(kind).ToArray();
+        return axes.Length == 1 &&
+            axes[0] == IR.NN.PagedKVCacheDimKind.HeadDim &&
+            lanes.Length == 1 &&
+            lanes[0] == 8;
+    }
+
+    private static IR.NN.IPagedAttentionConfig GetPagedAttentionConfig(
+        TIRMicroKernelSelectionContext context,
+        int index)
+    {
+        if ((uint)index < (uint)context.Arguments.Count &&
+            context.Arguments[index].CheckedType is TensorType
+            {
+                DType: ReferenceType
+                {
+                    ElemType: IR.NN.PagedAttentionKVCacheType
+                    {
+                        Config: { } config,
+                    },
+                },
+            })
+        {
+            return config;
+        }
+
+        throw new InvalidOperationException(
+            $"TIR microkernel selector for {context.Op.GetType().Name} expects a " +
+            $"paged-attention KV-cache object at argument {index}.");
     }
 
     private static TIRMicroKernelSelection SelectMatmul(
@@ -92,7 +288,7 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
             k,
             kDimension.IsFixed,
             kMajorPacked,
-            weightArgumentIndices: [rhsIndex]);
+            sourceArgumentIndices: [rhsIndex]);
     }
 
     private static TIRMicroKernelSelection SelectFusedLinear(
@@ -125,7 +321,7 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
             k,
             kDimension.IsFixed,
             kMajorPacked: false,
-            weightArgumentIndices: [weightIndex]);
+            sourceArgumentIndices: [weightIndex]);
     }
 
     private static TIRMicroKernelSelection SelectPackedQkv(
@@ -176,7 +372,7 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
             GetScalarExtent(kDimension, input.ElemType),
             kDimension.IsFixed,
             qkv.RhsLayout == IR.NTT.PackedMatMulRhsLayout.KMajor,
-            weightArgumentIndices: [1, 2, 3]);
+            sourceArgumentIndices: [1, 2, 3]);
     }
 
     private static TIRMicroKernelSelection SelectPackedMatMulGlu(
@@ -223,7 +419,7 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
             kDimension.IsFixed,
             matmulGlu.RhsLayout == IR.NTT.PackedMatMulRhsLayout.KMajor,
             simultaneousRhsTileCount: 2,
-            weightArgumentIndices: [1, 2]);
+            sourceArgumentIndices: [1, 2]);
     }
 
     private static TIRMicroKernelSelection SelectSumma(
@@ -256,7 +452,7 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
         bool fixedK,
         bool kMajorPacked,
         int simultaneousRhsTileCount = 1,
-        IReadOnlyList<int>? weightArgumentIndices = null)
+        IReadOnlyList<int>? sourceArgumentIndices = null)
     {
         var gemv = m == 1;
         if (gemv)
@@ -293,9 +489,9 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
                             "rhs_stage",
                             rhsShape,
                             NvidiaNvmmaSharedAlignmentBytes)),
-                    new TIRWeightPipelineContract(
-                        weightArgumentIndices ?? throw new InvalidOperationException(
-                            $"{family}/simt_fma_smem_pipeline is missing weight operand indexes."),
+                    new TIRTransferPipelineContract(
+                        sourceArgumentIndices ?? throw new InvalidOperationException(
+                            $"{family}/simt_fma_smem_pipeline is missing transfer source operand indexes."),
                         [0]));
             }
 
@@ -340,7 +536,7 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
                 variant,
                 CreateParameters(blockM, blockN, blockK, numStages: 1),
                 ImmutableArray<TIRSharedWorkspaceDescriptor>.Empty,
-                WeightPipeline: null);
+                TransferPipeline: null);
         }
 
         var gemv = blockM == 1;
@@ -357,7 +553,7 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
             ImmutableArray.Create(
                 new TIRSharedWorkspaceDescriptor("lhs_stage", lhsShape, NvidiaNvmmaSharedAlignmentBytes),
                 new TIRSharedWorkspaceDescriptor("rhs_stage", rhsShape, NvidiaNvmmaSharedAlignmentBytes)),
-            WeightPipeline: null);
+            TransferPipeline: null);
     }
 
     private static ImmutableDictionary<string, long> CreateParameters(

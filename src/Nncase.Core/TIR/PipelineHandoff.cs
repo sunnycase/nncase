@@ -6,12 +6,11 @@ using Nncase.IR;
 namespace Nncase.TIR;
 
 /// <summary>
-/// A one-shot consumer-to-producer ownership edge for Shared storage whose
-/// previous owner is not a cyclic pipeline.
+/// A one-shot consumer-to-producer dependency edge.
 /// </summary>
 public sealed class PipelineHandoff : Expr
 {
-    public PipelineHandoff(string handoffId, long sharedOffsetBytes)
+    public PipelineHandoff(string handoffId)
         : base([])
     {
         if (string.IsNullOrWhiteSpace(handoffId))
@@ -19,40 +18,23 @@ public sealed class PipelineHandoff : Expr
             throw new ArgumentException("Pipeline handoff ID must not be empty.", nameof(handoffId));
         }
 
-        if (sharedOffsetBytes < 0)
-        {
-            throw new ArgumentOutOfRangeException(
-                nameof(sharedOffsetBytes),
-                sharedOffsetBytes,
-                "Pipeline handoff Shared offset must be non-negative.");
-        }
-
         HandoffId = handoffId;
-        SharedOffsetBytes = sharedOffsetBytes;
     }
 
     public string HandoffId { get; }
-
-    public long SharedOffsetBytes { get; }
 
     public override TExprResult Accept<TExprResult, TTypeResult, TContext>(
         ExprFunctor<TExprResult, TTypeResult, TContext> functor,
         TContext context)
         => functor.VisitPipelineHandoff(this, context);
 
-    public PipelineHandoff With(
-        string? handoffId = null,
-        long? sharedOffsetBytes = null)
-        => new(handoffId ?? HandoffId, sharedOffsetBytes ?? SharedOffsetBytes);
+    public PipelineHandoff With(string? handoffId = null)
+        => new(handoffId ?? HandoffId);
 
     public override bool Equals(object? obj)
         => ReferenceEquals(this, obj) ||
-            (obj is PipelineHandoff other &&
-             HandoffId == other.HandoffId &&
-             SharedOffsetBytes == other.SharedOffsetBytes);
+            (obj is PipelineHandoff other && HandoffId == other.HandoffId);
 
     protected override int GetHashCodeCore()
-        => HashCode.Combine(
-            HandoffId.GetHashCode(StringComparison.Ordinal),
-            SharedOffsetBytes);
+        => HandoffId.GetHashCode(StringComparison.Ordinal);
 }

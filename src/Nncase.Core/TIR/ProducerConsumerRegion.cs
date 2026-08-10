@@ -57,27 +57,24 @@ public sealed class ProducerConsumerRegion : Expr
                 "Producer and consumer pipeline drain sets must be identical.");
         }
 
-        if (produce.Handoffs.Count != consume.Handoffs.Count ||
-            produce.Handoffs.Any(pair =>
-                !consume.Handoffs.TryGetValue(pair.Key, out var offset) ||
-                offset != pair.Value))
+        if (!produce.HandoffIds.SetEquals(consume.HandoffIds))
         {
             throw new ArgumentException(
-                "Producer and consumer Shared handoffs must have identical IDs and offsets.");
+                "Producer and consumer handoffs must have identical IDs.");
         }
     }
 
     private sealed record RegionStructure(
         IReadOnlyList<string> StageIds,
         HashSet<string> DrainIds,
-        IReadOnlyDictionary<string, long> Handoffs)
+        HashSet<string> HandoffIds)
     {
         public static RegionStructure Collect(Sequential body, string role)
         {
             var stages = new List<string>();
             var stageSet = new HashSet<string>(StringComparer.Ordinal);
             var drains = new HashSet<string>(StringComparer.Ordinal);
-            var handoffs = new Dictionary<string, long>(StringComparer.Ordinal);
+            var handoffs = new HashSet<string>(StringComparer.Ordinal);
             Visit(body);
             return new(stages, drains, handoffs);
 
@@ -109,12 +106,10 @@ public sealed class ProducerConsumerRegion : Expr
 
                         break;
                     case PipelineHandoff handoff:
-                        if (!handoffs.TryAdd(
-                                handoff.HandoffId,
-                                handoff.SharedOffsetBytes))
+                        if (!handoffs.Add(handoff.HandoffId))
                         {
                             throw new ArgumentException(
-                                $"{role} body contains duplicate Shared handoff {handoff.HandoffId}.");
+                                $"{role} body contains duplicate pipeline handoff {handoff.HandoffId}.");
                         }
 
                         break;

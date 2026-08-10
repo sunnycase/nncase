@@ -39,25 +39,26 @@ public sealed record TIRSharedWorkspaceDescriptor(
     int AlignmentBytes);
 
 /// <summary>
-/// Declares the independently executable weight-transfer phase of a selected
-/// microkernel. Argument indexes refer to semantic kernel operands; workspace
-/// indexes refer to <see cref="TIRMicroKernelSelection.SharedWorkspaces"/>.
+/// Declares an independently executable global-to-Shared transfer phase of a
+/// selected microkernel. Source indexes refer to semantic kernel operands;
+/// workspace indexes refer to
+/// <see cref="TIRMicroKernelSelection.SharedWorkspaces"/>.
 /// </summary>
-public sealed record TIRWeightPipelineContract
+public sealed record TIRTransferPipelineContract
 {
-    public TIRWeightPipelineContract(
-        IEnumerable<int> weightArgumentIndices,
+    public TIRTransferPipelineContract(
+        IEnumerable<int> sourceArgumentIndices,
         IEnumerable<int> sharedWorkspaceIndices)
     {
-        WeightArgumentIndices = ValidateIndices(
-            weightArgumentIndices,
-            nameof(weightArgumentIndices));
+        SourceArgumentIndices = ValidateIndices(
+            sourceArgumentIndices,
+            nameof(sourceArgumentIndices));
         SharedWorkspaceIndices = ValidateIndices(
             sharedWorkspaceIndices,
             nameof(sharedWorkspaceIndices));
     }
 
-    public ImmutableArray<int> WeightArgumentIndices { get; }
+    public ImmutableArray<int> SourceArgumentIndices { get; }
 
     public ImmutableArray<int> SharedWorkspaceIndices { get; }
 
@@ -88,7 +89,7 @@ public sealed record TIRMicroKernelSelection(
     string Variant,
     ImmutableDictionary<string, long> Parameters,
     ImmutableArray<TIRSharedWorkspaceDescriptor> SharedWorkspaces,
-    TIRWeightPipelineContract? WeightPipeline);
+    TIRTransferPipelineContract? TransferPipeline);
 
 /// <summary>
 /// Canonical expression representation for a microkernel's shared workspaces.

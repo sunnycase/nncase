@@ -29,10 +29,14 @@ WORKSPACE_STRIDE_PARAMETERS = (
 )
 
 SHARD_INDEX_PARAMETER = "shard_index"
-PYNTT_CODEGEN_MANIFEST_VERSION = 8
+PYNTT_CODEGEN_MANIFEST_VERSION = 9
 THROUGHPUT_BLOCK_SIZE_CANDIDATES = (128, 256, 512, 1024)
 WARP_SPECIALIZATION_PRODUCER_WARPS = 1
 WARP_SPECIALIZATION_WORKER_ALLOCATION_WARPS = 4
+PAGED_ATTENTION_BLOCK_N_CANDIDATES = (32, 64)
+PAGED_ATTENTION_NUM_STAGES_CANDIDATES = (2, 3)
+PAGED_ATTENTION_BLOCK_N = 64
+PAGED_ATTENTION_NUM_STAGES = 2
 
 DEVICE_CALL_RE = re.compile(
     r"(?m)^(?P<indent>[ \t]*)__pyntt_device_call__(?P<name>[A-Za-z_]\w*)\((?P<args>.*)\)$"
@@ -202,6 +206,7 @@ def _validate_launch(launch: Any, path: str) -> None:
                 "logical_strides",
                 "vector_lane_shape",
                 "contiguous_rebase_extent_elements",
+                "source_shape_axes",
             },
         )
         name = _require_string(
@@ -243,6 +248,34 @@ def _validate_launch(launch: Any, path: str) -> None:
                 f"{descriptor_path} logical shape/stride ranks differ: "
                 f"{len(logical_shape)} and {len(logical_strides)}."
             )
+        source_shape_axes = _require_list(
+            descriptor["source_shape_axes"],
+            f"{descriptor_path}.source_shape_axes",
+        )
+        if len(source_shape_axes) != len(logical_shape):
+            raise ValueError(
+                f"{descriptor_path} logical/source-shape ranks differ: "
+                f"{len(logical_shape)} and {len(source_shape_axes)}."
+            )
+        used_source_axes: set[int] = set()
+        for descriptor_axis, source_axes in enumerate(source_shape_axes):
+            source_axes = _require_list(
+                source_axes,
+                f"{descriptor_path}.source_shape_axes[{descriptor_axis}]",
+            )
+            for source_axis_index, source_axis in enumerate(source_axes):
+                source_axis = _require_int(
+                    source_axis,
+                    f"{descriptor_path}.source_shape_axes[{descriptor_axis}]"
+                    f"[{source_axis_index}]",
+                    minimum=0,
+                )
+                if source_axis in used_source_axes:
+                    raise ValueError(
+                        f"{descriptor_path} source tensor axis {source_axis} "
+                        "is used by more than one descriptor dimension."
+                    )
+                used_source_axes.add(source_axis)
         _require_positive_int_list(
             descriptor["vector_lane_shape"],
             f"{descriptor_path}.vector_lane_shape",
@@ -293,7 +326,7 @@ def _validate_python_statements(value: Any, path: str) -> str:
     return source
 
 
-def _validate_codegen_manifest_v8(manifest: dict[str, Any]) -> None:
+def _validate_codegen_manifest(manifest: dict[str, Any]) -> None:
     manifest = _require_exact_object(
         manifest,
         "PyNTT codegen manifest",
@@ -407,7 +440,7 @@ def validate_manifest(manifest: dict[str, Any]) -> None:
             "Unsupported PyNTT codegen manifest version "
             f"{manifest_version!r}; expected {PYNTT_CODEGEN_MANIFEST_VERSION}."
         )
-    _validate_codegen_manifest_v8(manifest)
+    _validate_codegen_manifest(manifest)
 
 
 def render_manifest(manifest: dict[str, Any]) -> str:
@@ -449,6 +482,60 @@ def render_manifest(manifest: dict[str, Any]) -> str:
         ],
         grid_barrier_axis_groups=grid_barrier_axis_groups,
     )
+
+
+def _paged_attention_backend_config(kernel: dict[str, Any]) -> dict[str, Any]:
+    cache_block_sizes: set[int] = set()
+    helper_groups = [kernel.get("helpers", ())]
+    helper_groups.extend(
+        device_function.get("helpers", ())
+        for device_function in kernel.get("device_functions", ())
+    )
+    for helpers in helper_groups:
+        for helper in helpers:
+            template = helper.get("template")
+            if not isinstance(template, str) or not template.startswith(
+                "triton/kernels/paged_attention/"
+            ):
+                continue
+            model = helper.get("model")
+            cache = model.get("Cache") if isinstance(model, dict) else None
+            if not isinstance(cache, dict):
+                continue
+            cache_block_sizes.add(
+                _require_int(
+                    cache.get("BlockSize"),
+                    f"PyNTT kernel {kernel['metadata']['name']} PagedAttention "
+                    "cache block size",
+                    minimum=1,
+                )
+            )
+
+    block_n_candidates = tuple(
+        candidate
+        for candidate in PAGED_ATTENTION_BLOCK_N_CANDIDATES
+        if all(
+            candidate <= cache_block_size
+            and cache_block_size % candidate == 0
+            for cache_block_size in cache_block_sizes
+        )
+    )
+    if cache_block_sizes and not block_n_candidates:
+        raise ValueError(
+            f"PyNTT kernel {kernel['metadata']['name']} has PagedAttention cache "
+            f"block sizes {sorted(cache_block_sizes)} but no legal block_n in "
+            f"{PAGED_ATTENTION_BLOCK_N_CANDIDATES}."
+        )
+    if not block_n_candidates:
+        block_n_candidates = PAGED_ATTENTION_BLOCK_N_CANDIDATES
+
+    block_n = min(PAGED_ATTENTION_BLOCK_N, max(block_n_candidates))
+    return {
+        "block_n": block_n,
+        "block_n_candidates": block_n_candidates,
+        "num_stages": PAGED_ATTENTION_NUM_STAGES,
+        "num_stages_candidates": PAGED_ATTENTION_NUM_STAGES_CANDIDATES,
+    }
 
 
 def _kernel_backend_config(kernel: dict[str, Any]) -> dict[str, Any]:
@@ -527,6 +614,7 @@ def _kernel_backend_config(kernel: dict[str, Any]) -> dict[str, Any]:
         },
         "num_warps": num_warps,
         "num_stages": 1,
+        "paged_attention": _paged_attention_backend_config(kernel),
         "producer_warps": WARP_SPECIALIZATION_PRODUCER_WARPS,
         "worker_registers": worker_registers,
         "register_granularity": register_granularity,
@@ -737,6 +825,18 @@ def _pipeline_helper_descriptor_specs(
             _packed_matmul_glu_gemv_host_descriptor_spec,
             _packed_matmul_glu_gemv_host_descriptor_spec,
         )
+    elif template in (
+        "triton/kernels/paged_attention/mma_tma_smem_pipeline.py.jinja",
+        "triton/kernels/paged_attention/simt_tma_smem_pipeline.py.jinja",
+    ):
+        descriptor_names = (
+            model.get("KeyDescriptorName"),
+            model.get("ValueDescriptorName"),
+        )
+        descriptor_specs = (
+            _paged_attention_host_descriptor_spec,
+            _paged_attention_host_descriptor_spec,
+        )
     else:
         return ()
 
@@ -749,6 +849,53 @@ def _pipeline_helper_descriptor_specs(
             )
         result.append((descriptor_name, make_spec))
     return tuple(result)
+
+
+def _paged_attention_host_descriptor_spec(
+    model: dict[str, Any],
+    backing: dict[str, Any],
+) -> dict[str, Any]:
+    microkernel = _microkernel_context(
+        model,
+        "triton.paged_attention_partial",
+    )
+    if microkernel["variant"] not in (
+        "mma_tma_smem_pipeline",
+        "simt_tma_smem_pipeline",
+    ):
+        raise ValueError(
+            "PyNTT PagedAttention host descriptor requires a TMA shared "
+            f"pipeline variant, got {microkernel['variant']!r}."
+        )
+    block_n = microkernel["parameters"]["block_n"]
+    head_dim = microkernel["parameters"]["head_dim"]
+    shape = tuple(int(value) for value in backing["logical_shape"])
+    strides = tuple(int(value) for value in backing["logical_strides"])
+    source_shape_axes = tuple(
+        tuple(int(axis) for axis in axes)
+        for axes in backing["source_shape_axes"]
+    )
+    if len(shape) != 5 or len(strides) != 5 or len(source_shape_axes) != 5:
+        raise ValueError(
+            "PyNTT PagedAttention host descriptor requires rank-5 "
+            "shape/stride/source-shape metadata."
+        )
+    if shape[-1] != head_dim or shape[2] % block_n != 0:
+        raise ValueError(
+            "PyNTT PagedAttention host descriptor shape is incompatible with "
+            f"block_n={block_n}, head_dim={head_dim}: {shape}."
+        )
+    return {
+        "name": backing["name"],
+        "source": backing["source"],
+        "offset_bytes": int(backing["offset_bytes"]),
+        "dtype": backing["scalar_dtype"],
+        "shape": shape,
+        "strides": strides,
+        "block_shape": (1, 1, block_n, 1, head_dim),
+        "source_shape_axes": source_shape_axes,
+        "padding": "zero",
+    }
 
 
 def _packed_gemv_host_descriptor_spec(
@@ -1006,6 +1153,7 @@ def _k_major_gemv_host_descriptor_spec(
             k_pack,
             contiguous_extent,
         ),
+        "source_shape_axes": ((), (), (), ()),
         "padding": "zero",
     }
 
@@ -1073,6 +1221,7 @@ def _render_kernel(kernel: dict[str, Any]) -> str:
         worker_registers=backend_config["worker_registers"],
         register_granularity=backend_config["register_granularity"],
         registers_per_thread_limit=backend_config["registers_per_thread_limit"],
+        kernel_config=backend_config,
         device_functions_by_name=device_functions_by_name,
     )
     device_function_sources = [
@@ -1086,6 +1235,7 @@ def _render_kernel(kernel: dict[str, Any]) -> str:
             backend_config["worker_registers"],
             backend_config["register_granularity"],
             backend_config["registers_per_thread_limit"],
+            backend_config,
         )
         for device_function in device_functions
     ]
@@ -1138,6 +1288,7 @@ def _render_device_function(
     worker_registers: int,
     register_granularity: int,
     registers_per_thread_limit: int,
+    kernel_config: dict[str, Any],
 ) -> str:
     helper_sources = _render_helper_sources(
         env,
@@ -1149,6 +1300,7 @@ def _render_device_function(
         worker_registers=worker_registers,
         register_granularity=register_granularity,
         registers_per_thread_limit=registers_per_thread_limit,
+        kernel_config=kernel_config,
         device_functions_by_name=device_functions_by_name,
     )
     parts = [source for source in helper_sources if source]
@@ -1286,6 +1438,7 @@ def _render_helper_sources(
     worker_registers: int | None = None,
     register_granularity: int | None = None,
     registers_per_thread_limit: int | None = None,
+    kernel_config: dict[str, Any] | None = None,
     device_functions_by_name: dict[str, dict[str, Any]] | None = None,
 ) -> list[str]:
     helper_sources = []
@@ -1299,6 +1452,7 @@ def _render_helper_sources(
             worker_registers=worker_registers,
             register_granularity=register_granularity,
             registers_per_thread_limit=registers_per_thread_limit,
+            kernel_config=kernel_config,
             device_functions_by_name=device_functions_by_name,
         )
         model["RematerializeEntryIndices"] = bool(
@@ -1322,6 +1476,7 @@ def _prepare_helper_model(
     worker_registers: int | None,
     register_granularity: int | None,
     registers_per_thread_limit: int | None,
+    kernel_config: dict[str, Any] | None,
     device_functions_by_name: dict[str, dict[str, Any]] | None,
 ) -> dict[str, Any]:
     model = dict(raw_model)
@@ -1339,6 +1494,8 @@ def _prepare_helper_model(
         model["RegisterGranularity"] = register_granularity
     if registers_per_thread_limit is not None:
         model["RegistersPerThreadLimit"] = registers_per_thread_limit
+    if kernel_config is not None:
+        model["KernelConfig"] = kernel_config
 
     if "Stages" in model:
         stages = []
@@ -1353,6 +1510,7 @@ def _prepare_helper_model(
                 worker_registers=worker_registers,
                 register_granularity=register_granularity,
                 registers_per_thread_limit=registers_per_thread_limit,
+                kernel_config=kernel_config,
                 device_functions_by_name=device_functions_by_name,
             )
             stages.append(stage)
@@ -1518,6 +1676,8 @@ def _make_env() -> Environment:
         norm_apply_context=_norm_apply_template_context,
         norm_stats_context=_norm_stats_template_context,
         paged_attention_context=_paged_attention_template_context,
+        paged_attention_merge_context=_paged_attention_merge_template_context,
+        paged_attention_partial_context=_paged_attention_partial_template_context,
         packed_gemv_pipeline_context=_packed_gemv_pipeline_template_context,
         packed_qkv_gemv_pipeline_context=_packed_qkv_gemv_pipeline_template_context,
         pointer_shard_hierarchy=_pointer_shard_hierarchy,
@@ -3108,6 +3268,9 @@ def _microkernel_context(
         "simt_fma_smem_pipeline": ("rhs_stage",),
         "mma": ("lhs_stage", "rhs_stage"),
         "dot": ("lhs_stage", "rhs_stage"),
+        "mma_direct": (),
+        "mma_tma_smem_pipeline": ("key_stage", "value_stage"),
+        "simt_tma_smem_pipeline": ("key_stage", "value_stage"),
     }.get(variant)
     if required_offsets is None:
         raise ValueError(f"Unsupported PyNTT microkernel variant {variant!r}.")
@@ -5497,6 +5660,53 @@ def _qkv_rope_with_cache_template_context(
     if model["KUpdate"]["Hierarchy"] != model["VUpdate"]["Hierarchy"]:
         raise ValueError("PyNTT QKVRoPEWithCache K/V updates must use one hierarchy")
 
+    qkv_layout = tuple(int(axis) for axis in model["QKVLayout"])
+    attention_layout = tuple(int(axis) for axis in model["AttentionLayout"])
+    if sorted(qkv_layout) != [0, 1, 2] or sorted(attention_layout) != [0, 1, 2]:
+        raise ValueError(
+            "PyNTT QKVRoPEWithCache layouts must each contain Seq, Head, and Dim"
+        )
+    permutation = tuple(qkv_layout.index(axis) for axis in attention_layout)
+    q_output_shape = model["QOutputShape"]
+    source_shape = model["QNorm"]["OutputShape"]
+    if len(q_output_shape) != len(permutation) or len(source_shape) != len(permutation):
+        raise ValueError(
+            "PyNTT QKVRoPEWithCache Q input/output rank must match its semantic layouts"
+        )
+    for output_axis, source_axis in enumerate(permutation):
+        output_extent = _fixed(q_output_shape[output_axis])
+        source_extent = _fixed(source_shape[source_axis])
+        if (
+            output_extent is not None
+            and source_extent is not None
+            and output_extent != source_extent
+        ):
+            raise ValueError(
+                "PyNTT QKVRoPEWithCache Q layout permutation changes a physical extent: "
+                f"output axis {output_axis} has {output_extent}, source axis "
+                f"{source_axis} has {source_extent}"
+            )
+    output_lane_shape = tuple(int(value) for value in model["QOutputVectorLaneShape"])
+    source_access = q_context["input_access"]
+    if (
+        output_lane_shape != tuple(source_access["LaneShape"])
+        or int(model["QOutputVectorLaneCount"])
+        != (_product_int(list(output_lane_shape)) if output_lane_shape else 1)
+    ):
+        raise ValueError(
+            "PyNTT QKVRoPEWithCache Q input/output vector lane layouts must match"
+        )
+    q_context["final_output_access"] = _tensor_access(
+        tuple(
+            tuple(source_access["TensorIndices"])[source_axis]
+            for source_axis in permutation
+        ),
+        model["QOutputStrides"],
+        source_access["LaneIndices"],
+        output_lane_shape,
+        q_context["tile_shape"],
+    )
+
     k_cache_context.update(
         {
             "source_dim_block": k_context["output_physical_rotary"],
@@ -6102,7 +6312,35 @@ def _paged_attention_template_context(model: dict[str, Any]) -> dict[str, Any]:
     """Validate PagedAttention layouts and prepare coordinate-native accesses."""
 
     cache = model["Cache"]
-    attention_block_size = int(model["AttentionBlockSize"])
+    microkernel_variant = None
+    if model.get("MicroKernel") is not None:
+        microkernel = _microkernel_context(
+            model,
+            "triton.paged_attention_partial",
+            str(model["MicroKernel"]["Variant"]),
+        )
+        microkernel_variant = microkernel["variant"]
+        attention_block_size = microkernel["parameters"]["block_n"]
+        attention_num_stages = microkernel["parameters"]["num_stages"]
+    else:
+        kernel_config = model.get("KernelConfig")
+        if not isinstance(kernel_config, dict):
+            raise ValueError("PyNTT PagedAttention requires a renderer kernel config.")
+        attention_config = kernel_config.get("paged_attention")
+        if not isinstance(attention_config, dict):
+            raise ValueError(
+                "PyNTT PagedAttention requires a paged_attention backend config."
+            )
+        attention_block_size = _require_int(
+            attention_config.get("block_n"),
+            "PyNTT PagedAttention backend block_n",
+            minimum=1,
+        )
+        attention_num_stages = _require_int(
+            attention_config.get("num_stages"),
+            "PyNTT PagedAttention backend num_stages",
+            minimum=1,
+        )
     cache_block_size = int(cache["BlockSize"])
     if (
         attention_block_size <= 0
@@ -6172,11 +6410,34 @@ def _paged_attention_template_context(model: dict[str, Any]) -> dict[str, Any]:
             f"head_dim={cache['HeadDim']}."
         )
 
+    global_num_query_heads = int(model["GlobalNumQueryHeads"])
+    num_kv_heads = int(cache["NumKVHeads"])
+    if (
+        global_num_query_heads <= 0
+        or num_kv_heads <= 0
+        or global_num_query_heads % num_kv_heads != 0
+    ):
+        raise ValueError(
+            "PyNTT PagedAttention requires a positive integral GQA group: "
+            f"query_heads={global_num_query_heads}, kv_heads={num_kv_heads}."
+        )
+    local_q_heads = _constant_dim_value(model["OutputShape"][model["HeadAxis"]])
+    if local_q_heads <= 0:
+        raise ValueError(
+            f"PyNTT PagedAttention local query-head extent must be positive, got {local_q_heads}."
+        )
+    q_head_group_size = global_num_query_heads // num_kv_heads
+    q_head_group_tile = 1 << (q_head_group_size - 1).bit_length()
+    global_q_head_begin = global_index_expression(
+        model["HeadAxis"], "0", global_num_query_heads
+    )
+
     query_dim_axis = _structured_axis_tile(
         "query_dim",
         query_lanes,
         int(cache["HeadDim"]),
         cache["HeadDim"],
+        leading_rank=1,
     )
     key_dim_axis = _structured_axis_tile(
         "key_dim",
@@ -6188,12 +6449,19 @@ def _paged_attention_template_context(model: dict[str, Any]) -> dict[str, Any]:
 
     query_indices = ["0"] * len(model["QueryShape"])
     query_indices[model["SeqAxis"]] = "local_query_id"
-    query_indices[model["HeadAxis"]] = "q_head"
+    query_indices[model["HeadAxis"]] = _broadcast_axis_coordinate(
+        "safe_local_q_heads", query_dim_axis["rank"], 0
+    )
     query_indices[dim_axis] = query_dim_axis["physical_coordinate"]
     output_indices = ["0"] * len(model["OutputShape"])
     output_indices[model["SeqAxis"]] = "local_query_id"
-    output_indices[model["HeadAxis"]] = "q_head"
+    output_indices[model["HeadAxis"]] = _broadcast_axis_coordinate(
+        "safe_local_q_heads", query_dim_axis["rank"], 0
+    )
     output_indices[dim_axis] = query_dim_axis["physical_coordinate"]
+    query_structured_shape = _structured_value_shape(
+        query_dim_axis, leading_extents=(q_head_group_tile,)
+    )
 
     key_lane = _flatten_coordinates(
         key_dim_axis["lane_coordinates"], key_dim_axis["lane_shape"]
@@ -6294,21 +6562,20 @@ def _paged_attention_template_context(model: dict[str, Any]) -> dict[str, Any]:
 
     local_query_tokens = model["OutputShape"][model["SeqAxis"]]
     global_query_tokens = model["OutputGlobalShape"][model["SeqAxis"]]
-    return {
+    context = {
         "attention_block_size": attention_block_size,
+        "attention_num_stages": attention_num_stages,
         "key_cache_block_id": (
             "(key_topology_id * num_blocks_per_shard + key_block_id)"
             if cache["IdLength"] > 1
             else "key_block_id"
         ),
         "value_cache_block_id": (
-            "(value_topology_id * num_blocks_per_shard + value_block_id)"
+            "(key_topology_id * num_blocks_per_shard + key_block_id)"
             if cache["IdLength"] > 1
-            else "value_block_id"
+            else "key_block_id"
         ),
-        "global_q_head": global_index_expression(
-            model["HeadAxis"], "q_head", model["GlobalNumQueryHeads"]
-        ),
+        "global_q_head_begin": global_q_head_begin,
         "global_query_id": global_index_expression(
             model["SeqAxis"], "local_query_id", global_query_tokens
         ),
@@ -6321,29 +6588,277 @@ def _paged_attention_template_context(model: dict[str, Any]) -> dict[str, Any]:
             key_dim_axis, trailing_extents=(attention_block_size,)
         ),
         "key_vector_offset": key_vector_offset,
-        "local_q_heads": model["OutputShape"][model["HeadAxis"]],
+        "local_q_heads": local_q_heads,
         "local_query_tokens": local_query_tokens,
+        "output_mask": _broadcast_axis_coordinate(
+            "q_head_mask", query_dim_axis["rank"], 0
+        ),
         "output_access": _tensor_access(
             output_indices,
             model["OutputStrides"],
             query_dim_axis["lane_coordinates"],
             output_lanes,
-            _coordinate_shape(query_dim_axis["structured_shape"]),
+            _coordinate_shape(query_structured_shape),
+        ),
+        "q_head_group_size": q_head_group_size,
+        "q_head_group_tile": q_head_group_tile,
+        "query_mask": _broadcast_axis_coordinate(
+            "q_head_mask", query_dim_axis["rank"], 0
         ),
         "query_access": _tensor_access(
             query_indices,
             model["QueryStrides"],
             query_dim_axis["lane_coordinates"],
             query_lanes,
-            _coordinate_shape(query_dim_axis["structured_shape"]),
+            _coordinate_shape(query_structured_shape),
         ),
         "query_dim_axis": query_dim_axis,
-        "query_structured_shape": query_dim_axis["structured_shape"],
+        "query_structured_shape": query_structured_shape,
         "value_axis": value_axis,
         "value_axis_kind": value_axis_kind,
         "value_mask": value_mask,
         "value_structured_shape": value_structured_shape,
         "value_vector_offset": value_vector_offset,
+    }
+    if microkernel_variant == "simt_tma_smem_pipeline":
+        target_worker_width = int(model["TargetWorkerWidth"])
+        consumer_warps = int(model["NumWarps"])
+        vector_elements = 8
+        if (
+            model["QueryDType"] != "bfloat16"
+            or int(cache["HeadDim"]) % vector_elements != 0
+        ):
+            raise ValueError(
+                "PyNTT SIMT paged attention requires a BF16 query and a "
+                "HeadDim divisible by eight elements."
+            )
+        dim_threads = int(cache["HeadDim"]) // vector_elements
+        if (
+            dim_threads <= 0
+            or target_worker_width % dim_threads != 0
+            or q_head_group_tile > consumer_warps
+            or consumer_warps % q_head_group_tile != 0
+        ):
+            raise ValueError(
+                "PyNTT SIMT paged attention cannot partition its GQA and "
+                "HeadDim axes over the configured consumer workers: "
+                f"group_tile={q_head_group_tile}, head_dim={cache['HeadDim']}, "
+                f"worker_width={target_worker_width}, warps={consumer_warps}."
+            )
+        token_threads = target_worker_width // dim_threads
+        token_warps = consumer_warps // q_head_group_tile
+        if attention_block_size % (token_threads * token_warps) != 0:
+            raise ValueError(
+                "PyNTT SIMT paged attention requires exact token coverage by "
+                "its thread/warp partition: "
+                f"block_n={attention_block_size}, token_threads={token_threads}, "
+                f"token_warps={token_warps}."
+            )
+        function_name = model["FunctionName"]
+        context.update(
+            simt_product_size_per_thread=(1, 1, vector_elements),
+            simt_product_threads_per_warp=(1, token_threads, dim_threads),
+            simt_product_warps_per_cta=(
+                q_head_group_tile,
+                token_warps,
+                1,
+            ),
+            simt_product_layout_name=f"{function_name}__product_layout",
+            simt_query_layout_name=f"{function_name}__query_layout",
+            simt_score_layout_name=f"{function_name}__score_layout",
+            simt_acc_layout_name=f"{function_name}__acc_layout",
+        )
+    return context
+
+
+def _paged_attention_partial_template_context(
+    model: dict[str, Any],
+) -> dict[str, Any]:
+    """Extend the common attention coordinates with FP32 partial-state stores."""
+
+    ctx = _paged_attention_template_context(model)
+    query_rank = len(model["QueryShape"])
+    state_rank = query_rank + 1
+    for name in ("MaxState", "SumState", "AccState"):
+        if len(model[f"{name}Shape"]) != state_rank or len(
+            model[f"{name}Strides"]
+        ) != state_rank:
+            raise ValueError(
+                f"PyNTT PagedAttentionPartial {name} must have rank {state_rank}"
+            )
+
+    split_count = int(model["SplitCount"])
+    split_axis = int(model["SplitHierarchyAxis"])
+    if (
+        split_axis < 0
+        or split_axis >= len(model["Hierarchy"])
+        or split_count <= 1
+        or split_count > model["Hierarchy"][split_axis]
+    ):
+        raise ValueError(
+            "PyNTT PagedAttentionPartial split count must fit its hierarchy axis"
+        )
+
+    def state_indices(head_index: str, dim_index: str) -> list[str]:
+        indices = ["0"] * state_rank
+        indices[model["SeqAxis"]] = "local_query_id"
+        indices[model["HeadAxis"]] = head_index
+        indices[model["DimAxis"]] = dim_index
+        indices[-1] = "0"
+        return indices
+
+    q_head_group_tile = int(ctx["q_head_group_tile"])
+    head_dimension = int(model["Cache"]["HeadDim"])
+    ctx.update(
+        acc_state_access=_tensor_access(
+            state_indices("safe_local_q_heads[:, None]", "dim_offsets[None, :]"),
+            model["AccStateStrides"],
+            coordinate_shape=f"({q_head_group_tile}, {head_dimension})",
+        ),
+        max_state_access=_tensor_access(
+            state_indices("safe_local_q_heads", "0"),
+            model["MaxStateStrides"],
+            coordinate_shape=f"({q_head_group_tile},)",
+        ),
+        split_coord=f"shard_coord{split_axis}",
+        split_count=split_count,
+        sum_state_access=_tensor_access(
+            state_indices("safe_local_q_heads", "0"),
+            model["SumStateStrides"],
+            coordinate_shape=f"({q_head_group_tile},)",
+        ),
+        simt_acc_state_access=_tensor_access(
+            state_indices("state_local_q_heads", "state_dim_offsets"),
+            model["AccStateStrides"],
+            coordinate_shape=f"({q_head_group_tile}, {head_dimension})",
+        ),
+        simt_max_state_access=_tensor_access(
+            state_indices("state_scalar_q_heads", "0"),
+            model["MaxStateStrides"],
+            coordinate_shape=f"({q_head_group_tile},)",
+        ),
+        simt_sum_state_access=_tensor_access(
+            state_indices("state_scalar_q_heads", "0"),
+            model["SumStateStrides"],
+            coordinate_shape=f"({q_head_group_tile},)",
+        ),
+    )
+    return ctx
+
+
+def _paged_attention_merge_template_context(
+    model: dict[str, Any],
+) -> dict[str, Any]:
+    """Prepare output and split-state coordinates for online-softmax merging."""
+
+    output_rank = len(model["OutputShape"])
+    state_rank = output_rank + 1
+    for name in ("MaxState", "SumState", "AccState"):
+        if len(model[f"{name}Shape"]) != state_rank or len(
+            model[f"{name}Strides"]
+        ) != state_rank:
+            raise ValueError(
+                f"PyNTT PagedAttentionMerge {name} must have rank {state_rank}"
+            )
+
+    split_count = int(model["SplitCount"])
+    split_axis = int(model["SplitHierarchyAxis"])
+    if (
+        split_axis < 0
+        or split_axis >= len(model["Hierarchy"])
+        or split_count <= 1
+        or split_count > model["Hierarchy"][split_axis]
+    ):
+        raise ValueError(
+            "PyNTT PagedAttentionMerge split count must fit its hierarchy axis"
+        )
+    split_tile = 1 << (split_count - 1).bit_length()
+    head_dimension = int(model["HeadDimension"])
+    output_lanes = _validate_coordinate_lane_shape(
+        model["OutputVectorLaneShape"], "PyNTT PagedAttentionMerge output"
+    )
+    output_lane_count = _product_int(list(output_lanes)) if output_lanes else 1
+    dim_axis = int(model["DimAxis"])
+    output_physical_dim = _constant_dim_value(model["OutputShape"][dim_axis])
+    if output_physical_dim is None or output_physical_dim * output_lane_count != head_dimension:
+        raise ValueError(
+            "PyNTT PagedAttentionMerge output HeadDim does not match its vector lanes"
+        )
+
+    output_dim_axis = _structured_axis_tile(
+        "output_dim",
+        output_lanes,
+        head_dimension,
+        head_dimension,
+    )
+
+    def global_index_expression(axis: int, local_index: str, global_extent: Any) -> str:
+        split_axes = model["OutputSplitAxes"][axis]
+        if not split_axes:
+            return local_index
+        divisor = _split_divisor(split_axes, model["Hierarchy"])
+        return (
+            f"{local_index} + "
+            f"({_split_linear_expression(split_axes, model['Hierarchy'])}) * "
+            f"tl.cdiv({_dim(global_extent)}, {divisor})"
+        )
+
+    output_indices = ["0"] * output_rank
+    output_indices[model["SeqAxis"]] = "local_query_id"
+    output_indices[model["HeadAxis"]] = "q_head"
+    output_indices[dim_axis] = output_dim_axis["physical_coordinate"]
+
+    def state_indices(dim_index: str, split_index: str) -> list[str]:
+        indices = ["0"] * state_rank
+        indices[model["SeqAxis"]] = "local_query_id"
+        indices[model["HeadAxis"]] = "q_head"
+        indices[dim_axis] = dim_index
+        indices[-1] = split_index
+        return indices
+
+    global_query_tokens = model["OutputGlobalShape"][model["SeqAxis"]]
+    global_query_id = global_index_expression(
+        model["SeqAxis"], "local_query_id", global_query_tokens
+    )
+    global_q_head = global_index_expression(
+        model["HeadAxis"], "q_head", model["GlobalNumQueryHeads"]
+    )
+    return {
+        "acc_state_access": _tensor_access(
+            state_indices("dim_grid", "split_grid"),
+            model["AccStateStrides"],
+            coordinate_shape=f"({split_tile}, {head_dimension})",
+        ),
+        "global_q_head": global_q_head,
+        "global_query_id": global_query_id,
+        "local_q_heads": model["OutputShape"][model["HeadAxis"]],
+        "local_query_tokens": model["OutputShape"][model["SeqAxis"]],
+        "max_state_access": _tensor_access(
+            state_indices("0", "split_offsets"),
+            model["MaxStateStrides"],
+            coordinate_shape=f"({split_tile},)",
+        ),
+        "output_access": _tensor_access(
+            output_indices,
+            model["OutputStrides"],
+            output_dim_axis["lane_coordinates"],
+            output_lanes,
+            _coordinate_shape(output_dim_axis["structured_shape"]),
+        ),
+        "output_active": (
+            f"({global_query_id} < {_dim(global_query_tokens)}) & "
+            f"({global_q_head} < {int(model['GlobalNumQueryHeads'])})"
+        ),
+        "output_dim_axis": output_dim_axis,
+        "output_structured_shape": output_dim_axis["structured_shape"],
+        "owner": f"shard_coord{split_axis} == 0",
+        "split_count": split_count,
+        "split_tile": split_tile,
+        "sum_state_access": _tensor_access(
+            state_indices("0", "split_offsets"),
+            model["SumStateStrides"],
+            coordinate_shape=f"({split_tile},)",
+        ),
     }
 
 

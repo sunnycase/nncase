@@ -38,15 +38,103 @@ public sealed class PagedAttentionEvaluator : ITypeInferencer<PagedAttention>, I
         var kvCachesType = context.GetArgumentType<TensorType>(target, PagedAttention.KVCaches);
         var returnType = context.GetReturnType<IRType>();
 
-        var cost = new Cost()
+        var executionPlan = PagedAttentionExecutionPlan.Direct;
+        PagedAttentionExecutionPlanQuery? executionQuery = null;
+        if (PagedAttentionExecutionPlanQuery.TryCreate(
+            qType,
+            extraType,
+            kvCachesType,
+            target.Layout,
+            target.HiddenSize,
+            out var query))
         {
-            [CostFactorNames.BlockLocalMemoryLoadBytes] = CostUtility.GetMemoryAccess(qType),
-            [CostFactorNames.BlockLocalMemoryStoreBytes] = CostUtility.GetMemoryAccess(returnType),
-        };
-        if (TryEstimatePagedAttentionCost(qType, extraType, kvCachesType, target, out var kvReadBytes, out var cpuCycles))
+            executionQuery = query;
+            if (context.CompileOptions.TargetOptions is IPagedAttentionExecutionPlanProvider provider)
+            {
+                executionPlan = provider.GetPagedAttentionExecutionPlan(query);
+                executionPlan.Validate(query);
+            }
+        }
+
+        var queryLoadBytes = CostUtility.GetMemoryAccess(qType);
+        var outputStoreBytes = CostUtility.GetMemoryAccess(returnType);
+        var cost = new Cost();
+
+        UInt128 kvReadBytes;
+        UInt128 cpuCycles;
+        var hasExecutionCost = false;
+        if (executionQuery is not null)
         {
+            kvReadBytes = ToCostFactor(
+                executionQuery.KVScalarElements * executionQuery.KVElementSizeBytes);
+            cpuCycles = ToCostFactor(executionQuery.ComputeWork);
+            hasExecutionCost = true;
+        }
+        else
+        {
+            hasExecutionCost = TryEstimatePagedAttentionCost(
+                qType,
+                extraType,
+                kvCachesType,
+                target,
+                out kvReadBytes,
+                out cpuCycles);
+        }
+
+        if (hasExecutionCost && executionPlan.Kind == PagedAttentionExecutionKind.Direct)
+        {
+            AddCostFactor(cost, CostFactorNames.BlockLocalMemoryLoadBytes, queryLoadBytes);
             AddCostFactor(cost, CostFactorNames.BlockLocalMemoryLoadBytes, kvReadBytes);
+            AddCostFactor(cost, CostFactorNames.BlockLocalMemoryStoreBytes, outputStoreBytes);
             AddCostFactor(cost, CostFactorNames.CPUCycles, cpuCycles);
+        }
+
+        if (executionPlan.Kind == PagedAttentionExecutionKind.SplitKV && executionQuery is not null)
+        {
+            var hierarchyExtent = executionQuery.QueryType.Placement.Hierarchy[
+                executionPlan.SplitHierarchyAxis];
+            var partialStateBytes = ToCostFactor(
+                executionQuery.PartialStateScalarElements * sizeof(float));
+            var activeQueryLoadBytes = ScaleRoundUp(
+                queryLoadBytes,
+                executionPlan.SplitCount,
+                hierarchyExtent);
+            var averageKVLoadBytes = DivideRoundUp(kvReadBytes, hierarchyExtent);
+            var partialStateStoreBytes = ScaleRoundUp(
+                partialStateBytes,
+                executionPlan.SplitCount,
+                hierarchyExtent);
+            var partialStateMergeLoadBytes = ScaleRoundUp(
+                partialStateBytes,
+                executionPlan.SplitCount,
+                hierarchyExtent);
+            var ownerOutputStoreBytes = DivideRoundUp(outputStoreBytes, hierarchyExtent);
+            AddCostFactor(cost, CostFactorNames.BlockLocalMemoryLoadBytes, activeQueryLoadBytes);
+            AddCostFactor(cost, CostFactorNames.BlockLocalMemoryLoadBytes, averageKVLoadBytes);
+            AddCostFactor(
+                cost,
+                CostFactorNames.BlockLocalMemoryLoadBytes,
+                partialStateMergeLoadBytes);
+            AddCostFactor(
+                cost,
+                CostFactorNames.BlockLocalMemoryStoreBytes,
+                partialStateStoreBytes);
+            AddCostFactor(
+                cost,
+                CostFactorNames.BlockLocalMemoryStoreBytes,
+                ownerOutputStoreBytes);
+            AddCostFactor(
+                cost,
+                CostFactorNames.CPUCycles,
+                DivideRoundUp(cpuCycles, executionPlan.SplitCount) +
+                ToCostFactor(executionQuery.PartialStateScalarElements * executionPlan.SplitCount));
+            AddCostFactor(cost, CostFactorNames.GridSynchronization, 2);
+        }
+
+        if (!hasExecutionCost)
+        {
+            AddCostFactor(cost, CostFactorNames.BlockLocalMemoryLoadBytes, queryLoadBytes);
+            AddCostFactor(cost, CostFactorNames.BlockLocalMemoryStoreBytes, outputStoreBytes);
         }
 
         return cost;
@@ -382,7 +470,8 @@ public sealed class PagedAttentionEvaluator : ITypeInferencer<PagedAttention>, I
         var headDim = System.Math.Max(1.0, qShape[dimAxis] * GetVectorLaneCount(GetDType(qType)));
         var contextLen = System.Math.Max(qSeq, EstimateContextLength(extraType, config, target, qSeq));
 
-        var kvScalarElements = 2.0 * qSeq * qHeads * contextLen * headDim;
+        var kvHeads = System.Math.Min(qHeads, System.Math.Max(1, config.NumKVHeads));
+        var kvScalarElements = 2.0 * qSeq * kvHeads * contextLen * headDim;
         kvReadBytes = ToCostFactor(kvScalarElements * config.KVPrimType.SizeInBytes);
 
         // qk and pv each cost roughly headDim FMA per attention element. Softmax/mask
@@ -450,6 +539,23 @@ public sealed class PagedAttentionEvaluator : ITypeInferencer<PagedAttention>, I
             VectorType vectorType => vectorType.Lanes.Aggregate(1, static (acc, lane) => acc * lane) * GetVectorLaneCount(vectorType.ElemType),
             _ => 1,
         };
+    }
+
+    private UInt128 DivideRoundUp(UInt128 value, int divisor)
+    {
+        var unsignedDivisor = (UInt128)checked((uint)divisor);
+        var quotient = value / unsignedDivisor;
+        return value % unsignedDivisor == 0 ? quotient : quotient + 1;
+    }
+
+    private UInt128 ScaleRoundUp(UInt128 value, int multiplier, int divisor)
+    {
+        var unsignedDivisor = (UInt128)checked((uint)divisor);
+        var unsignedMultiplier = (UInt128)checked((uint)multiplier);
+        var quotient = value / unsignedDivisor;
+        var remainder = value % unsignedDivisor;
+        return (quotient * unsignedMultiplier) +
+            DivideRoundUp(remainder * unsignedMultiplier, divisor);
     }
 
     private UInt128 ToCostFactor(double value)

@@ -52,10 +52,13 @@ public sealed partial class QKVRoPEWithCache : NTTKernelOp
 
     public bool KUseMean { get; }
 
-    public IRArray<AttentionDimKind> Layout { get; }
+    public IRArray<AttentionDimKind> QKVLayout { get; }
+
+    public IRArray<AttentionDimKind> AttentionLayout { get; }
 
     public override string DisplayProperty() =>
         $"QAxis: {QAxis}, QEpsilon: {QEpsilon}, QUseMean: {QUseMean}, " +
         $"KAxis: {KAxis}, KEpsilon: {KEpsilon}, KUseMean: {KUseMean}, " +
-        $"Layout [{string.Join(',', Layout)}]";
+        $"QKVLayout [{string.Join(',', QKVLayout)}], " +
+        $"AttentionLayout [{string.Join(',', AttentionLayout)}]";
 }

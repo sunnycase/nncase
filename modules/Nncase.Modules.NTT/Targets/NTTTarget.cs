@@ -90,6 +90,7 @@ public abstract class NTTTarget : Target
         pass.Add<Passes.Rules.NTT.VectorizeLayerNorm>(rank, lane);
         pass.Add<Passes.Rules.NTT.VectorizeNormStats>(rank, lane);
         pass.Add<Passes.Rules.NTT.VectorizeNormApply>(rank, lane);
+        pass.Add<Passes.Rules.NTT.VectorizeQKVRoPEWithCache>();
 
         RegisterPackPropagationRules(pass, options);
     }

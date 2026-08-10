@@ -65,7 +65,7 @@ public sealed partial class VectorizeReshapePropagation : RewriteRule<Pattern>
                 if (vectorizeAxisIndex >= 0)
                 {
                     if (vectorizeAxisIndex == newAxes.Count - 1
-                        || newAxes.Skip(vectorizeAxisIndex + 1).All(x => x == 1))
+                        || newAxes.Skip(vectorizeAxisIndex + 1).All(axis => newShape[axis] == 1))
                     {
                         // last axis, just use the vectorize axis
                         vectorizeAxes.Add(inAxis);
@@ -146,9 +146,10 @@ public sealed partial class ReshapeDevectorizePropagation : RewriteRule<Pattern>
 
     private Expr? GetReplace(Unpack devectorize, Call caller, Call callee, Expr input, RankedShape newShape)
     {
-        var maxDevectorizeedShape = CompilerServices.GetMaxShape(callee.CheckedShape);
+        var devectorizedShape = callee.CheckedShape;
+        var maxDevectorizedShape = CompilerServices.GetMaxShape(devectorizedShape);
         var maxNewShape = CompilerServices.GetMaxShape(newShape);
-        if (!IRUtility.TryGetShapeMapMatrix(maxDevectorizeedShape, maxNewShape, out var mat))
+        if (!IRUtility.TryGetShapeMapMatrix(maxDevectorizedShape, maxNewShape, out var mat))
         {
             return null;
         }
@@ -209,7 +210,7 @@ public sealed partial class ReshapeDevectorizePropagation : RewriteRule<Pattern>
                 if (vectorizeAxisIndex >= 0)
                 {
                     if (vectorizeAxisIndex == inAxes.Count - 1
-                        || inAxes.Skip(vectorizeAxisIndex + 1).All(x => x == 1))
+                        || inAxes.Skip(vectorizeAxisIndex + 1).All(axis => devectorizedShape[axis] == 1))
                     {
                         // last axis, just use the vectorize axis
                         devectorizeAxes.Add(newAxis);

@@ -183,7 +183,7 @@ def _write_generated_package(path, input_shape=(1,), layer_ids=("0",)):
         "\ufeff" + json.dumps(metadata), encoding="utf-8"
     )
     manifest = {
-        "pyntt_codegen_manifest_version": 8,
+        "pyntt_codegen_manifest_version": 9,
         "target_kind": "pyntt",
         "backend": "triton",
         "functions": [
@@ -219,10 +219,10 @@ def test_generated_package_contract_and_fingerprint(tmp_path):
     assert first.asset_file_bytes == {"assets/module_rdata.bin": 7}
     assert first.asset_file_sha256 == second.asset_file_sha256
     assert len(first.asset_file_sha256["assets/module_rdata.bin"]) == 64
-    assert first.manifest_summary["pyntt_codegen_manifest_version"] == 8
+    assert first.manifest_summary["pyntt_codegen_manifest_version"] == 9
 
     report_contract = _package_contract_json(first, generated_dir)
-    assert report_contract["manifest"]["pyntt_codegen_manifest_version"] == 8
+    assert report_contract["manifest"]["pyntt_codegen_manifest_version"] == 9
     assert "pipeline_gate" not in report_contract
 
 
@@ -244,7 +244,7 @@ def test_generated_package_rejects_incompatible_contract(
         inspect_generated_package(generated_dir)
 
 
-def test_generated_package_requires_manifest_v8(tmp_path):
+def test_generated_package_requires_manifest_v9(tmp_path):
     generated_dir = tmp_path / "generated"
     _write_generated_package(generated_dir)
     manifest_path = generated_dir / "kernel_params.json"
@@ -252,7 +252,7 @@ def test_generated_package_requires_manifest_v8(tmp_path):
     manifest["pyntt_codegen_manifest_version"] = 7
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
-    with pytest.raises(ValueError, match="expected 8"):
+    with pytest.raises(ValueError, match="expected 9"):
         inspect_generated_package(generated_dir)
 
 

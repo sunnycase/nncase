@@ -67,6 +67,7 @@ class TritonTensorDescriptorCache:
             "shape",
             "strides",
             "block_shape",
+            "source_shape_axes",
             "padding",
         }
     )
@@ -110,13 +111,65 @@ class TritonTensorDescriptorCache:
                     storage,
                     offset_bytes=int(spec["offset_bytes"]),
                     dtype=str(spec["dtype"]),
-                    shape=tuple(int(value) for value in spec["shape"]),
+                    shape=self._resolve_shape(
+                        f"{kernel_name}:{name}",
+                        storage,
+                        tuple(int(value) for value in spec["shape"]),
+                        tuple(
+                            tuple(int(axis) for axis in axes)
+                            for axes in spec["source_shape_axes"]
+                        ),
+                    ),
                     strides=tuple(int(value) for value in spec["strides"]),
                     block_shape=tuple(int(value) for value in spec["block_shape"]),
                     padding=str(spec["padding"]),
                 )
             )
         return tuple(descriptors)
+
+    @staticmethod
+    def _resolve_shape(
+        slot: str,
+        storage: Any,
+        static_shape: tuple[int, ...],
+        source_shape_axes: tuple[tuple[int, ...], ...],
+    ) -> tuple[int, ...]:
+        if len(source_shape_axes) != len(static_shape):
+            raise ValueError(
+                f"PyNTT host tensor descriptor {slot} static/source-shape "
+                f"ranks differ: {len(static_shape)}/{len(source_shape_axes)}."
+            )
+
+        storage_shape = tuple(int(extent) for extent in getattr(storage, "shape", ()))
+        used_axes: set[int] = set()
+        resolved = []
+        for descriptor_axis, (static_extent, source_axes) in enumerate(
+            zip(static_shape, source_shape_axes)
+        ):
+            extent = static_extent
+            if source_axes:
+                extent = 1
+                for source_axis in source_axes:
+                    if source_axis < 0 or source_axis >= len(storage_shape):
+                        raise ValueError(
+                            f"PyNTT host tensor descriptor {slot} dimension "
+                            f"{descriptor_axis} references source axis {source_axis}, "
+                            f"but source rank is {len(storage_shape)}."
+                        )
+                    if source_axis in used_axes:
+                        raise ValueError(
+                            f"PyNTT host tensor descriptor {slot} reuses source "
+                            f"axis {source_axis}."
+                        )
+                    used_axes.add(source_axis)
+                    extent *= storage_shape[source_axis]
+            if extent <= 0:
+                raise ValueError(
+                    f"PyNTT host tensor descriptor {slot} resolved non-positive "
+                    f"extent {extent} for dimension {descriptor_axis}."
+                )
+            resolved.append(extent)
+        return tuple(resolved)
 
     def _materialize(
         self,

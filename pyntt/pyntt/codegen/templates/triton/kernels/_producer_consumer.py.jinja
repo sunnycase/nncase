@@ -9,7 +9,7 @@ def {{ model["FunctionName"] }}__producer():
     pass
 
 
-{{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
+@triton.jit
 def {{ model["FunctionName"] }}({{ helper_parameters(model, args) }}):
     tle.gpu.warp_specialize(
         [

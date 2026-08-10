@@ -12,6 +12,7 @@ using System.Threading.Tasks;
 using DryIoc.ImTools;
 using Microsoft.Extensions.DependencyInjection;
 using NetFabric.Hyperlinq;
+using Nncase.CostModel;
 using Nncase.Diagnostics;
 using Nncase.IR;
 using Nncase.IR.Affine;
@@ -48,6 +49,14 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
         Expr selectedExpr,
         TIRSelectionContext context)
     {
+        if (selectedExpr is Sequential sequential)
+        {
+            return sequential.With(
+                fields: sequential.Fields.ToArray()
+                    .Select(field => FinalizeSelectedExpr(sourceCall, field, context))
+                    .ToArray());
+        }
+
         if (selectedExpr is not Call { Target: TIR.NTT.NTTKernelOp kernelOp } selectedCall)
         {
             return selectedExpr;
@@ -72,13 +81,13 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
                 kernelOp,
                 semanticArguments,
                 targetOptions.TargetMachineModel));
-        if (selection?.WeightPipeline is { } weightPipeline)
+        if (selection?.TransferPipeline is { } transferPipeline)
         {
-            ValidateWeightPipelineContract(
+            ValidateTransferPipelineContract(
                 kernelOp,
                 semanticArguments,
                 selection,
-                weightPipeline);
+                transferPipeline);
         }
 
         var workspaces = selection is null
@@ -263,7 +272,8 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
                         fused.KAxis,
                         fused.KEpsilon,
                         fused.KUseMean,
-                        fused.Layout);
+                        fused.QKVLayout,
+                        fused.AttentionLayout);
                 }
 
             case IR.NN.MatMulGlu matmulGlu:
@@ -368,7 +378,7 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
                 output = (Expr)arguments[0];
                 return TIR.F.NTT.IdentityPagedAttentionKVCache((Expr)arguments[0], (Expr)arguments[1], (Expr)arguments[2], (Expr)arguments[3], (Expr)arguments[4], (Expr)arguments[5], (Expr)arguments[6], (Expr)arguments[7], (Expr)arguments[8]);
             case IR.NN.PagedAttention pgat:
-                return TIR.F.NTT.PagedAttention((Expr)arguments[0], (Expr)arguments[1], (Expr)arguments[2], (Expr)arguments[3], (Dimension)arguments[4], output, pgat.Layout, pgat.HiddenSize);
+                return GeneratePagedAttention(call, pgat, arguments, ref output, context);
             case IR.Tensors.ConstantOfShape constantOfShape:
                 return TIR.F.NTT.ConstantOfShape((Shape)arguments[0], (Expr)arguments[1], output);
             case IR.Tensors.Range range:
@@ -420,20 +430,19 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
         }
     }
 
-    private static void ValidateWeightPipelineContract(
+    private static void ValidateTransferPipelineContract(
         TIR.NTT.NTTKernelOp kernelOp,
         IReadOnlyList<BaseExpr> semanticArguments,
         TIRMicroKernelSelection selection,
-        TIRWeightPipelineContract contract)
+        TIRTransferPipelineContract contract)
     {
-        foreach (var argumentIndex in contract.WeightArgumentIndices)
+        foreach (var argumentIndex in contract.SourceArgumentIndices)
         {
-            if ((uint)argumentIndex >= (uint)semanticArguments.Count ||
-                semanticArguments[argumentIndex] is not TIR.Buffer)
+            if ((uint)argumentIndex >= (uint)semanticArguments.Count)
             {
                 throw new InvalidOperationException(
                     $"TIR microkernel {selection.Family}/{selection.Variant} for " +
-                    $"{kernelOp.GetType().Name} declares invalid weight operand {argumentIndex}.");
+                    $"{kernelOp.GetType().Name} declares invalid transfer source operand {argumentIndex}.");
             }
 
             var parameter = kernelOp.Parameters[argumentIndex];
@@ -442,7 +451,7 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
             {
                 throw new InvalidOperationException(
                     $"TIR microkernel {selection.Family}/{selection.Variant} for " +
-                    $"{kernelOp.GetType().Name} declares weight operand {argumentIndex} " +
+                    $"{kernelOp.GetType().Name} declares transfer source operand {argumentIndex} " +
                     $"({parameter.Name}) with non-read-only memory effect {effect.Mode}.");
             }
         }
@@ -457,6 +466,197 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
             }
         }
     }
+
+    private Expr GeneratePagedAttention(
+        Call sourceCall,
+        IR.NN.PagedAttention pagedAttention,
+        IReadOnlyList<BaseExpr> arguments,
+        ref Expr output,
+        TIRSelectionContext context)
+    {
+        var direct = TIR.F.NTT.PagedAttention(
+            (Expr)arguments[0],
+            (Expr)arguments[1],
+            (Expr)arguments[2],
+            (Expr)arguments[3],
+            (Dimension)arguments[4],
+            output,
+            pagedAttention.Layout,
+            pagedAttention.HiddenSize);
+        if (_compileOptions.TargetOptions is not IPagedAttentionExecutionPlanProvider provider ||
+            sourceCall[IR.NN.PagedAttention.KVCaches].CheckedType is not TensorType kvCachesType ||
+            !PagedAttentionExecutionPlanQuery.TryCreate(
+                sourceCall[IR.NN.PagedAttention.Q].CheckedType,
+                sourceCall[IR.NN.PagedAttention.Extra].CheckedType,
+                kvCachesType,
+                pagedAttention.Layout,
+                pagedAttention.HiddenSize,
+                out var query))
+        {
+            return direct;
+        }
+
+        var plan = provider.GetPagedAttentionExecutionPlan(query);
+        plan.Validate(query);
+        if (plan.Kind != PagedAttentionExecutionKind.SplitKV)
+        {
+            return direct;
+        }
+
+        if (arguments[0] is not TIR.Buffer queryBuffer ||
+            queryBuffer.DistributedType is not { } queryDistributedType)
+        {
+            throw new InvalidOperationException(
+                "Split-KV PagedAttention requires a distributed query buffer at TIR selection.");
+        }
+
+        var seqAxis = pagedAttention.Layout.IndexOf(IR.NN.AttentionDimKind.Seq);
+        var headAxis = pagedAttention.Layout.IndexOf(IR.NN.AttentionDimKind.Head);
+        var dimAxis = pagedAttention.Layout.IndexOf(IR.NN.AttentionDimKind.Dim);
+        if (seqAxis < 0 || headAxis < 0 || dimAxis < 0)
+        {
+            throw new InvalidOperationException(
+                "Split-KV PagedAttention layout must contain Seq, Head, and Dim.");
+        }
+
+        var (partialMaxType, mergedMaxType) = CreatePagedAttentionStateTypes(
+            queryDistributedType,
+            dimAxis,
+            plan,
+            accumulator: false);
+        var (partialAccType, mergedAccType) = CreatePagedAttentionStateTypes(
+            queryDistributedType,
+            dimAxis,
+            plan,
+            accumulator: true);
+        var (partialMax, mergedMax) = CreateSplitKVStateBuffers(
+            partialMaxType,
+            mergedMaxType,
+            "paged_attention_max",
+            context);
+        var (partialSum, mergedSum) = CreateSplitKVStateBuffers(
+            partialMaxType,
+            mergedMaxType,
+            "paged_attention_sum",
+            context);
+        var (partialAcc, mergedAcc) = CreateSplitKVStateBuffers(
+            partialAccType,
+            mergedAccType,
+            "paged_attention_acc",
+            context);
+
+        var mergeOutput = output;
+        var requiresPublicationBarrier = false;
+        if (output is TIR.Buffer outputBuffer &&
+            outputBuffer.DistributedType is not null &&
+            outputBuffer.MemSpan.Buffer.Location == MemoryLocation.Data &&
+            outputBuffer.MemSpan.Buffer.Start is None)
+        {
+            var (canonicalOutput, _) = EnsureChipLocalShardedBacking(outputBuffer, context);
+            output = canonicalOutput;
+            mergeOutput = canonicalOutput;
+            requiresPublicationBarrier = true;
+        }
+
+        var partial = TIR.F.NTT.PagedAttentionPartial(
+            queryBuffer,
+            (Expr)arguments[1],
+            (Expr)arguments[2],
+            (Expr)arguments[3],
+            (Dimension)arguments[4],
+            partialMax,
+            partialSum,
+            partialAcc,
+            pagedAttention.Layout,
+            pagedAttention.HiddenSize,
+            plan.SplitHierarchyAxis,
+            plan.SplitCount);
+        var merge = TIR.F.NTT.PagedAttentionMerge(
+            mergedMax,
+            mergedSum,
+            mergedAcc,
+            mergeOutput,
+            pagedAttention.Layout,
+            pagedAttention.HiddenSize,
+            plan.SplitHierarchyAxis,
+            plan.SplitCount);
+        var fields = requiresPublicationBarrier
+            ? new Expr[]
+            {
+                partial,
+                merge,
+                TIR.F.NTT.Barrier(
+                    TIR.NTT.BarrierScope.Chip,
+                    new IRArray<int>(new[] { plan.SplitHierarchyAxis })),
+            }
+            : new Expr[] { partial, merge };
+        return new Sequential(
+            fields,
+            traceScopeName: "paged_attention_split_kv");
+    }
+
+    private (DistributedType Partial, DistributedType Merged) CreatePagedAttentionStateTypes(
+        DistributedType queryType,
+        int dimAxis,
+        PagedAttentionExecutionPlan plan,
+        bool accumulator)
+    {
+        if (queryType.TensorType.Shape is not RankedShape queryShape ||
+            queryType.AxisPolicies.Count != queryShape.Rank)
+        {
+            throw new InvalidOperationException(
+                "Split-KV PagedAttention requires a ranked query with one SBP policy per tensor axis.");
+        }
+
+        var dimensions = queryShape.Dimensions.ToArray();
+        dimensions[dimAxis] = accumulator
+            ? (dimensions[dimAxis] * GetVectorLaneCount(queryType.TensorType.DType)).Simplify()
+            : Dimension.One;
+        var stateTensorType = new TensorType(
+            DataTypes.Float32,
+            new RankedShape([
+                .. dimensions,
+                queryType.Placement.Hierarchy[plan.SplitHierarchyAxis],
+            ]));
+        var commonPolicies = queryType.AxisPolicies.ToArray();
+        var partialType = new DistributedType(
+            stateTensorType,
+            new IRArray<SBP>(commonPolicies.Append(SBP.S([plan.SplitHierarchyAxis])).ToArray()),
+            queryType.Placement);
+        var mergedType = new DistributedType(
+            stateTensorType,
+            new IRArray<SBP>(commonPolicies.Append(SBP.B).ToArray()),
+            queryType.Placement);
+        return (partialType, mergedType);
+    }
+
+    private (TIR.Buffer Partial, TIR.Buffer Merged) CreateSplitKVStateBuffers(
+        DistributedType partialType,
+        DistributedType mergedType,
+        string name,
+        TIRSelectionContext context)
+    {
+        var localBuffer = CreateMetadataBuffer(
+            partialType,
+            MemoryLocation.Data,
+            name);
+        var (canonicalBuffer, componentBase) = EnsureChipLocalShardedBacking(
+            localBuffer,
+            context);
+        var mergedBuffer = CreateShardedAlias(
+            canonicalBuffer,
+            mergedType,
+            componentBase,
+            $"{name}_merged_{_shardedViewIndex++}");
+        _shardedComponentBases.Add(mergedBuffer, componentBase);
+        return (canonicalBuffer, mergedBuffer);
+    }
+
+    private int GetVectorLaneCount(DataType dataType)
+        => dataType is VectorType vectorType
+            ? vectorType.Lanes.Aggregate(1, static (acc, lane) => checked(acc * lane)) *
+                GetVectorLaneCount(vectorType.ElemType)
+            : 1;
 
     private Expr GenerateShardedView(
         Call call,
@@ -742,8 +942,11 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
     }
 
     private TIR.Buffer CreateMetadataBuffer(Expr expr, MemoryLocation location, string namePrefix)
+        => CreateMetadataBuffer(expr.CheckedType, location, namePrefix);
+
+    private TIR.Buffer CreateMetadataBuffer(IRType type, MemoryLocation location, string namePrefix)
     {
-        var (tensorType, distributedType) = GetTensorTypeAndDistributedType(expr.CheckedType, namePrefix);
+        var (tensorType, distributedType) = GetTensorTypeAndDistributedType(type, namePrefix);
         T.CreateBuffer(tensorType, location, out var buffer, $"{namePrefix}_{_bufferIndex++}", distributedType);
         return buffer;
     }

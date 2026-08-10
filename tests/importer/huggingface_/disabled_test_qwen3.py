@@ -38,9 +38,16 @@ def test_qwen3(request):
     input_ids_type = "int32"
 
     [paged_attention_config]
+    block_size = 256
     kv_type = "bfloat16"
+    key_cache_layout = ["NumBlocks","NumLayers","KV","BlockSize","NumKVHeads","HeadDim"]
+    value_cache_layout = ["NumBlocks","NumLayers","KV","BlockSize","NumKVHeads","HeadDim"]
+    key_vectorized_axes = ["HeadDim"]
+    value_vectorized_axes = ["HeadDim"]
     key_lanes = [8]
     value_lanes = [8]
+    sharding_axes = []
+    axis_policies = []
 
     [generator]
     [generator.inputs]

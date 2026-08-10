@@ -1,6 +1,7 @@
 // Copyright (c) Canaan Inc. All rights reserved.
 // Licensed under the Apache license. See LICENSE file in the project root for full license information.
 
+using System.Linq;
 using Nncase.IR;
 using Nncase.Passes.Rules.Neutral;
 using Nncase.Tests.TestFixture;
@@ -61,6 +62,27 @@ public class UnitTestFoldPackBitcast : TransformTestBase
         Assert.Equal(repacked.CheckedType, post.CheckedType);
         Assert.IsType<IR.Tensors.Reshape>(((Call)post).Target);
         Assert.True(ReferenceEquals(input, ((Call)post).Arguments[IR.Tensors.Reshape.Input.Index]));
+    }
+
+    [Fact]
+    public void TestFoldPackReshapeAcrossTrailingUnitAxis()
+    {
+        var input = new Var(
+            "input",
+            new TensorType(DataTypes.BFloat16, new RankedShape(1, 16, 128)));
+        var repacked = Pack(Reshape(input, new RankedShape(16, 128, 1)), [8], [1]);
+        CompilerServices.InferenceType(repacked);
+
+        var post = (Expr)CompilerServices.Rewrite(repacked, [new FoldPackReshape()], new());
+        CompilerServices.InferenceType(post);
+
+        Assert.Equal(repacked.CheckedType, post.CheckedType);
+        var postReshape = Assert.IsType<Call>(post);
+        Assert.IsType<IR.Tensors.Reshape>(postReshape.Target);
+        var innerPack = Assert.IsType<Call>(postReshape.Arguments[IR.Tensors.Reshape.Input.Index]);
+        var pack = Assert.IsType<IR.Tensors.Pack>(innerPack.Target);
+        Assert.Equal(new[] { 2 }, pack.Axes.ToArray());
+        Assert.True(ReferenceEquals(input, innerPack.Arguments[IR.Tensors.Pack.Input.Index]));
     }
 
     [Fact]

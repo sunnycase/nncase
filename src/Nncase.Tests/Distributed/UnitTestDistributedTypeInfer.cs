@@ -308,6 +308,91 @@ public sealed class UnitTestDistributedTypeInfer : TestClassBase
     }
 
     [Fact]
+    public void TestVectorizedCastPreservesNonUniformPhysicalShardBoundaries()
+    {
+        var placement = new Placement(new[] { 4, 8 }, "yx", "bb");
+        var inputType = new DistributedType(
+            new TensorType(new VectorType(DataTypes.BFloat16, [8]), new long[] { 1, 18992 }),
+            new SBP[] { SBP.B, SBP.S([0, 1], 594) },
+            placement);
+        var input = new Var("input", inputType);
+
+        var widened = IR.F.NTT.VectorizedCast(
+            input,
+            new VectorType(DataTypes.Float32, [4]),
+            CastMode.KDefault,
+            [1],
+            None.Default);
+        var widenedType = Assert.IsType<DistributedType>(widened.CheckedType);
+        Assert.Equal(
+            new TensorType(new VectorType(DataTypes.Float32, [4]), new long[] { 1, 37984 }),
+            widenedType.TensorType);
+        Assert.Equal(new SBP[] { SBP.B, SBP.S([0, 1], 1188) }, widenedType.AxisPolicies.ToArray());
+
+        for (var linearIndex = 0; linearIndex < 32; linearIndex++)
+        {
+            var shardIndex = DistributedUtility.GetUnraveledIndex(linearIndex, placement.Hierarchy.ToArray());
+            var inputRegion = DistributedUtility.GetLocalOffsetAndShape(inputType, shardIndex);
+            var outputRegion = DistributedUtility.GetLocalOffsetAndShape(widenedType, shardIndex);
+            Assert.Equal(inputRegion.Offset[1].FixedValue * 2, outputRegion.Offset[1].FixedValue);
+            Assert.Equal(inputRegion.Shape[1].FixedValue * 2, outputRegion.Shape[1].FixedValue);
+        }
+
+        var scalar = IR.F.Tensors.Bitcast(widened, DataTypes.Float32);
+        var scalarType = Assert.IsType<DistributedType>(scalar.CheckedType);
+        Assert.Equal(new SBP[] { SBP.B, SBP.S([0, 1], 4752) }, scalarType.AxisPolicies.ToArray());
+
+        var narrowed = IR.F.NTT.VectorizedCast(
+            new Var("widened", widenedType),
+            new VectorType(DataTypes.BFloat16, [8]),
+            CastMode.KDefault,
+            [1],
+            None.Default);
+        Assert.Equal(inputType, narrowed.CheckedType);
+    }
+
+    [Fact]
+    public void TestVectorizedCastRejectsMisalignedSplitGranularity()
+    {
+        var placement = new Placement(new[] { 4, 8 }, "yx", "bb");
+        var input = new Var(
+            "input",
+            new DistributedType(
+                new TensorType(new VectorType(DataTypes.Float32, [4]), new long[] { 1, 37984 }),
+                new SBP[] { SBP.B, SBP.S([0, 1], 1187) },
+                placement));
+
+        var cast = IR.F.NTT.VectorizedCast(
+            input,
+            new VectorType(DataTypes.BFloat16, [8]),
+            CastMode.KDefault,
+            [1],
+            None.Default);
+
+        var invalid = Assert.IsType<InvalidType>(cast.CheckedType);
+        Assert.Contains("split granularity", invalid.Reason, System.StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void TestVectorizedCastShapeFollowsLaneLayout()
+    {
+        var input = new Var(
+            "input",
+            new TensorType(new VectorType(DataTypes.BFloat16, [8]), new long[] { 3 }));
+
+        var cast = IR.F.NTT.VectorizedCast(
+            input,
+            new VectorType(DataTypes.Float32, [2]),
+            CastMode.KDefault,
+            [0],
+            None.Default);
+
+        Assert.Equal(
+            new TensorType(new VectorType(DataTypes.Float32, [2]), new long[] { 12 }),
+            cast.CheckedType);
+    }
+
+    [Fact]
     public void TestKMajorPackedMatMulAcceptsNonUniformOutputSharding()
     {
         var placement = new Placement(new[] { 4, 8 }, "yx", "bb");

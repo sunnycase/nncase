@@ -19,7 +19,7 @@
     q_stats = {{ ptr(q_norm, "Stats") }}
     q_scale = {{ ptr(q_norm, "Scale") }}
     q_bias = {{ ptr(q_norm, "Bias") }}
-    q_output = {{ ptr(q_norm, "Output") }}
+    q_output = {{ ptr(model, "QOutput") }}
     k_input = {{ ptr(k_norm, "Input") }}
     k_stats = {{ ptr(k_norm, "Stats") }}
     k_scale = {{ ptr(k_norm, "Scale") }}
@@ -56,7 +56,7 @@
 {{ indent }}q_sin = tl.load({{ access_pointer(q_rope, "Sin", "sin", ctx["q"]["sin_access"]) }}, mask=mask, other=0.0).to(tl.float32)
 {{ indent }}q_rotated = tl.where({{ ctx["q"]["first_half"] }}, -q_pair_normalized, q_pair_normalized)
 {{ indent }}q_result = q_normalized * q_cos + q_rotated * q_sin
-{{ indent }}tl.store({{ access_pointer(q_norm, "Output", "q_output", ctx["q"]["output_access"]) }}, q_result, mask=mask)
+{{ indent }}tl.store({{ access_pointer(model, "QOutput", "q_output", ctx["q"]["final_output_access"]) }}, q_result, mask=mask)
 {% endcall %}
 
 {% call(indent) elementwise.iterate(ctx["k"]) %}

@@ -216,7 +216,7 @@ flat Tuple of two or more Buffers. PyNTT passes only the arena and compiler-owne
 offsets; Jinja creates typed aliases and chooses their Triton/MMA layout. Do not
 introduce compiler `Grid`/`For`/`PipelineFor`, executable Shared buffers,
 Register buffers, `TileLoad`/`TileStore`, storage encodings, or AutoTiling
-block-microkernel metadata. Manifest version 8 is the only supported reader
+block-microkernel metadata. Manifest version 9 is the only supported reader
 contract; each helper records the exact live workspace arguments separately
 from operation arguments. Do not add a legacy manifest reader or fallback path.
 `num_warps`, producer allocation, register partitioning, and renderer tuning

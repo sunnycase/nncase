@@ -100,14 +100,28 @@ public static class MemoryEffectUtility
     /// variadic operands are expanded according to the call's parameter contract.
     /// </summary>
     public static void VisitCallEffects(Call call, Action<Expr, ParameterInfo, MemoryEffect> visitor)
+        => VisitCallEffects(
+            call,
+            (argument, parameter, _, effect) => visitor(argument, parameter, effect));
+
+    /// <summary>
+    /// Visits every expression operand with a non-empty memory effect and
+    /// reports the concrete call-argument index. Tuple fields retain the index
+    /// of their containing argument.
+    /// </summary>
+    public static void VisitCallEffects(
+        Call call,
+        Action<Expr, ParameterInfo, int, MemoryEffect> visitor)
     {
         if (call.Target is not Op)
         {
             throw new ArgumentException("Operand memory effects can only be read from an Op call.", nameof(call));
         }
 
+        var argumentIndex = 0;
         call.ParametersForeach((argument, parameter) =>
         {
+            var currentArgumentIndex = argumentIndex++;
             var effect = call.Target is IOpMemoryEffectProvider provider
                 ? provider.GetMemoryEffect(parameter)
                 : parameter.MemoryEffect ?? MemoryEffect.None;
@@ -116,10 +130,14 @@ public static class MemoryEffectUtility
                 return;
             }
 
-            VisitArgument(argument, parameter, effect);
+            VisitArgument(argument, parameter, currentArgumentIndex, effect);
         });
 
-        void VisitArgument(BaseExpr argument, ParameterInfo parameter, MemoryEffect effect)
+        void VisitArgument(
+            BaseExpr argument,
+            ParameterInfo parameter,
+            int currentArgumentIndex,
+            MemoryEffect effect)
         {
             switch (argument)
             {
@@ -128,12 +146,12 @@ public static class MemoryEffectUtility
                 case IR.Tuple tuple:
                     foreach (var field in tuple.Fields)
                     {
-                        VisitArgument(field, parameter, effect);
+                        VisitArgument(field, parameter, currentArgumentIndex, effect);
                     }
 
                     return;
                 case Expr expression:
-                    visitor(expression, parameter, effect);
+                    visitor(expression, parameter, currentArgumentIndex, effect);
                     return;
                 default:
                     throw new InvalidOperationException(

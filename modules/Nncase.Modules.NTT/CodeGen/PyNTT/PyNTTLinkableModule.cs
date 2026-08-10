@@ -502,7 +502,7 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
         var topKernelFunctions = GetRuntimeTopKernelFunctions();
         var manifest = new
         {
-            pyntt_codegen_manifest_version = 8,
+            pyntt_codegen_manifest_version = 9,
             target_kind = _moduleKind,
             backend = targetOptions.Backend,
             functions = _functions.Select(function => new
@@ -849,10 +849,14 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
         if (kernels.Count == 0)
         {
             ValidateSingleRuntimeLaunchPath(function);
+            var workspaceSetup = BuildPreparedWorkspaceSetup(function, context, extraIndent: 0, materializeRData: false);
             var dispatch = BuildFunctionDispatch(function, context, extraIndent: 0);
-            if (!string.IsNullOrWhiteSpace(dispatch))
+            var preparedDispatch = string.Join(
+                Environment.NewLine,
+                new[] { workspaceSetup, dispatch }.Where(piece => !string.IsNullOrWhiteSpace(piece)));
+            if (!string.IsNullOrWhiteSpace(preparedDispatch))
             {
-                return dispatch;
+                return preparedDispatch;
             }
 
             var outputs = GetOutputTensorSpecs(function.SourceFunction);
@@ -940,114 +944,60 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
         return new WorkspaceUsage(true, localBytes);
     }
 
-    private static bool HasWorkspaceReference(BaseFunction function, MemoryLocation location)
-    {
-        var buffers = new List<TIR.Buffer>();
-        switch (function)
-        {
-            case Function f:
-                CollectWorkspaceBuffers(f.Body, location, buffers);
-                break;
-            case Fusion f:
-                CollectWorkspaceBuffers(f.Body, location, buffers);
-                break;
-            case PrimFunction f:
-                CollectWorkspaceBuffers(f.Body, location, buffers);
-                break;
-        }
-
-        return buffers.Count != 0;
-    }
-
     private PreparedWorkspaceRequirements GetPreparedWorkspaceRequirements(PyNTTLinkableFunction function)
-        => GetPreparedWorkspaceRequirements(function, new HashSet<PyNTTLinkableFunction>());
-
-    private PreparedWorkspaceRequirements GetPreparedWorkspaceRequirements(PyNTTLinkableFunction function, HashSet<PyNTTLinkableFunction> active)
     {
-        if (!active.Add(function))
+        var kernels = function.GeneratedKernelSource.Kernels.ToArray();
+        var tirKernels = kernels.Where(IsTirKernel).ToArray();
+        var maxShardCount = kernels
+            .Select(GetShardCount)
+            .DefaultIfEmpty(GetTargetShardCount())
+            .Max();
+        var kernelBlockLocalDataBytes = GetMaxBlockLocalDataBytes(tirKernels);
+        if (function.SourceFunction is not PrimFunction primFunction)
         {
-            throw new NotSupportedException($"PyNTT dispatch call graph contains a recursive call involving {function.SourceFunction.Name}.");
+            return new PreparedWorkspaceRequirements(false, 0, maxShardCount, false, 0, false, 0);
         }
 
-        try
+        var abiWorkspaceLocations = primFunction.GetAbiView().Workspaces
+            .OfType<BufferVar>()
+            .Select(workspace => workspace.Location)
+            .ToHashSet();
+        var dataUsage = GetWorkspaceUsage(function.SourceFunction, MemoryLocation.Data);
+        var dataLocalBytes = Math.Max((long)primFunction.SchedResult.DataUsage, dataUsage.LocalBytes);
+        var usesData = tirKernels.Length > 0
+            || primFunction.SchedResult.DataUsage > 0
+            || dataUsage.IsReferenced
+            || abiWorkspaceLocations.Contains(MemoryLocation.Data);
+
+        var chipLocalDataUsage = GetWorkspaceUsage(function.SourceFunction, MemoryLocation.ChipLocalData);
+        var chipLocalDataBytes = Math.Max(
+            (long)primFunction.SchedResult.ChipLocalDataPoolSize,
+            chipLocalDataUsage.LocalBytes);
+        var usesChipLocalData = primFunction.SchedResult.ChipLocalDataPoolSize > 0
+            || chipLocalDataUsage.IsReferenced
+            || abiWorkspaceLocations.Contains(MemoryLocation.ChipLocalData);
+
+        var blockLocalDataUsage = GetWorkspaceUsage(function.SourceFunction, MemoryLocation.BlockLocalData);
+        var blockLocalDataBytes = new[]
         {
-            var kernels = function.GeneratedKernelSource.Kernels.ToArray();
-            var tirKernels = kernels.Where(IsTirKernel).ToArray();
-            var maxShardCount = kernels
-                .Select(GetShardCount)
-                .DefaultIfEmpty(GetTargetShardCount())
-                .Max();
-            var kernelBlockLocalDataBytes = GetMaxBlockLocalDataBytes(tirKernels);
-            var usesData = false;
-            var dataLocalBytes = 0L;
-            var nestedDataLocalBytes = 0L;
-            var usesChipLocalData = false;
-            var chipLocalDataBytes = 0L;
-            var nestedChipLocalDataBytes = 0L;
-            var usesBlockLocalData = false;
-            var blockLocalDataBytes = 0L;
-            var nestedBlockLocalDataBytes = 0L;
+            (long)primFunction.SchedResult.BlockLocalDataPoolSize,
+            blockLocalDataUsage.LocalBytes,
+            kernelBlockLocalDataBytes,
+        }.Max();
+        var usesBlockLocalData = tirKernels.Length > 0
+            || primFunction.SchedResult.BlockLocalDataPoolSize > 0
+            || blockLocalDataUsage.IsReferenced
+            || kernelBlockLocalDataBytes > 0
+            || abiWorkspaceLocations.Contains(MemoryLocation.BlockLocalData);
 
-            if (function.SourceFunction is PrimFunction primFunction)
-            {
-                var abiWorkspaceLocations = primFunction.GetAbiView().Workspaces
-                    .OfType<BufferVar>()
-                    .Select(workspace => workspace.Location)
-                    .ToHashSet();
-                var dataUsage = GetWorkspaceUsage(function.SourceFunction, MemoryLocation.Data);
-                dataLocalBytes = Math.Max((long)primFunction.SchedResult.DataUsage, dataUsage.LocalBytes);
-                usesData = tirKernels.Length > 0
-                    || primFunction.SchedResult.DataUsage > 0
-                    || dataUsage.IsReferenced
-                    || abiWorkspaceLocations.Contains(MemoryLocation.Data);
-
-                var chipLocalDataUsage = HasWorkspaceReference(function.SourceFunction, MemoryLocation.ChipLocalData);
-                chipLocalDataBytes = (long)primFunction.SchedResult.ChipLocalDataPoolSize;
-                usesChipLocalData = primFunction.SchedResult.ChipLocalDataPoolSize > 0
-                    || chipLocalDataUsage
-                    || abiWorkspaceLocations.Contains(MemoryLocation.ChipLocalData);
-
-                var blockLocalDataUsage = GetWorkspaceUsage(function.SourceFunction, MemoryLocation.BlockLocalData);
-                blockLocalDataBytes = new[]
-                {
-                    (long)primFunction.SchedResult.BlockLocalDataPoolSize,
-                    blockLocalDataUsage.LocalBytes,
-                    kernelBlockLocalDataBytes,
-                }.Max();
-                usesBlockLocalData = tirKernels.Length > 0
-                    || primFunction.SchedResult.BlockLocalDataPoolSize > 0
-                    || blockLocalDataUsage.IsReferenced
-                    || kernelBlockLocalDataBytes > 0
-                    || abiWorkspaceLocations.Contains(MemoryLocation.BlockLocalData);
-            }
-
-            var callees = new List<PrimFunction>();
-            CollectDirectPrimFunctionCallees(function.SourceFunction, callees);
-            foreach (var directCallee in callees)
-            {
-                var calleeRequirements = GetPreparedWorkspaceRequirements(FindLinkableFunction(directCallee), active);
-                usesData |= calleeRequirements.UsesData;
-                nestedDataLocalBytes = Math.Max(nestedDataLocalBytes, calleeRequirements.DataLocalBytes);
-                maxShardCount = Math.Max(maxShardCount, calleeRequirements.MaxShardCount);
-                usesChipLocalData |= calleeRequirements.UsesChipLocalData;
-                nestedChipLocalDataBytes = Math.Max(nestedChipLocalDataBytes, calleeRequirements.ChipLocalDataBytes);
-                usesBlockLocalData |= calleeRequirements.UsesBlockLocalData;
-                nestedBlockLocalDataBytes = Math.Max(nestedBlockLocalDataBytes, calleeRequirements.BlockLocalDataBytes);
-            }
-
-            return new PreparedWorkspaceRequirements(
-                usesData,
-                checked(dataLocalBytes + nestedDataLocalBytes),
-                maxShardCount,
-                usesChipLocalData,
-                checked(chipLocalDataBytes + nestedChipLocalDataBytes),
-                usesBlockLocalData,
-                checked(blockLocalDataBytes + nestedBlockLocalDataBytes));
-        }
-        finally
-        {
-            active.Remove(function);
-        }
+        return new PreparedWorkspaceRequirements(
+            usesData,
+            dataLocalBytes,
+            maxShardCount,
+            usesChipLocalData,
+            chipLocalDataBytes,
+            usesBlockLocalData,
+            blockLocalDataBytes);
     }
 
     private static void CollectDirectPrimFunctionCallees(BaseExpr expr, List<PrimFunction> callees)
