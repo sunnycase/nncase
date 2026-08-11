@@ -4,8 +4,7 @@
 # generated from PyNTT Jinja TensorRegionCopy.py.jinja
 # {{ model["Comment"] }}; dtype={{ model["DType"] }}, source_shape={{ shape_tuple(model["SourceShape"]) }}, destination_shape={{ shape_tuple(model["DestinationShape"]) }}
 {{ phases.consumer_header(model) }}
-    shard_index = tl.program_id(0).to(tl.int64)
-{{ common.shard_coordinates(ctx["pointer_values"]) }}
+{{ common.mesh_coordinates(model["MeshAxes"]) }}
     source = {{ ptr(model, "Source") }}
     destination = {{ ptr(model, "Destination") }}
 {% for axis in ctx["outer_axes"] %}

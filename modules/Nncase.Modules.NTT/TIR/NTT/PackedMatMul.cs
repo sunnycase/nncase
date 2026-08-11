@@ -16,6 +16,11 @@ public sealed partial class PackedMatMul : NTTKernelOp
 
     public static readonly ParameterInfo Scale = new(typeof(PackedMatMul), 4, "scale", memoryEffect: MemoryEffect.Read);
 
+    /// <summary>
+    /// Gets the optional initial value used when <see cref="LoadC"/> is false.
+    /// </summary>
+    public static readonly ParameterInfo Addend = new(typeof(PackedMatMul), 5, "addend", memoryEffect: MemoryEffect.Read);
+
     public bool FusedReduce { get; }
 
     public IR.NTT.PackedMatMulRhsLayout RhsLayout { get; }

@@ -54,9 +54,15 @@ public partial class NTT
         bool fusedReduce = false,
         DataType? outDataType = null,
         Expr? scale = null,
-        PackedMatMulRhsLayout rhsLayout = PackedMatMulRhsLayout.NMajor)
+        PackedMatMulRhsLayout rhsLayout = PackedMatMulRhsLayout.NMajor,
+        Expr? addend = null)
     {
-        return new Call(new PackedMatMul(outDataType ?? DataTypes.Float32, fusedReduce, rhsLayout), lhs, rhs, scale ?? None.Default);
+        return new Call(
+            new PackedMatMul(outDataType ?? DataTypes.Float32, fusedReduce, rhsLayout),
+            lhs,
+            rhs,
+            scale ?? None.Default,
+            addend ?? None.Default);
     }
 
     public static Expr PackedQKVParallelLinear(

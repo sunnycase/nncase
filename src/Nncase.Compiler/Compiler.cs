@@ -355,6 +355,9 @@ public class Compiler : ICompiler
             p.Add<FoldBoxingUninitialized>();
         });
 
+        _compileSession.Target.RegisterPostAutoDistributedPass(
+            passManager,
+            _compileSession.CompileOptions);
         passManager.Add<RemoveUnusedFunctions>();
         passManager.Add<InferRangePass>();
         passManager.Add<OptimizeByRangePass>();

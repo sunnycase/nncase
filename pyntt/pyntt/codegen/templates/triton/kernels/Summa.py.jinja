@@ -4,13 +4,8 @@
 # generated from PyNTT Jinja Summa.py.jinja
 # {{ model["Comment"] }}; lhs_dtype={{ model["LhsDType"] }}, rhs_dtype={{ model["RhsDType"] }}, output_dtype={{ model["OutputDType"] }}, lhs_shape={{ shape_tuple(model["LhsShape"]) }}, rhs_shape={{ shape_tuple(model["RhsShape"]) }}, output_shape={{ shape_tuple(model["OutputShape"]) }}, lhs_global_shape={{ shape_tuple(model["LhsGlobalShape"]) }}, rhs_global_shape={{ shape_tuple(model["RhsGlobalShape"]) }}, output_global_shape={{ shape_tuple(model["OutputGlobalShape"]) }}, rhs_n_lane={{ model["RhsNVectorLaneCount"] }}, output_n_lane={{ model["OutputNVectorLaneCount"] }}
 {{ phases.consumer_header(model) }}
-    shard_index = tl.program_id(0).to(tl.int64)
+{{ common.mesh_coordinates(model["MeshAxes"]) }}
 {{ common.matrix_shared_aliases(ctx, model["LhsTritonDType"], model["RhsTritonDType"], [ctx["block_m"], ctx["block_k"]], [ctx["block_k"], ctx["block_n"]], true) }}
-    tmp_shard_coord = shard_index
-{% for axis in reverse_indices(model["Hierarchy"]) %}
-    shard_coord{{ axis }} = tmp_shard_coord % {{ model["Hierarchy"][axis] }}
-    tmp_shard_coord = tmp_shard_coord // {{ model["Hierarchy"][axis] }}
-{% endfor %}
 {% for prefix in ("out_m", "out_n") %}
 {% set axis = ctx[prefix] %}
 {% if not axis["split_axes"] %}

@@ -6,9 +6,8 @@
 # generated from PyNTT Jinja PagedAttention.py.jinja
 # {{ model["Comment"] }}; query_dtype={{ model["QueryDType"] }}, output_dtype={{ model["OutputDType"] }}, query_shape={{ shape_tuple(model["QueryShape"]) }}, output_shape={{ shape_tuple(model["OutputShape"]) }}, layer={{ model["LayerIdExpression"] }}, block_n={{ ctx["attention_block_size"] }}
 {{ phases.consumer_header(model, args) }}
-    shard_index = tl.program_id(0).to(tl.int64)
+{{ common.mesh_coordinates(model["MeshAxes"]) }}
     layer_id_value = (tl.full((), 0, tl.int32) + ({{ model["LayerIdExpression"] }})).to(tl.int32)
-{{ common.hierarchy_coordinates(model["Hierarchy"]) }}
 {% for name, key in (("query", "Query"), ("scale_ptr", "Scale"), ("output", "Output")) %}
     {{ name }} = {{ ptr(model, key) }}
 {% endfor %}

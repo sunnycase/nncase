@@ -5,19 +5,26 @@ namespace Nncase.CodeGen.PyNTT;
 
 public sealed record PyNTTBufferPointerTemplateModel(
     string Expression,
-    int[]? ShardCoordHierarchy = null,
     int AddressSpace = 1);
+
+public sealed record PyNTTTransferPipelineChannelTemplateModel(
+    string Name,
+    string[] SharedWorkspaceNames);
 
 public sealed record PyNTTMicroKernelTemplateModel(
     string Family,
     string Variant,
     IReadOnlyDictionary<string, long> Parameters,
     IReadOnlyDictionary<string, string> SharedWorkspaceOffsets,
-    bool HasTransferPipeline);
+    PyNTTTransferPipelineChannelTemplateModel[] TransferPipelineChannels)
+{
+    public bool HasTransferPipeline => TransferPipelineChannels.Length != 0;
+}
 
 public sealed record PyNTTPipelineStageTemplateModel(
     string StageId,
     string StageName,
+    string ChannelName,
     string HelperName,
     string Template,
     object Model,
@@ -877,6 +884,14 @@ public sealed record PyNTTMatmulTemplateModel(
     public int RhsKVectorLaneCount { get; set; } = 1;
 
     public string LoadCExpression { get; set; } = "False";
+
+    public PyNTTBufferPointerTemplateModel? Addend { get; set; }
+
+    public PyNTTDimExpression[] AddendShape { get; set; } = Array.Empty<PyNTTDimExpression>();
+
+    public PyNTTDimExpression[] AddendStrides { get; set; } = Array.Empty<PyNTTDimExpression>();
+
+    public bool HasAddend => Addend is not null;
 }
 
 public sealed record PyNTTQKVParallelLinearTemplateModel(

@@ -51,6 +51,46 @@ internal sealed class PyNTTDimEquivalence : IEquatable<PyNTTDimEquivalence>
             checked(value.Constant * scale),
             value._terms.Select(term => new KeyValuePair<string, long>(term.Key, checked(term.Value * scale))));
 
+    public bool TryDivideExact(long divisor, out PyNTTDimEquivalence quotient)
+    {
+        if (divisor <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(divisor), divisor, "Affine divisor must be positive.");
+        }
+
+        if (Constant % divisor != 0 || _terms.Any(term => term.Value % divisor != 0))
+        {
+            quotient = null!;
+            return false;
+        }
+
+        quotient = new(
+            Constant / divisor,
+            _terms.Select(term => new KeyValuePair<string, long>(term.Key, term.Value / divisor)));
+        return true;
+    }
+
+    public string ToExpression()
+    {
+        var parts = new List<string>();
+        if (Constant != 0)
+        {
+            parts.Add(Constant.ToString(CultureInfo.InvariantCulture));
+        }
+
+        parts.AddRange(_terms.Select(term => term.Value switch
+        {
+            1 => term.Key,
+            _ => $"({term.Value.ToString(CultureInfo.InvariantCulture)} * {term.Key})",
+        }));
+        return parts.Count switch
+        {
+            0 => "0",
+            1 => parts[0],
+            _ => $"({string.Join(" + ", parts)})",
+        };
+    }
+
     public bool Equals(PyNTTDimEquivalence? other)
         => other is not null &&
             Constant == other.Constant &&
@@ -148,6 +188,29 @@ public sealed record PyNTTDimExpression(
         => Equivalence is null
             ? this with { Equivalence = PyNTTDimEquivalence.FromAtom(TritonExpression) }
             : this;
+
+    internal PyNTTDimExpression? TryDivideExact(long divisor)
+    {
+        if (divisor <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(divisor), divisor, "Dimension divisor must be positive.");
+        }
+
+        if (Equivalence is not { } equivalence ||
+            !equivalence.TryDivideExact(divisor, out var quotient))
+        {
+            return null;
+        }
+
+        var expression = quotient.ToExpression();
+        return new(
+            expression,
+            expression,
+            FixedValue.HasValue ? FixedValue.Value / divisor : null)
+        {
+            Equivalence = quotient,
+        };
+    }
 }
 
 internal sealed class PyNTTDimExpressionEmitter : ExprFunctor<PyNTTDimExpression, Unit>
@@ -211,6 +274,12 @@ internal sealed class PyNTTDimExpressionEmitter : ExprFunctor<PyNTTDimExpression
         var denominator = Visit(expr.Denominator);
         if (expr.DivMode == DimDivideMode.FloorDiv)
         {
+            if (denominator.FixedValue is > 0 and var divisor &&
+                numerator.TryDivideExact(divisor) is { } exactQuotient)
+            {
+                return WithRangeFromMetadata(exactQuotient, expr);
+            }
+
             var expression = new PyNTTDimExpression(
                 $"(({numerator.PythonExpression}) // ({denominator.PythonExpression}))",
                 $"(({numerator.TritonExpression}) // ({denominator.TritonExpression}))")
@@ -271,10 +340,7 @@ internal sealed class PyNTTDimExpressionEmitter : ExprFunctor<PyNTTDimExpression
         var parts = new List<PyNTTDimExpression>();
         if (expr.Scale != 1)
         {
-            parts.Add(new(
-                expr.Scale.ToString(CultureInfo.InvariantCulture),
-                expr.Scale.ToString(CultureInfo.InvariantCulture),
-                expr.Scale));
+            parts.Add(Const(expr.Scale));
         }
 
         parts.AddRange(expr.Operands.ToArray().Select(Visit));
@@ -297,10 +363,7 @@ internal sealed class PyNTTDimExpressionEmitter : ExprFunctor<PyNTTDimExpression
         var parts = new List<PyNTTDimExpression>();
         if (expr.Bias != 0)
         {
-            parts.Add(new(
-                expr.Bias.ToString(CultureInfo.InvariantCulture),
-                expr.Bias.ToString(CultureInfo.InvariantCulture),
-                expr.Bias));
+            parts.Add(Const(expr.Bias));
         }
 
         parts.AddRange(expr.Operands.ToArray().Select(Visit));
@@ -407,22 +470,18 @@ internal sealed class PyNTTDimExpressionEmitter : ExprFunctor<PyNTTDimExpression
 
     private static PyNTTDimExpression BuildShardCoordExpression(int axis, IReadOnlyList<int> hierarchy)
     {
-        var divisor = 1;
-        for (var i = axis + 1; i < hierarchy.Count; i++)
+        if (axis < 0 || axis >= hierarchy.Count)
         {
-            divisor = checked(divisor * hierarchy[i]);
+            throw new ArgumentOutOfRangeException(nameof(axis), axis, $"Shard coordinate axis must be within hierarchy rank {hierarchy.Count}.");
         }
 
-        var dividend = divisor == 1
-            ? "shard_index"
-            : $"(shard_index // {divisor.ToString(CultureInfo.InvariantCulture)})";
         var extent = hierarchy[axis];
         if (extent == 1)
         {
             return PyNTTDimExpression.Zero;
         }
 
-        var expression = $"(({dividend}) % {extent.ToString(CultureInfo.InvariantCulture)})";
+        var expression = $"shard_coord{axis.ToString(CultureInfo.InvariantCulture)}";
         return new(expression, expression)
         {
             Equivalence = PyNTTDimEquivalence.FromAtom(expression),

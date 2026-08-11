@@ -93,6 +93,53 @@ def test_pyntt_target_options_do_not_expose_removed_pipeline_policy():
     assert not hasattr(options, "PipelinePolicy")
 
 
+def test_pyntt_elementwise_accesses_preserve_their_natural_broadcast_domain():
+    _add_pyntt_to_path()
+    from pyntt.codegen.render import _elementwise_binary_template_context
+
+    context = _elementwise_binary_template_context(
+        {
+            "LhsShape": [1, 1],
+            "LhsStrides": [0, 0],
+            "LhsVectorLaneShape": [],
+            "RhsShape": [4, 16],
+            "RhsStrides": [16, 1],
+            "RhsVectorLaneShape": [8],
+            "OutputShape": [4, 16],
+            "OutputStrides": [16, 1],
+            "OutputVectorLaneShape": [8],
+        }
+    )
+
+    assert context["lane_count"] == 8
+    assert context["tile_shape"] == "((block_size // 8), 8)"
+    assert context["lhs_access"]["ScalarOffset"] == "0"
+    assert context["lhs_access"]["BoundaryMask"] == "True"
+    assert context["rhs_access"]["BoundaryMask"] == "mask"
+    assert context["output_access"]["BoundaryMask"] == "mask"
+    assert context["tensor_coordinates"] == ("index0", "major_raw")
+    assert context["lane_coordinates"] == ("lane_raw0",)
+    assert "major_raw" in context["rhs_access"]["ScalarOffset"]
+    assert "lane_raw0" in context["rhs_access"]["ScalarOffset"]
+    assert "tl.broadcast_to" not in context["rhs_access"]["ScalarOffset"]
+    assert "tl.broadcast_to" not in context["output_access"]["ScalarOffset"]
+
+
+def test_pyntt_elementwise_iteration_uses_explicit_physical_tile_width():
+    template = (
+        Path(__file__).resolve().parents[2]
+        / "pyntt/pyntt/codegen/templates/triton/kernels/_elementwise.py.jinja"
+    ).read_text(encoding="utf-8")
+
+    assert "_physical_tile_width: tl.constexpr = block_size //" in template
+    assert "tl.arange(0, {{ scope }}_physical_tile_width)" in template
+    assert "block_size >>" not in template
+    assert "tl.broadcast_to" not in template
+    assert "zero_coord" not in template
+    assert "raw_coord" not in template
+    assert "raw_lane_coord" not in template
+
+
 def test_pyntt_package_imports():
     _add_pyntt_to_path()
 
@@ -531,6 +578,33 @@ def test_pyntt_renderer_constrains_attention_tile_to_cache_page(
     assert config["block_n_candidates"] == expected_candidates
 
 
+@pytest.mark.parametrize(
+    ("block_n", "page_size", "expected"),
+    [
+        (64, 32, (32, 2)),
+        (128, 32, (32, 4)),
+        (128, 256, (128, 1)),
+    ],
+)
+def test_pyntt_paged_attention_tma_tile_can_span_integral_cache_pages(
+    block_n, page_size, expected
+):
+    _add_pyntt_to_path()
+    from pyntt.codegen.render import _paged_attention_tile_geometry
+
+    assert _paged_attention_tile_geometry(
+        block_n, page_size, allow_cross_page=True
+    ) == expected
+
+
+def test_pyntt_paged_attention_direct_tile_cannot_span_cache_pages():
+    _add_pyntt_to_path()
+    from pyntt.codegen.render import _paged_attention_tile_geometry
+
+    with pytest.raises(ValueError, match="requires a transfer pipeline"):
+        _paged_attention_tile_geometry(64, 32, allow_cross_page=False)
+
+
 def test_pyntt_qkv_transfer_plan_uses_exact_projection_copy_extents():
     _add_pyntt_to_path()
     from pyntt.codegen.render import _packed_qkv_transfer_plan
@@ -733,10 +807,41 @@ def test_pyntt_renderer_preserves_codegen_scope_device_boundary():
             ]
         },
     )
-    assert source.count("tl.program_id(0).to(tl.int64)") == 1
+    assert "tl.program_id(0)" not in source
+    assert source.count(
+        "tle.shard_id(PYNTT_GRID_MESH, 'block_b').to(tl.int64)"
+    ) == 2
     assert source.count("child(shard_index)") == 2
     assert "def child(child_shard_index):" in source
     assert "pyntt_call_frame" not in source
+
+
+def test_pyntt_renderer_materializes_named_mesh_coordinates():
+    _add_pyntt_to_path()
+    from pyntt.codegen.render import render_manifest
+
+    manifest = _test_pyntt_codegen_manifest(
+        {
+            "metadata": {"name": "top"},
+            "body_source": "value = shard_coord0 + shard_coord1 + shard_index",
+        }
+    )
+    sharding = manifest["functions"][0]["render_kernels"][0]["metadata"][
+        "launch"
+    ]["sharding"]
+    sharding["placement_axis"] = "yx"
+    sharding["hierarchy"] = [4, 8]
+    sharding["hierarchy_levels"] = "bb"
+
+    source = render_manifest(manifest)
+
+    assert '_PYNTT_GRID_MESH_VALUE = tle.device_mesh({"block": [(\'block_y\', 4), (\'block_x\', 8)]})' in source
+    assert "shard_coord0 = tle.shard_id(PYNTT_GRID_MESH, 'block_y')" in source
+    assert "shard_coord1 = tle.shard_id(PYNTT_GRID_MESH, 'block_x')" in source
+    assert "shard_index = (shard_coord0 * 8 + shard_coord1)" in source
+    assert "tl.program_id(0)" not in source
+    assert "shard_index //" not in source
+    assert "shard_index %" not in source
 
 
 def test_pyntt_renderer_passes_nested_device_arguments_directly():

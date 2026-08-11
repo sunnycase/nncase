@@ -39,17 +39,25 @@ public sealed record TIRSharedWorkspaceDescriptor(
     int AlignmentBytes);
 
 /// <summary>
-/// Declares an independently executable global-to-Shared transfer phase of a
-/// selected microkernel. Source indexes refer to semantic kernel operands;
-/// workspace indexes refer to
-/// <see cref="TIRMicroKernelSelection.SharedWorkspaces"/>.
+/// One independently synchronized transfer channel owned by a selected
+/// microkernel. Source indexes refer to semantic kernel operands; workspace
+/// indexes refer to <see cref="TIRMicroKernelSelection.SharedWorkspaces"/>.
 /// </summary>
-public sealed record TIRTransferPipelineContract
+public sealed record TIRTransferPipelineChannel
 {
-    public TIRTransferPipelineContract(
+    public TIRTransferPipelineChannel(
+        string name,
         IEnumerable<int> sourceArgumentIndices,
         IEnumerable<int> sharedWorkspaceIndices)
     {
+        if (string.IsNullOrWhiteSpace(name))
+        {
+            throw new ArgumentException(
+                "Transfer-pipeline channel name must not be empty.",
+                nameof(name));
+        }
+
+        Name = name;
         SourceArgumentIndices = ValidateIndices(
             sourceArgumentIndices,
             nameof(sourceArgumentIndices));
@@ -57,6 +65,8 @@ public sealed record TIRTransferPipelineContract
             sharedWorkspaceIndices,
             nameof(sharedWorkspaceIndices));
     }
+
+    public string Name { get; }
 
     public ImmutableArray<int> SourceArgumentIndices { get; }
 
@@ -79,6 +89,70 @@ public sealed record TIRTransferPipelineContract
 
         return values;
     }
+}
+
+/// <summary>
+/// Declares independently executable global-to-Shared transfer channels of a
+/// selected microkernel. A Shared workspace has exactly one channel owner,
+/// while multiple channels may read the same semantic source operand.
+/// </summary>
+public sealed record TIRTransferPipelineContract
+{
+    public TIRTransferPipelineContract(
+        IEnumerable<TIRTransferPipelineChannel> channels)
+    {
+        ArgumentNullException.ThrowIfNull(channels);
+        var values = channels.ToImmutableArray();
+        if (values.IsDefaultOrEmpty)
+        {
+            throw new ArgumentException(
+                "A transfer pipeline must contain at least one channel.",
+                nameof(channels));
+        }
+
+        var duplicateName = values
+            .GroupBy(channel => channel.Name, StringComparer.Ordinal)
+            .FirstOrDefault(group => group.Count() > 1);
+        if (duplicateName is not null)
+        {
+            throw new ArgumentException(
+                $"Transfer pipeline contains duplicate channel {duplicateName.Key}.",
+                nameof(channels));
+        }
+
+        var duplicateWorkspace = values
+            .SelectMany(channel => channel.SharedWorkspaceIndices)
+            .GroupBy(index => index)
+            .FirstOrDefault(group => group.Count() > 1);
+        if (duplicateWorkspace is not null)
+        {
+            throw new ArgumentException(
+                $"Shared workspace {duplicateWorkspace.Key} is owned by multiple transfer channels.",
+                nameof(channels));
+        }
+
+        Channels = values;
+        SourceArgumentIndices = values
+            .SelectMany(channel => channel.SourceArgumentIndices)
+            .Distinct()
+            .ToImmutableArray();
+        SharedWorkspaceIndices = values
+            .SelectMany(channel => channel.SharedWorkspaceIndices)
+            .ToImmutableArray();
+    }
+
+    public ImmutableArray<TIRTransferPipelineChannel> Channels { get; }
+
+    /// <summary>
+    /// Gets the stable union of transfer source operands for memory-effect
+    /// analysis.
+    /// </summary>
+    public ImmutableArray<int> SourceArgumentIndices { get; }
+
+    /// <summary>
+    /// Gets all channel-owned Shared workspaces for arena lifetime analysis.
+    /// </summary>
+    public ImmutableArray<int> SharedWorkspaceIndices { get; }
 }
 
 /// <summary>

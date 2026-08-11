@@ -159,7 +159,15 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
             case IR.CustomNTT.MatMul matmul:
                 return TIR.F.NTT.Matmul((Expr)arguments[0], (Expr)arguments[1], output, None.Default, (Expr)call[IR.CustomNTT.MatMul.Scale], (Expr)arguments[3], matmul.LhsVectorizedAxes, matmul.RhsVectorizedAxes, matmul.TransposeA, matmul.TransposeB, false, matmul.CSourcePath, matmul.FuncName);
             case IR.NTT.PackedMatMul matmul:
-                return TIR.F.NTT.PackedMatMul((Expr)arguments[0], (Expr)arguments[1], output, None.Default, (Expr)call[IR.NTT.PackedMatMul.Scale], matmul.FusedReduce, matmul.RhsLayout);
+                return TIR.F.NTT.PackedMatMul(
+                    (Expr)arguments[0],
+                    (Expr)arguments[1],
+                    output,
+                    None.Default,
+                    (Expr)call[IR.NTT.PackedMatMul.Scale],
+                    matmul.FusedReduce,
+                    matmul.RhsLayout,
+                    (Expr)arguments[IR.NTT.PackedMatMul.Addend.Index]);
             case IR.NTT.PackedMatMulGlu matmulGlu:
                 return TIR.F.NTT.PackedMatMulGlu(
                     (Expr)arguments[0],
@@ -436,33 +444,39 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
         TIRMicroKernelSelection selection,
         TIRTransferPipelineContract contract)
     {
-        foreach (var argumentIndex in contract.SourceArgumentIndices)
+        foreach (var channel in contract.Channels)
         {
-            if ((uint)argumentIndex >= (uint)semanticArguments.Count)
+            foreach (var argumentIndex in channel.SourceArgumentIndices)
             {
-                throw new InvalidOperationException(
-                    $"TIR microkernel {selection.Family}/{selection.Variant} for " +
-                    $"{kernelOp.GetType().Name} declares invalid transfer source operand {argumentIndex}.");
+                if ((uint)argumentIndex >= (uint)semanticArguments.Count)
+                {
+                    throw new InvalidOperationException(
+                        $"TIR microkernel {selection.Family}/{selection.Variant} for " +
+                        $"{kernelOp.GetType().Name} transfer channel {channel.Name} declares " +
+                        $"invalid source operand {argumentIndex}.");
+                }
+
+                var parameter = kernelOp.Parameters[argumentIndex];
+                var effect = kernelOp.GetMemoryEffect(parameter);
+                if (MemoryEffectUtility.GetPhysicalBufferAccessMode(effect) != MemoryAccessMode.Read)
+                {
+                    throw new InvalidOperationException(
+                        $"TIR microkernel {selection.Family}/{selection.Variant} for " +
+                        $"{kernelOp.GetType().Name} transfer channel {channel.Name} declares " +
+                        $"source operand {argumentIndex} ({parameter.Name}) with non-read-only " +
+                        $"memory effect {effect.Mode}.");
+                }
             }
 
-            var parameter = kernelOp.Parameters[argumentIndex];
-            var effect = kernelOp.GetMemoryEffect(parameter);
-            if (MemoryEffectUtility.GetPhysicalBufferAccessMode(effect) != MemoryAccessMode.Read)
+            foreach (var workspaceIndex in channel.SharedWorkspaceIndices)
             {
-                throw new InvalidOperationException(
-                    $"TIR microkernel {selection.Family}/{selection.Variant} for " +
-                    $"{kernelOp.GetType().Name} declares transfer source operand {argumentIndex} " +
-                    $"({parameter.Name}) with non-read-only memory effect {effect.Mode}.");
-            }
-        }
-
-        foreach (var workspaceIndex in contract.SharedWorkspaceIndices)
-        {
-            if ((uint)workspaceIndex >= (uint)selection.SharedWorkspaces.Length)
-            {
-                throw new InvalidOperationException(
-                    $"TIR microkernel {selection.Family}/{selection.Variant} for " +
-                    $"{kernelOp.GetType().Name} declares invalid Shared workspace {workspaceIndex}.");
+                if ((uint)workspaceIndex >= (uint)selection.SharedWorkspaces.Length)
+                {
+                    throw new InvalidOperationException(
+                        $"TIR microkernel {selection.Family}/{selection.Variant} for " +
+                        $"{kernelOp.GetType().Name} transfer channel {channel.Name} declares " +
+                        $"invalid Shared workspace {workspaceIndex}.");
+                }
             }
         }
     }

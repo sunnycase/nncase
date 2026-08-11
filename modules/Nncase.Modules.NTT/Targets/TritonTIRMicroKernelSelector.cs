@@ -16,6 +16,8 @@ namespace Nncase.Targets;
 public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
 {
     private const int NvidiaNvmmaSharedAlignmentBytes = 1024;
+    private const int SimtPagedAttentionMaximumBlockN = 128;
+    private const int MmaPagedAttentionMaximumBlockN = 64;
 
     public TIRMicroKernelSelection? Select(TIRMicroKernelSelectionContext context)
     {
@@ -66,42 +68,42 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
         TIRMicroKernelSelectionContext context,
         Nncase.TIR.NTT.PagedAttentionPartial pagedAttention)
     {
-        const int numStages = 2;
+        const int numStages = 1;
         var config = GetPagedAttentionConfig(context, 1);
-        var blockN = SelectPagedAttentionBlockN(config.BlockSize);
-        var parameters = new Dictionary<string, long>(StringComparer.Ordinal)
+        var useDecodeGqaSimt = CanUsePagedAttentionDecodeGqaSimt(
+            context,
+            pagedAttention,
+            config);
+        var maximumBlockN = useDecodeGqaSimt
+            ? SimtPagedAttentionMaximumBlockN
+            : MmaPagedAttentionMaximumBlockN;
+        var tmaBlockN = SelectPagedAttentionTmaBlockN(
+            context.Machine,
+            config,
+            numStages,
+            maximumBlockN);
+        if (tmaBlockN is null)
         {
-            ["block_m"] = 1,
-            ["block_n"] = blockN,
-            ["block_k"] = config.HeadDim,
-            ["num_stages"] = numStages,
-            ["head_dim"] = config.HeadDim,
-            ["page_size"] = config.BlockSize,
-        }.ToImmutableDictionary(StringComparer.Ordinal);
-
-        if (!CanUsePagedAttentionTmaPipeline(context.Machine, config, blockN, numStages))
-        {
+            var blockN = SelectPagedAttentionPageLocalBlockN(config.BlockSize);
             return new(
                 "triton.paged_attention_partial",
-                "mma_direct",
-                parameters,
+                useDecodeGqaSimt ? "simt_direct" : "mma_direct",
+                CreatePagedAttentionParameters(config, blockN, numStages),
                 ImmutableArray<TIRSharedWorkspaceDescriptor>.Empty,
                 TransferPipeline: null);
         }
 
+        var selectedBlockN = tmaBlockN.Value;
         var stageType = new TensorType(
             config.KVPrimType,
-            new RankedShape(new[] { numStages, 1, 1, blockN, 1, config.HeadDim }));
-        var variant = CanUsePagedAttentionDecodeGqaSimt(
-            context,
-            pagedAttention,
-            config)
+            new RankedShape(new[] { numStages, 1, 1, selectedBlockN, 1, config.HeadDim }));
+        var variant = useDecodeGqaSimt
             ? "simt_tma_smem_pipeline"
             : "mma_tma_smem_pipeline";
         return new(
             "triton.paged_attention_partial",
             variant,
-            parameters,
+            CreatePagedAttentionParameters(config, selectedBlockN, numStages),
             ImmutableArray.Create(
                 new TIRSharedWorkspaceDescriptor(
                     "key_stage",
@@ -111,10 +113,28 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
                     "value_stage",
                     stageType,
                     NvidiaNvmmaSharedAlignmentBytes)),
-            new TIRTransferPipelineContract([1], [0, 1]));
+            new TIRTransferPipelineContract(
+            [
+                new TIRTransferPipelineChannel("key", [1], [0]),
+                new TIRTransferPipelineChannel("value", [1], [1]),
+            ]));
     }
 
-    private static int SelectPagedAttentionBlockN(int pageSize)
+    private static ImmutableDictionary<string, long> CreatePagedAttentionParameters(
+        IR.NN.IPagedAttentionConfig config,
+        int blockN,
+        int numStages)
+        => new Dictionary<string, long>(StringComparer.Ordinal)
+        {
+            ["block_m"] = 1,
+            ["block_n"] = blockN,
+            ["block_k"] = config.HeadDim,
+            ["num_stages"] = numStages,
+            ["head_dim"] = config.HeadDim,
+            ["page_size"] = config.BlockSize,
+        }.ToImmutableDictionary(StringComparer.Ordinal);
+
+    private static int SelectPagedAttentionPageLocalBlockN(int pageSize)
     {
         if (pageSize <= 0)
         {
@@ -134,6 +154,45 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
             $"PagedAttention cache page size {pageSize} has no legal block-N tile.");
     }
 
+    private static int? SelectPagedAttentionTmaBlockN(
+        TargetMachineModel machine,
+        IR.NN.IPagedAttentionConfig config,
+        int numStages,
+        int maximumBlockN)
+    {
+        if (config.BlockSize <= 0)
+        {
+            throw new InvalidOperationException(
+                $"PagedAttention cache page size must be positive, got {config.BlockSize}.");
+        }
+
+        if (maximumBlockN <= 0 || (maximumBlockN & (maximumBlockN - 1)) != 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(maximumBlockN),
+                maximumBlockN,
+                "PagedAttention maximum block-N must be a positive power of two.");
+        }
+
+        for (var candidate = maximumBlockN; candidate >= 1; candidate /= 2)
+        {
+            if (!CanPartitionPagedAttentionTile(config.BlockSize, candidate))
+            {
+                continue;
+            }
+
+            if (CanUsePagedAttentionTmaPipeline(machine, config, candidate, numStages))
+            {
+                return candidate;
+            }
+        }
+
+        return null;
+    }
+
+    private static bool CanPartitionPagedAttentionTile(int pageSize, int blockN)
+        => pageSize % blockN == 0 || blockN % pageSize == 0;
+
     private static bool CanUsePagedAttentionDecodeGqaSimt(
         TIRMicroKernelSelectionContext context,
         Nncase.TIR.NTT.PagedAttentionPartial pagedAttention,
@@ -152,6 +211,14 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
             pagedAttention.HiddenSize % config.HeadDim != 0 ||
             GetScalarDataType(query.ElemType) != DataTypes.BFloat16 ||
             GetVectorLaneCount(query.ElemType) != 8 ||
+            !PagedAttentionCacheLayoutUtility.Analyze(
+                config,
+                IR.NN.AttentionCacheKind.Key,
+                "Triton PagedAttention key cache").HasContiguousHeadDimension(8) ||
+            !PagedAttentionCacheLayoutUtility.Analyze(
+                config,
+                IR.NN.AttentionCacheKind.Value,
+                "Triton PagedAttention value cache").HasContiguousHeadDimension(8) ||
             GetMax(GetLocalDimensions(query)[seqAxis]) != 1)
         {
             return false;
@@ -185,22 +252,19 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
         int blockN,
         int numStages)
     {
-        ReadOnlySpan<IR.NN.PagedKVCacheDimKind> canonicalLayout =
-        [
-            IR.NN.PagedKVCacheDimKind.NumBlocks,
-            IR.NN.PagedKVCacheDimKind.NumLayers,
-            IR.NN.PagedKVCacheDimKind.KV,
-            IR.NN.PagedKVCacheDimKind.BlockSize,
-            IR.NN.PagedKVCacheDimKind.NumKVHeads,
-            IR.NN.PagedKVCacheDimKind.HeadDim,
-        ];
+        var keyLayout = PagedAttentionCacheLayoutUtility.Analyze(
+            config,
+            IR.NN.AttentionCacheKind.Key,
+            "Triton PagedAttention key cache");
+        var valueLayout = PagedAttentionCacheLayoutUtility.Analyze(
+            config,
+            IR.NN.AttentionCacheKind.Value,
+            "Triton PagedAttention value cache");
         if (config.KVPrimType != DataTypes.BFloat16 ||
             config.HeadDim != 128 ||
-            config.BlockSize % blockN != 0 ||
-            !config.KeyCacheLayout.ToArray().AsSpan().SequenceEqual(canonicalLayout) ||
-            !config.ValueCacheLayout.ToArray().AsSpan().SequenceEqual(canonicalLayout) ||
-            !HasHeadDimVectorization(config, IR.NN.AttentionCacheKind.Key) ||
-            !HasHeadDimVectorization(config, IR.NN.AttentionCacheKind.Value))
+            !CanPartitionPagedAttentionTile(config.BlockSize, blockN) ||
+            !keyLayout.HasContiguousHeadDimension(8) ||
+            !valueLayout.HasContiguousHeadDimension(8))
         {
             return false;
         }
@@ -218,18 +282,6 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
         var requiredBytes = checked(stageBytes * 2);
         return machine.GetAllocationSizeBytes(sharedSpace, requiredBytes) <=
             machine.GetMaximumUsableAllocationBytes(sharedSpace);
-    }
-
-    private static bool HasHeadDimVectorization(
-        IR.NN.IPagedAttentionConfig config,
-        IR.NN.AttentionCacheKind kind)
-    {
-        var axes = config.GetVectorizedAxes(kind).ToArray();
-        var lanes = config.GetLanes(kind).ToArray();
-        return axes.Length == 1 &&
-            axes[0] == IR.NN.PagedKVCacheDimKind.HeadDim &&
-            lanes.Length == 1 &&
-            lanes[0] == 8;
     }
 
     private static IR.NN.IPagedAttentionConfig GetPagedAttentionConfig(
@@ -490,9 +542,13 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
                             rhsShape,
                             NvidiaNvmmaSharedAlignmentBytes)),
                     new TIRTransferPipelineContract(
-                        sourceArgumentIndices ?? throw new InvalidOperationException(
-                            $"{family}/simt_fma_smem_pipeline is missing transfer source operand indexes."),
-                        [0]));
+                    [
+                        new TIRTransferPipelineChannel(
+                            "weight",
+                            sourceArgumentIndices ?? throw new InvalidOperationException(
+                                $"{family}/simt_fma_smem_pipeline is missing transfer source operand indexes."),
+                            [0]),
+                    ]));
             }
 
             const int blockK = 256;
@@ -647,22 +703,61 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
         return blockN;
     }
 
-    private static Nncase.TIR.Buffer GetBuffer(
+    private static TensorBufferOperand GetBuffer(
         TIRMicroKernelSelectionContext context,
         int index,
         string name)
     {
-        if ((uint)index >= (uint)context.Arguments.Count ||
-            context.Arguments[index] is not Nncase.TIR.Buffer buffer)
+        if ((uint)index >= (uint)context.Arguments.Count)
         {
             throw new InvalidOperationException(
                 $"TIR microkernel selector for {context.Op.GetType().Name} expects {name} buffer at argument {index}.");
         }
 
-        return buffer;
+        return context.Arguments[index] switch
+        {
+            Nncase.TIR.Buffer buffer => new TensorBufferOperand(
+                buffer.Name,
+                buffer.ElemType,
+                buffer.Dimensions.ToArray(),
+                buffer.DistributedType),
+            BufferVar bufferVar => CreateBufferOperand(context.Op, index, name, bufferVar),
+            _ => throw new InvalidOperationException(
+                $"TIR microkernel selector for {context.Op.GetType().Name} expects {name} " +
+                $"buffer at argument {index}, got {context.Arguments[index].GetType().Name}."),
+        };
     }
 
-    private static void RequireRank(Nncase.TIR.Buffer buffer, int minimumRank, Op op, string name)
+    private static TensorBufferOperand CreateBufferOperand(
+        Op op,
+        int index,
+        string name,
+        BufferVar bufferVar)
+    {
+        var (tensorType, distributedType) = bufferVar.TypeAnnotation switch
+        {
+            DistributedType distributed => (distributed.TensorType, distributed),
+            TensorType tensor => (tensor, null),
+            _ => throw new InvalidOperationException(
+                $"TIR microkernel selector for {op.GetType().Name} expects {name} tensor " +
+                $"buffer at argument {index}, got {bufferVar.TypeAnnotation}."),
+        };
+        if (tensorType.Shape is not RankedShape shape ||
+            tensorType.DType is PointerType or ReferenceType)
+        {
+            throw new InvalidOperationException(
+                $"TIR microkernel selector for {op.GetType().Name} expects {name} ranked " +
+                $"tensor buffer at argument {index}, got {tensorType}.");
+        }
+
+        return new TensorBufferOperand(
+            bufferVar.Name,
+            tensorType.DType,
+            shape.Dimensions.ToArray(),
+            distributedType);
+    }
+
+    private static void RequireRank(TensorBufferOperand buffer, int minimumRank, Op op, string name)
     {
         if (buffer.Rank < minimumRank)
         {
@@ -677,7 +772,7 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
     private static long GetScalarExtent(Dimension dimension, DataType dataType)
         => checked(GetMax(dimension) * GetVectorLaneCount(dataType));
 
-    private static Dimension[] GetLocalDimensions(Nncase.TIR.Buffer buffer)
+    private static Dimension[] GetLocalDimensions(TensorBufferOperand buffer)
     {
         if (buffer.DistributedType is not { } distributedType)
         {
@@ -709,4 +804,13 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
         int BlockN,
         int BlockK,
         int NumStages);
+
+    private sealed record TensorBufferOperand(
+        string Name,
+        DataType ElemType,
+        Dimension[] Dimensions,
+        DistributedType? DistributedType)
+    {
+        public int Rank => Dimensions.Length;
+    }
 }

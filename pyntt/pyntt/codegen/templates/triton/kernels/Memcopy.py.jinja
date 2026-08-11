@@ -5,13 +5,12 @@
 # generated from PyNTT Jinja Memcopy.py.jinja
 # {{ model["Comment"] }}; dtype={{ model["DType"] }}, shape={{ shape_tuple(model["Shape"]) }}
 {{ phases.consumer_header(model) }}
-    shard_index = tl.program_id(0).to(tl.int64)
-{{ common.shard_coordinates([model["Source"], model["Destination"]]) }}
+{{ common.mesh_coordinates(model["MeshAxes"]) }}
     source = {{ ptr(model, "Source") }}
     destination = {{ ptr(model, "Destination") }}
 {% call(indent) elementwise.iterate(ctx) %}
-{{ indent }}value = tl.load({{ access_pointer(model, "Source", "source", ctx["source_access"]) }}, mask=mask, other=0.0)
-{{ indent }}tl.store({{ access_pointer(model, "Destination", "destination", ctx["destination_access"]) }}, value, mask=mask)
+{{ indent }}value = tl.load({{ access_pointer(model, "Source", "source", ctx["source_access"]) }}, mask={{ access_boundary_mask(ctx["source_access"]) }}, other=0.0)
+{{ indent }}tl.store({{ access_pointer(model, "Destination", "destination", ctx["destination_access"]) }}, value, mask={{ access_boundary_mask(ctx["destination_access"]) }})
 {% endcall %}
 
 

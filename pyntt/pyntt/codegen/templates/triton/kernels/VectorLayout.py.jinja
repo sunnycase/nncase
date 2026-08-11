@@ -5,8 +5,7 @@
 # generated from PyNTT Jinja VectorLayout.py.jinja
 # {{ model["Comment"] }}; op={{ ctx["op"] }}, input_dtype={{ model["InputDType"] }}, output_dtype={{ model["OutputDType"] }}, input_shape={{ shape_tuple(model["InputShape"]) }}, output_shape={{ shape_tuple(model["OutputShape"]) }}
 {{ phases.consumer_header(model) }}
-    shard_index = tl.program_id(0).to(tl.int64)
-{{ common.shard_coordinates([model["Input"], model["Output"]]) }}
+{{ common.mesh_coordinates(model["MeshAxes"]) }}
     input_ptr = {{ ptr(model, "Input") }}
     output_ptr = {{ ptr(model, "Output") }}
 {% call(indent) elementwise.iterate(ctx) %}

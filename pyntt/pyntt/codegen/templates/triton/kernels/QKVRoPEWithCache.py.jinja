@@ -13,8 +13,7 @@
 # generated from PyNTT Jinja QKVRoPEWithCache.py.jinja
 # {{ model["Comment"] }}; q_shape={{ shape_tuple(q_norm["OutputShape"]) }}, k_shape={{ shape_tuple(k_norm["OutputShape"]) }}, v_shape={{ shape_tuple(v_update["SlotsShape"]) }}, layer={{ k_update["LayerIdExpression"] }}
 {{ phases.consumer_header(model, args) }}
-    shard_index = tl.program_id(0).to(tl.int64)
-{{ common.hierarchy_coordinates(k_update["Hierarchy"]) }}
+{{ common.mesh_coordinates(model["MeshAxes"]) }}
     q_input = {{ ptr(q_norm, "Input") }}
     q_stats = {{ ptr(q_norm, "Stats") }}
     q_scale = {{ ptr(q_norm, "Scale") }}
@@ -30,7 +29,7 @@
     layer_id_value = (tl.full((), 0, tl.int64) + ({{ k_update["LayerIdExpression"] }})).to(tl.int64)
     num_tokens = tl.load(query_start_loc + num_seqs).to(tl.int64)
 
-{% call(indent) elementwise.iterate(ctx["q"]) %}
+{% call(indent) elementwise.iterate(ctx["q"], scope="q") %}
 {{ indent }}mask = mask & ({{ ctx["q"]["output_physical_rotary"] }} < {{ dim(ctx["q"]["output_rotary_extent"]) }})
 {{ indent }}q_inner_count = ({{ ctx["q"]["normalization_size"] }}) + 0.0
 {% if q_norm["UseMean"] %}
@@ -59,7 +58,7 @@
 {{ indent }}tl.store({{ access_pointer(model, "QOutput", "q_output", ctx["q"]["final_output_access"]) }}, q_result, mask=mask)
 {% endcall %}
 
-{% call(indent) elementwise.iterate(ctx["k"]) %}
+{% call(indent) elementwise.iterate(ctx["k"], scope="k") %}
 {{ indent }}mask = mask & ({{ ctx["k"]["output_physical_rotary"] }} < {{ dim(ctx["k"]["output_rotary_extent"]) }})
 {{ indent }}k_inner_count = ({{ ctx["k"]["normalization_size"] }}) + 0.0
 {% if k_norm["UseMean"] %}
@@ -88,7 +87,7 @@
 {{ cache_io.store(k_update, ctx["k"]["cache"], "k_result", "mask", indent) }}
 {% endcall %}
 
-{% call(indent) elementwise.iterate(ctx["v"]) %}
+{% call(indent) elementwise.iterate(ctx["v"], scope="v") %}
 {{ indent }}v_value = tl.load({{ access_pointer(v_update, "Slots", "v_input", ctx["v"]["slots_access"]) }}, mask=mask, other=0.0)
 {{ cache_io.store(v_update, ctx["v"], "v_value", "mask", indent) }}
 {% endcall %}

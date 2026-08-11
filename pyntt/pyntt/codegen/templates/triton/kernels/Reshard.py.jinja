@@ -5,14 +5,8 @@
 # generated from PyNTT Jinja Reshard.py.jinja
 # {{ model["Comment"] }}; dtype={{ model["DType"] }}, global_shape={{ shape_tuple(model["GlobalShape"]) }}, input_tile_shape={{ shape_tuple(model["InputActiveShape"]) }}, output_local_shape={{ shape_tuple(model["OutputLocalShape"]) }}, lane={{ model["VectorLaneCount"] }}, stage=tile_scatter
 {{ phases.consumer_header(model) }}
-    shard_index = tl.program_id(0).to(tl.int64)
-{{ common.shard_coordinates([model["Input"]]) }}
+{{ common.mesh_coordinates(model["MeshAxes"]) }}
     input0 = {{ ptr(model, "Input") }}
-    tmp_shard = shard_index
-{% for axis in reverse_indices(model["Hierarchy"]) %}
-    shard_coord{{ axis }} = tmp_shard % {{ model["Hierarchy"][axis] }}
-    tmp_shard = tmp_shard // {{ model["Hierarchy"][axis] }}
-{% endfor %}
 {% for axis in ctx["output_broadcast_mesh_axes"] %}
 {{ "    " * loop.index }}for destination_shard_coord{{ axis }} in tl.range(0, {{ model["Hierarchy"][axis] }}):
 {% endfor %}

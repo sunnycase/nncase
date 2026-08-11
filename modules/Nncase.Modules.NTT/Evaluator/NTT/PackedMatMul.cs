@@ -21,6 +21,7 @@ public sealed class PackedMatMulEvaluator : IEvaluator<PackedMatMul>, ITypeInfer
         var lhs = context.GetOrtArgumentValue(target, PackedMatMul.Lhs); // [x, m, k]
         var rhs = context.GetArgumentValueAsTensor(target, PackedMatMul.Rhs);
         var scale = context.GetArgumentValue(target, PackedMatMul.Scale);
+        var addend = context.GetArgumentValue(target, PackedMatMul.Addend);
         var rhsOrt = rhs.ToOrtTensor();
 
         if (rhs.ElementType is not VectorType rhsVectorType)
@@ -60,6 +61,11 @@ public sealed class PackedMatMulEvaluator : IEvaluator<PackedMatMul>, ITypeInfer
         var matmul = Math.MatMulEvaluator.InferValue(lhs.DataType.ToDataType(), lhs.ToTensor(), rhsOrt.ToTensor(), target.OutputDataType, scale).AsTensor().ToOrtTensor();
         var cN = matmul.Rank - 1;
         matmul = matmul.Pack(0, outputLanes, Enumerable.Repeat(cN, outputLanes.Length).ToArray());
+        if (!IsNone(addend))
+        {
+            matmul = OrtKI.Add(matmul, addend.AsTensor().ToOrtTensor());
+        }
+
         return matmul.ToValue(new VectorType(target.OutputDataType, outputLanes));
     }
 
@@ -68,6 +74,7 @@ public sealed class PackedMatMulEvaluator : IEvaluator<PackedMatMul>, ITypeInfer
         var lhs = context.CheckArgumentType<IRType>(target, PackedMatMul.Lhs);
         var rhs = context.CheckArgumentType<IRType>(target, PackedMatMul.Rhs);
         var scale = context.CheckArgumentType<IRType>(target, PackedMatMul.Scale);
+        var addend = context.CheckArgumentType<IRType>(target, PackedMatMul.Addend);
         IRType rType;
         string? errorMessage = null;
         switch (lhs, rhs)
@@ -138,17 +145,27 @@ public sealed class PackedMatMulEvaluator : IEvaluator<PackedMatMul>, ITypeInfer
                 break;
         }
 
-        return rType;
+        if (rType is InvalidType || addend is NoneType)
+        {
+            return rType;
+        }
+
+        return Equals(rType, addend)
+            ? rType
+            : new InvalidType(
+                $"PackedMatMul addend must have exactly the packed output type, got output={rType}, addend={addend}.");
     }
 
     public Cost Visit(ICostEvaluateContext context, PackedMatMul target)
     {
         var lhs = context.GetArgumentType<IRType>(target, PackedMatMul.Lhs);
         var rhs = context.GetArgumentType<IRType>(target, PackedMatMul.Rhs);
+        var addend = context.GetArgumentType<IRType>(target, PackedMatMul.Addend);
         var outputType = context.GetReturnType<IRType>();
         bool hasAllReduce = false;
         if (TryGetTargetCost(context, target, lhs, rhs, outputType, out var targetCost, out hasAllReduce))
         {
+            AddAddendCost(targetCost, outputType, addend);
             return AddAllReduceCost(targetCost, outputType, hasAllReduce);
         }
 
@@ -170,8 +187,18 @@ public sealed class PackedMatMulEvaluator : IEvaluator<PackedMatMul>, ITypeInfer
         {
             [CostFactorNames.BlockLocalMemoryLoadBytes] = CostUtility.GetMemoryAccess(lhs) + CostUtility.GetMemoryAccess(rhs),
             [CostFactorNames.BlockLocalMemoryStoreBytes] = CostUtility.GetMemoryAccess(outputType),
-            [CostFactorNames.CPUCycles] = CostUtility.GetCPUCycles(outputType, macPerElement),
+            [CostFactorNames.CPUCycles] = CostUtility.GetCPUCycles(
+                outputType,
+                checked(macPerElement + (addend is NoneType ? 0U : 1U))),
         };
+
+        if (addend is not NoneType)
+        {
+            AddCostFactor(
+                cost,
+                CostFactorNames.BlockLocalMemoryLoadBytes,
+                CostUtility.GetMemoryAccess(addend));
+        }
 
         return AddAllReduceCost(cost, outputType, hasAllReduce);
     }
@@ -246,6 +273,25 @@ public sealed class PackedMatMulEvaluator : IEvaluator<PackedMatMul>, ITypeInfer
         _ => null,
     };
 
+    private static bool IsNone(IValue value) => value is NoneValue || value.Type is NoneType;
+
+    private static void AddAddendCost(Cost cost, IRType outputType, IRType addend)
+    {
+        if (addend is NoneType)
+        {
+            return;
+        }
+
+        AddCostFactor(
+            cost,
+            CostFactorNames.BlockLocalMemoryLoadBytes,
+            CostUtility.GetMemoryAccess(addend));
+        AddCostFactor(
+            cost,
+            CostFactorNames.CPUCycles,
+            CostUtility.GetCPUCycles(outputType, 1));
+    }
+
     private static IRType UnpackType(IRType input, int[] axes) => input switch
     {
         DistributedType distributedType => TypeInference.UnpackType(distributedType, axes),
@@ -280,7 +326,7 @@ public sealed class PackedMatMulEvaluator : IEvaluator<PackedMatMul>, ITypeInfer
         return cost;
     }
 
-    private void AddCostFactor(Cost cost, string name, UInt128 value)
+    private static void AddCostFactor(Cost cost, string name, UInt128 value)
     {
         if (cost.Factors.TryGetValue(name, out var oldValue))
         {

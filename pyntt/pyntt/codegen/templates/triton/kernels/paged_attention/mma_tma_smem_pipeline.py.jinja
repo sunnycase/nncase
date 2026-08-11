@@ -1,6 +1,7 @@
 {% macro pipeline_setup(stage) -%}
 {% set stage_model = stage["Model"] %}
 {% set stage_ctx = paged_attention_partial_context(stage_model) %}
+{% if stage["ChannelName"] == "key" %}
 {{ stage["StageName"] }}__key_stages = tle.gpu.alloc(
     [{{ stage_ctx["attention_num_stages"] }}, 1, 1, {{ stage_ctx["attention_block_size"] }}, 1, {{ stage_model["Cache"]["HeadDim"] }}],
     dtype={{ stage_model["Cache"]["TritonDType"] }},
@@ -10,6 +11,13 @@
     alias_offset_bytes={{ stage["SharedWorkspaceOffsets"]["key_stage"] }},
     nv_mma_shared_layout=True,
 )
+{{ stage["PipeName"] }} = tle.pipe(
+    capacity={{ stage_ctx["attention_num_stages"] }},
+    scope="cta",
+    name="{{ stage["StageName"] }}_key",
+    key={{ stage["StageName"] }}__key_stages,
+)
+{% elif stage["ChannelName"] == "value" %}
 {{ stage["StageName"] }}__value_stages = tle.gpu.alloc(
     [{{ stage_ctx["attention_num_stages"] }}, 1, 1, {{ stage_ctx["attention_block_size"] }}, 1, {{ stage_model["Cache"]["HeadDim"] }}],
     dtype={{ stage_model["Cache"]["TritonDType"] }},
@@ -22,20 +30,109 @@
 {{ stage["PipeName"] }} = tle.pipe(
     capacity={{ stage_ctx["attention_num_stages"] }},
     scope="cta",
-    name="{{ stage["StageName"] }}_kv",
-    key={{ stage["StageName"] }}__key_stages,
+    name="{{ stage["StageName"] }}_value",
     value={{ stage["StageName"] }}__value_stages,
 )
+{% else %}
+{{ stage["SharedWorkspaceOffsets"]["unsupported_paged_attention_channel"] }}
+{% endif %}
 {%- endmacro %}
 {% if model is defined %}
 {% import "triton/kernels/_common.py.jinja" as common with context %}
 {% set ctx = paged_attention_partial_context(model) %}
 {% set cache = model["Cache"] %}
+{% macro produce_tile(context_start, copies_per_transaction) %}
+                key_slot = key_writer.acquire(sequence)
+{% for copy_index in range(copies_per_transaction) %}
+                copy_start_{{ copy_index }} = {{ context_start }} + {{ copy_index * ctx["attention_copy_block_size"] }}
+                context_bid_{{ copy_index }} = copy_start_{{ copy_index }} // {{ cache["BlockSize"] }}
+                page_offset_{{ copy_index }} = (copy_start_{{ copy_index }} % {{ cache["BlockSize"] }}).to(tl.int32)
+{% if cache["IdLength"] > 1 %}
+                key_topology_id_{{ copy_index }} = tl.load(block_table + matched_seq_id * block_table_blocks * {{ cache["IdLength"] }} + context_bid_{{ copy_index }} * {{ cache["IdLength"] }}).to(tl.int64)
+{% endif %}
+                key_block_id_{{ copy_index }} = tl.load(block_table + matched_seq_id * block_table_blocks * {{ cache["IdLength"] }} + context_bid_{{ copy_index }} * {{ cache["IdLength"] }} + {{ cache["IdLength"] - 1 }}).to(tl.int64)
+                flat_block_id_{{ copy_index }} = ({{ ctx["key_cache_block_id"] | replace("key_topology_id", "key_topology_id_" ~ copy_index) | replace("key_block_id", "key_block_id_" ~ copy_index) }}).to(tl.int32)
+                key_destination_{{ copy_index }} = key_slot.key.subslice(
+                    [0, 0, {{ copy_index * ctx["attention_copy_block_size"] }}, 0, 0],
+                    [1, 1, {{ ctx["attention_copy_block_size"] }}, 1, {{ cache["HeadDim"] }}],
+                )
+                tle.gpu.copy(
+                    key_descriptor,
+                    key_destination_{{ copy_index }},
+                    [1, 1, {{ ctx["attention_copy_block_size"] }}, 1, {{ cache["HeadDim"] }}],
+                    offsets=[flat_block_id_{{ copy_index }}, layer_id_value, page_offset_{{ copy_index }}, kv_head, 0],
+                    eviction_policy="evict_first",
+                )
+{% endfor %}
+                key_writer.commit(sequence)
+                value_slot = value_writer.acquire(sequence)
+{% for copy_index in range(copies_per_transaction) %}
+                value_destination_{{ copy_index }} = value_slot.value.subslice(
+                    [0, 0, {{ copy_index * ctx["attention_copy_block_size"] }}, 0, 0],
+                    [1, 1, {{ ctx["attention_copy_block_size"] }}, 1, {{ cache["HeadDim"] }}],
+                )
+                tle.gpu.copy(
+                    value_descriptor,
+                    value_destination_{{ copy_index }},
+                    [1, 1, {{ ctx["attention_copy_block_size"] }}, 1, {{ cache["HeadDim"] }}],
+                    offsets=[flat_block_id_{{ copy_index }}, layer_id_value, page_offset_{{ copy_index }}, kv_head, 0],
+                    eviction_policy="evict_first",
+                )
+{% endfor %}
+                value_writer.commit(sequence)
+{% endmacro %}
+{% macro consume_tile(context_start, tile_size, shared_rows_name, shared_dims_name, masked) %}
+                key_ready = key_reader.wait(sequence)
+                context_ids = {{ context_start }} + tl.arange(0, {{ tile_size }})
+{% if masked %}
+                context_mask = context_ids < active_end
+{% endif %}
+                key_stage = key_ready.slot.key.subslice(
+                    [0, 0, 0, 0, 0],
+                    [1, 1, {{ tile_size }}, 1, {{ cache["HeadDim"] }}],
+                )
+                key_ptr = tle.gpu.local_ptr(
+                    key_stage,
+                    (shared_zero, shared_zero, {{ shared_rows_name }}, shared_zero, {{ shared_dims_name }}),
+                    shape=({{ tile_size }}, {{ cache["HeadDim"] }}),
+                )
+                key_values = tl.load(key_ptr)
+                score = tl.dot(q_values, tl.trans(key_values))
+                key_reader.release(sequence)
+{% if masked %}
+                attention_mask = q_head_mask[:, None] & context_mask[None, :]
+{% else %}
+                attention_mask = tl.broadcast_to(q_head_mask[:, None], ({{ ctx["q_head_group_tile"] }}, {{ tile_size }}))
+{% endif %}
+                score = tl.where(attention_mask, score * scale_log2_value, -float("inf"))
+                block_max = tl.max(score, axis=1)
+                has_context = block_max != -float("inf")
+                new_max = tl.maximum(max_score, block_max)
+                safe_new_max = tl.where(has_context, new_max, 0.0)
+                safe_prev_max = tl.where(has_context, max_score, 0.0)
+                alpha = tl.exp2(safe_prev_max - safe_new_max)
+                prob = tl.exp2(tl.where(attention_mask, score - safe_new_max[:, None], -float("inf")))
+                value_ready = value_reader.wait(sequence)
+                value_stage = value_ready.slot.value.subslice(
+                    [0, 0, 0, 0, 0],
+                    [1, 1, {{ tile_size }}, 1, {{ cache["HeadDim"] }}],
+                )
+                value_ptr = tle.gpu.local_ptr(
+                    value_stage,
+                    (shared_zero, shared_zero, {{ shared_rows_name }}, shared_zero, {{ shared_dims_name }}),
+                    shape=({{ tile_size }}, {{ cache["HeadDim"] }}),
+                )
+                value_values = tl.load(value_ptr)
+                acc = tl.dot(prob.to({{ cache["TritonDType"] }}), value_values, acc * alpha[:, None], input_precision="ieee")
+                value_reader.release(sequence)
+                sum_exp = sum_exp * alpha + tl.sum(prob, axis=1)
+                max_score = tl.where(has_context, new_max, max_score)
+{% endmacro %}
 # generated from PyNTT algorithm triton.paged_attention_partial/mma_tma_smem_pipeline
 # {{ model["Comment"] }}; query_dtype={{ model["QueryDType"] }}, query_shape={{ shape_tuple(model["QueryShape"]) }}, layer={{ model["LayerIdExpression"] }}, split_axis={{ model["SplitHierarchyAxis"] }}, split_count={{ model["SplitCount"] }}, block_n={{ ctx["attention_block_size"] }}, stages={{ ctx["attention_num_stages"] }}
 {{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
-def {{ model["FunctionName"] }}__producer(writer, {{ helper_parameters(model) }}):
-    shard_index = tl.program_id(0).to(tl.int64)
+def {{ model["FunctionName"] }}__producer(key_writer, value_writer, {{ helper_parameters(model) }}):
+{{ common.mesh_coordinates(model["MeshAxes"]) }}
     block_table = {{ model["BlockTableArgument"] }}
     num_blocks_per_shard = {{ model["NumBlocksPerShardArgument"] }}
     query_start_loc = {{ model["QueryStartLocArgument"] }}
@@ -44,73 +141,60 @@ def {{ model["FunctionName"] }}__producer(writer, {{ helper_parameters(model) }}
     key_descriptor = {{ model["KeyDescriptorName"] }}
     value_descriptor = {{ model["ValueDescriptorName"] }}
     layer_id_value = (tl.full((), 0, tl.int32) + ({{ model["LayerIdExpression"] }})).to(tl.int32)
-{{ common.hierarchy_coordinates(model["Hierarchy"]) }}
     max_seq_len = tl.full((), 0, tl.int64)
     num_tokens = tl.load(query_start_loc + num_seqs).to(tl.int64)
     for seq_scan in tl.range(0, num_seqs):
         max_seq_len = tl.maximum(max_seq_len, tl.load(seq_lens + seq_scan).to(tl.int64))
     block_table_blocks = tl.cdiv(max_seq_len, {{ cache["BlockSize"] }})
     split_span = tl.cdiv(max_seq_len, {{ ctx["split_count"] * ctx["attention_block_size"] }}) * {{ ctx["attention_block_size"] }}
+    split_active = {{ ctx["split_coord"] }} < {{ ctx["split_count"] }}
     split_begin = tl.minimum(({{ ctx["split_coord"] }}).to(tl.int64) * split_span, max_seq_len)
     split_end = tl.minimum(split_begin + split_span, max_seq_len)
-    first_page = split_begin // {{ cache["BlockSize"] }}
-    end_page = tl.cdiv(split_end, {{ cache["BlockSize"] }})
     sequence = tl.full((), 0, tl.int32)
     for local_query_id in tl.range(0, {{ dim(ctx["local_query_tokens"]) }}):
         global_query_id = {{ ctx["global_query_id"] }}
+        context_len = tl.full((), 0, tl.int64)
+        seq_len = tl.full((), 0, tl.int64)
+        query_id = tl.full((), 0, tl.int64)
         matched_seq_id = tl.full((), 0, tl.int64)
+        query_active = split_active & (global_query_id < {{ dim(ctx["global_query_tokens"]) }}) & (global_query_id < num_tokens)
         found_seq = False
         for seq_id in tl.range(0, num_seqs):
             current_query_start = tl.load(query_start_loc + seq_id).to(tl.int64)
             current_query_end = tl.load(query_start_loc + seq_id + 1).to(tl.int64)
-            in_seq = (global_query_id < num_tokens) & (global_query_id >= current_query_start) & (global_query_id < current_query_end)
+            current_seq_len = tl.load(seq_lens + seq_id).to(tl.int64)
+            current_context_len = current_seq_len - (current_query_end - current_query_start)
+            in_seq = query_active & (global_query_id >= current_query_start) & (global_query_id < current_query_end)
             matched_seq_id = tl.where(in_seq, seq_id, matched_seq_id)
+            context_len = tl.where(in_seq, current_context_len, context_len)
+            seq_len = tl.where(in_seq, current_seq_len, seq_len)
+            query_id = tl.where(in_seq, global_query_id - current_query_start, query_id)
             found_seq = found_seq | in_seq
-        global_q_head_begin = ({{ ctx["global_q_head_begin"] }}).to(tl.int32)
+        causal_end = tl.minimum(seq_len, context_len + query_id + 1)
+        active_end = tl.where(found_seq, tl.maximum(split_begin, tl.minimum(split_end, causal_end)), split_begin)
+        full_end = split_begin + ((active_end - split_begin) // {{ ctx["attention_block_size"] }}) * {{ ctx["attention_block_size"] }}
+        global_q_head_begin = (tl.full((), 0, tl.int32) + ({{ ctx["global_q_head_begin"] }})).to(tl.int32)
         first_kv_head = global_q_head_begin // {{ ctx["q_head_group_size"] }}
         local_kv_groups = tl.cdiv((global_q_head_begin % {{ ctx["q_head_group_size"] }}) + {{ ctx["local_q_heads"] }}, {{ ctx["q_head_group_size"] }})
         for local_kv_group in tl.range(0, local_kv_groups):
             kv_head = (first_kv_head + local_kv_group).to(tl.int32)
-            for context_bid in tl.range(first_page, end_page):
-                page_start = context_bid * {{ cache["BlockSize"] }}
-                tile_begin = tl.maximum(split_begin, page_start)
-                tile_end = tl.minimum(split_end, page_start + {{ cache["BlockSize"] }})
-                block_table_active = found_seq & (tile_begin < max_seq_len)
-{% if cache["IdLength"] > 1 %}
-                key_topology_id = tl.load(block_table + matched_seq_id * block_table_blocks * {{ cache["IdLength"] }} + context_bid * {{ cache["IdLength"] }}, mask=block_table_active, other=0).to(tl.int64)
-{% endif %}
-                key_block_id = tl.load(block_table + matched_seq_id * block_table_blocks * {{ cache["IdLength"] }} + context_bid * {{ cache["IdLength"] }} + {{ cache["IdLength"] - 1 }}, mask=block_table_active, other=0).to(tl.int64)
-                flat_block_id = ({{ ctx["key_cache_block_id"] }}).to(tl.int32)
-                for context_start in tl.range(tile_begin, tile_end, {{ ctx["attention_block_size"] }}):
-                    slot = writer.acquire(sequence)
-                    page_offset = (context_start - page_start).to(tl.int32)
-                    tle.gpu.copy(
-                        key_descriptor,
-                        slot.key,
-                        [1, 1, {{ ctx["attention_block_size"] }}, 1, {{ cache["HeadDim"] }}],
-                        offsets=[flat_block_id, layer_id_value, page_offset, kv_head, 0],
-                        eviction_policy="evict_first",
-                    )
-                    tle.gpu.copy(
-                        value_descriptor,
-                        slot.value,
-                        [1, 1, {{ ctx["attention_block_size"] }}, 1, {{ cache["HeadDim"] }}],
-                        offsets=[flat_block_id, layer_id_value, page_offset, kv_head, 0],
-                        eviction_policy="evict_first",
-                    )
-                    writer.commit(sequence)
-                    sequence += 1
-    writer.close(sequence)
+            for context_start in tl.range(split_begin, full_end, {{ ctx["attention_block_size"] }}):
+{{ produce_tile("context_start", ctx["attention_copies_per_tile"]) }}
+                sequence += 1
+            for context_start in tl.range(full_end, active_end, {{ ctx["attention_copy_block_size"] }}):
+{{ produce_tile("context_start", 1) }}
+                sequence += 1
+    key_writer.close(sequence)
+    value_writer.close(sequence)
 
 
 {{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
-def {{ model["FunctionName"] }}__consumer(reader, {{ helper_parameters(model) }}):
-    shard_index = tl.program_id(0).to(tl.int64)
+def {{ model["FunctionName"] }}__consumer(key_reader, value_reader, {{ helper_parameters(model) }}):
+{{ common.mesh_coordinates(model["MeshAxes"]) }}
     query_start_loc = {{ model["QueryStartLocArgument"] }}
     seq_lens = {{ model["SeqLensArgument"] }}
     num_seqs = {{ model["NumSeqsArgument"] }}
     layer_id_value = (tl.full((), 0, tl.int32) + ({{ model["LayerIdExpression"] }})).to(tl.int32)
-{{ common.hierarchy_coordinates(model["Hierarchy"]) }}
 {% for name, key in (("query", "Query"), ("scale_ptr", "Scale"), ("max_state", "MaxState"), ("sum_state", "SumState"), ("acc_state", "AccState")) %}
     {{ name }} = {{ ptr(model, key) }}
 {% endfor %}
@@ -124,12 +208,12 @@ def {{ model["FunctionName"] }}__consumer(reader, {{ helper_parameters(model) }}
     split_active = {{ ctx["split_coord"] }} < {{ ctx["split_count"] }}
     split_begin = tl.minimum(({{ ctx["split_coord"] }}).to(tl.int64) * split_span, max_seq_len)
     split_end = tl.minimum(split_begin + split_span, max_seq_len)
-    first_page = split_begin // {{ cache["BlockSize"] }}
-    end_page = tl.cdiv(split_end, {{ cache["BlockSize"] }})
 {{ common.structured_axis(ctx["query_dim_axis"], "    ") }}
     dim_offsets = tl.arange(0, {{ cache["HeadDim"] }})
-    shared_rows = tl.broadcast_to(tl.arange(0, {{ ctx["attention_block_size"] }})[:, None], ({{ ctx["attention_block_size"] }}, {{ cache["HeadDim"] }}))
-    shared_dims = tl.broadcast_to(dim_offsets[None, :], ({{ ctx["attention_block_size"] }}, {{ cache["HeadDim"] }}))
+    full_shared_rows = tl.broadcast_to(tl.arange(0, {{ ctx["attention_block_size"] }})[:, None], ({{ ctx["attention_block_size"] }}, {{ cache["HeadDim"] }}))
+    full_shared_dims = tl.broadcast_to(dim_offsets[None, :], ({{ ctx["attention_block_size"] }}, {{ cache["HeadDim"] }}))
+    tail_shared_rows = tl.broadcast_to(tl.arange(0, {{ ctx["attention_copy_block_size"] }})[:, None], ({{ ctx["attention_copy_block_size"] }}, {{ cache["HeadDim"] }}))
+    tail_shared_dims = tl.broadcast_to(dim_offsets[None, :], ({{ ctx["attention_copy_block_size"] }}, {{ cache["HeadDim"] }}))
     shared_zero = tl.full((), 0, tl.int32)
     sequence = tl.full((), 0, tl.int32)
     for local_query_id in tl.range(0, {{ dim(ctx["local_query_tokens"]) }}):
@@ -151,7 +235,7 @@ def {{ model["FunctionName"] }}__consumer(reader, {{ helper_parameters(model) }}
             seq_len = tl.where(in_seq, current_seq_len, seq_len)
             query_id = tl.where(in_seq, global_query_id - current_query_start, query_id)
             found_seq = found_seq | in_seq
-        global_q_head_begin = ({{ ctx["global_q_head_begin"] }}).to(tl.int32)
+        global_q_head_begin = (tl.full((), 0, tl.int32) + ({{ ctx["global_q_head_begin"] }})).to(tl.int32)
         first_kv_head = global_q_head_begin // {{ ctx["q_head_group_size"] }}
         local_kv_groups = tl.cdiv((global_q_head_begin % {{ ctx["q_head_group_size"] }}) + {{ ctx["local_q_heads"] }}, {{ ctx["q_head_group_size"] }})
         for local_kv_group in tl.range(0, local_kv_groups):
@@ -165,41 +249,15 @@ def {{ model["FunctionName"] }}__consumer(reader, {{ helper_parameters(model) }}
             max_score = tl.full(({{ ctx["q_head_group_tile"] }},), -float("inf"), tl.float32)
             sum_exp = tl.zeros(({{ ctx["q_head_group_tile"] }},), tl.float32)
             acc = tl.zeros(({{ ctx["q_head_group_tile"] }}, {{ cache["HeadDim"] }}), tl.float32)
-            for context_bid in tl.range(first_page, end_page):
-                page_start = context_bid * {{ cache["BlockSize"] }}
-                tile_begin = tl.maximum(split_begin, page_start)
-                tile_end = tl.minimum(split_end, page_start + {{ cache["BlockSize"] }})
-                for context_start in tl.range(tile_begin, tile_end, {{ ctx["attention_block_size"] }}):
-                    context_ids = context_start + tl.arange(0, {{ ctx["attention_block_size"] }})
-                    context_mask = found_seq & (context_ids < seq_len) & (context_ids <= context_len + query_id)
-                    ready = reader.wait(sequence)
-                    key_ptr = tle.gpu.local_ptr(
-                        ready.slot.key,
-                        (shared_zero, shared_zero, shared_rows, shared_zero, shared_dims),
-                        shape=({{ ctx["attention_block_size"] }}, {{ cache["HeadDim"] }}),
-                    )
-                    key_values = tl.load(key_ptr)
-                    score = tl.dot(q_values, tl.trans(key_values))
-                    attention_mask = q_head_mask[:, None] & context_mask[None, :]
-                    score = tl.where(attention_mask, score * scale_log2_value, -float("inf"))
-                    block_max = tl.max(score, axis=1)
-                    has_context = block_max != -float("inf")
-                    new_max = tl.maximum(max_score, block_max)
-                    safe_new_max = tl.where(has_context, new_max, 0.0)
-                    safe_prev_max = tl.where(has_context, max_score, 0.0)
-                    alpha = tl.exp2(safe_prev_max - safe_new_max)
-                    prob = tl.exp2(tl.where(attention_mask, score - safe_new_max[:, None], -float("inf")))
-                    value_ptr = tle.gpu.local_ptr(
-                        ready.slot.value,
-                        (shared_zero, shared_zero, shared_rows, shared_zero, shared_dims),
-                        shape=({{ ctx["attention_block_size"] }}, {{ cache["HeadDim"] }}),
-                    )
-                    value_values = tl.load(value_ptr)
-                    acc = tl.dot(prob.to({{ cache["TritonDType"] }}), value_values, acc * alpha[:, None], input_precision="ieee")
-                    sum_exp = sum_exp * alpha + tl.sum(prob, axis=1)
-                    max_score = tl.where(has_context, new_max, max_score)
-                    reader.release(sequence)
-                    sequence += 1
+            causal_end = tl.minimum(seq_len, context_len + query_id + 1)
+            active_end = tl.where(found_seq, tl.maximum(split_begin, tl.minimum(split_end, causal_end)), split_begin)
+            full_end = split_begin + ((active_end - split_begin) // {{ ctx["attention_block_size"] }}) * {{ ctx["attention_block_size"] }}
+            for context_start in tl.range(split_begin, full_end, {{ ctx["attention_block_size"] }}):
+{{ consume_tile("context_start", ctx["attention_block_size"], "full_shared_rows", "full_shared_dims", false) }}
+                sequence += 1
+            for context_start in tl.range(full_end, active_end, {{ ctx["attention_copy_block_size"] }}):
+{{ consume_tile("context_start", ctx["attention_copy_block_size"], "tail_shared_rows", "tail_shared_dims", true) }}
+                sequence += 1
             tl.store({{ access_pointer(model, "MaxState", "max_state", ctx["max_state_access"]) }}, max_score, mask=split_active & q_head_mask)
             tl.store({{ access_pointer(model, "SumState", "sum_state", ctx["sum_state_access"]) }}, sum_exp, mask=split_active & q_head_mask)
             tl.store({{ access_pointer(model, "AccState", "acc_state", ctx["acc_state_access"]) }}, acc, mask=split_active & q_head_mask[:, None])

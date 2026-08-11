@@ -1,13 +1,12 @@
+{% import "triton/kernels/_common.py.jinja" as common with context %}
 @triton.jit
 def {{ model["ConsumerFunctionName"] }}(
     {{ helper_parameters(model, model["ConsumerEndpointNames"]) }}
 ):
-{% if model["ConsumerNeedsShardIndex"] %}
-    shard_index = tl.program_id(0).to(tl.int64)
-{% endif %}
+{{ common.mesh_coordinates(model["MeshAxes"]) }}
 {% if model["ConsumerBodySource"].strip() %}
 {{ model["ConsumerBodySource"] | indent(4, true) }}
-{% elif not model["ConsumerNeedsShardIndex"] %}
+{% else %}
     pass
 {% endif %}
 
@@ -16,12 +15,10 @@ def {{ model["ConsumerFunctionName"] }}(
 def {{ model["ProducerFunctionName"] }}(
     {{ helper_parameters(model, model["ProducerEndpointNames"]) }}
 ):
-{% if model["ProducerNeedsShardIndex"] %}
-    shard_index = tl.program_id(0).to(tl.int64)
-{% endif %}
+{{ common.mesh_coordinates(model["MeshAxes"]) }}
 {% if model["ProducerBodySource"].strip() %}
 {{ model["ProducerBodySource"] | indent(4, true) }}
-{% elif not model["ProducerNeedsShardIndex"] %}
+{% else %}
     pass
 {% endif %}
 

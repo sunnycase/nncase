@@ -1,15 +1,19 @@
-{% macro hierarchy_coordinates(hierarchy) -%}
-{% if hierarchy is not none %}
-    tmp_shard_coord = shard_index
-{% for axis in reverse_indices(hierarchy) %}
-    shard_coord{{ axis }} = tmp_shard_coord % {{ hierarchy[axis] }}
-    tmp_shard_coord = tmp_shard_coord // {{ hierarchy[axis] }}
-{% endfor %}
+{% macro mesh_coordinates(mesh_axes) -%}
+{% set linear = namespace(expression="") %}
+{% for axis in mesh_axes %}
+{% if axis["level"] == "b" %}
+    shard_coord{{ axis["placement_axis"] }} = tle.shard_id(PYNTT_GRID_MESH, {{ pyrepr(axis["name"]) }}).to(tl.int64)
+{% else %}
+    shard_coord{{ axis["placement_axis"] }} = 0
 {% endif %}
-{%- endmacro %}
-
-{% macro shard_coordinates(pointers) -%}
-{{ hierarchy_coordinates(pointer_shard_hierarchy(pointers)) }}
+{% set coord = "shard_coord" ~ axis["placement_axis"] %}
+{% if loop.first %}
+{% set linear.expression = coord %}
+{% else %}
+{% set linear.expression = "(" ~ linear.expression ~ " * " ~ axis["size"] ~ " + " ~ coord ~ ")" %}
+{% endif %}
+{% endfor %}
+    shard_index = {{ linear.expression }}
 {%- endmacro %}
 
 {% macro structured_axis(axis, indent="") -%}

@@ -5,18 +5,17 @@
 # generated from PyNTT Jinja ElementwiseWhere.py.jinja
 # {{ model["Comment"] }}; cond_dtype={{ model["CondDType"] }}, value_dtype={{ model["ValueDType"] }}, output_dtype={{ model["OutputDType"] }}, shape={{ shape_tuple(model["Shape"]) }}
 {{ phases.consumer_header(model) }}
-    shard_index = tl.program_id(0).to(tl.int64)
-{{ common.shard_coordinates([model["Cond"], model["TrueValue"], model["FalseValue"], model["Output"]]) }}
+{{ common.mesh_coordinates(model["MeshAxes"]) }}
 {% for name, key in (("cond", "Cond"), ("true_value", "TrueValue"), ("false_value", "FalseValue"), ("output", "Output")) %}
     {{ name }} = {{ ptr(model, key) }}
 {% endfor %}
 {% call(indent) elementwise.iterate(ctx) %}
-{{ indent }}predicate_value = tl.load({{ access_pointer(model, "Cond", "cond", ctx["cond_access"]) }}, mask=mask, other=0)
+{{ indent }}predicate_value = tl.load({{ access_pointer(model, "Cond", "cond", ctx["cond_access"]) }}, mask={{ access_boundary_mask(ctx["cond_access"]) }}, other=0)
 {{ indent }}predicate = {{ "(predicate_value != 0)" if is_bool_dtype(model["CondDType"]) else "predicate_value" }}
-{{ indent }}value0 = tl.load({{ access_pointer(model, "TrueValue", "true_value", ctx["true_access"]) }}, mask=mask, other=0.0)
-{{ indent }}value1 = tl.load({{ access_pointer(model, "FalseValue", "false_value", ctx["false_access"]) }}, mask=mask, other=0.0)
+{{ indent }}value0 = tl.load({{ access_pointer(model, "TrueValue", "true_value", ctx["true_access"]) }}, mask={{ access_boundary_mask(ctx["true_access"]) }}, other=0.0)
+{{ indent }}value1 = tl.load({{ access_pointer(model, "FalseValue", "false_value", ctx["false_access"]) }}, mask={{ access_boundary_mask(ctx["false_access"]) }}, other=0.0)
 {{ indent }}result = tl.where(predicate, value0, value1)
-{{ indent }}tl.store({{ access_pointer(model, "Output", "output", ctx["output_access"]) }}, {{ "(result).to(tl.uint8)" if is_bool_dtype(model["OutputDType"]) else "result" }}, mask=mask)
+{{ indent }}tl.store({{ access_pointer(model, "Output", "output", ctx["output_access"]) }}, {{ "(result).to(tl.uint8)" if is_bool_dtype(model["OutputDType"]) else "result" }}, mask={{ access_boundary_mask(ctx["output_access"]) }})
 {% endcall %}
 
 

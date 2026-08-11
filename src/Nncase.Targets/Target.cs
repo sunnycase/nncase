@@ -89,6 +89,10 @@ public abstract class Target : ITarget
     {
     }
 
+    public virtual void RegisterPostAutoDistributedPass(IPassManager passManager, CompileOptions options)
+    {
+    }
+
     public virtual void RegisterTIRSelectionPass(IPassManager passManager, CompileOptions optionsÍ)
     {
     }

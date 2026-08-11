@@ -46,7 +46,7 @@
 
 {{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
 def {{ model["FunctionName"] }}__producer(writer, {{ helper_parameters(model) }}):
-    shard_index = tl.program_id(0).to(tl.int64)
+{{ common.mesh_coordinates(model["MeshAxes"]) }}
     active_n = {{ dim(ctx["n"]) }}
     for n_tile in tl.range(0, {{ ctx["runtime_num_n_tiles"] }}):
         n_start = n_tile * {{ ctx["block_n"] }}
@@ -93,12 +93,11 @@ def {{ model["FunctionName"] }}__producer(writer, {{ helper_parameters(model) }}
 
 {{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
 def {{ model["FunctionName"] }}__consumer(reader, {{ helper_parameters(model) }}):
-    shard_index = tl.program_id(0).to(tl.int64)
+{{ common.mesh_coordinates(model["MeshAxes"]) }}
 {% set pointer_keys = namespace(values=[model["Input"], model["Output"]]) %}
 {% for prefix in ("Gate", "Up") %}
 {% if model["Has" ~ prefix ~ "Bias"] %}{% do pointer_keys.values.append(model[prefix ~ "Bias"]) %}{% endif %}
 {% endfor %}
-{{ common.shard_coordinates(pointer_keys.values) }}
     input0 = {{ ptr(model, "Input") }}
     output = {{ ptr(model, "Output") }}
 {% for prefix in ("Gate", "Up") %}

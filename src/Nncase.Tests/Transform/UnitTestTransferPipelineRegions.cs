@@ -18,6 +18,45 @@ namespace Nncase.Tests.TransformTest;
 public sealed class UnitTestTransferPipelineRegions : TestClassBase
 {
     [Fact]
+    public void TestTransferPipelineChannelsMayShareSourceOperand()
+    {
+        var contract = new TIRTransferPipelineContract(
+        [
+            new TIRTransferPipelineChannel("key", [1], [0]),
+            new TIRTransferPipelineChannel("value", [1], [1]),
+        ]);
+
+        Assert.Equal(new[] { 1 }, contract.SourceArgumentIndices);
+        Assert.Equal(new[] { 0, 1 }, contract.SharedWorkspaceIndices);
+    }
+
+    [Fact]
+    public void TestTransferPipelineRejectsDuplicateChannelNames()
+    {
+        var exception = Assert.Throws<ArgumentException>(() =>
+            new TIRTransferPipelineContract(
+            [
+                new TIRTransferPipelineChannel("cache", [1], [0]),
+                new TIRTransferPipelineChannel("cache", [1], [1]),
+            ]));
+
+        Assert.Contains("duplicate channel cache", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void TestTransferPipelineRejectsSharedWorkspaceWithMultipleOwners()
+    {
+        var exception = Assert.Throws<ArgumentException>(() =>
+            new TIRTransferPipelineContract(
+            [
+                new TIRTransferPipelineChannel("key", [1], [0]),
+                new TIRTransferPipelineChannel("value", [1], [0]),
+            ]));
+
+        Assert.Contains("Shared workspace 0", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task TestOverlappingPipelineStagesDrainPreviousOwner()
     {
         var source = CreateBuffer("source", MemoryLocation.Data, 4096);
@@ -393,7 +432,10 @@ public sealed class UnitTestTransferPipelineRegions : TestClassBase
                     "shared",
                     new TensorType(DataTypes.Float32, new[] { 64 }),
                     256)),
-            new TIRTransferPipelineContract([1], [0]));
+            new TIRTransferPipelineContract(
+            [
+                new TIRTransferPipelineChannel("weight", [1], [0]),
+            ]));
         return call;
     }
 

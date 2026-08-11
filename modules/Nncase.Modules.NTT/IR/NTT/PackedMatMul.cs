@@ -40,6 +40,11 @@ public sealed partial class PackedMatMul : Op
     /// </summary>
     public static readonly ParameterInfo Scale = new(typeof(PackedMatMul), 2, "scale", ParameterKind.Attribute);
 
+    /// <summary>
+    /// Gets the optional tensor added to the packed matmul result.
+    /// </summary>
+    public static readonly ParameterInfo Addend = new(typeof(PackedMatMul), 3, "addend", ParameterKind.Input);
+
     public DataType OutputDataType { get; }
 
     public bool FusedReduce { get; }

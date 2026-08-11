@@ -5,11 +5,10 @@
 # generated from PyNTT algorithm triton.matmul_glu/simt_fma
 # {{ model["Comment"] }}; glu={{ model["GluType"] }}, input_dtype={{ model["InputDType"] }}, weight_dtype={{ model["WeightDType"] }}, output_dtype={{ model["OutputDType"] }}, input_shape={{ shape_tuple(model["InputShape"]) }}, gate_weight_shape={{ shape_tuple(model["GateWeightShape"]) }}, up_weight_shape={{ shape_tuple(model["UpWeightShape"]) }}, output_shape={{ shape_tuple(model["OutputShape"]) }}{{ ", n_packed_lane=" ~ model["NPackedLaneCount"] ~ ", n_lane=" ~ model["NVectorLaneCount"] ~ ", n_scalar_lane=" ~ (model["NPackedLaneCount"] * model["NVectorLaneCount"]) if packed else "" }}
 {{ phases.consumer_header(model) }}
-    shard_index = tl.program_id(0).to(tl.int64)
+{{ common.mesh_coordinates(model["MeshAxes"]) }}
 {% set pointer_keys = ("Input", "GateWeight", "UpWeight", "GateBias", "UpBias", "Output") %}
 {% set pointers = namespace(values=[]) %}
 {% for key in pointer_keys %}{% do pointers.values.append(model[key]) %}{% endfor %}
-{{ common.shard_coordinates(pointers.values) }}
 {% for name, key in (("input0", "Input"), ("gate_weight", "GateWeight"), ("up_weight", "UpWeight"), ("gate_bias", "GateBias"), ("up_bias", "UpBias"), ("output", "Output")) %}
     {{ name }} = {{ ptr(model, key) }}
 {% endfor %}

@@ -21,7 +21,7 @@
 {% import "triton/kernels/_common.py.jinja" as common with context %}
 {% set ctx = packed_gemv_pipeline_context(model) %}
 # generated from PyNTT algorithm triton.matmul/simt_fma_smem_pipeline
-# {{ model["Comment"] }}; lhs_dtype={{ model["LhsDType"] }}, rhs_dtype={{ model["RhsDType"] }}, output_dtype={{ model["OutputDType"] }}, lhs_shape={{ shape_tuple(model["LhsShape"]) }}, rhs_shape={{ shape_tuple(model["RhsShape"]) }}, output_shape={{ shape_tuple(model["OutputShape"]) }}, rhs_layout={{ ctx["rhs_layout"] }}, rhs_n_lane={{ model["RhsNVectorLaneCount"] }}, rhs_k_pack={{ model["RhsKPackLaneCount"] }}, rhs_k_lane={{ model["RhsKVectorLaneCount"] }}, block_n={{ ctx["block_n"] }}, block_k={{ ctx["block_k"] }}, num_stages={{ ctx["num_stages"] }}
+# {{ model["Comment"] }}; lhs_dtype={{ model["LhsDType"] }}, rhs_dtype={{ model["RhsDType"] }}, output_dtype={{ model["OutputDType"] }}, lhs_shape={{ shape_tuple(model["LhsShape"]) }}, rhs_shape={{ shape_tuple(model["RhsShape"]) }}, output_shape={{ shape_tuple(model["OutputShape"]) }}, rhs_layout={{ ctx["rhs_layout"] }}, rhs_n_lane={{ model["RhsNVectorLaneCount"] }}, rhs_k_pack={{ model["RhsKPackLaneCount"] }}, rhs_k_lane={{ model["RhsKVectorLaneCount"] }}, block_n={{ ctx["block_n"] }}, block_k={{ ctx["block_k"] }}, num_stages={{ ctx["num_stages"] }}, has_addend={{ model["HasAddend"] }}
 {{ ctx["consumer_weight_layout_name"] }} = tl.constexpr(
     tle.gpu.BlockEncoding(
         [{{ ctx["consumer_size_per_thread"] | join(", ") }}],
@@ -46,7 +46,7 @@
 
 {{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
 def {{ model["FunctionName"] }}__producer(writer, {{ helper_parameters(model) }}):
-    shard_index = tl.program_id(0).to(tl.int64)
+{{ common.mesh_coordinates(model["MeshAxes"]) }}
     active_n = {{ dim(ctx["n"]) }}
     for n_tile in tl.range(0, {{ ctx["runtime_num_n_tiles"] }}):
         n_start = n_tile * {{ ctx["block_n"] }}
@@ -83,10 +83,12 @@ def {{ model["FunctionName"] }}__producer(writer, {{ helper_parameters(model) }}
 
 {{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
 def {{ model["FunctionName"] }}__consumer(reader, {{ helper_parameters(model) }}):
-    shard_index = tl.program_id(0).to(tl.int64)
-{{ common.shard_coordinates([model["Lhs"], model["Output"]]) }}
+{{ common.mesh_coordinates(model["MeshAxes"]) }}
     lhs = {{ ptr(model, "Lhs") }}
     output = {{ ptr(model, "Output") }}
+{% if model["HasAddend"] %}
+    addend = {{ ptr(model, "Addend") }}
+{% endif %}
 {% if model["RematerializeEntryIndices"] %}
     local_n_source = tle.gpu.rematerialize_index(tl.arange(0, {{ ctx["block_n"] }}))
 {% else %}
@@ -180,8 +182,24 @@ def {{ model["FunctionName"] }}__consumer(reader, {{ helper_parameters(model) }}
 {% if ctx["load_c_predicate"] == "True" %}
         result = previous + result
 {% else %}
-        result = tl.where({{ ctx["load_c_predicate"] }}, previous + result, result)
+{% if model["HasAddend"] %}
+        addend_value = tl.load(
+            {{ access_pointer(model, "Addend", "addend", ctx["pipeline_addend_access"]) }},
+            mask=({{ ctx["pipeline_output_mask"] }}) & ~({{ ctx["load_c_predicate"] }}),
+            other=0.0,
+        ).to(tl.float32)
+{% else %}
+        addend_value = tl.zeros(({{ ctx["block_n"] }},), tl.float32)
 {% endif %}
+        result = tl.where({{ ctx["load_c_predicate"] }}, previous, addend_value) + result
+{% endif %}
+{% elif model["HasAddend"] %}
+        addend_value = tl.load(
+            {{ access_pointer(model, "Addend", "addend", ctx["pipeline_addend_access"]) }},
+            mask={{ ctx["pipeline_output_mask"] }},
+            other=0.0,
+        ).to(tl.float32)
+        result = addend_value + result
 {% endif %}
         tl.store(
             {{ access_pointer(model, "Output", "output", ctx["pipeline_output_access"]) }},

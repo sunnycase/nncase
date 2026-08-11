@@ -5,8 +5,7 @@
 # generated from PyNTT Jinja TensorStore.py.jinja
 # {{ model["Comment"] }}; dtype={{ model["DType"] }}, local_shape={{ shape_tuple(ctx["local_shape"]) }}, global_shape={{ shape_tuple(ctx["global_shape"]) }}
 {{ phases.consumer_header(model, args) }}
-    shard_index = tl.program_id(0).to(tl.int64)
-{{ common.shard_coordinates(([model["Source"], ctx["internal_destination"]] if ctx["internal_destination"] is not none else [model["Source"]])) }}
+{{ common.mesh_coordinates(model["MeshAxes"]) }}
     source = {{ ptr(model, "Source") }}
 {% if ctx["internal_destination"] is not none %}
     destination = {{ ptr(model, "Destination") }}

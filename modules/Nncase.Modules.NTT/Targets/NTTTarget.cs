@@ -153,4 +153,12 @@ public abstract class NTTTarget : Target
             p.Add<Passes.Rules.NTT.FoldBinaryPostOps>();
         });
     }
+
+    public override void RegisterPostAutoDistributedPass(IPassManager passManager, CompileOptions options)
+    {
+        passManager.AddWithName<DataflowPass>("FusePackedMatMulPostOps").Configure(p =>
+        {
+            p.Add<Passes.Rules.NTT.FusePackedMatMulAdd>();
+        });
+    }
 }

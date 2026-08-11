@@ -72,9 +72,17 @@ public partial class NTT
         Expr loadC,
         Expr scale,
         bool fusedReduce = false,
-        IR.NTT.PackedMatMulRhsLayout rhsLayout = IR.NTT.PackedMatMulRhsLayout.NMajor)
+        IR.NTT.PackedMatMulRhsLayout rhsLayout = IR.NTT.PackedMatMulRhsLayout.NMajor,
+        Expr? addend = null)
     {
-        return KernelCall(new PackedMatMul(fusedReduce, rhsLayout), lhs, rhs, output, loadC, scale);
+        return KernelCall(
+            new PackedMatMul(fusedReduce, rhsLayout),
+            lhs,
+            rhs,
+            output,
+            loadC,
+            scale,
+            addend ?? None.Default);
     }
 
     public static Call QKVParallelLinear(

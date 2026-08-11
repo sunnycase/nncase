@@ -194,6 +194,14 @@ public interface ITarget
     {
     }
 
+    /// <summary>
+    /// Register target-specific high-level IR passes that run after
+    /// AutoDistributed and before TIR selection.
+    /// </summary>
+    void RegisterPostAutoDistributedPass(IPassManager passManager, CompileOptions options)
+    {
+    }
+
     void RegisterTIRSelectionPass(IPassManager passManager, CompileOptions options);
 
     /// <summary>

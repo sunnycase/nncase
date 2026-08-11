@@ -5,18 +5,12 @@
 # generated from PyNTT Jinja Gather.py.jinja
 # {{ model["Comment"] }}; input_dtype={{ model["InputDType"] }}, index_dtype={{ model["IndexDType"] }}, output_dtype={{ model["OutputDType"] }}, input_shape={{ shape_tuple(model["InputShape"]) }}, output_shape={{ shape_tuple(model["OutputShape"]) }}, axis={{ model["Axis"] }}
 {{ phases.consumer_header(model) }}
-    shard_index = tl.program_id(0).to(tl.int64)
-{{ common.shard_coordinates([model["Input"], model["Index"], model["Output"]]) }}
+{{ common.mesh_coordinates(model["MeshAxes"]) }}
 {% for name, key in (("input", "Input"), ("index", "Index"), ("output", "Output")) %}
     {{ name }} = {{ ptr(model, key) }}
 {% endfor %}
-    tmp_shard = shard_index
-{% for axis in reverse_indices(model["Hierarchy"]) %}
-    shard_coord{{ axis }} = tmp_shard % {{ model["Hierarchy"][axis] }}
-    tmp_shard = tmp_shard // {{ model["Hierarchy"][axis] }}
-{% endfor %}
 {% call(indent) elementwise.iterate(ctx) %}
-{{ indent }}gather_index = tl.load({{ access_pointer(model, "Index", "index", ctx["index_access"]) }}, mask=mask, other=0)
+{{ indent }}gather_index = tl.load({{ access_pointer(model, "Index", "index", ctx["index_access"]) }}, mask={{ access_boundary_mask(ctx["index_access"]) }}, other=0)
 {% if ctx["signed_index"] %}
 {{ indent }}gather_index = tl.where(gather_index < 0, gather_index + {{ dim(model["InputGlobalShape"][model["Axis"]]) }}, gather_index)
 {% endif %}

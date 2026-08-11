@@ -1,9 +1,4 @@
 {% import "triton/kernels/_elementwise.py.jinja" as elementwise with context %}
-    tmp_shard = shard_index
-{% for axis in reverse_indices(model["Hierarchy"]) %}
-    shard_coord{{ axis }} = tmp_shard % {{ model["Hierarchy"][axis] }}
-    tmp_shard = tmp_shard // {{ model["Hierarchy"][axis] }}
-{% endfor %}
 {% call(indent) elementwise.iterate(ctx) %}
 {% for axis in range(ctx["global_shape"] | length) %}
 {{ indent }}mask = mask & ({{ ctx["global_coordinates"][axis] }} < {{ dim(ctx["global_shape"][axis]) }})

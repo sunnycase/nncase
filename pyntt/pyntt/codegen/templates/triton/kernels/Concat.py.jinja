@@ -4,8 +4,7 @@
 # generated from PyNTT Jinja Concat.py.jinja
 # {{ model["Comment"] }}; dtype={{ model["OutputDType"] }}, axis={{ model["Axis"] }}, output_shape={{ shape_tuple(model["OutputShape"]) }}
 {{ phases.consumer_header(model) }}
-    shard_index = tl.program_id(0).to(tl.int64)
-{{ common.shard_coordinates(ctx["pointer_values"]) }}
+{{ common.mesh_coordinates(model["MeshAxes"]) }}
 {% for entry in ctx["entries"] %}
     input{{ entry["index"] }} = {{ entry["input_expression"] }}
 {% endfor %}

@@ -5,8 +5,7 @@
 # generated from PyNTT Jinja RoPE.py.jinja
 # {{ model["Comment"] }}; input_dtype={{ model["InputDType"] }}, cos_dtype={{ model["CosDType"] }}, sin_dtype={{ model["SinDType"] }}, output_dtype={{ model["OutputDType"] }}, shape={{ shape_tuple(model["OutputShape"]) }}, rotary_axis={{ ctx["rotary_axis"] }}
 {{ phases.consumer_header(model) }}
-    shard_index = tl.program_id(0).to(tl.int64)
-{{ common.shard_coordinates([model["Input"], model["Cos"], model["Sin"], model["Output"]]) }}
+{{ common.mesh_coordinates(model["MeshAxes"]) }}
 {% for name, key in (("input0", "Input"), ("cos0", "Cos"), ("sin0", "Sin"), ("output", "Output")) %}
     {{ name }} = {{ ptr(model, key) }}
 {% endfor %}

@@ -4,8 +4,7 @@
 # generated from PyNTT Jinja PagedAttentionMerge.py.jinja
 # {{ model["Comment"] }}; output_dtype={{ model["OutputDType"] }}, output_shape={{ shape_tuple(model["OutputShape"]) }}, split_axis={{ model["SplitHierarchyAxis"] }}, split_count={{ model["SplitCount"] }}
 {{ phases.consumer_header(model) }}
-    shard_index = tl.program_id(0).to(tl.int64)
-{{ common.hierarchy_coordinates(model["Hierarchy"]) }}
+{{ common.mesh_coordinates(model["MeshAxes"]) }}
 {% for name, key in (("max_state", "MaxState"), ("sum_state", "SumState"), ("acc_state", "AccState"), ("output", "Output")) %}
     {{ name }} = {{ ptr(model, key) }}
 {% endfor %}

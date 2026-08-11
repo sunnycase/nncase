@@ -2,19 +2,16 @@
 {% import "triton/kernels/_producer_consumer.py.jinja" as phases with context %}
 {% set ctx = matmul_context(model, gemv=false) %}
 # generated from PyNTT algorithm triton.matmul/mma
-# {{ model["Comment"] }}; lhs_dtype={{ model["LhsDType"] }}, rhs_dtype={{ model["RhsDType"] }}, output_dtype={{ model["OutputDType"] }}, lhs_shape={{ shape_tuple(model["LhsShape"]) }}, rhs_shape={{ shape_tuple(model["RhsShape"]) }}, output_shape={{ shape_tuple(model["OutputShape"]) }}, rhs_layout={{ ctx["rhs_layout"] }}, rhs_n_packed_lane={{ model.get("RhsNPackedLaneCount", 1) }}, rhs_n_lane={{ model["RhsNVectorLaneCount"] }}, rhs_k_pack={{ model.get("RhsKPackLaneCount", 1) }}, rhs_k_lane={{ model.get("RhsKVectorLaneCount", 1) }}, output_n_packed_lane={{ model.get("OutputNPackedLaneCount", 1) }}, output_n_lane={{ model["OutputNVectorLaneCount"] }}, load_c={{ ctx["load_c_expression"] }}
+# {{ model["Comment"] }}; lhs_dtype={{ model["LhsDType"] }}, rhs_dtype={{ model["RhsDType"] }}, output_dtype={{ model["OutputDType"] }}, lhs_shape={{ shape_tuple(model["LhsShape"]) }}, rhs_shape={{ shape_tuple(model["RhsShape"]) }}, output_shape={{ shape_tuple(model["OutputShape"]) }}, rhs_layout={{ ctx["rhs_layout"] }}, rhs_n_packed_lane={{ model.get("RhsNPackedLaneCount", 1) }}, rhs_n_lane={{ model["RhsNVectorLaneCount"] }}, rhs_k_pack={{ model.get("RhsKPackLaneCount", 1) }}, rhs_k_lane={{ model.get("RhsKVectorLaneCount", 1) }}, output_n_packed_lane={{ model.get("OutputNPackedLaneCount", 1) }}, output_n_lane={{ model["OutputNVectorLaneCount"] }}, load_c={{ ctx["load_c_expression"] }}, has_addend={{ model["HasAddend"] }}
 {{ phases.consumer_header(model) }}
-    shard_index = tl.program_id(0).to(tl.int64)
+{{ common.mesh_coordinates(model["MeshAxes"]) }}
 {{ common.matrix_shared_aliases(ctx, model["LhsTritonDType"], model["RhsTritonDType"], [ctx["block_m"], ctx["block_k"]], [ctx["block_k"], ctx["block_n"]], true) }}
-{{ common.shard_coordinates([model["Lhs"], model["Rhs"], model["Output"]]) }}
 {% for name, key in (("lhs", "Lhs"), ("rhs", "Rhs"), ("output", "Output")) %}
     {{ name }} = {{ ptr(model, key) }}
 {% endfor %}
-    tmp_shard = shard_index
-{% for axis in reverse_indices(model["Hierarchy"]) %}
-    shard_coord{{ axis }} = tmp_shard % {{ model["Hierarchy"][axis] }}
-    tmp_shard = tmp_shard // {{ model["Hierarchy"][axis] }}
-{% endfor %}
+{% if model["HasAddend"] %}
+    addend = {{ ptr(model, "Addend") }}
+{% endif %}
 {% for axis in ctx["batch_axes"] %}
 {{ "    " * loop.index }}for idx{{ axis }} in tl.range(0, {{ dim(ctx["logical_output_shape"][axis]) }}):
 {% endfor %}
@@ -36,8 +33,16 @@
 {% if ctx["load_c_predicate"] == "True" %}
 {{ base }}        result = previous + result
 {% else %}
-{{ base }}        result = tl.where({{ ctx["load_c_predicate"] }}, previous + result, result)
+{% if model["HasAddend"] %}
+{{ base }}        addend_value = tl.reshape(tl.load({{ access_pointer(model, "Addend", "addend", ctx["addend_access"]) }}, mask=({{ ctx["output_mask"] }}) & ~({{ ctx["load_c_predicate"] }}), other=0.0), ({{ ctx["block_m"] }}, {{ ctx["block_n"] }})).to(tl.float32)
+{% else %}
+{{ base }}        addend_value = tl.zeros(({{ ctx["block_m"] }}, {{ ctx["block_n"] }}), tl.float32)
 {% endif %}
+{{ base }}        result = tl.where({{ ctx["load_c_predicate"] }}, previous, addend_value) + result
+{% endif %}
+{% elif model["HasAddend"] %}
+{{ base }}        addend_value = tl.reshape(tl.load({{ access_pointer(model, "Addend", "addend", ctx["addend_access"]) }}, mask={{ ctx["output_mask"] }}, other=0.0), ({{ ctx["block_m"] }}, {{ ctx["block_n"] }})).to(tl.float32)
+{{ base }}        result = addend_value + result
 {% endif %}
 {{ base }}        tl.store({{ access_pointer(model, "Output", "output", ctx["output_access"]) }}, tl.reshape(result, {{ ctx["output_structured_shape"] }}), mask={{ ctx["output_mask"] }})
 

@@ -4,6 +4,7 @@
 using NetFabric.Hyperlinq;
 using Nncase.IR;
 using Nncase.IR.Affine;
+using Nncase.IR.Affine.Builders;
 using Nncase.TIR;
 using Nncase.TIR.NTT;
 using Nncase.Utilities;
@@ -16,7 +17,12 @@ public partial class NTTAffineSelectionPass
     {
         var lhs = (Expr)call.Arguments[IR.Math.MatMul.Lhs.Index];
         var rhs = (Expr)call.Arguments[IR.Math.MatMul.Rhs.Index];
-        var scale = (Expr)call.Arguments[IR.Math.MatMul.Scale.Index];
+        var scale = op is IR.NTT.PackedMatMul
+            ? (Expr)call[IR.NTT.PackedMatMul.Scale]
+            : (Expr)call[IR.Math.MatMul.Scale];
+        var addend = op is IR.NTT.PackedMatMul
+            ? (Expr)call[IR.NTT.PackedMatMul.Addend]
+            : None.Default;
         bool reduceSum = false;
 
         // TODO: summa not support tiling for now.
@@ -204,16 +210,24 @@ public partial class NTTAffineSelectionPass
         var outMap = new AffineMap(domains, default, domains.SkipLast(3).Concat([domains[om], domains[on]]).Select(x => new AffineRange(x.Offset, x.Extent)).ToArray());
         var tileAxisPolicies = Enumerable.Repeat(GridTileAxisPolicy.Search(), rank).ToArray();
         tileAxisPolicies[ok] = GridTileAxisPolicy.Reduction();
-        return IR.F.Affine.Grid()
+        IGridBuilder builder = IR.F.Affine.Grid()
             .Domain(tileAxisPolicies, out var domainVar)
             .Read(lhs, lhsMap, out var lhsTile)
-            .Read(rhs, rhsMap, out var rhsTile)
+            .Read(rhs, rhsMap, out var rhsTile);
+        Expr addendTile = None.Default;
+        if (addend is not None)
+        {
+            builder.Read(addend, outMap, out var tile);
+            addendTile = tile;
+        }
+
+        return builder
             .Write(output, outMap, out var outTile)
             .Body(op switch
             {
                 IR.Math.MatMul => TIR.F.NTT.Matmul(lhsTile, rhsTile, outTile, IR.F.Math.NotEqual(domainVar[ok][0], 0L), scale),
                 IR.NTT.VectorizedMatMul pop => TIR.F.NTT.Matmul(lhsTile, rhsTile, outTile, IR.F.Math.NotEqual(domainVar[ok][0], 0L), scale, None.Default, pop.LhsVectorizedAxes, pop.RhsVectorizedAxes, pop.TransposeA, pop.TransposeB, pop.FusedReduce),
-                IR.NTT.PackedMatMul pop => TIR.F.NTT.PackedMatMul(lhsTile, rhsTile, outTile, IR.F.Math.NotEqual(domainVar[ok][0], 0L), scale, pop.FusedReduce, pop.RhsLayout),
+                IR.NTT.PackedMatMul pop => TIR.F.NTT.PackedMatMul(lhsTile, rhsTile, outTile, IR.F.Math.NotEqual(domainVar[ok][0], 0L), scale, pop.FusedReduce, pop.RhsLayout, addendTile),
                 _ => throw new System.Diagnostics.UnreachableException(),
             }).Build();
     }

@@ -5,15 +5,14 @@
 # generated from PyNTT Jinja ElementwiseUnary.py.jinja
 # {{ model["Comment"] }}; op={{ model["Op"] }}, input_dtype={{ model["InputDType"] }}, output_dtype={{ model["OutputDType"] }}, shape={{ shape_tuple(model["Shape"]) }}
 {{ phases.consumer_header(model) }}
-    shard_index = tl.program_id(0).to(tl.int64)
-{{ common.shard_coordinates([model["Input"], model["Output"]]) }}
+{{ common.mesh_coordinates(model["MeshAxes"]) }}
     input0 = {{ ptr(model, "Input") }}
     output = {{ ptr(model, "Output") }}
 {% call(indent) elementwise.iterate(ctx) %}
-{{ indent }}value0 = tl.load({{ access_pointer(model, "Input", "input0", ctx["input_access"]) }}, mask=mask, other=0.0)
+{{ indent }}value0 = tl.load({{ access_pointer(model, "Input", "input0", ctx["input_access"]) }}, mask={{ access_boundary_mask(ctx["input_access"]) }}, other=0.0)
 {{ indent }}value0_f32 = value0.to(tl.float32)
 {{ indent }}result = {{ model["UnaryExpression"] }}
-{{ indent }}tl.store({{ access_pointer(model, "Output", "output", ctx["output_access"]) }}, {{ "(result).to(tl.uint8)" if is_bool_dtype(model["OutputDType"]) else "result" }}, mask=mask)
+{{ indent }}tl.store({{ access_pointer(model, "Output", "output", ctx["output_access"]) }}, {{ "(result).to(tl.uint8)" if is_bool_dtype(model["OutputDType"]) else "result" }}, mask={{ access_boundary_mask(ctx["output_access"]) }})
 {% endcall %}
 
 

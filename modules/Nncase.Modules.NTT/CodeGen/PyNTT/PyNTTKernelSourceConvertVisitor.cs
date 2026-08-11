@@ -1143,7 +1143,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                             BuildHelperRoleCall(
                                 state.DirectHelperName,
                                 "producer",
-                                state.WriterName,
+                                state.PipeStages.Select(stage => stage.WriterName),
                                 recordMetadata: false));
                         break;
                     }
@@ -1448,8 +1448,11 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 microKernel = BuildMicroKernelTemplateModel(expr, kernelOp, sharedWorkspace);
             }
 
+            var materializeTensorParameters = expr.Target is Nncase.TIR.NTT.NTTKernelOp and
+                not Nncase.TIR.NTT.TensorLoad and
+                not Nncase.TIR.NTT.TensorStore;
             var args = sourceArguments
-                .Select((arg, index) => ResolveCallArgument(arg, index))
+                .Select((arg, index) => ResolveCallArgument(arg, index, materializeTensorParameters))
                 .ToArray();
             switch (expr.Target)
             {
@@ -1598,6 +1601,11 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     throw new NotSupportedException($"Unsupported PyNTT PrimFunction call target: {expr.Target.GetType().Name}.");
             }
 
+            if (expr.Target is Nncase.TIR.NTT.NTTKernelOp materializedKernelOp)
+            {
+                TrackMaterializedKernelOutputs(materializedKernelOp, args);
+            }
+
             return default;
         }
 
@@ -1650,12 +1658,19 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                         localOffset.ToString(CultureInfo.InvariantCulture)));
             }
 
+            var transferChannels = selection.TransferPipeline?.Channels
+                .Select(channel => new PyNTTTransferPipelineChannelTemplateModel(
+                    channel.Name,
+                    channel.SharedWorkspaceIndices
+                        .Select(index => selection.SharedWorkspaces[index].Name)
+                        .ToArray()))
+                .ToArray() ?? Array.Empty<PyNTTTransferPipelineChannelTemplateModel>();
             return new(
                 selection.Family,
                 selection.Variant,
                 selection.Parameters,
                 offsets,
-                selection.TransferPipeline is not null);
+                transferChannels);
         }
 
         private long GetFixedSharedWorkspaceOffsetBytes(
@@ -2812,7 +2827,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 MemoryLocation.BlockLocalData => GetBlockLocalDataBaseName(buffer),
                 var location => throw new NotSupportedException($"PyNTT workspace buffer {buffer.Name} cannot use memory location {location}."),
             };
-            return BuildPointerExpression(new BufferRef(baseName, offsetBytes, "0", null, null, true), "tl.uint8");
+            return BuildPointerExpression(new BufferRef(baseName, offsetBytes, "0", null, true), "tl.uint8");
         }
 
         private static BaseExpr NormalizeParameterAlias(IVar parameter, BaseExpr alias)
@@ -4606,7 +4621,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 throw new NotSupportedException("PyNTT PackedMatMul codegen does not support fused reduce yet.");
             }
 
-            if (args.Count < 5 ||
+            if (args.Count < 6 ||
                 args[0] is not TIR.Buffer lhs ||
                 args[1] is not TIR.Buffer rhs ||
                 args[2] is not TIR.Buffer output)
@@ -4615,6 +4630,13 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             }
 
             var loadCExpression = GetScalarBoolExpression(args[3], "PyNTT PackedMatMul loadC");
+            var addend = args[5] switch
+            {
+                TIR.Buffer buffer => buffer,
+                None => null,
+                _ => throw new NotSupportedException(
+                    "PyNTT PackedMatMul addend must be a TIR buffer or None."),
+            };
 
             SetComputeOp("matmul");
             var lhsShape = GetBufferActiveShape(lhs);
@@ -4623,6 +4645,20 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             ValidateMinimumRank("PyNTT PackedMatMul lhs", lhsShape, 2);
             ValidateMinimumRank("PyNTT PackedMatMul rhs", rhsShape, 2);
             ValidateMinimumRank("PyNTT PackedMatMul output", outputShape, 2);
+            PyNTTDimExpression[] addendShape = Array.Empty<PyNTTDimExpression>();
+            if (addend is not null)
+            {
+                addendShape = GetBufferActiveShape(addend);
+                if (!Equals(addend.ElemType, output.ElemType) ||
+                    addendShape.Length != outputShape.Length ||
+                    !addendShape.Zip(outputShape).All(pair => SameDim(pair.First, pair.Second)))
+                {
+                    throw new NotSupportedException(
+                        "PyNTT PackedMatMul addend must have the same element type and active shape as output, " +
+                        $"got addend={addend.ElemType}[{ShapeText(addendShape)}], " +
+                        $"output={output.ElemType}[{ShapeText(outputShape)}].");
+                }
+            }
 
             var lhsVectorLanes = GetVectorLanes(lhs.ElemType);
             var rhsVectorLanes = GetVectorLanes(rhs.ElemType);
@@ -4705,6 +4741,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             _attrs["k_pack_lane"] = kPackedLaneCount;
             _attrs["k_lane"] = kVectorLaneCount;
             _attrs["scale"] = scale;
+            _attrs["has_addend"] = addend is not null;
             var useGemv = IsGemvMatmul(outputShape);
             if (useGemv)
             {
@@ -4755,6 +4792,11 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 RhsKPackLaneCount = kPackedLaneCount,
                 RhsKVectorLaneCount = kVectorLaneCount,
                 LoadCExpression = loadCExpression,
+                Addend = addend is null ? null : GetBufferScalarPointer(addend),
+                AddendShape = addendShape,
+                AddendStrides = addend is null
+                    ? Array.Empty<PyNTTDimExpression>()
+                    : GetBufferStrides(addend),
             };
 
             WriteSelectedMicroKernelHelper(
@@ -5980,12 +6022,13 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 helperName,
                 templatePath,
                 templateModel,
+                microKernel.TransferPipelineChannels,
                 microKernel.SharedWorkspaceOffsets);
             WriteLine(
                 BuildHelperRoleCall(
                     helperName,
                     "consumer",
-                    stage.ReaderName,
+                    stage.PipeStages.Select(pipeStage => pipeStage.ReaderName),
                     recordMetadata: true));
         }
 
@@ -6002,6 +6045,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 ("triton.matmul_glu", "simt_fma_smem_pipeline") => "triton/kernels/matmul_glu/simt_fma_smem_pipeline.py.jinja",
                 ("triton.matmul_glu", "mma") => "triton/kernels/matmul_glu/mma.py.jinja",
                 ("triton.paged_attention_partial", "mma_direct") => "triton/kernels/paged_attention/mma_direct.py.jinja",
+                ("triton.paged_attention_partial", "simt_direct") => "triton/kernels/paged_attention/simt_direct.py.jinja",
                 ("triton.paged_attention_partial", "mma_tma_smem_pipeline") => "triton/kernels/paged_attention/mma_tma_smem_pipeline.py.jinja",
                 ("triton.paged_attention_partial", "simt_tma_smem_pipeline") => "triton/kernels/paged_attention/simt_tma_smem_pipeline.py.jinja",
                 _ => throw new NotSupportedException(
@@ -7084,15 +7128,39 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             };
         }
 
-        private BaseExpr ResolveCallArgument(BaseExpr expr, int index)
+        private BaseExpr ResolveCallArgument(BaseExpr expr, int index, bool materializeTensorParameters)
         {
             try
             {
-                return ResolveBoundExpression(expr);
+                var resolved = ResolveBoundExpression(expr);
+                return materializeTensorParameters &&
+                    resolved is BufferVar { Role: not BufferVarRole.Workspace } bufferVar &&
+                    !IsObjectDataType(bufferVar.CheckedDataType)
+                    ? GetAbiBuffer(bufferVar, $"PyNTT call argument {index}")
+                    : resolved;
             }
             catch (Exception ex) when (ex is NotSupportedException or InvalidOperationException)
             {
                 throw new NotSupportedException($"PyNTT failed to resolve call argument {index}: {ex.Message}", ex);
+            }
+        }
+
+        private void TrackMaterializedKernelOutputs(
+            Nncase.TIR.NTT.NTTKernelOp kernelOp,
+            IReadOnlyList<BaseExpr> arguments)
+        {
+            for (var index = 0; index < arguments.Count; index++)
+            {
+                var effect = kernelOp.GetMemoryEffect(kernelOp.Parameters[index]);
+                if (!MemoryEffectUtility.GetPhysicalBufferAccessMode(effect).HasFlag(MemoryAccessMode.Write) ||
+                    arguments[index] is not TIR.Buffer buffer)
+                {
+                    continue;
+                }
+
+                MarkStoredOutput(
+                    buffer,
+                    $"PyNTT {kernelOp.GetType().Name} operand {kernelOp.Parameters[index].Name}");
             }
         }
 
@@ -7808,8 +7876,14 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             var config = GetPagedAttentionConfig(expr, context);
             ValidatePagedAttentionConfig(config, context);
 
-            var key = GetPagedAttentionCacheKindLayout(config, AttentionCacheKind.Key, context);
-            var value = GetPagedAttentionCacheKindLayout(config, AttentionCacheKind.Value, context);
+            var key = PagedAttentionCacheLayoutUtility.Analyze(
+                config,
+                AttentionCacheKind.Key,
+                context);
+            var value = PagedAttentionCacheLayoutUtility.Analyze(
+                config,
+                AttentionCacheKind.Value,
+                context);
             var topologyShape = GetPagedAttentionTopologyShape(config);
             var numBlocksSplitAxes = GetPagedAttentionNumBlocksSplitAxes(config);
             var valueSectionOffset = key.SectionElements;
@@ -7823,8 +7897,8 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 config.BlockSize,
                 key.LaneCount,
                 value.LaneCount,
-                (int)key.VectorizedDim,
-                (int)value.VectorizedDim,
+                key.VectorizedDim is { } keyVectorizedDim ? (int)keyVectorizedDim : -1,
+                value.VectorizedDim is { } valueVectorizedDim ? (int)valueVectorizedDim : -1,
                 key.HeadDimBlocks,
                 value.HeadDimBlocks,
                 0,
@@ -7867,127 +7941,6 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             }
 
             throw new NotSupportedException($"{context} expects Reference<PagedAttentionKVCacheType>, got {dataType}.");
-        }
-
-        private sealed record PagedAttentionCacheKindLayout(
-            int LaneCount,
-            PagedKVCacheDimKind VectorizedDim,
-            int HeadDimBlocks,
-            int[] TailShape,
-            int SectionElements,
-            int LayerStride,
-            int HeadStride,
-            int DimBlockStride,
-            int BlockOffsetStride);
-
-        private static PagedAttentionCacheKindLayout GetPagedAttentionCacheKindLayout(IPagedAttentionConfig config, AttentionCacheKind kind, string context)
-        {
-            var vectorizedAxes = config.GetVectorizedAxes(kind).ToArray();
-            var lanes = config.GetLanes(kind).ToArray();
-            int laneCount;
-            PagedKVCacheDimKind vectorizedDim;
-            if (vectorizedAxes.Length == 0 && lanes.Length == 0)
-            {
-                laneCount = 1;
-                vectorizedDim = (PagedKVCacheDimKind)(-1);
-            }
-            else if (vectorizedAxes.Length == 1 && lanes.Length == 1 &&
-                vectorizedAxes[0] is PagedKVCacheDimKind.HeadDim or PagedKVCacheDimKind.BlockSize)
-            {
-                laneCount = checked((int)lanes[0]);
-                vectorizedDim = vectorizedAxes[0];
-            }
-            else
-            {
-                throw new NotSupportedException($"{context} currently supports only {kind} HeadDim or BlockSize vectorization with zero or one lane value.");
-            }
-
-            if (laneCount <= 0)
-            {
-                throw new NotSupportedException($"{context} requires {kind} lane to be positive, got {laneCount}.");
-            }
-
-            if (vectorizedDim == PagedKVCacheDimKind.HeadDim && config.HeadDim % laneCount != 0)
-            {
-                throw new NotSupportedException($"{context} requires {kind} head_dim divisible by lane, got head_dim={config.HeadDim}, lane={laneCount}.");
-            }
-
-            if (vectorizedDim == PagedKVCacheDimKind.BlockSize && config.BlockSize % laneCount != 0)
-            {
-                throw new NotSupportedException($"{context} requires {kind} block_size divisible by lane, got block_size={config.BlockSize}, lane={laneCount}.");
-            }
-
-            var headDimBlocks = vectorizedDim == PagedKVCacheDimKind.HeadDim
-                ? checked(config.HeadDim / laneCount)
-                : config.HeadDim;
-            var tailDims = new List<int>();
-            var tailDimKinds = new List<PagedKVCacheDimKind>();
-            foreach (var dimKind in config.GetCacheLayout(kind))
-            {
-                if (dimKind is PagedKVCacheDimKind.NumBlocks or PagedKVCacheDimKind.KV)
-                {
-                    continue;
-                }
-
-                tailDimKinds.Add(dimKind);
-                var dimExtent = dimKind switch
-                {
-                    PagedKVCacheDimKind.NumLayers => checked((int)config.NumLayers),
-                    PagedKVCacheDimKind.BlockSize => checked((int)config.BlockSize),
-                    PagedKVCacheDimKind.NumKVHeads => checked((int)config.NumKVHeads),
-                    PagedKVCacheDimKind.HeadDim => checked((int)config.HeadDim),
-                    _ => throw new NotSupportedException($"{context} does not support {kind} cache dimension {dimKind}."),
-                };
-                if (dimKind == vectorizedDim)
-                {
-                    dimExtent = checked(dimExtent / laneCount);
-                }
-
-                tailDims.Add(dimExtent);
-            }
-
-            if (tailDims.Count != 4)
-            {
-                throw new NotSupportedException($"{context} expects {kind} cache layout to contain exactly NumLayers, NumKVHeads, HeadDim, and BlockSize after removing NumBlocks/KV.");
-            }
-
-            var strides = ComputeContiguousStrides(tailDims);
-            int GetStride(PagedKVCacheDimKind dimKind)
-            {
-                var index = tailDimKinds.IndexOf(dimKind);
-                if (index < 0)
-                {
-                    throw new NotSupportedException($"{context} {kind} cache layout is missing {dimKind}.");
-                }
-
-                return strides[index];
-            }
-
-            var sectionVectorElements = checked(tailDims.Aggregate(1, static (acc, dim) => checked(acc * dim)));
-            var sectionElements = checked(sectionVectorElements * laneCount);
-            return new(
-                laneCount,
-                vectorizedDim,
-                headDimBlocks,
-                tailDims.ToArray(),
-                sectionElements,
-                GetStride(PagedKVCacheDimKind.NumLayers),
-                GetStride(PagedKVCacheDimKind.NumKVHeads),
-                GetStride(PagedKVCacheDimKind.HeadDim),
-                GetStride(PagedKVCacheDimKind.BlockSize));
-        }
-
-        private static int[] ComputeContiguousStrides(IReadOnlyList<int> shape)
-        {
-            var strides = new int[shape.Count];
-            var stride = 1;
-            for (int i = shape.Count - 1; i >= 0; i--)
-            {
-                strides[i] = stride;
-                stride = checked(stride * shape[i]);
-            }
-
-            return strides;
         }
 
         private PyNTTKVCacheStorageMetadata GetKVCacheStorageMetadata(PyNTTPagedAttentionCacheTemplateModel cache)
@@ -8097,10 +8050,14 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
 
         private void ValidatePagedAttentionConfig(IPagedAttentionConfig config, string context)
         {
-            ValidatePagedAttentionLayout(config.KeyCacheLayout, AttentionCacheKind.Key, context);
-            ValidatePagedAttentionLayout(config.ValueCacheLayout, AttentionCacheKind.Value, context);
-            _ = GetPagedAttentionCacheKindLayout(config, AttentionCacheKind.Key, context);
-            _ = GetPagedAttentionCacheKindLayout(config, AttentionCacheKind.Value, context);
+            _ = PagedAttentionCacheLayoutUtility.Analyze(
+                config,
+                AttentionCacheKind.Key,
+                context);
+            _ = PagedAttentionCacheLayoutUtility.Analyze(
+                config,
+                AttentionCacheKind.Value,
+                context);
 
             if (config.ShardingAxes.Count > 1 ||
                 (config.ShardingAxes.Count == 1 && config.ShardingAxes[0] != PagedKVCacheDimKind.NumBlocks))
@@ -8124,21 +8081,6 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                         throw new NotSupportedException($"{context} NumBlocks sharding axis {axis} is outside PyNTT hierarchy rank {hierarchy.Length}.");
                     }
                 }
-            }
-        }
-
-        private static void ValidatePagedAttentionLayout(IRArray<PagedKVCacheDimKind> layout, AttentionCacheKind kind, string context)
-        {
-            if (layout.Count != 6)
-            {
-                throw new NotSupportedException($"{context} {kind} cache layout must have 6 dimensions, got {layout.Count}.");
-            }
-
-            var expected = Enum.GetValues<PagedKVCacheDimKind>().OrderBy(x => (int)x).ToArray();
-            var actual = layout.ToArray().OrderBy(x => (int)x).ToArray();
-            if (!actual.SequenceEqual(expected))
-            {
-                throw new NotSupportedException($"{context} {kind} cache layout must be a permutation of [{string.Join(", ", expected)}], got [{string.Join(", ", layout)}].");
             }
         }
 
@@ -8170,7 +8112,6 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             var bufferRef = ResolveBufferRef(buffer);
             return new(
                 BuildPointerExpression(bufferRef, GetTritonDType(buffer.ElemType)),
-                bufferRef.ShardCoordHierarchy,
                 bufferRef.AddressSpace);
         }
 
@@ -8471,7 +8412,6 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             var bufferRef = ResolveBufferRef(buffer);
             return new(
                 BuildPointerExpression(bufferRef, GetScalarTritonDType(buffer.ElemType)),
-                bufferRef.ShardCoordHierarchy,
                 bufferRef.AddressSpace);
         }
 
@@ -8480,7 +8420,6 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             var bufferRef = ResolveBufferRef(buffer) with { IndexExpression = indexExpression };
             return new(
                 BuildPointerExpression(bufferRef, GetScalarTritonDType(buffer.ElemType)),
-                bufferRef.ShardCoordHierarchy,
                 bufferRef.AddressSpace);
         }
 
@@ -8488,7 +8427,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
         {
             var bufferRef = ResolveBufferRef(buffer);
             var pointer = BuildPointerExpression(bufferRef, GetScalarTritonDType(buffer.ElemType));
-            return new(pointer, bufferRef.ShardCoordHierarchy, bufferRef.AddressSpace);
+            return new(pointer, bufferRef.AddressSpace);
         }
 
         private string BuildFormalTensorBasePointerArgument(TIR.Buffer buffer)
@@ -8539,9 +8478,6 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             }
 
             var offsetBytes = GetBufferOffsetBytes(buffer);
-            var shardCoordHierarchy = RequiresShardCoords(offsetBytes)
-                ? GetShardCoordHierarchy(buffer)
-                : null;
             if (buffer.MemSpan.Buffer.Location is MemoryLocation.Shared or MemoryLocation.Register)
             {
                 throw CreateScheduledTirException(
@@ -8551,13 +8487,13 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
 
             return buffer.MemSpan.Buffer.Location switch
             {
-                MemoryLocation.Data when buffer.DistributedType is null => new(GetDataBaseName(buffer), offsetBytes, "0", null, shardCoordHierarchy, true),
-                MemoryLocation.Data => new(GetDataBaseName(buffer), offsetBytes, "data_pool_stride_bytes", "shard_index", shardCoordHierarchy, true),
-                MemoryLocation.ChipLocalData => new(GetChipLocalDataBaseName(buffer), offsetBytes, "0", null, shardCoordHierarchy, true),
-                MemoryLocation.BlockLocalData => CreateBlockLocalBufferRef(buffer, offsetBytes, shardCoordHierarchy),
-                MemoryLocation.Rdata => new("rdata", offsetBytes, "0", null, shardCoordHierarchy, true),
-                MemoryLocation.ChipLocalRdata => new("chip_local_rdata", offsetBytes, "0", null, shardCoordHierarchy, true),
-                MemoryLocation.BlockLocalRdata => new("block_local_rdata", offsetBytes, PyNTTRDataUtility.GetLocalRDataTableStrideBytes(_currentFunction.SchedResult.BlockLocalRdatas, _targetOptions, "b").ToString(CultureInfo.InvariantCulture), "shard_index", shardCoordHierarchy, true),
+                MemoryLocation.Data when buffer.DistributedType is null => new(GetDataBaseName(buffer), offsetBytes, "0", null, true),
+                MemoryLocation.Data => new(GetDataBaseName(buffer), offsetBytes, "data_pool_stride_bytes", "shard_index", true),
+                MemoryLocation.ChipLocalData => new(GetChipLocalDataBaseName(buffer), offsetBytes, "0", null, true),
+                MemoryLocation.BlockLocalData => CreateBlockLocalBufferRef(buffer, offsetBytes),
+                MemoryLocation.Rdata => new("rdata", offsetBytes, "0", null, true),
+                MemoryLocation.ChipLocalRdata => new("chip_local_rdata", offsetBytes, "0", null, true),
+                MemoryLocation.BlockLocalRdata => new("block_local_rdata", offsetBytes, PyNTTRDataUtility.GetLocalRDataTableStrideBytes(_currentFunction.SchedResult.BlockLocalRdatas, _targetOptions, "b").ToString(CultureInfo.InvariantCulture), "shard_index", true),
                 var location => throw new NotSupportedException($"PyNTT does not support buffer memory location {location} for Triton template operands yet."),
             };
         }
@@ -8588,7 +8524,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 bufferRef.PoolScopeSize,
                 bufferRef.AddressSpace);
 
-        private BufferRef CreateBlockLocalBufferRef(TIR.Buffer buffer, string offsetBytes, int[]? shardCoordHierarchy)
+        private BufferRef CreateBlockLocalBufferRef(TIR.Buffer buffer, string offsetBytes)
         {
             var poolScopeSize = GetBlockLocalDataScopeSize(_targetOptions);
             return new(
@@ -8596,7 +8532,6 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 offsetBytes,
                 "block_local_data_pool_stride_bytes",
                 BuildScopeIndexExpression("shard_index", poolScopeSize),
-                shardCoordHierarchy,
                 true,
                 poolScopeSize.ToString(CultureInfo.InvariantCulture));
         }
@@ -8624,13 +8559,9 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 ? MultiplyDim(scalarElementOffset, GetScalarElementSizeBytes(source.ElemType))
                 : scalarElementOffset;
             var combinedOffset = AddOffsetExpressions(sourceRef.OffsetBytes, storageOffset.TritonExpression);
-            var shardCoordHierarchy = RequiresShardCoords(combinedOffset)
-                ? sourceRef.ShardCoordHierarchy ?? GetShardCoordHierarchy(source)
-                : null;
             return sourceRef with
             {
                 OffsetBytes = combinedOffset,
-                ShardCoordHierarchy = shardCoordHierarchy,
             };
         }
 
@@ -8652,7 +8583,6 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 GetBufferSpanOffsetElements(buffer),
                 poolStrideName,
                 BuildScopeIndexExpression("shard_index", poolScopeSizeName),
-                null,
                 false,
                 poolScopeSizeName);
         }
@@ -8757,7 +8687,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             var spanHasShardOffset = ContainsShardCoordinate(buffer.MemSpan.Start);
             if (buffer.DistributedType is not { })
             {
-                return new(baseName, spanOffsetElements, "0", null, null, false);
+                return new(baseName, spanOffsetElements, "0", null, false);
             }
 
             var poolStrideElements = $"{baseName}{PoolStrideElementsSuffix}";
@@ -8776,10 +8706,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 offsetElements = AddOffsetExpressions(offsetElements, $"tl.where({poolStrideElements} == 0, {localOffsetElements}, 0)");
             }
 
-            var shardCoordHierarchy = RequiresShardCoords(offsetElements)
-                ? GetShardCoordHierarchy(buffer)
-                : null;
-            return new(baseName, offsetElements, poolStrideElements, "shard_index", shardCoordHierarchy, false);
+            return new(baseName, offsetElements, poolStrideElements, "shard_index", false);
         }
 
         private string BuildPointerExpression(BufferRef bufferRef, string tritonDType)
@@ -8826,7 +8753,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
         private string BuildHelperRoleCall(
             string helperName,
             string role,
-            string endpoint,
+            IEnumerable<string> endpoints,
             bool recordMetadata)
         {
             var (helperArguments, helperWorkspaceArguments, helperScalarArguments) =
@@ -8836,7 +8763,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 _helperCalls.Add(new(helperName, helperArguments));
             }
 
-            var args = new[] { endpoint }
+            var args = endpoints
                 .Concat(helperArguments)
                 .Concat(helperWorkspaceArguments)
                 .Concat(helperScalarArguments)
@@ -9090,16 +9017,10 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             return GetDimensionExpression(expr, name);
         }
 
-        private string GetBufferSpanOffsetBytes(TIR.Buffer buffer)
-        {
-            var spanOffset = GetLocalRegionDimensionExpression(buffer.MemSpan.Start, GetShardCoordHierarchy(buffer));
-            return spanOffset.TritonExpression;
-        }
-
         private string GetBufferSpanOffsetElements(TIR.Buffer buffer)
         {
-            var spanOffset = GetBufferSpanOffsetBytes(buffer);
-            return DivideOffsetExpression(spanOffset, GetScalarElementSizeBytes(buffer.ElemType));
+            var spanOffset = GetLocalRegionDimensionExpression(buffer.MemSpan.Start, GetShardCoordHierarchy(buffer));
+            return FloorDivDim(spanOffset, GetScalarElementSizeBytes(buffer.ElemType)).TritonExpression;
         }
 
         private string GetDistributedCompactLocalOffsetElements(TIR.Buffer buffer)
@@ -9542,19 +9463,10 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 throw new NotSupportedException($"PyNTT local shard coordinate axis {axis} is outside hierarchy rank {hierarchy.Count}.");
             }
 
-            var divisor = 1;
-            for (var i = axis + 1; i < hierarchy.Count; i++)
-            {
-                divisor = checked(divisor * hierarchy[i]);
-            }
-
-            var dividend = divisor == 1
-                ? "shard_index"
-                : $"(shard_index // {divisor.ToString(CultureInfo.InvariantCulture)})";
             var extent = hierarchy[axis];
             return extent == 1
                 ? "0"
-                : $"(({dividend}) % {extent.ToString(CultureInfo.InvariantCulture)})";
+                : $"shard_coord{axis.ToString(CultureInfo.InvariantCulture)}";
         }
 
         private static bool TryGetShardCoordDimAxis(string name, out int axis)
@@ -10167,7 +10079,6 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             string OffsetBytes,
             string PoolStrideBytes,
             string? IndexExpression,
-            int[]? ShardCoordHierarchy,
             bool IsByteAddressed,
             string PoolScopeSize = "1",
             int AddressSpace = 1);
@@ -10299,20 +10210,11 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             {
                 StageId = stageId;
                 StageName = stageName;
-                PipeName = $"{stageName}__pipe";
-                ReaderName = $"{stageName}__reader";
-                WriterName = $"{stageName}__writer";
             }
 
             public string StageId { get; }
 
             public string StageName { get; }
-
-            public string PipeName { get; }
-
-            public string ReaderName { get; }
-
-            public string WriterName { get; }
 
             public string DirectHelperName { get; private set; } = string.Empty;
 
@@ -10349,6 +10251,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 string helperName,
                 string template,
                 object model,
+                IReadOnlyList<PyNTTTransferPipelineChannelTemplateModel> channels,
                 IReadOnlyDictionary<string, string> sharedWorkspaceOffsets)
             {
                 if (IsBound)
@@ -10358,19 +10261,43 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 }
 
                 DirectHelperName = helperName;
-                var pipeStage = new PyNTTPipelineStageTemplateModel(
-                    StageId,
-                    StageName,
-                    helperName,
-                    template,
-                    model,
-                    sharedWorkspaceOffsets,
-                    PipeName,
-                    ReaderName,
-                    WriterName);
-                _pipeStages = new[] { pipeStage };
-                _consumerDrainEndpointNames = new[] { ReaderName };
-                _producerDrainEndpointNames = new[] { WriterName };
+                if (channels.Count == 0)
+                {
+                    throw new InvalidOperationException(
+                        $"Transfer-pipelined helper {helperName} has no transfer channels.");
+                }
+
+                _pipeStages = channels.Select(channel =>
+                {
+                    var channelStageName = channels.Count == 1
+                        ? StageName
+                        : SanitizeBoundedPythonIdentifier($"{StageName}__{channel.Name}");
+                    var channelOffsets = channel.SharedWorkspaceNames.ToDictionary(
+                        name => name,
+                        name => sharedWorkspaceOffsets.TryGetValue(name, out var offset)
+                            ? offset
+                            : throw new InvalidOperationException(
+                                $"Transfer channel {channel.Name} for {helperName} references " +
+                                $"unknown Shared workspace {name}."),
+                        StringComparer.Ordinal);
+                    return new PyNTTPipelineStageTemplateModel(
+                        channels.Count == 1 ? StageId : $"{StageId}/{channel.Name}",
+                        channelStageName,
+                        channel.Name,
+                        helperName,
+                        template,
+                        model,
+                        channelOffsets,
+                        $"{channelStageName}__pipe",
+                        $"{channelStageName}__reader",
+                        $"{channelStageName}__writer");
+                }).ToArray();
+                _consumerDrainEndpointNames = _pipeStages
+                    .Select(stage => stage.ReaderName)
+                    .ToArray();
+                _producerDrainEndpointNames = _pipeStages
+                    .Select(stage => stage.WriterName)
+                    .ToArray();
             }
 
             public void BindPipeline(
@@ -10576,9 +10503,16 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
     {
         if (output.DistributedType is { } distributedType)
         {
+            var placementAxisNames = distributedType.Placement.NormalizedHierarchyNames;
+            if (placementAxisNames.Length != distributedType.Placement.Rank)
+            {
+                throw new InvalidOperationException(
+                    $"PyNTT placement axis names '{placementAxisNames}' must match hierarchy rank {distributedType.Placement.Rank}.");
+            }
+
             return new ShardMetadata(
                 "local_shard",
-                string.IsNullOrWhiteSpace(distributedType.Placement.NormalizedHierarchyNames) ? "b" : distributedType.Placement.NormalizedHierarchyNames,
+                placementAxisNames,
                 GetTensorAxis(distributedType),
                 "grid[0]",
                 distributedType.Placement.Hierarchy.ToArray(),
@@ -10588,7 +10522,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
 
         return new ShardMetadata(
             "local_shard",
-            GetBlockPlacementAxis(targetOptions),
+            GetHierarchyAxisNames(targetOptions),
             0,
             "grid[0]",
             GetBlockHierarchy(targetOptions),
@@ -10609,21 +10543,19 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
         return 0;
     }
 
-    private static string GetBlockPlacementAxis(PyNTTTargetOptions targetOptions)
+    private static string GetHierarchyAxisNames(PyNTTTargetOptions targetOptions)
     {
         var hierarchy = GetBlockHierarchy(targetOptions);
         var hierarchyNames = Placement.NormalizeAxisString(string.IsNullOrWhiteSpace(targetOptions.HierarchyNames)
             ? "b"
             : targetOptions.HierarchyNames);
-        var hierarchyLevels = GetBlockHierarchyLevels(targetOptions);
         if (hierarchyNames.Length != hierarchy.Length)
         {
-            hierarchyNames = new string('b', hierarchy.Length);
+            throw new InvalidOperationException(
+                $"PyNTT hierarchy axis names '{hierarchyNames}' must match hierarchy rank {hierarchy.Length}.");
         }
 
-        var blockAxes = hierarchyNames.Zip(hierarchyLevels).Where(pair => pair.Second == 'b').Select(pair => pair.First);
-        var placementAxis = string.Concat(blockAxes);
-        return string.IsNullOrEmpty(placementAxis) ? "b" : placementAxis;
+        return hierarchyNames;
     }
 
     private static int[] GetBlockHierarchy(PyNTTTargetOptions targetOptions)
@@ -11500,6 +11432,11 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
         if (rhs == 1)
         {
             return lhs;
+        }
+
+        if (lhs.TryDivideExact(rhs) is { } exactQuotient)
+        {
+            return exactQuotient;
         }
 
         long? fixedValue = lhs.FixedValue.HasValue ? checked(lhs.FixedValue.Value / rhs) : null;
