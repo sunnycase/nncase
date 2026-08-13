@@ -160,7 +160,9 @@ public sealed class InstanceNormEvaluator : IEvaluator<InstacneNorm>, ITypeInfer
             var biasPolicy = i - rAxis == 0 ? bias.AxisPolicies[i - rAxis] : null;
             switch (input.AxisPolicies[i], scalePolicy, biasPolicy)
             {
-                case (SBPSplit si, SBPSplit ss, SBPSplit sb) when i == rAxis && si.Axes == ss.Axes && ss.Axes == sb.Axes:
+                case (SBPSplit si, SBPSplit ss, SBPSplit sb) when i == rAxis &&
+                    DistributedUtility.IsSamePolicy(si, ss, checkGranularity: false) &&
+                    DistributedUtility.IsSamePolicy(ss, sb, checkGranularity: false):
                     ndsbp[i] = si;
                     break;
                 case (SBPSplit si, _, _) when i != rAxis:

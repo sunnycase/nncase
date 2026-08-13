@@ -118,8 +118,8 @@ public sealed class CreatePagedAttentionKVCacheEvaluator : ITypeInferencer<Creat
 
         if (kv_caches.Placement.Name == "cdyxb")
         {
-            if (kv_caches.AxisPolicies[0] is SBPSplit { Axes: [1] } &&
-                kv_caches.AxisPolicies[1] is SBPSplit { Axes: [2, 3] } &&
+            if (kv_caches.AxisPolicies[0] is SBPSplit { HierarchyAxes: [1] } &&
+                kv_caches.AxisPolicies[1] is SBPSplit { HierarchyAxes: [2, 3] } &&
                 kv_caches.AxisPolicies.Skip(2).All(x => x is SBPBroadCast))
             {
                 return validType;

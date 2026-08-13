@@ -413,7 +413,7 @@ public sealed class PagedAttentionEvaluator : ITypeInferencer<PagedAttention>, I
                 return new InvalidType("kv cache sharding axes not support!");
             }
 
-            if (!config.AxisPolicies[0].Axes.SequenceEqual([1]) || !config.AxisPolicies[1].Axes.SequenceEqual([2, 3]))
+            if (!config.AxisPolicies[0].HierarchyAxes.SequenceEqual([1]) || !config.AxisPolicies[1].HierarchyAxes.SequenceEqual([2, 3]))
             {
                 return new InvalidType("kv cache axis policies not support!");
             }
@@ -422,8 +422,8 @@ public sealed class PagedAttentionEvaluator : ITypeInferencer<PagedAttention>, I
             var seqAxis = target.Layout.IndexOf(AttentionDimKind.Seq);
             var headAxis = target.Layout.IndexOf(AttentionDimKind.Head);
             var dimAxis = target.Layout.IndexOf(AttentionDimKind.Dim);
-            if (q.AxisPolicies[seqAxis] is SBPSplit { Axes: [2] } &&
-                q.AxisPolicies[headAxis] is SBPSplit { Axes: [1, 3] } &&
+            if (q.AxisPolicies[seqAxis] is SBPSplit { HierarchyAxes: [2] } &&
+                q.AxisPolicies[headAxis] is SBPSplit { HierarchyAxes: [1, 3] } &&
                 q.AxisPolicies[dimAxis] is SBPBroadCast)
             {
                 return q;

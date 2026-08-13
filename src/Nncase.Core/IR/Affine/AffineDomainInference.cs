@@ -18,7 +18,7 @@ public static class AffineDomainInference
             var divisor = 1;
             if (sbp is SBPSplit split)
             {
-                divisor = split.Axes.Select(axis => placement.Hierarchy[axis]).Aggregate(1, (lhs, rhs) => lhs * rhs);
+                divisor = split.HierarchyAxes.Select(axis => placement.Hierarchy[axis]).Aggregate(1, (lhs, rhs) => lhs * rhs);
             }
 
             return divisor;
@@ -27,24 +27,18 @@ public static class AffineDomainInference
         static Dimension GetLocalShardDimension(Dimension globalDimension, SBPSplit split, Placement placement)
         {
             var divisor = GetDivisor(split, placement);
+            var localCapacity = DistributedUtility.GetLocalCapacity(globalDimension, split, placement);
             if (globalDimension is DimConst fixedDimension &&
-                split.Granularity is null &&
-                fixedDimension.Value % divisor == 0)
+                localCapacity is DimConst fixedCapacity &&
+                fixedDimension.Value == fixedCapacity.Value * divisor)
             {
-                return fixedDimension / divisor;
-            }
-
-            if (globalDimension is DimConst fixedGranularDimension &&
-                split.Granularity is DimConst fixedGranularity &&
-                fixedGranularDimension.Value == fixedGranularity.Value * divisor)
-            {
-                return fixedGranularity;
+                return fixedCapacity;
             }
 
             var globalMax = CompilerServices.GetMaxShape(new RankedShape([globalDimension]))[0];
-            var localMax = split.Granularity is { } granularity
-                ? System.Math.Min(globalMax, CompilerServices.GetMaxShape(new RankedShape([granularity]))[0])
-                : MathUtility.CeilDiv(globalMax, divisor);
+            var localMax = CompilerServices.GetMaxShape(new RankedShape([
+                DistributedUtility.GetLocalCapacity(globalMax, split, placement, DistributedUtility.DivideFlags.MaxShape),
+            ]))[0];
             var runtimeDimension = new AsDim(F.Tensors.LocalShardDim(globalDimension, split, placement))
             {
                 Metadata = new()

@@ -13,6 +13,25 @@ using Nncase.Utilities;
 namespace Nncase.TIR;
 
 /// <summary>
+/// Physical interpretation of coordinates for a distributed buffer.
+/// </summary>
+public enum DistributedBufferStorageKind
+{
+    /// <summary>
+    /// The backing allocation contains one dense local shard. Logical local
+    /// coordinates are physical local coordinates.
+    /// </summary>
+    CompactLocal,
+
+    /// <summary>
+    /// The backing allocation contains the canonical global tensor. Logical
+    /// local coordinates must be mapped through the buffer's staged
+    /// <see cref="DistributedType"/> policy before applying global strides.
+    /// </summary>
+    CanonicalGlobal,
+}
+
+/// <summary>
 /// buffer.
 /// </summary>
 public sealed class Buffer : Expr
@@ -25,7 +44,8 @@ public sealed class Buffer : Expr
         Dimension[] strides,
         DistributedType? distributedType,
         TargetStorageEncodingSelection? storageEncoding = null,
-        StagedBufferLayout? stagedLayout = null)
+        StagedBufferLayout? stagedLayout = null,
+        DistributedBufferStorageKind distributedStorageKind = DistributedBufferStorageKind.CompactLocal)
         : base(new BaseExpr[] { memSpan }.Concat(dimensions).Concat(strides))
     {
         if (stagedLayout is not null)
@@ -65,6 +85,22 @@ public sealed class Buffer : Expr
         DistributedType = distributedType;
         StorageEncoding = storageEncoding;
         StagedLayout = stagedLayout;
+        if (distributedStorageKind == DistributedBufferStorageKind.CanonicalGlobal && distributedType is null)
+        {
+            throw new ArgumentException(
+                $"Canonical-global buffer {name} requires a DistributedType.",
+                nameof(distributedStorageKind));
+        }
+
+        if (distributedStorageKind == DistributedBufferStorageKind.CanonicalGlobal &&
+            memSpan.Buffer.Location is MemoryLocation.BlockLocalData or MemoryLocation.BlockLocalRdata)
+        {
+            throw new ArgumentException(
+                $"Canonical-global buffer {name} cannot use block-local backing {memSpan.Buffer.Location}.",
+                nameof(distributedStorageKind));
+        }
+
+        DistributedStorageKind = distributedStorageKind;
     }
 
     public string Name { get; }
@@ -111,9 +147,15 @@ public sealed class Buffer : Expr
     /// </summary>
     public StagedBufferLayout? StagedLayout { get; }
 
+    /// <summary>
+    /// Gets how distributed logical coordinates address this buffer's physical
+    /// allocation.
+    /// </summary>
+    public DistributedBufferStorageKind DistributedStorageKind { get; }
+
     public override TExprResult Accept<TExprResult, TTypeResult, TContext>(ExprFunctor<TExprResult, TTypeResult, TContext> functor, TContext context) => functor.VisitBuffer(this, context);
 
-    public Buffer With(string? name = null, DataType? elemType = null, MemSpan? memSpan = null, Dimension[]? dimensions = null, Dimension[]? strides = null, Expr[]? globalShape = null, DistributedType? distributedType = null, TargetStorageEncodingSelection? storageEncoding = null, StagedBufferLayout? stagedLayout = null)
+    public Buffer With(string? name = null, DataType? elemType = null, MemSpan? memSpan = null, Dimension[]? dimensions = null, Dimension[]? strides = null, Expr[]? globalShape = null, DistributedType? distributedType = null, TargetStorageEncodingSelection? storageEncoding = null, StagedBufferLayout? stagedLayout = null, DistributedBufferStorageKind? distributedStorageKind = null)
         => new Buffer(
             name ?? Name,
             elemType ?? ElemType,
@@ -122,7 +164,8 @@ public sealed class Buffer : Expr
             strides ?? Strides.ToArray(),
             distributedType ?? DistributedType,
             storageEncoding ?? StorageEncoding,
-            stagedLayout ?? StagedLayout);
+            stagedLayout ?? StagedLayout,
+            distributedStorageKind ?? DistributedStorageKind);
 
     /// <inheritdoc/>
     public override bool Equals(object? obj)
@@ -139,8 +182,9 @@ public sealed class Buffer : Expr
             && Rank == other.Rank
             && Equals(StorageEncoding, other.StorageEncoding)
             && Equals(StagedLayout, other.StagedLayout)
+            && DistributedStorageKind == other.DistributedStorageKind
             && Operands.SequenceEqual(other.Operands);
     }
 
-    protected override int GetHashCodeCore() => HashCode.Combine(Name, ElemType, Rank, StorageEncoding, StagedLayout, base.GetHashCodeCore());
+    protected override int GetHashCodeCore() => HashCode.Combine(Name, ElemType, Rank, StorageEncoding, StagedLayout, DistributedStorageKind, base.GetHashCodeCore());
 }

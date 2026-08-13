@@ -5,7 +5,27 @@ namespace Nncase.CodeGen.PyNTT;
 
 public sealed record PyNTTBufferPointerTemplateModel(
     string Expression,
-    int AddressSpace = 1);
+    int AddressSpace = 1)
+{
+    public string DistributedStorageKind { get; init; } = "CompactLocal";
+
+    public PyNTTDimExpression[] GlobalShape { get; init; } = Array.Empty<PyNTTDimExpression>();
+
+    public PyNTTDimExpression[] Strides { get; init; } = Array.Empty<PyNTTDimExpression>();
+
+    public PyNTTShardAxisTemplateModel[] ShardAxes { get; init; } = Array.Empty<PyNTTShardAxisTemplateModel>();
+
+    public int[] Hierarchy { get; init; } = Array.Empty<int>();
+}
+
+public sealed record PyNTTSplitStageTemplateModel(
+    int[] HierarchyAxes,
+    string Distribution,
+    PyNTTDimExpression? Granularity,
+    long BlockSize);
+
+public sealed record PyNTTShardAxisTemplateModel(
+    PyNTTSplitStageTemplateModel[] Stages);
 
 public sealed record PyNTTTransferPipelineChannelTemplateModel(
     string Name,
@@ -73,7 +93,7 @@ public sealed record PyNTTTensorLoadTemplateModel(
     PyNTTDimExpression[] GlobalShape,
     PyNTTDimExpression[] GlobalOffsets,
     int[] Hierarchy,
-    int[][] SplitAxes,
+    PyNTTShardAxisTemplateModel[] ShardAxes,
     int VectorLaneCount,
     int[] VectorLaneShape,
     string Comment)
@@ -97,7 +117,7 @@ public sealed record PyNTTTensorStoreTemplateModel(
     PyNTTDimExpression[] GlobalShape,
     PyNTTDimExpression[] GlobalOffsets,
     int[] Hierarchy,
-    int[][] SplitAxes,
+    PyNTTShardAxisTemplateModel[] ShardAxes,
     int VectorLaneCount,
     int[] VectorLaneShape,
     string Comment)
@@ -326,7 +346,7 @@ public sealed record PyNTTGatherTemplateModel(
     int ValueVectorLaneCount,
     int[] ValueVectorLaneShape,
     int[] Hierarchy,
-    int[][] InputSplitAxes,
+    PyNTTShardAxisTemplateModel[] InputShardAxes,
     string Comment)
 {
     public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
@@ -351,9 +371,9 @@ public sealed record PyNTTReshardTemplateModel(
     int VectorLaneCount,
     int[] VectorLaneShape,
     int[] Hierarchy,
-    int[][] InputSplitAxes,
+    PyNTTShardAxisTemplateModel[] InputShardAxes,
     int[] InputPartialAxes,
-    int[][] OutputSplitAxes,
+    PyNTTShardAxisTemplateModel[] OutputShardAxes,
     string Stage,
     string Comment)
 {
@@ -630,7 +650,7 @@ public sealed record PyNTTPagedAttentionCacheTemplateModel(
     int[] ValueTailShape,
     int IdLength,
     int[] TopologyShape,
-    int[] NumBlocksSplitAxes);
+    int[] NumBlocksHierarchyAxes);
 
 public sealed record PyNTTUpdatePagedAttentionKVCacheTemplateModel(
     string FunctionName,
@@ -641,8 +661,8 @@ public sealed record PyNTTUpdatePagedAttentionKVCacheTemplateModel(
     PyNTTDimExpression[] SlotsGlobalShape,
     PyNTTDimExpression[] SlotsGlobalOffsets,
     PyNTTDimExpression[] SlotsStrides,
-    int[][] SlotsSplitAxes,
-    int[][] SlotsSourceSplitAxes,
+    PyNTTShardAxisTemplateModel[] SlotsShardAxes,
+    PyNTTShardAxisTemplateModel[] SlotsSourceShardAxes,
     int[] Hierarchy,
     int SeqAxis,
     int HeadAxis,
@@ -695,7 +715,7 @@ public sealed record PyNTTPagedAttentionTemplateModel(
     PyNTTDimExpression[] OutputStrides,
     int[] QueryVectorLaneShape,
     int[] OutputVectorLaneShape,
-    int[][] OutputSplitAxes,
+    PyNTTShardAxisTemplateModel[] OutputShardAxes,
     int[] Hierarchy,
     int SeqAxis,
     int HeadAxis,
@@ -724,7 +744,7 @@ public sealed record PyNTTPagedAttentionPartialTemplateModel(
     PyNTTDimExpression[] OutputGlobalShape,
     PyNTTDimExpression[] OutputStrides,
     int[] OutputVectorLaneShape,
-    int[][] OutputSplitAxes,
+    PyNTTShardAxisTemplateModel[] OutputShardAxes,
     PyNTTDimExpression[] MaxStateShape,
     PyNTTDimExpression[] MaxStateStrides,
     PyNTTDimExpression[] SumStateShape,
@@ -772,7 +792,7 @@ public sealed record PyNTTPagedAttentionMergeTemplateModel(
     PyNTTDimExpression[] OutputGlobalShape,
     PyNTTDimExpression[] OutputStrides,
     int[] OutputVectorLaneShape,
-    int[][] OutputSplitAxes,
+    PyNTTShardAxisTemplateModel[] OutputShardAxes,
     int[] Hierarchy,
     int SeqAxis,
     int HeadAxis,
@@ -1064,9 +1084,9 @@ public sealed record PyNTTSummaTemplateModel(
     PyNTTDimExpression[] LhsStrides,
     PyNTTDimExpression[] RhsStrides,
     PyNTTDimExpression[] OutputStrides,
-    int[][] LhsSplitAxes,
-    int[][] RhsSplitAxes,
-    int[][] OutputSplitAxes,
+    PyNTTShardAxisTemplateModel[] LhsShardAxes,
+    PyNTTShardAxisTemplateModel[] RhsShardAxes,
+    PyNTTShardAxisTemplateModel[] OutputShardAxes,
     int[] Hierarchy,
     int RhsNVectorLaneCount,
     int OutputNVectorLaneCount,

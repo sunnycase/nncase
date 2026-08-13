@@ -125,7 +125,16 @@ public class LayerNormEvaluator : IEvaluator<LayerNorm>, ITypeInferencer<LayerNo
         {
             if (i == target.VectorizedAxes[0] && input.AxisPolicies[i] is SBPSplit split)
             {
-                ndsbps[i] = SBP.S(split.Axes, split.Granularity is null ? null : split.Granularity * ((VectorType)input.TensorType.DType).Lanes[0] / ((VectorType)tensorType.DType).Lanes[0]);
+                if (!DistributedUtility.TryScaleSplitUnits(
+                    split,
+                    ((VectorType)input.TensorType.DType).Lanes[0],
+                    ((VectorType)tensorType.DType).Lanes[0],
+                    out var scaledSplit))
+                {
+                    return new InvalidType($"Cannot scale LayerNorm split policy {split} for output vector lanes.");
+                }
+
+                ndsbps[i] = scaledSplit;
             }
             else
             {

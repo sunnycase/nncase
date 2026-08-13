@@ -236,7 +236,7 @@ public sealed class UnitTestQKVRoPEWithCacheFusion : TestClassBase
         [8],
         [8],
         [PagedKVCacheDimKind.NumBlocks],
-        [SBP.S([0])]);
+        [SBP.SContiguous([0])]);
 
     private static PagedAttentionConfig CreateEvaluatorCacheConfig() => new(
         1,
@@ -265,7 +265,7 @@ public sealed class UnitTestQKVRoPEWithCacheFusion : TestClassBase
         [8],
         [8],
         [PagedKVCacheDimKind.NumBlocks],
-        [SBP.S([0])]);
+        [SBP.SContiguous([0])]);
 
     private static Tensor CreateBFloat16Tensor(long[] shape, float step)
     {

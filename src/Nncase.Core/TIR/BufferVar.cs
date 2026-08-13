@@ -61,15 +61,26 @@ public sealed record BufferLayoutAnnotation
     /// <summary>
     /// Initializes a new instance of the <see cref="BufferLayoutAnnotation"/> class.
     /// </summary>
-    public BufferLayoutAnnotation(BufferLayoutKind kind, IRArray<Dimension> strides)
+    public BufferLayoutAnnotation(
+        BufferLayoutKind kind,
+        IRArray<Dimension> strides,
+        DistributedBufferStorageKind? distributedStorageKind)
     {
         if (kind != BufferLayoutKind.ExactStrided && strides.Count != 0)
         {
             throw new ArgumentException($"{kind} buffer layouts cannot carry exact strides.", nameof(strides));
         }
 
+        if ((kind == BufferLayoutKind.Opaque) != (distributedStorageKind is null))
+        {
+            throw new ArgumentException(
+                $"{kind} buffer layout must {(kind == BufferLayoutKind.Opaque ? "not " : string.Empty)}carry a distributed storage kind.",
+                nameof(distributedStorageKind));
+        }
+
         Kind = kind;
         Strides = strides;
+        DistributedStorageKind = distributedStorageKind;
     }
 
     /// <summary>
@@ -84,26 +95,43 @@ public sealed record BufferLayoutAnnotation
     public IRArray<Dimension> Strides { get; }
 
     /// <summary>
+    /// Gets how distributed logical coordinates address the physical backing.
+    /// Opaque resources do not carry tensor storage semantics.
+    /// </summary>
+    public DistributedBufferStorageKind? DistributedStorageKind { get; }
+
+    /// <summary>
     /// Gets the runtime-strided tensor layout.
     /// </summary>
-    public static BufferLayoutAnnotation RuntimeStrided { get; } = new(BufferLayoutKind.RuntimeStrided, new IRArray<Dimension>());
+    public static BufferLayoutAnnotation RuntimeStrided { get; } = CreateRuntimeStrided();
 
     /// <summary>
     /// Gets the opaque non-tensor layout.
     /// </summary>
-    public static BufferLayoutAnnotation Opaque { get; } = new(BufferLayoutKind.Opaque, new IRArray<Dimension>());
+    public static BufferLayoutAnnotation Opaque { get; } = new(BufferLayoutKind.Opaque, new IRArray<Dimension>(), null);
+
+    /// <summary>
+    /// Creates a runtime-strided tensor layout.
+    /// </summary>
+    public static BufferLayoutAnnotation CreateRuntimeStrided(
+        DistributedBufferStorageKind distributedStorageKind = DistributedBufferStorageKind.CompactLocal)
+        => new(BufferLayoutKind.RuntimeStrided, new IRArray<Dimension>(), distributedStorageKind);
 
     /// <summary>
     /// Creates an exact strided tensor layout.
     /// </summary>
-    public static BufferLayoutAnnotation ExactStrided(ReadOnlySpan<Dimension> strides)
-        => new(BufferLayoutKind.ExactStrided, new IRArray<Dimension>(strides));
+    public static BufferLayoutAnnotation ExactStrided(
+        ReadOnlySpan<Dimension> strides,
+        DistributedBufferStorageKind distributedStorageKind = DistributedBufferStorageKind.CompactLocal)
+        => new(BufferLayoutKind.ExactStrided, new IRArray<Dimension>(strides), distributedStorageKind);
 
     /// <inheritdoc/>
     public override string ToString()
-        => Kind == BufferLayoutKind.ExactStrided
-            ? $"exact[{string.Join(",", Strides)}]"
-            : Kind.ToString();
+        => Kind == BufferLayoutKind.Opaque
+            ? Kind.ToString()
+            : Kind == BufferLayoutKind.ExactStrided
+                ? $"exact[{string.Join(",", Strides)}]@{DistributedStorageKind}"
+                : $"{Kind}@{DistributedStorageKind}";
 }
 
 /// <summary>
@@ -258,6 +286,13 @@ public sealed class BufferVar : Expr, IVar, IEquatable<BufferVar?>
         if (layout.Kind == BufferLayoutKind.Opaque)
         {
             throw new ArgumentException($"Tensor BufferVar {type} cannot use an opaque layout.", nameof(layout));
+        }
+
+        if (layout.DistributedStorageKind == TIR.DistributedBufferStorageKind.CanonicalGlobal && type is not DistributedType)
+        {
+            throw new ArgumentException(
+                $"Canonical-global BufferVar storage requires a DistributedType, got {type}.",
+                nameof(layout));
         }
 
         if (layout.Kind == BufferLayoutKind.ExactStrided && layout.Strides.Count != tensorType!.Shape.Rank)

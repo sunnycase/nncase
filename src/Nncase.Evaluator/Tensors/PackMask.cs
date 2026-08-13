@@ -19,27 +19,9 @@ namespace Nncase.Evaluator.Tensors;
 
 public sealed class VectorizeMaskEvaluator : ITypeInferencer<VectorizeMask>, ICostEvaluator<VectorizeMask>, IEvaluator<VectorizeMask>
 {
-    private static bool TryDivideSplitGranularity(Dimension dim, SBPSplit split, Placement placement, int laneProduct, out Dimension? dividedGranularity)
+    private static bool CanDivideSplitUnits(Dimension dim, SBPSplit split, Placement placement, int laneProduct)
     {
-        dividedGranularity = null;
-        if (split.Granularity is { } granularity)
-        {
-            if (!Dimension.TryDivExactly(granularity, laneProduct, out var divided))
-            {
-                return false;
-            }
-
-            dividedGranularity = divided;
-            return true;
-        }
-
-        var divisor = split.Axes.Select(axis => placement.Hierarchy[axis]).Aggregate(1, (a, b) => a * b);
-        if (!dim.IsFixed)
-        {
-            return false;
-        }
-
-        var localDim = (Dimension)MathUtility.CeilDiv(dim.FixedValue, divisor);
+        var localDim = DistributedUtility.GetLocalCapacity(dim, split, placement);
         return Dimension.TryDivExactly(localDim, laneProduct, out _);
     }
 
@@ -109,9 +91,10 @@ public sealed class VectorizeMaskEvaluator : ITypeInferencer<VectorizeMask>, ICo
         {
             if (input.AxisPolicies[i] is SBPSplit split && target.Axis == i)
             {
-                if (TryDivideSplitGranularity(input.TensorType.Shape[i], split, input.Placement, target.Lanes, out var granularity))
+                if (CanDivideSplitUnits(input.TensorType.Shape[i], split, input.Placement, target.Lanes) &&
+                    DistributedUtility.TryScaleSplitUnits(split, 1, target.Lanes, out var packedSplit))
                 {
-                    ndsbp[i] = SBP.S(split.Axes, granularity);
+                    ndsbp[i] = packedSplit;
                 }
                 else
                 {

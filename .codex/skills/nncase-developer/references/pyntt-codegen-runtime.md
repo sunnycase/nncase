@@ -60,9 +60,9 @@ validates and implements that choice. Do not put GEMV, GEMM, and MMA schedules
 behind branches in one wrapper, and do not split one algorithm across included
 Jinja fragments. Generic address and syntax macros may remain shared.
 
-## Manifest v8
+## Manifest v9
 
-Version 8 is the only accepted codegen manifest. Objects use exact schemas.
+Version 9 is the only accepted codegen manifest. Objects use exact schemas.
 
 Each render kernel has only:
 
@@ -89,8 +89,8 @@ workspace_arguments
 
 `arguments` are operation-specific values. `workspace_arguments` are the exact
 live compiler-owned pool/arena parameters referenced by that helper; do not
-pass every top-level workspace conservatively. Unknown, missing, and version-7
-fields must fail validation.
+pass every top-level workspace conservatively. Unknown, missing, and obsolete
+pre-v9 fields must fail validation.
 
 Templates receive dtype, vector lanes, shapes, strides, distributed regions,
 runtime dimensions, operation attributes, fixed worker geometry, target
@@ -195,20 +195,29 @@ template.
 
 ## Host Tensor Descriptors
 
-TMA-capable helpers receive host-created
-`triton.tools.tensor_descriptor.TensorDescriptor` values as kernel arguments.
-Do not call `tl.make_tensor_descriptor` in generated device code.
+TMA-capable helpers receive either a host-created
+`triton.tools.tensor_descriptor.TensorDescriptor` or one pointer to a device
+table of host-encoded `CUtensorMap` entries. Do not call
+`tl.make_tensor_descriptor` in generated device code.
 
-- Build the descriptor from the authoritative global backing, never from a
-  local shard pointer.
-- Add compiler-derived global shard offsets to descriptor coordinates in the
-  helper, so each block still computes only its local shard.
-- Reject per-shard Data/RData and BlockLocal backing when one global descriptor
-  cannot represent it.
+- Build every descriptor entry from the authoritative global backing, never
+  from a guessed local pointer.
+- Use `single` only when one rectangular map describes the globally addressed
+  operand. Use `table` for distributed local views: one 128-byte entry per
+  hierarchy owner in one aligned CUDA byte buffer, selected by linear owner in
+  device code. Derive entries from the complete ordered `SplitStage` mapping.
+- For a table entry, use local descriptor coordinates. Acquire tensor-map proxy
+  visibility and reinterpret the raw entry against the actual destination
+  Shared memdesc before `tle.gpu.copy`.
+- Unequal owner extents are represented by unequal entry shapes; TMA OOB fill
+  handles the final tile. A partial `BlockCyclic(BlockSize > 1)` block is not a
+  rectangle and must fail fast.
+- Reject per-shard backing without a stable address/span contract and
+  BlockLocal backing.
 - Validate static shape, strides, byte offset, block shape, rank, and storage
   span before launch. Do not fall back to device descriptor construction.
-- Cache one descriptor per generated kernel ABI slot and replace that entry
-  when the backing pointer or descriptor configuration changes.
+- Cache one single descriptor or descriptor table per generated kernel ABI slot
+  and replace it when the backing pointer or descriptor configuration changes.
 - Keep the concrete descriptor layout renderer-owned so template-only TMA tile
   changes remain re-render-only changes.
 - Model fused QKV as one concatenated logical N stream. Generate one N/K tile
@@ -263,7 +272,7 @@ target options.
 - Verify target TIR microkernel metadata and Shared reservations agree, use
   canonical None/value/Tuple representation, and Bufferize assigns aligned
   in-bounds offsets.
-- Validate manifest v8 with the Python reader.
+- Validate manifest v9 with the Python reader.
 - Verify every executable helper renders producer/consumer functions and one
   specialization wrapper.
 - Inspect compiled metadata for the expected physical warp count and zero

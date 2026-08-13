@@ -5,11 +5,11 @@
 {{ indent }}head_id = {{ ctx["source_tensor_coordinates"][update["HeadAxis"]] }}
 {{ indent }}token_id = {{ ctx["source_tensor_coordinates"][update["SeqAxis"]] }}
 {% for axis in ctx["non_data_axes"] %}
-{{ indent }}global_idx{{ axis }} = {{ ctx["source_tensor_coordinates"][axis] }} + {{ dim(update["SlotsGlobalOffsets"][axis]) }}
+{{ indent }}global_idx{{ axis }} = {{ ctx["global_source_tensor_coordinates"][axis] }}
 {% endfor %}
-{{ indent }}global_token_id = token_id + {{ dim(update["SlotsGlobalOffsets"][update["SeqAxis"]]) }}
-{{ indent }}global_head_id = head_id + {{ dim(update["SlotsGlobalOffsets"][update["HeadAxis"]]) }}
-{{ indent }}global_source_dim_block = source_dim_block + {{ dim(update["SlotsGlobalOffsets"][update["DimAxis"]]) }}
+{{ indent }}global_token_id = {{ ctx["global_source_tensor_coordinates"][update["SeqAxis"]] }}
+{{ indent }}global_head_id = {{ ctx["global_source_tensor_coordinates"][update["HeadAxis"]] }}
+{{ indent }}global_source_dim_block = {{ ctx["global_source_tensor_coordinates"][update["DimAxis"]] }}
 {% if ctx["slots_lane_count"] == 1 %}
 {{ indent }}logical_dim = global_source_dim_block
 {% else %}
@@ -20,7 +20,7 @@
 {% if cache["IdLength"] > 1 %}
 {{ indent }}topology_id = tl.load(slot_mapping + global_token_id * {{ cache["IdLength"] }}, mask=token_active, other=0)
 {{ indent }}tmp_topology = topology_id
-{% for axis in cache["NumBlocksSplitAxes"] | reverse %}
+{% for axis in cache["NumBlocksHierarchyAxes"] | reverse %}
 {{ indent }}topology_coord{{ axis }} = tmp_topology % {{ update["Hierarchy"][axis] }}
 {{ indent }}tmp_topology = tmp_topology // {{ update["Hierarchy"][axis] }}
 {% endfor %}

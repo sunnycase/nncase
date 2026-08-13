@@ -8,21 +8,11 @@
 {{ common.matrix_shared_aliases(ctx, model["LhsTritonDType"], model["RhsTritonDType"], [ctx["block_m"], ctx["block_k"]], [ctx["block_k"], ctx["block_n"]], true) }}
 {% for prefix in ("out_m", "out_n") %}
 {% set axis = ctx[prefix] %}
-{% if not axis["split_axes"] %}
-    {{ prefix }}_local_dim = {{ dim(axis["global_extent"]) }}
-    {{ prefix }}_global_base = 0
-    {{ prefix }}_iter_dim = {{ dim(axis["global_extent"]) }}
-{% else %}
-    {{ prefix }}_local_dim = tl.cdiv({{ dim(axis["global_extent"]) }}, {{ axis["divisor"] }})
-    {{ prefix }}_split_linear = {{ axis["split_linear"] }}
-    {{ prefix }}_global_base = {{ prefix }}_split_linear * {{ prefix }}_local_dim
-    {{ prefix }}_remaining = {{ dim(axis["global_extent"]) }} - {{ prefix }}_global_base
-    {{ prefix }}_iter_dim = tl.minimum({{ prefix }}_local_dim, tl.maximum({{ prefix }}_remaining, 0))
-{% endif %}
+    {{ prefix }}_iter_dim = {{ axis["active_extent"] }}
 {% endfor %}
     for m_start in tl.range(0, out_m_iter_dim, {{ ctx["block_m"] }}):
         offs_m = m_start + tl.arange(0, {{ ctx["block_m"] }})
-        global_m = out_m_global_base + offs_m
+        global_m = {{ ctx["global_m"] }}
         for n_start in tl.range(0, out_n_iter_dim, {{ ctx["physical_block_n"] }}):
 {{ common.structured_axis(ctx["n_axis"], "            ") }}
             global_n_physical = {{ ctx["global_n_physical"] }}
@@ -35,16 +25,9 @@
 {% endfor %}
 {% for key in ("lhs_m", "lhs_k") %}
 {% set index = ctx[key] %}
-{% if index["split_axes"] %}
-                {{ index["prefix"] }}_local_dim = tl.cdiv({{ dim(index["global_extent"]) }}, {{ index["divisor"] }})
-                {{ index["prefix"] }}_split_linear = ({{ index["global_index"] }}) // {{ index["prefix"] }}_local_dim
-                {{ index["prefix"] }}_local = ({{ index["global_index"] }}) - {{ index["prefix"] }}_split_linear * {{ index["prefix"] }}_local_dim
-                {{ index["prefix"] }}_tmp_split = {{ index["prefix"] }}_split_linear
-{% for placement_axis in index["split_axes"] | reverse %}
-                source_shard_coord{{ placement_axis }} = {{ index["prefix"] }}_tmp_split % {{ model["Hierarchy"][placement_axis] }}
-                {{ index["prefix"] }}_tmp_split = {{ index["prefix"] }}_tmp_split // {{ model["Hierarchy"][placement_axis] }}
+{% for placement_axis, owner in index["owners"].items() %}
+                source_shard_coord{{ placement_axis }} = {{ owner }}
 {% endfor %}
-{% endif %}
 {% endfor %}
                 lhs_shard_index = {{ ctx["full_source_shard_index"] }}
                 lhs_offsets = {{ ctx["lhs_m"]["result"] }} * {{ dim(model["LhsStrides"][0]) }} + {{ ctx["lhs_k"]["result"] }} * {{ dim(model["LhsStrides"][1]) }}
@@ -56,16 +39,9 @@
 {% endfor %}
 {% for key in ("rhs_k", "rhs_n") %}
 {% set index = ctx[key] %}
-{% if index["split_axes"] %}
-                {{ index["prefix"] }}_local_dim = tl.cdiv({{ dim(index["global_extent"]) }}, {{ index["divisor"] }})
-                {{ index["prefix"] }}_split_linear = ({{ index["global_index"] }}) // {{ index["prefix"] }}_local_dim
-                {{ index["prefix"] }}_local = ({{ index["global_index"] }}) - {{ index["prefix"] }}_split_linear * {{ index["prefix"] }}_local_dim
-                {{ index["prefix"] }}_tmp_split = {{ index["prefix"] }}_split_linear
-{% for placement_axis in index["split_axes"] | reverse %}
-                source_shard_coord{{ placement_axis }} = {{ index["prefix"] }}_tmp_split % {{ model["Hierarchy"][placement_axis] }}
-                {{ index["prefix"] }}_tmp_split = {{ index["prefix"] }}_tmp_split // {{ model["Hierarchy"][placement_axis] }}
+{% for placement_axis, owner in index["owners"].items() %}
+                source_shard_coord{{ placement_axis }} = {{ owner }}
 {% endfor %}
-{% endif %}
 {% endfor %}
                 rhs_shard_index = {{ ctx["full_source_shard_index"] }}
                 rhs_physical_offsets = {{ ctx["rhs_k"]["result"] }} * {{ dim(model["RhsStrides"][0]) }} + {{ ctx["rhs_n"]["result"] }} * {{ dim(model["RhsStrides"][1]) }}

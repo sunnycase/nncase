@@ -148,22 +148,16 @@ internal sealed class ILPrintVisitor : ExprFunctor<string, string>
     /// <inheritdoc/>
     public override string VisitType(DistributedType type)
     {
-        var shape = CompilerServices.GetMaxShape(type.TensorType.Shape);
+        var globalShape = CompilerServices.GetMaxShape(type.TensorType.Shape);
+        var shape = CompilerServices.GetMaxShape(
+            DistributedUtility.GetDividedTensorType(type, DistributedUtility.DivideFlags.MaxShape).Shape);
         bool[] usedCeil = new bool[shape.Length];
         foreach (var (s, r) in type.AxisPolicies.Select((s, r) => (s, r)))
         {
             if (s is SBPSplit split)
             {
-                if (split.Granularity is null)
-                {
-                    var divisor = split.Axes.Select(a => type.Placement.Hierarchy[a]).Aggregate(1, (a, b) => a * b);
-                    usedCeil[r] = shape[r] % divisor != 0;
-                    shape[r] = (shape[r] + divisor - 1) / divisor;
-                }
-                else
-                {
-                    shape[r] = CompilerServices.GetMaxShape(new RankedShape(new[] { split.Granularity }))[0];
-                }
+                var divisor = split.HierarchyAxes.Select(a => type.Placement.Hierarchy[a]).Aggregate(1, (a, b) => a * b);
+                usedCeil[r] = shape[r] * divisor != globalShape[r];
             }
         }
 
@@ -172,7 +166,7 @@ internal sealed class ILPrintVisitor : ExprFunctor<string, string>
         {
             if (s is SBPSplit split)
             {
-                sshape[r] += string.Join(string.Empty, split.Axes.Select(a => $"@{type.Placement.Name[a]}"));
+                sshape[r] += string.Join(string.Empty, split.HierarchyAxes.Select(a => $"@{type.Placement.Name[a]}"));
             }
         }
 
@@ -545,7 +539,10 @@ internal sealed class ILPrintVisitor : ExprFunctor<string, string>
         var storageEncoding = expr.StorageEncoding is null
             ? string.Empty
             : $", storage_encoding={expr.StorageEncoding}";
-        _writer.WInd().WriteLine($"{name} = buffer({type}{storageEncoding})");
+        var distributedStorage = expr.DistributedStorageKind == TIR.DistributedBufferStorageKind.CompactLocal
+            ? string.Empty
+            : $", distributed_storage={expr.DistributedStorageKind}";
+        _writer.WInd().WriteLine($"{name} = buffer({type}{storageEncoding}{distributedStorage})");
         return name;
     }
 

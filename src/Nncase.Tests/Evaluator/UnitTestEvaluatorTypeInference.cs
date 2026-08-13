@@ -67,11 +67,11 @@ public class UnitTestEvaluatorTypeInference
         var placement = new Placement([4, 8], "y,x", "bb");
         var thenType = new DistributedType(
             tensorType,
-            [SBP.B, SBP.S([1]), SBP.B],
+            [SBP.B, SBP.SContiguous([1]), SBP.B],
             placement);
         var elseType = new DistributedType(
             tensorType,
-            [SBP.S([0]), SBP.B, SBP.B],
+            [SBP.SContiguous([0]), SBP.B, SBP.B],
             placement);
 
         var commonType = TypeInference.CommonType(thenType, elseType);

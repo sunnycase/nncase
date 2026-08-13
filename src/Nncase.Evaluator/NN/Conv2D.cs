@@ -125,27 +125,20 @@ public class Conv2DEvaluator : IEvaluator<Conv2D>, ITypeInferencer<Conv2D>, ICos
             return new InvalidType("placement not equal");
         }
 
-        var ndsbpsIf = DistributedUtility.AxisPolicesToNDSBP(input.AxisPolicies, input.Placement.Rank);
-        var ndsbpsW = DistributedUtility.AxisPolicesToNDSBP(weights.AxisPolicies, weights.Placement.Rank);
-        var ndsbpBias = DistributedUtility.AxisPolicesToNDSBP(bias.AxisPolicies, bias.Placement.Rank);
-        var ndsbp = new SBP[input.Placement.Rank];
-        for (int i = 0; i < ndsbp.Length; i++)
+        var ndsbpsIf = DistributedUtility.GetHierarchyAxisPolicies(input.AxisPolicies, input.Placement.Rank);
+        var ndsbpsW = DistributedUtility.GetHierarchyAxisPolicies(weights.AxisPolicies, weights.Placement.Rank);
+        var ndsbpBias = DistributedUtility.GetHierarchyAxisPolicies(bias.AxisPolicies, bias.Placement.Rank);
+        var hierarchyPolicies = new HierarchyAxisPolicy[input.Placement.Rank];
+        for (int i = 0; i < hierarchyPolicies.Length; i++)
         {
             var invalid = new InvalidType($"({ndsbpsIf[i]}, {ndsbpsW[i]}) not support");
             switch (ndsbpsIf[i], ndsbpsW[i])
             {
-                case (SBPSplit sa, SBPSplit sb):
+                case (HierarchyAxisSplit { TensorAxis: 1 }, HierarchyAxisSplit { TensorAxis: 1 }):
                     // split on ic
-                    if (sa.Axes[0] == 1 && sb.Axes[0] == 1)
+                    if (ndsbpBias[i] is HierarchyAxisBroadcast)
                     {
-                        if (ndsbpBias[i] is SBPBroadCast)
-                        {
-                            ndsbp[i] = SBP.P([1]);
-                        }
-                        else
-                        {
-                            return invalid;
-                        }
+                        hierarchyPolicies[i] = new HierarchyAxisPartial([1], ReduceOp.Sum);
                     }
                     else
                     {
@@ -153,10 +146,10 @@ public class Conv2DEvaluator : IEvaluator<Conv2D>, ITypeInferencer<Conv2D>, ICos
                     }
 
                     break;
-                case (SBPSplit sa, SBPBroadCast):
-                    if (sa.Axes[0] == 0 && ndsbpBias[i] is SBPBroadCast)
+                case (HierarchyAxisSplit { TensorAxis: 0 } splitInput, HierarchyAxisBroadcast):
+                    if (ndsbpBias[i] is HierarchyAxisBroadcast)
                     {
-                        ndsbp[i] = SBP.S([sa.Axes[0]]);
+                        hierarchyPolicies[i] = splitInput;
                     }
                     else
                     {
@@ -164,10 +157,14 @@ public class Conv2DEvaluator : IEvaluator<Conv2D>, ITypeInferencer<Conv2D>, ICos
                     }
 
                     break;
-                case (SBPBroadCast, SBPSplit sb):
-                    if (sb.Axes[0] == 0 && ndsbpBias[i] is SBPSplit s && s.Axes[0] == sb.Axes[0])
+                case (HierarchyAxisBroadcast, HierarchyAxisSplit { TensorAxis: 0 } splitWeights):
+                    if (ndsbpBias[i] is HierarchyAxisSplit splitBias &&
+                        splitBias.TensorAxis == 0 &&
+                        splitBias.StageIndex == splitWeights.StageIndex &&
+                        splitBias.StageAxisIndex == splitWeights.StageAxisIndex &&
+                        splitBias.Distribution == splitWeights.Distribution)
                     {
-                        ndsbp[i] = SBP.S([sb.Axes[0] + 1]);
+                        hierarchyPolicies[i] = splitWeights with { TensorAxis = 1 };
                     }
                     else
                     {
@@ -175,10 +172,10 @@ public class Conv2DEvaluator : IEvaluator<Conv2D>, ITypeInferencer<Conv2D>, ICos
                     }
 
                     break;
-                case (SBPBroadCast, SBPBroadCast):
-                    if (ndsbpBias[i] is SBPBroadCast)
+                case (HierarchyAxisBroadcast, HierarchyAxisBroadcast):
+                    if (ndsbpBias[i] is HierarchyAxisBroadcast)
                     {
-                        ndsbp[i] = SBP.B;
+                        hierarchyPolicies[i] = HierarchyAxisBroadcast.Instance;
                     }
                     else
                     {
@@ -191,7 +188,7 @@ public class Conv2DEvaluator : IEvaluator<Conv2D>, ITypeInferencer<Conv2D>, ICos
             }
         }
 
-        var polices = DistributedUtility.NDSBPToAxisPolices(ndsbp, outType.Shape.Rank);
+        var polices = DistributedUtility.ToTensorAxisPolicies(hierarchyPolicies, outType.Shape.Rank);
 
         return new DistributedType(outType, polices, input.Placement);
     }

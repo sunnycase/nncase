@@ -40,7 +40,7 @@ public partial class BinaryEvaluator : IEvaluator<Binary>, ITypeInferencer<Binar
                     ndsbp[i] = policyA!;
                     break;
                 case (SBPSplit sa, SBPSplit sb):
-                    if (sa.Axes != sb.Axes)
+                    if (!DistributedUtility.IsSamePolicy(sa, sb, checkGranularity: false))
                     {
                         return new InvalidType($"lhs rhs sbp at {i} not equal");
                     }

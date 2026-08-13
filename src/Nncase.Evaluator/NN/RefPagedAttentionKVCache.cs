@@ -118,7 +118,7 @@ public sealed record RefPagedAttentionKVCache(
             switch (config.ShardingAxes[shardId])
             {
                 case PagedKVCacheDimKind.NumBlocks:
-                    var parallelism = config.AxisPolicies[shardId].Axes.Select(axis => placement.Hierarchy[axis]).Product();
+                    var parallelism = config.AxisPolicies[shardId].HierarchyAxes.Select(axis => placement.Hierarchy[axis]).Product();
                     if (numBlocks < parallelism && !DistributedUtility.IsDivideExactly(numBlocks, parallelism))
                     {
                         throw new InvalidOperationException("numBlocks < parallelism");
@@ -128,7 +128,7 @@ public sealed record RefPagedAttentionKVCache(
                     var value = (int)System.Math.DivRem(physicalSlotId, numBlockTile, out physicalSlotId);
                     slotMappingTensor[indices] = value;
                     break;
-                case PagedKVCacheDimKind.NumKVHeads when config.AxisPolicies[shardId].Axes.Count == 1:
+                case PagedKVCacheDimKind.NumKVHeads when config.AxisPolicies[shardId].HierarchyAxes.Count == 1:
                     slotMappingTensor[indices] = -1; // todo should matching the kv sharding.
                     break;
                 default:
@@ -149,7 +149,7 @@ public sealed record RefPagedAttentionKVCache(
             switch (config.ShardingAxes[topoId])
             {
                 case PagedKVCacheDimKind.NumBlocks:
-                    var parallelism = config.AxisPolicies[topoId].Axes.Select(axis => placement.Hierarchy[axis]).Product();
+                    var parallelism = config.AxisPolicies[topoId].HierarchyAxes.Select(axis => placement.Hierarchy[axis]).Product();
                     if (numBlocks < parallelism && !DistributedUtility.IsDivideExactly(numBlocks, parallelism))
                     {
                         throw new InvalidOperationException("numBlocks < parallelism");

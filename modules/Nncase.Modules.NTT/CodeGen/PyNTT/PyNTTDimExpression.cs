@@ -417,14 +417,13 @@ internal sealed class PyNTTDimExpressionEmitter : ExprFunctor<PyNTTDimExpression
     private PyNTTDimExpression EmitLocalShardDim(LocalShardDim op, BaseExpr dimExpr)
     {
         var globalDim = EmitScalarExpression(dimExpr);
-        if (op.AxisPolicy is not SBPSplit split || split.Axes.Count == 0)
+        if (op.AxisPolicy is not SBPSplit split || split.HierarchyAxes.Count == 0)
         {
             return globalDim;
         }
 
-        var axes = split.Axes.ToArray();
         var hierarchy = op.Placement.Hierarchy.ToArray();
-        foreach (var axis in axes)
+        foreach (var axis in split.HierarchyAxes)
         {
             if (axis < 0 || axis >= hierarchy.Length)
             {
@@ -432,22 +431,66 @@ internal sealed class PyNTTDimExpressionEmitter : ExprFunctor<PyNTTDimExpression
             }
         }
 
-        var shardCount = axes.Select(axis => hierarchy[axis]).Aggregate(1, checked((lhs, rhs) => lhs * rhs));
-        if (shardCount == 1)
+        var parentExtent = globalDim;
+        foreach (var stage in split.Stages)
         {
-            return globalDim;
+            var axes = stage.HierarchyAxes.ToArray();
+            var shardCount = axes.Select(axis => hierarchy[axis]).Aggregate(1, checked((lhs, rhs) => lhs * rhs));
+            if (shardCount == 1)
+            {
+                continue;
+            }
+
+            var shardIndex = BuildSubShardLinearIndex(axes, hierarchy);
+            parentExtent = stage.Distribution switch
+            {
+                ContiguousSplit contiguous => EmitContiguousLocalExtent(
+                    parentExtent,
+                    contiguous.Granularity is { } granularity
+                        ? Visit(granularity)
+                        : CeilDiv(parentExtent, Const(shardCount)),
+                    shardIndex,
+                    shardCount),
+                BlockCyclicSplit blockCyclic => EmitBlockCyclicLocalExtent(
+                    parentExtent,
+                    shardIndex,
+                    shardCount,
+                    blockCyclic.BlockSize),
+                _ => throw new NotSupportedException(
+                    $"Unsupported PyNTT split distribution {stage.Distribution.GetType().Name}."),
+            };
         }
 
-        var localDim = split.Granularity is { } granularity
-            ? Visit(granularity)
-            : CeilDiv(globalDim, Const(shardCount));
-        var shardOffset = Multiply(BuildSubShardLinearIndex(axes, hierarchy), localDim);
-        if (CanUseFullLocalDim(globalDim, localDim, shardCount))
+        return parentExtent;
+    }
+
+    private static PyNTTDimExpression EmitContiguousLocalExtent(
+        PyNTTDimExpression parentExtent,
+        PyNTTDimExpression localCapacity,
+        PyNTTDimExpression shardIndex,
+        int shardCount)
+    {
+        if (CanUseFullLocalDim(parentExtent, localCapacity, shardCount))
         {
-            return localDim;
+            return localCapacity;
         }
 
-        return Maximum(PyNTTDimExpression.Zero, Minimum(localDim, Subtract(globalDim, shardOffset)));
+        var shardOffset = Multiply(shardIndex, localCapacity);
+        return Maximum(PyNTTDimExpression.Zero, Minimum(localCapacity, Subtract(parentExtent, shardOffset)));
+    }
+
+    private static PyNTTDimExpression EmitBlockCyclicLocalExtent(
+        PyNTTDimExpression parentExtent,
+        PyNTTDimExpression shardIndex,
+        int shardCount,
+        long blockSize)
+    {
+        var period = checked(shardCount * blockSize);
+        var fullBlocks = Multiply(FloorDiv(parentExtent, Const(period)), Const(blockSize));
+        var tail = Subtract(
+            Modulo(parentExtent, Const(period)),
+            Multiply(shardIndex, Const(blockSize)));
+        return Add(fullBlocks, Maximum(PyNTTDimExpression.Zero, Minimum(Const(blockSize), tail)));
     }
 
     private static PyNTTDimExpression BuildSubShardLinearIndex(IReadOnlyList<int> axes, IReadOnlyList<int> hierarchy)
@@ -679,6 +722,50 @@ internal sealed class PyNTTDimExpressionEmitter : ExprFunctor<PyNTTDimExpression
             null,
             rangeMin,
             rangeMax)
+            .EnsureEquivalence();
+    }
+
+    private static PyNTTDimExpression FloorDiv(PyNTTDimExpression numerator, PyNTTDimExpression denominator)
+    {
+        if (denominator.FixedValue is not > 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(denominator), "Floor division requires a positive fixed denominator.");
+        }
+
+        var divisor = denominator.FixedValue.Value;
+        if (numerator.FixedValue.HasValue)
+        {
+            return Const(numerator.FixedValue.Value / divisor);
+        }
+
+        return new PyNTTDimExpression(
+            $"(({numerator.PythonExpression}) // {divisor.ToString(CultureInfo.InvariantCulture)})",
+            $"(({numerator.TritonExpression}) // {divisor.ToString(CultureInfo.InvariantCulture)})",
+            null,
+            numerator.MinValue.HasValue ? numerator.MinValue.Value / divisor : null,
+            numerator.MaxValue.HasValue ? numerator.MaxValue.Value / divisor : null)
+            .EnsureEquivalence();
+    }
+
+    private static PyNTTDimExpression Modulo(PyNTTDimExpression numerator, PyNTTDimExpression denominator)
+    {
+        if (denominator.FixedValue is not > 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(denominator), "Modulo requires a positive fixed denominator.");
+        }
+
+        var divisor = denominator.FixedValue.Value;
+        if (numerator.FixedValue.HasValue)
+        {
+            return Const(numerator.FixedValue.Value % divisor);
+        }
+
+        return new PyNTTDimExpression(
+            $"(({numerator.PythonExpression}) % {divisor.ToString(CultureInfo.InvariantCulture)})",
+            $"(({numerator.TritonExpression}) % {divisor.ToString(CultureInfo.InvariantCulture)})",
+            null,
+            0,
+            divisor - 1)
             .EnsureEquivalence();
     }
 

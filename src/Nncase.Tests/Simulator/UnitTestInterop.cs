@@ -299,7 +299,7 @@ public class UnitTestInterop
                 new[] { 32 },
                 new[] { 2 },
                 new[] { IR.NN.PagedKVCacheDimKind.NumBlocks },
-                new[] { SBP.S([1, 2]) });
+                new[] { SBP.SContiguous([1, 2]) });
             var rtConfig = RTAttentionConfig.FromConfig(config);
             Assert.IsType<RTPagedAttentionConfig>(rtConfig);
             var rtPagedConfig = (RTPagedAttentionConfig)rtConfig;
@@ -309,7 +309,7 @@ public class UnitTestInterop
             Assert.True(rtPagedConfig.ValueVectorizedAxes.SequenceEqual([IR.NN.PagedKVCacheDimKind.NumKVHeads]));
             Assert.True(rtPagedConfig.KeyLanes.SequenceEqual([32]));
             Assert.True(rtPagedConfig.ValueLanes.SequenceEqual([2]));
-            Assert.True(rtPagedConfig.AxisPolicies.SequenceEqual([SBP.S([1, 2])]));
+            Assert.True(rtPagedConfig.AxisPolicies.SequenceEqual([SBP.SContiguous([1, 2])]));
         }
     }
 

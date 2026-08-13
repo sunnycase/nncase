@@ -35,7 +35,13 @@ public static class KernelUtility
     {
         if (value is SBPSplit s)
         {
-            return $"S<{string.Join(", ", s.Axes)}>({new CSourceConvertVisitor().Visit(s.Granularity as BaseExpr ?? None.Default).Name})";
+            if (s.Stages.Count != 1 || s.Stages[0].Distribution is not ContiguousSplit contiguous)
+            {
+                throw new NotSupportedException(
+                    $"The NTT CPU C ABI supports exactly one contiguous split stage, got {s}.");
+            }
+
+            return $"S<{string.Join(", ", s.Stages[0].HierarchyAxes)}>({new CSourceConvertVisitor().Visit(contiguous.Granularity as BaseExpr ?? None.Default).Name})";
         }
         else
         {

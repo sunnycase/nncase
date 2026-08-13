@@ -712,8 +712,13 @@ public static class LayoutUtilities
             throw new NotSupportedException();
         }
 
+        if (!split.IsContiguous)
+        {
+            throw new NotSupportedException("A strided layout tiler cannot represent block-cyclic shards.");
+        }
+
         var tiles = new List<IntValue>();
-        foreach (var axis in split.Axes)
+        foreach (var axis in split.HierarchyAxes)
         {
             var outer = placement.Hierarchy[axis];
             Trace.Assert(dim % outer == 0);

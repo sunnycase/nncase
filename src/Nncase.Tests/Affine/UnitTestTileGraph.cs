@@ -206,11 +206,11 @@ public sealed class UnitTestTileGraph : TestClassBase
         var dataType = new VectorType(DataTypes.Float32, [2, 8]);
         var source = new DistributedType(
             new TensorType(dataType, new[] { 20, 8 }),
-            new SBP[] { SBP.B, SBP.S([1], 1) },
+            new SBP[] { SBP.B, SBP.SContiguous([1], 1) },
             placement);
         var result = new DistributedType(
             new TensorType(dataType, new[] { 20, 1, 8 }),
-            new SBP[] { SBP.B, SBP.B, SBP.S([1], 1) },
+            new SBP[] { SBP.B, SBP.B, SBP.SContiguous([1], 1) },
             placement);
 
         Assert.True(IR.Affine.BufferViewUtility.TryCreate(source, result, out var transform));
@@ -228,11 +228,11 @@ public sealed class UnitTestTileGraph : TestClassBase
         var dataType = new VectorType(DataTypes.BFloat16, [4, 8]);
         var source = new DistributedType(
             new TensorType(dataType, new[] { 20, 64 }),
-            new SBP[] { SBP.B, SBP.S([1], 8) },
+            new SBP[] { SBP.B, SBP.SContiguous([1], 8) },
             placement);
         var result = new DistributedType(
             new TensorType(dataType, new[] { 20, 16, 4 }),
-            new SBP[] { SBP.B, SBP.S([1], 2), SBP.B },
+            new SBP[] { SBP.B, SBP.SContiguous([1], 2), SBP.B },
             placement);
 
         Assert.True(IR.Affine.BufferViewUtility.TryCreate(source, result, out _));
@@ -244,15 +244,36 @@ public sealed class UnitTestTileGraph : TestClassBase
         var placement = new Placement([8], "b", "b");
         var source = new DistributedType(
             new TensorType(new VectorType(DataTypes.BFloat16, [8]), new[] { 4, 8 }),
-            new SBP[] { SBP.B, SBP.S([0], 1) },
+            new SBP[] { SBP.B, SBP.SContiguous([0], 1) },
             placement);
         var incompatibleResult = new DistributedType(
             new TensorType(DataTypes.BFloat16, new[] { 4, 64 }),
-            new SBP[] { SBP.B, SBP.S([0], 1) },
+            new SBP[] { SBP.B, SBP.SContiguous([0], 1) },
             placement);
         var compatibleResult = new DistributedType(
             new TensorType(DataTypes.BFloat16, new[] { 4, 64 }),
-            new SBP[] { SBP.B, SBP.S([0], 8) },
+            new SBP[] { SBP.B, SBP.SContiguous([0], 8) },
+            placement);
+
+        Assert.False(IR.Affine.BufferViewUtility.TryCreate(source, incompatibleResult, out _));
+        Assert.True(IR.Affine.BufferViewUtility.TryCreate(source, compatibleResult, out _));
+    }
+
+    [Fact]
+    public void TestVectorBitcastScalesBlockCyclicShardUnitsInByteDomain()
+    {
+        var placement = new Placement([4, 8], "yx", "bb");
+        var source = new DistributedType(
+            new TensorType(new VectorType(DataTypes.BFloat16, [8]), new[] { 1, 256 }),
+            new SBP[] { SBP.B, SBP.SBlockCyclic([0, 1], 1) },
+            placement);
+        var incompatibleResult = new DistributedType(
+            new TensorType(DataTypes.BFloat16, new[] { 1, 2048 }),
+            new SBP[] { SBP.B, SBP.SBlockCyclic([0, 1], 1) },
+            placement);
+        var compatibleResult = new DistributedType(
+            new TensorType(DataTypes.BFloat16, new[] { 1, 2048 }),
+            new SBP[] { SBP.B, SBP.SBlockCyclic([0, 1], 8) },
             placement);
 
         Assert.False(IR.Affine.BufferViewUtility.TryCreate(source, incompatibleResult, out _));
@@ -313,11 +334,11 @@ public sealed class UnitTestTileGraph : TestClassBase
         var placement = new Placement([4, 8], "yx", "bb");
         var sourceType = new DistributedType(
             new TensorType(new VectorType(DataTypes.BFloat16, [8]), new[] { 4, 8 }),
-            new SBP[] { SBP.S([0], 1), SBP.S([1], 1) },
+            new SBP[] { SBP.SContiguous([0], 1), SBP.SContiguous([1], 1) },
             placement);
         var resultType = new DistributedType(
             new TensorType(DataTypes.BFloat16, new[] { 4, 64 }),
-            new SBP[] { SBP.S([0], 1), SBP.S([1], 8) },
+            new SBP[] { SBP.SContiguous([0], 1), SBP.SContiguous([1], 8) },
             placement);
         Assert.True(IR.Affine.BufferViewUtility.TryCreate(sourceType, resultType, out var transform));
         var source = T.CreateBuffer(sourceType.TensorType, MemoryLocation.Input, out _, distributedType: sourceType);
@@ -355,7 +376,7 @@ public sealed class UnitTestTileGraph : TestClassBase
         var placement = new Placement([4, 8], "yx", "bb");
         var distributedType = new DistributedType(
             new TensorType(DataTypes.BFloat16, new Dimension[] { sequenceLength, 8, 128 }),
-            new SBP[] { SBP.S([0], Dimension.CeilDiv(sequenceLength, 4)), SBP.S([1], 1), SBP.B },
+            new SBP[] { SBP.SContiguous([0], Dimension.CeilDiv(sequenceLength, 4)), SBP.SContiguous([1], 1), SBP.B },
             placement);
         var input = new Var("input", distributedType);
         var output = new Var("output", distributedType);
@@ -426,10 +447,10 @@ public sealed class UnitTestTileGraph : TestClassBase
         var placement = new Placement([4, 8], "yx", "bb");
         var physicalInput = new Var(
             "physical_input",
-            new DistributedType(scalarType, new SBP[] { SBP.B, SBP.S([0, 1], 32) }, placement));
+            new DistributedType(scalarType, new SBP[] { SBP.B, SBP.SContiguous([0, 1], 32) }, placement));
         var physicalOutput = new Var(
             "physical_output",
-            new DistributedType(packedType, new SBP[] { SBP.B, SBP.S([0, 1], 4) }, placement));
+            new DistributedType(packedType, new SBP[] { SBP.B, SBP.SContiguous([0, 1], 4) }, placement));
         var accesses = logicalGrid.Accesses.ToArray();
         accesses[0] = accesses[0].With(value: physicalInput, buffer: IR.F.Buffer.BufferOf(physicalInput));
         accesses[1] = accesses[1].With(value: physicalOutput, buffer: IR.F.Buffer.BufferOf(physicalOutput));
@@ -477,7 +498,7 @@ public sealed class UnitTestTileGraph : TestClassBase
     public void TestAffineDomainIntersectionPreservesUnevenLocalShardWithVectorView()
     {
         var placement = new Placement([4, 8], "yx", "bb");
-        var localN = new AsDim(IR.F.Tensors.LocalShardDim(4748L, SBP.S([0, 1], 149), placement))
+        var localN = new AsDim(IR.F.Tensors.LocalShardDim(4748L, SBP.SContiguous([0, 1], 149), placement))
         {
             Metadata = new()
             {
@@ -1153,8 +1174,8 @@ public sealed class UnitTestTileGraph : TestClassBase
     {
         var placement = new Placement([4], "b", "b");
         var tensorType = new TensorType(DataTypes.Float32, new[] { 32, 16 });
-        var inputType = new DistributedType(tensorType, new SBP[] { SBP.S([0], 0), SBP.B }, placement);
-        var outputType = new DistributedType(tensorType, new SBP[] { SBP.B, SBP.S([0], 1) }, placement);
+        var inputType = new DistributedType(tensorType, new SBP[] { SBP.SContiguous([0], 0), SBP.B }, placement);
+        var outputType = new DistributedType(tensorType, new SBP[] { SBP.B, SBP.SContiguous([0], 1) }, placement);
         var input = new Var("input", inputType);
         var boxing = IR.F.Distributed.Boxing(input, outputType);
         var function = new Function("main", Targets.CPUTarget.Kind, boxing, [input]);
@@ -1188,7 +1209,7 @@ public sealed class UnitTestTileGraph : TestClassBase
     {
         var placement = new Placement([4], "b", "b");
         var tensorType = new TensorType(DataTypes.Float32, new[] { 32, 16 });
-        var outputType = new DistributedType(tensorType, new SBP[] { SBP.S([0], 8), SBP.B }, placement);
+        var outputType = new DistributedType(tensorType, new SBP[] { SBP.SContiguous([0], 8), SBP.B }, placement);
         var input = new Var("input", tensorType);
         var boxing = IR.F.Distributed.Boxing(input, outputType);
         var function = new Function("main", Targets.CPUTarget.Kind, boxing, [input]);
@@ -1228,8 +1249,8 @@ public sealed class UnitTestTileGraph : TestClassBase
     {
         var placement = new Placement([4], "b", "b");
         var tensorType = new TensorType(DataTypes.Float32, new[] { 32, 16 });
-        var inputType = new DistributedType(tensorType, new SBP[] { SBP.B, SBP.S([0], 1) }, placement, SBP.P([0], ReduceOp.Sum));
-        var outputType = new DistributedType(tensorType, new SBP[] { SBP.B, SBP.S([0], 1) }, placement);
+        var inputType = new DistributedType(tensorType, new SBP[] { SBP.B, SBP.SContiguous([0], 1) }, placement, SBP.P([0], ReduceOp.Sum));
+        var outputType = new DistributedType(tensorType, new SBP[] { SBP.B, SBP.SContiguous([0], 1) }, placement);
         var input = new Var("input", inputType);
         var boxing = IR.F.Distributed.Boxing(input, outputType);
         var function = new Function("main", Targets.CPUTarget.Kind, boxing, [input]);
@@ -1258,9 +1279,9 @@ public sealed class UnitTestTileGraph : TestClassBase
         using var ctx = IntegerSetLibrary.ctx.Create();
         var placement = new Placement([4], "b", "b");
         var tensorType = new TensorType(DataTypes.Float32, new[] { 32, 16 });
-        var inputType = new DistributedType(tensorType, new SBP[] { SBP.S([0], 0), SBP.B }, placement);
+        var inputType = new DistributedType(tensorType, new SBP[] { SBP.SContiguous([0], 0), SBP.B }, placement);
         var intermediateType = new DistributedType(tensorType, new SBP[] { SBP.B, SBP.B }, placement);
-        var outputType = new DistributedType(tensorType, new SBP[] { SBP.B, SBP.S([0], 1) }, placement);
+        var outputType = new DistributedType(tensorType, new SBP[] { SBP.B, SBP.SContiguous([0], 1) }, placement);
         var input = new Var("input", inputType);
         var intermediate = IR.F.Distributed.Boxing(input, intermediateType);
         var output = IR.F.Distributed.Boxing(intermediate, outputType);
@@ -1388,7 +1409,7 @@ public sealed class UnitTestTileGraph : TestClassBase
         var placement = new Placement(new[] { 4, 8 }, "yx", "bb");
         var inputType = new DistributedType(
             new TensorType(new VectorType(DataTypes.BFloat16, [8]), new long[] { 20, 128 }),
-            new SBP[] { SBP.S([0], 5), SBP.S([1], 16) },
+            new SBP[] { SBP.SContiguous([0], 5), SBP.SContiguous([1], 16) },
             placement);
         var input = new Var("input", inputType);
         var stats = IR.F.NN.NormStats(1, input, useMean: false);

@@ -287,7 +287,7 @@ public sealed class RTPagedAttentionConfig : RTAttentionConfig, IPagedAttentionC
                 var policy = new int[len];
                 Native.PagedAttentionConfigGetAxisPolicy(this, i, policy, len).ThrowIfFailed();
 
-                policies.Add(SBP.S(policy));
+                policies.Add(SBP.SContiguous(policy));
             }
 
             return policies.ToArray();
@@ -301,8 +301,8 @@ public sealed class RTPagedAttentionConfig : RTAttentionConfig, IPagedAttentionC
                 Native.PagedAttentionConfigSetAxisPolicy(
                     this,
                     i,
-                    policy.Axes.ToArray(),
-                    policy.Axes.Count).ThrowIfFailed();
+                    policy.HierarchyAxes.ToArray(),
+                    policy.HierarchyAxes.Count).ThrowIfFailed();
             }
         }
     }
@@ -314,8 +314,8 @@ public sealed class RTPagedAttentionConfig : RTAttentionConfig, IPagedAttentionC
         var flattenedPolicies = new List<int>();
         foreach (var policy in cfg.AxisPolicies)
         {
-            policyLengths.Add(policy.Axes.Count);
-            flattenedPolicies.AddRange(policy.Axes);
+            policyLengths.Add(policy.HierarchyAxes.Count);
+            flattenedPolicies.AddRange(policy.HierarchyAxes);
         }
 
         // 2. Create config

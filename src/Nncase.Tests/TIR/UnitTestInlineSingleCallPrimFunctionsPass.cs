@@ -20,6 +20,7 @@ public sealed class UnitTestInlineSingleCallPrimFunctionsPass : TestClassBase
     [Fact]
     public async Task TestTIRSelectionPreservesNonTensorParameterIdentity()
     {
+        CompileOptions.TargetOptions = new Nncase.Targets.NTTTargetOptions();
         var layerId = new DimVar("layer_id") { Metadata = { Range = new(1, 16) } };
         var input = new Var("input", new TensorType(DataTypes.Float32, new[] { 16 }));
         var slice = IR.F.Tensors.Slice(
@@ -488,12 +489,67 @@ public sealed class UnitTestInlineSingleCallPrimFunctionsPass : TestClassBase
         var specializedCallee = specializedModule.Functions.OfType<PrimFunction>().Single(function => function.Name == "callee");
         var specializedParameter = Assert.IsType<BufferVar>(Assert.Single(specializedCallee.Parameters.ToArray()));
         Assert.Equal(BufferLayoutKind.ExactStrided, specializedParameter.LayoutAnnotation.Kind);
+        Assert.Equal(DistributedBufferStorageKind.CompactLocal, specializedParameter.LayoutAnnotation.DistributedStorageKind);
         Assert.Equal(3L, specializedParameter.LayoutAnnotation.Strides[0].FixedValue);
         var specializedBuffer = ExprCollector.Collect(specializedCallee.Body)
             .OfType<Buffer>()
             .Single(buffer => ReferenceEquals(buffer.MemSpan.Buffer.Start, specializedParameter));
         Assert.Equal(3L, specializedBuffer.Strides[0].FixedValue);
         Assert.Equal(40L, specializedBuffer.MemSpan.Size.FixedValue);
+    }
+
+    [Fact]
+    public async Task TestSpecializePrimFunctionBufferLayoutPreservesCanonicalGlobalStorage()
+    {
+        var tensorType = new TensorType(DataTypes.Float32, new[] { 4 });
+        var placement = new Placement([2], "b", "b");
+        var distributedType = new DistributedType(
+            tensorType,
+            new SBP[] { SBP.SContiguous([0], 2) },
+            placement);
+        var formal = new BufferVar("formal", distributedType, BufferVarRole.Output, MemoryLocation.Output);
+        var formalBuffer = T.AttachBuffer(
+            formal,
+            tensorType,
+            MemoryLocation.Output,
+            0,
+            out _,
+            "formal_buffer",
+            distributedType);
+        var callee = new PrimFunction(
+            "callee",
+            ModuleKind,
+            new Sequential(new Call(new LoadT(), formalBuffer, formalBuffer)),
+            new IVar[] { formal });
+        var actual = new Buffer(
+            "actual",
+            DataTypes.Float32,
+            new MemSpan(new PhysicalBuffer(DataTypes.Float32.SizeInBytes, 16, MemoryLocation.ChipLocalData)),
+            new Dimension[] { 2 },
+            new Dimension[] { 1 },
+            distributedType,
+            distributedStorageKind: DistributedBufferStorageKind.CanonicalGlobal);
+        var caller = new PrimFunction(
+            "caller",
+            ModuleKind,
+            new Sequential(new Call(callee, actual)),
+            System.Array.Empty<IVar>());
+        var module = new IRModule(caller);
+        module.Add(callee);
+
+        var specializedModule = await new SpecializePrimFunctionBufferLayoutsPass().RunAsync(module, new());
+
+        var specializedCallee = specializedModule.Functions
+            .OfType<PrimFunction>()
+            .Single(function => function.Name == "callee");
+        var specializedParameter = Assert.IsType<BufferVar>(Assert.Single(specializedCallee.Parameters.ToArray()));
+        Assert.Equal(
+            DistributedBufferStorageKind.CanonicalGlobal,
+            specializedParameter.LayoutAnnotation.DistributedStorageKind);
+        var specializedBuffer = ExprCollector.Collect(specializedCallee.Body)
+            .OfType<Buffer>()
+            .Single(buffer => ReferenceEquals(buffer.MemSpan.Buffer.Start, specializedParameter));
+        Assert.Equal(DistributedBufferStorageKind.CanonicalGlobal, specializedBuffer.DistributedStorageKind);
     }
 
     [Fact]
@@ -505,11 +561,11 @@ public sealed class UnitTestInlineSingleCallPrimFunctionsPass : TestClassBase
             new[] { 4, 8 });
         var packedDistributedType = new DistributedType(
             packedType,
-            new SBP[] { SBP.B, SBP.S([0], 4) },
+            new SBP[] { SBP.B, SBP.SContiguous([0], 4) },
             placement);
         var scalarDistributedType = new DistributedType(
             new TensorType(DataTypes.BFloat16, new[] { 4, 64 }),
-            new SBP[] { SBP.B, SBP.S([0], 32) },
+            new SBP[] { SBP.B, SBP.SContiguous([0], 32) },
             placement);
         var formal = new BufferVar(
             "formal",

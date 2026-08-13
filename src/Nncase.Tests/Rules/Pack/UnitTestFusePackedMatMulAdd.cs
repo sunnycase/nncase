@@ -140,7 +140,7 @@ public sealed class UnitTestFusePackedMatMulAdd : TransformTestBase
                 new TensorType(
                     new VectorType(DataTypes.BFloat16, [8, 2, 8]),
                     new long[] { 4, 16 }),
-                new SBP[] { SBP.B, SBP.S([0, 1], 1) },
+                new SBP[] { SBP.B, SBP.SContiguous([0, 1], 1) },
                 placement));
         var packedMatMul = Assert.IsType<Call>(IR.F.NTT.PackedMatMul(
             lhs,

@@ -69,6 +69,8 @@ public interface INTTTargetOptions : ITargetOptions
 
     Schedule.ILoopPipelineBackend LoopPipelineBackend { get; }
 
+    Utilities.IDistributedSplitCandidateProvider DistributedSplitCandidateProvider { get; }
+
     string DistributedScheme { get; set; }
 
     string CustomOpScheme { get; set; }

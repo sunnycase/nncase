@@ -23,7 +23,7 @@ nncase IR
   -> AutoDistributed (chip/die/block placement)
   -> TIR Selection + target microkernel/resource selection
   -> bufferize + shared-arena offsets + function ABI + synchronization
-  -> PyNTT manifest v8
+  -> PyNTT manifest v9
   -> reader-only Jinja renderer
   -> Triton kernels and Python model
 ```
@@ -106,8 +106,9 @@ Templates under `pyntt/pyntt/codegen/templates/triton/` own:
   stages within the compiler-reserved byte arena;
 - producer/consumer synchronization internal to a template;
 - Triton encodings and implementation of the selected microkernel contract;
-- deriving a concrete host TMA descriptor shape, stride, block shape, and
-  padding policy from the selected algorithm and compiler-provided backing;
+- deriving concrete host TMA descriptor or per-owner descriptor-table entries,
+  including shape, stride, block shape, and padding policy, from the selected
+  algorithm and compiler-provided backing;
 - use of `tl.dot`, reductions, vectorized accesses, and backend hints;
 - architecture-specific decision trees and optional Triton autotuning.
 
@@ -129,8 +130,8 @@ Generated `model.py` and the PyNTT runtime own:
 - shape-bucket selection;
 - one-time Triton specialization and direct prepared-launch binding;
 - passing dimensions, strides, workspace pointers, and tuning choices;
-- materializing and caching host Triton tensor descriptors from generated
-  descriptor specifications;
+- materializing and caching host Triton tensor descriptors or aligned device
+  descriptor tables from generated descriptor specifications;
 - installing the Triton scratch allocator only when grid synchronization
   requires it;
 - load/run separation and stable model state.
@@ -155,7 +156,7 @@ For PyNTT the relevant late pipeline is:
    Shared storage, assigns arena offsets, and forms function workspace ABI;
    later passes inline single-use helpers where legal, plan semantic memory
    synchronization, and canonicalize index expressions.
-4. PyNTT codegen validates the resulting TIR and emits manifest v8.
+4. PyNTT codegen validates the resulting TIR and emits manifest v9.
 
 There must be no `AutoTilingPass` dump for a PyNTT compilation.
 
@@ -238,8 +239,9 @@ or reinterpret the backing layout.
 
 ### Host Tensor Descriptor ABI
 
-Algorithms that use TMA receive a host-created Triton tensor descriptor as a
-kernel argument. Device code must not call `tl.make_tensor_descriptor`.
+Algorithms that use TMA receive either a host-created Triton tensor descriptor
+or a pointer to a host-encoded tensor-map table. Device code must not call
+`tl.make_tensor_descriptor`.
 
 The compiler serializes only facts owned by TIR and Bufferize:
 
@@ -255,19 +257,31 @@ and padding policy. It emits the result in
 tile and re-render an existing manifest without recompiling the model, provided
 the selected microkernel resource reservation remains valid.
 
-Generated `model.py` binds each descriptor source, and the runtime constructs a
-`triton.tools.tensor_descriptor.TensorDescriptor` before launch. Descriptors
-are cached by kernel/ABI slot and replaced when the backing pointer or
-descriptor configuration changes, so repeated inference does not rebuild them
-or retain an unbounded set of allocations.
+Generated `model.py` binds each descriptor source. The runtime materializes the
+renderer-selected descriptor ABI and caches it by kernel/ABI slot, backing
+pointer, and complete descriptor configuration:
 
-A descriptor for a distributed tensor describes the single global backing.
-The generated device helper adds its compiler-derived shard origin to TMA
-coordinates and accesses only the local shard. Per-shard backing pools and
-block-local storage cannot be exposed as one global descriptor and fail
-codegen. Descriptor shape, strides, offsets, and block shape are validated
-before construction; unsupported dynamic descriptor metadata fails rather
-than becoming a device-side fallback.
+- `single` is one `triton.tools.tensor_descriptor.TensorDescriptor` passed by
+  value. It is used when one rectangular tensor map describes the backing.
+- `table` is one 128-byte `CUtensorMap` entry per hierarchy owner, concatenated
+  in a 128-byte-aligned CUDA byte buffer and passed as one pointer. The active
+  block selects its entry by linear hierarchy owner, performs tensor-map proxy
+  acquire, and reinterprets the entry against the destination Shared memdesc.
+
+The table ABI is the exact lowering for distributed local views described by
+ordered `SplitStage` mappings, including owners with different active extents.
+For example, distributing 18,992 packed N entries over 32 block-cyclic owners
+gives sixteen 594-entry maps and sixteen 593-entry maps; the final TMA tile uses
+descriptor OOB fill for its tail. It avoids 32 kernel arguments and avoids
+reconstructing descriptors on the hot path. A partial final block for
+`BlockCyclic(BlockSize > 1)` is not one rectangular tensor map and therefore
+fails validation until a formally richer representation exists.
+
+Every entry still derives from the authoritative compiler-provided global
+backing. Per-shard backing without a stable address/span contract and
+BlockLocal storage are rejected. Shape, strides, offsets, entry alignment,
+block shape, and source span are validated before construction; unsupported
+dynamic metadata fails rather than becoming a device-side fallback.
 
 ## Distribution and Launch
 
@@ -290,15 +304,16 @@ The first invocation of a generated top kernel calls
 `JITFunction.prepare()`. The generated model passes the complete kernel ABI and
 an explicit ordered list of dynamic argument indices. The prepared launch plan
 retains compiler-owned workspace/rdata pointers, static strides and extents,
-host TMA descriptors, tuning constants, and the compiled CUDA launcher. Its hot
-path receives only runtime input/output pointers, dynamic ABI strides and
-dimensions, and other truly dynamic scalar values. It does not rebuild a
-specialization key, query the JIT cache, recreate TMA descriptors, or expand
-the full argument list in Python.
+host TMA descriptors or descriptor-table pointers, tuning constants, and the
+compiled CUDA launcher. Its hot path receives only runtime input/output
+pointers, dynamic ABI strides and dimensions, and other truly dynamic scalar
+values. It does not rebuild a specialization key, query the JIT cache, recreate
+TMA descriptors, or expand the full argument list in Python.
 
 The CUDA backend lowers the prepared plan into a native capsule. `prepare()`
 parses static pointers, scalars, launch metadata, and by-value TMA maps once;
-`launch_prepared()` parses only the flattened dynamic ABI. Each launch copies
+`launch_prepared()` parses only the flattened dynamic ABI. By-value single maps
+and descriptor-table pointers are both static bindings. Each launch copies
 the immutable native argument storage to its stack before filling dynamic
 slots, so concurrent launches do not mutate shared argument state.
 
@@ -373,9 +388,9 @@ Synchronization has two owners:
 `tle.distributed_barrier` is emitted only for a TIR grid-wide dependency.
 Template-internal barriers are not represented as manifest pipeline tables.
 
-## Manifest v8
+## Manifest v9
 
-`kernel_params.json` is a reader-only rendering manifest. Version 8 is the only
+`kernel_params.json` is a reader-only rendering manifest. Version 9 is the only
 accepted version.
 
 The root object contains exactly:
@@ -421,7 +436,7 @@ the live compiler-owned pool or Shared-arena parameters referenced by that
 helper. This exact list avoids extending every specialization region across
 unrelated top-function ABI values.
 
-Version 8 has no pipeline execution tables, typed Shared aliases, local-buffer
+Version 9 has no pipeline execution tables, typed Shared aliases, local-buffer
 tables, storage encodings, or compiler-generated reduction bodies.
 `num_warps` and launch tuning remain renderer-owned. A selected microkernel may
 include `num_stages` when it changes compiler-reserved workspace capacity. The
@@ -494,9 +509,9 @@ Typical matrix templates should:
 Fused projections such as QKV use one concatenated logical N domain. Their
 producer and consumer each contain one N-tile loop and one nested K-tile loop;
 they must not render separate Q-tile, K-tile, and V-tile loop nests. The
-producer routes each fixed-size portion of the current logical N tile to its
-Q, K, or V host descriptor and places all portions in one contiguous Shared
-stage. The consumer computes that complete tile once, then masks and rebases
+producer routes each fixed-size portion of the current logical N tile to its Q,
+K, or V per-owner descriptor entry and places all portions in one contiguous
+Shared stage. The consumer computes that complete tile once, then masks and rebases
 the result into the three output buffers. A tile crossing a projection
 boundary therefore performs multiple TMA transfers into disjoint Shared
 subviews without duplicating the tile computation.
@@ -582,7 +597,7 @@ No path returns fake success or changes backend silently.
 Validation is layered:
 
 1. C# target tests verify stage ownership, direct TIR selection, canonical
-   None/value/Tuple Shared operands, Bufferize allocation/offsets, manifest v8,
+   None/value/Tuple Shared operands, Bufferize allocation/offsets, manifest v9,
    strict rejection of scheduled TIR, function ABI, and generated source.
 2. Python package tests verify exact manifest reading, rendering, runtime tensor
    validation, workspace/rdata reuse, and removed-field rejection.
@@ -626,9 +641,9 @@ This architecture is implemented when:
 - scheduled TIR is rejected at the codegen boundary;
 - target microkernel resource reservations are bufferized into one Shared arena
   and emitted as named byte offsets with the arena size and alignment;
-- TMA algorithms receive validated host-created descriptors and emit no
-  device-side descriptor construction;
-- manifest v8 contains no compiler-generated block schedule or typed Shared
+- TMA algorithms receive validated host-created single descriptors or
+  per-owner descriptor tables and emit no device-side descriptor construction;
+- manifest v9 contains no compiler-generated block schedule or typed Shared
   alias representation;
 - templates own loops, tails, shared staging, pipelines, encodings, and
   microkernels;

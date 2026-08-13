@@ -1,14 +1,23 @@
 {% macro pipeline_setup(stage) -%}
 {% set stage_model = stage["Model"] %}
 {% set stage_ctx = packed_qkv_gemv_pipeline_context(stage_model) %}
+{% set shared_buffer_shape = [stage_ctx["num_stages"]] + (stage_ctx["shared_stage_shape"] | list) %}
 {{ stage["StageName"] }}__rhs_stages = tle.gpu.alloc(
-    [{{ stage_ctx["num_stages"] }}, {{ stage_ctx["shared_stage_shape"] | join(", ") }}],
+    [{{ shared_buffer_shape | join(", ") }}],
     dtype={{ stage_model["WeightTritonDType"] }},
-    layout=None,
+    layout=tle.gpu.nv_tma_shared_layout(
+        [{{ shared_buffer_shape | join(", ") }}],
+        [{{ range((shared_buffer_shape | length) - 1, -1, -1) | join(", ") }}],
+        {{ stage_model["WeightTritonDType"] }},
+        [{% for _ in shared_buffer_shape %}1{{ ", " if not loop.last }}{% endfor %}],
+        [{% for _ in shared_buffer_shape %}1{{ ", " if not loop.last }}{% endfor %}],
+        [{{ range((shared_buffer_shape | length) - 1, -1, -1) | join(", ") }}],
+        False,
+        True,
+    ),
     scope=tle.gpu.smem,
     alias=pyntt_shared_arena,
     alias_offset_bytes={{ stage["SharedWorkspaceOffsets"]["rhs_stage"] }},
-    nv_mma_shared_layout=True,
 )
 {{ stage["PipeName"] }} = tle.pipe(
     capacity={{ stage_ctx["num_stages"] }},
@@ -27,7 +36,7 @@
         [{{ ctx["consumer_size_per_thread"] | join(", ") }}],
         [{{ ctx["consumer_threads_per_warp"] | join(", ") }}],
         [{{ ctx["consumer_warps_per_cta"] | join(", ") }}],
-        [1, 0],
+        [0, 1],
     )
 )
 {{ ctx["consumer_lhs_layout_name"] }} = tl.constexpr(
@@ -47,6 +56,15 @@
 {{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
 def {{ model["FunctionName"] }}__producer(writer, {{ helper_parameters(model) }}):
 {{ common.mesh_coordinates(model["MeshAxes"]) }}
+{% for projection in ctx["projections"] %}
+    {{ projection["lower"] }}_descriptor_entry = tle.gpu.tensor_map_table_entry(
+        {{ projection["descriptor_name"] }},
+        shard_index,
+    )
+    tle.gpu.tensor_map_fenceproxy_acquire(
+        {{ projection["lower"] }}_descriptor_entry
+    )
+{% endfor %}
     for n_tile in tl.static_range(
         0,
         {{ ctx["num_n_tiles"] }},
@@ -59,31 +77,26 @@ def {{ model["FunctionName"] }}__producer(writer, {{ helper_parameters(model) }}
 {% for tile in ctx["transfer_tiles"] %}
             {{ "if" if loop.first else "elif" }} n_tile == {{ tile["tile_index"] }}:
 {% for copy in tile["copies"] %}
-                descriptor_k = (
-                    {{ dim(copy["descriptor_global_k_outer_offset"]) }}
-                    + k_tile * {{ ctx["packed_k_outer"] }}
-                ).to(tl.int32)
-                descriptor_n = (
-                    {{ dim(copy["descriptor_global_n_outer_offset"]) }}
-                    + {{ copy["descriptor_projection_n_outer_offset"] }}
-                ).to(tl.int32)
 {% if copy["copy_is_full_stage"] %}
                 copy_destination = slot.weight
 {% else %}
                 copy_destination = slot.weight.subslice(
-                    [{{ copy["destination_n_outer_offset"] }}, 0, 0, 0],
+                    [{{ copy["destination_offsets"] | join(", ") }}],
                     [{{ copy["copy_shape"] | join(", ") }}],
                 )
 {% endif %}
+                {{ copy["lower"] }}_descriptor = tle.gpu.reinterpret_tensor_map(
+                    {{ copy["lower"] }}_descriptor_entry,
+                    copy_destination,
+                )
                 tle.gpu.copy(
-                    {{ copy["descriptor_name"] }},
+                    {{ copy["lower"] }}_descriptor,
                     copy_destination,
                     [{{ copy["copy_shape"] | join(", ") }}],
                     offsets=[
-                        descriptor_n,
-                        descriptor_k,
-                        0,
-                        {{ copy["descriptor_origin_elements"] }},
+{% for offset in copy["descriptor_offsets"] %}
+                        {{ tma_offset(offset) }},
+{% endfor %}
                     ],
                 )
 {% endfor %}
@@ -154,10 +167,12 @@ def {{ model["FunctionName"] }}__consumer(reader, {{ helper_parameters(model) }}
                 weight_ptr = tle.gpu.local_ptr(
                     ready.slot.weight,
                     (
-                        local_n // {{ model["NVectorLaneCount"] }},
-                        shared_k // {{ ctx["k_atom"] }},
-                        shared_payload // {{ ctx["tma_contiguous_extent"] }},
-                        shared_payload % {{ ctx["tma_contiguous_extent"] }},
+{% for index in ctx["shared_weight_indices"] %}
+                        tle.encoding(
+                            {{ index }},
+                            {{ ctx["consumer_weight_layout_name"] }},
+                        ),
+{% endfor %}
                     ),
                     shape=({{ ctx["block_n"] }}, {{ ctx["reduction_group"] }}),
                 )

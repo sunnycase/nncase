@@ -78,7 +78,7 @@ public sealed class PagedAttentionKVCacheTestData : TheoryData<TestFixture.Paged
     private static readonly (PagedKVCacheDimKind[] Sharding, SBPSplit[] Policies, Placement Placement)[] ShardingConfigs =
     [
         (Array.Empty<PagedKVCacheDimKind>(), Array.Empty<SBPSplit>(), new Placement(new[] { 1 }, "b", "b")),
-        (new[] { PagedKVCacheDimKind.NumBlocks }, new[] { SBP.S([0]) }, new Placement(new[] { 1 }, "b", "b")),
+        (new[] { PagedKVCacheDimKind.NumBlocks }, new[] { SBP.SContiguous([0]) }, new Placement(new[] { 1 }, "b", "b")),
     ];
 
     private static readonly (AttentionDimKind[] QLayout, AttentionDimKind[] KLayout)[] QKLayoutConfigs =
@@ -114,7 +114,7 @@ public sealed class PagedAttentionKVCacheTestData : TheoryData<TestFixture.Paged
             }
         }
 
-        Add(new TestFixture.PagedAttentionKVCacheTestFixture([4], [4], 4, 2, 32, 8, 32, Runtime.TypeCode.Float32, 1, [PagedKVCacheDimKind.NumLayers, PagedKVCacheDimKind.NumBlocks, PagedKVCacheDimKind.KV, PagedKVCacheDimKind.NumKVHeads, PagedKVCacheDimKind.HeadDim, PagedKVCacheDimKind.BlockSize], [PagedKVCacheDimKind.HeadDim], new[] { PagedKVCacheDimKind.NumBlocks }, new[] { SBP.S([0]) }, [AttentionDimKind.Head, AttentionDimKind.Dim, AttentionDimKind.Seq], [AttentionDimKind.Head, AttentionDimKind.Dim, AttentionDimKind.Seq]), new Placement(new[] { 1 }, "b", "b"));
+        Add(new TestFixture.PagedAttentionKVCacheTestFixture([4], [4], 4, 2, 32, 8, 32, Runtime.TypeCode.Float32, 1, [PagedKVCacheDimKind.NumLayers, PagedKVCacheDimKind.NumBlocks, PagedKVCacheDimKind.KV, PagedKVCacheDimKind.NumKVHeads, PagedKVCacheDimKind.HeadDim, PagedKVCacheDimKind.BlockSize], [PagedKVCacheDimKind.HeadDim], new[] { PagedKVCacheDimKind.NumBlocks }, new[] { SBP.SContiguous([0]) }, [AttentionDimKind.Head, AttentionDimKind.Dim, AttentionDimKind.Seq], [AttentionDimKind.Head, AttentionDimKind.Dim, AttentionDimKind.Seq]), new Placement(new[] { 1 }, "b", "b"));
     }
 }
 
@@ -159,8 +159,8 @@ public sealed class PagedAttentionSchedulerTestData : TheoryData<PagedAttentionC
     private static readonly (PagedKVCacheDimKind[] Sharding, SBPSplit[] Policies, int[] Hierarchy)[] ShardingConfigs =
     [
         (Array.Empty<PagedKVCacheDimKind>(), Array.Empty<SBPSplit>(), Array.Empty<int>()),
-        (new[] { PagedKVCacheDimKind.NumBlocks }, new[] { SBP.S([0]) }, new[] { 1 }),
-        (new[] { PagedKVCacheDimKind.NumBlocks }, new[] { SBP.S([0]) }, new[] { 8 }),
+        (new[] { PagedKVCacheDimKind.NumBlocks }, new[] { SBP.SContiguous([0]) }, new[] { 1 }),
+        (new[] { PagedKVCacheDimKind.NumBlocks }, new[] { SBP.SContiguous([0]) }, new[] { 8 }),
     ];
 
     public PagedAttentionSchedulerTestData()

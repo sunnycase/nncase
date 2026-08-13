@@ -15,15 +15,8 @@
 {{ indent }}gather_index = tl.where(gather_index < 0, gather_index + {{ dim(model["InputGlobalShape"][model["Axis"]]) }}, gather_index)
 {% endif %}
 {{ indent }}input_active = (gather_index >= 0) & (gather_index < {{ dim(model["InputGlobalShape"][model["Axis"]]) }})
-{% if not ctx["gather_split_axes"] %}
-{{ indent }}local_gather_index = gather_index
-{% else %}
-{{ indent }}input_local_dim = {{ dim(model["InputShape"][model["Axis"]]) }}
-{{ indent }}input_split_linear = {{ ctx["input_split_linear"] }}
-{{ indent }}input_global_base = input_split_linear * input_local_dim
-{{ indent }}local_gather_index = gather_index - input_global_base
-{{ indent }}input_active = input_active & (gather_index >= input_global_base) & (gather_index < input_global_base + input_local_dim)
-{% endif %}
+{{ indent }}local_gather_index = {{ ctx["local_gather_index"] }}
+{{ indent }}input_active = input_active & ({{ ctx["input_owner_active"] }})
 {{ indent }}value = tl.load({{ access_pointer(model, "Input", "input", ctx["input_access"]) }}, mask=mask & input_active, other=0.0)
 {{ indent }}tl.store({{ access_pointer(model, "Output", "output", ctx["output_access"]) }}, value, mask=mask)
 {% endcall %}

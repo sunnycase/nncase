@@ -9,6 +9,7 @@ using Nncase.CostModel;
 using Nncase.Diagnostics;
 using Nncase.IR;
 using Nncase.IR.Tensors;
+using Nncase.Utilities;
 using OrtKISharp;
 
 namespace Nncase.Evaluator.Tensors;
@@ -93,15 +94,23 @@ public class CastEvaluator : IEvaluator<Cast>, ITypeInferencer<Cast>, IOpPrinter
                 var outShape = CompilerServices.GetMaxShape(ttOut.Shape);
                 if (vtIn.ElemType != vtOut.ElemType)
                 {
-                    var divisor = split.Axes.Select(a => inType.Placement.Hierarchy[a]).Aggregate(1, (a, b) => a * b);
+                    var divisor = split.HierarchyAxes.Select(a => inType.Placement.Hierarchy[a]).Aggregate(1, (a, b) => a * b);
                     if (shape[i] % divisor != 0 || outShape[i] % divisor != 0)
                     {
                         return invalid;
                     }
                     else
                     {
-                        var scale = 1f * outShape[i] / shape[i];
-                        ndsbp[i] = SBP.S(split.Axes, split.Granularity is not null ? (scale >= 1 ? split.Granularity * (long)scale : split.Granularity / (long)(1f / scale)) : null);
+                        if (!DistributedUtility.TryScaleSplitUnits(
+                            split,
+                            outShape[i],
+                            shape[i],
+                            out var scaledSplit))
+                        {
+                            return invalid;
+                        }
+
+                        ndsbp[i] = scaledSplit;
                     }
                 }
             }

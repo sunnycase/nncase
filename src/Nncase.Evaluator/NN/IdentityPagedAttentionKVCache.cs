@@ -25,8 +25,8 @@ public sealed class IdentityPagedAttentionKVCacheEvaluator : ITypeInferencer<Ide
                 {
                     // for kv cache.
                     if (distType.TensorType.Shape.Rank > 3 &&
-                        distType.AxisPolicies[0] is SBPSplit { Axes: [1] } &&
-                        distType.AxisPolicies[1] is SBPSplit { Axes: [2, 3] } &&
+                        distType.AxisPolicies[0] is SBPSplit { HierarchyAxes: [1] } &&
+                        distType.AxisPolicies[1] is SBPSplit { HierarchyAxes: [2, 3] } &&
                         distType.AxisPolicies.Skip(2).All(x => x is SBPBroadCast))
                     {
                         return distType;

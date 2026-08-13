@@ -70,18 +70,27 @@ internal static class PyNTTRDataUtility
         var shardIndex = GetScopedShardIndex(shard, targetOptions, scopeName);
         foreach (var (@const, range) in localRdatas)
         {
-            var tensor = ((TensorConst)@const).Value;
             var distributedType = (DistributedType)@const.CheckedType;
-            (var localOffsetExpr, var localShapeExpr) = DistributedUtility.GetLocalOffsetAndShape(distributedType, shardIndex, DistributedUtility.DivideFlags.MaxShape);
-            var localOffset = new RankedShape(localOffsetExpr).ToValueArray();
-            var localShape = new RankedShape(localShapeExpr).ToValueArray();
-            var linearOffset = TensorUtilities.GetLinearOffset(tensor.Strides, localOffset);
+            var descriptor = DistributedUtility.GetLocalShardDescriptor(
+                distributedType,
+                shardIndex,
+                DistributedUtility.DivideFlags.MaxShape);
+            var localShape = descriptor.ActiveShape.ToValueArray();
 
             builder.Append(range.Min);
             builder.Append(':');
             builder.Append(range.Max);
             builder.Append(':');
-            builder.Append(linearOffset);
+            builder.AppendJoin(
+                ',',
+                distributedType.AxisPolicies
+                    .OfType<SBPSplit>()
+                    .SelectMany(split => split.HierarchyAxes)
+                    .Distinct()
+                    .OrderBy(axis => axis)
+                    .Select(axis => shardIndex[axis]));
+            builder.Append(':');
+            builder.AppendJoin(',', distributedType.AxisPolicies.Select(policy => policy.ToString()));
             builder.Append(':');
             builder.AppendJoin(',', localShape);
             builder.Append(';');

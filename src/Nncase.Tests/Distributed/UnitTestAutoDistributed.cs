@@ -1,6 +1,7 @@
 ﻿// Copyright (c) Canaan Inc. All rights reserved.
 // Licensed under the Apache license. See LICENSE file in the project root for full license information.
 
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -52,6 +53,110 @@ public sealed class UnitTestDistribAutoDistributed : TestClassBase
         var main = new Function("main", lhs + rhs, [lhs, rhs]);
         var pass = new AutoDistributedPass(false, CPUTarget.Kind, CompileOptions);
         pass.RunAsync(main, new()).Wait();
+    }
+
+    [Fact]
+    public void TestBinaryCandidateProviderPropagatesExactProducerSplit()
+    {
+        var options = new PyNTTTargetOptions
+        {
+            HierarchyNames = "yx",
+            HierarchyLevels = "bb",
+            Hierarchies = [new[] { 4, 8 }],
+        };
+        CompileOptions.TargetOptions = options;
+        var tensorType = new TensorType(
+            new VectorType(DataTypes.BFloat16, [8]),
+            new RankedShape(1, 256));
+        var placement = new Placement([4, 8], "yx", "bb");
+        var broadcastType = new DistributedType(tensorType, [SBP.B, SBP.B], placement);
+        var canonicalSplitType = new DistributedType(
+            tensorType,
+            [SBP.B, SBP.SBlockCyclic([0, 1], 8)],
+            placement);
+        var producerSplitType = new DistributedType(
+            tensorType,
+            [SBP.B, SBP.SBlockCyclic([0, 1], 1)],
+            placement);
+        var lhs = new Var("lhs", tensorType);
+        var rhs = new Var("rhs", tensorType);
+        var sourceCall = Assert.IsType<Call>(IR.F.Math.Add(lhs, rhs));
+        Assert.True(sourceCall.InferenceType());
+        var context = new DistributedCandidateContext(
+            CompileOptions,
+            options,
+            PyNTTTarget.Kind,
+            sourceCall,
+            [
+                new IRType[] { broadcastType, canonicalSplitType },
+                new IRType[] { producerSplitType },
+            ]);
+        var provider = new BinaryCandidateProvider();
+        var target = Assert.IsType<Binary>(sourceCall.Target);
+
+        var returnTypes = provider.GetReturnCandidateTypes(
+            context,
+            target,
+            [broadcastType, canonicalSplitType]);
+        Assert.Contains(producerSplitType, returnTypes);
+        Assert.True(provider.TryGetInputTypeTuples(
+            context,
+            target,
+            producerSplitType,
+            out var tuples));
+        var tuple = Assert.Single(tuples);
+        Assert.Equal(producerSplitType, tuple.InputTypes[0]);
+        Assert.Equal(producerSplitType, tuple.InputTypes[1]);
+    }
+
+    [Fact]
+    public void TestAutoDistributedPropagatesPackedMatMulSplitThroughAdd()
+    {
+        var options = new PyNTTTargetOptions
+        {
+            HierarchyNames = "yx",
+            HierarchyLevels = "bb",
+            Hierarchies = [new[] { 4, 8 }],
+        };
+        CompileOptions.TargetOptions = options;
+        var lhs = new Var(
+            "lhs",
+            new TensorType(DataTypes.BFloat16, new RankedShape(1, 64)));
+        var rhs = new Var(
+            "rhs",
+            new TensorType(
+                new VectorType(DataTypes.BFloat16, [8, 2, 8]),
+                new RankedShape(4, 16)));
+        var packedMatMul = Assert.IsType<Call>(IR.F.NTT.PackedMatMul(
+            lhs,
+            rhs,
+            outDataType: DataTypes.BFloat16,
+            rhsLayout: IR.NTT.PackedMatMulRhsLayout.KMajor));
+        var residual = new Var("residual", packedMatMul.CheckedType);
+        var main = new Function(
+            "main",
+            IR.F.Math.Add(residual, packedMatMul),
+            [lhs, rhs, residual]);
+        Assert.True(main.InferenceType());
+
+        var post = Assert.IsType<Function>(
+            new AutoDistributedPass(false, PyNTTTarget.Kind, CompileOptions)
+                .RunAsync(main, new()).Result);
+
+        var add = Assert.Single(
+            ExprCollector.Collect(post.Body)
+                .OfType<Call>()
+                .Where(call => call.Target is Binary { BinaryOp: BinaryOp.Add }));
+        var outputType = Assert.IsType<DistributedType>(add.CheckedType);
+        var split = Assert.IsType<SBPSplit>(outputType.AxisPolicies[1]);
+        Assert.NotEmpty(split.HierarchyAxes);
+        Assert.Equal(1, Assert.IsType<BlockCyclicSplit>(Assert.Single(split.Stages).Distribution).BlockSize);
+        Assert.All(
+            add.Arguments.ToArray(),
+            argument => Assert.Equal(outputType, argument.CheckedType));
+        Assert.Contains(
+            add.Arguments.ToArray(),
+            argument => argument is Call { Target: IR.Distributed.ShardedView });
     }
 
     [Fact]
@@ -208,7 +313,7 @@ public sealed class UnitTestDistribAutoDistributed : TestClassBase
     {
         var tensorType = new TensorType(DataTypes.Float32, [32]);
         var placement = new Placement([4, 8], "yx", "bb");
-        var inputType = new DistributedType(tensorType, [SBP.S([0, 1])], placement);
+        var inputType = new DistributedType(tensorType, [SBP.SContiguous([0, 1])], placement);
         var outputType = new DistributedType(tensorType, [SBP.B], placement);
         var input = new Var("input", inputType);
 
@@ -250,7 +355,7 @@ public sealed class UnitTestDistribAutoDistributed : TestClassBase
     {
         var tensorType = new TensorType(DataTypes.Float32, [32]);
         var placement = new Placement([4, 8], "yx", "bb");
-        var inputType = new DistributedType(tensorType, [SBP.S([0, 1])], placement);
+        var inputType = new DistributedType(tensorType, [SBP.SContiguous([0, 1])], placement);
         var outputType = new DistributedType(tensorType, [SBP.B], placement);
         var input = new Var("input", inputType);
 
@@ -296,15 +401,15 @@ public sealed class UnitTestDistribAutoDistributed : TestClassBase
         var placement = new Placement([4, 8], "yx", "bb");
         var exclusiveSplit = new DistributedType(
             tensorType,
-            [SBP.S([0]), SBP.S([1])],
+            [SBP.SContiguous([0]), SBP.SContiguous([1])],
             placement);
         var ySplitXReplicated = new DistributedType(
             tensorType,
-            [SBP.S([0]), SBP.B],
+            [SBP.SContiguous([0]), SBP.B],
             placement);
         var yReplicatedXSplit = new DistributedType(
             tensorType,
-            [SBP.B, SBP.S([1])],
+            [SBP.B, SBP.SContiguous([1])],
             placement);
         var broadcast = new DistributedType(tensorType, [SBP.B, SBP.B], placement);
         var partial = new DistributedType(
@@ -314,7 +419,7 @@ public sealed class UnitTestDistribAutoDistributed : TestClassBase
             SBP.P([0, 1]));
         var reduceScatter = new DistributedType(
             tensorType,
-            [SBP.S([0, 1], 1), SBP.B],
+            [SBP.SContiguous([0, 1], 1), SBP.B],
             placement);
 
         Assert.Equal(
@@ -362,11 +467,11 @@ public sealed class UnitTestDistribAutoDistributed : TestClassBase
         var multiLevelPlacement = new Placement([2, 4], "cb", "cb");
         var multiLevelSource = new DistributedType(
             tensorType,
-            [SBP.S([0]), SBP.S([1])],
+            [SBP.SContiguous([0]), SBP.SContiguous([1])],
             multiLevelPlacement);
         var sameChipShardTarget = new DistributedType(
             tensorType,
-            [SBP.S([0]), SBP.B],
+            [SBP.SContiguous([0]), SBP.B],
             multiLevelPlacement);
         var crossChipTarget = new DistributedType(
             tensorType,
@@ -382,7 +487,7 @@ public sealed class UnitTestDistribAutoDistributed : TestClassBase
         var degenerateBlockPlacement = new Placement([2, 1], "yx", "bb");
         var degenerateSource = new DistributedType(
             tensorType,
-            [SBP.S([0]), SBP.B],
+            [SBP.SContiguous([0]), SBP.B],
             degenerateBlockPlacement);
         var degenerateTarget = new DistributedType(
             tensorType,
@@ -652,7 +757,7 @@ public sealed class UnitTestDistribAutoDistributed : TestClassBase
             entry.Key.TargetType is DistributedType targetType &&
             targetType.AxisPolicies[0] is SBPBroadCast &&
             targetType.AxisPolicies[1] is SBPSplit split &&
-            split.Axes.Order().SequenceEqual(new[] { 0, 1 }) &&
+            split.HierarchyAxes.Order().SequenceEqual(new[] { 0, 1 }) &&
             entry.Key.UsageKind == DistributedReshardUsageKind.Internal).ToArray();
         Assert.NotEmpty(candidates);
         Assert.All(
@@ -720,7 +825,7 @@ public sealed class UnitTestDistribAutoDistributed : TestClassBase
                 edge.Target.IRType is DistributedType sourceType &&
                 sourceType.AxisPolicies
                     .OfType<SBPSplit>()
-                    .SelectMany(split => split.Axes)
+                    .SelectMany(split => split.HierarchyAxes)
                     .Order()
                     .SequenceEqual(new[] { 0, 1 }));
         }).ToArray();
@@ -768,24 +873,138 @@ public sealed class UnitTestDistribAutoDistributed : TestClassBase
     {
         var tensorType = new TensorType(DataTypes.Float32, [1024]);
         var placement = new Placement([36], "b", "b");
-        var policies = DistributedUtility.GetLeafCandidatePolicies(tensorType, placement);
+        var policies = DistributedUtility.GetLeafCandidatePolicies(
+            tensorType,
+            placement,
+            ContiguousDistributedSplitCandidateProvider.Instance);
 
-        Assert.Contains(policies, policy => policy.Count == 1 && policy[0] is SBPSplit split && split.Axes.SequenceEqual(new[] { 0 }));
+        Assert.Contains(policies, policy => policy.Count == 1 && policy[0] is SBPSplit split && split.HierarchyAxes.SequenceEqual(new[] { 0 }));
 
-        var distributedType = new DistributedType(tensorType, new SBP[] { SBP.S([0]) }, placement);
+        var distributedType = new DistributedType(tensorType, new SBP[] { SBP.SContiguous([0]) }, placement);
         Assert.Equal(new[] { 1015L }, new RankedShape(DistributedUtility.GetLocalOffsetAndShape(distributedType, new[] { 35 }).Offset).ToValueArray());
         Assert.Equal(new[] { 9L }, new RankedShape(DistributedUtility.GetLocalOffsetAndShape(distributedType, new[] { 35 }).Shape).ToValueArray());
 
-        var skinnyType = new DistributedType(new TensorType(DataTypes.Float32, new[] { 37L }), new SBP[] { SBP.S([0]) }, placement);
+        var skinnyType = new DistributedType(new TensorType(DataTypes.Float32, new[] { 37L }), new SBP[] { SBP.SContiguous([0]) }, placement);
         Assert.Equal(new[] { 0L }, new RankedShape(DistributedUtility.GetLocalOffsetAndShape(skinnyType, new[] { 35 }).Shape).ToValueArray());
+    }
+
+    [Fact]
+    public void TestBlockCyclicLocalShardDescriptor()
+    {
+        var tensorType = new TensorType(DataTypes.Float32, [29]);
+        var placement = new Placement([4], "b", "b");
+        var distributedType = new DistributedType(
+            tensorType,
+            new SBP[] { SBP.SBlockCyclic([0], 3) },
+            placement);
+
+        var expectedActiveExtents = new long[] { 9, 8, 6, 6 };
+        for (var shard = 0; shard < placement.Hierarchy[0]; shard++)
+        {
+            var descriptor = DistributedUtility.GetLocalShardDescriptor(
+                distributedType,
+                new[] { shard });
+            Assert.Equal(new[] { 9L }, descriptor.LocalCapacityShape.ToValueArray());
+            Assert.Equal(new[] { expectedActiveExtents[shard] }, descriptor.ActiveShape.ToValueArray());
+        }
+
+        var shard0 = DistributedUtility.GetLocalShardDescriptor(distributedType, new[] { 0 });
+        Assert.Equal(
+            new long[] { 0, 1, 2, 12, 13, 14, 24, 25, 26 },
+            Enumerable.Range(0, 9)
+                .Select(index => shard0.Axes[0].MapLocalToGlobal(index).FixedValue)
+                .ToArray());
+        var shard1 = DistributedUtility.GetLocalShardDescriptor(distributedType, new[] { 1 });
+        Assert.Equal(
+            new long[] { 3, 4, 5, 15, 16, 17, 27, 28 },
+            Enumerable.Range(0, 8)
+                .Select(index => shard1.Axes[0].MapLocalToGlobal(index).FixedValue)
+                .ToArray());
+        Assert.Throws<InvalidOperationException>(
+            () => DistributedUtility.GetLocalOffsetAndShape(distributedType, new[] { 0 }));
+    }
+
+    [Fact]
+    public void TestOrderedSplitStagesComposeAcrossPhysicalLevels()
+    {
+        var tensorType = new TensorType(DataTypes.Float32, [1000]);
+        var placement = new Placement([2, 4, 8], "cyx", "cbb");
+        var split = SBP.S(
+            SplitStage.Contiguous([0]),
+            SplitStage.BlockCyclic([1, 2], 4));
+        var distributedType = new DistributedType(tensorType, new SBP[] { split }, placement);
+        var descriptor = DistributedUtility.GetLocalShardDescriptor(
+            distributedType,
+            new[] { 1, 2, 7 });
+
+        Assert.Equal(new[] { 16L }, descriptor.LocalCapacityShape.ToValueArray());
+        Assert.Equal(new[] { 16L }, descriptor.ActiveShape.ToValueArray());
+        Assert.Equal(592, descriptor.Axes[0].MapLocalToGlobal(0).FixedValue);
+        Assert.Equal(720, descriptor.Axes[0].MapLocalToGlobal(4).FixedValue);
+    }
+
+    [Fact]
+    public void TestSplitStageJsonIsStrictAndRoundTrips()
+    {
+        var options = new JsonSerializerOptions();
+        options.Converters.Add(new SBPConverter());
+        SBP policy = SBP.S(
+            SplitStage.Contiguous([0], 64),
+            SplitStage.BlockCyclic([1, 2], 8));
+
+        var json = JsonSerializer.Serialize(policy, options);
+        var roundTrip = JsonSerializer.Deserialize<SBP>(json, options);
+
+        Assert.Equal(policy, roundTrip);
+        Assert.Contains("\"Stages\"", json, StringComparison.Ordinal);
+        Assert.Contains("\"BlockCyclic\"", json, StringComparison.Ordinal);
+        Assert.Throws<JsonException>(() => JsonSerializer.Deserialize<SBP>(
+            "{\"$type\":\"S\",\"Axes\":[0]}",
+            options));
+        Assert.Throws<JsonException>(() => JsonSerializer.Deserialize<SBP>(
+            "{\"$type\":\"S\",\"Stages\":[{\"HierarchyAxes\":[0],\"Distribution\":{\"$type\":\"Contiguous\"}}],\"Axes\":[0]}",
+            options));
+        Assert.Throws<ArgumentException>(() => SBP.S(
+            SplitStage.Contiguous([0]),
+            SplitStage.BlockCyclic([0], 8)));
+    }
+
+    [Fact]
+    public void TestPyNTTSplitCandidateStagesFollowPhysicalLevels()
+    {
+        var tensorType = new TensorType(DataTypes.BFloat16, [4096]);
+        var placement = new Placement([2, 4, 8], "cyx", "cbb");
+        var context = new DistributedSplitCandidateContext(
+            tensorType,
+            0,
+            placement,
+            new[] { 0, 1, 2 },
+            64,
+            4096);
+        var candidates = new PyNTTDistributedSplitCandidateProvider(128)
+            .GetCandidates(context);
+
+        var staged = Assert.Single(candidates);
+        Assert.Collection(
+            staged.Stages,
+            stage =>
+            {
+                Assert.Equal(new[] { 0 }, stage.HierarchyAxes.ToArray());
+                Assert.IsType<ContiguousSplit>(stage.Distribution);
+            },
+            stage =>
+            {
+                Assert.Equal(new[] { 1, 2 }, stage.HierarchyAxes.ToArray());
+                Assert.Equal(64, Assert.IsType<BlockCyclicSplit>(stage.Distribution).BlockSize);
+            });
     }
 
     [Fact]
     public void TestD2DBoxingRejectsDifferentTensorType()
     {
         var placement = new Placement([4, 8], "yx", "bb");
-        var source = new DistributedType(new TensorType(DataTypes.Float32, [16, 32]), new SBP[] { SBP.S([0]), SBP.S([1]) }, placement);
-        var target = new DistributedType(new TensorType(DataTypes.Float32, [16, 8, 4]), new SBP[] { SBP.S([0]), SBP.S([1]), SBP.B }, placement);
+        var source = new DistributedType(new TensorType(DataTypes.Float32, [16, 32]), new SBP[] { SBP.SContiguous([0]), SBP.SContiguous([1]) }, placement);
+        var target = new DistributedType(new TensorType(DataTypes.Float32, [16, 8, 4]), new SBP[] { SBP.SContiguous([0]), SBP.SContiguous([1]), SBP.B }, placement);
         var rewriter = new AutoDistributedRewriter(CompileOptions, (INTTTargetOptions)CompileOptions.TargetOptions, AutoDistributedPhase.Final, CPUTarget.Kind);
 
         var method = typeof(AutoDistributedRewriter).GetMethod("CheckBoxingType", BindingFlags.Instance | BindingFlags.NonPublic);
@@ -865,7 +1084,7 @@ public sealed class UnitTestDistribAutoDistributed : TestClassBase
                 && distributed.TensorType == tensorType
                 && distributed.Placement == placement
                 && distributed.AxisPolicies is [SBPSplit split]
-                && split.Axes.SequenceEqual(axes);
+                && split.HierarchyAxes.SequenceEqual(axes);
     }
 
     [Fact]
@@ -874,16 +1093,20 @@ public sealed class UnitTestDistribAutoDistributed : TestClassBase
         var sequenceLength = new DimVar("sequence_length") { Metadata = { Range = (1, 1024) } };
         var tensorType = new TensorType(DataTypes.Float32, [sequenceLength]);
         var placement = new Placement([4], "y", "b");
-        var policies = DistributedUtility.GetLeafCandidatePolicies(tensorType, placement);
+        var policies = DistributedUtility.GetLeafCandidatePolicies(
+            tensorType,
+            placement,
+            ContiguousDistributedSplitCandidateProvider.Instance);
 
         var split = policies
             .Select(policy => policy.SingleOrDefault() as SBPSplit)
-            .Single(policy => policy is not null && policy.Axes.SequenceEqual(new[] { 0 }))!;
-        Assert.NotNull(split.Granularity);
-        Assert.False(split.Granularity.IsFixed);
-        Assert.True(split.Granularity.Metadata.Range.HasValue);
-        Assert.Equal(1d, split.Granularity.Metadata.Range.Value.Min);
-        Assert.Equal(256d, split.Granularity.Metadata.Range.Value.Max);
+            .Single(policy => policy is not null && policy.HierarchyAxes.SequenceEqual(new[] { 0 }))!;
+        var contiguous = Assert.IsType<ContiguousSplit>(Assert.Single(split.Stages).Distribution);
+        Assert.NotNull(contiguous.Granularity);
+        Assert.False(contiguous.Granularity.IsFixed);
+        Assert.True(contiguous.Granularity.Metadata.Range.HasValue);
+        Assert.Equal(1d, contiguous.Granularity.Metadata.Range.Value.Min);
+        Assert.Equal(256d, contiguous.Granularity.Metadata.Range.Value.Max);
 
         var distributedType = new DistributedType(tensorType, new SBP[] { split }, placement);
         var dividedShape = DistributedUtility.GetDividedTensorType(distributedType).Shape;
@@ -899,10 +1122,10 @@ public sealed class UnitTestDistribAutoDistributed : TestClassBase
     {
         var tensorType = new TensorType(DataTypes.Float32, [32, 64]);
         var placement = new Placement([4, 8], "yx", "bb");
-        var source = new DistributedType(tensorType, new SBP[] { SBP.B, SBP.S([1]) }, placement, SBP.P([1]));
+        var source = new DistributedType(tensorType, new SBP[] { SBP.B, SBP.SContiguous([1]) }, placement, SBP.P([1]));
         var noPartial = new DistributedType(tensorType, source.AxisPolicies, placement);
         var broadcast = new DistributedType(tensorType, new SBP[] { SBP.B, SBP.B }, placement);
-        var target = new DistributedType(tensorType, new SBP[] { SBP.S([0]), SBP.B }, placement);
+        var target = new DistributedType(tensorType, new SBP[] { SBP.SContiguous([0]), SBP.B }, placement);
 
         var plans = DistributedReshardPlanner.Plan(source, target, CanBox);
 
@@ -945,7 +1168,7 @@ public sealed class UnitTestDistribAutoDistributed : TestClassBase
                 var reduceScatter = Assert.IsType<DistributedType>(plan.StepTypes[0]);
                 Assert.Null(reduceScatter.Partial);
                 var split = Assert.Single(reduceScatter.AxisPolicies.OfType<SBPSplit>());
-                Assert.Equal(new[] { 0, 1 }, split.Axes.ToArray());
+                Assert.Equal(new[] { 0, 1 }, split.HierarchyAxes.ToArray());
                 Assert.Equal(target, plan.StepTypes[1]);
             });
 
@@ -961,7 +1184,7 @@ public sealed class UnitTestDistribAutoDistributed : TestClassBase
                     intermediate.Partial is null &&
                     intermediate.AxisPolicies
                         .OfType<SBPSplit>()
-                        .Any(split => split.Axes.SequenceEqual(new[] { 0, 1 }))
+                        .Any(split => split.HierarchyAxes.SequenceEqual(new[] { 0, 1 }))
                 : output == target;
         }
     }
@@ -971,8 +1194,8 @@ public sealed class UnitTestDistribAutoDistributed : TestClassBase
     {
         var tensorType = new TensorType(DataTypes.Float32, [32, 64]);
         var placement = new Placement([4, 8], "yx", "bb");
-        var source = new DistributedType(tensorType, new SBP[] { SBP.B, SBP.S([1]) }, placement);
-        var target = new DistributedType(tensorType, new SBP[] { SBP.S([0]), SBP.B }, placement);
+        var source = new DistributedType(tensorType, new SBP[] { SBP.B, SBP.SContiguous([1]) }, placement);
+        var target = new DistributedType(tensorType, new SBP[] { SBP.SContiguous([0]), SBP.B }, placement);
 
         var plans = DistributedReshardPlanner.Plan(source, target, (_, _) => true);
 

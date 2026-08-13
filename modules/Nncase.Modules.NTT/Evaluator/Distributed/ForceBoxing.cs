@@ -17,8 +17,8 @@ public sealed class ForceBoxingEvaluator : ITypeInferencer<ForceBoxing>, ICostEv
     {
         IRType VisitD2D(DistributedType inv, DistributedType outv)
         {
-            var ndsbpsA = DistributedUtility.AxisPolicesToNDSBP(inv.AxisPolicies, inv.Placement.Rank).ToArray();
-            var ndsbpsB = DistributedUtility.AxisPolicesToNDSBP(outv.AxisPolicies, outv.Placement.Rank).ToArray();
+            var ndsbpsA = DistributedUtility.GetHierarchyAxisPolicies(inv.AxisPolicies, inv.Placement.Rank).ToArray();
+            var ndsbpsB = DistributedUtility.GetHierarchyAxisPolicies(outv.AxisPolicies, outv.Placement.Rank).ToArray();
 
             // TODO: add more invalid cases
             if (ndsbpsA.Distinct().Count() == 1 && ndsbpsB.Distinct().Count() == 1 && ndsbpsA[0] == ndsbpsB[0] && inv.Partial == outv.Partial)
@@ -26,16 +26,16 @@ public sealed class ForceBoxingEvaluator : ITypeInferencer<ForceBoxing>, ICostEv
                 return new InvalidType("Same NDSBP");
             }
 
-            if (ndsbpsA.Any(sbp => sbp is SBPPartial))
+            if (ndsbpsA.Any(sbp => sbp is HierarchyAxisPartial))
             {
-                var nonPartialSumPos = Enumerable.Range(0, ndsbpsA.Length).Where(i => ndsbpsA[i] is not SBPPartial);
-                if (nonPartialSumPos.Any(i => ndsbpsA[i] is SBPSplit && ndsbpsB[i] is SBPBroadCast))
+                var nonPartialSumPos = Enumerable.Range(0, ndsbpsA.Length).Where(i => ndsbpsA[i] is not HierarchyAxisPartial);
+                if (nonPartialSumPos.Any(i => ndsbpsA[i] is HierarchyAxisSplit && ndsbpsB[i] is HierarchyAxisBroadcast))
                 {
                     return new InvalidType("Not supported input is Split output is BroadCast");
                 }
 
-                var partialSumPos = Enumerable.Range(0, ndsbpsA.Length).Where(i => ndsbpsA[i] is SBPPartial);
-                if (partialSumPos.Any(i => ndsbpsA[i] is SBPPartial && ndsbpsB[i] is SBPSplit))
+                var partialSumPos = Enumerable.Range(0, ndsbpsA.Length).Where(i => ndsbpsA[i] is HierarchyAxisPartial);
+                if (partialSumPos.Any(i => ndsbpsB[i] is HierarchyAxisSplit))
                 {
                     return new InvalidType("Not supported input is Partial output is Split");
                 }
@@ -43,16 +43,16 @@ public sealed class ForceBoxingEvaluator : ITypeInferencer<ForceBoxing>, ICostEv
                 return outv;
             }
 
-            if (ndsbpsB.Any(sbp => sbp is SBPPartial))
+            if (ndsbpsB.Any(sbp => sbp is HierarchyAxisPartial))
             {
-                var nonPartialSumPos = Enumerable.Range(0, ndsbpsB.Length).Where(i => ndsbpsB[i] is not SBPPartial);
-                if (nonPartialSumPos.Any(i => ndsbpsA[i] is SBPSplit && ndsbpsB[i] is SBPBroadCast))
+                var nonPartialSumPos = Enumerable.Range(0, ndsbpsB.Length).Where(i => ndsbpsB[i] is not HierarchyAxisPartial);
+                if (nonPartialSumPos.Any(i => ndsbpsA[i] is HierarchyAxisSplit && ndsbpsB[i] is HierarchyAxisBroadcast))
                 {
                     return new InvalidType("Not supported input is Split output is BroadCast");
                 }
 
-                var partialSumPos = Enumerable.Range(0, ndsbpsB.Length).Where(i => ndsbpsB[i] is SBPPartial);
-                if (partialSumPos.Any(i => ndsbpsA[i] is SBPSplit && ndsbpsB[i] is SBPPartial))
+                var partialSumPos = Enumerable.Range(0, ndsbpsB.Length).Where(i => ndsbpsB[i] is HierarchyAxisPartial);
+                if (partialSumPos.Any(i => ndsbpsA[i] is HierarchyAxisSplit))
                 {
                     return new InvalidType("Not supported input is Split output is Partial");
                 }
@@ -90,8 +90,8 @@ public sealed class ForceBoxingEvaluator : ITypeInferencer<ForceBoxing>, ICostEv
         var inTenor = context.GetArgumentValueAsTensor(target, ForceBoxing.Input);
         var input = inTenor.ToOrtTensor();
         var output = input - input;
-        var ndsbps = DistributedUtility.AxisPolicesToNDSBP(target.NewType.AxisPolicies, target.NewType.Placement.Rank).ToArray();
-        var repeat = ndsbps.Select((x, i) => (x is SBPPartial) ? target.NewType.Placement.Hierarchy[i] : 1).Aggregate(1, (x, i) => x * i);
+        var ndsbps = DistributedUtility.GetHierarchyAxisPolicies(target.NewType.AxisPolicies, target.NewType.Placement.Rank).ToArray();
+        var repeat = ndsbps.Select((x, i) => (x is HierarchyAxisPartial) ? target.NewType.Placement.Hierarchy[i] : 1).Aggregate(1, (x, i) => x * i);
         for (int i = 0; i < repeat; i++)
         {
             output += input;

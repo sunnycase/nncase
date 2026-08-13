@@ -134,7 +134,9 @@ public sealed class VectorizedLayerNormEvaluator : IEvaluator<VectorizedLayerNor
             var biasPolicy = i - raxis >= 0 ? bias.AxisPolicies[i - raxis] : null;
             switch (input.AxisPolicies[i], scalePolicy, biasPolicy)
             {
-                case (SBPSplit si, SBPSplit ss, SBPSplit sb) when i >= raxis && si.Axes == ss.Axes && ss.Axes == sb.Axes:
+                case (SBPSplit si, SBPSplit ss, SBPSplit sb) when i >= raxis &&
+                    DistributedUtility.IsSamePolicy(si, ss, checkGranularity: false) &&
+                    DistributedUtility.IsSamePolicy(ss, sb, checkGranularity: false):
                     // FIXME: not support on axes for now
 #if true
                     return invalid;

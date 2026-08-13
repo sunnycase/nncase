@@ -499,15 +499,23 @@ public static class TypeInference
                 continue;
             }
 
-            var localGranularity = split.Granularity
-                ?? Dimension.CeilDiv(input.TensorType.Shape[axis], GetSplitDivisor(split, input.Placement));
+            var localGranularity = DistributedUtility.GetLocalCapacity(
+                input.TensorType.Shape[axis],
+                split,
+                input.Placement);
             if (!Dimension.TryDivExactly(localGranularity, laneProduct, out var dividedGranularity))
             {
                 return new InvalidType(
                     $"{input}, pack axis {axis} split granularity {localGranularity} cuts vector lane group {laneProduct}");
             }
 
-            policies[axis] = SBP.S(split.Axes, split.Granularity is null ? null : dividedGranularity);
+            if (!DistributedUtility.TryScaleSplitUnits(split, 1, laneProduct, out var packedSplit))
+            {
+                return new InvalidType(
+                    $"{input}, pack axis {axis} split policy {split} cuts vector lane group {laneProduct}");
+            }
+
+            policies[axis] = packedSplit;
         }
 
         return input with { TensorType = tensorType, AxisPolicies = policies };
@@ -564,21 +572,13 @@ public static class TypeInference
                 continue;
             }
 
-            Dimension? granularity;
-            if (split.Granularity is { } splitGranularity)
+            if (!DistributedUtility.TryScaleSplitUnits(split, laneProduct, 1, out var unpackedSplit))
             {
-                granularity = splitGranularity * laneProduct;
-            }
-            else
-            {
-                var divisor = GetSplitDivisor(split, input.Placement);
-                var dimension = input.TensorType.Shape[axis];
-                granularity = dimension.IsFixed && dimension.FixedValue % divisor == 0
-                    ? null
-                    : Dimension.CeilDiv(dimension, divisor) * laneProduct;
+                return new InvalidType(
+                    $"{input}, cannot scale unpack axis {axis} split policy {split} by lane group {laneProduct}");
             }
 
-            policies[axis] = SBP.S(split.Axes, granularity);
+            policies[axis] = unpackedSplit;
         }
 
         return input with { TensorType = tensorType, AxisPolicies = policies };
@@ -847,7 +847,7 @@ public static class TypeInference
     private static int GetSplitDivisor(SBPSplit split, Placement placement)
     {
         var divisor = 1;
-        foreach (var axis in split.Axes)
+        foreach (var axis in split.HierarchyAxes)
         {
             divisor = checked(divisor * placement.Hierarchy[axis]);
         }

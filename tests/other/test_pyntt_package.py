@@ -374,6 +374,7 @@ def test_pyntt_runtime_reuses_bounded_host_tensor_descriptors():
 
     cache = TritonTensorDescriptorCache()
     spec = {
+        "kind": "single",
         "name": "rhs_descriptor",
         "source": "rdata",
         "offset_bytes": 0,
@@ -388,6 +389,50 @@ def test_pyntt_runtime_reuses_bounded_host_tensor_descriptors():
     first = cache.materialize_many("kernel", (spec,), {"rdata": storage})[0]
     second = cache.materialize_many("kernel", (spec,), {"rdata": storage})[0]
     assert second is first
+
+    replacement_storage = torch.empty_like(storage)
+    replacement = cache.materialize_many(
+        "kernel", (spec,), {"rdata": replacement_storage}
+    )[0]
+    assert replacement is not first
+
+
+def test_pyntt_runtime_reuses_per_owner_tensor_map_tables():
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("tensor-map tables require CUDA")
+    _add_pyntt_to_path()
+
+    from pyntt.runtime.triton import TritonTensorDescriptorCache
+
+    cache = TritonTensorDescriptorCache()
+    entries = tuple(
+        {
+            "offset_bytes": owner * 64,
+            "shape": (4, 16),
+            "strides": (16, 1),
+            "source_shape_axes": ((), ()),
+        }
+        for owner in range(2)
+    )
+    spec = {
+        "kind": "table",
+        "name": "rhs_descriptor_table",
+        "source": "rdata",
+        "dtype": "uint8",
+        "block_shape": (4, 16),
+        "padding": "zero",
+        "swizzle_mode": 0,
+        "entry_size_bytes": 128,
+        "entries": entries,
+    }
+    storage = torch.empty((128,), dtype=torch.uint8, device="cuda")
+    first = cache.materialize_many("kernel", (spec,), {"rdata": storage})[0]
+    second = cache.materialize_many("kernel", (spec,), {"rdata": storage})[0]
+    assert second is first
+    assert first.dtype == torch.uint8
+    assert first.numel() == 256
+    assert first.data_ptr() % 128 == 0
 
     replacement_storage = torch.empty_like(storage)
     replacement = cache.materialize_many(
@@ -414,6 +459,7 @@ def test_pyntt_runtime_validates_host_tensor_descriptor_layout(
     from pyntt.runtime.triton import TritonTensorDescriptorCache
 
     spec = {
+        "kind": "single",
         "name": "rhs_descriptor",
         "source": "rdata",
         "offset_bytes": 0,
@@ -516,6 +562,252 @@ def test_pyntt_renderer_preserves_shared_arena_alignment():
 
     source = render_manifest(manifest)
     assert "alignment=1024" in source
+
+
+def test_pyntt_renderer_maps_staged_block_cyclic_tma_local_coordinates():
+    _add_pyntt_to_path()
+    from pyntt.codegen.render import _tma_local_axis_transfer
+
+    def fixed(value):
+        return {"TritonExpression": str(value), "FixedValue": value}
+
+    pointer = {
+        "GlobalShape": [fixed(8192)],
+        "ShardAxes": [
+            {
+                "Stages": [
+                    {
+                        "HierarchyAxes": [0],
+                        "Distribution": "Contiguous",
+                        "Granularity": None,
+                        "BlockSize": 0,
+                    },
+                    {
+                        "HierarchyAxes": [1, 2],
+                        "Distribution": "BlockCyclic",
+                        "Granularity": None,
+                        "BlockSize": 8,
+                    },
+                ]
+            }
+        ],
+        "Hierarchy": [2, 4, 8],
+    }
+
+    transfer = _tma_local_axis_transfer(
+        pointer,
+        0,
+        fixed(0),
+        local_offset=0,
+        tile_index="n_tile",
+        tile_stride=8,
+        tile_extent=8,
+        context="test weight N",
+    )
+
+    coordinates = transfer["coordinates"]
+    assert transfer["block_shape"] == (1, 8)
+    assert "shard_coord" not in coordinates[0]
+    assert "n_tile" in coordinates[0]
+    with pytest.raises(ValueError, match="must start and advance"):
+        _tma_local_axis_transfer(
+            pointer,
+            0,
+            fixed(0),
+            local_offset=0,
+            tile_index="n_tile",
+            tile_stride=4,
+            tile_extent=8,
+            context="crossing weight N",
+        )
+
+    packed_pointer = {
+        "GlobalShape": [fixed(256)],
+        "ShardAxes": [
+            {
+                "Stages": [
+                    {
+                        "HierarchyAxes": [0, 1],
+                        "Distribution": "BlockCyclic",
+                        "Granularity": None,
+                        "BlockSize": 1,
+                    }
+                ]
+            }
+        ],
+        "Hierarchy": [4, 8],
+    }
+    packed_transfer = _tma_local_axis_transfer(
+        packed_pointer,
+        0,
+        fixed(0),
+        local_offset=0,
+        tile_index="n_tile",
+        tile_stride=8,
+        tile_extent=8,
+        context="packed weight N",
+    )
+    assert packed_transfer["block_shape"] == (8,)
+    assert len(packed_transfer["coordinates"]) == 1
+
+
+def test_pyntt_renderer_builds_exact_ragged_block_cyclic_descriptor_entries():
+    _add_pyntt_to_path()
+    from pyntt.codegen.render import _tma_descriptor_table_axis_entry
+
+    def fixed(value):
+        return {"TritonExpression": str(value), "FixedValue": value}
+
+    pointer = {
+        "GlobalShape": [fixed(18992)],
+        "ShardAxes": [
+            {
+                "Stages": [
+                    {
+                        "HierarchyAxes": [0, 1],
+                        "Distribution": "BlockCyclic",
+                        "Granularity": None,
+                        "BlockSize": 1,
+                    }
+                ]
+            }
+        ],
+        "Hierarchy": [4, 8],
+    }
+
+    owner0 = _tma_descriptor_table_axis_entry(
+        pointer, 0, (0, 0), tile_extent=8, context="lm_head N"
+    )
+    owner15 = _tma_descriptor_table_axis_entry(
+        pointer, 0, (1, 7), tile_extent=8, context="lm_head N"
+    )
+    owner16 = _tma_descriptor_table_axis_entry(
+        pointer, 0, (2, 0), tile_extent=8, context="lm_head N"
+    )
+    owner31 = _tma_descriptor_table_axis_entry(
+        pointer, 0, (3, 7), tile_extent=8, context="lm_head N"
+    )
+
+    assert owner0["descriptor_shape"] == (594,)
+    assert owner15["descriptor_shape"] == (594,)
+    assert owner16["descriptor_shape"] == (593,)
+    assert owner31["descriptor_shape"] == (593,)
+    assert owner0["stride_multipliers"] == (32,)
+    assert owner0["base"] == 0
+    assert owner15["base"] == 15
+    assert owner16["base"] == 16
+    assert owner31["base"] == 31
+
+
+def test_pyntt_renderer_maps_local_kv_head_to_block_cyclic_global_head():
+    _add_pyntt_to_path()
+    from pyntt.codegen.render import _distributed_local_to_global_coordinates
+
+    def fixed(value):
+        return {"TritonExpression": str(value), "FixedValue": value}
+
+    coordinates = _distributed_local_to_global_coordinates(
+        ("token_id", "head_id", "dim_block"),
+        [fixed(1), fixed(8), fixed(16)],
+        [fixed(0), fixed(0), fixed(0)],
+        [
+            {"Stages": []},
+            {
+                "Stages": [
+                    {
+                        "HierarchyAxes": [1],
+                        "Distribution": "BlockCyclic",
+                        "Granularity": None,
+                        "BlockSize": 1,
+                    }
+                ]
+            },
+            {"Stages": []},
+        ],
+        [4, 8],
+    )
+
+    assert coordinates[0] == "token_id"
+    assert "head_id" in coordinates[1]
+    assert "shard_coord1" in coordinates[1]
+    assert "* 8" in coordinates[1]
+    assert coordinates[2] == "dim_block"
+
+    offset_coordinates = _distributed_local_to_global_coordinates(
+        ("0",),
+        [fixed(32)],
+        [fixed(1)],
+        [
+            {
+                "Stages": [
+                    {
+                        "HierarchyAxes": [1],
+                        "Distribution": "BlockCyclic",
+                        "Granularity": None,
+                        "BlockSize": 1,
+                    }
+                ]
+            }
+        ],
+        [4, 8],
+    )
+    assert "((1) // 1) * 8" in offset_coordinates[0]
+    assert "shard_coord1" in offset_coordinates[0]
+
+
+def test_pyntt_renderer_maps_gather_global_index_and_local_shard_coordinates():
+    _add_pyntt_to_path()
+    from pyntt.codegen.render import _access_pointer, _gather_template_context
+
+    def fixed(value):
+        return {"TritonExpression": str(value), "FixedValue": value}
+
+    shard_axes = [
+        {"Stages": []},
+        {
+            "Stages": [
+                {
+                    "HierarchyAxes": [0, 1],
+                    "Distribution": "BlockCyclic",
+                    "Granularity": None,
+                    "BlockSize": 8,
+                }
+            ]
+        },
+    ]
+    input_strides = [fixed(256), fixed(1)]
+    model = {
+        "Input": {
+            "DistributedStorageKind": "CanonicalGlobal",
+            "GlobalShape": [fixed(151936), fixed(256)],
+            "Strides": input_strides,
+            "ShardAxes": shard_axes,
+            "Hierarchy": [4, 8],
+        },
+        "InputShape": [fixed(151936), fixed(8)],
+        "InputGlobalShape": [fixed(151936), fixed(256)],
+        "InputStrides": input_strides,
+        "InputShardAxes": shard_axes,
+        "IndexShape": [fixed(1)],
+        "IndexStrides": [fixed(0)],
+        "OutputShape": [fixed(1), fixed(8)],
+        "OutputStrides": [fixed(0), fixed(1)],
+        "Axis": 0,
+        "ValueVectorLaneCount": 8,
+        "ValueVectorLaneShape": [8],
+        "Hierarchy": [4, 8],
+        "IndexDType": "int32",
+    }
+    context = _gather_template_context(model)
+
+    assert context["input_access"]["GlobalCoordinateAxes"] == (0,)
+    pointer = _access_pointer(model, "Input", "input", context["input_access"])
+
+    assert "gather_index" in pointer
+    assert "shard_coord0" in pointer
+    assert "shard_coord1" in pointer
+    assert "major_raw" in pointer
+    assert "((gather_index) //" not in pointer
 
 
 def test_pyntt_renderer_owns_block_schedule_config():
@@ -916,6 +1208,23 @@ def test_pyntt_renderer_propagates_only_live_canonical_device_parameters():
     assert "parent(input1, rdata, extent)" in source
     assert "child(input1, rdata, extent)" in source
     assert "pyntt_call_frame" not in source
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (0, "(tl.full((), 0, tl.int32) + (0)).to(tl.int32)"),
+        (
+            "descriptor_origin",
+            "(tl.full((), 0, tl.int32) + (descriptor_origin)).to(tl.int32)",
+        ),
+    ],
+)
+def test_pyntt_tma_offset_is_type_stable_after_specialization(value, expected):
+    _add_pyntt_to_path()
+    from pyntt.codegen.render import _tma_offset
+
+    assert _tma_offset(value) == expected
 
 
 class _FakeCompiledKernel:

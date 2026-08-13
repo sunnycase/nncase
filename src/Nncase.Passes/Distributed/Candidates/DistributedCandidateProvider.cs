@@ -11,6 +11,11 @@ namespace Nncase.Passes.Distributed;
 
 public interface IDistributedCandidateProvider
 {
+    IReadOnlyList<IRType> GetReturnCandidateTypes(
+        DistributedCandidateContext context,
+        Op target,
+        IReadOnlyList<IRType> defaultReturnTypes);
+
     bool TryGetInputTypeTuples(
         DistributedCandidateContext context,
         Op target,
@@ -21,6 +26,11 @@ public interface IDistributedCandidateProvider
 public interface IDistributedCandidateProvider<T> : IDistributedCandidateProvider
     where T : Op
 {
+    IReadOnlyList<IRType> GetReturnCandidateTypes(
+        DistributedCandidateContext context,
+        T target,
+        IReadOnlyList<IRType> defaultReturnTypes);
+
     bool TryGetInputTypeTuples(
         DistributedCandidateContext context,
         T target,
@@ -63,6 +73,12 @@ public sealed class DistributedCandidateContext
 public abstract class DistributedCandidateProvider<T> : IDistributedCandidateProvider<T>
     where T : Op
 {
+    public virtual IReadOnlyList<IRType> GetReturnCandidateTypes(
+        DistributedCandidateContext context,
+        T target,
+        IReadOnlyList<IRType> defaultReturnTypes)
+        => defaultReturnTypes;
+
     public abstract bool TryGetInputTypeTuples(
         DistributedCandidateContext context,
         T target,
@@ -82,6 +98,19 @@ public abstract class DistributedCandidateProvider<T> : IDistributedCandidatePro
 
         tuples = Array.Empty<DistributedCandidateTuple>();
         return false;
+    }
+
+    IReadOnlyList<IRType> IDistributedCandidateProvider.GetReturnCandidateTypes(
+        DistributedCandidateContext context,
+        Op target,
+        IReadOnlyList<IRType> defaultReturnTypes)
+    {
+        if (target is T typedTarget)
+        {
+            return GetReturnCandidateTypes(context, typedTarget, defaultReturnTypes);
+        }
+
+        return defaultReturnTypes;
     }
 }
 

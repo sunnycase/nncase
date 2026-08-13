@@ -54,12 +54,14 @@ class PreparedTritonKernel:
 
 
 class TritonTensorDescriptorCache:
-    """Materialize bounded, reusable host tensor descriptors for generated kernels."""
+    """Materialize reusable host descriptors and per-owner descriptor tables."""
 
     _DESCRIPTOR_ALIGNMENT_BYTES = 16
+    _TENSOR_MAP_ALIGNMENT_BYTES = 128
     _MAX_BLOCK_ELEMENTS = 1_048_576
-    _SPEC_FIELDS = frozenset(
+    _SINGLE_SPEC_FIELDS = frozenset(
         {
+            "kind",
             "name",
             "source",
             "offset_bytes",
@@ -71,6 +73,34 @@ class TritonTensorDescriptorCache:
             "padding",
         }
     )
+    _TABLE_SPEC_FIELDS = frozenset(
+        {
+            "kind",
+            "name",
+            "source",
+            "dtype",
+            "block_shape",
+            "padding",
+            "swizzle_mode",
+            "entry_size_bytes",
+            "entries",
+        }
+    )
+    _TABLE_ENTRY_FIELDS = frozenset(
+        {"offset_bytes", "shape", "strides", "source_shape_axes"}
+    )
+    _TMA_HOST_DTYPE = {
+        "uint8": 0,
+        "uint16": 1,
+        "uint32": 2,
+        "int32": 3,
+        "uint64": 4,
+        "int64": 5,
+        "float16": 6,
+        "float32": 7,
+        "float64": 8,
+        "bfloat16": 9,
+    }
 
     def __init__(self) -> None:
         self._entries: dict[str, tuple[tuple[object, ...], object]] = {}
@@ -84,10 +114,23 @@ class TritonTensorDescriptorCache:
         """Return descriptors in compiler-defined ABI order."""
         descriptors = []
         for spec in specs:
+            kind = spec.get("kind")
+            expected_fields = (
+                self._SINGLE_SPEC_FIELDS
+                if kind == "single"
+                else self._TABLE_SPEC_FIELDS
+                if kind == "table"
+                else None
+            )
+            if expected_fields is None:
+                raise ValueError(
+                    "PyNTT host tensor descriptor spec kind must be "
+                    f"'single' or 'table', got {kind!r}."
+                )
             fields = frozenset(spec)
-            if fields != self._SPEC_FIELDS:
-                missing = sorted(self._SPEC_FIELDS - fields)
-                unexpected = sorted(fields - self._SPEC_FIELDS)
+            if fields != expected_fields:
+                missing = sorted(expected_fields - fields)
+                unexpected = sorted(fields - expected_fields)
                 raise ValueError(
                     f"PyNTT host tensor descriptor spec has missing fields "
                     f"{missing} and unexpected fields {unexpected}."
@@ -105,14 +148,15 @@ class TritonTensorDescriptorCache:
                     f"PyNTT host tensor descriptor {name!r} references "
                     f"unbound source {source_name!r}."
                 ) from ex
-            descriptors.append(
-                self._materialize(
-                    f"{kernel_name}:{name}",
+            slot = f"{kernel_name}:{name}"
+            if kind == "single":
+                descriptor = self._materialize(
+                    slot,
                     storage,
                     offset_bytes=int(spec["offset_bytes"]),
                     dtype=str(spec["dtype"]),
                     shape=self._resolve_shape(
-                        f"{kernel_name}:{name}",
+                        slot,
                         storage,
                         tuple(int(value) for value in spec["shape"]),
                         tuple(
@@ -124,7 +168,18 @@ class TritonTensorDescriptorCache:
                     block_shape=tuple(int(value) for value in spec["block_shape"]),
                     padding=str(spec["padding"]),
                 )
-            )
+            else:
+                descriptor = self._materialize_table(
+                    slot,
+                    storage,
+                    dtype=str(spec["dtype"]),
+                    block_shape=tuple(int(value) for value in spec["block_shape"]),
+                    padding=str(spec["padding"]),
+                    swizzle_mode=int(spec["swizzle_mode"]),
+                    entry_size_bytes=int(spec["entry_size_bytes"]),
+                    entries=tuple(spec["entries"]),
+                )
+            descriptors.append(descriptor)
         return tuple(descriptors)
 
     @staticmethod
@@ -171,7 +226,7 @@ class TritonTensorDescriptorCache:
             resolved.append(extent)
         return tuple(resolved)
 
-    def _materialize(
+    def _prepare_descriptor_base(
         self,
         slot: str,
         storage: Any,
@@ -182,7 +237,7 @@ class TritonTensorDescriptorCache:
         strides: tuple[int, ...],
         block_shape: tuple[int, ...],
         padding: str,
-    ) -> object:
+    ) -> tuple[object, tuple[object, ...]]:
         if len(shape) == 0 or len(shape) > 5:
             raise ValueError(
                 f"PyNTT host tensor descriptor {slot} rank must be in [1, 5], "
@@ -241,7 +296,7 @@ class TritonTensorDescriptorCache:
                 f"got {type(storage).__name__}."
             )
 
-        signature = (
+        signature: tuple[object, ...] = (
             int(storage.data_ptr()),
             str(storage.device),
             str(getattr(storage, "dtype", "")),
@@ -252,10 +307,6 @@ class TritonTensorDescriptorCache:
             block_shape,
             padding,
         )
-        cached = self._entries.get(slot)
-        if cached is not None and cached[0] == signature:
-            return cached[1]
-
         span_elements = 1 + sum(
             (extent - 1) * stride for extent, stride in zip(shape, strides)
         )
@@ -272,6 +323,35 @@ class TritonTensorDescriptorCache:
                 f"PyNTT host tensor descriptor {slot} cannot use NaN padding "
                 f"with dtype {dtype}."
             )
+        return base, signature
+
+    def _materialize(
+        self,
+        slot: str,
+        storage: Any,
+        *,
+        offset_bytes: int,
+        dtype: str,
+        shape: tuple[int, ...],
+        strides: tuple[int, ...],
+        block_shape: tuple[int, ...],
+        padding: str,
+    ) -> object:
+        base, descriptor_signature = self._prepare_descriptor_base(
+            slot,
+            storage,
+            offset_bytes=offset_bytes,
+            dtype=dtype,
+            shape=shape,
+            strides=strides,
+            block_shape=block_shape,
+            padding=padding,
+        )
+        signature = ("single", *descriptor_signature)
+        cached = self._entries.get(slot)
+        if cached is not None and cached[0] == signature:
+            return cached[1]
+
         from triton.tools.tensor_descriptor import TensorDescriptor
 
         descriptor = TensorDescriptor(
@@ -283,6 +363,137 @@ class TritonTensorDescriptorCache:
         )
         self._entries[slot] = (signature, descriptor)
         return descriptor
+
+    def _materialize_table(
+        self,
+        slot: str,
+        storage: Any,
+        *,
+        dtype: str,
+        block_shape: tuple[int, ...],
+        padding: str,
+        swizzle_mode: int,
+        entry_size_bytes: int,
+        entries: tuple[Mapping[str, Any], ...],
+    ) -> object:
+        if entry_size_bytes != self._TENSOR_MAP_ALIGNMENT_BYTES:
+            raise ValueError(
+                f"PyNTT tensor-map table {slot} entry size must be "
+                f"{self._TENSOR_MAP_ALIGNMENT_BYTES} bytes, got "
+                f"{entry_size_bytes}."
+            )
+        if swizzle_mode < 0 or swizzle_mode > 3:
+            raise ValueError(
+                f"PyNTT tensor-map table {slot} has invalid swizzle mode "
+                f"{swizzle_mode}."
+            )
+        if not entries:
+            raise ValueError(f"PyNTT tensor-map table {slot} cannot be empty.")
+        try:
+            host_dtype = self._TMA_HOST_DTYPE[dtype]
+        except KeyError as ex:
+            raise ValueError(
+                f"PyNTT tensor-map table {slot} does not support dtype {dtype!r}."
+            ) from ex
+
+        prepared_entries = []
+        entry_signatures = []
+        for index, entry in enumerate(entries):
+            fields = frozenset(entry)
+            if fields != self._TABLE_ENTRY_FIELDS:
+                missing = sorted(self._TABLE_ENTRY_FIELDS - fields)
+                unexpected = sorted(fields - self._TABLE_ENTRY_FIELDS)
+                raise ValueError(
+                    f"PyNTT tensor-map table {slot} entry {index} has missing "
+                    f"fields {missing} and unexpected fields {unexpected}."
+                )
+            entry_slot = f"{slot}[{index}]"
+            shape = self._resolve_shape(
+                entry_slot,
+                storage,
+                tuple(int(value) for value in entry["shape"]),
+                tuple(
+                    tuple(int(axis) for axis in axes)
+                    for axes in entry["source_shape_axes"]
+                ),
+            )
+            strides = tuple(int(value) for value in entry["strides"])
+            base, entry_signature = self._prepare_descriptor_base(
+                entry_slot,
+                storage,
+                offset_bytes=int(entry["offset_bytes"]),
+                dtype=dtype,
+                shape=shape,
+                strides=strides,
+                block_shape=block_shape,
+                padding=padding,
+            )
+            prepared_entries.append((base, shape, strides))
+            entry_signatures.append(entry_signature)
+
+        signature = (
+            "table",
+            dtype,
+            block_shape,
+            padding,
+            swizzle_mode,
+            entry_size_bytes,
+            tuple(entry_signatures),
+        )
+        cached = self._entries.get(slot)
+        if cached is not None and cached[0] == signature:
+            return cached[1]
+
+        device = getattr(storage, "device", None)
+        if getattr(device, "type", None) != "cuda":
+            raise ValueError(
+                f"PyNTT tensor-map table {slot} requires CUDA storage, got "
+                f"{device}."
+            )
+
+        import torch
+        import triton
+
+        encoder = getattr(
+            triton.runtime.driver.active.utils, "encode_tma_descriptor", None
+        )
+        if encoder is None:
+            raise RuntimeError(
+                "PyNTT tensor-map tables require FlagTree's "
+                "encode_tma_descriptor driver API."
+            )
+        item_size = dtype_item_size(dtype)
+        padding_mode = 1 if padding == "nan" else 0
+        payload = bytearray()
+        for index, (base, shape, strides) in enumerate(prepared_entries):
+            encoded = encoder(
+                int(base.data_ptr()),
+                swizzle_mode,
+                item_size,
+                host_dtype,
+                block_shape,
+                shape,
+                strides,
+                padding_mode,
+            )
+            if not isinstance(encoded, bytes) or len(encoded) != entry_size_bytes:
+                raise RuntimeError(
+                    f"FlagTree encoded tensor-map table {slot} entry {index} "
+                    f"as {type(encoded).__name__} with length "
+                    f"{len(encoded) if isinstance(encoded, bytes) else 'unknown'}; "
+                    f"expected {entry_size_bytes} bytes."
+                )
+            payload.extend(encoded)
+
+        host_table = torch.frombuffer(payload, dtype=torch.uint8)
+        table = host_table.to(device=device, non_blocking=False)
+        if int(table.data_ptr()) % self._TENSOR_MAP_ALIGNMENT_BYTES != 0:
+            raise RuntimeError(
+                f"PyNTT tensor-map table {slot} device address is not "
+                f"{self._TENSOR_MAP_ALIGNMENT_BYTES}-byte aligned."
+            )
+        self._entries[slot] = (signature, table)
+        return table
 
 
 def ensure_triton_allocator(device: Optional[object] = None) -> None:

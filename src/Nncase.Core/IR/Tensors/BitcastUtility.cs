@@ -1,6 +1,8 @@
 // Copyright (c) Canaan Inc. All rights reserved.
 // Licensed under the Apache license. See LICENSE file in the project root for full license information.
 
+using Nncase.Utilities;
+
 namespace Nncase.IR.Tensors;
 
 /// <summary>
@@ -55,10 +57,14 @@ public static class BitcastUtility
 
             if (inputType.AxisPolicies[index] is SBPSplit split)
             {
-                var granularity = split.Granularity is null
-                    ? null
-                    : split.Granularity * outputTensorType.Shape[index] / inputType.TensorType.Shape[index];
-                axisPolicies[index] = SBP.S(split.Axes, granularity);
+                var inputBytes = inputType.TensorType.DType.SizeInBytes;
+                var outputBytes = outputTensorType.DType.SizeInBytes;
+                if (!DistributedUtility.TryScaleSplitUnits(split, inputBytes, outputBytes, out var scaledSplit))
+                {
+                    return invalid;
+                }
+
+                axisPolicies[index] = scaledSplit;
             }
             else
             {

@@ -669,7 +669,7 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
                                 IndentScope.Writer.IndWrite("distributed::topology_synchronize();\n");
                                 int[] GetSplitTopoAxes(IRArray<SBP> axisPolicies)
                                 {
-                                    return axisPolicies.OfType<SBPSplit>().Select(x => x.Axes).SelectMany(x => x).ToArray();
+                                    return axisPolicies.OfType<SBPSplit>().Select(x => x.HierarchyAxes).SelectMany(x => x).ToArray();
                                 }
 
                                 var srcType = grs.InType;

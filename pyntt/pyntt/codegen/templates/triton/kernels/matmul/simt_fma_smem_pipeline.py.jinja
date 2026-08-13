@@ -1,14 +1,23 @@
 {% macro pipeline_setup(stage) -%}
 {% set stage_model = stage["Model"] %}
 {% set stage_ctx = packed_gemv_pipeline_context(stage_model) %}
+{% set shared_buffer_shape = [stage_ctx["num_stages"]] + (stage_ctx["shared_stage_shape"] | list) %}
 {{ stage["StageName"] }}__rhs_stages = tle.gpu.alloc(
-    [{{ stage_ctx["num_stages"] }}, {{ stage_ctx["shared_stage_shape"] | join(", ") }}],
+    [{{ shared_buffer_shape | join(", ") }}],
     dtype={{ stage_model["RhsTritonDType"] }},
-    layout=None,
+    layout=tle.gpu.nv_tma_shared_layout(
+        [{{ shared_buffer_shape | join(", ") }}],
+        [{{ range((shared_buffer_shape | length) - 1, -1, -1) | join(", ") }}],
+        {{ stage_model["RhsTritonDType"] }},
+        [{% for _ in shared_buffer_shape %}1{{ ", " if not loop.last }}{% endfor %}],
+        [{% for _ in shared_buffer_shape %}1{{ ", " if not loop.last }}{% endfor %}],
+        [{{ range((shared_buffer_shape | length) - 1, -1, -1) | join(", ") }}],
+        False,
+        True,
+    ),
     scope=tle.gpu.smem,
     alias=pyntt_shared_arena,
     alias_offset_bytes={{ stage["SharedWorkspaceOffsets"]["rhs_stage"] }},
-    nv_mma_shared_layout=True,
 )
 {{ stage["PipeName"] }} = tle.pipe(
     capacity={{ stage_ctx["num_stages"] }},
@@ -27,7 +36,7 @@
         [{{ ctx["consumer_size_per_thread"] | join(", ") }}],
         [{{ ctx["consumer_threads_per_warp"] | join(", ") }}],
         [{{ ctx["consumer_warps_per_cta"] | join(", ") }}],
-        [1, 0],
+        [0, 1],
     )
 )
 {{ ctx["consumer_lhs_layout_name"] }} = tl.constexpr(
@@ -47,31 +56,30 @@
 {{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
 def {{ model["FunctionName"] }}__producer(writer, {{ helper_parameters(model) }}):
 {{ common.mesh_coordinates(model["MeshAxes"]) }}
+    rhs_descriptor_entry = tle.gpu.tensor_map_table_entry(
+        {{ ctx["rhs_descriptor_name"] }},
+        shard_index,
+    )
+    tle.gpu.tensor_map_fenceproxy_acquire(rhs_descriptor_entry)
     active_n = {{ dim(ctx["n"]) }}
     for n_tile in tl.range(0, {{ ctx["runtime_num_n_tiles"] }}):
-        n_start = n_tile * {{ ctx["block_n"] }}
         for k_tile in tl.range(0, {{ ctx["num_k_tiles"] }}):
-            descriptor_k = (
-                {{ dim(ctx["rhs_global_k_outer_offset"]) }}
-                + k_tile * {{ ctx["packed_k_outer"] }}
-            ).to(tl.int32)
-            descriptor_n = (
-                {{ dim(ctx["rhs_global_n_outer_offset"]) }}
-                + n_start // {{ model["RhsNVectorLaneCount"] }}
-            ).to(tl.int32)
             sequence = (
                 n_tile * {{ ctx["num_k_tiles"] }} + k_tile
             ).to(tl.int32)
             slot = writer.acquire(sequence)
+            rhs_descriptor = tle.gpu.reinterpret_tensor_map(
+                rhs_descriptor_entry,
+                slot.weight,
+            )
             tle.gpu.copy(
-                {{ ctx["rhs_descriptor_name"] }},
+                rhs_descriptor,
                 slot.weight,
                 [{{ ctx["tma_block_shape"] | join(", ") }}],
                 offsets=[
-                    descriptor_k,
-                    descriptor_n,
-                    0,
-                    {{ ctx["rhs_descriptor_origin_elements"] }},
+{% for offset in ctx["rhs_descriptor_offsets"] %}
+                    {{ tma_offset(offset) }},
+{% endfor %}
                 ],
                 eviction_policy="evict_first",
             )
@@ -134,10 +142,12 @@ def {{ model["FunctionName"] }}__consumer(reader, {{ helper_parameters(model) }}
                 weight_ptr = tle.gpu.local_ptr(
                     ready.slot.weight,
                     (
-                        shared_k // {{ ctx["k_atom"] }},
-                        local_n // {{ model["RhsNVectorLaneCount"] }},
-                        shared_payload // {{ ctx["tma_contiguous_extent"] }},
-                        shared_payload % {{ ctx["tma_contiguous_extent"] }},
+{% for index in ctx["shared_weight_indices"] %}
+                        tle.encoding(
+                            {{ index }},
+                            {{ ctx["consumer_weight_layout_name"] }},
+                        ),
+{% endfor %}
                     ),
                     shape=({{ ctx["block_n"] }}, {{ ctx["reduction_group"] }}),
                 )

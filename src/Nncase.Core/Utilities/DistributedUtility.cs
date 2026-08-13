@@ -44,8 +44,12 @@ public static class DistributedUtility
         }
     }
 
-    public static IReadOnlyList<IRArray<SBP>> GetLeafCandidatePolicies(TensorType tensorType, Placement placement)
+    public static IReadOnlyList<IRArray<SBP>> GetLeafCandidatePolicies(
+        TensorType tensorType,
+        Placement placement,
+        IDistributedSplitCandidateProvider splitCandidateProvider)
     {
+        ArgumentNullException.ThrowIfNull(splitCandidateProvider);
         var maxShape = CompilerServices.GetMaxShape(tensorType.Shape);
         var splitsAxes = GetHierarchyCombinations(placement.Rank);
         var policies = new List<List<SBP>>();
@@ -59,7 +63,14 @@ public static class DistributedUtility
                 var dim = tensorType.Shape[di];
                 if (axis.All(a => placement.Hierarchy[a] > 1) && divisor > 1 && IsDivideBy(maxShape[di], divisor, dim.IsFixed))
                 {
-                    policy.Add(SBP.S(axis.ToArray(), GetSplitGranularity(dim, maxShape[di], divisor)));
+                    var context = new DistributedSplitCandidateContext(
+                        tensorType,
+                        di,
+                        placement,
+                        axis.ToArray(),
+                        GetSplitGranularity(dim, maxShape[di], divisor),
+                        maxShape[di]);
+                    policy.AddRange(splitCandidateProvider.GetCandidates(context));
                 }
             }
 
@@ -97,7 +108,7 @@ public static class DistributedUtility
                 // {
                 //     if (placement.Hierarchy[i] > 1 && IsDivideBy(maxShape[axis], placement.Hierarchy[i]) && !innerSplitedAxes.Contains(axis))
                 //     {
-                //         candidateNdsbps[i].Add(SBP.S(axis));
+                //         candidateNdsbps[i].Add(SBP.SContiguous(axis));
                 //     }
                 // }
             }
@@ -131,17 +142,22 @@ public static class DistributedUtility
 
     public static bool IsDistributable(ReadOnlySpan<SBP> polices)
     {
-        var splits = polices.ToArray().Where(p => p is SBPSplit).Select(p => (SBPSplit)p).ToArray();
-        if (splits == null || splits.Length == 0 || (splits.Length < 2 && splits[0].Axes.GroupBy(x => x).All(group => group.Count() == 1)))
+        var splits = polices.ToArray().OfType<SBPSplit>().ToArray();
+        if (splits.Length == 0)
         {
             return true;
+        }
+
+        if (splits.Any(split => split.HierarchyAxes.Distinct().Count() != split.HierarchyAxes.Count))
+        {
+            return false;
         }
 
         for (int i = 0; i < splits.Length - 1; i++)
         {
             for (int j = i + 1; j < splits.Length; j++)
             {
-                if (splits[i].Axes.Intersect(splits[j].Axes).Any())
+                if (splits[i].HierarchyAxes.Intersect(splits[j].HierarchyAxes).Any())
                 {
                     return false;
                 }
@@ -155,10 +171,72 @@ public static class DistributedUtility
     {
         if (policy is SBPSplit split)
         {
-            return split.Axes.Select(a => placement.Hierarchy[a]).Aggregate(1L, (a, b) => a * b);
+            return split.HierarchyAxes.Select(a => placement.Hierarchy[a]).Aggregate(1L, (a, b) => a * b);
         }
 
         return 1;
+    }
+
+    public static Dimension GetLocalCapacity(
+        Dimension globalExtent,
+        SBPSplit split,
+        Placement placement,
+        DivideFlags divideFlags = DivideFlags.None)
+        => GetAxisLocalCapacity(globalExtent, split, placement, divideFlags);
+
+    public static bool TryScaleSplitUnits(
+        SBPSplit split,
+        long numerator,
+        long denominator,
+        [MaybeNullWhen(false)] out SBPSplit result)
+    {
+        result = null;
+        if (numerator <= 0 || denominator <= 0)
+        {
+            return false;
+        }
+
+        var commonDivisor = GreatestCommonDivisor(numerator, denominator);
+        numerator /= commonDivisor;
+        denominator /= commonDivisor;
+        var stages = new SplitStage[split.Stages.Count];
+        for (var index = 0; index < split.Stages.Count; index++)
+        {
+            var stage = split.Stages[index];
+            SplitDistribution distribution;
+            switch (stage.Distribution)
+            {
+                case ContiguousSplit { Granularity: null }:
+                    distribution = new ContiguousSplit();
+                    break;
+                case ContiguousSplit { Granularity: { } granularity }:
+                    var scaledGranularity = granularity * numerator;
+                    if (!Dimension.TryDivExactly(scaledGranularity, denominator, out scaledGranularity))
+                    {
+                        return false;
+                    }
+
+                    distribution = new ContiguousSplit(scaledGranularity);
+                    break;
+                case BlockCyclicSplit blockCyclic:
+                    var scaledBlockSize = checked(blockCyclic.BlockSize * numerator);
+                    if (scaledBlockSize % denominator != 0)
+                    {
+                        return false;
+                    }
+
+                    distribution = new BlockCyclicSplit(scaledBlockSize / denominator);
+                    break;
+                default:
+                    throw new NotSupportedException(
+                        $"Unsupported split distribution {stage.Distribution.GetType().Name}.");
+            }
+
+            stages[index] = new SplitStage(stage.HierarchyAxes, distribution);
+        }
+
+        result = SBP.S(stages);
+        return true;
     }
 
     public static IReadOnlyList<int> GetDivisors(DistributedType distributedType)
@@ -169,7 +247,7 @@ public static class DistributedUtility
         {
             if (distributedType.AxisPolicies[i] is SBPSplit split)
             {
-                foreach (var a in split.Axes)
+                foreach (var a in split.HierarchyAxes)
                 {
                     if (divisors[i] == 0)
                     {
@@ -195,50 +273,139 @@ public static class DistributedUtility
         return true;
     }
 
-    public static IRArray<SBP> AxisPolicesToNDSBP(IRArray<SBP> axisPolices, int rank)
+    public static IRArray<HierarchyAxisPolicy> GetHierarchyAxisPolicies(
+        IRArray<SBP> axisPolicies,
+        int hierarchyRank)
     {
-        var ndsbp = Enumerable.Repeat(SBP.B, rank).Select(p => (SBP)p).ToArray();
-        for (var i = 0; i < axisPolices.Count; i++)
+        var hierarchyPolicies = Enumerable.Repeat(
+            (HierarchyAxisPolicy)HierarchyAxisBroadcast.Instance,
+            hierarchyRank).ToArray();
+        for (var tensorAxis = 0; tensorAxis < axisPolicies.Count; tensorAxis++)
         {
-            var policy = axisPolices[i];
+            var policy = axisPolicies[tensorAxis];
             if (policy is SBPSplit split)
             {
-                foreach (var ax in split.Axes)
+                for (var stageIndex = 0; stageIndex < split.Stages.Count; stageIndex++)
                 {
-                    ndsbp[ax] = SBP.S([i], split.Granularity);
+                    var stage = split.Stages[stageIndex];
+                    for (var stageAxisIndex = 0; stageAxisIndex < stage.HierarchyAxes.Count; stageAxisIndex++)
+                    {
+                        var hierarchyAxis = stage.HierarchyAxes[stageAxisIndex];
+                        if (hierarchyAxis < 0 || hierarchyAxis >= hierarchyRank)
+                        {
+                            throw new ArgumentOutOfRangeException(
+                                nameof(axisPolicies),
+                                $"Split hierarchy axis {hierarchyAxis} is outside rank {hierarchyRank}.");
+                        }
+
+                        if (hierarchyPolicies[hierarchyAxis] is not HierarchyAxisBroadcast)
+                        {
+                            throw new InvalidOperationException(
+                                $"Hierarchy axis {hierarchyAxis} is owned by more than one tensor-axis policy.");
+                        }
+
+                        hierarchyPolicies[hierarchyAxis] = new HierarchyAxisSplit(
+                            tensorAxis,
+                            stageIndex,
+                            stageAxisIndex,
+                            stage.Distribution);
+                    }
                 }
             }
             else if (policy is SBPPartial partial)
             {
-                foreach (var ax in partial.Axes)
+                foreach (var hierarchyAxis in partial.Axes)
                 {
-                    ndsbp[ax] = SBP.P(ndsbp[ax] is SBPPartial p ? p.Axes.Append(i).ToArray() : [i], partial.Op);
+                    if (hierarchyAxis < 0 || hierarchyAxis >= hierarchyRank)
+                    {
+                        throw new ArgumentOutOfRangeException(
+                            nameof(axisPolicies),
+                            $"Partial hierarchy axis {hierarchyAxis} is outside rank {hierarchyRank}.");
+                    }
+
+                    hierarchyPolicies[hierarchyAxis] = hierarchyPolicies[hierarchyAxis] switch
+                    {
+                        HierarchyAxisBroadcast => new HierarchyAxisPartial([tensorAxis], partial.Op),
+                        HierarchyAxisPartial existing when existing.Op == partial.Op =>
+                            existing with { TensorAxes = existing.TensorAxes.Append(tensorAxis).ToArray() },
+                        _ => throw new InvalidOperationException(
+                            $"Hierarchy axis {hierarchyAxis} has incompatible split/partial ownership."),
+                    };
                 }
             }
         }
 
-        return ndsbp;
+        return hierarchyPolicies;
     }
 
-    public static IRArray<SBP> NDSBPToAxisPolices(IRArray<SBP> ndsbp, int rank)
+    public static IRArray<SBP> ToTensorAxisPolicies(
+        IRArray<HierarchyAxisPolicy> hierarchyPolicies,
+        int tensorRank)
     {
-        var polices = Enumerable.Repeat(SBP.B, rank).Select(p => (SBP)p).ToArray();
-        for (int d = 0; d < polices.Length; d++)
+        var policies = Enumerable.Repeat(SBP.B, tensorRank).Select(policy => (SBP)policy).ToArray();
+        for (var tensorAxis = 0; tensorAxis < tensorRank; tensorAxis++)
         {
-            var splitAxes = Enumerable.Range(0, ndsbp.Count).Where(i => ndsbp[i] is SBPSplit split && split.Axes[0] == d).ToArray();
-            var partialAxes = Enumerable.Range(0, ndsbp.Count).Where(i => ndsbp[i] is SBPSplit partial && partial.Axes.Contains(d)).ToArray();
+            var splitAxes = Enumerable.Range(0, hierarchyPolicies.Count)
+                .Select(hierarchyAxis => (HierarchyAxis: hierarchyAxis, Policy: hierarchyPolicies[hierarchyAxis] as HierarchyAxisSplit))
+                .Where(item => item.Policy?.TensorAxis == tensorAxis)
+                .ToArray();
+            var partialAxes = Enumerable.Range(0, hierarchyPolicies.Count)
+                .Where(hierarchyAxis => hierarchyPolicies[hierarchyAxis] is HierarchyAxisPartial partial && partial.TensorAxes.Contains(tensorAxis))
+                .ToArray();
+            if (splitAxes.Length > 0 && partialAxes.Length > 0)
+            {
+                throw new InvalidOperationException(
+                    $"Tensor axis {tensorAxis} cannot be both split and partial.");
+            }
+
             if (splitAxes.Any())
             {
-                polices[d] = SBP.S(splitAxes, ((SBPSplit)ndsbp[splitAxes[0]]).Granularity);
+                var splitStages = splitAxes
+                    .GroupBy(item => item.Policy!.StageIndex)
+                    .OrderBy(group => group.Key)
+                    .Select((group, expectedStageIndex) =>
+                {
+                    if (group.Key != expectedStageIndex)
+                    {
+                        throw new InvalidOperationException(
+                            $"Tensor axis {tensorAxis} has non-contiguous split-stage indexes.");
+                    }
+
+                    var ordered = group.OrderBy(item => item.Policy!.StageAxisIndex).ToArray();
+                    if (ordered.Select((item, index) => item.Policy!.StageAxisIndex == index).Any(valid => !valid))
+                    {
+                        throw new InvalidOperationException(
+                            $"Tensor axis {tensorAxis} stage {group.Key} has non-contiguous hierarchy-axis indexes.");
+                    }
+
+                    var distribution = ordered[0].Policy!.Distribution;
+                    if (ordered.Any(item => item.Policy!.Distribution != distribution))
+                    {
+                        throw new InvalidOperationException(
+                            $"Tensor axis {tensorAxis} stage {group.Key} has inconsistent distributions.");
+                    }
+
+                    return new SplitStage(
+                        ordered.Select(item => item.HierarchyAxis).ToArray(),
+                        distribution);
+                }).ToArray();
+                policies[tensorAxis] = SBP.S(splitStages);
             }
 
             if (partialAxes.Any())
             {
-                polices[d] = SBP.P(partialAxes, ((SBPPartial)ndsbp[partialAxes[0]]).Op);
+                var operation = ((HierarchyAxisPartial)hierarchyPolicies[partialAxes[0]]).Op;
+                if (partialAxes.Any(axis => ((HierarchyAxisPartial)hierarchyPolicies[axis]).Op != operation))
+                {
+                    throw new InvalidOperationException(
+                        $"Tensor axis {tensorAxis} has inconsistent partial reduction operations.");
+                }
+
+                policies[tensorAxis] = SBP.P(partialAxes, operation);
             }
         }
 
-        return polices;
+        return policies;
     }
 
     public static List<long[]> TryGetNonUniformDividedSlice(DistributedType distributedType)
@@ -249,7 +416,7 @@ public static class DistributedUtility
         {
             if (distributedType.AxisPolicies[i] is SBPSplit split)
             {
-                hierarchies[i].AddRange(split.Axes);
+                hierarchies[i].AddRange(split.HierarchyAxes);
             }
         }
 
@@ -344,7 +511,28 @@ public static class DistributedUtility
             }
             else
             {
-                return splitA.Axes == splitB.Axes;
+                if (splitA.Stages.Count != splitB.Stages.Count)
+                {
+                    return false;
+                }
+
+                for (var index = 0; index < splitA.Stages.Count; index++)
+                {
+                    var stageA = splitA.Stages[index];
+                    var stageB = splitB.Stages[index];
+                    if (stageA.HierarchyAxes != stageB.HierarchyAxes ||
+                        (stageA.Distribution, stageB.Distribution) switch
+                        {
+                            (ContiguousSplit, ContiguousSplit) => false,
+                            (BlockCyclicSplit blockA, BlockCyclicSplit blockB) when blockA.BlockSize == blockB.BlockSize => false,
+                            _ => true,
+                        })
+                    {
+                        return false;
+                    }
+                }
+
+                return true;
             }
         }
         else
@@ -509,43 +697,120 @@ public static class DistributedUtility
 
     public static (Dimension[] Offset, Dimension[] Shape) GetLocalOffsetAndShape(DistributedType distributedType, Dimension[] shardIndex, DivideFlags divideFlags = DivideFlags.None)
     {
-        var globalShape = divideFlags.HasFlag(DivideFlags.MaxShape)
-            ? CompilerServices.GetMaxShape(distributedType.TensorType.Shape).Select(dim => (Dimension)dim).ToArray()
-            : distributedType.TensorType.Shape.ToArray();
-        var offset = new Dimension[distributedType.TensorType.Shape.Rank];
-        var shape = new Dimension[distributedType.TensorType.Shape.Rank];
-        for (int axis = 0; axis < offset.Length; axis++)
+        var descriptor = GetLocalShardDescriptor(distributedType, shardIndex, divideFlags);
+        if (!descriptor.TryGetContiguousRegion(out var offset, out var shape))
         {
-            var policy = distributedType.AxisPolicies[axis];
-            var splits = policy is SBPSplit s
-                ? s.Axes.Select(td => (Placement: td, DeviceIndex: shardIndex[td], DeviceDim: distributedType.Placement.Hierarchy[td])).ToArray()
-                : Array.Empty<(int Placement, Dimension DeviceIndex, int DeviceDim)>();
-            if (splits.Any())
-            {
-                var subHierarchies = splits.Select(x => x.DeviceDim).ToArray();
-                var subHierarchyStrides = TensorUtilities.GetDefaultStrides(subHierarchies).Select(stride => (Dimension)stride).ToArray();
-                var subHierarchySize = TensorUtilities.GetProduct(subHierarchies);
-                var subShardIndex = splits.Select(x => x.DeviceIndex).ToArray();
-                var linearIndex = TensorUtilities.GetLinearOffset(subHierarchyStrides, subShardIndex);
-                var localDim = ((SBPSplit)policy).Granularity is { } granularity
-                    ? divideFlags.HasFlag(DivideFlags.MaxShape) ? GetMaxDimension(granularity) : granularity
-                    : divideFlags.HasFlag(DivideFlags.FloorDiv) ? globalShape[axis] / subHierarchySize : Dimension.CeilDiv(globalShape[axis], subHierarchySize);
-                offset[axis] = linearIndex * localDim;
-                shape[axis] = CanUseFullLocalDim(globalShape[axis], localDim, subHierarchySize)
-                    ? localDim
-                    : Dimension.Max(0, Dimension.Min(localDim, globalShape[axis] - offset[axis]));
-            }
-            else
-            {
-                offset[axis] = 0L;
-                shape[axis] = globalShape[axis];
-            }
+            throw new InvalidOperationException(
+                $"Distributed type {distributedType} has a non-contiguous shard mapping. " +
+                $"Use {nameof(GetLocalShardDescriptor)} instead of requesting one rectangular offset/shape region.");
         }
 
         return (offset, shape);
     }
 
-    private static Dimension GetMaxDimension(Dimension dimension)
+    public static LocalShardDescriptor GetLocalShardDescriptor(
+        DistributedType distributedType,
+        int[] shardIndex,
+        DivideFlags divideFlags = DivideFlags.None)
+        => GetLocalShardDescriptor(
+            distributedType,
+            shardIndex.Select(index => (Dimension)index).ToArray(),
+            divideFlags);
+
+    public static LocalShardDescriptor GetLocalShardDescriptor(
+        DistributedType distributedType,
+        Dimension[] shardIndex,
+        DivideFlags divideFlags = DivideFlags.None)
+    {
+        if (shardIndex.Length != distributedType.Placement.Rank)
+        {
+            throw new ArgumentException(
+                $"Shard coordinate rank {shardIndex.Length} does not match placement rank {distributedType.Placement.Rank}.",
+                nameof(shardIndex));
+        }
+
+        var globalShape = divideFlags.HasFlag(DivideFlags.MaxShape)
+            ? CompilerServices.GetMaxShape(distributedType.TensorType.Shape).Select(dim => (Dimension)dim).ToArray()
+            : distributedType.TensorType.Shape.ToArray();
+        var axes = new LocalShardAxisDescriptor[distributedType.TensorType.Shape.Rank];
+        var usedHierarchyAxes = new HashSet<int>();
+        for (int axis = 0; axis < axes.Length; axis++)
+        {
+            var policy = distributedType.AxisPolicies[axis];
+            if (policy is not SBPSplit split)
+            {
+                axes[axis] = new LocalShardAxisDescriptor(
+                    globalShape[axis],
+                    globalShape[axis],
+                    globalShape[axis],
+                    Array.Empty<LocalShardStageDescriptor>());
+                continue;
+            }
+
+            var parentExtent = globalShape[axis];
+            var localCapacity = parentExtent;
+            var activeExtent = parentExtent;
+            var stages = new LocalShardStageDescriptor[split.Stages.Count];
+            for (var stageIndex = 0; stageIndex < split.Stages.Count; stageIndex++)
+            {
+                var stage = split.Stages[stageIndex];
+                foreach (var hierarchyAxis in stage.HierarchyAxes)
+                {
+                    if ((uint)hierarchyAxis >= (uint)distributedType.Placement.Rank)
+                    {
+                        throw new InvalidOperationException(
+                            $"Split stage hierarchy axis {hierarchyAxis} is outside placement rank {distributedType.Placement.Rank}.");
+                    }
+
+                    if (!usedHierarchyAxes.Add(hierarchyAxis))
+                    {
+                        throw new InvalidOperationException(
+                            $"Placement hierarchy axis {hierarchyAxis} is assigned to more than one tensor split policy.");
+                    }
+                }
+
+                var stageHierarchy = stage.HierarchyAxes
+                    .Select(hierarchyAxis => distributedType.Placement.Hierarchy[hierarchyAxis])
+                    .ToArray();
+                var stageHierarchyStrides = TensorUtilities.GetDefaultStrides(stageHierarchy)
+                    .Select(stride => (Dimension)stride)
+                    .ToArray();
+                var linearShardIndex = TensorUtilities.GetLinearOffset(
+                    stageHierarchyStrides,
+                    stage.HierarchyAxes.Select(hierarchyAxis => shardIndex[hierarchyAxis]).ToArray());
+                var shardCount = checked((int)TensorUtilities.GetProduct(stageHierarchy));
+                localCapacity = LocalShardStageDescriptor.GetLocalCapacity(
+                    parentExtent,
+                    shardCount,
+                    stage.Distribution,
+                    divideFlags);
+                activeExtent = LocalShardStageDescriptor.GetActiveExtent(
+                    parentExtent,
+                    localCapacity,
+                    linearShardIndex,
+                    shardCount,
+                    stage.Distribution);
+                stages[stageIndex] = new LocalShardStageDescriptor(
+                    stage,
+                    parentExtent,
+                    localCapacity,
+                    activeExtent,
+                    linearShardIndex,
+                    shardCount);
+                parentExtent = activeExtent;
+            }
+
+            axes[axis] = new LocalShardAxisDescriptor(
+                globalShape[axis],
+                GetAxisLocalCapacity(globalShape[axis], split, distributedType.Placement, divideFlags),
+                activeExtent,
+                stages);
+        }
+
+        return new LocalShardDescriptor(distributedType, axes);
+    }
+
+    internal static Dimension GetMaxDimension(Dimension dimension)
     {
         if (dimension.IsFixed)
         {
@@ -586,25 +851,42 @@ public static class DistributedUtility
         {
             if (distributedType.AxisPolicies.Count > d && distributedType.AxisPolicies[d] is SBPSplit split)
             {
-                if (split.Granularity is not null)
-                {
-                    tiles[d] = divideFlags.HasFlag(DivideFlags.MaxShape) ? GetMaxDimension(split.Granularity) : split.Granularity;
-                }
-                else
-                {
-                    var divisor = split.Axes.Select(t => distributedType.Placement.Hierarchy[t]).Aggregate(1, (a, b) => a * b);
-                    if (divideFlags.HasFlag(DivideFlags.FloorDiv))
-                    {
-                        tiles[d] = tiles[d] / divisor;
-                    }
-                    else
-                    {
-                        tiles[d] = Dimension.CeilDiv(tiles[d], divisor);
-                    }
-                }
+                tiles[d] = GetAxisLocalCapacity(shape[d], split, distributedType.Placement, divideFlags);
             }
         }
 
         return (new(tiles), new(shape));
+    }
+
+    private static Dimension GetAxisLocalCapacity(
+        Dimension globalExtent,
+        SBPSplit split,
+        Placement placement,
+        DivideFlags divideFlags)
+    {
+        var capacity = globalExtent;
+        foreach (var stage in split.Stages)
+        {
+            var shardCount = stage.HierarchyAxes.Aggregate(
+                1,
+                (product, hierarchyAxis) => checked(product * placement.Hierarchy[hierarchyAxis]));
+            capacity = LocalShardStageDescriptor.GetLocalCapacity(
+                capacity,
+                shardCount,
+                stage.Distribution,
+                divideFlags);
+        }
+
+        return capacity;
+    }
+
+    private static long GreatestCommonDivisor(long lhs, long rhs)
+    {
+        while (rhs != 0)
+        {
+            (lhs, rhs) = (rhs, lhs % rhs);
+        }
+
+        return lhs;
     }
 }

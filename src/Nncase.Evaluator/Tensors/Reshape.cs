@@ -60,16 +60,21 @@ public class ReshapeEvaluator : IEvaluator<Reshape>, ITypeInferencer<Reshape>, I
                     return invalidType;
                 }
 
-                var granularity = split.Granularity;
+                var reshapedSplit = split;
                 if (newDims[newSplitAxis] != inShape[inAxis])
                 {
-                    // If the new split axis is not the same as the old split axis, we need to adjust the granularity.
-                    granularity = granularity is null ? null : granularity / newAxes.Except([newAxesOffset + newSplitAxis]).Aggregate((Dimension)1, (a, b) => a * maxNewShape[b]);
+                    var unitDivisor = newAxes
+                        .Except([newAxesOffset + newSplitAxis])
+                        .Aggregate(1L, (product, axis) => checked(product * maxNewShape[axis]));
+                    if (!DistributedUtility.TryScaleSplitUnits(split, 1, unitDivisor, out reshapedSplit))
+                    {
+                        return invalidType;
+                    }
                 }
 
                 foreach (var newAxis in newAxes)
                 {
-                    newAxisPolicies[newAxis] = newAxis == (newAxesOffset + newSplitAxis) ? SBP.S(split.Axes, granularity) : SBP.B;
+                    newAxisPolicies[newAxis] = newAxis == (newAxesOffset + newSplitAxis) ? reshapedSplit : SBP.B;
                 }
             }
             else
@@ -109,8 +114,15 @@ public class ReshapeEvaluator : IEvaluator<Reshape>, ITypeInferencer<Reshape>, I
                 }
 
                 var split = (SBPSplit)inType.AxisPolicies[firstSplitAxis.Value];
-                newAxisPolicies[newAxis] = split.Granularity is null ? split :
-                    SBP.S(split.Axes, split.Granularity! * inAxes.Except([firstSplitAxis.Value]).Aggregate((Dimension)1, (a, b) => a * maxInShape[b]));
+                var unitMultiplier = inAxes
+                    .Except([firstSplitAxis.Value])
+                    .Aggregate(1L, (product, axis) => checked(product * maxInShape[axis]));
+                if (!DistributedUtility.TryScaleSplitUnits(split, unitMultiplier, 1, out var reshapedSplit))
+                {
+                    return invalidType;
+                }
+
+                newAxisPolicies[newAxis] = reshapedSplit;
             }
             else
             {

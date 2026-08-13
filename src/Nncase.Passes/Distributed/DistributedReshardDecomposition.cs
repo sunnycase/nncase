@@ -50,7 +50,7 @@ public static class DistributedReshardDecomposition
             }
 
             var policies = target.AxisPolicies.ToArray();
-            policies[tensorAxis] = SBP.S(
+            policies[tensorAxis] = SBP.SContiguous(
                 remainingPartialAxes,
                 Dimension.CeilDiv(target.TensorType.Shape[tensorAxis], divisor));
             candidates.Add(new DistributedType(target.TensorType, policies, target.Placement));
@@ -81,8 +81,8 @@ public static class DistributedReshardDecomposition
                 case (SBPBroadCast, SBPBroadCast):
                     break;
                 case (SBPBroadCast, SBPSplit targetSplit)
-                    when targetSplit.Axes.All(partialAxes.Contains):
-                    if (!targetSplitAxes.AddRange(targetSplit.Axes))
+                    when targetSplit.HierarchyAxes.All(partialAxes.Contains):
+                    if (!targetSplitAxes.AddRange(targetSplit.HierarchyAxes))
                     {
                         return false;
                     }
@@ -90,7 +90,7 @@ public static class DistributedReshardDecomposition
                     break;
                 case (SBPSplit sourceSplit, SBPSplit targetSplit)
                     when sourceSplit == targetSplit:
-                    if (!targetSplitAxes.AddRange(targetSplit.Axes))
+                    if (!targetSplitAxes.AddRange(targetSplit.HierarchyAxes))
                     {
                         return false;
                     }

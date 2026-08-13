@@ -234,8 +234,9 @@ register-file capacity and allocation granularity and applies it consistently
 to all helper variants.
 
 Generated top kernels use FlagTree's prepared-launch ABI. Bind static
-workspace/rdata pointers, static extents/strides, host TMA descriptors, and
-tuning constants once per kernel/device; pass only explicit dynamic arguments
+workspace/rdata pointers, static extents/strides, host TMA descriptors or
+aligned per-owner descriptor-table pointers, and tuning constants once per
+kernel/device; pass only explicit dynamic arguments
 on the hot path. FlagTree stores the parsed static CUDA ABI in a native capsule
 and copies it to per-launch stack storage before filling dynamic slots; do not
 reintroduce Python full-argument reconstruction. PyNTT may request trusted

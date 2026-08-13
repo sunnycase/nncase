@@ -930,7 +930,7 @@ internal static class SynchronizationRequirementInference
                     continue;
                 }
 
-                var axes = split.Axes.ToArray();
+                var axes = split.HierarchyAxes.ToArray();
                 if (axes.Distinct().Count() != axes.Length ||
                     axes.Any(axis => axis < 0 ||
                         axis >= type.Placement.Rank ||

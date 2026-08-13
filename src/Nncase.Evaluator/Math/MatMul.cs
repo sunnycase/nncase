@@ -65,7 +65,7 @@ public class MatMulEvaluator : IEvaluator<MatMul>, ITypeInferencer<MatMul>, ICos
                         ndsbp[i] = policyA!;
                         break;
                     case (SBPSplit sa, SBPSplit sb):
-                        if (sa.Axes != sb.Axes)
+                        if (!DistributedUtility.IsSamePolicy(sa, sb, checkGranularity: false))
                         {
                             return invalid;
                         }
@@ -110,7 +110,7 @@ public class MatMulEvaluator : IEvaluator<MatMul>, ITypeInferencer<MatMul>, ICos
             {
                 ndsbp[oRank - 2] = ndsbp[oRank - 2];
                 ndsbp[oRank - 1] = ndsbp[oRank - 1];
-                partial = SBP.P(sk.Axes);
+                partial = SBP.P(sk.HierarchyAxes);
             }
 
             if (!DistributedUtility.IsDistributable(outType, ndsbp, a.Placement))
@@ -143,9 +143,9 @@ public class MatMulEvaluator : IEvaluator<MatMul>, ITypeInferencer<MatMul>, ICos
                     // TODO: support split on multi-meshes.
                     if (a.AxisPolicies[lm] is SBPSplit slm && a.AxisPolicies[lk] is SBPSplit slk
                     && b.AxisPolicies[rk] is SBPSplit srk && b.AxisPolicies[rn] is SBPSplit srn
-                    && slm.Axes.Count == 1 && slk.Axes.Count == 1 && srk.Axes.Count == 1 && srn.Axes.Count == 1
-                    && slm.Axes[0] == srk.Axes[0] && slk.Axes[0] == srn.Axes[0]
-                    && slm.Axes[0] == lmMeshAxis && slk.Axes[0] == lkMeshAxis)
+                    && slm.HierarchyAxes.Count == 1 && slk.HierarchyAxes.Count == 1 && srk.HierarchyAxes.Count == 1 && srn.HierarchyAxes.Count == 1
+                    && slm.HierarchyAxes[0] == srk.HierarchyAxes[0] && slk.HierarchyAxes[0] == srn.HierarchyAxes[0]
+                    && slm.HierarchyAxes[0] == lmMeshAxis && slk.HierarchyAxes[0] == lkMeshAxis)
                     {
                         ndsbp[oRank - 2] = a.AxisPolicies[lm];
                         ndsbp[oRank - 1] = b.AxisPolicies[rn];
@@ -175,7 +175,7 @@ public class MatMulEvaluator : IEvaluator<MatMul>, ITypeInferencer<MatMul>, ICos
                         ndsbp[i] = policyA!;
                         break;
                     case (SBPSplit sa, SBPSplit sb):
-                        if (sa.Axes != sb.Axes)
+                        if (!DistributedUtility.IsSamePolicy(sa, sb, checkGranularity: false))
                         {
                             return new InvalidType($"lhs rhs sbp at {i} not equal");
                         }

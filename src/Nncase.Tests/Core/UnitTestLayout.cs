@@ -55,7 +55,7 @@ public sealed class UnitTestLayout
     public void TestDistributedTypeLayout()
     {
         var placement = new Placement([1, 2, 8, 4, 4], "cdyxb", "cdbbb");
-        var distType = new DistributedType(new TensorType(DataTypes.Float32, new[] { 2048, 1024 }), new SBP[] { SBP.S([1, 3]), SBP.B }, placement);
+        var distType = new DistributedType(new TensorType(DataTypes.Float32, new[] { 2048, 1024 }), new SBP[] { SBP.SContiguous([1, 3]), SBP.B }, placement);
         var layout = Layout.From(distType.TensorType);
         Assert.Equal("Layout((2048, 1024):(1024, 1))", layout.ToString());
 
@@ -88,8 +88,8 @@ public sealed class UnitTestLayout
     {
         var placement = new Placement([1, 2, 8, 4, 4], "cdyxb", "cdbbb");
         var tensorType = new TensorType(DataTypes.Float32, new[] { 2048, 1024 });
-        var distTypeA = new DistributedType(tensorType, new SBP[] { SBP.S([1, 3]), SBP.B }, placement);
-        var distTypeB = new DistributedType(tensorType, new SBP[] { SBP.B, SBP.S([2]) }, placement);
+        var distTypeA = new DistributedType(tensorType, new SBP[] { SBP.SContiguous([1, 3]), SBP.B }, placement);
+        var distTypeB = new DistributedType(tensorType, new SBP[] { SBP.B, SBP.SContiguous([2]) }, placement);
         var shardA = Layout.From(distTypeA);
         var shardB = Layout.From(distTypeB);
 
@@ -100,7 +100,7 @@ public sealed class UnitTestLayout
         long[] destPid = [0, 1, 3, 2, 1]; // sampled process id.
         long[] GetUsedPid(long[] longs, IRArray<SBP> axisPolicies)
         {
-            return axisPolicies.OfType<SBPSplit>().Select(x => x.Axes).SelectMany(x => x).Select(x => longs[x]).ToArray();
+            return axisPolicies.OfType<SBPSplit>().Select(x => x.HierarchyAxes).SelectMany(x => x).Select(x => longs[x]).ToArray();
         }
 
         var aPid = GetUsedPid(destPid, distTypeA.AxisPolicies);

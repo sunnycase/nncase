@@ -269,16 +269,20 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         var distributedType = CollectDistributedTypes(post)
             .FirstOrDefault(type => type.Placement.Name == "yx" && type.AxisPolicies.Any(policy => policy is SBPSplit));
         Assert.NotNull(distributedType);
-        var localRegion = DistributedUtility.GetLocalOffsetAndShape(distributedType, new[] { 3, 7 });
+        var localRegion = DistributedUtility.GetLocalShardDescriptor(distributedType, new[] { 3, 7 });
         var globalShape = ((RankedShape)distributedType.TensorType.Shape).ToValueArray();
-        var localOffset = new RankedShape(localRegion.Offset).ToValueArray();
-        var localShape = new RankedShape(localRegion.Shape).ToValueArray();
-        Assert.Equal(globalShape.Length, localOffset.Length);
+        var localShape = localRegion.ActiveShape.ToValueArray();
         Assert.Equal(globalShape.Length, localShape.Length);
         for (var axis = 0; axis < globalShape.Length; axis++)
         {
-            Assert.InRange(localOffset[axis], 0, globalShape[axis]);
-            Assert.InRange(localShape[axis], 0, globalShape[axis] - localOffset[axis]);
+            Assert.InRange(localShape[axis], 0, globalShape[axis]);
+            for (long localIndex = 0; localIndex < localShape[axis]; localIndex++)
+            {
+                Assert.InRange(
+                    localRegion.Axes[axis].MapLocalToGlobal(localIndex).FixedValue,
+                    0,
+                    globalShape[axis] - 1);
+            }
         }
 
         Assert.True(TensorUtilities.GetProduct(localShape) < TensorUtilities.GetProduct(globalShape));
@@ -645,8 +649,8 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         var inputType = new TensorType(DataTypes.BFloat16, new[] { 3, 128 });
         var input = new Var("x", inputType);
         var placement = new Placement(new[] { 4, 8 }, "yx", "bb");
-        var splitByFeatureType = new DistributedType(inputType, new SBP[] { SBP.B, SBP.S([0, 1], 4) }, placement);
-        var splitByTokenType = new DistributedType(inputType, new SBP[] { SBP.S([0], 1), SBP.B }, placement);
+        var splitByFeatureType = new DistributedType(inputType, new SBP[] { SBP.B, SBP.SContiguous([0, 1], 4) }, placement);
+        var splitByTokenType = new DistributedType(inputType, new SBP[] { SBP.SContiguous([0], 1), SBP.B }, placement);
         var featureShard = CreateBuffer("feature_shard", DataTypes.BFloat16, TIR.MemoryLocation.Data, 0, [3, 128], [4, 1], splitByFeatureType);
         var tokenShard = CreateBuffer("token_shard", DataTypes.BFloat16, TIR.MemoryLocation.Data, 1024, [3, 128], [128, 1], splitByTokenType);
         var output = CreateOutputVar("output", inputType);
@@ -749,8 +753,8 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         var vectorType = new VectorType(DataTypes.Float32, 2, 8);
         var packedType = new TensorType(vectorType, new[] { 1, 8 });
         var placement = new Placement(new[] { 4, 8 }, "yx", "bb");
-        var scalarDistributedType = new DistributedType(scalarType, new SBP[] { SBP.B, SBP.S([0, 1], 4) }, placement);
-        var packedDistributedType = new DistributedType(packedType, new SBP[] { SBP.B, SBP.S([0, 1], 2) }, placement);
+        var scalarDistributedType = new DistributedType(scalarType, new SBP[] { SBP.B, SBP.SContiguous([0, 1], 4) }, placement);
+        var packedDistributedType = new DistributedType(packedType, new SBP[] { SBP.B, SBP.SContiguous([0, 1], 2) }, placement);
         var scalarShard = CreateBuffer("scalar_shard", DataTypes.Float32, TIR.MemoryLocation.Data, 0, [1, 128], [4, 1], scalarDistributedType);
         var packedShard = CreateBuffer("packed_shard", vectorType, TIR.MemoryLocation.Data, 1024, [1, 8], [2, 1], packedDistributedType);
         var scalarOutputShard = CreateBuffer("scalar_output_shard", DataTypes.Float32, TIR.MemoryLocation.Data, 2048, [1, 128], [4, 1], scalarDistributedType);
@@ -794,7 +798,7 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         var inputType = new TensorType(DataTypes.BFloat16, new[] { 3, 128 });
         var input = new Var("x", inputType);
         var placement = new Placement(new[] { 4, 8 }, "yx", "bb");
-        var splitByTokenType = new DistributedType(inputType, new SBP[] { SBP.S([0], 1), SBP.B }, placement);
+        var splitByTokenType = new DistributedType(inputType, new SBP[] { SBP.SContiguous([0], 1), SBP.B }, placement);
         var broadcastType = new DistributedType(inputType, new SBP[] { SBP.B, SBP.B }, placement);
         var tokenShard = CreateBuffer("token_shard", DataTypes.BFloat16, TIR.MemoryLocation.Data, 0, [1, 128], [128, 1], splitByTokenType);
         var broadcastShard = CreateBuffer("broadcast_shard", DataTypes.BFloat16, TIR.MemoryLocation.Data, 1024, [3, 128], [128, 1], broadcastType);
@@ -835,8 +839,8 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         var vectorType = new TensorType(vectorElemType, new[] { 3, 16, 16 });
         var input = new Var("x", scalarInputType);
         var placement = new Placement(new[] { 4, 8 }, "yx", "bb");
-        var scalarSplitType = new DistributedType(scalarInputType, new SBP[] { SBP.B, SBP.S([1], 2), SBP.B }, placement);
-        var vectorSplitType = new DistributedType(vectorType, new SBP[] { SBP.B, SBP.S([1], 2), SBP.B }, placement);
+        var scalarSplitType = new DistributedType(scalarInputType, new SBP[] { SBP.B, SBP.SContiguous([1], 2), SBP.B }, placement);
+        var vectorSplitType = new DistributedType(vectorType, new SBP[] { SBP.B, SBP.SContiguous([1], 2), SBP.B }, placement);
         var vectorBroadcastType = new DistributedType(vectorType, new SBP[] { SBP.B, SBP.B, SBP.B }, placement);
         var scalarBroadcastType = new DistributedType(scalarInputType, new SBP[] { SBP.B, SBP.B, SBP.B }, placement);
         var scalarShard = CreateBuffer("scalar_shard", DataTypes.BFloat16, TIR.MemoryLocation.Data, 0, [3, 2, 128], [256, 128, 1], scalarSplitType);
@@ -882,10 +886,10 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         var vectorType = new TensorType(vectorElemType, new[] { 3, 128 });
         var input = new Var("x", scalarInputType);
         var placement = new Placement(new[] { 4, 8 }, "yx", "bb");
-        var scalarFeatureSplitType = new DistributedType(scalarInputType, new SBP[] { SBP.B, SBP.S([0, 1], 32) }, placement);
-        var vectorFeatureSplitType = new DistributedType(vectorType, new SBP[] { SBP.B, SBP.S([0, 1], 4) }, placement);
-        var vectorTokenSplitType = new DistributedType(vectorType, new SBP[] { SBP.S([0], 1), SBP.B }, placement);
-        var scalarTokenSplitType = new DistributedType(scalarInputType, new SBP[] { SBP.S([0], 1), SBP.B }, placement);
+        var scalarFeatureSplitType = new DistributedType(scalarInputType, new SBP[] { SBP.B, SBP.SContiguous([0, 1], 32) }, placement);
+        var vectorFeatureSplitType = new DistributedType(vectorType, new SBP[] { SBP.B, SBP.SContiguous([0, 1], 4) }, placement);
+        var vectorTokenSplitType = new DistributedType(vectorType, new SBP[] { SBP.SContiguous([0], 1), SBP.B }, placement);
+        var scalarTokenSplitType = new DistributedType(scalarInputType, new SBP[] { SBP.SContiguous([0], 1), SBP.B }, placement);
         var scalarFeatureShard = CreateBuffer("scalar_feature_shard", DataTypes.BFloat16, TIR.MemoryLocation.Data, 0, [3, 32], [32, 1], scalarFeatureSplitType);
         var vectorFeatureShard = CreateBuffer("vector_feature_shard", vectorElemType, TIR.MemoryLocation.Data, 256, [3, 4], [4, 1], vectorFeatureSplitType);
         var vectorTokenShard = CreateBuffer("vector_token_shard", vectorElemType, TIR.MemoryLocation.Data, 512, [1, 128], [128, 1], vectorTokenSplitType);
@@ -933,8 +937,8 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         var vectorType = new TensorType(vectorElemType, new[] { 16, 16, 20 });
         var input = new Var("x", scalarInputType);
         var placement = new Placement(new[] { 4, 8 }, "yx", "bb");
-        var scalarSplitType = new DistributedType(scalarInputType, new SBP[] { SBP.S([1], 2), SBP.B, SBP.S([0], 40) }, placement);
-        var vectorSplitType = new DistributedType(vectorType, new SBP[] { SBP.S([1], 2), SBP.B, SBP.S([0], 5) }, placement);
+        var scalarSplitType = new DistributedType(scalarInputType, new SBP[] { SBP.SContiguous([1], 2), SBP.B, SBP.SContiguous([0], 40) }, placement);
+        var vectorSplitType = new DistributedType(vectorType, new SBP[] { SBP.SContiguous([1], 2), SBP.B, SBP.SContiguous([0], 5) }, placement);
         var vectorBroadcastType = new DistributedType(vectorType, new SBP[] { SBP.B, SBP.B, SBP.B }, placement);
         var scalarBroadcastType = new DistributedType(scalarInputType, new SBP[] { SBP.B, SBP.B, SBP.B }, placement);
         var scalarShard = CreateBuffer("scalar_shard", DataTypes.BFloat16, TIR.MemoryLocation.Data, 0, [2, 16, 40], [640, 40, 1], scalarSplitType);
@@ -983,8 +987,8 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         var inputType = new TensorType(DataTypes.BFloat16, new[] { 20, 3072 });
         var input = new Var("x", inputType);
         var placement = new Placement(new[] { 4, 8 }, "yx", "bb");
-        var splitFeatureType = new DistributedType(inputType, new SBP[] { SBP.S([0], 5), SBP.S([1], 384) }, placement);
-        var broadcastFeatureType = new DistributedType(inputType, new SBP[] { SBP.S([0], 5), SBP.B }, placement);
+        var splitFeatureType = new DistributedType(inputType, new SBP[] { SBP.SContiguous([0], 5), SBP.SContiguous([1], 384) }, placement);
+        var broadcastFeatureType = new DistributedType(inputType, new SBP[] { SBP.SContiguous([0], 5), SBP.B }, placement);
         var featureShard = CreateBuffer("feature_shard", DataTypes.BFloat16, TIR.MemoryLocation.Data, 0, [5, 384], [384, 1], splitFeatureType);
         var broadcastShard = CreateBuffer("broadcast_shard", DataTypes.BFloat16, TIR.MemoryLocation.Data, 4096, [5, 3072], [3072, 1], broadcastFeatureType);
         var output = CreateOutputVar("output", inputType);
@@ -1167,13 +1171,13 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
             new TensorType(
                 new VectorType(DataTypes.BFloat16, [nLane]),
                 new long[] { 1, globalScalarN / nLane }),
-            new SBP[] { SBP.B, SBP.S([0, 1], 4) },
+            new SBP[] { SBP.B, SBP.SContiguous([0, 1], 4) },
             placement);
         var rhsType = new DistributedType(
             new TensorType(
                 new VectorType(DataTypes.BFloat16, [nLane, kPack, kLane]),
                 new long[] { k / (kPack * kLane), globalScalarN / nLane }),
-            new SBP[] { SBP.B, SBP.S([0, 1], 4) },
+            new SBP[] { SBP.B, SBP.SContiguous([0, 1], 4) },
             placement);
         var lhs = CreateBuffer(
             "lhs",
@@ -1363,7 +1367,9 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
                 StringComparison.Ordinal);
             Assert.Contains("__rhs_descriptor,\n                slot.weight,", generatedKernelsPy, StringComparison.Ordinal);
             Assert.DoesNotContain("tl.make_tensor_descriptor", generatedKernelsPy, StringComparison.Ordinal);
-            Assert.Contains("nv_mma_shared_layout=True", generatedKernelsPy, StringComparison.Ordinal);
+            Assert.DoesNotContain("nv_mma_shared_layout=True", generatedKernelsPy, StringComparison.Ordinal);
+            Assert.Contains("tle.gpu.nv_tma_shared_layout(", generatedKernelsPy, StringComparison.Ordinal);
+            Assert.Contains("nv_mma_shared_layout=False", generatedKernelsPy, StringComparison.Ordinal);
             Assert.Contains("alignment=1024", generatedKernelsPy, StringComparison.Ordinal);
             Assert.Contains("tle.gpu.BlockEncoding(", generatedKernelsPy, StringComparison.Ordinal);
             Assert.Contains("tle.gpu.SlicedEncoding(", generatedKernelsPy, StringComparison.Ordinal);
@@ -1726,7 +1732,7 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
             [8],
             [8],
             [PagedKVCacheDimKind.NumBlocks],
-            [SBP.S([0, 1])]);
+            [SBP.SContiguous([0, 1])]);
         var (root, queryVar, kvVars, kvCacheObjVar) = Nncase.Evaluator.NN.RefPagedAttentionKVCache.BuildPagedAttentionKernel(
             [20],
             [20],
@@ -1858,7 +1864,7 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
             [8],
             [8],
             [PagedKVCacheDimKind.NumBlocks],
-            [SBP.S([0, 1])]);
+            [SBP.SContiguous([0, 1])]);
         var (root, queryVar, kvVars, kvCacheObjVar) = Nncase.Evaluator.NN.RefPagedAttentionKVCache.BuildPagedAttentionKernel(
             [20],
             [20],
@@ -2225,6 +2231,8 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
             generatedKernelsPy,
             StringComparison.Ordinal);
         Assert.Contains("rhs_layout=k_major", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.DoesNotContain("nv_mma_shared_layout=True", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("tle.gpu.nv_tma_shared_layout(", generatedKernelsPy, StringComparison.Ordinal);
         Assert.Equal(3, Regex.Matches(generatedKernelsPy, @"tle\.gpu\.copy\(", RegexOptions.CultureInvariant).Count);
         Assert.DoesNotContain("eviction_policy=", generatedKernelsPy, StringComparison.Ordinal);
         var producerNTileLoops = Regex.Matches(
@@ -2257,6 +2265,9 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
             RegexOptions.CultureInvariant);
         Assert.Single(qDescriptorMatches.Cast<Match>());
         Assert.Equal(2, kvDescriptorMatches.Count);
+        Assert.Equal(3, Regex.Matches(generatedKernelsPy, @"'kind': 'table'", RegexOptions.CultureInvariant).Count);
+        Assert.Equal(3, Regex.Matches(generatedKernelsPy, @"tle\.gpu\.tensor_map_table_entry\(", RegexOptions.CultureInvariant).Count);
+        Assert.Equal(3, Regex.Matches(generatedKernelsPy, @"tle\.gpu\.reinterpret_tensor_map\(", RegexOptions.CultureInvariant).Count);
         Assert.Contains("capacity=4", generatedKernelsPy, StringComparison.Ordinal);
         Assert.Contains("[1]", generatedKernelsPy, StringComparison.Ordinal);
         Assert.DoesNotContain("tl.make_tensor_descriptor", generatedKernelsPy, StringComparison.Ordinal);
@@ -2516,6 +2527,8 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
             generatedKernelsPy,
             StringComparison.Ordinal);
         Assert.Contains("rhs_layout=k_major", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.DoesNotContain("nv_mma_shared_layout=True", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("tle.gpu.nv_tma_shared_layout(", generatedKernelsPy, StringComparison.Ordinal);
         Assert.Equal(2, Regex.Matches(generatedKernelsPy, @"tle\.gpu\.copy\(", RegexOptions.CultureInvariant).Count);
         Assert.DoesNotContain("slot.weight.subslice(", generatedKernelsPy, StringComparison.Ordinal);
         Assert.Equal(2, Regex.Matches(generatedKernelsPy, @"writer\.acquire\(", RegexOptions.CultureInvariant).Count);
@@ -2525,6 +2538,9 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
             @"'block_shape': \(8, 8, 2, 64\)",
             RegexOptions.CultureInvariant).Count;
         Assert.Equal(2, descriptorBlockShapeCount);
+        Assert.Equal(2, Regex.Matches(generatedKernelsPy, @"'kind': 'table'", RegexOptions.CultureInvariant).Count);
+        Assert.Equal(2, Regex.Matches(generatedKernelsPy, @"tle\.gpu\.tensor_map_table_entry\(", RegexOptions.CultureInvariant).Count);
+        Assert.Equal(2, Regex.Matches(generatedKernelsPy, @"tle\.gpu\.reinterpret_tensor_map\(", RegexOptions.CultureInvariant).Count);
         Assert.Equal(2, Regex.Matches(generatedKernelsPy, @"eviction_policy=""evict_last""", RegexOptions.CultureInvariant).Count);
         Assert.Contains("capacity=4", generatedKernelsPy, StringComparison.Ordinal);
         Assert.Contains("[4, 8, 8, 2, 64]", generatedKernelsPy, StringComparison.Ordinal);
@@ -2606,10 +2622,10 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
             [8],
             [8],
             [PagedKVCacheDimKind.NumBlocks],
-            [SBP.S([0, 1])]);
+            [SBP.SContiguous([0, 1])]);
         var placement = new Placement(new[] { 4, 8 }, "yx", "bb");
         var outputType = new TensorType(DataTypes.Float32, new[] { 20 });
-        var outputDistributedType = new DistributedType(outputType, new SBP[] { SBP.S([0], 5) }, placement);
+        var outputDistributedType = new DistributedType(outputType, new SBP[] { SBP.SContiguous([0], 5) }, placement);
         var kvCacheObjVar = new Var("kvCache", TensorType.Scalar(new ReferenceType(new PagedAttentionKVCacheType { Config = config })));
         var output = CreateOutputVar("output", outputType);
         var outputBuffer = CreateBuffer("position_ids", DataTypes.Float32, TIR.MemoryLocation.Data, 0, [5], [1], outputDistributedType);
@@ -3063,7 +3079,7 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         var placement = new Placement(new[] { 2 }, "b", "b");
         var distributedType = new DistributedType(
             tensorType,
-            new SBP[] { SBP.B, SBP.S([0], 4) },
+            new SBP[] { SBP.B, SBP.SContiguous([0], 4) },
             placement);
         var nestedInputVar = new TIR.BufferVar("nested_input", distributedType, TIR.BufferVarRole.Input, TIR.MemoryLocation.Input);
         var nestedOutputVar = CreateOutputVar("nested_output", distributedType);
@@ -3126,8 +3142,8 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
 
         var tensorType = new TensorType(DataTypes.BFloat16, new[] { 4, 8 });
         var placement = new Placement(new[] { 2 }, "b", "b");
-        var inputDistributedType = new DistributedType(tensorType, new SBP[] { SBP.B, SBP.S([0], 4) }, placement);
-        var outputDistributedType = new DistributedType(tensorType, new SBP[] { SBP.S([0], 2), SBP.B }, placement);
+        var inputDistributedType = new DistributedType(tensorType, new SBP[] { SBP.B, SBP.SContiguous([0], 4) }, placement);
+        var outputDistributedType = new DistributedType(tensorType, new SBP[] { SBP.SContiguous([0], 2), SBP.B }, placement);
         var nestedInput = new TIR.BufferVar("nested_input", inputDistributedType, TIR.BufferVarRole.Input, TIR.MemoryLocation.Input);
         var nestedOutput = new TIR.BufferVar("nested_output", outputDistributedType, TIR.BufferVarRole.Output, TIR.MemoryLocation.Output);
         var nestedData = new TIR.BufferVar("data", TensorType.Scalar(new PointerType(DataTypes.UInt8)), TIR.BufferVarRole.Workspace, TIR.MemoryLocation.Data);
@@ -3204,11 +3220,11 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         var placement = new Placement(new[] { 2 }, "b", "b");
         var inputType = new DistributedType(
             tensorType,
-            new SBP[] { SBP.B, SBP.S([0], 4) },
+            new SBP[] { SBP.B, SBP.SContiguous([0], 4) },
             placement);
         var outputType = new DistributedType(
             tensorType,
-            new SBP[] { SBP.S([0], 2), SBP.B },
+            new SBP[] { SBP.SContiguous([0], 2), SBP.B },
             placement);
         var input = CreateBuffer(
             "input_shard",
@@ -3259,7 +3275,7 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         var placement = new Placement(new[] { 4, 8 }, "yx", "bb");
         var inputType = new DistributedType(
             tensorType,
-            new SBP[] { SBP.B, SBP.S([1]) },
+            new SBP[] { SBP.B, SBP.SContiguous([1]) },
             placement);
         var input = new Var("input", inputType);
         var cast = IR.F.Tensors.Cast(input, DataTypes.BFloat16);
@@ -3314,7 +3330,7 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         var placement = new Placement(new[] { 4, 8 }, "yx", "bb");
         var inputType = new DistributedType(
             tensorType,
-            new SBP[] { SBP.B, SBP.S([1]) },
+            new SBP[] { SBP.B, SBP.SContiguous([1]) },
             placement);
         var input = new Var("input", inputType);
         var cast = IR.F.NTT.VectorizedCast(
@@ -3363,7 +3379,7 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         var placement = new Placement(new[] { 4, 8 }, "yx", "bb");
         var inputType = new DistributedType(
             new TensorType(new VectorType(DataTypes.BFloat16, [8]), new long[] { 1, 18992 }),
-            new SBP[] { SBP.B, SBP.S([0, 1], 594) },
+            new SBP[] { SBP.B, SBP.SContiguous([0, 1], 594) },
             placement);
         var input = new Var("input", inputType);
         var cast = IR.F.NTT.VectorizedCast(
@@ -3436,7 +3452,7 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
             SBP.P([0], ReduceOp.Sum));
         var splitType = new DistributedType(
             tensorType,
-            new SBP[] { SBP.S([0], 2), SBP.B },
+            new SBP[] { SBP.SContiguous([0], 2), SBP.B },
             placement);
         var partialBuffer = CreateBuffer("partial", DataTypes.BFloat16, TIR.MemoryLocation.Data, 0, [8, 16], [16, 1], partialType);
         var splitBuffer = CreateBuffer("split", DataTypes.BFloat16, TIR.MemoryLocation.Data, 256, [2, 16], [16, 1], splitType);
@@ -3645,7 +3661,7 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
             [8],
             [8],
             [PagedKVCacheDimKind.NumBlocks],
-            [SBP.S([0])]);
+            [SBP.SContiguous([0])]);
         var objectType = TensorType.Scalar(new ReferenceType(new PagedAttentionKVCacheType { Config = config }));
         var outputType = new TensorType(DataTypes.Float32, new[] { 4 });
         var placement = new Placement(new[] { 1 }, "b", "b");
@@ -3939,23 +3955,23 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         var placement = new Placement(new[] { y, x }, "yx", "bb");
         var lhsDistributedType = new DistributedType(
             new TensorType(DataTypes.BFloat16, new[] { m, k }),
-            new SBP[] { SBP.S([0], localM), SBP.B },
+            new SBP[] { SBP.SContiguous([0], localM), SBP.B },
             placement);
         var rhsDistributedType = new DistributedType(
             new TensorType(new VectorType(DataTypes.BFloat16, nPackedLane, nLane), new[] { packedN, k }),
-            new SBP[] { SBP.S([1], localPackedN), SBP.B },
+            new SBP[] { SBP.SContiguous([1], localPackedN), SBP.B },
             placement);
         var packedOutputDistributedType = new DistributedType(
             new TensorType(new VectorType(DataTypes.BFloat16, nPackedLane, nLane), new[] { m, packedN }),
-            new SBP[] { SBP.S([0], localM), SBP.S([1], localPackedN) },
+            new SBP[] { SBP.SContiguous([0], localM), SBP.SContiguous([1], localPackedN) },
             placement);
         var vectorOutputDistributedType = new DistributedType(
             new TensorType(new VectorType(DataTypes.BFloat16, nLane), new[] { m, n / nLane }),
-            new SBP[] { SBP.S([0], localM), SBP.S([1], localVectorN) },
+            new SBP[] { SBP.SContiguous([0], localM), SBP.SContiguous([1], localVectorN) },
             placement);
         var outputDistributedType = new DistributedType(
             new TensorType(DataTypes.BFloat16, new[] { m, n }),
-            new SBP[] { SBP.S([0], localM), SBP.S([1], localN) },
+            new SBP[] { SBP.SContiguous([0], localM), SBP.SContiguous([1], localN) },
             placement);
         var packedElemType = new VectorType(DataTypes.BFloat16, nPackedLane, nLane);
         var vectorElemType = new VectorType(DataTypes.BFloat16, nLane);

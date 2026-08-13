@@ -112,7 +112,7 @@ public sealed class UnitTestTritonTargetCostModel : TestClassBase
         var costModel = new TritonTargetOpCostModel(machine);
         var placement = new Placement([4, 8], "y,x", "bb");
         var tensorType = new TensorType(DataTypes.Float32, new RankedShape(128, 151936));
-        var distributedType = new DistributedType(tensorType, [SBP.S([0]), SBP.S([1])], placement);
+        var distributedType = new DistributedType(tensorType, [SBP.SContiguous([0]), SBP.SContiguous([1])], placement);
         var input = new Var("input", distributedType);
         var boxing = IR.F.Distributed.Boxing(input, tensorType);
         CompilerServices.InferenceType(boxing);
@@ -132,7 +132,7 @@ public sealed class UnitTestTritonTargetCostModel : TestClassBase
         CompileOptions.TargetOptions = CreateOptions(CreateGpuMachine());
         var placement = new Placement([4, 8], "y,x", "bb");
         var tensorType = new TensorType(DataTypes.BFloat16, new RankedShape(16, 128));
-        var inputType = new DistributedType(tensorType, [SBP.B, SBP.S([1])], placement);
+        var inputType = new DistributedType(tensorType, [SBP.B, SBP.SContiguous([1])], placement);
         var outputType = new DistributedType(tensorType, [SBP.B, SBP.B], placement);
         var input = new Var("input", inputType);
         var boxing = IR.F.Distributed.Boxing(input, outputType);
@@ -151,7 +151,7 @@ public sealed class UnitTestTritonTargetCostModel : TestClassBase
         CompileOptions.TargetOptions = CreateOptions(CreateGpuMachine());
         var placement = new Placement([4, 8], "yx", "bb");
         var tensorType = new TensorType(DataTypes.BFloat16, new RankedShape(32, 128));
-        var inputType = new DistributedType(tensorType, [SBP.S([0]), SBP.S([1])], placement);
+        var inputType = new DistributedType(tensorType, [SBP.SContiguous([0]), SBP.SContiguous([1])], placement);
         var outputType = new DistributedType(tensorType, [SBP.B, SBP.B], placement);
         var input = new Var("input", inputType);
         var shardedView = IR.F.Distributed.ShardedView(input, outputType);
@@ -173,7 +173,7 @@ public sealed class UnitTestTritonTargetCostModel : TestClassBase
         var placement = new Placement([4, 8], "yx", "bb");
         var tensorType = new TensorType(DataTypes.BFloat16, new RankedShape(32, 128));
         var inputType = new DistributedType(tensorType, [SBP.B, SBP.B], placement);
-        var outputType = new DistributedType(tensorType, [SBP.S([0]), SBP.S([1])], placement);
+        var outputType = new DistributedType(tensorType, [SBP.SContiguous([0]), SBP.SContiguous([1])], placement);
         var input = new Var("input", inputType);
         var shardedView = IR.F.Distributed.ShardedView(input, outputType);
         CompilerServices.InferenceType(shardedView);
@@ -752,7 +752,7 @@ public sealed class UnitTestTritonTargetCostModel : TestClassBase
         var placement = new Placement([4, 8], "y,x", "bb");
         var queryType = new DistributedType(
             new TensorType(DataTypes.BFloat16, new RankedShape(1, 16, 128)),
-            [SBP.B, SBP.S([1]), SBP.B],
+            [SBP.B, SBP.SContiguous([1]), SBP.B],
             placement);
         var planner = new TritonPagedAttentionExecutionPlanner(
             CreateGpuMachine(rootBytesPerCycle: 32));
@@ -778,7 +778,7 @@ public sealed class UnitTestTritonTargetCostModel : TestClassBase
         var placement = new Placement([4, 8], "y,x", "bb");
         var queryType = new DistributedType(
             new TensorType(DataTypes.BFloat16, new RankedShape(1, 16, 128)),
-            [SBP.B, SBP.S([1]), SBP.B],
+            [SBP.B, SBP.SContiguous([1]), SBP.B],
             placement);
         var planner = new TritonPagedAttentionExecutionPlanner(
             CreateGpuMachine(rootBytesPerCycle: 32));
@@ -802,7 +802,7 @@ public sealed class UnitTestTritonTargetCostModel : TestClassBase
         var placement = new Placement([3, 8], "y,x", "bb");
         var queryType = new DistributedType(
             new TensorType(DataTypes.BFloat16, new RankedShape(1, 16, 128)),
-            [SBP.B, SBP.S([1]), SBP.B],
+            [SBP.B, SBP.SContiguous([1]), SBP.B],
             placement);
         var planner = new TritonPagedAttentionExecutionPlanner(
             CreateGpuMachine(rootBytesPerCycle: 32));
@@ -856,11 +856,11 @@ public sealed class UnitTestTritonTargetCostModel : TestClassBase
         var placement = new Placement([4, 8], "y,x", "bb");
         var queryType = new DistributedType(
             new TensorType(DataTypes.BFloat16, new RankedShape(1, 16, 128)),
-            [SBP.B, SBP.S([1]), SBP.B],
+            [SBP.B, SBP.SContiguous([1]), SBP.B],
             placement);
         var extraType = new DistributedType(
             new TensorType(DataTypes.BFloat16, new RankedShape(8_404_992)),
-            [SBP.S([0, 1])],
+            [SBP.SContiguous([0, 1])],
             placement);
         var config = new PagedAttentionConfig(
             1,
@@ -889,7 +889,7 @@ public sealed class UnitTestTritonTargetCostModel : TestClassBase
             [8],
             [8],
             [PagedKVCacheDimKind.NumBlocks],
-            [SBP.S([0, 1])]);
+            [SBP.SContiguous([0, 1])]);
         var query = new Var("query", queryType);
         var extra = new Var("extra", extraType);
         var kvCaches = new Var(

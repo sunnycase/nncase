@@ -112,7 +112,7 @@ public sealed class UnitTestMemorySynchronization : TestClassBase
         var placement = new Placement([4, 8], "yx", "bb");
         var splitType = new DistributedType(
             tensorType,
-            [SBP.S([0]), SBP.S([1])],
+            [SBP.SContiguous([0]), SBP.SContiguous([1])],
             placement);
         var broadcastType = new DistributedType(
             tensorType,
@@ -176,7 +176,7 @@ public sealed class UnitTestMemorySynchronization : TestClassBase
         var placement = new Placement([4, 8], "yx", "bb");
         var xSplitType = new DistributedType(
             tensorType,
-            [SBP.B, SBP.S([1])],
+            [SBP.B, SBP.SContiguous([1])],
             placement);
         var broadcastType = new DistributedType(
             tensorType,
@@ -237,8 +237,8 @@ public sealed class UnitTestMemorySynchronization : TestClassBase
     {
         var placement = new Placement([4, 8], "yx", "bb");
         var tensorType = new TensorType(DataTypes.Float32, new[] { 64 });
-        var yxSplitType = new DistributedType(tensorType, [SBP.S([0, 1])], placement);
-        var ySplitType = new DistributedType(tensorType, [SBP.S([0])], placement);
+        var yxSplitType = new DistributedType(tensorType, [SBP.SContiguous([0, 1])], placement);
+        var ySplitType = new DistributedType(tensorType, [SBP.SContiguous([0])], placement);
         var broadcastType = new DistributedType(tensorType, [SBP.B], placement);
         var physical = new PhysicalBuffer(
             DataTypes.Float32.SizeInBytes,
@@ -283,8 +283,8 @@ public sealed class UnitTestMemorySynchronization : TestClassBase
     {
         var placement = new Placement([4, 8], "yx", "bb");
         var tensorType = new TensorType(DataTypes.Float32, new[] { 64 });
-        var yxSplitType = new DistributedType(tensorType, [SBP.S([0, 1])], placement);
-        var xSplitType = new DistributedType(tensorType, [SBP.S([1])], placement);
+        var yxSplitType = new DistributedType(tensorType, [SBP.SContiguous([0, 1])], placement);
+        var xSplitType = new DistributedType(tensorType, [SBP.SContiguous([1])], placement);
         var physical = new PhysicalBuffer(
             DataTypes.Float32.SizeInBytes,
             Tensor.FromPointer(4096, DataTypes.Float32),
@@ -328,7 +328,7 @@ public sealed class UnitTestMemorySynchronization : TestClassBase
             placement);
         var splitType = new DistributedType(
             tensorType,
-            [SBP.S([0]), SBP.S([1])],
+            [SBP.SContiguous([0]), SBP.SContiguous([1])],
             placement);
         var residual = new Var("residual", broadcastType);
         var projected = new Var("projected", splitType);
@@ -388,7 +388,7 @@ public sealed class UnitTestMemorySynchronization : TestClassBase
         var placement = new Placement([4, 8], "yx", "bb");
         var inputType = new DistributedType(
             new TensorType(DataTypes.Float32, new[] { 1, 128 }),
-            [SBP.B, SBP.S([0, 1], 4)],
+            [SBP.B, SBP.SContiguous([0, 1], 4)],
             placement);
         var input = new Var("input", inputType);
         var stats = IR.F.NN.NormStats(1, input, useMean: false);
@@ -396,7 +396,7 @@ public sealed class UnitTestMemorySynchronization : TestClassBase
         Assert.Equal(SBP.P([0, 1], ReduceOp.Sum), partialType.Partial);
         var reduceScatterType = new DistributedType(
             partialType.TensorType,
-            [SBP.S([0, 1], 1), SBP.B, SBP.B],
+            [SBP.SContiguous([0, 1], 1), SBP.B, SBP.B],
             placement);
         var broadcastType = new DistributedType(
             partialType.TensorType,

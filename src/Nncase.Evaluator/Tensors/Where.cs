@@ -235,7 +235,7 @@ public class WhereEvaluator : IEvaluator<Where>, ITypeInferencer<Where>, ICostEv
                 ret = policyA!;
                 break;
             case (SBPSplit sa, SBPSplit sb):
-                if (sa.Axes != sb.Axes)
+                if (!DistributedUtility.IsSamePolicy(sa, sb, checkGranularity: false))
                 {
                     ret = null;
                 }

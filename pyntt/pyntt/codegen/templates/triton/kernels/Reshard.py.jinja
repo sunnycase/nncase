@@ -15,20 +15,19 @@
 {{ body }}global_idx{{ axis }} = {{ ctx["global_coordinates"][axis] }}
 {{ body }}mask = mask & (global_idx{{ axis }} < {{ dim(model["GlobalShape"][axis]) }})
 {% endfor %}
-{% for split_axes in model["OutputSplitAxes"] %}
-{% set axis = loop.index0 %}
-{% if split_axes %}
-{{ body }}output_local_dim{{ axis }} = {{ dim(model["OutputLocalShape"][axis]) }}
-{{ body }}output_split_linear{{ axis }} = global_idx{{ axis }} // output_local_dim{{ axis }}
-{{ body }}output_idx{{ axis }} = global_idx{{ axis }} - output_split_linear{{ axis }} * output_local_dim{{ axis }}
-{{ body }}tmp_output_split{{ axis }} = output_split_linear{{ axis }}
-{% for placement_axis in split_axes | reverse %}
-{{ body }}destination_shard_coord{{ placement_axis }} = tmp_output_split{{ axis }} % {{ model["Hierarchy"][placement_axis] }}
-{{ body }}tmp_output_split{{ axis }} = tmp_output_split{{ axis }} // {{ model["Hierarchy"][placement_axis] }}
+{% if ctx["output_is_canonical"] %}
+{% for axis in range(model["Hierarchy"] | length) %}
+{{ body }}destination_shard_coord{{ axis }} = 0
 {% endfor %}
-{% else %}
-{{ body }}output_idx{{ axis }} = global_idx{{ axis }}
 {% endif %}
+{% for axis_plan in ctx["output_axis_plans"] %}
+{% set axis = loop.index0 %}
+{% if not ctx["output_is_canonical"] %}
+{{ body }}output_idx{{ axis }} = {{ axis_plan["local_coordinate"] }}
+{% endif %}
+{% for placement_axis, owner in axis_plan["owners"].items() %}
+{{ body }}destination_shard_coord{{ placement_axis }} = {{ owner }}
+{% endfor %}
 {% endfor %}
 {{ body }}mask = mask & ({{ ctx["writer_active"] }})
 {% for axis in range(model["Hierarchy"] | length) %}

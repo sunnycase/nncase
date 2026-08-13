@@ -635,7 +635,7 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
         var commonPolicies = queryType.AxisPolicies.ToArray();
         var partialType = new DistributedType(
             stateTensorType,
-            new IRArray<SBP>(commonPolicies.Append(SBP.S([plan.SplitHierarchyAxis])).ToArray()),
+            new IRArray<SBP>(commonPolicies.Append(SBP.SContiguous([plan.SplitHierarchyAxis])).ToArray()),
             queryType.Placement);
         var mergedType = new DistributedType(
             stateTensorType,
@@ -824,8 +824,37 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
         DistributedType targetType,
         string name)
     {
-        var (sourceOffset, _, _, _) = GetShardedBufferLayout(sourceType);
-        var (targetOffset, targetShape, _, _) = GetShardedBufferLayout(targetType);
+        var sourceDescriptor = GetLocalShardDescriptor(sourceType);
+        var targetDescriptor = GetLocalShardDescriptor(targetType);
+        var targetShape = targetDescriptor.LocalCapacityShape.Dimensions.ToArray();
+        if (!sourceDescriptor.TryGetContiguousRegion(out var sourceOffset, out _) ||
+            !targetDescriptor.TryGetContiguousRegion(out var targetOffset, out _))
+        {
+            if (sourceType.AxisPolicies.SequenceEqual(targetType.AxisPolicies))
+            {
+                return source.With(name: name, distributedType: targetType);
+            }
+
+            if (sourceType.AxisPolicies.Any(policy => policy is not SBPBroadCast))
+            {
+                throw new InvalidOperationException(
+                    $"Local ShardedView cannot alias non-contiguous mapping {sourceType} -> {targetType}.");
+            }
+
+            var (_, globalStrides) = TensorUtilities.GetTensorMaxSizeAndStridesExpr(
+                targetType.TensorType,
+                null);
+            return new TIR.Buffer(
+                name,
+                targetType.TensorType.DType,
+                source.MemSpan,
+                targetShape,
+                globalStrides,
+                targetType,
+                source.StorageEncoding,
+                distributedStorageKind: DistributedBufferStorageKind.CanonicalGlobal);
+        }
+
         if (sourceOffset.Length != source.Rank || targetOffset.Length != source.Rank)
         {
             throw new InvalidOperationException(
@@ -853,21 +882,37 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
             name);
     }
 
+    private LocalShardDescriptor GetLocalShardDescriptor(DistributedType distributedType)
+    {
+        if (!_shardCoordinates.TryGetValue(distributedType.Placement, out var shardIndex))
+        {
+            shardIndex = Enumerable.Range(0, distributedType.Placement.Rank)
+                .Select(axis => (Dimension)new DimVar($"__shard_coord_{axis}"))
+                .ToArray();
+            _shardCoordinates.Add(distributedType.Placement, shardIndex);
+        }
+
+        return DistributedUtility.GetLocalShardDescriptor(
+            distributedType,
+            shardIndex,
+            DistributedUtility.DivideFlags.MaxShape);
+    }
+
     private TIR.Buffer CreateCanonicalShardedBuffer(
         TIR.Buffer source,
         TIR.PhysicalBuffer physicalBuffer,
         DistributedType distributedType,
         Dimension componentBase)
     {
-        var (localOffset, localShape, globalStrides, byteSpanSize) = GetShardedBufferLayout(distributedType);
-        var localElementOffset = TensorUtilities.GetLinearOffset(globalStrides, localOffset);
+        var (localShape, globalStrides, byteSpanSize) = GetShardedBufferLayout(distributedType);
         return source.With(
             memSpan: new TIR.MemSpan(
                 physicalBuffer,
-                (componentBase + (localElementOffset * source.ElemType.SizeInBytes)).Simplify(),
+                componentBase,
                 byteSpanSize),
             dimensions: localShape,
-            strides: globalStrides);
+            strides: globalStrides,
+            distributedStorageKind: DistributedBufferStorageKind.CanonicalGlobal);
     }
 
     private TIR.Buffer CreateShardedAlias(
@@ -876,22 +921,22 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
         Dimension componentBase,
         string name)
     {
-        var (targetOffset, targetShape, targetStrides, targetByteSpanSize) = GetShardedBufferLayout(targetType);
-        var targetElementOffset = TensorUtilities.GetLinearOffset(targetStrides, targetOffset);
+        var (targetShape, targetStrides, targetByteSpanSize) = GetShardedBufferLayout(targetType);
         return new TIR.Buffer(
             name,
             targetType.TensorType.DType,
             new TIR.MemSpan(
                 source.MemSpan.Buffer,
-                (componentBase + (targetElementOffset * targetType.TensorType.DType.SizeInBytes)).Simplify(),
+                componentBase,
                 targetByteSpanSize),
             targetShape,
             targetStrides,
             targetType,
-            source.StorageEncoding);
+            source.StorageEncoding,
+            distributedStorageKind: DistributedBufferStorageKind.CanonicalGlobal);
     }
 
-    private (Dimension[] Offset, Dimension[] Shape, Dimension[] Strides, Dimension ByteSpanSize) GetShardedBufferLayout(
+    private (Dimension[] Shape, Dimension[] Strides, Dimension ByteSpanSize) GetShardedBufferLayout(
         DistributedType distributedType)
     {
         if (!_shardCoordinates.TryGetValue(distributedType.Placement, out var shardIndex))
@@ -902,15 +947,12 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
             _shardCoordinates.Add(distributedType.Placement, shardIndex);
         }
 
-        var (localOffset, localShape) = DistributedUtility.GetLocalOffsetAndShape(distributedType, shardIndex);
-        var (_, globalStrides) = TensorUtilities.GetTensorMaxSizeAndStridesExpr(
+        var shardDescriptor = GetLocalShardDescriptor(distributedType);
+        var localShape = shardDescriptor.LocalCapacityShape.Dimensions.ToArray();
+        var (globalSize, globalStrides) = TensorUtilities.GetTensorMaxSizeAndStridesExpr(
             distributedType.TensorType,
             null);
-        var byteSpanSize = BufferViewUtility.GetByteSpanSize(
-            localShape,
-            globalStrides,
-            distributedType.TensorType.DType.SizeInBytes);
-        return (localOffset, localShape, globalStrides, byteSpanSize);
+        return (localShape, globalStrides, globalSize);
     }
 
     private Expr GenerateBufferView(string opName, Expr input, ref Expr output)

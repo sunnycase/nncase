@@ -82,13 +82,14 @@ internal sealed class PyNTTFunctionBuilder
                 var tensor = ((TensorConst)@const).Value;
                 var distributedType = (DistributedType)@const.CheckedType;
                 var size = range.Max - range.Min;
-                var dividedDims = DistributedUtility.GetDividedTensorType(distributedType, DistributedUtility.DivideFlags.MaxShape).Shape.ToValueArray();
-                var localStrides = TensorUtilities.GetDefaultStrides(dividedDims);
                 var shardIndex = PyNTTRDataUtility.GetScopedShardIndex(shard, targetOptions, scopeName);
-                (var localOffsetExpr, var localShapeExpr) = DistributedUtility.GetLocalOffsetAndShape(distributedType, shardIndex, DistributedUtility.DivideFlags.MaxShape);
-                var localOffset = new RankedShape(localOffsetExpr).ToValueArray();
-                var localShape = new RankedShape(localShapeExpr).ToValueArray();
-                SerializeLocalTensorShard(stream, tensor, range, localOffset, localShape, localStrides);
+                var descriptor = DistributedUtility.GetLocalShardDescriptor(
+                    distributedType,
+                    shardIndex,
+                    DistributedUtility.DivideFlags.MaxShape);
+                var localCapacity = descriptor.LocalCapacityShape.ToValueArray();
+                var localStrides = TensorUtilities.GetDefaultStrides(localCapacity);
+                SerializeLocalTensorShard(stream, tensor, range, descriptor, localStrides);
             }
 
             var finalizedPayload = FinalizePayload(payload);
@@ -111,13 +112,13 @@ internal sealed class PyNTTFunctionBuilder
         Stream stream,
         Tensor tensor,
         ValueRange<ulong> range,
-        long[] localOffset,
-        long[] localShape,
+        LocalShardDescriptor descriptor,
         long[] localStrides)
     {
         var size = checked((long)(range.Max - range.Min));
         var elementSize = tensor.ElementType.SizeInBytes;
         var payload = new byte[checked((int)size)];
+        var localShape = descriptor.ActiveShape.ToValueArray();
         var localElementCount = TensorUtilities.GetProduct(localShape);
         var localIndex = new long[localShape.Length];
         var sourceIndex = new long[localShape.Length];
@@ -128,7 +129,14 @@ internal sealed class PyNTTFunctionBuilder
             TensorUtilities.UnravelIndex(linear, localShape, localIndex);
             for (int axis = 0; axis < localIndex.Length; axis++)
             {
-                sourceIndex[axis] = localOffset[axis] + localIndex[axis];
+                var sourceCoordinate = descriptor.Axes[axis].MapLocalToGlobal(localIndex[axis]);
+                if (!sourceCoordinate.IsFixed)
+                {
+                    throw new InvalidDataException(
+                        $"PyNTT local rdata axis {axis} did not resolve to a fixed global coordinate: {sourceCoordinate}.");
+                }
+
+                sourceIndex[axis] = sourceCoordinate.FixedValue;
             }
 
             var sourceElementOffset = TensorUtilities.GetLinearOffset(tensor.Strides, sourceIndex);

@@ -151,10 +151,15 @@ public interface IPagedAttentionConfig : IAttentionConfig
         {
             var axis = ShardingAxes[i];
             var sbp = AxisPolicies[i];
-            for (int j = 0; j < sbp.Axes.Count; j++)
+            if (!sbp.IsContiguous)
             {
-                dims[(int)axis] /= placement.Hierarchy[sbp.Axes[j]];
-                shardingDims[i] *= placement.Hierarchy[sbp.Axes[j]];
+                throw new NotSupportedException("PagedAttention KV-cache physical layout requires contiguous split stages.");
+            }
+
+            for (int j = 0; j < sbp.HierarchyAxes.Count; j++)
+            {
+                dims[(int)axis] /= placement.Hierarchy[sbp.HierarchyAxes[j]];
+                shardingDims[i] *= placement.Hierarchy[sbp.HierarchyAxes[j]];
             }
         }
 

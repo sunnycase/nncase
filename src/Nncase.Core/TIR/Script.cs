@@ -342,7 +342,17 @@ public static class T
         }
 
         var physicalBuffer = new PhysicalBuffer(alignment, start, size, location, hierarchy);
-        buffer = new Buffer(name, tensorType.DType, new MemSpan(physicalBuffer), dimensions, strides, distributedType);
+        var distributedStorageKind = start is BufferVar bufferParameter
+            ? bufferParameter.LayoutAnnotation.DistributedStorageKind ?? DistributedBufferStorageKind.CompactLocal
+            : DistributedBufferStorageKind.CompactLocal;
+        buffer = new Buffer(
+            name,
+            tensorType.DType,
+            new MemSpan(physicalBuffer),
+            dimensions,
+            strides,
+            distributedType,
+            distributedStorageKind: distributedStorageKind);
         return buffer;
     }
 
@@ -383,7 +393,8 @@ public static class T
             dimensions.ToArray(),
             strides.ToArray(),
             distributedType,
-            source.StorageEncoding);
+            source.StorageEncoding,
+            distributedStorageKind: source.DistributedStorageKind);
     }
 
     /// <summary>
@@ -420,25 +431,20 @@ public static class T
         var shardIndex = Enumerable.Range(0, distributedType.Placement.Rank)
             .Select(axis => (Dimension)new DimVar($"__shard_coord_{axis}"))
             .ToArray();
-        (var localOffset, var localShape) = DistributedUtility.GetLocalOffsetAndShape(distributedType, shardIndex);
+        var shardDescriptor = DistributedUtility.GetLocalShardDescriptor(distributedType, shardIndex);
+        var localShape = shardDescriptor.LocalCapacityShape.Dimensions.ToArray();
         var globalStrides = TensorUtilities.GetDefaultStrides(@const.Value.Dimensions.ToArray());
-        var localElementOffset = (Dimension)0;
-        for (var axis = 0; axis < localOffset.Length; axis++)
-        {
-            localElementOffset += localOffset[axis] * globalStrides[axis];
-        }
-
-        var spanStart = localElementOffset * @const.Value.ElementType.SizeInBytes;
         var size = (Dimension)(@const.Value.Length * @const.Value.ElementType.SizeInBytes);
         var alignment = @const.Value.ElementType.SizeInBytes;
         var physicalBuffer = new PhysicalBuffer(alignment, IR.F.Buffer.AddressOf(@const), size, MemoryLocation.ChipLocalRdata);
         buffer = new Buffer(
             name,
             @const.CheckedDataType,
-            new MemSpan(physicalBuffer, spanStart, size),
+            new MemSpan(physicalBuffer, 0, size),
             localShape,
             globalStrides.Select(stride => (Dimension)stride).ToArray(),
-            distributedType);
+            distributedType,
+            distributedStorageKind: DistributedBufferStorageKind.CanonicalGlobal);
         return buffer;
     }
 

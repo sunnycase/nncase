@@ -54,7 +54,7 @@ public class UnitTestDataFlowRewrite : RewriteFixtrue
     public void TestLocalShardDimIsNotFolded()
     {
         var placement = new Placement([4], "b", "b");
-        var pre = IR.F.Tensors.LocalShardDim(128, SBP.S([0]), placement);
+        var pre = IR.F.Tensors.LocalShardDim(128, SBP.SContiguous([0]), placement);
         Assert.True(CompilerServices.InferenceType(pre));
 
         var post = ApplyFoldConstCallRewrite(pre);

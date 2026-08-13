@@ -434,6 +434,10 @@ internal sealed record ReshardCandidateKey(
     DistributedSearchGraph? DependencyBucket,
     SearchableNode? DependencyNode);
 
+internal sealed record ProviderInputTypeKey(
+    DistributedSearchGraph InputCluster,
+    IRType TargetType);
+
 internal sealed class AutoDistributedProfiler
 {
     private static readonly bool IsEnabled = string.Equals(
@@ -721,6 +725,8 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
 
     private readonly Dictionary<ReshardCandidateKey, (DistributedSearchGraph Bucket, SearchableNode Node)> _reshardCandidateMemo = new();
 
+    private readonly Dictionary<ProviderInputTypeKey, IReadOnlyList<DistributedSearchGraph>> _providerInputTypeMemo = new();
+
     private readonly Dictionary<TypeInferenceCacheKey, (bool Success, IRType CheckedType)> _typeInferenceMemo = new();
 
     private readonly Dictionary<Function, DistributedSearchGraph> _functionReturnClusters = new(ReferenceEqualityComparer.Instance);
@@ -849,7 +855,7 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
 
         return placements.Select(
             placement =>
-            DistributedUtility.GetLeafCandidatePolicies(tensorType, placement)
+            DistributedUtility.GetLeafCandidatePolicies(tensorType, placement, targetOptions.DistributedSplitCandidateProvider)
             .Where(p => SingleNodeMemoryCheck(new(tensorType, p, placement), moduleKind, targetOptions))
             .Select(ndsbp => new DistributedType(tensorType, ndsbp, placement)))
             .SelectMany(e => e).ToArray();
@@ -1282,8 +1288,8 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
                 foreach (var bucket in input.Clusters.OfType<DistributedSearchGraph>())
                 {
                     bucket.RemoveVertexIf(v => !(v.IRType is not DistributedType dt || (dt.AxisPolicies is { Count: > 0 } policies
-                        && policies[0] is SBPSplit { Axes: [1, 3] }
-                        && policies[1] is SBPSplit { Axes: [2] })));
+                        && policies[0] is SBPSplit { HierarchyAxes: [1, 3] }
+                        && policies[1] is SBPSplit { HierarchyAxes: [2] })));
 
                     if (bucket.VertexCount == 0)
                     {
@@ -1318,8 +1324,8 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
                     {
                         bucket.RemoveVertexIf(v => !(v.IRType is not DistributedType dt || (dt.AxisPolicies is { Count: > 0 } policies
                         && policies[0] is SBPBroadCast
-                        && policies[1] is SBPSplit { Axes: [2] }
-                        && policies[2] is SBPSplit { Axes: [1, 3] })));
+                        && policies[1] is SBPSplit { HierarchyAxes: [2] }
+                        && policies[2] is SBPSplit { HierarchyAxes: [1, 3] })));
 
                         if (bucket.VertexCount == 0)
                         {
@@ -1647,14 +1653,25 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         var availableInputTypes = candidatesByInput
             .Select(candidates => (IReadOnlyList<IRType>)candidates.Select(candidate => candidate.Type).Distinct().ToArray())
             .ToArray();
-        var returnTypes = GetProviderReturnCandidateTypes(expr.CheckedType);
-        if (returnTypes.Count == 0)
+        var context = new DistributedCandidateContext(CompileOptions, TargetOptions, _moduleKind, expr, availableInputTypes);
+        var defaultReturnTypes = GetProviderReturnCandidateTypes(expr.CheckedType);
+        var returnTypes = provider
+            .GetReturnCandidateTypes(context, op, defaultReturnTypes)
+            .Distinct()
+            .ToArray();
+        if (returnTypes.Length == 0)
         {
             _profiler.Count("candidate_provider_no_return_types");
             return Array.Empty<DistributedSearchGraph[]>();
         }
 
-        var context = new DistributedCandidateContext(CompileOptions, TargetOptions, _moduleKind, expr, availableInputTypes);
+        if (returnTypes.Length > MaxProviderReturnCandidateTypes)
+        {
+            throw new InvalidOperationException(
+                $"Distributed candidate provider {provider.GetType().Name} returned {returnTypes.Length} output types " +
+                $"for {op.GetType().Name}; the limit is {MaxProviderReturnCandidateTypes}.");
+        }
+
         var bucketsByInputType = candidatesByInput
             .Select(candidates => candidates
                 .GroupBy(candidate => candidate.Type)
@@ -1672,11 +1689,11 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
             tupleCount += tuples.Count;
             foreach (var tuple in tuples)
             {
-                ExpandProviderTuple(tuple, bucketsByInputType, result);
+                ExpandProviderTuple(tuple, argClusters, bucketsByInputType, result);
             }
         }
 
-        _profiler.Count("candidate_provider_return_types", returnTypes.Count);
+        _profiler.Count("candidate_provider_return_types", returnTypes.Length);
         _profiler.Count("candidate_provider_tuples", tupleCount);
         _profiler.Count("candidate_provider_bucket_arrays", result.Count);
         if (result.Count == 0)
@@ -1691,6 +1708,7 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
 
     private void ExpandProviderTuple(
         DistributedCandidateTuple tuple,
+        IReadOnlyList<DistributedSearchGraph> inputClusters,
         IReadOnlyList<Dictionary<IRType, DistributedSearchGraph[]>> bucketsByInputType,
         List<DistributedSearchGraph[]> result)
     {
@@ -1702,7 +1720,16 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         var bucketChoices = new DistributedSearchGraph[tuple.InputTypes.Count][];
         for (int i = 0; i < tuple.InputTypes.Count; i++)
         {
-            if (!bucketsByInputType[i].TryGetValue(tuple.InputTypes[i], out var buckets) || buckets.Length == 0)
+            if (!bucketsByInputType[i].TryGetValue(tuple.InputTypes[i], out var buckets))
+            {
+                buckets = GetOrCreateProviderInputTypeBuckets(inputClusters[i], tuple.InputTypes[i]).ToArray();
+                if (buckets.Length > 0)
+                {
+                    bucketsByInputType[i].Add(tuple.InputTypes[i], buckets);
+                }
+            }
+
+            if (buckets.Length == 0)
             {
                 return;
             }
@@ -1714,6 +1741,82 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         {
             result.Add(combBuckets.ToArray());
         }
+    }
+
+    private IReadOnlyList<DistributedSearchGraph> GetOrCreateProviderInputTypeBuckets(
+        DistributedSearchGraph inputCluster,
+        IRType targetType)
+    {
+        var existingBuckets = inputCluster.Clusters
+            .OfType<DistributedSearchGraph>()
+            .Where(bucket => bucket.Vertices.FirstOrDefault()?.IRType == targetType)
+            .ToArray();
+        if (existingBuckets.Length > 0)
+        {
+            return existingBuckets;
+        }
+
+        var key = new ProviderInputTypeKey(inputCluster, targetType);
+        if (_providerInputTypeMemo.TryGetValue(key, out var cached))
+        {
+            return cached;
+        }
+
+        if (inputCluster.Kind != SearchGraphKind.DistributedCluster ||
+            targetType is not DistributedType distributedTarget ||
+            !SingleNodeMemoryCheck(distributedTarget, _moduleKind, TargetOptions))
+        {
+            _providerInputTypeMemo.Add(key, Array.Empty<DistributedSearchGraph>());
+            return Array.Empty<DistributedSearchGraph>();
+        }
+
+        var paths = new List<(DistributedSearchGraph SourceBucket, SearchableNode SourceNode, IReadOnlyList<IRType> Steps)>();
+        foreach (var sourceBucket in inputCluster.Clusters.OfType<DistributedSearchGraph>().ToArray())
+        {
+            foreach (var sourceNode in sourceBucket.Vertices.ToArray())
+            {
+                foreach (var plan in GetReshardPlans(
+                             sourceNode.IRType,
+                             targetType,
+                             GetReshardSourceKind(sourceNode),
+                             DistributedReshardUsageKind.Internal))
+                {
+                    if (plan.StepTypes.Count == 0 || plan.StepTypes[^1] != targetType)
+                    {
+                        throw new InvalidOperationException(
+                            $"Reshard planner returned an invalid provider-input path from {sourceNode.IRType} to {targetType}.");
+                    }
+
+                    paths.Add((sourceBucket, sourceNode, plan.StepTypes));
+                }
+            }
+        }
+
+        if (paths.Count == 0)
+        {
+            _providerInputTypeMemo.Add(key, Array.Empty<DistributedSearchGraph>());
+            return Array.Empty<DistributedSearchGraph>();
+        }
+
+        var adaptationCluster = _rootSearchGraph.CreateCluster<DistributedSearchGraph>(SearchGraphKind.DistributedCluster);
+        var targetBucket = adaptationCluster.CreateCluster<DistributedSearchGraph>(SearchGraphKind.Bucket);
+        DistributedSearchGraph? pathCluster = null;
+        foreach (var path in paths)
+        {
+            AddOutputReshardPath(
+                adaptationCluster,
+                ref pathCluster,
+                path.SourceBucket,
+                path.SourceNode,
+                targetBucket,
+                path.Steps,
+                DistributedReshardUsageKind.Internal);
+        }
+
+        IReadOnlyList<DistributedSearchGraph> created = [targetBucket];
+        _providerInputTypeMemo.Add(key, created);
+        _profiler.Count("candidate_provider_input_types_materialized");
+        return created;
     }
 
     private IReadOnlyList<IRType> GetProviderReturnCandidateTypes(IRType type)
@@ -2174,7 +2277,7 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
     {
         return placements.Select(
             placement =>
-                DistributedUtility.GetLeafCandidatePolicies(distributedType.TensorType, placement).
+                DistributedUtility.GetLeafCandidatePolicies(distributedType.TensorType, placement, TargetOptions.DistributedSplitCandidateProvider).
                 Where(p => SingleNodeMemoryCheck(new(distributedType.TensorType, p, placement), _moduleKind, TargetOptions)).
                 Where(ndsbp => ndsbp != distributedType.AxisPolicies)).
             SelectMany(e => e).ToArray();
@@ -2842,22 +2945,25 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
                     {
                         if (inv.AxisPolicies[i] is SBPSplit splitIn)
                         {
-                            if (splitIn.Axes.Except(s.Axes).Any())
+                            if (!DistributedUtility.IsSamePolicy(splitIn, s, checkGranularity: false))
                             {
                                 return new InvalidType("Not Supported Split-> Split.");
                             }
                         }
 
-                        if (s.Axes.Except(inv.Partial.Axes).ToArray() != s.Axes)
+                        if (s.HierarchyAxes.Any(inv.Partial.Axes.Contains))
                         {
                             partialDims.Add(i);
                         }
                     }
                 }
 
-                var ndspsIn = DistributedUtility.AxisPolicesToNDSBP(inv.AxisPolicies, inv.Placement.Rank);
-                var ndspsOut = DistributedUtility.AxisPolicesToNDSBP(outv.AxisPolicies, outv.Placement.Rank);
-                if (Enumerable.Range(0, ndspsIn.Count).Any(i => ndspsIn[i] is SBPSplit si && (ndspsOut[i] is SBPBroadCast || (ndspsOut[i] is SBPSplit so && so.Axes[0] != si.Axes[0]))))
+                var ndspsIn = DistributedUtility.GetHierarchyAxisPolicies(inv.AxisPolicies, inv.Placement.Rank);
+                var ndspsOut = DistributedUtility.GetHierarchyAxisPolicies(outv.AxisPolicies, outv.Placement.Rank);
+                if (Enumerable.Range(0, ndspsIn.Count).Any(i =>
+                    ndspsIn[i] is HierarchyAxisSplit splitIn &&
+                    (ndspsOut[i] is HierarchyAxisBroadcast ||
+                     (ndspsOut[i] is HierarchyAxisSplit splitOut && splitOut != splitIn))))
                 {
                     return new InvalidType("Not Supported Split-> Broadcast.");
                 }

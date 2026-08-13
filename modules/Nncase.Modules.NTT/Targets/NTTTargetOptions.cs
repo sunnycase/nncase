@@ -10,6 +10,7 @@ using System.Threading.Tasks;
 using Nncase.CostModel;
 using Nncase.Passes.Distributed;
 using Nncase.Schedule;
+using Nncase.Utilities;
 
 namespace Nncase.Targets;
 
@@ -135,6 +136,9 @@ public class NTTTargetOptions : INTTTargetOptions, ITargetOpCostModelProvider, I
     public ITargetStorageEncodingModelProvider StorageEncodingModel { get; protected set; }
 
     public ILoopPipelineBackend LoopPipelineBackend { get; protected set; }
+
+    public virtual IDistributedSplitCandidateProvider DistributedSplitCandidateProvider
+        => ContiguousDistributedSplitCandidateProvider.Instance;
 
     protected virtual void OnTargetMachineChanged()
     {

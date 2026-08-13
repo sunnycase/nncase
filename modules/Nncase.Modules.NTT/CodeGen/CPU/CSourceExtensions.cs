@@ -90,7 +90,8 @@ public static class CSourceExtensions
     {
         var toc = (SBP sbp) => sbp switch
         {
-            SBPSplit s => $"shard_policy::S<{string.Join(", ", s.Axes)}>()",
+            SBPSplit s when s.IsContiguous => $"shard_policy::S<{string.Join(", ", s.HierarchyAxes)}>()",
+            SBPSplit s => throw new NotSupportedException($"NTT CPU codegen does not support split policy {s}."),
             SBPPartial p => $"shard_policy::P<reduce_op::{p.Op.ToC()}>",
             SBPBroadCast b => $"shard_policy::B",
             _ => throw new ArgumentOutOfRangeException(nameof(arr)),
@@ -149,8 +150,8 @@ public static class CSourceExtensions
         {
             if (sbp is SBPSplit split)
             {
-                splits[i] = split.Axes.ToList();
-                splitHierarchy[i] = placement.Hierarchy.Select((h, i) => split.Axes.Contains(i) ? h : 1).ToList();
+                splits[i] = split.HierarchyAxes.ToList();
+                splitHierarchy[i] = placement.Hierarchy.Select((h, i) => split.HierarchyAxes.Contains(i) ? h : 1).ToList();
             }
         }
 

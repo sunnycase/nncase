@@ -132,7 +132,7 @@ public sealed class NormStatsEvaluator : IEvaluator<NormStats>, ITypeInferencer<
                 policies[i + 1] = policy;
                 if (policy is SBPSplit preservedSplit)
                 {
-                    foreach (var axis in preservedSplit.Axes)
+                    foreach (var axis in preservedSplit.HierarchyAxes)
                     {
                         preservedSplitAxes.Add(axis);
                     }
@@ -140,7 +140,7 @@ public sealed class NormStatsEvaluator : IEvaluator<NormStats>, ITypeInferencer<
             }
             else if (policy is SBPSplit reduceSplit)
             {
-                foreach (var axis in reduceSplit.Axes)
+                foreach (var axis in reduceSplit.HierarchyAxes)
                 {
                     partialAxes.Add(axis);
                 }

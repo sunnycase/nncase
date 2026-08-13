@@ -165,7 +165,16 @@ public class MatMulEvaluator : IEvaluator<MatMul>, ITypeInferencer<MatMul>, ICos
         var policyN = rhs.AxisPolicies[dimInfo!.Rn];
         if (policyN is SBPSplit split)
         {
-            policyN = SBP.S(split.Axes, split.Granularity is null ? null : split.Granularity / ((VectorType)tensorType.DType).Lanes[0]);
+            if (!DistributedUtility.TryScaleSplitUnits(
+                split,
+                1,
+                ((VectorType)tensorType.DType).Lanes[0],
+                out var packedSplit))
+            {
+                return new InvalidType($"Cannot pack MatMul output split policy {split}.");
+            }
+
+            policyN = packedSplit;
         }
 
         var policyM = lhs.AxisPolicies[dimInfo!.Lm];

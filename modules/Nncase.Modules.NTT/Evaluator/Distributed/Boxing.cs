@@ -56,22 +56,25 @@ public sealed class BoxingEvaluator : ITypeInferencer<Boxing>, ICostEvaluator<Bo
                     {
                         if (inv.AxisPolicies[i] is SBPSplit splitIn)
                         {
-                            if (splitIn.Axes.Except(s.Axes).Any())
+                            if (splitIn.HierarchyAxes.Except(s.HierarchyAxes).Any())
                             {
                                 return new InvalidType("Not Supported Split-> Split.");
                             }
                         }
 
-                        if (s.Axes.Except(inv.Partial.Axes).ToArray() != s.Axes)
+                        if (s.HierarchyAxes.Any(inv.Partial.Axes.Contains))
                         {
                             partialDims.Add(i);
                         }
                     }
                 }
 
-                var ndspsIn = DistributedUtility.AxisPolicesToNDSBP(inv.AxisPolicies, inv.Placement.Rank);
-                var ndspsOut = DistributedUtility.AxisPolicesToNDSBP(outv.AxisPolicies, outv.Placement.Rank);
-                if (Enumerable.Range(0, ndspsIn.Count).Any(i => ndspsIn[i] is SBPSplit si && (ndspsOut[i] is SBPBroadCast || (ndspsOut[i] is SBPSplit so && so.Axes[0] != si.Axes[0]))))
+                var ndspsIn = DistributedUtility.GetHierarchyAxisPolicies(inv.AxisPolicies, inv.Placement.Rank);
+                var ndspsOut = DistributedUtility.GetHierarchyAxisPolicies(outv.AxisPolicies, outv.Placement.Rank);
+                if (Enumerable.Range(0, ndspsIn.Count).Any(i =>
+                    ndspsIn[i] is HierarchyAxisSplit splitIn &&
+                    (ndspsOut[i] is HierarchyAxisBroadcast ||
+                     (ndspsOut[i] is HierarchyAxisSplit splitOut && splitOut != splitIn))))
                 {
                     return new InvalidType("Not Supported Split-> Broadcast.");
                 }
@@ -161,111 +164,6 @@ public sealed class BoxingEvaluator : ITypeInferencer<Boxing>, ICostEvaluator<Bo
                 break;
 
             case (DistributedType a, DistributedType b) when a.TensorType == b.TensorType && a.Placement == b.Placement && a.AxisPolicies != b.AxisPolicies:
-#if false
-                {
-                    var fullLoadStore = new Cost()
-                    {
-                        [CostFactorNames.ChipGlobalMemoryStoreBytes] = CostUtility.GetMemoryAccess(a),
-                        [CostFactorNames.ChipGlobalMemoryLoadBytes] = CostUtility.GetMemoryAccess(b),
-                        [CostFactorNames.GridSynchronization] = SynchronizationEventCount,
-                    };
-
-                    float scatterPart = 1;
-                    float gatherPart = 1;
-                    float reducePart = 1;
-                    float latency = 0;
-
-                    // TODO: calculate cost using NTTD.
-                    var ndsbpsA = DistributedUtility.AxisPolicesToNDSBP(a.AxisPolicies, a.Placement.Rank);
-                    var ndsbpsB = DistributedUtility.AxisPolicesToNDSBP(b.AxisPolicies, b.Placement.Rank);
-                    for (int i = 0; i < a.Placement.Rank; i++)
-                    {
-                        switch (ndsbpsA[i], ndsbpsB[i])
-                        {
-                            case (SBPSplit splitIn, SBP sbpout):
-                                switch (sbpout)
-                                {
-                                    case SBPSplit splitOut:
-                                        if (splitIn.Axes[0] != splitOut.Axes[0])
-                                        {
-                                            // when split different axis, need global load store.
-                                            return fullLoadStore;
-                                        }
-
-                                        break;
-                                    case SBPBroadCast:
-                                        scatterPart *= a.Placement.Hierarchy[i];
-                                        gatherPart *= a.Placement.Hierarchy[i];
-                                        break;
-                                    default:
-                                        throw new NotSupportedException("split to partial");
-                                }
-
-                                break;
-                            case (SBPBroadCast, SBPBroadCast or SBPSplit):
-                                // no cost.
-                                cost += new Cost()
-                                {
-                                    [CostFactorNames.CPUCycles] = 1,
-                                };
-                                break;
-                            case (SBPPartial, SBP sbpout):
-                                switch (sbpout)
-                                {
-                                    case SBPPartial:
-                                        break;
-                                    case SBPBroadCast:
-                                        latency = MathF.Max(latency, ((INTTTargetOptions)context.CompileOptions.TargetOptions).HierarchyLatencies[i]);
-                                        reducePart *= a.Placement.Hierarchy[i];
-                                        gatherPart *= a.Placement.Hierarchy[i];
-                                        if (i == 0)
-                                        {
-                                            scatterPart *= a.Placement.Hierarchy[i];
-                                        }
-
-                                        break;
-                                    case SBPSplit:
-                                        throw new NotSupportedException("split to partial");
-                                }
-
-                                break;
-                            case (SBPBroadCast, SBPPartial):
-                                // note this case only for tests.
-                                cost += new Cost()
-                                {
-                                    [CostFactorNames.CPUCycles] = 1,
-                                };
-                                break;
-                            default:
-                                throw new NotSupportedException($"{a} to {b}");
-                        }
-                    }
-
-                    if (gatherPart > 1f)
-                    {
-                        cost += new Cost()
-                        {
-                            [CostFactorNames.ChipGlobalMemoryStoreBytes] = (UInt128)((gatherPart - 1) * (float)CostUtility.GetMemoryAccess(DistributedUtility.GetDividedTensorType(a)) / gatherPart),
-                        };
-                    }
-
-                    if (reducePart > 1f)
-                    {
-                        cost += new Cost()
-                        {
-                            [CostFactorNames.Comm] = (UInt128)((reducePart - 1) * latency),
-                        };
-                    }
-
-                    if (scatterPart > 1f)
-                    {
-                        cost += new Cost()
-                        {
-                            [CostFactorNames.ChipGlobalMemoryLoadBytes] = (UInt128)((scatterPart - 1) * (float)CostUtility.GetMemoryAccess(DistributedUtility.GetDividedTensorType(b)) / scatterPart),
-                        };
-                    }
-                }
-#endif
                 {
                     var fullLoadStore = new Cost()
                     {
@@ -286,8 +184,8 @@ public sealed class BoxingEvaluator : ITypeInferencer<Boxing>, ICostEvaluator<Bo
                                 {
                                     case SBPSplit splitOut:
                                         {
-                                            var setA = new HashSet<int>(splitIn.Axes);
-                                            var setB = new HashSet<int>(splitOut.Axes);
+                                            var setA = new HashSet<int>(splitIn.HierarchyAxes);
+                                            var setB = new HashSet<int>(splitOut.HierarchyAxes);
                                             var aContainsB = setA.IsSupersetOf(setB);
                                             var bContainsA = setB.IsSupersetOf(setA);
                                             if (bContainsA && aContainsB)
@@ -300,7 +198,7 @@ public sealed class BoxingEvaluator : ITypeInferencer<Boxing>, ICostEvaluator<Bo
                                             else if (bContainsA)
                                             {
                                                 var diff = setB.Except(setA).ToArray();
-                                                if (diff.All(d => d > splitIn.Axes[^1]))
+                                                if (diff.All(d => d > splitIn.HierarchyAxes[^1]))
                                                 {
                                                     diff.ForEach(s => scatterPart *= hierarchyPenalty[s]);
                                                 }
@@ -323,7 +221,7 @@ public sealed class BoxingEvaluator : ITypeInferencer<Boxing>, ICostEvaluator<Bo
                                         break;
                                     case SBPBroadCast:
                                         // scatterPart *= a.Placement.Hierarchy[i];
-                                        splitIn.Axes.ToArray().ForEach(s => gatherPart *= hierarchyPenalty[s]);
+                                        splitIn.HierarchyAxes.ToArray().ForEach(s => gatherPart *= hierarchyPenalty[s]);
                                         break;
                                     default:
                                         throw new NotSupportedException("split to partial");
@@ -338,7 +236,7 @@ public sealed class BoxingEvaluator : ITypeInferencer<Boxing>, ICostEvaluator<Bo
                                 };
                                 break;
                             case (SBPBroadCast, SBPSplit splitOut):
-                                splitOut.Axes.ToArray().ForEach(s => scatterPart *= hierarchyPenalty[s]);
+                                splitOut.HierarchyAxes.ToArray().ForEach(s => scatterPart *= hierarchyPenalty[s]);
                                 break;
                             case (SBPPartial, SBPSplit splitOut):
                                 // actually partial to split needs gather.

@@ -112,6 +112,6 @@ public class GatherEvaluator : IEvaluator<Gather>, ITypeInferencer<Gather>, ICos
             return invalid;
         }
 
-        return new DistributedType(tensorType, ndsbp, input.Placement, input.AxisPolicies[axis] is SBPSplit split ? SBP.P(split.Axes) : null);
+        return new DistributedType(tensorType, ndsbp, input.Placement, input.AxisPolicies[axis] is SBPSplit split ? SBP.P(split.HierarchyAxes) : null);
     }
 }

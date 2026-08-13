@@ -6,6 +6,7 @@ using System.ComponentModel;
 using Nncase.CostModel;
 using Nncase.Passes.Distributed;
 using Nncase.Schedule;
+using Nncase.Utilities;
 
 namespace Nncase.Targets;
 
@@ -16,6 +17,7 @@ public sealed class PyNTTTargetOptions : NTTTargetOptions, IPagedAttentionExecut
 {
     private string _backend = "triton";
     private TritonPagedAttentionExecutionPlanner _pagedAttentionExecutionPlanner = null!;
+    private long _blockCyclicBlockBytes = 128;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="PyNTTTargetOptions"/> class.
@@ -57,9 +59,36 @@ public sealed class PyNTTTargetOptions : NTTTargetOptions, IPagedAttentionExecut
     [DefaultValue("")]
     public string OutputDirectory { get; set; } = string.Empty;
 
+    /// <summary>
+    /// Gets or sets the independent contiguous byte granule used by physical
+    /// block-cyclic split candidates.
+    /// </summary>
+    [DisplayName("--pyntt-block-cyclic-block-bytes")]
+    [Description("Independent contiguous byte granule for block-cyclic split stages.")]
+    [DefaultValue(128L)]
+    public long BlockCyclicBlockBytes
+    {
+        get => _blockCyclicBlockBytes;
+        set
+        {
+            if (value <= 0 || !System.Numerics.BitOperations.IsPow2((ulong)value))
+            {
+                throw new ArgumentOutOfRangeException(
+                    nameof(value),
+                    value,
+                    "PyNTT block-cyclic byte granularity must be a positive power of two.");
+            }
+
+            _blockCyclicBlockBytes = value;
+        }
+    }
+
     /// <inheritdoc/>
     public override IDistributedReshardRealizationPolicy ReshardRealizationPolicy
         => PyNTTDistributedReshardRealizationPolicy.Instance;
+
+    public override IDistributedSplitCandidateProvider DistributedSplitCandidateProvider
+        => new PyNTTDistributedSplitCandidateProvider(BlockCyclicBlockBytes);
 
     public PagedAttentionExecutionPlan GetPagedAttentionExecutionPlan(
         PagedAttentionExecutionPlanQuery query)

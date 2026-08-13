@@ -152,7 +152,7 @@ public sealed class PyNTTDistributedReshardRealizationPolicy : IDistributedResha
                 continue;
             }
 
-            foreach (var placementAxis in split.Axes)
+            foreach (var placementAxis in split.HierarchyAxes)
             {
                 if ((uint)placementAxis >= (uint)owners.Length ||
                     owners[placementAxis] >= 0)

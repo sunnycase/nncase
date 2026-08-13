@@ -484,7 +484,7 @@ public static class BufferViewUtility
 
     private static bool HasSuffixSplit(IRType type, int prefixRank)
         => type is DistributedType distributedType && distributedType.AxisPolicies.Any(policy =>
-            policy is SBPSplit split && split.Axes.Any(axis => axis >= prefixRank));
+            policy is SBPSplit split && split.HierarchyAxes.Any(axis => axis >= prefixRank));
 
     private static bool HaveCompatibleDistributedPlacement(IRType sourceType, IRType resultType)
         => (sourceType, resultType) switch
@@ -504,7 +504,7 @@ public static class BufferViewUtility
         => type.TensorType.Shape is RankedShape shape &&
             type.AxisPolicies.Count == shape.Rank &&
             type.AxisPolicies.All(policy => policy is not SBPSplit split ||
-                split.Axes.All(axis => axis >= 0 && axis < type.Placement.Rank));
+                split.HierarchyAxes.All(axis => axis >= 0 && axis < type.Placement.Rank));
 
     private static bool HaveCompatibleDistributedStorage(IRType sourceType, IRType resultType, BufferViewTransform transform)
     {
@@ -524,6 +524,11 @@ public static class BufferViewUtility
             return true;
         }
 
+        if (HaveEquivalentInnermostLinearizedStorage(source, result, transform))
+        {
+            return true;
+        }
+
         var domainBounds = CompilerServices.GetMaxShape(new RankedShape(transform.DomainBounds.ToArray()));
         var resultMapIsIdentity = transform.ResultMap.Equals(AffineMap.Identity(transform.ResultMap.Results.Length));
         var sourceInverse = resultMapIsIdentity ? null : AffineUtility.Inverse(transform.SourceMap, domainBounds);
@@ -533,8 +538,14 @@ public static class BufferViewUtility
         for (var linearIndex = 0; linearIndex < shardCount; linearIndex++)
         {
             var shardIndex = DistributedUtility.GetUnraveledIndex(linearIndex, hierarchy);
-            var (sourceOffset, sourceShape) = DistributedUtility.GetLocalOffsetAndShape(source, shardIndex);
-            var (resultOffset, resultShape) = DistributedUtility.GetLocalOffsetAndShape(result, shardIndex);
+            var sourceDescriptor = DistributedUtility.GetLocalShardDescriptor(source, shardIndex);
+            var resultDescriptor = DistributedUtility.GetLocalShardDescriptor(result, shardIndex);
+            if (!sourceDescriptor.TryGetContiguousRegion(out var sourceOffset, out var sourceShape) ||
+                !resultDescriptor.TryGetContiguousRegion(out var resultOffset, out var resultShape))
+            {
+                return false;
+            }
+
             if (resultMapIsIdentity)
             {
                 var mappedSource = transform.SourceMap.Apply(resultOffset, resultShape);
@@ -556,6 +567,69 @@ public static class BufferViewUtility
         }
 
         return true;
+    }
+
+    private static bool HaveEquivalentInnermostLinearizedStorage(
+        DistributedType source,
+        DistributedType result,
+        BufferViewTransform transform)
+    {
+        if (source.TensorType.Shape is not RankedShape sourceShape ||
+            result.TensorType.Shape is not RankedShape resultShape ||
+            sourceShape.Rank == 0 ||
+            sourceShape.Rank != resultShape.Rank)
+        {
+            return false;
+        }
+
+        var innermostAxis = sourceShape.Rank - 1;
+        if (GetCommonPrefixRank(sourceShape, resultShape) != innermostAxis)
+        {
+            return false;
+        }
+
+        var storageUnitBytes = GreatestCommonDivisor(
+            source.TensorType.DType.SizeInBytes,
+            result.TensorType.DType.SizeInBytes);
+        var sourceLanes = source.TensorType.DType.SizeInBytes / storageUnitBytes;
+        var resultLanes = result.TensorType.DType.SizeInBytes / storageUnitBytes;
+        if (!TryGetFlatToFlatMaps(
+                sourceShape,
+                resultShape,
+                innermostAxis,
+                sourceLanes,
+                resultLanes,
+                out var expectedTransform) ||
+            transform != expectedTransform)
+        {
+            return false;
+        }
+
+        for (var axis = 0; axis < innermostAxis; axis++)
+        {
+            if (!DistributedUtility.IsSamePolicy(
+                    source.AxisPolicies[axis],
+                    result.AxisPolicies[axis]))
+            {
+                return false;
+            }
+        }
+
+        var sourcePolicy = source.AxisPolicies[innermostAxis];
+        var resultPolicy = result.AxisPolicies[innermostAxis];
+        if (sourcePolicy is SBPBroadCast && resultPolicy is SBPBroadCast)
+        {
+            return true;
+        }
+
+        return sourcePolicy is SBPSplit sourceSplit &&
+            resultPolicy is SBPSplit resultSplit &&
+            DistributedUtility.TryScaleSplitUnits(
+                sourceSplit,
+                source.TensorType.DType.SizeInBytes,
+                result.TensorType.DType.SizeInBytes,
+                out var scaledSplit) &&
+            DistributedUtility.IsSamePolicy(scaledSplit, resultSplit);
     }
 
     private static bool AreSameRanges(ReadOnlySpan<TIR.Range> lhs, ReadOnlySpan<TIR.Range> rhs)

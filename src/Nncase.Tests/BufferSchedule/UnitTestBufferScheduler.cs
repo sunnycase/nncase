@@ -122,7 +122,7 @@ public sealed class UnitTestBufferScheduler : TestClassBase
         var placement = new Placement([2], "b", "b");
         var splitType = new DistributedType(
             tensorConst.CheckedTensorType,
-            [SBP.S([0])],
+            [SBP.SContiguous([0])],
             placement);
         var broadcastType = new DistributedType(
             tensorConst.CheckedTensorType,

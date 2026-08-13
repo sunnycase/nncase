@@ -7,6 +7,7 @@ using NetFabric.Hyperlinq;
 using Nncase.CostModel;
 using Nncase.IR;
 using Nncase.IR.NN;
+using Nncase.Utilities;
 using OrtKISharp;
 
 namespace Nncase.Evaluator.NN;
@@ -189,7 +190,9 @@ public class LayerNormEvaluator : IEvaluator<LayerNorm>, ITypeInferencer<LayerNo
             var biasPolicy = i - raxis >= 0 ? bias.AxisPolicies[i - raxis] : null;
             switch (input.AxisPolicies[i], scalePolicy, biasPolicy)
             {
-                case (SBPSplit si, SBPSplit ss, SBPSplit sb) when i >= raxis && si.Axes == ss.Axes && ss.Axes == sb.Axes:
+                case (SBPSplit si, SBPSplit ss, SBPSplit sb) when i >= raxis &&
+                    DistributedUtility.IsSamePolicy(si, ss, checkGranularity: false) &&
+                    DistributedUtility.IsSamePolicy(ss, sb, checkGranularity: false):
                     // FIXME: not support on axes for now
 #if true
                     return invalid;
@@ -214,7 +217,7 @@ public class LayerNormEvaluator : IEvaluator<LayerNorm>, ITypeInferencer<LayerNo
     private UInt128 GetRingReduceCommunicate(DistributedType distributedType, int[] axes)
     {
         var ttype = Utilities.DistributedUtility.GetDividedTensorType(distributedType);
-        var splits = axes.Where(i => i < distributedType.Placement.Rank && distributedType.AxisPolicies.Any(s => s is SBPSplit split && split.Axes.Contains(i)));
+        var splits = axes.Where(i => i < distributedType.Placement.Rank && distributedType.AxisPolicies.Any(s => s is SBPSplit split && split.HierarchyAxes.Contains(i)));
         if (!splits.Any())
         {
             return 0;

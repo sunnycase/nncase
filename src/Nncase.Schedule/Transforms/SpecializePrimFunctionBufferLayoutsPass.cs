@@ -274,11 +274,13 @@ public sealed class SpecializePrimFunctionBufferLayoutsPass : ModulePass
                     backingLayout.Strides,
                     out var derivedStrides))
                 {
-                    return BufferLayoutAnnotation.ExactStrided(derivedStrides);
+                    return BufferLayoutAnnotation.ExactStrided(
+                        derivedStrides,
+                        backingLayout.DistributedStorageKind ?? DistributedBufferStorageKind.CompactLocal);
                 }
             }
 
-            return BufferLayoutAnnotation.ExactStrided(buffer.Strides);
+            return BufferLayoutAnnotation.ExactStrided(buffer.Strides, buffer.DistributedStorageKind);
         }
 
         private static void ValidateSignature(PrimFunction function, FunctionLayoutSignature signature)
@@ -422,7 +424,10 @@ public sealed class SpecializePrimFunctionBufferLayoutsPass : ModulePass
                 var physicalSize = Dimension.Max(cloned.MemSpan.Buffer.Size, requiredPhysicalSize).Simplify();
                 var physicalBuffer = cloned.MemSpan.Buffer.With(size: physicalSize);
                 var memSpan = cloned.MemSpan.With(buffer: physicalBuffer, size: byteSpan);
-                return cloned.With(memSpan: memSpan, strides: strides);
+                return cloned.With(
+                    memSpan: memSpan,
+                    strides: strides,
+                    distributedStorageKind: specializedParameter.LayoutAnnotation.DistributedStorageKind);
             }
         }
 

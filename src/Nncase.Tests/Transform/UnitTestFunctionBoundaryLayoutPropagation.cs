@@ -348,7 +348,7 @@ public sealed class UnitTestFunctionBoundaryLayoutPropagation : TestClassBase
         var tensorType = new TensorType(DataTypes.Float32, new RankedShape(4, 16));
         var placement = new Placement(new[] { 2 }, "b", "b");
         var broadcastType = new DistributedType(tensorType, new SBP[] { SBP.B, SBP.B }, placement);
-        var splitType = new DistributedType(tensorType, new SBP[] { SBP.B, SBP.S([0]) }, placement);
+        var splitType = new DistributedType(tensorType, new SBP[] { SBP.B, SBP.SContiguous([0]) }, placement);
         var layerInput = new Var("layer_input", tensorType);
         var broadcast = IR.F.Distributed.Boxing(layerInput, broadcastType);
         var split = IR.F.Distributed.Boxing(layerInput, splitType);
@@ -384,7 +384,7 @@ public sealed class UnitTestFunctionBoundaryLayoutPropagation : TestClassBase
     {
         var tensorType = new TensorType(DataTypes.Float32, new RankedShape(4, 16));
         var placement = new Placement(new[] { 2 }, "b", "b");
-        var sourceType = new DistributedType(tensorType, new SBP[] { SBP.S([0]) }, placement);
+        var sourceType = new DistributedType(tensorType, new SBP[] { SBP.SContiguous([0]) }, placement);
         var targetType = new DistributedType(tensorType, new SBP[] { SBP.B }, placement);
         var input = new Var("input", sourceType);
         var body = IR.F.Distributed.Boxing(IR.F.Distributed.Boxing(input, tensorType), targetType);
@@ -410,7 +410,7 @@ public sealed class UnitTestFunctionBoundaryLayoutPropagation : TestClassBase
     {
         var tensorType = new TensorType(DataTypes.Float32, new RankedShape(4, 16));
         var placement = new Placement(new[] { 2 }, "b", "b");
-        var sourceType = new DistributedType(tensorType, new SBP[] { SBP.S([0]) }, placement);
+        var sourceType = new DistributedType(tensorType, new SBP[] { SBP.SContiguous([0]) }, placement);
         var targetType = new DistributedType(tensorType, new SBP[] { SBP.B }, placement);
         var input = new Var("input", sourceType);
         var tuple = new IR.Tuple(IR.F.Distributed.Boxing(input, tensorType), input);
@@ -442,7 +442,7 @@ public sealed class UnitTestFunctionBoundaryLayoutPropagation : TestClassBase
             UnifiedMemoryArch = true,
         };
         var tensorType = new TensorType(DataTypes.Float32, new RankedShape(4, 16));
-        var distributedType = new DistributedType(tensorType, new SBP[] { SBP.B, SBP.S([0]) }, new Placement(new[] { 2 }, "b", "b"));
+        var distributedType = new DistributedType(tensorType, new SBP[] { SBP.B, SBP.SContiguous([0]) }, new Placement(new[] { 2 }, "b", "b"));
         var weight = new Var("weight", tensorType);
         var distributedWeight = IR.F.Distributed.Boxing(weight, distributedType);
         var layer = new Function("layer", IR.F.Distributed.Boxing(distributedWeight, tensorType), weight);

@@ -124,7 +124,7 @@ public sealed record PagedAttentionExecutionPlanQuery(
     public bool UsesHierarchyAxis(int hierarchyAxis)
         => QueryType.AxisPolicies.Any(policy => policy switch
         {
-            SBPSplit split => split.Axes.Contains(hierarchyAxis),
+            SBPSplit split => split.HierarchyAxes.Contains(hierarchyAxis),
             SBPPartial partial => partial.Axes.Contains(hierarchyAxis),
             _ => false,
         });
@@ -213,28 +213,38 @@ public sealed record PagedAttentionExecutionPlanQuery(
         for (int linearIndex = 0; linearIndex < shardCount; linearIndex++)
         {
             var shardIndex = DistributedUtility.GetUnraveledIndex(linearIndex, hierarchy);
-            var (offset, shape) = DistributedUtility.GetLocalOffsetAndShape(
+            var descriptor = DistributedUtility.GetLocalShardDescriptor(
                 queryType,
                 shardIndex,
                 DistributedUtility.DivideFlags.MaxShape);
-            if (!offset[headAxis].IsFixed || !shape[headAxis].IsFixed)
+            var localHeadAxis = descriptor.Axes[headAxis];
+            if (!localHeadAxis.ActiveExtent.IsFixed)
             {
                 return false;
             }
 
-            var queryHeadBegin = Math.Clamp(offset[headAxis].FixedValue, 0, globalQueryHeads);
-            var queryHeadEnd = Math.Clamp(
-                queryHeadBegin + Math.Max(0, shape[headAxis].FixedValue),
-                queryHeadBegin,
-                globalQueryHeads);
-            if (queryHeadBegin == queryHeadEnd)
+            var localHeadCount = Math.Max(0, localHeadAxis.ActiveExtent.FixedValue);
+            if (localHeadCount == 0)
             {
                 continue;
             }
 
-            var firstKVHead = queryHeadBegin / queryHeadsPerKVHead;
-            var lastKVHead = (queryHeadEnd - 1) / queryHeadsPerKVHead;
-            maxLocalKVHeads = Math.Max(maxLocalKVHeads, lastKVHead - firstKVHead + 1);
+            var localKVHeads = new HashSet<long>();
+            for (long localHead = 0; localHead < localHeadCount; localHead++)
+            {
+                var globalHead = localHeadAxis.MapLocalToGlobal(localHead);
+                if (!globalHead.IsFixed)
+                {
+                    return false;
+                }
+
+                if ((ulong)globalHead.FixedValue < (ulong)globalQueryHeads)
+                {
+                    localKVHeads.Add(globalHead.FixedValue / queryHeadsPerKVHead);
+                }
+            }
+
+            maxLocalKVHeads = Math.Max(maxLocalKVHeads, localKVHeads.Count);
         }
 
         return maxLocalKVHeads > 0;

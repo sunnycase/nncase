@@ -98,7 +98,7 @@ public sealed class TestUpdatePagedAttentionCaseData : TheoryData<TestFixture.Pa
 
     private static readonly (PagedKVCacheDimKind[] Sharding, SBPSplit[] Policies, int[] Hierarchy)[] ShardingConfigs =
     [
-        (new[] { PagedKVCacheDimKind.NumBlocks }, new[] { SBP.S([0]) }, [1]),
+        (new[] { PagedKVCacheDimKind.NumBlocks }, new[] { SBP.SContiguous([0]) }, [1]),
     ];
 
     private static readonly (AttentionDimKind[] QLayout, AttentionDimKind[] KLayout)[] QKLayoutConfigs =
@@ -133,7 +133,7 @@ public sealed class TestUpdatePagedAttentionCaseData : TheoryData<TestFixture.Pa
             }
         }
 
-        Add(new TestFixture.PagedAttentionKVCacheTestFixture([256], [256], 14, 2, 64, 256, 16, Runtime.TypeCode.Float32, 1, [PagedKVCacheDimKind.NumBlocks, PagedKVCacheDimKind.NumLayers, PagedKVCacheDimKind.KV, PagedKVCacheDimKind.NumKVHeads, PagedKVCacheDimKind.HeadDim, PagedKVCacheDimKind.BlockSize], [PagedKVCacheDimKind.HeadDim], [PagedKVCacheDimKind.NumBlocks], [SBP.S([0])], [AttentionDimKind.Head, AttentionDimKind.Dim, AttentionDimKind.Seq], [AttentionDimKind.Head, AttentionDimKind.Dim, AttentionDimKind.Seq]), [1], count++);
+        Add(new TestFixture.PagedAttentionKVCacheTestFixture([256], [256], 14, 2, 64, 256, 16, Runtime.TypeCode.Float32, 1, [PagedKVCacheDimKind.NumBlocks, PagedKVCacheDimKind.NumLayers, PagedKVCacheDimKind.KV, PagedKVCacheDimKind.NumKVHeads, PagedKVCacheDimKind.HeadDim, PagedKVCacheDimKind.BlockSize], [PagedKVCacheDimKind.HeadDim], [PagedKVCacheDimKind.NumBlocks], [SBP.SContiguous([0])], [AttentionDimKind.Head, AttentionDimKind.Dim, AttentionDimKind.Seq], [AttentionDimKind.Head, AttentionDimKind.Dim, AttentionDimKind.Seq]), [1], count++);
     }
 }
 
@@ -186,7 +186,7 @@ public sealed class TestPagedAttentionCaseData : TheoryData<TestFixture.PagedAtt
 
     private static readonly (PagedKVCacheDimKind[] Sharding, SBPSplit[] Policies, int[] Hierarchy)[] ShardingConfigs =
     [
-        (new[] { PagedKVCacheDimKind.NumBlocks }, new[] { SBP.S([0]) }, [1]),
+        (new[] { PagedKVCacheDimKind.NumBlocks }, new[] { SBP.SContiguous([0]) }, [1]),
     ];
 
     private static readonly (AttentionDimKind[] QLayout, AttentionDimKind[] KLayout)[] QKLayoutConfigs =
@@ -221,7 +221,7 @@ public sealed class TestPagedAttentionCaseData : TheoryData<TestFixture.PagedAtt
             }
         }
 
-        Add(new TestFixture.PagedAttentionKVCacheTestFixture([4], [4], 14, 2, 64, 256, 16, Runtime.TypeCode.Float32, 1, [PagedKVCacheDimKind.NumBlocks, PagedKVCacheDimKind.NumLayers, PagedKVCacheDimKind.KV, PagedKVCacheDimKind.NumKVHeads, PagedKVCacheDimKind.HeadDim, PagedKVCacheDimKind.BlockSize], [PagedKVCacheDimKind.HeadDim], [PagedKVCacheDimKind.NumBlocks], [SBP.S([0])], [AttentionDimKind.Head, AttentionDimKind.Dim, AttentionDimKind.Seq], [AttentionDimKind.Head, AttentionDimKind.Dim, AttentionDimKind.Seq]), [1], count++);
+        Add(new TestFixture.PagedAttentionKVCacheTestFixture([4], [4], 14, 2, 64, 256, 16, Runtime.TypeCode.Float32, 1, [PagedKVCacheDimKind.NumBlocks, PagedKVCacheDimKind.NumLayers, PagedKVCacheDimKind.KV, PagedKVCacheDimKind.NumKVHeads, PagedKVCacheDimKind.HeadDim, PagedKVCacheDimKind.BlockSize], [PagedKVCacheDimKind.HeadDim], [PagedKVCacheDimKind.NumBlocks], [SBP.SContiguous([0])], [AttentionDimKind.Head, AttentionDimKind.Dim, AttentionDimKind.Seq], [AttentionDimKind.Head, AttentionDimKind.Dim, AttentionDimKind.Seq]), [1], count++);
     }
 }
 
@@ -479,7 +479,7 @@ public sealed class UnitTestCPUKernels : TestClassBase
         };
 
         var placement = new Placement(hierarchy, targetOptions.HierarchyNames, targetOptions.HierarchyLevels);
-        var ndsbps = sbps.Select(sbp => sbp.Select(s => s[0] < 0 ? (SBP)SBP.B : SBP.S(s)).ToArray()).ToArray();
+        var ndsbps = sbps.Select(sbp => sbp.Select(s => s[0] < 0 ? (SBP)SBP.B : SBP.SContiguous(s)).ToArray()).ToArray();
         Expr boxed = input;
         foreach (var ndsbp in ndsbps)
         {
@@ -789,7 +789,7 @@ public sealed class UnitTestCPUKernels : TestClassBase
                 call.Metadata = new() { OutputNames = new[] { "call" } };
             }
 
-            var scheme = new Passes.Distributed.DistributedSchema("1", "llama", [new("call", sbps.Select(s => s[0] < 0 ? SBP.B : (SBP)SBP.S(s)).ToArray(), hierarchy, targetOptions.HierarchyNames, targetOptions.HierarchyLevels)]);
+            var scheme = new Passes.Distributed.DistributedSchema("1", "llama", [new("call", sbps.Select(s => s[0] < 0 ? SBP.B : (SBP)SBP.SContiguous(s)).ToArray(), hierarchy, targetOptions.HierarchyNames, targetOptions.HierarchyLevels)]);
             var options = new JsonSerializerOptions();
             options.Converters.Add(new SBPConverter());
             options.WriteIndented = true;
@@ -1275,7 +1275,7 @@ public sealed class UnitTestCPUKernels : TestClassBase
             Metadata = new() { Range = new(1, MathUtility.AlignUp(queryLens.Sum(), 128)) },
         };
 
-        var fixture = new PagedAttentionKVCacheTestFixture(queryLens, seqLens, 2, 2, 64, 64, (int)MathUtility.CeilDiv(seqLens.Select(seq_len => MathUtility.CeilDiv(seq_len, 64)).Sum(), hierarchy.Max()) * hierarchy.Max(), Runtime.TypeCode.Float32, 1, [PagedKVCacheDimKind.NumBlocks, PagedKVCacheDimKind.NumLayers, PagedKVCacheDimKind.KV, PagedKVCacheDimKind.NumKVHeads, PagedKVCacheDimKind.HeadDim, PagedKVCacheDimKind.BlockSize], [PagedKVCacheDimKind.HeadDim], [PagedKVCacheDimKind.NumBlocks], [SBP.S([0])], [AttentionDimKind.Seq, AttentionDimKind.Dim, AttentionDimKind.Head], [AttentionDimKind.Seq, AttentionDimKind.Dim, AttentionDimKind.Head]);
+        var fixture = new PagedAttentionKVCacheTestFixture(queryLens, seqLens, 2, 2, 64, 64, (int)MathUtility.CeilDiv(seqLens.Select(seq_len => MathUtility.CeilDiv(seq_len, 64)).Sum(), hierarchy.Max()) * hierarchy.Max(), Runtime.TypeCode.Float32, 1, [PagedKVCacheDimKind.NumBlocks, PagedKVCacheDimKind.NumLayers, PagedKVCacheDimKind.KV, PagedKVCacheDimKind.NumKVHeads, PagedKVCacheDimKind.HeadDim, PagedKVCacheDimKind.BlockSize], [PagedKVCacheDimKind.HeadDim], [PagedKVCacheDimKind.NumBlocks], [SBP.SContiguous([0])], [AttentionDimKind.Seq, AttentionDimKind.Dim, AttentionDimKind.Head], [AttentionDimKind.Seq, AttentionDimKind.Dim, AttentionDimKind.Head]);
 
         var placement = new Placement(hierarchy, targetOptions.HierarchyNames, targetOptions.HierarchyLevels);
         var dataGeneratorOptions = new PagedAttentionKVCacheTestFixture.DataGeneratorOptions(Random: true, IncreaseBy: [AttentionDimKind.Head], ResetForKV: true);
@@ -1600,7 +1600,7 @@ public sealed class UnitTestCPUKernels : TestClassBase
                 }
             }
 
-            var scheme = new Passes.Distributed.DistributedSchema("1", "llama", [new("reduceIn", splitedAxes.Select(s => s[0] < 0 ? SBP.B : (SBP)SBP.S(s)).ToArray(), hierarchy, targetOptions.HierarchyNames, targetOptions.HierarchyLevels)]);
+            var scheme = new Passes.Distributed.DistributedSchema("1", "llama", [new("reduceIn", splitedAxes.Select(s => s[0] < 0 ? SBP.B : (SBP)SBP.SContiguous(s)).ToArray(), hierarchy, targetOptions.HierarchyNames, targetOptions.HierarchyLevels)]);
             var options = new JsonSerializerOptions();
             options.Converters.Add(new SBPConverter());
             options.WriteIndented = true;
