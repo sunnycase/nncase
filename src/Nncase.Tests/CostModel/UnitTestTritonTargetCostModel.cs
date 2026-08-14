@@ -221,11 +221,15 @@ public sealed class UnitTestTritonTargetCostModel : TestClassBase
         var rtxBackendShared = rtx.GetPrivateResource(NTTTargetMachineCatalog.GpuBackendSharedMemory);
         Assert.Equal(TargetPrivateResourceUnit.Bytes, rtxBackendShared.Unit);
         Assert.Equal(101_376, rtxBackendShared.CapacityUnits);
+        Assert.Equal(32 * 1024, rtxBackendShared.BaselineUsageUnits);
+        Assert.Equal(101_376 - (32 * 1024), rtxBackendShared.AvailableCapacityUnits);
         Assert.Equal(
             [MemoryLocation.Shared, MemoryLocation.BlockLocalData],
             rtx.TilingMemorySpaces.Select(space => space.TIRBinding!.Value.Location).ToArray());
         var rtxShared = rtx.TilingMemorySpaces.Single(space => space.TIRBinding?.Location == MemoryLocation.Shared);
-        Assert.Equal(64 * 1024, rtxShared.MaxAllocationBytesPerScope);
+        Assert.Equal(101_376, rtxShared.MaxAllocationBytesPerScope);
+        Assert.Equal(TargetMemoryAllocationSizePolicy.GranularityAligned, rtxShared.AllocationSizePolicy);
+        Assert.Equal(101_376 - (32 * 1024), rtx.GetMaximumUsableAllocationBytes(rtxShared));
         Assert.Equal(101_376, rtx.GetMemoryResource(rtxShared).CapacityBytes);
         Assert.Equal(
             16L * 1024 * 1024 * 1024,
@@ -253,9 +257,15 @@ public sealed class UnitTestTritonTargetCostModel : TestClassBase
             rtxShared.Id).Asynchronous;
         Assert.Equal(new[] { 2 }, Assert.IsType<TargetAsynchronousTransferSpec>(rtxAsyncTransfer).SupportedStageCounts);
         Assert.Equal(NTTTargetMachineCatalog.H800Sxm80Gb, h800.Id);
+        Assert.Equal(132, h800.Execution.ComputeUnitCount);
         Assert.Equal(255L * 8 * 32, h800.GetPrivateResource(NTTTargetMachineCatalog.GpuRegisterFile).CapacityUnits);
+        var h800BackendShared = h800.GetPrivateResource(NTTTargetMachineCatalog.GpuBackendSharedMemory);
+        Assert.Equal(32 * 1024, h800BackendShared.BaselineUsageUnits);
         var h800Shared = h800.TilingMemorySpaces.Single(space => space.TIRBinding?.Location == MemoryLocation.Shared);
-        Assert.Equal(128 * 1024, h800Shared.MaxAllocationBytesPerScope);
+        Assert.Equal(227 * 1024, h800Shared.MaxAllocationBytesPerScope);
+        Assert.Equal(TargetMemoryAllocationSizePolicy.GranularityAligned, h800Shared.AllocationSizePolicy);
+        Assert.Equal(195 * 1024, h800.GetMaximumUsableAllocationBytes(h800Shared));
+        Assert.Equal(192 * 1024, h800.GetAllocationSizeBytes(h800Shared, 192 * 1024));
         Assert.Equal(227 * 1024, h800.GetMemoryResource(h800Shared).CapacityBytes);
         Assert.Equal(
             80L * 1024 * 1024 * 1024,
@@ -770,6 +780,7 @@ public sealed class UnitTestTritonTargetCostModel : TestClassBase
         Assert.Equal(PagedAttentionExecutionKind.SplitKV, plan.Kind);
         Assert.Equal(0, plan.SplitHierarchyAxis);
         Assert.Equal(4, plan.SplitCount);
+        Assert.InRange(plan.DirectContextThreshold, 1, 511);
     }
 
     [Fact]

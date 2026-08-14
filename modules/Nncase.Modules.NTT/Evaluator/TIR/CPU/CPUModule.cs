@@ -70,6 +70,7 @@ internal class NTTModule : IApplicationPart
         registrator.RegisterManyInterface<ConstantOfShapeEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<RangeEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<PagedAttentionEvaluator>(reuse: Reuse.Singleton);
+        registrator.RegisterManyInterface<PagedAttentionUseSplitKVEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<PagedAttentionPartialEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<PagedAttentionMergeEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<UpdatePagedAttentionKVCacheEvaluator>(reuse: Reuse.Singleton);

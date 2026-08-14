@@ -111,7 +111,7 @@ public sealed class UnitTestQKVRoPEWithCacheFusion : TestClassBase
         Assert.Equal(attentionLayout, fused.AttentionLayout);
         Assert.DoesNotContain(
             calls,
-            call => call.Target is NormApply or RoPE or Transpose or Pack or UpdatePagedAttentionKVCache);
+            call => call.Target is NormStats or NormApply or RoPE or Transpose or Pack or UpdatePagedAttentionKVCache);
         Assert.True(rewritten.InferenceType());
         Assert.Equal(originalType, rewritten.CheckedType);
 
@@ -144,7 +144,6 @@ public sealed class UnitTestQKVRoPEWithCacheFusion : TestClassBase
         var cos = Tensor.From(Enumerable.Repeat(1f, 8 * 16).ToArray(), [8, 1, 16]);
         var sin = Tensor.Zeros(DataTypes.Float32, [8, 1, 16]);
         var qStats = IR.F.NN.NormStats(2, q, useMean: false).Evaluate().AsTensor();
-        var kStats = IR.F.NN.NormStats(2, k, useMean: false).Evaluate().AsTensor();
 
         var packedQ = IR.F.Tensors.Pack(q, [8], [2]).Evaluate().AsTensor();
         var packedK = IR.F.Tensors.Pack(k, [8], [2]).Evaluate().AsTensor();
@@ -165,8 +164,6 @@ public sealed class UnitTestQKVRoPEWithCacheFusion : TestClassBase
                 Const.FromTensor(packedQ),
                 Const.FromTensor(packedK),
                 Const.FromTensor(packedV)),
-            qStats,
-            kStats,
             packedQScale,
             packedKScale,
             packedBias,

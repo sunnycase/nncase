@@ -18,25 +18,21 @@ public sealed partial class QKVRoPEWithCache : Op
     /// </summary>
     public static readonly ParameterInfo QKV = new(typeof(QKVRoPEWithCache), 0, "qkv", ParameterKind.Input);
 
-    public static readonly ParameterInfo QStats = new(typeof(QKVRoPEWithCache), 1, "q_stats", ParameterKind.Input);
+    public static readonly ParameterInfo QScale = new(typeof(QKVRoPEWithCache), 1, "q_scale", ParameterKind.Input);
 
-    public static readonly ParameterInfo KStats = new(typeof(QKVRoPEWithCache), 2, "k_stats", ParameterKind.Input);
+    public static readonly ParameterInfo KScale = new(typeof(QKVRoPEWithCache), 2, "k_scale", ParameterKind.Input);
 
-    public static readonly ParameterInfo QScale = new(typeof(QKVRoPEWithCache), 3, "q_scale", ParameterKind.Input);
+    public static readonly ParameterInfo QBias = new(typeof(QKVRoPEWithCache), 3, "q_bias", ParameterKind.Input);
 
-    public static readonly ParameterInfo KScale = new(typeof(QKVRoPEWithCache), 4, "k_scale", ParameterKind.Input);
+    public static readonly ParameterInfo KBias = new(typeof(QKVRoPEWithCache), 4, "k_bias", ParameterKind.Input);
 
-    public static readonly ParameterInfo QBias = new(typeof(QKVRoPEWithCache), 5, "q_bias", ParameterKind.Input);
+    public static readonly ParameterInfo Cos = new(typeof(QKVRoPEWithCache), 5, "cos", ParameterKind.Input);
 
-    public static readonly ParameterInfo KBias = new(typeof(QKVRoPEWithCache), 6, "k_bias", ParameterKind.Input);
+    public static readonly ParameterInfo Sin = new(typeof(QKVRoPEWithCache), 6, "sin", ParameterKind.Input);
 
-    public static readonly ParameterInfo Cos = new(typeof(QKVRoPEWithCache), 7, "cos", ParameterKind.Input);
+    public static readonly ParameterInfo KVCaches = new(typeof(QKVRoPEWithCache), 7, "kv_caches", ParameterKind.Attribute);
 
-    public static readonly ParameterInfo Sin = new(typeof(QKVRoPEWithCache), 8, "sin", ParameterKind.Input);
-
-    public static readonly ParameterInfo KVCaches = new(typeof(QKVRoPEWithCache), 9, "kv_caches", ParameterKind.Attribute);
-
-    public static readonly ParameterInfo LayerId = new(typeof(QKVRoPEWithCache), 10, "layer_id", IsDimensionType(), ParameterKind.Attribute);
+    public static readonly ParameterInfo LayerId = new(typeof(QKVRoPEWithCache), 8, "layer_id", IsDimensionType(), ParameterKind.Attribute);
 
     public int QAxis { get; }
 

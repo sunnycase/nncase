@@ -6,6 +6,12 @@ using Nncase.TIR.NTT;
 
 namespace Nncase.Evaluator.TIR.NTT;
 
+public sealed class PagedAttentionUseSplitKVEvaluator : ITypeInferencer<PagedAttentionUseSplitKV>
+{
+    public IRType Visit(ITypeInferenceContext context, PagedAttentionUseSplitKV target)
+        => TensorType.Scalar(DataTypes.Boolean);
+}
+
 public sealed class PagedAttentionPartialEvaluator : ITypeInferencer<PagedAttentionPartial>
 {
     public IRType Visit(ITypeInferenceContext context, PagedAttentionPartial target)

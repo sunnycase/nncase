@@ -19,7 +19,7 @@ internal sealed class QKVRoPEWithCacheCandidateProvider : DistributedCandidatePr
     {
         var results = new List<DistributedCandidateTuple>();
         tuples = results;
-        if (returnType is not TupleType { Count: 2 } || context.AvailableInputTypes.Count != 11)
+        if (returnType is not TupleType { Count: 2 } || context.AvailableInputTypes.Count != 9)
         {
             return false;
         }
@@ -33,7 +33,6 @@ internal sealed class QKVRoPEWithCacheCandidateProvider : DistributedCandidatePr
 
             var qNormArguments = GetNormArguments(
                 qkv[0],
-                context.AvailableInputTypes[QKVRoPEWithCache.QStats.Index],
                 context.AvailableInputTypes[QKVRoPEWithCache.QScale.Index],
                 context.AvailableInputTypes[QKVRoPEWithCache.QBias.Index],
                 target.QAxis,
@@ -41,7 +40,6 @@ internal sealed class QKVRoPEWithCacheCandidateProvider : DistributedCandidatePr
                 target.QUseMean);
             var kNormArguments = GetNormArguments(
                 qkv[1],
-                context.AvailableInputTypes[QKVRoPEWithCache.KStats.Index],
                 context.AvailableInputTypes[QKVRoPEWithCache.KScale.Index],
                 context.AvailableInputTypes[QKVRoPEWithCache.KBias.Index],
                 target.KAxis,
@@ -66,8 +64,6 @@ internal sealed class QKVRoPEWithCacheCandidateProvider : DistributedCandidatePr
                                 var inferred = QKVRoPEWithCacheEvaluator.InferType(
                                     target,
                                     qkv,
-                                    qNorm.Stats,
-                                    kNorm.Stats,
                                     qNorm.Scale,
                                     kNorm.Scale,
                                     qNorm.Bias,
@@ -83,8 +79,6 @@ internal sealed class QKVRoPEWithCacheCandidateProvider : DistributedCandidatePr
                                 results.Add(new DistributedCandidateTuple(
                                     [
                                         qkv,
-                                        qNorm.Stats,
-                                        kNorm.Stats,
                                         qNorm.Scale,
                                         kNorm.Scale,
                                         qNorm.Bias,
@@ -107,7 +101,6 @@ internal sealed class QKVRoPEWithCacheCandidateProvider : DistributedCandidatePr
 
     private static IReadOnlyList<NormArguments> GetNormArguments(
         IRType input,
-        IReadOnlyList<IRType> statsCandidates,
         IReadOnlyList<IRType> scaleCandidates,
         IReadOnlyList<IRType> biasCandidates,
         int axis,
@@ -115,17 +108,20 @@ internal sealed class QKVRoPEWithCacheCandidateProvider : DistributedCandidatePr
         bool useMean)
     {
         var target = new NormApply(axis, epsilon, useMean);
+        var stats = NormStatsEvaluator.InferType(new NormStats(axis, useMean), input);
         var results = new List<NormArguments>();
-        foreach (var stats in statsCandidates)
+        if (stats is InvalidType)
         {
-            foreach (var scale in scaleCandidates)
+            return results;
+        }
+
+        foreach (var scale in scaleCandidates)
+        {
+            foreach (var bias in biasCandidates)
             {
-                foreach (var bias in biasCandidates)
+                if (NormApplyEvaluator.InferType(target, input, stats, scale, bias) == input)
                 {
-                    if (NormApplyEvaluator.InferType(target, input, stats, scale, bias) == input)
-                    {
-                        results.Add(new NormArguments(stats, scale, bias));
-                    }
+                    results.Add(new NormArguments(scale, bias));
                 }
             }
         }
@@ -155,7 +151,7 @@ internal sealed class QKVRoPEWithCacheCandidateProvider : DistributedCandidatePr
         return results;
     }
 
-    private sealed record NormArguments(IRType Stats, IRType Scale, IRType Bias);
+    private sealed record NormArguments(IRType Scale, IRType Bias);
 
     private sealed record RoPEArguments(IRType Cos, IRType Sin);
 }

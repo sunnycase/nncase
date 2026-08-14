@@ -23,8 +23,6 @@ public sealed class QKVRoPEWithCacheEvaluator :
     public static IRType InferType(
         QKVRoPEWithCache target,
         IRType qkv,
-        IRType qStats,
-        IRType kStats,
         IRType qScale,
         IRType kScale,
         IRType qBias,
@@ -38,6 +36,14 @@ public sealed class QKVRoPEWithCacheEvaluator :
             return new InvalidType($"QKVRoPEWithCache QKV must be a tuple of three tensors, got {qkv}.");
         }
 
+        var qStats = NormStatsEvaluator.InferType(
+            new NormStats(target.QAxis, target.QUseMean),
+            tuple[0]);
+        if (qStats is InvalidType)
+        {
+            return qStats;
+        }
+
         var qNorm = NormApplyEvaluator.InferType(
             new NormApply(target.QAxis, target.QEpsilon, target.QUseMean),
             tuple[0],
@@ -47,6 +53,14 @@ public sealed class QKVRoPEWithCacheEvaluator :
         if (qNorm is InvalidType)
         {
             return qNorm;
+        }
+
+        var kStats = NormStatsEvaluator.InferType(
+            new NormStats(target.KAxis, target.KUseMean),
+            tuple[1]);
+        if (kStats is InvalidType)
+        {
+            return kStats;
         }
 
         var kNorm = NormApplyEvaluator.InferType(
@@ -189,8 +203,6 @@ public sealed class QKVRoPEWithCacheEvaluator :
             throw new InvalidOperationException($"QKVRoPEWithCache expects three QKV tensors, got {qkv.Length}.");
         }
 
-        var qStats = context.GetArgumentValueAsTensor(target, QKVRoPEWithCache.QStats);
-        var kStats = context.GetArgumentValueAsTensor(target, QKVRoPEWithCache.KStats);
         var qScale = context.GetArgumentValueAsTensor(target, QKVRoPEWithCache.QScale);
         var kScale = context.GetArgumentValueAsTensor(target, QKVRoPEWithCache.KScale);
         var qBias = context.GetArgumentValueAsTensor(target, QKVRoPEWithCache.QBias);
@@ -225,6 +237,7 @@ public sealed class QKVRoPEWithCacheEvaluator :
             "Q bias");
         var qCos = ToLogicalRoPEParameter(cos, qLanes, qAxes, qkv[0].Shape.Count, "cos");
         var qSin = ToLogicalRoPEParameter(sin, qLanes, qAxes, qkv[0].Shape.Count, "sin");
+        var qStats = NormStatsEvaluator.Evaluate(qInput, target.QAxis, target.QUseMean);
 
         var q = NormApplyEvaluator.Evaluate(
             qInput,
@@ -259,6 +272,7 @@ public sealed class QKVRoPEWithCacheEvaluator :
             "K bias");
         var kCos = ToLogicalRoPEParameter(cos, kLanes, kAxes, qkv[1].Shape.Count, "cos");
         var kSin = ToLogicalRoPEParameter(sin, kLanes, kAxes, qkv[1].Shape.Count, "sin");
+        var kStats = NormStatsEvaluator.Evaluate(kInput, target.KAxis, target.KUseMean);
 
         var k = NormApplyEvaluator.Evaluate(
             kInput,
@@ -308,8 +322,6 @@ public sealed class QKVRoPEWithCacheEvaluator :
     public IRType Visit(ITypeInferenceContext context, QKVRoPEWithCache target)
     {
         var qkv = context.CheckArgumentType<IRType>(target, QKVRoPEWithCache.QKV);
-        var qStats = context.CheckArgumentType<IRType>(target, QKVRoPEWithCache.QStats);
-        var kStats = context.CheckArgumentType<IRType>(target, QKVRoPEWithCache.KStats);
         var qScale = context.CheckArgumentType<IRType>(target, QKVRoPEWithCache.QScale);
         var kScale = context.CheckArgumentType<IRType>(target, QKVRoPEWithCache.KScale);
         var qBias = context.CheckArgumentType<IRType>(target, QKVRoPEWithCache.QBias);
@@ -318,7 +330,7 @@ public sealed class QKVRoPEWithCacheEvaluator :
         var sin = context.CheckArgumentType<IRType>(target, QKVRoPEWithCache.Sin);
         var kvCaches = context.CheckArgumentType<IRType>(target, QKVRoPEWithCache.KVCaches);
         _ = context.CheckArgumentType<DimensionType>(target, QKVRoPEWithCache.LayerId);
-        return InferType(target, qkv, qStats, kStats, qScale, kScale, qBias, kBias, cos, sin, kvCaches);
+        return InferType(target, qkv, qScale, kScale, qBias, kBias, cos, sin, kvCaches);
     }
 
     public Cost Visit(ICostEvaluateContext context, QKVRoPEWithCache target)
@@ -332,8 +344,6 @@ public sealed class QKVRoPEWithCacheEvaluator :
         var q = qkv[0];
         var k = qkv[1];
         var v = qkv[2];
-        var qStats = context.GetArgumentType<IRType>(target, QKVRoPEWithCache.QStats);
-        var kStats = context.GetArgumentType<IRType>(target, QKVRoPEWithCache.KStats);
         var qScale = context.GetArgumentType<IRType>(target, QKVRoPEWithCache.QScale);
         var kScale = context.GetArgumentType<IRType>(target, QKVRoPEWithCache.KScale);
         var qBias = context.GetArgumentType<IRType>(target, QKVRoPEWithCache.QBias);
@@ -343,8 +353,7 @@ public sealed class QKVRoPEWithCacheEvaluator :
         return new()
         {
             [CostFactorNames.BlockLocalMemoryLoadBytes] =
-                CostUtility.GetMemoryAccess(q) + CostUtility.GetMemoryAccess(k) + CostUtility.GetMemoryAccess(v) +
-                CostUtility.GetMemoryAccess(qStats) + CostUtility.GetMemoryAccess(kStats) +
+                (2 * CostUtility.GetMemoryAccess(q)) + (2 * CostUtility.GetMemoryAccess(k)) + CostUtility.GetMemoryAccess(v) +
                 CostUtility.GetMemoryAccess(qScale) + CostUtility.GetMemoryAccess(kScale) +
                 CostUtility.GetMemoryAccess(qBias) + CostUtility.GetMemoryAccess(kBias) +
                 (2 * (CostUtility.GetMemoryAccess(cos) + CostUtility.GetMemoryAccess(sin))),

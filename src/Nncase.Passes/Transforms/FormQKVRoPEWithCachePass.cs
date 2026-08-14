@@ -171,7 +171,9 @@ public sealed class FormQKVRoPEWithCachePass : FunctionPass
             return false;
         }
 
-        if (!SameValue(qCos, kCos) ||
+        if (!HasMatchingNormStats(qNormCall, qNorm) ||
+            !HasMatchingNormStats(kNormCall, kNorm) ||
+            !SameValue(qCos, kCos) ||
             !SameValue(qSin, kSin) ||
             !SameValue(pagedAttentionCall[PagedAttention.LayerId], keyUpdateCall[UpdatePagedAttentionKVCache.LayerId]) ||
             !SameValue(pagedAttentionCall[PagedAttention.LayerId], valueUpdateCandidate[UpdatePagedAttentionKVCache.LayerId]) ||
@@ -193,8 +195,6 @@ public sealed class FormQKVRoPEWithCachePass : FunctionPass
             valueLayoutView.Source);
         fusedCall = IR.F.NN.QKVRoPEWithCache(
                 qkv,
-                (Expr)qNormCall[NormApply.Stats],
-                (Expr)kNormCall[NormApply.Stats],
                 (Expr)qNormCall[NormApply.Scale],
                 (Expr)kNormCall[NormApply.Scale],
                 (Expr)qNormCall[NormApply.Bias],
@@ -215,6 +215,27 @@ public sealed class FormQKVRoPEWithCachePass : FunctionPass
         queryView = queryLayoutView.Root;
         valueUpdateCall = valueUpdateCandidate;
         return true;
+    }
+
+    private static bool HasMatchingNormStats(Call normApplyCall, NormApply normApply)
+    {
+        if (normApplyCall[NormApply.Stats] is not Call { Target: NormStats normStats } normStatsCall ||
+            !SameValue(normApplyCall[NormApply.Input], normStatsCall[NormStats.Input]) ||
+            normApply.UseMean != normStats.UseMean)
+        {
+            return false;
+        }
+
+        var input = (Expr)normApplyCall[NormApply.Input];
+        if (input.CheckedShape.IsUnranked)
+        {
+            return false;
+        }
+
+        var rank = input.CheckedShape.Rank;
+        var applyAxis = normApply.Axis < 0 ? normApply.Axis + rank : normApply.Axis;
+        var statsAxis = normStats.Axis < 0 ? normStats.Axis + rank : normStats.Axis;
+        return applyAxis >= 0 && applyAxis < rank && applyAxis == statsAxis;
     }
 
     private static bool TryGetCacheUpdate(

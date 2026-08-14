@@ -16,16 +16,50 @@ namespace Nncase.Evaluator.NN;
 /// </summary>
 public sealed class NormStatsEvaluator : IEvaluator<NormStats>, ITypeInferencer<NormStats>, ICostEvaluator<NormStats>
 {
+    public static IRType InferType(NormStats target, IRType input)
+    {
+        return input switch
+        {
+            TensorType tensor => Visit(target, tensor),
+            DistributedType distributed => Visit(target, distributed),
+            _ => new InvalidType($"{nameof(NormStats)} input must be tensor-like, but got {input}."),
+        };
+    }
+
     public IValue Visit(IEvaluateContext context, NormStats target)
     {
-        var inputRaw = UnpackVectorInput(context.GetArgumentValueAsTensor(target, NormStats.Input));
+        var input = context.GetArgumentValueAsTensor(target, NormStats.Input);
+        return Value.FromTensor(Evaluate(input, target.Axis, target.UseMean));
+    }
+
+    public IRType Visit(ITypeInferenceContext context, NormStats target)
+    {
+        var input = context.CheckArgumentType<IRType>(target, NormStats.Input);
+        return InferType(target, input);
+    }
+
+    public Cost Visit(ICostEvaluateContext context, NormStats target)
+    {
+        var input = context.GetArgumentType<IRType>(target, NormStats.Input);
+        var output = context.GetReturnType<IRType>();
+        return new()
+        {
+            [CostFactorNames.BlockLocalMemoryLoadBytes] = CostUtility.GetMemoryAccess(input),
+            [CostFactorNames.BlockLocalMemoryStoreBytes] = CostUtility.GetMemoryAccess(output),
+            [CostFactorNames.CPUCycles] = CostUtility.GetCPUCycles(input, target.UseMean ? 3 : 2),
+        };
+    }
+
+    internal static Tensor Evaluate(Tensor inputRaw, int axis, bool useMean)
+    {
+        inputRaw = UnpackVectorInput(inputRaw);
         var input = inputRaw.CastElementTo(DataTypes.Float32).Cast<float>();
         var shape = input.Shape.ToValueArray();
         var rank = shape.Length;
-        var normalizedAxis = NormUtility.NormalizeAxis(target.Axis, rank);
+        var normalizedAxis = NormUtility.NormalizeAxis(axis, rank);
         var outerSize = TensorUtilities.GetProduct(shape.AsSpan(0, normalizedAxis));
         var innerSize = TensorUtilities.GetProduct(shape.AsSpan(normalizedAxis));
-        var components = target.UseMean ? 2 : 1;
+        var components = useMean ? 2 : 1;
 
         var statsShape = new long[rank + 1];
         statsShape[0] = components;
@@ -48,7 +82,7 @@ public sealed class NormStatsEvaluator : IEvaluator<NormStats>, ITypeInferencer<
                 sumSq += value * value;
             }
 
-            if (target.UseMean)
+            if (useMean)
             {
                 stats[outer] = sum;
                 stats[checked((int)(outerSize + outer))] = sumSq;
@@ -59,30 +93,7 @@ public sealed class NormStatsEvaluator : IEvaluator<NormStats>, ITypeInferencer<
             }
         }
 
-        return Value.FromTensor(Tensor.From(stats, statsShape));
-    }
-
-    public IRType Visit(ITypeInferenceContext context, NormStats target)
-    {
-        var input = context.CheckArgumentType<IRType>(target, NormStats.Input);
-        return input switch
-        {
-            TensorType tensor => Visit(target, tensor),
-            DistributedType distributed => Visit(target, distributed),
-            _ => new InvalidType($"{nameof(NormStats)} input must be tensor-like, but got {input}."),
-        };
-    }
-
-    public Cost Visit(ICostEvaluateContext context, NormStats target)
-    {
-        var input = context.GetArgumentType<IRType>(target, NormStats.Input);
-        var output = context.GetReturnType<IRType>();
-        return new()
-        {
-            [CostFactorNames.BlockLocalMemoryLoadBytes] = CostUtility.GetMemoryAccess(input),
-            [CostFactorNames.BlockLocalMemoryStoreBytes] = CostUtility.GetMemoryAccess(output),
-            [CostFactorNames.CPUCycles] = CostUtility.GetCPUCycles(input, target.UseMean ? 3 : 2),
-        };
+        return Tensor.From(stats, statsShape);
     }
 
     private static IRType Visit(NormStats target, TensorType input)

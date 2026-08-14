@@ -32,12 +32,14 @@ public interface IPagedAttentionExecutionPlanProvider
 public sealed record PagedAttentionExecutionPlan(
     PagedAttentionExecutionKind Kind,
     int SplitHierarchyAxis,
-    int SplitCount)
+    int SplitCount,
+    long DirectContextThreshold)
 {
     public static PagedAttentionExecutionPlan Direct { get; } = new(
         PagedAttentionExecutionKind.Direct,
         -1,
-        1);
+        1,
+        0);
 
     /// <summary>
     /// Validates this decision against the query that it was created for.
@@ -47,10 +49,10 @@ public sealed record PagedAttentionExecutionPlan(
         ArgumentNullException.ThrowIfNull(query);
         if (Kind == PagedAttentionExecutionKind.Direct)
         {
-            if (SplitHierarchyAxis != -1 || SplitCount != 1)
+            if (SplitHierarchyAxis != -1 || SplitCount != 1 || DirectContextThreshold != 0)
             {
                 throw new InvalidOperationException(
-                    "A direct PagedAttention plan must use split axis -1 and split count 1.");
+                    "A direct PagedAttention plan must use split axis -1, split count 1, and direct-context threshold 0.");
             }
 
             return;
@@ -86,6 +88,13 @@ public sealed record PagedAttentionExecutionPlan(
         {
             throw new InvalidOperationException(
                 $"Split-KV PagedAttention hierarchy axis {SplitHierarchyAxis} is already used by the query SBP policy.");
+        }
+
+        if (DirectContextThreshold < 0 || DirectContextThreshold >= query.ContextLength)
+        {
+            throw new InvalidOperationException(
+                $"Split-KV PagedAttention direct-context threshold {DirectContextThreshold} " +
+                $"must be in [0, {query.ContextLength}).");
         }
     }
 }

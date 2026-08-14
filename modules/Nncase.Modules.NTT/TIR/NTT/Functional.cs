@@ -272,8 +272,6 @@ public partial class NTT
         Expr q,
         Expr k,
         Expr v,
-        Expr qStats,
-        Expr kStats,
         Expr qScale,
         Expr kScale,
         Expr qBias,
@@ -305,8 +303,6 @@ public partial class NTT
             q,
             k,
             v,
-            qStats,
-            kStats,
             qScale,
             kScale,
             qBias,
@@ -348,6 +344,9 @@ public partial class NTT
         return KernelCall(new PagedAttention(layout, hiddenSize), q, kvcache, extra, scale, layerId, ret);
     }
 
+    public static Call PagedAttentionUseSplitKV(Expr kvcache, long directContextThreshold)
+        => new(new PagedAttentionUseSplitKV(directContextThreshold), kvcache);
+
     public static Expr PagedAttentionPartial(
         Expr q,
         Expr kvcache,
@@ -357,13 +356,20 @@ public partial class NTT
         Expr maxState,
         Expr sumState,
         Expr accState,
+        Expr output,
         IRArray<IR.NN.AttentionDimKind> layout,
         int hiddenSize,
         int splitHierarchyAxis,
-        int splitCount)
+        int splitCount,
+        long directContextThreshold)
     {
         return KernelCall(
-            new PagedAttentionPartial(layout, hiddenSize, splitHierarchyAxis, splitCount),
+            new PagedAttentionPartial(
+                layout,
+                hiddenSize,
+                splitHierarchyAxis,
+                splitCount,
+                directContextThreshold),
             q,
             kvcache,
             extra,
@@ -371,7 +377,8 @@ public partial class NTT
             layerId,
             maxState,
             sumState,
-            accState);
+            accState,
+            output);
     }
 
     public static Expr PagedAttentionMerge(

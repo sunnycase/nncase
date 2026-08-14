@@ -32,6 +32,7 @@ PYNTT_CODEGEN_MANIFEST_VERSION = 9
 THROUGHPUT_BLOCK_SIZE_CANDIDATES = (128, 256, 512, 1024)
 WARP_SPECIALIZATION_PRODUCER_WARPS = 1
 WARP_SPECIALIZATION_WORKER_ALLOCATION_WARPS = 4
+WARP_SPECIALIZATION_MINIMUM_PARTITION_REGISTERS = 24
 PAGED_ATTENTION_BLOCK_N_CANDIDATES = (32, 64)
 PAGED_ATTENTION_NUM_STAGES_CANDIDATES = (2, 3)
 PAGED_ATTENTION_BLOCK_N = 64
@@ -51,6 +52,8 @@ TMA_DTYPE_ITEM_SIZES = {
     "int64": 8,
     "float64": 8,
 }
+
+PACKED_GEMV_MAXIMUM_INLINE_REDUCTION_GROUPS = 8
 
 DEVICE_CALL_RE = re.compile(
     r"(?m)^(?P<indent>[ \t]*)__pyntt_device_call__(?P<name>[A-Za-z_]\w*)\((?P<args>.*)\)$"
@@ -594,19 +597,37 @@ def _kernel_backend_config(kernel: dict[str, Any]) -> dict[str, Any]:
     uniform_register_limit = register_file_capacity_units // (
         physical_warps * worker_width
     )
-    worker_registers = (
+    uniform_register_limit = (
         uniform_register_limit // register_granularity
     ) * register_granularity
-    if worker_registers <= 0:
+    producer_registers = (
+        (
+            WARP_SPECIALIZATION_MINIMUM_PARTITION_REGISTERS
+            + register_granularity
+            - 1
+        )
+        // register_granularity
+    ) * register_granularity
+    if uniform_register_limit < producer_registers:
         raise ValueError(
             f"PyNTT kernel {metadata['name']} has insufficient register capacity "
             "for its fixed producer/consumer execution geometry."
         )
+    reclaimed_registers = (
+        uniform_register_limit - producer_registers
+    ) * WARP_SPECIALIZATION_WORKER_ALLOCATION_WARPS
+    consumer_registers = uniform_register_limit + (
+        reclaimed_registers // num_warps // register_granularity
+    ) * register_granularity
     registers_per_thread_limit = _require_int(
         attrs.get("registers_per_thread_limit"),
         f"PyNTT kernel {metadata['name']} attrs.registers_per_thread_limit",
         minimum=1,
     )
+    if consumer_registers > registers_per_thread_limit:
+        consumer_registers = (
+            registers_per_thread_limit // register_granularity
+        ) * register_granularity
     block_size_candidates = tuple(
         sorted(
             {
@@ -628,7 +649,8 @@ def _kernel_backend_config(kernel: dict[str, Any]) -> dict[str, Any]:
         "num_stages": 1,
         "paged_attention": _paged_attention_backend_config(kernel),
         "producer_warps": WARP_SPECIALIZATION_PRODUCER_WARPS,
-        "worker_registers": worker_registers,
+        "producer_registers": producer_registers,
+        "consumer_registers": consumer_registers,
         "register_granularity": register_granularity,
         "registers_per_thread_limit": registers_per_thread_limit,
     }
@@ -1324,7 +1346,7 @@ def _render_kernel(
         num_warps=num_warps,
         target_worker_width=target_worker_width,
         producer_warps=backend_config["producer_warps"],
-        worker_registers=backend_config["worker_registers"],
+        producer_registers=backend_config["producer_registers"],
         register_granularity=backend_config["register_granularity"],
         registers_per_thread_limit=backend_config["registers_per_thread_limit"],
         kernel_config=backend_config,
@@ -1339,11 +1361,12 @@ def _render_kernel(
             num_warps,
             target_worker_width,
             backend_config["producer_warps"],
-            backend_config["worker_registers"],
+            backend_config["producer_registers"],
             backend_config["register_granularity"],
             backend_config["registers_per_thread_limit"],
             backend_config,
             mesh_axes,
+            rematerialize_entry_indices=True,
         )
         for device_function in device_functions
     ]
@@ -1390,20 +1413,23 @@ def _render_device_function(
     num_warps: int,
     target_worker_width: int,
     producer_warps: int,
-    worker_registers: int,
+    producer_registers: int,
     register_granularity: int,
     registers_per_thread_limit: int,
     kernel_config: dict[str, Any],
     mesh_axes: tuple[dict[str, Any], ...],
+    *,
+    rematerialize_entry_indices: bool,
 ) -> str:
     helper_sources = _render_helper_sources(
         env,
         device_function.get("helpers", ()),
         noinline=bool(device_function["preserve_helper_call_boundaries"]),
+        rematerialize_entry_indices=rematerialize_entry_indices,
         num_warps=num_warps,
         target_worker_width=target_worker_width,
         producer_warps=producer_warps,
-        worker_registers=worker_registers,
+        producer_registers=producer_registers,
         register_granularity=register_granularity,
         registers_per_thread_limit=registers_per_thread_limit,
         kernel_config=kernel_config,
@@ -1528,7 +1554,7 @@ def _render_helper_sources(
     num_warps: int | None = None,
     target_worker_width: int | None = None,
     producer_warps: int | None = None,
-    worker_registers: int | None = None,
+    producer_registers: int | None = None,
     register_granularity: int | None = None,
     registers_per_thread_limit: int | None = None,
     kernel_config: dict[str, Any] | None = None,
@@ -1543,7 +1569,7 @@ def _render_helper_sources(
             num_warps=num_warps,
             target_worker_width=target_worker_width,
             producer_warps=producer_warps,
-            worker_registers=worker_registers,
+            producer_registers=producer_registers,
             register_granularity=register_granularity,
             registers_per_thread_limit=registers_per_thread_limit,
             kernel_config=kernel_config,
@@ -1568,7 +1594,7 @@ def _prepare_helper_model(
     num_warps: int | None,
     target_worker_width: int | None,
     producer_warps: int | None,
-    worker_registers: int | None,
+    producer_registers: int | None,
     register_granularity: int | None,
     registers_per_thread_limit: int | None,
     kernel_config: dict[str, Any] | None,
@@ -1585,8 +1611,8 @@ def _prepare_helper_model(
         model["TargetWorkerWidth"] = target_worker_width
     if producer_warps is not None:
         model["ProducerWarps"] = producer_warps
-    if worker_registers is not None:
-        model["WorkerRegisters"] = worker_registers
+    if producer_registers is not None:
+        model["ProducerRegisters"] = producer_registers
     if register_granularity is not None:
         model["RegisterGranularity"] = register_granularity
     if registers_per_thread_limit is not None:
@@ -1604,7 +1630,7 @@ def _prepare_helper_model(
                 num_warps=num_warps,
                 target_worker_width=target_worker_width,
                 producer_warps=producer_warps,
-                worker_registers=worker_registers,
+                producer_registers=producer_registers,
                 register_granularity=register_granularity,
                 registers_per_thread_limit=registers_per_thread_limit,
                 kernel_config=kernel_config,
@@ -3268,11 +3294,24 @@ def _tensor_copy_template_context(
             f"local={len(local_shape)}, global={len(global_shape)}"
         )
     lane_shape = model.get("VectorLaneShape", ())
+    major_axis = _select_block_axis(local_shape, local_strides)
+    if all(_is_fixed_one(dim) for dim in local_shape) and _fixed(
+        local_strides[major_axis]
+    ) == 0:
+        major_axis = next(
+            (
+                axis
+                for axis in range(len(local_shape) - 1, -1, -1)
+                if _fixed(local_strides[axis]) != 0
+            ),
+            major_axis,
+        )
     ctx = _coordinate_iteration_context(
         local_shape,
         local_strides,
         lane_shape,
         "PyNTT TensorLoad" if is_load else "PyNTT TensorStore",
+        major_axis=major_axis,
     )
     local_access = _tensor_access(
         ctx["tensor_coordinates"],
@@ -3385,6 +3424,8 @@ def _coordinate_iteration_context(
     tensor_strides: list[Any],
     lane_shape: list[int],
     context: str = "PyNTT elementwise",
+    variable_prefix: str = "",
+    major_axis: int | None = None,
 ) -> dict[str, Any]:
     """Build a coordinate-native block tile without scalar unflattening."""
 
@@ -3395,15 +3436,24 @@ def _coordinate_iteration_context(
         )
     lanes = _validate_coordinate_lane_shape(lane_shape, context)
     lane_count = _product_int(list(lanes)) if lanes else 1
+    major_variable = f"{variable_prefix}major_raw"
+    index_variables = tuple(
+        f"{variable_prefix}index{axis}" for axis in range(len(tensor_shape))
+    )
 
     if tensor_shape:
-        major_axis = _select_block_axis(tensor_shape, tensor_strides)
+        if major_axis is None:
+            major_axis = _select_block_axis(tensor_shape, tensor_strides)
+        elif major_axis < 0 or major_axis >= len(tensor_shape):
+            raise ValueError(
+                f"{context} major axis {major_axis} is outside rank {len(tensor_shape)}"
+            )
         major_extent = tensor_shape[major_axis]
         loop_axes = tuple(
             axis for axis in range(len(tensor_shape)) if axis != major_axis
         )
         tensor_coordinates = tuple(
-            "major_raw" if axis == major_axis else f"index{axis}"
+            major_variable if axis == major_axis else index_variables[axis]
             for axis in range(len(tensor_shape))
         )
     else:
@@ -3412,7 +3462,9 @@ def _coordinate_iteration_context(
         loop_axes = ()
         tensor_coordinates = ()
 
-    lane_coordinates = tuple(f"lane_raw{axis}" for axis in range(len(lanes)))
+    lane_coordinates = tuple(
+        f"{variable_prefix}lane_raw{axis}" for axis in range(len(lanes))
+    )
     physical_tile_extent = (
         "block_size" if lane_count == 1 else f"(block_size // {lane_count})"
     )
@@ -3431,9 +3483,11 @@ def _coordinate_iteration_context(
         "lane_reshapes": tuple(lane_reshapes),
         "lane_shape": lanes,
         "loop_axes": loop_axes,
+        "index_variables": index_variables,
         "major_axis": major_axis,
         "major_extent": major_extent,
         "major_reshape": major_reshape,
+        "major_variable": major_variable,
         "tensor_coordinates": tensor_coordinates,
         "tensor_shape": tuple(tensor_shape),
         "tile_shape": tile_shape,
@@ -4915,6 +4969,23 @@ def _matmul_rhs_access(
     batch_coordinates = _aligned_batch_coordinates(
         model["RhsShape"], 2, output_batch_rank
     )
+    k_pack = int(model["RhsKPackLaneCount"])
+    k_lane = int(model["RhsKVectorLaneCount"])
+    has_packed_k = k_pack != 1 or k_lane != 1
+    if not has_packed_k:
+        matrix_coordinates = (
+            (n_axis["physical_coordinate"], k_expr)
+            if model["TransposeB"]
+            else (k_expr, n_axis["physical_coordinate"])
+        )
+        return _tensor_access(
+            batch_coordinates + matrix_coordinates,
+            model["RhsStrides"],
+            n_axis["lane_coordinates"],
+            lane_shape,
+            coordinate_shape=coordinate_shape,
+        )
+
     layout = _matmul_rhs_layout(model)
     if layout == "n_major":
         if not model["TransposeB"]:
@@ -4925,8 +4996,6 @@ def _matmul_rhs_access(
     else:
         if model["TransposeB"]:
             raise ValueError("PyNTT K-major packed RHS cannot be logically transposed.")
-        k_pack = int(model["RhsKPackLaneCount"])
-        k_lane = int(model["RhsKVectorLaneCount"])
         if k_pack <= 0 or k_lane <= 0:
             raise ValueError(
                 "PyNTT K-major packed RHS requires positive K pack/vector lanes."
@@ -5064,15 +5133,28 @@ def _matmul_template_context(
     n = logical_output_shape[-1]
     lhs_m = model["LhsShape"][-1] if model["TransposeA"] else model["LhsShape"][-2]
     lhs_k = model["LhsShape"][-2] if model["TransposeA"] else model["LhsShape"][-1]
-    if rhs_layout == "n_major":
-        rhs_k = model["RhsShape"][-1]
-        rhs_n = _multiply_dim(model["RhsShape"][-2], rhs_lane_count)
-    else:
-        rhs_k_lane_count = int(model["RhsKPackLaneCount"]) * int(
-            model["RhsKVectorLaneCount"]
-        )
+    rhs_k_lane_count = int(model["RhsKPackLaneCount"]) * int(
+        model["RhsKVectorLaneCount"]
+    )
+    if rhs_k_lane_count > 1:
+        if rhs_layout != "k_major" or model["TransposeB"]:
+            raise ValueError(
+                "PyNTT K-packed Matmul RHS requires a non-transposed K-major layout."
+            )
         rhs_k = _multiply_dim(model["RhsShape"][-2], rhs_k_lane_count)
         rhs_n = _multiply_dim(model["RhsShape"][-1], rhs_lane_count)
+    else:
+        rhs_k = (
+            model["RhsShape"][-1]
+            if model["TransposeB"]
+            else model["RhsShape"][-2]
+        )
+        rhs_n = _multiply_dim(
+            model["RhsShape"][-2]
+            if model["TransposeB"]
+            else model["RhsShape"][-1],
+            rhs_lane_count,
+        )
     context.update(
         m=m,
         n=n,
@@ -5327,6 +5409,52 @@ def _packed_gemv_consumer_layout(
     }
 
 
+def _validate_packed_gemv_pipeline_resource_contract(
+    *,
+    algorithm: str,
+    block_n: int,
+    block_k: int,
+    num_stages: int,
+    rhs_tiles_per_group: int = 1,
+) -> None:
+    """Validate the compiler-selected packed GEMV staging contract."""
+
+    minimum_physical_stages = 2 * rhs_tiles_per_group
+    if (
+        not _is_positive_power_of_two(block_n)
+        or not _is_positive_power_of_two(block_k)
+        or not 8 <= block_n <= 64
+        or block_n % 8 != 0
+        or not 128 <= block_k <= 1024
+        or num_stages < minimum_physical_stages
+        or num_stages % rhs_tiles_per_group != 0
+    ):
+        raise ValueError(
+            f"PyNTT {algorithm} resource contract requires a power-of-two "
+            "block_n in [8, 64], a power-of-two block_k in [128, 1024], "
+            "and at least two complete buffered RHS groups; got "
+            f"block_n={block_n}, block_k={block_k}, "
+            f"num_stages={num_stages}, rhs_tiles_per_group={rhs_tiles_per_group}."
+        )
+
+
+def _should_outline_packed_gemv_consumer_stage(
+    *, block_k: int, reduction_group: int
+) -> bool:
+    """Keep small stages inline and share large static reduction bodies."""
+
+    if block_k <= 0 or reduction_group <= 0 or block_k % reduction_group != 0:
+        raise ValueError(
+            "PyNTT packed GEMV consumer outlining requires a positive block_k "
+            "divisible by its positive reduction_group; got "
+            f"block_k={block_k}, reduction_group={reduction_group}."
+        )
+    return (
+        block_k // reduction_group
+        > PACKED_GEMV_MAXIMUM_INLINE_REDUCTION_GROUPS
+    )
+
+
 def _packed_gemv_pipeline_template_context(
     model: dict[str, Any],
 ) -> dict[str, Any]:
@@ -5386,16 +5514,12 @@ def _packed_gemv_pipeline_template_context(
     block_n = context["block_n"]
     block_k = context["block_k"]
     num_stages = context["microkernel"]["parameters"]["num_stages"]
-    if (
-        block_k != 128
-        or not 8 <= block_n <= 64
-        or not 2 <= num_stages <= 4
-    ):
-        raise ValueError(
-            "PyNTT packed GEMV pipeline resource contract must be "
-            "block_n in [8, 64], block_k=128, num_stages in [2, 4]; got "
-            f"{block_n}, {block_k}, {num_stages}."
-        )
+    _validate_packed_gemv_pipeline_resource_contract(
+        algorithm="packed GEMV pipeline",
+        block_n=block_n,
+        block_k=block_k,
+        num_stages=num_stages,
+    )
     n_lane = int(model["RhsNVectorLaneCount"])
     k_pack = int(model["RhsKPackLaneCount"])
     k_lane = int(model["RhsKVectorLaneCount"])
@@ -5609,16 +5733,12 @@ def _packed_qkv_gemv_pipeline_template_context(
     block_n = microkernel["parameters"]["block_n"]
     block_k = microkernel["parameters"]["block_k"]
     num_stages = microkernel["parameters"]["num_stages"]
-    if (
-        block_k != 128
-        or not 8 <= block_n <= 64
-        or not 2 <= num_stages <= 4
-    ):
-        raise ValueError(
-            "PyNTT packed QKV GEMV pipeline resource contract must be "
-            "block_n in [8, 64], block_k=128, num_stages in [2, 4]; got "
-            f"{block_n}, {block_k}, {num_stages}."
-        )
+    _validate_packed_gemv_pipeline_resource_contract(
+        algorithm="packed QKV GEMV pipeline",
+        block_n=block_n,
+        block_k=block_k,
+        num_stages=num_stages,
+    )
 
     n_lane = int(model["NVectorLaneCount"])
     k_pack = int(model["KPackLaneCount"])
@@ -5966,19 +6086,13 @@ def _packed_matmul_glu_gemv_pipeline_template_context(
     block_k = microkernel["parameters"]["block_k"]
     num_stages = microkernel["parameters"]["num_stages"]
     projection_count = 2
-    if (
-        not 8 <= block_n <= 64
-        or block_k != 128
-        or not 2 <= num_stages <= 4
-        or num_stages % projection_count != 0
-        or num_stages // projection_count < 2
-    ):
-        raise ValueError(
-            "PyNTT packed MatMulGlu GEMV pipeline resource contract requires "
-            "block_n in [8, 64], block_k=128, and at least two complete gate/up "
-            "transfer groups in 2-4 physical stages; got "
-            f"{block_n}, {block_k}, {num_stages}."
-        )
+    _validate_packed_gemv_pipeline_resource_contract(
+        algorithm="packed MatMulGlu GEMV pipeline",
+        block_n=block_n,
+        block_k=block_k,
+        num_stages=num_stages,
+        rhs_tiles_per_group=projection_count,
+    )
 
     n_lane = int(model["NVectorLaneCount"])
     k_pack = int(model["KPackLaneCount"])
@@ -5993,8 +6107,8 @@ def _packed_matmul_glu_gemv_pipeline_template_context(
     k = _fixed(context["k"])
     if k is None or k <= 0 or k % block_k != 0:
         raise ValueError(
-            "PyNTT packed MatMulGlu GEMV pipeline requires a fixed K "
-            "divisible by block_k."
+            "PyNTT packed MatMulGlu GEMV pipeline requires a fixed positive K "
+            f"divisible by block_k={block_k}, got K={k}."
         )
     packed_k_outer = block_k // k_atom
     packed_n_outer = block_n // n_lane
@@ -6151,6 +6265,10 @@ def _packed_matmul_glu_gemv_pipeline_template_context(
         packed_n_outer=packed_n_outer,
         reduction_group=reduction_group,
         reduction_groups_per_stage=block_k // reduction_group,
+        outline_consumer_stage=_should_outline_packed_gemv_consumer_stage(
+            block_k=block_k,
+            reduction_group=reduction_group,
+        ),
         shared_stage_shape=tma_block_shape,
         tma_block_shape=tma_block_shape,
         tma_contiguous_extent=tma_contiguous_extent,
@@ -6751,30 +6869,64 @@ def _rope_template_context(model: dict[str, Any]) -> dict[str, Any]:
 
 
 def _norm_rope_template_context(
-    norm: dict[str, Any], rope: dict[str, Any], context_name: str
+    norm: dict[str, Any], rope: dict[str, Any], context_name: str, scope: str
 ) -> dict[str, Any]:
-    """Compose NormApply addressing into RoPE's coordinate domain."""
+    """Compose an inline normalization reduction into RoPE's coordinate domain."""
 
     context = _rope_template_context(rope)
-    rank = len(norm["OutputShape"])
+    rank = len(norm["InputShape"])
     axis = int(norm["Axis"])
     if axis < 0 or axis >= rank:
         raise ValueError(f"{context_name} normalization axis {axis} is outside rank {rank}")
     if (
         norm["InputShape"] != rope["InputShape"]
-        or norm["OutputShape"] != rope["OutputShape"]
+        or norm["InputShape"] != rope["OutputShape"]
         or norm["InputStrides"] != rope["InputStrides"]
-        or norm["OutputStrides"] != rope["OutputStrides"]
+        or norm["InputStrides"] != rope["OutputStrides"]
         or norm["InputVectorLaneShape"] != rope["InputVectorLaneShape"]
-        or norm["OutputVectorLaneShape"] != rope["OutputVectorLaneShape"]
+        or norm["InputVectorLaneShape"] != rope["OutputVectorLaneShape"]
     ):
         raise ValueError(
-            f"{context_name} NormApply and RoPE must describe the same input/output layout"
+            f"{context_name} inline norm and RoPE must describe the same input/output layout"
+        )
+    if context["major_axis"] < axis:
+        raise ValueError(
+            f"{context_name} RoPE block axis {context['major_axis']} must be inside "
+            f"the normalized suffix starting at axis {axis}."
         )
 
     current = context["input_access"]
     paired = context["paired_input_access"]
     lane_shape = tuple(int(value) for value in norm["InputVectorLaneShape"])
+    reduction_context = _coordinate_iteration_context(
+        norm["InputShape"][axis:],
+        norm["InputStrides"][axis:],
+        list(lane_shape),
+        context_name,
+        variable_prefix=f"{scope}_reduce_",
+    )
+    reduction_major_extent = _fixed(reduction_context["major_extent"])
+    if reduction_major_extent is not None:
+        reduction_context["physical_tile_width_cap"] = 1 << max(
+            reduction_major_extent - 1, 0
+        ).bit_length()
+    if reduction_context["lane_count"] != int(norm["InputVectorLaneCount"]):
+        raise ValueError(
+            f"{context_name} inline reduction lane metadata is inconsistent: "
+            f"shape={lane_shape}, count={norm['InputVectorLaneCount']}."
+        )
+    reduction_context["input_access"] = _tensor_access(
+        tuple(f"index{index}" for index in range(axis))
+        + tuple(reduction_context["tensor_coordinates"]),
+        norm["InputStrides"],
+        reduction_context["lane_coordinates"],
+        reduction_context["lane_shape"],
+    )
+    reduction = "norm_value"
+    square_reduction = "norm_value * norm_value"
+    for _ in range(1 + len(reduction_context["lane_shape"])):
+        reduction = f"tl.sum({reduction}, axis=0)"
+        square_reduction = f"tl.sum({square_reduction}, axis=0)"
 
     def parameter_access(name: str, source: dict[str, Any]) -> dict[str, Any]:
         coordinates = tuple(source["TensorIndices"])[axis:]
@@ -6791,17 +6943,14 @@ def _norm_rope_template_context(
             lane_shape,
         )
 
-    def stats_access(component: int) -> dict[str, Any]:
-        input_coordinates = tuple(current["TensorIndices"])
-        coordinates = (str(component),) + tuple(
-            input_coordinates[index] if index < axis else "0"
-            for index in range(rank)
-        )
-        return _tensor_access(coordinates, norm["StatsStrides"])
-
     context.update(
         {
             "bias_access": parameter_access("Bias", current),
+            "loop_axes": tuple(
+                loop_axis
+                for loop_axis in context["loop_axes"]
+                if loop_axis >= axis
+            ),
             "normalization_size": _product(
                 _logical_shape(
                     norm["InputGlobalShape"], norm["InputVectorLaneCount"]
@@ -6809,8 +6958,12 @@ def _norm_rope_template_context(
             ),
             "paired_bias_access": parameter_access("Bias", paired),
             "paired_scale_access": parameter_access("Scale", paired),
+            "outer_axes": tuple(range(axis)),
+            "prefix_depth": axis,
+            "reduction": reduction,
+            "reduction_context": reduction_context,
             "scale_access": parameter_access("Scale", current),
-            "stats_accesses": (stats_access(0), stats_access(1)),
+            "square_reduction": square_reduction,
         }
     )
     return context
@@ -6820,10 +6973,10 @@ def _qkv_rope_with_cache_template_context(
     model: dict[str, Any],
 ) -> dict[str, Any]:
     q_context = _norm_rope_template_context(
-        model["QNorm"], model["QRoPE"], "PyNTT QKVRoPEWithCache Q"
+        model["QNorm"], model["QRoPE"], "PyNTT QKVRoPEWithCache Q", "q"
     )
     k_context = _norm_rope_template_context(
-        model["KNorm"], model["KRoPE"], "PyNTT QKVRoPEWithCache K"
+        model["KNorm"], model["KRoPE"], "PyNTT QKVRoPEWithCache K", "k"
     )
     k_cache_context = _update_paged_attention_kv_cache_template_context(
         model["KUpdate"]
@@ -6846,7 +6999,7 @@ def _qkv_rope_with_cache_template_context(
         )
     permutation = tuple(qkv_layout.index(axis) for axis in attention_layout)
     q_output_shape = model["QOutputShape"]
-    source_shape = model["QNorm"]["OutputShape"]
+    source_shape = model["QNorm"]["InputShape"]
     if len(q_output_shape) != len(permutation) or len(source_shape) != len(permutation):
         raise ValueError(
             "PyNTT QKVRoPEWithCache Q input/output rank must match its semantic layouts"

@@ -123,44 +123,44 @@ public class MatMulEvaluator : IEvaluator<MatMul>, ITypeInferencer<MatMul>, ICos
         else
         {
             var ndsbp = new SBP[oRank];
-            if (a.Placement.Rank == 1)
+            var lhsReductionPolicy = a.AxisPolicies[lk];
+            var rhsReductionPolicy = b.AxisPolicies[rk];
+            if (lhsReductionPolicy is SBPSplit || rhsReductionPolicy is SBPSplit)
             {
-                // not support split on k.
-                if (a.AxisPolicies[lk] is SBPSplit || b.AxisPolicies[rk] is SBPSplit)
-                {
-                    return new InvalidType("not support split on k for 1d mesh.");
-                }
-
-                ndsbp[oRank - 2] = a.AxisPolicies[lm];
-                ndsbp[oRank - 1] = b.AxisPolicies[rn];
-            }
-            else
-            {
-                if (a.AxisPolicies[lk] is SBPSplit || b.AxisPolicies[rk] is SBPSplit)
+                var isSumma = false;
+                if (a.Placement.Rank >= 2)
                 {
                     var (lmMeshAxis, lkMeshAxis) = (a.Placement.Rank - 2, a.Placement.Rank - 1);
 
-                    // TODO: support split on multi-meshes.
-                    if (a.AxisPolicies[lm] is SBPSplit slm && a.AxisPolicies[lk] is SBPSplit slk
-                    && b.AxisPolicies[rk] is SBPSplit srk && b.AxisPolicies[rn] is SBPSplit srn
-                    && slm.HierarchyAxes.Count == 1 && slk.HierarchyAxes.Count == 1 && srk.HierarchyAxes.Count == 1 && srn.HierarchyAxes.Count == 1
-                    && slm.HierarchyAxes[0] == srk.HierarchyAxes[0] && slk.HierarchyAxes[0] == srn.HierarchyAxes[0]
-                    && slm.HierarchyAxes[0] == lmMeshAxis && slk.HierarchyAxes[0] == lkMeshAxis)
-                    {
-                        ndsbp[oRank - 2] = a.AxisPolicies[lm];
-                        ndsbp[oRank - 1] = b.AxisPolicies[rn];
-                    }
-                    else
-                    {
-                        return new InvalidType("only support specific split for summa.");
-                    }
+                    // TODO: support SUMMA split on more than two mesh axes.
+                    isSumma = a.AxisPolicies[lm] is SBPSplit slm
+                        && lhsReductionPolicy is SBPSplit slk
+                        && rhsReductionPolicy is SBPSplit srk
+                        && b.AxisPolicies[rn] is SBPSplit srn
+                        && slm.HierarchyAxes.Count == 1
+                        && slk.HierarchyAxes.Count == 1
+                        && srk.HierarchyAxes.Count == 1
+                        && srn.HierarchyAxes.Count == 1
+                        && slm.HierarchyAxes[0] == srk.HierarchyAxes[0]
+                        && slk.HierarchyAxes[0] == srn.HierarchyAxes[0]
+                        && slm.HierarchyAxes[0] == lmMeshAxis
+                        && slk.HierarchyAxes[0] == lkMeshAxis;
                 }
-                else
+
+                if (!isSumma)
                 {
-                    ndsbp[oRank - 2] = a.AxisPolicies[lm];
-                    ndsbp[oRank - 1] = b.AxisPolicies[rn];
+                    if (lhsReductionPolicy != rhsReductionPolicy || lhsReductionPolicy is not SBPSplit split)
+                    {
+                        return new InvalidType(
+                            $"not support different policy on k: {lhsReductionPolicy} vs {rhsReductionPolicy}");
+                    }
+
+                    partial = SBP.P(split.HierarchyAxes);
                 }
             }
+
+            ndsbp[oRank - 2] = a.AxisPolicies[lm];
+            ndsbp[oRank - 1] = b.AxisPolicies[rn];
 
             for (int i = 0; i < ndsbp.Length - 2; i++)
             {
@@ -208,7 +208,7 @@ public class MatMulEvaluator : IEvaluator<MatMul>, ITypeInferencer<MatMul>, ICos
                 }
             }
 
-            if (DistributedUtility.IsDistributable(ndsbp))
+            if (DistributedUtility.IsDistributable(outType, ndsbp, a.Placement))
             {
                 return new DistributedType(outType, ndsbp, a.Placement, partial);
             }

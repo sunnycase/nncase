@@ -202,7 +202,7 @@ def {{ model["FunctionName"] }}__consumer(reader, {{ helper_parameters(model) }}
 
         result = tl.sum(partial, axis=1)
         pipeline_output_n = n_start + tle.encoding(
-            tl.arange(0, {{ ctx["block_n"] }}),
+            local_n_source,
             {{ ctx["consumer_output_layout_name"] }},
         )
 {% for projection in ctx["projections"] %}

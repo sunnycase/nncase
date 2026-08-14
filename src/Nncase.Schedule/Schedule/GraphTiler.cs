@@ -224,7 +224,7 @@ public sealed class GraphTiler
                 {
                     var resource = machine.GetPrivateResource(usage.Resource);
                     var allocatedUnits = GetAllocatedPrivateResourceUnits(usage.Units, resource, solver);
-                    var capacity = solver.MakeLessOrEqual(selected * allocatedUnits, resource.CapacityUnits);
+                    var capacity = solver.MakeLessOrEqual(selected * allocatedUnits, resource.AvailableCapacityUnits);
                     capacity.SetName($"microkernel_resource_le[op{opNode.OpId},{candidateIndex},{resource.Id}]");
                     solver.Add(capacity);
                 }
@@ -789,7 +789,7 @@ public sealed class GraphTiler
 
                 var constraint = solver.MakeLessOrEqual(
                     solver.MakeSum(terms.ToArray()),
-                    privateResource.CapacityUnits);
+                    privateResource.AvailableCapacityUnits);
                 constraint.SetName($"private_resource_capacity_le[{privateResource.Id},t{time}]");
                 solver.Add(constraint);
             }
@@ -1106,7 +1106,10 @@ public sealed class GraphTiler
                 .ToArray();
             foreach (var time in times)
             {
-                var terms = new List<IntExpr>();
+                var terms = new List<IntExpr>
+                {
+                    solver.MakeIntConst(machine.GetBaselinePrivateResourceUsageBytes(memoryResource.Id)),
+                };
                 foreach (var (level, allocationBytes) in managedArenaAllocationBytes)
                 {
                     if (tilingMemorySpaces[level].ResourceId == memoryResource.Id)
@@ -2872,7 +2875,7 @@ public sealed class GraphTiler
         writer.Indent++;
         foreach (var resource in machine.PrivateResources.Values.OrderBy(resource => resource.Id.Value, StringComparer.Ordinal))
         {
-            writer.WriteLine($"- {resource.Id}: unit={resource.Unit}, capacity={resource.CapacityUnits}, granularity={resource.AllocationGranularityUnits}, backing={resource.BackingMemoryResource?.ToString() ?? "none"}");
+            writer.WriteLine($"- {resource.Id}: unit={resource.Unit}, capacity={resource.CapacityUnits}, baseline={resource.BaselineUsageUnits}, available={resource.AvailableCapacityUnits}, granularity={resource.AllocationGranularityUnits}, backing={resource.BackingMemoryResource?.ToString() ?? "none"}");
         }
 
         writer.Indent--;
@@ -2881,7 +2884,7 @@ public sealed class GraphTiler
         foreach (var memorySpace in machine.MemorySpaces.Values.OrderBy(space => space.Id.Value, StringComparer.Ordinal))
         {
             var resource = machine.GetMemoryResource(memorySpace);
-            writer.WriteLine($"- {memorySpace.Id}: resource={resource.Id}, kind={resource.Kind}, scope={memorySpace.Scope}, allocation_limit={memorySpace.MaxAllocationBytesPerScope}, resource_capacity={resource.CapacityBytes}, read_bpc={resource.ReadBytesPerCycle}, write_bpc={resource.WriteBytesPerCycle}, latency={resource.LatencyCycles}, tiling_level={memorySpace.TilingLevel}");
+            writer.WriteLine($"- {memorySpace.Id}: resource={resource.Id}, kind={resource.Kind}, scope={memorySpace.Scope}, allocation_limit={memorySpace.MaxAllocationBytesPerScope}, usable_allocation={machine.GetMaximumUsableAllocationBytes(memorySpace)}, resource_capacity={resource.CapacityBytes}, read_bpc={resource.ReadBytesPerCycle}, write_bpc={resource.WriteBytesPerCycle}, latency={resource.LatencyCycles}, tiling_level={memorySpace.TilingLevel}");
         }
 
         writer.Indent--;

@@ -23,6 +23,6 @@ def {{ model["FunctionName"] }}({{ helper_parameters(model, args) }}):
             ),
         ],
         [{{ model["ProducerWarps"] }}],
-        [{{ model["WorkerRegisters"] }}],
+        [{{ model["ProducerRegisters"] }}],
     )
 {%- endmacro %}

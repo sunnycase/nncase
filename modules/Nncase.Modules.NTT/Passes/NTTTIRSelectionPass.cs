@@ -57,6 +57,13 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
                     .ToArray());
         }
 
+        if (selectedExpr is IfThenElse conditional)
+        {
+            return conditional.With(
+                then: (Sequential)FinalizeSelectedExpr(sourceCall, conditional.Then, context),
+                @else: (Sequential)FinalizeSelectedExpr(sourceCall, conditional.Else, context));
+        }
+
         if (selectedExpr is not Call { Target: TIR.NTT.NTTKernelOp kernelOp } selectedCall)
         {
             return selectedExpr;
@@ -263,8 +270,6 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
                         (Expr)qkvInputs[0],
                         (Expr)qkvInputs[1],
                         (Expr)qkvInputs[2],
-                        (Expr)arguments[IR.NN.QKVRoPEWithCache.QStats.Index],
-                        (Expr)arguments[IR.NN.QKVRoPEWithCache.KStats.Index],
                         (Expr)arguments[IR.NN.QKVRoPEWithCache.QScale.Index],
                         (Expr)arguments[IR.NN.QKVRoPEWithCache.KScale.Index],
                         (Expr)arguments[IR.NN.QKVRoPEWithCache.QBias.Index],
@@ -581,10 +586,12 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
             partialMax,
             partialSum,
             partialAcc,
+            mergeOutput,
             pagedAttention.Layout,
             pagedAttention.HiddenSize,
             plan.SplitHierarchyAxis,
-            plan.SplitCount);
+            plan.SplitCount,
+            plan.DirectContextThreshold);
         var merge = TIR.F.NTT.PagedAttentionMerge(
             mergedMax,
             mergedSum,
@@ -594,7 +601,7 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
             pagedAttention.HiddenSize,
             plan.SplitHierarchyAxis,
             plan.SplitCount);
-        var fields = requiresPublicationBarrier
+        var splitFields = requiresPublicationBarrier
             ? new Expr[]
             {
                 partial,
@@ -604,8 +611,25 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
                     new IRArray<int>(new[] { plan.SplitHierarchyAxis })),
             }
             : new Expr[] { partial, merge };
+        if (plan.DirectContextThreshold > 0)
+        {
+            var useSplitKV = TIR.F.NTT.PagedAttentionUseSplitKV(
+                (Expr)arguments[1],
+                plan.DirectContextThreshold);
+            return new Sequential(
+                [
+                    partial,
+                    new IfThenElse(
+                        useSplitKV,
+                        new Sequential(
+                            splitFields[1..],
+                            traceScopeName: "paged_attention_split_kv_merge")),
+                ],
+                traceScopeName: "paged_attention_adaptive");
+        }
+
         return new Sequential(
-            fields,
+            splitFields,
             traceScopeName: "paged_attention_split_kv");
     }
 
@@ -706,15 +730,23 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
 
         if (DistributedUtility.IsLocalShardSubview(sourceType, shardedView.NewType))
         {
+            var aliasSource = sourceBuffer;
+            if (RequiresCanonicalBackingForLocalAlias(sourceType, shardedView.NewType) &&
+                sourceBuffer.DistributedStorageKind != DistributedBufferStorageKind.CanonicalGlobal &&
+                sourceType.AxisPolicies.Any(policy => policy is not SBPBroadCast))
+            {
+                (aliasSource, _) = EnsureChipLocalShardedBacking(sourceBuffer, context);
+            }
+
             var localAlias = CreateLocalShardedAlias(
-                sourceBuffer,
+                aliasSource,
                 sourceType,
                 shardedView.NewType,
                 $"local_sharded_view_{_shardedViewIndex++}");
-            var localComponentBase = _shardedComponentBases.TryGetValue(sourceBuffer, out var knownComponentBase)
+            var localComponentBase = _shardedComponentBases.TryGetValue(aliasSource, out var knownComponentBase)
                 ? knownComponentBase
-                : sourceBuffer.MemSpan.Start;
-            _shardedComponentBases.TryAdd(sourceBuffer, localComponentBase);
+                : aliasSource.MemSpan.Start;
+            _shardedComponentBases.TryAdd(aliasSource, localComponentBase);
             _shardedComponentBases.Add(localAlias, localComponentBase);
             output = localAlias;
             return T.Nop();
@@ -835,10 +867,17 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
                 return source.With(name: name, distributedType: targetType);
             }
 
-            if (sourceType.AxisPolicies.Any(policy => policy is not SBPBroadCast))
+            if (!DistributedUtility.IsLocalShardSubview(sourceType, targetType))
             {
                 throw new InvalidOperationException(
                     $"Local ShardedView cannot alias non-contiguous mapping {sourceType} -> {targetType}.");
+            }
+
+            if (source.DistributedStorageKind != DistributedBufferStorageKind.CanonicalGlobal &&
+                sourceType.AxisPolicies.Any(policy => policy is not SBPBroadCast))
+            {
+                throw new InvalidOperationException(
+                    $"Local ShardedView requires canonical backing for non-contiguous refinement {sourceType} -> {targetType}.");
             }
 
             var (_, globalStrides) = TensorUtilities.GetTensorMaxSizeAndStridesExpr(
@@ -880,6 +919,21 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
             byteSpanSize,
             targetType,
             name);
+    }
+
+    private bool RequiresCanonicalBackingForLocalAlias(
+        DistributedType sourceType,
+        DistributedType targetType)
+    {
+        if (sourceType.AxisPolicies.SequenceEqual(targetType.AxisPolicies))
+        {
+            return false;
+        }
+
+        var sourceDescriptor = GetLocalShardDescriptor(sourceType);
+        var targetDescriptor = GetLocalShardDescriptor(targetType);
+        return !sourceDescriptor.TryGetContiguousRegion(out _, out _) ||
+            !targetDescriptor.TryGetContiguousRegion(out _, out _);
     }
 
     private LocalShardDescriptor GetLocalShardDescriptor(DistributedType distributedType)

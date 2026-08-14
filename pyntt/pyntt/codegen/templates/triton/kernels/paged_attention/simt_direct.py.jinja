@@ -35,7 +35,7 @@
     seq_lens = {{ model["SeqLensArgument"] }}
     num_seqs = {{ model["NumSeqsArgument"] }}
     layer_id_value = (tl.full((), 0, tl.int32) + ({{ model["LayerIdExpression"] }})).to(tl.int32)
-{% for name, key in (("query", "Query"), ("scale_ptr", "Scale"), ("max_state", "MaxState"), ("sum_state", "SumState"), ("acc_state", "AccState")) %}
+{% for name, key in (("query", "Query"), ("scale_ptr", "Scale"), ("max_state", "MaxState"), ("sum_state", "SumState"), ("acc_state", "AccState"), ("direct_output", "Output")) %}
     {{ name }} = {{ ptr(model, key) }}
 {% endfor %}
     scale_value = tl.load({{ access_pointer(model, "Scale", "scale_ptr") }}).to(tl.float32)
@@ -44,11 +44,14 @@
     num_tokens = tl.load(query_start_loc + num_seqs).to(tl.int64)
     for seq_scan in tl.range(0, num_seqs):
         max_seq_len = tl.maximum(max_seq_len, tl.load(seq_lens + seq_scan).to(tl.int64))
+    direct_context = (num_seqs == 1) & (max_seq_len <= {{ model["DirectContextThreshold"] }})
     block_table_blocks = tl.cdiv(max_seq_len, {{ cache["BlockSize"] }})
     split_span = tl.cdiv(max_seq_len, {{ ctx["split_count"] * ctx["attention_block_size"] }}) * {{ ctx["attention_block_size"] }}
-    split_active = {{ ctx["split_coord"] }} < {{ ctx["split_count"] }}
-    split_begin = tl.minimum(({{ ctx["split_coord"] }}).to(tl.int64) * split_span, max_seq_len)
-    split_end = tl.minimum(split_begin + split_span, max_seq_len)
+    planned_split_begin = tl.minimum(({{ ctx["split_coord"] }}).to(tl.int64) * split_span, max_seq_len)
+    planned_split_end = tl.minimum(planned_split_begin + split_span, max_seq_len)
+    split_active = direct_context | ({{ ctx["split_coord"] }} < {{ ctx["split_count"] }})
+    split_begin = tl.where(direct_context, 0, planned_split_begin).to(tl.int32)
+    split_end = tl.where(direct_context, max_seq_len, planned_split_end).to(tl.int32)
 {{ common.structured_axis(ctx["query_dim_axis"], "    ") }}
     dim_offsets = tl.arange(0, {{ cache["HeadDim"] }})
     product_rows = tle.encoding(
@@ -155,9 +158,14 @@
             state_local_q_heads = tle.encoding(safe_local_q_heads[:, None], {{ ctx["simt_acc_layout_name"] }})
             state_dim_offsets = tle.encoding(dim_offsets[None, :], {{ ctx["simt_acc_layout_name"] }})
             state_acc_mask = tle.encoding(q_head_mask[:, None], {{ ctx["simt_acc_layout_name"] }})
-            tl.store({{ access_pointer(model, "MaxState", "max_state", ctx["simt_max_state_access"]) }}, tle.encoding(max_score, {{ model["FunctionName"] }}__head_layout), mask=split_active & state_scalar_mask)
-            tl.store({{ access_pointer(model, "SumState", "sum_state", ctx["simt_sum_state_access"]) }}, tle.encoding(sum_exp, {{ model["FunctionName"] }}__head_layout), mask=split_active & state_scalar_mask)
-            tl.store({{ access_pointer(model, "AccState", "acc_state", ctx["simt_acc_state_access"]) }}, acc, mask=split_active & state_acc_mask)
+            scalar_store_mask = (~direct_context) & split_active & state_scalar_mask
+            acc_store_mask = (~direct_context) & split_active & state_acc_mask
+            tl.store({{ access_pointer(model, "MaxState", "max_state", ctx["simt_max_state_access"]) }}, tle.encoding(max_score, {{ model["FunctionName"] }}__head_layout), mask=scalar_store_mask)
+            tl.store({{ access_pointer(model, "SumState", "sum_state", ctx["simt_sum_state_access"]) }}, tle.encoding(sum_exp, {{ model["FunctionName"] }}__head_layout), mask=scalar_store_mask)
+            tl.store({{ access_pointer(model, "AccState", "acc_state", ctx["simt_acc_state_access"]) }}, acc, mask=acc_store_mask)
+            inv_sum = tl.where(sum_exp != 0.0, 1.0 / sum_exp, 0.0)
+            direct_result = tl.reshape(acc * inv_sum[:, None], {{ ctx["query_structured_shape"] }})
+            tl.store({{ access_pointer(model, "Output", "direct_output", ctx["output_access"]) }}, direct_result, mask=direct_context & found_seq & {{ ctx["output_mask"] }})
 
 
 {{ phases.dispatch(model) }}

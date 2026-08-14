@@ -382,14 +382,20 @@ public sealed class UnitTestTransferPipelineRegions : TestClassBase
         var rewrittenMain = Assert.IsType<PrimFunction>(module.Entry);
         var rewrittenCallee = Assert.IsType<PrimFunction>(
             module.Functions.Single(function => function.Name == callee.Name));
-        var callerRegion = GetRegion(rewrittenMain);
         var calleeRegion = GetRegion(rewrittenCallee);
-        var callerStages = callerRegion.ConsumeBody.Fields.ToArray()
-            .OfType<PipelineStage>()
+        var callerRegions = rewrittenMain.Body.Fields.ToArray()
+            .OfType<ProducerConsumerRegion>()
             .ToArray();
-        Assert.Equal(2, callerStages.Length);
+        Assert.Equal(2, callerRegions.Length);
+        var callerStages = callerRegions
+            .Select(region => Assert.Single(
+                region.ConsumeBody.Fields.ToArray().OfType<PipelineStage>()))
+            .ToArray();
         Assert.Single(calleeRegion.ConsumeBody.Fields.ToArray().OfType<PipelineStage>());
-        Assert.Single(callerRegion.ConsumeBody.Fields.ToArray().OfType<PipelineDrain>());
+        Assert.All(
+            callerRegions,
+            region => Assert.Empty(
+                ExprCollector.Collect(region).OfType<PipelineDrain>()));
         Assert.All(
             callerStages,
             stage => Assert.Same(rewrittenCallee, stage.Operation.Target));

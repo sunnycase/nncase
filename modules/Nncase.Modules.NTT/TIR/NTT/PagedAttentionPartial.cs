@@ -7,7 +7,8 @@ using Nncase.IR.NN;
 namespace Nncase.TIR.NTT;
 
 /// <summary>
-/// Computes one KV partition's FP32 online-softmax state.
+/// Computes either one KV partition's FP32 online-softmax state or, for a
+/// planner-selected short context, the complete attention output.
 /// </summary>
 public sealed partial class PagedAttentionPartial : NTTKernelOp
 {
@@ -27,6 +28,8 @@ public sealed partial class PagedAttentionPartial : NTTKernelOp
 
     public static readonly ParameterInfo AccState = new(typeof(PagedAttentionPartial), 7, "accState", memoryEffect: MemoryEffect.Write);
 
+    public static readonly ParameterInfo Output = new(typeof(PagedAttentionPartial), 8, "output", memoryEffect: MemoryEffect.Write);
+
     public IRArray<AttentionDimKind> Layout { get; }
 
     public int HiddenSize { get; }
@@ -34,4 +37,10 @@ public sealed partial class PagedAttentionPartial : NTTKernelOp
     public int SplitHierarchyAxis { get; }
 
     public int SplitCount { get; }
+
+    /// <summary>
+    /// Gets the largest single-sequence context length computed directly by
+    /// every query owner instead of publishing and merging split state.
+    /// </summary>
+    public long DirectContextThreshold { get; }
 }

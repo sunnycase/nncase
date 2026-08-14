@@ -56,7 +56,8 @@ public sealed class LowerTransferPipelineRegionsPass : ModulePass
             var loweredBody = LowerFunctionBody(
                 function,
                 pipelineFunctions,
-                effectAnalyzer);
+                effectAnalyzer,
+                splitNestedPipelineCalls: ReferenceEquals(function, input.Entry));
             var lowered = function.With(body: loweredBody);
             lowered.Metadata = function.Metadata.Clone();
             replacements.Add(function, lowered);
@@ -121,7 +122,8 @@ public sealed class LowerTransferPipelineRegionsPass : ModulePass
     private static Sequential LowerFunctionBody(
         PrimFunction function,
         IReadOnlySet<PrimFunction> pipelineFunctions,
-        MemoryEffectAnalyzer effectAnalyzer)
+        MemoryEffectAnalyzer effectAnalyzer,
+        bool splitNestedPipelineCalls)
     {
         ValidateStructuredPipelinePlacement(
             function.Body,
@@ -133,14 +135,88 @@ public sealed class LowerTransferPipelineRegionsPass : ModulePass
             pipelineFunctions,
             function.Name,
             ref stageIndex);
-        var synchronization = BuildSynchronizationPlan(
+        if (splitNestedPipelineCalls)
+        {
+            return BuildEntryPipelineRegions(
+                consumer,
+                pipelineFunctions,
+                function.Name,
+                effectAnalyzer);
+        }
+
+        return new Sequential(BuildPipelineRegion(
             consumer,
             function.Name,
+            effectAnalyzer));
+    }
+
+    private static Sequential BuildEntryPipelineRegions(
+        Sequential body,
+        IReadOnlySet<PrimFunction> pipelineFunctions,
+        string functionName,
+        MemoryEffectAnalyzer effectAnalyzer)
+    {
+        var result = new List<Expr>();
+        var pending = new List<Expr>();
+        foreach (var field in FlattenSequentialFields(body))
+        {
+            pending.Add(field);
+            if (field is PipelineStage { Operation.Target: PrimFunction callee } &&
+                pipelineFunctions.Contains(callee))
+            {
+                result.Add(BuildPipelineRegion(
+                    new Sequential(pending.ToArray()),
+                    functionName,
+                    effectAnalyzer));
+                pending.Clear();
+            }
+        }
+
+        if (pending.Any(expression => expression is PipelineStage))
+        {
+            result.Add(BuildPipelineRegion(
+                new Sequential(pending.ToArray()),
+                functionName,
+                effectAnalyzer));
+        }
+        else
+        {
+            result.AddRange(pending);
+        }
+
+        return new Sequential(result.ToArray());
+    }
+
+    private static ProducerConsumerRegion BuildPipelineRegion(
+        Sequential consumer,
+        string functionName,
+        MemoryEffectAnalyzer effectAnalyzer)
+    {
+        var synchronization = BuildSynchronizationPlan(
+            consumer,
+            functionName,
             effectAnalyzer);
         var consumeBody = InsertConsumerSynchronization(consumer, synchronization);
         var produceBody = BuildProducerBody(consumer, synchronization);
-        var region = new ProducerConsumerRegion(produceBody, consumeBody);
-        return new Sequential(region);
+        return new ProducerConsumerRegion(produceBody, consumeBody);
+    }
+
+    private static IEnumerable<Expr> FlattenSequentialFields(Sequential body)
+    {
+        foreach (var field in body.Fields.ToArray())
+        {
+            if (field is Sequential nested)
+            {
+                foreach (var nestedField in FlattenSequentialFields(nested))
+                {
+                    yield return nestedField;
+                }
+            }
+            else
+            {
+                yield return field;
+            }
+        }
     }
 
     private static PipelineSynchronizationPlan BuildSynchronizationPlan(

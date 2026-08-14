@@ -18,27 +18,23 @@ public sealed partial class QKVRoPEWithCache : NTTKernelOp
 
     public static readonly ParameterInfo V = new(typeof(QKVRoPEWithCache), 2, "v", memoryEffect: MemoryEffect.Read);
 
-    public static readonly ParameterInfo QStats = new(typeof(QKVRoPEWithCache), 3, "q_stats", memoryEffect: MemoryEffect.Read);
+    public static readonly ParameterInfo QScale = new(typeof(QKVRoPEWithCache), 3, "q_scale", memoryEffect: MemoryEffect.Read);
 
-    public static readonly ParameterInfo KStats = new(typeof(QKVRoPEWithCache), 4, "k_stats", memoryEffect: MemoryEffect.Read);
+    public static readonly ParameterInfo KScale = new(typeof(QKVRoPEWithCache), 4, "k_scale", memoryEffect: MemoryEffect.Read);
 
-    public static readonly ParameterInfo QScale = new(typeof(QKVRoPEWithCache), 5, "q_scale", memoryEffect: MemoryEffect.Read);
+    public static readonly ParameterInfo QBias = new(typeof(QKVRoPEWithCache), 5, "q_bias", memoryEffect: MemoryEffect.Read);
 
-    public static readonly ParameterInfo KScale = new(typeof(QKVRoPEWithCache), 6, "k_scale", memoryEffect: MemoryEffect.Read);
+    public static readonly ParameterInfo KBias = new(typeof(QKVRoPEWithCache), 6, "k_bias", memoryEffect: MemoryEffect.Read);
 
-    public static readonly ParameterInfo QBias = new(typeof(QKVRoPEWithCache), 7, "q_bias", memoryEffect: MemoryEffect.Read);
+    public static readonly ParameterInfo Cos = new(typeof(QKVRoPEWithCache), 7, "cos", memoryEffect: MemoryEffect.Read);
 
-    public static readonly ParameterInfo KBias = new(typeof(QKVRoPEWithCache), 8, "k_bias", memoryEffect: MemoryEffect.Read);
+    public static readonly ParameterInfo Sin = new(typeof(QKVRoPEWithCache), 8, "sin", memoryEffect: MemoryEffect.Read);
 
-    public static readonly ParameterInfo Cos = new(typeof(QKVRoPEWithCache), 9, "cos", memoryEffect: MemoryEffect.Read);
+    public static readonly ParameterInfo KVCaches = new(typeof(QKVRoPEWithCache), 9, "kv_caches", memoryEffect: MemoryEffect.ChipWrite);
 
-    public static readonly ParameterInfo Sin = new(typeof(QKVRoPEWithCache), 10, "sin", memoryEffect: MemoryEffect.Read);
+    public static readonly ParameterInfo LayerId = new(typeof(QKVRoPEWithCache), 10, "layer_id", IR.TypePatternUtility.IsDimensionType(), memoryEffect: MemoryEffect.None);
 
-    public static readonly ParameterInfo KVCaches = new(typeof(QKVRoPEWithCache), 11, "kv_caches", memoryEffect: MemoryEffect.ChipWrite);
-
-    public static readonly ParameterInfo LayerId = new(typeof(QKVRoPEWithCache), 12, "layer_id", IR.TypePatternUtility.IsDimensionType(), memoryEffect: MemoryEffect.None);
-
-    public static readonly ParameterInfo QOutput = new(typeof(QKVRoPEWithCache), 13, "q_output", memoryEffect: MemoryEffect.Write);
+    public static readonly ParameterInfo QOutput = new(typeof(QKVRoPEWithCache), 11, "q_output", memoryEffect: MemoryEffect.Write);
 
     public int QAxis { get; }
 

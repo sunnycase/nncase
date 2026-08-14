@@ -1,18 +1,24 @@
 {% macro iterate(ctx, base_depth=0, scope="elementwise") %}
+{% if "physical_tile_width_cap" in ctx %}
 {% if ctx["lane_count"] == 1 %}
+{{ "    " * (base_depth + 1) }}{{ scope }}_physical_tile_width: tl.constexpr = min(block_size, {{ ctx["physical_tile_width_cap"] }})
+{% else %}
+{{ "    " * (base_depth + 1) }}{{ scope }}_physical_tile_width: tl.constexpr = min(block_size // {{ ctx["lane_count"] }}, {{ ctx["physical_tile_width_cap"] }})
+{% endif %}
+{% elif ctx["lane_count"] == 1 %}
 {{ "    " * (base_depth + 1) }}{{ scope }}_physical_tile_width: tl.constexpr = block_size
 {% else %}
 {{ "    " * (base_depth + 1) }}{{ scope }}_physical_tile_width: tl.constexpr = block_size // {{ ctx["lane_count"] }}
 {% endif %}
 {% for axis in ctx["loop_axes"] %}
-{{ "    " * (base_depth + loop.index) }}for index{{ axis }} in tl.range(0, {{ dim(ctx["tensor_shape"][axis]) }}):
+{{ "    " * (base_depth + loop.index) }}for {{ ctx["index_variables"][axis] }} in tl.range(0, {{ dim(ctx["tensor_shape"][axis]) }}):
 {% endfor %}
 {% set outer_depth = base_depth + (ctx["loop_axes"] | length) %}
 {{ "    " * (outer_depth + 1) }}for major_start in tl.range(0, {{ dim(ctx["major_extent"]) }}, {{ scope }}_physical_tile_width):
-{{ "    " * (outer_depth + 2) }}major_raw = (major_start + tl.arange(0, {{ scope }}_physical_tile_width)){{ ctx["major_reshape"] }}
+{{ "    " * (outer_depth + 2) }}{{ ctx["major_variable"] }} = (major_start + tl.arange(0, {{ scope }}_physical_tile_width)){{ ctx["major_reshape"] }}
 {% for extent in ctx["lane_shape"] %}
-{{ "    " * (outer_depth + 2) }}lane_raw{{ loop.index0 }} = tl.arange(0, {{ extent }}){{ ctx["lane_reshapes"][loop.index0] }}
+{{ "    " * (outer_depth + 2) }}{{ ctx["lane_coordinates"][loop.index0] }} = tl.arange(0, {{ extent }}){{ ctx["lane_reshapes"][loop.index0] }}
 {% endfor %}
-{{ "    " * (outer_depth + 2) }}mask = major_raw < {{ dim(ctx["major_extent"]) }}
+{{ "    " * (outer_depth + 2) }}mask = {{ ctx["major_variable"] }} < {{ dim(ctx["major_extent"]) }}
 {{ caller("    " * (outer_depth + 2)) }}
 {% endmacro %}

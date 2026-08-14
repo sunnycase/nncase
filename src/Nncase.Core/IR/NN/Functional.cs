@@ -44,8 +44,6 @@ public static class NN
 
     public static Call QKVRoPEWithCache(
         BaseExpr qkv,
-        Expr qStats,
-        Expr kStats,
         Expr qScale,
         Expr kScale,
         Expr qBias,
@@ -73,8 +71,6 @@ public static class NN
                 qkvLayout,
                 attentionLayout),
             qkv,
-            qStats,
-            kStats,
             qScale,
             kScale,
             qBias,

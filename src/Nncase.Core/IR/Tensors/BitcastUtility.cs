@@ -57,6 +57,12 @@ public static class BitcastUtility
 
             if (inputType.AxisPolicies[index] is SBPSplit split)
             {
+                if (index != axisPolicies.Length - 1 || inputType.TensorType.DType.SizeInBytes == outputTensorType.DType.SizeInBytes)
+                {
+                    axisPolicies[index] = split;
+                    continue;
+                }
+
                 var inputBytes = inputType.TensorType.DType.SizeInBytes;
                 var outputBytes = outputTensorType.DType.SizeInBytes;
                 if (!DistributedUtility.TryScaleSplitUnits(split, inputBytes, outputBytes, out var scaledSplit))

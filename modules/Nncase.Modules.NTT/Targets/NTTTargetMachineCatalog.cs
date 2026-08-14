@@ -22,6 +22,11 @@ public static class NTTTargetMachineCatalog
     public static readonly TargetPrivateResourceId GpuRegisterFile = new("gpu.register-file-r32");
     public static readonly TargetPrivateResourceId GpuBackendSharedMemory = new("gpu.backend-shared-memory");
 
+    // Keep conservative scheduler headroom for lowering-owned pipe/barrier
+    // control, warp-specialization state, and prepared-ABI reload tables. This
+    // is not an allocation; the prepared-kernel path validates the exact total.
+    private const long GpuBackendSharedBaselineBytes = 32L * 1024;
+
     private static readonly ImmutableArray<DataType> _tensorCoreOperandDataTypes =
     [
         DataTypes.Float16,
@@ -117,14 +122,20 @@ public static class NTTTargetMachineCatalog
             new(25, 2200),
             [
                 new(GpuRegisterFile, TargetPrivateResourceUnit.Register32, 255L * 8 * 32, 8 * 32),
-                new(GpuBackendSharedMemory, TargetPrivateResourceUnit.Bytes, sharedCapacityBytes, 16, sharedResource),
+                new(
+                    GpuBackendSharedMemory,
+                    TargetPrivateResourceUnit.Bytes,
+                    sharedCapacityBytes,
+                    16,
+                    sharedResource,
+                    GpuBackendSharedBaselineBytes),
             ],
             [
                 new(sharedResource, TargetMemorySpaceKind.Shared, sharedCapacityBytes, 512, 512, 20, 16),
                 new(globalResource, TargetMemorySpaceKind.Global, int.MaxValue, 1110, 1110, 300, 128),
             ],
             [
-                new(shared, sharedResource, MemorySharingScope.Block, new(MemoryLocation.Shared), GetCompilerManagedSharedAllocationLimit(sharedCapacityBytes), TargetMemoryAllocationSizePolicy.PowerOfTwo, true, 0, true, true, true),
+                new(shared, sharedResource, MemorySharingScope.Block, new(MemoryLocation.Shared), sharedCapacityBytes, TargetMemoryAllocationSizePolicy.GranularityAligned, true, 0, true, true, true),
                 new(blockGlobal, globalResource, MemorySharingScope.Block, new(MemoryLocation.BlockLocalData), blockLocalWorkspaceBytes, TargetMemoryAllocationSizePolicy.GranularityAligned, true, 1, true, true, true),
                 new(root, globalResource, MemorySharingScope.Chip, null, int.MaxValue, TargetMemoryAllocationSizePolicy.GranularityAligned, false, -1, true, true, false),
             ],
@@ -202,7 +213,7 @@ public static class NTTTargetMachineCatalog
     private static TargetMachineModel CreateH800Sxm80Gb()
         => CreatePersistentNvidiaGpu(
             H800Sxm80Gb,
-            computeUnits: 114,
+            computeUnits: 132,
             clockRateGHz: 1.755,
             globalCapacityBytes: 80L * 1024 * 1024 * 1024,
             chipGlobalBytesPerCycle: 1908,
@@ -251,7 +262,6 @@ public static class NTTTargetMachineCatalog
         var blockGlobal = new TargetMemorySpaceId("gpu.block-global");
         var root = new TargetMemorySpaceId("gpu.global");
         var globalSharedBytesPerCycle = Math.Min(chipGlobalBytesPerCycle, sharedBytesPerCycle);
-        var compilerManagedSharedBytes = GetCompilerManagedSharedAllocationLimit(sharedCapacityBytes);
         var asynchronousGlobalToShared = supportsCpAsync
             ? new TargetAsynchronousTransferSpec(
                 supportedStageCounts: [2],
@@ -272,14 +282,20 @@ public static class NTTTargetMachineCatalog
             new(25, 2200),
             [
                 new(GpuRegisterFile, TargetPrivateResourceUnit.Register32, 255L * 8 * 32, 8 * 32),
-                new(GpuBackendSharedMemory, TargetPrivateResourceUnit.Bytes, sharedCapacityBytes, 16, sharedResource),
+                new(
+                    GpuBackendSharedMemory,
+                    TargetPrivateResourceUnit.Bytes,
+                    sharedCapacityBytes,
+                    16,
+                    sharedResource,
+                    GpuBackendSharedBaselineBytes),
             ],
             [
                 new(sharedResource, TargetMemorySpaceKind.Shared, sharedCapacityBytes, sharedBytesPerCycle, sharedBytesPerCycle, 20, 16),
                 new(globalResource, TargetMemorySpaceKind.Global, globalCapacityBytes, chipGlobalBytesPerCycle, chipGlobalBytesPerCycle, 300, 128),
             ],
             [
-                new(shared, sharedResource, MemorySharingScope.Block, new(MemoryLocation.Shared), compilerManagedSharedBytes, TargetMemoryAllocationSizePolicy.PowerOfTwo, true, 0, true, true, true),
+                new(shared, sharedResource, MemorySharingScope.Block, new(MemoryLocation.Shared), sharedCapacityBytes, TargetMemoryAllocationSizePolicy.GranularityAligned, true, 0, true, true, true),
                 new(blockGlobal, globalResource, MemorySharingScope.Block, new(MemoryLocation.BlockLocalData), blockLocalWorkspaceBytes, TargetMemoryAllocationSizePolicy.GranularityAligned, true, 1, true, true, true),
                 new(root, globalResource, MemorySharingScope.Chip, null, globalCapacityBytes, TargetMemoryAllocationSizePolicy.GranularityAligned, false, -1, true, true, false),
             ],
@@ -296,19 +312,5 @@ public static class NTTTargetMachineCatalog
                     Asynchronous: asynchronousGlobalToShared),
                 new(shared, blockGlobal, globalSharedBytesPerCycle, 300, TargetMemoryTransferMode.ExplicitCopy),
             ]);
-    }
-
-    private static long GetCompilerManagedSharedAllocationLimit(long physicalCapacityBytes)
-    {
-        // Keep one third of physical shared memory available for backend-private
-        // state. GraphTiler separately constrains the compiler arena and every
-        // backed private resource against the full physical capacity.
-        var budget = checked((physicalCapacityBytes * 2) / 3);
-        if (budget <= 0)
-        {
-            throw new ArgumentOutOfRangeException(nameof(physicalCapacityBytes), physicalCapacityBytes, "Physical shared-memory capacity is too small.");
-        }
-
-        return checked((long)(1UL << System.Numerics.BitOperations.Log2((ulong)budget)));
     }
 }

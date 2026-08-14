@@ -589,6 +589,38 @@ public sealed record PyNTTNormApplyTemplateModel(
     public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
 }
 
+public sealed record PyNTTQKVRoPENormTemplateModel(
+    string FunctionName,
+    PyNTTBufferPointerTemplateModel Input,
+    PyNTTBufferPointerTemplateModel Scale,
+    PyNTTBufferPointerTemplateModel Bias,
+    string InputDType,
+    string ScaleDType,
+    string BiasDType,
+    string InputTritonDType,
+    string ScaleTritonDType,
+    string BiasTritonDType,
+    PyNTTDimExpression[] InputShape,
+    PyNTTDimExpression[] InputGlobalShape,
+    PyNTTDimExpression[] ScaleShape,
+    PyNTTDimExpression[] BiasShape,
+    PyNTTDimExpression[] InputStrides,
+    PyNTTDimExpression[] ScaleStrides,
+    PyNTTDimExpression[] BiasStrides,
+    int InputVectorLaneCount,
+    int ScaleVectorLaneCount,
+    int BiasVectorLaneCount,
+    int[] InputVectorLaneShape,
+    int[] ScaleVectorLaneShape,
+    int[] BiasVectorLaneShape,
+    int Axis,
+    float Epsilon,
+    bool UseMean,
+    string Comment)
+{
+    public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
+}
+
 public sealed record PyNTTGetPositionIdsTemplateModel(
     string FunctionName,
     PyNTTBufferPointerTemplateModel Output,
@@ -679,8 +711,8 @@ public sealed record PyNTTUpdatePagedAttentionKVCacheTemplateModel(
 
 public sealed record PyNTTQKVRoPEWithCacheTemplateModel(
     string FunctionName,
-    PyNTTNormApplyTemplateModel QNorm,
-    PyNTTNormApplyTemplateModel KNorm,
+    PyNTTQKVRoPENormTemplateModel QNorm,
+    PyNTTQKVRoPENormTemplateModel KNorm,
     PyNTTRoPETemplateModel QRoPE,
     PyNTTRoPETemplateModel KRoPE,
     PyNTTUpdatePagedAttentionKVCacheTemplateModel KUpdate,
@@ -735,6 +767,7 @@ public sealed record PyNTTPagedAttentionPartialTemplateModel(
     PyNTTBufferPointerTemplateModel MaxState,
     PyNTTBufferPointerTemplateModel SumState,
     PyNTTBufferPointerTemplateModel AccState,
+    PyNTTBufferPointerTemplateModel Output,
     string QueryDType,
     string QueryTritonDType,
     PyNTTDimExpression[] QueryShape,
@@ -759,6 +792,7 @@ public sealed record PyNTTPagedAttentionPartialTemplateModel(
     string LayerIdExpression,
     int SplitHierarchyAxis,
     int SplitCount,
+    long DirectContextThreshold,
     PyNTTMicroKernelTemplateModel MicroKernel,
     string? KeyDescriptorName,
     string? ValueDescriptorName,

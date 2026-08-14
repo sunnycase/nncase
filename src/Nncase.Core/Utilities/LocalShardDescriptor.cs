@@ -16,6 +16,13 @@ public sealed record LocalShardStageDescriptor(
     Dimension LinearShardIndex,
     int ShardCount)
 {
+    public bool IsContiguous => Stage.Distribution switch
+    {
+        ContiguousSplit => true,
+        BlockCyclicSplit blockCyclic => FitsWithinSingleBlock(LocalCapacity, blockCyclic.BlockSize),
+        _ => false,
+    };
+
     /// <summary>
     /// Maps a coordinate in this stage's local domain to its parent domain.
     /// </summary>
@@ -84,6 +91,13 @@ public sealed record LocalShardStageDescriptor(
            localCapacity.IsFixed &&
            parentExtent.FixedValue % shardCount == 0 &&
            parentExtent.FixedValue / shardCount == localCapacity.FixedValue;
+
+    private static bool FitsWithinSingleBlock(Dimension extent, long blockSize)
+        => extent.IsFixed
+            ? extent.FixedValue <= blockSize
+            : extent.Metadata.Range is { } range &&
+              double.IsFinite(range.Max) &&
+              range.Max <= blockSize;
 }
 
 /// <summary>
@@ -95,7 +109,7 @@ public sealed record LocalShardAxisDescriptor(
     Dimension ActiveExtent,
     IRArray<LocalShardStageDescriptor> Stages)
 {
-    public bool IsContiguous => Stages.All(stage => stage.Stage.Distribution is ContiguousSplit);
+    public bool IsContiguous => Stages.All(stage => stage.IsContiguous);
 
     /// <summary>
     /// Maps a dense local coordinate to the corresponding global tensor coordinate.

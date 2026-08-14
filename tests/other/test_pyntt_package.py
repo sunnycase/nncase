@@ -132,12 +132,62 @@ def test_pyntt_elementwise_iteration_uses_explicit_physical_tile_width():
     ).read_text(encoding="utf-8")
 
     assert "_physical_tile_width: tl.constexpr = block_size //" in template
+    assert "min(block_size // {{ ctx[\"lane_count\"] }}," in template
     assert "tl.arange(0, {{ scope }}_physical_tile_width)" in template
     assert "block_size >>" not in template
     assert "tl.broadcast_to" not in template
     assert "zero_coord" not in template
     assert "raw_coord" not in template
     assert "raw_lane_coord" not in template
+
+
+def test_pyntt_inline_norm_reduction_caps_its_physical_tile_to_the_extent():
+    _add_pyntt_to_path()
+    from pyntt.codegen.render import _norm_rope_template_context
+
+    norm = {
+        "InputShape": [1, 1, 16],
+        "InputGlobalShape": [1, 16, 16],
+        "InputStrides": [0, 16, 1],
+        "ScaleShape": [16],
+        "ScaleStrides": [1],
+        "BiasShape": [16],
+        "BiasStrides": [1],
+        "InputVectorLaneShape": [8],
+        "InputVectorLaneCount": 8,
+        "ScaleVectorLaneShape": [8],
+        "ScaleVectorLaneCount": 8,
+        "BiasVectorLaneShape": [8],
+        "BiasVectorLaneCount": 8,
+        "Axis": 2,
+        "Epsilon": 1e-6,
+        "UseMean": False,
+    }
+    rope = {
+        "InputShape": [1, 1, 16],
+        "CosShape": [1, 1, 8],
+        "SinShape": [1, 1, 8],
+        "OutputShape": [1, 1, 16],
+        "InputStrides": [0, 16, 1],
+        "CosStrides": [0, 0, 1],
+        "SinStrides": [0, 0, 1],
+        "OutputStrides": [0, 16, 1],
+        "InputVectorLaneShape": [8],
+        "CosVectorLaneShape": [2, 8],
+        "SinVectorLaneShape": [2, 8],
+        "OutputVectorLaneShape": [8],
+        "InputVectorLaneCount": 8,
+        "CosVectorLaneCount": 16,
+        "SinVectorLaneCount": 16,
+        "OutputVectorLaneCount": 8,
+        "SinCosVectorPackFactor": 2,
+        "RotaryAxis": 2,
+    }
+
+    context = _norm_rope_template_context(norm, rope, "test norm", "q")
+
+    assert context["reduction_context"]["physical_tile_width_cap"] == 16
+    assert context["reduction_context"]["major_variable"] == "q_reduce_major_raw"
 
 
 def test_pyntt_package_imports():
@@ -839,6 +889,23 @@ def test_pyntt_renderer_owns_block_schedule_config():
 
 
 @pytest.mark.parametrize(
+    ("block_k", "expected"),
+    ((256, False), (512, True), (1024, True)),
+)
+def test_pyntt_renderer_outlines_only_large_packed_gemv_stages(block_k, expected):
+    _add_pyntt_to_path()
+    from pyntt.codegen.render import _should_outline_packed_gemv_consumer_stage
+
+    assert (
+        _should_outline_packed_gemv_consumer_stage(
+            block_k=block_k,
+            reduction_group=32,
+        )
+        is expected
+    )
+
+
+@pytest.mark.parametrize(
     ("cache_block_size", "expected_block_n", "expected_candidates"),
     [(32, 32, (32,)), (256, 64, (32, 64))],
 )
@@ -895,6 +962,39 @@ def test_pyntt_paged_attention_direct_tile_cannot_span_cache_pages():
 
     with pytest.raises(ValueError, match="requires a transfer pipeline"):
         _paged_attention_tile_geometry(64, 32, allow_cross_page=False)
+
+
+@pytest.mark.parametrize(
+    "template_name",
+    (
+        "simt_direct.py.jinja",
+        "mma_direct.py.jinja",
+        "simt_tma_smem_pipeline.py.jinja",
+        "mma_tma_smem_pipeline.py.jinja",
+    ),
+)
+def test_pyntt_paged_attention_narrows_bounded_split_indices(template_name):
+    template = (
+        Path(__file__).parents[2]
+        / "pyntt/pyntt/codegen/templates/triton/kernels/paged_attention"
+        / template_name
+    ).read_text(encoding="utf-8")
+    lines = tuple(line.strip() for line in template.splitlines())
+    split_begin_lines = tuple(
+        line for line in lines if line.startswith("split_begin =")
+    )
+    split_end_lines = tuple(
+        line for line in lines if line.startswith("split_end =")
+    )
+    causal_end_lines = tuple(
+        line for line in lines if line.startswith("causal_end =")
+    )
+
+    assert split_begin_lines
+    assert len(split_begin_lines) == len(split_end_lines)
+    assert all(line.endswith(".to(tl.int32)") for line in split_begin_lines)
+    assert all(line.endswith(".to(tl.int32)") for line in split_end_lines)
+    assert all(line.endswith(".to(tl.int32)") for line in causal_end_lines)
 
 
 def test_pyntt_qkv_transfer_plan_uses_exact_projection_copy_extents():
@@ -1167,6 +1267,38 @@ def test_pyntt_renderer_passes_nested_device_arguments_directly():
     assert "parent(data)" in source
     assert "child(parent_ptr)" in source
     assert "pyntt_call_frame" not in source
+
+
+def test_pyntt_renderer_rematerializes_nested_device_helper_indices(monkeypatch):
+    _add_pyntt_to_path()
+    import pyntt.codegen.render as render
+
+    captured = {}
+
+    def capture_helper_options(*args, **kwargs):
+        captured.update(kwargs)
+        return []
+
+    monkeypatch.setattr(render, "_render_helper_sources", capture_helper_options)
+    device_function = _device_function("child", "pass")
+    device_function["direct_parameters"] = []
+    device_function["direct_extra_parameter_declarations"] = []
+    render._render_device_function(
+        render._make_env(),
+        device_function,
+        {},
+        8,
+        32,
+        1,
+        24,
+        8,
+        255,
+        {},
+        (),
+        rematerialize_entry_indices=True,
+    )
+
+    assert captured["rematerialize_entry_indices"] is True
 
 
 def test_pyntt_renderer_propagates_only_live_canonical_device_parameters():

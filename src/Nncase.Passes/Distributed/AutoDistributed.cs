@@ -3499,7 +3499,7 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
             return Array.Empty<string>();
         }
 
-        return text.Split([';', ',', '|'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        return text.Split(new[] { ';', ',', '|' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
     }
 
     private bool ShouldDumpSelectedTree()

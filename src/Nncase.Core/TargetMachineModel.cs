@@ -136,7 +136,8 @@ public sealed record TargetPrivateResourceSpec
         TargetPrivateResourceUnit unit,
         long capacityUnits,
         int allocationGranularityUnits = 1,
-        TargetMemoryResourceId? backingMemoryResource = null)
+        TargetMemoryResourceId? backingMemoryResource = null,
+        long baselineUsageUnits = 0)
     {
         if (string.IsNullOrWhiteSpace(id.Value))
         {
@@ -158,11 +159,27 @@ public sealed record TargetPrivateResourceSpec
             throw new ArgumentException("A target-private resource backed by a memory resource must use byte units.", nameof(unit));
         }
 
+        if (baselineUsageUnits < 0 || baselineUsageUnits > capacityUnits)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(baselineUsageUnits),
+                baselineUsageUnits,
+                "Target-private baseline usage must be between zero and the resource capacity.");
+        }
+
+        if (baselineUsageUnits % allocationGranularityUnits != 0)
+        {
+            throw new ArgumentException(
+                "Target-private baseline usage must satisfy the resource allocation granularity.",
+                nameof(baselineUsageUnits));
+        }
+
         Id = id;
         Unit = unit;
         CapacityUnits = capacityUnits;
         AllocationGranularityUnits = allocationGranularityUnits;
         BackingMemoryResource = backingMemoryResource;
+        BaselineUsageUnits = baselineUsageUnits;
     }
 
     public TargetPrivateResourceId Id { get; }
@@ -174,6 +191,15 @@ public sealed record TargetPrivateResourceSpec
     public int AllocationGranularityUnits { get; }
 
     public TargetMemoryResourceId? BackingMemoryResource { get; }
+
+    /// <summary>
+    /// Gets the units consumed in every block before microkernel-specific resource
+    /// usage. For a memory-backed resource this reserves capacity for fixed
+    /// lowering-owned state that is not represented by microkernel resources.
+    /// </summary>
+    public long BaselineUsageUnits { get; }
+
+    public long AvailableCapacityUnits => CapacityUnits - BaselineUsageUnits;
 }
 
 /// <summary>
@@ -602,6 +628,22 @@ public sealed class TargetMachineModel
             }
         }
 
+        foreach (var group in privateResourceArray
+                     .Where(resource => resource.BackingMemoryResource is not null)
+                     .GroupBy(resource => resource.BackingMemoryResource!.Value))
+        {
+            var baselineUsageBytes = group.Aggregate(
+                0L,
+                (total, resource) => checked(total + resource.BaselineUsageUnits));
+            if (baselineUsageBytes >= _memoryResources[group.Key].CapacityBytes)
+            {
+                throw new ArgumentException(
+                    $"Target-private baseline usage {baselineUsageBytes} for memory resource {group.Key} " +
+                    $"must be smaller than its capacity {_memoryResources[group.Key].CapacityBytes}.",
+                    nameof(privateResources));
+            }
+        }
+
         var memorySpaceArray = memorySpaces.ToImmutableArray();
         if (memorySpaceArray.IsDefaultOrEmpty)
         {
@@ -822,15 +864,28 @@ public sealed class TargetMachineModel
 
     public long GetMaximumUsableAllocationBytes(TargetMemorySpaceSpec space)
     {
-        var granularity = GetMemoryResource(space).AllocationGranularityBytes;
+        var resource = GetMemoryResource(space);
+        var baselineUsageBytes = GetBaselinePrivateResourceUsageBytes(resource.Id);
+        var maximumBytes = Math.Min(
+            space.MaxAllocationBytesPerScope,
+            checked(resource.CapacityBytes - baselineUsageBytes));
+        var granularity = resource.AllocationGranularityBytes;
         return space.AllocationSizePolicy switch
         {
             TargetMemoryAllocationSizePolicy.GranularityAligned =>
-                (space.MaxAllocationBytesPerScope / granularity) * granularity,
+                (maximumBytes / granularity) * granularity,
             TargetMemoryAllocationSizePolicy.PowerOfTwo =>
-                checked((long)(1UL << System.Numerics.BitOperations.Log2((ulong)space.MaxAllocationBytesPerScope))),
+                checked((long)(1UL << System.Numerics.BitOperations.Log2((ulong)maximumBytes))),
             _ => throw new ArgumentOutOfRangeException(nameof(space), space.AllocationSizePolicy, "Unknown memory allocation size policy."),
         };
+    }
+
+    public long GetBaselinePrivateResourceUsageBytes(TargetMemoryResourceId memoryResource)
+    {
+        _ = GetMemoryResource(memoryResource);
+        return _privateResources.Values
+            .Where(resource => resource.BackingMemoryResource == memoryResource)
+            .Aggregate(0L, (total, resource) => checked(total + resource.BaselineUsageUnits));
     }
 
     private static long AlignUp(long value, long alignment)

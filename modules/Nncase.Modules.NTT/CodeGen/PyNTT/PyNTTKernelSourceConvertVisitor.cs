@@ -2959,7 +2959,55 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
 
         private void VisitInternalTensorLoad(TIR.Buffer dest, TIR.Buffer src)
         {
+            if (ShouldMapTensorLoadThroughDestinationShard(src, dest))
+            {
+                VisitShardedTensorLoad(dest, src);
+                return;
+            }
+
             VisitInternalTensorCopy(src, dest, "TensorLoad");
+        }
+
+        private bool ShouldMapTensorLoadThroughDestinationShard(TIR.Buffer src, TIR.Buffer dest)
+            => (IsFormalTensorBuffer(src) || src.MemSpan.Buffer.Location == MemoryLocation.Input) &&
+               (src.DistributedType is null || src.DistributedType.AxisPolicies.All(policy => policy is SBPBroadCast)) &&
+               dest.DistributedType is not null &&
+               dest.DistributedStorageKind == DistributedBufferStorageKind.CompactLocal &&
+               dest.DistributedType.AxisPolicies.Any(policy => policy is SBPSplit) &&
+               GetBufferGlobalOffsets(src).All(offset => EquivalentDim(offset, PyNTTDimExpression.Zero));
+
+        private void VisitShardedTensorLoad(TIR.Buffer dest, TIR.Buffer src)
+        {
+            const string operation = "TensorLoad";
+            ValidateMatchingBufferDType($"PyNTT {operation} buffer source/destination", src, dest);
+            var globalShape = GetBufferGlobalShape(src);
+            ValidateSameShape(
+                $"PyNTT {operation} global shape",
+                globalShape,
+                GetBufferGlobalShape(dest));
+            var helperName = GetNextHelperName("tensor_load");
+            var model = new PyNTTTensorLoadTemplateModel(
+                helperName,
+                src.Name,
+                0,
+                GetBufferPointer(dest),
+                GetPyNTTDTypeName(dest.ElemType),
+                GetTritonDType(dest.ElemType),
+                GetBufferShape(dest),
+                GetBufferStrides(dest),
+                globalShape,
+                GetBufferGlobalOffsets(dest),
+                GetHierarchy(dest),
+                GetBufferShardAxes(dest, globalShape.Length),
+                GetVectorLaneElementCount(dest.ElemType),
+                GetVectorLanes(dest.ElemType),
+                $"{operation}: {src.Name} -> {dest.Name}")
+            {
+                Source = GetBufferPointer(src),
+                SourceStrides = GetBufferStrides(src),
+            };
+            WriteHelperTemplate("triton/kernels/TensorLoad.py.jinja", model);
+            WriteHelperInvocation(helperName);
         }
 
         private void VisitInternalTensorStore(TIR.Buffer src, TIR.Buffer dest)
@@ -4546,7 +4594,10 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 }
             }
 
-            SetBufferLayoutMetadata(output, outputOffsets, GetBufferSourceShardAxes(input, input.Rank));
+            SetBufferLayoutMetadata(
+                output,
+                outputOffsets,
+                ScaleLayoutShardAxes(GetBufferSourceShardAxes(input, input.Rank), axes, lanes, packing: true));
         }
 
         private void PropagateUnpackLayoutMetadata(TIR.Buffer input, TIR.Buffer output, IReadOnlyList<int> axes, IReadOnlyList<int> lanes)
@@ -4562,8 +4613,54 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 }
             }
 
-            SetBufferLayoutMetadata(output, outputOffsets, GetBufferSourceShardAxes(input, input.Rank));
+            SetBufferLayoutMetadata(
+                output,
+                outputOffsets,
+                ScaleLayoutShardAxes(GetBufferSourceShardAxes(input, input.Rank), axes, lanes, packing: false));
         }
+
+        private PyNTTShardAxisTemplateModel[] ScaleLayoutShardAxes(
+            IReadOnlyList<PyNTTShardAxisTemplateModel> shardAxes,
+            IReadOnlyList<int> axes,
+            IReadOnlyList<int> lanes,
+            bool packing)
+            => shardAxes.Select((shardAxis, axis) =>
+            {
+                var laneProduct = GetLayoutAxisLaneProduct(axes, lanes, axis);
+                return new PyNTTShardAxisTemplateModel(shardAxis.Stages.Select(stage =>
+                {
+                    var hierarchyAxes = stage.HierarchyAxes.ToArray();
+                    if (laneProduct <= 1)
+                    {
+                        return stage with { HierarchyAxes = hierarchyAxes };
+                    }
+
+                    return stage.Distribution switch
+                    {
+                        "Contiguous" => stage with
+                        {
+                            HierarchyAxes = hierarchyAxes,
+                            Granularity = stage.Granularity is null
+                                ? null
+                                : packing
+                                    ? FloorDivDim(stage.Granularity, laneProduct)
+                                    : MultiplyDim(stage.Granularity, laneProduct),
+                        },
+                        "BlockCyclic" when packing && stage.BlockSize % laneProduct != 0 =>
+                            throw new NotSupportedException(
+                                $"PyNTT Pack source block-cyclic size {stage.BlockSize} cuts vector lane group {laneProduct}."),
+                        "BlockCyclic" => stage with
+                        {
+                            HierarchyAxes = hierarchyAxes,
+                            BlockSize = packing
+                                ? stage.BlockSize / laneProduct
+                                : checked(stage.BlockSize * laneProduct),
+                        },
+                        _ => throw new NotSupportedException(
+                            $"PyNTT layout metadata does not support split distribution {stage.Distribution}."),
+                    };
+                }).ToArray());
+            }).ToArray();
 
         private void PropagateTransposeLayoutMetadata(TIR.Buffer input, TIR.Buffer output, IReadOnlyList<int> perm)
         {
@@ -6618,42 +6715,40 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
 
         private void VisitQKVRoPEWithCache(Nncase.TIR.NTT.QKVRoPEWithCache fused, IReadOnlyList<BaseExpr> args)
         {
-            if (args.Count < 14)
+            if (args.Count < 12)
             {
                 throw new NotSupportedException(
-                    "PyNTT QKVRoPEWithCache codegen expects Q/K/V, Q/K stats, Q/K scale/bias, cos/sin, kv-cache, layer id, and Q output operands.");
+                    "PyNTT QKVRoPEWithCache codegen expects Q/K/V, Q/K scale/bias, cos/sin, kv-cache, layer id, and Q output operands.");
             }
 
             var q = GetBufferOperand(args[0], "PyNTT QKVRoPEWithCache Q");
             var k = GetBufferOperand(args[1], "PyNTT QKVRoPEWithCache K");
             var v = GetBufferOperand(args[2], "PyNTT QKVRoPEWithCache V");
-            var qStats = GetBufferOperand(args[3], "PyNTT QKVRoPEWithCache Q stats");
-            var kStats = GetBufferOperand(args[4], "PyNTT QKVRoPEWithCache K stats");
-            var qScale = GetBufferOperand(args[5], "PyNTT QKVRoPEWithCache Q scale");
-            var kScale = GetBufferOperand(args[6], "PyNTT QKVRoPEWithCache K scale");
-            var qBias = GetBufferOperand(args[7], "PyNTT QKVRoPEWithCache Q bias");
-            var kBias = GetBufferOperand(args[8], "PyNTT QKVRoPEWithCache K bias");
-            var cos = GetBufferOperand(args[9], "PyNTT QKVRoPEWithCache cos");
-            var sin = GetBufferOperand(args[10], "PyNTT QKVRoPEWithCache sin");
-            var qOutput = GetBufferOperand(args[13], "PyNTT QKVRoPEWithCache Q output");
+            var qScale = GetBufferOperand(args[3], "PyNTT QKVRoPEWithCache Q scale");
+            var kScale = GetBufferOperand(args[4], "PyNTT QKVRoPEWithCache K scale");
+            var qBias = GetBufferOperand(args[5], "PyNTT QKVRoPEWithCache Q bias");
+            var kBias = GetBufferOperand(args[6], "PyNTT QKVRoPEWithCache K bias");
+            var cos = GetBufferOperand(args[7], "PyNTT QKVRoPEWithCache cos");
+            var sin = GetBufferOperand(args[8], "PyNTT QKVRoPEWithCache sin");
+            var qOutput = GetBufferOperand(args[11], "PyNTT QKVRoPEWithCache Q output");
             var helperName = GetNextHelperName("qkv_rope_with_cache");
-            var qNorm = BuildNormApplyTemplateModel(
+            var qNorm = BuildQKVRoPENormTemplateModel(
                 $"{helperName}_q_norm",
-                new Nncase.TIR.NTT.NormApply(fused.QAxis, fused.QEpsilon, fused.QUseMean),
                 q,
-                qStats,
                 qScale,
                 qBias,
-                q,
+                fused.QAxis,
+                fused.QEpsilon,
+                fused.QUseMean,
                 "PyNTT QKVRoPEWithCache Q NormApply");
-            var kNorm = BuildNormApplyTemplateModel(
+            var kNorm = BuildQKVRoPENormTemplateModel(
                 $"{helperName}_k_norm",
-                new Nncase.TIR.NTT.NormApply(fused.KAxis, fused.KEpsilon, fused.KUseMean),
                 k,
-                kStats,
                 kScale,
                 kBias,
-                k,
+                fused.KAxis,
+                fused.KEpsilon,
+                fused.KUseMean,
                 "PyNTT QKVRoPEWithCache K NormApply");
             var qRoPE = BuildRoPETemplateModel(
                 $"{helperName}_q_rope",
@@ -6673,15 +6768,15 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 $"{helperName}_k_update",
                 new Nncase.TIR.NTT.UpdatePagedAttentionKVCache(AttentionCacheKind.Key, fused.QKVLayout),
                 k,
-                args[11],
-                args[12],
+                args[9],
+                args[10],
                 "PyNTT QKVRoPEWithCache K update");
             var (vUpdate, vLeadingArguments) = BuildUpdatePagedAttentionKVCacheTemplateModel(
                 $"{helperName}_v_update",
                 new Nncase.TIR.NTT.UpdatePagedAttentionKVCache(AttentionCacheKind.Value, fused.QKVLayout),
                 v,
-                args[11],
-                args[12],
+                args[9],
+                args[10],
                 "PyNTT QKVRoPEWithCache V update");
             if (!kLeadingArguments.SequenceEqual(vLeadingArguments, StringComparer.Ordinal))
             {
@@ -6717,6 +6812,70 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             WriteHelperTemplate("triton/kernels/QKVRoPEWithCache.py.jinja", templateModel);
             WriteLine(BuildHelperCall(helperName, kLeadingArguments));
             MarkStoredOutput(qOutput, "PyNTT QKVRoPEWithCache");
+        }
+
+        private PyNTTQKVRoPENormTemplateModel BuildQKVRoPENormTemplateModel(
+            string helperName,
+            TIR.Buffer input,
+            TIR.Buffer scale,
+            TIR.Buffer bias,
+            int axis,
+            float epsilon,
+            bool useMean,
+            string context)
+        {
+            var inputShape = GetBufferActiveShape(input);
+            var inputGlobalShape = GetBufferGlobalShape(input);
+            var scaleShape = GetBufferActiveShape(scale);
+            var biasShape = GetBufferActiveShape(bias);
+            var normalizedAxis = NormalizeAxis(axis, inputShape.Length, context);
+            var inputVectorLaneCount = GetSingleVectorLaneCount(input.ElemType, $"{context} input");
+            var scaleVectorLaneCount = GetSingleVectorLaneCount(scale.ElemType, $"{context} scale");
+            var biasVectorLaneCount = GetSingleVectorLaneCount(bias.ElemType, $"{context} bias");
+            if (new[] { inputVectorLaneCount, scaleVectorLaneCount, biasVectorLaneCount }.Distinct().Count() != 1)
+            {
+                throw new NotSupportedException(
+                    $"{context} expects matching input/scale/bias vector lanes, got input={inputVectorLaneCount}, scale={scaleVectorLaneCount}, bias={biasVectorLaneCount}.");
+            }
+
+            if (inputVectorLaneCount != 1 && normalizedAxis > inputShape.Length - 1)
+            {
+                throw new NotSupportedException($"{context} vectorized axis must be inside the normalized dimensions.");
+            }
+
+            var logicalInputShape = GetLogicalVectorShape(inputShape, inputVectorLaneCount);
+            var logicalScaleShape = GetLogicalVectorShape(scaleShape, scaleVectorLaneCount);
+            var logicalBiasShape = GetLogicalVectorShape(biasShape, biasVectorLaneCount);
+            ValidateLayerNormShape($"{context} scale", logicalScaleShape, logicalInputShape, normalizedAxis);
+            ValidateLayerNormShape($"{context} bias", logicalBiasShape, logicalInputShape, normalizedAxis);
+            return new PyNTTQKVRoPENormTemplateModel(
+                helperName,
+                GetBufferScalarPointer(input),
+                GetBufferScalarPointer(scale),
+                GetBufferScalarPointer(bias),
+                GetPyNTTScalarDTypeName(input.ElemType),
+                GetPyNTTScalarDTypeName(scale.ElemType),
+                GetPyNTTScalarDTypeName(bias.ElemType),
+                GetScalarTritonDType(input.ElemType),
+                GetScalarTritonDType(scale.ElemType),
+                GetScalarTritonDType(bias.ElemType),
+                inputShape,
+                inputGlobalShape,
+                scaleShape,
+                biasShape,
+                GetBufferStrides(input),
+                GetBufferStrides(scale),
+                GetBufferStrides(bias),
+                inputVectorLaneCount,
+                scaleVectorLaneCount,
+                biasVectorLaneCount,
+                GetVectorLanes(input.ElemType),
+                GetVectorLanes(scale.ElemType),
+                GetVectorLanes(bias.ElemType),
+                normalizedAxis,
+                epsilon,
+                useMean,
+                context);
         }
 
         private void VisitPagedAttention(Nncase.TIR.NTT.PagedAttention pagedAttention, IReadOnlyList<BaseExpr> args)
@@ -6796,16 +6955,17 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             IReadOnlyList<BaseExpr> args,
             PyNTTMicroKernelTemplateModel microKernel)
         {
-            if (args.Count < 8 ||
+            if (args.Count < 9 ||
                 args[0] is not TIR.Buffer query ||
                 args[2] is not TIR.Buffer ||
                 args[3] is not TIR.Buffer scale ||
                 args[5] is not TIR.Buffer maxState ||
                 args[6] is not TIR.Buffer sumState ||
-                args[7] is not TIR.Buffer accState)
+                args[7] is not TIR.Buffer accState ||
+                args[8] is not TIR.Buffer output)
             {
                 throw new NotSupportedException(
-                    "PyNTT PagedAttentionPartial codegen expects query, kv-cache, extra, scale, layer id, and three state buffers.");
+                    "PyNTT PagedAttentionPartial codegen expects query, kv-cache, extra, scale, layer id, three state buffers, and the adaptive direct output.");
             }
 
             if (maxState.ElemType != DataTypes.Float32 ||
@@ -6882,6 +7042,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             _attrs["hidden_size"] = pagedAttention.HiddenSize;
             _attrs["split_hierarchy_axis"] = pagedAttention.SplitHierarchyAxis;
             _attrs["split_count"] = pagedAttention.SplitCount;
+            _attrs["direct_context_threshold"] = pagedAttention.DirectContextThreshold;
             var queryShape = GetBufferShape(query);
             var queryGlobalShape = GetBufferGlobalShape(query);
             var queryStrides = GetBufferStrides(query);
@@ -6893,16 +7054,17 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     GetBufferScalarPointer(maxState),
                     GetBufferScalarPointer(sumState),
                     GetBufferScalarPointer(accState),
+                    GetBufferScalarPointer(output),
                     GetPyNTTScalarDTypeName(query.ElemType),
                     GetScalarTritonDType(query.ElemType),
                     queryShape,
                     queryStrides,
                     queryVectorLanes,
-                    queryShape,
-                    queryGlobalShape,
-                    queryStrides,
-                    queryVectorLanes,
-                    querySplitAxes,
+                    GetBufferShape(output),
+                    GetBufferGlobalShape(output),
+                    GetBufferStrides(output),
+                    GetVectorLanes(output.ElemType),
+                    GetBufferShardAxes(output, output.Dimensions.Length),
                     GetBufferShape(maxState),
                     GetBufferStrides(maxState),
                     GetBufferShape(sumState),
@@ -6917,21 +7079,23 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     layerIdExpression,
                     pagedAttention.SplitHierarchyAxis,
                     pagedAttention.SplitCount,
+                    pagedAttention.DirectContextThreshold,
                     microKernel,
                     keyDescriptor?.Name,
                     valueDescriptor?.Name,
                     blockTableArgument,
-                    usesHostCacheDescriptors ? null : storageArgument,
+                    storageArgument,
                     storageBlocksArgument,
                     queryStartLocArgument,
                     seqLensArgument,
                     numSeqsArgument,
                     cache,
-                    $"{query.Name}, kv-cache -> {maxState.Name}, {sumState.Name}, {accState.Name}");
+                    $"{query.Name}, kv-cache -> {maxState.Name}, {sumState.Name}, {accState.Name} or {output.Name}");
             WriteSelectedMicroKernelHelper(
                 microKernel,
                 templateModel,
                 helperName);
+            MarkStoredOutput(output, "PyNTT adaptive PagedAttentionPartial");
         }
 
         private void VisitPagedAttentionMerge(
@@ -9593,6 +9757,8 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                         $"({BuildScalarExpression(args[0])}).to({GetScalarTritonDType(cast.NewType)})",
                     LocalShardDim when args.Length == 1 =>
                         _dimEmitter.Emit(call.AsDim()).TritonExpression,
+                    Nncase.TIR.NTT.PagedAttentionUseSplitKV condition when args.Length == 1 =>
+                        BuildPagedAttentionUseSplitKV(condition, args[0]),
                     Nncase.IR.Math.Compare compare when args.Length >= 2 =>
                         $"({BuildScalarExpression(args[0])} {GetCompareOperator(compare.CompareOp)} {BuildScalarExpression(args[1])})",
                     Nncase.IR.Math.Binary binary when args.Length >= 2 =>
@@ -9602,6 +9768,21 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             }
 
             throw new NotSupportedException($"Unsupported PyNTT scalar expression: {expr.GetType().Name}.");
+        }
+
+        private string BuildPagedAttentionUseSplitKV(
+            Nncase.TIR.NTT.PagedAttentionUseSplitKV condition,
+            BaseExpr kvCaches)
+        {
+            if (condition.DirectContextThreshold <= 0)
+            {
+                throw new InvalidOperationException(
+                    "PyNTT adaptive PagedAttention requires a positive direct-context threshold.");
+            }
+
+            var numSeqs = GetKVCacheFieldArgument(kvCaches, "num_seqs");
+            var seqLens = GetKVCacheFieldArgument(kvCaches, "seq_lens");
+            return $"(({numSeqs} != 1) | (tl.load({seqLens}) > {condition.DirectContextThreshold.ToString(CultureInfo.InvariantCulture)}))";
         }
 
         private string GetScalarBoolExpression(BaseExpr expr, string name)

@@ -18,6 +18,17 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
     private const int NvidiaNvmmaSharedAlignmentBytes = 1024;
     private const int SimtPagedAttentionMaximumBlockN = 128;
     private const int MmaPagedAttentionMaximumBlockN = 64;
+    private const int PackedGemvMinimumBlockN = 8;
+    private const int PackedGemvMaximumBlockN = 64;
+    private const int SimtPagedAttentionNumStages = 1;
+    private const int MmaPagedAttentionNumStages = 2;
+    private const int PackedGemvMinimumBlockK = 128;
+
+    // The SIMT stage helper statically expands one 32-element reduction group.
+    // Keep a stage within 32 groups; larger bodies delay first-tile consumption
+    // and underutilize the asynchronous double buffer despite fitting in Shared.
+    private const int PackedGemvMaximumBlockK = 1024;
+    private const int PackedGemvMinimumLogicalStages = 2;
 
     public TIRMicroKernelSelection? Select(TIRMicroKernelSelectionContext context)
     {
@@ -68,42 +79,32 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
         TIRMicroKernelSelectionContext context,
         Nncase.TIR.NTT.PagedAttentionPartial pagedAttention)
     {
-        const int numStages = 1;
         var config = GetPagedAttentionConfig(context, 1);
-        var useDecodeGqaSimt = CanUsePagedAttentionDecodeGqaSimt(
+        var candidate = SelectPagedAttentionMicroKernelCandidate(
             context,
             pagedAttention,
             config);
-        var maximumBlockN = useDecodeGqaSimt
-            ? SimtPagedAttentionMaximumBlockN
-            : MmaPagedAttentionMaximumBlockN;
-        var tmaBlockN = SelectPagedAttentionTmaBlockN(
-            context.Machine,
+        var parameters = CreatePagedAttentionParameters(
             config,
-            numStages,
-            maximumBlockN);
-        if (tmaBlockN is null)
+            candidate.BlockN,
+            candidate.NumStages);
+        if (!candidate.UsesTma)
         {
-            var blockN = SelectPagedAttentionPageLocalBlockN(config.BlockSize);
             return new(
                 "triton.paged_attention_partial",
-                useDecodeGqaSimt ? "simt_direct" : "mma_direct",
-                CreatePagedAttentionParameters(config, blockN, numStages),
+                candidate.Variant,
+                parameters,
                 ImmutableArray<TIRSharedWorkspaceDescriptor>.Empty,
                 TransferPipeline: null);
         }
 
-        var selectedBlockN = tmaBlockN.Value;
         var stageType = new TensorType(
             config.KVPrimType,
-            new RankedShape(new[] { numStages, 1, 1, selectedBlockN, 1, config.HeadDim }));
-        var variant = useDecodeGqaSimt
-            ? "simt_tma_smem_pipeline"
-            : "mma_tma_smem_pipeline";
+            new RankedShape(new[] { candidate.NumStages, 1, 1, candidate.BlockN, 1, config.HeadDim }));
         return new(
             "triton.paged_attention_partial",
-            variant,
-            CreatePagedAttentionParameters(config, selectedBlockN, numStages),
+            candidate.Variant,
+            parameters,
             ImmutableArray.Create(
                 new TIRSharedWorkspaceDescriptor(
                     "key_stage",
@@ -118,6 +119,83 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
                 new TIRTransferPipelineChannel("key", [1], [0]),
                 new TIRTransferPipelineChannel("value", [1], [1]),
             ]));
+    }
+
+    private static PagedAttentionMicroKernelCandidate SelectPagedAttentionMicroKernelCandidate(
+        TIRMicroKernelSelectionContext context,
+        Nncase.TIR.NTT.PagedAttentionPartial pagedAttention,
+        IR.NN.IPagedAttentionConfig config)
+    {
+        var mma = CreatePagedAttentionMicroKernelCandidate(
+            context.Machine,
+            config,
+            useSimt: false);
+        if (!TryGetPagedAttentionDecodeGqaSimtGroupTile(
+                context,
+                pagedAttention,
+                config,
+                out var groupTile))
+        {
+            return mma;
+        }
+
+        var simt = CreatePagedAttentionMicroKernelCandidate(
+            context.Machine,
+            config,
+            useSimt: true);
+        var query = GetBuffer(context, 0, "query");
+        var mmaCyclesPerTile = EstimatePagedAttentionMmaCyclesPerTile(
+            context.Machine,
+            query.ElemType,
+            config.KVPrimType,
+            groupTile,
+            mma.BlockN,
+            config.HeadDim);
+        if (!double.IsFinite(mmaCyclesPerTile))
+        {
+            return simt;
+        }
+
+        // Compare equal logical KV spans. The transfer volume and softmax work
+        // are then equal; this isolates the target-dependent QK/PV arithmetic
+        // and reduction cost that differs between the two implementations.
+        var comparisonSpan = LeastCommonMultiple(simt.BlockN, mma.BlockN);
+        var simtCycles = EstimatePagedAttentionSimtCyclesPerTile(
+                context.Machine,
+                groupTile,
+                simt.BlockN,
+                config.HeadDim) *
+            (comparisonSpan / simt.BlockN);
+        var mmaCycles = mmaCyclesPerTile * (comparisonSpan / mma.BlockN);
+        return simtCycles < mmaCycles ? simt : mma;
+    }
+
+    private static PagedAttentionMicroKernelCandidate CreatePagedAttentionMicroKernelCandidate(
+        TargetMachineModel machine,
+        IR.NN.IPagedAttentionConfig config,
+        bool useSimt)
+    {
+        var numStages = useSimt
+            ? SimtPagedAttentionNumStages
+            : MmaPagedAttentionNumStages;
+        var maximumBlockN = useSimt
+            ? SimtPagedAttentionMaximumBlockN
+            : MmaPagedAttentionMaximumBlockN;
+        var tmaBlockN = SelectPagedAttentionTmaBlockN(
+            machine,
+            config,
+            numStages,
+            maximumBlockN);
+        var usesTma = tmaBlockN is not null;
+        var blockN = tmaBlockN ?? SelectPagedAttentionPageLocalBlockN(config.BlockSize);
+        var variant = (useSimt, usesTma) switch
+        {
+            (true, true) => "simt_tma_smem_pipeline",
+            (true, false) => "simt_direct",
+            (false, true) => "mma_tma_smem_pipeline",
+            (false, false) => "mma_direct",
+        };
+        return new(variant, blockN, numStages, usesTma);
     }
 
     private static ImmutableDictionary<string, long> CreatePagedAttentionParameters(
@@ -193,11 +271,13 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
     private static bool CanPartitionPagedAttentionTile(int pageSize, int blockN)
         => pageSize % blockN == 0 || blockN % pageSize == 0;
 
-    private static bool CanUsePagedAttentionDecodeGqaSimt(
+    private static bool TryGetPagedAttentionDecodeGqaSimtGroupTile(
         TIRMicroKernelSelectionContext context,
         Nncase.TIR.NTT.PagedAttentionPartial pagedAttention,
-        IR.NN.IPagedAttentionConfig config)
+        IR.NN.IPagedAttentionConfig config,
+        out int groupTile)
     {
+        groupTile = 0;
         var query = GetBuffer(context, 0, "query");
         var layout = pagedAttention.Layout.ToArray();
         var seqAxis = Array.IndexOf(layout, IR.NN.AttentionDimKind.Seq);
@@ -236,14 +316,100 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
             return false;
         }
 
-        var groupTile = 1;
+        groupTile = 1;
         while (groupTile < groupSize)
         {
-            groupTile *= 2;
+            groupTile = checked(groupTile * 2);
         }
 
-        const int consumerWarps = 8;
+        var consumerWarps = context.Machine.Execution.WorkersPerBlock;
         return groupTile <= consumerWarps && consumerWarps % groupTile == 0;
+    }
+
+    private static double EstimatePagedAttentionSimtCyclesPerTile(
+        TargetMachineModel machine,
+        int groupTile,
+        int blockN,
+        int headDim)
+    {
+        var fmaCount = checked(2L * groupTile * blockN * headDim);
+        var fmaCycles = fmaCount / Math.Max(1.0, machine.Compute.SimtFmaPerCycle);
+
+        // QK reduces headDim values for each score and PV reduces blockN
+        // probabilities for each output. Triton maps each reduction to a
+        // power-of-two lane tree in the explicit SIMT product layout.
+        var reductionSteps = Math.Ceiling(
+            Math.Log2(Math.Max(2, machine.Execution.WorkerWidth)));
+        var reductionOutputs = checked((long)groupTile * (blockN + headDim));
+        var reductionCycles = reductionOutputs * reductionSteps /
+            Math.Max(1.0, machine.Compute.ElementwiseElementsPerCycle);
+        return fmaCycles + reductionCycles;
+    }
+
+    private static double EstimatePagedAttentionMmaCyclesPerTile(
+        TargetMachineModel machine,
+        DataType queryType,
+        DataType kvType,
+        int groupTile,
+        int blockN,
+        int headDim)
+    {
+        var candidates = machine.Compute.MatrixPrimitives
+            .Where(primitive => primitive.Supports(queryType, kvType))
+            .Select(primitive =>
+                EstimatePagedAttentionMatrixCycles(
+                    machine,
+                    primitive,
+                    groupTile,
+                    blockN,
+                    headDim) +
+                EstimatePagedAttentionMatrixCycles(
+                    machine,
+                    primitive,
+                    groupTile,
+                    headDim,
+                    blockN))
+            .ToArray();
+        return candidates.Length == 0
+            ? double.PositiveInfinity
+            : candidates.Min();
+    }
+
+    private static double EstimatePagedAttentionMatrixCycles(
+        TargetMachineModel machine,
+        MatrixComputePrimitiveSpec primitive,
+        int m,
+        int n,
+        int k)
+    {
+        var accumulatorChains = checked(
+            (double)DivideRoundUp(m, primitive.M) *
+            DivideRoundUp(n, primitive.N));
+        var dependentInstructions = DivideRoundUp(k, primitive.K);
+        return MatrixComputeCostModel.EstimateCycles(
+            primitive,
+            accumulatorChains,
+            dependentInstructions,
+            machine.Execution);
+    }
+
+    private static int LeastCommonMultiple(int lhs, int rhs)
+    {
+        if (lhs <= 0 || rhs <= 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(lhs),
+                $"PagedAttention block-N values must be positive, got {lhs} and {rhs}.");
+        }
+
+        var a = lhs;
+        var b = rhs;
+        while (b != 0)
+        {
+            (a, b) = (b, a % b);
+        }
+
+        return checked((lhs / a) * rhs);
     }
 
     private static bool CanUsePagedAttentionTmaPipeline(
@@ -509,6 +675,9 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
         var gemv = m == 1;
         if (gemv)
         {
+            // QKV packs three descriptor copies into one staged RHS tile,
+            // while GLU stages gate/up in two adjacent physical slots.
+            var transferIssueCount = sourceArgumentIndices?.Count ?? 0;
             if (TryGetPackedBFloat16GemvPipelineConfiguration(
                     machine,
                     family,
@@ -519,6 +688,7 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
                     fixedK,
                     kMajorPacked,
                     simultaneousRhsTileCount,
+                    transferIssueCount,
                     out var pipeline))
             {
                 const int nVector = 8;
@@ -634,21 +804,23 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
         long k,
         bool fixedK,
         bool kMajorPacked,
-        int simultaneousRhsTileCount,
+        int rhsTilesPerGroup,
+        int transferIssueCount,
         out PackedGemvPipelineConfiguration configuration)
     {
         configuration = default;
         if ((family != "triton.matmul" &&
              family != "triton.qkv_parallel_linear" &&
              family != "triton.matmul_glu") ||
-            simultaneousRhsTileCount <= 0 ||
+            rhsTilesPerGroup <= 0 ||
+            transferIssueCount <= 0 ||
             !kMajorPacked ||
             lhsType != DataTypes.BFloat16 ||
             rhsType != DataTypes.BFloat16 ||
             n < 8 ||
             !fixedK ||
             k <= 0 ||
-            k % 128 != 0 ||
+            k % PackedGemvMinimumBlockK != 0 ||
             machine.Execution.Kind != BlockExecutionKind.PersistentGpuBlock ||
             machine.Execution.WorkersPerBlock != 8 ||
             machine.Execution.WorkerWidth != 32)
@@ -656,8 +828,7 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
             return false;
         }
 
-        const int blockK = 128;
-        var blockN = GetPackedGemvPipelineBlockN(n);
+        var maximumBlockN = GetPackedGemvPipelineMaximumBlockN(n);
         var sharedSpace = machine.MemorySpaces.Values.SingleOrDefault(
             space => space.TIRBinding?.Location == MemoryLocation.Shared);
         if (sharedSpace is null)
@@ -665,36 +836,180 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
             return false;
         }
 
-        const long elementBytes = 2;
-        var stageBytes = checked((long)blockN * blockK * elementBytes);
-        for (var candidateStages = 4; candidateStages >= 2; candidateStages--)
+        var parentSpace = machine.GetTilingParentMemorySpace(sharedSpace.TilingLevel);
+        var transfer = machine.GetTransfer(parentSpace.Id, sharedSpace.Id);
+        if (transfer.Asynchronous is not { } asynchronousTransfer)
         {
-            // A physical pipe slot owns one RHS transfer. Fused projections
-            // consume adjacent slots and require at least two logical tile groups.
-            if (candidateStages % simultaneousRhsTileCount != 0 ||
-                candidateStages / simultaneousRhsTileCount < 2)
-            {
-                continue;
-            }
+            return false;
+        }
 
-            var requiredSharedBytes = checked(candidateStages * stageBytes);
-            if (machine.GetAllocationSizeBytes(sharedSpace, requiredSharedBytes) <=
-                machine.GetMaximumUsableAllocationBytes(sharedSpace))
+        PackedGemvPipelineCandidate? bestCandidate = null;
+        const long elementBytes = 2;
+
+        // Search N and K jointly. The cycle model below charges ceil(N / blockN)
+        // tiles, including padded transfer and FMA work, so small local N shards
+        // can trade additional TMA issues for less tail computation.
+        for (var candidateBlockN = PackedGemvMinimumBlockN;
+             candidateBlockN <= maximumBlockN;
+             candidateBlockN *= 2)
+        {
+            for (var candidateBlockK = PackedGemvMinimumBlockK;
+                 candidateBlockK <= Math.Min(k, PackedGemvMaximumBlockK);
+                 candidateBlockK *= 2)
             {
-                configuration = new(blockN, blockK, candidateStages);
-                return true;
+                if (k % candidateBlockK != 0)
+                {
+                    continue;
+                }
+
+                var stageBytes = checked((long)candidateBlockN * candidateBlockK * elementBytes);
+                foreach (var logicalStageCount in asynchronousTransfer.SupportedStageCounts)
+                {
+                    // A physical pipe slot owns one staged RHS tile. Fused projections
+                    // consume adjacent slots, so double buffering applies to complete
+                    // RHS groups rather than individual slots.
+                    if (logicalStageCount < PackedGemvMinimumLogicalStages)
+                    {
+                        continue;
+                    }
+
+                    var candidateStages = checked(logicalStageCount * rhsTilesPerGroup);
+                    var requiredSharedBytes = checked(candidateStages * stageBytes);
+                    var allocatedSharedBytes = machine.GetAllocationSizeBytes(
+                        sharedSpace,
+                        requiredSharedBytes);
+                    if (allocatedSharedBytes > machine.GetMaximumUsableAllocationBytes(sharedSpace))
+                    {
+                        continue;
+                    }
+
+                    var candidateConfiguration = new PackedGemvPipelineConfiguration(
+                        candidateBlockN,
+                        candidateBlockK,
+                        candidateStages);
+                    var candidate = new PackedGemvPipelineCandidate(
+                        candidateConfiguration,
+                        EstimatePackedGemvPipelineCycles(
+                            machine,
+                            transfer,
+                            n,
+                            k,
+                            rhsTilesPerGroup,
+                            transferIssueCount,
+                            candidateConfiguration),
+                        allocatedSharedBytes);
+                    if (bestCandidate is null || IsBetterPackedGemvPipelineCandidate(candidate, bestCandidate.Value))
+                    {
+                        bestCandidate = candidate;
+                    }
+                }
             }
+        }
+
+        if (bestCandidate is null)
+        {
+            return false;
+        }
+
+        configuration = bestCandidate.Value.Configuration;
+        return true;
+    }
+
+    private static long EstimatePackedGemvPipelineCycles(
+        TargetMachineModel machine,
+        TargetMemoryTransferSpec transfer,
+        long n,
+        long k,
+        int rhsTilesPerGroup,
+        int transferIssueCount,
+        PackedGemvPipelineConfiguration configuration)
+    {
+        const long elementBytes = 2;
+        var nTileCount = DivideRoundUp(n, configuration.BlockN);
+        var kTileCount = k / configuration.BlockK;
+        var logicalTileCount = checked(nTileCount * kTileCount);
+        var rhsBytesPerLogicalTile = checked(
+            (long)configuration.BlockN *
+            configuration.BlockK *
+            elementBytes *
+            rhsTilesPerGroup);
+
+        // Global bandwidth is modeled at chip scope, so a persistent block is
+        // charged its contended share while all compute units are resident.
+        var contendedTransferBytes = checked(
+            rhsBytesPerLogicalTile * machine.Execution.ComputeUnitCount);
+        var transferCycles = checked(
+            DivideRoundUp(contendedTransferBytes, transfer.BytesPerCycle) +
+            (transfer.LatencyCycles * transferIssueCount));
+        var fmaCount = checked(
+            (long)configuration.BlockN *
+            configuration.BlockK *
+            rhsTilesPerGroup);
+        var consumerCycles = DivideRoundUp(fmaCount, machine.Compute.SimtFmaPerCycle);
+        var steadyStateCycles = Math.Max(transferCycles, consumerCycles);
+        var pipelineCycles = checked(
+            transferCycles +
+            consumerCycles +
+            ((logicalTileCount - 1) * steadyStateCycles));
+
+        var asynchronousControl = transfer.Asynchronous is null
+            ? 0
+            : checked(
+                transfer.Asynchronous.CommitCycles +
+                transfer.Asynchronous.WaitCycles);
+        var controlCycles = checked(
+            ((long)configuration.NumStages * machine.Synchronization.BlockCycles) +
+            (logicalTileCount * transferIssueCount * asynchronousControl));
+        return checked(pipelineCycles + controlCycles);
+    }
+
+    private static bool IsBetterPackedGemvPipelineCandidate(
+        PackedGemvPipelineCandidate candidate,
+        PackedGemvPipelineCandidate current)
+    {
+        if (candidate.EstimatedCycles != current.EstimatedCycles)
+        {
+            return candidate.EstimatedCycles < current.EstimatedCycles;
+        }
+
+        if (candidate.AllocatedSharedBytes != current.AllocatedSharedBytes)
+        {
+            return candidate.AllocatedSharedBytes < current.AllocatedSharedBytes;
+        }
+
+        if (candidate.Configuration.NumStages != current.Configuration.NumStages)
+        {
+            return candidate.Configuration.NumStages < current.Configuration.NumStages;
+        }
+
+        // Equal-cost tiles move the same bytes and execute the same FMA work.
+        // Prefer partitioning that work across N: it assigns more warp lanes
+        // to N, preserves a wider contiguous K vector per lane, and emits fewer
+        // static K-reduction groups per stage. This matters for large-N GEMV
+        // such as lm_head, where a larger K tile only grows the unrolled body.
+        if (candidate.Configuration.BlockN != current.Configuration.BlockN)
+        {
+            return candidate.Configuration.BlockN > current.Configuration.BlockN;
+        }
+
+        if (candidate.Configuration.BlockK != current.Configuration.BlockK)
+        {
+            return candidate.Configuration.BlockK > current.Configuration.BlockK;
         }
 
         return false;
     }
 
-    private static int GetPackedGemvPipelineBlockN(long n)
+    private static long DivideRoundUp(long value, long divisor)
+        => checked(((value - 1) / divisor) + 1);
+
+    private static long DivideRoundUp(long value, double divisor)
+        => checked((long)Math.Ceiling(value / divisor));
+
+    private static int GetPackedGemvPipelineMaximumBlockN(long n)
     {
-        const int minimumBlockN = 8;
-        const int maximumBlockN = 64;
-        var boundedN = Math.Min(n, maximumBlockN);
-        var blockN = minimumBlockN;
+        var boundedN = Math.Min(n, PackedGemvMaximumBlockN);
+        var blockN = PackedGemvMinimumBlockN;
         while (blockN < boundedN)
         {
             blockN *= 2;
@@ -813,4 +1128,15 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
     {
         public int Rank => Dimensions.Length;
     }
+
+    private readonly record struct PagedAttentionMicroKernelCandidate(
+        string Variant,
+        int BlockN,
+        int NumStages,
+        bool UsesTma);
+
+    private readonly record struct PackedGemvPipelineCandidate(
+        PackedGemvPipelineConfiguration Configuration,
+        long EstimatedCycles,
+        long AllocatedSharedBytes);
 }

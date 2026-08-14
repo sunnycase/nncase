@@ -352,6 +352,26 @@ public sealed class UnitTestDistributedTypeInfer : TestClassBase
     }
 
     [Fact]
+    public void TestBitcastPreservesSplitGranularityOnUnchangedAxes()
+    {
+        var placement = new Placement(new[] { 4, 8 }, "yx", "bb");
+        var input = new Var(
+            "input",
+            new DistributedType(
+                new TensorType(new VectorType(DataTypes.BFloat16, [8]), new long[] { 96, 16, 16 }),
+                new SBP[] { SBP.SBlockCyclic([0], 8), SBP.SBlockCyclic([1], 2), SBP.B },
+                placement));
+
+        var bitcast = IR.F.Tensors.Bitcast(input, DataTypes.BFloat16);
+
+        var outputType = Assert.IsType<DistributedType>(bitcast.CheckedType);
+        Assert.Equal(new TensorType(DataTypes.BFloat16, new long[] { 96, 16, 128 }), outputType.TensorType);
+        Assert.Equal(
+            new SBP[] { SBP.SBlockCyclic([0], 8), SBP.SBlockCyclic([1], 2), SBP.B },
+            outputType.AxisPolicies.ToArray());
+    }
+
+    [Fact]
     public void TestVectorizedCastRejectsMisalignedSplitGranularity()
     {
         var placement = new Placement(new[] { 4, 8 }, "yx", "bb");
@@ -420,6 +440,27 @@ public sealed class UnitTestDistributedTypeInfer : TestClassBase
             new TensorType(new VectorType(DataTypes.BFloat16, [8]), new long[] { 1, 18992 }),
             outputType.TensorType);
         Assert.Equal(new SBP[] { SBP.B, SBP.SContiguous([0, 1], 594) }, outputType.AxisPolicies.ToArray());
+    }
+
+    [Fact]
+    public void TestFixedMatMulReductionSplitProducesPartialOutput()
+    {
+        var placement = new Placement(new[] { 8, 16 }, "yx", "bb");
+        var lhs = new DistributedType(
+            new TensorType(DataTypes.BFloat16, new long[] { 1, 2048 }),
+            new SBP[] { SBP.B, SBP.SContiguous([0]) },
+            placement);
+        var rhs = new DistributedType(
+            new TensorType(DataTypes.BFloat16, new long[] { 2048, 4096 }),
+            new SBP[] { SBP.SContiguous([0]), SBP.SContiguous([1]) },
+            placement);
+
+        var output = Assert.IsType<DistributedType>(
+            Nncase.Evaluator.Math.MatMulEvaluator.VisitDistributedType(lhs, rhs, NoneType.Default));
+
+        Assert.Equal(new TensorType(DataTypes.BFloat16, new long[] { 1, 4096 }), output.TensorType);
+        Assert.Equal(new SBP[] { SBP.B, SBP.SContiguous([1]) }, output.AxisPolicies.ToArray());
+        Assert.Equal(SBP.P([0], ReduceOp.Sum), output.Partial);
     }
 
     [Fact]

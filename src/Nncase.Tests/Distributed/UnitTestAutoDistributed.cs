@@ -925,6 +925,22 @@ public sealed class UnitTestDistribAutoDistributed : TestClassBase
     }
 
     [Fact]
+    public void TestSingleBlockCyclicShardIsAContiguousRegion()
+    {
+        var tensorType = new TensorType(DataTypes.Float32, [8]);
+        var placement = new Placement([4], "b", "b");
+        var distributedType = new DistributedType(
+            tensorType,
+            new SBP[] { SBP.SBlockCyclic([0], 2) },
+            placement);
+
+        var descriptor = DistributedUtility.GetLocalShardDescriptor(distributedType, new[] { 3 });
+        Assert.True(descriptor.TryGetContiguousRegion(out var offset, out var shape));
+        Assert.Equal(new[] { 6L }, new RankedShape(offset).ToValueArray());
+        Assert.Equal(new[] { 2L }, new RankedShape(shape).ToValueArray());
+    }
+
+    [Fact]
     public void TestOrderedSplitStagesComposeAcrossPhysicalLevels()
     {
         var tensorType = new TensorType(DataTypes.Float32, [1000]);

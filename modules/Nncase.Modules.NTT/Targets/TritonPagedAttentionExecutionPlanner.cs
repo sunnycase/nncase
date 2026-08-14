@@ -25,6 +25,38 @@ public sealed class TritonPagedAttentionExecutionPlanner
 
     public PagedAttentionExecutionPlan Plan(PagedAttentionExecutionPlanQuery query)
     {
+        var plan = PlanCore(query);
+        if (plan.Kind != PagedAttentionExecutionKind.SplitKV || query.ContextLength <= 1)
+        {
+            plan.Validate(query);
+            return plan;
+        }
+
+        long lower = 1;
+        long upper = query.ContextLength - 1;
+        long directContextThreshold = 0;
+        while (lower <= upper)
+        {
+            var candidate = lower + ((upper - lower) / 2);
+            var candidatePlan = PlanCore(query with { ContextLength = candidate });
+            if (candidatePlan.Kind == PagedAttentionExecutionKind.Direct)
+            {
+                directContextThreshold = candidate;
+                lower = candidate + 1;
+            }
+            else
+            {
+                upper = candidate - 1;
+            }
+        }
+
+        plan = plan with { DirectContextThreshold = directContextThreshold };
+        plan.Validate(query);
+        return plan;
+    }
+
+    private PagedAttentionExecutionPlan PlanCore(PagedAttentionExecutionPlanQuery query)
+    {
         var placement = query.QueryType.Placement;
         var candidates = Enumerable.Range(0, placement.Rank)
             .Where(axis => placement.IsPhysicalBlockAxis(axis))
@@ -60,7 +92,8 @@ public sealed class TritonPagedAttentionExecutionPlanner
             ? new(
                 PagedAttentionExecutionKind.SplitKV,
                 best.Axis,
-                best.SplitCount)
+                best.SplitCount,
+                0)
             : PagedAttentionExecutionPlan.Direct;
         plan.Validate(query);
         return plan;
