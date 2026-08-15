@@ -158,7 +158,6 @@ def _validate_device_function(device_function: Any, path: str) -> None:
         {
             "name",
             "noinline",
-            "preserve_helper_call_boundaries",
             "helpers",
             "body_source",
             "parameter_overrides",
@@ -167,9 +166,8 @@ def _validate_device_function(device_function: Any, path: str) -> None:
         },
     )
     _require_string(device_function["name"], f"{path}.name", nonempty=True)
-    for field in ("noinline", "preserve_helper_call_boundaries"):
-        if not isinstance(device_function[field], bool):
-            raise ValueError(f"{path}.{field} must be a boolean.")
+    if not isinstance(device_function["noinline"], bool):
+        raise ValueError(f"{path}.noinline must be a boolean.")
     helpers = _require_list(device_function["helpers"], f"{path}.helpers")
     for index, helper in enumerate(helpers):
         _validate_helper(helper, f"{path}.helpers[{index}]")
@@ -1165,13 +1163,13 @@ def _k_major_gemv_host_descriptor_spec(
 
     packed_k_outer = block_k // k_atom
     packed_n_outer = block_n // n_lane
-    k_plan = _tma_local_axis_plan(
+    k_plan = _tma_canonical_axis_plan(
         pointer,
         0,
         tile_extent=packed_k_outer,
         context="packed GEMV descriptor K",
     )
-    n_plan = _tma_local_axis_plan(
+    n_plan = _tma_canonical_axis_plan(
         pointer,
         1,
         tile_extent=packed_n_outer,
@@ -1234,20 +1232,24 @@ def _k_major_gemv_host_descriptor_spec(
         )
 
         def axis_group(
-            axis: int, entry: dict[str, Any]
+            axis: int, entry: dict[str, Any], plan: dict[str, Any]
         ) -> tuple[tuple[int, ...], tuple[int, ...]]:
+            retained_dimensions = plan["retained_dimensions"]
             return (
-                tuple(int(value) for value in entry["descriptor_shape"]),
+                tuple(
+                    int(entry["descriptor_shape"][dimension])
+                    for dimension in retained_dimensions
+                ),
                 tuple(
                     logical_strides[axis]
                     * scalar_lanes_per_logical_element
-                    * int(value)
-                    for value in entry["stride_multipliers"]
+                    * int(entry["stride_multipliers"][dimension])
+                    for dimension in retained_dimensions
                 ),
             )
 
-        k_group = axis_group(0, k_entry)
-        n_group = axis_group(1, n_entry)
+        k_group = axis_group(0, k_entry, k_plan)
+        n_group = axis_group(1, n_entry, n_plan)
         ordered_groups = (n_group, k_group) if transpose_kn else (k_group, n_group)
         descriptor_shape = tuple(
             value for group in ordered_groups for value in group[0]
@@ -1424,7 +1426,7 @@ def _render_device_function(
     helper_sources = _render_helper_sources(
         env,
         device_function.get("helpers", ()),
-        noinline=bool(device_function["preserve_helper_call_boundaries"]),
+        noinline=True,
         rematerialize_entry_indices=rematerialize_entry_indices,
         num_warps=num_warps,
         target_worker_width=target_worker_width,
@@ -2419,9 +2421,15 @@ def _local_to_global_coordinate(
     axis_mapping: Any,
     hierarchy: list[int],
     coord_prefix: str = "shard_coord",
+    *,
+    local_extent: int | None = None,
 ) -> str:
     """Compose ordered SplitStage mappings from a dense local coordinate."""
 
+    if local_extent is not None and local_extent <= 0:
+        raise ValueError(
+            f"PyNTT local coordinate extent must be positive, got {local_extent}"
+        )
     stages = _shard_axis_stages(axis_mapping)
     if not stages:
         return str(local_coordinate)
@@ -2476,19 +2484,101 @@ def _local_to_global_coordinate(
         parent_extent = active_extent
 
     coordinate = str(local_coordinate)
+    coordinate_extent = local_extent
     for stage_info in reversed(stage_infos):
         shard_index = stage_info["shard_index"]
         if stage_info["distribution"] == "BlockCyclic":
             block_size = stage_info["block_size"]
             period = stage_info["period"]
-            coordinate = (
-                f"((({coordinate}) // {block_size}) * {period} + "
-                f"({shard_index}) * {block_size} + (({coordinate}) % {block_size}))"
-            )
+            if coordinate_extent is not None and coordinate_extent <= block_size:
+                coordinate = (
+                    f"(({shard_index}) * {block_size} + ({coordinate}))"
+                )
+            else:
+                coordinate = (
+                    f"((({coordinate}) // {block_size}) * {period} + "
+                    f"({shard_index}) * {block_size} + (({coordinate}) % {block_size}))"
+                )
         else:
             capacity = stage_info["capacity"]
             coordinate = f"(({shard_index}) * ({capacity}) + ({coordinate}))"
+        # The next outer stage sees this stage's parent domain. Its exact local
+        # bound is not represented by the flat coordinate expression, so only
+        # the innermost stage may consume the caller-provided bound.
+        coordinate_extent = None
     return coordinate
+
+
+def _dimensions_equivalent(lhs: Any, rhs: Any) -> bool:
+    lhs_fixed = _fixed(lhs)
+    rhs_fixed = _fixed(rhs)
+    if lhs_fixed is not None or rhs_fixed is not None:
+        return lhs_fixed is not None and lhs_fixed == rhs_fixed
+    return _dim(lhs) == _dim(rhs)
+
+
+def _scale_shard_axis_mapping(axis_mapping: Any, factor: int) -> dict[str, Any]:
+    """Lift a physical-axis shard mapping into its scalar vector-lane domain."""
+
+    if factor <= 0:
+        raise ValueError(f"PyNTT shard-axis scale must be positive, got {factor}")
+    stages = []
+    for stage in _shard_axis_stages(axis_mapping):
+        scaled = dict(stage)
+        distribution = stage.get("Distribution")
+        if distribution == "BlockCyclic":
+            block_size = stage.get("BlockSize")
+            if not isinstance(block_size, int) or block_size <= 0:
+                raise ValueError(
+                    "PyNTT block-cyclic split requires a positive BlockSize, "
+                    f"got {block_size!r}"
+                )
+            scaled["BlockSize"] = block_size * factor
+        elif distribution == "Contiguous":
+            granularity = stage.get("Granularity")
+            if granularity is not None:
+                scaled["Granularity"] = _multiply_dim(granularity, factor)
+        else:
+            raise ValueError(
+                f"Unsupported PyNTT split-stage distribution {distribution!r}"
+            )
+        stages.append(scaled)
+    return {**axis_mapping, "Stages": stages}
+
+
+def _remap_local_coordinate(
+    local_coordinate: str,
+    source_global_extent: Any,
+    source_axis_mapping: Any,
+    destination_global_extent: Any,
+    destination_axis_mapping: Any,
+    hierarchy: list[int],
+    *,
+    local_extent: int | None = None,
+) -> str:
+    """Compose local->global->local without expanding identical shard maps."""
+
+    if not _dimensions_equivalent(source_global_extent, destination_global_extent):
+        raise ValueError(
+            "PyNTT coordinate remapping requires equivalent logical extents: "
+            f"source={_dim(source_global_extent)}, "
+            f"destination={_dim(destination_global_extent)}"
+        )
+    if source_axis_mapping == destination_axis_mapping:
+        return str(local_coordinate)
+    global_coordinate = _local_to_global_coordinate(
+        local_coordinate,
+        source_global_extent,
+        source_axis_mapping,
+        hierarchy,
+        local_extent=local_extent,
+    )
+    return _global_to_local_coordinate(
+        global_coordinate,
+        destination_global_extent,
+        destination_axis_mapping,
+        hierarchy,
+    )["local_coordinate"]
 
 
 def _distributed_local_to_global_coordinates(
@@ -2682,7 +2772,7 @@ def _tma_local_axis_transfer(
             f"PyNTT {context} requires a non-negative local_offset and a "
             "positive tile_stride"
         )
-    plan = _tma_local_axis_plan(
+    plan = _tma_canonical_axis_plan(
         pointer,
         axis,
         tile_extent=tile_extent,
@@ -2730,12 +2820,16 @@ def _tma_local_axis_transfer(
         local_coordinate = _add_coordinate(local_origin, dynamic_delta)
     if plan["is_block_cyclic"] and plan["block_size"] != 1:
         block_size = plan["block_size"]
-        coordinates = (
+        raw_coordinates = (
             f"(({local_coordinate}) // {block_size})",
             f"(({local_coordinate}) % {block_size})",
         )
     else:
-        coordinates = (local_coordinate,)
+        raw_coordinates = (local_coordinate,)
+    coordinates = tuple(
+        raw_coordinates[dimension]
+        for dimension in plan["retained_dimensions"]
+    )
     return {**plan, "coordinates": coordinates}
 
 
@@ -2744,20 +2838,24 @@ def _tma_shared_axis_coordinates(
     plan: dict[str, Any],
 ) -> tuple[str, ...]:
     if not plan["is_block_cyclic"] or plan["block_size"] == 1:
-        return (local_coordinate,)
-    block_size = plan["block_size"]
-    try:
-        fixed_coordinate = int(local_coordinate)
-    except ValueError:
-        pass
+        raw_coordinates = (local_coordinate,)
     else:
-        return (
-            str(fixed_coordinate // block_size),
-            str(fixed_coordinate % block_size),
-        )
-    return (
-        f"(({local_coordinate}) // {block_size})",
-        f"(({local_coordinate}) % {block_size})",
+        block_size = plan["block_size"]
+        try:
+            fixed_coordinate = int(local_coordinate)
+        except ValueError:
+            raw_coordinates = (
+                f"(({local_coordinate}) // {block_size})",
+                f"(({local_coordinate}) % {block_size})",
+            )
+        else:
+            raw_coordinates = (
+                str(fixed_coordinate // block_size),
+                str(fixed_coordinate % block_size),
+            )
+    return tuple(
+        raw_coordinates[dimension]
+        for dimension in plan["retained_dimensions"]
     )
 
 
@@ -2897,6 +2995,54 @@ def _tma_descriptor_table_axis_entry(
     }
 
 
+def _tma_canonical_axis_plan(
+    pointer: Any,
+    axis: int,
+    *,
+    tile_extent: int,
+    context: str,
+) -> dict[str, Any]:
+    """Remove descriptor-axis dimensions that are provably unit for every owner."""
+
+    plan = _tma_local_axis_plan(
+        pointer,
+        axis,
+        tile_extent=tile_extent,
+        context=context,
+    )
+    hierarchy = plan["hierarchy"]
+    owner_count = _product_int([int(value) for value in hierarchy])
+    entries = tuple(
+        _tma_descriptor_table_axis_entry(
+            pointer,
+            axis,
+            _unflatten_hierarchy_owner(linear_owner, hierarchy),
+            tile_extent=tile_extent,
+            context=context,
+        )
+        for linear_owner in range(owner_count)
+    )
+    raw_block_shape = tuple(plan["block_shape"])
+    if any(len(entry["descriptor_shape"]) != len(raw_block_shape) for entry in entries):
+        raise ValueError(
+            f"PyNTT {context} descriptor shape rank differs from its block rank."
+        )
+    retained_dimensions = tuple(
+        dimension
+        for dimension, block_extent in enumerate(raw_block_shape)
+        if block_extent != 1
+        or any(entry["descriptor_shape"][dimension] != 1 for entry in entries)
+    )
+    return {
+        **plan,
+        "raw_block_shape": raw_block_shape,
+        "block_shape": tuple(
+            raw_block_shape[dimension] for dimension in retained_dimensions
+        ),
+        "retained_dimensions": retained_dimensions,
+    }
+
+
 def _nv_tma_swizzle_mode(block_shape: tuple[int, ...], dtype: str) -> int:
     try:
         item_size = TMA_DTYPE_ITEM_SIZES[dtype]
@@ -2984,15 +3130,21 @@ def _canonicalize_access(pointer: dict[str, Any], access: Any) -> Any:
     if pointer.get("DistributedStorageKind") != "CanonicalGlobal":
         return access
     global_shape = pointer.get("GlobalShape")
+    global_offsets = pointer.get("GlobalOffsets")
     shard_axes = pointer.get("ShardAxes")
     hierarchy = pointer.get("Hierarchy")
     strides = pointer.get("Strides")
-    if not all(isinstance(value, list) for value in (global_shape, shard_axes, hierarchy, strides)):
+    if not all(
+        isinstance(value, list)
+        for value in (global_shape, global_offsets, shard_axes, hierarchy, strides)
+    ):
         raise ValueError("PyNTT canonical-global pointer has incomplete shard metadata")
-    if not (len(global_shape) == len(shard_axes) == len(strides)):
+    if not (
+        len(global_shape) == len(global_offsets) == len(shard_axes) == len(strides)
+    ):
         raise ValueError(
-            "PyNTT canonical-global pointer shape/mapping/stride rank mismatch: "
-            f"{len(global_shape)}/{len(shard_axes)}/{len(strides)}"
+            "PyNTT canonical-global pointer shape/origin/mapping/stride rank mismatch: "
+            f"{len(global_shape)}/{len(global_offsets)}/{len(shard_axes)}/{len(strides)}"
         )
 
     if access is None:
@@ -3019,7 +3171,10 @@ def _canonicalize_access(pointer: dict[str, Any], access: Any) -> Any:
         if axis in global_coordinate_axis_set:
             return coordinate
         return _local_to_global_coordinate(
-            coordinate, global_shape[axis], shard_axes[axis], hierarchy
+            _add_coordinate(global_offsets[axis], coordinate),
+            global_shape[axis],
+            shard_axes[axis],
+            hierarchy,
         )
 
     tensor_indices = [
@@ -5100,6 +5255,7 @@ def _matmul_template_context(
     *,
     gemv: bool,
     variant: str | None = None,
+    expected_family: str = "triton.matmul",
 ) -> dict[str, Any]:
     """Prepare Matmul/Gemv dimensions and addresses for Jinja-owned kernels."""
 
@@ -5117,7 +5273,7 @@ def _matmul_template_context(
     )
     microkernel = _microkernel_context(
         model,
-        "triton.matmul",
+        expected_family,
         variant or ("simt_fma" if gemv else "mma"),
     )
     context: dict[str, Any] = {
@@ -5457,6 +5613,8 @@ def _should_outline_packed_gemv_consumer_stage(
 
 def _packed_gemv_pipeline_template_context(
     model: dict[str, Any],
+    *,
+    expected_family: str = "triton.matmul",
 ) -> dict[str, Any]:
     """Prepare the packed BF16, shared-staged SIMT GEMV algorithm."""
 
@@ -5464,6 +5622,7 @@ def _packed_gemv_pipeline_template_context(
         model,
         gemv=True,
         variant="simt_fma_smem_pipeline",
+        expected_family=expected_family,
     )
     if model["LhsDType"] != "bfloat16" or model["RhsDType"] != "bfloat16":
         raise ValueError(
@@ -5873,7 +6032,7 @@ def _packed_qkv_gemv_pipeline_template_context(
         projection["prefix"]: projection for projection in projections
     }
     shared_k_plans = [
-        _tma_local_axis_plan(
+        _tma_canonical_axis_plan(
             projection["weight_pointer"],
             -2,
             tile_extent=packed_k_outer,
@@ -5882,7 +6041,7 @@ def _packed_qkv_gemv_pipeline_template_context(
         for projection in projections
     ]
     shared_n_plans = [
-        _tma_local_axis_plan(
+        _tma_canonical_axis_plan(
             projection["weight_pointer"],
             -1,
             tile_extent=packed_n_outer,
@@ -6481,6 +6640,27 @@ def _layer_norm_template_context(model: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _reduce_all_axes(expression: str, rank: int) -> str:
+    if rank < 1:
+        raise ValueError(f"PyNTT all-axis reduction requires positive rank, got {rank}")
+    for axis in reversed(range(rank)):
+        expression = f"tl.sum({expression}, axis={axis})"
+    return expression
+
+
+def _is_contiguous_reduction_suffix(
+    shape: list[Any], strides: list[Any], axis: int
+) -> bool:
+    expected_stride = 1
+    for suffix_axis in range(len(shape) - 1, axis - 1, -1):
+        extent = _fixed(shape[suffix_axis])
+        stride = _fixed(strides[suffix_axis])
+        if extent is None or stride != expected_stride:
+            return False
+        expected_stride *= extent
+    return True
+
+
 def _norm_stats_template_context(model: dict[str, Any]) -> dict[str, Any]:
     rank = len(model["InputShape"])
     axis = int(model["Axis"])
@@ -6509,6 +6689,20 @@ def _norm_stats_template_context(model: dict[str, Any]) -> dict[str, Any]:
         context["lane_coordinates"],
         context["lane_shape"],
     )
+    flat_reduction = _is_contiguous_reduction_suffix(
+        model["InputShape"],
+        model["InputStrides"],
+        axis,
+    )
+    flat_base_coordinates = tuple(
+        f"outer_idx{index}" if index < axis else "0" for index in range(rank)
+    )
+    context["flat_input_base_access"] = _tensor_access(
+        flat_base_coordinates,
+        model["InputStrides"],
+        tuple("0" for _ in context["lane_shape"]),
+        context["lane_shape"],
+    )
 
     def stats_access(component: int) -> dict[str, Any]:
         coordinates = (str(component),) + tuple(
@@ -6516,21 +6710,25 @@ def _norm_stats_template_context(model: dict[str, Any]) -> dict[str, Any]:
         )
         return _tensor_access(coordinates, model["OutputStrides"])
 
-    reduction = "value0"
-    square_reduction = "value0 * value0"
-    for _ in range(1 + len(context["lane_shape"])):
-        reduction = f"tl.sum({reduction}, axis=0)"
-        square_reduction = f"tl.sum({square_reduction}, axis=0)"
+    reduction_rank = 1 if flat_reduction else 1 + len(context["lane_shape"])
+    reduction = _reduce_all_axes("mean_partial", reduction_rank)
+    square_reduction = _reduce_all_axes("square_partial", reduction_rank)
     context.update(
         {
             "logical_input_shape": _logical_shape(
                 model["InputShape"], model["InputVectorLaneCount"]
             ),
+            "flat_reduction": flat_reduction,
             "outer_axes": outer_axes,
             "prefix_depth": len(outer_axes),
             "reduction": reduction,
+            "reduction_extent": _multiply_expr(
+                _product(model["InputShape"][axis:]),
+                model["InputVectorLaneCount"],
+            ),
             "square_reduction": square_reduction,
             "stats_accesses": (stats_access(0), stats_access(1)),
+            "tile_shape": "(block_size,)" if flat_reduction else context["tile_shape"],
         }
     )
     return context
@@ -6922,11 +7120,11 @@ def _norm_rope_template_context(
         reduction_context["lane_coordinates"],
         reduction_context["lane_shape"],
     )
-    reduction = "norm_value"
-    square_reduction = "norm_value * norm_value"
-    for _ in range(1 + len(reduction_context["lane_shape"])):
-        reduction = f"tl.sum({reduction}, axis=0)"
-        square_reduction = f"tl.sum({square_reduction}, axis=0)"
+    reduction_rank = 1 + len(reduction_context["lane_shape"])
+    reduction = _reduce_all_axes("norm_value", reduction_rank)
+    square_reduction = _reduce_all_axes(
+        "norm_value * norm_value", reduction_rank
+    )
 
     def parameter_access(name: str, source: dict[str, Any]) -> dict[str, Any]:
         coordinates = tuple(source["TensorIndices"])[axis:]
@@ -8108,9 +8306,19 @@ def _paged_attention_partial_template_context(
 ) -> dict[str, Any]:
     """Extend the common attention coordinates with FP32 partial-state stores."""
 
+    has_direct_output = bool(model.get("HasDirectOutput"))
+    if has_direct_output != isinstance(model.get("Output"), dict):
+        raise ValueError(
+            "PyNTT PagedAttentionPartial direct-output metadata and pointer disagree"
+        )
+    if not has_direct_output and int(model["DirectContextThreshold"]) != 0:
+        raise ValueError(
+            "PyNTT state-only PagedAttentionPartial requires a zero direct-context threshold"
+        )
+
     ctx = _paged_attention_template_context(model)
     query_rank = len(model["QueryShape"])
-    state_rank = query_rank + 1
+    state_rank = query_rank
     for name in ("MaxState", "SumState", "AccState"):
         if len(model[f"{name}Shape"]) != state_rank or len(
             model[f"{name}Strides"]
@@ -8136,7 +8344,6 @@ def _paged_attention_partial_template_context(
         indices[model["SeqAxis"]] = "local_query_id"
         indices[model["HeadAxis"]] = head_index
         indices[model["DimAxis"]] = dim_index
-        indices[-1] = "0"
         return indices
 
     q_head_group_tile = int(ctx["q_head_group_tile"])
@@ -8184,7 +8391,7 @@ def _paged_attention_merge_template_context(
     """Prepare output and split-state coordinates for online-softmax merging."""
 
     output_rank = len(model["OutputShape"])
-    state_rank = output_rank + 1
+    state_rank = output_rank
     for name in ("MaxState", "SumState", "AccState"):
         if len(model[f"{name}Shape"]) != state_rank or len(
             model[f"{name}Strides"]
@@ -8212,60 +8419,146 @@ def _paged_attention_merge_template_context(
     output_lane_count = _product_int(list(output_lanes)) if output_lanes else 1
     dim_axis = int(model["DimAxis"])
     output_physical_dim = _constant_dim_value(model["OutputShape"][dim_axis])
-    if output_physical_dim is None or output_physical_dim * output_lane_count != head_dimension:
+    if output_physical_dim is None:
         raise ValueError(
-            "PyNTT PagedAttentionMerge output HeadDim does not match its vector lanes"
+            "PyNTT PagedAttentionMerge requires a fixed local output HeadDim"
         )
+    local_head_dimension = output_physical_dim * output_lane_count
 
     output_dim_axis = _structured_axis_tile(
         "output_dim",
         output_lanes,
-        head_dimension,
+        local_head_dimension,
         head_dimension,
     )
 
-    def global_index_expression(axis: int, local_index: str, global_extent: Any) -> str:
+    def global_index_expression(
+        axis: int,
+        local_index: str,
+        global_extent: Any,
+        local_extent: int | None = None,
+    ) -> str:
         return _local_to_global_coordinate(
             local_index,
             global_extent,
             model["OutputShardAxes"][axis],
             model["Hierarchy"],
+            local_extent=local_extent,
         )
-
-    output_indices = ["0"] * output_rank
-    output_indices[model["SeqAxis"]] = "local_query_id"
-    output_indices[model["HeadAxis"]] = "q_head"
-    output_indices[dim_axis] = output_dim_axis["physical_coordinate"]
-
-    def state_indices(dim_index: str, split_index: str) -> list[str]:
-        indices = ["0"] * state_rank
-        indices[model["SeqAxis"]] = "local_query_id"
-        indices[model["HeadAxis"]] = "q_head"
-        indices[dim_axis] = dim_index
-        indices[-1] = split_index
-        return indices
 
     global_query_tokens = model["OutputGlobalShape"][model["SeqAxis"]]
     global_query_id = global_index_expression(
-        model["SeqAxis"], "local_query_id", global_query_tokens
+        model["SeqAxis"],
+        "local_query_id",
+        global_query_tokens,
+        _constant_dim_value(model["OutputShape"][model["SeqAxis"]]),
     )
     global_q_head = global_index_expression(
-        model["HeadAxis"], "q_head", model["GlobalNumQueryHeads"]
+        model["HeadAxis"],
+        "q_head",
+        model["GlobalNumQueryHeads"],
+        _constant_dim_value(model["OutputShape"][model["HeadAxis"]]),
     )
+    global_output_physical_dim = global_index_expression(
+        dim_axis,
+        output_dim_axis["physical_coordinate"],
+        model["OutputGlobalShape"][dim_axis],
+        output_physical_dim,
+    )
+    output_scalar_global_extent = _multiply_dim(
+        model["OutputGlobalShape"][dim_axis], output_lane_count
+    )
+    output_scalar_shard_axis = _scale_shard_axis_mapping(
+        model["OutputShardAxes"][dim_axis], output_lane_count
+    )
+    global_output_scalar_dim = _local_to_global_coordinate(
+        output_dim_axis["logical_expression"],
+        output_scalar_global_extent,
+        output_scalar_shard_axis,
+        model["Hierarchy"],
+        local_extent=local_head_dimension,
+    )
+    state_dim_global_extent = model["StateGlobalShape"][dim_axis]
+    if not _dimensions_equivalent(
+        output_scalar_global_extent, state_dim_global_extent
+    ):
+        raise ValueError(
+            "PyNTT PagedAttentionMerge output scalar HeadDim and partial-state "
+            "HeadDim disagree"
+        )
+    flat_global_output_scalar_dim = _local_to_global_coordinate(
+        "dim_grid",
+        output_scalar_global_extent,
+        output_scalar_shard_axis,
+        model["Hierarchy"],
+        local_extent=local_head_dimension,
+    )
+
+    state_query_id = _remap_local_coordinate(
+        "local_query_id",
+        global_query_tokens,
+        model["OutputShardAxes"][model["SeqAxis"]],
+        model["StateGlobalShape"][model["SeqAxis"]],
+        model["StateShardAxes"][model["SeqAxis"]],
+        model["Hierarchy"],
+        local_extent=_constant_dim_value(
+            model["OutputShape"][model["SeqAxis"]]
+        ),
+    )
+    state_q_head = _remap_local_coordinate(
+        "q_head",
+        model["OutputGlobalShape"][model["HeadAxis"]],
+        model["OutputShardAxes"][model["HeadAxis"]],
+        model["StateGlobalShape"][model["HeadAxis"]],
+        model["StateShardAxes"][model["HeadAxis"]],
+        model["Hierarchy"],
+        local_extent=_constant_dim_value(
+            model["OutputShape"][model["HeadAxis"]]
+        ),
+    )
+    state_dim = _remap_local_coordinate(
+        "dim_grid",
+        output_scalar_global_extent,
+        output_scalar_shard_axis,
+        state_dim_global_extent,
+        model["StateShardAxes"][dim_axis],
+        model["Hierarchy"],
+        local_extent=local_head_dimension,
+    )
+
+    output_indices = ["0"] * output_rank
+    output_indices[model["SeqAxis"]] = global_query_id
+    output_indices[model["HeadAxis"]] = global_q_head
+    output_indices[dim_axis] = global_output_physical_dim
+
+    def state_indices(dim_index: str) -> list[str]:
+        indices = ["0"] * state_rank
+        indices[model["SeqAxis"]] = state_query_id
+        indices[model["HeadAxis"]] = state_q_head
+        indices[dim_axis] = dim_index
+        return indices
+
     return {
         "acc_state_access": _tensor_access(
-            state_indices("dim_grid", "split_grid"),
+            state_indices(state_dim),
             model["AccStateStrides"],
-            coordinate_shape=f"({split_tile}, {head_dimension})",
+            coordinate_shape=f"({split_tile}, {local_head_dimension})",
+        ),
+        "acc_state_source_pointer": _partial_state_source_pointer(
+            model, "AccState", "split_offsets"
         ),
         "global_q_head": global_q_head,
         "global_query_id": global_query_id,
         "local_q_heads": model["OutputShape"][model["HeadAxis"]],
+        "local_head_dimension": local_head_dimension,
         "local_query_tokens": model["OutputShape"][model["SeqAxis"]],
         "max_state_access": _tensor_access(
-            state_indices("0", "split_offsets"),
+            state_indices("0"),
             model["MaxStateStrides"],
             coordinate_shape=f"({split_tile},)",
+        ),
+        "max_state_source_pointer": _partial_state_source_pointer(
+            model, "MaxState", "split_offsets"
         ),
         "output_access": _tensor_access(
             output_indices,
@@ -8273,22 +8566,76 @@ def _paged_attention_merge_template_context(
             output_dim_axis["lane_coordinates"],
             output_lanes,
             _coordinate_shape(output_dim_axis["structured_shape"]),
+            global_coordinate_axes=(
+                model["SeqAxis"],
+                model["HeadAxis"],
+                dim_axis,
+            ),
         ),
         "output_active": (
             f"({global_query_id} < {_dim(global_query_tokens)}) & "
-            f"({global_q_head} < {int(model['GlobalNumQueryHeads'])})"
+            f"({global_q_head} < {int(model['GlobalNumQueryHeads'])}) & "
+            f"({global_output_scalar_dim} < {head_dimension})"
         ),
         "output_dim_axis": output_dim_axis,
         "output_structured_shape": output_dim_axis["structured_shape"],
-        "owner": f"shard_coord{split_axis} == 0",
         "split_count": split_count,
         "split_tile": split_tile,
         "sum_state_access": _tensor_access(
-            state_indices("0", "split_offsets"),
+            state_indices("0"),
             model["SumStateStrides"],
             coordinate_shape=f"({split_tile},)",
         ),
+        "sum_state_source_pointer": _partial_state_source_pointer(
+            model, "SumState", "split_offsets"
+        ),
     }
+
+
+def _partial_state_source_pointer(
+    model: dict[str, Any],
+    name: str,
+    source_axis_coordinate: str,
+    source_owner_coordinates: dict[int, str] | None = None,
+) -> str:
+    """Address one contributor's compact-local partial state in its pool."""
+
+    address = model.get(f"{name}Address")
+    if not isinstance(address, dict):
+        raise ValueError(f"PyNTT partial state {name} requires pooled address metadata")
+    split_axis = int(model["SplitHierarchyAxis"])
+    hierarchy = tuple(int(extent) for extent in model["Hierarchy"])
+    if split_axis < 0 or split_axis >= len(hierarchy):
+        raise ValueError(
+            f"PyNTT partial state split axis {split_axis} is outside rank {len(hierarchy)}"
+        )
+    source_coordinates = [f"shard_coord{axis}" for axis in range(len(hierarchy))]
+    source_coordinates[split_axis] = source_axis_coordinate
+    for axis, coordinate in (source_owner_coordinates or {}).items():
+        if axis < 0 or axis >= len(hierarchy):
+            raise ValueError(
+                f"PyNTT partial state owner axis {axis} is outside rank {len(hierarchy)}"
+            )
+        if axis == split_axis:
+            raise ValueError(
+                "PyNTT partial state owner coordinates must not replace its partial axis"
+            )
+        source_coordinates[axis] = coordinate
+    source_shard_index = source_coordinates[0]
+    for axis in range(1, len(hierarchy)):
+        source_shard_index = (
+            f"(({source_shard_index}) * {hierarchy[axis]} + "
+            f"({source_coordinates[axis]}))"
+        )
+    source_pool_index = _pool_index_expression(
+        source_shard_index, address["PoolScopeSize"]
+    )
+    byte_offset = (
+        f"({source_pool_index}) * ({address['PoolStrideBytes']})"
+        f" + ({address['OffsetBytes']})"
+    )
+    pointer_type = _pointer_type("tl.float32", address["AddressSpace"])
+    return f"({address['BaseName']} + ({byte_offset})).to({pointer_type})"
 
 
 def _update_paged_attention_kv_cache_template_context(

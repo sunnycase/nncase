@@ -14,21 +14,32 @@
 {% set base = "    " * ((ctx["outer_axes"] | length) + 1) %}
 {% set body = "    " * ((ctx["outer_axes"] | length) + 2) %}
 {% if model["UseMean"] %}
-{{ base }}mean_sum = tl.full((), 0.0, tl.float32)
+{{ base }}mean_partial = tl.zeros({{ ctx["tile_shape"] }}, tl.float32)
 {% endif %}
-{{ base }}square_sum = tl.full((), 0.0, tl.float32)
+{{ base }}square_partial = tl.zeros({{ ctx["tile_shape"] }}, tl.float32)
+{% if ctx["flat_reduction"] %}
+{{ base }}for reduction_start in tl.range(0, {{ ctx["reduction_extent"] }}, block_size, loop_unroll_factor=1):
+{{ body }}reduction_offsets = reduction_start + tl.arange(0, block_size)
+{{ body }}mask = reduction_offsets < {{ ctx["reduction_extent"] }}
+{{ body }}value0 = tl.load({{ access_pointer(model, "Input", "input0", ctx["flat_input_base_access"]) }} + reduction_offsets, mask=mask, other=0.0).to(tl.float32)
+{% if model["UseMean"] %}
+{{ body }}mean_partial += value0
+{% endif %}
+{{ body }}square_partial += value0 * value0
+{% else %}
 {% call(body) elementwise.iterate(ctx, ctx["prefix_depth"]) %}
 {{ body }}value0 = tl.load({{ access_pointer(model, "Input", "input0", ctx["input_access"]) }}, mask=mask, other=0.0).to(tl.float32)
 {% if model["UseMean"] %}
-{{ body }}mean_sum += {{ ctx["reduction"] }}
+{{ body }}mean_partial += value0
 {% endif %}
-{{ body }}square_sum += {{ ctx["square_reduction"] }}
+{{ body }}square_partial += value0 * value0
 {% endcall %}
+{% endif %}
 {% if model["UseMean"] %}
-{{ base }}tl.store({{ access_pointer(model, "Output", "output", ctx["stats_accesses"][0]) }}, mean_sum, mask=True)
-{{ base }}tl.store({{ access_pointer(model, "Output", "output", ctx["stats_accesses"][1]) }}, square_sum, mask=True)
+{{ base }}tl.store({{ access_pointer(model, "Output", "output", ctx["stats_accesses"][0]) }}, {{ ctx["reduction"] }}, mask=True)
+{{ base }}tl.store({{ access_pointer(model, "Output", "output", ctx["stats_accesses"][1]) }}, {{ ctx["square_reduction"] }}, mask=True)
 {% else %}
-{{ base }}tl.store({{ access_pointer(model, "Output", "output", ctx["stats_accesses"][0]) }}, square_sum, mask=True)
+{{ base }}tl.store({{ access_pointer(model, "Output", "output", ctx["stats_accesses"][0]) }}, {{ ctx["square_reduction"] }}, mask=True)
 {% endif %}
 
 

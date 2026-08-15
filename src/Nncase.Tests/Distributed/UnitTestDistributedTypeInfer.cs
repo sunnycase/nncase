@@ -524,4 +524,42 @@ public sealed class UnitTestDistributedTypeInfer : TestClassBase
             Assert.Equal(except, reshape.CheckedType);
         }
     }
+
+    [Fact]
+    public void TestReshapeFlattensOrderedBlockCyclicSplits()
+    {
+        var placement = new Placement([4, 8], "yx", "bb");
+        var inputType = new DistributedType(
+            new TensorType(new VectorType(DataTypes.BFloat16, [8]), [16, 16, 1]),
+            [
+                SBP.SBlockCyclic([1], 2),
+                SBP.SBlockCyclic([0], 4),
+                SBP.B,
+            ],
+            placement);
+
+        var reshape = IR.F.Tensors.Reshape(new Var("input", inputType), [1, 256]);
+        var expectedReshapeType = new DistributedType(
+            new TensorType(new VectorType(DataTypes.BFloat16, [8]), [1, 256]),
+            [
+                SBP.B,
+                SBP.S(
+                    SplitStage.BlockCyclic([1], 32),
+                    SplitStage.BlockCyclic([0], 4)),
+            ],
+            placement);
+        Assert.Equal(expectedReshapeType, reshape.CheckedType);
+
+        var bitcast = IR.F.Tensors.Bitcast(reshape, DataTypes.BFloat16);
+        var expectedBitcastType = new DistributedType(
+            new TensorType(DataTypes.BFloat16, [1, 2048]),
+            [
+                SBP.B,
+                SBP.S(
+                    SplitStage.BlockCyclic([1], 256),
+                    SplitStage.BlockCyclic([0], 32)),
+            ],
+            placement);
+        Assert.Equal(expectedBitcastType, bitcast.CheckedType);
+    }
 }

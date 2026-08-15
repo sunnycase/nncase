@@ -65,6 +65,54 @@ public partial class NTT
             addend ?? None.Default);
     }
 
+    public static Expr PagedAttentionPartial(
+        Expr q,
+        Expr kvCaches,
+        Expr extra,
+        Expr scale,
+        Dimension layerId,
+        IRArray<IR.NN.AttentionDimKind> layout,
+        int hiddenSize,
+        int splitHierarchyAxis,
+        int splitCount)
+    {
+        return new Call(
+            new PagedAttentionPartial(
+                layout,
+                hiddenSize,
+                splitHierarchyAxis,
+                splitCount),
+            q,
+            kvCaches,
+            extra,
+            scale,
+            layerId);
+    }
+
+    public static Expr PagedAttentionCombine(
+        Expr maxState,
+        Expr sumState,
+        Expr accState,
+        IRArray<IR.NN.AttentionDimKind> layout,
+        int hiddenSize,
+        DataType outputDataType,
+        IRType outputType,
+        int splitHierarchyAxis,
+        int splitCount)
+    {
+        return new Call(
+            new PagedAttentionCombine(
+                layout,
+                hiddenSize,
+                outputDataType,
+                outputType,
+                splitHierarchyAxis,
+                splitCount),
+            maxState,
+            sumState,
+            accState);
+    }
+
     public static Expr PackedQKVParallelLinear(
         Expr input,
         Expr qWeight,

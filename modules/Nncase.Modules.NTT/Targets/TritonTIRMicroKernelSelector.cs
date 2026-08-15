@@ -675,9 +675,6 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
         var gemv = m == 1;
         if (gemv)
         {
-            // QKV packs three descriptor copies into one staged RHS tile,
-            // while GLU stages gate/up in two adjacent physical slots.
-            var transferIssueCount = sourceArgumentIndices?.Count ?? 0;
             if (TryGetPackedBFloat16GemvPipelineConfiguration(
                     machine,
                     family,
@@ -688,7 +685,6 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
                     fixedK,
                     kMajorPacked,
                     simultaneousRhsTileCount,
-                    transferIssueCount,
                     out var pipeline))
             {
                 const int nVector = 8;
@@ -805,7 +801,6 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
         bool fixedK,
         bool kMajorPacked,
         int rhsTilesPerGroup,
-        int transferIssueCount,
         out PackedGemvPipelineConfiguration configuration)
     {
         configuration = default;
@@ -813,7 +808,6 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
              family != "triton.qkv_parallel_linear" &&
              family != "triton.matmul_glu") ||
             rhsTilesPerGroup <= 0 ||
-            transferIssueCount <= 0 ||
             !kMajorPacked ||
             lhsType != DataTypes.BFloat16 ||
             rhsType != DataTypes.BFloat16 ||
@@ -863,18 +857,18 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
                 }
 
                 var stageBytes = checked((long)candidateBlockN * candidateBlockK * elementBytes);
-                foreach (var logicalStageCount in asynchronousTransfer.SupportedStageCounts)
+                foreach (var physicalStageCount in asynchronousTransfer.SupportedStageCounts)
                 {
                     // A physical pipe slot owns one staged RHS tile. Fused projections
                     // consume adjacent slots, so double buffering applies to complete
                     // RHS groups rather than individual slots.
-                    if (logicalStageCount < PackedGemvMinimumLogicalStages)
+                    if (physicalStageCount % rhsTilesPerGroup != 0 ||
+                        physicalStageCount / rhsTilesPerGroup < PackedGemvMinimumLogicalStages)
                     {
                         continue;
                     }
 
-                    var candidateStages = checked(logicalStageCount * rhsTilesPerGroup);
-                    var requiredSharedBytes = checked(candidateStages * stageBytes);
+                    var requiredSharedBytes = checked(physicalStageCount * stageBytes);
                     var allocatedSharedBytes = machine.GetAllocationSizeBytes(
                         sharedSpace,
                         requiredSharedBytes);
@@ -886,16 +880,17 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
                     var candidateConfiguration = new PackedGemvPipelineConfiguration(
                         candidateBlockN,
                         candidateBlockK,
-                        candidateStages);
+                        physicalStageCount);
                     var candidate = new PackedGemvPipelineCandidate(
                         candidateConfiguration,
                         EstimatePackedGemvPipelineCycles(
                             machine,
                             transfer,
+                            machine.GetMemoryResource(sharedSpace),
                             n,
                             k,
                             rhsTilesPerGroup,
-                            transferIssueCount,
+                            rhsType.SizeInBytes,
                             candidateConfiguration),
                         allocatedSharedBytes);
                     if (bestCandidate is null || IsBetterPackedGemvPipelineCandidate(candidate, bestCandidate.Value))
@@ -918,49 +913,87 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
     private static long EstimatePackedGemvPipelineCycles(
         TargetMachineModel machine,
         TargetMemoryTransferSpec transfer,
+        TargetMemoryResourceSpec sharedMemory,
         long n,
         long k,
         int rhsTilesPerGroup,
-        int transferIssueCount,
+        int elementBytes,
         PackedGemvPipelineConfiguration configuration)
     {
-        const long elementBytes = 2;
         var nTileCount = DivideRoundUp(n, configuration.BlockN);
         var kTileCount = k / configuration.BlockK;
         var logicalTileCount = checked(nTileCount * kTileCount);
-        var rhsBytesPerLogicalTile = checked(
+        var bytesPerRhsTile = checked(
             (long)configuration.BlockN *
             configuration.BlockK *
-            elementBytes *
-            rhsTilesPerGroup);
+            elementBytes);
+        var bytesPerLogicalTile = checked(bytesPerRhsTile * rhsTilesPerGroup);
 
-        // Global bandwidth is modeled at chip scope, so a persistent block is
-        // charged its contended share while all compute units are resident.
-        var contendedTransferBytes = checked(
-            rhsBytesPerLogicalTile * machine.Execution.ComputeUnitCount);
-        var transferCycles = checked(
-            DivideRoundUp(contendedTransferBytes, transfer.BytesPerCycle) +
-            (transfer.LatencyCycles * transferIssueCount));
+        // Model the block-local modulo schedule here. Chip-global contention is
+        // common to all blocks and belongs to the graph-level cost model; folding
+        // it into each producer service serializes latency that the stage ring is
+        // specifically intended to overlap.
+        var producerTransferCycles = DivideRoundUp(
+            bytesPerLogicalTile,
+            transfer.BytesPerCycle);
+        var producerControlCycles = checked(
+            (long)rhsTilesPerGroup *
+            (machine.Synchronization.BlockCycles +
+             transfer.Asynchronous!.CommitCycles));
+        var producerServiceCycles = checked(
+            producerTransferCycles + producerControlCycles);
+
         var fmaCount = checked(
             (long)configuration.BlockN *
             configuration.BlockK *
             rhsTilesPerGroup);
-        var consumerCycles = DivideRoundUp(fmaCount, machine.Compute.SimtFmaPerCycle);
-        var steadyStateCycles = Math.Max(transferCycles, consumerCycles);
-        var pipelineCycles = checked(
-            transferCycles +
-            consumerCycles +
-            ((logicalTileCount - 1) * steadyStateCycles));
+        var sharedLoadCycles = DivideRoundUp(
+            bytesPerLogicalTile,
+            sharedMemory.ReadBytesPerCycle);
+        var fmaCycles = DivideRoundUp(fmaCount, machine.Compute.SimtFmaPerCycle);
+        var consumerWorkCycles = Math.Max(sharedLoadCycles, fmaCycles);
 
-        var asynchronousControl = transfer.Asynchronous is null
-            ? 0
-            : checked(
-                transfer.Asynchronous.CommitCycles +
-                transfer.Asynchronous.WaitCycles);
-        var controlCycles = checked(
-            ((long)configuration.NumStages * machine.Synchronization.BlockCycles) +
-            (logicalTileCount * transferIssueCount * asynchronousControl));
-        return checked(pipelineCycles + controlCycles);
+        // The template partitions N across all consumer warps and K within a
+        // warp. A tile narrower than one target vector per thread still issues
+        // the same warp instructions with proportionally fewer useful lanes.
+        var vectorLanes = machine.Execution.VectorWidthBits /
+            checked(elementBytes * 8);
+        var nValuesPerWarp = configuration.BlockN /
+            machine.Execution.WorkersPerBlock;
+        if (vectorLanes <= 0 || nValuesPerWarp <= 0)
+        {
+            throw new InvalidOperationException(
+                $"Packed GEMV vector utilization requires positive vector and per-warp N extents, " +
+                $"got vector_lanes={vectorLanes}, block_n={configuration.BlockN}, " +
+                $"consumer_warps={machine.Execution.WorkersPerBlock}.");
+        }
+
+        var usefulVectorLanes = Math.Min(vectorLanes, nValuesPerWarp);
+        consumerWorkCycles = DivideRoundUp(
+            checked(consumerWorkCycles * vectorLanes),
+            usefulVectorLanes);
+        var consumerControlCycles = checked(
+            (long)rhsTilesPerGroup *
+            (transfer.Asynchronous.WaitCycles +
+             machine.Synchronization.BlockCycles));
+        var consumerServiceCycles = checked(
+            consumerWorkCycles + consumerControlCycles);
+
+        var logicalStageCount = configuration.NumStages / rhsTilesPerGroup;
+        var slotLifetimeCycles = checked(
+            producerServiceCycles +
+            transfer.LatencyCycles +
+            consumerServiceCycles);
+        var recurrenceCycles = DivideRoundUp(
+            slotLifetimeCycles,
+            logicalStageCount);
+        var initiationIntervalCycles = Math.Max(
+            Math.Max(producerServiceCycles, consumerServiceCycles),
+            recurrenceCycles);
+        return checked(
+            producerServiceCycles +
+            consumerServiceCycles +
+            ((logicalTileCount - 1) * initiationIntervalCycles));
     }
 
     private static bool IsBetterPackedGemvPipelineCandidate(
@@ -994,7 +1027,7 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
 
         if (candidate.Configuration.BlockK != current.Configuration.BlockK)
         {
-            return candidate.Configuration.BlockK > current.Configuration.BlockK;
+            return candidate.Configuration.BlockK < current.Configuration.BlockK;
         }
 
         return false;

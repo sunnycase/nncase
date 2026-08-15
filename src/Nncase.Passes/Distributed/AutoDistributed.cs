@@ -691,6 +691,16 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
     private const int MaxProviderReturnCandidateTypes = 4096;
     private const int HiddenFunctionDependencyIndex = -1;
 
+    private readonly record struct CandidateInvocation(
+        DistributedSearchGraph[] Buckets,
+        Expr Target,
+        IRType? ExpectedReturnType,
+        bool AllowsPartialInputs);
+
+    private readonly record struct ProviderCandidateResult(
+        IReadOnlyList<CandidateInvocation> Invocations,
+        bool IsExhaustive);
+
     private readonly Dictionary<BaseExpr, DistributedSearchGraph> _reshardMemo;
 
     private readonly Dictionary<BaseExpr, DistributedSearchGraph> _inferedMemo;
@@ -1357,8 +1367,9 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
 
         // 1. inference
         var bucketMemo = new Dictionary<IRType, DistributedSearchGraph>();
-        foreach (var bucketArray in EnumerateCandidateBucketArrays(expr, isSupported, argClusters))
+        foreach (var candidate in EnumerateCandidateBucketArrays(expr, isSupported, argClusters))
         {
+            var bucketArray = candidate.Buckets;
             _profiler.Count("candidate_arg_combinations");
 
             string[]? candidateDesc = null;
@@ -1387,12 +1398,14 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
                 SearchableNode { Expr: Call { Target: AsTensor } attr } => attr,
                 SearchableNode n => new Var(n.IRType),
             }).ToArray();
-            var newExprs = _profiler.Time("build_equivalent_calls", () => BuildEquivalentCalls(expr.Target, tempArgs).ToArray());
+            var newExprs = _profiler.Time("build_equivalent_calls", () => BuildEquivalentCalls(candidate.Target, tempArgs).ToArray());
             _profiler.Count("candidate_equivalent_calls", newExprs.Length);
             foreach (var (newExpr, used) in newExprs)
             {
                 _profiler.Count("candidate_exprs");
-                if (expr.Target is not Boxing && ((Call)newExpr).Arguments.AsValueEnumerable().Any(a => a.CheckedType is DistributedType dt && dt.Partial is not null))
+                if (expr.Target is not Boxing &&
+                    !candidate.AllowsPartialInputs &&
+                    ((Call)newExpr).Arguments.AsValueEnumerable().Any(a => a.CheckedType is DistributedType dt && dt.Partial is not null))
                 {
                     RecordCandidateDiagnostic(expr, bucketArray, "infer", "rejected", null, "partial argument is not allowed before boxing");
                     continue;
@@ -1407,6 +1420,19 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
                 if (newExpr.CheckedType is InvalidType invalidType)
                 {
                     RecordCandidateDiagnostic(expr, bucketArray, "infer", "rejected", invalidType, invalidType.Reason);
+                    continue;
+                }
+
+                if (candidate.ExpectedReturnType is { } expectedReturnType &&
+                    newExpr.CheckedType != expectedReturnType)
+                {
+                    RecordCandidateDiagnostic(
+                        expr,
+                        bucketArray,
+                        "infer",
+                        "rejected",
+                        newExpr.CheckedType,
+                        $"candidate provider expected {expectedReturnType}, got {newExpr.CheckedType}");
                     continue;
                 }
 
@@ -1609,30 +1635,44 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         return success;
     }
 
-    private IEnumerable<DistributedSearchGraph[]> EnumerateCandidateBucketArrays(Call expr, bool isSupported, IReadOnlyList<DistributedSearchGraph> argClusters)
+    private IEnumerable<CandidateInvocation> EnumerateCandidateBucketArrays(Call expr, bool isSupported, IReadOnlyList<DistributedSearchGraph> argClusters)
     {
-        var providerBuckets = TryBuildProviderCandidateBucketArrays(expr, isSupported, argClusters);
-        if (providerBuckets.Count > 0)
+        var providerResult = TryBuildProviderCandidateBucketArrays(expr, isSupported, argClusters);
+        if (providerResult.Invocations.Count > 0)
         {
-            foreach (var bucketArray in providerBuckets)
+            foreach (var invocation in providerResult.Invocations)
             {
-                yield return bucketArray;
+                yield return invocation;
             }
 
             yield break;
         }
 
+        if (providerResult.IsExhaustive)
+        {
+            yield break;
+        }
+
+        var allowsPartialInputs = expr.Target is Op op &&
+            _candidateProviderResolver is not null &&
+            _candidateProviderResolver.TryGetProvider(op, out var fallbackProvider) &&
+            fallbackProvider.AllowsPartialInputs;
+
         foreach (var combBuckets in argClusters.Select(c => c.Clusters.OfType<DistributedSearchGraph>()).CartesianProduct())
         {
-            yield return combBuckets.ToArray();
+            yield return new CandidateInvocation(
+                combBuckets.ToArray(),
+                expr.Target,
+                null,
+                allowsPartialInputs);
         }
     }
 
-    private IReadOnlyList<DistributedSearchGraph[]> TryBuildProviderCandidateBucketArrays(Call expr, bool isSupported, IReadOnlyList<DistributedSearchGraph> argClusters)
+    private ProviderCandidateResult TryBuildProviderCandidateBucketArrays(Call expr, bool isSupported, IReadOnlyList<DistributedSearchGraph> argClusters)
     {
         if (!isSupported || expr.Target is not Op op || _candidateProviderResolver is null || !_candidateProviderResolver.TryGetProvider(op, out var provider))
         {
-            return Array.Empty<DistributedSearchGraph[]>();
+            return new(Array.Empty<CandidateInvocation>(), false);
         }
 
         _profiler.Count("candidate_provider_queries");
@@ -1647,7 +1687,7 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         if (candidatesByInput.Any(candidates => candidates.Length == 0))
         {
             _profiler.Count("candidate_provider_empty_input");
-            return Array.Empty<DistributedSearchGraph[]>();
+            return new(Array.Empty<CandidateInvocation>(), provider.IsExhaustive);
         }
 
         var availableInputTypes = candidatesByInput
@@ -1662,7 +1702,7 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         if (returnTypes.Length == 0)
         {
             _profiler.Count("candidate_provider_no_return_types");
-            return Array.Empty<DistributedSearchGraph[]>();
+            return new(Array.Empty<CandidateInvocation>(), provider.IsExhaustive);
         }
 
         if (returnTypes.Length > MaxProviderReturnCandidateTypes)
@@ -1677,7 +1717,7 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
                 .GroupBy(candidate => candidate.Type)
                 .ToDictionary(group => group.Key, group => group.Select(candidate => candidate.Bucket).ToArray()))
             .ToArray();
-        var result = new List<DistributedSearchGraph[]>();
+        var result = new List<CandidateInvocation>();
         var tupleCount = 0;
         foreach (var returnType in returnTypes)
         {
@@ -1687,9 +1727,17 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
             }
 
             tupleCount += tuples.Count;
+            var candidateTarget = provider.CreateCandidateTarget(context, op, returnType);
             foreach (var tuple in tuples)
             {
-                ExpandProviderTuple(tuple, argClusters, bucketsByInputType, result);
+                ExpandProviderTuple(
+                    tuple,
+                    argClusters,
+                    bucketsByInputType,
+                    result,
+                    candidateTarget,
+                    returnType,
+                    provider.AllowsPartialInputs);
             }
         }
 
@@ -1699,18 +1747,21 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         if (result.Count == 0)
         {
             _profiler.Count("candidate_provider_fallback");
-            return Array.Empty<DistributedSearchGraph[]>();
+            return new(Array.Empty<CandidateInvocation>(), provider.IsExhaustive);
         }
 
         _profiler.Count("candidate_provider_hit");
-        return result;
+        return new(result, provider.IsExhaustive);
     }
 
     private void ExpandProviderTuple(
         DistributedCandidateTuple tuple,
         IReadOnlyList<DistributedSearchGraph> inputClusters,
         IReadOnlyList<Dictionary<IRType, DistributedSearchGraph[]>> bucketsByInputType,
-        List<DistributedSearchGraph[]> result)
+        List<CandidateInvocation> result,
+        Expr candidateTarget,
+        IRType expectedReturnType,
+        bool allowsPartialInputs)
     {
         if (tuple.InputTypes.Count != bucketsByInputType.Count)
         {
@@ -1739,7 +1790,11 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
 
         foreach (var combBuckets in bucketChoices.CartesianProduct())
         {
-            result.Add(combBuckets.ToArray());
+            result.Add(new CandidateInvocation(
+                combBuckets.ToArray(),
+                candidateTarget,
+                expectedReturnType,
+                allowsPartialInputs));
         }
     }
 

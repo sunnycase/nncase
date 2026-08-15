@@ -239,6 +239,47 @@ public sealed class UnitTestTileGraph : TestClassBase
     }
 
     [Fact]
+    public void TestBlockCyclicAxesFlattenToEquivalentCompactLocalView()
+    {
+        var placement = new Placement([4, 8], "yx", "bb");
+        var dataType = new VectorType(DataTypes.BFloat16, [8]);
+        var sourceType = new DistributedType(
+            new TensorType(dataType, new[] { 16, 16, 1 }),
+            new SBP[]
+            {
+                SBP.SBlockCyclic([1], 2),
+                SBP.SBlockCyclic([0], 4),
+                SBP.B,
+            },
+            placement);
+        var resultType = new DistributedType(
+            new TensorType(dataType, new[] { 1, 256 }),
+            new SBP[]
+            {
+                SBP.B,
+                SBP.S(
+                    SplitStage.BlockCyclic([1], 32),
+                    SplitStage.BlockCyclic([0], 4)),
+            },
+            placement);
+
+        Assert.True(IR.Affine.BufferViewUtility.TryCreate(sourceType, resultType, out var transform));
+        var source = T.CreateBuffer(
+            sourceType.TensorType,
+            MemoryLocation.Data,
+            out _,
+            distributedType: sourceType);
+        var view = IR.Affine.BufferViewUtility.CreateLogicalBufferView(
+            source,
+            resultType,
+            transform,
+            "flattened_view");
+
+        Assert.Equal(new long[] { 0, 1 }, view.Strides.ToArray().Select(stride => stride.FixedValue));
+        Assert.Same(source.MemSpan.Buffer, view.MemSpan.Buffer);
+    }
+
+    [Fact]
     public void TestVectorBitcastRejectsByteIncompatibleShardGranularity()
     {
         var placement = new Placement([8], "b", "b");

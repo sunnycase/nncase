@@ -13,9 +13,12 @@
     seq_lens = {{ model["SeqLensArgument"] }}
     num_seqs = {{ model["NumSeqsArgument"] }}
     layer_id_value = (tl.full((), 0, tl.int32) + ({{ model["LayerIdExpression"] }})).to(tl.int32)
-{% for name, key in (("query", "Query"), ("scale_ptr", "Scale"), ("direct_output", "Output")) %}
+{% for name, key in (("query", "Query"), ("scale_ptr", "Scale")) %}
     {{ name }} = {{ ptr(model, key) }}
 {% endfor %}
+{% if model["HasDirectOutput"] %}
+    direct_output = {{ ptr(model, "Output") }}
+{% endif %}
     scale_value = tl.load({{ access_pointer(model, "Scale", "scale_ptr") }}).to(tl.float32)
     scale_log2_value = scale_value * 1.4426950408889634
     max_seq_len = tl.full((), 0, tl.int64)
@@ -23,7 +26,7 @@
     for seq_scan in tl.range(0, num_seqs):
         seq_len_scan = tl.load(seq_lens + seq_scan).to(tl.int64)
         max_seq_len = tl.maximum(max_seq_len, seq_len_scan)
-    direct_context = (num_seqs == 1) & (max_seq_len <= {{ model["DirectContextThreshold"] }})
+    direct_context = {{ "(num_seqs == 1) & (max_seq_len <= " ~ model["DirectContextThreshold"] ~ ")" if model["HasDirectOutput"] else "False" }}
     block_table_blocks = tl.cdiv(max_seq_len, {{ cache["BlockSize"] }})
     split_span = tl.cdiv(max_seq_len, {{ ctx["split_count"] * ctx["attention_block_size"] }}) * {{ ctx["attention_block_size"] }}
     planned_split_begin = tl.minimum(({{ ctx["split_coord"] }}).to(tl.int64) * split_span, max_seq_len)
@@ -120,9 +123,11 @@
             tl.store({{ access_pointer(model, "MaxState", "max_state", ctx["max_state_access"]) }}, max_score, mask=state_mask)
             tl.store({{ access_pointer(model, "SumState", "sum_state", ctx["sum_state_access"]) }}, sum_exp, mask=state_mask)
             tl.store({{ access_pointer(model, "AccState", "acc_state", ctx["acc_state_access"]) }}, acc, mask=state_mask[:, None])
+{% if model["HasDirectOutput"] %}
             inv_sum = tl.where(sum_exp != 0.0, 1.0 / sum_exp, 0.0)
             direct_result = tl.reshape(acc * inv_sum[:, None], {{ ctx["query_structured_shape"] }})
             tl.store({{ access_pointer(model, "Output", "direct_output", ctx["output_access"]) }}, direct_result, mask=direct_context & found_seq & {{ ctx["output_mask"] }})
+{% endif %}
 
 
 {{ phases.dispatch(model) }}

@@ -185,7 +185,7 @@ def {{ model["FunctionName"] }}__regular_producer(key_writer, value_writer, {{ h
     num_tokens = tl.load(query_start_loc + num_seqs).to(tl.int64)
     for seq_scan in tl.range(0, num_seqs):
         max_seq_len = tl.maximum(max_seq_len, tl.load(seq_lens + seq_scan).to(tl.int64))
-    direct_context = (num_seqs == 1) & (max_seq_len <= {{ model["DirectContextThreshold"] }})
+    direct_context = {{ "(num_seqs == 1) & (max_seq_len <= " ~ model["DirectContextThreshold"] ~ ")" if model["HasDirectOutput"] else "False" }}
     single_token_context = direct_context & (max_seq_len == 1)
     block_table_blocks = tl.cdiv(max_seq_len, {{ cache["BlockSize"] }})
     split_span = tl.cdiv(max_seq_len, {{ ctx["split_count"] * ctx["attention_block_size"] }}) * {{ ctx["attention_block_size"] }}
@@ -241,16 +241,19 @@ def {{ model["FunctionName"] }}__regular_consumer(key_reader, value_reader, {{ h
     query_start_loc = {{ model["QueryStartLocArgument"] }}
     seq_lens = {{ model["SeqLensArgument"] }}
     num_seqs = {{ model["NumSeqsArgument"] }}
-{% for name, key in (("query", "Query"), ("scale_ptr", "Scale"), ("direct_output", "Output")) %}
+{% for name, key in (("query", "Query"), ("scale_ptr", "Scale")) %}
     {{ name }} = {{ ptr(model, key) }}
 {% endfor %}
+{% if model["HasDirectOutput"] %}
+    direct_output = {{ ptr(model, "Output") }}
+{% endif %}
     scale_value = tl.load({{ access_pointer(model, "Scale", "scale_ptr") }}).to(tl.float32)
     scale_log2_value = scale_value * 1.4426950408889634
     max_seq_len = tl.full((), 0, tl.int64)
     num_tokens = tl.load(query_start_loc + num_seqs).to(tl.int64)
     for seq_scan in tl.range(0, num_seqs):
         max_seq_len = tl.maximum(max_seq_len, tl.load(seq_lens + seq_scan).to(tl.int64))
-    direct_context = (num_seqs == 1) & (max_seq_len <= {{ model["DirectContextThreshold"] }})
+    direct_context = {{ "(num_seqs == 1) & (max_seq_len <= " ~ model["DirectContextThreshold"] ~ ")" if model["HasDirectOutput"] else "False" }}
     single_token_context = direct_context & (max_seq_len == 1)
     block_table_blocks = tl.cdiv(max_seq_len, {{ cache["BlockSize"] }})
     split_span = tl.cdiv(max_seq_len, {{ ctx["split_count"] * ctx["attention_block_size"] }}) * {{ ctx["attention_block_size"] }}
@@ -361,9 +364,12 @@ def {{ model["FunctionName"] }}__regular_consumer(key_reader, value_reader, {{ h
             tl.store({{ access_pointer(model, "MaxState", "max_state", ctx["simt_max_state_access"]) }}, tle.encoding(max_score, {{ model["FunctionName"] }}__head_layout), mask=scalar_store_mask)
             tl.store({{ access_pointer(model, "SumState", "sum_state", ctx["simt_sum_state_access"]) }}, tle.encoding(sum_exp, {{ model["FunctionName"] }}__head_layout), mask=scalar_store_mask)
             tl.store({{ access_pointer(model, "AccState", "acc_state", ctx["simt_acc_state_access"]) }}, acc, mask=acc_store_mask)
+{% if model["HasDirectOutput"] %}
             inv_sum = tl.where(sum_exp != 0.0, 1.0 / sum_exp, 0.0)
-            direct_result = tl.reshape(acc * inv_sum[:, None], {{ ctx["query_structured_shape"] }})
+            acc_inv_sum = tle.encoding(inv_sum[:, None], {{ ctx["simt_acc_layout_name"] }})
+            direct_result = tl.reshape(acc * acc_inv_sum, {{ ctx["query_structured_shape"] }})
             tl.store({{ access_pointer(model, "Output", "direct_output", ctx["output_access"]) }}, direct_result, mask=direct_context & found_seq & {{ ctx["output_mask"] }})
+{% endif %}
 
 
 {{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
@@ -374,7 +380,7 @@ def {{ model["FunctionName"] }}__producer(key_writer, value_writer, {{ helper_pa
     max_seq_len = tl.full((), 0, tl.int64)
     for seq_scan in tl.range(0, num_seqs):
         max_seq_len = tl.maximum(max_seq_len, tl.load(seq_lens + seq_scan).to(tl.int64))
-    direct_context = (num_seqs == 1) & (max_seq_len <= {{ model["DirectContextThreshold"] }})
+    direct_context = {{ "(num_seqs == 1) & (max_seq_len <= " ~ model["DirectContextThreshold"] ~ ")" if model["HasDirectOutput"] else "False" }}
     single_token_context = direct_context & (max_seq_len == 1)
     direct_owner = {{ ctx["split_coord"] }} == 0
     run_regular = (~single_token_context) & ((direct_context & direct_owner) | ((~direct_context) & ({{ ctx["split_coord"] }} < {{ ctx["split_count"] }})))
@@ -398,10 +404,11 @@ def {{ model["FunctionName"] }}__consumer(key_reader, value_reader, {{ helper_pa
     num_tokens = tl.load(query_start_loc + num_seqs).to(tl.int64)
     for seq_scan in tl.range(0, num_seqs):
         max_seq_len = tl.maximum(max_seq_len, tl.load(seq_lens + seq_scan).to(tl.int64))
-    direct_context = (num_seqs == 1) & (max_seq_len <= {{ model["DirectContextThreshold"] }})
+    direct_context = {{ "(num_seqs == 1) & (max_seq_len <= " ~ model["DirectContextThreshold"] ~ ")" if model["HasDirectOutput"] else "False" }}
     single_token_context = direct_context & (max_seq_len == 1)
     direct_owner = {{ ctx["split_coord"] }} == 0
     run_regular = (~single_token_context) & ((direct_context & direct_owner) | ((~direct_context) & ({{ ctx["split_coord"] }} < {{ ctx["split_count"] }})))
+{% if model["HasDirectOutput"] %}
     if single_token_context:
         if direct_owner:
             layer_id_value = (tl.full((), 0, tl.int32) + ({{ model["LayerIdExpression"] }})).to(tl.int32)
@@ -440,4 +447,8 @@ def {{ model["FunctionName"] }}__consumer(key_reader, value_reader, {{ helper_pa
     else:
         if run_regular:
             {{ model["FunctionName"] }}__regular_consumer(key_reader, value_reader, {{ helper_argument_names(model) }})
+{% else %}
+    if run_regular:
+        {{ model["FunctionName"] }}__regular_consumer(key_reader, value_reader, {{ helper_argument_names(model) }})
+{% endif %}
 {% endif %}

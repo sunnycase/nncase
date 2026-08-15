@@ -35,16 +35,19 @@
     seq_lens = {{ model["SeqLensArgument"] }}
     num_seqs = {{ model["NumSeqsArgument"] }}
     layer_id_value = (tl.full((), 0, tl.int32) + ({{ model["LayerIdExpression"] }})).to(tl.int32)
-{% for name, key in (("query", "Query"), ("scale_ptr", "Scale"), ("max_state", "MaxState"), ("sum_state", "SumState"), ("acc_state", "AccState"), ("direct_output", "Output")) %}
+{% for name, key in (("query", "Query"), ("scale_ptr", "Scale"), ("max_state", "MaxState"), ("sum_state", "SumState"), ("acc_state", "AccState")) %}
     {{ name }} = {{ ptr(model, key) }}
 {% endfor %}
+{% if model["HasDirectOutput"] %}
+    direct_output = {{ ptr(model, "Output") }}
+{% endif %}
     scale_value = tl.load({{ access_pointer(model, "Scale", "scale_ptr") }}).to(tl.float32)
     scale_log2_value = scale_value * 1.4426950408889634
     max_seq_len = tl.full((), 0, tl.int64)
     num_tokens = tl.load(query_start_loc + num_seqs).to(tl.int64)
     for seq_scan in tl.range(0, num_seqs):
         max_seq_len = tl.maximum(max_seq_len, tl.load(seq_lens + seq_scan).to(tl.int64))
-    direct_context = (num_seqs == 1) & (max_seq_len <= {{ model["DirectContextThreshold"] }})
+    direct_context = {{ "(num_seqs == 1) & (max_seq_len <= " ~ model["DirectContextThreshold"] ~ ")" if model["HasDirectOutput"] else "False" }}
     block_table_blocks = tl.cdiv(max_seq_len, {{ cache["BlockSize"] }})
     split_span = tl.cdiv(max_seq_len, {{ ctx["split_count"] * ctx["attention_block_size"] }}) * {{ ctx["attention_block_size"] }}
     planned_split_begin = tl.minimum(({{ ctx["split_coord"] }}).to(tl.int64) * split_span, max_seq_len)
@@ -163,9 +166,12 @@
             tl.store({{ access_pointer(model, "MaxState", "max_state", ctx["simt_max_state_access"]) }}, tle.encoding(max_score, {{ model["FunctionName"] }}__head_layout), mask=scalar_store_mask)
             tl.store({{ access_pointer(model, "SumState", "sum_state", ctx["simt_sum_state_access"]) }}, tle.encoding(sum_exp, {{ model["FunctionName"] }}__head_layout), mask=scalar_store_mask)
             tl.store({{ access_pointer(model, "AccState", "acc_state", ctx["simt_acc_state_access"]) }}, acc, mask=acc_store_mask)
+{% if model["HasDirectOutput"] %}
             inv_sum = tl.where(sum_exp != 0.0, 1.0 / sum_exp, 0.0)
-            direct_result = tl.reshape(acc * inv_sum[:, None], {{ ctx["query_structured_shape"] }})
+            acc_inv_sum = tle.encoding(inv_sum[:, None], {{ ctx["simt_acc_layout_name"] }})
+            direct_result = tl.reshape(acc * acc_inv_sum, {{ ctx["query_structured_shape"] }})
             tl.store({{ access_pointer(model, "Output", "direct_output", ctx["output_access"]) }}, direct_result, mask=direct_context & found_seq & {{ ctx["output_mask"] }})
+{% endif %}
 
 
 {{ phases.dispatch(model) }}

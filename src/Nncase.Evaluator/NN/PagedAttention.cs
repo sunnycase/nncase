@@ -23,10 +23,20 @@ public sealed class PagedAttentionEvaluator : ITypeInferencer<PagedAttention>, I
         _ = context.CheckArgumentType<DimensionType>(target, PagedAttention.LayerId);
         var kvcaches = context.CheckArgumentType<TensorType>(target, PagedAttention.KVCaches);
 
+        return InferType(target, q, extra, scale, kvcaches);
+    }
+
+    public static IRType InferType(
+        PagedAttention target,
+        IRType q,
+        IRType extra,
+        TensorType scale,
+        TensorType kvcaches)
+    {
         return (q, extra) switch
         {
-            (DistributedType dq, DistributedType dextra) => Visit(context, target, dq, dextra, scale, kvcaches),
-            (TensorType tq, TensorType textra) => Visit(context, target, tq, textra, scale, kvcaches, out _),
+            (DistributedType dq, DistributedType dextra) => InferDistributedType(target, dq, dextra, scale, kvcaches),
+            (TensorType tq, TensorType textra) => InferTensorType(tq, textra, scale, kvcaches, out _),
             _ => new InvalidType("not support type"),
         };
     }
@@ -149,7 +159,7 @@ public sealed class PagedAttentionEvaluator : ITypeInferencer<PagedAttention>, I
         return RefPagedAttn(q, kvCaches, scale, layerId, target.Layout).ToValue(context.GetReturnType());
     }
 
-    private static OrtKISharp.Tensor RefPagedAttn(OrtKISharp.Tensor query, Tensor<Reference<IPagedAttentionKVCache>> kvCaches, OrtKISharp.Tensor scale, int layerId, IRArray<AttentionDimKind> qlayout)
+    public static OrtKISharp.Tensor RefPagedAttn(OrtKISharp.Tensor query, Tensor<Reference<IPagedAttentionKVCache>> kvCaches, OrtKISharp.Tensor scale, int layerId, IRArray<AttentionDimKind> qlayout)
     {
         // TODO: Support DP
         if (kvCaches.Length != 1)
@@ -341,7 +351,7 @@ public sealed class PagedAttentionEvaluator : ITypeInferencer<PagedAttention>, I
         return concatCache; // [num_heads, seq_len, head_dim]
     }
 
-    private IRType Visit(ITypeInferenceContext context, PagedAttention target, TensorType q, IRType extra, TensorType scale, TensorType kvCaches, out PagedAttentionKVCacheType pagedAttentionKVCacheType)
+    private static IRType InferTensorType(TensorType q, IRType extra, TensorType scale, TensorType kvCaches, out PagedAttentionKVCacheType pagedAttentionKVCacheType)
     {
         pagedAttentionKVCacheType = null!;
         if (kvCaches.DType is not ReferenceType { ElemType: PagedAttentionKVCacheType kVCacheType })
@@ -365,9 +375,9 @@ public sealed class PagedAttentionEvaluator : ITypeInferencer<PagedAttention>, I
         return q;
     }
 
-    private IRType Visit(ITypeInferenceContext context, PagedAttention target, DistributedType q, DistributedType extra, TensorType scale, TensorType kvCaches)
+    private static IRType InferDistributedType(PagedAttention target, DistributedType q, DistributedType extra, TensorType scale, TensorType kvCaches)
     {
-        if (Visit(context, target, q.TensorType, extra, scale, kvCaches, out var kVCacheType) is InvalidType invalidType)
+        if (InferTensorType(q.TensorType, extra, scale, kvCaches, out var kVCacheType) is InvalidType invalidType)
         {
             return invalidType;
         }

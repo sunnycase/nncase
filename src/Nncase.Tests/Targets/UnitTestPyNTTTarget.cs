@@ -1100,16 +1100,19 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
     }
 
     [Theory]
-    [InlineData("rtx5060", 8, 1024, 8, 1024, 2)]
-    [InlineData("rtx5060", 16, 1024, 16, 1024, 2)]
-    [InlineData("rtx5060", 24, 1024, 8, 1024, 2)]
-    [InlineData("rtx5060", 32, 1024, 32, 512, 2)]
-    [InlineData("rtx5060", 40, 1024, 8, 1024, 2)]
-    [InlineData("rtx5060", 64, 1024, 64, 256, 2)]
+    [InlineData("rtx5060", 8, 1024, 8, 512, 2)]
+    [InlineData("rtx5060", 16, 1024, 16, 512, 2)]
+    [InlineData("rtx5060", 24, 1024, 32, 256, 3)]
+    [InlineData("rtx5060", 32, 1024, 32, 256, 3)]
+    [InlineData("rtx5060", 40, 1024, 64, 128, 4)]
+    [InlineData("rtx5060", 64, 1024, 64, 128, 4)]
+    [InlineData("rtx5060", 64, 2048, 64, 128, 4)]
+    [InlineData("rtx5060", 64, 6144, 64, 128, 4)]
+    [InlineData("rtx5060", 4752, 2048, 64, 128, 4)]
     [InlineData("h800", 8, 2048, 8, 1024, 2)]
     [InlineData("h800", 16, 2048, 16, 1024, 2)]
     [InlineData("h800", 8, 3072, 8, 1024, 2)]
-    [InlineData("h800", 32, 1024, 32, 1024, 2)]
+    [InlineData("h800", 32, 1024, 32, 512, 2)]
     [InlineData("h800", 64, 1024, 64, 512, 2)]
     [InlineData("h800", 1192, 2048, 64, 512, 2)]
     public void TestTritonPackedBFloat16GemvPipelineSelectsLocalNTile(
@@ -1155,9 +1158,11 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
 
         Assert.Equal("triton.matmul", selection.Family);
         Assert.Equal("simt_fma_smem_pipeline", selection.Variant);
-        Assert.Equal(expectedBlockN, selection.Parameters["block_n"]);
-        Assert.Equal(expectedBlockK, selection.Parameters["block_k"]);
-        Assert.Equal(expectedNumStages, selection.Parameters["num_stages"]);
+        var actualConfiguration = (
+            (int)selection.Parameters["block_n"],
+            (int)selection.Parameters["block_k"],
+            (int)selection.Parameters["num_stages"]);
+        Assert.Equal((expectedBlockN, expectedBlockK, expectedNumStages), actualConfiguration);
         var workspace = Assert.Single(selection.SharedWorkspaces);
         Assert.Equal("rhs_stage", workspace.Name);
         Assert.Equal(
@@ -1219,9 +1224,11 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
                 new(op, [lhs, rhs, output], targetOptions.TargetMachineModel)));
 
         Assert.Equal("simt_fma_smem_pipeline", selection.Variant);
-        Assert.Equal(32, selection.Parameters["block_n"]);
-        Assert.Equal(512, selection.Parameters["block_k"]);
-        Assert.Equal(2, selection.Parameters["num_stages"]);
+        var actualConfiguration = (
+            selection.Parameters["block_n"],
+            selection.Parameters["block_k"],
+            selection.Parameters["num_stages"]);
+        Assert.Equal((32L, 512L, 2L), actualConfiguration);
     }
 
     [Fact]
@@ -1401,8 +1408,8 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
     }
 
     [Theory]
-    [InlineData(24, 1024, 8, 1024)]
-    [InlineData(48, 2048, 16, 1024)]
+    [InlineData(24, 1024, 32, 512)]
+    [InlineData(48, 2048, 64, 256)]
     public void TestTritonH800PackedBFloat16GluPipelineSelectsPairedDoubleBuffer(
         int localScalarN,
         int k,
@@ -1465,9 +1472,11 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
 
         Assert.Equal("triton.matmul_glu", selection.Family);
         Assert.Equal("simt_fma_smem_pipeline", selection.Variant);
-        Assert.Equal(expectedBlockN, selection.Parameters["block_n"]);
-        Assert.Equal(expectedBlockK, selection.Parameters["block_k"]);
-        Assert.Equal(4, selection.Parameters["num_stages"]);
+        var actualConfiguration = (
+            (int)selection.Parameters["block_n"],
+            (int)selection.Parameters["block_k"],
+            (int)selection.Parameters["num_stages"]);
+        Assert.Equal((expectedBlockN, expectedBlockK, 4), actualConfiguration);
         var workspace = Assert.Single(selection.SharedWorkspaces);
         Assert.Equal(
             new long[]
@@ -1903,12 +1912,14 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
                     .GetProperty("Parameters")
                     .GetProperty("page_size")
                     .GetInt32());
-            Assert.Equal(
-                1,
-                partialModel.GetProperty("MaxStateShape").EnumerateArray().Last().GetProperty("FixedValue").GetInt64());
-            Assert.Equal(
-                4,
-                mergeModel.GetProperty("MaxStateShape").EnumerateArray().Last().GetProperty("FixedValue").GetInt64());
+            Assert.Equal(3, partialModel.GetProperty("MaxStateShape").GetArrayLength());
+            Assert.Equal(3, mergeModel.GetProperty("MaxStateShape").GetArrayLength());
+            Assert.NotEqual(
+                "0",
+                mergeModel
+                    .GetProperty("MaxStateAddress")
+                    .GetProperty("PoolStrideBytes")
+                    .GetString());
 
             var kernelInputs = kernelParams.RootElement.GetProperty("functions")
                 .EnumerateArray()
@@ -2162,7 +2173,7 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
                 line.Contains("chip_local_data", StringComparison.Ordinal))
             .ToArray();
         var chipLocalAllocation = Assert.Single(chipLocalAllocations);
-        Assert.Contains("\"main_prim.chip_local_data\", 1499648, \"uint8\"", chipLocalAllocation, StringComparison.Ordinal);
+        Assert.Contains("\"main_prim.chip_local_data\", 401408, \"uint8\"", chipLocalAllocation, StringComparison.Ordinal);
         Assert.DoesNotContain("self.allocate_workspace(inputs, \"main_segment_", modelPy, StringComparison.Ordinal);
         AssertGeneratedModelRuns(
             outputDirectory,
@@ -2474,8 +2485,8 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         Assert.Equal("triton.qkv_parallel_linear", microKernel.Family);
         Assert.Equal("simt_fma_smem_pipeline", microKernel.Variant);
         Assert.Equal(64, microKernel.Parameters["block_n"]);
-        Assert.Equal(256, microKernel.Parameters["block_k"]);
-        Assert.Equal(2, microKernel.Parameters["num_stages"]);
+        Assert.Equal(128, microKernel.Parameters["block_k"]);
+        Assert.Equal(4, microKernel.Parameters["num_stages"]);
         Assert.Equal(new[] { "rhs_stage" }, microKernel.SharedWorkspaces.Select(workspace => workspace.Name).ToArray());
         Assert.Equal(
             TIR.MemoryLocation.Shared,
@@ -2530,7 +2541,7 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
             RegexOptions.CultureInvariant);
         var kTileLoops = Regex.Matches(
             generatedKernelsPy,
-            $@"for k_tile in tl\.range\(0, {k / 256}\):",
+            $@"for k_tile in tl\.range\(0, {k / 128}\):",
             RegexOptions.CultureInvariant);
         var sharedSubSlices = Regex.Matches(
             generatedKernelsPy,
@@ -2542,18 +2553,18 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         Assert.Equal(2, sharedSubSlices.Count);
         var qDescriptorMatches = Regex.Matches(
             generatedKernelsPy,
-            @"'block_shape': \(8, 16, 2, 64\)",
+            @"'block_shape': \(8, 8, 2, 64\)",
             RegexOptions.CultureInvariant);
         var kvDescriptorMatches = Regex.Matches(
             generatedKernelsPy,
-            @"'block_shape': \(4, 16, 2, 64\)",
+            @"'block_shape': \(4, 8, 2, 64\)",
             RegexOptions.CultureInvariant);
         Assert.Single(qDescriptorMatches.Cast<Match>());
         Assert.Equal(2, kvDescriptorMatches.Count);
         Assert.Equal(3, Regex.Matches(generatedKernelsPy, @"'kind': 'table'", RegexOptions.CultureInvariant).Count);
         Assert.Equal(3, Regex.Matches(generatedKernelsPy, @"tle\.gpu\.tensor_map_table_entry\(", RegexOptions.CultureInvariant).Count);
         Assert.Equal(3, Regex.Matches(generatedKernelsPy, @"tle\.gpu\.reinterpret_tensor_map\(", RegexOptions.CultureInvariant).Count);
-        Assert.Contains("capacity=2", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("capacity=4", generatedKernelsPy, StringComparison.Ordinal);
         Assert.Contains("[1]", generatedKernelsPy, StringComparison.Ordinal);
         Assert.DoesNotContain("tl.make_tensor_descriptor", generatedKernelsPy, StringComparison.Ordinal);
 
@@ -2782,8 +2793,8 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         var microKernel = Assert.IsType<Nncase.Schedule.TIRMicroKernelSelection>(gluCall.Metadata.TIRMicroKernel);
         Assert.Equal("triton.matmul_glu", microKernel.Family);
         Assert.Equal("simt_fma_smem_pipeline", microKernel.Variant);
-        Assert.Equal(32L, microKernel.Parameters["block_n"]);
-        Assert.Equal(256L, microKernel.Parameters["block_k"]);
+        Assert.Equal(64L, microKernel.Parameters["block_n"]);
+        Assert.Equal(128L, microKernel.Parameters["block_k"]);
         Assert.Equal(4L, microKernel.Parameters["num_stages"]);
         Assert.Equal(new[] { "rhs_stage" }, microKernel.SharedWorkspaces.Select(workspace => workspace.Name).ToArray());
         Assert.Equal(
@@ -2827,7 +2838,7 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         Assert.Equal(2, Regex.Matches(generatedKernelsPy, @"reader\.wait\(", RegexOptions.CultureInvariant).Count);
         var descriptorBlockShapeCount = Regex.Matches(
             generatedKernelsPy,
-            @"'block_shape': \(16, 4, 2, 64\)",
+            @"'block_shape': \(8, 8, 2, 64\)",
             RegexOptions.CultureInvariant).Count;
         Assert.Equal(2, descriptorBlockShapeCount);
         Assert.Equal(2, Regex.Matches(generatedKernelsPy, @"'kind': 'table'", RegexOptions.CultureInvariant).Count);
@@ -2835,7 +2846,7 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         Assert.Equal(2, Regex.Matches(generatedKernelsPy, @"tle\.gpu\.reinterpret_tensor_map\(", RegexOptions.CultureInvariant).Count);
         Assert.Equal(2, Regex.Matches(generatedKernelsPy, @"eviction_policy=""evict_last""", RegexOptions.CultureInvariant).Count);
         Assert.Contains("capacity=4", generatedKernelsPy, StringComparison.Ordinal);
-        Assert.Contains("[4, 16, 4, 2, 64]", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("[4, 8, 8, 2, 64]", generatedKernelsPy, StringComparison.Ordinal);
         Assert.DoesNotContain("tl.make_tensor_descriptor", generatedKernelsPy, StringComparison.Ordinal);
 
         AssertGeneratedModelRuns(
@@ -3306,8 +3317,18 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         var input = new Var("x", publicType);
         var publicOutput = CreateOutputVar("public_output", publicType);
         var tensorType = new TensorType(DataTypes.Float32, new[] { 8, 16 });
-        var nestedInputVar = new TIR.BufferVar("nested_input", tensorType, TIR.BufferVarRole.Input, TIR.MemoryLocation.Input);
-        var nestedOutputVar = CreateOutputVar("nested_output", tensorType);
+        var nestedInputVar = new TIR.BufferVar(
+            "nested_input",
+            tensorType,
+            TIR.BufferVarRole.Input,
+            TIR.MemoryLocation.Input,
+            TIR.BufferLayoutAnnotation.RuntimeStrided);
+        var nestedOutputVar = new TIR.BufferVar(
+            "nested_output",
+            tensorType,
+            TIR.BufferVarRole.Output,
+            TIR.MemoryLocation.Output,
+            TIR.BufferLayoutAnnotation.RuntimeStrided);
         var nestedDataVar = new TIR.BufferVar("data", TensorType.Scalar(new PointerType(DataTypes.UInt8)), TIR.BufferVarRole.Workspace, TIR.MemoryLocation.Data);
         var nestedChipLocalDataVar = new TIR.BufferVar("chip_local_data", TensorType.Scalar(new PointerType(DataTypes.UInt8)), TIR.BufferVarRole.Workspace, TIR.MemoryLocation.ChipLocalData);
         var nestedBlockLocalDataVar = new TIR.BufferVar("block_local_data", TensorType.Scalar(new PointerType(DataTypes.UInt8)), TIR.BufferVarRole.Workspace, TIR.MemoryLocation.BlockLocalData);
@@ -3373,8 +3394,18 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
             tensorType,
             new SBP[] { SBP.B, SBP.SContiguous([0], 4) },
             placement);
-        var nestedInputVar = new TIR.BufferVar("nested_input", distributedType, TIR.BufferVarRole.Input, TIR.MemoryLocation.Input);
-        var nestedOutputVar = CreateOutputVar("nested_output", distributedType);
+        var nestedInputVar = new TIR.BufferVar(
+            "nested_input",
+            distributedType,
+            TIR.BufferVarRole.Input,
+            TIR.MemoryLocation.Input,
+            TIR.BufferLayoutAnnotation.RuntimeStrided);
+        var nestedOutputVar = new TIR.BufferVar(
+            "nested_output",
+            distributedType,
+            TIR.BufferVarRole.Output,
+            TIR.MemoryLocation.Output,
+            TIR.BufferLayoutAnnotation.RuntimeStrided);
         var nestedDataVar = new TIR.BufferVar("data", TensorType.Scalar(new PointerType(DataTypes.UInt8)), TIR.BufferVarRole.Workspace, TIR.MemoryLocation.Data);
         var nestedChipLocalDataVar = new TIR.BufferVar("chip_local_data", TensorType.Scalar(new PointerType(DataTypes.UInt8)), TIR.BufferVarRole.Workspace, TIR.MemoryLocation.ChipLocalData);
         var nestedBlockLocalDataVar = new TIR.BufferVar("block_local_data", TensorType.Scalar(new PointerType(DataTypes.UInt8)), TIR.BufferVarRole.Workspace, TIR.MemoryLocation.BlockLocalData);
@@ -3420,8 +3451,92 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         var generatedKernelsPy = File.ReadAllText(Path.Join(outputDirectory, "generated_kernels.py"));
         var inputStride0 = "main_prim_nested_prim_device_arg0_nested_input_scalar_stride0";
         var outputStride0 = "main_prim_nested_prim_device_arg1_nested_output_scalar_stride0";
-        Assert.Contains($"* {inputStride0}", generatedKernelsPy, StringComparison.Ordinal);
-        Assert.Contains($"* {outputStride0}", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains($"({inputStride0} * 2)", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains($"({outputStride0} * 3)", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains($"* ({inputStride0})", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains($"* ({outputStride0})", generatedKernelsPy, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void TestPyNTTCanonicalGlobalPointerDoesNotRebaseLocalShardTwice()
+    {
+        var targetOptions = Assert.IsType<PyNTTTargetOptions>(CompileOptions.TargetOptions);
+        targetOptions.HierarchyNames = "b";
+        targetOptions.HierarchyLevels = "b";
+        targetOptions.Hierarchies = new[] { new[] { 2 } };
+
+        var placement = new Placement(new[] { 2 }, "b", "b");
+        var globalType = new TensorType(DataTypes.Float32, new[] { 8 });
+        var distributedType = new DistributedType(
+            globalType,
+            new SBP[] { SBP.SBlockCyclic([0], 1) },
+            placement);
+        var shardCoordinate = new DimVar("__shard_coord_0");
+        var physicalInput = new TIR.PhysicalBuffer(
+            DataTypes.Float32.SizeInBytes,
+            128,
+            32,
+            TIR.MemoryLocation.ChipLocalData);
+        var physicalOutput = new TIR.PhysicalBuffer(
+            DataTypes.Float32.SizeInBytes,
+            160,
+            32,
+            TIR.MemoryLocation.ChipLocalData);
+        var canonicalInput = new TIR.Buffer(
+            "canonical_input",
+            DataTypes.Float32,
+            new TIR.MemSpan(physicalInput, shardCoordinate * 4, 16),
+            new Dimension[] { 4 },
+            new Dimension[] { 1 },
+            distributedType,
+            distributedStorageKind: TIR.DistributedBufferStorageKind.CanonicalGlobal);
+        var canonicalOutput = new TIR.Buffer(
+            "canonical_output",
+            DataTypes.Float32,
+            new TIR.MemSpan(physicalOutput, shardCoordinate * 4, 16),
+            new Dimension[] { 4 },
+            new Dimension[] { 1 },
+            distributedType,
+            distributedStorageKind: TIR.DistributedBufferStorageKind.CanonicalGlobal);
+        var publicType = new TensorType(DataTypes.Float32, new[] { 1 });
+        var input = new Var("x", publicType);
+        var output = CreateOutputVar("output", publicType);
+        var main = new TIR.PrimFunction(
+            "main_prim",
+            PyNTTTarget.Kind,
+            new TIR.Sequential(
+                TIR.F.NTT.Unary(UnaryOp.Abs, canonicalInput, canonicalOutput),
+                TIR.T.Memcopy(output, input)),
+            new IVar[] { input, output })
+        {
+            SchedResult =
+            {
+                ChipLocalDataPoolSize = 192,
+            },
+        };
+
+        var outputDirectory = GeneratePyNTTModelDirectory(
+            "generated_canonical_global_pointer_model",
+            main);
+        using var manifest = JsonDocument.Parse(
+            File.ReadAllText(Path.Join(outputDirectory, "kernel_params.json")));
+        var unaryHelper = manifest.RootElement
+            .GetProperty("functions")[0]
+            .GetProperty("render_kernels")[0]
+            .GetProperty("helpers")
+            .EnumerateArray()
+            .Single(helper => helper.GetProperty("template").GetString() == "triton/kernels/ElementwiseUnary.py.jinja");
+        var inputPointer = unaryHelper.GetProperty("model").GetProperty("Input");
+        var inputExpression = inputPointer.GetProperty("Expression").GetString();
+        Assert.Contains("128", inputExpression, StringComparison.Ordinal);
+        Assert.DoesNotContain("shard_coord", inputExpression, StringComparison.Ordinal);
+        Assert.All(
+            inputPointer.GetProperty("GlobalOffsets").EnumerateArray(),
+            offset => Assert.Equal(0, offset.GetProperty("FixedValue").GetInt64()));
+
+        RenderGeneratedKernels(outputDirectory);
+        var generatedKernelsPy = File.ReadAllText(Path.Join(outputDirectory, "generated_kernels.py"));
+        Assert.Contains("shard_coord0", generatedKernelsPy, StringComparison.Ordinal);
     }
 
     [Fact]

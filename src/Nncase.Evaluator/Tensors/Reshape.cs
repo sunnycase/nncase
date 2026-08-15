@@ -26,7 +26,7 @@ public class ReshapeEvaluator : IEvaluator<Reshape>, ITypeInferencer<Reshape>, I
         var inShape = (RankedShape)inType.TensorType.Shape;
         var maxInShape = CompilerServices.GetMaxShape(inShape);
         var maxNewShape = CompilerServices.GetMaxShape(newShape);
-        if (!IRUtility.TryGetShapeMapMatrix(maxInShape, maxNewShape, out var mat))
+        if (!TryGetReshapeShapeMapMatrix(maxInShape, maxNewShape, out var mat))
         {
             if (inType.AxisPolicies.All(x => x is SBPBroadCast))
             {
@@ -94,16 +94,26 @@ public class ReshapeEvaluator : IEvaluator<Reshape>, ITypeInferencer<Reshape>, I
                 continue; // already set
             }
 
-            var splitAxes = from inAxis in inAxes
-                            let inPolicy = inType.AxisPolicies[inAxis]
-                            where inPolicy is SBPSplit
-                            select (int?)inAxis;
-            if (splitAxes.Count() > 1)
+            var splitAxes = (from inAxis in inAxes
+                             let inPolicy = inType.AxisPolicies[inAxis]
+                             where inPolicy is SBPSplit
+                             select inAxis).ToArray();
+            if (splitAxes.Length > 1)
             {
-                return invalidType; // more than one split axis, cannot reshape
+                if (!TryFlattenBlockCyclicSplits(
+                        inType,
+                        inAxes,
+                        maxInShape,
+                        out var flattenedSplit))
+                {
+                    return invalidType;
+                }
+
+                newAxisPolicies[newAxis] = flattenedSplit;
+                continue;
             }
 
-            var firstSplitAxis = splitAxes.FirstOrDefault();
+            var firstSplitAxis = splitAxes.Cast<int?>().FirstOrDefault();
             if (firstSplitAxis is not null)
             {
                 // Either the axis is the first axis or all of the dimensions before it are 1.
@@ -132,7 +142,13 @@ public class ReshapeEvaluator : IEvaluator<Reshape>, ITypeInferencer<Reshape>, I
 
         if (newAxisPolicies.Any(a => a is null))
         {
-            if (inType.AxisPolicies.Select((x, i) => (x, i)).Where(x => !forwardDict.ContainsKey(x.i)).All(x => x.x is SBPBroadCast))
+            var mappedInputAxes = forwardDict.Keys
+                .Concat(backwardDict.Values.SelectMany(axes => axes))
+                .ToHashSet();
+            if (inType.AxisPolicies
+                .Select((policy, axis) => (policy, axis))
+                .Where(item => !mappedInputAxes.Contains(item.axis))
+                .All(item => item.policy is SBPBroadCast))
             {
                 // If all axes that are not in the forward mapping are broadcast, we can still reshape.
                 for (int i = 0; i < newAxisPolicies.Length; i++)
@@ -156,6 +172,130 @@ public class ReshapeEvaluator : IEvaluator<Reshape>, ITypeInferencer<Reshape>, I
         }
 
         return new DistributedType(inType.TensorType with { Shape = newShape }, newAxisPolicies, inType.Placement);
+    }
+
+    private static bool TryGetReshapeShapeMapMatrix(
+        long[] inputShape,
+        long[] outputShape,
+        out int[,] matrix)
+    {
+        if (!inputShape.Contains(1L) && !outputShape.Contains(1L))
+        {
+            return IRUtility.TryGetShapeMapMatrix(inputShape, outputShape, out matrix);
+        }
+
+        var inputAxes = inputShape
+            .Select((extent, axis) => (extent, axis))
+            .Where(item => item.extent != 1)
+            .ToArray();
+        var outputAxes = outputShape
+            .Select((extent, axis) => (extent, axis))
+            .Where(item => item.extent != 1)
+            .ToArray();
+        var reducedInputShape = inputAxes.Select(item => item.extent).ToArray();
+        var reducedOutputShape = outputAxes.Select(item => item.extent).ToArray();
+        if (reducedInputShape.Length == 0 && reducedOutputShape.Length == 0)
+        {
+            matrix = new int[outputShape.Length, inputShape.Length];
+            return true;
+        }
+
+        if (reducedInputShape.Length == 0 || reducedOutputShape.Length == 0)
+        {
+            return IRUtility.TryGetShapeMapMatrix(inputShape, outputShape, out matrix);
+        }
+
+        if (IRUtility.TryGetShapeMapMatrix(
+                reducedInputShape,
+                reducedOutputShape,
+                out var reducedMatrix))
+        {
+            matrix = new int[outputShape.Length, inputShape.Length];
+            for (var outputIndex = 0; outputIndex < outputAxes.Length; outputIndex++)
+            {
+                for (var inputIndex = 0; inputIndex < inputAxes.Length; inputIndex++)
+                {
+                    matrix[outputAxes[outputIndex].axis, inputAxes[inputIndex].axis] =
+                        reducedMatrix[outputIndex, inputIndex];
+                }
+            }
+
+            return true;
+        }
+
+        return IRUtility.TryGetShapeMapMatrix(inputShape, outputShape, out matrix);
+    }
+
+    private static bool TryFlattenBlockCyclicSplits(
+        DistributedType inputType,
+        IReadOnlyList<int> inputAxes,
+        IReadOnlyList<long> inputShape,
+        out SBPSplit flattenedSplit)
+    {
+        var stages = new List<SplitStage>();
+        for (var position = 0; position < inputAxes.Count; position++)
+        {
+            var inputAxis = inputAxes[position];
+            if (inputType.AxisPolicies[inputAxis] is not SBPSplit split)
+            {
+                continue;
+            }
+
+            var parentExtent = inputShape[inputAxis];
+            foreach (var stage in split.Stages)
+            {
+                if (stage.Distribution is not BlockCyclicSplit blockCyclic)
+                {
+                    flattenedSplit = null!;
+                    return false;
+                }
+
+                var shardCount = stage.HierarchyAxes.Aggregate(
+                    1L,
+                    (product, hierarchyAxis) => checked(
+                        product * inputType.Placement.Hierarchy[hierarchyAxis]));
+                var period = checked(shardCount * blockCyclic.BlockSize);
+                if (parentExtent % period != 0)
+                {
+                    flattenedSplit = null!;
+                    return false;
+                }
+
+                parentExtent /= shardCount;
+            }
+
+            var trailingExtent = inputAxes
+                .Skip(position + 1)
+                .Aggregate(1L, (product, axis) => checked(product * inputShape[axis]));
+            if (!DistributedUtility.TryScaleSplitUnits(
+                    split,
+                    trailingExtent,
+                    1,
+                    out var scaledSplit))
+            {
+                flattenedSplit = null!;
+                return false;
+            }
+
+            stages.AddRange(scaledSplit.Stages);
+        }
+
+        if (stages.Count == 0)
+        {
+            flattenedSplit = null!;
+            return false;
+        }
+
+        try
+        {
+            flattenedSplit = SBP.S(stages.ToArray());
+            return true;
+        }
+        catch (ArgumentException)
+        {
+            flattenedSplit = null!;
+            return false;
+        }
     }
 
     /// <inheritdoc/>

@@ -22,6 +22,16 @@ public sealed class PackedMatMulEvaluator : IEvaluator<PackedMatMul>, ITypeInfer
         var rhs = context.GetArgumentValueAsTensor(target, PackedMatMul.Rhs);
         var scale = context.GetArgumentValue(target, PackedMatMul.Scale);
         var addend = context.GetArgumentValue(target, PackedMatMul.Addend);
+        return Evaluate(target, lhs, rhs, scale, addend);
+    }
+
+    public static IValue Evaluate(
+        PackedMatMul target,
+        OrtKISharp.Tensor lhs,
+        Tensor rhs,
+        IValue scale,
+        IValue addend)
+    {
         var rhsOrt = rhs.ToOrtTensor();
 
         if (rhs.ElementType is not VectorType rhsVectorType)
@@ -30,7 +40,6 @@ public sealed class PackedMatMulEvaluator : IEvaluator<PackedMatMul>, ITypeInfer
         }
 
         int[] outputLanes;
-        var outRank = context.CurrentCall.CheckedShape.Rank;
         switch (target.RhsLayout)
         {
             case PackedMatMulRhsLayout.NMajor when rhsVectorType.Lanes.Count == 2:
@@ -75,6 +84,16 @@ public sealed class PackedMatMulEvaluator : IEvaluator<PackedMatMul>, ITypeInfer
         var rhs = context.CheckArgumentType<IRType>(target, PackedMatMul.Rhs);
         var scale = context.CheckArgumentType<IRType>(target, PackedMatMul.Scale);
         var addend = context.CheckArgumentType<IRType>(target, PackedMatMul.Addend);
+        return InferType(target, lhs, rhs, scale, addend);
+    }
+
+    public static IRType InferType(
+        PackedMatMul target,
+        IRType lhs,
+        IRType rhs,
+        IRType scale,
+        IRType addend)
+    {
         IRType rType;
         string? errorMessage = null;
         switch (lhs, rhs)
@@ -180,7 +199,7 @@ public sealed class PackedMatMulEvaluator : IEvaluator<PackedMatMul>, ITypeInfer
             var lhsType = DistributedUtility.GetDividedTensorType(distributedType);
             var k = distributedType.TensorType.Shape.Rank - 1;
             macPerElement = lhsType.Shape[k].IsFixed ? (uint)lhsType.Shape[k].FixedValue : 1U;
-            hasAllReduce = distributedType.AxisPolicies[^1] is SBPSplit;
+            hasAllReduce = target.FusedReduce && distributedType.AxisPolicies[^1] is SBPSplit;
         }
 
         var cost = new Cost()
@@ -203,7 +222,7 @@ public sealed class PackedMatMulEvaluator : IEvaluator<PackedMatMul>, ITypeInfer
         return AddAllReduceCost(cost, outputType, hasAllReduce);
     }
 
-    private static bool TryGetLayoutInfo(
+    internal static bool TryGetLayoutInfo(
         PackedMatMulRhsLayout layout,
         VectorType vectorType,
         int rhsRank,
@@ -237,7 +256,9 @@ public sealed class PackedMatMulEvaluator : IEvaluator<PackedMatMul>, ITypeInfer
 
     private bool TryGetTargetCost(ICostEvaluateContext context, PackedMatMul target, IRType lhs, IRType rhs, IRType outputType, out Cost cost, out bool hasAllReduce)
     {
-        hasAllReduce = lhs is DistributedType distributedType && distributedType.AxisPolicies[^1] is SBPSplit;
+        hasAllReduce = target.FusedReduce &&
+            lhs is DistributedType distributedType &&
+            distributedType.AxisPolicies[^1] is SBPSplit;
         if (target.RhsLayout == PackedMatMulRhsLayout.KMajor)
         {
             if (GetTensorType(rhs)?.DType is not VectorType rhsVectorType ||

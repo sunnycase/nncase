@@ -11,6 +11,8 @@ public sealed record PyNTTBufferPointerTemplateModel(
 
     public PyNTTDimExpression[] GlobalShape { get; init; } = Array.Empty<PyNTTDimExpression>();
 
+    public PyNTTDimExpression[] GlobalOffsets { get; init; } = Array.Empty<PyNTTDimExpression>();
+
     public PyNTTDimExpression[] Strides { get; init; } = Array.Empty<PyNTTDimExpression>();
 
     public PyNTTShardAxisTemplateModel[] ShardAxes { get; init; } = Array.Empty<PyNTTShardAxisTemplateModel>();
@@ -767,7 +769,8 @@ public sealed record PyNTTPagedAttentionPartialTemplateModel(
     PyNTTBufferPointerTemplateModel MaxState,
     PyNTTBufferPointerTemplateModel SumState,
     PyNTTBufferPointerTemplateModel AccState,
-    PyNTTBufferPointerTemplateModel Output,
+    PyNTTBufferPointerTemplateModel? Output,
+    bool HasDirectOutput,
     string QueryDType,
     string QueryTritonDType,
     PyNTTDimExpression[] QueryShape,
@@ -811,8 +814,11 @@ public sealed record PyNTTPagedAttentionPartialTemplateModel(
 public sealed record PyNTTPagedAttentionMergeTemplateModel(
     string FunctionName,
     PyNTTBufferPointerTemplateModel MaxState,
+    PyNTTPooledByteAddressTemplateModel MaxStateAddress,
     PyNTTBufferPointerTemplateModel SumState,
+    PyNTTPooledByteAddressTemplateModel SumStateAddress,
     PyNTTBufferPointerTemplateModel AccState,
+    PyNTTPooledByteAddressTemplateModel AccStateAddress,
     PyNTTBufferPointerTemplateModel Output,
     string OutputDType,
     string OutputTritonDType,
@@ -822,6 +828,8 @@ public sealed record PyNTTPagedAttentionMergeTemplateModel(
     PyNTTDimExpression[] SumStateStrides,
     PyNTTDimExpression[] AccStateShape,
     PyNTTDimExpression[] AccStateStrides,
+    PyNTTDimExpression[] StateGlobalShape,
+    PyNTTShardAxisTemplateModel[] StateShardAxes,
     PyNTTDimExpression[] OutputShape,
     PyNTTDimExpression[] OutputGlobalShape,
     PyNTTDimExpression[] OutputStrides,

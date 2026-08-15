@@ -3,6 +3,7 @@
 
 using DryIoc;
 using Nncase.Hosting;
+using Nncase.Passes.Distributed;
 using Nncase.Targets;
 
 namespace Nncase;
@@ -17,5 +18,8 @@ internal class NTTModule : IApplicationPart
         registrator.Register<ITarget, CPUTarget>(reuse: Reuse.Singleton);
         registrator.Register<ITarget, CUDATarget>(reuse: Reuse.Singleton);
         registrator.Register<ITarget, PyNTTTarget>(reuse: Reuse.Singleton);
+        registrator.RegisterManyInterface<PagedAttentionPartialCandidateProvider>(reuse: Reuse.Singleton);
+        registrator.RegisterManyInterface<PagedAttentionCombineCandidateProvider>(reuse: Reuse.Singleton);
+        registrator.RegisterManyInterface<PackedMatMulCandidateProvider>(reuse: Reuse.Singleton);
     }
 }

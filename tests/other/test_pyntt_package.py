@@ -77,7 +77,6 @@ def _device_function(name, body, extra_parameters=()):
     return {
         "name": name,
         "noinline": True,
-        "preserve_helper_call_boundaries": False,
         "helpers": [],
         "body_source": body,
         "parameter_overrides": {},
@@ -126,10 +125,11 @@ def test_pyntt_elementwise_accesses_preserve_their_natural_broadcast_domain():
 
 
 def test_pyntt_elementwise_iteration_uses_explicit_physical_tile_width():
-    template = (
+    template_dir = (
         Path(__file__).resolve().parents[2]
-        / "pyntt/pyntt/codegen/templates/triton/kernels/_elementwise.py.jinja"
-    ).read_text(encoding="utf-8")
+        / "pyntt/pyntt/codegen/templates/triton/kernels"
+    )
+    template = (template_dir / "_elementwise.py.jinja").read_text(encoding="utf-8")
 
     assert "_physical_tile_width: tl.constexpr = block_size //" in template
     assert "min(block_size // {{ ctx[\"lane_count\"] }}," in template
@@ -749,6 +749,79 @@ def test_pyntt_renderer_builds_exact_ragged_block_cyclic_descriptor_entries():
     assert owner31["base"] == 31
 
 
+def test_pyntt_renderer_canonicalizes_unit_block_cyclic_tma_dimensions():
+    _add_pyntt_to_path()
+    from pyntt.codegen.render import (
+        _k_major_gemv_host_descriptor_spec,
+        _tma_local_axis_transfer,
+    )
+
+    def fixed(value):
+        return {"TritonExpression": str(value), "FixedValue": value}
+
+    pointer = {
+        "GlobalShape": [fixed(128), fixed(128)],
+        "ShardAxes": [
+            {
+                "Stages": [
+                    {
+                        "HierarchyAxes": [1],
+                        "Distribution": "BlockCyclic",
+                        "Granularity": None,
+                        "BlockSize": 16,
+                    }
+                ]
+            },
+            {
+                "Stages": [
+                    {
+                        "HierarchyAxes": [0],
+                        "Distribution": "BlockCyclic",
+                        "Granularity": None,
+                        "BlockSize": 8,
+                    }
+                ]
+            },
+        ],
+        "Hierarchy": [4, 8],
+    }
+    backing = {
+        "name": "weight_descriptor",
+        "source": "chip_local_rdata",
+        "offset_bytes": 0,
+        "scalar_dtype": "bfloat16",
+        "logical_shape": [128, 128],
+        "logical_strides": [128, 1],
+        "vector_lane_shape": [8, 2, 8],
+        "contiguous_rebase_extent_elements": 0,
+    }
+
+    spec = _k_major_gemv_host_descriptor_spec(
+        {},
+        backing,
+        block_n=64,
+        block_k=256,
+        pointer=pointer,
+    )
+    assert spec["block_shape"] == (16, 1, 8, 2, 64)
+    assert len(spec["entries"]) == 32
+    assert spec["entries"][0]["shape"] == (16, 4, 8, 2, 64)
+    assert spec["entries"][0]["strides"] == (16384, 4096, 128, 64, 1)
+
+    transfer = _tma_local_axis_transfer(
+        pointer,
+        0,
+        fixed(0),
+        local_offset=0,
+        tile_index="k_tile",
+        tile_stride=16,
+        tile_extent=16,
+        context="partial projection K",
+    )
+    assert transfer["block_shape"] == (16,)
+    assert len(transfer["coordinates"]) == 1
+
+
 def test_pyntt_renderer_maps_local_kv_head_to_block_cyclic_global_head():
     _add_pyntt_to_path()
     from pyntt.codegen.render import _distributed_local_to_global_coordinates
@@ -805,6 +878,61 @@ def test_pyntt_renderer_maps_local_kv_head_to_block_cyclic_global_head():
     assert "shard_coord1" in offset_coordinates[0]
 
 
+def test_pyntt_renderer_composes_bounded_block_cyclic_coordinates():
+    _add_pyntt_to_path()
+    from pyntt.codegen.render import (
+        _local_to_global_coordinate,
+        _remap_local_coordinate,
+        _scale_shard_axis_mapping,
+    )
+
+    def fixed(value):
+        return {"TritonExpression": str(value), "FixedValue": value}
+
+    hierarchy = [4, 8]
+    head_mapping = {
+        "Stages": [
+            {
+                "HierarchyAxes": [1],
+                "Distribution": "BlockCyclic",
+                "Granularity": None,
+                "BlockSize": 2,
+            }
+        ]
+    }
+    assert _local_to_global_coordinate(
+        "q_head", fixed(16), head_mapping, hierarchy, local_extent=2
+    ) == "((shard_coord1) * 2 + (q_head))"
+    assert (
+        _remap_local_coordinate(
+            "q_head",
+            fixed(16),
+            head_mapping,
+            fixed(16),
+            head_mapping,
+            hierarchy,
+            local_extent=2,
+        )
+        == "q_head"
+    )
+
+    physical_dim_mapping = {
+        "Stages": [
+            {
+                "HierarchyAxes": [0],
+                "Distribution": "BlockCyclic",
+                "Granularity": None,
+                "BlockSize": 4,
+            }
+        ]
+    }
+    scalar_dim_mapping = _scale_shard_axis_mapping(physical_dim_mapping, 8)
+    assert scalar_dim_mapping["Stages"][0]["BlockSize"] == 32
+    assert _local_to_global_coordinate(
+        "dim_grid", fixed(128), scalar_dim_mapping, hierarchy, local_extent=32
+    ) == "((shard_coord0) * 32 + (dim_grid))"
+
+
 def test_pyntt_renderer_maps_gather_global_index_and_local_shard_coordinates():
     _add_pyntt_to_path()
     from pyntt.codegen.render import _access_pointer, _gather_template_context
@@ -830,6 +958,7 @@ def test_pyntt_renderer_maps_gather_global_index_and_local_shard_coordinates():
         "Input": {
             "DistributedStorageKind": "CanonicalGlobal",
             "GlobalShape": [fixed(151936), fixed(256)],
+            "GlobalOffsets": [fixed(0), fixed(0)],
             "Strides": input_strides,
             "ShardAxes": shard_axes,
             "Hierarchy": [4, 8],
@@ -858,6 +987,43 @@ def test_pyntt_renderer_maps_gather_global_index_and_local_shard_coordinates():
     assert "shard_coord1" in pointer
     assert "major_raw" in pointer
     assert "((gather_index) //" not in pointer
+
+
+def test_pyntt_renderer_canonical_pointer_applies_view_origin_before_sharding():
+    _add_pyntt_to_path()
+    from pyntt.codegen.render import _access_pointer, _tensor_access
+
+    def fixed(value):
+        return {"TritonExpression": str(value), "FixedValue": value}
+
+    pointer_model = {
+        "Input": {
+            "DistributedStorageKind": "CanonicalGlobal",
+            "GlobalShape": [fixed(1), fixed(64)],
+            "GlobalOffsets": [fixed(0), fixed(2)],
+            "Strides": [fixed(64), fixed(1)],
+            "ShardAxes": [
+                {"Stages": []},
+                {
+                    "Stages": [
+                        {
+                            "HierarchyAxes": [1],
+                            "Distribution": "BlockCyclic",
+                            "Granularity": None,
+                            "BlockSize": 1,
+                        }
+                    ]
+                },
+            ],
+            "Hierarchy": [4, 8],
+        }
+    }
+    access = _tensor_access(("0", "local_index"), (fixed(64), fixed(1)))
+
+    pointer = _access_pointer(pointer_model, "Input", "input", access)
+
+    assert "(2) + (local_index)" in pointer
+    assert pointer.count("shard_coord1") == 1
 
 
 def test_pyntt_renderer_owns_block_schedule_config():
@@ -1299,6 +1465,54 @@ def test_pyntt_renderer_rematerializes_nested_device_helper_indices(monkeypatch)
     )
 
     assert captured["rematerialize_entry_indices"] is True
+    assert captured["noinline"] is True
+
+
+def test_pyntt_renderer_reduces_contiguous_axes_first():
+    _add_pyntt_to_path()
+    from pyntt.codegen.render import _norm_stats_template_context, _reduce_all_axes
+
+    assert _reduce_all_axes("value", 3) == (
+        "tl.sum(tl.sum(tl.sum(value, axis=2), axis=1), axis=0)"
+    )
+    context = _norm_stats_template_context(
+        {
+            "InputShape": [1, 256],
+            "InputStrides": [256, 1],
+            "InputVectorLaneShape": [8],
+            "InputVectorLaneCount": 8,
+            "OutputShape": [1, 1, 1],
+            "OutputStrides": [1, 1, 1],
+            "OutputVectorLaneShape": [],
+            "Axis": 1,
+        }
+    )
+    assert context["flat_reduction"] is True
+    assert context["reduction_extent"] == "((256)) * 8"
+    assert context["reduction"] == "tl.sum(mean_partial, axis=0)"
+    assert context["square_reduction"] == "tl.sum(square_partial, axis=0)"
+
+    template = Path(
+        "pyntt/pyntt/codegen/templates/triton/kernels/NormStats.py.jinja"
+    ).read_text()
+    assert "loop_unroll_factor=1" in template
+
+    strided = _norm_stats_template_context(
+        {
+            "InputShape": [1, 256],
+            "InputStrides": [512, 2],
+            "InputVectorLaneShape": [8],
+            "InputVectorLaneCount": 8,
+            "OutputShape": [1, 1, 1],
+            "OutputStrides": [1, 1, 1],
+            "OutputVectorLaneShape": [],
+            "Axis": 1,
+        }
+    )
+    assert strided["flat_reduction"] is False
+    assert strided["square_reduction"] == (
+        "tl.sum(tl.sum(square_partial, axis=1), axis=0)"
+    )
 
 
 def test_pyntt_renderer_propagates_only_live_canonical_device_parameters():

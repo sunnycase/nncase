@@ -264,7 +264,7 @@ public static class NTTTargetMachineCatalog
         var globalSharedBytesPerCycle = Math.Min(chipGlobalBytesPerCycle, sharedBytesPerCycle);
         var asynchronousGlobalToShared = supportsCpAsync
             ? new TargetAsynchronousTransferSpec(
-                supportedStageCounts: [2],
+                supportedStageCounts: [2, 3, 4],
                 commitCycles: 1,
                 waitCycles: 1)
             : null;

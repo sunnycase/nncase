@@ -9,8 +9,11 @@ using System.Reflection;
 using System.Text.Json;
 using System.Threading.Tasks;
 using Nncase.Diagnostics;
+using Nncase.Evaluator.IR.NTT;
 using Nncase.IR;
 using Nncase.IR.Math;
+using Nncase.IR.NN;
+using Nncase.IR.NTT;
 using Nncase.IR.Shapes;
 using Nncase.Passes.Distributed;
 using Nncase.Passes.Rules.ShapeBucket;
@@ -107,6 +110,159 @@ public sealed class UnitTestDistribAutoDistributed : TestClassBase
         var tuple = Assert.Single(tuples);
         Assert.Equal(producerSplitType, tuple.InputTypes[0]);
         Assert.Equal(producerSplitType, tuple.InputTypes[1]);
+    }
+
+    [Fact]
+    public void TestPagedAttentionPartialCombineDistributionContract()
+    {
+        var options = new PyNTTTargetOptions();
+        CompileOptions.TargetOptions = options;
+        var placement = new Placement([4, 8], "yx", "bb");
+        var layout = new IRArray<AttentionDimKind>(
+            new[] { AttentionDimKind.Head, AttentionDimKind.Dim, AttentionDimKind.Seq });
+        var queryTensorType = new TensorType(
+            new VectorType(DataTypes.BFloat16, [8]),
+            new RankedShape(16, 16, 1));
+        var queryType = new DistributedType(
+            queryTensorType,
+            [SBP.SBlockCyclic([1], 2), SBP.B, SBP.B],
+            placement);
+        var extraTensorType = new TensorType(DataTypes.UInt8, new RankedShape(8_404_992));
+        var extraType = new DistributedType(
+            extraTensorType,
+            [SBP.SBlockCyclic([0, 1], 128)],
+            placement);
+        var cacheConfig = new PagedAttentionConfig(
+            1,
+            8,
+            128,
+            DataTypes.BFloat16,
+            256,
+            [
+                PagedKVCacheDimKind.NumBlocks,
+                PagedKVCacheDimKind.NumLayers,
+                PagedKVCacheDimKind.KV,
+                PagedKVCacheDimKind.NumKVHeads,
+                PagedKVCacheDimKind.HeadDim,
+                PagedKVCacheDimKind.BlockSize,
+            ],
+            [
+                PagedKVCacheDimKind.NumBlocks,
+                PagedKVCacheDimKind.NumLayers,
+                PagedKVCacheDimKind.KV,
+                PagedKVCacheDimKind.NumKVHeads,
+                PagedKVCacheDimKind.BlockSize,
+                PagedKVCacheDimKind.HeadDim,
+            ],
+            [PagedKVCacheDimKind.HeadDim],
+            [PagedKVCacheDimKind.BlockSize],
+            [8],
+            [8],
+            [PagedKVCacheDimKind.NumBlocks],
+            [SBP.SContiguous([0, 1])]);
+        var cacheTensorType = TensorType.Scalar(new ReferenceType(
+            new PagedAttentionKVCacheType { Config = cacheConfig }));
+        var scaleTensorType = TensorType.Scalar(DataTypes.BFloat16);
+        var partialTarget = new PagedAttentionPartial(layout, 2048, 0, 4);
+        var partialType = Assert.IsType<TupleType>(PagedAttentionPartialEvaluator.InferType(
+            partialTarget,
+            queryType,
+            cacheTensorType,
+            extraType,
+            scaleTensorType,
+            new DimensionType(DimensionKind.Fixed)));
+        var partialMaxType = Assert.IsType<DistributedType>(partialType[0]);
+        var partialSumType = Assert.IsType<DistributedType>(partialType[1]);
+        var partialAccType = Assert.IsType<DistributedType>(partialType[2]);
+        Assert.Equal(queryTensorType.Shape.Rank, partialMaxType.TensorType.Shape.Rank);
+        Assert.Equal(queryTensorType.Shape.Rank, partialAccType.TensorType.Shape.Rank);
+        Assert.Equal(SBP.P([0], ReduceOp.Max), partialMaxType.Partial);
+        Assert.Equal(SBP.P([0], ReduceOp.Sum), partialSumType.Partial);
+        Assert.Equal(SBP.P([0], ReduceOp.Sum), partialAccType.Partial);
+        Assert.Equal(queryType.AxisPolicies, partialMaxType.AxisPolicies);
+        Assert.Equal(queryType.AxisPolicies, partialSumType.AxisPolicies);
+        Assert.Equal(queryType.AxisPolicies, partialAccType.AxisPolicies);
+
+        var combineTarget = new PagedAttentionCombine(
+            layout,
+            2048,
+            queryTensorType.DType,
+            queryType,
+            0,
+            4);
+        var combinedType = Assert.IsType<DistributedType>(
+            PagedAttentionCombineEvaluator.InferType(
+                combineTarget,
+                partialMaxType,
+                partialSumType,
+                partialAccType));
+        Assert.Equal(queryType, combinedType);
+
+        var broadcastQueryType = new DistributedType(
+            queryTensorType,
+            [SBP.B, SBP.B, SBP.B],
+            placement);
+        var broadcastPartialType = Assert.IsType<TupleType>(
+            PagedAttentionPartialEvaluator.InferType(
+                partialTarget,
+                broadcastQueryType,
+                cacheTensorType,
+                extraType,
+                scaleTensorType,
+                new DimensionType(DimensionKind.Fixed)));
+        var splitOutputType = new DistributedType(
+            queryTensorType,
+            [SBP.SBlockCyclic([0], 2), SBP.B, SBP.B],
+            placement);
+        var splitCombineTarget = new PagedAttentionCombine(
+            layout,
+            2048,
+            queryTensorType.DType,
+            splitOutputType,
+            0,
+            4);
+        Assert.Equal(
+            splitOutputType,
+            PagedAttentionCombineEvaluator.InferType(
+                splitCombineTarget,
+                broadcastPartialType[0],
+                broadcastPartialType[1],
+                broadcastPartialType[2]));
+
+        var splitDimOutputType = new DistributedType(
+            queryTensorType,
+            [SBP.SBlockCyclic([1], 2), SBP.SBlockCyclic([0], 4), SBP.B],
+            placement);
+        var splitDimCombineTarget = new PagedAttentionCombine(
+            layout,
+            2048,
+            queryTensorType.DType,
+            splitDimOutputType,
+            0,
+            4);
+        Assert.Equal(
+            splitDimOutputType,
+            PagedAttentionCombineEvaluator.InferType(
+                splitDimCombineTarget,
+                partialMaxType,
+                partialSumType,
+                partialAccType));
+
+        var invalidOutputType = new DistributedType(
+            queryTensorType,
+            [SBP.B, SBP.SBlockCyclic([1], 2), SBP.B],
+            placement);
+        Assert.IsType<InvalidType>(PagedAttentionCombineEvaluator.InferType(
+            new PagedAttentionCombine(
+                layout,
+                2048,
+                queryTensorType.DType,
+                invalidOutputType,
+                0,
+                4),
+            partialMaxType,
+            partialSumType,
+            partialAccType));
     }
 
     [Fact]

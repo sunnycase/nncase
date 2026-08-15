@@ -28,6 +28,10 @@ public sealed partial class PagedAttentionPartial : NTTKernelOp
 
     public static readonly ParameterInfo AccState = new(typeof(PagedAttentionPartial), 7, "accState", memoryEffect: MemoryEffect.Write);
 
+    /// <summary>
+    /// Optional direct output. This is <see cref="None"/> for a state-only
+    /// partial with <see cref="DirectContextThreshold"/> equal to zero.
+    /// </summary>
     public static readonly ParameterInfo Output = new(typeof(PagedAttentionPartial), 8, "output", memoryEffect: MemoryEffect.Write);
 
     public IRArray<AttentionDimKind> Layout { get; }

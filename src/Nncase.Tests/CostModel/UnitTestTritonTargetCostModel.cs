@@ -207,6 +207,52 @@ public sealed class UnitTestTritonTargetCostModel : TestClassBase
     }
 
     [Fact]
+    public void TestPackedMatMulOnlyCostsAllReduceWhenItExecutesTheReduction()
+    {
+        CompileOptions.TargetOptions = CreateOptions(CreateGpuMachine());
+        var placement = new Placement([4, 8], "y,x", "bb");
+        var lhsType = new DistributedType(
+            new TensorType(DataTypes.BFloat16, new RankedShape(1, 2048)),
+            [SBP.B, SBP.SBlockCyclic([1], 256)],
+            placement);
+        var rhsType = new DistributedType(
+            new TensorType(
+                new VectorType(DataTypes.BFloat16, [8, 2, 8]),
+                new RankedShape(128, 256)),
+            [SBP.SBlockCyclic([1], 16), SBP.SBlockCyclic([0], 8)],
+            placement);
+        var lhs = new Var("lhs", lhsType);
+        var rhs = new Var("rhs", rhsType);
+
+        var partial = IR.F.NTT.PackedMatMul(
+            lhs,
+            rhs,
+            fusedReduce: false,
+            outDataType: DataTypes.BFloat16,
+            rhsLayout: IR.NTT.PackedMatMulRhsLayout.KMajor);
+        CompilerServices.InferenceType(partial);
+        var partialType = Assert.IsType<DistributedType>(partial.CheckedType);
+        Assert.Equal(SBP.P([1]), partialType.Partial);
+        var partialCost = CompilerServices.EvaluateCost(partial, CompileOptions);
+        Assert.False(partialCost.Factors.ContainsKey(CostFactorNames.GridSynchronization));
+        Assert.False(partialCost.Factors.ContainsKey(CostFactorNames.ChipGlobalMemoryLoadBytes));
+        Assert.False(partialCost.Factors.ContainsKey(CostFactorNames.ChipGlobalMemoryStoreBytes));
+
+        var reduced = IR.F.NTT.PackedMatMul(
+            lhs,
+            rhs,
+            fusedReduce: true,
+            outDataType: DataTypes.BFloat16,
+            rhsLayout: IR.NTT.PackedMatMulRhsLayout.KMajor);
+        CompilerServices.InferenceType(reduced);
+        Assert.Null(Assert.IsType<DistributedType>(reduced.CheckedType).Partial);
+        var reducedCost = CompilerServices.EvaluateCost(reduced, CompileOptions);
+        Assert.Equal((UInt128)3, reducedCost[CostFactorNames.GridSynchronization]);
+        Assert.True(reducedCost[CostFactorNames.ChipGlobalMemoryLoadBytes] > 0);
+        Assert.True(reducedCost[CostFactorNames.ChipGlobalMemoryStoreBytes] > 0);
+    }
+
+    [Fact]
     public void TestNamedTargetMachineProfilesAreResolved()
     {
         var rtx = NTTTargetMachineCatalog.Resolve("rtx5060");
@@ -255,7 +301,7 @@ public sealed class UnitTestTritonTargetCostModel : TestClassBase
         var rtxAsyncTransfer = rtx.GetTransfer(
             rtx.GetTilingParentMemorySpace(rtxShared.TilingLevel).Id,
             rtxShared.Id).Asynchronous;
-        Assert.Equal(new[] { 2 }, Assert.IsType<TargetAsynchronousTransferSpec>(rtxAsyncTransfer).SupportedStageCounts);
+        Assert.Equal(new[] { 2, 3, 4 }, Assert.IsType<TargetAsynchronousTransferSpec>(rtxAsyncTransfer).SupportedStageCounts);
         Assert.Equal(NTTTargetMachineCatalog.H800Sxm80Gb, h800.Id);
         Assert.Equal(132, h800.Execution.ComputeUnitCount);
         Assert.Equal(255L * 8 * 32, h800.GetPrivateResource(NTTTargetMachineCatalog.GpuRegisterFile).CapacityUnits);
@@ -274,7 +320,7 @@ public sealed class UnitTestTritonTargetCostModel : TestClassBase
         var h800AsyncTransfer = h800.GetTransfer(
             h800.GetTilingParentMemorySpace(h800Shared.TilingLevel).Id,
             h800Shared.Id).Asynchronous;
-        Assert.Equal(new[] { 2 }, Assert.IsType<TargetAsynchronousTransferSpec>(h800AsyncTransfer).SupportedStageCounts);
+        Assert.Equal(new[] { 2, 3, 4 }, Assert.IsType<TargetAsynchronousTransferSpec>(h800AsyncTransfer).SupportedStageCounts);
     }
 
     [Fact]
@@ -398,11 +444,13 @@ public sealed class UnitTestTritonTargetCostModel : TestClassBase
         Assert.Equal(8, legalRegisterMma.Parameters.Single(parameter => parameter.Name == TritonBlockMicroKernelContract.InnerMParameter).Value.Var().Min());
         Assert.Equal(16, legalRegisterMma.Parameters.Single(parameter => parameter.Name == TritonBlockMicroKernelContract.MmaMParameter).Value.Var().Min());
         Assert.Equal(128, legalRegisterMma.Parameters.Single(parameter => parameter.Name == TritonBlockMicroKernelContract.InnerNParameter).Value.Var().Min());
+        var mmaCycleMessage =
+            $"Expected MMA cycles {legalRegisterMma.ExecutionCost.RegionCycles.Var().Max()} " +
+            $"to be lower than SIMT cycles {legalSimt.ExecutionCost.RegionCycles.Var().Min()}.";
         Assert.True(
             legalRegisterMma.ExecutionCost.RegionCycles.Var().Max() <
             legalSimt.ExecutionCost.RegionCycles.Var().Min(),
-            $"Expected MMA cycles {legalRegisterMma.ExecutionCost.RegionCycles.Var().Max()} " +
-            $"to be lower than SIMT cycles {legalSimt.ExecutionCost.RegionCycles.Var().Min()}.");
+            mmaCycleMessage);
         Assert.DoesNotContain(
             legalRegisterMma.Resources,
             usage => usage.Resource == NTTTargetMachineCatalog.GpuBackendSharedMemory);
@@ -435,11 +483,13 @@ public sealed class UnitTestTritonTargetCostModel : TestClassBase
         var n32Mma = Assert.Single(n32Candidates, candidate => IsCandidate(candidate, "register_mma_accumulator"));
         var n32Simt = Assert.Single(n32Candidates, candidate => IsCandidate(candidate, "register_simt_accumulator"));
         Assert.Equal(1, n32Mma.IsLegal.Var().Min());
+        var narrowMmaCycleMessage =
+            $"Expected narrow-N MMA cycles {n32Mma.ExecutionCost.RegionCycles.Var().Min()} " +
+            $"to exceed SIMT cycles {n32Simt.ExecutionCost.RegionCycles.Var().Max()}.";
         Assert.True(
             n32Mma.ExecutionCost.RegionCycles.Var().Min() >
             n32Simt.ExecutionCost.RegionCycles.Var().Max(),
-            $"Expected narrow-N MMA cycles {n32Mma.ExecutionCost.RegionCycles.Var().Min()} " +
-            $"to exceed SIMT cycles {n32Simt.ExecutionCost.RegionCycles.Var().Max()}.");
+            narrowMmaCycleMessage);
         Assert.DoesNotContain(
             n32Mma.Resources,
             usage => usage.Resource == NTTTargetMachineCatalog.GpuBackendSharedMemory);

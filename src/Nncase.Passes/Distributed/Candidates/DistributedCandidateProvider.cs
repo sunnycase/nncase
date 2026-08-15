@@ -11,6 +11,10 @@ namespace Nncase.Passes.Distributed;
 
 public interface IDistributedCandidateProvider
 {
+    bool AllowsPartialInputs { get; }
+
+    bool IsExhaustive { get; }
+
     IReadOnlyList<IRType> GetReturnCandidateTypes(
         DistributedCandidateContext context,
         Op target,
@@ -21,6 +25,11 @@ public interface IDistributedCandidateProvider
         Op target,
         IRType returnType,
         out IReadOnlyList<DistributedCandidateTuple> tuples);
+
+    Op CreateCandidateTarget(
+        DistributedCandidateContext context,
+        Op target,
+        IRType returnType);
 }
 
 public interface IDistributedCandidateProvider<T> : IDistributedCandidateProvider
@@ -73,6 +82,10 @@ public sealed class DistributedCandidateContext
 public abstract class DistributedCandidateProvider<T> : IDistributedCandidateProvider<T>
     where T : Op
 {
+    public virtual bool AllowsPartialInputs => false;
+
+    public virtual bool IsExhaustive => false;
+
     public virtual IReadOnlyList<IRType> GetReturnCandidateTypes(
         DistributedCandidateContext context,
         T target,
@@ -84,6 +97,12 @@ public abstract class DistributedCandidateProvider<T> : IDistributedCandidatePro
         T target,
         IRType returnType,
         out IReadOnlyList<DistributedCandidateTuple> tuples);
+
+    public virtual T CreateCandidateTarget(
+        DistributedCandidateContext context,
+        T target,
+        IRType returnType)
+        => target;
 
     bool IDistributedCandidateProvider.TryGetInputTypeTuples(
         DistributedCandidateContext context,
@@ -111,6 +130,21 @@ public abstract class DistributedCandidateProvider<T> : IDistributedCandidatePro
         }
 
         return defaultReturnTypes;
+    }
+
+    Op IDistributedCandidateProvider.CreateCandidateTarget(
+        DistributedCandidateContext context,
+        Op target,
+        IRType returnType)
+    {
+        if (target is not T typedTarget)
+        {
+            throw new ArgumentException(
+                $"Candidate provider {GetType().Name} cannot handle target {target.GetType().Name}.",
+                nameof(target));
+        }
+
+        return CreateCandidateTarget(context, typedTarget, returnType);
     }
 }
 

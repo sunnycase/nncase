@@ -4,6 +4,7 @@
 using System;
 using System.CommandLine;
 using System.CommandLine.Invocation;
+using System.Linq;
 using Nncase.Passes;
 using Nncase.Passes.Transforms;
 
@@ -45,6 +46,16 @@ public sealed class PyNTTTarget : NTTTarget
     }
 
     /// <inheritdoc/>
+    public override void RegisterPostAutoPackingPass(IPassManager passManager, CompileOptions options)
+    {
+        var (splitHierarchyAxis, splitCount) = GetPagedAttentionSplitPlan(options);
+        passManager.AddWithName<DataflowPass>("DecomposePagedAttention").Configure(p =>
+        {
+            p.Add<Passes.Rules.NTT.DecomposePagedAttention>(splitHierarchyAxis, splitCount);
+        });
+    }
+
+    /// <inheritdoc/>
     public override void RegisterTIRPostBufferizePass(IPassManager passManager, CompileOptions options)
     {
         passManager.AddWithName<InlineSingleCallPrimFunctionsPass>("InlineSingleCallPrimFunctions", Kind);
@@ -82,5 +93,43 @@ public sealed class PyNTTTarget : NTTTarget
         }
 
         return (cmd, ParseTargetCompileOptions);
+    }
+
+    private static (int Axis, int Count) GetPagedAttentionSplitPlan(CompileOptions options)
+    {
+        if (options.TargetOptions is not INTTTargetOptions targetOptions ||
+            targetOptions.Hierarchies.Length == 0)
+        {
+            throw new InvalidOperationException(
+                "PyNTT paged-attention decomposition requires at least one target hierarchy.");
+        }
+
+        var hierarchyRank = targetOptions.Hierarchies[0].Length;
+        var levels = Nncase.IR.Placement.NormalizeHierarchyLevels(
+            targetOptions.HierarchyLevels,
+            targetOptions.HierarchyNames,
+            hierarchyRank);
+        if (targetOptions.Hierarchies.Any(hierarchy => hierarchy.Length != hierarchyRank))
+        {
+            throw new InvalidOperationException(
+                "PyNTT paged-attention decomposition requires all target hierarchies to have the same rank.");
+        }
+
+        var candidates = Enumerable.Range(0, hierarchyRank)
+            .Where(axis => levels[axis] == 'b')
+            .Select(axis => new
+            {
+                Axis = axis,
+                Extents = targetOptions.Hierarchies.Select(hierarchy => hierarchy[axis]).Distinct().ToArray(),
+            })
+            .Where(candidate => candidate.Extents.Length == 1 && candidate.Extents[0] > 1)
+            .OrderBy(candidate => candidate.Extents[0])
+            .ThenBy(candidate => candidate.Axis)
+            .FirstOrDefault();
+        return candidates is not null
+            ? (candidates.Axis, candidates.Extents[0])
+            : throw new InvalidOperationException(
+                "PyNTT split-KV paged attention requires a physical block hierarchy axis " +
+                "with one fixed extent greater than one across all placement candidates.");
     }
 }

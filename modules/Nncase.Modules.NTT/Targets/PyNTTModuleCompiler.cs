@@ -84,6 +84,8 @@ public sealed class PyNTTModuleCompiler : INTTModuleCompiler
                 or IR.NTT.PackedMatMul
                 or IR.NTT.PackedQKVParallelLinear
                 or IR.NTT.PackedMatMulGlu
+                or IR.NTT.PagedAttentionPartial
+                or IR.NTT.PagedAttentionCombine
                 or IR.Math.Reduce { ReduceOp: ReduceOp.Sum or ReduceOp.Mean or ReduceOp.Max or ReduceOp.Min }
                 or IR.NTT.VectorizedReduce { ReduceOp: ReduceOp.Sum or ReduceOp.Mean or ReduceOp.Max or ReduceOp.Min }
                 or IR.NN.Softmax

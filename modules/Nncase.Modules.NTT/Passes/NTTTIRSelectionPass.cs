@@ -392,6 +392,18 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
                 return TIR.F.NTT.IdentityPagedAttentionKVCache((Expr)arguments[0], (Expr)arguments[1], (Expr)arguments[2], (Expr)arguments[3], (Expr)arguments[4], (Expr)arguments[5], (Expr)arguments[6], (Expr)arguments[7], (Expr)arguments[8]);
             case IR.NN.PagedAttention pgat:
                 return GeneratePagedAttention(call, pgat, arguments, ref output, context);
+            case IR.NTT.PagedAttentionPartial partialAttention:
+                return GeneratePagedAttentionPartial(partialAttention, arguments, output);
+            case IR.NTT.PagedAttentionCombine combineAttention:
+                return TIR.F.NTT.PagedAttentionMerge(
+                    (Expr)arguments[IR.NTT.PagedAttentionCombine.MaxState.Index],
+                    (Expr)arguments[IR.NTT.PagedAttentionCombine.SumState.Index],
+                    (Expr)arguments[IR.NTT.PagedAttentionCombine.AccState.Index],
+                    output,
+                    combineAttention.Layout,
+                    combineAttention.HiddenSize,
+                    combineAttention.SplitHierarchyAxis,
+                    combineAttention.SplitCount);
             case IR.Tensors.ConstantOfShape constantOfShape:
                 return TIR.F.NTT.ConstantOfShape((Shape)arguments[0], (Expr)arguments[1], output);
             case IR.Tensors.Range range:
@@ -538,31 +550,27 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
                 "Split-KV PagedAttention layout must contain Seq, Head, and Dim.");
         }
 
-        var (partialMaxType, mergedMaxType) = CreatePagedAttentionStateTypes(
+        var partialMaxType = CreatePagedAttentionStateType(
             queryDistributedType,
             dimAxis,
             plan,
-            accumulator: false);
-        var (partialAccType, mergedAccType) = CreatePagedAttentionStateTypes(
+            accumulator: false,
+            ReduceOp.Max);
+        var partialSumType = CreatePagedAttentionStateType(
             queryDistributedType,
             dimAxis,
             plan,
-            accumulator: true);
-        var (partialMax, mergedMax) = CreateSplitKVStateBuffers(
-            partialMaxType,
-            mergedMaxType,
-            "paged_attention_max",
-            context);
-        var (partialSum, mergedSum) = CreateSplitKVStateBuffers(
-            partialMaxType,
-            mergedMaxType,
-            "paged_attention_sum",
-            context);
-        var (partialAcc, mergedAcc) = CreateSplitKVStateBuffers(
-            partialAccType,
-            mergedAccType,
-            "paged_attention_acc",
-            context);
+            accumulator: false,
+            ReduceOp.Sum);
+        var partialAccType = CreatePagedAttentionStateType(
+            queryDistributedType,
+            dimAxis,
+            plan,
+            accumulator: true,
+            ReduceOp.Sum);
+        var partialMax = CreateMetadataBuffer(partialMaxType, MemoryLocation.Data, "paged_attention_max");
+        var partialSum = CreateMetadataBuffer(partialSumType, MemoryLocation.Data, "paged_attention_sum");
+        var partialAcc = CreateMetadataBuffer(partialAccType, MemoryLocation.Data, "paged_attention_acc");
 
         var mergeOutput = output;
         var requiresPublicationBarrier = false;
@@ -593,9 +601,9 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
             plan.SplitCount,
             plan.DirectContextThreshold);
         var merge = TIR.F.NTT.PagedAttentionMerge(
-            mergedMax,
-            mergedSum,
-            mergedAcc,
+            partialMax,
+            partialSum,
+            partialAcc,
             mergeOutput,
             pagedAttention.Layout,
             pagedAttention.HiddenSize,
@@ -633,11 +641,41 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
             traceScopeName: "paged_attention_split_kv");
     }
 
-    private (DistributedType Partial, DistributedType Merged) CreatePagedAttentionStateTypes(
+    private Expr GeneratePagedAttentionPartial(
+        IR.NTT.PagedAttentionPartial partial,
+        IReadOnlyList<BaseExpr> arguments,
+        Expr output)
+    {
+        var outputBase = Unsafe.As<Expr, BaseExpr>(ref output);
+        if (outputBase is not IR.Tuple { Count: 3 } states)
+        {
+            throw new InvalidOperationException(
+                "PagedAttentionPartial TIR selection expects max, sum, and accumulator output buffers.");
+        }
+
+        return TIR.F.NTT.PagedAttentionPartial(
+            (Expr)arguments[IR.NTT.PagedAttentionPartial.Q.Index],
+            (Expr)arguments[IR.NTT.PagedAttentionPartial.KVCaches.Index],
+            (Expr)arguments[IR.NTT.PagedAttentionPartial.Extra.Index],
+            (Expr)arguments[IR.NTT.PagedAttentionPartial.Scale.Index],
+            (Dimension)arguments[IR.NTT.PagedAttentionPartial.LayerId.Index],
+            (Expr)states[0],
+            (Expr)states[1],
+            (Expr)states[2],
+            None.Default,
+            partial.Layout,
+            partial.HiddenSize,
+            partial.SplitHierarchyAxis,
+            partial.SplitCount,
+            directContextThreshold: 0);
+    }
+
+    private DistributedType CreatePagedAttentionStateType(
         DistributedType queryType,
         int dimAxis,
         PagedAttentionExecutionPlan plan,
-        bool accumulator)
+        bool accumulator,
+        ReduceOp reduceOp)
     {
         if (queryType.TensorType.Shape is not RankedShape queryShape ||
             queryType.AxisPolicies.Count != queryShape.Rank)
@@ -652,42 +690,12 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
             : Dimension.One;
         var stateTensorType = new TensorType(
             DataTypes.Float32,
-            new RankedShape([
-                .. dimensions,
-                queryType.Placement.Hierarchy[plan.SplitHierarchyAxis],
-            ]));
-        var commonPolicies = queryType.AxisPolicies.ToArray();
-        var partialType = new DistributedType(
+            new RankedShape(dimensions));
+        return new DistributedType(
             stateTensorType,
-            new IRArray<SBP>(commonPolicies.Append(SBP.SContiguous([plan.SplitHierarchyAxis])).ToArray()),
-            queryType.Placement);
-        var mergedType = new DistributedType(
-            stateTensorType,
-            new IRArray<SBP>(commonPolicies.Append(SBP.B).ToArray()),
-            queryType.Placement);
-        return (partialType, mergedType);
-    }
-
-    private (TIR.Buffer Partial, TIR.Buffer Merged) CreateSplitKVStateBuffers(
-        DistributedType partialType,
-        DistributedType mergedType,
-        string name,
-        TIRSelectionContext context)
-    {
-        var localBuffer = CreateMetadataBuffer(
-            partialType,
-            MemoryLocation.Data,
-            name);
-        var (canonicalBuffer, componentBase) = EnsureChipLocalShardedBacking(
-            localBuffer,
-            context);
-        var mergedBuffer = CreateShardedAlias(
-            canonicalBuffer,
-            mergedType,
-            componentBase,
-            $"{name}_merged_{_shardedViewIndex++}");
-        _shardedComponentBases.Add(mergedBuffer, componentBase);
-        return (canonicalBuffer, mergedBuffer);
+            queryType.AxisPolicies,
+            queryType.Placement,
+            SBP.P([plan.SplitHierarchyAxis], reduceOp));
     }
 
     private int GetVectorLaneCount(DataType dataType)
@@ -705,7 +713,17 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
     {
         if (call[IR.Distributed.ShardedView.Input] is TensorConst tensorConst)
         {
-            output = T.AttachShardedConstView(tensorConst, shardedView.NewType, out _, $"const_sharded_view_{_shardedViewIndex++}");
+            var constView = T.AttachShardedConstView(
+                tensorConst,
+                shardedView.NewType,
+                out _,
+                $"const_sharded_view_{_shardedViewIndex++}");
+            if (output is BufferVar { Role: BufferVarRole.Output } outputParameter)
+            {
+                return GenerateTensorStore(constView, outputParameter);
+            }
+
+            output = constView;
             return T.Nop();
         }
 

@@ -777,7 +777,6 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 new DeviceFunctionRenderSpec(
                     name,
                     NoInline: true,
-                    PreserveHelperCallBoundaries: _currentFunction.Role == FunctionRole.Compute,
                     _helpers.ToArray(),
                     bodySource,
                     parameterOverrides,
@@ -863,7 +862,6 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 var consumerFunction = new DeviceFunctionRenderSpec(
                     $"{name}__consumer",
                     NoInline: true,
-                    PreserveHelperCallBoundaries: true,
                     _helpers.ToArray(),
                     consumerBody,
                     parameterOverrides,
@@ -872,7 +870,6 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 var producerFunction = new DeviceFunctionRenderSpec(
                     $"{name}__producer",
                     NoInline: true,
-                    PreserveHelperCallBoundaries: true,
                     Array.Empty<HelperTemplateRenderSpec>(),
                     producerBody,
                     parameterOverrides,
@@ -6950,6 +6947,28 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             MarkStoredOutput(output, "PyNTT PagedAttention");
         }
 
+        private static void ValidatePagedAttentionPartialState(
+            TIR.Buffer state,
+            int splitHierarchyAxis,
+            ReduceOp reduceOp,
+            string context)
+        {
+            if (state.DistributedType is not { Partial: { } partial } distributed ||
+                partial.Op != reduceOp ||
+                !partial.Axes.SequenceEqual(new[] { splitHierarchyAxis }) ||
+                distributed.AxisPolicies.Any(policy => policy is SBPPartial) ||
+                splitHierarchyAxis < 0 ||
+                splitHierarchyAxis >= distributed.Placement.Rank ||
+                DistributedUtility.GetHierarchyAxisPolicies(
+                    distributed.AxisPolicies,
+                    distributed.Placement.Rank)[splitHierarchyAxis] is not HierarchyAxisBroadcast)
+            {
+                throw new NotSupportedException(
+                    $"{context} must be P([{splitHierarchyAxis}], {reduceOp}) over an otherwise " +
+                    $"broadcast hierarchy axis, got {state.DistributedType}.");
+            }
+        }
+
         private void VisitPagedAttentionPartial(
             Nncase.TIR.NTT.PagedAttentionPartial pagedAttention,
             IReadOnlyList<BaseExpr> args,
@@ -6961,12 +6980,22 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 args[3] is not TIR.Buffer scale ||
                 args[5] is not TIR.Buffer maxState ||
                 args[6] is not TIR.Buffer sumState ||
-                args[7] is not TIR.Buffer accState ||
-                args[8] is not TIR.Buffer output)
+                args[7] is not TIR.Buffer accState)
             {
                 throw new NotSupportedException(
-                    "PyNTT PagedAttentionPartial codegen expects query, kv-cache, extra, scale, layer id, three state buffers, and the adaptive direct output.");
+                    "PyNTT PagedAttentionPartial codegen expects query, kv-cache, extra, scale, layer id, and three state buffers.");
             }
+
+            var output = args[8] switch
+            {
+                TIR.Buffer buffer => buffer,
+                None when pagedAttention.DirectContextThreshold == 0 => null,
+                None => throw new NotSupportedException(
+                    "PyNTT adaptive PagedAttentionPartial requires a direct output buffer when its direct-context threshold is positive."),
+                _ => throw new NotSupportedException(
+                    "PyNTT PagedAttentionPartial output must be a TIR buffer or None for a state-only partial."),
+            };
+            var outputLayout = output ?? query;
 
             if (maxState.ElemType != DataTypes.Float32 ||
                 sumState.ElemType != DataTypes.Float32 ||
@@ -6975,6 +7004,22 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 throw new NotSupportedException(
                     "PyNTT PagedAttentionPartial requires FP32 max, sum, and accumulator states.");
             }
+
+            ValidatePagedAttentionPartialState(
+                maxState,
+                pagedAttention.SplitHierarchyAxis,
+                ReduceOp.Max,
+                "PyNTT PagedAttentionPartial max state");
+            ValidatePagedAttentionPartialState(
+                sumState,
+                pagedAttention.SplitHierarchyAxis,
+                ReduceOp.Sum,
+                "PyNTT PagedAttentionPartial sum state");
+            ValidatePagedAttentionPartialState(
+                accState,
+                pagedAttention.SplitHierarchyAxis,
+                ReduceOp.Sum,
+                "PyNTT PagedAttentionPartial accumulator state");
 
             var cache = GetPagedAttentionCacheTemplateModel(
                 args[1],
@@ -7021,12 +7066,13 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     "PyNTT PagedAttentionPartial layout must contain Seq, Head, and Dim.");
             }
 
-            if (maxState.Rank != query.Rank + 1 ||
-                sumState.Rank != query.Rank + 1 ||
-                accState.Rank != query.Rank + 1)
+            if (maxState.Rank != query.Rank ||
+                sumState.Rank != query.Rank ||
+                accState.Rank != query.Rank)
             {
                 throw new NotSupportedException(
-                    "PyNTT PagedAttentionPartial state rank must equal query rank plus the KV-split axis.");
+                    "PyNTT PagedAttentionPartial state rank must equal query rank; " +
+                    "the KV partition is represented by DistributedType.Partial.");
             }
 
             var querySplitAxes = GetBufferShardAxes(query, query.Dimensions.Length);
@@ -7054,17 +7100,18 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     GetBufferScalarPointer(maxState),
                     GetBufferScalarPointer(sumState),
                     GetBufferScalarPointer(accState),
-                    GetBufferScalarPointer(output),
+                    output is null ? null : GetBufferScalarPointer(output),
+                    output is not null,
                     GetPyNTTScalarDTypeName(query.ElemType),
                     GetScalarTritonDType(query.ElemType),
                     queryShape,
                     queryStrides,
                     queryVectorLanes,
-                    GetBufferShape(output),
-                    GetBufferGlobalShape(output),
-                    GetBufferStrides(output),
-                    GetVectorLanes(output.ElemType),
-                    GetBufferShardAxes(output, output.Dimensions.Length),
+                    GetBufferShape(outputLayout),
+                    GetBufferGlobalShape(outputLayout),
+                    GetBufferStrides(outputLayout),
+                    GetVectorLanes(outputLayout.ElemType),
+                    GetBufferShardAxes(outputLayout, outputLayout.Dimensions.Length),
                     GetBufferShape(maxState),
                     GetBufferStrides(maxState),
                     GetBufferShape(sumState),
@@ -7090,12 +7137,17 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     seqLensArgument,
                     numSeqsArgument,
                     cache,
-                    $"{query.Name}, kv-cache -> {maxState.Name}, {sumState.Name}, {accState.Name} or {output.Name}");
+                    output is null
+                        ? $"{query.Name}, kv-cache -> {maxState.Name}, {sumState.Name}, {accState.Name}"
+                        : $"{query.Name}, kv-cache -> {maxState.Name}, {sumState.Name}, {accState.Name} or {output.Name}");
             WriteSelectedMicroKernelHelper(
                 microKernel,
                 templateModel,
                 helperName);
-            MarkStoredOutput(output, "PyNTT adaptive PagedAttentionPartial");
+            if (output is not null)
+            {
+                MarkStoredOutput(output, "PyNTT adaptive PagedAttentionPartial");
+            }
         }
 
         private void VisitPagedAttentionMerge(
@@ -7120,17 +7172,45 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     "PyNTT PagedAttentionMerge requires FP32 max, sum, and accumulator states.");
             }
 
+            ValidatePagedAttentionPartialState(
+                maxState,
+                pagedAttention.SplitHierarchyAxis,
+                ReduceOp.Max,
+                "PyNTT PagedAttentionMerge max state");
+            ValidatePagedAttentionPartialState(
+                sumState,
+                pagedAttention.SplitHierarchyAxis,
+                ReduceOp.Sum,
+                "PyNTT PagedAttentionMerge sum state");
+            ValidatePagedAttentionPartialState(
+                accState,
+                pagedAttention.SplitHierarchyAxis,
+                ReduceOp.Sum,
+                "PyNTT PagedAttentionMerge accumulator state");
+
             var layout = pagedAttention.Layout.ToArray();
             var seqAxis = Array.IndexOf(layout, AttentionDimKind.Seq);
             var headAxis = Array.IndexOf(layout, AttentionDimKind.Head);
             var dimAxis = Array.IndexOf(layout, AttentionDimKind.Dim);
             if (seqAxis < 0 || headAxis < 0 || dimAxis < 0 ||
-                maxState.Rank != output.Rank + 1 ||
-                sumState.Rank != output.Rank + 1 ||
-                accState.Rank != output.Rank + 1)
+                maxState.Rank != output.Rank ||
+                sumState.Rank != output.Rank ||
+                accState.Rank != output.Rank)
             {
                 throw new NotSupportedException(
-                    "PyNTT PagedAttentionMerge requires Seq/Head/Dim output axes and rank+1 state buffers.");
+                    "PyNTT PagedAttentionMerge requires Seq/Head/Dim output axes and " +
+                    "rank-preserving partial state buffers.");
+            }
+
+            var maxStateRef = ResolveByteAddressedBufferRef(maxState);
+            var sumStateRef = ResolveByteAddressedBufferRef(sumState);
+            var accStateRef = ResolveByteAddressedBufferRef(accState);
+            if (IsZeroOffset(maxStateRef.PoolStrideBytes) ||
+                IsZeroOffset(sumStateRef.PoolStrideBytes) ||
+                IsZeroOffset(accStateRef.PoolStrideBytes))
+            {
+                throw new NotSupportedException(
+                    "PyNTT PagedAttentionMerge partial states require distinct per-block pooled storage.");
             }
 
             var accGlobalShape = GetBufferGlobalShape(accState);
@@ -7146,11 +7226,6 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             }
 
             var outputSplitAxes = GetBufferShardAxes(output, output.Dimensions.Length);
-            if (outputSplitAxes[dimAxis].Stages.Length != 0)
-            {
-                throw new NotSupportedException(
-                    "PyNTT PagedAttentionMerge requires the attention Dim axis to be unsplit.");
-            }
 
             SetComputeOp("paged_attention_merge");
             _attrs["op"] = "paged_attention_merge";
@@ -7163,8 +7238,11 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 new PyNTTPagedAttentionMergeTemplateModel(
                     helperName,
                     GetBufferScalarPointer(maxState),
+                    GetPooledByteAddressTemplateModel(maxStateRef),
                     GetBufferScalarPointer(sumState),
+                    GetPooledByteAddressTemplateModel(sumStateRef),
                     GetBufferScalarPointer(accState),
+                    GetPooledByteAddressTemplateModel(accStateRef),
                     GetBufferScalarPointer(output),
                     GetPyNTTScalarDTypeName(output.ElemType),
                     GetScalarTritonDType(output.ElemType),
@@ -7174,6 +7252,8 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     GetBufferStrides(sumState),
                     GetBufferShape(accState),
                     GetBufferStrides(accState),
+                    GetBufferGlobalShape(accState),
+                    GetBufferShardAxes(accState, accState.Dimensions.Length),
                     GetBufferShape(output),
                     GetBufferGlobalShape(output),
                     GetBufferStrides(output),
@@ -8529,8 +8609,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             var spanOffset = GetLocalRegionDimensionExpression(
                 buffer.MemSpan.Start,
                 GetShardCoordHierarchy(buffer));
-            if (buffer.DistributedType is null ||
-                buffer.DistributedStorageKind == DistributedBufferStorageKind.CanonicalGlobal)
+            if (buffer.DistributedType is null)
             {
                 offsetBytes = checked(offsetBytes + RequireFixedDim(
                     spanOffset,
@@ -8624,6 +8703,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             {
                 DistributedStorageKind = buffer.DistributedStorageKind.ToString(),
                 GlobalShape = GetBufferGlobalShape(buffer),
+                GlobalOffsets = GetBufferGlobalOffsets(buffer),
                 Strides = GetBufferStrides(buffer),
                 ShardAxes = GetBufferSourceShardAxes(buffer, buffer.Rank),
                 Hierarchy = GetHierarchy(buffer),
@@ -8741,6 +8821,15 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
         {
             var source = viewSource.Source;
             var sourceRef = ResolveBufferRef(source);
+            if (source.DistributedType is not null &&
+                source.DistributedStorageKind == DistributedBufferStorageKind.CanonicalGlobal)
+            {
+                // Canonical-global pointers name the authoritative allocation base.
+                // BufferSubview origins remain logical coordinates and are applied by
+                // the renderer before the distributed local-to-global mapping.
+                return sourceRef;
+            }
+
             var sourceStrides = GetBufferStrides(source);
             if (sourceStrides.Length != viewSource.Offsets.Length)
             {
@@ -8777,6 +8866,12 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             if (!TryGetFormalTensorStorageNames(buffer, out var poolStrideName, out var poolScopeSizeName))
             {
                 throw new NotSupportedException($"PyNTT formal tensor buffer {buffer.Name} is missing backing-pool ABI metadata.");
+            }
+
+            if (buffer.DistributedType is not null &&
+                buffer.DistributedStorageKind == DistributedBufferStorageKind.CanonicalGlobal)
+            {
+                return new(baseName, "0", "0", null, false);
             }
 
             return new(
@@ -8886,10 +8981,14 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
         {
             var spanOffsetElements = GetBufferSpanOffsetElements(buffer);
             var spanHasShardOffset = ContainsShardCoordinate(buffer.MemSpan.Start);
-            if (buffer.DistributedType is not { } ||
-                buffer.DistributedStorageKind == DistributedBufferStorageKind.CanonicalGlobal)
+            if (buffer.DistributedType is not { })
             {
                 return new(baseName, spanOffsetElements, "0", null, false);
+            }
+
+            if (buffer.DistributedStorageKind == DistributedBufferStorageKind.CanonicalGlobal)
+            {
+                return new(baseName, "0", "0", null, false);
             }
 
             var poolStrideElements = $"{baseName}{PoolStrideElementsSuffix}";
@@ -9197,6 +9296,12 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
         private PyNTTDimExpression GetBufferOffsetDimension(TIR.Buffer buffer)
         {
             var physicalOffset = GetPhysicalBufferStartOffset(buffer.MemSpan.Buffer.Start, $"{buffer.MemSpan.Buffer.Location} physical buffer offset");
+            if (buffer.DistributedType is not null &&
+                buffer.DistributedStorageKind == DistributedBufferStorageKind.CanonicalGlobal)
+            {
+                return physicalOffset;
+            }
+
             var spanOffset = GetLocalRegionDimensionExpression(buffer.MemSpan.Start, GetShardCoordHierarchy(buffer));
             return AddDimExpression(physicalOffset, spanOffset);
         }
@@ -9234,6 +9339,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             {
                 return "0";
             }
+
             var globalShape = GetRankedShapeDimensions(distributedType.TensorType.Shape, $"{buffer.Name} distributed global shape").ToArray();
             var globalStrides = TensorUtilities.GetDefaultStrides(globalShape);
             var offsetElements = TensorUtilities.GetLinearOffset(globalStrides, localOffset) * GetVectorLaneElementCount(buffer.ElemType);
@@ -12442,8 +12548,6 @@ internal sealed record DeviceFunctionRenderSpec(
     string Name,
     [property: JsonPropertyName("noinline")]
     bool NoInline,
-    [property: JsonPropertyName("preserve_helper_call_boundaries")]
-    bool PreserveHelperCallBoundaries,
     [property: JsonPropertyName("helpers")]
     IReadOnlyList<HelperTemplateRenderSpec> Helpers,
     [property: JsonPropertyName("body_source")]
