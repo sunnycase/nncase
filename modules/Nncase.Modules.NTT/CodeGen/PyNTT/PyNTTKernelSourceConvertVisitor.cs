@@ -1482,6 +1482,9 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 case Nncase.TIR.NTT.GatherReduceScatter gatherReduceScatter:
                     VisitGatherReduceScatter(gatherReduceScatter, args);
                     break;
+                case Nncase.TIR.NTT.GatherReduceNormApply gatherReduceNormApply:
+                    VisitGatherReduceNormApply(gatherReduceNormApply, args);
+                    break;
                 case Nncase.TIR.NTT.Pad pad:
                     VisitPad(pad, args);
                     break;
@@ -6560,7 +6563,9 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             var helperName = GetNextHelperName("norm_apply_compute");
             var templateModel = BuildNormApplyTemplateModel(
                 helperName,
-                normApply,
+                normApply.Axis,
+                normApply.Epsilon,
+                normApply.UseMean,
                 input,
                 stats,
                 scale,
@@ -6578,9 +6583,94 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             MarkStoredOutput(output, "PyNTT NormApply");
         }
 
+        private void VisitGatherReduceNormApply(
+            Nncase.TIR.NTT.GatherReduceNormApply gatherReduceNormApply,
+            IReadOnlyList<BaseExpr> args)
+        {
+            const string context = "PyNTT GatherReduceNormApply";
+            if (args.Count < 5)
+            {
+                throw new NotSupportedException(
+                    $"{context} expects partial stats, input, scale, bias, and output buffers.");
+            }
+
+            var partialStats = GetBufferOperand(args[0], $"{context} partial stats");
+            var input = GetBufferOperand(args[1], $"{context} input");
+            var scale = GetBufferOperand(args[2], $"{context} scale");
+            var bias = GetBufferOperand(args[3], $"{context} bias");
+            var output = GetBufferOperand(args[4], $"{context} output");
+            var inStatsType = gatherReduceNormApply.InStatsType;
+            var outStatsType = gatherReduceNormApply.OutStatsType;
+            if (!inStatsType.Placement.Hierarchy.SequenceEqual(outStatsType.Placement.Hierarchy) ||
+                !inStatsType.AxisPolicies.All(policy => policy is SBPBroadCast) ||
+                !outStatsType.AxisPolicies.All(policy => policy is SBPBroadCast) ||
+                outStatsType.Partial is not null ||
+                inStatsType.Partial is not { Op: ReduceOp.Sum } partial)
+            {
+                throw new NotSupportedException(
+                    $"{context} requires Sum partial statistics reduced to broadcast policies on one placement.");
+            }
+
+            var hierarchy = inStatsType.Placement.Hierarchy.ToArray();
+            var partialAxes = partial.Axes.ToArray();
+            if (partialAxes.Length == 0 ||
+                partialAxes.Distinct().Count() != partialAxes.Length ||
+                partialAxes.Any(axis => axis < 0 || axis >= hierarchy.Length))
+            {
+                throw new NotSupportedException(
+                    $"{context} has invalid partial axes [{string.Join(",", partialAxes)}] for hierarchy [{string.Join(",", hierarchy)}].");
+            }
+
+            if (partialStats.DistributedStorageKind != DistributedBufferStorageKind.CompactPerOwner ||
+                !IsCompactPerOwnerBacking(partialStats.MemSpan.Buffer))
+            {
+                throw new NotSupportedException(
+                    $"{context} partial stats {partialStats.Name} must use compact per-owner chip-visible storage.");
+            }
+
+            var partialStatsRef = ResolveByteAddressedBufferRef(partialStats);
+            if (IsZeroOffset(partialStatsRef.PoolStrideBytes))
+            {
+                throw new NotSupportedException(
+                    $"{context} partial stats {partialStats.Name} requires distinct per-owner storage.");
+            }
+
+            SetComputeOp(gatherReduceNormApply.UseMean ? "gather_reduce_norm_apply" : "gather_reduce_rms_norm_apply");
+            var helperName = GetNextHelperName("gather_reduce_norm_apply_compute");
+            var normApplyModel = BuildNormApplyTemplateModel(
+                helperName,
+                gatherReduceNormApply.Axis,
+                gatherReduceNormApply.Epsilon,
+                gatherReduceNormApply.UseMean,
+                input,
+                partialStats,
+                scale,
+                bias,
+                output,
+                context);
+            var templateModel = new PyNTTGatherReduceNormApplyTemplateModel(
+                helperName,
+                normApplyModel,
+                GetPooledByteAddressTemplateModel(partialStatsRef),
+                hierarchy,
+                partialAxes,
+                $"{partialStats.Name}, {input.Name}, {scale.Name}, {bias.Name} -> {output.Name}");
+            _attrs["op"] = gatherReduceNormApply.UseMean ? "gather_reduce_norm_apply" : "gather_reduce_rms_norm_apply";
+            _attrs["dtype"] = normApplyModel.OutputDType;
+            _attrs["shape"] = GetLogicalVectorShape(normApplyModel.OutputShape, normApplyModel.OutputVectorLaneCount);
+            _attrs["axis"] = normApplyModel.Axis;
+            _attrs["epsilon"] = gatherReduceNormApply.Epsilon;
+            _attrs["use_mean"] = gatherReduceNormApply.UseMean;
+            WriteHelperTemplate("triton/kernels/GatherReduceNormApply.py.jinja", templateModel);
+            WriteHelperInvocation(helperName);
+            MarkStoredOutput(output, context);
+        }
+
         private PyNTTNormApplyTemplateModel BuildNormApplyTemplateModel(
             string helperName,
-            Nncase.TIR.NTT.NormApply normApply,
+            int axis,
+            float epsilon,
+            bool useMean,
             TIR.Buffer input,
             TIR.Buffer stats,
             TIR.Buffer scale,
@@ -6594,7 +6684,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             var scaleShape = GetBufferActiveShape(scale);
             var biasShape = GetBufferActiveShape(bias);
             var outputShape = GetBufferActiveShape(output);
-            var normalizedAxis = NormalizeAxis(normApply.Axis, outputShape.Length, context);
+            var normalizedAxis = NormalizeAxis(axis, outputShape.Length, context);
             var inputVectorLaneCount = GetSingleVectorLaneCount(input.ElemType, $"{context} input");
             var statsVectorLaneCount = GetSingleVectorLaneCount(stats.ElemType, $"{context} stats");
             var scaleVectorLaneCount = GetSingleVectorLaneCount(scale.ElemType, $"{context} scale");
@@ -6621,7 +6711,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             var logicalBiasShape = GetLogicalVectorShape(biasShape, biasVectorLaneCount);
             var logicalOutputShape = GetLogicalVectorShape(outputShape, outputVectorLaneCount);
             ValidateSameShape(context, logicalInputShape, logicalOutputShape);
-            ValidateNormStatsShape($"{context} stats", logicalOutputShape, logicalStatsShape, normalizedAxis, normApply.UseMean);
+            ValidateNormStatsShape($"{context} stats", logicalOutputShape, logicalStatsShape, normalizedAxis, useMean);
             ValidateLayerNormShape($"{context} scale", logicalScaleShape, logicalOutputShape, normalizedAxis);
             ValidateLayerNormShape($"{context} bias", logicalBiasShape, logicalOutputShape, normalizedAxis);
             return new PyNTTNormApplyTemplateModel(
@@ -6663,8 +6753,8 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 GetVectorLanes(bias.ElemType),
                 GetVectorLanes(output.ElemType),
                 normalizedAxis,
-                normApply.Epsilon,
-                normApply.UseMean,
+                epsilon,
+                useMean,
                 $"{input.Name}, {stats.Name}, {scale.Name}, {bias.Name} -> {output.Name}");
         }
 

@@ -1672,6 +1672,9 @@ def _make_env() -> Environment:
         elementwise_where_context=_elementwise_where_template_context,
         fixed=_fixed,
         gather_context=_gather_template_context,
+        gather_reduce_norm_apply_context=(
+            _gather_reduce_norm_apply_template_context
+        ),
         helper_argument_names=_helper_argument_names,
         helper_parameters=_helper_parameters,
         is_bool_dtype=_is_bool_dtype,
@@ -6722,6 +6725,67 @@ def _norm_apply_template_context(model: dict[str, Any]) -> dict[str, Any]:
             "stats_accesses": (stats_access(0), stats_access(1)),
         }
     )
+    return context
+
+
+def _gather_reduce_norm_apply_template_context(
+    model: dict[str, Any],
+) -> dict[str, Any]:
+    """Prepare a repeated partial reduction followed by local NormApply."""
+
+    norm_apply = model["NormApply"]
+    context = _norm_apply_template_context(norm_apply)
+    hierarchy = tuple(int(extent) for extent in model["Hierarchy"])
+    partial_axes = tuple(sorted(int(axis) for axis in model["PartialAxes"]))
+    if not partial_axes or len(set(partial_axes)) != len(partial_axes):
+        raise ValueError(
+            "PyNTT GatherReduceNormApply requires non-empty unique partial axes"
+        )
+    if any(axis < 0 or axis >= len(hierarchy) for axis in partial_axes):
+        raise ValueError(
+            "PyNTT GatherReduceNormApply partial axes are outside the hierarchy"
+        )
+
+    dtype = norm_apply["StatsDType"]
+    if dtype in ("float16", "bfloat16", "float32"):
+        accumulator_dtype, zero = "tl.float32", "0.0"
+    elif dtype == "float64":
+        accumulator_dtype, zero = "tl.float64", "0.0"
+    else:
+        raise ValueError(
+            f"PyNTT GatherReduceNormApply does not support stats dtype {dtype}"
+        )
+
+    reduction_extent = _product_int([hierarchy[axis] for axis in partial_axes])
+    reduction_width_cap = 1 << (reduction_extent - 1).bit_length()
+    axis_strides: dict[int, int] = {}
+    axis_stride = 1
+    for axis in reversed(partial_axes):
+        axis_strides[axis] = axis_stride
+        axis_stride *= hierarchy[axis]
+
+    address = model["PartialStatsAddress"]
+    source_shard_index = _split_linear_expression(
+        list(range(len(hierarchy))),
+        hierarchy,
+        "source_shard_coord",
+    )
+    context["partial"] = {
+        "accumulator_dtype": accumulator_dtype,
+        "address": address,
+        "axes": partial_axes,
+        "axis_strides": axis_strides,
+        "pointer_type": _pointer_type(
+            norm_apply["StatsTritonDType"], address["AddressSpace"]
+        ),
+        "reduction_extent": reduction_extent,
+        "reduction_width_cap": reduction_width_cap,
+        "source_pool_index": _pool_index_expression(
+            "source_shard_index", address["PoolScopeSize"]
+        ),
+        "source_shard_index": source_shard_index,
+        "zero": zero,
+    }
     return context
 
 

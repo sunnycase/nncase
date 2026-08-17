@@ -591,6 +591,17 @@ public sealed record PyNTTNormApplyTemplateModel(
     public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
 }
 
+public sealed record PyNTTGatherReduceNormApplyTemplateModel(
+    string FunctionName,
+    PyNTTNormApplyTemplateModel NormApply,
+    PyNTTPooledByteAddressTemplateModel PartialStatsAddress,
+    int[] Hierarchy,
+    int[] PartialAxes,
+    string Comment)
+{
+    public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
+}
+
 public sealed record PyNTTQKVRoPENormTemplateModel(
     string FunctionName,
     PyNTTBufferPointerTemplateModel Input,

@@ -203,6 +203,30 @@ def to_np_type(t: str):
         return None
 
 
+def to_torch_type(t: str):
+    types = {
+        "float16": torch.float16,
+        "float32": torch.float32,
+        "bfloat16": torch.bfloat16,
+    }
+    try:
+        return types[t]
+    except KeyError as ex:
+        raise ValueError(f"Unsupported HuggingFace tensor type: {t!r}") from ex
+
+
+def load_huggingface_reference(model_path, config, tensor_type: str):
+    reference_dtype = to_torch_type(tensor_type)
+    config.torch_dtype = reference_dtype
+    return AutoModelForCausalLM.from_pretrained(
+        model_path,
+        config=config,
+        torch_dtype=reference_dtype,
+        device_map="auto",
+        trust_remote_code=True,
+    ).eval()
+
+
 def dump_data_to_file(dir_path, file_path, data):
     if not test_utils.in_ci():
         dump_bin_file(os.path.join(dir_path, f'{file_path}.bin'), data)
@@ -630,8 +654,8 @@ class HuggingfaceTestRunner(TestRunner):
             normalize_safetensor(model_path)
             # dequantize_weights(model_path)
             # delattr(config, "quantization_config")
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_path, config=config, torch_dtype="auto", device_map="auto", trust_remote_code=True).eval()
+        self.model = load_huggingface_reference(
+            model_path, config, self.cfg['huggingface_options']['tensor_type'])
         # restore_weights(model_path)
         self.tokenizer = AutoTokenizer.from_pretrained(model_path)
         self.generation_config = self.model.generation_config

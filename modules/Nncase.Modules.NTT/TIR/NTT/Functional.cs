@@ -333,6 +333,27 @@ public partial class NTT
         return KernelCall(new NormApply(axis, epsilon, useMean), input, stats, scale, bias, output);
     }
 
+    public static Expr GatherReduceNormApply(
+        Expr partialStats,
+        Expr input,
+        Expr scale,
+        Expr bias,
+        Expr output,
+        DistributedType inStatsType,
+        DistributedType outStatsType,
+        int axis,
+        float epsilon,
+        bool useMean)
+    {
+        return KernelCall(
+            new GatherReduceNormApply(inStatsType, outStatsType, axis, epsilon, useMean),
+            partialStats,
+            input,
+            scale,
+            bias,
+            output);
+    }
+
     public static Expr QKVRoPEWithCache(
         Expr q,
         Expr k,

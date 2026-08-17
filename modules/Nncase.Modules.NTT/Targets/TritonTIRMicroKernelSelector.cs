@@ -170,6 +170,7 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
         var comparisonSpan = LeastCommonMultiple(simt.BlockN, mma.BlockN);
         var simtCycles = EstimatePagedAttentionSimtCyclesPerTile(
                 context.Machine,
+                config.KVPrimType,
                 groupTile,
                 simt.BlockN,
                 config.HeadDim) *
@@ -336,6 +337,7 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
 
     private static double EstimatePagedAttentionSimtCyclesPerTile(
         TargetMachineModel machine,
+        DataType kvType,
         int groupTile,
         int blockN,
         int headDim)
@@ -351,7 +353,25 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
         var reductionOutputs = checked((long)groupTile * (blockN + headDim));
         var reductionCycles = reductionOutputs * reductionSteps /
             Math.Max(1.0, machine.Compute.ElementwiseElementsPerCycle);
-        return fmaCycles + reductionCycles;
+        var sharedSpace = machine.MemorySpaces.Values.SingleOrDefault(
+            space => machine.GetMemoryResource(space).Kind == TargetMemorySpaceKind.Shared);
+        if (sharedSpace is null)
+        {
+            return double.PositiveInfinity;
+        }
+
+        // The explicit SIMT layout expands both K and V over the GQA head
+        // group before loading them from Shared. Account for those physical
+        // reads; global transfer traffic is equal between candidates and is
+        // intentionally excluded from this block-local comparison.
+        var sharedReadBytes = checked(
+            2L * groupTile * blockN * headDim * kvType.SizeInBytes);
+        var sharedReadCycles = sharedReadBytes /
+            Math.Max(1.0, machine.GetMemoryResource(sharedSpace).ReadBytesPerCycle);
+        var convertedElements = checked(2L * groupTile * blockN * headDim);
+        var conversionCycles = convertedElements /
+            Math.Max(1.0, machine.Compute.ElementwiseElementsPerCycle);
+        return Math.Max(fmaCycles, sharedReadCycles) + conversionCycles + reductionCycles;
     }
 
     private static double EstimatePagedAttentionMmaCyclesPerTile(

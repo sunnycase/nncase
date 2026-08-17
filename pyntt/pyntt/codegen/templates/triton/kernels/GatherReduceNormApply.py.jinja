@@ -1,0 +1,62 @@
+{% import "triton/kernels/_common.py.jinja" as common with context %}
+{% import "triton/kernels/_elementwise.py.jinja" as elementwise with context %}
+{% import "triton/kernels/_producer_consumer.py.jinja" as phases with context %}
+{% set norm = model["NormApply"] %}
+{% set ctx = gather_reduce_norm_apply_context(model) %}
+{% set partial = ctx["partial"] %}
+# generated from PyNTT Jinja GatherReduceNormApply.py.jinja
+# {{ model["Comment"] }}; input_dtype={{ norm["InputDType"] }}, stats_dtype={{ norm["StatsDType"] }}, scale_dtype={{ norm["ScaleDType"] }}, bias_dtype={{ norm["BiasDType"] }}, output_dtype={{ norm["OutputDType"] }}, output_shape={{ shape_tuple(norm["OutputShape"]) }}, axis={{ norm["Axis"] }}, partial_axes={{ model["PartialAxes"] }}
+{{ phases.consumer_header(model) }}
+{{ common.mesh_coordinates(model["MeshAxes"]) }}
+    input0 = {{ ptr(norm, "Input") }}
+    scale0 = {{ ptr(norm, "Scale") }}
+    bias0 = {{ ptr(norm, "Bias") }}
+    output = {{ ptr(norm, "Output") }}
+    partial_reduction_width: tl.constexpr = min({{ model["TargetWorkerWidth"] }}, {{ partial["reduction_width_cap"] }})
+{% for axis in ctx["outer_axes"] %}
+{{ "    " * loop.index }}for outer_idx{{ axis }} in tl.range(0, {{ dim(ctx["logical_output_shape"][axis]) }}):
+{% endfor %}
+{% set base = "    " * ((ctx["outer_axes"] | length) + 1) %}
+{% set body = "    " * ((ctx["outer_axes"] | length) + 2) %}
+{{ base }}inner_count = ({{ ctx["normalization_size"] }}) + 0.0
+{% for component in range(2 if norm["UseMean"] else 1) %}
+{{ base }}stats_acc{{ component }} = tl.full((), {{ partial["zero"] }}, {{ partial["accumulator_dtype"] }})
+{{ base }}for partial_start{{ component }} in tl.range(0, {{ partial["reduction_extent"] }}, partial_reduction_width):
+{{ base }}    partial_lane{{ component }} = partial_start{{ component }} + tl.arange(0, partial_reduction_width)
+{{ base }}    partial_mask{{ component }} = partial_lane{{ component }} < {{ partial["reduction_extent"] }}
+{% for axis in range(model["Hierarchy"] | length) %}
+{% if axis in partial["axes"] %}
+{{ base }}    source_shard_coord{{ axis }} = (partial_lane{{ component }} // {{ partial["axis_strides"][axis] }}) % {{ model["Hierarchy"][axis] }}
+{% else %}
+{{ base }}    source_shard_coord{{ axis }} = shard_coord{{ axis }}
+{% endif %}
+{% endfor %}
+{{ base }}    source_shard_index = {{ partial["source_shard_index"] }}
+{{ base }}    source_pool_index = {{ partial["source_pool_index"] }}
+{{ base }}    source_byte_offset = source_pool_index * {{ partial["address"]["PoolStrideBytes"] }} + {{ partial["address"]["OffsetBytes"] }}
+{{ base }}    stats_source = ({{ partial["address"]["BaseName"] }} + source_byte_offset).to({{ partial["pointer_type"] }})
+{{ base }}    stats_value = tl.load(stats_source + {{ ctx["stats_accesses"][component]["ScalarOffset"] }}, mask=partial_mask{{ component }}, other={{ partial["zero"] }}).to({{ partial["accumulator_dtype"] }})
+{{ base }}    stats_acc{{ component }} += tl.sum(stats_value, axis=0)
+{% endfor %}
+{% if norm["UseMean"] %}
+{{ base }}mean_sum = stats_acc0
+{{ base }}square_sum = stats_acc1
+{{ base }}mean_value = mean_sum / inner_count
+{{ base }}variance = (square_sum / inner_count) - (mean_value * mean_value)
+{% else %}
+{{ base }}square_sum = stats_acc0
+{{ base }}mean_value = 0.0
+{{ base }}variance = square_sum / inner_count
+{% endif %}
+{{ base }}variance = tl.maximum(variance, 0.0)
+{{ base }}inv_std = tl.rsqrt(variance + {{ pyrepr(norm["Epsilon"]) }})
+{% call(body) elementwise.iterate(ctx, ctx["prefix_depth"]) %}
+{{ body }}value0 = tl.load({{ access_pointer(norm, "Input", "input0", ctx["input_access"]) }}, mask=mask, other=0.0).to(tl.float32)
+{{ body }}scale_value = tl.load({{ access_pointer(norm, "Scale", "scale0", ctx["scale_access"]) }}, mask=mask, other=0.0).to(tl.float32)
+{{ body }}bias_value = tl.load({{ access_pointer(norm, "Bias", "bias0", ctx["bias_access"]) }}, mask=mask, other=0.0).to(tl.float32)
+{{ body }}result = ((value0 - mean_value) * inv_std * scale_value) + bias_value
+{{ body }}tl.store({{ access_pointer(norm, "Output", "output", ctx["output_access"]) }}, result, mask=mask)
+{% endcall %}
+
+
+{{ phases.dispatch(model) }}

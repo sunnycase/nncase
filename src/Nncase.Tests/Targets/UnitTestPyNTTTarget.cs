@@ -1241,15 +1241,15 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         var selection = SelectPagedAttentionPartialMicroKernel(DataTypes.BFloat16);
 
         Assert.Equal("triton.paged_attention_partial", selection.Family);
-        Assert.Equal("simt_tma_smem_pipeline", selection.Variant);
-        Assert.Equal(128, selection.Parameters["block_n"]);
+        Assert.Equal("mma_tma_smem_pipeline", selection.Variant);
+        Assert.Equal(64, selection.Parameters["block_n"]);
         Assert.Equal(32, selection.Parameters["page_size"]);
-        Assert.Equal(1, selection.Parameters["num_stages"]);
+        Assert.Equal(2, selection.Parameters["num_stages"]);
         Assert.Equal(2, selection.SharedWorkspaces.Length);
         Assert.All(
             selection.SharedWorkspaces,
             workspace => Assert.Equal(
-                new long[] { 1, 1, 1, 128, 1, 128 },
+                new long[] { 2, 1, 1, 64, 1, 128 },
                 workspace.Type.Shape.ToValueArray()));
         var channels = selection.TransferPipeline!.Channels;
         Assert.Collection(
@@ -1847,8 +1847,8 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         Assert.DoesNotContain("key_topology_id", generatedKernelsPy, StringComparison.Ordinal);
         Assert.DoesNotContain("value_topology_id", generatedKernelsPy, StringComparison.Ordinal);
         Assert.Matches(@"key_block_id_0 = tl\.load\([^\r\n]+\.to\(tl\.int64\)", generatedKernelsPy);
-        Assert.Contains("key_descriptor = main_prim__paged_attention_partial__0__key_descriptor__resource0", generatedKernelsPy, StringComparison.Ordinal);
-        Assert.Contains("value_descriptor = main_prim__paged_attention_partial__0__value_descriptor__resource0", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("key_descriptor = main_prim__paged_attention_adaptive__paged_attention_partial__0__key_descriptor__resource0", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("value_descriptor = main_prim__paged_attention_adaptive__paged_attention_partial__0__value_descriptor__resource0", generatedKernelsPy, StringComparison.Ordinal);
         Assert.Contains("tle.gpu.copy(", generatedKernelsPy, StringComparison.Ordinal);
         Assert.Contains("offsets=[flat_block_id_0, layer_id_value, page_offset_0, kv_head, 0]", generatedKernelsPy, StringComparison.Ordinal);
         Assert.Contains("eviction_policy=\"evict_first\"", generatedKernelsPy, StringComparison.Ordinal);
@@ -4205,6 +4205,126 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
             "x = ((torch.arange(8 * 16, dtype=torch.float32, device='cuda').reshape(8, 16) - 31) * 0.03125).to(torch.bfloat16)",
             "output = module(x)",
             "torch.testing.assert_close(output, x * 4, rtol=0, atol=0)");
+    }
+
+    [Fact]
+    public void TestPyNTTGatherReduceNormApplyRun()
+    {
+        var targetOptions = Assert.IsType<PyNTTTargetOptions>(CompileOptions.TargetOptions);
+        targetOptions.HierarchyNames = "b";
+        targetOptions.HierarchyLevels = "b";
+        targetOptions.Hierarchies = new[] { new[] { 4 } };
+
+        var placement = new Placement(new[] { 4 }, "b", "b");
+        var activationType = new TensorType(DataTypes.Float32, new[] { 1, 64 });
+        var activationDistributedType = new DistributedType(
+            activationType,
+            new SBP[] { SBP.B, SBP.SContiguous([0], 16) },
+            placement);
+        var parameterType = new TensorType(DataTypes.Float32, new[] { 64 });
+        var parameterDistributedType = new DistributedType(
+            parameterType,
+            new SBP[] { SBP.SContiguous([0], 16) },
+            placement);
+        var statsTensorType = new TensorType(DataTypes.Float32, new[] { 1, 1, 1 });
+        var partialStatsType = new DistributedType(
+            statsTensorType,
+            new SBP[] { SBP.B, SBP.B, SBP.B },
+            placement,
+            SBP.P([0], ReduceOp.Sum));
+        var broadcastStatsType = new DistributedType(
+            statsTensorType,
+            new SBP[] { SBP.B, SBP.B, SBP.B },
+            placement);
+
+        var input = new Var("input", activationType);
+        var scale = new Var("scale", parameterType);
+        var bias = new Var("bias", parameterType);
+        var output = CreateOutputVar("output", activationType);
+        var inputBuffer = CreateBuffer(
+            "input_buffer",
+            DataTypes.Float32,
+            TIR.MemoryLocation.Data,
+            0,
+            [1, 16],
+            [16, 1],
+            activationDistributedType);
+        var scaleBuffer = CreateBuffer(
+            "scale_buffer",
+            DataTypes.Float32,
+            TIR.MemoryLocation.Data,
+            64,
+            [16],
+            [1],
+            parameterDistributedType);
+        var biasBuffer = CreateBuffer(
+            "bias_buffer",
+            DataTypes.Float32,
+            TIR.MemoryLocation.Data,
+            128,
+            [16],
+            [1],
+            parameterDistributedType);
+        var outputBuffer = CreateBuffer(
+            "output_buffer",
+            DataTypes.Float32,
+            TIR.MemoryLocation.Data,
+            192,
+            [1, 16],
+            [16, 1],
+            activationDistributedType);
+        var partialStats = CreateCompactPerOwnerBuffer(
+            "partial_stats",
+            DataTypes.Float32,
+            0,
+            [1, 1, 1],
+            [0, 0, 0],
+            partialStatsType);
+        var main = new TIR.PrimFunction(
+            "main_prim",
+            PyNTTTarget.Kind,
+            new TIR.Sequential(
+                TIR.F.NTT.TensorLoad(inputBuffer, input, activationDistributedType.AxisPolicies, placement),
+                TIR.F.NTT.TensorLoad(scaleBuffer, scale, parameterDistributedType.AxisPolicies, placement),
+                TIR.F.NTT.TensorLoad(biasBuffer, bias, parameterDistributedType.AxisPolicies, placement),
+                TIR.F.NTT.NormStats(inputBuffer, partialStats, 1, useMean: false),
+                TIR.F.NTT.Barrier(TIR.NTT.BarrierScope.Chip),
+                TIR.F.NTT.GatherReduceNormApply(
+                    partialStats,
+                    inputBuffer,
+                    scaleBuffer,
+                    biasBuffer,
+                    outputBuffer,
+                    partialStatsType,
+                    broadcastStatsType,
+                    1,
+                    1e-5f,
+                    useMean: false),
+                TIR.F.NTT.TensorStore(outputBuffer, output, activationDistributedType.AxisPolicies, placement)),
+            new TIR.Return(new Expr[] { output }),
+            new IVar[] { input, scale, bias, output })
+        {
+            SchedResult =
+            {
+                DataUsage = 256,
+                ChipLocalDataPoolSize = 16,
+            },
+        };
+
+        var outputDirectory = GeneratePyNTTModelDirectory("generated_gather_reduce_norm_apply_model", main);
+        RenderGeneratedKernels(outputDirectory);
+        var generatedKernelsPy = File.ReadAllText(Path.Join(outputDirectory, "generated_kernels.py"));
+        Assert.Contains("generated from PyNTT Jinja GatherReduceNormApply.py.jinja", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("partial_reduction_width: tl.constexpr = min(32, 4)", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.DoesNotContain("reshard_tile_scatter", generatedKernelsPy, StringComparison.Ordinal);
+        AssertGeneratedModelRuns(
+            outputDirectory,
+            "input = (torch.arange(64, dtype=torch.float32, device='cuda').reshape(1, 64) - 17) * 0.03125",
+            "scale = 1.0 + torch.arange(64, dtype=torch.float32, device='cuda') * 0.001",
+            "bias = torch.arange(64, dtype=torch.float32, device='cuda') * -0.0005",
+            "expect = input * torch.rsqrt(torch.mean(input * input, dim=1, keepdim=True) + 1e-5) * scale + bias",
+            "output = module(input, scale, bias)",
+            "torch.testing.assert_close(output, expect, rtol=1e-5, atol=1e-5)");
     }
 
     [Fact]

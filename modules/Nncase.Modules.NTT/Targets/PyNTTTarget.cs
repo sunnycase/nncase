@@ -76,6 +76,7 @@ public sealed class PyNTTTarget : NTTTarget
     /// <inheritdoc/>
     public override void RegisterTIRPreBufferizePass(IPassManager passManager, CompileOptions options)
     {
+        passManager.Add<FuseGatherReduceNormApplyPass>(Kind);
         passManager.Add<CanonicalizePackedQKVWeightsPass>(Kind);
         base.RegisterTIRPreBufferizePass(passManager, options);
     }
