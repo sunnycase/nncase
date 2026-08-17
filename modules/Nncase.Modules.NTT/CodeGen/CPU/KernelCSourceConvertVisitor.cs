@@ -506,6 +506,17 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
                     }
 
                     break;
+                case TIR.NTT.PackedMatMulNormStats matmulNormStats:
+                    {
+                        WriteWithProfiler(
+                            RazorTemplateEngine.RenderAsync("~/CodeGen/CPU/Templates/Kernels/PackedMatMulNormStats.cshtml", new TypedKernelTemplateModel<TIR.NTT.PackedMatMulNormStats>(matmulNormStats)
+                            {
+                                Arguments = args.Select(x => new KernelArgument { Symbol = VisitBuffer(x, local: true) }).ToArray(),
+                            }).Result,
+                            "packed_matmul_norm_stats");
+                    }
+
+                    break;
                 case TIR.NTT.QKVParallelLinear qkvParallelLinear:
                     {
                         ValidateQKVParallelLinearScales(args);

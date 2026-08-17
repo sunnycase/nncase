@@ -14,6 +14,37 @@ class TritonKernelResourceError(RuntimeError):
     """A compiled specialization violates the target resource contract."""
 
 
+def _validate_execution_model_launch_options(
+    launch_options: Mapping[str, object],
+    *,
+    expected_compute_num_warps: int,
+    expected_resident_blocks_per_compute_unit: int,
+) -> None:
+    requested_num_warps = launch_options.get("num_warps")
+    if (
+        requested_num_warps is not None
+        and int(requested_num_warps) != expected_compute_num_warps
+    ):
+        raise TritonKernelResourceError(
+            f"Triton launch requests {int(requested_num_warps)} compute warps; "
+            f"the target execution model requires {expected_compute_num_warps}."
+        )
+
+    requested_min_ctas = launch_options.get("min_ctas_per_sm")
+    if requested_min_ctas is None:
+        raise TritonKernelResourceError(
+            "Triton launch does not specify min_ctas_per_sm; the target execution "
+            "model requires an explicit resident-block contract."
+        )
+    if int(requested_min_ctas) != expected_resident_blocks_per_compute_unit:
+        raise TritonKernelResourceError(
+            f"Triton launch requests min_ctas_per_sm={int(requested_min_ctas)}; "
+            "the target execution model requires "
+            f"{expected_resident_blocks_per_compute_unit} resident blocks per "
+            "compute unit."
+        )
+
+
 class PreparedTritonKernel:
     """One resource-validated Triton specialization ready for direct launch."""
 
@@ -524,21 +555,20 @@ def validate_triton_kernel_resources(
     *args,
     grid,
     expected_compute_num_warps: int,
+    expected_resident_blocks_per_compute_unit: int,
     registers_per_thread_limit: int,
     shared_memory_capacity_bytes: int,
     forbid_spills: bool,
     **kwargs,
 ) -> None:
     """Compile and validate one specialization before its first launch."""
-    requested_num_warps = kwargs.get("num_warps")
-    if (
-        requested_num_warps is not None
-        and int(requested_num_warps) != expected_compute_num_warps
-    ):
-        raise TritonKernelResourceError(
-            f"Triton launch requests {int(requested_num_warps)} compute warps; "
-            f"the target execution model requires {expected_compute_num_warps}."
-        )
+    _validate_execution_model_launch_options(
+        kwargs,
+        expected_compute_num_warps=expected_compute_num_warps,
+        expected_resident_blocks_per_compute_unit=(
+            expected_resident_blocks_per_compute_unit
+        ),
+    )
 
     # Compile the exact specialization that the subsequent launch will use.
     # KernelInterface.warmup() replaces tensors with MockTensor values and can
@@ -547,6 +577,7 @@ def validate_triton_kernel_resources(
     key = (
         compiled.hash,
         expected_compute_num_warps,
+        expected_resident_blocks_per_compute_unit,
         registers_per_thread_limit,
         shared_memory_capacity_bytes,
         forbid_spills,
@@ -558,6 +589,9 @@ def validate_triton_kernel_resources(
     _validate_compiled_triton_kernel_resources(
         compiled,
         expected_compute_num_warps=expected_compute_num_warps,
+        expected_resident_blocks_per_compute_unit=(
+            expected_resident_blocks_per_compute_unit
+        ),
         registers_per_thread_limit=registers_per_thread_limit,
         shared_memory_capacity_bytes=shared_memory_capacity_bytes,
         forbid_spills=forbid_spills,
@@ -568,6 +602,7 @@ def _validate_compiled_triton_kernel_resources(
     compiled,
     *,
     expected_compute_num_warps: int,
+    expected_resident_blocks_per_compute_unit: int,
     registers_per_thread_limit: int,
     shared_memory_capacity_bytes: int,
     forbid_spills: bool,
@@ -575,6 +610,7 @@ def _validate_compiled_triton_kernel_resources(
     key = (
         compiled.hash,
         expected_compute_num_warps,
+        expected_resident_blocks_per_compute_unit,
         registers_per_thread_limit,
         shared_memory_capacity_bytes,
         forbid_spills,
@@ -633,6 +669,7 @@ def prepare_and_validate_triton_kernel(
     dynamic_argument_indices: tuple[int, ...] | None = None,
     grid_for_candidate,
     expected_compute_num_warps: int,
+    expected_resident_blocks_per_compute_unit: int,
     registers_per_thread_limit: int,
     shared_memory_capacity_bytes: int,
     forbid_spills: bool,
@@ -642,15 +679,13 @@ def prepare_and_validate_triton_kernel(
     from pyntt.runtime.tuning import tuning_parameter_candidates
     from triton.runtime.errors import OutOfResources
 
-    requested_num_warps = launch_options.get("num_warps")
-    if (
-        requested_num_warps is not None
-        and int(requested_num_warps) != expected_compute_num_warps
-    ):
-        raise TritonKernelResourceError(
-            f"Triton launch requests {int(requested_num_warps)} compute warps; "
-            f"the target execution model requires {expected_compute_num_warps}."
-        )
+    _validate_execution_model_launch_options(
+        launch_options,
+        expected_compute_num_warps=expected_compute_num_warps,
+        expected_resident_blocks_per_compute_unit=(
+            expected_resident_blocks_per_compute_unit
+        ),
+    )
 
     prepare = getattr(kernel, "prepare", None)
     if not callable(prepare):
@@ -689,6 +724,9 @@ def prepare_and_validate_triton_kernel(
             _validate_compiled_triton_kernel_resources(
                 prepared.compiled_kernel,
                 expected_compute_num_warps=expected_compute_num_warps,
+                expected_resident_blocks_per_compute_unit=(
+                    expected_resident_blocks_per_compute_unit
+                ),
                 registers_per_thread_limit=registers_per_thread_limit,
                 shared_memory_capacity_bytes=shared_memory_capacity_bytes,
                 forbid_spills=forbid_spills,

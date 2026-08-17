@@ -336,6 +336,25 @@ public sealed class BoxingEvaluator : ITypeInferencer<Boxing>, ICostEvaluator<Bo
 
     private static bool TryGetTargetDistributedCopyCost(ITargetOpCostModel targetCostModel, DistributedType inputDistributed, DistributedType outputDistributed, out Cost cost)
     {
+        if (inputDistributed.Partial is { } partial && outputDistributed.Partial is null)
+        {
+            var reducedOutputLocal = GetMaxDividedTensorType(outputDistributed);
+            var peerInputTensor = new TargetCostTensor(inputDistributed.TensorType.DType, reducedOutputLocal.Shape);
+            var reducedOutputTensor = new TargetCostTensor(reducedOutputLocal.DType, reducedOutputLocal.Shape);
+            var reductionGroupSize = partial.Axes.Aggregate(
+                1.0,
+                (product, axis) => product * inputDistributed.Placement.Hierarchy[axis]);
+            return TryGetSynchronizedTargetElementwiseCost(
+                targetCostModel,
+                new(
+                    "boxing_partial_reduce",
+                    [peerInputTensor],
+                    reducedOutputTensor,
+                    WorkPerElement: System.Math.Max(0.0, reductionGroupSize - 1.0),
+                    InputReadMultiplicity: reductionGroupSize),
+                out cost);
+        }
+
         var inputLocal = GetMaxDividedTensorType(inputDistributed);
         var outputLocal = GetMaxDividedTensorType(outputDistributed);
         var localInputTensor = new TargetCostTensor(inputLocal.DType, inputLocal.Shape);

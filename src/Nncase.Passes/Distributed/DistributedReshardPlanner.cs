@@ -28,10 +28,6 @@ internal static class DistributedReshardPlanner
         var plans = new List<DistributedReshardPlan>();
         var seen = new HashSet<string>();
         AddPlanIfValid(sourceType, new[] { targetType }, canBox, maxHops, plans, seen);
-        if (plans.Count > 0)
-        {
-            return plans;
-        }
 
         if (maxHops == 1
             || sourceType is not DistributedType source
@@ -54,6 +50,8 @@ internal static class DistributedReshardPlanner
                 seen);
         }
 
+        // Direct all-reduce and reduce-scatter followed by a view/copy are
+        // distinct legal programs. Keep both so search can compare them.
         if (plans.Count > 0)
         {
             return plans;

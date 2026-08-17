@@ -716,7 +716,11 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                         ["rdata_pool_bytes"] = GetPoolSizeBytes(_function.SchedResult.Rdatas),
                         ["chip_local_rdata_pool_bytes"] = GetPoolSizeBytes(_function.SchedResult.ChipLocalRdatas),
                         ["block_local_rdata_pool_bytes"] = GetPoolSizeBytes(_function.SchedResult.BlockLocalRdatas),
-                        ["block_local_rdata_stride_bytes"] = PyNTTRDataUtility.GetLocalRDataTableStrideBytes(_function.SchedResult.BlockLocalRdatas, _targetOptions, "b"),
+                        ["block_local_rdata_stride_bytes"] = PyNTTRDataUtility.GetLocalRDataTableStrideBytes(
+                            _function.SchedResult.BlockLocalRdatas,
+                            _function.SchedResult.BlockLocalRDataMaterializations,
+                            _targetOptions,
+                            "b"),
                     },
                     hostTensorDescriptors));
             var renderSpec = new KernelRenderSpec(
@@ -739,6 +743,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             _attrs["target_machine"] = machine.Id;
             _attrs["target_worker_width"] = machine.Execution.WorkerWidth;
             _attrs["target_threads_per_block"] = machine.Execution.ThreadsPerBlock;
+            _attrs["target_resident_blocks_per_compute_unit"] = machine.Execution.ResidentBlocksPerComputeUnit;
             _attrs["shared_memory_capacity_bytes"] = sharedResource.CapacityBytes;
             _attrs["forbid_spills"] = true;
 
@@ -1525,12 +1530,22 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 case Nncase.TIR.NTT.PackedMatMul packedMatmul:
                     VisitPackedMatmul(packedMatmul, args, RequireMicroKernel(microKernel, packedMatmul));
                     break;
+                case Nncase.TIR.NTT.PackedMatMulNormStats packedMatmulNormStats:
+                    VisitPackedMatmulNormStats(
+                        packedMatmulNormStats,
+                        args,
+                        RequireMicroKernel(microKernel, packedMatmulNormStats));
+                    break;
                 case Nncase.TIR.NTT.QKVParallelLinear qkvParallelLinear:
                     VisitQKVParallelLinear(qkvParallelLinear, args, RequireMicroKernel(microKernel, qkvParallelLinear));
                     break;
-                case Nncase.TIR.NTT.PackedQKVParallelLinear packedQKVParallelLinear:
+                case Nncase.TIR.NTT.PackedQKVParallelLinearFusedRhs packedQKVParallelLinear:
                     VisitPackedQKVParallelLinear(packedQKVParallelLinear, args, RequireMicroKernel(microKernel, packedQKVParallelLinear));
                     break;
+                case Nncase.TIR.NTT.PackedQKVParallelLinear:
+                    throw new InvalidOperationException(
+                        "Legacy three-weight PackedQKVParallelLinear reached PyNTT codegen. " +
+                        "CanonicalizePackedQKVWeightsPass must run before microkernel selection.");
                 case Nncase.TIR.NTT.MatMulGlu matMulGlu:
                     VisitMatMulGlu(matMulGlu, args, RequireMicroKernel(microKernel, matMulGlu));
                     break;
@@ -3702,6 +3717,15 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
 
             var reductionGroupSize = partialAxes.Aggregate(1L, (size, axis) => checked(size * hierarchy[axis]));
             if (reductionGroupSize > 1 &&
+                (input.DistributedStorageKind != DistributedBufferStorageKind.CompactPerOwner ||
+                    !IsCompactPerOwnerBacking(input.MemSpan.Buffer)))
+            {
+                throw new NotSupportedException(
+                    $"PyNTT GatherReduceScatter partial input {input.Name} must use compact per-owner " +
+                    $"chip-visible storage, got {input.DistributedStorageKind}/{input.MemSpan.Buffer.Location}.");
+            }
+
+            if (reductionGroupSize > 1 &&
                 partialInputRef is { } reductionInputRef &&
                 IsZeroOffset(reductionInputRef.PoolStrideBytes))
             {
@@ -4735,7 +4759,10 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
         private void VisitPackedMatmul(
             Nncase.TIR.NTT.PackedMatMul matmul,
             IReadOnlyList<BaseExpr> args,
-            PyNTTMicroKernelTemplateModel microKernel)
+            PyNTTMicroKernelTemplateModel microKernel,
+            TIR.Buffer? stats = null,
+            int normAxis = -1,
+            bool useMean = false)
         {
             if (matmul.FusedReduce)
             {
@@ -4759,13 +4786,42 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     "PyNTT PackedMatMul addend must be a TIR buffer or None."),
             };
 
-            SetComputeOp("matmul");
+            SetComputeOp(stats is null ? "matmul" : "matmul_norm_stats");
             var lhsShape = GetBufferActiveShape(lhs);
             var rhsShape = GetBufferActiveShape(rhs);
             var outputShape = GetBufferActiveShape(output);
             ValidateMinimumRank("PyNTT PackedMatMul lhs", lhsShape, 2);
             ValidateMinimumRank("PyNTT PackedMatMul rhs", rhsShape, 2);
             ValidateMinimumRank("PyNTT PackedMatMul output", outputShape, 2);
+            PyNTTDimExpression[] statsShape = Array.Empty<PyNTTDimExpression>();
+            var normalizedNormAxis = -1;
+            if (stats is not null)
+            {
+                if (!Equals(stats.ElemType, DataTypes.Float32))
+                {
+                    throw new NotSupportedException(
+                        $"PyNTT PackedMatMulNormStats requires scalar float32 statistics, got {stats.ElemType}.");
+                }
+
+                normalizedNormAxis = NormalizeAxis(
+                    normAxis,
+                    outputShape.Length,
+                    "PyNTT PackedMatMulNormStats");
+                if (normalizedNormAxis != outputShape.Length - 1)
+                {
+                    throw new NotSupportedException(
+                        "PyNTT PackedMatMulNormStats currently requires normalization over the final logical output axis.");
+                }
+
+                statsShape = GetBufferActiveShape(stats);
+                ValidateNormStatsShape(
+                    "PyNTT PackedMatMulNormStats",
+                    outputShape,
+                    statsShape,
+                    normalizedNormAxis,
+                    useMean);
+            }
+
             PyNTTDimExpression[] addendShape = Array.Empty<PyNTTDimExpression>();
             if (addend is not null)
             {
@@ -4852,7 +4908,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             ValidateBroadcastable("PyNTT PackedMatMul rhs batch", rhsShape[..^2], outputShape[..^2]);
             _ = Nncase.IR.NTT.VectorizedMatMul.GetDimInfo(false, transposeB, lhsShape.Length, rhsShape.Length);
             var scale = GetScalarFloat(args[4], "PyNTT PackedMatMul scale", 1.0f);
-            _attrs["op"] = "packed_matmul";
+            _attrs["op"] = stats is null ? "packed_matmul" : "packed_matmul_norm_stats";
             _attrs["dtype"] = GetPyNTTScalarDTypeName(output.ElemType);
             _attrs["shape"] = outputShape;
             _attrs["rhs_layout"] = rhsLayout;
@@ -4869,7 +4925,10 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 _attrs["gemv"] = true;
             }
 
-            var helperName = GetNextHelperName(useGemv ? "gemv_compute" : "matmul_compute");
+            var helperName = GetNextHelperName(
+                stats is null
+                    ? (useGemv ? "gemv_compute" : "matmul_compute")
+                    : (useGemv ? "gemv_norm_stats_compute" : "matmul_norm_stats_compute"));
             var usesHostRhsDescriptor =
                 microKernel.Family == "triton.matmul" &&
                 microKernel.Variant == "simt_fma_smem_pipeline";
@@ -4916,12 +4975,41 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 AddendStrides = addend is null
                     ? Array.Empty<PyNTTDimExpression>()
                     : GetBufferStrides(addend),
+                Stats = stats is null ? null : GetBufferScalarPointer(stats),
+                StatsDType = stats is null ? "float32" : GetPyNTTScalarDTypeName(stats.ElemType),
+                StatsTritonDType = stats is null ? "tl.float32" : GetScalarTritonDType(stats.ElemType),
+                StatsShape = statsShape,
+                StatsStrides = stats is null
+                    ? Array.Empty<PyNTTDimExpression>()
+                    : GetBufferStrides(stats),
+                NormAxis = normalizedNormAxis,
+                UseMean = useMean,
             };
 
             WriteSelectedMicroKernelHelper(
                 microKernel,
                 templateModel,
                 helperName);
+        }
+
+        private void VisitPackedMatmulNormStats(
+            Nncase.TIR.NTT.PackedMatMulNormStats matmul,
+            IReadOnlyList<BaseExpr> args,
+            PyNTTMicroKernelTemplateModel microKernel)
+        {
+            if (args.Count < 7 || args[3] is not TIR.Buffer stats)
+            {
+                throw new NotSupportedException(
+                    "PyNTT PackedMatMulNormStats codegen expects lhs, rhs, value output, statistics output, loadC, scale, and addend operands.");
+            }
+
+            VisitPackedMatmul(
+                new Nncase.TIR.NTT.PackedMatMul(false, matmul.RhsLayout),
+                new[] { args[0], args[1], args[2], args[4], args[5], args[6] },
+                microKernel,
+                stats,
+                matmul.Axis,
+                matmul.UseMean);
         }
 
         private void VisitQKVParallelLinear(
@@ -5086,42 +5174,39 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
         }
 
         private void VisitPackedQKVParallelLinear(
-            Nncase.TIR.NTT.PackedQKVParallelLinear qkv,
+            Nncase.TIR.NTT.PackedQKVParallelLinearFusedRhs qkv,
             IReadOnlyList<BaseExpr> args,
             PyNTTMicroKernelTemplateModel microKernel)
         {
-            if (args.Count < 16 ||
+            if (args.Count < 14 ||
                 args[0] is not TIR.Buffer input ||
-                args[1] is not TIR.Buffer qWeight ||
-                args[2] is not TIR.Buffer kWeight ||
-                args[3] is not TIR.Buffer vWeight ||
-                args[13] is not TIR.Buffer qOutput ||
-                args[14] is not TIR.Buffer kOutput ||
-                args[15] is not TIR.Buffer vOutput)
+                args[1] is not TIR.Buffer weight ||
+                args[11] is not TIR.Buffer qOutput ||
+                args[12] is not TIR.Buffer kOutput ||
+                args[13] is not TIR.Buffer vOutput)
             {
-                throw new NotSupportedException("PyNTT PackedQKVParallelLinear codegen expects input, packed q/k/v weights, optional packed q/k/v bias and scale values, and packed q/k/v output TIR buffers.");
+                throw new NotSupportedException(
+                    "PyNTT PackedQKVParallelLinearFusedRhs codegen expects input, one fused packed weight, optional q/k/v bias and scale values, and q/k/v output buffers.");
             }
 
             TIR.Buffer? GetOptionalBuffer(int index, string name) => args[index] switch
             {
                 TIR.Buffer buffer => buffer,
                 None => null,
-                _ => throw new NotSupportedException($"PyNTT PackedQKVParallelLinear expects {name} to be a TIR buffer or None, got {args[index].GetType().Name}."),
+                _ => throw new NotSupportedException($"PyNTT PackedQKVParallelLinearFusedRhs expects {name} to be a TIR buffer or None, got {args[index].GetType().Name}."),
             };
 
-            if (args.Skip(7).Take(6).Any(arg => arg is not None))
+            if (args.Skip(5).Take(6).Any(arg => arg is not None))
             {
-                throw new NotSupportedException("PyNTT PackedQKVParallelLinear codegen currently supports only None input/weight scales.");
+                throw new NotSupportedException("PyNTT PackedQKVParallelLinearFusedRhs currently supports only None input/weight scales.");
             }
 
-            var qBias = GetOptionalBuffer(4, "q bias");
-            var kBias = GetOptionalBuffer(5, "k bias");
-            var vBias = GetOptionalBuffer(6, "v bias");
+            var qBias = GetOptionalBuffer(2, "q bias");
+            var kBias = GetOptionalBuffer(3, "k bias");
+            var vBias = GetOptionalBuffer(4, "v bias");
             SetComputeOp("packed_qkv_parallel_linear");
             var inputShape = GetBufferActiveShape(input);
-            var qWeightShape = GetBufferActiveShape(qWeight);
-            var kWeightShape = GetBufferActiveShape(kWeight);
-            var vWeightShape = GetBufferActiveShape(vWeight);
+            var weightShape = GetBufferActiveShape(weight);
             var qBiasShape = qBias is null ? Array.Empty<PyNTTDimExpression>() : GetBufferActiveShape(qBias);
             var kBiasShape = kBias is null ? Array.Empty<PyNTTDimExpression>() : GetBufferActiveShape(kBias);
             var vBiasShape = vBias is null ? Array.Empty<PyNTTDimExpression>() : GetBufferActiveShape(vBias);
@@ -5129,9 +5214,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             var kOutputShape = GetBufferActiveShape(kOutput);
             var vOutputShape = GetBufferActiveShape(vOutput);
             ValidateMinimumRank("PyNTT PackedQKVParallelLinear input", inputShape, 2);
-            ValidateMinimumRank("PyNTT PackedQKVParallelLinear q weight", qWeightShape, 2);
-            ValidateMinimumRank("PyNTT PackedQKVParallelLinear k weight", kWeightShape, 2);
-            ValidateMinimumRank("PyNTT PackedQKVParallelLinear v weight", vWeightShape, 2);
+            ValidateRank("PyNTT PackedQKVParallelLinear fused weight", weightShape, 2);
             ValidateMinimumRank("PyNTT PackedQKVParallelLinear q output", qOutputShape, 2);
             ValidateMinimumRank("PyNTT PackedQKVParallelLinear k output", kOutputShape, 2);
             ValidateMinimumRank("PyNTT PackedQKVParallelLinear v output", vOutputShape, 2);
@@ -5142,18 +5225,26 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 throw new NotSupportedException($"PyNTT PackedQKVParallelLinear expects scalar input operands, got lanes [{string.Join(",", inputVectorLanes)}].");
             }
 
-            var qWeightLanes = GetVectorLanes(qWeight.ElemType);
-            var kWeightLanes = GetVectorLanes(kWeight.ElemType);
-            var vWeightLanes = GetVectorLanes(vWeight.ElemType);
+            var weightLanes = GetVectorLanes(weight.ElemType);
             var qOutputLanes = GetVectorLanes(qOutput.ElemType);
             var kOutputLanes = GetVectorLanes(kOutput.ElemType);
             var vOutputLanes = GetVectorLanes(vOutput.ElemType);
-            ValidatePackedQKVLanes("q", qkv.RhsLayout, qWeightLanes, qOutputLanes);
-            ValidatePackedQKVLanes("k", qkv.RhsLayout, kWeightLanes, kOutputLanes);
-            ValidatePackedQKVLanes("v", qkv.RhsLayout, vWeightLanes, vOutputLanes);
-            if (!qWeightLanes.SequenceEqual(kWeightLanes) || !qWeightLanes.SequenceEqual(vWeightLanes))
+            if (qkv.RhsLayout != Nncase.IR.NTT.PackedMatMulRhsLayout.KMajor || weightLanes.Length != 3)
             {
-                throw new NotSupportedException($"PyNTT PackedQKVParallelLinear expects q/k/v packed lanes to match, got q=[{string.Join(",", qWeightLanes)}], k=[{string.Join(",", kWeightLanes)}], v=[{string.Join(",", vWeightLanes)}].");
+                throw new NotSupportedException(
+                    $"PyNTT fused packed QKV requires K-major <N,KPack,K> weight lanes, got layout={qkv.RhsLayout}, lanes=[{string.Join(",", weightLanes)}].");
+            }
+
+            var nVectorLaneCount = weightLanes[0];
+            var kPackedLaneCount = weightLanes[1];
+            var kVectorLaneCount = weightLanes[2];
+            foreach (var (name, outputLanes) in new[] { ("q", qOutputLanes), ("k", kOutputLanes), ("v", vOutputLanes) })
+            {
+                if (!outputLanes.SequenceEqual(new[] { nVectorLaneCount }))
+                {
+                    throw new NotSupportedException(
+                        $"PyNTT fused packed QKV expects {name} output lanes [{nVectorLaneCount}], got [{string.Join(",", outputLanes)}].");
+                }
             }
 
             foreach (var (name, bias, outputLanes) in new[]
@@ -5169,24 +5260,16 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 }
             }
 
-            ValidatePackedProjectionShape("q", qkv.RhsLayout, qWeightLanes, inputShape, qWeightShape, qOutputShape);
-            ValidatePackedProjectionShape("k", qkv.RhsLayout, kWeightLanes, inputShape, kWeightShape, kOutputShape);
-            ValidatePackedProjectionShape("v", qkv.RhsLayout, vWeightLanes, inputShape, vWeightShape, vOutputShape);
             ValidatePackedBiasShape("q", qBiasShape, qOutputShape);
             ValidatePackedBiasShape("k", kBiasShape, kOutputShape);
             ValidatePackedBiasShape("v", vBiasShape, vOutputShape);
             ValidateBroadcastable("PyNTT PackedQKVParallelLinear input/q output batch", inputShape[..^2], qOutputShape[..^2]);
             ValidateBroadcastable("PyNTT PackedQKVParallelLinear input/k output batch", inputShape[..^2], kOutputShape[..^2]);
             ValidateBroadcastable("PyNTT PackedQKVParallelLinear input/v output batch", inputShape[..^2], vOutputShape[..^2]);
-            ValidateBroadcastable("PyNTT PackedQKVParallelLinear q weight/q output batch", qWeightShape[..^2], qOutputShape[..^2]);
-            ValidateBroadcastable("PyNTT PackedQKVParallelLinear k weight/k output batch", kWeightShape[..^2], kOutputShape[..^2]);
-            ValidateBroadcastable("PyNTT PackedQKVParallelLinear v weight/v output batch", vWeightShape[..^2], vOutputShape[..^2]);
 
-            if (input.ElemType != GetScalarDataType(qWeight.ElemType) ||
-                GetScalarDataType(qWeight.ElemType) != GetScalarDataType(kWeight.ElemType) ||
-                GetScalarDataType(kWeight.ElemType) != GetScalarDataType(vWeight.ElemType))
+            if (input.ElemType != GetScalarDataType(weight.ElemType))
             {
-                throw new NotSupportedException($"PyNTT PackedQKVParallelLinear expects input and packed q/k/v weights to have the same scalar dtype, got input={input.ElemType}, q={qWeight.ElemType}, k={kWeight.ElemType}, v={vWeight.ElemType}.");
+                throw new NotSupportedException($"PyNTT fused packed QKV input/weight dtypes differ: {input.ElemType}/{weight.ElemType}.");
             }
 
             if (GetScalarDataType(qOutput.ElemType) != GetScalarDataType(kOutput.ElemType) ||
@@ -5196,40 +5279,45 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             }
 
             var biasDType = qBias?.ElemType ?? kBias?.ElemType ?? vBias?.ElemType ?? qOutput.ElemType;
-            var rhsLayout = qkv.RhsLayout switch
+            if (qkv.ProjectionNCapacities.Count != 3 || qkv.ProjectionNCapacities.Any(capacity => capacity <= 0 || capacity % nVectorLaneCount != 0))
             {
-                Nncase.IR.NTT.PackedMatMulRhsLayout.NMajor => "n_major",
-                Nncase.IR.NTT.PackedMatMulRhsLayout.KMajor => "k_major",
-                _ => throw new NotSupportedException($"PyNTT PackedQKVParallelLinear does not support RHS layout {qkv.RhsLayout}."),
-            };
-            var nPackedLaneCount = qkv.RhsLayout == Nncase.IR.NTT.PackedMatMulRhsLayout.NMajor
-                ? qWeightLanes[0]
-                : 1;
-            var nVectorLaneCount = qkv.RhsLayout == Nncase.IR.NTT.PackedMatMulRhsLayout.NMajor
-                ? qWeightLanes[1]
-                : qWeightLanes[0];
-            var kPackedLaneCount = qkv.RhsLayout == Nncase.IR.NTT.PackedMatMulRhsLayout.KMajor
-                ? qWeightLanes[1]
-                : 1;
-            var kVectorLaneCount = qkv.RhsLayout == Nncase.IR.NTT.PackedMatMulRhsLayout.KMajor
-                ? qWeightLanes[2]
-                : 1;
+                throw new NotSupportedException(
+                    $"PyNTT fused packed QKV requires three positive N capacities aligned to {nVectorLaneCount} lanes.");
+            }
+
+            var projectionNCapacities = qkv.ProjectionNCapacities.ToArray();
+            var totalPhysicalN = checked(projectionNCapacities.Sum() / nVectorLaneCount);
+            if (weightShape[1].MinValue != totalPhysicalN || weightShape[1].MaxValue != totalPhysicalN)
+            {
+                throw new NotSupportedException(
+                    $"PyNTT fused packed QKV weight N extent {weightShape[1]} does not match projection capacity {totalPhysicalN}.");
+            }
+
+            var kAtom = checked(kPackedLaneCount * kVectorLaneCount);
+            if (inputShape[^1].MinValue != inputShape[^1].MaxValue ||
+                weightShape[0].MinValue != weightShape[0].MaxValue ||
+                weightShape[0].MinValue != checked((inputShape[^1].MaxValue + kAtom - 1) / kAtom))
+            {
+                throw new NotSupportedException(
+                    $"PyNTT fused packed QKV weight K extent {weightShape[0]} does not match input K {inputShape[^1]} packed by {kAtom}.");
+            }
+
             _attrs["op"] = "packed_qkv_parallel_linear";
             _attrs["dtype"] = GetPyNTTScalarDTypeName(qOutput.ElemType);
             _attrs["has_bias"] = qBias is not null || kBias is not null || vBias is not null;
             _attrs["q_shape"] = qOutputShape;
             _attrs["k_shape"] = kOutputShape;
             _attrs["v_shape"] = vOutputShape;
-            _attrs["n_pack_lane"] = nPackedLaneCount;
+            _attrs["n_pack_lane"] = 1;
             _attrs["n_lane"] = nVectorLaneCount;
-            _attrs["n_scalar_lane"] = checked(nPackedLaneCount * nVectorLaneCount);
-            _attrs["rhs_layout"] = rhsLayout;
+            _attrs["n_scalar_lane"] = nVectorLaneCount;
+            _attrs["rhs_layout"] = "k_major";
             _attrs["k_pack_lane"] = kPackedLaneCount;
             _attrs["k_lane"] = kVectorLaneCount;
             _attrs["num_heads"] = qkv.NumHeads;
             _attrs["num_kv_heads"] = qkv.NumKvHeads;
             var qLogicalOutputShape = qOutputShape.ToArray();
-            qLogicalOutputShape[^1] = MultiplyDim(qLogicalOutputShape[^1], checked(nPackedLaneCount * nVectorLaneCount));
+            qLogicalOutputShape[^1] = MultiplyDim(qLogicalOutputShape[^1], nVectorLaneCount);
             var useGemv = IsGemvMatmul(qLogicalOutputShape);
             if (useGemv)
             {
@@ -5240,21 +5328,13 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             var usesHostWeightDescriptors =
                 microKernel.Family == "triton.qkv_parallel_linear" &&
                 microKernel.Variant == "simt_fma_smem_pipeline";
-            var qWeightDescriptor = usesHostWeightDescriptors
-                ? RegisterHostTensorDescriptor(qWeight, $"{helperName}__q_weight_descriptor")
+            var weightDescriptor = usesHostWeightDescriptors
+                ? RegisterHostTensorDescriptor(weight, $"{helperName}__weight_descriptor")
                 : null;
-            var kWeightDescriptor = usesHostWeightDescriptors
-                ? RegisterHostTensorDescriptor(kWeight, $"{helperName}__k_weight_descriptor")
-                : null;
-            var vWeightDescriptor = usesHostWeightDescriptors
-                ? RegisterHostTensorDescriptor(vWeight, $"{helperName}__v_weight_descriptor")
-                : null;
-            var templateModel = new PyNTTQKVParallelLinearTemplateModel(
+            var templateModel = new PyNTTPackedQKVParallelLinearTemplateModel(
                 helperName,
                 GetBufferScalarPointer(input),
-                GetBufferScalarPointer(qWeight),
-                GetBufferScalarPointer(kWeight),
-                GetBufferScalarPointer(vWeight),
+                GetBufferScalarPointer(weight),
                 qBias is null ? new PyNTTBufferPointerTemplateModel("None") : GetBufferScalarPointer(qBias),
                 kBias is null ? new PyNTTBufferPointerTemplateModel("None") : GetBufferScalarPointer(kBias),
                 vBias is null ? new PyNTTBufferPointerTemplateModel("None") : GetBufferScalarPointer(vBias),
@@ -5265,17 +5345,15 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 kBias is not null,
                 vBias is not null,
                 GetPyNTTScalarDTypeName(input.ElemType),
-                GetPyNTTScalarDTypeName(qWeight.ElemType),
+                GetPyNTTScalarDTypeName(weight.ElemType),
                 GetPyNTTScalarDTypeName(biasDType),
                 GetPyNTTScalarDTypeName(qOutput.ElemType),
                 GetScalarTritonDType(input.ElemType),
-                GetScalarTritonDType(qWeight.ElemType),
+                GetScalarTritonDType(weight.ElemType),
                 GetScalarTritonDType(biasDType),
                 GetScalarTritonDType(qOutput.ElemType),
                 inputShape,
-                qWeightShape,
-                kWeightShape,
-                vWeightShape,
+                weightShape,
                 qBiasShape,
                 kBiasShape,
                 vBiasShape,
@@ -5283,34 +5361,26 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 kOutputShape,
                 vOutputShape,
                 GetBufferStrides(input),
-                GetBufferStrides(qWeight),
-                GetBufferStrides(kWeight),
-                GetBufferStrides(vWeight),
+                GetBufferStrides(weight),
                 qBias is null ? Array.Empty<PyNTTDimExpression>() : GetBufferStrides(qBias),
                 kBias is null ? Array.Empty<PyNTTDimExpression>() : GetBufferStrides(kBias),
                 vBias is null ? Array.Empty<PyNTTDimExpression>() : GetBufferStrides(vBias),
                 GetBufferStrides(qOutput),
                 GetBufferStrides(kOutput),
                 GetBufferStrides(vOutput),
+                projectionNCapacities,
                 GetHierarchy(qOutput),
                 microKernel,
-                $"{input.Name}, packed({qWeight.Name}, {kWeight.Name}, {vWeight.Name}) -> packed({qOutput.Name}, {kOutput.Name}, {vOutput.Name})")
+                $"{input.Name}, fused packed {weight.Name} -> packed({qOutput.Name}, {kOutput.Name}, {vOutput.Name})")
             {
-                PackedN = true,
-                NPackedLaneCount = nPackedLaneCount,
+                NPackedLaneCount = 1,
                 NVectorLaneCount = nVectorLaneCount,
-                RhsLayout = rhsLayout,
+                RhsLayout = "k_major",
                 KPackLaneCount = kPackedLaneCount,
                 KVectorLaneCount = kVectorLaneCount,
-                QWeightGlobalOffsets = GetBufferGlobalOffsets(qWeight),
-                KWeightGlobalOffsets = GetBufferGlobalOffsets(kWeight),
-                VWeightGlobalOffsets = GetBufferGlobalOffsets(vWeight),
-                QWeightDescriptorName = qWeightDescriptor?.Name,
-                QWeightDescriptorOriginElements = qWeightDescriptor?.OriginElements ?? "0",
-                KWeightDescriptorName = kWeightDescriptor?.Name,
-                KWeightDescriptorOriginElements = kWeightDescriptor?.OriginElements ?? "0",
-                VWeightDescriptorName = vWeightDescriptor?.Name,
-                VWeightDescriptorOriginElements = vWeightDescriptor?.OriginElements ?? "0",
+                WeightGlobalOffsets = GetBufferGlobalOffsets(weight),
+                WeightDescriptorName = weightDescriptor?.Name,
+                WeightDescriptorOriginElements = weightDescriptor?.OriginElements ?? "0",
             };
 
             WriteSelectedMicroKernelHelper(
@@ -8272,6 +8342,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 name,
                 storageArgument,
                 checked((long)sectionOffset * scalarElementSizeBytes),
+                0,
                 cache.DType,
                 shape,
                 strides,
@@ -8577,15 +8648,22 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 MemoryLocation.Output => $"output{GetOutputIndex(buffer).ToString(CultureInfo.InvariantCulture)}",
                 MemoryLocation.Data when buffer.DistributedType is null ||
                     buffer.DistributedStorageKind == DistributedBufferStorageKind.CanonicalGlobal => GetDataBaseName(buffer),
-                MemoryLocation.ChipLocalData => GetChipLocalDataBaseName(buffer),
+                MemoryLocation.ChipLocalData when
+                    buffer.DistributedStorageKind == DistributedBufferStorageKind.CanonicalGlobal =>
+                    GetChipLocalDataBaseName(buffer),
+                MemoryLocation.ChipLocalData =>
+                    throw new NotSupportedException(
+                        $"PyNTT host tensor descriptor {name} cannot bind {buffer.DistributedStorageKind} " +
+                        $"chip-local buffer {buffer.Name}; it is not one canonical tensor allocation."),
                 MemoryLocation.Rdata when buffer.DistributedType is null ||
                     buffer.DistributedStorageKind == DistributedBufferStorageKind.CanonicalGlobal => "rdata",
                 MemoryLocation.ChipLocalRdata => "chip_local_rdata",
+                MemoryLocation.BlockLocalRdata => "block_local_rdata",
                 MemoryLocation.Data or MemoryLocation.Rdata =>
                     throw new NotSupportedException(
                         $"PyNTT host tensor descriptor {name} cannot bind distributed {buffer.MemSpan.Buffer.Location} buffer {buffer.Name}: " +
                         "that location uses per-shard backing storage rather than one globally strided allocation."),
-                MemoryLocation.BlockLocalData or MemoryLocation.BlockLocalRdata =>
+                MemoryLocation.BlockLocalData =>
                     throw new NotSupportedException(
                         $"PyNTT host tensor descriptor {name} cannot bind block-local buffer {buffer.Name}."),
                 var location => throw new NotSupportedException(
@@ -8633,10 +8711,18 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             }
 
             name = SanitizeBoundedPythonIdentifier(name);
+            var ownerStrideBytes = buffer.MemSpan.Buffer.Location == MemoryLocation.BlockLocalRdata
+                ? PyNTTRDataUtility.GetLocalRDataTableStrideBytes(
+                    _currentFunction.SchedResult.BlockLocalRdatas,
+                    _currentFunction.SchedResult.BlockLocalRDataMaterializations,
+                    _targetOptions,
+                    "b")
+                : 0;
             return new(
                 name,
                 source,
                 offsetBytes,
+                ownerStrideBytes,
                 GetPyNTTScalarDTypeName(buffer.ElemType),
                 globalShape,
                 logicalStrides,
@@ -8770,11 +8856,28 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     buffer.DistributedStorageKind == DistributedBufferStorageKind.CanonicalGlobal =>
                     new(GetDataBaseName(buffer), offsetBytes, "0", null, true),
                 MemoryLocation.Data => new(GetDataBaseName(buffer), offsetBytes, "data_pool_stride_bytes", "shard_index", true),
+                MemoryLocation.ChipLocalData when
+                    buffer.DistributedStorageKind == DistributedBufferStorageKind.CompactPerOwner =>
+                    new(
+                        GetChipLocalDataBaseName(buffer),
+                        offsetBytes,
+                        GetCompactPerOwnerStrideBytes(buffer),
+                        "shard_index",
+                        true),
                 MemoryLocation.ChipLocalData => new(GetChipLocalDataBaseName(buffer), offsetBytes, "0", null, true),
                 MemoryLocation.BlockLocalData => CreateBlockLocalBufferRef(buffer, offsetBytes),
                 MemoryLocation.Rdata => new("rdata", offsetBytes, "0", null, true),
                 MemoryLocation.ChipLocalRdata => new("chip_local_rdata", offsetBytes, "0", null, true),
-                MemoryLocation.BlockLocalRdata => new("block_local_rdata", offsetBytes, PyNTTRDataUtility.GetLocalRDataTableStrideBytes(_currentFunction.SchedResult.BlockLocalRdatas, _targetOptions, "b").ToString(CultureInfo.InvariantCulture), "shard_index", true),
+                MemoryLocation.BlockLocalRdata => new(
+                    "block_local_rdata",
+                    offsetBytes,
+                    PyNTTRDataUtility.GetLocalRDataTableStrideBytes(
+                        _currentFunction.SchedResult.BlockLocalRdatas,
+                        _currentFunction.SchedResult.BlockLocalRDataMaterializations,
+                        _targetOptions,
+                        "b").ToString(CultureInfo.InvariantCulture),
+                    "shard_index",
+                    true),
                 var location => throw new NotSupportedException($"PyNTT does not support buffer memory location {location} for Triton template operands yet."),
             };
         }
@@ -9323,10 +9426,30 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             return FloorDivDim(spanOffset, GetScalarElementSizeBytes(buffer.ElemType)).TritonExpression;
         }
 
+        private string GetCompactPerOwnerStrideBytes(TIR.Buffer buffer)
+        {
+            if (buffer.DistributedStorageKind != DistributedBufferStorageKind.CompactPerOwner ||
+                buffer.DistributedType is null ||
+                buffer.MemSpan.Buffer.Location != MemoryLocation.ChipLocalData)
+            {
+                throw new InvalidOperationException(
+                    $"Buffer {buffer.Name} is not compact per-owner chip-local storage.");
+            }
+
+            return GetDimensionExpression(buffer.MemSpan.Size).TritonExpression;
+        }
+
+        private static bool IsCompactPerOwnerBacking(PhysicalBuffer physicalBuffer)
+            => physicalBuffer.Location == MemoryLocation.ChipLocalData ||
+                physicalBuffer.Start is BufferVar
+                {
+                    LayoutAnnotation.DistributedStorageKind: DistributedBufferStorageKind.CompactPerOwner,
+                };
+
         private string GetDistributedCompactLocalOffsetElements(TIR.Buffer buffer)
         {
             if (buffer.DistributedType is not { } distributedType ||
-                buffer.DistributedStorageKind == DistributedBufferStorageKind.CanonicalGlobal)
+                buffer.DistributedStorageKind != DistributedBufferStorageKind.CompactLocal)
             {
                 return "0";
             }
@@ -12604,6 +12727,8 @@ internal sealed record HostTensorDescriptorBackingMetadata(
     string Source,
     [property: JsonPropertyName("offset_bytes")]
     long OffsetBytes,
+    [property: JsonPropertyName("owner_stride_bytes")]
+    long OwnerStrideBytes,
     [property: JsonPropertyName("scalar_dtype")]
     string ScalarDType,
     [property: JsonPropertyName("logical_shape")]

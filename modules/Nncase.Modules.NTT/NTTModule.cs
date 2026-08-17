@@ -21,5 +21,6 @@ internal class NTTModule : IApplicationPart
         registrator.RegisterManyInterface<PagedAttentionPartialCandidateProvider>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<PagedAttentionCombineCandidateProvider>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<PackedMatMulCandidateProvider>(reuse: Reuse.Singleton);
+        registrator.RegisterManyInterface<PackedMatMulNormStatsCandidateProvider>(reuse: Reuse.Singleton);
     }
 }

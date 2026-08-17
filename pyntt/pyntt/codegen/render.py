@@ -216,6 +216,7 @@ def _validate_launch(launch: Any, path: str) -> None:
                 "name",
                 "source",
                 "offset_bytes",
+                "owner_stride_bytes",
                 "scalar_dtype",
                 "logical_shape",
                 "logical_strides",
@@ -245,6 +246,11 @@ def _validate_launch(launch: Any, path: str) -> None:
         _require_int(
             descriptor["offset_bytes"],
             f"{descriptor_path}.offset_bytes",
+            minimum=0,
+        )
+        _require_int(
+            descriptor["owner_stride_bytes"],
+            f"{descriptor_path}.owner_stride_bytes",
             minimum=0,
         )
         _require_string(
@@ -564,6 +570,12 @@ def _kernel_backend_config(kernel: dict[str, Any]) -> dict[str, Any]:
         f"PyNTT kernel {metadata['name']} attrs.target_threads_per_block",
         minimum=1,
     )
+    resident_blocks_per_compute_unit = _require_int(
+        attrs.get("target_resident_blocks_per_compute_unit"),
+        f"PyNTT kernel {metadata['name']} "
+        "attrs.target_resident_blocks_per_compute_unit",
+        minimum=1,
+    )
     num_warps, remainder = divmod(threads_per_block, worker_width)
     if remainder:
         raise ValueError(
@@ -645,6 +657,7 @@ def _kernel_backend_config(kernel: dict[str, Any]) -> dict[str, Any]:
         },
         "num_warps": num_warps,
         "num_stages": 1,
+        "resident_blocks_per_compute_unit": resident_blocks_per_compute_unit,
         "paged_attention": _paged_attention_backend_config(kernel),
         "producer_warps": WARP_SPECIALIZATION_PRODUCER_WARPS,
         "producer_registers": producer_registers,
@@ -832,19 +845,8 @@ def _pipeline_helper_descriptor_specs(
         template
         == "triton/kernels/qkv_parallel_linear/simt_fma_smem_pipeline.py.jinja"
     ):
-        descriptor_names = tuple(
-            model.get(f"{prefix}WeightDescriptorName")
-            for prefix in ("Q", "K", "V")
-        )
-        descriptor_specs = tuple(
-            (
-                lambda current_model, backing, current_prefix=prefix:
-                _packed_qkv_gemv_host_descriptor_spec(
-                    current_model, backing, current_prefix
-                )
-            )
-            for prefix in ("Q", "K", "V")
-        )
+        descriptor_names = (model.get("WeightDescriptorName"),)
+        descriptor_specs = (_packed_qkv_gemv_host_descriptor_spec,)
     elif (
         template
         == "triton/kernels/matmul_glu/simt_fma_smem_pipeline.py.jinja"
@@ -960,26 +962,18 @@ def _packed_gemv_host_descriptor_spec(
 def _packed_qkv_gemv_host_descriptor_spec(
     model: dict[str, Any],
     backing: dict[str, Any],
-    prefix: str,
 ) -> dict[str, Any]:
     microkernel = _microkernel_context(
         model, "triton.qkv_parallel_linear", "simt_fma_smem_pipeline"
     )
-    block_n = microkernel["parameters"]["block_n"]
-    projection_ns = _packed_qkv_fixed_projection_ns(model)
-    if prefix not in projection_ns:
-        raise ValueError(f"Unknown PyNTT QKV projection prefix {prefix!r}.")
-    descriptor_block_ns, _ = _packed_qkv_transfer_plan(block_n, projection_ns)
-    descriptor_block_n = descriptor_block_ns[prefix]
-    spec = _k_major_gemv_host_descriptor_spec(
+    return _k_major_gemv_host_descriptor_spec(
         model,
         backing,
-        block_n=descriptor_block_n,
+        block_n=microkernel["parameters"]["block_n"],
         block_k=microkernel["parameters"]["block_k"],
-        pointer=model[f"{prefix}Weight"],
+        pointer=model["Weight"],
         transpose_kn=True,
     )
-    return spec
 
 
 def _packed_matmul_glu_gemv_host_descriptor_spec(
@@ -1000,122 +994,20 @@ def _packed_matmul_glu_gemv_host_descriptor_spec(
 
 
 def _packed_qkv_fixed_projection_ns(model: dict[str, Any]) -> dict[str, int]:
-    projection_ns: dict[str, int] = {}
-    for prefix in ("Q", "K", "V"):
-        projection_n = _fixed(_packed_qkv_logical_output_shape(model, prefix)[-1])
-        if projection_n is None or projection_n <= 0:
-            raise ValueError(
-                "PyNTT packed QKV GEMV requires fixed positive "
-                f"{prefix} projection N."
-            )
-        projection_ns[prefix] = projection_n
-    return projection_ns
-
-
-def _packed_qkv_copy_n(block_n: int, projection_ns: dict[str, int]) -> int:
-    copy_n = block_n
-    for projection_n in projection_ns.values():
-        copy_n = gcd(copy_n, projection_n)
-    if copy_n <= 0:
+    capacities = model.get("ProjectionNCapacities")
+    if not isinstance(capacities, list) or len(capacities) != 3:
         raise ValueError(
-            f"PyNTT packed QKV GEMV derived invalid TMA copy N extent {copy_n}."
+            "PyNTT fused packed QKV requires three projection N capacities."
         )
-    return copy_n
-
-
-def _packed_qkv_transfer_plan(
-    block_n: int,
-    projection_ns: dict[str, int],
-) -> tuple[dict[str, int], tuple[tuple[dict[str, int | str], ...], ...]]:
-    """Plan exact per-projection TMA copies over the concatenated Q/K/V N stream."""
-
-    prefixes = ("Q", "K", "V")
-    projection_starts: dict[str, int] = {}
-    total_n = 0
-    for prefix in prefixes:
-        projection_starts[prefix] = total_n
-        total_n += projection_ns[prefix]
-
-    candidate_block_ns = {
-        prefix: gcd(block_n, projection_ns[prefix]) for prefix in prefixes
+    projection_ns = {
+        prefix: _require_int(
+            capacities[index],
+            f"ProjectionNCapacities[{index}]",
+            minimum=1,
+        )
+        for index, prefix in enumerate(("Q", "K", "V"))
     }
-    if total_n % block_n == 0:
-        candidate_tiles: list[tuple[dict[str, int | str], ...]] = []
-        candidate_is_exact = True
-        for tile_start in range(0, total_n, block_n):
-            tile_end = tile_start + block_n
-            position = tile_start
-            copies: list[dict[str, int | str]] = []
-            while position < tile_end:
-                prefix = next(
-                    (
-                        value
-                        for value in prefixes
-                        if projection_starts[value]
-                        <= position
-                        < projection_starts[value] + projection_ns[value]
-                    ),
-                    None,
-                )
-                if prefix is None:
-                    candidate_is_exact = False
-                    break
-                copy_n = candidate_block_ns[prefix]
-                projection_end = projection_starts[prefix] + projection_ns[prefix]
-                if position + copy_n > min(tile_end, projection_end):
-                    candidate_is_exact = False
-                    break
-                copies.append(
-                    {
-                        "prefix": prefix,
-                        "tile_offset": position - tile_start,
-                        "projection_offset": position - projection_starts[prefix],
-                        "copy_n": copy_n,
-                    }
-                )
-                position += copy_n
-            if not candidate_is_exact:
-                break
-            candidate_tiles.append(tuple(copies))
-        if candidate_is_exact:
-            return candidate_block_ns, tuple(candidate_tiles)
-
-    common_copy_n = _packed_qkv_copy_n(block_n, projection_ns)
-    common_block_ns = {prefix: common_copy_n for prefix in prefixes}
-    padded_total_n = ((total_n + block_n - 1) // block_n) * block_n
-    fallback_tiles: list[tuple[dict[str, int | str], ...]] = []
-    for tile_start in range(0, padded_total_n, block_n):
-        copies = []
-        for tile_offset in range(0, block_n, common_copy_n):
-            position = tile_start + tile_offset
-            prefix = next(
-                (
-                    value
-                    for value in prefixes
-                    if projection_starts[value]
-                    <= position
-                    < projection_starts[value] + projection_ns[value]
-                ),
-                "V",
-            )
-            projection_offset = position - projection_starts[prefix]
-            if position < total_n and (
-                projection_offset < 0
-                or projection_offset + common_copy_n > projection_ns[prefix]
-            ):
-                raise ValueError(
-                    "PyNTT packed QKV GEMV common TMA copy crosses a projection boundary."
-                )
-            copies.append(
-                {
-                    "prefix": prefix,
-                    "tile_offset": tile_offset,
-                    "projection_offset": projection_offset,
-                    "copy_n": common_copy_n,
-                }
-            )
-        fallback_tiles.append(tuple(copies))
-    return common_block_ns, tuple(fallback_tiles)
+    return projection_ns
 
 
 def _k_major_gemv_host_descriptor_spec(
@@ -1264,6 +1156,7 @@ def _k_major_gemv_host_descriptor_spec(
         entries.append(
             {
                 "offset_bytes": int(backing["offset_bytes"])
+                + linear_owner * int(backing["owner_stride_bytes"])
                 + base_scalar_elements * item_size,
                 "shape": descriptor_shape,
                 "strides": descriptor_strides,
@@ -4275,6 +4168,7 @@ def _qkv_weight_access(
     n_axis: dict[str, Any],
     k_expr: str,
     coordinate_shape: str,
+    physical_n_base: int = 0,
 ) -> dict[str, Any]:
     n_lane_shape = _qkv_packed_lane_shape(model, packed=packed)
     if tuple(n_lane_shape) != tuple(n_axis["lane_shape"]):
@@ -4283,14 +4177,19 @@ def _qkv_weight_access(
             f"weight N={n_lane_shape}, tile={n_axis['lane_shape']}."
         )
     weight_lane_shape = _qkv_weight_lane_shape(model, packed=packed)
+    weight_shape_key = "WeightShape" if packed else f"{prefix}WeightShape"
+    weight_strides_key = "WeightStrides" if packed else f"{prefix}WeightStrides"
     batch_coordinates = _aligned_batch_coordinates(
-        model[f"{prefix}WeightShape"], 2, output_batch_rank
+        model[weight_shape_key], 2, output_batch_rank
     )
+    physical_n_coordinate = n_axis["physical_coordinate"]
+    if physical_n_base:
+        physical_n_coordinate = f"({physical_n_coordinate}) + {physical_n_base}"
     if not packed:
-        matrix_coordinates = (k_expr, n_axis["physical_coordinate"])
+        matrix_coordinates = (k_expr, physical_n_coordinate)
         lane_coordinates = ()
     elif model.get("RhsLayout", "n_major") == "n_major":
-        matrix_coordinates = (n_axis["physical_coordinate"], k_expr)
+        matrix_coordinates = (physical_n_coordinate, k_expr)
         lane_coordinates = n_axis["lane_coordinates"]
     else:
         k_pack = int(model["KPackLaneCount"])
@@ -4298,7 +4197,7 @@ def _qkv_weight_access(
         k_atom = k_pack * k_lane
         matrix_coordinates = (
             f"({k_expr}) // {k_atom}",
-            n_axis["physical_coordinate"],
+            physical_n_coordinate,
         )
         lane_coordinates = (
             *n_axis["lane_coordinates"],
@@ -4307,7 +4206,7 @@ def _qkv_weight_access(
         )
     return _tensor_access(
         batch_coordinates + matrix_coordinates,
-        model[f"{prefix}WeightStrides"],
+        model[weight_strides_key],
         lane_coordinates,
         weight_lane_shape,
         coordinate_shape,
@@ -4478,6 +4377,17 @@ def _qkv_parallel_linear_template_context(
             f"projection shape: M={_dim(m)}, block_m={block_m}."
         )
     projections = []
+    if packed:
+        for key in ("Weight", "WeightShape", "WeightStrides"):
+            if key not in model:
+                raise ValueError(
+                    "PyNTT packed QKV requires one canonical fused RHS; "
+                    f"missing model field {key!r}."
+                )
+        projection_capacities = _packed_qkv_fixed_projection_ns(model)
+    else:
+        projection_capacities = None
+    projection_physical_n_base = 0
     for prefix in ("Q", "K", "V"):
         lower = prefix.lower()
         has_bias = model[f"Has{prefix}Bias"]
@@ -4530,6 +4440,7 @@ def _qkv_parallel_linear_template_context(
                 n_axis=weight_n_axis,
                 k_expr=weight_k_coordinate,
                 coordinate_shape=_coordinate_shape(weight_structured_shape),
+                physical_n_base=projection_physical_n_base,
             )
             output_access = _qkv_output_access(
                 model,
@@ -4552,8 +4463,11 @@ def _qkv_parallel_linear_template_context(
                 else None
             )
             input_mask = f"offs_k < {_dim(k)}"
+            weight_capacity = (
+                projection_capacities[prefix] if projection_capacities else n
+            )
             weight_mask = (
-                f"({weight_n_axis['logical_coordinate']} < {_dim(n)}) & "
+                f"({weight_n_axis['logical_coordinate']} < {_dim(weight_capacity)}) & "
                 f"({weight_k_coordinate} < {_dim(k)})"
             )
             output_mask = f"{output_n_axis['logical_coordinate']} < {_dim(n)}"
@@ -4582,6 +4496,7 @@ def _qkv_parallel_linear_template_context(
                 n_axis=weight_n_axis,
                 k_expr=weight_k_coordinate,
                 coordinate_shape=_coordinate_shape(weight_structured_shape),
+                physical_n_base=projection_physical_n_base,
             )
             output_m_coordinate = _broadcast_axis_coordinate(
                 "offs_m", output_n_axis["rank"], 0
@@ -4610,9 +4525,12 @@ def _qkv_parallel_linear_template_context(
                 f"(offs_m[:, None] < {_dim(logical_output_shape[-2])}) & "
                 f"(offs_k[None, :] < {_dim(k)})"
             )
+            weight_capacity = (
+                projection_capacities[prefix] if projection_capacities else n
+            )
             weight_mask = (
                 f"({weight_k_coordinate} < {_dim(k)}) & "
-                f"({weight_n_axis['logical_coordinate']} < {_dim(n)})"
+                f"({weight_n_axis['logical_coordinate']} < {_dim(weight_capacity)})"
             )
             output_mask = (
                 f"({output_m_coordinate} < {_dim(logical_output_shape[-2])}) & "
@@ -4640,9 +4558,18 @@ def _qkv_parallel_linear_template_context(
                 "weight_n_axis": weight_n_axis,
                 "weight_mask": weight_mask,
                 "weight_access": weight_access,
+                "weight_key": "Weight" if packed else f"{prefix}Weight",
+                "weight_variable": "weight" if packed else f"{lower}_weight",
                 "weight_structured_shape": weight_structured_shape,
             }
         )
+        if projection_capacities is not None:
+            scalar_lanes = int(model["NPackedLaneCount"]) * int(
+                model["NVectorLaneCount"]
+            )
+            projection_physical_n_base += (
+                projection_capacities[prefix] // scalar_lanes
+            )
     context.update(
         batch_axes=tuple(range(output_batch_rank)),
         block_k=block_k,
@@ -5246,6 +5173,27 @@ def _matmul_addend_access(
     )
 
 
+def _matmul_stats_access(
+    model: dict[str, Any],
+    output_batch_rank: int,
+    m_expr: str,
+    component: int,
+    coordinate_shape: str | None,
+) -> dict[str, Any]:
+    if not model["HasNormStats"]:
+        raise ValueError("PyNTT Matmul statistics access requires a statistics output.")
+    coordinates = (
+        (str(component),)
+        + tuple(f"idx{axis}" for axis in range(output_batch_rank))
+        + (m_expr, "0")
+    )
+    return _tensor_access(
+        coordinates,
+        model["StatsStrides"],
+        coordinate_shape=coordinate_shape,
+    )
+
+
 def _is_positive_power_of_two(value: int) -> bool:
     return value > 0 and value & (value - 1) == 0
 
@@ -5261,6 +5209,8 @@ def _matmul_template_context(
 
     if not isinstance(model["HasAddend"], bool):
         raise ValueError("PyNTT Matmul HasAddend must be a boolean.")
+    if not isinstance(model["HasNormStats"], bool):
+        raise ValueError("PyNTT Matmul HasNormStats must be a boolean.")
     output_lane_count = (
         model.get("OutputNPackedLaneCount", 1) * model["OutputNVectorLaneCount"]
     )
@@ -5323,6 +5273,22 @@ def _matmul_template_context(
 
     k = lhs_k
     output_batch_rank = len(logical_output_shape) - 2
+    if model["HasNormStats"]:
+        if model["StatsDType"] != "float32":
+            raise ValueError(
+                "PyNTT Matmul normalization statistics must use float32 storage."
+            )
+        if int(model["NormAxis"]) != len(logical_output_shape) - 1:
+            raise ValueError(
+                "PyNTT Matmul normalization statistics must reduce the final "
+                "logical output axis."
+            )
+        if len(model["StatsShape"]) != len(model["OutputShape"]) + 1:
+            raise ValueError(
+                "PyNTT Matmul statistics rank must be output rank plus one."
+            )
+        if not isinstance(model["UseMean"], bool):
+            raise ValueError("PyNTT Matmul UseMean must be a boolean.")
     load_c_expression = str(model.get("LoadCExpression", "False")).strip() or "False"
     load_c = load_c_expression not in ("False", "false", "0")
     load_c_predicate = (
@@ -5517,6 +5483,25 @@ def _matmul_template_context(
             rhs_matrix_shape=(block_k, block_n),
             rhs_n_axis=rhs_n_axis,
             rhs_structured_shape=rhs_structured_shape,
+        )
+    if model["HasNormStats"]:
+        stats_m_expr = "m_idx" if gemv else "offs_m"
+        stats_coordinate_shape = (
+            None if gemv else _coordinate_shape((block_m,))
+        )
+        stats_components = 2 if model["UseMean"] else 1
+        context.update(
+            stats_accesses=tuple(
+                _matmul_stats_access(
+                    model,
+                    output_batch_rank,
+                    stats_m_expr,
+                    component,
+                    stats_coordinate_shape,
+                )
+                for component in range(stats_components)
+            ),
+            stats_mask=("True" if gemv else f"offs_m < {_dim(m)}"),
         )
     return context
 
@@ -5846,6 +5831,20 @@ def _packed_gemv_pipeline_template_context(
             else None
         ),
         "pipeline_output_mask": "(pipeline_output_n < active_n)",
+        "pipeline_stats_accesses": (
+            tuple(
+                _matmul_stats_access(
+                    model,
+                    output_batch_rank=0,
+                    m_expr="0",
+                    component=component,
+                    coordinate_shape=None,
+                )
+                for component in range(2 if model["UseMean"] else 1)
+            )
+            if model["HasNormStats"]
+            else ()
+        ),
     }
     context.update(pipeline_context)
     return context
@@ -5854,12 +5853,16 @@ def _packed_gemv_pipeline_template_context(
 def _packed_qkv_gemv_pipeline_template_context(
     model: dict[str, Any],
 ) -> dict[str, Any]:
-    """Prepare one K-major BF16 pipeline over the concatenated Q/K/V N axis."""
+    """Prepare one K-major BF16 pipeline over canonical fused local QKV weights."""
 
-    context = _qkv_parallel_linear_template_context(
+    logical_output_shapes = {
+        prefix: _packed_qkv_logical_output_shape(model, prefix)
+        for prefix in ("Q", "K", "V")
+    }
+    microkernel = _microkernel_context(
         model,
-        packed=True,
-        variant="simt_fma_smem_pipeline",
+        "triton.qkv_parallel_linear",
+        "simt_fma_smem_pipeline",
     )
     if model["InputDType"] != "bfloat16" or model["WeightDType"] != "bfloat16":
         raise ValueError(
@@ -5879,16 +5882,15 @@ def _packed_qkv_gemv_pipeline_template_context(
             "PyNTT packed QKV GEMV pipeline requires "
             "weight=[K/16,N/8]<8,2,8> and output=[M,N/8]<8>."
         )
-    if len(model["InputShape"]) != 2 or any(
-        len(model[f"{prefix}{suffix}Shape"]) != 2
-        for prefix in ("Q", "K", "V")
-        for suffix in ("Weight", "Output")
+    if (
+        len(model["InputShape"]) != 2
+        or len(model["WeightShape"]) != 2
+        or any(len(model[f"{prefix}OutputShape"]) != 2 for prefix in ("Q", "K", "V"))
     ):
         raise ValueError(
-            "PyNTT packed QKV GEMV pipeline currently requires rank-2 operands."
+            "PyNTT packed QKV GEMV pipeline requires rank-2 operands."
         )
 
-    microkernel = context["microkernel"]
     block_n = microkernel["parameters"]["block_n"]
     block_k = microkernel["parameters"]["block_k"]
     num_stages = microkernel["parameters"]["num_stages"]
@@ -5905,87 +5907,122 @@ def _packed_qkv_gemv_pipeline_template_context(
     k_atom = k_pack * k_lane
     if block_n % n_lane != 0 or block_k % k_atom != 0:
         raise ValueError(
-            "PyNTT packed QKV GEMV pipeline tile is incompatible with its "
-            f"packed lanes: block_n={block_n}, block_k={block_k}, "
-            f"n_lane={n_lane}, k_atom={k_atom}."
+            "PyNTT packed QKV GEMV tile is incompatible with its packed lanes: "
+            f"block_n={block_n}, block_k={block_k}, n_lane={n_lane}, "
+            f"k_atom={k_atom}."
         )
-    k = _fixed(context["k"])
+
+    k = _fixed(model["InputShape"][-1])
     if k is None or k <= 0 or k % block_k != 0:
         raise ValueError(
-            "PyNTT packed QKV GEMV pipeline requires a fixed K divisible by block_k."
+            "PyNTT packed QKV GEMV requires a fixed K divisible by block_k."
         )
-    packed_k_outer = block_k // k_atom
-    packed_n_outer = block_n // n_lane
-    for prefix in ("Q", "K", "V"):
-        descriptor_name = model.get(f"{prefix}WeightDescriptorName")
-        descriptor_origin_elements = model.get(
-            f"{prefix}WeightDescriptorOriginElements"
-        )
-        global_offsets = model.get(f"{prefix}WeightGlobalOffsets")
-        weight_shape = model[f"{prefix}WeightShape"]
-        if not isinstance(descriptor_name, str) or not descriptor_name:
-            raise ValueError(
-                f"PyNTT packed QKV GEMV pipeline requires a host {prefix} weight descriptor."
-            )
-        if not isinstance(descriptor_origin_elements, str) or not descriptor_origin_elements:
-            raise ValueError(
-                f"PyNTT packed QKV GEMV pipeline requires a {prefix} "
-                "weight descriptor origin."
-            )
-        if not isinstance(global_offsets, list) or len(global_offsets) != 2:
-            raise ValueError(
-                f"PyNTT packed QKV GEMV pipeline requires two {prefix} weight global offsets."
-            )
-        if (
-            _fixed(weight_shape[-2]) != k // k_atom
-            or _fixed(model[f"{prefix}WeightStrides"][-1]) != 1
-            or (_min_value(model[f"{prefix}WeightStrides"][-2]) or 0) <= 0
-        ):
-            raise ValueError(
-                f"PyNTT packed QKV GEMV TMA requires a positive-stride "
-                f"{prefix} weight [K/16,N/8]<8,2,8> view."
-            )
-
     projection_ns = _packed_qkv_fixed_projection_ns(model)
     if any(value % n_lane != 0 for value in projection_ns.values()):
         raise ValueError(
-            "PyNTT packed QKV GEMV projection N extents must be divisible by NVector."
+            "PyNTT packed QKV projection capacities must be N-vector aligned."
         )
-
     projection_starts: dict[str, int] = {}
     total_n = 0
     for prefix in ("Q", "K", "V"):
         projection_starts[prefix] = total_n
         total_n += projection_ns[prefix]
-    num_n_tiles = (total_n + block_n - 1) // block_n
-    num_k_tiles = k // block_k
-    max_sequence_count = num_n_tiles * num_k_tiles
-    if max_sequence_count > (2**31 - 1):
+
+    if total_n % block_n != 0:
         raise ValueError(
-            "PyNTT packed QKV GEMV sequence exceeds the signed int32 pipe ABI: "
-            f"{max_sequence_count}."
+            "PyNTT fused packed QKV capacity must be divisible by block_n; "
+            f"capacity={total_n}, block_n={block_n}."
+        )
+    packed_k_outer = block_k // k_atom
+    packed_n_outer = block_n // n_lane
+    expected_weight_shape = (k // k_atom, total_n // n_lane)
+    if tuple(_fixed(value) for value in model["WeightShape"]) != expected_weight_shape:
+        raise ValueError(
+            "PyNTT fused packed QKV weight shape does not match its capacities: "
+            f"expected={expected_weight_shape}, actual={model['WeightShape']}."
+        )
+    if (
+        _fixed(model["WeightStrides"][-1]) != 1
+        or (_min_value(model["WeightStrides"][-2]) or 0) <= 0
+    ):
+        raise ValueError(
+            "PyNTT fused packed QKV TMA requires positive-stride "
+            "[K/16,N/8]<8,2,8> storage."
         )
 
-    descriptor_block_ns, transfer_plan = _packed_qkv_transfer_plan(
-        block_n, projection_ns
-    )
-    if any(copy_n % n_lane != 0 for copy_n in descriptor_block_ns.values()):
+    descriptor_name = model.get("WeightDescriptorName")
+    descriptor_origin_elements = model.get("WeightDescriptorOriginElements")
+    global_offsets = model.get("WeightGlobalOffsets")
+    if not isinstance(descriptor_name, str) or not descriptor_name:
         raise ValueError(
-            "PyNTT packed QKV GEMV cannot form NVector-aligned per-projection "
-            f"TMA copy extents from block_n={block_n} and projections={projection_ns}."
+            "PyNTT fused packed QKV GEMV requires one host weight descriptor."
         )
-    projection_by_prefix = {
-        projection["prefix"]: projection for projection in context["projections"]
-    }
+    if not isinstance(descriptor_origin_elements, str) or not descriptor_origin_elements:
+        raise ValueError(
+            "PyNTT fused packed QKV GEMV requires a weight descriptor origin."
+        )
+    if not isinstance(global_offsets, list) or len(global_offsets) != 2:
+        raise ValueError(
+            "PyNTT fused packed QKV GEMV requires two weight global offsets."
+        )
+
+    weight_pointer = model["Weight"]
+    k_plan = _tma_canonical_axis_plan(
+        weight_pointer,
+        -2,
+        tile_extent=packed_k_outer,
+        context="fused packed QKV shared K",
+    )
+    n_plan = _tma_canonical_axis_plan(
+        weight_pointer,
+        -1,
+        tile_extent=packed_n_outer,
+        context="fused packed QKV shared N",
+    )
+    k_transfer = _tma_local_axis_transfer(
+        weight_pointer,
+        -2,
+        global_offsets[-2],
+        local_offset=0,
+        tile_index="k_tile",
+        tile_stride=packed_k_outer,
+        tile_extent=packed_k_outer,
+        context="fused packed QKV weight K",
+    )
+    n_transfer = _tma_local_axis_transfer(
+        weight_pointer,
+        -1,
+        global_offsets[-1],
+        local_offset=0,
+        tile_index="n_tile",
+        tile_stride=packed_n_outer,
+        tile_extent=packed_n_outer,
+        context="fused packed QKV weight N",
+    )
+    shared_stage_shape = (
+        tuple(n_plan["block_shape"])
+        + tuple(k_plan["block_shape"])
+        + (k_pack, n_lane * k_lane)
+    )
+    if len(shared_stage_shape) > 5:
+        raise ValueError(
+            "PyNTT fused packed QKV shared stage exceeds the TMA rank-5 limit: "
+            f"shape={shared_stage_shape}."
+        )
+    descriptor_offsets = (
+        tuple(n_transfer["coordinates"])
+        + tuple(k_transfer["coordinates"])
+        + ("0", descriptor_origin_elements)
+    )
+
     projections: list[dict[str, Any]] = []
     for prefix in ("Q", "K", "V"):
         lower = prefix.lower()
-        projection_start = projection_starts[prefix]
-        projection_end = projection_start + projection_ns[prefix]
         projection_n_expr = f"{lower}_projection_n"
+        active_n = logical_output_shapes[prefix][-1]
         projection_mask = (
             f"({projection_n_expr} >= 0) & "
-            f"({projection_n_expr} < {projection_ns[prefix]})"
+            f"({projection_n_expr} < {_dim(active_n)})"
         )
         output_access = _contiguous_vector_axis_access(
             ("0", "0"),
@@ -5995,7 +6032,7 @@ def _packed_qkv_gemv_pipeline_template_context(
             lane_count=n_lane,
             coordinate_shape=_coordinate_shape((block_n,)),
         )
-        has_bias = projection_by_prefix[prefix]["has_bias"]
+        has_bias = bool(model[f"Has{prefix}Bias"])
         bias_access = (
             _contiguous_vector_axis_access(
                 ("0",),
@@ -6012,14 +6049,7 @@ def _packed_qkv_gemv_pipeline_template_context(
             {
                 "prefix": prefix,
                 "lower": lower,
-                "descriptor_name": model[f"{prefix}WeightDescriptorName"],
-                "descriptor_origin_elements": model[
-                    f"{prefix}WeightDescriptorOriginElements"
-                ],
-                "weight_pointer": model[f"{prefix}Weight"],
-                "weight_global_offsets": model[f"{prefix}WeightGlobalOffsets"],
-                "projection_start": projection_start,
-                "projection_end": projection_end,
+                "projection_start": projection_starts[prefix],
                 "projection_n_expr": projection_n_expr,
                 "projection_mask": projection_mask,
                 "has_bias": has_bias,
@@ -6028,178 +6058,59 @@ def _packed_qkv_gemv_pipeline_template_context(
             }
         )
 
-    projection_metadata = {
-        projection["prefix"]: projection for projection in projections
-    }
-    shared_k_plans = [
-        _tma_canonical_axis_plan(
-            projection["weight_pointer"],
-            -2,
-            tile_extent=packed_k_outer,
-            context=f"packed QKV {projection['prefix']} shared K",
-        )
-        for projection in projections
-    ]
-    shared_n_plans = [
-        _tma_canonical_axis_plan(
-            projection["weight_pointer"],
-            -1,
-            tile_extent=packed_n_outer,
-            context=f"packed QKV {projection['prefix']} shared N",
-        )
-        for projection in projections
-    ]
-
-    def shared_axis_signature(plan: dict[str, Any]) -> tuple[Any, ...]:
-        return (
-            plan["is_block_cyclic"],
-            plan["block_size"],
-            tuple(plan["block_shape"]),
-        )
-
-    if len({shared_axis_signature(plan) for plan in shared_k_plans}) != 1 or len(
-        {shared_axis_signature(plan) for plan in shared_n_plans}
-    ) != 1:
+    num_n_tiles = total_n // block_n
+    num_k_tiles = k // block_k
+    sequence_count = num_n_tiles * num_k_tiles
+    if sequence_count > 2**31 - 1:
         raise ValueError(
-            "PyNTT packed QKV GEMV requires Q/K/V weights to use one common "
-            "staged split layout for each K/N axis."
-        )
-    shared_k_plan = shared_k_plans[0]
-    shared_n_plan = shared_n_plans[0]
-    shared_stage_shape = (
-        tuple(shared_n_plan["block_shape"])
-        + tuple(shared_k_plan["block_shape"])
-        + (k_pack, n_lane * k_lane)
-    )
-    if len(shared_stage_shape) > 5:
-        raise ValueError(
-            "PyNTT packed QKV GEMV shared stage exceeds the hardware rank-5 "
-            f"TMA limit: shape={shared_stage_shape}."
-        )
-    transfer_tiles = []
-    for tile_index, copies in enumerate(transfer_plan):
-        transfer_copies = []
-        for copy in copies:
-            prefix = str(copy["prefix"])
-            copy_n = int(copy["copy_n"])
-            copy_n_outer = copy_n // n_lane
-            projection = projection_metadata[prefix]
-            projection_n_outer_offset = int(copy["projection_offset"]) // n_lane
-            k_transfer = _tma_local_axis_transfer(
-                projection["weight_pointer"],
-                -2,
-                projection["weight_global_offsets"][-2],
-                local_offset=0,
-                tile_index="k_tile",
-                tile_stride=packed_k_outer,
-                tile_extent=packed_k_outer,
-                context=f"packed QKV {prefix} weight K",
-            )
-            n_transfer = _tma_local_axis_transfer(
-                projection["weight_pointer"],
-                -1,
-                projection["weight_global_offsets"][-1],
-                local_offset=projection_n_outer_offset,
-                tile_index=0,
-                tile_stride=copy_n_outer,
-                tile_extent=copy_n_outer,
-                context=f"packed QKV {prefix} weight N",
-            )
-            copy_shape = (
-                tuple(n_transfer["block_shape"])
-                + tuple(k_transfer["block_shape"])
-                + (k_pack, n_lane * k_lane)
-            )
-            destination_offsets = (
-                _tma_shared_axis_coordinates(
-                    str(int(copy["tile_offset"]) // n_lane), shared_n_plan
-                )
-                + _tma_shared_axis_coordinates("0", shared_k_plan)
-                + ("0", "0")
-            )
-            if len(copy_shape) != len(shared_stage_shape):
-                raise ValueError(
-                    "PyNTT packed QKV GEMV descriptor/shared rank mismatch: "
-                    f"copy={copy_shape}, shared={shared_stage_shape}."
-                )
-            transfer_copies.append(
-                {
-                    "prefix": prefix,
-                    "lower": projection["lower"],
-                    "descriptor_name": projection["descriptor_name"],
-                    "descriptor_origin_elements": projection[
-                        "descriptor_origin_elements"
-                    ],
-                    "descriptor_offsets": (
-                        tuple(n_transfer["coordinates"])
-                        + tuple(k_transfer["coordinates"])
-                        + (
-                            "0",
-                            projection["descriptor_origin_elements"],
-                        )
-                    ),
-                    "destination_offsets": destination_offsets,
-                    "copy_shape": copy_shape,
-                    "copy_is_full_stage": (
-                        copy_shape == shared_stage_shape
-                        and all(offset == "0" for offset in destination_offsets)
-                    ),
-                }
-            )
-        transfer_tiles.append(
-            {"tile_index": tile_index, "copies": tuple(transfer_copies)}
+            "PyNTT fused packed QKV GEMV sequence exceeds signed int32."
         )
 
     reduction_group = 32
-    target_worker_width = int(model["TargetWorkerWidth"])
-    consumer_warps = int(model["NumWarps"])
     consumer_layout = _packed_gemv_consumer_layout(
         block_n=block_n,
         reduction_group=reduction_group,
-        consumer_warps=consumer_warps,
-        target_worker_width=target_worker_width,
+        consumer_warps=int(model["NumWarps"]),
+        target_worker_width=int(model["TargetWorkerWidth"]),
     )
-    context.update(
-        block_n=block_n,
-        block_k=block_k,
-        num_stages=num_stages,
-        num_k_tiles=num_k_tiles,
-        num_n_tiles=num_n_tiles,
-        projections=tuple(projections),
-        transfer_tiles=tuple(transfer_tiles),
-        k_atom=k_atom,
-        packed_k_outer=packed_k_outer,
-        reduction_group=reduction_group,
-        reduction_groups_per_stage=block_k // reduction_group,
-        shared_stage_shape=shared_stage_shape,
-        shared_weight_indices=(
-            _tma_shared_axis_coordinates(
-                f"local_n // {n_lane}", shared_n_plan
-            )
-            + _tma_shared_axis_coordinates(
-                f"shared_k // {k_atom}", shared_k_plan
-            )
+    return {
+        "microkernel": microkernel,
+        "block_n": block_n,
+        "block_k": block_k,
+        "num_stages": num_stages,
+        "num_k_tiles": num_k_tiles,
+        "num_n_tiles": num_n_tiles,
+        "projections": tuple(projections),
+        "k": model["InputShape"][-1],
+        "k_atom": k_atom,
+        "packed_k_outer": packed_k_outer,
+        "reduction_group": reduction_group,
+        "reduction_groups_per_stage": block_k // reduction_group,
+        "shared_stage_shape": shared_stage_shape,
+        "descriptor_name": descriptor_name,
+        "descriptor_offsets": descriptor_offsets,
+        "shared_weight_indices": (
+            _tma_shared_axis_coordinates(f"local_n // {n_lane}", n_plan)
+            + _tma_shared_axis_coordinates(f"shared_k // {k_atom}", k_plan)
             + (
                 f"shared_payload // {n_lane * k_lane}",
                 f"shared_payload % {n_lane * k_lane}",
             )
         ),
-        tma_contiguous_extent=n_lane * k_lane,
-        consumer_size_per_thread=consumer_layout["size_per_thread"],
-        consumer_threads_per_warp=consumer_layout["threads_per_warp"],
-        consumer_warps_per_cta=consumer_layout["warps_per_cta"],
-        consumer_weight_layout_name=f"{model['FunctionName']}__weight_layout",
-        consumer_lhs_layout_name=f"{model['FunctionName']}__lhs_layout",
-        consumer_output_layout_name=f"{model['FunctionName']}__output_layout",
-        pipeline_input_access=_qkv_input_access(
+        "consumer_size_per_thread": consumer_layout["size_per_thread"],
+        "consumer_threads_per_warp": consumer_layout["threads_per_warp"],
+        "consumer_warps_per_cta": consumer_layout["warps_per_cta"],
+        "consumer_weight_layout_name": f"{model['FunctionName']}__weight_layout",
+        "consumer_lhs_layout_name": f"{model['FunctionName']}__lhs_layout",
+        "consumer_output_layout_name": f"{model['FunctionName']}__output_layout",
+        "pipeline_input_access": _qkv_input_access(
             model,
             output_batch_rank=0,
             m_expr="0",
             k_expr="pipeline_offs_k",
             coordinate_shape=_coordinate_shape((reduction_group,)),
         ),
-    )
-    return context
+    }
 
 
 def _packed_matmul_glu_gemv_pipeline_template_context(
@@ -7595,8 +7506,24 @@ def _reshard_template_context(model: dict[str, Any]) -> dict[str, Any]:
         for axis in range(len(model["Hierarchy"]))
         if axis not in output_split_mesh_axes
     ) if not output_is_canonical else ()
+    destination_local_mesh_axes = (
+        tuple(
+            axis
+            for axis in output_broadcast_mesh_axes
+            if axis not in input_split_mesh_axes
+        )
+        if input_partial_mesh_axes
+        else ()
+    )
+    destination_loop_mesh_axes = tuple(
+        axis
+        for axis in output_broadcast_mesh_axes
+        if axis not in destination_local_mesh_axes
+    )
     writer_active = "True"
     for axis in sorted(input_partial_mesh_axes):
+        if axis in destination_local_mesh_axes:
+            continue
         owner = (
             f"destination_shard_coord{axis}"
             if axis in output_split_mesh_axes
@@ -7609,10 +7536,21 @@ def _reshard_template_context(model: dict[str, Any]) -> dict[str, Any]:
         model["VectorLaneShape"],
         "PyNTT Reshard",
     )
+    major_extent_max = _max_value(context["major_extent"])
+    if major_extent_max is not None and major_extent_max > 0:
+        context["physical_tile_width_cap"] = 1 << (major_extent_max - 1).bit_length()
     if context["lane_count"] != model["VectorLaneCount"]:
         raise ValueError(
             "PyNTT Reshard vector lane metadata is inconsistent: "
             f"shape={context['lane_shape']}, count={model['VectorLaneCount']}"
+        )
+    if input_partial_mesh_axes:
+        partial_tile_extents = ("elementwise_physical_tile_width",) + tuple(
+            str(value) for value in context["lane_shape"]
+        )
+        context["tile_shape"] = (
+            f"({', '.join(partial_tile_extents)}"
+            f"{',' if len(partial_tile_extents) == 1 else ''})"
         )
     context["global_coordinates"] = tuple(
         _local_to_global_coordinate(
@@ -7628,6 +7566,7 @@ def _reshard_template_context(model: dict[str, Any]) -> dict[str, Any]:
         model["InputStrides"],
         context["lane_coordinates"],
         context["lane_shape"],
+        context["tile_shape"],
     )
     output_axis_plans = tuple(
         _global_to_local_coordinate(
@@ -7648,6 +7587,7 @@ def _reshard_template_context(model: dict[str, Any]) -> dict[str, Any]:
         model["OutputStrides"],
         context["lane_coordinates"],
         context["lane_shape"],
+        context["tile_shape"],
     )
     destination_shard_index = _split_linear_expression(
         list(range(len(model["Hierarchy"]))),
@@ -7678,13 +7618,34 @@ def _reshard_template_context(model: dict[str, Any]) -> dict[str, Any]:
             model["Hierarchy"],
             "source_shard_coord",
         )
+        reduction_axes = tuple(sorted(input_partial_mesh_axes))
+        reduction_extent = _product_int(
+            [model["Hierarchy"][axis] for axis in reduction_axes]
+        )
+        reduction_width_cap = 1 << (reduction_extent - 1).bit_length()
+        axis_strides: dict[int, int] = {}
+        axis_stride = 1
+        for axis in reversed(reduction_axes):
+            axis_strides[axis] = axis_stride
+            axis_stride *= model["Hierarchy"][axis]
+        tile_rank = 1 + len(context["lane_shape"])
         partial = {
             "accumulator_dtype": accumulator_dtype,
             "address": partial_input_address,
-            "axes": tuple(sorted(input_partial_mesh_axes)),
+            "axes": reduction_axes,
+            "axis_strides": axis_strides,
             "pointer_type": _pointer_type(
                 model["TritonDType"], partial_input_address["AddressSpace"]
             ),
+            "reduction_axis": tile_rank,
+            "reduction_extent": reduction_extent,
+            "append_reduction_axis": "["
+            + ", ".join([":"] * tile_rank + ["None"])
+            + "]",
+            "reduction_lane_reshape": "["
+            + ", ".join(["None"] * tile_rank + [":"])
+            + "]",
+            "reduction_width_cap": reduction_width_cap,
             "source_pool_index": _pool_index_expression(
                 "source_shard_index", partial_input_address["PoolScopeSize"]
             ),
@@ -7693,6 +7654,8 @@ def _reshard_template_context(model: dict[str, Any]) -> dict[str, Any]:
         }
     context.update(
         {
+            "destination_local_mesh_axes": destination_local_mesh_axes,
+            "destination_loop_mesh_axes": destination_loop_mesh_axes,
             "destination_pool_index": destination_pool_index,
             "destination_shard_index": destination_shard_index,
             "input_partial_mesh_axes": tuple(sorted(input_partial_mesh_axes)),
@@ -7704,7 +7667,7 @@ def _reshard_template_context(model: dict[str, Any]) -> dict[str, Any]:
                 model["TritonDType"], model["OutputAddress"]["AddressSpace"]
             ),
             "partial": partial,
-            "prefix_depth": len(output_broadcast_mesh_axes),
+            "prefix_depth": len(destination_loop_mesh_axes),
             "writer_active": writer_active,
         }
     )
@@ -8526,10 +8489,21 @@ def _paged_attention_merge_template_context(
         local_extent=local_head_dimension,
     )
 
+    output_is_canonical = (
+        model["Output"].get("DistributedStorageKind") == "CanonicalGlobal"
+    )
     output_indices = ["0"] * output_rank
-    output_indices[model["SeqAxis"]] = global_query_id
-    output_indices[model["HeadAxis"]] = global_q_head
-    output_indices[dim_axis] = global_output_physical_dim
+    output_indices[model["SeqAxis"]] = (
+        global_query_id if output_is_canonical else "local_query_id"
+    )
+    output_indices[model["HeadAxis"]] = (
+        global_q_head if output_is_canonical else "q_head"
+    )
+    output_indices[dim_axis] = (
+        global_output_physical_dim
+        if output_is_canonical
+        else output_dim_axis["physical_coordinate"]
+    )
 
     def state_indices(dim_index: str) -> list[str]:
         indices = ["0"] * state_rank
@@ -8567,9 +8541,9 @@ def _paged_attention_merge_template_context(
             output_lanes,
             _coordinate_shape(output_dim_axis["structured_shape"]),
             global_coordinate_axes=(
-                model["SeqAxis"],
-                model["HeadAxis"],
-                dim_axis,
+                (model["SeqAxis"], model["HeadAxis"], dim_axis)
+                if output_is_canonical
+                else ()
             ),
         ),
         "output_active": (
@@ -8662,6 +8636,11 @@ def _update_paged_attention_kv_cache_template_context(
     topology_match_axes = tuple(
         axis for axis in cache["NumBlocksHierarchyAxes"] if axis not in source_split_axes
     )
+    canonical_writer_axes = tuple(
+        axis
+        for axis in range(len(model["Hierarchy"]))
+        if axis not in source_split_axes and axis not in topology_match_axes
+    )
     block_index = (
         "(topology_id * num_blocks_per_shard + block_id)"
         if cache["IdLength"] > 1
@@ -8696,6 +8675,7 @@ def _update_paged_attention_kv_cache_template_context(
     context.update(
         {
             "cache_offset": cache_offset,
+            "canonical_writer_axes": canonical_writer_axes,
             "kind_prefix": kind_prefix,
             "lane_count": lane_count,
             "non_data_axes": tuple(

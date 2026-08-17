@@ -425,6 +425,7 @@ public sealed record TargetMemoryTransferSpec(
 public sealed record BlockExecutionSpec(
     BlockExecutionKind Kind,
     int ComputeUnitCount,
+    int ResidentBlocksPerComputeUnit,
     int WorkersPerBlock,
     int WorkerWidth,
     double ClockRateGHz,
@@ -544,7 +545,8 @@ public sealed class TargetMachineModel
             throw new ArgumentException("Target machine identity must not be empty.", nameof(id));
         }
 
-        if (execution.ComputeUnitCount <= 0 || execution.WorkersPerBlock <= 0 || execution.WorkerWidth <= 0 ||
+        if (execution.ComputeUnitCount <= 0 || execution.ResidentBlocksPerComputeUnit <= 0 ||
+            execution.WorkersPerBlock <= 0 || execution.WorkerWidth <= 0 ||
             !double.IsFinite(execution.ClockRateGHz) || execution.ClockRateGHz <= 0)
         {
             throw new ArgumentException("Target block execution resources must be positive.", nameof(execution));

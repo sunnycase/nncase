@@ -254,7 +254,7 @@ public sealed class PackedMatMulEvaluator : IEvaluator<PackedMatMul>, ITypeInfer
         }
     }
 
-    private bool TryGetTargetCost(ICostEvaluateContext context, PackedMatMul target, IRType lhs, IRType rhs, IRType outputType, out Cost cost, out bool hasAllReduce)
+    internal static bool TryGetTargetCost(ICostEvaluateContext context, PackedMatMul target, IRType lhs, IRType rhs, IRType outputType, out Cost cost, out bool hasAllReduce)
     {
         hasAllReduce = target.FusedReduce &&
             lhs is DistributedType distributedType &&
@@ -287,16 +287,7 @@ public sealed class PackedMatMulEvaluator : IEvaluator<PackedMatMul>, ITypeInfer
         return true;
     }
 
-    private static TensorType? GetTensorType(IRType type) => type switch
-    {
-        TensorType tensorType => tensorType,
-        DistributedType distributedType => distributedType.TensorType,
-        _ => null,
-    };
-
-    private static bool IsNone(IValue value) => value is NoneValue || value.Type is NoneType;
-
-    private static void AddAddendCost(Cost cost, IRType outputType, IRType addend)
+    internal static void AddAddendCost(Cost cost, IRType outputType, IRType addend)
     {
         if (addend is NoneType)
         {
@@ -313,6 +304,15 @@ public sealed class PackedMatMulEvaluator : IEvaluator<PackedMatMul>, ITypeInfer
             CostUtility.GetCPUCycles(outputType, 1));
     }
 
+    private static TensorType? GetTensorType(IRType type) => type switch
+    {
+        TensorType tensorType => tensorType,
+        DistributedType distributedType => distributedType.TensorType,
+        _ => null,
+    };
+
+    private static bool IsNone(IValue value) => value is NoneValue || value.Type is NoneType;
+
     private static IRType UnpackType(IRType input, int[] axes) => input switch
     {
         DistributedType distributedType => TypeInference.UnpackType(distributedType, axes),
@@ -327,7 +327,7 @@ public sealed class PackedMatMulEvaluator : IEvaluator<PackedMatMul>, ITypeInfer
         _ => new InvalidType($"Cannot pack {input}."),
     };
 
-    private DataType GetScalarType(DataType dtype) => dtype switch
+    private static DataType GetScalarType(DataType dtype) => dtype switch
     {
         VectorType vectorType => GetScalarType(vectorType.ElemType),
         _ => dtype,

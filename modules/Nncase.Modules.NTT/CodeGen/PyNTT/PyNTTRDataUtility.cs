@@ -38,7 +38,11 @@ internal static class PyNTTRDataUtility
             .ToArray();
     }
 
-    public static long GetLocalRDataTableStrideBytes(IReadOnlyDictionary<Const, ValueRange<ulong>> localRdatas, NTTTargetOptions targetOptions, string scopeName)
+    public static long GetLocalRDataTableStrideBytes(
+        IReadOnlyDictionary<Const, ValueRange<ulong>> localRdatas,
+        IReadOnlyDictionary<Const, TIR.BlockLocalRDataMaterialization> materializations,
+        NTTTargetOptions targetOptions,
+        string scopeName)
     {
         var poolSize = GetPoolSizeBytes(localRdatas);
         if (poolSize == 0)
@@ -52,10 +56,10 @@ internal static class PyNTTRDataUtility
             return poolSize;
         }
 
-        var firstSignature = GetLocalRDataShardSignature(localRdatas, targetOptions, scopeName, 0);
+        var firstSignature = GetLocalRDataShardSignature(localRdatas, materializations, targetOptions, scopeName, 0);
         for (var shard = 1; shard < shardCount; shard++)
         {
-            if (GetLocalRDataShardSignature(localRdatas, targetOptions, scopeName, shard) != firstSignature)
+            if (GetLocalRDataShardSignature(localRdatas, materializations, targetOptions, scopeName, shard) != firstSignature)
             {
                 return poolSize;
             }
@@ -64,12 +68,23 @@ internal static class PyNTTRDataUtility
         return 0;
     }
 
-    public static string GetLocalRDataShardSignature(IReadOnlyDictionary<Const, ValueRange<ulong>> localRdatas, NTTTargetOptions targetOptions, string scopeName, int shard)
+    public static string GetLocalRDataShardSignature(
+        IReadOnlyDictionary<Const, ValueRange<ulong>> localRdatas,
+        IReadOnlyDictionary<Const, TIR.BlockLocalRDataMaterialization> materializations,
+        NTTTargetOptions targetOptions,
+        string scopeName,
+        int shard)
     {
         var builder = new StringBuilder();
         var shardIndex = GetScopedShardIndex(shard, targetOptions, scopeName);
         foreach (var (@const, range) in localRdatas)
         {
+            if (materializations.TryGetValue(@const, out var materialization))
+            {
+                AppendMaterializationSignature(builder, materialization, range, shardIndex);
+                continue;
+            }
+
             var distributedType = (DistributedType)@const.CheckedType;
             var descriptor = DistributedUtility.GetLocalShardDescriptor(
                 distributedType,
@@ -97,6 +112,52 @@ internal static class PyNTTRDataUtility
         }
 
         return builder.ToString();
+    }
+
+    private static void AppendMaterializationSignature(
+        StringBuilder builder,
+        TIR.BlockLocalRDataMaterialization materialization,
+        ValueRange<ulong> range,
+        int[] shardIndex)
+    {
+        builder.Append(range.Min);
+        builder.Append(':');
+        builder.Append(range.Max);
+        builder.Append(":derived:");
+        switch (materialization)
+        {
+            case TIR.ConcatenatedDistributedTensorRDataMaterialization concatenated:
+                builder.Append("concat@");
+                builder.Append(concatenated.Axis);
+                builder.Append(':');
+                foreach (var source in concatenated.Sources)
+                {
+                    var descriptor = DistributedUtility.GetLocalShardDescriptor(
+                        source.DistributedType,
+                        shardIndex,
+                        DistributedUtility.DivideFlags.MaxShape);
+                    builder.AppendJoin(
+                        ',',
+                        source.DistributedType.AxisPolicies
+                            .OfType<SBPSplit>()
+                            .SelectMany(split => split.HierarchyAxes)
+                            .Distinct()
+                            .OrderBy(axis => axis)
+                            .Select(axis => shardIndex[axis]));
+                    builder.Append('/');
+                    builder.AppendJoin(',', source.DistributedType.AxisPolicies.Select(policy => policy.ToString()));
+                    builder.Append('/');
+                    builder.AppendJoin(',', descriptor.ActiveShape.ToValueArray());
+                    builder.Append('|');
+                }
+
+                break;
+            default:
+                throw new NotSupportedException(
+                    $"Unsupported block-local rdata materialization {materialization.GetType().Name}.");
+        }
+
+        builder.Append(';');
     }
 
     public static long GetPoolSizeBytes(IReadOnlyDictionary<Const, ValueRange<ulong>> ranges)

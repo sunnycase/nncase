@@ -75,20 +75,35 @@ public enum MemoryLocation
 
 public sealed class PhysicalBuffer : BaseExpr
 {
-    public PhysicalBuffer(int alignment, Dimension size, MemoryLocation location, int hierarchy = 0)
+    public PhysicalBuffer(
+        int alignment,
+        Dimension size,
+        MemoryLocation location,
+        int hierarchy = 0,
+        BlockLocalRDataMaterialization? blockLocalRDataMaterialization = null)
         : base([None.Default, size])
     {
         Alignment = alignment;
         Location = location;
         Hierarchy = hierarchy;
+        BlockLocalRDataMaterialization = blockLocalRDataMaterialization;
+        ValidateBlockLocalRDataMaterialization(location, blockLocalRDataMaterialization);
     }
 
-    public PhysicalBuffer(int alignment, Expr start, Dimension size, MemoryLocation location, int hierarchy = 0)
+    public PhysicalBuffer(
+        int alignment,
+        Expr start,
+        Dimension size,
+        MemoryLocation location,
+        int hierarchy = 0,
+        BlockLocalRDataMaterialization? blockLocalRDataMaterialization = null)
         : base([start, size])
     {
         Alignment = alignment;
         Location = location;
         Hierarchy = hierarchy;
+        BlockLocalRDataMaterialization = blockLocalRDataMaterialization;
+        ValidateBlockLocalRDataMaterialization(location, blockLocalRDataMaterialization);
     }
 
     /// <summary>
@@ -116,12 +131,30 @@ public sealed class PhysicalBuffer : BaseExpr
     /// </summary>
     public int Hierarchy { get; }
 
+    /// <summary>
+    /// Gets the optional compiler-owned recipe used to serialize this
+    /// block-local readonly allocation.
+    /// </summary>
+    public BlockLocalRDataMaterialization? BlockLocalRDataMaterialization { get; }
+
     /// <inheritdoc/>
     public override TExprResult Accept<TExprResult, TTypeResult, TContext>(ExprFunctor<TExprResult, TTypeResult, TContext> functor, TContext context)
         => functor.VisitPhysicalBuffer(this, context);
 
-    public PhysicalBuffer With(int? alignment = null, Expr? start = null, Dimension? size = null, MemoryLocation? location = null, int? hierarchy = null) =>
-        new(alignment ?? Alignment, start ?? Start, size ?? Size, location ?? Location, hierarchy ?? Hierarchy);
+    public PhysicalBuffer With(
+        int? alignment = null,
+        Expr? start = null,
+        Dimension? size = null,
+        MemoryLocation? location = null,
+        int? hierarchy = null,
+        BlockLocalRDataMaterialization? blockLocalRDataMaterialization = null) =>
+        new(
+            alignment ?? Alignment,
+            start ?? Start,
+            size ?? Size,
+            location ?? Location,
+            hierarchy ?? Hierarchy,
+            blockLocalRDataMaterialization ?? BlockLocalRDataMaterialization);
 
     /// <inheritdoc/>
     public override bool Equals(object? obj)
@@ -131,8 +164,24 @@ public sealed class PhysicalBuffer : BaseExpr
             return true;
         }
 
-        return obj is PhysicalBuffer other && GetHashCode() == other.GetHashCode() && Location == other.Location && Operands.SequenceEqual(other.Operands);
+        return obj is PhysicalBuffer other &&
+            GetHashCode() == other.GetHashCode() &&
+            Location == other.Location &&
+            ReferenceEquals(BlockLocalRDataMaterialization, other.BlockLocalRDataMaterialization) &&
+            Operands.SequenceEqual(other.Operands);
     }
 
-    protected override int GetHashCodeCore() => HashCode.Combine(Location, base.GetHashCodeCore());
+    protected override int GetHashCodeCore() => HashCode.Combine(Location, BlockLocalRDataMaterialization, base.GetHashCodeCore());
+
+    private static void ValidateBlockLocalRDataMaterialization(
+        MemoryLocation location,
+        BlockLocalRDataMaterialization? materialization)
+    {
+        if (materialization is not null && location != MemoryLocation.BlockLocalRdata)
+        {
+            throw new ArgumentException(
+                $"A block-local rdata materialization cannot back {location} storage.",
+                nameof(location));
+        }
+    }
 }

@@ -317,6 +317,89 @@ public sealed class UnitTestMemorySynchronization : TestClassBase
     }
 
     [Fact]
+    public async Task TestChangedBlockCyclicOwnershipUsesFullMeshBarrier()
+    {
+        var placement = new Placement([4, 8], "yx", "bb");
+        var tensorType = new TensorType(DataTypes.Float32, new[] { 2048 });
+        var producerType = new DistributedType(
+            tensorType,
+            [SBP.SBlockCyclic([0, 1], 1)],
+            placement);
+        var consumerType = new DistributedType(
+            tensorType,
+            [SBP.SBlockCyclic([0, 1], 64)],
+            placement);
+        var physical = new PhysicalBuffer(
+            DataTypes.Float32.SizeInBytes,
+            Tensor.FromPointer(4096, DataTypes.Float32),
+            8192,
+            MemoryLocation.ChipLocalData);
+        var producer = CreateDistributedAlias("producer_bc1", physical, producerType);
+        var consumer = CreateDistributedAlias("consumer_bc64", physical, consumerType);
+        var input = CreateWorkspaceBuffer("input", DataTypes.Float32, 0, 8192, [2048]);
+        var output = CreateWorkspaceBuffer("output", DataTypes.Float32, 12288, 8192, [2048]);
+        var main = new PrimFunction(
+            "main",
+            PyNTTTarget.Kind,
+            new Sequential(T.Memcopy(producer, input), T.Memcopy(output, consumer)),
+            Array.Empty<IVar>());
+        var module = new IRModule(main);
+
+        await new PlanMemorySynchronizationPass(
+            PyNTTTarget.Kind,
+            MemorySynchronizationScopes.All).RunAsync(module, new());
+
+        var rewritten = Assert.IsType<PrimFunction>(module.Entry);
+        var barrier = Assert.Single(
+            rewritten.Body.Fields
+                .ToArray()
+                .OfType<Call>()
+                .Select(call => call.Target)
+                .OfType<TIR.NTT.Barrier>());
+        Assert.Equal(TIR.NTT.BarrierScope.Chip, barrier.Scope);
+        Assert.Empty(barrier.AxisGroupAxes);
+    }
+
+    [Fact]
+    public async Task TestEquivalentBlockCyclicOwnershipNeedsOnlyBlockBarrier()
+    {
+        var placement = new Placement([4, 8], "yx", "bb");
+        var tensorType = new TensorType(DataTypes.Float32, new[] { 2048 });
+        var distributedType = new DistributedType(
+            tensorType,
+            [SBP.SBlockCyclic([0, 1], 64)],
+            placement);
+        var physical = new PhysicalBuffer(
+            DataTypes.Float32.SizeInBytes,
+            Tensor.FromPointer(4096, DataTypes.Float32),
+            8192,
+            MemoryLocation.ChipLocalData);
+        var producer = CreateDistributedAlias("producer_bc64", physical, distributedType);
+        var consumer = CreateDistributedAlias("consumer_bc64", physical, distributedType);
+        var input = CreateWorkspaceBuffer("input", DataTypes.Float32, 0, 8192, [2048]);
+        var output = CreateWorkspaceBuffer("output", DataTypes.Float32, 12288, 8192, [2048]);
+        var main = new PrimFunction(
+            "main",
+            PyNTTTarget.Kind,
+            new Sequential(T.Memcopy(producer, input), T.Memcopy(output, consumer)),
+            Array.Empty<IVar>());
+        var module = new IRModule(main);
+
+        await new PlanMemorySynchronizationPass(
+            PyNTTTarget.Kind,
+            MemorySynchronizationScopes.All).RunAsync(module, new());
+
+        var rewritten = Assert.IsType<PrimFunction>(module.Entry);
+        var barrier = Assert.Single(
+            rewritten.Body.Fields
+                .ToArray()
+                .OfType<Call>()
+                .Select(call => call.Target)
+                .OfType<TIR.NTT.Barrier>());
+        Assert.Equal(TIR.NTT.BarrierScope.Block, barrier.Scope);
+    }
+
+    [Fact]
     public async Task TestPyNTTLocalShardSubviewAliasesCallerBackingWithoutGridSynchronization()
     {
         CompileOptions.TargetOptions = new PyNTTTargetOptions();
@@ -448,6 +531,99 @@ public sealed class UnitTestMemorySynchronization : TestClassBase
             .ToArray();
         Assert.Equal(2, barriers.Length);
         Assert.All(barriers, barrier => Assert.Empty(barrier.AxisGroupAxes));
+    }
+
+    [Fact]
+    public async Task TestPyNTTPartialAllReduceWritesCompactLocalReplicaWithoutPostChipBarrier()
+    {
+        CompileOptions.TargetOptions = new PyNTTTargetOptions();
+        var placement = new Placement([4, 8], "yx", "bb");
+        var inputType = new DistributedType(
+            new TensorType(DataTypes.Float32, new[] { 1, 128 }),
+            [SBP.B, SBP.SContiguous([0, 1], 4)],
+            placement);
+        var input = new Var("input", inputType);
+        var stats = IR.F.NN.NormStats(1, input, useMean: false);
+        var partialType = Assert.IsType<DistributedType>(stats.CheckedType);
+        var broadcastType = new DistributedType(
+            partialType.TensorType,
+            [SBP.B, SBP.B, SBP.B],
+            placement);
+        var allReduce = IR.F.Distributed.Boxing(stats, broadcastType);
+        var consumer = IR.F.Math.Unary(UnaryOp.Neg, allReduce);
+        var result = IR.F.Distributed.Boxing(consumer, partialType.TensorType);
+        var function = new Function(
+            "main",
+            PyNTTTarget.Kind,
+            result,
+            new[] { input });
+        Assert.True(function.InferenceType());
+
+        var lowered = Assert.IsType<PrimFunction>(
+            await new NTTTIRSelectionPass(CompileOptions, PyNTTTarget.Kind).RunAsync(function, new()));
+        var allReduceCall = Assert.Single(
+            ExprCollector.Collect(lowered.Body)
+                .OfType<Call>()
+                .Where(call => call.Target is TIR.NTT.GatherReduceScatter));
+        var allReduceOutput = Assert.IsType<TIR.Buffer>(
+            allReduceCall[TIR.NTT.GatherReduceScatter.Output]);
+        var partialInput = Assert.IsType<TIR.Buffer>(
+            allReduceCall[TIR.NTT.GatherReduceScatter.Input]);
+
+        Assert.Equal(MemoryLocation.ChipLocalData, allReduceOutput.MemSpan.Buffer.Location);
+        Assert.Equal(DistributedBufferStorageKind.CompactPerOwner, allReduceOutput.DistributedStorageKind);
+        Assert.Equal(MemoryLocation.ChipLocalData, partialInput.MemSpan.Buffer.Location);
+        Assert.Equal(DistributedBufferStorageKind.CompactPerOwner, partialInput.DistributedStorageKind);
+        Assert.Equal(
+            partialInput.MemSpan.Size.FixedValue * 32,
+            partialInput.MemSpan.Buffer.Size.FixedValue);
+        Assert.Equal(
+            allReduceOutput.MemSpan.Size.FixedValue * 32,
+            allReduceOutput.MemSpan.Buffer.Size.FixedValue);
+
+        var partialPhysical = new PhysicalBuffer(
+            DataTypes.Float32.SizeInBytes,
+            Tensor.FromPointer(0, DataTypes.Float32),
+            4,
+            MemoryLocation.Data);
+        var allReducePhysical = new PhysicalBuffer(
+            DataTypes.Float32.SizeInBytes,
+            Tensor.FromPointer(256, DataTypes.Float32),
+            4,
+            MemoryLocation.Data);
+        var consumerPhysical = new PhysicalBuffer(
+            DataTypes.Float32.SizeInBytes,
+            Tensor.FromPointer(512, DataTypes.Float32),
+            4,
+            MemoryLocation.Data);
+        var partialBuffer = CreateDistributedAlias("partial", partialPhysical, partialType);
+        var broadcastBuffer = CreateDistributedAlias("broadcast", allReducePhysical, broadcastType);
+        var consumerBuffer = CreateDistributedAlias("consumer", consumerPhysical, broadcastType);
+        var seed = CreateWorkspaceBuffer("seed", DataTypes.Float32, 768, 4, [1, 1, 1]);
+        var tir = new PrimFunction(
+            "main",
+            PyNTTTarget.Kind,
+            new Sequential(
+                T.Memcopy(partialBuffer, seed),
+                TIR.F.NTT.GatherReduceScatter(partialBuffer, broadcastBuffer, partialType, broadcastType),
+                TIR.F.NTT.Unary(UnaryOp.Neg, broadcastBuffer, consumerBuffer)),
+            Array.Empty<IVar>());
+        var module = new IRModule(tir);
+        await new PlanMemorySynchronizationPass(
+            PyNTTTarget.Kind,
+            MemorySynchronizationScopes.All).RunAsync(module, new());
+        var planned = Assert.IsType<PrimFunction>(module.Entry);
+        Assert.Collection(
+            planned.Body.Fields.ToArray(),
+            field => Assert.IsType<Memcopy>(Assert.IsType<Call>(field).Target),
+            field => Assert.Equal(
+                TIR.NTT.BarrierScope.Chip,
+                Assert.IsType<TIR.NTT.Barrier>(Assert.IsType<Call>(field).Target).Scope),
+            field => Assert.IsType<TIR.NTT.GatherReduceScatter>(Assert.IsType<Call>(field).Target),
+            field => Assert.Equal(
+                TIR.NTT.BarrierScope.Block,
+                Assert.IsType<TIR.NTT.Barrier>(Assert.IsType<Call>(field).Target).Scope),
+            field => Assert.IsType<TIR.NTT.Unary>(Assert.IsType<Call>(field).Target));
     }
 
     [Fact]

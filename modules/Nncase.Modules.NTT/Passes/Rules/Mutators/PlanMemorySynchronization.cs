@@ -57,6 +57,16 @@ internal sealed class MemoryEffectAnalyzer
     public EffectSet GetTransferSourceEffects(Call call)
         => GetTransferSourceEffects(call, ResourceBindingScope.Empty);
 
+    public TransferSourceDependency AnalyzeTransferSourceDependency(
+        IReadOnlyList<Expr> executionOrder,
+        int stageIndex,
+        Call operation)
+        => AnalyzeTransferSourceDependency(
+            executionOrder,
+            stageIndex,
+            operation,
+            ResourceBindingScope.Empty);
+
     public EffectSet GetIterationLocalEffects(
         Sequential body,
         bool suppressReductionAccumulatorEffects)
@@ -211,7 +221,9 @@ internal sealed class MemoryEffectAnalyzer
                 $"Recursive PrimFunction call graph is not supported by transfer-source analysis: {function.Name}.");
         }
 
-        var effects = GetTransferSourceEffects(function.Body, ResourceBindingScope.Empty);
+        var effects = GetProducerEntrySourceEffects(
+            function.Body,
+            ResourceBindingScope.Empty);
         summary = CreateFunctionSummary(function, effects);
         _activeTransferSources.Remove(function);
         _transferSourceSummaries.Add(function, summary);
@@ -249,58 +261,104 @@ internal sealed class MemoryEffectAnalyzer
         return new FunctionEffectSummary(parameterEffects);
     }
 
-    private EffectSet GetTransferSourceEffects(
-        Expr expression,
+    private EffectSet GetProducerEntrySourceEffects(
+        Sequential body,
         ResourceBindingScope bindings)
     {
-        switch (expression)
+        var result = new EffectSet();
+        var executionOrder = EnumerateExecutionOrder(body).ToArray();
+        for (var stageIndex = 0; stageIndex < executionOrder.Length; stageIndex++)
         {
-            case Block block:
-                return Union(
-                    [
-                        GetTransferSourceEffects(block.InitBody, bindings),
-                        GetTransferSourceEffects(block.Body, bindings),
-                    ]);
-            case Sequential sequential:
-                return Union(sequential.Fields.ToArray().Select(
-                    field => GetTransferSourceEffects(field, bindings)));
-            case PipelineFor pipelineFor:
-                var pipelineBindings = bindings;
-                for (var index = 0; index < pipelineFor.StagedAccesses.Length; index++)
+            if (executionOrder[stageIndex] is not Call operation)
+            {
+                continue;
+            }
+
+            var dependency = AnalyzeTransferSourceDependency(
+                executionOrder,
+                stageIndex,
+                operation,
+                bindings);
+            if (!dependency.SourceEffects.Items.Any())
+            {
+                continue;
+            }
+
+            // An internal consumer-to-producer handoff owns sources released by
+            // a barrier in this function. Only sources available from function
+            // entry remain part of the interprocedural producer prerequisite.
+            if (dependency.ReleaseBoundary is null)
+            {
+                result.UnionWith(dependency.SourceEffects);
+            }
+        }
+
+        return result;
+    }
+
+    private TransferSourceDependency AnalyzeTransferSourceDependency(
+        IReadOnlyList<Expr> executionOrder,
+        int stageIndex,
+        Call operation,
+        ResourceBindingScope bindings)
+    {
+        if ((uint)stageIndex >= (uint)executionOrder.Count)
+        {
+            throw new ArgumentOutOfRangeException(nameof(stageIndex));
+        }
+
+        var sourceEffects = GetTransferSourceEffects(operation, bindings);
+        var pending = new PendingEffectSet();
+        Expr? releaseBoundary = null;
+        for (var expressionIndex = 0; expressionIndex < stageIndex; expressionIndex++)
+        {
+            var expression = executionOrder[expressionIndex];
+            if (MemorySynchronizationPlanner.TryGetBarrier(expression, out var barrier))
+            {
+                var hadConflict = pending.TryGetConflict(sourceEffects, out _);
+                pending.Synchronize(SynchronizationRequirement.FromBarrier(barrier));
+                if (hadConflict && !pending.TryGetConflict(sourceEffects, out _))
                 {
-                    pipelineBindings = pipelineBindings.Bind(
-                        (BaseExpr)pipelineFor.StagedAccesses[index],
-                        pipelineFor.StagedAllocations[index]);
+                    releaseBoundary = expression;
                 }
 
-                return Union(
-                    [
-                        GetTransferSourceEffects(pipelineFor.ProduceBody, pipelineBindings),
-                        GetTransferSourceEffects(pipelineFor.ConsumeBody, pipelineBindings),
-                    ]);
-            case Nncase.TIR.For @for:
-                return GetTransferSourceEffects(@for.Body, bindings);
-            case Let let:
-                var expressionEffects = let.Expression is Expr bindingExpression
-                    ? GetTransferSourceEffects(bindingExpression, bindings)
-                    : new EffectSet();
-                return Union(
-                    [
-                        expressionEffects,
-                        GetTransferSourceEffects(
-                            let.Body,
-                            bindings.Bind((BaseExpr)let.Var, let.Expression)),
-                    ]);
-            case IfThenElse ifThenElse:
-                return Union(
-                    [
-                        GetTransferSourceEffects(ifThenElse.Then, bindings),
-                        GetTransferSourceEffects(ifThenElse.Else, bindings),
-                    ]);
-            case Call call:
-                return GetTransferSourceEffects(call, bindings);
-            default:
-                return new EffectSet();
+                continue;
+            }
+
+            var effectExpression = expression is PipelineStage precedingStage
+                ? precedingStage.Operation
+                : expression;
+            pending.Add(GetEffects(
+                effectExpression,
+                bindings,
+                suppressReductionAccumulatorEffects: false,
+                stopAtNestedLoops: false));
+            if (pending.TryGetConflict(sourceEffects, out _))
+            {
+                releaseBoundary = null;
+            }
+        }
+
+        return pending.TryGetConflict(sourceEffects, out var unsynchronized)
+            ? new TransferSourceDependency(sourceEffects, null, unsynchronized)
+            : new TransferSourceDependency(sourceEffects, releaseBoundary, null);
+    }
+
+    private static IEnumerable<Expr> EnumerateExecutionOrder(Sequential body)
+    {
+        foreach (var field in body.Fields.ToArray())
+        {
+            if (field is Sequential nested)
+            {
+                foreach (var expression in EnumerateExecutionOrder(nested))
+                {
+                    yield return expression;
+                }
+            }
+            else
+            {
+                yield return field;
+            }
         }
     }
 
@@ -465,7 +523,8 @@ internal sealed class MemoryEffectAnalyzer
                     : sourceResource with { DistributedType = viewDistributedType };
             case TIR.Buffer buffer:
                 var physicalBuffer = buffer.MemSpan.Buffer;
-                var scope = explicitScope ?? (physicalBuffer.Location is MemoryLocation.ChipLocalData or MemoryLocation.ChipLocalRdata ||
+                var scope = explicitScope ?? (buffer.DistributedStorageKind == DistributedBufferStorageKind.CompactPerOwner ||
+                    physicalBuffer.Location is MemoryLocation.ChipLocalData or MemoryLocation.ChipLocalRdata ||
                     buffer.ElemType is ReferenceType
                     ? TIR.NTT.BarrierScope.Chip
                     : TIR.NTT.BarrierScope.Block);
@@ -895,6 +954,14 @@ internal static class SynchronizationRequirementInference
                 // it removes a suffix of the producer's split order.
                 return false;
             }
+
+            if (removesProducerAxis && consumerOrder.Length > 0 &&
+                !TryProvePrefixCoarsening(
+                    producer.AxisPolicies[tensorAxis],
+                    consumer.AxisPolicies[tensorAxis]))
+            {
+                return false;
+            }
         }
 
         var requiredAxes = new List<int>();
@@ -913,8 +980,64 @@ internal static class SynchronizationRequirementInference
             }
         }
 
+        for (var tensorAxis = 0; tensorAxis < Math.Min(producer.AxisPolicies.Count, consumer.AxisPolicies.Count); tensorAxis++)
+        {
+            var producerOrder = producerOrders.GetValueOrDefault(tensorAxis, Array.Empty<int>());
+            var consumerOrder = consumerOrders.GetValueOrDefault(tensorAxis, Array.Empty<int>());
+            if (producerOrder.Length > 0 &&
+                producerOrder.SequenceEqual(consumerOrder) &&
+                !DistributedUtility.IsSamePolicy(
+                    producer.AxisPolicies[tensorAxis],
+                    consumer.AxisPolicies[tensorAxis]))
+            {
+                // Equal hierarchy-axis assignments do not imply equal owners.
+                // Stage grouping and distribution parameters participate in the
+                // local-to-global coordinate map, so a policy change can move
+                // data between every block in those stages.
+                requiredAxes.AddRange(producerOrder);
+            }
+        }
+
         requirement = SynchronizationRequirement.ChipAxisGroup(placement, requiredAxes);
         return true;
+
+        static bool TryProvePrefixCoarsening(SBP producerPolicy, SBP consumerPolicy)
+        {
+            if (producerPolicy is not SBPSplit producerSplit ||
+                consumerPolicy is not SBPSplit consumerSplit)
+            {
+                return false;
+            }
+
+            var producerStageIndex = 0;
+            for (var consumerStageIndex = 0; consumerStageIndex < consumerSplit.Stages.Count; consumerStageIndex++)
+            {
+                if (producerStageIndex >= producerSplit.Stages.Count)
+                {
+                    return false;
+                }
+
+                var producerStage = producerSplit.Stages[producerStageIndex++];
+                var consumerStage = consumerSplit.Stages[consumerStageIndex];
+                if (producerStage == consumerStage)
+                {
+                    continue;
+                }
+
+                // Removing a suffix from one automatic contiguous stage
+                // preserves the prefix coordinates: the removed block axes
+                // form exactly the synchronization group. Explicit granularities
+                // and block-cyclic stages need a scaling proof, which this
+                // inference intentionally does not guess.
+                return consumerStageIndex == consumerSplit.Stages.Count - 1 &&
+                    producerStage.HierarchyAxes.Take(consumerStage.HierarchyAxes.Count)
+                        .SequenceEqual(consumerStage.HierarchyAxes) &&
+                    producerStage.Distribution is ContiguousSplit { Granularity: null } &&
+                    consumerStage.Distribution is ContiguousSplit { Granularity: null };
+            }
+
+            return true;
+        }
 
         static bool TryGetSplitAssignments(
             DistributedType type,
@@ -1256,6 +1379,11 @@ internal sealed record MemoryResource(
 }
 
 internal sealed record FunctionEffectSummary(IReadOnlyDictionary<int, EffectInfo> ParameterEffects);
+
+internal sealed record TransferSourceDependency(
+    EffectSet SourceEffects,
+    Expr? ReleaseBoundary,
+    SynchronizationRequirement? UnsynchronizedRequirement);
 
 internal sealed class EffectSet
 {

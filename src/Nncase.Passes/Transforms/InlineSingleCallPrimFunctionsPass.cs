@@ -283,13 +283,14 @@ public sealed class InlineSingleCallPrimFunctionsPass : ModulePass
             return expr;
         }
 
-        private static void MergeReadOnlyDataAllocations(
+        private static IReadOnlyDictionary<Const, Const> MergeReadOnlyDataAllocations(
             IDictionary<Const, ValueRange<ulong>> destination,
             IReadOnlyDictionary<Const, ValueRange<ulong>> source,
             PrimFunction destinationFunction,
             PrimFunction sourceFunction,
             MemoryLocation location)
         {
+            var destinationKeys = new Dictionary<Const, Const>(ReferenceEqualityComparer.Instance);
             foreach (var (@const, range) in source)
             {
                 var allocationKey = @const;
@@ -297,6 +298,7 @@ public sealed class InlineSingleCallPrimFunctionsPass : ModulePass
                 {
                     if (existingRange == range)
                     {
+                        destinationKeys.Add(@const, allocationKey);
                         continue;
                     }
 
@@ -304,7 +306,10 @@ public sealed class InlineSingleCallPrimFunctionsPass : ModulePass
                 }
 
                 destination.Add(allocationKey, range);
+                destinationKeys.Add(@const, allocationKey);
             }
+
+            return destinationKeys;
         }
 
         private static Const CloneReadOnlyDataConstant(
@@ -327,24 +332,45 @@ public sealed class InlineSingleCallPrimFunctionsPass : ModulePass
                 return;
             }
 
-            MergeReadOnlyDataAllocations(
+            _ = MergeReadOnlyDataAllocations(
                 _destinationFunction.SchedResult.Rdatas,
                 callee.SchedResult.Rdatas,
                 _destinationFunction,
                 callee,
                 MemoryLocation.Rdata);
-            MergeReadOnlyDataAllocations(
+            _ = MergeReadOnlyDataAllocations(
                 _destinationFunction.SchedResult.ChipLocalRdatas,
                 callee.SchedResult.ChipLocalRdatas,
                 _destinationFunction,
                 callee,
                 MemoryLocation.ChipLocalRdata);
-            MergeReadOnlyDataAllocations(
+            var blockLocalRDataKeys = MergeReadOnlyDataAllocations(
                 _destinationFunction.SchedResult.BlockLocalRdatas,
                 callee.SchedResult.BlockLocalRdatas,
                 _destinationFunction,
                 callee,
                 MemoryLocation.BlockLocalRdata);
+            foreach (var (sourceKey, materialization) in callee.SchedResult.BlockLocalRDataMaterializations)
+            {
+                if (!blockLocalRDataKeys.TryGetValue(sourceKey, out var destinationKey))
+                {
+                    throw new InvalidOperationException(
+                        $"Cannot inline prim function {callee.Name}: derived block-local rdata recipe has no allocation.");
+                }
+
+                if (_destinationFunction.SchedResult.BlockLocalRDataMaterializations.TryGetValue(destinationKey, out var existing))
+                {
+                    if (!ReferenceEquals(existing, materialization))
+                    {
+                        throw new InvalidOperationException(
+                            $"Cannot inline prim function {callee.Name}: block-local rdata allocation has conflicting materialization recipes.");
+                    }
+
+                    continue;
+                }
+
+                _destinationFunction.SchedResult.BlockLocalRDataMaterializations.Add(destinationKey, materialization);
+            }
         }
     }
 

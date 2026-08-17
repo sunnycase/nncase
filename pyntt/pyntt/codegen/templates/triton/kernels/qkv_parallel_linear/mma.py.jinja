@@ -3,14 +3,15 @@
 {% set packed = model.get("PackedN", false) %}
 {% set ctx = qkv_parallel_linear_context(model, packed=packed) %}
 # generated from PyNTT algorithm triton.qkv_parallel_linear/mma
-# {{ model["Comment"] }}; input_dtype={{ model["InputDType"] }}, weight_dtype={{ model["WeightDType"] }}, output_dtype={{ model["OutputDType"] }}, input_shape={{ shape_tuple(model["InputShape"]) }}, q_weight_shape={{ shape_tuple(model["QWeightShape"]) }}, k_weight_shape={{ shape_tuple(model["KWeightShape"]) }}, v_weight_shape={{ shape_tuple(model["VWeightShape"]) }}, q_output_shape={{ shape_tuple(model["QOutputShape"]) }}, k_output_shape={{ shape_tuple(model["KOutputShape"]) }}, v_output_shape={{ shape_tuple(model["VOutputShape"]) }}{{ ", n_packed_lane=" ~ model["NPackedLaneCount"] ~ ", n_lane=" ~ model["NVectorLaneCount"] ~ ", n_scalar_lane=" ~ (model["NPackedLaneCount"] * model["NVectorLaneCount"]) if packed else "" }}
+# {{ model["Comment"] }}; input_dtype={{ model["InputDType"] }}, weight_dtype={{ model["WeightDType"] }}, output_dtype={{ model["OutputDType"] }}, input_shape={{ shape_tuple(model["InputShape"]) }}, weight_shape={{ shape_tuple(model["WeightShape"]) if model.get("WeightShape") else "separate" }}, q_output_shape={{ shape_tuple(model["QOutputShape"]) }}, k_output_shape={{ shape_tuple(model["KOutputShape"]) }}, v_output_shape={{ shape_tuple(model["VOutputShape"]) }}{{ ", n_packed_lane=" ~ model["NPackedLaneCount"] ~ ", n_lane=" ~ model["NVectorLaneCount"] ~ ", n_scalar_lane=" ~ (model["NPackedLaneCount"] * model["NVectorLaneCount"]) if packed else "" }}
 {{ phases.consumer_header(model) }}
 {{ common.mesh_coordinates(model["MeshAxes"]) }}
 {{ common.matrix_shared_aliases(ctx, model["InputTritonDType"], model["WeightTritonDType"], [ctx["block_m"], ctx["block_k"]], [ctx["block_k"], ctx["block_n"]], true) }}
-{% set pointer_keys = ("Input", "QWeight", "KWeight", "VWeight", "QBias", "KBias", "VBias", "QOutput", "KOutput", "VOutput") %}
+{% set pointer_keys = ("Input", "Weight", "QBias", "KBias", "VBias", "QOutput", "KOutput", "VOutput") if model.get("Weight") else ("Input", "QWeight", "KWeight", "VWeight", "QBias", "KBias", "VBias", "QOutput", "KOutput", "VOutput") %}
 {% set pointers = namespace(values=[]) %}
 {% for key in pointer_keys %}{% do pointers.values.append(model[key]) %}{% endfor %}
-{% for name, key in (("input0", "Input"), ("q_weight", "QWeight"), ("k_weight", "KWeight"), ("v_weight", "VWeight"), ("q_bias", "QBias"), ("k_bias", "KBias"), ("v_bias", "VBias"), ("q_output", "QOutput"), ("k_output", "KOutput"), ("v_output", "VOutput")) %}
+{% set named_pointers = (("input0", "Input"), ("weight", "Weight"), ("q_bias", "QBias"), ("k_bias", "KBias"), ("v_bias", "VBias"), ("q_output", "QOutput"), ("k_output", "KOutput"), ("v_output", "VOutput")) if model.get("Weight") else (("input0", "Input"), ("q_weight", "QWeight"), ("k_weight", "KWeight"), ("v_weight", "VWeight"), ("q_bias", "QBias"), ("k_bias", "KBias"), ("v_bias", "VBias"), ("q_output", "QOutput"), ("k_output", "KOutput"), ("v_output", "VOutput")) %}
+{% for name, key in named_pointers %}
     {{ name }} = {{ ptr(model, key) }}
 {% endfor %}
 {% if packed %}
@@ -29,7 +30,7 @@
 {{ projection_base }}    acc = tl.zeros(({{ ctx["block_m"] }}, {{ ctx["block_n"] }}), tl.float32)
 {{ projection_base }}    for k_start in tl.range(0, {{ dim(ctx["k"]) }}, {{ ctx["block_k"] }}):
 {{ projection_base }}        offs_k = k_start + tl.arange(0, {{ ctx["block_k"] }})
-{{ projection_base }}        weight_values = tl.reshape(tl.load({{ access_pointer(model, projection["prefix"] ~ "Weight", projection["lower"] ~ "_weight", projection["weight_access"]) }}, mask={{ projection["weight_mask"] }}, other=0.0), {{ projection["weight_matrix_shape"] }})
+{{ projection_base }}        weight_values = tl.reshape(tl.load({{ access_pointer(model, projection["weight_key"], projection["weight_variable"], projection["weight_access"]) }}, mask={{ projection["weight_mask"] }}, other=0.0), {{ projection["weight_matrix_shape"] }})
 {{ projection_base }}        input_values = tl.load({{ access_pointer(model, "Input", "input0", projection["input_access"]) }}, mask={{ projection["input_mask"] }}, other=0.0)
 {{ projection_base }}        acc += tl.dot(input_values, weight_values{{ ctx["dot_precision"] }})
 {% if projection["has_bias"] %}

@@ -30,7 +30,7 @@
 {% import "triton/kernels/_common.py.jinja" as common with context %}
 {% set ctx = packed_qkv_gemv_pipeline_context(model) %}
 # generated from PyNTT algorithm triton.qkv_parallel_linear/simt_fma_smem_pipeline
-# {{ model["Comment"] }}; input_dtype={{ model["InputDType"] }}, weight_dtype={{ model["WeightDType"] }}, output_dtype={{ model["OutputDType"] }}, input_shape={{ shape_tuple(model["InputShape"]) }}, q_weight_shape={{ shape_tuple(model["QWeightShape"]) }}, k_weight_shape={{ shape_tuple(model["KWeightShape"]) }}, v_weight_shape={{ shape_tuple(model["VWeightShape"]) }}, q_output_shape={{ shape_tuple(model["QOutputShape"]) }}, k_output_shape={{ shape_tuple(model["KOutputShape"]) }}, v_output_shape={{ shape_tuple(model["VOutputShape"]) }}, rhs_layout={{ model["RhsLayout"] }}, n_lane={{ model["NVectorLaneCount"] }}, k_pack={{ model["KPackLaneCount"] }}, k_lane={{ model["KVectorLaneCount"] }}, block_n={{ ctx["block_n"] }}, block_k={{ ctx["block_k"] }}, num_stages={{ ctx["num_stages"] }}
+# {{ model["Comment"] }}; input_dtype={{ model["InputDType"] }}, weight_dtype={{ model["WeightDType"] }}, output_dtype={{ model["OutputDType"] }}, input_shape={{ shape_tuple(model["InputShape"]) }}, weight_shape={{ shape_tuple(model["WeightShape"]) }}, projection_n_capacities={{ model["ProjectionNCapacities"] }}, q_output_shape={{ shape_tuple(model["QOutputShape"]) }}, k_output_shape={{ shape_tuple(model["KOutputShape"]) }}, v_output_shape={{ shape_tuple(model["VOutputShape"]) }}, rhs_layout={{ model["RhsLayout"] }}, n_lane={{ model["NVectorLaneCount"] }}, k_pack={{ model["KPackLaneCount"] }}, k_lane={{ model["KVectorLaneCount"] }}, block_n={{ ctx["block_n"] }}, block_k={{ ctx["block_k"] }}, num_stages={{ ctx["num_stages"] }}
 {{ ctx["consumer_weight_layout_name"] }} = tl.constexpr(
     tle.gpu.BlockEncoding(
         [{{ ctx["consumer_size_per_thread"] | join(", ") }}],
@@ -56,15 +56,13 @@
 {{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
 def {{ model["FunctionName"] }}__producer(writer, {{ helper_parameters(model) }}):
 {{ common.mesh_coordinates(model["MeshAxes"]) }}
-{% for projection in ctx["projections"] %}
-    {{ projection["lower"] }}_descriptor_entry = tle.gpu.tensor_map_table_entry(
-        {{ projection["descriptor_name"] }},
+    weight_descriptor_entry = tle.gpu.tensor_map_table_entry(
+        {{ ctx["descriptor_name"] }},
         shard_index,
     )
     tle.gpu.tensor_map_fenceproxy_acquire(
-        {{ projection["lower"] }}_descriptor_entry
+        weight_descriptor_entry
     )
-{% endfor %}
     for n_tile in tl.static_range(
         0,
         {{ ctx["num_n_tiles"] }},
@@ -74,33 +72,20 @@ def {{ model["FunctionName"] }}__producer(writer, {{ helper_parameters(model) }}
                 n_tile * {{ ctx["num_k_tiles"] }} + k_tile
             ).to(tl.int32)
             slot = writer.acquire(sequence)
-{% for tile in ctx["transfer_tiles"] %}
-            {{ "if" if loop.first else "elif" }} n_tile == {{ tile["tile_index"] }}:
-{% for copy in tile["copies"] %}
-{% if copy["copy_is_full_stage"] %}
-                copy_destination = slot.weight
-{% else %}
-                copy_destination = slot.weight.subslice(
-                    [{{ copy["destination_offsets"] | join(", ") }}],
-                    [{{ copy["copy_shape"] | join(", ") }}],
-                )
-{% endif %}
-                {{ copy["lower"] }}_descriptor = tle.gpu.reinterpret_tensor_map(
-                    {{ copy["lower"] }}_descriptor_entry,
-                    copy_destination,
-                )
-                tle.gpu.copy(
-                    {{ copy["lower"] }}_descriptor,
-                    copy_destination,
-                    [{{ copy["copy_shape"] | join(", ") }}],
-                    offsets=[
-{% for offset in copy["descriptor_offsets"] %}
-                        {{ tma_offset(offset) }},
+            weight_descriptor = tle.gpu.reinterpret_tensor_map(
+                weight_descriptor_entry,
+                slot.weight,
+            )
+            tle.gpu.copy(
+                weight_descriptor,
+                slot.weight,
+                [{{ ctx["shared_stage_shape"] | join(", ") }}],
+                offsets=[
+{% for offset in ctx["descriptor_offsets"] %}
+                    {{ tma_offset(offset) }},
 {% endfor %}
-                    ],
-                )
-{% endfor %}
-{% endfor %}
+                ],
+            )
             writer.commit(sequence)
     writer.close({{ ctx["num_n_tiles"] * ctx["num_k_tiles"] }})
 

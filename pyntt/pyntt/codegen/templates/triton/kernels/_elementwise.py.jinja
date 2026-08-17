@@ -1,14 +1,19 @@
-{% macro iterate(ctx, base_depth=0, scope="elementwise") %}
-{% if "physical_tile_width_cap" in ctx %}
+{% macro iterate(ctx, base_depth=0, scope="elementwise", physical_width_divisor="1") %}
+{% if physical_width_divisor == "1" %}
 {% if ctx["lane_count"] == 1 %}
-{{ "    " * (base_depth + 1) }}{{ scope }}_physical_tile_width: tl.constexpr = min(block_size, {{ ctx["physical_tile_width_cap"] }})
+{% set physical_width = "block_size" %}
 {% else %}
-{{ "    " * (base_depth + 1) }}{{ scope }}_physical_tile_width: tl.constexpr = min(block_size // {{ ctx["lane_count"] }}, {{ ctx["physical_tile_width_cap"] }})
+{% set physical_width = "max(1, block_size // " ~ ctx["lane_count"] ~ ")" %}
 {% endif %}
 {% elif ctx["lane_count"] == 1 %}
-{{ "    " * (base_depth + 1) }}{{ scope }}_physical_tile_width: tl.constexpr = block_size
+{% set physical_width = "max(1, block_size // " ~ physical_width_divisor ~ ")" %}
 {% else %}
-{{ "    " * (base_depth + 1) }}{{ scope }}_physical_tile_width: tl.constexpr = block_size // {{ ctx["lane_count"] }}
+{% set physical_width = "max(1, block_size // (" ~ physical_width_divisor ~ " * " ~ ctx["lane_count"] ~ "))" %}
+{% endif %}
+{% if "physical_tile_width_cap" in ctx %}
+{{ "    " * (base_depth + 1) }}{{ scope }}_physical_tile_width: tl.constexpr = min({{ physical_width }}, {{ ctx["physical_tile_width_cap"] }})
+{% else %}
+{{ "    " * (base_depth + 1) }}{{ scope }}_physical_tile_width: tl.constexpr = {{ physical_width }}
 {% endif %}
 {% for axis in ctx["loop_axes"] %}
 {{ "    " * (base_depth + loop.index) }}for {{ ctx["index_variables"][axis] }} in tl.range(0, {{ dim(ctx["tensor_shape"][axis]) }}):

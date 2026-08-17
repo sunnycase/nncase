@@ -307,6 +307,45 @@ public static class T
         return buffer;
     }
 
+    /// <summary>
+    /// Creates chip-local storage containing one compact local component for
+    /// every owner in a distributed placement.
+    /// </summary>
+    public static Buffer CreateCompactPerOwnerBuffer(
+        DistributedType distributedType,
+        out Buffer buffer,
+        [CallerArgumentExpression("buffer")] string name = "")
+    {
+        if (name.StartsWith("var "))
+        {
+            name = name[4..];
+        }
+
+        var tensorType = distributedType.TensorType;
+        var alignment = tensorType.DType.SizeInBytes;
+        var dimensions = ((RankedShape)tensorType.Shape).Dimensions.ToArray();
+        (var componentSize, var strides) = TensorUtilities.GetTensorMaxSizeAndStridesExpr(
+            tensorType,
+            distributedType);
+        var ownerCount = distributedType.Placement.Hierarchy.Aggregate(
+            1L,
+            (product, extent) => checked(product * extent));
+        var physicalSize = (componentSize * ownerCount).Simplify();
+        var physicalBuffer = new PhysicalBuffer(
+            alignment,
+            physicalSize,
+            MemoryLocation.ChipLocalData);
+        buffer = new Buffer(
+            name,
+            tensorType.DType,
+            new MemSpan(physicalBuffer, Dimension.Zero, componentSize),
+            dimensions,
+            strides,
+            distributedType,
+            distributedStorageKind: DistributedBufferStorageKind.CompactPerOwner);
+        return buffer;
+    }
+
     public static Buffer AttachBuffer(Expr start, TensorType tensorType, MemoryLocation location, int hierarchy, out Buffer buffer, [CallerArgumentExpression("buffer")] string name = "", DistributedType? distributedType = null)
     {
         if (name.StartsWith("var "))
@@ -341,14 +380,25 @@ public static class T
                 : TensorUtilities.GetTensorMaxSizeAndStridesExpr(tensorType, distributedType);
         }
 
-        var physicalBuffer = new PhysicalBuffer(alignment, start, size, location, hierarchy);
         var distributedStorageKind = start is BufferVar bufferParameter
             ? bufferParameter.LayoutAnnotation.DistributedStorageKind ?? DistributedBufferStorageKind.CompactLocal
             : DistributedBufferStorageKind.CompactLocal;
+        if (distributedStorageKind == DistributedBufferStorageKind.CompactPerOwner && distributedType is null)
+        {
+            throw new InvalidOperationException(
+                $"Compact-per-owner buffer {name} requires a DistributedType while attaching storage.");
+        }
+
+        var physicalSize = distributedStorageKind == DistributedBufferStorageKind.CompactPerOwner
+            ? (size * distributedType!.Placement.Hierarchy.Aggregate(
+                1L,
+                (product, extent) => checked(product * extent))).Simplify()
+            : size;
+        var physicalBuffer = new PhysicalBuffer(alignment, start, physicalSize, location, hierarchy);
         buffer = new Buffer(
             name,
             tensorType.DType,
-            new MemSpan(physicalBuffer),
+            new MemSpan(physicalBuffer, Dimension.Zero, size),
             dimensions,
             strides,
             distributedType,

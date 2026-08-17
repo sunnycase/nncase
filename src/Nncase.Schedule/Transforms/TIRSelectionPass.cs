@@ -84,6 +84,52 @@ public abstract class TIRSelectionPass : FunctionPass
         TIRSelectionContext context)
         => selectedExpr;
 
+    /// <summary>
+    /// Applies target-owned physical storage requirements before binding a
+    /// caller-allocated PrimFunction invocation.
+    /// </summary>
+    protected virtual IReadOnlyList<BaseExpr> PrepareCallerAllocatedPrimFunctionArguments(
+        PrimFunction primFunction,
+        IReadOnlyList<BaseExpr> arguments,
+        TIRSelectionContext context)
+        => arguments;
+
+    /// <summary>
+    /// Creates storage for an intermediate tensor result. Targets may override
+    /// this when a distributed value requires a physical representation that is
+    /// not a per-owner slice of the default data arena.
+    /// </summary>
+    protected virtual TIR.Buffer CreateIntermediateBuffer(
+        Expr sourceExpr,
+        IRType type,
+        MemoryLocation defaultLocation,
+        string name)
+    {
+        var tensorType = type switch
+        {
+            DistributedType distributedType => distributedType.TensorType,
+            TensorType value => value,
+            _ => throw new ArgumentException($"Unsupported intermediate buffer type: {type}"),
+        };
+        return T.CreateBuffer(
+            tensorType,
+            defaultLocation,
+            out _,
+            name,
+            type as DistributedType);
+    }
+
+    /// <summary>
+    /// Selects the physical tensor layout carried by a function ABI parameter.
+    /// </summary>
+    protected virtual BufferLayoutAnnotation? GetBufferParameterLayout(
+        IRType type,
+        BufferVarRole role,
+        bool isEntry)
+        => isEntry && IsRuntimeTensorType(type)
+            ? BufferLayoutAnnotation.RuntimeStrided
+            : null;
+
     protected IRType GetArgumentType(BaseExpr argument)
     {
         return argument switch
@@ -92,6 +138,14 @@ public abstract class TIRSelectionPass : FunctionPass
             _ => argument.CheckedType,
         };
     }
+
+    private static bool IsRuntimeTensorType(IRType type)
+        => type switch
+        {
+            TensorType { DType: not (PointerType or ReferenceType), Shape: RankedShape } => true,
+            DistributedType { TensorType: { DType: not (PointerType or ReferenceType), Shape: RankedShape } } => true,
+            _ => false,
+        };
 
     private void RewriteCallersForPrimFunction(
         PrimFunction primFunction,
@@ -191,10 +245,10 @@ public abstract class TIRSelectionPass : FunctionPass
                         return;
                     case BufferVar { Role: BufferVarRole.Input or BufferVarRole.InOut }:
                         return;
-                    case None when physicalBuffer.Location is MemoryLocation.Data or MemoryLocation.Cache ||
-                        (_isEntry && physicalBuffer.Location == MemoryLocation.ChipLocalData):
-                        if (!buffer.MemSpan.Start.Simplify().Equals(Dimension.Zero) ||
-                            !buffer.MemSpan.Size.Simplify().Equals(physicalBuffer.Size.Simplify()))
+                    case None when physicalBuffer.Location is MemoryLocation.Data or
+                        MemoryLocation.Cache or
+                        MemoryLocation.ChipLocalData:
+                        if (!CanPromoteCompleteResultStorage(buffer))
                         {
                             throw new InvalidOperationException(
                                 $"Function {function.Name} result {resultIndex} is a partial view of internal storage. " +
@@ -203,7 +257,14 @@ public abstract class TIRSelectionPass : FunctionPass
 
                         if (!promotedStorages.TryGetValue(physicalBuffer, out var promotedOutput))
                         {
-                            promotedOutput = CreateOutputBufferVar(_selectionPass.GetArgumentType(buffer));
+                            var promotedLayout = _isEntry
+                                ? null
+                                : BufferLayoutAnnotation.ExactStrided(
+                                    buffer.Strides,
+                                    buffer.DistributedStorageKind);
+                            promotedOutput = CreateOutputBufferVar(
+                                _selectionPass.GetArgumentType(buffer),
+                                promotedLayout);
                             promotedStorages.Add(physicalBuffer, promotedOutput);
                             AddOutputParameter(promotedOutput);
                             var outputStorage = physicalBuffer.With(start: promotedOutput, location: MemoryLocation.Output);
@@ -215,6 +276,32 @@ public abstract class TIRSelectionPass : FunctionPass
                         throw new InvalidOperationException(
                             $"Function {function.Name} result {resultIndex} is backed by non-ABI storage {physicalBuffer.Location}/{physicalBuffer.Start.GetType().Name}. Insert an explicit materialization before TIR selection.");
                 }
+            }
+
+            static bool CanPromoteCompleteResultStorage(TIR.Buffer buffer)
+            {
+                if (!buffer.MemSpan.Start.Simplify().Equals(Dimension.Zero))
+                {
+                    return false;
+                }
+
+                var physicalSize = buffer.MemSpan.Buffer.Size.Simplify();
+                var componentSize = buffer.MemSpan.Size.Simplify();
+                if (buffer.DistributedStorageKind != DistributedBufferStorageKind.CompactPerOwner)
+                {
+                    return componentSize.Equals(physicalSize);
+                }
+
+                if (buffer.DistributedType is not { } distributedType ||
+                    buffer.MemSpan.Buffer.Location != MemoryLocation.ChipLocalData)
+                {
+                    return false;
+                }
+
+                var ownerCount = distributedType.Placement.Hierarchy.Aggregate(
+                    1L,
+                    (product, extent) => checked(product * extent));
+                return (componentSize * ownerCount).Simplify().Equals(physicalSize);
             }
         }
 
@@ -409,7 +496,12 @@ public abstract class TIRSelectionPass : FunctionPass
             }
         }
 
-        private static bool TrySelectCallerAllocatedPrimCall(Expr target, IReadOnlyList<BaseExpr> arguments, out Call selectedCall, out BaseExpr output)
+        private bool TrySelectCallerAllocatedPrimCall(
+            Expr target,
+            IReadOnlyList<BaseExpr> arguments,
+            TIRSelectionContext context,
+            out Call selectedCall,
+            out BaseExpr output)
         {
             selectedCall = null!;
             output = null!;
@@ -439,19 +531,30 @@ public abstract class TIRSelectionPass : FunctionPass
                 }
             }
 
-            var normalizedArguments = NormalizePrimFunctionArguments(primFunction, arguments);
+            var preparedArguments = _selectionPass.PrepareCallerAllocatedPrimFunctionArguments(
+                primFunction,
+                arguments,
+                context);
+            if (preparedArguments.Count != arguments.Count)
+            {
+                throw new InvalidOperationException(
+                    $"PrimFunction {primFunction.Name} argument preparation changed arity from " +
+                    $"{arguments.Count} to {preparedArguments.Count}.");
+            }
+
+            var normalizedArguments = NormalizePrimFunctionArguments(primFunction, preparedArguments);
             var resultValues = abi.Results.Select((result, resultIndex) =>
             {
                 var storageIndex = Array.FindIndex(parameters, parameter => ReferenceEquals(parameter, result.Storage));
-                if (storageIndex < 0 || storageIndex >= arguments.Count)
+                if (storageIndex < 0 || storageIndex >= preparedArguments.Count)
                 {
                     throw new InvalidOperationException(
                         $"PrimFunction {primFunction.Name} result {resultIndex} storage {result.Storage.Name} is not bound by the call arguments.");
                 }
 
                 // ABI normalization is local to the callee invocation. Keep the caller-visible
-                // result attached to the original logical storage supplied by the caller.
-                var storage = arguments[storageIndex];
+                // result attached to the prepared logical storage supplied by the caller.
+                var storage = preparedArguments[storageIndex];
                 return result.Value switch
                 {
                     BufferVar => storage,
@@ -575,9 +678,10 @@ public abstract class TIRSelectionPass : FunctionPass
                             parameter.CheckedType,
                             BufferVarRole.Input,
                             MemoryLocation.Input,
-                            _isEntry && IsRuntimeTensorType(parameter.CheckedType)
-                                ? BufferLayoutAnnotation.RuntimeStrided
-                                : null);
+                            _selectionPass.GetBufferParameterLayout(
+                                parameter.CheckedType,
+                                BufferVarRole.Input,
+                                _isEntry));
                     var buffer = T.AttachBuffer(bufferVar, tensorType, MemoryLocation.Input, 0, out _, $"{parameter.Name}_input", distributedType);
                     ExprMemo[(BaseExpr)parameter] = buffer;
                     _selectionContext.RegisterSelectedValue((BaseExpr)parameter, buffer);
@@ -600,7 +704,12 @@ public abstract class TIRSelectionPass : FunctionPass
             {
                 return tuple[index.Value];
             }
-            else if (TrySelectCallerAllocatedPrimCall(call.Target, arguments, out var callerAllocatedCall, out var callerAllocatedOutput))
+            else if (TrySelectCallerAllocatedPrimCall(
+                         call.Target,
+                         arguments,
+                         _selectionContext,
+                         out var callerAllocatedCall,
+                         out var callerAllocatedOutput))
             {
                 _body.Add(callerAllocatedCall);
                 return callerAllocatedOutput;
@@ -635,12 +744,12 @@ public abstract class TIRSelectionPass : FunctionPass
 
             if (expr.CheckedType is TupleType tt)
             {
-                var fields = tt.Fields.AsValueEnumerable().Select(x => CreateBuffer(x, memoryLocation)).ToArray();
+                var fields = tt.Fields.AsValueEnumerable().Select(x => CreateBuffer(expr, x, memoryLocation)).ToArray();
                 return new IR.Tuple(fields);
             }
             else
             {
-                return CreateBuffer(expr.CheckedType, memoryLocation);
+                return CreateBuffer(expr, expr.CheckedType, memoryLocation);
             }
         }
 
@@ -651,37 +760,42 @@ public abstract class TIRSelectionPass : FunctionPass
                 return new IR.Tuple(tupleType.Fields.AsValueEnumerable().Select(CreateOutputBuffer).ToArray());
             }
 
-            return CreateOutputBufferVar(type);
+            var outputParameter = CreateOutputBufferVar(type);
+            if (!TryGetTensorType(type, out var tensorType, out var distributedType))
+            {
+                return outputParameter;
+            }
+
+            return T.AttachBuffer(
+                outputParameter,
+                tensorType,
+                MemoryLocation.Output,
+                0,
+                out _,
+                $"{outputParameter.Name}_view",
+                distributedType);
         }
 
-        private BufferVar CreateOutputBufferVar(IRType type)
-            => new(
+        private BufferVar CreateOutputBufferVar(
+            IRType type,
+            BufferLayoutAnnotation? layoutAnnotation = null)
+        {
+            var layout = layoutAnnotation ??
+                _selectionPass.GetBufferParameterLayout(type, BufferVarRole.Output, _isEntry);
+            return new BufferVar(
                 $"out_{_bufferIndex++}",
                 type,
                 BufferVarRole.Output,
                 MemoryLocation.Output,
-                _isEntry && IsRuntimeTensorType(type)
-                    ? BufferLayoutAnnotation.RuntimeStrided
-                    : null);
-
-        private static bool IsRuntimeTensorType(IRType type)
-            => type switch
-            {
-                TensorType { DType: not (PointerType or ReferenceType), Shape: RankedShape } => true,
-                DistributedType { TensorType: { DType: not (PointerType or ReferenceType), Shape: RankedShape } } => true,
-                _ => false,
-            };
-
-        private TIR.Buffer CreateBuffer(IRType type, MemoryLocation memoryLocation)
-        {
-            var tensorType = type switch
-            {
-                DistributedType dt => dt.TensorType,
-                TensorType tt => tt,
-                _ => throw new ArgumentException($"Unsupported type: {type}"),
-            };
-            return T.CreateBuffer(tensorType, memoryLocation, out _, $"buffer_{_bufferIndex++}", type as DistributedType);
+                layout);
         }
+
+        private TIR.Buffer CreateBuffer(Expr sourceExpr, IRType type, MemoryLocation memoryLocation)
+            => _selectionPass.CreateIntermediateBuffer(
+                sourceExpr,
+                type,
+                memoryLocation,
+                $"buffer_{_bufferIndex++}");
     }
 }
 

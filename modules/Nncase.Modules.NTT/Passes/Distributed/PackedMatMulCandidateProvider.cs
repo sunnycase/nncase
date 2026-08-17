@@ -11,39 +11,9 @@ using Nncase.Utilities;
 
 namespace Nncase.Passes.Distributed;
 
-/// <summary>
-/// Propagates an exact lhs reduction-axis layout to the packed RHS reduction
-/// axis, including ordered multi-stage split policies.
-/// </summary>
-internal sealed class PackedMatMulCandidateProvider :
-    DistributedCandidateProvider<PackedMatMul>
+internal static class PackedMatMulDistributedCandidates
 {
-    public override IReadOnlyList<IRType> GetReturnCandidateTypes(
-        DistributedCandidateContext context,
-        PackedMatMul target,
-        IReadOnlyList<IRType> defaultReturnTypes)
-        => defaultReturnTypes
-            .Concat(EnumerateCandidates(context, target).Select(candidate => candidate.OutputType))
-            .Distinct()
-            .ToArray();
-
-    public override bool TryGetInputTypeTuples(
-        DistributedCandidateContext context,
-        PackedMatMul target,
-        IRType returnType,
-        out IReadOnlyList<DistributedCandidateTuple> tuples)
-    {
-        tuples = EnumerateCandidates(context, target)
-            .Where(candidate => candidate.OutputType == returnType)
-            .Select(candidate => new DistributedCandidateTuple(
-                [candidate.Lhs, candidate.Rhs, candidate.Scale, candidate.Addend],
-                "packed-matmul-reduction-sbp"))
-            .Distinct()
-            .ToArray();
-        return true;
-    }
-
-    private static IEnumerable<Candidate> EnumerateCandidates(
+    public static IEnumerable<PackedMatMulDistributedCandidate> Enumerate(
         DistributedCandidateContext context,
         PackedMatMul target)
     {
@@ -52,6 +22,8 @@ internal sealed class PackedMatMulCandidateProvider :
             yield break;
         }
 
+        var hasAddend = context.AvailableInputTypes[PackedMatMul.Addend.Index]
+            .Any(type => type is not NoneType);
         foreach (var lhs in context.AvailableInputTypes[PackedMatMul.Lhs.Index]
                      .OfType<DistributedType>()
                      .Where(type => type.Partial is null))
@@ -67,18 +39,33 @@ internal sealed class PackedMatMulCandidateProvider :
 
                 foreach (var scale in context.AvailableInputTypes[PackedMatMul.Scale.Index])
                 {
-                    foreach (var addend in context.AvailableInputTypes[PackedMatMul.Addend.Index])
+                    var outputType = PackedMatMulEvaluator.InferType(
+                        target,
+                        lhs,
+                        alignedRhs,
+                        scale,
+                        NoneType.Default);
+                    if (outputType is InvalidType ||
+                        (hasAddend && outputType is DistributedType { Partial: not null }))
                     {
-                        var outputType = PackedMatMulEvaluator.InferType(
-                            target,
+                        continue;
+                    }
+
+                    var addend = hasAddend ? outputType : NoneType.Default;
+                    var finalOutputType = PackedMatMulEvaluator.InferType(
+                        target,
+                        lhs,
+                        alignedRhs,
+                        scale,
+                        addend);
+                    if (finalOutputType is not InvalidType)
+                    {
+                        yield return new PackedMatMulDistributedCandidate(
                             lhs,
                             alignedRhs,
                             scale,
-                            addend);
-                        if (outputType is not InvalidType)
-                        {
-                            yield return new Candidate(lhs, alignedRhs, scale, addend, outputType);
-                        }
+                            addend,
+                            finalOutputType);
                     }
                 }
             }
@@ -138,11 +125,100 @@ internal sealed class PackedMatMulCandidateProvider :
         alignedRhs = packedRhs;
         return true;
     }
-
-    private sealed record Candidate(
-        IRType Lhs,
-        IRType Rhs,
-        IRType Scale,
-        IRType Addend,
-        IRType OutputType);
 }
+
+/// <summary>
+/// Propagates an exact lhs reduction-axis layout to the packed RHS reduction
+/// axis, including ordered multi-stage split policies.
+/// </summary>
+internal sealed class PackedMatMulCandidateProvider :
+    DistributedCandidateProvider<PackedMatMul>
+{
+    public override IReadOnlyList<IRType> GetReturnCandidateTypes(
+        DistributedCandidateContext context,
+        PackedMatMul target,
+        IReadOnlyList<IRType> defaultReturnTypes)
+        => defaultReturnTypes
+            .Concat(PackedMatMulDistributedCandidates.Enumerate(context, target).Select(candidate => candidate.OutputType))
+            .Distinct()
+            .ToArray();
+
+    public override bool TryGetInputTypeTuples(
+        DistributedCandidateContext context,
+        PackedMatMul target,
+        IRType returnType,
+        out IReadOnlyList<DistributedCandidateTuple> tuples)
+    {
+        tuples = PackedMatMulDistributedCandidates.Enumerate(context, target)
+            .Where(candidate => candidate.OutputType == returnType)
+            .Select(candidate => new DistributedCandidateTuple(
+                [candidate.Lhs, candidate.Rhs, candidate.Scale, candidate.Addend],
+                "packed-matmul-reduction-sbp"))
+            .Distinct()
+            .ToArray();
+        return true;
+    }
+}
+
+/// <summary>
+/// Propagates packed-matmul layouts while preserving the coupled value and
+/// normalization-statistics return types.
+/// </summary>
+internal sealed class PackedMatMulNormStatsCandidateProvider :
+    DistributedCandidateProvider<PackedMatMulNormStats>
+{
+    public override IReadOnlyList<IRType> GetReturnCandidateTypes(
+        DistributedCandidateContext context,
+        PackedMatMulNormStats target,
+        IReadOnlyList<IRType> defaultReturnTypes)
+        => defaultReturnTypes
+            .Concat(EnumerateCandidates(context, target).Select(candidate => candidate.OutputType))
+            .Distinct()
+            .ToArray();
+
+    public override bool TryGetInputTypeTuples(
+        DistributedCandidateContext context,
+        PackedMatMulNormStats target,
+        IRType returnType,
+        out IReadOnlyList<DistributedCandidateTuple> tuples)
+    {
+        tuples = EnumerateCandidates(context, target)
+            .Where(candidate => candidate.OutputType == returnType)
+            .Select(candidate => new DistributedCandidateTuple(
+                [candidate.Lhs, candidate.Rhs, candidate.Scale, candidate.Addend],
+                "packed-matmul-norm-stats-reduction-sbp"))
+            .Distinct()
+            .ToArray();
+        return true;
+    }
+
+    private static IEnumerable<PackedMatMulDistributedCandidate> EnumerateCandidates(
+        DistributedCandidateContext context,
+        PackedMatMulNormStats target)
+    {
+        var packedTarget = new PackedMatMul(
+            target.OutputDataType,
+            false,
+            target.RhsLayout);
+        foreach (var candidate in PackedMatMulDistributedCandidates.Enumerate(context, packedTarget))
+        {
+            var outputType = PackedMatMulNormStatsEvaluator.InferType(
+                target,
+                candidate.Lhs,
+                candidate.Rhs,
+                candidate.Scale,
+                candidate.Addend);
+            if (outputType is not InvalidType)
+            {
+                yield return candidate with { OutputType = outputType };
+            }
+        }
+    }
+}
+
+internal sealed record PackedMatMulDistributedCandidate(
+    IRType Lhs,
+    IRType Rhs,
+    IRType Scale,
+    IRType Addend,
+    IRType OutputType);

@@ -86,6 +86,7 @@ public sealed class SchedFunctionResult
         Rdatas = new(ReferenceEqualityComparer.Instance);
         ChipLocalRdatas = new(ReferenceEqualityComparer.Instance);
         BlockLocalRdatas = new(ReferenceEqualityComparer.Instance);
+        BlockLocalRDataMaterializations = new(ReferenceEqualityComparer.Instance);
         DataUsage = 0;
         ChipLocalDataPoolSize = 0;
         BlockLocalDataPoolSize = 0;
@@ -107,6 +108,12 @@ public sealed class SchedFunctionResult
     /// Gets the buffer allocation.
     /// </summary>
     public Dictionary<IR.Const, ValueRange<ulong>> BlockLocalRdatas { get; }
+
+    /// <summary>
+    /// Gets compiler-owned recipes for derived block-local readonly data,
+    /// keyed by the placeholder constant used by the physical allocation.
+    /// </summary>
+    public Dictionary<IR.Const, TIR.BlockLocalRDataMaterialization> BlockLocalRDataMaterializations { get; }
 
     /// <summary>
     /// Gets or sets the data section length.
@@ -162,7 +169,8 @@ public sealed class SchedFunctionResult
 
         if (Rdatas.Count != result.Rdatas.Count ||
             ChipLocalRdatas.Count != result.ChipLocalRdatas.Count ||
-            BlockLocalRdatas.Count != result.BlockLocalRdatas.Count)
+            BlockLocalRdatas.Count != result.BlockLocalRdatas.Count ||
+            BlockLocalRDataMaterializations.Count != result.BlockLocalRDataMaterializations.Count)
         {
             return false;
         }
@@ -170,6 +178,7 @@ public sealed class SchedFunctionResult
         return EqualityComparer<Dictionary<IR.Const, ValueRange<ulong>>>.Default.Equals(Rdatas, result.Rdatas) &&
                 EqualityComparer<Dictionary<IR.Const, ValueRange<ulong>>>.Default.Equals(ChipLocalRdatas, result.ChipLocalRdatas) &&
                 EqualityComparer<Dictionary<IR.Const, ValueRange<ulong>>>.Default.Equals(BlockLocalRdatas, result.BlockLocalRdatas) &&
+                EqualityComparer<Dictionary<IR.Const, TIR.BlockLocalRDataMaterialization>>.Default.Equals(BlockLocalRDataMaterializations, result.BlockLocalRDataMaterializations) &&
                 EqualityComparer<ulong>.Default.Equals(DataUsage, result.DataUsage) &&
                 EqualityComparer<ulong>.Default.Equals(ChipLocalDataPoolSize, result.ChipLocalDataPoolSize) &&
                 EqualityComparer<ulong>.Default.Equals(BlockLocalDataPoolSize, result.BlockLocalDataPoolSize) &&

@@ -323,7 +323,16 @@ public sealed class UnitTestInlineSingleCallPrimFunctionsPass : TestClassBase
     {
         var rdata = new TensorConst(Tensor.FromScalar(1.0f));
         var chipLocalRdata = new TensorConst(Tensor.FromScalar(2.0f));
-        var blockLocalRdata = new TensorConst(Tensor.FromScalar(3.0f));
+        var blockLocalRdata = new TensorConst(Tensor.From<float>([0.0f, 0.0f], [2]));
+        var source0 = new TensorConst(Tensor.From<float>([3.0f], [1]));
+        var source1 = new TensorConst(Tensor.From<float>([4.0f], [1]));
+        var placement = new Placement([1], "b", "b");
+        var source0Type = new DistributedType(source0.CheckedTensorType, new SBP[] { SBP.B }, placement);
+        var source1Type = new DistributedType(source1.CheckedTensorType, new SBP[] { SBP.B }, placement);
+        var materialization = new ConcatenatedDistributedTensorRDataMaterialization(
+            blockLocalRdata.CheckedTensorType,
+            [new(source0, source0Type), new(source1, source1Type)],
+            axis: 0);
         var source = MakeStridedBuffer("source", stride: 1);
         var callee = new PrimFunction(
             "callee",
@@ -332,7 +341,8 @@ public sealed class UnitTestInlineSingleCallPrimFunctionsPass : TestClassBase
             System.Array.Empty<IVar>());
         callee.SchedResult.Rdatas.Add(rdata, new(0, 4));
         callee.SchedResult.ChipLocalRdatas.Add(chipLocalRdata, new(16, 20));
-        callee.SchedResult.BlockLocalRdatas.Add(blockLocalRdata, new(32, 36));
+        callee.SchedResult.BlockLocalRdatas.Add(blockLocalRdata, new(32, 40));
+        callee.SchedResult.BlockLocalRDataMaterializations.Add(blockLocalRdata, materialization);
         var caller = new PrimFunction(
             "caller",
             ModuleKind,
@@ -346,7 +356,8 @@ public sealed class UnitTestInlineSingleCallPrimFunctionsPass : TestClassBase
         Assert.Single(module.Functions);
         Assert.Equal(new ValueRange<ulong>(0, 4), caller.SchedResult.Rdatas[rdata]);
         Assert.Equal(new ValueRange<ulong>(16, 20), caller.SchedResult.ChipLocalRdatas[chipLocalRdata]);
-        Assert.Equal(new ValueRange<ulong>(32, 36), caller.SchedResult.BlockLocalRdatas[blockLocalRdata]);
+        Assert.Equal(new ValueRange<ulong>(32, 40), caller.SchedResult.BlockLocalRdatas[blockLocalRdata]);
+        Assert.Same(materialization, caller.SchedResult.BlockLocalRDataMaterializations[blockLocalRdata]);
     }
 
     [Fact]

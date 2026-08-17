@@ -223,6 +223,65 @@ public sealed class UnitTestTransferPipelineRegions : TestClassBase
     }
 
     [Fact]
+    public async Task TestInternallyReleasedNestedTransferSourceDoesNotBlockCallerProducer()
+    {
+        var tensorType = new TensorType(DataTypes.Float32, new[] { 64 });
+        var formalSource = new BufferVar(
+            "formal_source",
+            tensorType,
+            BufferVarRole.Input,
+            MemoryLocation.Data);
+        var formalUpdate = new BufferVar(
+            "formal_update",
+            tensorType,
+            BufferVarRole.Input,
+            MemoryLocation.Data);
+        var formalShared = new BufferVar(
+            "formal_shared",
+            TensorType.Scalar(new PointerType(DataTypes.UInt8)),
+            BufferVarRole.Workspace,
+            MemoryLocation.Shared);
+        var calleeShared = CreateBuffer("callee_shared", MemoryLocation.Shared, 0);
+        var calleeBarrier = TIR.F.NTT.Barrier(TIR.NTT.BarrierScope.Block);
+        var callee = new PrimFunction(
+            "pipeline_callee",
+            PyNTTTarget.Kind,
+            new Sequential(
+                T.Memcopy(formalSource, formalUpdate),
+                calleeBarrier,
+                CreateTransferPipelineCall(formalSource, calleeShared)),
+            new IVar[] { formalSource, formalUpdate, formalShared });
+        var source = CreateBuffer("source", MemoryLocation.Data, 4096);
+        var callerUpdate = CreateBuffer("caller_update", MemoryLocation.Data, 8192);
+        var calleeUpdate = CreateBuffer("callee_update", MemoryLocation.Data, 12288);
+        var shared = CreateBuffer("shared", MemoryLocation.Shared, 0);
+        var callerBarrier = TIR.F.NTT.Barrier(TIR.NTT.BarrierScope.Block);
+        var main = new PrimFunction(
+            "main",
+            PyNTTTarget.Kind,
+            new Sequential(
+                T.Memcopy(source, callerUpdate),
+                callerBarrier,
+                new Call(callee, source, calleeUpdate, shared)),
+            Array.Empty<IVar>());
+        var module = new IRModule(main);
+        module.Add(callee);
+
+        await RunPass(module);
+
+        var rewrittenMain = Assert.IsType<PrimFunction>(module.Entry);
+        var rewrittenCallee = Assert.IsType<PrimFunction>(
+            module.Functions.Single(function => function.Name == callee.Name));
+        Assert.Empty(ExprCollector.Collect(GetRegion(rewrittenMain)).OfType<PipelineHandoff>());
+        var calleeRegion = GetRegion(rewrittenCallee);
+        var consumerHandoff = Assert.Single(
+            calleeRegion.ConsumeBody.Fields.ToArray().OfType<PipelineHandoff>());
+        var producerHandoff = Assert.Single(
+            calleeRegion.ProduceBody.Fields.ToArray().OfType<PipelineHandoff>());
+        Assert.Equal(consumerHandoff.HandoffId, producerHandoff.HandoffId);
+    }
+
+    [Fact]
     public async Task TestStructuredOrdinarySharedOwnerHandsStorageToProducer()
     {
         var source = CreateBuffer("source", MemoryLocation.Data, 4096);
@@ -382,23 +441,67 @@ public sealed class UnitTestTransferPipelineRegions : TestClassBase
         var rewrittenMain = Assert.IsType<PrimFunction>(module.Entry);
         var rewrittenCallee = Assert.IsType<PrimFunction>(
             module.Functions.Single(function => function.Name == callee.Name));
+        var callerRegion = GetRegion(rewrittenMain);
         var calleeRegion = GetRegion(rewrittenCallee);
-        var callerRegions = rewrittenMain.Body.Fields.ToArray()
-            .OfType<ProducerConsumerRegion>()
+        var callerStages = callerRegion.ConsumeBody.Fields.ToArray()
+            .OfType<PipelineStage>()
             .ToArray();
-        Assert.Equal(2, callerRegions.Length);
-        var callerStages = callerRegions
-            .Select(region => Assert.Single(
-                region.ConsumeBody.Fields.ToArray().OfType<PipelineStage>()))
-            .ToArray();
+        Assert.Equal(2, callerStages.Length);
         Assert.Single(calleeRegion.ConsumeBody.Fields.ToArray().OfType<PipelineStage>());
-        Assert.All(
-            callerRegions,
-            region => Assert.Empty(
-                ExprCollector.Collect(region).OfType<PipelineDrain>()));
+        Assert.Equal(
+            [callerStages[0].StageId],
+            callerRegion.ConsumeBody.Fields.ToArray()
+                .OfType<PipelineDrain>()
+                .Select(drain => drain.StageId));
+        Assert.Equal(
+            [callerStages[0].StageId],
+            callerRegion.ProduceBody.Fields.ToArray()
+                .OfType<PipelineDrain>()
+                .Select(drain => drain.StageId));
         Assert.All(
             callerStages,
             stage => Assert.Same(rewrittenCallee, stage.Operation.Target));
+    }
+
+    [Fact]
+    public async Task TestRepeatedPipelineCalleeWithDisjointCallerStorageDoesNotDrain()
+    {
+        var tensorType = new TensorType(DataTypes.Float32, new[] { 64 });
+        var formalShared = new BufferVar(
+            "formal_shared",
+            TensorType.Scalar(new PointerType(DataTypes.UInt8)),
+            BufferVarRole.Workspace,
+            MemoryLocation.Shared);
+        var formalSource = new BufferVar(
+            "formal_source",
+            tensorType,
+            BufferVarRole.Input,
+            MemoryLocation.Data);
+        var calleeShared = CreateBuffer("callee_shared", MemoryLocation.Shared, 0);
+        var callee = new PrimFunction(
+            "pipeline_callee",
+            PyNTTTarget.Kind,
+            new Sequential(CreateTransferPipelineCall(formalSource, calleeShared)),
+            new IVar[] { formalSource, formalShared });
+        var firstShared = CreateBuffer("first_shared", MemoryLocation.Shared, 0);
+        var secondShared = CreateBuffer("second_shared", MemoryLocation.Shared, 512);
+        var source = CreateBuffer("source", MemoryLocation.Data, 4096);
+        var main = new PrimFunction(
+            "main",
+            PyNTTTarget.Kind,
+            new Sequential(
+                new Call(callee, source, firstShared),
+                new Call(callee, source, secondShared)),
+            Array.Empty<IVar>());
+        var module = new IRModule(main);
+        module.Add(callee);
+
+        await RunPass(module);
+
+        var region = GetRegion(Assert.IsType<PrimFunction>(module.Entry));
+        Assert.Equal(2, region.ConsumeBody.Fields.ToArray().OfType<PipelineStage>().Count());
+        Assert.Empty(ExprCollector.Collect(region).OfType<PipelineDrain>());
+        Assert.Empty(ExprCollector.Collect(region).OfType<PipelineHandoff>());
     }
 
     private static Task<IRModule> RunPass(IRModule module)

@@ -11,11 +11,20 @@
 {% if model["HasAddend"] %}
     addend = {{ ptr(model, "Addend") }}
 {% endif %}
+{% if model["HasNormStats"] %}
+    stats = {{ ptr(model, "Stats") }}
+{% endif %}
 {% for axis in ctx["batch_axes"] %}
 {{ "    " * loop.index }}for idx{{ axis }} in tl.range(0, {{ dim(ctx["logical_output_shape"][axis]) }}):
 {% endfor %}
 {% set base = "    " * ((ctx["batch_axes"] | length) + 1) %}
 {{ base }}for m_idx in tl.range(0, {{ dim(ctx["m"]) }}):
+{% if model["HasNormStats"] %}
+{% if model["UseMean"] %}
+{{ base }}    stats_sum = 0.0
+{% endif %}
+{{ base }}    stats_square_sum = 0.0
+{% endif %}
 {{ base }}    for n_start in tl.range(0, {{ dim(ctx["physical_n"]) }}, {{ ctx["physical_block_n"] }}):
 {{ common.structured_axis(ctx["rhs_n_axis"], base ~ "        ") }}
 {{ common.structured_axis(ctx["output_n_axis"], base ~ "        ") }}
@@ -43,6 +52,23 @@
 {{ base }}        result = addend_value + result
 {% endif %}
 {{ base }}        tl.store({{ access_pointer(model, "Output", "output", ctx["output_access"]) }}, tl.reshape(result, {{ ctx["output_structured_shape"] }}), mask={{ ctx["output_mask"] }})
+{% if model["HasNormStats"] %}
+{{ base }}        stats_value = result.to({{ model["OutputTritonDType"] }}).to(tl.float32)
+{{ base }}        stats_mask = tl.reshape({{ ctx["output_mask"] }}, ({{ ctx["block_n"] }},))
+{{ base }}        stats_value = tl.where(stats_mask, stats_value, 0.0)
+{% if model["UseMean"] %}
+{{ base }}        stats_sum += tl.sum(stats_value, axis=None)
+{% endif %}
+{{ base }}        stats_square_sum += tl.sum(stats_value * stats_value, axis=None)
+{% endif %}
+{% if model["HasNormStats"] %}
+{% if model["UseMean"] %}
+{{ base }}    tl.store({{ access_pointer(model, "Stats", "stats", ctx["stats_accesses"][0]) }}, stats_sum, mask={{ ctx["stats_mask"] }})
+{{ base }}    tl.store({{ access_pointer(model, "Stats", "stats", ctx["stats_accesses"][1]) }}, stats_square_sum, mask={{ ctx["stats_mask"] }})
+{% else %}
+{{ base }}    tl.store({{ access_pointer(model, "Stats", "stats", ctx["stats_accesses"][0]) }}, stats_square_sum, mask={{ ctx["stats_mask"] }})
+{% endif %}
+{% endif %}
 
 
 {{ phases.dispatch(model) }}

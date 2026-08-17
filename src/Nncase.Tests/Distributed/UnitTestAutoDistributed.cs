@@ -113,6 +113,76 @@ public sealed class UnitTestDistribAutoDistributed : TestClassBase
     }
 
     [Fact]
+    public void TestPackedMatMulCandidateProviderRejectsPartialOutputWithFullAddend()
+    {
+        var options = new PyNTTTargetOptions
+        {
+            HierarchyNames = "yx",
+            HierarchyLevels = "bb",
+            Hierarchies = [new[] { 4, 8 }],
+        };
+        CompileOptions.TargetOptions = options;
+        var placement = new Placement([4, 8], "yx", "bb");
+        var lhsTensorType = new TensorType(DataTypes.BFloat16, new long[] { 1, 2048 });
+        var rhsTensorType = new TensorType(
+            new VectorType(DataTypes.BFloat16, [8, 2, 8]),
+            new long[] { 128, 256 });
+        var lhsType = new DistributedType(
+            lhsTensorType,
+            new SBP[] { SBP.B, SBP.SBlockCyclic([1], 256) },
+            placement);
+        var rhsType = new DistributedType(
+            rhsTensorType,
+            new SBP[] { SBP.SBlockCyclic([1], 16), SBP.SBlockCyclic([0], 8) },
+            placement);
+        var partialOutput = Assert.IsType<DistributedType>(PackedMatMulEvaluator.InferType(
+            new PackedMatMul(DataTypes.BFloat16, false, PackedMatMulRhsLayout.KMajor),
+            lhsType,
+            rhsType,
+            NoneType.Default,
+            NoneType.Default));
+        Assert.NotNull(partialOutput.Partial);
+        var fullAddendType = new DistributedType(
+            partialOutput.TensorType,
+            Enumerable.Repeat<SBP>(SBP.B, partialOutput.TensorType.Shape.Rank).ToArray(),
+            placement);
+
+        var lhs = new Var("lhs", lhsTensorType);
+        var rhs = new Var("rhs", rhsTensorType);
+        var output = IR.F.NTT.PackedMatMul(
+            lhs,
+            rhs,
+            outDataType: DataTypes.BFloat16,
+            rhsLayout: PackedMatMulRhsLayout.KMajor);
+        var addend = new Var("addend", output.CheckedType);
+        var sourceCall = Assert.IsType<Call>(IR.F.NTT.PackedMatMul(
+            lhs,
+            rhs,
+            outDataType: DataTypes.BFloat16,
+            rhsLayout: PackedMatMulRhsLayout.KMajor,
+            addend: addend));
+        var context = new DistributedCandidateContext(
+            CompileOptions,
+            options,
+            PyNTTTarget.Kind,
+            sourceCall,
+            [
+                new IRType[] { lhsType },
+                new IRType[] { rhsType },
+                new IRType[] { NoneType.Default },
+                new IRType[] { fullAddendType },
+            ]);
+        var provider = new PackedMatMulCandidateProvider();
+        var target = Assert.IsType<PackedMatMul>(sourceCall.Target);
+
+        var returnTypes = provider.GetReturnCandidateTypes(context, target, []);
+
+        Assert.DoesNotContain(
+            returnTypes,
+            type => type is DistributedType { Partial: not null });
+    }
+
+    [Fact]
     public void TestPagedAttentionPartialCombineDistributionContract()
     {
         var options = new PyNTTTargetOptions();
@@ -597,7 +667,7 @@ public sealed class UnitTestDistribAutoDistributed : TestClassBase
             DistributedReshardRealization.ShardedView,
             Classify(broadcast, exclusiveSplit, DistributedReshardSourceKind.FunctionParameter));
         Assert.Equal(
-            DistributedReshardRealization.Unsupported,
+            DistributedReshardRealization.Boxing,
             Classify(partial, broadcast, DistributedReshardSourceKind.Internal));
         Assert.Equal(
             DistributedReshardRealization.Boxing,
@@ -1359,6 +1429,32 @@ public sealed class UnitTestDistribAutoDistributed : TestClassBase
                         .Any(split => split.HierarchyAxes.SequenceEqual(new[] { 0, 1 }))
                 : output == target;
         }
+    }
+
+    [Fact]
+    public void TestReshardPlannerKeepsDirectAndDecomposedPartialAllReducePlans()
+    {
+        var tensorType = new TensorType(DataTypes.Float32, [32, 64]);
+        var placement = new Placement([4, 8], "yx", "bb");
+        var source = new DistributedType(
+            tensorType,
+            new SBP[] { SBP.B, SBP.B },
+            placement,
+            SBP.P([0, 1]));
+        var target = new DistributedType(
+            tensorType,
+            new SBP[] { SBP.B, SBP.B },
+            placement);
+
+        var plans = DistributedReshardPlanner.Plan(source, target, (_, _) => true);
+
+        Assert.Contains(plans, plan => plan.StepTypes.SequenceEqual(new IRType[] { target }));
+        Assert.Contains(
+            plans,
+            plan => plan.StepTypes.Count == 2 &&
+                plan.StepTypes[0] is DistributedType { Partial: null } intermediate &&
+                intermediate.AxisPolicies.OfType<SBPSplit>().Any() &&
+                plan.StepTypes[1] == target);
     }
 
     [Fact]

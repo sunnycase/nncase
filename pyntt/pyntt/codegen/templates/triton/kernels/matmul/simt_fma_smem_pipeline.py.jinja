@@ -97,6 +97,13 @@ def {{ model["FunctionName"] }}__consumer(reader, {{ helper_parameters(model) }}
 {% if model["HasAddend"] %}
     addend = {{ ptr(model, "Addend") }}
 {% endif %}
+{% if model["HasNormStats"] %}
+    stats = {{ ptr(model, "Stats") }}
+{% if model["UseMean"] %}
+    stats_sum = 0.0
+{% endif %}
+    stats_square_sum = 0.0
+{% endif %}
 {% if model["RematerializeEntryIndices"] %}
     local_n_source = tle.gpu.rematerialize_index(tl.arange(0, {{ ctx["block_n"] }}))
 {% else %}
@@ -216,6 +223,23 @@ def {{ model["FunctionName"] }}__consumer(reader, {{ helper_parameters(model) }}
             result,
             mask={{ ctx["pipeline_output_mask"] }},
         )
+{% if model["HasNormStats"] %}
+        stats_value = result.to({{ model["OutputTritonDType"] }}).to(tl.float32)
+        stats_mask = {{ ctx["pipeline_output_mask"] }}
+        stats_value = tl.where(stats_mask, stats_value, 0.0)
+{% if model["UseMean"] %}
+        stats_sum += tl.sum(stats_value, axis=None)
+{% endif %}
+        stats_square_sum += tl.sum(stats_value * stats_value, axis=None)
+{% endif %}
+{% if model["HasNormStats"] %}
+{% if model["UseMean"] %}
+    tl.store({{ access_pointer(model, "Stats", "stats", ctx["pipeline_stats_accesses"][0]) }}, stats_sum, mask=True)
+    tl.store({{ access_pointer(model, "Stats", "stats", ctx["pipeline_stats_accesses"][1]) }}, stats_square_sum, mask=True)
+{% else %}
+    tl.store({{ access_pointer(model, "Stats", "stats", ctx["pipeline_stats_accesses"][0]) }}, stats_square_sum, mask=True)
+{% endif %}
+{% endif %}
 
 
 {% endif %}

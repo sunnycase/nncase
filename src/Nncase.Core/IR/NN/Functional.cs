@@ -40,6 +40,8 @@ public static class NN
 
     public static Call NormStats(int axis, Expr input, bool useMean) => new Call(new NormStats(axis, useMean), input);
 
+    public static Call BindNormStats(int axis, Expr input, Expr stats, bool useMean) => new Call(new BindNormStats(axis, useMean), input, stats);
+
     public static Call NormApply(int axis, float epsilon, Expr input, Expr stats, Expr scale, Expr bias, bool useMean) => new Call(new NormApply(axis, epsilon, useMean), input, stats, scale, bias);
 
     public static Call QKVRoPEWithCache(

@@ -318,6 +318,7 @@ public class Compiler : ICompiler
             p.Add<Passes.Rules.Neutral.FoldBitcastBitcast>();
         });
 
+        passManager.AddWithName<ThreadNormStatsAcrossFunctionBoundariesPass>("ThreadNormStatsAcrossFunctionBoundaries");
         target.RegisterPostAutoPackingPass(passManager, _compileSession.CompileOptions);
         passManager.Add<RemoveUnusedFunctions>();
         passManager.Add<InferRangePass>();
@@ -353,6 +354,7 @@ public class Compiler : ICompiler
             p.Add<Passes.Rules.Neutral.FoldGetItemTuple>();
             p.Add<FoldBoxingBoxing>();
             p.Add<FoldBoxingUninitialized>();
+            p.Add<Passes.Rules.Neutral.FoldBindNormStats>();
         });
 
         _compileSession.Target.RegisterPostAutoDistributedPass(

@@ -954,6 +954,22 @@ public sealed record PyNTTMatmulTemplateModel(
     public PyNTTDimExpression[] AddendStrides { get; set; } = Array.Empty<PyNTTDimExpression>();
 
     public bool HasAddend => Addend is not null;
+
+    public PyNTTBufferPointerTemplateModel? Stats { get; set; }
+
+    public string StatsDType { get; set; } = "float32";
+
+    public string StatsTritonDType { get; set; } = "tl.float32";
+
+    public PyNTTDimExpression[] StatsShape { get; set; } = Array.Empty<PyNTTDimExpression>();
+
+    public PyNTTDimExpression[] StatsStrides { get; set; } = Array.Empty<PyNTTDimExpression>();
+
+    public int NormAxis { get; set; } = -1;
+
+    public bool UseMean { get; set; }
+
+    public bool HasNormStats => Stats is not null;
 }
 
 public sealed record PyNTTQKVParallelLinearTemplateModel(
@@ -1034,6 +1050,69 @@ public sealed record PyNTTQKVParallelLinearTemplateModel(
     public string? VWeightDescriptorName { get; set; }
 
     public string VWeightDescriptorOriginElements { get; set; } = "0";
+}
+
+public sealed record PyNTTPackedQKVParallelLinearTemplateModel(
+    string FunctionName,
+    PyNTTBufferPointerTemplateModel Input,
+    PyNTTBufferPointerTemplateModel Weight,
+    PyNTTBufferPointerTemplateModel QBias,
+    PyNTTBufferPointerTemplateModel KBias,
+    PyNTTBufferPointerTemplateModel VBias,
+    PyNTTBufferPointerTemplateModel QOutput,
+    PyNTTBufferPointerTemplateModel KOutput,
+    PyNTTBufferPointerTemplateModel VOutput,
+    bool HasQBias,
+    bool HasKBias,
+    bool HasVBias,
+    string InputDType,
+    string WeightDType,
+    string BiasDType,
+    string OutputDType,
+    string InputTritonDType,
+    string WeightTritonDType,
+    string BiasTritonDType,
+    string OutputTritonDType,
+    PyNTTDimExpression[] InputShape,
+    PyNTTDimExpression[] WeightShape,
+    PyNTTDimExpression[] QBiasShape,
+    PyNTTDimExpression[] KBiasShape,
+    PyNTTDimExpression[] VBiasShape,
+    PyNTTDimExpression[] QOutputShape,
+    PyNTTDimExpression[] KOutputShape,
+    PyNTTDimExpression[] VOutputShape,
+    PyNTTDimExpression[] InputStrides,
+    PyNTTDimExpression[] WeightStrides,
+    PyNTTDimExpression[] QBiasStrides,
+    PyNTTDimExpression[] KBiasStrides,
+    PyNTTDimExpression[] VBiasStrides,
+    PyNTTDimExpression[] QOutputStrides,
+    PyNTTDimExpression[] KOutputStrides,
+    PyNTTDimExpression[] VOutputStrides,
+    long[] ProjectionNCapacities,
+    int[] Hierarchy,
+    PyNTTMicroKernelTemplateModel MicroKernel,
+    string Comment)
+{
+    public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
+
+    public bool PackedN => true;
+
+    public int NPackedLaneCount { get; set; } = 1;
+
+    public int NVectorLaneCount { get; set; } = 1;
+
+    public string RhsLayout { get; set; } = "k_major";
+
+    public int KPackLaneCount { get; set; } = 1;
+
+    public int KVectorLaneCount { get; set; } = 1;
+
+    public PyNTTDimExpression[] WeightGlobalOffsets { get; set; } = Array.Empty<PyNTTDimExpression>();
+
+    public string? WeightDescriptorName { get; set; }
+
+    public string WeightDescriptorOriginElements { get; set; } = "0";
 }
 
 public sealed record PyNTTMatMulGluTemplateModel(

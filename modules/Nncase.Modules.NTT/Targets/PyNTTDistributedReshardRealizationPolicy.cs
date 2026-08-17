@@ -34,19 +34,6 @@ public sealed class PyNTTDistributedReshardRealizationPolicy : IDistributedResha
             return DistributedReshardRealization.Boxing;
         }
 
-        if (context.SourceType is DistributedType { Partial: not null } partialSource &&
-            context.TargetType is DistributedType { Partial: null } partialTarget &&
-            context.SourceKind == DistributedReshardSourceKind.Internal &&
-            context.UsageKind == DistributedReshardUsageKind.Internal &&
-            DistributedReshardDecomposition
-                .GetPartialReduceScatterIntermediates(partialSource, partialTarget)
-                .Any(intermediate => CanMaterializeCanonicalChipView(intermediate, partialTarget)))
-        {
-            // PyNTT realizes an internal all-reduce as reduce-scatter into
-            // canonical UMA storage followed by a zero-copy sharded view.
-            return DistributedReshardRealization.Unsupported;
-        }
-
         if (context.TargetType is not DistributedType targetType ||
             !DistributedUtility.TryValidateShardedView(context.SourceType, targetType, out _))
         {

@@ -2869,6 +2869,7 @@ public sealed class GraphTiler
         writer.WriteLine($"Id: {machine.Id}");
         writer.WriteLine($"Execution: {machine.Execution.Kind}");
         writer.WriteLine($"ComputeUnits: {machine.Execution.ComputeUnitCount}");
+        writer.WriteLine($"ResidentBlocksPerComputeUnit: {machine.Execution.ResidentBlocksPerComputeUnit}");
         writer.WriteLine($"WorkersPerBlock: {machine.Execution.WorkersPerBlock}");
         writer.WriteLine($"WorkerWidth: {machine.Execution.WorkerWidth}");
         writer.WriteLine("PrivateResources:");

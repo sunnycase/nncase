@@ -71,7 +71,7 @@ public static class NTTTargetMachineCatalog
         var root = new TargetMemorySpaceId("cpu.main-memory");
         return new TargetMachineModel(
             CpuGeneric,
-            new(BlockExecutionKind.CpuCore, Math.Max(1, Environment.ProcessorCount), 1, 1, 3.0, 512, 4),
+            new(BlockExecutionKind.CpuCore, Math.Max(1, Environment.ProcessorCount), 1, 1, 1, 3.0, 512, 4),
             new(16, 16, ImmutableArray<MatrixComputePrimitiveSpec>.Empty),
             new(25, 25_000),
             [new(CpuBackendPrivateBytes, TargetPrivateResourceUnit.Bytes, 64 * 1024, 4)],
@@ -104,7 +104,7 @@ public static class NTTTargetMachineCatalog
         var root = new TargetMemorySpaceId("cuda.global");
         return new TargetMachineModel(
             CudaGeneric,
-            new(BlockExecutionKind.PersistentGpuBlock, 108, 8, 32, 1.4, 128, 4),
+            new(BlockExecutionKind.PersistentGpuBlock, 108, 1, 8, 32, 1.4, 128, 4),
             new(
                 128,
                 64,
@@ -158,7 +158,7 @@ public static class NTTTargetMachineCatalog
         var root = new TargetMemorySpaceId("xpu.main-memory");
         return new TargetMachineModel(
             XpuGeneric,
-            new(BlockExecutionKind.CpuCore, 64, 1, 1, 1.0, 128, 4),
+            new(BlockExecutionKind.CpuCore, 64, 1, 1, 1, 1.0, 128, 4),
             new(16, 16, ImmutableArray<MatrixComputePrimitiveSpec>.Empty),
             new(25, 25_000),
             [new(XpuBackendPrivateBytes, TargetPrivateResourceUnit.Bytes, 64 * 1024, 4)],
@@ -273,6 +273,7 @@ public static class NTTTargetMachineCatalog
             new(
                 BlockExecutionKind.PersistentGpuBlock,
                 computeUnits,
+                1,
                 8,
                 32,
                 clockRateGHz,

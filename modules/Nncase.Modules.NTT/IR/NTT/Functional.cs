@@ -65,6 +65,24 @@ public partial class NTT
             addend ?? None.Default);
     }
 
+    public static Expr PackedMatMulNormStats(
+        Expr lhs,
+        Expr rhs,
+        DataType outputDataType,
+        PackedMatMulRhsLayout rhsLayout,
+        int axis,
+        bool useMean,
+        Expr? scale = null,
+        Expr? addend = null)
+    {
+        return new Call(
+            new PackedMatMulNormStats(outputDataType, rhsLayout, axis, useMean),
+            lhs,
+            rhs,
+            scale ?? None.Default,
+            addend ?? None.Default);
+    }
+
     public static Expr PagedAttentionPartial(
         Expr q,
         Expr kvCaches,

@@ -229,7 +229,12 @@ public sealed record BinaryOpCostQuery(BinaryOp Op, TargetCostTensor Lhs, Target
 /// <summary>
 /// Target cost query for generic elementwise-like operators.
 /// </summary>
-public sealed record ElementwiseOpCostQuery(string Op, IReadOnlyList<TargetCostTensor> Inputs, TargetCostTensor Output, double WorkPerElement = 1.0);
+public sealed record ElementwiseOpCostQuery(
+    string Op,
+    IReadOnlyList<TargetCostTensor> Inputs,
+    TargetCostTensor Output,
+    double WorkPerElement = 1.0,
+    double InputReadMultiplicity = 1.0);
 
 /// <summary>
 /// Target cost query for matmul operators.
@@ -350,7 +355,7 @@ public sealed class DefaultTargetOpCostModel : ITargetOpCostModel, IHierarchical
             EstimateElementwiseCycles(
                 elements * Math.Max(0.0, query.WorkPerElement),
                 query.Inputs.Select(input => input.DType).Append(query.Output.DType).ToArray()),
-            query.Inputs.Sum(GetTensorByteCount),
+            query.Inputs.Sum(GetTensorByteCount) * Math.Max(0.0, query.InputReadMultiplicity),
             GetTensorByteCount(query.Output));
         return true;
     }

@@ -56,8 +56,7 @@ public sealed class LowerTransferPipelineRegionsPass : ModulePass
             var loweredBody = LowerFunctionBody(
                 function,
                 pipelineFunctions,
-                effectAnalyzer,
-                splitNestedPipelineCalls: ReferenceEquals(function, input.Entry));
+                effectAnalyzer);
             var lowered = function.With(body: loweredBody);
             lowered.Metadata = function.Metadata.Clone();
             replacements.Add(function, lowered);
@@ -122,8 +121,7 @@ public sealed class LowerTransferPipelineRegionsPass : ModulePass
     private static Sequential LowerFunctionBody(
         PrimFunction function,
         IReadOnlySet<PrimFunction> pipelineFunctions,
-        MemoryEffectAnalyzer effectAnalyzer,
-        bool splitNestedPipelineCalls)
+        MemoryEffectAnalyzer effectAnalyzer)
     {
         ValidateStructuredPipelinePlacement(
             function.Body,
@@ -135,56 +133,10 @@ public sealed class LowerTransferPipelineRegionsPass : ModulePass
             pipelineFunctions,
             function.Name,
             ref stageIndex);
-        if (splitNestedPipelineCalls)
-        {
-            return BuildEntryPipelineRegions(
-                consumer,
-                pipelineFunctions,
-                function.Name,
-                effectAnalyzer);
-        }
-
         return new Sequential(BuildPipelineRegion(
             consumer,
             function.Name,
             effectAnalyzer));
-    }
-
-    private static Sequential BuildEntryPipelineRegions(
-        Sequential body,
-        IReadOnlySet<PrimFunction> pipelineFunctions,
-        string functionName,
-        MemoryEffectAnalyzer effectAnalyzer)
-    {
-        var result = new List<Expr>();
-        var pending = new List<Expr>();
-        foreach (var field in FlattenSequentialFields(body))
-        {
-            pending.Add(field);
-            if (field is PipelineStage { Operation.Target: PrimFunction callee } &&
-                pipelineFunctions.Contains(callee))
-            {
-                result.Add(BuildPipelineRegion(
-                    new Sequential(pending.ToArray()),
-                    functionName,
-                    effectAnalyzer));
-                pending.Clear();
-            }
-        }
-
-        if (pending.Any(expression => expression is PipelineStage))
-        {
-            result.Add(BuildPipelineRegion(
-                new Sequential(pending.ToArray()),
-                functionName,
-                effectAnalyzer));
-        }
-        else
-        {
-            result.AddRange(pending);
-        }
-
-        return new Sequential(result.ToArray());
     }
 
     private static ProducerConsumerRegion BuildPipelineRegion(
@@ -199,24 +151,6 @@ public sealed class LowerTransferPipelineRegionsPass : ModulePass
         var consumeBody = InsertConsumerSynchronization(consumer, synchronization);
         var produceBody = BuildProducerBody(consumer, synchronization);
         return new ProducerConsumerRegion(produceBody, consumeBody);
-    }
-
-    private static IEnumerable<Expr> FlattenSequentialFields(Sequential body)
-    {
-        foreach (var field in body.Fields.ToArray())
-        {
-            if (field is Sequential nested)
-            {
-                foreach (var nestedField in FlattenSequentialFields(nested))
-                {
-                    yield return nestedField;
-                }
-            }
-            else
-            {
-                yield return field;
-            }
-        }
     }
 
     private static PipelineSynchronizationPlan BuildSynchronizationPlan(
@@ -319,49 +253,32 @@ public sealed class LowerTransferPipelineRegionsPass : ModulePass
                 continue;
             }
 
-            var sourceEffects = effectAnalyzer.GetTransferSourceEffects(stage.Operation);
-            if (!sourceEffects.Items.Any())
+            var dependency = effectAnalyzer.AnalyzeTransferSourceDependency(
+                executionOrder,
+                stageIndex,
+                stage.Operation);
+            if (!dependency.SourceEffects.Items.Any())
             {
+                if (stage.Operation.Target is PrimFunction)
+                {
+                    // The callee may have no entry-ready source because every
+                    // transfer is released by one of its internal handoffs.
+                    continue;
+                }
+
                 throw new InvalidOperationException(
                     $"Transfer-pipeline stage {stage.StageId} in {functionName} has no " +
                     "physical source effects.");
             }
 
-            var pending = new PendingEffectSet();
-            Expr? releaseBoundary = null;
-            for (var expressionIndex = 0; expressionIndex < stageIndex; expressionIndex++)
-            {
-                var expression = executionOrder[expressionIndex];
-                if (MemorySynchronizationPlanner.TryGetBarrier(expression, out var barrier))
-                {
-                    var hadConflict = pending.TryGetConflict(sourceEffects, out _);
-                    pending.Synchronize(SynchronizationRequirement.FromBarrier(barrier));
-                    if (hadConflict && !pending.TryGetConflict(sourceEffects, out _))
-                    {
-                        releaseBoundary = expression;
-                    }
-
-                    continue;
-                }
-
-                var effects = expression is PipelineStage precedingStage
-                    ? effectAnalyzer.GetEffects(precedingStage.Operation)
-                    : effectAnalyzer.GetEffects(expression);
-                pending.Add(effects);
-                if (pending.TryGetConflict(sourceEffects, out _))
-                {
-                    releaseBoundary = null;
-                }
-            }
-
-            if (pending.TryGetConflict(sourceEffects, out var unsynchronized))
+            if (dependency.UnsynchronizedRequirement is { } unsynchronized)
             {
                 throw new InvalidOperationException(
                     $"Transfer-pipeline stage {stage.StageId} in {functionName} reads a " +
                     $"source after a conflicting write without an effective {unsynchronized.Scope} barrier.");
             }
 
-            if (releaseBoundary is null)
+            if (dependency.ReleaseBoundary is not { } releaseBoundary)
             {
                 continue;
             }

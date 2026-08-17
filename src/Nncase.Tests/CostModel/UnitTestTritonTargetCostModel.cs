@@ -146,6 +146,63 @@ public sealed class UnitTestTritonTargetCostModel : TestClassBase
     }
 
     [Fact]
+    public void TestPartialAllReduceCostsEveryPeerReadAndReduction()
+    {
+        CompileOptions.TargetOptions = CreateOptions(CreateGpuMachine());
+        var placement = new Placement([4, 8], "y,x", "bb");
+        var tensorType = new TensorType(DataTypes.BFloat16, new RankedShape(1, 2));
+        var inputType = new DistributedType(
+            tensorType,
+            [SBP.B, SBP.B],
+            placement,
+            SBP.P([0, 1]));
+        var outputType = new DistributedType(tensorType, [SBP.B, SBP.B], placement);
+        var input = new Var("input", inputType);
+        var boxing = IR.F.Distributed.Boxing(input, outputType);
+        CompilerServices.InferenceType(boxing);
+
+        var cost = CompilerServices.EvaluateCost(boxing, CompileOptions);
+
+        Assert.Equal((UInt128)128, cost[CostFactorNames.BlockLocalMemoryLoadBytes]);
+        Assert.Equal((UInt128)4, cost[CostFactorNames.BlockLocalMemoryStoreBytes]);
+        Assert.Equal((UInt128)62, cost[CostFactorNames.CPUCycles]);
+        Assert.Equal((UInt128)1, cost[CostFactorNames.GridSynchronization]);
+    }
+
+    [Fact]
+    public void TestPartialReduceScatterHasLessLocalWorkThanReplicatedAllReduce()
+    {
+        CompileOptions.TargetOptions = CreateOptions(CreateGpuMachine());
+        var placement = new Placement([4, 8], "y,x", "bb");
+        var tensorType = new TensorType(DataTypes.BFloat16, new RankedShape(32_768, 2));
+        var inputType = new DistributedType(
+            tensorType,
+            [SBP.B, SBP.B],
+            placement,
+            SBP.P([0, 1]));
+        var broadcastType = new DistributedType(tensorType, [SBP.B, SBP.B], placement);
+        var reduceScatterType = new DistributedType(
+            tensorType,
+            [SBP.SContiguous([0, 1], 1024), SBP.B],
+            placement);
+
+        var replicated = IR.F.Distributed.Boxing(new Var("replicated", inputType), broadcastType);
+        var reduceScatter = IR.F.Distributed.Boxing(new Var("reduce_scatter", inputType), reduceScatterType);
+        CompilerServices.InferenceType(replicated);
+        CompilerServices.InferenceType(reduceScatter);
+
+        var replicatedCost = CompilerServices.EvaluateCost(replicated, CompileOptions);
+        var reduceScatterCost = CompilerServices.EvaluateCost(reduceScatter, CompileOptions);
+
+        Assert.True(
+            replicatedCost[CostFactorNames.BlockLocalMemoryLoadBytes] >
+            reduceScatterCost[CostFactorNames.BlockLocalMemoryLoadBytes]);
+        Assert.True(
+            replicatedCost[CostFactorNames.CPUCycles] >
+            reduceScatterCost[CostFactorNames.CPUCycles]);
+    }
+
+    [Fact]
     public void TestShardedViewCostsSynchronizationWithoutCopyTraffic()
     {
         CompileOptions.TargetOptions = CreateOptions(CreateGpuMachine());
@@ -1011,7 +1068,7 @@ public sealed class UnitTestTritonTargetCostModel : TestClassBase
         var operandTypes = ImmutableArray.Create<DataType>(DataTypes.Float16, DataTypes.BFloat16, DataTypes.Float32, DataTypes.Int8);
         return new TargetMachineModel(
             "test-gpu",
-            new(BlockExecutionKind.PersistentGpuBlock, 128, 8, 32, 1.0, 128, 4),
+            new(BlockExecutionKind.PersistentGpuBlock, 128, 1, 8, 32, 1.0, 128, 4),
             new(
                 elementwiseElementsPerCycle,
                 simtFmaPerCycle,

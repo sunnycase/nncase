@@ -8,7 +8,7 @@ public sealed partial class GatherReduceScatter : NTTKernelOp
 {
     public static readonly ParameterInfo Input = new(typeof(GatherReduceScatter), 0, "input", memoryEffect: MemoryEffect.Read);
 
-    public static readonly ParameterInfo Output = new(typeof(GatherReduceScatter), 1, "output", memoryEffect: MemoryEffect.ChipWrite);
+    public static readonly ParameterInfo Output = new(typeof(GatherReduceScatter), 1, "output", memoryEffect: MemoryEffect.Write);
 
     public DistributedType InType { get; }
 
@@ -23,7 +23,10 @@ public sealed partial class GatherReduceScatter : NTTKernelOp
 
         if (ReferenceEquals(parameter, Output))
         {
-            return MemoryEffect.ChipWrite;
+            // Output visibility follows its physical backing. CompactLocal
+            // outputs are private replicas, while CanonicalGlobal outputs use
+            // chip-visible storage and are promoted by resource inference.
+            return MemoryEffect.Write;
         }
 
         return base.GetMemoryEffect(parameter);

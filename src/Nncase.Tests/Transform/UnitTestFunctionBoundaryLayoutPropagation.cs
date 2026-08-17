@@ -508,6 +508,88 @@ public sealed class UnitTestFunctionBoundaryLayoutPropagation : TestClassBase
     }
 
     [Fact]
+    public async Task TestTIRSelectionPromotesPartialTupleOutputAsCompactPerOwnerStorage()
+    {
+        CompileOptions.TargetOptions = new Nncase.Targets.PyNTTTargetOptions();
+        var placement = new Placement([4, 8], "yx", "bb");
+        var lhsType = new DistributedType(
+            new TensorType(DataTypes.BFloat16, new long[] { 1, 64 }),
+            [SBP.B, SBP.B],
+            placement);
+        var rhsType = new DistributedType(
+            new TensorType(
+                new VectorType(DataTypes.BFloat16, [8, 2, 8]),
+                new long[] { 4, 16 }),
+            [SBP.B, SBP.SContiguous([0, 1], 1)],
+            placement);
+        var lhs = new Var("lhs", lhsType);
+        var rhs = new Var("rhs", rhsType);
+        var fused = IR.F.NTT.PackedMatMulNormStats(
+            lhs,
+            rhs,
+            DataTypes.BFloat16,
+            IR.NTT.PackedMatMulRhsLayout.KMajor,
+            axis: 1,
+            useMean: false);
+        var value = GetItem(fused, 0);
+        var stats = GetItem(fused, 1);
+        var statsType = Assert.IsType<DistributedType>(stats.CheckedType);
+        Assert.NotNull(statsType.Partial);
+        var callee = new Function("callee", new IR.Tuple(value, stats), lhs, rhs);
+        Assert.True(callee.InferenceType());
+
+        var mainLhs = new Var("main_lhs", lhsType);
+        var mainRhs = new Var("main_rhs", rhsType);
+        var calleeCall = new Call(callee, mainLhs, mainRhs);
+        var broadcastStatsType = new DistributedType(
+            statsType.TensorType,
+            [SBP.B, SBP.B, SBP.B],
+            placement);
+        var reducedStats = IR.F.Distributed.Boxing(GetItem(calleeCall, 1), broadcastStatsType);
+        var main = new Function(
+            "main",
+            IR.F.Distributed.Boxing(reducedStats, statsType.TensorType),
+            mainLhs,
+            mainRhs);
+        Assert.True(main.InferenceType());
+
+        var module = new IRModule(main);
+        module.Add(callee);
+        var passManager = CompileSession.CreatePassManager("TIRSelectionPartialTupleOutput");
+        passManager.Add<NTTTIRSelectionPass>();
+        await passManager.RunAsync(module);
+
+        var calleeWrapper = Assert.Single(module.Functions.OfType<PrimFunctionWrapper>());
+        var calleeAbi = calleeWrapper.Target.GetAbiView();
+        var statsResult = calleeAbi.Results[1];
+        var statsOutput = Assert.IsType<BufferVar>(statsResult.Storage);
+        Assert.Equal(
+            DistributedBufferStorageKind.CompactPerOwner,
+            statsOutput.LayoutAnnotation.DistributedStorageKind);
+        var statsView = Assert.IsType<TIR.Buffer>(statsResult.Value);
+        Assert.Equal(DistributedBufferStorageKind.CompactPerOwner, statsView.DistributedStorageKind);
+        Assert.Equal(MemoryLocation.Output, statsView.MemSpan.Buffer.Location);
+        Assert.Equal(
+            statsView.MemSpan.Size.FixedValue * 32,
+            statsView.MemSpan.Buffer.Size.FixedValue);
+
+        var mainPrim = Assert.IsType<PrimFunction>(module.Entry);
+        var selectedCall = Assert.Single(
+            ExprCollector.Collect(mainPrim.Body)
+                .OfType<Call>()
+                .Where(call => ReferenceEquals(call.Target, calleeWrapper.Target)));
+        var statsParameterIndex = Array.FindIndex(
+            calleeWrapper.Target.Parameters.ToArray(),
+            parameter => ReferenceEquals(parameter, statsOutput));
+        var callerStats = Assert.IsType<TIR.Buffer>(selectedCall.Arguments[statsParameterIndex]);
+        Assert.Equal(MemoryLocation.ChipLocalData, callerStats.MemSpan.Buffer.Location);
+        Assert.Equal(DistributedBufferStorageKind.CompactPerOwner, callerStats.DistributedStorageKind);
+        Assert.Equal(
+            callerStats.MemSpan.Size.FixedValue * 32,
+            callerStats.MemSpan.Buffer.Size.FixedValue);
+    }
+
+    [Fact]
     public async Task TestTIRSelectionPreservesInputAliasInTupleOutput()
     {
         var tensorType = new TensorType(DataTypes.Float32, new RankedShape(4, 16));

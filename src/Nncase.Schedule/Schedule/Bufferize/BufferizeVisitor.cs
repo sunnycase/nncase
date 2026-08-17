@@ -379,6 +379,17 @@ public sealed class BufferizeVisitor : ExprRewriter
                     func.SchedResult.BlockLocalRdatas,
                     constValue,
                     range);
+                if (buffer.BlockLocalRDataMaterialization is { } materialization)
+                {
+                    if (func.SchedResult.BlockLocalRDataMaterializations.TryGetValue(constValue, out var existing) &&
+                        !ReferenceEquals(existing, materialization))
+                    {
+                        throw new InvalidOperationException(
+                            $"PrimFunction {func.Name} assigns conflicting derived block-local rdata recipes to one constant.");
+                    }
+
+                    func.SchedResult.BlockLocalRDataMaterializations[constValue] = materialization;
+                }
             }
 
             _currentBlockLocalRdataStart = blockLocalRdataResult.MemoryPoolEnd;

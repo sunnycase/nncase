@@ -127,6 +127,8 @@ public sealed class TritonTargetOpCostModel : ITargetOpCostModel, IHierarchicalT
             loadElements += GetTensorByteCount(input);
         }
 
+        loadElements *= Math.Max(0.0, query.InputReadMultiplicity);
+
         cost = ElementwiseCost(
             EstimateElementwiseComputeCycles(
                 elements,

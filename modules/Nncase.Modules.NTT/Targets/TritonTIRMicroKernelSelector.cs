@@ -50,6 +50,14 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
                 lhsIndex: 0,
                 rhsIndex: 1,
                 outputIndex: 2),
+            Nncase.TIR.NTT.PackedMatMulNormStats packedMatmulNormStats => SelectMatmul(
+                context,
+                transposeA: false,
+                transposeB: packedMatmulNormStats.RhsLayout == IR.NTT.PackedMatMulRhsLayout.NMajor,
+                kMajorPacked: packedMatmulNormStats.RhsLayout == IR.NTT.PackedMatMulRhsLayout.KMajor,
+                lhsIndex: 0,
+                rhsIndex: 1,
+                outputIndex: 2),
             Nncase.TIR.NTT.SUMMA summa => SelectSumma(context, summa),
             Nncase.TIR.NTT.QKVParallelLinear => SelectFusedLinear(
                 context,
@@ -57,7 +65,7 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
                 inputIndex: 0,
                 weightIndex: 1,
                 outputIndex: 13),
-            Nncase.TIR.NTT.PackedQKVParallelLinear packedQkv => SelectPackedQkv(
+            Nncase.TIR.NTT.PackedQKVParallelLinearFusedRhs packedQkv => SelectPackedQkv(
                 context,
                 packedQkv),
             Nncase.TIR.NTT.MatMulGlu => SelectFusedLinear(
@@ -544,19 +552,15 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
 
     private static TIRMicroKernelSelection SelectPackedQkv(
         TIRMicroKernelSelectionContext context,
-        Nncase.TIR.NTT.PackedQKVParallelLinear qkv)
+        Nncase.TIR.NTT.PackedQKVParallelLinearFusedRhs qkv)
     {
         var input = GetBuffer(context, 0, "input");
-        var qWeight = GetBuffer(context, 1, "q weight");
-        var kWeight = GetBuffer(context, 2, "k weight");
-        var vWeight = GetBuffer(context, 3, "v weight");
-        var qOutput = GetBuffer(context, 13, "q output");
-        var kOutput = GetBuffer(context, 14, "k output");
-        var vOutput = GetBuffer(context, 15, "v output");
+        var weight = GetBuffer(context, 1, "fused qkv weight");
+        var qOutput = GetBuffer(context, 11, "q output");
+        var kOutput = GetBuffer(context, 12, "k output");
+        var vOutput = GetBuffer(context, 13, "v output");
         RequireRank(input, 2, context.Op, "input");
-        RequireRank(qWeight, 2, context.Op, "q weight");
-        RequireRank(kWeight, 2, context.Op, "k weight");
-        RequireRank(vWeight, 2, context.Op, "v weight");
+        RequireRank(weight, 2, context.Op, "fused qkv weight");
         RequireRank(qOutput, 2, context.Op, "q output");
         RequireRank(kOutput, 2, context.Op, "k output");
         RequireRank(vOutput, 2, context.Op, "v output");
@@ -575,22 +579,25 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
                 "PackedQKVParallelLinear microkernel selection requires Q/K/V to have the same local M extent.");
         }
 
-        var n = checked(
-            GetScalarExtent(outputDimensions[0][^1], qOutput.ElemType) +
-            GetScalarExtent(outputDimensions[1][^1], kOutput.ElemType) +
-            GetScalarExtent(outputDimensions[2][^1], vOutput.ElemType));
+        if (qkv.ProjectionNCapacities.Count != 3 || qkv.ProjectionNCapacities.Any(x => x <= 0))
+        {
+            throw new InvalidOperationException(
+                "PackedQKVParallelLinearFusedRhs requires three positive projection N capacities.");
+        }
+
+        var n = checked(qkv.ProjectionNCapacities.Sum());
         var kDimension = inputDimensions[^1];
         return CreateMatrixSelection(
             context.Machine,
             "triton.qkv_parallel_linear",
             GetScalarDataType(input.ElemType),
-            GetScalarDataType(qWeight.ElemType),
+            GetScalarDataType(weight.ElemType),
             m,
             n,
             GetScalarExtent(kDimension, input.ElemType),
             kDimension.IsFixed,
             qkv.RhsLayout == IR.NTT.PackedMatMulRhsLayout.KMajor,
-            sourceArgumentIndices: [1, 2, 3]);
+            sourceArgumentIndices: [1]);
     }
 
     private static TIRMicroKernelSelection SelectPackedMatMulGlu(

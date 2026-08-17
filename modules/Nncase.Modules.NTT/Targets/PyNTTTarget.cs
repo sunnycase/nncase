@@ -53,6 +53,11 @@ public sealed class PyNTTTarget : NTTTarget
         {
             p.Add<Passes.Rules.NTT.DecomposePagedAttention>(splitHierarchyAxis, splitCount);
         });
+        passManager.AddWithName<DataflowPass>("FusePackedMatMulAddBeforeAutoDistributed").Configure(p =>
+        {
+            p.Add<Passes.Rules.NTT.FusePackedMatMulAdd>();
+        });
+        passManager.Add<FusePackedMatMulNormStatsPass>();
     }
 
     /// <inheritdoc/>
@@ -66,6 +71,13 @@ public sealed class PyNTTTarget : NTTTarget
         passManager.AddWithName<LowerTransferPipelineRegionsPass>(
             "LowerTransferPipelineRegions",
             Kind);
+    }
+
+    /// <inheritdoc/>
+    public override void RegisterTIRPreBufferizePass(IPassManager passManager, CompileOptions options)
+    {
+        passManager.Add<CanonicalizePackedQKVWeightsPass>(Kind);
+        base.RegisterTIRPreBufferizePass(passManager, options);
     }
 
     /// <inheritdoc/>

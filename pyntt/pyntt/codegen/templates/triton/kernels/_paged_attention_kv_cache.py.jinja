@@ -46,5 +46,8 @@
 {% endif %}
 {{ indent }}cache_offsets = {{ ctx["cache_offset"] }}
 {{ indent }}active = {{ element_mask }} & token_active & (cache_head_id < {{ cache["NumKVHeads"] }}) & (logical_dim < {{ cache["HeadDim"] }})
+{% for axis in ctx["canonical_writer_axes"] %}
+{{ indent }}active = active & (shard_coord{{ axis }} == 0)
+{% endfor %}
 {{ indent }}tl.store(kv_cache + cache_offsets, {{ value }}, mask=active)
 {%- endmacro %}

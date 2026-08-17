@@ -74,6 +74,36 @@ public sealed class UnitTestFusePackedMatMulAdd : TransformTestBase
     }
 
     [Fact]
+    public void TestFuseAddendThroughShardedView()
+    {
+        var (packedMatMul, _) = CreateDistributedPackedMatMul();
+        var packedType = Assert.IsType<DistributedType>(packedMatMul.CheckedType);
+        var broadcastType = new DistributedType(
+            packedType.TensorType,
+            Enumerable.Repeat<SBP>(SBP.B, packedType.TensorType.Shape.Rank).ToArray(),
+            packedType.Placement);
+        var viewed = IR.F.Distributed.ShardedView(packedMatMul, broadcastType);
+        var addend = new Var("broadcast_addend", broadcastType);
+        var expression = IR.F.Math.Add(viewed, addend);
+
+        var rewritten = CompilerServices.Rewrite(
+            expression,
+            [new FusePackedMatMulAddThroughShardedView()],
+            new Nncase.Passes.RunPassContext());
+        Assert.True(CompilerServices.InferenceType(rewritten));
+        Assert.Equal(expression.CheckedType, rewritten.CheckedType);
+
+        var outputView = Assert.IsType<Call>(rewritten);
+        Assert.IsType<IR.Distributed.ShardedView>(outputView.Target);
+        var fused = Assert.IsType<Call>(outputView[IR.Distributed.ShardedView.Input]);
+        Assert.IsType<IR.NTT.PackedMatMul>(fused.Target);
+        var localAddend = Assert.IsType<Call>(fused[IR.NTT.PackedMatMul.Addend]);
+        Assert.IsType<IR.Distributed.ShardedView>(localAddend.Target);
+        Assert.Same(addend, localAddend[IR.Distributed.ShardedView.Input]);
+        Assert.Equal(packedType, localAddend.CheckedType);
+    }
+
+    [Fact]
     public void TestPackedMatMulRejectsMismatchedAddendType()
     {
         var (packedMatMul, _) = CreateTensorPackedMatMul();

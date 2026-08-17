@@ -288,10 +288,10 @@ public sealed class BufferVar : Expr, IVar, IEquatable<BufferVar?>
             throw new ArgumentException($"Tensor BufferVar {type} cannot use an opaque layout.", nameof(layout));
         }
 
-        if (layout.DistributedStorageKind == TIR.DistributedBufferStorageKind.CanonicalGlobal && type is not DistributedType)
+        if (layout.DistributedStorageKind != TIR.DistributedBufferStorageKind.CompactLocal && type is not DistributedType)
         {
             throw new ArgumentException(
-                $"Canonical-global BufferVar storage requires a DistributedType, got {type}.",
+                $"Distributed BufferVar storage {layout.DistributedStorageKind} requires a DistributedType, got {type}.",
                 nameof(layout));
         }
 

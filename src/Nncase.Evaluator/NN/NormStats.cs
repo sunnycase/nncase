@@ -50,7 +50,7 @@ public sealed class NormStatsEvaluator : IEvaluator<NormStats>, ITypeInferencer<
         };
     }
 
-    internal static Tensor Evaluate(Tensor inputRaw, int axis, bool useMean)
+    public static Tensor Evaluate(Tensor inputRaw, int axis, bool useMean)
     {
         inputRaw = UnpackVectorInput(inputRaw);
         var input = inputRaw.CastElementTo(DataTypes.Float32).Cast<float>();

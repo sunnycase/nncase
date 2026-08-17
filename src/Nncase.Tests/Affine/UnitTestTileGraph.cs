@@ -1233,7 +1233,7 @@ public sealed class UnitTestTileGraph : TestClassBase
         var reshardCall = Assert.IsType<Call>(Assert.Single(grid.Body.Fields.ToArray()));
         Assert.IsType<TIR.NTT.GatherReduceScatter>(reshardCall.Target);
         Assert.Equal(MemoryEffect.Read, TIR.NTT.GatherReduceScatter.Input.MemoryEffect);
-        Assert.Equal(MemoryEffect.ChipWrite, TIR.NTT.GatherReduceScatter.Output.MemoryEffect);
+        Assert.Equal(MemoryEffect.Write, TIR.NTT.GatherReduceScatter.Output.MemoryEffect);
         MemoryEffect? resolvedInputEffect = null;
         MemoryEffectUtility.VisitCallEffects(reshardCall, (_, parameter, effect) =>
         {
@@ -1311,7 +1311,7 @@ public sealed class UnitTestTileGraph : TestClassBase
             }
         });
         Assert.Equal(MemoryEffect.ChipRead, resolvedInputEffect);
-        Assert.Equal(MemoryEffect.ChipWrite, TIR.NTT.GatherReduceScatter.Output.MemoryEffect);
+        Assert.Equal(MemoryEffect.Write, TIR.NTT.GatherReduceScatter.Output.MemoryEffect);
     }
 
     [Fact]
@@ -2582,7 +2582,7 @@ public sealed class UnitTestTileGraph : TestClassBase
             false);
         return new TargetMachineModel(
             $"tile-graph-test-{levelCount}",
-            new(BlockExecutionKind.CpuCore, 1, 1, 1, 1.0, 512, 4),
+            new(BlockExecutionKind.CpuCore, 1, 1, 1, 1, 1.0, 512, 4),
             new(16, 16, ImmutableArray<MatrixComputePrimitiveSpec>.Empty),
             new(25, 25_000),
             [new(new TargetPrivateResourceId("test.backend-private"), TargetPrivateResourceUnit.Bytes, 64 * 1024, 4)],

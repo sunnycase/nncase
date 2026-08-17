@@ -24,6 +24,15 @@ public enum DistributedBufferStorageKind
     CompactLocal,
 
     /// <summary>
+    /// The backing allocation contains one dense local component for every
+    /// placement owner. Components are ordered by the placement's linear owner
+    /// index, and <see cref="Buffer.MemSpan"/> describes one component. This is
+    /// the compact representation for distributed values whose owners carry
+    /// distinct data, including partial reductions.
+    /// </summary>
+    CompactPerOwner,
+
+    /// <summary>
     /// The backing allocation contains the canonical global tensor. Logical
     /// local coordinates must be mapped through the buffer's staged
     /// <see cref="DistributedType"/> policy before applying global strides.
@@ -85,10 +94,10 @@ public sealed class Buffer : Expr
         DistributedType = distributedType;
         StorageEncoding = storageEncoding;
         StagedLayout = stagedLayout;
-        if (distributedStorageKind == DistributedBufferStorageKind.CanonicalGlobal && distributedType is null)
+        if (distributedStorageKind != DistributedBufferStorageKind.CompactLocal && distributedType is null)
         {
             throw new ArgumentException(
-                $"Canonical-global buffer {name} requires a DistributedType.",
+                $"Distributed storage {distributedStorageKind} on buffer {name} requires a DistributedType.",
                 nameof(distributedStorageKind));
         }
 
@@ -97,6 +106,15 @@ public sealed class Buffer : Expr
         {
             throw new ArgumentException(
                 $"Canonical-global buffer {name} cannot use block-local backing {memSpan.Buffer.Location}.",
+                nameof(distributedStorageKind));
+        }
+
+        if (distributedStorageKind == DistributedBufferStorageKind.CompactPerOwner &&
+            !IsCompactPerOwnerBacking(memSpan.Buffer))
+        {
+            throw new ArgumentException(
+                $"Compact-per-owner buffer {name} requires internal chip-local storage or a " +
+                $"compact-per-owner ABI parameter, got {memSpan.Buffer.Location}/{memSpan.Buffer.Start.GetType().Name}.",
                 nameof(distributedStorageKind));
         }
 
@@ -187,4 +205,17 @@ public sealed class Buffer : Expr
     }
 
     protected override int GetHashCodeCore() => HashCode.Combine(Name, ElemType, Rank, StorageEncoding, StagedLayout, DistributedStorageKind, base.GetHashCodeCore());
+
+    private static bool IsCompactPerOwnerBacking(PhysicalBuffer physicalBuffer)
+    {
+        if (physicalBuffer.Location == MemoryLocation.ChipLocalData &&
+            physicalBuffer.Start is not BufferVar)
+        {
+            return true;
+        }
+
+        return physicalBuffer.Start is BufferVar parameter &&
+            parameter.Location == physicalBuffer.Location &&
+            parameter.LayoutAnnotation.DistributedStorageKind == DistributedBufferStorageKind.CompactPerOwner;
+    }
 }

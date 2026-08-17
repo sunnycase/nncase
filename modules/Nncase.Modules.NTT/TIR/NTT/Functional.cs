@@ -85,6 +85,29 @@ public partial class NTT
             addend ?? None.Default);
     }
 
+    public static Call PackedMatMulNormStats(
+        Expr lhs,
+        Expr rhs,
+        Expr output,
+        Expr stats,
+        Expr loadC,
+        Expr scale,
+        IR.NTT.PackedMatMulRhsLayout rhsLayout,
+        int axis,
+        bool useMean,
+        Expr? addend = null)
+    {
+        return KernelCall(
+            new PackedMatMulNormStats(rhsLayout, axis, useMean),
+            lhs,
+            rhs,
+            output,
+            stats,
+            loadC,
+            scale,
+            addend ?? None.Default);
+    }
+
     public static Call QKVParallelLinear(
         Expr input,
         Expr qWeight,
@@ -152,6 +175,48 @@ public partial class NTT
             qWeight,
             kWeight,
             vWeight,
+            qBias,
+            kBias,
+            vBias,
+            qInputScale,
+            kInputScale,
+            vInputScale,
+            qWeightScale,
+            kWeightScale,
+            vWeightScale,
+            qOutput,
+            kOutput,
+            vOutput);
+    }
+
+    public static Call PackedQKVParallelLinearFusedRhs(
+        Expr input,
+        Expr weight,
+        Expr qBias,
+        Expr kBias,
+        Expr vBias,
+        Expr qInputScale,
+        Expr kInputScale,
+        Expr vInputScale,
+        Expr qWeightScale,
+        Expr kWeightScale,
+        Expr vWeightScale,
+        Expr qOutput,
+        Expr kOutput,
+        Expr vOutput,
+        long numHeads,
+        long numKvHeads,
+        IR.NTT.PackedMatMulRhsLayout rhsLayout,
+        IRArray<long> projectionNCapacities)
+    {
+        return KernelCall(
+            new PackedQKVParallelLinearFusedRhs(
+                numHeads,
+                numKvHeads,
+                rhsLayout,
+                projectionNCapacities),
+            input,
+            weight,
             qBias,
             kBias,
             vBias,

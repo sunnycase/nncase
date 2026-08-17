@@ -176,7 +176,25 @@ public sealed class SpecializePrimFunctionBufferLayoutsPass : ModulePass
             CopyRdata(source.Rdatas, result.Rdatas, expressionMap);
             CopyRdata(source.ChipLocalRdatas, result.ChipLocalRdatas, expressionMap);
             CopyRdata(source.BlockLocalRdatas, result.BlockLocalRdatas, expressionMap);
+            CopyBlockLocalRDataMaterializations(
+                source.BlockLocalRDataMaterializations,
+                result.BlockLocalRDataMaterializations,
+                expressionMap);
             return result;
+        }
+
+        private static void CopyBlockLocalRDataMaterializations(
+            IReadOnlyDictionary<Const, BlockLocalRDataMaterialization> source,
+            IDictionary<Const, BlockLocalRDataMaterialization> destination,
+            IReadOnlyDictionary<BaseExpr, BaseExpr> expressionMap)
+        {
+            foreach (var (constant, materialization) in source)
+            {
+                var cloned = expressionMap.TryGetValue(constant, out var value)
+                    ? value as Const ?? throw new InvalidOperationException($"Cloned block-local rdata {constant} is not a Const.")
+                    : constant;
+                destination.Add(cloned, materialization);
+            }
         }
 
         private static void CopyRdata(

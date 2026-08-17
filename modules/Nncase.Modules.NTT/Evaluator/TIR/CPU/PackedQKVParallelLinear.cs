@@ -29,3 +29,12 @@ public sealed class PackedQKVParallelLinearEvaluator : ITypeInferencer<PackedQKV
         return new(m, n, k, solver.MakeIntConst(1));
     }
 }
+
+/// <summary>
+/// Type inference for the post-distribution canonical fused-RHS QKV kernel.
+/// This op is introduced after AutoTiling, so it has no tile-workload contract.
+/// </summary>
+public sealed class PackedQKVParallelLinearFusedRhsEvaluator : ITypeInferencer<PackedQKVParallelLinearFusedRhs>
+{
+    public IRType Visit(ITypeInferenceContext context, PackedQKVParallelLinearFusedRhs target) => TupleType.Void;
+}

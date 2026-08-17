@@ -1626,6 +1626,21 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
 
     private static string? GetBufferRuntimePoolStrideBytes(TIR.Buffer buffer, RuntimeDispatchContext context)
     {
+        if (buffer.DistributedStorageKind == DistributedBufferStorageKind.CompactPerOwner)
+        {
+            if (buffer.MemSpan.Buffer.Location != MemoryLocation.ChipLocalData ||
+                buffer.DistributedType is null)
+            {
+                throw new InvalidOperationException(
+                    $"Compact-per-owner buffer {buffer.Name} must use distributed ChipLocalData storage.");
+            }
+
+            return GetFixedDimension(
+                    buffer.MemSpan.Size,
+                    $"compact-per-owner stride for {buffer.Name}")
+                .ToString(CultureInfo.InvariantCulture);
+        }
+
         if (buffer.MemSpan.Buffer.Location == MemoryLocation.Data && buffer.DistributedType is null)
         {
             return "0";
@@ -1969,6 +1984,11 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
         => buffer.MemSpan.Buffer.Location switch
         {
             MemoryLocation.BlockLocalData => BuildBlockLocalDataBackingSizeExpression(context, contextName),
+            MemoryLocation.ChipLocalData when
+                buffer.DistributedStorageKind == DistributedBufferStorageKind.CompactPerOwner =>
+                BuildRuntimeDimensionExpression(
+                    buffer.MemSpan.Buffer.Size,
+                    $"{contextName} compact-per-owner buffer {buffer.Name} backing size"),
             _ => BuildRuntimeDimensionExpression(buffer.MemSpan.Size, $"{contextName} buffer {buffer.Name} size"),
         };
 
@@ -2389,7 +2409,7 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
         var tritonRuntimeSetup = requiresGridBarrier
             ? $"{Environment.NewLine}        ensure_triton_allocator({context.DeviceExpression})"
             : string.Empty;
-        const string kwargs = ", num_warps=pyntt_kernel_config['num_warps'], num_stages=pyntt_kernel_config['num_stages']";
+        const string kwargs = ", num_warps=pyntt_kernel_config['num_warps'], num_stages=pyntt_kernel_config['num_stages'], min_ctas_per_sm=pyntt_kernel_config['resident_blocks_per_compute_unit']";
         var importStatement = $"from .generated_kernels import {kernel.Name}, PYNTT_HOST_TENSOR_DESCRIPTOR_SPECS, PYNTT_KERNEL_CONFIGS";
         var launchStatement = string.IsNullOrWhiteSpace(dynamicKernelArgs)
             ? "        pyntt_prepared_kernel.launch(grid=grid)"
@@ -2400,7 +2420,7 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
         var prepareStatement = $"""
                     pyntt_prepared_kernel = self.lookup_prepared_triton_kernel({PythonString(kernel.Name)}, pyntt_execution_device)
                     if pyntt_prepared_kernel is None:
-                        pyntt_prepared_kernel = prepare_and_validate_triton_kernel({PythonString(kernel.Name)}, "block_size", pyntt_kernel_config["block_size"]["candidates"], source=pyntt_kernel_config["block_size"]["source"], kernel={kernel.Name}, kernel_args={kernelArgs}, dynamic_argument_indices={dynamicIndices}, grid_for_candidate={gridForCandidate}, expected_compute_num_warps=pyntt_kernel_config["num_warps"], registers_per_thread_limit={PythonValue(kernel.Attrs["registers_per_thread_limit"])}, shared_memory_capacity_bytes={PythonValue(kernel.Attrs["shared_memory_capacity_bytes"])}, forbid_spills={PythonValue(kernel.Attrs["forbid_spills"])}{kwargs})
+                        pyntt_prepared_kernel = prepare_and_validate_triton_kernel({PythonString(kernel.Name)}, "block_size", pyntt_kernel_config["block_size"]["candidates"], source=pyntt_kernel_config["block_size"]["source"], kernel={kernel.Name}, kernel_args={kernelArgs}, dynamic_argument_indices={dynamicIndices}, grid_for_candidate={gridForCandidate}, expected_compute_num_warps=pyntt_kernel_config["num_warps"], expected_resident_blocks_per_compute_unit=pyntt_kernel_config["resident_blocks_per_compute_unit"], registers_per_thread_limit={PythonValue(kernel.Attrs["registers_per_thread_limit"])}, shared_memory_capacity_bytes={PythonValue(kernel.Attrs["shared_memory_capacity_bytes"])}, forbid_spills={PythonValue(kernel.Attrs["forbid_spills"])}{kwargs})
                         self.store_prepared_triton_kernel({PythonString(kernel.Name)}, pyntt_execution_device, pyntt_prepared_kernel)
             """;
         return $"""

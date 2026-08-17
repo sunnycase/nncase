@@ -145,6 +145,12 @@ public abstract class NTTTarget : Target
         passManager.Add<NTTTIRSelectionPass>(NTTModuleCompiler.ModuleKind);
     }
 
+    /// <inheritdoc/>
+    public override void RegisterTIRPreBufferizePass(IPassManager passManager, CompileOptions options)
+    {
+        passManager.Add<SelectTIRMicroKernelsPass>(NTTModuleCompiler.ModuleKind);
+    }
+
     public override void RegisterPostAutoVectorizePass(IPassManager passManager, CompileOptions options)
     {
         passManager.AddWithName<DataflowPass>("FoldPostOps").Configure(p =>
@@ -159,6 +165,8 @@ public abstract class NTTTarget : Target
         passManager.AddWithName<DataflowPass>("FusePackedMatMulPostOps").Configure(p =>
         {
             p.Add<Passes.Rules.NTT.FusePackedMatMulAdd>();
+            p.Add<Passes.Rules.NTT.FusePackedMatMulAddThroughShardedView>();
         });
+        passManager.Add<FusePackedMatMulNormStatsPass>();
     }
 }

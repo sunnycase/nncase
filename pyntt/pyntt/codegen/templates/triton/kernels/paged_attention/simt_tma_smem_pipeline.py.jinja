@@ -186,7 +186,7 @@ def {{ model["FunctionName"] }}__regular_producer(key_writer, value_writer, {{ h
     for seq_scan in tl.range(0, num_seqs):
         max_seq_len = tl.maximum(max_seq_len, tl.load(seq_lens + seq_scan).to(tl.int64))
     direct_context = {{ "(num_seqs == 1) & (max_seq_len <= " ~ model["DirectContextThreshold"] ~ ")" if model["HasDirectOutput"] else "False" }}
-    single_token_context = direct_context & (max_seq_len == 1)
+    single_token_context = (num_seqs == 1) & (max_seq_len == 1)
     block_table_blocks = tl.cdiv(max_seq_len, {{ cache["BlockSize"] }})
     split_span = tl.cdiv(max_seq_len, {{ ctx["split_count"] * ctx["attention_block_size"] }}) * {{ ctx["attention_block_size"] }}
     planned_split_begin = tl.minimum(({{ ctx["split_coord"] }}).to(tl.int64) * split_span, max_seq_len)
@@ -241,6 +241,7 @@ def {{ model["FunctionName"] }}__regular_consumer(key_reader, value_reader, {{ h
     query_start_loc = {{ model["QueryStartLocArgument"] }}
     seq_lens = {{ model["SeqLensArgument"] }}
     num_seqs = {{ model["NumSeqsArgument"] }}
+    layer_id_value = (tl.full((), 0, tl.int32) + ({{ model["LayerIdExpression"] }})).to(tl.int32)
 {% for name, key in (("query", "Query"), ("scale_ptr", "Scale")) %}
     {{ name }} = {{ ptr(model, key) }}
 {% endfor %}
@@ -254,7 +255,8 @@ def {{ model["FunctionName"] }}__regular_consumer(key_reader, value_reader, {{ h
     for seq_scan in tl.range(0, num_seqs):
         max_seq_len = tl.maximum(max_seq_len, tl.load(seq_lens + seq_scan).to(tl.int64))
     direct_context = {{ "(num_seqs == 1) & (max_seq_len <= " ~ model["DirectContextThreshold"] ~ ")" if model["HasDirectOutput"] else "False" }}
-    single_token_context = direct_context & (max_seq_len == 1)
+    single_token_context = (num_seqs == 1) & (max_seq_len == 1)
+    direct_owner = {{ ctx["split_coord"] }} == 0
     block_table_blocks = tl.cdiv(max_seq_len, {{ cache["BlockSize"] }})
     split_span = tl.cdiv(max_seq_len, {{ ctx["split_count"] * ctx["attention_block_size"] }}) * {{ ctx["attention_block_size"] }}
     planned_split_begin = tl.minimum(({{ ctx["split_coord"] }}).to(tl.int64) * split_span, max_seq_len)
@@ -342,6 +344,31 @@ def {{ model["FunctionName"] }}__regular_consumer(key_reader, value_reader, {{ h
                 tl.zeros(({{ ctx["q_head_group_tile"] }}, {{ cache["HeadDim"] }}), tl.float32),
                 {{ ctx["simt_acc_layout_name"] }},
             )
+            single_query_active = single_token_context & direct_owner & found_seq
+{% if cache["IdLength"] > 1 %}
+            single_topology_id = tl.load(block_table, mask=single_query_active, other=0).to(tl.int64)
+{% endif %}
+            single_block_id = tl.load(block_table + {{ cache["IdLength"] - 1 }}, mask=single_query_active, other=0).to(tl.int64)
+            single_cache_block_id = {{ ctx["value_cache_block_id"] | replace("key_topology_id", "single_topology_id") | replace("key_block_id", "single_block_id") }}
+            single_value_page = kv_cache + single_cache_block_id * {{ cache["BlockElements"] }}
+{% if cache["ValueVectorizedDim"] == 5 %}
+            single_value_offsets = {{ cache["ValueSectionOffset"] }} + ((layer_id_value * {{ cache["ValueLayerStride"] }} + kv_head * {{ cache["ValueHeadStride"] }} + query_dim_physical * {{ cache["ValueDimBlockStride"] }}) * {{ cache["ValueLaneCount"] }} + query_dim_lane0)
+{% else %}
+            single_value_offsets = {{ cache["ValueSectionOffset"] }} + ((layer_id_value * {{ cache["ValueLayerStride"] }} + kv_head * {{ cache["ValueHeadStride"] }} + query_dim_logical * {{ cache["ValueDimBlockStride"] }}) * {{ cache["ValueLaneCount"] }})
+{% endif %}
+            single_value = tl.broadcast_to(
+                tl.load(single_value_page + single_value_offsets, mask=single_query_active, other=0.0, cache_modifier=".cg"),
+                {{ ctx["query_structured_shape"] }},
+            )
+            single_acc = tle.encoding(
+                tl.reshape(single_value, ({{ ctx["q_head_group_tile"] }}, {{ cache["HeadDim"] }})),
+                {{ ctx["simt_acc_layout_name"] }},
+            ).to(tl.float32)
+            single_head_mask = tle.encoding(single_query_active & q_head_mask, {{ model["FunctionName"] }}__head_layout)
+            single_acc_mask = tle.encoding((single_query_active & q_head_mask)[:, None], {{ ctx["simt_acc_layout_name"] }})
+            max_score = tl.where(single_head_mask, 0.0, max_score)
+            sum_exp = tl.where(single_head_mask, 1.0, sum_exp)
+            acc = tl.where(single_acc_mask, single_acc, acc)
             causal_end = tl.minimum(seq_len, context_len + query_id + 1).to(tl.int32)
             active_end = tl.where(single_token_context, split_begin, tl.where(found_seq, tl.maximum(split_begin, tl.minimum(split_end, causal_end)), split_begin))
             full_end = split_begin + ((active_end - split_begin) // {{ ctx["attention_block_size"] }}) * {{ ctx["attention_block_size"] }}
@@ -381,7 +408,7 @@ def {{ model["FunctionName"] }}__producer(key_writer, value_writer, {{ helper_pa
     for seq_scan in tl.range(0, num_seqs):
         max_seq_len = tl.maximum(max_seq_len, tl.load(seq_lens + seq_scan).to(tl.int64))
     direct_context = {{ "(num_seqs == 1) & (max_seq_len <= " ~ model["DirectContextThreshold"] ~ ")" if model["HasDirectOutput"] else "False" }}
-    single_token_context = direct_context & (max_seq_len == 1)
+    single_token_context = (num_seqs == 1) & (max_seq_len == 1)
     direct_owner = {{ ctx["split_coord"] }} == 0
     run_regular = (~single_token_context) & ((direct_context & direct_owner) | ((~direct_context) & ({{ ctx["split_coord"] }} < {{ ctx["split_count"] }})))
     if run_regular:
@@ -405,50 +432,10 @@ def {{ model["FunctionName"] }}__consumer(key_reader, value_reader, {{ helper_pa
     for seq_scan in tl.range(0, num_seqs):
         max_seq_len = tl.maximum(max_seq_len, tl.load(seq_lens + seq_scan).to(tl.int64))
     direct_context = {{ "(num_seqs == 1) & (max_seq_len <= " ~ model["DirectContextThreshold"] ~ ")" if model["HasDirectOutput"] else "False" }}
-    single_token_context = direct_context & (max_seq_len == 1)
+    single_token_context = (num_seqs == 1) & (max_seq_len == 1)
     direct_owner = {{ ctx["split_coord"] }} == 0
     run_regular = (~single_token_context) & ((direct_context & direct_owner) | ((~direct_context) & ({{ ctx["split_coord"] }} < {{ ctx["split_count"] }})))
-{% if model["HasDirectOutput"] %}
-    if single_token_context:
-        if direct_owner:
-            layer_id_value = (tl.full((), 0, tl.int32) + ({{ model["LayerIdExpression"] }})).to(tl.int32)
-            direct_output = {{ ptr(model, "Output") }}
-{{ common.structured_axis(ctx["query_dim_axis"], "            ") }}
-            for local_query_id in tl.range(0, {{ dim(ctx["local_query_tokens"]) }}):
-                global_query_id = {{ ctx["global_query_id"] }}
-                single_query_active = (global_query_id < {{ dim(ctx["global_query_tokens"]) }}) & (global_query_id < num_tokens)
-                global_q_head_begin = (tl.full((), 0, tl.int32) + ({{ ctx["global_q_head_begin"] }})).to(tl.int32)
-                first_kv_head = global_q_head_begin // {{ ctx["q_head_group_size"] }}
-                local_kv_groups = tl.cdiv((global_q_head_begin % {{ ctx["q_head_group_size"] }}) + {{ ctx["local_q_heads"] }}, {{ ctx["q_head_group_size"] }})
-                for local_kv_group in tl.range(0, local_kv_groups):
-                    kv_head = (first_kv_head + local_kv_group).to(tl.int32)
-{% if model["RematerializeEntryIndices"] %}
-                    q_group_offsets = tle.gpu.rematerialize_index(tl.arange(0, {{ ctx["q_head_group_tile"] }}))
-{% else %}
-                    q_group_offsets = tl.arange(0, {{ ctx["q_head_group_tile"] }})
-{% endif %}
-                    global_q_heads = kv_head * {{ ctx["q_head_group_size"] }} + q_group_offsets
-                    local_q_heads = global_q_heads - global_q_head_begin
-                    q_head_mask = (q_group_offsets < {{ ctx["q_head_group_size"] }}) & (local_q_heads >= 0) & (local_q_heads < {{ ctx["local_q_heads"] }}) & (global_q_heads < {{ model["GlobalNumQueryHeads"] }})
-                    safe_local_q_heads = tl.maximum(0, tl.minimum(local_q_heads, {{ ctx["local_q_heads"] - 1 }}))
-{% if cache["IdLength"] > 1 %}
-                    single_topology_id = tl.load(block_table, mask=single_query_active, other=0).to(tl.int64)
-{% endif %}
-                    single_block_id = tl.load(block_table + {{ cache["IdLength"] - 1 }}, mask=single_query_active, other=0).to(tl.int64)
-                    single_cache_block_id = {{ ctx["value_cache_block_id"] | replace("key_topology_id", "single_topology_id") | replace("key_block_id", "single_block_id") }}
-                    single_value_page = kv_cache + single_cache_block_id * {{ cache["BlockElements"] }}
-{% if cache["ValueVectorizedDim"] == 5 %}
-                    single_value_offsets = {{ cache["ValueSectionOffset"] }} + ((layer_id_value * {{ cache["ValueLayerStride"] }} + kv_head * {{ cache["ValueHeadStride"] }} + query_dim_physical * {{ cache["ValueDimBlockStride"] }}) * {{ cache["ValueLaneCount"] }} + query_dim_lane0)
-{% else %}
-                    single_value_offsets = {{ cache["ValueSectionOffset"] }} + ((layer_id_value * {{ cache["ValueLayerStride"] }} + kv_head * {{ cache["ValueHeadStride"] }} + query_dim_logical * {{ cache["ValueDimBlockStride"] }}) * {{ cache["ValueLaneCount"] }})
-{% endif %}
-                    single_value = tl.broadcast_to(tl.load(single_value_page + single_value_offsets, mask=single_query_active, other=0.0, cache_modifier=".cg"), {{ ctx["query_structured_shape"] }})
-                    tl.store({{ access_pointer(model, "Output", "direct_output", ctx["output_access"]) }}, single_value, mask=single_query_active & {{ ctx["output_mask"] }})
-    else:
-        if run_regular:
-            {{ model["FunctionName"] }}__regular_consumer(key_reader, value_reader, {{ helper_argument_names(model) }})
-{% else %}
-    if run_regular:
+    single_token_consumer = single_token_context & {{ "direct_owner" if model["HasDirectOutput"] else "True" }}
+    if run_regular | single_token_consumer:
         {{ model["FunctionName"] }}__regular_consumer(key_reader, value_reader, {{ helper_argument_names(model) }})
-{% endif %}
 {% endif %}

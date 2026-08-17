@@ -3,9 +3,11 @@
 
 using System.Linq;
 using Nncase.IR;
+using Nncase.IR.Distributed;
 using Nncase.IR.Math;
 using Nncase.IR.NTT;
 using Nncase.PatternMatch;
+using static Nncase.PatternMatch.F.Distributed;
 using static Nncase.PatternMatch.F.Math;
 using static Nncase.PatternMatch.F.NTT;
 using static Nncase.PatternMatch.Utility;
@@ -75,5 +77,100 @@ public sealed partial class FusePackedMatMulAdd : IRewriteRule
             scale,
             packedMatMul.RhsLayout,
             addend).InheritMetaData(binaryCall);
+    }
+}
+
+/// <summary>
+/// Fuses an add through a layout-only sharded view of a packed matmul result.
+/// </summary>
+[RuleGenerator]
+public sealed partial class FusePackedMatMulAddThroughShardedView : IRewriteRule
+{
+    public FusePackedMatMulAddThroughShardedView()
+    {
+        var packedMatMul = IsPackedMatMul(
+            "packedMatMul",
+            "packedCall",
+            _ => true,
+            IsWildcard("lhs"),
+            IsWildcard("rhs"),
+            IsWildcard("scale"),
+            IsNone());
+        var viewedPackedMatMul = IsShardedView(
+            "view",
+            _ => true,
+            packedMatMul);
+
+        Pattern = IsAlt(
+            IsBinary(
+                "binary",
+                "binaryCall",
+                op => op.BinaryOp == BinaryOp.Add,
+                viewedPackedMatMul,
+                IsWildcard("addend")),
+            IsBinary(
+                "binary",
+                "binaryCall",
+                op => op.BinaryOp == BinaryOp.Add,
+                IsWildcard("addend"),
+                viewedPackedMatMul));
+    }
+
+    public IPattern Pattern { get; }
+
+    private Expr? GetReplace(
+        PackedMatMul packedMatMul,
+        Call packedCall,
+        Expr lhs,
+        Expr rhs,
+        Expr scale,
+        ShardedView view,
+        Call binaryCall,
+        Expr addend)
+    {
+        if (packedMatMul.FusedReduce ||
+            packedCall.CheckedType is not DistributedType { Partial: null } packedType ||
+            view.NewType is not DistributedType viewType ||
+            binaryCall.CheckedType is not DistributedType binaryType ||
+            !Equals(viewType, binaryType) ||
+            !Equals(addend.CheckedType, binaryType) ||
+            ReferenceEquals(addend, packedCall))
+        {
+            return null;
+        }
+
+        var packedUsers = packedCall.Users.ToArray();
+        if (packedUsers.Length != 1 ||
+            packedUsers[0] is not Call { Target: ShardedView } viewCall ||
+            !ReferenceEquals(viewCall.Target, view) ||
+            viewCall.Users.Count() != 1 ||
+            !ReferenceEquals(viewCall.Users.Single(), binaryCall))
+        {
+            return null;
+        }
+
+        var localAddend = IR.F.Distributed.ShardedView(addend, packedType);
+        if (localAddend.CheckedType is InvalidType || !Equals(localAddend.CheckedType, packedType))
+        {
+            return null;
+        }
+
+        var fused = IR.F.NTT.PackedMatMul(
+            lhs,
+            rhs,
+            packedMatMul.FusedReduce,
+            packedMatMul.OutputDataType,
+            scale,
+            packedMatMul.RhsLayout,
+            localAddend).InheritMetaData(packedCall);
+        if (fused.CheckedType is InvalidType || !Equals(fused.CheckedType, packedType))
+        {
+            return null;
+        }
+
+        var result = IR.F.Distributed.ShardedView(fused, binaryType).InheritMetaData(binaryCall);
+        return result.CheckedType is not InvalidType && Equals(result.CheckedType, binaryType)
+            ? result
+            : null;
     }
 }

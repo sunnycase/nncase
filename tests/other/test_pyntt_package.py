@@ -16,6 +16,7 @@ def _test_pyntt_codegen_manifest(render_kernel):
     attrs = dict(metadata.get("attrs", {}))
     attrs.setdefault("target_worker_width", 32)
     attrs.setdefault("target_threads_per_block", 256)
+    attrs.setdefault("target_resident_blocks_per_compute_unit", 1)
     attrs.setdefault("register_file_capacity_units", 255 * 8 * 32)
     attrs.setdefault("register_file_allocation_granularity_units", 8 * 32)
     attrs.setdefault("registers_per_thread_limit", 255)
@@ -131,8 +132,9 @@ def test_pyntt_elementwise_iteration_uses_explicit_physical_tile_width():
     )
     template = (template_dir / "_elementwise.py.jinja").read_text(encoding="utf-8")
 
-    assert "_physical_tile_width: tl.constexpr = block_size //" in template
-    assert "min(block_size // {{ ctx[\"lane_count\"] }}," in template
+    assert 'physical_width_divisor="1"' in template
+    assert '"max(1, block_size // "' in template
+    assert "_physical_tile_width: tl.constexpr = min(" in template
     assert "tl.arange(0, {{ scope }}_physical_tile_width)" in template
     assert "block_size >>" not in template
     assert "tl.broadcast_to" not in template
@@ -794,6 +796,7 @@ def test_pyntt_renderer_canonicalizes_unit_block_cyclic_tma_dimensions():
         "logical_strides": [128, 1],
         "vector_lane_shape": [8, 2, 8],
         "contiguous_rebase_extent_elements": 0,
+        "owner_stride_bytes": 0,
     }
 
     spec = _k_major_gemv_host_descriptor_spec(
@@ -1040,6 +1043,7 @@ def test_pyntt_renderer_owns_block_schedule_config():
     assert "'candidates': (32, 128, 256, 512, 1024)" in source
     assert "'num_warps': 8" in source
     assert "'num_stages': 1" in source
+    assert "'resident_blocks_per_compute_unit': 1" in source
 
     launch["num_warps"] = 8
     with pytest.raises(ValueError, match=r"unexpected fields \['num_warps'\]"):
@@ -1163,56 +1167,33 @@ def test_pyntt_paged_attention_narrows_bounded_split_indices(template_name):
     assert all(line.endswith(".to(tl.int32)") for line in causal_end_lines)
 
 
-def test_pyntt_qkv_transfer_plan_uses_exact_projection_copy_extents():
+def test_pyntt_qkv_pipeline_uses_one_canonical_fused_n_transfer():
     _add_pyntt_to_path()
-    from pyntt.codegen.render import _packed_qkv_transfer_plan
+    from pyntt.codegen.render import _packed_qkv_fixed_projection_ns
 
-    descriptor_block_ns, tiles = _packed_qkv_transfer_plan(
-        64, {"Q": 64, "K": 32, "V": 32}
+    projection_ns = _packed_qkv_fixed_projection_ns(
+        {"ProjectionNCapacities": [96, 32, 32]}
     )
+    template = (
+        Path(__file__).resolve().parents[2]
+        / "pyntt/pyntt/codegen/templates/triton/kernels/qkv_parallel_linear"
+        / "simt_fma_smem_pipeline.py.jinja"
+    ).read_text(encoding="utf-8")
 
-    assert descriptor_block_ns == {"Q": 64, "K": 32, "V": 32}
-    assert [
-        [
-            (
-                copy["prefix"],
-                copy["tile_offset"],
-                copy["projection_offset"],
-                copy["copy_n"],
-            )
-            for copy in tile
-        ]
-        for tile in tiles
-    ] == [
-        [("Q", 0, 0, 64)],
-        [("K", 0, 0, 32), ("V", 32, 0, 32)],
-    ]
+    assert projection_ns == {"Q": 96, "K": 32, "V": 32}
+    assert template.count("tle.gpu.copy(") == 1
+    assert "for n_tile in tl.static_range(" in template
+    assert "for q_tile" not in template
+    assert "for k_projection_tile" not in template
+    assert "for v_tile" not in template
 
 
-def test_pyntt_qkv_transfer_plan_preserves_common_copy_tail_fallback():
+def test_pyntt_qkv_pipeline_requires_three_projection_capacities():
     _add_pyntt_to_path()
-    from pyntt.codegen.render import _packed_qkv_transfer_plan
+    from pyntt.codegen.render import _packed_qkv_fixed_projection_ns
 
-    descriptor_block_ns, tiles = _packed_qkv_transfer_plan(
-        64, {"Q": 96, "K": 32, "V": 32}
-    )
-
-    assert descriptor_block_ns == {"Q": 32, "K": 32, "V": 32}
-    assert [
-        [
-            (
-                copy["prefix"],
-                copy["tile_offset"],
-                copy["projection_offset"],
-            )
-            for copy in tile
-        ]
-        for tile in tiles
-    ] == [
-        [("Q", 0, 0), ("Q", 32, 32)],
-        [("Q", 0, 64), ("K", 32, 0)],
-        [("V", 0, 0), ("V", 32, 32)],
-    ]
+    with pytest.raises(ValueError, match="three projection N capacities"):
+        _packed_qkv_fixed_projection_ns({"ProjectionNCapacities": [64, 32]})
 
 
 def test_pyntt_renderer_marks_dynamic_top_kernel_scalars_non_specializing():
@@ -1614,11 +1595,13 @@ class _FakeTunableJitKernel:
     def __init__(self, compiled_by_candidate):
         self.compiled_by_candidate = compiled_by_candidate
         self.attempts = []
+        self.prepare_calls = []
         self.prepared = []
 
     def prepare(self, *args, **kwargs):
         candidate = int(args[-1])
         self.attempts.append(candidate)
+        self.prepare_calls.append((args, kwargs))
         result = self.compiled_by_candidate[candidate]
         if isinstance(result, BaseException):
             raise result
@@ -1649,9 +1632,11 @@ def test_pyntt_runtime_accepts_kernel_within_fixed_resource_budget():
         argument,
         grid=(36,),
         expected_compute_num_warps=8,
+        expected_resident_blocks_per_compute_unit=1,
         registers_per_thread_limit=255,
         shared_memory_capacity_bytes=101_376,
         forbid_spills=True,
+        min_ctas_per_sm=1,
     )
     assert kernel.calls[0][0][0] is argument
     assert kernel.calls[0][1]["warmup"] is True
@@ -1666,11 +1651,39 @@ def test_pyntt_runtime_accepts_backend_warp_specialization_workers():
         kernel,
         grid=(36,),
         expected_compute_num_warps=8,
+        expected_resident_blocks_per_compute_unit=1,
         registers_per_thread_limit=255,
         shared_memory_capacity_bytes=101_376,
         forbid_spills=True,
         num_warps=8,
+        min_ctas_per_sm=1,
     )
+
+
+@pytest.mark.parametrize(
+    ("launch_options", "message"),
+    [
+        ({}, "does not specify min_ctas_per_sm"),
+        ({"min_ctas_per_sm": 2}, "requires 1 resident blocks"),
+    ],
+)
+def test_pyntt_runtime_requires_target_resident_block_contract(
+    launch_options, message
+):
+    _add_pyntt_to_path()
+    from pyntt.runtime.triton import validate_triton_kernel_resources
+
+    with pytest.raises(RuntimeError, match=message):
+        validate_triton_kernel_resources(
+            _FakeJitKernel(_FakeCompiledKernel()),
+            grid=(36,),
+            expected_compute_num_warps=8,
+            expected_resident_blocks_per_compute_unit=1,
+            registers_per_thread_limit=255,
+            shared_memory_capacity_bytes=101_376,
+            forbid_spills=True,
+            **launch_options,
+        )
 
 
 @pytest.mark.parametrize(
@@ -1692,9 +1705,11 @@ def test_pyntt_runtime_rejects_kernel_outside_fixed_resource_budget(compiled, me
             _FakeJitKernel(compiled),
             grid=(36,),
             expected_compute_num_warps=8,
+            expected_resident_blocks_per_compute_unit=1,
             registers_per_thread_limit=255,
             shared_memory_capacity_bytes=shared_capacity,
             forbid_spills=True,
+            min_ctas_per_sm=1,
         )
 
 
@@ -1716,16 +1731,22 @@ def test_pyntt_runtime_prepares_first_resource_feasible_tuning_candidate():
         "kernel_args": (),
         "grid_for_candidate": lambda _: (1,),
         "expected_compute_num_warps": 8,
+        "expected_resident_blocks_per_compute_unit": 1,
         "registers_per_thread_limit": 255,
         "shared_memory_capacity_bytes": 101_376,
         "forbid_spills": True,
         "num_warps": 8,
+        "min_ctas_per_sm": 1,
     }
     prepared = prepare_and_validate_triton_kernel(
         "test_kernel", "block_size", (128, 256, 512), **kwargs
     )
     assert prepared.parameter_value == 128
     assert kernel.attempts == [512, 256, 128]
+    assert all(
+        call_kwargs["min_ctas_per_sm"] == 1
+        for _, call_kwargs in kernel.prepare_calls
+    )
 
     prepared.launch(grid=(4,))
     assert kernel.prepared[-1].launches == [((), {"grid": (4,), "stream": None})]
@@ -1745,10 +1766,12 @@ def test_pyntt_runtime_requires_prepared_triton_abi():
             kernel_args=(),
             grid_for_candidate=lambda _: (1,),
             expected_compute_num_warps=8,
+            expected_resident_blocks_per_compute_unit=1,
             registers_per_thread_limit=255,
             shared_memory_capacity_bytes=101_376,
             forbid_spills=True,
             num_warps=8,
+            min_ctas_per_sm=1,
         )
 
 

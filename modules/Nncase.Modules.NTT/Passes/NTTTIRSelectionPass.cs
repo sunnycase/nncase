@@ -44,67 +44,41 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
         _compileOptions = compileOptions;
     }
 
-    protected override Expr FinalizeSelectedExpr(
-        Call sourceCall,
-        Expr selectedExpr,
-        TIRSelectionContext context)
+    protected override TIR.Buffer CreateIntermediateBuffer(
+        Expr sourceExpr,
+        IRType type,
+        MemoryLocation defaultLocation,
+        string name)
     {
-        if (selectedExpr is Sequential sequential)
+        if (_compileOptions.TargetOptions is PyNTTTargetOptions &&
+            type is DistributedType distributedType &&
+            (distributedType.Partial is not null ||
+             IsCompactPartialReshardResult(sourceExpr)))
         {
-            return sequential.With(
-                fields: sequential.Fields.ToArray()
-                    .Select(field => FinalizeSelectedExpr(sourceCall, field, context))
-                    .ToArray());
+            return T.CreateCompactPerOwnerBuffer(distributedType, out _, name);
         }
 
-        if (selectedExpr is IfThenElse conditional)
+        return base.CreateIntermediateBuffer(sourceExpr, type, defaultLocation, name);
+    }
+
+    protected override BufferLayoutAnnotation? GetBufferParameterLayout(
+        IRType type,
+        BufferVarRole role,
+        bool isEntry)
+    {
+        if (!isEntry &&
+            _compileOptions.TargetOptions is PyNTTTargetOptions &&
+            type is DistributedType { Partial: not null } distributedType)
         {
-            return conditional.With(
-                then: (Sequential)FinalizeSelectedExpr(sourceCall, conditional.Then, context),
-                @else: (Sequential)FinalizeSelectedExpr(sourceCall, conditional.Else, context));
+            (_, var strides) = TensorUtilities.GetTensorMaxSizeAndStridesExpr(
+                distributedType.TensorType,
+                distributedType);
+            return BufferLayoutAnnotation.ExactStrided(
+                strides,
+                DistributedBufferStorageKind.CompactPerOwner);
         }
 
-        if (selectedExpr is not Call { Target: TIR.NTT.NTTKernelOp kernelOp } selectedCall)
-        {
-            return selectedExpr;
-        }
-
-        var arguments = selectedCall.Arguments.ToArray();
-        if (arguments.Length == 0 || arguments[^1] is not None)
-        {
-            throw new InvalidOperationException(
-                $"TIR kernel {kernelOp.GetType().Name} must carry an initially None shared_workspace operand.");
-        }
-
-        if (_compileOptions.TargetOptions is not INTTTargetOptions targetOptions)
-        {
-            throw new InvalidOperationException(
-                $"NTT TIR Selection requires {nameof(INTTTargetOptions)}, got {_compileOptions.TargetOptions?.GetType().Name ?? "null"}.");
-        }
-
-        var semanticArguments = arguments[..^1];
-        var selection = targetOptions.TIRMicroKernelSelector.Select(
-            new TIRMicroKernelSelectionContext(
-                kernelOp,
-                semanticArguments,
-                targetOptions.TargetMachineModel));
-        if (selection?.TransferPipeline is { } transferPipeline)
-        {
-            ValidateTransferPipelineContract(
-                kernelOp,
-                semanticArguments,
-                selection,
-                transferPipeline);
-        }
-
-        var workspaces = selection is null
-            ? Array.Empty<BaseExpr>()
-            : selection.SharedWorkspaces
-                .Select(descriptor => (BaseExpr)CreateSharedWorkspaceBuffer(kernelOp, descriptor))
-                .ToArray();
-        var result = selectedCall.With(arguments: [.. semanticArguments, TIRSharedWorkspace.Pack(workspaces)]);
-        result.Metadata.TIRMicroKernel = selection;
-        return result;
+        return base.GetBufferParameterLayout(type, role, isEntry);
     }
 
     protected override Expr SelectCall(Call call, IReadOnlyList<BaseExpr> arguments, ref Expr output, TIRSelectionContext context)
@@ -175,6 +149,27 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
                     matmul.FusedReduce,
                     matmul.RhsLayout,
                     (Expr)arguments[IR.NTT.PackedMatMul.Addend.Index]);
+            case IR.NTT.PackedMatMulNormStats matmulNormStats:
+                {
+                    var outputBase = Unsafe.As<Expr, BaseExpr>(ref output);
+                    if (outputBase is not IR.Tuple outputs || outputs.Count != 2)
+                    {
+                        throw new NotSupportedException(
+                            "PackedMatMulNormStats TIR selection expects value and local-statistics outputs.");
+                    }
+
+                    return TIR.F.NTT.PackedMatMulNormStats(
+                        (Expr)arguments[0],
+                        (Expr)arguments[1],
+                        (Expr)outputs[0],
+                        (Expr)outputs[1],
+                        None.Default,
+                        (Expr)call[IR.NTT.PackedMatMulNormStats.Scale],
+                        matmulNormStats.RhsLayout,
+                        matmulNormStats.Axis,
+                        matmulNormStats.UseMean,
+                        (Expr)arguments[IR.NTT.PackedMatMulNormStats.Addend.Index]);
+                }
             case IR.NTT.PackedMatMulGlu matmulGlu:
                 return TIR.F.NTT.PackedMatMulGlu(
                     (Expr)arguments[0],
@@ -455,47 +450,70 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
         }
     }
 
-    private static void ValidateTransferPipelineContract(
-        TIR.NTT.NTTKernelOp kernelOp,
-        IReadOnlyList<BaseExpr> semanticArguments,
-        TIRMicroKernelSelection selection,
-        TIRTransferPipelineContract contract)
+    protected override IReadOnlyList<BaseExpr> PrepareCallerAllocatedPrimFunctionArguments(
+        TIR.PrimFunction primFunction,
+        IReadOnlyList<BaseExpr> arguments,
+        TIRSelectionContext context)
     {
-        foreach (var channel in contract.Channels)
+        var parameters = primFunction.Parameters.ToArray();
+        var prepared = arguments.ToArray();
+        for (var index = 0; index < parameters.Length; index++)
         {
-            foreach (var argumentIndex in channel.SourceArgumentIndices)
+            if (parameters[index] is BufferVar
+                {
+                    Role: BufferVarRole.Output,
+                    LayoutAnnotation.DistributedStorageKind: DistributedBufferStorageKind.CompactPerOwner,
+                } compactOutputParameter)
             {
-                if ((uint)argumentIndex >= (uint)semanticArguments.Count)
+                if (index >= prepared.Length ||
+                    prepared[index] is not TIR.Buffer
+                    {
+                        DistributedStorageKind: DistributedBufferStorageKind.CompactPerOwner,
+                        MemSpan.Buffer.Location: MemoryLocation.ChipLocalData,
+                    })
                 {
                     throw new InvalidOperationException(
-                        $"TIR microkernel {selection.Family}/{selection.Variant} for " +
-                        $"{kernelOp.GetType().Name} transfer channel {channel.Name} declares " +
-                        $"invalid source operand {argumentIndex}.");
+                        $"Compact-per-owner output {primFunction.Name}.{compactOutputParameter.Name} " +
+                        "requires caller-allocated ChipLocalData backing.");
                 }
 
-                var parameter = kernelOp.Parameters[argumentIndex];
-                var effect = kernelOp.GetMemoryEffect(parameter);
-                if (MemoryEffectUtility.GetPhysicalBufferAccessMode(effect) != MemoryAccessMode.Read)
-                {
-                    throw new InvalidOperationException(
-                        $"TIR microkernel {selection.Family}/{selection.Variant} for " +
-                        $"{kernelOp.GetType().Name} transfer channel {channel.Name} declares " +
-                        $"source operand {argumentIndex} ({parameter.Name}) with non-read-only " +
-                        $"memory effect {effect.Mode}.");
-                }
+                continue;
             }
 
-            foreach (var workspaceIndex in channel.SharedWorkspaceIndices)
-            {
-                if ((uint)workspaceIndex >= (uint)selection.SharedWorkspaces.Length)
+            if (parameters[index] is not BufferVar
                 {
-                    throw new InvalidOperationException(
-                        $"TIR microkernel {selection.Family}/{selection.Variant} for " +
-                        $"{kernelOp.GetType().Name} transfer channel {channel.Name} declares " +
-                        $"invalid Shared workspace {workspaceIndex}.");
-                }
+                    Role: BufferVarRole.Output,
+                    LayoutAnnotation.DistributedStorageKind: DistributedBufferStorageKind.CanonicalGlobal,
+                } outputParameter)
+            {
+                continue;
             }
+
+            if (index >= prepared.Length)
+            {
+                throw new InvalidOperationException(
+                    $"Caller-allocated PrimFunction {primFunction.Name} is missing canonical output argument " +
+                    $"{outputParameter.Name} at index {index}.");
+            }
+
+            if (prepared[index] is not TIR.Buffer actualBuffer ||
+                actualBuffer.DistributedType is null)
+            {
+                throw new InvalidOperationException(
+                    $"Canonical output {primFunction.Name}.{outputParameter.Name} requires a distributed " +
+                    $"TIR.Buffer argument, got {prepared[index].GetType().Name}.");
+            }
+
+            if (actualBuffer.DistributedStorageKind == DistributedBufferStorageKind.CanonicalGlobal &&
+                actualBuffer.MemSpan.Buffer.Location != MemoryLocation.Data)
+            {
+                continue;
+            }
+
+            (prepared[index], _) = EnsureChipLocalShardedBacking(actualBuffer, context);
         }
+
+        return prepared;
     }
 
     private Expr GeneratePagedAttention(
@@ -718,9 +736,9 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
                 shardedView.NewType,
                 out _,
                 $"const_sharded_view_{_shardedViewIndex++}");
-            if (output is BufferVar { Role: BufferVarRole.Output } outputParameter)
+            if (IsCallerOutputBuffer(output))
             {
-                return GenerateTensorStore(constView, outputParameter);
+                return GenerateTensorStore(constView, output);
             }
 
             output = constView;
@@ -737,7 +755,7 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
         if (arguments[IR.Distributed.ShardedView.Input.Index] is not TIR.Buffer sourceBuffer)
         {
             throw new InvalidOperationException(
-                $"ShardedView TIR selection expects its distributed source to lower to Buffer, got " +
+                $"ShardedView TIR selection expects its distributed source to lower to TIR.Buffer, got " +
                 $"{arguments[IR.Distributed.ShardedView.Input.Index].GetType().Name}.");
         }
 
@@ -786,6 +804,31 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
         TIRSelectionContext context)
     {
         var oldPhysicalBuffer = source.MemSpan.Buffer;
+        if (oldPhysicalBuffer.Location == MemoryLocation.Output &&
+            oldPhysicalBuffer.Start is BufferVar { Role: BufferVarRole.Output } outputParameter)
+        {
+            if (source.DistributedType is not { } distributedType)
+            {
+                throw new InvalidOperationException(
+                    $"Caller output {source.Name} reached ShardedView without a DistributedType descriptor.");
+            }
+
+            if (source.DistributedStorageKind != DistributedBufferStorageKind.CanonicalGlobal)
+            {
+                source = CanonicalizeCallerOutputBacking(
+                    source,
+                    outputParameter,
+                    distributedType,
+                    context);
+            }
+
+            var outputComponentBase = _shardedComponentBases.TryGetValue(source, out var knownComponentBase)
+                ? knownComponentBase
+                : source.MemSpan.Start;
+            _shardedComponentBases.TryAdd(source, outputComponentBase);
+            return (source, outputComponentBase);
+        }
+
         if (oldPhysicalBuffer.Location == MemoryLocation.ChipLocalData)
         {
             if (!_shardedComponentBases.TryGetValue(source, out var componentBase))
@@ -866,6 +909,45 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
 
         var canonicalSource = rewrittenBuffers[source];
         return (canonicalSource, _shardedComponentBases[canonicalSource]);
+    }
+
+    private TIR.Buffer CanonicalizeCallerOutputBacking(
+        TIR.Buffer source,
+        BufferVar outputParameter,
+        DistributedType distributedType,
+        TIRSelectionContext context)
+    {
+        if (outputParameter.Role != BufferVarRole.Output || outputParameter.Location != MemoryLocation.Output)
+        {
+            throw new InvalidOperationException(
+                $"ShardedView source must be backed by a caller-allocated output, got " +
+                $"{outputParameter.Role}/{outputParameter.Location}.");
+        }
+
+        var (localShape, globalStrides, byteSpanSize) = GetShardedBufferLayout(distributedType);
+        var canonicalLayout = BufferLayoutAnnotation.ExactStrided(
+            globalStrides,
+            DistributedBufferStorageKind.CanonicalGlobal);
+        var canonicalParameter = outputParameter.With(layoutAnnotation: canonicalLayout);
+        var physicalBuffer = new TIR.PhysicalBuffer(
+            distributedType.TensorType.DType.SizeInBytes,
+            canonicalParameter,
+            byteSpanSize,
+            MemoryLocation.Output);
+        var canonicalSource = new TIR.Buffer(
+            source.Name,
+            distributedType.TensorType.DType,
+            new TIR.MemSpan(physicalBuffer, 0, byteSpanSize),
+            localShape,
+            globalStrides,
+            distributedType,
+            distributedStorageKind: DistributedBufferStorageKind.CanonicalGlobal);
+        ReplaceUtility.ReplaceAllUsesWith(outputParameter, canonicalParameter);
+        ReplaceUtility.ReplaceAllUsesWith(source, canonicalSource);
+        context.ReplaceSelectedValue(outputParameter, canonicalParameter);
+        context.ReplaceSelectedValue(source, canonicalSource);
+        _shardedComponentBases.Add(canonicalSource, Dimension.Zero);
+        return canonicalSource;
     }
 
     private TIR.Buffer CreateLocalShardedAlias(
@@ -1034,10 +1116,9 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
             throw new NotSupportedException($"{opName} only supports buffer input, got {input.GetType().Name}.");
         }
 
-        if (output is BufferVar { Role: BufferVarRole.Output })
+        if (IsCallerOutputBuffer(output))
         {
-            var outputBuffer = CreateMetadataBuffer(output, MemoryLocation.Output, $"{opName}_output");
-            return GenerateTensorStore(CreateLogicalView(opName, inputBuffer, outputBuffer), output);
+            return GenerateTensorStore(CreateLogicalView(opName, inputBuffer, (TIR.Buffer)output), output);
         }
 
         if (output is not TIR.Buffer selectedOutput)
@@ -1079,51 +1160,6 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
         return buffer;
     }
 
-    private TIR.Buffer CreateSharedWorkspaceBuffer(
-        TIR.NTT.NTTKernelOp kernelOp,
-        TIRSharedWorkspaceDescriptor descriptor)
-    {
-        if (string.IsNullOrWhiteSpace(descriptor.Name))
-        {
-            throw new InvalidOperationException(
-                $"TIR microkernel {kernelOp.GetType().Name} declared an unnamed shared workspace.");
-        }
-
-        if (descriptor.Type.Shape is not RankedShape shape)
-        {
-            throw new InvalidOperationException(
-                $"TIR microkernel {kernelOp.GetType().Name} shared workspace {descriptor.Name} must have a ranked shape.");
-        }
-
-        if (descriptor.AlignmentBytes <= 0 ||
-            (descriptor.AlignmentBytes & (descriptor.AlignmentBytes - 1)) != 0 ||
-            descriptor.AlignmentBytes < descriptor.Type.DType.SizeInBytes)
-        {
-            throw new InvalidOperationException(
-                $"TIR microkernel {kernelOp.GetType().Name} shared workspace {descriptor.Name} has invalid " +
-                $"alignment {descriptor.AlignmentBytes} for {descriptor.Type.DType}.");
-        }
-
-        (var size, var strides) = TensorUtilities.GetTensorMaxSizeAndStridesExpr(descriptor.Type, distributedType: null);
-        if (CompilerServices.GetMaxShape([size])[0] <= 0)
-        {
-            throw new InvalidOperationException(
-                $"TIR microkernel {kernelOp.GetType().Name} shared workspace {descriptor.Name} must contain at least one byte.");
-        }
-
-        var storage = new PhysicalBuffer(
-            descriptor.AlignmentBytes,
-            size,
-            MemoryLocation.Shared);
-        return new TIR.Buffer(
-            $"{kernelOp.GetType().Name}_{descriptor.Name}_shared_{_bufferIndex++}",
-            descriptor.Type.DType,
-            new MemSpan(storage),
-            shape.Dimensions.ToArray(),
-            strides,
-            distributedType: null);
-    }
-
     private static (TensorType TensorType, DistributedType? DistributedType) GetTensorTypeAndDistributedType(IRType type, string context)
         => type switch
         {
@@ -1134,6 +1170,19 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
 
     private static IRType GetBufferType(TIR.Buffer buffer)
         => (IRType?)buffer.DistributedType ?? new TensorType(buffer.ElemType, buffer.Dimensions.ToArray());
+
+    private static bool IsCallerOutputBuffer(Expr expr)
+        => expr is TIR.Buffer
+        {
+            MemSpan.Buffer.Start: BufferVar { Role: BufferVarRole.Output },
+        };
+
+    private static bool IsCompactPartialReshardResult(Expr sourceExpr)
+        => sourceExpr is Call sourceCall &&
+            sourceCall.Target is IR.Distributed.Boxing &&
+            sourceCall[IR.Distributed.Boxing.Input].CheckedType is DistributedType { Partial: not null } &&
+            sourceCall.CheckedType is DistributedType { Partial: null } outputType &&
+            outputType.AxisPolicies.AsValueEnumerable().All(policy => policy is SBPBroadCast);
 
     private static Expr GenerateTensorStore(TIR.Buffer source, Expr destination)
     {
