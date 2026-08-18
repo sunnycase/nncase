@@ -1,0 +1,81 @@
+{% import "triton/kernels/_common.py.jinja" as common with context %}
+{% import "triton/kernels/_producer_consumer.py.jinja" as phases with context %}
+{% set ctx = sampling_context(model) %}
+{% set history_processor_flags = model["ProcessorFlagValues"]["RepetitionPenalty"] + model["ProcessorFlagValues"]["FrequencyPenalty"] + model["ProcessorFlagValues"]["PresencePenalty"] %}
+# generated from PyNTT Jinja sampling/partial.py.jinja
+# {{ model["Comment"] }}; vocab={{ model["VocabSize"] }}
+{{ phases.consumer_header(model) }}
+{{ common.mesh_coordinates(model["MeshAxes"]) }}
+    logits_ptr = {{ ptr(model, "Logits") }}
+    processed_ptr = {{ ptr(model, "ProcessedLogits") }}
+    argmax_state_ptr = {{ ptr(model, "ArgMaxState") }}
+    sampling_tile: tl.constexpr = block_size
+
+    for batch in tl.static_range(0, {{ model["MaxBatchSize"] }}):
+        active = (batch < {{ ctx["global_batch"] }}) & (tl.load({{ model["Active"] }} + batch) != 0)
+        processor_flags = tl.load({{ model["ProcessorFlags"] }} + batch).to(tl.uint32)
+        frequency_penalty = 0.0
+        if (processor_flags & {{ model["ProcessorFlagValues"]["FrequencyPenalty"] }}) != 0:
+            frequency_penalty = tl.load({{ model["FrequencyPenalty"] }} + batch).to(tl.float32)
+        presence_penalty = 0.0
+        if (processor_flags & {{ model["ProcessorFlagValues"]["PresencePenalty"] }}) != 0:
+            presence_penalty = tl.load({{ model["PresencePenalty"] }} + batch).to(tl.float32)
+        repetition_penalty = 1.0
+        if (processor_flags & {{ model["ProcessorFlagValues"]["RepetitionPenalty"] }}) != 0:
+            repetition_penalty = tl.load({{ model["RepetitionPenalty"] }} + batch).to(tl.float32)
+        reads_output_counts = (
+            processor_flags
+            & {{ history_processor_flags }}
+        ) != 0
+        state_row = batch * {{ model["VocabSize"] }}
+        local_argmax_keys = tl.zeros((sampling_tile,), dtype=tl.uint64)
+
+        for local_start in tl.range(0, {{ ctx["local_vocab"] }}, sampling_tile):
+            local_token = local_start + tl.arange(0, sampling_tile)
+            global_token = ({{ ctx["global_token"] }}).to(tl.int32)
+            token_mask = active & (local_token < {{ ctx["local_vocab"] }}) & (global_token < {{ model["VocabSize"] }})
+            raw = tl.load(logits_ptr + {{ ctx["logits_offset"] }}, mask=token_mask, other=-float("inf")).to(tl.float32)
+            state_offset = state_row + global_token
+            allowed = tl.full(token_mask.shape, 1, tl.int1)
+            if (processor_flags & {{ model["ProcessorFlagValues"]["AllowedTokenMask"] }}) != 0:
+                allowed = tl.load({{ model["AllowedTokenMask"] }} + state_offset, mask=token_mask, other=0) != 0
+            forbidden = tl.full(token_mask.shape, 0, tl.int1)
+            if (processor_flags & {{ model["ProcessorFlagValues"]["ForbiddenTokenMask"] }}) != 0:
+                forbidden = tl.load({{ model["ForbiddenTokenMask"] }} + state_offset, mask=token_mask, other=1) != 0
+            output_count = tl.zeros(token_mask.shape, dtype=tl.float32)
+            if reads_output_counts:
+                output_count = tl.load({{ model["OutputTokenCounts"] }} + state_offset, mask=token_mask, other=0).to(tl.float32)
+            value = raw
+            if (processor_flags & {{ model["ProcessorFlagValues"]["LogitBias"] }}) != 0:
+                value += tl.load({{ model["LogitBias"] }} + state_offset, mask=token_mask, other=0.0).to(tl.float32)
+            if (processor_flags & {{ model["ProcessorFlagValues"]["RepetitionPenalty"] }}) != 0:
+                prompt_seen = tl.load({{ model["PromptTokenMask"] }} + state_offset, mask=token_mask, other=0) != 0
+                repeated = prompt_seen | (output_count != 0.0)
+                repeated_value = tl.where(value > 0.0, value / repetition_penalty, value * repetition_penalty)
+                value = tl.where(repeated & (repetition_penalty != 1.0), repeated_value, value)
+            if (processor_flags & {{ model["ProcessorFlagValues"]["FrequencyPenalty"] }}) != 0:
+                value -= output_count * frequency_penalty
+            if (processor_flags & {{ model["ProcessorFlagValues"]["PresencePenalty"] }}) != 0:
+                value -= tl.where(output_count != 0.0, presence_penalty, 0.0)
+            value = tl.where(token_mask & allowed & ~forbidden, value, -float("inf"))
+            tl.store(processed_ptr + {{ ctx["processed_offset"] }}, value, mask=token_mask)
+            value_bits = value.to(tl.uint32, bitcast=True)
+            ordered_value = tl.where(
+                value < 0.0,
+                ~value_bits,
+                value_bits ^ tl.full(value_bits.shape, 0x80000000, tl.uint32),
+            )
+            inverse_token = tl.full(global_token.shape, 0xFFFFFFFF, tl.uint32) - global_token.to(tl.uint32)
+            argmax_key = (ordered_value.to(tl.uint64) << 32) | inverse_token.to(tl.uint64)
+            local_argmax_keys = tl.maximum(
+                local_argmax_keys,
+                tl.where(token_mask, argmax_key, 0),
+            )
+
+        tl.store(
+            argmax_state_ptr + batch * {{ dim(model["ArgMaxStateStrides"][0]) }},
+            tl.max(local_argmax_keys),
+        )
+
+
+{{ phases.dispatch(model) }}

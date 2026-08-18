@@ -98,6 +98,12 @@ PYBIND11_MODULE(_nncase, m) {
         .value("Default", huggingface_attenion_backend::_default)
         .value("PagedAttention", huggingface_attenion_backend::paged_attention);
 
+    py::enum_<sampler_logprobs_mode>(m, "SamplerLogprobsMode")
+        .value("RawLogprobs", sampler_logprobs_mode::raw_logprobs)
+        .value("RawLogits", sampler_logprobs_mode::raw_logits)
+        .value("ProcessedLogprobs", sampler_logprobs_mode::processed_logprobs)
+        .value("ProcessedLogits", sampler_logprobs_mode::processed_logits);
+
     py::class_<huggingface_options>(m, "HuggingFaceOptions")
         .def(py::init())
         .def_property(
@@ -108,6 +114,22 @@ PYBIND11_MODULE(_nncase, m) {
             "output_hidden_states",
             py::overload_cast<>(&huggingface_options::output_hidden_states),
             py::overload_cast<bool>(&huggingface_options::output_hidden_states))
+        .def_property(
+            "enable_sampler",
+            py::overload_cast<>(&huggingface_options::enable_sampler),
+            py::overload_cast<bool>(&huggingface_options::enable_sampler))
+        .def_property(
+            "sampler_max_batch_size",
+            py::overload_cast<>(&huggingface_options::sampler_max_batch_size),
+            py::overload_cast<int32_t>(&huggingface_options::sampler_max_batch_size))
+        .def_property(
+            "sampler_max_logprobs",
+            py::overload_cast<>(&huggingface_options::sampler_max_logprobs),
+            py::overload_cast<int32_t>(&huggingface_options::sampler_max_logprobs))
+        .def_property(
+            "sampler_logprobs_mode",
+            py::overload_cast<>(&huggingface_options::sampler_logprobs_mode_value),
+            py::overload_cast<sampler_logprobs_mode>(&huggingface_options::sampler_logprobs_mode_value))
         .def_property(
             "num_layers", py::overload_cast<>(&huggingface_options::num_layers),
             py::overload_cast<int32_t>(&huggingface_options::num_layers))

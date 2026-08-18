@@ -818,7 +818,7 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
 
             from pyntt.codegen.render import render_generated_kernels
             from pyntt.runtime.interpreter import PyNTTInterpreter
-            from pyntt.runtime.tensor import get_kv_cache_num_seqs, materialize_kv_cache_blocks_per_shard, materialize_kv_cache_storage, require_kv_cache_tensor_field, resolve_execution_device, view_typed_buffer
+            from pyntt.runtime.tensor import get_kv_cache_num_seqs, materialize_kv_cache_blocks_per_shard, materialize_kv_cache_storage, require_kv_cache_tensor_field, require_object_tensor_field, resolve_execution_device, view_typed_buffer
             {{tritonRuntimeImport}}
             from .rdata import RDATA_BUNDLES
             from .specs import MODULE_SPEC
@@ -2218,8 +2218,8 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
 
     private string BuildModelKernelLaunchPython(string functionName, GeneratedKernelMetadata kernel, string[] parameterNames, string[] outputNames, RuntimeDispatchContext context, bool usePreparedWorkspace)
     {
-        var kvCacheFieldInputs = GetKVCacheFieldInputs(kernel).ToDictionary(input => input.Name, StringComparer.Ordinal);
-        var inputBindings = kernel.Inputs.Select(name => BuildKernelInputBinding(name, parameterNames, context, kvCacheFieldInputs)).ToArray();
+        var objectFieldInputs = GetObjectFieldInputs(kernel).ToDictionary(input => input.Name, StringComparer.Ordinal);
+        var inputBindings = kernel.Inputs.Select(name => BuildKernelInputBinding(name, parameterNames, context, objectFieldInputs)).ToArray();
         var inputArgs = inputBindings.Select(binding => binding.Expression).ToArray();
         var inputSetup = string.Join(
             Environment.NewLine,
@@ -2529,28 +2529,29 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
             ? throw new NotSupportedException($"PyNTT dispatch for {functionName} requires prepared {workspaceName} workspace.")
             : name;
 
-    private RuntimeBinding BuildKernelInputBinding(string name, string[] parameterNames, RuntimeDispatchContext context, IReadOnlyDictionary<string, PyNTTKVCacheFieldInputMetadata> kvCacheFieldInputs)
+    private RuntimeBinding BuildKernelInputBinding(string name, string[] parameterNames, RuntimeDispatchContext context, IReadOnlyDictionary<string, PyNTTObjectFieldInputMetadata> objectFieldInputs)
     {
-        if (!kvCacheFieldInputs.TryGetValue(name, out var kvCacheField))
+        if (!objectFieldInputs.TryGetValue(name, out var objectField))
         {
             return ResolveParameterBinding(context, name, parameterNames);
         }
 
-        var sourceExpression = ResolveParameterBinding(context, kvCacheField.SourceName, parameterNames).Expression;
-        var expression = kvCacheField.Field switch
+        var sourceExpression = ResolveParameterBinding(context, objectField.SourceName, parameterNames).Expression;
+        var expression = objectField.ObjectKind switch
         {
-            "query_start_loc" or "seq_lens" or "block_table" or "slot_mapping" when kvCacheField.DType is { } dtype =>
-                $"require_kv_cache_tensor_field({sourceExpression}, {PythonString(kvCacheField.Field)}, {context.DeviceExpression}, dtype={PythonString(dtype)})",
-            "num_seqs" => $"get_kv_cache_num_seqs({sourceExpression})",
-            "kv_caches" when kvCacheField.Storage is { } storage =>
+            "paged_attention_kv_cache" when objectField.Materialization == "tensor" && objectField.DType is { } dtype =>
+                $"require_kv_cache_tensor_field({sourceExpression}, {PythonString(objectField.Field)}, {context.DeviceExpression}, dtype={PythonString(dtype)})",
+            "paged_attention_kv_cache" when objectField.Materialization == "num_seqs" =>
+                $"get_kv_cache_num_seqs({sourceExpression})",
+            "paged_attention_kv_cache" when objectField.Materialization == "storage" && objectField.Storage is { } storage =>
                 $"materialize_kv_cache_storage({sourceExpression}, {context.DeviceExpression}, dtype={PythonString(storage.DType)}, topology_shape={PythonTuple(storage.TopologyShape.Select(value => value.ToString(CultureInfo.InvariantCulture)))}, key_tail_shape={PythonTuple(storage.KeyTailShape.Select(value => value.ToString(CultureInfo.InvariantCulture)))}, value_tail_shape={PythonTuple(storage.ValueTailShape.Select(value => value.ToString(CultureInfo.InvariantCulture)))}, key_section_elements={storage.KeySectionElements.ToString(CultureInfo.InvariantCulture)}, value_section_elements={storage.ValueSectionElements.ToString(CultureInfo.InvariantCulture)}, block_elements={storage.BlockElements.ToString(CultureInfo.InvariantCulture)}, block_size={storage.BlockSize.ToString(CultureInfo.InvariantCulture)})",
-            "kv_caches_blocks" when kvCacheField.Storage is { } storage =>
+            "paged_attention_kv_cache" when objectField.Materialization == "blocks_per_shard" && objectField.Storage is { } storage =>
                 $"materialize_kv_cache_blocks_per_shard({sourceExpression}, topology_shape={PythonTuple(storage.TopologyShape.Select(value => value.ToString(CultureInfo.InvariantCulture)))}, block_size={storage.BlockSize.ToString(CultureInfo.InvariantCulture)})",
-            "kv_caches" => throw new NotSupportedException($"Generated PyNTT kernel input {name} is missing KV-cache storage metadata."),
-            "kv_caches_blocks" => throw new NotSupportedException($"Generated PyNTT kernel input {name} is missing KV-cache storage metadata."),
-            _ => throw new NotSupportedException($"Generated PyNTT kernel input {name} references unsupported KV-cache field {kvCacheField.Field}."),
+            "sampler_state" when objectField.Materialization == "tensor" && objectField.DType is { } dtype =>
+                $"require_object_tensor_field({sourceExpression}, {PythonString("sampler_state")}, {PythonString(objectField.Field)}, {context.DeviceExpression}, dtype={PythonString(dtype)}, shape={PythonTuple(objectField.Shape.Select(value => value.ToString(CultureInfo.InvariantCulture)))})",
+            _ => throw new NotSupportedException($"Generated PyNTT kernel input {name} references unsupported {objectField.ObjectKind} field {objectField.Field} with materialization {objectField.Materialization}."),
         };
-        var localName = context.State.NewTemp($"kv_cache_{SanitizePythonIdentifier(kvCacheField.Field)}");
+        var localName = context.State.NewTemp($"{SanitizePythonIdentifier(objectField.ObjectKind)}_{SanitizePythonIdentifier(objectField.Field)}");
         return new RuntimeBinding(localName, SetupStatement: $"        {localName} = {expression}");
     }
 
@@ -3020,10 +3021,10 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
             ? args
             : Array.Empty<string>();
 
-    private static PyNTTKVCacheFieldInputMetadata[] GetKVCacheFieldInputs(GeneratedKernelMetadata kernel)
-        => kernel.Attrs.TryGetValue("kv_cache_field_inputs", out var value) && value is PyNTTKVCacheFieldInputMetadata[] args
+    private static PyNTTObjectFieldInputMetadata[] GetObjectFieldInputs(GeneratedKernelMetadata kernel)
+        => kernel.Attrs.TryGetValue("object_field_inputs", out var value) && value is PyNTTObjectFieldInputMetadata[] args
             ? args
-            : Array.Empty<PyNTTKVCacheFieldInputMetadata>();
+            : Array.Empty<PyNTTObjectFieldInputMetadata>();
 
     private static string SanitizePythonIdentifier(string value)
     {

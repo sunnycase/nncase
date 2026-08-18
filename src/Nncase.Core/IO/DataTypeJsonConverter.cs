@@ -192,6 +192,12 @@ internal sealed class DataTypeJsonConverterImpl : JsonConverter<DataType>
         {
             nameof(IR.NN.AttentionKVCacheType) => new IR.NN.AttentionKVCacheType(),
             nameof(IR.NN.PagedAttentionKVCacheType) => new IR.NN.PagedAttentionKVCacheType(),
+            nameof(IR.NN.SamplerStateType) => new IR.NN.SamplerStateType
+            {
+                Config = JsonSerializer.Deserialize<IR.NN.SamplerConfig>(
+                    element.GetProperty(nameof(IR.NN.SamplerStateType.Config)).GetRawText(),
+                    options) ?? throw new JsonException("Failed to deserialize SamplerConfig"),
+            },
             _ => throw new JsonException($"Unknown ValueType discriminator: {typeName}"),
         };
     }
@@ -209,5 +215,10 @@ internal sealed class DataTypeJsonConverterImpl : JsonConverter<DataType>
         }
 
         writer.WriteEndArray();
+        if (value is IR.NN.SamplerStateType samplerStateType)
+        {
+            writer.WritePropertyName(nameof(IR.NN.SamplerStateType.Config));
+            JsonSerializer.Serialize(writer, samplerStateType.Config, options);
+        }
     }
 }

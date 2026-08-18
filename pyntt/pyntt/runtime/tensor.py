@@ -427,6 +427,61 @@ def require_kv_cache_tensor_field(value: Any, name: str, device=None, dtype: str
     return field
 
 
+def require_object_tensor_field(
+    value: Any,
+    object_kind: str,
+    name: str,
+    device=None,
+    *,
+    dtype: str,
+    shape: tuple[int, ...],
+):
+    """Validate and return a stable tensor field from an external state object."""
+    torch = _import_torch()
+    actual_kind = (
+        value.get("pyntt_object_kind")
+        if isinstance(value, Mapping)
+        else getattr(value, "pyntt_object_kind", None)
+    )
+    if actual_kind != object_kind:
+        raise PyNTTArgumentError(
+            f"Expected PyNTT object kind {object_kind!r}, got {actual_kind!r}."
+        )
+
+    if isinstance(value, Mapping):
+        field = value.get(name)
+    else:
+        field = getattr(value, name, None)
+    if not isinstance(field, torch.Tensor):
+        raise PyNTTArgumentError(
+            f"{object_kind} field {name!r} must be a torch.Tensor, "
+            f"got {type(field).__name__}."
+        )
+
+    expected_dtype = _torch_dtype(torch, dtype)
+    if field.dtype != expected_dtype:
+        raise PyNTTArgumentError(
+            f"{object_kind} field {name!r} must have dtype {expected_dtype}, "
+            f"got {field.dtype}."
+        )
+    if tuple(field.shape) != tuple(shape):
+        raise PyNTTArgumentError(
+            f"{object_kind} field {name!r} must have shape {tuple(shape)}, "
+            f"got {tuple(field.shape)}."
+        )
+    if device is not None and field.device != torch.device(device):
+        raise PyNTTArgumentError(
+            f"{object_kind} field {name!r} must be on {torch.device(device)}, "
+            f"got {field.device}."
+        )
+    if not field.is_contiguous():
+        raise PyNTTArgumentError(
+            f"{object_kind} field {name!r} must be contiguous."
+        )
+    _validate_triton_pointer_alignment(field, f"{object_kind} field {name!r}")
+    return field
+
+
 def _validate_triton_pointer_alignment(tensor: Any, context: str) -> None:
     if (
         getattr(tensor, "is_cuda", False)

@@ -400,6 +400,92 @@ public sealed class UnitTestMemorySynchronization : TestClassBase
     }
 
     [Fact]
+    public async Task TestSamplingPartialReadsOnlyItsLocalVocabularyShard()
+    {
+        var placement = new Placement([4, 8], "yx", "bb");
+        var config = new SamplerConfig(
+            vocabSize: 1024,
+            maxBatchSize: 1,
+            maxLogprobs: 0,
+            SamplerLogprobsMode.RawLogprobs);
+        var packedDataType = new VectorType(DataTypes.BFloat16, [8]);
+        var packedType = new DistributedType(
+            new TensorType(packedDataType, new[] { 1, 128 }),
+            [SBP.B, SBP.SBlockCyclic([0, 1], 1)],
+            placement);
+        var scalarType = new DistributedType(
+            new TensorType(DataTypes.BFloat16, new[] { 1, 1024 }),
+            [SBP.B, SBP.SBlockCyclic([0, 1], 8)],
+            placement);
+        var physical = new PhysicalBuffer(
+            packedDataType.SizeInBytes,
+            Tensor.FromPointer(4096, packedDataType),
+            2048,
+            MemoryLocation.Data);
+        var packedLogits = CreateDistributedAlias("packed_logits", physical, packedType);
+        var scalarLogits = CreateDistributedAlias("scalar_logits", physical, scalarType);
+        var input = CreateWorkspaceBuffer("input", packedDataType, 12288, 2048, [1, 128]);
+        var processedLogits = CreateDistributedAlias(
+            "processed_logits",
+            new PhysicalBuffer(
+                DataTypes.Float32.SizeInBytes,
+                Tensor.FromPointer(12288, DataTypes.Float32),
+                4096,
+                MemoryLocation.Data),
+            new DistributedType(
+                new TensorType(DataTypes.Float32, new[] { 1, 1024 }),
+                scalarType.AxisPolicies,
+                placement));
+        var argMaxState = CreateDistributedAlias(
+            "argmax_state",
+            new PhysicalBuffer(
+                DataTypes.UInt64.SizeInBytes,
+                Tensor.FromPointer(16384, DataTypes.UInt64),
+                256,
+                MemoryLocation.ChipLocalData),
+            new DistributedType(
+                new TensorType(DataTypes.UInt64, new[] { 1 }),
+                [SBP.B],
+                placement,
+                SBP.P([0, 1], ReduceOp.Max)));
+        var samplerStateType = new ReferenceType(new SamplerStateType { Config = config });
+        var samplerState = CreateBufferView(
+            "sampler_state",
+            samplerStateType,
+            20480,
+            samplerStateType.SizeInBytes,
+            MemoryLocation.Input,
+            0,
+            samplerStateType.SizeInBytes,
+            Array.Empty<Dimension>());
+        var main = new PrimFunction(
+            "main",
+            PyNTTTarget.Kind,
+            new Sequential(
+                T.Memcopy(packedLogits, input),
+                TIR.F.NTT.SamplingPartial(
+                    scalarLogits,
+                    samplerState,
+                    processedLogits,
+                    argMaxState,
+                    config)),
+            Array.Empty<IVar>());
+        var module = new IRModule(main);
+
+        await new PlanMemorySynchronizationPass(
+            PyNTTTarget.Kind,
+            MemorySynchronizationScopes.All).RunAsync(module, new());
+
+        var rewritten = Assert.IsType<PrimFunction>(module.Entry);
+        var barrier = Assert.Single(
+            ExprCollector.Collect(rewritten.Body)
+                .OfType<Call>()
+                .Select(call => call.Target)
+                .OfType<TIR.NTT.Barrier>());
+        Assert.Equal(TIR.NTT.BarrierScope.Block, barrier.Scope);
+    }
+
+    [Fact]
     public async Task TestPyNTTLocalShardSubviewAliasesCallerBackingWithoutGridSynchronization()
     {
         CompileOptions.TargetOptions = new PyNTTTargetOptions();

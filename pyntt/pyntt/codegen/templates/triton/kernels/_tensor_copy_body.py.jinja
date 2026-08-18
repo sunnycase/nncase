@@ -3,6 +3,9 @@
 {% for axis in range(ctx["global_shape"] | length) %}
 {{ indent }}mask = mask & ({{ ctx["global_coordinates"][axis] }} < {{ dim(ctx["global_shape"][axis]) }})
 {% endfor %}
+{% if model.get("OwnerOnly", false) %}
+{{ indent }}mask = mask & (shard_index == 0)
+{% endif %}
 {{ indent }}value = tl.load({{ access_pointer(model, "Source", "source", ctx["source_access"]) }}, mask=mask, other=0.0)
 {{ indent }}tl.store({{ access_pointer(model, "Destination", "destination", ctx["destination_access"]) }}, value, mask=mask)
 {% endcall %}

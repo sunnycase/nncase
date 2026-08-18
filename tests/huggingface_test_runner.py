@@ -21,6 +21,46 @@ class _PyNTTPagedAttentionKVCache:
     pass
 
 
+class _PyNTTSamplerState:
+    pyntt_object_kind = "sampler_state"
+
+    def __init__(self, vocab_size, max_logprobs, prompt_token_ids):
+        self.active = torch.ones(1, dtype=torch.uint8, device="cuda")
+        self.processor_flags = torch.zeros(
+            1, dtype=torch.uint32, device="cuda")
+        self.temperature = torch.zeros(1, dtype=torch.float32, device="cuda")
+        self.top_p = torch.ones(1, dtype=torch.float32, device="cuda")
+        self.top_k = torch.full(
+            (1,), vocab_size, dtype=torch.int32, device="cuda")
+        self.min_p = torch.zeros(1, dtype=torch.float32, device="cuda")
+        self.frequency_penalty = torch.zeros(
+            1, dtype=torch.float32, device="cuda")
+        self.presence_penalty = torch.zeros(
+            1, dtype=torch.float32, device="cuda")
+        self.repetition_penalty = torch.ones(
+            1, dtype=torch.float32, device="cuda")
+        self.requested_logprobs = torch.full(
+            (1,), max_logprobs, dtype=torch.int32, device="cuda")
+        self.seeds = torch.zeros(1, dtype=torch.uint64, device="cuda")
+        self.counters = torch.zeros(1, dtype=torch.uint64, device="cuda")
+        self.prompt_token_mask = torch.zeros(
+            (1, vocab_size), dtype=torch.uint8, device="cuda")
+        prompt_ids = torch.as_tensor(
+            np.asarray(prompt_token_ids, dtype=np.int64).reshape(-1),
+            dtype=torch.int64,
+            device="cuda")
+        if prompt_ids.numel():
+            self.prompt_token_mask[0, prompt_ids] = 1
+        self.output_token_counts = torch.zeros(
+            (1, vocab_size), dtype=torch.int32, device="cuda")
+        self.allowed_token_mask = torch.ones(
+            (1, vocab_size), dtype=torch.uint8, device="cuda")
+        self.forbidden_token_mask = torch.zeros(
+            (1, vocab_size), dtype=torch.uint8, device="cuda")
+        self.logit_bias = torch.zeros(
+            (1, vocab_size), dtype=torch.float32, device="cuda")
+
+
 def _to_pyntt_paged_attention_kv_cache(cache, block_size, hierarchy):
     context_lens = np.asarray(cache.context_lens.to_numpy(), dtype=np.int64).reshape(-1)
     seq_lens = np.asarray(cache.seq_lens.to_numpy(), dtype=np.int64).reshape(-1)
@@ -241,6 +281,7 @@ class HuggingfaceTestRunner(TestRunner):
         self.model_type = "huggingface"
         self.num_layers = -1
         self.local_inputs: List[Any] = []
+        self._pyntt_sampler_state = None
 
     def decode_token(self, logits: np.ndarray):
         """
@@ -287,7 +328,13 @@ class HuggingfaceTestRunner(TestRunner):
             res = res_tensor.cpu().numpy()
 
             dump_data_to_file(self.tmp_dir, f'nncase_result_{token_num}_{idx}', res)
-            if (self.cfg['huggingface_options']['output_logits']) and idx == 0:
+            if self.cfg['huggingface_options'].get('enable_sampler', False):
+                results.append(res)
+                if idx == 0:
+                    next_token_id = int(res.reshape(-1)[0])
+                    next_token = self.tokenizer.decode(
+                        next_token_id, skip_special_tokens=False)
+            elif (self.cfg['huggingface_options']['output_logits']) and idx == 0:
                 results.append(res)
                 next_token_id, next_token = self.decode_token(res[np.newaxis, ...])
             elif idx == 0:
@@ -339,6 +386,15 @@ class HuggingfaceTestRunner(TestRunner):
                     value, self.block_size, self.hierarchy))
             else:
                 torch_inputs.append(torch.from_numpy(np.ascontiguousarray(value)).cuda())
+
+        if self.cfg['huggingface_options'].get('enable_sampler', False):
+            if self._pyntt_sampler_state is None:
+                self._pyntt_sampler_state = _PyNTTSamplerState(
+                    int(self.hf_config.vocab_size),
+                    int(self.cfg['huggingface_options']['sampler_max_logprobs']),
+                    input_data[0],
+                )
+            torch_inputs.append(self._pyntt_sampler_state)
 
         with torch.no_grad():
             torch_outputs = model(*torch_inputs)
@@ -502,7 +558,44 @@ class HuggingfaceTestRunner(TestRunner):
 
                 count = 0
                 logits = None
-                if (self.cfg['huggingface_options']['output_logits']):
+                if self.cfg['huggingface_options'].get('enable_sampler', False):
+                    logits = result.logits[:, -1, :].detach().to(
+                        torch.float32).cpu().numpy()
+                    sampled = np.argmax(logits, axis=-1).astype(np.int32)
+                    max_logprobs = int(
+                        self.cfg['huggingface_options']['sampler_max_logprobs'])
+                    shifted = logits - np.max(logits, axis=-1, keepdims=True)
+                    logprobs = shifted - np.log(
+                        np.exp(shifted).sum(axis=-1, keepdims=True))
+                    top_ids = np.argsort(-logprobs, axis=-1,
+                                         kind='stable')[:, :max_logprobs]
+                    top_values = np.take_along_axis(
+                        logprobs, top_ids, axis=-1)
+                    sampled_values = np.take_along_axis(
+                        logprobs, sampled[:, None], axis=-1)
+                    sampled_ranks = (
+                        (logprobs > sampled_values).sum(axis=-1) + 1
+                    ).astype(np.int32)
+                    outputs.extend([
+                        sampled[:, None],
+                        np.concatenate(
+                            [sampled[:, None], top_ids.astype(np.int32)], axis=-1),
+                        np.concatenate(
+                            [sampled_values.astype(np.float32),
+                             top_values.astype(np.float32)], axis=-1),
+                        sampled_ranks,
+                        np.full((sampled.shape[0],), max_logprobs + 1,
+                                dtype=np.int32),
+                    ])
+                    for output_index, output in enumerate(outputs):
+                        dump_data_to_file(
+                            self.case_dir,
+                            f'cpu_result_{i}_{output_index}',
+                            output)
+                    next_token_id = int(sampled[0])
+                    decoded_token = self.tokenizer.decode(
+                        next_token_id, skip_special_tokens=False)
+                elif (self.cfg['huggingface_options']['output_logits']):
                     logits = result.logits.detach().to(torch.float32).cpu().numpy()
                     dump_data_to_file(self.case_dir, f'cpu_result_{i}_{count}', logits[0])
                     outputs.append(logits)
@@ -520,7 +613,8 @@ class HuggingfaceTestRunner(TestRunner):
                                           None) if isinstance(logits_to_keep, int) else logits_to_keep
                     logits = self.model.lm_head(hidden_states)[
                         :, slice_indices, :].detach().to(torch.float32).cpu().numpy()
-                next_token_id, decoded_token = self.decode_token(logits)
+                if not self.cfg['huggingface_options'].get('enable_sampler', False):
+                    next_token_id, decoded_token = self.decode_token(logits)
                 tokens_ids.append(next_token_id)
                 tokens.append(decoded_token)
 
@@ -663,7 +757,8 @@ class HuggingfaceTestRunner(TestRunner):
         self.generation_config.max_new_tokens = self.cfg['huggingface_options']['max_tokens']
         self.generation_config.do_sample = False
         self.generation_config.temperature = 0.0  # for Stable result
-        if (self.cfg['huggingface_options']['output_logits']):
+        if (self.cfg['huggingface_options']['output_logits'] or
+                self.cfg['huggingface_options'].get('enable_sampler', False)):
             pass
         else:
             self.generation_config.output_hidden_states = True

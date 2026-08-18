@@ -83,6 +83,25 @@ public partial class NTT
             addend ?? None.Default);
     }
 
+    public static Expr PackedMatMulSamplingPartial(
+        Expr lhs,
+        Expr rhs,
+        Expr state,
+        DataType outputDataType,
+        PackedMatMulRhsLayout rhsLayout,
+        IR.NN.SamplerConfig config,
+        Expr? scale = null,
+        Expr? addend = null)
+    {
+        return new Call(
+            new PackedMatMulSamplingPartial(outputDataType, rhsLayout, config),
+            lhs,
+            rhs,
+            state,
+            scale ?? None.Default,
+            addend ?? None.Default);
+    }
+
     public static Expr PagedAttentionPartial(
         Expr q,
         Expr kvCaches,
@@ -130,6 +149,22 @@ public partial class NTT
             sumState,
             accState);
     }
+
+    public static Expr SamplingPartial(Expr logits, Expr state, IR.NN.SamplerConfig config)
+        => new Call(new SamplingPartial(config), logits, state);
+
+    public static Expr SamplingCombine(
+        Expr logits,
+        Expr processedLogits,
+        Expr argMaxState,
+        Expr state,
+        IR.NN.SamplerConfig config)
+        => new Call(
+            new SamplingCombine(config),
+            logits,
+            processedLogits,
+            argMaxState,
+            state);
 
     public static Expr PackedQKVParallelLinear(
         Expr input,

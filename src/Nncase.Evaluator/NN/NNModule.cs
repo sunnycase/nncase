@@ -71,5 +71,6 @@ internal class NNModule : IApplicationPart
         registrator.RegisterManyInterface<GetPositionIdsEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<Qwen3MoEEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<SparseExpertsEvaluator>(reuse: Reuse.Singleton);
+        registrator.RegisterManyInterface<SamplingEvaluator>(reuse: Reuse.Singleton);
     }
 }

@@ -1,0 +1,391 @@
+{% import "triton/kernels/_common.py.jinja" as common with context %}
+{% import "triton/kernels/_producer_consumer.py.jinja" as phases with context %}
+{% set ctx = sampling_context(model) %}
+{% set normalized_logprobs = model["LogprobsMode"] in ("RawLogprobs", "ProcessedLogprobs") %}
+{% set processed_logprobs = model["LogprobsMode"] in ("ProcessedLogprobs", "ProcessedLogits") %}
+# generated from PyNTT Jinja sampling/combine.py.jinja
+# {{ model["Comment"] }}; vocab={{ model["VocabSize"] }}, blocks={{ model["BlockCount"] }}, max_logprobs={{ model["MaxLogprobs"] }}, mode={{ model["LogprobsMode"] }}
+{{ phases.consumer_header(model) }}
+{{ common.mesh_coordinates(model["MeshAxes"]) }}
+    logits_ptr = {{ ptr(model, "Logits") }}
+    processed_ptr = {{ ptr(model, "ProcessedLogits") }}
+    summary_ptr = {{ ptr(model, "Summary") }}
+    sampled_ids_ptr = {{ ptr(model, "SampledIds") }}
+    logprob_ids_ptr = {{ ptr(model, "LogprobIds") }}
+    logprobs_ptr = {{ ptr(model, "Logprobs") }}
+    ranks_ptr = {{ ptr(model, "Ranks") }}
+    counts_ptr = {{ ptr(model, "Counts") }}
+    sampling_tile: tl.constexpr = block_size
+    summary_slots: tl.constexpr = {{ ctx["summary_slots"] }}
+    block_offsets = tl.arange(0, {{ ctx["summary_width"] }})
+    block_mask = block_offsets < {{ model["BlockCount"] }}
+
+    for batch in tl.static_range(0, {{ model["MaxBatchSize"] }}):
+        active = (batch < {{ ctx["global_batch"] }}) & (tl.load({{ model["Active"] }} + batch) != 0)
+        temperature = tl.load({{ model["Temperature"] }} + batch).to(tl.float32)
+        safe_temperature = tl.maximum(temperature, 1.0e-5)
+        top_p = tl.maximum(0.0, tl.minimum(1.0, tl.load({{ model["TopP"] }} + batch).to(tl.float32)))
+        top_k = tl.load({{ model["TopK"] }} + batch).to(tl.int32)
+        min_p = tl.maximum(0.0, tl.minimum(1.0, tl.load({{ model["MinP"] }} + batch).to(tl.float32)))
+        requested_logprobs = tl.maximum(-1, tl.minimum({{ model["MaxLogprobs"] }}, tl.load({{ model["RequestedLogprobs"] }} + batch)))
+        state_row = batch * {{ model["VocabSize"] }}
+        summary_row = batch * {{ model["BlockCount"] }} * summary_slots
+        local_summary = summary_row + shard_index * summary_slots
+
+        control = summary_row
+        global_max = -float("inf")
+        global_arg_token = -1
+        if shard_index == 0:
+            owner_argmax_keys = tl.load(
+                {{ ctx["argmax_owner_pointer"] }}
+                + batch * {{ dim(model["ArgMaxStateStrides"][0]) }},
+                mask=block_mask,
+                other=0,
+            )
+            global_argmax_key = tl.max(owner_argmax_keys)
+            global_ordered_value = (global_argmax_key >> 32).to(tl.uint32)
+            global_inverse_token = global_argmax_key.to(tl.uint32)
+            global_value_bits = tl.where(
+                (global_ordered_value & 0x80000000) != 0,
+                global_ordered_value ^ 0x80000000,
+                ~global_ordered_value,
+            )
+            global_max = global_value_bits.to(tl.float32, bitcast=True)
+            global_arg_token = (0xFFFFFFFF - global_inverse_token).to(tl.int32)
+        needs_global_broadcast = (temperature >= 1.0e-5) | (requested_logprobs >= 0)
+        if needs_global_broadcast:
+            if shard_index == 0:
+                tl.store(summary_ptr + control + 0, global_max)
+                tl.store(summary_ptr + control + 3, global_arg_token.to(tl.int32).to(tl.float32, bitcast=True))
+            tle.distributed_barrier(PYNTT_GRID_MESH)
+            global_max = tl.load(summary_ptr + control + 0)
+            global_arg_token = tl.load(summary_ptr + control + 3).to(tl.int32, bitcast=True)
+
+        sampling_max = global_max / safe_temperature
+        min_p_threshold = tl.where(min_p > 0.0, sampling_max + tl.log(min_p), -float("inf"))
+        cutoff = -float("inf")
+        if temperature >= 1.0e-5:
+{% filter indent(width=4, first=True) %}
+        local_eligible_count = 0
+        for local_start in tl.range(0, {{ ctx["local_vocab"] }}, sampling_tile):
+            local_token = local_start + tl.arange(0, sampling_tile)
+            global_token = ({{ ctx["global_token"] }}).to(tl.int32)
+            token_mask = active & (local_token < {{ ctx["local_vocab"] }}) & (global_token < {{ model["VocabSize"] }})
+            value = tl.load(processed_ptr + {{ ctx["processed_offset"] }}, mask=token_mask, other=-float("inf")) / safe_temperature
+            value_is_finite = (value > -float("inf")) & (value < float("inf"))
+            eligible = token_mask & value_is_finite & (value >= min_p_threshold)
+            local_eligible_count += tl.sum(eligible.to(tl.int32))
+        tl.store(summary_ptr + local_summary + 2, local_eligible_count.to(tl.float32))
+        tle.distributed_barrier(PYNTT_GRID_MESH)
+        if shard_index == 0:
+            eligible_counts = tl.load(summary_ptr + summary_row + block_offsets * summary_slots + 2, mask=block_mask, other=0.0)
+            tl.store(summary_ptr + control + 2, tl.sum(eligible_counts))
+        tle.distributed_barrier(PYNTT_GRID_MESH)
+
+        # Select exact FP32 thresholds with four ordered-key radix passes.
+        # Every CTA owns one 256-bin histogram in summary[16:]. CTA 0 merges
+        # those histograms after the grid barrier and broadcasts one digit.
+        radix_bins = tl.arange(0, 256)
+        eligible_count = tl.load(summary_ptr + control + 2).to(tl.int32)
+        top_k_active = (temperature >= 1.0e-5) & (top_k > 0) & (top_k < eligible_count)
+        top_k_cutoff = -float("inf")
+        if top_k_active:
+            top_k_prefix = tl.zeros((), dtype=tl.uint32)
+            top_k_prefix_mask = tl.zeros((), dtype=tl.uint32)
+            top_k_remaining = top_k.to(tl.float32)
+            for radix_pass in tl.range(0, 4):
+{% filter indent(width=4, first=True) %}
+            shift = 24 - radix_pass * 8
+            tl.store(summary_ptr + local_summary + 16 + radix_bins, 0.0)
+            tl.debug_barrier()
+            for local_start in tl.range(0, {{ ctx["local_vocab"] }}, sampling_tile):
+                local_token = local_start + tl.arange(0, sampling_tile)
+                global_token = ({{ ctx["global_token"] }}).to(tl.int32)
+                token_mask = active & (local_token < {{ ctx["local_vocab"] }}) & (global_token < {{ model["VocabSize"] }})
+                value = tl.load(processed_ptr + {{ ctx["processed_offset"] }}, mask=token_mask, other=-float("inf")) / safe_temperature
+                value_is_finite = (value > -float("inf")) & (value < float("inf"))
+                eligible = token_mask & value_is_finite & (value >= min_p_threshold)
+                value_bits = value.to(tl.uint32, bitcast=True)
+                ordered = tl.where(value < 0.0, ~value_bits, value_bits | tl.full(value_bits.shape, 0x80000000, tl.uint32))
+                prefix_match = (ordered & top_k_prefix_mask) == top_k_prefix
+                digit = ((ordered >> shift) & 0xFF).to(tl.int32)
+                tl.atomic_add(
+                    summary_ptr + local_summary + 16 + digit,
+                    eligible.to(tl.float32),
+                    mask=eligible & prefix_match,
+                    sem="relaxed",
+                    scope="cta",
+                )
+            tle.distributed_barrier(PYNTT_GRID_MESH)
+            if shard_index == 0:
+                global_histogram = tl.zeros([256], dtype=tl.float32)
+                for summary_block in tl.range(0, {{ model["BlockCount"] }}):
+                    global_histogram += tl.load(summary_ptr + summary_row + summary_block * summary_slots + 16 + radix_bins)
+                greater_count, _ = tle.cumsum(global_histogram, axis=0, reverse=True)
+                contains_rank = (global_histogram > 0.0) & (greater_count < top_k_remaining) & ((greater_count + global_histogram) >= top_k_remaining)
+                selected_digit = tl.sum(tl.where(contains_rank, radix_bins, 0))
+                selected_greater = tl.sum(tl.where(contains_rank, greater_count, 0.0))
+                tl.store(summary_ptr + control + 11, selected_digit.to(tl.float32))
+                tl.store(summary_ptr + control + 12, selected_greater)
+            tle.distributed_barrier(PYNTT_GRID_MESH)
+            top_k_digit = tl.load(summary_ptr + control + 11).to(tl.uint32)
+            top_k_remaining -= tl.load(summary_ptr + control + 12)
+            top_k_prefix |= top_k_digit << shift
+            top_k_prefix_mask |= tl.full((), 0xFF, tl.uint32) << shift
+{% endfilter %}
+            top_k_bits = tl.where(
+                (top_k_prefix & tl.full((), 0x80000000, tl.uint32)) != 0,
+                top_k_prefix & tl.full((), 0x7FFFFFFF, tl.uint32),
+                ~top_k_prefix,
+            )
+            top_k_cutoff = top_k_bits.to(tl.float32, bitcast=True)
+
+        # Top-p is evaluated after top-k, so its normalization mass must not
+        # include values removed by the top-k threshold.
+        local_mass = 0.0
+        for local_start in tl.range(0, {{ ctx["local_vocab"] }}, sampling_tile):
+            local_token = local_start + tl.arange(0, sampling_tile)
+            global_token = ({{ ctx["global_token"] }}).to(tl.int32)
+            token_mask = active & (local_token < {{ ctx["local_vocab"] }}) & (global_token < {{ model["VocabSize"] }})
+            value = tl.load(processed_ptr + {{ ctx["processed_offset"] }}, mask=token_mask, other=-float("inf")) / safe_temperature
+            value_is_finite = (value > -float("inf")) & (value < float("inf"))
+            eligible = token_mask & value_is_finite & (value >= min_p_threshold) & (value >= top_k_cutoff)
+            local_mass += tl.sum(tl.where(eligible, tl.exp(value - sampling_max), 0.0))
+        tl.store(summary_ptr + local_summary + 4, local_mass)
+        tle.distributed_barrier(PYNTT_GRID_MESH)
+        if shard_index == 0:
+            masses = tl.load(summary_ptr + summary_row + block_offsets * summary_slots + 4, mask=block_mask, other=0.0)
+            tl.store(summary_ptr + control + 13, tl.sum(masses))
+        tle.distributed_barrier(PYNTT_GRID_MESH)
+
+        total_mass = tl.load(summary_ptr + control + 13)
+        top_p_active = (temperature >= 1.0e-5) & (top_p > 0.0) & (top_p < 1.0) & (total_mass > 0.0)
+        top_p_cutoff = tl.where((temperature >= 1.0e-5) & (top_p <= 0.0), sampling_max, -float("inf"))
+        if top_p_active:
+            top_p_prefix = tl.zeros((), dtype=tl.uint32)
+            top_p_prefix_mask = tl.zeros((), dtype=tl.uint32)
+            top_p_remaining = top_p * total_mass
+            for radix_pass in tl.range(0, 4):
+{% filter indent(width=4, first=True) %}
+            shift = 24 - radix_pass * 8
+            tl.store(summary_ptr + local_summary + 16 + radix_bins, 0.0)
+            tl.debug_barrier()
+            for local_start in tl.range(0, {{ ctx["local_vocab"] }}, sampling_tile):
+                local_token = local_start + tl.arange(0, sampling_tile)
+                global_token = ({{ ctx["global_token"] }}).to(tl.int32)
+                token_mask = active & (local_token < {{ ctx["local_vocab"] }}) & (global_token < {{ model["VocabSize"] }})
+                value = tl.load(processed_ptr + {{ ctx["processed_offset"] }}, mask=token_mask, other=-float("inf")) / safe_temperature
+                value_is_finite = (value > -float("inf")) & (value < float("inf"))
+                eligible = token_mask & value_is_finite & (value >= min_p_threshold) & (value >= top_k_cutoff)
+                value_bits = value.to(tl.uint32, bitcast=True)
+                ordered = tl.where(value < 0.0, ~value_bits, value_bits | tl.full(value_bits.shape, 0x80000000, tl.uint32))
+                prefix_match = (ordered & top_p_prefix_mask) == top_p_prefix
+                digit = ((ordered >> shift) & 0xFF).to(tl.int32)
+                tl.atomic_add(
+                    summary_ptr + local_summary + 16 + digit,
+                    tl.exp(value - sampling_max),
+                    mask=eligible & prefix_match,
+                    sem="relaxed",
+                    scope="cta",
+                )
+            tle.distributed_barrier(PYNTT_GRID_MESH)
+            if shard_index == 0:
+                global_histogram = tl.zeros([256], dtype=tl.float32)
+                for summary_block in tl.range(0, {{ model["BlockCount"] }}):
+                    global_histogram += tl.load(summary_ptr + summary_row + summary_block * summary_slots + 16 + radix_bins)
+                greater_mass, _ = tle.cumsum(global_histogram, axis=0, reverse=True)
+                contains_mass = (global_histogram > 0.0) & (greater_mass < top_p_remaining) & ((greater_mass + global_histogram) >= top_p_remaining)
+                selected_digit = tl.sum(tl.where(contains_mass, radix_bins, 0))
+                selected_greater = tl.sum(tl.where(contains_mass, greater_mass, 0.0))
+                tl.store(summary_ptr + control + 11, selected_digit.to(tl.float32))
+                tl.store(summary_ptr + control + 12, selected_greater)
+            tle.distributed_barrier(PYNTT_GRID_MESH)
+            top_p_digit = tl.load(summary_ptr + control + 11).to(tl.uint32)
+            top_p_remaining -= tl.load(summary_ptr + control + 12)
+            top_p_prefix |= top_p_digit << shift
+            top_p_prefix_mask |= tl.full((), 0xFF, tl.uint32) << shift
+{% endfilter %}
+            top_p_bits = tl.where(
+                (top_p_prefix & tl.full((), 0x80000000, tl.uint32)) != 0,
+                top_p_prefix & tl.full((), 0x7FFFFFFF, tl.uint32),
+                ~top_p_prefix,
+            )
+            top_p_cutoff = top_p_bits.to(tl.float32, bitcast=True)
+        cutoff = tl.maximum(top_k_cutoff, top_p_cutoff)
+{% endfilter %}
+
+        sampled_token = tl.where(active, global_arg_token, -1)
+        seed = tl.load({{ model["Seeds"] }} + batch).to(tl.uint64)
+        counter = tl.load({{ model["Counters"] }} + batch).to(tl.uint64)
+        if temperature >= 1.0e-5:
+{% filter indent(width=4, first=True) %}
+        local_sample_score = -float("inf")
+        local_sample_token = {{ model["VocabSize"] }}
+        for local_start in tl.range(0, {{ ctx["local_vocab"] }}, sampling_tile):
+            local_token = local_start + tl.arange(0, sampling_tile)
+            global_token = ({{ ctx["global_token"] }}).to(tl.int32)
+            token_mask = active & (local_token < {{ ctx["local_vocab"] }}) & (global_token < {{ model["VocabSize"] }})
+            processed = tl.load(processed_ptr + {{ ctx["processed_offset"] }}, mask=token_mask, other=-float("inf"))
+            sampling_value = processed / safe_temperature
+            sampling_value_is_finite = (sampling_value > -float("inf")) & (sampling_value < float("inf"))
+            eligible = token_mask & sampling_value_is_finite & (sampling_value >= min_p_threshold) & (sampling_value >= cutoff)
+            random_offset = counter * {{ model["VocabSize"] }} + global_token.to(tl.uint64)
+            uniform = tl.maximum(tl.rand(seed, random_offset), 1.0e-7)
+            gumbel_score = sampling_value - tl.log(-tl.log(uniform))
+            score = tl.where(eligible, gumbel_score, -float("inf"))
+            tile_score = tl.max(score)
+            tile_token = tl.min(tl.where(score == tile_score, global_token, {{ model["VocabSize"] }}))
+            better = (tile_score > local_sample_score) | ((tile_score == local_sample_score) & (tile_token < local_sample_token))
+            local_sample_token = tl.where(better, tile_token, local_sample_token)
+            local_sample_score = tl.maximum(local_sample_score, tile_score)
+        tl.store(summary_ptr + local_summary + 5, local_sample_score)
+        tl.store(summary_ptr + local_summary + 6, local_sample_token.to(tl.int32).to(tl.float32, bitcast=True))
+        tle.distributed_barrier(PYNTT_GRID_MESH)
+        if shard_index == 0:
+            block_scores = tl.load(summary_ptr + summary_row + block_offsets * summary_slots + 5, mask=block_mask, other=-float("inf"))
+            block_tokens = tl.load(summary_ptr + summary_row + block_offsets * summary_slots + 6, mask=block_mask, other=0.0).to(tl.int32, bitcast=True)
+            block_tokens = tl.where(block_mask, block_tokens, {{ model["VocabSize"] }})
+            best_score = tl.max(block_scores)
+            sampled_token = tl.min(tl.where(block_scores == best_score, block_tokens, {{ model["VocabSize"] }}))
+            sampled_token = tl.where(active, sampled_token, -1)
+            tl.store(summary_ptr + control + 14, sampled_token.to(tl.int32).to(tl.float32, bitcast=True))
+            if active:
+                tl.store({{ model["Counters"] }} + batch, counter + 1)
+        tle.distributed_barrier(PYNTT_GRID_MESH)
+        sampled_token = tl.load(summary_ptr + control + 14).to(tl.int32, bitcast=True)
+{% endfilter %}
+        if shard_index == 0:
+            if active:
+                old_count = tl.load({{ model["OutputTokenCounts"] }} + state_row + sampled_token)
+                tl.store({{ model["OutputTokenCounts"] }} + state_row + sampled_token, old_count + 1)
+            tl.store(sampled_ids_ptr + batch, sampled_token)
+            for output_slot in tl.static_range(0, {{ model["MaxLogprobs"] + 1 }}):
+                tl.store(logprob_ids_ptr + batch * {{ model["MaxLogprobs"] + 1 }} + output_slot, -1)
+                tl.store(logprobs_ptr + batch * {{ model["MaxLogprobs"] + 1 }} + output_slot, -float("inf"))
+            tl.store(ranks_ptr + batch, 0)
+            tl.store(counts_ptr + batch, 0)
+        if active & (requested_logprobs >= 0):
+{% filter indent(width=4, first=True) %}
+        local_logprob_max = -float("inf")
+        local_sampled_value = -float("inf")
+        for local_start in tl.range(0, {{ ctx["local_vocab"] }}, sampling_tile):
+            local_token = local_start + tl.arange(0, sampling_tile)
+            global_token = ({{ ctx["global_token"] }}).to(tl.int32)
+            token_mask = active & (local_token < {{ ctx["local_vocab"] }}) & (global_token < {{ model["VocabSize"] }})
+{% if processed_logprobs %}
+            candidate = tl.load(processed_ptr + {{ ctx["processed_offset"] }}, mask=token_mask, other=-float("inf"))
+            if temperature >= 1.0e-5:
+                candidate /= safe_temperature
+                candidate = tl.where((candidate >= min_p_threshold) & (candidate >= cutoff), candidate, -float("inf"))
+{% else %}
+            candidate = tl.load(logits_ptr + {{ ctx["logits_offset"] }}, mask=token_mask, other=-float("inf")).to(tl.float32)
+{% endif %}
+            local_logprob_max = tl.maximum(local_logprob_max, tl.max(candidate))
+            local_sampled_value = tl.maximum(local_sampled_value, tl.max(tl.where(global_token == sampled_token, candidate, -float("inf"))))
+        tl.store(summary_ptr + local_summary + 7, local_logprob_max)
+        tl.store(summary_ptr + local_summary + 10, local_sampled_value)
+        tle.distributed_barrier(PYNTT_GRID_MESH)
+        if shard_index == 0:
+            block_max = tl.load(summary_ptr + summary_row + block_offsets * summary_slots + 7, mask=block_mask, other=-float("inf"))
+            sampled_values = tl.load(summary_ptr + summary_row + block_offsets * summary_slots + 10, mask=block_mask, other=-float("inf"))
+            tl.store(summary_ptr + control + 7, tl.max(block_max))
+            tl.store(summary_ptr + control + 10, tl.max(sampled_values))
+        tle.distributed_barrier(PYNTT_GRID_MESH)
+
+        logprob_max = tl.load(summary_ptr + control + 7)
+        sampled_value = tl.load(summary_ptr + control + 10)
+        local_logprob_sum = 0.0
+        local_rank = 0
+        for local_start in tl.range(0, {{ ctx["local_vocab"] }}, sampling_tile):
+            local_token = local_start + tl.arange(0, sampling_tile)
+            global_token = ({{ ctx["global_token"] }}).to(tl.int32)
+            token_mask = active & (local_token < {{ ctx["local_vocab"] }}) & (global_token < {{ model["VocabSize"] }})
+{% if processed_logprobs %}
+            candidate = tl.load(processed_ptr + {{ ctx["processed_offset"] }}, mask=token_mask, other=-float("inf"))
+            if temperature >= 1.0e-5:
+                candidate /= safe_temperature
+                candidate = tl.where((candidate >= min_p_threshold) & (candidate >= cutoff), candidate, -float("inf"))
+{% else %}
+            candidate = tl.load(logits_ptr + {{ ctx["logits_offset"] }}, mask=token_mask, other=-float("inf")).to(tl.float32)
+{% endif %}
+{% if normalized_logprobs %}
+            candidate_is_finite = (candidate > -float("inf")) & (candidate < float("inf"))
+            local_logprob_sum += tl.sum(tl.where(token_mask & candidate_is_finite, tl.exp(candidate - logprob_max), 0.0))
+{% endif %}
+            at_least_sampled = token_mask & (candidate >= sampled_value)
+            local_rank += tl.sum(at_least_sampled.to(tl.int32))
+        tl.store(summary_ptr + local_summary + 8, local_logprob_sum)
+        tl.store(summary_ptr + local_summary + 9, local_rank.to(tl.float32))
+        tle.distributed_barrier(PYNTT_GRID_MESH)
+        if shard_index == 0:
+            block_sums = tl.load(summary_ptr + summary_row + block_offsets * summary_slots + 8, mask=block_mask, other=0.0)
+            block_ranks = tl.load(summary_ptr + summary_row + block_offsets * summary_slots + 9, mask=block_mask, other=0.0)
+{% if normalized_logprobs %}
+            normalizer = logprob_max + tl.log(tl.sum(block_sums))
+{% else %}
+            normalizer = 0.0
+{% endif %}
+            tl.store(summary_ptr + control + 15, normalizer)
+            tl.store(summary_ptr + control + 9, tl.sum(block_ranks).to(tl.float32))
+        tle.distributed_barrier(PYNTT_GRID_MESH)
+        normalizer = tl.load(summary_ptr + control + 15)
+        global_rank = tl.load(summary_ptr + control + 9).to(tl.int32)
+        if shard_index == 0:
+            tl.store(logprob_ids_ptr + batch * {{ model["MaxLogprobs"] + 1 }}, sampled_token, mask=active)
+            tl.store(logprobs_ptr + batch * {{ model["MaxLogprobs"] + 1 }}, sampled_value - normalizer, mask=active)
+            tl.store(ranks_ptr + batch, tl.where(active, global_rank, 0))
+            tl.store(counts_ptr + batch, tl.where(active, requested_logprobs + 1, 0))
+
+        has_previous_top = 0
+        previous_top_value = 0.0
+        previous_top_token = -1
+        for selection in tl.range(0, {{ model["MaxLogprobs"] }}):
+            local_top_value = -float("inf")
+            local_top_token = {{ model["VocabSize"] }}
+            selection_active = active & (selection < requested_logprobs)
+            if selection_active:
+{% filter indent(width=4, first=True) %}
+            for local_start in tl.range(0, {{ ctx["local_vocab"] }}, sampling_tile):
+                local_token = local_start + tl.arange(0, sampling_tile)
+                global_token = ({{ ctx["global_token"] }}).to(tl.int32)
+                token_mask = selection_active & (local_token < {{ ctx["local_vocab"] }}) & (global_token < {{ model["VocabSize"] }})
+{% if processed_logprobs %}
+                candidate = tl.load(processed_ptr + {{ ctx["processed_offset"] }}, mask=token_mask, other=-float("inf"))
+                if temperature >= 1.0e-5:
+                    candidate /= safe_temperature
+                    candidate = tl.where((candidate >= min_p_threshold) & (candidate >= cutoff), candidate, -float("inf"))
+{% else %}
+                candidate = tl.load(logits_ptr + {{ ctx["logits_offset"] }}, mask=token_mask, other=-float("inf")).to(tl.float32)
+{% endif %}
+                follows_cursor = (has_previous_top == 0) | (candidate < previous_top_value) | ((candidate == previous_top_value) & (global_token > previous_top_token))
+                candidate = tl.where(token_mask & follows_cursor, candidate, -float("inf"))
+                tile_value = tl.max(candidate)
+                tile_token = tl.min(tl.where(candidate == tile_value, global_token, {{ model["VocabSize"] }}))
+                better = (tile_value > local_top_value) | ((tile_value == local_top_value) & (tile_token < local_top_token))
+                local_top_token = tl.where(better, tile_token, local_top_token)
+                local_top_value = tl.maximum(local_top_value, tile_value)
+            tl.store(summary_ptr + local_summary + 5, local_top_value)
+            tl.store(summary_ptr + local_summary + 6, local_top_token.to(tl.int32).to(tl.float32, bitcast=True))
+            tle.distributed_barrier(PYNTT_GRID_MESH)
+            if shard_index == 0:
+                block_values = tl.load(summary_ptr + summary_row + block_offsets * summary_slots + 5, mask=block_mask, other=-float("inf"))
+                block_tokens = tl.load(summary_ptr + summary_row + block_offsets * summary_slots + 6, mask=block_mask, other=0.0).to(tl.int32, bitcast=True)
+                block_tokens = tl.where(block_mask, block_tokens, {{ model["VocabSize"] }})
+                top_value = tl.max(block_values)
+                top_token = tl.min(tl.where(block_values == top_value, block_tokens, {{ model["VocabSize"] }}))
+                tl.store(summary_ptr + control + 5, top_value)
+                tl.store(summary_ptr + control + 6, top_token.to(tl.int32).to(tl.float32, bitcast=True))
+            tle.distributed_barrier(PYNTT_GRID_MESH)
+            top_value = tl.load(summary_ptr + control + 5)
+            top_token = tl.load(summary_ptr + control + 6).to(tl.int32, bitcast=True)
+            if shard_index == 0:
+                tl.store(logprob_ids_ptr + batch * {{ model["MaxLogprobs"] + 1 }} + selection + 1, top_token)
+                tl.store(logprobs_ptr + batch * {{ model["MaxLogprobs"] + 1 }} + selection + 1, top_value - normalizer)
+            has_previous_top = 1
+            previous_top_value = top_value
+            previous_top_token = top_token
+{% endfilter %}
+{% endfilter %}
+
+
+{{ phases.dispatch(model) }}

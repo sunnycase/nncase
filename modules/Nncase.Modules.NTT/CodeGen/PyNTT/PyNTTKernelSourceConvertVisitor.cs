@@ -422,8 +422,8 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
         private readonly Dictionary<string, string[]> _helperArguments = new(StringComparer.Ordinal);
         private readonly Dictionary<string, string[]> _helperWorkspaceArguments = new(StringComparer.Ordinal);
         private readonly Dictionary<string, string[]> _helperScalarArguments = new(StringComparer.Ordinal);
-        private readonly List<PyNTTKVCacheFieldInputMetadata> _kvCacheFieldInputs;
-        private readonly Dictionary<string, PyNTTKVCacheStorageMetadata?> _formalObjectFieldStorages = new(StringComparer.Ordinal);
+        private readonly List<PyNTTObjectFieldInputMetadata> _objectFieldInputs;
+        private readonly Dictionary<string, PyNTTObjectFieldBindingMetadata> _formalObjectFields = new(StringComparer.Ordinal);
         private readonly SortedSet<string> _runtimeScalarNames;
         private readonly SortedSet<string> _helperScalarNameCandidates = new(StringComparer.Ordinal);
         private readonly Dictionary<string, int> _activeLocalScalarNames = new(StringComparer.Ordinal);
@@ -522,7 +522,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             _validateOutputs = validateOutputs;
             abiState ??= new KernelAbiState(outputs.Length);
             _inputNames = abiState.InputNames;
-            _kvCacheFieldInputs = abiState.KVCacheFieldInputs;
+            _objectFieldInputs = abiState.ObjectFieldInputs;
             _runtimeScalarNames = abiState.RuntimeScalarNames;
             _abiViewStrideArgNames = abiState.AbiViewStrideArgNames;
             _bufferInputIndices = abiState.BufferInputIndices;
@@ -639,7 +639,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             }
 
             var runtimeScalarInputArgs = new SortedSet<string>(StringComparer.Ordinal);
-            foreach (var scalarInput in _kvCacheFieldInputs.Where(input => input.DType is null))
+            foreach (var scalarInput in _objectFieldInputs.Where(input => input.DType is null))
             {
                 var sourceIndex = _inputNames.IndexOf(scalarInput.Name);
                 if (sourceIndex < 0 || !inputLayout.IndexMap.TryGetValue(sourceIndex, out var kernelInputIndex))
@@ -667,9 +667,9 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     .ToArray();
             }
 
-            if (_kvCacheFieldInputs.Count > 0)
+            if (_objectFieldInputs.Count > 0)
             {
-                _attrs["kv_cache_field_inputs"] = _kvCacheFieldInputs.ToArray();
+                _attrs["object_field_inputs"] = _objectFieldInputs.ToArray();
             }
 
             if (_helperCalls.Count > 0)
@@ -794,7 +794,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 _gridBarrierAxisGroups.Values.ToArray(),
                 GetBlockLocalDataPoolBytes(),
                 _formalHostTensorDescriptors.ToArray(),
-                new Dictionary<string, PyNTTKVCacheStorageMetadata?>(_formalObjectFieldStorages, StringComparer.Ordinal),
+                new Dictionary<string, PyNTTObjectFieldBindingMetadata>(_formalObjectFields, StringComparer.Ordinal),
                 new Dictionary<int, string>(_formalObjectOutputAliases));
         }
 
@@ -893,8 +893,8 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     _gridBarrierAxisGroups.Values.ToArray(),
                     GetBlockLocalDataPoolBytes(),
                     _formalHostTensorDescriptors.ToArray(),
-                    new Dictionary<string, PyNTTKVCacheStorageMetadata?>(
-                        _formalObjectFieldStorages,
+                    new Dictionary<string, PyNTTObjectFieldBindingMetadata>(
+                        _formalObjectFields,
                         StringComparer.Ordinal),
                     new Dictionary<int, string>(_formalObjectOutputAliases),
                     new PipelineDeviceFunctionInterface(
@@ -1539,6 +1539,12 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                         args,
                         RequireMicroKernel(microKernel, packedMatmulNormStats));
                     break;
+                case Nncase.TIR.NTT.PackedMatMulSamplingPartial packedMatmulSamplingPartial:
+                    VisitPackedMatMulSamplingPartial(
+                        packedMatmulSamplingPartial,
+                        args,
+                        RequireMicroKernel(microKernel, packedMatmulSamplingPartial));
+                    break;
                 case Nncase.TIR.NTT.QKVParallelLinear qkvParallelLinear:
                     VisitQKVParallelLinear(qkvParallelLinear, args, RequireMicroKernel(microKernel, qkvParallelLinear));
                     break;
@@ -1607,6 +1613,12 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 case Nncase.TIR.NTT.Softmax softmax:
                     VisitSoftmax(softmax.Axis, default, args, "softmax");
                     break;
+                case Nncase.TIR.NTT.SamplingPartial samplingPartial:
+                    VisitSamplingPartial(samplingPartial, args);
+                    break;
+                case Nncase.TIR.NTT.SamplingCombine samplingCombine:
+                    VisitSamplingCombine(samplingCombine, args);
+                    break;
                 case PrimFunction callee:
                     VisitPrimFunctionCall(callee, args);
                     break;
@@ -1649,6 +1661,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             }
 
             var offsets = new Dictionary<string, string>(StringComparer.Ordinal);
+            var shapes = new Dictionary<string, long[]>(StringComparer.Ordinal);
             for (var index = 0; index < selection.SharedWorkspaces.Length; index++)
             {
                 var descriptor = selection.SharedWorkspaces[index];
@@ -1671,6 +1684,13 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     AddOffsetExpressions(
                         _sharedBaseOffsetBytes,
                         localOffset.ToString(CultureInfo.InvariantCulture)));
+                shapes.Add(
+                    descriptor.Name,
+                    buffer.Dimensions.ToArray()
+                        .Select((dimension, axis) => GetFixedDimension(
+                            dimension,
+                            $"{buffer.Name} shared shape axis {axis}"))
+                        .ToArray());
             }
 
             var transferChannels = selection.TransferPipeline?.Channels
@@ -1685,6 +1705,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 selection.Variant,
                 selection.Parameters,
                 offsets,
+                shapes,
                 transferChannels);
         }
 
@@ -1841,7 +1862,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                         definition.Name,
                         definition.Parameters,
                         buildResult.FormalHostTensorDescriptors,
-                        buildResult.FormalObjectFieldStorages);
+                        buildResult.FormalObjectFields);
                     if (!consumerValues.TryGetValue(
                             definition.SharedBaseOffsetParameter,
                             out var actualSharedBaseOffset))
@@ -2124,7 +2145,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
         {
             var deviceAbiState = new KernelAbiState(
                 _inputNames,
-                _kvCacheFieldInputs,
+                _objectFieldInputs,
                 _runtimeScalarNames,
                 _abiViewStrideArgNames,
                 _bufferInputIndices,
@@ -2650,7 +2671,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 definition.Name,
                 definition.Parameters,
                 definition.BuildResult.FormalHostTensorDescriptors,
-                definition.BuildResult.FormalObjectFieldStorages);
+                definition.BuildResult.FormalObjectFields);
             return OrderDeviceFunctionInvocationArguments(
                 callee,
                 definition.BuildResult.Function,
@@ -2663,7 +2684,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             string definitionName,
             IReadOnlyList<DeviceFunctionFormalParameter> definitionParameters,
             IReadOnlyList<FormalHostTensorDescriptorRequirement> formalHostTensorDescriptors,
-            IReadOnlyDictionary<string, PyNTTKVCacheStorageMetadata?> formalObjectFieldStorages)
+            IReadOnlyDictionary<string, PyNTTObjectFieldBindingMetadata> formalObjectFields)
         {
             var values = new Dictionary<string, string>(StringComparer.Ordinal)
             {
@@ -2746,15 +2767,14 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     case DeviceFunctionFormalParameterKind.Object:
                         var objectBaseName = RequireParameterName(parameter.ObjectBaseName, definitionName, parameter.Parameter.Name);
                         var prefix = objectBaseName + "_";
-                        foreach (var pair in formalObjectFieldStorages)
+                        foreach (var pair in formalObjectFields)
                         {
                             if (!pair.Key.StartsWith(prefix, StringComparison.Ordinal))
                             {
                                 continue;
                             }
 
-                            var field = pair.Key[prefix.Length..];
-                            values[pair.Key] = GetKVCacheFieldArgument(argument, field, pair.Value);
+                            values[pair.Key] = GetObjectFieldArgument(argument, pair.Value);
                         }
 
                         break;
@@ -2951,11 +2971,6 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
 
             if (args[1] is TIR.Buffer destBuffer)
             {
-                if (destBuffer.MemSpan.Buffer.Location == MemoryLocation.Output && !IsFormalTensorBuffer(destBuffer))
-                {
-                    throw new NotSupportedException($"PyNTT PrimFunction {_function.Name} must store to output BufferVar ABI parameters, but TensorStore destination {destBuffer.Name} is a TIR Buffer in Output memory.");
-                }
-
                 VisitInternalTensorStore(src, destBuffer);
                 return;
             }
@@ -3076,6 +3091,9 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     vectorLaneShape,
                     operation,
                     copyPlan,
+                    operation == "TensorStore" &&
+                    dest.MemSpan.Buffer.Location == MemoryLocation.Output &&
+                    RequiresCanonicalOwnerMaterialization(src),
                     $"{operation}: {src.Name} -> {dest.Name}");
             WriteHelperTemplate(
                 "triton/kernels/TensorRegionCopy.py.jinja",
@@ -3235,9 +3253,15 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     GetBufferShardAxes(src, globalShape.Length),
                     GetVectorLaneElementCount(src.ElemType),
                     GetVectorLanes(src.ElemType),
+                    RequiresCanonicalOwnerMaterialization(src),
                     comment));
             WriteLine(BuildHelperCall(helperName, outputName, $"{outputName}_pool_stride_elements"));
         }
+
+        private static bool RequiresCanonicalOwnerMaterialization(TIR.Buffer source)
+            => source.DistributedStorageKind == DistributedBufferStorageKind.CanonicalGlobal &&
+               source.DistributedType is { Partial: null } distributedType &&
+               distributedType.AxisPolicies.All(policy => policy is SBPBroadCast);
 
         private void VisitMemcopy(IReadOnlyList<BaseExpr> args)
         {
@@ -5015,6 +5039,194 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 matmul.UseMean);
         }
 
+        private void VisitPackedMatMulSamplingPartial(
+            Nncase.TIR.NTT.PackedMatMulSamplingPartial sampling,
+            IReadOnlyList<BaseExpr> args,
+            PyNTTMicroKernelTemplateModel microKernel)
+        {
+            if (args.Count < 8 ||
+                args[0] is not TIR.Buffer lhs ||
+                args[1] is not TIR.Buffer rhs ||
+                args[3] is not TIR.Buffer logits ||
+                args[4] is not TIR.Buffer processedLogits ||
+                args[5] is not TIR.Buffer argMaxState)
+            {
+                throw new NotSupportedException(
+                    "PyNTT PackedMatMulSamplingPartial codegen expects lhs, rhs, state, raw logits, processed logits, partial argmax state, scale, and optional addend.");
+            }
+
+            if (microKernel.Family != "triton.matmul_sampling_partial" ||
+                microKernel.Variant != "simt_fma_smem_pipeline" ||
+                sampling.RhsLayout != IR.NTT.PackedMatMulRhsLayout.KMajor)
+            {
+                throw new NotSupportedException(
+                    $"PyNTT PackedMatMulSamplingPartial requires triton.matmul_sampling_partial/simt_fma_smem_pipeline " +
+                    $"with K-major weights, got {microKernel.Family}/{microKernel.Variant}, {sampling.RhsLayout}.");
+            }
+
+            var addend = args[7] switch
+            {
+                TIR.Buffer buffer => buffer,
+                None => null,
+                _ => throw new NotSupportedException(
+                    "PyNTT PackedMatMulSamplingPartial addend must be a TIR buffer or None."),
+            };
+            var lhsShape = GetBufferActiveShape(lhs);
+            var rhsShape = GetBufferActiveShape(rhs);
+            var packedOutputShape = GetDistributedActiveShape(
+                sampling.PackedOutputType,
+                "PyNTT PackedMatMulSamplingPartial packed output");
+            var logitsShape = GetBufferActiveShape(logits);
+            var logitsGlobalShape = GetBufferGlobalShape(logits);
+            ValidateMinimumRank("PyNTT PackedMatMulSamplingPartial lhs", lhsShape, 2);
+            ValidateMinimumRank("PyNTT PackedMatMulSamplingPartial rhs", rhsShape, 2);
+            ValidateMinimumRank("PyNTT PackedMatMulSamplingPartial packed output", packedOutputShape, 2);
+            ValidateMinimumRank("PyNTT PackedMatMulSamplingPartial logits", logitsShape, 2);
+
+            var rhsLanes = GetVectorLanes(rhs.ElemType);
+            var outputLanes = GetVectorLanes(sampling.PackedOutputType.TensorType.DType);
+            if (GetVectorLanes(lhs.ElemType).Length != 0 ||
+                rhsLanes.Length != 3 ||
+                rhsLanes[0] != 8 ||
+                rhsLanes[1] != 2 ||
+                rhsLanes[2] != 8 ||
+                outputLanes.Length != 1 ||
+                outputLanes[0] != 8 ||
+                GetScalarDataType(lhs.ElemType) != DataTypes.BFloat16 ||
+                GetScalarDataType(rhs.ElemType) != DataTypes.BFloat16 ||
+                logits.ElemType != GetScalarDataType(sampling.PackedOutputType.TensorType.DType) ||
+                processedLogits.ElemType != DataTypes.Float32 ||
+                argMaxState.ElemType != DataTypes.UInt64)
+            {
+                throw new NotSupportedException(
+                    "PyNTT PackedMatMulSamplingPartial requires BF16 lhs, " +
+                    "rhs=[K/16,N/8]<8,2,8>, packed output <8>, scalar BF16 logits, FP32 processed logits, and UInt64 argmax state.");
+            }
+
+            if (logits.DistributedType is not { } logitsType ||
+                !Evaluator.IR.NTT.SamplingSplitTypeUtility.IsFullyVocabularySharded(logitsType) ||
+                argMaxState.DistributedType is not { } argMaxType ||
+                !Evaluator.IR.NTT.SamplingSplitTypeUtility.IsArgMaxPartial(argMaxType, logitsType.Placement))
+            {
+                throw new NotSupportedException(
+                    "PyNTT PackedMatMulSamplingPartial requires matching full-mesh vocabulary shards and P(Max) partial state.");
+            }
+
+            PyNTTDimExpression[] addendShape = Array.Empty<PyNTTDimExpression>();
+            if (addend is not null)
+            {
+                addendShape = GetBufferActiveShape(addend);
+                if (!Equals(addend.ElemType, sampling.PackedOutputType.TensorType.DType) ||
+                    addendShape.Length != packedOutputShape.Length ||
+                    !addendShape.Zip(packedOutputShape).All(pair => SameDim(pair.First, pair.Second)))
+                {
+                    throw new NotSupportedException(
+                        "PyNTT PackedMatMulSamplingPartial addend must have the packed output dtype and active shape.");
+                }
+            }
+
+            SetComputeOp("packed_matmul_sampling_partial");
+            _attrs["op"] = "packed_matmul_sampling_partial";
+            _attrs["vocab_size"] = sampling.Config.VocabSize;
+            _attrs["max_batch_size"] = sampling.Config.MaxBatchSize;
+            _attrs["rhs_layout"] = "k_major";
+            _attrs["gemv"] = true;
+
+            var helperName = GetNextHelperName("lm_head_sampling_partial_compute");
+            var rhsDescriptor = RegisterHostTensorDescriptor(
+                rhs,
+                $"{helperName}__rhs_descriptor");
+            var scale = GetScalarFloat(
+                args[6],
+                "PyNTT PackedMatMulSamplingPartial scale",
+                1.0f);
+            var matmulModel = new PyNTTMatmulTemplateModel(
+                helperName,
+                GetBufferScalarPointer(lhs),
+                GetBufferScalarPointer(rhs),
+                GetBufferScalarPointer(logits),
+                GetPyNTTScalarDTypeName(lhs.ElemType),
+                GetPyNTTScalarDTypeName(rhs.ElemType),
+                GetPyNTTScalarDTypeName(sampling.PackedOutputType.TensorType.DType),
+                GetScalarTritonDType(lhs.ElemType),
+                GetScalarTritonDType(rhs.ElemType),
+                GetScalarTritonDType(sampling.PackedOutputType.TensorType.DType),
+                lhsShape,
+                rhsShape,
+                packedOutputShape,
+                GetBufferStrides(lhs),
+                GetBufferStrides(rhs),
+                GetDistributedLocalStrides(
+                    sampling.PackedOutputType,
+                    "PyNTT PackedMatMulSamplingPartial packed output"),
+                false,
+                false,
+                sampling.LogitsType.Placement.Hierarchy.ToArray(),
+                8,
+                8,
+                scale.ToString("R", CultureInfo.InvariantCulture),
+                microKernel,
+                $"{lhs.Name}, {rhs.Name} -> {logits.Name}")
+            {
+                RhsGlobalOffsets = GetBufferGlobalOffsets(rhs),
+                RhsDescriptorName = rhsDescriptor.Name,
+                RhsDescriptorOriginElements = rhsDescriptor.OriginElements,
+                RhsNPackedLaneCount = 1,
+                OutputNPackedLaneCount = 1,
+                RhsLayout = "k_major",
+                RhsKPackLaneCount = 2,
+                RhsKVectorLaneCount = 8,
+                LoadCExpression = "False",
+                Addend = addend is null ? null : GetBufferScalarPointer(addend),
+                AddendShape = addendShape,
+                AddendStrides = addend is null
+                    ? Array.Empty<PyNTTDimExpression>()
+                    : GetBufferStrides(addend),
+            };
+            var config = sampling.Config;
+            var state = args[2];
+            var samplingModel = new PyNTTSamplingPartialTemplateModel(
+                helperName,
+                GetBufferScalarPointer(logits),
+                GetBufferScalarPointer(processedLogits),
+                GetBufferScalarPointer(argMaxState),
+                GetSamplerFieldArgument(state, "active", "uint8", config.MaxBatchSize),
+                GetSamplerFieldArgument(state, "processor_flags", "uint32", config.MaxBatchSize),
+                GetSamplerProcessorFlagValues(),
+                GetSamplerFieldArgument(state, "frequency_penalty", "float32", config.MaxBatchSize),
+                GetSamplerFieldArgument(state, "presence_penalty", "float32", config.MaxBatchSize),
+                GetSamplerFieldArgument(state, "repetition_penalty", "float32", config.MaxBatchSize),
+                GetSamplerFieldArgument(state, "prompt_token_mask", "uint8", config.MaxBatchSize, config.VocabSize),
+                GetSamplerFieldArgument(state, "output_token_counts", "int32", config.MaxBatchSize, config.VocabSize),
+                GetSamplerFieldArgument(state, "allowed_token_mask", "uint8", config.MaxBatchSize, config.VocabSize),
+                GetSamplerFieldArgument(state, "forbidden_token_mask", "uint8", config.MaxBatchSize, config.VocabSize),
+                GetSamplerFieldArgument(state, "logit_bias", "float32", config.MaxBatchSize, config.VocabSize),
+                GetPyNTTScalarDTypeName(logits.ElemType),
+                GetScalarTritonDType(logits.ElemType),
+                logitsShape,
+                logitsGlobalShape,
+                GetBufferStrides(logits),
+                GetBufferStrides(processedLogits),
+                GetBufferStrides(argMaxState),
+                GetBufferSourceShardAxes(logits, logits.Rank),
+                GetHierarchy(logits),
+                config.VocabSize,
+                config.MaxBatchSize,
+                $"{logits.Name} -> {processedLogits.Name}, {argMaxState.Name}");
+            WriteSelectedMicroKernelHelper(
+                microKernel,
+                new PyNTTPackedMatMulSamplingPartialTemplateModel(
+                    helperName,
+                    matmulModel,
+                    samplingModel,
+                    microKernel,
+                    $"{lhs.Name}, {rhs.Name} -> {logits.Name}, {processedLogits.Name}, {argMaxState.Name}"),
+                helperName);
+            MarkStoredOutput(logits, "PyNTT PackedMatMulSamplingPartial");
+            MarkStoredOutput(processedLogits, "PyNTT PackedMatMulSamplingPartial");
+            MarkStoredOutput(argMaxState, "PyNTT PackedMatMulSamplingPartial");
+        }
+
         private void VisitQKVParallelLinear(
             Nncase.TIR.NTT.QKVParallelLinear qkv,
             IReadOnlyList<BaseExpr> args,
@@ -6199,7 +6411,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             WriteHelperTemplate(
                 templatePath,
                 templateModel,
-                usesSharedArena: false);
+                usesSharedArena: UsesDirectSharedArena(microKernel));
             stage.BindDirect(
                 helperName,
                 templatePath,
@@ -6219,6 +6431,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             {
                 ("triton.matmul", "simt_fma") => "triton/kernels/matmul/simt_fma.py.jinja",
                 ("triton.matmul", "simt_fma_smem_pipeline") => "triton/kernels/matmul/simt_fma_smem_pipeline.py.jinja",
+                ("triton.matmul_sampling_partial", "simt_fma_smem_pipeline") => "triton/kernels/matmul_sampling_partial/simt_fma_smem_pipeline.py.jinja",
                 ("triton.matmul", "mma") => "triton/kernels/matmul/mma.py.jinja",
                 ("triton.qkv_parallel_linear", "simt_fma") => "triton/kernels/qkv_parallel_linear/simt_fma.py.jinja",
                 ("triton.qkv_parallel_linear", "simt_fma_smem_pipeline") => "triton/kernels/qkv_parallel_linear/simt_fma_smem_pipeline.py.jinja",
@@ -6237,6 +6450,15 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
 
         private static bool UsesSharedArena(PyNTTMicroKernelTemplateModel microKernel)
             => microKernel.SharedWorkspaceOffsets.Count != 0;
+
+        private static bool UsesDirectSharedArena(PyNTTMicroKernelTemplateModel microKernel)
+        {
+            var pipelineWorkspaceNames = microKernel.TransferPipelineChannels
+                .SelectMany(channel => channel.SharedWorkspaceNames)
+                .ToHashSet(StringComparer.Ordinal);
+            return microKernel.SharedWorkspaceOffsets.Keys.Any(
+                name => !pipelineWorkspaceNames.Contains(name));
+        }
 
         private void VisitReduce(Nncase.TIR.NTT.Reduce reduce, IReadOnlyList<BaseExpr> args)
         {
@@ -7474,6 +7696,232 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             WriteLine(BuildHelperCall(helperName));
         }
 
+        private void VisitSamplingPartial(
+            Nncase.TIR.NTT.SamplingPartial sampling,
+            IReadOnlyList<BaseExpr> args)
+        {
+            if (args.Count < 4 ||
+                args[0] is not TIR.Buffer logits ||
+                args[2] is not TIR.Buffer processedLogits ||
+                args[3] is not TIR.Buffer argMaxState)
+            {
+                throw new NotSupportedException(
+                    "PyNTT SamplingPartial codegen expects logits, state, processed logits, and a partial maximum state.");
+            }
+
+            var logitsShape = GetBufferActiveShape(logits);
+            var logitsGlobalShape = GetBufferGlobalShape(logits);
+            if (logitsShape.Length != 2 || logitsGlobalShape.Length != 2)
+            {
+                throw new NotSupportedException(
+                    $"PyNTT SamplingPartial requires rank-2 logits, got local/global ranks {logitsShape.Length}/{logitsGlobalShape.Length}.");
+            }
+
+            if (GetScalarDataType(logits.ElemType) is not PrimType { Attributes: var attributes } ||
+                (attributes & PrimTypeAttributes.IsFloat) == 0 ||
+                GetVectorLanes(logits.ElemType).Length != 0 ||
+                processedLogits.ElemType != DataTypes.Float32 ||
+                argMaxState.ElemType != DataTypes.UInt64)
+            {
+                throw new NotSupportedException(
+                    "PyNTT SamplingPartial requires scalar floating-point logits, FP32 processed logits, and a UInt64 argmax state.");
+            }
+
+            var hierarchy = GetHierarchy(logits);
+            if (logits.DistributedType is not { } logitsType ||
+                !Evaluator.IR.NTT.SamplingSplitTypeUtility.IsFullyVocabularySharded(logitsType))
+            {
+                throw new NotSupportedException(
+                    "PyNTT SamplingPartial requires its vocabulary axis to cover every placement axis exactly once.");
+            }
+
+            if (argMaxState.Rank != 1 ||
+                argMaxState.DistributedType is not { } argMaxType ||
+                !Evaluator.IR.NTT.SamplingSplitTypeUtility.IsArgMaxPartial(argMaxType, logitsType.Placement))
+            {
+                throw new NotSupportedException(
+                    "PyNTT SamplingPartial requires a rank-1 full-mesh P(Max) argmax state.");
+            }
+
+            var config = sampling.Config;
+            var state = args[1];
+            SetComputeOp("sampling_partial");
+            _attrs["op"] = "sampling_partial";
+            _attrs["vocab_size"] = config.VocabSize;
+            _attrs["max_batch_size"] = config.MaxBatchSize;
+            var helperName = GetNextHelperName("sampling_partial");
+            WriteHelperTemplate(
+                "triton/kernels/sampling/partial.py.jinja",
+                new PyNTTSamplingPartialTemplateModel(
+                    helperName,
+                    GetBufferScalarPointer(logits),
+                    GetBufferScalarPointer(processedLogits),
+                    GetBufferScalarPointer(argMaxState),
+                    GetSamplerFieldArgument(state, "active", "uint8", config.MaxBatchSize),
+                    GetSamplerFieldArgument(state, "processor_flags", "uint32", config.MaxBatchSize),
+                    GetSamplerProcessorFlagValues(),
+                    GetSamplerFieldArgument(state, "frequency_penalty", "float32", config.MaxBatchSize),
+                    GetSamplerFieldArgument(state, "presence_penalty", "float32", config.MaxBatchSize),
+                    GetSamplerFieldArgument(state, "repetition_penalty", "float32", config.MaxBatchSize),
+                    GetSamplerFieldArgument(state, "prompt_token_mask", "uint8", config.MaxBatchSize, config.VocabSize),
+                    GetSamplerFieldArgument(state, "output_token_counts", "int32", config.MaxBatchSize, config.VocabSize),
+                    GetSamplerFieldArgument(state, "allowed_token_mask", "uint8", config.MaxBatchSize, config.VocabSize),
+                    GetSamplerFieldArgument(state, "forbidden_token_mask", "uint8", config.MaxBatchSize, config.VocabSize),
+                    GetSamplerFieldArgument(state, "logit_bias", "float32", config.MaxBatchSize, config.VocabSize),
+                    GetPyNTTScalarDTypeName(logits.ElemType),
+                    GetScalarTritonDType(logits.ElemType),
+                    logitsShape,
+                    logitsGlobalShape,
+                    GetBufferStrides(logits),
+                    GetBufferStrides(processedLogits),
+                    GetBufferStrides(argMaxState),
+                    GetBufferSourceShardAxes(logits, logits.Rank),
+                    hierarchy,
+                    config.VocabSize,
+                    config.MaxBatchSize,
+                    $"{logits.Name} -> {processedLogits.Name}, {argMaxState.Name}"));
+            WriteLine(BuildHelperCall(helperName));
+            MarkStoredOutput(processedLogits, "PyNTT SamplingPartial");
+            MarkStoredOutput(argMaxState, "PyNTT SamplingPartial");
+        }
+
+        private void VisitSamplingCombine(
+            Nncase.TIR.NTT.SamplingCombine sampling,
+            IReadOnlyList<BaseExpr> args)
+        {
+            if (args.Count < 10 ||
+                args[0] is not TIR.Buffer logits ||
+                args[1] is not TIR.Buffer processedLogits ||
+                args[2] is not TIR.Buffer argMaxState ||
+                args[4] is not TIR.Buffer summary ||
+                args[5] is not TIR.Buffer sampledIds ||
+                args[6] is not TIR.Buffer logprobIds ||
+                args[7] is not TIR.Buffer logprobs ||
+                args[8] is not TIR.Buffer ranks ||
+                args[9] is not TIR.Buffer counts)
+            {
+                throw new NotSupportedException(
+                    "PyNTT SamplingCombine codegen expects raw/processed logits, a partial maximum state, state, summary, and five output buffers.");
+            }
+
+            var logitsShape = GetBufferActiveShape(logits);
+            var logitsGlobalShape = GetBufferGlobalShape(logits);
+            if (logitsShape.Length != 2 || logitsGlobalShape.Length != 2)
+            {
+                throw new NotSupportedException(
+                    $"PyNTT SamplingCombine requires rank-2 logits, got local/global ranks {logitsShape.Length}/{logitsGlobalShape.Length}.");
+            }
+
+            if (GetScalarDataType(logits.ElemType) is not PrimType { Attributes: var attributes } ||
+                (attributes & PrimTypeAttributes.IsFloat) == 0 ||
+                GetVectorLanes(logits.ElemType).Length != 0 ||
+                processedLogits.ElemType != DataTypes.Float32 ||
+                argMaxState.ElemType != DataTypes.UInt64)
+            {
+                throw new NotSupportedException(
+                    "PyNTT SamplingCombine requires scalar floating-point logits, FP32 processed logits, and a UInt64 argmax state.");
+            }
+
+            var hierarchy = GetHierarchy(logits);
+            if (logits.DistributedType is not { } logitsType ||
+                !Evaluator.IR.NTT.SamplingSplitTypeUtility.IsFullyVocabularySharded(logitsType))
+            {
+                throw new NotSupportedException(
+                    "PyNTT SamplingCombine requires its vocabulary axis to cover every placement axis exactly once.");
+            }
+
+            if (argMaxState.Rank != 1 ||
+                argMaxState.DistributedType is not { } argMaxType ||
+                !Evaluator.IR.NTT.SamplingSplitTypeUtility.IsArgMaxPartial(argMaxType, logitsType.Placement))
+            {
+                throw new NotSupportedException(
+                    "PyNTT SamplingCombine requires a rank-1 full-mesh P(Max) argmax state.");
+            }
+
+            if (argMaxState.DistributedStorageKind != DistributedBufferStorageKind.CompactPerOwner ||
+                !IsCompactPerOwnerBacking(argMaxState.MemSpan.Buffer))
+            {
+                throw new NotSupportedException(
+                    $"PyNTT SamplingCombine argmax state {argMaxState.Name} must use compact per-owner chip-visible storage.");
+            }
+
+            var argMaxStateRef = ResolveByteAddressedBufferRef(argMaxState);
+            if (IsZeroOffset(argMaxStateRef.PoolStrideBytes))
+            {
+                throw new NotSupportedException(
+                    $"PyNTT SamplingCombine argmax state {argMaxState.Name} requires distinct per-owner storage.");
+            }
+
+            var blockCount = hierarchy.Aggregate(1, (product, extent) => checked(product * extent));
+            if (blockCount != sampling.BlockCount)
+            {
+                throw new InvalidOperationException(
+                    $"PyNTT SamplingCombine block count {sampling.BlockCount} does not match hierarchy product {blockCount}.");
+            }
+
+            if (sampling.RadixBits != 8)
+            {
+                throw new NotSupportedException(
+                    $"PyNTT SamplingCombine currently requires 8-bit radix passes, got {sampling.RadixBits}.");
+            }
+
+            var config = sampling.Config;
+            var state = args[3];
+            SetComputeOp("sampling_combine");
+            _attrs["op"] = "sampling_combine";
+            _attrs["requires_grid_barrier"] = true;
+            _attrs["vocab_size"] = config.VocabSize;
+            _attrs["max_batch_size"] = config.MaxBatchSize;
+            _attrs["max_logprobs"] = config.MaxLogprobs;
+            _attrs["logprobs_mode"] = config.LogprobsMode.ToString();
+            var helperName = GetNextHelperName("sampling_combine");
+            WriteHelperTemplate(
+                "triton/kernels/sampling/combine.py.jinja",
+                new PyNTTSamplingCombineTemplateModel(
+                    helperName,
+                    GetBufferScalarPointer(logits),
+                    GetBufferScalarPointer(processedLogits),
+                    GetBufferScalarPointer(argMaxState),
+                    GetPooledByteAddressTemplateModel(argMaxStateRef),
+                    GetBufferScalarPointer(summary),
+                    GetBufferScalarPointer(sampledIds),
+                    GetBufferScalarPointer(logprobIds),
+                    GetBufferScalarPointer(logprobs),
+                    GetBufferScalarPointer(ranks),
+                    GetBufferScalarPointer(counts),
+                    GetSamplerFieldArgument(state, "active", "uint8", config.MaxBatchSize),
+                    GetSamplerFieldArgument(state, "temperature", "float32", config.MaxBatchSize),
+                    GetSamplerFieldArgument(state, "top_p", "float32", config.MaxBatchSize),
+                    GetSamplerFieldArgument(state, "top_k", "int32", config.MaxBatchSize),
+                    GetSamplerFieldArgument(state, "min_p", "float32", config.MaxBatchSize),
+                    GetSamplerFieldArgument(state, "requested_logprobs", "int32", config.MaxBatchSize),
+                    GetSamplerFieldArgument(state, "seeds", "uint64", config.MaxBatchSize),
+                    GetSamplerFieldArgument(state, "counters", "uint64", config.MaxBatchSize),
+                    GetSamplerFieldArgument(state, "output_token_counts", "int32", config.MaxBatchSize, config.VocabSize),
+                    GetPyNTTScalarDTypeName(logits.ElemType),
+                    GetScalarTritonDType(logits.ElemType),
+                    logitsShape,
+                    logitsGlobalShape,
+                    GetBufferStrides(logits),
+                    GetBufferStrides(processedLogits),
+                    GetBufferStrides(argMaxState),
+                    GetBufferSourceShardAxes(logits, logits.Rank),
+                    hierarchy,
+                    config.VocabSize,
+                    config.MaxBatchSize,
+                    config.MaxLogprobs,
+                    config.LogprobsMode.ToString(),
+                    sampling.BlockCount,
+                    sampling.RadixBits,
+                    $"{logits.Name} -> {sampledIds.Name}, {logprobs.Name}"));
+            WriteLine(BuildHelperCall(helperName));
+            MarkStoredOutput(sampledIds, "PyNTT SamplingCombine");
+            MarkStoredOutput(logprobIds, "PyNTT SamplingCombine");
+            MarkStoredOutput(logprobs, "PyNTT SamplingCombine");
+            MarkStoredOutput(ranks, "PyNTT SamplingCombine");
+            MarkStoredOutput(counts, "PyNTT SamplingCombine");
+        }
+
         private int GetInputIndex(BaseExpr expr)
         {
             expr = ResolveBoundExpression(expr);
@@ -8041,12 +8489,44 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
 
         private string GetKVCacheFieldArgument(BaseExpr expr, string field, PyNTTKVCacheStorageMetadata? storage = null)
         {
+            var metadata = new PyNTTObjectFieldBindingMetadata(
+                "paged_attention_kv_cache",
+                field,
+                GetKVCacheFieldMaterialization(field),
+                storage,
+                GetKVCacheFieldRuntimeDType(field, storage),
+                Array.Empty<int>());
+            return GetObjectFieldArgument(expr, metadata);
+        }
+
+        private string GetSamplerFieldArgument(BaseExpr expr, string field, string dtype, params int[] shape)
+            => GetObjectFieldArgument(
+                expr,
+                new PyNTTObjectFieldBindingMetadata(
+                    "sampler_state",
+                    field,
+                    "tensor",
+                    null,
+                    dtype,
+                    shape));
+
+        private static PyNTTSamplerProcessorFlagsTemplateModel GetSamplerProcessorFlagValues()
+            => new(
+                (uint)SamplerProcessorFlags.AllowedTokenMask,
+                (uint)SamplerProcessorFlags.ForbiddenTokenMask,
+                (uint)SamplerProcessorFlags.LogitBias,
+                (uint)SamplerProcessorFlags.RepetitionPenalty,
+                (uint)SamplerProcessorFlags.FrequencyPenalty,
+                (uint)SamplerProcessorFlags.PresencePenalty);
+
+        private string GetObjectFieldArgument(BaseExpr expr, PyNTTObjectFieldBindingMetadata metadata)
+        {
             expr = ResolveBoundExpression(expr);
             if (TryGetFormalObjectBaseName(expr, out var objectBaseName))
             {
-                var argumentName = SanitizePythonIdentifier($"{objectBaseName}_{field}");
+                var argumentName = SanitizePythonIdentifier($"{objectBaseName}_{metadata.Field}");
                 _extraWorkspaceBaseNames.Add(argumentName);
-                var runtimeDType = GetKVCacheFieldRuntimeDType(field, storage);
+                var runtimeDType = metadata.DType;
                 var tritonDType = runtimeDType is null ? null : GetTritonDType(runtimeDType);
                 if (tritonDType is not null &&
                     _extraPointerParameterTritonTypes.TryGetValue(argumentName, out var existingTritonDType) &&
@@ -8060,17 +8540,26 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     _extraPointerParameterTritonTypes[argumentName] = tritonDType;
                 }
 
-                _formalObjectFieldStorages[argumentName] = storage;
+                if (_formalObjectFields.TryGetValue(argumentName, out var existingMetadata) &&
+                    !ObjectFieldBindingMetadataEquals(existingMetadata, metadata))
+                {
+                    throw new NotSupportedException(
+                        $"PyNTT formal object field {argumentName} has conflicting ABI metadata.");
+                }
+
+                _formalObjectFields[argumentName] = metadata;
                 return argumentName;
             }
 
-            return $"input{RegisterKVCacheFieldInput(expr, field, storage).ToString(CultureInfo.InvariantCulture)}";
+            return $"input{RegisterObjectFieldInput(expr, metadata).ToString(CultureInfo.InvariantCulture)}";
         }
 
-        private int RegisterKVCacheFieldInput(BaseExpr expr, string field, PyNTTKVCacheStorageMetadata? storage = null)
+        private int RegisterObjectFieldInput(BaseExpr expr, PyNTTObjectFieldBindingMetadata metadata)
         {
-            var sourceName = GetKVCacheSourceInputName(expr, $"PyNTT KV-cache field {field}");
-            var syntheticName = $"{sourceName}.__{field}";
+            var sourceName = GetObjectSourceInputName(
+                expr,
+                $"PyNTT {metadata.ObjectKind} field {metadata.Field}");
+            var syntheticName = $"{sourceName}.__{metadata.Field}";
             var inputIndex = _inputNames.IndexOf(syntheticName);
             if (inputIndex < 0)
             {
@@ -8078,13 +8567,90 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 _inputNames.Add(syntheticName);
             }
 
-            if (!_kvCacheFieldInputs.Any(input => input.Name == syntheticName))
+            var inputMetadata = new PyNTTObjectFieldInputMetadata(
+                syntheticName,
+                sourceName,
+                metadata.ObjectKind,
+                metadata.Field,
+                metadata.Materialization,
+                metadata.Storage,
+                metadata.DType,
+                metadata.Shape);
+            var existing = _objectFieldInputs.FirstOrDefault(input => input.Name == syntheticName);
+            if (existing is null)
             {
-                _kvCacheFieldInputs.Add(new(syntheticName, sourceName, field, storage, GetKVCacheFieldRuntimeDType(field, storage)));
+                _objectFieldInputs.Add(inputMetadata);
+            }
+            else if (!ObjectFieldInputMetadataEquals(existing, inputMetadata))
+            {
+                throw new NotSupportedException(
+                    $"PyNTT object field input {syntheticName} has conflicting ABI metadata.");
             }
 
             return inputIndex;
         }
+
+        private static bool ObjectFieldInputMetadataEquals(
+            PyNTTObjectFieldInputMetadata left,
+            PyNTTObjectFieldInputMetadata right)
+            => left.Name == right.Name &&
+               left.SourceName == right.SourceName &&
+               ObjectFieldBindingMetadataEquals(
+                   new PyNTTObjectFieldBindingMetadata(
+                       left.ObjectKind,
+                       left.Field,
+                       left.Materialization,
+                       left.Storage,
+                       left.DType,
+                       left.Shape),
+                   new PyNTTObjectFieldBindingMetadata(
+                       right.ObjectKind,
+                       right.Field,
+                       right.Materialization,
+                       right.Storage,
+                       right.DType,
+                       right.Shape));
+
+        private static bool ObjectFieldBindingMetadataEquals(
+            PyNTTObjectFieldBindingMetadata left,
+            PyNTTObjectFieldBindingMetadata right)
+            => left.ObjectKind == right.ObjectKind &&
+               left.Field == right.Field &&
+               left.Materialization == right.Materialization &&
+               left.DType == right.DType &&
+               left.Shape.SequenceEqual(right.Shape) &&
+               KVCacheStorageMetadataEquals(left.Storage, right.Storage);
+
+        private static bool KVCacheStorageMetadataEquals(
+            PyNTTKVCacheStorageMetadata? left,
+            PyNTTKVCacheStorageMetadata? right)
+        {
+            if (ReferenceEquals(left, right))
+            {
+                return true;
+            }
+
+            return left is not null &&
+                   right is not null &&
+                   left.DType == right.DType &&
+                   left.TopologyShape.SequenceEqual(right.TopologyShape) &&
+                   left.KeyTailShape.SequenceEqual(right.KeyTailShape) &&
+                   left.ValueTailShape.SequenceEqual(right.ValueTailShape) &&
+                   left.KeySectionElements == right.KeySectionElements &&
+                   left.ValueSectionElements == right.ValueSectionElements &&
+                   left.BlockElements == right.BlockElements &&
+                   left.BlockSize == right.BlockSize;
+        }
+
+        private static string GetKVCacheFieldMaterialization(string field)
+            => field switch
+            {
+                "query_start_loc" or "seq_lens" or "block_table" or "slot_mapping" => "tensor",
+                "num_seqs" => "num_seqs",
+                "kv_caches" => "storage",
+                "kv_caches_blocks" => "blocks_per_shard",
+                _ => throw new NotSupportedException($"PyNTT KV-cache field {field} has unknown materialization kind."),
+            };
 
         private static string? GetKVCacheFieldRuntimeDType(string field, PyNTTKVCacheStorageMetadata? storage)
             => field switch
@@ -8130,7 +8696,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             return false;
         }
 
-        private string GetKVCacheSourceInputName(BaseExpr expr, string context)
+        private string GetObjectSourceInputName(BaseExpr expr, string context)
         {
             expr = UnwrapInputBoxing(expr);
             if (expr is TIR.Buffer kvCache)
@@ -9349,6 +9915,50 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             }
 
             return buffer.Dimensions.ToArray()
+                .Select(GetDimensionExpression)
+                .ToArray();
+        }
+
+        private PyNTTDimExpression[] GetDistributedActiveShape(
+            DistributedType distributedType,
+            string context)
+        {
+            var shardIndex = Enumerable.Range(0, distributedType.Placement.Rank)
+                .Select(axis => (Dimension)new DimVar($"{ShardCoordDimPrefix}{axis}"))
+                .ToArray();
+            var descriptor = DistributedUtility.GetLocalShardDescriptor(
+                distributedType,
+                shardIndex);
+            var hierarchy = distributedType.Placement.Hierarchy.ToArray();
+            var activeShape = descriptor.ActiveShape
+                .Select(dimension => GetLocalRegionDimensionExpression(dimension, hierarchy))
+                .ToArray();
+            if (activeShape.Length != distributedType.TensorType.Shape.Rank)
+            {
+                throw new InvalidOperationException(
+                    $"{context} local shard rank mismatch: expected " +
+                    $"{distributedType.TensorType.Shape.Rank}, got {activeShape.Length}.");
+            }
+
+            return activeShape;
+        }
+
+        private PyNTTDimExpression[] GetDistributedGlobalShape(
+            DistributedType distributedType,
+            string context)
+            => GetRankedShapeDimensions(distributedType.TensorType.Shape, context)
+                .Select(GetDimensionExpression)
+                .ToArray();
+
+        private PyNTTDimExpression[] GetDistributedLocalStrides(
+            DistributedType distributedType,
+            string context)
+        {
+            var localType = DistributedUtility.GetDividedTensorType(
+                distributedType,
+                DistributedUtility.DivideFlags.MaxShape);
+            var dimensions = GetRankedShapeDimensions(localType.Shape, context);
+            return TensorUtilities.GetDefaultStrides(dimensions)
                 .Select(GetDimensionExpression)
                 .ToArray();
         }
@@ -10576,7 +11186,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             public KernelAbiState(int outputCount)
                 : this(
                     new List<string>(),
-                    new List<PyNTTKVCacheFieldInputMetadata>(),
+                    new List<PyNTTObjectFieldInputMetadata>(),
                     new SortedSet<string>(StringComparer.Ordinal),
                     new SortedSet<string>(StringComparer.Ordinal),
                     new Dictionary<TIR.Buffer, int>(ReferenceEqualityComparer.Instance),
@@ -10595,7 +11205,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
 
             public KernelAbiState(
                 List<string> inputNames,
-                List<PyNTTKVCacheFieldInputMetadata> kvCacheFieldInputs,
+                List<PyNTTObjectFieldInputMetadata> objectFieldInputs,
                 SortedSet<string> runtimeScalarNames,
                 SortedSet<string> abiViewStrideArgNames,
                 Dictionary<TIR.Buffer, int> bufferInputIndices,
@@ -10611,7 +11221,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 Dictionary<string, PipelineDeviceFunctionDefinition>? pipelineDeviceFunctionDefinitionsByName = null)
             {
                 InputNames = inputNames;
-                KVCacheFieldInputs = kvCacheFieldInputs;
+                ObjectFieldInputs = objectFieldInputs;
                 RuntimeScalarNames = runtimeScalarNames;
                 AbiViewStrideArgNames = abiViewStrideArgNames;
                 BufferInputIndices = bufferInputIndices;
@@ -10629,7 +11239,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
 
             public List<string> InputNames { get; }
 
-            public List<PyNTTKVCacheFieldInputMetadata> KVCacheFieldInputs { get; }
+            public List<PyNTTObjectFieldInputMetadata> ObjectFieldInputs { get; }
 
             public SortedSet<string> RuntimeScalarNames { get; }
 
@@ -12715,7 +13325,7 @@ internal sealed record DeviceFunctionBuildResult(
     IReadOnlyList<int[]> GridBarrierAxisGroups,
     long BlockLocalDataPoolBytes,
     IReadOnlyList<FormalHostTensorDescriptorRequirement> FormalHostTensorDescriptors,
-    IReadOnlyDictionary<string, PyNTTKVCacheStorageMetadata?> FormalObjectFieldStorages,
+    IReadOnlyDictionary<string, PyNTTObjectFieldBindingMetadata> FormalObjectFields,
     IReadOnlyDictionary<int, string> FormalObjectOutputAliases);
 
 internal sealed record PipelineDeviceFunctionBuildResult(
@@ -12728,7 +13338,7 @@ internal sealed record PipelineDeviceFunctionBuildResult(
     IReadOnlyList<int[]> GridBarrierAxisGroups,
     long BlockLocalDataPoolBytes,
     IReadOnlyList<FormalHostTensorDescriptorRequirement> FormalHostTensorDescriptors,
-    IReadOnlyDictionary<string, PyNTTKVCacheStorageMetadata?> FormalObjectFieldStorages,
+    IReadOnlyDictionary<string, PyNTTObjectFieldBindingMetadata> FormalObjectFields,
     IReadOnlyDictionary<int, string> FormalObjectOutputAliases,
     PipelineDeviceFunctionInterface Interface);
 

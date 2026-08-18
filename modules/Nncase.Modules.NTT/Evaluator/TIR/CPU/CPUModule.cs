@@ -84,5 +84,8 @@ internal class NTTModule : IApplicationPart
         registrator.RegisterManyInterface<Qwen3MoEEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<SparseExpertsEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<TopKEvaluator>(reuse: Reuse.Singleton);
+        registrator.RegisterManyInterface<SamplingPartialEvaluator>(reuse: Reuse.Singleton);
+        registrator.RegisterManyInterface<SamplingCombineEvaluator>(reuse: Reuse.Singleton);
+        registrator.RegisterManyInterface<PackedMatMulSamplingPartialEvaluator>(reuse: Reuse.Singleton);
     }
 }

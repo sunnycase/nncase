@@ -53,6 +53,14 @@ public unsafe struct CApiMT
     public delegate* unmanaged<IntPtr, IntPtr, void> ImportOptionsSetHuggingFaceOptionsPtr;
     public delegate* unmanaged<IntPtr, byte, void> HuggingFaceOptionsOutputLogitsPtr;
     public delegate* unmanaged<IntPtr, byte, void> HuggingFaceOptionsOutputHiddenStatesPtr;
+    public delegate* unmanaged<IntPtr, byte, void> HuggingFaceOptionsEnableSamplerPtr;
+    public delegate* unmanaged<IntPtr, byte> HuggingFaceOptionsGetEnableSamplerPtr;
+    public delegate* unmanaged<IntPtr, int, void> HuggingFaceOptionsSamplerMaxBatchSizePtr;
+    public delegate* unmanaged<IntPtr, int> HuggingFaceOptionsGetSamplerMaxBatchSizePtr;
+    public delegate* unmanaged<IntPtr, int, void> HuggingFaceOptionsSamplerMaxLogprobsPtr;
+    public delegate* unmanaged<IntPtr, int> HuggingFaceOptionsGetSamplerMaxLogprobsPtr;
+    public delegate* unmanaged<IntPtr, byte, void> HuggingFaceOptionsSamplerLogprobsModePtr;
+    public delegate* unmanaged<IntPtr, byte> HuggingFaceOptionsGetSamplerLogprobsModePtr;
     public delegate* unmanaged<IntPtr, nuint, void> HuggingFaceOptionsNumLayersPtr;
     public delegate* unmanaged<IntPtr, byte*, nuint, void> HuggingFaceOptionsTensorTypePtr;
     public delegate* unmanaged<IntPtr, byte*, nuint, void> HuggingFaceOptionsInputIdsTypePtr;
@@ -195,6 +203,14 @@ public static unsafe class CApi
         mt->ImportOptionsSetHuggingFaceOptionsPtr = &ImportOptionsSetHuggingFaceOptions;
         mt->HuggingFaceOptionsOutputLogitsPtr = &HuggingFaceOptionsOutputLogits;
         mt->HuggingFaceOptionsOutputHiddenStatesPtr = &HuggingFaceOptionsOutputHiddenStates;
+        mt->HuggingFaceOptionsEnableSamplerPtr = &HuggingFaceOptionsEnableSampler;
+        mt->HuggingFaceOptionsGetEnableSamplerPtr = &HuggingFaceOptionsGetEnableSampler;
+        mt->HuggingFaceOptionsSamplerMaxBatchSizePtr = &HuggingFaceOptionsSamplerMaxBatchSize;
+        mt->HuggingFaceOptionsGetSamplerMaxBatchSizePtr = &HuggingFaceOptionsGetSamplerMaxBatchSize;
+        mt->HuggingFaceOptionsSamplerMaxLogprobsPtr = &HuggingFaceOptionsSamplerMaxLogprobs;
+        mt->HuggingFaceOptionsGetSamplerMaxLogprobsPtr = &HuggingFaceOptionsGetSamplerMaxLogprobs;
+        mt->HuggingFaceOptionsSamplerLogprobsModePtr = &HuggingFaceOptionsSamplerLogprobsMode;
+        mt->HuggingFaceOptionsGetSamplerLogprobsModePtr = &HuggingFaceOptionsGetSamplerLogprobsMode;
         mt->HuggingFaceOptionsNumLayersPtr = &HuggingFaceOptionsNumLayers;
         mt->HuggingFaceOptionsTensorTypePtr = &HuggingFaceOptionsTensorType;
         mt->HuggingFaceOptionsInputIdsTypePtr = &HuggingFaceOptionsInputIdsType;
@@ -426,6 +442,40 @@ public static unsafe class CApi
         bool outputHiddenStatesBool = outputHiddenStates != 0;
         Get<HuggingFaceOptions>(huggingFaceOptionsHandle).OutputHiddenStates = outputHiddenStatesBool;
     }
+
+    [UnmanagedCallersOnly]
+    private static void HuggingFaceOptionsEnableSampler(IntPtr handle, byte value)
+    {
+        Get<HuggingFaceOptions>(handle).EnableSampler = value != 0;
+    }
+
+    [UnmanagedCallersOnly]
+    private static byte HuggingFaceOptionsGetEnableSampler(IntPtr handle)
+        => Get<HuggingFaceOptions>(handle).EnableSampler ? (byte)1 : (byte)0;
+
+    [UnmanagedCallersOnly]
+    private static void HuggingFaceOptionsSamplerMaxBatchSize(IntPtr handle, int value)
+        => Get<HuggingFaceOptions>(handle).SamplerMaxBatchSize = value;
+
+    [UnmanagedCallersOnly]
+    private static int HuggingFaceOptionsGetSamplerMaxBatchSize(IntPtr handle)
+        => Get<HuggingFaceOptions>(handle).SamplerMaxBatchSize;
+
+    [UnmanagedCallersOnly]
+    private static void HuggingFaceOptionsSamplerMaxLogprobs(IntPtr handle, int value)
+        => Get<HuggingFaceOptions>(handle).SamplerMaxLogprobs = value;
+
+    [UnmanagedCallersOnly]
+    private static int HuggingFaceOptionsGetSamplerMaxLogprobs(IntPtr handle)
+        => Get<HuggingFaceOptions>(handle).SamplerMaxLogprobs;
+
+    [UnmanagedCallersOnly]
+    private static void HuggingFaceOptionsSamplerLogprobsMode(IntPtr handle, byte value)
+        => Get<HuggingFaceOptions>(handle).SamplerLogprobsMode = (SamplerLogprobsMode)value;
+
+    [UnmanagedCallersOnly]
+    private static byte HuggingFaceOptionsGetSamplerLogprobsMode(IntPtr handle)
+        => (byte)Get<HuggingFaceOptions>(handle).SamplerLogprobsMode;
 
     [UnmanagedCallersOnly]
     private static void HuggingFaceOptionsNumLayers(IntPtr huggingFaceOptionsHandle, nuint numLayers)

@@ -290,10 +290,19 @@ public abstract class HuggingFaceModel
         var pastKeyValue = new Var("kvCache", TensorType.Scalar(
             new ReferenceType(new PagedAttentionKVCacheType { Config = (IPagedAttentionConfig)ImportOptions.HuggingFaceOptions.Config })));
 
+        Var? samplerState = null;
+        if (ImportOptions.HuggingFaceOptions.EnableSampler)
+        {
+            var samplerConfig = GetSamplerConfig();
+            samplerState = new Var("samplerState", TensorType.Scalar(
+                new ReferenceType(new SamplerStateType { Config = samplerConfig })));
+        }
+
         Context.Inputs.Add(inputIds);
         Context.Inputs.Add(null); // attentionMask
         Context.Inputs.Add(null); // positionIds
         Context.Inputs.Add(pastKeyValue); // pastKeyValue
+        Context.Inputs.Add(samplerState);
 
         // _inputs.Add(attentionMask);
         // _inputs.Add(positionIds);
@@ -325,6 +334,27 @@ public abstract class HuggingFaceModel
     // public abstract Expr CreateOutputs();
     public virtual BaseExpr CreateOutputs()
     {
+        if (ImportOptions.HuggingFaceOptions.EnableSampler)
+        {
+            if (ImportOptions.HuggingFaceOptions.OutputLogits)
+            {
+                throw new InvalidOperationException("Sampling output replaces logits output; enable only one of them.");
+            }
+
+            if (ImportOptions.HuggingFaceOptions.OutputHiddenStates)
+            {
+                throw new InvalidOperationException("Sampling output cannot be combined with hidden-state output.");
+            }
+
+            var sampling = Context!.Outputs["sampling"];
+            return new IR.Tuple(
+                sampling[0],
+                sampling[1],
+                sampling[2],
+                sampling[3],
+                sampling[4]);
+        }
+
         // TODO: use self.config.output_attention to judge wether output kvache
         Expr? logits = null;
         Expr? lastHiddenStates = null;
@@ -1279,8 +1309,16 @@ public abstract class HuggingFaceModel
 
         var lmHead = Linear(lastHiddenStates, lmHeadWeights, layerName: "lm_head");
 
+        if (Context.ImportOptions!.HuggingFaceOptions.EnableSampler)
+        {
+            var samplerState = Context.Inputs![4]
+                ?? throw new InvalidOperationException("Sampler state input was not created.");
+            var sampling = IR.F.NN.Sampling(lmHead, samplerState, GetSamplerConfig());
+            Context.Outputs!.Add("sampling", sampling);
+        }
+
         // FIXIT: this is work around for bfloat16
-        if (Context.ImportOptions!.HuggingFaceOptions.OutputLogits)
+        else if (Context.ImportOptions.HuggingFaceOptions.OutputLogits)
         {
             Context.Outputs!.Add("logits", IR.F.Tensors.Cast(lmHead, DataTypes.Float32));
         }
@@ -1294,6 +1332,17 @@ public abstract class HuggingFaceModel
             // FIXIT: this is work around for bfloat16
             Context.Outputs!["hiddenStates"] = IR.F.Tensors.Cast(allHiddenStates!, DataTypes.Float32);
         }
+    }
+
+    private SamplerConfig GetSamplerConfig()
+    {
+        var options = ImportOptions.HuggingFaceOptions;
+        var vocabSize = checked((int)(long)Context!.Config!["vocab_size"]);
+        return new SamplerConfig(
+            vocabSize,
+            options.SamplerMaxBatchSize,
+            options.SamplerMaxLogprobs,
+            options.SamplerLogprobsMode);
     }
 
     protected static Tensor PrepareLinearWeightTensor(Tensor weight, DataType targetType)

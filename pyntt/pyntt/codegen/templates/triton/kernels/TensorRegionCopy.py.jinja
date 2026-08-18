@@ -15,6 +15,9 @@
 {{ inner_indent }}for copy_inner_start in tl.range(0, {{ dim(ctx["inner_extent"]) }}, block_size):
 {{ body_indent }}copy_idx{{ ctx["inner_axis"] }} = copy_inner_start + tl.arange(0, block_size)
 {{ body_indent }}mask = copy_idx{{ ctx["inner_axis"] }} < {{ dim(ctx["inner_extent"]) }}
+{% if model.get("OwnerOnly", false) %}
+{{ body_indent }}mask = mask & (shard_index == 0)
+{% endif %}
 {{ body_indent }}value = tl.load({{ access_pointer(model, "Source", "source", ctx["source_access"]) }}, mask=mask)
 {{ body_indent }}tl.store({{ access_pointer(model, "Destination", "destination", ctx["destination_access"]) }}, value, mask=mask)
 

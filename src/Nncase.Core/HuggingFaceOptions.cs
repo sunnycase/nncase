@@ -19,6 +19,14 @@ public record HuggingFaceOptions
 
     public bool OutputHiddenStates { get; set; }
 
+    public bool EnableSampler { get; set; }
+
+    public int SamplerMaxBatchSize { get; set; } = 1;
+
+    public int SamplerMaxLogprobs { get; set; }
+
+    public SamplerLogprobsMode SamplerLogprobsMode { get; set; } = SamplerLogprobsMode.RawLogprobs;
+
     public int NumLayers { get; set; } = -1;
 
     public string TensorType { get; set; } = string.Empty;

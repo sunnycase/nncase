@@ -1396,6 +1396,97 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         Assert.Equal(new[] { 1 }, selection.TransferPipeline!.SourceArgumentIndices);
     }
 
+    [Fact]
+    public void TestTritonPackedMatMulSamplingPartialOnlyReservesWeightStages()
+    {
+        const int k = 1024;
+        const int localN = 128;
+        const int nLane = 8;
+        const int kAtom = 16;
+        var placement = new Placement([4, 8], "yx", "bb");
+        var packedOutputType = new DistributedType(
+            new TensorType(
+                new VectorType(DataTypes.BFloat16, [nLane]),
+                new long[] { 1, localN / nLane * 32 }),
+            [SBP.B, SBP.SContiguous([0, 1], 1)],
+            placement);
+        var logitsType = new DistributedType(
+            new TensorType(DataTypes.BFloat16, new long[] { 1, localN * 32 }),
+            [SBP.B, SBP.SContiguous([0, 1])],
+            placement);
+        var input = CreateBuffer(
+            "input",
+            DataTypes.BFloat16,
+            TIR.MemoryLocation.Data,
+            0,
+            [1, k],
+            [k, 1]);
+        var weight = CreateBuffer(
+            "weight",
+            new VectorType(DataTypes.BFloat16, [nLane, 2, 8]),
+            TIR.MemoryLocation.BlockLocalRdata,
+            0,
+            [k / kAtom, localN / nLane],
+            [localN / nLane, 1]);
+        var config = new SamplerConfig(
+            vocabSize: localN * 32,
+            maxBatchSize: 1,
+            maxLogprobs: 4,
+            SamplerLogprobsMode.RawLogprobs);
+        var logits = CreateBuffer(
+            "logits",
+            DataTypes.BFloat16,
+            TIR.MemoryLocation.ChipLocalData,
+            0,
+            [1, localN],
+            [localN, 1]);
+        var processedLogits = CreateBuffer(
+            "processed_logits",
+            DataTypes.Float32,
+            TIR.MemoryLocation.ChipLocalData,
+            0,
+            [1, localN],
+            [localN, 1]);
+        var argMaxState = CreateBuffer(
+            "argmax_state",
+            DataTypes.UInt64,
+            TIR.MemoryLocation.ChipLocalData,
+            0,
+            [1],
+            [1]);
+        var op = new TIR.NTT.PackedMatMulSamplingPartial(
+            IR.NTT.PackedMatMulRhsLayout.KMajor,
+            packedOutputType,
+            logitsType,
+            config);
+        var targetOptions = Assert.IsType<PyNTTTargetOptions>(CompileOptions.TargetOptions);
+        BaseExpr[] operands =
+        [
+            input,
+            weight,
+            input,
+            logits,
+            processedLogits,
+            argMaxState,
+            input,
+            None.Default,
+        ];
+
+        var selection = Assert.IsType<Nncase.Schedule.TIRMicroKernelSelection>(
+            targetOptions.TIRMicroKernelSelector.Select(
+                new(op, operands, NTTTargetMachineCatalog.Resolve("h800"))));
+
+        Assert.Equal("triton.matmul_sampling_partial", selection.Family);
+        Assert.Equal("simt_fma_smem_pipeline", selection.Variant);
+        var workspace = Assert.Single(selection.SharedWorkspaces);
+        Assert.Equal("rhs_stage", workspace.Name);
+        Assert.Equal(DataTypes.BFloat16, workspace.Type.DType);
+
+        var channel = Assert.Single(selection.TransferPipeline!.Channels);
+        Assert.Equal(new[] { 1 }, channel.SourceArgumentIndices);
+        Assert.Equal(new[] { 0 }, channel.SharedWorkspaceIndices);
+    }
+
     [Theory]
     [InlineData(24, 1024, 32, 512)]
     [InlineData(48, 2048, 64, 256)]
@@ -3516,6 +3607,70 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
     }
 
     [Fact]
+    public void TestPyNTTCanonicalBroadcastOutputMaterializesFromOneOwner()
+    {
+        var targetOptions = Assert.IsType<PyNTTTargetOptions>(CompileOptions.TargetOptions);
+        targetOptions.HierarchyNames = "b";
+        targetOptions.HierarchyLevels = "b";
+        targetOptions.Hierarchies = new[] { new[] { 2 } };
+
+        var tensorType = new TensorType(DataTypes.Int32, new[] { 1 });
+        var placement = new Placement(new[] { 2 }, "b", "b");
+        var distributedType = new DistributedType(tensorType, new SBP[] { SBP.B }, placement);
+        var source = new TIR.Buffer(
+            "canonical_source",
+            DataTypes.Int32,
+            new TIR.MemSpan(
+                new TIR.PhysicalBuffer(
+                    DataTypes.Int32.SizeInBytes,
+                    0,
+                    DataTypes.Int32.SizeInBytes,
+                    TIR.MemoryLocation.ChipLocalData)),
+            new Dimension[] { 1 },
+            new Dimension[] { 0 },
+            distributedType,
+            distributedStorageKind: TIR.DistributedBufferStorageKind.CanonicalGlobal);
+        var output = CreateOutputVar("output", tensorType);
+        var outputBuffer = TIR.T.AttachBuffer(
+            output,
+            tensorType,
+            TIR.MemoryLocation.Output,
+            0,
+            out _,
+            "output_buffer");
+        var main = new TIR.PrimFunction(
+            "main_prim",
+            PyNTTTarget.Kind,
+            new TIR.Sequential(
+                TIR.F.NTT.TensorStore(source, outputBuffer, distributedType.AxisPolicies, placement)),
+            new TIR.Return(new Expr[] { output }),
+            new IVar[] { output })
+        {
+            SchedResult =
+            {
+                ChipLocalDataPoolSize = (ulong)DataTypes.Int32.SizeInBytes,
+            },
+        };
+
+        var outputDirectory = GeneratePyNTTModelDirectory(
+            "generated_canonical_broadcast_output_model",
+            main);
+        using var manifest = JsonDocument.Parse(
+            File.ReadAllText(Path.Join(outputDirectory, "kernel_params.json")));
+        var storeHelper = manifest.RootElement
+            .GetProperty("functions")[0]
+            .GetProperty("render_kernels")[0]
+            .GetProperty("helpers")
+            .EnumerateArray()
+            .Single(helper => helper.GetProperty("template").GetString() == "triton/kernels/TensorRegionCopy.py.jinja");
+        Assert.True(storeHelper.GetProperty("model").GetProperty("OwnerOnly").GetBoolean());
+
+        RenderGeneratedKernels(outputDirectory);
+        var generatedKernelsPy = File.ReadAllText(Path.Join(outputDirectory, "generated_kernels.py"));
+        Assert.Contains("mask = mask & (shard_index == 0)", generatedKernelsPy, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void TestPyNTTFormalReshardUsesByteAddressedBackingPool()
     {
         var targetOptions = Assert.IsType<PyNTTTargetOptions>(CompileOptions.TargetOptions);
@@ -4553,7 +4708,7 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         var metadata = kernel.GetProperty("metadata");
         var attrs = metadata.GetProperty("attrs");
         var fieldInputs = attrs
-            .GetProperty("kv_cache_field_inputs")
+            .GetProperty("object_field_inputs")
             .EnumerateArray()
             .ToArray();
         Assert.All(fieldInputs, fieldInput => Assert.Equal("cache", fieldInput.GetProperty("SourceName").GetString()));

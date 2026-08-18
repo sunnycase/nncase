@@ -843,6 +843,15 @@ def _pipeline_helper_descriptor_specs(
         descriptor_specs = (_packed_gemv_host_descriptor_spec,)
     elif (
         template
+        == "triton/kernels/matmul_sampling_partial/simt_fma_smem_pipeline.py.jinja"
+    ):
+        matmul = model.get("Matmul")
+        if not isinstance(matmul, dict):
+            raise ValueError("PyNTT packed matmul sampling is missing Matmul metadata.")
+        descriptor_names = (matmul.get("RhsDescriptorName"),)
+        descriptor_specs = (_packed_matmul_sampling_partial_host_descriptor_spec,)
+    elif (
+        template
         == "triton/kernels/qkv_parallel_linear/simt_fma_smem_pipeline.py.jinja"
     ):
         descriptor_names = (model.get("WeightDescriptorName"),)
@@ -956,6 +965,28 @@ def _packed_gemv_host_descriptor_spec(
         block_n=microkernel["parameters"]["block_n"],
         block_k=microkernel["parameters"]["block_k"],
         pointer=model["Rhs"],
+    )
+
+
+def _packed_matmul_sampling_partial_host_descriptor_spec(
+    model: dict[str, Any],
+    backing: dict[str, Any],
+) -> dict[str, Any]:
+    matmul = model.get("Matmul")
+    if not isinstance(matmul, dict):
+        raise ValueError("PyNTT packed matmul sampling is missing Matmul metadata.")
+    microkernel = _microkernel_context(
+        matmul,
+        "triton.matmul_sampling_partial",
+        "simt_fma_smem_pipeline",
+        required_workspace_names=_packed_matmul_sampling_partial_workspace_names(),
+    )
+    return _k_major_gemv_host_descriptor_spec(
+        matmul,
+        backing,
+        block_n=microkernel["parameters"]["block_n"],
+        block_k=microkernel["parameters"]["block_k"],
+        pointer=matmul["Rhs"],
     )
 
 
@@ -1695,6 +1726,9 @@ def _make_env() -> Environment:
         paged_attention_merge_context=_paged_attention_merge_template_context,
         paged_attention_partial_context=_paged_attention_partial_template_context,
         packed_gemv_pipeline_context=_packed_gemv_pipeline_template_context,
+        packed_matmul_sampling_partial_context=(
+            _packed_matmul_sampling_partial_template_context
+        ),
         packed_qkv_gemv_pipeline_context=_packed_qkv_gemv_pipeline_template_context,
         product=_product,
         qkv_rope_with_cache_context=_qkv_rope_with_cache_template_context,
@@ -1704,6 +1738,7 @@ def _make_env() -> Environment:
         pyrepr=repr,
         reshard_context=_reshard_template_context,
         rope_context=_rope_template_context,
+        sampling_context=_sampling_template_context,
         scatter_nd_context=_scatter_nd_template_context,
         select_block_axis=_select_block_axis,
         shape_tuple=_shape_tuple,
@@ -4271,6 +4306,8 @@ def _microkernel_context(
     model: dict[str, Any],
     expected_family: str,
     expected_variant: str | None = None,
+    *,
+    required_workspace_names: tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
     microkernel = model.get("MicroKernel")
     if not isinstance(microkernel, dict):
@@ -4316,16 +4353,34 @@ def _microkernel_context(
         )
         for name, value in raw_offsets.items()
     }
-    required_offsets = {
-        "simt_fma": (),
-        "simt_fma_smem_pipeline": ("rhs_stage",),
-        "mma": ("lhs_stage", "rhs_stage"),
-        "dot": ("lhs_stage", "rhs_stage"),
-        "mma_direct": (),
-        "simt_direct": (),
-        "mma_tma_smem_pipeline": ("key_stage", "value_stage"),
-        "simt_tma_smem_pipeline": ("key_stage", "value_stage"),
-    }.get(variant)
+    raw_shapes = microkernel.get("SharedWorkspaceShapes")
+    if not isinstance(raw_shapes, dict):
+        raise ValueError("microkernel.SharedWorkspaceShapes must be a JSON object.")
+    shapes = {}
+    for name, value in raw_shapes.items():
+        dimensions = _require_list(
+            value, f"microkernel.SharedWorkspaceShapes[{name!r}]"
+        )
+        shapes[str(name)] = tuple(
+            _require_int(
+                dimension,
+                f"microkernel.SharedWorkspaceShapes[{name!r}][{axis}]",
+                minimum=1,
+            )
+            for axis, dimension in enumerate(dimensions)
+        )
+    required_offsets = required_workspace_names
+    if required_offsets is None:
+        required_offsets = {
+            "simt_fma": (),
+            "simt_fma_smem_pipeline": ("rhs_stage",),
+            "mma": ("lhs_stage", "rhs_stage"),
+            "dot": ("lhs_stage", "rhs_stage"),
+            "mma_direct": (),
+            "simt_direct": (),
+            "mma_tma_smem_pipeline": ("key_stage", "value_stage"),
+            "simt_tma_smem_pipeline": ("key_stage", "value_stage"),
+        }.get(variant)
     if required_offsets is None:
         raise ValueError(f"Unsupported PyNTT microkernel variant {variant!r}.")
     if set(offsets) != set(required_offsets):
@@ -4334,12 +4389,19 @@ def _microkernel_context(
             f"{variant!r}: expected={list(required_offsets)}, "
             f"actual={sorted(offsets)}."
         )
+    if set(shapes) != set(required_offsets):
+        raise ValueError(
+            "microkernel.SharedWorkspaceShapes does not match variant "
+            f"{variant!r}: expected={list(required_offsets)}, "
+            f"actual={sorted(shapes)}."
+        )
 
     return {
         "family": family,
         "variant": variant,
         "parameters": parameters,
         "shared_workspace_offsets": offsets,
+        "shared_workspace_shapes": shapes,
     }
 
 
@@ -5207,6 +5269,7 @@ def _matmul_template_context(
     gemv: bool,
     variant: str | None = None,
     expected_family: str = "triton.matmul",
+    required_workspace_names: tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
     """Prepare Matmul/Gemv dimensions and addresses for Jinja-owned kernels."""
 
@@ -5228,6 +5291,7 @@ def _matmul_template_context(
         model,
         expected_family,
         variant or ("simt_fma" if gemv else "mma"),
+        required_workspace_names=required_workspace_names,
     )
     context: dict[str, Any] = {
         "gemv": gemv,
@@ -5603,6 +5667,7 @@ def _packed_gemv_pipeline_template_context(
     model: dict[str, Any],
     *,
     expected_family: str = "triton.matmul",
+    required_workspace_names: tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
     """Prepare the packed BF16, shared-staged SIMT GEMV algorithm."""
 
@@ -5611,6 +5676,7 @@ def _packed_gemv_pipeline_template_context(
         gemv=True,
         variant="simt_fma_smem_pipeline",
         expected_family=expected_family,
+        required_workspace_names=required_workspace_names,
     )
     if model["LhsDType"] != "bfloat16" or model["RhsDType"] != "bfloat16":
         raise ValueError(
@@ -6422,6 +6488,125 @@ def _reduce_template_context(model: dict[str, Any]) -> dict[str, Any]:
             coordinate_shape="(block_size,)",
         ),
     }
+
+
+def _sampling_template_context(model: dict[str, Any]) -> dict[str, Any]:
+    """Prepare exact local-to-global vocabulary coordinates for sampling."""
+    local_shape = model.get("LogitsShape")
+    global_shape = model.get("LogitsGlobalShape")
+    strides = model.get("LogitsStrides")
+    shard_axes = model.get("LogitsShardAxes")
+    hierarchy = model.get("Hierarchy")
+    if not all(
+        isinstance(value, list)
+        for value in (local_shape, global_shape, strides, shard_axes, hierarchy)
+    ):
+        raise ValueError("PyNTT sampling has incomplete logits layout metadata.")
+    if not (
+        len(local_shape)
+        == len(global_shape)
+        == len(strides)
+        == len(shard_axes)
+        == 2
+    ):
+        raise ValueError("PyNTT sampling requires rank-2 logits layout metadata.")
+    if _shard_axis_stages(shard_axes[0]):
+        raise ValueError("PyNTT sampling does not support a sharded batch axis.")
+
+    local_vocab_extent = _fixed(local_shape[1])
+    global_token = _local_to_global_coordinate(
+        "local_token",
+        global_shape[1],
+        shard_axes[1],
+        hierarchy,
+        local_extent=local_vocab_extent,
+    )
+    context = {
+        "local_batch": _dim(local_shape[0]),
+        "local_vocab": _dim(local_shape[1]),
+        "global_batch": _dim(global_shape[0]),
+        "global_vocab": _dim(global_shape[1]),
+        "global_token": global_token,
+        "logits_offset": (
+            f"batch * {_dim(strides[0])} + local_token * {_dim(strides[1])}"
+        ),
+        "processed_offset": (
+            f"batch * {_dim(model['ProcessedLogitsStrides'][0])} + "
+            f"local_token * {_dim(model['ProcessedLogitsStrides'][1])}"
+        ),
+    }
+    if "RadixBits" in model:
+        block_count = int(model["BlockCount"])
+        if block_count <= 0:
+            raise ValueError("PyNTT sampling block count must be positive.")
+        address = model.get("ArgMaxStateAddress")
+        argmax_state = model.get("ArgMaxState")
+        if not isinstance(address, dict) or not isinstance(argmax_state, dict):
+            raise ValueError(
+                "PyNTT SamplingCombine requires pooled argmax owner metadata."
+            )
+        if argmax_state.get("DistributedStorageKind") != "CompactPerOwner":
+            raise ValueError(
+                "PyNTT SamplingCombine argmax state must use CompactPerOwner storage."
+            )
+        owner_pool_index = _pool_index_expression(
+            "block_offsets", address["PoolScopeSize"]
+        )
+        owner_byte_offset = (
+            f"({owner_pool_index}) * ({address['PoolStrideBytes']})"
+            f" + ({address['OffsetBytes']})"
+        )
+        context.update(
+            argmax_owner_pointer=(
+                f"({address['BaseName']} + ({owner_byte_offset})).to("
+                f"{_pointer_type('tl.uint64', address['AddressSpace'])})"
+            ),
+            summary_width=1 << (block_count - 1).bit_length(),
+            summary_slots=(1 << int(model["RadixBits"])) + 16,
+        )
+    return context
+
+
+def _packed_matmul_sampling_partial_workspace_names() -> tuple[str, ...]:
+    return ("rhs_stage",)
+
+
+def _packed_matmul_sampling_partial_template_context(
+    model: dict[str, Any],
+) -> dict[str, Any]:
+    """Prepare one shared-staged LM-head with token-local sampling."""
+
+    matmul = model.get("Matmul")
+    sampling = model.get("Sampling")
+    if not isinstance(matmul, dict) or not isinstance(sampling, dict):
+        raise ValueError(
+            "PyNTT packed matmul sampling partial requires Matmul and Sampling metadata."
+        )
+    prepared_matmul = {
+        **matmul,
+        **{
+            name: model[name]
+            for name in (
+                "NoInline",
+                "RematerializeEntryIndices",
+                "MeshAxes",
+                "NumWarps",
+                "TargetWorkerWidth",
+            )
+            if name in model
+        },
+    }
+    context = _packed_gemv_pipeline_template_context(
+        prepared_matmul,
+        expected_family="triton.matmul_sampling_partial",
+        required_workspace_names=_packed_matmul_sampling_partial_workspace_names(),
+    )
+    sampling_context = _sampling_template_context(sampling)
+    context.update(
+        matmul=prepared_matmul,
+        sampling=sampling_context,
+    )
+    return context
 
 
 def _softmax_template_context(model: dict[str, Any]) -> dict[str, Any]:

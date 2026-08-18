@@ -170,6 +170,12 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
                         matmulNormStats.UseMean,
                         (Expr)arguments[IR.NTT.PackedMatMulNormStats.Addend.Index]);
                 }
+            case IR.NTT.PackedMatMulSamplingPartial matmulSamplingPartial:
+                return GeneratePackedMatMulSamplingPartial(
+                    call,
+                    matmulSamplingPartial,
+                    arguments,
+                    output);
             case IR.NTT.PackedMatMulGlu matmulGlu:
                 return TIR.F.NTT.PackedMatMulGlu(
                     (Expr)arguments[0],
@@ -399,6 +405,10 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
                     combineAttention.HiddenSize,
                     combineAttention.SplitHierarchyAxis,
                     combineAttention.SplitCount);
+            case IR.NTT.SamplingPartial samplingPartial:
+                return GenerateSamplingPartial(samplingPartial, arguments, output);
+            case IR.NTT.SamplingCombine samplingCombine:
+                return GenerateSamplingCombine(samplingCombine, arguments, ref output);
             case IR.Tensors.ConstantOfShape constantOfShape:
                 return TIR.F.NTT.ConstantOfShape((Shape)arguments[0], (Expr)arguments[1], output);
             case IR.Tensors.Range range:
@@ -1158,6 +1168,193 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
         var (tensorType, distributedType) = GetTensorTypeAndDistributedType(type, namePrefix);
         T.CreateBuffer(tensorType, location, out var buffer, $"{namePrefix}_{_bufferIndex++}", distributedType);
         return buffer;
+    }
+
+    private Expr GenerateSamplingPartial(
+        IR.NTT.SamplingPartial sampling,
+        IReadOnlyList<BaseExpr> arguments,
+        Expr output)
+    {
+        var outputBase = Unsafe.As<Expr, BaseExpr>(ref output);
+        if (outputBase is not IR.Tuple { Count: 2 } outputs)
+        {
+            throw new NotSupportedException(
+                "SamplingPartial TIR selection expects processed logits and a partial maximum state.");
+        }
+
+        if (arguments[IR.NTT.SamplingPartial.Logits.Index] is not TIR.Buffer { DistributedType: { } logitsType } ||
+            !Evaluator.IR.NTT.SamplingSplitTypeUtility.IsFullyVocabularySharded(logitsType))
+        {
+            throw new NotSupportedException(
+                "SamplingPartial requires its vocabulary axis to cover every placement axis exactly once.");
+        }
+
+        return TIR.F.NTT.SamplingPartial(
+            (Expr)arguments[IR.NTT.SamplingPartial.Logits.Index],
+            (Expr)arguments[IR.NTT.SamplingPartial.State.Index],
+            (Expr)outputs[0],
+            (Expr)outputs[1],
+            sampling.Config);
+    }
+
+    private Expr GeneratePackedMatMulSamplingPartial(
+        Call call,
+        IR.NTT.PackedMatMulSamplingPartial sampling,
+        IReadOnlyList<BaseExpr> arguments,
+        Expr output)
+    {
+        var outputBase = Unsafe.As<Expr, BaseExpr>(ref output);
+        if (outputBase is not IR.Tuple { Count: 3 } outputs)
+        {
+            throw new NotSupportedException(
+                "PackedMatMulSamplingPartial TIR selection expects raw logits, processed logits, and a partial maximum state.");
+        }
+
+        if (_compileOptions.TargetOptions is not PyNTTTargetOptions)
+        {
+            throw new NotSupportedException(
+                "PackedMatMulSamplingPartial is supported only by the PyNTT target.");
+        }
+
+        var packedOutput = Evaluator.IR.NTT.PackedMatMulEvaluator.InferType(
+            new IR.NTT.PackedMatMul(
+                sampling.OutputDataType,
+                false,
+                sampling.RhsLayout),
+            call[IR.NTT.PackedMatMulSamplingPartial.Lhs].CheckedType,
+            call[IR.NTT.PackedMatMulSamplingPartial.Rhs].CheckedType,
+            call[IR.NTT.PackedMatMulSamplingPartial.Scale].CheckedType,
+            call[IR.NTT.PackedMatMulSamplingPartial.Addend].CheckedType);
+        if (packedOutput is not DistributedType { Partial: null } packedOutputType)
+        {
+            throw new NotSupportedException(
+                $"PackedMatMulSamplingPartial requires a non-partial distributed packed output, got {packedOutput}.");
+        }
+
+        var logits = BitcastUtility.InferType(
+            packedOutputType,
+            sampling.OutputDataType);
+        if (logits is not DistributedType logitsType ||
+            !Evaluator.IR.NTT.SamplingSplitTypeUtility.IsFullyVocabularySharded(logitsType))
+        {
+            throw new NotSupportedException(
+                "PackedMatMulSamplingPartial requires its scalar vocabulary axis to cover every placement axis exactly once.");
+        }
+
+        return TIR.F.NTT.PackedMatMulSamplingPartial(
+            (Expr)arguments[IR.NTT.PackedMatMulSamplingPartial.Lhs.Index],
+            (Expr)arguments[IR.NTT.PackedMatMulSamplingPartial.Rhs.Index],
+            (Expr)arguments[IR.NTT.PackedMatMulSamplingPartial.State.Index],
+            (Expr)outputs[0],
+            (Expr)outputs[1],
+            (Expr)outputs[2],
+            (Expr)arguments[IR.NTT.PackedMatMulSamplingPartial.Scale.Index],
+            (Expr)arguments[IR.NTT.PackedMatMulSamplingPartial.Addend.Index],
+            sampling.RhsLayout,
+            packedOutputType,
+            logitsType,
+            sampling.Config);
+    }
+
+    private Expr GenerateSamplingCombine(
+        IR.NTT.SamplingCombine sampling,
+        IReadOnlyList<BaseExpr> arguments,
+        ref Expr output)
+    {
+        var outputBase = Unsafe.As<Expr, BaseExpr>(ref output);
+        if (outputBase is not IR.Tuple outputs || outputs.Count != 6)
+        {
+            throw new NotSupportedException(
+                "SamplingCombine TIR selection expects five tensor outputs followed by the sampler state.");
+        }
+
+        if (_compileOptions.TargetOptions is not PyNTTTargetOptions)
+        {
+            throw new NotSupportedException("SamplingCombine is currently supported only by the PyNTT target.");
+        }
+
+        if (arguments[IR.NTT.SamplingCombine.Logits.Index] is not TIR.Buffer { DistributedType: { } logitsType } ||
+            !Evaluator.IR.NTT.SamplingSplitTypeUtility.IsFullyVocabularySharded(logitsType))
+        {
+            throw new NotSupportedException(
+                "SamplingCombine requires its vocabulary axis to cover every placement axis exactly once.");
+        }
+
+        if (arguments[IR.NTT.SamplingCombine.ArgMaxState.Index] is not TIR.Buffer { DistributedType: { } argMaxType } ||
+            !Evaluator.IR.NTT.SamplingSplitTypeUtility.IsArgMaxPartial(argMaxType, logitsType.Placement))
+        {
+            throw new NotSupportedException(
+                "SamplingCombine requires a full-mesh P(Max) state.");
+        }
+
+        var blockCount = logitsType.Placement.Hierarchy
+            .Aggregate(1, (product, extent) => checked(product * extent));
+        const int radixBits = 8;
+        var radixBins = 1 << radixBits;
+        var summary = CreateMetadataBuffer(
+            new TensorType(
+                DataTypes.Float32,
+                new RankedShape(sampling.Config.MaxBatchSize, blockCount, radixBins + 16)),
+            MemoryLocation.ChipLocalData,
+            "sampling_summary");
+
+        var materializedOutputs = outputs.Fields[..5]
+            .AsValueEnumerable()
+            .Select((field, index) => CreateCanonicalReplicatedOutput(
+                field,
+                $"SamplingCombine output {index}"))
+            .ToArray();
+
+        Unsafe.As<Expr, BaseExpr>(ref output) = new IR.Tuple(
+            materializedOutputs[0],
+            materializedOutputs[1],
+            materializedOutputs[2],
+            materializedOutputs[3],
+            materializedOutputs[4],
+            arguments[IR.NTT.SamplingCombine.State.Index]);
+        return TIR.F.NTT.SamplingCombine(
+            (Expr)arguments[IR.NTT.SamplingCombine.Logits.Index],
+            (Expr)arguments[IR.NTT.SamplingCombine.ProcessedLogits.Index],
+            (Expr)arguments[IR.NTT.SamplingCombine.ArgMaxState.Index],
+            (Expr)arguments[IR.NTT.SamplingCombine.State.Index],
+            summary,
+            materializedOutputs[0],
+            materializedOutputs[1],
+            materializedOutputs[2],
+            materializedOutputs[3],
+            materializedOutputs[4],
+            sampling.Config,
+            blockCount,
+            radixBits);
+    }
+
+    private TIR.Buffer CreateCanonicalReplicatedOutput(BaseExpr output, string context)
+    {
+        if (output is not TIR.Buffer
+            {
+                DistributedType:
+                {
+                    Partial: null,
+                } distributedType,
+            } outputBuffer ||
+            !distributedType.AxisPolicies.AsValueEnumerable().All(policy => policy is SBPBroadCast))
+        {
+            throw new InvalidOperationException(
+                $"{context} must be a fully broadcast distributed tensor buffer, got {output.CheckedType}.");
+        }
+
+        var (_, _, byteSpanSize) = GetShardedBufferLayout(distributedType);
+        var physicalBuffer = new TIR.PhysicalBuffer(
+            distributedType.TensorType.DType.SizeInBytes,
+            byteSpanSize,
+            MemoryLocation.ChipLocalData);
+        var canonical = CreateCanonicalShardedBuffer(
+            outputBuffer,
+            physicalBuffer,
+            distributedType,
+            Dimension.Zero);
+        _shardedComponentBases.Add(canonical, Dimension.Zero);
+        return canonical;
     }
 
     private static (TensorType TensorType, DistributedType? DistributedType) GetTensorTypeAndDistributedType(IRType type, string context)

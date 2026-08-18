@@ -21,6 +21,9 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 def test_qwen3(request):
     num_layers = int(os.getenv("NNCASE_QWEN3_NUM_LAYERS", "-1"))
+    enable_sampler = os.getenv("NNCASE_QWEN3_ENABLE_SAMPLER", "0") == "1"
+    sampler_max_logprobs = int(
+        os.getenv("NNCASE_QWEN3_SAMPLER_MAX_LOGPROBS", "20"))
     cfg = f"""
     [compile_opt]
     dump_ir = true
@@ -31,8 +34,12 @@ def test_qwen3(request):
     shape_bucket_fix_var_map = {{ "sequence_length"=1 }}
     
     [huggingface_options]
-    output_logits = true
+    output_logits = {str(not enable_sampler).lower()}
     output_hidden_states = false
+    enable_sampler = {str(enable_sampler).lower()}
+    sampler_max_batch_size = 1
+    sampler_max_logprobs = {sampler_max_logprobs}
+    sampler_logprobs_mode = "raw_logprobs"
     num_layers = {num_layers}
     tensor_type = "bfloat16"
     input_ids_type = "int32"

@@ -38,6 +38,7 @@ public sealed record PyNTTMicroKernelTemplateModel(
     string Variant,
     IReadOnlyDictionary<string, long> Parameters,
     IReadOnlyDictionary<string, string> SharedWorkspaceOffsets,
+    IReadOnlyDictionary<string, long[]> SharedWorkspaceShapes,
     PyNTTTransferPipelineChannelTemplateModel[] TransferPipelineChannels)
 {
     public bool HasTransferPipeline => TransferPipelineChannels.Length != 0;
@@ -122,6 +123,7 @@ public sealed record PyNTTTensorStoreTemplateModel(
     PyNTTShardAxisTemplateModel[] ShardAxes,
     int VectorLaneCount,
     int[] VectorLaneShape,
+    bool OwnerOnly,
     string Comment)
 {
     public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
@@ -169,6 +171,7 @@ public sealed record PyNTTRegionCopyTemplateModel(
     int[] VectorLaneShape,
     string OperationKind,
     PyNTTRegionCopyPlanTemplateModel CopyPlan,
+    bool OwnerOnly,
     string Comment)
 {
     public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
@@ -648,12 +651,23 @@ public sealed record PyNTTGetPositionIdsTemplateModel(
     public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
 }
 
-internal sealed record PyNTTKVCacheFieldInputMetadata(
+internal sealed record PyNTTObjectFieldInputMetadata(
     string Name,
     string SourceName,
+    string ObjectKind,
     string Field,
+    string Materialization,
     PyNTTKVCacheStorageMetadata? Storage,
-    string? DType);
+    string? DType,
+    int[] Shape);
+
+internal sealed record PyNTTObjectFieldBindingMetadata(
+    string ObjectKind,
+    string Field,
+    string Materialization,
+    PyNTTKVCacheStorageMetadata? Storage,
+    string? DType,
+    int[] Shape);
 
 internal sealed record PyNTTKVCacheStorageMetadata(
     string DType,
@@ -1266,6 +1280,97 @@ public sealed record PyNTTSoftmaxTemplateModel(
     PyNTTDimExpression[] InputStrides,
     PyNTTDimExpression[] OutputStrides,
     int Axis,
+    string Comment)
+{
+    public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
+}
+
+public sealed record PyNTTSamplingPartialTemplateModel(
+    string FunctionName,
+    PyNTTBufferPointerTemplateModel Logits,
+    PyNTTBufferPointerTemplateModel ProcessedLogits,
+    PyNTTBufferPointerTemplateModel ArgMaxState,
+    string Active,
+    string ProcessorFlags,
+    PyNTTSamplerProcessorFlagsTemplateModel ProcessorFlagValues,
+    string FrequencyPenalty,
+    string PresencePenalty,
+    string RepetitionPenalty,
+    string PromptTokenMask,
+    string OutputTokenCounts,
+    string AllowedTokenMask,
+    string ForbiddenTokenMask,
+    string LogitBias,
+    string LogitsDType,
+    string LogitsTritonDType,
+    PyNTTDimExpression[] LogitsShape,
+    PyNTTDimExpression[] LogitsGlobalShape,
+    PyNTTDimExpression[] LogitsStrides,
+    PyNTTDimExpression[] ProcessedLogitsStrides,
+    PyNTTDimExpression[] ArgMaxStateStrides,
+    PyNTTShardAxisTemplateModel[] LogitsShardAxes,
+    int[] Hierarchy,
+    int VocabSize,
+    int MaxBatchSize,
+    string Comment)
+{
+    public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
+}
+
+public sealed record PyNTTSamplingCombineTemplateModel(
+    string FunctionName,
+    PyNTTBufferPointerTemplateModel Logits,
+    PyNTTBufferPointerTemplateModel ProcessedLogits,
+    PyNTTBufferPointerTemplateModel ArgMaxState,
+    PyNTTPooledByteAddressTemplateModel ArgMaxStateAddress,
+    PyNTTBufferPointerTemplateModel Summary,
+    PyNTTBufferPointerTemplateModel SampledIds,
+    PyNTTBufferPointerTemplateModel LogprobIds,
+    PyNTTBufferPointerTemplateModel Logprobs,
+    PyNTTBufferPointerTemplateModel Ranks,
+    PyNTTBufferPointerTemplateModel Counts,
+    string Active,
+    string Temperature,
+    string TopP,
+    string TopK,
+    string MinP,
+    string RequestedLogprobs,
+    string Seeds,
+    string Counters,
+    string OutputTokenCounts,
+    string LogitsDType,
+    string LogitsTritonDType,
+    PyNTTDimExpression[] LogitsShape,
+    PyNTTDimExpression[] LogitsGlobalShape,
+    PyNTTDimExpression[] LogitsStrides,
+    PyNTTDimExpression[] ProcessedLogitsStrides,
+    PyNTTDimExpression[] ArgMaxStateStrides,
+    PyNTTShardAxisTemplateModel[] LogitsShardAxes,
+    int[] Hierarchy,
+    int VocabSize,
+    int MaxBatchSize,
+    int MaxLogprobs,
+    string LogprobsMode,
+    int BlockCount,
+    int RadixBits,
+    string Comment)
+{
+    public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
+}
+
+public sealed record PyNTTSamplerProcessorFlagsTemplateModel(
+    uint AllowedTokenMask,
+    uint ForbiddenTokenMask,
+    uint LogitBias,
+    uint RepetitionPenalty,
+    uint FrequencyPenalty,
+    uint PresencePenalty);
+
+public sealed record PyNTTPackedMatMulSamplingPartialTemplateModel(
+    string FunctionName,
+    PyNTTMatmulTemplateModel Matmul,
+    PyNTTSamplingPartialTemplateModel Sampling,
+    PyNTTMicroKernelTemplateModel MicroKernel,
     string Comment)
 {
     public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();

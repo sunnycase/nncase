@@ -336,6 +336,66 @@ public sealed class UnitTestDistribAutoDistributed : TestClassBase
     }
 
     [Fact]
+    public void TestSamplingPartialCombineDistributionContract()
+    {
+        var placement = new Placement([4, 8], "yx", "bb");
+        var config = new SamplerConfig(
+            vocabSize: 1024,
+            maxBatchSize: 1,
+            maxLogprobs: 4,
+            SamplerLogprobsMode.RawLogprobs);
+        var stateType = TensorType.Scalar(
+            new ReferenceType(new SamplerStateType { Config = config }));
+        var logitsTensorType = new TensorType(DataTypes.BFloat16, new RankedShape(1, 1024));
+        var logitsType = new DistributedType(
+            logitsTensorType,
+            [SBP.B, SBP.SContiguous([0, 1])],
+            placement);
+
+        var partialTarget = new SamplingPartial(config);
+        var partialType = Assert.IsType<TupleType>(
+            SamplingPartialEvaluator.InferType(partialTarget, logitsType, stateType));
+        Assert.Equal(
+            new DistributedType(
+                new TensorType(DataTypes.Float32, logitsTensorType.Shape),
+                logitsType.AxisPolicies,
+                placement),
+            partialType[0]);
+
+        var argMaxStateType = Assert.IsType<DistributedType>(partialType[1]);
+        Assert.Equal(new RankedShape(1), argMaxStateType.TensorType.Shape);
+        Assert.Equal(DataTypes.UInt64, argMaxStateType.TensorType.DType);
+        Assert.Equal(new SBP[] { SBP.B }, argMaxStateType.AxisPolicies);
+        Assert.Equal(SBP.P([0, 1], ReduceOp.Max), argMaxStateType.Partial);
+
+        var combineTarget = new SamplingCombine(config);
+        var resultType = Assert.IsType<TupleType>(SamplingCombineEvaluator.InferType(
+            combineTarget,
+            logitsType,
+            partialType[0],
+            argMaxStateType,
+            stateType));
+        Assert.Equal(6, resultType.Count);
+        Assert.All(
+            resultType.Fields.Take(5),
+            field => Assert.All(
+                Assert.IsType<DistributedType>(field).AxisPolicies,
+                policy => Assert.Equal(SBP.B, policy)));
+        Assert.Equal(stateType, resultType[5]);
+
+        var nonPartialStateType = new DistributedType(
+            argMaxStateType.TensorType,
+            [SBP.B],
+            placement);
+        Assert.IsType<InvalidType>(SamplingCombineEvaluator.InferType(
+            combineTarget,
+            logitsType,
+            partialType[0],
+            nonPartialStateType,
+            stateType));
+    }
+
+    [Fact]
     public void TestAutoDistributedPropagatesPackedMatMulSplitThroughAdd()
     {
         var options = new PyNTTTargetOptions

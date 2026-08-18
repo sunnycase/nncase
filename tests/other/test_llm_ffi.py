@@ -153,6 +153,19 @@ def test_huggface_options():
     opt = nncase.HuggingFaceOptions()
     opt.max_model_len = 1234
     opt.input_ids_type = "int32"
+    opt.enable_sampler = True
+    opt.sampler_max_batch_size = 4
+    opt.sampler_max_logprobs = 8
+    opt.sampler_logprobs_mode = nncase.SamplerLogprobsMode.ProcessedLogprobs
+    assert opt.enable_sampler
+    assert opt.sampler_max_batch_size == 4
+    assert opt.sampler_max_logprobs == 8
+    assert (opt.sampler_logprobs_mode ==
+            nncase.SamplerLogprobsMode.ProcessedLogprobs)
+    with pytest.raises(ValueError, match="must be positive"):
+        opt.sampler_max_batch_size = 0
+    with pytest.raises(ValueError, match="must be non-negative"):
+        opt.sampler_max_logprobs = -1
     cfg = nncase.PagedAttentionConfig(1, 2, 3, np.dtype(np.float32), 16)
     opt.config = cfg
 

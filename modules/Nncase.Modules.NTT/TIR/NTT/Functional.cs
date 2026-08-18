@@ -108,6 +108,36 @@ public partial class NTT
             addend ?? None.Default);
     }
 
+    public static Call PackedMatMulSamplingPartial(
+        Expr lhs,
+        Expr rhs,
+        Expr state,
+        Expr logits,
+        Expr processedLogits,
+        Expr argMaxState,
+        Expr scale,
+        Expr addend,
+        IR.NTT.PackedMatMulRhsLayout rhsLayout,
+        DistributedType packedOutputType,
+        DistributedType logitsType,
+        IR.NN.SamplerConfig config)
+    {
+        return KernelCall(
+            new PackedMatMulSamplingPartial(
+                rhsLayout,
+                packedOutputType,
+                logitsType,
+                config),
+            lhs,
+            rhs,
+            state,
+            logits,
+            processedLogits,
+            argMaxState,
+            scale,
+            addend);
+    }
+
     public static Call QKVParallelLinear(
         Expr input,
         Expr qWeight,
@@ -653,5 +683,49 @@ public partial class NTT
     public static Expr TopK(Expr x, Expr k, Expr output, long axis, long largest, long sorted)
     {
         return KernelCall(new TIR.NTT.TopK(axis, largest, sorted), x, k, output);
+    }
+
+    public static Expr SamplingPartial(
+        Expr logits,
+        Expr state,
+        Expr processedLogits,
+        Expr argMaxState,
+        IR.NN.SamplerConfig config)
+    {
+        return KernelCall(
+            new TIR.NTT.SamplingPartial(config),
+            logits,
+            state,
+            processedLogits,
+            argMaxState);
+    }
+
+    public static Expr SamplingCombine(
+        Expr logits,
+        Expr processedLogits,
+        Expr argMaxState,
+        Expr state,
+        Expr summary,
+        Expr sampledIds,
+        Expr logprobIds,
+        Expr logprobs,
+        Expr ranks,
+        Expr counts,
+        IR.NN.SamplerConfig config,
+        int blockCount,
+        int radixBits = 8)
+    {
+        return KernelCall(
+            new TIR.NTT.SamplingCombine(config, blockCount, radixBits),
+            logits,
+            processedLogits,
+            argMaxState,
+            state,
+            summary,
+            sampledIds,
+            logprobIds,
+            logprobs,
+            ranks,
+            counts);
     }
 }

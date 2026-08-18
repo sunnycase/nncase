@@ -114,5 +114,25 @@ public sealed class UnitTestDataType
                 Assert.Equal(original, deserialized);
             }
         }
+
+        {
+            var config = new IR.NN.SamplerConfig(
+                32000,
+                4,
+                8,
+                IR.NN.SamplerLogprobsMode.ProcessedLogprobs);
+            var original = new ReferenceType(new IR.NN.SamplerStateType { Config = config });
+            using (var stream = new FileStream(path, FileMode.Create, FileAccess.Write))
+            {
+                JsonSerializer.Serialize(stream, original, options);
+            }
+
+            using (var stream = File.OpenRead(path))
+            {
+                var deserialized = JsonSerializer.Deserialize<DataType>(stream, options);
+                Assert.NotNull(deserialized);
+                Assert.Equal(original, deserialized);
+            }
+        }
     }
 }

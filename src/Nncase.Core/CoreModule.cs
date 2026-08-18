@@ -40,6 +40,7 @@ internal partial class CoreModule : IApplicationPart
         registrator.Register<ValueType, QuantParamType>(reuse: Reuse.Singleton);
         registrator.Register<ValueType, AttentionKVCacheType>(reuse: Reuse.Singleton);
         registrator.Register<ValueType, PagedAttentionKVCacheType>(reuse: Reuse.Singleton);
+        registrator.Register<ValueType, SamplerStateType>(reuse: Reuse.Singleton);
 
         // Mask types
         RegisterMaskTypes(registrator);

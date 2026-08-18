@@ -1,0 +1,277 @@
+{% macro pipeline_setup(stage) -%}
+{% set stage_model = stage["Model"] %}
+{% set stage_ctx = packed_matmul_sampling_partial_context(stage_model) %}
+{% set mm = stage_ctx["matmul"] %}
+{% set shared_buffer_shape = [stage_ctx["num_stages"]] + (stage_ctx["shared_stage_shape"] | list) %}
+{{ stage["StageName"] }}__rhs_stages = tle.gpu.alloc(
+    [{{ shared_buffer_shape | join(", ") }}],
+    dtype={{ mm["RhsTritonDType"] }},
+    layout=tle.gpu.nv_tma_shared_layout(
+        [{{ shared_buffer_shape | join(", ") }}],
+        [{{ range((shared_buffer_shape | length) - 1, -1, -1) | join(", ") }}],
+        {{ mm["RhsTritonDType"] }},
+        [{% for _ in shared_buffer_shape %}1{{ ", " if not loop.last }}{% endfor %}],
+        [{% for _ in shared_buffer_shape %}1{{ ", " if not loop.last }}{% endfor %}],
+        [{{ range((shared_buffer_shape | length) - 1, -1, -1) | join(", ") }}],
+        False,
+        True,
+    ),
+    scope=tle.gpu.smem,
+    alias=pyntt_shared_arena,
+    alias_offset_bytes={{ stage["SharedWorkspaceOffsets"]["rhs_stage"] }},
+)
+{{ stage["PipeName"] }} = tle.pipe(
+    capacity={{ stage_ctx["num_stages"] }},
+    scope="cta",
+    name="{{ stage["StageName"] }}_weight",
+    weight={{ stage["StageName"] }}__rhs_stages,
+)
+{%- endmacro %}
+{% if model is defined %}
+{% import "triton/kernels/_common.py.jinja" as common with context %}
+{% set ctx = packed_matmul_sampling_partial_context(model) %}
+{% set mm = ctx["matmul"] %}
+{% set sampling = model["Sampling"] %}
+{% set sctx = ctx["sampling"] %}
+{% set history_processor_flags = sampling["ProcessorFlagValues"]["RepetitionPenalty"] + sampling["ProcessorFlagValues"]["FrequencyPenalty"] + sampling["ProcessorFlagValues"]["PresencePenalty"] %}
+# generated from PyNTT algorithm triton.matmul_sampling_partial/simt_fma_smem_pipeline
+# {{ model["Comment"] }}; vocab={{ sampling["VocabSize"] }}, block_n={{ ctx["block_n"] }}, block_k={{ ctx["block_k"] }}, num_stages={{ ctx["num_stages"] }}
+{{ ctx["consumer_weight_layout_name"] }} = tl.constexpr(
+    tle.gpu.BlockEncoding(
+        [{{ ctx["consumer_size_per_thread"] | join(", ") }}],
+        [{{ ctx["consumer_threads_per_warp"] | join(", ") }}],
+        [{{ ctx["consumer_warps_per_cta"] | join(", ") }}],
+        [0, 1],
+    )
+)
+{{ ctx["consumer_lhs_layout_name"] }} = tl.constexpr(
+    tle.gpu.SlicedEncoding(
+        0,
+        {{ ctx["consumer_weight_layout_name"] }}.value,
+    )
+)
+{{ ctx["consumer_output_layout_name"] }} = tl.constexpr(
+    tle.gpu.SlicedEncoding(
+        1,
+        {{ ctx["consumer_weight_layout_name"] }}.value,
+    )
+)
+
+
+{{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
+def {{ model["FunctionName"] }}__producer(writer, {{ helper_parameters(model) }}):
+{{ common.mesh_coordinates(model["MeshAxes"]) }}
+    rhs_descriptor_entry = tle.gpu.tensor_map_table_entry(
+        {{ ctx["rhs_descriptor_name"] }},
+        shard_index,
+    )
+    tle.gpu.tensor_map_fenceproxy_acquire(rhs_descriptor_entry)
+    active_n = {{ dim(ctx["n"]) }}
+    for n_tile in tl.range(0, {{ ctx["runtime_num_n_tiles"] }}):
+        for k_tile in tl.range(0, {{ ctx["num_k_tiles"] }}):
+            sequence = (
+                n_tile * {{ ctx["num_k_tiles"] }} + k_tile
+            ).to(tl.int32)
+            slot = writer.acquire(sequence)
+            rhs_descriptor = tle.gpu.reinterpret_tensor_map(
+                rhs_descriptor_entry,
+                slot.weight,
+            )
+            tle.gpu.copy(
+                rhs_descriptor,
+                slot.weight,
+                [{{ ctx["tma_block_shape"] | join(", ") }}],
+                offsets=[
+{% for offset in ctx["rhs_descriptor_offsets"] %}
+                    {{ tma_offset(offset) }},
+{% endfor %}
+                ],
+                eviction_policy="evict_first",
+            )
+            writer.commit(sequence)
+    writer.close(
+        ({{ ctx["runtime_num_n_tiles"] }} * {{ ctx["num_k_tiles"] }}).to(tl.int32)
+    )
+
+
+{{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
+def {{ model["FunctionName"] }}__consumer(reader, {{ helper_parameters(model) }}):
+{{ common.mesh_coordinates(model["MeshAxes"]) }}
+    lhs = {{ ptr(mm, "Lhs") }}
+    logits_ptr = {{ ptr(sampling, "Logits") }}
+    processed_ptr = {{ ptr(sampling, "ProcessedLogits") }}
+    argmax_state_ptr = {{ ptr(sampling, "ArgMaxState") }}
+{% if mm["HasAddend"] %}
+    addend = {{ ptr(mm, "Addend") }}
+{% endif %}
+{% if model["RematerializeEntryIndices"] %}
+    local_n_source = tle.gpu.rematerialize_index(tl.arange(0, {{ ctx["block_n"] }}))
+{% else %}
+    local_n_source = tl.arange(0, {{ ctx["block_n"] }})
+{% endif %}
+    local_n = tle.encoding(
+        tle.encoding(
+            local_n_source,
+            {{ ctx["consumer_output_layout_name"] }},
+        )[:, None],
+        {{ ctx["consumer_weight_layout_name"] }},
+    )
+    local_k_vector = tle.encoding(
+        tl.arange(0, {{ ctx["reduction_group"] }}),
+        {{ ctx["consumer_lhs_layout_name"] }},
+    )
+    local_k = tle.encoding(
+        local_k_vector[None, :],
+        {{ ctx["consumer_weight_layout_name"] }},
+    )
+    batch = 0
+    active = tl.load({{ sampling["Active"] }}) != 0
+    processor_flags = tl.load({{ sampling["ProcessorFlags"] }}).to(tl.uint32)
+    frequency_penalty = 0.0
+    if (processor_flags & {{ sampling["ProcessorFlagValues"]["FrequencyPenalty"] }}) != 0:
+        frequency_penalty = tl.load({{ sampling["FrequencyPenalty"] }}).to(tl.float32)
+    presence_penalty = 0.0
+    if (processor_flags & {{ sampling["ProcessorFlagValues"]["PresencePenalty"] }}) != 0:
+        presence_penalty = tl.load({{ sampling["PresencePenalty"] }}).to(tl.float32)
+    repetition_penalty = 1.0
+    if (processor_flags & {{ sampling["ProcessorFlagValues"]["RepetitionPenalty"] }}) != 0:
+        repetition_penalty = tl.load({{ sampling["RepetitionPenalty"] }}).to(tl.float32)
+    reads_output_counts = (
+        processor_flags
+        & {{ history_processor_flags }}
+    ) != 0
+    local_argmax_keys = tle.encoding(
+        tl.zeros(({{ ctx["block_n"] }},), dtype=tl.uint64),
+        {{ ctx["consumer_output_layout_name"] }},
+    )
+    active_n = {{ dim(ctx["n"]) }}
+    for n_tile in tl.range(0, {{ ctx["runtime_num_n_tiles"] }}):
+        n_start = n_tile * {{ ctx["block_n"] }}
+        partial = tle.encoding(
+            tl.zeros(
+                ({{ ctx["block_n"] }}, {{ ctx["reduction_group"] }}),
+                tl.float32,
+            ),
+            {{ ctx["consumer_weight_layout_name"] }},
+        )
+        for k_tile in tl.range(0, {{ ctx["num_k_tiles"] }}):
+            sequence = (
+                n_tile * {{ ctx["num_k_tiles"] }} + k_tile
+            ).to(tl.int32)
+            ready = reader.wait(sequence)
+            for k_group in tl.static_range(0, {{ ctx["reduction_groups_per_stage"] }}):
+                shared_k = k_group * {{ ctx["reduction_group"] }} + local_k
+                shared_payload = (
+                    local_n % {{ mm["RhsNVectorLaneCount"] }}
+                    * {{ ctx["k_atom"] }}
+                    + shared_k % {{ ctx["k_atom"] }}
+                )
+                weight_ptr = tle.gpu.local_ptr(
+                    ready.slot.weight,
+                    (
+{% for index in ctx["shared_weight_indices"] %}
+                        tle.encoding(
+                            {{ index }},
+                            {{ ctx["consumer_weight_layout_name"] }},
+                        ),
+{% endfor %}
+                    ),
+                    shape=({{ ctx["block_n"] }}, {{ ctx["reduction_group"] }}),
+                )
+                weight_ptr = tl.max_contiguous(weight_ptr, [1, 8])
+                weight_ptr = tl.multiple_of(weight_ptr, [1, 16])
+                pipeline_offs_k = (
+                    k_tile * {{ ctx["block_k"] }}
+                    + k_group * {{ ctx["reduction_group"] }}
+                    + local_k_vector
+                )
+                weight_value = tle.encoding(
+                    tl.load(weight_ptr),
+                    {{ ctx["consumer_weight_layout_name"] }},
+                )
+                lhs_value = tle.encoding(
+                    tl.load(
+                        {{ access_pointer(mm, "Lhs", "lhs", ctx["pipeline_lhs_access"]) }}
+                    ),
+                    {{ ctx["consumer_lhs_layout_name"] }},
+                )
+                lhs_value = tle.encoding(
+                    lhs_value[None, :],
+                    {{ ctx["consumer_weight_layout_name"] }},
+                )
+                partial += weight_value.to(tl.float32) * lhs_value.to(tl.float32)
+            reader.release(sequence)
+
+        result = tl.sum(partial, axis=1) * {{ mm["Scale"] }}
+        pipeline_output_n = n_start + tle.encoding(
+            local_n_source,
+            {{ ctx["consumer_output_layout_name"] }},
+        )
+{% if mm["HasAddend"] %}
+        result += tl.load(
+            {{ access_pointer(mm, "Addend", "addend", ctx["pipeline_addend_access"]) }},
+            mask={{ ctx["pipeline_output_mask"] }},
+            other=0.0,
+        ).to(tl.float32)
+{% endif %}
+        raw = result.to({{ mm["OutputTritonDType"] }})
+        tl.store(
+            {{ access_pointer(mm, "Output", "logits_ptr", ctx["pipeline_output_access"]) }},
+            raw,
+            mask={{ ctx["pipeline_output_mask"] }},
+        )
+
+        local_token = pipeline_output_n
+        global_token = ({{ sctx["global_token"] }}).to(tl.int32)
+        token_mask = active & (local_token < {{ sctx["local_vocab"] }}) & (global_token < {{ sampling["VocabSize"] }})
+        state_offset = global_token
+        allowed = tl.full(token_mask.shape, 1, tl.int1)
+        if (processor_flags & {{ sampling["ProcessorFlagValues"]["AllowedTokenMask"] }}) != 0:
+            allowed = tl.load({{ sampling["AllowedTokenMask"] }} + state_offset, mask=token_mask, other=0) != 0
+        forbidden = tl.full(token_mask.shape, 0, tl.int1)
+        if (processor_flags & {{ sampling["ProcessorFlagValues"]["ForbiddenTokenMask"] }}) != 0:
+            forbidden = tl.load({{ sampling["ForbiddenTokenMask"] }} + state_offset, mask=token_mask, other=1) != 0
+        output_count = tle.encoding(
+            tl.zeros(({{ ctx["block_n"] }},), dtype=tl.float32),
+            {{ ctx["consumer_output_layout_name"] }},
+        )
+        if reads_output_counts:
+            output_count = tl.load({{ sampling["OutputTokenCounts"] }} + state_offset, mask=token_mask, other=0).to(tl.float32)
+        value = raw.to(tl.float32)
+        if (processor_flags & {{ sampling["ProcessorFlagValues"]["LogitBias"] }}) != 0:
+            value += tl.load({{ sampling["LogitBias"] }} + state_offset, mask=token_mask, other=0.0).to(tl.float32)
+        if (processor_flags & {{ sampling["ProcessorFlagValues"]["RepetitionPenalty"] }}) != 0:
+            prompt_seen = tl.load({{ sampling["PromptTokenMask"] }} + state_offset, mask=token_mask, other=0) != 0
+            repeated = prompt_seen | (output_count != 0.0)
+            repeated_value = tl.where(value > 0.0, value / repetition_penalty, value * repetition_penalty)
+            value = tl.where(repeated & (repetition_penalty != 1.0), repeated_value, value)
+        if (processor_flags & {{ sampling["ProcessorFlagValues"]["FrequencyPenalty"] }}) != 0:
+            value -= output_count * frequency_penalty
+        if (processor_flags & {{ sampling["ProcessorFlagValues"]["PresencePenalty"] }}) != 0:
+            value -= tl.where(output_count != 0.0, presence_penalty, 0.0)
+        value = tl.where(token_mask & allowed & ~forbidden, value, -float("inf"))
+        tl.store(
+            processed_ptr + {{ sctx["processed_offset"] }},
+            value,
+            mask=token_mask,
+        )
+        value_bits = value.to(tl.uint32, bitcast=True)
+        ordered_value = tl.where(
+            value < 0.0,
+            ~value_bits,
+            value_bits ^ tl.full(value_bits.shape, 0x80000000, tl.uint32),
+        )
+        inverse_token = tl.full(global_token.shape, 0xFFFFFFFF, tl.uint32) - global_token.to(tl.uint32)
+        argmax_key = (ordered_value.to(tl.uint64) << 32) | inverse_token.to(tl.uint64)
+        local_argmax_keys = tl.maximum(
+            local_argmax_keys,
+            tl.where(token_mask, argmax_key, 0),
+        )
+
+    tl.store(
+        argmax_state_ptr + batch * {{ dim(sampling["ArgMaxStateStrides"][0]) }},
+        tl.max(local_argmax_keys),
+    )
+
+
+{% endif %}

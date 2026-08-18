@@ -190,6 +190,72 @@ public sealed class PagedAttentionSchedulerTestData : TheoryData<PagedAttentionC
 public class UnitTestEvaluatorNN : TestClassBase
 {
     [Fact]
+    public void TestSamplerProcessorsAndLogprobs()
+    {
+        var config = new SamplerConfig(
+            vocabSize: 5,
+            maxBatchSize: 1,
+            maxLogprobs: 2,
+            SamplerLogprobsMode.RawLogprobs);
+        var state = new TestSamplerState(config)
+        {
+            ProcessorFlags = Tensor.From<uint>(
+                [(uint)(SamplerProcessorFlags.ForbiddenTokenMask |
+                        SamplerProcessorFlags.LogitBias |
+                        SamplerProcessorFlags.RepetitionPenalty |
+                        SamplerProcessorFlags.FrequencyPenalty |
+                        SamplerProcessorFlags.PresencePenalty)],
+                [1]),
+            FrequencyPenalty = Tensor.From<float>([0.5F], [1]),
+            PresencePenalty = Tensor.From<float>([0.25F], [1]),
+            RepetitionPenalty = Tensor.From<float>([2F], [1]),
+            RequestedLogprobs = Tensor.From<int>([2], [1]),
+            PromptTokenMask = Tensor.From<byte>([0, 0, 0, 1, 0], [1, 5]),
+            OutputTokenCounts = Tensor.From<int>([2, 0, 0, 0, 0], [1, 5]),
+            ForbiddenTokenMask = Tensor.From<byte>([0, 1, 0, 0, 0], [1, 5]),
+            LogitBias = Tensor.From<float>([0F, 0F, 2F, 0F, 0F], [1, 5]),
+        };
+        var logits = Tensor.From<float>([1F, 4F, 3F, 2F, 0F], [1, 5]);
+        var stateVar = new Var(
+            "state",
+            TensorType.Scalar(new ReferenceType(new SamplerStateType { Config = config })));
+        var expression = IR.F.NN.Sampling(logits, stateVar, config);
+
+        CompilerServices.InferenceType(expression);
+        var outputs = expression.Evaluate(new Dictionary<IVar, IValue>
+        {
+            {
+                stateVar,
+                Value.FromTensor(Tensor.FromScalar(new Reference<ISamplerState>(state)))
+            },
+        }).AsTensors();
+
+        Assert.Equal(new[] { 2 }, outputs[0].ToArray<int>());
+        Assert.Equal(new[] { 2, 1, 2 }, outputs[1].ToArray<int>());
+        Assert.Equal(new[] { 2 }, outputs[3].ToArray<int>());
+        Assert.Equal(new[] { 3 }, outputs[4].ToArray<int>());
+        Assert.Equal(1, state.OutputTokenCounts.ToArray<int>()[2]);
+
+        var raw = new[] { 1F, 4F, 3F, 2F, 0F };
+        state.ProcessorFlags = Tensor.From<uint>([0], [1]);
+        Assert.Equal(raw, Nncase.Evaluator.NN.SamplingEvaluator.ApplyProcessors(raw, state, 0, 5));
+        var max = raw.Max();
+        var normalizer = max + MathF.Log(raw.Sum(value => MathF.Exp(value - max)));
+        var expectedLogprobs = new[]
+        {
+            raw[2] - normalizer,
+            raw[1] - normalizer,
+            raw[2] - normalizer,
+        };
+        var actualLogprobs = outputs[2].ToArray<float>();
+        Assert.Equal(expectedLogprobs.Length, actualLogprobs.Length);
+        for (var index = 0; index < expectedLogprobs.Length; index++)
+        {
+            Assert.InRange(MathF.Abs(expectedLogprobs[index] - actualLogprobs[index]), 0F, 1e-6F);
+        }
+    }
+
+    [Fact]
     public void TestActivationCelu()
     {
         var input = OrtKI.Random(new long[] { 1, 3, 16, 16 });
@@ -1167,5 +1233,66 @@ public class UnitTestEvaluatorNN : TestClassBase
         var expr = IR.F.NN.LpNormalization(input.ToTensor(), axis, p);
         CompilerServices.InferenceType(expr);
         Assert.Equal(expect, expr.Evaluate().AsTensor().ToOrtTensor());
+    }
+
+    private sealed class TestSamplerState : ISamplerState
+    {
+        public TestSamplerState(SamplerConfig config)
+        {
+            Config = config;
+            Active = Tensor.From<byte>([1], [1]);
+            ProcessorFlags = Tensor.From<uint>([0U], [1]);
+            Temperature = Tensor.From<float>([0F], [1]);
+            TopP = Tensor.From<float>([1F], [1]);
+            TopK = Tensor.From<int>([config.VocabSize], [1]);
+            MinP = Tensor.From<float>([0F], [1]);
+            FrequencyPenalty = Tensor.From<float>([0F], [1]);
+            PresencePenalty = Tensor.From<float>([0F], [1]);
+            RepetitionPenalty = Tensor.From<float>([1F], [1]);
+            RequestedLogprobs = Tensor.From<int>([-1], [1]);
+            Seeds = Tensor.From<ulong>([0UL], [1]);
+            Counters = Tensor.From<ulong>([0UL], [1]);
+            PromptTokenMask = Tensor.From<byte>(new byte[config.VocabSize], [1, config.VocabSize]);
+            OutputTokenCounts = Tensor.From<int>(new int[config.VocabSize], [1, config.VocabSize]);
+            AllowedTokenMask = Tensor.From<byte>(Enumerable.Repeat((byte)1, config.VocabSize).ToArray(), [1, config.VocabSize]);
+            ForbiddenTokenMask = Tensor.From<byte>(new byte[config.VocabSize], [1, config.VocabSize]);
+            LogitBias = Tensor.From<float>(new float[config.VocabSize], [1, config.VocabSize]);
+        }
+
+        public SamplerConfig Config { get; }
+
+        public Tensor Active { get; }
+
+        public Tensor ProcessorFlags { get; set; }
+
+        public Tensor Temperature { get; }
+
+        public Tensor TopP { get; }
+
+        public Tensor TopK { get; }
+
+        public Tensor MinP { get; }
+
+        public Tensor FrequencyPenalty { get; set; }
+
+        public Tensor PresencePenalty { get; set; }
+
+        public Tensor RepetitionPenalty { get; set; }
+
+        public Tensor RequestedLogprobs { get; set; }
+
+        public Tensor Seeds { get; }
+
+        public Tensor Counters { get; }
+
+        public Tensor PromptTokenMask { get; set; }
+
+        public Tensor OutputTokenCounts { get; set; }
+
+        public Tensor AllowedTokenMask { get; }
+
+        public Tensor ForbiddenTokenMask { get; set; }
+
+        public Tensor LogitBias { get; set; }
     }
 }

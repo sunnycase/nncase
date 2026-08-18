@@ -114,10 +114,10 @@ Templates under `pyntt/pyntt/codegen/templates/triton/` own:
 
 A template receives actual dtype, logical shape, physical strides,
 distribution, runtime dimension expressions, target capability, operation
-attributes, selected microkernel parameters, and named Shared byte offsets. It
-chooses the typed alias shape and layout, including whether an alias uses an MMA
-Shared layout. It must not recover facts from generated names or assume a
-Qwen-specific shape.
+attributes, selected microkernel parameters, and named Shared physical shapes
+and byte offsets. It uses the compiler-owned physical shape and chooses the
+Triton alias layout, including whether an alias uses an MMA Shared layout. It
+must not recover facts from generated names or assume a Qwen-specific shape.
 
 ### Generated Python Runtime
 
@@ -388,6 +388,86 @@ Synchronization has two owners:
 `tle.distributed_barrier` is emitted only for a TIR grid-wide dependency.
 Template-internal barriers are not represented as manifest pipeline tables.
 
+## External Runtime Objects
+
+State owned by an embedding runtime is represented as a scalar
+`Reference<ValueType>` input in semantic IR and remains an object parameter
+through TIR. Codegen materializes only fields explicitly required by a selected
+kernel. Every manifest field binding records the object kind, field name,
+materialization kind, dtype, and fixed shape; the PyNTT runtime validates that
+contract, device, contiguity, and pointer alignment before prepared launch.
+This generic object-field ABI is shared by paged KV cache and sampler state.
+
+The canonical `Sampling` operation consumes `[batch, vocab]` logits and a
+mutable external sampler state, and returns sampled IDs plus the fixed-capacity
+logprob ABI. `SamplerState` and `SamplerConfig` retain the conventional runtime
+component name; `Sampling` is the operation name. The state carries stable
+tensors for temperature, top-k/top-p, min-p, penalties, RNG seed/counter, token
+histories, token masks, grammar or bad-word exclusions, and logit bias. A
+per-batch `processor_flags` bitset declares which dense token-state fields are
+semantically active. The evaluator and generated kernel must not read an
+inactive field; this keeps the default greedy path independent of vocabulary-
+sized masks, counts, and bias arrays while retaining one stable object ABI.
+`requested_logprobs` is `-1` when logprob materialization is disabled, `0` for
+the sampled-token logprob only, and positive for sampled-token plus top-N
+logprobs. Disabled work is skipped while output storage remains caller
+allocated.
+
+PyNTT decomposes `Sampling` before AutoDistributed into two explicit semantic
+operations:
+
+- `SamplingPartial` applies token-local processors to each vocabulary shard,
+  stores FP32 processed logits with the same `S(vocab)` policy, and emits one
+  `u64[batch]` `ArgMaxState` with `P(Max)` across every physical block axis.
+- `SamplingCombine` consumes the sharded raw/processed logits and the partial
+  argmax state, performs the cross-block filtering, random selection, and
+  logprob reductions, mutates sampler state, and returns replicated outputs.
+
+`ArgMaxState` is an associative reduction state, not a materialized block
+table. Its high 32 bits contain the total-order key of the FP32 processed
+logit, and its low 32 bits contain the reversed token ID. Unsigned `Max`
+therefore selects the greatest logit and, for ties, the smallest token ID.
+Keeping this relation in one monoid avoids the invalid alternative of reducing
+maxima and token IDs independently. AutoDistributed preserves the `P(Max)`
+edge directly into `SamplingCombine`; it must not insert a `P -> B` Boxing
+between the two operations.
+
+The vocabulary axis must be sharded exactly once across every axis of the
+selected placement. Replicated vocabulary shards and partially covered meshes
+are rejected because they would duplicate tokens in global counts and masses.
+The block count and reduction workspace are derived from that concrete
+placement, not from the target's set of candidate hierarchies.
+
+PyNTT materializes raw and processed logits once in compiler-owned global Data
+buffers, preserving their block-local vocabulary sharding. Exact top-k and
+top-p thresholds use four passes over ordered FP32 radix keys with one 256-bin
+histogram per block; top-p mass is computed after top-k filtering. Sampling
+uses the state's 64-bit Philox seed and counter. Distributed barriers expose
+the sharded logits and compact reduction summaries owned by `SamplingCombine`
+needed to produce replicated outputs. `SamplingCombine` reads the compact
+per-owner `P(Max)` backing directly after the producer/consumer boundary. Its
+replicated tensor results use `CanonicalGlobal` chip-local backing: the
+canonical owner writes them once, and a generic owner-only TensorStore
+materializes the caller ABI outputs. A replicated result must not be represented
+as one uninitialized `CompactLocal` copy per block.
+Top-logprob selection is a runtime ordered-cursor loop bounded by the manifest
+capacity; changing that capacity does not expand Jinja source or compiler IR.
+
+After AutoDistributed fixes the vocabulary sharding, a deterministic target
+pass may replace the single-use
+`PackedMatMul -> Bitcast -> SamplingPartial -> SamplingCombine` chain with
+`PackedMatMulSamplingPartial -> SamplingCombine`. The fusion is legal only
+when the packed result is not partial, the scalar vocabulary axis covers the
+complete block mesh, and none of the removed values has another user. The
+partial fusion writes scalar raw logits, FP32 processed logits, and the local
+`P(Max)` state to compiler-owned global buffers. `SamplingCombine` remains an
+independent operation and owns all cross-block barriers, filtering, random
+sampling, state mutation, and final outputs. TIR Selection reserves Shared
+workspace only for the LM-head weight-transfer pipeline; logits are never
+kept in Shared across the operation boundary. This preserves a clear global
+buffer contract while avoiding a second local pass over logits to apply
+processors and compute the partial argmax.
+
 ## Manifest v9
 
 `kernel_params.json` is a reader-only rendering manifest. Version 9 is the only
@@ -416,11 +496,11 @@ Metadata carries semantic operation attributes, tensor names, distributed
 launch metadata, fixed worker geometry, target resource capability, and total
 Shared arena bytes plus the Bufferize-computed arena alignment. Helper models
 may carry a selected microkernel family/variant, static parameters, and named
-Shared byte-offset expressions. Launch metadata may carry authoritative host
-tensor descriptor backing records; the renderer, not the compiler, derives
-their algorithm-specific TMA block shape. Helper models do not carry typed
-Triton aliases, encodings, copies, or pipeline bodies. Device functions carry a
-direct parameter ABI and body source.
+Shared physical shapes and byte-offset expressions. Launch metadata may carry
+authoritative host tensor descriptor backing records; the renderer, not the
+compiler, derives their algorithm-specific TMA block shape. Helper models do
+not carry Triton layouts, encodings, copies, or pipeline bodies. Device
+functions carry a direct parameter ABI and body source.
 
 Each helper contains exactly:
 

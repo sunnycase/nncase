@@ -18,6 +18,9 @@ namespace Nncase.IR.F;
 /// </summary>
 public static class NN
 {
+    public static Call Sampling(Expr logits, Expr state, SamplerConfig config)
+        => new(new Sampling(config), logits, state);
+
     public static Call Conv2D(Expr input, Expr weights, Expr bias, Shape stride, Paddings padding, Shape dilation, PadMode padMode, Dimension groups) => new Call(new Conv2D(padMode), input, weights, bias, stride, padding, dilation, groups, (Expr)new[] { ValueRange<float>.Full.Min, ValueRange<float>.Full.Max });
 
     public static Call Conv2D(Expr input, Expr weights, Expr bias, Shape stride, Paddings padding, Shape dilation, PadMode padMode, Dimension groups, Expr fusedClamp) => new Call(new Conv2D(padMode), input, weights, bias, stride, padding, dilation, groups, fusedClamp);

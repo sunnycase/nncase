@@ -478,6 +478,18 @@ class TestRunner(Evaluator, Inference, metaclass=ABCMeta):
         for k, v in import_opt.items():
             if k == "max_tokens":
                 continue
+            if k == "sampler_logprobs_mode":
+                modes = {
+                    "raw_logprobs": nncase.SamplerLogprobsMode.RawLogprobs,
+                    "raw_logits": nncase.SamplerLogprobsMode.RawLogits,
+                    "processed_logprobs": nncase.SamplerLogprobsMode.ProcessedLogprobs,
+                    "processed_logits": nncase.SamplerLogprobsMode.ProcessedLogits,
+                }
+                try:
+                    v = modes[v]
+                except KeyError as ex:
+                    raise ValueError(
+                        f"Unknown sampler_logprobs_mode {v!r}") from ex
             setattr(import_options.huggingface_options, k, v)
 
         return import_options

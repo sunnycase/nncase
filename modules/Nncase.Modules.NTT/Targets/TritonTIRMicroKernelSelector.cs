@@ -5,6 +5,7 @@ using System.Collections.Immutable;
 using Nncase.IR;
 using Nncase.Schedule;
 using Nncase.TIR;
+using Nncase.Utilities;
 
 namespace Nncase.Targets;
 
@@ -58,6 +59,8 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
                 lhsIndex: 0,
                 rhsIndex: 1,
                 outputIndex: 2),
+            Nncase.TIR.NTT.PackedMatMulSamplingPartial packedMatmulSamplingPartial =>
+                SelectPackedMatMulSamplingPartial(context, packedMatmulSamplingPartial),
             Nncase.TIR.NTT.SUMMA summa => SelectSumma(context, summa),
             Nncase.TIR.NTT.QKVParallelLinear => SelectFusedLinear(
                 context,
@@ -537,6 +540,96 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
             sourceArgumentIndices: [rhsIndex]);
     }
 
+    private static TIRMicroKernelSelection SelectPackedMatMulSamplingPartial(
+        TIRMicroKernelSelectionContext context,
+        Nncase.TIR.NTT.PackedMatMulSamplingPartial sampling)
+    {
+        var lhs = GetBuffer(context, 0, "lhs");
+        var rhs = GetBuffer(context, 1, "rhs");
+        var logits = GetBuffer(context, 3, "logits");
+        var processedLogits = GetBuffer(context, 4, "processed_logits");
+        var argMaxState = GetBuffer(context, 5, "argmax_state");
+        RequireRank(lhs, 2, context.Op, "lhs");
+        RequireRank(rhs, 2, context.Op, "rhs");
+        RequireRank(logits, 2, context.Op, "logits");
+        RequireRank(processedLogits, 2, context.Op, "processed_logits");
+        RequireRank(argMaxState, 1, context.Op, "argmax_state");
+        if (sampling.RhsLayout != IR.NTT.PackedMatMulRhsLayout.KMajor)
+        {
+            throw new NotSupportedException(
+                "PackedMatMulSamplingPartial currently requires K-major packed weights.");
+        }
+
+        var localLogits = DistributedUtility.GetDividedTensorType(
+            sampling.LogitsType,
+            DistributedUtility.DivideFlags.MaxShape);
+        if (localLogits.Shape is not RankedShape { Rank: 2 } logitsShape ||
+            localLogits.DType != GetScalarDataType(sampling.PackedOutputType.TensorType.DType))
+        {
+            throw new InvalidOperationException(
+                $"PackedMatMulSamplingPartial selector requires rank-2 scalar logits, got {localLogits}.");
+        }
+
+        if (GetScalarDataType(logits.ElemType) != localLogits.DType ||
+            processedLogits.ElemType != DataTypes.Float32 ||
+            argMaxState.ElemType != DataTypes.UInt64)
+        {
+            throw new InvalidOperationException(
+                "PackedMatMulSamplingPartial requires scalar logits, FP32 processed logits, and UInt64 partial argmax state outputs.");
+        }
+
+        var localLogitsDimensions = logitsShape.Dimensions.ToArray();
+        var m = GetMax(localLogitsDimensions[^2]);
+        var n = GetMax(localLogitsDimensions[^1]);
+        if (m != 1)
+        {
+            throw new NotSupportedException(
+                $"PackedMatMulSamplingPartial currently requires GEMV with local M=1, got {m}.");
+        }
+
+        var lhsDimensions = GetLocalDimensions(lhs);
+        var kDimension = lhsDimensions[^1];
+        var k = GetScalarExtent(kDimension, lhs.ElemType);
+        if (!TryGetPackedBFloat16GemvPipelineConfiguration(
+                context.Machine,
+                "triton.matmul_sampling_partial",
+                GetScalarDataType(lhs.ElemType),
+                GetScalarDataType(rhs.ElemType),
+                n,
+                k,
+                kDimension.IsFixed,
+                kMajorPacked: true,
+                rhsTilesPerGroup: 1,
+                reservedSharedBytes: 0,
+                out var pipeline))
+        {
+            throw new InvalidOperationException(
+                $"PackedMatMulSamplingPartial cannot select a spill-free BF16 Shared-staged GEMV for " +
+                $"local shape M={m}, N={n}, K={k}.");
+        }
+
+        const int nVector = 8;
+        const int kAtom = 16;
+        var rhsStage = new TIRSharedWorkspaceDescriptor(
+            "rhs_stage",
+            new TensorType(
+                GetScalarDataType(rhs.ElemType),
+                new RankedShape(
+                    pipeline.NumStages,
+                    (pipeline.BlockK / kAtom) * (pipeline.BlockN / nVector),
+                    nVector * kAtom)),
+            NvidiaNvmmaSharedAlignmentBytes);
+        return new(
+            "triton.matmul_sampling_partial",
+            "simt_fma_smem_pipeline",
+            CreateParameters(1, pipeline.BlockN, pipeline.BlockK, pipeline.NumStages),
+            ImmutableArray.Create(rhsStage),
+            new TIRTransferPipelineContract(
+            [
+                new TIRTransferPipelineChannel("weight", [1], [0]),
+            ]));
+    }
+
     private static TIRMicroKernelSelection SelectFusedLinear(
         TIRMicroKernelSelectionContext context,
         string family,
@@ -568,6 +661,19 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
             kDimension.IsFixed,
             kMajorPacked: false,
             sourceArgumentIndices: [weightIndex]);
+    }
+
+    private static long RoundUpPowerOfTwo(long value)
+    {
+        var rounded = System.Numerics.BitOperations.RoundUpToPowerOf2(
+            checked((ulong)value));
+        if (rounded == 0 || rounded > long.MaxValue)
+        {
+            throw new OverflowException(
+                $"Shared workspace element capacity {value} cannot be represented as a power of two.");
+        }
+
+        return checked((long)rounded);
     }
 
     private static TIRMicroKernelSelection SelectPackedQkv(
@@ -712,6 +818,7 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
                     fixedK,
                     kMajorPacked,
                     simultaneousRhsTileCount,
+                    reservedSharedBytes: 0,
                     out var pipeline))
             {
                 const int nVector = 8;
@@ -828,10 +935,12 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
         bool fixedK,
         bool kMajorPacked,
         int rhsTilesPerGroup,
+        long reservedSharedBytes,
         out PackedGemvPipelineConfiguration configuration)
     {
         configuration = default;
         if ((family != "triton.matmul" &&
+             family != "triton.matmul_sampling_partial" &&
              family != "triton.qkv_parallel_linear" &&
              family != "triton.matmul_glu") ||
             rhsTilesPerGroup <= 0 ||
@@ -899,7 +1008,8 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
                     var allocatedSharedBytes = machine.GetAllocationSizeBytes(
                         sharedSpace,
                         requiredSharedBytes);
-                    if (allocatedSharedBytes > machine.GetMaximumUsableAllocationBytes(sharedSpace))
+                    if (checked(allocatedSharedBytes + reservedSharedBytes) >
+                        machine.GetMaximumUsableAllocationBytes(sharedSpace))
                     {
                         continue;
                     }

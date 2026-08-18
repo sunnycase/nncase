@@ -53,6 +53,10 @@ public sealed class PyNTTTarget : NTTTarget
         {
             p.Add<Passes.Rules.NTT.DecomposePagedAttention>(splitHierarchyAxis, splitCount);
         });
+        passManager.AddWithName<DataflowPass>("DecomposeSampling").Configure(p =>
+        {
+            p.Add<Passes.Rules.NTT.DecomposeSampling>();
+        });
         passManager.AddWithName<DataflowPass>("FusePackedMatMulAddBeforeAutoDistributed").Configure(p =>
         {
             p.Add<Passes.Rules.NTT.FusePackedMatMulAdd>();
@@ -64,6 +68,7 @@ public sealed class PyNTTTarget : NTTTarget
     public override void RegisterPostAutoDistributedPass(IPassManager passManager, CompileOptions options)
     {
         base.RegisterPostAutoDistributedPass(passManager, options);
+        passManager.Add<FusePackedMatMulSamplingPartialPass>();
         passManager.Add<SinkNormStatsBoxingAcrossFunctionBoundariesPass>();
     }
 
