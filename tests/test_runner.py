@@ -432,7 +432,7 @@ class TestRunner(Evaluator, Inference, metaclass=ABCMeta):
         return [1]
 
     def get_pyntt_block_hierarchy_names(self, hierarchy: List[int]) -> str:
-        if list(hierarchy) == [4, 8]:
+        if len(hierarchy) == 2:
             return "yx"
         return "b"
 

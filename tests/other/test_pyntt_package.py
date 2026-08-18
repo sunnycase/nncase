@@ -1134,6 +1134,38 @@ def test_pyntt_paged_attention_direct_tile_cannot_span_cache_pages():
         _paged_attention_tile_geometry(64, 32, allow_cross_page=False)
 
 
+def test_pyntt_paged_attention_detects_noncontiguous_gqa_head_shards():
+    _add_pyntt_to_path()
+    from pyntt.codegen.render import _query_heads_form_contiguous_gqa_groups
+
+    def block_cyclic(block_size):
+        return {
+            "Stages": [
+                {
+                    "HierarchyAxes": [1],
+                    "Distribution": "BlockCyclic",
+                    "Granularity": None,
+                    "BlockSize": block_size,
+                }
+            ]
+        }
+
+    assert _query_heads_form_contiguous_gqa_groups(
+        block_cyclic(2),
+        [4, 8],
+        global_query_heads=16,
+        local_query_heads=2,
+        query_heads_per_kv_head=2,
+    )
+    assert not _query_heads_form_contiguous_gqa_groups(
+        block_cyclic(1),
+        [4, 9],
+        global_query_heads=16,
+        local_query_heads=2,
+        query_heads_per_kv_head=2,
+    )
+
+
 @pytest.mark.parametrize(
     "template_name",
     (

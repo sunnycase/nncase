@@ -7954,6 +7954,46 @@ def _paged_attention_tile_geometry(
     return page_size, block_n // page_size
 
 
+def _query_heads_form_contiguous_gqa_groups(
+    shard_axis: dict[str, Any],
+    hierarchy: list[int],
+    *,
+    global_query_heads: int,
+    local_query_heads: int,
+    query_heads_per_kv_head: int,
+) -> bool:
+    """Return whether the local query-head interval preserves whole GQA groups."""
+
+    stages = _shard_axis_stages(shard_axis)
+    if not stages:
+        return True
+    if len(stages) != 1:
+        return False
+
+    stage = stages[0]
+    distribution = stage.get("Distribution")
+    if distribution == "BlockCyclic":
+        block_size = stage.get("BlockSize")
+        return (
+            isinstance(block_size, int)
+            and block_size > 0
+            and block_size % query_heads_per_kv_head == 0
+            and local_query_heads <= block_size
+        )
+    if distribution == "Contiguous":
+        granularity = stage.get("Granularity")
+        capacity = _fixed(granularity) if granularity is not None else None
+        if capacity is None:
+            shard_count = _stage_shard_count(stage, hierarchy)
+            capacity = (global_query_heads + shard_count - 1) // shard_count
+        return (
+            capacity > 0
+            and capacity % query_heads_per_kv_head == 0
+            and local_query_heads <= capacity
+        )
+    return False
+
+
 def _paged_attention_template_context(model: dict[str, Any]) -> dict[str, Any]:
     """Validate PagedAttention layouts and prepare coordinate-native accesses."""
 
@@ -8009,12 +8049,19 @@ def _paged_attention_template_context(model: dict[str, Any]) -> dict[str, Any]:
         attention_block_size // attention_reduction_block_size
     )
 
-    def global_index_expression(axis: int, local_index: str, global_extent: Any) -> str:
+    def global_index_expression(
+        axis: int,
+        local_index: str,
+        global_extent: Any,
+        *,
+        local_extent: int | None = None,
+    ) -> str:
         return _local_to_global_coordinate(
             local_index,
             global_extent,
             model["OutputShardAxes"][axis],
             model["Hierarchy"],
+            local_extent=local_extent,
         )
 
     if cache["KeyVectorizedDim"] != 5:
@@ -8080,8 +8127,24 @@ def _paged_attention_template_context(model: dict[str, Any]) -> dict[str, Any]:
         )
     q_head_group_size = global_num_query_heads // num_kv_heads
     q_head_group_tile = 1 << (q_head_group_size - 1).bit_length()
+    contiguous_q_head_groups = _query_heads_form_contiguous_gqa_groups(
+        model["OutputShardAxes"][model["HeadAxis"]],
+        model["Hierarchy"],
+        global_query_heads=global_num_query_heads,
+        local_query_heads=local_q_heads,
+        query_heads_per_kv_head=q_head_group_size,
+    )
     global_q_head_begin = global_index_expression(
-        model["HeadAxis"], "0", global_num_query_heads
+        model["HeadAxis"],
+        "0",
+        global_num_query_heads,
+        local_extent=local_q_heads,
+    )
+    global_q_head_from_local = global_index_expression(
+        model["HeadAxis"],
+        "local_kv_group",
+        global_num_query_heads,
+        local_extent=local_q_heads,
     )
 
     query_dim_axis = _structured_axis_tile(
@@ -8232,6 +8295,7 @@ def _paged_attention_template_context(model: dict[str, Any]) -> dict[str, Any]:
             else "key_block_id"
         ),
         "global_q_head_begin": global_q_head_begin,
+        "global_q_head_from_local": global_q_head_from_local,
         "global_query_id": global_index_expression(
             model["SeqAxis"], "local_query_id", global_query_tokens
         ),
@@ -8245,6 +8309,7 @@ def _paged_attention_template_context(model: dict[str, Any]) -> dict[str, Any]:
         ),
         "key_vector_offset": key_vector_offset,
         "local_q_heads": local_q_heads,
+        "contiguous_q_head_groups": contiguous_q_head_groups,
         "local_query_tokens": local_query_tokens,
         "output_mask": _broadcast_axis_coordinate(
             "q_head_mask", query_dim_axis["rank"], 0

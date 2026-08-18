@@ -34,8 +34,7 @@ public sealed class ThreadNormStatsAcrossFunctionBoundariesPass : ModulePass
         }
 
         var functions = input.Functions.OfType<Function>().ToArray();
-        var moduleFunctions = new HashSet<Function>(functions, ReferenceEqualityComparer.Instance);
-        var callSites = CollectCallSites(functions);
+        var callSites = FunctionCallGraphUtility.CollectCallSites(functions);
         var plans = new Dictionary<Function, ThreadingPlan>(ReferenceEqualityComparer.Instance);
         foreach (var function in functions)
         {
@@ -53,7 +52,7 @@ public sealed class ThreadNormStatsAcrossFunctionBoundariesPass : ModulePass
 
         var replacements = new Dictionary<Function, Function>(ReferenceEqualityComparer.Instance);
         var plansByReplacement = new Dictionary<Function, ThreadingPlan>(ReferenceEqualityComparer.Instance);
-        foreach (var function in GetCalleeFirstOrder(functions, moduleFunctions))
+        foreach (var function in FunctionCallGraphUtility.GetCalleeFirstOrder(functions))
         {
             plans.TryGetValue(function, out var plan);
             Var? statsParameter = null;
@@ -130,31 +129,6 @@ public sealed class ThreadNormStatsAcrossFunctionBoundariesPass : ModulePass
 
         result.Entry = input.Entry is Function entry ? replacements[entry] : input.Entry;
         return Task.FromResult(result);
-    }
-
-    private static Dictionary<Function, List<Call>> CollectCallSites(IEnumerable<Function> functions)
-    {
-        var callSites = new Dictionary<Function, List<Call>>(ReferenceEqualityComparer.Instance);
-        foreach (var function in functions)
-        {
-            foreach (var call in ExprCollector.Collect(function.Body).OfType<Call>())
-            {
-                if (call.Target is not Function target)
-                {
-                    continue;
-                }
-
-                if (!callSites.TryGetValue(target, out var calls))
-                {
-                    calls = new List<Call>();
-                    callSites.Add(target, calls);
-                }
-
-                calls.Add(call);
-            }
-        }
-
-        return callSites;
     }
 
     private static bool TryCreatePlan(
@@ -345,49 +319,6 @@ public sealed class ThreadNormStatsAcrossFunctionBoundariesPass : ModulePass
         }
 
         return new IR.Tuple(fields.Append<BaseExpr>(stats).ToArray());
-    }
-
-    private static Function[] GetCalleeFirstOrder(
-        IEnumerable<Function> functions,
-        IReadOnlySet<Function> moduleFunctions)
-    {
-        var visited = new HashSet<Function>(ReferenceEqualityComparer.Instance);
-        var active = new HashSet<Function>(ReferenceEqualityComparer.Instance);
-        var order = new List<Function>();
-
-        void Visit(Function function)
-        {
-            if (visited.Contains(function))
-            {
-                return;
-            }
-
-            if (!active.Add(function))
-            {
-                throw new InvalidOperationException(
-                    $"Recursive function calls are not supported by NormStats threading: {function.Name}.");
-            }
-
-            foreach (var callee in ExprCollector.Collect(function.Body)
-                         .OfType<Call>()
-                         .Select(call => call.Target)
-                         .OfType<Function>()
-                         .Where(callee => moduleFunctions.Contains(callee)))
-            {
-                Visit(callee);
-            }
-
-            active.Remove(function);
-            visited.Add(function);
-            order.Add(function);
-        }
-
-        foreach (var function in functions)
-        {
-            Visit(function);
-        }
-
-        return order.ToArray();
     }
 
     private static int NormalizeAxis(int axis, BaseExpr input)

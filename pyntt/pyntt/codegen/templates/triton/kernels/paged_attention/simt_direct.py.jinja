@@ -84,15 +84,30 @@
             seq_len = tl.where(in_seq, current_seq_len, seq_len)
             query_id = tl.where(in_seq, global_query_id - current_query_start, query_id)
             found_seq = found_seq | in_seq
+{% if ctx["contiguous_q_head_groups"] %}
         global_q_head_begin = (tl.full((), 0, tl.int32) + ({{ ctx["global_q_head_begin"] }})).to(tl.int32)
         first_kv_head = global_q_head_begin // {{ ctx["q_head_group_size"] }}
         local_kv_groups = tl.cdiv((global_q_head_begin % {{ ctx["q_head_group_size"] }}) + {{ ctx["local_q_heads"] }}, {{ ctx["q_head_group_size"] }})
+{% else %}
+        local_kv_groups: tl.constexpr = {{ ctx["local_q_heads"] }}
+{% endif %}
         for local_kv_group in tl.range(0, local_kv_groups):
+{% if ctx["contiguous_q_head_groups"] %}
             kv_head = (first_kv_head + local_kv_group).to(tl.int32)
+{% else %}
+            global_q_head = (tl.full((), 0, tl.int32) + ({{ ctx["global_q_head_from_local"] }})).to(tl.int32)
+            kv_head = tl.minimum(global_q_head // {{ ctx["q_head_group_size"] }}, {{ cache["NumKVHeads"] - 1 }}).to(tl.int32)
+{% endif %}
             q_group_offsets = tl.arange(0, {{ ctx["q_head_group_tile"] }})
+{% if ctx["contiguous_q_head_groups"] %}
             global_q_heads = kv_head * {{ ctx["q_head_group_size"] }} + q_group_offsets
             local_q_heads = global_q_heads - global_q_head_begin
             q_head_mask = (q_group_offsets < {{ ctx["q_head_group_size"] }}) & (local_q_heads >= 0) & (local_q_heads < {{ ctx["local_q_heads"] }}) & (global_q_heads < {{ model["GlobalNumQueryHeads"] }})
+{% else %}
+            local_q_heads = local_kv_group + tl.zeros(({{ ctx["q_head_group_tile"] }},), tl.int32)
+            global_q_heads = global_q_head + tl.zeros(({{ ctx["q_head_group_tile"] }},), tl.int32)
+            q_head_mask = (q_group_offsets == 0) & (global_q_heads < {{ model["GlobalNumQueryHeads"] }})
+{% endif %}
             safe_local_q_heads = tl.maximum(0, tl.minimum(local_q_heads, {{ ctx["local_q_heads"] - 1 }}))
             q_values = tle.encoding(
                 tl.reshape(tl.load({{ access_pointer(model, "Query", "query", ctx["query_access"]) }}, mask=found_seq & {{ ctx["query_mask"] }}, other=0.0), ({{ ctx["q_head_group_tile"] }}, {{ cache["HeadDim"] }})),

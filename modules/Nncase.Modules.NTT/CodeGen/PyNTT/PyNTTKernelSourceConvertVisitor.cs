@@ -6324,10 +6324,10 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             TIR.Buffer output,
             string context)
         {
-            var inputShape = GetBufferShape(input);
-            var cosShape = GetBufferShape(cos);
-            var sinShape = GetBufferShape(sin);
-            var outputShape = GetBufferShape(output);
+            var inputShape = GetBufferActiveShape(input);
+            var cosShape = GetBufferActiveShape(cos);
+            var sinShape = GetBufferActiveShape(sin);
+            var outputShape = GetBufferActiveShape(output);
             var inputVectorLanes = GetVectorLanes(input.ElemType);
             var cosVectorLanes = GetVectorLanes(cos.ElemType);
             var sinVectorLanes = GetVectorLanes(sin.ElemType);

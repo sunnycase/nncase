@@ -61,6 +61,13 @@ public sealed class PyNTTTarget : NTTTarget
     }
 
     /// <inheritdoc/>
+    public override void RegisterPostAutoDistributedPass(IPassManager passManager, CompileOptions options)
+    {
+        base.RegisterPostAutoDistributedPass(passManager, options);
+        passManager.Add<SinkNormStatsBoxingAcrossFunctionBoundariesPass>();
+    }
+
+    /// <inheritdoc/>
     public override void RegisterTIRPostBufferizePass(IPassManager passManager, CompileOptions options)
     {
         passManager.AddWithName<InlineSingleCallPrimFunctionsPass>("InlineSingleCallPrimFunctions", Kind);
