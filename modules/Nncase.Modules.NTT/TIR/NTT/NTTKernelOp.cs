@@ -52,7 +52,9 @@ public abstract class NTTKernelOp : Op, IOpMemoryEffectProvider
         => new(this, [.. arguments, None.Default]);
 
     /// <inheritdoc/>
-    public virtual MemoryEffect GetMemoryEffect(ParameterInfo parameter)
+    public virtual MemoryEffect GetMemoryEffect(
+        ParameterInfo parameter,
+        IReadOnlyList<BaseExpr> arguments)
         => parameter.MemoryEffect
             ?? throw new ArgumentOutOfRangeException(
                 nameof(parameter),

@@ -21,15 +21,15 @@ public sealed partial class SamplingCombine : NTTKernelOp
 
     public static readonly ParameterInfo Summary = new(typeof(SamplingCombine), 4, "summary", memoryEffect: MemoryEffect.ChipReadWrite);
 
-    public static readonly ParameterInfo SampledIds = new(typeof(SamplingCombine), 5, "sampled_ids", memoryEffect: MemoryEffect.ChipWrite);
+    public static readonly ParameterInfo SampledIds = new(typeof(SamplingCombine), 5, "sampled_ids", memoryEffect: MemoryEffect.ChipWrite.InFixedBlock(0));
 
-    public static readonly ParameterInfo LogprobIds = new(typeof(SamplingCombine), 6, "logprob_ids", memoryEffect: MemoryEffect.ChipWrite);
+    public static readonly ParameterInfo LogprobIds = new(typeof(SamplingCombine), 6, "logprob_ids", memoryEffect: MemoryEffect.ChipWrite.InFixedBlock(0));
 
-    public static readonly ParameterInfo Logprobs = new(typeof(SamplingCombine), 7, "logprobs", memoryEffect: MemoryEffect.ChipWrite);
+    public static readonly ParameterInfo Logprobs = new(typeof(SamplingCombine), 7, "logprobs", memoryEffect: MemoryEffect.ChipWrite.InFixedBlock(0));
 
-    public static readonly ParameterInfo Ranks = new(typeof(SamplingCombine), 8, "ranks", memoryEffect: MemoryEffect.ChipWrite);
+    public static readonly ParameterInfo Ranks = new(typeof(SamplingCombine), 8, "ranks", memoryEffect: MemoryEffect.ChipWrite.InFixedBlock(0));
 
-    public static readonly ParameterInfo Counts = new(typeof(SamplingCombine), 9, "counts", memoryEffect: MemoryEffect.ChipWrite);
+    public static readonly ParameterInfo Counts = new(typeof(SamplingCombine), 9, "counts", memoryEffect: MemoryEffect.ChipWrite.InFixedBlock(0));
 
     public SamplerConfig Config { get; }
 

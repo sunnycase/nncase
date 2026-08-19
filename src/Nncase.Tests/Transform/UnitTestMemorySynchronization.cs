@@ -34,6 +34,16 @@ public sealed class UnitTestMemorySynchronization : TestClassBase
         var mixed = MemoryEffectUtility.Merge(MemoryEffect.Read, MemoryEffect.ReductionWrite);
         Assert.Equal(MemoryAccessMode.ReadWrite, mixed.Mode);
         Assert.Equal(MemoryEffectKind.Direct, mixed.Kind);
+
+        var fixedBlock = MemoryEffectUtility.Merge(
+            MemoryEffect.Read.InFixedBlock(3),
+            MemoryEffect.Write.InFixedBlock(3));
+        Assert.Equal(MemoryAccessDomain.FixedBlock(3), fixedBlock.AccessDomain);
+
+        var differentBlocks = MemoryEffectUtility.Merge(
+            MemoryEffect.Read.InFixedBlock(3),
+            MemoryEffect.Write.InFixedBlock(4));
+        Assert.Equal(MemoryAccessDomain.AllBlocks, differentBlocks.AccessDomain);
     }
 
     [Fact]
@@ -713,6 +723,209 @@ public sealed class UnitTestMemorySynchronization : TestClassBase
     }
 
     [Fact]
+    public async Task TestFixedBlockSamplingResultMaterializationRequiresOnlyBlockBarrier()
+    {
+        var (combine, sampledIds, placement) = CreateSamplingCombineForSynchronizationTest();
+        var output = CreateBufferView(
+            "sampled_ids_output",
+            DataTypes.Int32,
+            49152,
+            4,
+            MemoryLocation.Output,
+            0,
+            4,
+            [1, 1]);
+        var main = new PrimFunction(
+            "main",
+            PyNTTTarget.Kind,
+            new Sequential(
+                combine,
+                TIR.F.NTT.TensorStore(sampledIds, output, new[] { SBP.B, SBP.B }, placement)),
+            Array.Empty<IVar>());
+        var module = new IRModule(main);
+
+        await new PlanMemorySynchronizationPass(
+            PyNTTTarget.Kind,
+            MemorySynchronizationScopes.All).RunAsync(module, new());
+
+        var planned = Assert.IsType<PrimFunction>(module.Entry);
+        Assert.Collection(
+            planned.Body.Fields.ToArray(),
+            field => Assert.IsType<TIR.NTT.SamplingCombine>(Assert.IsType<Call>(field).Target),
+            field => Assert.Equal(
+                TIR.NTT.BarrierScope.Block,
+                Assert.IsType<TIR.NTT.Barrier>(Assert.IsType<Call>(field).Target).Scope),
+            field => Assert.IsType<TIR.NTT.TensorStore>(Assert.IsType<Call>(field).Target));
+        Assert.DoesNotContain(
+            ExprCollector.Collect(planned.Body).OfType<Call>(),
+            call => call.Target is TIR.NTT.Barrier { Scope: TIR.NTT.BarrierScope.Chip });
+    }
+
+    [Fact]
+    public async Task TestForwardTerminalFixedBlockSamplingResultIntoCallerOutput()
+    {
+        var (combine, sampledIds, placement) = CreateSamplingCombineForSynchronizationTest();
+        var offsetBacking = sampledIds.MemSpan.Buffer.With(size: sampledIds.MemSpan.Size + 64);
+        var offsetSampledIds = sampledIds.With(
+            memSpan: new MemSpan(offsetBacking, 64, sampledIds.MemSpan.Size));
+        var originalCombineCall = Assert.IsType<Call>(combine);
+        var combineArguments = originalCombineCall.Arguments.ToArray();
+        combineArguments[TIR.NTT.SamplingCombine.SampledIds.Index] = offsetSampledIds;
+        combine = originalCombineCall.With(arguments: combineArguments);
+        var (outputParameter, output) = CreateCallerOutputBuffer(
+            "sampled_ids_output",
+            DataTypes.Int32,
+            [1, 1]);
+        var main = new PrimFunction(
+            "main",
+            PyNTTTarget.Kind,
+            new Sequential(
+                combine,
+                TIR.F.NTT.TensorStore(offsetSampledIds, output, new[] { SBP.B, SBP.B }, placement)),
+            new Return(new Expr[] { output }),
+            new IVar[] { outputParameter });
+        var module = new IRModule(main);
+
+        await new ForwardTerminalStoreDestinationsPass(PyNTTTarget.Kind).RunAsync(module, new());
+
+        var rewritten = Assert.IsType<PrimFunction>(module.Entry);
+        Assert.DoesNotContain(
+            ExprCollector.Collect(rewritten.Body).OfType<Call>(),
+            call => call.Target is TIR.NTT.TensorStore);
+        var combineCall = Assert.Single(
+            ExprCollector.Collect(rewritten.Body)
+                .OfType<Call>()
+                .Where(call => call.Target is TIR.NTT.SamplingCombine));
+        var forwarded = Assert.IsType<TIR.Buffer>(combineCall[TIR.NTT.SamplingCombine.SampledIds]);
+        var canonicalOutput = Assert.IsType<BufferVar>(forwarded.MemSpan.Buffer.Start);
+        Assert.Equal(BufferVarRole.Output, canonicalOutput.Role);
+        Assert.Equal(BufferLayoutKind.ExactStrided, canonicalOutput.LayoutAnnotation.Kind);
+        Assert.Equal(
+            DistributedBufferStorageKind.CompactLocal,
+            canonicalOutput.LayoutAnnotation.DistributedStorageKind);
+        Assert.Equal(MemoryLocation.Output, forwarded.MemSpan.Buffer.Location);
+        Assert.Equal(sampledIds.DistributedType, forwarded.DistributedType);
+        Assert.Equal(output.MemSpan.Start, forwarded.MemSpan.Start);
+
+        await new PlanMemorySynchronizationPass(
+            PyNTTTarget.Kind,
+            MemorySynchronizationScopes.All).RunAsync(module, new());
+        Assert.DoesNotContain(
+            ExprCollector.Collect(rewritten.Body).OfType<Call>(),
+            call => call.Target is TIR.NTT.Barrier);
+    }
+
+    [Fact]
+    public async Task TestKeepTerminalStoreWhenCanonicalSourceHasAnotherConsumer()
+    {
+        var (combine, sampledIds, placement) = CreateSamplingCombineForSynchronizationTest();
+        var (outputParameter, output) = CreateCallerOutputBuffer(
+            "sampled_ids_output",
+            DataTypes.Int32,
+            [1, 1]);
+        var consumerOutput = CreateWorkspaceBuffer(
+            "sampled_ids_consumer",
+            DataTypes.Int32,
+            49152,
+            4,
+            [1, 1]);
+        var main = new PrimFunction(
+            "main",
+            PyNTTTarget.Kind,
+            new Sequential(
+                combine,
+                TIR.F.NTT.Unary(UnaryOp.Neg, sampledIds, consumerOutput),
+                TIR.F.NTT.TensorStore(sampledIds, output, new[] { SBP.B, SBP.B }, placement)),
+            new Return(new Expr[] { output }),
+            new IVar[] { outputParameter });
+        var module = new IRModule(main);
+
+        await new ForwardTerminalStoreDestinationsPass(PyNTTTarget.Kind).RunAsync(module, new());
+
+        var rewritten = Assert.IsType<PrimFunction>(module.Entry);
+        Assert.Contains(
+            ExprCollector.Collect(rewritten.Body).OfType<Call>(),
+            call => call.Target is TIR.NTT.TensorStore);
+        var combineCall = Assert.Single(
+            ExprCollector.Collect(rewritten.Body)
+                .OfType<Call>()
+                .Where(call => call.Target is TIR.NTT.SamplingCombine));
+        Assert.Same(sampledIds, combineCall[TIR.NTT.SamplingCombine.SampledIds]);
+    }
+
+    [Fact]
+    public async Task TestKeepTerminalStoreWhenCallerOutputHasAnotherAlias()
+    {
+        var (combine, sampledIds, placement) = CreateSamplingCombineForSynchronizationTest();
+        var (outputParameter, output) = CreateCallerOutputBuffer(
+            "sampled_ids_output",
+            DataTypes.Int32,
+            [1, 1]);
+        var outputAlias = output.With(name: "sampled_ids_output_alias");
+        var consumerOutput = CreateWorkspaceBuffer(
+            "sampled_ids_consumer",
+            DataTypes.Int32,
+            49152,
+            4,
+            [1, 1]);
+        var main = new PrimFunction(
+            "main",
+            PyNTTTarget.Kind,
+            new Sequential(
+                combine,
+                TIR.F.NTT.TensorStore(sampledIds, output, new[] { SBP.B, SBP.B }, placement),
+                TIR.F.NTT.Unary(UnaryOp.Neg, outputAlias, consumerOutput)),
+            new Return(new Expr[] { output }),
+            new IVar[] { outputParameter });
+        var module = new IRModule(main);
+
+        await new ForwardTerminalStoreDestinationsPass(PyNTTTarget.Kind).RunAsync(module, new());
+
+        var rewritten = Assert.IsType<PrimFunction>(module.Entry);
+        Assert.Contains(
+            ExprCollector.Collect(rewritten.Body).OfType<Call>(),
+            call => call.Target is TIR.NTT.TensorStore);
+        var combineCall = Assert.Single(
+            ExprCollector.Collect(rewritten.Body)
+                .OfType<Call>()
+                .Where(call => call.Target is TIR.NTT.SamplingCombine));
+        Assert.Same(sampledIds, combineCall[TIR.NTT.SamplingCombine.SampledIds]);
+    }
+
+    [Fact]
+    public async Task TestFixedBlockSamplingResultStillRequiresChipBarrierForAllBlockConsumer()
+    {
+        var (combine, sampledIds, _) = CreateSamplingCombineForSynchronizationTest();
+        var consumerOutput = CreateWorkspaceBuffer(
+            "sampled_ids_consumer",
+            DataTypes.Int32,
+            49152,
+            4,
+            [1, 1]);
+        var main = new PrimFunction(
+            "main",
+            PyNTTTarget.Kind,
+            new Sequential(
+                combine,
+                TIR.F.NTT.Unary(UnaryOp.Neg, sampledIds, consumerOutput)),
+            Array.Empty<IVar>());
+        var module = new IRModule(main);
+
+        await new PlanMemorySynchronizationPass(
+            PyNTTTarget.Kind,
+            MemorySynchronizationScopes.All).RunAsync(module, new());
+
+        var planned = Assert.IsType<PrimFunction>(module.Entry);
+        Assert.Collection(
+            planned.Body.Fields.ToArray(),
+            field => Assert.IsType<TIR.NTT.SamplingCombine>(Assert.IsType<Call>(field).Target),
+            field => Assert.Equal(
+                TIR.NTT.BarrierScope.Chip,
+                Assert.IsType<TIR.NTT.Barrier>(Assert.IsType<Call>(field).Target).Scope),
+            field => Assert.IsType<TIR.NTT.Unary>(Assert.IsType<Call>(field).Target));
+    }
+
+    [Fact]
     public async Task TestInterproceduralUpdatesShareOneOuterChipBarrier()
     {
         var cacheType = TensorType.Scalar(new ReferenceType(DataTypes.Int32));
@@ -1304,6 +1517,104 @@ public sealed class UnitTestMemorySynchronization : TestClassBase
             0,
             sizeBytes,
             shape);
+
+    private static (BufferVar Parameter, Nncase.TIR.Buffer Buffer) CreateCallerOutputBuffer(
+        string name,
+        DataType dataType,
+        Dimension[] shape)
+    {
+        var tensorType = new TensorType(dataType, shape);
+        var parameter = new BufferVar(
+            name,
+            tensorType,
+            BufferVarRole.Output,
+            MemoryLocation.Output);
+        var sizeBytes = shape.Aggregate(
+            (long)dataType.SizeInBytes,
+            (size, dimension) => checked(size * dimension.FixedValue));
+        var physical = new PhysicalBuffer(
+            dataType.SizeInBytes,
+            parameter,
+            sizeBytes,
+            MemoryLocation.Output);
+        var buffer = new Nncase.TIR.Buffer(
+            $"{name}_view",
+            dataType,
+            new MemSpan(physical, 0, sizeBytes),
+            shape,
+            TensorUtilities.GetDefaultStrides(shape)
+                .Select(stride => (Dimension)stride)
+                .ToArray(),
+            distributedType: null);
+        return (parameter, buffer);
+    }
+
+    private static (Expr Combine, Nncase.TIR.Buffer SampledIds, Placement Placement) CreateSamplingCombineForSynchronizationTest()
+    {
+        var placement = new Placement([4, 8], "yx", "bb");
+        var config = new SamplerConfig(
+            vocabSize: 128,
+            maxBatchSize: 1,
+            maxLogprobs: 0,
+            SamplerLogprobsMode.RawLogprobs);
+        var state = new Var(
+            "sampler_state",
+            TensorType.Scalar(new ReferenceType(new SamplerStateType { Config = config })));
+        var logits = CreateWorkspaceBuffer("sampling_logits", DataTypes.Float32, 0, 512, [1, 128]);
+        var processedLogits = CreateWorkspaceBuffer("sampling_processed", DataTypes.Float32, 1024, 512, [1, 128]);
+        var argMaxState = CreateWorkspaceBuffer("sampling_argmax", DataTypes.UInt64, 2048, 256, [1, 32]);
+        var summary = CreateWorkspaceBuffer("sampling_summary", DataTypes.Float32, 3072, 34816, [1, 32, 272]);
+        var sampledIds = CreateCanonicalReplicatedBuffer("sampling_ids", DataTypes.Int32, 40960, [1, 1], placement);
+        var logprobIds = CreateCanonicalReplicatedBuffer("sampling_logprob_ids", DataTypes.Int32, 41216, [1, 1], placement);
+        var logprobs = CreateCanonicalReplicatedBuffer("sampling_logprobs", DataTypes.Float32, 41472, [1, 1], placement);
+        var ranks = CreateCanonicalReplicatedBuffer("sampling_ranks", DataTypes.Int32, 41728, [1], placement);
+        var counts = CreateCanonicalReplicatedBuffer("sampling_counts", DataTypes.Int32, 41984, [1], placement);
+        var combine = TIR.F.NTT.SamplingCombine(
+            logits,
+            processedLogits,
+            argMaxState,
+            state,
+            summary,
+            sampledIds,
+            logprobIds,
+            logprobs,
+            ranks,
+            counts,
+            config,
+            blockCount: 32);
+        return (combine, sampledIds, placement);
+    }
+
+    private static Nncase.TIR.Buffer CreateCanonicalReplicatedBuffer(
+        string name,
+        DataType dataType,
+        ulong offset,
+        Dimension[] shape,
+        Placement placement)
+    {
+        var sizeBytes = shape.Aggregate(1L, (size, dimension) => checked(size * dimension.FixedValue)) *
+            dataType.SizeInBytes;
+        var physical = new PhysicalBuffer(
+            dataType.SizeInBytes,
+            Tensor.FromPointer(offset, dataType),
+            sizeBytes,
+            MemoryLocation.ChipLocalData);
+        var tensorType = new TensorType(dataType, shape);
+        var distributedType = new DistributedType(
+            tensorType,
+            Enumerable.Repeat<SBP>(SBP.B, placement.Rank).ToArray(),
+            placement);
+        return new Nncase.TIR.Buffer(
+            name,
+            dataType,
+            new MemSpan(physical, 0, sizeBytes),
+            shape,
+            TensorUtilities.GetDefaultStrides(shape)
+                .Select(stride => (Dimension)stride)
+                .ToArray(),
+            distributedType,
+            distributedStorageKind: DistributedBufferStorageKind.CanonicalGlobal);
+    }
 
     private static Nncase.TIR.Buffer CreateBufferView(
         string name,

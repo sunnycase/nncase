@@ -171,6 +171,16 @@ public sealed class Buffer : Expr
     /// </summary>
     public DistributedBufferStorageKind DistributedStorageKind { get; }
 
+    /// <summary>
+    /// Gets a value indicating whether every placement block observes the same
+    /// canonical physical tensor. Materializing such a value to one external
+    /// destination requires exactly one deterministic writer.
+    /// </summary>
+    public bool IsCanonicalReplicated
+        => DistributedStorageKind == DistributedBufferStorageKind.CanonicalGlobal &&
+           DistributedType is { Partial: null } distributedType &&
+           distributedType.AxisPolicies.All(policy => policy is SBPBroadCast);
+
     public override TExprResult Accept<TExprResult, TTypeResult, TContext>(ExprFunctor<TExprResult, TTypeResult, TContext> functor, TContext context) => functor.VisitBuffer(this, context);
 
     public Buffer With(string? name = null, DataType? elemType = null, MemSpan? memSpan = null, Dimension[]? dimensions = null, Dimension[]? strides = null, Expr[]? globalShape = null, DistributedType? distributedType = null, TargetStorageEncodingSelection? storageEncoding = null, StagedBufferLayout? stagedLayout = null, DistributedBufferStorageKind? distributedStorageKind = null)

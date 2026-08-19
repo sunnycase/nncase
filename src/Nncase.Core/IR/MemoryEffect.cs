@@ -39,13 +39,50 @@ public enum MemoryEffectKind
     ReductionAccumulator,
 }
 
+public enum MemoryAccessDomainKind
+{
+    AllBlocks,
+    FixedBlock,
+}
+
 /// <summary>
 /// Refines the default operand effects declared by <see cref="ParameterInfo"/>
-/// when an operation's static attributes change its memory access scope.
+/// when an operation's attributes or arguments change its memory access.
 /// </summary>
 public interface IOpMemoryEffectProvider
 {
-    MemoryEffect GetMemoryEffect(ParameterInfo parameter);
+    MemoryEffect GetMemoryEffect(ParameterInfo parameter, IReadOnlyList<BaseExpr> arguments);
+}
+
+/// <summary>
+/// Describes which physical blocks participate in one operand access. This is
+/// independent from <see cref="MemoryAccessScope"/>, which describes the
+/// visibility and synchronization scope of the accessed storage.
+/// </summary>
+public readonly record struct MemoryAccessDomain
+{
+    private MemoryAccessDomain(MemoryAccessDomainKind kind, int blockIndex)
+    {
+        if (kind == MemoryAccessDomainKind.FixedBlock && blockIndex < 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(blockIndex));
+        }
+
+        Kind = kind;
+        BlockIndex = blockIndex;
+    }
+
+    public static MemoryAccessDomain AllBlocks => default;
+
+    public MemoryAccessDomainKind Kind { get; }
+
+    public int BlockIndex { get; }
+
+    public static MemoryAccessDomain FixedBlock(int blockIndex)
+        => new(MemoryAccessDomainKind.FixedBlock, blockIndex);
+
+    public bool IsSameFixedBlock(MemoryAccessDomain other)
+        => Kind == MemoryAccessDomainKind.FixedBlock && this == other;
 }
 
 /// <summary>
@@ -54,7 +91,8 @@ public interface IOpMemoryEffectProvider
 public readonly record struct MemoryEffect(
     MemoryAccessMode Mode,
     MemoryAccessScope Scope = MemoryAccessScope.Inferred,
-    MemoryEffectKind Kind = MemoryEffectKind.Direct)
+    MemoryEffectKind Kind = MemoryEffectKind.Direct,
+    MemoryAccessDomain AccessDomain = default)
 {
     public static MemoryEffect None { get; } = new(MemoryAccessMode.None);
 
@@ -79,6 +117,9 @@ public readonly record struct MemoryEffect(
         MemoryAccessMode.ReadWrite,
         MemoryAccessScope.Inferred,
         MemoryEffectKind.ReductionAccumulator);
+
+    public MemoryEffect InFixedBlock(int blockIndex)
+        => this with { AccessDomain = MemoryAccessDomain.FixedBlock(blockIndex) };
 }
 
 /// <summary>
@@ -118,12 +159,13 @@ public static class MemoryEffectUtility
             throw new ArgumentException("Operand memory effects can only be read from an Op call.", nameof(call));
         }
 
+        var arguments = call.Arguments.ToArray();
         var argumentIndex = 0;
         call.ParametersForeach((argument, parameter) =>
         {
             var currentArgumentIndex = argumentIndex++;
             var effect = call.Target is IOpMemoryEffectProvider provider
-                ? provider.GetMemoryEffect(parameter)
+                ? provider.GetMemoryEffect(parameter, arguments)
                 : parameter.MemoryEffect ?? MemoryEffect.None;
             if (effect.Mode == MemoryAccessMode.None)
             {
@@ -175,7 +217,8 @@ public static class MemoryEffectUtility
         return new(
             lhs.Mode | rhs.Mode,
             MergeScope(lhs.Scope, rhs.Scope),
-            lhs.Kind == rhs.Kind ? lhs.Kind : MemoryEffectKind.Direct);
+            lhs.Kind == rhs.Kind ? lhs.Kind : MemoryEffectKind.Direct,
+            MergeAccessDomain(lhs.AccessDomain, rhs.AccessDomain));
     }
 
     public static MemoryAccessScope MergeScope(MemoryAccessScope lhs, MemoryAccessScope rhs)
@@ -184,4 +227,11 @@ public static class MemoryEffectUtility
             : lhs == MemoryAccessScope.Block || rhs == MemoryAccessScope.Block
                 ? MemoryAccessScope.Block
                 : MemoryAccessScope.Inferred;
+
+    public static MemoryAccessDomain MergeAccessDomain(
+        MemoryAccessDomain lhs,
+        MemoryAccessDomain rhs)
+        => lhs.IsSameFixedBlock(rhs)
+            ? lhs
+            : MemoryAccessDomain.AllBlocks;
 }

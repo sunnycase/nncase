@@ -378,7 +378,6 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
         private const string DeviceFunctionCallPrefix = "__pyntt_device_call__";
         private const string PoolScopeSizeSuffix = "_pool_scope_size";
         private const string SharedArenaId = "pyntt_shared_arena";
-
         private static readonly Regex DeviceFunctionCallNameRegex = new(
             $@"\b{DeviceFunctionCallPrefix}(?<name>[A-Za-z_]\w*)\(",
             RegexOptions.Compiled | RegexOptions.CultureInvariant);
@@ -1461,8 +1460,8 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 case Nncase.TIR.NTT.TensorLoad:
                     VisitTensorLoad(args);
                     break;
-                case Nncase.TIR.NTT.TensorStore:
-                    VisitTensorStore(args);
+                case Nncase.TIR.NTT.TensorStore tensorStore:
+                    VisitTensorStore(tensorStore, args);
                     break;
                 case Nncase.TIR.Memcopy:
                     VisitMemcopy(args);
@@ -2960,7 +2959,9 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             WriteHelperInvocation(helperName, $"input{inputIndex}", $"input{inputIndex}_pool_stride_elements");
         }
 
-        private void VisitTensorStore(IReadOnlyList<BaseExpr> args)
+        private void VisitTensorStore(
+            Nncase.TIR.NTT.TensorStore tensorStore,
+            IReadOnlyList<BaseExpr> args)
         {
             if (args.Count != 2)
             {
@@ -2971,20 +2972,20 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
 
             if (args[1] is TIR.Buffer destBuffer)
             {
-                VisitInternalTensorStore(src, destBuffer);
+                VisitInternalTensorStore(tensorStore, src, destBuffer);
                 return;
             }
 
             if (TryGetFormalTensorBuffer(args[1], "PyNTT TensorStore formal destination", out var formalDest))
             {
-                VisitInternalTensorStore(src, formalDest);
+                VisitInternalTensorStore(tensorStore, src, formalDest);
                 return;
             }
 
             _ = GetBufferShape(src);
             var globalShape = GetTensorShape(args[1], "TensorStore destination");
             var outputIndex = GetOutputIndex(args[1]);
-            WriteTensorStore(src, outputIndex, globalShape, $"{src.Name} -> TensorStore");
+            WriteTensorStore(tensorStore, src, outputIndex, globalShape, $"{src.Name} -> TensorStore");
         }
 
         private void VisitInternalTensorLoad(TIR.Buffer dest, TIR.Buffer src)
@@ -3040,12 +3041,19 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             WriteHelperInvocation(helperName);
         }
 
-        private void VisitInternalTensorStore(TIR.Buffer src, TIR.Buffer dest)
+        private void VisitInternalTensorStore(
+            Nncase.TIR.NTT.TensorStore tensorStore,
+            TIR.Buffer src,
+            TIR.Buffer dest)
         {
-            VisitInternalTensorCopy(src, dest, "TensorStore");
+            VisitInternalTensorCopy(src, dest, "TensorStore", tensorStore);
         }
 
-        private void VisitInternalTensorCopy(TIR.Buffer src, TIR.Buffer dest, string operation)
+        private void VisitInternalTensorCopy(
+            TIR.Buffer src,
+            TIR.Buffer dest,
+            string operation,
+            Nncase.TIR.NTT.TensorStore? tensorStore = null)
         {
             if (IsObjectDataType(src.ElemType) || IsObjectDataType(dest.ElemType))
             {
@@ -3093,7 +3101,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     copyPlan,
                     operation == "TensorStore" &&
                     dest.MemSpan.Buffer.Location == MemoryLocation.Output &&
-                    RequiresCanonicalOwnerMaterialization(src),
+                    tensorStore?.RequiresCoordinatorMaterialization(src, dest) == true,
                     $"{operation}: {src.Name} -> {dest.Name}");
             WriteHelperTemplate(
                 "triton/kernels/TensorRegionCopy.py.jinja",
@@ -3230,7 +3238,12 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             return string.IsNullOrWhiteSpace(name) ? "buffer" : name;
         }
 
-        private void WriteTensorStore(TIR.Buffer src, int outputIndex, PyNTTDimExpression[] globalShape, string comment)
+        private void WriteTensorStore(
+            Nncase.TIR.NTT.TensorStore tensorStore,
+            TIR.Buffer src,
+            int outputIndex,
+            PyNTTDimExpression[] globalShape,
+            string comment)
         {
             RecordTensorOutputStore(outputIndex, GetDistributedType(src), "TensorStore");
             var outputName = _outputs[outputIndex].Name;
@@ -3253,15 +3266,10 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     GetBufferShardAxes(src, globalShape.Length),
                     GetVectorLaneElementCount(src.ElemType),
                     GetVectorLanes(src.ElemType),
-                    RequiresCanonicalOwnerMaterialization(src),
+                    tensorStore.RequiresCoordinatorMaterialization(src, null),
                     comment));
             WriteLine(BuildHelperCall(helperName, outputName, $"{outputName}_pool_stride_elements"));
         }
-
-        private static bool RequiresCanonicalOwnerMaterialization(TIR.Buffer source)
-            => source.DistributedStorageKind == DistributedBufferStorageKind.CanonicalGlobal &&
-               source.DistributedType is { Partial: null } distributedType &&
-               distributedType.AxisPolicies.All(policy => policy is SBPBroadCast);
 
         private void VisitMemcopy(IReadOnlyList<BaseExpr> args)
         {
@@ -5193,6 +5201,8 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 GetSamplerFieldArgument(state, "active", "uint8", config.MaxBatchSize),
                 GetSamplerFieldArgument(state, "processor_flags", "uint32", config.MaxBatchSize),
                 GetSamplerProcessorFlagValues(),
+                GetSamplerFieldArgument(state, "temperature", "float32", config.MaxBatchSize),
+                GetSamplerFieldArgument(state, "requested_logprobs", "int32", config.MaxBatchSize),
                 GetSamplerFieldArgument(state, "frequency_penalty", "float32", config.MaxBatchSize),
                 GetSamplerFieldArgument(state, "presence_penalty", "float32", config.MaxBatchSize),
                 GetSamplerFieldArgument(state, "repetition_penalty", "float32", config.MaxBatchSize),
@@ -5212,6 +5222,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 GetHierarchy(logits),
                 config.VocabSize,
                 config.MaxBatchSize,
+                config.LogprobsMode.ToString(),
                 $"{logits.Name} -> {processedLogits.Name}, {argMaxState.Name}");
             WriteSelectedMicroKernelHelper(
                 microKernel,
@@ -7760,6 +7771,8 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     GetSamplerFieldArgument(state, "active", "uint8", config.MaxBatchSize),
                     GetSamplerFieldArgument(state, "processor_flags", "uint32", config.MaxBatchSize),
                     GetSamplerProcessorFlagValues(),
+                    GetSamplerFieldArgument(state, "temperature", "float32", config.MaxBatchSize),
+                    GetSamplerFieldArgument(state, "requested_logprobs", "int32", config.MaxBatchSize),
                     GetSamplerFieldArgument(state, "frequency_penalty", "float32", config.MaxBatchSize),
                     GetSamplerFieldArgument(state, "presence_penalty", "float32", config.MaxBatchSize),
                     GetSamplerFieldArgument(state, "repetition_penalty", "float32", config.MaxBatchSize),
@@ -7779,6 +7792,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     hierarchy,
                     config.VocabSize,
                     config.MaxBatchSize,
+                    config.LogprobsMode.ToString(),
                     $"{logits.Name} -> {processedLogits.Name}, {argMaxState.Name}"));
             WriteLine(BuildHelperCall(helperName));
             MarkStoredOutput(processedLogits, "PyNTT SamplingPartial");
@@ -8018,7 +8032,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
         {
             for (var index = 0; index < arguments.Count; index++)
             {
-                var effect = kernelOp.GetMemoryEffect(kernelOp.Parameters[index]);
+                var effect = kernelOp.GetMemoryEffect(kernelOp.Parameters[index], arguments);
                 if (!MemoryEffectUtility.GetPhysicalBufferAccessMode(effect).HasFlag(MemoryAccessMode.Write) ||
                     arguments[index] is not TIR.Buffer buffer)
                 {

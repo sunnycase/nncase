@@ -19,13 +19,15 @@ internal readonly record struct MemoryByteRange(long Start, long End)
 internal readonly record struct EffectInfo(
     MemoryAccessMode Mode,
     TIR.NTT.BarrierScope Scope,
-    bool RequiresFullChipSynchronization)
+    bool RequiresFullChipSynchronization,
+    MemoryAccessDomain AccessDomain)
 {
     public EffectInfo Merge(EffectInfo other)
         => new(
             Mode | other.Mode,
             MemoryEffectAnalyzer.MergeScope(Scope, other.Scope),
-            RequiresFullChipSynchronization || other.RequiresFullChipSynchronization);
+            RequiresFullChipSynchronization || other.RequiresFullChipSynchronization,
+            MemoryEffectUtility.MergeAccessDomain(AccessDomain, other.AccessDomain));
 }
 
 internal readonly record struct ResolvedMemoryEffect(MemoryResource Resource, EffectInfo Effect);
@@ -429,7 +431,8 @@ internal sealed class MemoryEffectAnalyzer
                     new EffectInfo(
                         effect.Mode,
                         resource.Scope,
-                        effect.Scope == MemoryAccessScope.Chip));
+                        effect.Scope == MemoryAccessScope.Chip,
+                        effect.AccessDomain));
             });
 
         return effects;
@@ -873,6 +876,11 @@ internal static class SynchronizationRequirementInference
         ResolvedMemoryEffect producer,
         ResolvedMemoryEffect consumer)
     {
+        if (HasSameFixedBlockDomain(producer, consumer))
+        {
+            return SynchronizationRequirement.Block;
+        }
+
         var mergedScope = MemoryEffectAnalyzer.MergeScope(
             producer.Effect.Scope,
             consumer.Effect.Scope);
@@ -914,6 +922,12 @@ internal static class SynchronizationRequirementInference
             : null;
         return SynchronizationRequirement.FullChip(placement);
     }
+
+    private static bool HasSameFixedBlockDomain(
+        ResolvedMemoryEffect producer,
+        ResolvedMemoryEffect consumer)
+        => producer.Effect.AccessDomain.IsSameFixedBlock(consumer.Effect.AccessDomain) &&
+           producer.Resource.DistributedType?.Placement == consumer.Resource.DistributedType?.Placement;
 
     internal static bool TryInferRawAxisGroup(
         DistributedType? producer,

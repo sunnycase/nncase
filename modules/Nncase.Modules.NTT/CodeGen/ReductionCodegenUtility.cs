@@ -50,10 +50,11 @@ internal static class ReductionCodegenUtility
         }
 
         var operands = new List<ReductionAccumulatorOperand>();
+        var arguments = call.Arguments.ToArray();
         call.ParametersForeach((argument, parameter) =>
         {
             var effect = op is IOpMemoryEffectProvider provider
-                ? provider.GetMemoryEffect(parameter)
+                ? provider.GetMemoryEffect(parameter, arguments)
                 : parameter.MemoryEffect ?? MemoryEffect.None;
             if (effect.Kind == MemoryEffectKind.ReductionAccumulator)
             {

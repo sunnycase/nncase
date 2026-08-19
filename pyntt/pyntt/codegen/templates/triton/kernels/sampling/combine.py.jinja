@@ -23,11 +23,8 @@
     for batch in tl.static_range(0, {{ model["MaxBatchSize"] }}):
         active = (batch < {{ ctx["global_batch"] }}) & (tl.load({{ model["Active"] }} + batch) != 0)
         temperature = tl.load({{ model["Temperature"] }} + batch).to(tl.float32)
-        safe_temperature = tl.maximum(temperature, 1.0e-5)
-        top_p = tl.maximum(0.0, tl.minimum(1.0, tl.load({{ model["TopP"] }} + batch).to(tl.float32)))
-        top_k = tl.load({{ model["TopK"] }} + batch).to(tl.int32)
-        min_p = tl.maximum(0.0, tl.minimum(1.0, tl.load({{ model["MinP"] }} + batch).to(tl.float32)))
         requested_logprobs = tl.maximum(-1, tl.minimum({{ model["MaxLogprobs"] }}, tl.load({{ model["RequestedLogprobs"] }} + batch)))
+        plain_greedy = (temperature < 1.0e-5) & (requested_logprobs < 0)
         state_row = batch * {{ model["VocabSize"] }}
         summary_row = batch * {{ model["BlockCount"] }} * summary_slots
         local_summary = summary_row + shard_index * summary_slots
@@ -52,6 +49,24 @@
             )
             global_max = global_value_bits.to(tl.float32, bitcast=True)
             global_arg_token = (0xFFFFFFFF - global_inverse_token).to(tl.int32)
+        sampled_token = tl.where(active, global_arg_token, -1)
+        if plain_greedy:
+            if shard_index == 0:
+                if active:
+                    old_count = tl.load({{ model["OutputTokenCounts"] }} + state_row + sampled_token)
+                    tl.store({{ model["OutputTokenCounts"] }} + state_row + sampled_token, old_count + 1)
+                tl.store(sampled_ids_ptr + batch, sampled_token)
+                for output_slot in tl.static_range(0, {{ model["MaxLogprobs"] + 1 }}):
+                    tl.store(logprob_ids_ptr + batch * {{ model["MaxLogprobs"] + 1 }} + output_slot, -1)
+                    tl.store(logprobs_ptr + batch * {{ model["MaxLogprobs"] + 1 }} + output_slot, -float("inf"))
+                tl.store(ranks_ptr + batch, 0)
+                tl.store(counts_ptr + batch, 0)
+        else:
+{% filter indent(width=4, first=True) %}
+        safe_temperature = tl.maximum(temperature, 1.0e-5)
+        top_p = tl.maximum(0.0, tl.minimum(1.0, tl.load({{ model["TopP"] }} + batch).to(tl.float32)))
+        top_k = tl.load({{ model["TopK"] }} + batch).to(tl.int32)
+        min_p = tl.maximum(0.0, tl.minimum(1.0, tl.load({{ model["MinP"] }} + batch).to(tl.float32)))
         needs_global_broadcast = (temperature >= 1.0e-5) | (requested_logprobs >= 0)
         if needs_global_broadcast:
             if shard_index == 0:
@@ -384,6 +399,7 @@
             has_previous_top = 1
             previous_top_value = top_value
             previous_top_token = top_token
+{% endfilter %}
 {% endfilter %}
 {% endfilter %}
 

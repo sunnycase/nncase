@@ -110,7 +110,7 @@ public sealed class SelectTIRMicroKernelsPass : ModulePass
                     }
 
                     var parameter = kernelOp.Parameters[argumentIndex];
-                    var effect = kernelOp.GetMemoryEffect(parameter);
+                    var effect = kernelOp.GetMemoryEffect(parameter, semanticArguments);
                     if (MemoryEffectUtility.GetPhysicalBufferAccessMode(effect) != MemoryAccessMode.Read)
                     {
                         throw new InvalidOperationException(

@@ -14,7 +14,9 @@ public sealed partial class GatherReduceScatter : NTTKernelOp
 
     public DistributedType OutType { get; }
 
-    public override MemoryEffect GetMemoryEffect(ParameterInfo parameter)
+    public override MemoryEffect GetMemoryEffect(
+        ParameterInfo parameter,
+        IReadOnlyList<BaseExpr> arguments)
     {
         if (ReferenceEquals(parameter, Input))
         {
@@ -29,6 +31,6 @@ public sealed partial class GatherReduceScatter : NTTKernelOp
             return MemoryEffect.Write;
         }
 
-        return base.GetMemoryEffect(parameter);
+        return base.GetMemoryEffect(parameter, arguments);
     }
 }

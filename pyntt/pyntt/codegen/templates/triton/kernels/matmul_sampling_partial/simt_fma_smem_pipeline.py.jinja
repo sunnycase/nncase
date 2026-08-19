@@ -33,6 +33,8 @@
 {% set mm = ctx["matmul"] %}
 {% set sampling = model["Sampling"] %}
 {% set sctx = ctx["sampling"] %}
+{% set raw_logprobs = sampling["LogprobsMode"] in ("RawLogprobs", "RawLogits") %}
+{% set processed_logprobs = sampling["LogprobsMode"] in ("ProcessedLogprobs", "ProcessedLogits") %}
 {% set history_processor_flags = sampling["ProcessorFlagValues"]["RepetitionPenalty"] + sampling["ProcessorFlagValues"]["FrequencyPenalty"] + sampling["ProcessorFlagValues"]["PresencePenalty"] %}
 # generated from PyNTT algorithm triton.matmul_sampling_partial/simt_fma_smem_pipeline
 # {{ model["Comment"] }}; vocab={{ sampling["VocabSize"] }}, block_n={{ ctx["block_n"] }}, block_k={{ ctx["block_k"] }}, num_stages={{ ctx["num_stages"] }}
@@ -126,6 +128,13 @@ def {{ model["FunctionName"] }}__consumer(reader, {{ helper_parameters(model) }}
     )
     batch = 0
     active = tl.load({{ sampling["Active"] }}) != 0
+    temperature = tl.load({{ sampling["Temperature"] }}).to(tl.float32)
+    requested_logprobs = tl.load({{ sampling["RequestedLogprobs"] }}).to(tl.int32)
+{% if processed_logprobs %}
+    needs_processed_logits = (temperature >= 1.0e-5) | (requested_logprobs >= 0)
+{% else %}
+    needs_processed_logits = temperature >= 1.0e-5
+{% endif %}
     processor_flags = tl.load({{ sampling["ProcessorFlags"] }}).to(tl.uint32)
     frequency_penalty = 0.0
     if (processor_flags & {{ sampling["ProcessorFlagValues"]["FrequencyPenalty"] }}) != 0:
@@ -215,11 +224,13 @@ def {{ model["FunctionName"] }}__consumer(reader, {{ helper_parameters(model) }}
         ).to(tl.float32)
 {% endif %}
         raw = result.to({{ mm["OutputTritonDType"] }})
+{% if raw_logprobs %}
         tl.store(
             {{ access_pointer(mm, "Output", "logits_ptr", ctx["pipeline_output_access"]) }},
             raw,
-            mask={{ ctx["pipeline_output_mask"] }},
+            mask={{ ctx["pipeline_output_mask"] }} & (requested_logprobs >= 0),
         )
+{% endif %}
 
         local_token = pipeline_output_n
         global_token = ({{ sctx["global_token"] }}).to(tl.int32)
@@ -253,7 +264,7 @@ def {{ model["FunctionName"] }}__consumer(reader, {{ helper_parameters(model) }}
         tl.store(
             processed_ptr + {{ sctx["processed_offset"] }},
             value,
-            mask=token_mask,
+            mask=token_mask & needs_processed_logits,
         )
         value_bits = value.to(tl.uint32, bitcast=True)
         ordered_value = tl.where(

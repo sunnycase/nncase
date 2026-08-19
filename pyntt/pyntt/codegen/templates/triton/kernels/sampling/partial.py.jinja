@@ -1,6 +1,7 @@
 {% import "triton/kernels/_common.py.jinja" as common with context %}
 {% import "triton/kernels/_producer_consumer.py.jinja" as phases with context %}
 {% set ctx = sampling_context(model) %}
+{% set processed_logprobs = model["LogprobsMode"] in ("ProcessedLogprobs", "ProcessedLogits") %}
 {% set history_processor_flags = model["ProcessorFlagValues"]["RepetitionPenalty"] + model["ProcessorFlagValues"]["FrequencyPenalty"] + model["ProcessorFlagValues"]["PresencePenalty"] %}
 # generated from PyNTT Jinja sampling/partial.py.jinja
 # {{ model["Comment"] }}; vocab={{ model["VocabSize"] }}
@@ -13,6 +14,13 @@
 
     for batch in tl.static_range(0, {{ model["MaxBatchSize"] }}):
         active = (batch < {{ ctx["global_batch"] }}) & (tl.load({{ model["Active"] }} + batch) != 0)
+        temperature = tl.load({{ model["Temperature"] }} + batch).to(tl.float32)
+        requested_logprobs = tl.load({{ model["RequestedLogprobs"] }} + batch).to(tl.int32)
+{% if processed_logprobs %}
+        needs_processed_logits = (temperature >= 1.0e-5) | (requested_logprobs >= 0)
+{% else %}
+        needs_processed_logits = temperature >= 1.0e-5
+{% endif %}
         processor_flags = tl.load({{ model["ProcessorFlags"] }} + batch).to(tl.uint32)
         frequency_penalty = 0.0
         if (processor_flags & {{ model["ProcessorFlagValues"]["FrequencyPenalty"] }}) != 0:
@@ -58,7 +66,11 @@
             if (processor_flags & {{ model["ProcessorFlagValues"]["PresencePenalty"] }}) != 0:
                 value -= tl.where(output_count != 0.0, presence_penalty, 0.0)
             value = tl.where(token_mask & allowed & ~forbidden, value, -float("inf"))
-            tl.store(processed_ptr + {{ ctx["processed_offset"] }}, value, mask=token_mask)
+            tl.store(
+                processed_ptr + {{ ctx["processed_offset"] }},
+                value,
+                mask=token_mask & needs_processed_logits,
+            )
             value_bits = value.to(tl.uint32, bitcast=True)
             ordered_value = tl.where(
                 value < 0.0,

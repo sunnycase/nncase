@@ -90,6 +90,7 @@ public sealed class PyNTTTarget : NTTTarget
     {
         passManager.Add<FuseGatherReduceNormApplyPass>(Kind);
         passManager.Add<CanonicalizePackedQKVWeightsPass>(Kind);
+        passManager.Add<ForwardTerminalStoreDestinationsPass>(Kind);
         base.RegisterTIRPreBufferizePass(passManager, options);
     }
 

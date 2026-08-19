@@ -1293,6 +1293,8 @@ public sealed record PyNTTSamplingPartialTemplateModel(
     string Active,
     string ProcessorFlags,
     PyNTTSamplerProcessorFlagsTemplateModel ProcessorFlagValues,
+    string Temperature,
+    string RequestedLogprobs,
     string FrequencyPenalty,
     string PresencePenalty,
     string RepetitionPenalty,
@@ -1312,6 +1314,7 @@ public sealed record PyNTTSamplingPartialTemplateModel(
     int[] Hierarchy,
     int VocabSize,
     int MaxBatchSize,
+    string LogprobsMode,
     string Comment)
 {
     public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
