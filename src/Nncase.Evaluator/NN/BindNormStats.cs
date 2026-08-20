@@ -16,6 +16,18 @@ public sealed class BindNormStatsEvaluator :
     ITypeInferencer<BindNormStats>,
     ICostEvaluator<BindNormStats>
 {
+    public static bool IsCompatibleMaterializedStatsType(IRType expected, IRType stats)
+    {
+        if (Equals(expected, stats))
+        {
+            return true;
+        }
+
+        return expected is DistributedType { Partial: { Op: ReduceOp.Sum, Axes.Count: > 0 } } partial &&
+            stats is DistributedType { Partial: null } materialized &&
+            Equals(partial with { Partial = null }, materialized);
+    }
+
     public IValue Visit(IEvaluateContext context, BindNormStats target)
         => context.GetArgumentValue(target, BindNormStats.Stats);
 
@@ -31,10 +43,10 @@ public sealed class BindNormStatsEvaluator :
             return invalid;
         }
 
-        if (!Equals(expected, stats))
+        if (!IsCompatibleMaterializedStatsType(expected, stats))
         {
             return new InvalidType(
-                $"BindNormStats stats type {stats} must exactly match NormStats({input}) type {expected}.");
+                $"BindNormStats stats type {stats} must be the materialized NormStats({input}) type {expected}.");
         }
 
         if (stats is DistributedType distributed &&

@@ -56,6 +56,11 @@ public sealed partial class GatherReduceNormApply : NTTKernelOp
 
     public bool UseMean { get; }
 
+    /// <summary>
+    /// Gets a value indicating whether the normalization applies a bias term.
+    /// </summary>
+    public bool HasBias { get; }
+
     public override string DisplayProperty()
-        => $"Axis: {Axis}, Epsilon: {Epsilon}, UseMean: {UseMean}";
+        => $"Axis: {Axis}, Epsilon: {Epsilon}, UseMean: {UseMean}, HasBias: {HasBias}";
 }

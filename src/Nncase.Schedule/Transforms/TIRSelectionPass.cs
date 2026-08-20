@@ -130,6 +130,43 @@ public abstract class TIRSelectionPass : FunctionPass
             ? BufferLayoutAnnotation.RuntimeStrided
             : null;
 
+    /// <summary>
+    /// Creates the caller-owned storage bound to a PrimFunction output
+    /// parameter. The output ABI is authoritative for representations that
+    /// require more than one physical owner component.
+    /// </summary>
+    protected virtual Expr CreateCallerAllocatedPrimFunctionOutput(
+        TIR.PrimFunction primFunction,
+        BufferVar outputParameter)
+    {
+        if (outputParameter.LayoutAnnotation.DistributedStorageKind ==
+                DistributedBufferStorageKind.CompactPerOwner &&
+            outputParameter.CheckedType is DistributedType distributedType)
+        {
+            return T.CreateCompactPerOwnerBuffer(
+                distributedType,
+                out _,
+                $"{primFunction.Name}_{outputParameter.Name}_storage");
+        }
+
+        return outputParameter.CheckedType switch
+        {
+            DistributedType dt => IR.F.Buffer.Uninitialized(
+                dt.TensorType.DType,
+                TIR.MemoryLocation.Data,
+                dt.TensorType.Shape,
+                dt.AxisPolicies,
+                dt.Placement,
+                dt.Partial),
+            TensorType tt => IR.F.Buffer.Uninitialized(
+                tt.DType,
+                TIR.MemoryLocation.Data,
+                tt.Shape),
+            var type => throw new InvalidOperationException(
+                $"TIR selection caller-allocated output expects tensor type, got {type.GetType().Name}."),
+        };
+    }
+
     protected IRType GetArgumentType(BaseExpr argument)
     {
         return argument switch
@@ -151,22 +188,17 @@ public abstract class TIRSelectionPass : FunctionPass
         PrimFunction primFunction,
         IEnumerable<Call> callers)
     {
-        var outputBufferTypes = primFunction.GetAbiView().OutputParameters.Select(x => x.CheckedType).ToArray();
+        var outputParameters = primFunction.GetAbiView().OutputParameters.ToArray();
         foreach (var caller in callers)
         {
-            var outputAllocs = outputBufferTypes.Select(CreateDataUninitialized).ToArray();
+            var outputAllocs = outputParameters
+                .Select(outputParameter =>
+                    CreateCallerAllocatedPrimFunctionOutput(primFunction, outputParameter))
+                .ToArray();
             var newArgs = caller.Arguments.ToArray().Concat(outputAllocs).ToArray();
             var newCaller = caller.With(arguments: newArgs);
             ReplaceUtility.ReplaceAllUsesWith(caller, newCaller);
         }
-
-        static Expr CreateDataUninitialized(IRType type)
-            => type switch
-            {
-                DistributedType dt => IR.F.Buffer.Uninitialized(dt.TensorType.DType, TIR.MemoryLocation.Data, dt.TensorType.Shape, dt.AxisPolicies, dt.Placement, dt.Partial),
-                TensorType tt => IR.F.Buffer.Uninitialized(tt.DType, TIR.MemoryLocation.Data, tt.Shape),
-                _ => throw new InvalidOperationException($"TIR selection caller-allocated output expects tensor type, got {type.GetType().Name}."),
-            };
     }
 
     private sealed record SelectionResult(
@@ -744,13 +776,36 @@ public abstract class TIRSelectionPass : FunctionPass
 
             if (expr.CheckedType is TupleType tt)
             {
-                var fields = tt.Fields.AsValueEnumerable().Select(x => CreateBuffer(expr, x, memoryLocation)).ToArray();
+                var fields = tt.Fields.AsValueEnumerable()
+                    .Select((type, index) => IsRootTupleProjection(expr, index)
+                        ? CreateOutputBuffer(type)
+                        : CreateBuffer(expr, type, memoryLocation))
+                    .ToArray();
                 return new IR.Tuple(fields);
             }
             else
             {
                 return CreateBuffer(expr, expr.CheckedType, memoryLocation);
             }
+        }
+
+        private bool IsRootTupleProjection(Expr tupleValue, int fieldIndex)
+        {
+            if (IsProjection(VisitRoot, tupleValue, fieldIndex))
+            {
+                return true;
+            }
+
+            return VisitRoot is IR.Tuple rootTuple &&
+                rootTuple.Fields.AsValueEnumerable().Any(field =>
+                    IsProjection(field, tupleValue, fieldIndex));
+
+            static bool IsProjection(BaseExpr? value, Expr tupleValue, int fieldIndex)
+                => value is Call projection &&
+                projection.Target is IR.Tensors.GetItem &&
+                ReferenceEquals(projection[IR.Tensors.GetItem.Input], tupleValue) &&
+                projection[IR.Tensors.GetItem.Index] is DimConst index &&
+                index.Value == fieldIndex;
         }
 
         private BaseExpr CreateOutputBuffer(IRType type)

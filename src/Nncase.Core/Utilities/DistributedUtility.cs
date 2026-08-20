@@ -167,6 +167,26 @@ public static class DistributedUtility
         return true;
     }
 
+    /// <summary>
+    /// Gets whether every placement hierarchy axis participates in a tensor
+    /// split. Such a value has one distinct local component per placement
+    /// owner and can therefore use compact-per-owner physical storage.
+    /// </summary>
+    public static bool IsFullyShardedAcrossPlacement(DistributedType distributedType)
+    {
+        if (distributedType.Placement.Rank == 0)
+        {
+            return false;
+        }
+
+        var splitHierarchyAxes = distributedType.AxisPolicies
+            .OfType<SBPSplit>()
+            .SelectMany(split => split.HierarchyAxes)
+            .Distinct()
+            .Count();
+        return splitHierarchyAxes == distributedType.Placement.Rank;
+    }
+
     public static long GetDivisor(SBP policy, Placement placement)
     {
         if (policy is SBPSplit split)

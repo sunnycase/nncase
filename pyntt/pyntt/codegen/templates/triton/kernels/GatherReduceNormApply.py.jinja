@@ -10,14 +10,19 @@
 {{ common.mesh_coordinates(model["MeshAxes"]) }}
     input0 = {{ ptr(norm, "Input") }}
     scale0 = {{ ptr(norm, "Scale") }}
+{% if model["HasBias"] %}
     bias0 = {{ ptr(norm, "Bias") }}
+{% endif %}
     output = {{ ptr(norm, "Output") }}
     partial_reduction_width: tl.constexpr = min({{ model["TargetWorkerWidth"] }}, {{ partial["reduction_width_cap"] }})
+    consumer_thread_id = tl.inline_asm_elementwise("mov.u32 $0, %tid.x;", "=r", [], dtype=tl.int32, is_pure=True, pack=1)
+    active_consumer_threads = tl.minimum({{ model["NumWarps"] * model["TargetWorkerWidth"] }}, tl.cdiv({{ ctx["local_normalization_size"] }}, {{ model["TargetWorkerWidth"] }}) * {{ model["TargetWorkerWidth"] }})
+    if consumer_thread_id < active_consumer_threads:
 {% for axis in ctx["outer_axes"] %}
-{{ "    " * loop.index }}for outer_idx{{ axis }} in tl.range(0, {{ dim(ctx["logical_output_shape"][axis]) }}):
+{{ "    " * (loop.index + 1) }}for outer_idx{{ axis }} in tl.range(0, {{ dim(ctx["logical_output_shape"][axis]) }}):
 {% endfor %}
-{% set base = "    " * ((ctx["outer_axes"] | length) + 1) %}
-{% set body = "    " * ((ctx["outer_axes"] | length) + 2) %}
+{% set base = "    " * ((ctx["outer_axes"] | length) + 2) %}
+{% set body = "    " * ((ctx["outer_axes"] | length) + 3) %}
 {{ base }}inner_count = ({{ ctx["normalization_size"] }}) + 0.0
 {% for component in range(2 if norm["UseMean"] else 1) %}
 {{ base }}stats_acc{{ component }} = tl.full((), {{ partial["zero"] }}, {{ partial["accumulator_dtype"] }})
@@ -50,11 +55,15 @@
 {% endif %}
 {{ base }}variance = tl.maximum(variance, 0.0)
 {{ base }}inv_std = tl.rsqrt(variance + {{ pyrepr(norm["Epsilon"]) }})
-{% call(body) elementwise.iterate(ctx, ctx["prefix_depth"]) %}
+{% call(body) elementwise.iterate(ctx, ctx["prefix_depth"] + 1) %}
 {{ body }}value0 = tl.load({{ access_pointer(norm, "Input", "input0", ctx["input_access"]) }}, mask=mask, other=0.0).to(tl.float32)
 {{ body }}scale_value = tl.load({{ access_pointer(norm, "Scale", "scale0", ctx["scale_access"]) }}, mask=mask, other=0.0).to(tl.float32)
+{% if model["HasBias"] %}
 {{ body }}bias_value = tl.load({{ access_pointer(norm, "Bias", "bias0", ctx["bias_access"]) }}, mask=mask, other=0.0).to(tl.float32)
 {{ body }}result = ((value0 - mean_value) * inv_std * scale_value) + bias_value
+{% else %}
+{{ body }}result = (value0 - mean_value) * inv_std * scale_value
+{% endif %}
 {{ body }}tl.store({{ access_pointer(norm, "Output", "output", ctx["output_access"]) }}, result, mask=mask)
 {% endcall %}
 

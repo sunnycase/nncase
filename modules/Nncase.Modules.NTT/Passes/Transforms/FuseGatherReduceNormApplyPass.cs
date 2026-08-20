@@ -2,6 +2,7 @@
 // Licensed under the Apache license. See LICENSE file in the project root for full license information.
 
 using Nncase.IR;
+using Nncase.IR.Buffers;
 using Nncase.Passes.Mutators;
 using Nncase.TIR;
 using Nncase.Utilities;
@@ -160,9 +161,21 @@ public sealed class FuseGatherReduceNormApplyPass : ModulePass
                     gather.OutType,
                     normApply.Axis,
                     normApply.Epsilon,
-                    normApply.UseMean)
+                    normApply.UseMean,
+                    HasNonZeroBias((TIR.Buffer)normArguments[3]))
                 .InheritMetaData(normApplyCall);
             return true;
+        }
+
+        private static bool HasNonZeroBias(TIR.Buffer bias)
+        {
+            if (bias.MemSpan.Buffer.Start is not Call { Target: AddressOf } addressOf ||
+                addressOf[AddressOf.Input] is not TensorConst tensor)
+            {
+                return true;
+            }
+
+            return tensor.Value.BytesBuffer.IndexOfAnyExcept((byte)0) >= 0;
         }
     }
 }

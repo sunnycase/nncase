@@ -600,6 +600,7 @@ public sealed record PyNTTGatherReduceNormApplyTemplateModel(
     PyNTTPooledByteAddressTemplateModel PartialStatsAddress,
     int[] Hierarchy,
     int[] PartialAxes,
+    bool HasBias,
     string Comment)
 {
     public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();

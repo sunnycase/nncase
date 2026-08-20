@@ -29,6 +29,7 @@ public sealed class UnitTestFuseGatherReduceNormApplyPass : TestClassBase
         var rewritten = Assert.IsType<PrimFunction>(module.Entry);
         var fusedCall = Assert.Single(rewritten.Body.Fields.ToArray().OfType<Call>());
         var fused = Assert.IsType<Nncase.TIR.NTT.GatherReduceNormApply>(fusedCall.Target);
+        Assert.True(fused.HasBias);
         Assert.Equal(new[] { 0, 1 }, fused.InStatsType.Partial!.Axes.ToArray());
         Assert.DoesNotContain(
             ExprCollector.Collect(rewritten.Body).OfType<Call>(),
@@ -36,6 +37,23 @@ public sealed class UnitTestFuseGatherReduceNormApplyPass : TestClassBase
         Assert.DoesNotContain(
             fusedCall.Arguments.ToArray(),
             argument => ReferenceEquals(argument, broadcastStats));
+    }
+
+    [Fact]
+    public async Task TestElideConstantZeroBias()
+    {
+        var (function, _, _) = CreateFunction(
+            additionalStatsConsumer: false,
+            addInterveningNop: false,
+            zeroBias: true);
+        var module = new IRModule(function);
+
+        await new FuseGatherReduceNormApplyPass(PyNTTTarget.Kind).RunAsync(module, new());
+
+        var fusedCall = Assert.Single(
+            Assert.IsType<PrimFunction>(module.Entry).Body.Fields.ToArray().OfType<Call>());
+        var fused = Assert.IsType<Nncase.TIR.NTT.GatherReduceNormApply>(fusedCall.Target);
+        Assert.False(fused.HasBias);
     }
 
     [Fact]
@@ -62,7 +80,8 @@ public sealed class UnitTestFuseGatherReduceNormApplyPass : TestClassBase
 
     private static (PrimFunction Function, Nncase.TIR.Buffer PartialStats, Nncase.TIR.Buffer BroadcastStats) CreateFunction(
         bool additionalStatsConsumer,
-        bool addInterveningNop)
+        bool addInterveningNop,
+        bool zeroBias = false)
     {
         var placement = new Placement([4, 8], "yx", "bb");
         var statsTensorType = new TensorType(DataTypes.Float32, new[] { 1, 1, 1 });
@@ -93,7 +112,16 @@ public sealed class UnitTestFuseGatherReduceNormApplyPass : TestClassBase
             compactPerOwner: true);
         var input = CreateBuffer("input", DataTypes.Float32, 256, [1, 8], [8, 1]);
         var scale = CreateBuffer("scale", DataTypes.Float32, 288, [8], [1]);
-        var bias = CreateBuffer("bias", DataTypes.Float32, 320, [8], [1]);
+        Nncase.TIR.Buffer bias;
+        if (zeroBias)
+        {
+            T.AttachBuffer(new TensorConst(Tensor.From<float>(new float[8], [8])), out bias);
+        }
+        else
+        {
+            bias = CreateBuffer("bias", DataTypes.Float32, 320, [8], [1]);
+        }
+
         var output = CreateBuffer("output", DataTypes.Float32, 352, [1, 8], [8, 1]);
         var fields = new List<Expr>
         {

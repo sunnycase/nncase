@@ -68,7 +68,9 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
     {
         if (!isEntry &&
             _compileOptions.TargetOptions is PyNTTTargetOptions &&
-            type is DistributedType { Partial: not null } distributedType)
+            type is DistributedType distributedType &&
+            (distributedType.Partial is not null ||
+             (role == BufferVarRole.Output && DistributedUtility.IsFullyShardedAcrossPlacement(distributedType))))
         {
             (_, var strides) = TensorUtilities.GetTensorMaxSizeAndStridesExpr(
                 distributedType.TensorType,

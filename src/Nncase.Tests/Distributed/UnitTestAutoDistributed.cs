@@ -10,6 +10,7 @@ using System.Text.Json;
 using System.Threading.Tasks;
 using Nncase.Diagnostics;
 using Nncase.Evaluator.IR.NTT;
+using Nncase.Evaluator.NN;
 using Nncase.IR;
 using Nncase.IR.Math;
 using Nncase.IR.NN;
@@ -110,6 +111,142 @@ public sealed class UnitTestDistribAutoDistributed : TestClassBase
         var tuple = Assert.Single(tuples);
         Assert.Equal(producerSplitType, tuple.InputTypes[0]);
         Assert.Equal(producerSplitType, tuple.InputTypes[1]);
+    }
+
+    [Fact]
+    public void TestNormApplyCandidateProviderPreservesExactInputSplit()
+    {
+        var options = new PyNTTTargetOptions
+        {
+            HierarchyNames = "yx",
+            HierarchyLevels = "bb",
+            Hierarchies = [new[] { 4, 8 }],
+        };
+        CompileOptions.TargetOptions = options;
+        var inputTensorType = new TensorType(
+            new VectorType(DataTypes.BFloat16, [8]),
+            new RankedShape(1, 256));
+        var parameterTensorType = new TensorType(
+            new VectorType(DataTypes.BFloat16, [8]),
+            new RankedShape(256));
+        var placement = new Placement([4, 8], "yx", "bb");
+        var broadcastInputType = new DistributedType(inputTensorType, [SBP.B, SBP.B], placement);
+        var canonicalInputType = new DistributedType(
+            inputTensorType,
+            [SBP.B, SBP.SBlockCyclic([0, 1], 8)],
+            placement);
+        var exactInputType = new DistributedType(
+            inputTensorType,
+            [SBP.B, SBP.SBlockCyclic([0, 1], 1)],
+            placement);
+        var partialStatsType = Assert.IsType<DistributedType>(
+            NormStatsEvaluator.InferType(new NormStats(1, false), exactInputType));
+        var materializedStatsType = partialStatsType with { Partial = null };
+        var broadcastParameterType = new DistributedType(parameterTensorType, [SBP.B], placement);
+
+        var input = new Var("input", inputTensorType);
+        var stats = new Var("stats", partialStatsType.TensorType);
+        var scale = new Var("scale", parameterTensorType);
+        var bias = new Var("bias", parameterTensorType);
+        var sourceCall = IR.F.NN.NormApply(1, 1e-6f, input, stats, scale, bias, useMean: false);
+        var context = new DistributedCandidateContext(
+            CompileOptions,
+            options,
+            PyNTTTarget.Kind,
+            sourceCall,
+            [
+                new IRType[] { broadcastInputType, canonicalInputType, exactInputType },
+                new IRType[] { partialStatsType },
+                new IRType[] { broadcastParameterType },
+                new IRType[] { broadcastParameterType },
+            ]);
+        var provider = new NormApplyCandidateProvider();
+        var target = Assert.IsType<NormApply>(sourceCall.Target);
+
+        var returnTypes = provider.GetReturnCandidateTypes(
+            context,
+            target,
+            [broadcastInputType, canonicalInputType]);
+        Assert.Contains(exactInputType, returnTypes);
+        Assert.True(provider.TryGetInputTypeTuples(
+            context,
+            target,
+            exactInputType,
+            out var tuples));
+        var tuple = Assert.Single(tuples);
+        Assert.Equal(exactInputType, tuple.InputTypes[NormApply.Input.Index]);
+        Assert.Equal(materializedStatsType, tuple.InputTypes[NormApply.Stats.Index]);
+
+        var scaleType = Assert.IsType<DistributedType>(tuple.InputTypes[NormApply.Scale.Index]);
+        var biasType = Assert.IsType<DistributedType>(tuple.InputTypes[NormApply.Bias.Index]);
+        var expectedParameterPolicy = SBP.SBlockCyclic([0, 1], 1);
+        Assert.Equal(expectedParameterPolicy, Assert.Single(scaleType.AxisPolicies.ToArray()));
+        Assert.Equal(expectedParameterPolicy, Assert.Single(biasType.AxisPolicies.ToArray()));
+
+        var distributedCall = new Call(
+            target,
+            new Var("distributed_input", exactInputType),
+            new Var("materialized_stats", materializedStatsType),
+            new Var("distributed_scale", scaleType),
+            new Var("distributed_bias", biasType));
+        Assert.True(distributedCall.InferenceType());
+        Assert.Equal(exactInputType, distributedCall.CheckedType);
+    }
+
+    [Fact]
+    public void TestBindNormStatsCandidateAcceptsMaterializedPartialStats()
+    {
+        var options = new PyNTTTargetOptions
+        {
+            HierarchyNames = "yx",
+            HierarchyLevels = "bb",
+            Hierarchies = [new[] { 4, 8 }],
+        };
+        CompileOptions.TargetOptions = options;
+        var placement = new Placement([4, 8], "yx", "bb");
+        var inputTensorType = new TensorType(
+            new VectorType(DataTypes.BFloat16, [8]),
+            new RankedShape(1, 256));
+        var inputType = new DistributedType(
+            inputTensorType,
+            [SBP.B, SBP.SBlockCyclic([0, 1], 1)],
+            placement);
+        var normStats = new NormStats(1, false);
+        var partialStatsType = Assert.IsType<DistributedType>(
+            NormStatsEvaluator.InferType(normStats, inputType));
+        Assert.NotNull(partialStatsType.Partial);
+        var materializedStatsType = partialStatsType with { Partial = null };
+
+        var input = new Var("input", inputTensorType);
+        var stats = new Var("stats", partialStatsType.TensorType);
+        var sourceCall = Assert.IsType<Call>(IR.F.NN.BindNormStats(1, input, stats, false));
+        var context = new DistributedCandidateContext(
+            CompileOptions,
+            options,
+            PyNTTTarget.Kind,
+            sourceCall,
+            [
+                new IRType[] { inputType },
+                new IRType[] { materializedStatsType },
+            ]);
+        var provider = new BindNormStatsCandidateProvider();
+        var target = Assert.IsType<BindNormStats>(sourceCall.Target);
+
+        Assert.True(provider.TryGetInputTypeTuples(
+            context,
+            target,
+            materializedStatsType,
+            out var tuples));
+        var tuple = Assert.Single(tuples);
+        Assert.Equal(inputType, tuple.InputTypes[BindNormStats.Input.Index]);
+        Assert.Equal(materializedStatsType, tuple.InputTypes[BindNormStats.Stats.Index]);
+
+        var distributedCall = new Call(
+            target,
+            new Var("distributed_input", inputType),
+            new Var("materialized_stats", materializedStatsType));
+        Assert.True(distributedCall.InferenceType());
+        Assert.Equal(materializedStatsType, distributedCall.CheckedType);
     }
 
     [Fact]
@@ -512,6 +649,370 @@ public sealed class UnitTestDistribAutoDistributed : TestClassBase
             EqualityComparer<IRType>.Default.Equals(argument.CheckedType, parameter.CheckedType),
             $"Function call ABI mismatch: argument is {argument.CheckedType}, parameter is {parameter.CheckedType}.");
         Assert.DoesNotContain("Boxing(", CompilerServices.Print(rewrittenLayer.Body), System.StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void TestFunctionBoundarySelectsConsistentShardedSignature()
+    {
+        var options = new PyNTTTargetOptions
+        {
+            HierarchyNames = "yx",
+            HierarchyLevels = "bb",
+            Hierarchies = [new[] { 4, 8 }],
+        };
+        CompileOptions.TargetOptions = options;
+        var tensorType = new TensorType(DataTypes.Float32, [256]);
+        var placement = new Placement([4, 8], "yx", "bb");
+        var producerType = new DistributedType(
+            tensorType,
+            [SBP.SBlockCyclic([0, 1], 1)],
+            placement);
+        var producer = new TensorConst(
+            Tensor.FromScalar(1.0f, [256]),
+            producerType.AxisPolicies,
+            producerType.Placement);
+        var layerInput = new Var("layer_input", tensorType);
+        var layer = new Function("layer", IR.F.Math.Unary(UnaryOp.Abs, layerInput), [layerInput]);
+        Assert.True(layer.InferenceType());
+
+        var main = new Function("main", new Call(layer, producer), Array.Empty<Var>());
+        Assert.True(main.InferenceType());
+        var pass = new AutoDistributedPass(false, PyNTTTarget.Kind, CompileOptions);
+
+        var post = Assert.IsType<Function>(pass.RunAsync(main, new()).Result);
+
+        var layerCall = Assert.Single(
+            ExprCollector.Collect(post.Body).OfType<Call>().Where(call => call.Target is Function { Name: "layer" }));
+        var rewrittenLayer = Assert.IsType<Function>(layerCall.Target);
+        var rewrittenParameter = Assert.IsType<Var>(Assert.Single(rewrittenLayer.Parameters.ToArray()));
+        var parameterType = Assert.IsType<DistributedType>(rewrittenParameter.CheckedType);
+        Assert.Contains(parameterType.AxisPolicies, policy => policy is SBPSplit);
+        var argument = Assert.Single(layerCall.Arguments.ToArray());
+        Assert.Equal(parameterType, argument.CheckedType);
+        Assert.DoesNotContain(
+            ExprCollector.Collect(argument).OfType<Call>(),
+            call => call.Target is IR.Distributed.ShardedView { NewType: var targetType }
+                && EqualityComparer<IRType>.Default.Equals(call.Arguments[0].CheckedType, targetType));
+    }
+
+    [Fact]
+    public void TestFunctionBoundaryDemandPropagatesThroughWhereAndGather()
+    {
+        var options = new PyNTTTargetOptions
+        {
+            HierarchyNames = "yx",
+            HierarchyLevels = "bb",
+            Hierarchies = [new[] { 4, 8 }],
+        };
+        CompileOptions.TargetOptions = options;
+        var placement = new Placement([4, 8], "yx", "bb");
+        var outputTensorType = new TensorType(DataTypes.Float32, [1, 256]);
+        var exactType = new DistributedType(
+            outputTensorType,
+            [SBP.B, SBP.SBlockCyclic([0, 1], 1)],
+            placement);
+
+        var index = new Var("index", new TensorType(DataTypes.Int64, [1]));
+        var table = Tensor.FromScalar(1.0f, [64, 256]);
+        var gathered = IR.F.Tensors.Gather(table, 0, index);
+        var where = IR.F.Tensors.Where(
+            Tensor.FromScalar(true, [1, 1]),
+            Tensor.FromScalar(0.0f, [1, 1]),
+            gathered);
+        Assert.Equal(outputTensorType, where.CheckedType);
+
+        var layerInput = new Var("layer_input", outputTensorType);
+        var layer = new Function("layer", IR.F.Math.Unary(UnaryOp.Abs, layerInput), [layerInput]);
+        var exactProducer0 = new TensorConst(
+            Tensor.FromScalar(2.0f, [1, 256]),
+            exactType.AxisPolicies,
+            exactType.Placement);
+        var exactProducer1 = new TensorConst(
+            Tensor.FromScalar(3.0f, [1, 256]),
+            exactType.AxisPolicies,
+            exactType.Placement);
+        var whereLayer = new Call(layer, where);
+        var exactLayer0 = new Call(layer, exactProducer0);
+        var exactLayer1 = new Call(layer, exactProducer1);
+        var main = new Function(
+            "main",
+            IR.F.Math.Add(IR.F.Math.Add(whereLayer, exactLayer0), exactLayer1),
+            [index]);
+        Assert.True(main.InferenceType());
+
+        var post = Assert.IsType<Function>(
+            new AutoDistributedPass(false, PyNTTTarget.Kind, CompileOptions)
+                .RunAsync(main, new()).Result);
+
+        var layerCalls = ExprCollector.Collect(post.Body)
+            .OfType<Call>()
+            .Where(call => call.Target is Function { Name: "layer" })
+            .ToArray();
+        Assert.Equal(3, layerCalls.Length);
+        var rewrittenLayer = Assert.IsType<Function>(layerCalls[0].Target);
+        var parameter = Assert.IsType<Var>(Assert.Single(rewrittenLayer.Parameters.ToArray()));
+        Assert.Equal(exactType, parameter.CheckedType);
+        Assert.All(layerCalls, call => Assert.Equal(exactType, Assert.Single(call.Arguments.ToArray()).CheckedType));
+
+        var selectedWhere = Assert.Single(
+            ExprCollector.Collect(post.Body).OfType<Call>().Where(call => call.Target is IR.Tensors.Where));
+        Assert.Equal(exactType, selectedWhere.CheckedType);
+        var selectedGather = Assert.Single(
+            ExprCollector.Collect(selectedWhere).OfType<Call>().Where(call => call.Target is IR.Tensors.Gather));
+        Assert.Equal(exactType, selectedGather.CheckedType);
+        var whereLayerCall = Assert.Single(layerCalls.Where(call =>
+            ExprCollector.Collect(Assert.Single(call.Arguments.ToArray()))
+                .OfType<Call>()
+                .Any(argumentCall => argumentCall.Target is IR.Tensors.Where)));
+        Assert.Same(selectedWhere, Assert.Single(whereLayerCall.Arguments.ToArray()));
+    }
+
+    [Fact]
+    public void TestLateFunctionSignatureCandidateConnectsDerivedParameterUses()
+    {
+        var options = new PyNTTTargetOptions
+        {
+            HierarchyNames = "yx",
+            HierarchyLevels = "bb",
+            Hierarchies = [new[] { 4, 8 }],
+        };
+        CompileOptions.TargetOptions = options;
+        var lhsType = new TensorType(DataTypes.BFloat16, new RankedShape(1, 64));
+        var rhsType = new TensorType(
+            new VectorType(DataTypes.BFloat16, [8, 2, 8]),
+            new RankedShape(4, 256));
+        var layerLhs = new Var("layer_lhs", lhsType);
+        var layerRhs = new Var("layer_rhs", rhsType);
+        var packed = IR.F.NTT.PackedMatMul(
+            layerLhs,
+            layerRhs,
+            outDataType: DataTypes.BFloat16,
+            rhsLayout: PackedMatMulRhsLayout.KMajor);
+        var tensorType = Assert.IsType<TensorType>(packed.CheckedType);
+        var placement = new Placement([4, 8], "yx", "bb");
+        var exactType = new DistributedType(
+            tensorType,
+            [SBP.B, SBP.SBlockCyclic([0, 1], 1)],
+            placement);
+        var layerInput = new Var("layer_input", tensorType);
+        var layer = new Function(
+            "layer",
+            IR.F.NTT.PackedMatMulNormStats(
+                layerLhs,
+                layerRhs,
+                DataTypes.BFloat16,
+                PackedMatMulRhsLayout.KMajor,
+                axis: 1,
+                useMean: false,
+                addend: layerInput),
+            [layerLhs, layerRhs, layerInput]);
+        var mainLhs = new Var("main_lhs", lhsType);
+        var mainRhs = new Var("main_rhs", rhsType);
+        var broadcast = new TensorConst(
+            Tensor.FromScalar((BFloat16)1.0f, tensorType.Shape.ToValueArray()));
+        var exact = IR.F.NTT.PackedMatMul(
+            mainLhs,
+            mainRhs,
+            outDataType: DataTypes.BFloat16,
+            rhsLayout: PackedMatMulRhsLayout.KMajor);
+        var main = new Function(
+            "main",
+            new IR.Tuple(
+                new Call(layer, mainLhs, mainRhs, broadcast),
+                new Call(layer, mainLhs, mainRhs, exact),
+                new Call(layer, mainLhs, mainRhs, broadcast)),
+            [mainLhs, mainRhs]);
+        Assert.True(main.InferenceType());
+
+        var rewriter = new AutoDistributedRewriter(
+            CompileOptions,
+            options,
+            AutoDistributedPhase.Final,
+            PyNTTTarget.Kind);
+        var buildFunctionGraph = typeof(AutoDistributedRewriter).GetMethod(
+            "BuildFunctionSearchGraph",
+            BindingFlags.Instance | BindingFlags.NonPublic);
+        Assert.NotNull(buildFunctionGraph);
+        _ = buildFunctionGraph!.Invoke(rewriter, [layer, false]);
+        _ = buildFunctionGraph.Invoke(rewriter, [main, true]);
+        var graphField = typeof(AutoDistributedRewriter).GetField(
+            "_rootSearchGraph",
+            BindingFlags.Instance | BindingFlags.NonPublic);
+        var graph = Assert.IsType<DistributedSearchGraph>(graphField?.GetValue(rewriter));
+        var formalNodes = graph.Vertices.Where(node =>
+            node.Kind == SearchableNodeKind.FunctionParameter
+            && ReferenceEquals(node.OriginParameter, layerInput)).ToArray();
+        var exactFormal = formalNodes.SingleOrDefault(
+            node => EqualityComparer<IRType>.Default.Equals(node.IRType, exactType));
+        Assert.True(
+            exactFormal is not null,
+            $"Expected {exactType}, but formal candidates were:{Environment.NewLine}{string.Join(Environment.NewLine, formalNodes.Select(node => node.IRType))}");
+        var callNodes = graph.Vertices.Where(node =>
+            node.Kind == SearchableNodeKind.FunctionCall
+            && ReferenceEquals(node.Expr, layer)).ToArray();
+        Assert.NotEmpty(callNodes);
+
+        var exactCallCandidates = callNodes.Where(callNode =>
+            graph.TryGetOutEdges(callNode, out var callEdges)
+            && callEdges.Any(edge => edge.InputIndex == 2
+                && edge.Target.Kind == SearchableNodeKind.FunctionBoundaryAdapter
+                && EqualityComparer<IRType>.Default.Equals(edge.Target.IRType, exactType)
+                && graph.TryGetOutEdges(edge.Target, out var adapterEdges)
+                && adapterEdges.Any(adapterEdge => ReferenceEquals(adapterEdge.Target, exactFormal)))).ToArray();
+        Assert.NotEmpty(exactCallCandidates);
+
+        Assert.Contains(
+            graph.Vertices,
+            node => node.Kind == SearchableNodeKind.TypeAdapter
+                && ReferenceEquals(node.OriginParameter, exactFormal.OriginParameter)
+                && EqualityComparer<IRType>.Default.Equals(node.IRType, exactType)
+                && graph.TryGetOutEdges(node, out var edges)
+                && edges.Any(edge => ReferenceEquals(edge.Target, exactFormal)));
+    }
+
+    [Fact]
+    public void TestLateFunctionSignaturePropagatesThroughNormApplyProvider()
+    {
+        var options = new PyNTTTargetOptions
+        {
+            HierarchyNames = "yx",
+            HierarchyLevels = "bb",
+            Hierarchies = [new[] { 4, 8 }],
+        };
+        CompileOptions.TargetOptions = options;
+        var lhsType = new TensorType(DataTypes.BFloat16, new RankedShape(1, 64));
+        var rhsType = new TensorType(
+            new VectorType(DataTypes.BFloat16, [8, 2, 8]),
+            new RankedShape(4, 256));
+        var hiddenType = new TensorType(
+            new VectorType(DataTypes.BFloat16, [8]),
+            new RankedShape(1, 256));
+        var statsType = new TensorType(DataTypes.Float32, new RankedShape(1, 1, 1));
+        var parameterType = new TensorType(
+            new VectorType(DataTypes.BFloat16, [8]),
+            new RankedShape(256));
+        var placement = new Placement([4, 8], "yx", "bb");
+        var exactType = new DistributedType(
+            hiddenType,
+            [SBP.B, SBP.SBlockCyclic([0, 1], 1)],
+            placement);
+
+        var layerHidden = new Var("layer_hidden", hiddenType);
+        var layerStats = new Var("layer_stats", statsType);
+        var layerScale = new Var("layer_scale", parameterType);
+        var layerBias = new Var("layer_bias", parameterType);
+        var layer = new Function(
+            "layer",
+            IR.F.NN.NormApply(
+                axis: 1,
+                epsilon: 1e-6f,
+                layerHidden,
+                layerStats,
+                layerScale,
+                layerBias,
+                useMean: false),
+            [layerHidden, layerStats, layerScale, layerBias]);
+        Assert.True(layer.InferenceType());
+
+        var mainLhs = new Var("main_lhs", lhsType);
+        var mainRhs = new Var("main_rhs", rhsType);
+        var mainStats = new Var("main_stats", statsType);
+        var mainScale = new Var("main_scale", parameterType);
+        var mainBias = new Var("main_bias", parameterType);
+        var packed = IR.F.NTT.PackedMatMul(
+            mainLhs,
+            mainRhs,
+            outDataType: DataTypes.BFloat16,
+            rhsLayout: PackedMatMulRhsLayout.KMajor);
+        Assert.Equal(hiddenType, packed.CheckedType);
+        var main = new Function(
+            "main",
+            new Call(layer, packed, mainStats, mainScale, mainBias),
+            [mainLhs, mainRhs, mainStats, mainScale, mainBias]);
+        Assert.True(main.InferenceType());
+
+        var rewriter = new AutoDistributedRewriter(
+            CompileOptions,
+            options,
+            AutoDistributedPhase.Final,
+            PyNTTTarget.Kind);
+        var buildFunctionGraph = typeof(AutoDistributedRewriter).GetMethod(
+            "BuildFunctionSearchGraph",
+            BindingFlags.Instance | BindingFlags.NonPublic);
+        var propagateCandidateClosure = typeof(AutoDistributedRewriter).GetMethod(
+            "PropagateCandidateClosure",
+            BindingFlags.Instance | BindingFlags.NonPublic);
+        Assert.NotNull(buildFunctionGraph);
+        Assert.NotNull(propagateCandidateClosure);
+        _ = buildFunctionGraph!.Invoke(rewriter, [layer, false]);
+        _ = buildFunctionGraph.Invoke(rewriter, [main, true]);
+        _ = propagateCandidateClosure!.Invoke(rewriter, null);
+
+        var graphField = typeof(AutoDistributedRewriter).GetField(
+            "_rootSearchGraph",
+            BindingFlags.Instance | BindingFlags.NonPublic);
+        var graph = Assert.IsType<DistributedSearchGraph>(graphField?.GetValue(rewriter));
+        var exactNormApply = graph.Vertices.SingleOrDefault(node =>
+            node.Expr is NormApply
+            && EqualityComparer<IRType>.Default.Equals(node.IRType, exactType));
+        Assert.True(exactNormApply is not null, "The exact function signature must reach the NormApply candidate domain.");
+        Assert.True(graph.TryGetOutEdges(exactNormApply!, out var normApplyEdges));
+        var hiddenEdge = Assert.Single(normApplyEdges.Where(edge => edge.InputIndex == NormApply.Input.Index));
+        Assert.Equal(exactType, hiddenEdge.InputGraph.Vertices.First().IRType);
+        Assert.Contains(
+            hiddenEdge.InputGraph.Vertices,
+            node => node.Kind == SearchableNodeKind.TypeAdapter
+                && ReferenceEquals(node.OriginParameter, layerHidden));
+    }
+
+    [Fact]
+    public void TestFunctionBoundaryDoesNotForceBroadcastFromUpstreamGetItem()
+    {
+        var options = new PyNTTTargetOptions
+        {
+            HierarchyNames = "yx",
+            HierarchyLevels = "bb",
+            Hierarchies = [new[] { 4, 8 }],
+        };
+        CompileOptions.TargetOptions = options;
+        var tensorType = new TensorType(DataTypes.Float32, [65536]);
+        var placement = new Placement([4, 8], "yx", "bb");
+        var broadcastType = new DistributedType(tensorType, [SBP.B], placement);
+        var sourceValue = new TensorConst(
+            Tensor.FromScalar(1.0f, [65536]),
+            broadcastType.AxisPolicies,
+            broadcastType.Placement);
+        var source = new Function("source", new IR.Tuple(sourceValue), Array.Empty<Var>());
+        Assert.True(source.InferenceType());
+
+        var layerInput = new Var("layer_input", tensorType);
+        var layer = new Function("layer", IR.F.Math.Unary(UnaryOp.Abs, layerInput), [layerInput]);
+        Assert.True(layer.InferenceType());
+
+        BaseExpr value = IR.F.Tensors.GetItem(new Call(source), 0);
+        for (var index = 0; index < 8; index++)
+        {
+            value = new Call(layer, value);
+        }
+
+        var main = new Function("main", value, Array.Empty<Var>());
+        Assert.True(main.InferenceType());
+        var pass = new AutoDistributedPass(false, PyNTTTarget.Kind, CompileOptions);
+
+        var post = Assert.IsType<Function>(pass.RunAsync(main, new()).Result);
+
+        var layerCalls = ExprCollector.Collect(post.Body)
+            .OfType<Call>()
+            .Where(call => call.Target is Function { Name: "layer" })
+            .ToArray();
+        Assert.Equal(8, layerCalls.Length);
+        var rewrittenLayer = Assert.IsType<Function>(layerCalls[0].Target);
+        var rewrittenParameter = Assert.IsType<Var>(Assert.Single(rewrittenLayer.Parameters.ToArray()));
+        var parameterType = Assert.IsType<DistributedType>(rewrittenParameter.CheckedType);
+        Assert.Contains(parameterType.AxisPolicies, policy => policy is SBPSplit);
+        Assert.All(
+            layerCalls,
+            call => Assert.Equal(parameterType, Assert.Single(call.Arguments.ToArray()).CheckedType));
     }
 
     [Fact]

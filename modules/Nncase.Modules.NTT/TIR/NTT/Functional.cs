@@ -373,10 +373,11 @@ public partial class NTT
         DistributedType outStatsType,
         int axis,
         float epsilon,
-        bool useMean)
+        bool useMean,
+        bool hasBias)
     {
         return KernelCall(
-            new GatherReduceNormApply(inStatsType, outStatsType, axis, epsilon, useMean),
+            new GatherReduceNormApply(inStatsType, outStatsType, axis, epsilon, useMean, hasBias),
             partialStats,
             input,
             scale,

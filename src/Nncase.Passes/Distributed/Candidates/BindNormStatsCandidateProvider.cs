@@ -41,7 +41,9 @@ internal sealed class BindNormStatsCandidateProvider : DistributedCandidateProvi
 
         var normStats = new NormStats(target.Axis, target.UseMean);
         tuples = context.AvailableInputTypes[BindNormStats.Input.Index]
-            .Where(input => Equals(NormStatsEvaluator.InferType(normStats, input), returnType))
+            .Where(input => BindNormStatsEvaluator.IsCompatibleMaterializedStatsType(
+                NormStatsEvaluator.InferType(normStats, input),
+                returnType))
             .Select(input => new DistributedCandidateTuple(
                 [input, stats],
                 "materialized-norm-stats-binding"))

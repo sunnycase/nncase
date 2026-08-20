@@ -4,15 +4,34 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using Nncase.Evaluator.NN;
 using Nncase.IR;
 using Nncase.IR.Distributed;
 using Nncase.IR.NN;
-using Nncase.Utilities;
 
 namespace Nncase.Passes.Distributed;
 
 internal sealed class NormApplyCandidateProvider : DistributedCandidateProvider<NormApply>
 {
+    public override IReadOnlyList<IRType> GetReturnCandidateTypes(
+        DistributedCandidateContext context,
+        NormApply target,
+        IReadOnlyList<IRType> defaultReturnTypes)
+    {
+        if (context.AvailableInputTypes.Count != 4 ||
+            !TryGetSourceTensorType(context, NormApply.Input.Index, out var outputTensorType))
+        {
+            return defaultReturnTypes;
+        }
+
+        return defaultReturnTypes
+            .Concat(context.AvailableInputTypes[NormApply.Input.Index]
+                .OfType<DistributedType>()
+                .Where(input => !HasPartial(input) && input.TensorType == outputTensorType))
+            .Distinct()
+            .ToArray();
+    }
+
     public override bool TryGetInputTypeTuples(
         DistributedCandidateContext context,
         NormApply target,
@@ -23,18 +42,16 @@ internal sealed class NormApplyCandidateProvider : DistributedCandidateProvider<
         if (returnType is not DistributedType output
             || HasPartial(output)
             || output.TensorType.Shape is not RankedShape inputShape
-            || context.AvailableInputTypes.Count != 4)
+            || context.AvailableInputTypes.Count != 4
+            || !TryGetSourceTensorType(context, NormApply.Input.Index, out var inputTensorType)
+            || inputTensorType != output.TensorType
+            || !TryGetSourceTensorType(context, NormApply.Scale.Index, out var scaleTensorType)
+            || !TryGetSourceTensorType(context, NormApply.Bias.Index, out var biasTensorType))
         {
             return false;
         }
 
         var normalizedAxis = NormalizeAxis(target.Axis, inputShape.Rank);
-        var input = FindExact(context, NormApply.Input.Index, output);
-        if (input is null)
-        {
-            return true;
-        }
-
         var statsTensorTypes = GetCompatibleStatsTensorTypes(output.TensorType, target.Axis, target.UseMean);
         if (statsTensorTypes.Count == 0)
         {
@@ -48,11 +65,6 @@ internal sealed class NormApplyCandidateProvider : DistributedCandidateProvider<
             statsPolicies[i + 1] = i < normalizedAxis ? output.AxisPolicies[i] : SBP.B;
         }
 
-        if (!TryFindDistributed(context, NormApply.Stats.Index, statsTensorTypes, output.Placement, statsPolicies, out var stats))
-        {
-            return true;
-        }
-
         var parameterRank = inputShape.Rank - normalizedAxis;
         var parameterPolicies = new SBP[parameterRank];
         for (int i = 0; i < parameterRank; i++)
@@ -60,72 +72,35 @@ internal sealed class NormApplyCandidateProvider : DistributedCandidateProvider<
             parameterPolicies[i] = output.AxisPolicies[normalizedAxis + i];
         }
 
-        if (!TryFindDistributed(context, NormApply.Scale.Index, output.Placement, parameterPolicies, out var scale)
-            || !TryFindDistributed(context, NormApply.Bias.Index, output.Placement, parameterPolicies, out var bias))
-        {
-            return true;
-        }
-
-        tuples =
-        [
-            new DistributedCandidateTuple(
-                [input, stats, scale, bias],
-                "norm-apply-output-sbp")
-        ];
-        return true;
-    }
-
-    private static IRType? FindExact(DistributedCandidateContext context, int index, IRType type)
-        => context.AvailableInputTypes[index].FirstOrDefault(candidate => candidate == type);
-
-    private static bool TryFindDistributed(
-        DistributedCandidateContext context,
-        int index,
-        Placement placement,
-        IReadOnlyList<SBP> policies,
-        out IRType result)
-    {
-        result = context.AvailableInputTypes[index].FirstOrDefault(candidate =>
-            candidate is DistributedType distributed
-            && distributed.Placement == placement
-            && !HasPartial(distributed)
-            && SamePolicies(distributed.AxisPolicies, policies))!;
-        return result is not null;
-    }
-
-    private static bool TryFindDistributed(
-        DistributedCandidateContext context,
-        int index,
-        IReadOnlyList<TensorType> tensorTypes,
-        Placement placement,
-        IReadOnlyList<SBP> policies,
-        out IRType result)
-    {
-        result = context.AvailableInputTypes[index].FirstOrDefault(candidate =>
-            candidate is DistributedType distributed
-            && tensorTypes.Any(tensorType => distributed.TensorType == tensorType)
-            && distributed.Placement == placement
-            && !HasPartial(distributed)
-            && SamePolicies(distributed.AxisPolicies, policies))!;
-        return result is not null;
-    }
-
-    private static bool SamePolicies(IReadOnlyList<SBP> lhs, IReadOnlyList<SBP> rhs)
-    {
-        if (lhs.Count != rhs.Count)
-        {
-            return false;
-        }
-
-        for (int i = 0; i < lhs.Count; i++)
-        {
-            if (!DistributedUtility.IsSamePolicy(lhs[i], rhs[i], checkGranularity: false))
+        tuples = statsTensorTypes
+            .Select(statsTensorType =>
             {
-                return false;
-            }
-        }
-
+                var stats = new DistributedType(statsTensorType, statsPolicies, output.Placement);
+                var scale = new DistributedType(scaleTensorType, parameterPolicies, output.Placement);
+                var bias = new DistributedType(biasTensorType, parameterPolicies, output.Placement);
+                return (Stats: stats, Scale: scale, Bias: bias);
+            })
+            .Where(arguments =>
+                NormApplyEvaluator.InferType(target, output, arguments.Stats, arguments.Scale, arguments.Bias) == output)
+            .Select(arguments => new DistributedCandidateTuple(
+                [output, arguments.Stats, arguments.Scale, arguments.Bias],
+                "norm-apply-preserve-input-sbp"))
+            .ToArray();
         return true;
+    }
+
+    private static bool TryGetSourceTensorType(
+        DistributedCandidateContext context,
+        int index,
+        out TensorType tensorType)
+    {
+        tensorType = context.SourceCall.Arguments[index].CheckedType switch
+        {
+            TensorType value => value,
+            DistributedType value => value.TensorType,
+            _ => null!,
+        };
+        return tensorType is not null;
     }
 
     private static bool HasPartial(DistributedType distributedType)

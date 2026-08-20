@@ -6887,6 +6887,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 GetPooledByteAddressTemplateModel(partialStatsRef),
                 hierarchy,
                 partialAxes,
+                gatherReduceNormApply.HasBias,
                 $"{partialStats.Name}, {input.Name}, {scale.Name}, {bias.Name} -> {output.Name}");
             _attrs["op"] = gatherReduceNormApply.UseMean ? "gather_reduce_norm_apply" : "gather_reduce_rms_norm_apply";
             _attrs["dtype"] = normApplyModel.OutputDType;

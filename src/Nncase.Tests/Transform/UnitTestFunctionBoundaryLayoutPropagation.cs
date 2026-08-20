@@ -8,6 +8,7 @@ using Nncase.CostModel;
 using Nncase.IR;
 using Nncase.IR.Distributed;
 using Nncase.Passes;
+using Nncase.Passes.Rules.ShapeBucket;
 using Nncase.Passes.Transforms;
 using Nncase.Tests.TestFixture;
 using Nncase.TIR;
@@ -561,6 +562,18 @@ public sealed class UnitTestFunctionBoundaryLayoutPropagation : TestClassBase
 
         var calleeWrapper = Assert.Single(module.Functions.OfType<PrimFunctionWrapper>());
         var calleeAbi = calleeWrapper.Target.GetAbiView();
+        var valueResult = calleeAbi.Results[0];
+        var valueOutput = Assert.IsType<BufferVar>(valueResult.Storage);
+        Assert.Equal(
+            DistributedBufferStorageKind.CompactPerOwner,
+            valueOutput.LayoutAnnotation.DistributedStorageKind);
+        var valueView = Assert.IsType<TIR.Buffer>(valueResult.Value);
+        Assert.Equal(DistributedBufferStorageKind.CompactPerOwner, valueView.DistributedStorageKind);
+        Assert.Equal(MemoryLocation.Output, valueView.MemSpan.Buffer.Location);
+        Assert.Equal(
+            valueView.MemSpan.Size.FixedValue * 32,
+            valueView.MemSpan.Buffer.Size.FixedValue);
+
         var statsResult = calleeAbi.Results[1];
         var statsOutput = Assert.IsType<BufferVar>(statsResult.Storage);
         Assert.Equal(
@@ -578,6 +591,16 @@ public sealed class UnitTestFunctionBoundaryLayoutPropagation : TestClassBase
             ExprCollector.Collect(mainPrim.Body)
                 .OfType<Call>()
                 .Where(call => ReferenceEquals(call.Target, calleeWrapper.Target)));
+        var valueParameterIndex = Array.FindIndex(
+            calleeWrapper.Target.Parameters.ToArray(),
+            parameter => ReferenceEquals(parameter, valueOutput));
+        var callerValue = Assert.IsType<TIR.Buffer>(selectedCall.Arguments[valueParameterIndex]);
+        Assert.Equal(MemoryLocation.ChipLocalData, callerValue.MemSpan.Buffer.Location);
+        Assert.Equal(DistributedBufferStorageKind.CompactPerOwner, callerValue.DistributedStorageKind);
+        Assert.Equal(
+            callerValue.MemSpan.Size.FixedValue * 32,
+            callerValue.MemSpan.Buffer.Size.FixedValue);
+
         var statsParameterIndex = Array.FindIndex(
             calleeWrapper.Target.Parameters.ToArray(),
             parameter => ReferenceEquals(parameter, statsOutput));
@@ -587,6 +610,138 @@ public sealed class UnitTestFunctionBoundaryLayoutPropagation : TestClassBase
         Assert.Equal(
             callerStats.MemSpan.Size.FixedValue * 32,
             callerStats.MemSpan.Buffer.Size.FixedValue);
+    }
+
+    [Fact]
+    public async Task TestTIRSelectionPromotesFullyShardedOutputAsCompactPerOwnerStorage()
+    {
+        CompileOptions.TargetOptions = new Nncase.Targets.PyNTTTargetOptions();
+        var placement = new Placement([4, 8], "yx", "bb");
+        var distributedType = new DistributedType(
+            new TensorType(DataTypes.BFloat16, new long[] { 1, 64 }),
+            [SBP.B, SBP.SBlockCyclic([0, 1], 1)],
+            placement);
+        var calleeInput = new Var("callee_input", distributedType);
+        var callee = new Function(
+            "callee",
+            IR.F.Math.Unary(
+                UnaryOp.Neg,
+                IR.F.Math.Unary(UnaryOp.Abs, calleeInput)),
+            calleeInput);
+        Assert.True(callee.InferenceType());
+
+        var mainInput = new Var("main_input", distributedType);
+        var calleeCall = new Call(callee, mainInput);
+        var main = new Function(
+            "main",
+            IR.F.Distributed.Boxing(calleeCall, distributedType.TensorType),
+            mainInput);
+        Assert.True(main.InferenceType());
+
+        var module = new IRModule(main);
+        module.Add(callee);
+        var passManager = CompileSession.CreatePassManager("TIRSelectionFullyShardedOutput");
+        passManager.Add<NTTTIRSelectionPass>();
+        await passManager.RunAsync(module);
+
+        var calleeWrapper = Assert.Single(module.Functions.OfType<PrimFunctionWrapper>());
+        var calleeAbi = calleeWrapper.Target.GetAbiView();
+        var input = Assert.Single(calleeAbi.Inputs.OfType<BufferVar>());
+        Assert.Equal(
+            DistributedBufferStorageKind.CompactLocal,
+            input.LayoutAnnotation.DistributedStorageKind);
+        var output = Assert.Single(calleeAbi.OutputParameters);
+        Assert.Equal(
+            DistributedBufferStorageKind.CompactPerOwner,
+            output.LayoutAnnotation.DistributedStorageKind);
+
+        var mainPrim = Assert.IsType<PrimFunction>(module.Entry);
+        var selectedCall = Assert.Single(
+            ExprCollector.Collect(mainPrim.Body)
+                .OfType<Call>()
+                .Where(call => ReferenceEquals(call.Target, calleeWrapper.Target)));
+        var outputParameterIndex = Array.FindIndex(
+            calleeWrapper.Target.Parameters.ToArray(),
+            parameter => ReferenceEquals(parameter, output));
+        var callerOutput = Assert.IsType<TIR.Buffer>(selectedCall.Arguments[outputParameterIndex]);
+        Assert.Equal(MemoryLocation.ChipLocalData, callerOutput.MemSpan.Buffer.Location);
+        Assert.Equal(DistributedBufferStorageKind.CompactPerOwner, callerOutput.DistributedStorageKind);
+        Assert.Equal(
+            callerOutput.MemSpan.Size.FixedValue * 32,
+            callerOutput.MemSpan.Buffer.Size.FixedValue);
+
+        var ordinaryIntermediates = ExprCollector.Collect(calleeWrapper.Target.Body)
+            .OfType<TIR.Buffer>()
+            .Where(buffer => buffer.MemSpan.Buffer.Location == MemoryLocation.Data)
+            .ToArray();
+        Assert.NotEmpty(ordinaryIntermediates);
+        Assert.All(
+            ordinaryIntermediates,
+            buffer => Assert.Equal(
+                DistributedBufferStorageKind.CompactLocal,
+                buffer.DistributedStorageKind));
+    }
+
+    [Fact]
+    public async Task TestTIRLayoutPropagationUnifiesRepeatedFullyShardedCallStorage()
+    {
+        CompileOptions.TargetOptions = new Nncase.Targets.PyNTTTargetOptions();
+        var placement = new Placement([4, 8], "yx", "bb");
+        var distributedType = new DistributedType(
+            new TensorType(DataTypes.BFloat16, new long[] { 1, 64 }),
+            [SBP.B, SBP.SBlockCyclic([0, 1], 1)],
+            placement);
+        var calleeInput = new Var("callee_input", distributedType);
+        var callee = new Function(
+            "callee",
+            IR.F.Math.Unary(UnaryOp.Neg, calleeInput),
+            calleeInput);
+        Assert.True(callee.InferenceType());
+
+        var mainInput = new Var("main_input", distributedType);
+        var seed = IR.F.Math.Unary(UnaryOp.Abs, mainInput);
+        var call0 = new Call(callee, seed);
+        var call1 = new Call(callee, call0);
+        var main = new Function(
+            "main",
+            IR.F.Distributed.Boxing(call1, distributedType.TensorType),
+            mainInput);
+        Assert.True(main.InferenceType());
+
+        var module = new IRModule(main);
+        module.Add(callee);
+        var passManager = CompileSession.CreatePassManager("TIRLayoutPropagationFullyShardedCalls");
+        passManager.Add<NTTTIRSelectionPass>();
+        passManager.Add<AddFunctionToModule>();
+        passManager.Add<RemoveFunctionWrapperPass>();
+        passManager.Add<PropagatePrimFunctionBufferLayoutsPass>();
+        passManager.Add<SpecializePrimFunctionBufferLayoutsPass>();
+        await passManager.RunAsync(module);
+
+        var mainPrim = Assert.IsType<PrimFunction>(module.Entry);
+        var calleePrim = Assert.Single(
+            module.Functions.OfType<PrimFunction>().Where(function =>
+                !ReferenceEquals(function, mainPrim)));
+        Assert.DoesNotContain("_layout_", calleePrim.Name, StringComparison.Ordinal);
+        var calls = ExprCollector.Collect(mainPrim.Body)
+            .OfType<Call>()
+            .Where(call => ReferenceEquals(call.Target, calleePrim))
+            .ToArray();
+        Assert.Equal(2, calls.Length);
+
+        var firstInput = Assert.IsType<TIR.Buffer>(calls[0].Arguments[0]);
+        Assert.Equal(MemoryLocation.ChipLocalData, firstInput.MemSpan.Buffer.Location);
+        Assert.Equal(
+            DistributedBufferStorageKind.CompactPerOwner,
+            firstInput.DistributedStorageKind);
+        Assert.Equal(
+            firstInput.MemSpan.Size.FixedValue * 32,
+            firstInput.MemSpan.Buffer.Size.FixedValue);
+        Assert.All(
+            calls,
+            call => Assert.Equal(
+                DistributedBufferStorageKind.CompactPerOwner,
+                Assert.IsType<TIR.Buffer>(call.Arguments[0]).DistributedStorageKind));
     }
 
     [Fact]

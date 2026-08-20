@@ -3505,6 +3505,13 @@ def _flatten_coordinates(indices: tuple[str, ...], shape: tuple[int, ...]) -> st
     return _join_index_terms(list(reversed(terms)))
 
 
+def _coordinate_tile_shape(
+    physical_tile_extent: str, lane_shape: tuple[int, ...] | list[int]
+) -> str:
+    tile_extents = (physical_tile_extent,) + tuple(str(value) for value in lane_shape)
+    return f"({', '.join(tile_extents)}{',' if len(tile_extents) == 1 else ''})"
+
+
 def _coordinate_iteration_context(
     tensor_shape: list[Any],
     tensor_strides: list[Any],
@@ -3554,8 +3561,6 @@ def _coordinate_iteration_context(
     physical_tile_extent = (
         "block_size" if lane_count == 1 else f"(block_size // {lane_count})"
     )
-    tile_extents = (physical_tile_extent,) + tuple(str(value) for value in lanes)
-    tile_shape = f"({', '.join(tile_extents)}{',' if len(tile_extents) == 1 else ''})"
     major_reshape = "" if not lanes else "[:, " + ", ".join("None" for _ in lanes) + "]"
     lane_reshapes = []
     for axis in range(len(lanes)):
@@ -3576,7 +3581,7 @@ def _coordinate_iteration_context(
         "major_variable": major_variable,
         "tensor_coordinates": tensor_coordinates,
         "tensor_shape": tuple(tensor_shape),
-        "tile_shape": tile_shape,
+        "tile_shape": _coordinate_tile_shape(physical_tile_extent, lanes),
     }
 
 
@@ -6904,6 +6909,7 @@ def _norm_apply_template_context(model: dict[str, Any]) -> dict[str, Any]:
     context.update(
         {
             "logical_output_shape": logical_output_shape,
+            "local_normalization_size": _product(logical_output_shape[axis:]),
             "normalization_size": _product(logical_input_global_shape[axis:]),
             "outer_axes": outer_axes,
             "prefix_depth": len(outer_axes),
@@ -7793,14 +7799,9 @@ def _reshard_template_context(model: dict[str, Any]) -> dict[str, Any]:
             "PyNTT Reshard vector lane metadata is inconsistent: "
             f"shape={context['lane_shape']}, count={model['VectorLaneCount']}"
         )
-    if input_partial_mesh_axes:
-        partial_tile_extents = ("elementwise_physical_tile_width",) + tuple(
-            str(value) for value in context["lane_shape"]
-        )
-        context["tile_shape"] = (
-            f"({', '.join(partial_tile_extents)}"
-            f"{',' if len(partial_tile_extents) == 1 else ''})"
-        )
+    context["tile_shape"] = _coordinate_tile_shape(
+        "elementwise_physical_tile_width", context["lane_shape"]
+    )
     context["global_coordinates"] = tuple(
         _local_to_global_coordinate(
             context["tensor_coordinates"][axis],

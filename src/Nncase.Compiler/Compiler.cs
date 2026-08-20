@@ -382,6 +382,8 @@ public class Compiler : ICompiler
 
         passManager.AddWithName<RemoveFunctionWrapperPass>("RemoveFunctionWrapper");
 
+        passManager.Add<PropagatePrimFunctionBufferLayoutsPass>();
+
         passManager.Add<SpecializePrimFunctionBufferLayoutsPass>();
 
         passManager.Add<RemoveUnusedFunctions>();

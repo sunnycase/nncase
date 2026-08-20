@@ -977,6 +977,8 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         Assert.Contains("global_shape=(16, 16, 20)", generatedKernelsPy, StringComparison.Ordinal);
         Assert.Contains("input_tile_shape=(2, 16, 5)", generatedKernelsPy, StringComparison.Ordinal);
         Assert.Contains("output_local_shape=(16, 16, 20)", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("(elementwise_physical_tile_width, 8)", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.DoesNotContain("((block_size // 8), 8)", generatedKernelsPy, StringComparison.Ordinal);
         AssertGeneratedModelRuns(
             outputDirectory,
             "x = ((torch.arange(16 * 16 * 160, dtype=torch.float32, device='cuda').reshape(16, 16, 160) - 127) * 0.001953125).to(torch.bfloat16)",
@@ -4362,8 +4364,10 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
             "torch.testing.assert_close(output, x * 4, rtol=0, atol=0)");
     }
 
-    [Fact]
-    public void TestPyNTTGatherReduceNormApplyRun()
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void TestPyNTTGatherReduceNormApplyRun(bool hasBias)
     {
         var targetOptions = Assert.IsType<PyNTTTargetOptions>(CompileOptions.TargetOptions);
         targetOptions.HierarchyNames = "b";
@@ -4454,7 +4458,8 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
                     broadcastStatsType,
                     1,
                     1e-5f,
-                    useMean: false),
+                    useMean: false,
+                    hasBias: hasBias),
                 TIR.F.NTT.TensorStore(outputBuffer, output, activationDistributedType.AxisPolicies, placement)),
             new TIR.Return(new Expr[] { output }),
             new IVar[] { input, scale, bias, output })
@@ -4466,18 +4471,20 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
             },
         };
 
-        var outputDirectory = GeneratePyNTTModelDirectory("generated_gather_reduce_norm_apply_model", main);
+        var outputDirectory = GeneratePyNTTModelDirectory($"generated_gather_reduce_norm_apply_{hasBias}_model", main);
         RenderGeneratedKernels(outputDirectory);
         var generatedKernelsPy = File.ReadAllText(Path.Join(outputDirectory, "generated_kernels.py"));
         Assert.Contains("generated from PyNTT Jinja GatherReduceNormApply.py.jinja", generatedKernelsPy, StringComparison.Ordinal);
         Assert.Contains("partial_reduction_width: tl.constexpr = min(32, 4)", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("consumer_thread_id < active_consumer_threads", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Equal(hasBias, generatedKernelsPy.Contains("bias_value = tl.load", StringComparison.Ordinal));
         Assert.DoesNotContain("reshard_tile_scatter", generatedKernelsPy, StringComparison.Ordinal);
         AssertGeneratedModelRuns(
             outputDirectory,
             "input = (torch.arange(64, dtype=torch.float32, device='cuda').reshape(1, 64) - 17) * 0.03125",
             "scale = 1.0 + torch.arange(64, dtype=torch.float32, device='cuda') * 0.001",
             "bias = torch.arange(64, dtype=torch.float32, device='cuda') * -0.0005",
-            "expect = input * torch.rsqrt(torch.mean(input * input, dim=1, keepdim=True) + 1e-5) * scale + bias",
+            $"expect = input * torch.rsqrt(torch.mean(input * input, dim=1, keepdim=True) + 1e-5) * scale{(hasBias ? " + bias" : string.Empty)}",
             "output = module(input, scale, bias)",
             "torch.testing.assert_close(output, expect, rtol=1e-5, atol=1e-5)");
     }

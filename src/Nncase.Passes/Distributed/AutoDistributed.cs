@@ -335,7 +335,8 @@ internal sealed class SearchableNode
         bool isBidirect = false,
         SearchableNodeKind kind = SearchableNodeKind.Normal,
         DistributedReshardSourceKind? sourceKind = null,
-        DistributedReshardUsageKind? reshardUsageKind = null)
+        DistributedReshardUsageKind? reshardUsageKind = null,
+        IVar? originParameter = null)
     {
         Expr = expr;
         IRType = type;
@@ -348,6 +349,10 @@ internal sealed class SearchableNode
                 : expr is TensorConst
                     ? DistributedReshardSourceKind.Constant
                     : DistributedReshardSourceKind.Internal);
+        OriginParameter = originParameter ??
+            (SourceKind == DistributedReshardSourceKind.FunctionParameter && expr is IVar parameter
+                ? parameter
+                : null);
     }
 
     public BaseExpr Expr { get; }
@@ -361,6 +366,8 @@ internal sealed class SearchableNode
     public DistributedReshardSourceKind SourceKind { get; }
 
     public DistributedReshardUsageKind? ReshardUsageKind { get; }
+
+    public IVar? OriginParameter { get; }
 }
 
 internal sealed record CrossEdge : IEdge<SearchableNode>
@@ -701,6 +708,255 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         IReadOnlyList<CandidateInvocation> Invocations,
         bool IsExhaustive);
 
+    private sealed class CandidateInvocationIdentity : IEquatable<CandidateInvocationIdentity>
+    {
+        private readonly Expr _target;
+        private readonly IRType? _expectedReturnType;
+        private readonly DistributedSearchGraph[] _buckets;
+        private readonly int _hashCode;
+
+        public CandidateInvocationIdentity(CandidateInvocation invocation)
+        {
+            _target = invocation.Target;
+            _expectedReturnType = invocation.ExpectedReturnType;
+            _buckets = invocation.Buckets;
+
+            HashCode hash = default;
+            hash.Add(RuntimeHelpers.GetHashCode(_target));
+            hash.Add(_expectedReturnType);
+            foreach (var bucket in _buckets)
+            {
+                hash.Add(RuntimeHelpers.GetHashCode(bucket));
+            }
+
+            _hashCode = hash.ToHashCode();
+        }
+
+        public bool Equals(CandidateInvocationIdentity? other)
+        {
+            if (other is null
+                || !ReferenceEquals(_target, other._target)
+                || !EqualityComparer<IRType?>.Default.Equals(_expectedReturnType, other._expectedReturnType)
+                || _buckets.Length != other._buckets.Length)
+            {
+                return false;
+            }
+
+            for (var index = 0; index < _buckets.Length; index++)
+            {
+                if (!ReferenceEquals(_buckets[index], other._buckets[index]))
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        public override bool Equals(object? obj) => Equals(obj as CandidateInvocationIdentity);
+
+        public override int GetHashCode() => _hashCode;
+    }
+
+    private sealed class BucketCombinationIdentity : IEquatable<BucketCombinationIdentity>
+    {
+        private readonly DistributedSearchGraph[] _buckets;
+        private readonly int _hashCode;
+
+        public BucketCombinationIdentity(IReadOnlyList<DistributedSearchGraph> buckets)
+        {
+            _buckets = buckets.ToArray();
+            HashCode hash = default;
+            foreach (var bucket in _buckets)
+            {
+                hash.Add(RuntimeHelpers.GetHashCode(bucket));
+            }
+
+            _hashCode = hash.ToHashCode();
+        }
+
+        public bool Equals(BucketCombinationIdentity? other)
+        {
+            if (other is null || _buckets.Length != other._buckets.Length)
+            {
+                return false;
+            }
+
+            for (var index = 0; index < _buckets.Length; index++)
+            {
+                if (!ReferenceEquals(_buckets[index], other._buckets[index]))
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        public override bool Equals(object? obj) => Equals(obj as BucketCombinationIdentity);
+
+        public override int GetHashCode() => _hashCode;
+    }
+
+    private sealed class OperationCandidateSite
+    {
+        public OperationCandidateSite(
+            Call sourceCall,
+            bool isSupported,
+            IReadOnlyList<DistributedSearchGraph> argumentClusters,
+            DistributedSearchGraph callCluster,
+            Function function)
+        {
+            SourceCall = sourceCall;
+            IsSupported = isSupported;
+            ArgumentClusters = argumentClusters;
+            CallCluster = callCluster;
+            Function = function;
+        }
+
+        public Call SourceCall { get; }
+
+        public bool IsSupported { get; }
+
+        public IReadOnlyList<DistributedSearchGraph> ArgumentClusters { get; }
+
+        public DistributedSearchGraph CallCluster { get; }
+
+        public Function Function { get; }
+
+        public Dictionary<IRType, DistributedSearchGraph> OutputBuckets { get; } = new();
+
+        public List<DistributedSearchGraph> DirectOutputBuckets { get; } = new();
+
+        public HashSet<CandidateInvocationIdentity> Invocations { get; } = new();
+
+        public HashSet<IRType> DemandedReturnTypes { get; } = new();
+    }
+
+    private sealed class FunctionResultSite
+    {
+        public FunctionResultSite(
+            Function function,
+            BaseExpr result,
+            DistributedSearchGraph resultCluster,
+            IReadOnlyList<DistributedSearchGraph>? fieldClusters = null)
+        {
+            Function = function;
+            Result = result;
+            ResultCluster = resultCluster;
+            FieldClusters = fieldClusters;
+        }
+
+        public Function Function { get; }
+
+        public BaseExpr Result { get; }
+
+        public DistributedSearchGraph ResultCluster { get; }
+
+        public IReadOnlyList<DistributedSearchGraph>? FieldClusters { get; }
+
+        public HashSet<DistributedSearchGraph> SourceBuckets { get; } = new(ReferenceEqualityComparer.Instance);
+
+        public HashSet<BucketCombinationIdentity> FieldCombinations { get; } = new();
+    }
+
+    private sealed class FunctionCallCandidateSite
+    {
+        public FunctionCallCandidateSite(
+            Call sourceCall,
+            Function callee,
+            DistributedSearchGraph calleeReturnCluster,
+            IReadOnlyList<DistributedSearchGraph> boundaryClusters,
+            IReadOnlyList<FunctionBoundarySite?> boundarySites,
+            DistributedSearchGraph callCluster,
+            Function function)
+        {
+            SourceCall = sourceCall;
+            Callee = callee;
+            CalleeReturnCluster = calleeReturnCluster;
+            BoundaryClusters = boundaryClusters;
+            BoundarySites = boundarySites;
+            CallCluster = callCluster;
+            Function = function;
+        }
+
+        public Call SourceCall { get; }
+
+        public Function Callee { get; }
+
+        public DistributedSearchGraph CalleeReturnCluster { get; }
+
+        public IReadOnlyList<DistributedSearchGraph> BoundaryClusters { get; }
+
+        public IReadOnlyList<FunctionBoundarySite?> BoundarySites { get; }
+
+        public DistributedSearchGraph CallCluster { get; }
+
+        public Function Function { get; }
+
+        public List<DistributedSearchGraph> DirectOutputBuckets { get; } = new();
+
+        public HashSet<DistributedSearchGraph> ReturnBuckets { get; } = new(ReferenceEqualityComparer.Instance);
+    }
+
+    private sealed class OutputReshardClosureState
+    {
+        public OutputReshardClosureState(TensorType tensorType, DistributedReshardUsageKind usageKind)
+        {
+            TensorType = tensorType;
+            UsageKind = usageKind;
+        }
+
+        public TensorType TensorType { get; }
+
+        public DistributedReshardUsageKind UsageKind { get; }
+
+        public HashSet<DistributedSearchGraph> Sources { get; } = new(ReferenceEqualityComparer.Instance);
+
+        public Dictionary<IRType, DistributedSearchGraph> TargetBuckets { get; } = new();
+
+        public DistributedSearchGraph? PathCluster { get; set; }
+    }
+
+    private sealed class FunctionBoundarySite
+    {
+        public FunctionBoundarySite(
+            Call sourceCall,
+            Function callee,
+            IVar parameter,
+            int argumentIndex,
+            BaseExpr actual,
+            DistributedSearchGraph actualCluster,
+            DistributedSearchGraph boundaryCluster)
+        {
+            SourceCall = sourceCall;
+            Callee = callee;
+            Parameter = parameter;
+            ArgumentIndex = argumentIndex;
+            Actual = actual;
+            ActualCluster = actualCluster;
+            BoundaryCluster = boundaryCluster;
+        }
+
+        public Call SourceCall { get; }
+
+        public Function Callee { get; }
+
+        public IVar Parameter { get; }
+
+        public int ArgumentIndex { get; }
+
+        public BaseExpr Actual { get; }
+
+        public DistributedSearchGraph ActualCluster { get; }
+
+        public DistributedSearchGraph BoundaryCluster { get; }
+
+        public HashSet<DistributedSearchGraph> DirectActualBuckets { get; } = new(ReferenceEqualityComparer.Instance);
+
+        public List<(SearchableNode CallNode, int InputIndex)> CallConsumers { get; } = new();
+    }
+
     private readonly Dictionary<BaseExpr, DistributedSearchGraph> _reshardMemo;
 
     private readonly Dictionary<BaseExpr, DistributedSearchGraph> _inferedMemo;
@@ -737,6 +993,8 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
 
     private readonly Dictionary<ProviderInputTypeKey, IReadOnlyList<DistributedSearchGraph>> _providerInputTypeMemo = new();
 
+    private readonly Dictionary<DistributedSearchGraph, OutputReshardClosureState> _outputReshardClosureStates = new(ReferenceEqualityComparer.Instance);
+
     private readonly Dictionary<TypeInferenceCacheKey, (bool Success, IRType CheckedType)> _typeInferenceMemo = new();
 
     private readonly Dictionary<Function, DistributedSearchGraph> _functionReturnClusters = new(ReferenceEqualityComparer.Instance);
@@ -746,6 +1004,24 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
     private readonly Dictionary<Function, Dictionary<IVar, DistributedSearchGraph>> _functionParameterClusters = new(ReferenceEqualityComparer.Instance);
 
     private readonly Dictionary<Function, Dictionary<IVar, DistributedSearchGraph>> _functionParameterUseClusters = new(ReferenceEqualityComparer.Instance);
+
+    private readonly Dictionary<IVar, List<FunctionBoundarySite>> _functionBoundarySites = new(ReferenceEqualityComparer.Instance);
+
+    private readonly Dictionary<IVar, Function> _functionParameterOwners = new(ReferenceEqualityComparer.Instance);
+
+    private readonly Dictionary<IVar, Dictionary<IRType, (DistributedSearchGraph Bucket, SearchableNode Node)>> _functionParameterSignatureCandidates = new(ReferenceEqualityComparer.Instance);
+
+    private readonly Dictionary<IVar, Dictionary<IRType, HashSet<DistributedSearchGraph>>> _functionParameterDerivedUseBuckets = new(ReferenceEqualityComparer.Instance);
+
+    private readonly List<OperationCandidateSite> _operationCandidateSites = new();
+
+    private readonly Dictionary<Call, OperationCandidateSite> _operationCandidateSitesByCall = new(ReferenceEqualityComparer.Instance);
+
+    private readonly List<FunctionResultSite> _functionResultSites = new();
+
+    private readonly List<FunctionCallCandidateSite> _functionCallCandidateSites = new();
+
+    private readonly List<FunctionBoundarySite> _allFunctionBoundarySites = new();
 
     private readonly Dictionary<BaseExpr, IReadOnlyList<DistributedSearchGraph>> _directValueBuckets = new(ReferenceEqualityComparer.Instance);
 
@@ -759,6 +1035,8 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
     /// The original tensor consts that are distributed.
     /// </summary>
     private readonly Dictionary<TensorConst, TensorConst> _distributedConstSources = new(ReferenceEqualityComparer.Instance);
+
+    private int _candidateDemandVersion;
 
     private Function? _currentFunction;
 
@@ -977,6 +1255,8 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
                         root = functionRoot;
                     }
                 }
+
+                PropagateCandidateClosure();
             });
 
             if (Diagnostics.DumpScope.Current.IsEnabled(Diagnostics.DumpFlags.EGraphCost))
@@ -1018,6 +1298,46 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         return rewritten[rootFunction];
     }
 
+    private void PropagateCandidateClosure()
+    {
+        var iterations = 0;
+        bool changed;
+        do
+        {
+            iterations++;
+            changed = false;
+            var demandVersion = _candidateDemandVersion;
+            foreach (var site in _allFunctionBoundarySites)
+            {
+                var formalCluster = GetFunctionParameterClusters(site.Callee)[site.Parameter];
+                var tensorType = site.Parameter.CheckedType as TensorType
+                    ?? throw new InvalidOperationException(
+                        $"Function {site.Callee.Name} parameter {site.Parameter.Name} must remain a TensorType during candidate propagation.");
+                changed |= ExpandFunctionBoundarySite(site, formalCluster, tensorType);
+            }
+
+            foreach (var site in _operationCandidateSites)
+            {
+                changed |= ExpandOperationCandidateSite(site);
+            }
+
+            foreach (var site in _functionResultSites)
+            {
+                changed |= ExpandFunctionResultSite(site);
+            }
+
+            foreach (var site in _functionCallCandidateSites)
+            {
+                changed |= ExpandFunctionCallCandidateSite(site);
+            }
+
+            changed |= demandVersion != _candidateDemandVersion;
+        }
+        while (changed);
+
+        _profiler.Count("candidate_closure_iterations", iterations);
+    }
+
     public DistributedSearchGraph BuildSearchGraph(Function function)
     {
         _profiler.SetFunction(function.Name);
@@ -1028,6 +1348,8 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
             var existingNodes = new HashSet<SearchableNode>(
                 _rootSearchGraph.Vertices,
                 ReferenceEqualityComparer.Instance);
+            _currentFunction = function;
+            _currentFunctionIsEntry = true;
             using (Nncase.IR.UserTrackingScope.Suppress())
             {
                 try
@@ -1050,6 +1372,8 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
                 finally
                 {
                     RecordNewFunctionNodes(function, existingNodes);
+                    _currentFunction = null;
+                    _currentFunctionIsEntry = false;
                 }
             }
 
@@ -1090,18 +1414,38 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
     {
         foreach (var node in _rootSearchGraph.Vertices.Where(node => !existingNodes.Contains(node)))
         {
-            if (_nodeOwnerFunctions.TryGetValue(node, out var owner) && !ReferenceEquals(owner, function))
+            if (_nodeOwnerFunctions.ContainsKey(node))
             {
-                throw new InvalidOperationException(
-                    $"AutoDistributed search node is owned by both {owner.Name} and {function.Name}.");
+                // A caller can contribute a new signature candidate to a callee's
+                // parameter cluster. Nodes created while wiring that candidate into
+                // the callee are explicitly assigned to the callee before this scan.
+                continue;
             }
 
             _nodeOwnerFunctions[node] = function;
         }
     }
 
+    private void RegisterNodeOwner(SearchableNode node, Function function)
+    {
+        if (_nodeOwnerFunctions.TryGetValue(node, out var owner))
+        {
+            if (!ReferenceEquals(owner, function))
+            {
+                throw new InvalidOperationException(
+                    $"AutoDistributed search node is owned by both {owner.Name} and {function.Name}.");
+            }
+
+            return;
+        }
+
+        _nodeOwnerFunctions.Add(node, function);
+    }
+
     private DistributedSearchGraph CreateFunctionResultCluster(BaseExpr result)
     {
+        var function = _currentFunction
+            ?? throw new InvalidOperationException("Function result candidates must be created while building a function search graph.");
         if (result is IR.Tuple tuple)
         {
             var fieldClusters = tuple.Fields
@@ -1109,33 +1453,13 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
                 .Select(CreateFunctionResultCluster)
                 .ToArray();
             var tupleCluster = _rootSearchGraph.CreateCluster<DistributedSearchGraph>(SearchGraphKind.DistributedCluster);
-            var fieldBuckets = fieldClusters
-                .Select((cluster, fieldIndex) =>
-                {
-                    var buckets = cluster.Clusters.OfType<DistributedSearchGraph>().ToArray();
-                    if (buckets.Length == 0)
-                    {
-                        throw new InvalidOperationException(
-                            $"Function result tuple field {fieldIndex} has no direct producer candidates.");
-                    }
-
-                    return buckets;
-                })
-                .ToArray();
-            foreach (var combination in fieldBuckets.Select(buckets => buckets.AsEnumerable()).CartesianProduct())
+            var tupleSite = new FunctionResultSite(function, result, tupleCluster, fieldClusters);
+            _functionResultSites.Add(tupleSite);
+            ExpandFunctionResultSite(tupleSite);
+            if (tupleCluster.VertexCount == 0)
             {
-                var selectedBuckets = combination.ToArray();
-                var tupleNode = new SearchableNode(
-                    new IR.Tuple(),
-                    new TupleType(selectedBuckets.Select(GetBucketType).ToArray()),
-                    kind: SearchableNodeKind.FunctionResult);
-                var tupleBucket = tupleCluster.CreateCluster<DistributedSearchGraph>(SearchGraphKind.Bucket);
-                tupleBucket.AddVertex(tupleNode);
-                for (var index = 0; index < selectedBuckets.Length; index++)
-                {
-                    var fieldBucket = selectedBuckets[index];
-                    _rootSearchGraph.AddEdge(new(tupleNode, fieldBucket.Vertices.First(), index, fieldBucket));
-                }
+                throw new InvalidOperationException(
+                    $"Function result tuple in {function.Name} has no direct producer candidates.");
             }
 
             return tupleCluster;
@@ -1152,21 +1476,85 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         }
 
         var resultCluster = _rootSearchGraph.CreateCluster<DistributedSearchGraph>(valueCluster.Kind);
+        var resultSite = new FunctionResultSite(function, result, resultCluster);
+        _functionResultSites.Add(resultSite);
+        ExpandFunctionResultSite(resultSite);
+
+        return resultCluster;
+    }
+
+    private bool ExpandFunctionResultSite(FunctionResultSite site)
+    {
+        if (site.FieldClusters is { } fieldClusters)
+        {
+            var fieldBuckets = fieldClusters
+                .Select((cluster, fieldIndex) =>
+                {
+                    var buckets = cluster.Clusters.OfType<DistributedSearchGraph>().ToArray();
+                    if (buckets.Length == 0)
+                    {
+                        throw new InvalidOperationException(
+                            $"Function {site.Function.Name} result tuple field {fieldIndex} has no direct producer candidates.");
+                    }
+
+                    return buckets;
+                })
+                .ToArray();
+            var changed = false;
+            foreach (var combination in fieldBuckets.Select(buckets => buckets.AsEnumerable()).CartesianProduct())
+            {
+                var selectedBuckets = combination.ToArray();
+                if (!site.FieldCombinations.Add(new BucketCombinationIdentity(selectedBuckets)))
+                {
+                    continue;
+                }
+
+                var tupleNode = new SearchableNode(
+                    new IR.Tuple(),
+                    new TupleType(selectedBuckets.Select(GetBucketType).ToArray()),
+                    kind: SearchableNodeKind.FunctionResult);
+                var tupleBucket = site.ResultCluster.CreateCluster<DistributedSearchGraph>(SearchGraphKind.Bucket);
+                tupleBucket.AddVertex(tupleNode);
+                RegisterNodeOwner(tupleNode, site.Function);
+                for (var index = 0; index < selectedBuckets.Length; index++)
+                {
+                    var fieldBucket = selectedBuckets[index];
+                    _rootSearchGraph.AddEdge(new(tupleNode, fieldBucket.Vertices.First(), index, fieldBucket));
+                }
+
+                changed = true;
+            }
+
+            return changed;
+        }
+
+        var valueCluster = TryAddOriginator(site.Result);
+        var sourceBuckets = _directValueBuckets.TryGetValue(site.Result, out var directBuckets)
+            ? directBuckets
+            : valueCluster.Clusters.OfType<DistributedSearchGraph>().ToArray();
+        var expanded = false;
         foreach (var sourceBucket in sourceBuckets)
         {
+            if (!site.SourceBuckets.Add(sourceBucket))
+            {
+                continue;
+            }
+
             var sourceNode = sourceBucket.Vertices.FirstOrDefault()
                 ?? throw new InvalidOperationException("Function result source bucket is empty.");
-            var resultBucket = resultCluster.CreateCluster<DistributedSearchGraph>(SearchGraphKind.Bucket);
+            var resultBucket = site.ResultCluster.CreateCluster<DistributedSearchGraph>(SearchGraphKind.Bucket);
             var resultNode = new SearchableNode(
-                result,
+                site.Result,
                 sourceNode.IRType,
                 kind: SearchableNodeKind.FunctionResult,
                 sourceKind: sourceNode.SourceKind);
             resultBucket.AddVertex(resultNode);
+            RegisterNodeOwner(resultNode, site.Function);
             _rootSearchGraph.AddEdge(new(resultNode, sourceNode, 0, sourceBucket));
+            expanded = true;
         }
 
-        return resultCluster;
+        return expanded;
 
         static IRType GetBucketType(DistributedSearchGraph bucket)
             => bucket.Vertices.FirstOrDefault()?.IRType
@@ -1364,95 +1752,16 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
 
         bool isStandalone = expr.Target is IR.NN.UpdatePagedAttentionKVCache;
         var callCluster = _rootSearchGraph.CreateCluster<DistributedSearchGraph>(!isSupported || isStandalone ? SearchGraphKind.StandaloneCluster : SearchGraphKind.DistributedCluster);
-
-        // 1. inference
-        var bucketMemo = new Dictionary<IRType, DistributedSearchGraph>();
-        foreach (var candidate in EnumerateCandidateBucketArrays(expr, isSupported, argClusters))
+        var function = _currentFunction
+            ?? throw new InvalidOperationException("Operation candidates must be created while building a function search graph.");
+        var candidateSite = new OperationCandidateSite(expr, isSupported, argClusters, callCluster, function);
+        _operationCandidateSites.Add(candidateSite);
+        if (!_operationCandidateSitesByCall.TryAdd(expr, candidateSite))
         {
-            var bucketArray = candidate.Buckets;
-            _profiler.Count("candidate_arg_combinations");
-
-            string[]? candidateDesc = null;
-            if (isSparseExperts)
-            {
-                candidateDesc = bucketArray.Select((bucket, idx) =>
-                {
-                    var vertex = bucket.Vertices.FirstOrDefault();
-                    return vertex is null ? $"Arg {idx}: Empty" : $"Arg {idx}: {DescribeSbp(vertex.IRType)}";
-                }).ToArray();
-
-                Console.WriteLine("[AutoDistributed][SparseExperts] Candidate SBP combination:");
-                foreach (var desc in candidateDesc)
-                {
-                    Console.WriteLine($"\t{desc}");
-                }
-            }
-
-            var tempArgs = bucketArray.Select<DistributedSearchGraph, BaseExpr>(bucket => bucket.Vertices.First() switch
-            {
-                SearchableNode { Expr: Dimension attr } => attr,
-                SearchableNode { Expr: Shape attr } => attr,
-                SearchableNode { Expr: Padding attr } => attr,
-                SearchableNode { Expr: Paddings attr } => attr,
-                SearchableNode { Expr: Const attr } => attr,
-                SearchableNode { Expr: Call { Target: AsTensor } attr } => attr,
-                SearchableNode n => new Var(n.IRType),
-            }).ToArray();
-            var newExprs = _profiler.Time("build_equivalent_calls", () => BuildEquivalentCalls(candidate.Target, tempArgs).ToArray());
-            _profiler.Count("candidate_equivalent_calls", newExprs.Length);
-            foreach (var (newExpr, used) in newExprs)
-            {
-                _profiler.Count("candidate_exprs");
-                if (expr.Target is not Boxing &&
-                    !candidate.AllowsPartialInputs &&
-                    ((Call)newExpr).Arguments.AsValueEnumerable().Any(a => a.CheckedType is DistributedType dt && dt.Partial is not null))
-                {
-                    RecordCandidateDiagnostic(expr, bucketArray, "infer", "rejected", null, "partial argument is not allowed before boxing");
-                    continue;
-                }
-
-                if (!InferCandidateType(newExpr))
-                {
-                    RecordCandidateDiagnostic(expr, bucketArray, "infer", "rejected", newExpr.CheckedType, "type inference returned false");
-                    continue;
-                }
-
-                if (newExpr.CheckedType is InvalidType invalidType)
-                {
-                    RecordCandidateDiagnostic(expr, bucketArray, "infer", "rejected", invalidType, invalidType.Reason);
-                    continue;
-                }
-
-                if (candidate.ExpectedReturnType is { } expectedReturnType &&
-                    newExpr.CheckedType != expectedReturnType)
-                {
-                    RecordCandidateDiagnostic(
-                        expr,
-                        bucketArray,
-                        "infer",
-                        "rejected",
-                        newExpr.CheckedType,
-                        $"candidate provider expected {expectedReturnType}, got {newExpr.CheckedType}");
-                    continue;
-                }
-
-                var checkType = newExpr.CheckedType;
-                RecordCandidateDiagnostic(expr, bucketArray, "infer", "accepted", checkType, string.Empty);
-                if (!bucketMemo.TryGetValue(checkType, out var dbucket))
-                {
-                    dbucket = callCluster.CreateCluster<DistributedSearchGraph>(SearchGraphKind.Bucket);
-                    bucketMemo.Add(checkType, dbucket);
-                }
-
-                var dnode = new SearchableNode(isSupported && newExpr is Call newCall ? newCall.Target : newExpr, checkType);
-                dbucket.AddVertex(dnode);
-
-                foreach (var ((arg, _), i) in bucketArray.Zip(used).Where(p => p.Second is true).Select((arg, i) => (arg, i)))
-                {
-                    _rootSearchGraph.AddEdge(new(dnode, arg.Vertices.First(), i, arg));
-                }
-            }
+            throw new InvalidOperationException("An operation call cannot own more than one distributed candidate site.");
         }
+
+        ExpandOperationCandidateSite(candidateSite, isSparseExperts);
 
         if (callCluster.VertexCount == 0)
         {
@@ -1475,8 +1784,7 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
             throw new InvalidOperationException(failureMessage);
         }
 
-        var directOutputBuckets = bucketMemo.Values.ToArray();
-        RecordDirectValueBuckets(expr, directOutputBuckets);
+        RecordDirectValueBuckets(expr, candidateSite.DirectOutputBuckets);
         _inferedMemo.Add(expr, callCluster);
 
         if (!isSupported || isStandalone)
@@ -1489,24 +1797,7 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         // remain consumer-side alternatives even when the value is returned.
         if (Bidirectional)
         {
-            foreach (var (lType, lBucket) in bucketMemo.Where(kv => kv.Key is DistributedType))
-            {
-                foreach (var (rType, rBucket) in bucketMemo.Where(kv => kv.Key is DistributedType distributedType && distributedType != lType))
-                {
-                    if (CheckBoxingTypeCached(lType, rType) is not InvalidType)
-                    {
-                        GetOrCreateReshardCandidate(
-                            callCluster,
-                            lBucket,
-                            lBucket.Vertices.First(),
-                            rType,
-                            usageKind: DistributedReshardUsageKind.Internal,
-                            isBidirect: true,
-                            outputBucket: rBucket,
-                            addDataEdgeToOwnerCluster: true);
-                    }
-                }
-            }
+            CompleteBidirectionalCandidateClosure(candidateSite);
         }
 
         // 4. add not infered type in search space.
@@ -1518,12 +1809,183 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         CompleteOutputReshardClosure(
             callCluster,
             tensorType,
-            directOutputBuckets,
-            DistributedReshardUsageKind.Internal);
+            candidateSite.DirectOutputBuckets,
+            DistributedReshardUsageKind.Internal,
+            function);
 
         // 5. filter
         FilterByScheme(expr, callCluster);
         return default;
+    }
+
+    private bool ExpandOperationCandidateSite(OperationCandidateSite site, bool isSparseExperts = false)
+    {
+        var newOutputBuckets = new List<DistributedSearchGraph>();
+        foreach (var candidate in EnumerateCandidateBucketArrays(
+                     site.SourceCall,
+                     site.IsSupported,
+                     site.ArgumentClusters,
+                     site.Function,
+                     site.DemandedReturnTypes))
+        {
+            if (!site.Invocations.Add(new CandidateInvocationIdentity(candidate)))
+            {
+                continue;
+            }
+
+            var bucketArray = candidate.Buckets;
+            _profiler.Count("candidate_arg_combinations");
+            if (isSparseExperts)
+            {
+                Console.WriteLine("[AutoDistributed][SparseExperts] Candidate SBP combination:");
+                foreach (var (bucket, index) in bucketArray.Select((bucket, index) => (bucket, index)))
+                {
+                    Console.WriteLine($"\tArg {index}: {FormatType(bucket.Vertices.FirstOrDefault()?.IRType)}");
+                }
+            }
+
+            var tempArgs = bucketArray.Select<DistributedSearchGraph, BaseExpr>(bucket => bucket.Vertices.First() switch
+            {
+                SearchableNode { Expr: Dimension attr } => attr,
+                SearchableNode { Expr: Shape attr } => attr,
+                SearchableNode { Expr: Padding attr } => attr,
+                SearchableNode { Expr: Paddings attr } => attr,
+                SearchableNode { Expr: Const attr } => attr,
+                SearchableNode { Expr: Call { Target: AsTensor } attr } => attr,
+                SearchableNode n => new Var(n.IRType),
+            }).ToArray();
+            var newExprs = _profiler.Time(
+                "build_equivalent_calls",
+                () => BuildEquivalentCalls(candidate.Target, tempArgs).ToArray());
+            _profiler.Count("candidate_equivalent_calls", newExprs.Length);
+            foreach (var (newExpr, used) in newExprs)
+            {
+                _profiler.Count("candidate_exprs");
+                if (site.SourceCall.Target is not Boxing
+                    && !candidate.AllowsPartialInputs
+                    && ((Call)newExpr).Arguments.AsValueEnumerable().Any(
+                        argument => argument.CheckedType is DistributedType { Partial: not null }))
+                {
+                    RecordCandidateDiagnostic(
+                        site.SourceCall,
+                        bucketArray,
+                        "infer",
+                        "rejected",
+                        null,
+                        "partial argument is not allowed before boxing");
+                    continue;
+                }
+
+                if (!InferCandidateType(newExpr))
+                {
+                    RecordCandidateDiagnostic(
+                        site.SourceCall,
+                        bucketArray,
+                        "infer",
+                        "rejected",
+                        newExpr.CheckedType,
+                        "type inference returned false");
+                    continue;
+                }
+
+                if (newExpr.CheckedType is InvalidType invalidType)
+                {
+                    RecordCandidateDiagnostic(
+                        site.SourceCall,
+                        bucketArray,
+                        "infer",
+                        "rejected",
+                        invalidType,
+                        invalidType.Reason);
+                    continue;
+                }
+
+                if (candidate.ExpectedReturnType is { } expectedReturnType
+                    && newExpr.CheckedType != expectedReturnType)
+                {
+                    RecordCandidateDiagnostic(
+                        site.SourceCall,
+                        bucketArray,
+                        "infer",
+                        "rejected",
+                        newExpr.CheckedType,
+                        $"candidate provider expected {expectedReturnType}, got {newExpr.CheckedType}");
+                    continue;
+                }
+
+                var checkType = newExpr.CheckedType;
+                RecordCandidateDiagnostic(site.SourceCall, bucketArray, "infer", "accepted", checkType, string.Empty);
+                if (!site.OutputBuckets.TryGetValue(checkType, out var outputBucket))
+                {
+                    outputBucket = site.CallCluster.CreateCluster<DistributedSearchGraph>(SearchGraphKind.Bucket);
+                    site.OutputBuckets.Add(checkType, outputBucket);
+                    site.DirectOutputBuckets.Add(outputBucket);
+                    newOutputBuckets.Add(outputBucket);
+                }
+
+                var node = new SearchableNode(
+                    site.IsSupported && newExpr is Call newCall ? newCall.Target : newExpr,
+                    checkType);
+                outputBucket.AddVertex(node);
+                RegisterNodeOwner(node, site.Function);
+                foreach (var ((argument, _), index) in bucketArray.Zip(used).Where(pair => pair.Second).Select((pair, index) => (pair, index)))
+                {
+                    _rootSearchGraph.AddEdge(new(node, argument.Vertices.First(), index, argument));
+                }
+            }
+        }
+
+        if (newOutputBuckets.Count == 0)
+        {
+            return false;
+        }
+
+        AppendDirectValueBuckets(site.SourceCall, newOutputBuckets);
+        if (site.IsSupported
+            && site.SourceCall.Target is not IR.NN.UpdatePagedAttentionKVCache
+            && site.SourceCall.CheckedType is TensorType tensorType
+            && IsDistributableTensorType(tensorType))
+        {
+            if (Bidirectional)
+            {
+                CompleteBidirectionalCandidateClosure(site);
+            }
+
+            CompleteOutputReshardClosure(
+                site.CallCluster,
+                tensorType,
+                newOutputBuckets,
+                DistributedReshardUsageKind.Internal,
+                site.Function);
+        }
+
+        return true;
+    }
+
+    private void CompleteBidirectionalCandidateClosure(OperationCandidateSite site)
+    {
+        foreach (var (leftType, leftBucket) in site.OutputBuckets.Where(pair => pair.Key is DistributedType))
+        {
+            foreach (var (rightType, rightBucket) in site.OutputBuckets.Where(
+                         pair => pair.Key is DistributedType && pair.Key != leftType))
+            {
+                if (CheckBoxingTypeCached(leftType, rightType) is InvalidType)
+                {
+                    continue;
+                }
+
+                GetOrCreateReshardCandidate(
+                    site.CallCluster,
+                    leftBucket,
+                    leftBucket.Vertices.First(),
+                    rightType,
+                    usageKind: DistributedReshardUsageKind.Internal,
+                    isBidirect: true,
+                    outputBucket: rightBucket,
+                    addDataEdgeToOwnerCluster: true,
+                    ownerFunction: site.Function);
+            }
+        }
     }
 
     private static UInt128 GetLocalTensorBytes(DistributedType distributedType)
@@ -1635,9 +2097,19 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         return success;
     }
 
-    private IEnumerable<CandidateInvocation> EnumerateCandidateBucketArrays(Call expr, bool isSupported, IReadOnlyList<DistributedSearchGraph> argClusters)
+    private IEnumerable<CandidateInvocation> EnumerateCandidateBucketArrays(
+        Call expr,
+        bool isSupported,
+        IReadOnlyList<DistributedSearchGraph> argClusters,
+        Function ownerFunction,
+        IReadOnlySet<IRType> demandedReturnTypes)
     {
-        var providerResult = TryBuildProviderCandidateBucketArrays(expr, isSupported, argClusters);
+        var providerResult = TryBuildProviderCandidateBucketArrays(
+            expr,
+            isSupported,
+            argClusters,
+            ownerFunction,
+            demandedReturnTypes);
         if (providerResult.Invocations.Count > 0)
         {
             foreach (var invocation in providerResult.Invocations)
@@ -1668,7 +2140,12 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         }
     }
 
-    private ProviderCandidateResult TryBuildProviderCandidateBucketArrays(Call expr, bool isSupported, IReadOnlyList<DistributedSearchGraph> argClusters)
+    private ProviderCandidateResult TryBuildProviderCandidateBucketArrays(
+        Call expr,
+        bool isSupported,
+        IReadOnlyList<DistributedSearchGraph> argClusters,
+        Function ownerFunction,
+        IReadOnlySet<IRType> demandedReturnTypes)
     {
         if (!isSupported || expr.Target is not Op op || _candidateProviderResolver is null || !_candidateProviderResolver.TryGetProvider(op, out var provider))
         {
@@ -1694,7 +2171,10 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
             .Select(candidates => (IReadOnlyList<IRType>)candidates.Select(candidate => candidate.Type).Distinct().ToArray())
             .ToArray();
         var context = new DistributedCandidateContext(CompileOptions, TargetOptions, _moduleKind, expr, availableInputTypes);
-        var defaultReturnTypes = GetProviderReturnCandidateTypes(expr.CheckedType);
+        var defaultReturnTypes = GetProviderReturnCandidateTypes(expr.CheckedType)
+            .Concat(demandedReturnTypes)
+            .Distinct()
+            .ToArray();
         var returnTypes = provider
             .GetReturnCandidateTypes(context, op, defaultReturnTypes)
             .Distinct()
@@ -1732,12 +2212,15 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
             {
                 ExpandProviderTuple(
                     tuple,
+                    expr.Arguments.ToArray(),
                     argClusters,
                     bucketsByInputType,
                     result,
                     candidateTarget,
                     returnType,
-                    provider.AllowsPartialInputs);
+                    provider.AllowsPartialInputs,
+                    ownerFunction,
+                    demandedReturnTypes.Contains(returnType));
             }
         }
 
@@ -1756,12 +2239,15 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
 
     private void ExpandProviderTuple(
         DistributedCandidateTuple tuple,
+        IReadOnlyList<BaseExpr> inputExpressions,
         IReadOnlyList<DistributedSearchGraph> inputClusters,
         IReadOnlyList<Dictionary<IRType, DistributedSearchGraph[]>> bucketsByInputType,
         List<CandidateInvocation> result,
         Expr candidateTarget,
         IRType expectedReturnType,
-        bool allowsPartialInputs)
+        bool allowsPartialInputs,
+        Function ownerFunction,
+        bool propagateInputDemands)
     {
         if (tuple.InputTypes.Count != bucketsByInputType.Count)
         {
@@ -1771,9 +2257,17 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         var bucketChoices = new DistributedSearchGraph[tuple.InputTypes.Count][];
         for (int i = 0; i < tuple.InputTypes.Count; i++)
         {
+            if (propagateInputDemands)
+            {
+                RegisterOperationReturnDemand(inputExpressions[i], tuple.InputTypes[i]);
+            }
+
             if (!bucketsByInputType[i].TryGetValue(tuple.InputTypes[i], out var buckets))
             {
-                buckets = GetOrCreateProviderInputTypeBuckets(inputClusters[i], tuple.InputTypes[i]).ToArray();
+                buckets = GetOrCreateProviderInputTypeBuckets(
+                    inputClusters[i],
+                    tuple.InputTypes[i],
+                    ownerFunction).ToArray();
                 if (buckets.Length > 0)
                 {
                     bucketsByInputType[i].Add(tuple.InputTypes[i], buckets);
@@ -1798,9 +2292,42 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         }
     }
 
+    private static bool HaveSameLogicalTensorType(IRType sourceType, IRType demandedType)
+    {
+        var sourceTensorType = sourceType switch
+        {
+            TensorType tensorType => tensorType,
+            DistributedType distributedType => distributedType.TensorType,
+            _ => null,
+        };
+        var demandedTensorType = demandedType switch
+        {
+            TensorType tensorType => tensorType,
+            DistributedType distributedType => distributedType.TensorType,
+            _ => null,
+        };
+        return sourceTensorType is not null && sourceTensorType == demandedTensorType;
+    }
+
+    private bool RegisterOperationReturnDemand(BaseExpr expression, IRType demandedType)
+    {
+        if (expression is not Call call ||
+            !_operationCandidateSitesByCall.TryGetValue(call, out var site) ||
+            !HaveSameLogicalTensorType(call.CheckedType, demandedType) ||
+            !site.DemandedReturnTypes.Add(demandedType))
+        {
+            return false;
+        }
+
+        _candidateDemandVersion++;
+        _profiler.Count("operation_demanded_return_types");
+        return true;
+    }
+
     private IReadOnlyList<DistributedSearchGraph> GetOrCreateProviderInputTypeBuckets(
         DistributedSearchGraph inputCluster,
-        IRType targetType)
+        IRType targetType,
+        Function ownerFunction)
     {
         var existingBuckets = inputCluster.Clusters
             .OfType<DistributedSearchGraph>()
@@ -1858,14 +2385,15 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         DistributedSearchGraph? pathCluster = null;
         foreach (var path in paths)
         {
-            AddOutputReshardPath(
+            pathCluster = AddOutputReshardPath(
                 adaptationCluster,
-                ref pathCluster,
+                pathCluster,
                 path.SourceBucket,
                 path.SourceNode,
                 targetBucket,
                 path.Steps,
-                DistributedReshardUsageKind.Internal);
+                DistributedReshardUsageKind.Internal,
+                ownerFunction);
         }
 
         IReadOnlyList<DistributedSearchGraph> created = [targetBucket];
@@ -1945,10 +2473,22 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         DistributedSearchGraph callCluster,
         TensorType tensorType,
         IReadOnlyList<DistributedSearchGraph> directOutputBuckets,
-        DistributedReshardUsageKind usageKind)
+        DistributedReshardUsageKind usageKind,
+        Function? ownerFunction = null)
     {
-        DistributedSearchGraph? pathCluster = null;
+        if (!_outputReshardClosureStates.TryGetValue(callCluster, out var state))
+        {
+            state = new OutputReshardClosureState(tensorType, usageKind);
+            _outputReshardClosureStates.Add(callCluster, state);
+        }
+        else if (state.TensorType != tensorType || state.UsageKind != usageKind)
+        {
+            throw new InvalidOperationException(
+                $"Output reshard closure for one cluster changed from {state.TensorType}/{state.UsageKind} to {tensorType}/{usageKind}.");
+        }
+
         var sources = directOutputBuckets
+            .Where(state.Sources.Add)
             .Select(bucket => (
                 Bucket: bucket,
                 Node: bucket.Vertices.FirstOrDefault()
@@ -1964,7 +2504,7 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         {
             // Keep reshard endpoints out of directly inferred buckets to preserve a DAG,
             // while coalescing equivalent target states into one consumer-visible bucket.
-            DistributedSearchGraph? targetBucket = null;
+            state.TargetBuckets.TryGetValue(targetType, out var targetBucket);
             foreach (var source in sources)
             {
                 var plans = _profiler.Time(
@@ -1984,17 +2524,23 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
                             $"Reshard planner returned an invalid path from {source.Node.IRType} to {targetType}.");
                     }
 
-                    targetBucket ??= callCluster.CreateCluster<DistributedSearchGraph>(SearchGraphKind.Bucket);
+                    if (targetBucket is null)
+                    {
+                        targetBucket = callCluster.CreateCluster<DistributedSearchGraph>(SearchGraphKind.Bucket);
+                        state.TargetBuckets.Add(targetType, targetBucket);
+                    }
+
                     _profiler.Count("output_reshard_paths");
                     _profiler.Count("output_reshard_steps", plan.StepTypes.Count);
-                    AddOutputReshardPath(
+                    state.PathCluster = AddOutputReshardPath(
                         callCluster,
-                        ref pathCluster,
+                        state.PathCluster,
                         source.Bucket,
                         source.Node,
                         targetBucket,
                         plan.StepTypes,
-                        usageKind);
+                        usageKind,
+                        ownerFunction);
                 }
             }
 
@@ -2005,14 +2551,15 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         }
     }
 
-    private void AddOutputReshardPath(
+    private DistributedSearchGraph? AddOutputReshardPath(
         DistributedSearchGraph callCluster,
-        ref DistributedSearchGraph? pathCluster,
+        DistributedSearchGraph? pathCluster,
         DistributedSearchGraph sourceBucket,
         SearchableNode sourceNode,
         DistributedSearchGraph targetBucket,
         IReadOnlyList<IRType> stepTypes,
-        DistributedReshardUsageKind usageKind)
+        DistributedReshardUsageKind usageKind,
+        Function? ownerFunction = null)
     {
         var inputBucket = sourceBucket;
         var inputNode = sourceNode;
@@ -2031,10 +2578,13 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
                 inputNode,
                 stepTypes[i],
                 usageKind: stepUsageKind,
-                outputBucket: isFinalStep ? targetBucket : null);
+                outputBucket: isFinalStep ? targetBucket : null,
+                ownerFunction: ownerFunction);
             inputBucket = bucket;
             inputNode = node;
         }
+
+        return pathCluster;
     }
 
     private bool CanBoxingType(IRType inputType, IRType outputType) => CheckBoxingTypeCached(inputType, outputType) is not InvalidType;
@@ -2050,7 +2600,8 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         DistributedSearchGraph? outputBucket = null,
         DistributedSearchGraph? dependencyBucket = null,
         SearchableNode? dependencyNode = null,
-        bool addDataEdgeToOwnerCluster = false)
+        bool addDataEdgeToOwnerCluster = false,
+        Function? ownerFunction = null)
     {
         if ((dependencyBucket is null) != (dependencyNode is null))
         {
@@ -2071,10 +2622,53 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
             dependencyNode);
         if (_reshardCandidateMemo.TryGetValue(key, out var existing))
         {
+            if (ownerFunction is not null)
+            {
+                RegisterNodeOwner(existing.Node, ownerFunction);
+            }
+
             return existing;
         }
 
         var bucket = outputBucket ?? ownerCluster.CreateCluster<DistributedSearchGraph>(SearchGraphKind.Bucket);
+        if (kind is SearchableNodeKind.FunctionBoundaryAdapter
+            && EqualityComparer<IRType>.Default.Equals(inputNode.IRType, targetType))
+        {
+            var identityNode = new SearchableNode(
+                inputNode.Expr,
+                targetType,
+                isBidirect,
+                kind,
+                inputNode.SourceKind,
+                resolvedUsageKind,
+                inputNode.OriginParameter);
+            bucket.AddVertex(identityNode);
+            var identityDataEdge = new CrossEdge(identityNode, inputNode, 0, inputBucket);
+            if (addDataEdgeToOwnerCluster)
+            {
+                ownerCluster.AddEdge(identityDataEdge);
+            }
+            else
+            {
+                _rootSearchGraph.AddEdge(identityDataEdge);
+            }
+
+            if (dependencyBucket is not null && dependencyNode is not null)
+            {
+                _rootSearchGraph.AddEdge(new(identityNode, dependencyNode, HiddenFunctionDependencyIndex, dependencyBucket));
+            }
+
+            if (ownerFunction is not null)
+            {
+                RegisterNodeOwner(identityNode, ownerFunction);
+            }
+
+            var identity = (bucket, identityNode);
+            _reshardCandidateMemo.Add(key, identity);
+            _profiler.Count("function_boundary_identity_candidates");
+            return identity;
+        }
+
         var realization = ClassifyReshardRealization(
             inputNode.IRType,
             targetType,
@@ -2103,7 +2697,8 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
             isBidirect,
             kind,
             outputSourceKind,
-            resolvedUsageKind);
+            resolvedUsageKind,
+            inputNode.OriginParameter);
         bucket.AddVertex(node);
         var dataEdge = new CrossEdge(node, inputNode, 0, inputBucket);
         if (addDataEdgeToOwnerCluster)
@@ -2118,6 +2713,18 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         if (dependencyBucket is not null && dependencyNode is not null)
         {
             _rootSearchGraph.AddEdge(new(node, dependencyNode, HiddenFunctionDependencyIndex, dependencyBucket));
+        }
+
+        if (ownerFunction is not null)
+        {
+            RegisterNodeOwner(node, ownerFunction);
+        }
+
+        if (kind == SearchableNodeKind.Normal
+            && resolvedUsageKind == DistributedReshardUsageKind.Internal
+            && node.OriginParameter is { } originParameter)
+        {
+            RegisterFunctionParameterDerivedUseBucket(originParameter, targetType, bucket);
         }
 
         var created = (bucket, node);
@@ -2158,6 +2765,7 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         var actualClusters = new DistributedSearchGraph[expr.Arguments.Length];
         var formalClusters = GetFunctionParameterClusters(callee);
         var boundaryClusters = new DistributedSearchGraph[expr.Arguments.Length];
+        var boundarySites = new FunctionBoundarySite?[expr.Arguments.Length];
         var calleeParameters = callee.Parameters.ToArray();
         if (calleeParameters.Length != expr.Arguments.Length)
         {
@@ -2171,7 +2779,14 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
             if (formalClusters.TryGetValue(parameter, out var formalCluster))
             {
                 actualClusters[i] = VisitLeafArgument(ParameterKind.Input, actual, isSupported: true);
-                boundaryClusters[i] = CreateFunctionBoundaryArgumentCluster(expr, i, actualClusters[i], formalCluster);
+                boundarySites[i] = CreateFunctionBoundaryArgumentCluster(
+                    expr,
+                    callee,
+                    parameter,
+                    i,
+                    actualClusters[i],
+                    formalCluster);
+                boundaryClusters[i] = boundarySites[i]!.BoundaryCluster;
             }
             else
             {
@@ -2181,88 +2796,464 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         }
 
         var callCluster = _rootSearchGraph.CreateCluster<DistributedSearchGraph>(SearchGraphKind.DistributedCluster);
-        var directCallBuckets = new List<DistributedSearchGraph>();
-        foreach (var returnBucket in calleeReturnCluster.Clusters.OfType<DistributedSearchGraph>())
-        {
-            var returnNode = returnBucket.Vertices.FirstOrDefault()
-                ?? throw new InvalidOperationException($"Function {callee.Name} has an empty return candidate bucket.");
-            var bucket = callCluster.CreateCluster<DistributedSearchGraph>(SearchGraphKind.Bucket);
-            directCallBuckets.Add(bucket);
-            var callNode = new SearchableNode(callee, returnNode.IRType, kind: SearchableNodeKind.FunctionCall);
-            bucket.AddVertex(callNode);
-            _rootSearchGraph.AddEdge(new(callNode, returnNode, HiddenFunctionDependencyIndex, returnBucket));
-            for (int i = 0; i < boundaryClusters.Length; i++)
-            {
-                foreach (var boundaryBucket in boundaryClusters[i].Clusters.OfType<DistributedSearchGraph>())
-                {
-                    var boundaryNode = boundaryBucket.Vertices.FirstOrDefault()
-                        ?? throw new InvalidOperationException($"Function {callee.Name} call boundary argument {i} has an empty candidate bucket.");
-                    _rootSearchGraph.AddEdge(new(callNode, boundaryNode, i, boundaryBucket));
-                }
-            }
-        }
-
-        RecordDirectValueBuckets(expr, directCallBuckets);
-        if (expr.CheckedType is TensorType tensorType && IsDistributableTensorType(tensorType))
-        {
-            CompleteOutputReshardClosure(
-                callCluster,
-                tensorType,
-                directCallBuckets,
-                DistributedReshardUsageKind.Internal);
-        }
+        var function = _currentFunction
+            ?? throw new InvalidOperationException("Function-call candidates must be created while building a function search graph.");
+        var candidateSite = new FunctionCallCandidateSite(
+            expr,
+            callee,
+            calleeReturnCluster,
+            boundaryClusters,
+            boundarySites,
+            callCluster,
+            function);
+        _functionCallCandidateSites.Add(candidateSite);
+        ExpandFunctionCallCandidateSite(candidateSite);
+        RecordDirectValueBuckets(expr, candidateSite.DirectOutputBuckets);
 
         _inferedMemo.Add(expr, callCluster);
         FilterByScheme(expr, callCluster);
         return default;
     }
 
-    private DistributedSearchGraph CreateFunctionBoundaryArgumentCluster(Call call, int argumentIndex, DistributedSearchGraph actualCluster, DistributedSearchGraph formalCluster)
+    private bool ExpandFunctionCallCandidateSite(FunctionCallCandidateSite site)
     {
-        var callTargetName = call.Target is Callable callable ? callable.Name : call.Target.GetType().Name;
-        var boundaryCluster = _rootSearchGraph.CreateCluster<DistributedSearchGraph>(SearchGraphKind.DistributedCluster);
-        DistributedSearchGraph? pathCluster = null;
-        var formalBuckets = formalCluster.Clusters.OfType<DistributedSearchGraph>().ToArray();
-        var actualBuckets = actualCluster.Clusters.OfType<DistributedSearchGraph>().ToArray();
-        foreach (var formalBucket in formalBuckets)
+        var newOutputBuckets = new List<DistributedSearchGraph>();
+        foreach (var returnBucket in site.CalleeReturnCluster.Clusters.OfType<DistributedSearchGraph>())
         {
-            var formalNode = formalBucket.Vertices.FirstOrDefault()
-                ?? throw new InvalidOperationException($"Function call {callTargetName} formal argument {argumentIndex} has an empty candidate bucket.");
-            foreach (var actualBucket in actualBuckets)
+            if (!site.ReturnBuckets.Add(returnBucket))
             {
-                var actualNode = actualBucket.Vertices.FirstOrDefault()
-                    ?? throw new InvalidOperationException($"Function call {callTargetName} actual argument {argumentIndex} has an empty candidate bucket.");
-                foreach (var plan in GetFunctionBoundaryReshardPlans(
-                             actualNode.IRType,
-                             formalNode.IRType,
-                             GetReshardSourceKind(actualNode)))
+                continue;
+            }
+
+            var returnNode = returnBucket.Vertices.FirstOrDefault()
+                ?? throw new InvalidOperationException($"Function {site.Callee.Name} has an empty return candidate bucket.");
+            var outputBucket = site.CallCluster.CreateCluster<DistributedSearchGraph>(SearchGraphKind.Bucket);
+            site.DirectOutputBuckets.Add(outputBucket);
+            newOutputBuckets.Add(outputBucket);
+            var callNode = new SearchableNode(
+                site.Callee,
+                returnNode.IRType,
+                kind: SearchableNodeKind.FunctionCall);
+            outputBucket.AddVertex(callNode);
+            RegisterNodeOwner(callNode, site.Function);
+            _rootSearchGraph.AddEdge(new(
+                callNode,
+                returnNode,
+                HiddenFunctionDependencyIndex,
+                returnBucket));
+            for (var index = 0; index < site.BoundaryClusters.Count; index++)
+            {
+                if (site.BoundarySites[index] is { } boundarySite)
                 {
-                    var finalBucket = plan.StepTypes.Count == 0
-                        ? actualBucket
-                        : AddFunctionBoundaryReshardPath(
-                            pathCluster ??= _rootSearchGraph.CreateCluster<DistributedSearchGraph>(SearchGraphKind.DistributedCluster),
-                            actualBucket,
-                            actualNode,
-                            plan.StepTypes);
-                    var finalNode = finalBucket.Vertices.First();
-                    GetOrCreateReshardCandidate(
-                        boundaryCluster,
-                        finalBucket,
-                        finalNode,
-                        formalNode.IRType,
-                        kind: SearchableNodeKind.FunctionBoundaryAdapter,
-                        dependencyBucket: formalBucket,
-                        dependencyNode: formalNode);
+                    RegisterFunctionBoundaryCallConsumer(boundarySite, callNode, index);
+                    continue;
+                }
+
+                foreach (var boundaryBucket in site.BoundaryClusters[index].Clusters.OfType<DistributedSearchGraph>())
+                {
+                    var boundaryNode = boundaryBucket.Vertices.FirstOrDefault()
+                        ?? throw new InvalidOperationException(
+                            $"Function {site.Callee.Name} call boundary argument {index} has an empty candidate bucket.");
+                    _rootSearchGraph.AddEdge(new(callNode, boundaryNode, index, boundaryBucket));
                 }
             }
         }
 
-        if (boundaryCluster.VertexCount == 0)
+        if (newOutputBuckets.Count == 0)
         {
-            throw new InvalidOperationException($"Function call {callTargetName} argument {argumentIndex} has no legal actual/formal distributed boundary plan.");
+            return false;
         }
 
-        return boundaryCluster;
+        AppendDirectValueBuckets(site.SourceCall, newOutputBuckets);
+        if (site.SourceCall.CheckedType is TensorType tensorType && IsDistributableTensorType(tensorType))
+        {
+            CompleteOutputReshardClosure(
+                site.CallCluster,
+                tensorType,
+                newOutputBuckets,
+                DistributedReshardUsageKind.Internal,
+                site.Function);
+        }
+
+        return true;
+    }
+
+    private FunctionBoundarySite CreateFunctionBoundaryArgumentCluster(
+        Call call,
+        Function callee,
+        IVar parameter,
+        int argumentIndex,
+        DistributedSearchGraph actualCluster,
+        DistributedSearchGraph formalCluster)
+    {
+        var boundaryCluster = _rootSearchGraph.CreateCluster<DistributedSearchGraph>(SearchGraphKind.DistributedCluster);
+        if (!_functionBoundarySites.TryGetValue(parameter, out var sites))
+        {
+            sites = new List<FunctionBoundarySite>();
+            _functionBoundarySites.Add(parameter, sites);
+        }
+
+        if (parameter.CheckedType is not TensorType parameterTensorType)
+        {
+            throw new InvalidOperationException(
+                $"Function call {callee.Name} distributed boundary parameter {argumentIndex} must be a TensorType, got {parameter.CheckedType}.");
+        }
+
+        var site = new FunctionBoundarySite(
+            call,
+            callee,
+            parameter,
+            argumentIndex,
+            call.Arguments[argumentIndex],
+            actualCluster,
+            boundaryCluster);
+        sites.Add(site);
+        _allFunctionBoundarySites.Add(site);
+        ExpandFunctionBoundarySite(site, formalCluster, parameterTensorType);
+
+        if (boundaryCluster.VertexCount == 0)
+        {
+            throw new InvalidOperationException($"Function call {callee.Name} argument {argumentIndex} has no legal actual/formal distributed boundary plan.");
+        }
+
+        return site;
+    }
+
+    private bool ExpandFunctionBoundarySite(
+        FunctionBoundarySite site,
+        DistributedSearchGraph formalCluster,
+        TensorType parameterTensorType)
+    {
+        var directBuckets = _directValueBuckets.TryGetValue(site.Actual, out var recordedDirectBuckets)
+            ? recordedDirectBuckets
+            : site.ActualCluster.Clusters
+                .OfType<DistributedSearchGraph>()
+                .Where(cluster => cluster.Kind is SearchGraphKind.Bucket)
+                .ToArray();
+        var changed = false;
+        foreach (var directBucket in directBuckets)
+        {
+            if (!site.DirectActualBuckets.Add(directBucket))
+            {
+                continue;
+            }
+
+            changed = true;
+            if (directBucket.Vertices.FirstOrDefault()?.IRType is DistributedType demandedType
+                && EqualityComparer<TensorType>.Default.Equals(demandedType.TensorType, parameterTensorType))
+            {
+                EnsureFunctionParameterSignatureCandidate(
+                    site.Callee,
+                    site.Parameter,
+                    formalCluster,
+                    demandedType);
+            }
+        }
+
+        foreach (var formalBucket in formalCluster.Clusters.OfType<DistributedSearchGraph>())
+        {
+            var formalNode = formalBucket.Vertices.FirstOrDefault()
+                ?? throw new InvalidOperationException(
+                    $"Function {site.Callee.Name} parameter {site.Parameter.Name} has an empty signature bucket.");
+            changed |= RegisterOperationReturnDemand(site.Actual, formalNode.IRType);
+            AddFunctionBoundaryCandidates(
+                site.SourceCall,
+                site.ArgumentIndex,
+                site,
+                formalBucket);
+        }
+
+        return changed;
+    }
+
+    private void EnsureFunctionParameterSignatureCandidate(
+        Function function,
+        IVar parameter,
+        DistributedSearchGraph formalCluster,
+        DistributedType demandedType)
+    {
+        if (formalCluster.Clusters.OfType<DistributedSearchGraph>()
+            .Any(bucket => EqualityComparer<IRType>.Default.Equals(bucket.Vertices.FirstOrDefault()?.IRType, demandedType)))
+        {
+            return;
+        }
+
+        if (!SingleNodeMemoryCheck(demandedType, _moduleKind, TargetOptions))
+        {
+            return;
+        }
+
+        var formalBucket = formalCluster.CreateCluster<DistributedSearchGraph>(SearchGraphKind.Bucket);
+        var formalNode = new SearchableNode(
+            (BaseExpr)parameter,
+            demandedType,
+            kind: SearchableNodeKind.FunctionParameter);
+        formalBucket.AddVertex(formalNode);
+        RegisterFunctionParameterSignatureCandidate(
+            function,
+            parameter,
+            formalBucket,
+            formalNode);
+        ConnectFunctionParameterSignatureToUses(function, parameter, formalBucket, formalNode);
+
+        if (_functionBoundarySites.TryGetValue(parameter, out var sites))
+        {
+            foreach (var site in sites)
+            {
+                AddFunctionBoundaryCandidates(null, -1, site, formalBucket);
+            }
+        }
+
+        _profiler.Count("function_parameter_demanded_signature_candidates");
+    }
+
+    private void ConnectFunctionParameterSignatureToUses(
+        Function function,
+        IVar parameter,
+        DistributedSearchGraph formalBucket,
+        SearchableNode formalNode)
+    {
+        var useClusters = GetFunctionParameterUseClusters(function);
+        if (!useClusters.TryGetValue(parameter, out var useCluster))
+        {
+            throw new InvalidOperationException(
+                $"Function {function.Name} parameter {parameter.Name} has a signature cluster but no use cluster.");
+        }
+
+        var parameterExpression = (BaseExpr)parameter;
+        var directBuckets = _directValueBuckets.TryGetValue(parameterExpression, out var recordedDirectBuckets)
+            ? recordedDirectBuckets
+            : Array.Empty<DistributedSearchGraph>();
+        var useBucket = directBuckets.FirstOrDefault(bucket =>
+            EqualityComparer<IRType>.Default.Equals(bucket.Vertices.FirstOrDefault()?.IRType, formalNode.IRType));
+        if (useBucket is null)
+        {
+            useBucket = useCluster.CreateCluster<DistributedSearchGraph>(SearchGraphKind.Bucket);
+            var useNode = new SearchableNode(
+                (BaseExpr)parameter,
+                formalNode.IRType,
+                kind: SearchableNodeKind.TypeAdapter,
+                sourceKind: DistributedReshardSourceKind.FunctionParameter);
+            useBucket.AddVertex(useNode);
+            _rootSearchGraph.AddEdge(new(useNode, formalNode, 0, formalBucket));
+            RegisterNodeOwner(useNode, function);
+            AppendDirectValueBuckets(parameterExpression, [useBucket]);
+        }
+
+        if (formalNode.IRType is DistributedType { TensorType: var tensorType })
+        {
+            CompleteOutputReshardClosure(
+                useCluster,
+                tensorType,
+                [useBucket],
+                DistributedReshardUsageKind.Internal,
+                function);
+        }
+    }
+
+    private void RegisterFunctionParameterSignatureCandidate(
+        Function function,
+        IVar parameter,
+        DistributedSearchGraph formalBucket,
+        SearchableNode formalNode)
+    {
+        if (_functionParameterOwners.TryGetValue(parameter, out var owner))
+        {
+            if (!ReferenceEquals(owner, function))
+            {
+                throw new InvalidOperationException(
+                    $"Function parameter {parameter.Name} is owned by both {owner.Name} and {function.Name}.");
+            }
+        }
+        else
+        {
+            _functionParameterOwners.Add(parameter, function);
+        }
+
+        if (!_functionParameterSignatureCandidates.TryGetValue(parameter, out var candidates))
+        {
+            candidates = new Dictionary<IRType, (DistributedSearchGraph, SearchableNode)>();
+            _functionParameterSignatureCandidates.Add(parameter, candidates);
+        }
+
+        if (!candidates.TryAdd(formalNode.IRType, (formalBucket, formalNode)))
+        {
+            throw new InvalidOperationException(
+                $"Function {function.Name} parameter {parameter.Name} has duplicate signature candidate {formalNode.IRType}.");
+        }
+
+        RegisterNodeOwner(formalNode, function);
+        if (_functionParameterDerivedUseBuckets.TryGetValue(parameter, out var bucketsByType)
+            && bucketsByType.TryGetValue(formalNode.IRType, out var derivedBuckets))
+        {
+            foreach (var derivedBucket in derivedBuckets)
+            {
+                ConnectFunctionParameterSignatureToDerivedUse(
+                    function,
+                    parameter,
+                    formalBucket,
+                    formalNode,
+                    derivedBucket);
+            }
+        }
+    }
+
+    private void RegisterFunctionParameterDerivedUseBucket(
+        IVar parameter,
+        IRType type,
+        DistributedSearchGraph derivedBucket)
+    {
+        if (!_functionParameterOwners.TryGetValue(parameter, out var function))
+        {
+            throw new InvalidOperationException(
+                $"Derived use for function parameter {parameter.Name} was registered before its owner.");
+        }
+
+        if (!_functionParameterDerivedUseBuckets.TryGetValue(parameter, out var bucketsByType))
+        {
+            bucketsByType = new Dictionary<IRType, HashSet<DistributedSearchGraph>>();
+            _functionParameterDerivedUseBuckets.Add(parameter, bucketsByType);
+        }
+
+        if (!bucketsByType.TryGetValue(type, out var buckets))
+        {
+            buckets = new HashSet<DistributedSearchGraph>(ReferenceEqualityComparer.Instance);
+            bucketsByType.Add(type, buckets);
+        }
+
+        if (!buckets.Add(derivedBucket))
+        {
+            return;
+        }
+
+        if (_functionParameterSignatureCandidates.TryGetValue(parameter, out var candidates)
+            && candidates.TryGetValue(type, out var signature))
+        {
+            ConnectFunctionParameterSignatureToDerivedUse(
+                function,
+                parameter,
+                signature.Bucket,
+                signature.Node,
+                derivedBucket);
+        }
+    }
+
+    private void ConnectFunctionParameterSignatureToDerivedUse(
+        Function function,
+        IVar parameter,
+        DistributedSearchGraph formalBucket,
+        SearchableNode formalNode,
+        DistributedSearchGraph derivedBucket)
+    {
+        if (derivedBucket.Vertices.Any(candidate =>
+            candidate.Kind == SearchableNodeKind.TypeAdapter
+            && _rootSearchGraph.TryGetOutEdges(candidate, out var edges)
+            && edges.Any(edge => ReferenceEquals(edge.Target, formalNode))))
+        {
+            return;
+        }
+
+        var adapter = new SearchableNode(
+            (BaseExpr)parameter,
+            formalNode.IRType,
+            kind: SearchableNodeKind.TypeAdapter,
+            sourceKind: DistributedReshardSourceKind.FunctionParameter,
+            originParameter: parameter);
+        derivedBucket.AddVertex(adapter);
+        _rootSearchGraph.AddEdge(new(adapter, formalNode, 0, formalBucket));
+        RegisterNodeOwner(adapter, function);
+        _profiler.Count("function_parameter_equivalent_derived_use_candidates");
+    }
+
+    private void AddFunctionBoundaryCandidates(
+        Call? call,
+        int argumentIndex,
+        FunctionBoundarySite site,
+        DistributedSearchGraph formalBucket)
+    {
+        var callTargetName = call?.Target is Callable callable
+            ? callable.Name
+            : call?.Target.GetType().Name ?? "function";
+        DistributedSearchGraph? pathCluster = null;
+        var formalNode = formalBucket.Vertices.FirstOrDefault()
+            ?? throw new InvalidOperationException($"Function call {callTargetName} formal argument {argumentIndex} has an empty candidate bucket.");
+        foreach (var actualBucket in site.DirectActualBuckets)
+        {
+            var actualNode = actualBucket.Vertices.FirstOrDefault()
+                ?? throw new InvalidOperationException($"Function call {callTargetName} actual argument {argumentIndex} has an empty candidate bucket.");
+            foreach (var plan in GetFunctionBoundaryReshardPlans(
+                         actualNode.IRType,
+                         formalNode.IRType,
+                         GetReshardSourceKind(actualNode)))
+            {
+                var finalBucket = plan.StepTypes.Count == 0
+                    ? actualBucket
+                    : AddFunctionBoundaryReshardPath(
+                        pathCluster ??= _rootSearchGraph.CreateCluster<DistributedSearchGraph>(SearchGraphKind.DistributedCluster),
+                        actualBucket,
+                        actualNode,
+                        plan.StepTypes);
+                var finalNode = finalBucket.Vertices.First();
+                var (adapterBucket, adapterNode) = GetOrCreateReshardCandidate(
+                    site.BoundaryCluster,
+                    finalBucket,
+                    finalNode,
+                    formalNode.IRType,
+                    kind: SearchableNodeKind.FunctionBoundaryAdapter,
+                    dependencyBucket: formalBucket,
+                    dependencyNode: formalNode);
+                ConnectFunctionBoundaryCandidate(site, adapterBucket, adapterNode);
+            }
+        }
+    }
+
+    private void RegisterFunctionBoundaryCallConsumer(
+        FunctionBoundarySite site,
+        SearchableNode callNode,
+        int inputIndex)
+    {
+        site.CallConsumers.Add((callNode, inputIndex));
+        foreach (var boundaryBucket in site.BoundaryCluster.Clusters.OfType<DistributedSearchGraph>())
+        {
+            var boundaryNode = boundaryBucket.Vertices.FirstOrDefault()
+                ?? throw new InvalidOperationException("Function call boundary has an empty candidate bucket.");
+            ConnectFunctionBoundaryCandidate(site, boundaryBucket, boundaryNode, callNode, inputIndex);
+        }
+    }
+
+    private void ConnectFunctionBoundaryCandidate(
+        FunctionBoundarySite site,
+        DistributedSearchGraph boundaryBucket,
+        SearchableNode boundaryNode)
+    {
+        foreach (var (callNode, inputIndex) in site.CallConsumers)
+        {
+            ConnectFunctionBoundaryCandidate(site, boundaryBucket, boundaryNode, callNode, inputIndex);
+        }
+    }
+
+    private void ConnectFunctionBoundaryCandidate(
+        FunctionBoundarySite site,
+        DistributedSearchGraph boundaryBucket,
+        SearchableNode boundaryNode,
+        SearchableNode callNode,
+        int inputIndex)
+    {
+        if (_rootSearchGraph.TryGetOutEdges(callNode, out var edges)
+            && edges.Any(edge => edge.InputIndex == inputIndex
+                && ReferenceEquals(edge.InputGraph, boundaryBucket)
+                && ReferenceEquals(edge.Target, boundaryNode)))
+        {
+            return;
+        }
+
+        if (!site.CallConsumers.Any(consumer => ReferenceEquals(consumer.CallNode, callNode)
+            && consumer.InputIndex == inputIndex))
+        {
+            throw new InvalidOperationException("Function boundary candidate is not owned by the call consumer being connected.");
+        }
+
+        _rootSearchGraph.AddEdge(new(callNode, boundaryNode, inputIndex, boundaryBucket));
     }
 
     private IEnumerable<DistributedReshardPlan> GetFunctionBoundaryReshardPlans(
@@ -2444,11 +3435,15 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
 
         var distCluster = _rootSearchGraph.CreateCluster<DistributedSearchGraph>(SearchGraphKind.DistributedCluster);
         var tensorBucket = distCluster.CreateCluster<DistributedSearchGraph>(SearchGraphKind.Bucket);
-        tensorBucket.AddVertex(new SearchableNode(parameter, tensorType, kind: SearchableNodeKind.FunctionParameter));
+        var tensorNode = new SearchableNode(parameter, tensorType, kind: SearchableNodeKind.FunctionParameter);
+        tensorBucket.AddVertex(tensorNode);
+        RegisterFunctionParameterSignatureCandidate(function, parameter, tensorBucket, tensorNode);
         foreach (var dType in GetLeafCandidateDistTypes(tensorType))
         {
             var bucket = distCluster.CreateCluster<DistributedSearchGraph>(SearchGraphKind.Bucket);
-            bucket.AddVertex(new SearchableNode(parameter, dType, kind: SearchableNodeKind.FunctionParameter));
+            var node = new SearchableNode(parameter, dType, kind: SearchableNodeKind.FunctionParameter);
+            bucket.AddVertex(node);
+            RegisterFunctionParameterSignatureCandidate(function, parameter, bucket, node);
         }
 
         clusters.Add(parameter, distCluster);
@@ -2506,7 +3501,8 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
             useCluster,
             tensorType,
             directUseBuckets,
-            DistributedReshardUsageKind.Internal);
+            DistributedReshardUsageKind.Internal,
+            function);
         RecordDirectValueBuckets(parameter, directUseBuckets);
         clusters.Add(parameter, useCluster);
         return useCluster;
@@ -2533,6 +3529,26 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         }
 
         _directValueBuckets.Add(expression, buckets.ToArray());
+    }
+
+    private void AppendDirectValueBuckets(
+        BaseExpr expression,
+        IReadOnlyList<DistributedSearchGraph> buckets)
+    {
+        if (buckets.Count == 0 || !_directValueBuckets.TryGetValue(expression, out var existing))
+        {
+            return;
+        }
+
+        var additions = buckets
+            .Where(bucket => !existing.Any(current => ReferenceEquals(current, bucket)))
+            .ToArray();
+        if (additions.Length == 0)
+        {
+            return;
+        }
+
+        _directValueBuckets[expression] = existing.Concat(additions).ToArray();
     }
 
     private DistributedSearchGraph CreateOriginatorCluster(BaseExpr expr, bool init)
@@ -3887,7 +4903,7 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
                         var boolVar = cpmodel.NewBoolVar(string.Empty);
                         varMemo.Add(enode, boolVar);
                         if (_singleChoiceClusters.Contains(cluster)
-                            || enode.Expr is Op o && !IsReshardRealization(o))
+                            || IsExecutableOperationCandidate(enode))
                         {
                             clusterVarMemo[cluster].Add(boolVar);
                         }
@@ -4054,6 +5070,10 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
 
     private bool IsReshardRealization(BaseExpr expr)
         => expr is IR.Distributed.Boxing or IR.Distributed.ShardedView;
+
+    private bool IsExecutableOperationCandidate(SearchableNode node)
+        => node is { Kind: SearchableNodeKind.Normal, Expr: Op op }
+            && !IsReshardRealization(op);
 
     private BaseExpr ExtractSelectedExpression(DistributedSearchGraph rootCluster, Dictionary<SearchableNode, bool> picks)
         => _profiler.Time("extract_expr", () => new ExprBuildVisitor(_rootSearchGraph, picks).Visit(rootCluster.Clusters.OfType<DistributedSearchGraph>()));
@@ -4296,8 +5316,20 @@ internal sealed class ExprBuildVisitor
                     expr = MaterializeReshard(children[0], realization, root.IRType, $"{root.Kind} node");
                     break;
                 case (SearchableNodeKind.FunctionBoundaryAdapter, _):
-                    throw new InvalidOperationException(
-                        $"{SearchableNodeKind.FunctionBoundaryAdapter} requires an explicit reshard op, got {root.Expr.GetType().Name}.");
+                    if (children.Length != 1)
+                    {
+                        throw new InvalidOperationException($"{root.Kind} expects one data input, got {children.Length}.");
+                    }
+
+                    var boundaryInputType = EnsureMaterializedType(children[0], $"{root.Kind} input");
+                    if (!EqualityComparer<IRType>.Default.Equals(boundaryInputType, root.IRType))
+                    {
+                        throw new InvalidOperationException(
+                            $"{root.Kind} identity cannot change {boundaryInputType} to {root.IRType}.");
+                    }
+
+                    expr = children[0];
+                    break;
                 case (SearchableNodeKind.TypeAdapter, _):
                     if (children.Length != 1)
                     {

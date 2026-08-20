@@ -18,6 +18,8 @@ internal class PassesModule : IApplicationPart
         registrator.Register<ISimplifyProvider, SimplifyProvider>(reuse: Reuse.Singleton);
         registrator.Register<Distributed.IDistributedCandidateProviderResolver, Distributed.DistributedCandidateProviderResolver>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<Distributed.BinaryCandidateProvider>(reuse: Reuse.Singleton);
+        registrator.RegisterManyInterface<Distributed.WhereCandidateProvider>(reuse: Reuse.Singleton);
+        registrator.RegisterManyInterface<Distributed.GatherCandidateProvider>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<Distributed.NormApplyCandidateProvider>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<Distributed.BindNormStatsCandidateProvider>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<Distributed.QKVRoPEWithCacheCandidateProvider>(reuse: Reuse.Singleton);
