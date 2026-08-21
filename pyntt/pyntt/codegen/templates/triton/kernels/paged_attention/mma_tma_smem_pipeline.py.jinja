@@ -276,11 +276,7 @@ def {{ model["FunctionName"] }}__regular_consumer(key_reader, value_reader, {{ h
     split_begin = tl.where(direct_context, 0, planned_split_begin).to(tl.int32)
     split_end = tl.where(direct_context, max_seq_len, planned_split_end).to(tl.int32)
 {{ common.structured_axis(ctx["query_dim_axis"], "    ") }}
-{% if model["RematerializeEntryIndices"] %}
-    dim_offsets = tle.gpu.rematerialize_index(tl.arange(0, {{ cache["HeadDim"] }}))
-{% else %}
     dim_offsets = tl.arange(0, {{ cache["HeadDim"] }})
-{% endif %}
     full_shared_rows = tl.broadcast_to(tl.arange(0, {{ ctx["attention_block_size"] }})[:, None], ({{ ctx["attention_block_size"] }}, {{ cache["HeadDim"] }}))
     full_shared_dims = tl.broadcast_to(dim_offsets[None, :], ({{ ctx["attention_block_size"] }}, {{ cache["HeadDim"] }}))
     tail_shared_rows = tl.broadcast_to(tl.arange(0, {{ ctx["attention_copy_block_size"] }})[:, None], ({{ ctx["attention_copy_block_size"] }}, {{ cache["HeadDim"] }}))
@@ -320,11 +316,7 @@ def {{ model["FunctionName"] }}__regular_consumer(key_reader, value_reader, {{ h
             global_q_head = (tl.full((), 0, tl.int32) + ({{ ctx["global_q_head_from_local"] }})).to(tl.int32)
             kv_head = tl.minimum(global_q_head // {{ ctx["q_head_group_size"] }}, {{ cache["NumKVHeads"] - 1 }}).to(tl.int32)
 {% endif %}
-{% if model["RematerializeEntryIndices"] %}
-            q_group_offsets = tle.gpu.rematerialize_index(tl.arange(0, {{ ctx["q_head_group_tile"] }}))
-{% else %}
             q_group_offsets = tl.arange(0, {{ ctx["q_head_group_tile"] }})
-{% endif %}
 {% if ctx["contiguous_q_head_groups"] %}
             global_q_heads = kv_head * {{ ctx["q_head_group_size"] }} + q_group_offsets
             local_q_heads = global_q_heads - global_q_head_begin

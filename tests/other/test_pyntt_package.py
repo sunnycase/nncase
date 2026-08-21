@@ -1448,7 +1448,7 @@ def test_pyntt_renderer_passes_nested_device_arguments_directly():
     assert "pyntt_call_frame" not in source
 
 
-def test_pyntt_renderer_rematerializes_nested_device_helper_indices(monkeypatch):
+def test_pyntt_renderer_marks_nested_device_helpers_noinline(monkeypatch):
     _add_pyntt_to_path()
     import pyntt.codegen.render as render
 
@@ -1474,10 +1474,8 @@ def test_pyntt_renderer_rematerializes_nested_device_helper_indices(monkeypatch)
         255,
         {},
         (),
-        rematerialize_entry_indices=True,
     )
 
-    assert captured["rematerialize_entry_indices"] is True
     assert captured["noinline"] is True
 
 

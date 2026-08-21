@@ -1268,7 +1268,6 @@ def _render_kernel(
         env,
         kernel.get("helpers", ()),
         noinline=True,
-        rematerialize_entry_indices=True,
         num_warps=num_warps,
         target_worker_width=target_worker_width,
         producer_warps=backend_config["producer_warps"],
@@ -1292,7 +1291,6 @@ def _render_kernel(
             backend_config["registers_per_thread_limit"],
             backend_config,
             mesh_axes,
-            rematerialize_entry_indices=True,
         )
         for device_function in device_functions
     ]
@@ -1344,14 +1342,11 @@ def _render_device_function(
     registers_per_thread_limit: int,
     kernel_config: dict[str, Any],
     mesh_axes: tuple[dict[str, Any], ...],
-    *,
-    rematerialize_entry_indices: bool,
 ) -> str:
     helper_sources = _render_helper_sources(
         env,
         device_function.get("helpers", ()),
         noinline=True,
-        rematerialize_entry_indices=rematerialize_entry_indices,
         num_warps=num_warps,
         target_worker_width=target_worker_width,
         producer_warps=producer_warps,
@@ -1476,7 +1471,6 @@ def _render_helper_sources(
     helpers: Any,
     *,
     noinline: bool = False,
-    rematerialize_entry_indices: bool = False,
     num_warps: int | None = None,
     target_worker_width: int | None = None,
     producer_warps: int | None = None,
@@ -1502,9 +1496,6 @@ def _render_helper_sources(
             device_functions_by_name=device_functions_by_name,
             mesh_axes=mesh_axes,
         )
-        model["RematerializeEntryIndices"] = bool(
-            rematerialize_entry_indices
-        )
         model["Arguments"] = tuple(helper["arguments"])
         model["WorkspaceArguments"] = tuple(helper["workspace_arguments"])
         helper_sources.append(
@@ -1529,7 +1520,6 @@ def _prepare_helper_model(
 ) -> dict[str, Any]:
     model = dict(raw_model)
     model["NoInline"] = bool(noinline)
-    model["RematerializeEntryIndices"] = False
     model["MeshAxes"] = mesh_axes
     if num_warps is not None:
         model["NumWarps"] = num_warps
@@ -6593,7 +6583,6 @@ def _packed_matmul_sampling_partial_template_context(
             name: model[name]
             for name in (
                 "NoInline",
-                "RematerializeEntryIndices",
                 "MeshAxes",
                 "NumWarps",
                 "TargetWorkerWidth",

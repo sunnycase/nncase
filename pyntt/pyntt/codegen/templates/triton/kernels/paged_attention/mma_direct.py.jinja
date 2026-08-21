@@ -39,11 +39,7 @@
 {% if ctx["value_axis_kind"] == "dim" %}
 {{ common.structured_axis(ctx["value_axis"], "    ") }}
 {% endif %}
-{% if model["RematerializeEntryIndices"] %}
-    dim_offsets = tle.gpu.rematerialize_index(tl.arange(0, {{ cache["HeadDim"] }}))
-{% else %}
     dim_offsets = tl.arange(0, {{ cache["HeadDim"] }})
-{% endif %}
     for local_query_id in tl.range(0, {{ dim(ctx["local_query_tokens"]) }}):
         global_query_id = {{ ctx["global_query_id"] }}
         context_len = tl.full((), 0, tl.int64)
@@ -77,11 +73,7 @@
             global_q_head = (tl.full((), 0, tl.int32) + ({{ ctx["global_q_head_from_local"] }})).to(tl.int32)
             kv_head = tl.minimum(global_q_head // {{ ctx["q_head_group_size"] }}, {{ cache["NumKVHeads"] - 1 }}).to(tl.int32)
 {% endif %}
-{% if model["RematerializeEntryIndices"] %}
-            q_group_offsets = tle.gpu.rematerialize_index(tl.arange(0, {{ ctx["q_head_group_tile"] }}))
-{% else %}
             q_group_offsets = tl.arange(0, {{ ctx["q_head_group_tile"] }})
-{% endif %}
 {% if ctx["contiguous_q_head_groups"] %}
             global_q_heads = kv_head * {{ ctx["q_head_group_size"] }} + q_group_offsets
             local_q_heads = global_q_heads - global_q_head_begin

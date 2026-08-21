@@ -104,11 +104,7 @@ def {{ model["FunctionName"] }}__consumer(reader, {{ helper_parameters(model) }}
 {% endif %}
     stats_square_sum = 0.0
 {% endif %}
-{% if model["RematerializeEntryIndices"] %}
-    local_n_source = tle.gpu.rematerialize_index(tl.arange(0, {{ ctx["block_n"] }}))
-{% else %}
     local_n_source = tl.arange(0, {{ ctx["block_n"] }})
-{% endif %}
     local_n = tle.encoding(
         tle.encoding(
             local_n_source,

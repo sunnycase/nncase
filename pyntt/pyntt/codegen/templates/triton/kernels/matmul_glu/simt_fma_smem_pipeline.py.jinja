@@ -111,11 +111,7 @@ def {{ model["FunctionName"] }}__consumer_stage(
     input0,
     k_tile,
 ):
-{% if model["RematerializeEntryIndices"] %}
-    local_n_source = tle.gpu.rematerialize_index(tl.arange(0, {{ ctx["block_n"] }}))
-{% else %}
     local_n_source = tl.arange(0, {{ ctx["block_n"] }})
-{% endif %}
     local_n = tle.encoding(
         tle.encoding(
             local_n_source,
@@ -207,11 +203,7 @@ def {{ model["FunctionName"] }}__consumer(reader, {{ helper_parameters(model) }}
     {{ prefix | lower }}_bias = {{ ptr(model, prefix ~ "Bias") }}
 {% endif %}
 {% endfor %}
-{% if model["RematerializeEntryIndices"] %}
-    local_n_source = tle.gpu.rematerialize_index(tl.arange(0, {{ ctx["block_n"] }}))
-{% else %}
     local_n_source = tl.arange(0, {{ ctx["block_n"] }})
-{% endif %}
 {% if not ctx["outline_consumer_stage"] %}
     local_n = tle.encoding(
         tle.encoding(
