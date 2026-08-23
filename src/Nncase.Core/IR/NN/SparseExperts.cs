@@ -14,6 +14,7 @@ namespace Nncase.IR.NN;
 [PatternFunctionalGenerator]
 public sealed partial class SparseExperts : Op
 {
+    // Vector lanes on Q and the result represent physical packing of hidden axis 1.
     public static readonly ParameterInfo Q = new(typeof(SparseExperts), 0, "q", ParameterKind.Input);
     public static readonly ParameterInfo RouterExpertIds = new(typeof(SparseExperts), 1, "RouterExpertIds", ParameterKind.Input);
     public static readonly ParameterInfo RouterExpertWeights = new(typeof(SparseExperts), 2, "RouterExpertWeights", ParameterKind.Input);

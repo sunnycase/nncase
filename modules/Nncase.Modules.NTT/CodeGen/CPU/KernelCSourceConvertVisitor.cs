@@ -790,6 +790,12 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
                 case TIR.NTT.SparseExperts sparseExperts:
                     IndentScope.Writer.IndWrite($"sparse_experts({VisitBuffer(args[0], local: true).Name}, {VisitBuffer(args[1], local: true).Name}, {VisitBuffer(args[2], local: true).Name}, {VisitBuffer(args[3], local: true).Name}, {VisitBuffer(args[4], local: true).Name}, {VisitBuffer(args[5], local: true).Name}, {VisitBuffer(args[6], local: true).Name}, {VisitBuffer(args[7], local: true).Name}, {VisitBuffer(args[8], local: true).Name}, {VisitBuffer(args[9], local: true).Name}, {VisitBuffer(args[10], local: true).Name}, {VisitBuffer(args[11], local: true).Name},{VisitBuffer(args[13], local: true).Name}, {sparseExperts.HiddenSize}, {sparseExperts.MoEIntermediateSize}, {sparseExperts.NumExpert}, {sparseExperts.NumTopK}, {sparseExperts.ChunkSize});\n");
                     break;
+                case TIR.NTT.SparseExpertsGateUp gateUp:
+                    IndentScope.Writer.IndWrite($"sparse_experts_gate_up({VisitBuffer(args[0], local: true).Name}, {VisitBuffer(args[1], local: true).Name}, {VisitBuffer(args[2], local: true).Name}, {VisitBuffer(args[3], local: true).Name}, {VisitBuffer(args[4], local: true).Name}, {VisitBuffer(args[5], local: true).Name}, {VisitBuffer(args[6], local: true).Name}, {VisitBuffer(args[7], local: true).Name}, {VisitBuffer(args[8], local: true).Name}, {gateUp.HiddenSize}, {gateUp.MoEIntermediateSize}, {gateUp.NumExpert}, {gateUp.NumTopK}, {gateUp.ChunkSize});\n");
+                    break;
+                case TIR.NTT.SparseExpertsDown down:
+                    IndentScope.Writer.IndWrite($"sparse_experts_down({VisitBuffer(args[0], local: true).Name}, {VisitBuffer(args[1], local: true).Name}, {VisitBuffer(args[2], local: true).Name}, {VisitBuffer(args[3], local: true).Name}, {VisitBuffer(args[4], local: true).Name}, {VisitBuffer(args[5], local: true).Name}, {VisitBuffer(args[6], local: true).Name}, {down.HiddenSize}, {down.MoEIntermediateSize}, {down.NumExpert}, {down.NumTopK}, {down.ChunkSize});\n");
+                    break;
                 case TIR.NTT.TopK topK:
                     {
                         var inputBuffer = VisitBuffer(args[0], local: true);

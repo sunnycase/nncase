@@ -292,6 +292,63 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
                         fused.AttentionLayout);
                 }
 
+            case IR.NN.GatedDeltaNetProjection projection:
+                {
+                    var outputBase = Unsafe.As<Expr, BaseExpr>(ref output);
+                    if (outputBase is not IR.Tuple { Count: 2 } outputs)
+                    {
+                        throw new NotSupportedException(
+                            "GatedDeltaNetProjection TIR selection expects QKV and state outputs.");
+                    }
+
+                    var qkvOutput = (Expr)outputs[0];
+                    Unsafe.As<Expr, BaseExpr>(ref output) = new IR.Tuple(
+                        qkvOutput,
+                        (Expr)arguments[IR.NN.GatedDeltaNetProjection.State.Index]);
+
+                    return TIR.F.NTT.GatedDeltaNetProjection(
+                        (Expr)arguments[IR.NN.GatedDeltaNetProjection.Input.Index],
+                        (Expr)arguments[IR.NN.GatedDeltaNetProjection.State.Index],
+                        (Expr)arguments[IR.NN.GatedDeltaNetProjection.QKVWeight.Index],
+                        (Expr)arguments[IR.NN.GatedDeltaNetProjection.ConvWeight.Index],
+                        qkvOutput,
+                        (Dimension)arguments[IR.NN.GatedDeltaNetProjection.LayerId.Index],
+                        projection.ConvKernelSize);
+                }
+
+            case IR.NN.GatedDeltaNetRecurrentCore recurrent:
+                {
+                    var outputBase = Unsafe.As<Expr, BaseExpr>(ref output);
+                    if (outputBase is not IR.Tuple { Count: 2 } outputs)
+                    {
+                        throw new NotSupportedException(
+                            "GatedDeltaNetRecurrentCore TIR selection expects gated activation and state outputs.");
+                    }
+
+                    var gatedOutput = (Expr)outputs[0];
+                    Unsafe.As<Expr, BaseExpr>(ref output) = new IR.Tuple(
+                        gatedOutput,
+                        (Expr)arguments[IR.NN.GatedDeltaNetRecurrentCore.State.Index]);
+
+                    return TIR.F.NTT.GatedDeltaNetRecurrentCore(
+                        (Expr)arguments[IR.NN.GatedDeltaNetRecurrentCore.Input.Index],
+                        (Expr)arguments[IR.NN.GatedDeltaNetRecurrentCore.State.Index],
+                        (Expr)arguments[IR.NN.GatedDeltaNetRecurrentCore.QKV.Index],
+                        (Expr)arguments[IR.NN.GatedDeltaNetRecurrentCore.ZWeight.Index],
+                        (Expr)arguments[IR.NN.GatedDeltaNetRecurrentCore.BWeight.Index],
+                        (Expr)arguments[IR.NN.GatedDeltaNetRecurrentCore.AWeight.Index],
+                        (Expr)arguments[IR.NN.GatedDeltaNetRecurrentCore.ALog.Index],
+                        (Expr)arguments[IR.NN.GatedDeltaNetRecurrentCore.DtBias.Index],
+                        (Expr)arguments[IR.NN.GatedDeltaNetRecurrentCore.NormWeight.Index],
+                        gatedOutput,
+                        (Dimension)arguments[IR.NN.GatedDeltaNetRecurrentCore.LayerId.Index],
+                        recurrent.NumKeyHeads,
+                        recurrent.NumValueHeads,
+                        recurrent.KeyHeadDim,
+                        recurrent.ValueHeadDim,
+                        recurrent.Epsilon);
+                }
+
             case IR.NN.MatMulGlu matmulGlu:
                 return TIR.F.NTT.MatMulGlu(
                     (Expr)arguments[0],
@@ -369,6 +426,10 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
                 return TIR.F.NTT.Expand((Expr)arguments[0], output);
             case IR.NN.Erf erf:
                 return TIR.F.NTT.Erf((Expr)arguments[0], output);
+            case IR.NN.Sigmoid:
+                return GenerateUnary(UnaryOp.Sigmoid, arguments, output);
+            case IR.NN.Softplus:
+                return GenerateUnary(UnaryOp.Softplus, arguments, output);
             case IR.NTT.VectorizedReduce pr:
                 return TIR.F.NTT.Reduce((Expr)arguments[0], output, false, pr.VectorizedAxes.ToArray(), ((RankedShape)call[IR.NTT.VectorizedReduce.PadedNums]).Dimensions.ToArray(), pr.Axes, pr.KeepDims, pr.ReduceOp);
             case IR.Math.Compare compare:
@@ -438,8 +499,10 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
                 return TIR.F.NTT.VectorizedSoftmax((Expr)arguments[0], output, softmax.Axis, softmax.VectorizedAxes);
             case IR.NN.Qwen3MoE moe:
                 return TIR.F.NTT.Qwen3MoE((Expr)arguments[0], (Expr)arguments[1], (Expr)arguments[2], (Expr)arguments[3], (Expr)arguments[4], (Expr)arguments[5], (Expr)arguments[6], (Expr)arguments[7], (Expr)arguments[8], (Expr)arguments[9], (Expr)arguments[10], output, moe.LayerId, moe.HiddenSize, moe.IntermediateSize, moe.MoEIntermediateSize, moe.NumExpert, moe.NumTopK, moe.IsNormTopkProb);
-            case IR.NN.SparseExperts sparseExperts:
-                return TIR.F.NTT.SparseExperts((Expr)arguments[0], (Expr)arguments[1], (Expr)arguments[2], (Expr)arguments[3], (Expr)arguments[4], (Expr)arguments[5], (Expr)arguments[6], (Expr)arguments[7], (Expr)arguments[8], (Expr)arguments[9], (Expr)arguments[10], (Expr)arguments[11], output, sparseExperts.HiddenSize, sparseExperts.MoEIntermediateSize, sparseExperts.NumExpert, sparseExperts.NumTopK, sparseExperts.ChunkSize);
+            case IR.NN.SparseExpertsGateUp gateUp:
+                return TIR.F.NTT.SparseExpertsGateUp((Expr)arguments[0], (Expr)arguments[1], (Expr)arguments[2], (Expr)arguments[3], (Expr)arguments[4], (Expr)arguments[5], (Expr)arguments[6], (Expr)arguments[7], output, gateUp.HiddenSize, gateUp.MoEIntermediateSize, gateUp.NumExpert, gateUp.NumTopK, gateUp.ChunkSize);
+            case IR.NN.SparseExpertsDown down:
+                return TIR.F.NTT.SparseExpertsDown((Expr)arguments[0], (Expr)arguments[1], (Expr)arguments[2], (Expr)arguments[3], (Expr)arguments[4], (Expr)arguments[5], output, down.HiddenSize, down.MoEIntermediateSize, down.NumExpert, down.NumTopK, down.ChunkSize);
             case IR.Tensors.TopK topk:
                 return TIR.F.NTT.TopK((Expr)arguments[0], (Expr)arguments[1], output, ((TensorConst)call[IR.Tensors.TopK.Axis]).Value.ToScalar<long>(), ((TensorConst)call[IR.Tensors.TopK.Largest]).Value.ToScalar<long>(), ((TensorConst)call[IR.Tensors.TopK.Sorted]).Value.ToScalar<long>());
             case IR.CustomNTT.SparseExperts sparseExperts:

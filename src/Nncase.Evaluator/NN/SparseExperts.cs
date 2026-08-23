@@ -18,47 +18,200 @@ public sealed class SparseExpertsEvaluator : ITypeInferencer<SparseExperts>, ICo
 {
     public IRType Visit(ITypeInferenceContext context, SparseExperts target)
     {
-        /*
-        public static readonly ParameterInfo Q = new(typeof(SparseExperts), 0, "q", ParameterKind.Input);
-        public static readonly ParameterInfo MoeGateW = new(typeof(SparseExperts), 1, "MoeGateW", ParameterKind.Input);
-        public static readonly ParameterInfo MoeExpertDownProjW = new(typeof(SparseExperts), 2, "MoeExpertDownProjW", ParameterKind.Input);
-        public static readonly ParameterInfo MoeExpertDownProjScale = new(typeof(SparseExperts), 3, "MoeExpertDownProjScale", ParameterKind.Input);
-        public static readonly ParameterInfo MoeExpertGateProjW = new(typeof(SparseExperts), 4, "MoeExpertGateProjW", ParameterKind.Input);
-        public static readonly ParameterInfo MoeExpertGateProjScale = new(typeof(SparseExperts), 5, "MoeExpertGateProjScale", ParameterKind.Input);
-        public static readonly ParameterInfo MoeExpertUpProjW = new(typeof(SparseExperts), 6, "MoeExpertUpProjW", ParameterKind.Input);
-        public static readonly ParameterInfo MoeExpertUpProjScale = new(typeof(SparseExperts), 7, "MoeExpertUpProjScale", ParameterKind.Input);
-        */
-        var qType = context.GetArgumentType(target, SparseExperts.Q);
-
-        return qType switch
-        {
-            AnyType => AnyType.Default,
-            InvalidType invalid => invalid,
-            DistributedType distributed => Visit(context, target, distributed),
-            TensorType tensor => Visit(context, target, tensor),
-            _ => new InvalidType("not support type"),
-        };
+        var arguments = target.Parameters
+            .Select(parameter => context.CheckArgumentType<IRType>(target, parameter))
+            .ToArray();
+        return InferType(target, arguments);
     }
 
     public Cost Visit(ICostEvaluateContext context, SparseExperts target)
     {
-        var qType = context.GetArgumentType<IRType>(target, SparseExperts.Q);
-        var returnType = context.GetReturnType<IRType>();
-
-        // cycles = softmax((q @ k^t) + mask) @ v.
-        return new()
+        var packedQ = GetLocalTensorType(context.GetArgumentType<IRType>(target, SparseExperts.Q));
+        var ids = GetLocalTensorType(context.GetArgumentType<IRType>(target, SparseExperts.RouterExpertIds));
+        var routerWeights = GetLocalTensorType(context.GetArgumentType<IRType>(target, SparseExperts.RouterExpertWeights));
+        var gateInputScale = GetLocalTensorType(context.GetArgumentType<IRType>(target, SparseExperts.MoeExpertGateInputScale));
+        var gateWeight = GetLocalTensorType(context.GetArgumentType<IRType>(target, SparseExperts.MoeExpertGateProjW));
+        var gateScale = GetLocalTensorType(context.GetArgumentType<IRType>(target, SparseExperts.MoeExpertGateProjScale));
+        var downInputScale = GetLocalTensorType(context.GetArgumentType<IRType>(target, SparseExperts.MoeExpertDownInputScale));
+        var downWeight = GetLocalTensorType(context.GetArgumentType<IRType>(target, SparseExperts.MoeExpertDownProjW));
+        var downScale = GetLocalTensorType(context.GetArgumentType<IRType>(target, SparseExperts.MoeExpertDownProjScale));
+        var upInputScale = GetLocalTensorType(context.GetArgumentType<IRType>(target, SparseExperts.MoeExpertUpInputScale));
+        var upWeight = GetLocalTensorType(context.GetArgumentType<IRType>(target, SparseExperts.MoeExpertUpProjW));
+        var upScale = GetLocalTensorType(context.GetArgumentType<IRType>(target, SparseExperts.MoeExpertUpProjScale));
+        var packedOutput = GetLocalTensorType(context.GetReturnType<IRType>());
+        var q = GetLogicalActivationType(packedQ);
+        var output = GetLogicalActivationType(packedOutput);
+        if (!TryGetMaxShape(q, out var qShape) ||
+            !TryGetMaxShape(gateWeight, out var gateShape) ||
+            !TryGetMaxShape(downWeight, out var downShape) ||
+            !TryGetMaxShape(output, out var outputShape))
         {
-            // todo kv cache
-            [CostFactorNames.BlockLocalMemoryLoadBytes] = CostUtility.GetMemoryAccess(qType),
+            return Cost.Zero;
+        }
 
-            // todo [CostFactorNames.CPUCycles].
-            [CostFactorNames.BlockLocalMemoryStoreBytes] = CostUtility.GetMemoryAccess(returnType),
-        };
+        var tokens = qShape[0];
+        var hidden = qShape[1];
+        var intermediate = gateShape[1];
+        var outputFeatures = outputShape[1];
+        var topK = System.Math.Max(0, target.NumTopK);
+        var inputTensor = new TargetCostTensor(q.DType, new RankedShape(tokens, hidden));
+        var intermediateTensor = new TargetCostTensor(output.DType, new RankedShape(tokens, intermediate));
+        var outputTensor = new TargetCostTensor(output.DType, new RankedShape(tokens, outputFeatures));
+        var gateMatrix = new TargetCostTensor(gateWeight.DType, new RankedShape(hidden, intermediate));
+        var upMatrix = new TargetCostTensor(upWeight.DType, new RankedShape(hidden, intermediate));
+        var downMatrix = new TargetCostTensor(downWeight.DType, new RankedShape(intermediate, outputFeatures));
+        var cost = Cost.Zero;
+        if (context.TargetCostModel.TryGetMatMulCost(
+                new(inputTensor, gateMatrix, intermediateTensor, output.DType, MatMulOpCostKind.Simt),
+                out var gateCost) &&
+            context.TargetCostModel.TryGetMatMulCost(
+                new(inputTensor, upMatrix, intermediateTensor, output.DType, MatMulOpCostKind.Simt),
+                out var upCost) &&
+            context.TargetCostModel.TryGetMatMulCost(
+                new(intermediateTensor, downMatrix, outputTensor, output.DType, MatMulOpCostKind.Simt),
+                out var downCost))
+        {
+            cost = (gateCost + upCost + downCost) * (UInt128)topK;
+        }
+        else
+        {
+            cost[CostFactorNames.CPUCycles] = checked(
+                (UInt128)tokens * (UInt128)topK *
+                (((UInt128)2 * (UInt128)hidden * (UInt128)intermediate) +
+                 ((UInt128)intermediate * (UInt128)outputFeatures)));
+        }
+
+        if (context.TargetCostModel.TryGetElementwiseCost(
+                new("sparse_experts_swiglu", [intermediateTensor, intermediateTensor], intermediateTensor, 9.0),
+                out var activationCost))
+        {
+            cost += activationCost * (UInt128)topK;
+        }
+
+        cost.Factors[CostFactorNames.BlockLocalMemoryLoadBytes] = checked(
+            (UInt128)tokens * (UInt128)topK *
+            (((UInt128)hidden * (UInt128)GetScalarByteCount(q.DType)) +
+             ((UInt128)intermediate * (UInt128)hidden * (UInt128)(GetScalarByteCount(gateWeight.DType) + GetScalarByteCount(upWeight.DType))) +
+             ((UInt128)outputFeatures * (UInt128)intermediate * (UInt128)GetScalarByteCount(downWeight.DType)) +
+             (UInt128)(GetScalarByteCount(ids.DType) + GetScalarByteCount(routerWeights.DType) +
+                 GetScalarByteCount(gateInputScale.DType) + GetScalarByteCount(gateScale.DType) +
+                 GetScalarByteCount(downInputScale.DType) + GetScalarByteCount(downScale.DType) +
+                 GetScalarByteCount(upInputScale.DType) + GetScalarByteCount(upScale.DType))));
+        cost.Factors[CostFactorNames.BlockLocalMemoryStoreBytes] = checked(
+            (UInt128)tokens * (UInt128)outputFeatures * (UInt128)GetScalarByteCount(output.DType));
+        return cost;
+    }
+
+    public static IRType InferType(SparseExperts target, IReadOnlyList<IRType> arguments)
+    {
+        if (arguments.Count != target.Parameters.Count)
+        {
+            return new InvalidType($"SparseExperts expects {target.Parameters.Count} inputs, got {arguments.Count}.");
+        }
+
+        if (arguments.OfType<InvalidType>().FirstOrDefault() is { } invalid)
+        {
+            return invalid;
+        }
+
+        if (arguments.Any(type => type is AnyType))
+        {
+            return AnyType.Default;
+        }
+
+        if (arguments.All(type => type is TensorType))
+        {
+            var tensors = arguments.Cast<TensorType>().ToArray();
+            return ValidateTensorContract(target, tensors) is { } plainTensorCheck
+                ? plainTensorCheck
+                : tensors[SparseExperts.Q.Index];
+        }
+
+        if (!arguments.All(type => type is DistributedType))
+        {
+            return new InvalidType("SparseExperts requires either tensor inputs or distributed inputs with one common placement.");
+        }
+
+        var distributed = arguments.Cast<DistributedType>().ToArray();
+        var tensorCheck = ValidateTensorContract(target, distributed.Select(type => type.TensorType).ToArray());
+        if (tensorCheck is not null)
+        {
+            return tensorCheck;
+        }
+
+        var placement = distributed[SparseExperts.Q.Index].Placement;
+        if (distributed.Any(type => type.Placement != placement))
+        {
+            return new InvalidType("SparseExperts distributed inputs must use one placement.");
+        }
+
+        if (distributed.Any(HasPartial))
+        {
+            return new InvalidType("SparseExperts does not accept partial inputs.");
+        }
+
+        var q = distributed[SparseExperts.Q.Index];
+        var ids = distributed[SparseExperts.RouterExpertIds.Index];
+        var routerWeights = distributed[SparseExperts.RouterExpertWeights.Index];
+        var gate = distributed[SparseExperts.MoeExpertGateProjW.Index];
+        var down = distributed[SparseExperts.MoeExpertDownProjW.Index];
+        var up = distributed[SparseExperts.MoeExpertUpProjW.Index];
+        var tokenPolicy = q.AxisPolicies[0];
+        var intermediatePolicy = gate.AxisPolicies[1];
+        var outputPolicy = down.AxisPolicies[1];
+        if (q.AxisPolicies[1] is not SBPBroadCast ||
+            ids.AxisPolicies[0] != tokenPolicy || ids.AxisPolicies[1] is not SBPBroadCast ||
+            routerWeights.AxisPolicies[0] != tokenPolicy || routerWeights.AxisPolicies[1] is not SBPBroadCast ||
+            gate.AxisPolicies[0] is not SBPBroadCast || gate.AxisPolicies[2] is not SBPBroadCast ||
+            up.AxisPolicies[0] is not SBPBroadCast || up.AxisPolicies[1] != intermediatePolicy || up.AxisPolicies[2] is not SBPBroadCast ||
+            down.AxisPolicies[0] is not SBPBroadCast || down.AxisPolicies[2] != intermediatePolicy)
+        {
+            return new InvalidType("SparseExperts requires token-aligned router inputs, matching gate/up intermediate sharding, and matching down reduction sharding.");
+        }
+
+        foreach (var parameter in new[]
+                 {
+                     SparseExperts.MoeExpertGateInputScale,
+                     SparseExperts.MoeExpertGateProjScale,
+                     SparseExperts.MoeExpertDownInputScale,
+                     SparseExperts.MoeExpertDownProjScale,
+                     SparseExperts.MoeExpertUpInputScale,
+                     SparseExperts.MoeExpertUpProjScale,
+                 })
+        {
+            if (distributed[parameter.Index].AxisPolicies.Any(policy => policy is not SBPBroadCast))
+            {
+                return new InvalidType($"SparseExperts {parameter.Name} must be broadcast because experts are selected dynamically.");
+            }
+        }
+
+        if (!TryGetRoleAxes(tokenPolicy, placement.Rank, out var tokenAxes) ||
+            !TryGetRoleAxes(intermediatePolicy, placement.Rank, out var intermediateAxes) ||
+            !TryGetRoleAxes(outputPolicy, placement.Rank, out var outputAxes) ||
+            !AreDisjoint(tokenAxes, intermediateAxes, outputAxes))
+        {
+            return new InvalidType("SparseExperts token, intermediate, and output sharding must own disjoint hierarchy axes and use contiguous splits.");
+        }
+
+        return new DistributedType(
+            q.TensorType,
+            [tokenPolicy, outputPolicy],
+            placement,
+            intermediateAxes.Length == 0 ? null : SBP.P(intermediateAxes));
     }
 
     public IValue Visit(IEvaluateContext context, SparseExperts target)
     {
-        var q = context.GetOrtArgumentValue(target, SparseExperts.Q);
+        var qValue = context.GetArgumentValueAsTensor(target, SparseExperts.Q);
+        var q = qValue.ToOrtTensor();
+        var qLanes = qValue.ElementType is VectorType vector
+            ? vector.Lanes.ToArray()
+            : Array.Empty<int>();
+        if (qLanes.Length != 0)
+        {
+            q = q.Unpack(qLanes.Length, Enumerable.Repeat(1, qLanes.Length).ToArray());
+        }
+
         var qType = q.DataType;
         q = q.Cast(OrtDataType.Float);
         var selectedExperts = GetOrtTensor(context.GetArgumentValue(target, SparseExperts.RouterExpertIds).AsTensor());
@@ -162,7 +315,14 @@ public sealed class SparseExpertsEvaluator : ITypeInferencer<SparseExperts>, ICo
 
         finalHiddenStates = OrtKI.Cast(finalHiddenStates, (long)qType);
 
-        return finalHiddenStates.ToValue();
+        if (qLanes.Length == 0)
+        {
+            return finalHiddenStates.ToValue();
+        }
+
+        return finalHiddenStates
+            .Pack(0, qLanes, Enumerable.Repeat(1, qLanes.Length).ToArray())
+            .ToValue(qValue.ElementType);
     }
 
     private OrtKISharp.Tensor GetOrtTensor(Tensor tensor)
@@ -233,36 +393,114 @@ public sealed class SparseExpertsEvaluator : ITypeInferencer<SparseExperts>, ICo
         return states;
     }
 
-    private IRType Visit(ITypeInferenceContext context, SparseExperts target, TensorType q)
+    private static InvalidType? ValidateTensorContract(SparseExperts target, IReadOnlyList<TensorType> arguments)
     {
-        // switch (q.DType)
-        // {
-        //     case VectorType vt:
-        //         var newElemType = vt.ElemType switch
-        //         {
-        //             _ => DataTypes.BFloat16,
-        //         };
-        //         return q with { DType = new VectorType(newElemType, vt.Lanes) };
-        //     default:
-        //         return q with { DType = DataTypes.BFloat16 };
-        // }
-        return q;
+        var q = GetLogicalActivationType(arguments[SparseExperts.Q.Index]);
+        var checks = new (ParameterInfo Parameter, long[] Shape)[]
+        {
+            (SparseExperts.Q, [target.ChunkSize, target.HiddenSize]),
+            (SparseExperts.RouterExpertIds, [target.ChunkSize, target.NumTopK]),
+            (SparseExperts.RouterExpertWeights, [target.ChunkSize, target.NumTopK]),
+            (SparseExperts.MoeExpertGateInputScale, [target.NumExpert, 1]),
+            (SparseExperts.MoeExpertGateProjW, [target.NumExpert, target.MoEIntermediateSize, target.HiddenSize]),
+            (SparseExperts.MoeExpertGateProjScale, [target.NumExpert, 1]),
+            (SparseExperts.MoeExpertDownInputScale, [target.NumExpert, 1]),
+            (SparseExperts.MoeExpertDownProjW, [target.NumExpert, target.HiddenSize, target.MoEIntermediateSize]),
+            (SparseExperts.MoeExpertDownProjScale, [target.NumExpert, 1]),
+            (SparseExperts.MoeExpertUpInputScale, [target.NumExpert, 1]),
+            (SparseExperts.MoeExpertUpProjW, [target.NumExpert, target.MoEIntermediateSize, target.HiddenSize]),
+            (SparseExperts.MoeExpertUpProjScale, [target.NumExpert, 1]),
+        };
+        foreach (var (parameter, expectedShape) in checks)
+        {
+            var type = parameter == SparseExperts.Q ? q : arguments[parameter.Index];
+            if (type.Shape is not RankedShape shape || shape.Rank != expectedShape.Length)
+            {
+                return new InvalidType($"SparseExperts {parameter.Name} must have rank {expectedShape.Length}, got {type.Shape}.");
+            }
+
+            for (var axis = 0; axis < expectedShape.Length; axis++)
+            {
+                if (shape[axis].IsFixed && shape[axis].FixedValue != expectedShape[axis])
+                {
+                    return new InvalidType(
+                        $"SparseExperts {parameter.Name} axis {axis} must be {expectedShape[axis]}, got {shape[axis]}.");
+                }
+            }
+        }
+
+        if (arguments[SparseExperts.RouterExpertIds.Index].DType != DataTypes.Int64)
+        {
+            return new InvalidType(
+                $"SparseExperts RouterExpertIds must be int64, got {arguments[SparseExperts.RouterExpertIds.Index].DType}.");
+        }
+
+        if (!q.DType.IsFloat())
+        {
+            return new InvalidType($"SparseExperts q must be floating point, got {q.DType}.");
+        }
+
+        return null;
     }
 
-    private IRType Visit(ITypeInferenceContext context, SparseExperts target, DistributedType q)
+    private static TensorType GetLocalTensorType(IRType type)
+        => type switch
+        {
+            TensorType tensor => tensor,
+            DistributedType distributed => DistributedUtility.GetDividedTensorType(
+                distributed,
+                DistributedUtility.DivideFlags.MaxShape),
+            _ => TensorType.Invalid(DataTypes.Float32),
+        };
+
+    private static TensorType GetLogicalActivationType(TensorType type)
     {
-        // // TODO: Handle distributed type inference
-        // // For now, we just return the type as is.
-        // // return q with { TensorType = (TensorType)q.TensorType with { DType = DataTypes.Float16 } };
-        // if (q.TensorType is TensorType tensorType && tensorType.DType is VectorType vt)
-        // {
-        //     var newElemType = vt.ElemType switch
-        //     {
-        //         _ => DataTypes.BFloat16,
-        //     };
-        //     return new DistributedType((TensorType)q.TensorType with { DType = new VectorType(newElemType, vt.Lanes) }, q.AxisPolicies, q.Placement);
-        // }
-        // return new DistributedType((TensorType)q.TensorType with { DType = DataTypes.BFloat16 }, q.AxisPolicies, q.Placement);
-        return q;
+        if (type.DType is not VectorType vector)
+        {
+            return type;
+        }
+
+        return TypeInference.UnpackType(
+            type,
+            Enumerable.Repeat(1, vector.Lanes.Count).ToArray()) switch
+        {
+            TensorType tensor => tensor,
+            IRType invalid => throw new InvalidOperationException(
+                $"SparseExperts activation lanes must map to hidden axis 1: {invalid}."),
+        };
     }
+
+    private static bool TryGetMaxShape(TensorType type, out long[] shape)
+    {
+        if (CompilerServices.TryGetMaxShape(type.Shape, out var maxShape) && maxShape is not null)
+        {
+            shape = maxShape;
+            return true;
+        }
+
+        shape = Array.Empty<long>();
+        return false;
+    }
+
+    private static int GetScalarByteCount(DataType dataType)
+        => dataType is VectorType vector ? GetScalarByteCount(vector.ElemType) : dataType.SizeInBytes;
+
+    private static bool HasPartial(DistributedType type)
+        => type.Partial is not null || type.AxisPolicies.Any(policy => policy is SBPPartial);
+
+    private static bool TryGetRoleAxes(SBP policy, int placementRank, out int[] axes)
+    {
+        axes = policy switch
+        {
+            SBPBroadCast => Array.Empty<int>(),
+            SBPSplit { IsContiguous: true } split => split.HierarchyAxes.ToArray(),
+            _ => null!,
+        };
+        return axes is not null &&
+            axes.Distinct().Count() == axes.Length &&
+            axes.All(axis => axis >= 0 && axis < placementRank);
+    }
+
+    private static bool AreDisjoint(params IReadOnlyList<int>[] groups)
+        => groups.SelectMany(static group => group).Distinct().Count() == groups.Sum(static group => group.Count);
 }

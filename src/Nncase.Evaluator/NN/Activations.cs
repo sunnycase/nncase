@@ -346,14 +346,21 @@ public class SigmoidEvaluator : IEvaluator<Sigmoid>, ITypeInferencer<Sigmoid>, I
     /// <inheritdoc/>
     public IRType Visit(ITypeInferenceContext context, Sigmoid target)
     {
-        var input = context.CheckArgumentType<TensorType>(target, Sigmoid.Input);
-        return Visit(input);
+        var input = context.CheckArgumentType<IRType>(target, Sigmoid.Input);
+        return input switch
+        {
+            TensorType tensor => tensor,
+            DistributedType distributed => distributed.AxisPolicies.Any(static policy => policy is SBPPartial)
+                ? new InvalidType("Sigmoid cannot preserve a partial distributed value.")
+                : distributed,
+            _ => new InvalidType(input.GetType().Name),
+        };
     }
 
     /// <inheritdoc/>
     public Cost Visit(ICostEvaluateContext context, Sigmoid target)
     {
-        var ret = context.GetReturnType<TensorType>();
+        var ret = context.GetReturnType<IRType>();
         uint macPerElement = 3;
         return CostUtility.GetActivationCost(ret, macPerElement);
     }
@@ -366,11 +373,6 @@ public class SigmoidEvaluator : IEvaluator<Sigmoid>, ITypeInferencer<Sigmoid>, I
             [MetricFactorNames.OffChipMemoryTraffic] = CostUtility.GetMemoryAccess(outputType) * 2,
             [MetricFactorNames.FLOPs] = MetricUtility.GetFLOPs(outputType) * (3 + MetricUtility.ExpFLOPs),
         };
-    }
-
-    private IRType Visit(TensorType input)
-    {
-        return input;
     }
 }
 

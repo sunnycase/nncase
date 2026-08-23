@@ -126,6 +126,29 @@ public sealed record TargetCostAggregationContext(long ActiveBlockCount)
 /// </summary>
 public static class TargetOpCostModelUtility
 {
+    public static double GetEffectiveMemoryBytes(
+        double usefulBytes,
+        TargetCostMemoryAccessPattern? access,
+        int preferredAccessBytes)
+    {
+        if (usefulBytes <= 0 || access is null || preferredAccessBytes <= 1)
+        {
+            return Math.Max(0, usefulBytes);
+        }
+
+        var segmentBytes = access.ContiguousBytesPerSegment;
+        var fullSegments = Math.Floor(usefulBytes / segmentBytes);
+        var remainderBytes = usefulBytes - (fullSegments * segmentBytes);
+        var effectiveFullSegmentBytes = Math.Ceiling((double)segmentBytes / preferredAccessBytes) * preferredAccessBytes;
+        var effectiveBytes = fullSegments * effectiveFullSegmentBytes;
+        if (remainderBytes > 0)
+        {
+            effectiveBytes += Math.Ceiling(remainderBytes / preferredAccessBytes) * preferredAccessBytes;
+        }
+
+        return effectiveBytes;
+    }
+
     public static ITargetOpCostModel GetTargetCostModel(CompileOptions compileOptions)
     {
         return compileOptions.TargetOptions is ITargetOpCostModelProvider provider
@@ -239,7 +262,38 @@ public sealed record ElementwiseOpCostQuery(
 /// <summary>
 /// Target cost query for matmul operators.
 /// </summary>
-public sealed record MatMulOpCostQuery(TargetCostTensor Lhs, TargetCostTensor Rhs, TargetCostTensor Output, DataType OutputDataType, MatMulOpCostKind Kind = MatMulOpCostKind.Auto);
+public sealed record MatMulOpCostQuery(
+    TargetCostTensor Lhs,
+    TargetCostTensor Rhs,
+    TargetCostTensor Output,
+    DataType OutputDataType,
+    MatMulOpCostKind Kind = MatMulOpCostKind.Auto,
+    TargetCostMemoryAccessPattern? LhsMemoryAccess = null,
+    TargetCostMemoryAccessPattern? RhsMemoryAccess = null,
+    TargetCostMemoryAccessPattern? OutputMemoryAccess = null);
+
+/// <summary>
+/// Describes a tensor access made of independently addressed contiguous segments.
+/// The target uses this to account for vectorization and coalescing efficiency
+/// without exposing hardware-specific transaction rules to op evaluators.
+/// </summary>
+public sealed record TargetCostMemoryAccessPattern
+{
+    public TargetCostMemoryAccessPattern(long contiguousBytesPerSegment)
+    {
+        if (contiguousBytesPerSegment <= 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(contiguousBytesPerSegment),
+                contiguousBytesPerSegment,
+                "A memory access segment must contain at least one byte.");
+        }
+
+        ContiguousBytesPerSegment = contiguousBytesPerSegment;
+    }
+
+    public long ContiguousBytesPerSegment { get; }
+}
 
 /// <summary>
 /// Default target cost model used when a target does not provide one.
@@ -377,10 +431,25 @@ public sealed class DefaultTargetOpCostModel : ITargetOpCostModel, IHierarchical
         var batch = Product(outputShape.AsSpan(0, outputShape.Length - 2));
         var work = (double)m * n * k * batch;
         var computeCycles = work / Math.Max(1.0, _machine?.Compute.SimtFmaPerCycle ?? 1.0);
+        var rootMemory = _machine is null
+            ? null
+            : _machine.GetMemoryResource(_machine.GetMemorySpace(_machine.RootMemorySpace));
+        var lhsLoadBytes = TargetOpCostModelUtility.GetEffectiveMemoryBytes(
+            GetTensorByteCount(query.Lhs),
+            query.LhsMemoryAccess,
+            rootMemory?.PreferredReadAccessBytes ?? 1);
+        var rhsLoadBytes = TargetOpCostModelUtility.GetEffectiveMemoryBytes(
+            GetTensorByteCount(query.Rhs),
+            query.RhsMemoryAccess,
+            rootMemory?.PreferredReadAccessBytes ?? 1);
+        var outputStoreBytes = TargetOpCostModelUtility.GetEffectiveMemoryBytes(
+            GetTensorByteCount(query.Output),
+            query.OutputMemoryAccess,
+            rootMemory?.PreferredWriteAccessBytes ?? 1);
         cost = ElementwiseCost(
             computeCycles,
-            GetTensorByteCount(query.Lhs) + GetTensorByteCount(query.Rhs),
-            GetTensorByteCount(query.Output));
+            lhsLoadBytes + rhsLoadBytes,
+            outputStoreBytes);
         return true;
     }
 

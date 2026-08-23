@@ -135,6 +135,10 @@ template <class T> struct sin {
     constexpr T operator()(const T &v) const noexcept { return std::sin(v); }
 };
 
+template <class T> struct sigmoid {
+    constexpr T operator()(const T &v) const noexcept;
+};
+
 template <class T> struct sinh {
     constexpr T operator()(const T &v) const noexcept;
 };
@@ -145,6 +149,10 @@ template <class T> struct sqrt {
 
 template <class T> struct square {
     constexpr T operator()(const T &v) const noexcept { return v * v; }
+};
+
+template <class T> struct softplus {
+    constexpr T operator()(const T &v) const noexcept;
 };
 
 template <class T> struct tanh {
@@ -415,9 +423,11 @@ NTT_DEFINE_UNARY_FUNC_IMPL(round)
 NTT_DEFINE_UNARY_FUNC_IMPL(rsqrt)
 NTT_DEFINE_UNARY_FUNC_IMPL(sign)
 NTT_DEFINE_UNARY_FUNC_IMPL(sin)
+NTT_DEFINE_UNARY_FUNC_IMPL(sigmoid)
 NTT_DEFINE_UNARY_FUNC_IMPL(sinh)
 NTT_DEFINE_UNARY_FUNC_IMPL(sqrt)
 NTT_DEFINE_UNARY_FUNC_IMPL(square)
+NTT_DEFINE_UNARY_FUNC_IMPL(softplus)
 NTT_DEFINE_UNARY_FUNC_IMPL(tanh)
 NTT_DEFINE_UNARY_FUNC_IMPL(swish)
 
@@ -580,6 +590,24 @@ template <class T> constexpr T cosh<T>::operator()(const T &v) const noexcept {
 // sinh(v) = (exp(v) - exp(-v)) / 2
 template <class T> constexpr T sinh<T>::operator()(const T &v) const noexcept {
     return (ntt::exp(v) - ntt::exp(-v)) / (T)2;
+}
+
+template <class T>
+constexpr T sigmoid<T>::operator()(const T &v) const noexcept {
+    const double x = static_cast<double>(v);
+    if (x >= 0.0) {
+        return static_cast<T>(1.0 / (1.0 + std::exp(-x)));
+    }
+
+    const double exp_x = std::exp(x);
+    return static_cast<T>(exp_x / (1.0 + exp_x));
+}
+
+template <class T>
+constexpr T softplus<T>::operator()(const T &v) const noexcept {
+    const double x = static_cast<double>(v);
+    return static_cast<T>(
+        std::max(x, 0.0) + std::log1p(std::exp(-std::abs(x))));
 }
 
 // swish(v) = v / (exp(-v) + 1)

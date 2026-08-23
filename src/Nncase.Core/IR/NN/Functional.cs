@@ -18,6 +18,95 @@ namespace Nncase.IR.F;
 /// </summary>
 public static class NN
 {
+    public static Call GatedDeltaNet(
+        Expr input,
+        Expr state,
+        Expr qkvWeight,
+        Expr zWeight,
+        Expr bWeight,
+        Expr aWeight,
+        Expr convWeight,
+        Expr aLog,
+        Expr dtBias,
+        Expr normWeight,
+        Expr outputWeight,
+        Dimension layerId,
+        long numKeyHeads,
+        long numValueHeads,
+        long keyHeadDim,
+        long valueHeadDim,
+        long convKernelSize,
+        float epsilon) =>
+        new(
+            new GatedDeltaNet(
+                numKeyHeads,
+                numValueHeads,
+                keyHeadDim,
+                valueHeadDim,
+                convKernelSize,
+                epsilon),
+            input,
+            state,
+            qkvWeight,
+            zWeight,
+            bWeight,
+            aWeight,
+            convWeight,
+            aLog,
+            dtBias,
+            normWeight,
+            outputWeight,
+            layerId);
+
+    public static Call GatedDeltaNetProjection(
+        Expr input,
+        Expr state,
+        Expr qkvWeight,
+        Expr convWeight,
+        Dimension layerId,
+        long convKernelSize) =>
+        new(
+            new GatedDeltaNetProjection(convKernelSize),
+            input,
+            state,
+            qkvWeight,
+            convWeight,
+            layerId);
+
+    public static Call GatedDeltaNetRecurrentCore(
+        Expr input,
+        Expr state,
+        Expr qkv,
+        Expr zWeight,
+        Expr bWeight,
+        Expr aWeight,
+        Expr aLog,
+        Expr dtBias,
+        Expr normWeight,
+        Dimension layerId,
+        long numKeyHeads,
+        long numValueHeads,
+        long keyHeadDim,
+        long valueHeadDim,
+        float epsilon) =>
+        new(
+            new GatedDeltaNetRecurrentCore(
+                numKeyHeads,
+                numValueHeads,
+                keyHeadDim,
+                valueHeadDim,
+                epsilon),
+            input,
+            state,
+            qkv,
+            zWeight,
+            bWeight,
+            aWeight,
+            aLog,
+            dtBias,
+            normWeight,
+            layerId);
+
     public static Call Sampling(Expr logits, Expr state, SamplerConfig config)
         => new(new Sampling(config), logits, state);
 
@@ -239,4 +328,8 @@ public static class NN
     public static Expr Qwen3MoE(Expr q, Expr moeGateW, Expr moeExpertGateInputScale, Expr moeExpertGateProjW, Expr moeExpertGateProjScale, Expr moeExpertDownInputScale, Expr moeExpertDownProjW, Expr moeExpertDownProjScale, Expr moeExpertUpInputScale, Expr moeExpertUpProjW, Expr moeExpertUpProjScale, long layerId, long hiddenSize, long intermediateSize, long moeIntermediateSize, long numExpert, long numTopK, long isNormTopkProb) => new Call(new Qwen3MoE(layerId, hiddenSize, intermediateSize, moeIntermediateSize, numExpert, numTopK, isNormTopkProb), q, moeGateW, moeExpertGateInputScale, moeExpertGateProjW, moeExpertGateProjScale, moeExpertDownInputScale, moeExpertDownProjW, moeExpertDownProjScale, moeExpertUpInputScale, moeExpertUpProjW, moeExpertUpProjScale);
 
     public static Call SparseExperts(Expr q, Expr routerExpertIds, Expr routerExpertWeights, Expr moeExpertGateInputScale, Expr moeExpertGateProjW, Expr moeExpertGateProjScale, Expr moeExpertDownInputScale, Expr moeExpertDownProjW, Expr moeExpertDownProjScale, Expr moeExpertUpInputScale, Expr moeExpertUpProjW, Expr moeExpertUpProjScale, long hiddenSize, long moeIntermediateSize, long numExpert, long numTopK, long chunkSize) => new Call(new SparseExperts(hiddenSize, moeIntermediateSize, numExpert, numTopK, chunkSize), q, routerExpertIds, routerExpertWeights, moeExpertGateInputScale, moeExpertGateProjW, moeExpertGateProjScale, moeExpertDownInputScale, moeExpertDownProjW, moeExpertDownProjScale, moeExpertUpInputScale, moeExpertUpProjW, moeExpertUpProjScale);
+
+    public static Call SparseExpertsGateUp(Expr q, Expr routerExpertIds, Expr moeExpertGateInputScale, Expr moeExpertGateProjW, Expr moeExpertGateProjScale, Expr moeExpertUpInputScale, Expr moeExpertUpProjW, Expr moeExpertUpProjScale, DataType outputDataType, long hiddenSize, long moeIntermediateSize, long numExpert, long numTopK, long chunkSize) => new Call(new SparseExpertsGateUp(outputDataType, hiddenSize, moeIntermediateSize, numExpert, numTopK, chunkSize), q, routerExpertIds, moeExpertGateInputScale, moeExpertGateProjW, moeExpertGateProjScale, moeExpertUpInputScale, moeExpertUpProjW, moeExpertUpProjScale);
+
+    public static Call SparseExpertsDown(Expr activations, Expr routerExpertIds, Expr routerExpertWeights, Expr moeExpertDownInputScale, Expr moeExpertDownProjW, Expr moeExpertDownProjScale, DataType outputDataType, long hiddenSize, long moeIntermediateSize, long numExpert, long numTopK, long chunkSize) => new Call(new SparseExpertsDown(outputDataType, hiddenSize, moeIntermediateSize, numExpert, numTopK, chunkSize), activations, routerExpertIds, routerExpertWeights, moeExpertDownInputScale, moeExpertDownProjW, moeExpertDownProjScale);
 }

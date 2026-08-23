@@ -66,6 +66,42 @@ public sealed class UnitTestTritonTargetCostModel : TestClassBase
     }
 
     [Fact]
+    public void TestSegmentedMatMulReadAccountsForTargetAccessEfficiency()
+    {
+        var costModel = new TritonTargetOpCostModel(CreateGpuMachine());
+        var lhs = new TargetCostTensor(DataTypes.BFloat16, new RankedShape(1, 128));
+        var rhs = new TargetCostTensor(DataTypes.BFloat16, new RankedShape(128, 2048));
+        var output = new TargetCostTensor(DataTypes.BFloat16, new RankedShape(1, 2048));
+
+        Assert.True(costModel.TryGetMatMulCost(
+            new(lhs, rhs, output, DataTypes.BFloat16),
+            out var dense));
+        Assert.True(costModel.TryGetMatMulCost(
+            new(
+                lhs,
+                rhs,
+                output,
+                DataTypes.BFloat16,
+                RhsMemoryAccess: new TargetCostMemoryAccessPattern(32)),
+            out var narrowSegments));
+        Assert.True(costModel.TryGetMatMulCost(
+            new(
+                lhs,
+                rhs,
+                output,
+                DataTypes.BFloat16,
+                RhsMemoryAccess: new TargetCostMemoryAccessPattern(256)),
+            out var wideSegments));
+
+        Assert.Equal(
+            dense[CostFactorNames.BlockLocalMemoryLoadBytes],
+            wideSegments[CostFactorNames.BlockLocalMemoryLoadBytes]);
+        Assert.True(
+            narrowSegments[CostFactorNames.BlockLocalMemoryLoadBytes] >
+            wideSegments[CostFactorNames.BlockLocalMemoryLoadBytes]);
+    }
+
+    [Fact]
     public async Task TestAutoVectorizeExtractsVectorizedMatMul()
     {
         CompileOptions.TargetOptions = CreateOptions(CreateGpuMachine(rootBytesPerCycle: 174));
@@ -1100,7 +1136,16 @@ public sealed class UnitTestTritonTargetCostModel : TestClassBase
             ],
             [
                 new(sharedResource, TargetMemorySpaceKind.Shared, 48 * 1024, blockBytesPerCycle, blockBytesPerCycle, 20, 16),
-                new(globalResource, TargetMemorySpaceKind.Global, int.MaxValue, rootBytesPerCycle, rootBytesPerCycle, 300, 128),
+                new(
+                    globalResource,
+                    TargetMemorySpaceKind.Global,
+                    int.MaxValue,
+                    rootBytesPerCycle,
+                    rootBytesPerCycle,
+                    300,
+                    allocationGranularityBytes: 128,
+                    preferredReadAccessBytes: 128,
+                    preferredWriteAccessBytes: 128),
             ],
             [
                 new(shared, sharedResource, MemorySharingScope.Block, new(MemoryLocation.Shared), 48 * 1024, TargetMemoryAllocationSizePolicy.PowerOfTwo, true, 0, true, true, true),

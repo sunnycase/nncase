@@ -1,0 +1,186 @@
+{% macro pipeline_setup(stage) -%}
+{% set stage_model = stage["Model"] %}
+{% set stage_ctx = gated_delta_net_projection_pipeline_context(stage_model) %}
+{% set shared_shape = [stage_ctx["num_stages"]] + (stage_ctx["transfer"]["shared_stage_shape"] | list) %}
+{{ stage["StageName"] }}__weight_stages = tle.gpu.alloc(
+    [{{ shared_shape | join(", ") }}],
+    dtype={{ stage_model["InputTritonDType"] }},
+    layout=None,
+    scope=tle.gpu.smem,
+    alias=pyntt_shared_arena,
+    alias_offset_bytes={{ stage["SharedWorkspaceOffsets"]["weight_stage"] }},
+    nv_mma_shared_layout=True,
+)
+{{ stage["PipeName"] }} = tle.pipe(
+    capacity={{ stage_ctx["num_stages"] }},
+    scope="cta",
+    name="{{ stage["StageName"] }}_weight",
+    weight={{ stage["StageName"] }}__weight_stages,
+)
+{%- endmacro %}
+{% if model is defined %}
+{% import "triton/kernels/_common.py.jinja" as common with context %}
+{% set ctx = gated_delta_net_projection_pipeline_context(model) %}
+{% set transfer = ctx["transfer"] %}
+{% macro state_axis_offset(coordinate, axis) -%}
+{% if axis["LaneCount"] == 1 -%}
+({{ coordinate }}) * {{ axis["BlockStride"] }}
+{%- else -%}
+(({{ coordinate }}) // {{ axis["LaneCount"] }}) * {{ axis["BlockStride"] }} + (({{ coordinate }}) % {{ axis["LaneCount"] }}) * {{ axis["LaneStride"] }}
+{%- endif %}
+{%- endmacro %}
+# generated from PyNTT algorithm triton.gated_delta_net/projection_mma_tma_smem_pipeline
+# {{ model["Comment"] }}; hidden={{ model["HiddenSize"] }}, local_channels={{ model["LocalConvDim"] }}, block_n={{ ctx["block_n"] }}, block_k={{ ctx["block_k"] }}, stages={{ ctx["num_stages"] }}
+{{ model["FunctionName"] }}__mma_layout = tl.constexpr(
+    tle.gpu.MmaEncoding(
+        [2, 0],
+        [1, {{ model["NumWarps"] }}],
+        [16, 8],
+    )
+)
+{{ model["FunctionName"] }}__lhs_dot_layout = tl.constexpr(
+    tle.gpu.DotOperandEncoding(
+        0,
+        {{ model["FunctionName"] }}__mma_layout,
+        2,
+    )
+)
+{{ model["FunctionName"] }}__rhs_dot_layout = tl.constexpr(
+    tle.gpu.DotOperandEncoding(
+        1,
+        {{ model["FunctionName"] }}__mma_layout,
+        2,
+    )
+)
+
+
+{{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
+def {{ model["FunctionName"] }}__producer(writer, {{ helper_parameters(model) }}):
+{{ common.mesh_coordinates(model["MeshAxes"]) }}
+    descriptor_entry = tle.gpu.tensor_map_table_entry(
+        {{ transfer["descriptor_name"] }},
+        shard_index,
+    )
+    tle.gpu.tensor_map_fenceproxy_acquire(descriptor_entry)
+    for n_tile in tl.range(0, {{ transfer["n_tiles"] }}):
+        for k_tile in tl.range(0, {{ transfer["k_tiles"] }}):
+            sequence = (n_tile * {{ transfer["k_tiles"] }} + k_tile).to(tl.int32)
+            slot = writer.acquire(sequence)
+            descriptor = tle.gpu.reinterpret_tensor_map(
+                descriptor_entry,
+                slot.weight,
+            )
+            tle.gpu.copy(
+                descriptor,
+                slot.weight,
+                [{{ transfer["shared_stage_shape"] | join(", ") }}],
+                offsets=[
+{% for offset in transfer["descriptor_offsets"] %}
+                    {{ tma_offset(offset) }},
+{% endfor %}
+                ],
+                eviction_policy="evict_first",
+            )
+            writer.commit(sequence)
+    writer.close({{ transfer["sequence_count"] }})
+
+
+{{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
+def {{ model["FunctionName"] }}__consumer(reader, {{ helper_parameters(model) }}):
+{{ common.mesh_coordinates(model["MeshAxes"]) }}
+    input0 = {{ ptr(model, "Input") }}
+    conv_state = {{ ptr(model, "ConvState") }}
+    conv_weight = {{ ptr(model, "ConvWeight") }}
+    qkv_output = {{ ptr(model, "QKVOutput") }}
+
+    shared_k = tl.broadcast_to(
+        tl.arange(0, {{ ctx["block_k"] }})[:, None],
+        ({{ ctx["block_k"] }}, {{ ctx["block_n"] }}),
+    )
+    shared_n = tl.broadcast_to(
+        tl.arange(0, {{ ctx["block_n"] }})[None, :],
+        ({{ ctx["block_k"] }}, {{ ctx["block_n"] }}),
+    )
+    mma_k = tl.arange(0, {{ ctx["block_k"] }})
+    for n_tile in tl.range(0, {{ transfer["n_tiles"] }}):
+        channel_start = n_tile * {{ ctx["block_n"] }}
+        channel = channel_start + tl.arange(0, {{ ctx["block_n"] }})
+        channel_mask = channel < {{ ctx["local_n"] }}
+        acc = tle.encoding(
+            tl.zeros(({{ ctx["block_m"] }}, {{ ctx["block_n"] }}), tl.float32),
+            {{ model["FunctionName"] }}__mma_layout,
+        )
+        for k_tile in tl.range(0, {{ transfer["k_tiles"] }}):
+            sequence = (n_tile * {{ transfer["k_tiles"] }} + k_tile).to(tl.int32)
+            ready = reader.wait(sequence)
+            weight_ptr = tle.gpu.local_ptr(
+                ready.slot.weight,
+                (
+{% for index in transfer["shared_k_indices"] %}
+                    {{ index }},
+{% endfor %}
+{% for index in transfer["shared_n_indices"] %}
+                    {{ index }},
+{% endfor %}
+                ),
+                shape=({{ ctx["block_k"] }}, {{ ctx["block_n"] }}),
+            )
+            rhs = tle.encoding(
+                tl.load(weight_ptr),
+                {{ model["FunctionName"] }}__rhs_dot_layout,
+            )
+            hidden = k_tile * {{ ctx["block_k"] }} + mma_k
+            activation = tl.load(
+                {{ access_pointer(model, "Input", "input0", tensor_access(["0", "hidden"], model["InputStrides"])) }},
+                mask=hidden < {{ ctx["hidden_size"] }},
+                other=0.0,
+            )
+            lhs = tle.encoding(
+                tl.broadcast_to(
+                    activation[None, :],
+                    ({{ ctx["block_m"] }}, {{ ctx["block_k"] }}),
+                ),
+                {{ model["FunctionName"] }}__lhs_dot_layout,
+            )
+            acc = tl.dot(lhs, rhs, acc=acc)
+            reader.release(sequence)
+
+        projection = tl.sum(acc, axis=0) * (1.0 / {{ ctx["block_m"] }})
+{% set global_packed_channel = pointer_local_to_global_coordinate(model["QKVOutput"], 1, "channel // " ~ model["QKVOutputLaneCount"]) %}
+{% set global_channel = "(" ~ global_packed_channel ~ ") * " ~ model["QKVOutputLaneCount"] ~ " + channel % " ~ model["QKVOutputLaneCount"] %}
+        conv_state_base = (
+            {{ state_axis_offset(model["LayerId"], model["ConvStateLayerAxis"]) }}
+            + {{ state_axis_offset(global_channel, model["ConvStateChannelAxis"]) }}
+        )
+        current = projection.to({{ model["InputTritonDType"] }})
+        convolved = current.to(tl.float32) * tl.load(
+            {{ access_pointer(model, "ConvWeight", "conv_weight", tensor_access(["channel", (model["ConvKernelSize"] - 1)|string], model["ConvWeightStrides"])) }},
+            mask=channel_mask,
+            other=0.0,
+        ).to(tl.float32)
+{% for history in range(model["ConvKernelSize"] - 1) %}
+        history{{ history }} = tl.load(
+            conv_state + conv_state_base + {{ state_axis_offset(history|string, model["ConvStateHistoryAxis"]) }},
+            mask=channel_mask,
+            other=0.0,
+        )
+        convolved += history{{ history }}.to(tl.float32) * tl.load(
+            {{ access_pointer(model, "ConvWeight", "conv_weight", tensor_access(["channel", history|string], model["ConvWeightStrides"])) }},
+            mask=channel_mask,
+            other=0.0,
+        ).to(tl.float32)
+{% endfor %}
+{% for history in range(model["ConvKernelSize"] - 1) %}
+        tl.store(
+            conv_state + conv_state_base + {{ state_axis_offset(history|string, model["ConvStateHistoryAxis"]) }},
+            {{ ("history" ~ (history + 1)) if history + 1 < model["ConvKernelSize"] - 1 else "current" }},
+            mask=channel_mask,
+        )
+{% endfor %}
+        convolved = convolved * tl.sigmoid(convolved)
+        tl.store(
+            {{ access_pointer(model, "QKVOutput", "qkv_output", contiguous_vector_axis_access(["0", "0"], model["QKVOutputStrides"], packed_axis=1, logical_index="channel", lane_count=model["QKVOutputLaneCount"])) }},
+            convolved.to({{ model["InputTritonDType"] }}),
+            mask=channel_mask,
+        )
+{% endif %}

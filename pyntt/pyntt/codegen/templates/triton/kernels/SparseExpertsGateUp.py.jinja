@@ -1,0 +1,75 @@
+{% import "triton/kernels/_common.py.jinja" as common with context %}
+{% import "triton/kernels/_producer_consumer.py.jinja" as phases with context %}
+# generated from PyNTT Jinja SparseExpertsGateUp.py.jinja
+# {{ model["Comment"] }}; hidden={{ model["HiddenSize"] }}, intermediate={{ model["IntermediateSize"] }}, top_k={{ model["NumTopK"] }}
+{{ phases.consumer_header(model) }}
+{{ common.mesh_coordinates(model["MeshAxes"]) }}
+    input0 = {{ ptr(model, "Input") }}
+    expert_ids = {{ ptr(model, "ExpertIds") }}
+    gate_input_scales = {{ ptr(model, "GateInputScale") }}
+    gate_weights = {{ ptr(model, "GateWeight") }}
+    gate_scales = {{ ptr(model, "GateScale") }}
+    up_input_scales = {{ ptr(model, "UpInputScale") }}
+    up_weights = {{ ptr(model, "UpWeight") }}
+    up_scales = {{ ptr(model, "UpScale") }}
+    output = {{ ptr(model, "Output") }}
+
+    for token in tl.range(0, {{ dim(model["InputShape"][0]) }}):
+        for topk_index in tl.static_range(0, {{ model["NumTopK"] }}):
+            expert = tl.load(
+                {{ access_pointer(model, "ExpertIds", "expert_ids", tensor_access(["token", "topk_index"], model["ExpertIdsStrides"])) }}
+            ).to(tl.int32)
+            gate_input_scale = tl.load(
+                {{ access_pointer(model, "GateInputScale", "gate_input_scales", tensor_access(["expert", "0"], model["GateInputScaleStrides"])) }}
+            ).to(tl.float32)
+            gate_scale = tl.load(
+                {{ access_pointer(model, "GateScale", "gate_scales", tensor_access(["expert", "0"], model["GateScaleStrides"])) }}
+            ).to(tl.float32)
+            up_input_scale = tl.load(
+                {{ access_pointer(model, "UpInputScale", "up_input_scales", tensor_access(["expert", "0"], model["UpInputScaleStrides"])) }}
+            ).to(tl.float32)
+            up_scale = tl.load(
+                {{ access_pointer(model, "UpScale", "up_scales", tensor_access(["expert", "0"], model["UpScaleStrides"])) }}
+            ).to(tl.float32)
+
+            for intermediate_index in tl.range(0, {{ model["LocalIntermediateSize"] }}):
+                gate_partial = tl.zeros((block_size,), dtype=tl.float32)
+                up_partial = tl.zeros((block_size,), dtype=tl.float32)
+                for hidden_start in tl.range(0, {{ model["HiddenSize"] }}, block_size):
+                    hidden_lane = hidden_start + tl.arange(0, block_size)
+                    hidden_mask = hidden_lane < {{ model["HiddenSize"] }}
+                    input_value = tl.load(
+{% if model["InputLaneCount"] == 1 %}
+                        {{ access_pointer(model, "Input", "input0", tensor_access(["token", "hidden_lane"], model["InputStrides"])) }},
+{% else %}
+                        {{ access_pointer(model, "Input", "input0", contiguous_vector_axis_access(["token", "0"], model["InputStrides"], packed_axis=1, logical_index="hidden_lane", lane_count=model["InputLaneCount"])) }},
+{% endif %}
+                        mask=hidden_mask,
+                        other=0.0,
+                    ).to(tl.float32)
+                    gate_value = tl.load(
+                        {{ access_pointer(model, "GateWeight", "gate_weights", tensor_access(["expert", "intermediate_index", "hidden_lane"], model["GateWeightStrides"])) }},
+                        mask=hidden_mask,
+                        other=0.0,
+                    ).to(tl.float32)
+                    up_value = tl.load(
+                        {{ access_pointer(model, "UpWeight", "up_weights", tensor_access(["expert", "intermediate_index", "hidden_lane"], model["UpWeightStrides"])) }},
+                        mask=hidden_mask,
+                        other=0.0,
+                    ).to(tl.float32)
+                    gate_partial += (input_value / gate_input_scale) * gate_value
+                    up_partial += (input_value / up_input_scale) * up_value
+
+                gate_value = tl.sum(gate_partial, axis=0) * gate_input_scale * gate_scale
+                up_value = tl.sum(up_partial, axis=0) * up_input_scale * up_scale
+                activated = (gate_value * tl.sigmoid(gate_value)) * up_value
+                tl.store(
+{% if model["OutputLaneCount"] == 1 %}
+                    {{ access_pointer(model, "Output", "output", tensor_access(["token", "topk_index", "intermediate_index"], model["OutputStrides"])) }},
+{% else %}
+                    {{ access_pointer(model, "Output", "output", contiguous_vector_axis_access(["token", "topk_index", "0"], model["OutputStrides"], packed_axis=2, logical_index="intermediate_index", lane_count=model["OutputLaneCount"])) }},
+{% endif %}
+                    activated.to({{ model["OutputTritonDType"] }}),
+                )
+
+{{ phases.dispatch(model) }}

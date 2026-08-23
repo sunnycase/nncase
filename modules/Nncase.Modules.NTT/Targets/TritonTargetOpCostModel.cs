@@ -166,10 +166,22 @@ public sealed class TritonTargetOpCostModel : ITargetOpCostModel, IHierarchicalT
             _ => EstimateMatMulComputeCycles(m, n, k, batch, query.Lhs.DType, query.Rhs.DType),
         };
 
+        var lhsLoadBytes = TargetOpCostModelUtility.GetEffectiveMemoryBytes(
+            GetTensorByteCount(query.Lhs),
+            query.LhsMemoryAccess,
+            _rootMemory.PreferredReadAccessBytes);
+        var rhsLoadBytes = TargetOpCostModelUtility.GetEffectiveMemoryBytes(
+            GetTensorByteCount(query.Rhs),
+            query.RhsMemoryAccess,
+            _rootMemory.PreferredReadAccessBytes);
+        var outputStoreBytes = TargetOpCostModelUtility.GetEffectiveMemoryBytes(
+            GetTensorByteCount(query.Output),
+            query.OutputMemoryAccess,
+            _rootMemory.PreferredWriteAccessBytes);
         cost = ElementwiseCost(
             computeCycles,
-            GetTensorByteCount(query.Lhs) + GetTensorByteCount(query.Rhs),
-            GetTensorByteCount(query.Output));
+            lhsLoadBytes + rhsLoadBytes,
+            outputStoreBytes);
         return true;
     }
 

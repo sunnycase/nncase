@@ -163,6 +163,7 @@ public sealed partial class ReshapeDevectorizePropagation : RewriteRule<Pattern>
         {
             var axis = devectorize.Axes[i];
             var lanes = devectorize.Lanes[i];
+            var mappedAxisCount = devectorizeAxes.Count;
 
             // 1. unpack(<8>[128], [0], [8]) -> [8, 128]: <8>[128] -> <8>[8, 16]
             if (forwardDict.TryGetValue(axis, out var newAxes))
@@ -224,6 +225,35 @@ public sealed partial class ReshapeDevectorizePropagation : RewriteRule<Pattern>
                     }
                 }
             }
+
+            if (devectorizeAxes.Count == mappedAxisCount
+                && devectorizedShape.Skip(axis + 1).All(dim => dim == 1))
+            {
+                // A row-major reshape preserves a vector on the final effective
+                // logical axis even when the complete shape map cannot represent
+                // a split such as [1, 32] -> [4, 8].
+                for (int newAxis = newShape.Rank - 1; newAxis >= 0; newAxis--)
+                {
+                    if (!newShape.Skip(newAxis + 1).All(dim => dim == 1))
+                    {
+                        continue;
+                    }
+
+                    if (newShape[newAxis] != 1
+                        && Dimension.TryDivExactly(newShape[newAxis], lanes, out var newDim))
+                    {
+                        devectorizeAxes.Add(newAxis);
+                        devectorizeLanes.Add(lanes);
+                        rewritedNewShape[newAxis] = newDim;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (devectorizeAxes.Count != devectorize.Axes.Count)
+        {
+            return null;
         }
 
         return IR.F.Tensors.Unpack(

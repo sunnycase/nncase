@@ -204,6 +204,8 @@ public static class MetricUtility
         UnaryOp.Sign or UnaryOp.Round or UnaryOp.Neg or UnaryOp.Floor or UnaryOp.Ceil => 1,
         UnaryOp.Exp => ExpFLOPs,
         UnaryOp.Log => LogFLOPs,
+        UnaryOp.Sigmoid => ExpFLOPs + DivFLOPs + AddFLOPs,
+        UnaryOp.Softplus => ExpFLOPs + LogFLOPs + AddFLOPs,
         UnaryOp.Rsqrt or UnaryOp.Sqrt => SqrtFLOPs,
         UnaryOp.Square => 2,
         UnaryOp.Tanh => TanhFLOPs,

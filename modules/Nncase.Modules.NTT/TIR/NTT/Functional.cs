@@ -20,6 +20,59 @@ public partial class NTT
     private static Call KernelCall(NTTKernelOp op, params BaseExpr[] arguments)
         => op.CreateCall(arguments);
 
+    public static Expr GatedDeltaNetProjection(
+        Expr input,
+        Expr state,
+        Expr qkvWeight,
+        Expr convWeight,
+        Expr qkvOutput,
+        Dimension layerId,
+        long convKernelSize) =>
+        KernelCall(
+            new TIR.NTT.GatedDeltaNetProjection(convKernelSize),
+            input,
+            state,
+            qkvWeight,
+            convWeight,
+            qkvOutput,
+            layerId);
+
+    public static Expr GatedDeltaNetRecurrentCore(
+        Expr input,
+        Expr state,
+        Expr qkv,
+        Expr zWeight,
+        Expr bWeight,
+        Expr aWeight,
+        Expr aLog,
+        Expr dtBias,
+        Expr normWeight,
+        Expr gatedOutput,
+        Dimension layerId,
+        long numKeyHeads,
+        long numValueHeads,
+        long keyHeadDim,
+        long valueHeadDim,
+        float epsilon) =>
+        KernelCall(
+            new TIR.NTT.GatedDeltaNetRecurrentCore(
+                numKeyHeads,
+                numValueHeads,
+                keyHeadDim,
+                valueHeadDim,
+                epsilon),
+            input,
+            state,
+            qkv,
+            zWeight,
+            bWeight,
+            aWeight,
+            aLog,
+            dtBias,
+            normWeight,
+            gatedOutput,
+            layerId);
+
     /// <summary>
     /// the ptr of can create the *PtrName in the c code.
     /// </summary>
@@ -674,6 +727,16 @@ public partial class NTT
     public static Expr SparseExperts(Expr q, Expr routerIdx, Expr routerWeights, Expr moeExpertGateInputScale, Expr moeExpertGateProjW, Expr moeExpertGateProjScale, Expr moeExpertDownInputScale, Expr moeExpertDownProjW, Expr moeExpertDownProjScale, Expr moeExpertUpInputScale, Expr moeExpertUpProjW, Expr moeExpertUpProjScale, Expr ret, long hiddenSize, long moeIntermediateSize, long numExpert, long numTopK, long chunkSize)
     {
         return KernelCall(new TIR.NTT.SparseExperts(Array.Empty<int>(), Array.Empty<int>(), Array.Empty<int>(), Array.Empty<int>(), Array.Empty<SBP>(), Array.Empty<SBP>(), Array.Empty<SBP>(), Array.Empty<SBP>(), hiddenSize, moeIntermediateSize, numExpert, numTopK, chunkSize, null, string.Empty, string.Empty), q, routerIdx, routerWeights, moeExpertGateInputScale, moeExpertGateProjW, moeExpertGateProjScale, moeExpertDownInputScale, moeExpertDownProjW, moeExpertDownProjScale, moeExpertUpInputScale, moeExpertUpProjW, moeExpertUpProjScale, None.Default, ret);
+    }
+
+    public static Expr SparseExpertsGateUp(Expr q, Expr routerExpertIds, Expr moeExpertGateInputScale, Expr moeExpertGateProjW, Expr moeExpertGateProjScale, Expr moeExpertUpInputScale, Expr moeExpertUpProjW, Expr moeExpertUpProjScale, Expr output, long hiddenSize, long moeIntermediateSize, long numExpert, long numTopK, long chunkSize)
+    {
+        return KernelCall(new TIR.NTT.SparseExpertsGateUp(hiddenSize, moeIntermediateSize, numExpert, numTopK, chunkSize), q, routerExpertIds, moeExpertGateInputScale, moeExpertGateProjW, moeExpertGateProjScale, moeExpertUpInputScale, moeExpertUpProjW, moeExpertUpProjScale, output);
+    }
+
+    public static Expr SparseExpertsDown(Expr activations, Expr routerExpertIds, Expr routerExpertWeights, Expr moeExpertDownInputScale, Expr moeExpertDownProjW, Expr moeExpertDownProjScale, Expr output, long hiddenSize, long moeIntermediateSize, long numExpert, long numTopK, long chunkSize)
+    {
+        return KernelCall(new TIR.NTT.SparseExpertsDown(hiddenSize, moeIntermediateSize, numExpert, numTopK, chunkSize), activations, routerExpertIds, routerExpertWeights, moeExpertDownInputScale, moeExpertDownProjW, moeExpertDownProjScale, output);
     }
 
     public static Expr SparseExperts(Expr q, Expr routerIdx, Expr routerWeights, Expr moeExpertGateInputScale, Expr moeExpertGateProjW, Expr moeExpertGateProjScale, Expr moeExpertDownInputScale, Expr moeExpertDownProjW, Expr moeExpertDownProjScale, Expr moeExpertUpInputScale, Expr moeExpertUpProjW, Expr moeExpertUpProjScale, Expr extra, Expr ret, IRArray<int> qVectorizedAxes, IRArray<int> gateVectorizedAxes, IRArray<int> downVectorizedAxes, IRArray<int> upVectorizedAxes, IRArray<SBP> qSBPs, IRArray<SBP> gateSBPs, IRArray<SBP> downSBPs, IRArray<SBP> upSBPs, long hiddenSize, long moeIntermediateSize, long numExpert, long numTopK, long chunkSize, Cost costmodel, string cSourcePath = "", string funcName = "")

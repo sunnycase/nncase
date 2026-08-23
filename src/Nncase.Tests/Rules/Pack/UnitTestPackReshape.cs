@@ -97,4 +97,15 @@ public class UnitTestVectorizeReshape : TransformTestBase
             expr,
             new Dictionary<IVar, IValue> { { inputVar, Value.FromTensor(input) } });
     }
+
+    [Fact]
+    public void TestReshapeDevectorizePropagationSplitLeadingUnitAxis()
+    {
+        var input = Pack(Testing.Rand<float>(1, 32), [4], [1]).Evaluate().AsTensor();
+        var inputVar = new Var(new TensorType(input.ElementType, input.Shape));
+        Expr expr = Reshape(Unpack(inputVar, [4], [1]), [4, 8]);
+        TestMatched<ReshapeDevectorizePropagation>(
+            expr,
+            new Dictionary<IVar, IValue> { { inputVar, Value.FromTensor(input) } });
+    }
 }

@@ -125,6 +125,26 @@ def test_pyntt_elementwise_accesses_preserve_their_natural_broadcast_domain():
     assert "tl.broadcast_to" not in context["output_access"]["ScalarOffset"]
 
 
+def test_pyntt_elementwise_scalar_domain_masks_the_physical_tile_tail():
+    _add_pyntt_to_path()
+    from pyntt.codegen.render import _elementwise_unary_template_context
+
+    context = _elementwise_unary_template_context(
+        {
+            "InputShape": [1, 1],
+            "InputStrides": [0, 1],
+            "InputVectorLaneShape": [],
+            "OutputShape": [1, 1],
+            "OutputStrides": [0, 1],
+            "OutputVectorLaneShape": [],
+        }
+    )
+
+    assert context["major_axis"] == 1
+    assert context["input_access"]["BoundaryMask"] == "True"
+    assert context["output_access"]["BoundaryMask"] == "mask"
+
+
 def test_pyntt_elementwise_iteration_uses_explicit_physical_tile_width():
     template_dir = (
         Path(__file__).resolve().parents[2]
@@ -1027,6 +1047,73 @@ def test_pyntt_renderer_canonical_pointer_applies_view_origin_before_sharding():
 
     assert "(2) + (local_index)" in pointer
     assert pointer.count("shard_coord1") == 1
+
+
+def test_pyntt_softmax_uses_coordinate_native_canonical_global_accesses():
+    _add_pyntt_to_path()
+    from pyntt.codegen.render import _access_pointer, _softmax_template_context
+
+    def fixed(value):
+        return {
+            "TritonExpression": str(value),
+            "FixedValue": value,
+            "MaxValue": value,
+        }
+
+    strides = [fixed(0), fixed(1)]
+    model = {
+        "Input": {
+            "DistributedStorageKind": "CanonicalGlobal",
+            "GlobalShape": [fixed(1), fixed(256)],
+            "GlobalOffsets": [fixed(0), fixed(0)],
+            "Strides": strides,
+            "ShardAxes": [{"Stages": []}, {"Stages": []}],
+            "Hierarchy": [4, 8],
+        },
+        "Shape": [fixed(1), fixed(256)],
+        "InputStrides": strides,
+        "OutputStrides": strides,
+        "Axis": 1,
+    }
+
+    context = _softmax_template_context(model)
+    input_pointer = _access_pointer(
+        model, "Input", "input", context["input_access"]
+    )
+
+    assert context["axis_block_size"] == 256
+    assert context["loop_axes"] == (0,)
+    assert context["input_access"]["TensorIndices"] == ("idx0", "lane")
+    assert "lane" in input_pointer
+
+
+def test_pyntt_softmax_uses_dynamic_axis_maximum_for_static_reduction_capacity():
+    _add_pyntt_to_path()
+    from pyntt.codegen.render import _softmax_template_context
+
+    def fixed(value):
+        return {
+            "TritonExpression": str(value),
+            "FixedValue": value,
+            "MaxValue": value,
+        }
+
+    dynamic_axis = {
+        "TritonExpression": "sequence_length",
+        "FixedValue": None,
+        "MaxValue": 300,
+    }
+    context = _softmax_template_context(
+        {
+            "Shape": [fixed(2), dynamic_axis],
+            "InputStrides": [dynamic_axis, fixed(1)],
+            "OutputStrides": [dynamic_axis, fixed(1)],
+            "Axis": 1,
+        }
+    )
+
+    assert context["axis_block_size"] == 512
+    assert context["axis_extent"] is dynamic_axis
 
 
 def test_pyntt_renderer_owns_block_schedule_config():

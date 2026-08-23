@@ -114,6 +114,398 @@ public sealed class UnitTestDistribAutoDistributed : TestClassBase
     }
 
     [Fact]
+    public void TestSparseExpertsStageProvidersPreservePackedBlockCyclicContracts()
+    {
+        var options = new PyNTTTargetOptions
+        {
+            HierarchyNames = "yx",
+            HierarchyLevels = "bb",
+            Hierarchies = [new[] { 4, 8 }],
+        };
+        CompileOptions.TargetOptions = options;
+        var placement = new Placement([4, 8], "yx", "bb");
+        const int hiddenSize = 64;
+        const int intermediateSize = 64;
+        const int numExperts = 4;
+        const int topK = 2;
+        var outputDataType = new VectorType(DataTypes.BFloat16, [8]);
+        var q = new Var("q", new TensorType(DataTypes.BFloat16, [1, hiddenSize]));
+        var ids = new Var("ids", new TensorType(DataTypes.Int64, [1, topK]));
+        var routerWeights = new Var("router_weights", new TensorType(DataTypes.Float32, [1, topK]));
+        var scales = new Var("scales", new TensorType(DataTypes.Float32, [numExperts, 1]));
+        var gate = new Var("gate", new TensorType(DataTypes.BFloat16, [numExperts, intermediateSize, hiddenSize]));
+        var up = new Var("up", new TensorType(DataTypes.BFloat16, [numExperts, intermediateSize, hiddenSize]));
+        var down = new Var("down", new TensorType(DataTypes.BFloat16, [numExperts, hiddenSize, intermediateSize]));
+        var gateUpCall = IR.F.NN.SparseExpertsGateUp(
+            q,
+            ids,
+            scales,
+            gate,
+            scales,
+            scales,
+            up,
+            scales,
+            outputDataType,
+            hiddenSize,
+            intermediateSize,
+            numExperts,
+            topK,
+            1);
+        Assert.True(gateUpCall.InferenceType());
+        var gateUpTensor = Assert.IsType<TensorType>(gateUpCall.CheckedType);
+        var gateUpOutput = new DistributedType(
+            gateUpTensor,
+            [SBP.B, SBP.B, SBP.SBlockCyclic([0], 2)],
+            placement);
+        var gateUpInputs = gateUpCall.Arguments.ToArray()
+            .Select(argument => (IReadOnlyList<IRType>)new IRType[]
+            {
+                new DistributedType(
+                    Assert.IsType<TensorType>(argument.CheckedType),
+                    Enumerable.Repeat<SBP>(SBP.B, argument.CheckedShape.Rank).ToArray(),
+                    placement),
+            })
+            .ToArray();
+        var gateUpContext = new DistributedCandidateContext(
+            CompileOptions,
+            options,
+            PyNTTTarget.Kind,
+            gateUpCall,
+            gateUpInputs);
+        var gateUpProvider = new SparseExpertsGateUpCandidateProvider();
+        var gateUpTarget = Assert.IsType<SparseExpertsGateUp>(gateUpCall.Target);
+        var expectedGateUpInputs = gateUpCall.Arguments.ToArray()
+            .Select(argument => (IRType)new DistributedType(
+                Assert.IsType<TensorType>(argument.CheckedType),
+                Enumerable.Repeat<SBP>(SBP.B, argument.CheckedShape.Rank).ToArray(),
+                placement))
+            .ToArray();
+        expectedGateUpInputs[SparseExpertsGateUp.MoeExpertGateProjW.Index] = new DistributedType(
+            Assert.IsType<TensorType>(gate.CheckedType),
+            [SBP.B, SBP.SBlockCyclic([0], 16), SBP.B],
+            placement);
+        expectedGateUpInputs[SparseExpertsGateUp.MoeExpertUpProjW.Index] = new DistributedType(
+            Assert.IsType<TensorType>(up.CheckedType),
+            [SBP.B, SBP.SBlockCyclic([0], 16), SBP.B],
+            placement);
+        Assert.Equal(
+            gateUpOutput,
+            SparseExpertsGateUpEvaluator.InferType(gateUpTarget, expectedGateUpInputs));
+
+        Assert.Contains(
+            gateUpOutput,
+            gateUpProvider.GetReturnCandidateTypes(gateUpContext, gateUpTarget, [gateUpOutput]));
+        Assert.True(gateUpProvider.TryGetInputTypeTuples(
+            gateUpContext,
+            gateUpTarget,
+            gateUpOutput,
+            out var gateUpTuples));
+        Assert.True(gateUpTuples.Count == 1, $"Expected one gate/up tuple, got {gateUpTuples.Count}.");
+        var gateUpTuple = gateUpTuples[0];
+        var distributedGateWeight = Assert.IsType<DistributedType>(
+            gateUpTuple.InputTypes[SparseExpertsGateUp.MoeExpertGateProjW.Index]);
+        Assert.Equal(SBP.SBlockCyclic([0], 16), distributedGateWeight.AxisPolicies[1]);
+
+        var activations = new Var("activations", gateUpTensor);
+        var downCall = IR.F.NN.SparseExpertsDown(
+            activations,
+            ids,
+            routerWeights,
+            scales,
+            down,
+            scales,
+            outputDataType,
+            hiddenSize,
+            intermediateSize,
+            numExperts,
+            topK,
+            1);
+        Assert.True(downCall.InferenceType());
+        var downTensor = Assert.IsType<TensorType>(downCall.CheckedType);
+        var downBaseOutput = new DistributedType(
+            downTensor,
+            [SBP.B, SBP.SBlockCyclic([1], 1)],
+            placement);
+        var downOutput = downBaseOutput with { Partial = SBP.P([0]) };
+        var downInputs = downCall.Arguments.ToArray()
+            .Select(argument => (IReadOnlyList<IRType>)new IRType[]
+            {
+                new DistributedType(
+                    Assert.IsType<TensorType>(argument.CheckedType),
+                    Enumerable.Repeat<SBP>(SBP.B, argument.CheckedShape.Rank).ToArray(),
+                    placement),
+            })
+            .ToArray();
+        downInputs[SparseExpertsDown.Activations.Index] = [gateUpOutput];
+        var downContext = new DistributedCandidateContext(
+            CompileOptions,
+            options,
+            PyNTTTarget.Kind,
+            downCall,
+            downInputs);
+        var downProvider = new SparseExpertsDownCandidateProvider();
+        var downTarget = Assert.IsType<SparseExpertsDown>(downCall.Target);
+        var expectedDownInputs = downCall.Arguments.ToArray()
+            .Select(argument => (IRType)new DistributedType(
+                Assert.IsType<TensorType>(argument.CheckedType),
+                Enumerable.Repeat<SBP>(SBP.B, argument.CheckedShape.Rank).ToArray(),
+                placement))
+            .ToArray();
+        expectedDownInputs[SparseExpertsDown.Activations.Index] = gateUpOutput;
+        expectedDownInputs[SparseExpertsDown.MoeExpertDownProjW.Index] = new DistributedType(
+            Assert.IsType<TensorType>(down.CheckedType),
+            [SBP.B, SBP.SBlockCyclic([1], 8), SBP.SBlockCyclic([0], 16)],
+            placement);
+        Assert.Equal(
+            downOutput,
+            SparseExpertsDownEvaluator.InferType(downTarget, expectedDownInputs));
+
+        Assert.Contains(
+            downOutput,
+            downProvider.GetReturnCandidateTypes(downContext, downTarget, [downBaseOutput]));
+        Assert.True(downProvider.TryGetInputTypeTuples(
+            downContext,
+            downTarget,
+            downOutput,
+            out var downTuples));
+        Assert.True(downTuples.Count == 1, $"Expected one down tuple, got {downTuples.Count}.");
+        var downTuple = downTuples[0];
+        Assert.Equal(gateUpOutput, downTuple.InputTypes[SparseExpertsDown.Activations.Index]);
+        Assert.Equal(
+            new SBP[] { SBP.B, SBP.SBlockCyclic([1], 8), SBP.SBlockCyclic([0], 16) },
+            Assert.IsType<DistributedType>(
+                downTuple.InputTypes[SparseExpertsDown.MoeExpertDownProjW.Index]).AxisPolicies.ToArray());
+    }
+
+    [Fact]
+    public void TestGatedDeltaNetStageCandidateProvidersDeriveIndependentContracts()
+    {
+        var options = new PyNTTTargetOptions
+        {
+            HierarchyNames = "yx",
+            HierarchyLevels = "bb",
+            Hierarchies = [new[] { 4, 8 }],
+        };
+        CompileOptions.TargetOptions = options;
+        var placement = new Placement([4, 8], "yx", "bb");
+        const int hidden = 64;
+        const int numKeyHeads = 4;
+        const int numValueHeads = 32;
+        const int keyHeadDim = 8;
+        const int valueHeadDim = 8;
+        const int convKernelSize = 4;
+        const int convDim = 320;
+        const int valueDim = 256;
+        var bf16 = DataTypes.BFloat16;
+        Var Buffer(string name, DataType dtype, params long[] shape) =>
+            new(name, new TensorType(dtype, new RankedShape(shape)));
+        DistributedType Broadcast(TensorType tensor) => new(
+            tensor,
+            Enumerable.Repeat<SBP>(SBP.B, tensor.Shape.Rank).ToArray(),
+            placement);
+
+        DistributedCandidateContext Context(Call call) => new(
+            CompileOptions,
+            options,
+            PyNTTTarget.Kind,
+            call,
+            call.Arguments.ToArray()
+                .Select(argument => (IReadOnlyList<IRType>)new IRType[]
+                {
+                    argument.CheckedType switch
+                    {
+                        DimensionType dimension => dimension,
+                        TensorType { DType: ReferenceType } reference => reference,
+                        TensorType tensor => Broadcast(tensor),
+                        var type => throw new InvalidOperationException($"Unexpected GDN argument type {type}."),
+                    },
+                })
+                .ToArray());
+
+        var stateConfig = new GatedDeltaNetStateConfig(
+            1,
+            numKeyHeads,
+            numValueHeads,
+            keyHeadDim,
+            valueHeadDim,
+            convKernelSize,
+            hidden,
+            bf16,
+            [8],
+            [GatedDeltaNetStateDimKind.NumLayers, GatedDeltaNetStateDimKind.ConvChannels, GatedDeltaNetStateDimKind.ConvHistory],
+            [GatedDeltaNetStateDimKind.ConvChannels],
+            [8],
+            [GatedDeltaNetStateDimKind.NumLayers, GatedDeltaNetStateDimKind.NumValueHeads, GatedDeltaNetStateDimKind.KeyHeadDim, GatedDeltaNetStateDimKind.ValueHeadDim],
+            [GatedDeltaNetStateDimKind.ValueHeadDim],
+            [4]);
+        var input = Buffer("input", bf16, 1, hidden);
+        var state = Buffer(
+            "state",
+            new ReferenceType(new GatedDeltaNetStateType { Config = stateConfig }));
+        var projectionCall = IR.F.NN.GatedDeltaNetProjection(
+            input,
+            state,
+            Buffer("qkv_weight", bf16, hidden, convDim),
+            Buffer("conv_weight", bf16, convDim, convKernelSize),
+            0,
+            convKernelSize);
+        var projectionOutput = Assert.IsType<TupleType>(projectionCall.CheckedType);
+        var projectionDefaultOutput = new TupleType([
+            Broadcast(Assert.IsType<TensorType>(projectionOutput[0])),
+            projectionOutput[1],
+        ]);
+        var projectionExpectedOutput = new TupleType([
+            new DistributedType(
+                Assert.IsType<TensorType>(projectionOutput[0]),
+                [SBP.B, SBP.SContiguous([0, 1])],
+                placement),
+            projectionOutput[1],
+        ]);
+        var projectionProvider = new GatedDeltaNetProjectionCandidateProvider();
+        var projectionTarget = Assert.IsType<GatedDeltaNetProjection>(projectionCall.Target);
+        Assert.True(projectionProvider.IsExhaustive);
+        Assert.Contains(
+            projectionExpectedOutput,
+            projectionProvider.GetReturnCandidateTypes(
+                Context(projectionCall),
+                projectionTarget,
+                [projectionDefaultOutput]));
+        Assert.True(projectionProvider.TryGetInputTypeTuples(
+            Context(projectionCall),
+            projectionTarget,
+            projectionExpectedOutput,
+            out var projectionTuples));
+        var projectionInputs = Assert.Single(projectionTuples).InputTypes;
+        Assert.Equal(state.CheckedType, projectionInputs[GatedDeltaNetProjection.State.Index]);
+        Assert.Equal(
+            new SBP[] { SBP.B, SBP.SContiguous([0, 1]) },
+            Assert.IsType<DistributedType>(projectionInputs[GatedDeltaNetProjection.QKVWeight.Index]).AxisPolicies.ToArray());
+
+        var recurrentCall = IR.F.NN.GatedDeltaNetRecurrentCore(
+            input,
+            state,
+            new Var("qkv", projectionOutput[0]),
+            Buffer("z_weight", bf16, hidden, valueDim),
+            Buffer("b_weight", bf16, hidden, numValueHeads),
+            Buffer("a_weight", bf16, hidden, numValueHeads),
+            Buffer("a_log", DataTypes.Float32, numValueHeads),
+            Buffer("dt_bias", DataTypes.Float32, numValueHeads),
+            Buffer("norm_weight", DataTypes.Float32, valueHeadDim),
+            0,
+            numKeyHeads,
+            numValueHeads,
+            keyHeadDim,
+            valueHeadDim,
+            1e-6F);
+        var recurrentOutput = Assert.IsType<TupleType>(recurrentCall.CheckedType);
+        var recurrentDefaultOutput = new TupleType([
+            Broadcast(Assert.IsType<TensorType>(recurrentOutput[0])),
+            recurrentOutput[1],
+        ]);
+        var recurrentExpectedOutput = new TupleType([
+            new DistributedType(
+                Assert.IsType<TensorType>(recurrentOutput[0]),
+                [SBP.B, SBP.SContiguous([0, 1])],
+                placement),
+            recurrentOutput[1],
+        ]);
+        var recurrentProvider = new GatedDeltaNetRecurrentCoreCandidateProvider();
+        var recurrentTarget = Assert.IsType<GatedDeltaNetRecurrentCore>(recurrentCall.Target);
+        Assert.True(recurrentProvider.IsExhaustive);
+        Assert.Contains(
+            recurrentExpectedOutput,
+            recurrentProvider.GetReturnCandidateTypes(
+                Context(recurrentCall),
+                recurrentTarget,
+                [recurrentDefaultOutput]));
+        Assert.True(recurrentProvider.TryGetInputTypeTuples(
+            Context(recurrentCall),
+            recurrentTarget,
+            recurrentExpectedOutput,
+            out var recurrentTuples));
+        var recurrentInputs = Assert.Single(recurrentTuples).InputTypes;
+        Assert.Equal(state.CheckedType, recurrentInputs[GatedDeltaNetRecurrentCore.State.Index]);
+        Assert.All(
+            Assert.IsType<DistributedType>(recurrentInputs[GatedDeltaNetRecurrentCore.QKV.Index]).AxisPolicies,
+            policy => Assert.IsType<SBPBroadCast>(policy));
+        Assert.Equal(
+            new SBP[] { SBP.B, SBP.SContiguous([0, 1]) },
+            Assert.IsType<DistributedType>(recurrentInputs[GatedDeltaNetRecurrentCore.ZWeight.Index]).AxisPolicies.ToArray());
+        Assert.Equal(
+            new SBP[] { SBP.SContiguous([0, 1]) },
+            Assert.IsType<DistributedType>(recurrentInputs[GatedDeltaNetRecurrentCore.ALog.Index]).AxisPolicies.ToArray());
+    }
+
+    [Fact]
+    public void TestProviderDemandedConstantShardedViewUsesCanonicalStorage()
+    {
+        var options = new PyNTTTargetOptions
+        {
+            HierarchyNames = "yx",
+            HierarchyLevels = "bb",
+            Hierarchies = [new[] { 4, 8 }],
+        };
+        CompileOptions.TargetOptions = options;
+        const int hiddenSize = 64;
+        const int intermediateSize = 16;
+        const int numExperts = 4;
+        const int topK = 2;
+        var q = new Var("q", new TensorType(DataTypes.BFloat16, [1, hiddenSize]));
+        var ids = new Var("ids", new TensorType(DataTypes.Int64, [1, topK]));
+        var scales = new Var("scales", new TensorType(DataTypes.Float32, [numExperts, 1]));
+        var gate = new TensorConst(
+            Tensor.FromScalar((BFloat16)1.0f, [numExperts, intermediateSize, hiddenSize]));
+        var up = new TensorConst(
+            Tensor.FromScalar((BFloat16)1.0f, [numExperts, intermediateSize, hiddenSize]));
+        var gateUp = IR.F.NN.SparseExpertsGateUp(
+            q,
+            ids,
+            scales,
+            gate,
+            scales,
+            scales,
+            up,
+            scales,
+            DataTypes.BFloat16,
+            hiddenSize,
+            intermediateSize,
+            numExperts,
+            topK,
+            1);
+        var main = new Function("main", gateUp, [q, ids, scales]);
+        Assert.True(main.InferenceType());
+
+        var rewriter = new AutoDistributedRewriter(
+            CompileOptions,
+            options,
+            AutoDistributedPhase.Final,
+            PyNTTTarget.Kind);
+        var buildMethod = typeof(AutoDistributedRewriter).GetMethod(
+            "BuildFunctionSearchGraph",
+            BindingFlags.Instance | BindingFlags.NonPublic);
+        Assert.NotNull(buildMethod);
+        _ = Assert.IsType<DistributedSearchGraph>(buildMethod!.Invoke(rewriter, [main, true]));
+        var graphField = typeof(AutoDistributedRewriter).GetField(
+            "_rootSearchGraph",
+            BindingFlags.Instance | BindingFlags.NonPublic);
+        var graph = Assert.IsType<DistributedSearchGraph>(graphField?.GetValue(rewriter));
+        var demandedViews = graph.Vertices.Where(node =>
+            node.Expr is IR.Distributed.ShardedView &&
+            node.IRType is DistributedType distributed &&
+            EqualityComparer<IRType>.Default.Equals(distributed.TensorType, gate.CheckedType) &&
+            distributed.AxisPolicies is [SBPBroadCast, SBPSplit, SBPBroadCast]).ToArray();
+
+        Assert.NotEmpty(demandedViews);
+        foreach (var view in demandedViews)
+        {
+            Assert.True(graph.TryGetOutEdges(view, out var edges));
+            var source = Assert.Single(edges.Where(edge => edge.InputIndex == 0));
+            Assert.IsType<TensorConst>(source.Target.Expr);
+            Assert.IsType<TensorType>(source.Target.IRType);
+        }
+    }
+
+    [Fact]
     public void TestNormApplyCandidateProviderPreservesExactInputSplit()
     {
         var options = new PyNTTTargetOptions

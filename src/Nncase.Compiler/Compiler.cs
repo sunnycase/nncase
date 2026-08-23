@@ -184,9 +184,13 @@ public class Compiler : ICompiler
             p.Add<Passes.Rules.Neutral.SwapBinaryArgs>();
             p.Add<Passes.Rules.Neutral.DecomposeInstanceNorm>();
             p.Add<Passes.Rules.Neutral.DecomposeLayerNorm>();
+            p.Add<Passes.Rules.Neutral.DecomposeGatedDeltaNet>();
+            p.Add<Passes.Rules.Neutral.DecomposeSparseExperts>();
             p.Add<Passes.Rules.Neutral.DecomposeGelu>();
             p.Add<Passes.Rules.Neutral.ScalarConstToTensor>();
         });
+
+        passManager.AddWithName<FoldTopKSoftmaxNormalizationPass>("FoldTopKSoftmaxNormalization");
 
         passManager.Add<InferRangePass>();
         passManager.Add<OptimizeByRangePass>();

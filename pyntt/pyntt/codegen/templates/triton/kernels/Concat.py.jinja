@@ -24,7 +24,7 @@
 {{ body }}mask = lane < {{ dim(entry["block_extent"]) }}
 {{ body }}input_offsets = {{ entry["input_offset"] }}
 {{ body }}output_offsets = {{ entry["output_offset"] }}
-{{ body }}value = tl.load({{ access_pointer_value(model["Inputs"][entry["index"]], "input" ~ entry["index"], "input_offsets") }}, mask=mask)
+{{ body }}value = tl.load(input{{ entry["index"] }} + input_offsets, mask=mask)
 {{ body }}tl.store({{ access_pointer(model, "Output", "output", "output_offsets") }}, value, mask=mask)
 {% endfor %}
 

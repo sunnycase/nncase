@@ -128,4 +128,14 @@ public enum UnaryOp : byte
     /// Logical not.
     /// </summary>
     LogicalNot,
+
+    /// <summary>
+    /// Sigmoid.
+    /// </summary>
+    Sigmoid,
+
+    /// <summary>
+    /// Softplus.
+    /// </summary>
+    Softplus,
 }

@@ -55,6 +55,151 @@
 
 namespace nncase::ntt {
 
+namespace sparse_experts_detail {
+
+template <Tensor T, Dimension... TPrefix>
+NTT_ALWAYS_INLINE constexpr auto
+read_last_axis_scalar(const T &tensor, size_t logical_index,
+                      const TPrefix &...prefix) noexcept {
+    using element_type = typename T::element_type;
+    if constexpr (Vector<element_type>) {
+        constexpr auto lane_count = element_scalar_count_v<element_type>;
+        const auto value = tensor(prefix..., logical_index / lane_count);
+        return unwrap_proxy(value(unravel_index(logical_index % lane_count,
+                                                element_type::shape())));
+    } else {
+        return unwrap_proxy(tensor(prefix..., logical_index));
+    }
+}
+
+} // namespace sparse_experts_detail
+
+template <Tensor TQ, Tensor TRouterIds, Tensor TGateInputScale,
+          Tensor TGateProjW, Tensor TGateProjScale, Tensor TUpInputScale,
+          Tensor TUpProjW, Tensor TUpProjScale, class TOut>
+void sparse_experts_gate_up(
+    const TQ &q, const TRouterIds &topk_indices,
+    const TGateInputScale &gate_input_scales,
+    const TGateProjW &gate_weights, const TGateProjScale &gate_scales,
+    const TUpInputScale &up_input_scales, const TUpProjW &up_weights,
+    const TUpProjScale &up_scales, TOut &&output, size_t /* hidden_size */,
+    size_t /* moe_intermediate_size */, size_t /* num_expert */,
+    size_t /* num_top_k */, size_t /* chunk_size */) noexcept {
+    using output_type = typename std::remove_reference_t<TOut>::element_type;
+    using output_scalar_type = element_or_scalar_t<output_type>;
+    using input_type = typename TQ::element_type;
+    constexpr auto input_lane_count = element_scalar_count_v<input_type>;
+    constexpr auto output_lane_count = element_scalar_count_v<output_type>;
+    const auto tokens = q.shape()[0_dim];
+    const auto hidden = q.shape()[1_dim] * input_lane_count;
+    const auto top_k = topk_indices.shape()[1_dim];
+    for (size_t token = 0; token < tokens; token++) {
+        for (size_t topk_index = 0; topk_index < top_k; topk_index++) {
+            const auto expert = static_cast<size_t>(topk_indices(token, topk_index));
+            const auto gate_input_scale = static_cast<float>(gate_input_scales(expert, 0));
+            const auto gate_scale = static_cast<float>(gate_scales(expert, 0));
+            const auto up_input_scale = static_cast<float>(up_input_scales(expert, 0));
+            const auto up_scale = static_cast<float>(up_scales(expert, 0));
+            const auto compute = [&](size_t logical_intermediate) {
+                float gate = 0.f;
+                float up = 0.f;
+                for (size_t h = 0; h < hidden; h++) {
+                    const auto input = static_cast<float>(
+                        sparse_experts_detail::read_last_axis_scalar(q, h,
+                                                                    token));
+                    gate +=
+                        (input / gate_input_scale) * static_cast<float>(
+                            gate_weights(expert, logical_intermediate, h));
+                    up += (input / up_input_scale) * static_cast<float>(
+                        up_weights(expert, logical_intermediate, h));
+                }
+
+                gate *= gate_input_scale * gate_scale;
+                up *= up_input_scale * up_scale;
+                return (gate * sigmoid(gate)) * up;
+            };
+            for (size_t d = 0; d < output.shape()[2_dim]; d++) {
+                if constexpr (Vector<output_type>) {
+                    output_type values{};
+                    for (size_t lane = 0; lane < output_lane_count; lane++) {
+                        const auto lane_index =
+                            unravel_index(lane, output_type::shape());
+                        values(lane_index) = static_cast<output_scalar_type>(
+                            compute(d * output_lane_count + lane));
+                    }
+
+                    output(token, topk_index, d) = values;
+                } else {
+                    output(token, topk_index, d) =
+                        static_cast<output_type>(compute(d));
+                }
+            }
+        }
+    }
+}
+
+template <Tensor TActivations, Tensor TRouterIds, Tensor TRouterWeights,
+          Tensor TDownInputScale, Tensor TDownProjW, Tensor TDownProjScale,
+          class TOut>
+void sparse_experts_down(
+    const TActivations &activations, const TRouterIds &topk_indices,
+    const TRouterWeights &topk_probs,
+    const TDownInputScale &down_input_scales,
+    const TDownProjW &down_weights, const TDownProjScale &down_scales,
+    TOut &&output, size_t /* hidden_size */,
+    size_t /* moe_intermediate_size */, size_t /* num_expert */,
+    size_t /* num_top_k */, size_t /* chunk_size */) noexcept {
+    using output_type = typename std::remove_reference_t<TOut>::element_type;
+    using output_scalar_type = element_or_scalar_t<output_type>;
+    using activation_type = typename TActivations::element_type;
+    constexpr auto activation_lane_count =
+        element_scalar_count_v<activation_type>;
+    constexpr auto output_lane_count = element_scalar_count_v<output_type>;
+    const auto tokens = activations.shape()[0_dim];
+    const auto top_k = activations.shape()[1_dim];
+    const auto intermediate =
+        activations.shape()[2_dim] * activation_lane_count;
+    for (size_t token = 0; token < tokens; token++) {
+        const auto compute = [&](size_t logical_hidden) {
+            auto result = 0.f;
+            for (size_t topk_index = 0; topk_index < top_k; topk_index++) {
+                const auto expert = static_cast<size_t>(topk_indices(token, topk_index));
+                const auto input_scale = static_cast<float>(down_input_scales(expert, 0));
+                const auto down_scale = static_cast<float>(down_scales(expert, 0));
+                float expert_result = 0.f;
+                for (size_t d = 0; d < intermediate; d++) {
+                    const auto activation = static_cast<float>(
+                        sparse_experts_detail::read_last_axis_scalar(
+                            activations, d, token, topk_index));
+                    expert_result += (activation / input_scale) *
+                                     static_cast<float>(down_weights(
+                                         expert, logical_hidden, d));
+                }
+
+                result += static_cast<float>(topk_probs(token, topk_index)) *
+                          expert_result * input_scale * down_scale;
+            }
+
+            return result;
+        };
+        for (size_t h = 0; h < output.shape()[1_dim]; h++) {
+            if constexpr (Vector<output_type>) {
+                output_type values{};
+                for (size_t lane = 0; lane < output_lane_count; lane++) {
+                    const auto lane_index =
+                        unravel_index(lane, output_type::shape());
+                    values(lane_index) = static_cast<output_scalar_type>(
+                        compute(h * output_lane_count + lane));
+                }
+
+                output(token, h) = values;
+            } else {
+                output(token, h) = static_cast<output_type>(compute(h));
+            }
+        }
+    }
+}
+
 namespace detail {
 
 template <Tensor TQ, Tensor TRouterIds, Tensor TRouterWeights,
@@ -74,18 +219,22 @@ void sparse_experts_impl(const TQ &q,
                          const TUpInputScale &moeExpertUpInputScale,
                          const TUpProjW &moeExpertUpProjW,
                          const TUpProjScale &moeExpertUpProjScale,
-                         size_t hidden_size,
-                         size_t moe_intermediate_size,
+                         size_t /* hidden_size */,
+                         size_t /* moe_intermediate_size */,
                          size_t /* num_expert */,
-                         size_t num_top_k,
+                         size_t /* num_top_k */,
                          size_t /* chunk_size */,
                          TOut &output) {
     using ElemType = typename TQ::element_type;
     const auto seq_len = q.shape()[0_dim];
+    const auto hidden_size = q.shape()[1_dim];
+    const auto moe_intermediate_size = moeExpertGateProjW.shape()[1_dim];
+    const auto output_hidden_size = output.shape()[1_dim];
+    const auto num_top_k = topk_indices.shape()[1_dim];
 
     // Initialize output to zero
     for (size_t i = 0; i < seq_len; i++)
-        for (size_t h = 0; h < hidden_size; h++) output(i, h) = (ElemType)0;
+        for (size_t h = 0; h < output_hidden_size; h++) output(i, h) = (ElemType)0;
 
     // For each token, accumulate expert contributions.
     for (size_t i = 0; i < seq_len; i++) {
@@ -202,7 +351,7 @@ void sparse_experts_impl(const TQ &q,
                 down_input_scale_val = (float)moeExpertDownInputScale(expert, 0);
             }
             
-            for (size_t h = 0; h < hidden_size; h++) {
+            for (size_t h = 0; h < output_hidden_size; h++) {
                 float acc = 0.f;
                 for (size_t d = 0; d < moe_intermediate_size; d++) {
                     float down_in = gate[d] * up[d];

@@ -1578,6 +1578,18 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 case Nncase.TIR.NTT.QKVRoPEWithCache qkvRoPEWithCache:
                     VisitQKVRoPEWithCache(qkvRoPEWithCache, args);
                     break;
+                case Nncase.TIR.NTT.GatedDeltaNetProjection gatedDeltaNetProjection:
+                    VisitGatedDeltaNetProjection(
+                        gatedDeltaNetProjection,
+                        args,
+                        RequireMicroKernel(microKernel, gatedDeltaNetProjection));
+                    break;
+                case Nncase.TIR.NTT.GatedDeltaNetRecurrentCore gatedDeltaNetRecurrent:
+                    VisitGatedDeltaNetRecurrentCore(
+                        gatedDeltaNetRecurrent,
+                        args,
+                        RequireMicroKernel(microKernel, gatedDeltaNetRecurrent));
+                    break;
                 case Nncase.TIR.NTT.PagedAttention pagedAttention:
                     VisitPagedAttention(pagedAttention, args);
                     break;
@@ -1611,6 +1623,18 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     break;
                 case Nncase.TIR.NTT.Softmax softmax:
                     VisitSoftmax(softmax.Axis, default, args, "softmax");
+                    break;
+                case Nncase.TIR.NTT.TopK topK:
+                    VisitTopK(topK, args);
+                    break;
+                case Nncase.TIR.NTT.SparseExpertsGateUp gateUp:
+                    VisitSparseExpertsGateUp(gateUp, args);
+                    break;
+                case Nncase.TIR.NTT.SparseExpertsDown down:
+                    VisitSparseExpertsDown(
+                        down,
+                        args,
+                        RequireMicroKernel(microKernel, down));
                     break;
                 case Nncase.TIR.NTT.SamplingPartial samplingPartial:
                     VisitSamplingPartial(samplingPartial, args);
@@ -3003,7 +3027,6 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             => (IsFormalTensorBuffer(src) || src.MemSpan.Buffer.Location == MemoryLocation.Input) &&
                (src.DistributedType is null || src.DistributedType.AxisPolicies.All(policy => policy is SBPBroadCast)) &&
                dest.DistributedType is not null &&
-               dest.DistributedStorageKind == DistributedBufferStorageKind.CompactLocal &&
                dest.DistributedType.AxisPolicies.Any(policy => policy is SBPSplit) &&
                GetBufferGlobalOffsets(src).All(offset => EquivalentDim(offset, PyNTTDimExpression.Zero));
 
@@ -6450,6 +6473,14 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 ("triton.matmul_glu", "simt_fma") => "triton/kernels/matmul_glu/simt_fma.py.jinja",
                 ("triton.matmul_glu", "simt_fma_smem_pipeline") => "triton/kernels/matmul_glu/simt_fma_smem_pipeline.py.jinja",
                 ("triton.matmul_glu", "mma") => "triton/kernels/matmul_glu/mma.py.jinja",
+                ("triton.gated_delta_net", "projection_mma_tma_smem_pipeline") =>
+                    "triton/kernels/gated_delta_net/projection_mma_tma_smem_pipeline.py.jinja",
+                ("triton.gated_delta_net", "recurrent_core_hybrid_tma_smem_pipeline") =>
+                    "triton/kernels/gated_delta_net/recurrent_core_hybrid_tma_smem_pipeline.py.jinja",
+                ("triton.gated_delta_net", "recurrent_core_single_head_register_state_hybrid_tma_smem_pipeline") =>
+                    "triton/kernels/gated_delta_net/recurrent_core_single_head_register_state_hybrid_tma_smem_pipeline.py.jinja",
+                ("triton.sparse_experts_down", "concatenated_mma_smem_pipeline") =>
+                    "triton/kernels/sparse_experts/down_concatenated_mma_smem_pipeline.py.jinja",
                 ("triton.paged_attention_partial", "mma_direct") => "triton/kernels/paged_attention/mma_direct.py.jinja",
                 ("triton.paged_attention_partial", "simt_direct") => "triton/kernels/paged_attention/simt_direct.py.jinja",
                 ("triton.paged_attention_partial", "mma_tma_smem_pipeline") => "triton/kernels/paged_attention/mma_tma_smem_pipeline.py.jinja",
@@ -7706,6 +7737,773 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     normalizedAxis,
                     $"{input.Name} -> {output.Name}"));
             WriteLine(BuildHelperCall(helperName));
+        }
+
+        private void VisitTopK(Nncase.TIR.NTT.TopK topK, IReadOnlyList<BaseExpr> args)
+        {
+            if (args.Count != 3 || args[0] is not TIR.Buffer input)
+            {
+                throw new NotSupportedException("PyNTT TopK codegen expects an input buffer and two output buffers.");
+            }
+
+            if (args[2] is not IR.Tuple { Count: 2 } outputs ||
+                outputs[0] is not TIR.Buffer values ||
+                outputs[1] is not TIR.Buffer indices)
+            {
+                throw new NotSupportedException("PyNTT TopK output must be a tuple of values and indices buffers.");
+            }
+
+            EnsureScalarBuffer(input, "PyNTT TopK input");
+            EnsureScalarBuffer(values, "PyNTT TopK values");
+            EnsureScalarBuffer(indices, "PyNTT TopK indices");
+            var inputShape = GetBufferActiveShape(input);
+            var valuesShape = GetBufferActiveShape(values);
+            var indicesShape = GetBufferActiveShape(indices);
+            var axis = NormalizeAxis(checked((int)topK.Axis), inputShape.Length, "PyNTT TopK");
+            if (axis != inputShape.Length - 1)
+            {
+                throw new NotSupportedException("PyNTT TopK currently requires the final logical axis.");
+            }
+
+            if (valuesShape.Length != inputShape.Length || indicesShape.Length != inputShape.Length)
+            {
+                throw new NotSupportedException("PyNTT TopK input and outputs must have the same rank.");
+            }
+
+            for (var i = 0; i < inputShape.Length - 1; i++)
+            {
+                if (!SameDim(inputShape[i], valuesShape[i]) || !SameDim(inputShape[i], indicesShape[i]))
+                {
+                    throw new NotSupportedException("PyNTT TopK outer input and output dimensions must match.");
+                }
+            }
+
+            if (!SameDim(valuesShape[^1], indicesShape[^1]))
+            {
+                throw new NotSupportedException("PyNTT TopK values and indices shapes must match.");
+            }
+
+            var k = checked((int)RequireFixedDim(valuesShape[^1], "PyNTT TopK K"));
+            var axisExtent = checked((int)RequireFixedDim(inputShape[^1], "PyNTT TopK axis extent"));
+            if (k <= 0 || k > axisExtent)
+            {
+                throw new NotSupportedException($"PyNTT TopK requires 0 < K <= axis extent, got K={k}, extent={axisExtent}.");
+            }
+
+            var axisBlockSize = 1;
+            while (axisBlockSize < axisExtent)
+            {
+                axisBlockSize = checked(axisBlockSize * 2);
+            }
+
+            SetComputeOp("topk");
+            _attrs["op"] = "topk";
+            _attrs["shape"] = valuesShape;
+            _attrs["axis"] = axis;
+            _attrs["k"] = k;
+            var helperName = GetNextHelperName("topk_compute");
+            WriteHelperTemplate(
+                "triton/kernels/TopK.py.jinja",
+                new PyNTTTopKTemplateModel(
+                    helperName,
+                    GetBufferPointer(input),
+                    GetBufferPointer(values),
+                    GetBufferPointer(indices),
+                    GetTritonDType(input.ElemType),
+                    GetTritonDType(values.ElemType),
+                    GetTritonDType(indices.ElemType),
+                    inputShape,
+                    valuesShape,
+                    GetBufferStrides(input),
+                    GetBufferStrides(values),
+                    GetBufferStrides(indices),
+                    axis,
+                    k,
+                    axisBlockSize,
+                    topK.Largest != 0,
+                    topK.Sorted != 0,
+                    $"{input.Name} -> ({values.Name}, {indices.Name})"));
+            WriteHelperInvocation(helperName);
+        }
+
+        private void VisitSparseExpertsGateUp(
+            Nncase.TIR.NTT.SparseExpertsGateUp gateUp,
+            IReadOnlyList<BaseExpr> args)
+        {
+            if (args.Count != 9 ||
+                args[0] is not TIR.Buffer input ||
+                args[1] is not TIR.Buffer expertIds ||
+                args[2] is not TIR.Buffer gateInputScale ||
+                args[3] is not TIR.Buffer gateWeight ||
+                args[4] is not TIR.Buffer gateScale ||
+                args[5] is not TIR.Buffer upInputScale ||
+                args[6] is not TIR.Buffer upWeight ||
+                args[7] is not TIR.Buffer upScale ||
+                args[8] is not TIR.Buffer output)
+            {
+                throw new NotSupportedException(
+                    "PyNTT SparseExpertsGateUp codegen expects eight input buffers and one output buffer.");
+            }
+
+            foreach (var (buffer, name) in new[]
+                     {
+                         (expertIds, "expert ids"),
+                         (gateInputScale, "gate input scale"),
+                         (gateWeight, "gate weight"),
+                         (gateScale, "gate scale"),
+                         (upInputScale, "up input scale"),
+                         (upWeight, "up weight"),
+                         (upScale, "up scale"),
+                     })
+            {
+                EnsureScalarBuffer(buffer, $"PyNTT SparseExpertsGateUp {name}");
+            }
+
+            var inputLanes = GetVectorLanes(input.ElemType);
+            var outputLanes = GetVectorLanes(output.ElemType);
+            var inputLaneCount = GetVectorLaneProduct(inputLanes);
+            var outputLaneCount = GetVectorLaneProduct(outputLanes);
+            var inputShape = GetBufferActiveShape(input);
+            var idsShape = GetBufferActiveShape(expertIds);
+            var gateShape = GetBufferActiveShape(gateWeight);
+            var upShape = GetBufferActiveShape(upWeight);
+            var outputShape = GetBufferActiveShape(output);
+            ValidateRank("PyNTT SparseExpertsGateUp input", inputShape, 2);
+            ValidateRank("PyNTT SparseExpertsGateUp expert ids", idsShape, 2);
+            ValidateRank("PyNTT SparseExpertsGateUp gate weight", gateShape, 3);
+            ValidateRank("PyNTT SparseExpertsGateUp up weight", upShape, 3);
+            ValidateRank("PyNTT SparseExpertsGateUp output", outputShape, 3);
+            if (!SameDim(inputShape[0], idsShape[0]) ||
+                !SameDim(inputShape[0], outputShape[0]) ||
+                !SameDim(idsShape[1], outputShape[1]) ||
+                !SameDim(gateShape[1], upShape[1]))
+            {
+                throw new NotSupportedException(
+                    "PyNTT SparseExpertsGateUp requires matching local token, top-k, and intermediate shards, got " +
+                    $"input=[{ShapeText(inputShape)}], ids=[{ShapeText(idsShape)}], gate=[{ShapeText(gateShape)}], " +
+                    $"up=[{ShapeText(upShape)}], output=[{ShapeText(outputShape)}].");
+            }
+
+            var packedHiddenSize = RequireFixedDim(
+                inputShape[1],
+                "PyNTT SparseExpertsGateUp packed input hidden");
+            if (checked(packedHiddenSize * inputLaneCount) != gateUp.HiddenSize)
+            {
+                throw new NotSupportedException(
+                    $"PyNTT SparseExpertsGateUp logical input hidden must be {gateUp.HiddenSize}, got " +
+                    $"{packedHiddenSize} * {inputLaneCount}.");
+            }
+
+            var localIntermediateSize = checked(
+                RequireFixedDim(outputShape[2], "PyNTT SparseExpertsGateUp packed local intermediate") *
+                outputLaneCount);
+            ValidateFixedDimension(gateShape[1], localIntermediateSize, "PyNTT SparseExpertsGateUp gate intermediate");
+            ValidateFixedDimension(upShape[1], localIntermediateSize, "PyNTT SparseExpertsGateUp up intermediate");
+            ValidateFixedDimension(idsShape[1], gateUp.NumTopK, "PyNTT SparseExpertsGateUp expert ids top-k");
+            ValidateFixedDimension(outputShape[1], gateUp.NumTopK, "PyNTT SparseExpertsGateUp output top-k");
+            ValidateFixedDimension(gateShape[0], gateUp.NumExpert, "PyNTT SparseExpertsGateUp gate expert");
+            ValidateFixedDimension(gateShape[2], gateUp.HiddenSize, "PyNTT SparseExpertsGateUp gate hidden");
+            ValidateFixedDimension(upShape[0], gateUp.NumExpert, "PyNTT SparseExpertsGateUp up expert");
+            ValidateFixedDimension(upShape[2], gateUp.HiddenSize, "PyNTT SparseExpertsGateUp up hidden");
+            foreach (var (scale, name) in new[]
+                     {
+                         (gateInputScale, "gate input scale"),
+                         (gateScale, "gate scale"),
+                         (upInputScale, "up input scale"),
+                         (upScale, "up scale"),
+                     })
+            {
+                ValidateFixedShape(
+                    GetBufferActiveShape(scale),
+                    new long[] { gateUp.NumExpert, 1 },
+                    $"PyNTT SparseExpertsGateUp {name}");
+            }
+
+            if (expertIds.ElemType != DataTypes.Int64)
+            {
+                throw new NotSupportedException(
+                    $"PyNTT SparseExpertsGateUp expert ids must be int64, got {expertIds.ElemType}.");
+            }
+
+            SetComputeOp("sparse_experts_gate_up");
+            _attrs["op"] = "sparse_experts_gate_up";
+            _attrs["dtype"] = GetPyNTTDTypeName(GetScalarDataType(output.ElemType));
+            _attrs["shape"] = outputShape;
+            var helperName = GetNextHelperName("sparse_experts_gate_up_compute");
+            WriteHelperTemplate(
+                "triton/kernels/SparseExpertsGateUp.py.jinja",
+                new PyNTTSparseExpertsGateUpTemplateModel(
+                    helperName,
+                    GetBufferScalarPointer(input),
+                    GetBufferPointer(expertIds),
+                    GetBufferPointer(gateInputScale),
+                    GetBufferPointer(gateWeight),
+                    GetBufferPointer(gateScale),
+                    GetBufferPointer(upInputScale),
+                    GetBufferPointer(upWeight),
+                    GetBufferPointer(upScale),
+                    GetBufferScalarPointer(output),
+                    GetTritonDType(input.ElemType),
+                    GetTritonDType(output.ElemType),
+                    inputShape,
+                    gateShape,
+                    outputShape,
+                    GetBufferStrides(input),
+                    GetBufferStrides(expertIds),
+                    GetBufferStrides(gateInputScale),
+                    GetBufferStrides(gateWeight),
+                    GetBufferStrides(gateScale),
+                    GetBufferStrides(upInputScale),
+                    GetBufferStrides(upWeight),
+                    GetBufferStrides(upScale),
+                    GetBufferStrides(output),
+                    checked((int)gateUp.HiddenSize),
+                    checked((int)gateUp.MoEIntermediateSize),
+                    checked((int)gateUp.NumExpert),
+                    checked((int)gateUp.NumTopK),
+                    inputLaneCount,
+                    outputLaneCount,
+                    checked((int)localIntermediateSize),
+                    $"{input.Name} -> {output.Name}"));
+            WriteHelperInvocation(helperName);
+        }
+
+        private void VisitSparseExpertsDown(
+            Nncase.TIR.NTT.SparseExpertsDown down,
+            IReadOnlyList<BaseExpr> args,
+            PyNTTMicroKernelTemplateModel microKernel)
+        {
+            if (args.Count != 7 ||
+                args[0] is not TIR.Buffer activations ||
+                args[1] is not TIR.Buffer expertIds ||
+                args[2] is not TIR.Buffer expertWeights ||
+                args[3] is not TIR.Buffer downInputScale ||
+                args[4] is not TIR.Buffer downWeight ||
+                args[5] is not TIR.Buffer downScale ||
+                args[6] is not TIR.Buffer output)
+            {
+                throw new NotSupportedException(
+                    "PyNTT SparseExpertsDown codegen expects six input buffers and one output buffer.");
+            }
+
+            foreach (var (buffer, name) in new[]
+                     {
+                         (expertIds, "expert ids"),
+                         (expertWeights, "expert weights"),
+                         (downInputScale, "down input scale"),
+                         (downWeight, "down weight"),
+                         (downScale, "down scale"),
+                     })
+            {
+                EnsureScalarBuffer(buffer, $"PyNTT SparseExpertsDown {name}");
+            }
+
+            var activationLanes = GetVectorLanes(activations.ElemType);
+            var outputLanes = GetVectorLanes(output.ElemType);
+            var activationLaneCount = GetVectorLaneProduct(activationLanes);
+            var outputLaneCount = GetVectorLaneProduct(outputLanes);
+            var activationShape = GetBufferActiveShape(activations);
+            var idsShape = GetBufferActiveShape(expertIds);
+            var weightsShape = GetBufferActiveShape(expertWeights);
+            var downShape = GetBufferActiveShape(downWeight);
+            var outputShape = GetBufferActiveShape(output);
+            ValidateRank("PyNTT SparseExpertsDown activations", activationShape, 3);
+            ValidateRank("PyNTT SparseExpertsDown expert ids", idsShape, 2);
+            ValidateRank("PyNTT SparseExpertsDown expert weights", weightsShape, 2);
+            ValidateRank("PyNTT SparseExpertsDown down weight", downShape, 3);
+            ValidateRank("PyNTT SparseExpertsDown output", outputShape, 2);
+            if (!SameDim(activationShape[0], idsShape[0]) ||
+                !SameDim(activationShape[0], weightsShape[0]) ||
+                !SameDim(activationShape[0], outputShape[0]) ||
+                !SameDim(activationShape[1], idsShape[1]) ||
+                !SameDim(activationShape[1], weightsShape[1]))
+            {
+                throw new NotSupportedException(
+                    "PyNTT SparseExpertsDown requires matching local token and top-k shards, got " +
+                    $"activations=[{ShapeText(activationShape)}], ids=[{ShapeText(idsShape)}], " +
+                    $"router=[{ShapeText(weightsShape)}], output=[{ShapeText(outputShape)}].");
+            }
+
+            var localIntermediateSize = checked(
+                RequireFixedDim(activationShape[2], "PyNTT SparseExpertsDown packed local intermediate") *
+                activationLaneCount);
+            var localOutputSize = checked(
+                RequireFixedDim(outputShape[1], "PyNTT SparseExpertsDown packed local output") *
+                outputLaneCount);
+            ValidateFixedDimension(downShape[1], localOutputSize, "PyNTT SparseExpertsDown down output hidden");
+            ValidateFixedDimension(downShape[2], localIntermediateSize, "PyNTT SparseExpertsDown down intermediate");
+            ValidateFixedDimension(idsShape[1], down.NumTopK, "PyNTT SparseExpertsDown expert ids top-k");
+            ValidateFixedDimension(weightsShape[1], down.NumTopK, "PyNTT SparseExpertsDown expert weights top-k");
+            ValidateFixedDimension(downShape[0], down.NumExpert, "PyNTT SparseExpertsDown down expert");
+            foreach (var (scale, name) in new[]
+                     {
+                         (downInputScale, "down input scale"),
+                         (downScale, "down scale"),
+                     })
+            {
+                ValidateFixedShape(
+                    GetBufferActiveShape(scale),
+                    new long[] { down.NumExpert, 1 },
+                    $"PyNTT SparseExpertsDown {name}");
+            }
+
+            if (expertIds.ElemType != DataTypes.Int64)
+            {
+                throw new NotSupportedException(
+                    $"PyNTT SparseExpertsDown expert ids must be int64, got {expertIds.ElemType}.");
+            }
+
+            SetComputeOp("sparse_experts_down");
+            _attrs["op"] = "sparse_experts_down";
+            _attrs["dtype"] = GetPyNTTDTypeName(GetScalarDataType(output.ElemType));
+            _attrs["shape"] = outputShape;
+            var helperName = GetNextHelperName("sparse_experts_down_compute");
+            WriteSelectedMicroKernelHelper(
+                microKernel,
+                new PyNTTSparseExpertsDownTemplateModel(
+                    helperName,
+                    GetBufferScalarPointer(activations),
+                    GetBufferPointer(expertIds),
+                    GetBufferPointer(expertWeights),
+                    GetBufferPointer(downInputScale),
+                    GetBufferPointer(downWeight),
+                    GetBufferPointer(downScale),
+                    GetBufferScalarPointer(output),
+                    GetTritonDType(activations.ElemType),
+                    GetTritonDType(output.ElemType),
+                    activationShape,
+                    downShape,
+                    outputShape,
+                    GetBufferStrides(activations),
+                    GetBufferStrides(expertIds),
+                    GetBufferStrides(expertWeights),
+                    GetBufferStrides(downInputScale),
+                    GetBufferStrides(downWeight),
+                    GetBufferStrides(downScale),
+                    GetBufferStrides(output),
+                    checked((int)down.HiddenSize),
+                    checked((int)down.MoEIntermediateSize),
+                    checked((int)down.NumExpert),
+                    checked((int)down.NumTopK),
+                    activationLaneCount,
+                    outputLaneCount,
+                    checked((int)localIntermediateSize),
+                    checked((int)localOutputSize),
+                    microKernel,
+                    $"{activations.Name} -> {output.Name}"),
+                helperName);
+        }
+
+        private void VisitGatedDeltaNetProjection(
+            Nncase.TIR.NTT.GatedDeltaNetProjection projection,
+            IReadOnlyList<BaseExpr> args,
+            PyNTTMicroKernelTemplateModel microKernel)
+        {
+            if (args.Count != 6 ||
+                args[0] is not TIR.Buffer input ||
+                args[2] is not TIR.Buffer qkvWeight ||
+                args[3] is not TIR.Buffer convWeight ||
+                args[4] is not TIR.Buffer qkvOutput)
+            {
+                throw new NotSupportedException(
+                    "PyNTT GatedDeltaNetProjection expects input, state, QKV weight, " +
+                    "convolution weight, QKV output, and layer id operands.");
+            }
+
+            var stateConfig = GetGatedDeltaNetStateConfig(args[1], "PyNTT GatedDeltaNetProjection");
+            var stateLayout = AnalyzeGatedDeltaNetStateLayout(
+                stateConfig,
+                GatedDeltaNetStateKind.Convolution);
+            foreach (var (buffer, name) in new[]
+                     {
+                         (input, "input"),
+                         (qkvWeight, "QKV weight"),
+                         (convWeight, "convolution weight"),
+                     })
+            {
+                EnsureScalarBuffer(buffer, $"PyNTT GatedDeltaNetProjection {name}");
+            }
+
+            var qkvOutputLanes = GetVectorLanes(qkvOutput.ElemType);
+            var expectedQkvOutputLanes = GetGatedDeltaNetStateAxisLanes(
+                stateConfig,
+                GatedDeltaNetStateKind.Convolution,
+                GatedDeltaNetStateDimKind.ConvChannels);
+            if (!qkvOutputLanes.SequenceEqual(expectedQkvOutputLanes))
+            {
+                throw new NotSupportedException(
+                    $"PyNTT GatedDeltaNetProjection QKV output lanes " +
+                    $"[{string.Join(',', qkvOutputLanes)}] must match the convolution-state channel lanes " +
+                    $"[{string.Join(',', expectedQkvOutputLanes)}].");
+            }
+
+            var qkvOutputLaneCount = GetVectorLaneProduct(qkvOutputLanes);
+
+            var hiddenSize = RequireFixedDim(
+                GetBufferActiveShape(input)[1],
+                "PyNTT GatedDeltaNetProjection hidden size");
+            ValidateFixedShape(
+                GetBufferActiveShape(input),
+                new long[] { 1, hiddenSize },
+                "PyNTT GatedDeltaNetProjection input");
+            var localPackedConvDim = RequireFixedDim(
+                GetBufferActiveShape(qkvOutput)[1],
+                "PyNTT GatedDeltaNetProjection local packed convolution-channel count");
+            var localConvDim = checked(localPackedConvDim * qkvOutputLaneCount);
+            ValidateFixedShape(GetBufferActiveShape(qkvWeight), new long[] { hiddenSize, localConvDim }, "PyNTT GatedDeltaNetProjection QKV weight");
+            ValidateFixedShape(GetBufferActiveShape(convWeight), new long[] { localConvDim, projection.ConvKernelSize }, "PyNTT GatedDeltaNetProjection convolution weight");
+            ValidateFixedShape(GetBufferActiveShape(qkvOutput), new long[] { 1, localPackedConvDim }, "PyNTT GatedDeltaNetProjection QKV output");
+            if (stateConfig.HiddenSize != hiddenSize ||
+                stateConfig.ConvKernelSize != projection.ConvKernelSize)
+            {
+                throw new NotSupportedException(
+                    $"PyNTT GatedDeltaNetProjection state config does not match the selected kernel: " +
+                    $"hidden={stateConfig.HiddenSize}/{hiddenSize}, " +
+                    $"conv_kernel={stateConfig.ConvKernelSize}/{projection.ConvKernelSize}.");
+            }
+
+            if (new[] { qkvWeight, convWeight }
+                    .Any(buffer => buffer.ElemType != input.ElemType) ||
+                GetScalarDataType(qkvOutput.ElemType) != input.ElemType)
+            {
+                throw new NotSupportedException(
+                    "PyNTT GatedDeltaNetProjection buffers must use the input element type.");
+            }
+
+            SetComputeOp("gated_delta_net_projection");
+            _attrs["op"] = "gated_delta_net_projection";
+            _attrs["dtype"] = GetPyNTTDTypeName(qkvOutput.ElemType);
+            _attrs["shape"] = GetBufferActiveShape(qkvOutput);
+            var helperName = GetNextHelperName("gated_delta_net_projection");
+            var qkvWeightDescriptor = RegisterHostTensorDescriptor(
+                qkvWeight,
+                $"{helperName}__qkv_weight_descriptor");
+            var templateModel = new PyNTTGatedDeltaNetProjectionTemplateModel(
+                    helperName,
+                    GetBufferScalarPointer(input),
+                    new PyNTTBufferPointerTemplateModel(
+                        GetGatedDeltaNetStateFieldArgument(
+                            args[1],
+                            GatedDeltaNetStateKind.Convolution,
+                            stateConfig)),
+                    GetBufferScalarPointer(qkvWeight),
+                    GetBufferScalarPointer(convWeight),
+                    GetBufferScalarPointer(qkvOutput),
+                    GetTritonDType(input.ElemType),
+                    GetBufferStrides(input),
+                    GetBufferStrides(qkvWeight),
+                    GetBufferStrides(convWeight),
+                    GetBufferStrides(qkvOutput),
+                    stateLayout.GetAxis(GatedDeltaNetStateDimKind.NumLayers),
+                    stateLayout.GetAxis(GatedDeltaNetStateDimKind.ConvChannels),
+                    stateLayout.GetAxis(GatedDeltaNetStateDimKind.ConvHistory),
+                    GetDimensionExpression(
+                        args[5],
+                        "PyNTT GatedDeltaNetProjection layer id").TritonExpression,
+                    checked((int)hiddenSize),
+                    checked((int)projection.ConvKernelSize),
+                    checked((int)localConvDim),
+                    qkvOutputLaneCount,
+                    microKernel,
+                    $"({input.Name}, gated_delta_net_state) -> {qkvOutput.Name}")
+            {
+                QKVWeightGlobalOffsets = GetBufferGlobalOffsets(qkvWeight),
+                QKVWeightDescriptorName = qkvWeightDescriptor.Name,
+                QKVWeightDescriptorOriginElements = qkvWeightDescriptor.OriginElements,
+            };
+            WriteSelectedMicroKernelHelper(microKernel, templateModel, helperName);
+            MarkStoredOutput(qkvOutput, "PyNTT GatedDeltaNetProjection");
+        }
+
+        private void VisitGatedDeltaNetRecurrentCore(
+            Nncase.TIR.NTT.GatedDeltaNetRecurrentCore recurrentCore,
+            IReadOnlyList<BaseExpr> args,
+            PyNTTMicroKernelTemplateModel microKernel)
+        {
+            if (args.Count != 11 ||
+                args[0] is not TIR.Buffer input ||
+                args[2] is not TIR.Buffer qkv ||
+                args[3] is not TIR.Buffer zWeight ||
+                args[4] is not TIR.Buffer bWeight ||
+                args[5] is not TIR.Buffer aWeight ||
+                args[6] is not TIR.Buffer aLog ||
+                args[7] is not TIR.Buffer dtBias ||
+                args[8] is not TIR.Buffer normWeight ||
+                args[9] is not TIR.Buffer gatedOutput)
+            {
+                throw new NotSupportedException(
+                    "PyNTT GatedDeltaNetRecurrentCore expects input, state, QKV, Z/B/A, " +
+                    "A_log, dt-bias, norm-weight, gated-output, and layer-id operands.");
+            }
+
+            var stateConfig = GetGatedDeltaNetStateConfig(args[1], "PyNTT GatedDeltaNetRecurrentCore");
+            var stateLayout = AnalyzeGatedDeltaNetStateLayout(
+                stateConfig,
+                GatedDeltaNetStateKind.Recurrent);
+            foreach (var (buffer, name) in new[]
+                     {
+                         (input, "input"),
+                         (zWeight, "Z weight"),
+                         (bWeight, "B weight"),
+                         (aWeight, "A weight"),
+                         (aLog, "A_log"),
+                         (dtBias, "dt bias"),
+                         (normWeight, "norm weight"),
+                         (gatedOutput, "gated output"),
+                     })
+            {
+                EnsureScalarBuffer(buffer, $"PyNTT GatedDeltaNetRecurrentCore {name}");
+            }
+
+            var qkvLanes = GetVectorLanes(qkv.ElemType);
+            var expectedQkvLanes = GetGatedDeltaNetStateAxisLanes(
+                stateConfig,
+                GatedDeltaNetStateKind.Convolution,
+                GatedDeltaNetStateDimKind.ConvChannels);
+            if (!qkvLanes.SequenceEqual(expectedQkvLanes))
+            {
+                throw new NotSupportedException(
+                    $"PyNTT GatedDeltaNetRecurrentCore QKV lanes [{string.Join(',', qkvLanes)}] " +
+                    $"must match the convolution-state channel lanes [{string.Join(',', expectedQkvLanes)}].");
+            }
+
+            var qkvLaneCount = GetVectorLaneProduct(qkvLanes);
+
+            var hiddenSize = RequireFixedDim(
+                GetBufferActiveShape(input)[1],
+                "PyNTT GatedDeltaNetRecurrentCore hidden size");
+            var keyDim = checked(recurrentCore.NumKeyHeads * recurrentCore.KeyHeadDim);
+            var valueDim = checked(recurrentCore.NumValueHeads * recurrentCore.ValueHeadDim);
+            var convDim = checked((keyDim * 2) + valueDim);
+            var localNumValueHeads = RequireFixedDim(
+                GetBufferActiveShape(bWeight)[1],
+                "PyNTT GatedDeltaNetRecurrentCore local value-head count");
+            var localValueDim = checked(localNumValueHeads * recurrentCore.ValueHeadDim);
+            ValidateFixedShape(GetBufferActiveShape(input), new long[] { 1, hiddenSize }, "PyNTT GatedDeltaNetRecurrentCore input");
+            ValidateFixedShape(GetBufferActiveShape(qkv), new long[] { 1, convDim / qkvLaneCount }, "PyNTT GatedDeltaNetRecurrentCore QKV");
+            ValidateFixedShape(GetBufferActiveShape(zWeight), new long[] { hiddenSize, localValueDim }, "PyNTT GatedDeltaNetRecurrentCore Z weight");
+            ValidateFixedShape(GetBufferActiveShape(bWeight), new long[] { hiddenSize, localNumValueHeads }, "PyNTT GatedDeltaNetRecurrentCore B weight");
+            ValidateFixedShape(GetBufferActiveShape(aWeight), new long[] { hiddenSize, localNumValueHeads }, "PyNTT GatedDeltaNetRecurrentCore A weight");
+            ValidateFixedShape(GetBufferActiveShape(aLog), new long[] { localNumValueHeads }, "PyNTT GatedDeltaNetRecurrentCore A_log");
+            ValidateFixedShape(GetBufferActiveShape(dtBias), new long[] { localNumValueHeads }, "PyNTT GatedDeltaNetRecurrentCore dt bias");
+            ValidateFixedShape(GetBufferActiveShape(normWeight), new long[] { recurrentCore.ValueHeadDim }, "PyNTT GatedDeltaNetRecurrentCore norm weight");
+            ValidateFixedShape(GetBufferActiveShape(gatedOutput), new long[] { 1, localValueDim }, "PyNTT GatedDeltaNetRecurrentCore gated output");
+            if (stateConfig.HiddenSize != hiddenSize ||
+                stateConfig.NumKeyHeads != recurrentCore.NumKeyHeads ||
+                stateConfig.NumValueHeads != recurrentCore.NumValueHeads ||
+                stateConfig.KeyHeadDim != recurrentCore.KeyHeadDim ||
+                stateConfig.ValueHeadDim != recurrentCore.ValueHeadDim)
+            {
+                throw new NotSupportedException(
+                    "PyNTT GatedDeltaNetRecurrentCore state config does not match the selected kernel.");
+            }
+
+            SetComputeOp("gated_delta_net_recurrent_core");
+            _attrs["op"] = "gated_delta_net_recurrent_core";
+            _attrs["dtype"] = GetPyNTTDTypeName(gatedOutput.ElemType);
+            _attrs["shape"] = GetBufferActiveShape(gatedOutput);
+            var helperName = GetNextHelperName("gated_delta_net_recurrent_core");
+            var zWeightDescriptor = RegisterHostTensorDescriptor(
+                zWeight,
+                $"{helperName}__z_weight_descriptor");
+            var templateModel = new PyNTTGatedDeltaNetRecurrentCoreTemplateModel(
+                    helperName,
+                    GetBufferScalarPointer(input),
+                    new PyNTTBufferPointerTemplateModel(
+                        GetGatedDeltaNetStateFieldArgument(
+                            args[1],
+                            GatedDeltaNetStateKind.Recurrent,
+                            stateConfig)),
+                    GetBufferScalarPointer(qkv),
+                    GetBufferScalarPointer(zWeight),
+                    GetBufferScalarPointer(bWeight),
+                    GetBufferScalarPointer(aWeight),
+                    GetBufferScalarPointer(aLog),
+                    GetBufferScalarPointer(dtBias),
+                    GetBufferScalarPointer(normWeight),
+                    GetBufferScalarPointer(gatedOutput),
+                    GetTritonDType(input.ElemType),
+                    GetTritonDType(gatedOutput.ElemType),
+                    GetBufferStrides(input),
+                    GetBufferStrides(qkv),
+                    GetBufferStrides(zWeight),
+                    GetBufferStrides(bWeight),
+                    GetBufferStrides(aWeight),
+                    GetBufferStrides(aLog),
+                    GetBufferStrides(dtBias),
+                    GetBufferStrides(normWeight),
+                    GetBufferStrides(gatedOutput),
+                    stateLayout.GetAxis(GatedDeltaNetStateDimKind.NumLayers),
+                    stateLayout.GetAxis(GatedDeltaNetStateDimKind.NumValueHeads),
+                    stateLayout.GetAxis(GatedDeltaNetStateDimKind.KeyHeadDim),
+                    stateLayout.GetAxis(GatedDeltaNetStateDimKind.ValueHeadDim),
+                    GetDimensionExpression(
+                        args[10],
+                        "PyNTT GatedDeltaNetRecurrentCore layer id").TritonExpression,
+                    checked((int)hiddenSize),
+                    checked((int)recurrentCore.NumKeyHeads),
+                    checked((int)recurrentCore.NumValueHeads),
+                    checked((int)recurrentCore.KeyHeadDim),
+                    checked((int)recurrentCore.ValueHeadDim),
+                    checked((int)convDim),
+                    checked((int)valueDim),
+                    checked((int)localNumValueHeads),
+                    qkvLaneCount,
+                    RoundUpToPowerOfTwo(checked(localNumValueHeads * ((recurrentCore.KeyHeadDim * 2) + recurrentCore.ValueHeadDim))),
+                    RoundUpToPowerOfTwo(checked(localNumValueHeads * recurrentCore.KeyHeadDim)),
+                    RoundUpToPowerOfTwo(localValueDim),
+                    RoundUpToPowerOfTwo(recurrentCore.KeyHeadDim),
+                    RoundUpToPowerOfTwo(recurrentCore.ValueHeadDim),
+                    recurrentCore.Epsilon,
+                    microKernel,
+                    $"({input.Name}, {qkv.Name}, gated_delta_net_state) -> {gatedOutput.Name}")
+            {
+                ZWeightGlobalOffsets = GetBufferGlobalOffsets(zWeight),
+                ZWeightDescriptorName = zWeightDescriptor.Name,
+                ZWeightDescriptorOriginElements = zWeightDescriptor.OriginElements,
+            };
+            WriteSelectedMicroKernelHelper(microKernel, templateModel, helperName);
+            MarkStoredOutput(gatedOutput, "PyNTT GatedDeltaNetRecurrentCore");
+        }
+
+        private string GetGatedDeltaNetStateFieldArgument(
+            BaseExpr expr,
+            GatedDeltaNetStateKind kind,
+            GatedDeltaNetStateConfig config)
+        {
+            var field = kind switch
+            {
+                GatedDeltaNetStateKind.Convolution => "convolution_state",
+                GatedDeltaNetStateKind.Recurrent => "recurrent_state",
+                _ => throw new ArgumentOutOfRangeException(nameof(kind)),
+            };
+            var scalarType = kind == GatedDeltaNetStateKind.Convolution
+                ? config.ActivationPrimType
+                : DataTypes.Float32;
+            var shape = config.GetStorageShape(kind)
+                .Select(value => checked((int)value))
+                .ToArray();
+            return GetObjectFieldArgument(
+                expr,
+                new PyNTTObjectFieldBindingMetadata(
+                    "gated_delta_net_state",
+                    field,
+                    "tensor",
+                    null,
+                    GetPyNTTScalarDTypeName(scalarType),
+                    shape));
+        }
+
+        private static GatedDeltaNetStateConfig GetGatedDeltaNetStateConfig(
+            BaseExpr expr,
+            string context)
+        {
+            var tensorType = GetTensorType(expr.CheckedType, context);
+            if (tensorType.DType is ReferenceType
+                {
+                    ElemType: GatedDeltaNetStateType { Config: { } config },
+                })
+            {
+                return config;
+            }
+
+            throw new NotSupportedException(
+                $"{context} expects Reference<GatedDeltaNetStateType>, got {tensorType.DType}.");
+        }
+
+        private static GatedDeltaNetStateStorageLayout AnalyzeGatedDeltaNetStateLayout(
+            GatedDeltaNetStateConfig config,
+            GatedDeltaNetStateKind kind)
+        {
+            var shape = config.GetStorageShape(kind);
+            var strides = new long[shape.Length];
+            var stride = 1L;
+            for (var index = shape.Length - 1; index >= 0; index--)
+            {
+                strides[index] = stride;
+                stride = checked(stride * shape[index]);
+            }
+
+            var layout = config.GetLayout(kind);
+            var vectorizedAxes = config.GetVectorizedAxes(kind);
+            var lanes = config.GetLanes(kind);
+            var axes = new Dictionary<GatedDeltaNetStateDimKind, PyNTTGatedDeltaNetStateAxisTemplateModel>();
+            for (var layoutIndex = 0; layoutIndex < layout.Count; layoutIndex++)
+            {
+                var axis = layout[layoutIndex];
+                var vectorIndex = vectorizedAxes.IndexOf(axis);
+                axes.Add(
+                    axis,
+                    new PyNTTGatedDeltaNetStateAxisTemplateModel(
+                        config.GetDimension(axis),
+                        strides[layoutIndex],
+                        vectorIndex < 0 ? 1 : lanes[vectorIndex],
+                        vectorIndex < 0 ? 0 : strides[layout.Count + vectorIndex]));
+            }
+
+            return new GatedDeltaNetStateStorageLayout(axes);
+        }
+
+        private static int[] GetGatedDeltaNetStateAxisLanes(
+            GatedDeltaNetStateConfig config,
+            GatedDeltaNetStateKind kind,
+            GatedDeltaNetStateDimKind axis)
+        {
+            var vectorizedAxes = config.GetVectorizedAxes(kind);
+            var lanes = config.GetLanes(kind);
+            return vectorizedAxes
+                .Select((vectorizedAxis, index) => (vectorizedAxis, lane: lanes[index]))
+                .Where(item => item.vectorizedAxis == axis)
+                .Select(item => item.lane)
+                .ToArray();
+        }
+
+        private static int GetVectorLaneProduct(IReadOnlyList<int> lanes) =>
+            lanes.Aggregate(1, checked((product, lane) => product * lane));
+
+        private static int RoundUpToPowerOfTwo(long value)
+        {
+            if (value <= 0 || value > int.MaxValue)
+            {
+                throw new ArgumentOutOfRangeException(nameof(value), value, "Expected a positive int32 extent.");
+            }
+
+            return checked((int)System.Numerics.BitOperations.RoundUpToPowerOf2((uint)value));
+        }
+
+        private static void ValidateFixedDimension(
+            PyNTTDimExpression actual,
+            long expected,
+            string context)
+        {
+            if (actual.FixedValue != expected)
+            {
+                throw new NotSupportedException(
+                    $"{context} must be {expected}, got {actual.TritonExpression}.");
+            }
+        }
+
+        private static void ValidateFixedShape(
+            IReadOnlyList<PyNTTDimExpression> actual,
+            IReadOnlyList<long> expected,
+            string context)
+        {
+            if (actual.Count != expected.Count ||
+                actual.Where((dimension, index) => dimension.FixedValue != expected[index]).Any())
+            {
+                throw new NotSupportedException(
+                    $"{context} must have shape [{string.Join(",", expected)}], got [{ShapeText(actual)}].");
+            }
+        }
+
+        private static void EnsureScalarBuffer(TIR.Buffer buffer, string context)
+        {
+            var lanes = GetVectorLanes(buffer.ElemType);
+            if (lanes.Length != 0)
+            {
+                throw new NotSupportedException(
+                    $"{context} must use a scalar element type, got vector lanes [{string.Join(",", lanes)}].");
+            }
         }
 
         private void VisitSamplingPartial(
@@ -9317,8 +10115,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             {
                 MemoryLocation.Input => $"input{GetInputIndex(buffer).ToString(CultureInfo.InvariantCulture)}",
                 MemoryLocation.Output => $"output{GetOutputIndex(buffer).ToString(CultureInfo.InvariantCulture)}",
-                MemoryLocation.Data when buffer.DistributedType is null ||
-                    buffer.DistributedStorageKind == DistributedBufferStorageKind.CanonicalGlobal => GetDataBaseName(buffer),
+                MemoryLocation.Data => GetDataBaseName(buffer),
                 MemoryLocation.ChipLocalData when
                     buffer.DistributedStorageKind == DistributedBufferStorageKind.CanonicalGlobal =>
                     GetChipLocalDataBaseName(buffer),
@@ -9330,7 +10127,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     buffer.DistributedStorageKind == DistributedBufferStorageKind.CanonicalGlobal => "rdata",
                 MemoryLocation.ChipLocalRdata => "chip_local_rdata",
                 MemoryLocation.BlockLocalRdata => "block_local_rdata",
-                MemoryLocation.Data or MemoryLocation.Rdata =>
+                MemoryLocation.Rdata =>
                     throw new NotSupportedException(
                         $"PyNTT host tensor descriptor {name} cannot bind distributed {buffer.MemSpan.Buffer.Location} buffer {buffer.Name}: " +
                         "that location uses per-shard backing storage rather than one globally strided allocation."),
@@ -9382,13 +10179,28 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             }
 
             name = SanitizeBoundedPythonIdentifier(name);
-            var ownerStrideBytes = buffer.MemSpan.Buffer.Location == MemoryLocation.BlockLocalRdata
-                ? PyNTTRDataUtility.GetLocalRDataTableStrideBytes(
-                    _currentFunction.SchedResult.BlockLocalRdatas,
-                    _currentFunction.SchedResult.BlockLocalRDataMaterializations,
-                    _targetOptions,
-                    "b")
-                : 0;
+            var ownerStrideBytes = buffer.MemSpan.Buffer.Location switch
+            {
+                MemoryLocation.Data when buffer.DistributedType is not null &&
+                    buffer.DistributedStorageKind != DistributedBufferStorageKind.CanonicalGlobal =>
+                    checked((long)_currentFunction.SchedResult.DataUsage),
+                MemoryLocation.BlockLocalRdata =>
+                    PyNTTRDataUtility.GetLocalRDataTableStrideBytes(
+                        _currentFunction.SchedResult.BlockLocalRdatas,
+                        _currentFunction.SchedResult.BlockLocalRDataMaterializations,
+                        _targetOptions,
+                        "b"),
+                _ => 0,
+            };
+            if (buffer.MemSpan.Buffer.Location == MemoryLocation.Data &&
+                buffer.DistributedType is not null &&
+                buffer.DistributedStorageKind != DistributedBufferStorageKind.CanonicalGlobal &&
+                ownerStrideBytes <= 0)
+            {
+                throw new InvalidOperationException(
+                    $"PyNTT host tensor descriptor {name} requires a positive per-owner Data pool stride.");
+            }
+
             return new(
                 name,
                 source,
@@ -9419,6 +10231,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             HostTensorDescriptorBackingMetadata resource,
             HostTensorDescriptorBackingMetadata candidate)
             => resource.Source == candidate.Source &&
+               resource.OwnerStrideBytes == candidate.OwnerStrideBytes &&
                resource.ScalarDType == candidate.ScalarDType &&
                resource.LogicalShape.SequenceEqual(candidate.LogicalShape) &&
                resource.LogicalStrides.SequenceEqual(candidate.LogicalStrides) &&
@@ -11951,9 +12764,11 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             UnaryOp.Round => "round",
             UnaryOp.Rsqrt => "rsqrt",
             UnaryOp.Sin => "sin",
+            UnaryOp.Sigmoid => "sigmoid",
             UnaryOp.Sinh => "sinh",
             UnaryOp.Sqrt => "sqrt",
             UnaryOp.Square => "square",
+            UnaryOp.Softplus => "softplus",
             UnaryOp.Tanh => "tanh",
             UnaryOp.LogicalNot => "logical_not",
             UnaryOp.Sign => "sign",
@@ -11988,9 +12803,11 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             UnaryOp.Round => "libdevice.round(value0)",
             UnaryOp.Rsqrt => "tl.rsqrt(value0_f32)",
             UnaryOp.Sin => "tl.sin(value0_f32)",
+            UnaryOp.Sigmoid => "tl.sigmoid(value0_f32)",
             UnaryOp.Sinh => "(tl.exp(value0_f32) - tl.exp(-value0_f32)) * 0.5",
             UnaryOp.Sqrt => "tl.sqrt(value0_f32)",
             UnaryOp.Square => "value0 * value0",
+            UnaryOp.Softplus => "tl.maximum(value0_f32, 0.0) + tl.log(1.0 + tl.exp(-tl.abs(value0_f32)))",
             UnaryOp.Tanh => "(tl.exp(value0_f32 + value0_f32) - 1.0) / (tl.exp(value0_f32 + value0_f32) + 1.0)",
             UnaryOp.LogicalNot => "value0 == 0",
             UnaryOp.Sign => "tl.where(value0 > 0, 1.0, tl.where(value0 < 0, -1.0, 0.0))",
@@ -13330,6 +14147,15 @@ internal sealed record BufferViewSource(
     Nncase.TIR.Buffer Source,
     PyNTTDimExpression[] Offsets,
     PyNTTDimExpression[] Shape);
+
+internal sealed record GatedDeltaNetStateStorageLayout(
+    IReadOnlyDictionary<GatedDeltaNetStateDimKind, PyNTTGatedDeltaNetStateAxisTemplateModel> Axes)
+{
+    public PyNTTGatedDeltaNetStateAxisTemplateModel GetAxis(GatedDeltaNetStateDimKind axis)
+        => Axes.TryGetValue(axis, out var value)
+            ? value
+            : throw new InvalidOperationException($"GDN state layout does not define semantic axis {axis}.");
+}
 
 internal sealed record DeviceFunctionBuildResult(
     DeviceFunctionRenderSpec Function,

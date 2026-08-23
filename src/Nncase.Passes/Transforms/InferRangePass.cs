@@ -174,6 +174,8 @@ internal sealed class InferRangeVisitor : ExprVisitor<ValueRange<double>, Unit>
         {
             UnaryOp.Abs => VisitAbs(input),
             UnaryOp.Neg => new(-input.Max, -input.Min),
+            UnaryOp.Sigmoid => new(0.0, 1.0),
+            UnaryOp.Softplus => new(0.0, double.PositiveInfinity),
             _ => ValueRange<double>.Full,
         };
     }

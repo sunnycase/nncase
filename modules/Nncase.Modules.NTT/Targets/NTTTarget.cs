@@ -110,6 +110,7 @@ public abstract class NTTTarget : Target
         pass.Add<Passes.Rules.NTT.VectorizeReshapePropagation>();
         pass.Add<Passes.Rules.NTT.VectorizeResizeImagePropagation>();
         pass.Add<Passes.Rules.NTT.VectorizeRoPEPropagation>();
+        pass.Add<Passes.Rules.NTT.VectorizeSparseExpertsPropagation>();
 
         // pass.Add<Passes.Rules.NTT.VectorizeScatterND>(rank, lane);
         pass.Add<Passes.Rules.NTT.VectorizeSlicePropagation>();

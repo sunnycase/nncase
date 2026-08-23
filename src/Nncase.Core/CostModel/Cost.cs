@@ -306,10 +306,12 @@ public static class CostUtility
             UnaryOp.Round => 1,
             UnaryOp.Rsqrt => 4,
             UnaryOp.Sin => 20,
+            UnaryOp.Sigmoid => 8,
             UnaryOp.Sinh => 8,
             UnaryOp.Sign => 1,
             UnaryOp.Sqrt => 8,
             UnaryOp.Square => 2,
+            UnaryOp.Softplus => 12,
             UnaryOp.Tanh => 8,
             UnaryOp.BitwiseNot => 1,
             UnaryOp.LogicalNot => 1,
@@ -370,7 +372,7 @@ public static class CostUtility
         };
     }
 
-    public static Cost GetActivationCost(TensorType ret, uint macPerElement)
+    public static Cost GetActivationCost(IRType ret, uint macPerElement)
     {
         return new()
         {

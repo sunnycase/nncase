@@ -214,7 +214,9 @@ public sealed record TargetMemoryResourceSpec
         long readBytesPerCycle,
         long writeBytesPerCycle,
         long latencyCycles,
-        int allocationGranularityBytes = 1)
+        int allocationGranularityBytes = 1,
+        int preferredReadAccessBytes = 1,
+        int preferredWriteAccessBytes = 1)
     {
         if (string.IsNullOrWhiteSpace(id.Value))
         {
@@ -241,6 +243,16 @@ public sealed record TargetMemoryResourceSpec
             throw new ArgumentOutOfRangeException(nameof(allocationGranularityBytes), allocationGranularityBytes, "Allocation granularity must be a positive power of two.");
         }
 
+        if (preferredReadAccessBytes <= 0 || !System.Numerics.BitOperations.IsPow2((uint)preferredReadAccessBytes))
+        {
+            throw new ArgumentOutOfRangeException(nameof(preferredReadAccessBytes), preferredReadAccessBytes, "Preferred read access width must be a positive power of two.");
+        }
+
+        if (preferredWriteAccessBytes <= 0 || !System.Numerics.BitOperations.IsPow2((uint)preferredWriteAccessBytes))
+        {
+            throw new ArgumentOutOfRangeException(nameof(preferredWriteAccessBytes), preferredWriteAccessBytes, "Preferred write access width must be a positive power of two.");
+        }
+
         Id = id;
         Kind = kind;
         CapacityBytes = capacityBytes;
@@ -248,6 +260,8 @@ public sealed record TargetMemoryResourceSpec
         WriteBytesPerCycle = writeBytesPerCycle;
         LatencyCycles = latencyCycles;
         AllocationGranularityBytes = allocationGranularityBytes;
+        PreferredReadAccessBytes = preferredReadAccessBytes;
+        PreferredWriteAccessBytes = preferredWriteAccessBytes;
     }
 
     public TargetMemoryResourceId Id { get; }
@@ -263,6 +277,18 @@ public sealed record TargetMemoryResourceSpec
     public long LatencyCycles { get; }
 
     public int AllocationGranularityBytes { get; }
+
+    /// <summary>
+    /// Gets the contiguous read width at which the advertised read bandwidth is attainable.
+    /// Segmented accesses narrower than this width consume proportionally more bandwidth time.
+    /// </summary>
+    public int PreferredReadAccessBytes { get; }
+
+    /// <summary>
+    /// Gets the contiguous write width at which the advertised write bandwidth is attainable.
+    /// Segmented accesses narrower than this width consume proportionally more bandwidth time.
+    /// </summary>
+    public int PreferredWriteAccessBytes { get; }
 }
 
 /// <summary>

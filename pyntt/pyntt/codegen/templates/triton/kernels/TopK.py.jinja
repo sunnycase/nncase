@@ -1,0 +1,52 @@
+{% import "triton/kernels/_common.py.jinja" as common with context %}
+{% import "triton/kernels/_producer_consumer.py.jinja" as phases with context %}
+# generated from PyNTT Jinja TopK.py.jinja
+# {{ model["Comment"] }}; axis={{ model["Axis"] }}, k={{ model["K"] }}
+{{ phases.consumer_header(model) }}
+{{ common.mesh_coordinates(model["MeshAxes"]) }}
+    input0 = {{ ptr(model, "Input") }}
+    values_output = {{ ptr(model, "Values") }}
+    indices_output = {{ ptr(model, "Indices") }}
+{% for axis in range(model["Axis"]) %}
+{{ "    " * loop.index }}for outer_idx{{ axis }} in tl.range(0, {{ dim(model["InputShape"][axis]) }}):
+{% endfor %}
+{% set indent = "    " * (model["Axis"] + 1) %}
+{% set input_base = namespace(value="0") %}
+{% set values_base = namespace(value="0") %}
+{% set indices_base = namespace(value="0") %}
+{% for axis in range(model["Axis"]) %}
+{% set input_base.value = input_base.value ~ " + outer_idx" ~ axis ~ " * " ~ dim(model["InputStrides"][axis]) %}
+{% set values_base.value = values_base.value ~ " + outer_idx" ~ axis ~ " * " ~ dim(model["ValuesStrides"][axis]) %}
+{% set indices_base.value = indices_base.value ~ " + outer_idx" ~ axis ~ " * " ~ dim(model["IndicesStrides"][axis]) %}
+{% endfor %}
+{{ indent }}lane = tl.arange(0, {{ model["AxisBlockSize"] }})
+{{ indent }}lane_mask = lane < {{ dim(model["InputShape"][model["Axis"]]) }}
+{{ indent }}remaining = tl.load(
+{{ indent }}    input0 + {{ input_base.value }} + lane * {{ dim(model["InputStrides"][model["Axis"]]) }},
+{{ indent }}    mask=lane_mask,
+{{ indent }}    other={{ "-float(\"inf\")" if model["Largest"] else "float(\"inf\")" }},
+{{ indent }}).to(tl.float32)
+{{ indent }}for result_index in tl.static_range(0, {{ model["K"] }}):
+{% if model["Largest"] %}
+{{ indent }}    selected_value = tl.max(remaining, axis=0)
+{{ indent }}    selected_index = tl.argmax(remaining, axis=0)
+{% else %}
+{{ indent }}    selected_value = tl.min(remaining, axis=0)
+{{ indent }}    selected_index = tl.argmin(remaining, axis=0)
+{% endif %}
+{{ indent }}    tl.store(
+{{ indent }}        values_output + {{ values_base.value }} + result_index * {{ dim(model["ValuesStrides"][model["Axis"]]) }},
+{{ indent }}        selected_value.to({{ model["ValuesTritonDType"] }}),
+{{ indent }}    )
+{{ indent }}    tl.store(
+{{ indent }}        indices_output + {{ indices_base.value }} + result_index * {{ dim(model["IndicesStrides"][model["Axis"]]) }},
+{{ indent }}        selected_index.to({{ model["IndicesTritonDType"] }}),
+{{ indent }}    )
+{{ indent }}    remaining = tl.where(
+{{ indent }}        lane == selected_index,
+{{ indent }}        {{ "-float(\"inf\")" if model["Largest"] else "float(\"inf\")" }},
+{{ indent }}        remaining,
+{{ indent }}    )
+
+
+{{ phases.dispatch(model) }}

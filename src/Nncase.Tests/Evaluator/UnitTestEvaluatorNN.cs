@@ -190,6 +190,69 @@ public sealed class PagedAttentionSchedulerTestData : TheoryData<PagedAttentionC
 public class UnitTestEvaluatorNN : TestClassBase
 {
     [Fact]
+    public void TestGatedDeltaNetQwen35BProductionShapeContract()
+    {
+        const int hidden = 2048;
+        const int numKeyHeads = 16;
+        const int numValueHeads = 32;
+        const int keyHeadDim = 128;
+        const int valueHeadDim = 128;
+        const int convKernelSize = 4;
+        const int convDim = 8192;
+        const int valueDim = 4096;
+        var bf16 = DataTypes.BFloat16;
+        Var Buffer(string name, DataType dtype, params long[] shape) =>
+            new(name, new TensorType(dtype, new RankedShape(shape)));
+        var stateConfig = new GatedDeltaNetStateConfig(
+            1,
+            numKeyHeads,
+            numValueHeads,
+            keyHeadDim,
+            valueHeadDim,
+            convKernelSize,
+            hidden,
+            bf16,
+            [8],
+            [GatedDeltaNetStateDimKind.NumLayers, GatedDeltaNetStateDimKind.ConvChannels, GatedDeltaNetStateDimKind.ConvHistory],
+            [GatedDeltaNetStateDimKind.ConvChannels],
+            [8],
+            [GatedDeltaNetStateDimKind.NumLayers, GatedDeltaNetStateDimKind.NumValueHeads, GatedDeltaNetStateDimKind.KeyHeadDim, GatedDeltaNetStateDimKind.ValueHeadDim],
+            [GatedDeltaNetStateDimKind.ValueHeadDim],
+            [4]);
+        var state = Buffer(
+            "state",
+            new ReferenceType(new GatedDeltaNetStateType { Config = stateConfig }));
+        var expression = NN.GatedDeltaNet(
+            Buffer("input", bf16, 1, hidden),
+            state,
+            Buffer("qkv_weight", bf16, hidden, convDim),
+            Buffer("z_weight", bf16, hidden, valueDim),
+            Buffer("b_weight", bf16, hidden, numValueHeads),
+            Buffer("a_weight", bf16, hidden, numValueHeads),
+            Buffer("conv_weight", bf16, convDim, convKernelSize),
+            Buffer("a_log", DataTypes.Float32, numValueHeads),
+            Buffer("dt_bias", DataTypes.Float32, numValueHeads),
+            Buffer("norm_weight", DataTypes.Float32, valueHeadDim),
+            Buffer("output_weight", bf16, valueDim, hidden),
+            0,
+            numKeyHeads,
+            numValueHeads,
+            keyHeadDim,
+            valueHeadDim,
+            convKernelSize,
+            1e-6F);
+
+        CompilerServices.InferenceType(expression);
+        var output = Assert.IsType<TupleType>(expression.CheckedType);
+        Assert.Equal(new RankedShape(1, hidden), Assert.IsType<TensorType>(output[0]).Shape);
+        Assert.Equal(state.CheckedType, output[1]);
+        Assert.Equal(new long[] { 1, 1024, 3, 8 }, stateConfig.GetStorageShape(GatedDeltaNetStateKind.Convolution));
+        Assert.Equal(new long[] { 1, 32, 128, 32, 4 }, stateConfig.GetStorageShape(GatedDeltaNetStateKind.Recurrent));
+        Assert.IsType<GatedDeltaNet>(expression.Target);
+        Assert.Equal(12, expression.Arguments.Length);
+    }
+
+    [Fact]
     public void TestSamplerProcessorsAndLogprobs()
     {
         var config = new SamplerConfig(

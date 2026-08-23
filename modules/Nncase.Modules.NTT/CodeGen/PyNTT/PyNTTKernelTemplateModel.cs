@@ -1286,6 +1286,194 @@ public sealed record PyNTTSoftmaxTemplateModel(
     public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
 }
 
+public sealed record PyNTTTopKTemplateModel(
+    string FunctionName,
+    PyNTTBufferPointerTemplateModel Input,
+    PyNTTBufferPointerTemplateModel Values,
+    PyNTTBufferPointerTemplateModel Indices,
+    string InputTritonDType,
+    string ValuesTritonDType,
+    string IndicesTritonDType,
+    PyNTTDimExpression[] InputShape,
+    PyNTTDimExpression[] ValuesShape,
+    PyNTTDimExpression[] InputStrides,
+    PyNTTDimExpression[] ValuesStrides,
+    PyNTTDimExpression[] IndicesStrides,
+    int Axis,
+    int K,
+    int AxisBlockSize,
+    bool Largest,
+    bool Sorted,
+    string Comment)
+{
+    public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
+}
+
+public sealed record PyNTTSparseExpertsGateUpTemplateModel(
+    string FunctionName,
+    PyNTTBufferPointerTemplateModel Input,
+    PyNTTBufferPointerTemplateModel ExpertIds,
+    PyNTTBufferPointerTemplateModel GateInputScale,
+    PyNTTBufferPointerTemplateModel GateWeight,
+    PyNTTBufferPointerTemplateModel GateScale,
+    PyNTTBufferPointerTemplateModel UpInputScale,
+    PyNTTBufferPointerTemplateModel UpWeight,
+    PyNTTBufferPointerTemplateModel UpScale,
+    PyNTTBufferPointerTemplateModel Output,
+    string InputTritonDType,
+    string OutputTritonDType,
+    PyNTTDimExpression[] InputShape,
+    PyNTTDimExpression[] GateWeightShape,
+    PyNTTDimExpression[] OutputShape,
+    PyNTTDimExpression[] InputStrides,
+    PyNTTDimExpression[] ExpertIdsStrides,
+    PyNTTDimExpression[] GateInputScaleStrides,
+    PyNTTDimExpression[] GateWeightStrides,
+    PyNTTDimExpression[] GateScaleStrides,
+    PyNTTDimExpression[] UpInputScaleStrides,
+    PyNTTDimExpression[] UpWeightStrides,
+    PyNTTDimExpression[] UpScaleStrides,
+    PyNTTDimExpression[] OutputStrides,
+    int HiddenSize,
+    int IntermediateSize,
+    int NumExperts,
+    int NumTopK,
+    int InputLaneCount,
+    int OutputLaneCount,
+    int LocalIntermediateSize,
+    string Comment)
+{
+    public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
+}
+
+public sealed record PyNTTSparseExpertsDownTemplateModel(
+    string FunctionName,
+    PyNTTBufferPointerTemplateModel Activations,
+    PyNTTBufferPointerTemplateModel ExpertIds,
+    PyNTTBufferPointerTemplateModel ExpertWeights,
+    PyNTTBufferPointerTemplateModel DownInputScale,
+    PyNTTBufferPointerTemplateModel DownWeight,
+    PyNTTBufferPointerTemplateModel DownScale,
+    PyNTTBufferPointerTemplateModel Output,
+    string ActivationTritonDType,
+    string OutputTritonDType,
+    PyNTTDimExpression[] ActivationShape,
+    PyNTTDimExpression[] DownWeightShape,
+    PyNTTDimExpression[] OutputShape,
+    PyNTTDimExpression[] ActivationStrides,
+    PyNTTDimExpression[] ExpertIdsStrides,
+    PyNTTDimExpression[] ExpertWeightsStrides,
+    PyNTTDimExpression[] DownInputScaleStrides,
+    PyNTTDimExpression[] DownWeightStrides,
+    PyNTTDimExpression[] DownScaleStrides,
+    PyNTTDimExpression[] OutputStrides,
+    int HiddenSize,
+    int IntermediateSize,
+    int NumExperts,
+    int NumTopK,
+    int ActivationLaneCount,
+    int OutputLaneCount,
+    int LocalIntermediateSize,
+    int LocalOutputSize,
+    PyNTTMicroKernelTemplateModel MicroKernel,
+    string Comment)
+{
+    public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
+}
+
+public sealed record PyNTTGatedDeltaNetProjectionTemplateModel(
+    string FunctionName,
+    PyNTTBufferPointerTemplateModel Input,
+    PyNTTBufferPointerTemplateModel ConvState,
+    PyNTTBufferPointerTemplateModel QKVWeight,
+    PyNTTBufferPointerTemplateModel ConvWeight,
+    PyNTTBufferPointerTemplateModel QKVOutput,
+    string InputTritonDType,
+    PyNTTDimExpression[] InputStrides,
+    PyNTTDimExpression[] QKVWeightStrides,
+    PyNTTDimExpression[] ConvWeightStrides,
+    PyNTTDimExpression[] QKVOutputStrides,
+    PyNTTGatedDeltaNetStateAxisTemplateModel ConvStateLayerAxis,
+    PyNTTGatedDeltaNetStateAxisTemplateModel ConvStateChannelAxis,
+    PyNTTGatedDeltaNetStateAxisTemplateModel ConvStateHistoryAxis,
+    string LayerId,
+    int HiddenSize,
+    int ConvKernelSize,
+    int LocalConvDim,
+    int QKVOutputLaneCount,
+    PyNTTMicroKernelTemplateModel MicroKernel,
+    string Comment)
+{
+    public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
+
+    public PyNTTDimExpression[] QKVWeightGlobalOffsets { get; set; } = Array.Empty<PyNTTDimExpression>();
+
+    public string? QKVWeightDescriptorName { get; set; }
+
+    public string QKVWeightDescriptorOriginElements { get; set; } = "0";
+}
+
+public sealed record PyNTTGatedDeltaNetRecurrentCoreTemplateModel(
+    string FunctionName,
+    PyNTTBufferPointerTemplateModel Input,
+    PyNTTBufferPointerTemplateModel RecurrentState,
+    PyNTTBufferPointerTemplateModel QKV,
+    PyNTTBufferPointerTemplateModel ZWeight,
+    PyNTTBufferPointerTemplateModel BWeight,
+    PyNTTBufferPointerTemplateModel AWeight,
+    PyNTTBufferPointerTemplateModel ALog,
+    PyNTTBufferPointerTemplateModel DtBias,
+    PyNTTBufferPointerTemplateModel NormWeight,
+    PyNTTBufferPointerTemplateModel GatedOutput,
+    string InputTritonDType,
+    string OutputTritonDType,
+    PyNTTDimExpression[] InputStrides,
+    PyNTTDimExpression[] QKVStrides,
+    PyNTTDimExpression[] ZWeightStrides,
+    PyNTTDimExpression[] BWeightStrides,
+    PyNTTDimExpression[] AWeightStrides,
+    PyNTTDimExpression[] ALogStrides,
+    PyNTTDimExpression[] DtBiasStrides,
+    PyNTTDimExpression[] NormWeightStrides,
+    PyNTTDimExpression[] GatedOutputStrides,
+    PyNTTGatedDeltaNetStateAxisTemplateModel RecurrentStateLayerAxis,
+    PyNTTGatedDeltaNetStateAxisTemplateModel RecurrentStateHeadAxis,
+    PyNTTGatedDeltaNetStateAxisTemplateModel RecurrentStateKeyAxis,
+    PyNTTGatedDeltaNetStateAxisTemplateModel RecurrentStateValueAxis,
+    string LayerId,
+    int HiddenSize,
+    int NumKeyHeads,
+    int NumValueHeads,
+    int KeyHeadDim,
+    int ValueHeadDim,
+    int ConvDim,
+    int ValueDim,
+    int LocalNumValueHeads,
+    int QKVLaneCount,
+    int QKVStageSize,
+    int KeyStageSize,
+    int ValueStageSize,
+    int KeyBlockSize,
+    int ValueBlockSize,
+    float Epsilon,
+    PyNTTMicroKernelTemplateModel MicroKernel,
+    string Comment)
+{
+    public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
+
+    public PyNTTDimExpression[] ZWeightGlobalOffsets { get; set; } = Array.Empty<PyNTTDimExpression>();
+
+    public string? ZWeightDescriptorName { get; set; }
+
+    public string ZWeightDescriptorOriginElements { get; set; } = "0";
+}
+
+public sealed record PyNTTGatedDeltaNetStateAxisTemplateModel(
+    long Extent,
+    long BlockStride,
+    int LaneCount,
+    long LaneStride);
+
 public sealed record PyNTTSamplingPartialTemplateModel(
     string FunctionName,
     PyNTTBufferPointerTemplateModel Logits,

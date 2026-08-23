@@ -34,7 +34,8 @@ public class UnaryEvaluator : IEvaluator<Unary>, ITypeInferencer<Unary>, ICostEv
             {
                 return Value.FromTensor(Tensor.FromScalar<int>(Compute_int(input_tensor.ToScalar<int>(), unaryOp)));
             }
-            else if (input_tensor.ElementType == DataTypes.Float32)
+            else if (input_tensor.ElementType == DataTypes.Float32 &&
+                     unaryOp is not UnaryOp.Sigmoid and not UnaryOp.Softplus)
             {
                 return Value.FromTensor(Tensor.FromScalar<float>(Compute_float(input_tensor.ToScalar<float>(), unaryOp)));
             }
@@ -64,10 +65,12 @@ public class UnaryEvaluator : IEvaluator<Unary>, ITypeInferencer<Unary>, ICostEv
             UnaryOp.Round => OrtKI.Round(input),
             UnaryOp.Rsqrt => OrtKI.Rsqrt(input),
             UnaryOp.Sin => OrtKI.Sin(input),
+            UnaryOp.Sigmoid => OrtKI.Sigmoid(input),
             UnaryOp.Sinh => OrtKI.Sinh(input),
             UnaryOp.Sign => OrtKI.Sign(input),
             UnaryOp.Sqrt => OrtKI.Sqrt(input),
             UnaryOp.Square => OrtKI.Square(input),
+            UnaryOp.Softplus => OrtKI.Softplus(input),
             UnaryOp.Tanh => OrtKI.Tanh(input),
             UnaryOp.BitwiseNot => throw new NotSupportedException("NotSupported UnaryOp BitwiseNot"),
             UnaryOp.LogicalNot => OrtKI.Not(input),
@@ -214,10 +217,14 @@ public class UnaryEvaluator : IEvaluator<Unary>, ITypeInferencer<Unary>, ICostEv
         UnaryOp.Round => System.MathF.Round(input),
         UnaryOp.Rsqrt => 1.0f / System.MathF.Sqrt(input),
         UnaryOp.Sin => System.MathF.Sin(input),
+        UnaryOp.Sigmoid => input >= 0.0f
+            ? 1.0f / (1.0f + System.MathF.Exp(-input))
+            : System.MathF.Exp(input) / (1.0f + System.MathF.Exp(input)),
         UnaryOp.Sinh => System.MathF.Sinh(input),
         UnaryOp.Sign => System.MathF.Sign(input),
         UnaryOp.Sqrt => System.MathF.Sqrt(input),
         UnaryOp.Square => input * input,
+        UnaryOp.Softplus => System.MathF.Max(input, 0.0f) + System.MathF.Log(1.0f + System.MathF.Exp(-System.MathF.Abs(input))),
         UnaryOp.Tanh => System.MathF.Tanh(input),
         _ => throw new ArgumentOutOfRangeException(nameof(op), $"NotSupported {nameof(op)} For Float"),
     };

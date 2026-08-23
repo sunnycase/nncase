@@ -293,7 +293,16 @@ public static class NTTTargetMachineCatalog
             ],
             [
                 new(sharedResource, TargetMemorySpaceKind.Shared, sharedCapacityBytes, sharedBytesPerCycle, sharedBytesPerCycle, 20, 16),
-                new(globalResource, TargetMemorySpaceKind.Global, globalCapacityBytes, chipGlobalBytesPerCycle, chipGlobalBytesPerCycle, 300, 128),
+                new(
+                    globalResource,
+                    TargetMemorySpaceKind.Global,
+                    globalCapacityBytes,
+                    chipGlobalBytesPerCycle,
+                    chipGlobalBytesPerCycle,
+                    300,
+                    allocationGranularityBytes: 128,
+                    preferredReadAccessBytes: 128,
+                    preferredWriteAccessBytes: 128),
             ],
             [
                 new(shared, sharedResource, MemorySharingScope.Block, new(MemoryLocation.Shared), sharedCapacityBytes, TargetMemoryAllocationSizePolicy.GranularityAligned, true, 0, true, true, true),

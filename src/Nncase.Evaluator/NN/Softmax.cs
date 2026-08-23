@@ -180,14 +180,21 @@ public class SoftplusEvaluator : IEvaluator<Softplus>, ITypeInferencer<Softplus>
     /// <inheritdoc/>
     public IRType Visit(ITypeInferenceContext context, Softplus target)
     {
-        var input = context.CheckArgumentType<TensorType>(target, Softplus.Input);
-        return Visit(input);
+        var input = context.CheckArgumentType<IRType>(target, Softplus.Input);
+        return input switch
+        {
+            TensorType tensor => tensor,
+            DistributedType distributed => distributed.AxisPolicies.Any(static policy => policy is SBPPartial)
+                ? new InvalidType("Softplus cannot preserve a partial distributed value.")
+                : distributed,
+            _ => new InvalidType(input.GetType().Name),
+        };
     }
 
     /// <inheritdoc/>
     public Cost Visit(ICostEvaluateContext context, Softplus target)
     {
-        var ret = context.GetReturnType<TensorType>();
+        var ret = context.GetReturnType<IRType>();
         return new()
         {
             [CostFactorNames.BlockLocalMemoryLoadBytes] = CostUtility.GetMemoryAccess(ret),
@@ -209,11 +216,6 @@ public class SoftplusEvaluator : IEvaluator<Softplus>, ITypeInferencer<Softplus>
             [MetricFactorNames.FLOPs] = (i * ((MetricUtility.ExpFLOPs * 2) + 3)) + reduced,
             [MetricFactorNames.Parallel] = 4,
         };
-    }
-
-    private IRType Visit(TensorType input)
-    {
-        return input;
     }
 }
 

@@ -85,6 +85,8 @@ public partial class HuggingFaceImporter : BaseImporter
         : base(compileSession)
     {
         var config = HuggingFaceUtils.GetConfigInfo(Path.Combine(huggingFaceDir, "config.json"));
+        var architectures = config.GetNestedValue<string>("architectures", 0);
+        config = SelectTextConfig(config, architectures);
         var tmp_config = HuggingFaceUtils.GetConfigInfo(Path.Combine(huggingFaceDir, "generation_config.json"));
         foreach (var pair in tmp_config)
         {
@@ -111,12 +113,13 @@ public partial class HuggingFaceImporter : BaseImporter
         _modelContext.ImportOptions = importOptions;
         _modelContext.CompileSession = compileSession;
 
-        var architectures = config.GetNestedValue<string>("architectures", 0);
         _model = architectures switch
         {
             "Qwen2ForCausalLM" => new Qwen2(),
             "Qwen3ForCausalLM" => new Qwen3(),
             "Qwen3MoeForCausalLM" => new Qwen3A3B(),
+            "Qwen3_5MoeForCausalLM" => new Qwen3_5Moe(textModelPrefix: "model"),
+            "Qwen3_5MoeForConditionalGeneration" => new Qwen3_5Moe(textModelPrefix: "model.language_model"),
             "LlamaForCausalLM" => new Llama3_2(),
             "GlmForCausalLM" => new Glm4V9B(),
             _ => throw new NotImplementedException($"Architecture {architectures} is not supported"),
@@ -138,6 +141,34 @@ public partial class HuggingFaceImporter : BaseImporter
     protected override BaseExpr CreateOutputs()
     {
         return _model.CreateOutputs();
+    }
+
+    private static Dictionary<string, object> SelectTextConfig(
+        Dictionary<string, object> rootConfig,
+        string architecture)
+    {
+        if (architecture != "Qwen3_5MoeForConditionalGeneration")
+        {
+            return rootConfig;
+        }
+
+        if (!rootConfig.TryGetValue("text_config", out var value) ||
+            value is not Dictionary<string, object> textConfig)
+        {
+            throw new InvalidDataException(
+                $"{architecture} requires a dictionary-valued text_config in config.json.");
+        }
+
+        var selected = new Dictionary<string, object>(rootConfig, StringComparer.Ordinal);
+        foreach (var pair in textConfig)
+        {
+            selected[pair.Key] = pair.Value;
+        }
+
+        // Keep dispatch based on the outer architecture while exposing the text
+        // model's scalar fields through the existing HuggingFace model contract.
+        selected["architectures"] = rootConfig["architectures"];
+        return selected;
     }
 
     private static bool IsModelFile(string fileName)

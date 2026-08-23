@@ -23,5 +23,9 @@ internal class PassesModule : IApplicationPart
         registrator.RegisterManyInterface<Distributed.NormApplyCandidateProvider>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<Distributed.BindNormStatsCandidateProvider>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<Distributed.QKVRoPEWithCacheCandidateProvider>(reuse: Reuse.Singleton);
+        registrator.RegisterManyInterface<Distributed.GatedDeltaNetProjectionCandidateProvider>(reuse: Reuse.Singleton);
+        registrator.RegisterManyInterface<Distributed.GatedDeltaNetRecurrentCoreCandidateProvider>(reuse: Reuse.Singleton);
+        registrator.RegisterManyInterface<Distributed.SparseExpertsGateUpCandidateProvider>(reuse: Reuse.Singleton);
+        registrator.RegisterManyInterface<Distributed.SparseExpertsDownCandidateProvider>(reuse: Reuse.Singleton);
     }
 }

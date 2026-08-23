@@ -1,0 +1,211 @@
+{% macro pipeline_setup(stage) -%}
+{% set stage_model = stage["Model"] %}
+{% set stage_ctx = sparse_experts_down_pipeline_context(stage_model) %}
+{% set shared_shape = [stage_ctx["num_stages"], stage_ctx["block_n"], stage_ctx["stage_k"]] %}
+{{ stage["StageName"] }}__weight_stages = tle.gpu.alloc(
+    [{{ shared_shape | join(", ") }}],
+    dtype={{ stage_model["ActivationTritonDType"] }},
+    layout=None,
+    scope=tle.gpu.smem,
+    alias=pyntt_shared_arena,
+    alias_offset_bytes={{ stage["SharedWorkspaceOffsets"]["weight_stage"] }},
+    nv_mma_shared_layout=True,
+)
+{{ stage["PipeName"] }} = tle.pipe(
+    capacity={{ stage_ctx["num_stages"] }},
+    scope="cta",
+    name="{{ stage["StageName"] }}_weight",
+    weight={{ stage["StageName"] }}__weight_stages,
+)
+{%- endmacro %}
+{% if model is defined %}
+{% import "triton/kernels/_common.py.jinja" as common with context %}
+{% set ctx = sparse_experts_down_pipeline_context(model) %}
+# generated from PyNTT algorithm triton.sparse_experts_down/concatenated_mma_smem_pipeline
+# {{ model["Comment"] }}; local_n={{ model["LocalOutputSize"] }}, local_k={{ model["LocalIntermediateSize"] }}, top_k={{ model["NumTopK"] }}, block_n={{ ctx["block_n"] }}, expert_block_k={{ ctx["expert_block_k"] }}, routes_per_stage={{ ctx["routes_per_stage"] }}, stages={{ ctx["num_stages"] }}
+{{ model["FunctionName"] }}__mma_layout = tl.constexpr(
+    tle.gpu.MmaEncoding(
+        [2, 0],
+        [1, {{ model["NumWarps"] }}],
+        [16, 8],
+    )
+)
+{{ model["FunctionName"] }}__lhs_dot_layout = tl.constexpr(
+    tle.gpu.DotOperandEncoding(
+        0,
+        {{ model["FunctionName"] }}__mma_layout,
+        2,
+    )
+)
+{{ model["FunctionName"] }}__rhs_dot_layout = tl.constexpr(
+    tle.gpu.DotOperandEncoding(
+        1,
+        {{ model["FunctionName"] }}__mma_layout,
+        2,
+    )
+)
+
+
+{{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
+def {{ model["FunctionName"] }}__producer(writer, {{ helper_parameters(model) }}):
+{{ common.mesh_coordinates(model["MeshAxes"]) }}
+    expert_ids = {{ ptr(model, "ExpertIds") }}
+    down_weights = {{ ptr(model, "DownWeight") }}
+    local_n = tl.arange(0, {{ ctx["block_n"] }})[:, None]
+    local_expert_k = tl.arange(0, {{ ctx["expert_block_k"] }})[None, :]
+    for token in tl.range(0, {{ ctx["token_count"] }}):
+        for n_tile in tl.range(0, {{ ctx["n_tiles"] }}):
+            output_n = n_tile * {{ ctx["block_n"] }} + local_n
+            for route_group in tl.range(0, {{ ctx["route_groups"] }}):
+                for k_tile in tl.range(0, {{ ctx["expert_k_tiles"] }}):
+                    sequence = (
+                        (
+                            (
+                                token * {{ ctx["n_tiles"] }} + n_tile
+                            ) * {{ ctx["route_groups"] }} + route_group
+                        ) * {{ ctx["expert_k_tiles"] }} + k_tile
+                    ).to(tl.int32)
+                    slot = writer.acquire(sequence)
+                    for route_in_group in tl.range(
+                        0,
+                        {{ ctx["routes_per_stage"] }},
+                        loop_unroll_factor=1,
+                    ):
+                        route_index = (
+                            route_group * {{ ctx["routes_per_stage"] }}
+                            + route_in_group
+                        )
+                        expert = tl.load(
+                            {{ access_pointer(model, "ExpertIds", "expert_ids", tensor_access(["token", "route_index"], model["ExpertIdsStrides"])) }}
+                        ).to(tl.int32)
+                        expert_k = (
+                            k_tile * {{ ctx["expert_block_k"] }}
+                            + local_expert_k
+                        )
+                        weight_source = (
+                            {{ access_pointer(model, "DownWeight", "down_weights", tensor_access(["expert", "output_n", "expert_k"], model["DownWeightStrides"])) }}
+                        )
+                        stage_k = (
+                            route_in_group * {{ ctx["expert_block_k"] }}
+                            + local_expert_k
+                        )
+                        weight_destination = tle.gpu.local_ptr(
+                            slot.weight,
+                            (local_n, stage_k),
+                            shape=(
+                                {{ ctx["block_n"] }},
+                                {{ ctx["expert_block_k"] }},
+                            ),
+                        )
+                        tl.store(
+                            weight_destination,
+                            tl.load(
+                                weight_source,
+                                cache_modifier=".cg",
+                            ),
+                        )
+                    writer.commit(sequence)
+    writer.close({{ ctx["sequence_count"] }})
+
+
+{{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
+def {{ model["FunctionName"] }}__consumer(reader, {{ helper_parameters(model) }}):
+{{ common.mesh_coordinates(model["MeshAxes"]) }}
+    activations = {{ ptr(model, "Activations") }}
+    expert_ids = {{ ptr(model, "ExpertIds") }}
+    expert_weights = {{ ptr(model, "ExpertWeights") }}
+    down_input_scales = {{ ptr(model, "DownInputScale") }}
+    down_scales = {{ ptr(model, "DownScale") }}
+    output = {{ ptr(model, "Output") }}
+
+    shared_k = tl.broadcast_to(
+        tl.arange(0, {{ ctx["stage_k"] }})[:, None],
+        ({{ ctx["stage_k"] }}, {{ ctx["block_n"] }}),
+    )
+    shared_n = tl.broadcast_to(
+        tl.arange(0, {{ ctx["block_n"] }})[None, :],
+        ({{ ctx["stage_k"] }}, {{ ctx["block_n"] }}),
+    )
+    route_in_group = tl.arange(0, {{ ctx["routes_per_stage"] }})[:, None]
+    expert_k_in_tile = tl.arange(0, {{ ctx["expert_block_k"] }})[None, :]
+    mma_row = tl.arange(0, {{ ctx["block_m"] }})[:, None]
+    for token in tl.range(0, {{ ctx["token_count"] }}):
+        for n_tile in tl.range(0, {{ ctx["n_tiles"] }}):
+            output_n = n_tile * {{ ctx["block_n"] }} + tl.arange(0, {{ ctx["block_n"] }})
+            acc = tle.encoding(
+                tl.zeros(({{ ctx["block_m"] }}, {{ ctx["block_n"] }}), tl.float32),
+                {{ model["FunctionName"] }}__mma_layout,
+            )
+            for route_group in tl.range(0, {{ ctx["route_groups"] }}):
+                route_index = (
+                    route_group * {{ ctx["routes_per_stage"] }} + route_in_group
+                )
+                experts = tl.load(
+                    {{ access_pointer(model, "ExpertIds", "expert_ids", tensor_access(["token", "route_index"], model["ExpertIdsStrides"])) }}
+                ).to(tl.int32)
+                probabilities = tl.load(
+                    {{ access_pointer(model, "ExpertWeights", "expert_weights", tensor_access(["token", "route_index"], model["ExpertWeightsStrides"])) }}
+                ).to(tl.float32)
+                input_scales = tl.load(
+                    {{ access_pointer(model, "DownInputScale", "down_input_scales", tensor_access(["experts", "0"], model["DownInputScaleStrides"])) }}
+                ).to(tl.float32)
+                output_scales = tl.load(
+                    {{ access_pointer(model, "DownScale", "down_scales", tensor_access(["experts", "0"], model["DownScaleStrides"])) }}
+                ).to(tl.float32)
+                route_scale = probabilities * input_scales * output_scales
+                for k_tile in tl.range(0, {{ ctx["expert_k_tiles"] }}):
+                    sequence = (
+                        (
+                            (
+                                token * {{ ctx["n_tiles"] }} + n_tile
+                            ) * {{ ctx["route_groups"] }} + route_group
+                        ) * {{ ctx["expert_k_tiles"] }} + k_tile
+                    ).to(tl.int32)
+                    ready = reader.wait(sequence)
+                    weight_ptr = tle.gpu.local_ptr(
+                        ready.slot.weight,
+                        (shared_n, shared_k),
+                        shape=({{ ctx["stage_k"] }}, {{ ctx["block_n"] }}),
+                    )
+                    rhs = tle.encoding(
+                        tl.load(weight_ptr),
+                        {{ model["FunctionName"] }}__rhs_dot_layout,
+                    )
+                    expert_k = (
+                        k_tile * {{ ctx["expert_block_k"] }} + expert_k_in_tile
+                    )
+                    activation = tl.load(
+                        {{ access_pointer(model, "Activations", "activations", tensor_access(["token", "route_index", "expert_k"], model["ActivationStrides"])) }}
+                    ).to(tl.float32)
+                    scaled = (
+                        activation / input_scales
+                    ) * route_scale
+                    scaled = tl.reshape(scaled, ({{ ctx["stage_k"] }},))
+                    scaled_high = scaled.to(tl.bfloat16)
+                    scaled_low = (
+                        scaled - scaled_high.to(tl.float32)
+                    ).to(tl.bfloat16)
+                    lhs_value = tl.where(
+                        mma_row == 0,
+                        scaled_high[None, :],
+                        tl.where(
+                            mma_row == 1,
+                            scaled_low[None, :],
+                            0.0,
+                        ),
+                    )
+                    lhs = tle.encoding(
+                        lhs_value,
+                        {{ model["FunctionName"] }}__lhs_dot_layout,
+                    )
+                    acc = tl.dot(lhs, rhs, acc=acc)
+                    reader.release(sequence)
+
+            result = tl.sum(acc, axis=0)
+            tl.store(
+                {{ access_pointer(model, "Output", "output", contiguous_vector_axis_access(["token", "0"], model["OutputStrides"], packed_axis=1, logical_index="output_n", lane_count=model["OutputLaneCount"])) }},
+                result.to({{ model["OutputTritonDType"] }}),
+            )
+
+
+{% endif %}

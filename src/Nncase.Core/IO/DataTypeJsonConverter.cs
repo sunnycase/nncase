@@ -198,6 +198,12 @@ internal sealed class DataTypeJsonConverterImpl : JsonConverter<DataType>
                     element.GetProperty(nameof(IR.NN.SamplerStateType.Config)).GetRawText(),
                     options) ?? throw new JsonException("Failed to deserialize SamplerConfig"),
             },
+            nameof(IR.NN.GatedDeltaNetStateType) => new IR.NN.GatedDeltaNetStateType
+            {
+                Config = JsonSerializer.Deserialize<IR.NN.GatedDeltaNetStateConfig>(
+                    element.GetProperty(nameof(IR.NN.GatedDeltaNetStateType.Config)).GetRawText(),
+                    options) ?? throw new JsonException("Failed to deserialize GatedDeltaNetStateConfig"),
+            },
             _ => throw new JsonException($"Unknown ValueType discriminator: {typeName}"),
         };
     }
@@ -219,6 +225,11 @@ internal sealed class DataTypeJsonConverterImpl : JsonConverter<DataType>
         {
             writer.WritePropertyName(nameof(IR.NN.SamplerStateType.Config));
             JsonSerializer.Serialize(writer, samplerStateType.Config, options);
+        }
+        else if (value is IR.NN.GatedDeltaNetStateType gatedDeltaNetStateType)
+        {
+            writer.WritePropertyName(nameof(IR.NN.GatedDeltaNetStateType.Config));
+            JsonSerializer.Serialize(writer, gatedDeltaNetStateType.Config, options);
         }
     }
 }

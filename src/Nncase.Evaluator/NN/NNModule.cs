@@ -24,6 +24,9 @@ internal class NNModule : IApplicationPart
         registrator.RegisterManyInterface<Relu6Evaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<QKVParallelLinearEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<QKVRoPEWithCacheEvaluator>(reuse: Reuse.Singleton);
+        registrator.RegisterManyInterface<GatedDeltaNetEvaluator>(reuse: Reuse.Singleton);
+        registrator.RegisterManyInterface<GatedDeltaNetProjectionEvaluator>(reuse: Reuse.Singleton);
+        registrator.RegisterManyInterface<GatedDeltaNetRecurrentCoreEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<MatMulGluEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<RoPEEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<SeluEvaluator>(reuse: Reuse.Singleton);
@@ -71,6 +74,8 @@ internal class NNModule : IApplicationPart
         registrator.RegisterManyInterface<GetPositionIdsEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<Qwen3MoEEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<SparseExpertsEvaluator>(reuse: Reuse.Singleton);
+        registrator.RegisterManyInterface<SparseExpertsGateUpEvaluator>(reuse: Reuse.Singleton);
+        registrator.RegisterManyInterface<SparseExpertsDownEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<SamplingEvaluator>(reuse: Reuse.Singleton);
     }
 }

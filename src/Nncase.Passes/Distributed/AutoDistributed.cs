@@ -993,6 +993,8 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
 
     private readonly Dictionary<ProviderInputTypeKey, IReadOnlyList<DistributedSearchGraph>> _providerInputTypeMemo = new();
 
+    private readonly Dictionary<TensorConst, DistributedSearchGraph> _constantStorageBuckets = new(ReferenceEqualityComparer.Instance);
+
     private readonly Dictionary<DistributedSearchGraph, OutputReshardClosureState> _outputReshardClosureStates = new(ReferenceEqualityComparer.Instance);
 
     private readonly Dictionary<TypeInferenceCacheKey, (bool Success, IRType CheckedType)> _typeInferenceMemo = new();
@@ -2265,6 +2267,7 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
             if (!bucketsByInputType[i].TryGetValue(tuple.InputTypes[i], out var buckets))
             {
                 buckets = GetOrCreateProviderInputTypeBuckets(
+                    inputExpressions[i],
                     inputClusters[i],
                     tuple.InputTypes[i],
                     ownerFunction).ToArray();
@@ -2325,6 +2328,7 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
     }
 
     private IReadOnlyList<DistributedSearchGraph> GetOrCreateProviderInputTypeBuckets(
+        BaseExpr inputExpression,
         DistributedSearchGraph inputCluster,
         IRType targetType,
         Function ownerFunction)
@@ -2350,6 +2354,18 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         {
             _providerInputTypeMemo.Add(key, Array.Empty<DistributedSearchGraph>());
             return Array.Empty<DistributedSearchGraph>();
+        }
+
+        if (TryCreateDirectConstantProviderInputBucket(
+                inputExpression,
+                inputCluster,
+                distributedTarget,
+                ownerFunction) is { } directConstantBucket)
+        {
+            IReadOnlyList<DistributedSearchGraph> direct = [directConstantBucket];
+            _providerInputTypeMemo.Add(key, direct);
+            _profiler.Count("candidate_provider_direct_constant_sharded_views");
+            return direct;
         }
 
         var paths = new List<(DistributedSearchGraph SourceBucket, SearchableNode SourceNode, IReadOnlyList<IRType> Steps)>();
@@ -2400,6 +2416,34 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         _providerInputTypeMemo.Add(key, created);
         _profiler.Count("candidate_provider_input_types_materialized");
         return created;
+    }
+
+    private DistributedSearchGraph? TryCreateDirectConstantProviderInputBucket(
+        BaseExpr inputExpression,
+        DistributedSearchGraph inputCluster,
+        DistributedType targetType,
+        Function ownerFunction)
+    {
+        if (inputExpression is not TensorConst { ValueType: TensorType sourceType } source ||
+            ClassifyReshardRealization(
+                sourceType,
+                targetType,
+                DistributedReshardSourceKind.Constant,
+                DistributedReshardUsageKind.Internal) != DistributedReshardRealization.ShardedView)
+        {
+            return null;
+        }
+
+        var sourceBucket = GetOrCreateConstantStorageBucket(source);
+        var sourceNode = sourceBucket.Vertices.Single();
+        var (bucket, _) = GetOrCreateReshardCandidate(
+            inputCluster,
+            sourceBucket,
+            sourceNode,
+            targetType,
+            usageKind: DistributedReshardUsageKind.Internal,
+            ownerFunction: ownerFunction);
+        return bucket;
     }
 
     private IReadOnlyList<IRType> GetProviderReturnCandidateTypes(IRType type)
@@ -3590,7 +3634,6 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
             if (tc2.ValueType is TensorType tensorType && IsDistributableTensorType(tensorType))
             {
                 var distCluster = _rootSearchGraph.CreateCluster<DistributedSearchGraph>(SearchGraphKind.DistributedCluster);
-                DistributedSearchGraph? shardedViewInputBucket = null;
                 foreach (var dType in GetLeafCandidateDistTypes(tensorType))
                 {
                     var bucket = distCluster.CreateCluster<DistributedSearchGraph>(SearchGraphKind.Bucket);
@@ -3616,7 +3659,7 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
                         case DistributedReshardRealization.ShardedView:
                             var shardedViewNode = new SearchableNode(new IR.Distributed.ShardedView(dType), dType);
                             bucket.AddVertex(shardedViewNode);
-                            shardedViewInputBucket ??= CreateShardedViewInputBucket(tc2);
+                            var shardedViewInputBucket = GetOrCreateConstantStorageBucket(tc2);
                             _rootSearchGraph.AddEdge(new(shardedViewNode, shardedViewInputBucket.Vertices.First(), 0, shardedViewInputBucket));
                             break;
                         case DistributedReshardRealization.Unsupported:
@@ -3736,11 +3779,17 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         return distCluster;
     }
 
-    private DistributedSearchGraph CreateShardedViewInputBucket(TensorConst source)
+    private DistributedSearchGraph GetOrCreateConstantStorageBucket(TensorConst source)
     {
+        if (_constantStorageBuckets.TryGetValue(source, out var existing))
+        {
+            return existing;
+        }
+
         var sourceCluster = _rootSearchGraph.CreateCluster<DistributedSearchGraph>(SearchGraphKind.StandaloneCluster);
         var sourceBucket = sourceCluster.CreateCluster<DistributedSearchGraph>(SearchGraphKind.Bucket);
         sourceBucket.AddVertex(new SearchableNode(source, source.CheckedType));
+        _constantStorageBuckets.Add(source, sourceBucket);
         return sourceBucket;
     }
 
@@ -3812,6 +3861,7 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
                 for (int i = 0; i < tupleType.Fields.Count; i++)
                 {
                     var field = IR.F.Tensors.GetItem(expr, i);
+                    Visit(field);
                     fieldClusters[i] = TryInstertTerminator(field);
                 }
 

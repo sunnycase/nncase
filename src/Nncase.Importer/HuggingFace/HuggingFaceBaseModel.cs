@@ -41,6 +41,10 @@ public abstract class HuggingFaceModel
 
     protected virtual bool SupportsDecoderLayerFunctionReuse => true;
 
+    protected virtual bool RequiresPagedAttentionKVCache => true;
+
+    protected virtual string ResolveWeightName(string canonicalWeightName) => canonicalWeightName;
+
     private sealed class LayerFunctionBuildContext
     {
         private readonly Dictionary<string, Expr> _parametersByWeight = new();
@@ -86,12 +90,13 @@ public abstract class HuggingFaceModel
 
     public Tensor? GetWeight(string weightName)
     {
-        if (LoadedWeights.TryGetValue(weightName, out var tensor))
+        var resolvedWeightName = ResolveWeightName(weightName);
+        if (LoadedWeights.TryGetValue(resolvedWeightName, out var tensor))
         {
             return tensor;
         }
 
-        if (!WeightToFileMap.TryGetValue(weightName, out var fileName))
+        if (!WeightToFileMap.TryGetValue(resolvedWeightName, out var fileName))
         {
             return null;
         }
@@ -114,13 +119,13 @@ public abstract class HuggingFaceModel
             LoadedFiles.Add(fileName);
         }
 
-        if (LoadedWeights.TryGetValue(weightName, out tensor))
+        if (LoadedWeights.TryGetValue(resolvedWeightName, out tensor))
         {
             return tensor;
         }
 
-        Console.WriteLine($"Weight {weightName} not found after loading {fileName}!");
-        throw new InvalidOperationException($"Weight {weightName} could not be loaded from {fileName}");
+        Console.WriteLine($"Weight {weightName} ({resolvedWeightName}) not found after loading {fileName}!");
+        throw new InvalidOperationException($"Weight {weightName} ({resolvedWeightName}) could not be loaded from {fileName}");
     }
 
     private static string GetLayerWeightName(string templateWeightName, int layerIndex)
@@ -287,8 +292,10 @@ public abstract class HuggingFaceModel
         //         numKVHeads,
         //         0, // _dynVarMap["history_len"],
         //         headDim)));
-        var pastKeyValue = new Var("kvCache", TensorType.Scalar(
-            new ReferenceType(new PagedAttentionKVCacheType { Config = (IPagedAttentionConfig)ImportOptions.HuggingFaceOptions.Config })));
+        Var? pastKeyValue = RequiresPagedAttentionKVCache
+            ? new Var("kvCache", TensorType.Scalar(
+                new ReferenceType(new PagedAttentionKVCacheType { Config = (IPagedAttentionConfig)ImportOptions.HuggingFaceOptions.Config })))
+            : null;
 
         Var? samplerState = null;
         if (ImportOptions.HuggingFaceOptions.EnableSampler)
@@ -1291,11 +1298,13 @@ public abstract class HuggingFaceModel
         Var input_ids = Context.Inputs![0]!;
         _ = Context.Inputs[1];
         _ = Context.Inputs[2];
-        var pastKeyValues = Context.Inputs![3];
+        Expr pastKeyValues = Context.Inputs![3] is { } pastKeyValue
+            ? pastKeyValue
+            : None.Default;
 
         var (lastHiddenStates, allHiddenStates) = LLMModel(
             input_ids,
-            pastKeyValues!);
+            pastKeyValues);
 
         var lmHeadWeights = GetWeight("model.embed_tokens.weight")!;
         if (Context!.Config!.ContainsKey("tie_word_embeddings") && !Context!.Config!.GetNestedValue<bool>("tie_word_embeddings"))

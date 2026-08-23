@@ -728,7 +728,7 @@ public class UnitTestEvaluatorMath : TestClassBase
             UnaryOp.Abs, UnaryOp.Acos, UnaryOp.Acosh, UnaryOp.Asin,
             UnaryOp.Asinh, UnaryOp.Ceil, UnaryOp.Cos, UnaryOp.Cosh, UnaryOp.Exp, UnaryOp.Floor,
             UnaryOp.Log, UnaryOp.Neg, UnaryOp.Round, UnaryOp.Rsqrt, UnaryOp.Sign, UnaryOp.Sin,
-            UnaryOp.Sinh, UnaryOp.Sqrt, UnaryOp.Square, UnaryOp.Tanh,
+            UnaryOp.Sigmoid, UnaryOp.Sinh, UnaryOp.Sqrt, UnaryOp.Square, UnaryOp.Softplus, UnaryOp.Tanh,
         };
         {
             var f = 1F;
@@ -799,9 +799,11 @@ public class UnitTestEvaluatorMath : TestClassBase
             UnaryOp.Rsqrt => OrtKI.Rsqrt(ort),
             UnaryOp.Sign => OrtKI.Sign(ort),
             UnaryOp.Sin => OrtKI.Sin(ort),
+            UnaryOp.Sigmoid => OrtKI.Sigmoid(ort),
             UnaryOp.Sinh => OrtKI.Sinh(ort),
             UnaryOp.Sqrt => OrtKI.Sqrt(ort),
             UnaryOp.Square => OrtKI.Square(ort),
+            UnaryOp.Softplus => OrtKI.Softplus(ort),
             UnaryOp.Tanh => OrtKI.Tanh(ort),
             _ => throw new ArgumentOutOfRangeException(nameof(op)),
         };

@@ -2549,6 +2549,8 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
                 $"materialize_kv_cache_blocks_per_shard({sourceExpression}, topology_shape={PythonTuple(storage.TopologyShape.Select(value => value.ToString(CultureInfo.InvariantCulture)))}, block_size={storage.BlockSize.ToString(CultureInfo.InvariantCulture)})",
             "sampler_state" when objectField.Materialization == "tensor" && objectField.DType is { } dtype =>
                 $"require_object_tensor_field({sourceExpression}, {PythonString("sampler_state")}, {PythonString(objectField.Field)}, {context.DeviceExpression}, dtype={PythonString(dtype)}, shape={PythonTuple(objectField.Shape.Select(value => value.ToString(CultureInfo.InvariantCulture)))})",
+            "gated_delta_net_state" when objectField.Materialization == "tensor" && objectField.DType is { } dtype =>
+                $"require_object_tensor_field({sourceExpression}, {PythonString("gated_delta_net_state")}, {PythonString(objectField.Field)}, {context.DeviceExpression}, dtype={PythonString(dtype)}, shape={PythonTuple(objectField.Shape.Select(value => value.ToString(CultureInfo.InvariantCulture)))})",
             _ => throw new NotSupportedException($"Generated PyNTT kernel input {name} references unsupported {objectField.ObjectKind} field {objectField.Field} with materialization {objectField.Materialization}."),
         };
         var localName = context.State.NewTemp($"{SanitizePythonIdentifier(objectField.ObjectKind)}_{SanitizePythonIdentifier(objectField.Field)}");

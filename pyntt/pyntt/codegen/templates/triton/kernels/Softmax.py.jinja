@@ -10,23 +10,15 @@
 {% for axis in ctx["loop_axes"] %}
 {{ "    " * loop.index }}for idx{{ axis }} in tl.range(0, {{ dim(model["Shape"][axis]) }}):
 {% endfor %}
-{% set base = "    " * ((ctx["loop_axes"] | length) + 1) %}
-{% set body = base ~ "    " %}
-{{ base }}for axis_start in tl.range(0, {{ dim(ctx["block_extent"]) }}, block_size):
-{{ body }}lane = axis_start + tl.arange(0, block_size)
-{{ body }}mask = lane < {{ dim(ctx["block_extent"]) }}
-{{ body }}slice_base = {{ ctx["slice_base"] }}
-{{ body }}max_value = tl.full((block_size,), -float("inf"), tl.float32)
-{{ body }}for axis_pos in tl.range(0, {{ dim(ctx["axis_extent"]) }}):
-{{ body }}    values = tl.load({{ access_pointer(model, "Input", "input0", ctx["slice_offset"]) }}, mask=mask, other=-float("inf"))
-{{ body }}    max_value = tl.maximum(max_value, values)
-{{ body }}sum_value = tl.full((block_size,), 0.0, tl.float32)
-{{ body }}for axis_pos in tl.range(0, {{ dim(ctx["axis_extent"]) }}):
-{{ body }}    values = tl.load({{ access_pointer(model, "Input", "input0", ctx["slice_offset"]) }}, mask=mask, other=-float("inf"))
-{{ body }}    sum_value += tl.exp(values - max_value)
-{{ body }}value0 = tl.load({{ access_pointer(model, "Input", "input0", ctx["input_offset"]) }}, mask=mask, other=-float("inf"))
-{{ body }}result = tl.exp(value0 - max_value) / sum_value
-{{ body }}tl.store({{ access_pointer(model, "Output", "output", ctx["output_offset"]) }}, result, mask=mask)
+{% set body = "    " * ((ctx["loop_axes"] | length) + 1) %}
+{{ body }}lane = tl.arange(0, {{ ctx["axis_block_size"] }})
+{{ body }}mask = lane < {{ dim(ctx["axis_extent"]) }}
+{{ body }}values = tl.load({{ access_pointer(model, "Input", "input0", ctx["input_access"]) }}, mask=mask, other=-float("inf")).to(tl.float32)
+{{ body }}max_value = tl.max(values, axis=0)
+{{ body }}numerator = tl.exp(values - max_value)
+{{ body }}denominator = tl.sum(numerator, axis=0)
+{{ body }}result = numerator / denominator
+{{ body }}tl.store({{ access_pointer(model, "Output", "output", ctx["output_access"]) }}, result.to({{ model["OutputTritonDType"] }}), mask=mask)
 
 
 {{ phases.dispatch(model) }}
