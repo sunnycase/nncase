@@ -151,6 +151,23 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
                     matmul.FusedReduce,
                     matmul.RhsLayout,
                     (Expr)arguments[IR.NTT.PackedMatMul.Addend.Index]);
+            case IR.NTT.PackedScaledMatMul scaledMatmul:
+                return TIR.F.NTT.PackedScaledMatMul(
+                    (Expr)arguments[IR.NTT.PackedScaledMatMul.Lhs.Index],
+                    (Expr)arguments[IR.NTT.PackedScaledMatMul.Rhs.Index],
+                    (Expr)arguments[IR.NTT.PackedScaledMatMul.LhsScale.Index],
+                    (Expr)arguments[IR.NTT.PackedScaledMatMul.RhsScale.Index],
+                    output,
+                    scaledMatmul.RhsLayout);
+            case IR.NTT.PackedBlockScaledMatMul blockScaledMatmul:
+                return TIR.F.NTT.PackedBlockScaledMatMul(
+                    (Expr)arguments[IR.NTT.PackedBlockScaledMatMul.Lhs.Index],
+                    (Expr)arguments[IR.NTT.PackedBlockScaledMatMul.Rhs.Index],
+                    (Expr)arguments[IR.NTT.PackedBlockScaledMatMul.RhsScale.Index],
+                    output,
+                    blockScaledMatmul.RhsLayout,
+                    blockScaledMatmul.WeightBlockN,
+                    blockScaledMatmul.WeightBlockK);
             case IR.NTT.PackedMatMulNormStats matmulNormStats:
                 {
                     var outputBase = Unsafe.As<Expr, BaseExpr>(ref output);
@@ -191,7 +208,10 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
                     (Expr)arguments[8],
                     output,
                     matmulGlu.GluType,
-                    matmulGlu.RhsLayout);
+                    matmulGlu.RhsLayout,
+                    matmulGlu.QuantizationMode,
+                    matmulGlu.WeightBlockN,
+                    matmulGlu.WeightBlockK);
             case IR.NTT.PackedQKVParallelLinear qkv:
                 {
                     var outputBase = Unsafe.As<Expr, BaseExpr>(ref output);
@@ -292,28 +312,27 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
                         fused.AttentionLayout);
                 }
 
-            case IR.NN.GatedDeltaNetProjection projection:
+            case IR.NN.GatedDeltaNetConvolution convolution:
                 {
                     var outputBase = Unsafe.As<Expr, BaseExpr>(ref output);
                     if (outputBase is not IR.Tuple { Count: 2 } outputs)
                     {
                         throw new NotSupportedException(
-                            "GatedDeltaNetProjection TIR selection expects QKV and state outputs.");
+                            "GatedDeltaNetConvolution TIR selection expects QKV and state outputs.");
                     }
 
                     var qkvOutput = (Expr)outputs[0];
                     Unsafe.As<Expr, BaseExpr>(ref output) = new IR.Tuple(
                         qkvOutput,
-                        (Expr)arguments[IR.NN.GatedDeltaNetProjection.State.Index]);
+                        (Expr)arguments[IR.NN.GatedDeltaNetConvolution.State.Index]);
 
-                    return TIR.F.NTT.GatedDeltaNetProjection(
-                        (Expr)arguments[IR.NN.GatedDeltaNetProjection.Input.Index],
-                        (Expr)arguments[IR.NN.GatedDeltaNetProjection.State.Index],
-                        (Expr)arguments[IR.NN.GatedDeltaNetProjection.QKVWeight.Index],
-                        (Expr)arguments[IR.NN.GatedDeltaNetProjection.ConvWeight.Index],
+                    return TIR.F.NTT.GatedDeltaNetConvolution(
+                        (Expr)arguments[IR.NN.GatedDeltaNetConvolution.QKV.Index],
+                        (Expr)arguments[IR.NN.GatedDeltaNetConvolution.State.Index],
+                        (Expr)arguments[IR.NN.GatedDeltaNetConvolution.ConvWeight.Index],
                         qkvOutput,
-                        (Dimension)arguments[IR.NN.GatedDeltaNetProjection.LayerId.Index],
-                        projection.ConvKernelSize);
+                        (Dimension)arguments[IR.NN.GatedDeltaNetConvolution.LayerId.Index],
+                        convolution.ConvKernelSize);
                 }
 
             case IR.NN.GatedDeltaNetRecurrentCore recurrent:
@@ -331,12 +350,11 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
                         (Expr)arguments[IR.NN.GatedDeltaNetRecurrentCore.State.Index]);
 
                     return TIR.F.NTT.GatedDeltaNetRecurrentCore(
-                        (Expr)arguments[IR.NN.GatedDeltaNetRecurrentCore.Input.Index],
                         (Expr)arguments[IR.NN.GatedDeltaNetRecurrentCore.State.Index],
                         (Expr)arguments[IR.NN.GatedDeltaNetRecurrentCore.QKV.Index],
-                        (Expr)arguments[IR.NN.GatedDeltaNetRecurrentCore.ZWeight.Index],
-                        (Expr)arguments[IR.NN.GatedDeltaNetRecurrentCore.BWeight.Index],
-                        (Expr)arguments[IR.NN.GatedDeltaNetRecurrentCore.AWeight.Index],
+                        (Expr)arguments[IR.NN.GatedDeltaNetRecurrentCore.Z.Index],
+                        (Expr)arguments[IR.NN.GatedDeltaNetRecurrentCore.BProjection.Index],
+                        (Expr)arguments[IR.NN.GatedDeltaNetRecurrentCore.AProjection.Index],
                         (Expr)arguments[IR.NN.GatedDeltaNetRecurrentCore.ALog.Index],
                         (Expr)arguments[IR.NN.GatedDeltaNetRecurrentCore.DtBias.Index],
                         (Expr)arguments[IR.NN.GatedDeltaNetRecurrentCore.NormWeight.Index],

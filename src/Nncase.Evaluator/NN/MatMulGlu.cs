@@ -6,6 +6,7 @@ using System.Linq;
 using Nncase.CostModel;
 using Nncase.IR;
 using Nncase.IR.Distributed;
+using Nncase.IR.Math;
 using Nncase.IR.NN;
 using Nncase.Utilities;
 using OrtKISharp;
@@ -26,14 +27,14 @@ public sealed class MatMulGluEvaluator : IEvaluator<MatMulGlu>, ITypeInferencer<
             context.GetArgumentValue(target, MatMulGlu.GateBias),
             context.GetArgumentValue(target, MatMulGlu.GateInputScale),
             context.GetArgumentValue(target, MatMulGlu.GateWeightScale),
-            target.OutputDataType);
+            target);
         var up = Project(
             input,
             context.GetArgumentValueAsTensor(target, MatMulGlu.UpWeight),
             context.GetArgumentValue(target, MatMulGlu.UpBias),
             context.GetArgumentValue(target, MatMulGlu.UpInputScale),
             context.GetArgumentValue(target, MatMulGlu.UpWeightScale),
-            target.OutputDataType);
+            target);
         return Value.FromTensor(ApplyGlu(gate, up, target.GluType, target.OutputDataType));
     }
 
@@ -44,8 +45,22 @@ public sealed class MatMulGluEvaluator : IEvaluator<MatMulGlu>, ITypeInferencer<
         var upWeight = context.CheckArgumentType<IRType>(target, MatMulGlu.UpWeight);
         var gateBias = context.CheckArgumentType<IRType>(target, MatMulGlu.GateBias);
         var upBias = context.CheckArgumentType<IRType>(target, MatMulGlu.UpBias);
-        var gate = VisitProjection(input, gateWeight, target.OutputDataType);
-        var up = VisitProjection(input, upWeight, target.OutputDataType);
+        var gateInputScale = context.CheckArgumentType<IRType>(target, MatMulGlu.GateInputScale);
+        var upInputScale = context.CheckArgumentType<IRType>(target, MatMulGlu.UpInputScale);
+        var gateWeightScale = context.CheckArgumentType<IRType>(target, MatMulGlu.GateWeightScale);
+        var upWeightScale = context.CheckArgumentType<IRType>(target, MatMulGlu.UpWeightScale);
+        if (CheckScaleContract(
+                target,
+                gateInputScale,
+                upInputScale,
+                gateWeightScale,
+                upWeightScale) is { } scaleError)
+        {
+            return scaleError;
+        }
+
+        var gate = VisitProjection(input, gateWeight, gateInputScale, gateWeightScale, target);
+        var up = VisitProjection(input, upWeight, upInputScale, upWeightScale, target);
         if (gate is InvalidType)
         {
             return gate;
@@ -115,11 +130,37 @@ public sealed class MatMulGluEvaluator : IEvaluator<MatMulGlu>, ITypeInferencer<
         };
     }
 
-    private static Tensor Project(Tensor input, Tensor weight, IValue bias, IValue inputScale, IValue weightScale, DataType outputDataType)
+    private static Tensor Project(
+        Tensor input,
+        Tensor weight,
+        IValue bias,
+        IValue inputScale,
+        IValue weightScale,
+        MatMulGlu target)
     {
-        _ = inputScale;
-        var effectiveWeight = DequantizeWeight(weight, weightScale, input.ElementType);
-        var result = Math.MatMulEvaluator.InferValue(input.ElementType, input, effectiveWeight, outputDataType).AsTensor();
+        var result = target.QuantizationMode switch
+        {
+            MatMulQuantizationMode.None => Math.MatMulEvaluator.InferValue(
+                input.ElementType,
+                input,
+                weight.ElementType == input.ElementType ? weight : weight.CastElementTo(input.ElementType),
+                target.OutputDataType).AsTensor(),
+            MatMulQuantizationMode.StaticTensor => Math.ScaledMatMulEvaluator.Evaluate(
+                input,
+                weight,
+                inputScale.AsTensor(),
+                weightScale.AsTensor(),
+                target.OutputDataType).AsTensor(),
+            MatMulQuantizationMode.DynamicBlock => Math.BlockScaledMatMulEvaluator.Evaluate(
+                input,
+                weight,
+                weightScale.AsTensor(),
+                target.OutputDataType,
+                target.WeightBlockN,
+                target.WeightBlockK).AsTensor(),
+            _ => throw new NotSupportedException(
+                $"Unsupported MatMulGlu quantization mode: {target.QuantizationMode}."),
+        };
         if (!IsNone(bias))
         {
             var biasTensor = bias.AsTensor().CastElementTo(result.ElementType);
@@ -127,18 +168,6 @@ public sealed class MatMulGluEvaluator : IEvaluator<MatMulGlu>, ITypeInferencer<
         }
 
         return result;
-    }
-
-    private static Tensor DequantizeWeight(Tensor weight, IValue weightScale, DataType outputType)
-    {
-        if (IsNone(weightScale))
-        {
-            return weight.ElementType == outputType ? weight : weight.CastElementTo(outputType);
-        }
-
-        var weightFloat = weight.CastElementTo(DataTypes.Float32).ToOrtTensor();
-        var scaleFloat = weightScale.AsTensor().CastElementTo(DataTypes.Float32).ToOrtTensor();
-        return OrtKI.Mul(weightFloat, scaleFloat).ToTensor().CastElementTo(outputType);
     }
 
     private static Tensor ApplyGlu(Tensor gate, Tensor up, GluType gluType, DataType outputDataType)
@@ -160,14 +189,82 @@ public sealed class MatMulGluEvaluator : IEvaluator<MatMulGlu>, ITypeInferencer<
         return OrtKI.Mul(swishCast, up.ToOrtTensor()).ToTensor().CastElementTo(outputDataType);
     }
 
-    private static IRType VisitProjection(IRType input, IRType weight, DataType outputDataType)
+    private static IRType VisitProjection(
+        IRType input,
+        IRType weight,
+        IRType inputScale,
+        IRType weightScale,
+        MatMulGlu target)
     {
-        return (input, weight) switch
+        return target.QuantizationMode switch
         {
-            (DistributedType a, DistributedType b) => Math.MatMulEvaluator.VisitDistributedType(a, b with { TensorType = b.TensorType with { DType = a.TensorType.DType } }, NoneType.Default, outputDataType: outputDataType),
-            (TensorType a, TensorType b) => Math.MatMulEvaluator.VisitTensorType(a, b with { DType = a.DType }, NoneType.Default, outputDataType: outputDataType),
-            _ => new InvalidType($"MatMulGlu input/weight types are not supported: {input}, {weight}."),
+            MatMulQuantizationMode.None => (input, weight) switch
+            {
+                (DistributedType a, DistributedType b) => Math.MatMulEvaluator.VisitDistributedType(
+                    a,
+                    b,
+                    NoneType.Default,
+                    outputDataType: target.OutputDataType),
+                (TensorType a, TensorType b) => Math.MatMulEvaluator.VisitTensorType(
+                    a,
+                    b,
+                    NoneType.Default,
+                    outputDataType: target.OutputDataType),
+                _ => new InvalidType($"MatMulGlu input/weight types are not supported: {input}, {weight}."),
+            },
+            MatMulQuantizationMode.StaticTensor => Math.ScaledMatMulEvaluator.InferType(
+                new ScaledMatMul(target.OutputDataType),
+                input,
+                weight,
+                inputScale,
+                weightScale),
+            MatMulQuantizationMode.DynamicBlock => Math.BlockScaledMatMulEvaluator.InferType(
+                new BlockScaledMatMul(
+                    target.OutputDataType,
+                    target.WeightBlockN,
+                    target.WeightBlockK),
+                input,
+                weight,
+                weightScale),
+            _ => new InvalidType(
+                $"Unsupported MatMulGlu quantization mode: {target.QuantizationMode}."),
         };
+    }
+
+    private static InvalidType? CheckScaleContract(
+        MatMulGlu target,
+        IRType gateInputScale,
+        IRType upInputScale,
+        IRType gateWeightScale,
+        IRType upWeightScale)
+    {
+        var hasGateInputScale = gateInputScale is not NoneType;
+        var hasUpInputScale = upInputScale is not NoneType;
+        var hasGateWeightScale = gateWeightScale is not NoneType;
+        var hasUpWeightScale = upWeightScale is not NoneType;
+        var valid = target.QuantizationMode switch
+        {
+            MatMulQuantizationMode.None =>
+                !hasGateInputScale && !hasUpInputScale &&
+                !hasGateWeightScale && !hasUpWeightScale &&
+                target.WeightBlockN == 0 && target.WeightBlockK == 0,
+            MatMulQuantizationMode.StaticTensor =>
+                hasGateInputScale && hasUpInputScale &&
+                hasGateWeightScale && hasUpWeightScale &&
+                target.WeightBlockN == 0 && target.WeightBlockK == 0,
+            MatMulQuantizationMode.DynamicBlock =>
+                !hasGateInputScale && !hasUpInputScale &&
+                hasGateWeightScale && hasUpWeightScale &&
+                target.WeightBlockN > 0 && target.WeightBlockK > 0,
+            _ => false,
+        };
+        return valid
+            ? null
+            : new InvalidType(
+                $"MatMulGlu scale operands do not match quantization mode {target.QuantizationMode}; " +
+                $"input scales={hasGateInputScale}/{hasUpInputScale}, weight scales=" +
+                $"{hasGateWeightScale}/{hasUpWeightScale}, block=" +
+                $"[{target.WeightBlockN}, {target.WeightBlockK}].");
     }
 
     private static InvalidType? RejectPartialProjection(string name, IRType projection)

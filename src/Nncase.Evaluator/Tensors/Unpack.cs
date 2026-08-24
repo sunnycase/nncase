@@ -35,7 +35,7 @@ public sealed class UnpackEvaluator : ITypeInferencer<Unpack>, ICostEvaluator<Un
         var postType = remainLanes switch
         {
             0 => basicElemType,
-            > 0 when input.ElementType is VectorType vt => new VectorType(basicElemType, vt.Lanes.Skip(remainLanes).ToArray()),
+            > 0 when input.ElementType is VectorType vt => new VectorType(basicElemType, vt.Lanes.Skip(axes.Count).ToArray()),
             _ => throw new InvalidOperationException($"Unsupported remain lanes: {remainLanes}"),
         };
 

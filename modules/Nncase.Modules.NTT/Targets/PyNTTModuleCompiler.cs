@@ -79,14 +79,18 @@ public sealed class PyNTTModuleCompiler : INTTModuleCompiler
                 or IR.NN.QKVParallelLinear
                 or IR.NN.QKVRoPEWithCache
                 or IR.NN.GatedDeltaNet
-                or IR.NN.GatedDeltaNetProjection
+                or IR.NN.GatedDeltaNetConvolution
                 or IR.NN.GatedDeltaNetRecurrentCore
                 or IR.NN.SparseExpertsGateUp
                 or IR.NN.SparseExpertsDown
                 or IR.NN.MatMulGlu
                 or IR.Math.MatMul
+                or IR.Math.ScaledMatMul
+                or IR.Math.BlockScaledMatMul
                 or IR.NTT.VectorizedMatMul
                 or IR.NTT.PackedMatMul
+                or IR.NTT.PackedScaledMatMul
+                or IR.NTT.PackedBlockScaledMatMul
                 or IR.NTT.PackedMatMulNormStats
                 or IR.NTT.PackedQKVParallelLinear
                 or IR.NTT.PackedMatMulGlu

@@ -30,7 +30,8 @@ var lanesValues = new[] {
   new[] { 4, 4 }, new[] { 4, 8 }, new[] { 4, 16 }, new[] { 4, 32 },
   new[] { 8, 8 }, new[] { 16, 16 }, new[] { 32, 16 }, new[] { 32, 32 }, new[] { 32, 64 },
   new[] { 32, 128 }, new[] { 64, 32 }, new[] { 64, 64 }, new[] { 64, 128 }, new[] { 128, 64 },
-  new[] { 2, 2, 2 }, new[] { 4, 2, 4 }, new[] { 8, 2, 8 }, new[] { 16, 2, 16 }, new[] { 32, 2, 32 } };
+  new[] { 2, 2, 2 }, new[] { 4, 2, 4 }, new[] { 8, 2, 8 }, new[] { 8, 2, 16 },
+  new[] { 16, 2, 16 }, new[] { 32, 2, 32 } };
 #>
 public partial record VectorType
 {

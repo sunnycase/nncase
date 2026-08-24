@@ -118,6 +118,8 @@ public partial class HuggingFaceImporter : BaseImporter
             "Qwen2ForCausalLM" => new Qwen2(),
             "Qwen3ForCausalLM" => new Qwen3(),
             "Qwen3MoeForCausalLM" => new Qwen3A3B(),
+            "Qwen3_5ForCausalLM" => new Qwen3_5(textModelPrefix: "model"),
+            "Qwen3_5ForConditionalGeneration" => new Qwen3_5(textModelPrefix: "model.language_model"),
             "Qwen3_5MoeForCausalLM" => new Qwen3_5Moe(textModelPrefix: "model"),
             "Qwen3_5MoeForConditionalGeneration" => new Qwen3_5Moe(textModelPrefix: "model.language_model"),
             "LlamaForCausalLM" => new Llama3_2(),
@@ -147,7 +149,7 @@ public partial class HuggingFaceImporter : BaseImporter
         Dictionary<string, object> rootConfig,
         string architecture)
     {
-        if (architecture != "Qwen3_5MoeForConditionalGeneration")
+        if (architecture is not ("Qwen3_5ForConditionalGeneration" or "Qwen3_5MoeForConditionalGeneration"))
         {
             return rootConfig;
         }

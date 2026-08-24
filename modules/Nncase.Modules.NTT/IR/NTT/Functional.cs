@@ -65,6 +65,38 @@ public partial class NTT
             addend ?? None.Default);
     }
 
+    public static Expr PackedScaledMatMul(
+        Expr lhs,
+        Expr rhs,
+        Expr lhsScale,
+        Expr rhsScale,
+        DataType outputDataType,
+        PackedMatMulRhsLayout rhsLayout = PackedMatMulRhsLayout.KMajor)
+        => new Call(
+            new PackedScaledMatMul(outputDataType, rhsLayout),
+            lhs,
+            rhs,
+            lhsScale,
+            rhsScale);
+
+    public static Expr PackedBlockScaledMatMul(
+        Expr lhs,
+        Expr rhs,
+        Expr rhsScale,
+        DataType outputDataType,
+        long weightBlockN,
+        long weightBlockK,
+        PackedMatMulRhsLayout rhsLayout = PackedMatMulRhsLayout.KMajor)
+        => new Call(
+            new PackedBlockScaledMatMul(
+                outputDataType,
+                rhsLayout,
+                weightBlockN,
+                weightBlockK),
+            lhs,
+            rhs,
+            rhsScale);
+
     public static Expr PackedMatMulNormStats(
         Expr lhs,
         Expr rhs,
@@ -214,10 +246,20 @@ public partial class NTT
         Expr upWeightScale,
         IR.NN.GluType gluType,
         DataType? outDataType = null,
-        PackedMatMulRhsLayout rhsLayout = PackedMatMulRhsLayout.NMajor)
+        PackedMatMulRhsLayout rhsLayout = PackedMatMulRhsLayout.NMajor,
+        global::Nncase.IR.Math.MatMulQuantizationMode quantizationMode =
+            global::Nncase.IR.Math.MatMulQuantizationMode.None,
+        long weightBlockN = 0,
+        long weightBlockK = 0)
     {
         return new Call(
-            new PackedMatMulGlu(gluType, outDataType ?? DataTypes.Float32, rhsLayout),
+            new PackedMatMulGlu(
+                gluType,
+                outDataType ?? DataTypes.Float32,
+                rhsLayout,
+                quantizationMode,
+                weightBlockN,
+                weightBlockK),
             input,
             gateWeight,
             upWeight,

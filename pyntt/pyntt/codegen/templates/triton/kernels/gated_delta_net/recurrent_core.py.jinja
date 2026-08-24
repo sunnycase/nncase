@@ -1,0 +1,145 @@
+{% import "triton/kernels/_common.py.jinja" as common with context %}
+{% import "triton/kernels/_producer_consumer.py.jinja" as phases with context %}
+{% set repeats = model["NumValueHeads"] // model["NumKeyHeads"] %}
+{% macro state_axis_offset(coordinate, axis) -%}
+{% if axis["LaneCount"] == 1 -%}
+({{ coordinate }}) * {{ axis["BlockStride"] }}
+{%- else -%}
+(({{ coordinate }}) // {{ axis["LaneCount"] }}) * {{ axis["BlockStride"] }} + (({{ coordinate }}) % {{ axis["LaneCount"] }}) * {{ axis["LaneStride"] }}
+{%- endif %}
+{%- endmacro %}
+# generated from PyNTT algorithm triton.gated_delta_net/recurrent_core
+# {{ model["Comment"] }}; key_heads={{ model["NumKeyHeads"] }}, value_heads={{ model["NumValueHeads"] }}, key_dim={{ model["KeyHeadDim"] }}, value_dim={{ model["ValueHeadDim"] }}, local_value_head_capacity={{ model["LocalValueHeadCapacity"] }}
+@triton.jit
+def {{ model["FunctionName"] }}__consumer({{ helper_parameters(model) }}):
+{{ common.mesh_coordinates(model["MeshAxes"]) }}
+    recurrent_state = {{ ptr(model, "RecurrentState") }}
+    qkv = {{ ptr(model, "QKV") }}
+    z = {{ ptr(model, "Z") }}
+    b_projection = {{ ptr(model, "BProjection") }}
+    a_projection = {{ ptr(model, "AProjection") }}
+    a_log = {{ ptr(model, "ALog") }}
+    dt_bias = {{ ptr(model, "DtBias") }}
+    norm_weight = {{ ptr(model, "NormWeight") }}
+    gated_output = {{ ptr(model, "GatedOutput") }}
+    active_local_value_heads = {{ model["ActiveLocalValueHeads"] }}
+    key_lane = tl.arange(0, {{ model["KeyBlockSize"] }})
+    value_lane = tl.arange(0, {{ model["ValueBlockSize"] }})
+    key_mask = key_lane < {{ model["KeyHeadDim"] }}
+    value_mask = value_lane < {{ model["ValueHeadDim"] }}
+
+    for local_head in tl.range(0, {{ model["LocalValueHeadCapacity"] }}):
+        local_head_active = local_head < active_local_value_heads
+{% set global_value = pointer_local_to_global_coordinate(model["GatedOutput"], 1, "local_head * " ~ model["ValueHeadDim"]) %}
+        global_value_head = ({{ global_value }}) // {{ model["ValueHeadDim"] }}
+        global_key_head = global_value_head // {{ repeats }}
+        query_channel = global_key_head * {{ model["KeyHeadDim"] }} + key_lane
+        key_channel = (
+            {{ model["NumKeyHeads"] * model["KeyHeadDim"] }}
+            + global_key_head * {{ model["KeyHeadDim"] }}
+            + key_lane
+        )
+        value_channel = (
+            {{ model["NumKeyHeads"] * model["KeyHeadDim"] * 2 }}
+            + global_value_head * {{ model["ValueHeadDim"] }}
+            + value_lane
+        )
+        query = tl.load(
+            {{ access_pointer(model, "QKV", "qkv", contiguous_vector_axis_access(["0", "0"], model["QKVStrides"], packed_axis=1, logical_index="query_channel", lane_count=model["QKVLaneCount"], global_coordinate_axes=[1])) }},
+            mask=key_mask & local_head_active,
+            other=0.0,
+        ).to(tl.float32)
+        key = tl.load(
+            {{ access_pointer(model, "QKV", "qkv", contiguous_vector_axis_access(["0", "0"], model["QKVStrides"], packed_axis=1, logical_index="key_channel", lane_count=model["QKVLaneCount"], global_coordinate_axes=[1])) }},
+            mask=key_mask & local_head_active,
+            other=0.0,
+        ).to(tl.float32)
+        value = tl.load(
+            {{ access_pointer(model, "QKV", "qkv", contiguous_vector_axis_access(["0", "0"], model["QKVStrides"], packed_axis=1, logical_index="value_channel", lane_count=model["QKVLaneCount"], global_coordinate_axes=[1])) }},
+            mask=value_mask & local_head_active,
+            other=0.0,
+        ).to(tl.float32)
+        query *= tl.rsqrt(tl.sum(query * query, axis=0) + 1.0e-6)
+        key *= tl.rsqrt(tl.sum(key * key, axis=0) + 1.0e-6)
+
+        a_bias = tl.load(
+            {{ access_pointer(model, "ALog", "a_log", tensor_access(["local_head"], model["ALogStrides"])) }},
+            mask=local_head_active,
+            other=0.0,
+        ).to(tl.float32)
+        dt_value = tl.load(
+            {{ access_pointer(model, "DtBias", "dt_bias", tensor_access(["local_head"], model["DtBiasStrides"])) }},
+            mask=local_head_active,
+            other=0.0,
+        ).to(tl.float32)
+        a_value = tl.load(
+            {{ access_pointer(model, "AProjection", "a_projection", contiguous_vector_axis_access(["0", "0"], model["AProjectionStrides"], tensor_shape=[1, model["NumValueHeads"] // model["ProjectionLaneCount"]], packed_axis=1, logical_index="global_value_head", lane_count=model["ProjectionLaneCount"])) }},
+            mask=local_head_active,
+            other=0.0,
+        ).to(tl.float32)
+        b_value = tl.load(
+            {{ access_pointer(model, "BProjection", "b_projection", contiguous_vector_axis_access(["0", "0"], model["BProjectionStrides"], tensor_shape=[1, model["NumValueHeads"] // model["ProjectionLaneCount"]], packed_axis=1, logical_index="global_value_head", lane_count=model["ProjectionLaneCount"])) }},
+            mask=local_head_active,
+            other=0.0,
+        ).to(tl.float32)
+        softplus_arg = a_value + dt_value
+        softplus_value = (
+            tl.maximum(softplus_arg, 0.0)
+            + tl.log(1.0 + tl.exp(-tl.abs(softplus_arg)))
+        )
+        decay = tl.exp(-tl.exp(a_bias) * softplus_value)
+        beta = tl.sigmoid(b_value)
+        recurrent_state_head_base = (
+            {{ state_axis_offset(model["LayerId"], model["RecurrentStateLayerAxis"]) }}
+            + {{ state_axis_offset("global_value_head", model["RecurrentStateHeadAxis"]) }}
+        )
+        state_mask = key_mask[:, None] & value_mask[None, :] & local_head_active
+        state = tl.load(
+            recurrent_state
+            + recurrent_state_head_base
+            + {{ state_axis_offset("key_lane[:, None]", model["RecurrentStateKeyAxis"]) }}
+            + {{ state_axis_offset("value_lane[None, :]", model["RecurrentStateValueAxis"]) }},
+            mask=state_mask,
+            other=0.0,
+        ).to(tl.float32) * decay
+        recalled = tl.sum(state * key[:, None], axis=0)
+        delta = (value - recalled) * beta
+        state += key[:, None] * delta[None, :]
+        core = tl.sum(
+            state * (query * {{ pyrepr(1.0 / (model["KeyHeadDim"] ** 0.5)) }})[:, None],
+            axis=0,
+        )
+        tl.store(
+            recurrent_state
+            + recurrent_state_head_base
+            + {{ state_axis_offset("key_lane[:, None]", model["RecurrentStateKeyAxis"]) }}
+            + {{ state_axis_offset("value_lane[None, :]", model["RecurrentStateValueAxis"]) }},
+            state,
+            mask=state_mask,
+        )
+
+        inv_rms = tl.rsqrt(
+            tl.sum(tl.where(value_mask, core * core, 0.0), axis=0)
+            / {{ model["ValueHeadDim"] }}
+            + {{ pyrepr(model["Epsilon"]) }}
+        )
+        local_value_index = local_head * {{ model["ValueHeadDim"] }} + value_lane
+        z_projection = tl.load(
+            {{ access_pointer(model, "Z", "z", contiguous_vector_axis_access(["0", "0"], model["ZStrides"], packed_axis=1, logical_index="local_value_index", lane_count=model["ZLaneCount"])) }},
+            mask=value_mask & local_head_active,
+            other=0.0,
+        ).to(tl.float32)
+        scale = tl.load(
+            {{ access_pointer(model, "NormWeight", "norm_weight", tensor_access(["value_lane"], model["NormWeightStrides"])) }},
+            mask=value_mask & local_head_active,
+            other=0.0,
+        ).to(tl.float32)
+        gated = core * inv_rms * scale * z_projection * tl.sigmoid(z_projection)
+        tl.store(
+            {{ access_pointer(model, "GatedOutput", "gated_output", tensor_access(["0", "local_value_index"], model["GatedOutputStrides"])) }},
+            gated.to({{ model["OutputTritonDType"] }}),
+            mask=value_mask & local_head_active,
+        )
+
+
+{{ phases.dispatch(model) }}

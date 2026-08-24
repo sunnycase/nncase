@@ -644,6 +644,7 @@ def test_pyntt_renderer_maps_staged_block_cyclic_tma_local_coordinates():
         return {"TritonExpression": str(value), "FixedValue": value}
 
     pointer = {
+        "DistributedStorageKind": "CanonicalGlobal",
         "GlobalShape": [fixed(8192)],
         "ShardAxes": [
             {
@@ -694,6 +695,7 @@ def test_pyntt_renderer_maps_staged_block_cyclic_tma_local_coordinates():
         )
 
     packed_pointer = {
+        "DistributedStorageKind": "CanonicalGlobal",
         "GlobalShape": [fixed(256)],
         "ShardAxes": [
             {
@@ -731,6 +733,7 @@ def test_pyntt_renderer_builds_exact_ragged_block_cyclic_descriptor_entries():
         return {"TritonExpression": str(value), "FixedValue": value}
 
     pointer = {
+        "DistributedStorageKind": "CanonicalGlobal",
         "GlobalShape": [fixed(18992)],
         "ShardAxes": [
             {
@@ -771,6 +774,47 @@ def test_pyntt_renderer_builds_exact_ragged_block_cyclic_descriptor_entries():
     assert owner31["base"] == 31
 
 
+def test_pyntt_renderer_builds_tile_sized_descriptor_for_inactive_owner():
+    _add_pyntt_to_path()
+    from pyntt.codegen.render import _tma_descriptor_table_axis_entry
+
+    def fixed(value):
+        return {"TritonExpression": str(value), "FixedValue": value}
+
+    pointer = {
+        "DistributedStorageKind": "CanonicalGlobal",
+        "GlobalShape": [fixed(48)],
+        "ShardAxes": [
+            {
+                "Stages": [
+                    {
+                        "HierarchyAxes": [0, 1],
+                        "Distribution": "Contiguous",
+                        "Granularity": fixed(2),
+                        "BlockSize": 0,
+                    }
+                ]
+            }
+        ],
+        "Hierarchy": [4, 8],
+    }
+
+    active_owner = _tma_descriptor_table_axis_entry(
+        pointer, 0, (2, 7), tile_extent=2, context="GDN value heads"
+    )
+    inactive_owner = _tma_descriptor_table_axis_entry(
+        pointer, 0, (3, 0), tile_extent=2, context="GDN value heads"
+    )
+
+    assert active_owner["active"]
+    assert active_owner["base"] == 46
+    assert active_owner["descriptor_shape"] == (2,)
+    assert not inactive_owner["active"]
+    assert inactive_owner["base"] == 0
+    assert inactive_owner["descriptor_shape"] == (2,)
+    assert inactive_owner["stride_multipliers"] == (1,)
+
+
 def test_pyntt_renderer_canonicalizes_unit_block_cyclic_tma_dimensions():
     _add_pyntt_to_path()
     from pyntt.codegen.render import (
@@ -782,6 +826,7 @@ def test_pyntt_renderer_canonicalizes_unit_block_cyclic_tma_dimensions():
         return {"TritonExpression": str(value), "FixedValue": value}
 
     pointer = {
+        "DistributedStorageKind": "CanonicalGlobal",
         "GlobalShape": [fixed(128), fixed(128)],
         "ShardAxes": [
             {
@@ -825,6 +870,7 @@ def test_pyntt_renderer_canonicalizes_unit_block_cyclic_tma_dimensions():
         block_n=64,
         block_k=256,
         pointer=pointer,
+        expected_vector_lane_shape=(8, 2, 8),
     )
     assert spec["block_shape"] == (16, 1, 8, 2, 64)
     assert len(spec["entries"]) == 32
@@ -843,6 +889,112 @@ def test_pyntt_renderer_canonicalizes_unit_block_cyclic_tma_dimensions():
     )
     assert transfer["block_shape"] == (16,)
     assert len(transfer["coordinates"]) == 1
+
+
+def test_pyntt_renderer_accepts_selected_fp8_packed_gemv_lane_shape():
+    _add_pyntt_to_path()
+    from pyntt.codegen.render import _k_major_gemv_host_descriptor_spec
+
+    def fixed(value):
+        return {"TritonExpression": str(value), "FixedValue": value}
+
+    pointer = {
+        "DistributedStorageKind": "CanonicalGlobal",
+        "GlobalShape": [fixed(128), fixed(128)],
+        "ShardAxes": [{"Stages": []}, {"Stages": []}],
+        "Hierarchy": [4, 8],
+    }
+    backing = {
+        "name": "weight_descriptor",
+        "source": "chip_local_rdata",
+        "offset_bytes": 0,
+        "scalar_dtype": "float8e4m3fn",
+        "logical_shape": [128, 128],
+        "logical_strides": [128, 1],
+        "vector_lane_shape": [8, 2, 16],
+        "contiguous_rebase_extent_elements": 0,
+        "owner_stride_bytes": 0,
+    }
+
+    spec = _k_major_gemv_host_descriptor_spec(
+        {},
+        backing,
+        block_n=64,
+        block_k=256,
+        pointer=pointer,
+        expected_vector_lane_shape=(8, 2, 16),
+    )
+
+    assert spec["dtype"] == "float8e4m3fn"
+    assert spec["block_shape"][-2:] == (2, 128)
+
+
+def test_pyntt_renderer_uses_dense_coordinates_for_compact_local_tma():
+    _add_pyntt_to_path()
+    from pyntt.codegen.render import _k_major_gemv_host_descriptor_spec
+
+    def fixed(value):
+        return {"TritonExpression": str(value), "FixedValue": value}
+
+    pointer = {
+        "DistributedStorageKind": "CompactLocal",
+        "GlobalShape": [fixed(96), fixed(16)],
+        "ShardAxes": [
+            {
+                "Stages": [
+                    {
+                        "HierarchyAxes": [0],
+                        "Distribution": "BlockCyclic",
+                        "Granularity": None,
+                        "BlockSize": 4,
+                    }
+                ]
+            },
+            {
+                "Stages": [
+                    {
+                        "HierarchyAxes": [1],
+                        "Distribution": "BlockCyclic",
+                        "Granularity": None,
+                        "BlockSize": 2,
+                    }
+                ]
+            },
+        ],
+        "Hierarchy": [4, 8],
+    }
+    backing = {
+        "name": "weight_descriptor",
+        "source": "data",
+        "offset_bytes": 0,
+        "scalar_dtype": "bfloat16",
+        "logical_shape": [96, 16],
+        "logical_strides": [2, 1],
+        "vector_lane_shape": [8, 2, 8],
+        "contiguous_rebase_extent_elements": 0,
+        "owner_stride_bytes": 24576,
+    }
+
+    spec = _k_major_gemv_host_descriptor_spec(
+        {},
+        backing,
+        block_n=64,
+        block_k=256,
+        pointer=pointer,
+        expected_vector_lane_shape=(8, 2, 8),
+    )
+
+    assert spec["block_shape"] == (16, 8, 2, 64)
+    assert len(spec["entries"]) == 32
+    assert spec["entries"][0]["shape"] == (24, 2, 2, 64)
+    assert spec["entries"][0]["strides"] == (256, 128, 64, 1)
+    for owner, entry in enumerate(spec["entries"]):
+        span_elements = 1 + sum(
+            (extent - 1) * stride
+            for extent, stride in zip(entry["shape"], entry["strides"])
+        )
+        assert entry["offset_bytes"] == owner * backing["owner_stride_bytes"]
+        assert span_elements * 2 <= backing["owner_stride_bytes"]
 
 
 def test_pyntt_renderer_maps_local_kv_head_to_block_cyclic_global_head():
@@ -899,6 +1051,46 @@ def test_pyntt_renderer_maps_local_kv_head_to_block_cyclic_global_head():
     )
     assert "((1) // 1) * 8" in offset_coordinates[0]
     assert "shard_coord1" in offset_coordinates[0]
+
+
+def test_pyntt_renderer_maps_local_packed_vector_coordinate_to_global_scalar():
+    _add_pyntt_to_path()
+    from pyntt.codegen.render import (
+        _pointer_local_vector_to_global_scalar_coordinate,
+    )
+
+    def fixed(value):
+        return {"TritonExpression": str(value), "FixedValue": value}
+
+    pointer = {
+        "DistributedStorageKind": "CompactLocal",
+        "GlobalShape": [fixed(1), fixed(640)],
+        "GlobalOffsets": [fixed(0), fixed(0)],
+        "ShardAxes": [
+            {"Stages": []},
+            {
+                "Stages": [
+                    {
+                        "HierarchyAxes": [0, 1],
+                        "Distribution": "BlockCyclic",
+                        "Granularity": None,
+                        "BlockSize": 1,
+                    }
+                ]
+            },
+        ],
+        "Hierarchy": [4, 8],
+    }
+
+    coordinate = _pointer_local_vector_to_global_scalar_coordinate(
+        pointer, 1, "local_n", 8
+    )
+
+    assert "((local_n) // 8)" in coordinate
+    assert "shard_coord0 * 8 + shard_coord1" in coordinate
+    assert "* 32" in coordinate
+    assert "* 8" in coordinate
+    assert "((local_n) % 8)" in coordinate
 
 
 def test_pyntt_renderer_composes_bounded_block_cyclic_coordinates():

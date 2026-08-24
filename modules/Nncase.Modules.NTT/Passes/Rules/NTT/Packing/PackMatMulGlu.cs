@@ -4,6 +4,7 @@
 using System;
 using System.Linq;
 using Nncase.IR;
+using Nncase.IR.Math;
 using Nncase.IR.NN;
 using Nncase.PatternMatch;
 using Nncase.Utilities;
@@ -64,6 +65,11 @@ public sealed partial class PackMatMulGluByN : RewriteRule<Pattern>
             return null;
         }
 
+        if (matmulGlu.QuantizationMode != MatMulQuantizationMode.None)
+        {
+            return null;
+        }
+
         var laneCount = GetLaneCount(gateWeight);
         if (laneCount <= 0 ||
             laneCount != GetLaneCount(upWeight) ||
@@ -87,7 +93,10 @@ public sealed partial class PackMatMulGluByN : RewriteRule<Pattern>
             None.Default,
             None.Default,
             matmulGlu.GluType,
-            matmulGlu.OutputDataType);
+            matmulGlu.OutputDataType,
+            quantizationMode: matmulGlu.QuantizationMode,
+            weightBlockN: matmulGlu.WeightBlockN,
+            weightBlockK: matmulGlu.WeightBlockK);
 
         return UnpackOutput(packed, rank, laneCount);
     }
@@ -210,23 +219,44 @@ public sealed partial class PackMatMulGluRhsKMajor : RewriteRule<Pattern>
         Expr upWeightScale)
     {
         if (input.CheckedDataType is not PrimType inputType ||
-            inputType == DataTypes.Float8E4M3 ||
-            inputType == DataTypes.Float8E5M2 ||
-            !IsNone(gateInputScale) ||
-            !IsNone(upInputScale) ||
-            !IsNone(gateWeightScale) ||
-            !IsNone(upWeightScale) ||
-            _vectorBytes % inputType.SizeInBytes != 0)
+            matmulGlu.OutputDataType is not PrimType outputType ||
+            _vectorBytes % outputType.SizeInBytes != 0)
         {
             return null;
         }
 
-        var vectorLanes = _vectorBytes / inputType.SizeInBytes;
-        if (vectorLanes <= 0 ||
-            !TryPackWeight(gateWeight, inputType, vectorLanes, out var packedGateWeight) ||
-            !TryPackWeight(upWeight, inputType, vectorLanes, out var packedUpWeight) ||
-            !TryPackBias(gateBias, inputType, vectorLanes, out var packedGateBias) ||
-            !TryPackBias(upBias, inputType, vectorLanes, out var packedUpBias))
+        var hasInputScales = !IsNone(gateInputScale) && !IsNone(upInputScale);
+        var hasWeightScales = !IsNone(gateWeightScale) && !IsNone(upWeightScale);
+        var scaleContractValid = matmulGlu.QuantizationMode switch
+        {
+            MatMulQuantizationMode.None => !hasInputScales && !hasWeightScales,
+            MatMulQuantizationMode.StaticTensor => hasInputScales && hasWeightScales,
+            MatMulQuantizationMode.DynamicBlock => !hasInputScales && hasWeightScales,
+            _ => false,
+        };
+        if (!scaleContractValid)
+        {
+            return null;
+        }
+
+        var weightType = gateWeight.CheckedDataType as PrimType;
+        if (weightType is null ||
+            weightType != upWeight.CheckedDataType ||
+            (matmulGlu.QuantizationMode != MatMulQuantizationMode.None
+                ? weightType != DataTypes.Float8E4M3
+                : weightType != inputType) ||
+            _vectorBytes % weightType.SizeInBytes != 0)
+        {
+            return null;
+        }
+
+        var nVectorLanes = _vectorBytes / outputType.SizeInBytes;
+        var kVectorLanes = _vectorBytes / weightType.SizeInBytes;
+        if (nVectorLanes <= 0 || kVectorLanes <= 0 ||
+            !TryPackWeight(gateWeight, weightType, nVectorLanes, kVectorLanes, out var packedGateWeight) ||
+            !TryPackWeight(upWeight, weightType, nVectorLanes, kVectorLanes, out var packedUpWeight) ||
+            !TryPackBias(gateBias, outputType, nVectorLanes, out var packedGateBias) ||
+            !TryPackBias(upBias, outputType, nVectorLanes, out var packedUpBias))
         {
             return null;
         }
@@ -238,31 +268,35 @@ public sealed partial class PackMatMulGluRhsKMajor : RewriteRule<Pattern>
             packedUpWeight,
             packedGateBias,
             packedUpBias,
-            None.Default,
-            None.Default,
-            None.Default,
-            None.Default,
+            gateInputScale,
+            upInputScale,
+            gateWeightScale,
+            upWeightScale,
             matmulGlu.GluType,
             matmulGlu.OutputDataType,
-            rhsLayout: IR.NTT.PackedMatMulRhsLayout.KMajor);
+            rhsLayout: IR.NTT.PackedMatMulRhsLayout.KMajor,
+            quantizationMode: matmulGlu.QuantizationMode,
+            weightBlockN: matmulGlu.WeightBlockN,
+            weightBlockK: matmulGlu.WeightBlockK);
 
-        return IR.F.Tensors.Unpack(packed, [vectorLanes], [rank - 1]);
+        return IR.F.Tensors.Unpack(packed, [nVectorLanes], [rank - 1]);
     }
 
     private static bool IsNone(Expr expr) => expr is None;
 
     private bool TryPackWeight(
         Expr weight,
-        PrimType inputType,
-        int vectorLanes,
+        PrimType weightType,
+        int nVectorLanes,
+        int kVectorLanes,
         out Expr packedWeight)
     {
         packedWeight = weight;
-        if (weight.CheckedDataType != inputType ||
+        if (weight.CheckedDataType != weightType ||
             weight.CheckedShape.IsUnranked ||
             weight.CheckedShape.Rank < 2 ||
-            !Dimension.TryDivExactly(weight.CheckedShape[^2], checked(_kPack * vectorLanes), out _) ||
-            !Dimension.TryDivExactly(weight.CheckedShape[^1], vectorLanes, out _))
+            !Dimension.TryDivExactly(weight.CheckedShape[^2], checked(_kPack * kVectorLanes), out _) ||
+            !Dimension.TryDivExactly(weight.CheckedShape[^1], nVectorLanes, out _))
         {
             return false;
         }
@@ -275,16 +309,16 @@ public sealed partial class PackMatMulGluRhsKMajor : RewriteRule<Pattern>
         // -> [N/NVector,K/(KPack*KVector)]<NVector,KPack,KVector>
         // -> [K/(KPack*KVector),N/NVector]<NVector,KPack,KVector>.
         packedWeight = IR.F.Tensors.Transpose(weight, permutation);
-        packedWeight = IR.F.Tensors.Pack(packedWeight, [vectorLanes], [rank - 1]);
+        packedWeight = IR.F.Tensors.Pack(packedWeight, [kVectorLanes], [rank - 1]);
         packedWeight = IR.F.Tensors.Pack(packedWeight, [_kPack], [rank - 1]);
-        packedWeight = IR.F.Tensors.Pack(packedWeight, [vectorLanes], [rank - 2]);
+        packedWeight = IR.F.Tensors.Pack(packedWeight, [nVectorLanes], [rank - 2]);
         packedWeight = IR.F.Tensors.Transpose(packedWeight, permutation);
         return packedWeight.CheckedType is not InvalidType;
     }
 
     private static bool TryPackBias(
         Expr bias,
-        PrimType inputType,
+        PrimType outputType,
         int vectorLanes,
         out Expr packedBias)
     {
@@ -294,7 +328,7 @@ public sealed partial class PackMatMulGluRhsKMajor : RewriteRule<Pattern>
             return true;
         }
 
-        if (bias.CheckedDataType != inputType ||
+        if (bias.CheckedDataType != outputType ||
             bias.CheckedShape.IsUnranked ||
             bias.CheckedShape.Rank != 1 ||
             !Dimension.TryDivExactly(bias.CheckedShape[0], vectorLanes, out _))

@@ -36,7 +36,14 @@ public static class NN
         long keyHeadDim,
         long valueHeadDim,
         long convKernelSize,
-        float epsilon) =>
+        float epsilon,
+        Expr? qkvWeightScale = null,
+        Expr? zWeightScale = null,
+        Expr? outputWeightScale = null,
+        global::Nncase.IR.Math.MatMulQuantizationMode quantizationMode =
+            global::Nncase.IR.Math.MatMulQuantizationMode.None,
+        long weightBlockN = 0,
+        long weightBlockK = 0) =>
         new(
             new GatedDeltaNet(
                 numKeyHeads,
@@ -44,11 +51,16 @@ public static class NN
                 keyHeadDim,
                 valueHeadDim,
                 convKernelSize,
-                epsilon),
+                epsilon,
+                quantizationMode,
+                weightBlockN,
+                weightBlockK),
             input,
             state,
             qkvWeight,
+            qkvWeightScale ?? None.Default,
             zWeight,
+            zWeightScale ?? None.Default,
             bWeight,
             aWeight,
             convWeight,
@@ -56,30 +68,28 @@ public static class NN
             dtBias,
             normWeight,
             outputWeight,
+            outputWeightScale ?? None.Default,
             layerId);
 
-    public static Call GatedDeltaNetProjection(
-        Expr input,
+    public static Call GatedDeltaNetConvolution(
+        Expr qkv,
         Expr state,
-        Expr qkvWeight,
         Expr convWeight,
         Dimension layerId,
         long convKernelSize) =>
         new(
-            new GatedDeltaNetProjection(convKernelSize),
-            input,
+            new GatedDeltaNetConvolution(convKernelSize),
+            qkv,
             state,
-            qkvWeight,
             convWeight,
             layerId);
 
     public static Call GatedDeltaNetRecurrentCore(
-        Expr input,
         Expr state,
         Expr qkv,
-        Expr zWeight,
-        Expr bWeight,
-        Expr aWeight,
+        Expr z,
+        Expr bProjection,
+        Expr aProjection,
         Expr aLog,
         Expr dtBias,
         Expr normWeight,
@@ -96,12 +106,11 @@ public static class NN
                 keyHeadDim,
                 valueHeadDim,
                 epsilon),
-            input,
             state,
             qkv,
-            zWeight,
-            bWeight,
-            aWeight,
+            z,
+            bProjection,
+            aProjection,
             aLog,
             dtBias,
             normWeight,
@@ -248,9 +257,18 @@ public static class NN
         Expr gateWeightScale,
         Expr upWeightScale,
         GluType gluType,
-        DataType outputDataType) =>
+        DataType outputDataType,
+        global::Nncase.IR.Math.MatMulQuantizationMode quantizationMode =
+            global::Nncase.IR.Math.MatMulQuantizationMode.None,
+        long weightBlockN = 0,
+        long weightBlockK = 0) =>
         new Call(
-            new MatMulGlu(gluType, outputDataType),
+            new MatMulGlu(
+                gluType,
+                outputDataType,
+                quantizationMode,
+                weightBlockN,
+                weightBlockK),
             input,
             gateWeight,
             upWeight,

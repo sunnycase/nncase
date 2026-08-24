@@ -4,7 +4,9 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using Nncase.Evaluator.Math;
 using Nncase.IR;
+using Nncase.IR.Math;
 using Nncase.IR.NN;
 using OrtKISharp;
 
@@ -35,15 +37,18 @@ public sealed class GatedDeltaNetEvaluator :
         var layerId = checked((int)context.GetArgumentValue(target, GatedDeltaNet.LayerId).AsTensor().ToScalar<long>());
         var convState = state.GetState(GatedDeltaNetStateKind.Convolution, layerId).ToOrtTensor();
         var recurrentState = state.GetState(GatedDeltaNetStateKind.Recurrent, layerId).ToOrtTensor();
-        var qkvWeight = context.GetArgumentValueAsTensor(target, GatedDeltaNet.QKVWeight).ToOrtTensor();
-        var zWeight = context.GetArgumentValueAsTensor(target, GatedDeltaNet.ZWeight).ToOrtTensor();
+        var qkvWeight = context.GetArgumentValueAsTensor(target, GatedDeltaNet.QKVWeight);
+        var zWeight = context.GetArgumentValueAsTensor(target, GatedDeltaNet.ZWeight);
         var bWeight = context.GetArgumentValueAsTensor(target, GatedDeltaNet.BWeight).ToOrtTensor();
         var aWeight = context.GetArgumentValueAsTensor(target, GatedDeltaNet.AWeight).ToOrtTensor();
         var convWeight = context.GetArgumentValueAsTensor(target, GatedDeltaNet.ConvWeight).ToOrtTensor();
         var aLog = context.GetArgumentValueAsTensor(target, GatedDeltaNet.ALog).ToOrtTensor().Cast(OrtDataType.Float);
         var dtBias = context.GetArgumentValueAsTensor(target, GatedDeltaNet.DtBias).ToOrtTensor().Cast(OrtDataType.Float);
         var normWeight = context.GetArgumentValueAsTensor(target, GatedDeltaNet.NormWeight).ToOrtTensor().Cast(OrtDataType.Float);
-        var outputWeight = context.GetArgumentValueAsTensor(target, GatedDeltaNet.OutputWeight).ToOrtTensor();
+        var outputWeight = context.GetArgumentValueAsTensor(target, GatedDeltaNet.OutputWeight);
+        var qkvWeightScale = GetWeightScale(context, target, GatedDeltaNet.QKVWeightScale);
+        var zWeightScale = GetWeightScale(context, target, GatedDeltaNet.ZWeightScale);
+        var outputWeightScale = GetWeightScale(context, target, GatedDeltaNet.OutputWeightScale);
 
         var keyDim = checked(target.NumKeyHeads * target.KeyHeadDim);
         var valueDim = checked(target.NumValueHeads * target.ValueHeadDim);
@@ -53,8 +58,23 @@ public sealed class GatedDeltaNetEvaluator :
         for (var token = 0L; token < input.Shape[0]; token++)
         {
             var hidden = OrtKI.Slice(input, new[] { token }, new[] { token + 1 }, new[] { 0L }, new[] { 1L });
-            var mixedQkv = OrtKI.MatMul(hidden, qkvWeight);
-            var z = OrtKI.MatMul(hidden, zWeight);
+            var hiddenValue = hidden.ToTensor().CastElementTo(inputType);
+            var mixedQkv = EvaluateProjection(
+                hiddenValue,
+                qkvWeight,
+                qkvWeightScale,
+                inputType,
+                target.QuantizationMode,
+                target.WeightBlockN,
+                target.WeightBlockK);
+            var z = EvaluateProjection(
+                hiddenValue,
+                zWeight,
+                zWeightScale,
+                inputType,
+                target.QuantizationMode,
+                target.WeightBlockN,
+                target.WeightBlockK);
             var beta = OrtKI.Sigmoid(OrtKI.MatMul(hidden, bWeight));
             var a = OrtKI.MatMul(hidden, aWeight);
 
@@ -119,7 +139,14 @@ public sealed class GatedDeltaNetEvaluator :
                 normalized.Cast(input.DataType),
                 Shape(1L, valueDim),
                 0L);
-            outputs.Add(OrtKI.MatMul(projectedInput, outputWeight));
+            outputs.Add(EvaluateProjection(
+                projectedInput.ToTensor().CastElementTo(inputType),
+                outputWeight,
+                outputWeightScale,
+                inputType,
+                target.QuantizationMode,
+                target.WeightBlockN,
+                target.WeightBlockK));
         }
 
         var output = OrtKI.Concat(outputs.ToArray(), 0L).ToTensor().CastElementTo(inputType);
@@ -144,9 +171,12 @@ public sealed class GatedDeltaNetEvaluator :
             return new InvalidType($"GatedDeltaNet expects {target.Parameters.Count} inputs, got {arguments.Count}.");
         }
 
-        if (arguments.OfType<InvalidType>().FirstOrDefault() is { } invalid)
+        if (arguments
+            .Select((type, index) => (type, index))
+            .FirstOrDefault(item => item.type is InvalidType) is { type: InvalidType invalid, index: var invalidIndex })
         {
-            return invalid;
+            return new InvalidType(
+                $"GatedDeltaNet argument {target.Parameters[invalidIndex].Name} is invalid: {invalid.Reason}");
         }
 
         if (arguments.Any(type => type is AnyType))
@@ -204,15 +234,15 @@ public sealed class GatedDeltaNetEvaluator :
 
         var checks = new (ParameterInfo Parameter, long[] Shape, DataType? DType)[]
         {
-            (GatedDeltaNet.QKVWeight, [hidden.FixedValue, convDim], input.DType),
-            (GatedDeltaNet.ZWeight, [hidden.FixedValue, valueDim], input.DType),
+            (GatedDeltaNet.QKVWeight, [hidden.FixedValue, convDim], null),
+            (GatedDeltaNet.ZWeight, [hidden.FixedValue, valueDim], null),
             (GatedDeltaNet.BWeight, [hidden.FixedValue, target.NumValueHeads], input.DType),
             (GatedDeltaNet.AWeight, [hidden.FixedValue, target.NumValueHeads], input.DType),
             (GatedDeltaNet.ConvWeight, [convDim, target.ConvKernelSize], input.DType),
             (GatedDeltaNet.ALog, [target.NumValueHeads], null),
             (GatedDeltaNet.DtBias, [target.NumValueHeads], null),
             (GatedDeltaNet.NormWeight, [target.ValueHeadDim], null),
-            (GatedDeltaNet.OutputWeight, [valueDim, hidden.FixedValue], input.DType),
+            (GatedDeltaNet.OutputWeight, [valueDim, hidden.FixedValue], null),
         };
         foreach (var (parameter, expectedShape, expectedDType) in checks)
         {
@@ -237,6 +267,30 @@ public sealed class GatedDeltaNetEvaluator :
             if (expectedDType is not null && type.DType != expectedDType)
             {
                 return new InvalidType($"GatedDeltaNet {parameter.Name} must have dtype {expectedDType}, got {type.DType}.");
+            }
+        }
+
+        var outputInput = new TensorType(
+            input.DType,
+            new RankedShape(inputShape[0], valueDim));
+        foreach (var (projectionInput, weight, scale, name) in new[]
+        {
+            (input, GatedDeltaNet.QKVWeight, GatedDeltaNet.QKVWeightScale, "QKV"),
+            (input, GatedDeltaNet.ZWeight, GatedDeltaNet.ZWeightScale, "Z"),
+            (outputInput, GatedDeltaNet.OutputWeight, GatedDeltaNet.OutputWeightScale, "output"),
+        })
+        {
+            if (ValidateProjectionType(
+                    projectionInput,
+                    arguments[weight.Index],
+                    arguments[scale.Index],
+                    input.DType,
+                    target.QuantizationMode,
+                    target.WeightBlockN,
+                    target.WeightBlockK,
+                    name) is { } error)
+            {
+                return error;
             }
         }
 
@@ -296,6 +350,85 @@ public sealed class GatedDeltaNetEvaluator :
         error = string.Empty;
         return true;
     }
+
+    internal static InvalidType? ValidateProjectionType(
+        TensorType input,
+        IRType weight,
+        IRType weightScale,
+        DataType outputDataType,
+        MatMulQuantizationMode quantizationMode,
+        long weightBlockN,
+        long weightBlockK,
+        string name)
+    {
+        switch (quantizationMode)
+        {
+            case MatMulQuantizationMode.None:
+                if (weightScale is not NoneType)
+                {
+                    return new InvalidType($"GatedDeltaNet {name} projection does not accept a scale in unquantized mode.");
+                }
+
+                if (weight is not TensorType weightTensor || weightTensor.DType != input.DType)
+                {
+                    return new InvalidType(
+                        $"GatedDeltaNet {name} projection weight must use {input.DType} in unquantized mode, got {weight}.");
+                }
+
+                var unquantized = MatMulEvaluator.VisitTensorType(
+                    input,
+                    weightTensor,
+                    NoneType.Default,
+                    outputDataType: outputDataType);
+                return unquantized as InvalidType;
+            case MatMulQuantizationMode.DynamicBlock:
+                var inferred = BlockScaledMatMulEvaluator.InferType(
+                    new BlockScaledMatMul(outputDataType, weightBlockN, weightBlockK),
+                    input,
+                    weight,
+                    weightScale);
+                return inferred is InvalidType invalid
+                    ? new InvalidType($"GatedDeltaNet {name} projection is invalid: {invalid.Reason}")
+                    : null;
+            default:
+                return new InvalidType(
+                    $"GatedDeltaNet {name} projection does not support quantization mode {quantizationMode}.");
+        }
+    }
+
+    internal static OrtKISharp.Tensor EvaluateProjection(
+        Tensor input,
+        Tensor weight,
+        Tensor? weightScale,
+        DataType outputDataType,
+        MatMulQuantizationMode quantizationMode,
+        long weightBlockN,
+        long weightBlockK) => quantizationMode switch
+        {
+            MatMulQuantizationMode.None when weightScale is null =>
+                OrtKI.MatMul(input.ToOrtTensor(), weight.ToOrtTensor()),
+            MatMulQuantizationMode.DynamicBlock when weightScale is not null =>
+                BlockScaledMatMulEvaluator.Evaluate(
+                    input,
+                    weight,
+                    weightScale,
+                    outputDataType,
+                    weightBlockN,
+                    weightBlockK).AsTensor().ToOrtTensor(),
+            _ => throw new InvalidOperationException(
+                $"GatedDeltaNet projection scale does not match quantization mode {quantizationMode}."),
+        };
+
+    private static Tensor? GetWeightScale(
+        IEvaluateContext context,
+        GatedDeltaNet target,
+        ParameterInfo parameter) => target.QuantizationMode switch
+        {
+            MatMulQuantizationMode.None => null,
+            MatMulQuantizationMode.DynamicBlock => context.GetArgumentValueAsTensor(target, parameter),
+            _ => throw new NotSupportedException(
+                $"GatedDeltaNet does not support quantization mode {target.QuantizationMode}."),
+        };
 
     private static OrtKISharp.Tensor Shape(params long[] dimensions) => OrtKISharp.Tensor.MakeTensor(dimensions);
 

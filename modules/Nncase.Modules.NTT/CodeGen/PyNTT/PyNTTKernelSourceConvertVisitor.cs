@@ -1532,6 +1532,18 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 case Nncase.TIR.NTT.PackedMatMul packedMatmul:
                     VisitPackedMatmul(packedMatmul, args, RequireMicroKernel(microKernel, packedMatmul));
                     break;
+                case Nncase.TIR.NTT.PackedScaledMatMul packedScaledMatmul:
+                    VisitPackedScaledMatmul(
+                        packedScaledMatmul,
+                        args,
+                        RequireMicroKernel(microKernel, packedScaledMatmul));
+                    break;
+                case Nncase.TIR.NTT.PackedBlockScaledMatMul packedBlockScaledMatmul:
+                    VisitPackedBlockScaledMatmul(
+                        packedBlockScaledMatmul,
+                        args,
+                        RequireMicroKernel(microKernel, packedBlockScaledMatmul));
+                    break;
                 case Nncase.TIR.NTT.PackedMatMulNormStats packedMatmulNormStats:
                     VisitPackedMatmulNormStats(
                         packedMatmulNormStats,
@@ -1578,11 +1590,11 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 case Nncase.TIR.NTT.QKVRoPEWithCache qkvRoPEWithCache:
                     VisitQKVRoPEWithCache(qkvRoPEWithCache, args);
                     break;
-                case Nncase.TIR.NTT.GatedDeltaNetProjection gatedDeltaNetProjection:
-                    VisitGatedDeltaNetProjection(
-                        gatedDeltaNetProjection,
+                case Nncase.TIR.NTT.GatedDeltaNetConvolution gatedDeltaNetConvolution:
+                    VisitGatedDeltaNetConvolution(
+                        gatedDeltaNetConvolution,
                         args,
-                        RequireMicroKernel(microKernel, gatedDeltaNetProjection));
+                        RequireMicroKernel(microKernel, gatedDeltaNetConvolution));
                     break;
                 case Nncase.TIR.NTT.GatedDeltaNetRecurrentCore gatedDeltaNetRecurrent:
                     VisitGatedDeltaNetRecurrentCore(
@@ -4820,11 +4832,48 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             PyNTTMicroKernelTemplateModel microKernel,
             TIR.Buffer? stats = null,
             int normAxis = -1,
-            bool useMean = false)
+            bool useMean = false,
+            TIR.Buffer? lhsScale = null,
+            TIR.Buffer? rhsScale = null,
+            long weightBlockN = 0,
+            long weightBlockK = 0)
         {
             if (matmul.FusedReduce)
             {
                 throw new NotSupportedException("PyNTT PackedMatMul codegen does not support fused reduce yet.");
+            }
+
+            var hasTensorScales = lhsScale is not null && rhsScale is not null;
+            var hasBlockScale = lhsScale is null && rhsScale is not null;
+            if (lhsScale is not null && rhsScale is null)
+            {
+                throw new NotSupportedException(
+                    "PyNTT PackedMatMul cannot have an lhs scale without an rhs scale.");
+            }
+
+            if (hasTensorScales)
+            {
+                ValidateOperandScaleBuffer("PyNTT PackedMatMul lhs", lhsScale!);
+                ValidateOperandScaleBuffer("PyNTT PackedMatMul rhs", rhsScale!);
+                if (weightBlockN != 0 || weightBlockK != 0)
+                {
+                    throw new NotSupportedException(
+                        "PyNTT tensor-scaled PackedMatMul cannot declare weight block dimensions.");
+                }
+            }
+            else if (hasBlockScale)
+            {
+                if (weightBlockN <= 0 || weightBlockK <= 0 ||
+                    GetBufferActiveShape(rhsScale!).Length != 2)
+                {
+                    throw new NotSupportedException(
+                        "PyNTT block-scaled PackedMatMul requires a rank-2 rhs scale and positive block dimensions.");
+                }
+            }
+            else if (weightBlockN != 0 || weightBlockK != 0)
+            {
+                throw new NotSupportedException(
+                    "PyNTT PackedMatMul weight block dimensions require an rhs block scale.");
             }
 
             if (args.Count < 6 ||
@@ -4833,6 +4882,26 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 args[2] is not TIR.Buffer output)
             {
                 throw new NotSupportedException("PyNTT PackedMatMul codegen expects lhs, rhs, and output TIR buffers.");
+            }
+
+            var lhsScalarType = GetScalarDataType(lhs.ElemType);
+            var rhsScalarType = GetScalarDataType(rhs.ElemType);
+            var outputScalarType = GetScalarDataType(output.ElemType);
+            if (!hasTensorScales && !hasBlockScale)
+            {
+                if (lhsScalarType != rhsScalarType)
+                {
+                    throw new NotSupportedException(
+                        $"PyNTT PackedMatMul expects unscaled lhs/rhs scalar dtypes to match, got {lhsScalarType}/{rhsScalarType}.");
+                }
+            }
+            else if (lhsScalarType != DataTypes.BFloat16 ||
+                     rhsScalarType != DataTypes.Float8E4M3 ||
+                     outputScalarType != DataTypes.BFloat16)
+            {
+                throw new NotSupportedException(
+                    "PyNTT scaled PackedMatMul currently requires BF16 input/output and E4M3 weights, " +
+                    $"got {lhsScalarType}/{rhsScalarType}/{outputScalarType}.");
             }
 
             var loadCExpression = GetScalarBoolExpression(args[3], "PyNTT PackedMatMul loadC");
@@ -4966,7 +5035,9 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             ValidateBroadcastable("PyNTT PackedMatMul rhs batch", rhsShape[..^2], outputShape[..^2]);
             _ = Nncase.IR.NTT.VectorizedMatMul.GetDimInfo(false, transposeB, lhsShape.Length, rhsShape.Length);
             var scale = GetScalarFloat(args[4], "PyNTT PackedMatMul scale", 1.0f);
-            _attrs["op"] = stats is null ? "packed_matmul" : "packed_matmul_norm_stats";
+            _attrs["op"] = hasBlockScale
+                ? "packed_block_scaled_matmul"
+                : stats is null ? "packed_matmul" : "packed_matmul_norm_stats";
             _attrs["dtype"] = GetPyNTTScalarDTypeName(output.ElemType);
             _attrs["shape"] = outputShape;
             _attrs["rhs_layout"] = rhsLayout;
@@ -4984,12 +5055,16 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             }
 
             var helperName = GetNextHelperName(
-                stats is null
+                hasBlockScale
+                    ? "block_fp8_gemv_compute"
+                    : stats is null
                     ? (useGemv ? "gemv_compute" : "matmul_compute")
                     : (useGemv ? "gemv_norm_stats_compute" : "matmul_norm_stats_compute"));
             var usesHostRhsDescriptor =
                 microKernel.Family == "triton.matmul" &&
-                microKernel.Variant == "simt_fma_smem_pipeline";
+                microKernel.Variant is "simt_fma_smem_pipeline" or
+                    "simt_fp8_fma_smem_pipeline" or
+                    "simt_block_fp8_fma_smem_pipeline";
             var rhsDescriptor = usesHostRhsDescriptor
                 ? RegisterHostTensorDescriptor(rhs, $"{helperName}__rhs_descriptor")
                 : null;
@@ -5019,6 +5094,8 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 microKernel,
                 $"{lhs.Name}, {rhs.Name} -> {output.Name}")
             {
+                LhsGlobalOffsets = GetBufferGlobalOffsets(lhs),
+                OutputGlobalOffsets = GetBufferGlobalOffsets(output),
                 RhsGlobalOffsets = GetBufferGlobalOffsets(rhs),
                 RhsDescriptorName = rhsDescriptor?.Name,
                 RhsDescriptorOriginElements = rhsDescriptor?.OriginElements ?? "0",
@@ -5027,6 +5104,16 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 RhsLayout = rhsLayout,
                 RhsKPackLaneCount = kPackedLaneCount,
                 RhsKVectorLaneCount = kVectorLaneCount,
+                LhsScale = lhsScale is null ? null : GetBufferScalarPointer(lhsScale),
+                RhsScale = rhsScale is null ? null : GetBufferScalarPointer(rhsScale),
+                RhsScaleShape = rhsScale is null
+                    ? Array.Empty<PyNTTDimExpression>()
+                    : GetBufferActiveShape(rhsScale),
+                RhsScaleStrides = rhsScale is null
+                    ? Array.Empty<PyNTTDimExpression>()
+                    : GetBufferStrides(rhsScale),
+                WeightBlockN = weightBlockN,
+                WeightBlockK = weightBlockK,
                 LoadCExpression = loadCExpression,
                 Addend = addend is null ? null : GetBufferScalarPointer(addend),
                 AddendShape = addendShape,
@@ -5048,6 +5135,70 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 microKernel,
                 templateModel,
                 helperName);
+        }
+
+        private void VisitPackedScaledMatmul(
+            Nncase.TIR.NTT.PackedScaledMatMul matmul,
+            IReadOnlyList<BaseExpr> args,
+            PyNTTMicroKernelTemplateModel microKernel)
+        {
+            if (args.Count != 5 ||
+                args[0] is not TIR.Buffer lhs ||
+                args[1] is not TIR.Buffer rhs ||
+                args[2] is not TIR.Buffer lhsScale ||
+                args[3] is not TIR.Buffer rhsScale ||
+                args[4] is not TIR.Buffer output)
+            {
+                throw new NotSupportedException(
+                    "PyNTT PackedScaledMatMul codegen expects lhs, rhs, lhs/rhs scale, and output TIR buffers.");
+            }
+
+            VisitPackedMatmul(
+                new Nncase.TIR.NTT.PackedMatMul(false, matmul.RhsLayout),
+                new BaseExpr[]
+                {
+                    lhs,
+                    rhs,
+                    output,
+                    None.Default,
+                    None.Default,
+                    None.Default,
+                },
+                microKernel,
+                lhsScale: lhsScale,
+                rhsScale: rhsScale);
+        }
+
+        private void VisitPackedBlockScaledMatmul(
+            Nncase.TIR.NTT.PackedBlockScaledMatMul matmul,
+            IReadOnlyList<BaseExpr> args,
+            PyNTTMicroKernelTemplateModel microKernel)
+        {
+            if (args.Count != 4 ||
+                args[0] is not TIR.Buffer lhs ||
+                args[1] is not TIR.Buffer rhs ||
+                args[2] is not TIR.Buffer rhsScale ||
+                args[3] is not TIR.Buffer output)
+            {
+                throw new NotSupportedException(
+                    "PyNTT PackedBlockScaledMatMul codegen expects lhs, rhs, rhs scale, and output TIR buffers.");
+            }
+
+            VisitPackedMatmul(
+                new Nncase.TIR.NTT.PackedMatMul(false, matmul.RhsLayout),
+                new BaseExpr[]
+                {
+                    lhs,
+                    rhs,
+                    output,
+                    None.Default,
+                    None.Default,
+                    None.Default,
+                },
+                microKernel,
+                rhsScale: rhsScale,
+                weightBlockN: matmul.WeightBlockN,
+                weightBlockK: matmul.WeightBlockK);
         }
 
         private void VisitPackedMatmulNormStats(
@@ -5445,14 +5596,36 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 _ => throw new NotSupportedException($"PyNTT PackedQKVParallelLinearFusedRhs expects {name} to be a TIR buffer or None, got {args[index].GetType().Name}."),
             };
 
-            if (args.Skip(5).Take(6).Any(arg => arg is not None))
-            {
-                throw new NotSupportedException("PyNTT PackedQKVParallelLinearFusedRhs currently supports only None input/weight scales.");
-            }
-
             var qBias = GetOptionalBuffer(2, "q bias");
             var kBias = GetOptionalBuffer(3, "k bias");
             var vBias = GetOptionalBuffer(4, "v bias");
+            var qInputScale = GetOptionalBuffer(5, "q input scale");
+            var kInputScale = GetOptionalBuffer(6, "k input scale");
+            var vInputScale = GetOptionalBuffer(7, "v input scale");
+            var qWeightScale = GetOptionalBuffer(8, "q weight scale");
+            var kWeightScale = GetOptionalBuffer(9, "k weight scale");
+            var vWeightScale = GetOptionalBuffer(10, "v weight scale");
+            var operandScales = new[]
+            {
+                qInputScale,
+                kInputScale,
+                vInputScale,
+                qWeightScale,
+                kWeightScale,
+                vWeightScale,
+            };
+            var hasOperandScales = operandScales.All(scale => scale is not null);
+            if (!hasOperandScales && operandScales.Any(scale => scale is not null))
+            {
+                throw new NotSupportedException(
+                    "PyNTT PackedQKVParallelLinear requires either all six operand scales or none of them.");
+            }
+
+            foreach (var scale in operandScales.OfType<TIR.Buffer>())
+            {
+                ValidateOperandScaleBuffer("PyNTT PackedQKVParallelLinear", scale);
+            }
+
             SetComputeOp("packed_qkv_parallel_linear");
             var inputShape = GetBufferActiveShape(input);
             var weightShape = GetBufferActiveShape(weight);
@@ -5516,9 +5689,22 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             ValidateBroadcastable("PyNTT PackedQKVParallelLinear input/k output batch", inputShape[..^2], kOutputShape[..^2]);
             ValidateBroadcastable("PyNTT PackedQKVParallelLinear input/v output batch", inputShape[..^2], vOutputShape[..^2]);
 
-            if (input.ElemType != GetScalarDataType(weight.ElemType))
+            var inputScalarType = GetScalarDataType(input.ElemType);
+            var weightScalarType = GetScalarDataType(weight.ElemType);
+            var outputScalarType = GetScalarDataType(qOutput.ElemType);
+            if (!hasOperandScales && inputScalarType != weightScalarType)
             {
                 throw new NotSupportedException($"PyNTT fused packed QKV input/weight dtypes differ: {input.ElemType}/{weight.ElemType}.");
+            }
+
+            if (hasOperandScales &&
+                (inputScalarType != DataTypes.BFloat16 ||
+                 weightScalarType != DataTypes.Float8E4M3 ||
+                 outputScalarType != DataTypes.BFloat16))
+            {
+                throw new NotSupportedException(
+                    "PyNTT scaled packed QKV currently requires BF16 input/output and E4M3 weights, " +
+                    $"got {inputScalarType}/{weightScalarType}/{outputScalarType}.");
             }
 
             if (GetScalarDataType(qOutput.ElemType) != GetScalarDataType(kOutput.ElemType) ||
@@ -5565,6 +5751,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             _attrs["k_lane"] = kVectorLaneCount;
             _attrs["num_heads"] = qkv.NumHeads;
             _attrs["num_kv_heads"] = qkv.NumKvHeads;
+            _attrs["has_operand_scales"] = hasOperandScales;
             var qLogicalOutputShape = qOutputShape.ToArray();
             qLogicalOutputShape[^1] = MultiplyDim(qLogicalOutputShape[^1], nVectorLaneCount);
             var useGemv = IsGemvMatmul(qLogicalOutputShape);
@@ -5576,7 +5763,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             var helperName = GetNextHelperName(useGemv ? "packed_qkv_gemv_compute" : "packed_qkv_matmul_compute");
             var usesHostWeightDescriptors =
                 microKernel.Family == "triton.qkv_parallel_linear" &&
-                microKernel.Variant == "simt_fma_smem_pipeline";
+                microKernel.Variant is "simt_fma_smem_pipeline" or "simt_fp8_fma_smem_pipeline";
             var weightDescriptor = usesHostWeightDescriptors
                 ? RegisterHostTensorDescriptor(weight, $"{helperName}__weight_descriptor")
                 : null;
@@ -5627,6 +5814,12 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 RhsLayout = "k_major",
                 KPackLaneCount = kPackedLaneCount,
                 KVectorLaneCount = kVectorLaneCount,
+                QInputScale = qInputScale is null ? null : GetBufferScalarPointer(qInputScale),
+                KInputScale = kInputScale is null ? null : GetBufferScalarPointer(kInputScale),
+                VInputScale = vInputScale is null ? null : GetBufferScalarPointer(vInputScale),
+                QWeightScale = qWeightScale is null ? null : GetBufferScalarPointer(qWeightScale),
+                KWeightScale = kWeightScale is null ? null : GetBufferScalarPointer(kWeightScale),
+                VWeightScale = vWeightScale is null ? null : GetBufferScalarPointer(vWeightScale),
                 WeightGlobalOffsets = GetBufferGlobalOffsets(weight),
                 WeightDescriptorName = weightDescriptor?.Name,
                 WeightDescriptorOriginElements = weightDescriptor?.OriginElements ?? "0",
@@ -5780,13 +5973,71 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 _ => throw new NotSupportedException($"PyNTT PackedMatMulGlu expects {name} to be a TIR buffer or None, got {args[index].GetType().Name}."),
             };
 
-            if (args.Skip(5).Take(4).Any(arg => arg is not None))
-            {
-                throw new NotSupportedException("PyNTT PackedMatMulGlu codegen currently supports only None input/weight scales.");
-            }
-
             var gateBias = GetOptionalBuffer(3, "gate bias");
             var upBias = GetOptionalBuffer(4, "up bias");
+            var gateInputScale = GetOptionalBuffer(5, "gate input scale");
+            var upInputScale = GetOptionalBuffer(6, "up input scale");
+            var gateWeightScale = GetOptionalBuffer(7, "gate weight scale");
+            var upWeightScale = GetOptionalBuffer(8, "up weight scale");
+            var inputScales = new[]
+            {
+                gateInputScale,
+                upInputScale,
+            };
+            var weightScales = new[]
+            {
+                gateWeightScale,
+                upWeightScale,
+            };
+            var scaleContractValid = matMulGlu.QuantizationMode switch
+            {
+                Nncase.IR.Math.MatMulQuantizationMode.None =>
+                    inputScales.All(scale => scale is null) &&
+                    weightScales.All(scale => scale is null) &&
+                    matMulGlu.WeightBlockN == 0 && matMulGlu.WeightBlockK == 0,
+                Nncase.IR.Math.MatMulQuantizationMode.StaticTensor =>
+                    inputScales.All(scale => scale is not null) &&
+                    weightScales.All(scale => scale is not null) &&
+                    matMulGlu.WeightBlockN == 0 && matMulGlu.WeightBlockK == 0,
+                Nncase.IR.Math.MatMulQuantizationMode.DynamicBlock =>
+                    inputScales.All(scale => scale is null) &&
+                    weightScales.All(scale => scale is not null) &&
+                    matMulGlu.WeightBlockN > 0 && matMulGlu.WeightBlockK > 0,
+                _ => false,
+            };
+            if (!scaleContractValid)
+            {
+                throw new NotSupportedException(
+                    $"PyNTT PackedMatMulGlu scale operands do not match quantization mode " +
+                    $"{matMulGlu.QuantizationMode} and block " +
+                    $"[{matMulGlu.WeightBlockN}, {matMulGlu.WeightBlockK}].");
+            }
+
+            if (matMulGlu.QuantizationMode == Nncase.IR.Math.MatMulQuantizationMode.StaticTensor)
+            {
+                foreach (var scale in inputScales.Concat(weightScales).OfType<TIR.Buffer>())
+                {
+                    ValidateOperandScaleBuffer("PyNTT PackedMatMulGlu", scale);
+                }
+            }
+            else if (matMulGlu.QuantizationMode == Nncase.IR.Math.MatMulQuantizationMode.DynamicBlock)
+            {
+                foreach (var (name, scale) in new[]
+                {
+                    ("gate weight", gateWeightScale!),
+                    ("up weight", upWeightScale!),
+                })
+                {
+                    var scaleShape = GetBufferActiveShape(scale);
+                    ValidateRank($"PyNTT PackedMatMulGlu {name} block scale", scaleShape, 2);
+                    if (!GetScalarDataType(scale.ElemType).IsFloat())
+                    {
+                        throw new NotSupportedException(
+                            $"PyNTT PackedMatMulGlu {name} block scale must be floating, got {scale.ElemType}.");
+                    }
+                }
+            }
+
             SetComputeOp("packed_matmul_glu");
             var inputShape = GetBufferActiveShape(input);
             var gateWeightShape = GetBufferActiveShape(gateWeight);
@@ -5831,10 +6082,26 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             ValidateBroadcastable("PyNTT PackedMatMulGlu gate weight/output batch", gateWeightShape[..^2], outputShape[..^2]);
             ValidateBroadcastable("PyNTT PackedMatMulGlu up weight/output batch", upWeightShape[..^2], outputShape[..^2]);
 
-            if (input.ElemType != GetScalarDataType(gateWeight.ElemType) ||
-                GetScalarDataType(gateWeight.ElemType) != GetScalarDataType(upWeight.ElemType))
+            var inputScalarType = GetScalarDataType(input.ElemType);
+            var gateWeightScalarType = GetScalarDataType(gateWeight.ElemType);
+            var upWeightScalarType = GetScalarDataType(upWeight.ElemType);
+            var outputScalarType = GetScalarDataType(output.ElemType);
+            if (matMulGlu.QuantizationMode == Nncase.IR.Math.MatMulQuantizationMode.None &&
+                (inputScalarType != gateWeightScalarType ||
+                 gateWeightScalarType != upWeightScalarType))
             {
                 throw new NotSupportedException($"PyNTT PackedMatMulGlu expects input and packed gate/up weights to have the same scalar dtype, got input={input.ElemType}, gate={gateWeight.ElemType}, up={upWeight.ElemType}.");
+            }
+
+            if (matMulGlu.QuantizationMode != Nncase.IR.Math.MatMulQuantizationMode.None &&
+                (inputScalarType != DataTypes.BFloat16 ||
+                 gateWeightScalarType != DataTypes.Float8E4M3 ||
+                 upWeightScalarType != DataTypes.Float8E4M3 ||
+                 outputScalarType != DataTypes.BFloat16))
+            {
+                throw new NotSupportedException(
+                    "PyNTT scaled PackedMatMulGlu currently requires BF16 input/output and E4M3 weights, " +
+                    $"got input={inputScalarType}, gate={gateWeightScalarType}, up={upWeightScalarType}, output={outputScalarType}.");
             }
 
             var biasDType = gateBias?.ElemType ?? upBias?.ElemType ?? output.ElemType;
@@ -5867,6 +6134,9 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             _attrs["k_pack_lane"] = kPackedLaneCount;
             _attrs["k_lane"] = kVectorLaneCount;
             _attrs["glu_type"] = GetGluTypeName(matMulGlu.GluType);
+            _attrs["has_operand_scales"] =
+                matMulGlu.QuantizationMode == Nncase.IR.Math.MatMulQuantizationMode.StaticTensor;
+            _attrs["quantization_mode"] = matMulGlu.QuantizationMode.ToString();
             var logicalOutputShape = outputShape.ToArray();
             logicalOutputShape[^1] = MultiplyDim(logicalOutputShape[^1], checked(nPackedLaneCount * nVectorLaneCount));
             var useGemv = IsGemvMatmul(logicalOutputShape);
@@ -5878,7 +6148,9 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             var helperName = GetNextHelperName(useGemv ? "packed_matmul_glu_gemv_compute" : "packed_matmul_glu_matmul_compute");
             var usesHostWeightDescriptors =
                 microKernel.Family == "triton.matmul_glu" &&
-                microKernel.Variant == "simt_fma_smem_pipeline";
+                microKernel.Variant is "simt_fma_smem_pipeline" or
+                    "simt_fp8_fma_smem_pipeline" or
+                    "simt_block_fp8_fma_smem_pipeline";
             var gateWeightDescriptor = usesHostWeightDescriptors
                 ? RegisterHostTensorDescriptor(gateWeight, $"{helperName}__gate_weight_descriptor")
                 : null;
@@ -5925,6 +6197,34 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 RhsLayout = rhsLayout,
                 KPackLaneCount = kPackedLaneCount,
                 KVectorLaneCount = kVectorLaneCount,
+                GateInputScale = gateInputScale is null ? null : GetBufferScalarPointer(gateInputScale),
+                UpInputScale = upInputScale is null ? null : GetBufferScalarPointer(upInputScale),
+                GateWeightScale = gateWeightScale is null ? null : GetBufferScalarPointer(gateWeightScale),
+                UpWeightScale = upWeightScale is null ? null : GetBufferScalarPointer(upWeightScale),
+                QuantizationMode = matMulGlu.QuantizationMode switch
+                {
+                    Nncase.IR.Math.MatMulQuantizationMode.None => "none",
+                    Nncase.IR.Math.MatMulQuantizationMode.StaticTensor => "static_tensor",
+                    Nncase.IR.Math.MatMulQuantizationMode.DynamicBlock => "dynamic_block",
+                    _ => throw new NotSupportedException(
+                        $"Unsupported PackedMatMulGlu quantization mode {matMulGlu.QuantizationMode}."),
+                },
+                WeightBlockN = checked((int)matMulGlu.WeightBlockN),
+                WeightBlockK = checked((int)matMulGlu.WeightBlockK),
+                GateWeightScaleShape = gateWeightScale is null
+                    ? Array.Empty<PyNTTDimExpression>()
+                    : GetBufferActiveShape(gateWeightScale),
+                UpWeightScaleShape = upWeightScale is null
+                    ? Array.Empty<PyNTTDimExpression>()
+                    : GetBufferActiveShape(upWeightScale),
+                GateWeightScaleStrides = gateWeightScale is null
+                    ? Array.Empty<PyNTTDimExpression>()
+                    : GetBufferStrides(gateWeightScale),
+                UpWeightScaleStrides = upWeightScale is null
+                    ? Array.Empty<PyNTTDimExpression>()
+                    : GetBufferStrides(upWeightScale),
+                InputGlobalOffsets = GetBufferGlobalOffsets(input),
+                OutputGlobalOffsets = GetBufferGlobalOffsets(output),
                 GateWeightGlobalOffsets = GetBufferGlobalOffsets(gateWeight),
                 UpWeightGlobalOffsets = GetBufferGlobalOffsets(upWeight),
                 GateWeightDescriptorName = gateWeightDescriptor?.Name,
@@ -6465,20 +6765,23 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             {
                 ("triton.matmul", "simt_fma") => "triton/kernels/matmul/simt_fma.py.jinja",
                 ("triton.matmul", "simt_fma_smem_pipeline") => "triton/kernels/matmul/simt_fma_smem_pipeline.py.jinja",
+                ("triton.matmul", "simt_fp8_fma_smem_pipeline") => "triton/kernels/matmul/simt_fp8_fma_smem_pipeline.py.jinja",
+                ("triton.matmul", "simt_block_fp8_fma_smem_pipeline") => "triton/kernels/matmul/simt_block_fp8_fma_smem_pipeline.py.jinja",
                 ("triton.matmul_sampling_partial", "simt_fma_smem_pipeline") => "triton/kernels/matmul_sampling_partial/simt_fma_smem_pipeline.py.jinja",
                 ("triton.matmul", "mma") => "triton/kernels/matmul/mma.py.jinja",
                 ("triton.qkv_parallel_linear", "simt_fma") => "triton/kernels/qkv_parallel_linear/simt_fma.py.jinja",
                 ("triton.qkv_parallel_linear", "simt_fma_smem_pipeline") => "triton/kernels/qkv_parallel_linear/simt_fma_smem_pipeline.py.jinja",
+                ("triton.qkv_parallel_linear", "simt_fp8_fma_smem_pipeline") => "triton/kernels/qkv_parallel_linear/simt_fp8_fma_smem_pipeline.py.jinja",
                 ("triton.qkv_parallel_linear", "mma") => "triton/kernels/qkv_parallel_linear/mma.py.jinja",
                 ("triton.matmul_glu", "simt_fma") => "triton/kernels/matmul_glu/simt_fma.py.jinja",
                 ("triton.matmul_glu", "simt_fma_smem_pipeline") => "triton/kernels/matmul_glu/simt_fma_smem_pipeline.py.jinja",
+                ("triton.matmul_glu", "simt_fp8_fma_smem_pipeline") => "triton/kernels/matmul_glu/simt_fp8_fma_smem_pipeline.py.jinja",
+                ("triton.matmul_glu", "simt_block_fp8_fma_smem_pipeline") => "triton/kernels/matmul_glu/simt_block_fp8_fma_smem_pipeline.py.jinja",
                 ("triton.matmul_glu", "mma") => "triton/kernels/matmul_glu/mma.py.jinja",
-                ("triton.gated_delta_net", "projection_mma_tma_smem_pipeline") =>
-                    "triton/kernels/gated_delta_net/projection_mma_tma_smem_pipeline.py.jinja",
-                ("triton.gated_delta_net", "recurrent_core_hybrid_tma_smem_pipeline") =>
-                    "triton/kernels/gated_delta_net/recurrent_core_hybrid_tma_smem_pipeline.py.jinja",
-                ("triton.gated_delta_net", "recurrent_core_single_head_register_state_hybrid_tma_smem_pipeline") =>
-                    "triton/kernels/gated_delta_net/recurrent_core_single_head_register_state_hybrid_tma_smem_pipeline.py.jinja",
+                ("triton.gated_delta_net", "convolution") =>
+                    "triton/kernels/gated_delta_net/convolution.py.jinja",
+                ("triton.gated_delta_net", "recurrent_core") =>
+                    "triton/kernels/gated_delta_net/recurrent_core.py.jinja",
                 ("triton.sparse_experts_down", "concatenated_mma_smem_pipeline") =>
                     "triton/kernels/sparse_experts/down_concatenated_mma_smem_pipeline.py.jinja",
                 ("triton.paged_attention_partial", "mma_direct") => "triton/kernels/paged_attention/mma_direct.py.jinja",
@@ -8094,125 +8397,114 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 helperName);
         }
 
-        private void VisitGatedDeltaNetProjection(
-            Nncase.TIR.NTT.GatedDeltaNetProjection projection,
+        private void VisitGatedDeltaNetConvolution(
+            Nncase.TIR.NTT.GatedDeltaNetConvolution convolution,
             IReadOnlyList<BaseExpr> args,
             PyNTTMicroKernelTemplateModel microKernel)
         {
-            if (args.Count != 6 ||
-                args[0] is not TIR.Buffer input ||
-                args[2] is not TIR.Buffer qkvWeight ||
-                args[3] is not TIR.Buffer convWeight ||
-                args[4] is not TIR.Buffer qkvOutput)
+            if (args.Count != 5 ||
+                args[0] is not TIR.Buffer qkv ||
+                args[2] is not TIR.Buffer convWeight ||
+                args[3] is not TIR.Buffer qkvOutput)
             {
                 throw new NotSupportedException(
-                    "PyNTT GatedDeltaNetProjection expects input, state, QKV weight, " +
-                    "convolution weight, QKV output, and layer id operands.");
+                    "PyNTT GatedDeltaNetConvolution expects QKV, state, convolution weight, " +
+                    "QKV output, and layer-id operands.");
             }
 
-            var stateConfig = GetGatedDeltaNetStateConfig(args[1], "PyNTT GatedDeltaNetProjection");
+            var stateConfig = GetGatedDeltaNetStateConfig(args[1], "PyNTT GatedDeltaNetConvolution");
             var stateLayout = AnalyzeGatedDeltaNetStateLayout(
                 stateConfig,
                 GatedDeltaNetStateKind.Convolution);
-            foreach (var (buffer, name) in new[]
-                     {
-                         (input, "input"),
-                         (qkvWeight, "QKV weight"),
-                         (convWeight, "convolution weight"),
-                     })
-            {
-                EnsureScalarBuffer(buffer, $"PyNTT GatedDeltaNetProjection {name}");
-            }
+            EnsureScalarBuffer(convWeight, "PyNTT GatedDeltaNetConvolution convolution weight");
 
+            var qkvLanes = GetVectorLanes(qkv.ElemType);
             var qkvOutputLanes = GetVectorLanes(qkvOutput.ElemType);
-            var expectedQkvOutputLanes = GetGatedDeltaNetStateAxisLanes(
+            var expectedLanes = GetGatedDeltaNetStateAxisLanes(
                 stateConfig,
                 GatedDeltaNetStateKind.Convolution,
                 GatedDeltaNetStateDimKind.ConvChannels);
-            if (!qkvOutputLanes.SequenceEqual(expectedQkvOutputLanes))
+            if (!qkvLanes.SequenceEqual(expectedLanes) ||
+                !qkvOutputLanes.SequenceEqual(expectedLanes))
             {
                 throw new NotSupportedException(
-                    $"PyNTT GatedDeltaNetProjection QKV output lanes " +
-                    $"[{string.Join(',', qkvOutputLanes)}] must match the convolution-state channel lanes " +
-                    $"[{string.Join(',', expectedQkvOutputLanes)}].");
+                    $"PyNTT GatedDeltaNetConvolution QKV/input-output lanes " +
+                    $"[{string.Join(',', qkvLanes)}]/[{string.Join(',', qkvOutputLanes)}] must match " +
+                    $"the convolution-state channel lanes [{string.Join(',', expectedLanes)}].");
             }
 
-            var qkvOutputLaneCount = GetVectorLaneProduct(qkvOutputLanes);
-
-            var hiddenSize = RequireFixedDim(
-                GetBufferActiveShape(input)[1],
-                "PyNTT GatedDeltaNetProjection hidden size");
-            ValidateFixedShape(
-                GetBufferActiveShape(input),
-                new long[] { 1, hiddenSize },
-                "PyNTT GatedDeltaNetProjection input");
+            var laneCount = GetVectorLaneProduct(expectedLanes);
             var localPackedConvDim = RequireFixedDim(
-                GetBufferActiveShape(qkvOutput)[1],
-                "PyNTT GatedDeltaNetProjection local packed convolution-channel count");
-            var localConvDim = checked(localPackedConvDim * qkvOutputLaneCount);
-            ValidateFixedShape(GetBufferActiveShape(qkvWeight), new long[] { hiddenSize, localConvDim }, "PyNTT GatedDeltaNetProjection QKV weight");
-            ValidateFixedShape(GetBufferActiveShape(convWeight), new long[] { localConvDim, projection.ConvKernelSize }, "PyNTT GatedDeltaNetProjection convolution weight");
-            ValidateFixedShape(GetBufferActiveShape(qkvOutput), new long[] { 1, localPackedConvDim }, "PyNTT GatedDeltaNetProjection QKV output");
-            if (stateConfig.HiddenSize != hiddenSize ||
-                stateConfig.ConvKernelSize != projection.ConvKernelSize)
+                GetBufferShape(qkv)[1],
+                "PyNTT GatedDeltaNetConvolution local packed convolution-channel capacity");
+            var localConvDim = checked(localPackedConvDim * laneCount);
+            var activeLocalPackedConvDim = GetBufferActiveShape(qkv)[1];
+            if (activeLocalPackedConvDim.MinValue is not { } activeConvMin ||
+                activeLocalPackedConvDim.MaxValue is not { } activeConvMax ||
+                activeConvMin < 0 ||
+                activeConvMax > localPackedConvDim)
             {
                 throw new NotSupportedException(
-                    $"PyNTT GatedDeltaNetProjection state config does not match the selected kernel: " +
-                    $"hidden={stateConfig.HiddenSize}/{hiddenSize}, " +
-                    $"conv_kernel={stateConfig.ConvKernelSize}/{projection.ConvKernelSize}.");
+                    "PyNTT GatedDeltaNetConvolution active local channel extent " +
+                    $"must be bounded by [0, {localPackedConvDim}], got " +
+                    $"{activeLocalPackedConvDim.TritonExpression} with range " +
+                    $"[{activeLocalPackedConvDim.MinValue}, {activeLocalPackedConvDim.MaxValue}].");
             }
 
-            if (new[] { qkvWeight, convWeight }
-                    .Any(buffer => buffer.ElemType != input.ElemType) ||
-                GetScalarDataType(qkvOutput.ElemType) != input.ElemType)
+            ValidateFixedShape(GetBufferShape(qkv), new long[] { 1, localPackedConvDim }, "PyNTT GatedDeltaNetConvolution QKV");
+            ValidateFixedShape(GetBufferShape(convWeight), new long[] { localConvDim, convolution.ConvKernelSize }, "PyNTT GatedDeltaNetConvolution convolution weight");
+            ValidateFixedShape(GetBufferShape(qkvOutput), new long[] { 1, localPackedConvDim }, "PyNTT GatedDeltaNetConvolution QKV output");
+            if (stateConfig.ConvKernelSize != convolution.ConvKernelSize)
             {
                 throw new NotSupportedException(
-                    "PyNTT GatedDeltaNetProjection buffers must use the input element type.");
+                    $"PyNTT GatedDeltaNetConvolution state convolution kernel " +
+                    $"{stateConfig.ConvKernelSize} does not match selected kernel " +
+                    $"{convolution.ConvKernelSize}.");
             }
 
-            SetComputeOp("gated_delta_net_projection");
-            _attrs["op"] = "gated_delta_net_projection";
+            var activationType = GetScalarDataType(qkv.ElemType);
+            if (activationType != stateConfig.ActivationPrimType ||
+                convWeight.ElemType != activationType ||
+                GetScalarDataType(qkvOutput.ElemType) != activationType)
+            {
+                throw new NotSupportedException(
+                    "PyNTT GatedDeltaNetConvolution QKV, convolution weight, state, and output " +
+                    "must use the configured activation element type.");
+            }
+
+            SetComputeOp("gated_delta_net_convolution");
+            _attrs["op"] = "gated_delta_net_convolution";
             _attrs["dtype"] = GetPyNTTDTypeName(qkvOutput.ElemType);
             _attrs["shape"] = GetBufferActiveShape(qkvOutput);
-            var helperName = GetNextHelperName("gated_delta_net_projection");
-            var qkvWeightDescriptor = RegisterHostTensorDescriptor(
-                qkvWeight,
-                $"{helperName}__qkv_weight_descriptor");
-            var templateModel = new PyNTTGatedDeltaNetProjectionTemplateModel(
+            var helperName = GetNextHelperName("gated_delta_net_convolution");
+            var templateModel = new PyNTTGatedDeltaNetConvolutionTemplateModel(
                     helperName,
-                    GetBufferScalarPointer(input),
+                    GetBufferScalarPointer(qkv),
                     new PyNTTBufferPointerTemplateModel(
                         GetGatedDeltaNetStateFieldArgument(
                             args[1],
                             GatedDeltaNetStateKind.Convolution,
                             stateConfig)),
-                    GetBufferScalarPointer(qkvWeight),
                     GetBufferScalarPointer(convWeight),
                     GetBufferScalarPointer(qkvOutput),
-                    GetTritonDType(input.ElemType),
-                    GetBufferStrides(input),
-                    GetBufferStrides(qkvWeight),
+                    GetTritonDType(activationType),
+                    GetBufferStrides(qkv),
                     GetBufferStrides(convWeight),
                     GetBufferStrides(qkvOutput),
                     stateLayout.GetAxis(GatedDeltaNetStateDimKind.NumLayers),
                     stateLayout.GetAxis(GatedDeltaNetStateDimKind.ConvChannels),
                     stateLayout.GetAxis(GatedDeltaNetStateDimKind.ConvHistory),
                     GetDimensionExpression(
-                        args[5],
-                        "PyNTT GatedDeltaNetProjection layer id").TritonExpression,
-                    checked((int)hiddenSize),
-                    checked((int)projection.ConvKernelSize),
+                        args[4],
+                        "PyNTT GatedDeltaNetConvolution layer id").TritonExpression,
+                    checked((int)convolution.ConvKernelSize),
                     checked((int)localConvDim),
-                    qkvOutputLaneCount,
+                    $"({activeLocalPackedConvDim.TritonExpression}) * {laneCount}",
+                    laneCount,
                     microKernel,
-                    $"({input.Name}, gated_delta_net_state) -> {qkvOutput.Name}")
-            {
-                QKVWeightGlobalOffsets = GetBufferGlobalOffsets(qkvWeight),
-                QKVWeightDescriptorName = qkvWeightDescriptor.Name,
-                QKVWeightDescriptorOriginElements = qkvWeightDescriptor.OriginElements,
-            };
+                    $"({qkv.Name}, gated_delta_net_state) -> {qkvOutput.Name}");
             WriteSelectedMicroKernelHelper(microKernel, templateModel, helperName);
-            MarkStoredOutput(qkvOutput, "PyNTT GatedDeltaNetProjection");
+            MarkStoredOutput(qkvOutput, "PyNTT GatedDeltaNetConvolution");
         }
 
         private void VisitGatedDeltaNetRecurrentCore(
@@ -8220,32 +8512,27 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             IReadOnlyList<BaseExpr> args,
             PyNTTMicroKernelTemplateModel microKernel)
         {
-            if (args.Count != 11 ||
-                args[0] is not TIR.Buffer input ||
-                args[2] is not TIR.Buffer qkv ||
-                args[3] is not TIR.Buffer zWeight ||
-                args[4] is not TIR.Buffer bWeight ||
-                args[5] is not TIR.Buffer aWeight ||
-                args[6] is not TIR.Buffer aLog ||
-                args[7] is not TIR.Buffer dtBias ||
-                args[8] is not TIR.Buffer normWeight ||
-                args[9] is not TIR.Buffer gatedOutput)
+            if (args.Count != 10 ||
+                args[1] is not TIR.Buffer qkv ||
+                args[2] is not TIR.Buffer z ||
+                args[3] is not TIR.Buffer bProjection ||
+                args[4] is not TIR.Buffer aProjection ||
+                args[5] is not TIR.Buffer aLog ||
+                args[6] is not TIR.Buffer dtBias ||
+                args[7] is not TIR.Buffer normWeight ||
+                args[8] is not TIR.Buffer gatedOutput)
             {
                 throw new NotSupportedException(
-                    "PyNTT GatedDeltaNetRecurrentCore expects input, state, QKV, Z/B/A, " +
+                    "PyNTT GatedDeltaNetRecurrentCore expects state, projected QKV/Z/B/A, " +
                     "A_log, dt-bias, norm-weight, gated-output, and layer-id operands.");
             }
 
-            var stateConfig = GetGatedDeltaNetStateConfig(args[1], "PyNTT GatedDeltaNetRecurrentCore");
+            var stateConfig = GetGatedDeltaNetStateConfig(args[0], "PyNTT GatedDeltaNetRecurrentCore");
             var stateLayout = AnalyzeGatedDeltaNetStateLayout(
                 stateConfig,
                 GatedDeltaNetStateKind.Recurrent);
             foreach (var (buffer, name) in new[]
                      {
-                         (input, "input"),
-                         (zWeight, "Z weight"),
-                         (bWeight, "B weight"),
-                         (aWeight, "A weight"),
                          (aLog, "A_log"),
                          (dtBias, "dt bias"),
                          (normWeight, "norm weight"),
@@ -8268,28 +8555,70 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             }
 
             var qkvLaneCount = GetVectorLaneProduct(qkvLanes);
+            var zLanes = GetVectorLanes(z.ElemType);
+            var expectedZLanes = GetVectorLanes(stateConfig.ActivationType);
+            if (!zLanes.SequenceEqual(expectedZLanes))
+            {
+                throw new NotSupportedException(
+                    $"PyNTT GatedDeltaNetRecurrentCore Z lanes [{string.Join(',', zLanes)}] " +
+                    $"must match the configured activation lanes [{string.Join(',', expectedZLanes)}].");
+            }
 
-            var hiddenSize = RequireFixedDim(
-                GetBufferActiveShape(input)[1],
-                "PyNTT GatedDeltaNetRecurrentCore hidden size");
+            var zLaneCount = GetVectorLaneProduct(zLanes);
+            var projectionLanes = GetVectorLanes(bProjection.ElemType);
+            var expectedProjectionLanes = GetVectorLanes(stateConfig.ActivationType);
+            if (!projectionLanes.SequenceEqual(expectedProjectionLanes) ||
+                !GetVectorLanes(aProjection.ElemType).SequenceEqual(expectedProjectionLanes))
+            {
+                throw new NotSupportedException(
+                    $"PyNTT GatedDeltaNetRecurrentCore A/B projection lanes must match " +
+                    $"the configured activation lanes [{string.Join(',', expectedProjectionLanes)}].");
+            }
+
+            var projectionLaneCount = GetVectorLaneProduct(projectionLanes);
             var keyDim = checked(recurrentCore.NumKeyHeads * recurrentCore.KeyHeadDim);
             var valueDim = checked(recurrentCore.NumValueHeads * recurrentCore.ValueHeadDim);
             var convDim = checked((keyDim * 2) + valueDim);
-            var localNumValueHeads = RequireFixedDim(
-                GetBufferActiveShape(bWeight)[1],
-                "PyNTT GatedDeltaNetRecurrentCore local value-head count");
-            var localValueDim = checked(localNumValueHeads * recurrentCore.ValueHeadDim);
-            ValidateFixedShape(GetBufferActiveShape(input), new long[] { 1, hiddenSize }, "PyNTT GatedDeltaNetRecurrentCore input");
-            ValidateFixedShape(GetBufferActiveShape(qkv), new long[] { 1, convDim / qkvLaneCount }, "PyNTT GatedDeltaNetRecurrentCore QKV");
-            ValidateFixedShape(GetBufferActiveShape(zWeight), new long[] { hiddenSize, localValueDim }, "PyNTT GatedDeltaNetRecurrentCore Z weight");
-            ValidateFixedShape(GetBufferActiveShape(bWeight), new long[] { hiddenSize, localNumValueHeads }, "PyNTT GatedDeltaNetRecurrentCore B weight");
-            ValidateFixedShape(GetBufferActiveShape(aWeight), new long[] { hiddenSize, localNumValueHeads }, "PyNTT GatedDeltaNetRecurrentCore A weight");
-            ValidateFixedShape(GetBufferActiveShape(aLog), new long[] { localNumValueHeads }, "PyNTT GatedDeltaNetRecurrentCore A_log");
-            ValidateFixedShape(GetBufferActiveShape(dtBias), new long[] { localNumValueHeads }, "PyNTT GatedDeltaNetRecurrentCore dt bias");
-            ValidateFixedShape(GetBufferActiveShape(normWeight), new long[] { recurrentCore.ValueHeadDim }, "PyNTT GatedDeltaNetRecurrentCore norm weight");
-            ValidateFixedShape(GetBufferActiveShape(gatedOutput), new long[] { 1, localValueDim }, "PyNTT GatedDeltaNetRecurrentCore gated output");
-            if (stateConfig.HiddenSize != hiddenSize ||
-                stateConfig.NumKeyHeads != recurrentCore.NumKeyHeads ||
+            var localValueCapacity = RequireFixedDim(
+                GetBufferShape(gatedOutput)[1],
+                "PyNTT GatedDeltaNetRecurrentCore local value capacity");
+            if (localValueCapacity % recurrentCore.ValueHeadDim != 0)
+            {
+                throw new NotSupportedException(
+                    "PyNTT GatedDeltaNetRecurrentCore local output must contain complete value heads.");
+            }
+
+            var localValueHeadCapacity = localValueCapacity / recurrentCore.ValueHeadDim;
+            var activeLocalValueCapacity = GetBufferActiveShape(gatedOutput)[1];
+            var activeLocalValueHeadsExpression =
+                $"({activeLocalValueCapacity.TritonExpression}) // {recurrentCore.ValueHeadDim}";
+            var activeLocalValueHeads = new PyNTTDimExpression(
+                activeLocalValueHeadsExpression,
+                activeLocalValueHeadsExpression,
+                null,
+                activeLocalValueCapacity.MinValue is { } min ? min / recurrentCore.ValueHeadDim : null,
+                activeLocalValueCapacity.MaxValue is { } max ? max / recurrentCore.ValueHeadDim : null);
+            if (activeLocalValueHeads.MinValue is not { } activeHeadMin ||
+                activeLocalValueHeads.MaxValue is not { } activeHeadMax ||
+                activeHeadMin < 0 ||
+                activeHeadMax > localValueHeadCapacity)
+            {
+                throw new NotSupportedException(
+                    "PyNTT GatedDeltaNetRecurrentCore active local value-head extent " +
+                    $"must be bounded by [0, {localValueHeadCapacity}], got " +
+                    $"{activeLocalValueHeads.TritonExpression} with range " +
+                    $"[{activeLocalValueHeads.MinValue}, {activeLocalValueHeads.MaxValue}].");
+            }
+
+            ValidateFixedShape(GetBufferShape(qkv), new long[] { 1, convDim / qkvLaneCount }, "PyNTT GatedDeltaNetRecurrentCore QKV");
+            ValidateFixedShape(GetBufferShape(z), new long[] { 1, localValueCapacity / zLaneCount }, "PyNTT GatedDeltaNetRecurrentCore Z");
+            ValidateFixedShape(GetBufferShape(bProjection), new long[] { 1, recurrentCore.NumValueHeads / projectionLaneCount }, "PyNTT GatedDeltaNetRecurrentCore B projection");
+            ValidateFixedShape(GetBufferShape(aProjection), new long[] { 1, recurrentCore.NumValueHeads / projectionLaneCount }, "PyNTT GatedDeltaNetRecurrentCore A projection");
+            ValidateFixedShape(GetBufferShape(aLog), new long[] { localValueHeadCapacity }, "PyNTT GatedDeltaNetRecurrentCore A_log");
+            ValidateFixedShape(GetBufferShape(dtBias), new long[] { localValueHeadCapacity }, "PyNTT GatedDeltaNetRecurrentCore dt bias");
+            ValidateFixedShape(GetBufferShape(normWeight), new long[] { recurrentCore.ValueHeadDim }, "PyNTT GatedDeltaNetRecurrentCore norm weight");
+            ValidateFixedShape(GetBufferShape(gatedOutput), new long[] { 1, localValueCapacity }, "PyNTT GatedDeltaNetRecurrentCore gated output");
+            if (stateConfig.NumKeyHeads != recurrentCore.NumKeyHeads ||
                 stateConfig.NumValueHeads != recurrentCore.NumValueHeads ||
                 stateConfig.KeyHeadDim != recurrentCore.KeyHeadDim ||
                 stateConfig.ValueHeadDim != recurrentCore.ValueHeadDim)
@@ -8298,37 +8627,41 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     "PyNTT GatedDeltaNetRecurrentCore state config does not match the selected kernel.");
             }
 
+            var activationType = GetScalarDataType(qkv.ElemType);
+            if (GetScalarDataType(z.ElemType) != activationType ||
+                GetScalarDataType(bProjection.ElemType) != activationType ||
+                GetScalarDataType(aProjection.ElemType) != activationType)
+            {
+                throw new NotSupportedException(
+                    "PyNTT GatedDeltaNetRecurrentCore QKV/Z/A/B projections must share one scalar element type.");
+            }
+
             SetComputeOp("gated_delta_net_recurrent_core");
             _attrs["op"] = "gated_delta_net_recurrent_core";
             _attrs["dtype"] = GetPyNTTDTypeName(gatedOutput.ElemType);
             _attrs["shape"] = GetBufferActiveShape(gatedOutput);
             var helperName = GetNextHelperName("gated_delta_net_recurrent_core");
-            var zWeightDescriptor = RegisterHostTensorDescriptor(
-                zWeight,
-                $"{helperName}__z_weight_descriptor");
             var templateModel = new PyNTTGatedDeltaNetRecurrentCoreTemplateModel(
                     helperName,
-                    GetBufferScalarPointer(input),
                     new PyNTTBufferPointerTemplateModel(
                         GetGatedDeltaNetStateFieldArgument(
-                            args[1],
+                            args[0],
                             GatedDeltaNetStateKind.Recurrent,
                             stateConfig)),
                     GetBufferScalarPointer(qkv),
-                    GetBufferScalarPointer(zWeight),
-                    GetBufferScalarPointer(bWeight),
-                    GetBufferScalarPointer(aWeight),
+                    GetBufferScalarPointer(z),
+                    GetBufferScalarPointer(bProjection),
+                    GetBufferScalarPointer(aProjection),
                     GetBufferScalarPointer(aLog),
                     GetBufferScalarPointer(dtBias),
                     GetBufferScalarPointer(normWeight),
                     GetBufferScalarPointer(gatedOutput),
-                    GetTritonDType(input.ElemType),
+                    GetTritonDType(activationType),
                     GetTritonDType(gatedOutput.ElemType),
-                    GetBufferStrides(input),
                     GetBufferStrides(qkv),
-                    GetBufferStrides(zWeight),
-                    GetBufferStrides(bWeight),
-                    GetBufferStrides(aWeight),
+                    GetBufferStrides(z),
+                    GetBufferStrides(bProjection),
+                    GetBufferStrides(aProjection),
                     GetBufferStrides(aLog),
                     GetBufferStrides(dtBias),
                     GetBufferStrides(normWeight),
@@ -8338,30 +8671,24 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     stateLayout.GetAxis(GatedDeltaNetStateDimKind.KeyHeadDim),
                     stateLayout.GetAxis(GatedDeltaNetStateDimKind.ValueHeadDim),
                     GetDimensionExpression(
-                        args[10],
+                        args[9],
                         "PyNTT GatedDeltaNetRecurrentCore layer id").TritonExpression,
-                    checked((int)hiddenSize),
                     checked((int)recurrentCore.NumKeyHeads),
                     checked((int)recurrentCore.NumValueHeads),
                     checked((int)recurrentCore.KeyHeadDim),
                     checked((int)recurrentCore.ValueHeadDim),
                     checked((int)convDim),
                     checked((int)valueDim),
-                    checked((int)localNumValueHeads),
+                    checked((int)localValueHeadCapacity),
+                    activeLocalValueHeads.TritonExpression,
                     qkvLaneCount,
-                    RoundUpToPowerOfTwo(checked(localNumValueHeads * ((recurrentCore.KeyHeadDim * 2) + recurrentCore.ValueHeadDim))),
-                    RoundUpToPowerOfTwo(checked(localNumValueHeads * recurrentCore.KeyHeadDim)),
-                    RoundUpToPowerOfTwo(localValueDim),
+                    zLaneCount,
+                    projectionLaneCount,
                     RoundUpToPowerOfTwo(recurrentCore.KeyHeadDim),
                     RoundUpToPowerOfTwo(recurrentCore.ValueHeadDim),
                     recurrentCore.Epsilon,
                     microKernel,
-                    $"({input.Name}, {qkv.Name}, gated_delta_net_state) -> {gatedOutput.Name}")
-            {
-                ZWeightGlobalOffsets = GetBufferGlobalOffsets(zWeight),
-                ZWeightDescriptorName = zWeightDescriptor.Name,
-                ZWeightDescriptorOriginElements = zWeightDescriptor.OriginElements,
-            };
+                    $"({qkv.Name}, {z.Name}, {bProjection.Name}, {aProjection.Name}, gated_delta_net_state) -> {gatedOutput.Name}");
             WriteSelectedMicroKernelHelper(microKernel, templateModel, helperName);
             MarkStoredOutput(gatedOutput, "PyNTT GatedDeltaNetRecurrentCore");
         }
@@ -10745,6 +11072,23 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             return buffer.Dimensions.ToArray()
                 .Select(GetDimensionExpression)
                 .ToArray();
+        }
+
+        private void ValidateOperandScaleBuffer(string context, TIR.Buffer scale)
+        {
+            var scalarType = GetScalarDataType(scale.ElemType);
+            if (scalarType is not PrimType || !scalarType.IsFloat())
+            {
+                throw new NotSupportedException(
+                    $"{context} scale must use scalar floating-point storage, got {scale.ElemType}.");
+            }
+
+            var elementCount = Product(GetBufferActiveShape(scale));
+            if (elementCount.MinValue != 1 || elementCount.MaxValue != 1)
+            {
+                throw new NotSupportedException(
+                    $"{context} scale must contain exactly one active element, got {elementCount}.");
+            }
         }
 
         private PyNTTDimExpression[] GetDistributedActiveShape(
@@ -13934,6 +14278,8 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             "uint64" => "tl.uint64",
             "float16" => "tl.float16",
             "bfloat16" => "tl.bfloat16",
+            "float8e4m3fn" => "tl.float8e4nv",
+            "float8e5m2" => "tl.float8e5",
             "float32" => "tl.float32",
             "float64" => "tl.float64",
             var name => throw new NotSupportedException($"Unsupported PyNTT Triton dtype: {name}."),
@@ -14024,6 +14370,16 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
 
     private static string GetPyNTTDTypeName(DataType dataType)
     {
+        if (dataType == DataTypes.Float8E4M3)
+        {
+            return "float8e4m3fn";
+        }
+
+        if (dataType == DataTypes.Float8E5M2)
+        {
+            return "float8e5m2";
+        }
+
         return dataType.GetDisplayName() switch
         {
             "bool" => "bool",

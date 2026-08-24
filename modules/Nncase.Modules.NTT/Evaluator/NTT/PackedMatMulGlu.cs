@@ -6,10 +6,13 @@ using System.Linq;
 using Nncase.CostModel;
 using Nncase.IR;
 using Nncase.IR.Distributed;
+using Nncase.IR.Math;
 using Nncase.IR.NN;
 using Nncase.IR.NTT;
 using Nncase.Utilities;
 using OrtKISharp;
+using ScaledMatMulEvaluator = Nncase.Evaluator.Math.ScaledMatMulEvaluator;
+using BlockScaledMatMulEvaluator = Nncase.Evaluator.Math.BlockScaledMatMulEvaluator;
 
 namespace Nncase.Evaluator.IR.NTT;
 
@@ -20,15 +23,9 @@ public sealed class PackedMatMulGluEvaluator : IEvaluator<PackedMatMulGlu>, ITyp
 {
     public IValue Visit(IEvaluateContext context, PackedMatMulGlu target)
     {
-        ValidateNoScales(
-            context.GetArgumentValue(target, PackedMatMulGlu.GateInputScale),
-            context.GetArgumentValue(target, PackedMatMulGlu.UpInputScale),
-            context.GetArgumentValue(target, PackedMatMulGlu.GateWeightScale),
-            context.GetArgumentValue(target, PackedMatMulGlu.UpWeightScale));
-
         var input = context.GetArgumentValueAsTensor(target, PackedMatMulGlu.Input);
-        var gate = Project(input, context.GetArgumentValueAsTensor(target, PackedMatMulGlu.GateWeight), context.GetArgumentValue(target, PackedMatMulGlu.GateBias), target.OutputDataType, target.RhsLayout);
-        var up = Project(input, context.GetArgumentValueAsTensor(target, PackedMatMulGlu.UpWeight), context.GetArgumentValue(target, PackedMatMulGlu.UpBias), target.OutputDataType, target.RhsLayout);
+        var gate = Project(input, context.GetArgumentValueAsTensor(target, PackedMatMulGlu.GateWeight), context.GetArgumentValue(target, PackedMatMulGlu.GateBias), context.GetArgumentValue(target, PackedMatMulGlu.GateInputScale), context.GetArgumentValue(target, PackedMatMulGlu.GateWeightScale), target);
+        var up = Project(input, context.GetArgumentValueAsTensor(target, PackedMatMulGlu.UpWeight), context.GetArgumentValue(target, PackedMatMulGlu.UpBias), context.GetArgumentValue(target, PackedMatMulGlu.UpInputScale), context.GetArgumentValue(target, PackedMatMulGlu.UpWeightScale), target);
         return Value.FromTensor(ApplyGlu(gate, up, target.GluType));
     }
 
@@ -39,18 +36,23 @@ public sealed class PackedMatMulGluEvaluator : IEvaluator<PackedMatMulGlu>, ITyp
         var upWeight = context.CheckArgumentType<IRType>(target, PackedMatMulGlu.UpWeight);
         var gateBias = context.CheckArgumentType<IRType>(target, PackedMatMulGlu.GateBias);
         var upBias = context.CheckArgumentType<IRType>(target, PackedMatMulGlu.UpBias);
-        var scaleCheck = CheckScales(
-            context.CheckArgumentType<IRType>(target, PackedMatMulGlu.GateInputScale),
-            context.CheckArgumentType<IRType>(target, PackedMatMulGlu.UpInputScale),
-            context.CheckArgumentType<IRType>(target, PackedMatMulGlu.GateWeightScale),
-            context.CheckArgumentType<IRType>(target, PackedMatMulGlu.UpWeightScale));
+        var gateInputScale = context.CheckArgumentType<IRType>(target, PackedMatMulGlu.GateInputScale);
+        var upInputScale = context.CheckArgumentType<IRType>(target, PackedMatMulGlu.UpInputScale);
+        var gateWeightScale = context.CheckArgumentType<IRType>(target, PackedMatMulGlu.GateWeightScale);
+        var upWeightScale = context.CheckArgumentType<IRType>(target, PackedMatMulGlu.UpWeightScale);
+        var scaleCheck = CheckScaleContract(
+            target,
+            gateInputScale,
+            upInputScale,
+            gateWeightScale,
+            upWeightScale);
         if (scaleCheck is not null)
         {
             return scaleCheck;
         }
 
-        var gate = VisitProjection(input, gateWeight, target.OutputDataType, target.RhsLayout);
-        var up = VisitProjection(input, upWeight, target.OutputDataType, target.RhsLayout);
+        var gate = VisitProjection(input, gateWeight, gateInputScale, gateWeightScale, target);
+        var up = VisitProjection(input, upWeight, upInputScale, upWeightScale, target);
         if (gate is InvalidType)
         {
             return gate;
@@ -96,6 +98,13 @@ public sealed class PackedMatMulGluEvaluator : IEvaluator<PackedMatMulGlu>, ITyp
         var upWeight = context.GetArgumentType<IRType>(target, PackedMatMulGlu.UpWeight);
         var gateBias = context.GetArgumentType<IRType>(target, PackedMatMulGlu.GateBias);
         var upBias = context.GetArgumentType<IRType>(target, PackedMatMulGlu.UpBias);
+        var scales = new[]
+        {
+            context.GetArgumentType<IRType>(target, PackedMatMulGlu.GateInputScale),
+            context.GetArgumentType<IRType>(target, PackedMatMulGlu.UpInputScale),
+            context.GetArgumentType<IRType>(target, PackedMatMulGlu.GateWeightScale),
+            context.GetArgumentType<IRType>(target, PackedMatMulGlu.UpWeightScale),
+        };
         var output = context.GetReturnType<IRType>();
         if (TryGetTargetCost(context, target, input, gateWeight, upWeight, output, out var targetCost))
         {
@@ -108,7 +117,8 @@ public sealed class PackedMatMulGluEvaluator : IEvaluator<PackedMatMulGlu>, ITyp
         {
             [CostFactorNames.BlockLocalMemoryLoadBytes] = CostUtility.GetMemoryAccess(input)
                 + CostUtility.GetMemoryAccess(gateWeight) + CostUtility.GetMemoryAccess(upWeight)
-                + CostUtility.GetMemoryAccess(gateBias) + CostUtility.GetMemoryAccess(upBias),
+                + CostUtility.GetMemoryAccess(gateBias) + CostUtility.GetMemoryAccess(upBias)
+                + scales.Aggregate((UInt128)0, (sum, scale) => sum + CostUtility.GetMemoryAccess(scale)),
             [CostFactorNames.BlockLocalMemoryStoreBytes] = CostUtility.GetMemoryAccess(output),
             [CostFactorNames.CPUCycles] = CostUtility.GetCPUCycles(output, checked(macPerElement * 2U + 9U)),
         };
@@ -118,13 +128,14 @@ public sealed class PackedMatMulGluEvaluator : IEvaluator<PackedMatMulGlu>, ITyp
         Tensor input,
         Tensor packedWeight,
         IValue packedBias,
-        DataType outputDataType,
-        PackedMatMulRhsLayout rhsLayout)
+        IValue inputScale,
+        IValue weightScale,
+        PackedMatMulGlu target)
     {
         string? errorMessage = null;
         if (packedWeight.ElementType is not VectorType weightVectorType ||
             !TryGetLayoutInfo(
-                rhsLayout,
+                target.RhsLayout,
                 weightVectorType,
                 packedWeight.Rank,
                 out var rhsUnpackAxes,
@@ -145,7 +156,30 @@ public sealed class PackedMatMulGluEvaluator : IEvaluator<PackedMatMulGlu>, ITyp
             weightOrt = OrtKI.Transpose(weightOrt, perm);
         }
 
-        var result = Math.MatMulEvaluator.InferValue(input.ElementType, input, weightOrt.ToTensor(), outputDataType).AsTensor().ToOrtTensor();
+        var logicalWeight = weightOrt.ToTensor();
+        var result = target.QuantizationMode switch
+        {
+            MatMulQuantizationMode.None => Math.MatMulEvaluator.InferValue(
+                input.ElementType,
+                input,
+                logicalWeight,
+                target.OutputDataType).AsTensor().ToOrtTensor(),
+            MatMulQuantizationMode.StaticTensor => ScaledMatMulEvaluator.Evaluate(
+                input,
+                logicalWeight,
+                inputScale.AsTensor(),
+                weightScale.AsTensor(),
+                target.OutputDataType).AsTensor().ToOrtTensor(),
+            MatMulQuantizationMode.DynamicBlock => BlockScaledMatMulEvaluator.Evaluate(
+                input,
+                logicalWeight,
+                weightScale.AsTensor(),
+                target.OutputDataType,
+                target.WeightBlockN,
+                target.WeightBlockK).AsTensor().ToOrtTensor(),
+            _ => throw new NotSupportedException(
+                $"Unsupported PackedMatMulGlu quantization mode: {target.QuantizationMode}."),
+        };
         result = result.Pack(
             0,
             outputLanes,
@@ -155,7 +189,7 @@ public sealed class PackedMatMulGluEvaluator : IEvaluator<PackedMatMulGlu>, ITyp
             result = OrtKI.Add(result, packedBias.AsTensor().ToOrtTensor());
         }
 
-        return result.ToTensor(new VectorType(outputDataType, outputLanes));
+        return result.ToTensor(new VectorType(target.OutputDataType, outputLanes));
     }
 
     private static Tensor ApplyGlu(Tensor gate, Tensor up, GluType gluType)
@@ -180,8 +214,9 @@ public sealed class PackedMatMulGluEvaluator : IEvaluator<PackedMatMulGlu>, ITyp
     private static IRType VisitProjection(
         IRType input,
         IRType packedWeight,
-        DataType outputDataType,
-        PackedMatMulRhsLayout rhsLayout)
+        IRType inputScale,
+        IRType weightScale,
+        PackedMatMulGlu target)
     {
         switch (input, packedWeight)
         {
@@ -190,7 +225,7 @@ public sealed class PackedMatMulGluEvaluator : IEvaluator<PackedMatMulGlu>, ITyp
                     string? errorMessage = null;
                     if (b.TensorType.DType is not VectorType vectorType ||
                         !TryGetLayoutInfo(
-                            rhsLayout,
+                            target.RhsLayout,
                             vectorType,
                             b.TensorType.Shape.Rank,
                             out var rhsUnpackAxes,
@@ -221,15 +256,33 @@ public sealed class PackedMatMulGluEvaluator : IEvaluator<PackedMatMulGlu>, ITyp
                             $"weight={unpackedWeight.AxisPolicies[dimInfo.Rk]}.");
                     }
 
-                    return PackOutput(
-                        Math.MatMulEvaluator.VisitDistributedType(
+                    var projection = target.QuantizationMode switch
+                    {
+                        MatMulQuantizationMode.None => Math.MatMulEvaluator.VisitDistributedType(
                             a,
                             unpackedWeight,
                             NoneType.Default,
                             dimInfo: dimInfo,
                             transB: transposeB,
-                            outputDataType: outputDataType),
-                        outputLanes);
+                            outputDataType: target.OutputDataType),
+                        MatMulQuantizationMode.StaticTensor => ScaledMatMulEvaluator.InferType(
+                            new ScaledMatMul(target.OutputDataType),
+                            a,
+                            unpackedWeight,
+                            inputScale,
+                            weightScale),
+                        MatMulQuantizationMode.DynamicBlock => BlockScaledMatMulEvaluator.InferType(
+                            new BlockScaledMatMul(
+                                target.OutputDataType,
+                                target.WeightBlockN,
+                                target.WeightBlockK),
+                            a,
+                            unpackedWeight,
+                            weightScale),
+                        _ => new InvalidType(
+                            $"Unsupported PackedMatMulGlu quantization mode: {target.QuantizationMode}."),
+                    };
+                    return PackOutput(projection, outputLanes);
                 }
 
             case (TensorType a, TensorType b):
@@ -237,7 +290,7 @@ public sealed class PackedMatMulGluEvaluator : IEvaluator<PackedMatMulGlu>, ITyp
                     string? errorMessage = null;
                     if (b.DType is not VectorType vectorType ||
                         !TryGetLayoutInfo(
-                            rhsLayout,
+                            target.RhsLayout,
                             vectorType,
                             b.Shape.Rank,
                             out var rhsUnpackAxes,
@@ -260,14 +313,32 @@ public sealed class PackedMatMulGluEvaluator : IEvaluator<PackedMatMulGlu>, ITyp
                         transposeB,
                         a.Shape.Rank,
                         unpackedWeight.Shape.Rank);
-                    return PackOutput(
-                        Math.MatMulEvaluator.VisitTensorType(
+                    var projection = target.QuantizationMode switch
+                    {
+                        MatMulQuantizationMode.None => Math.MatMulEvaluator.VisitTensorType(
                             a,
                             unpackedWeight,
                             NoneType.Default,
                             dimInfo: dimInfo,
-                            outputDataType: outputDataType),
-                        outputLanes);
+                            outputDataType: target.OutputDataType),
+                        MatMulQuantizationMode.StaticTensor => ScaledMatMulEvaluator.InferType(
+                            new ScaledMatMul(target.OutputDataType),
+                            a,
+                            unpackedWeight,
+                            inputScale,
+                            weightScale),
+                        MatMulQuantizationMode.DynamicBlock => BlockScaledMatMulEvaluator.InferType(
+                            new BlockScaledMatMul(
+                                target.OutputDataType,
+                                target.WeightBlockN,
+                                target.WeightBlockK),
+                            a,
+                            unpackedWeight,
+                            weightScale),
+                        _ => new InvalidType(
+                            $"Unsupported PackedMatMulGlu quantization mode: {target.QuantizationMode}."),
+                    };
+                    return PackOutput(projection, outputLanes);
                 }
 
             default:
@@ -520,19 +591,42 @@ public sealed class PackedMatMulGluEvaluator : IEvaluator<PackedMatMulGlu>, ITyp
         return null;
     }
 
-    private static InvalidType? CheckScales(params IRType[] scales)
+    private static InvalidType? CheckScaleContract(
+        PackedMatMulGlu target,
+        IRType gateInputScale,
+        IRType upInputScale,
+        IRType gateWeightScale,
+        IRType upWeightScale)
     {
-        return scales.All(scale => scale is NoneType)
-            ? null
-            : new InvalidType("PackedMatMulGlu currently supports only None input/weight scales.");
-    }
-
-    private static void ValidateNoScales(params IValue[] scales)
-    {
-        if (scales.Any(scale => !IsNone(scale)))
+        var hasGateInputScale = gateInputScale is not NoneType;
+        var hasUpInputScale = upInputScale is not NoneType;
+        var hasGateWeightScale = gateWeightScale is not NoneType;
+        var hasUpWeightScale = upWeightScale is not NoneType;
+        var valid = target.QuantizationMode switch
         {
-            throw new NotSupportedException("PackedMatMulGlu currently supports only None input/weight scales.");
-        }
+            MatMulQuantizationMode.None =>
+                !hasGateInputScale && !hasUpInputScale &&
+                !hasGateWeightScale && !hasUpWeightScale &&
+                target.WeightBlockN == 0 && target.WeightBlockK == 0,
+            MatMulQuantizationMode.StaticTensor =>
+                ScaledMatMulEvaluator.IsScaleType(gateInputScale) &&
+                ScaledMatMulEvaluator.IsScaleType(upInputScale) &&
+                ScaledMatMulEvaluator.IsScaleType(gateWeightScale) &&
+                ScaledMatMulEvaluator.IsScaleType(upWeightScale) &&
+                target.WeightBlockN == 0 && target.WeightBlockK == 0,
+            MatMulQuantizationMode.DynamicBlock =>
+                !hasGateInputScale && !hasUpInputScale &&
+                hasGateWeightScale && hasUpWeightScale &&
+                target.WeightBlockN > 0 && target.WeightBlockK > 0,
+            _ => false,
+        };
+        return valid
+            ? null
+            : new InvalidType(
+                $"PackedMatMulGlu scale operands do not match quantization mode {target.QuantizationMode}; " +
+                $"input scales={hasGateInputScale}/{hasUpInputScale}, weight scales=" +
+                $"{hasGateWeightScale}/{hasUpWeightScale}, block=" +
+                $"[{target.WeightBlockN}, {target.WeightBlockK}].");
     }
 
     private static bool SameProjectionType(IRType lhs, IRType rhs) => (lhs, rhs) switch

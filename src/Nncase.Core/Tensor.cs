@@ -151,6 +151,11 @@ public abstract partial class Tensor : IStructuralComparable, IStructuralEquatab
     /// </summary>
     public abstract Span<byte> BytesBuffer { get; }
 
+    /// <summary>
+    /// Gets the byte length of the backing buffer.
+    /// </summary>
+    public abstract long ByteLength { get; }
+
     int ICollection.Count => checked((int)Length);
 
     bool ICollection.IsSynchronized => false;
@@ -487,6 +492,13 @@ public abstract partial class Tensor : IStructuralComparable, IStructuralEquatab
     }
 
     public static Tensor One(DataType dataType) => Ones(dataType, []);
+
+    /// <summary>
+    /// Copies a byte range from the backing buffer.
+    /// </summary>
+    /// <param name="sourceByteOffset">Byte offset in the backing buffer.</param>
+    /// <param name="destination">Destination buffer.</param>
+    public abstract void CopyBytesTo(long sourceByteOffset, Span<byte> destination);
 
     /// <summary>
     /// Cast to typed tensor.

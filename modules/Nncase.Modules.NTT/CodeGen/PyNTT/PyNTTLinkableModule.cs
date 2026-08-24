@@ -192,6 +192,16 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
             return "object";
         }
 
+        if (dataType == DataTypes.Float8E4M3)
+        {
+            return "float8e4m3fn";
+        }
+
+        if (dataType == DataTypes.Float8E5M2)
+        {
+            return "float8e5m2";
+        }
+
         return dataType.GetDisplayName() switch
         {
             "bool" => "bool",
@@ -2832,7 +2842,7 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
         {
             var tensor = allocation.Const.Value;
             var size = allocation.Range.Max - allocation.Range.Min;
-            if ((ulong)tensor.BytesBuffer.Length != size)
+            if ((ulong)tensor.ByteLength != size)
             {
                 throw new InvalidDataException("The PyNTT module rdata buffer size does not match the scheduled range.");
             }
@@ -2920,8 +2930,8 @@ internal sealed class PyNTTLinkableModule : ILinkableModule
         if (lhsTensor.ElementType != rhsTensor.ElementType ||
             !lhsTensor.Dimensions.ToArray().SequenceEqual(rhsTensor.Dimensions.ToArray()) ||
             !lhsTensor.Strides.ToArray().SequenceEqual(rhsTensor.Strides.ToArray()) ||
-            lhsTensor.BytesBuffer.Length != rhsTensor.BytesBuffer.Length ||
-            !lhsTensor.BytesBuffer.SequenceEqual(rhsTensor.BytesBuffer))
+            lhsTensor.ByteLength != rhsTensor.ByteLength ||
+            !lhsTensor.Equals(rhsTensor))
         {
             throw new InvalidDataException($"PyNTT module rdata range [{range.Min}, {range.Max}) is assigned to different constants.");
         }

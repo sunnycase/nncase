@@ -1,0 +1,66 @@
+{% import "triton/kernels/_common.py.jinja" as common with context %}
+{% import "triton/kernels/_producer_consumer.py.jinja" as phases with context %}
+{% set ctx = gated_delta_net_convolution_context(model) %}
+{% macro state_axis_offset(coordinate, axis) -%}
+{% if axis["LaneCount"] == 1 -%}
+({{ coordinate }}) * {{ axis["BlockStride"] }}
+{%- else -%}
+(({{ coordinate }}) // {{ axis["LaneCount"] }}) * {{ axis["BlockStride"] }} + (({{ coordinate }}) % {{ axis["LaneCount"] }}) * {{ axis["LaneStride"] }}
+{%- endif %}
+{%- endmacro %}
+# generated from PyNTT algorithm triton.gated_delta_net/convolution
+# {{ model["Comment"] }}; local_channels={{ model["LocalConvDim"] }}, block_n={{ ctx["block_n"] }}
+{{ phases.consumer_header(model) }}
+{{ common.mesh_coordinates(model["MeshAxes"]) }}
+    qkv = {{ ptr(model, "QKV") }}
+    conv_state = {{ ptr(model, "ConvState") }}
+    conv_weight = {{ ptr(model, "ConvWeight") }}
+    qkv_output = {{ ptr(model, "QKVOutput") }}
+    active_local_n = {{ model["ActiveLocalConvDim"] }}
+    for channel_start in tl.range(0, {{ ctx["local_n"] }}, {{ ctx["block_n"] }}):
+        channel = channel_start + tl.arange(0, {{ ctx["block_n"] }})
+        channel_mask = channel < active_local_n
+        current = tl.load(
+            {{ access_pointer(model, "QKV", "qkv", contiguous_vector_axis_access(["0", "0"], model["QKVStrides"], packed_axis=1, logical_index="channel", lane_count=model["ActivationLaneCount"])) }},
+            mask=channel_mask,
+            other=0.0,
+        )
+{% set global_packed_channel = pointer_local_to_global_coordinate(model["QKVOutput"], 1, "channel // " ~ model["ActivationLaneCount"]) %}
+{% set global_channel = "(" ~ global_packed_channel ~ ") * " ~ model["ActivationLaneCount"] ~ " + channel % " ~ model["ActivationLaneCount"] %}
+        conv_state_base = (
+            {{ state_axis_offset(model["LayerId"], model["ConvStateLayerAxis"]) }}
+            + {{ state_axis_offset(global_channel, model["ConvStateChannelAxis"]) }}
+        )
+        convolved = current.to(tl.float32) * tl.load(
+            {{ access_pointer(model, "ConvWeight", "conv_weight", tensor_access(["channel", (model["ConvKernelSize"] - 1)|string], model["ConvWeightStrides"])) }},
+            mask=channel_mask,
+            other=0.0,
+        ).to(tl.float32)
+{% for history in range(model["ConvKernelSize"] - 1) %}
+        history{{ history }} = tl.load(
+            conv_state + conv_state_base + {{ state_axis_offset(history|string, model["ConvStateHistoryAxis"]) }},
+            mask=channel_mask,
+            other=0.0,
+        )
+        convolved += history{{ history }}.to(tl.float32) * tl.load(
+            {{ access_pointer(model, "ConvWeight", "conv_weight", tensor_access(["channel", history|string], model["ConvWeightStrides"])) }},
+            mask=channel_mask,
+            other=0.0,
+        ).to(tl.float32)
+{% endfor %}
+{% for history in range(model["ConvKernelSize"] - 1) %}
+        tl.store(
+            conv_state + conv_state_base + {{ state_axis_offset(history|string, model["ConvStateHistoryAxis"]) }},
+            {{ ("history" ~ (history + 1)) if history + 1 < model["ConvKernelSize"] - 1 else "current" }},
+            mask=channel_mask,
+        )
+{% endfor %}
+        convolved = convolved * tl.sigmoid(convolved)
+        tl.store(
+            {{ access_pointer(model, "QKVOutput", "qkv_output", contiguous_vector_axis_access(["0", "0"], model["QKVOutputStrides"], packed_axis=1, logical_index="channel", lane_count=model["ActivationLaneCount"])) }},
+            convolved.to({{ model["ActivationTritonDType"] }}),
+            mask=channel_mask,
+        )
+
+
+{{ phases.dispatch(model) }}

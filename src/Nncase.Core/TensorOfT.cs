@@ -97,6 +97,9 @@ public unsafe sealed partial class Tensor<T> : Tensor, IEnumerable<T>, ICollecti
     /// <inheritdoc/>
     public override Span<byte> BytesBuffer => MemoryMarshal.AsBytes(Buffer.Span);
 
+    /// <inheritdoc/>
+    public override long ByteLength => checked((long)Buffer.Length * Unsafe.SizeOf<T>());
+
     int ICollection<T>.Count => checked((int)Length);
 
     bool ICollection<T>.IsReadOnly => false;
@@ -140,6 +143,35 @@ public unsafe sealed partial class Tensor<T> : Tensor, IEnumerable<T>, ICollecti
     /// </summary>
     /// <param name="value">Value.</param>
     public static implicit operator Tensor<T>(T value) => FromScalar(value);
+
+    /// <inheritdoc/>
+    public override void CopyBytesTo(long sourceByteOffset, Span<byte> destination)
+    {
+        var endByteOffset = checked(sourceByteOffset + destination.Length);
+        if (sourceByteOffset < 0 || endByteOffset > ByteLength)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(sourceByteOffset),
+                $"Byte range [{sourceByteOffset}, {endByteOffset}) is outside the tensor backing buffer [0, {ByteLength}).");
+        }
+
+        const int maxChunkBytes = 1024 * 1024 * 1024;
+        var elementSize = Unsafe.SizeOf<T>();
+        var remaining = destination;
+        while (!remaining.IsEmpty)
+        {
+            var elementOffset = sourceByteOffset / elementSize;
+            var byteOffsetInElement = checked((int)(sourceByteOffset % elementSize));
+            var copyCapacity = Math.Min(remaining.Length, maxChunkBytes - byteOffsetInElement);
+            var elementCount = checked((int)(((long)byteOffsetInElement + copyCapacity + elementSize - 1) / elementSize));
+            var source = MemoryMarshal.AsBytes(
+                Buffer.Span.Slice(checked((int)elementOffset), elementCount));
+            var copyLength = Math.Min(remaining.Length, source.Length - byteOffsetInElement);
+            source.Slice(byteOffsetInElement, copyLength).CopyTo(remaining);
+            sourceByteOffset += copyLength;
+            remaining = remaining[copyLength..];
+        }
+    }
 
     /// <summary>
     /// Creates a shallow copy of this tensor, with new backing storage.

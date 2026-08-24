@@ -277,8 +277,10 @@ public sealed class UnitTestDistribAutoDistributed : TestClassBase
                 downTuple.InputTypes[SparseExpertsDown.MoeExpertDownProjW.Index]).AxisPolicies.ToArray());
     }
 
-    [Fact]
-    public void TestGatedDeltaNetStageCandidateProvidersDeriveIndependentContracts()
+    [Theory]
+    [InlineData(32)]
+    [InlineData(48)]
+    public void TestGatedDeltaNetStageCandidateProvidersDeriveIndependentContracts(int numValueHeads)
     {
         var options = new PyNTTTargetOptions
         {
@@ -290,12 +292,11 @@ public sealed class UnitTestDistribAutoDistributed : TestClassBase
         var placement = new Placement([4, 8], "yx", "bb");
         const int hidden = 64;
         const int numKeyHeads = 4;
-        const int numValueHeads = 32;
         const int keyHeadDim = 8;
         const int valueHeadDim = 8;
         const int convKernelSize = 4;
-        const int convDim = 320;
-        const int valueDim = 256;
+        var convDim = (numKeyHeads * keyHeadDim * 2) + (numValueHeads * valueHeadDim);
+        var valueDim = numValueHeads * valueHeadDim;
         var bf16 = DataTypes.BFloat16;
         Var Buffer(string name, DataType dtype, params long[] shape) =>
             new(name, new TensorType(dtype, new RankedShape(shape)));
@@ -342,52 +343,52 @@ public sealed class UnitTestDistribAutoDistributed : TestClassBase
         var state = Buffer(
             "state",
             new ReferenceType(new GatedDeltaNetStateType { Config = stateConfig }));
-        var projectionCall = IR.F.NN.GatedDeltaNetProjection(
-            input,
+        var packedActivation = new VectorType(bf16, [8]);
+        var qkv = Buffer("qkv", packedActivation, 1, convDim / 8);
+        var convolutionCall = IR.F.NN.GatedDeltaNetConvolution(
+            qkv,
             state,
-            Buffer("qkv_weight", bf16, hidden, convDim),
             Buffer("conv_weight", bf16, convDim, convKernelSize),
             0,
             convKernelSize);
-        var projectionOutput = Assert.IsType<TupleType>(projectionCall.CheckedType);
-        var projectionDefaultOutput = new TupleType([
-            Broadcast(Assert.IsType<TensorType>(projectionOutput[0])),
-            projectionOutput[1],
+        var convolutionOutput = Assert.IsType<TupleType>(convolutionCall.CheckedType);
+        var convolutionDefaultOutput = new TupleType([
+            Broadcast(Assert.IsType<TensorType>(convolutionOutput[0])),
+            convolutionOutput[1],
         ]);
-        var projectionExpectedOutput = new TupleType([
+        var convolutionExpectedOutput = new TupleType([
             new DistributedType(
-                Assert.IsType<TensorType>(projectionOutput[0]),
+                Assert.IsType<TensorType>(convolutionOutput[0]),
                 [SBP.B, SBP.SContiguous([0, 1])],
                 placement),
-            projectionOutput[1],
+            convolutionOutput[1],
         ]);
-        var projectionProvider = new GatedDeltaNetProjectionCandidateProvider();
-        var projectionTarget = Assert.IsType<GatedDeltaNetProjection>(projectionCall.Target);
-        Assert.True(projectionProvider.IsExhaustive);
+        var convolutionProvider = new GatedDeltaNetConvolutionCandidateProvider();
+        var convolutionTarget = Assert.IsType<GatedDeltaNetConvolution>(convolutionCall.Target);
+        Assert.True(convolutionProvider.IsExhaustive);
         Assert.Contains(
-            projectionExpectedOutput,
-            projectionProvider.GetReturnCandidateTypes(
-                Context(projectionCall),
-                projectionTarget,
-                [projectionDefaultOutput]));
-        Assert.True(projectionProvider.TryGetInputTypeTuples(
-            Context(projectionCall),
-            projectionTarget,
-            projectionExpectedOutput,
-            out var projectionTuples));
-        var projectionInputs = Assert.Single(projectionTuples).InputTypes;
-        Assert.Equal(state.CheckedType, projectionInputs[GatedDeltaNetProjection.State.Index]);
+            convolutionExpectedOutput,
+            convolutionProvider.GetReturnCandidateTypes(
+                Context(convolutionCall),
+                convolutionTarget,
+                [convolutionDefaultOutput]));
+        Assert.True(convolutionProvider.TryGetInputTypeTuples(
+            Context(convolutionCall),
+            convolutionTarget,
+            convolutionExpectedOutput,
+            out var convolutionTuples));
+        var convolutionInputs = Assert.Single(convolutionTuples).InputTypes;
+        Assert.Equal(state.CheckedType, convolutionInputs[GatedDeltaNetConvolution.State.Index]);
         Assert.Equal(
             new SBP[] { SBP.B, SBP.SContiguous([0, 1]) },
-            Assert.IsType<DistributedType>(projectionInputs[GatedDeltaNetProjection.QKVWeight.Index]).AxisPolicies.ToArray());
+            Assert.IsType<DistributedType>(convolutionInputs[GatedDeltaNetConvolution.QKV.Index]).AxisPolicies.ToArray());
 
         var recurrentCall = IR.F.NN.GatedDeltaNetRecurrentCore(
-            input,
             state,
-            new Var("qkv", projectionOutput[0]),
-            Buffer("z_weight", bf16, hidden, valueDim),
-            Buffer("b_weight", bf16, hidden, numValueHeads),
-            Buffer("a_weight", bf16, hidden, numValueHeads),
+            new Var("convolved_qkv", convolutionOutput[0]),
+            Buffer("z", packedActivation, 1, valueDim / 8),
+            Buffer("b_projection", packedActivation, 1, numValueHeads / 8),
+            Buffer("a_projection", packedActivation, 1, numValueHeads / 8),
             Buffer("a_log", DataTypes.Float32, numValueHeads),
             Buffer("dt_bias", DataTypes.Float32, numValueHeads),
             Buffer("norm_weight", DataTypes.Float32, valueHeadDim),
@@ -398,6 +399,15 @@ public sealed class UnitTestDistribAutoDistributed : TestClassBase
             valueHeadDim,
             1e-6F);
         var recurrentOutput = Assert.IsType<TupleType>(recurrentCall.CheckedType);
+        var headSplit = DistributedUtility.CreateUnitAlignedContiguousSplit(
+            [0, 1],
+            placement,
+            numValueHeads);
+        var valueSplit = DistributedUtility.CreateUnitAlignedContiguousSplit(
+            [0, 1],
+            placement,
+            numValueHeads,
+            valueHeadDim);
         var recurrentDefaultOutput = new TupleType([
             Broadcast(Assert.IsType<TensorType>(recurrentOutput[0])),
             recurrentOutput[1],
@@ -405,7 +415,7 @@ public sealed class UnitTestDistribAutoDistributed : TestClassBase
         var recurrentExpectedOutput = new TupleType([
             new DistributedType(
                 Assert.IsType<TensorType>(recurrentOutput[0]),
-                [SBP.B, SBP.SContiguous([0, 1])],
+                [SBP.B, valueSplit],
                 placement),
             recurrentOutput[1],
         ]);
@@ -429,10 +439,16 @@ public sealed class UnitTestDistribAutoDistributed : TestClassBase
             Assert.IsType<DistributedType>(recurrentInputs[GatedDeltaNetRecurrentCore.QKV.Index]).AxisPolicies,
             policy => Assert.IsType<SBPBroadCast>(policy));
         Assert.Equal(
-            new SBP[] { SBP.B, SBP.SContiguous([0, 1]) },
-            Assert.IsType<DistributedType>(recurrentInputs[GatedDeltaNetRecurrentCore.ZWeight.Index]).AxisPolicies.ToArray());
+            new SBP[] { SBP.B, valueSplit },
+            Assert.IsType<DistributedType>(recurrentInputs[GatedDeltaNetRecurrentCore.Z.Index]).AxisPolicies.ToArray());
+        Assert.All(
+            Assert.IsType<DistributedType>(recurrentInputs[GatedDeltaNetRecurrentCore.BProjection.Index]).AxisPolicies,
+            policy => Assert.IsType<SBPBroadCast>(policy));
+        Assert.All(
+            Assert.IsType<DistributedType>(recurrentInputs[GatedDeltaNetRecurrentCore.AProjection.Index]).AxisPolicies,
+            policy => Assert.IsType<SBPBroadCast>(policy));
         Assert.Equal(
-            new SBP[] { SBP.SContiguous([0, 1]) },
+            new SBP[] { headSplit },
             Assert.IsType<DistributedType>(recurrentInputs[GatedDeltaNetRecurrentCore.ALog.Index]).AxisPolicies.ToArray());
     }
 

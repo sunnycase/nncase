@@ -210,14 +210,13 @@ internal sealed class PyNTTFunctionBuilder
 
                 var sourceElementOffset = TensorUtilities.GetLinearOffset(tensor.Strides, sourceIndex);
                 var destinationElementOffset = TensorUtilities.GetLinearOffset(localStrides, destinationIndex);
-                var sourceByteOffset = checked((int)(sourceElementOffset * elementSize));
+                var sourceByteOffset = checked(sourceElementOffset * elementSize);
                 var destinationByteOffset = checked((int)(destinationElementOffset * elementSize));
-                var sourceBytes = tensor.BytesBuffer;
-                if (sourceByteOffset < 0 || sourceByteOffset + elementSize > sourceBytes.Length)
+                if (sourceByteOffset < 0 || sourceByteOffset + elementSize > tensor.ByteLength)
                 {
                     throw new InvalidDataException(
                         $"Derived block-local rdata source slice is out of range: " +
-                        $"source={sourceByteOffset}, element_size={elementSize}, tensor_bytes={sourceBytes.Length}, " +
+                        $"source={sourceByteOffset}, element_size={elementSize}, tensor_bytes={tensor.ByteLength}, " +
                         $"source_shape=[{string.Join(',', tensor.Dimensions.ToArray())}], " +
                         $"source_strides=[{string.Join(',', tensor.Strides.ToArray())}], " +
                         $"source_index=[{string.Join(',', sourceIndex)}], source_type={source.DistributedType}.");
@@ -232,8 +231,7 @@ internal sealed class PyNTTFunctionBuilder
                         $"destination_index=[{string.Join(',', destinationIndex)}].");
                 }
 
-                sourceBytes.Slice(sourceByteOffset, elementSize)
-                    .CopyTo(payload.AsSpan(destinationByteOffset, elementSize));
+                tensor.CopyBytesTo(sourceByteOffset, payload.AsSpan(destinationByteOffset, elementSize));
             }
 
             concatenatedAxisOffset = checked(concatenatedAxisOffset + sourceCapacity[materialization.Axis]);
@@ -263,8 +261,6 @@ internal sealed class PyNTTFunctionBuilder
         var localElementCount = TensorUtilities.GetProduct(localShape);
         var localIndex = new long[localShape.Length];
         var sourceIndex = new long[localShape.Length];
-        var sourceBytes = tensor.BytesBuffer;
-
         for (long linear = 0; linear < localElementCount; linear++)
         {
             TensorUtilities.UnravelIndex(linear, localShape, localIndex);
@@ -282,12 +278,12 @@ internal sealed class PyNTTFunctionBuilder
 
             var sourceElementOffset = TensorUtilities.GetLinearOffset(tensor.Strides, sourceIndex);
             var destinationElementOffset = TensorUtilities.GetLinearOffset(localStrides, localIndex);
-            var sourceByteOffset = checked((int)(sourceElementOffset * elementSize));
+            var sourceByteOffset = checked(sourceElementOffset * elementSize);
             var destinationByteOffset = checked((int)(destinationElementOffset * elementSize));
 
-            if (sourceByteOffset < 0 || sourceByteOffset + elementSize > sourceBytes.Length)
+            if (sourceByteOffset < 0 || sourceByteOffset + elementSize > tensor.ByteLength)
             {
-                throw new InvalidDataException($"The PyNTT local rdata source slice is out of range: source={sourceByteOffset}, element_size={elementSize}, tensor_bytes={sourceBytes.Length}.");
+                throw new InvalidDataException($"The PyNTT local rdata source slice is out of range: source={sourceByteOffset}, element_size={elementSize}, tensor_bytes={tensor.ByteLength}.");
             }
 
             if (destinationByteOffset < 0 || destinationByteOffset + elementSize > payload.Length)
@@ -295,8 +291,7 @@ internal sealed class PyNTTFunctionBuilder
                 throw new InvalidDataException($"The PyNTT local rdata destination slice is out of range: destination={destinationByteOffset}, element_size={elementSize}, payload_bytes={payload.Length}.");
             }
 
-            sourceBytes.Slice(sourceByteOffset, elementSize)
-                .CopyTo(payload.AsSpan(destinationByteOffset, elementSize));
+            tensor.CopyBytesTo(sourceByteOffset, payload.AsSpan(destinationByteOffset, elementSize));
         }
 
         stream.Position = checked((long)range.Min);

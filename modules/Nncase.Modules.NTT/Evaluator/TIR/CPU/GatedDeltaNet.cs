@@ -6,9 +6,9 @@ using Nncase.TIR.NTT;
 
 namespace Nncase.Evaluator.TIR.NTT;
 
-public sealed class GatedDeltaNetProjectionEvaluator : ITypeInferencer<GatedDeltaNetProjection>
+public sealed class GatedDeltaNetConvolutionEvaluator : ITypeInferencer<GatedDeltaNetConvolution>
 {
-    public IRType Visit(ITypeInferenceContext context, GatedDeltaNetProjection target) => TupleType.Void;
+    public IRType Visit(ITypeInferenceContext context, GatedDeltaNetConvolution target) => TupleType.Void;
 }
 
 public sealed class GatedDeltaNetRecurrentCoreEvaluator : ITypeInferencer<GatedDeltaNetRecurrentCore>

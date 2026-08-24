@@ -197,6 +197,46 @@ public static class DistributedUtility
         return 1;
     }
 
+    /// <summary>
+    /// Creates a contiguous split whose local capacity never cuts a semantic unit.
+    /// </summary>
+    public static SBPSplit CreateUnitAlignedContiguousSplit(
+        IRArray<int> hierarchyAxes,
+        Placement placement,
+        long unitCount,
+        long elementsPerUnit = 1)
+    {
+        if (unitCount <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(unitCount), unitCount, "Unit count must be positive.");
+        }
+
+        if (elementsPerUnit <= 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(elementsPerUnit),
+                elementsPerUnit,
+                "Elements per unit must be positive.");
+        }
+
+        if (hierarchyAxes.Count == 0 ||
+            hierarchyAxes.Distinct().Count() != hierarchyAxes.Count ||
+            hierarchyAxes.Any(axis => axis < 0 || axis >= placement.Rank))
+        {
+            throw new ArgumentException(
+                "Unit-aligned split axes must be a non-empty, unique subset of the placement axes.",
+                nameof(hierarchyAxes));
+        }
+
+        var shardCount = hierarchyAxes.Aggregate(
+            1L,
+            (product, axis) => checked(product * placement.Hierarchy[axis]));
+        var localUnitCapacity = MathUtility.CeilDiv(unitCount, shardCount);
+        return SBP.SContiguous(
+            hierarchyAxes,
+            checked(localUnitCapacity * elementsPerUnit));
+    }
+
     public static Dimension GetLocalCapacity(
         Dimension globalExtent,
         SBPSplit split,

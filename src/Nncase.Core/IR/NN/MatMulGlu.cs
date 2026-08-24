@@ -2,6 +2,7 @@
 // Licensed under the Apache license. See LICENSE file in the project root for full license information.
 
 using Nncase.PatternMatch;
+using Nncase.IR.Math;
 
 namespace Nncase.IR.NN;
 
@@ -44,5 +45,13 @@ public sealed partial class MatMulGlu : Op
 
     public DataType OutputDataType { get; }
 
-    public override string DisplayProperty() => $"GluType: {GluType}, OutputDataType: {OutputDataType}";
+    public MatMulQuantizationMode QuantizationMode { get; }
+
+    public long WeightBlockN { get; }
+
+    public long WeightBlockK { get; }
+
+    public override string DisplayProperty() =>
+        $"GluType: {GluType}, OutputDataType: {OutputDataType}, " +
+        $"QuantizationMode: {QuantizationMode}, WeightBlock: [{WeightBlockN}, {WeightBlockK}]";
 }

@@ -25,7 +25,7 @@ internal class NNModule : IApplicationPart
         registrator.RegisterManyInterface<QKVParallelLinearEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<QKVRoPEWithCacheEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<GatedDeltaNetEvaluator>(reuse: Reuse.Singleton);
-        registrator.RegisterManyInterface<GatedDeltaNetProjectionEvaluator>(reuse: Reuse.Singleton);
+        registrator.RegisterManyInterface<GatedDeltaNetConvolutionEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<GatedDeltaNetRecurrentCoreEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<MatMulGluEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<RoPEEvaluator>(reuse: Reuse.Singleton);

@@ -21,6 +21,8 @@ internal class MathModule : IApplicationPart
         registrator.RegisterManyInterface<FakeDequantizeEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<FakeQuantizeEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<MatMulEvaluator>(reuse: Reuse.Singleton);
+        registrator.RegisterManyInterface<ScaledMatMulEvaluator>(reuse: Reuse.Singleton);
+        registrator.RegisterManyInterface<BlockScaledMatMulEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<QuantizeEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<QuantParamOfEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<RangeOfEvaluator>(reuse: Reuse.Singleton);

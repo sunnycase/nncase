@@ -3,6 +3,7 @@
 
 using Nncase.IR;
 using Nncase.IR.NN;
+using Nncase.IR.Math;
 
 namespace Nncase.TIR.NTT;
 
@@ -30,5 +31,13 @@ public sealed partial class MatMulGlu : NTTKernelOp
 
     public GluType GluType { get; }
 
-    public override string DisplayProperty() => $"GluType: {GluType}";
+    public MatMulQuantizationMode QuantizationMode { get; }
+
+    public long WeightBlockN { get; }
+
+    public long WeightBlockK { get; }
+
+    public override string DisplayProperty() =>
+        $"GluType: {GluType}, QuantizationMode: {QuantizationMode}, " +
+        $"WeightBlock: [{WeightBlockN}, {WeightBlockK}]";
 }

@@ -20,30 +20,27 @@ public partial class NTT
     private static Call KernelCall(NTTKernelOp op, params BaseExpr[] arguments)
         => op.CreateCall(arguments);
 
-    public static Expr GatedDeltaNetProjection(
-        Expr input,
+    public static Expr GatedDeltaNetConvolution(
+        Expr qkv,
         Expr state,
-        Expr qkvWeight,
         Expr convWeight,
         Expr qkvOutput,
         Dimension layerId,
         long convKernelSize) =>
         KernelCall(
-            new TIR.NTT.GatedDeltaNetProjection(convKernelSize),
-            input,
+            new TIR.NTT.GatedDeltaNetConvolution(convKernelSize),
+            qkv,
             state,
-            qkvWeight,
             convWeight,
             qkvOutput,
             layerId);
 
     public static Expr GatedDeltaNetRecurrentCore(
-        Expr input,
         Expr state,
         Expr qkv,
-        Expr zWeight,
-        Expr bWeight,
-        Expr aWeight,
+        Expr z,
+        Expr bProjection,
+        Expr aProjection,
         Expr aLog,
         Expr dtBias,
         Expr normWeight,
@@ -61,12 +58,11 @@ public partial class NTT
                 keyHeadDim,
                 valueHeadDim,
                 epsilon),
-            input,
             state,
             qkv,
-            zWeight,
-            bWeight,
-            aWeight,
+            z,
+            bProjection,
+            aProjection,
             aLog,
             dtBias,
             normWeight,
@@ -136,6 +132,40 @@ public partial class NTT
             loadC,
             scale,
             addend ?? None.Default);
+    }
+
+    public static Call PackedScaledMatMul(
+        Expr lhs,
+        Expr rhs,
+        Expr lhsScale,
+        Expr rhsScale,
+        Expr output,
+        IR.NTT.PackedMatMulRhsLayout rhsLayout)
+    {
+        return KernelCall(
+            new PackedScaledMatMul(rhsLayout),
+            lhs,
+            rhs,
+            lhsScale,
+            rhsScale,
+            output);
+    }
+
+    public static Call PackedBlockScaledMatMul(
+        Expr lhs,
+        Expr rhs,
+        Expr rhsScale,
+        Expr output,
+        IR.NTT.PackedMatMulRhsLayout rhsLayout,
+        long weightBlockN,
+        long weightBlockK)
+    {
+        return KernelCall(
+            new PackedBlockScaledMatMul(rhsLayout, weightBlockN, weightBlockK),
+            lhs,
+            rhs,
+            rhsScale,
+            output);
     }
 
     public static Call PackedMatMulNormStats(
@@ -325,10 +355,14 @@ public partial class NTT
         Expr gateWeightScale,
         Expr upWeightScale,
         Expr output,
-        IR.NN.GluType gluType)
+        IR.NN.GluType gluType,
+        global::Nncase.IR.Math.MatMulQuantizationMode quantizationMode =
+            global::Nncase.IR.Math.MatMulQuantizationMode.None,
+        long weightBlockN = 0,
+        long weightBlockK = 0)
     {
         return KernelCall(
-            new MatMulGlu(gluType),
+            new MatMulGlu(gluType, quantizationMode, weightBlockN, weightBlockK),
             input,
             gateWeight,
             upWeight,
@@ -353,10 +387,19 @@ public partial class NTT
         Expr upWeightScale,
         Expr output,
         IR.NN.GluType gluType,
-        IR.NTT.PackedMatMulRhsLayout rhsLayout = IR.NTT.PackedMatMulRhsLayout.NMajor)
+        IR.NTT.PackedMatMulRhsLayout rhsLayout = IR.NTT.PackedMatMulRhsLayout.NMajor,
+        global::Nncase.IR.Math.MatMulQuantizationMode quantizationMode =
+            global::Nncase.IR.Math.MatMulQuantizationMode.None,
+        long weightBlockN = 0,
+        long weightBlockK = 0)
     {
         return KernelCall(
-            new PackedMatMulGlu(gluType, rhsLayout),
+            new PackedMatMulGlu(
+                gluType,
+                rhsLayout,
+                quantizationMode,
+                weightBlockN,
+                weightBlockK),
             input,
             gateWeight,
             upWeight,

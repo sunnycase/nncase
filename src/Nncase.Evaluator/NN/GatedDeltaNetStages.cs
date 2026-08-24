@@ -6,18 +6,19 @@ using System.Collections.Generic;
 using System.Linq;
 using Nncase.CostModel;
 using Nncase.IR;
+using Nncase.IR.Math;
 using Nncase.IR.NN;
 using Nncase.Utilities;
 using OrtKISharp;
 
 namespace Nncase.Evaluator.NN;
 
-public sealed class GatedDeltaNetProjectionEvaluator :
-    IEvaluator<GatedDeltaNetProjection>,
-    ITypeInferencer<GatedDeltaNetProjection>,
-    ICostEvaluator<GatedDeltaNetProjection>
+public sealed class GatedDeltaNetConvolutionEvaluator :
+    IEvaluator<GatedDeltaNetConvolution>,
+    ITypeInferencer<GatedDeltaNetConvolution>,
+    ICostEvaluator<GatedDeltaNetConvolution>
 {
-    public IRType Visit(ITypeInferenceContext context, GatedDeltaNetProjection target)
+    public IRType Visit(ITypeInferenceContext context, GatedDeltaNetConvolution target)
     {
         var arguments = target.Parameters
             .Select(parameter => context.CheckArgumentType<IRType>(target, parameter))
@@ -25,14 +26,12 @@ public sealed class GatedDeltaNetProjectionEvaluator :
         return InferType(target, arguments);
     }
 
-    public Cost Visit(ICostEvaluateContext context, GatedDeltaNetProjection target)
+    public Cost Visit(ICostEvaluateContext context, GatedDeltaNetConvolution target)
     {
-        var input = GatedDeltaNetStageUtility.GetLocalTensorType(
-            context.GetArgumentType<IRType>(target, GatedDeltaNetProjection.Input));
-        var qkvWeight = GatedDeltaNetStageUtility.GetLocalTensorType(
-            context.GetArgumentType<IRType>(target, GatedDeltaNetProjection.QKVWeight));
+        var qkv = GatedDeltaNetStageUtility.GetLocalTensorType(
+            context.GetArgumentType<IRType>(target, GatedDeltaNetConvolution.QKV));
         var convWeight = GatedDeltaNetStageUtility.GetLocalTensorType(
-            context.GetArgumentType<IRType>(target, GatedDeltaNetProjection.ConvWeight));
+            context.GetArgumentType<IRType>(target, GatedDeltaNetConvolution.ConvWeight));
         var output = context.GetReturnType<TupleType>();
         var qkvOutput = GatedDeltaNetStageUtility.GetLocalTensorType(output[0]);
         var scalarQkvOutput = GatedDeltaNetStageUtility.UnpackTensorAxis(
@@ -43,8 +42,7 @@ public sealed class GatedDeltaNetProjectionEvaluator :
             return Cost.Zero;
         }
 
-        var cost = Cost.Zero;
-        GatedDeltaNetStageUtility.AddMatMulCost(context, input, qkvWeight, scalarQkvOutput, ref cost);
+        var cost = new Cost();
         GatedDeltaNetStageUtility.AddCostFactor(
             cost,
             CostFactorNames.CPUCycles,
@@ -54,33 +52,43 @@ public sealed class GatedDeltaNetProjectionEvaluator :
             CostFactorNames.BlockLocalMemoryLoadBytes,
             checked(
                 (UInt128)qkvShape[1] * (UInt128)(target.ConvKernelSize - 1) *
-                (UInt128)GatedDeltaNetStageUtility.GetScalarDataType(input.DType).SizeInBytes +
+                (UInt128)GatedDeltaNetStageUtility.GetScalarDataType(qkv.DType).SizeInBytes +
+                CostUtility.GetMemoryAccess(qkv) +
                 CostUtility.GetMemoryAccess(convWeight)));
         GatedDeltaNetStageUtility.AddCostFactor(
             cost,
             CostFactorNames.BlockLocalMemoryStoreBytes,
             checked(
                 (UInt128)qkvShape[1] * (UInt128)(target.ConvKernelSize - 1) *
-                (UInt128)GatedDeltaNetStageUtility.GetScalarDataType(input.DType).SizeInBytes));
+                (UInt128)GatedDeltaNetStageUtility.GetScalarDataType(qkv.DType).SizeInBytes +
+                CostUtility.GetMemoryAccess(qkvOutput)));
         return cost;
     }
 
-    public IValue Visit(IEvaluateContext context, GatedDeltaNetProjection target)
+    public IValue Visit(IEvaluateContext context, GatedDeltaNetConvolution target)
     {
-        var inputValue = context.GetArgumentValueAsTensor(target, GatedDeltaNetProjection.Input);
-        var input = inputValue.ToOrtTensor();
-        var stateValue = context.GetArgumentValue(target, GatedDeltaNetProjection.State);
+        var qkvValue = context.GetArgumentValueAsTensor(target, GatedDeltaNetConvolution.QKV);
+        var qkv = qkvValue.ToOrtTensor();
+        var stateValue = context.GetArgumentValue(target, GatedDeltaNetConvolution.State);
         var state = stateValue.AsTensor().Cast<Reference<IGatedDeltaNetState>>().Single().Value;
-        var layerId = checked((int)context.GetArgumentValue(target, GatedDeltaNetProjection.LayerId).AsTensor().ToScalar<long>());
+        var layerId = checked((int)context.GetArgumentValue(target, GatedDeltaNetConvolution.LayerId).AsTensor().ToScalar<long>());
         var convState = state.GetState(GatedDeltaNetStateKind.Convolution, layerId).ToOrtTensor();
-        var qkvWeight = context.GetArgumentValueAsTensor(target, GatedDeltaNetProjection.QKVWeight).ToOrtTensor();
-        var convWeight = context.GetArgumentValueAsTensor(target, GatedDeltaNetProjection.ConvWeight).ToOrtTensor();
-        var outputs = new List<OrtKISharp.Tensor>(checked((int)input.Shape[0]));
-        for (var token = 0L; token < input.Shape[0]; token++)
+        var qkvLanes = GatedDeltaNetStageUtility.GetDataTypeLanes(qkvValue.ElementType);
+        if (qkvLanes.Count != 0)
         {
-            var hidden = OrtKI.Slice(input, new[] { token }, new[] { token + 1 }, new[] { 0L }, new[] { 1L });
-            var projected = OrtKI.MatMul(hidden, qkvWeight);
-            var current = OrtKI.Transpose(projected, new[] { 1L, 0L });
+            qkv = qkv.Unpack(
+                qkvLanes.Count,
+                Enumerable.Repeat(1, qkvLanes.Count).ToArray());
+        }
+
+        var scalarType = GatedDeltaNetStageUtility.GetScalarDataType(qkvValue.ElementType);
+        var convWeight = context.GetArgumentValueAsTensor(target, GatedDeltaNetConvolution.ConvWeight).ToOrtTensor();
+        var outputs = new List<OrtKISharp.Tensor>(checked((int)qkv.Shape[0]));
+        for (var token = 0L; token < qkv.Shape[0]; token++)
+        {
+            var current = OrtKI.Transpose(
+                OrtKI.Slice(qkv, new[] { token }, new[] { token + 1 }, new[] { 0L }, new[] { 1L }),
+                new[] { 1L, 0L });
             var history = OrtKI.Concat(new[] { convState, current }, 1L);
             convState = OrtKI.Slice(
                 history,
@@ -100,16 +108,12 @@ public sealed class GatedDeltaNetProjectionEvaluator :
         state.UpdateState(
             GatedDeltaNetStateKind.Convolution,
             layerId,
-            convState.ToTensor().CastElementTo(inputValue.ElementType));
+            convState.ToTensor().CastElementTo(scalarType));
         var output = OrtKI.Concat(outputs.ToArray(), 0L);
-        var outputLanes = GatedDeltaNetStageUtility.GetPackedLanes(
-            state.Config,
-            GatedDeltaNetStateKind.Convolution,
-            GatedDeltaNetStateDimKind.ConvChannels);
         var outputValue = GatedDeltaNetStageUtility.PackValue(
             output,
-            inputValue.ElementType,
-            outputLanes,
+            scalarType,
+            qkvLanes,
             1);
         return new TupleValue([
             outputValue,
@@ -117,16 +121,19 @@ public sealed class GatedDeltaNetProjectionEvaluator :
         ]);
     }
 
-    public static IRType InferType(GatedDeltaNetProjection target, IReadOnlyList<IRType> arguments)
+    public static IRType InferType(GatedDeltaNetConvolution target, IReadOnlyList<IRType> arguments)
     {
         if (arguments.Count != target.Parameters.Count)
         {
-            return new InvalidType($"GatedDeltaNetProjection expects {target.Parameters.Count} inputs, got {arguments.Count}.");
+            return new InvalidType($"GatedDeltaNetConvolution expects {target.Parameters.Count} inputs, got {arguments.Count}.");
         }
 
-        if (arguments.OfType<InvalidType>().FirstOrDefault() is { } invalid)
+        if (arguments
+            .Select((type, index) => (type, index))
+            .FirstOrDefault(item => item.type is InvalidType) is { type: InvalidType invalid, index: var invalidIndex })
         {
-            return invalid;
+            return new InvalidType(
+                $"GatedDeltaNetConvolution argument {target.Parameters[invalidIndex].Name} is invalid: {invalid.Reason}");
         }
 
         if (arguments.Any(type => type is AnyType))
@@ -134,20 +141,20 @@ public sealed class GatedDeltaNetProjectionEvaluator :
             return AnyType.Default;
         }
 
-        if (GatedDeltaNetStageUtility.AreTensorArguments(arguments, GatedDeltaNetProjection.LayerId.Index))
+        if (GatedDeltaNetStageUtility.AreTensorArguments(arguments, GatedDeltaNetConvolution.LayerId.Index))
         {
             return InferTensorType(target, arguments);
         }
 
         if (!GatedDeltaNetStageUtility.TryGetDistributedArguments(
                 arguments,
-                GatedDeltaNetProjection.LayerId.Index,
-                GatedDeltaNetProjection.State.Index,
+                GatedDeltaNetConvolution.LayerId.Index,
+                GatedDeltaNetConvolution.State.Index,
                 out var distributed,
                 out var placement))
         {
             return new InvalidType(
-                "GatedDeltaNetProjection inputs must be either all tensors or compatible distributed tensors.");
+                "GatedDeltaNetConvolution inputs must be either all tensors or compatible distributed tensors.");
         }
 
         var localArguments = GatedDeltaNetStageUtility.GetTensorArguments(arguments, distributed);
@@ -157,31 +164,30 @@ public sealed class GatedDeltaNetProjectionEvaluator :
             return tensorResult;
         }
 
-        var channel = distributed[GatedDeltaNetProjection.QKVWeight.Index].AxisPolicies[1];
+        var channel = distributed[GatedDeltaNetConvolution.QKV.Index].AxisPolicies[1];
         if (!GatedDeltaNetStageUtility.TryGetContiguousAxes(channel, placement.Rank, out var channelAxes))
         {
             return new InvalidType(
-                "GatedDeltaNetProjection QKV-weight output channels must be broadcast or contiguously split.");
+                "GatedDeltaNetConvolution QKV channels must be broadcast or contiguously split.");
         }
 
         if (!GatedDeltaNetStageUtility.CoversPlacement(channelAxes, placement.Rank))
         {
             return new InvalidType(
-                "GatedDeltaNetProjection channel split must cover the block placement so each state channel has one writer.");
+                "GatedDeltaNetConvolution channel split must cover the block placement so each state channel has one writer.");
         }
 
         var expected = new Dictionary<int, DistributedType>
         {
-            [GatedDeltaNetProjection.Input.Index] = GatedDeltaNetStageUtility.CreateBroadcast(distributed[GatedDeltaNetProjection.Input.Index].TensorType, placement),
-            [GatedDeltaNetProjection.QKVWeight.Index] = GatedDeltaNetStageUtility.Create(distributed[GatedDeltaNetProjection.QKVWeight.Index].TensorType, [SBP.B, channel], placement),
-            [GatedDeltaNetProjection.ConvWeight.Index] = GatedDeltaNetStageUtility.Create(distributed[GatedDeltaNetProjection.ConvWeight.Index].TensorType, [channel, SBP.B], placement),
+            [GatedDeltaNetConvolution.QKV.Index] = GatedDeltaNetStageUtility.Create(distributed[GatedDeltaNetConvolution.QKV.Index].TensorType, [SBP.B, channel], placement),
+            [GatedDeltaNetConvolution.ConvWeight.Index] = GatedDeltaNetStageUtility.Create(distributed[GatedDeltaNetConvolution.ConvWeight.Index].TensorType, [channel, SBP.B], placement),
         };
         foreach (var (index, expectedType) in expected)
         {
             if (distributed[index] != expectedType)
             {
                 return new InvalidType(
-                    $"GatedDeltaNetProjection input {target.Parameters[index].Name} has distributed type " +
+                    $"GatedDeltaNetConvolution input {target.Parameters[index].Name} has distributed type " +
                     $"{distributed[index]}; expected {expectedType}.");
             }
         }
@@ -193,21 +199,20 @@ public sealed class GatedDeltaNetProjectionEvaluator :
     }
 
     public static IRType InferTensorType(
-        GatedDeltaNetProjection target,
+        GatedDeltaNetConvolution target,
         IReadOnlyList<IRType> arguments)
     {
         if (target.ConvKernelSize < 2)
         {
-            return new InvalidType("GatedDeltaNetProjection convolution kernel size must be at least two.");
+            return new InvalidType("GatedDeltaNetConvolution convolution kernel size must be at least two.");
         }
 
-        if (arguments[GatedDeltaNetProjection.Input.Index] is not TensorType input ||
-            arguments[GatedDeltaNetProjection.State.Index] is not TensorType state ||
-            arguments[GatedDeltaNetProjection.QKVWeight.Index] is not TensorType qkvWeight ||
-            arguments[GatedDeltaNetProjection.ConvWeight.Index] is not TensorType convWeight ||
-            arguments[GatedDeltaNetProjection.LayerId.Index] is not DimensionType)
+        if (arguments[GatedDeltaNetConvolution.QKV.Index] is not TensorType qkv ||
+            arguments[GatedDeltaNetConvolution.State.Index] is not TensorType state ||
+            arguments[GatedDeltaNetConvolution.ConvWeight.Index] is not TensorType convWeight ||
+            arguments[GatedDeltaNetConvolution.LayerId.Index] is not DimensionType)
         {
-            return new InvalidType("GatedDeltaNetProjection expects tensor operands and a dimension-valued layer id.");
+            return new InvalidType("GatedDeltaNetConvolution expects tensor operands and a dimension-valued layer id.");
         }
 
         if (!GatedDeltaNetEvaluator.TryGetStateConfig(state, out var stateConfig, out var stateError))
@@ -215,48 +220,40 @@ public sealed class GatedDeltaNetProjectionEvaluator :
             return new InvalidType(stateError);
         }
 
-        if (input.Shape is not RankedShape { Rank: 2 } inputShape ||
-            qkvWeight.Shape is not RankedShape { Rank: 2 } qkvWeightShape ||
+        if (qkv.Shape is not RankedShape { Rank: 2 } ||
             convWeight.Shape is not RankedShape { Rank: 2 } convWeightShape)
         {
-            return new InvalidType("GatedDeltaNetProjection expects rank-2 tensor inputs.");
+            return new InvalidType("GatedDeltaNetConvolution expects rank-2 tensor inputs.");
         }
 
-        if (input.DType != stateConfig.ActivationPrimType ||
-            qkvWeight.DType != input.DType ||
-            convWeight.DType != input.DType)
-        {
-            return new InvalidType(
-                $"GatedDeltaNetProjection inputs must use scalar activation dtype {stateConfig.ActivationPrimType}.");
-        }
-
-        if (!GatedDeltaNetStageUtility.AreCompatible(inputShape[1], qkvWeightShape[0]) ||
-            !GatedDeltaNetStageUtility.AreCompatible(qkvWeightShape[1], convWeightShape[0]) ||
-            !GatedDeltaNetStageUtility.IsFixedValue(convWeightShape[1], target.ConvKernelSize) ||
-            !GatedDeltaNetStageUtility.IsFixedValue(
-                qkvWeightShape[1],
-                stateConfig.GetDimension(GatedDeltaNetStateDimKind.ConvChannels)) ||
-            stateConfig.ConvKernelSize != target.ConvKernelSize ||
-            !GatedDeltaNetStageUtility.IsFixedValue(inputShape[1], stateConfig.HiddenSize))
-        {
-            return new InvalidType(
-                "GatedDeltaNetProjection input shapes do not satisfy the projection/convolution contract.");
-        }
-
-        var scalarOutput = new TensorType(
-            input.DType,
-            new RankedShape(inputShape[0], qkvWeightShape[1]));
-        var outputLanes = GatedDeltaNetStageUtility.GetPackedLanes(
-            stateConfig,
+        var qkvLanes = stateConfig.GetLanes(
             GatedDeltaNetStateKind.Convolution,
             GatedDeltaNetStateDimKind.ConvChannels);
-        var packedOutput = GatedDeltaNetStageUtility.PackTensorAxis(
-            scalarOutput,
-            outputLanes,
-            1);
-        return packedOutput is InvalidType
-            ? packedOutput
-            : new TupleType([packedOutput, state]);
+        DataType expectedQkvType = qkvLanes.Count == 0
+            ? stateConfig.ActivationPrimType
+            : new VectorType(stateConfig.ActivationPrimType, qkvLanes);
+        if (qkv.DType != expectedQkvType || convWeight.DType != stateConfig.ActivationPrimType)
+        {
+            return new InvalidType(
+                $"GatedDeltaNetConvolution QKV must use packed activation dtype " +
+                $"{expectedQkvType}, and convolution weight must use " +
+                $"{stateConfig.ActivationPrimType}.");
+        }
+
+        var scalarQkv = GatedDeltaNetStageUtility.UnpackTensorAxis(qkv, 1);
+        if (scalarQkv.Shape is not RankedShape scalarQkvShape ||
+            !GatedDeltaNetStageUtility.AreCompatible(scalarQkvShape[1], convWeightShape[0]) ||
+            !GatedDeltaNetStageUtility.IsFixedValue(convWeightShape[1], target.ConvKernelSize) ||
+            !GatedDeltaNetStageUtility.IsFixedValue(
+                scalarQkvShape[1],
+                stateConfig.GetDimension(GatedDeltaNetStateDimKind.ConvChannels)) ||
+            stateConfig.ConvKernelSize != target.ConvKernelSize)
+        {
+            return new InvalidType(
+                "GatedDeltaNetConvolution input shapes do not satisfy the stateful convolution contract.");
+        }
+
+        return new TupleType([qkv, state]);
     }
 }
 
@@ -275,43 +272,25 @@ public sealed class GatedDeltaNetRecurrentCoreEvaluator :
 
     public Cost Visit(ICostEvaluateContext context, GatedDeltaNetRecurrentCore target)
     {
-        var input = GatedDeltaNetStageUtility.GetLocalTensorType(
-            context.GetArgumentType<IRType>(target, GatedDeltaNetRecurrentCore.Input));
-        var zWeight = GatedDeltaNetStageUtility.GetLocalTensorType(
-            context.GetArgumentType<IRType>(target, GatedDeltaNetRecurrentCore.ZWeight));
-        var bWeight = GatedDeltaNetStageUtility.GetLocalTensorType(
-            context.GetArgumentType<IRType>(target, GatedDeltaNetRecurrentCore.BWeight));
-        var aWeight = GatedDeltaNetStageUtility.GetLocalTensorType(
-            context.GetArgumentType<IRType>(target, GatedDeltaNetRecurrentCore.AWeight));
+        var qkv = GatedDeltaNetStageUtility.GetLocalTensorType(
+            context.GetArgumentType<IRType>(target, GatedDeltaNetRecurrentCore.QKV));
+        var z = GatedDeltaNetStageUtility.GetLocalTensorType(
+            context.GetArgumentType<IRType>(target, GatedDeltaNetRecurrentCore.Z));
+        var bProjection = GatedDeltaNetStageUtility.GetLocalTensorType(
+            context.GetArgumentType<IRType>(target, GatedDeltaNetRecurrentCore.BProjection));
+        var aProjection = GatedDeltaNetStageUtility.GetLocalTensorType(
+            context.GetArgumentType<IRType>(target, GatedDeltaNetRecurrentCore.AProjection));
         var result = context.GetReturnType<TupleType>();
         var output = GatedDeltaNetStageUtility.GetLocalTensorType(result[0]);
-        if (!GatedDeltaNetStageUtility.TryGetMaxShape(input, out var inputShape) ||
-            !GatedDeltaNetStageUtility.TryGetMaxShape(bWeight, out var bWeightShape))
+        if (!GatedDeltaNetStageUtility.TryGetMaxShape(output, out var outputShape))
         {
             return Cost.Zero;
         }
 
-        var tokens = inputShape[0];
-        var localHeads = bWeightShape[1];
-        var localValueDim = checked(localHeads * target.ValueHeadDim);
+        var tokens = outputShape[0];
+        var localHeads = outputShape[1] / target.ValueHeadDim;
         var localQkvDim = checked(localHeads * ((target.KeyHeadDim * 2) + target.ValueHeadDim));
-        var cost = Cost.Zero;
-        GatedDeltaNetStageUtility.AddMatMulCost(
-            context,
-            input,
-            zWeight,
-            new TensorType(input.DType, new RankedShape(tokens, localValueDim)),
-            ref cost);
-        foreach (var weight in new[] { bWeight, aWeight })
-        {
-            GatedDeltaNetStageUtility.AddMatMulCost(
-                context,
-                input,
-                weight,
-                new TensorType(input.DType, new RankedShape(tokens, localHeads)),
-                ref cost);
-        }
-
+        var cost = new Cost();
         GatedDeltaNetStageUtility.AddCostFactor(
             cost,
             CostFactorNames.CPUCycles,
@@ -323,7 +302,10 @@ public sealed class GatedDeltaNetRecurrentCoreEvaluator :
             cost,
             CostFactorNames.BlockLocalMemoryLoadBytes,
             checked(
-                (UInt128)localQkvDim * (UInt128)input.DType.SizeInBytes +
+                (UInt128)localQkvDim * (UInt128)GatedDeltaNetStageUtility.GetScalarDataType(qkv.DType).SizeInBytes +
+                CostUtility.GetMemoryAccess(z) +
+                CostUtility.GetMemoryAccess(bProjection) +
+                CostUtility.GetMemoryAccess(aProjection) +
                 ((UInt128)localHeads * (UInt128)target.KeyHeadDim *
                     (UInt128)target.ValueHeadDim * (UInt128)DataTypes.Float32.SizeInBytes * 2)));
         GatedDeltaNetStageUtility.AddCostFactor(
@@ -338,8 +320,6 @@ public sealed class GatedDeltaNetRecurrentCoreEvaluator :
 
     public IValue Visit(IEvaluateContext context, GatedDeltaNetRecurrentCore target)
     {
-        var inputValue = context.GetArgumentValueAsTensor(target, GatedDeltaNetRecurrentCore.Input);
-        var input = inputValue.ToOrtTensor();
         var stateValue = context.GetArgumentValue(target, GatedDeltaNetRecurrentCore.State);
         var state = stateValue.AsTensor().Cast<Reference<IGatedDeltaNetState>>().Single().Value;
         var layerId = checked((int)context.GetArgumentValue(target, GatedDeltaNetRecurrentCore.LayerId).AsTensor().ToScalar<long>());
@@ -356,9 +336,27 @@ public sealed class GatedDeltaNetRecurrentCoreEvaluator :
                 Enumerable.Repeat(1, qkvLanes.Count).ToArray());
         }
 
-        var zWeight = context.GetArgumentValueAsTensor(target, GatedDeltaNetRecurrentCore.ZWeight).ToOrtTensor();
-        var bWeight = context.GetArgumentValueAsTensor(target, GatedDeltaNetRecurrentCore.BWeight).ToOrtTensor();
-        var aWeight = context.GetArgumentValueAsTensor(target, GatedDeltaNetRecurrentCore.AWeight).ToOrtTensor();
+        var zValue = context.GetArgumentValueAsTensor(target, GatedDeltaNetRecurrentCore.Z);
+        var z = zValue.ToOrtTensor();
+        var zLanes = GatedDeltaNetStageUtility.GetDataTypeLanes(zValue.ElementType);
+        if (zLanes.Count != 0)
+        {
+            z = z.Unpack(
+                zLanes.Count,
+                Enumerable.Repeat(1, zLanes.Count).ToArray());
+        }
+
+        var bProjectionValue = context.GetArgumentValueAsTensor(target, GatedDeltaNetRecurrentCore.BProjection);
+        var bProjection = bProjectionValue.ToOrtTensor();
+        var aProjectionValue = context.GetArgumentValueAsTensor(target, GatedDeltaNetRecurrentCore.AProjection);
+        var aProjection = aProjectionValue.ToOrtTensor();
+        var projectionLanes = GatedDeltaNetStageUtility.GetDataTypeLanes(bProjectionValue.ElementType);
+        if (projectionLanes.Count != 0)
+        {
+            var unpackAxes = Enumerable.Repeat(1, projectionLanes.Count).ToArray();
+            bProjection = bProjection.Unpack(projectionLanes.Count, unpackAxes);
+            aProjection = aProjection.Unpack(projectionLanes.Count, unpackAxes);
+        }
         var aLog = context.GetArgumentValueAsTensor(target, GatedDeltaNetRecurrentCore.ALog).ToOrtTensor().Cast(OrtDataType.Float);
         var dtBias = context.GetArgumentValueAsTensor(target, GatedDeltaNetRecurrentCore.DtBias).ToOrtTensor().Cast(OrtDataType.Float);
         var normWeight = context.GetArgumentValueAsTensor(target, GatedDeltaNetRecurrentCore.NormWeight).ToOrtTensor().Cast(OrtDataType.Float);
@@ -366,17 +364,32 @@ public sealed class GatedDeltaNetRecurrentCoreEvaluator :
         var valueDim = checked(target.NumValueHeads * target.ValueHeadDim);
         var convDim = checked((keyDim * 2) + valueDim);
         var repeats = checked(target.NumValueHeads / target.NumKeyHeads);
-        var outputs = new List<OrtKISharp.Tensor>(checked((int)input.Shape[0]));
-        for (var token = 0L; token < input.Shape[0]; token++)
+        var activationType = state.Config.ActivationPrimType;
+        var outputs = new List<OrtKISharp.Tensor>(checked((int)qkv.Shape[0]));
+        for (var token = 0L; token < qkv.Shape[0]; token++)
         {
-            var hidden = OrtKI.Slice(input, new[] { token }, new[] { token + 1 }, new[] { 0L }, new[] { 1L });
             var currentQkv = OrtKI.Reshape(
                 OrtKI.Slice(qkv, new[] { token }, new[] { token + 1 }, new[] { 0L }, new[] { 1L }),
                 GatedDeltaNetStageUtility.Shape(convDim),
                 0L);
-            var z = OrtKI.MatMul(hidden, zWeight);
-            var beta = OrtKI.Sigmoid(OrtKI.MatMul(hidden, bWeight));
-            var a = OrtKI.MatMul(hidden, aWeight);
+            var currentZ = OrtKI.Slice(
+                z,
+                new[] { token },
+                new[] { token + 1 },
+                new[] { 0L },
+                new[] { 1L });
+            var beta = OrtKI.Sigmoid(OrtKI.Slice(
+                bProjection,
+                new[] { token },
+                new[] { token + 1 },
+                new[] { 0L },
+                new[] { 1L }));
+            var a = OrtKI.Slice(
+                aProjection,
+                new[] { token },
+                new[] { token + 1 },
+                new[] { 0L },
+                new[] { 1L });
             var query = GatedDeltaNetStageUtility.Slice(currentQkv, 0, keyDim);
             var key = GatedDeltaNetStageUtility.Slice(currentQkv, keyDim, keyDim * 2);
             var value = GatedDeltaNetStageUtility.Slice(currentQkv, keyDim * 2, convDim);
@@ -432,13 +445,13 @@ public sealed class GatedDeltaNetRecurrentCoreEvaluator :
             var invRms = OrtKI.Reciprocal(
                 OrtKI.Sqrt(OrtKI.Add(OrtKI.Div(squareSum, (float)target.ValueHeadDim), target.Epsilon)));
             var gate = OrtKI.Reshape(
-                z.Cast(OrtDataType.Float),
+                currentZ.Cast(OrtDataType.Float),
                 GatedDeltaNetStageUtility.Shape(target.NumValueHeads, target.ValueHeadDim),
                 0L);
             var normalized = OrtKI.Mul(OrtKI.Mul(core, invRms), normWeight);
             normalized = OrtKI.Mul(normalized, OrtKI.Mul(gate, OrtKI.Sigmoid(gate)));
             outputs.Add(OrtKI.Reshape(
-                normalized.Cast(input.DataType),
+                normalized.Cast(qkv.DataType),
                 GatedDeltaNetStageUtility.Shape(1L, valueDim),
                 0L));
         }
@@ -449,7 +462,7 @@ public sealed class GatedDeltaNetRecurrentCoreEvaluator :
             recurrentState.ToTensor().CastElementTo(DataTypes.Float32));
         var output = OrtKI.Concat(outputs.ToArray(), 0L);
         return new TupleValue([
-            output.ToValue(inputValue.ElementType),
+            output.ToValue(activationType),
             stateValue,
         ]);
     }
@@ -461,9 +474,12 @@ public sealed class GatedDeltaNetRecurrentCoreEvaluator :
             return new InvalidType($"GatedDeltaNetRecurrentCore expects {target.Parameters.Count} inputs, got {arguments.Count}.");
         }
 
-        if (arguments.OfType<InvalidType>().FirstOrDefault() is { } invalid)
+        if (arguments
+            .Select((type, index) => (type, index))
+            .FirstOrDefault(item => item.type is InvalidType) is { type: InvalidType invalid, index: var invalidIndex })
         {
-            return invalid;
+            return new InvalidType(
+                $"GatedDeltaNetRecurrentCore argument {target.Parameters[invalidIndex].Name} is invalid: {invalid.Reason}");
         }
 
         if (arguments.Any(type => type is AnyType))
@@ -495,7 +511,7 @@ public sealed class GatedDeltaNetRecurrentCoreEvaluator :
         }
 
         if (!GatedDeltaNetStageUtility.TryGetContiguousAxes(
-                distributed[GatedDeltaNetRecurrentCore.BWeight.Index].AxisPolicies[1],
+                distributed[GatedDeltaNetRecurrentCore.Z.Index].AxisPolicies[1],
                 placement.Rank,
                 out var headAxes))
         {
@@ -503,29 +519,40 @@ public sealed class GatedDeltaNetRecurrentCoreEvaluator :
                 "GatedDeltaNetRecurrentCore value-head split must be contiguous.");
         }
 
-        var headShardCount = headAxes.Aggregate(
-            1L,
-            (product, axis) => checked(product * placement.Hierarchy[axis]));
         if (!GatedDeltaNetStageUtility.CoversPlacement(headAxes, placement.Rank))
         {
             return new InvalidType(
                 "GatedDeltaNetRecurrentCore value-head split must cover the block placement so each state head has one writer.");
         }
 
-        if (target.NumValueHeads % headShardCount != 0)
+        var head = DistributedUtility.CreateUnitAlignedContiguousSplit(
+            headAxes,
+            placement,
+            target.NumValueHeads);
+        var value = DistributedUtility.CreateUnitAlignedContiguousSplit(
+            headAxes,
+            placement,
+            target.NumValueHeads,
+            target.ValueHeadDim);
+        var zLaneCount = GatedDeltaNetStageUtility.GetVectorLaneCount(
+            distributed[GatedDeltaNetRecurrentCore.Z.Index].TensorType.DType);
+        if (!DistributedUtility.TryScaleSplitUnits(
+                value,
+                1,
+                zLaneCount,
+                out var packedValue))
         {
             return new InvalidType(
-                $"GatedDeltaNetRecurrentCore head split count {headShardCount} must divide value heads.");
+                $"GatedDeltaNetRecurrentCore value-head split {value} is not representable " +
+                $"in Z's packed dtype {distributed[GatedDeltaNetRecurrentCore.Z.Index].TensorType.DType}.");
         }
 
-        var head = GatedDeltaNetStageUtility.CreateSplitPolicy(headAxes);
         var expected = new Dictionary<int, DistributedType>
         {
-            [GatedDeltaNetRecurrentCore.Input.Index] = GatedDeltaNetStageUtility.CreateBroadcast(distributed[GatedDeltaNetRecurrentCore.Input.Index].TensorType, placement),
             [GatedDeltaNetRecurrentCore.QKV.Index] = GatedDeltaNetStageUtility.CreateBroadcast(distributed[GatedDeltaNetRecurrentCore.QKV.Index].TensorType, placement),
-            [GatedDeltaNetRecurrentCore.ZWeight.Index] = GatedDeltaNetStageUtility.Create(distributed[GatedDeltaNetRecurrentCore.ZWeight.Index].TensorType, [SBP.B, head], placement),
-            [GatedDeltaNetRecurrentCore.BWeight.Index] = GatedDeltaNetStageUtility.Create(distributed[GatedDeltaNetRecurrentCore.BWeight.Index].TensorType, [SBP.B, head], placement),
-            [GatedDeltaNetRecurrentCore.AWeight.Index] = GatedDeltaNetStageUtility.Create(distributed[GatedDeltaNetRecurrentCore.AWeight.Index].TensorType, [SBP.B, head], placement),
+            [GatedDeltaNetRecurrentCore.Z.Index] = GatedDeltaNetStageUtility.Create(distributed[GatedDeltaNetRecurrentCore.Z.Index].TensorType, [SBP.B, packedValue], placement),
+            [GatedDeltaNetRecurrentCore.BProjection.Index] = GatedDeltaNetStageUtility.CreateBroadcast(distributed[GatedDeltaNetRecurrentCore.BProjection.Index].TensorType, placement),
+            [GatedDeltaNetRecurrentCore.AProjection.Index] = GatedDeltaNetStageUtility.CreateBroadcast(distributed[GatedDeltaNetRecurrentCore.AProjection.Index].TensorType, placement),
             [GatedDeltaNetRecurrentCore.ALog.Index] = GatedDeltaNetStageUtility.Create(distributed[GatedDeltaNetRecurrentCore.ALog.Index].TensorType, [head], placement),
             [GatedDeltaNetRecurrentCore.DtBias.Index] = GatedDeltaNetStageUtility.Create(distributed[GatedDeltaNetRecurrentCore.DtBias.Index].TensorType, [head], placement),
             [GatedDeltaNetRecurrentCore.NormWeight.Index] = GatedDeltaNetStageUtility.CreateBroadcast(distributed[GatedDeltaNetRecurrentCore.NormWeight.Index].TensorType, placement),
@@ -541,7 +568,7 @@ public sealed class GatedDeltaNetRecurrentCoreEvaluator :
         }
 
         return new TupleType([
-            new DistributedType((TensorType)tuple[0], [SBP.B, head], placement),
+            new DistributedType((TensorType)tuple[0], [SBP.B, value], placement),
             tuple[1],
         ]);
     }
@@ -557,8 +584,7 @@ public sealed class GatedDeltaNetRecurrentCoreEvaluator :
             return new InvalidType("GatedDeltaNetRecurrentCore head configuration is invalid.");
         }
 
-        if (arguments[GatedDeltaNetRecurrentCore.Input.Index] is not TensorType input ||
-            arguments[GatedDeltaNetRecurrentCore.State.Index] is not TensorType state ||
+        if (arguments[GatedDeltaNetRecurrentCore.State.Index] is not TensorType state ||
             arguments[GatedDeltaNetRecurrentCore.LayerId.Index] is not DimensionType)
         {
             return new InvalidType("GatedDeltaNetRecurrentCore expects tensor operands and a dimension-valued layer id.");
@@ -569,36 +595,37 @@ public sealed class GatedDeltaNetRecurrentCoreEvaluator :
             return new InvalidType(stateError);
         }
 
-        if (input.Shape is not RankedShape { Rank: 2 } inputShape ||
-            input.DType != stateConfig.ActivationPrimType)
+        if (arguments[GatedDeltaNetRecurrentCore.QKV.Index] is not TensorType qkv)
+        {
+            return new InvalidType("GatedDeltaNetRecurrentCore QKV must be a tensor.");
+        }
+
+        var qkvLanes = GatedDeltaNetStageUtility.GetPackedLanes(
+            stateConfig,
+            GatedDeltaNetStateKind.Convolution,
+            GatedDeltaNetStateDimKind.ConvChannels);
+        var scalarQkv = GatedDeltaNetStageUtility.UnpackTensorAxis(qkv, 1);
+        if (scalarQkv.Shape is not RankedShape { Rank: 2 } qkvShape ||
+            scalarQkv.DType != stateConfig.ActivationPrimType)
         {
             return new InvalidType(
-                $"GatedDeltaNetRecurrentCore input must be a rank-2 scalar {stateConfig.ActivationPrimType} tensor.");
+                $"GatedDeltaNetRecurrentCore QKV must unpack to a rank-2 " +
+                $"{stateConfig.ActivationPrimType} tensor.");
         }
 
-        if (!inputShape[1].IsFixed)
-        {
-            return new InvalidType("GatedDeltaNetRecurrentCore hidden size must be fixed.");
-        }
-
-        var hidden = inputShape[1].FixedValue;
         var keyDim = checked(target.NumKeyHeads * target.KeyHeadDim);
         var valueDim = checked(target.NumValueHeads * target.ValueHeadDim);
         var convDim = checked((keyDim * 2) + valueDim);
         if (stateConfig.NumKeyHeads != target.NumKeyHeads ||
             stateConfig.NumValueHeads != target.NumValueHeads ||
             stateConfig.KeyHeadDim != target.KeyHeadDim ||
-            stateConfig.ValueHeadDim != target.ValueHeadDim ||
-            stateConfig.HiddenSize != hidden)
+            stateConfig.ValueHeadDim != target.ValueHeadDim)
         {
             return new InvalidType("GatedDeltaNetRecurrentCore state config does not match the operator geometry.");
         }
 
         var checks = new (ParameterInfo Parameter, long[] Shape, DataType? DType)[]
         {
-            (GatedDeltaNetRecurrentCore.ZWeight, [hidden, valueDim], input.DType),
-            (GatedDeltaNetRecurrentCore.BWeight, [hidden, target.NumValueHeads], input.DType),
-            (GatedDeltaNetRecurrentCore.AWeight, [hidden, target.NumValueHeads], input.DType),
             (GatedDeltaNetRecurrentCore.ALog, [target.NumValueHeads], null),
             (GatedDeltaNetRecurrentCore.DtBias, [target.NumValueHeads], null),
             (GatedDeltaNetRecurrentCore.NormWeight, [target.ValueHeadDim], null),
@@ -633,17 +660,28 @@ public sealed class GatedDeltaNetRecurrentCoreEvaluator :
             }
         }
 
-        if (arguments[GatedDeltaNetRecurrentCore.QKV.Index] is not TensorType qkv)
+        var expectedProjection = GatedDeltaNetStageUtility.PackTensorAxis(
+            new TensorType(
+                stateConfig.ActivationPrimType,
+                new RankedShape(qkvShape[0], target.NumValueHeads)),
+            stateConfig.ActivationLanes,
+            1);
+        foreach (var parameter in new[]
+                 {
+                     GatedDeltaNetRecurrentCore.BProjection,
+                     GatedDeltaNetRecurrentCore.AProjection,
+                 })
         {
-            return new InvalidType("GatedDeltaNetRecurrentCore QKV must be a tensor.");
+            if (arguments[parameter.Index] != expectedProjection)
+            {
+                return new InvalidType(
+                    $"GatedDeltaNetRecurrentCore {parameter.Name} must use the packed " +
+                    $"activation layout {expectedProjection}, got {arguments[parameter.Index]}.");
+            }
         }
 
-        var qkvLanes = GatedDeltaNetStageUtility.GetPackedLanes(
-            stateConfig,
-            GatedDeltaNetStateKind.Convolution,
-            GatedDeltaNetStateDimKind.ConvChannels);
         var expectedQkv = GatedDeltaNetStageUtility.PackTensorAxis(
-            new TensorType(input.DType, new RankedShape(inputShape[0], convDim)),
+            new TensorType(stateConfig.ActivationPrimType, new RankedShape(qkvShape[0], convDim)),
             qkvLanes,
             1);
         if (expectedQkv is not TensorType expectedQkvType || qkv != expectedQkvType)
@@ -652,8 +690,23 @@ public sealed class GatedDeltaNetRecurrentCoreEvaluator :
                 $"GatedDeltaNetRecurrentCore QKV must use the state projection layout {expectedQkv}, got {qkv}.");
         }
 
+        if (arguments[GatedDeltaNetRecurrentCore.Z.Index] is not TensorType z)
+        {
+            return new InvalidType("GatedDeltaNetRecurrentCore Z must be a tensor.");
+        }
+
+        var expectedZ = GatedDeltaNetStageUtility.PackTensorAxis(
+            new TensorType(stateConfig.ActivationPrimType, new RankedShape(qkvShape[0], valueDim)),
+            stateConfig.ActivationLanes,
+            1);
+        if (expectedZ is not TensorType expectedZType || z != expectedZType)
+        {
+            return new InvalidType(
+                $"GatedDeltaNetRecurrentCore Z must use the packed activation layout {expectedZ}, got {z}.");
+        }
+
         return new TupleType([
-            new TensorType(input.DType, new RankedShape(inputShape[0], valueDim)),
+            new TensorType(stateConfig.ActivationPrimType, new RankedShape(qkvShape[0], valueDim)),
             state,
         ]);
     }
@@ -665,7 +718,7 @@ internal static class GatedDeltaNetStageUtility
         arguments.Select((type, index) => (type, index)).All(item =>
             item.index == dimensionIndex
                 ? item.type is DimensionType
-                : item.type is TensorType);
+                : item.type is TensorType or NoneType);
 
     public static bool TryGetDistributedArguments(
         IReadOnlyList<IRType> arguments,
@@ -677,7 +730,9 @@ internal static class GatedDeltaNetStageUtility
         distributed = new DistributedType[arguments.Count];
         var values = arguments
             .Select((type, index) => (type, index))
-            .Where(item => item.index != dimensionIndex && item.index != invariantTensorIndex)
+            .Where(item => item.index != dimensionIndex &&
+                item.index != invariantTensorIndex &&
+                item.type is not NoneType)
             .ToArray();
         var commonPlacement = values
             .Select(item => item.type)
@@ -771,19 +826,26 @@ internal static class GatedDeltaNetStageUtility
         _ => type,
     };
 
+    public static IRArray<int> GetDataTypeLanes(DataType type) => type switch
+    {
+        VectorType vector => vector.Lanes,
+        _ => Array.Empty<int>(),
+    };
+
+    public static long GetVectorLaneCount(DataType type) => type switch
+    {
+        VectorType vector => vector.Lanes.Aggregate(
+            GetVectorLaneCount(vector.ElemType),
+            static (product, lane) => checked(product * lane)),
+        _ => 1,
+    };
+
     public static IRArray<int> GetPackedLanes(
         GatedDeltaNetStateConfig config,
         GatedDeltaNetStateKind kind,
         GatedDeltaNetStateDimKind axis)
     {
-        var vectorizedAxes = config.GetVectorizedAxes(kind);
-        var lanes = config.GetLanes(kind);
-        var result = vectorizedAxes
-            .Select((vectorizedAxis, index) => (vectorizedAxis, lane: lanes[index]))
-            .Where(item => item.vectorizedAxis == axis)
-            .Select(item => item.lane)
-            .ToArray();
-        return result;
+        return config.GetLanes(kind, axis);
     }
 
     public static IRType PackTensorAxis(TensorType input, IRArray<int> lanes, int axis)

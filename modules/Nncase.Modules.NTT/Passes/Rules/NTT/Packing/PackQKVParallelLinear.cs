@@ -244,27 +244,44 @@ public sealed partial class PackQKVParallelLinearRhsKMajor : RewriteRule<Pattern
         Expr vWeightScale)
     {
         if (input.CheckedDataType is not PrimType inputType ||
-            inputType == DataTypes.Float8E4M3 ||
-            inputType == DataTypes.Float8E5M2 ||
-            !IsNone(qInputScale) ||
-            !IsNone(kInputScale) ||
-            !IsNone(vInputScale) ||
-            !IsNone(qWeightScale) ||
-            !IsNone(kWeightScale) ||
-            !IsNone(vWeightScale) ||
-            _vectorBytes % inputType.SizeInBytes != 0)
+            qkv.OutputDataType is not PrimType outputType ||
+            _vectorBytes % outputType.SizeInBytes != 0)
         {
             return null;
         }
 
-        var vectorLanes = _vectorBytes / inputType.SizeInBytes;
-        if (vectorLanes <= 0 ||
-            !TryPackWeight(qWeight, inputType, vectorLanes, out var packedQWeight) ||
-            !TryPackWeight(kWeight, inputType, vectorLanes, out var packedKWeight) ||
-            !TryPackWeight(vWeight, inputType, vectorLanes, out var packedVWeight) ||
-            !TryPackBias(qBias, inputType, vectorLanes, out var packedQBias) ||
-            !TryPackBias(kBias, inputType, vectorLanes, out var packedKBias) ||
-            !TryPackBias(vBias, inputType, vectorLanes, out var packedVBias) ||
+        var scales = new[]
+        {
+            qInputScale, kInputScale, vInputScale,
+            qWeightScale, kWeightScale, vWeightScale,
+        };
+        var hasScales = scales.All(scale => !IsNone(scale));
+        if (!hasScales && scales.Any(scale => !IsNone(scale)))
+        {
+            return null;
+        }
+
+        var weightType = qWeight.CheckedDataType as PrimType;
+        if (weightType is null ||
+            weightType != kWeight.CheckedDataType ||
+            weightType != vWeight.CheckedDataType ||
+            (hasScales
+                ? weightType != DataTypes.Float8E4M3
+                : weightType != inputType) ||
+            _vectorBytes % weightType.SizeInBytes != 0)
+        {
+            return null;
+        }
+
+        var nVectorLanes = _vectorBytes / outputType.SizeInBytes;
+        var kVectorLanes = _vectorBytes / weightType.SizeInBytes;
+        if (nVectorLanes <= 0 || kVectorLanes <= 0 ||
+            !TryPackWeight(qWeight, weightType, nVectorLanes, kVectorLanes, out var packedQWeight) ||
+            !TryPackWeight(kWeight, weightType, nVectorLanes, kVectorLanes, out var packedKWeight) ||
+            !TryPackWeight(vWeight, weightType, nVectorLanes, kVectorLanes, out var packedVWeight) ||
+            !TryPackBias(qBias, outputType, nVectorLanes, out var packedQBias) ||
+            !TryPackBias(kBias, outputType, nVectorLanes, out var packedKBias) ||
+            !TryPackBias(vBias, outputType, nVectorLanes, out var packedVBias) ||
             caller.CheckedType is not TupleType { Fields.Count: 3 } tupleType)
         {
             return null;
@@ -278,37 +295,38 @@ public sealed partial class PackQKVParallelLinearRhsKMajor : RewriteRule<Pattern
             packedQBias,
             packedKBias,
             packedVBias,
-            None.Default,
-            None.Default,
-            None.Default,
-            None.Default,
-            None.Default,
-            None.Default,
+            qInputScale,
+            kInputScale,
+            vInputScale,
+            qWeightScale,
+            kWeightScale,
+            vWeightScale,
             qkv.NumHeads,
             qkv.NumKvHeads,
             qkv.OutputDataType,
             rhsLayout: IR.NTT.PackedMatMulRhsLayout.KMajor);
 
         return new IR.Tuple(
-            UnpackOutput(packed, 0, GetRank(tupleType.Fields[0]), vectorLanes),
-            UnpackOutput(packed, 1, GetRank(tupleType.Fields[1]), vectorLanes),
-            UnpackOutput(packed, 2, GetRank(tupleType.Fields[2]), vectorLanes));
+            UnpackOutput(packed, 0, GetRank(tupleType.Fields[0]), nVectorLanes),
+            UnpackOutput(packed, 1, GetRank(tupleType.Fields[1]), nVectorLanes),
+            UnpackOutput(packed, 2, GetRank(tupleType.Fields[2]), nVectorLanes));
     }
 
     private static bool IsNone(Expr expr) => expr is None;
 
     private bool TryPackWeight(
         Expr weight,
-        PrimType inputType,
-        int vectorLanes,
+        PrimType weightType,
+        int nVectorLanes,
+        int kVectorLanes,
         out Expr packedWeight)
     {
         packedWeight = weight;
-        if (weight.CheckedDataType != inputType ||
+        if (weight.CheckedDataType != weightType ||
             weight.CheckedShape.IsUnranked ||
             weight.CheckedShape.Rank < 2 ||
-            !Dimension.TryDivExactly(weight.CheckedShape[^2], checked(_kPack * vectorLanes), out _) ||
-            !Dimension.TryDivExactly(weight.CheckedShape[^1], vectorLanes, out _))
+            !Dimension.TryDivExactly(weight.CheckedShape[^2], checked(_kPack * kVectorLanes), out _) ||
+            !Dimension.TryDivExactly(weight.CheckedShape[^1], nVectorLanes, out _))
         {
             return false;
         }
@@ -321,16 +339,16 @@ public sealed partial class PackQKVParallelLinearRhsKMajor : RewriteRule<Pattern
         // -> [N/NVector,K/(KPack*KVector)]<NVector,KPack,KVector>
         // -> [K/(KPack*KVector),N/NVector]<NVector,KPack,KVector>.
         packedWeight = IR.F.Tensors.Transpose(weight, permutation);
-        packedWeight = IR.F.Tensors.Pack(packedWeight, [vectorLanes], [rank - 1]);
+        packedWeight = IR.F.Tensors.Pack(packedWeight, [kVectorLanes], [rank - 1]);
         packedWeight = IR.F.Tensors.Pack(packedWeight, [_kPack], [rank - 1]);
-        packedWeight = IR.F.Tensors.Pack(packedWeight, [vectorLanes], [rank - 2]);
+        packedWeight = IR.F.Tensors.Pack(packedWeight, [nVectorLanes], [rank - 2]);
         packedWeight = IR.F.Tensors.Transpose(packedWeight, permutation);
         return packedWeight.CheckedType is not InvalidType;
     }
 
     private static bool TryPackBias(
         Expr bias,
-        PrimType inputType,
+        PrimType outputType,
         int vectorLanes,
         out Expr packedBias)
     {
@@ -340,7 +358,7 @@ public sealed partial class PackQKVParallelLinearRhsKMajor : RewriteRule<Pattern
             return true;
         }
 
-        if (bias.CheckedDataType != inputType ||
+        if (bias.CheckedDataType != outputType ||
             bias.CheckedShape.IsUnranked ||
             bias.CheckedShape.Rank != 1 ||
             !Dimension.TryDivExactly(bias.CheckedShape[0], vectorLanes, out _))

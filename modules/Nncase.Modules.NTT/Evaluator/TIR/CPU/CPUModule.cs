@@ -22,6 +22,8 @@ internal class NTTModule : IApplicationPart
         registrator.RegisterManyInterface<GetItemEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<MatmulEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<PackedMatMulEvaluator>(reuse: Reuse.Singleton);
+        registrator.RegisterManyInterface<PackedScaledMatMulEvaluator>(reuse: Reuse.Singleton);
+        registrator.RegisterManyInterface<PackedBlockScaledMatMulEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<PackedMatMulNormStatsEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<QKVParallelLinearEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<PackedQKVParallelLinearEvaluator>(reuse: Reuse.Singleton);
@@ -45,7 +47,7 @@ internal class NTTModule : IApplicationPart
         registrator.RegisterManyInterface<NormApplyEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<GatherReduceNormApplyEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<QKVRoPEWithCacheEvaluator>(reuse: Reuse.Singleton);
-        registrator.RegisterManyInterface<GatedDeltaNetProjectionEvaluator>(reuse: Reuse.Singleton);
+        registrator.RegisterManyInterface<GatedDeltaNetConvolutionEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<GatedDeltaNetRecurrentCoreEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<VectorizedBinaryEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<UnpackEvaluator>(reuse: Reuse.Singleton);

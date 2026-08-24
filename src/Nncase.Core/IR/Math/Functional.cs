@@ -244,6 +244,33 @@ public static class Math
     public static Call MatMul(Expr lhs, Expr rhs, DataType outDataType, Expr? accOp = null) => new(new MatMul(outDataType), lhs, rhs, accOp ?? None.Default);
 
     /// <summary>
+    /// Creates a scaled low-precision matrix multiplication.
+    /// </summary>
+    public static Call ScaledMatMul(
+        Expr lhs,
+        Expr rhs,
+        Expr lhsScale,
+        Expr rhsScale,
+        DataType outputDataType)
+        => new(new ScaledMatMul(outputDataType), lhs, rhs, lhsScale, rhsScale);
+
+    /// <summary>
+    /// Creates a dynamically activated, block-scaled low-precision matrix multiplication.
+    /// </summary>
+    public static Call BlockScaledMatMul(
+        Expr lhs,
+        Expr rhs,
+        Expr rhsScale,
+        DataType outputDataType,
+        long weightBlockN,
+        long weightBlockK)
+        => new(
+            new BlockScaledMatMul(outputDataType, weightBlockN, weightBlockK),
+            lhs,
+            rhs,
+            rhsScale);
+
+    /// <summary>
     /// Call max.
     /// </summary>
     /// <param name="lhs">Left operand.</param>

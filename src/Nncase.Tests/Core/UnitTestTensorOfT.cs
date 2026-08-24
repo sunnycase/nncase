@@ -117,6 +117,21 @@ public sealed class UnitTestTensorOfT
     }
 
     [Fact]
+    public void TestCopyBytesTo()
+    {
+        var tensor = Tensor.From(new[] { 0x11223344, 0x55667788 }, [2]);
+        var actual = new byte[5];
+
+        tensor.CopyBytesTo(2, actual);
+
+        Assert.Equal(8, tensor.ByteLength);
+        Assert.Equal(tensor.BytesBuffer.Slice(2, actual.Length).ToArray(), actual);
+        tensor.CopyBytesTo(tensor.ByteLength, Span<byte>.Empty);
+        Assert.Throws<ArgumentOutOfRangeException>(() => tensor.CopyBytesTo(-1, actual));
+        Assert.Throws<ArgumentOutOfRangeException>(() => tensor.CopyBytesTo(tensor.ByteLength - 1, actual));
+    }
+
+    [Fact]
     public void TestCloneEmpty()
     {
         var t1 = new Tensor<float>([1, 2, 3, 4]);

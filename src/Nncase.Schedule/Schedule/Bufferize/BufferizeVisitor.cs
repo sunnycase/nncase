@@ -463,12 +463,19 @@ public sealed class BufferizeVisitor : ExprRewriter
         }
 
         var tensor = tensorConst.Value;
+        using var sha256 = SHA256.Create();
+        using (var hashStream = new CryptoStream(Stream.Null, sha256, CryptoStreamMode.Write, leaveOpen: true))
+        {
+            tensor.Serialize(hashStream);
+            hashStream.FlushFinalBlock();
+        }
+
         return new(
             tensor.ElementType.GetDisplayName(),
             string.Join(",", tensor.Dimensions.ToArray()),
             string.Join(",", tensor.Strides.ToArray()),
-            tensor.BytesBuffer.Length,
-            Convert.ToHexString(SHA256.HashData(tensor.BytesBuffer)));
+            tensor.ByteLength,
+            Convert.ToHexString(sha256.Hash!));
     }
 
     private void DumpSchedule(TIR.Buffer[] buffers, IReadOnlyDictionary<MemoryLocation, BufferScheduleResult> scheduleResult)
@@ -605,5 +612,5 @@ show(p)");
         }
     }
 
-    private sealed record ReadOnlyDataKey(string ElementType, string Dimensions, string Strides, int ByteLength, string Hash);
+    private sealed record ReadOnlyDataKey(string ElementType, string Dimensions, string Strides, long ByteLength, string Hash);
 }

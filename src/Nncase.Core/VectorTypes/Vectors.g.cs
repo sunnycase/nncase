@@ -47,6 +47,7 @@ public partial record VectorType
         [2, 2, 2] => typeof(Vector2x2x2<>).MakeGenericType(ElemType.CLRType),
         [4, 2, 4] => typeof(Vector4x2x4<>).MakeGenericType(ElemType.CLRType),
         [8, 2, 8] => typeof(Vector8x2x8<>).MakeGenericType(ElemType.CLRType),
+        [8, 2, 16] => typeof(Vector8x2x16<>).MakeGenericType(ElemType.CLRType),
         [16, 2, 16] => typeof(Vector16x2x16<>).MakeGenericType(ElemType.CLRType),
         [32, 2, 32] => typeof(Vector32x2x32<>).MakeGenericType(ElemType.CLRType),
         _ => throw new NotSupportedException($"Unsupported vector lanes: {string.Join(", ", Lanes)}"),
@@ -84,6 +85,7 @@ public partial record DataType
         { typeof(Vector2x2x2<>), [2, 2, 2] },
         { typeof(Vector4x2x4<>), [4, 2, 4] },
         { typeof(Vector8x2x8<>), [8, 2, 8] },
+        { typeof(Vector8x2x16<>), [8, 2, 16] },
         { typeof(Vector16x2x16<>), [16, 2, 16] },
         { typeof(Vector32x2x32<>), [32, 2, 32] },
     };
@@ -33141,6 +33143,336 @@ public unsafe struct Vector8x2x8<T> : IVector<T>, IEquatable<Vector8x2x8<T>>
     public static int Height => 2;
 
     public static int Width => 8;
+
+    public static int Count => Depth * Height * Width;
+
+
+    public override string ToString()
+    {
+        var sb = new System.Text.StringBuilder();
+        sb.Append("<");
+        for (int i = 0; i < Depth; i++)
+        {
+            sb.Append("<");
+            for (int j = 0; j < Height; j++)
+            {
+                sb.Append($"<{Nncase.Utilities.StringUtility.Join<T>(',', AsSpan(i, j))}>");
+                if (j < Height - 1)
+                {
+                    sb.Append(",");
+                }
+            }
+
+            sb.Append(">");
+            if (i < Depth - 1)
+            {
+                sb.Append(",");
+            }
+        }
+
+        sb.Append(">");
+        return sb.ToString();
+    }
+}
+
+[StructLayout(LayoutKind.Sequential)]
+public unsafe struct Vector8x2x16<T> : IVector<T>, IEquatable<Vector8x2x16<T>>
+    where T : unmanaged, IEquatable<T>
+{
+    private T _item_0_0_0;
+    private T _item_0_0_1;
+    private T _item_0_0_2;
+    private T _item_0_0_3;
+    private T _item_0_0_4;
+    private T _item_0_0_5;
+    private T _item_0_0_6;
+    private T _item_0_0_7;
+    private T _item_0_0_8;
+    private T _item_0_0_9;
+    private T _item_0_0_10;
+    private T _item_0_0_11;
+    private T _item_0_0_12;
+    private T _item_0_0_13;
+    private T _item_0_0_14;
+    private T _item_0_0_15;
+    private T _item_0_1_0;
+    private T _item_0_1_1;
+    private T _item_0_1_2;
+    private T _item_0_1_3;
+    private T _item_0_1_4;
+    private T _item_0_1_5;
+    private T _item_0_1_6;
+    private T _item_0_1_7;
+    private T _item_0_1_8;
+    private T _item_0_1_9;
+    private T _item_0_1_10;
+    private T _item_0_1_11;
+    private T _item_0_1_12;
+    private T _item_0_1_13;
+    private T _item_0_1_14;
+    private T _item_0_1_15;
+    private T _item_1_0_0;
+    private T _item_1_0_1;
+    private T _item_1_0_2;
+    private T _item_1_0_3;
+    private T _item_1_0_4;
+    private T _item_1_0_5;
+    private T _item_1_0_6;
+    private T _item_1_0_7;
+    private T _item_1_0_8;
+    private T _item_1_0_9;
+    private T _item_1_0_10;
+    private T _item_1_0_11;
+    private T _item_1_0_12;
+    private T _item_1_0_13;
+    private T _item_1_0_14;
+    private T _item_1_0_15;
+    private T _item_1_1_0;
+    private T _item_1_1_1;
+    private T _item_1_1_2;
+    private T _item_1_1_3;
+    private T _item_1_1_4;
+    private T _item_1_1_5;
+    private T _item_1_1_6;
+    private T _item_1_1_7;
+    private T _item_1_1_8;
+    private T _item_1_1_9;
+    private T _item_1_1_10;
+    private T _item_1_1_11;
+    private T _item_1_1_12;
+    private T _item_1_1_13;
+    private T _item_1_1_14;
+    private T _item_1_1_15;
+    private T _item_2_0_0;
+    private T _item_2_0_1;
+    private T _item_2_0_2;
+    private T _item_2_0_3;
+    private T _item_2_0_4;
+    private T _item_2_0_5;
+    private T _item_2_0_6;
+    private T _item_2_0_7;
+    private T _item_2_0_8;
+    private T _item_2_0_9;
+    private T _item_2_0_10;
+    private T _item_2_0_11;
+    private T _item_2_0_12;
+    private T _item_2_0_13;
+    private T _item_2_0_14;
+    private T _item_2_0_15;
+    private T _item_2_1_0;
+    private T _item_2_1_1;
+    private T _item_2_1_2;
+    private T _item_2_1_3;
+    private T _item_2_1_4;
+    private T _item_2_1_5;
+    private T _item_2_1_6;
+    private T _item_2_1_7;
+    private T _item_2_1_8;
+    private T _item_2_1_9;
+    private T _item_2_1_10;
+    private T _item_2_1_11;
+    private T _item_2_1_12;
+    private T _item_2_1_13;
+    private T _item_2_1_14;
+    private T _item_2_1_15;
+    private T _item_3_0_0;
+    private T _item_3_0_1;
+    private T _item_3_0_2;
+    private T _item_3_0_3;
+    private T _item_3_0_4;
+    private T _item_3_0_5;
+    private T _item_3_0_6;
+    private T _item_3_0_7;
+    private T _item_3_0_8;
+    private T _item_3_0_9;
+    private T _item_3_0_10;
+    private T _item_3_0_11;
+    private T _item_3_0_12;
+    private T _item_3_0_13;
+    private T _item_3_0_14;
+    private T _item_3_0_15;
+    private T _item_3_1_0;
+    private T _item_3_1_1;
+    private T _item_3_1_2;
+    private T _item_3_1_3;
+    private T _item_3_1_4;
+    private T _item_3_1_5;
+    private T _item_3_1_6;
+    private T _item_3_1_7;
+    private T _item_3_1_8;
+    private T _item_3_1_9;
+    private T _item_3_1_10;
+    private T _item_3_1_11;
+    private T _item_3_1_12;
+    private T _item_3_1_13;
+    private T _item_3_1_14;
+    private T _item_3_1_15;
+    private T _item_4_0_0;
+    private T _item_4_0_1;
+    private T _item_4_0_2;
+    private T _item_4_0_3;
+    private T _item_4_0_4;
+    private T _item_4_0_5;
+    private T _item_4_0_6;
+    private T _item_4_0_7;
+    private T _item_4_0_8;
+    private T _item_4_0_9;
+    private T _item_4_0_10;
+    private T _item_4_0_11;
+    private T _item_4_0_12;
+    private T _item_4_0_13;
+    private T _item_4_0_14;
+    private T _item_4_0_15;
+    private T _item_4_1_0;
+    private T _item_4_1_1;
+    private T _item_4_1_2;
+    private T _item_4_1_3;
+    private T _item_4_1_4;
+    private T _item_4_1_5;
+    private T _item_4_1_6;
+    private T _item_4_1_7;
+    private T _item_4_1_8;
+    private T _item_4_1_9;
+    private T _item_4_1_10;
+    private T _item_4_1_11;
+    private T _item_4_1_12;
+    private T _item_4_1_13;
+    private T _item_4_1_14;
+    private T _item_4_1_15;
+    private T _item_5_0_0;
+    private T _item_5_0_1;
+    private T _item_5_0_2;
+    private T _item_5_0_3;
+    private T _item_5_0_4;
+    private T _item_5_0_5;
+    private T _item_5_0_6;
+    private T _item_5_0_7;
+    private T _item_5_0_8;
+    private T _item_5_0_9;
+    private T _item_5_0_10;
+    private T _item_5_0_11;
+    private T _item_5_0_12;
+    private T _item_5_0_13;
+    private T _item_5_0_14;
+    private T _item_5_0_15;
+    private T _item_5_1_0;
+    private T _item_5_1_1;
+    private T _item_5_1_2;
+    private T _item_5_1_3;
+    private T _item_5_1_4;
+    private T _item_5_1_5;
+    private T _item_5_1_6;
+    private T _item_5_1_7;
+    private T _item_5_1_8;
+    private T _item_5_1_9;
+    private T _item_5_1_10;
+    private T _item_5_1_11;
+    private T _item_5_1_12;
+    private T _item_5_1_13;
+    private T _item_5_1_14;
+    private T _item_5_1_15;
+    private T _item_6_0_0;
+    private T _item_6_0_1;
+    private T _item_6_0_2;
+    private T _item_6_0_3;
+    private T _item_6_0_4;
+    private T _item_6_0_5;
+    private T _item_6_0_6;
+    private T _item_6_0_7;
+    private T _item_6_0_8;
+    private T _item_6_0_9;
+    private T _item_6_0_10;
+    private T _item_6_0_11;
+    private T _item_6_0_12;
+    private T _item_6_0_13;
+    private T _item_6_0_14;
+    private T _item_6_0_15;
+    private T _item_6_1_0;
+    private T _item_6_1_1;
+    private T _item_6_1_2;
+    private T _item_6_1_3;
+    private T _item_6_1_4;
+    private T _item_6_1_5;
+    private T _item_6_1_6;
+    private T _item_6_1_7;
+    private T _item_6_1_8;
+    private T _item_6_1_9;
+    private T _item_6_1_10;
+    private T _item_6_1_11;
+    private T _item_6_1_12;
+    private T _item_6_1_13;
+    private T _item_6_1_14;
+    private T _item_6_1_15;
+    private T _item_7_0_0;
+    private T _item_7_0_1;
+    private T _item_7_0_2;
+    private T _item_7_0_3;
+    private T _item_7_0_4;
+    private T _item_7_0_5;
+    private T _item_7_0_6;
+    private T _item_7_0_7;
+    private T _item_7_0_8;
+    private T _item_7_0_9;
+    private T _item_7_0_10;
+    private T _item_7_0_11;
+    private T _item_7_0_12;
+    private T _item_7_0_13;
+    private T _item_7_0_14;
+    private T _item_7_0_15;
+    private T _item_7_1_0;
+    private T _item_7_1_1;
+    private T _item_7_1_2;
+    private T _item_7_1_3;
+    private T _item_7_1_4;
+    private T _item_7_1_5;
+    private T _item_7_1_6;
+    private T _item_7_1_7;
+    private T _item_7_1_8;
+    private T _item_7_1_9;
+    private T _item_7_1_10;
+    private T _item_7_1_11;
+    private T _item_7_1_12;
+    private T _item_7_1_13;
+    private T _item_7_1_14;
+    private T _item_7_1_15;
+
+    static Vector8x2x16()
+    {
+        if (typeof(T) == typeof(bool))
+        {
+            throw new ArgumentException("Boolean is not supported in vector type.");
+        }
+    }
+
+    public static Vector8x2x16<T> Create(T[] array)
+    {
+        Vector8x2x16<T> vec = default;
+        var src = array.AsSpan();
+        var dest = vec.AsSpan();
+        src.CopyTo(dest);
+        return vec;
+    }
+
+    public T this[int i, int j, int k]
+    {
+        get => Unsafe.Add(ref Unsafe.AsRef(in _item_0_0_0), ((i * Height) + j) * Width + k);
+        set => Unsafe.Add(ref Unsafe.AsRef(in _item_0_0_0), ((i * Height) + j) * Width + k) = value;
+    }
+
+    public bool Equals(Vector8x2x16<T> other) => AsSpan().SequenceEqual(other.AsSpan());
+
+    public override bool Equals([NotNullWhen(true)] object obj) => obj is Vector8x2x16<T> other && Equals(other);
+
+    public Span<T> AsSpan() => MemoryMarshal.CreateSpan(ref Unsafe.AsRef(in _item_0_0_0), Count);
+
+
+    public Span<T> AsSpan(int i, int j) => MemoryMarshal.CreateSpan(ref Unsafe.Add(ref Unsafe.AsRef(in _item_0_0_0), ((i * Height) + j) * Width), Width);
+
+    public static int Depth => 8;
+
+    public static int Height => 2;
+
+    public static int Width => 16;
 
     public static int Count => Depth * Height * Width;
 

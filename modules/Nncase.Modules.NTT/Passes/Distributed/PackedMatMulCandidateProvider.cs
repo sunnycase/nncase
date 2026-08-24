@@ -8,6 +8,7 @@ using Nncase.Evaluator.IR.NTT;
 using Nncase.IR;
 using Nncase.IR.NTT;
 using Nncase.Utilities;
+using ScaledMatMulEvaluator = Nncase.Evaluator.Math.ScaledMatMulEvaluator;
 
 namespace Nncase.Passes.Distributed;
 
@@ -32,7 +33,7 @@ internal static class PackedMatMulDistributedCandidates
                          .OfType<DistributedType>()
                          .Where(type => type.Partial is null))
             {
-                if (!TryAlignRhsReductionPolicy(target, lhs, rhs, out var alignedRhs))
+                if (!TryAlignRhsReductionPolicy(target.RhsLayout, lhs, rhs, out var alignedRhs))
                 {
                     continue;
                 }
@@ -72,8 +73,8 @@ internal static class PackedMatMulDistributedCandidates
         }
     }
 
-    private static bool TryAlignRhsReductionPolicy(
-        PackedMatMul target,
+    internal static bool TryAlignRhsReductionPolicy(
+        PackedMatMulRhsLayout rhsLayout,
         DistributedType lhs,
         DistributedType rhs,
         out DistributedType alignedRhs)
@@ -82,7 +83,7 @@ internal static class PackedMatMulDistributedCandidates
         if (lhs.Placement != rhs.Placement ||
             rhs.TensorType.DType is not VectorType rhsVectorType ||
             !PackedMatMulEvaluator.TryGetLayoutInfo(
-                target.RhsLayout,
+                rhsLayout,
                 rhsVectorType,
                 rhs.TensorType.Shape.Rank,
                 out var rhsUnpackAxes,
@@ -124,6 +125,200 @@ internal static class PackedMatMulDistributedCandidates
 
         alignedRhs = packedRhs;
         return true;
+    }
+}
+
+/// <summary>
+/// Propagates the packed reduction layout for scaled low-precision matmul while
+/// keeping both scalar scales replicated on the matrix placement.
+/// </summary>
+internal sealed class PackedScaledMatMulCandidateProvider :
+    DistributedCandidateProvider<PackedScaledMatMul>
+{
+    public override IReadOnlyList<IRType> GetReturnCandidateTypes(
+        DistributedCandidateContext context,
+        PackedScaledMatMul target,
+        IReadOnlyList<IRType> defaultReturnTypes)
+        => defaultReturnTypes
+            .Concat(Enumerate(context, target).Select(candidate => candidate.OutputType))
+            .Distinct()
+            .ToArray();
+
+    public override bool TryGetInputTypeTuples(
+        DistributedCandidateContext context,
+        PackedScaledMatMul target,
+        IRType returnType,
+        out IReadOnlyList<DistributedCandidateTuple> tuples)
+    {
+        tuples = Enumerate(context, target)
+            .Where(candidate => candidate.OutputType == returnType)
+            .Select(candidate => new DistributedCandidateTuple(
+                [candidate.Lhs, candidate.Rhs, candidate.LhsScale, candidate.RhsScale],
+                "packed-scaled-matmul-reduction-sbp"))
+            .Distinct()
+            .ToArray();
+        return true;
+    }
+
+    private static IEnumerable<PackedScaledMatMulDistributedCandidate> Enumerate(
+        DistributedCandidateContext context,
+        PackedScaledMatMul target)
+    {
+        if (context.AvailableInputTypes.Count != 4)
+        {
+            yield break;
+        }
+
+        foreach (var lhs in context.AvailableInputTypes[PackedScaledMatMul.Lhs.Index]
+                     .OfType<DistributedType>()
+                     .Where(type => type.Partial is null))
+        {
+            foreach (var rhs in context.AvailableInputTypes[PackedScaledMatMul.Rhs.Index]
+                         .OfType<DistributedType>()
+                         .Where(type => type.Partial is null))
+            {
+                if (!PackedMatMulDistributedCandidates.TryAlignRhsReductionPolicy(
+                        target.RhsLayout,
+                        lhs,
+                        rhs,
+                        out var alignedRhs))
+                {
+                    continue;
+                }
+
+                foreach (var lhsScale in context.AvailableInputTypes[PackedScaledMatMul.LhsScale.Index]
+                             .Where(type => IsReplicatedScale(type, lhs.Placement)))
+                {
+                    foreach (var rhsScale in context.AvailableInputTypes[PackedScaledMatMul.RhsScale.Index]
+                                 .Where(type => IsReplicatedScale(type, lhs.Placement)))
+                    {
+                        var outputType = PackedScaledMatMulEvaluator.InferType(
+                            target,
+                            lhs,
+                            alignedRhs,
+                            lhsScale,
+                            rhsScale);
+                        if (outputType is not InvalidType)
+                        {
+                            yield return new(
+                                lhs,
+                                alignedRhs,
+                                lhsScale,
+                                rhsScale,
+                                outputType);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private static bool IsReplicatedScale(IRType type, Placement placement) => type switch
+    {
+        TensorType => ScaledMatMulEvaluator.IsScaleType(type),
+        DistributedType distributed =>
+            distributed.Placement == placement &&
+            distributed.Partial is null &&
+            distributed.AxisPolicies.All(policy => policy is SBPBroadCast) &&
+            ScaledMatMulEvaluator.IsScaleType(distributed),
+        _ => false,
+    };
+}
+
+/// <summary>
+/// Propagates the packed matrix policies for block-scaled FP8 matmul. The scale
+/// grid remains replicated because matrix shards may start inside a 128-wide
+/// quantization block and therefore cannot be represented by a non-overlapping
+/// split of the scale tensor.
+/// </summary>
+internal sealed class PackedBlockScaledMatMulCandidateProvider :
+    DistributedCandidateProvider<PackedBlockScaledMatMul>
+{
+    public override IReadOnlyList<IRType> GetReturnCandidateTypes(
+        DistributedCandidateContext context,
+        PackedBlockScaledMatMul target,
+        IReadOnlyList<IRType> defaultReturnTypes)
+        => defaultReturnTypes
+            .Concat(Enumerate(context, target).Select(candidate => candidate.OutputType))
+            .Distinct()
+            .ToArray();
+
+    public override bool TryGetInputTypeTuples(
+        DistributedCandidateContext context,
+        PackedBlockScaledMatMul target,
+        IRType returnType,
+        out IReadOnlyList<DistributedCandidateTuple> tuples)
+    {
+        tuples = Enumerate(context, target)
+            .Where(candidate => candidate.OutputType == returnType)
+            .Select(candidate => new DistributedCandidateTuple(
+                [candidate.Lhs, candidate.Rhs, candidate.RhsScale],
+                "packed-block-scaled-matmul-reduction-sbp"))
+            .Distinct()
+            .ToArray();
+        return true;
+    }
+
+    private static IEnumerable<PackedBlockScaledMatMulDistributedCandidate> Enumerate(
+        DistributedCandidateContext context,
+        PackedBlockScaledMatMul target)
+    {
+        if (context.AvailableInputTypes.Count != 3)
+        {
+            yield break;
+        }
+
+        foreach (var lhs in context.AvailableInputTypes[PackedBlockScaledMatMul.Lhs.Index]
+                     .OfType<DistributedType>()
+                     .Where(type => type.Partial is null))
+        {
+            foreach (var rhs in context.AvailableInputTypes[PackedBlockScaledMatMul.Rhs.Index]
+                         .OfType<DistributedType>()
+                         .Where(type => type.Partial is null))
+            {
+                if (!PackedMatMulDistributedCandidates.TryAlignRhsReductionPolicy(
+                        target.RhsLayout,
+                        lhs,
+                        rhs,
+                        out var alignedRhs))
+                {
+                    continue;
+                }
+
+                foreach (var rhsScale in context.AvailableInputTypes[PackedBlockScaledMatMul.RhsScale.Index]
+                             .Where(type => IsReplicatedScale(type, lhs.Placement)))
+                {
+                    var outputType = PackedBlockScaledMatMulEvaluator.InferType(
+                        target,
+                        lhs,
+                        alignedRhs,
+                        rhsScale);
+                    if (outputType is not InvalidType)
+                    {
+                        yield return new(lhs, alignedRhs, rhsScale, outputType);
+                    }
+                }
+            }
+        }
+    }
+
+    private static bool IsReplicatedScale(IRType type, Placement placement)
+    {
+        var scale = ScaledMatMulEvaluator.GetTensorType(type);
+        if (scale?.Shape is not RankedShape { Rank: 2 })
+        {
+            return false;
+        }
+
+        return type switch
+        {
+            TensorType => true,
+            DistributedType distributed =>
+                distributed.Placement == placement &&
+                distributed.Partial is null &&
+                distributed.AxisPolicies.All(policy => policy is SBPBroadCast),
+            _ => false,
+        };
     }
 }
 
@@ -221,4 +416,17 @@ internal sealed record PackedMatMulDistributedCandidate(
     IRType Rhs,
     IRType Scale,
     IRType Addend,
+    IRType OutputType);
+
+internal sealed record PackedScaledMatMulDistributedCandidate(
+    IRType Lhs,
+    IRType Rhs,
+    IRType LhsScale,
+    IRType RhsScale,
+    IRType OutputType);
+
+internal sealed record PackedBlockScaledMatMulDistributedCandidate(
+    IRType Lhs,
+    IRType Rhs,
+    IRType RhsScale,
     IRType OutputType);

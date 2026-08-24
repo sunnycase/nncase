@@ -131,6 +131,9 @@ class TritonTensorDescriptorCache:
         "float32": 7,
         "float64": 8,
         "bfloat16": 9,
+        # CUDA tensor maps transport FP8 storage as raw one-byte elements.
+        "float8e4m3fn": 0,
+        "float8e5m2": 0,
     }
 
     def __init__(self) -> None:

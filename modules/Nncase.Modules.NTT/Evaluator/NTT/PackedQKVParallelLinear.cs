@@ -8,6 +8,7 @@ using Nncase.IR;
 using Nncase.IR.NTT;
 using Nncase.Utilities;
 using OrtKISharp;
+using ScaledMatMulEvaluator = Nncase.Evaluator.Math.ScaledMatMulEvaluator;
 
 namespace Nncase.Evaluator.IR.NTT;
 
@@ -18,19 +19,11 @@ public sealed class PackedQKVParallelLinearEvaluator : IEvaluator<PackedQKVParal
 {
     public IValue Visit(IEvaluateContext context, PackedQKVParallelLinear target)
     {
-        ValidateNoScales(
-            context.GetArgumentValue(target, PackedQKVParallelLinear.QInputScale),
-            context.GetArgumentValue(target, PackedQKVParallelLinear.KInputScale),
-            context.GetArgumentValue(target, PackedQKVParallelLinear.VInputScale),
-            context.GetArgumentValue(target, PackedQKVParallelLinear.QWeightScale),
-            context.GetArgumentValue(target, PackedQKVParallelLinear.KWeightScale),
-            context.GetArgumentValue(target, PackedQKVParallelLinear.VWeightScale));
-
         var input = context.GetArgumentValueAsTensor(target, PackedQKVParallelLinear.Input);
         return Value.FromTensors(
-            Project(input, context.GetArgumentValueAsTensor(target, PackedQKVParallelLinear.QWeight), context.GetArgumentValue(target, PackedQKVParallelLinear.QBias), target.OutputDataType, target.RhsLayout),
-            Project(input, context.GetArgumentValueAsTensor(target, PackedQKVParallelLinear.KWeight), context.GetArgumentValue(target, PackedQKVParallelLinear.KBias), target.OutputDataType, target.RhsLayout),
-            Project(input, context.GetArgumentValueAsTensor(target, PackedQKVParallelLinear.VWeight), context.GetArgumentValue(target, PackedQKVParallelLinear.VBias), target.OutputDataType, target.RhsLayout));
+            Project(input, context.GetArgumentValueAsTensor(target, PackedQKVParallelLinear.QWeight), context.GetArgumentValue(target, PackedQKVParallelLinear.QBias), context.GetArgumentValue(target, PackedQKVParallelLinear.QInputScale), context.GetArgumentValue(target, PackedQKVParallelLinear.QWeightScale), target.OutputDataType, target.RhsLayout),
+            Project(input, context.GetArgumentValueAsTensor(target, PackedQKVParallelLinear.KWeight), context.GetArgumentValue(target, PackedQKVParallelLinear.KBias), context.GetArgumentValue(target, PackedQKVParallelLinear.KInputScale), context.GetArgumentValue(target, PackedQKVParallelLinear.KWeightScale), target.OutputDataType, target.RhsLayout),
+            Project(input, context.GetArgumentValueAsTensor(target, PackedQKVParallelLinear.VWeight), context.GetArgumentValue(target, PackedQKVParallelLinear.VBias), context.GetArgumentValue(target, PackedQKVParallelLinear.VInputScale), context.GetArgumentValue(target, PackedQKVParallelLinear.VWeightScale), target.OutputDataType, target.RhsLayout));
     }
 
     public IRType Visit(ITypeInferenceContext context, PackedQKVParallelLinear target)
@@ -42,21 +35,23 @@ public sealed class PackedQKVParallelLinearEvaluator : IEvaluator<PackedQKVParal
         var qBias = context.CheckArgumentType<IRType>(target, PackedQKVParallelLinear.QBias);
         var kBias = context.CheckArgumentType<IRType>(target, PackedQKVParallelLinear.KBias);
         var vBias = context.CheckArgumentType<IRType>(target, PackedQKVParallelLinear.VBias);
-        var scaleCheck = CheckScales(
-            context.CheckArgumentType<IRType>(target, PackedQKVParallelLinear.QInputScale),
-            context.CheckArgumentType<IRType>(target, PackedQKVParallelLinear.KInputScale),
-            context.CheckArgumentType<IRType>(target, PackedQKVParallelLinear.VInputScale),
-            context.CheckArgumentType<IRType>(target, PackedQKVParallelLinear.QWeightScale),
-            context.CheckArgumentType<IRType>(target, PackedQKVParallelLinear.KWeightScale),
-            context.CheckArgumentType<IRType>(target, PackedQKVParallelLinear.VWeightScale));
+        var qInputScale = context.CheckArgumentType<IRType>(target, PackedQKVParallelLinear.QInputScale);
+        var kInputScale = context.CheckArgumentType<IRType>(target, PackedQKVParallelLinear.KInputScale);
+        var vInputScale = context.CheckArgumentType<IRType>(target, PackedQKVParallelLinear.VInputScale);
+        var qWeightScale = context.CheckArgumentType<IRType>(target, PackedQKVParallelLinear.QWeightScale);
+        var kWeightScale = context.CheckArgumentType<IRType>(target, PackedQKVParallelLinear.KWeightScale);
+        var vWeightScale = context.CheckArgumentType<IRType>(target, PackedQKVParallelLinear.VWeightScale);
+        var scaleCheck = CheckScalePair("q", qInputScale, qWeightScale)
+            ?? CheckScalePair("k", kInputScale, kWeightScale)
+            ?? CheckScalePair("v", vInputScale, vWeightScale);
         if (scaleCheck is not null)
         {
             return scaleCheck;
         }
 
-        var q = VisitProjection(input, qWeight, target.OutputDataType, target.RhsLayout);
-        var k = VisitProjection(input, kWeight, target.OutputDataType, target.RhsLayout);
-        var v = VisitProjection(input, vWeight, target.OutputDataType, target.RhsLayout);
+        var q = VisitProjection(input, qWeight, qInputScale, qWeightScale, target.OutputDataType, target.RhsLayout);
+        var k = VisitProjection(input, kWeight, kInputScale, kWeightScale, target.OutputDataType, target.RhsLayout);
+        var v = VisitProjection(input, vWeight, vInputScale, vWeightScale, target.OutputDataType, target.RhsLayout);
         if (q is InvalidType)
         {
             return q;
@@ -90,6 +85,15 @@ public sealed class PackedQKVParallelLinearEvaluator : IEvaluator<PackedQKVParal
         var qBias = context.GetArgumentType<IRType>(target, PackedQKVParallelLinear.QBias);
         var kBias = context.GetArgumentType<IRType>(target, PackedQKVParallelLinear.KBias);
         var vBias = context.GetArgumentType<IRType>(target, PackedQKVParallelLinear.VBias);
+        var scales = new[]
+        {
+            context.GetArgumentType<IRType>(target, PackedQKVParallelLinear.QInputScale),
+            context.GetArgumentType<IRType>(target, PackedQKVParallelLinear.KInputScale),
+            context.GetArgumentType<IRType>(target, PackedQKVParallelLinear.VInputScale),
+            context.GetArgumentType<IRType>(target, PackedQKVParallelLinear.QWeightScale),
+            context.GetArgumentType<IRType>(target, PackedQKVParallelLinear.KWeightScale),
+            context.GetArgumentType<IRType>(target, PackedQKVParallelLinear.VWeightScale),
+        };
         var output = context.GetReturnType<TupleType>();
         if (TryGetTargetCost(context, target, input, qWeight, kWeight, vWeight, output, out var targetCost))
         {
@@ -102,7 +106,8 @@ public sealed class PackedQKVParallelLinearEvaluator : IEvaluator<PackedQKVParal
         {
             [CostFactorNames.BlockLocalMemoryLoadBytes] = CostUtility.GetMemoryAccess(input)
                 + CostUtility.GetMemoryAccess(qWeight) + CostUtility.GetMemoryAccess(kWeight) + CostUtility.GetMemoryAccess(vWeight)
-                + CostUtility.GetMemoryAccess(qBias) + CostUtility.GetMemoryAccess(kBias) + CostUtility.GetMemoryAccess(vBias),
+                + CostUtility.GetMemoryAccess(qBias) + CostUtility.GetMemoryAccess(kBias) + CostUtility.GetMemoryAccess(vBias)
+                + scales.Aggregate((UInt128)0, (sum, scale) => sum + CostUtility.GetMemoryAccess(scale)),
             [CostFactorNames.BlockLocalMemoryStoreBytes] = output.Fields.Aggregate((UInt128)0, (sum, type) => sum + CostUtility.GetMemoryAccess(type)),
             [CostFactorNames.CPUCycles] = output.Fields.Aggregate((UInt128)0, (sum, type) => sum + CostUtility.GetCPUCycles(type, macPerElement)),
         };
@@ -114,6 +119,8 @@ public sealed class PackedQKVParallelLinearEvaluator : IEvaluator<PackedQKVParal
         Tensor input,
         Tensor packedWeight,
         IValue packedBias,
+        IValue inputScale,
+        IValue weightScale,
         DataType outputDataType,
         PackedMatMulRhsLayout rhsLayout)
     {
@@ -141,7 +148,15 @@ public sealed class PackedQKVParallelLinearEvaluator : IEvaluator<PackedQKVParal
             weightOrt = OrtKI.Transpose(weightOrt, perm);
         }
 
-        var result = Math.MatMulEvaluator.InferValue(input.ElementType, input, weightOrt.ToTensor(), outputDataType).AsTensor().ToOrtTensor();
+        var logicalWeight = weightOrt.ToTensor();
+        var result = IsNone(inputScale) && IsNone(weightScale)
+            ? Math.MatMulEvaluator.InferValue(input.ElementType, input, logicalWeight, outputDataType).AsTensor().ToOrtTensor()
+            : ScaledMatMulEvaluator.Evaluate(
+                input,
+                logicalWeight,
+                inputScale.AsTensor(),
+                weightScale.AsTensor(),
+                outputDataType).AsTensor().ToOrtTensor();
         result = result.Pack(
             0,
             outputLanes,
@@ -157,6 +172,8 @@ public sealed class PackedQKVParallelLinearEvaluator : IEvaluator<PackedQKVParal
     private static IRType VisitProjection(
         IRType input,
         IRType packedWeight,
+        IRType inputScale,
+        IRType weightScale,
         DataType outputDataType,
         PackedMatMulRhsLayout rhsLayout)
     {
@@ -198,15 +215,21 @@ public sealed class PackedQKVParallelLinearEvaluator : IEvaluator<PackedQKVParal
                             $"weight={unpackedWeight.AxisPolicies[dimInfo.Rk]}.");
                     }
 
-                    return PackOutput(
-                        Math.MatMulEvaluator.VisitDistributedType(
+                    var projection = inputScale is NoneType && weightScale is NoneType
+                        ? Math.MatMulEvaluator.VisitDistributedType(
                             a,
                             unpackedWeight,
                             NoneType.Default,
                             dimInfo: dimInfo,
                             transB: transposeB,
-                            outputDataType: outputDataType),
-                        outputLanes);
+                            outputDataType: outputDataType)
+                        : ScaledMatMulEvaluator.InferType(
+                            new global::Nncase.IR.Math.ScaledMatMul(outputDataType),
+                            a,
+                            unpackedWeight,
+                            inputScale,
+                            weightScale);
+                    return PackOutput(projection, outputLanes);
                 }
 
             case (TensorType a, TensorType b):
@@ -237,14 +260,20 @@ public sealed class PackedQKVParallelLinearEvaluator : IEvaluator<PackedQKVParal
                         transposeB,
                         a.Shape.Rank,
                         unpackedWeight.Shape.Rank);
-                    return PackOutput(
-                        Math.MatMulEvaluator.VisitTensorType(
+                    var projection = inputScale is NoneType && weightScale is NoneType
+                        ? Math.MatMulEvaluator.VisitTensorType(
                             a,
                             unpackedWeight,
                             NoneType.Default,
                             dimInfo: dimInfo,
-                            outputDataType: outputDataType),
-                        outputLanes);
+                            outputDataType: outputDataType)
+                        : ScaledMatMulEvaluator.InferType(
+                            new global::Nncase.IR.Math.ScaledMatMul(outputDataType),
+                            a,
+                            unpackedWeight,
+                            inputScale,
+                            weightScale);
+                    return PackOutput(projection, outputLanes);
                 }
 
             default:
@@ -463,19 +492,18 @@ public sealed class PackedQKVParallelLinearEvaluator : IEvaluator<PackedQKVParal
         return null;
     }
 
-    private static InvalidType? CheckScales(params IRType[] scales)
+    private static InvalidType? CheckScalePair(string name, IRType inputScale, IRType weightScale)
     {
-        return scales.All(scale => scale is NoneType)
-            ? null
-            : new InvalidType("PackedQKVParallelLinear currently supports only None input/weight scales.");
-    }
-
-    private static void ValidateNoScales(params IValue[] scales)
-    {
-        if (scales.Any(scale => !IsNone(scale)))
+        if (inputScale is NoneType && weightScale is NoneType)
         {
-            throw new NotSupportedException("PackedQKVParallelLinear currently supports only None input/weight scales.");
+            return null;
         }
+
+        return ScaledMatMulEvaluator.IsScaleType(inputScale) &&
+            ScaledMatMulEvaluator.IsScaleType(weightScale)
+            ? null
+            : new InvalidType(
+                $"PackedQKVParallelLinear {name} input/weight scales must both be single-element float32 tensors.");
     }
 
     private static bool IsNone(IValue value) => value is NoneValue || value.Type is NoneType;

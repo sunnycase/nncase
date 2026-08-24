@@ -59,6 +59,7 @@ internal static class GatedDeltaNetCandidateUtility
                 TensorType tensor => tensor,
                 DistributedType distributed => distributed.TensorType,
                 DimensionType dimension => dimension,
+                NoneType none => none,
                 _ => null!,
             };
             if (tensorTypes[parameter.Index] is null)
@@ -73,25 +74,33 @@ internal static class GatedDeltaNetCandidateUtility
     public static TensorType GetTensorType(IRType type) => type as TensorType
         ?? throw new InvalidOperationException($"Expected a tensor type, got {type}.");
 
+    public static long GetVectorLaneCount(DataType type) => type switch
+    {
+        VectorType vector => vector.Lanes.Aggregate(
+            GetVectorLaneCount(vector.ElemType),
+            static (product, lane) => checked(product * lane)),
+        _ => 1,
+    };
+
     private static bool AreValidAxes(IReadOnlyList<int> axes, int placementRank) =>
         axes.Distinct().Count() == axes.Count && axes.All(axis => axis >= 0 && axis < placementRank);
 }
 
 /// <summary>
-/// Derives channel-parallel projection candidates independently from recurrent-head placement.
+/// Derives channel-parallel convolution candidates independently from recurrent-head placement.
 /// </summary>
-internal sealed class GatedDeltaNetProjectionCandidateProvider :
-    DistributedCandidateProvider<GatedDeltaNetProjection>
+internal sealed class GatedDeltaNetConvolutionCandidateProvider :
+    DistributedCandidateProvider<GatedDeltaNetConvolution>
 {
     public override bool IsExhaustive => true;
 
     public override IReadOnlyList<IRType> GetReturnCandidateTypes(
         DistributedCandidateContext context,
-        GatedDeltaNetProjection target,
+        GatedDeltaNetConvolution target,
         IReadOnlyList<IRType> defaultReturnTypes)
     {
         if (!GatedDeltaNetCandidateUtility.TryGetSourceTensorTypes(context, target, out var inputs) ||
-            GatedDeltaNetProjectionEvaluator.InferTensorType(target, inputs) is not TupleType output)
+            GatedDeltaNetConvolutionEvaluator.InferTensorType(target, inputs) is not TupleType output)
         {
             return Array.Empty<IRType>();
         }
@@ -119,7 +128,7 @@ internal sealed class GatedDeltaNetProjectionCandidateProvider :
 
     public override bool TryGetInputTypeTuples(
         DistributedCandidateContext context,
-        GatedDeltaNetProjection target,
+        GatedDeltaNetConvolution target,
         IRType returnType,
         out IReadOnlyList<DistributedCandidateTuple> tuples)
     {
@@ -143,22 +152,18 @@ internal sealed class GatedDeltaNetProjectionCandidateProvider :
         var placement = qkvOutput.Placement;
         var channel = GatedDeltaNetCandidateUtility.CreateSplitPolicy(channelAxes);
         IRType[] inputs = sourceTypes.ToArray();
-        inputs[GatedDeltaNetProjection.Input.Index] =
-            GatedDeltaNetCandidateUtility.Broadcast(
-                GatedDeltaNetCandidateUtility.GetTensorType(sourceTypes[GatedDeltaNetProjection.Input.Index]),
-                placement);
-        inputs[GatedDeltaNetProjection.State.Index] = stateOutput;
-        inputs[GatedDeltaNetProjection.QKVWeight.Index] =
+        inputs[GatedDeltaNetConvolution.QKV.Index] =
             GatedDeltaNetCandidateUtility.Create(
-                GatedDeltaNetCandidateUtility.GetTensorType(sourceTypes[GatedDeltaNetProjection.QKVWeight.Index]),
+                GatedDeltaNetCandidateUtility.GetTensorType(sourceTypes[GatedDeltaNetConvolution.QKV.Index]),
                 [SBP.B, channel],
                 placement);
-        inputs[GatedDeltaNetProjection.ConvWeight.Index] =
+        inputs[GatedDeltaNetConvolution.State.Index] = stateOutput;
+        inputs[GatedDeltaNetConvolution.ConvWeight.Index] =
             GatedDeltaNetCandidateUtility.Create(
-                GatedDeltaNetCandidateUtility.GetTensorType(sourceTypes[GatedDeltaNetProjection.ConvWeight.Index]),
+                GatedDeltaNetCandidateUtility.GetTensorType(sourceTypes[GatedDeltaNetConvolution.ConvWeight.Index]),
                 [channel, SBP.B],
                 placement);
-        if (GatedDeltaNetProjectionEvaluator.InferType(target, inputs) != output)
+        if (GatedDeltaNetConvolutionEvaluator.InferType(target, inputs) != output)
         {
             return true;
         }
@@ -167,7 +172,7 @@ internal sealed class GatedDeltaNetProjectionCandidateProvider :
         [
             new DistributedCandidateTuple(
                 inputs,
-                $"gated-delta-net-projection-channel=[{string.Join(',', channelAxes)}]"),
+                $"gated-delta-net-convolution-channel=[{string.Join(',', channelAxes)}]"),
         ];
         return true;
     }
@@ -196,17 +201,13 @@ internal sealed class GatedDeltaNetRecurrentCoreCandidateProvider :
         foreach (var placement in GatedDeltaNetCandidateUtility.GetPlacements(defaultReturnTypes))
         {
             var headAxes = Enumerable.Range(0, placement.Rank).ToArray();
-            var headShardCount = headAxes.Aggregate(
-                1L,
-                (product, axis) => checked(product * placement.Hierarchy[axis]));
-            if (target.NumValueHeads % headShardCount != 0)
-            {
-                continue;
-            }
-
-            var head = GatedDeltaNetCandidateUtility.CreateSplitPolicy(headAxes);
+            var value = DistributedUtility.CreateUnitAlignedContiguousSplit(
+                headAxes,
+                placement,
+                target.NumValueHeads,
+                target.ValueHeadDim);
             var candidate = new TupleType([
-                new DistributedType((TensorType)output[0], [SBP.B, head], placement),
+                new DistributedType((TensorType)output[0], [SBP.B, value], placement),
                 output[1],
             ]);
             if (DistributedUtility.IsDistributable(
@@ -245,19 +246,41 @@ internal sealed class GatedDeltaNetRecurrentCoreCandidateProvider :
         }
 
         var placement = gatedOutput.Placement;
-        var head = GatedDeltaNetCandidateUtility.CreateSplitPolicy(headAxes);
+        var head = DistributedUtility.CreateUnitAlignedContiguousSplit(
+            headAxes,
+            placement,
+            target.NumValueHeads);
+        var value = DistributedUtility.CreateUnitAlignedContiguousSplit(
+            headAxes,
+            placement,
+            target.NumValueHeads,
+            target.ValueHeadDim);
+        var zType = GatedDeltaNetCandidateUtility.GetTensorType(
+            sourceTypes[GatedDeltaNetRecurrentCore.Z.Index]);
+        if (!DistributedUtility.TryScaleSplitUnits(
+                value,
+                1,
+                GatedDeltaNetCandidateUtility.GetVectorLaneCount(zType.DType),
+                out var packedValue))
+        {
+            return true;
+        }
+
+        if (gatedOutput.AxisPolicies[1] != value)
+        {
+            return true;
+        }
+
         IRType[] inputs = sourceTypes.ToArray();
-        inputs[GatedDeltaNetRecurrentCore.Input.Index] = GatedDeltaNetCandidateUtility.Broadcast(
-            GatedDeltaNetCandidateUtility.GetTensorType(sourceTypes[GatedDeltaNetRecurrentCore.Input.Index]), placement);
         inputs[GatedDeltaNetRecurrentCore.State.Index] = stateOutput;
         inputs[GatedDeltaNetRecurrentCore.QKV.Index] = GatedDeltaNetCandidateUtility.Broadcast(
             GatedDeltaNetCandidateUtility.GetTensorType(sourceTypes[GatedDeltaNetRecurrentCore.QKV.Index]), placement);
-        inputs[GatedDeltaNetRecurrentCore.ZWeight.Index] = GatedDeltaNetCandidateUtility.Create(
-            GatedDeltaNetCandidateUtility.GetTensorType(sourceTypes[GatedDeltaNetRecurrentCore.ZWeight.Index]), [SBP.B, head], placement);
-        inputs[GatedDeltaNetRecurrentCore.BWeight.Index] = GatedDeltaNetCandidateUtility.Create(
-            GatedDeltaNetCandidateUtility.GetTensorType(sourceTypes[GatedDeltaNetRecurrentCore.BWeight.Index]), [SBP.B, head], placement);
-        inputs[GatedDeltaNetRecurrentCore.AWeight.Index] = GatedDeltaNetCandidateUtility.Create(
-            GatedDeltaNetCandidateUtility.GetTensorType(sourceTypes[GatedDeltaNetRecurrentCore.AWeight.Index]), [SBP.B, head], placement);
+        inputs[GatedDeltaNetRecurrentCore.Z.Index] = GatedDeltaNetCandidateUtility.Create(
+            zType, [SBP.B, packedValue], placement);
+        inputs[GatedDeltaNetRecurrentCore.BProjection.Index] = GatedDeltaNetCandidateUtility.Broadcast(
+            GatedDeltaNetCandidateUtility.GetTensorType(sourceTypes[GatedDeltaNetRecurrentCore.BProjection.Index]), placement);
+        inputs[GatedDeltaNetRecurrentCore.AProjection.Index] = GatedDeltaNetCandidateUtility.Broadcast(
+            GatedDeltaNetCandidateUtility.GetTensorType(sourceTypes[GatedDeltaNetRecurrentCore.AProjection.Index]), placement);
         inputs[GatedDeltaNetRecurrentCore.ALog.Index] = GatedDeltaNetCandidateUtility.Create(
             GatedDeltaNetCandidateUtility.GetTensorType(sourceTypes[GatedDeltaNetRecurrentCore.ALog.Index]), [head], placement);
         inputs[GatedDeltaNetRecurrentCore.DtBias.Index] = GatedDeltaNetCandidateUtility.Create(

@@ -605,16 +605,12 @@ public abstract class HuggingFaceModel
     {
         if (hasInputScale && hasWeightScale)
         {
-            var qScaleA = Nncase.IR.F.Math.Div(1.0f, inputScale);
-            if (qScaleA.CheckedDataType != expr.CheckedDataType)
-            {
-                qScaleA = Nncase.IR.F.Tensors.Cast(qScaleA, expr.CheckedDataType);
-            }
-
-            var qInput = Nncase.IR.F.Math.Binary(Nncase.BinaryOp.Mul, expr, qScaleA);
-            qInput = Nncase.IR.F.Tensors.Cast(qInput, DataTypes.Float8E4M3);
-            var deqScale = Nncase.IR.F.Math.Binary(Nncase.BinaryOp.Mul, inputScale, weightScale);
-            var result = Nncase.IR.F.Math.MatMul(qInput, weight, expr.CheckedDataType, deqScale).With(metadata: new IRMetadata() { OutputNames = new[] { layerName } });
+            var result = Nncase.IR.F.Math.ScaledMatMul(
+                expr,
+                weight,
+                inputScale,
+                weightScale,
+                expr.CheckedDataType).With(metadata: new IRMetadata() { OutputNames = new[] { layerName } });
 
             if (bias is not None)
             {

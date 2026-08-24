@@ -714,6 +714,29 @@ public class UnitTestEvaluatorTensors : TestClassBase
     }
 
     [Fact]
+    public void TestPackFloat8Vector()
+    {
+        var source = Tensor.From(
+            Enumerable.Range(0, 32 * 8).Select(index => (float)index / 32F).ToArray(),
+            [32, 8]).CastElementTo(DataTypes.Float8E4M3);
+        var vectorized = IR.F.Tensors.Pack(source, [16], [0]);
+        var kPacked = IR.F.Tensors.Pack(vectorized, [2], [0]);
+        var repacked = IR.F.Tensors.Pack(kPacked, [8], [1]);
+
+        var actual = repacked.Evaluate().AsTensor();
+        Assert.Equal(new VectorType(DataTypes.Float8E4M3, [8, 2, 16]), actual.ElementType);
+        var restored = IR.F.Tensors.Unpack(
+            IR.F.Tensors.Unpack(
+                IR.F.Tensors.Unpack(actual, [8], [1]),
+                [2],
+                [0]),
+            [16],
+            [0]).Evaluate().AsTensor();
+
+        Assert.Equal(source, restored);
+    }
+
+    [Fact]
     public void TestReverseSequence()
     {
         var shape = new long[] { 4, 4 };

@@ -21,19 +21,34 @@ print("getpid", os.getpid())
 
 
 def test_qwen3_fp8_static(request):
-    cfg = """
+    num_layers = int(os.getenv("NNCASE_QWEN3_NUM_LAYERS", "1"))
+    cfg = f"""
     [compile_opt]
     dump_ir = true
-    shape_bucket_enable = true
-    shape_bucket_range_info = { "sequence_length"=[1,512] }
-    shape_bucket_segments_count = 2
-    shape_bucket_fix_var_map = { "batch_size"=1 }
+    shape_bucket_enable = false
+    shape_bucket_range_info = {{ }}
+    shape_bucket_segments_count = 0
+    shape_bucket_segments = {{ }}
+    shape_bucket_fix_var_map = {{ "sequence_length"=1 }}
     
     [huggingface_options]
     output_logits = true
     output_hidden_states = false
-    num_layers = -1
-    tensor_type = "float16"
+    num_layers = {num_layers}
+    tensor_type = "bfloat16"
+    input_ids_type = "int32"
+
+    [paged_attention_config]
+    block_size = 256
+    kv_type = "bfloat16"
+    key_cache_layout = ["NumBlocks","NumLayers","KV","BlockSize","NumKVHeads","HeadDim"]
+    value_cache_layout = ["NumBlocks","NumLayers","KV","BlockSize","NumKVHeads","HeadDim"]
+    key_vectorized_axes = ["HeadDim"]
+    value_vectorized_axes = ["HeadDim"]
+    key_lanes = [8]
+    value_lanes = [8]
+    sharding_axes = []
+    axis_policies = []
 
     [generator]
     [generator.inputs]
@@ -42,7 +57,8 @@ def test_qwen3_fp8_static(request):
     batch = 1
 
     [generator.inputs.text]
-    args = 'tests/importer/huggingface_/prompt_qwen.txt'
+    args = 'tests/importer/huggingface_/prompt.txt'
+    sequence_length = 1
 
     [generator.calibs]
     method = 'text'
@@ -50,18 +66,8 @@ def test_qwen3_fp8_static(request):
     batch = 1
 
     [generator.calibs.text]
-    args = 'tests/importer/huggingface_/prompt_qwen.txt'
-
-    #TODO: Need remove!
-    [target]
-    [target.cpu]
-    infer = false
-    [target.xpu]
-    infer = true
-
-    [target.cpu.mode.noptq]
-    enabled = true
-    threshold = 0.98
+    args = 'tests/importer/huggingface_/prompt.txt'
+    sequence_length = 1
     """
     runner = HuggingfaceTestRunner(request.node.name, overwrite_configs=cfg)
 

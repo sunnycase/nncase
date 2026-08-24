@@ -2,6 +2,7 @@
 // Licensed under the Apache license. See LICENSE file in the project root for full license information.
 
 using System;
+using System.Collections.Generic;
 using System.Linq;
 using Nncase.IR;
 using Nncase.IR.NN;
@@ -26,7 +27,9 @@ public sealed partial class DecomposeGatedDeltaNet : IRewriteRule
         IsWildcard("input"),
         IsWildcard("state"),
         IsWildcard("qkvWeight"),
+        IsWildcard("qkvWeightScale"),
         IsWildcard("zWeight"),
+        IsWildcard("zWeightScale"),
         IsWildcard("bWeight"),
         IsWildcard("aWeight"),
         IsWildcard("convWeight"),
@@ -34,6 +37,7 @@ public sealed partial class DecomposeGatedDeltaNet : IRewriteRule
         IsWildcard("dtBias"),
         IsWildcard("normWeight"),
         IsWildcard("outputWeight"),
+        IsWildcard("outputWeightScale"),
         IsWildcard("layerId"));
 
     private BaseExpr GetReplace(
@@ -42,7 +46,9 @@ public sealed partial class DecomposeGatedDeltaNet : IRewriteRule
         Expr input,
         Expr state,
         Expr qkvWeight,
+        Expr qkvWeightScale,
         Expr zWeight,
+        Expr zWeightScale,
         Expr bWeight,
         Expr aWeight,
         Expr convWeight,
@@ -50,6 +56,7 @@ public sealed partial class DecomposeGatedDeltaNet : IRewriteRule
         Expr dtBias,
         Expr normWeight,
         Expr outputWeight,
+        Expr outputWeightScale,
         Dimension layerId)
     {
         if (state.CheckedDataType is not ReferenceType
@@ -61,20 +68,53 @@ public sealed partial class DecomposeGatedDeltaNet : IRewriteRule
                 $"GatedDeltaNet decomposition requires a configured GatedDeltaNetState, got {state.CheckedDataType}.");
         }
 
-        var projection = IR.F.NN.GatedDeltaNetProjection(
-            input,
+        Expr Project(Expr weight, Expr weightScale) => gatedDeltaNet.QuantizationMode switch
+        {
+            IR.Math.MatMulQuantizationMode.None => IR.F.Tensors.MatMul(
+                input,
+                weight,
+                stateConfig.ActivationPrimType),
+            IR.Math.MatMulQuantizationMode.DynamicBlock => IR.F.Math.BlockScaledMatMul(
+                input,
+                weight,
+                weightScale,
+                stateConfig.ActivationPrimType,
+                gatedDeltaNet.WeightBlockN,
+                gatedDeltaNet.WeightBlockK),
+            _ => throw new NotSupportedException(
+                $"GatedDeltaNet decomposition does not support quantization mode " +
+                $"{gatedDeltaNet.QuantizationMode}."),
+        };
+
+        Expr Pack(Expr value, IReadOnlyList<int> lanes) => IR.F.Tensors.Pack(
+            value,
+            lanes.ToArray(),
+            Enumerable.Repeat(1, lanes.Count).ToArray());
+
+        var qkv = Pack(
+            Project(qkvWeight, qkvWeightScale),
+            stateConfig.GetLanes(
+                GatedDeltaNetStateKind.Convolution,
+                GatedDeltaNetStateDimKind.ConvChannels));
+        var convolution = IR.F.NN.GatedDeltaNetConvolution(
+            qkv,
             state,
-            qkvWeight,
             convWeight,
             layerId,
             gatedDeltaNet.ConvKernelSize);
+        var z = Pack(Project(zWeight, zWeightScale), stateConfig.ActivationLanes);
+        var bProjection = Pack(
+            IR.F.Tensors.MatMul(input, bWeight, stateConfig.ActivationPrimType),
+            stateConfig.ActivationLanes);
+        var aProjection = Pack(
+            IR.F.Tensors.MatMul(input, aWeight, stateConfig.ActivationPrimType),
+            stateConfig.ActivationLanes);
         var recurrent = IR.F.NN.GatedDeltaNetRecurrentCore(
-            input,
-            projection[1],
-            projection[0],
-            zWeight,
-            bWeight,
-            aWeight,
+            convolution[1],
+            convolution[0],
+            z,
+            bProjection,
+            aProjection,
             aLog,
             dtBias,
             normWeight,
@@ -84,10 +124,23 @@ public sealed partial class DecomposeGatedDeltaNet : IRewriteRule
             gatedDeltaNet.KeyHeadDim,
             gatedDeltaNet.ValueHeadDim,
             gatedDeltaNet.Epsilon);
-        var output = IR.F.Tensors.MatMul(
-            recurrent[0],
-            outputWeight,
-            stateConfig.ActivationPrimType);
+        var output = gatedDeltaNet.QuantizationMode switch
+        {
+            IR.Math.MatMulQuantizationMode.None => IR.F.Tensors.MatMul(
+                recurrent[0],
+                outputWeight,
+                stateConfig.ActivationPrimType),
+            IR.Math.MatMulQuantizationMode.DynamicBlock => IR.F.Math.BlockScaledMatMul(
+                recurrent[0],
+                outputWeight,
+                outputWeightScale,
+                stateConfig.ActivationPrimType,
+                gatedDeltaNet.WeightBlockN,
+                gatedDeltaNet.WeightBlockK),
+            _ => throw new NotSupportedException(
+                $"GatedDeltaNet decomposition does not support quantization mode " +
+                $"{gatedDeltaNet.QuantizationMode}."),
+        };
 
         return new IR.Tuple(output, recurrent[1]).InheritMetaData(call);
     }

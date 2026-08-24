@@ -42,6 +42,8 @@ TMA_MAXIMUM_SWIZZLE_BYTES = 128
 TMA_DTYPE_ITEM_SIZES = {
     "uint8": 1,
     "int8": 1,
+    "float8e4m3fn": 1,
+    "float8e5m2": 1,
     "uint16": 2,
     "int16": 2,
     "float16": 2,
@@ -194,6 +196,33 @@ def _require_positive_int_list(value: Any, path: str) -> list[int]:
     return values
 
 
+def _normalize_singleton_strides(
+    shape: tuple[int, ...], strides: tuple[int, ...]
+) -> tuple[int, ...]:
+    """Give zero-stride singleton dimensions an equivalent positive stride."""
+
+    if len(shape) != len(strides):
+        raise ValueError(
+            "PyNTT tensor descriptor shape/stride ranks differ: "
+            f"{len(shape)} and {len(strides)}."
+        )
+    normalized = list(strides)
+    trailing_span = 1
+    for axis in range(len(shape) - 1, -1, -1):
+        extent = shape[axis]
+        stride = normalized[axis]
+        if stride == 0:
+            if extent != 1:
+                raise ValueError(
+                    "PyNTT tensor descriptor has a zero stride on non-singleton "
+                    f"axis {axis}: shape={shape}, strides={strides}."
+                )
+            stride = trailing_span
+            normalized[axis] = stride
+        trailing_span = max(trailing_span, stride * extent)
+    return tuple(normalized)
+
+
 def _validate_launch(launch: Any, path: str) -> None:
     launch = _require_exact_object(
         launch,
@@ -262,14 +291,23 @@ def _validate_launch(launch: Any, path: str) -> None:
         logical_shape = _require_positive_int_list(
             descriptor["logical_shape"], f"{descriptor_path}.logical_shape"
         )
-        logical_strides = _require_positive_int_list(
+        logical_strides = _require_list(
             descriptor["logical_strides"], f"{descriptor_path}.logical_strides"
         )
+        for axis, stride in enumerate(logical_strides):
+            _require_int(
+                stride,
+                f"{descriptor_path}.logical_strides[{axis}]",
+                minimum=0,
+            )
         if len(logical_shape) != len(logical_strides):
             raise ValueError(
                 f"{descriptor_path} logical shape/stride ranks differ: "
                 f"{len(logical_shape)} and {len(logical_strides)}."
             )
+        _normalize_singleton_strides(
+            tuple(logical_shape), tuple(logical_strides)
+        )
         source_shape_axes = _require_list(
             descriptor["source_shape_axes"],
             f"{descriptor_path}.source_shape_axes",
@@ -839,7 +877,11 @@ def _pipeline_helper_descriptor_specs(
 ) -> tuple[tuple[str, Any], ...]:
     model = helper["model"]
     template = helper["template"]
-    if template == "triton/kernels/matmul/simt_fma_smem_pipeline.py.jinja":
+    if template in (
+        "triton/kernels/matmul/simt_fma_smem_pipeline.py.jinja",
+        "triton/kernels/matmul/simt_fp8_fma_smem_pipeline.py.jinja",
+        "triton/kernels/matmul/simt_block_fp8_fma_smem_pipeline.py.jinja",
+    ):
         descriptor_names = (model.get("RhsDescriptorName"),)
         descriptor_specs = (_packed_gemv_host_descriptor_spec,)
     elif (
@@ -852,14 +894,19 @@ def _pipeline_helper_descriptor_specs(
         descriptor_names = (matmul.get("RhsDescriptorName"),)
         descriptor_specs = (_packed_matmul_sampling_partial_host_descriptor_spec,)
     elif (
-        template
-        == "triton/kernels/qkv_parallel_linear/simt_fma_smem_pipeline.py.jinja"
+        template in (
+            "triton/kernels/qkv_parallel_linear/simt_fma_smem_pipeline.py.jinja",
+            "triton/kernels/qkv_parallel_linear/simt_fp8_fma_smem_pipeline.py.jinja",
+        )
     ):
         descriptor_names = (model.get("WeightDescriptorName"),)
         descriptor_specs = (_packed_qkv_gemv_host_descriptor_spec,)
     elif (
-        template
-        == "triton/kernels/matmul_glu/simt_fma_smem_pipeline.py.jinja"
+        template in (
+            "triton/kernels/matmul_glu/simt_fma_smem_pipeline.py.jinja",
+            "triton/kernels/matmul_glu/simt_fp8_fma_smem_pipeline.py.jinja",
+            "triton/kernels/matmul_glu/simt_block_fp8_fma_smem_pipeline.py.jinja",
+        )
     ):
         descriptor_names = tuple(
             model.get(f"{prefix}WeightDescriptorName")
@@ -886,18 +933,6 @@ def _pipeline_helper_descriptor_specs(
             _paged_attention_host_descriptor_spec,
             _paged_attention_host_descriptor_spec,
         )
-    elif (
-        template
-        == "triton/kernels/gated_delta_net/projection_mma_tma_smem_pipeline.py.jinja"
-    ):
-        descriptor_names = (model.get("QKVWeightDescriptorName"),)
-        descriptor_specs = (_gated_delta_net_projection_descriptor_spec,)
-    elif template in (
-        "triton/kernels/gated_delta_net/recurrent_core_hybrid_tma_smem_pipeline.py.jinja",
-        "triton/kernels/gated_delta_net/recurrent_core_single_head_register_state_hybrid_tma_smem_pipeline.py.jinja",
-    ):
-        descriptor_names = (model.get("ZWeightDescriptorName"),)
-        descriptor_specs = (_gated_delta_net_recurrent_core_descriptor_spec,)
     else:
         return ()
 
@@ -936,7 +971,10 @@ def _paged_attention_host_descriptor_spec(
         allow_cross_page=True,
     )
     shape = tuple(int(value) for value in backing["logical_shape"])
-    strides = tuple(int(value) for value in backing["logical_strides"])
+    strides = _normalize_singleton_strides(
+        shape,
+        tuple(int(value) for value in backing["logical_strides"]),
+    )
     source_shape_axes = tuple(
         tuple(int(axis) for axis in axes)
         for axes in backing["source_shape_axes"]
@@ -970,7 +1008,7 @@ def _packed_gemv_host_descriptor_spec(
     backing: dict[str, Any],
 ) -> dict[str, Any]:
     microkernel = _microkernel_context(
-        model, "triton.matmul", "simt_fma_smem_pipeline"
+        model, "triton.matmul", str(model["MicroKernel"]["Variant"])
     )
     return _k_major_gemv_host_descriptor_spec(
         model,
@@ -978,225 +1016,10 @@ def _packed_gemv_host_descriptor_spec(
         block_n=microkernel["parameters"]["block_n"],
         block_k=microkernel["parameters"]["block_k"],
         pointer=model["Rhs"],
-    )
-
-
-def _gated_delta_net_projection_descriptor_spec(
-    model: dict[str, Any],
-    backing: dict[str, Any],
-) -> dict[str, Any]:
-    microkernel = _microkernel_context(
-        model,
-        "triton.gated_delta_net",
-        "projection_mma_tma_smem_pipeline",
-        required_workspace_names=("weight_stage",),
-    )
-    return _scalar_matrix_host_descriptor_spec(
-        backing,
-        pointer=model["QKVWeight"],
-        block_k=microkernel["parameters"]["block_k"],
-        block_n=microkernel["parameters"]["block_n"],
-        context="GatedDeltaNet projection QKV weight",
-    )
-
-
-def _gated_delta_net_recurrent_core_descriptor_spec(
-    model: dict[str, Any],
-    backing: dict[str, Any],
-) -> dict[str, Any]:
-    raw_microkernel = model.get("MicroKernel")
-    if not isinstance(raw_microkernel, dict):
-        raise ValueError(
-            "PyNTT GatedDeltaNet recurrent core requires selected microkernel metadata."
-        )
-    variant = _require_string(
-        raw_microkernel.get("Variant"),
-        "microkernel.Variant",
-        nonempty=True,
-    )
-    required_workspaces = {
-        "recurrent_core_hybrid_tma_smem_pipeline": (
-            "weight_stage",
-            "activation_stage",
-            "qkv_stage",
-            "query_stage",
-            "key_stage",
-            "state_stage",
-            "read_stage",
-            "z_stage",
+        expected_vector_lane_shape=_packed_gemv_vector_lane_shape(
+            microkernel["variant"]
         ),
-        "recurrent_core_single_head_register_state_hybrid_tma_smem_pipeline": (
-            "weight_stage",
-            "activation_stage",
-            "qkv_result_stage",
-            "query_stage",
-            "key_stage",
-        ),
-    }
-    if variant not in required_workspaces:
-        raise ValueError(
-            "PyNTT GatedDeltaNet recurrent-core descriptor does not support "
-            f"microkernel variant {variant!r}."
-        )
-    microkernel = _microkernel_context(
-        model,
-        "triton.gated_delta_net",
-        variant,
-        required_workspace_names=required_workspaces[variant],
     )
-    return _scalar_matrix_host_descriptor_spec(
-        backing,
-        pointer=model["ZWeight"],
-        block_k=microkernel["parameters"]["block_k"],
-        block_n=microkernel["parameters"]["block_n"],
-        context="GatedDeltaNet recurrent-core Z weight",
-    )
-
-
-def _scalar_matrix_host_descriptor_spec(
-    backing: dict[str, Any],
-    *,
-    pointer: dict[str, Any],
-    block_k: int,
-    block_n: int,
-    context: str,
-) -> dict[str, Any]:
-    """Build an owner-local TMA table for a scalar row-major [K,N] matrix."""
-
-    logical_shape = tuple(int(value) for value in backing["logical_shape"])
-    logical_strides = tuple(int(value) for value in backing["logical_strides"])
-    vector_lane_shape = tuple(int(value) for value in backing["vector_lane_shape"])
-    if len(logical_shape) != 2 or len(logical_strides) != 2:
-        raise ValueError(
-            f"PyNTT {context} requires a rank-2 logical backing, got "
-            f"ranks {len(logical_shape)}/{len(logical_strides)}."
-        )
-    if vector_lane_shape:
-        raise ValueError(
-            f"PyNTT {context} requires scalar matrix elements, got vector "
-            f"lanes {vector_lane_shape}."
-        )
-    if logical_strides[1] != 1:
-        raise ValueError(
-            f"PyNTT {context} requires a contiguous N axis, got strides "
-            f"{logical_strides}."
-        )
-
-    k_plan = _tma_canonical_axis_plan(
-        pointer, 0, tile_extent=block_k, context=f"{context} K"
-    )
-    n_plan = _tma_canonical_axis_plan(
-        pointer, 1, tile_extent=block_n, context=f"{context} N"
-    )
-    n_block_shape, n_terminal_atom = _tma_split_contiguous_terminal_block(
-        tuple(n_plan["block_shape"]),
-        backing["scalar_dtype"],
-        context=f"{context} N",
-    )
-    descriptor_block_shape = tuple(k_plan["block_shape"]) + n_block_shape
-    if len(descriptor_block_shape) > 5:
-        raise ValueError(
-            f"PyNTT {context} TMA descriptor exceeds the rank-5 limit: "
-            f"block_shape={descriptor_block_shape}."
-        )
-
-    hierarchy = pointer.get("Hierarchy")
-    pointer_global_shape = pointer.get("GlobalShape")
-    if not isinstance(hierarchy, list) or not hierarchy:
-        raise ValueError(f"PyNTT {context} descriptor table requires a hierarchy.")
-    if not isinstance(pointer_global_shape, list) or len(pointer_global_shape) != 2:
-        raise ValueError(f"PyNTT {context} requires a rank-2 global pointer.")
-    fixed_pointer_shape = tuple(
-        _require_fixed_positive_dim(extent, f"PyNTT {context} global axis {axis}")
-        for axis, extent in enumerate(pointer_global_shape)
-    )
-    if fixed_pointer_shape != logical_shape:
-        raise ValueError(
-            f"PyNTT {context} backing/pointer shapes differ: "
-            f"{logical_shape}/{fixed_pointer_shape}."
-        )
-
-    item_size = TMA_DTYPE_ITEM_SIZES.get(backing["scalar_dtype"])
-    if item_size is None:
-        raise ValueError(
-            f"PyNTT {context} does not support scalar dtype "
-            f"{backing['scalar_dtype']!r}."
-        )
-    rebase_extent = int(backing["contiguous_rebase_extent_elements"])
-    owner_count = _product_int([int(value) for value in hierarchy])
-    entries = []
-    for linear_owner in range(owner_count):
-        owner = _unflatten_hierarchy_owner(linear_owner, hierarchy)
-        k_entry = _tma_descriptor_table_axis_entry(
-            pointer, 0, owner, tile_extent=block_k, context=f"{context} K"
-        )
-        n_entry = _tma_descriptor_table_axis_entry(
-            pointer, 1, owner, tile_extent=block_n, context=f"{context} N"
-        )
-
-        def axis_group(
-            axis: int, entry: dict[str, Any], plan: dict[str, Any]
-        ) -> tuple[list[int], list[int]]:
-            retained = plan["retained_dimensions"]
-            return (
-                [int(entry["descriptor_shape"][dimension]) for dimension in retained],
-                [
-                    logical_strides[axis]
-                    * int(entry["stride_multipliers"][dimension])
-                    for dimension in retained
-                ],
-            )
-
-        k_shape, k_strides = axis_group(0, k_entry, k_plan)
-        n_shape, n_strides = axis_group(1, n_entry, n_plan)
-        if not n_shape or n_strides[-1] != 1:
-            raise ValueError(
-                f"PyNTT {context} cannot place linear descriptor rebases on "
-                "a non-contiguous N coordinate."
-            )
-        n_shape[-1] += rebase_extent
-        if n_terminal_atom is not None:
-            if n_shape[-1] % n_terminal_atom != 0:
-                raise ValueError(
-                    f"PyNTT {context} N descriptor extent {n_shape[-1]} is "
-                    f"not divisible by its {n_terminal_atom}-element "
-                    "contiguous TMA atom."
-                )
-            n_shape[-1:] = [n_shape[-1] // n_terminal_atom, n_terminal_atom]
-            terminal_stride = n_strides[-1]
-            n_strides[-1:] = [terminal_stride * n_terminal_atom, terminal_stride]
-        descriptor_shape = tuple(k_shape + n_shape)
-        descriptor_strides = tuple(k_strides + n_strides)
-        base_elements = _tma_owner_backing_base_elements(
-            pointer,
-            (k_entry, n_entry),
-            logical_strides,
-            context=context,
-        )
-        entries.append(
-            {
-                "offset_bytes": int(backing["offset_bytes"])
-                + linear_owner * int(backing["owner_stride_bytes"])
-                + base_elements * item_size,
-                "shape": descriptor_shape,
-                "strides": descriptor_strides,
-                "source_shape_axes": tuple(() for _ in descriptor_shape),
-            }
-        )
-
-    return {
-        "kind": "table",
-        "name": backing["name"],
-        "source": backing["source"],
-        "dtype": backing["scalar_dtype"],
-        "block_shape": descriptor_block_shape,
-        "padding": "zero",
-        "swizzle_mode": _nv_tma_swizzle_mode(
-            descriptor_block_shape, backing["scalar_dtype"]
-        ),
-        "entry_size_bytes": TENSOR_MAP_ENTRY_BYTES,
-        "entries": tuple(entries),
-    }
 
 
 def _tma_owner_backing_base_elements(
@@ -1254,6 +1077,9 @@ def _packed_matmul_sampling_partial_host_descriptor_spec(
         block_n=microkernel["parameters"]["block_n"],
         block_k=microkernel["parameters"]["block_k"],
         pointer=matmul["Rhs"],
+        expected_vector_lane_shape=_packed_gemv_vector_lane_shape(
+            microkernel["variant"]
+        ),
     )
 
 
@@ -1262,7 +1088,9 @@ def _packed_qkv_gemv_host_descriptor_spec(
     backing: dict[str, Any],
 ) -> dict[str, Any]:
     microkernel = _microkernel_context(
-        model, "triton.qkv_parallel_linear", "simt_fma_smem_pipeline"
+        model,
+        "triton.qkv_parallel_linear",
+        str(model["MicroKernel"]["Variant"]),
     )
     return _k_major_gemv_host_descriptor_spec(
         model,
@@ -1270,6 +1098,9 @@ def _packed_qkv_gemv_host_descriptor_spec(
         block_n=microkernel["parameters"]["block_n"],
         block_k=microkernel["parameters"]["block_k"],
         pointer=model["Weight"],
+        expected_vector_lane_shape=_packed_gemv_vector_lane_shape(
+            microkernel["variant"]
+        ),
         transpose_kn=True,
     )
 
@@ -1280,7 +1111,7 @@ def _packed_matmul_glu_gemv_host_descriptor_spec(
     prefix: str,
 ) -> dict[str, Any]:
     microkernel = _microkernel_context(
-        model, "triton.matmul_glu", "simt_fma_smem_pipeline"
+        model, "triton.matmul_glu", str(model["MicroKernel"]["Variant"])
     )
     return _k_major_gemv_host_descriptor_spec(
         model,
@@ -1288,6 +1119,9 @@ def _packed_matmul_glu_gemv_host_descriptor_spec(
         block_n=microkernel["parameters"]["block_n"],
         block_k=microkernel["parameters"]["block_k"],
         pointer=model[f"{prefix}Weight"],
+        expected_vector_lane_shape=_packed_gemv_vector_lane_shape(
+            microkernel["variant"]
+        ),
     )
 
 
@@ -1308,6 +1142,21 @@ def _packed_qkv_fixed_projection_ns(model: dict[str, Any]) -> dict[str, int]:
     return projection_ns
 
 
+def _packed_gemv_vector_lane_shape(variant: str) -> tuple[int, int, int]:
+    shapes = {
+        "simt_fma_smem_pipeline": (8, 2, 8),
+        "simt_fp8_fma_smem_pipeline": (8, 2, 16),
+        "simt_block_fp8_fma_smem_pipeline": (8, 2, 16),
+    }
+    try:
+        return shapes[variant]
+    except KeyError as error:
+        raise ValueError(
+            "PyNTT packed GEMV host descriptor does not support microkernel "
+            f"variant {variant!r}."
+        ) from error
+
+
 def _k_major_gemv_host_descriptor_spec(
     model: dict[str, Any],
     backing: dict[str, Any],
@@ -1315,20 +1164,24 @@ def _k_major_gemv_host_descriptor_spec(
     block_n: int,
     block_k: int,
     pointer: dict[str, Any],
+    expected_vector_lane_shape: tuple[int, int, int],
     transpose_kn: bool = False,
 ) -> dict[str, Any]:
     logical_shape = tuple(int(value) for value in backing["logical_shape"])
-    logical_strides = tuple(int(value) for value in backing["logical_strides"])
+    logical_strides = _normalize_singleton_strides(
+        logical_shape,
+        tuple(int(value) for value in backing["logical_strides"]),
+    )
     vector_lane_shape = tuple(int(value) for value in backing["vector_lane_shape"])
     if len(logical_shape) != 2 or len(logical_strides) != 2:
         raise ValueError(
             "PyNTT packed GEMV host descriptor requires a rank-2 logical RHS "
             f"backing, got ranks {len(logical_shape)}/{len(logical_strides)}."
         )
-    if vector_lane_shape != (8, 2, 8):
+    if vector_lane_shape != expected_vector_lane_shape:
         raise ValueError(
             "PyNTT packed GEMV host descriptor requires vector lane shape "
-            f"(8, 2, 8), got {vector_lane_shape}."
+            f"{expected_vector_lane_shape}, got {vector_lane_shape}."
         )
 
     n_lane, k_pack, k_lane = vector_lane_shape
@@ -1966,11 +1819,11 @@ def _make_env() -> Environment:
         gather_reduce_norm_apply_context=(
             _gather_reduce_norm_apply_template_context
         ),
-        gated_delta_net_projection_pipeline_context=(
-            _gated_delta_net_projection_pipeline_template_context
+        gated_delta_net_convolution_context=(
+            _gated_delta_net_convolution_template_context
         ),
-        gated_delta_net_recurrent_core_pipeline_context=(
-            _gated_delta_net_recurrent_core_pipeline_template_context
+        gated_delta_net_recurrent_core_context=(
+            _gated_delta_net_recurrent_core_template_context
         ),
         helper_argument_names=_helper_argument_names,
         helper_parameters=_helper_parameters,
@@ -1984,6 +1837,12 @@ def _make_env() -> Environment:
         packed_matmul_glu_gemv_pipeline_context=(
             _packed_matmul_glu_gemv_pipeline_template_context
         ),
+        packed_fp8_matmul_glu_gemv_pipeline_context=(
+            _packed_fp8_matmul_glu_gemv_pipeline_template_context
+        ),
+        packed_block_fp8_matmul_glu_gemv_pipeline_context=(
+            _packed_block_fp8_matmul_glu_gemv_pipeline_template_context
+        ),
         matmul_context=_matmul_template_context,
         multiply_expr=_multiply_expr,
         norm_apply_context=_norm_apply_template_context,
@@ -1992,10 +1851,19 @@ def _make_env() -> Environment:
         paged_attention_merge_context=_paged_attention_merge_template_context,
         paged_attention_partial_context=_paged_attention_partial_template_context,
         packed_gemv_pipeline_context=_packed_gemv_pipeline_template_context,
+        packed_fp8_gemv_pipeline_context=(
+            _packed_fp8_gemv_pipeline_template_context
+        ),
+        packed_block_fp8_gemv_pipeline_context=(
+            _packed_block_fp8_gemv_pipeline_template_context
+        ),
         packed_matmul_sampling_partial_context=(
             _packed_matmul_sampling_partial_template_context
         ),
         packed_qkv_gemv_pipeline_context=_packed_qkv_gemv_pipeline_template_context,
+        packed_fp8_qkv_gemv_pipeline_context=(
+            _packed_fp8_qkv_gemv_pipeline_template_context
+        ),
         pointer_local_to_global_coordinate=_pointer_local_to_global_coordinate,
         product=_product,
         qkv_rope_with_cache_context=_qkv_rope_with_cache_template_context,
@@ -2436,6 +2304,7 @@ def _contiguous_vector_axis_access(
     tensor_indices: tuple[str, ...] | list[str],
     strides: list[Any],
     *,
+    tensor_shape: list[Any] | None = None,
     packed_axis: int,
     logical_index: str,
     lane_count: int,
@@ -2455,7 +2324,14 @@ def _contiguous_vector_axis_access(
             "PyNTT contiguous vector access requires the vectorized tensor "
             f"axis to be innermost, got axis {packed_axis} for rank {len(strides)}."
         )
-    if _fixed(strides[packed_axis]) != 1:
+    packed_stride = _fixed(strides[packed_axis])
+    singleton_zero_stride = (
+        packed_stride == 0
+        and tensor_shape is not None
+        and len(tensor_shape) == len(strides)
+        and _fixed(tensor_shape[packed_axis]) == 1
+    )
+    if packed_stride != 1 and not singleton_zero_stride:
         raise ValueError(
             "PyNTT contiguous vector access requires unit stride on the "
             f"vectorized tensor axis, got {_dim(strides[packed_axis])}."
@@ -2860,6 +2736,27 @@ def _pointer_local_to_global_coordinate(
     )
 
 
+def _pointer_local_vector_to_global_scalar_coordinate(
+    pointer: dict[str, Any], axis: int, local_coordinate: str, lane_count: int
+) -> str:
+    """Map a scalar coordinate on a contiguous packed axis to the global domain."""
+
+    if lane_count <= 0:
+        raise ValueError(
+            "PyNTT vector coordinate mapping requires a positive lane count, "
+            f"got {lane_count}."
+        )
+    global_packed_coordinate = _pointer_local_to_global_coordinate(
+        pointer,
+        axis,
+        f"(({local_coordinate}) // {lane_count})",
+    )
+    return (
+        f"(({global_packed_coordinate}) * {lane_count} + "
+        f"(({local_coordinate}) % {lane_count}))"
+    )
+
+
 def _local_axis_active_extent(
     global_extent: Any,
     axis_mapping: Any,
@@ -2932,6 +2829,28 @@ def _tma_local_axis_plan(
         raise ValueError(f"PyNTT {context} requires a positive tile extent")
 
     axis_mapping = shard_axes[normalized_axis]
+    storage_kind = _require_string(
+        pointer.get("DistributedStorageKind"),
+        f"PyNTT {context} distributed storage kind",
+        nonempty=True,
+    )
+    if storage_kind in ("CompactLocal", "CompactPerOwner"):
+        return {
+            "axis": normalized_axis,
+            "axis_mapping": axis_mapping,
+            "hierarchy": hierarchy,
+            "is_block_cyclic": False,
+            "is_compact_local": True,
+            "block_shape": (tile_extent,),
+            "block_size": None,
+            "period": None,
+        }
+    if storage_kind != "CanonicalGlobal":
+        raise ValueError(
+            f"PyNTT {context} TMA does not support distributed storage "
+            f"kind {storage_kind!r}."
+        )
+
     stages = _shard_axis_stages(axis_mapping)
     cyclic_stage_indexes = [
         index
@@ -2952,6 +2871,7 @@ def _tma_local_axis_plan(
             "axis_mapping": axis_mapping,
             "hierarchy": hierarchy,
             "is_block_cyclic": False,
+            "is_compact_local": False,
             "block_shape": (tile_extent,),
             "block_size": None,
             "period": None,
@@ -2996,6 +2916,7 @@ def _tma_local_axis_plan(
         "axis_mapping": axis_mapping,
         "hierarchy": hierarchy,
         "is_block_cyclic": True,
+        "is_compact_local": False,
         "block_shape": block_shape,
         "block_size": block_size,
         "period": period,
@@ -3166,6 +3087,7 @@ def _tma_descriptor_table_axis_entry(
     base = 0
     descriptor_shape: tuple[int, ...] | None = None
     stride_multipliers: tuple[int, ...] | None = None
+    is_compact_local = bool(plan["is_compact_local"])
 
     for stage in _shard_axis_stages(plan["axis_mapping"]):
         shard_count = _stage_shard_count(stage, plan["hierarchy"])
@@ -3182,7 +3104,8 @@ def _tma_descriptor_table_axis_entry(
             )
             start = shard_owner * capacity
             active_extent = max(0, min(capacity, parent_extent - start))
-            base += start
+            if not is_compact_local:
+                base += start
             parent_extent = active_extent
         elif distribution == "BlockCyclic":
             block_size = stage.get("BlockSize")
@@ -3201,21 +3124,23 @@ def _tma_descriptor_table_axis_entry(
                     ),
                 )
             )
-            base += shard_owner * block_size
+            if not is_compact_local:
+                base += shard_owner * block_size
             parent_extent = active_extent
-            if block_size == 1:
-                descriptor_shape = (active_extent,)
-                stride_multipliers = (period,)
-            else:
-                if active_extent % block_size != 0:
-                    raise ValueError(
-                        f"PyNTT {context} owner {owner} has a partial "
-                        f"block-cyclic block ({active_extent} elements, "
-                        f"BlockSize={block_size}); one rectangular tensor map "
-                        "cannot represent that shard exactly"
-                    )
-                descriptor_shape = (active_extent // block_size, block_size)
-                stride_multipliers = (period, 1)
+            if not is_compact_local:
+                if block_size == 1:
+                    descriptor_shape = (active_extent,)
+                    stride_multipliers = (period,)
+                else:
+                    if active_extent % block_size != 0:
+                        raise ValueError(
+                            f"PyNTT {context} owner {owner} has a partial "
+                            f"block-cyclic block ({active_extent} elements, "
+                            f"BlockSize={block_size}); one rectangular tensor map "
+                            "cannot represent that shard exactly"
+                        )
+                    descriptor_shape = (active_extent // block_size, block_size)
+                    stride_multipliers = (period, 1)
         else:
             raise ValueError(
                 f"Unsupported PyNTT split-stage distribution {distribution!r}"
@@ -3231,7 +3156,7 @@ def _tma_descriptor_table_axis_entry(
             **plan,
             "active": False,
             "base": 0,
-            "descriptor_shape": tuple(1 for _ in descriptor_shape),
+            "descriptor_shape": tuple(plan["block_shape"]),
             "stride_multipliers": stride_multipliers,
         }
     return {
@@ -3341,6 +3266,8 @@ def _tma_dtype_from_triton_dtype(dtype: Any, *, context: str) -> str:
     mapping = {
         "tl.float16": "float16",
         "tl.bfloat16": "bfloat16",
+        "tl.float8e4nv": "float8e4m3fn",
+        "tl.float8e5": "float8e5m2",
         "tl.float32": "float32",
         "tl.int8": "int8",
         "tl.uint8": "uint8",
@@ -4744,6 +4671,8 @@ def _microkernel_context(
         required_offsets = {
             "simt_fma": (),
             "simt_fma_smem_pipeline": ("rhs_stage",),
+            "simt_fp8_fma_smem_pipeline": ("rhs_stage",),
+            "simt_block_fp8_fma_smem_pipeline": ("rhs_stage",),
             "mma": ("lhs_stage", "rhs_stage"),
             "dot": ("lhs_stage", "rhs_stage"),
             "mma_direct": (),
@@ -6033,146 +5962,112 @@ def _should_outline_packed_gemv_consumer_stage(
     )
 
 
-def _gated_delta_net_matrix_transfer(
-    model: dict[str, Any],
-    *,
-    prefix: str,
-    block_k: int,
-    block_n: int,
-    k_tiles: int,
-    n_tiles: int,
-) -> dict[str, Any]:
-    pointer = model.get(f"{prefix}Weight")
-    global_offsets = model.get(f"{prefix}WeightGlobalOffsets")
-    descriptor_name = model.get(f"{prefix}WeightDescriptorName")
-    descriptor_origin = model.get(f"{prefix}WeightDescriptorOriginElements")
-    if not isinstance(global_offsets, list) or len(global_offsets) != 2:
-        raise ValueError(
-            f"PyNTT GatedDeltaNet {prefix} weight requires two global offsets."
-        )
-    if not isinstance(descriptor_name, str) or not descriptor_name:
-        raise ValueError(
-            f"PyNTT GatedDeltaNet {prefix} weight requires a host descriptor."
-        )
-    if not isinstance(descriptor_origin, str) or not descriptor_origin:
-        raise ValueError(
-            f"PyNTT GatedDeltaNet {prefix} weight requires a descriptor origin."
-        )
-
-    k_transfer = _tma_local_axis_transfer(
-        pointer,
-        0,
-        global_offsets[0],
-        local_offset=0,
-        tile_index="k_tile",
-        tile_stride=block_k,
-        tile_extent=block_k,
-        context=f"GatedDeltaNet {prefix} weight K",
-    )
-    n_transfer = _tma_local_axis_transfer(
-        pointer,
-        1,
-        global_offsets[1],
-        local_offset=0,
-        tile_index="n_tile",
-        tile_stride=block_n,
-        tile_extent=block_n,
-        context=f"GatedDeltaNet {prefix} weight N",
-    )
-    descriptor_n_coordinates = list(n_transfer["coordinates"])
-    if not descriptor_n_coordinates:
-        raise ValueError(
-            f"PyNTT GatedDeltaNet {prefix} weight has no retained N coordinate."
-        )
-    descriptor_n_coordinates[-1] = (
-        f"({descriptor_n_coordinates[-1]}) + ({descriptor_origin})"
-    )
-    shared_n_indices = list(
-        _tma_shared_axis_coordinates("shared_n", n_transfer)
-    )
-    shared_n_shape, n_terminal_atom = _tma_split_contiguous_terminal_block(
-        tuple(n_transfer["block_shape"]),
-        _tma_dtype_from_triton_dtype(
-            model["InputTritonDType"],
-            context=f"GatedDeltaNet {prefix} weight",
-        ),
-        context=f"GatedDeltaNet {prefix} weight N",
-    )
-    if n_terminal_atom is not None:
-        descriptor_n_coordinates[-1:] = [
-            f"({descriptor_n_coordinates[-1]}) // {n_terminal_atom}",
-            f"({descriptor_n_coordinates[-1]}) % {n_terminal_atom}",
-        ]
-        shared_n_indices[-1:] = [
-            f"({shared_n_indices[-1]}) // {n_terminal_atom}",
-            f"({shared_n_indices[-1]}) % {n_terminal_atom}",
-        ]
-    sequence_count = k_tiles * n_tiles
-    if sequence_count > 2**31 - 1:
-        raise ValueError(
-            f"PyNTT GatedDeltaNet {prefix} weight pipeline has "
-            f"{sequence_count} sequences, exceeding signed int32 indexing."
-        )
-    return {
-        "prefix": prefix,
-        "lower": prefix.lower(),
-        "descriptor_name": descriptor_name,
-        "descriptor_offsets": tuple(k_transfer["coordinates"])
-        + tuple(descriptor_n_coordinates),
-        "shared_stage_shape": tuple(k_transfer["block_shape"])
-        + shared_n_shape,
-        "shared_k_indices": _tma_shared_axis_coordinates(
-            "shared_k", k_transfer
-        ),
-        "shared_n_indices": tuple(shared_n_indices),
-        "k_tiles": k_tiles,
-        "n_tiles": n_tiles,
-        "sequence_count": sequence_count,
-    }
-
-
-def _gated_delta_net_projection_pipeline_template_context(
+def _gated_delta_net_convolution_template_context(
     model: dict[str, Any],
 ) -> dict[str, Any]:
-    required_workspaces = ("weight_stage",)
     microkernel = _microkernel_context(
         model,
         "triton.gated_delta_net",
-        "projection_mma_tma_smem_pipeline",
-        required_workspace_names=required_workspaces,
+        "convolution",
+        required_workspace_names=(),
     )
     parameters = microkernel["parameters"]
-    block_m = parameters["block_m"]
     block_n = parameters["block_n"]
-    block_k = parameters["block_k"]
-    num_stages = parameters["num_stages"]
-    hidden_size = _require_int(model.get("HiddenSize"), "HiddenSize", minimum=1)
     local_n = _require_int(model.get("LocalConvDim"), "LocalConvDim", minimum=1)
-    k_tiles = (hidden_size + block_k - 1) // block_k
-    n_tiles = (local_n + block_n - 1) // block_n
-    transfer = _gated_delta_net_matrix_transfer(
-        model,
-        prefix="QKV",
-        block_k=block_k,
-        block_n=block_n,
-        k_tiles=k_tiles,
-        n_tiles=n_tiles,
+    lane_count = _require_int(
+        model.get("ActivationLaneCount"), "ActivationLaneCount", minimum=1
     )
-    weight_shape = microkernel["shared_workspace_shapes"]["weight_stage"]
-    if block_m != 16 or weight_shape != (num_stages, block_k, block_n):
+    if (
+        parameters["block_m"] != 1
+        or parameters["block_k"] != 1
+        or parameters["num_stages"] != 1
+        or not _is_positive_power_of_two(block_n)
+        or block_n > local_n
+        or local_n % lane_count != 0
+    ):
         raise ValueError(
-            "PyNTT GatedDeltaNet projection requires block_m=16 and a "
-            "[stages,block_k,block_n] weight workspace."
+            "PyNTT GatedDeltaNet convolution requires block_m=block_k=num_stages=1, "
+            "a power-of-two block_n no larger than LocalConvDim, and a local "
+            f"convolution extent divisible by its lanes; got parameters={parameters}, "
+            f"local_n={local_n}, lane_count={lane_count}."
         )
     return {
         "microkernel": microkernel,
-        "block_m": block_m,
+        "block_n": block_n,
+        "local_n": local_n,
+    }
+
+
+def _gated_delta_net_recurrent_core_template_context(
+    model: dict[str, Any],
+) -> dict[str, Any]:
+    required_workspaces = (
+        "activation_stage",
+        "qkv_stage",
+        "query_stage",
+        "key_stage",
+        "state_stage",
+        "read_stage",
+    )
+    microkernel = _microkernel_context(
+        model,
+        "triton.gated_delta_net",
+        "recurrent_core",
+        required_workspace_names=required_workspaces,
+    )
+    parameters = microkernel["parameters"]
+    block_n = parameters["block_n"]
+    block_k = parameters["block_k"]
+    state_value_tile = _require_int(
+        parameters.get("state_value_tile"), "state_value_tile", minimum=1
+    )
+    hidden_size = _require_int(model.get("HiddenSize"), "HiddenSize", minimum=1)
+    local_heads = _require_int(
+        model.get("LocalValueHeadCapacity"),
+        "LocalValueHeadCapacity",
+        minimum=1,
+    )
+    key_dim = _require_int(model.get("KeyHeadDim"), "KeyHeadDim", minimum=1)
+    value_dim = _require_int(model.get("ValueHeadDim"), "ValueHeadDim", minimum=1)
+    activation_shape = microkernel["shared_workspace_shapes"]["activation_stage"]
+    expected_shapes = {
+        "qkv_stage": (_require_int(model.get("QKVStageSize"), "QKVStageSize", minimum=1),),
+        "query_stage": (_require_int(model.get("KeyStageSize"), "KeyStageSize", minimum=1),),
+        "key_stage": (_require_int(model.get("KeyStageSize"), "KeyStageSize", minimum=1),),
+        "state_stage": (key_dim, state_value_tile),
+        "read_stage": (_require_int(model.get("ValueStageSize"), "ValueStageSize", minimum=1),),
+    }
+    if (
+        parameters["block_m"] != 1
+        or parameters["num_stages"] != 1
+        or not _is_positive_power_of_two(block_n)
+        or not _is_positive_power_of_two(block_k)
+        or len(activation_shape) != 1
+        or activation_shape[0] < hidden_size
+        or activation_shape[0] % block_k != 0
+        or value_dim % state_value_tile != 0
+    ):
+        raise ValueError(
+            "PyNTT GatedDeltaNet recurrent core has an invalid selected tile or "
+            f"activation workspace contract: parameters={parameters}, "
+            f"activation_shape={activation_shape}, hidden_size={hidden_size}."
+        )
+    for name, expected_shape in expected_shapes.items():
+        actual_shape = microkernel["shared_workspace_shapes"][name]
+        if actual_shape != expected_shape:
+            raise ValueError(
+                f"PyNTT GatedDeltaNet recurrent workspace {name!r} has shape "
+                f"{actual_shape}, expected {expected_shape}."
+            )
+    return {
+        "microkernel": microkernel,
         "block_n": block_n,
         "block_k": block_k,
-        "num_stages": num_stages,
         "hidden_size": hidden_size,
-        "local_n": local_n,
-        "transfer": transfer,
+        "activation_elements": activation_shape[0],
+        "activation_tiles": activation_shape[0] // block_k,
+        "local_value_dim": local_heads * value_dim,
+        "state_value_tile": state_value_tile,
     }
 
 
@@ -6279,183 +6174,40 @@ def _sparse_experts_down_pipeline_template_context(
     }
 
 
-def _gated_delta_net_recurrent_core_pipeline_template_context(
-    model: dict[str, Any],
-    expected_variant: str,
-) -> dict[str, Any]:
-    required_workspaces_by_variant = {
-        "recurrent_core_hybrid_tma_smem_pipeline": (
-            "weight_stage",
-            "activation_stage",
-            "qkv_stage",
-            "query_stage",
-            "key_stage",
-            "state_stage",
-            "read_stage",
-            "z_stage",
-        ),
-        "recurrent_core_single_head_register_state_hybrid_tma_smem_pipeline": (
-            "weight_stage",
-            "activation_stage",
-            "qkv_result_stage",
-            "query_stage",
-            "key_stage",
-        ),
-    }
-    if expected_variant not in required_workspaces_by_variant:
-        raise ValueError(
-            "PyNTT GatedDeltaNet recurrent core does not support microkernel "
-            f"variant {expected_variant!r}."
-        )
-    microkernel = _microkernel_context(
-        model,
-        "triton.gated_delta_net",
-        expected_variant,
-        required_workspace_names=required_workspaces_by_variant[expected_variant],
-    )
-    parameters = microkernel["parameters"]
-    block_m = parameters["block_m"]
-    block_n = parameters["block_n"]
-    block_k = parameters["block_k"]
-    num_stages = parameters["num_stages"]
-    hidden_size = _require_int(model.get("HiddenSize"), "HiddenSize", minimum=1)
-    local_value_dim = (
-        _require_int(model.get("LocalNumValueHeads"), "LocalNumValueHeads", minimum=1)
-        * _require_int(model.get("ValueHeadDim"), "ValueHeadDim", minimum=1)
-    )
-    if (
-        expected_variant
-        == "recurrent_core_single_head_register_state_hybrid_tma_smem_pipeline"
-        and model["LocalNumValueHeads"] != 1
-    ):
-        raise ValueError(
-            "PyNTT GatedDeltaNet register-state recurrent core requires exactly "
-            "one local value head."
-        )
-    z_transfer = _gated_delta_net_matrix_transfer(
-        model,
-        prefix="Z",
-        block_k=block_k,
-        block_n=block_n,
-        k_tiles=(hidden_size + block_k - 1) // block_k,
-        n_tiles=(local_value_dim + block_n - 1) // block_n,
-    )
-    weight_shape = microkernel["shared_workspace_shapes"]["weight_stage"]
-    if block_m != 16 or weight_shape != (num_stages, block_k, block_n):
-        raise ValueError(
-            "PyNTT GatedDeltaNet recurrent core requires block_m=16 and a "
-            "[stages,block_k,block_n] weight workspace."
-        )
-    activation_shape = microkernel["shared_workspace_shapes"]["activation_stage"]
-    if len(activation_shape) != 1 or activation_shape[0] < hidden_size:
-        raise ValueError(
-            "PyNTT GatedDeltaNet recurrent-core activation workspace is too small."
-        )
-    if (
-        expected_variant
-        == "recurrent_core_single_head_register_state_hybrid_tma_smem_pipeline"
-    ):
-        state_value_tile = _require_int(
-            parameters.get("state_value_tile"), "state_value_tile", minimum=1
-        )
-        value_block_size = _require_int(
-            model.get("ValueBlockSize"), "ValueBlockSize", minimum=1
-        )
-        if value_block_size % state_value_tile != 0:
-            raise ValueError(
-                "PyNTT GatedDeltaNet register-state recurrent core requires "
-                f"ValueBlockSize divisible by state_value_tile, got "
-                f"{value_block_size}/{state_value_tile}."
-            )
-        if block_n % state_value_tile != 0:
-            raise ValueError(
-                "PyNTT GatedDeltaNet register-state recurrent core requires "
-                f"block_n divisible by state_value_tile, got "
-                f"{block_n}/{state_value_tile}."
-            )
-        state_tiles_per_n = block_n // state_value_tile
-        if z_transfer["k_tiles"] % state_tiles_per_n != 0:
-            raise ValueError(
-                "PyNTT GatedDeltaNet register-state recurrent core requires "
-                "each state tile to consume an integral number of Z K tiles, "
-                f"got k_tiles={z_transfer['k_tiles']} and "
-                f"state_tiles_per_n={state_tiles_per_n}."
-            )
-        z_k_tiles_per_state_tile = z_transfer["k_tiles"] // state_tiles_per_n
-        qkv_stage_size = _require_int(
-            model.get("QKVStageSize"), "QKVStageSize", minimum=1
-        )
-        local_qkv_dim = (
-            _require_int(
-                model.get("LocalNumValueHeads"),
-                "LocalNumValueHeads",
-                minimum=1,
-            )
-            * (
-                2 * _require_int(model.get("KeyHeadDim"), "KeyHeadDim", minimum=1)
-                + _require_int(
-                    model.get("ValueHeadDim"), "ValueHeadDim", minimum=1
-                )
-            )
-        )
-        qkv_result_shape = microkernel["shared_workspace_shapes"][
-            "qkv_result_stage"
-        ]
-        required_qkv_result_bytes = max(
-            qkv_stage_size * 2,
-            local_qkv_dim * 2 + value_block_size * 2,
-        )
-        if qkv_result_shape != (required_qkv_result_bytes,):
-            raise ValueError(
-                "PyNTT GatedDeltaNet register-state recurrent-core combined "
-                "QKV/result workspace has invalid shape: "
-                f"{qkv_result_shape}, expected ({required_qkv_result_bytes},)."
-            )
-    sequence_count = z_transfer["sequence_count"]
-    if sequence_count > 2**31 - 1:
-        raise ValueError(
-            "PyNTT GatedDeltaNet recurrent-core pipeline sequence count exceeds "
-            "signed int32 indexing."
-        )
-    return {
-        "microkernel": microkernel,
-        "block_m": block_m,
-        "block_n": block_n,
-        "block_k": block_k,
-        "num_stages": num_stages,
-        "hidden_size": hidden_size,
-        "local_value_dim": local_value_dim,
-        "activation_elements": activation_shape[0],
-        "state_value_tile": parameters.get("state_value_tile"),
-        "z_k_tiles_per_state_tile": (
-            z_k_tiles_per_state_tile
-            if expected_variant
-            == "recurrent_core_single_head_register_state_hybrid_tma_smem_pipeline"
-            else None
-        ),
-        "z": z_transfer,
-        "sequence_count": sequence_count,
-    }
-
-
 def _packed_gemv_pipeline_template_context(
     model: dict[str, Any],
     *,
     expected_family: str = "triton.matmul",
+    expected_variant: str = "simt_fma_smem_pipeline",
+    expected_rhs_dtype: str = "bfloat16",
+    expected_k_vector_lanes: int = 8,
+    require_operand_scales: bool = False,
     required_workspace_names: tuple[str, ...] | None = None,
+    reduction_group: int = 32,
 ) -> dict[str, Any]:
-    """Prepare the packed BF16, shared-staged SIMT GEMV algorithm."""
+    """Prepare a selected packed, shared-staged SIMT GEMV algorithm."""
 
     context = _matmul_template_context(
         model,
         gemv=True,
-        variant="simt_fma_smem_pipeline",
+        variant=expected_variant,
         expected_family=expected_family,
         required_workspace_names=required_workspace_names,
     )
-    if model["LhsDType"] != "bfloat16" or model["RhsDType"] != "bfloat16":
+    if (
+        model["LhsDType"] != "bfloat16"
+        or model["RhsDType"] != expected_rhs_dtype
+        or model["OutputDType"] != "bfloat16"
+    ):
         raise ValueError(
-            "PyNTT packed GEMV pipeline requires BF16 lhs and rhs operands."
+            "PyNTT packed GEMV pipeline has an incompatible dtype contract: "
+            f"expected=bfloat16/{expected_rhs_dtype}/bfloat16, "
+            f"actual={model['LhsDType']}/{model['RhsDType']}/{model['OutputDType']}."
+        )
+    if bool(model.get("HasOperandScales")) != require_operand_scales:
+        raise ValueError(
+            "PyNTT packed GEMV operand-scale contract does not match its selected "
+            f"variant {expected_variant!r}."
         )
     rhs_layout = _matmul_rhs_layout(model)
     if model["TransposeA"]:
@@ -6471,11 +6223,12 @@ def _packed_gemv_pipeline_template_context(
         or rhs_lane_shape != (8,)
         or output_lane_shape != (8,)
         or int(model["RhsKPackLaneCount"]) != 2
-        or int(model["RhsKVectorLaneCount"]) != 8
+        or int(model["RhsKVectorLaneCount"]) != expected_k_vector_lanes
     ):
         raise ValueError(
-            "PyNTT K-major BF16 GEMV pipeline requires "
-            "rhs=[K/16,N/8]<8,2,8> and output=[M,N/8]<8>."
+            "PyNTT K-major GEMV pipeline requires "
+            f"rhs=[K/{2 * expected_k_vector_lanes},N/8]"
+            f"<8,2,{expected_k_vector_lanes}> and output=[M,N/8]<8>."
         )
     if len(model["LhsShape"]) != 2 or len(model["RhsShape"]) != 2 or len(
         model["OutputShape"]
@@ -6523,14 +6276,25 @@ def _packed_gemv_pipeline_template_context(
             "PyNTT packed GEMV pipeline requires equal fixed lhs/rhs K "
             f"dimensions, got lhs K={k} and rhs K={rhs_k}."
         )
+    rhs_physical_shape = tuple(_fixed(value) for value in model["RhsShape"])
+    rhs_physical_strides = tuple(_fixed(value) for value in model["RhsStrides"])
+    if any(value is None for value in rhs_physical_shape + rhs_physical_strides):
+        raise ValueError(
+            "PyNTT packed GEMV TMA requires fixed physical RHS shape and strides."
+        )
+    normalized_rhs_strides = _normalize_singleton_strides(
+        tuple(int(value) for value in rhs_physical_shape),
+        tuple(int(value) for value in rhs_physical_strides),
+    )
     if (
-        _fixed(model["RhsShape"][-2]) != k // k_atom
-        or _fixed(model["RhsStrides"][-1]) != 1
-        or (_min_value(model["RhsStrides"][-2]) or 0) <= 0
+        rhs_physical_shape[-2] != k // k_atom
+        or normalized_rhs_strides[-1] != 1
+        or normalized_rhs_strides[-2] <= 0
     ):
         raise ValueError(
             "PyNTT packed GEMV TMA requires a positive-stride "
-            "physical RHS [K/16,N/8]<8,2,8> view."
+            f"physical RHS [K/{k_atom},N/{n_lane}]"
+            f"<{n_lane},{k_pack},{k_lane}> view."
         )
     max_n = _max_value(context["n"])
     if max_n is None:
@@ -6579,7 +6343,11 @@ def _packed_gemv_pipeline_template_context(
         tile_extent=packed_n_outer,
         context="packed GEMV RHS N",
     )
-    reduction_group = 32
+    if not _is_positive_power_of_two(reduction_group):
+        raise ValueError(
+            "PyNTT K-major GEMV reduction group must be a positive power of two, "
+            f"got {reduction_group}."
+        )
     if block_k % reduction_group != 0:
         raise ValueError(
             "PyNTT K-major GEMV staging requires block_k divisible by "
@@ -6657,6 +6425,7 @@ def _packed_gemv_pipeline_template_context(
         "pipeline_output_access": _contiguous_vector_axis_access(
             ("0", "0"),
             model["OutputStrides"],
+            tensor_shape=model["OutputShape"],
             packed_axis=1,
             logical_index="pipeline_output_n",
             lane_count=n_lane,
@@ -6666,6 +6435,7 @@ def _packed_gemv_pipeline_template_context(
             _contiguous_vector_axis_access(
                 ("0", "0"),
                 model["AddendStrides"],
+                tensor_shape=model.get("AddendShape"),
                 packed_axis=1,
                 logical_index="pipeline_output_n",
                 lane_count=n_lane,
@@ -6694,10 +6464,90 @@ def _packed_gemv_pipeline_template_context(
     return context
 
 
-def _packed_qkv_gemv_pipeline_template_context(
+def _packed_fp8_gemv_pipeline_template_context(
     model: dict[str, Any],
 ) -> dict[str, Any]:
-    """Prepare one K-major BF16 pipeline over canonical fused local QKV weights."""
+    """Prepare the E4M3-weight, statically scaled SIMT GEMV algorithm."""
+
+    return _packed_gemv_pipeline_template_context(
+        model,
+        expected_variant="simt_fp8_fma_smem_pipeline",
+        expected_rhs_dtype="float8e4m3fn",
+        expected_k_vector_lanes=16,
+        require_operand_scales=True,
+    )
+
+
+def _packed_block_fp8_gemv_pipeline_template_context(
+    model: dict[str, Any],
+) -> dict[str, Any]:
+    """Prepare dynamic K-group activation and 2-D block-scaled FP8 GEMV."""
+
+    context = _packed_gemv_pipeline_template_context(
+        model,
+        expected_variant="simt_block_fp8_fma_smem_pipeline",
+        expected_rhs_dtype="float8e4m3fn",
+        expected_k_vector_lanes=16,
+        require_operand_scales=False,
+        reduction_group=_require_int(
+            model.get("WeightBlockK"), "WeightBlockK", minimum=1
+        ),
+    )
+    if not bool(model.get("HasRhsBlockScale")):
+        raise ValueError(
+            "PyNTT block-scaled FP8 GEMV requires an rhs block scale and no "
+            "precomputed lhs scale."
+        )
+    block_n = _require_int(model.get("WeightBlockN"), "WeightBlockN", minimum=1)
+    block_k = _require_int(model.get("WeightBlockK"), "WeightBlockK", minimum=1)
+    if block_n != 128 or block_k != 128:
+        raise ValueError(
+            "PyNTT block-scaled FP8 GEMV currently implements the official "
+            f"128x128 scale ABI, got {block_n}x{block_k}."
+        )
+
+    scale_shape = _require_list(model.get("RhsScaleShape"), "RhsScaleShape")
+    scale_strides = _require_list(
+        model.get("RhsScaleStrides"), "RhsScaleStrides"
+    )
+    if len(scale_shape) != 2 or len(scale_strides) != 2:
+        raise ValueError(
+            "PyNTT block-scaled FP8 GEMV requires a rank-2 rhs scale buffer."
+        )
+    n_lane = int(model["OutputNVectorLaneCount"])
+    global_output_n = _pointer_local_vector_to_global_scalar_coordinate(
+        model["Output"], 1, "output_n", n_lane
+    )
+    global_k_start = _pointer_local_to_global_coordinate(
+        model["Lhs"],
+        1,
+        f"k_tile * {context['block_k']} + "
+        f"k_group * {context['reduction_group']}",
+    )
+    context.update(
+        weight_block_n=block_n,
+        weight_block_k=block_k,
+        global_output_n=global_output_n,
+        global_k_start=global_k_start,
+        rhs_scale_access=_tensor_access(
+            ("weight_scale_n", "weight_scale_k"),
+            scale_strides,
+            coordinate_shape=_coordinate_shape((context["block_n"],)),
+            global_coordinate_axes=(0, 1),
+        ),
+    )
+    return context
+
+
+def _packed_qkv_gemv_pipeline_template_context(
+    model: dict[str, Any],
+    *,
+    expected_variant: str = "simt_fma_smem_pipeline",
+    expected_weight_dtype: str = "bfloat16",
+    expected_k_vector_lanes: int = 8,
+    require_operand_scales: bool = False,
+) -> dict[str, Any]:
+    """Prepare one selected K-major pipeline over fused local QKV weights."""
 
     logical_output_shapes = {
         prefix: _packed_qkv_logical_output_shape(model, prefix)
@@ -6706,11 +6556,22 @@ def _packed_qkv_gemv_pipeline_template_context(
     microkernel = _microkernel_context(
         model,
         "triton.qkv_parallel_linear",
-        "simt_fma_smem_pipeline",
+        expected_variant,
     )
-    if model["InputDType"] != "bfloat16" or model["WeightDType"] != "bfloat16":
+    if (
+        model["InputDType"] != "bfloat16"
+        or model["WeightDType"] != expected_weight_dtype
+        or model["OutputDType"] != "bfloat16"
+    ):
         raise ValueError(
-            "PyNTT packed QKV GEMV pipeline requires BF16 input and weights."
+            "PyNTT packed QKV GEMV pipeline has an incompatible dtype contract: "
+            f"expected=bfloat16/{expected_weight_dtype}/bfloat16, "
+            f"actual={model['InputDType']}/{model['WeightDType']}/{model['OutputDType']}."
+        )
+    if bool(model.get("HasOperandScales")) != require_operand_scales:
+        raise ValueError(
+            "PyNTT packed QKV operand-scale contract does not match its selected "
+            f"variant {expected_variant!r}."
         )
     if model.get("RhsLayout") != "k_major":
         raise ValueError(
@@ -6720,11 +6581,12 @@ def _packed_qkv_gemv_pipeline_template_context(
         int(model["NPackedLaneCount"]) != 1
         or int(model["NVectorLaneCount"]) != 8
         or int(model["KPackLaneCount"]) != 2
-        or int(model["KVectorLaneCount"]) != 8
+        or int(model["KVectorLaneCount"]) != expected_k_vector_lanes
     ):
         raise ValueError(
             "PyNTT packed QKV GEMV pipeline requires "
-            "weight=[K/16,N/8]<8,2,8> and output=[M,N/8]<8>."
+            f"weight=[K/{2 * expected_k_vector_lanes},N/8]"
+            f"<8,2,{expected_k_vector_lanes}> and output=[M,N/8]<8>."
         )
     if (
         len(model["InputShape"]) != 2
@@ -6791,7 +6653,7 @@ def _packed_qkv_gemv_pipeline_template_context(
     ):
         raise ValueError(
             "PyNTT fused packed QKV TMA requires positive-stride "
-            "[K/16,N/8]<8,2,8> storage."
+            f"[K/{k_atom},N/{n_lane}]<{n_lane},{k_pack},{k_lane}> storage."
         )
 
     descriptor_name = model.get("WeightDescriptorName")
@@ -6871,6 +6733,7 @@ def _packed_qkv_gemv_pipeline_template_context(
         output_access = _contiguous_vector_axis_access(
             ("0", "0"),
             model[f"{prefix}OutputStrides"],
+            tensor_shape=model[f"{prefix}OutputShape"],
             packed_axis=1,
             logical_index=projection_n_expr,
             lane_count=n_lane,
@@ -6881,6 +6744,7 @@ def _packed_qkv_gemv_pipeline_template_context(
             _contiguous_vector_axis_access(
                 ("0",),
                 model[f"{prefix}BiasStrides"],
+                tensor_shape=model.get(f"{prefix}BiasShape"),
                 packed_axis=0,
                 logical_index=projection_n_expr,
                 lane_count=n_lane,
@@ -6957,19 +6821,50 @@ def _packed_qkv_gemv_pipeline_template_context(
     }
 
 
-def _packed_matmul_glu_gemv_pipeline_template_context(
+def _packed_fp8_qkv_gemv_pipeline_template_context(
     model: dict[str, Any],
 ) -> dict[str, Any]:
-    """Prepare one K-major BF16 pipeline for paired gate/up projections."""
+    """Prepare the E4M3-weight, statically scaled fused QKV algorithm."""
+
+    return _packed_qkv_gemv_pipeline_template_context(
+        model,
+        expected_variant="simt_fp8_fma_smem_pipeline",
+        expected_weight_dtype="float8e4m3fn",
+        expected_k_vector_lanes=16,
+        require_operand_scales=True,
+    )
+
+
+def _packed_matmul_glu_gemv_pipeline_template_context(
+    model: dict[str, Any],
+    *,
+    expected_variant: str = "simt_fma_smem_pipeline",
+    expected_weight_dtype: str = "bfloat16",
+    expected_k_vector_lanes: int = 8,
+    require_operand_scales: bool = False,
+    reduction_group: int = 32,
+) -> dict[str, Any]:
+    """Prepare one selected K-major pipeline for paired gate/up projections."""
 
     context = _matmul_glu_template_context(
         model,
         packed=True,
-        variant="simt_fma_smem_pipeline",
+        variant=expected_variant,
     )
-    if model["InputDType"] != "bfloat16" or model["WeightDType"] != "bfloat16":
+    if (
+        model["InputDType"] != "bfloat16"
+        or model["WeightDType"] != expected_weight_dtype
+        or model["OutputDType"] != "bfloat16"
+    ):
         raise ValueError(
-            "PyNTT packed MatMulGlu GEMV pipeline requires BF16 input and weights."
+            "PyNTT packed MatMulGlu GEMV pipeline has an incompatible dtype contract: "
+            f"expected=bfloat16/{expected_weight_dtype}/bfloat16, "
+            f"actual={model['InputDType']}/{model['WeightDType']}/{model['OutputDType']}."
+        )
+    if bool(model.get("HasOperandScales")) != require_operand_scales:
+        raise ValueError(
+            "PyNTT packed MatMulGlu operand-scale contract does not match its "
+            f"selected variant {expected_variant!r}."
         )
     if model.get("RhsLayout") != "k_major":
         raise ValueError(
@@ -6979,11 +6874,12 @@ def _packed_matmul_glu_gemv_pipeline_template_context(
         int(model["NPackedLaneCount"]) != 1
         or int(model["NVectorLaneCount"]) != 8
         or int(model["KPackLaneCount"]) != 2
-        or int(model["KVectorLaneCount"]) != 8
+        or int(model["KVectorLaneCount"]) != expected_k_vector_lanes
     ):
         raise ValueError(
             "PyNTT packed MatMulGlu GEMV pipeline requires "
-            "weight=[K/16,N/8]<8,2,8> and output=[M,N/8]<8>."
+            f"weight=[K/{2 * expected_k_vector_lanes},N/8]"
+            f"<8,2,{expected_k_vector_lanes}> and output=[M,N/8]<8>."
         )
     if (
         len(model["InputShape"]) != 2
@@ -7055,7 +6951,8 @@ def _packed_matmul_glu_gemv_pipeline_template_context(
         ):
             raise ValueError(
                 "PyNTT packed MatMulGlu GEMV TMA requires a positive-stride "
-                f"{prefix.lower()} weight [K/16,N/8]<8,2,8> view."
+                f"{prefix.lower()} weight [K/{k_atom},N/{n_lane}]"
+                f"<{n_lane},{k_pack},{k_lane}> view."
             )
 
     max_n = _max_value(context["n"])
@@ -7072,7 +6969,6 @@ def _packed_matmul_glu_gemv_pipeline_template_context(
             f"pipe ABI: {max_sequence_count}."
         )
 
-    reduction_group = 32
     target_worker_width = int(model["TargetWorkerWidth"])
     consumer_warps = int(model["NumWarps"])
     consumer_layout = _packed_gemv_consumer_layout(
@@ -7148,8 +7044,9 @@ def _packed_matmul_glu_gemv_pipeline_template_context(
                 "has_bias": bool(model[f"Has{prefix}Bias"]),
                 "bias_access": (
                     _contiguous_vector_axis_access(
-                        ("0",),
-                        model[f"{prefix}BiasStrides"],
+                    ("0",),
+                    model[f"{prefix}BiasStrides"],
+                    tensor_shape=model.get(f"{prefix}BiasShape"),
                         packed_axis=0,
                         logical_index=output_n,
                         lane_count=n_lane,
@@ -7214,12 +7111,104 @@ def _packed_matmul_glu_gemv_pipeline_template_context(
         pipeline_output_access=_contiguous_vector_axis_access(
             ("0", "0"),
             model["OutputStrides"],
+            tensor_shape=model["OutputShape"],
             packed_axis=1,
             logical_index="pipeline_output_n",
             lane_count=n_lane,
             coordinate_shape=_coordinate_shape((block_n,)),
         ),
         pipeline_output_mask="pipeline_output_n < active_n",
+    )
+    return context
+
+
+def _packed_fp8_matmul_glu_gemv_pipeline_template_context(
+    model: dict[str, Any],
+) -> dict[str, Any]:
+    """Prepare the E4M3-weight, statically scaled paired GLU algorithm."""
+
+    return _packed_matmul_glu_gemv_pipeline_template_context(
+        model,
+        expected_variant="simt_fp8_fma_smem_pipeline",
+        expected_weight_dtype="float8e4m3fn",
+        expected_k_vector_lanes=16,
+        require_operand_scales=True,
+    )
+
+
+def _packed_block_fp8_matmul_glu_gemv_pipeline_template_context(
+    model: dict[str, Any],
+) -> dict[str, Any]:
+    """Prepare dynamic K-group activation and block-scaled paired GLU."""
+
+    block_n = _require_int(model.get("WeightBlockN"), "WeightBlockN", minimum=1)
+    block_k = _require_int(model.get("WeightBlockK"), "WeightBlockK", minimum=1)
+    if block_n != 128 or block_k != 128:
+        raise ValueError(
+            "PyNTT block-scaled FP8 MatMulGlu currently implements the official "
+            f"128x128 scale ABI, got {block_n}x{block_k}."
+        )
+    if model.get("QuantizationMode") != "dynamic_block":
+        raise ValueError(
+            "PyNTT block-scaled FP8 MatMulGlu requires dynamic_block quantization."
+        )
+    if bool(model.get("HasOperandScales")) or not bool(model.get("HasWeightScales")):
+        raise ValueError(
+            "PyNTT block-scaled FP8 MatMulGlu requires two weight block scales "
+            "and no precomputed input scales."
+        )
+
+    context = _packed_matmul_glu_gemv_pipeline_template_context(
+        model,
+        expected_variant="simt_block_fp8_fma_smem_pipeline",
+        expected_weight_dtype="float8e4m3fn",
+        expected_k_vector_lanes=16,
+        require_operand_scales=False,
+        reduction_group=block_k,
+    )
+    n_lane = int(model["NVectorLaneCount"])
+    global_output_n = _pointer_local_vector_to_global_scalar_coordinate(
+        model["Output"], 1, "pipeline_output_n", n_lane
+    )
+    global_k_start = _pointer_local_to_global_coordinate(
+        model["Input"],
+        1,
+        f"k_tile * {context['block_k']} + "
+        f"k_group * {context['reduction_group']}",
+    )
+    projections = []
+    for projection in context["projections"]:
+        prefix = projection["prefix"]
+        scale_shape = _require_list(
+            model.get(f"{prefix}WeightScaleShape"),
+            f"{prefix}WeightScaleShape",
+        )
+        scale_strides = _require_list(
+            model.get(f"{prefix}WeightScaleStrides"),
+            f"{prefix}WeightScaleStrides",
+        )
+        if len(scale_shape) != 2 or len(scale_strides) != 2:
+            raise ValueError(
+                f"PyNTT block-scaled FP8 MatMulGlu {prefix.lower()} scale must be rank 2."
+            )
+        projections.append(
+            {
+                **projection,
+                "weight_scale_access": _tensor_access(
+                    ("weight_scale_n", "weight_scale_k"),
+                    scale_strides,
+                    coordinate_shape=_coordinate_shape((context["block_n"],)),
+                    global_coordinate_axes=(0, 1),
+                ),
+            }
+        )
+
+    context.update(
+        weight_block_n=block_n,
+        weight_block_k=block_k,
+        global_output_n=global_output_n,
+        global_k_start=global_k_start,
+        projections=tuple(projections),
     )
     return context
 

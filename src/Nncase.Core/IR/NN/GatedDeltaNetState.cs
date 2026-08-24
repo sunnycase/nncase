@@ -166,6 +166,15 @@ public sealed record GatedDeltaNetStateConfig
         _ => throw new ArgumentOutOfRangeException(nameof(kind)),
     };
 
+    public IRArray<int> GetLanes(
+        GatedDeltaNetStateKind kind,
+        GatedDeltaNetStateDimKind axis) =>
+        GetVectorizedAxes(kind)
+            .Select((vectorizedAxis, index) => (vectorizedAxis, lane: GetLanes(kind)[index]))
+            .Where(item => item.vectorizedAxis == axis)
+            .Select(item => item.lane)
+            .ToArray();
+
     public long GetDimension(GatedDeltaNetStateDimKind axis) => axis switch
     {
         GatedDeltaNetStateDimKind.NumLayers => NumLayers,
