@@ -733,6 +733,234 @@ public sealed class UnitTestDistribAutoDistributed : TestClassBase
     }
 
     [Fact]
+    public void TestPackedNVFP4CandidateProvidersPreserveOutputNSplit()
+    {
+        var options = new PyNTTTargetOptions
+        {
+            HierarchyNames = "yx",
+            HierarchyLevels = "bb",
+            Hierarchies = [new[] { 4, 8 }],
+        };
+        CompileOptions.TargetOptions = options;
+        var placement = new Placement([4, 8], "yx", "bb");
+        var inputTensorType = new TensorType(
+            new VectorType(DataTypes.BFloat16, [8]),
+            new RankedShape(1, 640));
+        var weightTensorType = new TensorType(
+            new VectorType(DataTypes.UInt8, [2, 16]),
+            new RankedShape(640, 80));
+        var weightScaleTensorType = new TensorType(
+            DataTypes.Float8E4M3,
+            new RankedShape(640, 320));
+        var globalScaleTensorType = new TensorType(DataTypes.Float32, new RankedShape(1));
+        var inputType = new DistributedType(inputTensorType, [SBP.B, SBP.B], placement);
+        var inputKSplitType = new DistributedType(
+            inputTensorType,
+            [SBP.B, SBP.SBlockCyclic([0], 8)],
+            placement);
+        var weightType = new DistributedType(
+            weightTensorType,
+            [SBP.SBlockCyclic([0, 1], 8), SBP.B],
+            placement);
+        var weightScaleType = new DistributedType(
+            weightScaleTensorType,
+            [SBP.SBlockCyclic([0, 1], 8), SBP.B],
+            placement);
+        var globalScaleType = new DistributedType(globalScaleTensorType, [SBP.B], placement);
+
+        var input = new Var("input", inputTensorType);
+        var gateWeight = new Var("gate_weight", weightTensorType);
+        var upWeight = new Var("up_weight", weightTensorType);
+        var gateWeightScale = new Var("gate_weight_scale", weightScaleTensorType);
+        var upWeightScale = new Var("up_weight_scale", weightScaleTensorType);
+        var inputGlobalScale = new Var("input_global_scale", globalScaleTensorType);
+        var weightGlobalScale = new Var("weight_global_scale", globalScaleTensorType);
+
+        var matmulCall = Assert.IsType<Call>(IR.F.NTT.PackedNVFP4MatMul(
+            input,
+            gateWeight,
+            gateWeightScale,
+            inputGlobalScale,
+            weightGlobalScale,
+            DataTypes.BFloat16,
+            16,
+            8,
+            2,
+            16,
+            8));
+        Assert.True(matmulCall.InferenceType());
+        var matmulContext = new DistributedCandidateContext(
+            CompileOptions,
+            options,
+            PyNTTTarget.Kind,
+            matmulCall,
+            [
+                new IRType[] { inputType, inputKSplitType },
+                new IRType[] { weightType },
+                new IRType[] { weightScaleType },
+                new IRType[] { globalScaleType },
+                new IRType[] { globalScaleType },
+            ]);
+        var matmulProvider = new PackedNVFP4MatMulCandidateProvider();
+        var matmulTarget = Assert.IsType<PackedNVFP4MatMul>(matmulCall.Target);
+        var allMatmulOutputs = matmulProvider
+            .GetReturnCandidateTypes(matmulContext, matmulTarget, []);
+        var matmulOutputs = allMatmulOutputs.Where(IsPackedNVFP4NSplit).ToArray();
+        Assert.True(
+            matmulOutputs.Length == 1,
+            $"Expected one packed NVFP4 matmul N-split output, got {string.Join("; ", allMatmulOutputs)}.");
+        var matmulOutput = matmulOutputs[0];
+        AssertPackedNVFP4NSplit(matmulOutput);
+        Assert.True(matmulProvider.TryGetInputTypeTuples(
+            matmulContext,
+            matmulTarget,
+            matmulOutput,
+            out var matmulTuples));
+        Assert.True(
+            matmulTuples.Count == 1,
+            $"Expected one packed NVFP4 matmul input tuple, got {matmulTuples.Count}.");
+        AssertPackedNVFP4WeightNPolicy(matmulOutput, matmulTuples[0].InputTypes[1]);
+
+        var partialOutput = Assert.Single(allMatmulOutputs.Where(IsPackedNVFP4KPartial));
+        Assert.True(matmulProvider.TryGetInputTypeTuples(
+            matmulContext,
+            matmulTarget,
+            partialOutput,
+            out var partialTuples));
+        var partialTuple = Assert.Single(partialTuples);
+        Assert.Equal(inputKSplitType, partialTuple.InputTypes[0]);
+        AssertPackedNVFP4KPolicies(
+            partialTuple.InputTypes[0],
+            partialTuple.InputTypes[1],
+            partialTuple.InputTypes[2]);
+
+        var gluCall = Assert.IsType<Call>(IR.F.NTT.PackedNVFP4MatMulGlu(
+            input,
+            gateWeight,
+            upWeight,
+            gateWeightScale,
+            upWeightScale,
+            inputGlobalScale,
+            inputGlobalScale,
+            weightGlobalScale,
+            weightGlobalScale,
+            GluType.SwiGLU,
+            DataTypes.BFloat16,
+            16,
+            8,
+            2,
+            16,
+            8));
+        Assert.True(gluCall.InferenceType());
+        var gluContext = new DistributedCandidateContext(
+            CompileOptions,
+            options,
+            PyNTTTarget.Kind,
+            gluCall,
+            [
+                new IRType[] { inputType, inputKSplitType },
+                new IRType[] { weightType },
+                new IRType[] { weightType },
+                new IRType[] { weightScaleType },
+                new IRType[] { weightScaleType },
+                new IRType[] { globalScaleType },
+                new IRType[] { globalScaleType },
+                new IRType[] { globalScaleType },
+                new IRType[] { globalScaleType },
+            ]);
+        var gluProvider = new PackedNVFP4MatMulGluCandidateProvider();
+        var gluTarget = Assert.IsType<PackedNVFP4MatMulGlu>(gluCall.Target);
+        var gluOutputs = gluProvider
+            .GetReturnCandidateTypes(gluContext, gluTarget, [])
+            .Where(IsPackedNVFP4NSplit)
+            .ToArray();
+        Assert.True(
+            gluOutputs.Length == 1,
+            $"Expected one packed NVFP4 GLU N-split output, got {string.Join("; ", gluOutputs.AsEnumerable())}.");
+        var gluOutput = gluOutputs[0];
+        AssertPackedNVFP4NSplit(gluOutput);
+        Assert.True(gluProvider.TryGetInputTypeTuples(
+            gluContext,
+            gluTarget,
+            gluOutput,
+            out var gluTuples));
+        Assert.True(
+            gluTuples.Count == 1,
+            $"Expected one packed NVFP4 GLU input tuple, got {gluTuples.Count}.");
+        AssertPackedNVFP4WeightNPolicy(gluOutput, gluTuples[0].InputTypes[1]);
+
+        static void AssertPackedNVFP4NSplit(IRType type)
+        {
+            var distributed = Assert.IsType<DistributedType>(type);
+            Assert.Null(distributed.Partial);
+            Assert.Equal(SBP.B, distributed.AxisPolicies[0]);
+            var split = Assert.IsType<SBPSplit>(distributed.AxisPolicies[1]);
+            Assert.Equal(new[] { 0, 1 }, split.HierarchyAxes);
+            Assert.True(
+                Assert.IsType<BlockCyclicSplit>(Assert.Single(split.Stages).Distribution).BlockSize > 0);
+        }
+
+        static bool IsPackedNVFP4NSplit(IRType type)
+        {
+            if (type is not DistributedType { Partial: null } distributed ||
+                distributed.AxisPolicies[0] is not SBPBroadCast ||
+                distributed.AxisPolicies[1] is not SBPSplit split ||
+                !split.HierarchyAxes.SequenceEqual([0, 1]) ||
+                split.Stages.Count != 1)
+            {
+                return false;
+            }
+
+            return split.Stages[0].Distribution is BlockCyclicSplit;
+        }
+
+        static bool IsPackedNVFP4KPartial(IRType type)
+        {
+            if (type is not DistributedType
+            {
+                Partial: SBPPartial { Axes: var axes },
+                AxisPolicies: var policies,
+            })
+            {
+                return false;
+            }
+
+            return axes.SequenceEqual([0]) &&
+                policies.All(policy => policy is SBPBroadCast);
+        }
+
+        static void AssertPackedNVFP4WeightNPolicy(IRType outputType, IRType weightType)
+        {
+            var output = Assert.IsType<DistributedType>(outputType);
+            var outputSplit = Assert.IsType<SBPSplit>(output.AxisPolicies[1]);
+            var outputBlock = Assert.IsType<BlockCyclicSplit>(Assert.Single(outputSplit.Stages).Distribution);
+            var weight = Assert.IsType<DistributedType>(weightType);
+            var weightSplit = Assert.IsType<SBPSplit>(weight.AxisPolicies[0]);
+            var weightBlock = Assert.IsType<BlockCyclicSplit>(Assert.Single(weightSplit.Stages).Distribution);
+            Assert.Equal(outputBlock.BlockSize * 8, weightBlock.BlockSize);
+        }
+
+        static void AssertPackedNVFP4KPolicies(
+            IRType inputType,
+            IRType weightType,
+            IRType scaleType)
+        {
+            var input = Assert.IsType<DistributedType>(inputType);
+            var weight = Assert.IsType<DistributedType>(weightType);
+            var scale = Assert.IsType<DistributedType>(scaleType);
+            Assert.Equal(8, GetBlockSize(input.AxisPolicies[^1]));
+            Assert.Equal(1, GetBlockSize(weight.AxisPolicies[1]));
+            Assert.Equal(4, GetBlockSize(scale.AxisPolicies[1]));
+        }
+
+        static long GetBlockSize(SBP policy)
+        {
+            var split = Assert.IsType<SBPSplit>(policy);
+            return Assert.IsType<BlockCyclicSplit>(Assert.Single(split.Stages).Distribution).BlockSize;
+        }
+    }
+
+    [Fact]
     public void TestPackedBlockScaledMatMulNormStatsCandidatePreservesOutputSplit()
     {
         var options = new PyNTTTargetOptions

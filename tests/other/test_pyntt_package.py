@@ -963,6 +963,7 @@ def test_pyntt_renderer_preserves_one_block_cyclic_n_block_per_mma_tile():
                 "block_n": 64,
                 "block_k": 512,
                 "num_stages": 2,
+                "transfer_block_k": 128,
             },
             "SharedWorkspaceOffsets": {
                 "rhs_stage": "0",
@@ -970,7 +971,7 @@ def test_pyntt_renderer_preserves_one_block_cyclic_n_block_per_mma_tile():
                 "lhs_scale": "66048",
             },
             "SharedWorkspaceShapes": {
-                "rhs_stage": [2, 4, 64, 128],
+                "rhs_stage": [2, 4, 1, 64, 128],
                 "lhs_quantized": [4, 128],
                 "lhs_scale": [4, 1],
             },
@@ -1007,6 +1008,304 @@ def test_pyntt_renderer_preserves_one_block_cyclic_n_block_per_mma_tile():
     assert spec["entries"][2]["offset_bytes"] == 256 + 64 * 512
 
 
+def test_pyntt_nvfp4_accesses_map_local_n_through_block_cyclic_storage():
+    _add_pyntt_to_path()
+    from pyntt.codegen.render import (
+        _access_pointer,
+        _nvfp4_matmul_glu_template_context,
+        _nvfp4_matmul_template_context,
+    )
+
+    def pointer(shape, strides, sharded_axis, block_size=128):
+        shard_axes = [{"Stages": []} for _ in shape]
+        shard_axes[sharded_axis] = {
+            "Stages": [
+                {
+                    "HierarchyAxes": [0, 1],
+                    "Distribution": "BlockCyclic",
+                    "Granularity": None,
+                    "BlockSize": block_size,
+                }
+            ]
+        }
+        return {
+            "Expression": "pointer",
+            "DistributedStorageKind": "CanonicalGlobal",
+            "GlobalShape": list(shape),
+            "GlobalOffsets": [0] * len(shape),
+            "ShardAxes": shard_axes,
+            "Hierarchy": [4, 8],
+            "Strides": list(strides),
+        }
+
+    def microkernel(family):
+        return {
+            "Family": family,
+            "Variant": "mma_tma_smem_pipeline",
+            "Parameters": {
+                "block_m": 1,
+                "block_n": 128,
+                "block_k": 256,
+                "num_stages": 4,
+                "group_size": 16,
+            },
+            "SharedWorkspaceOffsets": {
+                "packed_weight_stage": "0",
+            },
+            "SharedWorkspaceShapes": {
+                "packed_weight_stage": [4, 128, 128],
+            },
+        }
+
+    output_pointer = pointer((1, 2176), (0, 1), 1, block_size=16)
+    packed_pointer = pointer((17408, 80), (80, 1), 0)
+    scale_pointer = pointer((17408, 320), (320, 1), 0)
+    matmul = {
+        "GroupSize": 16,
+        "MicroKernel": microkernel("triton.nvfp4_matmul"),
+        "LhsShape": [1, 640],
+        "RhsPackedShape": [640, 80],
+        "RhsScaleShape": [640, 320],
+        "OutputShape": [1, 80],
+        "LhsVectorLanes": [8],
+        "RhsPackedVectorLanes": [2, 16],
+        "OutputVectorLanes": [8],
+        "LhsStrides": [0, 1],
+        "RhsPackedStrides": [80, 1],
+        "RhsScaleStrides": [320, 1],
+        "OutputStrides": [0, 1],
+        "RhsPacked": packed_pointer,
+        "RhsScale": scale_pointer,
+        "Output": output_pointer,
+        "RhsPackedDescriptorName": "rhs_packed_descriptor",
+    }
+    matmul_context = _nvfp4_matmul_template_context(matmul)
+    assert matmul_context["n_tiles_per_activation_batch"] == 2
+    matmul_packed = _access_pointer(
+        matmul, "RhsPacked", "rhs_packed", matmul_context["packed_weight_access"]
+    )
+    matmul_scale = _access_pointer(
+        matmul, "RhsScale", "rhs_scale", matmul_context["weight_scale_access"]
+    )
+    matmul_output = _access_pointer(
+        matmul, "Output", "output", matmul_context["output_access"]
+    )
+
+    glu = {
+        "GroupSize": 16,
+        "GluType": "swiglu",
+        "MicroKernel": microkernel("triton.nvfp4_matmul_glu"),
+        "InputShape": [1, 640],
+        "WeightPackedShape": [640, 80],
+        "WeightScaleShape": [640, 320],
+        "OutputShape": [1, 80],
+        "InputVectorLanes": [8],
+        "WeightPackedVectorLanes": [2, 16],
+        "OutputVectorLanes": [8],
+        "InputStrides": [0, 1],
+        "GateWeightPackedStrides": [80, 1],
+        "UpWeightPackedStrides": [80, 1],
+        "GateWeightScaleStrides": [320, 1],
+        "UpWeightScaleStrides": [320, 1],
+        "OutputStrides": [0, 1],
+        "GateWeightPacked": packed_pointer,
+        "UpWeightPacked": packed_pointer,
+        "GateWeightScale": scale_pointer,
+        "UpWeightScale": scale_pointer,
+        "Output": output_pointer,
+        "GateWeightPackedDescriptorName": "gate_weight_packed_descriptor",
+        "UpWeightPackedDescriptorName": "up_weight_packed_descriptor",
+    }
+    glu_context = _nvfp4_matmul_glu_template_context(glu)
+    assert glu_context["n_tiles_per_activation_batch"] == 1
+    gate = glu_context["projections"][0]
+    glu_packed = _access_pointer(
+        glu,
+        "GateWeightPacked",
+        "gate_weight_packed",
+        gate["packed_weight_access"],
+    )
+    glu_scale = _access_pointer(
+        glu,
+        "GateWeightScale",
+        "gate_weight_scale",
+        gate["weight_scale_access"],
+    )
+    glu_output = _access_pointer(glu, "Output", "output", glu_context["output_access"])
+
+    for expression in (matmul_packed, matmul_scale, glu_packed, glu_scale):
+        assert "shard_coord0 * 8 + shard_coord1" in expression
+        assert "% 128" in expression
+
+    for expression in (matmul_output, glu_output):
+        assert "shard_coord0 * 8 + shard_coord1" in expression
+        assert "% 16" in expression
+
+    assert "* (80)" in matmul_packed
+    assert "* (320)" in matmul_scale
+    assert "* (80)" in glu_packed
+    assert "* (320)" in glu_scale
+
+
+def test_pyntt_nvfp4_descriptor_reinterprets_target_packed_k_lanes():
+    _add_pyntt_to_path()
+    from pyntt.codegen.render import _nvfp4_n_major_host_descriptor_spec
+
+    pointer = {
+        "Expression": "rhs_packed",
+        "DistributedStorageKind": "CanonicalGlobal",
+        "GlobalShape": [640, 80],
+        "GlobalOffsets": [0, 0],
+        "ShardAxes": [{"Stages": []}, {"Stages": []}],
+        "Hierarchy": [1],
+        "Strides": [80, 1],
+    }
+    model = {
+        "GroupSize": 16,
+        "MicroKernel": {
+            "Family": "triton.nvfp4_matmul",
+            "Variant": "mma_tma_smem_pipeline",
+            "Parameters": {
+                "block_m": 1,
+                "block_n": 128,
+                "block_k": 256,
+                "num_stages": 4,
+                "group_size": 16,
+            },
+            "SharedWorkspaceOffsets": {"packed_weight_stage": "0"},
+            "SharedWorkspaceShapes": {"packed_weight_stage": [4, 128, 128]},
+        },
+        "LhsShape": [1, 640],
+        "RhsPackedShape": [640, 80],
+        "RhsScaleShape": [640, 320],
+        "OutputShape": [1, 80],
+        "LhsVectorLanes": [8],
+        "RhsPackedVectorLanes": [2, 16],
+        "OutputVectorLanes": [8],
+        "LhsStrides": [0, 1],
+        "RhsPackedStrides": [80, 1],
+        "RhsScaleStrides": [320, 1],
+        "OutputStrides": [0, 1],
+        "RhsPacked": pointer,
+        "RhsPackedDescriptorName": "rhs_packed_descriptor",
+    }
+    backing = {
+        "name": "rhs_packed_descriptor",
+        "source": "chip_local_rdata",
+        "offset_bytes": 256,
+        "scalar_dtype": "uint8",
+        "logical_shape": [640, 80],
+        "logical_strides": [80, 1],
+        "vector_lane_shape": [2, 16],
+        "contiguous_rebase_extent_elements": 0,
+        "owner_stride_bytes": 0,
+    }
+
+    spec = _nvfp4_n_major_host_descriptor_spec(
+        model, backing, pointer_key="RhsPacked"
+    )
+    assert spec["block_shape"] == (128, 4, 32)
+    assert len(spec["entries"]) == 5
+    assert spec["entries"][0] == {
+        "offset_bytes": 256,
+        "shape": (128, 80, 32),
+        "strides": (2560, 32, 1),
+        "source_shape_axes": ((), (), ()),
+    }
+    assert spec["entries"][1]["offset_bytes"] == 256 + 128 * 2560
+
+
+def test_pyntt_nvfp4_descriptor_preserves_block_cyclic_n_and_k_axes():
+    _add_pyntt_to_path()
+    from pyntt.codegen.render import _nvfp4_n_major_host_descriptor_spec
+
+    pointer = {
+        "Expression": "rhs_packed",
+        "DistributedStorageKind": "CanonicalGlobal",
+        "GlobalShape": [5120, 272],
+        "GlobalOffsets": [0, 0],
+        "ShardAxes": [
+            {
+                "Stages": [
+                    {
+                        "HierarchyAxes": [1],
+                        "Distribution": "BlockCyclic",
+                        "Granularity": None,
+                        "BlockSize": 64,
+                    }
+                ]
+            },
+            {
+                "Stages": [
+                    {
+                        "HierarchyAxes": [0],
+                        "Distribution": "BlockCyclic",
+                        "Granularity": None,
+                        "BlockSize": 1,
+                    }
+                ]
+            },
+        ],
+        "Hierarchy": [4, 8],
+        "Strides": [272, 1],
+    }
+    model = {
+        "GroupSize": 16,
+        "MicroKernel": {
+            "Family": "triton.nvfp4_matmul",
+            "Variant": "mma_tma_smem_pipeline",
+            "Parameters": {
+                "block_m": 1,
+                "block_n": 128,
+                "block_k": 256,
+                "num_stages": 4,
+                "group_size": 16,
+            },
+            "SharedWorkspaceOffsets": {"packed_weight_stage": "0"},
+            "SharedWorkspaceShapes": {"packed_weight_stage": [4, 128, 128]},
+        },
+        "LhsShape": [1, 544],
+        "RhsPackedShape": [640, 68],
+        "RhsScaleShape": [640, 272],
+        "OutputShape": [1, 80],
+        "LhsVectorLanes": [8],
+        "RhsPackedVectorLanes": [2, 16],
+        "OutputVectorLanes": [8],
+        "LhsStrides": [0, 1],
+        "RhsPackedStrides": [272, 1],
+        "RhsScaleStrides": [1088, 1],
+        "OutputStrides": [0, 1],
+        "RhsPacked": pointer,
+        "RhsPackedDescriptorName": "rhs_packed_descriptor",
+    }
+    backing = {
+        "name": "rhs_packed_descriptor",
+        "source": "chip_local_rdata",
+        "offset_bytes": 256,
+        "scalar_dtype": "uint8",
+        "logical_shape": [5120, 272],
+        "logical_strides": [272, 1],
+        "vector_lane_shape": [2, 16],
+        "contiguous_rebase_extent_elements": 0,
+        "owner_stride_bytes": 0,
+    }
+
+    spec = _nvfp4_n_major_host_descriptor_spec(
+        model, backing, pointer_key="RhsPacked"
+    )
+    assert spec["block_shape"] == (2, 64, 4, 32)
+    assert len(spec["entries"]) == 32 * 5
+    assert spec["entries"][0] == {
+        "offset_bytes": 256,
+        "shape": (2, 64, 68, 32),
+        "strides": (512 * 272 * 32, 272 * 32, 4 * 32, 1),
+        "source_shape_axes": ((), (), (), ()),
+    }
+    assert spec["entries"][1]["offset_bytes"] == 256 + 1024 * 272 * 32
+    assert spec["entries"][5]["offset_bytes"] == 256 + 64 * 272 * 32
+    assert spec["entries"][8 * 5]["offset_bytes"] == 256 + 32
+
+
 def test_pyntt_renderer_uses_one_rank3_descriptor_for_block_cyclic_mma_tile():
     _add_pyntt_to_path()
     from pyntt.codegen.render import _n_major_k_packed_gemv_host_descriptor_spec
@@ -1041,6 +1340,7 @@ def test_pyntt_renderer_uses_one_rank3_descriptor_for_block_cyclic_mma_tile():
                 "block_n": 128,
                 "block_k": 256,
                 "num_stages": 2,
+                "transfer_block_k": 128,
             },
             "SharedWorkspaceOffsets": {
                 "rhs_stage": "0",
@@ -1048,7 +1348,7 @@ def test_pyntt_renderer_uses_one_rank3_descriptor_for_block_cyclic_mma_tile():
                 "lhs_scale": "65792",
             },
             "SharedWorkspaceShapes": {
-                "rhs_stage": [2, 2, 128, 128],
+                "rhs_stage": [2, 2, 1, 128, 128],
                 "lhs_quantized": [2, 128],
                 "lhs_scale": [2, 1],
             },

@@ -1550,6 +1550,12 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                         args,
                         RequireMicroKernel(microKernel, packedBlockScaledMatmulNormStats));
                     break;
+                case Nncase.TIR.NTT.NVFP4MatMul nvfp4Matmul:
+                    VisitNVFP4Matmul(
+                        nvfp4Matmul,
+                        args,
+                        RequireMicroKernel(microKernel, nvfp4Matmul));
+                    break;
                 case Nncase.TIR.NTT.PackedMatMulNormStats packedMatmulNormStats:
                     VisitPackedMatmulNormStats(
                         packedMatmulNormStats,
@@ -1577,6 +1583,12 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     break;
                 case Nncase.TIR.NTT.PackedMatMulGlu packedMatMulGlu:
                     VisitPackedMatMulGlu(packedMatMulGlu, args, RequireMicroKernel(microKernel, packedMatMulGlu));
+                    break;
+                case Nncase.TIR.NTT.NVFP4MatMulGlu nvfp4MatMulGlu:
+                    VisitNVFP4MatMulGlu(
+                        nvfp4MatMulGlu,
+                        args,
+                        RequireMicroKernel(microKernel, nvfp4MatMulGlu));
                     break;
                 case Nncase.TIR.NTT.SUMMA summa:
                     VisitSUMMA(summa, args, RequireMicroKernel(microKernel, summa));
@@ -6036,6 +6048,295 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 helperName);
         }
 
+        private void VisitNVFP4Matmul(
+            Nncase.TIR.NTT.NVFP4MatMul matmul,
+            IReadOnlyList<BaseExpr> args,
+            PyNTTMicroKernelTemplateModel microKernel)
+        {
+            if (args.Count != 6 || args.Any(static argument => argument is not TIR.Buffer))
+            {
+                throw new NotSupportedException(
+                    "PyNTT NVFP4MatMul codegen expects lhs, packed weight, block scale, " +
+                    "input global scale, weight global scale, and output TIR buffers.");
+            }
+
+            var lhs = (TIR.Buffer)args[0];
+            var rhsPacked = (TIR.Buffer)args[1];
+            var rhsScale = (TIR.Buffer)args[2];
+            var lhsGlobalScale = (TIR.Buffer)args[3];
+            var rhsGlobalScale = (TIR.Buffer)args[4];
+            var output = (TIR.Buffer)args[5];
+            ValidateNVFP4ProjectionBuffers(
+                "PyNTT NVFP4MatMul",
+                lhs,
+                rhsPacked,
+                rhsScale,
+                lhsGlobalScale,
+                rhsGlobalScale,
+                output,
+                matmul.GroupSize);
+
+            SetComputeOp("nvfp4_matmul");
+            var lhsShape = GetBufferActiveShape(lhs);
+            var rhsPackedShape = GetBufferActiveShape(rhsPacked);
+            var rhsScaleShape = GetBufferActiveShape(rhsScale);
+            var outputShape = GetBufferActiveShape(output);
+            CanonicalizeNVFP4ProjectionN(
+                output,
+                outputShape,
+                rhsPackedShape,
+                rhsScaleShape);
+            _attrs["dtype"] = GetPyNTTScalarDTypeName(output.ElemType);
+            _attrs["shape"] = outputShape;
+            _attrs["group_size"] = matmul.GroupSize;
+            var helperName = GetNextHelperName("nvfp4_gemv_compute");
+            var rhsPackedDescriptor = RegisterHostTensorDescriptor(
+                rhsPacked,
+                $"{helperName}__rhs_packed_descriptor");
+            var templateModel = new PyNTTNVFP4MatmulTemplateModel(
+                helperName,
+                GetBufferScalarPointer(lhs),
+                GetBufferScalarPointer(rhsPacked),
+                GetBufferScalarPointer(rhsScale),
+                GetBufferScalarPointer(lhsGlobalScale),
+                GetBufferScalarPointer(rhsGlobalScale),
+                GetBufferScalarPointer(output),
+                GetScalarTritonDType(lhs.ElemType),
+                GetScalarTritonDType(output.ElemType),
+                GetVectorLanes(lhs.ElemType),
+                GetVectorLanes(rhsPacked.ElemType),
+                GetVectorLanes(output.ElemType),
+                lhsShape,
+                rhsPackedShape,
+                rhsScaleShape,
+                outputShape,
+                GetBufferStrides(lhs),
+                GetBufferStrides(rhsPacked),
+                GetBufferStrides(rhsScale),
+                GetBufferStrides(output),
+                matmul.GroupSize,
+                microKernel,
+                $"{lhs.Name}, {rhsPacked.Name}, {rhsScale.Name} -> {output.Name}")
+            {
+                RhsPackedDescriptorName = rhsPackedDescriptor.Name,
+            };
+            WriteSelectedMicroKernelHelper(microKernel, templateModel, helperName);
+        }
+
+        private void VisitNVFP4MatMulGlu(
+            Nncase.TIR.NTT.NVFP4MatMulGlu matMulGlu,
+            IReadOnlyList<BaseExpr> args,
+            PyNTTMicroKernelTemplateModel microKernel)
+        {
+            if (args.Count != 10 || args.Any(static argument => argument is not TIR.Buffer))
+            {
+                throw new NotSupportedException(
+                    "PyNTT NVFP4MatMulGlu codegen expects input, gate/up packed weights, " +
+                    "gate/up block scales, four global scales, and output TIR buffers.");
+            }
+
+            var input = (TIR.Buffer)args[0];
+            var gateWeightPacked = (TIR.Buffer)args[1];
+            var upWeightPacked = (TIR.Buffer)args[2];
+            var gateWeightScale = (TIR.Buffer)args[3];
+            var upWeightScale = (TIR.Buffer)args[4];
+            var gateInputGlobalScale = (TIR.Buffer)args[5];
+            var upInputGlobalScale = (TIR.Buffer)args[6];
+            var gateWeightGlobalScale = (TIR.Buffer)args[7];
+            var upWeightGlobalScale = (TIR.Buffer)args[8];
+            var output = (TIR.Buffer)args[9];
+            ValidateNVFP4ProjectionBuffers(
+                "PyNTT NVFP4MatMulGlu gate projection",
+                input,
+                gateWeightPacked,
+                gateWeightScale,
+                gateInputGlobalScale,
+                gateWeightGlobalScale,
+                output,
+                matMulGlu.GroupSize);
+            ValidateNVFP4ProjectionBuffers(
+                "PyNTT NVFP4MatMulGlu up projection",
+                input,
+                upWeightPacked,
+                upWeightScale,
+                upInputGlobalScale,
+                upWeightGlobalScale,
+                output,
+                matMulGlu.GroupSize);
+            ValidateSameShape(
+                "PyNTT NVFP4MatMulGlu packed weights",
+                GetBufferActiveShape(gateWeightPacked),
+                GetBufferActiveShape(upWeightPacked));
+            ValidateSameShape(
+                "PyNTT NVFP4MatMulGlu block scales",
+                GetBufferActiveShape(gateWeightScale),
+                GetBufferActiveShape(upWeightScale));
+
+            SetComputeOp("nvfp4_matmul_glu");
+            var inputShape = GetBufferActiveShape(input);
+            var weightPackedShape = GetBufferActiveShape(gateWeightPacked);
+            var weightScaleShape = GetBufferActiveShape(gateWeightScale);
+            var outputShape = GetBufferActiveShape(output);
+            CanonicalizeNVFP4ProjectionN(
+                output,
+                outputShape,
+                weightPackedShape,
+                weightScaleShape);
+            _attrs["dtype"] = GetPyNTTScalarDTypeName(output.ElemType);
+            _attrs["shape"] = outputShape;
+            _attrs["glu_type"] = GetGluTypeName(matMulGlu.GluType);
+            _attrs["group_size"] = matMulGlu.GroupSize;
+            var helperName = GetNextHelperName("nvfp4_matmul_glu_gemv_compute");
+            var gateWeightPackedDescriptor = RegisterHostTensorDescriptor(
+                gateWeightPacked,
+                $"{helperName}__gate_weight_packed_descriptor");
+            var upWeightPackedDescriptor = RegisterHostTensorDescriptor(
+                upWeightPacked,
+                $"{helperName}__up_weight_packed_descriptor");
+            var templateModel = new PyNTTNVFP4MatMulGluTemplateModel(
+                helperName,
+                GetBufferScalarPointer(input),
+                GetBufferScalarPointer(gateWeightPacked),
+                GetBufferScalarPointer(upWeightPacked),
+                GetBufferScalarPointer(gateWeightScale),
+                GetBufferScalarPointer(upWeightScale),
+                GetBufferScalarPointer(gateInputGlobalScale),
+                GetBufferScalarPointer(upInputGlobalScale),
+                GetBufferScalarPointer(gateWeightGlobalScale),
+                GetBufferScalarPointer(upWeightGlobalScale),
+                GetBufferScalarPointer(output),
+                GetScalarTritonDType(input.ElemType),
+                GetScalarTritonDType(output.ElemType),
+                GetVectorLanes(input.ElemType),
+                GetVectorLanes(gateWeightPacked.ElemType),
+                GetVectorLanes(output.ElemType),
+                inputShape,
+                weightPackedShape,
+                weightScaleShape,
+                outputShape,
+                GetBufferStrides(input),
+                GetBufferStrides(gateWeightPacked),
+                GetBufferStrides(upWeightPacked),
+                GetBufferStrides(gateWeightScale),
+                GetBufferStrides(upWeightScale),
+                GetBufferStrides(output),
+                GetGluTypeName(matMulGlu.GluType),
+                matMulGlu.GroupSize,
+                microKernel,
+                $"{input.Name}, ({gateWeightPacked.Name}, {upWeightPacked.Name}) -> {output.Name}")
+            {
+                GateWeightPackedDescriptorName = gateWeightPackedDescriptor.Name,
+                UpWeightPackedDescriptorName = upWeightPackedDescriptor.Name,
+            };
+            WriteSelectedMicroKernelHelper(microKernel, templateModel, helperName);
+        }
+
+        private void ValidateNVFP4ProjectionBuffers(
+            string context,
+            TIR.Buffer input,
+            TIR.Buffer weightPacked,
+            TIR.Buffer weightScale,
+            TIR.Buffer inputGlobalScale,
+            TIR.Buffer weightGlobalScale,
+            TIR.Buffer output,
+            long groupSize)
+        {
+            if (groupSize != 16)
+            {
+                throw new NotSupportedException($"{context} requires group size 16, got {groupSize}.");
+            }
+
+            var inputShape = GetBufferActiveShape(input);
+            var weightPackedShape = GetBufferActiveShape(weightPacked);
+            var weightScaleShape = GetBufferActiveShape(weightScale);
+            var outputShape = GetBufferActiveShape(output);
+            ValidateRank($"{context} input", inputShape, 2);
+            ValidateRank($"{context} packed weight", weightPackedShape, 2);
+            ValidateRank($"{context} weight scale", weightScaleShape, 2);
+            ValidateRank($"{context} output", outputShape, 2);
+            ValidateRank($"{context} input global scale", GetBufferActiveShape(inputGlobalScale), 1);
+            ValidateRank($"{context} weight global scale", GetBufferActiveShape(weightGlobalScale), 1);
+            ValidateVectorLanes(context, "input", input.ElemType, [8]);
+            ValidateVectorLanes(context, "packed weight", weightPacked.ElemType, [2, 16]);
+            ValidateVectorLanes(context, "weight scale", weightScale.ElemType, []);
+            ValidateVectorLanes(context, "input global scale", inputGlobalScale.ElemType, []);
+            ValidateVectorLanes(context, "weight global scale", weightGlobalScale.ElemType, []);
+            ValidateVectorLanes(context, "output", output.ElemType, [8]);
+
+            if (GetScalarDataType(input.ElemType) != DataTypes.BFloat16 ||
+                GetScalarDataType(weightPacked.ElemType) != DataTypes.UInt8 ||
+                GetScalarDataType(weightScale.ElemType) != DataTypes.Float8E4M3 ||
+                inputGlobalScale.ElemType != DataTypes.Float32 ||
+                weightGlobalScale.ElemType != DataTypes.Float32 ||
+                GetScalarDataType(output.ElemType) != DataTypes.BFloat16)
+            {
+                throw new NotSupportedException(
+                    $"{context} requires BF16 input/output, U8 packed weight, E4M3 block scale, " +
+                    $"and F32 global scales, got {input.ElemType}/{weightPacked.ElemType}/" +
+                    $"{weightScale.ElemType}/{inputGlobalScale.ElemType}/" +
+                    $"{weightGlobalScale.ElemType}/{output.ElemType}.");
+            }
+
+            var inferredOutput = Nncase.Evaluator.IR.NTT.PackedNVFP4MatMulEvaluator.InferProjectionType(
+                DataTypes.BFloat16,
+                groupSize,
+                8,
+                2,
+                16,
+                8,
+                GetNVFP4BufferType(input),
+                GetNVFP4BufferType(weightPacked),
+                GetNVFP4BufferType(weightScale),
+                GetNVFP4BufferType(inputGlobalScale),
+                GetNVFP4BufferType(weightGlobalScale));
+            var outputType = GetNVFP4BufferType(output);
+            if (inferredOutput is InvalidType invalidType)
+            {
+                throw new InvalidOperationException(
+                    $"{context} violates the target-packed distributed storage contract: " +
+                    invalidType.Reason);
+            }
+
+            if (inferredOutput != outputType)
+            {
+                throw new InvalidOperationException(
+                    $"{context} output type does not match its validated target-packed operands: " +
+                    $"expected {inferredOutput}, got {outputType}.");
+            }
+        }
+
+        private static void CanonicalizeNVFP4ProjectionN(
+            TIR.Buffer output,
+            IReadOnlyList<PyNTTDimExpression> outputShape,
+            PyNTTDimExpression[] weightPackedShape,
+            PyNTTDimExpression[] weightScaleShape)
+        {
+            var outputLaneCount = GetVectorLaneProduct(GetVectorLanes(output.ElemType));
+            var logicalN = MultiplyDim(outputShape[^1], outputLaneCount);
+            weightPackedShape[0] = logicalN;
+            weightScaleShape[0] = logicalN;
+        }
+
+        private static IRType GetNVFP4BufferType(TIR.Buffer buffer)
+            => buffer.DistributedType is { } distributedType
+                ? distributedType
+                : new TensorType(buffer.ElemType, new RankedShape(buffer.Dimensions.ToArray()));
+
+        private static void ValidateVectorLanes(
+            string context,
+            string operand,
+            DataType dataType,
+            int[] expectedLanes)
+        {
+            var actualLanes = GetVectorLanes(dataType);
+            if (!actualLanes.SequenceEqual(expectedLanes))
+            {
+                throw new NotSupportedException(
+                    $"{context} requires {operand} vector lanes [{string.Join(",", expectedLanes)}], " +
+                    $"got [{string.Join(",", actualLanes)}].");
+            }
+        }
+
         private void VisitPackedMatMulGlu(
             Nncase.TIR.NTT.PackedMatMulGlu matMulGlu,
             IReadOnlyList<BaseExpr> args,
@@ -6852,6 +7153,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 ("triton.matmul", "simt_fp8_fma_smem_pipeline") => "triton/kernels/matmul/simt_fp8_fma_smem_pipeline.py.jinja",
                 ("triton.matmul", "simt_block_fp8_fma_smem_pipeline") => "triton/kernels/matmul/simt_block_fp8_fma_smem_pipeline.py.jinja",
                 ("triton.matmul", "mma_block_fp8_smem_pipeline") => "triton/kernels/matmul/mma_block_fp8_smem_pipeline.py.jinja",
+                ("triton.nvfp4_matmul", "mma_tma_smem_pipeline") => "triton/kernels/nvfp4_matmul/mma_tma_smem_pipeline.py.jinja",
                 ("triton.matmul_sampling_partial", "simt_fma_smem_pipeline") => "triton/kernels/matmul_sampling_partial/simt_fma_smem_pipeline.py.jinja",
                 ("triton.matmul", "mma") => "triton/kernels/matmul/mma.py.jinja",
                 ("triton.qkv_parallel_linear", "simt_fma") => "triton/kernels/qkv_parallel_linear/simt_fma.py.jinja",
@@ -6863,6 +7165,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 ("triton.matmul_glu", "simt_fp8_fma_smem_pipeline") => "triton/kernels/matmul_glu/simt_fp8_fma_smem_pipeline.py.jinja",
                 ("triton.matmul_glu", "simt_block_fp8_fma_smem_pipeline") => "triton/kernels/matmul_glu/simt_block_fp8_fma_smem_pipeline.py.jinja",
                 ("triton.matmul_glu", "mma") => "triton/kernels/matmul_glu/mma.py.jinja",
+                ("triton.nvfp4_matmul_glu", "mma_tma_smem_pipeline") => "triton/kernels/nvfp4_matmul_glu/mma_tma_smem_pipeline.py.jinja",
                 ("triton.gated_delta_net", "convolution") =>
                     "triton/kernels/gated_delta_net/convolution.py.jinja",
                 ("triton.gated_delta_net", "recurrent_core") =>

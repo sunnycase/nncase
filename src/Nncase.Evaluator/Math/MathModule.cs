@@ -23,6 +23,7 @@ internal class MathModule : IApplicationPart
         registrator.RegisterManyInterface<MatMulEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<ScaledMatMulEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<BlockScaledMatMulEvaluator>(reuse: Reuse.Singleton);
+        registrator.RegisterManyInterface<NVFP4MatMulEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<QuantizeEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<QuantParamOfEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<RangeOfEvaluator>(reuse: Reuse.Singleton);

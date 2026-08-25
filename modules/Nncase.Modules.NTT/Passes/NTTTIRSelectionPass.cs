@@ -170,6 +170,15 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
                     blockScaledMatmul.WeightBlockN,
                     blockScaledMatmul.WeightBlockK,
                     (Expr)arguments[IR.NTT.PackedBlockScaledMatMul.Addend.Index]);
+            case IR.NTT.PackedNVFP4MatMul nvfp4MatMul:
+                return TIR.F.NTT.NVFP4MatMul(
+                    (Expr)arguments[IR.NTT.PackedNVFP4MatMul.Lhs.Index],
+                    (Expr)arguments[IR.NTT.PackedNVFP4MatMul.RhsPacked.Index],
+                    (Expr)arguments[IR.NTT.PackedNVFP4MatMul.RhsScale.Index],
+                    (Expr)arguments[IR.NTT.PackedNVFP4MatMul.LhsGlobalScale.Index],
+                    (Expr)arguments[IR.NTT.PackedNVFP4MatMul.RhsGlobalScale.Index],
+                    output,
+                    nvfp4MatMul.GroupSize);
             case IR.NTT.PackedBlockScaledMatMulNormStats blockScaledMatmulNormStats:
                 {
                     var outputBase = Unsafe.As<Expr, BaseExpr>(ref output);
@@ -237,6 +246,20 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
                     matmulGlu.QuantizationMode,
                     matmulGlu.WeightBlockN,
                     matmulGlu.WeightBlockK);
+            case IR.NTT.PackedNVFP4MatMulGlu nvfp4MatMulGlu:
+                return TIR.F.NTT.NVFP4MatMulGlu(
+                    (Expr)arguments[IR.NTT.PackedNVFP4MatMulGlu.Input.Index],
+                    (Expr)arguments[IR.NTT.PackedNVFP4MatMulGlu.GateWeightPacked.Index],
+                    (Expr)arguments[IR.NTT.PackedNVFP4MatMulGlu.UpWeightPacked.Index],
+                    (Expr)arguments[IR.NTT.PackedNVFP4MatMulGlu.GateWeightScale.Index],
+                    (Expr)arguments[IR.NTT.PackedNVFP4MatMulGlu.UpWeightScale.Index],
+                    (Expr)arguments[IR.NTT.PackedNVFP4MatMulGlu.GateInputGlobalScale.Index],
+                    (Expr)arguments[IR.NTT.PackedNVFP4MatMulGlu.UpInputGlobalScale.Index],
+                    (Expr)arguments[IR.NTT.PackedNVFP4MatMulGlu.GateWeightGlobalScale.Index],
+                    (Expr)arguments[IR.NTT.PackedNVFP4MatMulGlu.UpWeightGlobalScale.Index],
+                    output,
+                    nvfp4MatMulGlu.GluType,
+                    nvfp4MatMulGlu.GroupSize);
             case IR.NTT.PackedQKVParallelLinear qkv:
                 {
                     var outputBase = Unsafe.As<Expr, BaseExpr>(ref output);

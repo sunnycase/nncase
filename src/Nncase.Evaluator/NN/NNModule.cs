@@ -28,6 +28,7 @@ internal class NNModule : IApplicationPart
         registrator.RegisterManyInterface<GatedDeltaNetConvolutionEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<GatedDeltaNetRecurrentCoreEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<MatMulGluEvaluator>(reuse: Reuse.Singleton);
+        registrator.RegisterManyInterface<NVFP4MatMulGluEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<RoPEEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<SeluEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<SigmoidEvaluator>(reuse: Reuse.Singleton);

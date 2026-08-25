@@ -394,7 +394,9 @@ public sealed class UnitTestTritonTargetCostModel : TestClassBase
         var rtxAsyncTransfer = rtx.GetTransfer(
             rtx.GetTilingParentMemorySpace(rtxShared.TilingLevel).Id,
             rtxShared.Id).Asynchronous;
-        Assert.Equal(new[] { 2, 3, 4 }, Assert.IsType<TargetAsynchronousTransferSpec>(rtxAsyncTransfer).SupportedStageCounts);
+        var rtxAsyncTransferSpec = Assert.IsType<TargetAsynchronousTransferSpec>(rtxAsyncTransfer);
+        Assert.Equal(new[] { 2, 3, 4 }, rtxAsyncTransferSpec.SupportedStageCounts);
+        Assert.Equal(16 * 1024, rtxAsyncTransferSpec.MaximumTransactionBytes);
         Assert.Equal(NTTTargetMachineCatalog.H800Sxm80Gb, h800.Id);
         Assert.Equal(132, h800.Execution.ComputeUnitCount);
         Assert.Equal(255L * 8 * 32, h800.GetPrivateResource(NTTTargetMachineCatalog.GpuRegisterFile).CapacityUnits);
@@ -413,7 +415,9 @@ public sealed class UnitTestTritonTargetCostModel : TestClassBase
         var h800AsyncTransfer = h800.GetTransfer(
             h800.GetTilingParentMemorySpace(h800Shared.TilingLevel).Id,
             h800Shared.Id).Asynchronous;
-        Assert.Equal(new[] { 2, 3, 4 }, Assert.IsType<TargetAsynchronousTransferSpec>(h800AsyncTransfer).SupportedStageCounts);
+        var h800AsyncTransferSpec = Assert.IsType<TargetAsynchronousTransferSpec>(h800AsyncTransfer);
+        Assert.Equal(new[] { 2, 3, 4 }, h800AsyncTransferSpec.SupportedStageCounts);
+        Assert.Equal(16 * 1024, h800AsyncTransferSpec.MaximumTransactionBytes);
     }
 
     [Fact]

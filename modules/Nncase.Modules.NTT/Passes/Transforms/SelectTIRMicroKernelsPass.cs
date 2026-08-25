@@ -30,14 +30,27 @@ public sealed class SelectTIRMicroKernelsPass : ModulePass
                 $"TIR microkernel selection requires {nameof(INTTTargetOptions)}.");
         }
 
-        foreach (var function in input.Functions.OfType<PrimFunction>().Where(x => x.ModuleKind == _moduleKind))
+        var functions = input.Functions
+            .OfType<PrimFunction>()
+            .Where(x => x.ModuleKind == _moduleKind)
+            .ToArray();
+        var alignmentRequirements = new OperandAlignmentRequirements();
+        foreach (var function in functions)
         {
-            var rewriter = new SelectorRewriter(targetOptions);
+            var rewriter = new SelectorRewriter(targetOptions, alignmentRequirements);
             rewriter.Rewrite(function);
             if (rewriter.IsMutated && !CompilerServices.InferenceType(function))
             {
                 throw new InvalidOperationException(
                     $"Type inference failed after selecting TIR microkernels in {function.Name}.");
+            }
+        }
+
+        if (alignmentRequirements.HasRequirements)
+        {
+            foreach (var function in functions)
+            {
+                new PhysicalBufferAlignmentRewriter(alignmentRequirements).Rewrite(function);
             }
         }
 
@@ -47,12 +60,16 @@ public sealed class SelectTIRMicroKernelsPass : ModulePass
     private sealed class SelectorRewriter : ExprRewriter
     {
         private readonly INTTTargetOptions _targetOptions;
+        private readonly OperandAlignmentRequirements _alignmentRequirements;
         private int _bufferIndex;
 
-        public SelectorRewriter(INTTTargetOptions targetOptions)
+        public SelectorRewriter(
+            INTTTargetOptions targetOptions,
+            OperandAlignmentRequirements alignmentRequirements)
             : base(visitOtherFunctions: false)
         {
             _targetOptions = targetOptions;
+            _alignmentRequirements = alignmentRequirements;
         }
 
         protected override BaseExpr RewriteLeafCall(Call expr)
@@ -78,6 +95,7 @@ public sealed class SelectTIRMicroKernelsPass : ModulePass
             if (selection?.TransferPipeline is { } transferPipeline)
             {
                 ValidateTransferPipelineContract(kernelOp, semanticArguments, selection, transferPipeline);
+                RecordTransferSourceAlignments(semanticArguments, transferPipeline);
             }
 
             var workspaces = selection is null
@@ -89,6 +107,27 @@ public sealed class SelectTIRMicroKernelsPass : ModulePass
             result.Metadata.TIRMicroKernel = selection;
             SetMutated();
             return result;
+        }
+
+        private void RecordTransferSourceAlignments(
+            IReadOnlyList<BaseExpr> semanticArguments,
+            TIRTransferPipelineContract contract)
+        {
+            foreach (var channel in contract.Channels)
+            {
+                if (channel.SourceAlignmentBytes == 1)
+                {
+                    continue;
+                }
+
+                foreach (var argumentIndex in channel.SourceArgumentIndices)
+                {
+                    _alignmentRequirements.Add(
+                        semanticArguments[argumentIndex],
+                        channel.SourceAlignmentBytes,
+                        channel.Name);
+                }
+            }
         }
 
         private static void ValidateTransferPipelineContract(
@@ -179,6 +218,106 @@ public sealed class SelectTIRMicroKernelsPass : ModulePass
                 shape.Dimensions.ToArray(),
                 strides,
                 distributedType: null);
+        }
+    }
+
+    private sealed class OperandAlignmentRequirements
+    {
+        private readonly Dictionary<PhysicalBuffer, int> _physicalBuffers =
+            new(ReferenceEqualityComparer.Instance);
+        private readonly Dictionary<Const, int> _constants =
+            new(ReferenceEqualityComparer.Instance);
+
+        public bool HasRequirements => _physicalBuffers.Count != 0;
+
+        public void Add(BaseExpr operand, int alignmentBytes, string channelName)
+        {
+            switch (operand)
+            {
+                case TIR.Buffer buffer:
+                    Add(buffer, alignmentBytes, channelName);
+                    return;
+                case IR.Tuple tuple:
+                    foreach (var field in tuple.Fields)
+                    {
+                        Add(field, alignmentBytes, channelName);
+                    }
+
+                    return;
+                default:
+                    throw new InvalidOperationException(
+                        $"Transfer channel {channelName} requires {alignmentBytes}-byte aligned " +
+                        $"TIR buffer operands, got {operand.GetType().Name}.");
+            }
+        }
+
+        public int GetRequiredAlignment(PhysicalBuffer buffer)
+        {
+            var alignment = _physicalBuffers.TryGetValue(buffer, out var physicalAlignment)
+                ? physicalAlignment
+                : 1;
+            if (TryGetAddressedConst(buffer, out var constValue) &&
+                _constants.TryGetValue(constValue, out var constAlignment))
+            {
+                alignment = Math.Max(alignment, constAlignment);
+            }
+
+            return alignment;
+        }
+
+        private void Add(TIR.Buffer buffer, int alignmentBytes, string channelName)
+        {
+            if (!buffer.MemSpan.Start.IsFixed ||
+                buffer.MemSpan.Start.FixedValue % alignmentBytes != 0)
+            {
+                throw new InvalidOperationException(
+                    $"Transfer channel {channelName} requires {alignmentBytes}-byte aligned " +
+                    $"buffer views, but {buffer.Name} starts at byte offset {buffer.MemSpan.Start}.");
+            }
+
+            _physicalBuffers[buffer.MemSpan.Buffer] = Math.Max(
+                _physicalBuffers.GetValueOrDefault(buffer.MemSpan.Buffer, 1),
+                alignmentBytes);
+            if (TryGetAddressedConst(buffer.MemSpan.Buffer, out var constValue))
+            {
+                _constants[constValue] = Math.Max(
+                    _constants.GetValueOrDefault(constValue, 1),
+                    alignmentBytes);
+            }
+        }
+
+        private static bool TryGetAddressedConst(
+            PhysicalBuffer buffer,
+            [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out Const? constValue)
+        {
+            if (buffer.Start is Call { Target: IR.Buffers.AddressOf } addressOf &&
+                addressOf[IR.Buffers.AddressOf.Input] is Const addressedConst)
+            {
+                constValue = addressedConst;
+                return true;
+            }
+
+            constValue = null;
+            return false;
+        }
+    }
+
+    private sealed class PhysicalBufferAlignmentRewriter : ExprRewriter
+    {
+        private readonly OperandAlignmentRequirements _requirements;
+
+        public PhysicalBufferAlignmentRewriter(OperandAlignmentRequirements requirements)
+            : base(visitOtherFunctions: false)
+        {
+            _requirements = requirements;
+        }
+
+        protected override BaseExpr RewriteLeafPhysicalBuffer(PhysicalBuffer expr)
+        {
+            var requiredAlignment = _requirements.GetRequiredAlignment(expr);
+            return requiredAlignment > expr.Alignment
+                ? expr.With(alignment: requiredAlignment)
+                : expr;
         }
     }
 }

@@ -380,7 +380,8 @@ public sealed class TargetAsynchronousTransferSpec : IEquatable<TargetAsynchrono
     public TargetAsynchronousTransferSpec(
         IEnumerable<int> supportedStageCounts,
         long commitCycles,
-        long waitCycles)
+        long waitCycles,
+        long maximumTransactionBytes)
     {
         SupportedStageCounts = supportedStageCounts?.Distinct().Order().ToImmutableArray()
             ?? throw new ArgumentNullException(nameof(supportedStageCounts));
@@ -399,8 +400,17 @@ public sealed class TargetAsynchronousTransferSpec : IEquatable<TargetAsynchrono
             throw new ArgumentOutOfRangeException(nameof(waitCycles), waitCycles, "Asynchronous transfer wait cost must not be negative.");
         }
 
+        if (maximumTransactionBytes <= 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(maximumTransactionBytes),
+                maximumTransactionBytes,
+                "Asynchronous transfer maximum transaction size must be positive.");
+        }
+
         CommitCycles = commitCycles;
         WaitCycles = waitCycles;
+        MaximumTransactionBytes = maximumTransactionBytes;
     }
 
     public ImmutableArray<int> SupportedStageCounts { get; }
@@ -409,13 +419,16 @@ public sealed class TargetAsynchronousTransferSpec : IEquatable<TargetAsynchrono
 
     public long WaitCycles { get; }
 
+    public long MaximumTransactionBytes { get; }
+
     public bool SupportsStageCount(int stageCount) => SupportedStageCounts.Contains(stageCount);
 
     public bool Equals(TargetAsynchronousTransferSpec? other)
         => other is not null
         && SupportedStageCounts.SequenceEqual(other.SupportedStageCounts)
         && CommitCycles == other.CommitCycles
-        && WaitCycles == other.WaitCycles;
+        && WaitCycles == other.WaitCycles
+        && MaximumTransactionBytes == other.MaximumTransactionBytes;
 
     public override bool Equals(object? obj) => obj is TargetAsynchronousTransferSpec other && Equals(other);
 
@@ -424,6 +437,7 @@ public sealed class TargetAsynchronousTransferSpec : IEquatable<TargetAsynchrono
         HashCode hash = default;
         hash.Add(CommitCycles);
         hash.Add(WaitCycles);
+        hash.Add(MaximumTransactionBytes);
         foreach (var stageCount in SupportedStageCounts)
         {
             hash.Add(stageCount);

@@ -299,6 +299,33 @@ public static class DistributedUtility
         return true;
     }
 
+    /// <summary>
+    /// Scales an axis policy when one destination element represents a rational
+    /// number of source-axis units.
+    /// </summary>
+    /// <remarks>
+    /// Broadcast is invariant under a unit change. Split granularities are
+    /// multiplied by <paramref name="numerator"/> and divided by
+    /// <paramref name="denominator"/>; the conversion fails when an explicit
+    /// split boundary cannot be represented exactly in the destination units.
+    /// Partial policies do not describe a physical shard boundary and therefore
+    /// cannot be converted by this helper.
+    /// </remarks>
+    public static bool TryScaleAxisPolicyUnits(
+        SBP policy,
+        long numerator,
+        long denominator,
+        [MaybeNullWhen(false)] out SBP result)
+    {
+        result = policy switch
+        {
+            SBPBroadCast => SBP.B,
+            SBPSplit split when TryScaleSplitUnits(split, numerator, denominator, out var scaled) => scaled,
+            _ => null,
+        };
+        return result is not null;
+    }
+
     public static IReadOnlyList<int> GetDivisors(DistributedType distributedType)
     {
         var rank = distributedType.TensorType.Shape.Rank;

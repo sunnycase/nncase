@@ -101,6 +101,68 @@ public partial class NTT
             rhsScale,
             addend ?? None.Default);
 
+    public static Expr PackedNVFP4MatMul(
+        Expr lhs,
+        Expr rhsPacked,
+        Expr rhsScale,
+        Expr lhsGlobalScale,
+        Expr rhsGlobalScale,
+        DataType outputDataType,
+        long groupSize,
+        int inputKVectorLaneCount,
+        int rhsKPackLaneCount,
+        int rhsKVectorLaneCount,
+        int outputNVectorLaneCount)
+        => new Call(
+            new PackedNVFP4MatMul(
+                outputDataType,
+                groupSize,
+                inputKVectorLaneCount,
+                rhsKPackLaneCount,
+                rhsKVectorLaneCount,
+                outputNVectorLaneCount),
+            lhs,
+            rhsPacked,
+            rhsScale,
+            lhsGlobalScale,
+            rhsGlobalScale);
+
+    public static Expr PackedNVFP4MatMulGlu(
+        Expr input,
+        Expr gateWeightPacked,
+        Expr upWeightPacked,
+        Expr gateWeightScale,
+        Expr upWeightScale,
+        Expr gateInputGlobalScale,
+        Expr upInputGlobalScale,
+        Expr gateWeightGlobalScale,
+        Expr upWeightGlobalScale,
+        IR.NN.GluType gluType,
+        DataType outputDataType,
+        long groupSize,
+        int inputKVectorLaneCount,
+        int rhsKPackLaneCount,
+        int rhsKVectorLaneCount,
+        int outputNVectorLaneCount)
+        => new Call(
+            new PackedNVFP4MatMulGlu(
+                gluType,
+                outputDataType,
+                groupSize,
+                inputKVectorLaneCount,
+                rhsKPackLaneCount,
+                rhsKVectorLaneCount,
+                outputNVectorLaneCount),
+            input,
+            gateWeightPacked,
+            upWeightPacked,
+            gateWeightScale,
+            upWeightScale,
+            gateInputGlobalScale,
+            upInputGlobalScale,
+            gateWeightGlobalScale,
+            upWeightGlobalScale);
+
     public static Expr PackedMatMulNormStats(
         Expr lhs,
         Expr rhs,

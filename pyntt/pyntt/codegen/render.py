@@ -950,6 +950,29 @@ def _pipeline_helper_descriptor_specs(
             _gated_delta_net_projection_host_descriptor_spec,
             _gated_delta_net_projection_host_descriptor_spec,
         )
+    elif template == "triton/kernels/nvfp4_matmul/mma_tma_smem_pipeline.py.jinja":
+        descriptor_names = (model.get("RhsPackedDescriptorName"),)
+        descriptor_specs = (
+            lambda current_model, backing: _nvfp4_n_major_host_descriptor_spec(
+                current_model,
+                backing,
+                pointer_key="RhsPacked",
+            ),
+        )
+    elif template == "triton/kernels/nvfp4_matmul_glu/mma_tma_smem_pipeline.py.jinja":
+        descriptor_names = tuple(
+            model.get(f"{prefix}WeightPackedDescriptorName")
+            for prefix in ("Gate", "Up")
+        )
+        descriptor_specs = tuple(
+            lambda current_model, backing, current_prefix=prefix:
+                _nvfp4_n_major_host_descriptor_spec(
+                    current_model,
+                    backing,
+                    pointer_key=f"{current_prefix}WeightPacked",
+                )
+            for prefix in ("Gate", "Up")
+        )
     else:
         return ()
 
@@ -1216,6 +1239,11 @@ def _n_major_k_packed_gemv_host_descriptor_spec(
         model, "triton.matmul", "mma_block_fp8_smem_pipeline"
     )
     logical_block_n = microkernel["parameters"]["block_n"]
+    transfer_block_k = _require_int(
+        microkernel["parameters"].get("transfer_block_k"),
+        "microkernel.transfer_block_k",
+        minimum=1,
+    )
     reduction_group = _require_int(
         model.get("WeightBlockK"), "WeightBlockK", minimum=1
     )
@@ -1237,17 +1265,21 @@ def _n_major_k_packed_gemv_host_descriptor_spec(
         )
 
     k_atom = _product_int(list(vector_lane_shape))
-    if logical_block_n <= 0 or reduction_group % k_atom != 0:
+    if (
+        logical_block_n <= 0
+        or transfer_block_k % k_atom != 0
+        or reduction_group % transfer_block_k != 0
+    ):
         raise ValueError(
             "PyNTT N-major K-packed GEMV descriptor tile is incompatible with "
             f"block_n={logical_block_n}, reduction_group={reduction_group}, "
-            f"k_atom={k_atom}."
+            f"transfer_block_k={transfer_block_k}, k_atom={k_atom}."
         )
-    k_outer_extent = reduction_group // k_atom
+    k_outer_extent = transfer_block_k // k_atom
 
     pointer = model["Rhs"]
     n_plan = _n_major_k_packed_gemv_descriptor_n_plan(pointer, logical_block_n)
-    descriptor_block_shape = tuple(n_plan["block_shape"]) + (reduction_group,)
+    descriptor_block_shape = tuple(n_plan["block_shape"]) + (transfer_block_k,)
     hierarchy = pointer.get("Hierarchy")
     pointer_global_shape = pointer.get("GlobalShape")
     if not isinstance(hierarchy, list) or not hierarchy:
@@ -1482,6 +1514,254 @@ def _tma_owner_backing_base_elements(
         )
         * scalar_lanes_per_logical_element
     )
+
+
+def _nvfp4_n_major_host_descriptor_spec(
+    model: dict[str, Any],
+    backing: dict[str, Any],
+    *,
+    pointer_key: str,
+) -> dict[str, Any]:
+    """Build scalar TMA views over target-packed N-major NVFP4 payloads."""
+
+    family = _require_string(
+        model.get("MicroKernel", {}).get("Family"),
+        "microkernel.Family",
+        nonempty=True,
+    )
+    if family == "triton.nvfp4_matmul":
+        context = _nvfp4_matmul_template_context(model)
+    elif family == "triton.nvfp4_matmul_glu":
+        context = _nvfp4_matmul_glu_template_context(model)
+    else:
+        raise ValueError(
+            f"PyNTT NVFP4 descriptor does not support family {family!r}."
+        )
+    pointer = model[pointer_key]
+    logical_shape = tuple(int(value) for value in backing["logical_shape"])
+    logical_strides = _normalize_singleton_strides(
+        logical_shape,
+        tuple(int(value) for value in backing["logical_strides"]),
+    )
+    vector_lane_shape = tuple(int(value) for value in backing["vector_lane_shape"])
+    expected_dtype = "uint8"
+    expected_vector_lane_shape = (2, 16)
+    k_atom = _product_int(list(expected_vector_lane_shape))
+    expected_local_k_outer = context["fixed_k"] // 2 // k_atom
+    if (
+        backing["scalar_dtype"] != expected_dtype
+        or vector_lane_shape != expected_vector_lane_shape
+        or len(logical_shape) != 2
+        or len(logical_strides) != 2
+        or logical_strides[1] != 1
+    ):
+        raise ValueError(
+            "PyNTT NVFP4 TMA requires a target-packed N-major backing with a "
+            "unit outer-K stride, got "
+            f"shape={logical_shape}, strides={logical_strides}, "
+            f"lanes={vector_lane_shape}, dtype={backing['scalar_dtype']!r}, "
+            f"expected_lanes={expected_vector_lane_shape}, "
+            f"expected_dtype={expected_dtype!r}."
+        )
+
+    hierarchy = pointer.get("Hierarchy")
+    pointer_global_shape = pointer.get("GlobalShape")
+    if not isinstance(hierarchy, list) or not hierarchy:
+        raise ValueError("PyNTT NVFP4 TMA descriptor requires a hierarchy.")
+    if not isinstance(pointer_global_shape, list) or len(pointer_global_shape) != 2:
+        raise ValueError("PyNTT NVFP4 TMA descriptor requires a rank-2 global pointer.")
+    fixed_pointer_shape = tuple(
+        _require_fixed_positive_dim(
+            extent, f"PyNTT NVFP4 TMA pointer global axis {axis}"
+        )
+        for axis, extent in enumerate(pointer_global_shape)
+    )
+    if fixed_pointer_shape != logical_shape:
+        raise ValueError(
+            "PyNTT NVFP4 TMA backing/pointer shapes differ: "
+            f"{logical_shape}/{fixed_pointer_shape}."
+        )
+
+    block_n = context["block_n"]
+    transfer_k = context["block_k"] // 2
+    if transfer_k % k_atom != 0:
+        raise ValueError(
+            "PyNTT NVFP4 TMA transfer K must be divisible by the packed K atom, "
+            f"got transfer_k={transfer_k}, k_atom={k_atom}."
+        )
+    transfer_k_outer = transfer_k // k_atom
+    n_plan = _n_major_k_packed_gemv_descriptor_n_plan(pointer, block_n)
+    k_payload_plan = _tma_packed_atom_axis_plan(
+        pointer,
+        1,
+        tile_extent=transfer_k_outer,
+        atom_extent=k_atom,
+        logical_axis_stride=logical_strides[1],
+        context=f"NVFP4 {pointer_key} TMA descriptor K",
+    )
+    k_plan = k_payload_plan["axis_plan"]
+    descriptor_block_shape = context["packed_tma_block_shape"]
+    pointer_block_shape = (
+        tuple(n_plan["block_shape"])
+        + tuple(k_payload_plan["block_shape"])
+    )
+    if pointer_block_shape != descriptor_block_shape:
+        raise ValueError(
+            "PyNTT NVFP4 descriptor and Shared tile ABIs differ: "
+            f"pointer={pointer_key}, descriptor={pointer_block_shape}, "
+            f"shared={descriptor_block_shape}."
+        )
+
+    item_size = TMA_DTYPE_ITEM_SIZES[expected_dtype]
+    owner_count = _product_int([int(value) for value in hierarchy])
+    owner_entries: list[list[dict[str, Any]]] = []
+    maximum_tiles_per_owner = 0
+    maximum_local_k_outer = 0
+    for linear_owner in range(owner_count):
+        owner = _unflatten_hierarchy_owner(linear_owner, hierarchy)
+        n_entry = _tma_descriptor_table_axis_entry(
+            pointer,
+            0,
+            owner,
+            tile_extent=block_n,
+            context="NVFP4 TMA descriptor N",
+        )
+        k_entry = _tma_descriptor_table_axis_entry(
+            pointer,
+            1,
+            owner,
+            tile_extent=transfer_k_outer,
+            context="NVFP4 TMA descriptor K",
+        )
+        if not n_entry["active"] or not k_entry["active"]:
+            owner_entries.append([])
+            continue
+        local_n_extent = _product_int(list(n_entry["descriptor_shape"]))
+        local_k_outer = _product_int(list(k_entry["descriptor_shape"]))
+        if local_k_outer > expected_local_k_outer:
+            raise ValueError(
+                "PyNTT NVFP4 TMA local K exceeds the selected local projection K: "
+                f"owner={owner}, descriptor={local_k_outer}, "
+                f"selected={expected_local_k_outer}."
+            )
+        maximum_local_k_outer = max(maximum_local_k_outer, local_k_outer)
+        descriptor_tile_count = (local_n_extent + block_n - 1) // block_n
+        maximum_tiles_per_owner = max(maximum_tiles_per_owner, descriptor_tile_count)
+        base_scalar_elements = _tma_owner_backing_base_elements(
+            pointer,
+            (n_entry, k_entry),
+            logical_strides,
+            scalar_lanes_per_logical_element=k_atom,
+            context="NVFP4 TMA",
+        )
+        entries_for_owner = []
+        for tile_index in range(descriptor_tile_count):
+            local_n_offset = tile_index * block_n
+            if n_entry["is_block_cyclic"] and n_entry["block_size"] != 1:
+                block_size = int(n_entry["block_size"])
+                raw_coordinates = (
+                    local_n_offset // block_size,
+                    local_n_offset % block_size,
+                )
+            else:
+                raw_coordinates = (local_n_offset,)
+            if len(raw_coordinates) != len(n_entry["stride_multipliers"]):
+                raise ValueError(
+                    "PyNTT NVFP4 TMA N coordinate/stride ranks differ: "
+                    f"{raw_coordinates}/{n_entry['stride_multipliers']}."
+                )
+            physical_n_offset = sum(
+                coordinate * int(multiplier)
+                for coordinate, multiplier in zip(
+                    raw_coordinates, n_entry["stride_multipliers"]
+                )
+            )
+            tile_n_extent = min(block_n, local_n_extent - local_n_offset)
+            if n_entry["is_block_cyclic"] and n_entry["block_size"] != 1:
+                block_size = int(n_entry["block_size"])
+                if block_n <= block_size:
+                    raw_descriptor_n_shape = (1, tile_n_extent)
+                elif tile_n_extent % block_size == 0:
+                    raw_descriptor_n_shape = (
+                        tile_n_extent // block_size,
+                        block_size,
+                    )
+                else:
+                    raise ValueError(
+                        "PyNTT NVFP4 TMA cannot encode a partial block-cyclic "
+                        f"N block: extent={tile_n_extent}, block_size={block_size}."
+                    )
+            else:
+                raw_descriptor_n_shape = (tile_n_extent,)
+            descriptor_n_shape = tuple(
+                raw_descriptor_n_shape[dimension]
+                for dimension in n_plan["retained_dimensions"]
+            )
+            descriptor_row_stride = logical_strides[0] * k_atom
+            descriptor_n_strides = tuple(
+                int(n_entry["stride_multipliers"][dimension])
+                * descriptor_row_stride
+                for dimension in n_plan["retained_dimensions"]
+            )
+            descriptor_k_shape, descriptor_k_strides = (
+                _tma_packed_atom_entry(k_entry, k_payload_plan)
+            )
+            descriptor_shape = descriptor_n_shape + descriptor_k_shape
+            entries_for_owner.append(
+                {
+                    "offset_bytes": int(backing["offset_bytes"])
+                    + linear_owner * int(backing["owner_stride_bytes"])
+                    + (
+                        base_scalar_elements
+                        + physical_n_offset * logical_strides[0] * k_atom
+                    )
+                    * item_size,
+                    "shape": descriptor_shape,
+                    "strides": descriptor_n_strides
+                    + descriptor_k_strides,
+                    "source_shape_axes": tuple(() for _ in descriptor_shape),
+                }
+            )
+        owner_entries.append(entries_for_owner)
+
+    if maximum_local_k_outer != expected_local_k_outer:
+        raise ValueError(
+            "PyNTT NVFP4 descriptor/local projection K extents differ: "
+            f"{maximum_local_k_outer}/{expected_local_k_outer}."
+        )
+    expected_tiles = context["num_n_tiles"]
+    if maximum_tiles_per_owner != expected_tiles:
+        raise ValueError(
+            "PyNTT NVFP4 descriptor/output tile counts differ: "
+            f"{maximum_tiles_per_owner}/{expected_tiles}."
+        )
+    first_entry = next(
+        entry for entries_for_owner in owner_entries for entry in entries_for_owner
+    )
+    padding_entry = {
+        **first_entry,
+        "shape": tuple(1 for _ in n_plan["block_shape"])
+        + first_entry["shape"][len(n_plan["block_shape"]):],
+    }
+    entries = tuple(
+        entry
+        for entries_for_owner in owner_entries
+        for entry in (
+            entries_for_owner
+            + [padding_entry] * (expected_tiles - len(entries_for_owner))
+        )
+    )
+    return {
+        "kind": "table",
+        "name": backing["name"],
+        "source": backing["source"],
+        "dtype": expected_dtype,
+        "block_shape": descriptor_block_shape,
+        "padding": "zero",
+        "swizzle_mode": _nv_tma_swizzle_mode(descriptor_block_shape, expected_dtype),
+        "entry_size_bytes": TENSOR_MAP_ENTRY_BYTES,
+        "entries": entries,
+    }
 
 
 def _packed_matmul_sampling_partial_host_descriptor_spec(
@@ -2270,6 +2550,8 @@ def _make_env() -> Environment:
             _packed_block_fp8_matmul_glu_gemv_pipeline_template_context
         ),
         matmul_context=_matmul_template_context,
+        nvfp4_matmul_context=_nvfp4_matmul_template_context,
+        nvfp4_matmul_glu_context=_nvfp4_matmul_glu_template_context,
         multiply_expr=_multiply_expr,
         norm_apply_context=_norm_apply_template_context,
         norm_stats_context=_norm_stats_template_context,
@@ -3674,6 +3956,67 @@ def _tma_canonical_axis_plan(
         ),
         "retained_dimensions": retained_dimensions,
     }
+
+
+def _tma_packed_atom_axis_plan(
+    pointer: Any,
+    axis: int,
+    *,
+    tile_extent: int,
+    atom_extent: int,
+    logical_axis_stride: int,
+    context: str,
+) -> dict[str, Any]:
+    """Preserve a target-packed scalar atom as an explicit TMA layout axis."""
+
+    if atom_extent <= 0 or logical_axis_stride <= 0:
+        raise ValueError(
+            f"PyNTT {context} requires positive atom extent and logical stride."
+        )
+    axis_plan = _tma_canonical_axis_plan(
+        pointer,
+        axis,
+        tile_extent=tile_extent,
+        context=context,
+    )
+    axis_block_shape = tuple(axis_plan["block_shape"])
+    return {
+        "axis_plan": axis_plan,
+        "atom_extent": atom_extent,
+        "logical_axis_stride": logical_axis_stride,
+        "block_shape": axis_block_shape + (atom_extent,),
+    }
+
+
+def _tma_packed_atom_coordinates(
+    local_coordinate: str,
+    plan: dict[str, Any],
+) -> tuple[str, ...]:
+    coordinates = _tma_shared_axis_coordinates(
+        local_coordinate, plan["axis_plan"]
+    )
+    return coordinates + ("0",)
+
+
+def _tma_packed_atom_entry(
+    entry: dict[str, Any],
+    plan: dict[str, Any],
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    axis_plan = plan["axis_plan"]
+    retained_dimensions = tuple(axis_plan["retained_dimensions"])
+    atom_extent = int(plan["atom_extent"])
+    logical_axis_stride = int(plan["logical_axis_stride"])
+    shape = tuple(
+        int(entry["descriptor_shape"][dimension])
+        for dimension in retained_dimensions
+    )
+    strides = tuple(
+        int(entry["stride_multipliers"][dimension])
+        * logical_axis_stride
+        * atom_extent
+        for dimension in retained_dimensions
+    )
+    return shape + (atom_extent,), strides + (1,)
 
 
 def _nv_tma_swizzle_mode(block_shape: tuple[int, ...], dtype: str) -> int:
@@ -5167,6 +5510,397 @@ def _microkernel_context(
         "shared_workspace_offsets": offsets,
         "shared_workspace_shapes": shapes,
     }
+
+
+def _nvfp4_projection_template_context(
+    model: dict[str, Any],
+    *,
+    expected_family: str,
+    n_tiles_per_activation_batch: int,
+    input_shape_key: str,
+    input_strides_key: str,
+    packed_weight_shape_key: str,
+    weight_scale_shape_key: str,
+    packed_weight_pointer_keys: tuple[str, ...],
+) -> dict[str, Any]:
+    """Validate the selected decode NVFP4 projection's physical storage ABI."""
+
+    if n_tiles_per_activation_batch < 1:
+        raise ValueError(
+            "PyNTT NVFP4 activation batch must contain at least one N tile."
+        )
+
+    microkernel = _microkernel_context(
+        model,
+        expected_family,
+        "mma_tma_smem_pipeline",
+        required_workspace_names=("packed_weight_stage",),
+    )
+    group_size = _require_int(model["GroupSize"], "NVFP4 GroupSize", minimum=1)
+    parameter_group_size = microkernel["parameters"].get("group_size")
+    if group_size != 16 or parameter_group_size != group_size:
+        raise ValueError(
+            "PyNTT NVFP4 projection requires group size 16 in both the op and "
+            f"selected microkernel, got op={group_size}, microkernel={parameter_group_size}."
+        )
+
+    input_shape = _require_list(model[input_shape_key], input_shape_key)
+    weight_shape = _require_list(
+        model[packed_weight_shape_key], packed_weight_shape_key
+    )
+    scale_shape = _require_list(model[weight_scale_shape_key], weight_scale_shape_key)
+    output_shape = _require_list(model["OutputShape"], "OutputShape")
+    for name, shape in (
+        (input_shape_key, input_shape),
+        (packed_weight_shape_key, weight_shape),
+        (weight_scale_shape_key, scale_shape),
+        ("OutputShape", output_shape),
+    ):
+        if len(shape) != 2:
+            raise ValueError(f"PyNTT NVFP4 {name} must have rank 2, got {len(shape)}.")
+
+    input_lanes = tuple(
+        int(value) for value in _require_list(model["LhsVectorLanes"] if input_shape_key == "LhsShape" else model["InputVectorLanes"], "NVFP4 input vector lanes")
+    )
+    weight_lanes = tuple(
+        int(value) for value in _require_list(
+            model["RhsPackedVectorLanes"] if packed_weight_shape_key == "RhsPackedShape" else model["WeightPackedVectorLanes"],
+            "NVFP4 packed-weight vector lanes",
+        )
+    )
+    output_lanes = tuple(
+        int(value) for value in _require_list(model["OutputVectorLanes"], "NVFP4 output vector lanes")
+    )
+    if input_lanes != (8,) or weight_lanes != (2, 16) or output_lanes != (8,):
+        raise ValueError(
+            "PyNTT NVFP4 requires input/weight/output vector lanes "
+            f"(8)/(2,16)/(8), got {input_lanes}/{weight_lanes}/{output_lanes}."
+        )
+
+    m = _require_fixed_positive_dim(input_shape[0], f"{input_shape_key}[0]")
+    input_k_outer = _require_fixed_positive_dim(
+        input_shape[1], f"{input_shape_key}[1]"
+    )
+    k = input_k_outer * _product_int(list(input_lanes))
+    logical_n = _multiply_dim(output_shape[1], _product_int(list(output_lanes)))
+    n_min = _min_value(logical_n)
+    n_max = _max_value(logical_n)
+    if n_min is None or n_max is None or n_min <= 0 or n_max < n_min:
+        raise ValueError(
+            "PyNTT NVFP4 output N must have a bounded positive local domain, "
+            f"got {_dim(output_shape[1])}."
+        )
+    output_m = _require_fixed_positive_dim(output_shape[0], "OutputShape[0]")
+    packed_k = _require_fixed_positive_dim(
+        weight_shape[1], f"{packed_weight_shape_key}[1]"
+    )
+    scale_k = _require_fixed_positive_dim(
+        scale_shape[1], f"{weight_scale_shape_key}[1]"
+    )
+    if m != 1 or output_m != 1:
+        raise ValueError(
+            f"PyNTT NVFP4 decode projection requires local M=1, got input={m}, output={output_m}."
+        )
+    if k % group_size != 0:
+        raise ValueError(f"PyNTT NVFP4 local K must be divisible by {group_size}, got {k}.")
+    if (
+        not _dimensions_equivalent(weight_shape[0], logical_n)
+        or not _dimensions_equivalent(scale_shape[0], logical_n)
+        or packed_k * _product_int(list(weight_lanes)) * 2 != k
+        or scale_k * group_size != k
+    ):
+        raise ValueError(
+            "PyNTT NVFP4 physical storage must be input=bf16<8>[1,K/8], "
+            "packed_weight=u8<2,16>[N,K/64], "
+            f"weight_scale=[N,K/{group_size}], output=bf16<8>[1,N/8]; got "
+            f"input={[m, input_k_outer]}, weight=[{_dim(weight_shape[0])}, {packed_k}], "
+            f"scale=[{_dim(scale_shape[0])}, {scale_k}], "
+            f"output=[{output_m}, {_dim(output_shape[1])}]."
+        )
+
+    for key in (input_strides_key, "OutputStrides"):
+        if len(_require_list(model[key], key)) != 2:
+            raise ValueError(f"PyNTT NVFP4 {key} must have rank 2.")
+
+    block_n = microkernel["parameters"]["block_n"]
+    block_k = microkernel["parameters"]["block_k"]
+    if not _is_positive_power_of_two(block_n) or not _is_positive_power_of_two(block_k):
+        raise ValueError(
+            f"PyNTT NVFP4 block sizes must be powers of two, got N={block_n}, K={block_k}."
+        )
+    if block_k % group_size != 0:
+        raise ValueError(
+            f"PyNTT NVFP4 block K must be divisible by group size {group_size}, got {block_k}."
+        )
+    num_stages = microkernel["parameters"]["num_stages"]
+    if num_stages < 2:
+        raise ValueError(
+            f"PyNTT NVFP4 TMA pipeline requires at least two stages, got {num_stages}."
+        )
+    expected_workspace_shapes = {
+        "packed_weight_stage": (num_stages, block_n, block_k // 2),
+    }
+    if microkernel["shared_workspace_shapes"] != expected_workspace_shapes:
+        raise ValueError(
+            "PyNTT NVFP4 Shared workspace shapes disagree with the selected "
+            f"pipeline: expected={expected_workspace_shapes}, "
+            f"actual={microkernel['shared_workspace_shapes']}."
+        )
+
+    packed_k_atom = _product_int(list(weight_lanes))
+    packed_block_k = block_k // 2
+    if packed_block_k % packed_k_atom != 0:
+        raise ValueError(
+            "PyNTT NVFP4 packed block K must contain complete vector atoms, "
+            f"got packed_block_k={packed_block_k}, atom={packed_k_atom}."
+        )
+    packed_block_k_outer = packed_block_k // packed_k_atom
+    packed_plans = []
+    for pointer_key in packed_weight_pointer_keys:
+        pointer = model.get(pointer_key)
+        if not isinstance(pointer, dict):
+            raise ValueError(
+                f"PyNTT NVFP4 {pointer_key} pointer metadata must be an object."
+            )
+        n_plan = _n_major_k_packed_gemv_descriptor_n_plan(pointer, block_n)
+        k_payload_plan = _tma_packed_atom_axis_plan(
+            pointer,
+            1,
+            tile_extent=packed_block_k_outer,
+            atom_extent=packed_k_atom,
+            logical_axis_stride=1,
+            context=f"NVFP4 {pointer_key} TMA descriptor K",
+        )
+        k_plan = k_payload_plan["axis_plan"]
+        tma_block_shape = (
+            tuple(n_plan["block_shape"])
+            + tuple(k_payload_plan["block_shape"])
+        )
+        if len(tma_block_shape) > 5:
+            raise ValueError(
+                "PyNTT NVFP4 TMA descriptor exceeds the hardware rank-5 limit: "
+                f"pointer={pointer_key}, block_shape={tma_block_shape}."
+            )
+        if _product_int(list(tma_block_shape)) != block_n * packed_block_k:
+            raise ValueError(
+                "PyNTT NVFP4 TMA block does not cover the selected Shared tile: "
+                f"pointer={pointer_key}, block_shape={tma_block_shape}, "
+                f"expected_elements={block_n * packed_block_k}."
+            )
+        tma_offsets = (
+            tuple("0" for _ in n_plan["block_shape"])
+            + _tma_packed_atom_coordinates(
+                f"k_tile * {packed_block_k_outer}", k_payload_plan
+            )
+        )
+        packed_plans.append(
+            (
+                pointer_key,
+                n_plan,
+                k_plan,
+                k_payload_plan,
+                tma_block_shape,
+                tma_offsets,
+            )
+        )
+
+    if not packed_plans:
+        raise ValueError("PyNTT NVFP4 projection requires a packed-weight pointer.")
+    (
+        _,
+        packed_n_plan,
+        packed_k_plan,
+        packed_k_payload_plan,
+        packed_tma_block_shape,
+        packed_tma_offsets,
+    ) = packed_plans[0]
+    for (
+        pointer_key,
+        n_plan,
+        k_plan,
+        k_payload_plan,
+        tma_block_shape,
+        tma_offsets,
+    ) in packed_plans[1:]:
+        if (
+            tuple(n_plan["block_shape"]) != tuple(packed_n_plan["block_shape"])
+            or tuple(k_plan["block_shape"]) != tuple(packed_k_plan["block_shape"])
+            or tuple(k_payload_plan["block_shape"])
+            != tuple(packed_k_payload_plan["block_shape"])
+            or tma_block_shape != packed_tma_block_shape
+            or tma_offsets != packed_tma_offsets
+        ):
+            raise ValueError(
+                "PyNTT fused NVFP4 projections require one shared TMA tile ABI, "
+                f"but {pointer_key} uses {tma_block_shape} and the first "
+                f"projection uses {packed_tma_block_shape}."
+            )
+
+    num_n_tiles = (n_max + block_n - 1) // block_n
+    num_k_tiles = (k + block_k - 1) // block_k
+    if num_n_tiles * num_k_tiles > 2**31 - 1:
+        raise ValueError("PyNTT NVFP4 MMA pipe sequence exceeds signed int32.")
+
+    return {
+        "microkernel": microkernel,
+        "m": input_shape[0],
+        "n": logical_n,
+        "k": _multiply_dim(input_shape[1], _product_int(list(input_lanes))),
+        "max_n": n_max,
+        "fixed_k": k,
+        "block_n": block_n,
+        "block_k": block_k,
+        "num_stages": num_stages,
+        "num_n_tiles": num_n_tiles,
+        "num_k_tiles": num_k_tiles,
+        "n_tiles_per_activation_batch": n_tiles_per_activation_batch,
+        "packed_block_k": packed_block_k,
+        "packed_block_k_outer": packed_block_k_outer,
+        "packed_k_atom": packed_k_atom,
+        "packed_n_plan": packed_n_plan,
+        "packed_k_plan": packed_k_plan,
+        "packed_k_payload_plan": packed_k_payload_plan,
+        "packed_tma_block_shape": packed_tma_block_shape,
+        "packed_tma_offsets": packed_tma_offsets,
+        "scale_block_k": block_k // group_size,
+        "group_size": group_size,
+        "input_access": _tensor_access(
+            ("0", f"offs_k // {input_lanes[0]}"),
+            model[input_strides_key],
+            (f"offs_k % {input_lanes[0]}",),
+            input_lanes,
+            coordinate_shape=_coordinate_shape((block_k,)),
+        ),
+        "output_access": _tensor_access(
+            ("0", f"offs_n // {output_lanes[0]}"),
+            model["OutputStrides"],
+            (f"offs_n % {output_lanes[0]}",),
+            output_lanes,
+            coordinate_shape=_coordinate_shape((block_n,)),
+        ),
+    }
+
+
+def _nvfp4_matmul_template_context(model: dict[str, Any]) -> dict[str, Any]:
+    context = _nvfp4_projection_template_context(
+        model,
+        expected_family="triton.nvfp4_matmul",
+        n_tiles_per_activation_batch=2,
+        input_shape_key="LhsShape",
+        input_strides_key="LhsStrides",
+        packed_weight_shape_key="RhsPackedShape",
+        weight_scale_shape_key="RhsScaleShape",
+        packed_weight_pointer_keys=("RhsPacked",),
+    )
+    context.update(
+        packed_descriptor_name=_require_string(
+            model.get("RhsPackedDescriptorName"),
+            "RhsPackedDescriptorName",
+            nonempty=True,
+        ),
+        packed_weight_access=_tensor_access(
+            (
+                "offs_n[:, None]",
+                "(k_start // 2 + packed_k[None, :]) // 32",
+            ),
+            model["RhsPackedStrides"],
+            (
+                "((k_start // 2 + packed_k[None, :]) % 32) // 16",
+                "(k_start // 2 + packed_k[None, :]) % 16",
+            ),
+            (2, 16),
+            coordinate_shape=_coordinate_shape(
+                (context["block_n"], context["packed_block_k"])
+            ),
+        ),
+        weight_scale_access=_tensor_access(
+            (
+                "offs_n[:, None]",
+                f"k_start // {context['group_size']} + scale_k[None, :]",
+            ),
+            model["RhsScaleStrides"],
+            coordinate_shape=_coordinate_shape(
+                (context["block_n"], context["scale_block_k"])
+            ),
+        ),
+    )
+    return context
+
+
+def _nvfp4_matmul_glu_template_context(model: dict[str, Any]) -> dict[str, Any]:
+    context = _nvfp4_projection_template_context(
+        model,
+        expected_family="triton.nvfp4_matmul_glu",
+        n_tiles_per_activation_batch=1,
+        input_shape_key="InputShape",
+        input_strides_key="InputStrides",
+        packed_weight_shape_key="WeightPackedShape",
+        weight_scale_shape_key="WeightScaleShape",
+        packed_weight_pointer_keys=("GateWeightPacked", "UpWeightPacked"),
+    )
+    if model["GluType"] != "swiglu":
+        raise ValueError(
+            f"PyNTT NVFP4MatMulGlu supports SwiGLU, got {model['GluType']!r}."
+        )
+    for key in (
+        "GateWeightPackedStrides",
+        "UpWeightPackedStrides",
+        "GateWeightScaleStrides",
+        "UpWeightScaleStrides",
+    ):
+        if len(_require_list(model[key], key)) != 2:
+            raise ValueError(f"PyNTT NVFP4MatMulGlu {key} must have rank 2.")
+    context.update(
+        projections=tuple(
+            {
+                "prefix": prefix,
+                "lower": prefix.lower(),
+                "sequence_offset": index,
+                "packed_descriptor_name": _require_string(
+                    model.get(f"{prefix}WeightPackedDescriptorName"),
+                    f"{prefix}WeightPackedDescriptorName",
+                    nonempty=True,
+                ),
+                "packed_weight_access": _tensor_access(
+                    (
+                        "offs_n[:, None]",
+                        "(k_start // 2 + packed_k[None, :]) // 32",
+                    ),
+                    model[f"{prefix}WeightPackedStrides"],
+                    (
+                        "((k_start // 2 + packed_k[None, :]) % 32) // 16",
+                        "(k_start // 2 + packed_k[None, :]) % 16",
+                    ),
+                    (2, 16),
+                    coordinate_shape=_coordinate_shape(
+                        (context["block_n"], context["packed_block_k"])
+                    ),
+                ),
+                "weight_scale_access": _tensor_access(
+                    (
+                        "offs_n[:, None]",
+                        f"k_start // {context['group_size']} + scale_k[None, :]",
+                    ),
+                    model[f"{prefix}WeightScaleStrides"],
+                    coordinate_shape=_coordinate_shape(
+                        (context["block_n"], context["scale_block_k"])
+                    ),
+                ),
+            }
+            for index, prefix in enumerate(("Gate", "Up"))
+        )
+    )
+    context["projection_count"] = len(context["projections"])
+    if (
+        context["num_n_tiles"]
+        * context["num_k_tiles"]
+        * context["projection_count"]
+        > 2**31 - 1
+    ):
+        raise ValueError(
+            "PyNTT NVFP4MatMulGlu MMA pipe sequence exceeds signed int32."
+        )
+    return context
 
 
 def _qkv_parallel_linear_template_context(
@@ -7209,21 +7943,28 @@ def _packed_block_fp8_mma_gemv_pipeline_template_context(
     block_n = microkernel["parameters"]["block_n"]
     block_k = microkernel["parameters"]["block_k"]
     num_stages = microkernel["parameters"]["num_stages"]
+    transfer_block_k = microkernel["parameters"].get("transfer_block_k")
+    if not isinstance(transfer_block_k, int) or transfer_block_k <= 0:
+        raise ValueError(
+            "PyNTT block-FP8 MMA GEMV requires a positive selected "
+            f"transfer_block_k, got {transfer_block_k!r}."
+        )
     weight_block_n = _require_int(
         model.get("WeightBlockN"), "WeightBlockN", minimum=1
     )
     reduction_group = _require_int(
         model.get("WeightBlockK"), "WeightBlockK", minimum=1
     )
-    if weight_block_n != 128 or reduction_group != 128:
-        raise ValueError(
-            "PyNTT block-FP8 MMA GEMV currently implements the official "
-            f"128x128 scale ABI, got {weight_block_n}x{reduction_group}."
-        )
-    if block_n % 16 != 0 or block_k % reduction_group != 0:
+    if (
+        block_n % 16 != 0
+        or block_k % reduction_group != 0
+        or reduction_group % transfer_block_k != 0
+    ):
         raise ValueError(
             "PyNTT block-FP8 MMA GEMV requires block_n divisible by 16 and "
-            f"block_k divisible by {reduction_group}, got {block_n}/{block_k}."
+            "a nested block_k/scale-group/transfer-K hierarchy, got "
+            f"block_n={block_n}, block_k={block_k}, "
+            f"scale_group_k={reduction_group}, transfer_k={transfer_block_k}."
         )
     _validate_packed_gemv_pipeline_resource_contract(
         algorithm="block-FP8 MMA GEMV pipeline",
@@ -7233,11 +7974,13 @@ def _packed_block_fp8_mma_gemv_pipeline_template_context(
         maximum_block_n=128,
     )
     reduction_groups_per_stage = block_k // reduction_group
+    transfer_chunks_per_group = reduction_group // transfer_block_k
     expected_workspace_shape = (
         num_stages,
         reduction_groups_per_stage,
+        transfer_chunks_per_group,
         block_n,
-        reduction_group,
+        transfer_block_k,
     )
     if microkernel["shared_workspace_shapes"]["rhs_stage"] != expected_workspace_shape:
         raise ValueError(
@@ -7300,27 +8043,34 @@ def _packed_block_fp8_mma_gemv_pipeline_template_context(
     k_atom = int(model["RhsKPackLaneCount"]) * int(
         model["RhsKVectorLaneCount"]
     )
-    group_outer = reduction_group // k_atom
-    group_transfers = tuple(
-        _tma_local_axis_transfer(
-            model["Rhs"],
-            1,
-            rhs_global_offsets[1],
-            local_offset=0,
-            tile_index=(
-                f"k_tile * {reduction_groups_per_stage} + {group}"
-            ),
-            tile_stride=group_outer,
-            tile_extent=group_outer,
-            context=f"N-major K-packed GEMV RHS K group {group}",
+    transfer_outer = transfer_block_k // k_atom
+    group_chunk_transfers = tuple(
+        tuple(
+            _tma_local_axis_transfer(
+                model["Rhs"],
+                1,
+                rhs_global_offsets[1],
+                local_offset=chunk * transfer_outer,
+                tile_index=(
+                    f"k_tile * {reduction_groups_per_stage} + {group}"
+                ),
+                tile_stride=reduction_group // k_atom,
+                tile_extent=transfer_outer,
+                context=(
+                    "N-major K-packed GEMV RHS "
+                    f"K group {group} transfer chunk {chunk}"
+                ),
+            )
+            for chunk in range(transfer_chunks_per_group)
         )
         for group in range(reduction_groups_per_stage)
     )
     if any(
         transfer["is_block_cyclic"]
-        or tuple(transfer["block_shape"]) != (group_outer,)
+        or tuple(transfer["block_shape"]) != (transfer_outer,)
         or len(transfer["coordinates"]) != 1
-        for transfer in group_transfers
+        for group in group_chunk_transfers
+        for transfer in group
     ):
         raise ValueError(
             "PyNTT block-FP8 MMA GEMV requires a contiguous packed K axis."
@@ -7330,7 +8080,7 @@ def _packed_block_fp8_mma_gemv_pipeline_template_context(
     )
     rhs_descriptor_chunks_per_tile = 1
     tma_block_shape = tuple(n_descriptor_plan["block_shape"]) + (
-        reduction_group,
+        transfer_block_k,
     )
     rhs_scalar_bytes = TMA_DTYPE_ITEM_SIZES.get(model["RhsDType"])
     if rhs_scalar_bytes is None:
@@ -7339,12 +8089,15 @@ def _packed_block_fp8_mma_gemv_pipeline_template_context(
             f"dtype {model['RhsDType']!r}."
         )
     rhs_descriptor_offsets = tuple(
-        tuple("0" for _ in n_descriptor_plan["block_shape"])
-        + (
-            f"(({transfer['coordinates'][0]}) * {k_atom}) + "
-            f"({descriptor_origin_elements})",
+        tuple(
+            tuple("0" for _ in n_descriptor_plan["block_shape"])
+            + (
+                f"(({transfer['coordinates'][0]}) * {k_atom}) + "
+                f"({descriptor_origin_elements})",
+            )
+            for transfer in group
         )
-        for transfer in group_transfers
+        for group in group_chunk_transfers
     )
 
     num_k_tiles = k // block_k
@@ -7377,6 +8130,8 @@ def _packed_block_fp8_mma_gemv_pipeline_template_context(
         runtime_num_n_tiles=f"tl.cdiv(active_n, {block_n})",
         reduction_group=reduction_group,
         reduction_groups_per_stage=reduction_groups_per_stage,
+        transfer_block_k=transfer_block_k,
+        transfer_chunks_per_group=transfer_chunks_per_group,
         weight_block_n=weight_block_n,
         weight_block_k=reduction_group,
         rhs_descriptor_name=descriptor_name,
@@ -7387,7 +8142,10 @@ def _packed_block_fp8_mma_gemv_pipeline_template_context(
         rhs_descriptor_chunks_per_tile=rhs_descriptor_chunks_per_tile,
         rhs_descriptor_offsets=rhs_descriptor_offsets,
         rhs_scalar_bytes=rhs_scalar_bytes,
-        group_stage_bytes=num_stages * block_n * reduction_group,
+        transfer_stage_bytes=(
+            num_stages * block_n * transfer_block_k * rhs_scalar_bytes
+        ),
+        tma_n_elements=prod(tma_block_shape[:-1]),
         pipeline_lhs_access=_matmul_lhs_access(
             model,
             output_batch_rank=0,

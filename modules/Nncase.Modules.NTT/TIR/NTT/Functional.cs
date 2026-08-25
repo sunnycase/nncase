@@ -179,6 +179,25 @@ public partial class NTT
             addend ?? None.Default);
     }
 
+    public static Call NVFP4MatMul(
+        Expr lhs,
+        Expr rhsPacked,
+        Expr rhsScale,
+        Expr lhsGlobalScale,
+        Expr rhsGlobalScale,
+        Expr output,
+        long groupSize)
+    {
+        return KernelCall(
+            new Nncase.TIR.NTT.NVFP4MatMul(groupSize),
+            lhs,
+            rhsPacked,
+            rhsScale,
+            lhsGlobalScale,
+            rhsGlobalScale,
+            output);
+    }
+
     public static Call PackedBlockScaledMatMulNormStats(
         Expr lhs,
         Expr rhs,
@@ -413,6 +432,34 @@ public partial class NTT
             upInputScale,
             gateWeightScale,
             upWeightScale,
+            output);
+    }
+
+    public static Call NVFP4MatMulGlu(
+        Expr input,
+        Expr gateWeightPacked,
+        Expr upWeightPacked,
+        Expr gateWeightScale,
+        Expr upWeightScale,
+        Expr gateInputGlobalScale,
+        Expr upInputGlobalScale,
+        Expr gateWeightGlobalScale,
+        Expr upWeightGlobalScale,
+        Expr output,
+        IR.NN.GluType gluType,
+        long groupSize)
+    {
+        return KernelCall(
+            new NVFP4MatMulGlu(gluType, groupSize),
+            input,
+            gateWeightPacked,
+            upWeightPacked,
+            gateWeightScale,
+            upWeightScale,
+            gateInputGlobalScale,
+            upInputGlobalScale,
+            gateWeightGlobalScale,
+            upWeightGlobalScale,
             output);
     }
 

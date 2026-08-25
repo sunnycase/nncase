@@ -141,6 +141,21 @@ public sealed class SchedFunctionResult
     public ulong DataAlign { get; set; } = 8;
 
     /// <summary>
+    /// Gets or sets the readonly data section alignment.
+    /// </summary>
+    public ulong RDataAlign { get; set; } = 8;
+
+    /// <summary>
+    /// Gets or sets the chip-local readonly data section alignment.
+    /// </summary>
+    public ulong ChipLocalRDataAlign { get; set; } = 8;
+
+    /// <summary>
+    /// Gets or sets the block-local readonly data section alignment.
+    /// </summary>
+    public ulong BlockLocalRDataAlign { get; set; } = 8;
+
+    /// <summary>
     /// Gets or sets the target block shared-memory pool alignment.
     /// </summary>
     public ulong SharedDataAlign { get; set; } = 8;
@@ -184,6 +199,9 @@ public sealed class SchedFunctionResult
                 EqualityComparer<ulong>.Default.Equals(BlockLocalDataPoolSize, result.BlockLocalDataPoolSize) &&
                 EqualityComparer<ulong>.Default.Equals(SharedDataPoolSize, result.SharedDataPoolSize) &&
                 EqualityComparer<ulong>.Default.Equals(DataAlign, result.DataAlign) &&
+                EqualityComparer<ulong>.Default.Equals(RDataAlign, result.RDataAlign) &&
+                EqualityComparer<ulong>.Default.Equals(ChipLocalRDataAlign, result.ChipLocalRDataAlign) &&
+                EqualityComparer<ulong>.Default.Equals(BlockLocalRDataAlign, result.BlockLocalRDataAlign) &&
                 EqualityComparer<ulong>.Default.Equals(SharedDataAlign, result.SharedDataAlign);
     }
 

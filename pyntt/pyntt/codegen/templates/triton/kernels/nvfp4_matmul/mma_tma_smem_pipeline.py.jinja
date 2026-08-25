@@ -1,0 +1,216 @@
+{% macro pipeline_setup(stage) -%}
+{% set stage_model = stage["Model"] %}
+{% set stage_ctx = nvfp4_matmul_context(stage_model) %}
+{% set packed_shape = [stage_ctx["num_stages"]] + (stage_ctx["packed_tma_block_shape"] | list) %}
+{{ stage["StageName"] }}__packed_weight_stages = tle.gpu.alloc(
+    [{{ packed_shape | join(", ") }}],
+    dtype=tl.uint8,
+    layout=tle.gpu.nv_tma_shared_layout(
+        [{{ packed_shape | join(", ") }}],
+        [{{ range((packed_shape | length) - 1, -1, -1) | join(", ") }}],
+        tl.uint8,
+        [{% for _ in packed_shape %}1{{ ", " if not loop.last }}{% endfor %}],
+        [{% for _ in packed_shape %}1{{ ", " if not loop.last }}{% endfor %}],
+        [{{ range((packed_shape | length) - 1, -1, -1) | join(", ") }}],
+        False,
+        True,
+    ),
+    scope=tle.gpu.smem,
+    alias=pyntt_shared_arena,
+    alias_offset_bytes={{ stage["SharedWorkspaceOffsets"]["packed_weight_stage"] }},
+)
+{{ stage["PipeName"] }} = tle.pipe(
+    capacity={{ stage_ctx["num_stages"] }},
+    scope="cta",
+    name="{{ stage["StageName"] }}_weight",
+    packed_weight={{ stage["StageName"] }}__packed_weight_stages,
+)
+{%- endmacro %}
+{% if model is defined %}
+{% import "triton/kernels/_common.py.jinja" as common with context %}
+{% set ctx = nvfp4_matmul_context(model) %}
+# generated from PyNTT algorithm triton.nvfp4_matmul/mma_tma_smem_pipeline
+# {{ model["Comment"] }}; lhs_shape={{ shape_tuple(model["LhsShape"]) }}, packed_weight_shape={{ shape_tuple(model["RhsPackedShape"]) }}, scale_shape={{ shape_tuple(model["RhsScaleShape"]) }}, output_shape={{ shape_tuple(model["OutputShape"]) }}, group_size={{ ctx["group_size"] }}, block_n={{ ctx["block_n"] }}, block_k={{ ctx["block_k"] }}, num_stages={{ ctx["num_stages"] }}
+{{ model["FunctionName"] }}__mma_layout = tl.constexpr(
+    tle.gpu.MmaEncoding([2, 0], [{{ model["NumWarps"] }}, 1], [16, 8])
+)
+{{ model["FunctionName"] }}__weight_dot_layout = tl.constexpr(
+    tle.gpu.DotOperandEncoding(0, {{ model["FunctionName"] }}__mma_layout, 4)
+)
+{{ model["FunctionName"] }}__activation_dot_layout = tl.constexpr(
+    tle.gpu.DotOperandEncoding(1, {{ model["FunctionName"] }}__mma_layout, 4)
+)
+{{ model["FunctionName"] }}__output_layout = tl.constexpr(
+    tle.gpu.SlicedEncoding(1, {{ model["FunctionName"] }}__mma_layout)
+)
+
+
+{{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
+def {{ model["FunctionName"] }}__producer(writer, {{ helper_parameters(model) }}):
+{{ common.mesh_coordinates(model["MeshAxes"]) }}
+{% for n_tile in range(ctx["num_n_tiles"]) %}
+    packed_descriptor_entry_{{ n_tile }} = tle.gpu.tensor_map_table_entry(
+        {{ ctx["packed_descriptor_name"] }},
+        shard_index * {{ ctx["num_n_tiles"] }} + {{ n_tile }},
+    )
+    tle.gpu.tensor_map_fenceproxy_acquire(packed_descriptor_entry_{{ n_tile }})
+{% endfor %}
+{% for n_batch_start in range(0, ctx["num_n_tiles"], ctx["n_tiles_per_activation_batch"]) %}
+{% set n_batch_end = [n_batch_start + ctx["n_tiles_per_activation_batch"], ctx["num_n_tiles"]] | min %}
+{% set n_batch_count = n_batch_end - n_batch_start %}
+    for k_tile_{{ n_batch_start }} in tl.range(0, {{ ctx["num_k_tiles"] }}):
+        k_tile = k_tile_{{ n_batch_start }}
+{% for n_tile in range(n_batch_start, n_batch_end) %}
+        sequence = (
+            {{ n_batch_start * ctx["num_k_tiles"] }}
+            + k_tile * {{ n_batch_count }}
+            + {{ n_tile - n_batch_start }}
+        ).to(tl.int32)
+        slot = writer.acquire(sequence)
+        packed_descriptor = tle.gpu.reinterpret_tensor_map(
+            packed_descriptor_entry_{{ n_tile }}, slot.packed_weight
+        )
+        tle.gpu.copy(
+            packed_descriptor,
+            slot.packed_weight,
+            [{{ ctx["packed_tma_block_shape"] | join(", ") }}],
+            offsets=[
+{% for offset in ctx["packed_tma_offsets"] %}
+                {{ tma_offset(offset) }},
+{% endfor %}
+            ],
+            eviction_policy="evict_first",
+        )
+        writer.commit(sequence)
+{% endfor %}
+{% endfor %}
+    writer.close(tl.full((), {{ ctx["num_n_tiles"] * ctx["num_k_tiles"] }}, tl.int32))
+
+
+{{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
+def {{ model["FunctionName"] }}__consumer(reader, {{ helper_parameters(model) }}):
+{{ common.mesh_coordinates(model["MeshAxes"]) }}
+    lhs = {{ ptr(model, "Lhs") }}
+    rhs_scale = {{ ptr(model, "RhsScale") }}
+    lhs_global_scale_ptr = {{ ptr(model, "LhsGlobalScale") }}
+    rhs_global_scale_ptr = {{ ptr(model, "RhsGlobalScale") }}
+    output = {{ ptr(model, "Output") }}
+    lhs_global_scale = tl.load({{ access_pointer(model, "LhsGlobalScale", "lhs_global_scale_ptr") }}).to(tl.float32)
+    rhs_global_scale = tl.load({{ access_pointer(model, "RhsGlobalScale", "rhs_global_scale_ptr") }}).to(tl.float32)
+    logical_k = tl.arange(0, {{ ctx["block_k"] }})
+    scale_k = tl.arange(0, {{ ctx["scale_block_k"] }})
+    mma_column = tle.encoding(
+        tl.arange(0, 8)[None, :],
+        {{ model["FunctionName"] }}__mma_layout,
+    )
+    local_n_source = tl.arange(0, {{ ctx["block_n"] }})
+    local_n = tle.encoding(local_n_source, {{ model["FunctionName"] }}__output_layout)
+{% for n_batch_start in range(0, ctx["num_n_tiles"], ctx["n_tiles_per_activation_batch"]) %}
+{% set n_batch_end = [n_batch_start + ctx["n_tiles_per_activation_batch"], ctx["num_n_tiles"]] | min %}
+{% set n_batch_count = n_batch_end - n_batch_start %}
+{% for n_tile in range(n_batch_start, n_batch_end) %}
+    output_offs_n_{{ n_tile }} = {{ n_tile * ctx["block_n"] }} + local_n
+    acc_{{ n_tile }} = tle.encoding(
+        tl.zeros(({{ ctx["block_n"] }},), tl.float32),
+        {{ model["FunctionName"] }}__output_layout,
+    )
+{% endfor %}
+    for k_tile_{{ n_batch_start }} in tl.range(0, {{ ctx["num_k_tiles"] }}):
+        k_tile = k_tile_{{ n_batch_start }}
+        k_start = k_tile * {{ ctx["block_k"] }}
+        offs_k = k_start + logical_k
+        lhs_value = tl.load(
+            {{ access_pointer(model, "Lhs", "lhs", ctx["input_access"]) }},
+            mask=offs_k < {{ dim(ctx["k"]) }},
+            other=0.0,
+        ).to(tl.float32)
+        lhs_groups = tl.reshape(lhs_value, ({{ ctx["scale_block_k"] }}, {{ ctx["group_size"] }}))
+        lhs_max = tl.max(tl.abs(lhs_groups), axis=1)
+        lhs_block_scale = tl.maximum(
+            -448.0,
+            tl.minimum(lhs_global_scale * lhs_max / 6.0, 448.0),
+        ).to(tl.float8e4nv)
+        lhs_block_scale_f32 = lhs_block_scale.to(tl.float32)
+        lhs_quantized = tl.where(
+            lhs_block_scale_f32[:, None] != 0.0,
+            lhs_groups * lhs_global_scale / lhs_block_scale_f32[:, None],
+            0.0,
+        )
+        lhs_pairs = tl.reshape(lhs_quantized, ({{ ctx["packed_block_k"] }}, 2))
+        lhs_lo, lhs_hi = tl.split(lhs_pairs)
+        lhs_fp4 = tl.inline_asm_elementwise(
+            """
+            {
+                .reg .b8 r;
+                cvt.rn.satfinite.e2m1x2.f32 r, $1, $2;
+                mov.b32 $0, {r, r, r, r};
+            }
+            """,
+            constraints="=r,f,f",
+            args=[lhs_hi.to(tl.float32), lhs_lo.to(tl.float32)],
+            dtype=tl.uint8,
+            is_pure=True,
+            pack=1,
+        )
+        lhs_fp4_mma = tle.encoding(
+            tl.broadcast_to(lhs_fp4[:, None], ({{ ctx["packed_block_k"] }}, 8)),
+            {{ model["FunctionName"] }}__activation_dot_layout,
+        )
+        lhs_scale_mma = tl.broadcast_to(
+            lhs_block_scale[None, :],
+            (8, {{ ctx["scale_block_k"] }}),
+        )
+{% for n_tile in range(n_batch_start, n_batch_end) %}
+        offs_n = {{ n_tile * ctx["block_n"] }} + local_n_source
+        sequence = (
+            {{ n_batch_start * ctx["num_k_tiles"] }}
+            + k_tile * {{ n_batch_count }}
+            + {{ n_tile - n_batch_start }}
+        ).to(tl.int32)
+        ready = reader.wait(sequence)
+        rhs_value = tle.encoding(
+            tl.reshape(
+                tl.load(tle.gpu.local_ptr(ready.slot.packed_weight)),
+                ({{ ctx["block_n"] }}, {{ ctx["packed_block_k"] }}),
+            ),
+            {{ model["FunctionName"] }}__weight_dot_layout,
+        )
+        rhs_block_scale = tl.load(
+            {{ access_pointer(model, "RhsScale", "rhs_scale", ctx["weight_scale_access"]) }},
+            mask=(offs_n[:, None] < {{ dim(ctx["n"]) }})
+            & (k_start // {{ ctx["group_size"] }} + scale_k[None, :] < {{ dim(ctx["k"]) }} // {{ ctx["group_size"] }}),
+            other=0.0,
+        )
+        mma = tl.dot_scaled(
+            rhs_value,
+            rhs_block_scale,
+            "e2m1",
+            lhs_fp4_mma,
+            lhs_scale_mma,
+            "e2m1",
+            acc=tle.encoding(
+                tl.zeros(({{ ctx["block_n"] }}, 8), tl.float32),
+                {{ model["FunctionName"] }}__mma_layout,
+            ),
+            lhs_k_pack=True,
+            rhs_k_pack=True,
+        )
+        acc_{{ n_tile }} += tle.encoding(
+            tl.sum(tl.where(mma_column == 0, mma, 0.0), axis=1),
+            {{ model["FunctionName"] }}__output_layout,
+        )
+        reader.release(sequence)
+{% endfor %}
+{% for n_tile in range(n_batch_start, n_batch_end) %}
+    result_{{ n_tile }} = acc_{{ n_tile }} / (lhs_global_scale * rhs_global_scale)
+    offs_n = output_offs_n_{{ n_tile }}
+    tl.store(
+        {{ access_pointer(model, "Output", "output", ctx["output_access"]) }},
+        result_{{ n_tile }}.to({{ model["OutputTritonDType"] }}),
+        mask=offs_n < {{ dim(ctx["n"]) }},
+    )
+{% endfor %}
+{% endfor %}
+
+
+{% endif %}

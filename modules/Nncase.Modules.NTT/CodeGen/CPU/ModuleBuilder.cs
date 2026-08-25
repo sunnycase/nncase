@@ -58,7 +58,17 @@ public sealed class NTTModuleBuilder : IModuleBuilder
             .Select(range => range.Max)
             .DefaultIfEmpty()
             .Max();
-        var chipLocalRdataBase = MathUtility.AlignUp(rdataPoolSize, 8UL);
+        var rdataAlignment = primFunctions
+            .Select(function => function.SchedResult.RDataAlign)
+            .DefaultIfEmpty(8UL)
+            .Max();
+        var chipLocalRdataAlignment = primFunctions
+            .Select(function => function.SchedResult.ChipLocalRDataAlign)
+            .DefaultIfEmpty(8UL)
+            .Max();
+        var chipLocalRdataBase = MathUtility.AlignUp(
+            MathUtility.AlignUp(rdataPoolSize, rdataAlignment),
+            chipLocalRdataAlignment);
         var mergedRdataPoolSize = checked(chipLocalRdataBase + chipLocalRdataPoolSize);
 
         // 1. write the module header

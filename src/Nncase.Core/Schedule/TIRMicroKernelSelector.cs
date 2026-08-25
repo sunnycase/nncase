@@ -48,7 +48,8 @@ public sealed record TIRTransferPipelineChannel
     public TIRTransferPipelineChannel(
         string name,
         IEnumerable<int> sourceArgumentIndices,
-        IEnumerable<int> sharedWorkspaceIndices)
+        IEnumerable<int> sharedWorkspaceIndices,
+        int sourceAlignmentBytes = 1)
     {
         if (string.IsNullOrWhiteSpace(name))
         {
@@ -64,6 +65,16 @@ public sealed record TIRTransferPipelineChannel
         SharedWorkspaceIndices = ValidateIndices(
             sharedWorkspaceIndices,
             nameof(sharedWorkspaceIndices));
+        if (sourceAlignmentBytes <= 0 ||
+            (sourceAlignmentBytes & (sourceAlignmentBytes - 1)) != 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(sourceAlignmentBytes),
+                sourceAlignmentBytes,
+                "Transfer source alignment must be a positive power of two.");
+        }
+
+        SourceAlignmentBytes = sourceAlignmentBytes;
     }
 
     public string Name { get; }
@@ -71,6 +82,12 @@ public sealed record TIRTransferPipelineChannel
     public ImmutableArray<int> SourceArgumentIndices { get; }
 
     public ImmutableArray<int> SharedWorkspaceIndices { get; }
+
+    /// <summary>
+    /// Gets the minimum base-address alignment required for every source
+    /// operand in this channel.
+    /// </summary>
+    public int SourceAlignmentBytes { get; }
 
     private static ImmutableArray<int> ValidateIndices(
         IEnumerable<int> indices,

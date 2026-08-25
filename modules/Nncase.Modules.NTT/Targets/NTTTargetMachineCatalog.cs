@@ -266,7 +266,8 @@ public static class NTTTargetMachineCatalog
             ? new TargetAsynchronousTransferSpec(
                 supportedStageCounts: [2, 3, 4],
                 commitCycles: 1,
-                waitCycles: 1)
+                waitCycles: 1,
+                maximumTransactionBytes: 16 * 1024)
             : null;
         return new TargetMachineModel(
             id,

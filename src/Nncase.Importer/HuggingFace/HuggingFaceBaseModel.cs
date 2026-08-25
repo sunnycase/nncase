@@ -1302,20 +1302,9 @@ public abstract class HuggingFaceModel
             input_ids,
             pastKeyValues);
 
-        var lmHeadWeights = GetWeight("model.embed_tokens.weight")!;
-        if (Context!.Config!.ContainsKey("tie_word_embeddings") && !Context!.Config!.GetNestedValue<bool>("tie_word_embeddings"))
-        {
-            var newLmHeadWeights = GetWeight("lm_head.weight");
-            if (newLmHeadWeights != null)
-            {
-                lmHeadWeights = newLmHeadWeights;
-            }
-        }
-
-        var lmHead = Linear(lastHiddenStates, lmHeadWeights, layerName: "lm_head");
-
         if (Context.ImportOptions!.HuggingFaceOptions.EnableSampler)
         {
+            var lmHead = BuildLmHead(lastHiddenStates);
             var samplerState = Context.Inputs![4]
                 ?? throw new InvalidOperationException("Sampler state input was not created.");
             var sampling = IR.F.NN.Sampling(lmHead, samplerState, GetSamplerConfig());
@@ -1325,6 +1314,7 @@ public abstract class HuggingFaceModel
         // FIXIT: this is work around for bfloat16
         else if (Context.ImportOptions.HuggingFaceOptions.OutputLogits)
         {
+            var lmHead = BuildLmHead(lastHiddenStates);
             Context.Outputs!.Add("logits", IR.F.Tensors.Cast(lmHead, DataTypes.Float32));
         }
         else
@@ -1336,6 +1326,18 @@ public abstract class HuggingFaceModel
         {
             // FIXIT: this is work around for bfloat16
             Context.Outputs!["hiddenStates"] = IR.F.Tensors.Cast(allHiddenStates!, DataTypes.Float32);
+        }
+
+        Expr BuildLmHead(Expr hiddenStates)
+        {
+            var lmHeadWeights = GetWeight("model.embed_tokens.weight")!;
+            if (Context.Config!.ContainsKey("tie_word_embeddings") &&
+                !Context.Config.GetNestedValue<bool>("tie_word_embeddings"))
+            {
+                lmHeadWeights = GetWeight("lm_head.weight") ?? lmHeadWeights;
+            }
+
+            return Linear(hiddenStates, lmHeadWeights, layerName: "lm_head");
         }
     }
 

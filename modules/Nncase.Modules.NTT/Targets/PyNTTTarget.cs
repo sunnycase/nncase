@@ -37,6 +37,8 @@ public sealed class PyNTTTarget : NTTTarget
         pass.Add<Passes.Rules.NTT.PackMatMulRhsKMajor>(vectorBytes, kPack);
         pass.Add<Passes.Rules.NTT.PackScaledMatMulRhsKMajor>(vectorBytes, kPack);
         pass.Add<Passes.Rules.NTT.PackBlockScaledMatMulRhsNMajorKPacked>(vectorBytes, kPack);
+        pass.Add<Passes.Rules.NTT.PackNVFP4MatMulRhsKMajor>(vectorBytes, kPack);
+        pass.Add<Passes.Rules.NTT.PackNVFP4MatMulGluRhsKMajor>(vectorBytes, kPack);
         pass.Add<Passes.Rules.NTT.PackQKVParallelLinearRhsKMajor>(vectorBytes, kPack);
         pass.Add<Passes.Rules.NTT.PackMatMulGluRhsKMajor>(vectorBytes, kPack);
     }

@@ -1019,6 +1019,75 @@ public sealed record PyNTTMatmulTemplateModel(
     public bool HasNormStats => Stats is not null;
 }
 
+public sealed record PyNTTNVFP4MatmulTemplateModel(
+    string FunctionName,
+    PyNTTBufferPointerTemplateModel Lhs,
+    PyNTTBufferPointerTemplateModel RhsPacked,
+    PyNTTBufferPointerTemplateModel RhsScale,
+    PyNTTBufferPointerTemplateModel LhsGlobalScale,
+    PyNTTBufferPointerTemplateModel RhsGlobalScale,
+    PyNTTBufferPointerTemplateModel Output,
+    string LhsTritonDType,
+    string OutputTritonDType,
+    int[] LhsVectorLanes,
+    int[] RhsPackedVectorLanes,
+    int[] OutputVectorLanes,
+    PyNTTDimExpression[] LhsShape,
+    PyNTTDimExpression[] RhsPackedShape,
+    PyNTTDimExpression[] RhsScaleShape,
+    PyNTTDimExpression[] OutputShape,
+    PyNTTDimExpression[] LhsStrides,
+    PyNTTDimExpression[] RhsPackedStrides,
+    PyNTTDimExpression[] RhsScaleStrides,
+    PyNTTDimExpression[] OutputStrides,
+    long GroupSize,
+    PyNTTMicroKernelTemplateModel MicroKernel,
+    string Comment)
+{
+    public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
+
+    public string? RhsPackedDescriptorName { get; set; }
+}
+
+public sealed record PyNTTNVFP4MatMulGluTemplateModel(
+    string FunctionName,
+    PyNTTBufferPointerTemplateModel Input,
+    PyNTTBufferPointerTemplateModel GateWeightPacked,
+    PyNTTBufferPointerTemplateModel UpWeightPacked,
+    PyNTTBufferPointerTemplateModel GateWeightScale,
+    PyNTTBufferPointerTemplateModel UpWeightScale,
+    PyNTTBufferPointerTemplateModel GateInputGlobalScale,
+    PyNTTBufferPointerTemplateModel UpInputGlobalScale,
+    PyNTTBufferPointerTemplateModel GateWeightGlobalScale,
+    PyNTTBufferPointerTemplateModel UpWeightGlobalScale,
+    PyNTTBufferPointerTemplateModel Output,
+    string InputTritonDType,
+    string OutputTritonDType,
+    int[] InputVectorLanes,
+    int[] WeightPackedVectorLanes,
+    int[] OutputVectorLanes,
+    PyNTTDimExpression[] InputShape,
+    PyNTTDimExpression[] WeightPackedShape,
+    PyNTTDimExpression[] WeightScaleShape,
+    PyNTTDimExpression[] OutputShape,
+    PyNTTDimExpression[] InputStrides,
+    PyNTTDimExpression[] GateWeightPackedStrides,
+    PyNTTDimExpression[] UpWeightPackedStrides,
+    PyNTTDimExpression[] GateWeightScaleStrides,
+    PyNTTDimExpression[] UpWeightScaleStrides,
+    PyNTTDimExpression[] OutputStrides,
+    string GluType,
+    long GroupSize,
+    PyNTTMicroKernelTemplateModel MicroKernel,
+    string Comment)
+{
+    public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
+
+    public string? GateWeightPackedDescriptorName { get; set; }
+
+    public string? UpWeightPackedDescriptorName { get; set; }
+}
+
 public sealed record PyNTTQKVParallelLinearTemplateModel(
     string FunctionName,
     PyNTTBufferPointerTemplateModel Input,

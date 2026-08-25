@@ -178,6 +178,20 @@ public class Qwen3_5 : HuggingFaceModel
 
     public override Call LLMMlp(int count, Expr hiddenStates)
     {
+        if (TryGetNVFP4Config(out var groupSize))
+        {
+            var prefix = $"model.layers.{count}.mlp.down_proj";
+            return IR.F.Math.NVFP4MatMul(
+                    BuildMatMulGlu(count, hiddenStates),
+                    RequireWeight($"{prefix}.weight_packed"),
+                    RequireWeight($"{prefix}.weight_scale"),
+                    RequireWeight($"{prefix}.input_global_scale"),
+                    RequireWeight($"{prefix}.weight_global_scale"),
+                    hiddenStates.CheckedDataType,
+                    groupSize)
+                .With(metadata: new IRMetadata { OutputNames = new[] { prefix } });
+        }
+
         if (!TryGetDynamicBlockFp8Config(out var blockN, out var blockK))
         {
             return base.LLMMlp(count, hiddenStates);
@@ -202,6 +216,29 @@ public class Qwen3_5 : HuggingFaceModel
 
     protected override Call BuildMatMulGlu(int count, Expr hiddenStates)
     {
+        if (TryGetNVFP4Config(out var groupSize))
+        {
+            var gatePrefix = $"model.layers.{count}.mlp.gate_proj";
+            var upPrefix = $"model.layers.{count}.mlp.up_proj";
+            return IR.F.NN.NVFP4MatMulGlu(
+                    hiddenStates,
+                    RequireWeight($"{gatePrefix}.weight_packed"),
+                    RequireWeight($"{upPrefix}.weight_packed"),
+                    RequireWeight($"{gatePrefix}.weight_scale"),
+                    RequireWeight($"{upPrefix}.weight_scale"),
+                    RequireWeight($"{gatePrefix}.input_global_scale"),
+                    RequireWeight($"{upPrefix}.input_global_scale"),
+                    RequireWeight($"{gatePrefix}.weight_global_scale"),
+                    RequireWeight($"{upPrefix}.weight_global_scale"),
+                    GetMlpGluType(),
+                    hiddenStates.CheckedDataType,
+                    groupSize)
+                .With(metadata: new IRMetadata
+                {
+                    OutputNames = new[] { $"model.layers.{count}.mlp.gate_up_proj" },
+                });
+        }
+
         if (!TryGetDynamicBlockFp8Config(out var blockN, out var blockK))
         {
             return base.BuildMatMulGlu(count, hiddenStates);
@@ -251,19 +288,54 @@ public class Qwen3_5 : HuggingFaceModel
         var convDim = (keyDim * 2) + valueDim;
         var prefix = $"model.layers.{count}.linear_attn";
         var state = _state ?? throw new InvalidOperationException("Qwen3.5 GDN state input is unavailable.");
-        Tensor RequireWeight(string name) => GetWeight(name)
-            ?? throw new InvalidOperationException($"Required weight {name} is missing.");
         Tensor PrepareLinearWeight(string name) => PrepareLinearWeightTensor(RequireWeight(name), inputType);
-        var hasBlockFp8 = TryGetDynamicBlockFp8Config(out var blockN, out var blockK);
+        var hasLegacyBlockFp8 = TryGetDynamicBlockFp8Config(out var blockN, out var blockK);
+        var hasCompressedFp8 = !hasLegacyBlockFp8 && TryGetCompressedTensorFp8Config(out blockN, out blockK);
+        var hasBlockFp8 = hasLegacyBlockFp8 || hasCompressedFp8;
         Tensor PrepareBlockWeight(string name) => PrepareLinearWeightTensor(
             RequireWeight(name),
             DataTypes.Float8E4M3);
         Expr PrepareProjectionWeight(string name) => hasBlockFp8
             ? PrepareBlockWeight(name)
             : PrepareLinearWeight(name);
-        Expr PrepareProjectionScale(string name) => hasBlockFp8
-            ? RequireWeight(name)
-            : None.Default;
+        Expr PrepareProjectionScale(string name, long reductionExtent)
+        {
+            if (!hasBlockFp8)
+            {
+                return None.Default;
+            }
+
+            var scale = RequireWeight(name);
+            if (!hasCompressedFp8)
+            {
+                return scale;
+            }
+
+            if (scale.Rank != 2 || scale.Dimensions[1] != 1 || reductionExtent % blockK != 0)
+            {
+                throw new InvalidOperationException(
+                    $"Compressed-tensors FP8 scale {name} must have shape [N,1] and K " +
+                    $"must divide block K {blockK}, got shape [{string.Join(",", scale.Dimensions.ToArray())}] " +
+                    $"and K={reductionExtent}.");
+            }
+
+            var repeats = reductionExtent / blockK;
+            var expanded = Tensor.Zeros(scale.ElementType, [scale.Dimensions[0], repeats]);
+            var elementSize = scale.ElementType.SizeInBytes;
+            for (var row = 0L; row < scale.Dimensions[0]; row++)
+            {
+                var source = scale.BytesBuffer.Slice(checked((int)(row * elementSize)), elementSize);
+                for (var column = 0L; column < repeats; column++)
+                {
+                    source.CopyTo(
+                        expanded.BytesBuffer.Slice(
+                            checked((int)(((row * repeats) + column) * elementSize)),
+                            elementSize));
+                }
+            }
+
+            return expanded;
+        }
 
         var convWeightTensor = GetWeight($"{prefix}.conv1d.weight")
             ?? throw new InvalidOperationException($"Required weight {prefix}.conv1d.weight is missing.");
@@ -289,9 +361,15 @@ public class Qwen3_5 : HuggingFaceModel
             valueHeadDim,
             convKernelSize,
             (float)Config.GetNestedValue<double>("rms_norm_eps"),
-            qkvWeightScale: PrepareProjectionScale($"{prefix}.in_proj_qkv.weight_scale_inv"),
-            zWeightScale: PrepareProjectionScale($"{prefix}.in_proj_z.weight_scale_inv"),
-            outputWeightScale: PrepareProjectionScale($"{prefix}.out_proj.weight_scale_inv"),
+            qkvWeightScale: PrepareProjectionScale(
+                $"{prefix}.in_proj_qkv.{(hasCompressedFp8 ? "weight_scale" : "weight_scale_inv")}",
+                hiddenStates.CheckedShape[^1].FixedValue),
+            zWeightScale: PrepareProjectionScale(
+                $"{prefix}.in_proj_z.{(hasCompressedFp8 ? "weight_scale" : "weight_scale_inv")}",
+                hiddenStates.CheckedShape[^1].FixedValue),
+            outputWeightScale: PrepareProjectionScale(
+                $"{prefix}.out_proj.{(hasCompressedFp8 ? "weight_scale" : "weight_scale_inv")}",
+                valueDim),
             quantizationMode: hasBlockFp8
                 ? MatMulQuantizationMode.DynamicBlock
                 : MatMulQuantizationMode.None,
@@ -342,6 +420,11 @@ public class Qwen3_5 : HuggingFaceModel
         }
 
         var method = quantization.GetNestedValue<string>("quant_method");
+        if (string.Equals(method, "compressed-tensors", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
         var activationScheme = quantization.GetNestedValue<string>("activation_scheme");
         var format = quantization.GetNestedValue<string>("fmt");
         if (!string.Equals(method, "fp8", StringComparison.OrdinalIgnoreCase) ||
@@ -363,6 +446,106 @@ public class Qwen3_5 : HuggingFaceModel
 
         return true;
     }
+
+    private bool TryGetNVFP4Config(out long groupSize)
+    {
+        groupSize = 0;
+        if (!TryGetCompressedTensorsConfig(out var quantization))
+        {
+            return false;
+        }
+
+        var format = quantization.GetNestedValue<string>("config_groups", "group_1", "format");
+        var weightBits = quantization.GetNestedValue<long>("config_groups", "group_1", "weights", "num_bits");
+        var activationBits = quantization.GetNestedValue<long>("config_groups", "group_1", "input_activations", "num_bits");
+        var weightGroupSize = quantization.GetNestedValue<long>("config_groups", "group_1", "weights", "group_size");
+        var activationGroupSize = quantization.GetNestedValue<long>("config_groups", "group_1", "input_activations", "group_size");
+        var scaleType = quantization.GetNestedValue<string>("config_groups", "group_1", "weights", "scale_dtype");
+        if (!string.Equals(format, "nvfp4-pack-quantized", StringComparison.OrdinalIgnoreCase) ||
+            weightBits != 4 || activationBits != 4 ||
+            weightGroupSize != activationGroupSize || weightGroupSize != 16 ||
+            !string.Equals(scaleType, "torch.float8_e4m3fn", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new NotSupportedException(
+                $"Qwen3.5 compressed-tensors NVFP4 group is unsupported: format={format}, " +
+                $"bits={weightBits}/{activationBits}, group_size={weightGroupSize}/{activationGroupSize}, " +
+                $"scale_dtype={scaleType}.");
+        }
+
+        groupSize = weightGroupSize;
+        return true;
+    }
+
+    private bool TryGetCompressedTensorFp8Config(out long blockN, out long blockK)
+    {
+        blockN = 0;
+        blockK = 0;
+        if (!TryGetCompressedTensorsConfig(out var quantization))
+        {
+            return false;
+        }
+
+        var format = quantization.GetNestedValue<string>("config_groups", "group_0", "format");
+        var weightBits = quantization.GetNestedValue<long>("config_groups", "group_0", "weights", "num_bits");
+        var weightStrategy = quantization.GetNestedValue<string>("config_groups", "group_0", "weights", "strategy");
+        var activationBits = quantization.GetNestedValue<long>("config_groups", "group_0", "input_activations", "num_bits");
+        var activationStrategy = quantization.GetNestedValue<string>("config_groups", "group_0", "input_activations", "strategy");
+        if (!string.Equals(format, "float-quantized", StringComparison.OrdinalIgnoreCase) ||
+            weightBits != 8 || activationBits != 8 ||
+            !string.Equals(weightStrategy, "channel", StringComparison.OrdinalIgnoreCase) ||
+            !string.Equals(activationStrategy, "token", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new NotSupportedException(
+                $"Qwen3.5 compressed-tensors FP8 group is unsupported: format={format}, " +
+                $"bits={weightBits}/{activationBits}, strategies={weightStrategy}/{activationStrategy}.");
+        }
+
+        var hiddenSize = Config.GetNestedValue<long>("hidden_size");
+        var valueProjectionSize = Config.GetNestedValue<long>("linear_num_value_heads") *
+            Config.GetNestedValue<long>("linear_value_head_dim");
+        blockN = 1;
+        blockK = GreatestCommonDivisor(hiddenSize, valueProjectionSize);
+        return true;
+    }
+
+    private bool TryGetCompressedTensorsConfig(out Dictionary<string, object> quantization)
+    {
+        quantization = null!;
+        if (!Config.TryGetValue("quantization_config", out var value) ||
+            value is not Dictionary<string, object> candidate)
+        {
+            return false;
+        }
+
+        var method = candidate.GetNestedValue<string>("quant_method");
+        if (!string.Equals(method, "compressed-tensors", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        var format = candidate.GetNestedValue<string>("format");
+        if (!string.Equals(format, "mixed-precision", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new NotSupportedException(
+                $"Qwen3.5 compressed-tensors format must be mixed-precision, got {format}.");
+        }
+
+        quantization = candidate;
+        return true;
+    }
+
+    private static long GreatestCommonDivisor(long lhs, long rhs)
+    {
+        while (rhs != 0)
+        {
+            (lhs, rhs) = (rhs, lhs % rhs);
+        }
+
+        return System.Math.Abs(lhs);
+    }
+
+    private Tensor RequireWeight(string name) => GetWeight(name)
+        ?? throw new InvalidOperationException($"Required weight {name} is missing.");
 
     private void ValidateSupportedConfiguration()
     {

@@ -31,6 +31,9 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
     // Keep a stage within 32 groups; larger bodies delay first-tile consumption
     // and underutilize the asynchronous double buffer despite fitting in Shared.
     private const int PackedGemvMaximumBlockK = 1024;
+    private const int BlockFp8MmaMaximumTransferBlockK = 128;
+    private const int NVFP4BlockK = 512;
+    private const int NVFP4MaximumBlockN = 128;
     private const int PackedGemvMinimumLogicalStages = 2;
     private const int BlockFp8MmaNTilesPerActivationBatch = 2;
     private const int GatedDeltaNetConvolutionMaximumBlockN = 256;
@@ -100,6 +103,17 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
                     ? "mma_block_fp8_smem_pipeline"
                     : "simt_block_fp8_fma_smem_pipeline",
                 blockFp8ReductionGroup: checked((int)packedBlockScaledMatmulNormStats.WeightBlockK)),
+            Nncase.TIR.NTT.NVFP4MatMul nvfp4MatMul => SelectNVFP4MatMul(
+                context,
+                nvfp4MatMul.GroupSize,
+                Nncase.TIR.NTT.NVFP4MatMul.Lhs.Index,
+                Nncase.TIR.NTT.NVFP4MatMul.RhsPacked.Index,
+                Nncase.TIR.NTT.NVFP4MatMul.RhsScale.Index,
+                Nncase.TIR.NTT.NVFP4MatMul.Output.Index,
+                "triton.nvfp4_matmul",
+                [
+                    Nncase.TIR.NTT.NVFP4MatMul.RhsPacked.Index,
+                ]),
             Nncase.TIR.NTT.PackedMatMulNormStats packedMatmulNormStats => SelectMatmul(
                 context,
                 transposeA: false,
@@ -129,6 +143,9 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
             Nncase.TIR.NTT.PackedMatMulGlu packedMatmulGlu => SelectPackedMatMulGlu(
                 context,
                 packedMatmulGlu),
+            Nncase.TIR.NTT.NVFP4MatMulGlu nvfp4MatMulGlu => SelectNVFP4MatMulGlu(
+                context,
+                nvfp4MatMulGlu),
             Nncase.TIR.NTT.PagedAttentionPartial pagedAttention =>
                 SelectPagedAttentionPartial(context, pagedAttention),
             Nncase.TIR.NTT.GatedDeltaNetConvolution convolution =>
@@ -1212,6 +1229,168 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
                 : null);
     }
 
+    private static TIRMicroKernelSelection SelectNVFP4MatMulGlu(
+        TIRMicroKernelSelectionContext context,
+        Nncase.TIR.NTT.NVFP4MatMulGlu op)
+    {
+        var selection = SelectNVFP4MatMul(
+            context,
+            op.GroupSize,
+            Nncase.TIR.NTT.NVFP4MatMulGlu.Input.Index,
+            Nncase.TIR.NTT.NVFP4MatMulGlu.GateWeightPacked.Index,
+            Nncase.TIR.NTT.NVFP4MatMulGlu.GateWeightScale.Index,
+            Nncase.TIR.NTT.NVFP4MatMulGlu.Output.Index,
+            "triton.nvfp4_matmul_glu",
+            [
+                Nncase.TIR.NTT.NVFP4MatMulGlu.GateWeightPacked.Index,
+                Nncase.TIR.NTT.NVFP4MatMulGlu.UpWeightPacked.Index,
+            ]);
+        var upWeight = GetBuffer(
+            context,
+            Nncase.TIR.NTT.NVFP4MatMulGlu.UpWeightPacked.Index,
+            "up packed weight");
+        var upScale = GetBuffer(
+            context,
+            Nncase.TIR.NTT.NVFP4MatMulGlu.UpWeightScale.Index,
+            "up weight scale");
+        var gateWeight = GetBuffer(
+            context,
+            Nncase.TIR.NTT.NVFP4MatMulGlu.GateWeightPacked.Index,
+            "gate packed weight");
+        var gateScale = GetBuffer(
+            context,
+            Nncase.TIR.NTT.NVFP4MatMulGlu.GateWeightScale.Index,
+            "gate weight scale");
+        if (!SameLocalShape(gateWeight, upWeight) || !SameLocalShape(gateScale, upScale))
+        {
+            throw new InvalidOperationException(
+                "NVFP4MatMulGlu requires gate/up packed weights and block scales to have matching local shapes.");
+        }
+
+        return selection;
+    }
+
+    private static TIRMicroKernelSelection SelectNVFP4MatMul(
+        TIRMicroKernelSelectionContext context,
+        long groupSize,
+        int lhsIndex,
+        int rhsIndex,
+        int rhsScaleIndex,
+        int outputIndex,
+        string family,
+        int[] transferSourceArgumentIndices)
+    {
+        if (groupSize != 16)
+        {
+            throw new NotSupportedException(
+                $"{family} supports the NVFP4 group size 16, got {groupSize}.");
+        }
+
+        RequirePersistentBFloat16Mma(context.Machine);
+        var lhs = GetBuffer(context, lhsIndex, "lhs");
+        var rhs = GetBuffer(context, rhsIndex, "packed rhs");
+        var rhsScale = GetBuffer(context, rhsScaleIndex, "rhs block scale");
+        var output = GetBuffer(context, outputIndex, "output");
+        RequireRank(lhs, 2, context.Op, "lhs");
+        RequireRank(rhs, 2, context.Op, "packed rhs");
+        RequireRank(rhsScale, 2, context.Op, "rhs block scale");
+        RequireRank(output, 2, context.Op, "output");
+        if (GetScalarDataType(lhs.ElemType) != DataTypes.BFloat16 ||
+            GetScalarDataType(rhs.ElemType) != DataTypes.UInt8 ||
+            GetScalarDataType(rhsScale.ElemType) != DataTypes.Float8E4M3 ||
+            GetScalarDataType(output.ElemType) != DataTypes.BFloat16)
+        {
+            throw new NotSupportedException(
+                $"{family} requires BF16 lhs/output, U8 packed E2M1 rhs, and E4M3 block scales, got " +
+                $"{lhs.ElemType}/{rhs.ElemType}/{rhsScale.ElemType}/{output.ElemType}.");
+        }
+
+        RequireVectorLanes(lhs.ElemType, [8], family, "lhs");
+        RequireVectorLanes(rhs.ElemType, [2, 16], family, "packed rhs");
+        RequireVectorLanes(rhsScale.ElemType, [], family, "rhs block scale");
+        RequireVectorLanes(output.ElemType, [8], family, "output");
+
+        var lhsShape = GetLocalDimensions(lhs);
+        var rhsShape = GetLocalDimensions(rhs);
+        var scaleShape = GetLocalDimensions(rhsScale);
+        var outputShape = GetLocalDimensions(output);
+        var m = GetMax(outputShape[0]);
+        var n = GetScalarExtent(outputShape[1], output.ElemType);
+        var k = GetScalarExtent(lhsShape[1], lhs.ElemType);
+        if (m != 1)
+        {
+            throw new NotSupportedException(
+                $"{family} currently selects the decode GEMV algorithm only, got local M={m}.");
+        }
+
+        if (k % groupSize != 0 ||
+            GetMax(lhsShape[0]) != m ||
+            GetMax(rhsShape[0]) != n || GetScalarExtent(rhsShape[1], rhs.ElemType) * 2 != k ||
+            GetMax(scaleShape[0]) != n || GetMax(scaleShape[1]) * groupSize != k)
+        {
+            throw new InvalidOperationException(
+                $"{family} local storage contract must be lhs=bf16<8>[1,K/8], " +
+                $"rhs=u8<2,16>[N,K/64], scale=[N,K/{groupSize}], " +
+                $"output=bf16<8>[1,N/8].");
+        }
+
+        var selectedBlockN = SelectPowerOfTwoAtMost(n, NVFP4MaximumBlockN);
+        var sharedSpace = context.Machine.MemorySpaces.Values.SingleOrDefault(
+            space => space.TIRBinding?.Location == MemoryLocation.Shared)
+            ?? throw new NotSupportedException($"{family} requires Shared memory.");
+        var parentSpace = context.Machine.GetTilingParentMemorySpace(sharedSpace.TilingLevel);
+        var asynchronousTransfer = context.Machine
+            .GetTransfer(parentSpace.Id, sharedSpace.Id)
+            .Asynchronous
+            ?? throw new NotSupportedException($"{family} requires an asynchronous parent-to-Shared transfer.");
+        var maximumTransactionBlockK = checked(
+            (int)((asynchronousTransfer.MaximumTransactionBytes * 2L) / selectedBlockN));
+        var selectedBlockK = SelectPowerOfTwoAtMost(
+            k,
+            Math.Min(NVFP4BlockK, maximumTransactionBlockK));
+        if (selectedBlockK < groupSize)
+        {
+            throw new NotSupportedException(
+                $"{family} requires local K to admit at least one group-{groupSize} MMA tile, got K={k}.");
+        }
+
+        var stageBytes = checked(
+            (long)selectedBlockN *
+            (selectedBlockK / 2L));
+        var numStages = SelectMaximumFittingAsyncStageCount(
+            context.Machine,
+            stageBytes,
+            family);
+        var packedWeightStage = new TIRSharedWorkspaceDescriptor(
+            "packed_weight_stage",
+            new TensorType(
+                DataTypes.UInt8,
+                new RankedShape(numStages, selectedBlockN, selectedBlockK / 2)),
+            NvidiaNvmmaSharedAlignmentBytes);
+        return new(
+            family,
+            "mma_tma_smem_pipeline",
+            CreateParameters(1, selectedBlockN, selectedBlockK, numStages)
+                .Add("group_size", groupSize),
+            ImmutableArray.Create(packedWeightStage),
+            new TIRTransferPipelineContract(
+            [
+                new TIRTransferPipelineChannel(
+                    "weight",
+                    transferSourceArgumentIndices,
+                    [0],
+                    sourceAlignmentBytes: 16),
+            ]));
+    }
+
+    private static bool SameLocalShape(TensorBufferOperand lhs, TensorBufferOperand rhs)
+    {
+        var lhsShape = GetLocalDimensions(lhs);
+        var rhsShape = GetLocalDimensions(rhs);
+        return lhsShape.Length == rhsShape.Length &&
+            lhsShape.Where((dimension, index) => GetMax(dimension) != GetMax(rhsShape[index])).Any() is false;
+    }
+
     private static TIRMicroKernelSelection SelectSumma(
         TIRMicroKernelSelectionContext context,
         Nncase.TIR.NTT.SUMMA summa)
@@ -1278,6 +1457,7 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
                 var kVector = 16 / rhsType.SizeInBytes;
                 const int kPack = 2;
                 var kAtom = kPack * kVector;
+                var blockFp8TransferBlockK = 0;
                 if (variant == "mma_block_fp8_smem_pipeline" &&
                     (blockFp8ReductionGroup <= 0 ||
                      pipeline.BlockK % blockFp8ReductionGroup != 0))
@@ -1288,6 +1468,20 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
                         $"group={blockFp8ReductionGroup}.");
                 }
 
+                if (variant == "mma_block_fp8_smem_pipeline")
+                {
+                    blockFp8TransferBlockK = Math.Min(
+                        blockFp8ReductionGroup,
+                        BlockFp8MmaMaximumTransferBlockK);
+                    if (blockFp8ReductionGroup % blockFp8TransferBlockK != 0)
+                    {
+                        throw new InvalidOperationException(
+                            $"{family}/{variant} requires its scale-group K " +
+                            $"{blockFp8ReductionGroup} to be divisible by the selected " +
+                            $"transfer K {blockFp8TransferBlockK}.");
+                    }
+                }
+
                 var rhsShape = new TensorType(
                     rhsType,
                     new RankedShape(
@@ -1296,8 +1490,9 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
                             {
                                 pipeline.NumStages,
                                 pipeline.BlockK / blockFp8ReductionGroup,
+                                blockFp8ReductionGroup / blockFp8TransferBlockK,
                                 pipeline.BlockN,
-                                blockFp8ReductionGroup,
+                                blockFp8TransferBlockK,
                             }
                             : new[]
                             {
@@ -1337,7 +1532,10 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
                 return new(
                     family,
                     variant,
-                    CreateParameters(1, pipeline.BlockN, pipeline.BlockK, pipeline.NumStages),
+                    variant == "mma_block_fp8_smem_pipeline"
+                        ? CreateParameters(1, pipeline.BlockN, pipeline.BlockK, pipeline.NumStages)
+                            .Add("transfer_block_k", blockFp8TransferBlockK)
+                        : CreateParameters(1, pipeline.BlockN, pipeline.BlockK, pipeline.NumStages),
                     sharedWorkspaces.ToImmutable(),
                     new TIRTransferPipelineContract(
                     [
@@ -1992,6 +2190,23 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
         => dataType is VectorType vectorType
             ? GetScalarDataType(vectorType.ElemType)
             : dataType;
+
+    private static void RequireVectorLanes(
+        DataType dataType,
+        int[] expectedLanes,
+        string family,
+        string operand)
+    {
+        var actualLanes = dataType is VectorType vectorType
+            ? vectorType.Lanes.ToArray()
+            : Array.Empty<int>();
+        if (!actualLanes.SequenceEqual(expectedLanes))
+        {
+            throw new NotSupportedException(
+                $"{family} requires {operand} vector lanes [{string.Join(",", expectedLanes)}], " +
+                $"got [{string.Join(",", actualLanes)}].");
+        }
+    }
 
     private readonly record struct PackedGemvPipelineConfiguration(
         int BlockN,

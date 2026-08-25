@@ -334,6 +334,7 @@ public sealed class BufferizeVisitor : ExprRewriter
     {
         if (scheduleResult.TryGetValue(MemoryLocation.Rdata, out var rdataResult))
         {
+            func.SchedResult.RDataAlign = Math.Max(8, (ulong)rdataResult.Alignment);
             foreach ((var buffer, var lifetime) in rdataResult.Buffers)
             {
                 var constValue = (Const)((Call)buffer.Start)[IR.Buffers.AddressOf.Input];
@@ -349,6 +350,7 @@ public sealed class BufferizeVisitor : ExprRewriter
     {
         if (scheduleResult.TryGetValue(MemoryLocation.ChipLocalRdata, out var chipLocalRdataResult))
         {
+            func.SchedResult.ChipLocalRDataAlign = Math.Max(8, (ulong)chipLocalRdataResult.Alignment);
             foreach ((var buffer, var lifetime) in chipLocalRdataResult.Buffers)
             {
                 var constValue = (Const)((Call)buffer.Start)[IR.Buffers.AddressOf.Input];
@@ -369,6 +371,7 @@ public sealed class BufferizeVisitor : ExprRewriter
     {
         if (scheduleResult.TryGetValue(MemoryLocation.BlockLocalRdata, out var blockLocalRdataResult))
         {
+            func.SchedResult.BlockLocalRDataAlign = Math.Max(8, (ulong)blockLocalRdataResult.Alignment);
             foreach ((var buffer, var lifetime) in blockLocalRdataResult.Buffers)
             {
                 var constValue = (Const)((Call)buffer.Start)[IR.Buffers.AddressOf.Input];

@@ -1311,6 +1311,78 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
     }
 
     [Fact]
+    public void TestTritonNVFP4SelectorRespectsAsynchronousTransferLimit()
+    {
+        const int k = 5120;
+        const int n = 640;
+        const int groupSize = 16;
+        var lhs = CreateBuffer(
+            "lhs",
+            new VectorType(DataTypes.BFloat16, [8]),
+            TIR.MemoryLocation.Data,
+            0,
+            [1, k / 8],
+            [k / 8, 1]);
+        var rhsPacked = CreateBuffer(
+            "rhs_packed",
+            new VectorType(DataTypes.UInt8, [2, 16]),
+            TIR.MemoryLocation.ChipLocalRdata,
+            0,
+            [n, k / 64],
+            [k / 64, 1]);
+        var rhsScale = CreateBuffer(
+            "rhs_scale",
+            DataTypes.Float8E4M3,
+            TIR.MemoryLocation.ChipLocalRdata,
+            0,
+            [n, k / groupSize],
+            [k / groupSize, 1]);
+        var lhsGlobalScale = CreateBuffer(
+            "lhs_global_scale",
+            DataTypes.Float32,
+            TIR.MemoryLocation.ChipLocalRdata,
+            0,
+            [1],
+            [1]);
+        var rhsGlobalScale = CreateBuffer(
+            "rhs_global_scale",
+            DataTypes.Float32,
+            TIR.MemoryLocation.ChipLocalRdata,
+            0,
+            [1],
+            [1]);
+        var output = CreateBuffer(
+            "output",
+            new VectorType(DataTypes.BFloat16, [8]),
+            TIR.MemoryLocation.Data,
+            0,
+            [1, n / 8],
+            [n / 8, 1]);
+        var op = new TIR.NTT.NVFP4MatMul(groupSize);
+        var targetOptions = Assert.IsType<PyNTTTargetOptions>(CompileOptions.TargetOptions);
+
+        var selection = Assert.IsType<Nncase.Schedule.TIRMicroKernelSelection>(
+            targetOptions.TIRMicroKernelSelector.Select(
+                new(
+                    op,
+                    [lhs, rhsPacked, rhsScale, lhsGlobalScale, rhsGlobalScale, output],
+                    targetOptions.TargetMachineModel)));
+
+        Assert.Equal("triton.nvfp4_matmul", selection.Family);
+        Assert.Equal("mma_tma_smem_pipeline", selection.Variant);
+        Assert.Equal(128, selection.Parameters["block_n"]);
+        Assert.Equal(256, selection.Parameters["block_k"]);
+        Assert.Equal(4, selection.Parameters["num_stages"]);
+        var workspace = Assert.Single(selection.SharedWorkspaces);
+        Assert.Equal(
+            new long[] { 4, 128, 128 },
+            workspace.Type.Shape.ToValueArray());
+        var channel = Assert.Single(selection.TransferPipeline!.Channels);
+        Assert.Equal(new[] { Nncase.TIR.NTT.NVFP4MatMul.RhsPacked.Index }, channel.SourceArgumentIndices);
+        Assert.Equal(new[] { 0 }, channel.SharedWorkspaceIndices);
+    }
+
+    [Fact]
     public void TestTritonPagedAttentionSelectsCrossPageTmaForVllmLayout()
     {
         var selection = SelectPagedAttentionPartialMicroKernel(DataTypes.BFloat16);

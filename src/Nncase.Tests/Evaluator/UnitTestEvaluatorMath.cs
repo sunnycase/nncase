@@ -10,6 +10,7 @@ using Nncase.Evaluator;
 using Nncase.IR;
 using Nncase.IR.F;
 using Nncase.IR.Math;
+using Nncase.IR.NN;
 using Nncase.IR.Tensors;
 using Nncase.Quantization;
 using Nncase.Utilities;
@@ -33,6 +34,61 @@ public class UnitTestEvaluatorMath : TestClassBase
         { [1, 2, 3, 4], [4], [8] },
         { [1, 2, 3, 4], [4], [1] },
     };
+
+    [Fact]
+    public void TestNVFP4MatMulPackedNibbleAndScaleSemantics()
+    {
+        var lhsValues = new float[16];
+        lhsValues[0] = 6F;
+        var packedWeights = new byte[16];
+        packedWeights[0] = 0x07;
+        packedWeights[8] = 0x0F;
+        var rhsScale = Tensor.From<float>(Enumerable.Repeat(1F, 2).ToArray(), [2, 1])
+            .CastElementTo(DataTypes.Float8E4M3);
+        var expression = IR.F.Math.NVFP4MatMul(
+            Tensor.From<float>(lhsValues, [1, 16]),
+            Tensor.From<byte>(packedWeights, [2, 8]),
+            rhsScale,
+            Tensor.From<float>([1F], [1]),
+            Tensor.From<float>([1F], [1]),
+            DataTypes.Float32);
+
+        CompilerServices.InferenceType(expression);
+        Assert.Equal(new TensorType(DataTypes.Float32, new RankedShape(1, 2)), expression.CheckedType);
+        Assert.Equal(new[] { 36F, -36F }, expression.Evaluate().AsTensor().ToArray<float>());
+    }
+
+    [Fact]
+    public void TestNVFP4MatMulGluUsesIndependentProjectionScales()
+    {
+        var lhsValues = new float[16];
+        lhsValues[0] = 6F;
+        var gateWeight = new byte[8];
+        var upWeight = new byte[8];
+        gateWeight[0] = 0x01;
+        upWeight[0] = 0x02;
+        var gateScale = Tensor.From<float>([1F], [1, 1])
+            .CastElementTo(DataTypes.Float8E4M3);
+        var upScale = Tensor.From<float>([2F], [1, 1])
+            .CastElementTo(DataTypes.Float8E4M3);
+        var expression = IR.F.NN.NVFP4MatMulGlu(
+            Tensor.From<float>(lhsValues, [1, 16]),
+            Tensor.From<byte>(gateWeight, [1, 8]),
+            Tensor.From<byte>(upWeight, [1, 8]),
+            gateScale,
+            upScale,
+            Tensor.From<float>([1F], [1]),
+            Tensor.From<float>([2F], [1]),
+            Tensor.From<float>([1F], [1]),
+            Tensor.From<float>([2F], [1]),
+            GluType.SwiGLU,
+            DataTypes.Float32);
+
+        CompilerServices.InferenceType(expression);
+        var actual = expression.Evaluate().AsTensor().ToArray<float>()[0];
+        var expected = 3F / (1F + MathF.Exp(-3F)) * 6F;
+        Assert.Equal(expected, actual, 4);
+    }
 
     [Fact]
     public void TestBinaryScalarScalar()

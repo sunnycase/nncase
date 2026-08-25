@@ -251,6 +251,105 @@ public class UnitTestVectorizeVectorizedMatMul : TransformTestBase
     }
 
     [Fact]
+    public void TestPackNVFP4MatMulRhsKMajorCreatesTargetPackedAbi()
+    {
+        var lhs = new Var("lhs", new TensorType(DataTypes.BFloat16, new RankedShape(1, 64)));
+        var rhs = new Var("rhs", new TensorType(DataTypes.UInt8, new RankedShape(128, 32)));
+        var rhsScale = new Var("rhs_scale", new TensorType(DataTypes.Float8E4M3, new RankedShape(128, 4)));
+        var lhsGlobalScale = new Var("lhs_global_scale", new TensorType(DataTypes.Float32, new RankedShape(1)));
+        var rhsGlobalScale = new Var("rhs_global_scale", new TensorType(DataTypes.Float32, new RankedShape(1)));
+        var expr = IR.F.Math.NVFP4MatMul(
+            lhs,
+            rhs,
+            rhsScale,
+            lhsGlobalScale,
+            rhsGlobalScale,
+            DataTypes.BFloat16,
+            16);
+        CompilerServices.InferenceType(expr);
+
+        var context = new Nncase.Passes.RunPassContext();
+        var post = (Expr)CompilerServices.Rewrite(
+            expr,
+            [new PackNVFP4MatMulRhsKMajor(16, 2)],
+            context);
+        CompilerServices.InferenceType(post);
+        var packedCall = Assert.Single(
+            ExprCollector.Collect(post).OfType<Call>().Where(
+                call => call.Target is IR.NTT.PackedNVFP4MatMul));
+
+        Assert.False(ReferenceEquals(expr, post));
+        Assert.Equal(expr.CheckedType, post.CheckedType);
+        AssertPackedBuffer(
+            packedCall,
+            IR.NTT.PackedNVFP4MatMul.Lhs.Index,
+            new RankedShape(1, 8),
+            new VectorType(DataTypes.BFloat16, [8]));
+        AssertPackedBuffer(
+            packedCall,
+            IR.NTT.PackedNVFP4MatMul.RhsPacked.Index,
+            new RankedShape(128, 1),
+            new VectorType(DataTypes.UInt8, [2, 16]));
+        Assert.Equal(
+            new TensorType(new VectorType(DataTypes.BFloat16, [8]), new RankedShape(1, 16)),
+            packedCall.CheckedType);
+    }
+
+    [Fact]
+    public void TestPackNVFP4MatMulGluConsumesExistingPackedInput()
+    {
+        var packedInput = new Var(
+            "packed_input",
+            new TensorType(new VectorType(DataTypes.BFloat16, [8]), new RankedShape(1, 8)));
+        var input = Unpack(packedInput, [8], [1]);
+        var gateWeight = new Var("gate_weight", new TensorType(DataTypes.UInt8, new RankedShape(128, 32)));
+        var upWeight = new Var("up_weight", new TensorType(DataTypes.UInt8, new RankedShape(128, 32)));
+        var gateScale = new Var("gate_scale", new TensorType(DataTypes.Float8E4M3, new RankedShape(128, 4)));
+        var upScale = new Var("up_scale", new TensorType(DataTypes.Float8E4M3, new RankedShape(128, 4)));
+        var inputGlobalScale = new Var("input_global_scale", new TensorType(DataTypes.Float32, new RankedShape(1)));
+        var weightGlobalScale = new Var("weight_global_scale", new TensorType(DataTypes.Float32, new RankedShape(1)));
+        var expr = IR.F.NN.NVFP4MatMulGlu(
+            input,
+            gateWeight,
+            upWeight,
+            gateScale,
+            upScale,
+            inputGlobalScale,
+            inputGlobalScale,
+            weightGlobalScale,
+            weightGlobalScale,
+            IR.NN.GluType.SwiGLU,
+            DataTypes.BFloat16,
+            16);
+        CompilerServices.InferenceType(expr);
+
+        var context = new Nncase.Passes.RunPassContext();
+        var post = (Expr)CompilerServices.Rewrite(
+            expr,
+            [new PackNVFP4MatMulGluRhsKMajor(16, 2)],
+            context);
+        CompilerServices.InferenceType(post);
+        var packedCall = Assert.Single(
+            ExprCollector.Collect(post).OfType<Call>().Where(
+                call => call.Target is IR.NTT.PackedNVFP4MatMulGlu));
+
+        Assert.Equal(expr.CheckedType, post.CheckedType);
+        Assert.Same(
+            packedInput,
+            packedCall.Arguments[IR.NTT.PackedNVFP4MatMulGlu.Input.Index]);
+        AssertPackedBuffer(
+            packedCall,
+            IR.NTT.PackedNVFP4MatMulGlu.GateWeightPacked.Index,
+            new RankedShape(128, 1),
+            new VectorType(DataTypes.UInt8, [2, 16]));
+        AssertPackedBuffer(
+            packedCall,
+            IR.NTT.PackedNVFP4MatMulGlu.UpWeightPacked.Index,
+            new RankedShape(128, 1),
+            new VectorType(DataTypes.UInt8, [2, 16]));
+    }
+
+    [Fact]
     public void TestVectorizedMatMulDevectorizePropagation()
     {
         var lhs = Pack(Testing.Rand<float>(3, 24), [8], [1]).Evaluate().AsTensor();
@@ -264,5 +363,16 @@ public class UnitTestVectorizeVectorizedMatMul : TransformTestBase
             new Dictionary<IVar, IValue> {
                 { lhsVar, Value.FromTensor(lhs) },
             });
+    }
+
+    private static void AssertPackedBuffer(
+        Call call,
+        int index,
+        RankedShape shape,
+        DataType dataType)
+    {
+        var argument = Assert.IsAssignableFrom<Expr>(call.Arguments[index]);
+        Assert.Equal(shape, argument.CheckedShape);
+        Assert.Equal(dataType, argument.CheckedDataType);
     }
 }

@@ -281,6 +281,31 @@ public static class NN
             gateWeightScale,
             upWeightScale);
 
+    public static Call NVFP4MatMulGlu(
+        Expr input,
+        Expr gateWeightPacked,
+        Expr upWeightPacked,
+        Expr gateWeightScale,
+        Expr upWeightScale,
+        Expr gateInputGlobalScale,
+        Expr upInputGlobalScale,
+        Expr gateWeightGlobalScale,
+        Expr upWeightGlobalScale,
+        GluType gluType,
+        DataType outputDataType,
+        long groupSize = 16)
+        => new(
+            new NVFP4MatMulGlu(gluType, outputDataType, groupSize),
+            input,
+            gateWeightPacked,
+            upWeightPacked,
+            gateWeightScale,
+            upWeightScale,
+            gateInputGlobalScale,
+            upInputGlobalScale,
+            gateWeightGlobalScale,
+            upWeightGlobalScale);
+
     public static Call PRelu(Expr input, Expr slope) => new Call(new PRelu(), input, slope);
 
     public static Call Selu(Expr input, Expr alpha, Expr gamma) => new Call(new Selu(), input, alpha, gamma);

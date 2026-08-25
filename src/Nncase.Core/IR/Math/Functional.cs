@@ -271,6 +271,25 @@ public static class Math
             rhsScale);
 
     /// <summary>
+    /// Creates an NVFP4 matrix multiplication with dynamically quantized activations.
+    /// </summary>
+    public static Call NVFP4MatMul(
+        Expr lhs,
+        Expr rhsPacked,
+        Expr rhsScale,
+        Expr lhsGlobalScale,
+        Expr rhsGlobalScale,
+        DataType outputDataType,
+        long groupSize = 16)
+        => new(
+            new NVFP4MatMul(outputDataType, groupSize),
+            lhs,
+            rhsPacked,
+            rhsScale,
+            lhsGlobalScale,
+            rhsGlobalScale);
+
+    /// <summary>
     /// Call max.
     /// </summary>
     /// <param name="lhs">Left operand.</param>
