@@ -127,19 +127,21 @@ public sealed partial class GatedDeltaNetRecurrentCore : Op
 
     public static readonly ParameterInfo Z = new(typeof(GatedDeltaNetRecurrentCore), 2, "z", ParameterKind.Input);
 
-    public static readonly ParameterInfo BProjection = new(typeof(GatedDeltaNetRecurrentCore), 3, "b_projection", ParameterKind.Input);
+    public static readonly ParameterInfo ProjectionInput = new(typeof(GatedDeltaNetRecurrentCore), 3, "projection_input", ParameterKind.Input);
 
-    public static readonly ParameterInfo AProjection = new(typeof(GatedDeltaNetRecurrentCore), 4, "a_projection", ParameterKind.Input);
+    public static readonly ParameterInfo BWeight = new(typeof(GatedDeltaNetRecurrentCore), 4, "b_weight", ParameterKind.Input);
 
-    public static readonly ParameterInfo ALog = new(typeof(GatedDeltaNetRecurrentCore), 5, "a_log", ParameterKind.Input);
+    public static readonly ParameterInfo AWeight = new(typeof(GatedDeltaNetRecurrentCore), 5, "a_weight", ParameterKind.Input);
 
-    public static readonly ParameterInfo DtBias = new(typeof(GatedDeltaNetRecurrentCore), 6, "dt_bias", ParameterKind.Input);
+    public static readonly ParameterInfo ALog = new(typeof(GatedDeltaNetRecurrentCore), 6, "a_log", ParameterKind.Input);
 
-    public static readonly ParameterInfo NormWeight = new(typeof(GatedDeltaNetRecurrentCore), 7, "norm_weight", ParameterKind.Input);
+    public static readonly ParameterInfo DtBias = new(typeof(GatedDeltaNetRecurrentCore), 7, "dt_bias", ParameterKind.Input);
+
+    public static readonly ParameterInfo NormWeight = new(typeof(GatedDeltaNetRecurrentCore), 8, "norm_weight", ParameterKind.Input);
 
     public static readonly ParameterInfo LayerId = new(
         typeof(GatedDeltaNetRecurrentCore),
-        8,
+        9,
         "layer_id",
         TypePatternUtility.IsDimensionType(),
         ParameterKind.Attribute);

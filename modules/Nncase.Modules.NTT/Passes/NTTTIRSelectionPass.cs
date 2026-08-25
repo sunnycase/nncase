@@ -166,8 +166,33 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
                     (Expr)arguments[IR.NTT.PackedBlockScaledMatMul.RhsScale.Index],
                     output,
                     blockScaledMatmul.RhsLayout,
+                    blockScaledMatmul.OutputNVectorLaneCount,
                     blockScaledMatmul.WeightBlockN,
-                    blockScaledMatmul.WeightBlockK);
+                    blockScaledMatmul.WeightBlockK,
+                    (Expr)arguments[IR.NTT.PackedBlockScaledMatMul.Addend.Index]);
+            case IR.NTT.PackedBlockScaledMatMulNormStats blockScaledMatmulNormStats:
+                {
+                    var outputBase = Unsafe.As<Expr, BaseExpr>(ref output);
+                    if (outputBase is not IR.Tuple outputs || outputs.Count != 2)
+                    {
+                        throw new NotSupportedException(
+                            "PackedBlockScaledMatMulNormStats TIR selection expects value and local-statistics outputs.");
+                    }
+
+                    return TIR.F.NTT.PackedBlockScaledMatMulNormStats(
+                        (Expr)arguments[IR.NTT.PackedBlockScaledMatMulNormStats.Lhs.Index],
+                        (Expr)arguments[IR.NTT.PackedBlockScaledMatMulNormStats.Rhs.Index],
+                        (Expr)arguments[IR.NTT.PackedBlockScaledMatMulNormStats.RhsScale.Index],
+                        (Expr)outputs[0],
+                        (Expr)outputs[1],
+                        (Expr)arguments[IR.NTT.PackedBlockScaledMatMulNormStats.Addend.Index],
+                        blockScaledMatmulNormStats.RhsLayout,
+                        blockScaledMatmulNormStats.OutputNVectorLaneCount,
+                        blockScaledMatmulNormStats.WeightBlockN,
+                        blockScaledMatmulNormStats.WeightBlockK,
+                        blockScaledMatmulNormStats.Axis,
+                        blockScaledMatmulNormStats.UseMean);
+                }
             case IR.NTT.PackedMatMulNormStats matmulNormStats:
                 {
                     var outputBase = Unsafe.As<Expr, BaseExpr>(ref output);
@@ -348,16 +373,24 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
                     Unsafe.As<Expr, BaseExpr>(ref output) = new IR.Tuple(
                         gatedOutput,
                         (Expr)arguments[IR.NN.GatedDeltaNetRecurrentCore.State.Index]);
+                    var coreScratch = CreateMetadataBuffer(
+                        new TensorType(
+                            DataTypes.Float32,
+                            new RankedShape(recurrent.NumValueHeads, recurrent.ValueHeadDim)),
+                        MemoryLocation.ChipLocalData,
+                        "gated_delta_net_core");
 
                     return TIR.F.NTT.GatedDeltaNetRecurrentCore(
                         (Expr)arguments[IR.NN.GatedDeltaNetRecurrentCore.State.Index],
                         (Expr)arguments[IR.NN.GatedDeltaNetRecurrentCore.QKV.Index],
                         (Expr)arguments[IR.NN.GatedDeltaNetRecurrentCore.Z.Index],
-                        (Expr)arguments[IR.NN.GatedDeltaNetRecurrentCore.BProjection.Index],
-                        (Expr)arguments[IR.NN.GatedDeltaNetRecurrentCore.AProjection.Index],
+                        (Expr)arguments[IR.NN.GatedDeltaNetRecurrentCore.ProjectionInput.Index],
+                        (Expr)arguments[IR.NN.GatedDeltaNetRecurrentCore.BWeight.Index],
+                        (Expr)arguments[IR.NN.GatedDeltaNetRecurrentCore.AWeight.Index],
                         (Expr)arguments[IR.NN.GatedDeltaNetRecurrentCore.ALog.Index],
                         (Expr)arguments[IR.NN.GatedDeltaNetRecurrentCore.DtBias.Index],
                         (Expr)arguments[IR.NN.GatedDeltaNetRecurrentCore.NormWeight.Index],
+                        coreScratch,
                         gatedOutput,
                         (Dimension)arguments[IR.NN.GatedDeltaNetRecurrentCore.LayerId.Index],
                         recurrent.NumKeyHeads,

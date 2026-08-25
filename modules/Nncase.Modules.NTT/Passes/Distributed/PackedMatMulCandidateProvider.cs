@@ -82,12 +82,11 @@ internal static class PackedMatMulDistributedCandidates
         alignedRhs = null!;
         if (lhs.Placement != rhs.Placement ||
             rhs.TensorType.DType is not VectorType rhsVectorType ||
-            !PackedMatMulEvaluator.TryGetLayoutInfo(
+            !PackedMatMulEvaluator.TryGetRhsLayoutInfo(
                 rhsLayout,
                 rhsVectorType,
                 rhs.TensorType.Shape.Rank,
                 out var rhsUnpackAxes,
-                out _,
                 out var transposeB,
                 out _) ||
             TypeInference.UnpackType(rhs, rhsUnpackAxes) is not DistributedType logicalRhs)
@@ -239,7 +238,7 @@ internal sealed class PackedBlockScaledMatMulCandidateProvider :
         PackedBlockScaledMatMul target,
         IReadOnlyList<IRType> defaultReturnTypes)
         => defaultReturnTypes
-            .Concat(Enumerate(context, target).Select(candidate => candidate.OutputType))
+            .Concat(EnumerateCandidates(context, target).Select(candidate => candidate.OutputType))
             .Distinct()
             .ToArray();
 
@@ -249,24 +248,109 @@ internal sealed class PackedBlockScaledMatMulCandidateProvider :
         IRType returnType,
         out IReadOnlyList<DistributedCandidateTuple> tuples)
     {
-        tuples = Enumerate(context, target)
+        tuples = EnumerateCandidates(context, target)
             .Where(candidate => candidate.OutputType == returnType)
+            .Concat(EnumerateFromOutput(context, target, returnType))
             .Select(candidate => new DistributedCandidateTuple(
-                [candidate.Lhs, candidate.Rhs, candidate.RhsScale],
+                [candidate.Lhs, candidate.Rhs, candidate.RhsScale, candidate.Addend],
                 "packed-block-scaled-matmul-reduction-sbp"))
             .Distinct()
             .ToArray();
         return true;
     }
 
-    private static IEnumerable<PackedBlockScaledMatMulDistributedCandidate> Enumerate(
+    internal static IEnumerable<PackedBlockScaledMatMulDistributedCandidate> EnumerateFromOutput(
         DistributedCandidateContext context,
-        PackedBlockScaledMatMul target)
+        PackedBlockScaledMatMul target,
+        IRType returnType)
     {
-        if (context.AvailableInputTypes.Count != 3)
+        if (target.RhsLayout != PackedMatMulRhsLayout.NMajorKPacked ||
+            context.AvailableInputTypes.Count != 4 ||
+            returnType is not DistributedType output ||
+            output.TensorType.DType is not VectorType outputVector ||
+            outputVector.Lanes is not [var outputLane] ||
+            outputLane != target.OutputNVectorLaneCount ||
+            output.TensorType.Shape is not RankedShape { Rank: 2 } ||
+            TypeInference.UnpackType(output, [1]) is not DistributedType logicalOutput ||
+            ScaledMatMulEvaluator.GetTensorType(
+                context.SourceCall.Arguments[PackedBlockScaledMatMul.Rhs.Index].CheckedType) is not
+                { DType: VectorType rhsVector, Shape: RankedShape { Rank: 2 } } rhsTensor ||
+            !PackedMatMulEvaluator.TryGetRhsLayoutInfo(
+                target.RhsLayout,
+                rhsVector,
+                rhsTensor.Shape.Rank,
+                out var rhsUnpackAxes,
+                out var transposeB,
+                out _) ||
+            !transposeB ||
+            TypeInference.UnpackType(rhsTensor, rhsUnpackAxes) is not TensorType
+                { Shape: RankedShape { Rank: 2 } } logicalRhsTensor)
         {
             yield break;
         }
+
+        var hasAddend = context.AvailableInputTypes[PackedBlockScaledMatMul.Addend.Index]
+            .Any(type => type is not NoneType);
+        if (hasAddend && output.Partial is not null)
+        {
+            yield break;
+        }
+
+        foreach (var lhs in context.AvailableInputTypes[PackedBlockScaledMatMul.Lhs.Index]
+                     .OfType<DistributedType>()
+                     .Where(type =>
+                         type.Partial is null &&
+                         type.Placement == output.Placement &&
+                         type.TensorType.Shape is RankedShape { Rank: 2 }))
+        {
+            var logicalRhs = new DistributedType(
+                logicalRhsTensor,
+                [logicalOutput.AxisPolicies[1], lhs.AxisPolicies[1]],
+                output.Placement);
+            if (!DistributedUtility.IsDistributable(
+                    logicalRhs.TensorType,
+                    logicalRhs.AxisPolicies,
+                    logicalRhs.Placement) ||
+                TypeInference.PackType(logicalRhs, rhsVector.Lanes.ToArray(), rhsUnpackAxes) is not
+                    DistributedType packedRhs ||
+                packedRhs.TensorType != rhsTensor)
+            {
+                continue;
+            }
+
+            foreach (var rhsScale in context.AvailableInputTypes[PackedBlockScaledMatMul.RhsScale.Index]
+                         .Where(type => IsReplicatedScale(type, output.Placement)))
+            {
+                var inferredOutput = PackedBlockScaledMatMulEvaluator.InferType(
+                    target,
+                    lhs,
+                    packedRhs,
+                    rhsScale,
+                    hasAddend ? output : NoneType.Default);
+                if (inferredOutput == output)
+                {
+                    yield return new(
+                        lhs,
+                        packedRhs,
+                        rhsScale,
+                        hasAddend ? output : NoneType.Default,
+                        output);
+                }
+            }
+        }
+    }
+
+    internal static IEnumerable<PackedBlockScaledMatMulDistributedCandidate> EnumerateCandidates(
+        DistributedCandidateContext context,
+        PackedBlockScaledMatMul target)
+    {
+        if (context.AvailableInputTypes.Count != 4)
+        {
+            yield break;
+        }
+
+        var hasAddend = context.AvailableInputTypes[PackedBlockScaledMatMul.Addend.Index]
+            .Any(type => type is not NoneType);
 
         foreach (var lhs in context.AvailableInputTypes[PackedBlockScaledMatMul.Lhs.Index]
                      .OfType<DistributedType>()
@@ -292,10 +376,24 @@ internal sealed class PackedBlockScaledMatMulCandidateProvider :
                         target,
                         lhs,
                         alignedRhs,
-                        rhsScale);
-                    if (outputType is not InvalidType)
+                        rhsScale,
+                        NoneType.Default);
+                    if (outputType is InvalidType ||
+                        (hasAddend && outputType is DistributedType { Partial: not null }))
                     {
-                        yield return new(lhs, alignedRhs, rhsScale, outputType);
+                        continue;
+                    }
+
+                    var addend = hasAddend ? outputType : NoneType.Default;
+                    var finalOutputType = PackedBlockScaledMatMulEvaluator.InferType(
+                        target,
+                        lhs,
+                        alignedRhs,
+                        rhsScale,
+                        addend);
+                    if (finalOutputType is not InvalidType)
+                    {
+                        yield return new(lhs, alignedRhs, rhsScale, addend, finalOutputType);
                     }
                 }
             }
@@ -319,6 +417,120 @@ internal sealed class PackedBlockScaledMatMulCandidateProvider :
                 distributed.AxisPolicies.All(policy => policy is SBPBroadCast),
             _ => false,
         };
+    }
+}
+
+/// <summary>
+/// Propagates block-scaled packed-matmul layouts while preserving the coupled
+/// value and local normalization-statistics return types.
+/// </summary>
+internal sealed class PackedBlockScaledMatMulNormStatsCandidateProvider :
+    DistributedCandidateProvider<PackedBlockScaledMatMulNormStats>
+{
+    public override IReadOnlyList<IRType> GetReturnCandidateTypes(
+        DistributedCandidateContext context,
+        PackedBlockScaledMatMulNormStats target,
+        IReadOnlyList<IRType> defaultReturnTypes)
+        => defaultReturnTypes
+            .Concat(EnumerateCandidates(
+                context,
+                target,
+                EnumerateValueOutputCandidates(context, defaultReturnTypes))
+                .Select(candidate => candidate.OutputType))
+            .Distinct()
+            .ToArray();
+
+    public override bool TryGetInputTypeTuples(
+        DistributedCandidateContext context,
+        PackedBlockScaledMatMulNormStats target,
+        IRType returnType,
+        out IReadOnlyList<DistributedCandidateTuple> tuples)
+    {
+        var valueOutput = returnType is TupleType { Count: 2 } tupleType
+            ? tupleType.Fields[0]
+            : null;
+        tuples = EnumerateCandidates(
+                context,
+                target,
+                valueOutput is null ? [] : [valueOutput])
+            .Where(candidate => candidate.OutputType == returnType)
+            .Distinct()
+            .Select(candidate => new DistributedCandidateTuple(
+                [candidate.Lhs, candidate.Rhs, candidate.RhsScale, candidate.Addend],
+                "packed-block-scaled-matmul-norm-stats-reduction-sbp"))
+            .ToArray();
+        return true;
+    }
+
+    private static IEnumerable<PackedBlockScaledMatMulDistributedCandidate> EnumerateCandidates(
+        DistributedCandidateContext context,
+        PackedBlockScaledMatMulNormStats target,
+        IEnumerable<IRType> valueOutputCandidates)
+    {
+        var packedTarget = new PackedBlockScaledMatMul(
+            target.OutputDataType,
+            target.RhsLayout,
+            target.OutputNVectorLaneCount,
+            target.WeightBlockN,
+            target.WeightBlockK);
+        foreach (var candidate in PackedBlockScaledMatMulCandidateProvider.EnumerateCandidates(
+                     context,
+                     packedTarget))
+        {
+            var outputType = PackedBlockScaledMatMulNormStatsEvaluator.InferType(
+                target,
+                candidate.Lhs,
+                candidate.Rhs,
+                candidate.RhsScale,
+                candidate.Addend);
+            if (outputType is not InvalidType)
+            {
+                yield return candidate with { OutputType = outputType };
+            }
+        }
+
+        foreach (var valueOutput in valueOutputCandidates)
+        {
+            foreach (var candidate in PackedBlockScaledMatMulCandidateProvider.EnumerateFromOutput(
+                         context,
+                         packedTarget,
+                         valueOutput))
+            {
+                var outputType = PackedBlockScaledMatMulNormStatsEvaluator.InferType(
+                    target,
+                    candidate.Lhs,
+                    candidate.Rhs,
+                    candidate.RhsScale,
+                    candidate.Addend);
+                if (outputType is not InvalidType)
+                {
+                    yield return candidate with { OutputType = outputType };
+                }
+            }
+        }
+    }
+
+    private static IEnumerable<IRType> EnumerateValueOutputCandidates(
+        DistributedCandidateContext context,
+        IReadOnlyList<IRType> defaultReturnTypes)
+    {
+        if (context.SourceCall.CheckedType is not TupleType { Count: 2 } sourceOutput ||
+            sourceOutput.Fields[0] is not TensorType valueTensorType)
+        {
+            yield break;
+        }
+
+        var placements = defaultReturnTypes
+            .OfType<TupleType>()
+            .SelectMany(tuple => tuple.Fields.OfType<DistributedType>())
+            .Concat(context.AvailableInputTypes.SelectMany(types => types).OfType<DistributedType>())
+            .Select(type => type.Placement)
+            .Distinct()
+            .ToArray();
+        foreach (var candidate in context.GetLeafCandidateTypes(valueTensorType, placements))
+        {
+            yield return candidate;
+        }
     }
 }
 
@@ -429,4 +641,5 @@ internal sealed record PackedBlockScaledMatMulDistributedCandidate(
     IRType Lhs,
     IRType Rhs,
     IRType RhsScale,
+    IRType Addend,
     IRType OutputType);

@@ -1,6 +1,38 @@
+{% macro pipeline_setup(stage) -%}
+{% set stage_model = stage["Model"] %}
+{% set stage_ctx = gated_delta_net_recurrent_core_context(stage_model) %}
+{% set shared_buffer_shape = [stage_ctx["num_stages"]] + (stage_ctx["projection_weight_stage_shape"] | list) %}
+{% for weight in ("b", "a") %}
+{{ stage["StageName"] }}__{{ weight }}_projection_stages = tle.gpu.alloc(
+    [{{ shared_buffer_shape | join(", ") }}],
+    dtype={{ stage_model["ActivationTritonDType"] }},
+    layout=tle.gpu.nv_tma_shared_layout(
+        [{{ shared_buffer_shape | join(", ") }}],
+        [{{ range((shared_buffer_shape | length) - 1, -1, -1) | join(", ") }}],
+        {{ stage_model["ActivationTritonDType"] }},
+        [{% for _ in shared_buffer_shape %}1{{ ", " if not loop.last }}{% endfor %}],
+        [{% for _ in shared_buffer_shape %}1{{ ", " if not loop.last }}{% endfor %}],
+        [{{ range((shared_buffer_shape | length) - 1, -1, -1) | join(", ") }}],
+        False,
+        True,
+    ),
+    scope=tle.gpu.smem,
+    alias=pyntt_shared_arena,
+    alias_offset_bytes={{ stage["SharedWorkspaceOffsets"][weight ~ "_projection_stage"] }},
+)
+{% endfor %}
+{{ stage["PipeName"] }} = tle.pipe(
+    capacity={{ stage_ctx["num_stages"] }},
+    scope="cta",
+    name="{{ stage["StageName"] }}_projection",
+    b_weight={{ stage["StageName"] }}__b_projection_stages,
+    a_weight={{ stage["StageName"] }}__a_projection_stages,
+)
+{%- endmacro %}
+{% if model is defined %}
 {% import "triton/kernels/_common.py.jinja" as common with context %}
-{% import "triton/kernels/_producer_consumer.py.jinja" as phases with context %}
-{% set repeats = model["NumValueHeads"] // model["NumKeyHeads"] %}
+{% set ctx = gated_delta_net_recurrent_core_context(model) %}
+{% set repeats = ctx["value_heads_per_key_head"] %}
 {% macro state_axis_offset(coordinate, axis) -%}
 {% if axis["LaneCount"] == 1 -%}
 ({{ coordinate }}) * {{ axis["BlockStride"] }}
@@ -9,137 +41,687 @@
 {%- endif %}
 {%- endmacro %}
 # generated from PyNTT algorithm triton.gated_delta_net/recurrent_core
-# {{ model["Comment"] }}; key_heads={{ model["NumKeyHeads"] }}, value_heads={{ model["NumValueHeads"] }}, key_dim={{ model["KeyHeadDim"] }}, value_dim={{ model["ValueHeadDim"] }}, local_value_head_capacity={{ model["LocalValueHeadCapacity"] }}
-@triton.jit
-def {{ model["FunctionName"] }}__consumer({{ helper_parameters(model) }}):
+# {{ model["Comment"] }}; hidden={{ model["HiddenSize"] }}, key_heads={{ model["NumKeyHeads"] }}, value_heads={{ model["NumValueHeads"] }}, key_dim={{ model["KeyHeadDim"] }}, value_dim={{ model["ValueHeadDim"] }}, ctas_per_key_head={{ ctx["ctas_per_key_head"] }}, state_waves={{ ctx["state_waves"] }}
+{{ model["FunctionName"] }}__projection_layout = tl.constexpr(
+    tle.gpu.BlockEncoding(
+        [1, 8],
+        [1, 32],
+        [{{ ctx["projection_heads_per_group"] }}, {{ ctx["projection_k_warps"] }}],
+        [1, 0],
+    )
+)
+{{ model["FunctionName"] }}__projection_head_layout = tl.constexpr(
+    tle.gpu.SlicedEncoding(
+        1,
+        {{ model["FunctionName"] }}__projection_layout.value,
+    )
+)
+{{ model["FunctionName"] }}__state_layout = tl.constexpr(
+    tle.gpu.BlockEncoding(
+        [1, 1, {{ model["KeyBlockSize"] // 32 }}],
+        [1, 1, 32],
+        [8, 1, 1],
+        [2, 1, 0],
+    )
+)
+{{ model["FunctionName"] }}__qk_layout = tl.constexpr(
+    tle.gpu.SlicedEncoding(
+        1,
+        {{ model["FunctionName"] }}__state_layout.value,
+    )
+)
+{{ model["FunctionName"] }}__value_layout = tl.constexpr(
+    tle.gpu.SlicedEncoding(
+        2,
+        {{ model["FunctionName"] }}__state_layout.value,
+    )
+)
+{{ model["FunctionName"] }}__gate_layout = tl.constexpr(
+    tle.gpu.BlockEncoding(
+        [1, 1],
+        [{{ ctx["state_key_threads"] }}, {{ ctx["state_value_threads"] }}],
+        [8, 1],
+        [1, 0],
+    )
+)
+
+
+{{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
+def {{ model["FunctionName"] }}__producer(writer, {{ helper_parameters(model) }}):
 {{ common.mesh_coordinates(model["MeshAxes"]) }}
+    global_key_head = shard_index // {{ ctx["ctas_per_key_head"] }}
+    key_head_owner = shard_index % {{ ctx["ctas_per_key_head"] }}
+    projection_task_begin = key_head_owner * {{ ctx["state_tasks_per_cta"] }}
+    projection_first_value_head = projection_task_begin // {{ ctx["value_tiles_per_head"] }}
+    projection_global_head = (
+        global_key_head * {{ repeats }} + projection_first_value_head
+    ).to(tl.int32)
+{% for weight in ("b", "a") %}
+{% if ctx[weight ~ "_weight_descriptor_owner_indexed"] %}
+    {{ weight }}_weight_descriptor_entry = tle.gpu.tensor_map_table_entry(
+        {{ ctx[weight ~ "_weight_descriptor_name"] }},
+        shard_index,
+    )
+    tle.gpu.tensor_map_fenceproxy_acquire(
+        {{ weight }}_weight_descriptor_entry
+    )
+{% endif %}
+{% endfor %}
+    for projection_k_tile in tl.range(0, {{ ctx["num_k_tiles"] }}):
+        sequence = projection_k_tile.to(tl.int32)
+        slot = writer.acquire(sequence)
+{% for weight in ("b", "a") %}
+{% if ctx[weight ~ "_weight_descriptor_owner_indexed"] %}
+        {{ weight }}_weight_descriptor = tle.gpu.reinterpret_tensor_map(
+            {{ weight }}_weight_descriptor_entry,
+            slot.{{ weight }}_weight,
+        )
+{% endif %}
+{% endfor %}
+        tle.gpu.copy(
+{% if ctx["b_weight_descriptor_owner_indexed"] %}
+            b_weight_descriptor,
+{% else %}
+            {{ ctx["b_weight_descriptor_name"] }},
+{% endif %}
+            slot.b_weight,
+            [{{ ctx["projection_tma_block_shape"] | join(", ") }}],
+            offsets=[
+                projection_global_head,
+                projection_k_tile * {{ ctx["block_k"] // ctx["projection_tma_k_atom"] }},
+                {{ ctx["b_weight_descriptor_origin"] }},
+            ],
+            eviction_policy="evict_first",
+        )
+        tle.gpu.copy(
+{% if ctx["a_weight_descriptor_owner_indexed"] %}
+            a_weight_descriptor,
+{% else %}
+            {{ ctx["a_weight_descriptor_name"] }},
+{% endif %}
+            slot.a_weight,
+            [{{ ctx["projection_tma_block_shape"] | join(", ") }}],
+            offsets=[
+                projection_global_head,
+                projection_k_tile * {{ ctx["block_k"] // ctx["projection_tma_k_atom"] }},
+                {{ ctx["a_weight_descriptor_origin"] }},
+            ],
+            eviction_policy="evict_first",
+        )
+        writer.commit(sequence)
+    writer.close({{ ctx["num_k_tiles"] }})
+
+
+{{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
+def {{ model["FunctionName"] }}__consumer(reader, {{ helper_parameters(model) }}):
+{{ common.mesh_coordinates(model["MeshAxes"]) }}
+    projection_stage = tle.gpu.alloc(
+        [2, {{ ctx["projection_capacity"] }}],
+        dtype=tl.float32,
+        layout=None,
+        scope=tle.gpu.smem,
+        alias=pyntt_shared_arena,
+        alias_offset_bytes={{ ctx["microkernel"]["shared_workspace_offsets"]["projection_stage"] }},
+        nv_mma_shared_layout=False,
+    )
     recurrent_state = {{ ptr(model, "RecurrentState") }}
     qkv = {{ ptr(model, "QKV") }}
     z = {{ ptr(model, "Z") }}
-    b_projection = {{ ptr(model, "BProjection") }}
-    a_projection = {{ ptr(model, "AProjection") }}
+    projection_input = {{ ptr(model, "ProjectionInput") }}
     a_log = {{ ptr(model, "ALog") }}
     dt_bias = {{ ptr(model, "DtBias") }}
     norm_weight = {{ ptr(model, "NormWeight") }}
+    core_scratch = {{ ptr(model, "CoreScratch") }}
     gated_output = {{ ptr(model, "GatedOutput") }}
-    active_local_value_heads = {{ model["ActiveLocalValueHeads"] }}
-    key_lane = tl.arange(0, {{ model["KeyBlockSize"] }})
-    value_lane = tl.arange(0, {{ model["ValueBlockSize"] }})
-    key_mask = key_lane < {{ model["KeyHeadDim"] }}
-    value_mask = value_lane < {{ model["ValueHeadDim"] }}
+    global_key_head = shard_index // {{ ctx["ctas_per_key_head"] }}
+    key_head_owner = shard_index % {{ ctx["ctas_per_key_head"] }}
+    projection_task_begin = key_head_owner * {{ ctx["state_tasks_per_cta"] }}
+    projection_task_end = tl.minimum(
+        projection_task_begin + {{ ctx["state_tasks_per_cta"] }},
+        {{ ctx["value_tiles_per_key_head"] }},
+    )
+    projection_first_value_head = projection_task_begin // {{ ctx["value_tiles_per_head"] }}
+    projection_value_head_count = (
+        (projection_task_end + {{ ctx["value_tiles_per_head"] - 1 }})
+        // {{ ctx["value_tiles_per_head"] }}
+        - projection_first_value_head
+    )
 
-    for local_head in tl.range(0, {{ model["LocalValueHeadCapacity"] }}):
-        local_head_active = local_head < active_local_value_heads
-{% set global_value = pointer_local_to_global_coordinate(model["GatedOutput"], 1, "local_head * " ~ model["ValueHeadDim"]) %}
-        global_value_head = ({{ global_value }}) // {{ model["ValueHeadDim"] }}
-        global_key_head = global_value_head // {{ repeats }}
-        query_channel = global_key_head * {{ model["KeyHeadDim"] }} + key_lane
-        key_channel = (
-            {{ model["NumKeyHeads"] * model["KeyHeadDim"] }}
-            + global_key_head * {{ model["KeyHeadDim"] }}
-            + key_lane
+    projection_head_slot = tle.encoding(
+        tl.arange(0, {{ ctx["projection_heads_per_group"] }}),
+        {{ model["FunctionName"] }}__projection_head_layout,
+    )
+    projection_k = tle.encoding(
+        tl.arange(0, {{ ctx["block_k"] }}),
+        tle.gpu.SlicedEncoding(
+            0,
+            {{ model["FunctionName"] }}__projection_layout.value,
+        ),
+    )
+    projection_k_matrix = tle.encoding(
+        tl.broadcast_to(
+            projection_k[None, :],
+            ({{ ctx["projection_heads_per_group"] }}, {{ ctx["block_k"] }}),
+        ),
+        {{ model["FunctionName"] }}__projection_layout,
+    )
+{% for projection_group in range(ctx["projection_groups"]) %}
+    b_projection_partial_{{ projection_group }} = tle.encoding(
+        tl.zeros(({{ ctx["projection_heads_per_group"] }}, {{ ctx["block_k"] }}), tl.float32),
+        {{ model["FunctionName"] }}__projection_layout,
+    )
+    a_projection_partial_{{ projection_group }} = tle.encoding(
+        tl.zeros(({{ ctx["projection_heads_per_group"] }}, {{ ctx["block_k"] }}), tl.float32),
+        {{ model["FunctionName"] }}__projection_layout,
+    )
+{% endfor %}
+    for projection_k_tile in tl.range(0, {{ ctx["num_k_tiles"] }}):
+        sequence = projection_k_tile.to(tl.int32)
+        ready = reader.wait(sequence)
+        projection_k_offset = projection_k_tile * {{ ctx["block_k"] }} + projection_k_matrix
+{% for projection_group in range(ctx["projection_groups"]) %}
+        projection_stage_slot_{{ projection_group }} = tle.encoding(
+            projection_first_value_head
+            + {{ projection_group * ctx["projection_heads_per_group"] }}
+            + projection_head_slot,
+            {{ model["FunctionName"] }}__projection_head_layout,
         )
-        value_channel = (
-            {{ model["NumKeyHeads"] * model["KeyHeadDim"] * 2 }}
-            + global_value_head * {{ model["ValueHeadDim"] }}
-            + value_lane
+        projection_mask_{{ projection_group }} = (
+            (
+                {{ projection_group * ctx["projection_heads_per_group"] }}
+                + projection_head_slot[:, None]
+                < projection_value_head_count
+            )
+            & (projection_stage_slot_{{ projection_group }}[:, None] < {{ repeats }})
+            & (projection_k_offset < {{ model["HiddenSize"] }})
         )
-        query = tl.load(
-            {{ access_pointer(model, "QKV", "qkv", contiguous_vector_axis_access(["0", "0"], model["QKVStrides"], packed_axis=1, logical_index="query_channel", lane_count=model["QKVLaneCount"], global_coordinate_axes=[1])) }},
-            mask=key_mask & local_head_active,
+        projection_input_value_{{ projection_group }} = tl.load(
+            {{ access_pointer(model, "ProjectionInput", "projection_input", contiguous_vector_axis_access(["0", "0"], model["ProjectionInputStrides"], packed_axis=1, logical_index="projection_k_offset", lane_count=model["ProjectionInputLaneCount"])) }},
+            mask=projection_mask_{{ projection_group }},
             other=0.0,
         ).to(tl.float32)
-        key = tl.load(
-            {{ access_pointer(model, "QKV", "qkv", contiguous_vector_axis_access(["0", "0"], model["QKVStrides"], packed_axis=1, logical_index="key_channel", lane_count=model["QKVLaneCount"], global_coordinate_axes=[1])) }},
-            mask=key_mask & local_head_active,
-            other=0.0,
-        ).to(tl.float32)
+        projection_shared_head_{{ projection_group }} = tle.encoding(
+            tl.broadcast_to(
+                (
+                    {{ projection_group * ctx["projection_heads_per_group"] }}
+                    + projection_head_slot
+                )[:, None],
+                ({{ ctx["projection_heads_per_group"] }}, {{ ctx["block_k"] }}),
+            ),
+            {{ model["FunctionName"] }}__projection_layout,
+        )
+        b_projection_ptr_{{ projection_group }} = tle.gpu.local_ptr(
+            ready.slot.b_weight,
+            (
+                projection_shared_head_{{ projection_group }},
+                projection_k_matrix // {{ ctx["projection_tma_k_atom"] }},
+                projection_k_matrix % {{ ctx["projection_tma_k_atom"] }},
+            ),
+            shape=({{ ctx["projection_heads_per_group"] }}, {{ ctx["block_k"] }}),
+        )
+        b_projection_ptr_{{ projection_group }} = tl.max_contiguous(
+            b_projection_ptr_{{ projection_group }},
+            [1, 8],
+        )
+        b_projection_ptr_{{ projection_group }} = tl.multiple_of(
+            b_projection_ptr_{{ projection_group }},
+            [1, 16],
+        )
+        a_projection_ptr_{{ projection_group }} = tle.gpu.local_ptr(
+            ready.slot.a_weight,
+            (
+                projection_shared_head_{{ projection_group }},
+                projection_k_matrix // {{ ctx["projection_tma_k_atom"] }},
+                projection_k_matrix % {{ ctx["projection_tma_k_atom"] }},
+            ),
+            shape=({{ ctx["projection_heads_per_group"] }}, {{ ctx["block_k"] }}),
+        )
+        a_projection_ptr_{{ projection_group }} = tl.max_contiguous(
+            a_projection_ptr_{{ projection_group }},
+            [1, 8],
+        )
+        a_projection_ptr_{{ projection_group }} = tl.multiple_of(
+            a_projection_ptr_{{ projection_group }},
+            [1, 16],
+        )
+        b_projection_partial_{{ projection_group }} += (
+            projection_input_value_{{ projection_group }}
+            * tl.load(b_projection_ptr_{{ projection_group }}).to(tl.float32)
+        )
+        a_projection_partial_{{ projection_group }} += (
+            projection_input_value_{{ projection_group }}
+            * tl.load(a_projection_ptr_{{ projection_group }}).to(tl.float32)
+        )
+{% endfor %}
+        reader.release(sequence)
+{% for projection_group in range(ctx["projection_groups"]) %}
+    projection_stage_slot_{{ projection_group }} = tle.encoding(
+        projection_first_value_head
+        + {{ projection_group * ctx["projection_heads_per_group"] }}
+        + projection_head_slot,
+        {{ model["FunctionName"] }}__projection_head_layout,
+    )
+    projection_stage_row_{{ projection_group }} = tle.encoding(
+        tl.zeros(({{ ctx["projection_heads_per_group"] }},), tl.int32),
+        {{ model["FunctionName"] }}__projection_head_layout,
+    )
+    projection_head_{{ projection_group }} = (
+        global_key_head * {{ repeats }} + projection_stage_slot_{{ projection_group }}
+    )
+    b_projection_{{ projection_group }} = tle.encoding(
+        tl.sum(b_projection_partial_{{ projection_group }}, axis=1),
+        {{ model["FunctionName"] }}__projection_head_layout,
+    )
+    a_projection_{{ projection_group }} = tle.encoding(
+        tl.sum(a_projection_partial_{{ projection_group }}, axis=1),
+        {{ model["FunctionName"] }}__projection_head_layout,
+    )
+    projection_slot_active_{{ projection_group }} = (
+        {{ projection_group * ctx["projection_heads_per_group"] }}
+        + projection_head_slot
+        < projection_value_head_count
+    ) & (projection_stage_slot_{{ projection_group }} < {{ repeats }})
+    projection_a_log_{{ projection_group }} = tl.load(
+        {{ access_pointer(model, "ALog", "a_log", tensor_access(["projection_head_" ~ projection_group], model["ALogStrides"])) }},
+        mask=projection_slot_active_{{ projection_group }},
+        other=0.0,
+    ).to(tl.float32)
+    projection_dt_bias_{{ projection_group }} = tl.load(
+        {{ access_pointer(model, "DtBias", "dt_bias", tensor_access(["projection_head_" ~ projection_group], model["DtBiasStrides"])) }},
+        mask=projection_slot_active_{{ projection_group }},
+        other=0.0,
+    ).to(tl.float32)
+    projection_softplus_arg_{{ projection_group }} = (
+        a_projection_{{ projection_group }} + projection_dt_bias_{{ projection_group }}
+    )
+    projection_softplus_{{ projection_group }} = tl.maximum(
+        projection_softplus_arg_{{ projection_group }}, 0.0
+    ) + tl.log(1.0 + tl.exp(-tl.abs(projection_softplus_arg_{{ projection_group }})))
+    projection_beta_{{ projection_group }} = tl.sigmoid(b_projection_{{ projection_group }})
+    projection_decay_{{ projection_group }} = tl.exp(
+        -tl.exp(projection_a_log_{{ projection_group }})
+        * projection_softplus_{{ projection_group }}
+    )
+    tl.store(
+        tle.gpu.local_ptr(
+            projection_stage,
+            (projection_stage_row_{{ projection_group }}, projection_stage_slot_{{ projection_group }}),
+            shape=({{ ctx["projection_heads_per_group"] }},),
+        ),
+        projection_beta_{{ projection_group }},
+        mask=projection_slot_active_{{ projection_group }},
+    )
+    tl.store(
+        tle.gpu.local_ptr(
+            projection_stage,
+            (projection_stage_row_{{ projection_group }} + 1, projection_stage_slot_{{ projection_group }}),
+            shape=({{ ctx["projection_heads_per_group"] }},),
+        ),
+        projection_decay_{{ projection_group }},
+        mask=projection_slot_active_{{ projection_group }},
+    )
+{% endfor %}
+    tl.debug_barrier()
+
+    {{ model["FunctionName"] }}__state_and_gated_norm(
+        {{ helper_argument_names(model) }}
+    )
+
+
+{% macro state_and_gated_norm_body() %}
+{{ common.mesh_coordinates(model["MeshAxes"]) }}
+    projection_stage = tle.gpu.alloc(
+        [2, {{ ctx["projection_capacity"] }}],
+        dtype=tl.float32,
+        layout=None,
+        scope=tle.gpu.smem,
+        alias=pyntt_shared_arena,
+        alias_offset_bytes={{ ctx["microkernel"]["shared_workspace_offsets"]["projection_stage"] }},
+        nv_mma_shared_layout=False,
+    )
+    recurrent_state = {{ ptr(model, "RecurrentState") }}
+    qkv = {{ ptr(model, "QKV") }}
+    z = {{ ptr(model, "Z") }}
+    norm_weight = {{ ptr(model, "NormWeight") }}
+    core_scratch = {{ ptr(model, "CoreScratch") }}
+    gated_output = {{ ptr(model, "GatedOutput") }}
+    global_key_head = shard_index // {{ ctx["ctas_per_key_head"] }}
+    key_head_owner = shard_index % {{ ctx["ctas_per_key_head"] }}
+    projection_task_begin = key_head_owner * {{ ctx["state_tasks_per_cta"] }}
+    projection_task_end = tl.minimum(
+        projection_task_begin + {{ ctx["state_tasks_per_cta"] }},
+        {{ ctx["value_tiles_per_key_head"] }},
+    )
+    projection_first_value_head = projection_task_begin // {{ ctx["value_tiles_per_head"] }}
+    projection_value_head_count = (
+        (projection_task_end + {{ ctx["value_tiles_per_head"] - 1 }})
+        // {{ ctx["value_tiles_per_head"] }}
+        - projection_first_value_head
+    )
+    projection_head_slot = tle.encoding(
+        tl.arange(0, {{ ctx["projection_heads_per_group"] }}),
+        {{ model["FunctionName"] }}__projection_head_layout,
+    )
+
+    task_source = tl.arange(0, 8)
+    key_source = tl.arange(0, {{ model["KeyBlockSize"] }})
+    value_source = tl.arange(0, {{ ctx["state_value_tile"] }})
+    state_projection_row = tle.encoding(
+        tl.zeros((8, {{ ctx["state_value_tile"] }}), tl.int32),
+        {{ model["FunctionName"] }}__value_layout,
+    )
+    qk_task = tle.encoding(
+        tl.broadcast_to(task_source[:, None], (8, {{ model["KeyBlockSize"] }})),
+        {{ model["FunctionName"] }}__qk_layout,
+    )
+    qk_key = tle.encoding(
+        tl.broadcast_to(key_source[None, :], (8, {{ model["KeyBlockSize"] }})),
+        {{ model["FunctionName"] }}__qk_layout,
+    )
+    key_mask = qk_key < {{ model["KeyHeadDim"] }}
+    query = tl.load(
+        {{ access_pointer(model, "QKV", "qkv", contiguous_vector_axis_access(["0", "0"], model["QKVStrides"], packed_axis=1, logical_index="global_key_head * " ~ model["KeyHeadDim"] ~ " + qk_key", lane_count=model["QKVLaneCount"], global_coordinate_axes=[1])) }},
+        mask=key_mask,
+        other=0.0,
+    ).to(tl.float32)
+    key = tl.load(
+        {{ access_pointer(model, "QKV", "qkv", contiguous_vector_axis_access(["0", "0"], model["QKVStrides"], packed_axis=1, logical_index=model["NumKeyHeads"] * model["KeyHeadDim"] ~ " + global_key_head * " ~ model["KeyHeadDim"] ~ " + qk_key", lane_count=model["QKVLaneCount"], global_coordinate_axes=[1])) }},
+        mask=key_mask,
+        other=0.0,
+    ).to(tl.float32)
+    query *= tl.rsqrt(tl.sum(query * query, axis=1)[:, None] + 1.0e-6)
+    key *= tl.rsqrt(tl.sum(key * key, axis=1)[:, None] + 1.0e-6)
+
+    for task_wave in tl.range(0, {{ ctx["state_waves"] }}):
+        key_head_task = (
+            key_head_owner * {{ ctx["state_tasks_per_cta"] }}
+            + task_wave * 8
+            + task_source
+        )
+        value_head_in_key = key_head_task // {{ model["ValueHeadDim"] // ctx["state_value_tile"] }}
+        value_tile = key_head_task % {{ model["ValueHeadDim"] // ctx["state_value_tile"] }}
+        global_value_head_source = global_key_head * {{ repeats }} + value_head_in_key
+        global_value_head = tle.encoding(
+            tl.broadcast_to(global_value_head_source[:, None], (8, {{ ctx["state_value_tile"] }})),
+            {{ model["FunctionName"] }}__value_layout,
+        )
+        value_lane = tle.encoding(
+            tl.broadcast_to(
+                value_tile[:, None] * {{ ctx["state_value_tile"] }} + value_source[None, :],
+                (8, {{ ctx["state_value_tile"] }}),
+            ),
+            {{ model["FunctionName"] }}__value_layout,
+        )
+{% if ctx["has_state_tail"] %}
+        task_active = tle.encoding(
+            tl.broadcast_to(
+                (
+                    (task_wave * 8 + task_source < {{ ctx["state_tasks_per_cta"] }})
+                    & (key_head_task < {{ ctx["value_tiles_per_key_head"] }})
+                )[:, None],
+                (8, {{ ctx["state_value_tile"] }}),
+            ),
+            {{ model["FunctionName"] }}__value_layout,
+        )
+{% endif %}
         value = tl.load(
-            {{ access_pointer(model, "QKV", "qkv", contiguous_vector_axis_access(["0", "0"], model["QKVStrides"], packed_axis=1, logical_index="value_channel", lane_count=model["QKVLaneCount"], global_coordinate_axes=[1])) }},
-            mask=value_mask & local_head_active,
-            other=0.0,
+            {{ access_pointer(model, "QKV", "qkv", contiguous_vector_axis_access(["0", "0"], model["QKVStrides"], packed_axis=1, logical_index=model["NumKeyHeads"] * model["KeyHeadDim"] * 2 ~ " + global_value_head * " ~ model["ValueHeadDim"] ~ " + value_lane", lane_count=model["QKVLaneCount"], global_coordinate_axes=[1])) }}{% if ctx["has_state_tail"] %},
+            mask=task_active,
+            other=0.0{% endif %}
         ).to(tl.float32)
-        query *= tl.rsqrt(tl.sum(query * query, axis=0) + 1.0e-6)
-        key *= tl.rsqrt(tl.sum(key * key, axis=0) + 1.0e-6)
-
-        a_bias = tl.load(
-            {{ access_pointer(model, "ALog", "a_log", tensor_access(["local_head"], model["ALogStrides"])) }},
-            mask=local_head_active,
-            other=0.0,
-        ).to(tl.float32)
-        dt_value = tl.load(
-            {{ access_pointer(model, "DtBias", "dt_bias", tensor_access(["local_head"], model["DtBiasStrides"])) }},
-            mask=local_head_active,
-            other=0.0,
-        ).to(tl.float32)
-        a_value = tl.load(
-            {{ access_pointer(model, "AProjection", "a_projection", contiguous_vector_axis_access(["0", "0"], model["AProjectionStrides"], tensor_shape=[1, model["NumValueHeads"] // model["ProjectionLaneCount"]], packed_axis=1, logical_index="global_value_head", lane_count=model["ProjectionLaneCount"])) }},
-            mask=local_head_active,
-            other=0.0,
-        ).to(tl.float32)
-        b_value = tl.load(
-            {{ access_pointer(model, "BProjection", "b_projection", contiguous_vector_axis_access(["0", "0"], model["BProjectionStrides"], tensor_shape=[1, model["NumValueHeads"] // model["ProjectionLaneCount"]], packed_axis=1, logical_index="global_value_head", lane_count=model["ProjectionLaneCount"])) }},
-            mask=local_head_active,
-            other=0.0,
-        ).to(tl.float32)
-        softplus_arg = a_value + dt_value
-        softplus_value = (
-            tl.maximum(softplus_arg, 0.0)
-            + tl.log(1.0 + tl.exp(-tl.abs(softplus_arg)))
+        projection_value_head = tle.encoding(
+            tl.broadcast_to(value_head_in_key[:, None], (8, {{ ctx["state_value_tile"] }})),
+            {{ model["FunctionName"] }}__value_layout,
         )
-        decay = tl.exp(-tl.exp(a_bias) * softplus_value)
-        beta = tl.sigmoid(b_value)
+        beta = tl.load(
+            tle.gpu.local_ptr(
+                projection_stage,
+                (state_projection_row, projection_value_head),
+                shape=(8, {{ ctx["state_value_tile"] }}),
+            ){% if ctx["has_state_tail"] %},
+            mask=task_active,
+            other=0.0{% endif %}
+        )
+        decay = tl.load(
+            tle.gpu.local_ptr(
+                projection_stage,
+                (state_projection_row + 1, projection_value_head),
+                shape=(8, {{ ctx["state_value_tile"] }}),
+            ){% if ctx["has_state_tail"] %},
+            mask=task_active,
+            other=0.0{% endif %}
+        )
         recurrent_state_head_base = (
             {{ state_axis_offset(model["LayerId"], model["RecurrentStateLayerAxis"]) }}
             + {{ state_axis_offset("global_value_head", model["RecurrentStateHeadAxis"]) }}
         )
-        state_mask = key_mask[:, None] & value_mask[None, :] & local_head_active
+        state_key = tle.encoding(
+            tl.broadcast_to(key_source[None, None, :], (8, {{ ctx["state_value_tile"] }}, {{ model["KeyBlockSize"] }})),
+            {{ model["FunctionName"] }}__state_layout,
+        )
+        state_value = tle.encoding(
+            tl.broadcast_to(value_lane[:, :, None], (8, {{ ctx["state_value_tile"] }}, {{ model["KeyBlockSize"] }})),
+            {{ model["FunctionName"] }}__state_layout,
+        )
+        state_head_base = tle.encoding(
+            tl.broadcast_to(recurrent_state_head_base[:, :, None], (8, {{ ctx["state_value_tile"] }}, {{ model["KeyBlockSize"] }})),
+            {{ model["FunctionName"] }}__state_layout,
+        )
+{% if ctx["has_state_tail"] %}
+        state_task_active = tle.encoding(
+            tl.broadcast_to(
+                (
+                    (task_wave * 8 + task_source < {{ ctx["state_tasks_per_cta"] }})
+                    & (key_head_task < {{ ctx["value_tiles_per_key_head"] }})
+                )[:, None, None],
+                (8, {{ ctx["state_value_tile"] }}, {{ model["KeyBlockSize"] }}),
+            ),
+            {{ model["FunctionName"] }}__state_layout,
+        )
+        state_mask = (state_key < {{ model["KeyHeadDim"] }}) & state_task_active
+{% else %}
+        state_mask = state_key < {{ model["KeyHeadDim"] }}
+{% endif %}
+        state_decay = tle.encoding(
+            decay,
+            {{ model["FunctionName"] }}__value_layout,
+        )
         state = tl.load(
             recurrent_state
-            + recurrent_state_head_base
-            + {{ state_axis_offset("key_lane[:, None]", model["RecurrentStateKeyAxis"]) }}
-            + {{ state_axis_offset("value_lane[None, :]", model["RecurrentStateValueAxis"]) }},
+            + state_head_base
+            + {{ state_axis_offset("state_value", model["RecurrentStateValueAxis"]) }}
+            + {{ state_axis_offset("state_key", model["RecurrentStateKeyAxis"]) }},
             mask=state_mask,
             other=0.0,
-        ).to(tl.float32) * decay
-        recalled = tl.sum(state * key[:, None], axis=0)
+        ).to(tl.float32) * state_decay[:, :, None]
+        recalled = tle.encoding(
+            tl.sum(state * key[:, None, :], axis=2),
+            {{ model["FunctionName"] }}__value_layout,
+        )
         delta = (value - recalled) * beta
-        state += key[:, None] * delta[None, :]
-        core = tl.sum(
-            state * (query * {{ pyrepr(1.0 / (model["KeyHeadDim"] ** 0.5)) }})[:, None],
-            axis=0,
+        state_delta = tle.encoding(
+            delta,
+            {{ model["FunctionName"] }}__value_layout,
+        )
+        state += key[:, None, :] * state_delta[:, :, None]
+        core = tle.encoding(
+            tl.sum(
+                state * (query * {{ pyrepr(1.0 / (model["KeyHeadDim"] ** 0.5)) }})[:, None, :],
+                axis=2,
+            ),
+            {{ model["FunctionName"] }}__value_layout,
         )
         tl.store(
             recurrent_state
-            + recurrent_state_head_base
-            + {{ state_axis_offset("key_lane[:, None]", model["RecurrentStateKeyAxis"]) }}
-            + {{ state_axis_offset("value_lane[None, :]", model["RecurrentStateValueAxis"]) }},
+            + state_head_base
+            + {{ state_axis_offset("state_value", model["RecurrentStateValueAxis"]) }}
+            + {{ state_axis_offset("state_key", model["RecurrentStateKeyAxis"]) }},
             state,
             mask=state_mask,
         )
-
-        inv_rms = tl.rsqrt(
-            tl.sum(tl.where(value_mask, core * core, 0.0), axis=0)
-            / {{ model["ValueHeadDim"] }}
-            + {{ pyrepr(model["Epsilon"]) }}
+        tl.store(
+            {{ access_pointer(model, "CoreScratch", "core_scratch", tensor_access(["global_value_head", "value_lane"], model["CoreScratchStrides"])) }},
+            core{% if ctx["has_state_tail"] %},
+            mask=task_active{% endif %},
         )
-        local_value_index = local_head * {{ model["ValueHeadDim"] }} + value_lane
+
+    {{ model["StateBarrier"] }}
+    norm_lane_source = tl.arange(0, {{ model["ValueBlockSize"] }})
+    norm_lane = tle.encoding(
+        tl.broadcast_to(
+            norm_lane_source[None, :],
+            ({{ ctx["projection_heads_per_group"] }}, {{ model["ValueBlockSize"] }}),
+        ),
+        {{ model["FunctionName"] }}__projection_layout,
+    )
+{% for projection_group in range(ctx["projection_groups"]) %}
+    norm_stage_slot = tle.encoding(
+        projection_first_value_head
+        + {{ projection_group * ctx["projection_heads_per_group"] }}
+        + projection_head_slot,
+        {{ model["FunctionName"] }}__projection_head_layout,
+    )
+    norm_head_active = (
+        {{ projection_group * ctx["projection_heads_per_group"] }}
+        + projection_head_slot
+        < projection_value_head_count
+    ) & (norm_stage_slot < {{ repeats }})
+    norm_global_head = global_key_head * {{ repeats }} + norm_stage_slot
+    norm_global_head_matrix = tle.encoding(
+        tl.broadcast_to(
+            norm_global_head[:, None],
+            ({{ ctx["projection_heads_per_group"] }}, {{ model["ValueBlockSize"] }}),
+        ),
+        {{ model["FunctionName"] }}__projection_layout,
+    )
+    norm_head_mask = tle.encoding(
+        tl.broadcast_to(
+            norm_head_active[:, None],
+            ({{ ctx["projection_heads_per_group"] }}, {{ model["ValueBlockSize"] }}),
+        ),
+        {{ model["FunctionName"] }}__projection_layout,
+    )
+    norm_core = tl.load(
+        {{ access_pointer(model, "CoreScratch", "core_scratch", tensor_access(["norm_global_head_matrix", "norm_lane"], model["CoreScratchStrides"])) }},
+        mask=(norm_lane < {{ model["ValueHeadDim"] }}) & norm_head_mask,
+        other=0.0,
+    )
+    norm_inv_rms = tle.encoding(
+        tl.rsqrt(
+            tl.sum(norm_core * norm_core, axis=1) / {{ model["ValueHeadDim"] }}
+            + {{ pyrepr(model["Epsilon"]) }}
+        ),
+        {{ model["FunctionName"] }}__projection_head_layout,
+    )
+    norm_stage_row = tle.encoding(
+        tl.zeros(({{ ctx["projection_heads_per_group"] }},), tl.int32),
+        {{ model["FunctionName"] }}__projection_head_layout,
+    )
+    tl.store(
+        tle.gpu.local_ptr(
+            projection_stage,
+            (norm_stage_row, norm_stage_slot),
+            shape=({{ ctx["projection_heads_per_group"] }},),
+        ),
+        norm_inv_rms,
+        mask=norm_head_active,
+    )
+{% endfor %}
+    tl.debug_barrier()
+
+    active_local_value_dim = {{ model["ActiveLocalValueDim"] }}
+    gate_projection_row = tle.encoding(
+        tl.zeros((8, {{ ctx["state_value_tile"] }}), tl.int32),
+        {{ model["FunctionName"] }}__gate_layout,
+    )
+    for task_wave in tl.range(0, {{ ctx["state_waves"] }}):
+        local_value_index = tle.encoding(
+            tl.broadcast_to(
+                (
+                    (task_wave * 8 + task_source)[:, None]
+                    * {{ ctx["state_value_tile"] }}
+                    + value_source[None, :]
+                ),
+                (8, {{ ctx["state_value_tile"] }}),
+            ),
+            {{ model["FunctionName"] }}__gate_layout,
+        )
+        key_head_task = (
+            key_head_owner * {{ ctx["state_tasks_per_cta"] }}
+            + task_wave * 8
+            + task_source
+        )
+        value_head_in_key = key_head_task // {{ ctx["value_tiles_per_head"] }}
+        value_tile = key_head_task % {{ ctx["value_tiles_per_head"] }}
+        global_value_head_source = global_key_head * {{ repeats }} + value_head_in_key
+        global_value_head = tle.encoding(
+            tl.broadcast_to(
+                global_value_head_source[:, None],
+                (8, {{ ctx["state_value_tile"] }}),
+            ),
+            {{ model["FunctionName"] }}__gate_layout,
+        )
+        value_lane = tle.encoding(
+            tl.broadcast_to(
+                value_tile[:, None] * {{ ctx["state_value_tile"] }} + value_source[None, :],
+                (8, {{ ctx["state_value_tile"] }}),
+            ),
+            {{ model["FunctionName"] }}__gate_layout,
+        )
+        gate_active = local_value_index < active_local_value_dim
+{% if ctx["has_state_tail"] %}
+        gate_active &= tle.encoding(
+            tl.broadcast_to(
+                (
+                    (task_wave * 8 + task_source < {{ ctx["state_tasks_per_cta"] }})
+                    & (key_head_task < {{ ctx["value_tiles_per_key_head"] }})
+                )[:, None],
+                (8, {{ ctx["state_value_tile"] }}),
+            ),
+            {{ model["FunctionName"] }}__gate_layout,
+        )
+{% endif %}
+        core = tl.load(
+            {{ access_pointer(model, "CoreScratch", "core_scratch", tensor_access(["global_value_head", "value_lane"], model["CoreScratchStrides"])) }},
+            mask=gate_active,
+            other=0.0,
+        )
+        projection_value_head = tle.encoding(
+            tl.broadcast_to(
+                value_head_in_key[:, None],
+                (8, {{ ctx["state_value_tile"] }}),
+            ),
+            {{ model["FunctionName"] }}__gate_layout,
+        )
+        inv_rms = tl.load(
+            tle.gpu.local_ptr(
+                projection_stage,
+                (gate_projection_row, projection_value_head),
+                shape=(8, {{ ctx["state_value_tile"] }}),
+            ),
+            mask=gate_active,
+            other=0.0,
+        )
         z_projection = tl.load(
             {{ access_pointer(model, "Z", "z", contiguous_vector_axis_access(["0", "0"], model["ZStrides"], packed_axis=1, logical_index="local_value_index", lane_count=model["ZLaneCount"])) }},
-            mask=value_mask & local_head_active,
+            mask=gate_active,
             other=0.0,
         ).to(tl.float32)
         scale = tl.load(
             {{ access_pointer(model, "NormWeight", "norm_weight", tensor_access(["value_lane"], model["NormWeightStrides"])) }},
-            mask=value_mask & local_head_active,
+            mask=gate_active,
             other=0.0,
         ).to(tl.float32)
         gated = core * inv_rms * scale * z_projection * tl.sigmoid(z_projection)
         tl.store(
             {{ access_pointer(model, "GatedOutput", "gated_output", tensor_access(["0", "local_value_index"], model["GatedOutputStrides"])) }},
             gated.to({{ model["OutputTritonDType"] }}),
-            mask=value_mask & local_head_active,
+            mask=gate_active,
         )
+{% endmacro %}
 
 
-{{ phases.dispatch(model) }}
+@triton.jit(noinline=True)
+def {{ model["FunctionName"] }}__state_and_gated_norm({{ helper_parameters(model) }}):
+{{ state_and_gated_norm_body() }}
+{% endif %}

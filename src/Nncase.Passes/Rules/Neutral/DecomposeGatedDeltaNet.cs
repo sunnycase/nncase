@@ -103,18 +103,13 @@ public sealed partial class DecomposeGatedDeltaNet : IRewriteRule
             layerId,
             gatedDeltaNet.ConvKernelSize);
         var z = Pack(Project(zWeight, zWeightScale), stateConfig.ActivationLanes);
-        var bProjection = Pack(
-            IR.F.Tensors.MatMul(input, bWeight, stateConfig.ActivationPrimType),
-            stateConfig.ActivationLanes);
-        var aProjection = Pack(
-            IR.F.Tensors.MatMul(input, aWeight, stateConfig.ActivationPrimType),
-            stateConfig.ActivationLanes);
         var recurrent = IR.F.NN.GatedDeltaNetRecurrentCore(
             convolution[1],
             convolution[0],
             z,
-            bProjection,
-            aProjection,
+            input,
+            IR.F.Tensors.Transpose(bWeight, [1, 0]),
+            IR.F.Tensors.Transpose(aWeight, [1, 0]),
             aLog,
             dtBias,
             normWeight,

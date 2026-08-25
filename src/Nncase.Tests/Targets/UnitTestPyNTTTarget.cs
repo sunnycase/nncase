@@ -1184,6 +1184,79 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
     }
 
     [Fact]
+    public void TestTritonPackedBlockFp8MmaGemvUsesAllConsumerWarpsAcrossN()
+    {
+        const int localScalarN = 320;
+        const int k = 5120;
+        const int outputNLane = 8;
+        const int weightKPack = 2;
+        const int weightKLane = 16;
+        const int weightBlockK = 128;
+        var lhs = CreateBuffer(
+            "lhs",
+            DataTypes.BFloat16,
+            TIR.MemoryLocation.Data,
+            0,
+            [1, k],
+            [k, 1]);
+        var rhs = CreateBuffer(
+            "rhs",
+            new VectorType(DataTypes.Float8E4M3, [weightKPack, weightKLane]),
+            TIR.MemoryLocation.ChipLocalRdata,
+            0,
+            [localScalarN, k / (weightKPack * weightKLane)],
+            [k / (weightKPack * weightKLane), 1]);
+        var rhsScale = CreateBuffer(
+            "rhs_scale",
+            DataTypes.BFloat16,
+            TIR.MemoryLocation.ChipLocalRdata,
+            0,
+            [(localScalarN + 127) / 128, k / weightBlockK],
+            [k / weightBlockK, 1]);
+        var output = CreateBuffer(
+            "output",
+            new VectorType(DataTypes.BFloat16, [outputNLane]),
+            TIR.MemoryLocation.ChipLocalData,
+            0,
+            [1, localScalarN / outputNLane],
+            [localScalarN / outputNLane, 1]);
+        var op = new TIR.NTT.PackedBlockScaledMatMul(
+            IR.NTT.PackedMatMulRhsLayout.NMajorKPacked,
+            outputNLane,
+            128,
+            weightBlockK);
+        var targetOptions = Assert.IsType<PyNTTTargetOptions>(CompileOptions.TargetOptions);
+
+        var selection = Assert.IsType<Nncase.Schedule.TIRMicroKernelSelection>(
+            targetOptions.TIRMicroKernelSelector.Select(
+                new(op, [lhs, rhs, rhsScale, output], NTTTargetMachineCatalog.Resolve("rtx5060"))));
+
+        Assert.Equal("triton.matmul", selection.Family);
+        Assert.Equal("mma_block_fp8_smem_pipeline", selection.Variant);
+        Assert.Equal(128, selection.Parameters["block_n"]);
+        var blockK = selection.Parameters["block_k"];
+        var numStages = selection.Parameters["num_stages"];
+        Assert.Equal((256L, 2L), (blockK, numStages));
+        Assert.Equal(3, selection.SharedWorkspaces.Length);
+        var workspace = selection.SharedWorkspaces[0];
+        Assert.Equal(
+            new long[] { numStages, blockK / weightBlockK, 128, weightBlockK },
+            workspace.Type.Shape.ToValueArray());
+        Assert.Equal("lhs_quantized", selection.SharedWorkspaces[1].Name);
+        Assert.Equal(
+            new long[] { blockK / weightBlockK, weightBlockK },
+            selection.SharedWorkspaces[1].Type.Shape.ToValueArray());
+        Assert.Equal(DataTypes.Float8E4M3, selection.SharedWorkspaces[1].Type.DType);
+        Assert.Equal("lhs_scale", selection.SharedWorkspaces[2].Name);
+        Assert.Equal(
+            new long[] { blockK / weightBlockK, 1 },
+            selection.SharedWorkspaces[2].Type.Shape.ToValueArray());
+        Assert.Equal(DataTypes.Float32, selection.SharedWorkspaces[2].Type.DType);
+        Assert.Equal(new[] { 1 }, selection.TransferPipeline!.SourceArgumentIndices);
+        Assert.Equal(new[] { 0 }, selection.TransferPipeline.SharedWorkspaceIndices);
+    }
+
+    [Fact]
     public void TestTritonPackedGemvSelectorAcceptsDistributedOutputBufferVar()
     {
         const int k = 2048;
@@ -5165,8 +5238,8 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
             [GatedDeltaNetStateDimKind.NumLayers, GatedDeltaNetStateDimKind.ConvChannels, GatedDeltaNetStateDimKind.ConvHistory],
             [GatedDeltaNetStateDimKind.ConvChannels],
             [8],
-            [GatedDeltaNetStateDimKind.NumLayers, GatedDeltaNetStateDimKind.NumValueHeads, GatedDeltaNetStateDimKind.KeyHeadDim, GatedDeltaNetStateDimKind.ValueHeadDim],
-            [GatedDeltaNetStateDimKind.ValueHeadDim],
+            [GatedDeltaNetStateDimKind.NumLayers, GatedDeltaNetStateDimKind.NumValueHeads, GatedDeltaNetStateDimKind.ValueHeadDim, GatedDeltaNetStateDimKind.KeyHeadDim],
+            [GatedDeltaNetStateDimKind.KeyHeadDim],
             [4]);
         var input = Input("input", bf16, 1, hiddenSize);
         var state = Input(
@@ -5238,15 +5311,31 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
             "generated from PyNTT algorithm triton.gated_delta_net/recurrent_core",
             generatedKernelsPy,
             StringComparison.Ordinal);
+        if (hierarchyY * hierarchyX < 32)
+        {
+            Assert.Contains(
+                "b_weight_descriptor_entry = tle.gpu.tensor_map_table_entry(",
+                generatedKernelsPy,
+                StringComparison.Ordinal);
+            Assert.Contains(
+                "a_weight_descriptor_entry = tle.gpu.tensor_map_table_entry(",
+                generatedKernelsPy,
+                StringComparison.Ordinal);
+        }
+
+        Assert.Contains(
+            "__state_and_gated_norm(",
+            generatedKernelsPy,
+            StringComparison.Ordinal);
         AssertGeneratedModelRuns(
             outputDirectory,
             "torch.manual_seed(7)",
             $"input = (torch.randn(1, {hiddenSize}, device='cuda') * 0.1).to(torch.bfloat16)",
             $"conv_state = (torch.randn(1, {convDim / 8}, {convKernelSize - 1}, 8, device='cuda') * 0.1).to(torch.bfloat16)",
-            $"recurrent_state = torch.randn(1, {numValueHeads}, {keyHeadDim}, {valueHeadDim / 4}, 4, device='cuda') * 0.05",
+            $"recurrent_state = torch.randn(1, {numValueHeads}, {valueHeadDim}, {keyHeadDim / 4}, 4, device='cuda') * 0.05",
             "state = {'pyntt_object_kind': 'gated_delta_net_state', 'convolution_state': conv_state, 'recurrent_state': recurrent_state}",
             $"logical_conv_state = conv_state[0].permute(0, 2, 1).reshape({convDim}, {convKernelSize - 1})",
-            $"logical_recurrent_state = recurrent_state.reshape({numValueHeads}, {keyHeadDim}, {valueHeadDim})",
+            $"logical_recurrent_state = recurrent_state[0].reshape({numValueHeads}, {valueHeadDim}, {keyHeadDim}).transpose(1, 2)",
             $"qkv_weight = (torch.randn({hiddenSize}, {convDim}, device='cuda') * 0.05).to(torch.bfloat16)",
             $"z_weight = (torch.randn({hiddenSize}, {valueDim}, device='cuda') * 0.05).to(torch.bfloat16)",
             $"b_weight = (torch.randn({hiddenSize}, {numValueHeads}, device='cuda') * 0.05).to(torch.bfloat16)",
@@ -5280,7 +5369,7 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
             "expected_output = (gated.reshape(1, -1).float() @ output_weight.float()).to(torch.bfloat16)",
             "actual_output = module(input, state, qkv_weight, z_weight, b_weight, a_weight, conv_weight, a_log, dt_bias, norm_weight, output_weight)",
             $"actual_conv_state = state['convolution_state'][0].permute(0, 2, 1).reshape({convDim}, {convKernelSize - 1})",
-            $"actual_recurrent_state = state['recurrent_state'].reshape({numValueHeads}, {keyHeadDim}, {valueHeadDim})",
+            $"actual_recurrent_state = state['recurrent_state'][0].reshape({numValueHeads}, {valueHeadDim}, {keyHeadDim}).transpose(1, 2)",
             "torch.testing.assert_close(actual_conv_state, expected_conv_state, rtol=0, atol=0)",
             "torch.testing.assert_close(actual_recurrent_state, expected_recurrent_state, rtol=2e-4, atol=2e-4)",
             "torch.testing.assert_close(actual_output, expected_output, rtol=2e-2, atol=2e-2)");
@@ -5314,8 +5403,8 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
             [GatedDeltaNetStateDimKind.NumLayers, GatedDeltaNetStateDimKind.ConvChannels, GatedDeltaNetStateDimKind.ConvHistory],
             [GatedDeltaNetStateDimKind.ConvChannels],
             [8],
-            [GatedDeltaNetStateDimKind.NumLayers, GatedDeltaNetStateDimKind.NumValueHeads, GatedDeltaNetStateDimKind.KeyHeadDim, GatedDeltaNetStateDimKind.ValueHeadDim],
-            [GatedDeltaNetStateDimKind.ValueHeadDim],
+            [GatedDeltaNetStateDimKind.NumLayers, GatedDeltaNetStateDimKind.NumValueHeads, GatedDeltaNetStateDimKind.ValueHeadDim, GatedDeltaNetStateDimKind.KeyHeadDim],
+            [GatedDeltaNetStateDimKind.KeyHeadDim],
             [4]);
         var inputs = new[]
         {
@@ -5363,7 +5452,7 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
             .SelectMany(function => ExprCollector.Collect(function).OfType<Call>())
             .Where(candidate => candidate.Target is TIR.NTT.GatedDeltaNetRecurrentCore));
         Assert.Equal(
-            5,
+            3,
             compiler.Module.Functions
                 .SelectMany(function => ExprCollector.Collect(function).OfType<Call>())
                 .Count(candidate => candidate.Target is TIR.NTT.PackedMatMul));
@@ -5377,9 +5466,26 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         Assert.Equal("triton.gated_delta_net", microKernel.Family);
         Assert.Equal("recurrent_core", microKernel.Variant);
         Assert.Equal(128, microKernel.Parameters["block_n"]);
-        Assert.Equal(1, microKernel.Parameters["block_k"]);
-        Assert.Empty(microKernel.SharedWorkspaces);
-        Assert.Null(microKernel.TransferPipeline);
+        Assert.Equal(2048, microKernel.Parameters["block_k"]);
+        Assert.Equal(4, microKernel.Parameters["num_stages"]);
+        Assert.Equal(8, microKernel.Parameters["state_value_tile"]);
+        Assert.Equal(1, microKernel.Parameters["projection_head_capacity"]);
+        Assert.Equal(64, microKernel.Parameters["projection_tma_k_atom"]);
+        Assert.Equal(3, microKernel.SharedWorkspaces.Length);
+        var bProjectionWorkspace = microKernel.SharedWorkspaces[0];
+        Assert.Equal("b_projection_stage", bProjectionWorkspace.Name);
+        Assert.Equal(new long[] { 4, 1, 32, 64 }, bProjectionWorkspace.Type.Shape.ToValueArray());
+        var aProjectionWorkspace = microKernel.SharedWorkspaces[1];
+        Assert.Equal("a_projection_stage", aProjectionWorkspace.Name);
+        Assert.Equal(new long[] { 4, 1, 32, 64 }, aProjectionWorkspace.Type.Shape.ToValueArray());
+        var projectionWorkspace = microKernel.SharedWorkspaces[2];
+        Assert.Equal("projection_stage", projectionWorkspace.Name);
+        Assert.Equal(new long[] { 2, 2 }, projectionWorkspace.Type.Shape.ToValueArray());
+        var transferPipeline = Assert.IsType<Nncase.Schedule.TIRTransferPipelineContract>(microKernel.TransferPipeline);
+        var projectionChannel = Assert.Single(transferPipeline.Channels);
+        Assert.Equal("projection", projectionChannel.Name);
+        Assert.Equal(new[] { 4, 5 }, projectionChannel.SourceArgumentIndices);
+        Assert.Equal(new[] { 0, 1 }, projectionChannel.SharedWorkspaceIndices);
 
         RenderGeneratedKernels(outputDirectory);
         var generatedKernelsPy = File.ReadAllText(Path.Join(outputDirectory, "generated_kernels.py"));
@@ -5388,7 +5494,17 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
             generatedKernelsPy,
             StringComparison.Ordinal);
         Assert.Contains("key_heads=16, value_heads=32, key_dim=128, value_dim=128", generatedKernelsPy, StringComparison.Ordinal);
-        Assert.Contains("local_value_head_capacity=1", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("ctas_per_key_head=2, state_waves=2", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("projection_stage = tle.gpu.alloc(", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.DoesNotContain("core_stage = tle.gpu.alloc(", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("__b_projection_stages = tle.gpu.alloc(", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("__b_weight_descriptor,\n            slot.b_weight,", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("eviction_policy=\"evict_first\"", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("reader.release(sequence)", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains(
+            "@triton.jit(noinline=True)\ndef main_prim__gated_delta_net_recurrent_core__0__state_and_gated_norm(",
+            generatedKernelsPy,
+            StringComparison.Ordinal);
         Assert.Contains("state = tl.load(", generatedKernelsPy, StringComparison.Ordinal);
         Assert.DoesNotContain("state_tile_index", generatedKernelsPy, StringComparison.Ordinal);
         Assert.Contains("local_channels=256", generatedKernelsPy, StringComparison.Ordinal);

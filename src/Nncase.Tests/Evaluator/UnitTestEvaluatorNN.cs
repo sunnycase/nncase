@@ -216,8 +216,8 @@ public class UnitTestEvaluatorNN : TestClassBase
             [GatedDeltaNetStateDimKind.NumLayers, GatedDeltaNetStateDimKind.ConvChannels, GatedDeltaNetStateDimKind.ConvHistory],
             [GatedDeltaNetStateDimKind.ConvChannels],
             [8],
-            [GatedDeltaNetStateDimKind.NumLayers, GatedDeltaNetStateDimKind.NumValueHeads, GatedDeltaNetStateDimKind.KeyHeadDim, GatedDeltaNetStateDimKind.ValueHeadDim],
-            [GatedDeltaNetStateDimKind.ValueHeadDim],
+            [GatedDeltaNetStateDimKind.NumLayers, GatedDeltaNetStateDimKind.NumValueHeads, GatedDeltaNetStateDimKind.ValueHeadDim, GatedDeltaNetStateDimKind.KeyHeadDim],
+            [GatedDeltaNetStateDimKind.KeyHeadDim],
             [4]);
         var state = Buffer(
             "state",
@@ -249,7 +249,7 @@ public class UnitTestEvaluatorNN : TestClassBase
         Assert.Equal(new long[] { 1, 1024, 3, 8 }, stateConfig.GetStorageShape(GatedDeltaNetStateKind.Convolution));
         Assert.Equal(new long[] { 1, 32, 128, 32, 4 }, stateConfig.GetStorageShape(GatedDeltaNetStateKind.Recurrent));
         Assert.IsType<GatedDeltaNet>(expression.Target);
-        Assert.Equal(12, expression.Arguments.Length);
+        Assert.Equal(15, expression.Arguments.Length);
     }
 
     [Fact]

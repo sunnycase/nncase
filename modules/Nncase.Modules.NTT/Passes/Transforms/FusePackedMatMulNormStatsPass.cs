@@ -21,6 +21,13 @@ namespace Nncase.Passes.Transforms;
 /// </summary>
 public sealed class FusePackedMatMulNormStatsPass : FunctionPass
 {
+    private readonly bool _enableBlockScaledMatMul;
+
+    public FusePackedMatMulNormStatsPass(bool enableBlockScaledMatMul)
+    {
+        _enableBlockScaledMatMul = enableBlockScaledMatMul;
+    }
+
     protected override Task<BaseFunction> RunCoreAsync(BaseFunction input, RunPassContext context)
     {
         if (input is not Function function)
@@ -39,38 +46,29 @@ public sealed class FusePackedMatMulNormStatsPass : FunctionPass
                 continue;
             }
 
-            var packed = (PackedMatMul)producer.Target;
             var fused = AssertValidCall(
-                IR.F.NTT.PackedMatMulNormStats(
-                    (Expr)producer[PackedMatMul.Lhs],
-                    (Expr)producer[PackedMatMul.Rhs],
-                    packed.OutputDataType,
-                    packed.RhsLayout,
-                    first.Axis,
-                    first.UseMean,
-                    (Expr)producer[PackedMatMul.Scale],
-                    (Expr)producer[PackedMatMul.Addend])
-                .InheritMetaData(producer),
-                $"forming PackedMatMulNormStats in {function.Name}");
+                CreateFusedProducer(producer, first.Axis, first.UseMean)
+                    .InheritMetaData(producer),
+                $"forming packed matmul normalization statistics in {function.Name}");
             if (fused.CheckedType is not TupleType { Fields.Count: 2 } fusedType)
             {
                 throw new InvalidOperationException(
-                    $"PackedMatMulNormStats in {function.Name} must infer two outputs, got {fused.CheckedType}.");
+                    $"Fused packed matmul normalization statistics in {function.Name} must infer two outputs, got {fused.CheckedType}.");
             }
 
             if (!Equals(fusedType.Fields[0], producer.CheckedType))
             {
                 throw new InvalidOperationException(
-                    $"PackedMatMulNormStats in {function.Name} changed the matmul boundary type from " +
+                    $"Fused packed matmul normalization statistics in {function.Name} changed the matmul boundary type from " +
                     $"{producer.CheckedType} to {fusedType.Fields[0]}.");
             }
 
             var valueOutput = AssertValidExpr(
                 IR.F.Tensors.GetItem(fused, 0).InheritMetaData(producer),
-                $"selecting PackedMatMulNormStats value output in {function.Name}");
+                $"selecting fused packed matmul value output in {function.Name}");
             var localStats = AssertValidExpr(
                 IR.F.Tensors.GetItem(fused, 1),
-                $"selecting PackedMatMulNormStats statistics output in {function.Name}");
+                $"selecting fused packed matmul statistics output in {function.Name}");
             replacements.Add(producer, valueOutput);
 
             foreach (var candidate in candidates)
@@ -80,13 +78,13 @@ public sealed class FusePackedMatMulNormStatsPass : FunctionPass
                 {
                     replacement = AssertValidCall(
                         IR.F.Distributed.Boxing(localStats, candidate.NormStats.CheckedType),
-                        $"reducing PackedMatMulNormStats statistics in {function.Name}");
+                        $"reducing fused packed matmul statistics in {function.Name}");
                 }
 
                 if (!Equals(replacement.CheckedType, candidate.NormStats.CheckedType))
                 {
                     throw new InvalidOperationException(
-                        $"PackedMatMulNormStats in {function.Name} cannot preserve NormStats boundary type " +
+                        $"Fused packed matmul normalization statistics in {function.Name} cannot preserve NormStats boundary type " +
                         $"{candidate.NormStats.CheckedType}; got {replacement.CheckedType}.");
                 }
 
@@ -117,7 +115,7 @@ public sealed class FusePackedMatMulNormStatsPass : FunctionPass
         return Task.FromResult(rewritten);
     }
 
-    private static Dictionary<Call, List<Candidate>> CollectCandidates(Function function)
+    private Dictionary<Call, List<Candidate>> CollectCandidates(Function function)
     {
         var result = new Dictionary<Call, List<Candidate>>(ReferenceEqualityComparer.Instance);
         foreach (var normStatsCall in ExprCollector.Collect(function.Body)
@@ -127,9 +125,9 @@ public sealed class FusePackedMatMulNormStatsPass : FunctionPass
             var normStats = (NormStats)normStatsCall.Target;
             if (!TryGetPackedMatMul(
                     normStatsCall[NormStats.Input],
-                    out var packedCall,
-                    out var packed) ||
-                packed.FusedReduce ||
+                    out var packedCall) ||
+                packedCall.Target is not Op packedTarget ||
+                !CanFuseProducer(packedTarget) ||
                 packedCall.CheckedType is DistributedType { Partial: not null } ||
                 packedCall.CheckedType is not (TensorType or DistributedType) ||
                 !TryNormalizeAxis(normStats.Axis, packedCall.CheckedShape.Rank, out var axis) ||
@@ -152,28 +150,73 @@ public sealed class FusePackedMatMulNormStatsPass : FunctionPass
 
     private static bool TryGetPackedMatMul(
         BaseExpr input,
-        out Call packedCall,
-        out PackedMatMul packed)
+        out Call packedCall)
     {
-        if (input is Call { Target: PackedMatMul direct } directCall)
+        if (input is Call { Target: PackedMatMul } directCall)
         {
             packedCall = directCall;
-            packed = direct;
+            return true;
+        }
+
+        if (input is Call { Target: PackedBlockScaledMatMul } directBlockScaledCall)
+        {
+            packedCall = directBlockScaledCall;
             return true;
         }
 
         if (input is Call { Target: ShardedView } viewCall &&
-            viewCall[ShardedView.Input] is Call { Target: PackedMatMul viewed } viewedCall)
+            viewCall[ShardedView.Input] is Call { Target: PackedMatMul } viewedCall)
         {
             packedCall = viewedCall;
-            packed = viewed;
+            return true;
+        }
+
+        if (input is Call { Target: ShardedView } blockScaledViewCall &&
+            blockScaledViewCall[ShardedView.Input] is Call
+            { Target: PackedBlockScaledMatMul } viewedBlockScaledCall)
+        {
+            packedCall = viewedBlockScaledCall;
             return true;
         }
 
         packedCall = null!;
-        packed = null!;
         return false;
     }
+
+    private bool CanFuseProducer(Op target) => target switch
+    {
+        PackedMatMul { FusedReduce: false } => true,
+        PackedBlockScaledMatMul => _enableBlockScaledMatMul,
+        _ => false,
+    };
+
+    private static Expr CreateFusedProducer(Call producer, int axis, bool useMean) =>
+        producer.Target switch
+        {
+            PackedMatMul packed => IR.F.NTT.PackedMatMulNormStats(
+                (Expr)producer[PackedMatMul.Lhs],
+                (Expr)producer[PackedMatMul.Rhs],
+                packed.OutputDataType,
+                packed.RhsLayout,
+                axis,
+                useMean,
+                (Expr)producer[PackedMatMul.Scale],
+                (Expr)producer[PackedMatMul.Addend]),
+            PackedBlockScaledMatMul packed => IR.F.NTT.PackedBlockScaledMatMulNormStats(
+                (Expr)producer[PackedBlockScaledMatMul.Lhs],
+                (Expr)producer[PackedBlockScaledMatMul.Rhs],
+                (Expr)producer[PackedBlockScaledMatMul.RhsScale],
+                packed.OutputDataType,
+                packed.WeightBlockN,
+                packed.WeightBlockK,
+                packed.RhsLayout,
+                packed.OutputNVectorLaneCount,
+                axis,
+                useMean,
+                (Expr)producer[PackedBlockScaledMatMul.Addend]),
+            _ => throw new InvalidOperationException(
+                $"Unsupported packed matmul normalization-statistics producer {producer.Target.GetType().Name}."),
+        };
 
     private static bool TryNormalizeAxis(int axis, int rank, out int normalizedAxis)
     {

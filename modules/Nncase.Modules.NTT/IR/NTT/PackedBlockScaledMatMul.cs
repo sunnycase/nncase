@@ -17,9 +17,13 @@ public sealed partial class PackedBlockScaledMatMul : Op
 
     public static readonly ParameterInfo RhsScale = new(typeof(PackedBlockScaledMatMul), 2, "rhs_scale", ParameterKind.Input);
 
+    public static readonly ParameterInfo Addend = new(typeof(PackedBlockScaledMatMul), 3, "addend", ParameterKind.Input);
+
     public DataType OutputDataType { get; }
 
     public PackedMatMulRhsLayout RhsLayout { get; }
+
+    public int OutputNVectorLaneCount { get; }
 
     public long WeightBlockN { get; }
 
@@ -27,5 +31,6 @@ public sealed partial class PackedBlockScaledMatMul : Op
 
     public override string DisplayProperty() =>
         $"OutputDataType: {OutputDataType}, RhsLayout: {RhsLayout}, " +
+        $"OutputNVectorLaneCount: {OutputNVectorLaneCount}, " +
         $"WeightBlock: [{WeightBlockN}, {WeightBlockK}]";
 }

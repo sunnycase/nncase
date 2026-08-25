@@ -11,7 +11,10 @@ _PYNTT_GRID_MESH_VALUE = tle.device_mesh({"block": {{ pyrepr(grid_mesh_axes) }}}
 PYNTT_GRID_MESH = tl.constexpr(_PYNTT_GRID_MESH_VALUE)
 {% for group in grid_barrier_axis_groups %}
 PYNTT_GRID_AXIS_GROUP_{{ group.key }} = tl.constexpr(
-    _PYNTT_GRID_MESH_VALUE.axis_group({{ pyrepr(group.axis_names) }})
+    _PYNTT_GRID_MESH_VALUE.axis_group(
+        {{ pyrepr(group.axis_names) }},
+        group_shape={{ pyrepr(group.shape) }},
+    )
 )
 {% endfor %}
 

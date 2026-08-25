@@ -86,16 +86,20 @@ public partial class NTT
         DataType outputDataType,
         long weightBlockN,
         long weightBlockK,
-        PackedMatMulRhsLayout rhsLayout = PackedMatMulRhsLayout.KMajor)
+        PackedMatMulRhsLayout rhsLayout = PackedMatMulRhsLayout.KMajor,
+        int outputNVectorLaneCount = 1,
+        Expr? addend = null)
         => new Call(
             new PackedBlockScaledMatMul(
                 outputDataType,
                 rhsLayout,
+                outputNVectorLaneCount,
                 weightBlockN,
                 weightBlockK),
             lhs,
             rhs,
-            rhsScale);
+            rhsScale,
+            addend ?? None.Default);
 
     public static Expr PackedMatMulNormStats(
         Expr lhs,
@@ -112,6 +116,34 @@ public partial class NTT
             lhs,
             rhs,
             scale ?? None.Default,
+            addend ?? None.Default);
+    }
+
+    public static Expr PackedBlockScaledMatMulNormStats(
+        Expr lhs,
+        Expr rhs,
+        Expr rhsScale,
+        DataType outputDataType,
+        long weightBlockN,
+        long weightBlockK,
+        PackedMatMulRhsLayout rhsLayout,
+        int outputNVectorLaneCount,
+        int axis,
+        bool useMean,
+        Expr? addend = null)
+    {
+        return new Call(
+            new PackedBlockScaledMatMulNormStats(
+                outputDataType,
+                rhsLayout,
+                outputNVectorLaneCount,
+                weightBlockN,
+                weightBlockK,
+                axis,
+                useMean),
+            lhs,
+            rhs,
+            rhsScale,
             addend ?? None.Default);
     }
 

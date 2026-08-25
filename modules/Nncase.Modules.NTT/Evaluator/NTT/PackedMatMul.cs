@@ -231,25 +231,63 @@ public sealed class PackedMatMulEvaluator : IEvaluator<PackedMatMul>, ITypeInfer
         out bool transposeB,
         out string? errorMessage)
     {
+        if (!TryGetRhsLayoutInfo(
+                layout,
+                vectorType,
+                rhsRank,
+                out rhsUnpackAxes,
+                out transposeB,
+                out errorMessage))
+        {
+            outputLanes = [];
+            return false;
+        }
+
+        switch (layout)
+        {
+            case PackedMatMulRhsLayout.NMajor:
+                outputLanes = vectorType.Lanes.ToArray();
+                return true;
+            case PackedMatMulRhsLayout.KMajor:
+                outputLanes = [vectorType.Lanes[0]];
+                return true;
+            default:
+                outputLanes = [];
+                errorMessage = $"PackedMatMul {layout} requires an operation-defined output N vector lane count.";
+                return false;
+        }
+    }
+
+    internal static bool TryGetRhsLayoutInfo(
+        PackedMatMulRhsLayout layout,
+        VectorType vectorType,
+        int rhsRank,
+        out int[] rhsUnpackAxes,
+        out bool transposeB,
+        out string? errorMessage)
+    {
         switch (layout, vectorType.Lanes.Count)
         {
             case (PackedMatMulRhsLayout.NMajor, 2):
                 rhsUnpackAxes = [rhsRank - 2, rhsRank - 2];
-                outputLanes = vectorType.Lanes.ToArray();
                 transposeB = true;
                 errorMessage = null;
                 return true;
             case (PackedMatMulRhsLayout.KMajor, 3):
                 rhsUnpackAxes = [rhsRank - 1, rhsRank - 2, rhsRank - 2];
-                outputLanes = [vectorType.Lanes[0]];
                 transposeB = false;
+                errorMessage = null;
+                return true;
+            case (PackedMatMulRhsLayout.NMajorKPacked, 2):
+                rhsUnpackAxes = [rhsRank - 1, rhsRank - 1];
+                transposeB = true;
                 errorMessage = null;
                 return true;
             default:
                 rhsUnpackAxes = [];
-                outputLanes = [];
                 transposeB = false;
-                errorMessage = $"PackedMatMul {layout} expects {(layout == PackedMatMulRhsLayout.NMajor ? 2 : 3)} RHS vector lanes, got [{string.Join(",", vectorType.Lanes)}].";
+                var expectedLanes = layout == PackedMatMulRhsLayout.KMajor ? 3 : 2;
+                errorMessage = $"PackedMatMul {layout} expects {expectedLanes} RHS vector lanes, got [{string.Join(",", vectorType.Lanes)}].";
                 return false;
         }
     }

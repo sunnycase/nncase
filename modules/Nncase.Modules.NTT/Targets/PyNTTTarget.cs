@@ -36,7 +36,7 @@ public sealed class PyNTTTarget : NTTTarget
 
         pass.Add<Passes.Rules.NTT.PackMatMulRhsKMajor>(vectorBytes, kPack);
         pass.Add<Passes.Rules.NTT.PackScaledMatMulRhsKMajor>(vectorBytes, kPack);
-        pass.Add<Passes.Rules.NTT.PackBlockScaledMatMulRhsKMajor>(vectorBytes, kPack);
+        pass.Add<Passes.Rules.NTT.PackBlockScaledMatMulRhsNMajorKPacked>(vectorBytes, kPack);
         pass.Add<Passes.Rules.NTT.PackQKVParallelLinearRhsKMajor>(vectorBytes, kPack);
         pass.Add<Passes.Rules.NTT.PackMatMulGluRhsKMajor>(vectorBytes, kPack);
     }
@@ -62,8 +62,9 @@ public sealed class PyNTTTarget : NTTTarget
         passManager.AddWithName<DataflowPass>("FusePackedMatMulAddBeforeAutoDistributed").Configure(p =>
         {
             p.Add<Passes.Rules.NTT.FusePackedMatMulAdd>();
+            p.Add<Passes.Rules.NTT.FusePackedBlockScaledMatMulAdd>();
         });
-        passManager.Add<FusePackedMatMulNormStatsPass>();
+        passManager.Add<FusePackedMatMulNormStatsPass>(true);
     }
 
     /// <inheritdoc/>

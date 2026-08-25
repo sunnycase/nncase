@@ -1480,45 +1480,63 @@ public sealed record PyNTTGatedDeltaNetRecurrentCoreTemplateModel(
     PyNTTBufferPointerTemplateModel RecurrentState,
     PyNTTBufferPointerTemplateModel QKV,
     PyNTTBufferPointerTemplateModel Z,
-    PyNTTBufferPointerTemplateModel BProjection,
-    PyNTTBufferPointerTemplateModel AProjection,
+    PyNTTBufferPointerTemplateModel ProjectionInput,
+    PyNTTBufferPointerTemplateModel BWeight,
+    PyNTTBufferPointerTemplateModel AWeight,
     PyNTTBufferPointerTemplateModel ALog,
     PyNTTBufferPointerTemplateModel DtBias,
     PyNTTBufferPointerTemplateModel NormWeight,
+    PyNTTBufferPointerTemplateModel CoreScratch,
     PyNTTBufferPointerTemplateModel GatedOutput,
     string ActivationTritonDType,
     string OutputTritonDType,
     PyNTTDimExpression[] QKVStrides,
     PyNTTDimExpression[] ZStrides,
-    PyNTTDimExpression[] BProjectionStrides,
-    PyNTTDimExpression[] AProjectionStrides,
+    PyNTTDimExpression[] ProjectionInputStrides,
+    PyNTTDimExpression[] BWeightStrides,
+    PyNTTDimExpression[] AWeightStrides,
     PyNTTDimExpression[] ALogStrides,
     PyNTTDimExpression[] DtBiasStrides,
     PyNTTDimExpression[] NormWeightStrides,
+    PyNTTDimExpression[] CoreScratchStrides,
     PyNTTDimExpression[] GatedOutputStrides,
     PyNTTGatedDeltaNetStateAxisTemplateModel RecurrentStateLayerAxis,
     PyNTTGatedDeltaNetStateAxisTemplateModel RecurrentStateHeadAxis,
     PyNTTGatedDeltaNetStateAxisTemplateModel RecurrentStateKeyAxis,
     PyNTTGatedDeltaNetStateAxisTemplateModel RecurrentStateValueAxis,
     string LayerId,
+    int HiddenSize,
     int NumKeyHeads,
     int NumValueHeads,
     int KeyHeadDim,
     int ValueHeadDim,
     int ConvDim,
     int ValueDim,
-    int LocalValueHeadCapacity,
-    string ActiveLocalValueHeads,
+    int LocalValueCapacity,
+    string ActiveLocalValueDim,
     int QKVLaneCount,
     int ZLaneCount,
-    int ProjectionLaneCount,
+    int ProjectionInputLaneCount,
     int KeyBlockSize,
     int ValueBlockSize,
+    string StateBarrier,
     float Epsilon,
     PyNTTMicroKernelTemplateModel MicroKernel,
     string Comment)
 {
     public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
+
+    public string? BWeightDescriptorName { get; set; }
+
+    public string BWeightDescriptorOriginElements { get; set; } = "0";
+
+    public bool BWeightDescriptorOwnerIndexed { get; set; }
+
+    public string? AWeightDescriptorName { get; set; }
+
+    public string AWeightDescriptorOriginElements { get; set; } = "0";
+
+    public bool AWeightDescriptorOwnerIndexed { get; set; }
 }
 
 public sealed record PyNTTGatedDeltaNetStateAxisTemplateModel(

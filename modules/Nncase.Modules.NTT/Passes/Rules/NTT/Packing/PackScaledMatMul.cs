@@ -93,15 +93,16 @@ public sealed partial class PackScaledMatMulRhsKMajor : RewriteRule<Pattern>
 }
 
 /// <summary>
-/// Packs an E4M3 block-scaled matmul RHS into the GPU K-major ABI.
+/// Packs an E4M3 block-scaled matmul RHS into a row-major scalar [N, K]
+/// physical layout that can be staged directly into an MMA operand.
 /// </summary>
 [RuleGenerator]
-public sealed partial class PackBlockScaledMatMulRhsKMajor : RewriteRule<Pattern>
+public sealed partial class PackBlockScaledMatMulRhsNMajorKPacked : RewriteRule<Pattern>
 {
     private readonly int _vectorBytes;
     private readonly int _kPack;
 
-    public PackBlockScaledMatMulRhsKMajor(int vectorBytes, int kPack)
+    public PackBlockScaledMatMulRhsNMajorKPacked(int vectorBytes, int kPack)
     {
         _vectorBytes = vectorBytes > 0
             ? vectorBytes
@@ -150,8 +151,6 @@ public sealed partial class PackBlockScaledMatMulRhsKMajor : RewriteRule<Pattern
         Expr packedRhs = IR.F.Tensors.Transpose(rhs, permutation);
         packedRhs = IR.F.Tensors.Pack(packedRhs, [kVectorLanes], [rank - 1]);
         packedRhs = IR.F.Tensors.Pack(packedRhs, [_kPack], [rank - 1]);
-        packedRhs = IR.F.Tensors.Pack(packedRhs, [nVectorLanes], [rank - 2]);
-        packedRhs = IR.F.Tensors.Transpose(packedRhs, permutation);
         if (packedRhs.CheckedType is InvalidType)
         {
             return null;
@@ -163,7 +162,9 @@ public sealed partial class PackBlockScaledMatMulRhsKMajor : RewriteRule<Pattern
             rhsScale,
             blockScaledMatMul.OutputDataType,
             blockScaledMatMul.WeightBlockN,
-            blockScaledMatMul.WeightBlockK);
+            blockScaledMatMul.WeightBlockK,
+            IR.NTT.PackedMatMulRhsLayout.NMajorKPacked,
+            nVectorLanes);
         return IR.F.Tensors.Unpack(
             packed,
             [nVectorLanes],

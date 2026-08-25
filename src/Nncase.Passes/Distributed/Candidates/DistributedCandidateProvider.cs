@@ -77,6 +77,15 @@ public sealed class DistributedCandidateContext
     public Call SourceCall { get; }
 
     public IReadOnlyList<IReadOnlyList<IRType>> AvailableInputTypes { get; }
+
+    public IReadOnlyList<DistributedType> GetLeafCandidateTypes(
+        TensorType tensorType,
+        IEnumerable<Placement> placements)
+        => AutoDistributedRewriter.GetLeafCandidateDistTypes(
+            tensorType,
+            placements,
+            ModuleKind,
+            TargetOptions);
 }
 
 public abstract class DistributedCandidateProvider<T> : IDistributedCandidateProvider<T>

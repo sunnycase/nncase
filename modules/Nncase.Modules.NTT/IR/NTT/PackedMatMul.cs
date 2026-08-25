@@ -20,6 +20,12 @@ public enum PackedMatMulRhsLayout
     /// GPU-oriented [..., K, N]&lt;NVector, KPack, KVector&gt; layout.
     /// </summary>
     KMajor,
+
+    /// <summary>
+    /// GPU MMA-oriented [..., N, K / (KPack * KVector)]&lt;KPack, KVector&gt;
+    /// layout. Its scalar physical order is row-major [..., N, K].
+    /// </summary>
+    NMajorKPacked,
 }
 
 [PatternFunctionalGenerator]

@@ -336,8 +336,8 @@ public sealed class UnitTestDistribAutoDistributed : TestClassBase
             [GatedDeltaNetStateDimKind.NumLayers, GatedDeltaNetStateDimKind.ConvChannels, GatedDeltaNetStateDimKind.ConvHistory],
             [GatedDeltaNetStateDimKind.ConvChannels],
             [8],
-            [GatedDeltaNetStateDimKind.NumLayers, GatedDeltaNetStateDimKind.NumValueHeads, GatedDeltaNetStateDimKind.KeyHeadDim, GatedDeltaNetStateDimKind.ValueHeadDim],
-            [GatedDeltaNetStateDimKind.ValueHeadDim],
+            [GatedDeltaNetStateDimKind.NumLayers, GatedDeltaNetStateDimKind.NumValueHeads, GatedDeltaNetStateDimKind.ValueHeadDim, GatedDeltaNetStateDimKind.KeyHeadDim],
+            [GatedDeltaNetStateDimKind.KeyHeadDim],
             [4]);
         var input = Buffer("input", bf16, 1, hidden);
         var state = Buffer(
@@ -387,8 +387,9 @@ public sealed class UnitTestDistribAutoDistributed : TestClassBase
             state,
             new Var("convolved_qkv", convolutionOutput[0]),
             Buffer("z", packedActivation, 1, valueDim / 8),
-            Buffer("b_projection", packedActivation, 1, numValueHeads / 8),
-            Buffer("a_projection", packedActivation, 1, numValueHeads / 8),
+            input,
+            Buffer("b_weight", bf16, numValueHeads, hidden),
+            Buffer("a_weight", bf16, numValueHeads, hidden),
             Buffer("a_log", DataTypes.Float32, numValueHeads),
             Buffer("dt_bias", DataTypes.Float32, numValueHeads),
             Buffer("norm_weight", DataTypes.Float32, valueHeadDim),
@@ -399,15 +400,16 @@ public sealed class UnitTestDistribAutoDistributed : TestClassBase
             valueHeadDim,
             1e-6F);
         var recurrentOutput = Assert.IsType<TupleType>(recurrentCall.CheckedType);
-        var headSplit = DistributedUtility.CreateUnitAlignedContiguousSplit(
-            [0, 1],
-            placement,
-            numValueHeads);
         var valueSplit = DistributedUtility.CreateUnitAlignedContiguousSplit(
             [0, 1],
             placement,
-            numValueHeads,
-            valueHeadDim);
+            numValueHeads * valueHeadDim / 8,
+            8);
+        Assert.True(DistributedUtility.TryScaleSplitUnits(
+            valueSplit,
+            1,
+            8,
+            out var packedValueSplit));
         var recurrentDefaultOutput = new TupleType([
             Broadcast(Assert.IsType<TensorType>(recurrentOutput[0])),
             recurrentOutput[1],
@@ -439,17 +441,20 @@ public sealed class UnitTestDistribAutoDistributed : TestClassBase
             Assert.IsType<DistributedType>(recurrentInputs[GatedDeltaNetRecurrentCore.QKV.Index]).AxisPolicies,
             policy => Assert.IsType<SBPBroadCast>(policy));
         Assert.Equal(
-            new SBP[] { SBP.B, valueSplit },
+            new SBP[] { SBP.B, packedValueSplit },
             Assert.IsType<DistributedType>(recurrentInputs[GatedDeltaNetRecurrentCore.Z.Index]).AxisPolicies.ToArray());
         Assert.All(
-            Assert.IsType<DistributedType>(recurrentInputs[GatedDeltaNetRecurrentCore.BProjection.Index]).AxisPolicies,
+            Assert.IsType<DistributedType>(recurrentInputs[GatedDeltaNetRecurrentCore.ProjectionInput.Index]).AxisPolicies,
             policy => Assert.IsType<SBPBroadCast>(policy));
         Assert.All(
-            Assert.IsType<DistributedType>(recurrentInputs[GatedDeltaNetRecurrentCore.AProjection.Index]).AxisPolicies,
+            Assert.IsType<DistributedType>(recurrentInputs[GatedDeltaNetRecurrentCore.BWeight.Index]).AxisPolicies,
             policy => Assert.IsType<SBPBroadCast>(policy));
-        Assert.Equal(
-            new SBP[] { headSplit },
-            Assert.IsType<DistributedType>(recurrentInputs[GatedDeltaNetRecurrentCore.ALog.Index]).AxisPolicies.ToArray());
+        Assert.All(
+            Assert.IsType<DistributedType>(recurrentInputs[GatedDeltaNetRecurrentCore.AWeight.Index]).AxisPolicies,
+            policy => Assert.IsType<SBPBroadCast>(policy));
+        Assert.All(
+            Assert.IsType<DistributedType>(recurrentInputs[GatedDeltaNetRecurrentCore.ALog.Index]).AxisPolicies,
+            policy => Assert.IsType<SBPBroadCast>(policy));
     }
 
     [Fact]
@@ -725,6 +730,92 @@ public sealed class UnitTestDistribAutoDistributed : TestClassBase
         Assert.DoesNotContain(
             returnTypes,
             type => type is DistributedType { Partial: not null });
+    }
+
+    [Fact]
+    public void TestPackedBlockScaledMatMulNormStatsCandidatePreservesOutputSplit()
+    {
+        var options = new PyNTTTargetOptions
+        {
+            HierarchyNames = "yx",
+            HierarchyLevels = "bb",
+            Hierarchies = [new[] { 4, 8 }],
+        };
+        CompileOptions.TargetOptions = options;
+        var placement = new Placement([4, 8], "yx", "bb");
+        var lhsTensorType = new TensorType(DataTypes.BFloat16, new long[] { 1, 128 });
+        var rhsTensorType = new TensorType(
+            new VectorType(DataTypes.Float8E4M3, [2, 16]),
+            new long[] { 256, 4 });
+        var rhsScaleTensorType = new TensorType(DataTypes.BFloat16, new long[] { 2, 1 });
+        var lhsType = new DistributedType(lhsTensorType, [SBP.B, SBP.B], placement);
+        var rhsType = new DistributedType(
+            rhsTensorType,
+            [SBP.SBlockCyclic([0, 1], 8), SBP.B],
+            placement);
+        var rhsScaleType = new DistributedType(rhsScaleTensorType, [SBP.B, SBP.B], placement);
+
+        var lhs = new Var("lhs", lhsTensorType);
+        var rhs = new Var("rhs", rhsTensorType);
+        var rhsScale = new Var("rhs_scale", rhsScaleTensorType);
+        var packed = Assert.IsType<Call>(IR.F.NTT.PackedBlockScaledMatMul(
+            lhs,
+            rhs,
+            rhsScale,
+            DataTypes.BFloat16,
+            128,
+            128,
+            PackedMatMulRhsLayout.NMajorKPacked,
+            8));
+        Assert.True(packed.InferenceType());
+        var outputTensorType = Assert.IsType<TensorType>(packed.CheckedType);
+        var outputType = new DistributedType(
+            outputTensorType,
+            [SBP.B, SBP.SBlockCyclic([0, 1], 1)],
+            placement);
+        var addend = new Var("addend", outputTensorType);
+        var sourceCall = Assert.IsType<Call>(IR.F.NTT.PackedBlockScaledMatMulNormStats(
+            lhs,
+            rhs,
+            rhsScale,
+            DataTypes.BFloat16,
+            128,
+            128,
+            PackedMatMulRhsLayout.NMajorKPacked,
+            8,
+            1,
+            false,
+            addend));
+        Assert.True(sourceCall.InferenceType());
+        var context = new DistributedCandidateContext(
+            CompileOptions,
+            options,
+            PyNTTTarget.Kind,
+            sourceCall,
+            [
+                new IRType[] { lhsType },
+                new IRType[] { rhsType },
+                new IRType[] { rhsScaleType },
+                new IRType[] { outputType },
+            ]);
+        var provider = new PackedBlockScaledMatMulNormStatsCandidateProvider();
+        var target = Assert.IsType<PackedBlockScaledMatMulNormStats>(sourceCall.Target);
+
+        var returnTypes = provider.GetReturnCandidateTypes(context, target, []);
+
+        var tupleType = Assert.IsType<TupleType>(PackedBlockScaledMatMulNormStatsEvaluator.InferType(
+            target,
+            lhsType,
+            rhsType,
+            rhsScaleType,
+            outputType));
+        Assert.Contains(tupleType, returnTypes);
+        var statsType = Assert.IsType<DistributedType>(tupleType.Fields[1]);
+        Assert.Equal(SBP.P([0, 1], ReduceOp.Sum), statsType.Partial);
+        Assert.True(provider.TryGetInputTypeTuples(context, target, tupleType, out var tuples));
+        var tuple = Assert.Single(tuples);
+        Assert.Equal(rhsType, tuple.InputTypes[PackedBlockScaledMatMulNormStats.Rhs.Index]);
+        Assert.Equal(outputType, tuple.InputTypes[PackedBlockScaledMatMulNormStats.Addend.Index]);
     }
 
     [Fact]

@@ -19,12 +19,17 @@ public sealed partial class PackedBlockScaledMatMul : NTTKernelOp
 
     public static readonly ParameterInfo Output = new(typeof(PackedBlockScaledMatMul), 3, "output", memoryEffect: MemoryEffect.ReductionWrite);
 
+    public static readonly ParameterInfo Addend = new(typeof(PackedBlockScaledMatMul), 4, "addend", memoryEffect: MemoryEffect.Read);
+
     public IR.NTT.PackedMatMulRhsLayout RhsLayout { get; }
+
+    public int OutputNVectorLaneCount { get; }
 
     public long WeightBlockN { get; }
 
     public long WeightBlockK { get; }
 
     public override string DisplayProperty() =>
-        $"RhsLayout: {RhsLayout}, WeightBlock: [{WeightBlockN}, {WeightBlockK}]";
+        $"RhsLayout: {RhsLayout}, OutputNVectorLaneCount: {OutputNVectorLaneCount}, " +
+        $"WeightBlock: [{WeightBlockN}, {WeightBlockK}]";
 }

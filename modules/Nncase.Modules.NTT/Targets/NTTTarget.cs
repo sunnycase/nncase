@@ -168,6 +168,6 @@ public abstract class NTTTarget : Target
             p.Add<Passes.Rules.NTT.FusePackedMatMulAdd>();
             p.Add<Passes.Rules.NTT.FusePackedMatMulAddThroughShardedView>();
         });
-        passManager.Add<FusePackedMatMulNormStatsPass>();
+        passManager.Add<FusePackedMatMulNormStatsPass>(false);
     }
 }

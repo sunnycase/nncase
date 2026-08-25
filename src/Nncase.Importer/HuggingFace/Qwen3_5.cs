@@ -78,10 +78,10 @@ public class Qwen3_5 : HuggingFaceModel
             [
                 GatedDeltaNetStateDimKind.NumLayers,
                 GatedDeltaNetStateDimKind.NumValueHeads,
-                GatedDeltaNetStateDimKind.KeyHeadDim,
                 GatedDeltaNetStateDimKind.ValueHeadDim,
+                GatedDeltaNetStateDimKind.KeyHeadDim,
             ],
-            [GatedDeltaNetStateDimKind.ValueHeadDim],
+            [GatedDeltaNetStateDimKind.KeyHeadDim],
             [recurrentLane]);
         var state = new Var(
             "gated_delta_net_state",

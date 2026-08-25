@@ -81,6 +81,72 @@ public sealed partial class FusePackedMatMulAdd : IRewriteRule
 }
 
 /// <summary>
+/// Fuses an exact-layout add into a packed block-scaled matmul before
+/// distributed layouts are selected.
+/// </summary>
+[RuleGenerator]
+public sealed partial class FusePackedBlockScaledMatMulAdd : IRewriteRule
+{
+    public FusePackedBlockScaledMatMulAdd()
+    {
+        var packedMatMul = IsPackedBlockScaledMatMul(
+            "packedMatMul",
+            "packedCall",
+            _ => true,
+            IsWildcard("lhs"),
+            IsWildcard("rhs"),
+            IsWildcard("rhsScale"),
+            IsNone());
+
+        Pattern = IsAlt(
+            IsBinary(
+                "binary",
+                "binaryCall",
+                op => op.BinaryOp == BinaryOp.Add,
+                packedMatMul,
+                IsWildcard("addend")),
+            IsBinary(
+                "binary",
+                "binaryCall",
+                op => op.BinaryOp == BinaryOp.Add,
+                IsWildcard("addend"),
+                packedMatMul));
+    }
+
+    public IPattern Pattern { get; }
+
+    private Expr? GetReplace(
+        PackedBlockScaledMatMul packedMatMul,
+        Call packedCall,
+        Expr lhs,
+        Expr rhs,
+        Expr rhsScale,
+        Call binaryCall,
+        Expr addend)
+    {
+        if (ReferenceEquals(addend, packedCall) ||
+            packedCall.Users.Count() != 1 ||
+            !ReferenceEquals(packedCall.Users.Single(), binaryCall) ||
+            !Equals(packedCall.CheckedType, addend.CheckedType) ||
+            !Equals(binaryCall.CheckedType, packedCall.CheckedType))
+        {
+            return null;
+        }
+
+        return IR.F.NTT.PackedBlockScaledMatMul(
+            lhs,
+            rhs,
+            rhsScale,
+            packedMatMul.OutputDataType,
+            packedMatMul.WeightBlockN,
+            packedMatMul.WeightBlockK,
+            packedMatMul.RhsLayout,
+            packedMatMul.OutputNVectorLaneCount,
+            addend).InheritMetaData(binaryCall);
+    }
+}
+
+/// <summary>
 /// Fuses an add through a layout-only sharded view of a packed matmul result.
 /// </summary>
 [RuleGenerator]

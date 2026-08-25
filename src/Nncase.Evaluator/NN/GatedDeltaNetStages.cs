@@ -276,44 +276,52 @@ public sealed class GatedDeltaNetRecurrentCoreEvaluator :
             context.GetArgumentType<IRType>(target, GatedDeltaNetRecurrentCore.QKV));
         var z = GatedDeltaNetStageUtility.GetLocalTensorType(
             context.GetArgumentType<IRType>(target, GatedDeltaNetRecurrentCore.Z));
-        var bProjection = GatedDeltaNetStageUtility.GetLocalTensorType(
-            context.GetArgumentType<IRType>(target, GatedDeltaNetRecurrentCore.BProjection));
-        var aProjection = GatedDeltaNetStageUtility.GetLocalTensorType(
-            context.GetArgumentType<IRType>(target, GatedDeltaNetRecurrentCore.AProjection));
+        var projectionInput = GatedDeltaNetStageUtility.UnpackTensorAxis(
+            GatedDeltaNetStageUtility.GetLocalTensorType(
+                context.GetArgumentType<IRType>(target, GatedDeltaNetRecurrentCore.ProjectionInput)),
+            1);
         var result = context.GetReturnType<TupleType>();
         var output = GatedDeltaNetStageUtility.GetLocalTensorType(result[0]);
-        if (!GatedDeltaNetStageUtility.TryGetMaxShape(output, out var outputShape))
+        if (!GatedDeltaNetStageUtility.TryGetMaxShape(output, out var outputShape) ||
+            !GatedDeltaNetStageUtility.TryGetMaxShape(projectionInput, out var projectionInputShape))
         {
             return Cost.Zero;
         }
 
         var tokens = outputShape[0];
-        var localHeads = outputShape[1] / target.ValueHeadDim;
-        var localQkvDim = checked(localHeads * ((target.KeyHeadDim * 2) + target.ValueHeadDim));
+        var localValueElements = outputShape[1];
+        var localProjectionHeads = MathUtility.CeilDiv(
+            checked(localValueElements + target.ValueHeadDim - 1),
+            target.ValueHeadDim);
+        var projectionK = projectionInputShape[1];
+        var localQkvDim = checked((target.KeyHeadDim * 2) + localValueElements);
+        var activationBytes = GatedDeltaNetStageUtility.GetScalarDataType(qkv.DType).SizeInBytes;
         var cost = new Cost();
         GatedDeltaNetStageUtility.AddCostFactor(
             cost,
             CostFactorNames.CPUCycles,
             checked(
-                (UInt128)tokens * (UInt128)localHeads *
-                (UInt128)((target.KeyHeadDim * target.ValueHeadDim * 5) +
-                    (target.KeyHeadDim * 8) + (target.ValueHeadDim * 12))));
+                (UInt128)tokens *
+                (((UInt128)localProjectionHeads * (UInt128)projectionK * 2U) +
+                    ((UInt128)localValueElements * (UInt128)target.KeyHeadDim * 5U) +
+                    ((UInt128)localProjectionHeads * (UInt128)target.KeyHeadDim * 8U) +
+                    ((UInt128)localValueElements * 12U))));
         GatedDeltaNetStageUtility.AddCostFactor(
             cost,
             CostFactorNames.BlockLocalMemoryLoadBytes,
             checked(
-                (UInt128)localQkvDim * (UInt128)GatedDeltaNetStageUtility.GetScalarDataType(qkv.DType).SizeInBytes +
+                (UInt128)localQkvDim * (UInt128)activationBytes +
                 CostUtility.GetMemoryAccess(z) +
-                CostUtility.GetMemoryAccess(bProjection) +
-                CostUtility.GetMemoryAccess(aProjection) +
-                ((UInt128)localHeads * (UInt128)target.KeyHeadDim *
-                    (UInt128)target.ValueHeadDim * (UInt128)DataTypes.Float32.SizeInBytes * 2)));
+                (UInt128)projectionK * (UInt128)activationBytes +
+                (UInt128)localProjectionHeads * (UInt128)projectionK * (UInt128)activationBytes * 2U +
+                ((UInt128)localValueElements * (UInt128)target.KeyHeadDim *
+                    (UInt128)DataTypes.Float32.SizeInBytes * 2U)));
         GatedDeltaNetStageUtility.AddCostFactor(
             cost,
             CostFactorNames.BlockLocalMemoryStoreBytes,
             checked(
-                (UInt128)localHeads * (UInt128)target.KeyHeadDim *
-                    (UInt128)target.ValueHeadDim * (UInt128)DataTypes.Float32.SizeInBytes +
+                (UInt128)localValueElements * (UInt128)target.KeyHeadDim *
+                    (UInt128)DataTypes.Float32.SizeInBytes +
                 CostUtility.GetMemoryAccess(output)));
         return cost;
     }
@@ -346,17 +354,31 @@ public sealed class GatedDeltaNetRecurrentCoreEvaluator :
                 Enumerable.Repeat(1, zLanes.Count).ToArray());
         }
 
-        var bProjectionValue = context.GetArgumentValueAsTensor(target, GatedDeltaNetRecurrentCore.BProjection);
-        var bProjection = bProjectionValue.ToOrtTensor();
-        var aProjectionValue = context.GetArgumentValueAsTensor(target, GatedDeltaNetRecurrentCore.AProjection);
-        var aProjection = aProjectionValue.ToOrtTensor();
-        var projectionLanes = GatedDeltaNetStageUtility.GetDataTypeLanes(bProjectionValue.ElementType);
-        if (projectionLanes.Count != 0)
+        var projectionInputValue = context.GetArgumentValueAsTensor(
+            target,
+            GatedDeltaNetRecurrentCore.ProjectionInput);
+        var projectionInput = projectionInputValue.ToOrtTensor();
+        var projectionInputLanes = GatedDeltaNetStageUtility.GetDataTypeLanes(
+            projectionInputValue.ElementType);
+        if (projectionInputLanes.Count != 0)
         {
-            var unpackAxes = Enumerable.Repeat(1, projectionLanes.Count).ToArray();
-            bProjection = bProjection.Unpack(projectionLanes.Count, unpackAxes);
-            aProjection = aProjection.Unpack(projectionLanes.Count, unpackAxes);
+            projectionInput = projectionInput.Unpack(
+                projectionInputLanes.Count,
+                Enumerable.Repeat(1, projectionInputLanes.Count).ToArray());
         }
+
+        var bWeight = context.GetArgumentValueAsTensor(
+            target,
+            GatedDeltaNetRecurrentCore.BWeight).ToOrtTensor();
+        var aWeight = context.GetArgumentValueAsTensor(
+            target,
+            GatedDeltaNetRecurrentCore.AWeight).ToOrtTensor();
+        var bProjection = OrtKI.MatMul(
+            projectionInput,
+            OrtKI.Transpose(bWeight, new[] { 1L, 0L }));
+        var aProjection = OrtKI.MatMul(
+            projectionInput,
+            OrtKI.Transpose(aWeight, new[] { 1L, 0L }));
         var aLog = context.GetArgumentValueAsTensor(target, GatedDeltaNetRecurrentCore.ALog).ToOrtTensor().Cast(OrtDataType.Float);
         var dtBias = context.GetArgumentValueAsTensor(target, GatedDeltaNetRecurrentCore.DtBias).ToOrtTensor().Cast(OrtDataType.Float);
         var normWeight = context.GetArgumentValueAsTensor(target, GatedDeltaNetRecurrentCore.NormWeight).ToOrtTensor().Cast(OrtDataType.Float);
@@ -525,17 +547,21 @@ public sealed class GatedDeltaNetRecurrentCoreEvaluator :
                 "GatedDeltaNetRecurrentCore value-head split must cover the block placement so each state head has one writer.");
         }
 
-        var head = DistributedUtility.CreateUnitAlignedContiguousSplit(
-            headAxes,
-            placement,
-            target.NumValueHeads);
+        var zLaneCount = GatedDeltaNetStageUtility.GetVectorLaneCount(
+            distributed[GatedDeltaNetRecurrentCore.Z.Index].TensorType.DType);
+        var scalarValueElements = checked(target.NumValueHeads * target.ValueHeadDim);
+        if (scalarValueElements % zLaneCount != 0)
+        {
+            return new InvalidType(
+                $"GatedDeltaNetRecurrentCore value extent {scalarValueElements} is not divisible by " +
+                $"Z's packed lane count {zLaneCount}.");
+        }
+
         var value = DistributedUtility.CreateUnitAlignedContiguousSplit(
             headAxes,
             placement,
-            target.NumValueHeads,
-            target.ValueHeadDim);
-        var zLaneCount = GatedDeltaNetStageUtility.GetVectorLaneCount(
-            distributed[GatedDeltaNetRecurrentCore.Z.Index].TensorType.DType);
+            scalarValueElements / zLaneCount,
+            zLaneCount);
         if (!DistributedUtility.TryScaleSplitUnits(
                 value,
                 1,
@@ -551,10 +577,11 @@ public sealed class GatedDeltaNetRecurrentCoreEvaluator :
         {
             [GatedDeltaNetRecurrentCore.QKV.Index] = GatedDeltaNetStageUtility.CreateBroadcast(distributed[GatedDeltaNetRecurrentCore.QKV.Index].TensorType, placement),
             [GatedDeltaNetRecurrentCore.Z.Index] = GatedDeltaNetStageUtility.Create(distributed[GatedDeltaNetRecurrentCore.Z.Index].TensorType, [SBP.B, packedValue], placement),
-            [GatedDeltaNetRecurrentCore.BProjection.Index] = GatedDeltaNetStageUtility.CreateBroadcast(distributed[GatedDeltaNetRecurrentCore.BProjection.Index].TensorType, placement),
-            [GatedDeltaNetRecurrentCore.AProjection.Index] = GatedDeltaNetStageUtility.CreateBroadcast(distributed[GatedDeltaNetRecurrentCore.AProjection.Index].TensorType, placement),
-            [GatedDeltaNetRecurrentCore.ALog.Index] = GatedDeltaNetStageUtility.Create(distributed[GatedDeltaNetRecurrentCore.ALog.Index].TensorType, [head], placement),
-            [GatedDeltaNetRecurrentCore.DtBias.Index] = GatedDeltaNetStageUtility.Create(distributed[GatedDeltaNetRecurrentCore.DtBias.Index].TensorType, [head], placement),
+            [GatedDeltaNetRecurrentCore.ProjectionInput.Index] = GatedDeltaNetStageUtility.CreateBroadcast(distributed[GatedDeltaNetRecurrentCore.ProjectionInput.Index].TensorType, placement),
+            [GatedDeltaNetRecurrentCore.BWeight.Index] = GatedDeltaNetStageUtility.CreateBroadcast(distributed[GatedDeltaNetRecurrentCore.BWeight.Index].TensorType, placement),
+            [GatedDeltaNetRecurrentCore.AWeight.Index] = GatedDeltaNetStageUtility.CreateBroadcast(distributed[GatedDeltaNetRecurrentCore.AWeight.Index].TensorType, placement),
+            [GatedDeltaNetRecurrentCore.ALog.Index] = GatedDeltaNetStageUtility.CreateBroadcast(distributed[GatedDeltaNetRecurrentCore.ALog.Index].TensorType, placement),
+            [GatedDeltaNetRecurrentCore.DtBias.Index] = GatedDeltaNetStageUtility.CreateBroadcast(distributed[GatedDeltaNetRecurrentCore.DtBias.Index].TensorType, placement),
             [GatedDeltaNetRecurrentCore.NormWeight.Index] = GatedDeltaNetStageUtility.CreateBroadcast(distributed[GatedDeltaNetRecurrentCore.NormWeight.Index].TensorType, placement),
         };
         foreach (var (index, expectedType) in expected)
@@ -624,8 +651,25 @@ public sealed class GatedDeltaNetRecurrentCoreEvaluator :
             return new InvalidType("GatedDeltaNetRecurrentCore state config does not match the operator geometry.");
         }
 
+        if (arguments[GatedDeltaNetRecurrentCore.ProjectionInput.Index] is not TensorType projectionInput)
+        {
+            return new InvalidType("GatedDeltaNetRecurrentCore projection input must be a tensor.");
+        }
+
+        var scalarProjectionInput = GatedDeltaNetStageUtility.UnpackTensorAxis(projectionInput, 1);
+        if (scalarProjectionInput.Shape is not RankedShape { Rank: 2 } projectionInputShape ||
+            scalarProjectionInput.DType != stateConfig.ActivationPrimType ||
+            !GatedDeltaNetStageUtility.AreCompatible(projectionInputShape[0], qkvShape[0]))
+        {
+            return new InvalidType(
+                $"GatedDeltaNetRecurrentCore projection input must unpack to a rank-2 " +
+                $"{stateConfig.ActivationPrimType} tensor with the QKV token extent.");
+        }
+
         var checks = new (ParameterInfo Parameter, long[] Shape, DataType? DType)[]
         {
+            (GatedDeltaNetRecurrentCore.BWeight, [target.NumValueHeads, -1], stateConfig.ActivationPrimType),
+            (GatedDeltaNetRecurrentCore.AWeight, [target.NumValueHeads, -1], stateConfig.ActivationPrimType),
             (GatedDeltaNetRecurrentCore.ALog, [target.NumValueHeads], null),
             (GatedDeltaNetRecurrentCore.DtBias, [target.NumValueHeads], null),
             (GatedDeltaNetRecurrentCore.NormWeight, [target.ValueHeadDim], null),
@@ -658,25 +702,14 @@ public sealed class GatedDeltaNetRecurrentCoreEvaluator :
                 return new InvalidType(
                     $"GatedDeltaNetRecurrentCore {parameter.Name} must use {expectedDType}, got {type.DType}.");
             }
-        }
 
-        var expectedProjection = GatedDeltaNetStageUtility.PackTensorAxis(
-            new TensorType(
-                stateConfig.ActivationPrimType,
-                new RankedShape(qkvShape[0], target.NumValueHeads)),
-            stateConfig.ActivationLanes,
-            1);
-        foreach (var parameter in new[]
-                 {
-                     GatedDeltaNetRecurrentCore.BProjection,
-                     GatedDeltaNetRecurrentCore.AProjection,
-                 })
-        {
-            if (arguments[parameter.Index] != expectedProjection)
+            if ((parameter == GatedDeltaNetRecurrentCore.BWeight ||
+                    parameter == GatedDeltaNetRecurrentCore.AWeight) &&
+                !GatedDeltaNetStageUtility.AreCompatible(shape[1], projectionInputShape[1]))
             {
                 return new InvalidType(
-                    $"GatedDeltaNetRecurrentCore {parameter.Name} must use the packed " +
-                    $"activation layout {expectedProjection}, got {arguments[parameter.Index]}.");
+                    $"GatedDeltaNetRecurrentCore {parameter.Name} reduction extent {shape[1]} " +
+                    $"must match projection input extent {projectionInputShape[1]}.");
             }
         }
 

@@ -39,11 +39,13 @@ public partial class NTT
         Expr state,
         Expr qkv,
         Expr z,
-        Expr bProjection,
-        Expr aProjection,
+        Expr projectionInput,
+        Expr bWeight,
+        Expr aWeight,
         Expr aLog,
         Expr dtBias,
         Expr normWeight,
+        Expr coreScratch,
         Expr gatedOutput,
         Dimension layerId,
         long numKeyHeads,
@@ -61,11 +63,13 @@ public partial class NTT
             state,
             qkv,
             z,
-            bProjection,
-            aProjection,
+            projectionInput,
+            bWeight,
+            aWeight,
             aLog,
             dtBias,
             normWeight,
+            coreScratch,
             gatedOutput,
             layerId);
 
@@ -157,15 +161,52 @@ public partial class NTT
         Expr rhsScale,
         Expr output,
         IR.NTT.PackedMatMulRhsLayout rhsLayout,
+        int outputNVectorLaneCount,
         long weightBlockN,
-        long weightBlockK)
+        long weightBlockK,
+        Expr? addend = null)
     {
         return KernelCall(
-            new PackedBlockScaledMatMul(rhsLayout, weightBlockN, weightBlockK),
+            new PackedBlockScaledMatMul(
+                rhsLayout,
+                outputNVectorLaneCount,
+                weightBlockN,
+                weightBlockK),
             lhs,
             rhs,
             rhsScale,
-            output);
+            output,
+            addend ?? None.Default);
+    }
+
+    public static Call PackedBlockScaledMatMulNormStats(
+        Expr lhs,
+        Expr rhs,
+        Expr rhsScale,
+        Expr output,
+        Expr stats,
+        Expr addend,
+        IR.NTT.PackedMatMulRhsLayout rhsLayout,
+        int outputNVectorLaneCount,
+        long weightBlockN,
+        long weightBlockK,
+        int axis,
+        bool useMean)
+    {
+        return KernelCall(
+            new PackedBlockScaledMatMulNormStats(
+                rhsLayout,
+                outputNVectorLaneCount,
+                weightBlockN,
+                weightBlockK,
+                axis,
+                useMean),
+            lhs,
+            rhs,
+            rhsScale,
+            output,
+            stats,
+            addend);
     }
 
     public static Call PackedMatMulNormStats(

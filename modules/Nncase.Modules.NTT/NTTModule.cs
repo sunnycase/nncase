@@ -23,6 +23,7 @@ internal class NTTModule : IApplicationPart
         registrator.RegisterManyInterface<PackedMatMulCandidateProvider>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<PackedScaledMatMulCandidateProvider>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<PackedBlockScaledMatMulCandidateProvider>(reuse: Reuse.Singleton);
+        registrator.RegisterManyInterface<PackedBlockScaledMatMulNormStatsCandidateProvider>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<PackedMatMulNormStatsCandidateProvider>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<SamplingPartialCandidateProvider>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<SamplingCombineCandidateProvider>(reuse: Reuse.Singleton);

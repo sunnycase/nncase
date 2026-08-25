@@ -929,6 +929,164 @@ def test_pyntt_renderer_accepts_selected_fp8_packed_gemv_lane_shape():
     assert spec["block_shape"][-2:] == (2, 128)
 
 
+def test_pyntt_renderer_preserves_one_block_cyclic_n_block_per_mma_tile():
+    _add_pyntt_to_path()
+    from pyntt.codegen.render import _n_major_k_packed_gemv_host_descriptor_spec
+
+    def fixed(value):
+        return {"TritonExpression": str(value), "FixedValue": value}
+
+    pointer = {
+        "DistributedStorageKind": "CanonicalGlobal",
+        "GlobalShape": [fixed(512), fixed(16)],
+        "ShardAxes": [
+            {
+                "Stages": [
+                    {
+                        "HierarchyAxes": [0, 1],
+                        "Distribution": "BlockCyclic",
+                        "Granularity": None,
+                        "BlockSize": 64,
+                    }
+                ]
+            },
+            {"Stages": []},
+        ],
+        "Hierarchy": [2, 2],
+    }
+    model = {
+        "MicroKernel": {
+            "Family": "triton.matmul",
+            "Variant": "mma_block_fp8_smem_pipeline",
+            "Parameters": {
+                "block_m": 1,
+                "block_n": 64,
+                "block_k": 512,
+                "num_stages": 2,
+            },
+            "SharedWorkspaceOffsets": {
+                "rhs_stage": "0",
+                "lhs_quantized": "65536",
+                "lhs_scale": "66048",
+            },
+            "SharedWorkspaceShapes": {
+                "rhs_stage": [2, 4, 64, 128],
+                "lhs_quantized": [4, 128],
+                "lhs_scale": [4, 1],
+            },
+        },
+        "WeightBlockK": 128,
+        "Rhs": pointer,
+        "OutputShape": [fixed(1), fixed(16)],
+        "OutputNVectorLaneCount": 8,
+    }
+    backing = {
+        "name": "weight_descriptor",
+        "source": "chip_local_rdata",
+        "offset_bytes": 256,
+        "scalar_dtype": "float8e4m3fn",
+        "logical_shape": [512, 16],
+        "logical_strides": [16, 1],
+        "vector_lane_shape": [2, 16],
+        "contiguous_rebase_extent_elements": 0,
+        "owner_stride_bytes": 0,
+    }
+
+    spec = _n_major_k_packed_gemv_host_descriptor_spec(model, backing)
+
+    assert spec["block_shape"] == (64, 128)
+    assert spec["swizzle_mode"] == 3
+    assert len(spec["entries"]) == 8
+    assert spec["entries"][0] == {
+        "offset_bytes": 256,
+        "shape": (64, 512),
+        "strides": (512, 1),
+        "source_shape_axes": ((), ()),
+    }
+    assert spec["entries"][1]["offset_bytes"] == 256 + 256 * 512
+    assert spec["entries"][2]["offset_bytes"] == 256 + 64 * 512
+
+
+def test_pyntt_renderer_uses_one_rank3_descriptor_for_block_cyclic_mma_tile():
+    _add_pyntt_to_path()
+    from pyntt.codegen.render import _n_major_k_packed_gemv_host_descriptor_spec
+
+    def fixed(value):
+        return {"TritonExpression": str(value), "FixedValue": value}
+
+    pointer = {
+        "DistributedStorageKind": "CanonicalGlobal",
+        "GlobalShape": [fixed(640), fixed(16)],
+        "ShardAxes": [
+            {
+                "Stages": [
+                    {
+                        "HierarchyAxes": [0],
+                        "Distribution": "BlockCyclic",
+                        "Granularity": None,
+                        "BlockSize": 64,
+                    }
+                ]
+            },
+            {"Stages": []},
+        ],
+        "Hierarchy": [2],
+    }
+    model = {
+        "MicroKernel": {
+            "Family": "triton.matmul",
+            "Variant": "mma_block_fp8_smem_pipeline",
+            "Parameters": {
+                "block_m": 1,
+                "block_n": 128,
+                "block_k": 256,
+                "num_stages": 2,
+            },
+            "SharedWorkspaceOffsets": {
+                "rhs_stage": "0",
+                "lhs_quantized": "65536",
+                "lhs_scale": "65792",
+            },
+            "SharedWorkspaceShapes": {
+                "rhs_stage": [2, 2, 128, 128],
+                "lhs_quantized": [2, 128],
+                "lhs_scale": [2, 1],
+            },
+        },
+        "WeightBlockK": 128,
+        "Rhs": pointer,
+        "OutputShape": [fixed(1), fixed(40)],
+        "OutputNVectorLaneCount": 8,
+    }
+    backing = {
+        "name": "weight_descriptor",
+        "source": "chip_local_rdata",
+        "offset_bytes": 256,
+        "scalar_dtype": "float8e4m3fn",
+        "logical_shape": [640, 16],
+        "logical_strides": [16, 1],
+        "vector_lane_shape": [2, 16],
+        "contiguous_rebase_extent_elements": 0,
+        "owner_stride_bytes": 0,
+    }
+
+    spec = _n_major_k_packed_gemv_host_descriptor_spec(model, backing)
+
+    assert spec["block_shape"] == (2, 64, 128)
+    assert len(spec["entries"]) == 6
+    assert [entry["shape"][:2] for entry in spec["entries"]] == [
+        (2, 64),
+        (2, 64),
+        (1, 64),
+        (2, 64),
+        (2, 64),
+        (1, 64),
+    ]
+    assert spec["entries"][0]["offset_bytes"] == 256
+    assert spec["entries"][1]["offset_bytes"] == 256 + 256 * 512
+    assert spec["entries"][3]["offset_bytes"] == 256 + 64 * 512
+
+
 def test_pyntt_renderer_uses_dense_coordinates_for_compact_local_tma():
     _add_pyntt_to_path()
     from pyntt.codegen.render import _k_major_gemv_host_descriptor_spec
